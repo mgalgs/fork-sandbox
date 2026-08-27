@@ -583,6 +583,23 @@ if [[ "$harness" == "pi" && -z "$model" ]]; then
     exit 1
 fi
 
+# Validated here, above the dry-run exit, rather than beside the rest of the
+# review-loop setup below: --dry-run exists to say whether a flag combination
+# is good, so it must not approve one the real run refuses.
+if [[ -n "$review_loop_arg" ]]; then
+    if [[ ! "$review_loop_arg" =~ ^[1-9][0-9]*$ ]]; then
+        echo "Error: --review-loop takes a positive integer — the maximum" >&2
+        echo "number of review-then-fix iterations — not '$review_loop_arg'." >&2
+        exit 1
+    fi
+    review_loop_cap="$review_loop_arg"
+fi
+if [[ -n "$review_model" && "$review_loop_cap" == "0" ]]; then
+    echo "Error: --review-model only applies to review legs and requires" >&2
+    echo "--review-loop." >&2
+    exit 1
+fi
+
 if [[ "$dry_run" == true ]]; then
     printf 'harness=%s\nmodel=%s\n' "$harness" "$model"
     [[ -z "$review_model" ]] || printf 'review_model=%s\n' "$review_model"
@@ -698,19 +715,8 @@ fi
 # leaves the flag off, and a silently accepted 0 makes a typo look like a run
 # that reviewed itself. Checked here, with the other flag checks, so a bad
 # value fails before anything is created.
-if [[ -n "$review_loop_arg" ]]; then
-    if [[ ! "$review_loop_arg" =~ ^[1-9][0-9]*$ ]]; then
-        echo "Error: --review-loop takes a positive integer — the maximum" >&2
-        echo "number of review-then-fix iterations — not '$review_loop_arg'." >&2
-        exit 1
-    fi
-    review_loop_cap="$review_loop_arg"
-fi
-if [[ -n "$review_model" && "$review_loop_cap" == "0" ]]; then
-    echo "Error: --review-model only applies to review legs and requires" >&2
-    echo "--review-loop." >&2
-    exit 1
-fi
+# --review-loop and --review-model are validated above, before the dry-run
+# exit, so that --dry-run cannot approve a combination the real run refuses.
 # The review leg follows the code-review-portable skill, which is also what
 # gets bound into the sandbox below. Without it there is no review method to
 # point the leg at, and a review leg improvising one is not the reviewed

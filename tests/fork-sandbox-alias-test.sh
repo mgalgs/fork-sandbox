@@ -172,15 +172,18 @@ fi
 
 printf '\n== --review-model resolution (same path as --model) ==\n'
 
-out="$(run --harness codex --review-model sol 2>/dev/null)"
+# --review-model requires --review-loop, so every case here carries it: a
+# dry run has to be given a combination the real run would accept, or it is
+# testing the refusal rather than the resolution.
+out="$(run --review-loop 2 --harness codex --review-model sol 2>/dev/null)"
 check "review-model alias resolves" \
     $'harness=codex\nmodel=\nreview_model=gpt-5.6-sol' "$out"
 
-out="$(HOME="$tmp" run --harness codex --review-model custom 2>/dev/null)"
+out="$(HOME="$tmp" run --review-loop 2 --harness codex --review-model custom 2>/dev/null)"
 check "review-model user alias beats discovery" \
     $'harness=codex\nmodel=\nreview_model=account-specific-model' "$out"
 
-if run --harness codex --review-model sob > /dev/null 2>"$err"; then
+if run --review-loop 2 --harness codex --review-model sob > /dev/null 2>"$err"; then
     no "unknown review-model is refused"
 else
     case "$(cat "$err")" in
@@ -190,13 +193,49 @@ else
     esac
 fi
 
-out="$(run --harness codex --model sob --review-model sob2 --model-unchecked 2>"$err")"
+out="$(run --review-loop 2 --harness codex --model sob --review-model sob2 --model-unchecked 2>"$err")"
 check "unchecked mode sends both model and review-model verbatim" \
     $'harness=codex\nmodel=sob\nreview_model=sob2' "$out"
 case "$(cat "$err")" in
     *"model 'sob'"*"were skipped"*"model 'sob2'"*"were skipped"*)
         ok "unchecked mode warns for both model and review-model" ;;
     *) no "unchecked mode warns for both model and review-model" "$(cat "$err")" ;;
+esac
+
+# --dry-run answers "would this run start?", so it has to refuse every
+# combination the real run refuses. --review-model without --review-loop is
+# the one that used to slip through: the dry run printed a resolved
+# review_model and exited 0 for flags the real run rejects outright.
+if run --harness codex --model sol --review-model terra > /dev/null 2>"$err"; then
+    no "dry-run refuses --review-model without --review-loop"
+else
+    case "$(cat "$err")" in
+        *"--review-model only applies to review legs"*"--review-loop"*)
+            ok "dry-run refuses --review-model without --review-loop" ;;
+        *) no "dry-run refuses --review-model without --review-loop" "$(cat "$err")" ;;
+    esac
+fi
+
+if run --review-loop zero --harness codex --model sol > /dev/null 2>"$err"; then
+    no "dry-run refuses a non-numeric --review-loop"
+else
+    case "$(cat "$err")" in
+        *"--review-loop takes a positive integer"*)
+            ok "dry-run refuses a non-numeric --review-loop" ;;
+        *) no "dry-run refuses a non-numeric --review-loop" "$(cat "$err")" ;;
+    esac
+fi
+
+# A missing model cache cannot validate anything, so the value goes through
+# unresolved — but silently doing that defeats the check that exists to catch
+# a typo before anything is cloned. It has to say so, like --model-unchecked.
+out="$(CODEX_HOME="$tmp/no-such-codex-home" run --harness codex --model garbage-xyz 2>"$err")"
+check "missing model cache sends the model verbatim" \
+    $'harness=codex\nmodel=garbage-xyz' "$out"
+case "$(cat "$err")" in
+    *"no readable model cache"*"garbage-xyz"*"verbatim"*)
+        ok "missing model cache warns that validation was skipped" ;;
+    *) no "missing model cache warns that validation was skipped" "$(cat "$err")" ;;
 esac
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
