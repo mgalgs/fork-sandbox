@@ -170,5 +170,34 @@ else
     ok "dry-run validates pi's required model"
 fi
 
+printf '\n== --review-model resolution (same path as --model) ==\n'
+
+out="$(run --harness codex --review-model sol 2>/dev/null)"
+check "review-model alias resolves" \
+    $'harness=codex\nmodel=\nreview_model=gpt-5.6-sol' "$out"
+
+out="$(HOME="$tmp" run --harness codex --review-model custom 2>/dev/null)"
+check "review-model user alias beats discovery" \
+    $'harness=codex\nmodel=\nreview_model=account-specific-model' "$out"
+
+if run --harness codex --review-model sob > /dev/null 2>"$err"; then
+    no "unknown review-model is refused"
+else
+    case "$(cat "$err")" in
+        *"no model matching 'sob'"*gpt-5.6-sol*gpt-5.4-mini*)
+            ok "unknown review-model names known models" ;;
+        *) no "unknown review-model names known models" "$(cat "$err")" ;;
+    esac
+fi
+
+out="$(run --harness codex --model sob --review-model sob2 --model-unchecked 2>"$err")"
+check "unchecked mode sends both model and review-model verbatim" \
+    $'harness=codex\nmodel=sob\nreview_model=sob2' "$out"
+case "$(cat "$err")" in
+    *"model 'sob'"*"were skipped"*"model 'sob2'"*"were skipped"*)
+        ok "unchecked mode warns for both model and review-model" ;;
+    *) no "unchecked mode warns for both model and review-model" "$(cat "$err")" ;;
+esac
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))

@@ -22,6 +22,7 @@
 # --model-unchecked:     send the selected model verbatim, without alias
 #                        resolution or validation. Useful before a new model
 #                        reaches a harness's local cache. Requires a model.
+#                        Governs --review-model too, when both are given.
 # --harness <name>[/<model>]:
 #                        claude (the default), pi, pi-local, or codex. A model
 #                        may follow the first slash, so a displayed
@@ -42,7 +43,9 @@
 #                        See "The review loop" below.
 # --review-model <model>:
 #                        use this model for review legs. Fix legs continue to
-#                        use --model. Requires --review-loop.
+#                        use --model. Requires --review-loop. Resolved and
+#                        validated the same way as --model, against the same
+#                        harness.
 # --task-meta '<json>':  one JSON object of orchestrator-supplied task
 #                        metadata -- kind, difficulty, size,
 #                        prompt_template_id, stage -- stored beside the run
@@ -472,29 +475,36 @@ display_config_path() {
     fi
 }
 
+# Resolves the model named by $1 (a variable name — "model" or
+# "review_model"), in place, when $2 is true. Shared by --model and
+# --review-model: both go through the same alias file and codex-cache
+# lookup, against the same $harness, so a bad --review-model is refused
+# before the clone exactly as a bad --model is.
 resolve_model() {
+    local varname="$1" given="$2"
     local aliases_file="$config_dir/aliases.conf"
-    local resolved="" source="" cache_file="" cache_label="" cache_rows=""
+    local resolved="" source="" cache_file="" cache_label="" cache_rows="" current
     local -a candidates=() known=()
 
-    [[ "$model_given" == true ]] || return 0
+    [[ "$given" == true ]] || return 0
+    current="${!varname}"
     if [[ "$model_unchecked" == true ]]; then
-        echo "Warning: sending model '$model' verbatim; alias resolution and" >&2
+        echo "Warning: sending model '$current' verbatim; alias resolution and" >&2
         echo "validation were skipped by --model-unchecked." >&2
         return 0
     fi
 
     if [[ -f "$aliases_file" ]]; then
-        resolved="$(awk -v harness="$harness" -v alias="$model" '
+        resolved="$(awk -v harness="$harness" -v alias="$current" '
             /^[[:space:]]*($|#)/ { next }
             $1 == harness && $2 == alias { print $3; exit }
         ' "$aliases_file")"
         if [[ -n "$resolved" ]]; then
             source="$(display_config_path "$aliases_file")"
-            if [[ "$resolved" != "$model" ]]; then
-                echo "fork-sandbox: model '$model' -> '$resolved' ($source)" >&2
+            if [[ "$resolved" != "$current" ]]; then
+                echo "fork-sandbox: model '$current' -> '$resolved' ($source)" >&2
             fi
-            model="$resolved"
+            printf -v "$varname" '%s' "$resolved"
             return 0
         fi
     fi
@@ -516,35 +526,35 @@ resolve_model() {
             mapfile -t known <<< "$cache_rows"
 
             mapfile -t candidates < <(printf '%s\n' "${known[@]}" |
-                awk -F '\t' -v name="$model" '$1 == name { print $1 }')
+                awk -F '\t' -v name="$current" '$1 == name { print $1 }')
             if (( ${#candidates[@]} == 0 )); then
                 mapfile -t candidates < <(printf '%s\n' "${known[@]}" |
-                    awk -F '\t' -v suffix="-$model" '
+                    awk -F '\t' -v suffix="-$current" '
                         $2 == "list" && substr($1, length($1) - length(suffix) + 1) == suffix { print $1 }
                     ')
             fi
             if (( ${#candidates[@]} == 0 )); then
                 mapfile -t candidates < <(printf '%s\n' "${known[@]}" |
-                    awk -F '\t' -v name="$model" '
+                    awk -F '\t' -v name="$current" '
                         $2 == "list" && index($1, name) { print $1 }
                     ')
             fi
             if (( ${#candidates[@]} == 1 )); then
                 resolved="${candidates[0]}"
-                if [[ "$resolved" != "$model" ]]; then
-                    echo "fork-sandbox: model '$model' -> '$resolved' ($cache_label)" >&2
+                if [[ "$resolved" != "$current" ]]; then
+                    echo "fork-sandbox: model '$current' -> '$resolved' ($cache_label)" >&2
                 fi
-                model="$resolved"
+                printf -v "$varname" '%s' "$resolved"
                 return 0
             fi
             if (( ${#candidates[@]} > 1 )); then
-                echo "Error: model '$model' is ambiguous for harness codex" >&2
+                echo "Error: model '$current' is ambiguous for harness codex" >&2
                 echo "($cache_label). Matches:" >&2
                 printf '  %s\n' "${candidates[@]}" >&2
                 return 1
             fi
 
-            echo "Error: no model matching '$model' for harness codex." >&2
+            echo "Error: no model matching '$current' for harness codex." >&2
             echo "Known models ($cache_label):" >&2
             printf '%s\n' "${known[@]}" | awk -F '\t' '$2 == "list" { printf "  %s\n", $1 }' >&2
             echo "Pass --model-unchecked to send it anyway." >&2
@@ -553,7 +563,11 @@ resolve_model() {
     esac
 }
 
-resolve_model || exit 1
+resolve_model model "$model_given" || exit 1
+
+review_model_given=false
+[[ -n "$review_model" ]] && review_model_given=true
+resolve_model review_model "$review_model_given" || exit 1
 
 if [[ "$harness" == "pi" && -z "$model" ]]; then
     echo "Error: --harness pi needs --model. There is no default: the model" >&2
@@ -563,6 +577,7 @@ fi
 
 if [[ "$dry_run" == true ]]; then
     printf 'harness=%s\nmodel=%s\n' "$harness" "$model"
+    [[ -z "$review_model" ]] || printf 'review_model=%s\n' "$review_model"
     exit 0
 fi
 
