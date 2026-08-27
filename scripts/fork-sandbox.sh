@@ -481,9 +481,9 @@ mkdir -p /var/tmp/claude-scratch/forks
 #                     tool itself and takes its flags instead.
 #   harness_sandbox_bin
 #                     the sandbox wrapper, when it is not claude-sandboxed.
-#                     agent-sandboxed for a sealed local-model run: it is
-#                     claude-sandboxed plus the model bridge, and it takes
-#                     the same bind flags.
+#                     agent-sandboxed for a sealed local-model run: it
+#                     drives the same sandbox backend, sealed and with the
+#                     model bridged in, and it takes the same bind flags.
 #   run_formatter     what renders the output stream, or empty when the
 #                     tool does not speak stream-json.
 #   usage_source      which reader can total this run's tokens.
@@ -579,8 +579,8 @@ pi)
 
 pi-local)
     # pi against a model you host, in a sandbox with no network at all.
-    # agent-sandboxed is the wrapper: it is claude-sandboxed --seal-egress
-    # plus the socket bridge that carries the one endpoint in, and it
+    # agent-sandboxed is the wrapper: it calls sandbox-backend-bwrap
+    # sealed, adds the socket bridge that carries the one endpoint in, and
     # resolves pi, generates pi's config and starts pi itself. So this arm
     # names no command and no key — there is nothing to authenticate to —
     # and what follows the clone dir is pi's own flags.
@@ -1199,9 +1199,9 @@ mv -- "$handoff_copy.part" "$handoff_copy"
 # PATH setup. The pre-flight above checked this launcher's environment,
 # which proves nothing about the runner's.
 # A harness may bring its own wrapper: agent-sandboxed for a sealed
-# local-model run, which is claude-sandboxed plus a model bridge and takes the
-# same bind flags. It is already resolved to an absolute path, for the same
-# reason this one is.
+# local-model run, which drives the same sandbox backend with a model bridged
+# in and takes the same bind flags. It is already resolved to an absolute
+# path, for the same reason this one is.
 if [[ -n "$harness_sandbox_bin" ]]; then
     sandbox_bin="$harness_sandbox_bin"
 else
