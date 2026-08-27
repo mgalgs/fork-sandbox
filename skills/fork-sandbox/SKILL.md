@@ -348,7 +348,7 @@ clone inside it is mounted, and the log is written by the host shell.
 | `<run-dir>/events.jsonl` | every event, one JSON object per line |
 | `<run-dir>/sandbox.log` | the sandbox wrapper's messages, startup errors included |
 | `<run-dir>/summary.txt` | branch, exit code, commit list and diffstat after the fetch |
-| `<run-dir>/summary.json` | the same facts structured — harness and its version, model, exit code, commits with subjects, `cost_usd`, `total_cost_usd` (the run plus any `--review-loop` legs), and `usage` token counts — for reading, not grepping |
+| `<run-dir>/summary.json` | the same facts structured — harness and its version, model, exit code, commits with subjects, `cost_usd`, `total_cost_usd` (the run plus any `--review-loop` legs), `usage` token counts, and `author_email_unexpected` (empty unless a returned commit carries an address other than the repo's own) — for reading, not grepping |
 | `<run-dir>/handoff.md` | the prompt as it was sent |
 | `<run-dir>/task-meta.json` | the `--task-meta` object, when one was given |
 | `<run-dir>/review-loop.json` | `--review-loop` only: how the loop ended, and one record per iteration |

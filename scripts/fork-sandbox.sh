@@ -2435,6 +2435,31 @@ if [[ -n "$run_cost_fmt" && "$loop_cost_unknown" != "1" ]]; then
     fi
 fi
 
+# Did the work come back authored by this repo's own identity? The clone is
+# seeded with the origin's effective user.email (fs_make_clone in the lib says
+# why), so it should. Before that seeding existed a repo whose identity was a
+# local override got commits authored by whatever ~/.gitconfig held, and
+# nothing downstream noticed: integration re-creates the commits on the host,
+# and cherry-pick and rebase deliberately keep the author. Silent misattribution
+# is how that survived, so the run checks itself rather than wait for someone to
+# look. A report only -- rewriting authorship on fetch would be a surprise, and
+# integration is where that call belongs. When the seeding works this is empty
+# and the summary reads exactly as before, so silence is the pass signal.
+#
+# The addresses come from the session's commits and are untrusted text, so
+# control characters go the same way they do for the subjects below.
+author_email_want=""
+author_email_bad=""
+if (( fetched )) && [[ "$n_commits" != "0" ]]; then
+    author_email_want="$( (cd "$origin_repo" && git config --get user.email) 2>/dev/null || true )"
+    if [[ -n "$author_email_want" ]]; then
+        author_email_bad="$( (cd "$origin_repo" \
+            && git log --format='%ae' "$base_sha..$branch") 2>/dev/null \
+            | tr -d '\000-\010\013-\037\177' \
+            | grep -vxF -- "$author_email_want" | sort -u || true )"
+    fi
+fi
+
 {
     printf '== fork-sandbox summary ==\n'
     printf 'branch:   %s\n' "$branch"
@@ -2491,6 +2516,16 @@ fi
         printf '\nNothing landed in %s. Whatever the session wrote is still\n' "$origin_repo"
         printf 'in the clone at %s\n' "$clone_dir"
     fi
+    # Last, so it is the hardest line in the summary to skim past.
+    if [[ -n "$author_email_bad" ]]; then
+        printf '\nWARNING: a returned commit was authored by an unexpected address.\n'
+        printf '  expected: %s   (the user.email %s resolves to)\n' \
+            "$author_email_want" "$origin_repo"
+        printf '%s\n' "$author_email_bad" | sed 's/^/  found:    /'
+        printf 'The clone is seeded with the repo user.email, so a mismatch means\n'
+        printf 'that seeding regressed. Fix authorship before you integrate: rebase\n'
+        printf 'and cherry-pick both keep the author, so it lands as-is otherwise.\n'
+    fi
 } > "$run_dir/summary.txt" 2>&1
 
 # The same facts, structured, so a caller never has to parse the prose
@@ -2502,6 +2537,12 @@ commit_list="$( (cd "$origin_repo" && git log --format='%H %s' "$base_sha..$bran
     | jq -R -s 'split("\n") | map(select(length > 0))
                 | map({sha: .[0:40], subject: .[41:]})' 2>/dev/null )"
 [[ -n "$commit_list" ]] || commit_list='[]'
+# The identity check, structured: the address the commits should carry, and
+# every other one they actually do. An empty array is the pass, and it is the
+# array a caller can assert on without parsing the warning prose above.
+author_email_bad_json="$(printf '%s' "$author_email_bad" \
+    | jq -R -s -c 'split("\n") | map(select(length > 0))' 2>/dev/null)"
+[[ -n "$author_email_bad_json" ]] || author_email_bad_json='[]'
 fetched_json=false
 (( fetched )) && fetched_json=true
 removed_json=false
@@ -2533,6 +2574,8 @@ jq -n \
     --argjson started_at "$started_at" \
     --argjson ended_at "$ended_at" \
     --argjson commits_list "$commit_list" \
+    --arg author_email "$author_email_want" \
+    --argjson author_email_unexpected "$author_email_bad_json" \
     '{
         version: $version,
         harness: $harness,
@@ -2547,6 +2590,8 @@ jq -n \
         harness_error: (if $harness_error == "" then null else $harness_error end),
         commits: $commits,
         commits_list: $commits_list,
+        author_email: (if $author_email == "" then null else $author_email end),
+        author_email_unexpected: $author_email_unexpected,
         fetched: $fetched,
         branch_removed: $branch_removed,
         cost_usd: $cost_usd,
