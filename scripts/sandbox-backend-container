@@ -386,18 +386,25 @@ if [[ "$NET_MODE" == pinned ]]; then
     # and stdin is how a large prompt reaches the command (see the header) —
     # losing it would be a silent regression, not a loud one.
     #
-    # But stdin can be CLOSED rather than merely empty — a script launched
-    # from a harness, a cron job, or a tmux runner often has no fd 0 at all.
-    # Then /dev/stdin cannot be opened, and the redirect kills the whole run
-    # before the command starts ("No such device or address"). Test it and
-    # fall back, because a pinned run must not depend on the caller having
-    # bothered to give us a stdin.
-    if [[ -r /dev/stdin ]]; then
-        "$CLI" start --attach --interactive "$CONTAINER" < /dev/stdin &
+    # But stdin can be unopenable by path rather than merely empty. A script
+    # launched from a harness, a cron job or a tmux runner often has no fd 0
+    # at all, and a socket-activated or supervised caller can hand us one that
+    # exists and still cannot be reopened. Then /dev/stdin fails with "No such
+    # device or address" and the redirect kills the whole run before the
+    # command starts.
+    #
+    # Probe by OPENING it, not by testing it: `[[ -r /dev/stdin ]]` is an
+    # access() on the resolved path, which answers correctly for a closed fd 0
+    # but says "readable" for a socket that then fails to open. A pinned run
+    # must not depend on the caller having bothered to give us a usable stdin.
+    if exec 3< /dev/stdin 2>/dev/null; then
+        "$CLI" start --attach --interactive "$CONTAINER" <&3 &
+        attach_pid=$!
+        exec 3<&-
     else
         "$CLI" start --attach --interactive "$CONTAINER" < /dev/null &
+        attach_pid=$!
     fi
-    attach_pid=$!
     "$CLI" run --rm --network "container:$CONTAINER" --cap-add=NET_ADMIN --user 0 --entrypoint /bin/bash "$IMAGE" -c "$routes" || { echo "Error: pin helper failed; command was not run." >&2; exit 1; }
     wait "$attach_pid" || true
 else
