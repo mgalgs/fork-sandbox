@@ -101,14 +101,39 @@ else
         out="$(run --workdir "$rw" --net sealed --bridge "$usock=23456" -- bash -c 'exec 3<>/dev/tcp/127.0.0.1/23456; cat <&3')"
         check "sealed unix-socket bridge" bridged "$out"
 
-        stale_sock="$sockdir/stale.sock"
-        python3 - "$stale_sock" <<'PY'
+        # A bridge readiness probe is a TCP connect against the relay's own
+        # listening port; a socat that has bound and is `fork`-ing does not
+        # validate its UNIX-CONNECT target until a client actually arrives.
+        # So a unix socket with no listener behind it (previously tested
+        # here) cannot exercise the timeout path: the probe still succeeds
+        # against socat's own listener, and only a later real connection
+        # would see the dead peer. To exercise a listener that genuinely
+        # never appears, build an image where socat exists (so the
+        # pre-flight `command -v socat` probe, which runs with the image's
+        # own default PATH, passes) but is not reachable on this backend's
+        # fixed sandbox PATH, so the generated bootstrap's bare `socat`
+        # invocation fails with "not found" and no listener ever binds. The
+        # bridge socket itself only needs to pass the host-side "-S" check;
+        # it never gets a connection attempt, so it need not be live.
+        dead_sock="$sockdir/dead.sock"
+        python3 - "$dead_sock" <<'PY'
 import socket, sys
 s = socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.close()
 PY
-        marker="$rw/bridge-must-not-run"
-        refuses "unready bridge fails closed" "did not become ready" run --workdir "$rw" --net sealed --bridge "$stale_sock=23457" -- touch "$marker"
-        if [[ ! -e "$marker" ]]; then ok "unready bridge did not run command"; else no "unready bridge did not run command"; fi
+        nosocat="fork-sandbox-container-nosocat:$RANDOM-$$"
+        if "$runtime" build -t "$nosocat" -f - "$repo_dir" >/dev/null <<'EOF'
+FROM alpine:3.22
+RUN apk add --no-cache bash socat
+RUN mkdir -p /outside-sandbox-path && mv "$(command -v socat)" /outside-sandbox-path/socat
+ENV PATH="/outside-sandbox-path:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+EOF
+        then
+            marker="$rw/bridge-must-not-run"
+            refuses "unreachable bridge listener fails closed" "did not become ready" \
+                "$backend" --image "$nosocat" --workdir "$rw" --net sealed --bridge "$dead_sock=23457" -- touch "$marker"
+            if [[ ! -e "$marker" ]]; then ok "unreachable bridge listener did not run command"; else no "unreachable bridge listener did not run command"; fi
+            "$runtime" image rm "$nosocat" >/dev/null 2>&1 || true
+        else printf '  SKIP  no-PATH-socat image build failed\n'; fi
 
         noip="fork-sandbox-container-noip:$RANDOM-$$"
         if "$runtime" build -t "$noip" -f - "$repo_dir" >/dev/null <<'EOF'

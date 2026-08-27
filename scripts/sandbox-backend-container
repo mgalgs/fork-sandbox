@@ -18,8 +18,13 @@
 # internet and the LAN but blackholes host, tunnel and bridge destinations;
 # unpinned is an extension with unrestricted bridge egress and a warning.
 # --bridge SOCKET=PORT works only sealed and relays a read-only-mounted host
-# unix socket to container loopback. -- ends options; the remaining argv and
-# its authoritative inspected exit status are the command and backend status.
+# unix socket to container loopback. A bridge proves that a listener exists
+# on the port, not that the endpoint behind it is alive: the readiness probe
+# is a TCP connect, which the relay satisfies as soon as it binds, whether or
+# not its target unix socket has anything listening. A dead peer surfaces
+# only on the first real connection attempt, not at startup. -- ends options;
+# the remaining argv and its authoritative inspected exit status are the
+# command and backend status.
 #
 # The image supplies the sandbox toolchain, unlike bwrap, which mounts host
 # /usr. It must contain bash; pinned mode also needs iproute2's ip, and bridges
@@ -209,6 +214,16 @@ fi
 bridge_dirs=()
 for s in "${BRIDGE_SOCKETS[@]}"; do d="$(dirname "$(realpath "$s")")"; seen=0; for r in "${bridge_dirs[@]}"; do [[ "$r" == "$d" ]] && seen=1; done; (( seen )) || { bridge_dirs+=("$d"); MOUNTS+=(--mount "type=bind,src=$d,dst=$d,readonly"); }; done
 
+# Generated INSIDE the container and run before the caller's command. In
+# pinned mode it polls for the sentinel blackhole 169.254.0.0/16 — always the
+# last route the pin helper below installs — and refuses to run the command
+# if it never shows up within the timeout. That makes the sandbox verify its
+# own pin rather than trust that the helper ran: a helper that failed, or was
+# skipped, fails the whole run closed instead of silently running unpinned.
+# For each --bridge it starts the relay and a watchdog that names the socket
+# if it later vanishes, then waits for the relay's port to accept a TCP
+# connection before continuing — see the --bridge paragraph above for what
+# that readiness check does and does not prove.
 {
     echo '#!/usr/bin/env bash'; echo 'set -euo pipefail'
     if [[ "$NET_MODE" == pinned ]]; then echo 'for ((i=0;i<200;i++)); do ip route show type blackhole | grep -q "169.254.0.0/16" && break; sleep .05; done'; echo 'ip route show type blackhole | grep -q "169.254.0.0/16" || { echo "Error: pinned-egress route gate timed out; command not run." >&2; exit 1; }'; fi
