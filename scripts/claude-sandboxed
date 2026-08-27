@@ -1,0 +1,479 @@
+#!/usr/bin/env bash
+# Run claude in a sandbox, provisioned with a throwaway copy of its credential.
+#
+# Usage: claude-sandboxed [--unpin-egress | --seal-egress] [--bind-ro PATH]... [--bind-rw PATH]... [--bind-ro-at SRC DEST]... [--prepend-path DIR]... [--env-file FILE] [--exec] [work-dir] [claude-args... | CMD ARG...]
+#
+# This is the Claude client of the sandbox backend. The isolation itself —
+# the mount allowlist, the network namespace, the egress pin, the seal — is
+# sandbox-backend-bwrap's, and its header is where those properties and their
+# limits are written down. Read it: everything this script says about
+# containment rests on it. FORK_SANDBOX_BACKEND names another backend if you
+# have one; the contract is docs/sandbox-backend.md.
+#
+# What this script adds is everything Claude-shaped: a copy of the access
+# token with the refresh token stripped out, a synthetic ~/.claude, the
+# onboarding and trust file, the claude binary's own mounts, the git identity,
+# the host's model and browser caches, and the transcript rescue on the way
+# out.
+#
+# --unpin-egress is also accepted as --allow-tunnels. It widens egress to
+# include the tailnet, VPNs and bridge networks, which the default pin
+# removes. It is what a VM on a libvirt or docker bridge needs — address it
+# directly, by its bridge address.
+#
+# --seal-egress removes the network entirely: no internet, no LAN, no DNS.
+# The one way in is a unix socket bound from the host, so a caller can
+# publish one service — a local model endpoint, say — and nothing else (see
+# agent-sandboxed). Requires --exec: claude itself cannot reach the Anthropic
+# API from a sealed sandbox, so a sealed claude session would be dead on
+# arrival.
+#
+# --bind-ro adds one read-only host path, file or directory. Repeat it for
+# more. It grants no write, so it cannot be used to plant anything on the
+# host — but it does widen the allowlist, so pointing it at a secret puts
+# that secret in the sandbox. Name the smallest path that works.
+#
+# --bind-rw adds one read-WRITE host path. Repeat it for more. Unlike
+# --bind-ro it grants write, so it carries the work dir's own risk: a system
+# path here would let the sandbox modify host files, so it is refused the
+# same way the work dir is. It exists for the one path a run must write
+# outside the work dir — a per-run services sockets directory, say.
+#
+# --bind-ro-at SRC DEST binds SRC read-only at DEST, rather than at SRC's own
+# path. DEST must be absolute, and is normally a path inside the work dir,
+# which the bind then re-protects read-only. It exists so a directory the
+# sandbox needs under the work dir — a provisioned virtualenv, say — can be
+# served read-only from elsewhere on the host.
+#
+# --prepend-path puts DIR at the front of the sandbox PATH. Repeat it for
+# more; later flags end up earlier on PATH. It changes lookup order only —
+# it mounts nothing, so a DIR the sandbox should read still needs its own
+# --bind-ro. It exists for toolchains that live outside /usr: nvm's node,
+# say, which must beat an older /usr/bin/node.
+#
+# It exists for `git clone --shared`. Such a clone holds no objects of its
+# own: it records the source object store in objects/info/alternates and
+# reads history from there. Bind that store read-only and a sandboxed
+# clone can read the whole history and still commit, because new objects
+# are written into the clone. The source repository stays unwritable, so
+# nothing in the sandbox can reach its hooks or its config — both of
+# which are host code execution the next time anyone runs git there.
+#
+# --exec runs another program in this sandbox instead of claude. With it,
+# the arguments after the work dir are the command and its own arguments,
+# not claude flags, so the work dir must be given explicitly. Nothing
+# claude-specific happens in this mode: no credential is copied, no
+# ~/.claude exists, no onboarding file is written and the claude install
+# is not mounted. Every other line below is unchanged — the same mount
+# allowlist, the same network namespace and egress pin, the same work-dir
+# rules and the same lock. A command outside /usr needs its own
+# --bind-ro; /usr is mounted already.
+#
+# --env-file adds environment variables to that command, one NAME=VALUE
+# per line, and only with --exec. It exists for a harness that needs an
+# API key of its own — an OpenRouter key, say. The file must be a regular
+# file, owned by you, mode 0600 or stricter, and each name must look like
+# [A-Z_][A-Z0-9_]*. The values never reach any argv: an argument would put
+# them in a command line that /proc publishes to every local user for as long
+# as the sandbox runs, so the file is copied to mode 600 in the per-run state
+# dir, bind-mounted read-only, and read by a small shell shim that exports it
+# and execs the command. `ps` shows the shim and the path, never a value. Keys
+# named here are readable by everything inside the sandbox — that is the point
+# of passing them — so name only the ones that run has to have.
+#
+# With no work-dir, the script creates a unique one under
+# /var/tmp/claude-scratch/forks and prints the path. Many sandboxes can run at
+# the same time; every run gets
+# its own work dir, its own network namespace, and its own credentials copy.
+#
+# The work dir is also the results channel. It is the only writable path
+# that outlives the sandbox, so a sandboxed claude reports back by writing
+# files there. The script prints the path on entry and on exit.
+#
+# What a claude session gets on top of the backend's own mounts:
+#   - The Hugging Face model cache, read-only, when the host has one:
+#     ~/.cache/huggingface/hub and .../xet at their own paths, plus
+#     HF_HUB_OFFLINE=1. The content subdirectories only — never the parent,
+#     which is where huggingface_hub keeps `token`.
+#   - The Playwright browser cache, read-only, when the host has one:
+#     ~/.cache/ms-playwright at its own path, whole.
+#   - Claude state, in claude mode only: a temp dir holding a copy of the
+#     access token is bind-mounted as ~/.claude. The real one is never
+#     mounted.
+#     That temp dir is removed when the script exits, Ctrl-C included.
+#     A SIGKILL leaves it behind, holding a mode 600 copy of a token
+#     that expires within hours.
+#     With --exec none of this happens and no Claude credential is
+#     present at all; whatever --env-file names is the only secret inside.
+#   - Credentials: the copy holds the short-lived access token only. The
+#     refresh token and the mcpOAuth tokens stay on the host. A leaked
+#     sandbox credential dies at token expiry, and the session cannot
+#     outlive the access token.
+#   - Git: the host identity is carried in, with commit and tag signing
+#     switched off, because the signing key lives in the masked ~/.ssh.
+#     Commits work; pushing does not, since no key, token or agent is
+#     present. Work leaves the sandbox as files in the work dir.
+#
+# Residual risk: the backend's header has the containment limits — namespace
+# isolation rather than a virtual machine, no seccomp filter, a reachable LAN
+# the sandbox reaches AS this host. Two more belong to this script rather than
+# to the sandbox. The access token is inside by design, so whatever runs there
+# can spend the subscription. And unrestricted internet is an exfiltration
+# channel for anything the sandbox can read.
+
+set -euo pipefail
+
+script_dir="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=fork-sandbox-lib.sh
+# shellcheck disable=SC1091  # plain shellcheck cannot follow it; use -x
+source "$script_dir/fork-sandbox-lib.sh"
+
+UID_N="$(id -u)"
+
+# Accept the flag on either side of the work dir, and stop at the first
+# claude flag so claude's own arguments are never consumed here.
+UNPIN_EGRESS=0
+SEAL_EGRESS=0
+WORK_DIR_ARG=""
+BIND_RO=()
+BIND_RW=()
+BIND_RO_AT_SRC=()
+BIND_RO_AT_DEST=()
+PREPEND_PATH=()
+EXEC_MODE=0
+ENV_FILE=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --unpin-egress|--allow-tunnels) UNPIN_EGRESS=1; shift ;;
+        --seal-egress) SEAL_EGRESS=1; shift ;;
+        --exec) EXEC_MODE=1; shift ;;
+        --env-file)
+            ENV_FILE="${2:?--env-file requires a path}"
+            shift 2
+            ;;
+        --bind-ro)
+            BIND_RO+=("${2:?--bind-ro requires a path}")
+            shift 2
+            ;;
+        --bind-rw)
+            BIND_RW+=("${2:?--bind-rw requires a path}")
+            shift 2
+            ;;
+        --bind-ro-at)
+            BIND_RO_AT_SRC+=("${2:?--bind-ro-at requires a source path}")
+            BIND_RO_AT_DEST+=("${3:?--bind-ro-at requires a destination path}")
+            shift 3
+            ;;
+        --prepend-path)
+            PREPEND_PATH+=("${2:?--prepend-path requires a directory}")
+            shift 2
+            ;;
+        -*) break ;;
+        *)
+            [[ -n "$WORK_DIR_ARG" ]] && break
+            WORK_DIR_ARG="$1"
+            shift
+            ;;
+    esac
+done
+
+# --exec replaces claude with another program, so the words after the work
+# dir are the command. Both have to be there: with no work dir the first
+# word of the command would be taken for one.
+if (( EXEC_MODE )); then
+    if [[ -z "$WORK_DIR_ARG" ]]; then
+        echo "Error: --exec needs an explicit work dir before the command:" >&2
+        echo "  claude-sandboxed --exec <work-dir> CMD [ARG...]" >&2
+        exit 1
+    fi
+    if (( $# == 0 )); then
+        echo "Error: --exec needs a command after the work dir." >&2
+        exit 1
+    fi
+elif [[ -n "$ENV_FILE" ]]; then
+    echo "Error: --env-file works only with --exec. A claude session gets no" >&2
+    echo "API keys on purpose, so this script carries none into one." >&2
+    exit 1
+fi
+
+# A sealed sandbox has no route anywhere, so claude cannot reach the
+# Anthropic API from inside one and a sealed claude session would die on its
+# first request. Refuse the combination rather than let it fail in there.
+if (( SEAL_EGRESS )); then
+    if (( ! EXEC_MODE )); then
+        echo "Error: --seal-egress needs --exec. A sealed sandbox has no route" >&2
+        echo "to the Anthropic API, so a claude session inside one is dead on" >&2
+        echo "arrival. Run another harness with --exec, bridged to a local" >&2
+        echo "model over a unix socket (see agent-sandboxed)." >&2
+        exit 1
+    fi
+    if (( UNPIN_EGRESS )); then
+        echo "Error: --seal-egress and --unpin-egress contradict each other." >&2
+        echo "One removes the network; the other widens it. Pick one." >&2
+        exit 1
+    fi
+fi
+
+# The backend has to exist before anything is created, so a missing one is one
+# line here rather than a failure after the credential copy.
+fs_resolve_backend "$script_dir" || exit 1
+
+# Read the environment file before anything is created, so a bad one stops
+# the run early. Values are never printed and never reach a command line.
+EXEC_ENV_LINES=()
+if [[ -n "$ENV_FILE" ]]; then
+    if [[ -L "$ENV_FILE" ]]; then
+        echo "Error: --env-file '$ENV_FILE' is a symlink. Name the file itself." >&2
+        exit 1
+    fi
+    if [[ ! -f "$ENV_FILE" ]]; then
+        echo "Error: --env-file '$ENV_FILE' is not a regular file." >&2
+        exit 1
+    fi
+    ENV_STAT="$(stat -c '%u %a' -- "$ENV_FILE")"
+    ENV_OWNER="${ENV_STAT%% *}"
+    ENV_PERMS="${ENV_STAT##* }"
+    if [[ "$ENV_OWNER" != "$UID_N" ]]; then
+        echo "Error: --env-file '$ENV_FILE' is owned by uid $ENV_OWNER, not by you." >&2
+        exit 1
+    fi
+    if (( 8#$ENV_PERMS & 0077 )); then
+        echo "Error: --env-file '$ENV_FILE' is mode $ENV_PERMS. It holds a secret," >&2
+        echo "so it must be 0600 or stricter. Run: chmod 600 '$ENV_FILE'" >&2
+        exit 1
+    fi
+    # A final line without a newline still counts, so test the buffer too.
+    while IFS= read -r env_line || [[ -n "$env_line" ]]; do
+        [[ -z "$env_line" || "$env_line" == \#* ]] && continue
+        if [[ "$env_line" != *=* ]]; then
+            echo "Error: --env-file '$ENV_FILE' has a line that is not NAME=VALUE." >&2
+            exit 1
+        fi
+        if [[ ! "${env_line%%=*}" =~ ^[A-Z_][A-Z0-9_]*$ ]]; then
+            echo "Error: --env-file '$ENV_FILE' names a variable that is not" >&2
+            echo "[A-Z_][A-Z0-9_]*: '${env_line%%=*}'" >&2
+            exit 1
+        fi
+        EXEC_ENV_LINES+=("$env_line")
+    done < "$ENV_FILE"
+    if (( ${#EXEC_ENV_LINES[@]} == 0 )); then
+        echo "Error: --env-file '$ENV_FILE' sets no variables." >&2
+        exit 1
+    fi
+fi
+
+# Everything claude needs: its credential, its binary, and a token with
+# life left in it. --exec runs something else, so none of it applies and
+# no Claude credential enters the sandbox at all.
+CREDS="$HOME/.claude/.credentials.json"
+CLAUDE_BIN=""
+CLAUDE_REAL=""
+MINS_LEFT=0
+if (( ! EXEC_MODE )); then
+    if [[ ! -f "$CREDS" ]]; then
+        echo "Error: $CREDS not found. Log in with claude first." >&2
+        exit 1
+    fi
+
+    # Resolve the claude binary on the host and run it by absolute path.
+    # ~/.local/bin is often absent from a non-interactive PATH, so relying on
+    # a PATH lookup inside the sandbox breaks cron and ssh invocations.
+    CLAUDE_BIN="$(command -v claude 2>/dev/null || true)"
+    if [[ -z "$CLAUDE_BIN" && -x "$HOME/.local/bin/claude" ]]; then
+        CLAUDE_BIN="$HOME/.local/bin/claude"
+    fi
+    if [[ -z "$CLAUDE_BIN" ]]; then
+        echo "Error: cannot find the claude binary on PATH or in ~/.local/bin." >&2
+        exit 1
+    fi
+    CLAUDE_REAL="$(readlink -f "$CLAUDE_BIN")"
+
+    # The sandbox cannot refresh the token, so the session dies at expiry.
+    # Check the remaining lifetime up front.
+    EXPIRES_AT_MS=$(jq -r '.claudeAiOauth.expiresAt // 0' "$CREDS")
+    MINS_LEFT=$(( EXPIRES_AT_MS / 60000 - $(date +%s) / 60 ))
+    if (( MINS_LEFT <= 0 )); then
+        echo "Error: the access token in $CREDS has expired." >&2
+        echo "Log in with claude on the host, then retry." >&2
+        exit 1
+    elif (( MINS_LEFT < 60 )); then
+        echo "Warning: the access token expires in ${MINS_LEFT}m; the sandbox session dies then." >&2
+    fi
+fi
+
+# The default work dir and the per-run state dir both live under the scratch
+# root's forks/ directory. Create it now; the UserPromptSubmit hook makes it
+# too, but a script cannot assume the hook ran. The backend requires an
+# explicit --workdir, so defaulting one is this script's job.
+mkdir -p /var/tmp/claude-scratch/forks
+if [[ -n "$WORK_DIR_ARG" ]]; then
+    mkdir -p "$WORK_DIR_ARG"
+    WORK_DIR="$(realpath "$WORK_DIR_ARG")"
+else
+    WORK_DIR="$(mktemp -d /var/tmp/claude-scratch/forks/claude-sandbox.XXXXXX)"
+fi
+
+# Per-run state on the host, removed on exit.
+STATE_DIR="$(mktemp -d /var/tmp/claude-scratch/forks/claude-sandboxed-state.XXXXXX)"
+
+# The sandboxed session's transcript lives in the ephemeral state dir, so a
+# run that is killed or abandoned loses the agent's reasoning while keeping
+# its files. Copy it into the work dir, which persists.
+# shellcheck disable=SC2329  # invoked by the EXIT trap below
+cleanup() {
+    # Drop errexit first. This handler must always reach the rm: the state
+    # dir holds a copy of the access token, so leaking it leaks a secret.
+    # A pipeline here is a trap of its own — `find | head` takes SIGPIPE,
+    # and pipefail turns that into a failure that would abort the handler.
+    set +e
+    # There is no transcript in --exec mode: that directory is claude's.
+    if (( ! EXEC_MODE )) \
+        && find "$STATE_DIR/claude/projects" -name '*.jsonl' -print -quit 2>/dev/null \
+        | grep -q .; then
+        mkdir -p "$WORK_DIR/claude-session"
+        find "$STATE_DIR/claude/projects" -name '*.jsonl' \
+            -exec cp {} "$WORK_DIR/claude-session/" \; 2>/dev/null
+    fi
+    rm -rf "$STATE_DIR"
+}
+trap cleanup EXIT
+
+if (( ! EXEC_MODE )); then
+    mkdir -p "$STATE_DIR/claude"
+
+    # Keep the access token. Drop the refresh token, which is long-lived and
+    # single-use — a sandbox refresh would invalidate the host's copy. Drop
+    # mcpOAuth, which holds unrelated MCP server tokens.
+    install -m 600 /dev/null "$STATE_DIR/claude/.credentials.json"
+    jq 'del(.mcpOAuth)
+        | del(.claudeAiOauth.refreshToken, .claudeAiOauth.refreshTokenExpiresAt)' \
+        "$CREDS" > "$STATE_DIR/claude/.credentials.json"
+fi
+
+# The git identity, signing switched off, so a session in here can commit.
+# Fills FS_GITCONFIG_FLAGS.
+fs_gitconfig_bind "$STATE_DIR"
+
+# $HOME is a fresh tmpfs, so claude finds no config. Pre-accept onboarding
+# and trust for the work dir to keep non-interactive runs from stalling.
+if (( ! EXEC_MODE )); then
+    jq -n --arg dir "$WORK_DIR" '{
+        hasCompletedOnboarding: true,
+        hasTrustDialogAccepted: true,
+        projects: { ($dir): { hasTrustDialogAccepted: true } },
+    }' > "$STATE_DIR/.claude.json"
+fi
+
+# The --exec command's own environment. Written mode 600 in the state dir,
+# which the trap above removes, and bind-mounted read-only below. The
+# values stay out of every command line this way; see the header.
+ENV_MOUNT="$HOME/.sandbox-env"
+if (( ${#EXEC_ENV_LINES[@]} )); then
+    install -m 600 /dev/null "$STATE_DIR/exec-env"
+    printf '%s\n' "${EXEC_ENV_LINES[@]}" > "$STATE_DIR/exec-env"
+fi
+
+# The host's model and browser caches, read-only when they exist. Fills
+# FS_CACHE_FLAGS with backend flags, HF_HUB_OFFLINE included.
+fs_cache_binds
+
+# Claude's own install and state. The backend's --bind-ro errors on a path
+# that does not exist, so filter here rather than ask it to tolerate one: a
+# claude installed somewhere else has no ~/.local/share/claude, and the
+# resolved binary is often one of the paths already named. Bind the resolved
+# binary too, so a non-standard install location still works.
+CLAUDE_FLAGS=()
+if (( ! EXEC_MODE )); then
+    claude_paths_seen=()
+    for p in "$HOME/.local/share/claude" "$HOME/.local/bin/claude" \
+             "$CLAUDE_BIN" "$(dirname "$CLAUDE_REAL")"; do
+        [[ -e "$p" ]] || continue
+        p_seen=0
+        for q in "${claude_paths_seen[@]}"; do
+            [[ "$q" == "$p" ]] && { p_seen=1; break; }
+        done
+        (( p_seen )) && continue
+        claude_paths_seen+=("$p")
+        CLAUDE_FLAGS+=(--bind-ro "$p")
+    done
+    # The onboarding file read-only, and a writable ~/.claude isolated from
+    # the real one — which is why the backend needs a writable remap: the
+    # copy lives in the state dir and has to appear at $HOME/.claude.
+    CLAUDE_FLAGS+=(
+        --bind-ro-at "$STATE_DIR/.claude.json" "$HOME/.claude.json"
+        --bind-rw-at "$STATE_DIR/claude" "$HOME/.claude"
+    )
+fi
+
+# The network mode, in the backend's spelling. --unpin-egress maps onto the
+# bwrap backend's own extension, which is not part of the contract.
+NET_MODE=pinned
+if (( SEAL_EGRESS )); then
+    NET_MODE=sealed
+elif (( UNPIN_EGRESS )); then
+    NET_MODE=unpinned
+fi
+
+BACKEND_ARGS=(
+    --workdir "$WORK_DIR"
+    --net "$NET_MODE"
+    --hostname claude-sandbox
+    "${FS_GITCONFIG_FLAGS[@]}"
+    "${FS_CACHE_FLAGS[@]}"
+    "${CLAUDE_FLAGS[@]}"
+)
+for d in "${BIND_RO[@]}"; do
+    BACKEND_ARGS+=(--bind-ro "$d")
+done
+for d in "${BIND_RW[@]}"; do
+    BACKEND_ARGS+=(--bind-rw "$d")
+done
+for i in "${!BIND_RO_AT_SRC[@]}"; do
+    BACKEND_ARGS+=(--bind-ro-at "${BIND_RO_AT_SRC[$i]}" "${BIND_RO_AT_DEST[$i]}")
+done
+for d in "${PREPEND_PATH[@]}"; do
+    BACKEND_ARGS+=(--prepend-path "$d")
+done
+
+# What the backend runs. In --exec mode with an environment file, a shim reads
+# the bound file and execs the real command, so no value is ever an
+# argument. `export "$l"` takes the whole NAME=VALUE word: the value is
+# assigned, never re-parsed as shell syntax, whatever it holds.
+if (( EXEC_MODE )); then
+    TARGET_CMD=("$@")
+    if (( ${#EXEC_ENV_LINES[@]} )); then
+        BACKEND_ARGS+=(--bind-ro-at "$STATE_DIR/exec-env" "$ENV_MOUNT")
+        # shellcheck disable=SC2016  # the shim is a program for the inner bash
+        TARGET_CMD=(
+            /bin/bash -c \
+            'f="$1"; shift; while IFS= read -r l; do [ -n "$l" ] && export "$l"; done < "$f"; exec "$@"' \
+            claude-sandboxed-env "$ENV_MOUNT" "$@"
+        )
+    fi
+else
+    TARGET_CMD=("$CLAUDE_BIN" "$@")
+fi
+
+if (( ! EXEC_MODE )) && (( MINS_LEFT >= 60 )); then
+    printf 'claude-sandboxed: access token expires in %dh%02dm\n' \
+        $(( MINS_LEFT / 60 )) $(( MINS_LEFT % 60 )) >&2
+fi
+if (( EXEC_MODE )); then
+    echo "claude-sandboxed: exec mode: $1 (no Claude credential inside)" >&2
+fi
+if (( ${#EXEC_ENV_LINES[@]} )); then
+    # Names only. A value is a secret, and this goes to a log.
+    echo "claude-sandboxed: environment from $ENV_FILE: ${EXEC_ENV_LINES[*]%%=*}" >&2
+fi
+
+# The backend's exit code is the command's own, so pass it straight back: the
+# layers above use it to decide whether a run failed. stdin is untouched all
+# the way down — a prompt too large for one argv arrives that way.
+set +e
+"$FS_BACKEND_BIN" "${BACKEND_ARGS[@]}" -- "${TARGET_CMD[@]}"
+RC=$?
+set -e
+
+echo "claude-sandboxed: results in $WORK_DIR" >&2
+exit "$RC"

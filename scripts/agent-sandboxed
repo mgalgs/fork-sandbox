@@ -1,0 +1,985 @@
+#!/usr/bin/env bash
+# agent-sandboxed — Run a coding agent in a sealed sandbox against a local model
+#
+# Usage: agent-sandboxed [--harness pi] [--endpoint URL] [--model ID] [--bridge HOST:PORT[=INPORT]]... [--services] [--bind-ro PATH]... [--bind-rw PATH]... [--bind-ro-at SRC DEST]... [--prepend-path DIR]... [work-dir] [agent-args...]
+#
+# This runs the sandbox backend sealed, with a model bridged in. The sandbox
+# has NO network: no internet, no LAN, no DNS. The single exception is one
+# OpenAI-compatible endpoint, reached over a unix socket, so an agent can think
+# without being able to send anything anywhere.
+#
+# That combination is what makes an unsupervised run cheap and safe at the same
+# time. The endpoint is a model you host, so tokens cost nothing; the seal means
+# a session that goes wrong has nowhere to exfiltrate to and no LAN service to
+# reach. Nothing secret is inside either: a local endpoint needs no credential,
+# so unlike a claude or an OpenRouter run there is no key to leak.
+#
+# --harness names the agent. pi (github.com/earendil-works/pi) is the default
+# and the only one today; the name leaves room for another.
+#
+# pi-sandboxed is this same script under another name, and the usual way in for
+# an interactive session: the name says which agent is running, which
+# agent-sandboxed cannot. Invoked that way the harness is pinned, so a
+# --harness naming anything else is refused rather than honored — the name you
+# typed is the instruction.
+#
+# --endpoint is the model's base URL, such as http://your-host:8001/v1. Any
+# OpenAI-compatible server will do — vLLM, llama.cpp, TGI, LM Studio. It
+# defaults to MODEL_ENDPOINT in ~/.config/fork-sandbox/model.env, which is where
+# it belongs: the endpoint is a fact about one machine's network, not about this
+# repository, so a checkout shared between machines must not carry it.
+#
+# --model names the model to use. With no value the endpoint is asked: a server
+# offering exactly one model needs no flag, and its context window is read from
+# the same answer. MODEL_ID in the config file sets a default.
+#
+# --bridge carries one more TCP endpoint into the seal, using the same
+# unix-socket bridge the model endpoint uses: a host-side socat dials the real
+# host, a sandbox-side socat listens on loopback, and the socket between them
+# is bound read-only. Pass it once per endpoint, as HOST:PORT or
+# HOST:PORT=INPORT. INPORT defaults to PORT and must be 1024 or higher: the
+# sandbox's unprivileged uid cannot bind a privileged port, and this script
+# refuses such a value rather than remap it, because the consumer has to know
+# the port it gets. The mapping is printed on stderr when the run starts, so a
+# test suite or client can point at the in-sandbox address.
+#
+# --services stands up this repository's throwaway service stack — postgres,
+# redis, object storage — and binds what its checkout needs to run sealed. It
+# honors the same committed contract fork-sandbox.sh uses: a repo opts in by
+# committing .agents/sandbox-services/ (or the legacy .claude/sandbox-services/)
+# with a compose file, a sandbox-services.sh hook and an optional provision-ro
+# list, so one setup serves both tools. The
+# stack is a compose project of its own with no published ports, reachable only
+# through unix sockets in one bound directory, and torn down when the run ends.
+# It is the one-flag form of what an interactive sealed session used to do by
+# hand: mkdir a sockets dir, run the up hook, bind the sockets and the venv's
+# interpreter, run the down hook. See docs/sandbox-quickstart.md "Level 2".
+#
+# There is one real difference from fork-sandbox.sh: it clones first, and this
+# does not — the work dir is your own checkout. So the hook writes .env.sandbox
+# straight into it (a project that gitignores .env* is unbothered), the
+# untracked paths provision-ro lists are already present so only a uv or pyenv
+# venv's interpreter is bound, and a linked worktree's real gitdir is bound
+# READ-ONLY so git status and log work. Commits cannot be made in a sealed
+# session — a writable gitdir would hand over the real repo's object store and
+# hooks, and there is no fetch-back here anyway; use fork-sandbox.sh for work
+# meant to come back as a branch. Two of the fork-sandbox rules still hold and
+# are the boundary: images are pulled never built, and the hook is copied out
+# before the sandbox starts so a session cannot rewrite the code that tears the
+# stack down. A SIGKILL skips the teardown and leaks the compose project, the
+# same way it leaks the state dir below.
+#
+# --bind-ro, --bind-rw, --bind-ro-at and --prepend-path pass straight through to
+# the sandbox backend. See sandbox-backend-bwrap's header for what each one
+# costs.
+#
+# --no-git-warning drops the warning below about a work dir that is a git
+# checkout. It exists for fork-sandbox.sh, whose work dir is always a throwaway
+# clone that it never runs git in again — there the warning's advice is to use
+# the very script that is asking.
+#
+# Everything after the work dir goes to the agent verbatim, so pi's own flags
+# work: -p "prompt" for a headless run, --thinking high, --skill PATH. With no
+# arguments pi starts its interactive TUI, which is the point of this script —
+# an agent you can watch, poking at a sealed machine, for free.
+#
+# With no work dir one is created under /var/tmp/claude-scratch/forks and
+# printed. The work dir is the only writable path that outlives the run, so it
+# is both the project directory and the results channel.
+#
+# pi's sessions are kept in <work-dir>/.git/pi-sessions when the work dir is a
+# repository, and in <work-dir>/pi-sessions when it is not. pi's own default —
+# ~/.pi/agent/sessions — is a tmpfs here and would die with the run, and the
+# work dir's root would show up untracked in the owner's `git status` and need
+# an ignore rule in every repo this is pointed at. git tracks nothing under
+# .git, so a repository gets them there. The path is printed when the run ends,
+# because nothing else would lead anyone to it. A --session-dir of the caller's
+# own takes precedence over all of this.
+#
+# How the model gets in. A sealed sandbox has loopback and nothing else, and
+# nothing inside can add an interface or a route. So the endpoint arrives as a
+# unix socket instead of a route:
+#
+#   host:    socat UNIX-LISTEN:<state>/sockets/model.sock TCP:<endpoint host>
+#   sandbox: socat TCP-LISTEN:127.0.0.1:<port>            UNIX-CONNECT:<same>
+#
+# The sockets directory is bound READ-ONLY. That is enough, because connect()
+# needs write permission on the socket inode rather than a writable mount — the
+# same property the mount allowlist in sandbox-backend-bwrap is built on. The
+# socket is mode 600 and the sandbox runs as your uid, so nothing else on the
+# host can use the bridge either.
+#
+# The split is by side. This script owns the HOST half: it dials the real TCP
+# endpoint, keeps each socat in a process group of its own, and tears them down
+# when the run ends. The backend owns the SANDBOX half: given a socket that
+# already exists, its --bridge SOCKET=PORT binds the socket's directory in,
+# stands the inner relay up, waits for it, and refuses to start the agent if it
+# never comes.
+#
+# The host half runs outside the sandbox, in this script's process tree, and
+# dies with it. Only the named endpoints are reachable through it: the
+# --endpoint host:port, and the host:ports --bridge names. Anything else those
+# hosts run is not.
+#
+# The backend also arms a watchdog job inside the sandbox, beside the agent,
+# polling each socket a bridge serves. If one vanishes mid-run — the host half
+# killed, or the per-run state dir removed outside the seal — it names the
+# in-sandbox port on stderr, so the agent's opaque connection errors are
+# preceded by the reason.
+#
+# A SIGKILL skips the trap that does that tidying, so it leaves the socat
+# groups running and the per-run state dir behind under
+# /var/tmp/claude-scratch/forks, and — with --services — the compose project
+# up. Nothing left behind
+# holds a secret: the state dir is mode 0700 and carries a socket, the pi
+# config copy and the generated models.json, a local endpoint needs no
+# credential, and the services are a throwaway per-run stack. But a dangling
+# listener to the model host, and a set of leaked containers, are worth knowing
+# about. Any other exit runs the trap and tidies all of it.
+# sandbox-backend-bwrap says the same about its own state dir.
+#
+# pi's configuration is NOT your ~/.pi/agent. That directory holds auth.json and
+# expects a machine this sandbox is not, so it is never mounted. The sandbox gets
+# a copy of this repo's pi-agent/ instead, with a generated
+# models.json naming the bridged endpoint. Being a copy, it cannot be corrupted
+# by a run, and nothing a run changes persists. Grow pi-agent/ to give every
+# sandboxed session the same settings, extensions and skills.
+#
+# What a sealed run gives up: everything that fetches. No npm install, no pip
+# install, no documentation lookup, no git fetch. Whatever the work needs must
+# already be in the work dir or bound in. For a repo that needs its services and
+# its dependencies provisioned, use fork-sandbox.sh --harness pi-local, which
+# does all of that and clones first.
+#
+# This is deliberately NOT blanket-approved in permissions. It forwards
+# --bind-rw and --bind-ro, so approving it would hand any session a bounded
+# host-write and host-read primitive. Launching a sandbox is a deliberate act;
+# one prompt is the right price.
+
+set -euo pipefail
+
+script_dir="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=fork-sandbox-lib.sh
+# shellcheck disable=SC1091  # plain shellcheck cannot follow it; use -x
+source "$script_dir/fork-sandbox-lib.sh"
+
+CONFIG_FILE="${FORK_SANDBOX_CONFIG_DIR:-$HOME/.config/fork-sandbox}/model.env"
+REPO_ROOT="$(dirname "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")")"
+
+# The name this was called by, which is a choice of harness when it names one.
+# Deliberately NOT resolved through the symlink, unlike BASH_SOURCE above: that
+# has to find the real file, because the lib and pi-agent/ live beside it, while
+# this has to see the name the caller actually typed.
+INVOKED_AS="$(basename "$0")"
+HARNESS_PINNED=0
+if [[ "$INVOKED_AS" == "pi-sandboxed" ]]; then
+    HARNESS_PINNED=1
+fi
+
+if [[ "${1-}" == -h || "${1-}" == --help ]]; then
+    # The header names the real script, so under an alias the help would open
+    # by contradicting the name that was typed — which is the one thing the
+    # alias exists to get right. Substitute it where it is the PROGRAM name:
+    # the title line and the usage line. Prose that names agent-sandboxed
+    # deliberately — the sentence about running a different harness — has to
+    # survive as written, so this is not a blanket replace.
+    sed -n '2,/^$/p' "$(readlink -f "${BASH_SOURCE[0]}")" \
+        | sed 's/^# \{0,1\}//' \
+        | sed "1s/^agent-sandboxed/$INVOKED_AS/
+               s/^Usage: agent-sandboxed/Usage: $INVOKED_AS/"
+    exit 0
+fi
+
+# Flags are taken until the first argument this script does not know, which
+# ends its own parsing exactly as claude-sandboxed does — everything from
+# there belongs to the agent. The first bare word before that is the work dir.
+HARNESS="pi"
+ENDPOINT=""
+MODEL=""
+WORK_DIR_ARG=""
+GIT_WARNING=1
+SERVICES=0
+FORWARD_FLAGS=()
+# One entry per --bridge flag: the host to dial, the port to dial, and the
+# port the relay listens on inside the sandbox. The socket path and the host
+# side's process-group PID join here later, once the state dir exists and the
+# socat is started. Declared before the parse loop, which appends to them.
+BRIDGE_HOSTS=()
+BRIDGE_PORTS=()
+BRIDGE_INPORTS=()
+BRIDGE_SOCKETS=()
+BRIDGE_PIDS=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --no-git-warning) GIT_WARNING=0; shift ;;
+        --services) SERVICES=1; shift ;;
+        --harness)
+            HARNESS="${2:?--harness requires a name}"
+            if (( HARNESS_PINNED )) && [[ "$HARNESS" != "pi" ]]; then
+                echo "Error: this is $INVOKED_AS, so the harness is pi. Run" >&2
+                echo "agent-sandboxed --harness $HARNESS for another one." >&2
+                exit 1
+            fi
+            shift 2
+            ;;
+        --endpoint)
+            ENDPOINT="${2:?--endpoint requires a URL}"
+            shift 2
+            ;;
+        --model)
+            MODEL="${2:?--model requires an id}"
+            shift 2
+            ;;
+        --bridge)
+            # HOST:PORT or HOST:PORT=INPORT, validated here at parse time, so a
+            # bad value is refused before the endpoint probe and before
+            # anything is created.
+            bridge_val="${2:?--bridge requires HOST:PORT[=INPORT]}"
+            if [[ "$bridge_val" == *=* ]]; then
+                bridge_inport="${bridge_val#*=}"
+                bridge_hostport="${bridge_val%%=*}"
+            else
+                bridge_inport=""
+                bridge_hostport="$bridge_val"
+            fi
+            if [[ "$bridge_hostport" != *:* ]]; then
+                echo "Error: --bridge '$bridge_val' has no port. The form is" >&2
+                echo "HOST:PORT or HOST:PORT=INPORT." >&2
+                exit 1
+            fi
+            if [[ "${bridge_hostport#*:}" == *:* ]]; then
+                echo "Error: --bridge '$bridge_val' names an IPv6 literal, which" >&2
+                echo "this script cannot split into a host and a port. Use a" >&2
+                echo "hostname." >&2
+                exit 1
+            fi
+            bridge_host="${bridge_hostport%%:*}"
+            bridge_port="${bridge_hostport##*:}"
+            if [[ -z "$bridge_host" ]]; then
+                echo "Error: --bridge '$bridge_val' names no host." >&2
+                exit 1
+            fi
+            # A plain decimal: no leading zero (arithmetic would read one as
+            # octal), no zero, at most five digits (the range check below then
+            # bounds it at 65535).
+            if [[ ! "$bridge_port" =~ ^[1-9][0-9]{0,4}$ ]] \
+                    || (( bridge_port > 65535 )); then
+                echo "Error: --bridge '$bridge_val' has a port that is not a" >&2
+                echo "number from 1 to 65535." >&2
+                exit 1
+            fi
+            if [[ -n "$bridge_inport" ]] && { \
+                    [[ ! "$bridge_inport" =~ ^[1-9][0-9]{0,4}$ ]] \
+                    || (( bridge_inport > 65535 )); }; then
+                echo "Error: --bridge '$bridge_val' has an INPORT that is not a" >&2
+                echo "number from 1 to 65535." >&2
+                exit 1
+            fi
+            if [[ -z "$bridge_inport" ]]; then
+                bridge_inport="$bridge_port"
+            fi
+            # The in-sandbox relay binds INPORT as an unprivileged uid, so a
+            # privileged port cannot be bound there. Refuse it rather than
+            # remap it: the consumer must know the port it is dialing, so a
+            # silent remap would leave it pointing at nothing.
+            if (( bridge_inport < 1024 )); then
+                echo "Error: --bridge '$bridge_val' would listen on port" >&2
+                echo "$bridge_inport inside the sandbox, which its unprivileged" >&2
+                echo "uid cannot bind. Pass an explicit =INPORT of 1024 or more." >&2
+                exit 1
+            fi
+            # The values land in the host-side socat command, and the INPORT
+            # also in the generated shim. Refuse the characters that would
+            # break a generated script, as the values above are refused.
+            fs_reject_unsafe_chars "$bridge_host" "$bridge_port" "$bridge_inport" \
+                || exit 1
+            BRIDGE_HOSTS+=("$bridge_host")
+            BRIDGE_PORTS+=("$bridge_port")
+            BRIDGE_INPORTS+=("$bridge_inport")
+            shift 2
+            ;;
+        --bind-ro|--bind-rw|--prepend-path)
+            FORWARD_FLAGS+=("$1" "${2:?$1 requires a path}")
+            shift 2
+            ;;
+        --bind-ro-at)
+            FORWARD_FLAGS+=("$1" "${2:?--bind-ro-at requires a source path}" \
+                            "${3:?--bind-ro-at requires a destination path}")
+            shift 3
+            ;;
+        # claude-sandboxed's own flags, named here only to refuse them. Every
+        # unrecognized flag otherwise becomes an argument for the agent, and
+        # these four would do that silently — taking the work dir with them,
+        # because parsing stops before it is read. They cannot be honored: two
+        # of them contradict the seal this script exists to apply, and the
+        # other two belong to a wrapper this script no longer goes through.
+        --unpin-egress|--allow-tunnels|--seal-egress|--exec|--env-file)
+            echo "Error: '$1' is a claude-sandboxed flag, and this script is not" >&2
+            echo "claude-sandboxed — it calls the sandbox backend itself. The" >&2
+            echo "sandbox is always sealed, and the agent is always the command," >&2
+            echo "so nothing here can change either. Pass --bind-ro, --bind-rw," >&2
+            echo "--bind-ro-at or --prepend-path, which do reach the backend." >&2
+            exit 1
+            ;;
+        -*) break ;;
+        *)
+            [[ -n "$WORK_DIR_ARG" ]] && break
+            WORK_DIR_ARG="$1"
+            shift
+            ;;
+    esac
+done
+
+if [[ "$HARNESS" != "pi" ]]; then
+    echo "Error: --harness '$HARNESS' is not a harness here. Only pi is, for" >&2
+    echo "now: it points at a custom OpenAI-compatible endpoint with a config" >&2
+    echo "file, which is what a bridged local model needs." >&2
+    exit 1
+fi
+
+# The config file is not a secret — an endpoint is not a credential — so there
+# is no mode check here. It is parsed rather than sourced, so a stray shell
+# construct in it cannot run.
+cfg_endpoint=""
+cfg_model=""
+if [[ -f "$CONFIG_FILE" ]]; then
+    while IFS= read -r cfg_line || [[ -n "$cfg_line" ]]; do
+        cfg_line="${cfg_line#"${cfg_line%%[![:space:]]*}"}"
+        cfg_line="${cfg_line%"${cfg_line##*[![:space:]]}"}"
+        [[ -z "$cfg_line" || "$cfg_line" == \#* ]] && continue
+        if [[ "$cfg_line" != *=* ]]; then
+            echo "Error: $CONFIG_FILE has a line that is not NAME=VALUE:" >&2
+            echo "  $cfg_line" >&2
+            exit 1
+        fi
+        cfg_key="${cfg_line%%=*}"
+        cfg_val="${cfg_line#*=}"
+        # Accept a quoted value, which is what anyone who has written a .env
+        # before will type, and which parsing rather than sourcing would
+        # otherwise keep as part of the URL.
+        if [[ "$cfg_val" == \"*\" || "$cfg_val" == \'*\' ]]; then
+            cfg_val="${cfg_val:1:${#cfg_val}-2}"
+        fi
+        case "$cfg_key" in
+            # VLLM_* are the older spelling of the same two keys, from when
+            # vLLM was the only server this had been run against. Still
+            # accepted, because a config file outlives a rename.
+            MODEL_ENDPOINT|VLLM_ENDPOINT) cfg_endpoint="$cfg_val" ;;
+            MODEL_ID|VLLM_MODEL) cfg_model="$cfg_val" ;;
+            *)
+                echo "Warning: $CONFIG_FILE names an unknown key '$cfg_key';" >&2
+                echo "ignoring it. This file takes MODEL_ENDPOINT and MODEL_ID." >&2
+                ;;
+        esac
+    done < "$CONFIG_FILE"
+fi
+[[ -n "$ENDPOINT" ]] || ENDPOINT="$cfg_endpoint"
+[[ -n "$MODEL" ]] || MODEL="$cfg_model"
+
+if [[ -z "$ENDPOINT" ]]; then
+    echo "Error: no model endpoint. The endpoint is a fact about this machine's" >&2
+    echo "network, so it lives in a config file rather than in the repo:" >&2
+    echo "  mkdir -p $(dirname "$CONFIG_FILE")" >&2
+    echo "  echo 'MODEL_ENDPOINT=http://your-host:8001/v1' > $CONFIG_FILE" >&2
+    echo "Or pass --endpoint URL for a one-off." >&2
+    exit 1
+fi
+
+ENDPOINT="${ENDPOINT%/}"
+if [[ "$ENDPOINT" == https://* ]]; then
+    echo "Error: --endpoint '$ENDPOINT' is https, which this bridge cannot" >&2
+    echo "carry yet. The agent connects to 127.0.0.1 inside the sandbox, so a" >&2
+    echo "certificate for the real host would fail verification there." >&2
+    echo "Terminating TLS in the host-side socat is the fix, and is not built." >&2
+    echo "Use the endpoint's http address." >&2
+    exit 1
+fi
+if [[ "$ENDPOINT" != http://* ]]; then
+    echo "Error: --endpoint '$ENDPOINT' must be an http:// URL." >&2
+    exit 1
+fi
+
+# Split the URL into the parts the two halves of the bridge need: a host and
+# port to dial from the host, and a path prefix to keep in the base URL the
+# agent is given.
+ep_rest="${ENDPOINT#http://}"
+ep_hostport="${ep_rest%%/*}"
+EP_PREFIX=""
+[[ "$ep_rest" == */* ]] && EP_PREFIX="/${ep_rest#*/}"
+if [[ "$ep_hostport" == \[* ]]; then
+    echo "Error: --endpoint '$ENDPOINT' names an IPv6 literal, which this" >&2
+    echo "script does not split correctly yet. Use a hostname." >&2
+    exit 1
+fi
+EP_HOST="${ep_hostport%%:*}"
+if [[ "$ep_hostport" == *:* ]]; then
+    EP_PORT="${ep_hostport##*:}"
+else
+    EP_PORT=80
+fi
+if [[ ! "$EP_PORT" =~ ^[0-9]+$ ]] || [[ -z "$EP_HOST" ]]; then
+    echo "Error: cannot read a host and port out of '$ENDPOINT'." >&2
+    exit 1
+fi
+
+# The port the bridge listens on inside the sandbox. Keeping the endpoint's own
+# port makes the two halves easy to match up when reading a log; a privileged
+# port cannot be bound by the sandbox's unprivileged uid, so those move.
+IN_PORT="$EP_PORT"
+if (( IN_PORT < 1024 )); then
+    IN_PORT=8318
+fi
+
+# Two relays cannot share one in-sandbox port, and the backend refuses that
+# outright. Catch the overlap here as well, because only this script knows
+# which --bridge flag caused it and which port the model took; the backend
+# sees sockets and numbers. Refuse an overlap with the model's port or with
+# another bridge.
+for i in "${!BRIDGE_INPORTS[@]}"; do
+    if [[ "${BRIDGE_INPORTS[$i]}" == "$IN_PORT" ]]; then
+        echo "Error: --bridge ${BRIDGE_HOSTS[$i]}:${BRIDGE_PORTS[$i]} wants" >&2
+        echo "in-sandbox port $IN_PORT, where the model bridge listens. Give" >&2
+        echo "it another =INPORT." >&2
+        exit 1
+    fi
+done
+bridge_inport_seen=""
+for i in "${!BRIDGE_INPORTS[@]}"; do
+    for p in $bridge_inport_seen; do
+        if [[ "${BRIDGE_INPORTS[$i]}" == "$p" ]]; then
+            echo "Error: two --bridge flags want in-sandbox port $p. Give one" >&2
+            echo "of them another =INPORT." >&2
+            exit 1
+        fi
+    done
+    bridge_inport_seen+=" ${BRIDGE_INPORTS[$i]}"
+done
+
+# Ask the endpoint what it serves. This doubles as the reachability check: a
+# down endpoint, or a VPN that is not up, fails here in one line instead of
+# inside the agent as a connection error minutes later.
+if ! probe="$(curl -sS --max-time 10 "$ENDPOINT/models" 2>&1)"; then
+    echo "Error: cannot reach $ENDPOINT/models" >&2
+    echo "  $probe" >&2
+    echo "The endpoint may be down, or its network may need a VPN that is not up." >&2
+    exit 1
+fi
+if ! probe_ids="$(jq -r '.data[].id' <<<"$probe" 2>/dev/null)" || [[ -z "$probe_ids" ]]; then
+    echo "Error: $ENDPOINT/models did not answer with a model list." >&2
+    echo "It answered:" >&2
+    printf '%s\n' "${probe:0:400}" >&2
+    exit 1
+fi
+
+if [[ -z "$MODEL" ]]; then
+    if (( $(printf '%s\n' "$probe_ids" | wc -l) > 1 )); then
+        echo "Error: $ENDPOINT serves more than one model, so one has to be named." >&2
+        echo "Pass --model, or set MODEL_ID in $CONFIG_FILE. It offers:" >&2
+        while IFS= read -r probe_id; do echo "  $probe_id" >&2; done <<<"$probe_ids"
+        exit 1
+    fi
+    MODEL="$probe_ids"
+elif ! printf '%s\n' "$probe_ids" | grep -qxF "$MODEL"; then
+    echo "Warning: $ENDPOINT does not list a model called '$MODEL'. Trying it" >&2
+    echo "anyway; the endpoint may serve more than it advertises." >&2
+fi
+
+# The context window comes from the endpoint when it says, because a wrong one
+# is worse than a conservative one: too large and the agent packs a context the
+# server rejects, with the failure arriving mid-run.
+CTX="$(jq -r --arg m "$MODEL" \
+    'first(.data[] | select(.id == $m) | .max_model_len // empty) // empty' \
+    <<<"$probe" 2>/dev/null || true)"
+if [[ ! "$CTX" =~ ^[0-9]+$ ]]; then
+    # Small on purpose. Only vLLM reports max_model_len here; llama.cpp, Ollama
+    # and LM Studio do not, so this is the ordinary path for those and a guess
+    # has to be made. Guess low: too small only wastes context, while too large
+    # means the agent packs a request the server rejects, and that failure
+    # arrives mid-run with the work half done.
+    CTX=32768
+    echo "Warning: $ENDPOINT does not report a context length for '$MODEL', so" >&2
+    echo "this run assumes $CTX tokens. A server that reports max_model_len in" >&2
+    echo "/v1/models — vLLM does — is used at its real size instead." >&2
+fi
+# Declare the window as the endpoint reports it, with no safety margin held
+# back. Overflow and compaction are pi's job to handle against the real
+# window; declaring less was tried and did not change when compaction ran
+# (pi 0.53), and it costs reply room -- MAX_TOKENS is derived from CTX just
+# below, so shrinking CTX trades a context-length failure for a stop=length
+# truncation.
+
+# Room for the reply. Every token reserved here is one the prompt cannot
+# use, but the floor is set by the harness's failure mode, not by typical
+# replies: a headless pi run that hits stop=length simply ends, losing all
+# uncommitted work, and Qwen thinking turns composing a whole file have
+# been measured blowing straight through 16384. 32768 of a 131072 window
+# still leaves ~98k for the prompt. The quarter-of-the-window fraction
+# still applies below this cap, which the small-window fallback assumes.
+MAX_TOKENS=32768
+if (( CTX / 4 < MAX_TOKENS )); then
+    MAX_TOKENS=$(( CTX / 4 ))
+fi
+
+# The host half of every bridge is socat under setsid: setsid gives it a
+# process group of its own, which is what lets the trap take its per-connection
+# children down with it. The backend checks socat again for the sandbox half,
+# which runs out of the host's /usr; this check is for the half that runs here.
+# Check for both before anything is created.
+for tool in socat setsid; do
+    if ! command -v "$tool" >/dev/null; then
+        echo "Error: $tool not found, and the model bridge is built from it." >&2
+        echo "On Arch: pacman -S $( [[ "$tool" == socat ]] && echo socat || echo util-linux )" >&2
+        exit 1
+    fi
+done
+
+fs_resolve_pi || exit 1
+
+# The sandbox backend has to exist before anything is created: a missing one
+# after the clone, the sockets and the compose stack would waste all of it.
+fs_resolve_backend "$script_dir" || exit 1
+
+# The work dir is the only path that persists. Default to a fresh one under the
+# scratch root, as claude-sandboxed does, so a run with no arguments still has
+# somewhere to leave its results.
+mkdir -p /var/tmp/claude-scratch/forks
+if [[ -n "$WORK_DIR_ARG" ]]; then
+    mkdir -p "$WORK_DIR_ARG"
+    WORK_DIR="$(realpath "$WORK_DIR_ARG")"
+else
+    WORK_DIR="$(mktemp -d /var/tmp/claude-scratch/forks/agent-sandbox.XXXXXX)"
+fi
+
+# Every path below ends up inside a generated shell script, and printf %q is
+# what keeps it safe there. A newline would still break the file's shape, so
+# refuse the characters that do not survive the trip.
+fs_reject_unsafe_chars "$WORK_DIR" "$FS_PI_NODE" "$FS_PI_REAL" "$FS_PI_ROOT" \
+    "$FS_PI_BIN_DIR" "$MODEL" "$EP_HOST" "$EP_PREFIX" || exit 1
+
+# A writable .git is host code execution: a hook, or a config key such as
+# core.fsmonitor, runs on the HOST the next time anyone uses git in there. The
+# sandbox contains the session, so this is a risk to the person at the keyboard
+# rather than to the sandbox, and it is a risk worth naming out loud.
+if (( GIT_WARNING )) && [[ -e "$WORK_DIR/.git" ]]; then
+    echo "agent-sandboxed: WARNING: $WORK_DIR is a git checkout, and the sandbox" >&2
+    echo "agent-sandboxed: can write .git/ — a planted hook or config key would run" >&2
+    echo "agent-sandboxed: on the HOST the next time git runs there. For work you do" >&2
+    echo "agent-sandboxed: not intend to watch, use fork-sandbox.sh, which clones first." >&2
+fi
+
+# Per-run state on the host: the socket the bridge listens on, the pi config
+# copy, and the shim. Removed on exit.
+STATE_DIR="$(mktemp -d /var/tmp/claude-scratch/forks/agent-sandboxed.XXXXXX)"
+chmod 700 "$STATE_DIR"
+fs_reject_unsafe_chars "$STATE_DIR" || exit 1
+SOCKETS_DIR="$STATE_DIR/sockets"
+SOCK="$SOCKETS_DIR/model.sock"
+# One socket per bridge, named by index: the state dir is unique per run, so
+# the index cannot collide, and no part of a user-supplied name needs to be
+# sanitized for the sockets dir to be safe.
+for i in "${!BRIDGE_HOSTS[@]}"; do
+    BRIDGE_SOCKETS+=("$SOCKETS_DIR/bridge-$((i + 1)).sock")
+done
+mkdir -p "$SOCKETS_DIR"
+
+SOCAT_PID=""
+# Set by the --services block below when a compose stack is stood up, and read
+# by cleanup(). Declared here, empty, so the trap can reference them under
+# `set -u` even for an early exit that never reaches that block.
+SERVICES_SCRIPT=""
+SERVICES_PROJECT=""
+# shellcheck disable=SC2329  # invoked by the EXIT trap below
+cleanup() {
+    set +e
+    if [[ -n "$SERVICES_SCRIPT" ]]; then
+        # Tear the per-run services down first: the hook copy lives under
+        # STATE_DIR, which this function removes at the end. `down` sweeps by
+        # the compose-project label, so it needs neither the sockets dir nor the
+        # work dir — which is why a copy taken before the sandbox ran can still
+        # do it. timeout because this is the EXIT trap: a wedged docker daemon
+        # must not hang the session forever.
+        timeout 120 "$SERVICES_SCRIPT" down "$SERVICES_PROJECT" >&2 || true
+    fi
+    if [[ -n "$SOCAT_PID" ]]; then
+        # Kill the GROUP, not just the listener. A ,fork listener answers each
+        # connection with a child of its own, and those are separate processes
+        # holding their own TCP connection to the model host — signalling only
+        # the leader would leave one behind whenever a run is killed with a
+        # request in flight. setsid below made this process group.
+        kill -- -"$SOCAT_PID" 2>/dev/null || kill "$SOCAT_PID" 2>/dev/null
+        wait "$SOCAT_PID" 2>/dev/null
+    fi
+    # Each --bridge host side is its own process group, for the same reason.
+    # Empty when no bridge was passed, so the loop is a no-op there.
+    if (( ${#BRIDGE_PIDS[@]} )); then
+        for pid in "${BRIDGE_PIDS[@]}"; do
+            kill -- -"$pid" 2>/dev/null || kill "$pid" 2>/dev/null
+            wait "$pid" 2>/dev/null
+        done
+    fi
+    rm -rf "$STATE_DIR"
+}
+trap cleanup EXIT
+
+# pi's configuration for the sandbox: a copy of the repo's pi-agent/, never the
+# user's own ~/.pi/agent. A copy, so a run cannot corrupt the master and nothing
+# a run writes persists.
+mkdir -p "$STATE_DIR/pi-agent"
+if [[ -d "$REPO_ROOT/pi-agent" ]]; then
+    cp -a "$REPO_ROOT/pi-agent/." "$STATE_DIR/pi-agent/"
+else
+    echo "Warning: $REPO_ROOT/pi-agent does not exist, so the sandbox gets a" >&2
+    echo "bare pi configuration. Only the generated model registration." >&2
+fi
+
+# Register the bridged endpoint as a provider pi can select. The base URL names
+# loopback inside the sandbox, which is where the inner half of the bridge
+# listens. The key is required by the API shape and ignored by the server.
+#
+# compat, both halves earned: max_tokens because a local server implements the
+# older field rather than max_completion_tokens, and the qwen thinking format
+# because that is how enable_thinking is carried. reasoning is declared true so
+# the thinking dial is available; no default level is set here, so --thinking
+# and Shift+Tab decide, and pi-agent/settings.json can settle it later.
+jq -n \
+    --arg base "http://127.0.0.1:$IN_PORT$EP_PREFIX" \
+    --arg model "$MODEL" \
+    --argjson ctx "$CTX" \
+    --argjson maxtok "$MAX_TOKENS" \
+    '{
+        providers: {
+            local: {
+                baseUrl: $base,
+                api: "openai-completions",
+                apiKey: "sandbox",
+                models: [{
+                    id: $model,
+                    name: ($model + " (local)"),
+                    reasoning: true,
+                    input: ["text"],
+                    contextWindow: $ctx,
+                    maxTokens: $maxtok,
+                    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+                    compat: {
+                        maxTokensField: "max_tokens",
+                        thinkingFormat: "qwen",
+                    },
+                }],
+            },
+        },
+    }' > "$STATE_DIR/pi-agent/models.json"
+
+# Point pi at that provider by default, keeping whatever else pi-agent/ sets.
+# Only the run knows which model the endpoint serves, so these two keys are
+# generated and everything else in the file is the repo's.
+settings_base='{}'
+if [[ -f "$STATE_DIR/pi-agent/settings.json" ]]; then
+    settings_base="$(cat "$STATE_DIR/pi-agent/settings.json")"
+fi
+if ! jq -n --argjson base "$settings_base" --arg model "$MODEL" \
+    '$base * { defaultProvider: "local", defaultModel: $model }' \
+    > "$STATE_DIR/pi-agent/settings.json.new"; then
+    echo "Error: pi-agent/settings.json is not valid JSON, so the generated" >&2
+    echo "model defaults cannot be merged into it. Fix that file." >&2
+    exit 1
+fi
+mv "$STATE_DIR/pi-agent/settings.json.new" "$STATE_DIR/pi-agent/settings.json"
+
+# pi keeps its sessions in ~/.pi/agent/sessions by default, and $HOME in the
+# sandbox is a tmpfs that dies with the run, so they have to go somewhere that
+# persists. The work dir is the only such path — but its root is the wrong place
+# in a repository: it shows up as untracked in every `git status` the owner
+# reads, it would need an ignore rule in every repo this is ever pointed at, and
+# an agent running `git add -A` could commit it. .git is writable and git tracks
+# nothing inside it, so a repository gets them there instead. fork-sandbox.sh
+# does the same, for the same reasons.
+#
+# A linked worktree or a submodule has .git as a FILE, naming a directory
+# outside the work dir that the sandbox cannot write. Those fall back to the
+# work-dir root, where the transcript is untracked and visible — the only
+# writable place there is.
+# Both spellings count as the caller having chosen: --session-dir PATH and
+# --session-dir=PATH. Matching only the first would emit the generated flag
+# too, and pi taking the last occurrence is the only reason that would be
+# harmless rather than wrong.
+SESSION_DIR=""
+session_flags=()
+if ! printf '%s\0' "$@" | grep -qzE -- '^--session-dir(=|$)'; then
+    if [[ -d "$WORK_DIR/.git" ]]; then
+        SESSION_DIR="$WORK_DIR/.git/pi-sessions"
+    else
+        SESSION_DIR="$WORK_DIR/pi-sessions"
+    fi
+    session_flags=(--session-dir "$SESSION_DIR")
+fi
+
+# The in-sandbox shim: put the pi config where pi looks for it, then become pi.
+# Values are baked in with %q, so no path or model name can break out of the
+# script, and nothing has to be passed through an environment the sandbox
+# strips anyway. The relays, their readiness waits and the vanish watchdog used
+# to live here too; they are the backend's --bridge now, and it runs this shim
+# only after every listener is up.
+#
+# The copy is what makes ~/.pi/agent writable: pi rewrites settings.json when a
+# setting changes in the TUI, and a read-only bind would fail that write.
+# shellcheck disable=SC2016  # every printf below writes a program for the
+# sandbox's own bash, so $HOME must reach the file unexpanded
+{
+    printf '#!/bin/bash\n'
+    printf '# Generated by agent-sandboxed. Runs INSIDE the sealed sandbox.\n'
+    printf 'set -e\n'
+    printf 'mkdir -p "$HOME/.pi"\n'
+    printf 'cp -a %q "$HOME/.pi/agent"\n' "$STATE_DIR/pi-agent"
+    printf 'exec %q %q --provider local --model %q' \
+        "$FS_PI_NODE" "$FS_PI_REAL" "$MODEL"
+    for f in "${session_flags[@]-}"; do
+        [[ -n "$f" ]] && printf ' %q' "$f"
+    done
+    printf ' "$@"\n'
+} > "$STATE_DIR/shim.sh"
+chmod 755 "$STATE_DIR/shim.sh"
+
+# --services: stand up this repo's throwaway service stack and bind what its
+# checkout needs to run sealed. See the header. Everything here is host-side
+# preparation, done before the sandbox starts. EXTRA_BIND_FLAGS collects the
+# --bind flags this adds; SERVICES_SOCKETS_BIND names the sockets dir to bind
+# read-only, set only when the stack actually came up.
+EXTRA_BIND_FLAGS=()
+SERVICES_SOCKETS_BIND=""
+if (( SERVICES )); then
+    services_hook_dir="$(fs_services_dir "$WORK_DIR")"
+    if [[ ! -d "$services_hook_dir" ]]; then
+        echo "Error: --services needs a sandbox-services contract, which this" >&2
+        echo "repo does not have: neither .agents/sandbox-services/ nor the" >&2
+        echo "legacy .claude/sandbox-services/ exists. That directory is how a" >&2
+        echo "repo opts in — a compose file plus a sandbox-services.sh hook." >&2
+        echo "See docs/sandbox-quickstart.md 'Level 2'. Drop --services to run" >&2
+        echo "without services." >&2
+        exit 1
+    fi
+
+    # The untracked-path binds. For a real checkout only a uv/pyenv venv's
+    # interpreter is missing (it lives outside the tree); everything else
+    # provision-ro names is already present. Fills FS_PROVISION_RO_FLAGS.
+    fs_workdir_venv_binds "$WORK_DIR"
+    if (( ${#FS_PROVISION_RO_FLAGS[@]} )); then
+        EXTRA_BIND_FLAGS+=("${FS_PROVISION_RO_FLAGS[@]}")
+    fi
+
+    # A linked worktree keeps .git as a FILE naming a gitdir outside the work
+    # dir, so git in the sandbox fails with "not a git repository" until that
+    # tree is bound. Bind the common gitdir READ-ONLY: enough for status and
+    # log, and read-only on purpose — a writable one would hand the sandbox the
+    # real repo's object store and hook dir. The main worktree keeps .git as a
+    # directory inside the writable work dir and needs nothing.
+    if [[ -f "$WORK_DIR/.git" ]]; then
+        git_common="$(cd "$WORK_DIR" && git rev-parse --git-common-dir 2>/dev/null || true)"
+        # rev-parse may answer with a path relative to the work dir; resolve it.
+        if [[ -n "$git_common" ]]; then
+            git_common="$(cd "$WORK_DIR" && cd "$git_common" 2>/dev/null && pwd || true)"
+        fi
+        if [[ -n "$git_common" && -d "$git_common" ]]; then
+            fs_reject_unsafe_chars "$git_common" || exit 1
+            EXTRA_BIND_FLAGS+=(--bind-ro "$git_common")
+            echo "agent-sandboxed: $WORK_DIR is a linked worktree; binding its main" >&2
+            echo "agent-sandboxed: gitdir read-only ($git_common) so git works. Commits" >&2
+            echo "agent-sandboxed: cannot be made here — use fork-sandbox.sh for that." >&2
+        else
+            echo "Warning: $WORK_DIR looks like a linked worktree but its main gitdir" >&2
+            echo "could not be resolved, so git may not work in the sandbox." >&2
+        fi
+    fi
+
+    # The compose stack is optional within --services: the binds above stand on
+    # their own. This mirrors fork-sandbox.sh, where the provisioning half of
+    # the contract runs even when the compose hook or docker is absent.
+    if [[ -f "$services_hook_dir/sandbox-services.sh" ]]; then
+        if ! command -v docker >/dev/null; then
+            echo "Warning: $services_hook_dir has a services hook but docker is not" >&2
+            echo "on PATH; running without the compose stack." >&2
+        elif grep -rqE '^[[:space:]]*build[[:space:]]*:' "$services_hook_dir" \
+                --include='*.yml' --include='*.yaml' 2>/dev/null; then
+            echo "Warning: the services compose has a 'build:' key, so the stack is" >&2
+            echo "NOT started. Images must be pulled, never built: a build runs" >&2
+            echo "Dockerfile steps from the checkout on the host, outside the sandbox" >&2
+            echo "and outside the seal. See docs/sandbox-quickstart.md." >&2
+        else
+            # Copy the hook out before the sandbox can touch it, and run both up
+            # and down from the copy. The work dir is bound writable, so a
+            # session could otherwise rewrite the teardown code that runs on the
+            # host after it exits.
+            mkdir -p "$STATE_DIR/services/hook"
+            cp -a "$services_hook_dir/." "$STATE_DIR/services/hook/"
+            SERVICES_SCRIPT="$STATE_DIR/services/hook/sandbox-services.sh"
+            chmod +x "$SERVICES_SCRIPT" 2>/dev/null || true
+            services_sockets="$STATE_DIR/services/sockets"
+            mkdir -p "$services_sockets"
+            # A compose project name: lowercase alphanumerics and hyphens.
+            # Derive it from the state dir basename, which mktemp already made
+            # unique, and add a checksum of the un-folded name: lowercasing
+            # mktemp's mixed case could otherwise fold two concurrent runs to one
+            # project, and one run's teardown would remove the other's containers.
+            svc_base="$(basename "$STATE_DIR")"
+            SERVICES_PROJECT="${svc_base,,}"
+            SERVICES_PROJECT="${SERVICES_PROJECT//[^a-z0-9-]/-}"
+            SERVICES_PROJECT="$SERVICES_PROJECT-$(printf '%s' "$svc_base" | cksum | cut -d' ' -f1)"
+            fs_reject_unsafe_chars "$services_sockets" "$SERVICES_SCRIPT" \
+                "$SERVICES_PROJECT" || exit 1
+
+            echo "agent-sandboxed: starting per-run services ($SERVICES_PROJECT)..." >&2
+            # The teardown trap is already armed (SERVICES_SCRIPT is set), so a
+            # partial `up` is still swept on exit. A services failure is a
+            # warning, not fatal: the session runs, it just cannot reach them.
+            if "$SERVICES_SCRIPT" up "$services_sockets" "$WORK_DIR" \
+                    "$SERVICES_PROJECT" >&2; then
+                SERVICES_SOCKETS_BIND="$services_sockets"
+                echo "agent-sandboxed: services up. Env file: $WORK_DIR/.env.sandbox" >&2
+                echo "agent-sandboxed: sockets (bound read-only, same path inside):" >&2
+                echo "agent-sandboxed:   $services_sockets" >&2
+                echo "agent-sandboxed: a TCP-only client needs a relay first, in the session:" >&2
+                echo "agent-sandboxed:   socat TCP-LISTEN:PORT,fork,bind=127.0.0.1 UNIX:$services_sockets/NAME.sock &" >&2
+            else
+                echo "Warning: services failed to start (output above). The session" >&2
+                echo "runs without them; teardown still runs on exit." >&2
+            fi
+        fi
+    fi
+fi
+
+# The host half of the bridge. It runs out here, in the host's network
+# namespace, which is the only place the endpoints are reachable from —
+# including when the route to one is a tunnel the sandbox is not allowed to
+# see. The model half carries the one --endpoint host:port, and each --bridge
+# below carries one more. mode 600 on the socket keeps each bridge to this
+# uid.
+# setsid puts each in a process group of its own, so the trap can take its
+# per-connection children with it. $! is then the group leader.
+setsid socat "UNIX-LISTEN:$SOCK,fork,mode=600" "TCP:$EP_HOST:$EP_PORT" &
+SOCAT_PID=$!
+
+for _ in $(seq 1 25); do
+    [[ -S "$SOCK" ]] && break
+    sleep 0.1
+done
+if [[ ! -S "$SOCK" ]]; then
+    echo "Error: the host side of the bridge did not create $SOCK." >&2
+    exit 1
+fi
+
+# The host half of each --bridge, for the same reason and with the same group
+# handling. Each PID is collected as it starts, so a failure partway still
+# leaves every earlier group to the trap. Each listener is waited for the same
+# way, so a socat that cannot start fails here, in one line, rather than
+# inside the run as connection errors.
+for i in "${!BRIDGE_HOSTS[@]}"; do
+    setsid socat "UNIX-LISTEN:${BRIDGE_SOCKETS[$i]},fork,mode=600" \
+        "TCP:${BRIDGE_HOSTS[$i]}:${BRIDGE_PORTS[$i]}" &
+    BRIDGE_PIDS+=("$!")
+    for _ in $(seq 1 25); do
+        [[ -S "${BRIDGE_SOCKETS[$i]}" ]] && break
+        sleep 0.1
+    done
+    if [[ ! -S "${BRIDGE_SOCKETS[$i]}" ]]; then
+        echo "Error: the host side of the bridge to ${BRIDGE_HOSTS[$i]}:" >&2
+        echo "${BRIDGE_PORTS[$i]} did not create ${BRIDGE_SOCKETS[$i]}." >&2
+        exit 1
+    fi
+done
+
+echo "agent-sandboxed: $HARNESS against $MODEL at $ENDPOINT (${CTX} token context)" >&2
+if (( ${#BRIDGE_HOSTS[@]} )); then
+    # A bridge consumer dials the in-sandbox address, so the mapping is
+    # printed at start, where the model line is, not only in a log.
+    for i in "${!BRIDGE_HOSTS[@]}"; do
+        echo "agent-sandboxed: bridge: ${BRIDGE_HOSTS[$i]}:${BRIDGE_PORTS[$i]}" \
+            "-> 127.0.0.1:${BRIDGE_INPORTS[$i]} inside" >&2
+    done
+fi
+if (( ${#BRIDGE_HOSTS[@]} )) && [[ -n "$SERVICES_SOCKETS_BIND" ]]; then
+    echo "agent-sandboxed: the model, the per-run services and the bridges are" >&2
+    echo "agent-sandboxed: the only things reachable; no credential is inside" >&2
+elif (( ${#BRIDGE_HOSTS[@]} )); then
+    echo "agent-sandboxed: the model and the bridges are the only things" >&2
+    echo "agent-sandboxed: reachable; no credential is inside" >&2
+elif [[ -n "$SERVICES_SOCKETS_BIND" ]]; then
+    echo "agent-sandboxed: the model and the per-run services are the only things" >&2
+    echo "agent-sandboxed: reachable, both over unix sockets; no credential is inside" >&2
+else
+    echo "agent-sandboxed: the model is the only thing reachable; no credential is inside" >&2
+fi
+
+# The git identity and the host caches, as backend flags. Both fill arrays the
+# assembly below splices in; the gitconfig copy lands in the state dir, which
+# the trap removes.
+fs_gitconfig_bind "$STATE_DIR"
+fs_cache_binds
+
+# The backend's options come first and the command last, with '--' between
+# them, so the agent's own arguments can start with '-' without being read as
+# flags here. The hostname says which wrapper built the box, so a prompt inside
+# a sealed pi session does not claim to be a claude sandbox.
+sandbox_cmd=(
+    "$FS_BACKEND_BIN"
+    --net sealed
+    --workdir "$WORK_DIR"
+    --hostname agent-sandbox
+)
+# pi's own node goes on PATH FIRST, which puts it LAST in lookup order among
+# the prepended directories: the backend prepends each one in turn, so the
+# last flag ends up leftmost. That ordering is the point. A caller's own
+# --prepend-path — a project's pinned .nvmrc node, when fork-sandbox.sh
+# provisions one — arrives in FORWARD_FLAGS below and must beat pi's node, or
+# the project's node_modules meets an interpreter of the wrong major version and
+# its compiled extensions stop loading. In a sealed sandbox nothing can be
+# rebuilt, so that would end the run.
+sandbox_cmd+=(--prepend-path "$FS_PI_BIN_DIR")
+# The git identity with signing switched off, and the host's model and browser
+# caches. claude-sandboxed's exec path used to provide both to this script for
+# free; calling the backend directly means asking for them. The gitconfig is
+# the load-bearing one: pi commits in a fork-sandbox pi-local run, and without
+# it every commit fails on a signing key that is not in the sandbox.
+sandbox_cmd+=("${FS_GITCONFIG_FLAGS[@]}")
+sandbox_cmd+=("${FS_CACHE_FLAGS[@]}")
+if (( ${#FORWARD_FLAGS[@]} )); then
+    sandbox_cmd+=("${FORWARD_FLAGS[@]}")
+fi
+# The binds --services added: a venv's interpreter, a linked worktree's gitdir.
+# They land after FORWARD_FLAGS so a caller's own flags still take precedence.
+if (( ${#EXTRA_BIND_FLAGS[@]} )); then
+    sandbox_cmd+=("${EXTRA_BIND_FLAGS[@]}")
+fi
+# The services sockets dir, read-only for the same reason as the model bridge
+# below: connect() needs write on the socket inode, not a writable mount. Set
+# only when the stack came up.
+if [[ -n "$SERVICES_SOCKETS_BIND" ]]; then
+    sandbox_cmd+=(--bind-ro "$SERVICES_SOCKETS_BIND")
+fi
+# The bridges. Each one names a socket the host half above already created and
+# the loopback port it should answer on inside; the backend binds the socket's
+# directory read-only — connect() needs write on the socket inode, not a
+# writable mount, so that is enough to use the bridge and leaves the sandbox no
+# writable path outside the work dir — and stands the inner relay up.
+sandbox_cmd+=(--bridge "$SOCK=$IN_PORT")
+for i in "${!BRIDGE_SOCKETS[@]}"; do
+    sandbox_cmd+=(--bridge "${BRIDGE_SOCKETS[$i]}=${BRIDGE_INPORTS[$i]}")
+done
+sandbox_cmd+=(--bind-ro "$STATE_DIR/pi-agent")
+sandbox_cmd+=(--bind-ro "$STATE_DIR/shim.sh")
+if [[ "$FS_PI_ROOT" != "/usr" ]]; then
+    sandbox_cmd+=(--bind-ro "$FS_PI_ROOT")
+fi
+sandbox_cmd+=(-- "$STATE_DIR/shim.sh" "$@")
+
+set +e
+"${sandbox_cmd[@]}"
+RC=$?
+set -e
+
+# Say where the transcript went. Inside .git it is deliberately somewhere no
+# `git status` will ever mention, which also means nowhere anyone would think
+# to look for it.
+if [[ -n "$SESSION_DIR" && -d "$SESSION_DIR" ]]; then
+    echo "agent-sandboxed: session transcript in $SESSION_DIR" >&2
+fi
+exit "$RC"

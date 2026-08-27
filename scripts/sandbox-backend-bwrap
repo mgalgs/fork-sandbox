@@ -1,0 +1,963 @@
+#!/usr/bin/env bash
+# sandbox-backend-bwrap — the bubblewrap implementation of the sandbox backend contract
+#
+# Usage: sandbox-backend-bwrap --workdir DIR --net pinned|sealed|unpinned
+#          [--bind-ro PATH]... [--bind-rw PATH]...
+#          [--bind-ro-at SRC DEST]... [--bind-rw-at SRC DEST]...
+#          [--bridge SOCKET=PORT]... [--setenv K=V]... [--prepend-path DIR]...
+#          [--hostname NAME] -- COMMAND [ARG...]
+#
+# This is the isolation substrate and nothing else. It knows about mounts,
+# namespaces, egress and bridges; it knows nothing about agents, credentials
+# or harnesses. Provisioning an agent is the caller's job — see
+# claude-sandboxed and agent-sandboxed, which are the two clients in this
+# repository. The contract this implements is docs/sandbox-backend.md.
+#
+# --workdir is the one writable project directory, and the command's cwd. It
+# is bind-mounted WRITABLE, so pointing it at a system directory would hand
+# the sandboxed command write access to the host's own files — silently, with
+# everything else still looking sandboxed. Those paths are refused.
+#
+# --bind-ro adds one read-only host path, file or directory. Repeat it for
+# more. It grants no write, so it cannot be used to plant anything on the
+# host — but it does widen the allowlist, so pointing it at a secret puts
+# that secret in the sandbox. Name the smallest path that works.
+#
+# --bind-rw adds one read-WRITE host path. Repeat it for more. Unlike
+# --bind-ro it grants write, so it carries the work dir's own risk: a system
+# path here would let the sandbox modify host files, so it is refused the
+# same way the work dir is. It exists for the one path a run must write
+# outside the work dir — a per-run services sockets directory, say.
+#
+# --bind-ro-at SRC DEST binds SRC read-only at DEST, rather than at SRC's own
+# path. DEST must be absolute, and is normally a path inside the work dir,
+# which the bind then re-protects read-only. It exists so a directory the
+# sandbox needs under the work dir — a provisioned virtualenv, say — can be
+# served read-only from elsewhere on the host.
+#
+# --bind-rw-at SRC DEST is the writable form of the same remapping, and
+# carries --bind-rw's risk: SRC is refused on the same list as the work dir.
+# It exists because a client that synthesizes state on the host has to mount
+# it where the program inside looks for it — claude-sandboxed builds a
+# throwaway ~/.claude in its state dir and mounts it at $HOME/.claude.
+#
+# --net picks the network mode, and has no default: the default would be the
+# one nobody chose.
+#
+#   pinned    Egress through the interface that carries the host's default
+#             route, and nothing else. Anything reachable only through
+#             another interface is therefore unreachable: the tailnet and its
+#             subnet routes, WireGuard tunnels, libvirt and docker bridges. A
+#             VPN authenticates the device, not the process, so without this
+#             pin the sandbox inherits the host's tunnel membership and can
+#             reach production hosts with no credential at all. The local LAN
+#             stays reachable, because it lives on the default-route
+#             interface.
+#   sealed    No network at all. See below.
+#   unpinned  Full egress, tunnels included. This is a bwrap-backend
+#             EXTENSION, not part of the contract, which offers pinned and
+#             sealed only — a mode whose guarantee is "none" does not belong
+#             in a guarantee list. It exists for the one case the pin breaks:
+#             a VM on a libvirt or docker bridge, addressed directly by its
+#             bridge address. It prints a warning saying what it gave up.
+#
+# --net sealed removes the network entirely. No pasta runs; bwrap unshares
+# the network namespace, so the sandbox has loopback and nothing else — no
+# internet, no LAN, no DNS. bwrap is also what brings lo up: a fresh
+# namespace has it DOWN. The seal needs no packet filter, because a namespace
+# with nothing in it reaches nothing, and a sandbox that nests its own
+# namespaces only gets more empty ones. The one way in is --bridge.
+#
+# --bridge SOCKET=PORT makes an existing host unix socket reachable at
+# 127.0.0.1:PORT inside, and works in sealed mode only. connect() needs write
+# permission on the socket inode rather than a writable mount, so the socket's
+# directory is bound READ-ONLY and the bridge still works — which is also why
+# it grants the sandbox no writable path. A socat inside relays the loopback
+# port onto the socket; the host half, which dials whatever real endpoint the
+# socket fronts, is the caller's to run and to tear down. PORT must be 1024 or
+# higher: the sandbox's unprivileged uid cannot bind a privileged port.
+#
+# --setenv K=V sets one variable inside, on top of the minimum below. It is
+# NOT for secrets: the value sits in this script's argv, which /proc
+# publishes to every local user for as long as the run lasts. A client with a
+# secret to pass should write it to a mode-600 file, bind that read-only, and
+# have the command read it — claude-sandboxed's --env-file does exactly that.
+# Only the NAMES are announced on stderr here.
+#
+# --prepend-path puts DIR at the front of the sandbox PATH. Repeat it for
+# more; later flags end up earlier on PATH. It changes lookup order only —
+# it mounts nothing, so a DIR the sandbox should read still needs its own
+# --bind-ro. It exists for toolchains that live outside /usr: nvm's node,
+# say, which must beat an older /usr/bin/node.
+#
+# --hostname sets the sandbox hostname, so a shell prompt inside can show
+# where it is.
+#
+# -- ends option parsing. Everything after it is the command, passed
+# verbatim, and its exit code is this script's.
+#
+# stdin is NOT touched. Nothing here reads from it and nothing between the
+# caller and the final exec consumes it, because that is how a large prompt
+# reaches a harness: a single argv string is capped at 128KB on Linux
+# (MAX_ARG_STRLEN), and a handoff that outgrew it once died as a bare exit
+# 126. Keep it that way.
+#
+# Design: the mount policy is an ALLOWLIST. The sandbox starts from an
+# empty filesystem and this script binds in only what a program needs to
+# run. That is the opposite of binding the host root read-only and masking
+# the dangerous parts. It matters because a read-only bind does NOT stop
+# connect() on a unix socket — connect() needs write permission on the
+# socket inode, not a writable mount. An opt-out policy therefore hands
+# over every host daemon it forgets to mask: the session D-Bus (which
+# runs commands outside the sandbox via systemd-run --user), the docker
+# socket (host root), the ssh-agent, gnome-keyring, and the tmux socket.
+# With an allowlist, a host socket or secret that this script does not
+# name is unreachable, including ones added to the host later.
+#
+# What the sandbox gets:
+#   - Filesystem: /usr, /etc, /opt and /sys read-only, so the host
+#     toolchain works. The root, $HOME and /tmp are ephemeral tmpfs,
+#     writable but invisible to the host and gone when the sandbox
+#     exits. No host content beyond the paths named here is present.
+#     /run and /var do exist, but only as empty scaffolding holding the
+#     resolv.conf replacement and the work dir path. The tmpfs mounts
+#     are not size-capped, so a runaway sandbox can use host memory.
+#   - Writable: the work dir and each --bind-rw. Those are the only paths
+#     that persist. --bind-ro adds readable paths, never writable ones, so
+#     it cannot change what the sandbox is able to leave behind.
+#   - Network, in pinned and unpinned mode: full unrestricted internet, no
+#     proxy and no domain filtering, via pasta (passt) in a private network
+#     namespace. Host loopback services are unreachable
+#     (--map-host-loopback none, plus -t/-u/-T/-U none — pasta's
+#     namespace-mode default is `auto`, which would splice host-bound ports
+#     into the namespace and publish namespace binds on the host), and host
+#     abstract unix sockets are unreachable because the network namespace is
+#     not shared. DNS goes to pasta's forwarder. With egress pinned the
+#     forwarder relays to an upstream nameserver taken from the host's
+#     resolver config, not to systemd-resolved, because a pinned socket
+#     cannot reach a loopback stub. Anything resolved itself adds is
+#     therefore bypassed: split-horizon and per-link DNS, and mDNS names
+#     such as .local. Names the upstream serves, .lan among them, resolve
+#     normally.
+#   - Namespaces: net, pid, ipc, uts and mount are all unshared.
+#   - Environment: cleared, then HOME, PATH, TERM, LANG, USER, SHELL and
+#     PYTHONDONTWRITEBYTECODE, plus whatever --setenv names.
+#
+# Services on the host itself are unreachable in every mode, and no flag
+# changes that. Host loopback is not mapped, and the host's own LAN address
+# belongs to the sandbox's namespace interface, so traffic to it stays inside
+# the namespace. A service the host publishes by DNAT, or an /etc/hosts name
+# pointing at 127.0.0.1, therefore cannot be reached from inside. Reach such
+# a service by the address it actually listens on, or bridge it in.
+#
+# The limits, which every backend states in its own header:
+#
+#   - Isolation strength: shared-kernel namespaces. This is not a virtual
+#     machine, so a kernel bug still breaks out. A syscall-virtualizing
+#     runtime or a microVM would be stronger; neither is this.
+#   - Syscall filtering: NONE. No seccomp profile is applied — verified
+#     inside the sandbox as `Seccomp: 0`. keyctl, add_key, bpf, userfaultfd
+#     and perf_event_open are all reachable, and those are the historic
+#     source of kernel privilege escalations.
+#   - LAN reachability in pinned mode: the local LAN is reachable, and pasta
+#     re-originates the sandbox's connections from THIS HOST's own address,
+#     so the sandbox reaches LAN services as this machine, holding no
+#     identity of its own — an export or ACL keyed on client IP cannot tell
+#     it apart from you. Missing privilege closes less than it seems: a user
+#     namespace cannot mount NFS, because the kernel refuses that filesystem
+#     type without real privilege, but a userspace client speaking the
+#     protocol to port 2049 needs no mount at all. The same goes for anything
+#     else that authenticates by network position — unauthenticated admin
+#     panels, printers, metrics endpoints. Audit what your LAN trusts by
+#     position before pointing agents at this. Read access plus unrestricted
+#     internet is an exfiltration channel.
+#     Closing LAN egress from the sandbox itself is not built. pasta has no
+#     outbound filter — every port option it takes is inbound forwarding into
+#     the namespace — so it would take nftables inside the network namespace,
+#     and whether the sandbox could tear those rules down again from its own
+#     child user namespace is untested; if it can, the control is decorative.
+#   - Resource limits: NONE. CPU, memory and disk are unbounded, and the
+#     tmpfs mounts are not size-capped, so a runaway sandbox can exhaust host
+#     memory.
+#   - What a SIGKILL leaves behind: the per-run state dir under
+#     /var/tmp/claude-scratch/forks, holding the synthesized resolv.conf and,
+#     with --bridge, the generated bootstrap script. Neither holds a secret.
+#     Teardown runs from an EXIT trap, and a trap that is skipped does not
+#     run. The per-work-dir lock is released by the kernel either way.
+
+set -euo pipefail
+
+script_dir="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=fork-sandbox-lib.sh
+# shellcheck disable=SC1091  # plain shellcheck cannot follow it; use -x
+source "$script_dir/fork-sandbox-lib.sh"
+
+if [[ "${1-}" == -h || "${1-}" == --help ]]; then
+    sed -n '2,/^$/p' "$(readlink -f "${BASH_SOURCE[0]}")" | sed 's/^# \{0,1\}//'
+    exit 0
+fi
+
+UID_N="$(id -u)"
+GID_N="$(id -g)"
+
+# pasta answers DNS at this address inside the namespace and relays to the
+# host resolver. Link-local, so it cannot collide with a real route.
+DNS_FORWARD_ADDR="169.254.0.53"
+
+WORK_DIR_ARG=""
+NET_MODE=""
+HOSTNAME_ARG=""
+BIND_RO=()
+BIND_RW=()
+BIND_RO_AT_SRC=(); BIND_RO_AT_DEST=()
+BIND_RW_AT_SRC=(); BIND_RW_AT_DEST=()
+BRIDGE_SOCKETS=(); BRIDGE_PORTS=()
+SETENV=()
+PREPEND_PATH=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --workdir)
+            WORK_DIR_ARG="${2:?--workdir requires a directory}"
+            shift 2
+            ;;
+        --net)
+            NET_MODE="${2:?--net requires pinned, sealed or unpinned}"
+            shift 2
+            ;;
+        --hostname)
+            HOSTNAME_ARG="${2:?--hostname requires a name}"
+            shift 2
+            ;;
+        --bind-ro)
+            BIND_RO+=("${2:?--bind-ro requires a path}")
+            shift 2
+            ;;
+        --bind-rw)
+            BIND_RW+=("${2:?--bind-rw requires a path}")
+            shift 2
+            ;;
+        --bind-ro-at)
+            BIND_RO_AT_SRC+=("${2:?--bind-ro-at requires a source path}")
+            BIND_RO_AT_DEST+=("${3:?--bind-ro-at requires a destination path}")
+            shift 3
+            ;;
+        --bind-rw-at)
+            BIND_RW_AT_SRC+=("${2:?--bind-rw-at requires a source path}")
+            BIND_RW_AT_DEST+=("${3:?--bind-rw-at requires a destination path}")
+            shift 3
+            ;;
+        --bridge)
+            # SOCKET=PORT. Split at the LAST '=', so a socket path that
+            # contains one still parses.
+            bridge_val="${2:?--bridge requires SOCKET=PORT}"
+            if [[ "$bridge_val" != *=* ]]; then
+                echo "Error: --bridge '$bridge_val' has no port. The form is" >&2
+                echo "SOCKET=PORT." >&2
+                exit 1
+            fi
+            BRIDGE_SOCKETS+=("${bridge_val%=*}")
+            BRIDGE_PORTS+=("${bridge_val##*=}")
+            shift 2
+            ;;
+        --setenv)
+            SETENV+=("${2:?--setenv requires NAME=VALUE}")
+            shift 2
+            ;;
+        --prepend-path)
+            PREPEND_PATH+=("${2:?--prepend-path requires a directory}")
+            shift 2
+            ;;
+        --)
+            shift
+            break
+            ;;
+        *)
+            echo "Error: unknown option '$1'. The command goes after '--':" >&2
+            echo "  sandbox-backend-bwrap [options] -- COMMAND [ARG...]" >&2
+            exit 1
+            ;;
+    esac
+done
+
+if (( $# == 0 )); then
+    echo "Error: no command. Everything after '--' is the command to run:" >&2
+    echo "  sandbox-backend-bwrap [options] -- COMMAND [ARG...]" >&2
+    exit 1
+fi
+
+# A path that names nothing fails inside bwrap as a bare "execvp: No such
+# file or directory", which reads like a missing library. Say it here
+# instead. A bare name is left alone: it is looked up on the sandbox PATH,
+# which is not this script's.
+if [[ "$1" == */* && ! -x "$1" ]]; then
+    echo "Error: the command '$1' is not an executable file." >&2
+    exit 1
+fi
+
+if [[ -z "$WORK_DIR_ARG" ]]; then
+    echo "Error: --workdir is required. It is the one writable project" >&2
+    echo "directory, and the command's working directory." >&2
+    exit 1
+fi
+
+# No default network mode. A default would be the mode nobody chose, and both
+# choices here are load-bearing: one decides whether a VPN is reachable, the
+# other whether anything is.
+case "$NET_MODE" in
+    pinned|sealed|unpinned) ;;
+    "")
+        echo "Error: --net is required, and has no default. Pass 'pinned' for" >&2
+        echo "egress out the default route only, or 'sealed' for no network." >&2
+        exit 1
+        ;;
+    *)
+        echo "Error: --net '$NET_MODE' is not a mode. Use pinned, sealed or" >&2
+        echo "unpinned." >&2
+        exit 1
+        ;;
+esac
+
+# pasta is what provides egress, so it is needed only when there is egress:
+# check for it after the mode is known, not at the top of the file.
+if [[ "$NET_MODE" != sealed ]] && ! command -v pasta >/dev/null; then
+    echo "Error: pasta not found. Install it with: pacman -S passt" >&2
+    exit 1
+fi
+
+# The bridges. Each one is a host unix socket that already exists, published
+# inside as a loopback port, and the seal is the only reason the mechanism
+# exists: with a route out there is no need to tunnel one endpoint through a
+# socket.
+if (( ${#BRIDGE_SOCKETS[@]} )); then
+    if [[ "$NET_MODE" != sealed ]]; then
+        echo "Error: --bridge works only with --net sealed. With egress there is" >&2
+        echo "already a route to the endpoint, so the socket buys nothing." >&2
+        exit 1
+    fi
+    # socat runs on BOTH sides. The inner one comes from /usr, which is
+    # mounted from this host, so a host without socat has a sandbox without
+    # socat — and that failure would land inside, backgrounded and silent.
+    if ! command -v socat >/dev/null; then
+        echo "Error: socat not found, and every bridge is built from it. The" >&2
+        echo "sandbox runs it out of the host's /usr, so it has to be here." >&2
+        echo "On Arch: pacman -S socat" >&2
+        exit 1
+    fi
+fi
+for i in "${!BRIDGE_SOCKETS[@]}"; do
+    bridge_sock="${BRIDGE_SOCKETS[$i]}"
+    bridge_port="${BRIDGE_PORTS[$i]}"
+    if [[ ! -S "$bridge_sock" ]]; then
+        echo "Error: --bridge source '$bridge_sock' is not a unix socket. The" >&2
+        echo "host half of the bridge creates it, so start that first." >&2
+        exit 1
+    fi
+    # A plain decimal: no leading zero (arithmetic would read one as octal),
+    # no zero, at most five digits (the range check then bounds it at 65535).
+    if [[ ! "$bridge_port" =~ ^[1-9][0-9]{0,4}$ ]] || (( bridge_port > 65535 )); then
+        echo "Error: --bridge '$bridge_sock=$bridge_port' has a port that is not" >&2
+        echo "a number from 1 to 65535." >&2
+        exit 1
+    fi
+    # The relay binds this port as an unprivileged uid, so a privileged port
+    # cannot be bound. Refuse it rather than remap it: the consumer has to
+    # know the port it is dialing, so a silent remap would leave it pointing
+    # at nothing.
+    if (( bridge_port < 1024 )); then
+        echo "Error: --bridge '$bridge_sock=$bridge_port' would listen on a" >&2
+        echo "privileged port, which the sandbox's unprivileged uid cannot" >&2
+        echo "bind. Use 1024 or higher." >&2
+        exit 1
+    fi
+    # Two relays cannot share one in-sandbox port: the second socat dies at
+    # bind time, while the first keeps listening, so a readiness wait passes
+    # against the first and one service's traffic reaches the other silently.
+    for j in "${!BRIDGE_PORTS[@]}"; do
+        (( j < i )) || continue
+        if [[ "${BRIDGE_PORTS[$j]}" == "$bridge_port" ]]; then
+            echo "Error: two --bridge flags want in-sandbox port $bridge_port." >&2
+            echo "One port carries one socket; a second listener on it fails at" >&2
+            echo "bind time while the first keeps answering, so one service's" >&2
+            echo "traffic would silently reach the other. Give one of them" >&2
+            echo "another port." >&2
+            exit 1
+        fi
+    done
+    # Both values are baked into a generated shell script below. printf %q is
+    # what keeps them safe there, but a newline would still break the file's
+    # shape, so refuse what does not survive the trip.
+    fs_reject_unsafe_chars "$bridge_sock" "$bridge_port" || exit 1
+done
+
+# --setenv NAME=VALUE. The name is checked; the value is whatever the caller
+# said, and bwrap takes it as one word, so nothing in it is re-parsed.
+SETENV_NAMES=()
+for kv in "${SETENV[@]}"; do
+    if [[ "$kv" != *=* ]]; then
+        echo "Error: --setenv '$kv' is not NAME=VALUE." >&2
+        exit 1
+    fi
+    if [[ ! "${kv%%=*}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+        echo "Error: --setenv names a variable that is not" >&2
+        echo "[A-Za-z_][A-Za-z0-9_]*: '${kv%%=*}'" >&2
+        exit 1
+    fi
+    SETENV_NAMES+=("${kv%%=*}")
+done
+
+# The interface a family's internet traffic leaves by. Derived from the
+# routing table, so it works on any host — br0 here, wlp1s0 on a laptop.
+# Prints nothing when that family has no route, which is not an error:
+# a host with no IPv6 default route is normal. Capture `ip` separately
+# rather than piping it, because pipefail would turn its failure into a
+# failed assignment and set -e would kill the script.
+egress_iface() {
+    local out
+    out="$(ip -"$1" route get "$2" 2>/dev/null)" || return 0
+    awk '{for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit }}' <<<"$out"
+}
+
+# Interfaces whose reachability is the thing we are trying to remove.
+# Pinning egress to one of these would enforce nothing.
+is_tunnel_iface() {
+    case "$1" in
+        tailscale*|ts*|wg*|tun*|tap*|zt*|ppp*|nebula*|gpd*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Pinning egress cuts pasta off from a loopback resolver, because a query
+# to 127.0.0.53 cannot leave by the pinned interface. Find a real
+# nameserver that is routed through that interface instead. Rejecting
+# candidates on the wrong interface matters on a laptop, where resolved's
+# upstream may be a corporate resolver behind a VPN.
+# Read each file separately and skip missing ones. Handing awk several
+# files at once is wrong here: it aborts on the first unreadable one, so
+# on a host without systemd-resolved it would never reach
+# /etc/resolv.conf and DNS selection would fail with a misleading error.
+nameserver_candidates() {
+    local f
+    for f in /run/systemd/resolve/resolv.conf /etc/resolv.conf; do
+        [[ -r "$f" ]] || continue
+        awk '/^nameserver/ {print $2}' "$f"
+    done
+}
+
+pick_dns_host() {
+    local iface="$1" ns
+    while read -r ns; do
+        [[ "$ns" == *:* || "$ns" == 127.* ]] && continue
+        if [[ "$(egress_iface 4 "$ns")" == "$iface" ]]; then
+            printf '%s\n' "$ns"
+            return 0
+        fi
+    done < <(nameserver_candidates)
+    return 1
+}
+
+PASTA_NET_ARGS=()
+EGRESS_IF4=""
+DNS_HOST=""
+case "$NET_MODE" in
+    sealed)
+        # No pasta runs at all in sealed mode, so there is no egress to pin
+        # and no upstream nameserver to pick. bwrap unshares the network
+        # namespace itself further down.
+        :
+        ;;
+    unpinned)
+        echo "sandbox-backend-bwrap: egress not pinned: tailnet, VPNs and bridge networks reachable" >&2
+        ;;
+    pinned)
+        EGRESS_IF4="$(egress_iface 4 1.1.1.1)"
+        if [[ -z "$EGRESS_IF4" ]]; then
+            echo "Error: cannot determine the IPv4 egress interface, so tunnel" >&2
+            echo "reachability cannot be restricted. Pass --net unpinned to run anyway." >&2
+            exit 1
+        fi
+        if is_tunnel_iface "$EGRESS_IF4"; then
+            echo "Error: the default route leaves by '$EGRESS_IF4', which is itself a" >&2
+            echo "tunnel. Pinning egress to it would not block tunnel access. Pass" >&2
+            echo "--net unpinned to run without the restriction." >&2
+            exit 1
+        fi
+        PASTA_NET_ARGS+=(--outbound-if4 "$EGRESS_IF4")
+
+        DNS_HOST="$(pick_dns_host "$EGRESS_IF4" || true)"
+        if [[ -z "$DNS_HOST" ]]; then
+            echo "Error: no nameserver is reachable through '$EGRESS_IF4', so pinning" >&2
+            echo "egress would break DNS. The host may resolve only through a local" >&2
+            echo "stub or a VPN resolver. Pass --net unpinned to run without the" >&2
+            echo "restriction." >&2
+            exit 1
+        fi
+        PASTA_NET_ARGS+=(--dns-host "$DNS_HOST")
+
+        # Constrain IPv6 the same way. With no IPv6 default route the host has
+        # no IPv6 internet, so drop IPv6 in the sandbox rather than leave an
+        # unpinned family that could still route into a tunnel.
+        EGRESS_IF6="$(egress_iface 6 2606:4700:4700::1111)"
+        if [[ -n "$EGRESS_IF6" ]] && ! is_tunnel_iface "$EGRESS_IF6"; then
+            PASTA_NET_ARGS+=(--outbound-if6 "$EGRESS_IF6")
+        else
+            PASTA_NET_ARGS+=(--ipv4-only)
+        fi
+        ;;
+esac
+
+# TIOCSTI lets a sandboxed process inject keystrokes into the terminal
+# that started it. No namespace stops it. Modern kernels disable it.
+if [[ "$(cat /proc/sys/dev/tty/legacy_tiocsti 2>/dev/null || echo 0)" != "0" ]]; then
+    echo "Warning: dev.tty.legacy_tiocsti is enabled; the sandbox can inject" >&2
+    echo "keystrokes into this terminal. Set it to 0 to close that hole." >&2
+fi
+
+# The work dir is bind-mounted WRITABLE, so pointing it at a system
+# directory would hand the sandboxed agent write access to the host's
+# own files — silently, with everything else still looking sandboxed.
+# Refuse those paths. The agent cannot choose the work dir, so this
+# guards the person typing the command, not the sandbox boundary.
+is_refused_work_dir() {
+    local d="$1" p
+    case "$d" in
+        / | "$HOME" | /home | /root | /boot | /var | /var/tmp \
+          | /var/tmp/claude-scratch | /var/tmp/claude-scratch/forks \
+          | /tmp | /opt | /srv | /mnt | /nix)
+            return 0 ;;
+    esac
+    for p in /usr /etc /bin /sbin /lib /lib64 /proc /sys /dev /run /boot; do
+        [[ "$d" == "$p" || "$d" == "$p"/* ]] && return 0
+    done
+    return 1
+}
+
+# The lock file and the per-run state dir live under the scratch root's forks/
+# directory. Create it now; the UserPromptSubmit hook makes it too, but a
+# script cannot assume the hook ran.
+mkdir -p /var/tmp/claude-scratch/forks
+mkdir -p "$WORK_DIR_ARG"
+WORK_DIR="$(realpath "$WORK_DIR_ARG")"
+
+if is_refused_work_dir "$WORK_DIR"; then
+    echo "Error: refusing '$WORK_DIR' as the work dir. It is bind-mounted" >&2
+    echo "writable, so the sandbox would be able to modify host system files." >&2
+    echo "Use a dedicated directory." >&2
+    exit 1
+fi
+
+# Resolve the read-only binds before the mount list is built, so a bad
+# path fails here rather than inside bwrap. There is no refusal list:
+# these grant no write, so none of them can damage the host. Mount the
+# resolved source at the path as written, because those differ when the
+# caller names a path through a symlink, and it is the name as written
+# that something inside the sandbox will look for.
+BIND_RO_SRC=(); BIND_RO_DEST=()
+for d in "${BIND_RO[@]}"; do
+    if [[ ! -e "$d" ]]; then
+        echo "Error: --bind-ro '$d' does not exist." >&2
+        exit 1
+    fi
+    BIND_RO_SRC+=("$(realpath "$d")"); BIND_RO_DEST+=("$(realpath -s "$d")")
+done
+
+# The read-write binds. These grant write, so they carry the work dir's own
+# risk: a system path here would let the sandbox modify host files. Refuse the
+# same paths the work dir refuses, resolve, and mount at the path as written.
+BIND_RW_SRC=(); BIND_RW_DEST=()
+for d in "${BIND_RW[@]}"; do
+    if [[ ! -e "$d" ]]; then
+        echo "Error: --bind-rw '$d' does not exist." >&2
+        exit 1
+    fi
+    rw_real="$(realpath "$d")"
+    if is_refused_work_dir "$rw_real"; then
+        echo "Error: refusing '$rw_real' as a --bind-rw path. It would be" >&2
+        echo "writable inside the sandbox, so a system path here would let the" >&2
+        echo "sandbox modify host files. Name a dedicated directory." >&2
+        exit 1
+    fi
+    BIND_RW_SRC+=("$rw_real"); BIND_RW_DEST+=("$(realpath -s "$d")")
+done
+
+# The destination of a remapped bind is used as written, so a '..' component
+# would move the mount somewhere the absolute prefix does not say
+# ('/work/../etc' mounts over /etc). Refuse it; the slash wrapping keeps names
+# that merely start with '..' allowed.
+check_remap_dest() {
+    local flag="$1" dest="$2"
+    if [[ "$dest" != /* ]]; then
+        echo "Error: $flag destination '$dest' must be absolute." >&2
+        return 1
+    fi
+    if [[ "$dest/" == *"/../"* ]]; then
+        echo "Error: $flag destination '$dest' must not contain a '..'" >&2
+        echo "component." >&2
+        return 1
+    fi
+    return 0
+}
+
+# The remapped read-only binds: source SRC, mounted at DEST rather than at its
+# own path. DEST is normally a path inside the work dir, which the bind
+# re-protects read-only below.
+BIND_RO_AT_RSRC=()
+for i in "${!BIND_RO_AT_SRC[@]}"; do
+    ro_at_src="${BIND_RO_AT_SRC[$i]}"
+    if [[ ! -e "$ro_at_src" ]]; then
+        echo "Error: --bind-ro-at source '$ro_at_src' does not exist." >&2
+        exit 1
+    fi
+    check_remap_dest --bind-ro-at "${BIND_RO_AT_DEST[$i]}" || exit 1
+    BIND_RO_AT_RSRC+=("$(realpath "$ro_at_src")")
+done
+
+# The remapped read-write binds. Writable, so the source is refused on the
+# same list as the work dir, for the same reason.
+BIND_RW_AT_RSRC=()
+for i in "${!BIND_RW_AT_SRC[@]}"; do
+    rw_at_src="${BIND_RW_AT_SRC[$i]}"
+    if [[ ! -e "$rw_at_src" ]]; then
+        echo "Error: --bind-rw-at source '$rw_at_src' does not exist." >&2
+        exit 1
+    fi
+    check_remap_dest --bind-rw-at "${BIND_RW_AT_DEST[$i]}" || exit 1
+    rw_at_real="$(realpath "$rw_at_src")"
+    if is_refused_work_dir "$rw_at_real"; then
+        echo "Error: refusing '$rw_at_real' as a --bind-rw-at source. It would" >&2
+        echo "be writable inside the sandbox, so a system path here would let" >&2
+        echo "the sandbox modify host files. Name a dedicated directory." >&2
+        exit 1
+    fi
+    BIND_RW_AT_RSRC+=("$rw_at_real")
+done
+
+# PATH is assembled here, on the host, because the sandbox runs with
+# --clearenv. Existence is checked against the host: a prepended dir is
+# normally made visible by a --bind-ro of the same path, so a typo would
+# otherwise fail only at lookup time inside the sandbox, silently.
+SANDBOX_PATH="$HOME/.local/bin:$PATH"
+for d in "${PREPEND_PATH[@]}"; do
+    if [[ ! -d "$d" ]]; then
+        echo "Error: --prepend-path '$d' is not a directory on the host." >&2
+        exit 1
+    fi
+    SANDBOX_PATH="$d:$SANDBOX_PATH"
+done
+
+# One sandbox per work dir. A harness that times out stops waiting but does
+# not kill the run, so the sandbox keeps working while its caller believes
+# it died. A second run would then race the first, and a caller that clears
+# the work dir first would delete results while they are still being
+# written. Hold the lock outside the work dir, so the sandbox cannot
+# remove it, and let the kernel drop it however this process ends.
+LOCK_FILE="/var/tmp/claude-scratch/forks/.sandbox-backend-lock-$(printf '%s' "$WORK_DIR" | md5sum | cut -d' ' -f1)"
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+    echo "Error: another sandbox is already using" >&2
+    echo "$WORK_DIR" >&2
+    echo "A timed-out caller does not kill the sandbox, so one may still be" >&2
+    echo "running. Check with: pgrep -af sandbox-backend" >&2
+    exit 1
+fi
+
+# Per-run state on the host: the synthesized resolv.conf, and the bridge
+# bootstrap when there is one. Neither is a secret. Removed on exit.
+STATE_DIR="$(mktemp -d /var/tmp/claude-scratch/forks/sandbox-backend-bwrap.XXXXXX)"
+# shellcheck disable=SC2329  # invoked by the EXIT trap below
+cleanup() {
+    # Drop errexit first: this handler must always reach the rm.
+    set +e
+    rm -rf "$STATE_DIR"
+}
+trap cleanup EXIT
+
+# The host resolver is unreachable from the namespace: /etc/resolv.conf
+# names 127.0.0.53, and resolved's varlink socket lives in /run, which is
+# not mounted. Point at pasta's forwarder instead. In sealed mode there is
+# no forwarder and no route to any nameserver, so say that instead of
+# naming a server that can never answer.
+if [[ "$NET_MODE" == sealed ]]; then
+    printf '# sealed sandbox: no network, no resolver\n' > "$STATE_DIR/resolv.conf"
+else
+    printf 'nameserver %s\noptions edns0 trust-ad\n' "$DNS_FORWARD_ADDR" \
+        > "$STATE_DIR/resolv.conf"
+fi
+
+# Mount the replacement where the host's /etc/resolv.conf actually
+# resolves to. On systemd-resolved hosts that is a symlink into /run,
+# which the allowlist does not mount, so binding onto /etc/resolv.conf
+# would fail with a dangling destination.
+RESOLV_MOUNT_AT="$(readlink -f /etc/resolv.conf 2>/dev/null || true)"
+if [[ -z "$RESOLV_MOUNT_AT" ]]; then
+    RESOLV_MOUNT_AT=/etc/resolv.conf
+fi
+
+# The bridge mounts: the DIRECTORY holding each socket, read-only, deduplicated
+# so several sockets in one directory cost one mount. The directory rather than
+# the socket file, for two reasons: a bind-mounted socket file pins the inode,
+# so a host half that re-created its socket would leave the sandbox talking to
+# a stale one, and it would also blind the vanish watchdog below, which watches
+# the path. Read-only is enough — connect() needs write on the socket inode,
+# not a writable mount — so a bridge leaves the sandbox no writable path.
+BRIDGE_MOUNTS=()
+bridge_dirs_seen=()
+for sock in "${BRIDGE_SOCKETS[@]}"; do
+    sock_dir="$(dirname "$(realpath "$sock")")"
+    dir_seen=0
+    for d in "${bridge_dirs_seen[@]}"; do
+        [[ "$d" == "$sock_dir" ]] && { dir_seen=1; break; }
+    done
+    (( dir_seen )) && continue
+    bridge_dirs_seen+=("$sock_dir")
+    BRIDGE_MOUNTS+=(--ro-bind "$sock_dir" "$sock_dir")
+done
+
+echo "sandbox-backend-bwrap: work dir $WORK_DIR (writes here persist; everything else is ephemeral)" >&2
+for d in "${BIND_RO_DEST[@]}"; do
+    echo "sandbox-backend-bwrap: readable, not writable: $d" >&2
+done
+for d in "${BIND_RW_DEST[@]}"; do
+    echo "sandbox-backend-bwrap: WRITABLE: $d" >&2
+done
+for i in "${!BIND_RW_AT_RSRC[@]}"; do
+    echo "sandbox-backend-bwrap: WRITABLE: ${BIND_RW_AT_DEST[$i]} (from ${BIND_RW_AT_RSRC[$i]})" >&2
+done
+for i in "${!BIND_RO_AT_RSRC[@]}"; do
+    echo "sandbox-backend-bwrap: readable, not writable: ${BIND_RO_AT_DEST[$i]} (from ${BIND_RO_AT_RSRC[$i]})" >&2
+done
+for i in "${!BRIDGE_SOCKETS[@]}"; do
+    echo "sandbox-backend-bwrap: bridge: 127.0.0.1:${BRIDGE_PORTS[$i]} inside -> ${BRIDGE_SOCKETS[$i]}" >&2
+done
+# Report these in the order they actually end up on PATH, which is the
+# reverse of the order they were given: each --prepend-path goes in front
+# of the one before it. One line per flag, each claiming to be first, was
+# wrong as soon as a caller passed two.
+if (( ${#PREPEND_PATH[@]} )); then
+    PATH_ORDER=""
+    for (( i = ${#PREPEND_PATH[@]} - 1; i >= 0; i-- )); do
+        PATH_ORDER="${PATH_ORDER:+$PATH_ORDER, }${PREPEND_PATH[$i]}"
+    done
+    echo "sandbox-backend-bwrap: ahead of the system PATH, in order: $PATH_ORDER" >&2
+fi
+if (( ${#SETENV_NAMES[@]} )); then
+    # Names only. A value is not supposed to be a secret here — see the
+    # header — but this goes to a log, so it names nothing it need not.
+    echo "sandbox-backend-bwrap: environment: ${SETENV_NAMES[*]}" >&2
+fi
+case "$NET_MODE" in
+    sealed)
+        echo "sandbox-backend-bwrap: egress SEALED: loopback only — no internet, no LAN, no DNS" >&2
+        ;;
+    pinned)
+        echo "sandbox-backend-bwrap: egress pinned to ${EGRESS_IF4}, DNS via ${DNS_HOST} (tailnet, VPNs and bridges unreachable)" >&2
+        ;;
+esac
+
+# Mount order matters: bwrap applies these in sequence, so every tmpfs
+# comes before the binds that must show through it.
+BWRAP_ARGS=(
+    # The host toolchain, read-only. Arch merges /bin, /sbin and /lib
+    # into /usr, so recreate those symlinks.
+    --ro-bind /usr /usr
+    --symlink usr/bin /bin
+    --symlink usr/bin /sbin
+    --symlink usr/lib /lib
+    --symlink usr/lib /lib64
+
+    # System config: TLS trust store, passwd/group, nsswitch, ld.so.cache.
+    # /etc holds no world-readable secrets on this host, and the one
+    # socket set in it (/etc/pacman.d/gnupg) is root-only.
+    --ro-bind /etc /etc
+    --ro-bind "$STATE_DIR/resolv.conf" "$RESOLV_MOUNT_AT"
+
+    # Optional read-only extras
+    --ro-bind-try /opt /opt
+    --ro-bind-try /nix/store /nix/store
+    --ro-bind-try /sys /sys
+
+    --dev /dev
+    --proc /proc
+
+    # Ephemeral, writable, invisible to the host
+    --tmpfs /tmp
+    --tmpfs "$HOME"
+
+    # The bridge sockets' directories, read-only. After the tmpfs mounts so
+    # they show through, and empty when there is no bridge.
+    "${BRIDGE_MOUNTS[@]}"
+
+    # Writable: the work dir. Last, so no tmpfs shadows it.
+    --bind "$WORK_DIR" "$WORK_DIR"
+
+    # pasta already put us in a private net namespace and mapped us to
+    # uid 0 there. Map back to the real uid so file ownership lines up
+    # and an agent does not refuse to run as root.
+    --unshare-user
+    --uid "$UID_N"
+    --gid "$GID_N"
+
+    --unshare-pid
+    --unshare-ipc
+    --unshare-uts
+
+    --die-with-parent
+    --chdir "$WORK_DIR"
+
+    # Minimal environment allowlist — no API keys leak in
+    --clearenv
+    --setenv HOME "$HOME"
+    --setenv PATH "$SANDBOX_PATH"
+    --setenv TERM "${TERM:-xterm-256color}"
+    --setenv LANG "${LANG:-C.UTF-8}"
+    --setenv USER "${USER:-$(id -un)}"
+    --setenv SHELL /bin/bash
+    # A read-only bind can land anywhere Python imports from — a provisioned
+    # virtualenv, say — and Python writing .pyc into a read-only tree fails
+    # noisily. Turning bytecode writing off avoids it and costs a run nothing.
+    --setenv PYTHONDONTWRITEBYTECODE 1
+)
+
+if [[ -n "$HOSTNAME_ARG" ]]; then
+    BWRAP_ARGS+=(--hostname "$HOSTNAME_ARG")
+fi
+
+# The caller's own variables, after the minimum above so a client can also
+# override one of those deliberately.
+for kv in "${SETENV[@]}"; do
+    BWRAP_ARGS+=(--setenv "${kv%%=*}" "${kv#*=}")
+done
+
+# Read-only binds go last, after the tmpfs mounts they must show through
+# and after the work dir, so one may also re-protect a path inside it.
+for i in "${!BIND_RO_SRC[@]}"; do
+    BWRAP_ARGS+=(--ro-bind "${BIND_RO_SRC[$i]}" "${BIND_RO_DEST[$i]}")
+done
+
+# Read-write binds: the paths a run must write outside the work dir — a per-run
+# services sockets directory, say. Writable, so they go after the work dir like
+# it does.
+for i in "${!BIND_RW_SRC[@]}"; do
+    BWRAP_ARGS+=(--bind "${BIND_RW_SRC[$i]}" "${BIND_RW_DEST[$i]}")
+done
+for i in "${!BIND_RW_AT_RSRC[@]}"; do
+    BWRAP_ARGS+=(--bind "${BIND_RW_AT_RSRC[$i]}" "${BIND_RW_AT_DEST[$i]}")
+done
+
+# Remapped read-only binds, last of all, so they re-protect a path inside the
+# work dir that the writable work-dir bind would otherwise leave writable.
+for i in "${!BIND_RO_AT_RSRC[@]}"; do
+    BWRAP_ARGS+=(--ro-bind "${BIND_RO_AT_RSRC[$i]}" "${BIND_RO_AT_DEST[$i]}")
+done
+
+# Sealed mode: bwrap unshares the network namespace itself, and brings lo up —
+# a fresh namespace has it DOWN with no address. The seal holds without a
+# filter because a namespace with nothing in it reaches nothing, and one the
+# sandbox nests for itself is empty too. In pasta mode this flag would be
+# wrong: pasta makes the namespace and puts its own interface in it, so
+# unsharing again here would leave the sandbox with no egress at all.
+if [[ "$NET_MODE" == sealed ]]; then
+    BWRAP_ARGS+=(--unshare-net)
+fi
+
+# What bwrap runs. With no bridge that is the caller's command, unchanged.
+# With one, a generated bootstrap stands the inner relays up first and then
+# becomes the command, so the command still gets this script's stdin and its
+# exit code is still the one that comes back.
+TARGET_CMD=("$@")
+if (( ${#BRIDGE_SOCKETS[@]} )); then
+    BOOTSTRAP="$STATE_DIR/bridge-bootstrap.sh"
+    # Every interpolated value goes in through printf %q, and each was checked
+    # for the characters that would break the file's shape before we got here.
+    # shellcheck disable=SC2016  # every printf below writes a program for the
+    # sandbox's own bash, so $1, $2 and $(seq …) must reach the file unexpanded
+    {
+        printf '#!/bin/bash\n'
+        printf '# Generated by sandbox-backend-bwrap. Runs INSIDE the sandbox.\n'
+        printf 'set -e\n'
+        # Every relay starts before any waiting, so each gets the full window.
+        for i in "${!BRIDGE_SOCKETS[@]}"; do
+            printf 'socat %q %q &\n' \
+                "TCP-LISTEN:${BRIDGE_PORTS[$i]},bind=127.0.0.1,fork,reuseaddr" \
+                "UNIX-CONNECT:${BRIDGE_SOCKETS[$i]}"
+        done
+        printf '# Wait for each listener, so the first request cannot lose a race.\n'
+        printf '# Say so and stop if one never comes: socat is backgrounded, so a\n'
+        printf '# failure there is silent, and starting the command anyway would\n'
+        printf '# spend the whole run on connection errors.\n'
+        printf 'wait_port() {\n'
+        printf '    for _ in $(seq 1 40); do\n'
+        printf '        if (: </dev/tcp/127.0.0.1/"$1") 2>/dev/null; then return 0; fi\n'
+        printf '        sleep 0.1\n'
+        printf '    done\n'
+        printf '    echo "sandbox-backend-bwrap: the bridge on 127.0.0.1:$1 never came up." >&2\n'
+        printf '    echo "sandbox-backend-bwrap: nothing else is reachable from a sealed" >&2\n'
+        printf '    echo "sandbox-backend-bwrap: sandbox, so the command is not started." >&2\n'
+        printf '    return 1\n'
+        printf '}\n'
+        for i in "${!BRIDGE_PORTS[@]}"; do
+            printf 'wait_port %q\n' "${BRIDGE_PORTS[$i]}"
+        done
+        # The waits above catch a bridge that is dead at boot. One can still
+        # vanish mid-run — the host half killed, or the state dir removed
+        # outside the sandbox — leaving the command to retry into an opaque
+        # connection error. One job per socket polls its path and, on loss,
+        # names the endpoint it served, once. A background job survives the
+        # exec, so it is started just before it, and runs beside the command
+        # for the whole run.
+        printf 'watch_sock() {\n'
+        printf '    while [[ -S $1 ]]; do sleep 2; done\n'
+        printf '    echo "sandbox-backend-bwrap: the bridge on 127.0.0.1:$2 lost its" >&2\n'
+        printf '    echo "sandbox-backend-bwrap: socket ($1) — the host-side bridge was" >&2\n'
+        printf '    echo "sandbox-backend-bwrap: killed or the directory holding it was" >&2\n'
+        printf '    echo "sandbox-backend-bwrap: removed; that endpoint is unreachable" >&2\n'
+        printf '}\n'
+        for i in "${!BRIDGE_SOCKETS[@]}"; do
+            printf 'watch_sock %q %q &\n' \
+                "${BRIDGE_SOCKETS[$i]}" "${BRIDGE_PORTS[$i]}"
+        done
+        printf 'exec "$@"\n'
+    } > "$BOOTSTRAP"
+    chmod 755 "$BOOTSTRAP"
+    BWRAP_ARGS+=(--ro-bind "$BOOTSTRAP" "$BOOTSTRAP")
+    TARGET_CMD=(/bin/bash "$BOOTSTRAP" "$@")
+fi
+
+# pasta creates the network namespace, configures it, and runs bwrap in
+# it. --map-host-loopback none keeps host loopback services unreachable.
+# pasta relays queries sent to the forwarder address to the host's own
+# resolver, so .lan names keep working.
+#
+# The four port-forwarding directions are disabled EXPLICITLY because
+# pasta's namespace-mode default for every one of them is `auto`:
+#   -T/-U auto splices every host-bound TCP/UDP port into the namespace,
+#   so 127.0.0.1:<port> inside reaches the HOST's service on that port —
+#   verified live: a sandboxed curl hit the host's dev minio. It also
+#   squats those ports inside, so a sandbox relay cannot bind them.
+#   -t/-u auto publishes every port the SANDBOX binds on the host.
+# `none` everywhere restores the documented properties: host services
+# unreachable, sandbox listeners invisible. Outbound egress and DNS are
+# unaffected — those are pasta's NAT, not port forwarding.
+#
+# Sealed mode skips pasta entirely and runs bwrap straight from the host,
+# where --unshare-net above is what removes the network. bwrap's own
+# --unshare-user/--uid/--gid do the uid mapping that pasta would otherwise
+# have started.
+set +e
+if [[ "$NET_MODE" == sealed ]]; then
+    bwrap "${BWRAP_ARGS[@]}" "${TARGET_CMD[@]}"
+else
+    pasta --quiet --config-net \
+        --map-host-loopback none \
+        -t none -u none -T none -U none \
+        --dns-forward "$DNS_FORWARD_ADDR" \
+        "${PASTA_NET_ARGS[@]}" \
+        -- \
+        bwrap "${BWRAP_ARGS[@]}" "${TARGET_CMD[@]}"
+fi
+RC=$?
+set -e
+
+# The command's exit code, always. The layers above use it to decide whether a
+# run failed, so substituting one here would break failure detection silently.
+exit "$RC"

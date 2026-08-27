@@ -1,0 +1,1998 @@
+#!/usr/bin/env bash
+# fork-sandbox.sh — Run one unattended headless agent session in a sandboxed clone
+#
+# Usage: fork-sandbox.sh [options] <project-path> <handoff-file>
+#
+# --branch <name>:       branch the session commits on. Defaults to a
+#                        timestamped name.
+# --checkout <ref>:      start the branch at <ref> instead of the repo's HEAD.
+#                        The ref is resolved in YOUR repo, so anything it can
+#                        name works, including a commit under a private ref
+#                        namespace such as a fetched pull request head. That
+#                        commit also becomes the base the session's work is
+#                        measured against, so a session that commits nothing
+#                        still leaves the repo unchanged.
+# --model <model>:       model for the session (e.g. fable, opus, sonnet).
+#                        Required with --harness pi, where it names an
+#                        OpenRouter model such as moonshotai/kimi-k3.
+#                        Optional with --harness pi-local, which asks the
+#                        endpoint what it serves, and with --harness codex,
+#                        which passes it to `codex exec --model`.
+# --harness <name>:      claude (the default), pi, pi-local, or codex. See
+#                        below.
+# --claude-args "...":   extra arguments passed verbatim to the claude CLI
+# --pi-args "...":       extra arguments passed verbatim to pi, e.g.
+#                        "--thinking low". Only with --harness pi or
+#                        pi-local, which are the harnesses that start pi.
+# --task-meta '<json>':  one JSON object of orchestrator-supplied task
+#                        metadata -- kind, difficulty, size,
+#                        prompt_template_id, stage -- stored beside the run
+#                        and folded into the run-log record. See
+#                        sandbox-run-log.py's header for the recommended
+#                        fields.
+# --sandbox-args "...":  extra arguments passed to claude-sandboxed itself.
+#                        Only --unpin-egress is accepted. Refused outright
+#                        with --harness pi-local, which is sealed and so has
+#                        no egress to unpin.
+# --context-ro <dir>:    bind <dir> read-only into the sandbox as gathered
+#                        context. The directory must live under
+#                        /var/tmp/claude-scratch/forks/ — a staging path a
+#                        host-side script created on purpose — never an
+#                        arbitrary host path.
+# --keep-session:        leave the tmux session open on a shell when the run
+#                        ends, instead of letting it close. Ignored with
+#                        --foreground, which has no tmux session.
+# --foreground:          run here in the foreground instead of a detached
+#                        tmux session. Blocks until the session ends.
+# --no-services:         skip the per-run services a repo opts into with
+#                        .agents/sandbox-services/ (see below), even when it
+#                        has them.
+# --services-trust-ref <ref>:
+#                        honor the services hook only if the checked-out ref
+#                        did not change the sandbox-services contract relative to
+#                        <ref>. A services hook is host-side code, so a
+#                        review of an untrusted ref (a pull request head)
+#                        passes the trusted base here, and a hook the ref
+#                        modified is not run.
+# -h, --help:            print this header and exit.
+#
+# The run gets its own detached tmux session, not a window of yours, so
+# launching one never takes your focus and never adds to your window list.
+# Attach only to troubleshoot or to watch:
+#
+#   tmux attach -t cc-sbx-<branch>          # from a plain terminal
+#   tmux switch-client -t cc-sbx-<branch>   # from inside tmux
+#
+# The tmux session ends when the run ends, so a session that still exists
+# means the work is still going. Everything worth reading outlives it in the
+# run directory, so nothing is lost when it closes. Pass --keep-session to
+# hold it open on a shell instead.
+#
+# This needs tmux but does not need you to be inside it. Launched from a plain
+# terminal it starts the tmux server itself.
+#
+# This is fork-task.sh --sandboxed, made unattended. The session runs
+# headless — `claude --print` — so three things follow that an interactive
+# session does not get:
+#
+#   - It needs no keypress. --dangerously-skip-permissions shows a one-time
+#     acceptance dialog and records the answer under $HOME. The sandbox gives
+#     every run a fresh ephemeral $HOME, so the answer is never remembered and
+#     an interactive session stops on that dialog forever. Print mode never
+#     shows it.
+#   - It exits when the work is done, so the branch comes back on its own.
+#   - Its whole event stream lands in a host-side log file. The redirection is
+#     opened by this script, outside the sandbox, so the sandbox cannot see or
+#     touch the log.
+#
+# Read the log with fork-sandbox-status.sh, which is the supported way in.
+#
+# A run is not sealed off once it starts. <run-dir>/inbox is bound read-only
+# into the sandbox, and fork-sandbox-say.sh drops an operator addendum there —
+# a course correction carrying the same authority as the handoff. On the claude
+# harness a hook puts it in front of the session on its next tool call and
+# refuses to let it finish while one is unread; the other harnesses are told to
+# read the directory before each commit and before their final report. So
+# steering a run no longer means killing it and starting over.
+#
+# Sandboxed mode trades isolation for silence: the session never asks for
+# permission, because the sandbox is the boundary instead of the prompt.
+#
+# It does NOT run in your checkout. It runs in a throwaway `git clone
+# --shared` of it, and only that clone is writable. This is the whole
+# security design, not a convenience. A writable git directory is host code
+# execution: a hook, or a config key such as core.fsmonitor, runs on the HOST
+# the next time anyone uses git in that repo — outside the sandbox, with the
+# ssh keys and the tailnet. The clone's own git directory is writable and
+# therefore untrusted, so the work comes back by `git fetch`, which git
+# deliberately does not let a fetched-from repository use to run commands.
+# Nothing writable of yours is ever mounted, so there is no hook to plant and
+# nothing to enumerate. For the same reason nothing here ever runs git inside
+# the clone once the sandbox has touched it.
+#
+# What the session gives up:
+#   - No global ~/.claude. No global CLAUDE.md, skills, scripts, settings
+#     or hooks. A project .claude/ is committed, so it comes with the clone.
+#   - No ssh keys, repository tokens or agent socket. Some harnesses carry only
+#     the model credential described below. It commits; it cannot push.
+#   - No tailnet and no VPN. The LAN stays reachable.
+#   - No tmux. It cannot split panes or fork further tasks.
+#   - Only committed state, with three carve-outs. Uncommitted changes,
+#     .env files and anything else untracked stay behind, as does any
+#     project setup a .claude/fork-worktree.sh hook would have done. The
+#     carve-outs: for a node project the origin's node_modules is copied
+#     into the clone and the .nvmrc node is bound read-only; a repo may
+#     list untracked paths in .agents/sandbox-services/provision-ro to
+#     bind read-only from the origin (a .venv, say); and a repo may stand
+#     per-run services up with .agents/sandbox-services/ (see below).
+# Write the handoff doc so it stands on its own, and tell the session to
+# commit — uncommitted work has nothing to fetch.
+#
+# Per-run services. A repo opts in by committing .agents/sandbox-services/ (or
+# the legacy .claude/sandbox-services/) with a compose file and a
+# sandbox-services.sh. When it is present, this
+# script stands the services up on the HOST as a throwaway docker compose
+# project, one per run, and binds only a unix-socket directory into the
+# sandbox read-write. There is no TCP path from the sandbox to the host, the
+# egress pin is untouched, and the compose publishes no host ports — that
+# last one is the hook's obligation, not something this script can enforce —
+# so a hostile session can at worst trash its own empty per-run database. The
+# services come down when the run ends, on the same trap that runs however
+# the session dies. The hook is host-side code, run from a copy taken before
+# the sandbox starts; for an untrusted checkout use --services-trust-ref so a
+# ref that changed the hook does not run it. The full contract — the up/down
+# interface, what this script guarantees, and the isolation properties a
+# repo's hook must hold — is docs/sandbox-services.md.
+#
+# Reviewing still matters. The sandbox contains the session while it runs;
+# it does not make the code it wrote safe. Read the branch before you build
+# it, exactly as you would a pull request from a stranger.
+#
+# --harness pi runs pi (github.com/earendil-works/pi) against OpenRouter
+# instead of claude,
+# in the same sandbox, with the same clone and the same fetch-back. It
+# needs --model, because there is no default, and it reads its key from
+# ~/.config/fork-sandbox/pi.env, which claude-sandboxed requires to be
+# mode 0600 and owned by you. That key is the only credential inside: no
+# Claude token is copied, and the run cannot spend the subscription.
+#
+# It keeps the review kit. pi implements the Agent Skills standard, so the
+# commit-then-review and code-review-portable skill directories and the script
+# toolbox are bound in; pi is handed each skill with --skill, because its $HOME
+# here is a fresh tmpfs with no settings file to discover them from. A handoff
+# should ask for a skill by name rather than with a slash command.
+# code-review-portable is a stand-in for the built-in /code-review, which is
+# compiled into claude and so exists on no other harness.
+#
+# What a pi run does give up is the rendered log. It runs with --mode json,
+# so events.jsonl holds one JSON AgentSessionEvent per line — agent_start,
+# message_start, message_end, text, auto_compaction_start,
+# auto_compaction_end, agent_end — but those are pi's own event shapes, not
+# claude's stream-json, so the formatted views of fork-sandbox-status.sh —
+# --result above all — still have nothing to render. Read events.jsonl
+# directly, with --log and the summary alongside it.
+#
+# --harness pi-local runs pi against a model YOU host, in a sandbox with no
+# network at all. The wrapper is agent-sandboxed rather than
+# claude-sandboxed: same clone, same services, same fetch-back, but egress
+# is sealed and the one endpoint arrives over a unix socket. Read its
+# header for how the bridge works.
+#
+# Three things follow. The run costs nothing, because the tokens are yours.
+# Nothing secret is inside — a local endpoint needs no credential, so
+# unlike a pi or a codex run there is no key in there at all. And the
+# session cannot exfiltrate or reach a LAN service, because there is
+# nowhere to reach.
+#
+# It needs an endpoint, in ~/.config/fork-sandbox/model.env, and --model
+# only when the endpoint serves more than one. The review kit, the raw-text
+# log caveat and the session copy are the same as --harness pi.
+#
+# The cost is that nothing can be fetched: no npm install, no pip install,
+# no git fetch. A repo whose suite needs dependencies must provision them
+# the usual way — node_modules is copied in, provision-ro binds a venv, and
+# .agents/sandbox-services stands the databases up. The generated prompt
+# tells the session that the network is gone, so it reports a missing
+# dependency instead of trying to install one.
+#
+# --harness codex runs OpenAI's codex the same way. It needs no --model,
+# because codex has a default of its own -- but one given is honoured, and
+# passed straight to `codex exec --model`. It needs no key file either: it
+# takes the ChatGPT sign-in from ~/.codex/auth.json. codex will not parse a
+# credential with fields missing, so the whole file goes in — except the
+# refresh token, which is replaced by a placeholder. That token is
+# single-use, and a sandbox that spent it would silently log the host out
+# of codex. codex refreshes only when the access token has expired, so a
+# run works and cannot rotate the host's credential; when the token HAS
+# expired the run refuses to start and says to log in again. The launcher
+# warns when under an hour is left.
+#
+# codex reports tokens but no price, so a codex run has counts and a null
+# cost. Its cached_input_tokens is part of input_tokens rather than a
+# figure beside it, unlike claude's, which is why total_tokens is
+# computed per harness and usage_source names which convention produced
+# the numbers.
+#
+# Both report their cost where they can, which matters more here than for
+# claude: an OpenRouter run spends money rather than a subscription.
+# claude states the session total in its result event; pi states it
+# nowhere, but records the token cost of every message in its session
+# file. So the session is written inside the clone's .git, copied to
+# <run-dir>/pi-session when the run ends, and totalled. Either way the
+# summary carries one 'cost:' line, which is the place to look.
+#
+# Every run's end is also appended to the durable run log,
+# ~/.claude/sandbox-runs.jsonl, by sandbox-run-log.py -- whatever the
+# harness and however the run ended: harness, model, exit code, commits,
+# tokens, cost, the --task-meta object, and a hash plus archived copy of
+# the handoff. The orchestrator judges the run later with
+# `sandbox-run-log.py verdict <run-id>` (the run dir's basename is the
+# id); `list` and `stats` read the log back. A machine without the tool
+# skips the append rather than failing the run.
+
+set -euo pipefail
+
+script_dir="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=fork-sandbox-lib.sh
+# shellcheck disable=SC1091  # plain shellcheck cannot follow it; use -x
+source "$script_dir/fork-sandbox-lib.sh"
+
+formatter="$script_dir/fork-sandbox-format.sh"
+status_cmd="fork-sandbox-status.sh"
+
+# Per-machine facts a shared checkout must not carry: the model endpoint for
+# a pi-local run, and the OpenRouter key for a pi run. agent-sandboxed reads
+# the same directory, and honors the same override.
+config_dir="${FORK_SANDBOX_CONFIG_DIR:-$HOME/.config/fork-sandbox}"
+
+usage() {
+    # The header block is the documentation: print it from line 2 down to the
+    # first non-comment line.
+    sed -n '2,/^[^#]/{ /^#/s/^# \?//p }' "$0"
+}
+
+branch=""
+checkout_ref=""
+model=""
+harness="claude"
+claude_extra_args=""
+pi_extra_args=""
+sandbox_args=""
+task_meta=""
+context_ro=""
+foreground=false
+keep_session=false
+no_services=false
+services_trust_ref=""
+
+while [[ "${1:-}" == -* ]]; do
+    case "$1" in
+        --branch)
+            branch="${2:?--branch requires a name}"
+            shift 2
+            ;;
+        --harness)
+            harness="${2:?--harness requires claude, pi, pi-local or codex}"
+            shift 2
+            ;;
+        --checkout)
+            checkout_ref="${2:?--checkout requires a ref}"
+            shift 2
+            ;;
+        --model)
+            model="${2:?--model requires a value}"
+            shift 2
+            ;;
+        --claude-args)
+            claude_extra_args="${2:?--claude-args requires a value}"
+            shift 2
+            ;;
+        --pi-args)
+            pi_extra_args="${2:?--pi-args requires a value}"
+            shift 2
+            ;;
+        --sandbox-args)
+            sandbox_args="${2:?--sandbox-args requires a value}"
+            shift 2
+            ;;
+        --task-meta)
+            task_meta="${2:?--task-meta requires a JSON object}"
+            shift 2
+            ;;
+        --context-ro)
+            context_ro="${2:?--context-ro requires a directory}"
+            shift 2
+            ;;
+        --foreground|--no-window)
+            # --no-window is the old name, kept so existing callers work.
+            foreground=true
+            shift
+            ;;
+        --keep-session)
+            keep_session=true
+            shift
+            ;;
+        --no-services)
+            no_services=true
+            shift
+            ;;
+        --services-trust-ref)
+            services_trust_ref="${2:?--services-trust-ref requires a ref}"
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1" >&2
+            echo "Run 'fork-sandbox.sh --help' for the options." >&2
+            exit 1
+            ;;
+    esac
+done
+
+project_path="${1:?Usage: fork-sandbox.sh [options] <project-path> <handoff-file>}"
+handoff_file="${2:?Usage: fork-sandbox.sh [options] <project-path> <handoff-file>}"
+
+if [[ ! -d "$project_path" ]]; then
+    echo "Error: project path '$project_path' is not a directory" >&2
+    exit 1
+fi
+if [[ ! -f "$handoff_file" ]]; then
+    echo "Error: handoff file '$handoff_file' not found" >&2
+    exit 1
+fi
+if [[ ! -s "$handoff_file" ]]; then
+    echo "Error: handoff file '$handoff_file' is empty. It is the session's" >&2
+    echo "whole prompt, so an empty one gives the session nothing to do." >&2
+    exit 1
+fi
+
+# This script is meant to be blanket-approved, so IT is the security boundary
+# (docs/permissions.md), and three of its arguments could otherwise be
+# turned into primitives the approval must not hand over:
+#
+#   - The handoff is READ INTO THE PROMPT of a model with internet
+#     access, so an unconstrained path is arbitrary-file-read plus
+#     exfiltration. Handoffs live in the scratch dir, where sessions
+#     stage them on purpose.
+#   - The project is CLONED INTO the sandbox, same channel. Repos under
+#     ~/src are the working material; nothing else is.
+#   - --sandbox-args passes through to claude-sandboxed, where --bind-ro
+#     would mount any host path — ~/.ssh, say — into that same sandbox.
+#     Only --unpin-egress may pass; the script adds every bind it needs
+#     itself.
+handoff_real="$(realpath -m "$handoff_file")"
+if [[ "$handoff_real" != /var/tmp/claude-scratch/* && "$handoff_real" != /tmp/claude-scratch/* ]]; then
+    echo "Error: handoff files must live under /var/tmp/claude-scratch/ (or the" >&2
+    echo "/tmp/claude-scratch compat symlink) — got '$handoff_real'. The handoff" >&2
+    echo "becomes the prompt of a session with internet access, so this path is a" >&2
+    echo "security boundary, not a tidiness rule. Stage the document there and" >&2
+    echo "rerun." >&2
+    exit 1
+fi
+# forks/ is excluded: it holds what approved scripts mktemp — run dirs, stage
+# dirs, and the codex credential staging dir. A handoff there would read a
+# file the machinery wrote (the credential above all) into the prompt of a
+# session with internet access. Handoffs go in the scratch root.
+if [[ "$handoff_real" == /var/tmp/claude-scratch/forks/* || "$handoff_real" == /tmp/claude-scratch/forks/* ]]; then
+    echo "Error: handoff files must not live under the forks/ machinery" >&2
+    echo "directory — got '$handoff_real'. forks/ holds run dirs, staging" >&2
+    echo "dirs and credential files that approved scripts create; reading one" >&2
+    echo "into an internet-connected prompt is the exfiltration this check" >&2
+    echo "exists to stop. Stage the handoff in the scratch root itself." >&2
+    exit 1
+fi
+project_real="$(realpath -m "$project_path")"
+if [[ "$project_real" != "$HOME"/src/* && "$project_real" != "$HOME/src" ]]; then
+    echo "Error: the project must live under ~/src — got '$project_real'." >&2
+    echo "An unattended agent gets the whole clone, and for most harnesses it" >&2
+    echo "gets internet too, so which repos may be handed over is a security" >&2
+    echo "boundary. Work from a checkout under ~/src, or launch" >&2
+    echo "claude-sandboxed by hand for something else." >&2
+    exit 1
+fi
+# --context-ro is the reviewed home for the one extra bind a caller may
+# need: context a host-side script gathered for the session to read. The
+# path constraint is what keeps it from becoming the --bind-ro primitive
+# the --sandbox-args check below refuses: /var/tmp/claude-scratch/forks/ holds
+# staging directories that approved scripts mktemp on purpose, and nothing
+# else — no $HOME, no ~/.ssh, no secrets.
+if [[ -n "$context_ro" ]]; then
+    context_ro_real="$(realpath -m "$context_ro")"
+    if [[ "$context_ro_real" != /var/tmp/claude-scratch/forks/* ]]; then
+        echo "Error: --context-ro must name a directory under" >&2
+        echo "/var/tmp/claude-scratch/forks/ — got '$context_ro_real'. An" >&2
+        echo "unattended agent can read the bind, and for most harnesses it has" >&2
+        echo "internet too, so which paths may be handed over is a security" >&2
+        echo "boundary. Stage the context in a mktemp directory there and rerun." >&2
+        exit 1
+    fi
+    if [[ ! -d "$context_ro_real" ]]; then
+        echo "Error: --context-ro directory '$context_ro_real' does not exist." >&2
+        exit 1
+    fi
+    context_ro="$context_ro_real"
+fi
+
+# A pi-local run is sealed, and --unpin-egress — the one value permitted below
+# — is the one flag agent-sandboxed refuses outright. So there is nothing this
+# option can legally carry for that harness; say so here rather than let it fail
+# after the clone.
+if [[ -n "$sandbox_args" && "$harness" == "pi-local" ]]; then
+    echo "Error: --sandbox-args does nothing for --harness pi-local. The only" >&2
+    echo "value allowed here is --unpin-egress, and a sealed sandbox refuses" >&2
+    echo "it: there is no network to unpin. Drop the flag." >&2
+    exit 1
+fi
+if [[ -n "$sandbox_args" && "$sandbox_args" != "--unpin-egress" ]]; then
+    echo "Error: --sandbox-args may only be '--unpin-egress'. Anything else —" >&2
+    echo "--bind-ro above all — widens what the sandbox can read, and this" >&2
+    echo "script is approved to run unsupervised. Add other binds to the" >&2
+    echo "script itself, where they get reviewed." >&2
+    exit 1
+fi
+if [[ ! -x "$formatter" ]]; then
+    echo "Error: $formatter is missing or not executable." >&2
+    echo "Run install.sh in the fork-sandbox repo." >&2
+    exit 1
+fi
+
+case "$harness" in
+    claude|pi|pi-local|codex) ;;
+    *)
+        echo "Error: --harness takes 'claude', 'pi', 'pi-local' or 'codex'," >&2
+        echo "not '$harness'." >&2
+        exit 1
+        ;;
+esac
+
+fs_require_sandbox_wrapper
+
+# The run dir, the codex auth dir and everything else this run stages live
+# under the one scratch root's forks/ directory. Create it now; the
+# UserPromptSubmit hook makes it too, but a script cannot assume the hook ran.
+mkdir -p /var/tmp/claude-scratch/forks
+
+# One block per harness, each resolving its tool and filling the same
+# variables. Nothing after this knows which harness it is looking at, so a
+# fourth means writing another arm rather than threading one more
+# condition through the rest of the script. Everything resolves here,
+# before anything is created, so a missing piece fails now rather than in
+# a detached tmux session an hour later.
+#
+#   harness_bin       the tool, as an absolute path. The tmux runner's
+#                     PATH is not this script's, so a bare name is not
+#                     enough.
+#   harness_version   what that binary calls itself, recorded so a result
+#                     can be read months later.
+#   harness_env_file  a NAME=VALUE file for the run's own secrets, or
+#                     empty. claude-sandboxed requires 0600 and refuses to
+#                     put a value on any command line.
+#   harness_flags     extra sandbox-wrapper flags — binds and PATH.
+#   harness_cmd       with harness_exec, the command --exec runs. Without
+#                     it, the tool's own flags, which follow the work dir.
+#                     Empty for claude, which claude-sandboxed starts by
+#                     itself.
+#   harness_exec      1 when the harness is a command claude-sandboxed has
+#                     to be told to run, 0 when the wrapper starts the
+#                     tool itself and takes its flags instead.
+#   harness_sandbox_bin
+#                     the sandbox wrapper, when it is not claude-sandboxed.
+#                     agent-sandboxed for a sealed local-model run: it is
+#                     claude-sandboxed plus the model bridge, and it takes
+#                     the same bind flags.
+#   run_formatter     what renders the output stream, or empty when the
+#                     tool does not speak stream-json.
+#   usage_source      which reader can total this run's tokens.
+harness_bin=""
+harness_version=""
+harness_env_file=""
+harness_flags=()
+harness_cmd=()
+harness_exec=0
+harness_sandbox_bin=""
+run_formatter="$formatter"
+usage_source="$harness"
+pi_session_dir=""
+
+# --claude-args names the claude CLI, which no other harness starts.
+if [[ -n "$claude_extra_args" && "$harness" != "claude" ]]; then
+    echo "Error: --claude-args passes flags to the claude CLI, which a" >&2
+    echo "$harness run never starts. Drop it, or drop --harness $harness." >&2
+    exit 1
+fi
+
+# --pi-args names pi, which only the pi harnesses start.
+if [[ -n "$pi_extra_args" && "$harness" != "pi" && "$harness" != "pi-local" ]]; then
+    echo "Error: --pi-args passes flags to pi, which a $harness run" >&2
+    echo "never starts. Drop it, or use --harness pi / pi-local." >&2
+    exit 1
+fi
+pi_extra_argv=()
+if [[ -n "$pi_extra_args" ]]; then
+    read -r -a pi_extra_argv <<< "$pi_extra_args"
+fi
+
+case "$harness" in
+claude)
+    # claude-sandboxed resolves and starts claude itself, and has done
+    # since before there was more than one harness. Leave it that way:
+    # its credential handling is bound up with that path.
+    harness_bin="$(command -v claude 2>/dev/null || true)"
+    [[ -n "$harness_bin" ]] || harness_bin="$HOME/.local/bin/claude"
+    if [[ -x "$harness_bin" ]]; then
+        harness_version="$("$harness_bin" --version 2>/dev/null | head -1 || true)"
+    fi
+    ;;
+
+pi)
+    if [[ -z "$model" ]]; then
+        echo "Error: --harness pi needs --model. There is no default: the model" >&2
+        echo "is an OpenRouter id, such as moonshotai/kimi-k3." >&2
+        exit 1
+    fi
+    harness_env_file="$config_dir/pi.env"
+    if [[ ! -f "$harness_env_file" ]]; then
+        echo "Error: $harness_env_file not found. A pi run reads its" >&2
+        echo "OpenRouter key from that file, one NAME=VALUE per line, and" >&2
+        echo "claude-sandboxed requires it to be mode 0600 and owned by you:" >&2
+        echo "  install -m 600 /dev/null $harness_env_file" >&2
+        echo "  \$EDITOR $harness_env_file   # OPENROUTER_API_KEY=..." >&2
+        exit 1
+    fi
+
+    # Resolving pi, its node and the tree to bind is shared with
+    # agent-sandboxed, so it lives in the lib.
+    fs_resolve_pi || exit 1
+    pi_real="$FS_PI_REAL"
+    pi_bin_dir="$FS_PI_BIN_DIR"
+    pi_root="$FS_PI_ROOT"
+    pi_node="$FS_PI_NODE"
+
+    # /usr is mounted already; anything else needs its own bind. The bin
+    # dir goes on PATH so a repo with no .nvmrc still has a node and an
+    # npm. These flags go in before the .nvmrc ones, and claude-sandboxed
+    # puts the last --prepend-path first, so a project that pins its own
+    # node still wins.
+    if [[ "$pi_root" != "/usr" ]]; then
+        harness_flags+=(--bind-ro "$pi_root")
+    fi
+    harness_flags+=(--prepend-path "$pi_bin_dir")
+
+    harness_bin="$pi_real"
+    harness_version="$("$pi_node" "$pi_real" --version 2>/dev/null | head -1 || true)"
+    # pi reads its prompt on stdin, like every other harness. --skill comes
+    # later, with the review kit; --mode json and -p come last, from the runner.
+    harness_cmd=("$pi_node" "$pi_real" --provider openrouter --model "$model")
+    if (( ${#pi_extra_argv[@]} )); then
+        harness_cmd+=("${pi_extra_argv[@]}")
+    fi
+    harness_exec=1
+    # pi speaks plain text, not stream-json, so there is nothing for the
+    # formatter to render. The log keeps the raw output instead.
+    run_formatter=""
+    fs_reject_unsafe_chars "$harness_env_file" "$pi_real" "$pi_node" "$pi_root" "$pi_bin_dir"
+    ;;
+
+pi-local)
+    # pi against a model you host, in a sandbox with no network at all.
+    # agent-sandboxed is the wrapper: it is claude-sandboxed --seal-egress
+    # plus the socket bridge that carries the one endpoint in, and it
+    # resolves pi, generates pi's config and starts pi itself. So this arm
+    # names no command and no key — there is nothing to authenticate to —
+    # and what follows the clone dir is pi's own flags.
+    harness_sandbox_bin="$(command -v agent-sandboxed 2>/dev/null || true)"
+    if [[ -z "$harness_sandbox_bin" ]]; then
+        harness_sandbox_bin="$HOME/.claude/scripts/agent-sandboxed"
+    fi
+    if [[ ! -x "$harness_sandbox_bin" ]]; then
+        echo "Error: cannot find agent-sandboxed, which runs the sealed" >&2
+        echo "local-model sandbox. Run install.sh in the fork-sandbox repo." >&2
+        exit 1
+    fi
+    # Fail before the clone, not after it: agent-sandboxed would refuse the
+    # same thing, but by then this script has staged a run directory, cloned
+    # the repo and started the services. --model does not stand in for the
+    # config file: it names the model, and there is no flag here that can
+    # carry an endpoint.
+    if [[ ! -f "$config_dir/model.env" ]]; then
+        echo "Error: --harness pi-local needs an endpoint to talk to. It is a" >&2
+        echo "fact about this machine's network, so it lives in a config file:" >&2
+        echo "  mkdir -p $config_dir" >&2
+        echo "  echo 'MODEL_ENDPOINT=http://your-host:8001/v1' > $config_dir/model.env" >&2
+        exit 1
+    fi
+
+    # Only for the version record: agent-sandboxed resolves pi again for
+    # itself, and binds it, so nothing here has to.
+    fs_resolve_pi || exit 1
+    harness_bin="$FS_PI_REAL"
+    harness_version="$("$FS_PI_NODE" "$FS_PI_REAL" --version 2>/dev/null | head -1 || true)"
+    if [[ -n "$model" ]]; then
+        harness_flags+=(--model "$model")
+    fi
+    # harness_cmd lands after the clone dir, where agent-sandboxed passes
+    # argv through to pi -- harness_flags would hit agent-sandboxed's own
+    # option parser instead.
+    if (( ${#pi_extra_argv[@]} )); then
+        harness_cmd+=("${pi_extra_argv[@]}")
+    fi
+    run_formatter=""
+    fs_reject_unsafe_chars "$harness_sandbox_bin" "$FS_PI_REAL" "$FS_PI_NODE"
+    # The run's token counts come from pi's session file either way, so the
+    # reader is pi's, whichever endpoint served the run.
+    usage_source="pi"
+    ;;
+
+codex)
+    # nvm is a shell function, so a non-interactive PATH usually has no
+    # node and no codex. Fall back to where a global npm install under nvm
+    # puts it; the last match of the glob wins, which is the newest version
+    # for the v1x/v2x names nvm creates.
+    codex_bin="$(command -v codex 2>/dev/null || true)"
+    if [[ -z "$codex_bin" ]]; then
+        for cand in "$HOME"/.nvm/versions/node/*/bin/codex; do
+            [[ -x "$cand" ]] && codex_bin="$cand"
+        done
+    fi
+    if [[ -z "$codex_bin" ]]; then
+        echo "Error: cannot find codex. Install it with:" >&2
+        echo "  npm install -g @openai/codex" >&2
+        echo "or, on Arch, the openai-codex package." >&2
+        exit 1
+    fi
+    codex_auth_src="$HOME/.codex/auth.json"
+    if [[ ! -f "$codex_auth_src" ]]; then
+        echo "Error: $codex_auth_src not found. Sign in on the host first:" >&2
+        echo "  codex login" >&2
+        exit 1
+    fi
+
+    # The sandbox cannot refresh, so check the lifetime here and say so in
+    # words, rather than let the run die inside codex as a 401. The token
+    # is a JWT: take its payload, undo base64url, and read exp. A payload
+    # that will not decode leaves the check silent rather than blocking a
+    # run over a format guess.
+    codex_exp=""
+    codex_jwt="$(jq -r '.tokens.access_token // empty' "$codex_auth_src" \
+        | cut -d. -f2 | tr '_-' '/+')"
+    if [[ -n "$codex_jwt" ]]; then
+        while (( ${#codex_jwt} % 4 )); do codex_jwt+="="; done
+        codex_exp="$(printf '%s' "$codex_jwt" | base64 -d 2>/dev/null \
+            | jq -r '.exp // empty' 2>/dev/null)"
+    fi
+    if [[ "$codex_exp" =~ ^[0-9]+$ ]]; then
+        codex_mins_left=$(( codex_exp / 60 - $(date +%s) / 60 ))
+        if (( codex_mins_left <= 0 )); then
+            echo "Error: the codex access token expired. The sandbox cannot" >&2
+            echo "refresh it — that is deliberate, because the refresh token is" >&2
+            echo "single-use and a sandbox refresh would log the host out. Run:" >&2
+            echo "  codex login" >&2
+            exit 1
+        elif (( codex_mins_left < 60 )); then
+            echo "Warning: the codex access token expires in ${codex_mins_left}m;" >&2
+            echo "a longer run than that will die when it does." >&2
+        fi
+    fi
+
+    # An npm codex is a node script symlinked out of bin/ into
+    # lib/node_modules, so the bin dir taken as written and the script taken
+    # as resolved name two different trees; bind the one directory that
+    # covers both. The sandbox's $HOME is a fresh tmpfs, so an install under
+    # ~/.nvm is invisible there without this. A distro package is a native
+    # binary under /usr, which is mounted already and needs none of it.
+    codex_real="$(readlink -f "$codex_bin")"
+    codex_bin_dir="$(readlink -f "$(dirname "$codex_bin")")"
+    codex_root="$(dirname "$codex_bin_dir")"
+    codex_node=""
+    if [[ "$(head -c 2 "$codex_real" 2>/dev/null)" == '#!' ]] \
+        && head -1 "$codex_real" | grep -q node; then
+        # The shebang is `env node`, so running the script by name would take
+        # whatever node the sandbox PATH happens to offer -- the project's
+        # pinned one, from a different major version. Name codex's own node
+        # instead, and let PATH stay the project's business.
+        codex_node="$codex_bin_dir/node"
+        if [[ ! -x "$codex_node" ]]; then
+            codex_node="$(command -v node 2>/dev/null || true)"
+        fi
+        if [[ -z "$codex_node" || ! -x "$codex_node" ]]; then
+            echo "Error: found codex at $codex_bin but no node to run it with." >&2
+            exit 1
+        fi
+        # One bind covers the lot: under nvm, bin/node and lib/node_modules/...
+        # are both inside the version directory. Refuse the case it does not
+        # cover rather than guess at a second mount -- a guess that binds too
+        # little fails deep inside node, as a missing package.
+        if [[ "$codex_real" != "$codex_root"/* ]]; then
+            echo "Error: codex resolves to $codex_real, which is outside its" >&2
+            echo "node install at $codex_root. This binds that one tree into" >&2
+            echo "the sandbox, so an install split across two would lose its" >&2
+            echo "dependencies. Install codex with npm -g under nvm." >&2
+            exit 1
+        fi
+    fi
+
+    # /usr is mounted already; anything else needs its own bind. The bin dir
+    # goes on PATH so a repo with no .nvmrc still has a node. These flags go
+    # in before the .nvmrc ones, and claude-sandboxed puts the last
+    # --prepend-path first, so a project that pins its own node still wins.
+    if [[ "$codex_root" != "/usr" ]]; then
+        harness_flags+=(--bind-ro "$codex_root")
+    fi
+    harness_flags+=(--prepend-path "$codex_bin_dir")
+
+    # Whether codex is run through its own node or straight, every later use
+    # is the same words, so settle it once.
+    codex_argv0=("$codex_real")
+    [[ -n "$codex_node" ]] && codex_argv0=("$codex_node" "$codex_real")
+
+    harness_bin="$codex_real"
+    harness_version="$("${codex_argv0[@]}" --version 2>/dev/null | head -1 || true)"
+    # The credential is built by the runner, into a file this script only
+    # names. See the runner for why it is made there and not here.
+    codex_auth_dir="$(mktemp -d /var/tmp/claude-scratch/forks/claude-fork-codex.XXXXXX)"
+    chmod 700 "$codex_auth_dir"
+    harness_env_file="$codex_auth_dir/env"
+
+    #   --json                 events as JSONL, which is where the token
+    #                          counts are; codex reports them nowhere else.
+    #   --dangerously-bypass…  codex ships its own Landlock and seccomp
+    #                          sandbox, which cannot nest inside bwrap's
+    #                          user namespace. Ours is the boundary here,
+    #                          and two half-working ones are worse than
+    #                          one that holds.
+    #   --ignore-rules         codex otherwise loads execpolicy .rules
+    #                          files FROM THE CHECKOUT. The clone is
+    #                          untrusted content by design, and a rules
+    #                          file in it steers the tool. No container
+    #                          closes that; not reading them does.
+    #   -                      read the prompt from stdin, said out loud
+    #                          rather than left to a default.
+    harness_cmd=("${codex_argv0[@]}" exec --json
+                 --dangerously-bypass-approvals-and-sandbox --ignore-rules)
+    if [[ -n "$model" ]]; then
+        harness_cmd+=(--model "$model")
+    fi
+    harness_cmd+=(-)
+    harness_exec=1
+    # codex speaks its own JSONL, not claude's stream-json, so the
+    # formatter has nothing it can render.
+    run_formatter=""
+    fs_reject_unsafe_chars "$codex_bin" "$codex_auth_src" "$codex_auth_dir" \
+        "$codex_real" "$codex_bin_dir" "$codex_root" "$codex_node"
+    ;;
+esac
+
+[[ -n "$harness_version" ]] || harness_version="unknown"
+fs_reject_unsafe_chars "$harness_bin" "$harness_version"
+
+# Check every value that goes into the generated runner or the run record
+# before anything is created, so a bad name cannot leave a clone behind on
+# the way out.
+fs_reject_unsafe_chars "$project_path" "$handoff_file" "$branch" "$checkout_ref" \
+    "$model" "$claude_extra_args" "$sandbox_args"
+
+# --task-meta never enters the generated runner -- it is written straight to
+# a file in the run dir -- so the check it needs is JSON validity, not shell
+# safety. Compacting to one line here also normalizes whatever whitespace
+# the caller's JSON carried. Validate before anything is created, so a typo
+# fails at once.
+if [[ -n "$task_meta" ]]; then
+    if ! task_meta="$(printf '%s' "$task_meta" \
+        | jq -ce 'if type == "object" then . else halt_error end' 2>/dev/null)"; then
+        echo "Error: --task-meta must be one valid JSON object, e.g." >&2
+        echo "  --task-meta '{\"kind\":\"implement\",\"difficulty\":3}'" >&2
+        echo "See sandbox-run-log.py's header for the recommended fields." >&2
+        exit 1
+    fi
+fi
+
+origin_repo="$(fs_repo_toplevel "$project_path")"
+branch="${branch:-sandbox-$(date +%Y%m%d-%H%M%S)}"
+
+fs_reject_unsafe_chars "$origin_repo" "$branch"
+fs_check_branch_free "$origin_repo" "$branch"
+
+# The clone starts at the origin repo's HEAD, so that is what the session's
+# commits are measured against later. --checkout moves that start point, and
+# moves the base with it, so a session that reviews a pull request head and
+# commits nothing still leaves the repo exactly as it was. Resolve the ref
+# here, in the user's own repo: a clone carries refs/heads and refs/tags only,
+# so a commit held under a private ref namespace has no name inside it.
+# A repo with no commits has nothing to clone and nothing to branch from.
+if [[ -n "$checkout_ref" ]]; then
+    if ! base_sha="$(cd "$origin_repo" && \
+        git rev-parse --verify --quiet "$checkout_ref^{commit}")"; then
+        echo "Error: --checkout '$checkout_ref' does not name a commit in" >&2
+        echo "$origin_repo. The ref is resolved there, not in the clone, so" >&2
+        echo "fetch it into that repo first." >&2
+        exit 1
+    fi
+elif ! base_sha="$(cd "$origin_repo" && git rev-parse HEAD 2>/dev/null)"; then
+    echo "Error: '$origin_repo' has no commits yet, so there is nothing to" >&2
+    echo "clone. Make a first commit and try again." >&2
+    exit 1
+fi
+
+fs_warn_if_dirty "$project_path" "$origin_repo"
+
+# Everything about this run lives under one directory. The clone sits inside
+# it, and only the clone is bind-mounted into the sandbox, so the log, the
+# handoff and the summary are all out of the sandbox's reach.
+run_dir="$(mktemp -d /var/tmp/claude-scratch/forks/claude-fork-sandbox.XXXXXX)"
+fs_reject_unsafe_chars "$run_dir"
+# The task metadata rides beside the run, where sandbox-run-log.py picks it
+# up at the end. The run dir is never bound into the sandbox, so the session
+# cannot see or edit it.
+if [[ -n "$task_meta" ]]; then
+    printf '%s\n' "$task_meta" > "$run_dir/task-meta.json"
+fi
+# Name the parent 'clone', not 'repo'. A directory called 'repo' sitting one
+# level above the checkout reads like the repository root, and a session that
+# builds an absolute path by hand drops the last segment and reads nothing.
+# The error it gets back says "No such file or directory", which looks like a
+# missing file rather than a wrong path.
+clone_dir="$run_dir/clone/$(basename "$origin_repo")"
+mkdir -p "$run_dir/clone"
+
+echo "Cloning '$origin_repo' for the sandbox..." >&2
+# Take the run dir back out if the clone fails, so a bad branch name does
+# not leave an empty directory behind under the scratch root.
+if ! fs_make_clone "$origin_repo" "$branch" "$clone_dir" \
+    "${checkout_ref:+$base_sha}"; then
+    rm -rf "$run_dir"
+    exit 1
+fi
+fs_collect_alternates "$clone_dir"
+
+# Node toolchain and dependencies, for a repo that has them (fs_node_provision
+# in the lib explains both halves).
+fs_node_provision "$origin_repo" "$clone_dir"
+
+# Per-run services and provision-ro binds, for a repo that opts in with
+# .agents/sandbox-services/ (or the legacy .claude/sandbox-services/). Both are
+# host-side or origin-reading actions
+# driven by committed config, so they run only when that config is trusted:
+# not with --no-services, and — when a trust ref is named, as a review of an
+# untrusted pull request head does — only if the checked-out ref did not
+# change the hook relative to that ref.
+services_enabled=0        # docker compose services are stood up
+provision_enabled=0       # provision-ro binds are honored
+services_hook_dir="$(fs_services_dir "$clone_dir")"
+if ! $no_services && [[ -d "$services_hook_dir" ]]; then
+    services_trusted=1
+    if [[ -n "$checkout_ref" && -z "$services_trust_ref" ]]; then
+        # --checkout names an arbitrary ref, which may be untrusted — a fetched
+        # pull-request head, say. A services hook is host-side code, and this
+        # script is blanket-approved, so the boundary is here, not a prompt: a
+        # checked-out ref does not get its hook run without a trust anchor.
+        echo "Warning: --checkout names an unanchored ref, so its per-run" >&2
+        echo "services hook is NOT run — a hook is host-side code and the ref" >&2
+        echo "may be untrusted. Pass --services-trust-ref <trusted-base> to" >&2
+        echo "enable it, or --no-services to skip this quietly." >&2
+        services_trusted=0
+    elif [[ -n "$services_trust_ref" ]]; then
+        # Run git in the ORIGIN, never the clone: the clone's git config is
+        # writable by the sandbox. Three-dot, so only what the checked-out ref
+        # changed relative to the trust ref counts — a hook change made on the
+        # base branch that the ref never touched does not disable it.
+        # git diff --quiet exits 0 for unchanged, 1 for changed, and higher
+        # when it could not evaluate the refs at all. Only 1 means what the
+        # warning says. A bad ref must be loud instead: the caller named an
+        # anchor on purpose, and a typo silently disabling services would
+        # change the run while blaming the checked-out ref for it.
+        trust_diff_rc=0
+        # Diff BOTH contract paths, not only the resolved one: a hostile ref
+        # could ADD a hook at the path the base lacks, and that must count as a
+        # change. .agents/sandbox-services/ is current, .claude/ the fallback.
+        (cd "$origin_repo" && git diff --quiet \
+            "${services_trust_ref}...${base_sha}" \
+            -- .agents/sandbox-services/ .claude/sandbox-services/) || trust_diff_rc=$?
+        if (( trust_diff_rc == 1 )); then
+            echo "Warning: the checked-out ref changes the sandbox-services" >&2
+            echo "contract (.agents/ or .claude/sandbox-services/) relative to the" >&2
+            echo "trusted base, so per-run services and" >&2
+            echo "provisioning are disabled for this run. A services hook is" >&2
+            echo "host-side code; a modified one from an untrusted ref is not run." >&2
+            services_trusted=0
+        elif (( trust_diff_rc != 0 )); then
+            echo "Error: git could not evaluate --services-trust-ref" >&2
+            echo "'$services_trust_ref' against '$base_sha' (git exited" >&2
+            echo "$trust_diff_rc; its error is above). Fix the ref — is it" >&2
+            echo "fetched? — and rerun." >&2
+            exit 1
+        fi
+    fi
+    if (( services_trusted )); then
+        provision_enabled=1
+        if [[ -f "$services_hook_dir/sandbox-services.sh" ]]; then
+            if command -v docker >/dev/null; then
+                services_enabled=1
+            else
+                echo "Warning: the sandbox-services contract is present but docker" >&2
+                echo "is not on PATH; running without per-run services." >&2
+            fi
+        fi
+    fi
+fi
+
+# Provision-ro binds (read-only origin paths into the clone), gated by the same
+# trust decision as the services. fs_provision_ro fills FS_PROVISION_RO_FLAGS.
+if (( provision_enabled )); then
+    fs_provision_ro "$origin_repo" "$clone_dir"
+fi
+
+# A services compose must pull its images, never build them: a `build:` runs
+# Dockerfile steps from the checked-out clone on the HOST daemon, with
+# unrestricted network — content the trust check above does not cover, since it
+# diffs only the sandbox-services dir and a hostile ref can edit a Dockerfile
+# alone. Refuse the mechanism rather than run it. The clone is still trusted
+# committed state at this point (the sandbox has not started), so checking it
+# here equals checking the copy taken below.
+#
+# This scans the hook dir only. A repo using the overlay variant keeps its base
+# compose at the repo root, and may name a repo-root overlay too (referenced
+# from its own hook script); both are outside this scan, exactly as the base
+# compose always was. The protection there is the trusted, trust-diffed hook not
+# invoking a build — not this grep.
+if (( services_enabled )); then
+    if grep -rqE '^[[:space:]]*build[[:space:]]*:' "$services_hook_dir" \
+        --include='*.yml' --include='*.yaml' 2>/dev/null; then
+        echo "Warning: the services compose contains a 'build:' key, so per-run" >&2
+        echo "services are disabled for this run. Images must be pulled, never" >&2
+        echo "built: a build runs Dockerfile steps from the checked-out clone on" >&2
+        echo "the host, outside the sandbox and outside the trust check. See the" >&2
+        echo "contract in skills/fork-sandbox/SKILL.md." >&2
+        services_enabled=0
+    fi
+fi
+
+# Stand the services up: create the sockets directory, copy the hook out of the
+# clone before the sandbox can touch it, and name a compose project the orphan
+# sweep can recognize. The copy matters — the clone is trusted committed state
+# now but becomes untrusted the moment the sandbox writes to it, and `down`
+# runs after that. The run dir is never bound into the sandbox, so a copy here
+# stays trusted for both up and down.
+services_script=""
+sockets_dir=""
+services_project=""
+if (( services_enabled )); then
+    sockets_dir="$run_dir/services/sockets"
+    mkdir -p "$sockets_dir"
+    cp -a "$services_hook_dir" "$run_dir/services/hook"
+    services_script="$run_dir/services/hook/sandbox-services.sh"
+    chmod +x "$services_script" 2>/dev/null || true
+    # Compose project names must be lowercase alphanumeric and hyphens. The run
+    # dir basename already begins 'claude-fork-sandbox', which is the
+    # distinctive prefix the orphan sweep matches on. Do NOT prepend another
+    # 'claude-': a broad 'claude-*' sweep would also match unrelated user
+    # compose projects (any `docker compose` run in a 'claude-*' directory) and
+    # delete their volumes.
+    services_rd_base="$(basename "$run_dir")"
+    services_project="${services_rd_base,,}"
+    services_project="${services_project//[^a-z0-9-]/-}"
+    # Case-folding collapses mktemp's case-sensitive uniqueness, so two
+    # concurrent runs could fold to one project name — and one run's `down -v`
+    # would then destroy the other's volumes mid-session. A checksum of the
+    # original basename keeps folded names distinct. The orphan sweep in the
+    # generated runner derives live names the same way; keep the two matched.
+    services_project="$services_project-$(printf '%s' "$services_rd_base" | cksum | cut -d' ' -f1)"
+    fs_reject_unsafe_chars "$sockets_dir" "$services_script" "$services_project"
+fi
+
+# The self-review skills and the read-only script toolbox, so an unattended
+# session can end its work the way an interactive one does: run
+# commit-then-review, which drives review-context.sh. Two skills go in.
+# commit-then-review is the wrapper. code-review-portable is the review engine
+# itself, a harness-agnostic stand-in for the built-in /code-review — which is
+# compiled into claude and so exists on no other harness; a handoff for pi,
+# pi-local or codex asks for it by name, while claude keeps its built-in. The
+# skills are instructions; the scripts are whatever your toolbox holds, and any
+# that want a credential fail closed in the sandbox, because the ones they reach
+# for — a forge token, gh, slack — are not in the environment. Keep secrets out
+# of that directory: it is bound read-only into every run. A pi run does carry
+# one key, its own OpenRouter key, and no script here uses that.
+# The global CLAUDE.md stays out on purpose — a sandboxed run gets the
+# project's CLAUDE.md from its own clone.
+#
+# Every harness gets the binds. pi implements the Agent Skills standard and its
+# own documentation names ~/.claude/skills as a source, so the same directory
+# serves both; the difference is that claude discovers a skill and pi has to be
+# handed it with --skill, because the sandbox gives it a fresh $HOME with no
+# settings file to read.
+review_kit_flags=()
+for skill_name in commit-then-review code-review-portable; do
+    skill_dir="$HOME/.claude/skills/$skill_name"
+    [[ -d "$skill_dir" ]] || continue
+    fs_reject_unsafe_chars "$skill_dir"
+    review_kit_flags+=(--bind-ro "$skill_dir")
+    if [[ "$harness" == "pi" || "$harness" == "pi-local" ]]; then
+        harness_cmd+=(--skill "$skill_dir")
+    fi
+done
+if [[ -d "$HOME/.claude/scripts" ]]; then
+    review_kit_flags+=(--bind-ro "$HOME/.claude/scripts"
+                       --prepend-path "$HOME/.claude/scripts")
+    # The farm is per-file symlinks into a checkout (install.sh's doing),
+    # so binding the farm alone mounts dangling links. Bind the checkout's
+    # scripts directory too, at its real path, so the links resolve. One
+    # readlink suffices: every script resolves into the one directory.
+    first_link="$(find "$HOME/.claude/scripts" -maxdepth 1 -type l -print -quit)"
+    if [[ -n "$first_link" ]]; then
+        link_target_dir="$(dirname "$(readlink -f "$first_link")")"
+        if [[ -d "$link_target_dir" && "$link_target_dir" != "$HOME/.claude/scripts" ]]; then
+            review_kit_flags+=(--bind-ro "$link_target_dir")
+        fi
+    fi
+fi
+
+# The operator inbox: the one channel that reaches a run after it has started.
+# The host writes files into it with fork-sandbox-say.sh; the sandbox sees it
+# read-only, and a read-only bind reflects host writes live, so an addendum
+# written a minute from now is visible inside without remounting anything.
+#
+# This adds NO writable surface. The bind is read-only, and the run dir already
+# lives under /var/tmp/claude-scratch/forks/, which is the same constraint
+# --context-ro enforces on the one caller-chosen bind — so it is a path this
+# script may legally mount.
+inbox_dir="$run_dir/inbox"
+mkdir -p "$inbox_dir"
+chmod 755 "$inbox_dir"
+fs_reject_unsafe_chars "$inbox_dir"
+
+# Delivery on the claude harness is by hook, so the session needs no
+# cooperation: a PostToolUse hook puts an unread addendum next to the very next
+# tool result, and a Stop hook refuses to let the session finish while one is
+# unread. Both the hook script and the settings file naming it must be readable
+# INSIDE the sandbox, and the run dir is not bound — only the inbox is. So both
+# go in the inbox, as dotfiles: the hook and fork-sandbox-say.sh both work in
+# '*.md', so a leading dot is invisible to them, and it keeps the sandbox's
+# bind list at one entry instead of three. Nothing inside can rewrite them —
+# the bind is read-only — and nothing outside writes the inbox except
+# fork-sandbox-say.sh, which only ever generates a '<epoch>-<nn>.md' name.
+inbox_hook=""
+inbox_settings=""
+if [[ "$harness" == "claude" ]]; then
+    inbox_hook_src="$script_dir/fork-sandbox-inbox-hook.sh"
+    if [[ ! -r "$inbox_hook_src" ]]; then
+        echo "Error: $inbox_hook_src is missing. It delivers operator addenda" >&2
+        echo "to a running session. Run install.sh in the fork-sandbox repo." >&2
+        exit 1
+    fi
+    inbox_hook="$inbox_dir/.inbox-hook.sh"
+    inbox_settings="$inbox_dir/.settings.json"
+    install -m 755 "$inbox_hook_src" "$inbox_hook"
+    # jq builds it so the path is escaped properly rather than interpolated
+    # into hand-written JSON. Stop takes no matcher; PostToolUse matches every
+    # tool, because an addendum is not about any particular one.
+    jq -n --arg hook "$inbox_hook" '{
+        hooks: {
+            PostToolUse: [ { matcher: "*",
+                             hooks: [ { type: "command", command: $hook, timeout: 20 } ] } ],
+            Stop: [ { hooks: [ { type: "command", command: $hook, timeout: 20 } ] } ],
+        },
+    }' > "$inbox_settings"
+    fs_reject_unsafe_chars "$inbox_hook" "$inbox_settings"
+fi
+
+# The handoff is the whole prompt, so prepend the one fact the caller cannot
+# know: where the clone ended up. The session starts there, so relative paths
+# always work — but a model that writes an absolute path by hand can drop a
+# segment, and the "No such file or directory" it gets back reads as a missing
+# file rather than a wrong path. Naming the directory once, at the top, costs
+# nothing and removes the guess.
+handoff_copy="$run_dir/handoff.md"
+{
+    cat <<EOF
+# Your working directory
+
+You are in a sandboxed, throwaway clone of the repository. Its absolute path
+is:
+
+    $clone_dir
+
+You start there, so **prefer relative paths**. When you do need an absolute
+one, copy the line above rather than typing it out: a hand-built path that
+drops a segment fails as "No such file or directory", which looks like a
+missing file rather than a wrong path.
+
+That directory is the only writable thing here. Everything else in the sandbox
+is read-only or ephemeral.
+EOF
+    # Same convention as the working-directory block above: name the absolute
+    # path once so nothing has to build it by hand.
+    cat <<EOF
+
+## Operator inbox
+
+The person who launched this run can send you further instructions while you
+work. They arrive as files in:
+
+    $inbox_dir
+
+Each file there is an **operator addendum**: a message from the same person who
+wrote your handoff, written after this run started. An addendum is a
+continuation of the handoff and carries the same authority — it may override
+the handoff rather than merely add to it, and where the two conflict the
+addendum is the newer instruction and wins.
+
+The directory is mounted read-only. Never write to it. An empty inbox is the
+normal case, not a problem: most runs get no addenda at all.
+EOF
+    if [[ "$harness" == "claude" ]]; then
+        cat <<'EOF'
+
+Addenda are pushed to you automatically — beside a tool result, or at the end
+of a turn — so you do not have to go looking. Reading the directory yourself is
+a backstop, not the mechanism.
+EOF
+    else
+        cat <<'EOF'
+
+Nothing pushes them at you on this harness, so you have to look. List that
+directory and read anything new **before every commit, and again before you
+write your final report**. An addendum you never read is an instruction you
+never followed.
+EOF
+    fi
+    if [[ "$harness" == "pi-local" ]]; then
+        cat <<'EOF'
+
+## This sandbox has no network
+
+There is no internet here, no LAN, and no DNS. The model you are running on is
+reached over a socket and is the only thing outside this machine you can talk
+to. Nothing else will answer.
+
+So do not try to install anything — no `npm install`, no `pip install`, no
+`apt-get`, no `git fetch`, no documentation lookup. Those fail, and the failure
+is the sandbox working as intended rather than a problem to debug or work
+around.
+
+Everything the work needs is already here: the clone, whatever dependencies
+were provisioned into it, and any per-run services. If something genuinely
+necessary is missing, say so in your final report instead of trying to fetch
+it.
+EOF
+    fi
+    if (( services_enabled )); then
+        cat <<EOF
+
+## Per-run services are up
+
+This repository sets up services for the sandbox, and they are running now on
+the host. The clone holds an env file, \`.env.sandbox\`, that points the
+project's configuration at them over unix sockets. Use it the way the project
+expects — most projects read it as \`ENVFILE=.env.sandbox <command>\`, or by
+sourcing it; check the project's own CLAUDE.md.
+
+The services listen on unix sockets under:
+
+    $sockets_dir
+
+A client that speaks a unix socket connects to it directly. A client that can
+only reach a service over TCP on localhost needs a relay first — run this in
+the background, once per such service, before starting the client:
+
+    socat TCP-LISTEN:<port>,fork,bind=127.0.0.1 UNIX:$sockets_dir/<name>.sock &
+
+\`socat\` is already on PATH here. The socket names, the ports and the env-file
+convention are the project's; its CLAUDE.md or the services hook documents them.
+EOF
+    fi
+    printf '\n---\n\n'
+    cat -- "$handoff_file"
+} > "$handoff_copy.part"
+# Assemble into a temp name and rename, rather than redirect straight onto the
+# destination. A redirection truncates before the `cat` above reads, so a caller
+# that passed this very path as its handoff would have its prompt destroyed and
+# replaced by the preamble alone. `cp` used to make that case an error; building
+# beside the destination keeps it correct instead.
+mv -- "$handoff_copy.part" "$handoff_copy"
+
+# Resolve the wrapper to an absolute path now. The generated runner executes
+# in the tmux server's environment, and that PATH may not carry
+# ~/.claude/scripts — a server started at login often predates the user's
+# PATH setup. The pre-flight above checked this launcher's environment,
+# which proves nothing about the runner's.
+# A harness may bring its own wrapper: agent-sandboxed for a sealed
+# local-model run, which is claude-sandboxed plus a model bridge and takes the
+# same bind flags. It is already resolved to an absolute path, for the same
+# reason this one is.
+if [[ -n "$harness_sandbox_bin" ]]; then
+    sandbox_bin="$harness_sandbox_bin"
+else
+    sandbox_bin="$(command -v claude-sandboxed || true)"
+    if [[ -z "$sandbox_bin" ]]; then
+        sandbox_bin="$HOME/.claude/scripts/claude-sandboxed"
+    fi
+fi
+
+# The run-log appender, resolved to an absolute path for the same reason the
+# wrapper is. Optional on purpose: a machine without it skips the append
+# rather than failing the run.
+run_log_bin="$(command -v sandbox-run-log.py 2>/dev/null || true)"
+[[ -n "$run_log_bin" ]] || run_log_bin="$HOME/.claude/scripts/sandbox-run-log.py"
+[[ -x "$run_log_bin" ]] || run_log_bin=""
+
+# claude-sandboxed stops parsing its own flags at the first argument starting
+# with '-', so its flags and the work dir must come first.
+sandbox_cmd=("$sandbox_bin")
+for alt in "${FS_ALTERNATES[@]-}"; do
+    [[ -n "$alt" ]] || continue
+    sandbox_cmd+=(--bind-ro "$alt")
+done
+if (( ${#harness_flags[@]} )); then
+    sandbox_cmd+=("${harness_flags[@]}")
+fi
+if (( ${#FS_NODE_FLAGS[@]} )); then
+    sandbox_cmd+=("${FS_NODE_FLAGS[@]}")
+fi
+if (( ${#FS_PROVISION_RO_FLAGS[@]} )); then
+    sandbox_cmd+=("${FS_PROVISION_RO_FLAGS[@]}")
+fi
+# The one writable path outside the clone: the per-run services sockets dir.
+# Docker on the host creates the sockets here; the sandbox reaches the services
+# through them and by no other route.
+if (( services_enabled )); then
+    sandbox_cmd+=(--bind-rw "$sockets_dir")
+fi
+if (( ${#review_kit_flags[@]} )); then
+    sandbox_cmd+=("${review_kit_flags[@]}")
+fi
+if [[ -n "$context_ro" ]]; then
+    sandbox_cmd+=(--bind-ro "$context_ro")
+fi
+# The operator inbox, for every harness. Read-only, so this widens nothing the
+# sandbox can write; it is the one path a host can put words into after launch.
+sandbox_cmd+=(--bind-ro "$inbox_dir")
+if [[ -n "$sandbox_args" ]]; then
+    # Deliberate word splitting: the caller passes a flag string.
+    # shellcheck disable=SC2206
+    sandbox_cmd+=($sandbox_args)
+fi
+# A harness with a command of its own runs through --exec. claude has none,
+# because claude-sandboxed starts it, and pi-local has none either, because
+# agent-sandboxed starts pi — so for both of those what follows the clone dir
+# is the tool's own flags.
+if (( harness_exec )); then
+    case "$harness" in
+    pi)
+        # pi keeps its session under $HOME, and $HOME here is a tmpfs that
+        # dies with the sandbox — so the transcript, and the tokens
+        # recorded in it, would go with it. Put it inside the clone's .git
+        # instead. That is writable, and git tracks nothing under .git, so
+        # a session that runs `git add -A` cannot commit it by accident.
+        # The runner copies it out at the end. The prompt arrives on stdin,
+        # which forces print mode by itself; -p states the intent anyway.
+        #
+        # --mode json makes print mode emit every AgentSessionEvent as JSONL
+        # on stdout instead of just the final text, so events.jsonl holds a
+        # real event stream. It changes what the run reports, never what it
+        # does: the same print mode, the same session, the same agent loop.
+        pi_session_dir="$clone_dir/.git/pi-session"
+        harness_cmd+=(--session-dir "$pi_session_dir" --mode json -p)
+        ;;
+    codex)
+        # codex wants its credential as a FILE, and the sandbox's $HOME is
+        # a fresh tmpfs with nothing in it. The token rides in as an
+        # environment variable, which claude-sandboxed keeps out of every
+        # command line, and this shim writes it where codex looks. Writing
+        # it inside rather than binding it also leaves codex free to
+        # rewrite it, which a read-only bind would refuse.
+        # shellcheck disable=SC2016  # a program for the sandbox's bash
+        harness_cmd=(/bin/bash -c \
+            'umask 077; mkdir -p "$HOME/.codex"; printf %s "$CODEX_AUTH_JSON" > "$HOME/.codex/auth.json"; unset CODEX_AUTH_JSON; exec "$@"' \
+            codex-auth-shim "${harness_cmd[@]}")
+        ;;
+    esac
+    sandbox_cmd+=(--exec)
+    if [[ -n "$harness_env_file" ]]; then
+        sandbox_cmd+=(--env-file "$harness_env_file")
+    fi
+    sandbox_cmd+=("$clone_dir" "${harness_cmd[@]}")
+elif [[ "$harness" == "pi-local" ]]; then
+    # pi's own flags, in the position claude's go. The session dir is the
+    # same trick as the pi harness above: $HOME is a tmpfs that dies with
+    # the sandbox, and .git is writable but tracked by nothing, so a session
+    # running `git add -A` cannot commit the transcript by accident. The
+    # runner copies it out at the end.
+    pi_session_dir="$clone_dir/.git/pi-session"
+    # The work dir here is a throwaway clone, and nothing runs git in it once
+    # the sandbox has touched it, so agent-sandboxed's warning about a writable
+    # .git would only tell the caller to use this script.
+    sandbox_cmd+=(--no-git-warning "$clone_dir")
+    if (( ${#harness_cmd[@]} )); then
+        sandbox_cmd+=("${harness_cmd[@]}")
+    fi
+    # --mode json for the same reason as the pi arm above: a real event
+    # stream in events.jsonl, and no change to how the session runs.
+    sandbox_cmd+=(--session-dir "$pi_session_dir" --mode json -p)
+else
+    sandbox_cmd+=("$clone_dir" --dangerously-skip-permissions)
+    # --print exits when the work is done and never shows a dialog. stream-json
+    # needs --verbose to emit anything beyond the final result.
+    sandbox_cmd+=(--print --verbose --output-format stream-json)
+    # The operator-inbox hooks. --settings loads them on top of whatever the
+    # sandbox has, which is nothing: there is no global ~/.claude in here.
+    # --include-hook-events puts each hook firing into the event stream, which
+    # is how fork-sandbox-status.sh --monitor can report a delivery. It costs
+    # two extra log lines per tool call; the log is the only thing that grows.
+    if [[ -n "$inbox_settings" ]]; then
+        sandbox_cmd+=(--settings "$inbox_settings" --include-hook-events)
+    fi
+    if [[ -n "$model" ]]; then
+        sandbox_cmd+=(--model "$model")
+    fi
+    if [[ -n "$claude_extra_args" ]]; then
+        # shellcheck disable=SC2206
+        sandbox_cmd+=($claude_extra_args)
+    fi
+fi
+
+# tmux rewrites ':' and '.' in a session name without saying so, and a branch
+# name may hold either. Fold every character tmux would touch to '-' here, so
+# the name this script records is the name tmux actually uses.
+session_name="cc-sbx-$(printf '%s' "$branch" | tr -c 'A-Za-z0-9_-' '-')"
+# Two runs on different repos may want the same branch name, and an earlier
+# --keep-session run may still be sitting there. tmux refuses a duplicate, so
+# fall back to the run directory's own unique suffix.
+if tmux has-session -t "=$session_name" 2>/dev/null; then
+    session_name="$session_name-${run_dir##*.}"
+fi
+
+user_shell="${SHELL:-/bin/bash}"
+# In the foreground the runner holds this terminal, so an interactive shell at
+# the end would never hand it back.
+if $keep_session && $foreground; then
+    echo "Warning: --keep-session does nothing with --foreground; there is" >&2
+    echo "no tmux session to keep open." >&2
+fi
+if $keep_session && ! $foreground; then
+    keep_open=1
+else
+    keep_open=0
+fi
+
+started_at="$(date +%s)"
+
+{
+    printf 'version=1\n'
+    printf 'run_dir=%s\n' "$run_dir"
+    printf 'origin_repo=%s\n' "$origin_repo"
+    printf 'clone_dir=%s\n' "$clone_dir"
+    # The run's machine-readable record of where the inbox is, for a reader
+    # that has the run.env and should not have to know the layout. The two
+    # scripts that touch the inbox deliberately do NOT read this: they build
+    # "$run_dir/inbox" from the run dir they validated, which is the same
+    # fixed-name discipline resolve_run_file uses, so a rewritten run.env
+    # cannot point either of them at another directory.
+    printf 'inbox=%s\n' "$inbox_dir"
+    printf 'branch=%s\n' "$branch"
+    printf 'base_sha=%s\n' "$base_sha"
+    printf 'checkout=%s\n' "$checkout_ref"
+    printf 'harness=%s\n' "$harness"
+    printf 'harness_version=%s\n' "$harness_version"
+    printf 'model=%s\n' "$model"
+    printf 'session=%s\n' "$session_name"
+    printf 'started_at=%s\n' "$started_at"
+} > "$run_dir/run.env"
+
+# Generate the runner instead of building a shell command string. Every value
+# below is quoted with printf %q, so nothing in a path, a branch name or a
+# handoff document is ever re-parsed as shell syntax.
+{
+    printf '#!/usr/bin/env bash\n'
+    printf '# Generated by fork-sandbox.sh. One headless sandboxed agent session.\n'
+    printf '# Values are quoted with printf %%q. Do not edit; relaunch instead.\n'
+    printf 'set -uo pipefail\n\n'
+    printf 'run_dir=%q\n' "$run_dir"
+    printf 'clone_dir=%q\n' "$clone_dir"
+    printf 'origin_repo=%q\n' "$origin_repo"
+    printf 'branch=%q\n' "$branch"
+    printf 'base_sha=%q\n' "$base_sha"
+    printf 'handoff=%q\n' "$handoff_copy"
+    printf 'formatter=%q\n' "$run_formatter"
+    printf 'harness=%q\n' "$harness"
+    printf 'harness_version=%q\n' "$harness_version"
+    printf 'usage_source=%q\n' "$usage_source"
+    printf 'harness_env_file=%q\n' "$harness_env_file"
+    printf 'codex_auth_src=%q\n' "${codex_auth_src:-}"
+    printf 'codex_auth_dir=%q\n' "${codex_auth_dir:-}"
+    printf 'model=%q\n' "$model"
+    printf 'started_at=%q\n' "$started_at"
+    printf 'pi_session_dir=%q\n' "$pi_session_dir"
+    printf 'user_shell=%q\n' "$user_shell"
+    printf 'keep_open=%q\n' "$keep_open"
+    printf 'services_enabled=%q\n' "$services_enabled"
+    printf 'services_script=%q\n' "$services_script"
+    printf 'sockets_dir=%q\n' "$sockets_dir"
+    printf 'services_project=%q\n' "$services_project"
+    printf 'run_log_bin=%q\n' "$run_log_bin"
+    printf 'sandbox_cmd=('
+    printf '%q ' "${sandbox_cmd[@]}"
+    printf ')\n\n'
+    cat <<'RUNNER'
+events="$run_dir/events.jsonl"
+sandbox_log="$run_dir/sandbox.log"
+
+printf '%s\n' "$$" > "$run_dir/pid"
+# Drop the previous run's exit code, so a manual re-run reads as running
+# rather than as already finished.
+rm -f "$run_dir/exit-code"
+: > "$events"
+: > "$sandbox_log"
+
+printf '== fork-sandbox ==\n'
+printf 'harness: %s\n' "$harness"
+printf 'branch:  %s\n' "$branch"
+printf 'origin:  %s\n' "$origin_repo"
+printf 'clone:   %s\n' "$clone_dir"
+printf 'log:     %s\n' "$events"
+printf '\nHeadless. Nothing here needs a keypress; the session exits on its own.\n\n'
+
+# codex's credential is built here, when the run starts, rather than by the
+# launcher — a run that sits in a queue would otherwise carry a token that
+# aged while it waited. The refresh token is replaced by a placeholder: the
+# real one is single-use, so a sandbox that spent it would silently log the
+# host out of codex. codex only refreshes when the access token has
+# expired, so this run works and simply cannot rotate the host's
+# credential. The file is 0600 and goes when this script does.
+# Cleanup that must run however this session ends — a normal exit, an error, or
+# a kill. It removes the codex credential and tears the per-run services down.
+# It runs its body once (a --keep-session run calls it inline before the exec,
+# which never reaches an EXIT trap; the trap catches every other ending).
+run_cleanup() {
+    [[ -n "${_cleanup_done:-}" ]] && return 0
+    _cleanup_done=1
+    if [[ -n "$codex_auth_dir" ]]; then
+        rm -rf "$codex_auth_dir"
+    fi
+    if [[ "$services_enabled" == "1" && -n "$services_script" ]]; then
+        # timeout on every docker-touching command here: this function is the
+        # EXIT trap, and a wedged docker daemon must not hang the run forever
+        # with the output hidden in sandbox.log.
+        timeout 120 "$services_script" down "$services_project" \
+            >> "$sandbox_log" 2>&1 || true
+        # Opportunistic sweep: remove any claude-* compose project whose run
+        # dir is gone. A session killed before this ran can leak one; catch it
+        # on the next run's teardown. Best-effort, never fatal.
+        if command -v docker >/dev/null 2>&1; then
+            local live=" " d bn p orphan
+            for d in /var/tmp/claude-scratch/forks/claude-fork-sandbox.*/; do
+                [[ -d "$d" ]] || continue
+                # Both name forms per run dir: with the cksum suffix (what the
+                # launcher derives now) and without it (what runs launched
+                # before the suffix existed still use). Dropping the old form
+                # would sweep a live old-format run's services out from under
+                # it during the transition.
+                bn="$(basename "$d")"; p="${bn,,}"; p="${p//[^a-z0-9-]/-}"
+                live+="$p $p-$(printf '%s' "$bn" | cksum | cut -d' ' -f1) "
+            done
+            while IFS= read -r orphan; do
+                # Only projects this script creates: the run-dir basename,
+                # sanitized. A bare claude-* would sweep unrelated user projects.
+                case "$orphan" in claude-fork-sandbox-*) ;; *) continue ;; esac
+                [[ "$live" == *" $orphan "* ]] && continue
+                # The run dir is gone, so its compose file is too. Remove the
+                # project's resources by their compose label rather than through
+                # a compose file that no longer exists.
+                timeout 60 docker ps -aq \
+                    --filter "label=com.docker.compose.project=$orphan" \
+                    | xargs -r timeout 60 docker rm -f >> "$sandbox_log" 2>&1 || true
+                timeout 60 docker network ls -q \
+                    --filter "label=com.docker.compose.project=$orphan" \
+                    | xargs -r timeout 60 docker network rm >> "$sandbox_log" 2>&1 || true
+                timeout 60 docker volume ls -q \
+                    --filter "label=com.docker.compose.project=$orphan" \
+                    | xargs -r timeout 60 docker volume rm >> "$sandbox_log" 2>&1 || true
+            done < <(timeout 60 docker compose ls -a --format json 2>/dev/null \
+                     | jq -r 'if type == "array" then .[] else . end
+                              | .Name' 2>/dev/null || true)
+            # The jq filter takes both shapes compose emits: one JSON array
+            # (current `compose ls`) and NDJSON, one object per line (what
+            # `compose ps` moved to in v2.21) — assuming one shape makes the
+            # sweep a silent permanent no-op on the other.
+        fi
+    fi
+}
+trap run_cleanup EXIT
+if [[ -n "$codex_auth_src" && -n "$harness_env_file" ]]; then
+    install -m 600 /dev/null "$harness_env_file"
+    {
+        printf 'CODEX_AUTH_JSON='
+        jq -c '.tokens.refresh_token = "sandbox-placeholder-cannot-refresh"' \
+            "$codex_auth_src"
+    } > "$harness_env_file"
+fi
+
+# Per-run services: stand them up before the session and point the project's
+# config at the sockets. The teardown is already armed, so a failure here still
+# cleans up. A services failure is a warning, not fatal — the session runs, it
+# just cannot reach the services.
+if [[ "$services_enabled" == "1" && -n "$services_script" ]]; then
+    printf 'fork-sandbox: starting per-run services (%s)...\n' "$services_project" >&2
+    if ! "$services_script" up "$sockets_dir" "$clone_dir" "$services_project" \
+        >> "$sandbox_log" 2>&1; then
+        printf 'fork-sandbox: WARNING: services failed to start; see %s.\n' \
+            "$sandbox_log" >&2
+        printf 'The session runs without them.\n' >&2
+        # The prompt's preamble already says the services are up — it was
+        # written at launch, before this could fail. Correct it, or the
+        # session burns its run debugging sockets that never existed. The
+        # prompt is read below, after this block, so both prompt paths see
+        # the correction.
+        cat >> "$handoff" <<'NOSVC'
+
+---
+
+## Correction: the per-run services FAILED to start
+
+Ignore the "Per-run services are up" section at the top of this prompt.
+`docker compose up` failed on the host after that text was written, so there
+is no `.env.sandbox` and no socket under the sockets directory works. Treat
+the environment as committed state only, and report "the per-run services
+failed to start" instead of debugging the missing sockets.
+NOSVC
+    fi
+fi
+
+# The handoff document is the prompt, and every harness reads it on stdin —
+# never as an argument. Linux caps one argv string at 128KB (MAX_ARG_STRLEN),
+# so an argv prompt makes a big handoff die as exit 126 before the tool even
+# starts; stdin has no such cap. pi treats piped stdin as a prompt and forces
+# print mode on it; claude and codex read stdin natively. The redirect opens
+# the file at exec time, after the services block above, so a failure
+# correction appended there still lands in the prompt.
+
+# stdout is the session's output: tee keeps the raw copy in the event log,
+# and the formatter renders it live when there is one to render. The
+# sandbox's own messages go to stderr, which is copied to the log and shown
+# here too.
+if [[ -n "$formatter" ]]; then
+    "${sandbox_cmd[@]}" < "$handoff" \
+        2> >(tee -a "$sandbox_log" >&2) \
+        | tee -a "$events" \
+        | "$formatter"
+else
+    "${sandbox_cmd[@]}" < "$handoff" \
+        2> >(tee -a "$sandbox_log" >&2) \
+        | tee -a "$events"
+fi
+rc="${PIPESTATUS[0]:-1}"
+printf '%s\n' "$rc" > "$run_dir/exit-code"
+
+# The session is done with the credential and the services. Clean both up now
+# rather than lean on the trap, which a --keep-session run never reaches: that
+# path ends in exec. run_cleanup runs once, so the EXIT trap below is a no-op
+# after this.
+run_cleanup
+
+# A pi-local run usually carries no --model: agent-sandboxed discovers the
+# model from the endpoint, so this script never saw it and the run record
+# would say null. Recover it from the banner agent-sandboxed prints into the
+# log. The model id is the one whitespace-free token between "pi against " and
+# " at ", so match a run of non-space characters. Take the first banner only.
+if [[ -z "$model" && -s "$sandbox_log" ]]; then
+    model="$(sed -n 's/^agent-sandboxed: pi against \([^ ]*\) at .*/\1/p' \
+        "$sandbox_log" | head -n1)"
+fi
+
+# What the run cost, in one place for both harnesses. Either way a missing
+# or unreadable source leaves it unreported rather than wrong.
+#
+# claude says so itself: the result event carries the session total, and
+# the formatter reads it out. pi does not say it anywhere in its output,
+# but records the token cost of every message in its session file — so
+# rescue that file first, before anything else touches the clone. It is
+# worth keeping for its own sake, being the whole transcript. cp -a copies
+# symlinks as symlinks, so nothing the sandbox left behind can redirect
+# this write. Summing every usage.cost counts tool-reported usage too,
+# which is what pi's own totals do.
+run_cost=""
+run_usage=""
+run_error=""
+if [[ -n "$pi_session_dir" && -d "$pi_session_dir" ]]; then
+    cp -a "$pi_session_dir" "$run_dir/pi-session" 2>/dev/null
+
+    # pi exits 0 even when its final turn ended in a provider error -- a
+    # context-length 400, a refused request, a dropped endpoint -- because the
+    # process itself ran fine; the failure was in the last response it read.
+    # The run then reports "done, exit 0" having written nothing, which is the
+    # one outcome a watcher cannot tell apart from success. Observed: a review
+    # that spent 23 minutes reading, overflowed the window by a single token on
+    # its final call, and was reported as a clean run.
+    #
+    # The session file is the only place that error is recorded, so take the
+    # last turn's stopReason from it. The LAST one specifically: pi retries, and
+    # an error it recovered from is not a failed run.
+    pi_error="$(find "$run_dir/pi-session" -name '*.jsonl' -exec cat {} + 2>/dev/null \
+        | jq -rs '[.. | objects | select(has("stopReason"))] | last // empty
+                  | select(.stopReason == "error")
+                  | .errorMessage // "the model reported an error"' \
+             2>/dev/null || true)"
+    if [[ -n "$pi_error" ]]; then
+        run_error="$pi_error"
+        printf 'fork-sandbox: the session ended in a model error: %s\n' \
+            "$pi_error" >> "$sandbox_log"
+        # Never turn a non-zero exit into a different non-zero one: the
+        # process's own code is the better diagnosis when it has one.
+        if [[ "$rc" == "0" ]]; then
+            rc=1
+            printf '%s\n' "$rc" > "$run_dir/exit-code"
+        fi
+    fi
+
+    # Round to millionths. Adding floats leaves noise a dollar figure
+    # should not carry, and a cheap run costs well under a cent, so
+    # rounding to cents would report every one of them as zero.
+    run_cost="$(find "$run_dir/pi-session" -name '*.jsonl' -exec cat {} + 2>/dev/null \
+        | jq -s '[.. | objects | select(has("usage")) | .usage.cost.total? // empty]
+                 | add
+                 | if . == null then empty else (. * 1000000 | round) / 1000000 end' \
+             2>/dev/null)"
+    # The same walk, for the counts behind that figure. pi names them
+    # differently from claude; this is where they are made to agree.
+    run_usage="$(find "$run_dir/pi-session" -name '*.jsonl' -exec cat {} + 2>/dev/null \
+        | jq -s -c '[.. | objects | select(has("usage")) | .usage]
+                    | if length == 0 then empty else
+                        {
+                          input_tokens: ([.[].input // empty] | add),
+                          output_tokens: ([.[].output // empty] | add),
+                          cache_read_tokens: ([.[].cacheRead // empty] | add),
+                          cache_write_tokens: ([.[].cacheWrite // empty] | add),
+                          reasoning_output_tokens: null,
+                          total_tokens: ([.[].totalTokens // empty] | add),
+                        }
+                      end' 2>/dev/null)"
+elif [[ "$usage_source" == "codex" && -s "$events" ]]; then
+    # codex reports tokens in its turn.completed events and a price
+    # nowhere, so cost stays null and the counts carry the run.
+    #
+    # Note what total_tokens must NOT be here. codex's
+    # cached_input_tokens is part of input_tokens, not a figure beside
+    # it — 9600 cached of 12217 input — so adding the two double-counts
+    # the cache. claude reports its cache separately and does add up.
+    # That is what usage_source is for: the shape is common, the
+    # convention behind it is not.
+    run_usage="$(jq -R -s -c '
+        [ split("\n")[] | fromjson? // empty
+          | select(.type == "turn.completed") | .usage // empty ]
+        | if length == 0 then empty else
+            {
+              input_tokens: ([.[].input_tokens // empty] | add),
+              output_tokens: ([.[].output_tokens // empty] | add),
+              cache_read_tokens: ([.[].cached_input_tokens // empty] | add),
+              cache_write_tokens: null,
+              reasoning_output_tokens: ([.[].reasoning_output_tokens // empty] | add),
+              total_tokens: (([.[].input_tokens // empty] | add)
+                             + ([.[].output_tokens // empty] | add)),
+            }
+          end' "$events" 2>/dev/null)"
+elif [[ -n "$formatter" && -s "$events" ]]; then
+    run_cost="$("$formatter" --cost "$events" 2>/dev/null)"
+    run_usage="$("$formatter" --usage "$events" 2>/dev/null)"
+fi
+# A reader should not have to tell "no tokens" from "tokens not reported".
+[[ -n "$run_usage" ]] || run_usage=null
+
+# Format once, here, and record it where a caller can read it without
+# parsing prose. %.6f rather than the raw number: a sum of floats carries
+# noise, and a cheap run is small enough that jq hands back scientific
+# notation, which is no way to write a price. Millionths, because a run
+# can honestly cost less than a cent. run.env is the run's machine-readable
+# record and fork-sandbox-status.sh already reads it key by key, so the
+# value goes there as well as into the summary. Check it is a number
+# first: this block writes into the summary with stderr folded in, so a
+# printf that rejects its argument would land its complaint in the report.
+run_cost_fmt=""
+if [[ "$run_cost" =~ ^-?[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?$ ]]; then
+    run_cost_fmt="$(printf '%.6f' "$run_cost")"
+    # Replace the line rather than append one. This script can be re-run by
+    # hand, which is why everything else it writes is truncated first, and
+    # a reader takes the FIRST match for a key — so a second cost= line
+    # would hide the new figure behind the old one. Build the replacement
+    # beside the file and rename, which is atomic, so a reader watching the
+    # run sees one version or the other and never a half-written record.
+    # Rewrite nothing if the record cannot be read: an empty run.env would
+    # lose the whole run rather than one line.
+    if [[ -s "$run_dir/run.env" ]] \
+        && grep -v '^cost=' "$run_dir/run.env" > "$run_dir/run.env.part" 2>/dev/null; then
+        printf 'cost=%s\n' "$run_cost_fmt" >> "$run_dir/run.env.part"
+        mv -f "$run_dir/run.env.part" "$run_dir/run.env"
+    else
+        rm -f "$run_dir/run.env.part"
+    fi
+fi
+# The run.env written at start carries model= empty for a run whose model the
+# endpoint discovered. Refresh that one line the same way: replace rather
+# than append, because a reader takes the first match, and build the
+# replacement beside the file and rename, which is atomic.
+if [[ -n "$model" ]] \
+    && [[ -s "$run_dir/run.env" ]] \
+    && grep -v '^model=' "$run_dir/run.env" > "$run_dir/run.env.part" 2>/dev/null; then
+    printf 'model=%s\n' "$model" >> "$run_dir/run.env.part"
+    mv -f "$run_dir/run.env.part" "$run_dir/run.env"
+else
+    rm -f "$run_dir/run.env.part"
+fi
+
+printf '\n'
+if [[ "$rc" != "0" ]]; then
+    printf 'fork-sandbox: the session exited %s\n' "$rc"
+fi
+
+# Bring the work back. Fetching is the one way into the real repo that cannot
+# be turned into code execution by the clone's config, so the work crosses
+# back as objects and nothing else. Nothing below runs git inside the clone:
+# the sandbox could write its config, and a key such as core.fsmonitor runs
+# on the HOST. Every git command here runs in the origin repo, which is the
+# user's own.
+fetched=0
+if (cd "$origin_repo" && git fetch --quiet "$clone_dir" "$branch:$branch"); then
+    fetched=1
+fi
+
+n_commits=0
+removed=0
+if (( fetched )); then
+    n_commits="$( (cd "$origin_repo" && git rev-list --count "$base_sha..$branch") 2>/dev/null || printf 0 )"
+    if [[ "$n_commits" == "0" ]]; then
+        # The branch is exactly where it started, so removing it leaves the
+        # repo as it was. Compare the sha rather than trust the count.
+        head_now="$( (cd "$origin_repo" && git rev-parse "$branch") 2>/dev/null || true )"
+        if [[ "$head_now" == "$base_sha" ]] \
+            && (cd "$origin_repo" && git branch -q -D "$branch") >/dev/null 2>&1; then
+            removed=1
+        fi
+    fi
+fi
+
+{
+    printf '== fork-sandbox summary ==\n'
+    printf 'branch:   %s\n' "$branch"
+    printf 'origin:   %s\n' "$origin_repo"
+    printf 'clone:    %s\n' "$clone_dir"
+    printf 'exit:     %s\n' "$rc"
+    printf 'commits:  %s\n' "$n_commits"
+    if [[ -n "$run_cost_fmt" ]]; then
+        printf 'cost:     $%s\n' "$run_cost_fmt"
+    fi
+    if [[ -d "$run_dir/pi-session" ]]; then
+        printf 'session:  %s\n' "$run_dir/pi-session"
+    fi
+    if (( ! fetched )); then
+        printf 'fetched:  NO -- the work is in the clone only\n'
+    elif (( removed )); then
+        printf 'fetched:  nothing. The session made no commits, so branch %s\n' "$branch"
+        printf '          was removed again and %s is unchanged.\n' "$origin_repo"
+    else
+        printf 'fetched:  yes. Branch %s is now in %s\n' "$branch" "$origin_repo"
+    fi
+    if (( fetched )) && [[ "$n_commits" != "0" ]]; then
+        # The commits are untrusted, and git passes a subject through
+        # verbatim when stdout is not a tty. Strip control characters so an
+        # ESC or CR planted in a commit message cannot spoof this summary in
+        # the pane or the monitor stream. Tab and newline stay.
+        printf '\n'
+        (cd "$origin_repo" && git log --oneline --no-decorate "$base_sha..$branch") \
+            | tr -d '\000-\010\013-\037\177'
+        printf '\n'
+        (cd "$origin_repo" && git diff --stat "$base_sha" "$branch") \
+            | tr -d '\000-\010\013-\037\177'
+    fi
+    if (( fetched )) && [[ "$n_commits" != "0" ]]; then
+        printf '\nReview the branch before you build it. It is agent-written code,\n'
+        printf 'and a Makefile or package.json script in it runs on the host.\n'
+    else
+        printf '\nNothing landed in %s. Whatever the session wrote is still\n' "$origin_repo"
+        printf 'in the clone at %s\n' "$clone_dir"
+    fi
+} > "$run_dir/summary.txt" 2>&1
+
+# The same facts, structured, so a caller never has to parse the prose
+# above — a decimal cost especially, which the obvious grep-and-strip
+# mangles. jq builds it, so every value is escaped properly: commit
+# subjects come from the session and are untrusted text. A jq that fails
+# leaves no file, and summary.txt, which is what a person reads, stands.
+commit_list="$( (cd "$origin_repo" && git log --format='%H %s' "$base_sha..$branch") 2>/dev/null \
+    | jq -R -s 'split("\n") | map(select(length > 0))
+                | map({sha: .[0:40], subject: .[41:]})' 2>/dev/null )"
+[[ -n "$commit_list" ]] || commit_list='[]'
+fetched_json=false
+(( fetched )) && fetched_json=true
+removed_json=false
+(( removed )) && removed_json=true
+session_dir_json=""
+[[ -d "$run_dir/pi-session" ]] && session_dir_json="$run_dir/pi-session"
+ended_at="$(date +%s)"
+
+jq -n \
+    --argjson version 1 \
+    --arg harness "$harness" \
+    --arg harness_version "$harness_version" \
+    --arg usage_source "$usage_source" \
+    --argjson usage "$run_usage" \
+    --arg model "$model" \
+    --arg branch "$branch" \
+    --arg origin_repo "$origin_repo" \
+    --arg clone_dir "$clone_dir" \
+    --arg run_dir "$run_dir" \
+    --arg base_sha "$base_sha" \
+    --arg session_dir "$session_dir_json" \
+    --arg harness_error "$run_error" \
+    --argjson exit_code "$rc" \
+    --argjson commits "$n_commits" \
+    --argjson fetched "$fetched_json" \
+    --argjson branch_removed "$removed_json" \
+    --argjson cost_usd "${run_cost_fmt:-null}" \
+    --argjson started_at "$started_at" \
+    --argjson ended_at "$ended_at" \
+    --argjson commits_list "$commit_list" \
+    '{
+        version: $version,
+        harness: $harness,
+        harness_version: (if $harness_version == "" then null else $harness_version end),
+        model: (if $model == "" then null else $model end),
+        branch: $branch,
+        origin_repo: $origin_repo,
+        clone_dir: $clone_dir,
+        run_dir: $run_dir,
+        base_sha: $base_sha,
+        exit_code: $exit_code,
+        harness_error: (if $harness_error == "" then null else $harness_error end),
+        commits: $commits,
+        commits_list: $commits_list,
+        fetched: $fetched,
+        branch_removed: $branch_removed,
+        cost_usd: $cost_usd,
+        usage: $usage,
+        usage_source: (if $usage == null then null else $usage_source end),
+        session_dir: (if $session_dir == "" then null else $session_dir end),
+        started_at: $started_at,
+        ended_at: $ended_at,
+        duration_seconds: ($ended_at - $started_at),
+    }' > "$run_dir/summary.json" 2>/dev/null \
+    || rm -f "$run_dir/summary.json"
+
+# Append this run to the durable run log (~/.claude/sandbox-runs.jsonl),
+# however it ended. The tool owns the record shape and reads summary.json,
+# task-meta.json and the handoff out of the run dir itself. Best-effort: a
+# failed append must not fail the run.
+if [[ -n "$run_log_bin" && -x "$run_log_bin" ]]; then
+    "$run_log_bin" record --run-dir "$run_dir" >> "$sandbox_log" 2>&1 \
+        || printf 'fork-sandbox: run-log append failed; see %s\n' \
+            "$sandbox_log" >&2
+fi
+
+cat "$run_dir/summary.txt"
+
+if [[ "$keep_open" == "1" ]]; then
+    cd "$origin_repo" 2>/dev/null || cd /
+    exec "$user_shell" -i
+fi
+exit "$rc"
+RUNNER
+} > "$run_dir/run.sh"
+chmod +x "$run_dir/run.sh"
+
+where="here, in the foreground"
+if ! $foreground; then
+    # -d leaves it detached, so this never takes the caller's focus and never
+    # adds a window to the caller's session. It also works outside tmux: with
+    # no server running, tmux starts one.
+    if ! tmux new-session -d -s "$session_name" -n "$session_name" \
+        -c "$origin_repo" "$run_dir/run.sh"; then
+        echo "Error: tmux could not start a session. Run it here with" >&2
+        echo "--foreground, or start the generated runner yourself:" >&2
+        echo "$run_dir/run.sh" >&2
+        exit 1
+    fi
+    where="detached tmux session $session_name"
+fi
+
+# Its own leading newline, so an unused line adds nothing to the block.
+checkout_line=""
+if [[ -n "$checkout_ref" ]]; then
+    checkout_line="$(printf '\n  start:    %s (%.12s)' "$checkout_ref" "$base_sha")"
+fi
+
+harness_line="$harness"
+[[ -z "$model" ]] || harness_line="$harness  ($model)"
+
+cat <<EOF
+fork-sandbox: launched in $where
+  harness:  $harness_line
+  branch:   $branch  ->  $origin_repo$checkout_line
+  clone:    $clone_dir
+  run dir:  $run_dir
+  log:      $run_dir/events.jsonl
+
+EOF
+
+# Only claude speaks the stream-json the formatter renders. Every other harness
+# writes something else — pi plain text, codex its own JSONL — so point at what
+# does hold the output instead of at commands that print nothing. Keyed on the
+# formatter rather than on a harness name, so a harness added later cannot
+# promise a rendered log it does not produce.
+if [[ -z "$run_formatter" ]]; then
+    cat <<EOF
+  watch:    $status_cmd --monitor $run_dir   (state and the final summary)
+  status:   $status_cmd $run_dir
+  output:   $run_dir/events.jsonl   ($harness's own output, whatever the name says)
+EOF
+else
+    cat <<EOF
+  watch:    $status_cmd --monitor $run_dir
+  follow:   $status_cmd --follow $run_dir   (every event, live, for a terminal)
+  status:   $status_cmd $run_dir
+  result:   $status_cmd --result $run_dir
+EOF
+fi
+
+if ! $foreground; then
+    cat <<EOF
+  attach:   tmux attach -t $session_name
+            (from inside tmux: tmux switch-client -t $session_name)
+
+Nothing in the tmux session needs input, and the run directory holds
+everything worth reading, so attach only to troubleshoot.
+EOF
+    if (( keep_open )); then
+        echo "It stays open on a shell when the run ends. Close it yourself."
+    else
+        echo "It closes when the run ends, so a session that is still there"
+        echo "means the work is still going."
+    fi
+fi
+
+cat <<EOF
+
+The session is headless and needs no keypress. When it exits, branch
+'$branch' is fetched into $origin_repo on its own.
+It sees committed state only, has no global ~/.claude, no ssh keys and no
+tailnet, and it cannot push.
+EOF
+
+if [[ "$harness" == "pi" ]]; then
+    cat <<EOF
+The OpenRouter key in $harness_env_file is the one
+credential inside. No Claude token is copied, so this run cannot spend
+the subscription. pi has the commit-then-review skill and the script
+toolbox, but writes plain text, so read
+$run_dir/events.jsonl rather than --result. Its session
+is copied to $run_dir/pi-session when the run
+ends, and the summary reports what the run cost from it.
+EOF
+elif [[ "$harness" == "pi-local" ]]; then
+    cat <<EOF
+This sandbox has no network at all, and the model it runs on is one you
+host, so the run holds no credential and costs nothing. Nothing can be
+installed or fetched in there — the clone, its provisioned dependencies
+and any per-run services are all it has. pi has the commit-then-review
+skill and the script toolbox, but writes plain text, so read
+$run_dir/events.jsonl rather than --result. Its session
+is copied to $run_dir/pi-session when the run ends.
+EOF
+elif [[ "$harness" == "codex" ]]; then
+    cat <<EOF
+The sandbox carries a live Codex access token so it can reach the model, but
+its refresh token is replaced with a placeholder. It has no GitHub token or
+other service credential and cannot rotate the host's Codex sign-in.
+EOF
+else
+    cat <<EOF
+It carries no API tokens.
+EOF
+fi
+
+cat <<EOF
+Review the branch before you build it.
+EOF
+
+if $foreground; then
+    exec "$run_dir/run.sh"
+fi
