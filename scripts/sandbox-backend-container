@@ -92,6 +92,12 @@ if [[ "${1-}" == --capabilities ]]; then
     exit 0
 fi
 
+# The GNU flags these scripts use (realpath -m, stat -c) do not exist on the
+# BSD tools of the same name, and macOS has no timeout at all. Say so here, in
+# a sentence, before anything is created -- otherwise the first use fails as
+# "illegal option -- m" from a tool the reader has no reason to suspect.
+fs_require_gnu_tools || exit 1
+
 CLI="${FORK_SANDBOX_CONTAINER_CLI:-docker}"
 IMAGE="${FORK_SANDBOX_CONTAINER_IMAGE:-}"
 WORK_DIR_ARG=""; NET_MODE=""; HOSTNAME_ARG=""

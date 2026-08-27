@@ -53,6 +53,12 @@ script_dir="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 # shellcheck disable=SC1091  # plain shellcheck cannot follow it; use -x
 source "$script_dir/fork-sandbox-lib.sh"
 
+# The GNU flags these scripts use (realpath -m, stat -c) do not exist on the
+# BSD tools of the same name, and macOS has no timeout at all. Say so here, in
+# a sentence, before anything is created -- otherwise the first use fails as
+# "illegal option -- m" from a tool the reader has no reason to suspect.
+fs_require_gnu_tools || exit 1
+
 RUN_DIR_PREFIX="/var/tmp/claude-scratch/forks/claude-fork-sandbox."
 # The pre-consolidation location, still accepted so a run dir from before the
 # move can be steered. New runs never land here.
