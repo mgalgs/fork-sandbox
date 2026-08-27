@@ -124,6 +124,13 @@ becomes a second backend. It declares one backend-specific option, `--image`.
 Its mechanism, threat model, and limits are described in
 [sandbox-backend-container.md](sandbox-backend-container.md).
 
+It also declares bwrap's `--net unpinned`, on the same terms and for the same
+reason: a plain per-run bridge, reaching tunnels, VPNs and other bridge
+networks, with a warning naming what it gave up. Listing it here rather than
+only in its own doc keeps this table an honest answer to "which backends can
+be asked for unrestricted egress" — the question a reader comes to the
+contract to settle.
+
 ### `k8s` — planned
 
 One Job per run. `--net` maps onto a NetworkPolicy, `--bridge` onto an egress
