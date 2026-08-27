@@ -32,6 +32,8 @@ refuses "bridge only sealed" "only with" "$backend" --workdir "$w" --net pinned 
 refuses "requires command" "no command" "$backend" --workdir "$w" --net sealed --image "$image" --
 refuses "rejects unknown option" unknown "$backend" --wat -- true
 refuses "requires image" image env -u FORK_SANDBOX_CONTAINER_IMAGE "$backend" --workdir "$w" --net sealed -- true
+comma_dir="$(newdir),comma"; mv "${comma_dir%,comma}" "$comma_dir"; tmpdirs+=("$comma_dir")
+refuses "rejects comma in mount path" comma "$backend" --workdir "$comma_dir" --net sealed --image "$image" -- true
 
 # A live unix socket is needed to reach port and duplicate-port validation.
 sockdir="$(newdir)"; sock="$sockdir/service.sock"
@@ -43,6 +45,13 @@ pids+=("$!")
 for _ in {1..50}; do [[ -S "$sock" ]] && break; sleep .02; done
 refuses "bridge rejects privileged port" privileged "$backend" --workdir "$w" --net sealed --image "$image" --bridge "$sock=80" -- true
 refuses "bridge rejects duplicate port" "two --bridge" "$backend" --workdir "$w" --net sealed --image "$image" --bridge "$sock=3000" --bridge "$sock=3000" -- true
+comma_sockdir="$(newdir),comma"; mv "${comma_sockdir%,comma}" "$comma_sockdir"; tmpdirs+=("$comma_sockdir"); comma_sock="$comma_sockdir/service.sock"
+python3 - "$comma_sock" <<'PY' &
+import socket, sys, time
+s = socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.listen(); time.sleep(30)
+PY
+pids+=("$!"); for _ in {1..50}; do [[ -S "$comma_sock" ]] && break; sleep .02; done
+refuses "rejects comma in generated bridge mount" comma "$backend" --workdir "$w" --net sealed --image "$image" --bridge "$comma_sock=3001" -- true
 
 printf '\n== runtime integration ==\n'
 runtime="${FORK_SANDBOX_CONTAINER_CLI:-docker}"
@@ -60,8 +69,10 @@ else
         check "HOME path and emptiness" "$HOME|" "$out"
         export FORK_SANDBOX_SECRET_SHOULD_NOT_LEAK=secret
         # shellcheck disable=SC2016  # expanded by bash inside the container
-        out="$(run --workdir "$rw" --net sealed --setenv PASSED='right value' -- bash -c 'printf "%s|%s" "${FORK_SANDBOX_SECRET_SHOULD_NOT_LEAK-unset}" "$PASSED"')"
-        check "environment allowlist" "unset|right value" "$out"
+        out="$(run --workdir "$rw" --net sealed --setenv PASSED='right value' -- bash -c 'printf "%s|%s|%s" "${FORK_SANDBOX_SECRET_SHOULD_NOT_LEAK-unset}" "${IMAGE_BAKED_SECRET-unset}" "$PASSED"')"
+        check "environment allowlist includes image ENV" "unset|unset|right value" "$out"
+        out="$(run --workdir "$rw" --net sealed -- /opt/image-tool)"
+        check "image-only absolute command" image-tool "$out"
         run --workdir "$rw" --net sealed --bind-ro "$ro" -- bash -c 'touch written; cat '"$ro"'/file; ! touch '"$ro"'/blocked' >/dev/null
         if [[ -f "$rw/written" && "$(stat -c %u:%g "$rw/written")" == "$(id -u):$(id -g)" ]]; then ok "persistent writes are host-owned; read-only bind rejects writes"; else no "persistent writes are host-owned; read-only bind rejects writes"; fi
         run --workdir "$rw" --net sealed -- bash -c 'exit 42' >/dev/null 2>&1; check "exit 42 passes through" 42 "$?"
@@ -89,6 +100,15 @@ else
         usock="$sockdir/bridge.sock"; rm -f "$usock"; socat "UNIX-LISTEN:$usock,fork" SYSTEM:'printf bridged' & pids+=("$!"); for _ in {1..50}; do [[ -S "$usock" ]] && break; sleep .02; done
         out="$(run --workdir "$rw" --net sealed --bridge "$usock=23456" -- bash -c 'exec 3<>/dev/tcp/127.0.0.1/23456; cat <&3')"
         check "sealed unix-socket bridge" bridged "$out"
+
+        stale_sock="$sockdir/stale.sock"
+        python3 - "$stale_sock" <<'PY'
+import socket, sys
+s = socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.close()
+PY
+        marker="$rw/bridge-must-not-run"
+        refuses "unready bridge fails closed" "did not become ready" run --workdir "$rw" --net sealed --bridge "$stale_sock=23457" -- touch "$marker"
+        if [[ ! -e "$marker" ]]; then ok "unready bridge did not run command"; else no "unready bridge did not run command"; fi
 
         noip="fork-sandbox-container-noip:$RANDOM-$$"
         if "$runtime" build -t "$noip" -f - "$repo_dir" >/dev/null <<'EOF'
