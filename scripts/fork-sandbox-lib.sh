@@ -563,6 +563,59 @@ fs_resolve_backend() {
     return 0
 }
 
+# What the resolved backend says about itself. One property matters so far:
+# whether the sandbox inherits the host's userland or brings its own.
+#
+# bwrap mounts the host's /usr, so the agent CLI, node and a venv interpreter
+# can be bound in from the host and will run. A container gets its userland
+# from its image, and a host binary bound into that has neither its
+# interpreter nor its shared libraries. On a Mac that is Mach-O against Linux;
+# on Linux it is the host's glibc against the image's. One property, two
+# symptoms -- which is why this is asked of the BACKEND and never derived from
+# `uname`. Deriving it from the host would leave Linux-plus-container broken
+# and, worse, untestable: asking the backend means the image path can be
+# exercised on Linux, where it is the same code path a Mac takes.
+#
+# A backend written before this option exists refuses it and exits nonzero.
+# That reads as `host`, the status quo, so such a backend keeps behaving
+# exactly as it does today rather than silently changing.
+#
+# Takes FS_BACKEND_BIN, or any backend path. Fills FS_BACKEND_TOOLCHAIN.
+# shellcheck disable=SC2034  # written here, read by the sourcing scripts
+FS_BACKEND_TOOLCHAIN=host
+
+fs_backend_capabilities() {
+    local bin="$1" out line key value
+    FS_BACKEND_TOOLCHAIN=host
+    # Parse only a clean exit. A backend that refuses the option may still
+    # print its usage, and a usage line can hold an '=' -- reading that as a
+    # capability would be inventing an answer out of an error message.
+    out="$("$bin" --capabilities 2>/dev/null)" || return 0
+    while IFS= read -r line; do
+        [[ "$line" == *=* ]] || continue
+        key="${line%%=*}"
+        value="${line#*=}"
+        case "$key" in
+        toolchain)
+            case "$value" in
+            host|image)
+                # shellcheck disable=SC2034  # read by the sourcing scripts
+                FS_BACKEND_TOOLCHAIN="$value"
+                ;;
+            *)
+                echo "Warning: the backend reports toolchain='$value', which is" >&2
+                echo "not 'host' or 'image'. Assuming host, which is what every" >&2
+                echo "backend did before the property existed." >&2
+                ;;
+            esac
+            ;;
+        esac
+        # An unknown key is ignored on purpose: a newer backend may declare
+        # properties this caller has never heard of.
+    done <<< "$out"
+    return 0
+}
+
 # Carry the git identity into a sandbox, but switch commit signing off. The
 # host config here signs with an SSH key under ~/.ssh, and ~/.ssh is masked on
 # purpose, so every commit inside the sandbox would fail. Appending the

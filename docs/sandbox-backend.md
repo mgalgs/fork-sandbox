@@ -51,6 +51,36 @@ Backends may add their own options — a container backend needs an image, a
 Kubernetes backend needs a namespace and a service account. Those are declared
 by the backend and must not be required for the contract above to work.
 
+## Asking a backend about itself
+
+```
+sandbox-backend-<name> --capabilities
+```
+
+Prints `key=value` lines to stdout and exits 0, running nothing. One key is
+defined:
+
+| Key | Values | Meaning |
+|---|---|---|
+| `toolchain` | `host` \| `image` | Whether the sandbox inherits the host's userland. |
+
+`host` means the backend mounts the host's `/usr`, so a binary bound in from
+the host runs — bwrap. `image` means the userland comes from somewhere else and
+a host binary has neither its interpreter nor its shared libraries — the
+container backend, whose `/usr` is its image's.
+
+The callers need this to decide whether to bind the agent CLI, node, and a
+virtualenv's interpreter from the host, or to expect the sandbox to carry them.
+It is asked of the backend rather than derived from `uname` because it is a
+fact about the *sandbox*, not about the machine: a Linux host running the
+container backend has the same problem a Mac does, and deriving it from the
+host would leave that case broken and untestable.
+
+A backend that does not implement this option exits nonzero, and callers read
+that as `toolchain=host` — the status quo, so a backend written against the
+earlier contract keeps working unchanged. Unknown keys are ignored, so a newer
+backend may declare more than a given caller understands.
+
 ## The guarantees
 
 A backend that cannot hold all six is not a backend; it is a different tool that

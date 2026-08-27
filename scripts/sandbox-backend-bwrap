@@ -198,6 +198,18 @@ if [[ "${1-}" == -h || "${1-}" == --help ]]; then
     exit 0
 fi
 
+# What this backend can tell a caller about itself, one key=value per line.
+# `toolchain` says whether the sandbox inherits the host's userland: bwrap
+# mounts the host's /usr, so a host binary bound in here runs. The callers use
+# it to decide whether to bind the agent CLI and the node install from the
+# host, which is the difference between working and not on macOS -- and on any
+# host whose backend brings its own /usr. A backend that predates this option
+# exits nonzero, and the caller reads that as the status quo, `host`.
+if [[ "${1-}" == --capabilities ]]; then
+    echo "toolchain=host"
+    exit 0
+fi
+
 UID_N="$(id -u)"
 GID_N="$(id -g)"
 

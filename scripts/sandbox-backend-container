@@ -80,6 +80,18 @@ if [[ "${1-}" == -h || "${1-}" == --help ]]; then
     exit 0
 fi
 
+# What this backend can tell a caller about itself, one key=value per line.
+# `toolchain` says whether the sandbox inherits the host's userland. It does
+# not: the userland is the image's. A host binary bound in here has neither
+# its interpreter nor its shared libraries, which is Mach-O against Linux on
+# a Mac and glibc against musl on Linux -- one property with two symptoms. The
+# callers read this to decide whether to bind the agent CLI and the node
+# install from the host at all.
+if [[ "${1-}" == --capabilities ]]; then
+    echo "toolchain=image"
+    exit 0
+fi
+
 CLI="${FORK_SANDBOX_CONTAINER_CLI:-docker}"
 IMAGE="${FORK_SANDBOX_CONTAINER_IMAGE:-}"
 WORK_DIR_ARG=""; NET_MODE=""; HOSTNAME_ARG=""
