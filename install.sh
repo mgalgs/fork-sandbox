@@ -62,7 +62,7 @@ need jq     "reading run events and generating agent config"     required
 need tmux   "detached runs; --foreground works without it"       optional
 need socat  "the model bridge for a sealed local-model run"      optional
 need setsid "same bridge: its own process group for teardown"    optional
-need docker "--services, for a repo that needs a service stack"  optional
+need docker "container backend and --services runtime"           optional
 need python3 "sandbox-run-log.py, the durable run log"           optional
 
 if (( ${#missing_required[@]} )); then
