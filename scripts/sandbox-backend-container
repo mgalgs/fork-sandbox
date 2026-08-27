@@ -1,0 +1,221 @@
+#!/usr/bin/env bash
+# sandbox-backend-container — the container implementation of the sandbox backend contract
+#
+# Usage: sandbox-backend-container --workdir DIR --net pinned|sealed|unpinned
+#          --image NAME [--bind-ro PATH]... [--bind-rw PATH]...
+#          [--bind-ro-at SRC DEST]... [--bind-rw-at SRC DEST]...
+#          [--bridge SOCKET=PORT]... [--setenv K=V]... [--prepend-path DIR]...
+#          [--hostname NAME] -- COMMAND [ARG...]
+#
+# --image selects the Linux image; FORK_SANDBOX_CONTAINER_IMAGE is its
+# default. The runtime is docker unless FORK_SANDBOX_CONTAINER_CLI overrides
+# it. Only Docker is tested; Podman's rootless uid remapping is untested.
+# --workdir and --bind-rw paths persist on the host; --bind-ro paths are
+# readable only. Remapped forms mount SRC at absolute DEST. --setenv passes
+# exactly NAME=VALUE (never host-inheriting bare --env NAME). Later
+# --prepend-path flags appear earlier. --hostname sets the container hostname.
+# --net has no default: sealed has loopback only; pinned reaches public
+# internet and the LAN but blackholes host, tunnel and bridge destinations;
+# unpinned is an extension with unrestricted bridge egress and a warning.
+# --bridge SOCKET=PORT works only sealed and relays a read-only-mounted host
+# unix socket to container loopback. -- ends options; the remaining argv and
+# its authoritative inspected exit status are the command and backend status.
+#
+# The image supplies the sandbox toolchain, unlike bwrap, which mounts host
+# /usr. It must contain bash; pinned mode also needs iproute2's ip, and bridges
+# need socat. A host toolchain bind works on Linux only if ABI-compatible and
+# cannot work with macOS Mach-O binaries. On macOS the image must carry it.
+# A synthesized passwd/group replaces the image files for a non-root host uid;
+# images whose entrypoint depends on their own users are unsupported. This
+# backend overrides the entrypoint.
+#
+# What the sandbox gets: a disposable writable image overlay, empty tmpfs /tmp
+# and $HOME, only named host mounts, host uid/gid, dropped capabilities,
+# no-new-privileges, Docker's default seccomp, init, a minimal explicit
+# environment, and stdin unchanged. The overlay is not a host-persistent write.
+#
+# Limits:
+#   - Isolation strength: shared-kernel namespaces on Linux, so a kernel bug is
+#     an escape. On macOS it escapes into the runtime's Linux VM, not directly
+#     into the Mac. A rootful Docker daemon is root-equivalent; writable-path
+#     refusals guard operator mistakes, not the daemon boundary.
+#   - Syscall filtering: Docker's default seccomp profile applies (stronger
+#     than bwrap's none), but blocks nested user namespaces. Chromium and
+#     Playwright need --no-sandbox and nested bwrap cannot work. Runtime option
+#     seccomp=unconfined is an escape hatch that gives up this protection; this
+#     backend does not select it.
+#   - LAN reachability: pinned LAN traffic is NATed from the host, so a service
+#     trusting network position cannot distinguish it. The pin is a destination
+#     denylist snapshot, not a source-interface pin: later tunnels are covered
+#     only by fixed private ranges, and global tunnel prefixes only if present
+#     at startup. Docker DNS may resolve VPN-only names via the daemon even
+#     though their addresses are unreachable: names leak, reachability does not.
+#   - Resource limits: none. Docker supports --memory, --cpus and --pids-limit,
+#     but this backend does not set them.
+#   - SIGKILL leaves the stopped labeled container, labeled network, and state
+#     dir; the kernel releases the lock. Find strays with `docker ps -a
+#     --filter label=fork-sandbox-run` and `docker network ls --filter
+#     label=fork-sandbox-run`.
+#   - --bridge is verified only on Linux and probably fails through Docker
+#     Desktop/Colima filesystem sharing. Treat it as Linux-only until verified.
+
+set -euo pipefail
+
+script_dir="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=fork-sandbox-lib.sh
+# shellcheck disable=SC1091
+source "$script_dir/fork-sandbox-lib.sh"
+
+if [[ "${1-}" == -h || "${1-}" == --help ]]; then
+    sed -n '2,/^$/p' "$(readlink -f "${BASH_SOURCE[0]}")" | sed 's/^# \{0,1\}//'
+    exit 0
+fi
+
+CLI="${FORK_SANDBOX_CONTAINER_CLI:-docker}"
+IMAGE="${FORK_SANDBOX_CONTAINER_IMAGE:-}"
+WORK_DIR_ARG=""; NET_MODE=""; HOSTNAME_ARG=""
+BIND_RO=(); BIND_RW=(); BIND_RO_AT_SRC=(); BIND_RO_AT_DEST=()
+BIND_RW_AT_SRC=(); BIND_RW_AT_DEST=(); BRIDGE_SOCKETS=(); BRIDGE_PORTS=()
+SETENV=(); PREPEND_PATH=()
+while (( $# )); do
+    case "$1" in
+        --workdir) WORK_DIR_ARG="${2:?--workdir requires a directory}"; shift 2 ;;
+        --net) NET_MODE="${2:?--net requires pinned, sealed or unpinned}"; shift 2 ;;
+        --image) IMAGE="${2:?--image requires a name}"; shift 2 ;;
+        --hostname) HOSTNAME_ARG="${2:?--hostname requires a name}"; shift 2 ;;
+        --bind-ro) BIND_RO+=("${2:?--bind-ro requires a path}"); shift 2 ;;
+        --bind-rw) BIND_RW+=("${2:?--bind-rw requires a path}"); shift 2 ;;
+        --bind-ro-at) BIND_RO_AT_SRC+=("${2:?--bind-ro-at requires a source path}"); BIND_RO_AT_DEST+=("${3:?--bind-ro-at requires a destination path}"); shift 3 ;;
+        --bind-rw-at) BIND_RW_AT_SRC+=("${2:?--bind-rw-at requires a source path}"); BIND_RW_AT_DEST+=("${3:?--bind-rw-at requires a destination path}"); shift 3 ;;
+        --bridge)
+            v="${2:?--bridge requires SOCKET=PORT}"
+            if [[ "$v" != *=* ]]; then echo "Error: --bridge '$v' has no port. The form is" >&2; echo "SOCKET=PORT." >&2; exit 1; fi
+            BRIDGE_SOCKETS+=("${v%=*}"); BRIDGE_PORTS+=("${v##*=}"); shift 2 ;;
+        --setenv) SETENV+=("${2:?--setenv requires NAME=VALUE}"); shift 2 ;;
+        --prepend-path) PREPEND_PATH+=("${2:?--prepend-path requires a directory}"); shift 2 ;;
+        --) shift; break ;;
+        *) echo "Error: unknown option '$1'. The command goes after '--'." >&2; exit 1 ;;
+    esac
+done
+(( $# )) || { echo "Error: no command. Everything after '--' is the command to run." >&2; exit 1; }
+if [[ "$1" == */* && ! -x "$1" ]]; then echo "Error: the command '$1' is not an executable file." >&2; exit 1; fi
+[[ -n "$WORK_DIR_ARG" ]] || { echo "Error: --workdir is required. It is the one writable project directory." >&2; exit 1; }
+case "$NET_MODE" in pinned|sealed|unpinned) ;; "") echo "Error: --net is required, and has no default." >&2; exit 1 ;; *) echo "Error: --net '$NET_MODE' is not a mode. Use pinned, sealed or unpinned." >&2; exit 1 ;; esac
+[[ -n "$IMAGE" ]] || { echo "Error: --image is required (or set FORK_SANDBOX_CONTAINER_IMAGE)." >&2; exit 1; }
+
+is_refused_work_dir() {
+    local d="$1" p
+    case "$d" in /|"$HOME"|/home|/root|/boot|/var|/var/tmp|/var/tmp/claude-scratch|/var/tmp/claude-scratch/forks|/tmp|/opt|/srv|/mnt|/nix) return 0 ;; esac
+    for p in /usr /etc /bin /sbin /lib /lib64 /proc /sys /dev /run /boot; do [[ "$d" == "$p" || "$d" == "$p"/* ]] && return 0; done
+    return 1
+}
+check_remap_dest() {
+    local flag="$1" dest="$2"
+    [[ "$dest" == /* ]] || { echo "Error: $flag destination '$dest' must be absolute." >&2; return 1; }
+    [[ "$dest/" != *"/../"* ]] || { echo "Error: $flag destination '$dest' must not contain a '..' component." >&2; return 1; }
+}
+is_tunnel_iface() { case "$1" in tailscale*|ts*|wg*|tun*|tap*|zt*|ppp*|nebula*|gpd*) return 0 ;; *) return 1 ;; esac; }
+
+mkdir -p /var/tmp/claude-scratch/forks "$WORK_DIR_ARG"
+WORK_DIR="$(realpath "$WORK_DIR_ARG")"
+is_refused_work_dir "$WORK_DIR" && { echo "Error: refusing '$WORK_DIR' as the work dir. It is bind-mounted writable." >&2; exit 1; }
+
+MOUNTS=(--mount "type=bind,src=$WORK_DIR,dst=$WORK_DIR")
+for d in "${BIND_RO[@]}"; do [[ -e "$d" ]] || { echo "Error: --bind-ro '$d' does not exist." >&2; exit 1; }; MOUNTS+=(--mount "type=bind,src=$(realpath "$d"),dst=$(realpath -s "$d"),readonly"); done
+for d in "${BIND_RW[@]}"; do
+    [[ -e "$d" ]] || { echo "Error: --bind-rw '$d' does not exist." >&2; exit 1; }; r="$(realpath "$d")"
+    is_refused_work_dir "$r" && { echo "Error: refusing '$r' as a --bind-rw path. It would be writable inside the sandbox." >&2; exit 1; }
+    MOUNTS+=(--mount "type=bind,src=$r,dst=$(realpath -s "$d")")
+done
+for i in "${!BIND_RO_AT_SRC[@]}"; do s="${BIND_RO_AT_SRC[$i]}"; d="${BIND_RO_AT_DEST[$i]}"; [[ -e "$s" ]] || { echo "Error: --bind-ro-at source '$s' does not exist." >&2; exit 1; }; check_remap_dest --bind-ro-at "$d" || exit 1; MOUNTS+=(--mount "type=bind,src=$(realpath "$s"),dst=$d,readonly"); done
+for i in "${!BIND_RW_AT_SRC[@]}"; do s="${BIND_RW_AT_SRC[$i]}"; d="${BIND_RW_AT_DEST[$i]}"; [[ -e "$s" ]] || { echo "Error: --bind-rw-at source '$s' does not exist." >&2; exit 1; }; check_remap_dest --bind-rw-at "$d" || exit 1; r="$(realpath "$s")"; is_refused_work_dir "$r" && { echo "Error: refusing '$r' as a --bind-rw-at source." >&2; exit 1; }; MOUNTS+=(--mount "type=bind,src=$r,dst=$d"); done
+
+SETENV_NAMES=()
+for kv in "${SETENV[@]}"; do [[ "$kv" == *=* ]] || { echo "Error: --setenv '$kv' is not NAME=VALUE." >&2; exit 1; }; [[ "${kv%%=*}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || { echo "Error: --setenv names a variable that is not [A-Za-z_][A-Za-z0-9_]*: '${kv%%=*}'" >&2; exit 1; }; SETENV_NAMES+=("${kv%%=*}"); done
+if (( ${#BRIDGE_SOCKETS[@]} )) && [[ "$NET_MODE" != sealed ]]; then echo "Error: --bridge works only with --net sealed." >&2; exit 1; fi
+for i in "${!BRIDGE_SOCKETS[@]}"; do
+    s="${BRIDGE_SOCKETS[$i]}"; p="${BRIDGE_PORTS[$i]}"
+    [[ -S "$s" ]] || { echo "Error: --bridge source '$s' is not a unix socket." >&2; exit 1; }
+    if [[ ! "$p" =~ ^[1-9][0-9]{0,4}$ ]] || (( p > 65535 )); then
+        echo "Error: --bridge '$s=$p' has a port that is not a number from 1 to 65535." >&2
+        exit 1
+    fi
+    (( p >= 1024 )) || { echo "Error: --bridge '$s=$p' would listen on a privileged port. Use 1024 or higher." >&2; exit 1; }
+    for j in "${!BRIDGE_PORTS[@]}"; do (( j < i )) || continue; [[ "${BRIDGE_PORTS[$j]}" != "$p" ]] || { echo "Error: two --bridge flags want in-sandbox port $p." >&2; exit 1; }; done
+    fs_reject_unsafe_chars "$s" "$p" || exit 1
+done
+
+SANDBOX_PATH="$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+for d in "${PREPEND_PATH[@]}"; do [[ -d "$d" ]] || { echo "Error: --prepend-path '$d' is not a directory on the host." >&2; exit 1; }; SANDBOX_PATH="$d:$SANDBOX_PATH"; done
+command -v "$CLI" >/dev/null || { echo "Error: container runtime '$CLI' not found." >&2; exit 1; }
+probe='command -v bash >/dev/null'
+[[ "$NET_MODE" == pinned ]] && probe+=' && command -v ip >/dev/null'
+(( ${#BRIDGE_SOCKETS[@]} )) && probe+=' && command -v socat >/dev/null'
+if ! "$CLI" run --rm --entrypoint /bin/sh "$IMAGE" -c "$probe"; then echo "Error: image '$IMAGE' lacks bash, iproute2's ip (pinned mode), or socat (bridges), as required." >&2; exit 1; fi
+
+LOCK_FILE="/var/tmp/claude-scratch/forks/.sandbox-backend-lock-$(printf '%s' "$WORK_DIR" | md5sum | cut -d' ' -f1)"
+exec 9>"$LOCK_FILE"; flock -n 9 || { echo "Error: another sandbox is already using $WORK_DIR" >&2; exit 1; }
+RUN_ID="$(date +%s)-$$-$RANDOM"; STATE_DIR="$(mktemp -d /var/tmp/claude-scratch/forks/sandbox-backend-container.XXXXXX)"
+CONTAINER=""; NETWORK=""
+# shellcheck disable=SC2329  # invoked by the EXIT trap
+cleanup() { set +e; [[ -z "$CONTAINER" ]] || "$CLI" rm -f "$CONTAINER" >/dev/null 2>&1; [[ -z "$NETWORK" ]] || "$CLI" network rm "$NETWORK" >/dev/null 2>&1; rm -rf "$STATE_DIR"; }
+trap cleanup EXIT
+
+uid_n="$(id -u)"; gid_n="$(id -g)"
+if (( uid_n != 0 )); then
+    printf 'root:x:0:0:root:/root:/bin/bash\nsandbox:x:%s:%s:sandbox:%s:/bin/bash\nnobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n' "$uid_n" "$gid_n" "$HOME" >"$STATE_DIR/passwd"
+    printf 'root:x:0:\nsandbox:x:%s:\nnogroup:x:65534:\n' "$gid_n" >"$STATE_DIR/group"
+    MOUNTS+=(--mount "type=bind,src=$STATE_DIR/passwd,dst=/etc/passwd,readonly" --mount "type=bind,src=$STATE_DIR/group,dst=/etc/group,readonly")
+fi
+
+bridge_dirs=()
+for s in "${BRIDGE_SOCKETS[@]}"; do d="$(dirname "$(realpath "$s")")"; seen=0; for r in "${bridge_dirs[@]}"; do [[ "$r" == "$d" ]] && seen=1; done; (( seen )) || { bridge_dirs+=("$d"); MOUNTS+=(--mount "type=bind,src=$d,dst=$d,readonly"); }; done
+
+{
+    echo '#!/usr/bin/env bash'; echo 'set -euo pipefail'
+    if [[ "$NET_MODE" == pinned ]]; then echo 'for ((i=0;i<200;i++)); do ip route show type blackhole | grep -q "169.254.0.0/16" && break; sleep .05; done'; echo 'ip route show type blackhole | grep -q "169.254.0.0/16" || { echo "Error: pinned-egress route gate timed out; command not run." >&2; exit 1; }'; fi
+    for i in "${!BRIDGE_SOCKETS[@]}"; do printf 'socat %q %q &\n' "TCP-LISTEN:${BRIDGE_PORTS[$i]},bind=127.0.0.1,reuseaddr,fork" "UNIX-CONNECT:${BRIDGE_SOCKETS[$i]}"; printf '(while [[ -S %q ]]; do sleep 1; done; kill -TERM $$) &\n' "${BRIDGE_SOCKETS[$i]}"; done
+    for p in "${BRIDGE_PORTS[@]}"; do printf 'for ((i=0;i<100;i++)); do (exec 3<>/dev/tcp/127.0.0.1/%q) 2>/dev/null && break; sleep .02; done\n' "$p"; done
+    echo 'exec "$@"'
+} >"$STATE_DIR/bootstrap"; chmod +x "$STATE_DIR/bootstrap"
+MOUNTS+=(--mount "type=bind,src=$STATE_DIR/bootstrap,dst=/fork-sandbox-bootstrap,readonly")
+
+NET_ARGS=()
+if [[ "$NET_MODE" == sealed ]]; then NET_ARGS=(--network none); else NETWORK="fork-sandbox-$RUN_ID"; "$CLI" network create --label "fork-sandbox-run=$RUN_ID" "$NETWORK" >/dev/null; NET_ARGS=(--network "$NETWORK"); fi
+[[ "$NET_MODE" != unpinned ]] || echo "sandbox-backend-container: egress not pinned: tunnels, VPNs and bridge networks reachable" >&2
+
+ENV_ARGS=(--env "HOME=$HOME" --env "PATH=$SANDBOX_PATH" --env "TERM=${TERM:-dumb}" --env "LANG=${LANG:-C.UTF-8}" --env "USER=${USER:-sandbox}" --env SHELL=/bin/bash --env PYTHONDONTWRITEBYTECODE=1)
+for kv in "${SETENV[@]}"; do ENV_ARGS+=(--env "$kv"); done
+TTY=(); [[ -t 0 && -t 1 ]] && TTY=(-t)
+CREATE_ARGS=(create --label "fork-sandbox-run=$RUN_ID" --init --user "$uid_n:$gid_n" --cap-drop=ALL --security-opt no-new-privileges --tmpfs /tmp --tmpfs "$HOME" -i "${TTY[@]}" "${NET_ARGS[@]}" "${MOUNTS[@]}" "${ENV_ARGS[@]}" --workdir "$WORK_DIR" --entrypoint /bin/bash)
+[[ -z "$HOSTNAME_ARG" ]] || CREATE_ARGS+=(--hostname "$HOSTNAME_ARG")
+CONTAINER="$("$CLI" "${CREATE_ARGS[@]}" "$IMAGE" /fork-sandbox-bootstrap "$@")" || { echo "Error: container create failed; command did not start." >&2; exit 1; }
+
+if [[ "$NET_MODE" == pinned ]]; then
+    host_os="$(uname -s)"; [[ "$host_os" != Darwin ]] || echo "Warning: pinned routing on Darwin is unverified." >&2
+    if [[ "$host_os" == Linux ]]; then
+        default_line="$(ip -4 route show default | head -n1)" || true; iface="$(awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' <<<"$default_line")"
+        [[ -n "$iface" ]] || { echo "Error: cannot determine default-route interface; refusing unpinned run." >&2; exit 1; }
+        is_tunnel_iface "$iface" && { echo "Error: default route interface '$iface' is a tunnel; refusing unpinned run." >&2; exit 1; }
+        gateway="$("$CLI" inspect -f '{{range .NetworkSettings.Networks}}{{.Gateway}}{{end}}' "$CONTAINER")"
+        routes='ip route add blackhole 10.0.0.0/8; ip route add blackhole 172.16.0.0/12; ip route add blackhole 192.168.0.0/16; ip route add blackhole 100.64.0.0/10; ip route add blackhole 169.254.0.0/16; ip route add blackhole 198.18.0.0/15; ip -6 route add blackhole default'
+        while read -r prefix dev; do [[ -n "$prefix" && "$dev" != "$iface" ]] && routes+="; ip route replace blackhole $prefix"; done < <(ip -4 route show | awk '$1 != "default" {p=$1; for(i=1;i<=NF;i++) if($i=="dev") {print p, $(i+1); break}}')
+        while read -r addr; do routes+="; ip route replace blackhole $addr/32"; done < <(ip -4 -o addr show dev "$iface" scope global | awk '{split($4,a,"/"); print a[1]}')
+        routes+="; ip route replace blackhole $gateway/32"
+        while read -r prefix; do routes+="; ip route replace $prefix via $gateway"; done < <(ip -4 route show dev "$iface" scope link | awk '$1 != "default" {print $1}')
+    elif [[ "$host_os" == Darwin ]]; then
+        default_line="$(route -n get default)" || true; iface="$(awk '/interface:/{print $2}' <<<"$default_line")"; [[ -n "$iface" ]] || { echo "Error: Darwin default route parse failed; refusing unpinned run." >&2; exit 1; }
+        is_tunnel_iface "$iface" && { echo "Error: default route interface '$iface' is a tunnel." >&2; exit 1; }
+        gateway="$("$CLI" inspect -f '{{range .NetworkSettings.Networks}}{{.Gateway}}{{end}}' "$CONTAINER")"; routes='ip route add blackhole 10.0.0.0/8; ip route add blackhole 172.16.0.0/12; ip route add blackhole 192.168.0.0/16; ip route add blackhole 100.64.0.0/10; ip route add blackhole 169.254.0.0/16; ip route add blackhole 198.18.0.0/15; ip -6 route add blackhole default'; while read -r prefix dev; do [[ "$dev" == "$iface" ]] || routes+="; ip route replace blackhole $prefix"; done < <(netstat -rn -f inet | awk 'NR>4 && $1 != "default" && $1 ~ /\// {print $1, $NF}'); routes+="; ip route replace blackhole $gateway/32"
+    else echo "Error: pinned routing is unsupported on $host_os." >&2; exit 1; fi
+    fs_reject_unsafe_chars "$routes" || exit 1
+    "$CLI" start "$CONTAINER" >/dev/null
+    "$CLI" run --rm --network "container:$CONTAINER" --cap-add=NET_ADMIN --user 0 --entrypoint /bin/bash "$IMAGE" -c "$routes" || { echo "Error: pin helper failed; command was not run." >&2; exit 1; }
+    "$CLI" attach --sig-proxy=true "$CONTAINER" || true
+else
+    "$CLI" start --attach --interactive "$CONTAINER" || true
+fi
+started="$("$CLI" inspect -f '{{.State.StartedAt}}' "$CONTAINER")"; [[ "$started" != '0001-01-01T00:00:00Z' ]] || { echo "Error: container never started; no command exit code exists." >&2; exit 1; }
+exit_code="$("$CLI" inspect -f '{{.State.ExitCode}}' "$CONTAINER")"
+exit "$exit_code"
