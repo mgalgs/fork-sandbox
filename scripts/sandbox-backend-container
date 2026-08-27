@@ -261,7 +261,7 @@ for s in "${BRIDGE_SOCKETS[@]}"; do d="$(dirname "$s")"; seen=0; for r in "${bri
 {
     echo '#!/usr/bin/env bash'; echo 'set -euo pipefail'
     if [[ "$NET_MODE" == pinned ]]; then echo 'for ((i=0;i<200;i++)); do ip route show type blackhole | grep -q "169.254.0.0/16" && break; sleep .05; done'; echo 'ip route show type blackhole | grep -q "169.254.0.0/16" || { echo "Error: pinned-egress route gate timed out; command not run." >&2; exit 1; }'; fi
-    for i in "${!BRIDGE_SOCKETS[@]}"; do printf 'socat %q %q &\n' "TCP-LISTEN:${BRIDGE_PORTS[$i]},bind=127.0.0.1,reuseaddr,fork" "UNIX-CONNECT:${BRIDGE_SOCKETS[$i]}"; printf '(while [[ -S %q ]]; do sleep 1; done; kill -TERM $$) &\n' "${BRIDGE_SOCKETS[$i]}"; done
+    for i in "${!BRIDGE_SOCKETS[@]}"; do printf 'socat %q %q &\n' "TCP-LISTEN:${BRIDGE_PORTS[$i]},bind=127.0.0.1,reuseaddr,fork" "UNIX-CONNECT:${BRIDGE_SOCKETS[$i]}"; printf '(while [[ -S %q ]]; do sleep 1; done; echo "Error: --bridge socket vanished; terminating the command:" %q >&2; kill -TERM $$) &\n' "${BRIDGE_SOCKETS[$i]}" "${BRIDGE_SOCKETS[$i]}"; done
     for p in "${BRIDGE_PORTS[@]}"; do printf 'ready=0; for ((i=0;i<100;i++)); do (exec 3<>/dev/tcp/127.0.0.1/%q) 2>/dev/null && { ready=1; break; }; sleep .02; done; (( ready )) || { echo "Error: bridge listener on port %q did not become ready; command not run." >&2; exit 1; }\n' "$p" "$p"; done
     printf 'exec env -i'; for kv in "${COMMAND_ENV[@]}"; do printf ' %q' "$kv"; done; echo ' "$@"'
 } >"$STATE_DIR/bootstrap"; chmod +x "$STATE_DIR/bootstrap"
