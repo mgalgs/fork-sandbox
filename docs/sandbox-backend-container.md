@@ -45,25 +45,34 @@ silently break guarantee 3.
 
 ## Destination blackhole pin
 
-At container start the backend computes and installs:
+At container start the backend computes and installs, in this order:
 
 1. Blackholes for `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`,
-   `100.64.0.0/10`, `169.254.0.0/16`, and `198.18.0.0/15`.
-2. Blackholes for every host prefix routed through an interface other than the
+   `100.64.0.0/10`, and `198.18.0.0/15`.
+2. An IPv6 default blackhole, because the runtime network is IPv4-only and an
+   unpinned address family must not remain.
+3. Blackholes for every host prefix routed through an interface other than the
    default-route interface.
-3. `/32` blackholes for every host address on the default-route interface.
-4. A `/32` blackhole for the container gateway. It remains usable as a next
+4. `/32` blackholes for every host address on the default-route interface.
+5. A `/32` blackhole for the container gateway. It remains usable as a next
    hop.
-5. Normal routes through that gateway for every directly connected prefix on
+6. Normal routes through that gateway for every directly connected prefix on
    the host default-route interface, punching the LAN through broader private
    range denials while the `/32` host and gateway denials still win.
-6. An IPv6 default blackhole, because the runtime network is IPv4-only and an
-   unpinned address family must not remain.
+7. Last: a blackhole for `169.254.0.0/16`.
 
-Longest-prefix matching makes rule order irrelevant. The container's own
-subnet route is normally more specific than the fixed private-range denial and
-therefore remains usable. If a host LAN overlaps the container subnet, that
-part of the LAN is unreachable; failing closed is preferable.
+Longest-prefix matching makes rule order irrelevant to *which* destinations
+end up blocked. The container's own subnet route is normally more specific
+than the fixed private-range denial and therefore remains usable. If a host
+LAN overlaps the container subnet, that part of the LAN is unreachable;
+failing closed is preferable.
+
+Order is not irrelevant to the *gate* described below, though: it polls for
+one specific route and treats that route's appearance as proof the whole
+program above ran. `169.254.0.0/16` is therefore installed last, deliberately,
+rather than grouped with the other five fixed ranges in step 1 — a poll that
+lands after step 1 but before steps 3-6 have run must not see a pin it can
+trust.
 
 A short-lived helper container shares the target's network namespace and runs
 as root with `NET_ADMIN` to install the routes. The target itself has
