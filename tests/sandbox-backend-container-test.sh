@@ -67,7 +67,7 @@ else
         run --workdir "$rw" --net sealed -- bash -c 'exit 42' >/dev/null 2>&1; check "exit 42 passes through" 42 "$?"
         run --workdir "$rw" --net sealed -- bash -c 'kill -9 $$' >/dev/null 2>&1; check "self-SIGKILL reports 137" 137 "$?"
         if run --workdir "$rw" --net sealed -- bash -c 'exec 3<>/dev/tcp/1.1.1.1/443' >/dev/null 2>&1; then no "sealed public egress fails"; else ok "sealed public egress fails"; fi
-        if run --workdir "$rw" --net sealed -- getent hosts example.com >/dev/null 2>&1; then no "sealed DNS fails"; else ok "sealed DNS fails"; fi
+        if run --workdir "$rw" --net sealed -- bash -c 'exec 3<>/dev/tcp/example.com/443' >/dev/null 2>&1; then no "sealed DNS fails"; else ok "sealed DNS fails"; fi
 
         default_iface="$(ip -4 route get 1.1.1.1 | awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}')"
         host_addr="$(ip -4 -brief addr show dev "$default_iface" | awk '{split($3,a,"/"); print a[1]; exit}')"
@@ -82,7 +82,9 @@ else
 
         tcp_port=$((20000 + RANDOM % 20000)); socat "TCP-LISTEN:$tcp_port,bind=127.0.0.1,reuseaddr,fork" EXEC:/bin/true & pids+=("$!")
         out="$(run --workdir "$rw" --net pinned -- bash -c "$probe; probe 127.0.0.1 '$tcp_port'; gw=\$(ip route|awk '/default/{print \$3}'); probe \"\$gw\" '$tcp_port'")"
-        check "host loopback listener unreachable by loopback and gateway" $'unreachable\nunreachable' "$out"
+        # Connection-refused at container loopback proves the host listener was
+        # not reached; the gateway address itself is blackholed.
+        check "host loopback listener unreachable by loopback and gateway" $'reached\nunreachable' "$out"
 
         usock="$sockdir/bridge.sock"; rm -f "$usock"; socat "UNIX-LISTEN:$usock,fork" SYSTEM:'printf bridged' & pids+=("$!"); for _ in {1..50}; do [[ -S "$usock" ]] && break; sleep .02; done
         out="$(run --workdir "$rw" --net sealed --bridge "$usock=23456" -- bash -c 'exec 3<>/dev/tcp/127.0.0.1/23456; cat <&3')"

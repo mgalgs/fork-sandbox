@@ -149,10 +149,15 @@ done
 SANDBOX_PATH="$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 for d in "${PREPEND_PATH[@]}"; do [[ -d "$d" ]] || { echo "Error: --prepend-path '$d' is not a directory on the host." >&2; exit 1; }; SANDBOX_PATH="$d:$SANDBOX_PATH"; done
 command -v "$CLI" >/dev/null || { echo "Error: container runtime '$CLI' not found." >&2; exit 1; }
-probe='command -v bash >/dev/null'
-[[ "$NET_MODE" == pinned ]] && probe+=' && command -v ip >/dev/null'
-(( ${#BRIDGE_SOCKETS[@]} )) && probe+=' && command -v socat >/dev/null'
-if ! "$CLI" run --rm --entrypoint /bin/sh "$IMAGE" -c "$probe"; then echo "Error: image '$IMAGE' lacks bash, iproute2's ip (pinned mode), or socat (bridges), as required." >&2; exit 1; fi
+if ! "$CLI" run --rm --entrypoint /bin/sh "$IMAGE" -c 'command -v bash >/dev/null'; then
+    echo "Error: image '$IMAGE' does not provide bash." >&2; exit 1
+fi
+if [[ "$NET_MODE" == pinned ]] && ! "$CLI" run --rm --entrypoint /bin/sh "$IMAGE" -c 'command -v ip >/dev/null'; then
+    echo "Error: image '$IMAGE' does not provide iproute2's ip, required in pinned mode." >&2; exit 1
+fi
+if (( ${#BRIDGE_SOCKETS[@]} )) && ! "$CLI" run --rm --entrypoint /bin/sh "$IMAGE" -c 'command -v socat >/dev/null'; then
+    echo "Error: image '$IMAGE' does not provide socat, required by --bridge." >&2; exit 1
+fi
 
 LOCK_FILE="/var/tmp/claude-scratch/forks/.sandbox-backend-lock-$(printf '%s' "$WORK_DIR" | md5sum | cut -d' ' -f1)"
 exec 9>"$LOCK_FILE"; flock -n 9 || { echo "Error: another sandbox is already using $WORK_DIR" >&2; exit 1; }
@@ -199,15 +204,17 @@ if [[ "$NET_MODE" == pinned ]]; then
         [[ -n "$iface" ]] || { echo "Error: cannot determine default-route interface; refusing unpinned run." >&2; exit 1; }
         is_tunnel_iface "$iface" && { echo "Error: default route interface '$iface' is a tunnel; refusing unpinned run." >&2; exit 1; }
         gateway="$("$CLI" inspect -f '{{range .NetworkSettings.Networks}}{{.Gateway}}{{end}}' "$CONTAINER")"
+        container_subnet="$("$CLI" network inspect -f '{{range .IPAM.Config}}{{.Subnet}}{{end}}' "$NETWORK")"
+        [[ -n "$gateway" && -n "$container_subnet" ]] || { echo "Error: cannot inspect the container gateway and subnet; refusing unpinned run." >&2; exit 1; }
         routes='ip route add blackhole 10.0.0.0/8; ip route add blackhole 172.16.0.0/12; ip route add blackhole 192.168.0.0/16; ip route add blackhole 100.64.0.0/10; ip route add blackhole 169.254.0.0/16; ip route add blackhole 198.18.0.0/15; ip -6 route add blackhole default'
-        while read -r prefix dev; do [[ -n "$prefix" && "$dev" != "$iface" ]] && routes+="; ip route replace blackhole $prefix"; done < <(ip -4 route show | awk '$1 != "default" {p=$1; for(i=1;i<=NF;i++) if($i=="dev") {print p, $(i+1); break}}')
+        while read -r prefix dev; do [[ -n "$prefix" && "$prefix" != "$container_subnet" && "$dev" != "$iface" ]] && routes+="; ip route replace blackhole $prefix"; done < <(ip -4 route show | awk '$1 != "default" {p=$1; for(i=1;i<=NF;i++) if($i=="dev") {print p, $(i+1); break}}')
         while read -r addr; do routes+="; ip route replace blackhole $addr/32"; done < <(ip -4 -o addr show dev "$iface" scope global | awk '{split($4,a,"/"); print a[1]}')
         routes+="; ip route replace blackhole $gateway/32"
         while read -r prefix; do routes+="; ip route replace $prefix via $gateway"; done < <(ip -4 route show dev "$iface" scope link | awk '$1 != "default" {print $1}')
     elif [[ "$host_os" == Darwin ]]; then
         default_line="$(route -n get default)" || true; iface="$(awk '/interface:/{print $2}' <<<"$default_line")"; [[ -n "$iface" ]] || { echo "Error: Darwin default route parse failed; refusing unpinned run." >&2; exit 1; }
         is_tunnel_iface "$iface" && { echo "Error: default route interface '$iface' is a tunnel." >&2; exit 1; }
-        gateway="$("$CLI" inspect -f '{{range .NetworkSettings.Networks}}{{.Gateway}}{{end}}' "$CONTAINER")"; routes='ip route add blackhole 10.0.0.0/8; ip route add blackhole 172.16.0.0/12; ip route add blackhole 192.168.0.0/16; ip route add blackhole 100.64.0.0/10; ip route add blackhole 169.254.0.0/16; ip route add blackhole 198.18.0.0/15; ip -6 route add blackhole default'; while read -r prefix dev; do [[ "$dev" == "$iface" ]] || routes+="; ip route replace blackhole $prefix"; done < <(netstat -rn -f inet | awk 'NR>4 && $1 != "default" && $1 ~ /\// {print $1, $NF}'); routes+="; ip route replace blackhole $gateway/32"
+        gateway="$("$CLI" inspect -f '{{range .NetworkSettings.Networks}}{{.Gateway}}{{end}}' "$CONTAINER")"; container_subnet="$("$CLI" network inspect -f '{{range .IPAM.Config}}{{.Subnet}}{{end}}' "$NETWORK")"; [[ -n "$gateway" && -n "$container_subnet" ]] || { echo "Error: Darwin container network parse failed; refusing unpinned run." >&2; exit 1; }; routes='ip route add blackhole 10.0.0.0/8; ip route add blackhole 172.16.0.0/12; ip route add blackhole 192.168.0.0/16; ip route add blackhole 100.64.0.0/10; ip route add blackhole 169.254.0.0/16; ip route add blackhole 198.18.0.0/15; ip -6 route add blackhole default'; while read -r prefix dev; do [[ "$prefix" == "$container_subnet" || "$dev" == "$iface" ]] || routes+="; ip route replace blackhole $prefix"; done < <(netstat -rn -f inet | awk 'NR>4 && $1 != "default" && $1 ~ /\// {print $1, $NF}'); while read -r addr; do routes+="; ip route replace blackhole $addr/32"; done < <(ifconfig "$iface" | awk '/inet /{print $2}'); routes+="; ip route replace blackhole $gateway/32"; while read -r prefix; do routes+="; ip route replace $prefix via $gateway"; done < <(netstat -rn -f inet | awk -v dev="$iface" 'NR>4 && $NF == dev && $3 !~ /G/ && $1 != "default" && $1 ~ /\// {print $1}')
     else echo "Error: pinned routing is unsupported on $host_os." >&2; exit 1; fi
     fs_reject_unsafe_chars "$routes" || exit 1
     "$CLI" start "$CONTAINER" >/dev/null
