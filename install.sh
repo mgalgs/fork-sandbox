@@ -55,15 +55,54 @@ need() {
     fi
 }
 
-need bwrap  "bubblewrap: the sandbox itself"                     required
-need pasta  "passt: pinned egress for a non-sealed run"          required
+HOST_OS="$(uname -s)"
+
 need git    "cloning the project into the sandbox"               required
 need jq     "reading run events and generating agent config"     required
-need tmux   "detached runs; --foreground works without it"       optional
-need socat  "the model bridge for a sealed local-model run"      optional
-need setsid "same bridge: its own process group for teardown"    optional
-need docker "container backend and --services runtime"           optional
-need python3 "sandbox-run-log.py, the durable run log"           optional
+
+# Which sandbox this machine can actually run decides what is required.
+# bubblewrap and pasta are Linux kernel features with no macOS equivalent, so
+# listing them as missing on a Mac would be reporting the weather. There the
+# container backend is the sandbox, and its own dependencies take their place.
+if [[ "$HOST_OS" == Darwin ]]; then
+    need docker "the container backend: the sandbox macOS runs"   required
+    need flock  "the container backend's per-work-directory lock" required
+    need tmux   "detached runs; --foreground works without it"    optional
+    need socat  "the model bridge for a sealed local-model run"   optional
+    need python3 "sandbox-run-log.py, the durable run log"        optional
+else
+    need bwrap  "bubblewrap: the sandbox itself"                     required
+    need pasta  "passt: pinned egress for a non-sealed run"          required
+    need tmux   "detached runs; --foreground works without it"       optional
+    need socat  "the model bridge for a sealed local-model run"      optional
+    need setsid "same bridge: its own process group for teardown"    optional
+    need docker "container backend and --services runtime"           optional
+    need python3 "sandbox-run-log.py, the durable run log"           optional
+fi
+
+# The scripts start with `#!/usr/bin/env bash`, so the bash that matters is the
+# first one on PATH, not the /bin/bash running this installer. macOS ships 3.2
+# from 2007, and these scripts use mapfile and ${var,,}, which are bash 4.
+# Check the one that will actually run them.
+env_bash="$(command -v bash 2>/dev/null || true)"
+if [[ -n "$env_bash" ]]; then
+    # shellcheck disable=SC2016  # the expansion is for the inner bash, not this one
+    bash_major="$("$env_bash" -c 'echo ${BASH_VERSINFO[0]}' 2>/dev/null || echo 0)"
+    if [[ "$bash_major" =~ ^[0-9]+$ ]] && (( bash_major < 4 )); then
+        missing_required+=("bash 4+ — $env_bash is $bash_major.x; the scripts use mapfile and \${var,,}")
+    fi
+fi
+
+# GNU coreutils. realpath -m and stat -c are GNU flags the BSD tools of the
+# same name do not have. On Linux these ARE the GNU tools; under Homebrew they
+# are grealpath and gstat, which the scripts find on their own -- but only if
+# coreutils is installed at all.
+for gnu_tool in realpath stat; do
+    if ! { "g$gnu_tool" --version 2>/dev/null || "$gnu_tool" --version 2>/dev/null; } \
+        | grep -q "GNU coreutils"; then
+        missing_required+=("GNU $gnu_tool — the scripts use its GNU-only flags (brew install coreutils)")
+    fi
+done
 
 if (( ${#missing_required[@]} )); then
     echo "Missing required tools:"
@@ -84,14 +123,23 @@ fi
 # Linux-only. Say so here rather than let bwrap's absence read as a packaging
 # problem -- and say what the container backend does and does not get you,
 # rather than let its existence read as macOS support.
-if [[ "$(uname -s)" != "Linux" ]]; then
+if [[ "$HOST_OS" != "Linux" ]]; then
     echo "Note: the default backend is bubblewrap plus a network namespace,"
-    echo "which is Linux-only, so bwrap and pasta above cannot be satisfied"
-    echo "here. sandbox-backend-container implements the same contract in a"
-    echo "Linux container and is the intended macOS path, but macOS does not"
-    echo "work end-to-end yet: the callers mount the host's agent binary into"
-    echo "the sandbox, and a Mach-O binary cannot run in a Linux container."
-    echo "See the README's Portability section for what is missing."
+    echo "which is Linux-only. On macOS the sandbox is sandbox-backend-container,"
+    echo "which implements the same contract in a Linux container. Select it,"
+    echo "and build the image that supplies its userland:"
+    echo ""
+    echo "  ./scripts/build-sandbox-image.sh"
+    echo "  export FORK_SANDBOX_BACKEND=container"
+    echo "  export FORK_SANDBOX_CONTAINER_IMAGE=fork-sandbox:latest"
+    echo ""
+    echo "Homebrew supplies the rest:"
+    echo "  brew install bash coreutils util-linux"
+    echo "util-linux is keg-only, so put its bin directory on PATH for flock."
+    echo ""
+    echo "Two things are still unverified on macOS, and both fail closed: the"
+    echo "Darwin routing branch that builds pinned egress, and unix-socket"
+    echo "bridges (so --harness pi-local). See docs/macos-support.md."
     echo ""
 fi
 
