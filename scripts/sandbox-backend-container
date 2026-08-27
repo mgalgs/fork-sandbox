@@ -379,7 +379,18 @@ if [[ "$NET_MODE" == pinned ]]; then
     # stdin from /dev/null in a non-interactive shell unless told otherwise,
     # and stdin is how a large prompt reaches the command (see the header) —
     # losing it would be a silent regression, not a loud one.
-    "$CLI" start --attach --interactive "$CONTAINER" < /dev/stdin &
+    #
+    # But stdin can be CLOSED rather than merely empty — a script launched
+    # from a harness, a cron job, or a tmux runner often has no fd 0 at all.
+    # Then /dev/stdin cannot be opened, and the redirect kills the whole run
+    # before the command starts ("No such device or address"). Test it and
+    # fall back, because a pinned run must not depend on the caller having
+    # bothered to give us a stdin.
+    if [[ -r /dev/stdin ]]; then
+        "$CLI" start --attach --interactive "$CONTAINER" < /dev/stdin &
+    else
+        "$CLI" start --attach --interactive "$CONTAINER" < /dev/null &
+    fi
     attach_pid=$!
     "$CLI" run --rm --network "container:$CONTAINER" --cap-add=NET_ADMIN --user 0 --entrypoint /bin/bash "$IMAGE" -c "$routes" || { echo "Error: pin helper failed; command was not run." >&2; exit 1; }
     wait "$attach_pid" || true
