@@ -1,7 +1,7 @@
 ---
 name: fork-sandbox
 description: Fork a task to an unattended Claude Code session in a sandboxed clone of the repo. Headless, so it needs no keypress, exits on its own, fetches its branch back, and logs every event to a file this session can watch. A running session can still be steered with fork-sandbox-say.sh, which sends it an operator addendum. Use when work should run without babysitting — a refactor, a test sweep, a long build.
-argument-hint: [--branch <name>] [--model <model>] [--harness claude|pi|pi-local|codex] [--review-loop <N>] [--sandbox-args "..."] <project-path> — path to the target project (omit or use "." for the current repo). Use --branch to name the branch the session commits on. Use --model to pick the model (fable, opus, sonnet). Use --harness pi to run pi against OpenRouter, which then requires --model; --harness pi-local to run pi against a self-hosted endpoint in a sandbox with no network at all, which costs nothing; or --harness codex to run OpenAI codex on your ChatGPT sign-in. Use --review-loop N to have a fresh session review the run's commits and a third session fix what it found, up to N times. Use --sandbox-args "--unpin-egress" only when the task must reach the tailnet, a VPN, or a libvirt/docker bridge.
+argument-hint: [--branch <name>] [--model <model>] [--harness claude|pi|pi-local|codex] [--review-loop <N>] [--review-model <model>] [--sandbox-args "..."] <project-path> — path to the target project (omit or use "." for the current repo). Use --branch to name the branch the session commits on. Use --model to pick the model (fable, opus, sonnet). Use --harness pi to run pi against OpenRouter, which then requires --model; --harness pi-local to run pi against a self-hosted endpoint in a sandbox with no network at all, which costs nothing; or --harness codex to run OpenAI codex on your ChatGPT sign-in. Use --review-loop N to have a fresh session review the run's commits and a third session fix what it found, up to N times; --review-model selects a different model for review legs only. Use --sandbox-args "--unpin-egress" only when the task must reach the tailnet, a VPN, or a libvirt/docker bridge.
 ---
 
 # Fork Sandbox
@@ -61,6 +61,7 @@ reach it — see "What it gives up".)
    fork-sandbox.sh --claude-args "--effort high" --branch "<branch>" "<path>" "<handoff>"
    fork-sandbox.sh --task-meta '{"kind":"implement","difficulty":3,"size":"m"}' --branch "<branch>" "<path>" "<handoff>"
    fork-sandbox.sh --review-loop 2 --branch "<branch>" "<path>" "<handoff>"
+   fork-sandbox.sh --review-loop 2 --review-model opus --branch "<branch>" "<path>" "<handoff>"
    ```
    Pass `--sandbox-args "--unpin-egress"` only when the task must reach the
    tailnet, a VPN, or a libvirt/docker bridge. It removes a restriction.
@@ -86,11 +87,14 @@ reach it — see "What it gives up".)
    reviewer to hold the branch to.
 
    **It costs sessions.** Every iteration is up to two more sessions at the
-   same model and price as the run itself, so `--review-loop 2` can cost
+   selected models' prices, so `--review-loop 2` can cost
    three to five times a plain run. Note the asymmetry: a review that
    approves costs one extra session, a review that finds something costs
    two. On a `pi-local` run the price is zero either way, which is where a
    large N is free to try.
+
+   Pass `--review-model <model>` to use another model for review legs only.
+   Fix legs keep using the implementation model selected by `--model`.
 
    **Watching one is no different.** The run counts as running until the last
    leg is done, so the Monitor tool still fires exactly one terminal event,

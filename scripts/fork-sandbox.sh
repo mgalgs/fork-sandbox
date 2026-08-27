@@ -28,6 +28,9 @@
 #                        session and let a third one fix what the review
 #                        found, up to N times. N must be a positive integer.
 #                        See "The review loop" below.
+# --review-model <model>:
+#                        use this model for review legs. Fix legs continue to
+#                        use --model. Requires --review-loop.
 # --task-meta '<json>':  one JSON object of orchestrator-supplied task
 #                        metadata -- kind, difficulty, size,
 #                        prompt_template_id, stage -- stored beside the run
@@ -103,8 +106,9 @@
 # session: a REVIEW leg reads the commits the run just made and writes a
 # verdict, and when that verdict lists problems a FIX leg is given them and
 # commits the fixes. That pair repeats up to N times. Each leg is a fresh
-# session of the same harness and model, started the same way as the main one
-# with a generated prompt on stdin, so a reviewer never sits inside the
+# session of the same harness, started the same way as the main one (or with
+# --review-model for review legs), with a generated prompt on stdin. A reviewer
+# therefore never sits inside the
 # conversation whose work it is judging — an author defends its code, a
 # stranger reads it. The review leg follows the code-review-portable skill,
 # which is bound into every run already, and writes its verdict to
@@ -301,6 +305,7 @@ usage() {
 branch=""
 checkout_ref=""
 model=""
+review_model=""
 harness="claude"
 claude_extra_args=""
 pi_extra_args=""
@@ -330,6 +335,10 @@ while [[ "${1:-}" == -* ]]; do
             ;;
         --model)
             model="${2:?--model requires a value}"
+            shift 2
+            ;;
+        --review-model)
+            review_model="${2:?--review-model requires a value}"
             shift 2
             ;;
         --claude-args)
@@ -504,6 +513,11 @@ if [[ -n "$review_loop_arg" ]]; then
         exit 1
     fi
     review_loop_cap="$review_loop_arg"
+fi
+if [[ -n "$review_model" && "$review_loop_cap" == "0" ]]; then
+    echo "Error: --review-model only applies to review legs and requires" >&2
+    echo "--review-loop." >&2
+    exit 1
 fi
 # The review leg follows the code-review-portable skill, which is also what
 # gets bound into the sandbox below. Without it there is no review method to
@@ -850,7 +864,7 @@ fs_reject_unsafe_chars "$harness_bin" "$harness_version"
 # before anything is created, so a bad name cannot leave a clone behind on
 # the way out.
 fs_reject_unsafe_chars "$project_path" "$handoff_file" "$branch" "$checkout_ref" \
-    "$model" "$claude_extra_args" "$sandbox_args"
+    "$model" "$review_model" "$claude_extra_args" "$sandbox_args"
 
 # --task-meta never enters the generated runner -- it is written straight to
 # a file in the run dir -- so the check it needs is JSON validity, not shell
@@ -1541,6 +1555,54 @@ else
     fi
 fi
 
+# Review legs may use a stronger or independent model. Keep a distinct command
+# instead of mutating sandbox_cmd in the runner: fix legs deliberately stay on
+# the implementation model. The model flag sits in a different argv region for
+# each harness, so put it in the harness-specific legal position when absent.
+review_sandbox_cmd=("${sandbox_cmd[@]}")
+if [[ -n "$review_model" ]]; then
+    if [[ "$harness" == "claude" ]]; then
+        # Last occurrence wins, including over one supplied in --claude-args.
+        review_sandbox_cmd+=(--model "$review_model")
+    elif [[ "$harness" == "pi-local" ]]; then
+        model_flag_i=-1
+        for i in "${!review_sandbox_cmd[@]}"; do
+            if [[ "${review_sandbox_cmd[$i]}" == "$clone_dir" ]]; then
+                workdir_i="$i"
+                break
+            fi
+            [[ "${review_sandbox_cmd[$i]}" == "--model" ]] && model_flag_i="$i"
+        done
+        if (( model_flag_i >= 0 )); then
+            review_sandbox_cmd[model_flag_i+1]="$review_model"
+        else
+            review_sandbox_cmd=("${review_sandbox_cmd[@]:0:workdir_i}" --model "$review_model" "${review_sandbox_cmd[@]:workdir_i}")
+        fi
+    elif [[ "$harness" == "codex" ]]; then
+        model_flag_i=-1
+        for i in "${!review_sandbox_cmd[@]}"; do
+            if [[ "${review_sandbox_cmd[$i]}" == "-" ]]; then
+                prompt_i="$i"
+                break
+            fi
+            [[ "${review_sandbox_cmd[$i]}" == "--model" ]] && model_flag_i="$i"
+        done
+        if (( model_flag_i >= 0 )); then
+            review_sandbox_cmd[model_flag_i+1]="$review_model"
+        else
+            review_sandbox_cmd=("${review_sandbox_cmd[@]:0:prompt_i}" --model "$review_model" "${review_sandbox_cmd[@]:prompt_i}")
+        fi
+    else
+        # OpenRouter pi always has this flag, immediately after its provider.
+        for i in "${!review_sandbox_cmd[@]}"; do
+            if [[ "${review_sandbox_cmd[$i]}" == "--provider" && "${review_sandbox_cmd[$((i+2))]:-}" == "--model" ]]; then
+                review_sandbox_cmd[i+3]="$review_model"
+                break
+            fi
+        done
+    fi
+fi
+
 # tmux rewrites ':' and '.' in a session name without saying so, and a branch
 # name may hold either. Fold every character tmux would touch to '-' here, so
 # the name this script records is the name tmux actually uses.
@@ -1585,6 +1647,7 @@ started_at="$(date +%s)"
     printf 'harness=%s\n' "$harness"
     printf 'harness_version=%s\n' "$harness_version"
     printf 'model=%s\n' "$model"
+    printf 'review_model=%s\n' "$review_model"
     printf 'session=%s\n' "$session_name"
     printf 'review_loop_cap=%s\n' "$review_loop_cap"
     printf 'started_at=%s\n' "$started_at"
@@ -1612,6 +1675,7 @@ started_at="$(date +%s)"
     printf 'codex_auth_src=%q\n' "${codex_auth_src:-}"
     printf 'codex_auth_dir=%q\n' "${codex_auth_dir:-}"
     printf 'model=%q\n' "$model"
+    printf 'review_model=%q\n' "$review_model"
     printf 'started_at=%q\n' "$started_at"
     printf 'pi_session_dir=%q\n' "$pi_session_dir"
     printf 'review_loop_cap=%q\n' "$review_loop_cap"
@@ -1627,6 +1691,9 @@ started_at="$(date +%s)"
     printf 'run_log_bin=%q\n' "$run_log_bin"
     printf 'sandbox_cmd=('
     printf '%q ' "${sandbox_cmd[@]}"
+    printf ')\n'
+    printf 'review_sandbox_cmd=('
+    printf '%q ' "${review_sandbox_cmd[@]}"
     printf ')\n\n'
     cat <<'RUNNER'
 events="$run_dir/events.jsonl"
@@ -1947,7 +2014,8 @@ fi
 
 # ------------------------------------------------------------- review loop --
 # --review-loop N: review the commits the session just made in a FRESH session
-# of the same harness and model, and when that review reports problems, hand
+# of the same harness and (when supplied) --review-model, and when that review
+# reports problems, hand
 # them to a fresh session that fixes them. Repeat until the review approves,
 # until a fix leg stops making progress, or until N iterations have run.
 #
@@ -1957,7 +2025,8 @@ fi
 # it had worked, so the loop runs downstream of the check that catches it.
 #
 # The legs reuse this run's sandbox command, so they get the same harness, the
-# same model, the same clone and the same binds. They differ in the prompt on
+# same clone and the same binds. Review legs may override the model; fix legs
+# retain the implementation model. They differ in the prompt on
 # stdin and in where their output goes: each leg has its own events file, so
 # events.jsonl stays the implement leg's and --result keeps showing the work
 # rather than the review of it.
@@ -2046,12 +2115,14 @@ save_review_loop() {
     [[ -n "$cur" ]] || cur='[]'
     if jq -n \
         --argjson cap "$review_loop_cap" \
+        --arg review_model "$review_model" \
         --arg ended "$review_loop_ended" \
         --arg detail "$review_loop_detail" \
         --argjson prev "$review_iters_done" \
         --argjson cur "$cur" \
         '{
             cap: $cap,
+            review_model: (if $review_model == "" then null else $review_model end),
             ended: (if $ended == "" then null else $ended end),
             detail: (if $detail == "" then null else $detail end),
             iterations: ($prev + $cur),
@@ -2083,6 +2154,7 @@ run_leg() {
     local leg_events="$run_dir/events-$kind-$n.jsonl"
     local leg_session="" leg_session_copy="" idx
     local -a cmd=("${sandbox_cmd[@]}")
+    [[ "$kind" == "review" ]] && cmd=("${review_sandbox_cmd[@]}")
     leg_rc=1
     leg_cost=""
     leg_usage=""

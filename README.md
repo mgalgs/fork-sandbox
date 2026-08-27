@@ -107,9 +107,13 @@ Pass `--review-loop 2` and the branch gets a quality pass before it comes back
 in step 4: a fresh session reviews the commits the run just made and writes a
 verdict, and if it found problems a third session fixes them and commits. That
 repeats until the review approves, until a fix session stops making progress,
-or until the count runs out. Each leg is a whole session at the same model's
-price, so reach for it when a defect would be expensive to find later — and
+or until the count runs out. Each leg is a whole session at its selected
+model's price, so reach for it when a defect would be expensive to find later — and
 freely on a model you host yourself, where it costs nothing.
+
+Add `--review-model <model>` to run only the review legs on a different model.
+Fix legs continue to use `--model`, keeping the original implementation model
+responsible for applying the findings.
 
 ## The three network modes
 
