@@ -269,9 +269,22 @@ if [[ "$NET_MODE" == pinned ]]; then
         gateway="$("$CLI" network inspect -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}' "$NETWORK")"; container_subnet="$("$CLI" network inspect -f '{{range .IPAM.Config}}{{.Subnet}}{{end}}' "$NETWORK")"; if ! is_valid_ipv4 "$gateway" || ! is_valid_ipv4_cidr "$container_subnet"; then echo "Error: container network gateway '$gateway' or subnet '$container_subnet' is not a valid address; refusing pinned run." >&2; exit 1; fi; routes='ip route add blackhole 10.0.0.0/8; ip route add blackhole 172.16.0.0/12; ip route add blackhole 192.168.0.0/16; ip route add blackhole 100.64.0.0/10; ip route add blackhole 169.254.0.0/16; ip route add blackhole 198.18.0.0/15; ip -6 route add blackhole default'; while read -r prefix dev; do [[ "$prefix" == "$container_subnet" || "$dev" == "$iface" ]] || routes+="; ip route replace blackhole $prefix"; done < <(netstat -rn -f inet | awk 'NR>4 && $1 != "default" && $1 ~ /\// {print $1, $NF}'); while read -r addr; do routes+="; ip route replace blackhole $addr/32"; done < <(ifconfig "$iface" | awk '/inet /{print $2}'); routes+="; ip route replace blackhole $gateway/32"; while read -r prefix; do routes+="; ip route replace $prefix via $gateway"; done < <(netstat -rn -f inet | awk -v dev="$iface" 'NR>4 && $NF == dev && $3 !~ /G/ && $1 != "default" && $1 ~ /\// {print $1}')
     else echo "Error: pinned routing is unsupported on $host_os." >&2; exit 1; fi
     fs_reject_unsafe_chars "$routes" || exit 1
-    "$CLI" start "$CONTAINER" >/dev/null
+    # The network namespace exists only once the container starts, so it
+    # starts attached before the pin exists; the generated bootstrap gates
+    # the real command on the pin's own sentinel route until the helper
+    # below installs it (see the bootstrap comment above). Attach runs in
+    # the background so the pin helper can run concurrently with the gate it
+    # is racing to close — `docker attach` never replays output written
+    # before it connects, so waiting for the helper first would silently
+    # drop anything the gated command prints before attach catches up.
+    # `< /dev/stdin` is required: bash redirects a background command's
+    # stdin from /dev/null in a non-interactive shell unless told otherwise,
+    # and stdin is how a large prompt reaches the command (see the header) —
+    # losing it would be a silent regression, not a loud one.
+    "$CLI" start --attach --interactive "$CONTAINER" < /dev/stdin &
+    attach_pid=$!
     "$CLI" run --rm --network "container:$CONTAINER" --cap-add=NET_ADMIN --user 0 --entrypoint /bin/bash "$IMAGE" -c "$routes" || { echo "Error: pin helper failed; command was not run." >&2; exit 1; }
-    "$CLI" attach --sig-proxy=true "$CONTAINER" || true
+    wait "$attach_pid" || true
 else
     "$CLI" start --attach --interactive "$CONTAINER" || true
 fi
