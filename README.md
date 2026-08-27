@@ -102,6 +102,14 @@ does and does not let a caller do.
    pull request from a stranger — a `Makefile` or a `package.json` script in
    it runs on *your* host the moment you build.
 
+Pass `--review-loop 2` and the branch gets a quality pass before it comes back
+in step 4: a fresh session reviews the commits the run just made and writes a
+verdict, and if it found problems a third session fixes them and commits. That
+repeats until the review approves, until a fix session stops making progress,
+or until the count runs out. Each leg is a whole session at the same model's
+price, so reach for it when a defect would be expensive to find later — and
+freely on a model you host yourself, where it costs nothing.
+
 ## The three network modes
 
 Every run is in exactly one of these, and the mode decides what a compromised

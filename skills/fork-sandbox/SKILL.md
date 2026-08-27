@@ -1,7 +1,7 @@
 ---
 name: fork-sandbox
 description: Fork a task to an unattended Claude Code session in a sandboxed clone of the repo. Headless, so it needs no keypress, exits on its own, fetches its branch back, and logs every event to a file this session can watch. A running session can still be steered with fork-sandbox-say.sh, which sends it an operator addendum. Use when work should run without babysitting — a refactor, a test sweep, a long build.
-argument-hint: [--branch <name>] [--model <model>] [--harness claude|pi|pi-local|codex] [--sandbox-args "..."] <project-path> — path to the target project (omit or use "." for the current repo). Use --branch to name the branch the session commits on. Use --model to pick the model (fable, opus, sonnet). Use --harness pi to run pi against OpenRouter, which then requires --model; --harness pi-local to run pi against a self-hosted endpoint in a sandbox with no network at all, which costs nothing; or --harness codex to run OpenAI codex on your ChatGPT sign-in. Use --sandbox-args "--unpin-egress" only when the task must reach the tailnet, a VPN, or a libvirt/docker bridge.
+argument-hint: [--branch <name>] [--model <model>] [--harness claude|pi|pi-local|codex] [--review-loop <N>] [--sandbox-args "..."] <project-path> — path to the target project (omit or use "." for the current repo). Use --branch to name the branch the session commits on. Use --model to pick the model (fable, opus, sonnet). Use --harness pi to run pi against OpenRouter, which then requires --model; --harness pi-local to run pi against a self-hosted endpoint in a sandbox with no network at all, which costs nothing; or --harness codex to run OpenAI codex on your ChatGPT sign-in. Use --review-loop N to have a fresh session review the run's commits and a third session fix what it found, up to N times. Use --sandbox-args "--unpin-egress" only when the task must reach the tailnet, a VPN, or a libvirt/docker bridge.
 ---
 
 # Fork Sandbox
@@ -60,9 +60,53 @@ reach it — see "What it gives up".)
    fork-sandbox.sh --sandbox-args "--unpin-egress" --branch "<branch>" "<path>" "<handoff>"
    fork-sandbox.sh --claude-args "--effort high" --branch "<branch>" "<path>" "<handoff>"
    fork-sandbox.sh --task-meta '{"kind":"implement","difficulty":3,"size":"m"}' --branch "<branch>" "<path>" "<handoff>"
+   fork-sandbox.sh --review-loop 2 --branch "<branch>" "<path>" "<handoff>"
    ```
    Pass `--sandbox-args "--unpin-egress"` only when the task must reach the
    tailnet, a VPN, or a libvirt/docker bridge. It removes a restriction.
+
+   ### `--review-loop N` — let the run review its own work
+
+   With the flag, the run does not end when the coding session does. A
+   **fresh** session reviews the commits it made, following the
+   `code-review-portable` skill, and writes a verdict whose first line is
+   `APPROVED` or `FINDINGS`. On `FINDINGS`, another fresh session is handed
+   those findings and commits fixes. That pair repeats up to N times, and the
+   loop stops on the first of: the review approves, N iterations have run, a
+   fix session commits nothing (`no-progress`), or a leg fails outright
+   (`harness-error`). The review never sits inside the coding session's own
+   conversation — an author defends its work, a stranger reads it.
+
+   **Reach for it when** the branch will be integrated with little scrutiny,
+   when the model is a cheap or local one whose first draft usually needs a
+   second pass, or when a defect would be expensive and quiet — a migration,
+   a security-adjacent change, anything touching money or auth. **Skip it**
+   for a small mechanical diff you will read yourself anyway, and for
+   exploratory work where there is no settled definition of correct for a
+   reviewer to hold the branch to.
+
+   **It costs sessions.** Every iteration is up to two more sessions at the
+   same model and price as the run itself, so `--review-loop 2` can cost
+   three to five times a plain run. Note the asymmetry: a review that
+   approves costs one extra session, a review that finds something costs
+   two. On a `pi-local` run the price is zero either way, which is where a
+   large N is free to try.
+
+   **Watching one is no different.** The run counts as running until the last
+   leg is done, so the Monitor tool still fires exactly one terminal event,
+   at the end of the whole loop, with the summary — which now carries a
+   `review:` line saying how many iterations ran and how it ended. Expect the
+   wall-clock to be two to five times a plain run, and set `timeout_ms`
+   accordingly.
+
+   `<run-dir>/review-loop.json` records what happened per iteration —
+   findings, each leg's exit and cost, the head sha before and after — and
+   `summary.json`'s `total_cost_usd` is the whole run including the loop
+   (`cost_usd` stays the coding session alone). Read
+   `<run-dir>/review-verdict-<i>.md` for what the reviewer actually said. It
+   is worth quoting to the user when the loop ended in `cap` or
+   `no-progress`, which means the branch came back with findings still
+   outstanding.
 
    The script prints the **run directory** and the exact monitor, status and
    result commands. Keep the run directory path; everything else needs it.
@@ -304,9 +348,12 @@ clone inside it is mounted, and the log is written by the host shell.
 | `<run-dir>/events.jsonl` | every event, one JSON object per line |
 | `<run-dir>/sandbox.log` | the sandbox wrapper's messages, startup errors included |
 | `<run-dir>/summary.txt` | branch, exit code, commit list and diffstat after the fetch |
-| `<run-dir>/summary.json` | the same facts structured — harness and its version, model, exit code, commits with subjects, `cost_usd`, and `usage` token counts — for reading, not grepping |
+| `<run-dir>/summary.json` | the same facts structured — harness and its version, model, exit code, commits with subjects, `cost_usd`, `total_cost_usd` (the run plus any `--review-loop` legs), and `usage` token counts — for reading, not grepping |
 | `<run-dir>/handoff.md` | the prompt as it was sent |
 | `<run-dir>/task-meta.json` | the `--task-meta` object, when one was given |
+| `<run-dir>/review-loop.json` | `--review-loop` only: how the loop ended, and one record per iteration |
+| `<run-dir>/review-verdict-<i>.md` | `--review-loop` only: what the reviewer wrote, verbatim |
+| `<run-dir>/events-review-<i>.jsonl`, `<run-dir>/events-fix-<i>.jsonl` | `--review-loop` only: each loop leg's own event stream |
 | `<run-dir>/inbox/` | operator addenda, written with `fork-sandbox-say.sh`; bound read-only into the sandbox |
 | `<run-dir>/exit-code` | written when the session exits |
 | `<run-dir>/pi-session` | `--harness pi` only: pi's session, with per-message cost |
