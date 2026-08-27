@@ -552,6 +552,12 @@ resolve_model() {
 
 resolve_model || exit 1
 
+if [[ "$harness" == "pi" && -z "$model" ]]; then
+    echo "Error: --harness pi needs --model. There is no default: the model" >&2
+    echo "is an OpenRouter id, such as moonshotai/kimi-k3." >&2
+    exit 1
+fi
+
 if [[ "$dry_run" == true ]]; then
     printf 'harness=%s\nmodel=%s\n' "$harness" "$model"
     exit 0
@@ -771,11 +777,6 @@ claude)
     ;;
 
 pi)
-    if [[ -z "$model" ]]; then
-        echo "Error: --harness pi needs --model. There is no default: the model" >&2
-        echo "is an OpenRouter id, such as moonshotai/kimi-k3." >&2
-        exit 1
-    fi
     harness_env_file="$config_dir/pi.env"
     if [[ ! -f "$harness_env_file" ]]; then
         echo "Error: $harness_env_file not found. A pi run reads its" >&2

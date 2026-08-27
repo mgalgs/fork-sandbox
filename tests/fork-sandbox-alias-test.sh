@@ -154,6 +154,11 @@ out="$(run --harness claude/fable 2>/dev/null)"
 check "claude model passes through" $'harness=claude\nmodel=fable' "$out"
 out="$(run --harness pi/vendor/model 2>/dev/null)"
 check "pi model passes through" $'harness=pi\nmodel=vendor/model' "$out"
+if run --harness pi > /dev/null 2>"$err"; then
+    no "dry-run validates pi's required model"
+else
+    ok "dry-run validates pi's required model"
+fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))
