@@ -1,7 +1,7 @@
 ---
 name: fork-sandbox
 description: Fork a task to an unattended Claude Code session in a sandboxed clone of the repo. Headless, so it needs no keypress, exits on its own, fetches its branch back, and logs every event to a file this session can watch. A running session can still be steered with fork-sandbox-say.sh, which sends it an operator addendum. Use when work should run without babysitting — a refactor, a test sweep, a long build.
-argument-hint: [--branch <name>] [--model <model>] [--harness claude|pi|pi-local|codex] [--review-loop <N>] [--review-model <model>] [--sandbox-args "..."] <project-path> — path to the target project (omit or use "." for the current repo). Use --branch to name the branch the session commits on. Use --model to pick the model (fable, opus, sonnet). Use --harness pi to run pi against OpenRouter, which then requires --model; --harness pi-local to run pi against a self-hosted endpoint in a sandbox with no network at all, which costs nothing; or --harness codex to run OpenAI codex on your ChatGPT sign-in. Use --review-loop N to have a fresh session review the run's commits and a third session fix what it found, up to N times; --review-model selects a different model for review legs only. Use --sandbox-args "--unpin-egress" only when the task must reach the tailnet, a VPN, or a libvirt/docker bridge.
+argument-hint: [--branch <name>] [--model <model>] [--harness <harness>[/<model>]] [--review-loop <N>] [--review-model <model>] [--sandbox-args "..."] <project-path> — path to the target project (omit or use "." for the current repo). Use --branch to name the branch the session commits on. Use --model to pick the model (fable, opus, sonnet) or append it to the harness. Use --harness pi to run pi against OpenRouter, which then requires a model; --harness pi-local to run pi against a self-hosted endpoint in a sandbox with no network at all, which costs nothing; or --harness codex to run OpenAI codex on your ChatGPT sign-in. Use --review-loop N to have a fresh session review the run's commits and a third session fix what it found, up to N times; --review-model selects a different model for review legs only. Use --sandbox-args "--unpin-egress" only when the task must reach the tailnet, a VPN, or a libvirt/docker bridge.
 ---
 
 # Fork Sandbox
@@ -57,6 +57,7 @@ reach it — see "What it gives up".)
    Extra flags, all optional:
    ```bash
    fork-sandbox.sh --model sonnet --branch "<branch>" "<path>" "<handoff>"
+   fork-sandbox.sh --dry-run --harness codex/sol "<path>" "<handoff>"
    fork-sandbox.sh --sandbox-args "--unpin-egress" --branch "<branch>" "<path>" "<handoff>"
    fork-sandbox.sh --claude-args "--effort high" --branch "<branch>" "<path>" "<handoff>"
    fork-sandbox.sh --task-meta '{"kind":"implement","difficulty":3,"size":"m"}' --branch "<branch>" "<path>" "<handoff>"
@@ -215,6 +216,21 @@ Two things to avoid:
 The inbox also adds **no writable surface**. The bind is read-only; a read-only bind still reflects host writes live, which is the whole trick. Nothing inside the sandbox can write to the inbox, or forge an addendum.
 
 ## The other harnesses: `pi`, `pi-local` and `codex`
+
+`--harness` also accepts the `harness/model` form printed in run logs and by
+the status command. It splits only the first slash, so
+`--harness pi/moonshotai/kimi-k3` preserves the OpenRouter model id. A model
+cannot be supplied both there and with `--model`.
+
+Before creating a run, model names are checked against the harness's local
+knowledge. `claude` and `pi` have no local list, so their names pass through;
+Claude's CLI resolves its own short names. Codex reads its visible models from
+`${CODEX_HOME:-~/.codex}/models_cache.json`, accepting exact ids and unique
+suffix or substring aliases. Personal aliases can be placed in
+`~/.config/fork-sandbox/aliases.conf`, one `harness alias model-id` entry per
+line; these take precedence over discovery. `--model-unchecked` deliberately
+skips both steps for a newly released model. Use `--dry-run` to inspect the
+resolved harness and model without creating anything.
 
 The same sandbox, the same clone, the same fetch-back — but the session is
 [pi](https://github.com/earendil-works/pi) talking to OpenRouter instead of

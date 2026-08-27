@@ -115,6 +115,13 @@ Add `--review-model <model>` to run only the review legs on a different model.
 Fix legs continue to use `--model`, keeping the original implementation model
 responsible for applying the findings.
 
+The launcher accepts either `--model sol --harness codex` or the pasteable
+combined form `--harness codex/sol`. It resolves personal aliases from
+`~/.config/fork-sandbox/aliases.conf` first, then Codex aliases against the
+models its local cache actually offers. Use `--dry-run` to print the resolved
+harness and model without creating a run, or `--model-unchecked` to send a new
+model id verbatim before it appears in the cache.
+
 ## The three network modes
 
 Every run is in exactly one of these, and the mode decides what a compromised
