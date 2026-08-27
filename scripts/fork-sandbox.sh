@@ -802,15 +802,34 @@ if [[ -n "$pi_extra_args" ]]; then
     read -r -a pi_extra_argv <<< "$pi_extra_args"
 fi
 
+# Where the sandbox's userland comes from. It decides whether the agent CLI
+# and node are bound in from this host or supplied by the sandbox itself, and
+# every harness arm below needs the answer. Ask before the clone, so a missing
+# backend is one line here rather than a failure after a repo has been copied.
+fs_resolve_backend "$script_dir" || exit 1
+fs_backend_capabilities "$FS_BACKEND_BIN"
+
+# For the run record only. In image mode there is no host binary to ask for a
+# version, so name where the toolchain came from instead of inventing one.
+# This reads a backend's own variable, which is a leak -- but into a log line,
+# never into a decision, and a backend that does not set it says "unnamed".
+image_toolchain_version="image:${FORK_SANDBOX_CONTAINER_IMAGE:-unnamed}"
+
 case "$harness" in
 claude)
     # claude-sandboxed resolves and starts claude itself, and has done
     # since before there was more than one harness. Leave it that way:
     # its credential handling is bound up with that path.
-    harness_bin="$(command -v claude 2>/dev/null || true)"
-    [[ -n "$harness_bin" ]] || harness_bin="$HOME/.local/bin/claude"
-    if [[ -x "$harness_bin" ]]; then
-        harness_version="$("$harness_bin" --version 2>/dev/null | head -1 || true)"
+    if [[ "$FS_BACKEND_TOOLCHAIN" == host ]]; then
+        harness_bin="$(command -v claude 2>/dev/null || true)"
+        [[ -n "$harness_bin" ]] || harness_bin="$HOME/.local/bin/claude"
+        if [[ -x "$harness_bin" ]]; then
+            harness_version="$("$harness_bin" --version 2>/dev/null | head -1 || true)"
+        fi
+    else
+        # The image carries claude; claude-sandboxed invokes it by name.
+        harness_bin="claude"
+        harness_version="$image_toolchain_version"
     fi
     ;;
 
@@ -833,21 +852,31 @@ pi)
     pi_root="$FS_PI_ROOT"
     pi_node="$FS_PI_NODE"
 
-    # /usr is mounted already; anything else needs its own bind. The bin
-    # dir goes on PATH so a repo with no .nvmrc still has a node and an
-    # npm. These flags go in before the .nvmrc ones, and claude-sandboxed
-    # puts the last --prepend-path first, so a project that pins its own
-    # node still wins.
-    if [[ "$pi_root" != "/usr" ]]; then
+    # Under a host toolchain: /usr is mounted already, anything else needs its
+    # own bind, and the bin dir goes on PATH so a repo with no .nvmrc still
+    # has a node and an npm. These flags go in before the .nvmrc ones, and
+    # claude-sandboxed puts the last --prepend-path first, so a project that
+    # pins its own node still wins.
+    #
+    # Under an image toolchain fs_resolve_pi leaves both empty: there is
+    # nothing on this host to bind, and the image's own /usr/local/bin is
+    # already on the sandbox PATH.
+    if [[ -n "$pi_root" && "$pi_root" != "/usr" ]]; then
         harness_flags+=(--bind-ro "$pi_root")
     fi
-    harness_flags+=(--prepend-path "$pi_bin_dir")
+    if [[ -n "$pi_bin_dir" ]]; then
+        harness_flags+=(--prepend-path "$pi_bin_dir")
+    fi
 
     harness_bin="$pi_real"
-    harness_version="$("$pi_node" "$pi_real" --version 2>/dev/null | head -1 || true)"
+    if [[ "$FS_BACKEND_TOOLCHAIN" == host ]]; then
+        harness_version="$("${FS_PI_ARGV0[@]}" --version 2>/dev/null | head -1 || true)"
+    else
+        harness_version="$image_toolchain_version"
+    fi
     # pi reads its prompt on stdin, like every other harness. --skill comes
     # later, with the review kit; --mode json and -p come last, from the runner.
-    harness_cmd=("$pi_node" "$pi_real" --provider openrouter --model "$model")
+    harness_cmd=("${FS_PI_ARGV0[@]}" --provider openrouter --model "$model")
     if (( ${#pi_extra_argv[@]} )); then
         harness_cmd+=("${pi_extra_argv[@]}")
     fi
@@ -891,7 +920,11 @@ pi-local)
     # itself, and binds it, so nothing here has to.
     fs_resolve_pi || exit 1
     harness_bin="$FS_PI_REAL"
-    harness_version="$("$FS_PI_NODE" "$FS_PI_REAL" --version 2>/dev/null | head -1 || true)"
+    if [[ "$FS_BACKEND_TOOLCHAIN" == host ]]; then
+        harness_version="$("${FS_PI_ARGV0[@]}" --version 2>/dev/null | head -1 || true)"
+    else
+        harness_version="$image_toolchain_version"
+    fi
     if [[ -n "$model" ]]; then
         harness_flags+=(--model "$model")
     fi
@@ -909,21 +942,31 @@ pi-local)
     ;;
 
 codex)
+    # Every path this arm might resolve, emptied up front: in image mode none
+    # of them is set, and they all reach fs_reject_unsafe_chars at the end.
+    codex_bin=""; codex_real=""; codex_bin_dir=""; codex_root=""; codex_node=""
+
     # nvm is a shell function, so a non-interactive PATH usually has no
     # node and no codex. Fall back to where a global npm install under nvm
     # puts it; the last match of the glob wins, which is the newest version
     # for the v1x/v2x names nvm creates.
-    codex_bin="$(command -v codex 2>/dev/null || true)"
-    if [[ -z "$codex_bin" ]]; then
-        for cand in "$HOME"/.nvm/versions/node/*/bin/codex; do
-            [[ -x "$cand" ]] && codex_bin="$cand"
-        done
-    fi
-    if [[ -z "$codex_bin" ]]; then
-        echo "Error: cannot find codex. Install it with:" >&2
-        echo "  npm install -g @openai/codex" >&2
-        echo "or, on Arch, the openai-codex package." >&2
-        exit 1
+    #
+    # Only under a host toolchain. When the sandbox brings its own userland
+    # the host's codex could not execute inside, so there is nothing to look
+    # for here and the image supplies it.
+    if [[ "$FS_BACKEND_TOOLCHAIN" == host ]]; then
+        codex_bin="$(command -v codex 2>/dev/null || true)"
+        if [[ -z "$codex_bin" ]]; then
+            for cand in "$HOME"/.nvm/versions/node/*/bin/codex; do
+                [[ -x "$cand" ]] && codex_bin="$cand"
+            done
+        fi
+        if [[ -z "$codex_bin" ]]; then
+            echo "Error: cannot find codex. Install it with:" >&2
+            echo "  npm install -g @openai/codex" >&2
+            echo "or, on Arch, the openai-codex package." >&2
+            exit 1
+        fi
     fi
     # Same CODEX_HOME the model cache is read from above. Honouring it in one
     # place and not the other let a run validate its model against one codex
@@ -964,59 +1007,71 @@ codex)
         fi
     fi
 
-    # An npm codex is a node script symlinked out of bin/ into
-    # lib/node_modules, so the bin dir taken as written and the script taken
-    # as resolved name two different trees; bind the one directory that
-    # covers both. The sandbox's $HOME is a fresh tmpfs, so an install under
-    # ~/.nvm is invisible there without this. A distro package is a native
-    # binary under /usr, which is mounted already and needs none of it.
-    codex_real="$(readlink -f "$codex_bin")"
-    codex_bin_dir="$(readlink -f "$(dirname "$codex_bin")")"
-    codex_root="$(dirname "$codex_bin_dir")"
-    codex_node=""
-    if [[ "$(head -c 2 "$codex_real" 2>/dev/null)" == '#!' ]] \
-        && head -1 "$codex_real" | grep -q node; then
-        # The shebang is `env node`, so running the script by name would take
-        # whatever node the sandbox PATH happens to offer -- the project's
-        # pinned one, from a different major version. Name codex's own node
-        # instead, and let PATH stay the project's business.
-        codex_node="$codex_bin_dir/node"
-        if [[ ! -x "$codex_node" ]]; then
-            codex_node="$(command -v node 2>/dev/null || true)"
+    # How codex gets into the sandbox, which is the one thing the toolchain
+    # answer changes here. Everything above -- the credential, its expiry --
+    # is data and is the same either way.
+    if [[ "$FS_BACKEND_TOOLCHAIN" != host ]]; then
+        # The image's codex, found on the sandbox PATH. Nothing to resolve,
+        # nothing to bind, and no host node to name: the image's codex runs on
+        # the image's node.
+        codex_argv0=(codex)
+        harness_bin="codex"
+        harness_version="$image_toolchain_version"
+    else
+        # An npm codex is a node script symlinked out of bin/ into
+        # lib/node_modules, so the bin dir taken as written and the script
+        # taken as resolved name two different trees; bind the one directory
+        # that covers both. The sandbox's $HOME is a fresh tmpfs, so an
+        # install under ~/.nvm is invisible there without this. A distro
+        # package is a native binary under /usr, which is mounted already and
+        # needs none of it.
+        codex_real="$(readlink -f "$codex_bin")"
+        codex_bin_dir="$(readlink -f "$(dirname "$codex_bin")")"
+        codex_root="$(dirname "$codex_bin_dir")"
+        if [[ "$(head -c 2 "$codex_real" 2>/dev/null)" == '#!' ]] \
+            && head -1 "$codex_real" | grep -q node; then
+            # The shebang is `env node`, so running the script by name would take
+            # whatever node the sandbox PATH happens to offer -- the project's
+            # pinned one, from a different major version. Name codex's own node
+            # instead, and let PATH stay the project's business.
+            codex_node="$codex_bin_dir/node"
+            if [[ ! -x "$codex_node" ]]; then
+                codex_node="$(command -v node 2>/dev/null || true)"
+            fi
+            if [[ -z "$codex_node" || ! -x "$codex_node" ]]; then
+                echo "Error: found codex at $codex_bin but no node to run it with." >&2
+                exit 1
+            fi
+            # One bind covers the lot: under nvm, bin/node and lib/node_modules/...
+            # are both inside the version directory. Refuse the case it does not
+            # cover rather than guess at a second mount -- a guess that binds too
+            # little fails deep inside node, as a missing package.
+            if [[ "$codex_real" != "$codex_root"/* ]]; then
+                echo "Error: codex resolves to $codex_real, which is outside its" >&2
+                echo "node install at $codex_root. This binds that one tree into" >&2
+                echo "the sandbox, so an install split across two would lose its" >&2
+                echo "dependencies. Install codex with npm -g under nvm." >&2
+                exit 1
+            fi
         fi
-        if [[ -z "$codex_node" || ! -x "$codex_node" ]]; then
-            echo "Error: found codex at $codex_bin but no node to run it with." >&2
-            exit 1
+
+        # /usr is mounted already; anything else needs its own bind. The bin dir
+        # goes on PATH so a repo with no .nvmrc still has a node. These flags go
+        # in before the .nvmrc ones, and claude-sandboxed puts the last
+        # --prepend-path first, so a project that pins its own node still wins.
+        if [[ "$codex_root" != "/usr" ]]; then
+            harness_flags+=(--bind-ro "$codex_root")
         fi
-        # One bind covers the lot: under nvm, bin/node and lib/node_modules/...
-        # are both inside the version directory. Refuse the case it does not
-        # cover rather than guess at a second mount -- a guess that binds too
-        # little fails deep inside node, as a missing package.
-        if [[ "$codex_real" != "$codex_root"/* ]]; then
-            echo "Error: codex resolves to $codex_real, which is outside its" >&2
-            echo "node install at $codex_root. This binds that one tree into" >&2
-            echo "the sandbox, so an install split across two would lose its" >&2
-            echo "dependencies. Install codex with npm -g under nvm." >&2
-            exit 1
-        fi
+        harness_flags+=(--prepend-path "$codex_bin_dir")
+
+        # Whether codex is run through its own node or straight, every later use
+        # is the same words, so settle it once.
+        codex_argv0=("$codex_real")
+        [[ -n "$codex_node" ]] && codex_argv0=("$codex_node" "$codex_real")
+
+        harness_bin="$codex_real"
+        harness_version="$("${codex_argv0[@]}" --version 2>/dev/null | head -1 || true)"
     fi
-
-    # /usr is mounted already; anything else needs its own bind. The bin dir
-    # goes on PATH so a repo with no .nvmrc still has a node. These flags go
-    # in before the .nvmrc ones, and claude-sandboxed puts the last
-    # --prepend-path first, so a project that pins its own node still wins.
-    if [[ "$codex_root" != "/usr" ]]; then
-        harness_flags+=(--bind-ro "$codex_root")
-    fi
-    harness_flags+=(--prepend-path "$codex_bin_dir")
-
-    # Whether codex is run through its own node or straight, every later use
-    # is the same words, so settle it once.
-    codex_argv0=("$codex_real")
-    [[ -n "$codex_node" ]] && codex_argv0=("$codex_node" "$codex_real")
-
-    harness_bin="$codex_real"
-    harness_version="$("${codex_argv0[@]}" --version 2>/dev/null | head -1 || true)"
     # The credential is built by the runner, into a file this script only
     # names. See the runner for why it is made there and not here.
     codex_auth_dir="$(mktemp -d /var/tmp/claude-scratch/forks/claude-fork-codex.XXXXXX)"

@@ -10,6 +10,15 @@
 # containment rests on it. FORK_SANDBOX_BACKEND names another backend if you
 # have one; the contract is docs/sandbox-backend.md.
 #
+# Where claude itself comes from depends on the backend, which the script asks
+# rather than guesses. A backend reporting toolchain=host mounts the host's
+# /usr, so the host's claude install is bound in and run by absolute path. One
+# reporting toolchain=image -- a container -- supplies its own userland, and a
+# host binary bound into that has neither its interpreter nor its libraries,
+# so nothing is bound and `claude` is resolved on the sandbox's own PATH. The
+# image must therefore carry it. Everything else this script provisions is
+# data, not executables, and is identical under both.
+#
 # What this script adds is everything Claude-shaped: a copy of the access
 # token with the refresh token stripped out, a synthetic ~/.claude, the
 # onboarding and trust file, the claude binary's own mounts, the git identity,
@@ -66,8 +75,10 @@
 # ~/.claude exists, no onboarding file is written and the claude install
 # is not mounted. Every other line below is unchanged — the same mount
 # allowlist, the same network namespace and egress pin, the same work-dir
-# rules and the same lock. A command outside /usr needs its own
-# --bind-ro; /usr is mounted already.
+# rules and the same lock. Under a toolchain=host backend a command outside
+# /usr needs its own --bind-ro, /usr being mounted already; under
+# toolchain=image the /usr inside is the image's, so a host command needs to
+# be in the image rather than bound.
 #
 # --env-file adds environment variables to that command, one NAME=VALUE
 # per line, and only with --exec. It exists for a harness that needs an
@@ -219,6 +230,13 @@ fi
 # line here rather than a failure after the credential copy.
 fs_resolve_backend "$script_dir" || exit 1
 
+# Where the sandbox's userland comes from. With `host` (bwrap) the claude
+# install is resolved here and bound in; with `image` (a container) the host's
+# binary cannot run inside, so the image has to carry claude and it is invoked
+# by name. Everything else -- the credential, the synthetic ~/.claude, the
+# onboarding file -- is DATA and is identical either way.
+fs_backend_capabilities "$FS_BACKEND_BIN"
+
 # Read the environment file before anything is created, so a bad one stops
 # the run early. Values are never printed and never reach a command line.
 EXEC_ENV_LINES=()
@@ -279,15 +297,22 @@ if (( ! EXEC_MODE )); then
     # Resolve the claude binary on the host and run it by absolute path.
     # ~/.local/bin is often absent from a non-interactive PATH, so relying on
     # a PATH lookup inside the sandbox breaks cron and ssh invocations.
-    CLAUDE_BIN="$(command -v claude 2>/dev/null || true)"
-    if [[ -z "$CLAUDE_BIN" && -x "$HOME/.local/bin/claude" ]]; then
-        CLAUDE_BIN="$HOME/.local/bin/claude"
+    #
+    # Only when the sandbox runs the host's userland. Under an image backend
+    # there is nothing to resolve: the host binary could not execute inside
+    # even if it were bound, so claude comes from the image and is found on
+    # the sandbox's own PATH.
+    if [[ "$FS_BACKEND_TOOLCHAIN" == host ]]; then
+        CLAUDE_BIN="$(command -v claude 2>/dev/null || true)"
+        if [[ -z "$CLAUDE_BIN" && -x "$HOME/.local/bin/claude" ]]; then
+            CLAUDE_BIN="$HOME/.local/bin/claude"
+        fi
+        if [[ -z "$CLAUDE_BIN" ]]; then
+            echo "Error: cannot find the claude binary on PATH or in ~/.local/bin." >&2
+            exit 1
+        fi
+        CLAUDE_REAL="$(readlink -f "$CLAUDE_BIN")"
     fi
-    if [[ -z "$CLAUDE_BIN" ]]; then
-        echo "Error: cannot find the claude binary on PATH or in ~/.local/bin." >&2
-        exit 1
-    fi
-    CLAUDE_REAL="$(readlink -f "$CLAUDE_BIN")"
 
     # The sandbox cannot refresh the token, so the session dies at expiry.
     # Check the remaining lifetime up front.
@@ -385,18 +410,24 @@ fs_cache_binds
 # binary too, so a non-standard install location still works.
 CLAUDE_FLAGS=()
 if (( ! EXEC_MODE )); then
-    claude_paths_seen=()
-    for p in "$HOME/.local/share/claude" "$HOME/.local/bin/claude" \
-             "$CLAUDE_BIN" "$(dirname "$CLAUDE_REAL")"; do
-        [[ -e "$p" ]] || continue
-        p_seen=0
-        for q in "${claude_paths_seen[@]}"; do
-            [[ "$q" == "$p" ]] && { p_seen=1; break; }
+    # The install itself, bound from the host -- and only when the sandbox
+    # runs the host's userland. Under an image backend these binds would carry
+    # in an executable the sandbox cannot run, which fails later and less
+    # clearly than not carrying it at all.
+    if [[ "$FS_BACKEND_TOOLCHAIN" == host ]]; then
+        claude_paths_seen=()
+        for p in "$HOME/.local/share/claude" "$HOME/.local/bin/claude" \
+                 "$CLAUDE_BIN" "$(dirname "$CLAUDE_REAL")"; do
+            [[ -e "$p" ]] || continue
+            p_seen=0
+            for q in "${claude_paths_seen[@]}"; do
+                [[ "$q" == "$p" ]] && { p_seen=1; break; }
+            done
+            (( p_seen )) && continue
+            claude_paths_seen+=("$p")
+            CLAUDE_FLAGS+=(--bind-ro "$p")
         done
-        (( p_seen )) && continue
-        claude_paths_seen+=("$p")
-        CLAUDE_FLAGS+=(--bind-ro "$p")
-    done
+    fi
     # The onboarding file read-only, and a writable ~/.claude isolated from
     # the real one — which is why the backend needs a writable remap: the
     # copy lives in the state dir and has to appear at $HOME/.claude.
@@ -452,7 +483,13 @@ if (( EXEC_MODE )); then
         )
     fi
 else
-    TARGET_CMD=("$CLAUDE_BIN" "$@")
+    # An absolute host path when the sandbox shares the host's userland; the
+    # bare name when the image supplies claude, resolved on the sandbox PATH.
+    if [[ "$FS_BACKEND_TOOLCHAIN" == host ]]; then
+        TARGET_CMD=("$CLAUDE_BIN" "$@")
+    else
+        TARGET_CMD=(claude "$@")
+    fi
 fi
 
 if (( ! EXEC_MODE )) && (( MINS_LEFT >= 60 )); then

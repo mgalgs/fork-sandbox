@@ -534,11 +534,15 @@ for tool in socat setsid; do
     fi
 done
 
-fs_resolve_pi || exit 1
-
 # The sandbox backend has to exist before anything is created: a missing one
 # after the clone, the sockets and the compose stack would waste all of it.
+# It comes FIRST because resolving pi depends on its answer: a backend that
+# brings its own userland supplies pi from its image, and there is then
+# nothing on this host to find or bind.
 fs_resolve_backend "$script_dir" || exit 1
+fs_backend_capabilities "$FS_BACKEND_BIN"
+
+fs_resolve_pi || exit 1
 
 # The work dir is the only path that persists. Default to a fresh one under the
 # scratch root, as claude-sandboxed does, so a run with no arguments still has
@@ -731,8 +735,12 @@ fi
     printf 'set -e\n'
     printf 'mkdir -p "$HOME/.pi"\n'
     printf 'cp -a %q "$HOME/.pi/agent"\n' "$STATE_DIR/pi-agent"
-    printf 'exec %q %q --provider local --model %q' \
-        "$FS_PI_NODE" "$FS_PI_REAL" "$MODEL"
+    # The words that start pi: the host's node plus its entry script under a
+    # host toolchain, or the bare name the image resolves under an image one.
+    # fs_resolve_pi settles which; this only has to print it.
+    printf 'exec'
+    for w in "${FS_PI_ARGV0[@]}"; do printf ' %q' "$w"; done
+    printf ' --provider local --model %q' "$MODEL"
     for f in "${session_flags[@]-}"; do
         [[ -n "$f" ]] && printf ' %q' "$f"
     done
@@ -933,7 +941,13 @@ sandbox_cmd=(
 # the project's node_modules meets an interpreter of the wrong major version and
 # its compiled extensions stop loading. In a sealed sandbox nothing can be
 # rebuilt, so that would end the run.
-sandbox_cmd+=(--prepend-path "$FS_PI_BIN_DIR")
+#
+# Empty under an image toolchain: pi and its node come from the image, whose
+# own bin directory is already on the sandbox PATH, so there is nothing here
+# to prepend.
+if [[ -n "$FS_PI_BIN_DIR" ]]; then
+    sandbox_cmd+=(--prepend-path "$FS_PI_BIN_DIR")
+fi
 # The git identity with signing switched off, and the host's model and browser
 # caches. claude-sandboxed's exec path used to provide both to this script for
 # free; calling the backend directly means asking for them. The gitconfig is
@@ -966,7 +980,10 @@ for i in "${!BRIDGE_SOCKETS[@]}"; do
 done
 sandbox_cmd+=(--bind-ro "$STATE_DIR/pi-agent")
 sandbox_cmd+=(--bind-ro "$STATE_DIR/shim.sh")
-if [[ "$FS_PI_ROOT" != "/usr" ]]; then
+# /usr is mounted already under a host toolchain; under an image one
+# FS_PI_ROOT is empty, because pi lives in the image and nothing on this host
+# needs to travel.
+if [[ -n "$FS_PI_ROOT" && "$FS_PI_ROOT" != "/usr" ]]; then
     sandbox_cmd+=(--bind-ro "$FS_PI_ROOT")
 fi
 sandbox_cmd+=(-- "$STATE_DIR/shim.sh" "$@")

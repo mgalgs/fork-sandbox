@@ -209,12 +209,19 @@ fs_make_clone() {
 FS_NODE_FLAGS=()
 
 fs_node_provision() {
-    local origin_repo="$1" clone_dir="$2" ver dir
+    local origin_repo="$1" clone_dir="$2" ver dir native count nm
+    local -a shown
     FS_NODE_FLAGS=()
     if [[ -f "$origin_repo/.nvmrc" ]]; then
         ver="$(tr -d 'v[:space:]' < "$origin_repo/.nvmrc")"
         dir="$HOME/.nvm/versions/node/v$ver"
-        if [[ ! "$ver" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
+        if [[ "$FS_BACKEND_TOOLCHAIN" != host ]]; then
+            # The bind names a host node install, and the sandbox's userland
+            # is the image's. Say which version was asked for and not honoured
+            # rather than let a version mismatch surface as a mystery later.
+            echo "Note: .nvmrc asks for node v$ver, but this backend brings its" >&2
+            echo "own userland, so the image's node is what the run gets." >&2
+        elif [[ ! "$ver" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
             echo "Warning: .nvmrc says '$ver', which is not a plain version" >&2
             echo "number. The sandbox falls back to system node." >&2
         elif [[ -d "$dir" ]]; then
@@ -228,6 +235,31 @@ fs_node_provision() {
     if [[ -d "$origin_repo/node_modules" ]]; then
         echo "Copying node_modules into the clone..." >&2
         cp -a "$origin_repo/node_modules" "$clone_dir/node_modules"
+        # Nearly all of that tree is JavaScript and runs anywhere. A few
+        # packages also carry a compiled .node, built for one OS and one CPU.
+        # Under a host toolchain those are the right binaries. Under an image
+        # they are not -- a different Linux, or on a Mac a different operating
+        # system -- and the failure is a throw from deep inside node with
+        # nothing to say the platform is the reason. So name them here.
+        # Collect the whole list before counting: `find | head` would take
+        # SIGPIPE, and pipefail would turn that into a failed provision.
+        if [[ "$FS_BACKEND_TOOLCHAIN" != host ]]; then
+            native="$(find "$clone_dir/node_modules" -type f -name '*.node' 2>/dev/null || true)"
+            if [[ -n "$native" ]]; then
+                count=0
+                shown=()
+                while IFS= read -r nm; do
+                    count=$(( count + 1 ))
+                    (( count <= 3 )) && shown+=("${nm#"$clone_dir/"}")
+                done <<< "$native"
+                echo "Warning: node_modules holds $count compiled native module(s)," >&2
+                echo "built for THIS host. The sandbox's userland comes from its" >&2
+                echo "image, so requiring one of these fails inside node:" >&2
+                printf '  %s\n' "${shown[@]}" >&2
+                (( count > 3 )) && echo "  ... and $(( count - 3 )) more" >&2
+                echo "Run 'npm rebuild' (or 'npm ci') inside the sandbox to fix it." >&2
+            fi
+        fi
     fi
     return 0
 }
@@ -351,9 +383,19 @@ fs_venv_interpreter_bind() {
     local venv="$1" cfg home prefix store
     cfg="$venv/pyvenv.cfg"
     [[ -f "$cfg" ]] || return 0
+    # An interpreter is an executable, so it can only be carried in when the
+    # sandbox runs the host's userland. Under an image backend the bind would
+    # deliver something the sandbox cannot execute; say so once, here, rather
+    # than let .venv/bin/python fail as a format error.
+    if [[ "$FS_BACKEND_TOOLCHAIN" != host ]]; then
+        echo "Warning: the venv at '$venv' needs a host interpreter, which this" >&2
+        echo "backend's sandbox cannot execute -- its userland comes from an" >&2
+        echo "image. The venv will not run; the image must supply python." >&2
+        return 0
+    fi
     home="$(sed -nE 's/^home[[:space:]]*=[[:space:]]*//p' "$cfg" | head -n1)"
     [[ -n "$home" ]] || return 0
-    home="$(realpath -m "$home")"
+    home="$("$FS_REALPATH" -m "$home")"
     if [[ ! -d "$home" ]]; then
         echo "Warning: the venv at '$venv' names an interpreter home that does" >&2
         echo "not exist ($home). The venv will not run in the sandbox." >&2
@@ -464,8 +506,16 @@ fs_collect_alternates() {
 # taken as resolved name two different trees, and binding only what the first
 # covers leaves node unable to find pi's dependencies.
 #
+# Under a backend that brings its own userland none of that applies: the host's
+# pi and node cannot execute inside, the image supplies both, and pi is found
+# on the sandbox's own PATH. That case fills the same variables with the
+# nothing-to-bind answer, so a caller needs one branch and not five.
+#
 # Fills FS_PI_NODE (the interpreter), FS_PI_REAL (the entry script), FS_PI_ROOT
-# (the one tree to bind) and FS_PI_BIN_DIR (the directory for PATH).
+# (the one tree to bind), FS_PI_BIN_DIR (the directory for PATH), and
+# FS_PI_ARGV0 (the words that start pi, whichever case applies). FS_PI_ROOT and
+# FS_PI_BIN_DIR are EMPTY when there is nothing to bind or prepend; callers
+# test that rather than testing the backend again.
 # shellcheck disable=SC2034  # written here, read by the sourcing scripts
 FS_PI_NODE=""
 # shellcheck disable=SC2034  # written here, read by the sourcing scripts
@@ -474,10 +524,23 @@ FS_PI_REAL=""
 FS_PI_ROOT=""
 # shellcheck disable=SC2034  # written here, read by the sourcing scripts
 FS_PI_BIN_DIR=""
+# shellcheck disable=SC2034  # written here, read by the sourcing scripts
+FS_PI_ARGV0=()
 
 fs_resolve_pi() {
     local pi_bin cand
-    FS_PI_NODE=""; FS_PI_REAL=""; FS_PI_ROOT=""; FS_PI_BIN_DIR=""
+    FS_PI_NODE=""; FS_PI_REAL=""; FS_PI_ROOT=""; FS_PI_BIN_DIR=""; FS_PI_ARGV0=()
+
+    if [[ "$FS_BACKEND_TOOLCHAIN" != host ]]; then
+        # Nothing to find, nothing to bind, nothing to put on PATH. pi is a
+        # name the image resolves. Naming its node would be wrong here too:
+        # the image's pi runs on the image's node, by its own shebang.
+        # shellcheck disable=SC2034  # read by the sourcing scripts
+        FS_PI_REAL="pi"
+        # shellcheck disable=SC2034  # read by the sourcing scripts
+        FS_PI_ARGV0=(pi)
+        return 0
+    fi
 
     pi_bin="$(command -v pi 2>/dev/null || true)"
     if [[ -z "$pi_bin" ]]; then
@@ -520,6 +583,9 @@ fs_resolve_pi() {
         echo "dependencies. Install pi with npm -g under nvm." >&2
         return 1
     fi
+    # Every later use is the same words, so settle them once.
+    # shellcheck disable=SC2034  # read by the sourcing scripts
+    FS_PI_ARGV0=("$FS_PI_NODE" "$FS_PI_REAL")
     return 0
 }
 
@@ -697,7 +763,11 @@ fs_cache_binds() {
     if (( hf_bound )); then
         FS_CACHE_FLAGS+=(--setenv HF_HUB_OFFLINE=1)
     fi
-    if [[ -d "$pw_root" ]]; then
+    # The Hugging Face bind above is model DATA and travels to any sandbox.
+    # This one is browser BINARIES, so it is host-toolchain only: an image's
+    # userland cannot execute the host's Chromium build, and an image that
+    # needs a browser has to carry its own.
+    if [[ -d "$pw_root" && "$FS_BACKEND_TOOLCHAIN" == host ]]; then
         FS_CACHE_FLAGS+=(--bind-ro "$pw_root")
     fi
     return 0
