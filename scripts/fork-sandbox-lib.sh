@@ -709,6 +709,73 @@ fs_gitconfig_bind() {
     return 0
 }
 
+# The Claude OAuth credential, as JSON on stdout.
+#
+# On Linux the CLI keeps it in ~/.claude/.credentials.json. On macOS it keeps
+# it in the login Keychain instead and that file does not exist, so a Mac fails
+# the file check and never reaches the sandbox at all. Reading it here rather
+# than at two later jq call sites also means the Keychain is touched exactly
+# once: it can prompt for access the first time, and a prompt is a foreground
+# interaction in a tool built to run unattended, so it belongs at launch on the
+# host and nowhere else.
+#
+# The value never reaches an argv. Callers hold it in a variable and pipe it
+# with printf, a builtin, so `ps` never shows it.
+#
+# Prints the JSON on success; writes its own error and returns non-zero
+# otherwise. It reports WHERE it came from through fs_claude_credential_source
+# rather than through a variable of its own: a caller can only take the JSON
+# through a command substitution, and a subshell cannot set a variable in the
+# shell that started it -- so such a variable would read empty at exactly the
+# moment an error message wanted it.
+#
+# The Keychain service name Claude Code stores the credential under. It is a
+# list because the name is the CLI's business and could change; each is tried
+# in turn, and the error below says how to look it up by hand.
+FS_CLAUDE_KEYCHAIN_SERVICES=("Claude Code-credentials")
+
+# A human name for where the credential comes from, for error messages. Reads
+# nothing and holds no secret, so it is safe to call from anywhere, as often as
+# a message needs it.
+fs_claude_credential_source() {
+    local file="$HOME/.claude/.credentials.json"
+    if [[ ! -f "$file" && "$(uname -s)" == Darwin ]]; then
+        printf '%s\n' "the login Keychain"
+    else
+        printf '%s\n' "$file"
+    fi
+}
+
+fs_read_claude_credential() {
+    local file="$HOME/.claude/.credentials.json" svc out
+    if [[ -f "$file" ]]; then
+        cat -- "$file"
+        return 0
+    fi
+
+    if [[ "$(uname -s)" == Darwin ]] && command -v security >/dev/null 2>&1; then
+        for svc in "${FS_CLAUDE_KEYCHAIN_SERVICES[@]}"; do
+            out="$(security find-generic-password -s "$svc" -w 2>/dev/null)" || continue
+            # A wrong item would otherwise become a silently broken credential
+            # inside the sandbox, which fails as a 401 an hour later. Check the
+            # shape here, where the error can still say what is wrong.
+            printf '%s' "$out" | jq -e '.claudeAiOauth.accessToken' >/dev/null 2>&1 || continue
+            printf '%s' "$out"
+            return 0
+        done
+        echo "Error: no Claude credential found. $file does not exist, which is" >&2
+        echo "expected on macOS -- the CLI keeps it in the login Keychain -- but" >&2
+        echo "no usable item was there either. Tried: ${FS_CLAUDE_KEYCHAIN_SERVICES[*]}" >&2
+        echo "Log in with claude first. If you are already logged in, the service" >&2
+        echo "name may have changed; find it with:" >&2
+        echo "  security dump-keychain | grep -i claude" >&2
+        return 1
+    fi
+
+    echo "Error: $file not found. Log in with claude first." >&2
+    return 1
+}
+
 # The host's model and browser caches, read-only, when the host has them.
 # Both clients want them, and neither wants the surgery to be repeated.
 # Fills FS_CACHE_FLAGS with backend flags; empty when the host has no cache.

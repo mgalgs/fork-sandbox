@@ -120,6 +120,11 @@
 #     refresh token and the mcpOAuth tokens stay on the host. A leaked
 #     sandbox credential dies at token expiry, and the session cannot
 #     outlive the access token.
+#     Where the original is read from is the platform's business: a file at
+#     ~/.claude/.credentials.json on Linux, the login Keychain on macOS,
+#     where that file does not exist. It is read once, at launch, on the
+#     host -- the Keychain can prompt, and a prompt has no place inside an
+#     unattended run -- and it never reaches any command line.
 #   - Git: the host identity is carried in, with commit and tag signing
 #     switched off, because the signing key lives in the masked ~/.ssh.
 #     Commits work; pushing does not, since no key, token or agent is
@@ -284,15 +289,18 @@ fi
 # Everything claude needs: its credential, its binary, and a token with
 # life left in it. --exec runs something else, so none of it applies and
 # no Claude credential enters the sandbox at all.
-CREDS="$HOME/.claude/.credentials.json"
 CLAUDE_BIN=""
 CLAUDE_REAL=""
+CLAUDE_CRED_JSON=""
 MINS_LEFT=0
 if (( ! EXEC_MODE )); then
-    if [[ ! -f "$CREDS" ]]; then
-        echo "Error: $CREDS not found. Log in with claude first." >&2
-        exit 1
-    fi
+    # Where this comes from is the platform's business, not this script's:
+    # a file on Linux, the login Keychain on macOS. Read it ONCE, here, before
+    # anything is created -- the Keychain can prompt, and a prompt belongs at
+    # launch rather than somewhere inside an unattended run. The value lives in
+    # a variable from here on and is piped with printf, a builtin, so it never
+    # appears in an argv that /proc or `ps` would publish.
+    CLAUDE_CRED_JSON="$(fs_read_claude_credential)" || exit 1
 
     # Resolve the claude binary on the host and run it by absolute path.
     # ~/.local/bin is often absent from a non-interactive PATH, so relying on
@@ -316,10 +324,10 @@ if (( ! EXEC_MODE )); then
 
     # The sandbox cannot refresh the token, so the session dies at expiry.
     # Check the remaining lifetime up front.
-    EXPIRES_AT_MS=$(jq -r '.claudeAiOauth.expiresAt // 0' "$CREDS")
+    EXPIRES_AT_MS=$(printf '%s' "$CLAUDE_CRED_JSON" | jq -r '.claudeAiOauth.expiresAt // 0')
     MINS_LEFT=$(( EXPIRES_AT_MS / 60000 - $(date +%s) / 60 ))
     if (( MINS_LEFT <= 0 )); then
-        echo "Error: the access token in $CREDS has expired." >&2
+        echo "Error: the access token in $(fs_claude_credential_source) has expired." >&2
         echo "Log in with claude on the host, then retry." >&2
         exit 1
     elif (( MINS_LEFT < 60 )); then
@@ -371,9 +379,10 @@ if (( ! EXEC_MODE )); then
     # single-use — a sandbox refresh would invalidate the host's copy. Drop
     # mcpOAuth, which holds unrelated MCP server tokens.
     install -m 600 /dev/null "$STATE_DIR/claude/.credentials.json"
-    jq 'del(.mcpOAuth)
-        | del(.claudeAiOauth.refreshToken, .claudeAiOauth.refreshTokenExpiresAt)' \
-        "$CREDS" > "$STATE_DIR/claude/.credentials.json"
+    printf '%s' "$CLAUDE_CRED_JSON" \
+        | jq 'del(.mcpOAuth)
+            | del(.claudeAiOauth.refreshToken, .claudeAiOauth.refreshTokenExpiresAt)' \
+        > "$STATE_DIR/claude/.credentials.json"
 fi
 
 # The git identity, signing switched off, so a session in here can commit.
