@@ -117,6 +117,10 @@ else
     ok "unchecked mode without model is refused"
 fi
 
+out="$(run --harness codex/sob --model-unchecked 2>"$err")"
+check "unchecked mode accepts the combined harness/model form" \
+    $'harness=codex\nmodel=sob' "$out"
+
 cat > "$FORK_SANDBOX_CONFIG_DIR/aliases.conf" <<'ALIASES'
 # harness  alias  model-id
 codex custom account-specific-model

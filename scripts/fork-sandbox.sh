@@ -448,16 +448,17 @@ if [[ -n "$combined_model" && "$model_given" == true ]]; then
     echo "--model '$model_option'. Drop one of the two model values." >&2
     exit 1
 fi
-if [[ "$model_unchecked" == true && "$model_given" != true ]]; then
-    echo "Error: --model-unchecked requires --model, since it sends that" >&2
-    echo "value verbatim." >&2
-    exit 1
-fi
 if [[ -n "$combined_model" ]]; then
     model="$combined_model"
     model_given=true
 else
     model="$model_option"
+fi
+if [[ "$model_unchecked" == true && "$model_given" != true ]]; then
+    echo "Error: --model-unchecked requires a model, since it sends that" >&2
+    echo "value verbatim, from either --model or the combined harness/model" >&2
+    echo "form." >&2
+    exit 1
 fi
 
 display_config_path() {
