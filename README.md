@@ -36,7 +36,8 @@ It runs **Claude Code**, **pi**, or **codex**, against a hosted API or against
 a model on your own hardware.
 
 > **Linux only today.** The isolation is bubblewrap plus a network namespace,
-> which macOS has no equivalent for. See [Portability](#portability).
+> which macOS has no equivalent for. A container backend to serve macOS and a
+> Kubernetes one are planned — see [Portability](#portability).
 
 ## Why
 
