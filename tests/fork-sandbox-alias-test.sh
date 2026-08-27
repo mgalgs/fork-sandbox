@@ -122,13 +122,19 @@ cat > "$FORK_SANDBOX_CONFIG_DIR/aliases.conf" <<'ALIASES'
 codex custom account-specific-model
 pi sol provider/pi-sol
 ALIASES
-out="$(run --harness codex/custom 2>"$err")"
+out="$(HOME="$tmp" run --harness codex/custom 2>"$err")"
 check "user alias beats discovery" \
     $'harness=codex\nmodel=account-specific-model' "$out"
 case "$(cat "$err")" in
     *aliases.conf*) ok "alias rewrite names its source" ;;
     *) no "alias rewrite names its source" "$(cat "$err")" ;;
 esac
+err_content="$(cat "$err")"
+if [[ "$err_content" == *'~/'* && "$err_content" != *"$tmp"* ]]; then
+    ok "alias source under \$HOME renders as ~/, not the raw path"
+else
+    no "alias source under \$HOME renders as ~/, not the raw path" "$err_content"
+fi
 out="$(run --harness pi/custom 2>/dev/null)"
 check "alias for another harness does not match" $'harness=pi\nmodel=custom' "$out"
 

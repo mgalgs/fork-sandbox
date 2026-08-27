@@ -463,7 +463,9 @@ fi
 display_config_path() {
     local path="$1"
     if [[ "$path" == "$HOME"/* ]]; then
-        printf '%c/%s' 126 "${path#"$HOME"/}"
+        # Literal display text, not a path for the shell to expand.
+        # shellcheck disable=SC2088
+        printf '~/%s' "${path#"$HOME"/}"
     else
         printf '%s' "$path"
     fi
