@@ -755,7 +755,18 @@ fs_claude_credential_source() {
 fs_read_claude_credential() {
     local file="$HOME/.claude/.credentials.json" svc out
     if [[ -f "$file" ]]; then
-        cat -- "$file"
+        # `-f` proves it is a regular file, not that it can be read. Check the
+        # read itself: an unreadable credential used to abort loudly, when jq
+        # opened the file directly, and returning 0 with no output here would
+        # instead be diagnosed downstream as an EXPIRED token -- sending the
+        # user to re-log-in, which rewrites a file they still cannot read.
+        if ! cat -- "$file"; then
+            echo "Error: $file exists but could not be read. Check its owner" >&2
+            echo "and mode -- a credential written under sudo is the usual" >&2
+            echo "cause. This is not an expired token; logging in again would" >&2
+            echo "rewrite a file you still cannot read." >&2
+            return 1
+        fi
         return 0
     fi
 
