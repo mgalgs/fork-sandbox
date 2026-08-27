@@ -124,7 +124,14 @@ PY
         if "$runtime" build -t "$nosocat" -f - "$repo_dir" >/dev/null <<'EOF'
 FROM alpine:3.22
 RUN apk add --no-cache bash socat
-RUN mkdir -p /outside-sandbox-path && mv "$(command -v socat)" /outside-sandbox-path/socat
+# Alpine ships socat as a symlink to socat1, so moving what `command -v`
+# reports moves the LINK and strands its target: the result is a dangling
+# symlink and an image with no usable socat at all, which the pre-flight
+# probe then refuses -- the wrong path for this test. Move the real binary
+# and drop the stale link.
+RUN mkdir -p /outside-sandbox-path \
+ && mv "$(readlink -f "$(command -v socat)")" /outside-sandbox-path/socat \
+ && rm -f /usr/bin/socat
 ENV PATH="/outside-sandbox-path:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 EOF
         then
