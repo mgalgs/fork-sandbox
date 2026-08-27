@@ -1736,6 +1736,7 @@ if [[ -n "$review_model" ]]; then
         review_sandbox_cmd+=(--model "$review_model")
     elif [[ "$harness" == "pi-local" ]]; then
         model_flag_i=-1
+        workdir_i=-1
         for i in "${!review_sandbox_cmd[@]}"; do
             if [[ "${review_sandbox_cmd[$i]}" == "$clone_dir" ]]; then
                 workdir_i="$i"
@@ -1745,11 +1746,16 @@ if [[ -n "$review_model" ]]; then
         done
         if (( model_flag_i >= 0 )); then
             review_sandbox_cmd[model_flag_i+1]="$review_model"
-        else
+        elif (( workdir_i >= 0 )); then
             review_sandbox_cmd=("${review_sandbox_cmd[@]:0:workdir_i}" --model "$review_model" "${review_sandbox_cmd[@]:workdir_i}")
+        else
+            echo "Error: cannot place --review-model in the pi-local command:" >&2
+            echo "neither --model nor the clone directory was found in it." >&2
+            exit 1
         fi
     elif [[ "$harness" == "codex" ]]; then
         model_flag_i=-1
+        prompt_i=-1
         for i in "${!review_sandbox_cmd[@]}"; do
             if [[ "${review_sandbox_cmd[$i]}" == "-" ]]; then
                 prompt_i="$i"
@@ -1759,8 +1765,12 @@ if [[ -n "$review_model" ]]; then
         done
         if (( model_flag_i >= 0 )); then
             review_sandbox_cmd[model_flag_i+1]="$review_model"
-        else
+        elif (( prompt_i >= 0 )); then
             review_sandbox_cmd=("${review_sandbox_cmd[@]:0:prompt_i}" --model "$review_model" "${review_sandbox_cmd[@]:prompt_i}")
+        else
+            echo "Error: cannot place --review-model in the codex command:" >&2
+            echo "neither --model nor the '-' prompt marker was found in it." >&2
+            exit 1
         fi
     else
         # OpenRouter pi always has this flag, immediately after its provider.
