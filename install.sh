@@ -80,12 +80,18 @@ if (( ${#missing_optional[@]} )); then
     echo ""
 fi
 
-# The sandbox is bubblewrap and network namespaces, so it is Linux-only. Say so
-# here rather than let bwrap's absence read as a packaging problem.
+# The default sandbox is bubblewrap and network namespaces, so it is
+# Linux-only. Say so here rather than let bwrap's absence read as a packaging
+# problem -- and say what the container backend does and does not get you,
+# rather than let its existence read as macOS support.
 if [[ "$(uname -s)" != "Linux" ]]; then
-    echo "Note: this is Linux-only today. The isolation is bubblewrap plus a"
-    echo "network namespace, and macOS has no equivalent — see the README for"
-    echo "where a container backend would fit."
+    echo "Note: the default backend is bubblewrap plus a network namespace,"
+    echo "which is Linux-only, so bwrap and pasta above cannot be satisfied"
+    echo "here. sandbox-backend-container implements the same contract in a"
+    echo "Linux container and is the intended macOS path, but macOS does not"
+    echo "work end-to-end yet: the callers mount the host's agent binary into"
+    echo "the sandbox, and a Mach-O binary cannot run in a Linux container."
+    echo "See the README's Portability section for what is missing."
     echo ""
 fi
 

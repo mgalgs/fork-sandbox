@@ -36,8 +36,10 @@ It runs **Claude Code**, **pi**, or **codex**, against a hosted API or against
 a model on your own hardware.
 
 > **Linux only today.** The isolation is bubblewrap plus a network namespace,
-> which macOS has no equivalent for. A container backend to serve macOS and a
-> Kubernetes one are planned — see [Portability](#portability).
+> which macOS has no equivalent for. A container backend now implements the
+> same contract and is the intended macOS path, but macOS does not work
+> end-to-end yet — see [Portability](#portability) for exactly what is
+> missing.
 
 ## Why
 
@@ -173,16 +175,42 @@ directly; the skills are markdown, readable by anything.
 The scripts above the sandbox are ordinary bash. The sandbox itself is
 bubblewrap, pasta and network namespaces, all Linux-specific. That layer is a
 **backend interface**: one executable per isolation mechanism, behind a fixed
-contract, chosen with `FORK_SANDBOX_BACKEND`. `sandbox-backend-bwrap` is the
-implementation that exists, and `claude-sandboxed` and `agent-sandboxed` are
-its two callers. A container backend — which is what would serve macOS — and a
-Kubernetes one are planned and not built. The contract is written down in
+contract, chosen with `FORK_SANDBOX_BACKEND`. Two implementations exist —
+`sandbox-backend-bwrap`, the default, and `sandbox-backend-container` — and
+`claude-sandboxed` and `agent-sandboxed` are their callers. A Kubernetes
+backend is planned and not built. The contract is written down in
 [docs/sandbox-backend.md](docs/sandbox-backend.md).
 
 macOS's own `sandbox-exec` is not a substitute: its network control is
 allow-all-or-nothing, so pinned egress and the sealed bridge cannot be
 expressed with it. Running the sandbox in a Linux container is the realistic
-path to macOS support.
+path to macOS support, which is what `sandbox-backend-container` is for: there
+the runtime's Linux VM supplies the kernel, so the port becomes a second
+backend rather than a translation.
+
+### What still blocks macOS
+
+The backend holds the contract — its six guarantees are verified against a
+real Docker daemon, on Linux. Two things stand between that and a working
+macOS run, and both are above the backend rather than in it:
+
+- **The callers bind a host binary.** `claude-sandboxed` resolves the agent
+  CLI on the host and mounts it into the sandbox. On Linux that is fine; the
+  binaries are ABI-compatible. On macOS it hands a Mach-O executable to a
+  Linux container, which cannot run it. For macOS the image has to carry the
+  toolchain, and nothing wires that up yet. Until it does, the container
+  backend is usable directly against the contract but not through
+  `fork-sandbox.sh` on a Mac.
+- **The Darwin routing branch is unverified.** It has never executed on a
+  Mac. It fails closed, and
+  `tests/sandbox-backend-container-test.sh` now drives it on any host with
+  stubbed Darwin commands, but the fixture is representative rather than
+  captured. Replacing those stubs with real output from a Mac is the one
+  step that settles it.
+
+So a macOS contributor is welcome and wanted; a macOS *user* is not served
+yet. Saying otherwise would make this the thing the contract warns about — a
+sandbox that claims a guarantee it does not hold.
 
 ## What this does not protect you from
 
@@ -205,7 +233,9 @@ what is mounted, what is not, and a numbered list of the gaps.
   contract a repo uses to declare its service stack.
 - [docs/permissions.md](docs/permissions.md) — running these without a prompt.
 - [docs/sandbox-backend.md](docs/sandbox-backend.md) — the isolation contract,
-  and where macOS and Kubernetes support would plug in.
+  its two implementations, and where Kubernetes support would plug in.
+- [docs/sandbox-backend-container.md](docs/sandbox-backend-container.md) — the
+  container backend: mechanism, threat model, and limits.
 
 Every script also documents itself: run it with `--help`, or read the header
 comment, which is the same text.
