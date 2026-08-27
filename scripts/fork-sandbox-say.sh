@@ -47,6 +47,12 @@
 
 set -uo pipefail
 
+script_dir="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=fork-sandbox-lib.sh
+# shellcheck disable=SC1091  # plain shellcheck cannot follow it; use -x
+source "$script_dir/fork-sandbox-lib.sh"
+
 RUN_DIR_PREFIX="/var/tmp/claude-scratch/forks/claude-fork-sandbox."
 # The pre-consolidation location, still accepted so a run dir from before the
 # move can be steered. New runs never land here.
@@ -103,7 +109,7 @@ done
 
 # Resolve first, then check the prefix, so a symlink cannot point the write
 # somewhere else.
-run_dir="$(realpath -e -- "$run_dir_arg" 2>/dev/null)" \
+run_dir="$("$FS_REALPATH" -e -- "$run_dir_arg" 2>/dev/null)" \
     || die "'$run_dir_arg' does not exist"
 [[ -d "$run_dir" ]] || die "'$run_dir' is not a directory"
 [[ "$run_dir" == "$RUN_DIR_PREFIX"* || "$run_dir" == "$RUN_DIR_PREFIX_LEGACY"* ]] \

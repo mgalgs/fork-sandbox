@@ -157,20 +157,20 @@ digest() {
 }
 
 mkdir -p /var/tmp/claude-scratch/forks "$WORK_DIR_ARG"
-WORK_DIR="$(realpath "$WORK_DIR_ARG")"
+WORK_DIR="$("$FS_REALPATH" "$WORK_DIR_ARG")"
 is_refused_work_dir "$WORK_DIR" && { echo "Error: refusing '$WORK_DIR' as the work dir. It is bind-mounted writable." >&2; exit 1; }
 check_mount_path --workdir "$WORK_DIR" || exit 1
 
 MOUNTS=(--mount "type=bind,src=$WORK_DIR,dst=$WORK_DIR")
-for d in "${BIND_RO[@]}"; do [[ -e "$d" ]] || { echo "Error: --bind-ro '$d' does not exist." >&2; exit 1; }; s="$(realpath "$d")"; r="$(realpath -s "$d")"; check_mount_path --bind-ro "$s" && check_mount_path --bind-ro "$r" || exit 1; MOUNTS+=(--mount "type=bind,src=$s,dst=$r,readonly"); done
+for d in "${BIND_RO[@]}"; do [[ -e "$d" ]] || { echo "Error: --bind-ro '$d' does not exist." >&2; exit 1; }; s="$("$FS_REALPATH" "$d")"; r="$("$FS_REALPATH" -s "$d")"; check_mount_path --bind-ro "$s" && check_mount_path --bind-ro "$r" || exit 1; MOUNTS+=(--mount "type=bind,src=$s,dst=$r,readonly"); done
 for d in "${BIND_RW[@]}"; do
-    [[ -e "$d" ]] || { echo "Error: --bind-rw '$d' does not exist." >&2; exit 1; }; r="$(realpath "$d")"
+    [[ -e "$d" ]] || { echo "Error: --bind-rw '$d' does not exist." >&2; exit 1; }; r="$("$FS_REALPATH" "$d")"
     is_refused_work_dir "$r" && { echo "Error: refusing '$r' as a --bind-rw path. It would be writable inside the sandbox." >&2; exit 1; }
-    s="$(realpath -s "$d")"; check_mount_path --bind-rw "$r" && check_mount_path --bind-rw "$s" || exit 1
+    s="$("$FS_REALPATH" -s "$d")"; check_mount_path --bind-rw "$r" && check_mount_path --bind-rw "$s" || exit 1
     MOUNTS+=(--mount "type=bind,src=$r,dst=$s")
 done
-for i in "${!BIND_RO_AT_SRC[@]}"; do s="${BIND_RO_AT_SRC[$i]}"; d="${BIND_RO_AT_DEST[$i]}"; [[ -e "$s" ]] || { echo "Error: --bind-ro-at source '$s' does not exist." >&2; exit 1; }; check_remap_dest --bind-ro-at "$d" || exit 1; s="$(realpath "$s")"; check_mount_path --bind-ro-at "$s" && check_mount_path --bind-ro-at "$d" || exit 1; MOUNTS+=(--mount "type=bind,src=$s,dst=$d,readonly"); done
-for i in "${!BIND_RW_AT_SRC[@]}"; do s="${BIND_RW_AT_SRC[$i]}"; d="${BIND_RW_AT_DEST[$i]}"; [[ -e "$s" ]] || { echo "Error: --bind-rw-at source '$s' does not exist." >&2; exit 1; }; check_remap_dest --bind-rw-at "$d" || exit 1; r="$(realpath "$s")"; is_refused_work_dir "$r" && { echo "Error: refusing '$r' as a --bind-rw-at source." >&2; exit 1; }; check_mount_path --bind-rw-at "$r" && check_mount_path --bind-rw-at "$d" || exit 1; MOUNTS+=(--mount "type=bind,src=$r,dst=$d"); done
+for i in "${!BIND_RO_AT_SRC[@]}"; do s="${BIND_RO_AT_SRC[$i]}"; d="${BIND_RO_AT_DEST[$i]}"; [[ -e "$s" ]] || { echo "Error: --bind-ro-at source '$s' does not exist." >&2; exit 1; }; check_remap_dest --bind-ro-at "$d" || exit 1; s="$("$FS_REALPATH" "$s")"; check_mount_path --bind-ro-at "$s" && check_mount_path --bind-ro-at "$d" || exit 1; MOUNTS+=(--mount "type=bind,src=$s,dst=$d,readonly"); done
+for i in "${!BIND_RW_AT_SRC[@]}"; do s="${BIND_RW_AT_SRC[$i]}"; d="${BIND_RW_AT_DEST[$i]}"; [[ -e "$s" ]] || { echo "Error: --bind-rw-at source '$s' does not exist." >&2; exit 1; }; check_remap_dest --bind-rw-at "$d" || exit 1; r="$("$FS_REALPATH" "$s")"; is_refused_work_dir "$r" && { echo "Error: refusing '$r' as a --bind-rw-at source." >&2; exit 1; }; check_mount_path --bind-rw-at "$r" && check_mount_path --bind-rw-at "$d" || exit 1; MOUNTS+=(--mount "type=bind,src=$r,dst=$d"); done
 
 SETENV_NAMES=()
 for kv in "${SETENV[@]}"; do [[ "$kv" == *=* ]] || { echo "Error: --setenv '$kv' is not NAME=VALUE." >&2; exit 1; }; [[ "${kv%%=*}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || { echo "Error: --setenv names a variable that is not [A-Za-z_][A-Za-z0-9_]*: '${kv%%=*}'" >&2; exit 1; }; SETENV_NAMES+=("${kv%%=*}"); done
@@ -185,7 +185,7 @@ for i in "${!BRIDGE_SOCKETS[@]}"; do
     # something that does not exist inside the container: socat would fail
     # and the watchdog's very first `-S` test would be false, killing the
     # command instantly with a bare 143 and no diagnostic.
-    s="$(realpath "$s")"; BRIDGE_SOCKETS[i]="$s"
+    s="$("$FS_REALPATH" "$s")"; BRIDGE_SOCKETS[i]="$s"
     # The directory's comma check below covers the --mount syntax, but the
     # FULL path is also interpolated into socat's UNIX-CONNECT: address,
     # where a comma is socat's own option separator -- and %q cannot help,

@@ -546,7 +546,7 @@ fs_resolve_backend "$script_dir" || exit 1
 mkdir -p /var/tmp/claude-scratch/forks
 if [[ -n "$WORK_DIR_ARG" ]]; then
     mkdir -p "$WORK_DIR_ARG"
-    WORK_DIR="$(realpath "$WORK_DIR_ARG")"
+    WORK_DIR="$("$FS_REALPATH" "$WORK_DIR_ARG")"
 else
     WORK_DIR="$(mktemp -d /var/tmp/claude-scratch/forks/agent-sandbox.XXXXXX)"
 fi

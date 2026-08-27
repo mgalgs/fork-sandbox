@@ -640,7 +640,7 @@ fi
 #     would mount any host path — ~/.ssh, say — into that same sandbox.
 #     Only --unpin-egress may pass; the script adds every bind it needs
 #     itself.
-handoff_real="$(realpath -m "$handoff_file")"
+handoff_real="$("$FS_REALPATH" -m "$handoff_file")"
 if [[ "$handoff_real" != /var/tmp/claude-scratch/* && "$handoff_real" != /tmp/claude-scratch/* ]]; then
     echo "Error: handoff files must live under /var/tmp/claude-scratch/ (or the" >&2
     echo "/tmp/claude-scratch compat symlink) — got '$handoff_real'. The handoff" >&2
@@ -661,7 +661,7 @@ if [[ "$handoff_real" == /var/tmp/claude-scratch/forks/* || "$handoff_real" == /
     echo "exists to stop. Stage the handoff in the scratch root itself." >&2
     exit 1
 fi
-project_real="$(realpath -m "$project_path")"
+project_real="$("$FS_REALPATH" -m "$project_path")"
 if [[ "$project_real" != "$HOME"/src/* && "$project_real" != "$HOME/src" ]]; then
     echo "Error: the project must live under ~/src — got '$project_real'." >&2
     echo "An unattended agent gets the whole clone, and for most harnesses it" >&2
@@ -677,7 +677,7 @@ fi
 # staging directories that approved scripts mktemp on purpose, and nothing
 # else — no $HOME, no ~/.ssh, no secrets.
 if [[ -n "$context_ro" ]]; then
-    context_ro_real="$(realpath -m "$context_ro")"
+    context_ro_real="$("$FS_REALPATH" -m "$context_ro")"
     if [[ "$context_ro_real" != /var/tmp/claude-scratch/forks/* ]]; then
         echo "Error: --context-ro must name a directory under" >&2
         echo "/var/tmp/claude-scratch/forks/ — got '$context_ro_real'. An" >&2

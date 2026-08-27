@@ -48,6 +48,10 @@
 set -uo pipefail
 
 script_dir="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=fork-sandbox-lib.sh
+# shellcheck disable=SC1091  # plain shellcheck cannot follow it; use -x
+source "$script_dir/fork-sandbox-lib.sh"
 formatter="$script_dir/fork-sandbox-format.sh"
 
 RUN_DIR_PREFIX="/var/tmp/claude-scratch/forks/claude-fork-sandbox."
@@ -106,7 +110,7 @@ fi
 
 # Resolve first, then check the prefix, so a symlink cannot point the rest of
 # this script somewhere else.
-run_dir="$(realpath -e -- "$run_dir_arg" 2>/dev/null)" \
+run_dir="$("$FS_REALPATH" -e -- "$run_dir_arg" 2>/dev/null)" \
     || die "'$run_dir_arg' does not exist"
 [[ -d "$run_dir" ]] || die "'$run_dir' is not a directory"
 [[ "$run_dir" == "$RUN_DIR_PREFIX"* || "$run_dir" == "$RUN_DIR_PREFIX_LEGACY"* ]] \
@@ -238,7 +242,7 @@ elapsed_seconds() {
         return
     fi
     if resolve_run_file exit-code 2>/dev/null; then
-        end="$(stat -c %Y -- "$RUN_FILE_PATH" 2>/dev/null)"
+        end="$("$FS_STAT" -c %Y -- "$RUN_FILE_PATH" 2>/dev/null)"
     fi
     if [[ ! "${end:-}" =~ ^[0-9]+$ ]]; then
         end="$(date +%s)"

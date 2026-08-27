@@ -12,6 +12,61 @@
 # Every function writes its own error message to stderr and returns non-zero.
 # The caller decides whether to exit.
 
+# GNU coreutils, under whatever name this machine has for it.
+#
+# Everything above the sandbox is bash, and it uses GNU flags that BSD userland
+# does not have: `realpath -m` (canonicalize a path whose tail need not exist),
+# `realpath -s` (normalize without resolving symlinks), `stat -c` (a format
+# string BSD spells with -f, and differently). On Linux the GNU tool simply IS
+# `realpath`. Under Homebrew on macOS, coreutils installs it as `grealpath` and
+# is keg-only, so the plain name still resolves to BSD's.
+#
+# Resolving the name once, here, lets every call site keep its GNU flags
+# instead of growing a second BSD spelling that nobody on Linux would ever
+# exercise -- and an unexercised portability branch is a bug waiting for the
+# one person who runs it.
+#
+# The bare name is the last resort, so Linux is unaffected and a macOS box
+# without coreutils fails at fs_require_gnu_tools with a sentence rather than
+# at a call site with "illegal option -- m".
+FS_REALPATH="realpath"
+FS_STAT="stat"
+
+_fs_resolve_gnu_tool() {
+    local name="$1" cand out
+    for cand in "g$name" "$name"; do
+        command -v "$cand" >/dev/null 2>&1 || continue
+        # Capture rather than pipe: `--version | grep -q` gives the producer
+        # SIGPIPE, and pipefail would then report a match as a failure.
+        out="$("$cand" --version 2>/dev/null)" || out=""
+        case "$out" in
+            *"GNU coreutils"*) printf '%s\n' "$cand"; return 0 ;;
+        esac
+    done
+    return 1
+}
+
+# shellcheck disable=SC2034  # written here, read by the sourcing scripts
+FS_REALPATH="$(_fs_resolve_gnu_tool realpath || echo realpath)"
+# shellcheck disable=SC2034  # written here, read by the sourcing scripts
+FS_STAT="$(_fs_resolve_gnu_tool stat || echo stat)"
+
+# Say so once, early, in words. Call this from an entry script before anything
+# is created; the failure otherwise lands mid-run as an unknown-option error
+# from a tool the reader has no reason to suspect.
+fs_require_gnu_tools() {
+    local missing=()
+    _fs_resolve_gnu_tool realpath >/dev/null || missing+=(realpath)
+    _fs_resolve_gnu_tool stat >/dev/null || missing+=(stat)
+    if (( ${#missing[@]} )); then
+        echo "Error: no GNU ${missing[*]} on PATH. These scripts use GNU flags" >&2
+        echo "(realpath -m, stat -c) that the BSD tools of the same name do" >&2
+        echo "not have. On macOS: brew install coreutils" >&2
+        return 1
+    fi
+    return 0
+}
+
 # claude-sandboxed must exist before anything is created. Resolve it here
 # rather than let it fail inside a tmux pane: the pane closes when its
 # command exits, so the error would flash past and the fork would look like
@@ -230,8 +285,8 @@ fs_provision_ro() {
     FS_PROVISION_RO_FLAGS=()
     list="$(fs_services_dir "$clone_dir")/provision-ro"
     [[ -f "$list" ]] || return 0
-    origin_real="$(realpath -m "$origin_repo")"
-    clone_real="$(realpath -m "$clone_dir")"
+    origin_real="$("$FS_REALPATH" -m "$origin_repo")"
+    clone_real="$("$FS_REALPATH" -m "$clone_dir")"
     while IFS= read -r rel || [[ -n "$rel" ]]; do
         # Trim surrounding whitespace. A line whose first non-blank character
         # is '#' is a comment; a '#' anywhere else is part of the path — an
@@ -259,8 +314,8 @@ fs_provision_ro() {
         # Resolve symlinks and confirm both ends stay inside their repo. A
         # committed symlink pointing at /etc or ~/.ssh is refused here, so it
         # can never reach --bind-ro-at.
-        src_real="$(realpath -m "$src")"
-        dest_real="$(realpath -m "$dest")"
+        src_real="$("$FS_REALPATH" -m "$src")"
+        dest_real="$("$FS_REALPATH" -m "$dest")"
         if [[ "$src_real" != "$origin_real"/* ]]; then
             echo "Warning: provision-ro entry '$rel' resolves outside the repo" >&2
             echo "($src_real); refusing it." >&2
@@ -378,7 +433,7 @@ _fs_walk_alternates() {
         [[ -n "$line" ]] || continue
         # An entry may be relative to the objects dir holding the file.
         [[ "$line" == /* ]] || line="$objdir/$line"
-        alt="$(realpath -m "$line")"
+        alt="$("$FS_REALPATH" -m "$line")"
         [[ -d "$alt" ]] || continue
         # Stop on a repeat, so a cycle cannot spin forever.
         case " ${FS_ALTERNATES[*]-} " in *" $alt "*) continue ;; esac

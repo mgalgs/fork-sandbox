@@ -231,7 +231,7 @@ if [[ -n "$ENV_FILE" ]]; then
         echo "Error: --env-file '$ENV_FILE' is not a regular file." >&2
         exit 1
     fi
-    ENV_STAT="$(stat -c '%u %a' -- "$ENV_FILE")"
+    ENV_STAT="$("$FS_STAT" -c '%u %a' -- "$ENV_FILE")"
     ENV_OWNER="${ENV_STAT%% *}"
     ENV_PERMS="${ENV_STAT##* }"
     if [[ "$ENV_OWNER" != "$UID_N" ]]; then
@@ -309,7 +309,7 @@ fi
 mkdir -p /var/tmp/claude-scratch/forks
 if [[ -n "$WORK_DIR_ARG" ]]; then
     mkdir -p "$WORK_DIR_ARG"
-    WORK_DIR="$(realpath "$WORK_DIR_ARG")"
+    WORK_DIR="$("$FS_REALPATH" "$WORK_DIR_ARG")"
 else
     WORK_DIR="$(mktemp -d /var/tmp/claude-scratch/forks/claude-sandbox.XXXXXX)"
 fi
