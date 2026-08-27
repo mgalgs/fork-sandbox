@@ -120,6 +120,25 @@ check_mount_path() {
 }
 is_tunnel_iface() { case "$1" in tailscale*|ts*|wg*|tun*|tap*|zt*|ppp*|nebula*|gpd*) return 0 ;; *) return 1 ;; esac; }
 
+# Docker can answer a gateway/subnet lookup with a non-empty but bogus value
+# instead of failing outright — a created-but-not-started container reports
+# its gateway as the literal string "invalid IP" — so callers validate the
+# SHAPE of what comes back rather than trust mere non-emptiness before it is
+# interpolated into a generated `ip route` command.
+is_valid_ipv4() {
+    local ip="$1" octets o
+    [[ "$ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] || return 1
+    IFS=. read -ra octets <<<"$ip"
+    for o in "${octets[@]}"; do (( 10#$o <= 255 )) || return 1; done
+    return 0
+}
+is_valid_ipv4_cidr() {
+    local cidr="$1"
+    [[ "$cidr" == */* ]] || return 1
+    is_valid_ipv4 "${cidr%/*}" || return 1
+    [[ "${cidr#*/}" =~ ^[0-9]{1,2}$ ]] && (( 10#${cidr#*/} <= 32 ))
+}
+
 mkdir -p /var/tmp/claude-scratch/forks "$WORK_DIR_ARG"
 WORK_DIR="$(realpath "$WORK_DIR_ARG")"
 is_refused_work_dir "$WORK_DIR" && { echo "Error: refusing '$WORK_DIR' as the work dir. It is bind-mounted writable." >&2; exit 1; }
@@ -207,13 +226,33 @@ CONTAINER="$("$CLI" "${CREATE_ARGS[@]}" "$IMAGE" /fork-sandbox-bootstrap "$@")" 
 
 if [[ "$NET_MODE" == pinned ]]; then
     host_os="$(uname -s)"; [[ "$host_os" != Darwin ]] || echo "Warning: pinned routing on Darwin is unverified." >&2
+    # The gateway and subnet are read from the NETWORK, not the container:
+    # IPAM config is populated when the network is created, before any
+    # container joins it, so both are available here regardless of container
+    # state — no reordering needed. Reading the gateway off the container
+    # instead would race container start, and Docker does not fail closed on
+    # that race: a created-but-not-started container reports its gateway as
+    # the literal string "invalid IP", which is non-empty and would sail
+    # through an emptiness check straight into the generated `ip route`
+    # command below. Both values are validated for shape, not just presence.
     if [[ "$host_os" == Linux ]]; then
         default_line="$(ip -4 route show default | head -n1)" || true; iface="$(awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' <<<"$default_line")"
         [[ -n "$iface" ]] || { echo "Error: cannot determine default-route interface; refusing unpinned run." >&2; exit 1; }
         is_tunnel_iface "$iface" && { echo "Error: default route interface '$iface' is a tunnel; refusing unpinned run." >&2; exit 1; }
-        gateway="$("$CLI" inspect -f '{{range .NetworkSettings.Networks}}{{.Gateway}}{{end}}' "$CONTAINER")"
+        gateway="$("$CLI" network inspect -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}' "$NETWORK")"
         container_subnet="$("$CLI" network inspect -f '{{range .IPAM.Config}}{{.Subnet}}{{end}}' "$NETWORK")"
-        [[ -n "$gateway" && -n "$container_subnet" ]] || { echo "Error: cannot inspect the container gateway and subnet; refusing unpinned run." >&2; exit 1; }
+        if ! is_valid_ipv4 "$gateway" || ! is_valid_ipv4_cidr "$container_subnet"; then echo "Error: container network gateway '$gateway' or subnet '$container_subnet' is not a valid address; refusing pinned run." >&2; exit 1; fi
+        # Six fixed private/special-use ranges denied outright, then every
+        # host prefix reachable through a NON-default interface (other
+        # tunnels, other bridges), then every address the default interface
+        # itself holds, then the gateway's own /32 (kept usable only as a
+        # route next-hop below, never as a destination), and finally the LAN
+        # prefixes on the default interface restored as normal routes so the
+        # local network stays reachable. Installation order does not matter:
+        # the kernel selects routes by longest-prefix match, so a /32 always
+        # outranks the broader blackhole it sits inside, and a restored LAN
+        # /24 always outranks the /8-/12-/16 denials, regardless of which
+        # rule went in first.
         routes='ip route add blackhole 10.0.0.0/8; ip route add blackhole 172.16.0.0/12; ip route add blackhole 192.168.0.0/16; ip route add blackhole 100.64.0.0/10; ip route add blackhole 169.254.0.0/16; ip route add blackhole 198.18.0.0/15; ip -6 route add blackhole default'
         while read -r prefix dev; do [[ -n "$prefix" && "$prefix" != "$container_subnet" && "$dev" != "$iface" ]] && routes+="; ip route replace blackhole $prefix"; done < <(ip -4 route show | awk '$1 != "default" {p=$1; for(i=1;i<=NF;i++) if($i=="dev") {print p, $(i+1); break}}')
         while read -r addr; do routes+="; ip route replace blackhole $addr/32"; done < <(ip -4 -o addr show dev "$iface" scope global | awk '{split($4,a,"/"); print a[1]}')
@@ -222,7 +261,7 @@ if [[ "$NET_MODE" == pinned ]]; then
     elif [[ "$host_os" == Darwin ]]; then
         default_line="$(route -n get default)" || true; iface="$(awk '/interface:/{print $2}' <<<"$default_line")"; [[ -n "$iface" ]] || { echo "Error: Darwin default route parse failed; refusing unpinned run." >&2; exit 1; }
         is_tunnel_iface "$iface" && { echo "Error: default route interface '$iface' is a tunnel." >&2; exit 1; }
-        gateway="$("$CLI" inspect -f '{{range .NetworkSettings.Networks}}{{.Gateway}}{{end}}' "$CONTAINER")"; container_subnet="$("$CLI" network inspect -f '{{range .IPAM.Config}}{{.Subnet}}{{end}}' "$NETWORK")"; [[ -n "$gateway" && -n "$container_subnet" ]] || { echo "Error: Darwin container network parse failed; refusing unpinned run." >&2; exit 1; }; routes='ip route add blackhole 10.0.0.0/8; ip route add blackhole 172.16.0.0/12; ip route add blackhole 192.168.0.0/16; ip route add blackhole 100.64.0.0/10; ip route add blackhole 169.254.0.0/16; ip route add blackhole 198.18.0.0/15; ip -6 route add blackhole default'; while read -r prefix dev; do [[ "$prefix" == "$container_subnet" || "$dev" == "$iface" ]] || routes+="; ip route replace blackhole $prefix"; done < <(netstat -rn -f inet | awk 'NR>4 && $1 != "default" && $1 ~ /\// {print $1, $NF}'); while read -r addr; do routes+="; ip route replace blackhole $addr/32"; done < <(ifconfig "$iface" | awk '/inet /{print $2}'); routes+="; ip route replace blackhole $gateway/32"; while read -r prefix; do routes+="; ip route replace $prefix via $gateway"; done < <(netstat -rn -f inet | awk -v dev="$iface" 'NR>4 && $NF == dev && $3 !~ /G/ && $1 != "default" && $1 ~ /\// {print $1}')
+        gateway="$("$CLI" network inspect -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}' "$NETWORK")"; container_subnet="$("$CLI" network inspect -f '{{range .IPAM.Config}}{{.Subnet}}{{end}}' "$NETWORK")"; if ! is_valid_ipv4 "$gateway" || ! is_valid_ipv4_cidr "$container_subnet"; then echo "Error: container network gateway '$gateway' or subnet '$container_subnet' is not a valid address; refusing pinned run." >&2; exit 1; fi; routes='ip route add blackhole 10.0.0.0/8; ip route add blackhole 172.16.0.0/12; ip route add blackhole 192.168.0.0/16; ip route add blackhole 100.64.0.0/10; ip route add blackhole 169.254.0.0/16; ip route add blackhole 198.18.0.0/15; ip -6 route add blackhole default'; while read -r prefix dev; do [[ "$prefix" == "$container_subnet" || "$dev" == "$iface" ]] || routes+="; ip route replace blackhole $prefix"; done < <(netstat -rn -f inet | awk 'NR>4 && $1 != "default" && $1 ~ /\// {print $1, $NF}'); while read -r addr; do routes+="; ip route replace blackhole $addr/32"; done < <(ifconfig "$iface" | awk '/inet /{print $2}'); routes+="; ip route replace blackhole $gateway/32"; while read -r prefix; do routes+="; ip route replace $prefix via $gateway"; done < <(netstat -rn -f inet | awk -v dev="$iface" 'NR>4 && $NF == dev && $3 !~ /G/ && $1 != "default" && $1 ~ /\// {print $1}')
     else echo "Error: pinned routing is unsupported on $host_os." >&2; exit 1; fi
     fs_reject_unsafe_chars "$routes" || exit 1
     "$CLI" start "$CONTAINER" >/dev/null
