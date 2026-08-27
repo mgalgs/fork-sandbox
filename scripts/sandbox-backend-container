@@ -179,8 +179,13 @@ command -v "$CLI" >/dev/null || { echo "Error: container runtime '$CLI' not foun
 if ! "$CLI" run --rm --entrypoint /bin/sh "$IMAGE" -c 'command -v bash >/dev/null'; then
     echo "Error: image '$IMAGE' does not provide bash." >&2; exit 1
 fi
-if [[ "$NET_MODE" == pinned ]] && ! "$CLI" run --rm --entrypoint /bin/sh "$IMAGE" -c 'command -v ip >/dev/null'; then
-    echo "Error: image '$IMAGE' does not provide iproute2's ip, required in pinned mode." >&2; exit 1
+# BusyBox (present on every Alpine image) ships its own `ip` applet, so
+# `command -v ip` succeeds even with no iproute2 installed at all — the probe
+# has to test capability, not mere presence. BusyBox's `ip -V` also exits 0,
+# so the exit status alone cannot tell them apart either; only grepping the
+# version string for "iproute2" does.
+if [[ "$NET_MODE" == pinned ]] && ! "$CLI" run --rm --entrypoint /bin/sh "$IMAGE" -c 'ip -V 2>&1 | grep -q iproute2'; then
+    echo "Error: image '$IMAGE' does not provide iproute2's ip (BusyBox's ip applet is not enough for pinned mode); install iproute2." >&2; exit 1
 fi
 if (( ${#BRIDGE_SOCKETS[@]} )) && ! "$CLI" run --rm --entrypoint /bin/sh "$IMAGE" -c 'command -v socat >/dev/null'; then
     echo "Error: image '$IMAGE' does not provide socat, required by --bridge." >&2; exit 1
