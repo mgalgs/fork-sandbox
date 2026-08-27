@@ -74,6 +74,152 @@ PY
 pids+=("$!"); for _ in {1..50}; do [[ -S "$comma_name_sock" ]] && break; sleep .02; done
 refuses "rejects comma in the bridge socket filename" comma "$backend" --workdir "$w" --net sealed --image "$image" --bridge "$comma_name_sock=3002" -- true
 
+printf '\n== Darwin pin route program (no runtime required) ==\n'
+# The Darwin branch only runs on a Mac, which is why it has never executed in
+# any test. It does not need a Mac to run, though: every input it reads comes
+# from a command on PATH, so stubbing `uname`, `route`, `netstat` and
+# `ifconfig`, plus a fake container CLI that records the route program instead
+# of running it, drives the real code path on any host.
+#
+# The fixture below is REPRESENTATIVE, not captured from a Mac -- so the
+# assertions deliberately test properties that hold whatever a real routing
+# table looks like, rather than an exact expected string. Asserting an exact
+# program against an invented fixture would only prove the code matches the
+# guess. In particular, "every blackhole operand carries a prefix length"
+# catches the whole class of mis-parses without anyone having to predict which
+# one macOS produces.
+#
+# Every address here is from the RFC 5737 documentation ranges rather than a
+# private range, so the fixture cannot be mistaken for anyone's real network.
+dwn="$(newdir)"; tmpdirs+=("$dwn")
+mkdir -p "$dwn/bin" "$dwn/work"
+cat > "$dwn/bin/uname" <<'EOF'
+#!/bin/sh
+[ "$1" = "-s" ] && { echo Darwin; exit 0; }
+exec /usr/bin/uname "$@"
+EOF
+cat > "$dwn/bin/route" <<'EOF'
+#!/bin/sh
+cat <<'OUT'
+   route to: default
+destination: default
+       mask: default
+    gateway: 192.0.2.1
+  interface: en0
+      flags: <UP,GATEWAY,DONE,STATIC,PRCLONING,GLOBAL>
+OUT
+EOF
+# macOS netstat abbreviates classful destinations (no /len) and prints an
+# Expire column, so $NF is not always the interface. Both are in the fixture
+# on purpose: they are the two things most likely to trip the parser.
+cat > "$dwn/bin/netstat" <<'EOF'
+#!/bin/sh
+cat <<'OUT'
+Routing tables
+
+Internet:
+Destination        Gateway            Flags        Netif Expire
+default            192.0.2.1          UGScg          en0
+127                127.0.0.1          UCS            lo0
+192.0.2            link#15            UCS            en0      !
+192.0.2.1/32       link#15            UCS            en0
+198.51.100/24      link#22            UCS         utun4
+100.64.0.0/10      link#22            UCS         utun4
+OUT
+EOF
+cat > "$dwn/bin/ifconfig" <<'EOF'
+#!/bin/sh
+cat <<'OUT'
+en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+	inet 192.0.2.198 netmask 0xffffff00 broadcast 192.0.2.255
+OUT
+EOF
+cat > "$dwn/bin/fakecli" <<EOF
+#!/usr/bin/env bash
+# Records the pin helper's route program, fakes everything else.
+case "\$1 \$2" in
+  "network create") echo fake-net; exit 0 ;;
+  "network inspect") case "\$*" in *Gateway*) echo 203.0.113.1 ;; *Subnet*) echo 203.0.113.0/24 ;; esac; exit 0 ;;
+  "network rm") exit 0 ;;
+esac
+case "\$1" in
+  create) echo fake-container; exit 0 ;;
+  start)  exit 0 ;;
+  wait)   echo 0; exit 0 ;;
+  rm)     exit 0 ;;
+  inspect) echo 2026-01-01T00:00:00Z; exit 0 ;;
+  run)
+    for a in "\$@"; do prev_is_c=\${is_c:-0}; done
+    # the pin helper is the only 'run' carrying --cap-add=NET_ADMIN
+    if [[ "\$*" == *NET_ADMIN* ]]; then
+      prog=""; while (( \$# )); do [[ "\$1" == "-c" ]] && { prog="\$2"; break; }; shift; done
+      printf '%s' "\$prog" > "$dwn/routes.txt"
+    fi
+    exit 0 ;;
+esac
+exit 0
+EOF
+chmod +x "$dwn/bin/"*
+rm -f "$dwn/routes.txt"
+PATH="$dwn/bin:$PATH" FORK_SANDBOX_CONTAINER_CLI="$dwn/bin/fakecli" \
+    "$backend" --workdir "$dwn/work" --net pinned --image fake -- true >/dev/null 2>&1
+if [[ ! -s "$dwn/routes.txt" ]]; then
+    no "Darwin branch generates a route program" "no program captured"
+else
+    ok "Darwin branch generates a route program"
+    dprog="$(cat "$dwn/routes.txt")"
+    case "$dprog" in "set -e;"*) ok "Darwin program is prefixed with set -e" ;;
+        *) no "Darwin program is prefixed with set -e" "$dprog" ;; esac
+    case "$dprog" in *"; ip route add blackhole 169.254.0.0/16") ok "Darwin sentinel is installed last" ;;
+        *) no "Darwin sentinel is installed last" "tail: ${dprog##*;}" ;; esac
+    case "$dprog" in *"ip route replace blackhole 203.0.113.1/32"*) ok "Darwin blackholes the gateway /32" ;;
+        *) no "Darwin blackholes the gateway /32" "$dprog" ;; esac
+    if [[ "$dprog" == *"blackhole 203.0.113.0/24"* ]]; then
+        no "Darwin never blackholes the container subnet" "$dprog"
+    else ok "Darwin never blackholes the container subnet"; fi
+    # The class-catching assertion, and the reason it is about the slash
+    # rather than about the address. iproute2 is lenient in two different
+    # ways, and only one of them is safe:
+    #
+    #   - An abbreviated prefix WITH a length -- three octets and /24, say --
+    #     expands to the network you meant. macOS netstat prints destinations
+    #     in exactly that form, so those must be allowed through.
+    #   - An operand with NO length is also accepted, and silently becomes a
+    #     single /32 host route instead of the network. A denial that looks
+    #     installed and covers one address out of the whole prefix is the
+    #     dangerous outcome, and it is silent.
+    #
+    # Requiring the slash separates the two, and it catches the whole
+    # mis-parse class without predicting which form macOS emits.
+    bad=""
+    while read -r op; do
+        [[ -n "$op" ]] || continue
+        [[ "$op" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){0,3}/[0-9]{1,2}$ ]] || bad+="$op "
+    done < <(printf '%s' "$dprog" | tr ';' '\n' | awk '/ip route (add|replace) blackhole /{print $NF}' | grep -v '^default$')
+    if [[ -z "$bad" ]]; then ok "Darwin blackhole operands all carry a prefix length"
+    else no "Darwin blackhole operands all carry a prefix length" "no prefix length: $bad"; fi
+    # NOT covered, and the reason this harness exists rather than a claim of
+    # correctness: whether the LAN-restore loop actually restores the LAN on a
+    # Mac. With the fixture above it restores only the router's own /32, never
+    # the surrounding LAN network, because that loop filters on `$1 ~ /\//` and
+    # on `$NF == dev` -- and macOS netstat prints an abbreviated destination
+    # with no prefix length for a classful network, and an Expire column that
+    # makes $NF `!` rather than the interface. A real Mac's LAN sits in one of
+    # the three private ranges the fixed denials already cover, so if both of
+    # those hold there, nothing punches it back through and pinned mode reaches
+    # the router but no other LAN host -- contradicting guarantee 3's "it does
+    # reach the host's LAN". (The fixture's own LAN is a documentation range,
+    # outside those denials, so the effect is not visible here; only the
+    # restore loop's output is.)
+    #
+    # That is fail-closed, so it is a functional divergence rather than a hole
+    # -- and it is unconfirmed, because the fixture is representative rather
+    # than captured. Anyone with a Mac can settle it in one step: replace the
+    # netstat and ifconfig stubs above with real output from that machine and
+    # re-run. Until someone does, the script header's "the Darwin routing
+    # branch itself remains unverified" is the honest statement.
+fi
+
 printf '\n== runtime integration ==\n'
 runtime="${FORK_SANDBOX_CONTAINER_CLI:-docker}"
 if ! command -v "$runtime" >/dev/null 2>&1 || ! "$runtime" info >/dev/null 2>&1; then
