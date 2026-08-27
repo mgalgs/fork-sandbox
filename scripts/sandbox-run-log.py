@@ -45,6 +45,20 @@ Recommended --task-meta fields (documented here, enforced nowhere):
                       then reuse it exactly, or the stats group on noise.
   stage, tags         free-form
 
+The review loop (fork-sandbox.sh --review-loop N):
+  review_loop  present only when the run used the flag. The whole loop, as
+               the runner recorded it: `cap`, `ended` (approved | cap |
+               no-progress | harness-error | skipped), `detail` for the last
+               two, and `iterations` -- one object per review/fix pair with
+               its findings count, each leg's exit code and cost, the branch
+               head before and after, and the commits the fix leg added.
+               `total_cost_usd` beside it is the run's implement leg plus
+               every loop leg; `cost_usd` stays the implement leg alone.
+               Group on it directly: `stats --by model,review_loop.ended`
+               answers how often a model talks itself into an extra
+               iteration, and the per-iteration costs say what that was
+               worth.
+
 Verdict outcomes:
   integrated             merged as-is, or with trivial touch-ups
   integrated-with-fixes  merged after this session fixed real defects
@@ -97,6 +111,7 @@ SUMMARY_FIELDS = [
     "fetched",
     "branch_removed",
     "cost_usd",
+    "total_cost_usd",
     "usage",
     "started_at",
     "ended_at",
@@ -254,6 +269,14 @@ def cmd_record(args):
             pass
 
     rec["task"] = load_json_file(os.path.join(rd, "task-meta.json"))
+
+    # --review-loop's record, when the run had one: what the loop cost, how
+    # many iterations it took and how it ended. No key at all when the file is
+    # absent, which is every run launched without the flag and every run from
+    # before it existed -- readers must not assume it is there.
+    review_loop = load_json_file(os.path.join(rd, "review-loop.json"))
+    if review_loop is not None:
+        rec["review_loop"] = review_loop
 
     # The handoff is the prompt, and the run dir it lives in gets deleted
     # after review -- archive it, so prompt iteration has the actual text to
