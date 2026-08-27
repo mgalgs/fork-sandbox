@@ -63,6 +63,9 @@
 #     label=fork-sandbox-run`.
 #   - --bridge is verified only on Linux and probably fails through Docker
 #     Desktop/Colima filesystem sharing. Treat it as Linux-only until verified.
+#   - macOS needs `flock` on PATH (stock macOS ships neither it nor GNU
+#     md5sum); this script refuses up front rather than failing confusingly
+#     on either. The Darwin routing branch itself remains unverified.
 
 set -euo pipefail
 
@@ -143,6 +146,15 @@ is_valid_ipv4_cidr() {
     is_valid_ipv4 "${cidr%/*}" || return 1
     [[ "${cidr#*/}" =~ ^[0-9]{1,2}$ ]] && (( 10#${cidr#*/} <= 32 ))
 }
+# The lock file name only needs a stable digest of the work dir, not a
+# cryptographic one, so any of these does: GNU md5sum (Linux), BSD md5 -q
+# (stock macOS), or cksum (POSIX, everywhere) as a last resort.
+digest() {
+    if command -v md5sum >/dev/null 2>&1; then md5sum | cut -d' ' -f1
+    elif command -v md5 >/dev/null 2>&1; then md5 -q
+    else cksum | cut -d' ' -f1
+    fi
+}
 
 mkdir -p /var/tmp/claude-scratch/forks "$WORK_DIR_ARG"
 WORK_DIR="$(realpath "$WORK_DIR_ARG")"
@@ -196,7 +208,19 @@ if (( ${#BRIDGE_SOCKETS[@]} )) && ! "$CLI" run --rm --entrypoint /bin/sh "$IMAGE
     echo "Error: image '$IMAGE' does not provide socat, required by --bridge." >&2; exit 1
 fi
 
-LOCK_FILE="/var/tmp/claude-scratch/forks/.sandbox-backend-lock-$(printf '%s' "$WORK_DIR" | md5sum | cut -d' ' -f1)"
+# flock(1) is util-linux, absent on stock macOS. A mkdir-based substitute
+# would lose the property flock gives for free: the kernel releases it
+# however the holding process dies, including SIGKILL, so a stale lock never
+# outlives its process. Refuse outright rather than fake the lock or silently
+# skip it.
+command -v flock >/dev/null 2>&1 || {
+    echo "Error: flock not found. This backend serializes runs against the" >&2
+    echo "same --workdir with it, and there is no substitute that keeps its" >&2
+    echo "release-on-SIGKILL property. On macOS: brew install util-linux," >&2
+    echo "then add its (keg-only) bin directory to PATH." >&2
+    exit 1
+}
+LOCK_FILE="/var/tmp/claude-scratch/forks/.sandbox-backend-lock-$(printf '%s' "$WORK_DIR" | digest)"
 exec 9>"$LOCK_FILE"; flock -n 9 || { echo "Error: another sandbox is already using $WORK_DIR" >&2; exit 1; }
 RUN_ID="$(date +%s)-$$-$RANDOM"; STATE_DIR="$(mktemp -d /var/tmp/claude-scratch/forks/sandbox-backend-container.XXXXXX)"
 CONTAINER=""; NETWORK=""
