@@ -925,7 +925,12 @@ codex)
         echo "or, on Arch, the openai-codex package." >&2
         exit 1
     fi
-    codex_auth_src="$HOME/.codex/auth.json"
+    # Same CODEX_HOME the model cache is read from above. Honouring it in one
+    # place and not the other let a run validate its model against one codex
+    # home and then authenticate from a different one, so the model check --
+    # whose whole job is to fail before the clone -- could pass against an
+    # account that is not the one the run uses.
+    codex_auth_src="${CODEX_HOME:-$HOME/.codex}/auth.json"
     if [[ ! -f "$codex_auth_src" ]]; then
         echo "Error: $codex_auth_src not found. Sign in on the host first:" >&2
         echo "  codex login" >&2
