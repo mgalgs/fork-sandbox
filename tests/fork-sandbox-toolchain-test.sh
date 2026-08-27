@@ -67,6 +67,17 @@ contains() {
     esac
 }
 
+# Like contains(), but never echoes the haystack. Used where the value under
+# test could be a real credential: a secret printed into a failure message is
+# a leaked secret, and a test log is a place secrets go to be forgotten about.
+contains_quiet() {
+    local label="$1" needle="$2" hay="$3"
+    case "$hay" in
+        *"$needle"*) ok "$label" ;;
+        *) no "$label" "expected to find '$needle'; the actual value is withheld here because it may be a credential" ;;
+    esac
+}
+
 lacks() {
     local label="$1" needle="$2" hay="$3"
     case "$hay" in
@@ -244,6 +255,13 @@ contains "image mode says why" "userland comes from an" "$err"
 echo ""
 echo "== fs_read_claude_credential =="
 
+# The Keychain is NOT addressed through $HOME, so overriding HOME does not
+# isolate it: on a Mac the fallback would read the user's real credential,
+# every assertion below would compare against it, and a failure message would
+# print it. Point the lookup at a service that cannot exist instead. That keeps
+# the cases running on every platform AND keeps a live token out of them.
+FS_CLAUDE_KEYCHAIN_SERVICES=("fork-sandbox-test-service-that-does-not-exist")
+
 cred_home="$scratch/cred-home"
 mkdir -p "$cred_home/.claude"
 printf '{"claudeAiOauth":{"accessToken":"tok","expiresAt":1}}\n' \
@@ -252,14 +270,14 @@ HOME="$cred_home"
 out="$(fs_read_claude_credential)"
 rc=$?
 check "a credential file is read" "0" "$rc"
-contains "the file's contents come back" '"accessToken":"tok"' "$out"
+contains_quiet "the file's contents come back" '"accessToken":"tok"' "$out"
 # The source is a separate function precisely because the reader can only be
 # used through a command substitution, and a subshell cannot hand a variable
 # back. Naming it must therefore work from inside one.
 check "the source is named for error messages" \
     "$cred_home/.claude/.credentials.json" "$(fs_claude_credential_source)"
 
-# No file, and (on Linux) no Keychain to fall back to.
+# No file, and no Keychain item under the service name above.
 HOME="$scratch/empty-home"
 mkdir -p "$HOME"
 if err="$(fs_read_claude_credential 2>&1)"; then
@@ -267,7 +285,20 @@ if err="$(fs_read_claude_credential 2>&1)"; then
 else
     ok "a missing credential returns non-zero"
 fi
-contains "a missing credential says what to do" "Log in with claude first" "$err"
+contains_quiet "a missing credential says what to do" "claude" "$err"
+
+# A file that exists but cannot be READ. `-f` proves neither, and returning 0
+# with no output here is diagnosed downstream as an expired token -- sending
+# the user to log in again, which rewrites a file they still cannot read.
+HOME="$cred_home"
+chmod 000 "$cred_home/.claude/.credentials.json"
+if err="$(fs_read_claude_credential 2>&1)"; then
+    no "an unreadable credential returns non-zero"
+else
+    ok "an unreadable credential returns non-zero"
+fi
+contains_quiet "an unreadable credential is not called expired" "could not be read" "$err"
+chmod 600 "$cred_home/.claude/.credentials.json"
 HOME="$real_home"
 
 echo ""
@@ -278,6 +309,7 @@ echo "== GNU tool resolution =="
 # scripts ask for it by resolved name rather than hardcoding one.
 check "a GNU realpath was found" "0" "$( _fs_resolve_gnu_tool realpath >/dev/null; echo $? )"
 check "a GNU stat was found" "0" "$( _fs_resolve_gnu_tool stat >/dev/null; echo $? )"
+check "a GNU timeout was found" "0" "$( _fs_resolve_gnu_tool timeout >/dev/null; echo $? )"
 check "fs_require_gnu_tools passes here" "0" "$( fs_require_gnu_tools >/dev/null 2>&1; echo $? )"
 
 # A g-prefixed build wins over a bare one, which is what makes a Mac work.
@@ -294,10 +326,15 @@ PATH="$old_path"
 # illegal-option error deep in a run.
 bsddir="$scratch/bsd-bin"
 mkdir -p "$bsddir"
-for t in realpath stat; do
-    printf '#!/usr/bin/env bash\necho "usage: %s [-q] path" >&2\nexit 1\n' "$t" > "$bsddir/$t"
+for t in realpath stat timeout; do
+    printf '#!/bin/bash\necho "usage: %s [-q] path" >&2\nexit 1\n' "$t" > "$bsddir/$t"
     chmod 755 "$bsddir/$t"
 done
+# The stubs use an absolute shebang on purpose: `#!/usr/bin/env bash` would
+# send env looking for bash on a PATH that holds only this directory, so the
+# stubs would fail to EXEC rather than answer like BSD tools -- and the
+# assertion would pass for the wrong reason.
+check "the stubs actually run" "1" "$(PATH="$bsddir" realpath --version >/dev/null 2>&1; echo $?)"
 err="$(PATH="$bsddir" fs_require_gnu_tools 2>&1)"
 rc=$?
 check "a BSD-only PATH fails the check" "1" "$rc"
