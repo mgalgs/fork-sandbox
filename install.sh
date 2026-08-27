@@ -94,13 +94,31 @@ if [[ -n "$env_bash" ]]; then
 fi
 
 # GNU coreutils. realpath -m and stat -c are GNU flags the BSD tools of the
-# same name do not have. On Linux these ARE the GNU tools; under Homebrew they
-# are grealpath and gstat, which the scripts find on their own -- but only if
-# coreutils is installed at all.
-for gnu_tool in realpath stat; do
-    if ! { "g$gnu_tool" --version 2>/dev/null || "$gnu_tool" --version 2>/dev/null; } \
-        | grep -q "GNU coreutils"; then
-        missing_required+=("GNU $gnu_tool — the scripts use its GNU-only flags (brew install coreutils)")
+# same name do not have, and macOS ships no timeout at all. On Linux these ARE
+# the GNU tools; under Homebrew they are grealpath, gstat and gtimeout, which
+# the scripts find on their own -- but only if coreutils is installed.
+#
+# This repeats fork-sandbox-lib.sh's _fs_resolve_gnu_tool rather than sourcing
+# it, deliberately: one thing this installer has to do is tell a macOS user
+# their bash is too old, and it cannot do that from a library it failed to
+# parse with that same bash.
+#
+# Capture the version rather than piping it to grep. Under `set -o pipefail` a
+# `--version | grep -q` gives the producer SIGPIPE, and the pipeline then
+# reports a match as a failure. Trying the bare name after a g-prefixed one
+# that turned out not to be GNU matters too -- `g`-prefixed is a convention,
+# not a guarantee.
+for gnu_tool in realpath stat timeout; do
+    gnu_found=""
+    for gnu_cand in "g$gnu_tool" "$gnu_tool"; do
+        command -v "$gnu_cand" >/dev/null 2>&1 || continue
+        gnu_ver="$("$gnu_cand" --version 2>/dev/null)" || gnu_ver=""
+        case "$gnu_ver" in
+            *"GNU coreutils"*) gnu_found="$gnu_cand"; break ;;
+        esac
+    done
+    if [[ -z "$gnu_found" ]]; then
+        missing_required+=("GNU $gnu_tool — the scripts need it (brew install coreutils)")
     fi
 done
 
