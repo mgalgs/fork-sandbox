@@ -58,6 +58,22 @@ PY
 pids+=("$!"); for _ in {1..50}; do [[ -S "$comma_sock" ]] && break; sleep .02; done
 refuses "rejects comma in generated bridge mount" comma "$backend" --workdir "$w" --net sealed --image "$image" --bridge "$comma_sock=3001" -- true
 
+# A comma in the socket's own FILENAME leaves the mounted directory clean, so
+# the mount check above passes it -- but socat reads the comma in its
+# UNIX-CONNECT: address as an option separator. That was the one bridge input
+# that failed OPEN: socat binds its TCP listener anyway, the readiness probe
+# passes, the gate releases, and the command runs behind a relay that can
+# never carry a byte.
+comma_name_sock="$(newdir)/a,b.sock"; tmpdirs+=("$(dirname "$comma_name_sock")")
+python3 - "$comma_name_sock" <<'PY' &
+import socket, sys
+s = socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.listen(5)
+while True:
+    c, _ = s.accept(); c.close()
+PY
+pids+=("$!"); for _ in {1..50}; do [[ -S "$comma_name_sock" ]] && break; sleep .02; done
+refuses "rejects comma in the bridge socket filename" comma "$backend" --workdir "$w" --net sealed --image "$image" --bridge "$comma_name_sock=3002" -- true
+
 printf '\n== runtime integration ==\n'
 runtime="${FORK_SANDBOX_CONTAINER_CLI:-docker}"
 if ! command -v "$runtime" >/dev/null 2>&1 || ! "$runtime" info >/dev/null 2>&1; then

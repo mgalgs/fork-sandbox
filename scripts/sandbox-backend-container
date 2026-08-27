@@ -186,6 +186,16 @@ for i in "${!BRIDGE_SOCKETS[@]}"; do
     # and the watchdog's very first `-S` test would be false, killing the
     # command instantly with a bare 143 and no diagnostic.
     s="$(realpath "$s")"; BRIDGE_SOCKETS[i]="$s"
+    # The directory's comma check below covers the --mount syntax, but the
+    # FULL path is also interpolated into socat's UNIX-CONNECT: address,
+    # where a comma is socat's own option separator -- and %q cannot help,
+    # because the mangling happens inside socat, not the shell. Left
+    # unchecked this is the one bridge input that does not fail closed:
+    # socat still binds its TCP listener (with `fork` the second address is
+    # parsed per-connection), so the bootstrap's readiness probe passes, the
+    # gate releases, and the command runs with a relay that can never carry
+    # a byte. Refuse it here instead.
+    [[ "$s" != *,* ]] || { echo "Error: --bridge socket '$s' contains a comma, which socat reads as its own option separator, so the relay could never connect to it." >&2; exit 1; }
     if [[ ! "$p" =~ ^[1-9][0-9]{0,4}$ ]] || (( p > 65535 )); then
         echo "Error: --bridge '$s=$p' has a port that is not a number from 1 to 65535." >&2
         exit 1
