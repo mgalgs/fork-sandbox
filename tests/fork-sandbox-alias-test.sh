@@ -216,6 +216,27 @@ else
     esac
 fi
 
+# --dry-run prints the resolved model, so it has to clear the same
+# shell-safety check the real run applies to it. It used to sit above that
+# check and hand out a green light for a value the real invocation refuses.
+if run --harness claude --model "opus'x" > /dev/null 2>"$err"; then
+    no "dry-run refuses a shell-unsafe model"
+else
+    case "$(cat "$err")" in
+        *"single quote"*) ok "dry-run refuses a shell-unsafe model" ;;
+        *) no "dry-run refuses a shell-unsafe model" "$(cat "$err")" ;;
+    esac
+fi
+
+if run --review-loop 2 --harness claude --model opus --review-model "sonnet'y" > /dev/null 2>"$err"; then
+    no "dry-run refuses a shell-unsafe review model"
+else
+    case "$(cat "$err")" in
+        *"single quote"*) ok "dry-run refuses a shell-unsafe review model" ;;
+        *) no "dry-run refuses a shell-unsafe review model" "$(cat "$err")" ;;
+    esac
+fi
+
 if run --review-loop zero --harness codex --model sol > /dev/null 2>"$err"; then
     no "dry-run refuses a non-numeric --review-loop"
 else

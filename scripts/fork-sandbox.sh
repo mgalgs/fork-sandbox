@@ -599,6 +599,12 @@ if [[ -n "$review_model" && "$review_loop_cap" == "0" ]]; then
     echo "--review-loop." >&2
     exit 1
 fi
+# The resolved model values are what --dry-run prints, so they have to clear
+# the shell-safety check before it prints them. The full sweep over every
+# generated-runner value still runs below; this is the same check applied
+# early to dry-run's own subject, so a model the real run refuses cannot get
+# a green light here first.
+fs_reject_unsafe_chars "$model" "$review_model" || exit 1
 
 if [[ "$dry_run" == true ]]; then
     printf 'harness=%s\nmodel=%s\n' "$harness" "$model"
