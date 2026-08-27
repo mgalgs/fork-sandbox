@@ -6,9 +6,9 @@ Only one layer is Linux-specific — the part that actually isolates the agent �
 and this document defines the contract that layer implements, so another
 implementation can be dropped in without the layers above knowing.
 
-**Status: `sandbox-backend-bwrap` implements this contract, and
-`claude-sandboxed` and `agent-sandboxed` are its two callers.** The container
-and Kubernetes backends described below are not built. The contract was written
+**Status: `sandbox-backend-bwrap` and `sandbox-backend-container` implement
+this contract, and `claude-sandboxed` and `agent-sandboxed` are their two
+callers.** The Kubernetes backend described below is not built. The contract was written
 down before the extraction because it is the part that has to be right; a
 backend that gets it wrong is not a weaker sandbox, it is a sandbox that lies.
 
@@ -114,15 +114,15 @@ is "none" does not belong in a guarantee list. It exists for the one case the
 pin breaks — a VM on a libvirt or docker bridge, which has to be addressed by
 its bridge address — and it prints a warning naming what it gave up.
 
-### `container` — planned, and the macOS answer
+### `container` — the macOS answer
 
-Run the command in a Linux container (Docker, Podman, OrbStack, Apple's
-`container`). `--bind-*` become mounts, `--net sealed` becomes a network-less
-container, `--net pinned` becomes a network that routes only to the default
-gateway, `--bridge` becomes a published port or a mounted socket. On macOS the
-container's Linux VM provides the kernel, so the same isolation applies inside
-it — the port stops being a port and becomes a second backend. Needs one
-backend-specific option: the image.
+`sandbox-backend-container` runs the command in a Linux container. Mounts
+implement the filesystem allowlist, a network-less container implements sealed
+egress, and destination blackhole routes implement pinned egress. On macOS the
+container's Linux VM provides the kernel, so the port stops being a port and
+becomes a second backend. It declares one backend-specific option, `--image`.
+Its mechanism, threat model, and limits are described in
+[sandbox-backend-container.md](sandbox-backend-container.md).
 
 ### `k8s` — planned
 
