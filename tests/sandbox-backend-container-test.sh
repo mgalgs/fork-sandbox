@@ -106,6 +106,17 @@ else
         out="$(run --workdir "$rw" --net sealed --bridge "$usock=23456" -- bash -c 'exec 3<>/dev/tcp/127.0.0.1/23456; cat <&3')"
         check "sealed unix-socket bridge" bridged "$out"
 
+        # What gets mounted is the socket's REAL directory, so the path the
+        # generated bootstrap connects to and watches has to be canonical
+        # too. When it was left raw, a --bridge path through a symlink named
+        # a directory that does not exist inside the container: socat could
+        # not connect and the watchdog's first `-S` test was already false,
+        # so the run died instantly with a bare 143 and said nothing.
+        ln -sfn "$sockdir" "$sockdir/../bridge-link"
+        out="$(run --workdir "$rw" --net sealed --bridge "$sockdir/../bridge-link/bridge.sock=23458" -- bash -c 'exec 3<>/dev/tcp/127.0.0.1/23458; cat <&3')"
+        check "sealed bridge through a symlinked socket path" bridged "$out"
+        rm -f "$sockdir/../bridge-link"
+
         # A bridge readiness probe is a TCP connect against the relay's own
         # listening port; a socat that has bound and is `fork`-ing does not
         # validate its UNIX-CONNECT target until a client actually arrives.

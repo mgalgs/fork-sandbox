@@ -178,6 +178,14 @@ if (( ${#BRIDGE_SOCKETS[@]} )) && [[ "$NET_MODE" != sealed ]]; then echo "Error:
 for i in "${!BRIDGE_SOCKETS[@]}"; do
     s="${BRIDGE_SOCKETS[$i]}"; p="${BRIDGE_PORTS[$i]}"
     [[ -S "$s" ]] || { echo "Error: --bridge source '$s' is not a unix socket." >&2; exit 1; }
+    # Canonicalize ONCE, here, and keep only the canonical form. What gets
+    # mounted is the socket's real directory, so the path the generated
+    # bootstrap connects to and watches has to be the real one too. A
+    # symlinked or relative --bridge path that stayed raw would name
+    # something that does not exist inside the container: socat would fail
+    # and the watchdog's very first `-S` test would be false, killing the
+    # command instantly with a bare 143 and no diagnostic.
+    s="$(realpath "$s")"; BRIDGE_SOCKETS[i]="$s"
     if [[ ! "$p" =~ ^[1-9][0-9]{0,4}$ ]] || (( p > 65535 )); then
         echo "Error: --bridge '$s=$p' has a port that is not a number from 1 to 65535." >&2
         exit 1
@@ -185,7 +193,7 @@ for i in "${!BRIDGE_SOCKETS[@]}"; do
     (( p >= 1024 )) || { echo "Error: --bridge '$s=$p' would listen on a privileged port. Use 1024 or higher." >&2; exit 1; }
     for j in "${!BRIDGE_PORTS[@]}"; do (( j < i )) || continue; [[ "${BRIDGE_PORTS[$j]}" != "$p" ]] || { echo "Error: two --bridge flags want in-sandbox port $p." >&2; exit 1; }; done
     fs_reject_unsafe_chars "$s" "$p" || exit 1
-    check_mount_path --bridge "$(dirname "$(realpath "$s")")" || exit 1
+    check_mount_path --bridge "$(dirname "$s")" || exit 1
 done
 
 SANDBOX_PATH="$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -236,7 +244,7 @@ if (( uid_n != 0 )); then
 fi
 
 bridge_dirs=()
-for s in "${BRIDGE_SOCKETS[@]}"; do d="$(dirname "$(realpath "$s")")"; seen=0; for r in "${bridge_dirs[@]}"; do [[ "$r" == "$d" ]] && seen=1; done; (( seen )) || { bridge_dirs+=("$d"); MOUNTS+=(--mount "type=bind,src=$d,dst=$d,readonly"); }; done
+for s in "${BRIDGE_SOCKETS[@]}"; do d="$(dirname "$s")"; seen=0; for r in "${bridge_dirs[@]}"; do [[ "$r" == "$d" ]] && seen=1; done; (( seen )) || { bridge_dirs+=("$d"); MOUNTS+=(--mount "type=bind,src=$d,dst=$d,readonly"); }; done
 
 # Generated INSIDE the container and run before the caller's command. In
 # pinned mode it polls for the sentinel blackhole 169.254.0.0/16 — deliberately
