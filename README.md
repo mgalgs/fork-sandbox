@@ -217,9 +217,9 @@ than the base should build its own image `FROM` it.
 
 ### What is still unverified on macOS
 
-Two properties have never executed on a Mac. Both fail closed, so the
-consequence is a refused run rather than a sandbox that quietly holds less
-than it claims:
+Three things have never executed on a Mac. The first two fail closed, so the
+consequence there is a refused run rather than a sandbox that quietly holds
+less than it claims:
 
 - **The Darwin routing branch**, which builds pinned egress.
   `tests/sandbox-backend-container-test.sh` drives it on any host with stubbed
@@ -230,9 +230,11 @@ than it claims:
 - **Unix-socket bridges**, and so `--harness pi-local`, which is sealed plus a
   bridge. Docker Desktop and Colima share files over virtiofs or a FUSE
   gateway, and unix sockets generally do not survive that.
-
-`--services` is Linux-only for now: it drives Docker Compose on the host from
-inside a run, which is a second runtime question on macOS.
+- **Per-run services.** These are opt-*out*, so a repo carrying a
+  `sandbox-services.sh` hook gets them on a Mac whether or not anyone planned
+  for it. Whether the sockets they publish survive Docker Desktop's filesystem
+  sharing is the same open question as the bridges. `--no-services` turns them
+  off.
 
 [docs/macos-support.md](docs/macos-support.md) has the full design and the
 remaining checklist.

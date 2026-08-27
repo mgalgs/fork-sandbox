@@ -1978,6 +1978,12 @@ started_at="$(date +%s)"
     printf 'sockets_dir=%q\n' "$sockets_dir"
     printf 'services_project=%q\n' "$services_project"
     printf 'run_log_bin=%q\n' "$run_log_bin"
+    # GNU coreutils' timeout, under whatever name this machine has for it. The
+    # services teardown below is an EXIT trap around a docker daemon that can
+    # wedge, so the bound matters -- and macOS has no `timeout` at all, where
+    # a bare call would fail into the `|| true` and leak the compose stack
+    # silently, which is the one outcome the trap exists to prevent.
+    printf 'FS_TIMEOUT=%q\n' "$FS_TIMEOUT"
     printf 'sandbox_cmd=('
     printf '%q ' "${sandbox_cmd[@]}"
     printf ')\n'
@@ -2024,7 +2030,7 @@ run_cleanup() {
         # timeout on every docker-touching command here: this function is the
         # EXIT trap, and a wedged docker daemon must not hang the run forever
         # with the output hidden in sandbox.log.
-        timeout 120 "$services_script" down "$services_project" \
+        "$FS_TIMEOUT" 120 "$services_script" down "$services_project" \
             >> "$sandbox_log" 2>&1 || true
         # Opportunistic sweep: remove any claude-* compose project whose run
         # dir is gone. A session killed before this ran can leak one; catch it
@@ -2049,16 +2055,24 @@ run_cleanup() {
                 # The run dir is gone, so its compose file is too. Remove the
                 # project's resources by their compose label rather than through
                 # a compose file that no longer exists.
-                timeout 60 docker ps -aq \
-                    --filter "label=com.docker.compose.project=$orphan" \
-                    | xargs -r timeout 60 docker rm -f >> "$sandbox_log" 2>&1 || true
-                timeout 60 docker network ls -q \
-                    --filter "label=com.docker.compose.project=$orphan" \
-                    | xargs -r timeout 60 docker network rm >> "$sandbox_log" 2>&1 || true
-                timeout 60 docker volume ls -q \
-                    --filter "label=com.docker.compose.project=$orphan" \
-                    | xargs -r timeout 60 docker volume rm >> "$sandbox_log" 2>&1 || true
-            done < <(timeout 60 docker compose ls -a --format json 2>/dev/null \
+                # `xargs -r` would be the natural way to skip an empty list,
+                # but BSD xargs rejects the flag rather than ignoring it, so
+                # the whole sweep would fail on a Mac. Collect and test here,
+                # which needs no flag at all.
+                for what in ps network volume; do
+                    case "$what" in
+                        ps)      ids="$("$FS_TIMEOUT" 60 docker ps -aq --filter "label=com.docker.compose.project=$orphan" 2>/dev/null || true)" ;;
+                        network) ids="$("$FS_TIMEOUT" 60 docker network ls -q --filter "label=com.docker.compose.project=$orphan" 2>/dev/null || true)" ;;
+                        volume)  ids="$("$FS_TIMEOUT" 60 docker volume ls -q --filter "label=com.docker.compose.project=$orphan" 2>/dev/null || true)" ;;
+                    esac
+                    [[ -n "$ids" ]] || continue
+                    case "$what" in
+                        ps)      printf '%s\n' "$ids" | xargs "$FS_TIMEOUT" 60 docker rm -f >> "$sandbox_log" 2>&1 || true ;;
+                        network) printf '%s\n' "$ids" | xargs "$FS_TIMEOUT" 60 docker network rm >> "$sandbox_log" 2>&1 || true ;;
+                        volume)  printf '%s\n' "$ids" | xargs "$FS_TIMEOUT" 60 docker volume rm >> "$sandbox_log" 2>&1 || true ;;
+                    esac
+                done
+            done < <("$FS_TIMEOUT" 60 docker compose ls -a --format json 2>/dev/null \
                      | jq -r 'if type == "array" then .[] else . end
                               | .Name' 2>/dev/null || true)
             # The jq filter takes both shapes compose emits: one JSON array

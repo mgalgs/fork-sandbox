@@ -609,7 +609,7 @@ cleanup() {
         # work dir — which is why a copy taken before the sandbox ran can still
         # do it. timeout because this is the EXIT trap: a wedged docker daemon
         # must not hang the session forever.
-        timeout 120 "$SERVICES_SCRIPT" down "$SERVICES_PROJECT" >&2 || true
+        "$FS_TIMEOUT" 120 "$SERVICES_SCRIPT" down "$SERVICES_PROJECT" >&2 || true
     fi
     if [[ -n "$SOCAT_PID" ]]; then
         # Kill the GROUP, not just the listener. A ,fork listener answers each

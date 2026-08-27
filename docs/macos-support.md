@@ -136,9 +136,19 @@ use `mapfile` and `${var,,}`), `flock`, and GNU `coreutils`. `install.sh
 --check` enforces all three, and checks the bash that `#!/usr/bin/env bash`
 would actually find rather than the one running the installer.
 
-**Left alone, deliberately.** `timeout` and `xargs -r` appear only in the
-`--services` teardown, and `--services` is Linux-only for now. Fixing them
-would be changing code on no macOS path.
+**Also fixed, because the first version of this document was wrong about it.**
+`timeout` and `xargs -r` appear in the per-run services teardown, which an
+earlier draft called a Linux-only path. It is not. There is no `--services`
+flag: services are opt-*out* (`--no-services`), and they turn on automatically
+whenever a repo carries a `sandbox-services.sh` hook and `docker` is on `PATH`
+— and `install.sh` makes docker a *required* dependency on Darwin, so that
+condition holds by construction on exactly the platform the claim excluded.
+
+macOS ships no `timeout` at all, so the teardown would have failed into its own
+`|| true` and leaked the compose stack silently, with the orphan sweep meant to
+catch that leak failing identically. `timeout` now resolves like `realpath` and
+`stat`; `xargs -r` is gone, since BSD xargs rejects the flag rather than
+ignoring it, replaced by testing the list for emptiness in the shell.
 
 ## Gap 3: the credential on macOS
 
@@ -232,5 +242,10 @@ a sandbox quietly holding less than it claims.
 3. **Unix-socket bridges**, and so `--harness pi-local`, which is sealed plus a
    bridge. Docker Desktop and Colima share files over virtiofs or a FUSE
    gateway, and unix sockets generally do not survive that.
-4. **`--services`**, which drives Docker Compose on the host from inside a run.
-   Out of scope for now; it is a second runtime question on macOS.
+4. **Per-run services**, which drive Docker Compose on the host from inside a
+   run. These are opt-out rather than opt-in, so a repo that ships a
+   `sandbox-services.sh` hook gets them on a Mac whether or not anyone planned
+   for it. Their GNU-tool dependencies are fixed, but the path as a whole has
+   not been exercised on macOS — in particular whether the sockets the services
+   publish survive Docker Desktop's filesystem sharing, which is the same
+   open question as the bridges above. `--no-services` turns them off.

@@ -17,9 +17,10 @@
 # Everything above the sandbox is bash, and it uses GNU flags that BSD userland
 # does not have: `realpath -m` (canonicalize a path whose tail need not exist),
 # `realpath -s` (normalize without resolving symlinks), `stat -c` (a format
-# string BSD spells with -f, and differently). On Linux the GNU tool simply IS
-# `realpath`. Under Homebrew on macOS, coreutils installs it as `grealpath` and
-# is keg-only, so the plain name still resolves to BSD's.
+# string BSD spells with -f, and differently), and `timeout`, which macOS does
+# not ship at all. On Linux the GNU tool simply IS `realpath`. Under Homebrew on
+# macOS, coreutils installs it as `grealpath` and is keg-only, so the plain name
+# still resolves to BSD's.
 #
 # Resolving the name once, here, lets every call site keep its GNU flags
 # instead of growing a second BSD spelling that nobody on Linux would ever
@@ -31,6 +32,7 @@
 # at a call site with "illegal option -- m".
 FS_REALPATH="realpath"
 FS_STAT="stat"
+FS_TIMEOUT="timeout"
 
 _fs_resolve_gnu_tool() {
     local name="$1" cand out
@@ -50,18 +52,22 @@ _fs_resolve_gnu_tool() {
 FS_REALPATH="$(_fs_resolve_gnu_tool realpath || echo realpath)"
 # shellcheck disable=SC2034  # written here, read by the sourcing scripts
 FS_STAT="$(_fs_resolve_gnu_tool stat || echo stat)"
+# shellcheck disable=SC2034  # written here, read by the sourcing scripts
+FS_TIMEOUT="$(_fs_resolve_gnu_tool timeout || echo timeout)"
 
 # Say so once, early, in words. Call this from an entry script before anything
 # is created; the failure otherwise lands mid-run as an unknown-option error
 # from a tool the reader has no reason to suspect.
 fs_require_gnu_tools() {
-    local missing=()
-    _fs_resolve_gnu_tool realpath >/dev/null || missing+=(realpath)
-    _fs_resolve_gnu_tool stat >/dev/null || missing+=(stat)
+    local tool missing=()
+    for tool in realpath stat timeout; do
+        _fs_resolve_gnu_tool "$tool" >/dev/null || missing+=("$tool")
+    done
     if (( ${#missing[@]} )); then
         echo "Error: no GNU ${missing[*]} on PATH. These scripts use GNU flags" >&2
-        echo "(realpath -m, stat -c) that the BSD tools of the same name do" >&2
-        echo "not have. On macOS: brew install coreutils" >&2
+        echo "(realpath -m, stat -c) that the BSD tools of the same name do not" >&2
+        echo "have, and timeout, which macOS does not ship at all. All three" >&2
+        echo "come from one package. On macOS: brew install coreutils" >&2
         return 1
     fi
     return 0
