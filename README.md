@@ -35,11 +35,12 @@ rule the world
 It runs **Claude Code**, **pi**, or **codex**, against a hosted API or against
 a model on your own hardware.
 
-> **Linux only today.** The isolation is bubblewrap plus a network namespace,
-> which macOS has no equivalent for. A container backend now implements the
-> same contract and is the intended macOS path, but macOS does not work
-> end-to-end yet — see [Portability](#portability) for exactly what is
-> missing.
+> **Linux by default; macOS through a container.** The default isolation is
+> bubblewrap plus a network namespace, which macOS has no equivalent for. A
+> container backend implements the same contract and is the macOS path: build
+> the sandbox image, set two environment variables, and the same commands work.
+> Two macOS-specific properties are still unverified, and both fail closed —
+> see [Portability](#portability).
 
 ## Why
 
@@ -184,33 +185,57 @@ backend is planned and not built. The contract is written down in
 macOS's own `sandbox-exec` is not a substitute: its network control is
 allow-all-or-nothing, so pinned egress and the sealed bridge cannot be
 expressed with it. Running the sandbox in a Linux container is the realistic
-path to macOS support, which is what `sandbox-backend-container` is for: there
-the runtime's Linux VM supplies the kernel, so the port becomes a second
-backend rather than a translation.
+path, which is what `sandbox-backend-container` is for: there the runtime's
+Linux VM supplies the kernel, so the port becomes a second backend rather than
+a translation.
 
-### What still blocks macOS
+### Running it on macOS
 
-The backend holds the contract — its six guarantees are verified against a
-real Docker daemon, on Linux. Two things stand between that and a working
-macOS run, and both are above the backend rather than in it:
+```bash
+brew install bash coreutils util-linux   # util-linux is keg-only: add its bin to PATH
+./install.sh --check                     # says what is still missing
+./scripts/build-sandbox-image.sh         # the userland the sandbox runs
+export FORK_SANDBOX_BACKEND=container
+export FORK_SANDBOX_CONTAINER_IMAGE=fork-sandbox:latest
+```
 
-- **The callers bind a host binary.** `claude-sandboxed` resolves the agent
-  CLI on the host and mounts it into the sandbox. On Linux that is fine; the
-  binaries are ABI-compatible. On macOS it hands a Mach-O executable to a
-  Linux container, which cannot run it. For macOS the image has to carry the
-  toolchain, and nothing wires that up yet. Until it does, the container
-  backend is usable directly against the contract but not through
-  `fork-sandbox.sh` on a Mac.
-- **The Darwin routing branch is unverified.** It has never executed on a
-  Mac. It fails closed, and
-  `tests/sandbox-backend-container-test.sh` now drives it on any host with
-  stubbed Darwin commands, but the fixture is representative rather than
-  captured. Replacing those stubs with real output from a Mac is the one
-  step that settles it.
+From there the commands are the same as on Linux.
 
-So a macOS contributor is welcome and wanted; a macOS *user* is not served
-yet. Saying otherwise would make this the thing the contract warns about — a
-sandbox that claims a guarantee it does not hold.
+The image is the part worth understanding. bwrap mounts the host's `/usr`, so
+a bwrap sandbox borrows the host's tools; a container's userland is its
+image's. So the agent CLIs, node and git live in the image rather than being
+bound in from the host — which is what makes a Mac possible at all, since a
+Mach-O binary cannot execute in a Linux container. The callers ask the backend
+which case they are in (`--capabilities`, in the contract) rather than testing
+`uname`, because a *Linux* host running the container backend has the same
+problem: the image's `/usr` is not the host's either.
+
+That image holds the agent CLIs and a run hands them your access token, so it
+is a supply-chain surface. There is no registry copy; you build it from
+[images/sandbox/Dockerfile](images/sandbox/Dockerfile), and a repo needing more
+than the base should build its own image `FROM` it.
+
+### What is still unverified on macOS
+
+Two properties have never executed on a Mac. Both fail closed, so the
+consequence is a refused run rather than a sandbox that quietly holds less
+than it claims:
+
+- **The Darwin routing branch**, which builds pinned egress.
+  `tests/sandbox-backend-container-test.sh` drives it on any host with stubbed
+  Darwin commands, but the fixture is representative rather than captured.
+  Replacing those stubs with real `netstat -rn -f inet` and `ifconfig` output
+  from a Mac is the one step that settles it, and the cheapest useful thing a
+  Mac owner can contribute.
+- **Unix-socket bridges**, and so `--harness pi-local`, which is sealed plus a
+  bridge. Docker Desktop and Colima share files over virtiofs or a FUSE
+  gateway, and unix sockets generally do not survive that.
+
+`--services` is Linux-only for now: it drives Docker Compose on the host from
+inside a run, which is a second runtime question on macOS.
+
+[docs/macos-support.md](docs/macos-support.md) has the full design and the
+remaining checklist.
 
 ## What this does not protect you from
 

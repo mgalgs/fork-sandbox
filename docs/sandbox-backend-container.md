@@ -14,9 +14,34 @@ pinned mode and `socat` for bridges. A startup probe checks these requirements.
 
 This differs fundamentally from bwrap. bwrap mounts the host's `/usr`, so its
 toolchain is the host's. A container gets its toolchain from its image. A
-read-only host toolchain bind works on Linux only when its binaries are
-ABI-compatible with the image; macOS Mach-O binaries cannot run in Linux, so
-the image must carry the toolchain there.
+read-only host toolchain bind is not reliable either way: on macOS a Mach-O
+binary cannot run in Linux at all, and on Linux a host binary bound into an
+image finds neither its interpreter nor its shared libraries.
+
+That is a property of the backend, not of the host, so the backend declares it
+rather than leaving callers to infer it:
+
+```
+sandbox-backend-container --capabilities
+toolchain=image
+```
+
+`sandbox-backend-bwrap` answers `toolchain=host`. The callers use the answer to
+decide whether to bind the agent CLI, node and a virtualenv interpreter from
+the host, or to expect the image to carry them. See
+[sandbox-backend.md](sandbox-backend.md).
+
+The image is therefore where the run's userland lives.
+[images/sandbox/Dockerfile](../images/sandbox/Dockerfile) is the one this
+repository ships — Debian, node, git, jq, iproute2, socat, and the three agent
+CLIs — built by `scripts/build-sandbox-image.sh`. It is a base: a repo whose
+suites need a compiler, a database client or a browser should build its own
+image `FROM` it. Any image meeting the requirements above works; nothing in
+the backend knows about that particular one.
+
+It is also a supply-chain surface worth naming as one. It holds the agent CLIs
+and a run hands them the user's credential, which is why there is no published
+copy to pull: you build the thing you trust.
 
 The contract maps directly to bind mounts, runtime environment and hostname
 options. All mounts use `--mount type=bind`, never `-v`, because `-v` creates a
