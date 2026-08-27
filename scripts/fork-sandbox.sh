@@ -12,14 +12,26 @@
 #                        commit also becomes the base the session's work is
 #                        measured against, so a session that commits nothing
 #                        still leaves the repo unchanged.
-# --model <model>:       model for the session (e.g. fable, opus, sonnet).
+# --model <model>:       model or model alias for the session (e.g. fable,
+#                        opus, sonnet, or a name from aliases.conf).
 #                        Required with --harness pi, where it names an
 #                        OpenRouter model such as moonshotai/kimi-k3.
 #                        Optional with --harness pi-local, which asks the
 #                        endpoint what it serves, and with --harness codex,
 #                        which passes it to `codex exec --model`.
-# --harness <name>:      claude (the default), pi, pi-local, or codex. See
-#                        below.
+# --model-unchecked:     send the selected model verbatim, without alias
+#                        resolution or validation. Useful before a new model
+#                        reaches a harness's local cache. Requires a model.
+# --harness <name>[/<model>]:
+#                        claude (the default), pi, pi-local, or codex. A model
+#                        may follow the first slash, so a displayed
+#                        harness/model value can be pasted back in. Claude
+#                        model names are passed to its CLI, which resolves
+#                        opus/sonnet/haiku/fable itself; pi model ids are also
+#                        passed through because neither has a local model list.
+#                        See below.
+# --dry-run:             resolve and print the harness and model, then exit
+#                        without creating a clone, run directory or session.
 # --claude-args "...":   extra arguments passed verbatim to the claude CLI
 # --pi-args "...":       extra arguments passed verbatim to pi, e.g.
 #                        "--thinking low". Only with --harness pi or
@@ -305,8 +317,14 @@ usage() {
 branch=""
 checkout_ref=""
 model=""
+model_option=""
+model_given=false
+model_unchecked=false
 review_model=""
-harness="claude"
+harness_spec="claude"
+harness=""
+combined_model=""
+dry_run=false
 claude_extra_args=""
 pi_extra_args=""
 sandbox_args=""
@@ -326,7 +344,7 @@ while [[ "${1:-}" == -* ]]; do
             shift 2
             ;;
         --harness)
-            harness="${2:?--harness requires claude, pi, pi-local or codex}"
+            harness_spec="${2:?--harness requires claude, pi, pi-local or codex}"
             shift 2
             ;;
         --checkout)
@@ -334,8 +352,17 @@ while [[ "${1:-}" == -* ]]; do
             shift 2
             ;;
         --model)
-            model="${2:?--model requires a value}"
+            model_option="${2:?--model requires a value}"
+            model_given=true
             shift 2
+            ;;
+        --model-unchecked)
+            model_unchecked=true
+            shift
+            ;;
+        --dry-run)
+            dry_run=true
+            shift
             ;;
         --review-model)
             review_model="${2:?--review-model requires a value}"
@@ -396,6 +423,139 @@ done
 
 project_path="${1:?Usage: fork-sandbox.sh [options] <project-path> <handoff-file>}"
 handoff_file="${2:?Usage: fork-sandbox.sh [options] <project-path> <handoff-file>}"
+
+# Split only the harness prefix. pi model ids are commonly provider/model, so
+# splitting every slash (or the last one) would corrupt the model that most
+# needs the combined form.
+if [[ "$harness_spec" == */* ]]; then
+    harness="${harness_spec%%/*}"
+    combined_model="${harness_spec#*/}"
+else
+    harness="$harness_spec"
+fi
+
+case "$harness" in
+    claude|pi|pi-local|codex) ;;
+    *)
+        echo "Error: --harness takes 'claude', 'pi', 'pi-local' or 'codex'," >&2
+        echo "not '$harness'." >&2
+        exit 1
+        ;;
+esac
+
+if [[ -n "$combined_model" && "$model_given" == true ]]; then
+    echo "Error: combined harness model '$combined_model' conflicts with" >&2
+    echo "--model '$model_option'. Drop one of the two model values." >&2
+    exit 1
+fi
+if [[ "$model_unchecked" == true && "$model_given" != true ]]; then
+    echo "Error: --model-unchecked requires --model, since it sends that" >&2
+    echo "value verbatim." >&2
+    exit 1
+fi
+if [[ -n "$combined_model" ]]; then
+    model="$combined_model"
+    model_given=true
+else
+    model="$model_option"
+fi
+
+display_config_path() {
+    local path="$1"
+    if [[ "$path" == "$HOME"/* ]]; then
+        printf '%c/%s' 126 "${path#"$HOME"/}"
+    else
+        printf '%s' "$path"
+    fi
+}
+
+resolve_model() {
+    local aliases_file="$config_dir/aliases.conf"
+    local resolved="" source="" cache_file="" cache_label="" cache_rows=""
+    local -a candidates=() known=()
+
+    [[ "$model_given" == true ]] || return 0
+    if [[ "$model_unchecked" == true ]]; then
+        echo "Warning: sending model '$model' verbatim; alias resolution and" >&2
+        echo "validation were skipped by --model-unchecked." >&2
+        return 0
+    fi
+
+    if [[ -f "$aliases_file" ]]; then
+        resolved="$(awk -v harness="$harness" -v alias="$model" '
+            /^[[:space:]]*($|#)/ { next }
+            $1 == harness && $2 == alias { print $3; exit }
+        ' "$aliases_file")"
+        if [[ -n "$resolved" ]]; then
+            source="$(display_config_path "$aliases_file")"
+            if [[ "$resolved" != "$model" ]]; then
+                echo "fork-sandbox: model '$model' -> '$resolved' ($source)" >&2
+            fi
+            model="$resolved"
+            return 0
+        fi
+    fi
+
+    case "$harness" in
+        claude|pi|pi-local)
+            return 0
+            ;;
+        codex)
+            cache_file="${CODEX_HOME:-$HOME/.codex}/models_cache.json"
+            cache_label="$(display_config_path "$cache_file")"
+            if ! cache_rows="$(jq -er '
+                .models | arrays | .[] |
+                select(.slug | type == "string") |
+                [.slug, (.visibility // "")] | @tsv
+            ' "$cache_file" 2>/dev/null)"; then
+                return 0
+            fi
+            mapfile -t known <<< "$cache_rows"
+
+            mapfile -t candidates < <(printf '%s\n' "${known[@]}" |
+                awk -F '\t' -v name="$model" '$1 == name { print $1 }')
+            if (( ${#candidates[@]} == 0 )); then
+                mapfile -t candidates < <(printf '%s\n' "${known[@]}" |
+                    awk -F '\t' -v suffix="-$model" '
+                        $2 == "list" && substr($1, length($1) - length(suffix) + 1) == suffix { print $1 }
+                    ')
+            fi
+            if (( ${#candidates[@]} == 0 )); then
+                mapfile -t candidates < <(printf '%s\n' "${known[@]}" |
+                    awk -F '\t' -v name="$model" '
+                        $2 == "list" && index($1, name) { print $1 }
+                    ')
+            fi
+            if (( ${#candidates[@]} == 1 )); then
+                resolved="${candidates[0]}"
+                if [[ "$resolved" != "$model" ]]; then
+                    echo "fork-sandbox: model '$model' -> '$resolved' ($cache_label)" >&2
+                fi
+                model="$resolved"
+                return 0
+            fi
+            if (( ${#candidates[@]} > 1 )); then
+                echo "Error: model '$model' is ambiguous for harness codex" >&2
+                echo "($cache_label). Matches:" >&2
+                printf '  %s\n' "${candidates[@]}" >&2
+                return 1
+            fi
+
+            echo "Error: no model matching '$model' for harness codex." >&2
+            echo "Known models ($cache_label):" >&2
+            printf '%s\n' "${known[@]}" | awk -F '\t' '$2 == "list" { printf "  %s\n", $1 }' >&2
+            echo "Pass --model-unchecked to send it anyway." >&2
+            return 1
+            ;;
+    esac
+}
+
+resolve_model || exit 1
+
+if [[ "$dry_run" == true ]]; then
+    printf 'harness=%s\nmodel=%s\n' "$harness" "$model"
+    exit 0
+fi
 
 if [[ ! -d "$project_path" ]]; then
     echo "Error: project path '$project_path' is not a directory" >&2
@@ -530,15 +690,6 @@ if (( review_loop_cap > 0 )) && [[ ! -d "$review_skill_src" ]]; then
     echo "is not there. Run install.sh in the fork-sandbox repo." >&2
     exit 1
 fi
-
-case "$harness" in
-    claude|pi|pi-local|codex) ;;
-    *)
-        echo "Error: --harness takes 'claude', 'pi', 'pi-local' or 'codex'," >&2
-        echo "not '$harness'." >&2
-        exit 1
-        ;;
-esac
 
 fs_require_sandbox_wrapper
 
