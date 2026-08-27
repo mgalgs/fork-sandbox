@@ -276,5 +276,13 @@ else
     "$CLI" start --attach --interactive "$CONTAINER" || true
 fi
 started="$("$CLI" inspect -f '{{.State.StartedAt}}' "$CONTAINER")"; [[ "$started" != '0001-01-01T00:00:00Z' ]] || { echo "Error: container never started; no command exit code exists." >&2; exit 1; }
-exit_code="$("$CLI" inspect -f '{{.State.ExitCode}}' "$CONTAINER")"
+# docker wait blocks until the container actually stops and prints its exit
+# status; by construction the container has already stopped by this line, so
+# this returns immediately. `docker inspect .State.ExitCode` was used here
+# before, but it reports 0 for a container that is STILL RUNNING, so any path
+# where attach returned early or failed silently — the `|| true` above
+# guarantees that is possible — would report success for a run that never
+# finished. `docker wait`'s status is authoritative; the loose `|| true` on
+# attach can no longer forge a passing exit code.
+exit_code="$("$CLI" wait "$CONTAINER")"
 exit "$exit_code"
