@@ -14,10 +14,15 @@ refuses() {
     out="$("$@" 2>&1)"; rc=$?
     if (( rc != 0 )) && [[ "$out" == *"$needle"* ]]; then ok "$label"; else no "$label" "status $rc: $out"; fi
 }
-newdir() { local d; d="$(mktemp -d)"; tmpdirs+=("$d"); printf '%s' "$d"; }
+# mktemp -d only; registration is the caller's job. A helper that both prints
+# a path for capture (`x="$(newdir)"`) and appends to tmpdirs internally
+# would do that append inside the command-substitution subshell, where it
+# never reaches the parent shell's array -- silently defeating the very
+# cleanup it looks like it provides.
+newdir() { mktemp -d; }
 
 printf '== validation (no runtime required) ==\n'
-w="$(newdir)"; image=x
+w="$(newdir)"; tmpdirs+=("$w"); image=x
 refuses "requires workdir" workdir "$backend" --net sealed --image "$image" -- true
 refuses "requires network mode" net "$backend" --workdir "$w" --image "$image" -- true
 refuses "validates network mode" bogus "$backend" --workdir "$w" --net bogus --image "$image" -- true
@@ -36,7 +41,7 @@ comma_dir="$(newdir),comma"; mv "${comma_dir%,comma}" "$comma_dir"; tmpdirs+=("$
 refuses "rejects comma in mount path" comma "$backend" --workdir "$comma_dir" --net sealed --image "$image" -- true
 
 # A live unix socket is needed to reach port and duplicate-port validation.
-sockdir="$(newdir)"; sock="$sockdir/service.sock"
+sockdir="$(newdir)"; tmpdirs+=("$sockdir"); sock="$sockdir/service.sock"
 python3 - "$sock" <<'PY' &
 import socket, sys, time
 s = socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.listen(); time.sleep(30)
@@ -63,7 +68,7 @@ else
         printf '  SKIP  test image build failed (the machine may be offline)\n'
     else
         run() { FORK_SANDBOX_CONTAINER_CLI="$runtime" "$backend" --image "$image" "$@"; }
-        rw="$(newdir)"; ro="$(newdir)"; printf 'readable\n' >"$ro/file"
+        rw="$(newdir)"; tmpdirs+=("$rw"); ro="$(newdir)"; tmpdirs+=("$ro"); printf 'readable\n' >"$ro/file"
         # shellcheck disable=SC2016  # expanded by bash inside the container
         out="$(run --workdir "$rw" --net sealed -- bash -c 'printf "%s|" "$HOME"; find "$HOME" -mindepth 1 -print -quit')"
         check "HOME path and emptiness" "$HOME|" "$out"
