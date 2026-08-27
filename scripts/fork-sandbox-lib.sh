@@ -98,9 +98,40 @@ fs_warn_if_dirty() {
 # namespace — a fetched pull request head, say — has no name here. The object
 # is still readable through the alternates, so a sha resolves.
 fs_make_clone() {
-    local repo="$1" branch="$2" dest="$3" start_sha="${4:-}"
+    local repo="$1" branch="$2" dest="$3" start_sha="${4:-}" key value
     git clone --shared --quiet "$repo" "$dest" || return 1
     (cd "$dest" && git checkout --quiet -b "$branch" ${start_sha:+"$start_sha"}) || return 1
+    # Carry the origin's identity across. git clone copies no repo-local
+    # config, so a repo whose user.email is a local override — a work address
+    # on a machine whose ~/.gitconfig holds a personal one — leaves the clone
+    # with no identity of its own, and every commit the sandbox makes is
+    # authored by the global address fs_gitconfig_bind mounts inside. Nothing
+    # downstream catches that: integration re-creates the commits on the host,
+    # and cherry-pick and rebase deliberately KEEP the author while making a
+    # new committer, so the wrong name survives all the way in. Signing does
+    # self-heal that way; authorship does not.
+    #
+    # --get reads the value git would actually use, so this is right whether
+    # the override is repo-local, per-worktree, or an includeIf conditional
+    # include — reading --global, or a config file by hand, would miss exactly
+    # the case this fixes. It lands in the clone's own repo-local config,
+    # which outranks the global copy bound at $HOME/.gitconfig inside. Name
+    # and address only: signing keys stay out, because the sandbox holds no
+    # ssh key to sign with and fs_gitconfig_bind switches signing off for
+    # that reason. A repo with no override seeds the value the global copy
+    # already carries, and a machine with no identity configured seeds
+    # nothing — both silent, both no-ops.
+    #
+    # Running git in the clone is safe HERE, though the fork-sandbox and
+    # sandbox-coder-mode skills tell callers never to do it: that rule guards
+    # against a clone the sandbox has written, which can carry a
+    # core.fsmonitor that then executes on the host. This is creation time.
+    # The sandbox has not started, and the config is still only ours.
+    for key in user.name user.email; do
+        value="$( (cd "$repo" && git config --get "$key") 2>/dev/null || true )"
+        [[ -n "$value" ]] || continue
+        (cd "$dest" && git config "$key" "$value") || true
+    done
     return 0
 }
 
