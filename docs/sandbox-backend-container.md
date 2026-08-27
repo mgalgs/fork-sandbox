@@ -118,11 +118,17 @@ command without consuming stdin.
 
 ## Exit status and cleanup
 
-The backend uses create, attached start, and inspect rather than `docker run`.
-Runtime statuses 125–127 otherwise collide with real command statuses. Inspect
-provides the authoritative command exit code; a container that never starts is
-reported as a backend failure. `--init` is mandatory so signals reach the
-command rather than being ignored by a command running as PID 1.
+The backend uses create, attached start, and `docker wait` rather than
+`docker run`. Runtime statuses 125–127 otherwise collide with real command
+statuses. `docker inspect .State.StartedAt` first confirms the container ever
+started, since a container that never did has no command exit code and is
+reported as a backend failure; `docker wait` then blocks until the container
+stops and provides the authoritative command exit code. An earlier version
+used `docker inspect .State.ExitCode` for that second step, but inspect
+reports 0 for a container that is still running, so any path where attach
+returned early or failed silently would have reported success for a run that
+never finished. `--init` is mandatory so signals reach the command rather
+than being ignored by a command running as PID 1.
 
 An EXIT trap removes the target container, its per-run network, and its state
 directory, in that order. A per-work-directory `flock` prevents overlapping

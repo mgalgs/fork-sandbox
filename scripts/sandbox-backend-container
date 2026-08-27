@@ -23,7 +23,7 @@
 # is a TCP connect, which the relay satisfies as soon as it binds, whether or
 # not its target unix socket has anything listening. A dead peer surfaces
 # only on the first real connection attempt, not at startup. -- ends options;
-# the remaining argv and its authoritative inspected exit status are the
+# the remaining argv and its authoritative `docker wait` exit status are the
 # command and backend status.
 #
 # The image supplies the sandbox toolchain, unlike bwrap, which mounts host
