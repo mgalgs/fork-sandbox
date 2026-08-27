@@ -266,7 +266,13 @@ if [[ "$NET_MODE" == sealed ]]; then NET_ARGS=(--network none); else NETWORK="fo
 ENV_ARGS=()
 for kv in "${COMMAND_ENV[@]}"; do ENV_ARGS+=(--env "$kv"); done
 TTY=(); [[ -t 0 && -t 1 ]] && TTY=(-t)
-CREATE_ARGS=(create --label "fork-sandbox-run=$RUN_ID" --init --user "$uid_n:$gid_n" --cap-drop=ALL --security-opt no-new-privileges --tmpfs /tmp --tmpfs "$HOME" -i "${TTY[@]}" "${NET_ARGS[@]}" "${MOUNTS[@]}" "${ENV_ARGS[@]}" --workdir "$WORK_DIR" --entrypoint /bin/bash)
+# Docker's --tmpfs default options include noexec, which bwrap's equivalent
+# scratch does not apply — a silent divergence from the reference backend
+# that breaks a helper script written to /tmp and run, or a `pip install
+# --user`/`npm i -g` into a $HOME prefix, with a bare "Permission denied"
+# that points nowhere near the mount. Pass the rest of Docker's default set
+# explicitly, restoring only exec, for parity with bwrap.
+CREATE_ARGS=(create --label "fork-sandbox-run=$RUN_ID" --init --user "$uid_n:$gid_n" --cap-drop=ALL --security-opt no-new-privileges --tmpfs "/tmp:rw,nosuid,nodev,exec" --tmpfs "$HOME:rw,nosuid,nodev,exec" -i "${TTY[@]}" "${NET_ARGS[@]}" "${MOUNTS[@]}" "${ENV_ARGS[@]}" --workdir "$WORK_DIR" --entrypoint /bin/bash)
 [[ -z "$HOSTNAME_ARG" ]] || CREATE_ARGS+=(--hostname "$HOSTNAME_ARG")
 CONTAINER="$("$CLI" "${CREATE_ARGS[@]}" "$IMAGE" /fork-sandbox-bootstrap "$@")" || { echo "Error: container create failed; command did not start." >&2; exit 1; }
 

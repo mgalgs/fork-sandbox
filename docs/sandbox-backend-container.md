@@ -20,7 +20,10 @@ the image must carry the toolchain there.
 
 The contract maps directly to bind mounts, runtime environment and hostname
 options. All mounts use `--mount type=bind`, never `-v`, because `-v` creates a
-missing source as a root-owned host directory. `$HOME` and `/tmp` are tmpfs.
+missing source as a root-owned host directory. `$HOME` and `/tmp` are tmpfs,
+mounted `rw,nosuid,nodev,exec` — Docker's `--tmpfs` default set includes
+`noexec`, which would silently diverge from bwrap's equivalent scratch space,
+so `exec` is requested explicitly. Neither tmpfs has a size cap.
 The container runs as the host UID/GID, with all capabilities dropped,
 no-new-privileges, Docker's default seccomp profile, and an init process.
 A synthesized passwd/group entry makes the otherwise unknown host UID usable.
