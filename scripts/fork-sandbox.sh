@@ -516,11 +516,19 @@ resolve_model() {
         codex)
             cache_file="${CODEX_HOME:-$HOME/.codex}/models_cache.json"
             cache_label="$(display_config_path "$cache_file")"
+            # No readable cache means there is nothing to validate against,
+            # so the value goes through unresolved. Say so: this is the same
+            # outcome --model-unchecked asks for, and that flag announces
+            # itself. Staying quiet here would let a typo survive the one
+            # check meant to catch it before anything is cloned.
             if ! cache_rows="$(jq -er '
                 .models | arrays | .[] |
                 select(.slug | type == "string") |
                 [.slug, (.visibility // "")] | @tsv
             ' "$cache_file" 2>/dev/null)"; then
+                echo "Warning: no readable model cache at $cache_label, so" >&2
+                echo "'$current' could not be checked and is being sent" >&2
+                echo "verbatim. Run codex once to populate the cache." >&2
                 return 0
             fi
             mapfile -t known <<< "$cache_rows"
