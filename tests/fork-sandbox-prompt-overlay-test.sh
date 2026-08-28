@@ -89,7 +89,7 @@ out="$(dry "$config" --harness claude 2>/dev/null)"
 check "default directory is \$config_dir/prompts" \
     "$config/prompts" "$(printf '%s\n' "$out" | sed -n 's/^prompt_overlay_dir=//p')"
 check "default directory being absent leaves fragments empty" \
-    "" "$(printf '%s\n' "$out" | sed -n 's/^prompt_overlay_fragments=//p')"
+    "" "$(printf '%s\n' "$out" | sed -n 's/^prompt_overlay_fragments\[implement\]=//p')"
 err="$(dry "$config" --harness claude 2>&1 >/dev/null)"
 check "an absent default directory is completely silent" "" "$err"
 
@@ -147,17 +147,17 @@ printf 'model\n' > "$pdir/model/some-model.md"
 out="$(dry "$config" --harness claude --model some-model --prompts-dir "$pdir" 2>/dev/null)"
 check "all three fragments compose, general first, model last" \
     "all.md,harness/claude.md,model/some-model.md" \
-    "$(printf '%s\n' "$out" | sed -n 's/^prompt_overlay_fragments=//p')"
+    "$(printf '%s\n' "$out" | sed -n 's/^prompt_overlay_fragments\[implement\]=//p')"
 
 rm "$pdir/harness/claude.md"
 out="$(dry "$config" --harness claude --model some-model --prompts-dir "$pdir" 2>/dev/null)"
 check "a missing middle fragment is skipped, not fatal" \
     "all.md,model/some-model.md" \
-    "$(printf '%s\n' "$out" | sed -n 's/^prompt_overlay_fragments=//p')"
+    "$(printf '%s\n' "$out" | sed -n 's/^prompt_overlay_fragments\[implement\]=//p')"
 
 out="$(dry "$config" --harness codex --prompts-dir "$pdir" 2>/dev/null)"
 check "no model given: only harness-independent fragments match" \
-    "all.md" "$(printf '%s\n' "$out" | sed -n 's/^prompt_overlay_fragments=//p')"
+    "all.md" "$(printf '%s\n' "$out" | sed -n 's/^prompt_overlay_fragments\[implement\]=//p')"
 
 printf '\n== --dry-run: model id sanitisation ==\n'
 
@@ -165,14 +165,14 @@ mkdir -p "$pdir/model"
 printf 'sanitised\n' > "$pdir/model/openai_gpt-4o.md"
 out="$(dry "$config" --harness claude --model openai/gpt-4o --prompts-dir "$pdir" 2>/dev/null)"
 contains "a model id's slash becomes an underscore in the file name" \
-    "model/openai_gpt-4o.md" "$(printf '%s\n' "$out" | sed -n 's/^prompt_overlay_fragments=//p')"
+    "model/openai_gpt-4o.md" "$(printf '%s\n' "$out" | sed -n 's/^prompt_overlay_fragments\[implement\]=//p')"
 
 # A model id built entirely of slashes sanitises to a name with no separator
 # left in it at all -- proof the directory cannot be escaped by way of the
 # model id, whatever it contains.
 out="$(dry "$config" --harness claude --model '../../etc/passwd' --prompts-dir "$pdir" 2>/dev/null)"
 check "a path-shaped model id cannot escape the directory" \
-    "all.md" "$(printf '%s\n' "$out" | sed -n 's/^prompt_overlay_fragments=//p')"
+    "all.md" "$(printf '%s\n' "$out" | sed -n 's/^prompt_overlay_fragments\[implement\]=//p')"
 
 printf '\n== --dry-run: git provenance ==\n'
 
@@ -355,17 +355,91 @@ if [[ -n "$rd2" ]]; then
             "$pdir2" "$(jq -r '.dir' "$rd2/prompt-overlay.json")"
         check "prompt-overlay.json lists fragments in composition order" \
             '["all.md","model/vendor_model-y.md"]' \
-            "$(jq -c '.fragments' "$rd2/prompt-overlay.json")"
+            "$(jq -c '.legs.implement.fragments' "$rd2/prompt-overlay.json")"
         check "prompt-overlay.json's rev is null for a non-git directory" \
             "null" "$(jq -c '.rev' "$rd2/prompt-overlay.json")"
         want_sha="$(cat "$pdir2/all.md" "$pdir2/model/vendor_model-y.md" | sha256sum | cut -d' ' -f1)"
         check "prompt-overlay.json's sha256 matches the concatenated fragments" \
-            "$want_sha" "$(jq -r '.sha256' "$rd2/prompt-overlay.json")"
+            "$want_sha" "$(jq -r '.legs.implement.sha256' "$rd2/prompt-overlay.json")"
+        check "prompt-overlay.json has no review or fix leg without --review-loop" \
+            "[null,null]" "$(jq -c '[.legs.review, .legs.fix]' "$rd2/prompt-overlay.json")"
     else
         no "prompt-overlay.json is written when an overlay applies"
     fi
 else
     no "run_real produced a run directory for the configured-overlay case" \
+        "run_real failed"
+fi
+
+printf '\n== --review-loop: per-leg fragments ==\n'
+
+# -- root-level fragments reach every leg; leg-scoped fragments reach only
+# their own leg -- the whole point of the per-leg layer.
+pdir3="$(mktemp -d)"
+tmpdirs+=("$pdir3")
+mkdir -p "$pdir3/review" "$pdir3/fix"
+printf 'ROOT FRAGMENT\n' > "$pdir3/all.md"
+printf 'REVIEW ONLY FRAGMENT\n' > "$pdir3/review/all.md"
+printf 'FIX ONLY FRAGMENT\n' > "$pdir3/fix/all.md"
+config3="$(new_empty_config)"; tmpdirs+=("$config3")
+rd3="$(run_real "$proj" "$config3" "$handoff" --review-loop 1 --prompts-dir "$pdir3")"
+[[ -n "$rd3" ]] && tmpdirs+=("$rd3")
+if [[ -n "$rd3" ]]; then
+    implement_content="$(cat "$rd3/handoff.md")"
+    review_content="$(cat "$rd3/review-prompt.md" 2>/dev/null)"
+    fix_content="$(cat "$rd3/fix-prompt-header.md" 2>/dev/null)"
+
+    contains "root-level fragment reaches the implement prompt" \
+        "ROOT FRAGMENT" "$implement_content"
+    contains "root-level fragment reaches the review prompt" \
+        "ROOT FRAGMENT" "$review_content"
+    contains "root-level fragment reaches the fix prompt" \
+        "ROOT FRAGMENT" "$fix_content"
+
+    contains "a review/ fragment reaches the review prompt" \
+        "REVIEW ONLY FRAGMENT" "$review_content"
+    case "$implement_content" in
+        *"REVIEW ONLY FRAGMENT"*)
+            no "a review/ fragment does NOT reach the implement prompt" ;;
+        *)
+            ok "a review/ fragment does NOT reach the implement prompt" ;;
+    esac
+    case "$fix_content" in
+        *"REVIEW ONLY FRAGMENT"*)
+            no "a review/ fragment does NOT reach the fix prompt" ;;
+        *)
+            ok "a review/ fragment does NOT reach the fix prompt" ;;
+    esac
+
+    contains "a fix/ fragment reaches the fix prompt" \
+        "FIX ONLY FRAGMENT" "$fix_content"
+    case "$implement_content" in
+        *"FIX ONLY FRAGMENT"*)
+            no "a fix/ fragment does NOT reach the implement prompt" ;;
+        *)
+            ok "a fix/ fragment does NOT reach the implement prompt" ;;
+    esac
+    case "$review_content" in
+        *"FIX ONLY FRAGMENT"*)
+            no "a fix/ fragment does NOT reach the review prompt" ;;
+        *)
+            ok "a fix/ fragment does NOT reach the review prompt" ;;
+    esac
+
+    if [[ -f "$rd3/prompt-overlay.json" ]]; then
+        check "prompt-overlay.json's implement leg holds only the root fragment" \
+            '["all.md"]' "$(jq -c '.legs.implement.fragments' "$rd3/prompt-overlay.json")"
+        check "prompt-overlay.json's review leg holds root then review/all.md" \
+            '["all.md","review/all.md"]' \
+            "$(jq -c '.legs.review.fragments' "$rd3/prompt-overlay.json")"
+        check "prompt-overlay.json's fix leg holds root then fix/all.md" \
+            '["all.md","fix/all.md"]' \
+            "$(jq -c '.legs.fix.fragments' "$rd3/prompt-overlay.json")"
+    else
+        no "prompt-overlay.json is written for a --review-loop run with an overlay"
+    fi
+else
+    no "run_real produced a run directory for the --review-loop overlay case" \
         "run_real failed"
 fi
 
@@ -380,9 +454,9 @@ if [[ -n "$rd2" && -x "$run_log" ]]; then
         rec="$(HOME="$fakehome" "$run_log" show "$(basename "$rd2")")"
         check "the record carries prompt_overlay.dir" \
             "$pdir2" "$(printf '%s' "$rec" | jq -r '.prompt_overlay.dir')"
-        check "the record carries prompt_overlay.fragments" \
+        check "the record carries prompt_overlay.legs.implement.fragments" \
             '["all.md","model/vendor_model-y.md"]' \
-            "$(printf '%s' "$rec" | jq -c '.prompt_overlay.fragments')"
+            "$(printf '%s' "$rec" | jq -c '.prompt_overlay.legs.implement.fragments')"
         stats_out="$(HOME="$fakehome" "$run_log" stats --by prompt_overlay.rev 2>&1)"
         contains "stats --by prompt_overlay.rev groups on it" \
             "PROMPT_OVERLAY.REV" "$stats_out"
@@ -395,6 +469,21 @@ if [[ -n "$rd2" && -x "$run_log" ]]; then
         rec="$(HOME="$fakehome" "$run_log" show "$(basename "$rd")")"
         check "a run with no overlay carries no prompt_overlay key" \
             "null" "$(printf '%s' "$rec" | jq -c '.prompt_overlay // null')"
+    fi
+
+    if [[ -n "$rd3" ]]; then
+        if HOME="$fakehome" "$run_log" record --run-dir "$rd3" >/dev/null 2>&1; then
+            ok "sandbox-run-log.py record accepts a --review-loop run with a prompt overlay"
+            rec="$(HOME="$fakehome" "$run_log" show "$(basename "$rd3")")"
+            check "the record's review leg round-trips its fragments" \
+                '["all.md","review/all.md"]' \
+                "$(printf '%s' "$rec" | jq -c '.prompt_overlay.legs.review.fragments')"
+            check "the record's fix leg round-trips its fragments" \
+                '["all.md","fix/all.md"]' \
+                "$(printf '%s' "$rec" | jq -c '.prompt_overlay.legs.fix.fragments')"
+        else
+            no "sandbox-run-log.py record accepts a --review-loop run with a prompt overlay"
+        fi
     fi
 else
     no "sandbox-run-log.py record accepts a run with a prompt overlay" \
