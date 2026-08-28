@@ -209,7 +209,7 @@ check "reads the text from stdin with '-'" "from stdin" "$(cat "$f")"
 run_dir="$(new_run_dir pi)"
 out="$("$say" "$run_dir" 'switch to the other approach' 2>&1)"
 case "$out" in
-    *"next commit"*) ok "reports pi delivery timing" ;;
+    *"within ~25 tool calls"*) ok "reports pi delivery timing" ;;
     *) no "reports pi delivery timing" "$out" ;;
 esac
 

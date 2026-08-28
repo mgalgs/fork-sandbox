@@ -320,6 +320,50 @@ else
     no "no prompts directory: no prompt-overlay.json is written" "run_real failed"
 fi
 
+printf '\n== real runs: hookless harness (pi-local) prompt ==\n'
+
+# The claude-sandboxed stub above proves the every-harness-shared text. This
+# proves the hookless arm specifically renders: the tool-call-floor contract
+# is present, and the claude-only "pushed to you automatically" language is
+# not. --harness pi-local additionally needs agent-sandboxed on PATH (stubbed
+# the same way as claude-sandboxed above), a model.env, and a real `pi`
+# resolvable on the host (fs_resolve_pi requires one under a host toolchain).
+# That last one is environment-dependent, so this SKIPs rather than fails on
+# a machine without pi.
+if ! command -v pi >/dev/null 2>&1; then
+    printf '  SKIP  pi is not on PATH -- cannot exercise --harness pi-local\n'
+else
+    cat > "$stub_bin/agent-sandboxed" <<'STUB'
+#!/usr/bin/env bash
+cat >/dev/null
+exit 0
+STUB
+    chmod +x "$stub_bin/agent-sandboxed"
+
+    pi_config="$(new_empty_config)"; tmpdirs+=("$pi_config")
+    printf 'MODEL_ENDPOINT=http://127.0.0.1:1/v1\n' > "$pi_config/model.env"
+
+    pi_out="$(PATH="$stub_bin:$PATH" FORK_SANDBOX_CONFIG_DIR="$pi_config" \
+        timeout 60 "$launcher" --foreground --harness pi-local "$proj" "$handoff" 2>&1)"
+    pi_rc=$?
+    pi_rd="$(printf '%s\n' "$pi_out" | sed -n 's/^  run dir:  *//p' | head -1)"
+    if (( pi_rc == 0 )) && [[ -n "$pi_rd" ]]; then
+        tmpdirs+=("$pi_rd")
+        pi_content="$(cat "$pi_rd/handoff.md")"
+        contains "pi-local prompt carries the tool-call floor" \
+            "at least once every 25 tool calls" "$pi_content"
+        case "$pi_content" in
+            *"pushed to you automatically"*)
+                no "pi-local prompt omits the claude-only push language" "$pi_content" ;;
+            *)
+                ok "pi-local prompt omits the claude-only push language" ;;
+        esac
+    else
+        no "hookless harness (pi-local) renders a prompt" \
+            "run failed (rc=$pi_rc): $pi_out"
+    fi
+fi
+
 # -- configured overlay: the fragment text actually lands in the prompt --
 pdir2="$(mktemp -d)"
 tmpdirs+=("$pdir2")
