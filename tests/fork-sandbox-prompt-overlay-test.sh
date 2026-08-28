@@ -470,6 +470,22 @@ if [[ -n "$rd3" ]]; then
             ok "a fix/ fragment does NOT reach the review prompt" ;;
     esac
 
+    # -- the operator-addendum mandate: reviewer must report an unfollowed
+    # addendum as a finding, and the fix leg must carry it out rather than
+    # weigh it like an ordinary finding.
+    contains "review prompt carries the addendum-finding mandate" \
+        "If an addendum asks for work that the" \
+        "$review_content"
+    contains "review prompt tells the reviewer not to approve over it" \
+        "branch that leaves an operator instruction unfollowed" \
+        "$review_content"
+    contains "fix header carries the addendum carve-out" \
+        "same escape hatch above" \
+        "$fix_content"
+    contains "fix header says the addendum finding is carried out, not weighed" \
+        "except one that quotes an addendum, which is: weigh the rest, carry that" \
+        "$fix_content"
+
     if [[ -f "$rd3/prompt-overlay.json" ]]; then
         check "prompt-overlay.json's implement leg holds only the root fragment" \
             '["all.md"]' "$(jq -c '.legs.implement.fragments' "$rd3/prompt-overlay.json")"
