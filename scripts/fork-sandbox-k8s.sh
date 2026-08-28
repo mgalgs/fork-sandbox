@@ -3,9 +3,9 @@
 #
 # Usage: fork-sandbox-k8s.sh install [--dry-run]
 #        fork-sandbox-k8s.sh submit [--dry-run] --branch NAME --model MODEL
-#                            <project-path> <handoff-file>
+#                            [--review-loop N] <project-path> <handoff-file>
 #        fork-sandbox-k8s.sh run [--dry-run] [--timeout SECONDS] [--keep]
-#                            --branch NAME --model MODEL
+#                            --branch NAME --model MODEL [--review-loop N]
 #                            <project-path> <handoff-file>
 #        fork-sandbox-k8s.sh fetch --branch NAME <project-path>
 #        fork-sandbox-k8s.sh say --branch NAME <text>
@@ -71,6 +71,21 @@
 #
 # --keep (run): skip the final rm, leaving the Job and pod in place after a
 # successful fetch.
+#
+# --review-loop N (submit, run): after the coding leg, run a fresh review
+# session against the branch and, on findings, a fresh fix session, up to N
+# times -- the cluster analogue of fork-sandbox.sh's own --review-loop. The
+# loop runs POD-SIDE, in fork-sandbox-k8s-review-loop.sh, shipped in the
+# same per-run ConfigMap as the entrypoint; the review and fix prompts
+# themselves are rendered HOST-SIDE, by fs_emit_review_prompt_body /
+# fs_emit_fix_prompt_body in fork-sandbox-lib.sh -- the same functions the
+# local loop uses -- and shipped in alongside handoff.md, never composed a
+# second time inside the pod. The outcome lands in the pod at
+# /work/review-loop.json; `run` reads it back and prints a summary before
+# fetching (see cmd_run below), because the container's own exit code stays
+# the CODING leg's regardless of how the loop ended -- see
+# fork-sandbox-k8s-entrypoint.sh's comment on .run-complete for why. See
+# docs/kubernetes-runs.md for the full design.
 #
 # Cluster-specific settings are never taken from this repo -- a public repo
 # must not carry a private hostname, a real cluster name or a registry
@@ -337,6 +352,48 @@ k8s_safe_name() {
     printf '%s-%s' "$prefix" "$safe" | cut -c1-63 | sed 's/-$//'
 }
 
+# Renders the four --review-loop-only ConfigMap keys: the review and fix
+# prompts, the flattened review skill, and the loop script itself. The
+# prompts are composed the same way handoff.md itself is -- preamble, then
+# body -- except with NO overlay in between: --prompts-dir is refused on
+# this path (see fork-sandbox.sh's --k8s flag refusals), so there is no
+# overlay to layer on. The body text comes from fs_emit_review_prompt_body /
+# fs_emit_fix_prompt_body in fork-sandbox-lib.sh, the exact functions
+# fork-sandbox.sh's own local --review-loop uses -- this function renders
+# no prompt prose of its own, only concatenates what those functions emit.
+# Indented 2 spaces to sit beside handoff.md as ConfigMap data keys.
+render_review_loop_configmap_keys() {
+    local pod_clone_dir="$1" pod_inbox_dir="$2" pod_skill_dir="$3" pod_verdict_file="$4"
+    local branch="$5" base_sha="$6" review_skill_src="$7" review_loop_sh="$8"
+    cat <<KEYS
+  review-prompt.md: |
+$({ fs_emit_prompt_preamble "$pod_clone_dir" "$pod_inbox_dir" pi gated pod
+   fs_emit_review_prompt_body "$branch" "$base_sha" "$pod_skill_dir" \
+       "$pod_verdict_file" "$pod_inbox_dir"; } | indent_block)
+  fix-prompt-header.md: |
+$({ fs_emit_prompt_preamble "$pod_clone_dir" "$pod_inbox_dir" pi gated pod
+   fs_emit_fix_prompt_body "$branch" "$base_sha"; } | indent_block)
+  code-review-portable-skill.md: |
+$(indent_block < "$review_skill_src")
+  review-loop.sh: |
+$(indent_block < "$review_loop_sh")
+KEYS
+}
+
+# The two --review-loop-only env vars the agent container needs --
+# REVIEW_LOOP_CAP (so the entrypoint knows to run the loop) and BASE_SHA
+# (the commit review-loop.sh measures the branch against). Indented to
+# match the other env entries in the rendered Job spec.
+render_review_loop_env() {
+    local cap="$1" base_sha="$2"
+    cat <<ENV
+            - name: REVIEW_LOOP_CAP
+              value: "$cap"
+            - name: BASE_SHA
+              value: "$base_sha"
+ENV
+}
+
 cmd_install() {
     local dry_run=false
     while (( $# )); do
@@ -419,12 +476,13 @@ cmd_install() {
 }
 
 cmd_submit() {
-    local dry_run=false branch="" model=""
+    local dry_run=false branch="" model="" review_loop_cap=""
     while (( $# )); do
         case "$1" in
             --dry-run) dry_run=true; shift ;;
             --branch) branch="${2:?--branch requires a name}"; shift 2 ;;
             --model) model="${2:?--model requires an OpenRouter model id}"; shift 2 ;;
+            --review-loop) review_loop_cap="${2:?--review-loop requires a positive integer}"; shift 2 ;;
             -*) echo "Error: unknown option '$1' for submit." >&2; exit 1 ;;
             *) break ;;
         esac
@@ -437,6 +495,19 @@ cmd_submit() {
     branch="${branch:-k8s-$(date +%Y%m%d-%H%M%S)}"
     fs_reject_unsafe_chars "$branch" "$model" || exit 1
 
+    # --review-loop takes a positive integer, the same shape and the same
+    # message fork-sandbox.sh's own local flag uses, so a bad value reads
+    # the same regardless of which path a caller is on. review_loop_cap
+    # starts empty (flag not given) rather than "0", so that "--review-loop
+    # 0" -- a real value, not the same thing as omitting the flag -- is
+    # caught here instead of silently collapsing into "no loop".
+    if [[ -n "$review_loop_cap" && ! "$review_loop_cap" =~ ^[1-9][0-9]*$ ]]; then
+        echo "Error: --review-loop takes a positive integer — the maximum" >&2
+        echo "number of review-then-fix iterations — not '$review_loop_cap'." >&2
+        exit 1
+    fi
+    review_loop_cap="${review_loop_cap:-0}"
+
     if [[ ! -d "$project_path" ]]; then
         echo "Error: project path '$project_path' is not a directory." >&2
         exit 1
@@ -444,6 +515,33 @@ cmd_submit() {
     local origin_repo
     origin_repo="$(fs_repo_toplevel "$project_path")" || exit 1
     fs_check_branch_free "$origin_repo" "$branch" || exit 1
+
+    # base_sha, the review skill and the loop script itself are only needed
+    # under --review-loop, but resolved here, before anything is created,
+    # so a missing one fails now rather than after the pod is up.
+    local base_sha="" review_skill_src="" review_loop_sh="$script_dir/fork-sandbox-k8s-review-loop.sh"
+    if (( review_loop_cap > 0 )); then
+        # submit pushes this repo's current HEAD as the branch's starting
+        # point (see the push below), so that HEAD is the base the review
+        # leg's commit range is measured from.
+        if ! base_sha="$(cd "$origin_repo" && git rev-parse HEAD 2>/dev/null)"; then
+            echo "Error: could not read HEAD in $origin_repo. --review-loop" >&2
+            echo "needs the commit the branch is measured against, and submit" >&2
+            echo "pushes this repo's current HEAD as that base." >&2
+            exit 1
+        fi
+
+        # The review leg's method. Read from this repo's own skills/, never
+        # from ~/.claude/skills/ -- that path is a symlink into this repo on
+        # a machine that has run install.sh, and would not exist elsewhere.
+        review_skill_src="$(dirname "$script_dir")/skills/code-review-portable/SKILL.md"
+        if [[ ! -f "$review_skill_src" ]]; then
+            echo "Error: --review-loop needs the code-review-portable skill, which" >&2
+            echo "is the review leg's method, and $review_skill_src" >&2
+            echo "is not there. Run this from a fork-sandbox checkout." >&2
+            exit 1
+        fi
+    fi
 
     if [[ ! -f "$handoff_file" ]]; then
         echo "Error: handoff file '$handoff_file' not found." >&2
@@ -485,14 +583,31 @@ cmd_submit() {
     local entrypoint_sh="$script_dir/fork-sandbox-k8s-entrypoint.sh"
     local gate_sh="$script_dir/fork-sandbox-k8s-egress-gate.sh"
     local inbox_write_sh="$script_dir/fork-sandbox-k8s-inbox-write.sh"
-    for f in "$entrypoint_sh" "$gate_sh" "$inbox_write_sh"; do
+    for f in "$entrypoint_sh" "$gate_sh" "$inbox_write_sh" "$review_loop_sh"; do
         [[ -x "$f" ]] || { echo "Error: $f is missing or not executable." >&2; exit 1; }
     done
 
     # Must track fork-sandbox-k8s-entrypoint.sh's own work_dir/clone_dir --
     # this script renders the ConfigMap before the pod exists, so there is
-    # nowhere to read the value back from.
+    # nowhere to read the value back from. POD_SKILL_DIR and
+    # POD_VERDICT_FILE are the same kind of pod-path knowledge, for the two
+    # more paths the review prompt has to name.
     local pod_clone_dir=/work/clone
+    local POD_SKILL_DIR=/work/skills/code-review-portable
+    local POD_VERDICT_FILE="$pod_clone_dir/.git/review-verdict.md"
+
+    # The four --review-loop-only ConfigMap keys and the two env vars they
+    # need, rendered only when this run carries a loop. Prefixed with a
+    # newline so embedding an EMPTY string here changes nothing about the
+    # no-review-loop render below -- see render_review_loop_configmap_keys's
+    # own header for why the keys carry no prompt prose of their own.
+    local review_loop_configmap_keys="" review_loop_env=""
+    if (( review_loop_cap > 0 )); then
+        review_loop_configmap_keys=$'\n'"$(render_review_loop_configmap_keys \
+            "$pod_clone_dir" "$POD_INBOX_DIR" "$POD_SKILL_DIR" "$POD_VERDICT_FILE" \
+            "$branch" "$base_sha" "$review_skill_src" "$review_loop_sh")"
+        review_loop_env=$'\n'"$(render_review_loop_env "$review_loop_cap" "$base_sha")"
+    fi
 
     local rendered
     rendered="$(cat <<EOF
@@ -515,7 +630,7 @@ $(indent_block < "$inbox_write_sh")
   handoff.md: |
 $({ fs_emit_prompt_preamble "$pod_clone_dir" "$POD_INBOX_DIR" pi gated pod
    printf '\n---\n\n'
-   cat -- "$handoff_file"; } | indent_block)
+   cat -- "$handoff_file"; } | indent_block)${review_loop_configmap_keys}
 ---
 apiVersion: batch/v1
 kind: Job
@@ -582,7 +697,7 @@ spec:
             - name: GIT_USER_EMAIL
               value: "$GIT_USER_EMAIL"
             - name: RUN_TTL
-              value: "$K8S_RUN_TTL"
+              value: "$K8S_RUN_TTL"${review_loop_env}
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -784,7 +899,7 @@ cmd_rm() {
 # of any of their bodies; the only new logic here is the poll loop and its
 # failure handling.
 cmd_run() {
-    local dry_run=false keep=false timeout=3600 branch="" model=""
+    local dry_run=false keep=false timeout=3600 branch="" model="" review_loop_cap=""
     while (( $# )); do
         case "$1" in
             --dry-run) dry_run=true; shift ;;
@@ -792,6 +907,7 @@ cmd_run() {
             --timeout) timeout="${2:?--timeout requires a number of seconds}"; shift 2 ;;
             --branch) branch="${2:?--branch requires a name}"; shift 2 ;;
             --model) model="${2:?--model requires an OpenRouter model id}"; shift 2 ;;
+            --review-loop) review_loop_cap="${2:?--review-loop requires a positive integer}"; shift 2 ;;
             -*) echo "Error: unknown option '$1' for run." >&2; exit 1 ;;
             *) break ;;
         esac
@@ -810,15 +926,23 @@ cmd_run() {
         exit 1
     fi
 
+    local -a submit_argv=(--branch "$branch" --model "$model")
+    # Passed through whenever the flag was given at all, "0" included --
+    # cmd_submit does the actual positive-integer validation below, and a
+    # bad value here must reach that error rather than silently collapse
+    # into "no loop" the way an `(( review_loop_cap > 0 ))` gate would.
+    [[ -n "$review_loop_cap" ]] && submit_argv+=(--review-loop "$review_loop_cap")
+    submit_argv+=("$project_path" "$handoff_file")
+
     # cmd_submit does its own full validation (K8S_IMAGE, K8S_DENIED_PROBE,
     # branch freedom, handoff contents...) and, under --dry-run, exits the
     # whole process itself with the rendered YAML -- run never reaches the
     # wait/fetch/rm steps below in that case, and touches no kubectl either.
     if [[ "$dry_run" == true ]]; then
-        cmd_submit --dry-run --branch "$branch" --model "$model" "$project_path" "$handoff_file"
+        cmd_submit --dry-run "${submit_argv[@]}"
         exit 0
     fi
-    cmd_submit --branch "$branch" --model "$model" "$project_path" "$handoff_file"
+    cmd_submit "${submit_argv[@]}"
 
     local safe_name pod_name
     safe_name="$(k8s_safe_name fork-sandbox-agent "$branch")"
@@ -902,7 +1026,52 @@ cmd_run() {
     fi
     local agent_rc="$run_complete"
 
-    echo "fork-sandbox-k8s: agent finished (exit $agent_rc); fetching branch $branch" >&2
+    echo "fork-sandbox-k8s: agent finished (exit $agent_rc)" >&2
+
+    # The review loop's outcome, when this run carried one. This is the
+    # ONLY place a bad loop outcome ever surfaces: agent_rc below stays the
+    # CODING leg's exit code (see fork-sandbox-k8s-entrypoint.sh's own
+    # comment on .run-complete for why), so a `--k8s --review-loop` run
+    # that hit its cap with findings still open would otherwise report
+    # success and say nothing about it. Read before cmd_fetch, so this
+    # prints even if the fetch itself fails partway through.
+    if (( review_loop_cap > 0 )); then
+        local loop_json
+        if loop_json="$(kubectl exec "$pod_name" -- cat /work/review-loop.json 2>/dev/null)" \
+            && jq -e . >/dev/null 2>&1 <<< "$loop_json"; then
+            local loop_ended loop_detail loop_iters loop_last_findings
+            loop_ended="$(jq -r '.ended // "unknown"' <<< "$loop_json")"
+            loop_detail="$(jq -r '.detail // empty' <<< "$loop_json")"
+            loop_iters="$(jq -r '.iterations | length' <<< "$loop_json")"
+            loop_last_findings="$(jq -r '.iterations[-1].findings // "unknown"' <<< "$loop_json")"
+            case "$loop_ended" in
+                approved)
+                    echo "fork-sandbox-k8s: review loop: APPROVED after $loop_iters iteration(s)" >&2
+                    ;;
+                cap|no-progress)
+                    echo "fork-sandbox-k8s: ################################################" >&2
+                    echo "fork-sandbox-k8s: *** review loop ended '$loop_ended' after" >&2
+                    echo "fork-sandbox-k8s: *** $loop_iters iteration(s) -- the branch was NOT" >&2
+                    echo "fork-sandbox-k8s: *** approved, with $loop_last_findings finding(s)" >&2
+                    echo "fork-sandbox-k8s: *** outstanding as of the last iteration." >&2
+                    echo "fork-sandbox-k8s: ################################################" >&2
+                    ;;
+                skipped)
+                    echo "fork-sandbox-k8s: review loop skipped${loop_detail:+: $loop_detail}" >&2
+                    ;;
+                *)
+                    echo "fork-sandbox-k8s: ################################################" >&2
+                    echo "fork-sandbox-k8s: *** review loop ended '$loop_ended'${loop_detail:+: $loop_detail}" >&2
+                    echo "fork-sandbox-k8s: ################################################" >&2
+                    ;;
+            esac
+        else
+            echo "fork-sandbox-k8s: warning: could not read /work/review-loop.json" >&2
+            echo "from pod $pod_name -- the branch is still worth fetching." >&2
+        fi
+    fi
+
+    echo "fork-sandbox-k8s: fetching branch $branch" >&2
     cmd_fetch --branch "$branch" "$project_path"
 
     if [[ "$keep" == true ]]; then
