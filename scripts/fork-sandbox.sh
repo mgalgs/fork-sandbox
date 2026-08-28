@@ -317,13 +317,20 @@
 # That also means most of this script's flags have nothing to attach to on a
 # cluster run: they describe local-sandbox machinery -- bubblewrap, per-run
 # docker-compose services, the detached tmux session -- that a Kubernetes pod
-# has no equivalent of, or they describe a real capability (--review-loop,
-# --checkout, --context-ro, --prompts-dir, --pi-args, --task-meta) the
-# cluster path has not been built to carry yet. --k8s refuses each of these
-# by name instead of accepting and dropping it: an operator who thinks
-# --review-loop reviewed their branch, when a k8s run silently skipped it, has
-# no way to notice from the outside -- no error, no missing output, just an
-# unreviewed branch that looks reviewed.
+# has no equivalent of, or they describe a real capability (--checkout,
+# --context-ro, --prompts-dir, --pi-args, --task-meta) the cluster path has
+# not been built to carry yet. --k8s refuses each of these by name instead of
+# accepting and dropping it: an operator who thinks a refused flag did
+# something, when a k8s run silently ignored it, has no way to notice from
+# the outside -- no error, no missing output, just a run that looks like it
+# honored a flag it never saw.
+#
+# --review-loop is the one capability in that list that IS carried: --k8s
+# passes it through to fork-sandbox-k8s.sh run, which runs the loop POD-SIDE
+# after the coding leg -- see fork-sandbox-k8s-review-loop.sh and
+# docs/kubernetes-runs.md. --review-model stays refused: the pod's
+# models.json is generated with a single model entry, so a second model for
+# the review leg has nowhere to be declared yet.
 #
 # One gap is not a refused flag, because no flag controls it: a --k8s run
 # never appends to the durable run log described below
@@ -761,16 +768,11 @@ if [[ "$k8s_mode" == true ]]; then
         echo "to layer it onto." >&2
         exit 1
     fi
-    if [[ -n "$review_loop_arg" ]]; then
-        echo "Error: --review-loop is not yet supported with --k8s. The loop is" >&2
-        echo "host-side today -- the review and fix prompts are generated on" >&2
-        echo "the host, and code-review-portable is not in the pod image." >&2
-        exit 1
-    fi
     if [[ -n "$review_model" ]]; then
-        echo "Error: --review-model is not yet supported with --k8s, for the" >&2
-        echo "same reason as --review-loop: there is no review leg on the" >&2
-        echo "cluster path." >&2
+        echo "Error: --review-model is not yet supported with --k8s. The pod's" >&2
+        echo "models.json is generated with a single model entry (see" >&2
+        echo "fork-sandbox-k8s-entrypoint.sh), so a second model for the" >&2
+        echo "review leg has nowhere to be declared yet." >&2
         exit 1
     fi
 
@@ -799,6 +801,11 @@ if [[ "$k8s_mode" == true ]]; then
     [[ "$dry_run" == true ]] && k8s_argv+=(--dry-run)
     [[ -n "$k8s_timeout" ]] && k8s_argv+=(--timeout "$k8s_timeout")
     [[ "$k8s_keep" == true ]] && k8s_argv+=(--keep)
+    # --review-loop's own validation (a positive integer) is left to
+    # fork-sandbox-k8s.sh's cmd_submit, which run below execs into -- it
+    # applies the identical check, before any kubectl call, so there is
+    # nothing to duplicate here.
+    [[ -n "$review_loop_arg" ]] && k8s_argv+=(--review-loop "$review_loop_arg")
     k8s_argv+=(--branch "$branch" --model "$model" "$project_path" "$handoff_file")
 
     exec "$script_dir/fork-sandbox-k8s.sh" "${k8s_argv[@]}"
