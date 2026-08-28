@@ -41,6 +41,13 @@
 #                           local run's ~/.pi/agent from. Only the
 #                           defaultProvider/defaultModel keys are generated
 #                           fresh here; everything else in it survives.
+#
+# Creates /work/inbox: the operator inbox, written to from outside the pod
+# by `fork-sandbox-k8s.sh say` over kubectl exec, and read by the agent per
+# the preamble fs_emit_prompt_preamble renders into handoff.md. It is a
+# sibling of clone_dir, never a descendant of it, so the `git add -A` this
+# script runs at the bottom -- scoped to clone_dir, the repository it is run
+# in -- can never sweep an addendum into a commit.
 
 set -euo pipefail
 
@@ -56,9 +63,13 @@ mounts_dir=/mnt/fork-sandbox
 work_dir=/work
 repo_bare="$work_dir/repo.git"
 clone_dir="$work_dir/clone"
+inbox_dir="$work_dir/inbox"
 sentinel="$work_dir/.inputs-complete"
 fetched_marker="$work_dir/.fetched"
 run_complete="$work_dir/.run-complete"
+
+echo "fork-sandbox-k8s-entrypoint: creating $inbox_dir" >&2
+mkdir -p "$inbox_dir"
 
 echo "fork-sandbox-k8s-entrypoint: initializing $repo_bare" >&2
 git init --quiet --bare "$repo_bare"

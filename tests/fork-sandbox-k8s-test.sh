@@ -9,8 +9,8 @@
 # the whole point of --dry-run existing -- see docs/kubernetes-runs.md.
 #
 # It covers:
-#   - shellcheck on the four new scripts (the client, the platform plugin,
-#     the pod entrypoint, the egress gate).
+#   - shellcheck on the five new scripts (the client, the platform plugin,
+#     the pod entrypoint, the egress gate, the inbox writer).
 #   - yamllint on manifests/k8s/ and on the install/submit/run --dry-run
 #     renders.
 #   - fork-sandbox-k8s-platform-generic's two verbs.
@@ -24,6 +24,17 @@
 #     mistakes the other verbs reject. The poll/wait/fetch/rm sequence
 #     itself needs a live cluster and is not covered here -- see the header
 #     comment on cmd_run in fork-sandbox-k8s.sh.
+#   - `submit --dry-run`'s rendered handoff.md carries the operator-inbox
+#     section, names /work/inbox, and never claims that directory is
+#     read-only -- it is not, in a pod (see docs/kubernetes-runs.md).
+#   - `say`'s own argument validation (missing --branch, missing/empty
+#     message, unknown option) -- all rejected before any kubectl call, so
+#     they run with no cluster. The kubectl exec write itself needs a live
+#     pod and is not covered here.
+#   - fork-sandbox-k8s-inbox-write.sh's naming and no-collision behavior,
+#     run directly against a plain directory -- the same script the pod
+#     mounts and `say` execs over kubectl exec, so this is the real
+#     implementation under test, not a duplicate of its logic.
 #   - no file in the repo matches a private-hostname shape, guarding the
 #     public-repo leak rule every script and manifest here has to hold to.
 #   - fork-sandbox.sh --k8s: the two new lib functions it shares with the
@@ -65,12 +76,13 @@ lib_sh="$repo_dir/scripts/fork-sandbox-lib.sh"
 platform_generic="$repo_dir/scripts/fork-sandbox-k8s-platform-generic"
 entrypoint_sh="$repo_dir/scripts/fork-sandbox-k8s-entrypoint.sh"
 gate_sh="$repo_dir/scripts/fork-sandbox-k8s-egress-gate.sh"
+inbox_write_sh="$repo_dir/scripts/fork-sandbox-k8s-inbox-write.sh"
 
 printf '== shellcheck ==\n'
 if ! command -v shellcheck >/dev/null 2>&1; then
     printf '  SKIP  shellcheck not installed\n'
 else
-    for f in "$k8s_sh" "$platform_generic" "$entrypoint_sh" "$gate_sh"; do
+    for f in "$k8s_sh" "$platform_generic" "$entrypoint_sh" "$gate_sh" "$inbox_write_sh"; do
         out="$(shellcheck "$f" 2>&1)"
         if [[ -z "$out" ]]; then ok "shellcheck: $(basename "$f")"; else no "shellcheck: $(basename "$f")" "$out"; fi
     done
@@ -307,9 +319,10 @@ fi
 
 # fs_emit_prompt_preamble (fork-sandbox-lib.sh), shared with fork-sandbox.sh's
 # local path: the rendered handoff.md must carry the clone-path and
-# gated-egress blocks, must NOT carry an "Operator inbox" section (no k8s
-# inbox exists yet -- that is the next round's work), and must still carry
-# the operator's own handoff text after the preamble.
+# gated-egress blocks, must carry an "Operator inbox" section naming
+# /work/inbox, must NOT claim that directory is read-only (it is not, in a
+# pod -- see docs/kubernetes-runs.md), and must still carry the operator's
+# own handoff text after the preamble.
 if grep -q '/work/clone' "$submit_out"; then
     ok "rendered handoff.md preamble names the pod's clone path"
 else
@@ -322,10 +335,31 @@ else
         "not found in $submit_out"
 fi
 if grep -q '## Operator inbox' "$submit_out"; then
-    no "rendered handoff.md omits the operator inbox section" \
-        "found in $submit_out"
+    ok "rendered handoff.md includes the operator inbox section"
 else
-    ok "rendered handoff.md omits the operator inbox section"
+    no "rendered handoff.md includes the operator inbox section" \
+        "not found in $submit_out"
+fi
+if grep -q '/work/inbox' "$submit_out"; then
+    ok "rendered handoff.md preamble names the pod's inbox path"
+else
+    no "rendered handoff.md preamble names the pod's inbox path" "not found in $submit_out"
+fi
+# The negated form ("not mounted read-only", the pod's honest wording) also
+# contains the substring 'mounted read-only', so this checks for the old,
+# unqualified claim exactly -- the sentence a local run's rendered preamble
+# still carries unchanged.
+if grep -qF 'The directory is mounted read-only.' "$submit_out"; then
+    no "rendered handoff.md does not claim the pod inbox is read-only" \
+        "found the unqualified read-only claim in $submit_out"
+else
+    ok "rendered handoff.md does not claim the pod inbox is read-only"
+fi
+if grep -qF 'not mounted read-only' "$submit_out"; then
+    ok "rendered handoff.md tells the agent the pod inbox is writable"
+else
+    no "rendered handoff.md tells the agent the pod inbox is writable" \
+        "not found in $submit_out"
 fi
 if grep -q 'Do the thing.' "$submit_out"; then
     ok "rendered handoff.md still carries the operator's own handoff text"
@@ -379,6 +413,62 @@ if "$k8s_sh" --help 2>&1 | grep -q 'fork-sandbox-k8s.sh run'; then
     ok "usage() mentions run"
 else
     no "usage() mentions run" "not found in --help output"
+fi
+if "$k8s_sh" --help 2>&1 | grep -q 'fork-sandbox-k8s.sh say'; then
+    ok "usage() mentions say"
+else
+    no "usage() mentions say" "not found in --help output"
+fi
+
+printf '\n== fork-sandbox-k8s.sh say: argument validation (no cluster) ==\n'
+# Every one of these is rejected before cmd_say ever calls kubectl, so all
+# of them run with no cluster reachable. The write itself (kubectl exec into
+# a real pod) is not covered here -- see the inbox-write.sh section below
+# for what of the write path CAN be proven offline.
+refuses "say rejects a missing --branch" \
+    "say requires --branch" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" say "hello"
+refuses "say rejects a missing message" \
+    "nothing to say" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" say --branch fs-k8s-test-branch
+refuses "say rejects an empty message" \
+    "the message is empty" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" say --branch fs-k8s-test-branch ""
+refuses "say rejects an all-whitespace message" \
+    "the message is empty" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" say --branch fs-k8s-test-branch "   "
+refuses "say rejects an unknown option" \
+    "unknown option" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" say --branch fs-k8s-test-branch --bogus "hello"
+
+printf '\n== fork-sandbox-k8s-inbox-write.sh: naming and no-collision (no cluster) ==\n'
+# This is the exact script the pod mounts and `say` execs over kubectl exec
+# -i -- run directly here, against a plain directory, so its naming and
+# no-collision behavior is proven without a cluster or kubectl at all.
+inbox_dir="$(newdir)"; tmpdirs+=("$inbox_dir")
+fixed_epoch=1700000000
+out1="$(printf 'first message\n' | "$inbox_write_sh" "$fixed_epoch" "$inbox_dir")"
+if [[ "$out1" == "$inbox_dir"/"$fixed_epoch"-[0-9][0-9].md ]]; then
+    ok "generated filename matches <epoch>-<nn>.md"
+else
+    no "generated filename matches <epoch>-<nn>.md" "got '$out1'"
+fi
+if [[ -f "$out1" && "$(cat "$out1")" == "first message" ]]; then
+    ok "the written file holds the message"
+else
+    no "the written file holds the message" "'$out1' missing or wrong content"
+fi
+out2="$(printf 'second message\n' | "$inbox_write_sh" "$fixed_epoch" "$inbox_dir")"
+if [[ -n "$out2" && "$out1" != "$out2" ]]; then
+    ok "two addenda in the same second do not collide"
+else
+    no "two addenda in the same second do not collide" "out1='$out1' out2='$out2'"
+fi
+inbox_count="$(find "$inbox_dir" -maxdepth 1 -type f | wc -l)"
+if [[ "$inbox_count" -eq 2 ]]; then
+    ok "both addenda land in the inbox directory, nothing else"
+else
+    no "both addenda land in the inbox directory, nothing else" "$(ls "$inbox_dir")"
 fi
 
 # git disables the ext:: transport by default, so a push or fetch built

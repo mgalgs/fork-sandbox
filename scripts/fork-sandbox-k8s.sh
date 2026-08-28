@@ -8,6 +8,8 @@
 #                            --branch NAME --model MODEL
 #                            <project-path> <handoff-file>
 #        fork-sandbox-k8s.sh fetch --branch NAME <project-path>
+#        fork-sandbox-k8s.sh say --branch NAME <text>
+#        fork-sandbox-k8s.sh say --branch NAME -        # text from stdin
 #        fork-sandbox-k8s.sh rm --branch NAME
 #
 # The Kubernetes analogue of fork-sandbox.sh: submit a task from anywhere
@@ -42,6 +44,20 @@
 # fetch runs `git fetch` against the pod's clone, the same channel in
 # reverse, landing the branch in your real repo. It also signals the pod
 # that the run has been collected, so it does not idle out its full TTL.
+#
+# say sends an operator addendum to a run that is already going -- the
+# Kubernetes analogue of fork-sandbox-say.sh, over the same kubectl exec
+# channel submit and fetch already use. It resolves the pod from --branch
+# exactly as fetch does, then writes one generated filename
+# (<epoch>-<nn>.md, never taken from an argument) into /work/inbox inside
+# the pod. The pod runs pi, which has no hook system, so delivery is the
+# same hookless contract every non-claude harness gets: the agent reads the
+# inbox itself, on a tool-call floor and around long commands, commits and
+# its final report -- see fs_emit_prompt_preamble in fork-sandbox-lib.sh.
+# fork-sandbox-say.sh itself is not taught to reach into a pod: it is
+# blanket-approved specifically because its write is bounded to one
+# structurally constrained host directory, and kubectl exec would replace
+# that argument with a far larger one. This is a separate command instead.
 #
 # rm deletes the run's Job, its pod, and its ConfigMap.
 #
@@ -186,6 +202,17 @@ fs_reject_unsafe_chars "$K8S_CONTEXT" "$K8S_NAMESPACE" "$K8S_IMAGE" \
 kubectl() {
     command kubectl --context="$K8S_CONTEXT" -n "$K8S_NAMESPACE" "$@"
 }
+
+# The pod's operator inbox. Must track fork-sandbox-k8s-entrypoint.sh's own
+# work_dir/inbox_dir, for the same reason cmd_submit's pod_clone_dir must
+# track its work_dir/clone_dir: this script renders and writes before the
+# pod's own shell ever runs, so there is nowhere to read the path back from.
+# A sibling of /work/clone, never a descendant -- the entrypoint's
+# `git add -A` at run end is scoped to the clone it runs in, so a path
+# outside it can never be swept into a commit. Read by cmd_submit (to tell
+# the preamble where to point the agent) and cmd_say (to know where to
+# write).
+POD_INBOX_DIR=/work/inbox
 
 # The identical resolution rule fs_resolve_backend uses for
 # sandbox-backend-<name>, applied to the platform plugin: PATH first, then
@@ -457,7 +484,8 @@ cmd_submit() {
 
     local entrypoint_sh="$script_dir/fork-sandbox-k8s-entrypoint.sh"
     local gate_sh="$script_dir/fork-sandbox-k8s-egress-gate.sh"
-    for f in "$entrypoint_sh" "$gate_sh"; do
+    local inbox_write_sh="$script_dir/fork-sandbox-k8s-inbox-write.sh"
+    for f in "$entrypoint_sh" "$gate_sh" "$inbox_write_sh"; do
         [[ -x "$f" ]] || { echo "Error: $f is missing or not executable." >&2; exit 1; }
     done
 
@@ -482,8 +510,10 @@ data:
 $(indent_block < "$entrypoint_sh")
   egress-gate.sh: |
 $(indent_block < "$gate_sh")
+  inbox-write.sh: |
+$(indent_block < "$inbox_write_sh")
   handoff.md: |
-$({ fs_emit_prompt_preamble "$pod_clone_dir" "" pi gated
+$({ fs_emit_prompt_preamble "$pod_clone_dir" "$POD_INBOX_DIR" pi gated pod
    printf '\n---\n\n'
    cat -- "$handoff_file"; } | indent_block)
 ---
@@ -663,6 +693,74 @@ cmd_fetch() {
     echo "fork-sandbox-k8s: fetched into $origin_repo as branch $branch" >&2
 }
 
+cmd_say() {
+    local branch="" text="" have_text=0
+    while (( $# )); do
+        case "$1" in
+            --branch) branch="${2:?--branch requires a name}"; shift 2 ;;
+            -)
+                # The stdin sentinel, not an option -- same convention
+                # fork-sandbox-say.sh uses for "read the message from stdin".
+                [[ -n "$branch" ]] \
+                    || { echo "Error: the branch comes first: fork-sandbox-k8s.sh say --branch NAME -" >&2; exit 1; }
+                (( have_text )) && { echo "Error: only one message may be given" >&2; exit 1; }
+                text="$(cat)"
+                have_text=1
+                shift
+                ;;
+            -*) echo "Error: unknown option '$1' for say." >&2; exit 1 ;;
+            *)
+                if (( ! have_text )); then
+                    text="$1"
+                    have_text=1
+                else
+                    echo "Error: only one message may be given; quote it as a single argument" >&2
+                    exit 1
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    [[ -n "$branch" ]] || { echo "Error: say requires --branch." >&2; exit 1; }
+    (( have_text )) \
+        || { echo "Error: nothing to say. Give the message as one quoted argument, or '-' to read it from stdin." >&2; exit 1; }
+    [[ -n "${text//[[:space:]]/}" ]] \
+        || { echo "Error: the message is empty. A blank addendum tells the session nothing." >&2; exit 1; }
+    fs_reject_unsafe_chars "$branch" || exit 1
+
+    local safe_name pod_name
+    safe_name="$(k8s_safe_name fork-sandbox-agent "$branch")"
+    pod_name="$(kubectl get pod -l "job-name=$safe_name" -o jsonpath='{.items[0].metadata.name}')"
+    if [[ -z "$pod_name" ]]; then
+        echo "Error: no pod found for branch '$branch' (job $safe_name). It may" >&2
+        echo "have already been fetched and removed, or the run never started." >&2
+        exit 1
+    fi
+
+    # The search-and-write loop lives in fork-sandbox-k8s-inbox-write.sh,
+    # mounted into the pod at /mnt/fork-sandbox/ from the same per-run
+    # ConfigMap entrypoint.sh and egress-gate.sh already ride in on -- see
+    # that script's own header for why the name is always generated and
+    # never taken from an argument, and why the final rename is atomic. It
+    # runs as the single command this kubectl exec -i carries on its stdio.
+    # kubectl exec -i, never -t: a tty would apply line-discipline
+    # translation to the message bytes on their way to `cat`.
+    local epoch write_out
+    epoch="$(date +%s)"
+    if ! write_out="$(printf '%s\n' "$text" | kubectl exec -i "$pod_name" -- \
+        sh /mnt/fork-sandbox/inbox-write.sh "$epoch" "$POD_INBOX_DIR" 2>&1)"; then
+        echo "Error: could not write the addendum into pod $pod_name: $write_out" >&2
+        exit 1
+    fi
+
+    printf 'wrote %s\n' "$write_out"
+    printf 'delivery: within ~25 tool calls. The pod runs pi, which has no\n'
+    printf 'hook system, so the agent reads the inbox itself -- on a\n'
+    printf 'tool-call floor, around long commands, before each commit, and\n'
+    printf 'before its final report.\n'
+}
+
 cmd_rm() {
     local branch=""
     while (( $# )); do
@@ -826,9 +924,10 @@ case "$verb" in
     submit) cmd_submit "$@" ;;
     run) cmd_run "$@" ;;
     fetch) cmd_fetch "$@" ;;
+    say) cmd_say "$@" ;;
     rm) cmd_rm "$@" ;;
     *)
-        echo "Error: unknown command '$verb'. Use install, submit, run, fetch or rm." >&2
+        echo "Error: unknown command '$verb'. Use install, submit, run, fetch, say or rm." >&2
         exit 1
         ;;
 esac

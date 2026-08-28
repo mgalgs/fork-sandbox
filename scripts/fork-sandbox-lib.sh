@@ -925,8 +925,15 @@ fs_cache_binds() {
 #                pi-local run (no network at all), "gated" for a Kubernetes
 #                pod (egress allowed only to DNS and the model proxy), or
 #                "" to omit the section (an unrestricted local run).
+# $5  inbox_write  "" (default) says the inbox is mounted read-only, true of
+#                every local run's --bind-ro inbox. "pod" says it instead for
+#                a Kubernetes pod, where kubectl exec runs in the agent's own
+#                mount namespace and nothing actually blocks a write there --
+#                see fork-sandbox-k8s.sh's `say` verb and
+#                docs/kubernetes-runs.md. Unused when $2 is empty.
 fs_emit_prompt_preamble() {
     local clone_dir="$1" inbox_dir="$2" harness="$3" network="$4"
+    local inbox_write="${5:-}"
     cat <<EOF
 # Your working directory
 
@@ -960,10 +967,24 @@ wrote your handoff, written after this run started. An addendum is a
 continuation of the handoff and carries the same authority — it may override
 the handoff rather than merely add to it, and where the two conflict the
 addendum is the newer instruction and wins.
+EOF
+        if [[ "$inbox_write" == "pod" ]]; then
+            cat <<'EOF'
+
+Unlike a local run's inbox, this directory is not mounted read-only — the
+same kubectl exec channel that delivers an addendum runs in this container's
+own mount namespace, so nothing technically stops a write here. Do not write
+to it anyway: it is the operator's channel to reach you, not yours to speak
+through. An empty inbox is the normal case, not a problem: most runs get no
+addenda at all.
+EOF
+        else
+            cat <<'EOF'
 
 The directory is mounted read-only. Never write to it. An empty inbox is the
 normal case, not a problem: most runs get no addenda at all.
 EOF
+        fi
         if [[ "$harness" == "claude" ]]; then
             cat <<'EOF'
 

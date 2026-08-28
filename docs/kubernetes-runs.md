@@ -278,6 +278,88 @@ half-received repository.
 is not the repository and not the handoff — is not built in v1. See
 "Deliberately not done" below.
 
+**The operator inbox breaks the "every input is gated" claim above, and it
+should say so rather than quietly stop being true.**
+`scripts/fork-sandbox-k8s.sh say` writes an addendum into a running pod over
+`kubectl exec`, and it does so **after** the agent has already started — an
+addendum can land seconds or hours after `/work/.inputs-complete` was
+written, so it is not, and cannot be, covered by a before-start sentinel the
+way the repository and the handoff are. This is a real difference from the
+gating story above, not a rounding error.
+
+It is still safe, for the reasoning `fork-sandbox-say.sh`'s own header
+already gives for the local case, carried across unchanged: whoever can
+write an addendum must already be able to `kubectl exec` into the pod — the
+same capability `submit` uses to push the repository in and `fetch` uses to
+pull the branch back out. `say` grants no access that submitting a run did
+not already grant. And an addendum is not a new kind of authority reaching
+the pod; it is the same authority as the handoff, delivered later — the
+person writing it is the same person who authored the run's entire prompt to
+begin with. See "The operator inbox: reaching a pod after it starts" below
+for the mechanism.
+
+## The operator inbox: reaching a pod after it starts
+
+Every other input to a pod is gated before the agent ever starts — see
+above. An addendum cannot be gated that way, because by definition it
+arrives after the agent is already running. `scripts/fork-sandbox-k8s.sh
+say` is the client:
+
+```
+fork-sandbox-k8s.sh say --branch my-branch "keep going, but skip the tests"
+fork-sandbox-k8s.sh say --branch my-branch -        # read the text from stdin
+```
+
+It resolves the pod the same way `fetch` does — from `--branch`, via the
+Job's `job-name` label — and writes through the same `kubectl exec` channel
+`submit` and `fetch` already use: no new access, no new credential, nothing
+this project did not already trust in the client-to-pod direction. The write
+lands in `/work/inbox` inside the pod, a sibling of `/work/clone` and never
+a descendant of it, so `fork-sandbox-k8s-entrypoint.sh`'s `git add -A` at
+run end — scoped to the clone it runs in — can never sweep an addendum into
+a commit. As with the local inbox, the file name is always generated
+(`<epoch>-<nn>.md`), never taken from an argument, which is what keeps this
+from being an arbitrary-file-write primitive; the search for a free name and
+the write both run as one command inside the pod, over one `kubectl exec
+-i`, so the final rename is atomic on one filesystem the same way the local
+script's is.
+
+`fork-sandbox-say.sh` itself is not taught to reach into a pod. It is
+blanket-approved specifically because its write is a bounded one — one
+structurally constrained host directory, a filename it generates itself —
+and `kubectl exec` would replace that argument with a far larger one, for
+which the same blanket approval would no longer be justified. Two commands
+at a slightly higher price than one is the trade this makes on purpose.
+
+One property is honestly different from the local inbox, and the pod's
+prompt says so rather than pretending otherwise. Locally, `<run-dir>/inbox`
+is bind-mounted into the sandbox read-only, so "never write to it" is an
+enforced fact the agent cannot violate even if it tried. In a pod,
+`kubectl exec` runs in the agent's own container and mount namespace — the
+same one `fork-sandbox-k8s-entrypoint.sh` already writes `/work/clone` and
+its sentinels from — so there is no mount boundary that could make
+`/work/inbox` read-only without also blocking the write this feature
+depends on. A sidecar holding the write path instead of the agent's own
+container would work, but is disproportionate machinery for one small
+directory. So the pod's preamble tells the agent the directory is writable
+and instructs it not to write there anyway, instead of asserting an
+enforcement that does not actually exist — see `fs_emit_prompt_preamble` in
+`scripts/fork-sandbox-lib.sh`.
+
+Delivery is the hookless contract every non-`claude` harness already gets
+from that same function: pi has no hook system, so the pod's prompt tells
+the agent to read the inbox itself — on a tool-call floor, around long
+commands, before each commit, and before its final report. Nothing new was
+needed for this: the pod already passed `pi` as the harness argument, for
+the reason `fs_emit_prompt_preamble`'s hookless branch exists at all.
+
+**A real gap, not yet closed: there is no cluster equivalent of
+`fork-sandbox-status.sh`'s addendum count.** The local status script reads a
+host run directory to report how many addenda a run has received; a cluster
+run has no host run directory, so an operator who calls `say` today has no
+way to confirm what has already been sent short of the pod's own eventual
+commit or final report. Worth its own round, not solved here.
+
 ## Egress is sealed, except the proxy
 
 **Stronger than the original design's `pinned` mode, and worth stating
@@ -452,12 +534,14 @@ rather than waiting for a general `--copy-files`.
 There is no install step, because there is no egress to install anything
 with — see "Limits" below. Whatever a run needs is already in the image.
 
-**Scripts ship as a ConfigMap, not baked into the image.** Both
-`scripts/fork-sandbox-k8s-entrypoint.sh` (the main container) and
-`scripts/fork-sandbox-k8s-egress-gate.sh` (the initContainer) are mounted in
-from a per-run ConfigMap `submit` renders, rather than compiled into
-`K8S_IMAGE`. Iterating on either needs no image rebuild and no registry push
-— only a re-`submit`.
+**Scripts ship as a ConfigMap, not baked into the image.** Three of them:
+`scripts/fork-sandbox-k8s-entrypoint.sh` (the main container),
+`scripts/fork-sandbox-k8s-egress-gate.sh` (the initContainer), and
+`scripts/fork-sandbox-k8s-inbox-write.sh` (run on demand, over `kubectl exec
+-i`, by the `say` verb — see "The operator inbox" above). All three are
+mounted in from a per-run ConfigMap `submit` renders, rather than compiled
+into `K8S_IMAGE`. Iterating on any of them needs no image rebuild and no
+registry push — only a re-`submit`.
 
 ## Bringing your own image and registry
 
@@ -610,8 +694,15 @@ implementation. The rest are unchanged.
    sets a namespace `ResourceQuota` and `LimitRange`, which bounds the
    cluster-wide blast radius of a runaway fleet, but nothing yet bounds how
    many runs one person or one pipeline can have in flight at once.
-5. **The operator inbox.** Still open, and explicitly out of scope for v1 —
-   see "Deliberately not done" below.
+5. **The operator inbox.** Resolved: `fork-sandbox-k8s.sh say` writes an
+   addendum into a running pod over the same `kubectl exec` channel `submit`
+   and `fetch` already use — see "The operator inbox: reaching a pod after
+   it starts" above for the mechanism and "Every run is gated, and the gate
+   is an initContainer" above for why this does not weaken the gating
+   property. What is still missing is visibility: there is no cluster
+   equivalent of `fork-sandbox-status.sh`'s addendum count, so an operator
+   has no way to confirm a `say` landed short of the pod's own eventual
+   commit or report.
 6. **Seeding a large read-only cache.** Still open; a volume shared across
    runs still needs a lifecycle, a writer and a story for staleness, and v1
    has no cache-bearing run to force the question.
@@ -633,8 +724,6 @@ Scoped out of v1 on purpose, not overlooked:
   second one is added.
 - **The PVC / results-pod upgrade path.** v1 idles the pod, as originally
   planned.
-- **The operator inbox** (`fork-sandbox-say.sh`'s cluster equivalent). Nothing
-  reaches a running pod after submission in v1.
 - **`status` / `logs` subcommands.** `kubectl` already does both, against the
   Job and pod this client creates with ordinary, discoverable names and
   labels.
