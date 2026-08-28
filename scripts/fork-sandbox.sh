@@ -76,6 +76,9 @@
 #                        review of an untrusted ref (a pull request head)
 #                        passes the trusted base here, and a hook the ref
 #                        modified is not run.
+# --prompts-dir <dir>:   overlay model-specific prompt fragments from <dir>
+#                        onto the generated prompt for this run only. <dir>
+#                        must exist. See docs/prompt-overlays.md.
 # -h, --help:            print this header and exit.
 #
 # The run gets its own detached tmux session, not a window of yours, so
@@ -345,6 +348,7 @@ foreground=false
 keep_session=false
 no_services=false
 services_trust_ref=""
+prompts_dir_arg=""
 
 while [[ "${1:-}" == -* ]]; do
     case "$1" in
@@ -416,6 +420,10 @@ while [[ "${1:-}" == -* ]]; do
             ;;
         --services-trust-ref)
             services_trust_ref="${2:?--services-trust-ref requires a ref}"
+            shift 2
+            ;;
+        --prompts-dir)
+            prompts_dir_arg="${2:?--prompts-dir requires a directory}"
             shift 2
             ;;
         -h|--help)
@@ -612,9 +620,117 @@ fi
 # a green light here first.
 fs_reject_unsafe_chars "$model" "$review_model" || exit 1
 
+# --- Prompt overlay -------------------------------------------------------
+# A machine-local directory of prompt fragments, layered onto the generated
+# prompt below the environment blocks and above the operator's handoff. This
+# script ships the mechanism only -- no fragment for any model lives in this
+# repo. See docs/prompt-overlays.md.
+#
+# Resolved here, above the dry-run exit, for the same reason the model is:
+# --dry-run exists to say what a real run would get, so it has to see the
+# same overlay a real run would apply.
+#
+# --prompts-dir names a directory for this run alone. Naming one that does
+# not exist is refused outright: silently applying nothing would look
+# exactly like a run that used it, and that gap is the failure class this
+# project keeps paying to avoid. Left unset, the default directory is
+# read only if it happens to exist -- absent is the common case, and it is
+# silent on purpose, so a machine with no overlay configured is completely
+# unaffected.
+if [[ -n "$prompts_dir_arg" ]]; then
+    prompt_overlay_dir="$prompts_dir_arg"
+    prompt_overlay_explicit=true
+else
+    prompt_overlay_dir="${FORK_SANDBOX_PROMPTS_DIR:-$config_dir/prompts}"
+    prompt_overlay_explicit=false
+fi
+fs_reject_unsafe_chars "$prompt_overlay_dir" || exit 1
+
+if [[ "$prompt_overlay_explicit" == true && ! -d "$prompt_overlay_dir" ]]; then
+    echo "Error: --prompts-dir '$prompt_overlay_dir' does not exist." >&2
+    exit 1
+fi
+
+# Relative fragment paths (composition order) and their matching absolute
+# paths. Empty on a machine with no overlay directory -- the common case --
+# which is what makes fs_emit_prompt_overlay a no-op below.
+prompt_overlay_fragments=()
+prompt_overlay_paths=()
+prompt_overlay_rev=""
+prompt_overlay_sha256=""
+
+if [[ -d "$prompt_overlay_dir" ]]; then
+    # A model id commonly holds a slash (openai/gpt-4o), and a slash in a
+    # filename is a path separator -- replacing every one with '_' both
+    # produces a sane file name and removes the only character that could
+    # turn a model id into a path outside this directory.
+    prompt_overlay_model_frag=""
+    [[ -n "$model" ]] && prompt_overlay_model_frag="${model//\//_}"
+
+    # General first, specific last: a later fragment can override an earlier
+    # one, so all.md sets the baseline, the harness fragment narrows it, and
+    # the model fragment has the last word. No glob or family matching --
+    # deliberately deferred, see docs/prompt-overlays.md.
+    prompt_overlay_candidates=("all.md" "harness/$harness.md")
+    [[ -n "$prompt_overlay_model_frag" ]] \
+        && prompt_overlay_candidates+=("model/$prompt_overlay_model_frag.md")
+
+    for prompt_overlay_rel in "${prompt_overlay_candidates[@]}"; do
+        if [[ -f "$prompt_overlay_dir/$prompt_overlay_rel" ]]; then
+            prompt_overlay_fragments+=("$prompt_overlay_rel")
+            prompt_overlay_paths+=("$prompt_overlay_dir/$prompt_overlay_rel")
+        fi
+    done
+
+    if (( ${#prompt_overlay_fragments[@]} == 0 )); then
+        # The directory exists but matched nothing. Silent for the default
+        # directory would be fine, but the caller may have just named it with
+        # --prompts-dir, and a request that quietly does nothing is exactly
+        # the failure class this mechanism exists to avoid -- so it is a
+        # warning either way, naming what was looked for.
+        echo "Warning: prompt overlay directory '$prompt_overlay_dir' matched" >&2
+        echo "no fragment. Looked for:" >&2
+        for prompt_overlay_rel in "${prompt_overlay_candidates[@]}"; do
+            echo "  $prompt_overlay_dir/$prompt_overlay_rel" >&2
+        done
+    else
+        # A content fingerprint of exactly the bytes about to be inserted,
+        # independent of git state -- the one thing that ties a run to what
+        # it actually saw, whether or not the directory is version controlled
+        # or clean.
+        prompt_overlay_sha256="$(cat -- "${prompt_overlay_paths[@]}" | sha256sum | cut -d' ' -f1)"
+        if [[ "$(git -C "$prompt_overlay_dir" rev-parse --is-inside-work-tree \
+                2>/dev/null)" == "true" ]]; then
+            prompt_overlay_head="$(git -C "$prompt_overlay_dir" rev-parse HEAD 2>/dev/null || true)"
+            if [[ -n "$prompt_overlay_head" ]]; then
+                # A dirty working tree means the commit named below is not
+                # what actually rendered. Recording the plain rev anyway
+                # would attribute this run's outcome to a commit that did not
+                # produce it -- worse than recording no rev at all, because
+                # it looks trustworthy. The check is scoped to this directory
+                # alone, not the whole repo, so an unrelated change elsewhere
+                # in a larger checkout (a dotfiles repo, say) does not mark it
+                # dirty.
+                if [[ -n "$(git -C "$prompt_overlay_dir" status --porcelain -- . 2>/dev/null)" ]]; then
+                    prompt_overlay_rev="${prompt_overlay_head}-dirty"
+                else
+                    prompt_overlay_rev="$prompt_overlay_head"
+                fi
+            fi
+        fi
+    fi
+fi
+
 if [[ "$dry_run" == true ]]; then
     printf 'harness=%s\nmodel=%s\n' "$harness" "$model"
     [[ -z "$review_model" ]] || printf 'review_model=%s\n' "$review_model"
+    printf 'prompt_overlay_dir=%s\n' "$prompt_overlay_dir"
+    prompt_overlay_fragments_csv=""
+    if (( ${#prompt_overlay_fragments[@]} )); then
+        prompt_overlay_fragments_csv="$(IFS=,; printf '%s' "${prompt_overlay_fragments[*]}")"
+    fi
+    printf 'prompt_overlay_fragments=%s\n' "$prompt_overlay_fragments_csv"
+    printf 'prompt_overlay_rev=%s\n' "$prompt_overlay_rev"
     exit 0
 fi
 
@@ -1177,6 +1293,21 @@ fs_reject_unsafe_chars "$run_dir"
 if [[ -n "$task_meta" ]]; then
     printf '%s\n' "$task_meta" > "$run_dir/task-meta.json"
 fi
+# The prompt overlay's provenance, beside the run for the same reason: what
+# was applied has to be queryable later, not just present in the rendered
+# handoff. Written only when an overlay actually applied -- a run with no
+# prompts directory writes no file, and sandbox-run-log.py reads that as "no
+# prompt_overlay key", exactly like a run made before this mechanism existed.
+if (( ${#prompt_overlay_fragments[@]} )); then
+    jq -n \
+        --arg dir "$prompt_overlay_dir" \
+        --arg rev "$prompt_overlay_rev" \
+        --arg sha256 "$prompt_overlay_sha256" \
+        '{dir: $dir, rev: (if $rev == "" then null else $rev end),
+          fragments: $ARGS.positional, sha256: $sha256}' \
+        --args "${prompt_overlay_fragments[@]}" \
+        > "$run_dir/prompt-overlay.json"
+fi
 # Name the parent 'clone', not 'repo'. A directory called 'repo' sitting one
 # level above the checkout reads like the repository root, and a session that
 # builds an absolute path by hand drops the last segment and reads nothing.
@@ -1528,6 +1659,25 @@ EOF
     fi
 }
 
+# The model-specific layer, applied after every generated block above and
+# immediately before the operator's handoff: the environment blocks say
+# where the agent is, this says how THIS model should behave, and the
+# handoff says what to do. A no-op when prompt_overlay_fragments is empty,
+# which is the default on a machine with no prompts directory configured --
+# so this function costs the rendered prompt nothing when the feature is
+# unused. See docs/prompt-overlays.md; no fragment for any model ships here.
+fs_emit_prompt_overlay() {
+    (( ${#prompt_overlay_fragments[@]} )) || return 0
+    printf '\n## Model-specific notes\n\n'
+    printf 'A machine-local overlay applies here (see docs/prompt-overlays.md).\n'
+    printf 'Fragments, general first: %s\n' "$(IFS=,; printf '%s' "${prompt_overlay_fragments[*]}")"
+    local path
+    for path in "${prompt_overlay_paths[@]}"; do
+        printf '\n'
+        cat -- "$path"
+    done
+}
+
 {
     fs_emit_prompt_preamble
     if (( services_enabled )); then
@@ -1555,6 +1705,7 @@ the background, once per such service, before starting the client:
 convention are the project's; its CLAUDE.md or the services hook documents them.
 EOF
     fi
+    fs_emit_prompt_overlay
     printf '\n---\n\n'
     cat -- "$handoff_file"
 } > "$handoff_copy.part"
