@@ -67,16 +67,26 @@ Any task whose product is a change to files in the project.
 
 The exceptions are the ones where a round trip costs more than the work:
 
-- A one-line typo or a comment fix — under a minute, verifiable by reading.
+- **A small, self-contained edit** — a typo, a comment, a wording fix, a few
+  lines across a file or two. A sandbox costs a clone, a run, a review and a
+  merge; that is a bad trade for a change you can read and be sure of.
 - Files outside the project: scratch files, notes, and the handoff documents
   themselves. The sandbox cannot see them, so they can only be written here.
 - A change the user explicitly asks this session to make by hand.
 
-The threshold: if the edit needs a plan, touches more than a file or two, or
-has to be verified by running something, it goes to a sandbox. If it is one
-obvious edit this session can prove correct by reading, just make it. When a
-"trivial" edit turns out to need a second one, stop and delegate the rest
-rather than drifting back into writing the change here.
+**The threshold is confidence, not line count.** Make the edit here when you
+can tell it is right by reading it, and the whole change stays within a few
+lines across a file or two. Send it to a sandbox when it needs a plan, spans
+several files, or can only be shown correct by running something — a test
+suite, a build, a render.
+
+Do not stand up a sandbox to fix three lines. The overhead is real and it is
+paid in wall-clock, tokens and your own attention; a round trip that costs
+more than the work is not caution, it is ceremony.
+
+When a "small" edit turns out to need a second and a third, stop and delegate
+the rest. The signal is not the size you estimated, but the size it is turning
+into.
 
 ## Before every launch
 
