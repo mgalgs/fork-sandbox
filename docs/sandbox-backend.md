@@ -51,6 +51,32 @@ Backends may add their own options — a container backend needs an image, a
 Kubernetes backend needs a namespace and a service account. Those are declared
 by the backend and must not be required for the contract above to work.
 
+### Mount order
+
+A backend applies mounts in sequence, and a mount over a directory hides every
+mount already made inside it. So the order is part of the contract, not an
+implementation detail: **binds are applied shallowest destination first**, and
+one that lands inside another's destination therefore survives it. Binds at
+equal depth keep the order above — read-only, read-write, then the remapped
+forms — which is what lets `--bind-ro-at` re-protect a path inside the writable
+work dir.
+
+Callers depend on this. `claude-sandboxed` binds the self-review skills at
+`$HOME/.claude/skills/<name>` and also remaps the whole of `$HOME/.claude` to a
+per-run state dir; only depth ordering gives it both. A backend that applies
+binds in the order the flags arrived instead will drop the nested ones without
+saying anything — the sandbox comes up, the command runs, and the files are
+simply not there.
+
+The order the caller passes the flags in does not matter, and must not.
+`sandbox-backend-container` gets this from Docker, which sorts its own mounts
+by destination depth; `sandbox-backend-bwrap` sorts them itself, because bwrap
+does not. `tests/sandbox-backend-bind-order-test.sh` holds both to it.
+
+One consequence for a backend that creates a missing destination: create it as
+the invoking user, or a caller that owns the tree it lands in will not be able
+to remove it afterwards.
+
 ## Asking a backend about itself
 
 ```

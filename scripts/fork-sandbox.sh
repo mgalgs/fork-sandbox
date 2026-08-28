@@ -1350,6 +1350,15 @@ fi
 # serves both; the difference is that claude discovers a skill and pi has to be
 # handed it with --skill, because the sandbox gives it a fresh $HOME with no
 # settings file to read.
+# Both destinations sit INSIDE $HOME/.claude, which claude-sandboxed also
+# remaps wholesale to its per-run state dir. That works only because a backend
+# applies binds shallowest destination first, so the remap goes down before the
+# kit lands in it -- see the mount-order section of docs/sandbox-backend.md,
+# and tests/sandbox-backend-bind-order-test.sh, which holds both backends to
+# it. Ordered the other way the remap covers the kit and the run comes up
+# without it: no error, no missing file, just a --review-loop whose review leg
+# has no method and a --prepend-path aimed at nothing. Keep new binds under
+# $HOME/.claude aware of that.
 review_kit_flags=()
 # Where code-review-portable ends up bound, for the review leg's prompt to
 # point at. The bind puts it at the same absolute path inside the sandbox, so

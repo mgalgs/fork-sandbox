@@ -840,26 +840,57 @@ for kv in "${SETENV[@]}"; do
     BWRAP_ARGS+=(--setenv "${kv%%=*}" "${kv#*=}")
 done
 
-# Read-only binds go last, after the tmpfs mounts they must show through
-# and after the work dir, so one may also re-protect a path inside it.
+# The caller's binds, all four kinds, gathered before any is emitted. They go
+# after the tmpfs mounts they must show through and after the work dir, so one
+# may also re-protect a path inside it.
+#
+# Category order sets the tiebreak below, and it is the order the flags
+# document: read-only first, then the writable paths a run needs outside the
+# work dir, then the remapped read-only binds, which re-protect a path inside
+# the work dir that the writable work-dir bind would otherwise leave writable.
+CALLER_FLAG=(); CALLER_SRC=(); CALLER_DEST=()
 for i in "${!BIND_RO_SRC[@]}"; do
-    BWRAP_ARGS+=(--ro-bind "${BIND_RO_SRC[$i]}" "${BIND_RO_DEST[$i]}")
+    CALLER_FLAG+=(--ro-bind); CALLER_SRC+=("${BIND_RO_SRC[$i]}"); CALLER_DEST+=("${BIND_RO_DEST[$i]}")
 done
-
-# Read-write binds: the paths a run must write outside the work dir — a per-run
-# services sockets directory, say. Writable, so they go after the work dir like
-# it does.
 for i in "${!BIND_RW_SRC[@]}"; do
-    BWRAP_ARGS+=(--bind "${BIND_RW_SRC[$i]}" "${BIND_RW_DEST[$i]}")
+    CALLER_FLAG+=(--bind); CALLER_SRC+=("${BIND_RW_SRC[$i]}"); CALLER_DEST+=("${BIND_RW_DEST[$i]}")
 done
 for i in "${!BIND_RW_AT_RSRC[@]}"; do
-    BWRAP_ARGS+=(--bind "${BIND_RW_AT_RSRC[$i]}" "${BIND_RW_AT_DEST[$i]}")
+    CALLER_FLAG+=(--bind); CALLER_SRC+=("${BIND_RW_AT_RSRC[$i]}"); CALLER_DEST+=("${BIND_RW_AT_DEST[$i]}")
+done
+for i in "${!BIND_RO_AT_RSRC[@]}"; do
+    CALLER_FLAG+=(--ro-bind); CALLER_SRC+=("${BIND_RO_AT_RSRC[$i]}"); CALLER_DEST+=("${BIND_RO_AT_DEST[$i]}")
 done
 
-# Remapped read-only binds, last of all, so they re-protect a path inside the
-# work dir that the writable work-dir bind would otherwise leave writable.
-for i in "${!BIND_RO_AT_RSRC[@]}"; do
-    BWRAP_ARGS+=(--ro-bind "${BIND_RO_AT_RSRC[$i]}" "${BIND_RO_AT_DEST[$i]}")
+# Emit them shallowest destination first, so a bind never shadows one that
+# lands inside it. bwrap applies mounts in sequence and a later mount over a
+# parent directory hides every child mount made before it -- which silently
+# emptied the review kit: claude-sandboxed binds the skills at
+# $HOME/.claude/skills/<name> and then remaps the whole of $HOME/.claude to a
+# per-run state dir, and by category order the remap came second and won.
+# Nothing is lost by ordering this way: a shallower mount shadowing a deeper
+# one is never what a caller wants, and the container backend already behaves
+# like this, because Docker orders its own mounts by destination depth. Sorting
+# here is what makes the two backends agree.
+#
+# The sort is stable -- one pass per depth, each preserving the order above --
+# so binds at equal depth keep their category order, and equal-depth callers
+# see exactly what they saw before.
+CALLER_DEPTH=(); max_depth=0
+for d in "${CALLER_DEST[@]}"; do
+    rest="$d"; depth=0
+    while [[ "$rest" == */* ]]; do rest="${rest#*/}"; depth=$(( depth + 1 )); done
+    CALLER_DEPTH+=("$depth")
+    # An `if`, not `(( ... )) && max_depth=...`: that form is the last command
+    # in this loop body, so a false test would make the loop's status non-zero
+    # under errexit.
+    if (( depth > max_depth )); then max_depth="$depth"; fi
+done
+for (( depth = 1; depth <= max_depth; depth++ )); do
+    for i in "${!CALLER_DEST[@]}"; do
+        (( CALLER_DEPTH[i] == depth )) || continue
+        BWRAP_ARGS+=("${CALLER_FLAG[$i]}" "${CALLER_SRC[$i]}" "${CALLER_DEST[$i]}")
+    done
 done
 
 # Sealed mode: bwrap unshares the network namespace itself, and brings lo up —
