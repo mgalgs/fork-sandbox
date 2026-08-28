@@ -1,20 +1,24 @@
 # Prompt overlays: model-specific corrections, machine-local
 
-`fork-sandbox.sh` renders one prompt per run: a preamble describing the
-sandbox, the services block when a repo has them, and the operator's
-handoff. Every model reads the same text. That is right for most of it — the
-sandbox does not change per model — but some corrections are genuinely
-model-specific, and pasting them into the shared preamble either wastes
-tokens on a model that never needed them or, worse, becomes a correction one
-model needs and every other model has to read anyway.
+`fork-sandbox.sh` renders up to three prompts per run: the implement prompt
+(`handoff.md`), always, and — under `--review-loop` — a review prompt and a
+fix prompt, one pair per review-then-fix iteration's shared template. Each
+starts with the same preamble describing the sandbox, the services block
+when a repo has them, and that leg's own task text (the operator's handoff
+for implement, "review this branch" for review, "fix what a reviewer found"
+for fix). Every model reads the same text for a given leg. That is right for
+most of it — the sandbox does not change per model — but some corrections
+are genuinely model-specific, and pasting them into the shared preamble
+either wastes tokens on a model that never needed them or, worse, becomes a
+correction one model needs and every other model has to read anyway.
 
 The prompt overlay is a fourth block: a machine-local directory of markdown
-fragments, selected by harness and model, appended after the generated
-environment blocks and immediately before the handoff. This repo ships the
-mechanism only. No fragment for any model lives here — the same call the
-repo already makes for its Dockerfile-not-image, manifests-not-cluster
-pieces. What a model needs corrected is something you observe by running it,
-not something this repo can know in advance.
+fragments, selected by leg, harness and model, appended after the generated
+environment blocks and immediately before that leg's task text. This repo
+ships the mechanism only. No fragment for any model lives here — the same
+call the repo already makes for its Dockerfile-not-image,
+manifests-not-cluster pieces. What a model needs corrected is something you
+observe by running it, not something this repo can know in advance.
 
 ## What this is for
 
@@ -46,6 +50,16 @@ Put it in a fragment under `model/`, and only the model that needs it ever
 sees it — and the run record says whether that fragment was even present, so
 a later change to it is visible as a change in results rather than a mystery.
 
+That example happened during the implement leg, but the implement leg is not
+the only one that commits. Under `--review-loop`, the fix leg's own prompt
+says "Fix the real ones, and commit" — it is the leg that turns a reviewer's
+findings into a committed change, so a commit-safety correction is exactly
+as relevant there as it is in the implement leg, and arguably more urgent:
+it is the leg most runs actually reach last. A fragment under `model/` alone
+cannot land there and nowhere else — it reaches every leg or none. The
+per-leg layer below (`fix/model/<model>.md`) is what makes "this model needs
+correcting, and only when it is about to commit" expressible at all.
+
 ## Where the fragments live
 
 Default: `~/.config/fork-sandbox/prompts`, alongside this project's other
@@ -60,19 +74,40 @@ before this mechanism existed.
 
 ## Search order
 
-Three files, general first so a later one can override what an earlier one
+Five files, general first so a later one can override what an earlier one
 said:
 
 ```
 <prompts-dir>/all.md
 <prompts-dir>/harness/<harness>.md
 <prompts-dir>/model/<model>.md
+<prompts-dir>/<leg>/all.md
+<prompts-dir>/<leg>/model/<model>.md
 ```
 
-`<harness>` is one of `claude`, `pi`, `pi-local`, `codex`. Any file that does
-not exist is skipped silently — a directory holding only `all.md` is a
-perfectly normal setup. The ones that do exist are concatenated, in that
-order, under one heading, into the rendered prompt.
+`<harness>` is one of `claude`, `pi`, `pi-local`, `codex`. `<leg>` is exactly
+one of `implement`, `review`, `fix` — the prompt currently being rendered.
+Any file that does not exist is skipped silently — a directory holding only
+`all.md` is a perfectly normal setup. The ones that do exist are
+concatenated, in that order, under one heading, into the rendered prompt.
+
+The first three are the same three this mechanism always had, and they still
+mean what they meant: every leg reads them. A fragment saying how a model
+should write a commit is as true in the fix leg as in the implement leg, so
+`all.md`, `harness/<harness>.md` and `model/<model>.md` apply everywhere,
+unchanged, and an existing prompts directory keeps working exactly as it did
+before this layer existed — it now simply applies to all three legs instead
+of one. The last two narrow that baseline to one leg: `<leg>/all.md` for
+every model in this leg, `<leg>/model/<model>.md` for this model in this leg
+alone, general first within the leg-scoped pair too.
+
+`implement`, `review` and `fix` are reserved directory names at the root of a
+prompts directory — a model can never be called `review`. There is no actual
+collision to worry about: a model id is always sanitised into `model/<id>.md`
+(below), never written at the root, so a model literally named `review`
+still cannot shadow the leg directory. But a reader should not have to work
+that out to know a model id is safe to pick; treat the three leg names as
+off-limits at the root, full stop.
 
 There is no glob or family matching (`qwen*.md` for a whole model family is
 tempting, but the override order gets fiddly fast, and this project prefers
@@ -118,15 +153,31 @@ that before spending the run.
 ## `--dry-run` shows what a run would get
 
 `--dry-run` already resolves and prints the harness and model without
-creating anything. It also prints the resolved prompts directory, the
-fragments that would apply, and their rev — so `--prompts-dir` can be
-checked before it is spent on a real run.
+creating anything. It also prints the resolved prompts directory, one
+`prompt_overlay_fragments[<leg>]=` line per leg with that leg's fragments in
+composition order (comma-separated, empty when the leg matched nothing), and
+the one rev that covers all of them:
+
+```
+prompt_overlay_dir=/home/you/.config/fork-sandbox/prompts
+prompt_overlay_fragments[implement]=all.md,model/qwen3.5-9b.md
+prompt_overlay_fragments[review]=all.md,review/all.md
+prompt_overlay_fragments[fix]=all.md,fix/all.md,fix/model/qwen3.5-9b.md
+prompt_overlay_rev=abc1234
+```
+
+`--dry-run` knows, from `--review-loop`, exactly which legs a real run would
+generate — the same flag the real run reads — so it reports exactly those
+legs and no others. Without `--review-loop`, only `implement` is printed;
+review and fix never ran, so there is nothing to report for them. This is
+what lets a reader see, at a glance, that the fix leg gets a fragment the
+review leg does not: check `--prompts-dir` before it is spent on a real run.
 
 ## Provenance: what the run record carries
 
 A prompt is part of what produced a result, so a change to one has to be
-attributable the same way a code change is. When an overlay applies,
-`fork-sandbox.sh` writes `<run-dir>/prompt-overlay.json`, and
+attributable the same way a code change is. When an overlay applies to at
+least one leg, `fork-sandbox.sh` writes `<run-dir>/prompt-overlay.json`, and
 `sandbox-run-log.py record` folds it into the run's log entry under
 `prompt_overlay`:
 
@@ -134,32 +185,53 @@ attributable the same way a code change is. When an overlay applies,
 "prompt_overlay": {
   "dir": "/home/you/.config/fork-sandbox/prompts",
   "rev": "abc1234-dirty",
-  "fragments": ["all.md", "model/qwen3.5-9b.md"],
-  "sha256": "…"
+  "legs": {
+    "implement": {
+      "fragments": ["all.md", "model/qwen3.5-9b.md"],
+      "sha256": "…"
+    },
+    "fix": {
+      "fragments": ["all.md", "fix/all.md", "fix/model/qwen3.5-9b.md"],
+      "sha256": "…"
+    }
+  }
 }
 ```
 
-- **`dir`** — the source directory this run read.
-- **`fragments`** — the relative paths that matched, in composition order.
-- **`sha256`** — a fingerprint of exactly the bytes concatenated into the
-  prompt, independent of git state.
+- **`dir`** — the source directory this run read. A fact about the run, not
+  about any one leg, so it stays at the top level.
 - **`rev`** — `git rev-parse HEAD` of the prompts directory, when it is a git
   repository. **If its working tree has uncommitted changes, the rev is
   suffixed `-dirty`.** This is the one rule that has to be right: a record
-  that names a clean commit which did not actually produce the run's prompt
+  that names a clean commit which did not actually produce the run's prompts
   is worse than a record with no rev at all, because it looks trustworthy
   when it is lying. The dirty check (`git status --porcelain`) is scoped to
   the prompts directory itself, not the whole repository it may live inside.
-  When the directory is not a git repository at all, `rev` is `null` — the
-  fragment list and the hash still work, and still identify exactly what ran.
+  When the directory is not a git repository at all, `rev` is `null`. Like
+  `dir`, one rev covers every leg — the directory did not change git state
+  between rendering the implement prompt and rendering the fix prompt.
+- **`legs`** — one key per leg that matched at least one fragment:
+  `implement`, `review`, `fix`. A leg that matched nothing is absent from
+  `legs` entirely, and `review`/`fix` are absent altogether from a run made
+  without `--review-loop`, since those legs never rendered a prompt to carry
+  provenance for. Each present leg holds:
+  - **`fragments`** — the relative paths that matched for that leg, in
+    composition order (the five-file search order above, filtered to what
+    existed).
+  - **`sha256`** — a fingerprint of exactly the bytes concatenated into that
+    leg's prompt, independent of git state. Two legs that matched the same
+    fragments (root-level `all.md` only, say) get the same hash; a leg with
+    its own `<leg>/all.md` gets a different one.
 
-No key is written at all when a run applied no overlay — the common case, and
-the same shape a run made before this mechanism existed already had.
+No `prompt_overlay` key is written at all when a run applied no overlay to
+any leg — the common case, and the same shape a run made before this
+mechanism existed already had.
 
 Query it like any other dimension `sandbox-run-log.py` groups on:
 
 ```
 sandbox-run-log.py stats --by model,prompt_overlay.rev
+sandbox-run-log.py stats --by prompt_overlay.legs.fix.sha256
 ```
 
 ## What is deliberately not here
