@@ -59,6 +59,19 @@ The review loop (fork-sandbox.sh --review-loop N):
                iteration, and the per-iteration costs say what that was
                worth.
 
+The prompt overlay (fork-sandbox.sh --prompts-dir, or a machine's default
+~/.config/fork-sandbox/prompts):
+  prompt_overlay  present only when a run applied one. `dir` is the source
+                  directory, `fragments` the relative paths that matched, in
+                  the order they were composed, `sha256` a fingerprint of
+                  their concatenated bytes, and `rev` the source directory's
+                  git HEAD -- suffixed `-dirty` if its working tree had
+                  uncommitted changes, or null if it is not a git repo at
+                  all. This ships no fragment content of its own; see
+                  docs/prompt-overlays.md. Group on it directly: `stats --by
+                  model,prompt_overlay.rev` says which prompt revision a
+                  model's outcomes actually came from.
+
 Verdict outcomes:
   integrated             merged as-is, or with trivial touch-ups
   integrated-with-fixes  merged after this session fixed real defects
@@ -277,6 +290,16 @@ def cmd_record(args):
     review_loop = load_json_file(os.path.join(rd, "review-loop.json"))
     if review_loop is not None:
         rec["review_loop"] = review_loop
+
+    # The prompt overlay's provenance, when the run applied one: which
+    # machine-local fragments, from where, at what rev (marked -dirty if the
+    # prompts working tree had uncommitted changes when the run started, null
+    # if the directory is not a git repo at all). No key at all when the run
+    # had no prompts directory or nothing in it matched -- readers must not
+    # assume it is there. See docs/prompt-overlays.md.
+    prompt_overlay = load_json_file(os.path.join(rd, "prompt-overlay.json"))
+    if prompt_overlay is not None:
+        rec["prompt_overlay"] = prompt_overlay
 
     # The handoff is the prompt, and the run dir it lives in gets deleted
     # after review -- archive it, so prompt iteration has the actual text to
