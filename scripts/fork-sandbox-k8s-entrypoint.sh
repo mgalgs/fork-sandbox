@@ -33,6 +33,13 @@
 #   INPUTS_TIMEOUT  seconds to wait for the repository push. Default 300.
 #   RUN_TTL         seconds to idle after the agent exits, so the clone is
 #                   still there when the client fetches. Default 3600.
+#   REVIEW_LOOP_CAP the maximum review-then-fix iterations to run after the
+#                   coding leg, for fork-sandbox-k8s.sh's --review-loop.
+#                   Default 0 (no loop). Set by fork-sandbox-k8s.sh's
+#                   `submit` only when --review-loop was given.
+#   BASE_SHA        the commit the branch is measured against, for the
+#                   review loop's commit range. Required when
+#                   REVIEW_LOOP_CAP is set; unused otherwise.
 #
 # Reads from /mnt/fork-sandbox/ (the scripts ConfigMap, mounted read-only):
 #   handoff.md              the run's whole prompt, on pi's stdin.
@@ -41,13 +48,25 @@
 #                           local run's ~/.pi/agent from. Only the
 #                           defaultProvider/defaultModel keys are generated
 #                           fresh here; everything else in it survives.
+#   review-prompt.md, fix-prompt-header.md, code-review-portable-skill.md,
+#   review-loop.sh          present only when REVIEW_LOOP_CAP is set. The
+#                           first two are the review and fix leg prompts,
+#                           fully rendered on the HOST by
+#                           fork-sandbox-k8s.sh (fs_emit_review_prompt_body /
+#                           fs_emit_fix_prompt_body in fork-sandbox-lib.sh) --
+#                           this script never composes prompt text of its
+#                           own. review-loop.sh is the loop's own control
+#                           flow; see its header for why it is a separate
+#                           script.
 #
 # Creates /work/inbox: the operator inbox, written to from outside the pod
 # by `fork-sandbox-k8s.sh say` over kubectl exec, and read by the agent per
 # the preamble fs_emit_prompt_preamble renders into handoff.md. It is a
 # sibling of clone_dir, never a descendant of it, so the `git add -A` this
 # script runs at the bottom -- scoped to clone_dir, the repository it is run
-# in -- can never sweep an addendum into a commit.
+# in -- can never sweep an addendum into a commit. /work/skills, created
+# below when a review skill is shipped, is a sibling for the identical
+# reason.
 
 set -euo pipefail
 
@@ -58,18 +77,40 @@ set -euo pipefail
 : "${GIT_USER_EMAIL:=agent@fork-sandbox.invalid}"
 : "${INPUTS_TIMEOUT:=300}"
 : "${RUN_TTL:=3600}"
+: "${REVIEW_LOOP_CAP:=0}"
+if [[ "$REVIEW_LOOP_CAP" =~ ^[1-9][0-9]*$ ]]; then
+    : "${BASE_SHA:?BASE_SHA must be set when REVIEW_LOOP_CAP is set}"
+elif [[ "$REVIEW_LOOP_CAP" != "0" ]]; then
+    echo "Error: REVIEW_LOOP_CAP must be a non-negative integer, got '$REVIEW_LOOP_CAP'." >&2
+    exit 1
+fi
 
 mounts_dir=/mnt/fork-sandbox
 work_dir=/work
 repo_bare="$work_dir/repo.git"
 clone_dir="$work_dir/clone"
 inbox_dir="$work_dir/inbox"
+skill_dir="$work_dir/skills/code-review-portable"
 sentinel="$work_dir/.inputs-complete"
 fetched_marker="$work_dir/.fetched"
 run_complete="$work_dir/.run-complete"
 
 echo "fork-sandbox-k8s-entrypoint: creating $inbox_dir" >&2
 mkdir -p "$inbox_dir"
+
+# The review skill, staged only when this run carries one. A ConfigMap key
+# cannot contain '/', so the skill arrives flattened at
+# code-review-portable-skill.md and is placed here at the path the review
+# prompt (rendered on the host, see fs_emit_review_prompt_body) names it at.
+# /work/skills is a SIBLING of clone_dir, never a descendant of it -- the
+# same structural reason /work/inbox above is a sibling -- so the
+# `git add -A` this script runs at the bottom, scoped to clone_dir, can
+# never sweep it into a commit.
+if [[ -f "$mounts_dir/code-review-portable-skill.md" ]]; then
+    echo "fork-sandbox-k8s-entrypoint: staging the review skill at $skill_dir" >&2
+    mkdir -p "$skill_dir"
+    cp "$mounts_dir/code-review-portable-skill.md" "$skill_dir/SKILL.md"
+fi
 
 echo "fork-sandbox-k8s-entrypoint: initializing $repo_bare" >&2
 git init --quiet --bare "$repo_bare"
@@ -139,6 +180,20 @@ if ! jq -n --argjson base "$settings_base" --arg model "$MODEL" \
 fi
 mv "$HOME/.pi/agent/settings.json.new" "$HOME/.pi/agent/settings.json"
 
+# A safety net run after both the coding leg and (when there is one) the
+# review loop: whichever left work uncommitted must not lose it. A single
+# function rather than two copies, so the call at each site stays short --
+# nesting three levels deep inside the review-loop block below is exactly
+# where a repeated inline version would blow past this file's own line
+# length.
+commit_uncommitted_work() {
+    if [[ -n "$(git status --porcelain)" ]]; then
+        echo "fork-sandbox-k8s-entrypoint: committing uncommitted work ($1)" >&2
+        git add -A
+        git commit --quiet -m "fork-sandbox: commit uncommitted work at run end"
+    fi
+}
+
 echo "fork-sandbox-k8s-entrypoint: running pi" >&2
 pi_rc=0
 pi --provider proxy --model "$MODEL" --mode json -p \
@@ -148,12 +203,63 @@ pi --provider proxy --model "$MODEL" --mode json -p \
     || pi_rc=$?
 echo "fork-sandbox-k8s-entrypoint: pi exited $pi_rc" >&2
 
-if [[ -n "$(git status --porcelain)" ]]; then
-    echo "fork-sandbox-k8s-entrypoint: committing work the agent left uncommitted" >&2
-    git add -A
-    git commit --quiet -m "fork-sandbox: commit uncommitted work at run end"
+commit_uncommitted_work "coding leg"
+
+# The --review-loop pass, when this run carries one. Runs pod-side -- the
+# pod owns the clone, so a fresh review/fix session per iteration costs no
+# kubectl round trip. See review-loop.sh's own header for the control flow;
+# this block only decides whether to run it and folds its result in.
+if [[ "$REVIEW_LOOP_CAP" =~ ^[1-9][0-9]*$ ]]; then
+    if [[ "$pi_rc" != "0" ]]; then
+        # A session that died of a model error must not be reviewed as if
+        # it had worked -- the same rule fork-sandbox.sh's own local loop
+        # follows. There is no review-loop.sh invocation to make that call
+        # itself here, since only this script knows pi's exit code, so the
+        # skip and its review-loop.json are written right here rather than
+        # threaded into the loop script's interface.
+        echo "fork-sandbox-k8s-entrypoint: pi exited $pi_rc; skipping the review loop" >&2
+        jq -n --argjson cap "$REVIEW_LOOP_CAP" --arg rc "$pi_rc" '{
+            cap: $cap,
+            ended: "skipped",
+            detail: ("the session exited " + $rc + ", so there is nothing worth reviewing"),
+            iterations: [],
+        }' > "$work_dir/review-loop.json"
+    else
+        echo "fork-sandbox-k8s-entrypoint: running the review loop" >&2
+        loop_rc=0
+        bash "$mounts_dir/review-loop.sh" \
+            --clone "$clone_dir" \
+            --cap "$REVIEW_LOOP_CAP" \
+            --base-sha "$BASE_SHA" \
+            --review-prompt "$mounts_dir/review-prompt.md" \
+            --fix-header "$mounts_dir/fix-prompt-header.md" \
+            --verdict "$clone_dir/.git/review-verdict.md" \
+            --work-dir "$work_dir" \
+            --out "$work_dir/review-loop.json" \
+            || loop_rc=$?
+        if [[ "$loop_rc" != "0" ]]; then
+            # Not propagated to this container's own exit status -- see the
+            # comment on run_complete below. review-loop.json is where the
+            # loop's outcome actually lives.
+            echo "fork-sandbox-k8s-entrypoint: review-loop.sh exited $loop_rc" >&2
+        fi
+
+        # Deliberately NOT run between iterations -- review-loop.sh's own
+        # no-progress detection reads the branch head, and auto-committing
+        # mid-loop would make "a fix leg committed nothing" undetectable
+        # from inside it.
+        commit_uncommitted_work "review loop"
+    fi
 fi
 
+# .run-complete holds the CODING leg's exit code, never the review loop's --
+# even when a loop ran and even if it ended in harness-error. This mirrors
+# fork-sandbox.sh's own local loop, where `rc` stays the implement leg's
+# code and the loop never reassigns it: the loop's outcome travels in
+# review-loop.json instead, and cmd_run reports it separately (see
+# fork-sandbox-k8s.sh). Do not "fix" this to propagate the loop's result
+# into the process exit code -- that would collapse two different signals
+# (did the AGENT'S work run, did the REVIEW judge it clean) into one.
 printf '%s\n' "$pi_rc" > "$run_complete"
 
 echo "fork-sandbox-k8s-entrypoint: idling up to ${RUN_TTL}s for the fetch" >&2
