@@ -151,8 +151,8 @@ reach it — see "What it gives up".)
    ```
 
    Read a single fact with `--json` rather than grepping the prose — the
-   cost is a decimal, and the obvious strip-to-digits turns `$0.076198`
-   into `076198`:
+   cost is a decimal with a currency prefix, and the obvious
+   strip-to-digits mangling turns it into `076198`:
    ```bash
    fork-sandbox-status.sh --json <run-dir> | jq .cost_usd
    ```
@@ -287,7 +287,7 @@ same sandbox with egress sealed and the one endpoint bridged in over a unix
 socket. Read `agent-sandboxed`'s header for how that works.
 
 - **It costs nothing.** The tokens are yours. The summary still prints a
-  `cost:` line and it reads `$0.000000`.
+  `cost:` line and it reads all zeros.
 - **Nothing secret is inside.** A local endpoint needs no credential, so
   unlike a `pi` or `codex` run there is no key in the sandbox at all.
 - **It cannot exfiltrate or reach the LAN**, because there is nowhere to
@@ -470,7 +470,7 @@ The contract, all under `.agents/sandbox-services/`:
   is scanned too.
 - **`sandbox-services.sh`** — runs on the host, invoked by the wrapper. It
   must find its `compose.yaml` **relative to itself**
-  (`dirname "$(readlink -f "$0")"`), not under the clone: the wrapper runs a
+  (`dirname "$(readlink -f "${0}")"`), not under the clone: the wrapper runs a
   copy taken before the sandbox started, and the clone's copy is untrusted by
   the time `down` runs. The wrapper passes positional arguments only and sets
   no environment. The hook itself must export every variable the compose

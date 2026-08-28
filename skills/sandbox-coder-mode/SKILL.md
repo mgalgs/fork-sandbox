@@ -330,7 +330,7 @@ fork-sandbox-status.sh --json <run-dir> | jq .cost_usd
 ```
 
 `--json` also carries the token counts and the harness version. A `pi-local`
-run reads `$0.000000`; a codex run reports tokens and a null cost.
+run reads a zero cost; a codex run reports tokens and a null cost.
 
 ## When NOT to use this mode
 
