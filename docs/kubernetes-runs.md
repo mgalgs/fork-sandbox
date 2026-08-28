@@ -135,12 +135,40 @@ rather than by mount flags.
 Service, no Ingress, no new credential. One machinery, one failure mode. The
 image must carry `tar`, which the shipping image does.
 
-**It forces a two-phase start, and that is a gate.** The pod starts, waits, the
-client copies, the client signals, and only then does the agent run. **It must
-fail closed.** If the copy does not land, the agent must not start with its
-inputs missing — a silently absent input is the same failure class as a silently
-absent bind, which is a bug this project has already paid for once. The
-container backend's sentinel gate is the shape to copy.
+**When files are expected, it forces a two-phase start, and that is a gate.**
+The pod starts, waits, the client copies, the client signals, and only then does
+the agent run.
+
+**A run with no `--copy-files` has no gate at all.** Not a wait that expires
+immediately — no wait path in the bootstrap to get wrong. That is the common
+case and it should cost nothing. The Job spec says which case it is, because the
+client knows at submission time whether it passed the flag.
+
+**The signal is a sentinel, not a boolean.** "Expect files: yes" is the weak
+form: it is satisfied by a *partial* copy, so a client that copies three of four
+paths and then dies leaves a pod that sees something arrive and runs the agent
+without the fourth. Instead the client writes one marker **after the last
+successful copy**, and the pod waits for exactly that. A partial copy never
+produces it.
+
+This is the same reasoning, and the same shape, as the pin gate: poll for one
+specific thing installed last, and treat its appearance as proof the whole
+program ran. That backend learned it by having a poll that could land between
+steps and see a pin it could not trust.
+
+**And it must fail closed.** A deadline bounds the wait, and expiry means the
+run fails rather than proceeding — a client that dies mid-copy must not become
+an agent running with its inputs missing. A silently absent input is the same
+failure class as a silently absent bind, which this project has already paid for
+once.
+
+An optimization worth recording but not building yet: the small-data case above
+would fit in a per-run ConfigMap or Secret, mounted at pod start, which skips
+the gate entirely because the files are simply there when the container starts.
+It is tempting, but it is a second mechanism with a hard size ceiling near a
+mebibyte, and a gathered-context directory exceeds that easily. One mechanism
+with a gate is the better starting point; add the shortcut only if the small
+case turns out to dominate.
 
 ### What this does *not* replace
 
