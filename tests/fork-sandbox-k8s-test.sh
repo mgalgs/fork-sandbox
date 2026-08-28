@@ -9,8 +9,9 @@
 # the whole point of --dry-run existing -- see docs/kubernetes-runs.md.
 #
 # It covers:
-#   - shellcheck on the five new scripts (the client, the platform plugin,
-#     the pod entrypoint, the egress gate, the inbox writer).
+#   - shellcheck on the six new scripts (the client, the platform plugin,
+#     the pod entrypoint, the egress gate, the inbox writer, the review
+#     loop).
 #   - yamllint on manifests/k8s/ and on the install/submit/run --dry-run
 #     renders.
 #   - fork-sandbox-k8s-platform-generic's two verbs.
@@ -47,6 +48,27 @@
 #     the same Job YAML `fork-sandbox-k8s.sh run --dry-run` does for the
 #     same arguments -- proving the dispatcher execs rather than growing a
 #     divergent copy of anything.
+#   - `submit --dry-run --review-loop N`: the four review-loop ConfigMap
+#     keys (review-prompt.md, fix-prompt-header.md,
+#     code-review-portable-skill.md, review-loop.sh) and the REVIEW_LOOP_CAP
+#     / BASE_SHA env vars render only with the flag, never without it; the
+#     rendered review-prompt.md and fix-prompt-header.md are byte-for-byte
+#     what fs_emit_prompt_preamble + fs_emit_review_prompt_body /
+#     fs_emit_fix_prompt_body produce for the same arguments, with no
+#     overlay in between -- the property that keeps this from growing a
+#     second copy of the prompt text; the rendered review prompt names the
+#     POD's skill and verdict paths, never a host path; --review-loop 0 and
+#     a non-numeric value are both rejected before any kubectl call.
+#   - fork-sandbox.sh --k8s --review-loop N is no longer refused, and
+#     --review-model still is (with an updated reason: one model slot in
+#     the pod's models.json, not "no review leg at all").
+#   - fork-sandbox-k8s-review-loop.sh, the pod-side review/fix loop, driven
+#     directly against a scratch git repo with PI_BIN pointed at a stub --
+#     no cluster, no pod, no real pi. Covers every ended value the control
+#     flow can reach: approved, findings-then-fix-with-progress,
+#     no-progress, harness-error (a bad first verdict line, a missing
+#     verdict, and a SYMLINKED verdict whose target is never read), cap,
+#     and skipped (branch head already at --base-sha).
 #
 # This lives in tests/ rather than scripts/tests/ on purpose: install.sh
 # iterates scripts/* and runs `sed -n 2p` on each entry to build the
@@ -78,12 +100,26 @@ platform_generic="$repo_dir/scripts/fork-sandbox-k8s-platform-generic"
 entrypoint_sh="$repo_dir/scripts/fork-sandbox-k8s-entrypoint.sh"
 gate_sh="$repo_dir/scripts/fork-sandbox-k8s-egress-gate.sh"
 inbox_write_sh="$repo_dir/scripts/fork-sandbox-k8s-inbox-write.sh"
+review_loop_sh="$repo_dir/scripts/fork-sandbox-k8s-review-loop.sh"
+
+# Sourced directly into this shell, not a subshell: ok()/no() below have to
+# reach the pass/fail counters this file reports at the end, and a subshell
+# (command substitution, or the read side of a pipe) would trap them there.
+# Sourced up here, rather than only where fs_require_scratch_handoff is
+# first used further down, because the --review-loop ConfigMap-rendering
+# section below also needs fs_emit_prompt_preamble / fs_emit_review_prompt_body
+# / fs_emit_fix_prompt_body directly, to compute the byte-for-byte expected
+# prompt text.
+# shellcheck source-path=SCRIPTDIR/../scripts
+# shellcheck source=../scripts/fork-sandbox-lib.sh
+# shellcheck disable=SC1091  # plain shellcheck cannot follow it; use -x
+source "$lib_sh"
 
 printf '== shellcheck ==\n'
 if ! command -v shellcheck >/dev/null 2>&1; then
     printf '  SKIP  shellcheck not installed\n'
 else
-    for f in "$k8s_sh" "$platform_generic" "$entrypoint_sh" "$gate_sh" "$inbox_write_sh"; do
+    for f in "$k8s_sh" "$platform_generic" "$entrypoint_sh" "$gate_sh" "$inbox_write_sh" "$review_loop_sh"; do
         out="$(shellcheck "$f" 2>&1)"
         if [[ -z "$out" ]]; then ok "shellcheck: $(basename "$f")"; else no "shellcheck: $(basename "$f")" "$out"; fi
     done
@@ -370,6 +406,134 @@ else
 fi
 rm -f /tmp/fs-k8s-test-install.err /tmp/fs-k8s-test-submit.err
 
+printf '\n== fork-sandbox-k8s.sh submit --dry-run --review-loop N ==\n'
+# Extracts one ConfigMap data key's block-scalar content, reversing
+# indent_block's 4-space indent -- the same technique extract_nginx_conf
+# above uses for the nginx.conf key, generalized to any key name so it can
+# pull review-prompt.md and fix-prompt-header.md back out for a byte-for-byte
+# comparison against what fs_emit_prompt_preamble / fs_emit_review_prompt_body
+# / fs_emit_fix_prompt_body produce directly.
+extract_configmap_key() {
+    local key="$1" file="$2"
+    awk -v k="  ${key}: |" '
+        $0 == k { flag=1; next }
+        flag && (length($0)==0 || substr($0,1,4)=="    ") { print substr($0,5); next }
+        flag { flag=0 }
+    ' "$file"
+}
+
+proj_base_sha="$(git -C "$proj_dir" rev-parse HEAD)"
+rl_submit_out="$(newdir)/rl-submit.yaml"; tmpdirs+=("$(dirname "$rl_submit_out")")
+if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-rl-branch --model moonshotai/kimi-k3 --review-loop 2 \
+    "$proj_dir" "$handoff_file" > "$rl_submit_out" 2>/tmp/fs-k8s-test-rl-submit.err; then
+    ok "submit --dry-run --review-loop 2 exits 0"
+else
+    no "submit --dry-run --review-loop 2 exits 0" "$(cat /tmp/fs-k8s-test-rl-submit.err)"
+fi
+if command -v yamllint >/dev/null 2>&1; then
+    # Only structural validity is asserted here, not zero warnings: the
+    # rendered review/fix prompt bodies and the skill's own front matter
+    # carry long prose lines by nature, which .yamllint's own header comment
+    # documents as an accepted, non-error condition for exactly this file.
+    out="$(yamllint -d "{extends: default, rules: {line-length: disable}}" "$rl_submit_out" 2>&1)"
+    if [[ -z "$out" ]]; then ok "yamllint: submit --dry-run --review-loop output (line-length excluded)"
+    else no "yamllint: submit --dry-run --review-loop output (line-length excluded)" "$out"; fi
+fi
+
+# Item: the four review-loop-only ConfigMap keys render with the flag, and
+# render in NONE of the earlier no-flag submit_out.
+for key in review-prompt.md fix-prompt-header.md code-review-portable-skill.md review-loop.sh; do
+    if grep -qF "  $key: |" "$rl_submit_out"; then
+        ok "submit --review-loop renders the $key ConfigMap key"
+    else
+        no "submit --review-loop renders the $key ConfigMap key" "not found in $rl_submit_out"
+    fi
+    if grep -qF "  $key: |" "$submit_out"; then
+        no "submit without --review-loop renders no $key ConfigMap key" "found in $submit_out"
+    else
+        ok "submit without --review-loop renders no $key ConfigMap key"
+    fi
+done
+
+# Item: REVIEW_LOOP_CAP / BASE_SHA env present with the flag, absent without
+# it. Matched as full Job-spec env entries ("- name: X"), not a bare
+# substring search -- entrypoint.sh's own header comment now mentions both
+# names in prose, and that comment is embedded in EVERY render, flag or not.
+if grep -qF -- '- name: REVIEW_LOOP_CAP' "$rl_submit_out" \
+    && grep -qF -- '- name: BASE_SHA' "$rl_submit_out"; then
+    ok "submit --review-loop renders REVIEW_LOOP_CAP and BASE_SHA env entries"
+else
+    no "submit --review-loop renders REVIEW_LOOP_CAP and BASE_SHA env entries" \
+        "not found in $rl_submit_out"
+fi
+if grep -qF -- '- name: REVIEW_LOOP_CAP' "$submit_out" \
+    || grep -qF -- '- name: BASE_SHA' "$submit_out"; then
+    no "submit without --review-loop renders no REVIEW_LOOP_CAP/BASE_SHA env entries" \
+        "found in $submit_out"
+else
+    ok "submit without --review-loop renders no REVIEW_LOOP_CAP/BASE_SHA env entries"
+fi
+
+# Item: the rendered review-prompt.md / fix-prompt-header.md are
+# byte-for-byte what fs_emit_prompt_preamble + fs_emit_review_prompt_body /
+# fs_emit_fix_prompt_body produce for the same arguments, with NO overlay in
+# between -- the property that keeps fork-sandbox-k8s.sh from ever growing a
+# second copy of this prompt text. Same assertion style
+# tests/fork-sandbox-prompt-overlay-test.sh already uses for the local path.
+pod_clone_dir_expected=/work/clone
+pod_inbox_dir_expected=/work/inbox
+pod_skill_dir_expected=/work/skills/code-review-portable
+pod_verdict_file_expected=/work/clone/.git/review-verdict.md
+expected_rl_review_prompt="$({ fs_emit_prompt_preamble "$pod_clone_dir_expected" \
+        "$pod_inbox_dir_expected" pi gated pod
+    fs_emit_review_prompt_body fs-k8s-test-rl-branch "$proj_base_sha" \
+        "$pod_skill_dir_expected" "$pod_verdict_file_expected" "$pod_inbox_dir_expected"
+})"
+actual_rl_review_prompt="$(extract_configmap_key review-prompt.md "$rl_submit_out")"
+check "review-prompt.md renders byte-for-byte (preamble + body, no overlay)" \
+    "$expected_rl_review_prompt" "$actual_rl_review_prompt"
+
+expected_rl_fix_header="$({ fs_emit_prompt_preamble "$pod_clone_dir_expected" \
+        "$pod_inbox_dir_expected" pi gated pod
+    fs_emit_fix_prompt_body fs-k8s-test-rl-branch "$proj_base_sha"
+})"
+actual_rl_fix_header="$(extract_configmap_key fix-prompt-header.md "$rl_submit_out")"
+check "fix-prompt-header.md renders byte-for-byte (preamble + body, no overlay)" \
+    "$expected_rl_fix_header" "$actual_rl_fix_header"
+
+# Item: the rendered review prompt names the POD's paths, never a host path
+# -- proof this run's clone-under-/var/tmp and the operator's real project
+# path never leak into a prompt a model on the internet is about to read.
+if grep -qF '/work/skills/code-review-portable' "$rl_submit_out" \
+    && grep -qF '/work/clone/.git/review-verdict.md' "$rl_submit_out"; then
+    ok "rendered review prompt names the pod's skill and verdict paths"
+else
+    no "rendered review prompt names the pod's skill and verdict paths" \
+        "not found in $rl_submit_out"
+fi
+if grep -qF "$proj_dir" "$rl_submit_out"; then
+    no "rendered review prompt does not name the host project path" \
+        "found $proj_dir in $rl_submit_out"
+else
+    ok "rendered review prompt does not name the host project path"
+fi
+
+# Item: --review-loop 0 and a non-numeric value are both rejected, before
+# any kubectl call -- --dry-run proves that, the same way it does for every
+# other flag-validation case in this file.
+refuses "submit --review-loop 0 is rejected" \
+    "--review-loop takes a positive integer" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-rl-bad --model moonshotai/kimi-k3 --review-loop 0 \
+    "$proj_dir" "$handoff_file"
+refuses "submit --review-loop abc is rejected" \
+    "--review-loop takes a positive integer" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-rl-bad --model moonshotai/kimi-k3 --review-loop abc \
+    "$proj_dir" "$handoff_file"
+rm -f /tmp/fs-k8s-test-rl-submit.err
+
 printf '\n== fork-sandbox-k8s.sh run --dry-run (fixture config, no cluster) ==\n'
 run_out="$(newdir)/run.yaml"; tmpdirs+=("$(dirname "$run_out")")
 if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" run --dry-run \
@@ -511,19 +675,213 @@ else
     ok "no kubectl exec uses -t (would corrupt the pack stream)"
 fi
 
+printf '\n== fork-sandbox-k8s-review-loop.sh: control flow (no cluster) ==\n'
+# Driven directly against a scratch git repo, with PI_BIN pointed at a tiny
+# stub that reads the prompt off stdin (discarded) and writes a canned
+# verdict / commit per the test's own logic. No cluster, no pod, no real pi
+# -- this is the same reason fork-sandbox-k8s-inbox-write.sh's own section
+# above runs the real script directly rather than re-implementing its logic
+# in the test.
+rl_sh="$repo_dir/scripts/fork-sandbox-k8s-review-loop.sh"
+
+# A fresh one-commit-past-base git repo, with review-prompt.md/fix-header.md
+# fixtures (their content is irrelevant to the control flow under test --
+# the stub ignores stdin) and a work dir for the loop's own artifacts.
+# Returns "repo base_sha work_dir review_prompt fix_header out" on stdout,
+# callers split with `read`. The fixture's own root is `dirname "$repo"`,
+# which is what callers register with tmpdirs for cleanup.
+new_rl_fixture() {
+    local d repo base_sha work
+    d="$(mktemp -d /var/tmp/claude-scratch/fs-k8s-rl-test.XXXXXX)"
+    repo="$d/repo"
+    mkdir -p "$repo"
+    git -C "$repo" init -q
+    git -C "$repo" -c user.email=t@fork-sandbox.invalid -c user.name=t \
+        commit -q --allow-empty -m init
+    base_sha="$(git -C "$repo" rev-parse HEAD)"
+    git -C "$repo" -c user.email=t@fork-sandbox.invalid -c user.name=t \
+        commit -q --allow-empty -m "the coding leg's work"
+    printf 'review prompt fixture\n' > "$d/review-prompt.md"
+    printf 'fix header fixture\n' > "$d/fix-header.md"
+    work="$d/work"
+    printf '%s %s %s %s %s %s\n' "$repo" "$base_sha" "$work" \
+        "$d/review-prompt.md" "$d/fix-header.md" "$d/review-loop.json"
+}
+
+# jq -r '.ended' / '.iterations | length' / '.iterations[N].FIELD' against
+# the written review-loop.json, for terse assertions below.
+rl_json() { jq -r "$2" "$1" 2>/dev/null; }
+
+printf '\n-- approved on the first review --\n'
+stub_dir="$(mktemp -d /var/tmp/claude-scratch/fs-k8s-rl-stub.XXXXXX)"; tmpdirs+=("$stub_dir")
+cat > "$stub_dir/pi-approve" <<'STUB'
+#!/bin/sh
+cat >/dev/null
+echo APPROVED > "$RL_TEST_VERDICT"
+exit 0
+STUB
+chmod +x "$stub_dir/pi-approve"
+read -r repo base_sha work review_prompt fix_header out < <(new_rl_fixture)
+tmpdirs+=("$(dirname "$repo")")
+RL_TEST_VERDICT="$repo/.git/review-verdict.md" PI_BIN="$stub_dir/pi-approve" MODEL=test-model \
+    "$rl_sh" --clone "$repo" --cap 2 --base-sha "$base_sha" \
+    --review-prompt "$review_prompt" --fix-header "$fix_header" \
+    --verdict "$repo/.git/review-verdict.md" --work-dir "$work" --out "$out" \
+    >/dev/null 2>&1
+check "approved: ended=approved" "approved" "$(rl_json "$out" '.ended')"
+check "approved: one iteration recorded" "1" "$(rl_json "$out" '.iterations | length')"
+check "approved: findings=0" "0" "$(rl_json "$out" '.iterations[0].findings')"
+
+printf '\n-- findings, then a fix leg that makes progress --\n'
+stub_dir2="$(mktemp -d /var/tmp/claude-scratch/fs-k8s-rl-stub.XXXXXX)"; tmpdirs+=("$stub_dir2")
+read -r repo base_sha work review_prompt fix_header out < <(new_rl_fixture)
+tmpdirs+=("$(dirname "$repo")")
+counter_file="$stub_dir2/count"
+cat > "$stub_dir2/pi-dispatch" <<STUB
+#!/bin/sh
+cat >/dev/null
+n=0
+[ -f "$counter_file" ] && n=\$(cat "$counter_file")
+n=\$((n + 1))
+echo \$n > "$counter_file"
+if [ \$((n % 2)) -eq 1 ]; then
+    printf 'FINDINGS\n\nsomething is wrong at foo.c:12\n' > "\$RL_TEST_VERDICT"
+else
+    git -C "$repo" -c user.email=t@fork-sandbox.invalid -c user.name=t \\
+        commit -q --allow-empty -m "fix \$n"
+fi
+exit 0
+STUB
+chmod +x "$stub_dir2/pi-dispatch"
+RL_TEST_VERDICT="$repo/.git/review-verdict.md" PI_BIN="$stub_dir2/pi-dispatch" MODEL=test-model \
+    "$rl_sh" --clone "$repo" --cap 2 --base-sha "$base_sha" \
+    --review-prompt "$review_prompt" --fix-header "$fix_header" \
+    --verdict "$repo/.git/review-verdict.md" --work-dir "$work" --out "$out" \
+    >/dev/null 2>&1
+check "progress: ended=cap (findings still open after 2 iterations)" \
+    "cap" "$(rl_json "$out" '.ended')"
+check "progress: iteration 1 findings=1" "1" "$(rl_json "$out" '.iterations[0].findings')"
+check "progress: iteration 1 head_after != head_before" "true" \
+    "$(rl_json "$out" 'if .iterations[0].head_after != .iterations[0].head_before then "true" else "false" end')"
+check "progress: iteration 1 commits_added=1" "1" "$(rl_json "$out" '.iterations[0].commits_added')"
+if [[ -f "$work/fix-prompt-1.md" ]] && grep -qF 'fix header fixture' "$work/fix-prompt-1.md" \
+    && grep -qF 'something is wrong at foo.c:12' "$work/fix-prompt-1.md"; then
+    ok "the fix prompt concatenates the fix header and the verdict"
+else
+    no "the fix prompt concatenates the fix header and the verdict" \
+        "$(cat "$work/fix-prompt-1.md" 2>/dev/null)"
+fi
+
+printf '\n-- no-progress: the fix leg commits nothing --\n'
+stub_dir3="$(mktemp -d /var/tmp/claude-scratch/fs-k8s-rl-stub.XXXXXX)"; tmpdirs+=("$stub_dir3")
+read -r repo base_sha work review_prompt fix_header out < <(new_rl_fixture)
+tmpdirs+=("$(dirname "$repo")")
+cat > "$stub_dir3/pi-findings-only" <<'STUB'
+#!/bin/sh
+cat >/dev/null
+printf 'FINDINGS\n\nsomething is wrong at foo.c:12\n' > "$RL_TEST_VERDICT"
+exit 0
+STUB
+chmod +x "$stub_dir3/pi-findings-only"
+RL_TEST_VERDICT="$repo/.git/review-verdict.md" PI_BIN="$stub_dir3/pi-findings-only" MODEL=test-model \
+    "$rl_sh" --clone "$repo" --cap 3 --base-sha "$base_sha" \
+    --review-prompt "$review_prompt" --fix-header "$fix_header" \
+    --verdict "$repo/.git/review-verdict.md" --work-dir "$work" --out "$out" \
+    >/dev/null 2>&1
+check "no-progress: ended=no-progress" "no-progress" "$(rl_json "$out" '.ended')"
+check "no-progress: exactly one iteration ran" "1" "$(rl_json "$out" '.iterations | length')"
+
+printf '\n-- harness-error: neither APPROVED nor FINDINGS --\n'
+stub_dir4="$(mktemp -d /var/tmp/claude-scratch/fs-k8s-rl-stub.XXXXXX)"; tmpdirs+=("$stub_dir4")
+read -r repo base_sha work review_prompt fix_header out < <(new_rl_fixture)
+tmpdirs+=("$(dirname "$repo")")
+cat > "$stub_dir4/pi-garbage" <<'STUB'
+#!/bin/sh
+cat >/dev/null
+printf 'this is not a verdict\n' > "$RL_TEST_VERDICT"
+exit 0
+STUB
+chmod +x "$stub_dir4/pi-garbage"
+RL_TEST_VERDICT="$repo/.git/review-verdict.md" PI_BIN="$stub_dir4/pi-garbage" MODEL=test-model \
+    "$rl_sh" --clone "$repo" --cap 2 --base-sha "$base_sha" \
+    --review-prompt "$review_prompt" --fix-header "$fix_header" \
+    --verdict "$repo/.git/review-verdict.md" --work-dir "$work" --out "$out" \
+    >/dev/null 2>&1
+check "bad first line: ended=harness-error" "harness-error" "$(rl_json "$out" '.ended')"
+
+printf '\n-- harness-error: the review leg writes no verdict at all --\n'
+stub_dir5="$(mktemp -d /var/tmp/claude-scratch/fs-k8s-rl-stub.XXXXXX)"; tmpdirs+=("$stub_dir5")
+read -r repo base_sha work review_prompt fix_header out < <(new_rl_fixture)
+tmpdirs+=("$(dirname "$repo")")
+cat > "$stub_dir5/pi-silent" <<'STUB'
+#!/bin/sh
+cat >/dev/null
+exit 0
+STUB
+chmod +x "$stub_dir5/pi-silent"
+RL_TEST_VERDICT="$repo/.git/review-verdict.md" PI_BIN="$stub_dir5/pi-silent" MODEL=test-model \
+    "$rl_sh" --clone "$repo" --cap 2 --base-sha "$base_sha" \
+    --review-prompt "$review_prompt" --fix-header "$fix_header" \
+    --verdict "$repo/.git/review-verdict.md" --work-dir "$work" --out "$out" \
+    >/dev/null 2>&1
+check "no verdict written: ended=harness-error" "harness-error" "$(rl_json "$out" '.ended')"
+
+printf '\n-- harness-error: a SYMLINK at the verdict path is refused --\n'
+stub_dir6="$(mktemp -d /var/tmp/claude-scratch/fs-k8s-rl-stub.XXXXXX)"; tmpdirs+=("$stub_dir6")
+read -r repo base_sha work review_prompt fix_header out < <(new_rl_fixture)
+rl_fixture_dir6="$(dirname "$repo")"; tmpdirs+=("$rl_fixture_dir6")
+secret_target="$rl_fixture_dir6/secret-target"
+printf 'this must never be read\n' > "$secret_target"
+cat > "$stub_dir6/pi-symlink" <<STUB
+#!/bin/sh
+cat >/dev/null
+ln -sf "$secret_target" "\$RL_TEST_VERDICT"
+exit 0
+STUB
+chmod +x "$stub_dir6/pi-symlink"
+RL_TEST_VERDICT="$repo/.git/review-verdict.md" PI_BIN="$stub_dir6/pi-symlink" MODEL=test-model \
+    "$rl_sh" --clone "$repo" --cap 2 --base-sha "$base_sha" \
+    --review-prompt "$review_prompt" --fix-header "$fix_header" \
+    --verdict "$repo/.git/review-verdict.md" --work-dir "$work" --out "$out" \
+    >/dev/null 2>&1
+check "symlinked verdict: ended=harness-error" "harness-error" "$(rl_json "$out" '.ended')"
+# A copy is only ever made AFTER the symlink check passes, so no
+# review-verdict-*.md copy existing at all is itself proof the target was
+# never read -- but check any that do exist too, in case that invariant
+# ever regresses silently.
+secret_leaked=false
+while IFS= read -r verdict_copy_file; do
+    [[ -n "$verdict_copy_file" ]] || continue
+    grep -qF 'this must never be read' "$verdict_copy_file" 2>/dev/null && secret_leaked=true
+done < <(find "$work" -maxdepth 1 -name 'review-verdict-*.md' 2>/dev/null)
+if [[ "$secret_leaked" == true ]]; then
+    no "symlinked verdict: the symlink target is never read" \
+        "the secret target's content leaked into $work"
+else
+    ok "symlinked verdict: the symlink target is never read"
+fi
+
+printf '\n-- skipped: branch head already at --base-sha --\n'
+stub_dir7="$(mktemp -d /var/tmp/claude-scratch/fs-k8s-rl-stub.XXXXXX)"; tmpdirs+=("$stub_dir7")
+read -r repo base_sha work review_prompt fix_header out < <(new_rl_fixture)
+tmpdirs+=("$(dirname "$repo")")
+current_head="$(git -C "$repo" rev-parse HEAD)"
+RL_TEST_VERDICT="$repo/.git/review-verdict.md" PI_BIN="$stub_dir7/should-never-run" MODEL=test-model \
+    "$rl_sh" --clone "$repo" --cap 2 --base-sha "$current_head" \
+    --review-prompt "$review_prompt" --fix-header "$fix_header" \
+    --verdict "$repo/.git/review-verdict.md" --work-dir "$work" --out "$out" \
+    >/dev/null 2>&1
+check "skipped: ended=skipped" "skipped" "$(rl_json "$out" '.ended')"
+check "skipped: no iterations ran" "0" "$(rl_json "$out" '.iterations | length')"
+
+
 printf '\n== fs_require_scratch_handoff / fs_require_src_project (fork-sandbox-lib.sh) ==\n'
 # Unit-level, sourcing the lib directly -- the same level fork-sandbox-clone-
 # test.sh tests fs_make_clone at. These are the two checks that let
 # fork-sandbox.sh be blanket-approved as its own security boundary, shared
 # between the local path and --k8s below; a regression here would silently
-# widen what either path accepts.
-# Sourced directly into this shell, not a subshell: ok()/no() below have to
-# reach the pass/fail counters this file reports at the end, and a subshell
-# (command substitution, or the read side of a pipe) would trap them there.
-# shellcheck source-path=SCRIPTDIR/../scripts
-# shellcheck source=../scripts/fork-sandbox-lib.sh
-# shellcheck disable=SC1091  # plain shellcheck cannot follow it; use -x
-source "$lib_sh"
+# widen what either path accepts. lib_sh was already sourced near the top of
+# this file.
 lib_test_scratch_dir="$(mktemp -d /var/tmp/claude-scratch/fs-k8s-flag-lib-test.XXXXXX)"
 tmpdirs+=("$lib_test_scratch_dir")
 err="$(mktemp)"
@@ -674,13 +1032,41 @@ refuses "--k8s --prompts-dir is refused as not yet supported" \
     env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
     --harness pi --model moonshotai/kimi-k3 --prompts-dir /nonexistent \
     unused-project unused-handoff
-refuses "--k8s --review-loop is refused as not yet supported" \
-    "--review-loop is not yet supported with --k8s" \
-    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
+# --review-loop is carried through, not refused -- the cluster analogue of
+# fork-sandbox.sh's own local loop, running pod-side. Real fixtures
+# required (k8s_flag_proj / k8s_flag_handoff): --dry-run's own validation
+# runs after fs_require_scratch_handoff / fs_require_src_project, unlike
+# the flag-refusal cases above, which fail on their own flag first and so
+# get away with a placeholder.
+if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
     --harness pi --model moonshotai/kimi-k3 --review-loop 2 \
-    unused-project unused-handoff
+    --branch fs-k8s-flag-test-rl-branch \
+    "$k8s_flag_proj" "$k8s_flag_handoff" \
+    > /tmp/fs-k8s-flag-test-rl.yaml 2>/tmp/fs-k8s-flag-test-rl.err; then
+    ok "--k8s --review-loop 2 --dry-run is no longer refused"
+else
+    no "--k8s --review-loop 2 --dry-run is no longer refused" \
+        "$(cat /tmp/fs-k8s-flag-test-rl.err)"
+fi
+if grep -qF '  review-prompt.md: |' /tmp/fs-k8s-flag-test-rl.yaml; then
+    ok "--k8s --review-loop 2 --dry-run renders the review-prompt.md ConfigMap key"
+else
+    no "--k8s --review-loop 2 --dry-run renders the review-prompt.md ConfigMap key" \
+        "not found in /tmp/fs-k8s-flag-test-rl.yaml"
+fi
+rm -f /tmp/fs-k8s-flag-test-rl.err /tmp/fs-k8s-flag-test-rl.yaml
+
 refuses "--k8s --review-model is refused as not yet supported" \
     "--review-model is not yet supported with --k8s" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
+    --harness pi --model moonshotai/kimi-k3 --review-model opus \
+    unused-project unused-handoff
+# The reason changed with this flag's own support: it used to be "no review
+# leg on the cluster path at all"; now that --review-loop IS carried, the
+# reason is that the pod's models.json is generated with a single model
+# entry, so a second model for the review leg has nowhere to be declared.
+refuses "--k8s --review-model's refusal reason names the one-model-slot limit" \
+    "single model entry" \
     env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
     --harness pi --model moonshotai/kimi-k3 --review-model opus \
     unused-project unused-handoff
