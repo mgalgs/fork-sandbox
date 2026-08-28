@@ -1,7 +1,7 @@
 ---
 name: fork-sandbox
 description: Fork a task to an unattended Claude Code session in a sandboxed clone of the repo. Headless, so it needs no keypress, exits on its own, fetches its branch back, and logs every event to a file this session can watch. A running session can still be steered with fork-sandbox-say.sh, which sends it an operator addendum. Use when work should run without babysitting — a refactor, a test sweep, a long build.
-argument-hint: [--branch <name>] [--model <model>] [--harness <harness>[/<model>]] [--review-loop <N>] [--review-model <model>] [--sandbox-args "..."] <project-path> — path to the target project (omit or use "." for the current repo). Use --branch to name the branch the session commits on. Use --model to pick the model (fable, opus, sonnet) or append it to the harness. Use --harness pi to run pi against OpenRouter, which then requires a model; --harness pi-local to run pi against a self-hosted endpoint in a sandbox with no network at all, which costs nothing; or --harness codex to run OpenAI codex on your ChatGPT sign-in. Use --review-loop N to have a fresh session review the run's commits and a third session fix what it found, up to N times; --review-model selects a different model for review legs only. Use --sandbox-args "--unpin-egress" only when the task must reach the tailnet, a VPN, or a libvirt/docker bridge.
+argument-hint: [--branch <name>] [--model <model>] [--harness <harness>[/<model>]] [--review-loop <N>] [--review-model <model>] [--sandbox-args "..."] [--k8s [--timeout <seconds>] [--keep]] <project-path> — path to the target project (omit or use "." for the current repo). Use --branch to name the branch the session commits on. Use --model to pick the model (fable, opus, sonnet) or append it to the harness. Use --harness pi to run pi against OpenRouter, which then requires a model; --harness pi-local to run pi against a self-hosted endpoint in a sandbox with no network at all, which costs nothing; or --harness codex to run OpenAI codex on your ChatGPT sign-in. Use --review-loop N to have a fresh session review the run's commits and a third session fix what it found, up to N times; --review-model selects a different model for review legs only. Use --sandbox-args "--unpin-egress" only when the task must reach the tailnet, a VPN, or a libvirt/docker bridge. Use --k8s to run in a Kubernetes cluster instead of the local sandbox — requires --harness pi and refuses most other flags by name; see "Kubernetes runs" below.
 ---
 
 # Fork Sandbox
@@ -340,6 +340,31 @@ fork-sandbox.sh --harness codex --branch "<branch>" "<path>" "<handoff>"
 
 Reviewing the branch matters more for both, not less. Say so when you
 report.
+
+## Kubernetes runs
+
+`--k8s` runs the session as a Kubernetes Job instead of a local sandbox, by handing the whole run to `fork-sandbox-k8s.sh run` — submit, wait, fetch, and clean up, in one blocking call. Reach for it when the machine you are on should not have to stay awake for the run (a CI job, a workstation you are about to close the lid on) or when you want a fleet of runs going at once rather than one tmux session at a time; reach for the plain local launch above for everything else, since it is simpler and has every capability this path is still missing.
+
+```bash
+fork-sandbox.sh --k8s --harness pi --model moonshotai/kimi-k3 --branch "<branch>" "<path>" "<handoff>"
+```
+
+**`--harness pi` is required, explicitly** — leaving `--harness` off defaults to `claude`, which the cluster path refuses just like `pi-local` and `codex`. This is what a Kubernetes run *is*: pi talking to a model proxy that holds the OpenRouter key, the same key `~/.config/fork-sandbox/pi.env` supplies locally. The cluster itself needs a one-time `fork-sandbox-k8s.sh install` and `~/.config/fork-sandbox/k8s.env` configured with the cluster context, image and proxy upstream — see `docs/kubernetes-runs.md` for the full setup.
+
+**`--branch` is optional here too**, unlike a direct `fork-sandbox-k8s.sh run` call, which requires it up front to poll, fetch and clean up by. Leave it off and `--k8s` generates one the same way `submit` itself does, `k8s-<timestamp>`, so an auto-named branch is recognizable as a cluster run at a glance.
+
+**`--timeout <seconds>` and `--keep`** pass straight through to `fork-sandbox-k8s.sh run`: how long to wait for the agent before giving up, and whether to leave the Job and pod in place after a successful fetch instead of tearing them down. Both are refused without `--k8s`.
+
+What it cannot do yet, and why saying so matters: a flag this path cannot honor is refused by name rather than silently dropped, because a dropped flag looks identical to a run that used it — no error, no missing output, just a branch that is not what the flag promised.
+
+- **No review loop.** `--review-loop` and `--review-model` are refused. The loop is host-side today — the review and fix prompts are generated on the host, and the `code-review-portable` skill is not in the pod image — so review the branch yourself after fetching it, same as always.
+- **No other harness.** `--harness claude`, `pi-local` and `codex` are all refused; pi against the model proxy is the only agent this path runs, for the same sealed-network reason `--harness pi-local` is pi-only locally.
+- **No per-run services.** `.agents/sandbox-services/` never runs in a pod, so `--no-services` and `--services-trust-ref` are refused outright — there is no mechanism on this path for either to control.
+- **No host-composed prompt preamble.** A local run's prompt gets blocks fs_emit_prompt_preamble adds — where the clone lives, the operator inbox, whether the sandbox has network — layered on before the handoff. A `--k8s` run skips all of that: the handoff file goes into the pod byte-for-byte, on pi's stdin, with nothing prepended. Write the handoff to stand entirely on its own, and say explicitly that the sandbox's egress is sealed to the model proxy and nothing else, since nothing else will tell the session that.
+- **No steering.** There is no cluster equivalent of `fork-sandbox-say.sh` and the operator inbox — nothing reaches a running pod after submission, so get the handoff right before launching.
+- **No run-log entry.** A local run appends cost, tokens and outcome to `~/.claude/sandbox-runs.jsonl`; a `--k8s` run does not, so `--task-meta` — which exists to be folded into that log — is refused too.
+- **`--sandbox-args` and `--claude-args` are refused** for the same reason as always: no bubblewrap and no claude CLI exist on this path to pass flags to.
+- **`--checkout`, `--context-ro`, `--pi-args` and `--prompts-dir` are refused as not-yet-built**, not as permanently unsupported — each names a real capability the cluster path has not been wired up to carry yet.
 
 ## What the calling session must not do
 

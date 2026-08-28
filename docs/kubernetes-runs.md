@@ -62,10 +62,19 @@ its error message prints the exact `fetch` command to run by hand once the
 agent does finish. `--keep` skips the final `rm`, for a caller who wants
 the Job and pod left in place after a successful fetch.
 
-This is a **new script**, not a mode of `fork-sandbox.sh`. There is no `--k8s`
-flag and none is planned yet — wiring the two together is a later round, and
-doing it before this path has run for a while would put an untested cluster
-dependency in a script that is otherwise pure local sandboxing.
+`fork-sandbox.sh --k8s` dispatches to exactly this `run` verb: it resolves
+and validates the harness and model the same way a local run does, builds
+the argument list above, and `exec`s this script — no local clone, tmux
+runner or review loop ever starts. Most of `fork-sandbox.sh`'s other flags
+describe that local machinery and have nothing to attach to on a cluster
+run, so `--k8s` refuses each of them by name (`--review-loop`, `--harness`
+values other than `pi`, and several more) rather than accepting and
+silently dropping it. See the `--k8s` entry in `fork-sandbox.sh`'s own
+header for the full list and the reasoning, and
+`skills/fork-sandbox/SKILL.md` for when a cluster run is the right choice.
+This script itself stays the direct entry point either way — `install`,
+`submit` and `fetch` are unaffected, and `run` behaves identically whether
+invoked here or through the dispatcher.
 
 ## This is a run mode, not a backend
 
@@ -629,8 +638,12 @@ Scoped out of v1 on purpose, not overlooked:
 - **`status` / `logs` subcommands.** `kubectl` already does both, against the
   Job and pod this client creates with ordinary, discoverable names and
   labels.
-- **Any change to `fork-sandbox.sh`.** `fork-sandbox-k8s.sh` is a new,
-  separate script. No `--k8s` flag exists yet.
+- **A review loop inside a pod.** `--k8s` refuses `--review-loop` by name.
+  The loop is host-side: the review and fix prompts are generated on the
+  host, and `code-review-portable` is not in the pod image.
+- **Any harness other than `pi` inside a pod.** `--k8s` refuses `--harness`
+  values other than `pi` by name — see "Model access" above for why `pi`
+  talking to the proxy is the one shape this path builds at all.
 - **Any change to `sandbox-backend-*`.** Kubernetes is explicitly not a
   backend — see "This is a run mode, not a backend" above, and
   `sandbox-backend.md`'s own "Kubernetes — deliberately not a backend"
