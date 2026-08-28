@@ -61,16 +61,24 @@ The review loop (fork-sandbox.sh --review-loop N):
 
 The prompt overlay (fork-sandbox.sh --prompts-dir, or a machine's default
 ~/.config/fork-sandbox/prompts):
-  prompt_overlay  present only when a run applied one. `dir` is the source
-                  directory, `fragments` the relative paths that matched, in
-                  the order they were composed, `sha256` a fingerprint of
-                  their concatenated bytes, and `rev` the source directory's
-                  git HEAD -- suffixed `-dirty` if its working tree had
-                  uncommitted changes, or null if it is not a git repo at
-                  all. This ships no fragment content of its own; see
+  prompt_overlay  present only when a run applied one, to at least one leg.
+                  `dir` is the source directory and `rev` its git HEAD --
+                  suffixed `-dirty` if its working tree had uncommitted
+                  changes, or null if it is not a git repo at all -- both
+                  facts about the run, not about any one leg. `legs` holds
+                  one key per leg that actually got a fragment --
+                  `implement`, `review`, `fix` -- each an object with
+                  `fragments` (the relative paths that matched, in the order
+                  they were composed) and `sha256` (a fingerprint of their
+                  concatenated bytes). A leg that matched nothing is absent
+                  from `legs` entirely; a run with --review-loop unset never
+                  has `review` or `fix` keys, since those legs never ran.
+                  This ships no fragment content of its own; see
                   docs/prompt-overlays.md. Group on it directly: `stats --by
                   model,prompt_overlay.rev` says which prompt revision a
-                  model's outcomes actually came from.
+                  model's outcomes actually came from, and `stats --by
+                  prompt_overlay.legs.fix.sha256` narrows to the fix leg
+                  alone.
 
 Verdict outcomes:
   integrated             merged as-is, or with trivial touch-ups
