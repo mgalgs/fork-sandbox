@@ -294,15 +294,32 @@ rm -f /tmp/fs-k8s-test-install.err /tmp/fs-k8s-test-submit.err
 # static assertion on the source rather than a live push/fetch, which no
 # cluster here can exercise, but it is exactly the kind of check that stops
 # a future refactor from silently dropping the flag on one of the two paths.
-if grep -q 'git -c protocol.ext.allow=always push' "$k8s_sh"; then
+if grep -qE 'git -c protocol\.ext\.allow=always .*push' "$k8s_sh"; then
     ok "submit's git push scopes protocol.ext.allow=always"
 else
     no "submit's git push scopes protocol.ext.allow=always" "not found in $k8s_sh"
 fi
-if grep -q 'git -c protocol.ext.allow=always fetch' "$k8s_sh"; then
+if grep -qE 'git -c protocol\.ext\.allow=always .*fetch' "$k8s_sh"; then
     ok "fetch's git fetch scopes protocol.ext.allow=always"
 else
     no "fetch's git fetch scopes protocol.ext.allow=always" "not found in $k8s_sh"
+fi
+# This push and this fetch both run ON THE HOST, in a repo named on the
+# command line, and git would otherwise run that repo's own hooks --
+# pre-push on the push side, reference-transaction on the fetch side, since
+# fetch here writes straight into refs/heads/$branch rather than a
+# remote-tracking ref (githooks(5): reference-transaction "is invoked by any
+# Git command that performs reference updates"). Scoped the same way as
+# protocol.ext.allow=always, and checked the same way here.
+if grep -qE 'git -c protocol\.ext\.allow=always -c core\.hooksPath=/dev/null push' "$k8s_sh"; then
+    ok "submit's git push scopes core.hooksPath=/dev/null"
+else
+    no "submit's git push scopes core.hooksPath=/dev/null" "not found in $k8s_sh"
+fi
+if grep -qE 'git -c protocol\.ext\.allow=always -c core\.hooksPath=/dev/null fetch' "$k8s_sh"; then
+    ok "fetch's git fetch scopes core.hooksPath=/dev/null"
+else
+    no "fetch's git fetch scopes core.hooksPath=/dev/null" "not found in $k8s_sh"
 fi
 if grep -qE 'kubectl.*exec -t' "$k8s_sh"; then
     no "no kubectl exec uses -t (would corrupt the pack stream)" "found in $k8s_sh"

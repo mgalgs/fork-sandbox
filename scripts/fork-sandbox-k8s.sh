@@ -575,9 +575,14 @@ EOF
     # fails with 'fatal: transport "ext" not allowed'. Scoped to this one
     # invocation with git -c, never to global config or GIT_ALLOW_PROTOCOL --
     # this is a real hardening measure, relaxed for exactly one command.
+    # -c core.hooksPath=/dev/null: this push runs ON THE HOST, in the repo
+    # named on the command line -- and git would otherwise run that repo's
+    # own pre-push hook. project_path is caller-supplied, so this script must
+    # not trust hooks in a repo it was merely pointed at. Scoped with git -c
+    # to this one invocation, never set globally.
     # kubectl exec -i, never -t: a tty applies line-discipline translation
     # to what must stay a binary pack stream, and would corrupt it.
-    (cd "$origin_repo" && git -c protocol.ext.allow=always push --quiet \
+    (cd "$origin_repo" && git -c protocol.ext.allow=always -c core.hooksPath=/dev/null push --quiet \
         "ext::kubectl --context=$K8S_CONTEXT -n $K8S_NAMESPACE exec -i $pod_name -- git-receive-pack /work/repo.git" \
         "HEAD:refs/heads/$branch")
 
@@ -614,8 +619,14 @@ cmd_fetch() {
 
     echo "fork-sandbox-k8s: fetching $branch from pod $pod_name" >&2
     # Same -c protocol.ext.allow=always and -i (never -t) as the push side
-    # above, and for the same two reasons.
-    (cd "$origin_repo" && git -c protocol.ext.allow=always fetch --quiet \
+    # above, and for the same two reasons. core.hooksPath=/dev/null is
+    # load-bearing here too, not just on push: this fetch writes straight
+    # into refs/heads/$branch in the caller's real repo rather than a
+    # remote-tracking ref, and githooks(5) documents reference-transaction as
+    # firing on any Git command that performs reference updates, fetch
+    # included -- so a hook in project_path's repo would otherwise run here
+    # as well.
+    (cd "$origin_repo" && git -c protocol.ext.allow=always -c core.hooksPath=/dev/null fetch --quiet \
         "ext::kubectl --context=$K8S_CONTEXT -n $K8S_NAMESPACE exec -i $pod_name -- git-upload-pack /work/clone" \
         "refs/heads/$branch:refs/heads/$branch")
 
