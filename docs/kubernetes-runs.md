@@ -331,6 +331,15 @@ exact failure class this project keeps paying to avoid (see
 `docs/sandbox-backend.md`'s discussion of a pin that is asserted but never
 verified).
 
+**A constraint learned since, worth recording before `direct` is ever
+built:** an on-LAN endpoint (an `ollama serve` on a workstation, say) may sit
+on hardware shared with other work, and can simply not be there when a run
+tries to dispatch to it. `direct` therefore has to health-check the endpoint
+before dispatch and fail with a clear message rather than hang waiting on a
+model call that will never return. A connection refusal from
+`K8S_MODEL_ENDPOINT` is an expected, ordinary state to design for, not a bug
+to chase down each time it happens.
+
 ### 3. secret — **Status: designed, not built.**
 
 Mount the provider token directly into the agent pod, from a Secret — the
