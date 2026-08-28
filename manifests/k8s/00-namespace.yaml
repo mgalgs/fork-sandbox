@@ -1,0 +1,41 @@
+---
+# The namespace a fork-sandbox Kubernetes deployment lives in, plus the two
+# objects that bound it: a ResourceQuota, so an unbounded run of Jobs cannot
+# starve the rest of the cluster, and a LimitRange, so a Job that names no
+# resources of its own still gets one. __NAMESPACE__ is a placeholder token;
+# fork-sandbox-k8s.sh substitutes it with K8S_NAMESPACE before applying.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: __NAMESPACE__
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: fork-sandbox-quota
+  namespace: __NAMESPACE__
+spec:
+  hard:
+    pods: "10"
+    requests.cpu: "10"
+    requests.memory: 20Gi
+    limits.cpu: "20"
+    limits.memory: 40Gi
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: fork-sandbox-limits
+  namespace: __NAMESPACE__
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: "1"
+        memory: 2Gi
+      defaultRequest:
+        cpu: 250m
+        memory: 512Mi
+      max:
+        cpu: "4"
+        memory: 8Gi

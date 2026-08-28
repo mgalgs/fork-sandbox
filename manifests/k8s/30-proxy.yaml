@@ -1,0 +1,192 @@
+---
+# The model-access proxy: the one thing in this namespace that ever reaches
+# the public internet, and the reason the agent pod does not have to. It
+# holds the provider key, injects it as the run passes through, and forwards
+# exactly one path. __NAMESPACE__, __PROXY_UPSTREAM__ and
+# __PROXY_UPSTREAM_HOST__ are placeholder tokens; fork-sandbox-k8s.sh
+# substitutes them from K8S_NAMESPACE and K8S_PROXY_UPSTREAM before applying.
+# The key itself is never in this file -- it comes from the
+# fork-sandbox-upstream-key Secret, which `install` creates separately from
+# ~/.config/fork-sandbox/pi.env, and is included into nginx's config from a
+# path nginx.conf never otherwise names, so a `kubectl get configmap` never
+# shows it.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fork-sandbox-proxy-conf
+  namespace: __NAMESPACE__
+data:
+  nginx.conf: |
+    worker_processes 1;
+    pid /tmp/nginx.pid;
+
+    events {
+        worker_connections 1024;
+    }
+
+    http {
+        resolver kube-dns.kube-system.svc.cluster.local valid=10s;
+        client_body_temp_path /tmp/client_body;
+        proxy_temp_path /tmp/proxy;
+        fastcgi_temp_path /tmp/fastcgi;
+        uwsgi_temp_path /tmp/uwsgi;
+        scgi_temp_path /tmp/scgi;
+
+        limit_req_zone $binary_remote_addr zone=fork_sandbox:10m rate=5r/s;
+
+        # Defines $upstream_key. Mounted from the Secret, never from this
+        # ConfigMap -- see the header above.
+        include /etc/nginx/upstream-key.conf;
+
+        server {
+            listen 8080;
+
+            # Deny by default. Only the one path below is forwarded.
+            location / {
+                return 403;
+            }
+
+            location = /api/v1/chat/completions {
+                limit_req zone=fork_sandbox burst=10 nodelay;
+
+                set $upstream "__PROXY_UPSTREAM__";
+                proxy_pass $upstream/api/v1/chat/completions;
+
+                # A variable in proxy_pass makes nginx resolve at request
+                # time through the resolver above, rather than once at
+                # startup -- so the upstream's DNS record can rotate
+                # without a restart here.
+                proxy_ssl_verify on;
+                proxy_ssl_server_name on;
+                proxy_ssl_name "__PROXY_UPSTREAM_HOST__";
+                proxy_set_header Host "__PROXY_UPSTREAM_HOST__";
+
+                proxy_set_header Authorization "Bearer $upstream_key";
+                proxy_hide_header Authorization;
+            }
+        }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fork-sandbox-proxy
+  namespace: __NAMESPACE__
+  labels:
+    app: fork-sandbox-proxy
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: fork-sandbox-proxy
+  template:
+    metadata:
+      labels:
+        app: fork-sandbox-proxy
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 101
+        runAsGroup: 101
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: nginx
+          image: nginx:1.27-alpine
+          ports:
+            - containerPort: 8080
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: conf
+              mountPath: /etc/nginx/nginx.conf
+              subPath: nginx.conf
+              readOnly: true
+            - name: upstream-key
+              mountPath: /etc/nginx/upstream-key.conf
+              subPath: upstream-key.conf
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+            - name: run
+              mountPath: /var/run
+      volumes:
+        - name: conf
+          configMap:
+            name: fork-sandbox-proxy-conf
+        - name: upstream-key
+          secret:
+            secretName: fork-sandbox-upstream-key
+        - name: tmp
+          emptyDir: {}
+        - name: run
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fork-sandbox-proxy
+  namespace: __NAMESPACE__
+  labels:
+    app: fork-sandbox-proxy
+spec:
+  selector:
+    app: fork-sandbox-proxy
+  ports:
+    - port: 8080
+      targetPort: 8080
+      protocol: TCP
+---
+# The proxy's own policy. Unlike the agent pod's, this one is ordinary and
+# portable, so it lives here as a static file rather than behind the
+# platform plugin (see docs/k8s-platform.md for why the agent pod's policy
+# cannot).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: fork-sandbox-proxy
+  namespace: __NAMESPACE__
+spec:
+  podSelector:
+    matchLabels:
+      app: fork-sandbox-proxy
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: fork-sandbox-agent
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+              - 100.64.0.0/10
+      ports:
+        - protocol: TCP
+          port: 443

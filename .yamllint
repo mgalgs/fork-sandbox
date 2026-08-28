@@ -1,0 +1,14 @@
+---
+# manifests/k8s/ and the YAML fork-sandbox-k8s.sh renders both embed shell
+# scripts and prose as block-scalar ConfigMap values, and those routinely
+# exceed 80 columns without being a problem -- the 80-column rule is about
+# YAML structure, not about the shell script text living inside one string
+# value. Every other default rule (document-start, trailing-spaces,
+# indentation, and the rest) stays at its default, error-level strictness:
+# those catch real structural mistakes.
+extends: default
+
+rules:
+  line-length:
+    max: 100
+    level: warning
