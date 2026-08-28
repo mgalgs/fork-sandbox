@@ -304,6 +304,35 @@ if grep -q 'automountServiceAccountToken: false' "$submit_out"; then
 else
     no "rendered Job sets automountServiceAccountToken: false" "not found in $submit_out"
 fi
+
+# fs_emit_prompt_preamble (fork-sandbox-lib.sh), shared with fork-sandbox.sh's
+# local path: the rendered handoff.md must carry the clone-path and
+# gated-egress blocks, must NOT carry an "Operator inbox" section (no k8s
+# inbox exists yet -- that is the next round's work), and must still carry
+# the operator's own handoff text after the preamble.
+if grep -q '/work/clone' "$submit_out"; then
+    ok "rendered handoff.md preamble names the pod's clone path"
+else
+    no "rendered handoff.md preamble names the pod's clone path" "not found in $submit_out"
+fi
+if grep -q "egress is gated to the model proxy" "$submit_out"; then
+    ok "rendered handoff.md preamble includes the gated-egress block"
+else
+    no "rendered handoff.md preamble includes the gated-egress block" \
+        "not found in $submit_out"
+fi
+if grep -q '## Operator inbox' "$submit_out"; then
+    no "rendered handoff.md omits the operator inbox section" \
+        "found in $submit_out"
+else
+    ok "rendered handoff.md omits the operator inbox section"
+fi
+if grep -q 'Do the thing.' "$submit_out"; then
+    ok "rendered handoff.md still carries the operator's own handoff text"
+else
+    no "rendered handoff.md still carries the operator's own handoff text" \
+        "not found in $submit_out"
+fi
 rm -f /tmp/fs-k8s-test-install.err /tmp/fs-k8s-test-submit.err
 
 printf '\n== fork-sandbox-k8s.sh run --dry-run (fixture config, no cluster) ==\n'
