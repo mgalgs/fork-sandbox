@@ -11,12 +11,19 @@
 # It covers:
 #   - shellcheck on the four new scripts (the client, the platform plugin,
 #     the pod entrypoint, the egress gate).
-#   - yamllint on manifests/k8s/ and on both --dry-run renders.
+#   - yamllint on manifests/k8s/ and on the install/submit/run --dry-run
+#     renders.
 #   - fork-sandbox-k8s-platform-generic's two verbs.
 #   - the properties docs/kubernetes-runs.md promises: the agent pod never
 #     automounts a ServiceAccount token, and its egress policy has no rule
 #     permitting port 443 -- only the proxy and DNS are reachable.
 #   - an unknown platform name fails with a clear error.
+#   - `run --dry-run` renders byte-for-byte the same Job YAML as
+#     `submit --dry-run`, proving run delegates rather than growing its own
+#     divergent copy of the rendering, and rejects the same argument
+#     mistakes the other verbs reject. The poll/wait/fetch/rm sequence
+#     itself needs a live cluster and is not covered here -- see the header
+#     comment on cmd_run in fork-sandbox-k8s.sh.
 #   - no file in the repo matches a private-hostname shape, guarding the
 #     public-repo leak rule every script and manifest here has to hold to.
 #
@@ -287,6 +294,52 @@ else
     no "rendered Job sets automountServiceAccountToken: false" "not found in $submit_out"
 fi
 rm -f /tmp/fs-k8s-test-install.err /tmp/fs-k8s-test-submit.err
+
+printf '\n== fork-sandbox-k8s.sh run --dry-run (fixture config, no cluster) ==\n'
+run_out="$(newdir)/run.yaml"; tmpdirs+=("$(dirname "$run_out")")
+if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" run --dry-run \
+    --branch fs-k8s-test-branch --model moonshotai/kimi-k3 \
+    "$proj_dir" "$handoff_file" > "$run_out" 2>/tmp/fs-k8s-test-run.err; then
+    ok "run --dry-run exits 0"
+else
+    no "run --dry-run exits 0" "$(cat /tmp/fs-k8s-test-run.err)"
+fi
+if command -v yamllint >/dev/null 2>&1; then
+    out="$(yamllint "$run_out" 2>&1)"
+    if [[ -z "$out" ]]; then ok "yamllint: run --dry-run output"; else no "yamllint: run --dry-run output" "$out"; fi
+    out="$(yamllint - < "$run_out" 2>&1)"
+    if [[ -z "$out" ]]; then ok "yamllint: run --dry-run piped through stdin"; else no "yamllint: run --dry-run piped through stdin" "$out"; fi
+fi
+# The strongest proof that `run --dry-run` delegates to cmd_submit's own
+# rendering, rather than having grown a second, divergent copy of it: for
+# the same arguments the two must render byte-for-byte identical YAML.
+if diff -q "$submit_out" "$run_out" >/dev/null 2>&1; then
+    ok "run --dry-run renders the same Job YAML as submit --dry-run"
+else
+    no "run --dry-run renders the same Job YAML as submit --dry-run" \
+        "$(diff "$submit_out" "$run_out" 2>&1 | head -n 20)"
+fi
+rm -f /tmp/fs-k8s-test-run.err
+
+refuses "run rejects a missing --branch" \
+    "run requires --branch" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" run --dry-run \
+    --model moonshotai/kimi-k3 "$proj_dir" "$handoff_file"
+refuses "run rejects a missing project path" \
+    "Usage: fork-sandbox-k8s.sh run" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" run --dry-run \
+    --branch fs-k8s-test-branch --model moonshotai/kimi-k3
+refuses "run rejects an unknown option" \
+    "unknown option" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" run --dry-run \
+    --branch fs-k8s-test-branch --model moonshotai/kimi-k3 --bogus \
+    "$proj_dir" "$handoff_file"
+
+if "$k8s_sh" --help 2>&1 | grep -q 'fork-sandbox-k8s.sh run'; then
+    ok "usage() mentions run"
+else
+    no "usage() mentions run" "not found in --help output"
+fi
 
 # git disables the ext:: transport by default, so a push or fetch built
 # without -c protocol.ext.allow=always fails at the git layer with 'fatal:

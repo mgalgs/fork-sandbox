@@ -27,6 +27,41 @@ scripts/fork-sandbox-k8s.sh submit --branch my-branch --model moonshotai/kimi-k3
 scripts/fork-sandbox-k8s.sh fetch --branch my-branch ~/src/myproject
 ```
 
+Or, to block on the whole thing in one call — the cluster analogue of a local
+`fork-sandbox.sh` launch:
+
+```
+scripts/fork-sandbox-k8s.sh run --branch my-branch --model moonshotai/kimi-k3 \
+    ~/src/myproject ~/handoff.md
+```
+
+`run` is `submit`, then a wait, then `fetch`, then `rm` — it exists so a
+caller never has to hand-roll the polling loop in between `submit` and
+`fetch` themselves. `submit`/`fetch` stay available on their own for the
+case they were built for: starting a run from one place — a workstation
+before walking away, a CI job that should not block — and collecting it
+later from somewhere else, on nobody's clock but the operator's.
+
+The wait is a poll for a sentinel the pod's entrypoint writes right after
+the agent exits, `/work/.run-complete`, whose contents are the agent's own
+exit code (see `fork-sandbox-k8s-entrypoint.sh`). It cannot be a wait on pod
+phase instead: the pod deliberately stays `Running` for up to `K8S_RUN_TTL`
+after the agent finishes, idling so its clone survives long enough to be
+fetched (see "v1: the pod idles after the agent exits" below) — so `Running`
+means anything from "the agent is still working" to "the agent finished
+five minutes ago and is waiting to be collected," and only the sentinel
+tells the two apart. `run` polls every 10 seconds (each probe is a `kubectl
+exec`), gives up after `--timeout` (default 3600, matching the entrypoint's
+own `RUN_TTL` default — waiting longer than the pod will idle for is
+pointless), and detects a pod that died before writing the sentinel — an
+OOM kill, a crashed image pull, a node eviction — by checking pod and Job
+state each iteration, rather than polling a corpse for the full timeout. A
+run still going at the deadline is left exactly as it is: `run` does not
+fetch a half-finished branch and does not remove a still-running pod, and
+its error message prints the exact `fetch` command to run by hand once the
+agent does finish. `--keep` skips the final `rm`, for a caller who wants
+the Job and pod left in place after a successful fetch.
+
 This is a **new script**, not a mode of `fork-sandbox.sh`. There is no `--k8s`
 flag and none is planned yet — wiring the two together is a later round, and
 doing it before this path has run for a while would put an untested cluster
