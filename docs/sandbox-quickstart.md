@@ -364,7 +364,9 @@ These are checked, not advisory:
   not protect against, and what sealed egress changes.
 - `docs/sandbox-backend.md` — the contract the isolation layer implements,
   and what each backend does and does not hold.
-- `docs/kubernetes-runs.md` — the design for running a whole run in a cluster.
+- `docs/kubernetes-runs.md` — running a whole agent run in a Kubernetes
+  cluster, via `scripts/fork-sandbox-k8s.sh`.
+- `docs/k8s-platform.md` — the pluggable per-cluster layer underneath it.
 - The script headers (`fork-sandbox.sh`, `pr-review-sandbox.sh`,
   `claude-sandboxed`, `agent-sandboxed`, `sandbox-backend-bwrap`) — flags and
   boundaries, exhaustively.

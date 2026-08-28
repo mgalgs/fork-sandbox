@@ -16,9 +16,21 @@
 #   export FORK_SANDBOX_BACKEND=container
 #   export FORK_SANDBOX_CONTAINER_IMAGE=fork-sandbox:latest
 #
-# The image is built locally and never pushed. There is no registry copy,
-# deliberately: it carries the agent CLIs, and a run hands them your access
-# token, so the honest arrangement is that you build the thing you trust.
+# This script never pushes anywhere, and this project never ships a built
+# image or a registry of its own -- deliberately: the image carries the agent
+# CLIs, and a local run hands them your access token, so the honest
+# arrangement is that you build the thing you trust rather than pull a copy
+# someone else built.
+#
+# A Kubernetes run (docs/kubernetes-runs.md) is the one case that needs this
+# image to leave the machine that built it: a pod cannot pull from a local
+# docker daemon, so that path pushes the image you built here to a registry
+# you control (see "Bringing your own image and registry" in that doc for
+# concrete options) and names it with K8S_IMAGE. That does not weaken the
+# reasoning above, and if anything the supply-chain exposure is LOWER for a
+# Kubernetes run than a local one: the k8s agent pod holds no credential of
+# its own at all, where a locally-run agent may carry a model token this
+# image's build step never sees or needs to protect.
 
 set -euo pipefail
 
