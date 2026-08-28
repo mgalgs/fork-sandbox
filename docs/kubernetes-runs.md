@@ -55,6 +55,7 @@ and the pod exits.
 | Toolchain | host `/usr`, or the image | the image |
 | Agent's credentials | the model token only | the model token only, from a Secret |
 | Git write credential | **none** — it commits, it cannot push | **none** — the same |
+| Files arrive via | `--bind-ro` of a host path | `--copy-files`, over the same channel |
 | Work leaves via | `git fetch` from the clone | `git fetch` from the pod's clone |
 | Services reach it via | unix-socket bridges | Services, narrowed by NetworkPolicy |
 | Egress pin | pasta, or blackhole routes | NetworkPolicy, plus a self-test |
@@ -114,6 +115,53 @@ constraint it imposes:
 
 Either way the TTL is a real setting with a real trade-off, and it should be
 explicit rather than defaulted silently.
+
+## Getting files in
+
+`--bind-ro` does not survive the trip to another node, but the need it serves
+does: a run often has to see something that is not in the repository. The
+replacement is `--copy-files` — name a host path, and the client copies it into
+the pod before the agent starts.
+
+The name is deliberately not `--bind-ro`. The guarantee is weaker in ways a
+caller must know about: no live updates, a practical size ceiling, and a copy
+rather than a mount. Reusing the old word for a weaker property is the mistake
+this project refuses to make elsewhere. It is *stronger* in one respect —
+nothing the pod does to its copy can reach the client, guaranteed by physics
+rather than by mount flags.
+
+**The mechanism is the fetch path in reverse.** `kubectl cp` is `tar` over
+`kubectl exec`, so files go in exactly the way work comes out: the same RBAC, no
+Service, no Ingress, no new credential. One machinery, one failure mode. The
+image must carry `tar`, which the shipping image does.
+
+**It forces a two-phase start, and that is a gate.** The pod starts, waits, the
+client copies, the client signals, and only then does the agent run. **It must
+fail closed.** If the copy does not land, the agent must not start with its
+inputs missing — a silently absent input is the same failure class as a silently
+absent bind, which is a bug this project has already paid for once. The
+container backend's sentinel gate is the shape to copy.
+
+### What this does *not* replace
+
+`--bind-ro` carries three different kinds of thing today, and a copy serves one
+of them.
+
+- **Small data needed at start** — the git identity, the synthesized agent
+  config, a gathered-context directory, a small provisioned path. `--copy-files`
+  is the right answer, and this is most uses by count.
+- **Large read-only caches** — a model cache, browser builds, the object store a
+  `--shared` clone reads its history through. Copying gigabytes per run is the
+  wrong mechanism; these want a volume seeded once and mounted read-only across
+  many runs, or an image layer. Most of them do not arise here — the image
+  supplies the toolchain, and a pod that clones from a remote needs no
+  alternates — but a model cache is real, and a run that needs one should not
+  pay for it every time.
+- **The operator inbox**, which is live. It is the one channel that reaches a
+  run *after* it has started, and it works because a read-only bind reflects
+  host writes without remounting: an addendum written a minute from now is
+  simply visible. **A copy cannot do this**, and neither can a ConfigMap
+  mounted at start. This needs its own mechanism and is an open question below.
 
 ## The agent pod
 
@@ -210,6 +258,13 @@ These are genuinely unresolved and should be settled before implementation:
 4. **Concurrency and quota.** A fleet needs a bound on how many runs a person or
    a pipeline can have in flight, and a namespace `ResourceQuota` is only part
    of the answer.
+5. **The operator inbox.** Steering a running session depends on a mount that
+   reflects host writes live, and no copy reproduces that. A mounted ConfigMap
+   does eventually propagate updates, which is the closest native fit, but the
+   delay is unspecified and the size ceiling is low. Polling `kubectl cp` on a
+   timer is cruder and more predictable. Neither is obviously right.
+6. **Seeding a large read-only cache**, per the section above: a volume shared
+   across runs needs a lifecycle, a writer, and a story for staleness.
 
 ## Deliberately not done
 
