@@ -116,9 +116,10 @@
 # into the sandbox, and fork-sandbox-say.sh drops an operator addendum there —
 # a course correction carrying the same authority as the handoff. On the claude
 # harness a hook puts it in front of the session on its next tool call and
-# refuses to let it finish while one is unread; the other harnesses are told to
-# read the directory before each commit and before their final report. So
-# steering a run no longer means killing it and starting over.
+# refuses to let it finish while one is unread; the other harnesses are told
+# to read the directory on a tool-call floor, around long commands, before
+# each commit, and before their final report. So steering a run no longer
+# means killing it and starting over.
 #
 # The review loop. --review-loop N adds a quality pass after the coding
 # session: a REVIEW leg reads the commits the run just made and writes a
@@ -1689,9 +1690,19 @@ EOF
         cat <<'EOF'
 
 Nothing pushes them at you on this harness, so you have to look. List that
-directory and read anything new **before every commit, and again before you
-write your final report**. An addendum you never read is an instruction you
-never followed.
+directory and read anything new at each of these points:
+
+  - before each commit,
+  - before and after any command you expect to take more than ~30 seconds
+    (a test suite, a build, a bulk network call),
+  - at least once every 25 tool calls,
+  - before you write your final report.
+
+Reading it is an `ls` and a `cat` over a small directory, so it costs almost
+nothing — read it more often than you think you need to. Do not wait for a
+commit: a session that is stuck, off-scope, or grinding through a long build
+is the one most likely to be sent a correction and the least likely to reach
+a commit. An addendum you never read is an instruction you never followed.
 EOF
     fi
     if [[ "$harness" == "pi-local" ]]; then
