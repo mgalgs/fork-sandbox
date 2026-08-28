@@ -8,7 +8,7 @@ implementation can be dropped in without the layers above knowing.
 
 **Status: `sandbox-backend-bwrap` and `sandbox-backend-container` implement
 this contract, and `claude-sandboxed` and `agent-sandboxed` are their two
-callers.** The Kubernetes backend described below is not built. The contract was written
+callers.** The contract was written
 down before the extraction because it is the part that has to be right; a
 backend that gets it wrong is not a weaker sandbox, it is a sandbox that lies.
 
@@ -21,8 +21,10 @@ Three reasons, in the order they will bite:
    bridge. A Linux container is the honest port, and it is a *different
    backend*, not a patch to this one.
 2. **Kubernetes.** A cloud fleet of agents wants the same run shape — clone,
-   work, push a branch, die — with a Job as the unit. The isolation primitive
-   changes completely; nothing else does.
+   work, return a branch, die. Writing this down is what made it possible to
+   see that a cluster is *not* another backend: the pod is already the sandbox,
+   and the options below that name host paths do not survive the trip to
+   another node. See [kubernetes-runs.md](kubernetes-runs.md).
 3. **Honesty.** Writing the guarantees down as a contract makes it possible to
    say which of them a given backend actually holds. Before this existed it was
    implicit in 1,000 lines of flag handling inside `claude-sandboxed`.
@@ -47,9 +49,10 @@ sandbox-backend-<name> [options] -- COMMAND [ARG...]
 | `--hostname NAME` | Set the sandbox hostname, so a prompt can show where it is. |
 | `--` | Ends option parsing. Everything after is the command, passed verbatim. |
 
-Backends may add their own options — a container backend needs an image, a
-Kubernetes backend needs a namespace and a service account. Those are declared
-by the backend and must not be required for the contract above to work.
+Backends may add their own options — a container backend needs an image, and
+a hypothetical VM backend would need a disk and a machine type. Those are
+declared by the backend and must not be required for the contract above to
+work.
 
 ### Mount order
 
@@ -187,15 +190,26 @@ only in its own doc keeps this table an honest answer to "which backends can
 be asked for unrestricted egress" — the question a reader comes to the
 contract to settle.
 
-### `k8s` — planned
+### Kubernetes — deliberately not a backend
 
-One Job per run. `--net` maps onto a NetworkPolicy, `--bridge` onto an egress
-rule to a Service. `runAsNonRoot`, `readOnlyRootFilesystem`, dropped
-capabilities, `automountServiceAccountToken: false` and a `seccompProfile` are
-the pod-level equivalents of the guarantees above, and a `RuntimeClass` of
-gVisor or Kata raises the isolation strength past anything available locally.
-The branch comes back by being pushed to a remote rather than fetched from a run
-directory, which is simpler than the local flow rather than harder.
+There is no `k8s` backend planned, and that is a decision rather than a gap.
+
+Two options in the table above are *local*. `--bind-ro` and `--bind-rw` assume
+the thing running the command can see the path, which is free on one machine and
+false for a pod on another node — and the callers lean on it hard, for the clone
+itself, the object store a `--shared` clone reads its history through, and
+caches measured in gigabytes. The work also returns by `git fetch` from a
+bind-mounted clone, which needs a shared filesystem.
+
+More to the point, in a cluster **the pod already is the sandbox**: its spec
+supplies the namespaces, the filesystem policy and the egress control this
+contract describes. A backend inside a Job would isolate twice and inherit
+host-path assumptions in exchange for nothing.
+
+So the cluster path moves the whole *run* rather than one command, which is a
+different verb at a different layer. It is designed in
+[kubernetes-runs.md](kubernetes-runs.md), and this contract stays honestly
+local.
 
 ## Selecting one
 

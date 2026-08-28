@@ -178,9 +178,14 @@ bubblewrap, pasta and network namespaces, all Linux-specific. That layer is a
 **backend interface**: one executable per isolation mechanism, behind a fixed
 contract, chosen with `FORK_SANDBOX_BACKEND`. Two implementations exist —
 `sandbox-backend-bwrap`, the default, and `sandbox-backend-container` — and
-`claude-sandboxed` and `agent-sandboxed` are their callers. A Kubernetes
-backend is planned and not built. The contract is written down in
-[docs/sandbox-backend.md](docs/sandbox-backend.md).
+`claude-sandboxed` and `agent-sandboxed` are their callers. The contract is
+written down in [docs/sandbox-backend.md](docs/sandbox-backend.md).
+
+Kubernetes is deliberately **not** a third backend. In a cluster the pod is
+already the sandbox, and the contract's host-path options do not survive the
+trip to another node — so the whole *run* moves there instead of one command.
+That is designed in [docs/kubernetes-runs.md](docs/kubernetes-runs.md), and it
+is not built either.
 
 macOS's own `sandbox-exec` is not a substitute: its network control is
 allow-all-or-nothing, so pinned egress and the sealed bridge cannot be
@@ -259,8 +264,10 @@ what is mounted, what is not, and a numbered list of the gaps.
 - [docs/sandbox-services.md](docs/sandbox-services.md) — the committed
   contract a repo uses to declare its service stack.
 - [docs/permissions.md](docs/permissions.md) — running these without a prompt.
-- [docs/sandbox-backend.md](docs/sandbox-backend.md) — the isolation contract,
-  its two implementations, and where Kubernetes support would plug in.
+- [docs/sandbox-backend.md](docs/sandbox-backend.md) — the isolation contract
+  and its two implementations.
+- [docs/kubernetes-runs.md](docs/kubernetes-runs.md) — running a whole run in a
+  cluster, and why that is not a backend. Design only.
 - [docs/sandbox-backend-container.md](docs/sandbox-backend-container.md) — the
   container backend: mechanism, threat model, and limits.
 
