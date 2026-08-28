@@ -170,6 +170,23 @@ git -c protocol.ext.allow=always push \
     HEAD:refs/heads/BRANCH
 ```
 
+The script's actual push also passes `-c core.hooksPath=/dev/null`, for a
+reason unrelated to `protocol.ext.allow`. This push runs on the host, in the
+repository the caller names on the command line — and that path is
+caller-supplied, so the client has no business trusting whatever `pre-push`
+hook happens to be installed there. Disabling hooks for the one invocation
+is what keeps a repo the script was merely pointed at from running its own
+code inside the client.
+
+The fetch carries the same flag for a different reason. It writes straight
+into `refs/heads/BRANCH` in the caller's real repository rather than into a
+remote-tracking ref, and `githooks(5)` documents `reference-transaction` as
+firing on any git command that updates refs — fetch included — so the same
+untrusted repository could run a hook there too. Both invocations scope the
+flag with git's own `-c`, exactly like `protocol.ext.allow=always` above:
+never set globally, and never active for longer than the one command that
+needs it.
+
 The pod's entrypoint runs `git init --bare /work/repo.git` before anything
 else, so there is somewhere for this to land; once the push completes, the
 client writes a sentinel and the pod clones its own bare repo, checks out the
