@@ -46,7 +46,10 @@ cat > "$CODEX_HOME/models_cache.json" <<'JSON'
 JSON
 
 run() {
-    "$launcher" --dry-run "$@" unused-project unused-handoff
+    # --dry-run also reports the resolved prompt overlay (tests of its own in
+    # fork-sandbox-prompt-overlay-test.sh); filtered out here so this file
+    # stays scoped to harness/model resolution, its own subject.
+    "$launcher" --dry-run "$@" unused-project unused-handoff | grep -v '^prompt_overlay_'
 }
 
 printf '== fork-sandbox harness/model resolution ==\n'
