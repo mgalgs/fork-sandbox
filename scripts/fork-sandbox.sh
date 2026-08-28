@@ -1832,96 +1832,13 @@ fi
 # nothing and removes the guess.
 handoff_copy="$run_dir/handoff.md"
 
-# The preamble every generated prompt starts with: where the clone is, where
-# the operator inbox is, how addenda reach this harness, and — for a sealed
-# run — that there is no network. The handoff needs it, and so do the review
-# and fix prompts of --review-loop, which are separate sessions in the same
-# sandbox and know none of it either. Written once here rather than pasted
-# three times.
-fs_emit_prompt_preamble() {
-    cat <<EOF
-# Your working directory
-
-You are in a sandboxed, throwaway clone of the repository. Its absolute path
-is:
-
-    $clone_dir
-
-You start there, so **prefer relative paths**. When you do need an absolute
-one, copy the line above rather than typing it out: a hand-built path that
-drops a segment fails as "No such file or directory", which looks like a
-missing file rather than a wrong path.
-
-That directory is the only writable thing here. Everything else in the sandbox
-is read-only or ephemeral.
-EOF
-    # Same convention as the working-directory block above: name the absolute
-    # path once so nothing has to build it by hand.
-    cat <<EOF
-
-## Operator inbox
-
-The person who launched this run can send you further instructions while you
-work. They arrive as files in:
-
-    $inbox_dir
-
-Each file there is an **operator addendum**: a message from the same person who
-wrote your handoff, written after this run started. An addendum is a
-continuation of the handoff and carries the same authority — it may override
-the handoff rather than merely add to it, and where the two conflict the
-addendum is the newer instruction and wins.
-
-The directory is mounted read-only. Never write to it. An empty inbox is the
-normal case, not a problem: most runs get no addenda at all.
-EOF
-    if [[ "$harness" == "claude" ]]; then
-        cat <<'EOF'
-
-Addenda are pushed to you automatically — beside a tool result, or at the end
-of a turn — so you do not have to go looking. Reading the directory yourself is
-a backstop, not the mechanism.
-EOF
-    else
-        cat <<'EOF'
-
-Nothing pushes them at you on this harness, so you have to look. List that
-directory and read anything new at each of these points:
-
-  - before each commit,
-  - before and after any command you expect to take more than ~30 seconds
-    (a test suite, a build, a bulk network call),
-  - at least once every 25 tool calls,
-  - before you write your final report.
-
-Reading it is an `ls` and a `cat` over a small directory, so it costs almost
-nothing — read it more often than you think you need to. Do not wait for a
-commit: a session that is stuck, off-scope, or grinding through a long build
-is the one most likely to be sent a correction and the least likely to reach
-a commit. An addendum you never read is an instruction you never followed.
-EOF
-    fi
-    if [[ "$harness" == "pi-local" ]]; then
-        cat <<'EOF'
-
-## This sandbox has no network
-
-There is no internet here, no LAN, and no DNS. The model you are running on is
-reached over a socket and is the only thing outside this machine you can talk
-to. Nothing else will answer.
-
-So do not try to install anything — no `npm install`, no `pip install`, no
-`apt-get`, no `git fetch`, no documentation lookup. Those fail, and the failure
-is the sandbox working as intended rather than a problem to debug or work
-around.
-
-Everything the work needs is already here: the clone, whatever dependencies
-were provisioned into it, and any per-run services. If something genuinely
-necessary is missing, say so in your final report instead of trying to fetch
-it.
-EOF
-    fi
-}
+# fs_emit_prompt_preamble (fork-sandbox-lib.sh) takes its network argument
+# explicitly rather than reading $harness itself, so it can also serve
+# fork-sandbox-k8s.sh's pod, which is a network situation of its own and not
+# "pi-local". Resolve it once here: "sealed" for a pi-local run (no network
+# at all), empty for every other local harness (unrestricted).
+preamble_network=""
+[[ "$harness" == "pi-local" ]] && preamble_network=sealed
 
 # The model-specific layer, applied after every generated block above and
 # immediately before that leg's own task text: the environment blocks say
@@ -1946,7 +1863,7 @@ fs_emit_prompt_overlay() {
 }
 
 {
-    fs_emit_prompt_preamble
+    fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" "$harness" "$preamble_network"
     if (( services_enabled )); then
         cat <<EOF
 
@@ -2002,7 +1919,7 @@ if (( review_loop_cap > 0 )); then
     fs_reject_unsafe_chars "$review_prompt" "$fix_prompt_header" \
         "$review_verdict_file" "$review_skill_dir"
     {
-        fs_emit_prompt_preamble
+        fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" "$harness" "$preamble_network"
         fs_emit_prompt_overlay review
         cat <<EOF
 
@@ -2078,7 +1995,7 @@ EOF
     mv -- "$review_prompt.part" "$review_prompt"
 
     {
-        fs_emit_prompt_preamble
+        fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" "$harness" "$preamble_network"
         fs_emit_prompt_overlay fix
         cat <<EOF
 

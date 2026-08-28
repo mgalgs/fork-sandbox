@@ -461,6 +461,11 @@ cmd_submit() {
         [[ -x "$f" ]] || { echo "Error: $f is missing or not executable." >&2; exit 1; }
     done
 
+    # Must track fork-sandbox-k8s-entrypoint.sh's own work_dir/clone_dir --
+    # this script renders the ConfigMap before the pod exists, so there is
+    # nowhere to read the value back from.
+    local pod_clone_dir=/work/clone
+
     local rendered
     rendered="$(cat <<EOF
 ---
@@ -478,7 +483,9 @@ $(indent_block < "$entrypoint_sh")
   egress-gate.sh: |
 $(indent_block < "$gate_sh")
   handoff.md: |
-$(indent_block < "$handoff_file")
+$({ fs_emit_prompt_preamble "$pod_clone_dir" "" pi gated
+   printf '\n---\n\n'
+   cat -- "$handoff_file"; } | indent_block)
 ---
 apiVersion: batch/v1
 kind: Job

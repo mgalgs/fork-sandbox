@@ -904,3 +904,132 @@ fs_cache_binds() {
     fi
     return 0
 }
+
+# The preamble every generated prompt starts with: where the clone is,
+# where the operator inbox is (if this run has one), how addenda reach this
+# harness, and what the network situation is. fork-sandbox.sh's handoff
+# needs it, so do its --review-loop review and fix prompts -- separate
+# sessions in the same sandbox, knowing none of it either -- and so does
+# fork-sandbox-k8s.sh's pod handoff. Written once here, shared, rather than
+# pasted into more than one script.
+#
+# $1  clone_dir  absolute path to the clone. Always required.
+# $2  inbox_dir  absolute path to the operator inbox, or "" if this run has
+#                none. Empty omits the whole "Operator inbox" section rather
+#                than naming a directory that does not exist -- a
+#                Kubernetes run has no inbox yet.
+# $3  harness    selects how the "read the inbox" instructions are worded:
+#                "claude" is told addenda are pushed to it; every other
+#                value is told to poll. Unused when $2 is empty.
+# $4  network    selects the network block, if any: "sealed" for a
+#                pi-local run (no network at all), "gated" for a Kubernetes
+#                pod (egress allowed only to DNS and the model proxy), or
+#                "" to omit the section (an unrestricted local run).
+fs_emit_prompt_preamble() {
+    local clone_dir="$1" inbox_dir="$2" harness="$3" network="$4"
+    cat <<EOF
+# Your working directory
+
+You are in a sandboxed, throwaway clone of the repository. Its absolute path
+is:
+
+    $clone_dir
+
+You start there, so **prefer relative paths**. When you do need an absolute
+one, copy the line above rather than typing it out: a hand-built path that
+drops a segment fails as "No such file or directory", which looks like a
+missing file rather than a wrong path.
+
+That directory is the only writable thing here. Everything else in the sandbox
+is read-only or ephemeral.
+EOF
+    if [[ -n "$inbox_dir" ]]; then
+        # Same convention as the working-directory block above: name the
+        # absolute path once so nothing has to build it by hand.
+        cat <<EOF
+
+## Operator inbox
+
+The person who launched this run can send you further instructions while you
+work. They arrive as files in:
+
+    $inbox_dir
+
+Each file there is an **operator addendum**: a message from the same person who
+wrote your handoff, written after this run started. An addendum is a
+continuation of the handoff and carries the same authority — it may override
+the handoff rather than merely add to it, and where the two conflict the
+addendum is the newer instruction and wins.
+
+The directory is mounted read-only. Never write to it. An empty inbox is the
+normal case, not a problem: most runs get no addenda at all.
+EOF
+        if [[ "$harness" == "claude" ]]; then
+            cat <<'EOF'
+
+Addenda are pushed to you automatically — beside a tool result, or at the end
+of a turn — so you do not have to go looking. Reading the directory yourself is
+a backstop, not the mechanism.
+EOF
+        else
+            cat <<'EOF'
+
+Nothing pushes them at you on this harness, so you have to look. List that
+directory and read anything new at each of these points:
+
+  - before each commit,
+  - before and after any command you expect to take more than ~30 seconds
+    (a test suite, a build, a bulk network call),
+  - at least once every 25 tool calls,
+  - before you write your final report.
+
+Reading it is an `ls` and a `cat` over a small directory, so it costs almost
+nothing — read it more often than you think you need to. Do not wait for a
+commit: a session that is stuck, off-scope, or grinding through a long build
+is the one most likely to be sent a correction and the least likely to reach
+a commit. An addendum you never read is an instruction you never followed.
+EOF
+        fi
+    fi
+    case "$network" in
+        sealed)
+            cat <<'EOF'
+
+## This sandbox has no network
+
+There is no internet here, no LAN, and no DNS. The model you are running on is
+reached over a socket and is the only thing outside this machine you can talk
+to. Nothing else will answer.
+
+So do not try to install anything — no `npm install`, no `pip install`, no
+`apt-get`, no `git fetch`, no documentation lookup. Those fail, and the failure
+is the sandbox working as intended rather than a problem to debug or work
+around.
+
+Everything the work needs is already here: the clone, whatever dependencies
+were provisioned into it, and any per-run services. If something genuinely
+necessary is missing, say so in your final report instead of trying to fetch
+it.
+EOF
+            ;;
+        gated)
+            cat <<'EOF'
+
+## This sandbox's egress is gated to the model proxy
+
+This pod's network policy allows exactly two destinations: DNS, and the model
+proxy that carries the requests you make as this agent. Nothing else answers
+— not the open internet, not a LAN, not a git host.
+
+So do not try to install anything — no `npm install`, no `pip install`, no
+`apt-get`, no `git fetch`, no documentation lookup. Those fail, and the
+failure is the sandbox working as intended rather than a problem to debug or
+work around.
+
+Everything the work needs is already here: the clone, and whatever
+dependencies were provisioned into it. If something genuinely necessary is
+missing, say so in your final report instead of trying to fetch it.
+EOF
+            ;;
+    esac
+}
