@@ -64,13 +64,14 @@ the Job and pod left in place after a successful fetch.
 
 `fork-sandbox.sh --k8s` dispatches to exactly this `run` verb: it resolves
 and validates the harness and model the same way a local run does, builds
-the argument list above, and `exec`s this script — no local clone, tmux
-runner or review loop ever starts. Most of `fork-sandbox.sh`'s other flags
-describe that local machinery and have nothing to attach to on a cluster
-run, so `--k8s` refuses each of them by name (`--review-loop`, `--harness`
-values other than `pi`, and several more) rather than accepting and
-silently dropping it. See the `--k8s` entry in `fork-sandbox.sh`'s own
-header for the full list and the reasoning, and
+the argument list above, and `exec`s this script — no local clone or tmux
+runner ever starts (the review loop, unlike those two, DOES run on this
+path — see "The cluster review loop" below). Most of `fork-sandbox.sh`'s
+other flags describe that local machinery and have nothing to attach to on
+a cluster run, so `--k8s` refuses each of them by name (`--harness` values
+other than `pi`, `--checkout`, `--prompts-dir`, and several more) rather
+than accepting and silently dropping it. See the `--k8s` entry in
+`fork-sandbox.sh`'s own header for the full list and the reasoning, and
 `skills/fork-sandbox/SKILL.md` for when a cluster run is the right choice.
 This script itself stays the direct entry point either way — `install`,
 `submit` and `fetch` are unaffected, and `run` behaves identically whether
@@ -360,6 +361,84 @@ run has no host run directory, so an operator who calls `say` today has no
 way to confirm what has already been sent short of the pod's own eventual
 commit or final report. Worth its own round, not solved here.
 
+## The cluster review loop
+
+`fork-sandbox-k8s.sh submit`/`run --review-loop N` is the cluster analogue
+of `fork-sandbox.sh`'s own local `--review-loop`: after the coding leg, run
+a fresh session to review the branch and, on findings, a fresh session to
+fix them, repeating until the review approves, a fix leg makes no further
+progress, or `N` iterations have run.
+
+**The loop runs POD-SIDE; its prompts are generated HOST-SIDE.** The two
+have to split that way for different reasons. The loop has to run inside
+the pod because the pod owns the clone — running each review/fix leg
+anywhere else would cost a `kubectl exec` round trip per leg, on top of the
+push/fetch round trips submit and fetch already pay. The prompts have to be
+generated on the host because that is the only place the whole design
+already funnels prompt composition through: `fs_emit_review_prompt_body` /
+`fs_emit_fix_prompt_body` in `fork-sandbox-lib.sh` are the exact functions
+`fork-sandbox.sh`'s own local loop calls, and `fork-sandbox-k8s.sh` calls
+the same two functions to render `review-prompt.md` and
+`fix-prompt-header.md` into the per-run ConfigMap, right beside `handoff.md`.
+The pod's own script, `fork-sandbox-k8s-review-loop.sh`, composes no prompt
+text of its own — its only prompt-related job is concatenating the
+host-rendered fix header to a verdict before handing the result to the fix
+leg. This is the one property this design exists to hold: a second copy of
+the prompt text would be exactly the kind of thing that drifts unnoticed
+from the local wording it is supposed to match.
+
+Unlike the local loop's prompts, which layer a machine-local overlay
+(`--prompts-dir`) between the preamble and the body, the cluster path's
+review and fix prompts render with no overlay at all: `--prompts-dir` is
+refused outright with `--k8s` (see its refusal in `fork-sandbox.sh`'s own
+header), so there is nothing to layer onto them. They are preamble, then
+body, exactly as the local loop's own prompts render when no overlay is
+configured.
+
+The review leg's method — the `code-review-portable` skill — arrives the
+same way the two prompts do: read from this repo's own `skills/`
+directory (never `~/.claude/skills/`, which is a symlink into this repo on
+a machine that has run `install.sh` and would not exist on a fresh
+checkout or a CI runner), rendered as a flat ConfigMap key
+(`code-review-portable-skill.md`, since a ConfigMap key cannot contain
+`/`), and staged by the entrypoint at the path the review prompt names —
+`/work/skills/code-review-portable/SKILL.md` — before the coding leg even
+starts. `/work/skills` is a sibling of `/work/clone`, never a descendant,
+the same structural reason `/work/inbox` is a sibling: the entrypoint's
+`git add -A` safety net is scoped to the clone it runs in, so nothing
+outside it can ever be swept into a commit.
+
+The loop's outcome lands in the pod at `/work/review-loop.json`, written
+after every leg rather than only at the end, so a pod killed mid-loop still
+leaves behind the iterations it finished — the same discipline the local
+loop's own `review-loop.json` follows. It is a trimmed version of the local
+file: no `review_model`, no cost or usage fields, because there is no cost
+accounting on the cluster path at all yet, and inventing empty keys for
+numbers nobody is computing would imply there is. `commits_added` **is**
+filled in during the loop here, unlike locally — the pod owns the clone
+directly, so `git rev-list --count` needs no fetch to run against.
+
+`fork-sandbox-k8s.sh run` reads `/work/review-loop.json` back and prints a
+summary before fetching the branch, because of a constraint the local run
+does not have: **the container's own exit code always stays the CODING
+leg's**, never the review loop's, even when a loop ran and even if it ended
+in `harness-error`. This mirrors the local loop exactly — `fork-sandbox.sh`
+never reassigns `rc` after the implement leg either, and the loop's outcome
+travels in `review-loop.json` instead of the exit code there too — but on
+the cluster path, unlike locally, `run`'s own exit code is the only thing
+an unattended caller (a CI job, say) sees automatically. So `run` reading
+the JSON back and printing an unmissable summary when the loop ended in
+`cap` or `no-progress` with findings still open is not a nicety; it is the
+one place a `--review-loop` run on this path can report a review that never
+approved, given that the exit code cannot.
+
+**`--review-model` is not supported yet.** The pod's `~/.pi/agent/models.json`
+is generated with a single model entry (see
+`fork-sandbox-k8s-entrypoint.sh`'s `jq` block), so a second model for the
+review leg has nowhere to be declared. This is a real follow-up — adding it
+needs the entrypoint to accept a second model id and register a second
+provider entry — not a permanent no.
+
 ## Egress is sealed, except the proxy
 
 **Stronger than the original design's `pinned` mode, and worth stating
@@ -534,14 +613,16 @@ rather than waiting for a general `--copy-files`.
 There is no install step, because there is no egress to install anything
 with — see "Limits" below. Whatever a run needs is already in the image.
 
-**Scripts ship as a ConfigMap, not baked into the image.** Three of them:
+**Scripts ship as a ConfigMap, not baked into the image.** Four of them:
 `scripts/fork-sandbox-k8s-entrypoint.sh` (the main container),
-`scripts/fork-sandbox-k8s-egress-gate.sh` (the initContainer), and
+`scripts/fork-sandbox-k8s-egress-gate.sh` (the initContainer),
 `scripts/fork-sandbox-k8s-inbox-write.sh` (run on demand, over `kubectl exec
--i`, by the `say` verb — see "The operator inbox" above). All three are
-mounted in from a per-run ConfigMap `submit` renders, rather than compiled
-into `K8S_IMAGE`. Iterating on any of them needs no image rebuild and no
-registry push — only a re-`submit`.
+-i`, by the `say` verb — see "The operator inbox" above), and
+`scripts/fork-sandbox-k8s-review-loop.sh` (run by the entrypoint after the
+coding leg, only when `--review-loop` was given — see "The cluster review
+loop" above). All four are mounted in from a per-run ConfigMap `submit`
+renders, rather than compiled into `K8S_IMAGE`. Iterating on any of them
+needs no image rebuild and no registry push — only a re-`submit`.
 
 ## Bringing your own image and registry
 
@@ -727,9 +808,11 @@ Scoped out of v1 on purpose, not overlooked:
 - **`status` / `logs` subcommands.** `kubectl` already does both, against the
   Job and pod this client creates with ordinary, discoverable names and
   labels.
-- **A review loop inside a pod.** `--k8s` refuses `--review-loop` by name.
-  The loop is host-side: the review and fix prompts are generated on the
-  host, and `code-review-portable` is not in the pod image.
+- **`--review-model` for the cluster review loop.** `--k8s` refuses it by
+  name -- the pod's `models.json` is generated with a single model entry,
+  so a second model for the review leg has nowhere to be declared yet. See
+  "The cluster review loop" above. (The loop itself, `--review-loop`, IS
+  built and runs pod-side -- this is the one narrower gap left in it.)
 - **Any harness other than `pi` inside a pod.** `--k8s` refuses `--harness`
   values other than `pi` by name — see "Model access" above for why `pi`
   talking to the proxy is the one shape this path builds at all.
