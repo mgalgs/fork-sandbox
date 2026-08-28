@@ -381,6 +381,39 @@ trap cleanup EXIT
 if (( ! EXEC_MODE )); then
     mkdir -p "$STATE_DIR/claude"
 
+    # Mountpoints for the caller's binds that land inside ~/.claude -- the
+    # review kit is the one that does, at ~/.claude/skills/<name> and
+    # ~/.claude/scripts. ~/.claude is this state dir remapped, so those binds
+    # nest inside it, and a backend given a destination that does not exist
+    # creates it. Under the container backend the runtime creates it as root,
+    # inside a directory this script owns, and the EXIT trap's `rm -rf` then
+    # cannot remove it: the state dir survives the run it was made for, an
+    # empty root-owned husk the user needs sudo to clear. Creating them here,
+    # as this user, means every backend mounts onto a directory that already
+    # exists and the trap always finishes.
+    # claude_mountpoint SRC DEST -- make DEST's stand-in under the state dir,
+    # a directory or an empty file to match SRC, which is what the backend
+    # will mount there.
+    claude_mountpoint() {
+        local src="$1" dest="$2" at
+        [[ "$dest" == "$HOME/.claude/"* ]] || return 0
+        at="$STATE_DIR/claude/${dest#"$HOME/.claude/"}"
+        if [[ -d "$src" ]]; then
+            mkdir -p "$at"
+        else
+            mkdir -p "$(dirname "$at")"
+            : > "$at"
+        fi
+    }
+    # --bind-ro and --bind-rw land a path at its own location, so each is its
+    # own destination. --bind-ro-at names the two separately.
+    for bind_path in "${BIND_RO[@]}" "${BIND_RW[@]}"; do
+        claude_mountpoint "$bind_path" "$bind_path"
+    done
+    for i in "${!BIND_RO_AT_DEST[@]}"; do
+        claude_mountpoint "${BIND_RO_AT_SRC[$i]}" "${BIND_RO_AT_DEST[$i]}"
+    done
+
     # Keep the access token. Drop the refresh token, which is long-lived and
     # single-use — a sandbox refresh would invalidate the host's copy. Drop
     # mcpOAuth, which holds unrelated MCP server tokens.
