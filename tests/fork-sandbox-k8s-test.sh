@@ -124,6 +124,19 @@ if command -v yamllint >/dev/null 2>&1; then
     if [[ -z "$out" ]]; then ok "yamllint: install --dry-run piped through stdin"; else no "yamllint: install --dry-run piped through stdin" "$out"; fi
 fi
 
+printf '\n== namespace enforces Pod Security Admission (restricted) ==\n'
+if grep -q 'pod-security.kubernetes.io/enforce: restricted' "$install_out"; then
+    ok "rendered Namespace enforces PSA restricted"
+else
+    no "rendered Namespace enforces PSA restricted" "not found in $install_out"
+fi
+if grep -q 'pod-security.kubernetes.io/warn: restricted' "$install_out" \
+    && grep -q 'pod-security.kubernetes.io/audit: restricted' "$install_out"; then
+    ok "rendered Namespace holds PSA warn and audit to the same level"
+else
+    no "rendered Namespace holds PSA warn and audit to the same level" "not found in $install_out"
+fi
+
 submit_out="$(newdir)/submit.yaml"; tmpdirs+=("$(dirname "$submit_out")")
 if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-branch --model moonshotai/kimi-k3 \

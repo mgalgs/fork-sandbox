@@ -4,10 +4,22 @@
 # starve the rest of the cluster, and a LimitRange, so a Job that names no
 # resources of its own still gets one. __NAMESPACE__ is a placeholder token;
 # fork-sandbox-k8s.sh substitutes it with K8S_NAMESPACE before applying.
+#
+# Pod Security Admission is enforced at `restricted`, not left to the pod
+# specs alone -- both the agent Job and the proxy Deployment already comply
+# (runAsNonRoot, allowPrivilegeEscalation: false, capabilities dropped to
+# ALL, seccompProfile RuntimeDefault), so this label makes that containment
+# a cluster-enforced floor instead of something a future edit could weaken
+# silently. warn and audit are held to the same level, so a violation is
+# visible before it is ever admitted.
 apiVersion: v1
 kind: Namespace
 metadata:
   name: __NAMESPACE__
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/audit: restricted
 ---
 apiVersion: v1
 kind: ResourceQuota
