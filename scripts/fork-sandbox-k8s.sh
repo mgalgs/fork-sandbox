@@ -245,6 +245,38 @@ indent_block() {
     done
 }
 
+# Extracts the `nginx.conf` key from a rendered proxy ConfigMap's block
+# scalar (`nginx.conf: |`), reversing indent_block's 4-space indent. A blank
+# line in the block carries no indent of its own, so it is matched too.
+k8s_extract_nginx_conf() {
+    awk '
+        /^  nginx\.conf: \|$/ { flag=1; next }
+        flag && (length($0)==0 || substr($0,1,4)=="    ") { print substr($0,5); next }
+        flag { flag=0 }
+    '
+}
+
+# A hex sha256 of stdin, for the proxy config-change annotation below.
+# sha256sum and openssl are not both guaranteed on every machine this might
+# run on (sha256sum is missing without GNU coreutils, openssl is missing on
+# a minimal install) -- try the GNU tool, then two portable fallbacks,
+# before giving up.
+k8s_sha256_stdin() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum | cut -d' ' -f1
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 | cut -d' ' -f1
+    elif command -v openssl >/dev/null 2>&1; then
+        openssl dgst -sha256 | sed 's/^.* //'
+    else
+        echo "Error: none of sha256sum, shasum or openssl found. One is" >&2
+        echo "needed to hash the proxy ConfigMap's content, so a config" >&2
+        echo "change can roll the proxy Deployment -- see" >&2
+        echo "docs/kubernetes-runs.md." >&2
+        return 1
+    fi
+}
+
 # A Kubernetes object name: lowercase RFC 1123, <=63 chars. Branch names are
 # freeform, so this derives a safe name rather than requiring the caller to
 # pick one that already qualifies.
@@ -291,11 +323,23 @@ cmd_install() {
     local rendered f
     rendered=""
     for f in "$manifests_dir"/*.yaml; do
-        rendered+="$(sed \
+        local file_rendered
+        file_rendered="$(sed \
             -e "s|__NAMESPACE__|$K8S_NAMESPACE|g" \
             -e "s|__PROXY_UPSTREAM_HOST__|$upstream_host|g" \
             -e "s|__PROXY_UPSTREAM__|$K8S_PROXY_UPSTREAM|g" \
-            "$f")"$'\n'
+            "$f")"
+        if [[ "$(basename "$f")" == 30-proxy.yaml ]]; then
+            # A hash of the rendered nginx.conf, filled into the proxy
+            # Deployment's pod-template annotation so a config change rolls
+            # the proxy by itself -- see the annotation's own comment in
+            # manifests/k8s/30-proxy.yaml for why the template, not the
+            # Deployment's own metadata, has to carry it.
+            local conf_checksum
+            conf_checksum="$(k8s_extract_nginx_conf <<< "$file_rendered" | k8s_sha256_stdin)" || exit 1
+            file_rendered="${file_rendered//__PROXY_CONF_CHECKSUM__/$conf_checksum}"
+        fi
+        rendered+="$file_rendered"$'\n'
     done
     rendered+="$("$K8S_PLATFORM_BIN" render-policy --namespace "$K8S_NAMESPACE" \
         --agent-label app=fork-sandbox-agent \

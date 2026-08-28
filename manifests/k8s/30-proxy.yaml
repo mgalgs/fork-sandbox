@@ -97,6 +97,19 @@ spec:
     metadata:
       labels:
         app: fork-sandbox-proxy
+      annotations:
+        # A hash of the ConfigMap's nginx.conf, filled in by
+        # fork-sandbox-k8s.sh at render time. A ConfigMap update alone does
+        # not restart the pods reading it -- the mounted file eventually
+        # updates on disk, but nginx does not reload on its own, and the
+        # Deployment is otherwise unchanged so nothing restarts it either.
+        # Annotating the POD TEMPLATE (not the Deployment's own metadata)
+        # changes the template on a config change, which is what makes
+        # Kubernetes roll the pods by itself. Measured against a live
+        # cluster: without this, `install` reported the ConfigMap
+        # "configured" and the Deployment "unchanged", and the proxy kept
+        # crashlooping on its stale config until a manual rollout restart.
+        checksum/nginx-conf: "__PROXY_CONF_CHECKSUM__"
     spec:
       automountServiceAccountToken: false
       securityContext:

@@ -137,6 +137,44 @@ else
     no "rendered Namespace holds PSA warn and audit to the same level" "not found in $install_out"
 fi
 
+printf '\n== proxy Deployment rolls when its config changes ==\n'
+# A ConfigMap update alone does not restart the pods reading it, so
+# fork-sandbox-k8s.sh hashes the rendered nginx.conf into the proxy
+# Deployment's POD TEMPLATE annotation -- see the annotation's own comment
+# in manifests/k8s/30-proxy.yaml. Confirm the annotation exists, and that it
+# actually changes when the config does, by rendering install twice with two
+# different K8S_PROXY_UPSTREAM values (the upstream is embedded in
+# nginx.conf, so this is a real config change, not a synthetic one).
+checksum1="$(sed -n 's/.*checksum\/nginx-conf: "\([0-9a-f]*\)".*/\1/p' "$install_out" | head -n1)"
+if [[ -n "$checksum1" ]]; then
+    ok "rendered proxy Deployment carries a checksum/nginx-conf annotation"
+else
+    no "rendered proxy Deployment carries a checksum/nginx-conf annotation" "not found in $install_out"
+fi
+
+config_dir2="$(newdir)"; tmpdirs+=("$config_dir2")
+cat > "$config_dir2/k8s.env" <<'CONF'
+K8S_CONTEXT=test-context
+K8S_NAMESPACE=fork-sandbox-test
+K8S_IMAGE=registry.example/you/fork-sandbox:latest
+K8S_PROXY_UPSTREAM=https://example.com
+K8S_DENIED_PROBE=10.0.0.1:443
+K8S_RUN_TTL=1800
+CONF
+install -m 600 /dev/null "$config_dir2/pi.env"
+printf 'OPENROUTER_API_KEY=sk-test-dummy\n' >> "$config_dir2/pi.env"
+chmod 600 "$config_dir2/pi.env"
+install_out2="$(newdir)/install2.yaml"; tmpdirs+=("$(dirname "$install_out2")")
+FORK_SANDBOX_CONFIG_DIR="$config_dir2" "$k8s_sh" install --dry-run > "$install_out2" 2>/tmp/fs-k8s-test-install2.err
+checksum2="$(sed -n 's/.*checksum\/nginx-conf: "\([0-9a-f]*\)".*/\1/p' "$install_out2" | head -n1)"
+if [[ -n "$checksum1" && -n "$checksum2" && "$checksum1" != "$checksum2" ]]; then
+    ok "checksum/nginx-conf annotation changes when the proxy config changes"
+else
+    no "checksum/nginx-conf annotation changes when the proxy config changes" \
+        "checksum1='$checksum1' checksum2='$checksum2' ($(cat /tmp/fs-k8s-test-install2.err 2>/dev/null))"
+fi
+rm -f /tmp/fs-k8s-test-install2.err
+
 submit_out="$(newdir)/submit.yaml"; tmpdirs+=("$(dirname "$submit_out")")
 if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-branch --model moonshotai/kimi-k3 \
