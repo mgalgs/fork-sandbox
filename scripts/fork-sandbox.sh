@@ -81,12 +81,13 @@
 #                        must exist. See docs/prompt-overlays.md.
 # --k8s:                 submit this run as a Kubernetes Job instead of a
 #                        local sandbox, by exec'ing fork-sandbox-k8s.sh run
-#                        with the arguments below. Requires --harness pi;
-#                        every other harness runs claude, pi-local or codex,
-#                        none of which the cluster path supports. Most other
-#                        flags describe LOCAL sandbox machinery this run
-#                        never touches and are refused by name rather than
-#                        silently dropped -- see "Kubernetes runs" below.
+#                        with the arguments below. Defaults --harness to pi,
+#                        the only harness the cluster path builds; claude,
+#                        pi-local and codex are still refused if named
+#                        explicitly. Most other flags describe LOCAL sandbox
+#                        machinery this run never touches and are refused by
+#                        name rather than silently dropped -- see
+#                        "Kubernetes runs" below.
 # --timeout <seconds>:   with --k8s, how long to wait for the agent before
 #                        giving up (passed to fork-sandbox-k8s.sh run).
 #                        Refused without --k8s.
@@ -378,6 +379,7 @@ model_given=false
 model_unchecked=false
 review_model=""
 harness_spec="claude"
+harness_given=false
 harness=""
 combined_model=""
 dry_run=false
@@ -405,6 +407,7 @@ while [[ "${1:-}" == -* ]]; do
             ;;
         --harness)
             harness_spec="${2:?--harness requires claude, pi, pi-local or codex}"
+            harness_given=true
             shift 2
             ;;
         --checkout)
@@ -518,6 +521,19 @@ case "$harness" in
         exit 1
         ;;
 esac
+
+# pi is the only harness the cluster path builds (see the --k8s block
+# below), so --k8s defaults to it rather than making an operator type
+# --harness pi on the one flag whose whole purpose is being the front door.
+# This has to run before the harness/model validation just below -- the
+# pi-needs-model check in particular -- so every downstream check sees the
+# harness this run will actually use, instead of the still-"claude" value a
+# bare --k8s would otherwise have at validation time. Nothing here becomes
+# ambiguous once another harness lands on the cluster path: pi simply stays
+# the established default.
+if [[ "$k8s_mode" == true && "$harness_given" != true ]]; then
+    harness="pi"
+fi
 
 if [[ -n "$combined_model" && "$model_given" == true ]]; then
     echo "Error: combined harness model '$combined_model' conflicts with" >&2
@@ -667,10 +683,10 @@ fi
 # reuses that work rather than re-implementing it.
 if [[ "$k8s_mode" == true ]]; then
     if [[ "$harness" != "pi" ]]; then
-        echo "Error: --k8s needs --harness pi -- explicitly, not just left at" >&2
-        echo "the 'claude' default. A cluster run is pi talking to a model proxy" >&2
-        echo "that holds the provider key; claude, pi-local and codex have no" >&2
-        echo "sandboxed path in the cluster (not yet supported)." >&2
+        echo "Error: --k8s only supports --harness pi. A cluster run is pi" >&2
+        echo "talking to a model proxy that holds the provider key; claude," >&2
+        echo "pi-local and codex have no sandboxed path in the cluster (not" >&2
+        echo "yet supported)." >&2
         exit 1
     fi
 

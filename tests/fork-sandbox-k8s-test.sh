@@ -39,7 +39,8 @@
 #     public-repo leak rule every script and manifest here has to hold to.
 #   - fork-sandbox.sh --k8s: the two new lib functions it shares with the
 #     local path (fs_require_scratch_handoff, fs_require_src_project), that
-#     it refuses --harness values other than pi and every flag the cluster
+#     it defaults a bare --k8s to --harness pi (still requiring --model)
+#     and refuses --harness values other than pi and every flag the cluster
 #     path cannot honor by name (never silently dropping one), that
 #     --timeout/--keep are refused without --k8s, that a --branch is
 #     generated when none is given, and that --dry-run renders byte-for-byte
@@ -594,20 +595,30 @@ tmpdirs+=("$k8s_flag_handoff_dir")
 k8s_flag_handoff="$k8s_flag_handoff_dir/handoff.md"
 printf 'Do the k8s thing.\n' > "$k8s_flag_handoff"
 
-refuses "--k8s without --harness pi is refused (default harness)" \
-    "needs --harness pi" \
+refuses "--k8s with no --harness and no --model needs a model" \
+    "--harness pi needs --model" \
     env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
-    --model moonshotai/kimi-k3 unused-project unused-handoff
+    unused-project unused-handoff
+if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
+    --model moonshotai/kimi-k3 --branch fs-k8s-flag-test-default-harness \
+    "$k8s_flag_proj" "$k8s_flag_handoff" \
+    > /dev/null 2>/tmp/fs-k8s-flag-test-default-harness.err; then
+    ok "--k8s with no --harness defaults to pi"
+else
+    no "--k8s with no --harness defaults to pi" \
+        "$(cat /tmp/fs-k8s-flag-test-default-harness.err)"
+fi
+rm -f /tmp/fs-k8s-flag-test-default-harness.err
 refuses "--k8s --harness claude is refused" \
-    "needs --harness pi" \
+    "only supports --harness pi" \
     env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
     --harness claude --model moonshotai/kimi-k3 unused-project unused-handoff
 refuses "--k8s --harness pi-local is refused" \
-    "needs --harness pi" \
+    "only supports --harness pi" \
     env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
     --harness pi-local unused-project unused-handoff
 refuses "--k8s --harness codex is refused" \
-    "needs --harness pi" \
+    "only supports --harness pi" \
     env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
     --harness codex unused-project unused-handoff
 
