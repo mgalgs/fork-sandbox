@@ -682,12 +682,19 @@ if [[ -d "$prompt_overlay_dir" ]]; then
         fi
     done
 
-    if (( ${#prompt_overlay_fragments[@]} == 0 )); then
-        # The directory exists but matched nothing. Silent for the default
-        # directory would be fine, but the caller may have just named it with
-        # --prompts-dir, and a request that quietly does nothing is exactly
-        # the failure class this mechanism exists to avoid -- so it is a
-        # warning either way, naming what was looked for.
+    if (( ${#prompt_overlay_fragments[@]} == 0 )) \
+        && [[ "$prompt_overlay_explicit" == true ]]; then
+        # The directory exists but matched nothing. Warn only when the caller
+        # named it with --prompts-dir: they asked for an overlay and got none,
+        # which is the request-that-quietly-does-nothing this mechanism exists
+        # to avoid.
+        #
+        # The DEFAULT directory is silent here on purpose. Holding fragments
+        # for one model and running another is the normal way to use this --
+        # a machine with only model/<some-small-model>.md would otherwise warn
+        # on every run of every other model, which is noise, and noise is how
+        # a warning stops being read. --dry-run already reports the fragments
+        # a run would get, so the fact stays available where it is wanted.
         echo "Warning: prompt overlay directory '$prompt_overlay_dir' matched" >&2
         echo "no fragment. Looked for:" >&2
         for prompt_overlay_rel in "${prompt_overlay_candidates[@]}"; do

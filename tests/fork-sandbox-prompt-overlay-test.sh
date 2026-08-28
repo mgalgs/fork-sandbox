@@ -123,6 +123,20 @@ contains "the warning names the harness path it looked for" \
 contains "the warning names the model path it looked for" \
     "$config/empty-explicit/model/demo-model.md" "$err"
 
+# The other half of that rule, and the one that keeps the mechanism quiet in
+# everyday use: a DEFAULT directory that exists but holds nothing for this
+# model must not warn. Carrying a fragment for one model and running another
+# is the normal way to use an overlay, so warning here would fire on every
+# run of every other model -- noise, which is how a warning stops being read.
+silent="$(new_empty_config)"; tmpdirs+=("$silent")
+mkdir -p "$silent/prompts/model"
+printf 'only for some other model\n' > "$silent/prompts/model/some-other-model.md"
+err="$(dry "$silent" --harness pi --model demo-model 2>&1 >/dev/null)"
+check "a present default directory matching nothing is silent" "" "$err"
+out="$(dry "$silent" --harness pi --model demo-model 2>/dev/null)"
+check "and it still resolves to that directory" \
+    "$silent/prompts" "$(printf '%s\n' "$out" | sed -n 's/^prompt_overlay_dir=//p')"
+
 printf '\n== --dry-run: fragment composition order ==\n'
 
 pdir="$(mktemp -d)"; tmpdirs+=("$pdir")
