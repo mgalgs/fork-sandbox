@@ -13,9 +13,10 @@
 # The Kubernetes analogue of fork-sandbox.sh: submit a task from anywhere
 # with cluster access, and a few minutes later fetch a branch. See
 # docs/kubernetes-runs.md for the design and docs/k8s-platform.md for the
-# pluggable layer this script talks to. This is a NEW script -- it does not
-# touch fork-sandbox.sh, and there is no --k8s flag. Wiring the two together
-# is a later round.
+# pluggable layer this script talks to. fork-sandbox.sh --k8s is a thin
+# dispatcher onto the `run` verb below, for a caller already using
+# fork-sandbox.sh; this script remains the direct entry point, and every
+# verb below is unchanged by that dispatcher's existence.
 #
 # install renders manifests/k8s/ and this cluster's egress policy (from the
 # platform plugin), applies both, and creates the Secret the model proxy

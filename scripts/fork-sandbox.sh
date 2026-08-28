@@ -79,6 +79,20 @@
 # --prompts-dir <dir>:   overlay model-specific prompt fragments from <dir>
 #                        onto the generated prompt for this run only. <dir>
 #                        must exist. See docs/prompt-overlays.md.
+# --k8s:                 submit this run as a Kubernetes Job instead of a
+#                        local sandbox, by exec'ing fork-sandbox-k8s.sh run
+#                        with the arguments below. Requires --harness pi;
+#                        every other harness runs claude, pi-local or codex,
+#                        none of which the cluster path supports. Most other
+#                        flags describe LOCAL sandbox machinery this run
+#                        never touches and are refused by name rather than
+#                        silently dropped -- see "Kubernetes runs" below.
+# --timeout <seconds>:   with --k8s, how long to wait for the agent before
+#                        giving up (passed to fork-sandbox-k8s.sh run).
+#                        Refused without --k8s.
+# --keep:                with --k8s, leave the Job and pod in place after a
+#                        successful fetch instead of removing them (passed
+#                        to fork-sandbox-k8s.sh run). Refused without --k8s.
 # -h, --help:            print this header and exit.
 #
 # The run gets its own detached tmux session, not a window of yours, so
@@ -290,6 +304,35 @@
 # <run-dir>/pi-session when the run ends, and totalled. Either way the
 # summary carries one 'cost:' line, which is the place to look.
 #
+# --k8s hands the whole run to fork-sandbox-k8s.sh, which submits it as a
+# Kubernetes Job, waits for it to finish, fetches the branch back and (unless
+# --keep) tears the Job down. See docs/kubernetes-runs.md for the design.
+# It is a thin dispatcher, not a second implementation: this script resolves
+# and validates the harness and model exactly as it does locally, builds the
+# argument list fork-sandbox-k8s.sh run already accepts, and execs it. None
+# of the clone, tmux-runner or review-loop machinery below this point ever
+# runs for a --k8s call.
+#
+# That also means most of this script's flags have nothing to attach to on a
+# cluster run: they describe local-sandbox machinery -- bubblewrap, per-run
+# docker-compose services, the detached tmux session -- that a Kubernetes pod
+# has no equivalent of, or they describe a real capability (--review-loop,
+# --checkout, --context-ro, --prompts-dir, --pi-args, --task-meta) the
+# cluster path has not been built to carry yet. --k8s refuses each of these
+# by name instead of accepting and dropping it: an operator who thinks
+# --review-loop reviewed their branch, when a k8s run silently skipped it, has
+# no way to notice from the outside -- no error, no missing output, just an
+# unreviewed branch that looks reviewed.
+#
+# One gap is not a refused flag, because no flag controls it: a --k8s run
+# never appends to the durable run log described below
+# (~/.claude/sandbox-runs.jsonl), unlike every local run. The numbers that
+# log would need -- cost, tokens, exit code -- live in the pod, and getting
+# them out is its own piece of work, not done here. --task-meta IS refused
+# with --k8s, for the same underlying reason: it exists to be folded into
+# that log by sandbox-run-log.py, and there is no log entry for a --k8s run
+# to fold it into yet.
+#
 # Every run's end is also appended to the durable run log,
 # ~/.claude/sandbox-runs.jsonl, by sandbox-run-log.py -- whatever the
 # harness and however the run ended: harness, model, exit code, commits,
@@ -350,6 +393,9 @@ keep_session=false
 no_services=false
 services_trust_ref=""
 prompts_dir_arg=""
+k8s_mode=false
+k8s_timeout=""
+k8s_keep=false
 
 while [[ "${1:-}" == -* ]]; do
     case "$1" in
@@ -426,6 +472,18 @@ while [[ "${1:-}" == -* ]]; do
         --prompts-dir)
             prompts_dir_arg="${2:?--prompts-dir requires a directory}"
             shift 2
+            ;;
+        --k8s)
+            k8s_mode=true
+            shift
+            ;;
+        --timeout)
+            k8s_timeout="${2:?--timeout requires a number of seconds}"
+            shift 2
+            ;;
+        --keep)
+            k8s_keep=true
+            shift
             ;;
         -h|--help)
             usage
@@ -595,6 +653,144 @@ resolve_model review_model "$review_model_given" || exit 1
 if [[ "$harness" == "pi" && -z "$model" ]]; then
     echo "Error: --harness pi needs --model. There is no default: the model" >&2
     echo "is an OpenRouter id, such as moonshotai/kimi-k3." >&2
+    exit 1
+fi
+
+# --k8s dispatches the whole run to fork-sandbox-k8s.sh run, which submits it
+# as a Kubernetes Job -- see the header comment above and
+# docs/kubernetes-runs.md. This block is placed here, before the review-loop,
+# prompt-overlay and local dry-run handling below, on purpose: every one of
+# those belongs to the LOCAL sandbox path, and --k8s must refuse (or ignore
+# outright) every flag among them rather than let this script's own
+# machinery run and then throw its result away. The harness and model are
+# already resolved above, exactly as a local run resolves them, so this
+# reuses that work rather than re-implementing it.
+if [[ "$k8s_mode" == true ]]; then
+    if [[ "$harness" != "pi" ]]; then
+        echo "Error: --k8s needs --harness pi -- explicitly, not just left at" >&2
+        echo "the 'claude' default. A cluster run is pi talking to a model proxy" >&2
+        echo "that holds the provider key; claude, pi-local and codex have no" >&2
+        echo "sandboxed path in the cluster (not yet supported)." >&2
+        exit 1
+    fi
+
+    # Flags that name local-sandbox machinery a cluster run has no
+    # equivalent of AT ALL, and never will: bubblewrap arguments, the claude
+    # CLI, per-run docker-compose services and their trust anchor, and the
+    # detached tmux session this script normally launches.
+    if [[ -n "$sandbox_args" ]]; then
+        echo "Error: --sandbox-args is not supported with --k8s. It passes flags" >&2
+        echo "to claude-sandboxed, the bubblewrap wrapper -- a Kubernetes pod has" >&2
+        echo "no bubblewrap to pass them to." >&2
+        exit 1
+    fi
+    if [[ -n "$claude_extra_args" ]]; then
+        echo "Error: --claude-args is not supported with --k8s. It passes flags" >&2
+        echo "to the claude CLI, and --k8s always runs --harness pi." >&2
+        exit 1
+    fi
+    if [[ "$no_services" == true ]]; then
+        echo "Error: --no-services is not supported with --k8s. There is no" >&2
+        echo "per-run services mechanism on the cluster path to skip in the" >&2
+        echo "first place." >&2
+        exit 1
+    fi
+    if [[ -n "$services_trust_ref" ]]; then
+        echo "Error: --services-trust-ref is not supported with --k8s, for the" >&2
+        echo "same reason as --no-services: there is no per-run services" >&2
+        echo "mechanism on the cluster path to trust or distrust." >&2
+        exit 1
+    fi
+    if [[ "$keep_session" == true ]]; then
+        echo "Error: --keep-session is not supported with --k8s. It holds open" >&2
+        echo "the detached tmux session a local run starts on the end of the" >&2
+        echo "run; a --k8s run execs fork-sandbox-k8s.sh directly and never" >&2
+        echo "creates one. A cluster run already blocks in this shell until it" >&2
+        echo "finishes, which is what --foreground asks for locally, so that" >&2
+        echo "flag is accepted (and redundant) rather than refused." >&2
+        exit 1
+    fi
+
+    # Flags that name a real, wanted capability the cluster path has not been
+    # built to carry yet -- a later round of work, not a permanent no.
+    if [[ -n "$checkout_ref" ]]; then
+        echo "Error: --checkout is not yet supported with --k8s. submit always" >&2
+        echo "pushes the origin repo's current HEAD into the pod; starting a" >&2
+        echo "cluster run from another ref needs submit to take one, which it" >&2
+        echo "does not yet." >&2
+        exit 1
+    fi
+    if [[ -n "$pi_extra_args" ]]; then
+        echo "Error: --pi-args is not yet supported with --k8s." >&2
+        echo "fork-sandbox-k8s.sh run has no flag yet to carry extra pi" >&2
+        echo "arguments into the pod." >&2
+        exit 1
+    fi
+    if [[ -n "$context_ro" ]]; then
+        echo "Error: --context-ro is not yet supported with --k8s. There is no" >&2
+        echo "bind-in mechanism for gathered context on the cluster path yet --" >&2
+        echo "see 'Getting files in' in docs/kubernetes-runs.md." >&2
+        exit 1
+    fi
+    if [[ -n "$task_meta" ]]; then
+        echo "Error: --task-meta is not yet supported with --k8s. It is folded" >&2
+        echo "into the local run log, and a --k8s run does not append to that" >&2
+        echo "log at all yet." >&2
+        exit 1
+    fi
+    if [[ -n "$prompts_dir_arg" ]]; then
+        echo "Error: --prompts-dir is not yet supported with --k8s. The overlay" >&2
+        echo "is layered onto a generated per-leg prompt, and the cluster path" >&2
+        echo "sends the handoff file straight through with no generated prompt" >&2
+        echo "to layer it onto." >&2
+        exit 1
+    fi
+    if [[ -n "$review_loop_arg" ]]; then
+        echo "Error: --review-loop is not yet supported with --k8s. The loop is" >&2
+        echo "host-side today -- the review and fix prompts are generated on" >&2
+        echo "the host, and code-review-portable is not in the pod image." >&2
+        exit 1
+    fi
+    if [[ -n "$review_model" ]]; then
+        echo "Error: --review-model is not yet supported with --k8s, for the" >&2
+        echo "same reason as --review-loop: there is no review leg on the" >&2
+        echo "cluster path." >&2
+        exit 1
+    fi
+
+    # Same two security checks the local path applies below, applied here
+    # before this run is handed to fork-sandbox-k8s.sh: this script is meant
+    # to be blanket-approved, so it is the security boundary regardless of
+    # which path a run takes. The handoff becomes the pod's prompt to a model
+    # with internet access, and project_path is what gets pushed into the
+    # pod, so both need the same constraint here that the local path enforces
+    # for the same reason -- see fs_require_scratch_handoff and
+    # fs_require_src_project in fork-sandbox-lib.sh.
+    fs_require_scratch_handoff "$handoff_file" || exit 1
+    fs_require_src_project "$project_path" || exit 1
+
+    # Unlike fork-sandbox-k8s.sh run, this script generates a branch name
+    # when one is not given -- the same convenience --branch has locally.
+    # Naming it the way `submit` itself does when --branch is omitted
+    # (k8s-<timestamp>) keeps a cluster run's auto-named branches
+    # recognizable as cluster runs at a glance, and means `run`'s own
+    # --branch requirement is always satisfied by the time this execs: run
+    # needs the name up front to poll, fetch and clean up by, and there is
+    # no point teaching it to generate one only for this one caller.
+    branch="${branch:-k8s-$(date +%Y%m%d-%H%M%S)}"
+
+    k8s_argv=(run)
+    [[ "$dry_run" == true ]] && k8s_argv+=(--dry-run)
+    [[ -n "$k8s_timeout" ]] && k8s_argv+=(--timeout "$k8s_timeout")
+    [[ "$k8s_keep" == true ]] && k8s_argv+=(--keep)
+    k8s_argv+=(--branch "$branch" --model "$model" "$project_path" "$handoff_file")
+
+    exec "$script_dir/fork-sandbox-k8s.sh" "${k8s_argv[@]}"
+fi
+
+if [[ -n "$k8s_timeout" || "$k8s_keep" == true ]]; then
+    echo "Error: --timeout and --keep only apply with --k8s, which passes" >&2
+    echo "them on to fork-sandbox-k8s.sh run. Add --k8s, or drop the flag." >&2
     exit 1
 fi
 

@@ -138,6 +138,54 @@ fs_check_branch_free() {
     return 0
 }
 
+# The two path constraints that let fork-sandbox.sh be blanket-approved as
+# its own security boundary: the handoff becomes the prompt of a session with
+# internet access, and the project is what gets cloned or pushed into a run,
+# so neither is trusted as given -- both are checked against a fixed root.
+# Shared so that every entry point fork-sandbox.sh grows for starting a run
+# (a local sandboxed session, a --k8s dispatch) enforces the same rule rather
+# than drifting: a second copy of a security check is exactly the kind of
+# duplication that silently stops matching the first one.
+fs_require_scratch_handoff() {
+    local handoff_file="$1" real
+    real="$("$FS_REALPATH" -m "$handoff_file")"
+    if [[ "$real" != /var/tmp/claude-scratch/* && "$real" != /tmp/claude-scratch/* ]]; then
+        echo "Error: handoff files must live under /var/tmp/claude-scratch/ (or the" >&2
+        echo "/tmp/claude-scratch compat symlink) — got '$real'. The handoff" >&2
+        echo "becomes the prompt of a session with internet access, so this path is a" >&2
+        echo "security boundary, not a tidiness rule. Stage the document there and" >&2
+        echo "rerun." >&2
+        return 1
+    fi
+    # forks/ is excluded: it holds what approved scripts mktemp -- run dirs,
+    # stage dirs, and the codex credential staging dir. A handoff there would
+    # read a file the machinery wrote (the credential above all) into the
+    # prompt of a session with internet access. Handoffs go in the scratch root.
+    if [[ "$real" == /var/tmp/claude-scratch/forks/* || "$real" == /tmp/claude-scratch/forks/* ]]; then
+        echo "Error: handoff files must not live under the forks/ machinery" >&2
+        echo "directory — got '$real'. forks/ holds run dirs, staging" >&2
+        echo "dirs and credential files that approved scripts create; reading one" >&2
+        echo "into an internet-connected prompt is the exfiltration this check" >&2
+        echo "exists to stop. Stage the handoff in the scratch root itself." >&2
+        return 1
+    fi
+    return 0
+}
+
+fs_require_src_project() {
+    local project_path="$1" real
+    real="$("$FS_REALPATH" -m "$project_path")"
+    if [[ "$real" != "$HOME"/src/* && "$real" != "$HOME/src" ]]; then
+        echo "Error: the project must live under ~/src — got '$real'." >&2
+        echo "An unattended agent gets the whole clone, and for most harnesses it" >&2
+        echo "gets internet too, so which repos may be handed over is a security" >&2
+        echo "boundary. Work from a checkout under ~/src, or launch" >&2
+        echo "claude-sandboxed by hand for something else." >&2
+        return 1
+    fi
+    return 0
+}
+
 fs_warn_if_dirty() {
     local path="$1" repo="$2"
     if [[ -n "$(cd "$path" && git status --porcelain)" ]]; then
