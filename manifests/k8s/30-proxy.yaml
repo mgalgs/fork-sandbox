@@ -34,12 +34,19 @@ data:
 
         limit_req_zone $binary_remote_addr zone=fork_sandbox:10m rate=5r/s;
 
-        # Defines $upstream_key. Mounted from the Secret, never from this
-        # ConfigMap -- see the header above.
-        include /etc/nginx/upstream-key.conf;
-
         server {
             listen 8080;
+
+            # Defines $upstream_key. Mounted from the Secret, never from this
+            # ConfigMap -- see the header above.
+            #
+            # This include sits in `server`, NOT in `http`, and that is
+            # load-bearing: the file it pulls in is a `set` directive, and
+            # nginx allows `set` only in server, location and if. At http
+            # level nginx refuses to start with
+            #   "set" directive is not allowed here
+            # which crashloops the proxy. Measured against a live cluster.
+            include /etc/nginx/upstream-key.conf;
 
             # Deny by default. Only the one path below is forwarded.
             location / {
@@ -56,7 +63,14 @@ data:
                 # time through the resolver above, rather than once at
                 # startup -- so the upstream's DNS record can rotate
                 # without a restart here.
+                # proxy_ssl_verify without a trusted certificate is a
+                # startup error, not a silent downgrade -- nginx refuses
+                # with "no proxy_ssl_trusted_certificate for
+                # proxy_ssl_verify". The path is the CA bundle shipped in
+                # the nginx alpine image. Measured against a live cluster.
                 proxy_ssl_verify on;
+                proxy_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;
+                proxy_ssl_verify_depth 3;
                 proxy_ssl_server_name on;
                 proxy_ssl_name "__PROXY_UPSTREAM_HOST__";
                 proxy_set_header Host "__PROXY_UPSTREAM_HOST__";
