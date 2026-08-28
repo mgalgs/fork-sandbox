@@ -175,6 +175,98 @@ else
 fi
 rm -f /tmp/fs-k8s-test-install2.err
 
+printf '\n== nginx -t on the rendered proxy config ==\n'
+# The gap this closes: yamllint proves the manifest is valid YAML, not that
+# the string embedded in it is a config nginx will actually start on -- see
+# 'manifests/k8s: Fix the two directives nginx refuses to start on'. Extract
+# the nginx.conf key exactly as the ConfigMap embeds it (indent_block's
+# 4-space block-scalar indent), then run nginx -t against it, either with a
+# real nginx or with the image manifests/k8s/30-proxy.yaml itself names.
+extract_nginx_conf() {
+    awk '
+        /^  nginx\.conf: \|$/ { flag=1; next }
+        flag && (length($0)==0 || substr($0,1,4)=="    ") { print substr($0,5); next }
+        flag { flag=0 }
+    ' "$1"
+}
+
+nginx_conf="$(extract_nginx_conf "$install_out")"
+if [[ -z "$nginx_conf" ]]; then
+    no "extracted nginx.conf from install --dry-run output" "no nginx.conf block found in $install_out"
+else
+    nginx_check_dir="$(newdir)"; tmpdirs+=("$nginx_check_dir")
+    # nginx resolves `resolver` AT STARTUP, and
+    # kube-dns.kube-system.svc.cluster.local only exists inside a real
+    # cluster. An IP literal needs no resolution, so this lets the check run
+    # outside a cluster -- in THIS COPY ONLY. manifests/k8s/30-proxy.yaml
+    # keeps the real in-cluster name; nothing here writes back to it.
+    printf '%s\n' "${nginx_conf//kube-dns.kube-system.svc.cluster.local/127.0.0.1}" \
+        > "$nginx_check_dir/nginx.conf"
+    # $upstream_key is Secret-mounted in a deployed pod; a throwaway stub
+    # stands in at the same path the include names.
+    # shellcheck disable=SC2016  # $upstream_key is nginx config, not shell
+    printf 'set $upstream_key "dummy";\n' > "$nginx_check_dir/upstream-key.conf"
+
+    proxy_image="$(sed -n 's/^[[:space:]]*image:[[:space:]]*//p' "$repo_dir/manifests/k8s/30-proxy.yaml" | head -n1)"
+
+    nginx_mode=""
+    if command -v nginx >/dev/null 2>&1; then
+        nginx_mode=native
+    elif command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+        nginx_mode=docker
+    fi
+
+    # Runs `nginx -t` against $nginx_check_dir/nginx.conf, with
+    # upstream-key.conf staged at the literal absolute path the include
+    # names (/etc/nginx/upstream-key.conf). Prints combined output; returns
+    # nginx's exit status.
+    run_nginx_t() {
+        case "$nginx_mode" in
+            native)
+                # The include and proxy_ssl_trusted_certificate directives
+                # are absolute host paths, so testing natively needs the
+                # stub staged at the literal path -- which needs root. Fall
+                # back to docker rather than fail outright when that is not
+                # available.
+                if install -Dm644 "$nginx_check_dir/upstream-key.conf" \
+                        /etc/nginx/upstream-key.conf 2>/dev/null; then
+                    local rc
+                    nginx -t -c "$nginx_check_dir/nginx.conf" 2>&1
+                    rc=$?
+                    rm -f /etc/nginx/upstream-key.conf
+                    return "$rc"
+                fi
+                if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+                    echo "(cannot stage /etc/nginx/upstream-key.conf without root; falling back to docker)"
+                    nginx_mode=docker
+                    run_nginx_t
+                    return $?
+                fi
+                echo "nginx is on PATH but /etc/nginx/upstream-key.conf could not be staged, and no docker fallback is available"
+                return 127
+                ;;
+            docker)
+                docker run --rm \
+                    -v "$nginx_check_dir/nginx.conf:/etc/nginx/nginx.conf:ro" \
+                    -v "$nginx_check_dir/upstream-key.conf:/etc/nginx/upstream-key.conf:ro" \
+                    "$proxy_image" nginx -t 2>&1
+                return $?
+                ;;
+        esac
+    }
+
+    if [[ -z "$nginx_mode" ]]; then
+        printf '  SKIP  neither nginx nor a working docker on PATH\n'
+    else
+        out="$(run_nginx_t)"; rc=$?
+        if (( rc == 0 )); then
+            ok "nginx -t accepts the rendered proxy config"
+        else
+            no "nginx -t accepts the rendered proxy config" "$out"
+        fi
+    fi
+fi
+
 submit_out="$(newdir)/submit.yaml"; tmpdirs+=("$(dirname "$submit_out")")
 if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-branch --model moonshotai/kimi-k3 \
