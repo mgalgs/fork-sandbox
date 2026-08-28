@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+# fork-sandbox-k8s-platform-generic -- the portable Kubernetes platform plugin
+#
+# Usage: fork-sandbox-k8s-platform-generic --capabilities
+#        fork-sandbox-k8s-platform-generic render-policy --namespace NS \
+#                --agent-label KEY=VAL --proxy-label KEY=VAL --proxy-port PORT
+#
+# Implements the contract in docs/k8s-platform.md: two verbs, nothing else.
+# --capabilities prints what this platform can do, to stdout, and touches
+# nothing. render-policy prints the NetworkPolicy YAML that seals the agent
+# pod's egress, to stdout, and touches nothing -- neither verb ever runs
+# kubectl or reaches a cluster. fork-sandbox-k8s.sh applies the result.
+#
+# This is the one platform v1 ships: plain Kubernetes NetworkPolicy, the
+# dialect Calico, Cilium, kube-router, Antrea and Weave all honour. It is
+# named generic, not after a cluster or a CNI, because it is not tied to
+# one -- it is the portable baseline every other platform is measured
+# against.
+#
+#   policy=networkpolicy   the dialect render-policy emits
+#   icmp=unfiltered        plain NetworkPolicy has no field that denies
+#                          ICMP, so a pod here can ping-sweep whatever its
+#                          egress rules leave reachable, and can tunnel data
+#                          out in echo-request bodies regardless of what the
+#                          policy says. This is not a shortcut -- it is the
+#                          truth about the dialect, and a richer platform
+#                          (Cilium's CiliumNetworkPolicy, say) is where this
+#                          first becomes `filtered`.
+#   dns=recursive          DNS egress is not content-filtered here.
+#   runtimeclass=none      no stronger isolation class is offered.
+#
+# render-policy's output seals the agent pod to exactly two destinations:
+# DNS in kube-system, and the proxy on the given label and port. It has no
+# opinion about the proxy's own policy -- that one is ordinary and portable
+# and lives as a static file in manifests/k8s/ instead.
+
+set -euo pipefail
+
+if [[ "${1-}" == -h || "${1-}" == --help ]]; then
+    sed -n '2,/^$/p' "$(readlink -f "${BASH_SOURCE[0]}")" | sed 's/^# \{0,1\}//'
+    exit 0
+fi
+
+# Checked first, before anything else, exactly as sandbox-backend-* checks
+# --capabilities before any required-option validation: a caller asking what
+# this platform can do must never be refused for lacking render-policy's
+# options.
+if [[ "${1-}" == --capabilities ]]; then
+    cat <<'EOF'
+policy=networkpolicy
+icmp=unfiltered
+dns=recursive
+runtimeclass=none
+EOF
+    exit 0
+fi
+
+verb="${1-}"
+if [[ -z "$verb" ]]; then
+    echo "Error: no verb given. Use --capabilities or render-policy." >&2
+    exit 1
+fi
+shift
+
+case "$verb" in
+render-policy)
+    ;;
+*)
+    echo "Error: unknown verb '$verb'. Use --capabilities or render-policy." >&2
+    exit 1
+    ;;
+esac
+
+namespace=""
+agent_label=""
+proxy_label=""
+proxy_port=""
+
+while (( $# )); do
+    case "$1" in
+        --namespace) namespace="${2:?--namespace requires a name}"; shift 2 ;;
+        --agent-label) agent_label="${2:?--agent-label requires KEY=VAL}"; shift 2 ;;
+        --proxy-label) proxy_label="${2:?--proxy-label requires KEY=VAL}"; shift 2 ;;
+        --proxy-port) proxy_port="${2:?--proxy-port requires a port number}"; shift 2 ;;
+        *) echo "Error: unknown option '$1' for render-policy." >&2; exit 1 ;;
+    esac
+done
+
+for required in namespace agent_label proxy_label proxy_port; do
+    if [[ -z "${!required}" ]]; then
+        echo "Error: render-policy requires --namespace, --agent-label," >&2
+        echo "--proxy-label and --proxy-port. Missing: --${required//_/-}." >&2
+        exit 1
+    fi
+done
+
+for pair_name in agent_label proxy_label; do
+    pair="${!pair_name}"
+    if [[ "$pair" != *=* || -z "${pair%%=*}" ]]; then
+        echo "Error: --${pair_name//_/-} takes KEY=VAL, not '$pair'." >&2
+        exit 1
+    fi
+done
+
+if [[ ! "$proxy_port" =~ ^[0-9]+$ ]]; then
+    echo "Error: --proxy-port takes a port number, not '$proxy_port'." >&2
+    exit 1
+fi
+
+agent_key="${agent_label%%=*}"
+agent_val="${agent_label#*=}"
+proxy_key="${proxy_label%%=*}"
+proxy_val="${proxy_label#*=}"
+
+# Default-deny is implicit: policyTypes names both Ingress and Egress, and
+# an empty ingress list denies all ingress. The agent pod needs none -- it
+# is never dialed into, only fetched from over kubectl exec, which does not
+# cross this policy at all.
+cat <<EOF
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: fork-sandbox-agent-egress
+  namespace: $namespace
+spec:
+  podSelector:
+    matchLabels:
+      $agent_key: $agent_val
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress: []
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - podSelector:
+            matchLabels:
+              $proxy_key: $proxy_val
+      ports:
+        - protocol: TCP
+          port: $proxy_port
+EOF
