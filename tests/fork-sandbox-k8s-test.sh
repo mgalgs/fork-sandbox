@@ -26,6 +26,15 @@
 #     comment on cmd_run in fork-sandbox-k8s.sh.
 #   - no file in the repo matches a private-hostname shape, guarding the
 #     public-repo leak rule every script and manifest here has to hold to.
+#   - fork-sandbox.sh --k8s: the two new lib functions it shares with the
+#     local path (fs_require_scratch_handoff, fs_require_src_project), that
+#     it refuses --harness values other than pi and every flag the cluster
+#     path cannot honor by name (never silently dropping one), that
+#     --timeout/--keep are refused without --k8s, that a --branch is
+#     generated when none is given, and that --dry-run renders byte-for-byte
+#     the same Job YAML `fork-sandbox-k8s.sh run --dry-run` does for the
+#     same arguments -- proving the dispatcher execs rather than growing a
+#     divergent copy of anything.
 #
 # This lives in tests/ rather than scripts/tests/ on purpose: install.sh
 # iterates scripts/* and runs `sed -n 2p` on each entry to build the
@@ -51,6 +60,8 @@ refuses() {
 newdir() { mktemp -d; }
 
 k8s_sh="$repo_dir/scripts/fork-sandbox-k8s.sh"
+fs_sh="$repo_dir/scripts/fork-sandbox.sh"
+lib_sh="$repo_dir/scripts/fork-sandbox-lib.sh"
 platform_generic="$repo_dir/scripts/fork-sandbox-k8s-platform-generic"
 entrypoint_sh="$repo_dir/scripts/fork-sandbox-k8s-entrypoint.sh"
 gate_sh="$repo_dir/scripts/fork-sandbox-k8s-egress-gate.sh"
@@ -379,6 +390,257 @@ if grep -qE 'kubectl.*exec -t' "$k8s_sh"; then
 else
     ok "no kubectl exec uses -t (would corrupt the pack stream)"
 fi
+
+printf '\n== fs_require_scratch_handoff / fs_require_src_project (fork-sandbox-lib.sh) ==\n'
+# Unit-level, sourcing the lib directly -- the same level fork-sandbox-clone-
+# test.sh tests fs_make_clone at. These are the two checks that let
+# fork-sandbox.sh be blanket-approved as its own security boundary, shared
+# between the local path and --k8s below; a regression here would silently
+# widen what either path accepts.
+# Sourced directly into this shell, not a subshell: ok()/no() below have to
+# reach the pass/fail counters this file reports at the end, and a subshell
+# (command substitution, or the read side of a pipe) would trap them there.
+# shellcheck source-path=SCRIPTDIR/../scripts
+# shellcheck source=../scripts/fork-sandbox-lib.sh
+# shellcheck disable=SC1091  # plain shellcheck cannot follow it; use -x
+source "$lib_sh"
+lib_test_scratch_dir="$(mktemp -d /var/tmp/claude-scratch/fs-k8s-flag-lib-test.XXXXXX)"
+tmpdirs+=("$lib_test_scratch_dir")
+err="$(mktemp)"
+
+if fs_require_scratch_handoff "$lib_test_scratch_dir/handoff.md" 2>"$err"; then
+    ok "a scratch-dir handoff accepted"
+else
+    no "a scratch-dir handoff accepted" "$(cat "$err")"
+fi
+if fs_require_scratch_handoff "/tmp/outside-scratch/handoff.md" 2>"$err"; then
+    no "a handoff outside scratch is refused"
+else
+    case "$(cat "$err")" in
+        *"must live under /var/tmp/claude-scratch"*)
+            ok "a handoff outside scratch is refused" ;;
+        *) no "a handoff outside scratch is refused" "$(cat "$err")" ;;
+    esac
+fi
+if fs_require_scratch_handoff "/var/tmp/claude-scratch/forks/x/handoff.md" 2>"$err"; then
+    no "a handoff under forks/ is refused"
+else
+    case "$(cat "$err")" in
+        *"must not live under the forks/"*)
+            ok "a handoff under forks/ is refused" ;;
+        *) no "a handoff under forks/ is refused" "$(cat "$err")" ;;
+    esac
+fi
+if fs_require_src_project "$HOME/src/anything" 2>"$err"; then
+    ok "a ~/src project is accepted"
+else
+    no "a ~/src project is accepted" "$(cat "$err")"
+fi
+if fs_require_src_project "/tmp/outside-src" 2>"$err"; then
+    no "a project outside ~/src is refused"
+else
+    case "$(cat "$err")" in
+        *"must live under ~/src"*)
+            ok "a project outside ~/src is refused" ;;
+        *) no "a project outside ~/src is refused" "$(cat "$err")" ;;
+    esac
+fi
+rm -f "$err"
+
+printf '\n== fork-sandbox.sh --k8s (fixture config, no cluster) ==\n'
+# Real fixtures: unlike --dry-run's own local exit, fs_require_scratch_handoff
+# and fs_require_src_project run for every --k8s call, including a --dry-run
+# one, so a placeholder path is refused rather than ignored. Only the flag-
+# refusal cases below get away with a placeholder -- each fails on its own
+# flag before reaching these checks. new_src_project mirrors fork-sandbox-
+# prompt-overlay-test.sh's own fixture: a real git repo under the real
+# ~/src, since that is the one root fork-sandbox.sh accepts a project from.
+new_src_project() {
+    local d
+    d="$(mktemp -d "$HOME/src/fs-k8s-flag-test.XXXXXX")"
+    (
+        cd "$d" \
+            && git init -q . \
+            && git config user.email t@fork-sandbox.invalid \
+            && git config user.name Tester \
+            && printf 'hello\n' > file.txt \
+            && git add file.txt \
+            && git commit -q -m init
+    ) >/dev/null 2>&1
+    printf '%s' "$d"
+}
+k8s_flag_proj="$(new_src_project)"; tmpdirs+=("$k8s_flag_proj")
+k8s_flag_handoff_dir="$(mktemp -d /var/tmp/claude-scratch/fs-k8s-flag-test.XXXXXX)"
+tmpdirs+=("$k8s_flag_handoff_dir")
+k8s_flag_handoff="$k8s_flag_handoff_dir/handoff.md"
+printf 'Do the k8s thing.\n' > "$k8s_flag_handoff"
+
+refuses "--k8s without --harness pi is refused (default harness)" \
+    "needs --harness pi" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
+    --model moonshotai/kimi-k3 unused-project unused-handoff
+refuses "--k8s --harness claude is refused" \
+    "needs --harness pi" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
+    --harness claude --model moonshotai/kimi-k3 unused-project unused-handoff
+refuses "--k8s --harness pi-local is refused" \
+    "needs --harness pi" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
+    --harness pi-local unused-project unused-handoff
+refuses "--k8s --harness codex is refused" \
+    "needs --harness pi" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
+    --harness codex unused-project unused-handoff
+
+refuses "--k8s --sandbox-args is refused" \
+    "--sandbox-args is not supported with --k8s" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
+    --harness pi --model moonshotai/kimi-k3 --sandbox-args "--unpin-egress" \
+    unused-project unused-handoff
+refuses "--k8s --claude-args is refused" \
+    "--claude-args is not supported with --k8s" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
+    --harness pi --model moonshotai/kimi-k3 --claude-args "--effort high" \
+    unused-project unused-handoff
+refuses "--k8s --no-services is refused" \
+    "--no-services is not supported with --k8s" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
+    --harness pi --model moonshotai/kimi-k3 --no-services \
+    unused-project unused-handoff
+refuses "--k8s --services-trust-ref is refused" \
+    "--services-trust-ref is not supported with --k8s" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
+    --harness pi --model moonshotai/kimi-k3 --services-trust-ref main \
+    unused-project unused-handoff
+refuses "--k8s --keep-session is refused" \
+    "--keep-session is not supported with --k8s" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
+    --harness pi --model moonshotai/kimi-k3 --keep-session \
+    unused-project unused-handoff
+
+refuses "--k8s --checkout is refused as not yet supported" \
+    "--checkout is not yet supported with --k8s" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
+    --harness pi --model moonshotai/kimi-k3 --checkout HEAD \
+    unused-project unused-handoff
+refuses "--k8s --pi-args is refused as not yet supported" \
+    "--pi-args is not yet supported with --k8s" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
+    --harness pi --model moonshotai/kimi-k3 --pi-args "--thinking low" \
+    unused-project unused-handoff
+refuses "--k8s --context-ro is refused as not yet supported" \
+    "--context-ro is not yet supported with --k8s" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
+    --harness pi --model moonshotai/kimi-k3 \
+    --context-ro /var/tmp/claude-scratch/forks/somewhere \
+    unused-project unused-handoff
+refuses "--k8s --task-meta is refused as not yet supported" \
+    "--task-meta is not yet supported with --k8s" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
+    --harness pi --model moonshotai/kimi-k3 --task-meta '{"kind":"implement"}' \
+    unused-project unused-handoff
+refuses "--k8s --prompts-dir is refused as not yet supported" \
+    "--prompts-dir is not yet supported with --k8s" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
+    --harness pi --model moonshotai/kimi-k3 --prompts-dir /nonexistent \
+    unused-project unused-handoff
+refuses "--k8s --review-loop is refused as not yet supported" \
+    "--review-loop is not yet supported with --k8s" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
+    --harness pi --model moonshotai/kimi-k3 --review-loop 2 \
+    unused-project unused-handoff
+refuses "--k8s --review-model is refused as not yet supported" \
+    "--review-model is not yet supported with --k8s" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
+    --harness pi --model moonshotai/kimi-k3 --review-model opus \
+    unused-project unused-handoff
+
+refuses "--timeout without --k8s is refused" \
+    "only apply with --k8s" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --dry-run \
+    --timeout 100 unused-project unused-handoff
+refuses "--keep without --k8s is refused" \
+    "only apply with --k8s" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --dry-run \
+    --keep unused-project unused-handoff
+
+refuses "--k8s refuses a handoff outside the scratch dir" \
+    "must live under /var/tmp/claude-scratch" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
+    --harness pi --model moonshotai/kimi-k3 --branch fs-k8s-flag-test-branch \
+    "$k8s_flag_proj" /tmp/fs-k8s-flag-test-outside-scratch.md
+refuses "--k8s refuses a project outside ~/src" \
+    "must live under ~/src" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
+    --harness pi --model moonshotai/kimi-k3 --branch fs-k8s-flag-test-branch \
+    /tmp/fs-k8s-flag-test-outside-src "$k8s_flag_handoff"
+
+# The positive case: --k8s --harness pi --dry-run has to actually reach
+# fork-sandbox-k8s.sh, and with the arguments this dispatcher promises. Prove
+# it the same way this file already proves `run --dry-run` delegates to
+# `submit --dry-run` above: a direct invocation and the dispatcher's must
+# render byte-for-byte the same Job YAML for the same branch and model.
+dispatch_out="$(newdir)/dispatch.yaml"; tmpdirs+=("$(dirname "$dispatch_out")")
+if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
+    --harness pi --model moonshotai/kimi-k3 --branch fs-k8s-flag-test-branch \
+    "$k8s_flag_proj" "$k8s_flag_handoff" \
+    > "$dispatch_out" 2>/tmp/fs-k8s-flag-test-dispatch.err; then
+    ok "--k8s --harness pi --dry-run exits 0"
+else
+    no "--k8s --harness pi --dry-run exits 0" "$(cat /tmp/fs-k8s-flag-test-dispatch.err)"
+fi
+direct_out="$(newdir)/direct.yaml"; tmpdirs+=("$(dirname "$direct_out")")
+if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" run --dry-run \
+    --branch fs-k8s-flag-test-branch --model moonshotai/kimi-k3 \
+    "$k8s_flag_proj" "$k8s_flag_handoff" \
+    > "$direct_out" 2>/tmp/fs-k8s-flag-test-direct.err; then
+    ok "direct run --dry-run (matching args) exits 0"
+else
+    no "direct run --dry-run (matching args) exits 0" \
+        "$(cat /tmp/fs-k8s-flag-test-direct.err)"
+fi
+rm -f /tmp/fs-k8s-flag-test-direct.err
+if diff -q "$direct_out" "$dispatch_out" >/dev/null 2>&1; then
+    ok "--k8s renders the same Job YAML as a direct run --dry-run call"
+else
+    no "--k8s renders the same Job YAML as a direct run --dry-run call" \
+        "$(diff "$direct_out" "$dispatch_out" 2>&1 | head -n 20)"
+fi
+rm -f /tmp/fs-k8s-flag-test-dispatch.err
+
+# --branch omitted: --k8s generates one, unlike a direct `run` call, which
+# requires --branch up front. The generated name follows submit's own
+# auto-naming convention (k8s-<timestamp>), embedded in the rendered Job as
+# both the fork-sandbox/branch label and the BRANCH env value.
+nobranch_out="$(newdir)/nobranch.yaml"; tmpdirs+=("$(dirname "$nobranch_out")")
+if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
+    --harness pi --model moonshotai/kimi-k3 \
+    "$k8s_flag_proj" "$k8s_flag_handoff" \
+    > "$nobranch_out" 2>/tmp/fs-k8s-flag-test-nobranch.err; then
+    ok "--k8s without --branch exits 0"
+else
+    no "--k8s without --branch exits 0" "$(cat /tmp/fs-k8s-flag-test-nobranch.err)"
+fi
+if grep -qE 'value: "k8s-[0-9]{8}-[0-9]{6}"' "$nobranch_out"; then
+    ok "--k8s without --branch generates a k8s-<timestamp> branch"
+else
+    no "--k8s without --branch generates a k8s-<timestamp> branch" \
+        "$(cat "$nobranch_out")"
+fi
+rm -f /tmp/fs-k8s-flag-test-nobranch.err
+
+# --timeout/--keep are accepted with --k8s (--dry-run never reaches the poll
+# loop they configure, but they must not be refused as unsupported flags).
+if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
+    --harness pi --model moonshotai/kimi-k3 --timeout 42 --keep \
+    --branch fs-k8s-flag-test-branch2 \
+    "$k8s_flag_proj" "$k8s_flag_handoff" \
+    > /dev/null 2>/tmp/fs-k8s-flag-test-timeout.err; then
+    ok "--k8s accepts --timeout and --keep"
+else
+    no "--k8s accepts --timeout and --keep" "$(cat /tmp/fs-k8s-flag-test-timeout.err)"
+fi
+rm -f /tmp/fs-k8s-flag-test-timeout.err
 
 printf '\n== no private-hostname shape anywhere in the repo ==\n'
 # Guards the public-repo leak rule (see the fork-sandbox-k8s.sh header): no
