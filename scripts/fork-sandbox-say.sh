@@ -21,9 +21,10 @@
 #   claude   next tool call. A PostToolUse hook puts it beside the tool
 #            result, and a Stop hook refuses to let the session finish while
 #            an addendum is unread — so it cannot be missed.
-#   others   next commit. pi, pi-local and codex have no hook system, so the
-#            generated prompt tells the session to read the inbox before each
-#            commit and before its final report. Same inbox, slower delivery.
+#   others   within ~25 tool calls. pi, pi-local and codex have no hook
+#            system, so the generated prompt tells the session to read the
+#            inbox on a tool-call floor, around long commands, before each
+#            commit, and before its final report. Same inbox, slower delivery.
 #
 # Why this is safe to blanket-approve. It is a bounded write
 # (docs/permissions.md): it writes into exactly one structurally constrained
@@ -201,7 +202,8 @@ if [[ "$harness" == "claude" ]]; then
     printf 'delivery: next tool call. A Stop hook also blocks the session from\n'
     printf 'finishing while it is unread, so it cannot be missed.\n'
 else
-    printf 'delivery: next commit. The %s harness has no hook system, so the\n' "$harness"
-    printf 'session reads the inbox itself — before each commit and before its\n'
+    printf 'delivery: within ~25 tool calls. The %s harness has no hook\n' "$harness"
+    printf 'system, so the session reads the inbox itself — on a tool-call\n'
+    printf 'floor, around long commands, before each commit, and before its\n'
     printf 'final report. Expect it to land later than it would on claude.\n'
 fi

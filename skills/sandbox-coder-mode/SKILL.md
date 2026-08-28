@@ -177,9 +177,10 @@ can be steered:
 fork-sandbox-say.sh <run-dir> "The API changed under you — parse() takes a dict now, not a string."
 ```
 
-It lands on the session's next tool call (`claude`) or next commit (`pi`,
-`pi-local`, `codex`), and it carries the same authority as the handoff, so it
-may override it. See "Steering a run" in the `fork-sandbox` skill.
+It lands on the session's next tool call (`claude`) or within ~25 tool calls
+(`pi`, `pi-local`, `codex`), and it carries the same authority as the
+handoff, so it may override it. See "Steering a run" in the `fork-sandbox`
+skill.
 
 Prefer an addendum when the run is broadly on track and one fact changed: a
 detail you got wrong in the handoff, a file it should not touch, an extra

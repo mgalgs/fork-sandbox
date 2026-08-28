@@ -189,9 +189,9 @@ That is the whole interface. The file is timestamped and generated; you never na
 | Harness | Delivery | How |
 |---|---|---|
 | `claude` | next tool call | A `PostToolUse` hook puts it beside the tool result. A `Stop` hook refuses to let the session finish while an addendum is unread, so it cannot be missed. |
-| `pi`, `pi-local`, `codex` | next commit | No hook system. The generated prompt tells the session to read the inbox before each commit and before its final report. |
+| `pi`, `pi-local`, `codex` | within ~25 tool calls | No hook system. The generated prompt tells the session to read the inbox on a tool-call floor, around long commands, before each commit, and before its final report. |
 
-So steering a `pi` run lands at the next commit, not the next tool call. For a session in the middle of a long build that can be a while. Send it anyway — the instruction to read the inbox before the final report means it will not finish without seeing it.
+So steering a `pi` run is bounded by tool calls, not by commits — it no longer takes a long build swallowing the run before an addendum gets read. It still lands later than it would on `claude`. Send it anyway — the instruction to read the inbox before the final report means it will not finish without seeing it.
 
 The status block counts what you have sent, and `--monitor` prints a line when one actually reaches the session:
 
