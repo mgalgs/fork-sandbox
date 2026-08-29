@@ -93,8 +93,14 @@ do not vary it round to round.
    per thread**, enforced by `lkml-mailbox.sh post` itself.
 4. **When `open` is empty**, or everything left open can only be moved by
    the author, run `lkml-revise.sh <series> --project <path> --checkout
-   <branch> --version <N>` to produce vN+1. This posts vN+1 on a NEW branch,
-   `lkml/<series>-v<N+1>` -- lkml-revise.sh's own report names it. Go back
+   <branch> --version <N> --base <base-ref>` to produce vN+1, where
+   `<base-ref>` is the SAME base you formatted v1 against in step 1, not
+   vN's branch -- the author's commits land on top of vN, so posting
+   against vN's tip would ship only this round's fixups as if they were
+   the whole series. This posts vN+1 on a NEW, timestamped branch named
+   `lkml/<series>-v<N+1>-<timestamp>` -- lkml-revise.sh's own report names
+   the exact branch, which you need verbatim since the timestamp makes it
+   unguessable. Go back
    to step 2 with the whole panel checked out against THAT branch, not the
    one you started this step with: a round launched with `--checkout
    <branch>` still pointing at vN's branch reviews vN's code while being

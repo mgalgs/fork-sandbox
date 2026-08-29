@@ -160,12 +160,21 @@ echo "actually this leaks the buffer on the error path" > nak.txt
 "$mailbox" post widget-frob --from linus --reply-to "${r2:0:7}" --file nak.txt \
     --tags NAK --harness claude --model opus >/dev/null 2>&1
 tally_out2="$("$mailbox" tally widget-frob --version 1)"
-# Scoped to the "Patch 1:" block specifically: patch 0 (the cover) rolls up
-# every descendant's tags too (it is the root of the whole tree), so a
-# bare "line starting with linus" grep over the whole tally would also
-# match linus's entry there and could see stale values from that rollup.
+# Scoped to the "Patch 1:" block specifically, not because patch 0 would
+# roll it up (a bare "line starting with linus" grep over the whole tally
+# is exactly the bug the next check guards against) but to pin the format.
 linus_tag="$(printf '%s\n' "$tally_out2" | awk '/^Patch 1:/{f=1;next} /^Patch [0-9]+:/{f=0} f && $1=="linus"{print $2}')"
 check "tally: a later NAK supersedes an earlier Reviewed-by (not both)" "NAK" "$linus_tag"
+
+# Nobody has said a word about the cover itself -- every tag so far landed
+# on patch 1 or patch 2's own threads. Patch 0's subtree walk used to reach
+# every patch's descendants too (the cover is their common ancestor), so
+# this exact scenario used to print "Patch 0: (cover) ... linus NAK" for a
+# NAK that was actually about patch 1.
+contains "tally: patch 0 (cover) is NOT contaminated by patch 1's NAK" \
+    "$tally_out2" "Patch 0: (cover)"
+cover_block="$(printf '%s\n' "$tally_out2" | awk '/^Patch 0:/{f=1;next} /^Patch [0-9]+:/{f=0} f')"
+check "tally: patch 0's block has no tags of its own yet" "  no tags" "$cover_block"
 
 printf '\n== tally: direct replies to the cover ==\n'
 
@@ -247,7 +256,11 @@ check "six concurrent posts all land as distinct files" "$(( before + 6 ))" "$af
 
 printf '\n== a second version ==\n'
 
-fixture_cover cover2.txt
+# Deliberately distinct from fixture_cover's text (not just a second copy
+# of it) -- v1's cover already contains "widget subsystem", so asserting
+# that string alone would pass whether `cover` picked the highest version
+# or the lowest, and prove nothing about which one it actually returned.
+printf 'Add frobnicator locking\n\nThis v2 adds a mutex around the frobnicator.\n' > cover2.txt
 fixture_patches patches2
 "$mailbox" init widget-frob --cover cover2.txt --patches patches2 --from author \
     --harness claude --model opus >/dev/null 2>diag.txt
@@ -257,7 +270,7 @@ contains "tree still shows v1" "$tree_out2" "=== v1 ==="
 contains "a bare init with no --version posts v2" "$tree_out2" "=== v2 ==="
 
 cover_out2="$("$mailbox" cover widget-frob)"
-contains "cover now returns the LATEST version's letter" "$cover_out2" "widget subsystem"
+contains "cover now returns the LATEST version's letter, not v1's" "$cover_out2" "adds a mutex around the frobnicator"
 
 out="$("$mailbox" init widget-frob --cover cover2.txt --patches patches2 --from author --version 1 2>&1)"
 rc=$?

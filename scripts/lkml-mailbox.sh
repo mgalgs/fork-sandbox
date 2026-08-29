@@ -609,17 +609,30 @@ cmd_tally() {
     local -a nums
     mapfile -t nums < <(printf '%s\n' "${!patch_by_num[@]}" | sort -n)
     local p root label
+    # Every patch's root is a direct child of the cover, so a plain
+    # descendant walk from the cover's id reaches every patch's whole
+    # subtree too -- patch 0's tally would then roll up every persona's
+    # LATEST tag anywhere in the series, not just tags about the cover
+    # itself. Stop the walk at another patch's own root so each patch
+    # (cover included) is tallied only from what was actually said about it.
+    local -A is_patch_root=()
+    for p in "${nums[@]}"; do
+        is_patch_root["${patch_by_num[$p]}"]=1
+    done
     for p in "${nums[@]}"; do
         root="${patch_by_num[$p]}"
         label="${label_by_num[$p]}"
         [[ "$p" == "0" ]] && label="(cover) $label"
 
         local -a subtree=("$root")
-        local k=0 cur j
+        local k=0 cur j child
         while (( k < ${#subtree[@]} )); do
             cur="${subtree[$k]}"
             for j in "${!LKML_PARENT[@]}"; do
-                [[ "${LKML_PARENT[$j]}" == "$cur" ]] && subtree+=("${LKML_ID[$j]}")
+                [[ "${LKML_PARENT[$j]}" == "$cur" ]] || continue
+                child="${LKML_ID[$j]}"
+                [[ "$child" == "$root" || -z "${is_patch_root[$child]+x}" ]] || continue
+                subtree+=("$child")
             done
             k=$(( k + 1 ))
         done

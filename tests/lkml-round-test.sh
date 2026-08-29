@@ -7,11 +7,11 @@
 #
 # No sandbox, no bwrap, no real agent: the stub fork-sandbox.sh captures its
 # own --task-meta, fabricates a run directory with a clone_dir already
-# holding .lkml-out/*.msg replies, writes summary.json immediately (so
+# holding .git/lkml-out/*.msg replies, writes summary.json immediately (so
 # lkml-round.sh's wait loop never actually sleeps), and prints the same
 # "  run dir:  <path>" line the real launcher does. What is under test is
 # entirely lkml-round.sh's own logic: parsing that line, waiting for
-# summary.json, harvesting .lkml-out files, and posting them through
+# summary.json, harvesting .git/lkml-out files, and posting them through
 # lkml-mailbox.sh with the launching persona's own attribution.
 
 set -uo pipefail
@@ -66,7 +66,7 @@ patch_id_bracketed="<$("$mailbox" show widget-frob "$patch_id" \
 
 # The stub replaces fork-sandbox.sh entirely: no clone, no sandbox, no
 # network. It reads its own --task-meta (captured for the test to inspect),
-# fabricates a run directory holding a clone_dir with .lkml-out replies that
+# fabricates a run directory holding a clone_dir with .git/lkml-out replies that
 # depend on which persona this launch was for, and writes summary.json
 # before it ever prints anything -- so lkml-round.sh's wait loop sees
 # summary.json on its very first check and never sleeps.
@@ -88,20 +88,20 @@ printf '%s\n' "$task_meta" > "$STUB_CAPTURE_DIR/$persona.task-meta.json"
 
 run_dir="$(mktemp -d "$STUB_RUN_PREFIX/run.XXXXXX")"
 clone_dir="$run_dir/clone/proj"
-mkdir -p "$clone_dir/.lkml-out"
+mkdir -p "$clone_dir/.git/lkml-out"
 
 case "$persona" in
     linus)
         printf 'In-Reply-To: %s\nX-Tags: Reviewed-by\n\nLooks fine now.\n' "$STUB_REPLY_TO" \
-            > "$clone_dir/.lkml-out/1.msg"
+            > "$clone_dir/.git/lkml-out/1.msg"
         printf 'Subject: a stray note\n\nThis one forgot In-Reply-To on purpose.\n' \
-            > "$clone_dir/.lkml-out/2.msg"
+            > "$clone_dir/.git/lkml-out/2.msg"
         ;;
     security)
         # RFC-822 bracket form, not the bare id linus's reply above uses --
         # exercises harvest_one's In-Reply-To stripping (lkml_round_strip_id).
         printf 'In-Reply-To: %s\nX-Tags: Question\n\nWhat about the empty-input case?\n' "$STUB_REPLY_TO_BRACKETED" \
-            > "$clone_dir/.lkml-out/1.msg"
+            > "$clone_dir/.git/lkml-out/1.msg"
         ;;
 esac
 
@@ -154,9 +154,28 @@ n_msgs=$(find "$LKML_MAILBOX_ROOT/widget-frob/cur" -name '*.msg' | wc -l)
 # second linus file must NOT have been posted.
 check "exactly the well-formed replies were posted (4 messages total)" "4" "$n_msgs"
 
-contains "a .lkml-out file with no In-Reply-To is refused with a clear line" \
+contains "a .git/lkml-out file with no In-Reply-To is refused with a clear line" \
     "$out" "has no In-Reply-To"
 contains "the refusal names the file it skipped" "$out" "2.msg"
+
+printf '\n== bad --reply-to id is caught before any persona launches ==\n'
+
+# Before the fix this required for two things to line up to go unchecked:
+# a bad id past the first --reply-to (only index 0 was ever resolved), and
+# --version passed explicitly (the only path that skipped resolving index 0
+# too, since that resolution was a side effect of INFERRING the version).
+# Cover both by passing --version explicitly and putting the bad id second.
+capture_dir2="$(mktemp -d)"; tmpdirs+=("$capture_dir2")
+out2="$(PATH="$stub_bin:$PATH" STUB_CAPTURE_DIR="$capture_dir2" STUB_RUN_PREFIX="$run_prefix_dir" \
+    STUB_REPLY_TO="$patch_id" STUB_REPLY_TO_BRACKETED="$patch_id_bracketed" \
+    "$round" widget-frob --project /nonexistent/project --checkout somebranch \
+    --personas linus,security --version 1 \
+    --reply-to "$patch_id" --reply-to deadbeefbad 2>&1)"
+rc2=$?
+if (( rc2 != 0 )); then ok "exits non-zero on an unresolvable --reply-to id"; else no "exits non-zero on an unresolvable --reply-to id" "exit 0: $out2"; fi
+contains "names the bad id" "$out2" "deadbeefbad"
+n_launches=$(find "$capture_dir2" -name '*.task-meta.json' | wc -l)
+check "no persona was launched (caught before the launch loop)" "0" "$n_launches"
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 (( fail == 0 )) || exit 1

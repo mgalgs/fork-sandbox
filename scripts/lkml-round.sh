@@ -37,7 +37,11 @@
 # series' tip, with a handoff built from the persona file, the mailbox's
 # `cover` and `tree` output, and (with --reply-to) the specific threads to
 # answer. The run makes NO commits -- it writes its replies as
-# .lkml-out/<n>.msg files in its own clone. Launches are started back to
+# .git/lkml-out/<n>.msg files in its own clone -- .git/ rather than the
+# working tree because git tracks nothing under it, so this project's
+# "commit early and often" instinct cannot sweep it into a commit by
+# accident (see fork-sandbox.sh's own review-verdict.md and pi-session
+# for the same convention). Launches are started back to
 # back rather than backgrounded with `&`: each fork-sandbox.sh call returns
 # as soon as its own detached tmux session exists, so by the time the last
 # one is launched every session is already running concurrently -- the same
@@ -47,10 +51,10 @@
 # After every launched run has written summary.json -- fork-sandbox.sh's
 # own signal that the run is fully over, including its (possibly empty)
 # fetch back into the real repo, written strictly after exit-code -- each
-# run's clone is read directly -- `cat`, never git -- for .lkml-out/*.msg
+# run's clone is read directly -- `cat`, never git -- for .git/lkml-out/*.msg
 # files, which are posted into the mailbox via lkml-mailbox.sh post,
 # stamped with that persona's own harness/model and display name. A
-# .lkml-out file with no In-Reply-To header is skipped with a clear
+# .git/lkml-out file with no In-Reply-To header is skipped with a clear
 # warning; the rest of that run's replies still land.
 
 set -uo pipefail
@@ -119,6 +123,22 @@ if [[ -z "$version" ]]; then
 fi
 [[ -n "$version" ]] || { echo "Error: could not determine which version this round is about." >&2; exit 1; }
 
+# Every --reply-to id must resolve before ANY persona is launched -- a
+# typo'd id would otherwise only be caught when build_handoff calls
+# `mailbox show` per-persona, and under `set -uo pipefail` (no `-e`) that
+# failure is silent: the command substitution just yields an empty string,
+# so the persona is launched -- at real cost -- with a "### Thread <id>"
+# section with nothing to reply to. Checking here catches it before any
+# run starts, for one `show` per id instead of one per persona per id.
+if (( ${#reply_to_ids[@]} > 0 )); then
+    for id in "${reply_to_ids[@]}"; do
+        "$mailbox" show "$series" "$id" >/dev/null 2>&1 || {
+            echo "Error: --reply-to '$id' does not resolve in series '$series'." >&2
+            exit 1
+        }
+    done
+fi
+
 lkml_persona_field() {
     local file="$1" key="$2"
     awk -v k="$key" '
@@ -131,7 +151,7 @@ lkml_persona_field() {
 # Builds one persona's handoff on stdout: the persona file verbatim, the
 # series' cover letter and full thread tree, then either the specific
 # threads to answer or instructions to review the whole diff, then the
-# fixed rules for writing .lkml-out replies.
+# fixed rules for writing .git/lkml-out replies.
 build_handoff() {
     local persona_file="$1" cover="$2" tree="$3"
     cat -- "$persona_file"
@@ -158,9 +178,11 @@ build_handoff() {
 
 ## How to reply
 
-Write each thing you have to say as its own file under `.lkml-out/` in this
-clone's working directory (create the directory if it does not exist),
-named `1.msg`, `2.msg`, `3.msg` ... Each file looks like:
+Write each thing you have to say as its own file under `.git/lkml-out/` in
+this clone (create the directory if it does not exist), named `1.msg`,
+`2.msg`, `3.msg` ... Under `.git/`, not the working tree: git tracks
+nothing there, so it cannot end up staged or committed by accident. Each
+file looks like:
 
     In-Reply-To: <id>
     Subject: <optional -- default is "Re: <the parent's subject>">
@@ -187,9 +209,9 @@ Rules, all load-bearing:
   quoted line, the way an email reply does.
 - **Ask a question rather than guess** when you are not sure.
 - **Make no commits and no other repository changes.** Do not edit, stage
-  or commit anything tracked. Writing `.lkml-out/*.msg` files is the whole
+  or commit anything. Writing `.git/lkml-out/*.msg` files is the whole
   job this round.
-- In your final report, say how many `.lkml-out/*.msg` files you wrote and,
+- In your final report, say how many `.git/lkml-out/*.msg` files you wrote and,
   in one line each, what each one says.
 RULES
 }
@@ -361,9 +383,9 @@ for persona in "${!run_dir_of[@]}"; do
         continue
     fi
     clone_dir="$(jq -r '.clone_dir' "$run_dir/summary.json")"
-    out_dir="$clone_dir/.lkml-out"
+    out_dir="$clone_dir/.git/lkml-out"
     if [[ ! -d "$out_dir" ]]; then
-        echo "fork-sandbox lkml-round: $persona wrote no .lkml-out replies." >&2
+        echo "fork-sandbox lkml-round: $persona wrote no .git/lkml-out replies." >&2
         continue
     fi
     while IFS= read -r msgfile; do

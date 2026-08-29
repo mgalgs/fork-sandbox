@@ -14,7 +14,9 @@
 # Covers:
 #   - the happy path: a run that committed, fetched, and left a cover
 #     letter posts vN+1 with the real repo's own format-patch output, and
-#     harvests the run's reply alongside it.
+#     harvests the run's reply alongside it -- as the WHOLE series (format-
+#     patch'd from the original --base, not vN's tip), not just this
+#     round's fixup commits.
 #   - commits == 0: the "a version changes nothing" stop condition exits
 #     non-zero but still harvests any reply.
 #   - fetched != true: same stop condition, the other way it can trip.
@@ -54,15 +56,23 @@ if ! command -v git >/dev/null 2>&1; then
 fi
 
 # A real, throwaway repo for `git format-patch` to run against -- this is
-# what --project points at, standing in for the operator's actual repo.
+# what --project points at, standing in for the operator's actual repo. It
+# has a pre-series base commit distinct from v1's tip, so a test that
+# passes the ORIGINAL base as --base (as SKILL.md's step 4 now requires)
+# and one that mistakenly passed vN's tip instead would disagree about how
+# many patches v2 contains -- see the "whole series" assertion below.
 real_repo="$(mktemp -d)"; tmpdirs+=("$real_repo")
 git -C "$real_repo" init -q
 git -C "$real_repo" config user.email test@example.com
 git -C "$real_repo" config user.name "Test"
+printf 'this is the trunk the series branches from\n' > "$real_repo/base.txt"
+git -C "$real_repo" add base.txt
+git -C "$real_repo" commit -q -m "repo: pre-series base"
+series_base_sha="$(git -C "$real_repo" rev-parse HEAD)"
+
 printf 'int frob(void) { return 0; }\n' > "$real_repo/frob.c"
 git -C "$real_repo" add frob.c
 git -C "$real_repo" commit -q -m "frob: add core"
-base_sha="$(git -C "$real_repo" rev-parse HEAD)"
 
 # The branch a persona's run would have fetched back into the real repo --
 # built here directly, standing in for what fork-sandbox.sh's own fetch
@@ -100,22 +110,22 @@ write_stub() {
 set -euo pipefail
 run_dir="\$(mktemp -d "$run_prefix_dir/run.XXXXXX")"
 clone_dir="\$run_dir/clone/proj"
-mkdir -p "\$clone_dir/.lkml-out"
+mkdir -p "\$clone_dir/.git/lkml-out"
 STUB
     if [[ "$write_cover" == 1 ]]; then
         cat >> "$stub_bin/fork-sandbox.sh" <<STUB
-printf 'Add the return-value fix\n\nv2: fixed frob per linus.\n' > "\$clone_dir/.lkml-out/cover-letter.md"
+printf 'Add the return-value fix\n\nv2: fixed frob per linus.\n' > "\$clone_dir/.git/lkml-out/cover-letter.md"
 STUB
     fi
     if [[ "$write_reply" == 1 ]]; then
         cat >> "$stub_bin/fork-sandbox.sh" <<STUB
-printf 'In-Reply-To: $r1\nX-Tags: Reviewed-by\n\nFixed, see v2.\n' > "\$clone_dir/.lkml-out/1.msg"
+printf 'In-Reply-To: $r1\nX-Tags: Reviewed-by\n\nFixed, see v2.\n' > "\$clone_dir/.git/lkml-out/1.msg"
 STUB
     fi
     cat >> "$stub_bin/fork-sandbox.sh" <<STUB
-jq -n --arg clone_dir "\$clone_dir" --arg branch "v2-branch" --arg base_sha "$base_sha" \\
+jq -n --arg clone_dir "\$clone_dir" --arg branch "v2-branch" \\
     --argjson commits $commits --argjson fetched $fetched \\
-    '{clone_dir: \$clone_dir, branch: \$branch, base_sha: \$base_sha, commits: \$commits, fetched: \$fetched}' \\
+    '{clone_dir: \$clone_dir, branch: \$branch, commits: \$commits, fetched: \$fetched}' \\
     > "\$run_dir/summary.json"
 echo "fork-sandbox: launched in a stub"
 echo "  run dir:  \$run_dir"
@@ -126,7 +136,7 @@ STUB
 printf '\n== happy path: commits + fetched + cover letter ==\n'
 write_stub 1 true 1 1
 out="$(PATH="$stub_bin:$PATH" "$revise" widget-frob --project "$real_repo" \
-    --checkout somebranch --version 1 2>&1)"
+    --checkout somebranch --version 1 --base "$series_base_sha" 2>&1)"
 rc=$?
 check "exits 0 and posts v2" "0" "$rc"
 contains "reports harvesting the reply" "$out" "harvested 1 repl"
@@ -135,13 +145,15 @@ contains "reports posting v2" "$out" "posted v2"
 tree_out="$("$mailbox" tree widget-frob)"
 contains "v2 shows up in the tree" "$tree_out" "=== v2 ==="
 contains "v2's patch carries the real repo's commit message" "$tree_out" "frob: fix return value"
+contains "v2 is posted as the whole series (v1's commit plus this round's fixup), not just the fixup alone" \
+    "$tree_out" "PATCH v2 2/2"
 contains "linus's Changes-requested was answered with Reviewed-by" \
     "$("$mailbox" tree widget-frob)" "Reviewed-by"
 
 printf '\n== stop condition: commits == 0 ==\n'
 write_stub 0 true 0 1
 out="$(PATH="$stub_bin:$PATH" "$revise" widget-frob --project "$real_repo" \
-    --checkout somebranch --version 1 2>&1)"
+    --checkout somebranch --version 1 --base "$series_base_sha" 2>&1)"
 rc=$?
 if (( rc != 0 )); then ok "exits non-zero when commits == 0"; else no "exits non-zero when commits == 0" "exit 0"; fi
 contains "names the 'changes nothing' stop condition" "$out" "changes nothing"
@@ -150,7 +162,7 @@ contains "still harvests the reply even with no commits" "$out" "harvested 1 rep
 printf '\n== stop condition: fetched != true ==\n'
 write_stub 1 false 1 0
 out="$(PATH="$stub_bin:$PATH" "$revise" widget-frob --project "$real_repo" \
-    --checkout somebranch --version 1 2>&1)"
+    --checkout somebranch --version 1 --base "$series_base_sha" 2>&1)"
 rc=$?
 if (( rc != 0 )); then ok "exits non-zero when fetched != true"; else no "exits non-zero when fetched != true" "exit 0"; fi
 contains "names the 'changes nothing' stop condition (fetched case)" "$out" "changes nothing"
@@ -159,7 +171,7 @@ printf '\n== refusal: commits but no cover letter ==\n'
 write_stub 1 true 0 0
 n_before=$(find "$LKML_MAILBOX_ROOT/widget-frob/cur" -name '*.msg' | wc -l)
 out="$(PATH="$stub_bin:$PATH" "$revise" widget-frob --project "$real_repo" \
-    --checkout somebranch --version 1 2>&1)"
+    --checkout somebranch --version 1 --base "$series_base_sha" 2>&1)"
 rc=$?
 if (( rc != 0 )); then ok "exits non-zero with commits but no cover letter"; else no "exits non-zero with commits but no cover letter" "exit 0"; fi
 contains "refusal names the branch to read by hand" "$out" "v2-branch"

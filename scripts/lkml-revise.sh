@@ -2,7 +2,7 @@
 # lkml-revise.sh — Launch the author persona to answer review and produce
 # the next version of an lkml-mode series.
 #
-# Usage: lkml-revise.sh <series> --project <path> --checkout <ref> --version <n>
+# Usage: lkml-revise.sh <series> --project <path> --checkout <ref> --version <n> --base <ref>
 #            [--personas-dir <dir>] [--author <persona>] [--model-override <harness/model>]
 #            [--timeout <seconds>]
 #
@@ -10,8 +10,18 @@
 # --checkout  the ref to revise from -- normally the branch vN was posted
 #             from, so the author's clone already holds vN's commits.
 # --version   the CURRENT version being revised (an integer N). This launch
-#             produces vN+1; the branch is named lkml/<series>-vN+1, and
-#             that is also the version lkml-mailbox.sh init posts under.
+#             produces vN+1, posted under that version by lkml-mailbox.sh
+#             init; the branch is named lkml/<series>-vN+1-<timestamp> (see
+#             the launch report for the exact name -- the timestamp is
+#             there so a retry after this script refuses downstream, e.g.
+#             "committed but left no cover letter" below, does not collide
+#             with the branch the failed attempt already fetched).
+# --base      the series' ORIGINAL base -- the same ref v1's patches were
+#             formatted against (SKILL.md step 1's <base-ref>), NOT vN's
+#             tip. The author's commits land on top of vN, so formatting
+#             vN's tip..vN+1 would post only this round's fixups as if they
+#             were the whole series; formatting the ORIGINAL base..vN+1
+#             posts the complete series every time.
 # --author    which persona file speaks for the series. Defaults to
 #             "author" -- see skills/lkml-mode/personas/author.md.
 # --model-override <harness>[/<model>] overrides the author persona's own
@@ -23,18 +33,22 @@
 # `lkml-mailbox.sh open` flags, and asks it to, for each open item, either
 # fix the code (and commit, one logical change per commit rather than one
 # squash) or reply on-thread explaining why not, then write the new cover
-# letter to `.lkml-out/cover-letter.md` before finishing.
+# letter to `.git/lkml-out/cover-letter.md` before finishing -- under
+# .git/, not the working tree, so the "commit early and often" advice
+# below cannot sweep it into a commit by accident (git tracks nothing
+# under .git/; same convention fork-sandbox.sh itself uses for
+# review-verdict.md and pi's session dir).
 #
 # After the run: this waits for summary.json (fork-sandbox.sh's own signal
 # that the run -- and its fetch back into the real repo -- is fully over),
 # then:
 #
-#   - Harvests any `.lkml-out/*.msg` reply files into the CURRENT threads,
+#   - Harvests any `.git/lkml-out/*.msg` reply files into the CURRENT threads,
 #     exactly as lkml-round.sh does, whether or not any commits landed --
 #     a reply explaining a disagreement is still worth posting even on a
 #     round that changes no code.
 #   - If, and only if, the run committed at least one commit AND left a
-#     `.lkml-out/cover-letter.md`, runs `git format-patch` in the REAL repo
+#     `.git/lkml-out/cover-letter.md`, runs `git format-patch` in the REAL repo
 #     (never the clone) over the fetched branch, and posts the result as
 #     the new version with `lkml-mailbox.sh init`.
 #
@@ -61,6 +75,7 @@ shift
 project=""
 checkout_ref=""
 version=""
+base_ref=""
 personas_dir="$default_personas_dir"
 author_persona="author"
 model_override=""
@@ -71,6 +86,7 @@ while [[ $# -gt 0 ]]; do
         --project) project="${2:?--project requires a path}"; shift 2 ;;
         --checkout) checkout_ref="${2:?--checkout requires a ref}"; shift 2 ;;
         --version) version="${2:?--version requires a number}"; shift 2 ;;
+        --base) base_ref="${2:?--base requires a ref}"; shift 2 ;;
         --personas-dir) personas_dir="${2:?--personas-dir requires a directory}"; shift 2 ;;
         --author) author_persona="${2:?--author requires a persona name}"; shift 2 ;;
         --model-override) model_override="${2:?--model-override requires harness or harness/model}"; shift 2 ;;
@@ -84,6 +100,7 @@ done
 [[ -n "$checkout_ref" ]] || { echo "Error: --checkout is required." >&2; exit 1; }
 [[ -n "$version" ]] || { echo "Error: --version is required (the version being revised)." >&2; exit 1; }
 [[ "$version" =~ ^[0-9]+$ ]] || { echo "Error: --version must be a plain integer." >&2; exit 1; }
+[[ -n "$base_ref" ]] || { echo "Error: --base is required (the series' original base, the same ref v1 was formatted against)." >&2; exit 1; }
 command -v fork-sandbox.sh >/dev/null 2>&1 || { echo "Error: fork-sandbox.sh not found on PATH." >&2; exit 1; }
 command -v jq >/dev/null 2>&1 || { echo "Error: jq not found on PATH." >&2; exit 1; }
 
@@ -153,7 +170,11 @@ early and often rather than saving it all for a final commit.
 When you are done, write the new cover letter, including a changelog
 section that says what changed because of which reviewer's comment, to:
 
-    .lkml-out/cover-letter.md
+    .git/lkml-out/cover-letter.md
+
+Under \`.git/\`, not the working tree: git tracks nothing there, so it
+cannot end up staged or committed by the "commit early and often" habit
+above.
 
 The cover letter's FIRST LINE becomes the mailbox Subject verbatim, so
 write it as a plain, short sentence -- no markdown heading marker, and no
@@ -167,7 +188,7 @@ version that changes nothing.
 ## How to reply
 
 For anything you are answering with words rather than a code change,
-write it as its own file under \`.lkml-out/\`, named \`1.msg\`, \`2.msg\`, ...
+write it as its own file under \`.git/lkml-out/\`, named \`1.msg\`, \`2.msg\`, ...
 (not \`cover-letter.md\`, which is reserved for the new cover letter):
 
     In-Reply-To: <id>
@@ -182,7 +203,14 @@ than guess when a comment itself is unclear.
 RULES
 } > "$handoff_file"
 
-branch="lkml/${series}-v${next_version}"
+# Timestamped like lkml-round.sh's own per-round branches, and for the same
+# reason: fork-sandbox.sh refuses to launch onto a branch that already
+# exists, so a deterministic name would permanently wedge this series the
+# first time a run fetches its branch and then this script refuses
+# downstream (no commits, or commits with no cover letter) -- the next
+# attempt at vN+1 would collide with the failed one's branch until an
+# operator deletes it by hand.
+branch="lkml/${series}-v${next_version}-$(date +%s)"
 task_meta="$(jq -nc --arg series "$series" --arg persona "$author_persona" \
     '{kind:"implement", tags:["lkml", $series, $persona]}')"
 
@@ -220,11 +248,10 @@ done
 
 clone_dir="$(jq -r '.clone_dir' "$run_dir/summary.json")"
 real_branch="$(jq -r '.branch' "$run_dir/summary.json")"
-base_sha="$(jq -r '.base_sha' "$run_dir/summary.json")"
 commits="$(jq -r '.commits' "$run_dir/summary.json")"
 fetched="$(jq -r '.fetched' "$run_dir/summary.json")"
 
-# Harvest one .lkml-out/*.msg file as a reply from the author persona.
+# Harvest one .git/lkml-out/*.msg file as a reply from the author persona.
 # Kept as a function, not inline, specifically so its per-message state
 # (reply_to, subject, tags, in_headers) is `local` and cannot leak between
 # iterations of the loop below -- a message with no X-Tags must not inherit
@@ -285,7 +312,7 @@ harvest_reply() {
 # disagreement explained on-thread is worth having even on a round that
 # changes no code.
 harvested=0
-out_dir="$clone_dir/.lkml-out"
+out_dir="$clone_dir/.git/lkml-out"
 if [[ -d "$out_dir" ]]; then
     while IFS= read -r msgfile; do
         [[ -e "$msgfile" ]] || continue
@@ -315,8 +342,12 @@ patch_dir="$(mktemp -d /var/tmp/claude-scratch/lkml-revise-patches-XXXXXX)" || {
     exit 1
 }
 real_repo="$(git -C "$project" rev-parse --show-toplevel)"
-if ! (cd "$real_repo" && git format-patch --quiet -o "$patch_dir" "$base_sha..$real_branch") >/dev/null; then
-    echo "Error: git format-patch failed for $base_sha..$real_branch in $real_repo." >&2
+series_base_sha="$(cd "$real_repo" && git rev-parse --verify --quiet "${base_ref}^{commit}")" || {
+    echo "Error: --base '$base_ref' does not name a commit in $real_repo." >&2
+    exit 1
+}
+if ! (cd "$real_repo" && git format-patch --quiet -o "$patch_dir" "$series_base_sha..$real_branch") >/dev/null; then
+    echo "Error: git format-patch failed for $series_base_sha..$real_branch in $real_repo." >&2
     exit 1
 fi
 
