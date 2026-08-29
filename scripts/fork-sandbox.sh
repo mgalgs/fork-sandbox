@@ -441,10 +441,142 @@ See docs/configure.md, including "Adding a discoverer".
 EOF
 }
 
-# Both filled in below, once the discoverer protocol (fs_configure_gather)
-# and the picker (fs_configure_select) exist. Stubbed for now so `configure`
-# fails loudly rather than silently doing nothing while this command is
-# built up commit by commit.
+# Resolves the discoverer binary for one name: PATH first, then beside this
+# script. Identical to fork-sandbox-k8s.sh's resolve_platform, and for the
+# identical reason -- a checkout must work before install.sh has put
+# anything on PATH.
+fs_configure_resolve_discoverer() {
+    local name="$1" bin
+    bin="$(command -v "fork-sandbox-discover-$name" 2>/dev/null || true)"
+    if [[ -z "$bin" && -x "$script_dir/fork-sandbox-discover-$name" ]]; then
+        bin="$script_dir/fork-sandbox-discover-$name"
+    fi
+    printf '%s' "$bin"
+}
+
+# Prints every discoverer name found on PATH or beside this script, one per
+# line, deduplicated. A name is whatever follows the fork-sandbox-discover-
+# prefix in an executable file's basename.
+fs_configure_discoverer_names() {
+    local -A seen=()
+    local -a dirs=()
+    IFS=':' read -r -a dirs <<< "$PATH"
+    dirs+=("$script_dir")
+    local dir f name
+    for dir in "${dirs[@]}"; do
+        [[ -d "$dir" ]] || continue
+        for f in "$dir"/fork-sandbox-discover-*; do
+            [[ -f "$f" && -x "$f" ]] || continue
+            name="${f##*/fork-sandbox-discover-}"
+            [[ "$name" =~ ^[a-z0-9][a-z0-9_-]*$ ]] || continue
+            seen["$name"]=1
+        done
+    done
+    if (( ${#seen[@]} )); then
+        printf '%s\n' "${!seen[@]}" | sort
+    fi
+}
+
+# The candidate table `configure` builds by running every discoverer's
+# `discover` verb. Parallel arrays rather than one structured value, because
+# bash has no records: index i of each array describes one candidate.
+# Filled by fs_configure_gather; read by the add path built in later
+# commits.
+FS_CAND_ID=()          # namespaced "<discoverer>/<id>", for display and logs
+FS_CAND_RAWID=()       # the id exactly as the discoverer printed it
+FS_CAND_TARGET=()      # "<file>:<KEY>", or "-" for informational
+FS_CAND_LABEL=()
+FS_CAND_SOURCE=()
+FS_CAND_DISPLAY=()     # already-safe rendering; never a raw secret
+FS_CAND_BIN=()         # the discoverer binary that produced this candidate
+FS_CAND_NAME=()        # the discoverer's name, for error messages
+FS_CAND_SELECTABLE=()  # 1 unless target is "-"
+
+# Runs `discover` against every resolved discoverer and appends whatever it
+# printed to the FS_CAND_* arrays above, after checking each line's target
+# against FS_CONFIGURE_TARGETS. A discoverer that exits non-zero, or a line
+# naming a target outside that table, is reported to stderr and skipped
+# rather than aborting the whole command -- one broken, or maliciously
+# steered, plugin must not take every other one down with it, and must
+# never turn into a write anywhere but $config_dir.
+fs_configure_gather() {
+    FS_CAND_ID=(); FS_CAND_RAWID=(); FS_CAND_TARGET=(); FS_CAND_LABEL=()
+    FS_CAND_SOURCE=(); FS_CAND_DISPLAY=(); FS_CAND_BIN=(); FS_CAND_NAME=()
+    FS_CAND_SELECTABLE=()
+
+    local name bin out rc id target label source display
+    while IFS= read -r name; do
+        [[ -n "$name" ]] || continue
+        bin="$(fs_configure_resolve_discoverer "$name")"
+        if [[ -z "$bin" ]]; then
+            echo "Warning: configure: could not resolve fork-sandbox-discover-$name; skipping." >&2
+            continue
+        fi
+
+        rc=0
+        out="$("$bin" discover)" || rc=$?
+        if (( rc != 0 )); then
+            echo "Warning: configure: fork-sandbox-discover-$name exited $rc on 'discover'; skipping its candidates." >&2
+            continue
+        fi
+        [[ -n "$out" ]] || continue
+
+        while IFS=$'\t' read -r id target label source display; do
+            [[ -n "$id" ]] || continue
+            if [[ ! "$id" =~ ^[a-z0-9][a-z0-9_-]*$ ]]; then
+                echo "Warning: configure: fork-sandbox-discover-$name printed an invalid id '$id'; dropping that candidate." >&2
+                continue
+            fi
+            # The security boundary: a target not in the fixed table is
+            # refused by name, loudly, and dropped -- never written, and
+            # never silently ignored either, since a silent drop here is
+            # indistinguishable from "everything is fine" to whoever is
+            # reading the output of a --dry-run or a script's log.
+            if [[ "$target" != "-" && -z "${FS_CONFIGURE_TARGETS[$target]+x}" ]]; then
+                echo "Error: configure: fork-sandbox-discover-$name named target" >&2
+                echo "'$target', which is not one of the targets this script" >&2
+                echo "writes. A discoverer names a target from a fixed table," >&2
+                echo "never a path -- see docs/configure.md. Dropping that candidate." >&2
+                continue
+            fi
+            FS_CAND_ID+=("$name/$id")
+            FS_CAND_RAWID+=("$id")
+            FS_CAND_TARGET+=("$target")
+            FS_CAND_LABEL+=("$label")
+            FS_CAND_SOURCE+=("$source")
+            FS_CAND_DISPLAY+=("$display")
+            FS_CAND_BIN+=("$bin")
+            FS_CAND_NAME+=("$name")
+            if [[ "$target" == "-" ]]; then
+                FS_CAND_SELECTABLE+=(0)
+            else
+                FS_CAND_SELECTABLE+=(1)
+            fi
+        done <<< "$out"
+    done < <(fs_configure_discoverer_names)
+}
+
+# Calls `value <id>` on the discoverer that produced candidate $1 (an index
+# into the FS_CAND_* arrays) and prints the raw value on stdout. This is the
+# second half of the two-phase protocol: a secret's real value is read only
+# for a candidate the user actually selected, never while the picker is
+# still deciding.
+fs_configure_fetch_value() {
+    local idx="$1" bin rawid rc out
+    bin="${FS_CAND_BIN[$idx]}"
+    rawid="${FS_CAND_RAWID[$idx]}"
+    rc=0
+    out="$("$bin" value "$rawid")" || rc=$?
+    if (( rc != 0 )); then
+        echo "Warning: configure: fork-sandbox-discover-${FS_CAND_NAME[$idx]} could not produce a value for '$rawid'; skipping." >&2
+        return 1
+    fi
+    printf '%s' "$out"
+}
+
+# Both filled in below, once the picker (fs_configure_select) and writer
+# exist. Stubbed for now so `configure` fails loudly rather than silently
+# doing nothing while this command is built up commit by commit.
 fs_configure_do_add() {
     echo "fork-sandbox: configure: add path not implemented yet." >&2
     exit 1
