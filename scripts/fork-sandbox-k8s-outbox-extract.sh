@@ -3,7 +3,7 @@
 # outbox tarball onto the host, invoked by fork-sandbox-k8s.sh's `run` verb
 # after it pulls /work/outbox out of the pod over kubectl exec.
 #
-# Usage: fork-sandbox-k8s-outbox-extract.sh TAR_FILE DEST_DIR
+# Usage: fork-sandbox-k8s-outbox-extract.sh TAR_FILE DEST_DIR [MAX_BYTES]
 #
 # Untarring a stream from an untrusted pod onto the host is a path-traversal
 # sink -- kubectl cp is itself tar-over-exec and has had CVEs of exactly
@@ -41,13 +41,17 @@
 
 set -euo pipefail
 
-tar_file="${1:?usage: fork-sandbox-k8s-outbox-extract.sh TAR_FILE DEST_DIR}"
-dest_dir="${2:?usage: fork-sandbox-k8s-outbox-extract.sh TAR_FILE DEST_DIR}"
+tar_file="${1:?usage: fork-sandbox-k8s-outbox-extract.sh TAR_FILE DEST_DIR [MAX_BYTES]}"
+dest_dir="${2:?usage: fork-sandbox-k8s-outbox-extract.sh TAR_FILE DEST_DIR [MAX_BYTES]}"
 
-# 64 MiB. An outbox is for screenshots, reports and the like, not build
-# artifacts or datasets -- generous enough for that, small enough that a
-# confused or hostile pod cannot use it to fill the host's disk.
-max_bytes=$((64 * 1024 * 1024))
+# 64 MiB by default. An outbox is for screenshots, reports and the like, not
+# build artifacts or datasets -- generous enough for that, small enough that
+# a confused or hostile pod cannot use it to fill the host's disk. This
+# script is deliberately standalone (see the header above) and does not
+# source fork-sandbox-lib.sh, so the caller passes its own FS_OUTBOX_MAX_BYTES
+# down as $3 rather than the two drifting apart; a bare invocation (as a test
+# drives it directly against a fixture tarball) still gets the same default.
+max_bytes="${3:-$((64 * 1024 * 1024))}"
 
 size="$(stat -c '%s' -- "$tar_file")"
 if (( size > max_bytes )); then

@@ -1109,7 +1109,7 @@ cmd_run() {
     local outbox_dest="$outbox_dir"
     [[ -n "$outbox_dest" ]] \
         || outbox_dest="/var/tmp/claude-scratch/forks/k8s-$(k8s_safe_name_component "$branch")/outbox"
-    local outbox_max_bytes=$((64 * 1024 * 1024))
+    local outbox_max_bytes="$FS_OUTBOX_MAX_BYTES"
     local outbox_tar outbox_ok=true
     outbox_tar="$(mktemp)"
     if ! kubectl exec "$pod_name" -- tar cf - -C /work/outbox . 2>/dev/null \
@@ -1126,7 +1126,7 @@ cmd_run() {
         outbox_ok=false
     fi
     if [[ "$outbox_ok" == true ]]; then
-        if "$script_dir/fork-sandbox-k8s-outbox-extract.sh" "$outbox_tar" "$outbox_dest"; then
+        if "$script_dir/fork-sandbox-k8s-outbox-extract.sh" "$outbox_tar" "$outbox_dest" "$outbox_max_bytes"; then
             local outbox_count
             outbox_count="$(find "$outbox_dest" -type f | wc -l)"
             if (( outbox_count > 0 )); then

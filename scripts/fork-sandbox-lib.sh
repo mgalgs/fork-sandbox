@@ -73,6 +73,15 @@ fs_require_gnu_tools() {
     return 0
 }
 
+# The artifact outbox's size budget, shared by every path that enforces or
+# reports it: fork-sandbox-k8s.sh's own pull-back cap, the default handed to
+# fork-sandbox-k8s-outbox-extract.sh when it is invoked without an explicit
+# third argument, the local run's end-of-run check in fork-sandbox.sh, and
+# the number fs_emit_prompt_preamble tells the agent about below. One
+# constant, so the four of them cannot drift apart.
+# shellcheck disable=SC2034  # written here, read by the sourcing scripts
+FS_OUTBOX_MAX_BYTES=$((64 * 1024 * 1024))   # 64 MiB
+
 # claude-sandboxed must exist before anything is created. Resolve it here
 # rather than let it fail inside a tmux pane: the pane closes when its
 # command exits, so the error would flash past and the fork would look like
