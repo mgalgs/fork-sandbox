@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# fork-sandbox-discover-openrouter -- find an OpenRouter API key already on this machine
+#
+# Usage: fork-sandbox-discover-openrouter discover
+#        fork-sandbox-discover-openrouter value <id>
+#
+# A `fork-sandbox.sh configure` discoverer plugin -- see docs/configure.md
+# for the two-verb protocol this implements. `discover` prints metadata
+# only, with the key masked to its last 4 characters; `value` prints the
+# real key, and is only ever called by configure for an id the user
+# actually selected.
+#
+# Two candidate sources, both read-only and local:
+#   - $OPENROUTER_API_KEY, if set.
+#   - ~/.config/openrouter/key, if it exists and is non-empty.
+# Both map to the same target, pi.env:OPENROUTER_API_KEY -- the only file
+# and key a pi run reads its OpenRouter credential from.
+
+set -euo pipefail
+
+if [[ "${1-}" == -h || "${1-}" == --help ]]; then
+    sed -n '2,/^$/p' "$(readlink -f "${BASH_SOURCE[0]}")" | sed 's/^# \{0,1\}//'
+    exit 0
+fi
+
+key_file="$HOME/.config/openrouter/key"
+
+cmd_discover() {
+    local val
+    if [[ -n "${OPENROUTER_API_KEY:-}" ]]; then
+        val="$OPENROUTER_API_KEY"
+        # shellcheck disable=SC2016  # the literal text $OPENROUTER_API_KEY is the `source` field
+        printf 'env\tpi.env:OPENROUTER_API_KEY\tOpenRouter key\t$OPENROUTER_API_KEY\t%s\n' \
+            "$(fs_mask_secret "$val")"
+    fi
+    if [[ -f "$key_file" ]]; then
+        val="$(<"$key_file")"
+        if [[ -n "$val" ]]; then
+            printf 'file\tpi.env:OPENROUTER_API_KEY\tOpenRouter key\t~/.config/openrouter/key\t%s\n' \
+                "$(fs_mask_secret "$val")"
+        fi
+    fi
+}
+
+cmd_value() {
+    local id="$1"
+    case "$id" in
+        env) printf '%s' "${OPENROUTER_API_KEY:-}" ;;
+        file) printf '%s' "$(<"$key_file")" ;;
+        *)
+            echo "Error: fork-sandbox-discover-openrouter: unknown id '$id'." >&2
+            exit 1
+            ;;
+    esac
+}
+
+script_dir="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=fork-sandbox-lib.sh
+# shellcheck disable=SC1091  # plain shellcheck cannot follow it; use -x
+source "$script_dir/fork-sandbox-lib.sh"
+
+case "${1-}" in
+    discover) cmd_discover ;;
+    value) cmd_value "${2:?value requires an id}" ;;
+    *)
+        echo "Usage: fork-sandbox-discover-openrouter discover|value <id>" >&2
+        exit 1
+        ;;
+esac

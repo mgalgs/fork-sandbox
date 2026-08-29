@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# fork-sandbox-discover-k8s -- find kubectl contexts already on this machine
+#
+# Usage: fork-sandbox-discover-k8s discover
+#        fork-sandbox-discover-k8s value <id>
+#
+# A `fork-sandbox.sh configure` discoverer plugin -- see docs/configure.md.
+#
+# One candidate per context in `kubectl config get-contexts -o name`,
+# target k8s.env:K8S_CONTEXT. Read-only: this never runs kubectl against a
+# live cluster, only reads the local kubeconfig that command already
+# parses. If kubectl is not on PATH, exits 0 with no candidates -- a
+# missing kubectl is not an error here, just nothing to discover.
+#
+# A context name can contain characters this protocol's id does not allow
+# (uppercase, colons, slashes are common in cloud-provider context names),
+# so ids are derived by lowercasing and collapsing anything else to '-',
+# with a numeric suffix on collision. Both verbs derive ids the same way,
+# from the same command, so `value <id>` can recover the original context
+# name without either verb having to persist anything between runs.
+
+set -euo pipefail
+
+if [[ "${1-}" == -h || "${1-}" == --help ]]; then
+    sed -n '2,/^$/p' "$(readlink -f "${BASH_SOURCE[0]}")" | sed 's/^# \{0,1\}//'
+    exit 0
+fi
+
+sanitize_id() {
+    local s="$1" out
+    out="$(printf '%s' "$s" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9_-]+/-/g; s/^-+//; s/-+$//')"
+    [[ -n "$out" ]] || out="ctx"
+    [[ "$out" =~ ^[a-z0-9] ]] || out="ctx-$out"
+    printf '%s' "$out"
+}
+
+# Prints "<id><TAB><context name>", one per line, for every context in the
+# local kubeconfig -- the shared list both discover and value walk, so an
+# id always means the same context in both.
+list_contexts_with_ids() {
+    command -v kubectl >/dev/null 2>&1 || return 0
+    local -A seen=()
+    local ctx id base n
+    while IFS= read -r ctx; do
+        [[ -n "$ctx" ]] || continue
+        base="$(sanitize_id "$ctx")"
+        id="$base"
+        n=1
+        while [[ -n "${seen[$id]+x}" ]]; do
+            n=$((n + 1))
+            id="$base-$n"
+        done
+        seen["$id"]=1
+        printf '%s\t%s\n' "$id" "$ctx"
+    done < <(kubectl config get-contexts -o name 2>/dev/null || true)
+}
+
+cmd_discover() {
+    local id ctx
+    while IFS=$'\t' read -r id ctx; do
+        [[ -n "$id" ]] || continue
+        printf '%s\tk8s.env:K8S_CONTEXT\tKubernetes context\tkubeconfig\t%s\n' "$id" "$ctx"
+    done < <(list_contexts_with_ids)
+}
+
+cmd_value() {
+    local want="$1" id ctx
+    while IFS=$'\t' read -r id ctx; do
+        if [[ "$id" == "$want" ]]; then
+            printf '%s' "$ctx"
+            return 0
+        fi
+    done < <(list_contexts_with_ids)
+    echo "Error: fork-sandbox-discover-k8s: unknown id '$want'." >&2
+    exit 1
+}
+
+case "${1-}" in
+    discover) cmd_discover ;;
+    value) cmd_value "${2:?value requires an id}" ;;
+    *)
+        echo "Usage: fork-sandbox-discover-k8s discover|value <id>" >&2
+        exit 1
+        ;;
+esac

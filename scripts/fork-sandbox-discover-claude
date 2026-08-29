@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# fork-sandbox-discover-claude -- report whether a Claude credential is ready
+#
+# Usage: fork-sandbox-discover-claude discover
+#        fork-sandbox-discover-claude value <id>
+#
+# A `fork-sandbox.sh configure` discoverer plugin -- see docs/configure.md.
+#
+# Informational only: its one candidate's target is "-", never selectable
+# and never written anywhere. fork-sandbox.sh already finds the Claude
+# credential at run time with no config of its own (fs_read_claude_credential
+# in fork-sandbox-lib.sh), so there is nothing for configure to install --
+# the value of listing it at all is telling a new user their `claude`
+# harness is ready before they try a run and find out the hard way.
+#
+# Never prints the credential itself, or any part of it: presence is
+# checked by redirecting fs_read_claude_credential's stdout (the credential
+# JSON) to /dev/null and looking only at its exit status.
+
+set -euo pipefail
+
+if [[ "${1-}" == -h || "${1-}" == --help ]]; then
+    sed -n '2,/^$/p' "$(readlink -f "${BASH_SOURCE[0]}")" | sed 's/^# \{0,1\}//'
+    exit 0
+fi
+
+script_dir="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=fork-sandbox-lib.sh
+# shellcheck disable=SC1091  # plain shellcheck cannot follow it; use -x
+source "$script_dir/fork-sandbox-lib.sh"
+
+cmd_discover() {
+    if fs_read_claude_credential >/dev/null 2>&1; then
+        printf 'present\t-\tClaude credential\t%s\tfound\n' "$(fs_claude_credential_source)"
+    fi
+}
+
+cmd_value() {
+    # Never reached by fork-sandbox.sh -- an informational candidate (target
+    # "-") is never selectable, so configure never calls `value` for it.
+    # Refuse explicitly rather than let a direct invocation print the
+    # credential.
+    echo "Error: fork-sandbox-discover-claude: 'present' is informational" >&2
+    echo "and has no installable value." >&2
+    exit 1
+}
+
+case "${1-}" in
+    discover) cmd_discover ;;
+    value) cmd_value "${2:?value requires an id}" ;;
+    *)
+        echo "Usage: fork-sandbox-discover-claude discover|value <id>" >&2
+        exit 1
+        ;;
+esac

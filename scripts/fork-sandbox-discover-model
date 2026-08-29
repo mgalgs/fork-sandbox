@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# fork-sandbox-discover-model -- find a local model endpoint already on this machine
+#
+# Usage: fork-sandbox-discover-model discover
+#        fork-sandbox-discover-model value <id>
+#
+# A `fork-sandbox.sh configure` discoverer plugin -- see docs/configure.md.
+#
+# The only source is $FORK_SANDBOX_MODEL_ENDPOINT, an environment variable
+# naming an endpoint the caller already knows about. This deliberately does
+# not port-scan the network or probe any host that was not explicitly
+# named: a discoverer reaching out to guessed addresses to see what
+# answers is a surprise fork-sandbox.sh configure must never spring on
+# whoever runs it, and an endpoint is a fact about one machine's network
+# that only that machine's operator can actually know.
+
+set -euo pipefail
+
+if [[ "${1-}" == -h || "${1-}" == --help ]]; then
+    sed -n '2,/^$/p' "$(readlink -f "${BASH_SOURCE[0]}")" | sed 's/^# \{0,1\}//'
+    exit 0
+fi
+
+cmd_discover() {
+    if [[ -n "${FORK_SANDBOX_MODEL_ENDPOINT:-}" ]]; then
+        # shellcheck disable=SC2016  # the literal text $FORK_SANDBOX_MODEL_ENDPOINT is the `source` field
+        printf 'env\tmodel.env:MODEL_ENDPOINT\tLocal model endpoint\t$FORK_SANDBOX_MODEL_ENDPOINT\t%s\n' \
+            "$FORK_SANDBOX_MODEL_ENDPOINT"
+    fi
+}
+
+cmd_value() {
+    local id="$1"
+    case "$id" in
+        env) printf '%s' "${FORK_SANDBOX_MODEL_ENDPOINT:-}" ;;
+        *)
+            echo "Error: fork-sandbox-discover-model: unknown id '$id'." >&2
+            exit 1
+            ;;
+    esac
+}
+
+case "${1-}" in
+    discover) cmd_discover ;;
+    value) cmd_value "${2:?value requires an id}" ;;
+    *)
+        echo "Usage: fork-sandbox-discover-model discover|value <id>" >&2
+        exit 1
+        ;;
+esac
