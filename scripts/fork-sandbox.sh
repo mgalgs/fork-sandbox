@@ -982,6 +982,10 @@ harness_spec="claude"
 harness_given=false
 harness=""
 combined_model=""
+review_harness_spec=""
+review_harness_given=false
+review_harness=""
+review_combined_model=""
 dry_run=false
 claude_extra_args=""
 pi_extra_args=""
@@ -1032,6 +1036,11 @@ while [[ "${1:-}" == -* ]]; do
             ;;
         --review-model)
             review_model="${2:?--review-model requires a value}"
+            shift 2
+            ;;
+        --review-harness)
+            review_harness_spec="${2:?--review-harness requires claude, pi, pi-local or codex}"
+            review_harness_given=true
             shift 2
             ;;
         --claude-args)
@@ -1134,6 +1143,27 @@ case "$harness" in
         ;;
 esac
 
+# --review-harness takes the identical harness[/model] shape as --harness,
+# split the identical way, for the identical reason (an OpenRouter model id
+# such as moonshotai/kimi-k3 carries its own slash).
+if [[ "$review_harness_given" == true ]]; then
+    if [[ "$review_harness_spec" == */* ]]; then
+        review_harness="${review_harness_spec%%/*}"
+        review_combined_model="${review_harness_spec#*/}"
+    else
+        review_harness="$review_harness_spec"
+    fi
+
+    case "$review_harness" in
+        claude|pi|pi-local|codex) ;;
+        *)
+            echo "Error: --review-harness takes 'claude', 'pi', 'pi-local' or" >&2
+            echo "'codex', not '$review_harness'." >&2
+            exit 1
+            ;;
+    esac
+fi
+
 # pi is the only harness the cluster path builds (see the --k8s block
 # below), so --k8s defaults to it rather than making an operator type
 # --harness pi on the one flag whose whole purpose is being the front door.
@@ -1158,6 +1188,14 @@ if [[ -n "$combined_model" ]]; then
 else
     model="$model_option"
 fi
+if [[ -n "$review_combined_model" && -n "$review_model" ]]; then
+    echo "Error: combined review-harness model '$review_combined_model'" >&2
+    echo "conflicts with --review-model '$review_model'. Drop one of the two" >&2
+    echo "model values." >&2
+    exit 1
+fi
+[[ -n "$review_combined_model" ]] && review_model="$review_combined_model"
+
 if [[ "$model_unchecked" == true && "$model_given" != true ]]; then
     echo "Error: --model-unchecked requires a model, since it sends that" >&2
     echo "value verbatim, from either --model or the combined harness/model" >&2
@@ -1177,12 +1215,15 @@ display_config_path() {
 }
 
 # Resolves the model named by $1 (a variable name — "model" or
-# "review_model"), in place, when $2 is true. Shared by --model and
-# --review-model: both go through the same alias file and codex-cache
-# lookup, against the same $harness, so a bad --review-model is refused
-# before the clone exactly as a bad --model is.
+# "review_model"), in place, when $2 is true, against harness $3. Shared by
+# --model and --review-model: both go through the same alias file and
+# codex-cache lookup, so a bad --review-model is refused before the clone
+# exactly as a bad --model is. $3 is the harness to resolve against rather
+# than always the implement $harness, because --review-harness (when
+# given) means review_model's aliases and codex cache belong to a
+# different harness than model's do.
 resolve_model() {
-    local varname="$1" given="$2"
+    local varname="$1" given="$2" resolve_harness="$3"
     local aliases_file="$config_dir/aliases.conf"
     local resolved="" source="" cache_file="" cache_label="" cache_rows="" current
     local -a candidates=() known=()
@@ -1196,7 +1237,7 @@ resolve_model() {
     fi
 
     if [[ -f "$aliases_file" ]]; then
-        resolved="$(awk -v harness="$harness" -v alias="$current" '
+        resolved="$(awk -v harness="$resolve_harness" -v alias="$current" '
             /^[[:space:]]*($|#)/ { next }
             $1 == harness && $2 == alias { print $3; exit }
         ' "$aliases_file")"
@@ -1210,7 +1251,7 @@ resolve_model() {
         fi
     fi
 
-    case "$harness" in
+    case "$resolve_harness" in
         claude|pi|pi-local)
             return 0
             ;;
@@ -1272,15 +1313,24 @@ resolve_model() {
     esac
 }
 
-resolve_model model "$model_given" || exit 1
+resolve_model model "$model_given" "$harness" || exit 1
 
 review_model_given=false
 [[ -n "$review_model" ]] && review_model_given=true
-resolve_model review_model "$review_model_given" || exit 1
+# Against the review harness when one was given -- its aliases and codex
+# cache are its own, not the implement harness's -- and against the
+# implement harness otherwise, exactly as before --review-harness existed.
+resolve_model review_model "$review_model_given" "${review_harness:-$harness}" || exit 1
 
 if [[ "$harness" == "pi" && -z "$model" ]]; then
     echo "Error: --harness pi needs --model. There is no default: the model" >&2
     echo "is an OpenRouter id, such as moonshotai/kimi-k3." >&2
+    exit 1
+fi
+if [[ "$review_harness_given" == true && "$review_harness" == "pi" && -z "$review_model" ]]; then
+    echo "Error: --review-harness pi needs a model, either in the combined" >&2
+    echo "harness/model form (--review-harness pi/moonshotai/kimi-k3) or via" >&2
+    echo "--review-model. There is no default." >&2
     exit 1
 fi
 
@@ -1380,6 +1430,12 @@ if [[ "$k8s_mode" == true ]]; then
         echo "review leg has nowhere to be declared yet." >&2
         exit 1
     fi
+    if [[ "$review_harness_given" == true ]]; then
+        echo "Error: --review-harness is not supported with --k8s. Not yet" >&2
+        echo "supported -- the pod runs pi against the model proxy and nothing" >&2
+        echo "else, so a second harness has nowhere to run." >&2
+        exit 1
+    fi
     if [[ "$refresh_at_given" == true ]]; then
         echo "Error: --refresh-at is not supported with --k8s. It is measured by" >&2
         echo "a hook fork-sandbox-inbox-hook.sh installs into the local" >&2
@@ -1449,6 +1505,32 @@ fi
 if [[ -n "$review_model" && "$review_loop_cap" == "0" ]]; then
     echo "Error: --review-model only applies to review legs and requires" >&2
     echo "--review-loop." >&2
+    exit 1
+fi
+if [[ "$review_harness_given" == true && "$review_loop_cap" == "0" ]]; then
+    echo "Error: --review-harness only applies to review legs and requires" >&2
+    echo "--review-loop." >&2
+    exit 1
+fi
+
+# --harness pi-local is sealed: no network at all, which is the property a
+# caller picks it for. If its review legs ran under a networked harness,
+# the same clone's contents -- the code a sealed run was chosen to keep
+# local -- would go to that harness's model provider, silently defeating
+# the seal. Refuse the combination by name, the same way this script
+# refuses every other combination that would quietly widen what a sandbox
+# can reach, rather than honor it and let the seal's whole point leak out
+# through a flag nobody thought to cross-check. The reverse is fine: a
+# networked implement harness reviewed by --review-harness pi-local adds
+# no exposure the run did not already have.
+if [[ "$review_harness_given" == true && "$harness" == "pi-local" \
+    && "$review_harness" != "pi-local" ]]; then
+    echo "Error: --harness pi-local seals this run -- no network at all -- and" >&2
+    echo "--review-harness $review_harness is networked. Its review leg would" >&2
+    echo "send the clone's contents to $review_harness's model provider," >&2
+    echo "defeating the seal this run was chosen for. If a networked second" >&2
+    echo "opinion is genuinely wanted, run it as a separate fork-sandbox.sh" >&2
+    echo "invocation against the branch this run returns." >&2
     exit 1
 fi
 
@@ -1523,7 +1605,7 @@ fi
 # generated-runner value still runs below; this is the same check applied
 # early to dry-run's own subject, so a model the real run refuses cannot get
 # a green light here first.
-fs_reject_unsafe_chars "$model" "$review_model" || exit 1
+fs_reject_unsafe_chars "$model" "$review_model" "$review_harness" || exit 1
 
 # --- Prompt overlay -------------------------------------------------------
 # A machine-local directory of prompt fragments, layered onto each generated
@@ -1668,6 +1750,7 @@ fi
 if [[ "$dry_run" == true ]]; then
     printf 'harness=%s\nmodel=%s\n' "$harness" "$model"
     [[ -z "$review_model" ]] || printf 'review_model=%s\n' "$review_model"
+    [[ "$review_harness_given" != true ]] || printf 'review_harness=%s\n' "$review_harness"
     printf 'prompt_overlay_dir=%s\n' "$prompt_overlay_dir"
     for prompt_overlay_leg in "${prompt_overlay_legs[@]}"; do
         prompt_overlay_leg_csv="${prompt_overlay_fragments[$prompt_overlay_leg]:-}"
