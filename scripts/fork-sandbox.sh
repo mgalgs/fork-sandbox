@@ -2352,11 +2352,24 @@ fs_resolve_harness "$harness" "$model" impl
     usage_source="$impl_usage_source"
 }
 
+# --review-harness resolves a second time here, before anything is
+# created, for the same reason the implement harness resolves above: a
+# missing credential or binary fails now, in one message, rather than an
+# hour into the run when the first review leg starts and finds its
+# OpenRouter key or its codex login missing. Without this, an
+# implement-pi + review-claude run would do the whole (possibly
+# expensive) coding leg, then die at the very first review leg with
+# nothing to show for it -- precisely the failure "fail before the clone"
+# exists to prevent for the implement harness alone.
+if [[ "$review_harness_given" == true ]]; then
+    fs_resolve_harness "$review_harness" "$review_model" rev
+fi
+
 # Check every value that goes into the generated runner or the run record
 # before anything is created, so a bad name cannot leave a clone behind on
 # the way out.
 fs_reject_unsafe_chars "$project_path" "$handoff_file" "$branch" "$checkout_ref" \
-    "$model" "$review_model" "$claude_extra_args" "$sandbox_args"
+    "$model" "$review_model" "$review_harness" "$claude_extra_args" "$sandbox_args"
 
 # --task-meta never enters the generated runner -- it is written straight to
 # a file in the run dir -- so the check it needs is JSON validity, not shell
@@ -2638,12 +2651,20 @@ for skill_name in commit-then-review code-review-portable; do
     fs_reject_unsafe_chars "$skill_dir"
     review_kit_flags+=(--bind-ro "$skill_dir")
     [[ "$skill_name" == "code-review-portable" ]] && review_skill_dir="$skill_dir"
-    # Written into "impl_harness_cmd" directly (the array
-    # fs_resolve_harness left behind for the implement harness), not a
-    # bare "harness_cmd" -- fs_build_sandbox_cmd reads the prefixed array,
-    # and there is no bare one to read any more.
+    # Written into "impl_harness_cmd" (and "rev_harness_cmd", when
+    # --review-harness names its own pi/pi-local) directly -- the arrays
+    # fs_resolve_harness left behind for each -- not a bare "harness_cmd":
+    # fs_build_sandbox_cmd reads the prefixed array, and there is no bare
+    # one to read any more. Checked independently per harness, since an
+    # implement/review pair can mix a pi-family harness with one that
+    # isn't: a pi-local implement reviewed by claude needs the skill flag
+    # on its own leg but not the other's, and the reverse just as much.
     if [[ "$harness" == "pi" || "$harness" == "pi-local" ]]; then
         impl_harness_cmd+=(--skill "$skill_dir")
+    fi
+    if [[ "$review_harness_given" == true \
+        && ( "$review_harness" == "pi" || "$review_harness" == "pi-local" ) ]]; then
+        rev_harness_cmd+=(--skill "$skill_dir")
     fi
 done
 if [[ -d "$HOME/.claude/scripts" ]]; then
@@ -2688,7 +2709,16 @@ fs_reject_unsafe_chars "$inbox_dir"
 # fork-sandbox-say.sh, which only ever generates a '<epoch>-<nn>.md' name.
 inbox_hook=""
 inbox_settings=""
-if [[ "$harness" == "claude" ]]; then
+# One hook and one settings file cover every claude leg this run has, not
+# just the implement one: --review-harness claude (with a non-claude
+# implement harness) still starts a claude session for its review leg, and
+# that leg needs the same delivery mechanism the implement leg would have
+# gotten. fs_build_sandbox_cmd only wires --settings/--include-hook-events
+# into a build whose OWN harness is claude, so creating these unconditionally
+# whenever either harness is claude, rather than only the implement one,
+# is what makes a claude review leg (implement pi, say) receive addenda at
+# all instead of running the "no hook" harness it happens not to be.
+if [[ "$harness" == "claude" || "$review_harness" == "claude" ]]; then
     inbox_hook_src="$script_dir/fork-sandbox-inbox-hook.sh"
     if [[ ! -r "$inbox_hook_src" ]]; then
         echo "Error: $inbox_hook_src is missing. It delivers operator addenda" >&2
@@ -2758,6 +2788,23 @@ handoff_copy="$run_dir/handoff.md"
 # at all), empty for every other local harness (unrestricted).
 preamble_network=""
 [[ "$harness" == "pi-local" ]] && preamble_network=sealed
+
+# The review leg's own preamble, separate from the implement/fix one above:
+# fs_emit_prompt_preamble's $harness argument decides whether the prompt
+# describes claude's automatic addendum push or the "you have to look"
+# instructions every other harness gets, and $network decides whether it
+# describes a sealed sandbox -- both are true facts about whichever harness
+# is ABOUT TO RUN that leg, not necessarily the implement harness. The fix
+# leg has no such split: it always stays on the implement harness (the
+# existing rule --review-model never changed), so its own preamble below
+# keeps reading $harness/$preamble_network directly.
+review_preamble_harness="$harness"
+review_preamble_network="$preamble_network"
+if [[ "$review_harness_given" == true ]]; then
+    review_preamble_harness="$review_harness"
+    review_preamble_network=""
+    [[ "$review_harness" == "pi-local" ]] && review_preamble_network=sealed
+fi
 
 # The model-specific layer, applied after every generated block above and
 # immediately before that leg's own task text: the environment blocks say
@@ -2838,7 +2885,8 @@ if (( review_loop_cap > 0 )); then
     fs_reject_unsafe_chars "$review_prompt" "$fix_prompt_header" \
         "$review_verdict_file" "$review_skill_dir"
     {
-        fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" "$harness" "$preamble_network"
+        fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" \
+            "$review_preamble_harness" "$review_preamble_network"
         fs_emit_prompt_overlay review
         fs_emit_review_prompt_body "$branch" "$base_sha" "$review_skill_dir" \
             "$review_verdict_file" "$inbox_dir"
@@ -3078,66 +3126,96 @@ fs_build_sandbox_cmd() {
     pi_session_dir="$impl_pi_session_dir"
 }
 
-# Review legs may use a stronger or independent model. Keep a distinct command
-# instead of mutating sandbox_cmd in the runner: fix legs deliberately stay on
-# the implementation model. The model flag sits in a different argv region for
-# each harness, so put it in the harness-specific legal position when absent.
-# "sandbox_cmd" was populated above by fs_build_sandbox_cmd's nameref, not by
-# a literal assignment shellcheck can see -- the same false positive as
-# fs_resolve_harness's "impl_*"/"rev_*" outputs.
-# shellcheck disable=SC2154
-review_sandbox_cmd=("${sandbox_cmd[@]}")
-if [[ -n "$review_model" ]]; then
-    if [[ "$harness" == "claude" ]]; then
-        # Last occurrence wins, including over one supplied in --claude-args.
-        review_sandbox_cmd+=(--model "$review_model")
-    elif [[ "$harness" == "pi-local" ]]; then
-        model_flag_i=-1
-        workdir_i=-1
-        for i in "${!review_sandbox_cmd[@]}"; do
-            if [[ "${review_sandbox_cmd[$i]}" == "$clone_dir" ]]; then
-                workdir_i="$i"
-                break
+# Review legs may use a stronger or independent model, or -- with
+# --review-harness -- a different harness entirely. A different harness
+# means a different wrapper, harness_flags and harness_cmd: there is
+# nothing in sandbox_cmd to patch, so that whole case is built fresh by
+# fs_build_sandbox_cmd from the "rev_*" state fs_resolve_harness resolved
+# above, exactly as sandbox_cmd itself was built from "impl_*". Without
+# --review-harness, review legs still run the implement harness, and the
+# original approach applies: keep a distinct command instead of mutating
+# sandbox_cmd in the runner (fix legs deliberately stay on the
+# implementation model), patching --review-model into whatever
+# harness-specific argv position is legal, since the model flag sits in a
+# different region for each harness.
+if [[ "$review_harness_given" == true ]]; then
+    # "rev_pi_session_dir" ends up set as a side effect (fs_build_sandbox_cmd
+    # writes it via its own nameref, same as it does "impl_pi_session_dir"
+    # above); nothing further to copy here since the per-leg accounting
+    # below reads "rev_pi_session_dir" directly, not a bare compat name.
+    fs_build_sandbox_cmd rev review_sandbox_cmd
+else
+    # "sandbox_cmd" was populated above by fs_build_sandbox_cmd's nameref,
+    # not by a literal assignment shellcheck can see -- the same false
+    # positive as fs_resolve_harness's "impl_*"/"rev_*" outputs.
+    # shellcheck disable=SC2154
+    review_sandbox_cmd=("${sandbox_cmd[@]}")
+    if [[ -n "$review_model" ]]; then
+        if [[ "$harness" == "claude" ]]; then
+            # Last occurrence wins, including over one supplied in --claude-args.
+            review_sandbox_cmd+=(--model "$review_model")
+        elif [[ "$harness" == "pi-local" ]]; then
+            model_flag_i=-1
+            workdir_i=-1
+            for i in "${!review_sandbox_cmd[@]}"; do
+                if [[ "${review_sandbox_cmd[$i]}" == "$clone_dir" ]]; then
+                    workdir_i="$i"
+                    break
+                fi
+                [[ "${review_sandbox_cmd[$i]}" == "--model" ]] && model_flag_i="$i"
+            done
+            if (( model_flag_i >= 0 )); then
+                review_sandbox_cmd[model_flag_i+1]="$review_model"
+            elif (( workdir_i >= 0 )); then
+                review_sandbox_cmd=("${review_sandbox_cmd[@]:0:workdir_i}" --model "$review_model" "${review_sandbox_cmd[@]:workdir_i}")
+            else
+                echo "Error: cannot place --review-model in the pi-local command:" >&2
+                echo "neither --model nor the clone directory was found in it." >&2
+                exit 1
             fi
-            [[ "${review_sandbox_cmd[$i]}" == "--model" ]] && model_flag_i="$i"
-        done
-        if (( model_flag_i >= 0 )); then
-            review_sandbox_cmd[model_flag_i+1]="$review_model"
-        elif (( workdir_i >= 0 )); then
-            review_sandbox_cmd=("${review_sandbox_cmd[@]:0:workdir_i}" --model "$review_model" "${review_sandbox_cmd[@]:workdir_i}")
+        elif [[ "$harness" == "codex" ]]; then
+            model_flag_i=-1
+            prompt_i=-1
+            for i in "${!review_sandbox_cmd[@]}"; do
+                if [[ "${review_sandbox_cmd[$i]}" == "-" ]]; then
+                    prompt_i="$i"
+                    break
+                fi
+                [[ "${review_sandbox_cmd[$i]}" == "--model" ]] && model_flag_i="$i"
+            done
+            if (( model_flag_i >= 0 )); then
+                review_sandbox_cmd[model_flag_i+1]="$review_model"
+            elif (( prompt_i >= 0 )); then
+                review_sandbox_cmd=("${review_sandbox_cmd[@]:0:prompt_i}" --model "$review_model" "${review_sandbox_cmd[@]:prompt_i}")
+            else
+                echo "Error: cannot place --review-model in the codex command:" >&2
+                echo "neither --model nor the '-' prompt marker was found in it." >&2
+                exit 1
+            fi
         else
-            echo "Error: cannot place --review-model in the pi-local command:" >&2
-            echo "neither --model nor the clone directory was found in it." >&2
-            exit 1
+            # OpenRouter pi always has this flag, immediately after its provider.
+            for i in "${!review_sandbox_cmd[@]}"; do
+                if [[ "${review_sandbox_cmd[$i]}" == "--provider" && "${review_sandbox_cmd[$((i+2))]:-}" == "--model" ]]; then
+                    review_sandbox_cmd[i+3]="$review_model"
+                    break
+                fi
+            done
         fi
-    elif [[ "$harness" == "codex" ]]; then
-        model_flag_i=-1
-        prompt_i=-1
-        for i in "${!review_sandbox_cmd[@]}"; do
-            if [[ "${review_sandbox_cmd[$i]}" == "-" ]]; then
-                prompt_i="$i"
-                break
-            fi
-            [[ "${review_sandbox_cmd[$i]}" == "--model" ]] && model_flag_i="$i"
-        done
-        if (( model_flag_i >= 0 )); then
-            review_sandbox_cmd[model_flag_i+1]="$review_model"
-        elif (( prompt_i >= 0 )); then
-            review_sandbox_cmd=("${review_sandbox_cmd[@]:0:prompt_i}" --model "$review_model" "${review_sandbox_cmd[@]:prompt_i}")
-        else
-            echo "Error: cannot place --review-model in the codex command:" >&2
-            echo "neither --model nor the '-' prompt marker was found in it." >&2
-            exit 1
-        fi
-    else
-        # OpenRouter pi always has this flag, immediately after its provider.
-        for i in "${!review_sandbox_cmd[@]}"; do
-            if [[ "${review_sandbox_cmd[$i]}" == "--provider" && "${review_sandbox_cmd[$((i+2))]:-}" == "--model" ]]; then
-                review_sandbox_cmd[i+3]="$review_model"
-                break
-            fi
-        done
     fi
+    # No --review-harness, so the review leg stays on the implement
+    # harness in every respect fs_resolve_harness would otherwise have
+    # resolved separately -- its session dir (there is only one clone, so
+    # only one "$clone_dir/.git/pi-session"), its usage reader, its
+    # formatter and its credential file. Falling back to the "impl_*"
+    # values here, rather than branching on review_harness_given again
+    # everywhere a leg's own accounting reads one of these, means the
+    # runner (below) and run_leg can always read "rev_*" for a review leg
+    # and get the right answer whether or not --review-harness was given.
+    rev_pi_session_dir="$impl_pi_session_dir"
+    rev_usage_source="$impl_usage_source"
+    rev_run_formatter="$impl_run_formatter"
+    rev_harness_env_file="$impl_harness_env_file"
+    rev_harness_version="$impl_harness_version"
 fi
 
 # tmux rewrites ':' and '.' in a session name without saying so, and a branch
@@ -3185,6 +3263,7 @@ started_at="$(date +%s)"
     printf 'harness_version=%s\n' "$harness_version"
     printf 'model=%s\n' "$model"
     printf 'review_model=%s\n' "$review_model"
+    printf 'review_harness=%s\n' "$review_harness"
     printf 'session=%s\n' "$session_name"
     printf 'review_loop_cap=%s\n' "$review_loop_cap"
     printf 'started_at=%s\n' "$started_at"
@@ -3236,8 +3315,19 @@ started_at="$(date +%s)"
     printf 'codex_auth_dir=%q\n' "${codex_auth_dir:-}"
     printf 'model=%q\n' "$model"
     printf 'review_model=%q\n' "$review_model"
+    printf 'review_harness=%q\n' "$review_harness"
+    # The review leg's own accounting state, so run_leg can read a leg's
+    # session dir, usage reader, formatter and credential file without
+    # knowing whether --review-harness was given -- see the "rev_*"
+    # fallback set above, right beside review_sandbox_cmd, for the case
+    # where it was not.
+    printf 'rev_usage_source=%q\n' "$rev_usage_source"
+    printf 'rev_formatter=%q\n' "$rev_run_formatter"
+    printf 'rev_harness_version=%q\n' "$rev_harness_version"
+    printf 'rev_harness_env_file=%q\n' "$rev_harness_env_file"
     printf 'started_at=%q\n' "$started_at"
     printf 'pi_session_dir=%q\n' "$pi_session_dir"
+    printf 'rev_pi_session_dir=%q\n' "$rev_pi_session_dir"
     printf 'review_loop_cap=%q\n' "$review_loop_cap"
     printf 'review_prompt=%q\n' "$review_prompt"
     printf 'fix_prompt_header=%q\n' "$fix_prompt_header"
@@ -3359,13 +3449,30 @@ run_cleanup() {
     fi
 }
 trap run_cleanup EXIT
-if [[ -n "$codex_auth_src" && -n "$harness_env_file" ]]; then
+if [[ "$harness" == "codex" && -n "$harness_env_file" ]]; then
     install -m 600 /dev/null "$harness_env_file"
     {
         printf 'CODEX_AUTH_JSON='
         jq -c '.tokens.refresh_token = "sandbox-placeholder-cannot-refresh"' \
             "$codex_auth_src"
     } > "$harness_env_file"
+fi
+# The review leg's own credential file, when --review-harness names its
+# own codex independently of the implement harness. review_harness is
+# empty without --review-harness, in which case rev_harness_env_file
+# already equals harness_env_file (fs_resolve_harness was never called a
+# second time -- see the "rev_*" fallback beside review_sandbox_cmd,
+# above) and the path-equality check below skips the duplicate write.
+review_codex_harness="$harness"
+[[ -n "$review_harness" ]] && review_codex_harness="$review_harness"
+if [[ "$review_codex_harness" == "codex" && -n "$rev_harness_env_file" \
+    && "$rev_harness_env_file" != "$harness_env_file" ]]; then
+    install -m 600 /dev/null "$rev_harness_env_file"
+    {
+        printf 'CODEX_AUTH_JSON='
+        jq -c '.tokens.refresh_token = "sandbox-placeholder-cannot-refresh"' \
+            "$codex_auth_src"
+    } > "$rev_harness_env_file"
 fi
 
 # Per-run services: stand them up before the session and point the project's
@@ -3920,6 +4027,7 @@ save_review_loop() {
     if jq -n \
         --argjson cap "$review_loop_cap" \
         --arg review_model "$review_model" \
+        --arg review_harness "$review_harness" \
         --arg ended "$review_loop_ended" \
         --arg detail "$review_loop_detail" \
         --argjson prev "$review_iters_done" \
@@ -3927,6 +4035,7 @@ save_review_loop() {
         '{
             cap: $cap,
             review_model: (if $review_model == "" then null else $review_model end),
+            review_harness: (if $review_harness == "" then null else $review_harness end),
             ended: (if $ended == "" then null else $ended end),
             detail: (if $detail == "" then null else $detail end),
             iterations: ($prev + $cur),
@@ -3958,7 +4067,22 @@ run_leg() {
     local leg_events="$run_dir/events-$kind-$n.jsonl"
     local leg_session="" leg_session_copy="" idx
     local -a cmd=("${sandbox_cmd[@]}")
-    [[ "$kind" == "review" ]] && cmd=("${review_sandbox_cmd[@]}")
+    # A review leg's own harness (--review-harness, when given -- the
+    # "rev_*" values, which fall back to the implement ones otherwise, see
+    # where they are set above) decides its accounting, not the implement
+    # harness's: a different harness means a different session-dir marker
+    # to substitute, a different usage reader, and a different formatter
+    # for its own output stream. A fix leg stays on the implement harness
+    # throughout, by the existing rule that --review-model never changed.
+    local leg_pi_session_dir="$pi_session_dir"
+    local leg_usage_source="$usage_source"
+    local leg_formatter="$formatter"
+    if [[ "$kind" == "review" ]]; then
+        cmd=("${review_sandbox_cmd[@]}")
+        leg_pi_session_dir="$rev_pi_session_dir"
+        leg_usage_source="$rev_usage_source"
+        leg_formatter="$rev_formatter"
+    fi
     leg_rc=1
     leg_cost=""
     leg_usage=""
@@ -3967,13 +4091,18 @@ run_leg() {
 
     # pi records its transcript, and the tokens with it, in a session
     # directory. Two legs must not share one, or the cost walk below bills
-    # each leg for every leg before it. The sandbox command is exact strings,
-    # so give this leg its own by substituting the one element that is the
-    # implement leg's session dir.
-    if [[ -n "$pi_session_dir" ]]; then
+    # each leg for every leg before it. The sandbox command is exact
+    # strings, so give this leg its own by substituting the one element
+    # that is this leg's harness's session dir -- the review harness's
+    # marker for a review leg, the implement harness's for anything else,
+    # so a review leg under an independent harness is not searched for a
+    # marker that was never in its own command in the first place, which
+    # would silently leave it sharing the implement leg's session
+    # directory and billing every leg for every leg before it.
+    if [[ -n "$leg_pi_session_dir" ]]; then
         leg_session="$clone_dir/.git/pi-session-$kind-$n"
         for idx in "${!cmd[@]}"; do
-            if [[ "${cmd[$idx]}" == "$pi_session_dir" ]]; then
+            if [[ "${cmd[$idx]}" == "$leg_pi_session_dir" ]]; then
                 cmd[$idx]="$leg_session"
             fi
         done
@@ -3983,11 +4112,11 @@ run_leg() {
     # The prompt is a FILE on stdin, never an argument -- see the implement
     # leg's redirect for why (MAX_ARG_STRLEN), and note that the fix prompt
     # carries verdict text of no fixed size.
-    if [[ -n "$formatter" ]]; then
+    if [[ -n "$leg_formatter" ]]; then
         "${cmd[@]}" < "$prompt" \
             2> >(tee -a "$sandbox_log" >&2) \
             | tee -a "$leg_events" \
-            | "$formatter"
+            | "$leg_formatter"
     else
         "${cmd[@]}" < "$prompt" \
             2> >(tee -a "$sandbox_log" >&2) \
@@ -4031,7 +4160,7 @@ run_leg() {
                               total_tokens: ([.[].totalTokens // empty] | add),
                             }
                           end' 2>/dev/null)"
-    elif [[ "$usage_source" == "codex" && -s "$leg_events" ]]; then
+    elif [[ "$leg_usage_source" == "codex" && -s "$leg_events" ]]; then
         # codex reports tokens and no price, so a codex leg has counts and a
         # null cost. cached_input_tokens is part of input_tokens here, which
         # is why total_tokens is not a sum of all three.
@@ -4049,9 +4178,9 @@ run_leg() {
                                  + ([.[].output_tokens // empty] | add)),
                 }
               end' "$leg_events" 2>/dev/null)"
-    elif [[ -n "$formatter" && -s "$leg_events" ]]; then
-        leg_cost="$("$formatter" --cost "$leg_events" 2>/dev/null)"
-        leg_usage="$("$formatter" --usage "$leg_events" 2>/dev/null)"
+    elif [[ -n "$leg_formatter" && -s "$leg_events" ]]; then
+        leg_cost="$("$leg_formatter" --cost "$leg_events" 2>/dev/null)"
+        leg_usage="$("$leg_formatter" --usage "$leg_events" 2>/dev/null)"
     fi
     [[ -n "$leg_usage" ]] || leg_usage=null
     if [[ ! "$leg_cost" =~ ^-?[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?$ ]]; then
