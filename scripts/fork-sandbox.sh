@@ -220,9 +220,10 @@
 # It costs what it looks like it costs: each continuation is another whole
 # session, at the same model's price. summary.json's `continuations` array
 # and `refresh` field say what happened — how many legs ran, each one's exit,
-# cost and usage, and how the chain ended (`none`, `empty-outbox`, `cap`, or
-# `no-handoff` for a nudged leg that never wrote one) — and `total_cost_usd`
-# folds every continuation in beside the review loop's own legs.
+# cost and usage, and how the chain ended (`none`, `empty-outbox`, `cap`,
+# `no-handoff` for a nudged leg that never wrote one, or `leg-error` for a
+# continuation that exited non-zero) — and `total_cost_usd` folds every
+# continuation in beside the review loop's own legs.
 #
 # claude only, for now. The threshold is measured in
 # fork-sandbox-inbox-hook.sh, which already runs on every tool call and reads
@@ -3411,6 +3412,16 @@ if [[ "$refresh_enabled" == "1" ]]; then
                 refresh_ended="cap"
                 break
             fi
+            # The hand-off is written by a session, so a symlink at that path
+            # is not a hand-off: refuse it rather than follow it out of the
+            # clone -- the same guard the review loop's verdict file gets.
+            if [[ -L "$outbox_dir/handoff.md" ]]; then
+                printf 'fork-sandbox: outbox handoff.md is a symlink; refusing it.\n' \
+                    >> "$sandbox_log"
+                rm -f -- "$outbox_dir/handoff.md" 2>/dev/null
+                refresh_ended="no-handoff"
+                break
+            fi
             # An oversized hand-off is refused rather than trusted -- moved
             # aside so it is not silently reconsidered on the next check, and
             # the run proceeds as if this leg had written nothing at all.
@@ -3422,11 +3433,33 @@ if [[ "$refresh_enabled" == "1" ]]; then
                 refresh_ended="no-handoff"
                 break
             fi
+            # An empty or dangling hand-off (wc -c failing on it falls back to
+            # 0, which passes the cap above) is refused the same way -- it
+            # would otherwise launch a whole continuation with nothing under
+            # "Read the hand-off as your task".
+            if [[ ! -s "$outbox_dir/handoff.md" ]]; then
+                printf 'fork-sandbox: outbox handoff.md is empty; refusing it.\n' \
+                    >> "$sandbox_log"
+                mv -f -- "$outbox_dir/handoff.md" "$run_dir/handoff-refused-empty.md" 2>/dev/null
+                refresh_ended="no-handoff"
+                break
+            fi
 
             refresh_leg_n=$(( refresh_leg_n + 1 ))
             leg_no=$(( refresh_leg_n + 1 ))
             record_name="handoff-$refresh_leg_n.md"
             mv -f -- "$outbox_dir/handoff.md" "$run_dir/$record_name"
+            # Guard the window between the checks above and this mv: what
+            # gets cat'd into the prompt below must be a plain file that
+            # actually landed in the run dir, never a symlink followed here.
+            if [[ -L "$run_dir/$record_name" || ! -f "$run_dir/$record_name" ]]; then
+                printf 'fork-sandbox: %s is not a regular file after the move; refusing it.\n' \
+                    "$record_name" >> "$sandbox_log"
+                rm -f -- "$run_dir/$record_name" 2>/dev/null
+                refresh_leg_n=$(( refresh_leg_n - 1 ))
+                refresh_ended="no-handoff"
+                break
+            fi
 
             cont_prompt="$run_dir/continuation-prompt-$refresh_leg_n.md"
             refresh_build_prompt "$leg_no" "$run_dir/$record_name" "$cont_prompt"
@@ -3487,7 +3520,17 @@ if [[ "$refresh_enabled" == "1" ]]; then
             [[ -n "$merged" ]] && continuations_json="$merged"
 
             if [[ "$rc" != "0" ]]; then
-                refresh_ended="empty-outbox"
+                # A crashed leg is not the ordinary ending: it gets its own
+                # terminal value rather than being folded into empty-outbox,
+                # which readers (including `stats --by refresh`) treat as
+                # success. A hand-off the leg managed to write just before
+                # dying is worth keeping as part of the record even though
+                # this run is not going to act on it.
+                if [[ -f "$outbox_dir/handoff.md" && ! -L "$outbox_dir/handoff.md" ]]; then
+                    mv -f -- "$outbox_dir/handoff.md" \
+                        "$run_dir/handoff-leg-$leg_no-after-error.md" 2>/dev/null
+                fi
+                refresh_ended="leg-error"
                 break
             fi
             continue

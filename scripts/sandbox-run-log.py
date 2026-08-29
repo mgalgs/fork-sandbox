@@ -65,8 +65,10 @@ claude harness):
                  or any harness but claude), `empty-outbox` (a coding leg
                  ended with no hand-off waiting -- the ordinary ending,
                  whether or not any continuation ran), `cap` (--refresh-max
-                 legs ran and a hand-off was still waiting), or `no-handoff`
-                 (a leg was nudged and ended its turn without writing one).
+                 legs ran and a hand-off was still waiting), `no-handoff`
+                 (a leg was nudged and ended its turn without writing one),
+                 or `leg-error` (a continuation leg exited non-zero -- a
+                 crash, not an ordinary ending; see `continuations[].exit`).
                  Present on every claude run made after this field existed,
                  even one that never came near its threshold -- readers
                  comparing against `none` do not also need to check for a

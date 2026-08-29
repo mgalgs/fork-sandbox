@@ -37,9 +37,37 @@ runs on the host needs to be more permissive than it already is.
 Both reasons collapse if the harness is unpinned. Pin the model on every
 launch — see **Choosing a harness and a model**.
 
+## Stay high level (the default; `--long`)
+
+High-level operation is the mode's default, not a special tier — learned
+from a real day of use:
+
+- **The orchestrating session reads to plan, then stops reading.** It does
+  not read the code a sandbox writes; it reads the run's five-line report,
+  the review verdicts, and the diffstat, and spot-checks only what executes
+  on the host (Makefile, package.json scripts, shell scripts, Dockerfile).
+- **Every handoff demands a five-line report** as the run's last message:
+  files touched, test result as `N ok / M fail`, one line per non-obvious
+  decision, what was left open, what the session is unsure of. Nothing else.
+- **The user's narrative outranks implementation detail.** When the user is
+  describing a world, a feel, a product, answer in that register — vision,
+  shape, the read of a screenshot, the two decisions that are the user's —
+  never file names and line numbers unless asked.
+- **Findings from a review are split by file ownership into fix rounds**;
+  this session never fixes them by hand, except the few-line case the
+  threshold already allows.
+- **Screenshots and shape summaries go to the user; heartbeats do not.** A
+  monitor event that changes nothing gets one line, or none.
+- **"Stay high level" only needs to be said once.** The mode does not need
+  to hear it again. "Exit sandbox coder mode" is the only thing that ends it.
+
+This posture is the mode's long form. `/sandbox-coder-mode --long` is the
+explicit spelling of it; it is also what plain `/sandbox-coder-mode` means.
+
 ## Entering the mode
 
-Tell the user, in one or two lines:
+Tell the user, in one or two lines, stating plainly that this session will
+stay high level:
 
 > Sandbox coder mode is on. I'll read, plan, review and integrate; the actual
 > editing goes to sandboxed runs on their own branches. Say "exit sandbox
@@ -61,16 +89,18 @@ this section describes what changes when it runs long.
 Tell the user, in one or two lines:
 
 > Sandbox coder mode is on, long-horizon. I'll run this as tiers: I plan,
-> review every diff line by line, and integrate; a cheap model does the
-> typing in the sandbox, with an optional in-sandbox reviewer ahead of me.
-> I'll report each round with its cost, and flag anything still unpushed.
+> stay high level, and integrate; a cheap model does the typing in the
+> sandbox, with an optional in-sandbox reviewer ahead of me. I'll report
+> each round with its cost, and flag anything still unpushed.
 
 **The tiers.** Three, and the distinction between them is the whole point:
 
 - **Tier 1 — orchestrator and reviewer.** The expensive model: this session.
-  It reads the code, decides the design, writes the handoffs, reviews every
-  returned diff line by line, integrates, and owns all host-side git (see
-  **What stays in this session**). It writes no project code.
+  It reads the code to decide the design, writes the handoffs, reviews each
+  round per **Stay high level** — the report, the verdicts, the diffstat,
+  and a spot-check of what executes on the host — integrates, and owns all
+  host-side git (see **What stays in this session**). It writes no project
+  code.
 - **Tier 2 — implementer.** The cheap model, in the sandbox. It types. Pin it
   explicitly on every launch — `--harness claude --model sonnet`, or a `pi` /
   `pi-local` harness — per **Choosing a harness and a model**.

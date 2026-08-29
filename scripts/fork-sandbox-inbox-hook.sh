@@ -139,14 +139,19 @@ list_unread() {
 list_unread
 
 # need_work also covers a leg that was already nudged but not yet reminded:
-# that case can only be resolved once we know whether THIS call is a Stop,
-# which needs the payload. A leg settles into the fully-silent fast path once
-# it is both nudged and reminded, or wrote a hand-off before ever reaching a
-# Stop that would have reminded it — see the recheck after the lock below.
+# that case can only be resolved for certain once we know whether THIS call
+# is a Stop, which needs the payload — but a hand-off already sitting in the
+# outbox settles it without one, and that check is a builtin, so it is worth
+# doing here rather than paying the payload read on every remaining tool call
+# of a leg that has already written its hand-off and moved on. A leg settles
+# into the fully-silent fast path once it is both nudged and reminded, or
+# once it has a hand-off waiting, whichever comes first.
 need_work=0
 (( ${#unread[@]} > 0 )) && need_work=1
 (( measure_usage )) && need_work=1
-[[ -n "$refresh_threshold" && "$nudged" == 1 && "$reminded" == 0 ]] && need_work=1
+if [[ -n "$refresh_threshold" && "$nudged" == 1 && "$reminded" == 0 ]]; then
+    [[ -z "$outbox_dir" || ! -f "$outbox_dir/handoff.md" ]] && need_work=1
+fi
 
 if (( ! need_work )); then
     # Nothing to say. Drain stdin first: Claude Code is still writing the hook
@@ -203,15 +208,18 @@ if (( measure_usage )); then
     fi
 fi
 
-# The Stop-only reminder: this leg was nudged (just now, or on an earlier
-# tool call), has not been reminded yet, and no hand-off has shown up in the
-# outbox. Checked only on Stop — a PostToolUse call gets the nudge itself
-# instead of the reminder, so a session mid-turn is never told twice in the
-# same breath.
+# The Stop-only reminder: this leg was nudged on an EARLIER tool call, has
+# not been reminded yet, and no hand-off has shown up in the outbox. Gated on
+# "$nudge_now" == 0 as well as "$nudged" == 1 so the first crossing of the
+# threshold -- when it happens to land on a Stop rather than a PostToolUse --
+# gets the nudge itself instead of the reminder; without that, "you were
+# already told on an earlier tool call" would go out on the very call that
+# told it, which is false, and the leg's one real reminder would be spent
+# before it ever had a chance to act on the nudge.
 handoff_missing=0
 if [[ ( "$event" == "Stop" || "$event" == "SubagentStop" ) \
     && -n "$refresh_threshold" && "$reminded" == 0 \
-    && ( "$nudged" == 1 || "$nudge_now" == 1 ) ]]; then
+    && "$nudged" == 1 && "$nudge_now" == 0 ]]; then
     if [[ -z "$outbox_dir" || ! -f "$outbox_dir/handoff.md" ]]; then
         handoff_missing=1
     fi

@@ -34,7 +34,7 @@ tmpdirs=()
 cleanup() {
     local d
     for d in "${tmpdirs[@]-}"; do
-        [[ -n "$d" && -d "$d" ]] && rm -rf -- "$d"
+        [[ -n "$d" && -e "$d" ]] && rm -rf -- "$d"
     done
 }
 trap cleanup EXIT
@@ -181,8 +181,9 @@ cat > "$stub_bin/claude-sandboxed" <<'STUB'
 # session's observable effect on the parts fork-sandbox.sh's outer refresh
 # loop reacts to. Which invocation this is (1 = implement leg, 2 = first
 # continuation, ...) comes from a counter file so a scenario can control each
-# leg independently; FAKE_NUDGE_LEGS and FAKE_HANDOFF_LEGS are comma lists of
-# leg numbers (or the literal "all"), read fresh per call.
+# leg independently; FAKE_NUDGE_LEGS, FAKE_HANDOFF_LEGS, FAKE_SYMLINK_LEGS
+# and FAKE_FAIL_LEGS are comma lists of leg numbers (or the literal "all"),
+# read fresh per call.
 set -uo pipefail
 
 outbox=""
@@ -201,14 +202,23 @@ printf '%s' "$n" > "$FAKE_CLAUDE_COUNT_FILE"
 
 nudge_legs=",${FAKE_NUDGE_LEGS:-},"
 handoff_legs=",${FAKE_HANDOFF_LEGS:-},"
+symlink_legs=",${FAKE_SYMLINK_LEGS:-},"
+fail_legs=",${FAKE_FAIL_LEGS:-},"
 
 if [[ "${FAKE_NUDGE_LEGS:-}" == "all" || "$nudge_legs" == *",$n,"* ]]; then
     printf '{"type":"system","subtype":"hook_response","stderr":"fork-sandbox-refresh: nudged (usage >= 1 tokens)\\n"}\n'
 fi
-if [[ "${FAKE_HANDOFF_LEGS:-}" == "all" || "$handoff_legs" == *",$n,"* ]]; then
+if [[ "${FAKE_SYMLINK_LEGS:-}" == "all" || "$symlink_legs" == *",$n,"* ]]; then
+    [[ -n "$outbox" ]] && ln -sf "${FAKE_SYMLINK_TARGET:-/etc/hostname}" "$outbox/handoff.md"
+elif [[ "${FAKE_HANDOFF_LEGS:-}" == "all" || "$handoff_legs" == *",$n,"* ]]; then
     if [[ -n "$outbox" ]]; then
         printf 'HANDOFF from leg %s\n' "$n" > "$outbox/handoff.md"
     fi
+fi
+
+if [[ "${FAKE_FAIL_LEGS:-}" == "all" || "$fail_legs" == *",$n,"* ]]; then
+    printf '{"type":"result","subtype":"error_during_execution","total_cost_usd":0.0,"usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}\n'
+    exit 1
 fi
 
 printf '{"type":"result","subtype":"success","total_cost_usd":0.01,"usage":{"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}\n'
@@ -237,7 +247,12 @@ run_real() {
     shift 4
     local handoff_dir handoff out rc rd
     handoff_dir="$(mktemp -d /var/tmp/claude-scratch/fs-refresh-handoff.XXXXXX)"
-    tmpdirs+=("$handoff_dir")
+    # Appending to tmpdirs here would land in this function's own frame, not
+    # the EXIT trap's array -- run_real is always called as a command
+    # substitution, which forks a subshell (see the new_inbox comment above).
+    # This dir is only needed for the launcher call below, so it is cleaned
+    # up on every return from this function instead of being registered.
+    trap 'rm -rf -- "$handoff_dir"' RETURN
     handoff="$handoff_dir/handoff.md"
     printf 'do the task\n' > "$handoff"
     : > "$count_file"
@@ -245,11 +260,18 @@ run_real() {
         FAKE_CLAUDE_COUNT_FILE="$count_file" \
         FAKE_NUDGE_LEGS="$nudge_legs" \
         FAKE_HANDOFF_LEGS="$handoff_legs" \
+        FAKE_SYMLINK_LEGS="${FAKE_SYMLINK_LEGS:-}" \
+        FAKE_SYMLINK_TARGET="${FAKE_SYMLINK_TARGET:-}" \
+        FAKE_FAIL_LEGS="${FAKE_FAIL_LEGS:-}" \
         timeout 60 "$launcher" --foreground --harness claude "$@" \
         "$proj" "$handoff" 2>&1)"
     rc=$?
     rd="$(printf '%s\n' "$out" | sed -n 's/^  run dir:  *//p' | head -1)"
-    if (( rc != 0 )) || [[ -z "$rd" ]]; then
+    # A non-zero $rc is not itself a failure of the harness under test here:
+    # the launcher's own exit mirrors a crashed leg's, which is exactly what
+    # the leg-error scenario means to produce. Only a missing run dir means
+    # this call never got far enough to be worth inspecting.
+    if [[ -z "$rd" ]]; then
         printf 'run_real failed (rc=%s):\n%s\n' "$rc" "$out" >&2
         return 1
     fi
@@ -335,6 +357,49 @@ if [[ -n "$rd" ]]; then
         "0" "$(jq '.continuations | length' "$rd/summary.json" 2>/dev/null)"
     check "a nudge with no hand-off logs no-handoff" \
         "no-handoff" "$(jq -r '.refresh' "$rd/summary.json" 2>/dev/null)"
+fi
+
+# -- a symlinked hand-off is refused, not followed: the leg is treated as
+# having written nothing, and the secret the symlink points at never reaches
+# any file this run produces (not the run-dir record, not the continuation
+# prompt a later leg would have read).
+secret_file="$(mktemp)"; tmpdirs+=("$secret_file")
+printf 'TOP SECRET CONTENT\n' > "$secret_file"
+count_file="$(mktemp)"; tmpdirs+=("$count_file")
+FAKE_SYMLINK_LEGS=1 FAKE_SYMLINK_TARGET="$secret_file"
+rd="$(run_real "$proj" "$count_file" 1 "" --refresh-at 0.5)"
+FAKE_SYMLINK_LEGS="" FAKE_SYMLINK_TARGET=""
+[[ -n "$rd" ]] && tmpdirs+=("$rd")
+if [[ -n "$rd" ]]; then
+    check "a symlinked hand-off: only one leg ran" "1" "$(cat "$count_file")"
+    check "a symlinked hand-off: no continuations" \
+        "0" "$(jq '.continuations | length' "$rd/summary.json" 2>/dev/null)"
+    check "a symlinked hand-off: refresh ends no-handoff, not followed" \
+        "no-handoff" "$(jq -r '.refresh' "$rd/summary.json" 2>/dev/null)"
+    if grep -rq 'TOP SECRET CONTENT' "$rd" 2>/dev/null; then
+        no "a symlinked hand-off: the secret never appears in the run dir"
+    else
+        ok "a symlinked hand-off: the secret never appears in the run dir"
+    fi
+fi
+
+# -- a continuation leg crashes: the chain reports leg-error rather than
+# empty-outbox (which readers, including `stats --by refresh`, treat as a
+# success), and a hand-off it wrote just before dying is recovered into the
+# run dir rather than left sitting unmoved in the outbox.
+count_file="$(mktemp)"; tmpdirs+=("$count_file")
+FAKE_FAIL_LEGS=2
+rd="$(run_real "$proj" "$count_file" 1 "1,2" --refresh-at 0.5)"
+FAKE_FAIL_LEGS=""
+[[ -n "$rd" ]] && tmpdirs+=("$rd")
+if [[ -n "$rd" ]]; then
+    check "a crashed continuation: two legs ran" "2" "$(cat "$count_file")"
+    check "a crashed continuation: refresh ends leg-error" \
+        "leg-error" "$(jq -r '.refresh' "$rd/summary.json" 2>/dev/null)"
+    check "a crashed continuation: its non-zero exit is recorded" \
+        "1" "$(jq -r '.continuations[0].exit' "$rd/summary.json" 2>/dev/null)"
+    check "a crashed continuation: its hand-off is recovered into the run dir" \
+        "HANDOFF from leg 2" "$(cat "$rd/handoff-leg-2-after-error.md" 2>/dev/null)"
 fi
 
 # -- --refresh-at 0: never nudges, never binds an outbox, so even a stub

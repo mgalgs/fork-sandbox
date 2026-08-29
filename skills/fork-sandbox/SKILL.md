@@ -142,10 +142,11 @@ reach it — see "What it gives up".)
    `summary.json`'s `continuations` array has one entry per leg that actually
    ran — exit, cost, usage, and which `handoff-N.md` its prompt was built
    from — and its `refresh` field says how the chain ended: `none`
-   (disabled), `empty-outbox` (the ordinary ending), `cap`, or `no-handoff`
+   (disabled), `empty-outbox` (the ordinary ending), `cap`, `no-handoff`
    (a leg was nudged and never wrote one — worth a look, since it means the
-   run may have run out of room mid-thought). `total_cost_usd` folds every
-   continuation in beside the review loop's own legs.
+   run may have run out of room mid-thought), or `leg-error` (a continuation
+   leg crashed — check that leg's `exit` in `continuations`). `total_cost_usd`
+   folds every continuation in beside the review loop's own legs.
 
    **Watching one is no different**, for the same reason a review loop
    isn't: the run counts as running until the last leg is done, so the
