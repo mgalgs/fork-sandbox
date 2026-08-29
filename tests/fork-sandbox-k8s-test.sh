@@ -101,6 +101,7 @@ entrypoint_sh="$repo_dir/scripts/fork-sandbox-k8s-entrypoint.sh"
 gate_sh="$repo_dir/scripts/fork-sandbox-k8s-egress-gate.sh"
 inbox_write_sh="$repo_dir/scripts/fork-sandbox-k8s-inbox-write.sh"
 review_loop_sh="$repo_dir/scripts/fork-sandbox-k8s-review-loop.sh"
+outbox_extract_sh="$repo_dir/scripts/fork-sandbox-k8s-outbox-extract.sh"
 
 # Sourced directly into this shell, not a subshell: ok()/no() below have to
 # reach the pass/fail counters this file reports at the end, and a subshell
@@ -119,7 +120,7 @@ printf '== shellcheck ==\n'
 if ! command -v shellcheck >/dev/null 2>&1; then
     printf '  SKIP  shellcheck not installed\n'
 else
-    for f in "$k8s_sh" "$platform_generic" "$entrypoint_sh" "$gate_sh" "$inbox_write_sh" "$review_loop_sh"; do
+    for f in "$k8s_sh" "$platform_generic" "$entrypoint_sh" "$gate_sh" "$inbox_write_sh" "$review_loop_sh" "$outbox_extract_sh"; do
         out="$(shellcheck "$f" 2>&1)"
         if [[ -z "$out" ]]; then ok "shellcheck: $(basename "$f")"; else no "shellcheck: $(basename "$f")" "$out"; fi
     done
@@ -520,6 +521,21 @@ else
     ok "rendered review prompt does not name the host project path"
 fi
 
+# Item: an empty outbox_dir argument (5th positional) omits the whole
+# "## Artifact outbox" section -- fs_emit_prompt_preamble is shared with the
+# local path, where a run genuinely has no outbox to point at is not a case
+# that currently arises (fork-sandbox.sh now always binds one), but the
+# function itself still has to degrade cleanly for any future caller that
+# passes "".
+no_outbox_preamble="$(fs_emit_prompt_preamble "$pod_clone_dir_expected" \
+    "$pod_inbox_dir_expected" pi gated "" pod)"
+if [[ "$no_outbox_preamble" != *'## Artifact outbox'* ]]; then
+    ok "fs_emit_prompt_preamble omits the outbox section when outbox_dir is empty"
+else
+    no "fs_emit_prompt_preamble omits the outbox section when outbox_dir is empty" \
+        "found '## Artifact outbox' despite an empty outbox_dir argument"
+fi
+
 # Item: --review-loop 0 and a non-numeric value are both rejected, before
 # any kubectl call -- --dry-run proves that, the same way it does for every
 # other flag-validation case in this file.
@@ -635,6 +651,136 @@ if [[ "$inbox_count" -eq 2 ]]; then
     ok "both addenda land in the inbox directory, nothing else"
 else
     no "both addenda land in the inbox directory, nothing else" "$(ls "$inbox_dir")"
+fi
+
+printf '\n== fork-sandbox-k8s-outbox-extract.sh: extraction guards (no cluster) ==\n'
+# This script is the actual security boundary for the outbox pull-back --
+# what stands between a hostile or confused pod's tar stream and the host
+# filesystem (see its own header comment for the full threat model). Driven
+# directly here against hand-built tar fixtures, the same way the
+# inbox-write.sh section above drives that script directly: no cluster, no
+# kubectl, no real pod involved.
+#
+# GNU tar sanitizes dangerous member names AT CREATION TIME by default (it
+# silently strips a leading `/` and a leading `../`), which is exactly the
+# opposite of what a fixture for this test needs -- so the absolute-path and
+# `..`-component fixtures below are built with `tar -P`/`--absolute-names`,
+# which preserves the member name as given. The warning tar prints to
+# stderr while doing that ("Removing leading...") is fixture-creation noise,
+# not a signal, so it is redirected away rather than asserted on.
+
+# well-formed: the shape `tar cf - -C /work/outbox .` on a real pod
+# produces -- relative entries, no `..`, no links. Must extract cleanly.
+of_src="$(newdir)"; tmpdirs+=("$of_src")
+mkdir -p "$of_src/sub"
+printf 'hello\n' > "$of_src/foo.txt"
+printf 'world\n' > "$of_src/sub/bar.txt"
+of_parent="$(newdir)"; tmpdirs+=("$of_parent")
+of_wf_tar="$of_parent/wf.tar"
+tar cf "$of_wf_tar" -C "$of_src" .
+of_wf_dest="$of_parent/wf_dest"
+if "$outbox_extract_sh" "$of_wf_tar" "$of_wf_dest" >/tmp/fs-k8s-outbox-wf.err 2>&1; then
+    ok "well-formed archive extracts"
+else
+    no "well-formed archive extracts" "$(cat /tmp/fs-k8s-outbox-wf.err)"
+fi
+if [[ "$(cat "$of_wf_dest/foo.txt" 2>/dev/null)" == "hello" \
+    && "$(cat "$of_wf_dest/sub/bar.txt" 2>/dev/null)" == "world" ]]; then
+    ok "well-formed archive's files land with their content intact"
+else
+    no "well-formed archive's files land with their content intact" \
+        "$(find "$of_wf_dest" 2>&1)"
+fi
+rm -f /tmp/fs-k8s-outbox-wf.err
+
+# absolute path: refused outright, whole archive, before anything is
+# extracted -- the dest directory must not even be created.
+of_abs_src="$(newdir)"; tmpdirs+=("$of_abs_src")
+mkdir -p "$of_abs_src/a"
+printf 'x\n' > "$of_abs_src/a/f.txt"
+of_abs_parent="$(newdir)"; tmpdirs+=("$of_abs_parent")
+of_abs_tar="$of_abs_parent/abs.tar"
+( cd "$of_abs_src" && tar -P -cf "$of_abs_tar" "$of_abs_src/a/f.txt" 2>/dev/null )
+of_abs_dest="$of_abs_parent/abs_dest"
+refuses "absolute path is refused" \
+    "contains an absolute path" \
+    "$outbox_extract_sh" "$of_abs_tar" "$of_abs_dest"
+if [[ ! -e "$of_abs_dest" ]]; then
+    ok "absolute-path archive: nothing is extracted"
+else
+    no "absolute-path archive: nothing is extracted" "$of_abs_dest exists"
+fi
+
+# `..` path component: same refuse-the-whole-archive treatment.
+of_dd_src="$(newdir)"; tmpdirs+=("$of_dd_src")
+mkdir -p "$of_dd_src/a"
+printf 'x\n' > "$of_dd_src/a/f.txt"
+of_dd_parent="$(newdir)"; tmpdirs+=("$of_dd_parent")
+of_dd_tar="$of_dd_parent/dd.tar"
+( cd "$of_dd_src" && tar -P -cf "$of_dd_tar" a/../a/f.txt 2>/dev/null )
+of_dd_dest="$of_dd_parent/dd_dest"
+refuses "a '..' path component is refused" \
+    "contains a '..' path component" \
+    "$outbox_extract_sh" "$of_dd_tar" "$of_dd_dest"
+if [[ ! -e "$of_dd_dest" ]]; then
+    ok "'..'-component archive: nothing is extracted"
+else
+    no "'..'-component archive: nothing is extracted" "$of_dd_dest exists"
+fi
+
+# symlink: refused as a link entry, listed and rejected before extraction
+# even starts -- this is the guard that closes the kubectl-cp-CVE-shaped
+# escape the script's header describes (a symlink entry followed by a
+# second entry that writes through it).
+of_sym_src="$(newdir)"; tmpdirs+=("$of_sym_src")
+ln -s /etc/passwd "$of_sym_src/evil"
+of_sym_parent="$(newdir)"; tmpdirs+=("$of_sym_parent")
+of_sym_tar="$of_sym_parent/sym.tar"
+tar cf "$of_sym_tar" -C "$of_sym_src" .
+of_sym_dest="$of_sym_parent/sym_dest"
+refuses "a symlink entry is refused" \
+    "contains a link entry" \
+    "$outbox_extract_sh" "$of_sym_tar" "$of_sym_dest"
+if [[ ! -e "$of_sym_dest" ]]; then
+    ok "symlink archive: nothing is extracted"
+else
+    no "symlink archive: nothing is extracted" "$of_sym_dest exists"
+fi
+
+# hard link: a distinct code path from the symlink check above (tar -tvf
+# marks a hard link with a leading 'h' and a trailing "link to TARGET",
+# not the 'l' mode a symlink gets), so it needs its own fixture.
+of_hl_src="$(newdir)"; tmpdirs+=("$of_hl_src")
+printf 'x\n' > "$of_hl_src/f.txt"
+ln "$of_hl_src/f.txt" "$of_hl_src/g.txt"
+of_hl_parent="$(newdir)"; tmpdirs+=("$of_hl_parent")
+of_hl_tar="$of_hl_parent/hl.tar"
+tar cf "$of_hl_tar" -C "$of_hl_src" .
+of_hl_dest="$of_hl_parent/hl_dest"
+refuses "a hard-link entry is refused" \
+    "contains a link entry" \
+    "$outbox_extract_sh" "$of_hl_tar" "$of_hl_dest"
+if [[ ! -e "$of_hl_dest" ]]; then
+    ok "hard-link archive: nothing is extracted"
+else
+    no "hard-link archive: nothing is extracted" "$of_hl_dest exists"
+fi
+
+# oversized: refused on the streaming byte-size cap, before tar -tvf is
+# even run over it.
+of_big_src="$(newdir)"; tmpdirs+=("$of_big_src")
+dd if=/dev/zero of="$of_big_src/big.bin" bs=1M count=65 2>/dev/null
+of_big_parent="$(newdir)"; tmpdirs+=("$of_big_parent")
+of_big_tar="$of_big_parent/big.tar"
+tar cf "$of_big_tar" -C "$of_big_src" .
+of_big_dest="$of_big_parent/big_dest"
+refuses "an over-cap archive is refused" \
+    "byte cap; refusing it" \
+    "$outbox_extract_sh" "$of_big_tar" "$of_big_dest"
+if [[ ! -e "$of_big_dest" ]]; then
+    ok "over-cap archive: nothing is extracted"
+else
+    no "over-cap archive: nothing is extracted" "$of_big_dest exists"
 fi
 
 # git disables the ext:: transport by default, so a push or fetch built
@@ -1080,6 +1226,10 @@ refuses "--keep without --k8s is refused" \
     "only apply with --k8s" \
     env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --dry-run \
     --keep unused-project unused-handoff
+refuses "--outbox-dir without --k8s is refused" \
+    "only apply with --k8s" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --dry-run \
+    --outbox-dir /tmp/fs-k8s-flag-test-outbox unused-project unused-handoff
 
 refuses "--k8s refuses a handoff outside the scratch dir" \
     "must live under /var/tmp/claude-scratch" \
@@ -1158,6 +1308,21 @@ else
     no "--k8s accepts --timeout and --keep" "$(cat /tmp/fs-k8s-flag-test-timeout.err)"
 fi
 rm -f /tmp/fs-k8s-flag-test-timeout.err
+
+# --outbox-dir is likewise accepted with --k8s and threaded through to
+# fork-sandbox-k8s.sh run (--dry-run never reaches the pull-back step it
+# configures, but the flag must not be refused as unknown on either leg of
+# the dispatch).
+if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
+    --harness pi --model moonshotai/kimi-k3 --outbox-dir /tmp/fs-k8s-flag-test-outbox \
+    --branch fs-k8s-flag-test-branch3 \
+    "$k8s_flag_proj" "$k8s_flag_handoff" \
+    > /dev/null 2>/tmp/fs-k8s-flag-test-outboxdir.err; then
+    ok "--k8s accepts --outbox-dir"
+else
+    no "--k8s accepts --outbox-dir" "$(cat /tmp/fs-k8s-flag-test-outboxdir.err)"
+fi
+rm -f /tmp/fs-k8s-flag-test-outboxdir.err
 
 printf '\n== no private-hostname shape anywhere in the repo ==\n'
 # Guards the public-repo leak rule (see the fork-sandbox-k8s.sh header): no
