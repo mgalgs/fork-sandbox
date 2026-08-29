@@ -82,6 +82,38 @@ fs_require_gnu_tools() {
 # shellcheck disable=SC2034  # written here, read by the sourcing scripts
 FS_OUTBOX_MAX_BYTES=$((64 * 1024 * 1024))   # 64 MiB
 
+# Parses a --outbox-max argument into a byte count on stdout: bare digits
+# mean bytes, and a K/M/G suffix means that many KiB/MiB/GiB, consistent
+# with the 1024-based arithmetic FS_OUTBOX_MAX_BYTES above already uses.
+# Rejects everything else -- decimals, negatives, a bare suffix, empty, and
+# 0 (with or without a suffix), all with a message naming what was given --
+# so a typo is caught here, before --outbox-max's caller creates anything,
+# rather than surfacing later as a cap silently equal to 0.
+fs_parse_size_bytes() {
+    local input="$1" digits suffix
+    if [[ "$input" =~ ^([0-9]+)([KkMmGg])$ ]]; then
+        digits="${BASH_REMATCH[1]}"
+        suffix="${BASH_REMATCH[2]}"
+    elif [[ "$input" =~ ^[0-9]+$ ]]; then
+        digits="$input"
+        suffix=""
+    else
+        echo "Error: invalid size '$input' -- expected a byte count or a" >&2
+        echo "number followed by K, M or G, e.g. 512K, 256M, 2G, 1048576" >&2
+        return 1
+    fi
+    if (( 10#$digits == 0 )); then
+        echo "Error: size '$input' must be greater than zero" >&2
+        return 1
+    fi
+    case "$suffix" in
+        K|k) echo $(( 10#$digits * 1024 )) ;;
+        M|m) echo $(( 10#$digits * 1024 * 1024 )) ;;
+        G|g) echo $(( 10#$digits * 1024 * 1024 * 1024 )) ;;
+        *)   echo $(( 10#$digits )) ;;
+    esac
+}
+
 # claude-sandboxed must exist before anything is created. Resolve it here
 # rather than let it fail inside a tmux pane: the pane closes when its
 # command exits, so the error would flash past and the fork would look like

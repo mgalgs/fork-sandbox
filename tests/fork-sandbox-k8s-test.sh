@@ -1078,6 +1078,42 @@ else
 fi
 rm -f "$err"
 
+printf '\n== fs_parse_size_bytes (fork-sandbox-lib.sh) ==\n'
+# Unit-level, sourcing the lib directly -- the one place --outbox-max's
+# accepted units and rejections are defined, shared by fork-sandbox.sh and
+# fork-sandbox-k8s.sh below rather than each parsing it their own way.
+check "bare digits mean bytes" "12345" "$(fs_parse_size_bytes 12345)"
+check "K means KiB" "$((512 * 1024))" "$(fs_parse_size_bytes 512K)"
+check "a lowercase k also means KiB" "$((512 * 1024))" "$(fs_parse_size_bytes 512k)"
+check "M means MiB" "$((256 * 1024 * 1024))" "$(fs_parse_size_bytes 256M)"
+check "G means GiB" "$((2 * 1024 * 1024 * 1024))" "$(fs_parse_size_bytes 2G)"
+
+err_file="$(mktemp)"
+for bad in "" 0 0K -5 5.5M 5MB M garbage; do
+    if out="$(fs_parse_size_bytes "$bad" 2>"$err_file")"; then
+        no "'$bad' is rejected" "accepted, got '$out'"
+    else
+        ok "'$bad' is rejected"
+    fi
+done
+if fs_parse_size_bytes garbage 2>"$err_file"; then
+    no "a bad value's error names what was given"
+else
+    case "$(cat "$err_file")" in
+        *"'garbage'"*) ok "a bad value's error names what was given" ;;
+        *) no "a bad value's error names what was given" "$(cat "$err_file")" ;;
+    esac
+fi
+if fs_parse_size_bytes 0 2>"$err_file"; then
+    no "0 is rejected with a message naming it"
+else
+    case "$(cat "$err_file")" in
+        *"'0'"*) ok "0 is rejected with a message naming it" ;;
+        *) no "0 is rejected with a message naming it" "$(cat "$err_file")" ;;
+    esac
+fi
+rm -f "$err_file"
+
 printf '\n== fork-sandbox.sh --k8s (fixture config, no cluster) ==\n'
 # Real fixtures: unlike --dry-run's own local exit, fs_require_scratch_handoff
 # and fs_require_src_project run for every --k8s call, including a --dry-run
