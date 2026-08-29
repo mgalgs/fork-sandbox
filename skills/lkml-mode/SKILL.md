@@ -93,8 +93,13 @@ do not vary it round to round.
    per thread**, enforced by `lkml-mailbox.sh post` itself.
 4. **When `open` is empty**, or everything left open can only be moved by
    the author, run `lkml-revise.sh <series> --project <path> --checkout
-   <branch> --version <N>` to produce vN+1, then go back to step 2 with the
-   whole panel against the new version.
+   <branch> --version <N>` to produce vN+1. This posts vN+1 on a NEW branch,
+   `lkml/<series>-v<N+1>` -- lkml-revise.sh's own report names it. Go back
+   to step 2 with the whole panel checked out against THAT branch, not the
+   one you started this step with: a round launched with `--checkout
+   <branch>` still pointing at vN's branch reviews vN's code while being
+   handed vN+1's patches in its handoff, and every comment it produces is
+   against a version that has already been superseded.
 5. **Converged** when every patch in the current version has
    `Reviewed-by` or `Acked-by` from Linus AND from at least one other
    reviewer (`lkml-mailbox.sh tally`), no `NAK` stands unanswered, and

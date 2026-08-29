@@ -151,12 +151,42 @@ contains "tally: names the reviewing persona" "$tally_out" "linus"
 
 # A later NAK from the same reviewer supersedes the earlier Reviewed-by --
 # tally reports the LATEST tag per persona per patch, not every tag ever
-# applied.
+# applied. Asserting "NAK" merely appears somewhere in the whole tally
+# output would also pass if the superseded Reviewed-by were still counted
+# alongside it (both tags surviving would make convergence look stuck
+# forever, the exact bug this rule exists to prevent) -- so pull out
+# linus's own tally line for patch 1 and check it is EXACTLY "NAK".
 echo "actually this leaks the buffer on the error path" > nak.txt
 "$mailbox" post widget-frob --from linus --reply-to "${r2:0:7}" --file nak.txt \
     --tags NAK --harness claude --model opus >/dev/null 2>&1
 tally_out2="$("$mailbox" tally widget-frob --version 1)"
-contains "tally: a later NAK supersedes an earlier Reviewed-by" "$tally_out2" "NAK"
+# Scoped to the "Patch 1:" block specifically: patch 0 (the cover) rolls up
+# every descendant's tags too (it is the root of the whole tree), so a
+# bare "line starting with linus" grep over the whole tally would also
+# match linus's entry there and could see stale values from that rollup.
+linus_tag="$(printf '%s\n' "$tally_out2" | awk '/^Patch 1:/{f=1;next} /^Patch [0-9]+:/{f=0} f && $1=="linus"{print $2}')"
+check "tally: a later NAK supersedes an earlier Reviewed-by (not both)" "NAK" "$linus_tag"
+
+printf '\n== tally: direct replies to the cover ==\n'
+
+# A direct reply to the cover letter is depth 1, same as a real patch, and
+# its default subject is "Re: [PATCH v1 0/2] ..." -- which an unanchored
+# "patch number" regex would match as patch 0 and use to overwrite the
+# cover's own tally entry with the reply's id, silently dropping every
+# OTHER direct reply to the cover from the count.
+echo "the changelog checks out" > ack.txt
+"$mailbox" post widget-frob --from linus --reply-to "${cover_id:0:7}" --file ack.txt \
+    --tags Acked-by --harness claude --model opus >/dev/null 2>&1
+echo "please split patch 2 first" > cr.txt
+"$mailbox" post widget-frob --from security --reply-to "${cover_id:0:7}" --file cr.txt \
+    --tags Changes-requested --harness claude --model opus >/dev/null 2>&1
+
+tally_cover="$("$mailbox" tally widget-frob --version 1)"
+contains "tally: patch 0 is still the cover, not the reply that clobbered it" \
+    "$tally_cover" "Patch 0: (cover)"
+contains "tally: patch 0 shows linus's Acked-by" "$tally_cover" "Acked-by"
+contains "tally: patch 0 also shows security's Changes-requested (not dropped)" \
+    "$tally_cover" "Changes-requested"
 
 printf '\n== depth cap ==\n'
 

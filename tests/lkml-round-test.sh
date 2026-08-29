@@ -7,11 +7,11 @@
 #
 # No sandbox, no bwrap, no real agent: the stub fork-sandbox.sh captures its
 # own --task-meta, fabricates a run directory with a clone_dir already
-# holding .lkml-out/*.msg replies, marks itself finished immediately (so
+# holding .lkml-out/*.msg replies, writes summary.json immediately (so
 # lkml-round.sh's wait loop never actually sleeps), and prints the same
 # "  run dir:  <path>" line the real launcher does. What is under test is
 # entirely lkml-round.sh's own logic: parsing that line, waiting for
-# exit-code, harvesting .lkml-out files, and posting them through
+# summary.json, harvesting .lkml-out files, and posting them through
 # lkml-mailbox.sh with the launching persona's own attribution.
 
 set -uo pipefail
@@ -57,13 +57,19 @@ printf 'Subject: [PATCH 1/1] frob: add core\n\ndiff\n' > patches/0001.patch
 "$mailbox" init widget-frob --cover cover.txt --patches patches --from author \
     --harness claude --model opus >/dev/null 2>&1
 patch_id="$("$mailbox" tree widget-frob | awk 'NR==3{print $1}')"
+# The full, un-truncated id in RFC-822 form -- what a persona sees in
+# `Message-ID: <uuid@lkml.local>` when its handoff embeds `mailbox show`
+# output for a --reply-to round, and may reasonably copy verbatim into its
+# own In-Reply-To rather than the bare id `tree`/`show` display elsewhere.
+patch_id_bracketed="<$("$mailbox" show widget-frob "$patch_id" \
+    | sed -n 's/^Message-ID: <\(.*\)>$/\1/p')>"
 
 # The stub replaces fork-sandbox.sh entirely: no clone, no sandbox, no
 # network. It reads its own --task-meta (captured for the test to inspect),
 # fabricates a run directory holding a clone_dir with .lkml-out replies that
-# depend on which persona this launch was for, and marks itself finished
+# depend on which persona this launch was for, and writes summary.json
 # before it ever prints anything -- so lkml-round.sh's wait loop sees
-# exit-code on its very first check and never sleeps.
+# summary.json on its very first check and never sleeps.
 cat > "$stub_bin/fork-sandbox.sh" <<'STUB'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -92,7 +98,9 @@ case "$persona" in
             > "$clone_dir/.lkml-out/2.msg"
         ;;
     security)
-        printf 'In-Reply-To: %s\nX-Tags: Question\n\nWhat about the empty-input case?\n' "$STUB_REPLY_TO" \
+        # RFC-822 bracket form, not the bare id linus's reply above uses --
+        # exercises harvest_one's In-Reply-To stripping (lkml_round_strip_id).
+        printf 'In-Reply-To: %s\nX-Tags: Question\n\nWhat about the empty-input case?\n' "$STUB_REPLY_TO_BRACKETED" \
             > "$clone_dir/.lkml-out/1.msg"
         ;;
 esac
@@ -106,7 +114,7 @@ STUB
 chmod +x "$stub_bin/fork-sandbox.sh"
 
 out="$(PATH="$stub_bin:$PATH" STUB_CAPTURE_DIR="$capture_dir" STUB_RUN_PREFIX="$run_prefix_dir" \
-    STUB_REPLY_TO="$patch_id" \
+    STUB_REPLY_TO="$patch_id" STUB_REPLY_TO_BRACKETED="$patch_id_bracketed" \
     "$round" widget-frob --project /nonexistent/project --checkout somebranch \
     --personas linus,security --reply-to "$patch_id" 2>&1)"
 rc=$?
