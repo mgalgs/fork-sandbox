@@ -1,13 +1,25 @@
 #!/usr/bin/env bash
 # lkml-mailbox.sh — A Maildir-like message store for one lkml-mode series
 #
-# Usage: lkml-mailbox.sh init <series> --cover <file> --patches <dir> --from <persona> [--display <name>] [--version <n>] [--harness <h>] [--model <m>]
-#        lkml-mailbox.sh post <series> --from <persona> --reply-to <id> --file <file|-> [--display <name>] [--subject <s>] [--tags <t1,t2>] [--harness <h>] [--model <m>]
+# Usage: lkml-mailbox.sh init <series> --cover <file> --patches <dir> --from <persona> [--display <name>] [--version <n>] [--harness <h>] [--model <m>] [--attach <file>]...
+#        lkml-mailbox.sh post <series> --from <persona> --reply-to <id> --file <file|-> [--display <name>] [--subject <s>] [--tags <t1,t2>] [--harness <h>] [--model <m>] [--attach <file>]...
 #        lkml-mailbox.sh tree <series>
 #        lkml-mailbox.sh cover <series>
 #        lkml-mailbox.sh show <series> <id>
 #        lkml-mailbox.sh open <series> [--version <n>]
 #        lkml-mailbox.sh tally <series> --version <n>
+#
+# Attachments. --attach <file> may repeat on `init` (attaches to the cover
+# letter) or `post` (attaches to that one reply). Each file is copied into
+# <series>/attachments/<basename> and the message gets one
+# "X-Attachment: attachments/<basename>" header per file, alongside the
+# other X-* headers -- so `show`, which just cats the whole message file,
+# prints them as part of the header block it always printed, no special
+# rendering needed. `tree` marks any message carrying at least one
+# attachment with a trailing "📎" so a reader can tell at a glance that
+# there is something outside the text to go look at (e.g. a screenshot a
+# reviewer persona should look at, per the lkml-mode skill). Refused outright
+# over 4 MiB -- this is a message store, not a file server.
 #
 # One series lives under $LKML_MAILBOX_ROOT/<series>/cur/ (default
 # /var/tmp/claude-scratch/lkml/<series>/cur), one file per message, named
@@ -91,6 +103,7 @@
 set -euo pipefail
 
 LKML_ROOT="${LKML_MAILBOX_ROOT:-/var/tmp/claude-scratch/lkml}"
+LKML_ATTACH_MAX_BYTES=$(( 4 * 1024 * 1024 ))
 
 usage() {
     sed -n '2,/^set -euo/{ /^#/s/^# \?//p }' "$0"
@@ -192,10 +205,14 @@ lkml_validate_tags() {
 # "" for a top-level post); $4 is the FULL References value already
 # computed by the caller (or "" for a top-level post / a direct child of a
 # top-level post, whose References is just the parent's own Message-ID).
+# $14 is an optional comma-separated list of attachment basenames, already
+# copied into <series>/attachments/ by the caller -- this function only
+# writes the X-Attachment header per name, it does not touch the filesystem
+# beyond the message file itself.
 lkml_post_raw() {
     local series="$1" id="$2" parent_id="$3" references="$4" version="$5" depth="$6"
     local persona="$7" display_override="$8" harness="$9" model="${10}"
-    local subject="${11}" tags="${12}" body="${13}"
+    local subject="${11}" tags="${12}" body="${13}" attachments="${14:-}"
     local dir; dir="$(lkml_series_dir "$series")/cur"
     local display="${display_override:-$(lkml_default_display "$persona")}"
     local email="${persona}.ai@lkml.local"
@@ -218,6 +235,14 @@ lkml_post_raw() {
         printf 'X-Version: %s\n' "$version"
         printf 'X-Depth: %s\n' "$depth"
         printf 'X-Tags: %s\n' "$tags"
+        if [[ -n "$attachments" ]]; then
+            local _att_name
+            local -a _att_names=()
+            IFS=',' read -ra _att_names <<< "$attachments"
+            for _att_name in "${_att_names[@]}"; do
+                printf 'X-Attachment: attachments/%s\n' "$_att_name"
+            done
+        fi
         printf 'X-Seq: %s\n' "$(lkml_now_seq)"
         printf '\n'
         printf '%s\n' "$body"
@@ -225,19 +250,57 @@ lkml_post_raw() {
     mv -- "$tmp" "$dir/$id.msg"
 }
 
+# Validates and copies each --attach file into <series>/attachments/,
+# printing a comma-separated list of basenames on stdout for the caller to
+# hand to lkml_post_raw. Errors (missing file, over the size cap) abort the
+# whole post -- an attachment named on the command line that silently failed
+# to land would leave an X-Attachment header pointing at nothing.
+lkml_stage_attachments() {
+    local series="$1"; shift
+    local dir; dir="$(lkml_series_dir "$series")/attachments"
+    local -a names=()
+    local f base size
+    for f in "$@"; do
+        [[ -f "$f" ]] || { echo "Error: --attach file '$f' not found." >&2; return 1; }
+        size="$(wc -c < "$f" | tr -d '[:space:]')"
+        if (( size > LKML_ATTACH_MAX_BYTES )); then
+            echo "Error: --attach file '$f' is $size bytes, over the" >&2
+            echo "$LKML_ATTACH_MAX_BYTES byte (4 MiB) cap." >&2
+            return 1
+        fi
+        mkdir -p -- "$dir"
+        base="$(basename -- "$f")"
+        cp -f -- "$f" "$dir/$base"
+        names+=("$base")
+    done
+    (IFS=','; printf '%s' "${names[*]:-}")
+}
+
+# Counts how many header lines named $2 a message file $1 carries -- unlike
+# lkml_header, which returns only the first, this is for X-Attachment, which
+# may legitimately repeat once per attached file.
+lkml_count_header() {
+    local file="$1" name="$2" line count=0
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && break
+        [[ "$line" == "$name:"* ]] && count=$(( count + 1 ))
+    done < "$file"
+    printf '%s' "$count"
+}
+
 # Loads every message in a series into the parallel LKML_* arrays below,
 # indexed identically -- the same convention fork-sandbox.sh's configure
 # picker uses for its FS_CAND_* candidate table.
 LKML_ID=(); LKML_PARENT=(); LKML_DEPTH=(); LKML_VERSION=(); LKML_PERSONA=()
 LKML_HARNESS=(); LKML_MODEL=(); LKML_SUBJECT=(); LKML_TAGS=()
-LKML_SEQ=(); LKML_FILE=()
+LKML_SEQ=(); LKML_FILE=(); LKML_ATTACH=()
 
 lkml_load_series() {
     local series="$1" dir f id parent depth version persona harness model
-    local subject tags seq
+    local subject tags seq attach
     LKML_ID=(); LKML_PARENT=(); LKML_DEPTH=(); LKML_VERSION=(); LKML_PERSONA=()
     LKML_HARNESS=(); LKML_MODEL=(); LKML_SUBJECT=(); LKML_TAGS=()
-    LKML_SEQ=(); LKML_FILE=()
+    LKML_SEQ=(); LKML_FILE=(); LKML_ATTACH=()
     dir="$(lkml_series_dir "$series")/cur"
     [[ -d "$dir" ]] || return 0
     for f in "$dir"/*.msg; do
@@ -252,11 +315,12 @@ lkml_load_series() {
         subject="$(lkml_header "$f" Subject)"
         tags="$(lkml_header "$f" X-Tags)"
         seq="$(lkml_header "$f" X-Seq)"
+        attach="$(lkml_count_header "$f" X-Attachment)"
         [[ -n "$seq" ]] || seq=0
         LKML_ID+=("$id"); LKML_PARENT+=("$parent"); LKML_DEPTH+=("$depth")
         LKML_VERSION+=("$version"); LKML_PERSONA+=("$persona")
         LKML_HARNESS+=("$harness"); LKML_MODEL+=("$model"); LKML_SUBJECT+=("$subject")
-        LKML_TAGS+=("$tags"); LKML_SEQ+=("$seq"); LKML_FILE+=("$f")
+        LKML_TAGS+=("$tags"); LKML_SEQ+=("$seq"); LKML_FILE+=("$f"); LKML_ATTACH+=("$attach")
     done
 }
 
@@ -298,6 +362,7 @@ cmd_init() {
     local series="${1:?Usage: lkml-mailbox.sh init <series> --cover <file> --patches <dir> --from <persona>}"
     shift
     local cover="" patches="" from="" display="" version="" harness="unknown" model="unknown"
+    local -a attach_files=()
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --cover) cover="${2:?--cover requires a file}"; shift 2 ;;
@@ -307,6 +372,7 @@ cmd_init() {
             --version) version="${2:?--version requires a number}"; shift 2 ;;
             --harness) harness="${2:?--harness requires a value}"; shift 2 ;;
             --model) model="${2:?--model requires a value}"; shift 2 ;;
+            --attach) attach_files+=("${2:?--attach requires a file}"); shift 2 ;;
             -h|--help) usage; exit 0 ;;
             *) echo "Error: init: unknown option '$1'." >&2; return 1 ;;
         esac
@@ -345,13 +411,18 @@ cmd_init() {
         return 1
     fi
 
+    local attach_csv=""
+    if (( ${#attach_files[@]} > 0 )); then
+        attach_csv="$(lkml_stage_attachments "$series" "${attach_files[@]}")" || return 1
+    fi
+
     local cover_id cover_subject cover_body cover_first_line
     cover_id="$(lkml_new_uuid)"
     cover_first_line="$(head -n1 -- "$cover" | sed 's/[[:space:]]*$//')"
     cover_subject="[PATCH v$version 0/$m] $cover_first_line"
     cover_body="$(cat -- "$cover")"
     lkml_post_raw "$series" "$cover_id" "" "" "$version" 0 \
-        "$from" "$display" "$harness" "$model" "$cover_subject" "" "$cover_body"
+        "$from" "$display" "$harness" "$model" "$cover_subject" "" "$cover_body" "$attach_csv"
     echo "fork-sandbox lkml: posted cover ${cover_id:0:7} as v$version 0/$m" >&2
 
     local n=0 pf subj body id
@@ -372,6 +443,7 @@ cmd_post() {
     local series="${1:?Usage: lkml-mailbox.sh post <series> --from <persona> --reply-to <id> --file <file>}"
     shift
     local from="" display="" reply_to="" file="" subject_override="" tags="" harness="unknown" model="unknown"
+    local -a attach_files=()
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --from) from="${2:?--from requires a persona name}"; shift 2 ;;
@@ -382,6 +454,7 @@ cmd_post() {
             --tags) tags="${2:?--tags requires a comma-separated list}"; shift 2 ;;
             --harness) harness="${2:?--harness requires a value}"; shift 2 ;;
             --model) model="${2:?--model requires a value}"; shift 2 ;;
+            --attach) attach_files+=("${2:?--attach requires a file}"); shift 2 ;;
             -h|--help) usage; exit 0 ;;
             *) echo "Error: post: unknown option '$1'." >&2; return 1 ;;
         esac
@@ -394,6 +467,11 @@ cmd_post() {
     [[ -d "$dir/cur" ]] || { echo "Error: post: series '$series' does not exist. Run init first." >&2; return 1; }
 
     lkml_validate_tags "$tags" || return 1
+
+    local attach_csv=""
+    if (( ${#attach_files[@]} > 0 )); then
+        attach_csv="$(lkml_stage_attachments "$series" "${attach_files[@]}")" || return 1
+    fi
 
     lkml_load_series "$series"
     lkml_resolve_id "$reply_to" || return 1
@@ -439,19 +517,21 @@ cmd_post() {
 
     local id; id="$(lkml_new_uuid)"
     lkml_post_raw "$series" "$id" "$parent" "$newrefs" "$pversion" "$newdepth" \
-        "$from" "$display" "$harness" "$model" "$subject" "$tags" "$body"
+        "$from" "$display" "$harness" "$model" "$subject" "$tags" "$body" "$attach_csv"
     echo "fork-sandbox lkml: posted ${id:0:7} as reply to ${parent:0:7} (depth $newdepth)" >&2
     printf '%s\n' "$id"
 }
 
 lkml_tree_print() {
-    local id="$1" depth="$2" i indent tags
+    local id="$1" depth="$2" i indent tags attach_mark
     i="$(lkml_index_of "$id")" || return 0
     indent="$(printf '%*s' $(( depth * 2 )) '')"
     tags="${LKML_TAGS[$i]}"
     [[ -n "$tags" ]] || tags="-"
-    printf '%s%s  %-14s %-16s %-20s %s\n' "$indent" "${id:0:7}" \
-        "${LKML_PERSONA[$i]}" "(${LKML_HARNESS[$i]}/${LKML_MODEL[$i]})" "$tags" "${LKML_SUBJECT[$i]}"
+    attach_mark=""
+    [[ "${LKML_ATTACH[$i]:-0}" -gt 0 ]] && attach_mark=" 📎"
+    printf '%s%s  %-14s %-16s %-20s %s%s\n' "$indent" "${id:0:7}" \
+        "${LKML_PERSONA[$i]}" "(${LKML_HARNESS[$i]}/${LKML_MODEL[$i]})" "$tags" "${LKML_SUBJECT[$i]}" "$attach_mark"
     local -a child_idx=()
     local j
     for j in "${!LKML_PARENT[@]}"; do

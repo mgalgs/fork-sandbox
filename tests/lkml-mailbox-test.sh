@@ -280,5 +280,39 @@ else
     no "refuses --version 1 a second time" "it succeeded"
 fi
 
+printf '\n== attachments ==\n'
+
+printf 'a screenshot, pretend\n' > shot.png
+out="$("$mailbox" init widget-frob --cover cover.txt --patches patches --from author \
+    --harness claude --model opus --attach shot.png 2>diag.txt)"
+rc=$?
+check "init --attach exits 0" "0" "$rc"
+attach_cover_id="$out"
+check "the attachment is copied into <series>/attachments/" "1" \
+    "$(find "$LKML_MAILBOX_ROOT/widget-frob/attachments" -name 'shot.png' | wc -l)"
+
+raw_att="$("$mailbox" show widget-frob "${attach_cover_id:0:7}")"
+contains "show prints the X-Attachment header" "$raw_att" "X-Attachment: attachments/shot.png"
+
+tree_att="$("$mailbox" tree widget-frob)"
+contains "tree marks the attachment-carrying cover with 📎" \
+    "$(printf '%s\n' "$tree_att" | grep "${attach_cover_id:0:7}")" "📎"
+
+echo "see the attached log" > note.txt
+r_att="$("$mailbox" post widget-frob --from linus --reply-to "${attach_cover_id:0:7}" \
+    --file note.txt --attach shot.png --harness claude --model opus 2>diag.txt)"
+rc=$?
+check "post --attach exits 0" "0" "$rc"
+raw_reply_att="$("$mailbox" show widget-frob "${r_att:0:7}")"
+contains "a reply's attachment also gets an X-Attachment header" "$raw_reply_att" "X-Attachment: attachments/shot.png"
+
+big="$(mktemp)"; tmpdirs+=("$big")
+dd if=/dev/zero of="$big" bs=1M count=5 >/dev/null 2>&1
+out="$("$mailbox" post widget-frob --from linus --reply-to "${attach_cover_id:0:7}" \
+    --file note.txt --attach "$big" --harness claude --model opus 2>&1)"
+rc=$?
+if (( rc != 0 )); then ok "refuses an attachment over the 4 MiB cap"; else no "refuses an attachment over the 4 MiB cap" "it succeeded"; fi
+contains "the cap refusal names the byte cap" "$out" "4194304"
+
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 (( fail == 0 )) || exit 1
