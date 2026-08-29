@@ -485,8 +485,9 @@ pod_clone_dir_expected=/work/clone
 pod_inbox_dir_expected=/work/inbox
 pod_skill_dir_expected=/work/skills/code-review-portable
 pod_verdict_file_expected=/work/clone/.git/review-verdict.md
+pod_outbox_dir_expected=/work/outbox
 expected_rl_review_prompt="$({ fs_emit_prompt_preamble "$pod_clone_dir_expected" \
-        "$pod_inbox_dir_expected" pi gated pod
+        "$pod_inbox_dir_expected" pi gated "$pod_outbox_dir_expected" pod
     fs_emit_review_prompt_body fs-k8s-test-rl-branch "$proj_base_sha" \
         "$pod_skill_dir_expected" "$pod_verdict_file_expected" "$pod_inbox_dir_expected"
 })"
@@ -495,7 +496,7 @@ check "review-prompt.md renders byte-for-byte (preamble + body, no overlay)" \
     "$expected_rl_review_prompt" "$actual_rl_review_prompt"
 
 expected_rl_fix_header="$({ fs_emit_prompt_preamble "$pod_clone_dir_expected" \
-        "$pod_inbox_dir_expected" pi gated pod
+        "$pod_inbox_dir_expected" pi gated "$pod_outbox_dir_expected" pod
     fs_emit_fix_prompt_body fs-k8s-test-rl-branch "$proj_base_sha"
 })"
 actual_rl_fix_header="$(extract_configmap_key fix-prompt-header.md "$rl_submit_out")"

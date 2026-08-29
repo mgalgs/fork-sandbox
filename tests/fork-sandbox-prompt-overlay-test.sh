@@ -305,6 +305,21 @@ Addenda are pushed to you automatically — beside a tool result, or at the end
 of a turn — so you do not have to go looking. Reading the directory yourself is
 a backstop, not the mechanism.
 
+## Artifact outbox
+
+Files written here come back to the person who launched this run; everything
+else outside the clone is discarded when the sandbox is torn down. Its
+absolute path is:
+
+    $rd/outbox
+
+This is for artifacts a human will look at -- screenshots, reports,
+generated images, coverage output, anything that is not source. Source
+changes belong in commits, not here.
+
+**\`handoff.md\` at the root of this directory is reserved** for this run's
+own self-refresh protocol. Do not write anything named that.
+
 ---
 
 do the task
@@ -563,6 +578,21 @@ Addenda are pushed to you automatically — beside a tool result, or at the end
 of a turn — so you do not have to go looking. Reading the directory yourself is
 a backstop, not the mechanism.
 
+## Artifact outbox
+
+Files written here come back to the person who launched this run; everything
+else outside the clone is discarded when the sandbox is torn down. Its
+absolute path is:
+
+    $rd4/outbox
+
+This is for artifacts a human will look at -- screenshots, reports,
+generated images, coverage output, anything that is not source. Source
+changes belong in commits, not here.
+
+**\`handoff.md\` at the root of this directory is reserved** for this run's
+own self-refresh protocol. Do not write anything named that.
+
 ---
 
 # Your task: review this branch, and only review it
@@ -670,6 +700,21 @@ normal case, not a problem: most runs get no addenda at all.
 Addenda are pushed to you automatically — beside a tool result, or at the end
 of a turn — so you do not have to go looking. Reading the directory yourself is
 a backstop, not the mechanism.
+
+## Artifact outbox
+
+Files written here come back to the person who launched this run; everything
+else outside the clone is discarded when the sandbox is torn down. Its
+absolute path is:
+
+    $rd4/outbox
+
+This is for artifacts a human will look at -- screenshots, reports,
+generated images, coverage output, anything that is not source. Source
+changes belong in commits, not here.
+
+**\`handoff.md\` at the root of this directory is reserved** for this run's
+own self-refresh protocol. Do not write anything named that.
 
 ---
 
