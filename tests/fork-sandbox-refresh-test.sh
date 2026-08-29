@@ -1,0 +1,364 @@
+#!/usr/bin/env bash
+# fork-sandbox-refresh-test.sh — Exercise fork-sandbox.sh's --refresh-at
+#
+# Usage: tests/fork-sandbox-refresh-test.sh
+#
+# Two halves:
+#
+#   The hook's own threshold arithmetic, driven directly with fake hook JSON
+#   and a fixture transcript on stdin against a temp inbox -- the same style
+#   fork-sandbox-inbox-test.sh uses for the addendum half of this hook.
+#
+#   The outer loop, driven for real: fork-sandbox.sh --foreground with
+#   claude-sandboxed stubbed out (the fork-sandbox-prompt-overlay-test.sh
+#   style) so no bwrap/container backend is ever exercised. The stub bypasses
+#   the real claude CLI and its hook engine entirely and simulates their
+#   observable effect directly -- writing to the outbox, and emitting the
+#   hook's own stderr tag -- since a nudge's actual DECISION logic is already
+#   covered by the hook half above.
+#
+# This lives in tests/ rather than scripts/tests/ on purpose: install.sh
+# iterates scripts/* and runs `sed -n 2p` on each entry to build the Utilities
+# table, and a directory there makes that read fail under `set -e`.
+
+set -uo pipefail
+
+repo_dir="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+launcher="$repo_dir/scripts/fork-sandbox.sh"
+hook="$repo_dir/scripts/fork-sandbox-inbox-hook.sh"
+
+pass=0
+fail=0
+tmpdirs=()
+
+cleanup() {
+    local d
+    for d in "${tmpdirs[@]-}"; do
+        [[ -n "$d" && -d "$d" ]] && rm -rf -- "$d"
+    done
+}
+trap cleanup EXIT
+
+ok() { printf '  ok    %s\n' "$1"; pass=$(( pass + 1 )); }
+no() { printf '  FAIL  %s\n' "$1"; [[ -n "${2:-}" ]] && printf '        %s\n' "$2"; fail=$(( fail + 1 )); }
+
+check() {
+    local label="$1" expected="$2" actual="$3"
+    if [[ "$expected" == "$actual" ]]; then
+        ok "$label"
+    else
+        no "$label" "expected '$expected', got '$actual'"
+    fi
+}
+
+contains() {
+    local label="$1" needle="$2" hay="$3"
+    case "$hay" in
+        *"$needle"*) ok "$label" ;;
+        *) no "$label" "expected to find '$needle' in: $hay" ;;
+    esac
+}
+
+# $1 label  $2 path  $3 want ("yes" the file must exist, "no" it must not)
+marker() {
+    local label="$1" path="$2" want="$3" have="no"
+    [[ -f "$path" ]] && have="yes"
+    check "$label" "$want" "$have"
+}
+
+# =====================================================================
+printf '== fork-sandbox-inbox-hook.sh: the threshold arithmetic ==\n'
+# =====================================================================
+
+# Command substitution runs a function in its own subshell, so an append to
+# tmpdirs made INSIDE either of these would vanish with that subshell instead
+# of reaching the array the EXIT trap actually reads (the same gotcha
+# fork-sandbox-prompt-overlay-test.sh's new_project documents). Registering
+# the result is the CALLER's job here.
+new_inbox() {
+    mktemp -d
+}
+
+# A transcript in the shape the hook reads: the last line is an assistant
+# message carrying usage, the way Claude Code's own transcript does.
+new_transcript() {
+    local input="$1" cache_read="$2" cache_write="$3" dir f
+    dir="$(mktemp -d)"
+    f="$dir/transcript.jsonl"
+    printf '{"type":"user","message":{"role":"user","content":"hi"}}\n' > "$f"
+    printf '{"type":"assistant","message":{"role":"assistant","usage":{"input_tokens":%s,"cache_read_input_tokens":%s,"cache_creation_input_tokens":%s}}}\n' \
+        "$input" "$cache_read" "$cache_write" >> "$f"
+    printf '%s' "$f"
+}
+
+hook_run() {
+    # The env prefix has to sit directly on "$hook", the SECOND command of
+    # the pipe -- on jq, upstream of the pipe, it would only ever be seen by
+    # jq itself.
+    local inbox="$1" event="$2" transcript="$3"
+    jq -n --arg ev "$event" --arg t "$transcript" \
+        '{hook_event_name: $ev, transcript_path: $t}' \
+    | FORK_SANDBOX_INBOX="$inbox" \
+        FORK_SANDBOX_INBOX_SEEN="$inbox/../seen-$$" \
+        FORK_SANDBOX_NUDGE_MARKER="$nudge_marker" \
+        FORK_SANDBOX_NUDGE_REMINDED="$nudge_reminded" \
+        "$hook" 2>/dev/null
+}
+
+# Below the threshold: 100 total tokens against a 1000-token cap.
+inbox="$(new_inbox)"; tmpdirs+=("$inbox")
+printf 'THRESHOLD_TOKENS=1000\nOUTBOX_DIR=%s/outbox\n' "$inbox" > "$inbox/.refresh-config"
+mkdir -p "$inbox/outbox"
+nudge_marker="$(mktemp -u)"; nudge_reminded="$(mktemp -u)"
+tmpdirs+=("$nudge_marker" "$nudge_reminded")
+transcript="$(new_transcript 60 30 10)"; tmpdirs+=("$(dirname "$transcript")")
+out="$(hook_run "$inbox" PostToolUse "$transcript")"
+check "usage below threshold: no nudge" "" "$out"
+marker "usage below threshold: no marker written" "$nudge_marker" no
+
+# At the threshold: input + cache_read + cache_write sums to exactly 1000.
+inbox="$(new_inbox)"; tmpdirs+=("$inbox")
+printf 'THRESHOLD_TOKENS=1000\nOUTBOX_DIR=%s/outbox\n' "$inbox" > "$inbox/.refresh-config"
+mkdir -p "$inbox/outbox"
+nudge_marker="$(mktemp -u)"; nudge_reminded="$(mktemp -u)"
+tmpdirs+=("$nudge_marker" "$nudge_reminded")
+transcript="$(new_transcript 700 250 50)"; tmpdirs+=("$(dirname "$transcript")")
+out="$(hook_run "$inbox" PostToolUse "$transcript")"
+contains "usage at threshold: nudge fires as additionalContext" \
+    "this run refreshes itself" "$(printf '%s' "$out" | jq -r '.hookSpecificOutput.additionalContext // empty')"
+contains "the nudge names the outbox hand-off path" \
+    "$inbox/outbox/handoff.md" "$(printf '%s' "$out" | jq -r '.hookSpecificOutput.additionalContext // empty')"
+marker "the nudge marker is written" "$nudge_marker" yes
+
+# Delivered once: the marker means the next call, even well over threshold,
+# does not measure again or nudge again.
+out="$(hook_run "$inbox" PostToolUse "$transcript")"
+check "a nudged leg is not nudged twice" "" "$out"
+
+# The Stop reminder: nudged, no hand-off in the outbox yet.
+out="$(hook_run "$inbox" Stop "$transcript")"
+check "Stop after a nudge with no hand-off blocks" \
+    "block" "$(printf '%s' "$out" | jq -r '.decision')"
+contains "the reminder says it is the only one" \
+    "only reminder" "$(printf '%s' "$out" | jq -r '.reason')"
+marker "the reminder marker is written" "$nudge_reminded" yes
+
+# A leg must never be trapped: the next Stop lets it through.
+out="$(hook_run "$inbox" Stop "$transcript")"
+check "a second Stop is not blocked again" "" "$out"
+
+# Once a hand-off exists, Stop does not remind at all.
+inbox="$(new_inbox)"; tmpdirs+=("$inbox")
+printf 'THRESHOLD_TOKENS=1000\nOUTBOX_DIR=%s/outbox\n' "$inbox" > "$inbox/.refresh-config"
+mkdir -p "$inbox/outbox"
+nudge_marker="$(mktemp -u)"; nudge_reminded="$(mktemp -u)"
+tmpdirs+=("$nudge_marker" "$nudge_reminded")
+transcript="$(new_transcript 900 100 50)"; tmpdirs+=("$(dirname "$transcript")")
+hook_run "$inbox" PostToolUse "$transcript" >/dev/null
+printf 'the hand-off\n' > "$inbox/outbox/handoff.md"
+out="$(hook_run "$inbox" Stop "$transcript")"
+check "Stop with a hand-off already written does not block" "" "$out"
+
+# No refresh config at all: the mechanism is fully inert, and an addendum
+# still works exactly as it always did.
+inbox="$(new_inbox)"; tmpdirs+=("$inbox")
+printf 'do the other thing\n' > "$inbox/1724650001-01.md"
+nudge_marker="$(mktemp -u)"; nudge_reminded="$(mktemp -u)"
+tmpdirs+=("$nudge_marker" "$nudge_reminded")
+out="$(hook_run "$inbox" PostToolUse "/nonexistent/transcript.jsonl")"
+contains "with no refresh config, addenda still deliver" \
+    "do the other thing" "$out"
+
+# =====================================================================
+printf '\n== the outer loop: real fork-sandbox.sh runs, claude-sandboxed stubbed ==\n'
+# =====================================================================
+
+stub_bin="$(mktemp -d /var/tmp/claude-scratch/fs-refresh-stub.XXXXXX)"
+tmpdirs+=("$stub_bin")
+cat > "$stub_bin/claude-sandboxed" <<'STUB'
+#!/usr/bin/env bash
+# Fake claude-sandboxed: bypasses bwrap entirely and simulates a claude
+# session's observable effect on the parts fork-sandbox.sh's outer refresh
+# loop reacts to. Which invocation this is (1 = implement leg, 2 = first
+# continuation, ...) comes from a counter file so a scenario can control each
+# leg independently; FAKE_NUDGE_LEGS and FAKE_HANDOFF_LEGS are comma lists of
+# leg numbers (or the literal "all"), read fresh per call.
+set -uo pipefail
+
+outbox=""
+prev=""
+for a in "$@"; do
+    [[ "$prev" == "--bind-rw" ]] && outbox="$a"
+    prev="$a"
+done
+
+cat >/dev/null   # drain the prompt; its content is not needed by this stub
+
+n=0
+[[ -f "$FAKE_CLAUDE_COUNT_FILE" ]] && n="$(cat "$FAKE_CLAUDE_COUNT_FILE")"
+n=$(( n + 1 ))
+printf '%s' "$n" > "$FAKE_CLAUDE_COUNT_FILE"
+
+nudge_legs=",${FAKE_NUDGE_LEGS:-},"
+handoff_legs=",${FAKE_HANDOFF_LEGS:-},"
+
+if [[ "${FAKE_NUDGE_LEGS:-}" == "all" || "$nudge_legs" == *",$n,"* ]]; then
+    printf '{"type":"system","subtype":"hook_response","stderr":"fork-sandbox-refresh: nudged (usage >= 1 tokens)\\n"}\n'
+fi
+if [[ "${FAKE_HANDOFF_LEGS:-}" == "all" || "$handoff_legs" == *",$n,"* ]]; then
+    if [[ -n "$outbox" ]]; then
+        printf 'HANDOFF from leg %s\n' "$n" > "$outbox/handoff.md"
+    fi
+fi
+
+printf '{"type":"result","subtype":"success","total_cost_usd":0.01,"usage":{"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}\n'
+exit 0
+STUB
+chmod +x "$stub_bin/claude-sandboxed"
+
+new_project() {
+    local d
+    d="$(mktemp -d "$HOME/src/fs-refresh-test.XXXXXX")"
+    (
+        cd "$d" \
+            && git init -q . \
+            && git config user.email t@fork-sandbox.invalid \
+            && git config user.name Tester \
+            && printf 'hello\n' > file.txt \
+            && git add file.txt \
+            && git commit -q -m init
+    ) >/dev/null 2>&1
+    printf '%s' "$d"
+}
+
+# $1 project  $2 count-file  $3 nudge-legs  $4 handoff-legs  rest: extra launcher args
+run_real() {
+    local proj="$1" count_file="$2" nudge_legs="$3" handoff_legs="$4"
+    shift 4
+    local handoff_dir handoff out rc rd
+    handoff_dir="$(mktemp -d /var/tmp/claude-scratch/fs-refresh-handoff.XXXXXX)"
+    tmpdirs+=("$handoff_dir")
+    handoff="$handoff_dir/handoff.md"
+    printf 'do the task\n' > "$handoff"
+    : > "$count_file"
+    out="$(PATH="$stub_bin:$PATH" \
+        FAKE_CLAUDE_COUNT_FILE="$count_file" \
+        FAKE_NUDGE_LEGS="$nudge_legs" \
+        FAKE_HANDOFF_LEGS="$handoff_legs" \
+        timeout 60 "$launcher" --foreground --harness claude "$@" \
+        "$proj" "$handoff" 2>&1)"
+    rc=$?
+    rd="$(printf '%s\n' "$out" | sed -n 's/^  run dir:  *//p' | head -1)"
+    if (( rc != 0 )) || [[ -z "$rd" ]]; then
+        printf 'run_real failed (rc=%s):\n%s\n' "$rc" "$out" >&2
+        return 1
+    fi
+    printf '%s' "$rd"
+}
+
+proj="$(new_project)"; tmpdirs+=("$proj")
+
+# -- the happy path: leg 1 is nudged and writes a hand-off, leg 2 finishes
+# comfortably on its own. Two legs total, ended empty-outbox.
+count_file="$(mktemp)"; tmpdirs+=("$count_file")
+rd="$(run_real "$proj" "$count_file" 1 1 --refresh-at 0.5)"
+[[ -n "$rd" ]] && tmpdirs+=("$rd")
+if [[ -n "$rd" ]]; then
+    check "two legs ran (implement + one continuation)" \
+        "2" "$(cat "$count_file")"
+    check "handoff-1.md is the record" \
+        "HANDOFF from leg 1" "$(cat "$rd/handoff-1.md" 2>/dev/null)"
+    cont_prompt="$rd/continuation-prompt-1.md"
+    if [[ -f "$cont_prompt" ]]; then
+        ok "the continuation prompt file exists"
+        contains "leg 2's prompt carries the continuation line" \
+            "This is continuation 2 of a run that refreshed its context" \
+            "$(cat "$cont_prompt")"
+        contains "leg 2's prompt carries the hand-off text" \
+            "HANDOFF from leg 1" "$(cat "$cont_prompt")"
+    else
+        no "the continuation prompt file exists"
+        no "leg 2's prompt carries the continuation line"
+        no "leg 2's prompt carries the hand-off text"
+    fi
+    if [[ -f "$rd/summary.json" ]]; then
+        check "summary.json has one continuation" \
+            "1" "$(jq '.continuations | length' "$rd/summary.json")"
+        check "summary.json's refresh field is empty-outbox" \
+            "empty-outbox" "$(jq -r '.refresh' "$rd/summary.json")"
+        check "the continuation's leg number is 2" \
+            "2" "$(jq -r '.continuations[0].leg' "$rd/summary.json")"
+    else
+        no "summary.json has one continuation" "no summary.json"
+        no "summary.json's refresh field is empty-outbox" "no summary.json"
+        no "the continuation's leg number is 2" "no summary.json"
+    fi
+fi
+
+# -- --refresh-max 0: the implement leg is nudged and writes a hand-off, but
+# the cap is already exhausted, so no second leg ever runs.
+count_file="$(mktemp)"; tmpdirs+=("$count_file")
+rd="$(run_real "$proj" "$count_file" 1 1 --refresh-at 0.5 --refresh-max 0)"
+[[ -n "$rd" ]] && tmpdirs+=("$rd")
+if [[ -n "$rd" ]]; then
+    check "--refresh-max 0: only the implement leg ran" \
+        "1" "$(cat "$count_file")"
+    check "--refresh-max 0: summary.json has no continuations" \
+        "0" "$(jq '.continuations | length' "$rd/summary.json" 2>/dev/null)"
+    check "--refresh-max 0: refresh ended at the cap" \
+        "cap" "$(jq -r '.refresh' "$rd/summary.json" 2>/dev/null)"
+fi
+
+# -- a stub that always writes a hand-off: the loop stops at the default cap
+# (6), never running a 7th (uncapped) leg.
+count_file="$(mktemp)"; tmpdirs+=("$count_file")
+rd="$(run_real "$proj" "$count_file" all all --refresh-at 0.5)"
+[[ -n "$rd" ]] && tmpdirs+=("$rd")
+if [[ -n "$rd" ]]; then
+    check "an always-refreshing run stops at 7 legs (1 + 6 continuations)" \
+        "7" "$(cat "$count_file")"
+    check "summary.json has six continuations" \
+        "6" "$(jq '.continuations | length' "$rd/summary.json" 2>/dev/null)"
+    check "refresh ended at the cap" \
+        "cap" "$(jq -r '.refresh' "$rd/summary.json" 2>/dev/null)"
+fi
+
+# -- a nudge with no hand-off: the implement leg is nudged but never writes
+# to the outbox, so the chain never starts and says why.
+count_file="$(mktemp)"; tmpdirs+=("$count_file")
+rd="$(run_real "$proj" "$count_file" 1 "" --refresh-at 0.5)"
+[[ -n "$rd" ]] && tmpdirs+=("$rd")
+if [[ -n "$rd" ]]; then
+    check "a nudge with no hand-off: only one leg ran" \
+        "1" "$(cat "$count_file")"
+    check "a nudge with no hand-off: no continuations" \
+        "0" "$(jq '.continuations | length' "$rd/summary.json" 2>/dev/null)"
+    check "a nudge with no hand-off logs no-handoff" \
+        "no-handoff" "$(jq -r '.refresh' "$rd/summary.json" 2>/dev/null)"
+fi
+
+# -- --refresh-at 0: never nudges, never binds an outbox, so even a stub
+# willing to write one has nowhere to put it.
+count_file="$(mktemp)"; tmpdirs+=("$count_file")
+rd="$(run_real "$proj" "$count_file" all all --refresh-at 0)"
+[[ -n "$rd" ]] && tmpdirs+=("$rd")
+if [[ -n "$rd" ]]; then
+    check "--refresh-at 0: only one leg ran" "1" "$(cat "$count_file")"
+    check "--refresh-at 0: refresh field is none" \
+        "none" "$(jq -r '.refresh' "$rd/summary.json" 2>/dev/null)"
+    check "--refresh-at 0: no continuations" \
+        "0" "$(jq '.continuations | length' "$rd/summary.json" 2>/dev/null)"
+fi
+
+# -- harness refusal, no stub needed: fails during flag validation, before
+# any clone or run directory exists.
+if PATH="$stub_bin:$PATH" "$launcher" --harness pi --model demo/model \
+    --refresh-at 0.5 "$proj" "$repo_dir/README.md" >/dev/null 2>"$stub_bin/err"; then
+    no "--harness pi --refresh-at 0.5 is refused"
+else
+    contains "--harness pi --refresh-at 0.5 is refused" \
+        "only works with --harness claude" "$(cat "$stub_bin/err")"
+fi
+
+printf '\n%d passed, %d failed\n' "$pass" "$fail"
+(( fail == 0 ))
