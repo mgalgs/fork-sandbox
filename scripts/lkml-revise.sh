@@ -197,6 +197,12 @@ if (( rc != 0 )) || [[ -z "$run_dir" ]]; then
 fi
 echo "fork-sandbox lkml-revise: $run_dir" >&2
 
+# Same cost ledger lkml-round.sh appends to -- see its comment.
+ledger_root="${LKML_MAILBOX_ROOT:-/var/tmp/claude-scratch/lkml}"
+mkdir -p -- "$ledger_root/$series"
+jq -nc --arg persona "$author_persona" --arg run_dir "$run_dir" --arg kind implement \
+    '{persona:$persona, run_dir:$run_dir, kind:$kind}' >> "$ledger_root/$series/runs.jsonl"
+
 echo "fork-sandbox lkml-revise: waiting up to ${timeout}s..." >&2
 waited=0
 while [[ ! -f "$run_dir/summary.json" ]]; do

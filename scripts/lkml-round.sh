@@ -254,6 +254,15 @@ for persona in "${personas[@]}"; do
     harness_of["$persona"]="$harness"
     model_of["$persona"]="$model"
     display_of["$persona"]="$display"
+
+    # A cost ledger for lkml-status.sh, kept beside the mailbox rather than
+    # as an 8th mailbox verb: one JSON line per launched run, so cost can be
+    # summed later from each run's own summary.json without lkml-status.sh
+    # having to know how a run was launched.
+    ledger_root="${LKML_MAILBOX_ROOT:-/var/tmp/claude-scratch/lkml}"
+    mkdir -p -- "$ledger_root/$series"
+    jq -nc --arg persona "$persona" --arg run_dir "$run_dir" --arg kind review \
+        '{persona:$persona, run_dir:$run_dir, kind:$kind}' >> "$ledger_root/$series/runs.jsonl"
 done
 
 if (( ${#run_dir_of[@]} == 0 )); then
