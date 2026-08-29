@@ -138,6 +138,19 @@ fi
 command -v fork-sandbox.sh >/dev/null 2>&1 || { echo "Error: fork-sandbox.sh not found on PATH." >&2; exit 1; }
 command -v jq >/dev/null 2>&1 || { echo "Error: jq not found on PATH." >&2; exit 1; }
 
+# Resolved up front, before the persona launch below, so a bad --base
+# refuses in seconds instead of after an up-to-3600s run -- --base's only
+# other use is inside the handoff text itself (a ref name, never resolved
+# there), so nothing before this needs $real_repo.
+real_repo="$(git -C "$project" rev-parse --show-toplevel 2>/dev/null)" || {
+    echo "Error: '$project' is not inside a git repository." >&2
+    exit 1
+}
+git -C "$real_repo" rev-parse --verify --quiet "${base_ref}^{commit}" >/dev/null || {
+    echo "Error: --base '$base_ref' does not name a commit in $real_repo." >&2
+    exit 1
+}
+
 # Every path handed to the eventual `(cd "$real_repo" && "$mailbox" init
 # ...)` call must already be absolute, since that call changes directory
 # first -- resolved right after argument parsing, before anything else
@@ -309,8 +322,6 @@ if (( ${#attach_files[@]} > 0 )); then
     } >> "$completed_cover"
 fi
 
-real_repo="$(git -C "$project" rev-parse --show-toplevel)"
-
 init_args=(init "$series" --cover "$completed_cover" --patches "$patches_dir" \
     --from "$author_persona" --display "$display" --harness "$harness" --model "$model" \
     --diffstat "$base_ref..$checkout_ref")
@@ -321,8 +332,9 @@ for f in "${attach_files[@]}"; do
 done
 
 cover_id="$(cd "$real_repo" && "$mailbox" "${init_args[@]}")" || {
-    echo "Error: lkml-mailbox.sh init failed." >&2
-    rm -rf -- "$completed_dir"
+    echo "Error: lkml-mailbox.sh init failed. The cover letter it would have" >&2
+    echo "posted is still at $completed_cover (run dir: $run_dir, clone:" >&2
+    echo "$clone_dir) -- salvage it by hand." >&2
     exit 1
 }
 rm -rf -- "$completed_dir"

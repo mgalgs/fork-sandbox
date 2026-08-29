@@ -33,7 +33,11 @@
 # attachment with a trailing "📎" so a reader can tell at a glance that
 # there is something outside the text to go look at (e.g. a screenshot a
 # reviewer persona should look at, per the lkml-mode skill). Refused outright
-# over 4 MiB -- this is a message store, not a file server.
+# over 4 MiB -- this is a message store, not a file server. A basename that
+# already exists under attachments/ with DIFFERENT content is refused too --
+# the namespace is flat and keyed only on basename, so silently overwriting
+# it would leave an earlier message's X-Attachment header pointing at the
+# wrong file.
 #
 # One series lives under $LKML_MAILBOX_ROOT/<series>/cur/ (default
 # /var/tmp/claude-scratch/lkml/<series>/cur), one file per message, named
@@ -219,10 +223,12 @@ lkml_validate_tags() {
 # "" for a top-level post); $4 is the FULL References value already
 # computed by the caller (or "" for a top-level post / a direct child of a
 # top-level post, whose References is just the parent's own Message-ID).
-# $14 is an optional comma-separated list of attachment basenames, already
-# copied into <series>/attachments/ by the caller -- this function only
-# writes the X-Attachment header per name, it does not touch the filesystem
-# beyond the message file itself.
+# $14 is an optional '/'-separated list of attachment basenames (see
+# lkml_stage_attachments -- '/' rather than ',' since a basename may
+# contain a comma but never a '/'), already copied into
+# <series>/attachments/ by the caller -- this function only writes the
+# X-Attachment header per name, it does not touch the filesystem beyond the
+# message file itself.
 lkml_post_raw() {
     local series="$1" id="$2" parent_id="$3" references="$4" version="$5" depth="$6"
     local persona="$7" display_override="$8" harness="$9" model="${10}"
@@ -252,7 +258,7 @@ lkml_post_raw() {
         if [[ -n "$attachments" ]]; then
             local _att_name
             local -a _att_names=()
-            IFS=',' read -ra _att_names <<< "$attachments"
+            IFS='/' read -ra _att_names <<< "$attachments"
             for _att_name in "${_att_names[@]}"; do
                 printf 'X-Attachment: attachments/%s\n' "$_att_name"
             done
@@ -265,10 +271,14 @@ lkml_post_raw() {
 }
 
 # Validates and copies each --attach file into <series>/attachments/,
-# printing a comma-separated list of basenames on stdout for the caller to
-# hand to lkml_post_raw. Errors (missing file, over the size cap) abort the
-# whole post -- an attachment named on the command line that silently failed
-# to land would leave an X-Attachment header pointing at nothing.
+# printing a '/'-separated list of basenames on stdout for the caller to
+# hand to lkml_post_raw -- '/' rather than ',' because a basename can
+# legally contain a comma but, by construction of `basename`, never a '/'.
+# Errors (missing file, over the size cap, a basename collision with
+# different content already staged) abort the whole post -- an attachment
+# named on the command line that silently failed to land, or silently
+# overwrote another message's attachment, would leave an X-Attachment
+# header pointing at the wrong thing.
 lkml_stage_attachments() {
     local series="$1"; shift
     local dir; dir="$(lkml_series_dir "$series")/attachments"
@@ -284,10 +294,16 @@ lkml_stage_attachments() {
         fi
         mkdir -p -- "$dir"
         base="$(basename -- "$f")"
+        if [[ -e "$dir/$base" ]] && ! cmp -s -- "$f" "$dir/$base"; then
+            echo "Error: --attach '$f' would overwrite attachments/$base," >&2
+            echo "which already holds different content staged by an earlier" >&2
+            echo "message in this series. Rename the file and retry." >&2
+            return 1
+        fi
         cp -f -- "$f" "$dir/$base"
         names+=("$base")
     done
-    (IFS=','; printf '%s' "${names[*]:-}")
+    (IFS='/'; printf '%s' "${names[*]:-}")
 }
 
 # Counts how many header lines named $2 a message file $1 carries -- unlike

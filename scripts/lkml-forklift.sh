@@ -22,36 +22,48 @@
 # exists in --project.
 #
 # The fold is computed via plumbing, not `git cherry-pick`/`git rebase`,
-# because the version's branch is NOT based on --onto -- it is a series
-# reviewed on top of whatever --project looked like when lkml-series.sh (or
-# an earlier lkml-forklift.sh run) branched it off, which can be arbitrarily
-# far from --onto's current tip by the time review converges:
+# because the version's branch is NOT based on --onto's CURRENT tip -- it is
+# a series reviewed on top of whatever --project looked like when
+# lkml-series.sh (or an earlier lkml-forklift.sh run) branched it off, which
+# can be arbitrarily far from --onto's current tip by the time review
+# converges. Folding must therefore apply only the version's OWN delta (what
+# changed between where it forked and its own tip), not the whole
+# onto-vs-branch diff -- the latter would also include, in reverse, whatever
+# --onto picked up on its own since the fork point:
 #
-#   1. `git diff --binary <onto> <branch>` -- the WHOLE delta between the
-#      two trees, computed once, with binary support so this doesn't choke
-#      on non-text files.
-#   2. Read <onto>'s tree into a throwaway index (GIT_INDEX_FILE, never the
-#      real repo's own index) and apply that delta onto it with `git apply
-#      --check --cached` first -- refusing clearly ("the delta does not
-#      apply") if the two have diverged enough that the patch's context no
-#      longer matches, without leaving any half-applied state behind.
-#   3. On success: apply for real, write-tree, commit-tree with <onto>'s
-#      ORIGINAL commit as the sole parent, and move refs/heads/<onto> to the
-#      new commit with a compare-and-swap update-ref (so a concurrent
-#      mutation of <onto> between steps 1 and 3 is caught, not silently
-#      overwritten). If --project's HEAD is <onto>, also `reset --hard` the
-#      working tree to match -- this script does not push, and does not run
-#      the tests on the result; the operator does both by hand.
+#   1. `git merge-base <onto> <branch>` -- the commit the version's branch
+#      actually forked from, however far back that is.
+#   2. `git merge-tree --write-tree --merge-base=<that commit> <onto>
+#      <branch>` -- a real three-way merge of --onto's CURRENT tip with the
+#      version's tip, computed entirely in-memory (no index, no working
+#      tree touched). Exit 0 means a clean merge and its tree is the fold
+#      result; any change --onto picked up since the fork point survives
+#      alongside the version's own changes. Exit nonzero means the two
+#      genuinely conflict -- something --onto did since the fork point
+#      touches the same lines the version touched -- and this refuses
+#      outright ("has moved too far for a clean fold") with `git
+#      merge-tree`'s own conflict markers/messages, leaving nothing applied
+#      and moving no ref.
+#   3. On success: commit-tree the merged tree with <onto>'s ORIGINAL commit
+#      as the sole parent, and move refs/heads/<onto> to the new commit with
+#      a compare-and-swap update-ref (so a concurrent mutation of <onto>
+#      between steps 1 and 3 is caught, not silently overwritten). If
+#      --project's HEAD is <onto>, also `reset --hard` the working tree to
+#      match -- this script does not push, and does not run the tests on
+#      the result; the operator does both by hand.
 #
 # The commit message: a subject naming the series/version/onto, the
 # version's own cover letter's first line, `lkml-mailbox.sh tally --version
 # <n>` verbatim under a "Tally (vN):" heading, and -- for v2 and later -- a
 # "Changelog:" section concatenating every respin's own Changelog section
 # (v2..vN), each labelled "vK:", extracted from that version's cover letter
-# (case-insensitively matched "## Changelog" or similar; a cover with no
-# such heading contributes its whole body instead, with a warning on
-# stderr -- this script only ever WARNS about a missing changelog, it never
-# refuses over one).
+# (case-insensitively matched "## Changelog" or similar, up to but not
+# including the next heading line -- so a cover letter's own "## Diffstat"/
+# "## Test results" sections, appended by `lkml-mailbox.sh init
+# --diffstat`/`--smoke`, never get swallowed into the changelog; a cover
+# with no Changelog heading at all contributes its whole body instead, with
+# a warning on stderr -- this script only ever WARNS about a missing
+# changelog, it never refuses over one).
 
 set -uo pipefail
 
@@ -127,25 +139,22 @@ git -C "$real_repo" rev-parse --verify --quiet "${branch}^{commit}" >/dev/null |
 echo "fork-sandbox lkml-forklift: folding v$version ($branch) onto $onto..." >&2
 git -C "$real_repo" diff --stat "$onto" "$branch"
 
-tmp_index="$(mktemp)"
-patch_file="$(mktemp)"
-cleanup() { rm -f -- "$tmp_index" "$patch_file"; }
-trap cleanup EXIT
+fork_point="$(git -C "$real_repo" merge-base "$onto" "$branch")" || {
+    echo "Error: $onto and v$version's branch '$branch' share no common history." >&2
+    exit 1
+}
 
-git -C "$real_repo" diff --binary "$onto" "$branch" > "$patch_file"
-
-GIT_INDEX_FILE="$tmp_index" git -C "$real_repo" read-tree "$onto"
-apply_err="$(GIT_INDEX_FILE="$tmp_index" git -C "$real_repo" apply --check --cached "$patch_file" 2>&1 >/dev/null)"
-apply_rc=$?
-if (( apply_rc != 0 )); then
-    echo "Error: the delta between $onto and v$version's branch '$branch' does" >&2
-    echo "not apply -- $onto has moved too far for a clean fold. git apply said:" >&2
-    printf '%s\n' "$apply_err" >&2
-    echo "Inspect by hand: git diff --binary $onto $branch" >&2
+merge_out="$(git -C "$real_repo" merge-tree --write-tree --merge-base="$fork_point" "$onto" "$branch" 2>&1)"
+merge_rc=$?
+if (( merge_rc != 0 )); then
+    echo "Error: v$version's branch '$branch' conflicts with $onto -- $onto has" >&2
+    echo "moved too far (or touches the same lines the version touched) for a" >&2
+    echo "clean fold. git merge-tree said:" >&2
+    printf '%s\n' "$merge_out" >&2
+    echo "Inspect by hand: git merge-tree --merge-base=$fork_point $onto $branch" >&2
     exit 1
 fi
-GIT_INDEX_FILE="$tmp_index" git -C "$real_repo" apply --cached "$patch_file"
-new_tree="$(GIT_INDEX_FILE="$tmp_index" git -C "$real_repo" write-tree)"
+new_tree="$(printf '%s\n' "$merge_out" | head -n1)"
 
 # Same convention every other lkml-mode script uses for the persona
 # frontmatter fields -- see lkml-revise.sh's comment for why this stays
@@ -182,9 +191,13 @@ if (( version >= 2 )); then
         fi
         k_body="$("$mailbox" show "$series" "$k_cover_id" | awk 'f{print} /^$/{f=1}')"
         # Portable POSIX awk, not gawk's IGNORECASE -- matches "## Changelog",
-        # "### changelog", etc.
+        # "### changelog", etc. Stops at the next heading line so it does not
+        # swallow whatever lkml-mailbox.sh init --diffstat/--smoke appended
+        # after the author's own Changelog section (## Diffstat, ## Test
+        # results).
         k_changelog="$(printf '%s\n' "$k_body" | awk '
             BEGIN { found = 0 }
+            found && /^#+[[:space:]]/ { exit }
             !found && tolower($0) ~ /^#+[[:space:]]*changelog/ { found = 1 }
             found { print }
         ')"

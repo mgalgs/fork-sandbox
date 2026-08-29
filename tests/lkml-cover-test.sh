@@ -21,6 +21,8 @@
 #   - --version passed explicitly: posted as that exact version, recorded as
 #     that exact version (not autocomputed).
 #   - an --attach file over the mailbox's 4 MiB cap is refused.
+#   - a bad --base is refused BEFORE the persona launches (no run dir
+#     created), not after an up-to-timeout wait.
 
 set -uo pipefail
 
@@ -201,6 +203,18 @@ if (( rc != 0 )); then ok "refuses an attachment over the 4 MiB cap"; else no "r
 contains "names the mailbox init failure" "$out" "lkml-mailbox.sh init failed"
 check "versions.jsonl was never written" "0" \
     "$(find "$LKML_MAILBOX_ROOT/widget-frob" -maxdepth 1 -name 'versions.jsonl' 2>/dev/null | wc -l)"
+
+printf '\n== a bad --base is refused before the persona launches ==\n'
+export LKML_MAILBOX_ROOT; LKML_MAILBOX_ROOT="$(mktemp -d)"; tmpdirs+=("$LKML_MAILBOX_ROOT")
+write_stub 1
+n_runs_before=$(find "$run_prefix_dir" -maxdepth 1 -name 'run.*' | wc -l)
+out="$(PATH="$stub_bin:$PATH" "$cover" widget-frob --project "$real_repo" \
+    --checkout cover-branch --base no-such-ref --patches "$patches_dir" 2>&1)"
+rc=$?
+if (( rc != 0 )); then ok "exits non-zero on a bad --base"; else no "exits non-zero on a bad --base" "exit 0"; fi
+contains "names the bad --base" "$out" "no-such-ref"
+n_runs_after=$(find "$run_prefix_dir" -maxdepth 1 -name 'run.*' | wc -l)
+check "no run was launched" "$n_runs_before" "$n_runs_after"
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 (( fail == 0 )) || exit 1

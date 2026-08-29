@@ -314,6 +314,31 @@ rc=$?
 if (( rc != 0 )); then ok "refuses an attachment over the 4 MiB cap"; else no "refuses an attachment over the 4 MiB cap" "it succeeded"; fi
 contains "the cap refusal names the byte cap" "$out" "4194304"
 
+echo "perf numbers" > "perf,before.txt"
+echo "plain data" > plain.txt
+out="$("$mailbox" post widget-frob --from linus --reply-to "${attach_cover_id:0:7}" \
+    --file note.txt --attach "perf,before.txt" --attach plain.txt \
+    --harness claude --model opus 2>diag.txt)"
+rc=$?
+check "post with a comma in one attachment's basename exits 0" "0" "$rc"
+raw_comma="$("$mailbox" show widget-frob "${out:0:7}")"
+contains "the comma-basename file gets its own X-Attachment header" "$raw_comma" "X-Attachment: attachments/perf,before.txt"
+contains "the other attachment gets its own X-Attachment header" "$raw_comma" "X-Attachment: attachments/plain.txt"
+check "the comma-basename file actually landed on disk" "1" \
+    "$(find "$LKML_MAILBOX_ROOT/widget-frob/attachments" -name 'perf,before.txt' | wc -l)"
+
+echo "different content" > shot2.png
+mv shot2.png shot.png
+out="$("$mailbox" post widget-frob --from linus --reply-to "${attach_cover_id:0:7}" \
+    --file note.txt --attach shot.png --harness claude --model opus 2>&1)"
+rc=$?
+if (( rc != 0 )); then
+    ok "refuses an attachment basename collision with different content"
+else
+    no "refuses an attachment basename collision with different content" "it succeeded"
+fi
+contains "the collision refusal names the colliding path" "$out" "attachments/shot.png"
+
 printf '\n== init --diffstat / --smoke ==\n'
 
 diffstat_repo="$(mktemp -d)"; tmpdirs+=("$diffstat_repo")
