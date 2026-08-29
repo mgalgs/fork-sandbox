@@ -2761,24 +2761,23 @@ if [[ "$harness" == "claude" || "$review_harness" == "claude" ]]; then
     fs_reject_unsafe_chars "$inbox_hook" "$inbox_settings"
 fi
 
-# --refresh-at's outbox: the ONE writable path outside the clone, bound
+# The artifact outbox: the ONE writable path outside the clone, bound
 # --bind-rw beside the read-only inbox. This adds a writable surface, unlike
-# everything above, and that is deliberate rather than an oversight -- the
-# session has to have somewhere to put a hand-off nobody proactively reads
-# out of the clone for it. It stays safe because it is read the same way the
+# everything above, and that is deliberate rather than an oversight -- an
+# agent needs somewhere to put a screenshot, a report, a generated image, or
+# (when --refresh-at is enabled) a hand-off nobody proactively reads out of
+# the clone for it. It stays safe because it is read the same way the
 # workspace and PLAN.md already are: the host only ever reads a hand-off as
 # TEXT, and treats it as untrusted prompt content, never as anything to
 # execute -- see the continuation prompt this script builds further down.
-# Created and bound only when refresh is actually enabled, so a run with
-# --refresh-at 0 (or any harness but claude) gets no extra bind at all.
-outbox_dir=""
+# Created and bound on every run, whether or not refresh is enabled.
+outbox_dir="$run_dir/outbox"
+mkdir -p "$outbox_dir"
+chmod 755 "$outbox_dir"
+fs_reject_unsafe_chars "$outbox_dir"
+
 refresh_config=""
 if (( refresh_enabled )); then
-    outbox_dir="$run_dir/outbox"
-    mkdir -p "$outbox_dir"
-    chmod 755 "$outbox_dir"
-    fs_reject_unsafe_chars "$outbox_dir"
-
     # The hook's own settings, in the same inbox-dotfile trick .settings.json
     # uses above: the run dir itself is never bound, so anything the hook
     # needs to read has to live somewhere that IS. THRESHOLD_TOKENS is
@@ -2948,7 +2947,7 @@ run_log_bin="$(command -v sandbox-run-log.py 2>/dev/null || true)"
 # "${prefix}_*" output, plus every bind flag that is the same regardless of
 # which harness runs -- the alternates, the node toolchain, provision-ro,
 # the services socket, the review kit, --context-ro, the inbox and the
-# refresh outbox, and --sandbox-args. Those shared flags are not captured
+# outbox, and --sandbox-args. Those shared flags are not captured
 # into a separate array first: they are read straight off the same globals
 # fs_node_provision, fs_provision_ro and the services/inbox/outbox setup
 # above already computed once, in the same order, on every call -- so a
@@ -3035,11 +3034,9 @@ fs_build_sandbox_cmd() {
     # nothing the sandbox can write; it is the one path a host can put
     # words into after launch.
     out+=(--bind-ro "$inbox_dir")
-    # --refresh-at's outbox: writable, and only bound at all when refresh is
-    # enabled -- see the comment where it is created, above.
-    if (( refresh_enabled )); then
-        out+=(--bind-rw "$outbox_dir")
-    fi
+    # The artifact outbox: writable, bound on every run -- see the comment
+    # where it is created, above.
+    out+=(--bind-rw "$outbox_dir")
     if [[ -n "$sandbox_args" ]]; then
         # Deliberate word splitting: the caller passes a flag string.
         # shellcheck disable=SC2206
