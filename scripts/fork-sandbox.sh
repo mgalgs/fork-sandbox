@@ -1848,9 +1848,6 @@ mkdir -p /var/tmp/claude-scratch/forks
 harness_bin=""
 harness_version=""
 harness_env_file=""
-harness_flags=()
-harness_cmd=()
-harness_exec=0
 harness_sandbox_bin=""
 run_formatter="$formatter"
 usage_source="$harness"
@@ -1919,10 +1916,23 @@ fs_resolve_harness() {
     local -n harness_flags="${prefix}_harness_flags"
     # shellcheck disable=SC2178
     local -n harness_cmd="${prefix}_harness_cmd"
+    # shellcheck disable=SC2034  # read back via fs_build_sandbox_cmd's own
+    # nameref, not by name here -- same false positive as above.
     local -n harness_exec="${prefix}_harness_exec"
     local -n harness_sandbox_bin="${prefix}_harness_sandbox_bin"
     local -n run_formatter="${prefix}_run_formatter"
     local -n usage_source="${prefix}_usage_source"
+    # Not part of the old bare-name contract -- these two just record the
+    # inputs this call resolved from, so fs_build_sandbox_cmd (which builds
+    # a command from "${prefix}_*" alone) can find the harness name and
+    # model without a caller having to pass them again.
+    # Read back via a differently-named nameref in fs_build_sandbox_cmd,
+    # invisible to shellcheck across the function boundary -- same false
+    # positive as every nameref in this function.
+    # shellcheck disable=SC2034
+    local -n out_prefix_harness="${prefix}_harness"
+    # shellcheck disable=SC2034
+    local -n out_prefix_model="${prefix}_model"
 
     harness_bin=""
     harness_version=""
@@ -1933,6 +1943,11 @@ fs_resolve_harness() {
     harness_sandbox_bin=""
     run_formatter="$formatter"
     usage_source="$rh_harness"
+    # shellcheck disable=SC2034  # read by fs_build_sandbox_cmd, across the
+    # same nameref-name boundary shellcheck cannot see through.
+    out_prefix_harness="$rh_harness"
+    # shellcheck disable=SC2034
+    out_prefix_model="$rh_model"
 
     case "$rh_harness" in
     claude)
@@ -2217,6 +2232,8 @@ codex)
         harness_cmd+=(--model "$rh_model")
     fi
     harness_cmd+=(-)
+    # shellcheck disable=SC2034  # read by fs_build_sandbox_cmd via its own
+    # nameref -- see fs_resolve_harness's declarations, above.
     harness_exec=1
     # codex speaks its own JSONL, not claude's stream-json, so the
     # formatter has nothing it can render.
@@ -2231,21 +2248,22 @@ codex)
 }
 
 fs_resolve_harness "$harness" "$model" impl
-# Pure compatibility copy: everything below this line, for the rest of this
-# commit, still reads the bare names a single-harness run always used.
-# --review-harness (a later commit) is what starts reading the "impl_" and
-# "rev_" names directly instead. The "impl_*" names only exist as the
-# namerefs above wrote them into being, so shellcheck has no literal
-# assignment to point at -- SC2154 here is a false positive of the same
-# dynamic-name pattern fs_resolve_harness itself uses.
+# Compatibility copy: the run record (run.env, the generated runner) and
+# the review-loop accounting below still read these bare names -- moving
+# THEM onto "impl_"/"rev_" is per-leg accounting, a later commit's job, not
+# this refactor's. harness_flags/harness_cmd/harness_exec are NOT copied
+# back: nothing reads them bare any more, since fs_build_sandbox_cmd below
+# reads "${prefix}_harness_flags" etc. directly, and the review-kit skill
+# loop just below was updated to write into "impl_harness_cmd" for the
+# same reason. The "impl_*" names only exist as the namerefs above wrote
+# them into being, so shellcheck has no literal assignment to point at --
+# SC2154 here is a false positive of the same dynamic-name pattern
+# fs_resolve_harness itself uses.
 # shellcheck disable=SC2154
 {
     harness_bin="$impl_harness_bin"
     harness_version="$impl_harness_version"
     harness_env_file="$impl_harness_env_file"
-    harness_flags=("${impl_harness_flags[@]}")
-    harness_cmd=("${impl_harness_cmd[@]}")
-    harness_exec="$impl_harness_exec"
     harness_sandbox_bin="$impl_harness_sandbox_bin"
     run_formatter="$impl_run_formatter"
     usage_source="$impl_usage_source"
@@ -2537,8 +2555,12 @@ for skill_name in commit-then-review code-review-portable; do
     fs_reject_unsafe_chars "$skill_dir"
     review_kit_flags+=(--bind-ro "$skill_dir")
     [[ "$skill_name" == "code-review-portable" ]] && review_skill_dir="$skill_dir"
+    # Written into "impl_harness_cmd" directly (the array
+    # fs_resolve_harness left behind for the implement harness), not a
+    # bare "harness_cmd" -- fs_build_sandbox_cmd reads the prefixed array,
+    # and there is no bare one to read any more.
     if [[ "$harness" == "pi" || "$harness" == "pi-local" ]]; then
-        harness_cmd+=(--skill "$skill_dir")
+        impl_harness_cmd+=(--skill "$skill_dir")
     fi
 done
 if [[ -d "$HOME/.claude/scripts" ]]; then
@@ -2764,24 +2786,6 @@ if (( refresh_enabled )); then
     mv -- "$continuation_prompt_header.part" "$continuation_prompt_header"
 fi
 
-# Resolve the wrapper to an absolute path now. The generated runner executes
-# in the tmux server's environment, and that PATH may not carry
-# ~/.claude/scripts — a server started at login often predates the user's
-# PATH setup. The pre-flight above checked this launcher's environment,
-# which proves nothing about the runner's.
-# A harness may bring its own wrapper: agent-sandboxed for a sealed
-# local-model run, which drives the same sandbox backend with a model bridged
-# in and takes the same bind flags. It is already resolved to an absolute
-# path, for the same reason this one is.
-if [[ -n "$harness_sandbox_bin" ]]; then
-    sandbox_bin="$harness_sandbox_bin"
-else
-    sandbox_bin="$(command -v claude-sandboxed || true)"
-    if [[ -z "$sandbox_bin" ]]; then
-        sandbox_bin="$HOME/.claude/scripts/claude-sandboxed"
-    fi
-fi
-
 # The run-log appender, resolved to an absolute path for the same reason the
 # wrapper is. Optional on purpose: a machine without it skips the append
 # rather than failing the run.
@@ -2789,130 +2793,216 @@ run_log_bin="$(command -v sandbox-run-log.py 2>/dev/null || true)"
 [[ -n "$run_log_bin" ]] || run_log_bin="$HOME/.claude/scripts/sandbox-run-log.py"
 [[ -x "$run_log_bin" ]] || run_log_bin=""
 
-# claude-sandboxed stops parsing its own flags at the first argument starting
-# with '-', so its flags and the work dir must come first.
-sandbox_cmd=("$sandbox_bin")
-for alt in "${FS_ALTERNATES[@]-}"; do
-    [[ -n "$alt" ]] || continue
-    sandbox_cmd+=(--bind-ro "$alt")
-done
-if (( ${#harness_flags[@]} )); then
-    sandbox_cmd+=("${harness_flags[@]}")
-fi
-if (( ${#FS_NODE_FLAGS[@]} )); then
-    sandbox_cmd+=("${FS_NODE_FLAGS[@]}")
-fi
-if (( ${#FS_PROVISION_RO_FLAGS[@]} )); then
-    sandbox_cmd+=("${FS_PROVISION_RO_FLAGS[@]}")
-fi
-# The one writable path outside the clone: the per-run services sockets dir.
-# Docker on the host creates the sockets here; the sandbox reaches the services
-# through them and by no other route.
-if (( services_enabled )); then
-    sandbox_cmd+=(--bind-rw "$sockets_dir")
-fi
-if (( ${#review_kit_flags[@]} )); then
-    sandbox_cmd+=("${review_kit_flags[@]}")
-fi
-if [[ -n "$context_ro" ]]; then
-    sandbox_cmd+=(--bind-ro "$context_ro")
-fi
-# The operator inbox, for every harness. Read-only, so this widens nothing the
-# sandbox can write; it is the one path a host can put words into after launch.
-sandbox_cmd+=(--bind-ro "$inbox_dir")
-# --refresh-at's outbox: writable, and only bound at all when refresh is
-# enabled -- see the comment where it is created, above.
-if (( refresh_enabled )); then
-    sandbox_cmd+=(--bind-rw "$outbox_dir")
-fi
-if [[ -n "$sandbox_args" ]]; then
-    # Deliberate word splitting: the caller passes a flag string.
-    # shellcheck disable=SC2206
-    sandbox_cmd+=($sandbox_args)
-fi
-# A harness with a command of its own runs through --exec. claude has none,
-# because claude-sandboxed starts it, and pi-local has none either, because
-# agent-sandboxed starts pi — so for both of those what follows the clone dir
-# is the tool's own flags.
-if (( harness_exec )); then
-    case "$harness" in
-    pi)
-        # pi keeps its session under $HOME, and $HOME here is a tmpfs that
-        # dies with the sandbox — so the transcript, and the tokens
-        # recorded in it, would go with it. Put it inside the clone's .git
-        # instead. That is writable, and git tracks nothing under .git, so
-        # a session that runs `git add -A` cannot commit it by accident.
-        # The runner copies it out at the end. The prompt arrives on stdin,
-        # which forces print mode by itself; -p states the intent anyway.
-        #
-        # --mode json makes print mode emit every AgentSessionEvent as JSONL
-        # on stdout instead of just the final text, so events.jsonl holds a
-        # real event stream. It changes what the run reports, never what it
-        # does: the same print mode, the same session, the same agent loop.
-        pi_session_dir="$clone_dir/.git/pi-session"
-        harness_cmd+=(--session-dir "$pi_session_dir" --mode json -p)
-        ;;
-    codex)
-        # codex wants its credential as a FILE, and the sandbox's $HOME is
-        # a fresh tmpfs with nothing in it. The token rides in as an
-        # environment variable, which claude-sandboxed keeps out of every
-        # command line, and this shim writes it where codex looks. Writing
-        # it inside rather than binding it also leaves codex free to
-        # rewrite it, which a read-only bind would refuse.
-        # shellcheck disable=SC2016  # a program for the sandbox's bash
-        harness_cmd=(/bin/bash -c \
-            'umask 077; mkdir -p "$HOME/.codex"; printf %s "$CODEX_AUTH_JSON" > "$HOME/.codex/auth.json"; unset CODEX_AUTH_JSON; exec "$@"' \
-            codex-auth-shim "${harness_cmd[@]}")
-        ;;
-    esac
-    sandbox_cmd+=(--exec)
-    if [[ -n "$harness_env_file" ]]; then
-        sandbox_cmd+=(--env-file "$harness_env_file")
+# Builds one harness's full sandbox_cmd argv from fs_resolve_harness's
+# "${prefix}_*" output, plus every bind flag that is the same regardless of
+# which harness runs -- the alternates, the node toolchain, provision-ro,
+# the services socket, the review kit, --context-ro, the inbox and the
+# refresh outbox, and --sandbox-args. Those shared flags are not captured
+# into a separate array first: they are read straight off the same globals
+# fs_node_provision, fs_provision_ro and the services/inbox/outbox setup
+# above already computed once, in the same order, on every call -- so a
+# call for "impl" and a call for "rev" can never disagree about them,
+# without a second array to keep in sync by hand. $1 is the prefix; $2 is
+# the name of the array to write the built command into.
+fs_build_sandbox_cmd() {
+    local prefix="$1" out_name="$2"
+
+    local -n b_harness="${prefix}_harness"
+    local -n b_model="${prefix}_model"
+    local -n b_harness_env_file="${prefix}_harness_env_file"
+    local -n b_harness_exec="${prefix}_harness_exec"
+    local -n b_harness_sandbox_bin="${prefix}_harness_sandbox_bin"
+    # shellcheck disable=SC2178  # -n aliases an array here; shellcheck
+    # cannot see through the dynamic target name to know that.
+    local -n b_harness_flags="${prefix}_harness_flags"
+    # shellcheck disable=SC2178
+    local -n b_harness_cmd_src="${prefix}_harness_cmd"
+    local -n out="$out_name"
+    local -n out_pi_session_dir="${prefix}_pi_session_dir"
+    # Only the pi and pi-local arms below set this; claude and codex leave
+    # it empty. Pre-set it here rather than leave it unset -- under set -u
+    # an unassigned nameref target was never auto-vivified at all, and the
+    # compat-copy read of it below would die as an unbound variable.
+    out_pi_session_dir=""
+
+    # A local, mutable copy: this prefix's own resolved harness_cmd is
+    # appended to below (--session-dir, the codex auth shim), and must not
+    # mutate fs_resolve_harness's own recorded result -- a second build for
+    # the same prefix (there is none today, but nothing here should assume
+    # it can never happen) would otherwise pick up the previous build's
+    # additions too.
+    local -a harness_cmd=("${b_harness_cmd_src[@]}")
+
+    # Resolve the wrapper to an absolute path now. The generated runner
+    # executes in the tmux server's environment, and that PATH may not
+    # carry ~/.claude/scripts — a server started at login often predates
+    # the user's PATH setup. The pre-flight above checked this launcher's
+    # environment, which proves nothing about the runner's.
+    # A harness may bring its own wrapper: agent-sandboxed for a sealed
+    # local-model run, which drives the same sandbox backend with a model
+    # bridged in and takes the same bind flags. It is already resolved to
+    # an absolute path, for the same reason this one is.
+    local sandbox_bin
+    if [[ -n "$b_harness_sandbox_bin" ]]; then
+        sandbox_bin="$b_harness_sandbox_bin"
+    else
+        sandbox_bin="$(command -v claude-sandboxed || true)"
+        if [[ -z "$sandbox_bin" ]]; then
+            sandbox_bin="$HOME/.claude/scripts/claude-sandboxed"
+        fi
     fi
-    sandbox_cmd+=("$clone_dir" "${harness_cmd[@]}")
-elif [[ "$harness" == "pi-local" ]]; then
-    # pi's own flags, in the position claude's go. The session dir is the
-    # same trick as the pi harness above: $HOME is a tmpfs that dies with
-    # the sandbox, and .git is writable but tracked by nothing, so a session
-    # running `git add -A` cannot commit the transcript by accident. The
-    # runner copies it out at the end.
-    pi_session_dir="$clone_dir/.git/pi-session"
-    # The work dir here is a throwaway clone, and nothing runs git in it once
-    # the sandbox has touched it, so agent-sandboxed's warning about a writable
-    # .git would only tell the caller to use this script.
-    sandbox_cmd+=(--no-git-warning "$clone_dir")
-    if (( ${#harness_cmd[@]} )); then
-        sandbox_cmd+=("${harness_cmd[@]}")
+
+    # claude-sandboxed stops parsing its own flags at the first argument
+    # starting with '-', so its flags and the work dir must come first.
+    out=("$sandbox_bin")
+    for alt in "${FS_ALTERNATES[@]-}"; do
+        [[ -n "$alt" ]] || continue
+        out+=(--bind-ro "$alt")
+    done
+    if (( ${#b_harness_flags[@]} )); then
+        out+=("${b_harness_flags[@]}")
     fi
-    # --mode json for the same reason as the pi arm above: a real event
-    # stream in events.jsonl, and no change to how the session runs.
-    sandbox_cmd+=(--session-dir "$pi_session_dir" --mode json -p)
-else
-    sandbox_cmd+=("$clone_dir" --dangerously-skip-permissions)
-    # --print exits when the work is done and never shows a dialog. stream-json
-    # needs --verbose to emit anything beyond the final result.
-    sandbox_cmd+=(--print --verbose --output-format stream-json)
-    # The operator-inbox hooks. --settings loads them on top of whatever the
-    # sandbox has, which is nothing: there is no global ~/.claude in here.
-    # --include-hook-events puts each hook firing into the event stream, which
-    # is how fork-sandbox-status.sh --monitor can report a delivery. It costs
-    # two extra log lines per tool call; the log is the only thing that grows.
-    if [[ -n "$inbox_settings" ]]; then
-        sandbox_cmd+=(--settings "$inbox_settings" --include-hook-events)
+    if (( ${#FS_NODE_FLAGS[@]} )); then
+        out+=("${FS_NODE_FLAGS[@]}")
     fi
-    if [[ -n "$model" ]]; then
-        sandbox_cmd+=(--model "$model")
+    if (( ${#FS_PROVISION_RO_FLAGS[@]} )); then
+        out+=("${FS_PROVISION_RO_FLAGS[@]}")
     fi
-    if [[ -n "$claude_extra_args" ]]; then
+    # The one writable path outside the clone: the per-run services sockets
+    # dir. Docker on the host creates the sockets here; the sandbox reaches
+    # the services through them and by no other route.
+    if (( services_enabled )); then
+        out+=(--bind-rw "$sockets_dir")
+    fi
+    if (( ${#review_kit_flags[@]} )); then
+        out+=("${review_kit_flags[@]}")
+    fi
+    if [[ -n "$context_ro" ]]; then
+        out+=(--bind-ro "$context_ro")
+    fi
+    # The operator inbox, for every harness. Read-only, so this widens
+    # nothing the sandbox can write; it is the one path a host can put
+    # words into after launch.
+    out+=(--bind-ro "$inbox_dir")
+    # --refresh-at's outbox: writable, and only bound at all when refresh is
+    # enabled -- see the comment where it is created, above.
+    if (( refresh_enabled )); then
+        out+=(--bind-rw "$outbox_dir")
+    fi
+    if [[ -n "$sandbox_args" ]]; then
+        # Deliberate word splitting: the caller passes a flag string.
         # shellcheck disable=SC2206
-        sandbox_cmd+=($claude_extra_args)
+        out+=($sandbox_args)
     fi
-fi
+    # A harness with a command of its own runs through --exec. claude has
+    # none, because claude-sandboxed starts it, and pi-local has none
+    # either, because agent-sandboxed starts pi — so for both of those what
+    # follows the clone dir is the tool's own flags.
+    if (( b_harness_exec )); then
+        case "$b_harness" in
+        pi)
+            # pi keeps its session under $HOME, and $HOME here is a tmpfs
+            # that dies with the sandbox — so the transcript, and the
+            # tokens recorded in it, would go with it. Put it inside the
+            # clone's .git instead. That is writable, and git tracks
+            # nothing under .git, so a session that runs `git add -A`
+            # cannot commit it by accident. The runner copies it out at
+            # the end. The prompt arrives on stdin, which forces print
+            # mode by itself; -p states the intent anyway.
+            #
+            # --mode json makes print mode emit every AgentSessionEvent as
+            # JSONL on stdout instead of just the final text, so
+            # events.jsonl holds a real event stream. It changes what the
+            # run reports, never what it does: the same print mode, the
+            # same session, the same agent loop.
+            out_pi_session_dir="$clone_dir/.git/pi-session"
+            harness_cmd+=(--session-dir "$out_pi_session_dir" --mode json -p)
+            ;;
+        codex)
+            # codex wants its credential as a FILE, and the sandbox's $HOME
+            # is a fresh tmpfs with nothing in it. The token rides in as an
+            # environment variable, which claude-sandboxed keeps out of
+            # every command line, and this shim writes it where codex
+            # looks. Writing it inside rather than binding it also leaves
+            # codex free to rewrite it, which a read-only bind would
+            # refuse.
+            # shellcheck disable=SC2016  # a program for the sandbox's bash
+            harness_cmd=(/bin/bash -c \
+                'umask 077; mkdir -p "$HOME/.codex"; printf %s "$CODEX_AUTH_JSON" > "$HOME/.codex/auth.json"; unset CODEX_AUTH_JSON; exec "$@"' \
+                codex-auth-shim "${harness_cmd[@]}")
+            ;;
+        esac
+        out+=(--exec)
+        if [[ -n "$b_harness_env_file" ]]; then
+            out+=(--env-file "$b_harness_env_file")
+        fi
+        out+=("$clone_dir" "${harness_cmd[@]}")
+    elif [[ "$b_harness" == "pi-local" ]]; then
+        # pi's own flags, in the position claude's go. The session dir is
+        # the same trick as the pi harness above: $HOME is a tmpfs that
+        # dies with the sandbox, and .git is writable but tracked by
+        # nothing, so a session running `git add -A` cannot commit the
+        # transcript by accident. The runner copies it out at the end.
+        out_pi_session_dir="$clone_dir/.git/pi-session"
+        # The work dir here is a throwaway clone, and nothing runs git in
+        # it once the sandbox has touched it, so agent-sandboxed's warning
+        # about a writable .git would only tell the caller to use this
+        # script.
+        out+=(--no-git-warning "$clone_dir")
+        if (( ${#harness_cmd[@]} )); then
+            out+=("${harness_cmd[@]}")
+        fi
+        # --mode json for the same reason as the pi arm above: a real
+        # event stream in events.jsonl, and no change to how the session
+        # runs.
+        out+=(--session-dir "$out_pi_session_dir" --mode json -p)
+    else
+        out+=("$clone_dir" --dangerously-skip-permissions)
+        # --print exits when the work is done and never shows a dialog.
+        # stream-json needs --verbose to emit anything beyond the final
+        # result.
+        out+=(--print --verbose --output-format stream-json)
+        # The operator-inbox hooks. --settings loads them on top of
+        # whatever the sandbox has, which is nothing: there is no global
+        # ~/.claude in here. --include-hook-events puts each hook firing
+        # into the event stream, which is how fork-sandbox-status.sh
+        # --monitor can report a delivery. It costs two extra log lines
+        # per tool call; the log is the only thing that grows.
+        if [[ -n "$inbox_settings" ]]; then
+            out+=(--settings "$inbox_settings" --include-hook-events)
+        fi
+        if [[ -n "$b_model" ]]; then
+            out+=(--model "$b_model")
+        fi
+        # --claude-args has no per-leg form -- see the check beside
+        # --pi-args, above, which refuses it against anything but the
+        # implement harness. It applies to the implement leg alone, so
+        # only the "impl" build picks it up here.
+        if [[ "$prefix" == impl && -n "$claude_extra_args" ]]; then
+            # shellcheck disable=SC2206
+            out+=($claude_extra_args)
+        fi
+    fi
+}
+
+# "sandbox_cmd" is itself the out-array-name passed in, and
+# "impl_pi_session_dir" only exists as the nameref inside fs_build_sandbox_cmd
+# wrote it into being -- shellcheck cannot trace either through the dynamic
+# name, the same false positive noted above fs_resolve_harness's call.
+# shellcheck disable=SC2154
+{
+    fs_build_sandbox_cmd impl sandbox_cmd
+    pi_session_dir="$impl_pi_session_dir"
+}
 
 # Review legs may use a stronger or independent model. Keep a distinct command
 # instead of mutating sandbox_cmd in the runner: fix legs deliberately stay on
 # the implementation model. The model flag sits in a different argv region for
 # each harness, so put it in the harness-specific legal position when absent.
+# "sandbox_cmd" was populated above by fs_build_sandbox_cmd's nameref, not by
+# a literal assignment shellcheck can see -- the same false positive as
+# fs_resolve_harness's "impl_*"/"rev_*" outputs.
+# shellcheck disable=SC2154
 review_sandbox_cmd=("${sandbox_cmd[@]}")
 if [[ -n "$review_model" ]]; then
     if [[ "$harness" == "claude" ]]; then
