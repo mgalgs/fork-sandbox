@@ -312,9 +312,10 @@ fi
 
 # 8. --refresh-at is claude-only, tied to the IMPLEMENT harness alone: a
 # --harness pi run reviewed by --review-harness claude must not enable
-# refresh, and the refresh outbox bind must not appear in either built
-# command -- not the implement one (pi never gets it, refresh or not) and
-# not the review one either, since it is inert without refresh_enabled.
+# refresh. The artifact outbox is a separate, unconditional bind (see
+# fork-sandbox.sh's own "Created and bound on every run, whether or not
+# refresh is enabled" comment) -- it must still appear in both commands
+# here even though refresh itself stays off.
 rd8="$(run_real --harness pi/some-model --review-loop 1 --review-harness claude)"
 if [[ -n "$rd8" ]]; then
     tmpdirs+=("$rd8")
@@ -322,14 +323,10 @@ if [[ -n "$rd8" ]]; then
         "0" "$(sed -n 's/^refresh_enabled=//p' "$rd8/run.sh")"
     sandbox_line8="$(grep '^sandbox_cmd=' "$rd8/run.sh")"
     review_line8="$(grep '^review_sandbox_cmd=' "$rd8/run.sh")"
-    case "$sandbox_line8" in
-        *"--bind-rw"*"/outbox"*) no "the outbox is not bound into the implement command" "$sandbox_line8" ;;
-        *) ok "the outbox is not bound into the implement command" ;;
-    esac
-    case "$review_line8" in
-        *"--bind-rw"*"/outbox"*) no "the outbox is not bound into the review command" "$review_line8" ;;
-        *) ok "the outbox is not bound into the review command" ;;
-    esac
+    contains "the outbox is bound into the implement command regardless of refresh" \
+        "--bind-rw $rd8/outbox" "$sandbox_line8"
+    contains "the outbox is bound into the review command regardless of refresh" \
+        "--bind-rw $rd8/outbox" "$review_line8"
     # The claude review leg still gets the operator-inbox delivery hook,
     # even though the implement harness (pi) is the one that decided
     # refresh is off: the inbox mechanism and refresh are independent, and
