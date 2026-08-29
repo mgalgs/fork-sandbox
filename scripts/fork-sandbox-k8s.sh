@@ -6,7 +6,7 @@
 #                            [--review-loop N] <project-path> <handoff-file>
 #        fork-sandbox-k8s.sh run [--dry-run] [--timeout SECONDS] [--keep]
 #                            --branch NAME --model MODEL [--review-loop N]
-#                            <project-path> <handoff-file>
+#                            [--outbox-dir DIR] <project-path> <handoff-file>
 #        fork-sandbox-k8s.sh fetch --branch NAME <project-path>
 #        fork-sandbox-k8s.sh say --branch NAME <text>
 #        fork-sandbox-k8s.sh say --branch NAME -        # text from stdin
@@ -71,6 +71,16 @@
 #
 # --keep (run): skip the final rm, leaving the Job and pod in place after a
 # successful fetch.
+#
+# --outbox-dir DIR (run): where to land the pod's /work/outbox after the
+# agent finishes. Defaults to
+# /var/tmp/claude-scratch/forks/k8s-<safe-branch>/outbox. Pulled back over
+# the same kubectl exec channel fetch uses, through
+# fork-sandbox-k8s-outbox-extract.sh, which refuses the whole archive if it
+# is oversized or contains anything unsafe (absolute paths, `..` components,
+# symlinks) -- see that script's own header. Best-effort: a failure here
+# warns and falls through rather than failing the run, since retrieving
+# artifacts must never cost the branch itself.
 #
 # --review-loop N (submit, run): after the coding leg, run a fresh review
 # session against the branch and, on findings, a fresh fix session, up to N
@@ -347,15 +357,23 @@ k8s_sha256_stdin() {
     fi
 }
 
+# The sanitising half of k8s_safe_name below, factored out so a filesystem
+# path (which has no 63-char Kubernetes object-name limit) can reuse it
+# without the truncation that would otherwise chop it.
+k8s_safe_name_component() {
+    local branch="$1" safe
+    safe="$(printf '%s' "$branch" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-')"
+    safe="${safe##-}"
+    safe="${safe%%-}"
+    printf '%s' "$safe"
+}
+
 # A Kubernetes object name: lowercase RFC 1123, <=63 chars. Branch names are
 # freeform, so this derives a safe name rather than requiring the caller to
 # pick one that already qualifies.
 k8s_safe_name() {
-    local prefix="$1" branch="$2" safe
-    safe="$(printf '%s' "$branch" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-')"
-    safe="${safe##-}"
-    safe="${safe%%-}"
-    printf '%s-%s' "$prefix" "$safe" | cut -c1-63 | sed 's/-$//'
+    local prefix="$1" branch="$2"
+    printf '%s-%s' "$prefix" "$(k8s_safe_name_component "$branch")" | cut -c1-63 | sed 's/-$//'
 }
 
 # Renders the four --review-loop-only ConfigMap keys: the review and fix
@@ -907,6 +925,7 @@ cmd_rm() {
 # failure handling.
 cmd_run() {
     local dry_run=false keep=false timeout=3600 branch="" model="" review_loop_cap=""
+    local outbox_dir=""
     while (( $# )); do
         case "$1" in
             --dry-run) dry_run=true; shift ;;
@@ -915,6 +934,7 @@ cmd_run() {
             --branch) branch="${2:?--branch requires a name}"; shift 2 ;;
             --model) model="${2:?--model requires an OpenRouter model id}"; shift 2 ;;
             --review-loop) review_loop_cap="${2:?--review-loop requires a positive integer}"; shift 2 ;;
+            --outbox-dir) outbox_dir="${2:?--outbox-dir requires a path}"; shift 2 ;;
             -*) echo "Error: unknown option '$1' for run." >&2; exit 1 ;;
             *) break ;;
         esac
@@ -1080,6 +1100,45 @@ cmd_run() {
 
     echo "fork-sandbox-k8s: fetching branch $branch" >&2
     cmd_fetch --branch "$branch" "$project_path"
+
+    # Pull /work/outbox back, symmetric with the local path's run_dir/outbox
+    # (see fs_emit_prompt_preamble's "## Artifact outbox" section). This is
+    # best-effort: retrieving artifacts must never cost the branch just
+    # fetched, or block the --keep/rm step below, so every failure here
+    # warns and falls through rather than exiting.
+    local outbox_dest="$outbox_dir"
+    [[ -n "$outbox_dest" ]] \
+        || outbox_dest="/var/tmp/claude-scratch/forks/k8s-$(k8s_safe_name_component "$branch")/outbox"
+    local outbox_max_bytes=$((64 * 1024 * 1024))
+    local outbox_tar outbox_ok=true
+    outbox_tar="$(mktemp)"
+    if ! kubectl exec "$pod_name" -- tar cf - -C /work/outbox . 2>/dev/null \
+            | head -c "$((outbox_max_bytes + 1))" > "$outbox_tar"; then
+        echo "fork-sandbox-k8s: warning: could not read the outbox from pod $pod_name; nothing pulled back." >&2
+        outbox_ok=false
+    fi
+    if [[ "$outbox_ok" == true ]] && (( $(stat -c '%s' -- "$outbox_tar") > outbox_max_bytes )); then
+        echo "fork-sandbox-k8s: warning: pod $pod_name's outbox is over the $outbox_max_bytes byte cap; refusing to pull it back." >&2
+        outbox_ok=false
+    fi
+    if [[ "$outbox_ok" == true ]] && ! mkdir -p -- "$(dirname -- "$outbox_dest")"; then
+        echo "fork-sandbox-k8s: warning: could not create $(dirname -- "$outbox_dest"); outbox not pulled back." >&2
+        outbox_ok=false
+    fi
+    if [[ "$outbox_ok" == true ]]; then
+        if "$script_dir/fork-sandbox-k8s-outbox-extract.sh" "$outbox_tar" "$outbox_dest"; then
+            local outbox_count
+            outbox_count="$(find "$outbox_dest" -type f | wc -l)"
+            if (( outbox_count > 0 )); then
+                echo "fork-sandbox-k8s: outbox: $outbox_count file(s) at $outbox_dest" >&2
+            else
+                echo "fork-sandbox-k8s: outbox: empty (nothing written)" >&2
+            fi
+        else
+            echo "fork-sandbox-k8s: warning: could not extract the outbox tarball; nothing pulled back to $outbox_dest" >&2
+        fi
+    fi
+    rm -f -- "$outbox_tar"
 
     if [[ "$keep" == true ]]; then
         echo "fork-sandbox-k8s: --keep set; leaving job and pod for branch $branch in place" >&2
