@@ -574,9 +574,100 @@ fs_configure_fetch_value() {
     printf '%s' "$out"
 }
 
-# Both filled in below, once the picker (fs_configure_select) and writer
-# exist. Stubbed for now so `configure` fails loudly rather than silently
-# doing nothing while this command is built up commit by commit.
+# The result of the most recent fs_configure_select call: indices into
+# whatever display array was passed to it. A global rather than a return
+# value, because bash has no way to return an array from a function.
+FS_CONFIGURE_SELECTED=()
+
+# The picker. $1 and $2 name (by nameref) two same-length arrays: display
+# lines and a 1/0 selectable flag per line. $3 is a header string, $4
+# whether --all was given.
+#
+# fzf when it is on PATH and stdout is a tty; a numbered plain-text list
+# otherwise. Not a tty and no --all is refused outright -- configure is
+# meant to be looked at, and silently selecting everything when nobody
+# could see what "everything" was would be a surprise, not a convenience.
+# --all skips both UIs and takes every selectable line.
+#
+# An unselectable line (target "-", an informational candidate) is shown in
+# both UIs so the user knows it exists, but is filtered back out of
+# whatever they picked -- fzf has no per-line disable, so this is done
+# after the fact rather than by refusing the keystroke.
+fs_configure_select() {
+    local -n _fcs_lines="$1"
+    local -n _fcs_selectable="$2"
+    local header="$3" all="$4"
+    FS_CONFIGURE_SELECTED=()
+
+    local n="${#_fcs_lines[@]}"
+    (( n > 0 )) || return 0
+
+    if [[ "$all" == true ]]; then
+        local i
+        for i in "${!_fcs_lines[@]}"; do
+            [[ "${_fcs_selectable[$i]}" == 1 ]] && FS_CONFIGURE_SELECTED+=("$i")
+        done
+        return 0
+    fi
+
+    if [[ ! -t 0 || ! -t 1 ]]; then
+        echo "Error: configure is interactive and needs a terminal to pick" >&2
+        echo "candidates. Pass --all to take every candidate non-interactively" >&2
+        echo "-- the mode a script driving this should use." >&2
+        return 1
+    fi
+
+    if command -v fzf >/dev/null 2>&1; then
+        local i input out sel_idx rest
+        input=""
+        for i in "${!_fcs_lines[@]}"; do
+            if [[ "${_fcs_selectable[$i]}" == 1 ]]; then
+                input+="$i"$'\t'"${_fcs_lines[$i]}"$'\n'
+            else
+                input+="$i"$'\t'"(info, not selectable) ${_fcs_lines[$i]}"$'\n'
+            fi
+        done
+        out="$(printf '%s' "$input" | fzf --multi --delimiter=$'\t' --with-nth=2.. \
+            --header="$header (TAB to select, ENTER to confirm)")" || true
+        while IFS=$'\t' read -r sel_idx rest; do
+            [[ -n "$sel_idx" ]] || continue
+            [[ "${_fcs_selectable[$sel_idx]}" == 1 ]] || continue
+            FS_CONFIGURE_SELECTED+=("$sel_idx")
+        done <<< "$out"
+    else
+        local i reply tok idx
+        echo "$header" >&2
+        for i in "${!_fcs_lines[@]}"; do
+            if [[ "${_fcs_selectable[$i]}" == 1 ]]; then
+                printf '  %d) %s\n' "$((i + 1))" "${_fcs_lines[$i]}" >&2
+            else
+                printf '  -) %s (informational, not selectable)\n' "${_fcs_lines[$i]}" >&2
+            fi
+        done
+        printf 'Pick numbers separated by spaces, "all", or empty to cancel: ' >&2
+        read -r reply
+        if [[ -z "$reply" ]]; then
+            return 0
+        fi
+        if [[ "$reply" == all ]]; then
+            for i in "${!_fcs_lines[@]}"; do
+                [[ "${_fcs_selectable[$i]}" == 1 ]] && FS_CONFIGURE_SELECTED+=("$i")
+            done
+        else
+            for tok in $reply; do
+                [[ "$tok" =~ ^[0-9]+$ ]] || continue
+                idx=$((tok - 1))
+                (( idx >= 0 && idx < n )) || continue
+                [[ "${_fcs_selectable[$idx]}" == 1 ]] && FS_CONFIGURE_SELECTED+=("$idx")
+            done
+        fi
+    fi
+    return 0
+}
+
+# Both filled in below, once the writer exists. Stubbed for now so
+# `configure` fails loudly rather than silently doing nothing while this
+# command is built up commit by commit.
 fs_configure_do_add() {
     echo "fork-sandbox: configure: add path not implemented yet." >&2
     exit 1
