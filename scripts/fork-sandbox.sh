@@ -1856,6 +1856,11 @@ run_formatter="$formatter"
 usage_source="$harness"
 pi_session_dir=""
 
+# --review-harness (below) needs the whole block below resolved a second
+# time, for a second harness, without the two runs seeing or clobbering
+# each other's state -- see fs_resolve_harness just above its case
+# statement for how.
+
 # --claude-args names the claude CLI, which no other harness starts.
 if [[ -n "$claude_extra_args" && "$harness" != "claude" ]]; then
     echo "Error: --claude-args passes flags to the claude CLI, which a" >&2
@@ -1887,8 +1892,50 @@ fs_backend_capabilities "$FS_BACKEND_BIN"
 # never into a decision, and a backend that does not set it says "unnamed".
 image_toolchain_version="image:${FORK_SANDBOX_CONTAINER_IMAGE:-unnamed}"
 
-case "$harness" in
-claude)
+# Resolves one harness (claude, pi, pi-local or codex) into a run's worth
+# of command-building state -- the same case statement a single-harness run
+# always ran, wrapped so it can run TWICE in one invocation: once for the
+# implement harness, and again for --review-harness, without either call
+# seeing or overwriting the other's result. $1 is the harness name, $2 its
+# model (already resolved by resolve_model), $3 a prefix ("impl" or "rev")
+# naming where the output lands.
+#
+# Every output is a bash nameref bound to "${prefix}_<name>", so the case
+# arms below -- moved here unchanged from the single-harness block this
+# replaced -- read and write the exact same bare names (harness_bin,
+# harness_cmd, ...) they always did; only the declarations here say which
+# prefixed global those names actually resolve to. $model is the one thing
+# the old arms read from outside their own scope, so it becomes the local
+# $rh_model parameter instead -- everything else below is untouched,
+# comments included.
+fs_resolve_harness() {
+    local rh_harness="$1" rh_model="$2" prefix="$3"
+
+    local -n harness_bin="${prefix}_harness_bin"
+    local -n harness_version="${prefix}_harness_version"
+    local -n harness_env_file="${prefix}_harness_env_file"
+    # shellcheck disable=SC2178  # -n aliases an array here; shellcheck
+    # cannot see through the dynamic target name to know that.
+    local -n harness_flags="${prefix}_harness_flags"
+    # shellcheck disable=SC2178
+    local -n harness_cmd="${prefix}_harness_cmd"
+    local -n harness_exec="${prefix}_harness_exec"
+    local -n harness_sandbox_bin="${prefix}_harness_sandbox_bin"
+    local -n run_formatter="${prefix}_run_formatter"
+    local -n usage_source="${prefix}_usage_source"
+
+    harness_bin=""
+    harness_version=""
+    harness_env_file=""
+    harness_flags=()
+    harness_cmd=()
+    harness_exec=0
+    harness_sandbox_bin=""
+    run_formatter="$formatter"
+    usage_source="$rh_harness"
+
+    case "$rh_harness" in
+    claude)
     # claude-sandboxed resolves and starts claude itself, and has done
     # since before there was more than one harness. Leave it that way:
     # its credential handling is bound up with that path.
@@ -1948,7 +1995,7 @@ pi)
     fi
     # pi reads its prompt on stdin, like every other harness. --skill comes
     # later, with the review kit; --mode json and -p come last, from the runner.
-    harness_cmd=("${FS_PI_ARGV0[@]}" --provider openrouter --model "$model")
+    harness_cmd=("${FS_PI_ARGV0[@]}" --provider openrouter --model "$rh_model")
     if (( ${#pi_extra_argv[@]} )); then
         harness_cmd+=("${pi_extra_argv[@]}")
     fi
@@ -1997,8 +2044,8 @@ pi-local)
     else
         harness_version="$image_toolchain_version"
     fi
-    if [[ -n "$model" ]]; then
-        harness_flags+=(--model "$model")
+    if [[ -n "$rh_model" ]]; then
+        harness_flags+=(--model "$rh_model")
     fi
     # harness_cmd lands after the clone dir, where agent-sandboxed passes
     # argv through to pi -- harness_flags would hit agent-sandboxed's own
@@ -2166,8 +2213,8 @@ codex)
     #                          rather than left to a default.
     harness_cmd=("${codex_argv0[@]}" exec --json
                  --dangerously-bypass-approvals-and-sandbox --ignore-rules)
-    if [[ -n "$model" ]]; then
-        harness_cmd+=(--model "$model")
+    if [[ -n "$rh_model" ]]; then
+        harness_cmd+=(--model "$rh_model")
     fi
     harness_cmd+=(-)
     harness_exec=1
@@ -2177,10 +2224,32 @@ codex)
     fs_reject_unsafe_chars "$codex_bin" "$codex_auth_src" "$codex_auth_dir" \
         "$codex_real" "$codex_bin_dir" "$codex_root" "$codex_node"
     ;;
-esac
+    esac
 
-[[ -n "$harness_version" ]] || harness_version="unknown"
-fs_reject_unsafe_chars "$harness_bin" "$harness_version"
+    [[ -n "$harness_version" ]] || harness_version="unknown"
+    fs_reject_unsafe_chars "$harness_bin" "$harness_version"
+}
+
+fs_resolve_harness "$harness" "$model" impl
+# Pure compatibility copy: everything below this line, for the rest of this
+# commit, still reads the bare names a single-harness run always used.
+# --review-harness (a later commit) is what starts reading the "impl_" and
+# "rev_" names directly instead. The "impl_*" names only exist as the
+# namerefs above wrote them into being, so shellcheck has no literal
+# assignment to point at -- SC2154 here is a false positive of the same
+# dynamic-name pattern fs_resolve_harness itself uses.
+# shellcheck disable=SC2154
+{
+    harness_bin="$impl_harness_bin"
+    harness_version="$impl_harness_version"
+    harness_env_file="$impl_harness_env_file"
+    harness_flags=("${impl_harness_flags[@]}")
+    harness_cmd=("${impl_harness_cmd[@]}")
+    harness_exec="$impl_harness_exec"
+    harness_sandbox_bin="$impl_harness_sandbox_bin"
+    run_formatter="$impl_run_formatter"
+    usage_source="$impl_usage_source"
+}
 
 # Check every value that goes into the generated runner or the run record
 # before anything is created, so a bad name cannot leave a clone behind on
