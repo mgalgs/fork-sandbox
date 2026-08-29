@@ -1079,6 +1079,12 @@ changes belong in commits, not here.
 
 **\`handoff.md\` at the root of this directory is reserved** for this run's
 own self-refresh protocol. Do not write anything named that.
+
+The whole directory has a $((FS_OUTBOX_MAX_BYTES / 1024 / 1024)) MiB budget.
+Go over it and the outbox is refused **as a whole, not truncated** -- one
+oversized artifact means everything in here is lost, not just the large
+file. If you are about to write something big, downscale a screenshot or
+write one image instead of forty rather than risk the rest.
 EOF
     fi
     case "$network" in
