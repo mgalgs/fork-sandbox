@@ -229,6 +229,12 @@ kubectl() {
 # write).
 POD_INBOX_DIR=/work/inbox
 
+# The pod's artifact outbox. Same tracking requirement and sibling-of-clone
+# reasoning as POD_INBOX_DIR above, mirrored on fork-sandbox-k8s-entrypoint.sh's
+# own outbox_dir. Read by cmd_submit (to tell the preamble where to point the
+# agent) and cmd_run (to know where to pull artifacts back from).
+POD_OUTBOX_DIR=/work/outbox
+
 # The identical resolution rule fs_resolve_backend uses for
 # sandbox-backend-<name>, applied to the platform plugin: PATH first, then
 # beside this script, so a checkout works before install.sh has run.
@@ -365,13 +371,14 @@ k8s_safe_name() {
 render_review_loop_configmap_keys() {
     local pod_clone_dir="$1" pod_inbox_dir="$2" pod_skill_dir="$3" pod_verdict_file="$4"
     local branch="$5" base_sha="$6" review_skill_src="$7" review_loop_sh="$8"
+    local pod_outbox_dir="$9"
     cat <<KEYS
   review-prompt.md: |
-$({ fs_emit_prompt_preamble "$pod_clone_dir" "$pod_inbox_dir" pi gated pod
+$({ fs_emit_prompt_preamble "$pod_clone_dir" "$pod_inbox_dir" pi gated "$pod_outbox_dir" pod
    fs_emit_review_prompt_body "$branch" "$base_sha" "$pod_skill_dir" \
        "$pod_verdict_file" "$pod_inbox_dir"; } | indent_block)
   fix-prompt-header.md: |
-$({ fs_emit_prompt_preamble "$pod_clone_dir" "$pod_inbox_dir" pi gated pod
+$({ fs_emit_prompt_preamble "$pod_clone_dir" "$pod_inbox_dir" pi gated "$pod_outbox_dir" pod
    fs_emit_fix_prompt_body "$branch" "$base_sha"; } | indent_block)
   code-review-portable-skill.md: |
 $(indent_block < "$review_skill_src")
@@ -605,7 +612,7 @@ cmd_submit() {
     if (( review_loop_cap > 0 )); then
         review_loop_configmap_keys=$'\n'"$(render_review_loop_configmap_keys \
             "$pod_clone_dir" "$POD_INBOX_DIR" "$POD_SKILL_DIR" "$POD_VERDICT_FILE" \
-            "$branch" "$base_sha" "$review_skill_src" "$review_loop_sh")"
+            "$branch" "$base_sha" "$review_skill_src" "$review_loop_sh" "$POD_OUTBOX_DIR")"
         review_loop_env=$'\n'"$(render_review_loop_env "$review_loop_cap" "$base_sha")"
     fi
 
@@ -628,7 +635,7 @@ $(indent_block < "$gate_sh")
   inbox-write.sh: |
 $(indent_block < "$inbox_write_sh")
   handoff.md: |
-$({ fs_emit_prompt_preamble "$pod_clone_dir" "$POD_INBOX_DIR" pi gated pod
+$({ fs_emit_prompt_preamble "$pod_clone_dir" "$POD_INBOX_DIR" pi gated "$POD_OUTBOX_DIR" pod
    printf '\n---\n\n'
    cat -- "$handoff_file"; } | indent_block)${review_loop_configmap_keys}
 ---

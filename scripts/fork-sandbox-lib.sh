@@ -960,7 +960,10 @@ fs_cache_binds() {
 #                pi-local run (no network at all), "gated" for a Kubernetes
 #                pod (egress allowed only to DNS and the model proxy), or
 #                "" to omit the section (an unrestricted local run).
-# $5  inbox_write  "" (default) says the inbox is mounted read-only, true of
+# $5  outbox_dir  absolute path to the artifact outbox, or "" if this run has
+#                none. Empty omits the whole "Artifact outbox" section, same
+#                convention as $2.
+# $6  inbox_write  "" (default) says the inbox is mounted read-only, true of
 #                every local run's --bind-ro inbox. "pod" says it instead for
 #                a Kubernetes pod, where kubectl exec runs in the agent's own
 #                mount namespace and nothing actually blocks a write there --
@@ -968,7 +971,8 @@ fs_cache_binds() {
 #                docs/kubernetes-runs.md. Unused when $2 is empty.
 fs_emit_prompt_preamble() {
     local clone_dir="$1" inbox_dir="$2" harness="$3" network="$4"
-    local inbox_write="${5:-}"
+    local outbox_dir="$5"
+    local inbox_write="${6:-}"
     cat <<EOF
 # Your working directory
 
@@ -1046,6 +1050,27 @@ is the one most likely to be sent a correction and the least likely to reach
 a commit. An addendum you never read is an instruction you never followed.
 EOF
         fi
+    fi
+    if [[ -n "$outbox_dir" ]]; then
+        # Same convention as the inbox block above: name the absolute path
+        # once so nothing has to build it by hand.
+        cat <<EOF
+
+## Artifact outbox
+
+Files written here come back to the person who launched this run; everything
+else outside the clone is discarded when the sandbox is torn down. Its
+absolute path is:
+
+    $outbox_dir
+
+This is for artifacts a human will look at -- screenshots, reports,
+generated images, coverage output, anything that is not source. Source
+changes belong in commits, not here.
+
+**\`handoff.md\` at the root of this directory is reserved** for this run's
+own self-refresh protocol. Do not write anything named that.
+EOF
     fi
     case "$network" in
         sealed)
