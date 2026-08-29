@@ -797,9 +797,85 @@ fs_configure_do_add() {
     done
 }
 
+# Deletes every line matching "<KEY>=" from $target's file, leaving every
+# other line -- other keys, comments, blank lines -- intact. The same
+# temp-file-then-mv discipline as the writer. If the file ends up empty,
+# it is left in place rather than removed: deleting a file the user may
+# have hand-commented would be a surprise nobody asked for.
+fs_configure_remove_target() {
+    local target="$1" file key tmp line existing_mode
+    file="$config_dir/${target%%:*}"
+    key="${target#*:}"
+    [[ -f "$file" ]] || return 0
+    existing_mode="$("$FS_STAT" -c '%a' -- "$file")"
+    tmp="$file.part"
+    : > "$tmp"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" == "$key="* ]] && continue
+        printf '%s\n' "$line" >> "$tmp"
+    done < "$file"
+    chmod "$existing_mode" -- "$tmp"
+    mv -- "$tmp" "$file"
+}
+
 fs_configure_do_remove() {
-    echo "fork-sandbox: configure --remove: not implemented yet." >&2
-    exit 1
+    local all="$1" dry_run="$2"
+    local -a rm_target=() rm_display=() rm_selectable=()
+    local target secret file key value
+
+    for target in "${!FS_CONFIGURE_TARGETS[@]}"; do
+        secret="${FS_CONFIGURE_TARGETS[$target]}"
+        file="$config_dir/${target%%:*}"
+        key="${target#*:}"
+        value="$(fs_read_env_value "$file" "$key" || true)"
+        [[ -n "$value" ]] || continue
+        rm_target+=("$target")
+        if [[ "$secret" == secret ]]; then
+            rm_display+=("$target = $(fs_mask_secret "$value")")
+        else
+            rm_display+=("$target = $value")
+        fi
+        rm_selectable+=(1)
+    done
+
+    if (( ${#rm_target[@]} == 0 )); then
+        echo "fork-sandbox: configure --remove: nothing currently set in $config_dir." >&2
+        return 0
+    fi
+
+    fs_configure_select rm_display rm_selectable \
+        "configure --remove: pick what to remove" "$all" || exit 1
+
+    if (( ${#FS_CONFIGURE_SELECTED[@]} == 0 )); then
+        echo "fork-sandbox: configure --remove: nothing selected." >&2
+        return 0
+    fi
+
+    # A second confirmation on top of the picker's own ENTER-to-confirm
+    # gesture, because removal is destructive and --all bypasses the picker
+    # entirely -- there is otherwise no point at which a non-interactive
+    # removal of everything currently configured gets a chance to be
+    # stopped.
+    if [[ "$all" != true && "$dry_run" != true ]]; then
+        local reply
+        printf 'Remove %d key(s) from %s? [y/N] ' "${#FS_CONFIGURE_SELECTED[@]}" "$config_dir" >&2
+        read -r reply
+        if [[ ! "$reply" =~ ^[Yy]$ ]]; then
+            echo "fork-sandbox: configure --remove: cancelled." >&2
+            return 0
+        fi
+    fi
+
+    local idx
+    for idx in "${FS_CONFIGURE_SELECTED[@]}"; do
+        target="${rm_target[$idx]}"
+        if [[ "$dry_run" == true ]]; then
+            echo "[dry-run] would remove $target" >&2
+            continue
+        fi
+        fs_configure_remove_target "$target"
+        echo "fork-sandbox: configure --remove: removed $target." >&2
+    done
 }
 
 cmd_configure() {
