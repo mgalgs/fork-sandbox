@@ -83,7 +83,6 @@ printf '%s\n' "$task_meta" > "$STUB_CAPTURE_DIR/$persona.task-meta.json"
 run_dir="$(mktemp -d "$STUB_RUN_PREFIX/run.XXXXXX")"
 clone_dir="$run_dir/clone/proj"
 mkdir -p "$clone_dir/.lkml-out"
-printf 'clone_dir=%s\n' "$clone_dir" > "$run_dir/run.env"
 
 case "$persona" in
     linus)
@@ -99,6 +98,8 @@ case "$persona" in
 esac
 
 printf '0\n' > "$run_dir/exit-code"
+jq -n --arg clone_dir "$clone_dir" --arg branch "stub-branch" '{clone_dir: $clone_dir, branch: $branch, base_sha: "0000000000000000000000000000000000000000", commits: 0, fetched: false}' \
+    > "$run_dir/summary.json"
 echo "fork-sandbox: launched in a stub"
 echo "  run dir:  $run_dir"
 STUB

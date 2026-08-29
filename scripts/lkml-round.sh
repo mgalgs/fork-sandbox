@@ -44,12 +44,14 @@
 # "launch them back to back" idiom the fork-sandbox skill's own Parallelism
 # section documents for fanning out several runs.
 #
-# After every launched run has an exit-code file (or --timeout elapses),
-# each run's clone is read directly -- `cat`, never git -- for
-# .lkml-out/*.msg files, which are posted into the mailbox via
-# lkml-mailbox.sh post, stamped with that persona's own harness/model and
-# display name. A .lkml-out file with no In-Reply-To header is skipped with
-# a clear warning; the rest of that run's replies still land.
+# After every launched run has written summary.json -- fork-sandbox.sh's
+# own signal that the run is fully over, including its (possibly empty)
+# fetch back into the real repo, written strictly after exit-code -- each
+# run's clone is read directly -- `cat`, never git -- for .lkml-out/*.msg
+# files, which are posted into the mailbox via lkml-mailbox.sh post,
+# stamped with that persona's own harness/model and display name. A
+# .lkml-out file with no In-Reply-To header is skipped with a clear
+# warning; the rest of that run's replies still land.
 
 set -uo pipefail
 
@@ -264,7 +266,7 @@ waited=0
 while true; do
     all_done=1
     for persona in "${!run_dir_of[@]}"; do
-        [[ -f "${run_dir_of[$persona]}/exit-code" ]] || all_done=0
+        [[ -f "${run_dir_of[$persona]}/summary.json" ]] || all_done=0
     done
     (( all_done )) && break
     if (( waited >= timeout )); then
@@ -324,11 +326,11 @@ harvest_one() {
 harvested=0
 for persona in "${!run_dir_of[@]}"; do
     run_dir="${run_dir_of[$persona]}"
-    if [[ ! -f "$run_dir/exit-code" ]]; then
+    if [[ ! -f "$run_dir/summary.json" ]]; then
         echo "Warning: $persona's run never finished; nothing harvested from it." >&2
         continue
     fi
-    clone_dir="$(sed -n 's/^clone_dir=//p' "$run_dir/run.env" | head -n1)"
+    clone_dir="$(jq -r '.clone_dir' "$run_dir/summary.json")"
     out_dir="$clone_dir/.lkml-out"
     if [[ ! -d "$out_dir" ]]; then
         echo "fork-sandbox lkml-round: $persona wrote no .lkml-out replies." >&2
