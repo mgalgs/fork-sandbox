@@ -4526,6 +4526,38 @@ if (( fetched )) && [[ "$n_commits" != "0" ]]; then
     fi
 fi
 
+# The outbox is measured here, at the end of the run, rather than checked
+# live as the agent writes to it: a local run has nothing to "pull" the way
+# a k8s run's client does, so there is no point to enforce and nothing to
+# refuse -- only a heads-up if the agent left more there than the cap allows.
+# Nothing is deleted either way; the files stay on disk for the operator to
+# look at and clean up themselves.
+outbox_bytes="$(du -sb -- "$outbox_dir" 2>/dev/null | cut -f1)"
+[[ -n "$outbox_bytes" ]] || outbox_bytes=0
+if (( outbox_bytes > outbox_max_bytes )); then
+    printf 'fork-sandbox: WARNING: outbox is %s bytes, over the %s byte cap.\n' \
+        "$outbox_bytes" "$outbox_max_bytes" >&2
+    printf 'fork-sandbox: files are still on disk at %s -- nothing was deleted.\n' \
+        "$outbox_dir" >&2
+fi
+# Recorded in run.env the same way cost= and model= are refreshed above:
+# replace rather than append, since a reader takes the first match, and
+# build the replacement beside the file and rename, which is atomic.
+if [[ -s "$run_dir/run.env" ]] \
+    && grep -v '^outbox_bytes=' "$run_dir/run.env" > "$run_dir/run.env.part" 2>/dev/null; then
+    printf 'outbox_bytes=%s\n' "$outbox_bytes" >> "$run_dir/run.env.part"
+    mv -f "$run_dir/run.env.part" "$run_dir/run.env"
+else
+    rm -f "$run_dir/run.env.part"
+fi
+if [[ -s "$run_dir/run.env" ]] \
+    && grep -v '^outbox_max_bytes=' "$run_dir/run.env" > "$run_dir/run.env.part" 2>/dev/null; then
+    printf 'outbox_max_bytes=%s\n' "$outbox_max_bytes" >> "$run_dir/run.env.part"
+    mv -f "$run_dir/run.env.part" "$run_dir/run.env"
+else
+    rm -f "$run_dir/run.env.part"
+fi
+
 {
     printf '== fork-sandbox summary ==\n'
     printf 'branch:   %s\n' "$branch"
@@ -4656,6 +4688,8 @@ jq -n \
     --argjson author_email_unexpected "$author_email_bad_json" \
     --arg refresh "$refresh_ended" \
     --argjson continuations "$continuations_json" \
+    --argjson outbox_bytes "$outbox_bytes" \
+    --argjson outbox_max_bytes "$outbox_max_bytes" \
     '{
         version: $version,
         harness: $harness,
@@ -4678,6 +4712,8 @@ jq -n \
         total_cost_usd: $total_cost_usd,
         refresh: $refresh,
         continuations: $continuations,
+        outbox_bytes: $outbox_bytes,
+        outbox_max_bytes: $outbox_max_bytes,
         usage: $usage,
         usage_source: (if $usage == null then null else $usage_source end),
         session_dir: (if $session_dir == "" then null else $session_dir end),
