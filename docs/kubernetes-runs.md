@@ -200,6 +200,46 @@ constraint it imposes:
   when someone fetches. More moving parts; worth it once runs are routine.
   Not built in v1.
 
+## Getting artifacts back: the outbox
+
+`fetch` gets the branch back; it says nothing about anything that is not a
+commit — a screenshot, a rendered report, a coverage tree. `run` also pulls
+back `/work/outbox` from inside the pod, over the same `kubectl exec`
+channel `fetch` uses, and lands it at `--outbox-dir`'s path on the host —
+default `/var/tmp/claude-scratch/forks/k8s-<safe-branch>/outbox`. This is
+the cluster counterpart of the local sandbox's own unconditional
+`$run_dir/outbox`: a place for something a human will look at that does not
+belong in a commit, described to the agent in `fs_emit_prompt_preamble`'s
+"## Artifact outbox" preamble section.
+
+The pull-back is:
+
+- **Capped at 64 MiB.** An outbox is for a handful of screenshots or a
+  report, not a build artifact or a dataset; `run` reads the pod's tar
+  stream up to that cap plus one byte and refuses the whole thing if it is
+  over.
+- **Guarded before extraction.** `fork-sandbox-k8s-outbox-extract.sh` lists
+  every entry in the tarball and rejects the whole archive — no partial
+  extraction — if anything is an absolute path, has a `..` path component,
+  or is a symlink or hard link. Untarring a stream from an untrusted pod
+  onto the host is a path-traversal sink of exactly the shape `kubectl cp`'s
+  own CVEs have had; the extraction script's own header comment has the
+  full reasoning, including why listing every entry up front catches a
+  symlink-then-write escape that per-entry extraction-time checks alone
+  would miss.
+- **Best-effort.** A failure anywhere in the pull-back — the exec failing,
+  the size cap, the extraction guard rejecting the archive — warns and
+  falls through rather than failing the run. Retrieving artifacts must
+  never cost the branch itself.
+
+A run whose job is to produce an artifact — render a page, screenshot it —
+needs something in the pod that can do that, a browser in most cases, and
+the base image deliberately does not carry one; see
+[images/sandbox/Dockerfile](../images/sandbox/Dockerfile)'s own header. Name
+a custom image built `FROM` that base, with `K8S_IMAGE` — see "Bringing your
+own image and registry" below — rather than adding one to the base image
+everyone else's runs also pull.
+
 ## Getting the repository in: by push, not by clone
 
 **This is the biggest change from the original design, and it replaces two

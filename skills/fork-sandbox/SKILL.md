@@ -401,7 +401,7 @@ fork-sandbox.sh --k8s --model moonshotai/kimi-k3 --branch "<branch>" "<path>" "<
 
 **`--branch` is optional here too**, unlike a direct `fork-sandbox-k8s.sh run` call, which requires it up front to poll, fetch and clean up by. Leave it off and `--k8s` generates one the same way `submit` itself does, `k8s-<timestamp>`, so an auto-named branch is recognizable as a cluster run at a glance.
 
-**`--timeout <seconds>` and `--keep`** pass straight through to `fork-sandbox-k8s.sh run`: how long to wait for the agent before giving up, and whether to leave the Job and pod in place after a successful fetch instead of tearing them down. Both are refused without `--k8s`.
+**`--timeout <seconds>`, `--keep` and `--outbox-dir <path>`** pass straight through to `fork-sandbox-k8s.sh run`: how long to wait for the agent before giving up, whether to leave the Job and pod in place after a successful fetch instead of tearing them down, and where to land the pod's `/work/outbox` on the host once the run finishes (default `/var/tmp/claude-scratch/forks/k8s-<safe-branch>/outbox`). All three are refused without `--k8s`.
 
 What it cannot do yet, and why saying so matters: a flag this path cannot honor is refused by name rather than silently dropped, because a dropped flag looks identical to a run that used it — no error, no missing output, just a branch that is not what the flag promised.
 
@@ -451,7 +451,8 @@ clone inside it is mounted, and the log is written by the host shell.
 | `<run-dir>/handoff-<N>.md` | `--refresh-at` only: continuation N's prompt, exactly as the previous leg wrote it to the outbox |
 | `<run-dir>/continuation-prompt-<N>.md` | `--refresh-at` only: continuation N's whole rendered prompt (preamble plus the hand-off above) |
 | `<run-dir>/events-continuation-<N>.jsonl` | `--refresh-at` only: continuation N's own event stream, for its isolated cost and usage; its events also land in `events.jsonl`, unlike a review-loop leg's |
-| `<run-dir>/outbox/` | `--refresh-at` only: the one writable path outside the clone, where a nudged session leaves its hand-off; bound read-write into the sandbox |
+| `<run-dir>/outbox/` | the one writable path outside the clone, created and bound read-write on every run; a nudged `--refresh-at` session's hand-off lands here, and it's otherwise free for anything the agent wants a human to see — a screenshot, a report |
+| `--outbox-dir` path (`--k8s` only) | the pod's own `/work/outbox`, pulled back to the host here once the run finishes; see "Kubernetes runs" above |
 | `<run-dir>/inbox/` | operator addenda, written with `fork-sandbox-say.sh`; bound read-only into the sandbox |
 | `<run-dir>/exit-code` | written when the session exits |
 | `<run-dir>/pi-session` | `--harness pi` only: pi's session, with per-message cost |
