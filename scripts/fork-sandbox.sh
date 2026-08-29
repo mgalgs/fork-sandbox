@@ -665,13 +665,138 @@ fs_configure_select() {
     return 0
 }
 
-# Both filled in below, once the writer exists. Stubbed for now so
-# `configure` fails loudly rather than silently doing nothing while this
-# command is built up commit by commit.
-fs_configure_do_add() {
-    echo "fork-sandbox: configure: add path not implemented yet." >&2
-    exit 1
+# Checked before a value is ever written. $1 is the target ("<file>:<KEY>"),
+# $2 the raw value a discoverer's `value` verb printed.
+fs_configure_validate_value() {
+    local target="$1" value="$2" key
+    if [[ "$value" =~ ^[[:space:]]*$ ]]; then
+        echo "Error: configure: empty value for $target; refusing to write it." >&2
+        return 1
+    fi
+    # A newline here would inject a second NAME=VALUE line into the env
+    # file this is merged into -- a real escalation when the file is
+    # k8s.env, where K8S_CONTEXT picks the cluster a run talks to. Checked
+    # before fs_reject_unsafe_chars below too, so the reason is specific
+    # rather than folded into that helper's generic message.
+    if [[ "$value" == *$'\n'* || "$value" == *$'\r'* ]]; then
+        echo "Error: configure: value for $target contains a newline or" >&2
+        echo "carriage return. Writing it verbatim would inject a second" >&2
+        echo "NAME=VALUE line into the env file. Refusing." >&2
+        return 1
+    fi
+    fs_reject_unsafe_chars "$value" || return 1
+    key="${target#*:}"
+    case "$key" in
+        MODEL_ENDPOINT|K8S_PROXY_UPSTREAM)
+            if [[ ! "$value" =~ ^https?:// ]]; then
+                echo "Error: configure: '$key' must look like a URL (http://" >&2
+                echo "or https://); refusing to write it." >&2
+                return 1
+            fi
+            ;;
+    esac
+    return 0
 }
+
+# Writes one target's value into its file under $config_dir, merging rather
+# than clobbering: an existing NAME=VALUE line for this key is replaced in
+# place (first match, the same semantics fs_read_env_value reads back), and
+# every other line -- other keys, comments, blank lines -- survives
+# untouched. Builds a temp file beside the target and mv's it into place,
+# the atomic-write discipline used throughout this repo.
+#
+# A file receiving a "secret" target is created, or tightened, to mode
+# 0600; tightening an existing looser file is reported on stderr rather
+# than done silently, since a silent permission change is as confusing as
+# silently leaving one too loose.
+fs_configure_write_target() {
+    local target="$1" value="$2" secret="$3"
+    local file key tmp replaced=false line existing_mode=""
+    file="$config_dir/${target%%:*}"
+    key="${target#*:}"
+    tmp="$file.part"
+
+    if [[ -f "$file" ]]; then
+        existing_mode="$("$FS_STAT" -c '%a' -- "$file")"
+    fi
+
+    : > "$tmp"
+    if [[ -f "$file" ]]; then
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            if [[ "$replaced" == false && "$line" == "$key="* ]]; then
+                printf '%s=%s\n' "$key" "$value" >> "$tmp"
+                replaced=true
+            else
+                printf '%s\n' "$line" >> "$tmp"
+            fi
+        done < "$file"
+    fi
+    if [[ "$replaced" == false ]]; then
+        printf '%s=%s\n' "$key" "$value" >> "$tmp"
+    fi
+
+    if [[ "$secret" == secret ]]; then
+        chmod 0600 -- "$tmp"
+        if [[ -n "$existing_mode" && "$existing_mode" != "600" ]]; then
+            echo "fork-sandbox: configure: tightening $file to mode 0600 (was $existing_mode) because it now holds a secret." >&2
+        fi
+    elif [[ -n "$existing_mode" ]]; then
+        chmod "$existing_mode" -- "$tmp"
+    fi
+
+    mv -- "$tmp" "$file"
+}
+
+fs_configure_do_add() {
+    local all="$1" dry_run="$2"
+    fs_configure_gather
+
+    local n="${#FS_CAND_ID[@]}"
+    if (( n == 0 )); then
+        echo "fork-sandbox: configure: no discoverers found any candidates." >&2
+        return 0
+    fi
+
+    local -a fs_configure_display=()
+    local i target key file existing marker
+    for i in "${!FS_CAND_ID[@]}"; do
+        target="${FS_CAND_TARGET[$i]}"
+        marker=""
+        if [[ "$target" != "-" ]]; then
+            file="$config_dir/${target%%:*}"
+            key="${target#*:}"
+            existing="$(fs_read_env_value "$file" "$key" || true)"
+            [[ -n "$existing" ]] && marker=" (replaces existing)"
+        fi
+        fs_configure_display+=("${FS_CAND_LABEL[$i]} [$target] -- ${FS_CAND_SOURCE[$i]}: ${FS_CAND_DISPLAY[$i]}${marker}")
+    done
+
+    fs_configure_select fs_configure_display FS_CAND_SELECTABLE \
+        "configure: pick what to install" "$all" || exit 1
+
+    if (( ${#FS_CONFIGURE_SELECTED[@]} == 0 )); then
+        echo "fork-sandbox: configure: nothing selected." >&2
+        return 0
+    fi
+
+    local idx value secret
+    for idx in "${FS_CONFIGURE_SELECTED[@]}"; do
+        target="${FS_CAND_TARGET[$idx]}"
+        secret="${FS_CONFIGURE_TARGETS[$target]}"
+        value="$(fs_configure_fetch_value "$idx")" || continue
+        if ! fs_configure_validate_value "$target" "$value"; then
+            echo "Warning: configure: dropping ${FS_CAND_ID[$idx]} (see error above)." >&2
+            continue
+        fi
+        if [[ "$dry_run" == true ]]; then
+            echo "[dry-run] would write $target from ${FS_CAND_ID[$idx]} (${FS_CAND_DISPLAY[$idx]})" >&2
+            continue
+        fi
+        fs_configure_write_target "$target" "$value" "$secret"
+        echo "fork-sandbox: configure: wrote $target from ${FS_CAND_ID[$idx]}." >&2
+    done
+}
+
 fs_configure_do_remove() {
     echo "fork-sandbox: configure --remove: not implemented yet." >&2
     exit 1
