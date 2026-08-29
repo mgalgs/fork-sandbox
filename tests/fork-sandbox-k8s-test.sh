@@ -69,6 +69,17 @@
 #     no-progress, harness-error (a bad first verdict line, a missing
 #     verdict, and a SYMLINKED verdict whose target is never read), cap,
 #     and skipped (branch head already at --base-sha).
+#   - `--outbox-max` on both submit and run: a parsed value in each accepted
+#     unit (bare digits, K, M, G) reaches both the rendered Job spec's
+#     OUTBOX_MAX_BYTES env entry and fs_emit_prompt_preamble's stated MiB
+#     figure; run's own copy is forwarded through to submit's render, not
+#     just accepted directly; 0/negative/garbage values are rejected before
+#     anything is created, for both verbs; combined with --review-loop N,
+#     all three preamble renders (not just handoff.md) carry the raised
+#     figure; the default still renders when the flag is absent, and its
+#     literal matches the pod-side entrypoint's own default; the work
+#     emptyDir volume carries no sizeLimit key. The extractor honoring an
+#     explicit non-default cap is covered in its own section below.
 #
 # This lives in tests/ rather than scripts/tests/ on purpose: install.sh
 # iterates scripts/* and runs `sed -n 2p` on each entry to build the
@@ -591,6 +602,165 @@ refuses "run rejects an unknown option" \
     --branch fs-k8s-test-branch --model moonshotai/kimi-k3 --bogus \
     "$proj_dir" "$handoff_file"
 
+printf '\n== fork-sandbox-k8s.sh submit/run --dry-run --outbox-max ==\n'
+# --outbox-max threads one byte value into both the rendered Job spec's
+# OUTBOX_MAX_BYTES env entry and fs_emit_prompt_preamble's own stated
+# figure -- covers bare digits plus each accepted unit suffix, per the
+# operator addendum that added this flag ("a parsed value in each accepted
+# unit reaches the Job spec and the preamble text").
+check_outbox_max_render() {
+    local label="$1" out="$2" expected_bytes="$3" expected_mib="$4"
+    if grep -qF "value: \"$expected_bytes\"" "$out"; then
+        ok "$label: OUTBOX_MAX_BYTES=$expected_bytes in the Job spec"
+    else
+        no "$label: OUTBOX_MAX_BYTES=$expected_bytes in the Job spec" "not found in $out"
+    fi
+    if grep -qF "$expected_mib MiB budget" "$out"; then
+        ok "$label: preamble states $expected_mib MiB budget"
+    else
+        no "$label: preamble states $expected_mib MiB budget" "not found in $out"
+    fi
+}
+
+om_bare_out="$(newdir)/om-bare.yaml"; tmpdirs+=("$(dirname "$om_bare_out")")
+if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-om-bare --model moonshotai/kimi-k3 \
+    --outbox-max "$((100 * 1024 * 1024))" \
+    "$proj_dir" "$handoff_file" > "$om_bare_out" 2>/tmp/fs-k8s-test-om.err; then
+    ok "submit --outbox-max <bare digits> exits 0"
+else
+    no "submit --outbox-max <bare digits> exits 0" "$(cat /tmp/fs-k8s-test-om.err)"
+fi
+check_outbox_max_render "submit --outbox-max <bare digits>" "$om_bare_out" "$((100 * 1024 * 1024))" 100
+
+om_k_out="$(newdir)/om-k.yaml"; tmpdirs+=("$(dirname "$om_k_out")")
+if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-om-k --model moonshotai/kimi-k3 --outbox-max 131072K \
+    "$proj_dir" "$handoff_file" > "$om_k_out" 2>/tmp/fs-k8s-test-om.err; then
+    ok "submit --outbox-max 131072K exits 0"
+else
+    no "submit --outbox-max 131072K exits 0" "$(cat /tmp/fs-k8s-test-om.err)"
+fi
+check_outbox_max_render "submit --outbox-max 131072K" "$om_k_out" "$((131072 * 1024))" 128
+
+om_m_out="$(newdir)/om-m.yaml"; tmpdirs+=("$(dirname "$om_m_out")")
+if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-om-m --model moonshotai/kimi-k3 --outbox-max 256M \
+    "$proj_dir" "$handoff_file" > "$om_m_out" 2>/tmp/fs-k8s-test-om.err; then
+    ok "submit --outbox-max 256M exits 0"
+else
+    no "submit --outbox-max 256M exits 0" "$(cat /tmp/fs-k8s-test-om.err)"
+fi
+check_outbox_max_render "submit --outbox-max 256M" "$om_m_out" "$((256 * 1024 * 1024))" 256
+
+om_g_out="$(newdir)/om-g.yaml"; tmpdirs+=("$(dirname "$om_g_out")")
+if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-om-g --model moonshotai/kimi-k3 --outbox-max 2G \
+    "$proj_dir" "$handoff_file" > "$om_g_out" 2>/tmp/fs-k8s-test-om.err; then
+    ok "submit --outbox-max 2G exits 0"
+else
+    no "submit --outbox-max 2G exits 0" "$(cat /tmp/fs-k8s-test-om.err)"
+fi
+check_outbox_max_render "submit --outbox-max 2G" "$om_g_out" "$((2 * 1024 * 1024 * 1024))" 2048
+rm -f /tmp/fs-k8s-test-om.err
+
+# `run --dry-run --outbox-max` is a different code path than the direct
+# submit case above: cmd_run parses its own copy for its own pull-back
+# guard, then forwards the raw string into submit_argv for cmd_submit to
+# parse again for the Job spec -- the same boundary --review-loop already
+# crosses. Assert the forwarded path renders the same figure, not just the
+# direct one.
+om_run_out="$(newdir)/om-run.yaml"; tmpdirs+=("$(dirname "$om_run_out")")
+if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" run --dry-run \
+    --branch fs-k8s-test-om-run --model moonshotai/kimi-k3 --outbox-max 256M \
+    "$proj_dir" "$handoff_file" > "$om_run_out" 2>/tmp/fs-k8s-test-om-run.err; then
+    ok "run --outbox-max 256M exits 0"
+else
+    no "run --outbox-max 256M exits 0" "$(cat /tmp/fs-k8s-test-om-run.err)"
+fi
+check_outbox_max_render "run --outbox-max 256M (forwarded to submit)" "$om_run_out" "$((256 * 1024 * 1024))" 256
+rm -f /tmp/fs-k8s-test-om-run.err
+
+# Bad values are rejected before anything is created -- same convention as
+# the --review-loop bad-value checks above -- for both verbs, since each
+# parses its own copy via fs_parse_size_bytes.
+for verb in submit run; do
+    refuses "$verb --outbox-max 0 is rejected" \
+        "Error: size '0' must be greater than zero" \
+        env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" "$verb" --dry-run \
+        --branch fs-k8s-test-om-bad --model moonshotai/kimi-k3 --outbox-max 0 \
+        "$proj_dir" "$handoff_file"
+    refuses "$verb --outbox-max -5 is rejected" \
+        "Error: invalid size '-5'" \
+        env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" "$verb" --dry-run \
+        --branch fs-k8s-test-om-bad --model moonshotai/kimi-k3 --outbox-max -5 \
+        "$proj_dir" "$handoff_file"
+    refuses "$verb --outbox-max bogus is rejected" \
+        "Error: invalid size 'bogus'" \
+        env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" "$verb" --dry-run \
+        --branch fs-k8s-test-om-bad --model moonshotai/kimi-k3 --outbox-max bogus \
+        "$proj_dir" "$handoff_file"
+done
+
+# --review-loop N --outbox-max SIZE together: render_review_loop_configmap_keys
+# is a separate code path from the handoff.md render above, with its own
+# fs_emit_prompt_preamble calls for review-prompt.md and fix-prompt-header.md
+# -- confirm the raised figure reaches all three preamble renders, not just
+# handoff.md. 512K is deliberately sub-1-MiB: fs_emit_prompt_preamble's MiB
+# display truncates via integer division (see fork-sandbox-lib.sh), so this
+# also pins the pre-existing "0 MiB budget" display for a sub-1-MiB cap
+# rather than silently drifting if that rounding ever changes.
+om_rl_out="$(newdir)/om-rl.yaml"; tmpdirs+=("$(dirname "$om_rl_out")")
+if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-om-rl --model moonshotai/kimi-k3 \
+    --review-loop 2 --outbox-max 512K \
+    "$proj_dir" "$handoff_file" > "$om_rl_out" 2>/tmp/fs-k8s-test-om-rl.err; then
+    ok "submit --review-loop 2 --outbox-max 512K exits 0"
+else
+    no "submit --review-loop 2 --outbox-max 512K exits 0" "$(cat /tmp/fs-k8s-test-om-rl.err)"
+fi
+om_rl_mib_count="$(grep -c '0 MiB budget' "$om_rl_out" || true)"
+check "--review-loop + --outbox-max 512K: all three preambles (handoff.md, review-prompt.md, fix-prompt-header.md) state 0 MiB budget" \
+    3 "$om_rl_mib_count"
+om_rl_env_count="$(grep -cF 'value: "524288"' "$om_rl_out" || true)"
+check "--review-loop + --outbox-max 512K: exactly one OUTBOX_MAX_BYTES Job-spec env entry carries 524288" \
+    1 "$om_rl_env_count"
+rm -f /tmp/fs-k8s-test-om-rl.err
+
+# Default OUTBOX_MAX_BYTES (FS_OUTBOX_MAX_BYTES, unraised) still renders when
+# --outbox-max is absent -- reusing submit_out from the plain submit
+# --dry-run render earlier in this file, which was never given the flag.
+if grep -qF "value: \"$FS_OUTBOX_MAX_BYTES\"" "$submit_out"; then
+    ok "submit without --outbox-max renders the default OUTBOX_MAX_BYTES"
+else
+    no "submit without --outbox-max renders the default OUTBOX_MAX_BYTES" "not found in $submit_out"
+fi
+# The pod-side entrypoint has its own literal default (it does not source
+# fork-sandbox-lib.sh) -- guard the two from drifting apart silently.
+if grep -qF ":=$FS_OUTBOX_MAX_BYTES}" "$entrypoint_sh"; then
+    ok "fork-sandbox-k8s-entrypoint.sh's OUTBOX_MAX_BYTES default matches FS_OUTBOX_MAX_BYTES"
+else
+    no "fork-sandbox-k8s-entrypoint.sh's OUTBOX_MAX_BYTES default matches FS_OUTBOX_MAX_BYTES" \
+        "expected literal $FS_OUTBOX_MAX_BYTES in $entrypoint_sh"
+fi
+
+# The work emptyDir must never grow a sizeLimit key back (see the comment
+# on that volume entry in fork-sandbox-k8s.sh, which explains why -- and
+# which itself mentions the word "sizeLimit" in prose, so this checks for
+# the YAML key specifically rather than the bare substring). Scoped to the
+# work volume's own block, not the whole file, so this would still fail if
+# some other volume grew a sizeLimit while `work` stayed clean.
+work_volume_block="$(awk '
+    /^        - name: work$/ { p=1 }
+    p { print }
+    p && /emptyDir: \{\}/ { exit }
+' "$submit_out")"
+if [[ -n "$work_volume_block" ]] && ! grep -qE '^\s*sizeLimit:' <<< "$work_volume_block"; then
+    ok "the work emptyDir volume carries no sizeLimit"
+else
+    no "the work emptyDir volume carries no sizeLimit" "$work_volume_block"
+fi
+
 # Captured once, then matched, rather than piped straight into `grep -q`.
 # Piping is what made this flaky: `grep -q` exits the moment it matches,
 # which closes the pipe under usage()'s `sed`, which then dies of SIGPIPE --
@@ -788,6 +958,38 @@ if [[ ! -e "$of_big_dest" ]]; then
 else
     no "over-cap archive: nothing is extracted" "$of_big_dest exists"
 fi
+
+# An explicit $3 cap, not just the default -- the argument fork-sandbox-k8s.sh
+# actually passes (its own resolved outbox_max_bytes), so this exercises the
+# real call shape rather than only the no-arg default the two cases above use.
+of_cap_src="$(newdir)"; tmpdirs+=("$of_cap_src")
+printf 'a small file, well under any default cap\n' > "$of_cap_src/small.txt"
+of_cap_parent="$(newdir)"; tmpdirs+=("$of_cap_parent")
+of_cap_tar="$of_cap_parent/cap.tar"
+tar cf "$of_cap_tar" -C "$of_cap_src" .
+of_cap_dest_lo="$of_cap_parent/cap_dest_lo"
+refuses "an explicit low \$3 cap refuses an archive under the default cap" \
+    "byte cap; refusing it" \
+    "$outbox_extract_sh" "$of_cap_tar" "$of_cap_dest_lo" 10
+if [[ ! -e "$of_cap_dest_lo" ]]; then
+    ok "explicit low \$3 cap: nothing is extracted"
+else
+    no "explicit low \$3 cap: nothing is extracted" "$of_cap_dest_lo exists"
+fi
+of_cap_dest_hi="$of_cap_parent/cap_dest_hi"
+if "$outbox_extract_sh" "$of_cap_tar" "$of_cap_dest_hi" 1000000 \
+    >/tmp/fs-k8s-outbox-cap.err 2>&1; then
+    ok "an explicit high \$3 cap extracts the same archive"
+else
+    no "an explicit high \$3 cap extracts the same archive" "$(cat /tmp/fs-k8s-outbox-cap.err)"
+fi
+if [[ "$(cat "$of_cap_dest_hi/small.txt" 2>/dev/null)" == "a small file, well under any default cap" ]]; then
+    ok "explicit high \$3 cap: the file lands with its content intact"
+else
+    no "explicit high \$3 cap: the file lands with its content intact" \
+        "$(find "$of_cap_dest_hi" 2>&1)"
+fi
+rm -f /tmp/fs-k8s-outbox-cap.err
 
 # git disables the ext:: transport by default, so a push or fetch built
 # without -c protocol.ext.allow=always fails at the git layer with 'fatal:
