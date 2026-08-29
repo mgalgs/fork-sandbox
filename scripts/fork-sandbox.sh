@@ -2,6 +2,15 @@
 # fork-sandbox.sh — Run one unattended headless agent session in a sandboxed clone
 #
 # Usage: fork-sandbox.sh [options] <project-path> <handoff-file>
+#        fork-sandbox.sh configure [--remove] [--all] [--dry-run]
+#
+# `configure` discovers per-machine config already present on this host --
+# an OPENROUTER_API_KEY in the environment, a local model endpoint, a
+# kubectl context -- and installs the pieces you pick into
+# ~/.config/fork-sandbox/{pi,model,k8s}.env, the files documented below and
+# in docs/configure.md. `--remove` runs the same picker against what is
+# currently set, to take keys back out. See docs/configure.md for the full
+# picture, including how to add a new discoverer.
 #
 # --branch <name>:       branch the session commits on. Defaults to a
 #                        timestamped name.
@@ -371,6 +380,115 @@ status_cmd="fork-sandbox-status.sh"
 # a pi-local run, and the OpenRouter key for a pi run. agent-sandboxed reads
 # the same directory, and honors the same override.
 config_dir="${FORK_SANDBOX_CONFIG_DIR:-$HOME/.config/fork-sandbox}"
+
+# ---------------------------------------------------------------------------
+# `configure` -- discovering and installing the per-machine config above.
+# See docs/configure.md for the full picture; this comment covers only the
+# part that must not be casually loosened later.
+#
+# fork-sandbox.sh is blanket-approved in this project's own permission
+# config, so once launched it runs with nobody watching. A discoverer
+# (fork-sandbox-discover-<name>) is an executable found on PATH or beside
+# this script -- effectively a plugin supplied by whoever set up this
+# machine, not code this repo has reviewed. If a discoverer could name an
+# arbitrary file to write, running `configure` would be equivalent to
+# running whatever that plugin says, which defeats the point of a narrow
+# blanket approval.
+#
+# The fix: a discoverer never supplies a path, only a `target` string of
+# the form <file>:<KEY>, which is looked up in the table below -- a fixed
+# set of (filename, key) pairs compiled into this script. A target that is
+# not a key here is refused by name, loudly, and the candidate that named
+# it is dropped without being written anywhere. Every write `configure`
+# ever makes lands in $config_dir, under one of the four filenames that
+# appear as a key prefix below, with no other path reachable by any flag or
+# plugin. Adding a target means editing this table, in a reviewed change to
+# a script the user already trusts -- not something a discoverer can do by
+# itself, ever.
+#
+# The value half of each entry is "secret" or "plain". A "secret" target's
+# file is created (or tightened) to mode 0600, and its value is never
+# printed anywhere this command writes -- not in --dry-run, not in a
+# confirmation, not in an error.
+declare -A FS_CONFIGURE_TARGETS=(
+    [pi.env:OPENROUTER_API_KEY]=secret
+    [model.env:MODEL_ENDPOINT]=plain
+    [model.env:MODEL_ID]=plain
+    [k8s.env:K8S_CONTEXT]=plain
+    [k8s.env:K8S_NAMESPACE]=plain
+    [k8s.env:K8S_IMAGE]=plain
+    [k8s.env:K8S_PROXY_UPSTREAM]=plain
+    [k8s.env:K8S_DENIED_PROBE]=plain
+)
+
+cmd_configure_usage() {
+    cat <<'EOF'
+Usage: fork-sandbox.sh configure [--remove] [--all] [--dry-run]
+
+Discover per-machine config already on this host -- an OPENROUTER_API_KEY,
+a local model endpoint, a kubectl context -- and install the pieces you
+pick into ~/.config/fork-sandbox/{pi,model,k8s}.env.
+
+  --remove    show what is currently set and remove the selected keys,
+              instead of adding new ones.
+  --all       skip the picker and take every candidate (add) or every
+              currently-set key (remove). configure refuses to run
+              non-interactively without this.
+  --dry-run   print what would be written or removed; write nothing.
+  -h, --help  print this and exit.
+
+See docs/configure.md, including "Adding a discoverer".
+EOF
+}
+
+# Both filled in below, once the discoverer protocol (fs_configure_gather)
+# and the picker (fs_configure_select) exist. Stubbed for now so `configure`
+# fails loudly rather than silently doing nothing while this command is
+# built up commit by commit.
+fs_configure_do_add() {
+    echo "fork-sandbox: configure: add path not implemented yet." >&2
+    exit 1
+}
+fs_configure_do_remove() {
+    echo "fork-sandbox: configure --remove: not implemented yet." >&2
+    exit 1
+}
+
+cmd_configure() {
+    local remove=false all=false dry_run=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --remove) remove=true; shift ;;
+            --all) all=true; shift ;;
+            --dry-run) dry_run=true; shift ;;
+            -h|--help) cmd_configure_usage; exit 0 ;;
+            *)
+                echo "Error: configure: unknown option '$1'." >&2
+                echo "Run 'fork-sandbox.sh configure --help' for the options." >&2
+                exit 1
+                ;;
+        esac
+    done
+
+    mkdir -p -- "$config_dir"
+
+    if [[ "$remove" == true ]]; then
+        fs_configure_do_remove "$all" "$dry_run"
+    else
+        fs_configure_do_add "$all" "$dry_run"
+    fi
+}
+
+# Intercepted before the flag-parsing loop below, and before config_dir's
+# usual readers care what $1 is: the loop that follows treats $1 as either
+# an option or the leading `<project-path>` positional, and `configure`
+# would otherwise be mistaken for one or the other. This is the same place
+# fork-sandbox-k8s.sh intercepts -h/--help, for the same reason.
+if [[ "${1-}" == configure ]]; then
+    shift
+    cmd_configure "$@"
+    exit 0
+fi
 
 usage() {
     # The header block is the documentation: print it from line 2 down to the

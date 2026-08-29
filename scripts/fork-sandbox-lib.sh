@@ -112,6 +112,41 @@ fs_reject_unsafe_chars() {
     return 0
 }
 
+# Reads one NAME=VALUE line from an env file, first match wins. This is the
+# same first-match, never-`source`d contract fork-sandbox-k8s.sh's own
+# read_env_value applies to k8s.env and pi.env -- kept as a second, identical
+# copy rather than a shared call, because fork-sandbox-configure's target
+# table (fork-sandbox.sh) and the Kubernetes run path (fork-sandbox-k8s.sh)
+# are reviewed as separate surfaces, and this repo does not import behavior
+# across that boundary. If one changes, check the other.
+fs_read_env_value() {
+    local file="$1" key="$2" line
+    [[ -f "$file" ]] || return 1
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        if [[ "$line" == "$key="* ]]; then
+            printf '%s\n' "${line#*=}"
+            return 0
+        fi
+    done < "$file"
+    return 1
+}
+
+# Masks a secret down to its last 4 characters, for display anywhere a value
+# might otherwise leak: a TUI listing, a --dry-run render, a --remove
+# confirmation. `fork-sandbox.sh configure`'s discoverer protocol (see
+# docs/configure.md) requires every discoverer to mask a secret candidate's
+# `display` field with exactly this shape before it is ever printed, so the
+# format is fixed here rather than left to each discoverer to invent.
+fs_mask_secret() {
+    local v="$1"
+    if (( ${#v} <= 4 )); then
+        printf '…%s' "$v"
+    else
+        printf '…%s' "${v: -4}"
+    fi
+}
+
 # Print the top level of the repository holding a path.
 fs_repo_toplevel() {
     local path="$1"
