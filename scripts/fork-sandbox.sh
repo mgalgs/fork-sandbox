@@ -135,6 +135,12 @@
 #                        fork-sandbox-k8s.sh run). Defaults to
 #                        /var/tmp/claude-scratch/forks/k8s-<safe-branch>/outbox.
 #                        Refused without --k8s.
+# --outbox-max <size>:   raise the outbox size cap above the default 64 MiB.
+#                        Takes a plain byte count or a size with a K/M/G
+#                        suffix (512K, 256M, 2G). Applies to both the local
+#                        path and --k8s -- there is no upper ceiling, since
+#                        the operator raising it is the one accepting the
+#                        extra disk cost.
 # -h, --help:            print this header and exit.
 #
 # The run gets its own detached tmux session, not a window of yours, so
@@ -1031,6 +1037,7 @@ k8s_mode=false
 k8s_timeout=""
 k8s_keep=false
 k8s_outbox_dir=""
+outbox_max_arg=""
 
 while [[ "${1:-}" == -* ]]; do
     case "$1" in
@@ -1137,6 +1144,10 @@ while [[ "${1:-}" == -* ]]; do
             ;;
         --outbox-dir)
             k8s_outbox_dir="${2:?--outbox-dir requires a path}"
+            shift 2
+            ;;
+        --outbox-max)
+            outbox_max_arg="${2:?--outbox-max requires a size}"
             shift 2
             ;;
         -h|--help)
@@ -1364,6 +1375,15 @@ if [[ "$review_harness_given" == true && "$review_harness" == "pi" && -z "$revie
     exit 1
 fi
 
+# Validated here, above both the --k8s dispatch below and the local dry-run
+# exit further down, since --outbox-max applies to both paths and must fail
+# before either one creates anything. fs_parse_size_bytes already prints its
+# own error naming what was given, so there is nothing to add on failure.
+outbox_max_bytes="$FS_OUTBOX_MAX_BYTES"
+if [[ -n "$outbox_max_arg" ]]; then
+    outbox_max_bytes="$(fs_parse_size_bytes "$outbox_max_arg")" || exit 1
+fi
+
 # --k8s dispatches the whole run to fork-sandbox-k8s.sh run, which submits it
 # as a Kubernetes Job -- see the header comment above and
 # docs/kubernetes-runs.md. This block is placed here, before the review-loop,
@@ -1511,6 +1531,11 @@ if [[ "$k8s_mode" == true ]]; then
     # nothing to duplicate here.
     [[ -n "$review_loop_arg" ]] && k8s_argv+=(--review-loop "$review_loop_arg")
     [[ -n "$k8s_outbox_dir" ]] && k8s_argv+=(--outbox-dir "$k8s_outbox_dir")
+    # Forwarded as the raw string, not the byte count already parsed above:
+    # fork-sandbox-k8s.sh does its own parsing, so there is one source of
+    # truth per process rather than a cross-process byte count to keep in
+    # sync.
+    [[ -n "$outbox_max_arg" ]] && k8s_argv+=(--outbox-max "$outbox_max_arg")
     k8s_argv+=(--branch "$branch" --model "$model" "$project_path" "$handoff_file")
 
     exec "$script_dir/fork-sandbox-k8s.sh" "${k8s_argv[@]}"
@@ -1792,6 +1817,7 @@ if [[ "$dry_run" == true ]]; then
     done
     printf 'prompt_overlay_rev=%s\n' "$prompt_overlay_rev"
     printf 'refresh_at=%s\nrefresh_max=%s\n' "$refresh_at" "$refresh_max"
+    printf 'outbox_max_bytes=%s\n' "$outbox_max_bytes"
     if (( refresh_enabled )); then
         printf 'refresh_context_window=%s\nrefresh_threshold_tokens=%s\n' \
             "$refresh_context_window" "$refresh_threshold_tokens"
@@ -2861,7 +2887,7 @@ fs_emit_prompt_overlay() {
 
 {
     fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" "$harness" "$preamble_network" \
-        "$outbox_dir" "" "$FS_OUTBOX_MAX_BYTES"
+        "$outbox_dir" "" "$outbox_max_bytes"
     if (( services_enabled )); then
         cat <<EOF
 
@@ -2919,7 +2945,7 @@ if (( review_loop_cap > 0 )); then
     {
         fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" \
             "$review_preamble_harness" "$review_preamble_network" "$outbox_dir" \
-            "" "$FS_OUTBOX_MAX_BYTES"
+            "" "$outbox_max_bytes"
         fs_emit_prompt_overlay review
         fs_emit_review_prompt_body "$branch" "$base_sha" "$review_skill_dir" \
             "$review_verdict_file" "$inbox_dir"
@@ -2928,7 +2954,7 @@ if (( review_loop_cap > 0 )); then
 
     {
         fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" "$harness" "$preamble_network" \
-            "$outbox_dir" "" "$FS_OUTBOX_MAX_BYTES"
+            "$outbox_dir" "" "$outbox_max_bytes"
         fs_emit_prompt_overlay fix
         fs_emit_fix_prompt_body "$branch" "$base_sha"
     } > "$fix_prompt_header.part"
@@ -2947,7 +2973,7 @@ if (( refresh_enabled )); then
     continuation_prompt_header="$run_dir/continuation-prompt-header.md"
     fs_reject_unsafe_chars "$continuation_prompt_header"
     fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" "$harness" "$preamble_network" \
-        "$outbox_dir" "" "$FS_OUTBOX_MAX_BYTES" > "$continuation_prompt_header.part"
+        "$outbox_dir" "" "$outbox_max_bytes" > "$continuation_prompt_header.part"
     mv -- "$continuation_prompt_header.part" "$continuation_prompt_header"
 fi
 
@@ -3298,6 +3324,7 @@ started_at="$(date +%s)"
     printf 'review_harness=%s\n' "$review_harness"
     printf 'session=%s\n' "$session_name"
     printf 'review_loop_cap=%s\n' "$review_loop_cap"
+    printf 'outbox_max_bytes=%s\n' "$outbox_max_bytes"
     printf 'started_at=%s\n' "$started_at"
 } > "$run_dir/run.env"
 
@@ -3368,6 +3395,7 @@ started_at="$(date +%s)"
     printf 'refresh_max=%q\n' "$refresh_max"
     printf 'refresh_config=%q\n' "$refresh_config"
     printf 'outbox_dir=%q\n' "$outbox_dir"
+    printf 'outbox_max_bytes=%q\n' "$outbox_max_bytes"
     printf 'continuation_prompt_header=%q\n' "$continuation_prompt_header"
     printf 'user_shell=%q\n' "$user_shell"
     printf 'keep_open=%q\n' "$keep_open"
