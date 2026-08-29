@@ -52,7 +52,7 @@ run() {
     # filtered out here so this file stays scoped to harness/model
     # resolution, its own subject.
     "$launcher" --dry-run "$@" unused-project unused-handoff \
-        | grep -v -e '^prompt_overlay_' -e '^refresh_'
+        | grep -v -e '^prompt_overlay_' -e '^refresh_' -e '^outbox_max_bytes='
 }
 
 printf '== fork-sandbox harness/model resolution ==\n'
