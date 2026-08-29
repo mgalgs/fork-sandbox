@@ -721,6 +721,14 @@ fs_configure_write_target() {
     fi
 
     : > "$tmp"
+    # Tighten BEFORE the value goes in, not after. The temp file is created
+    # with the ambient umask -- commonly 0644 -- and $config_dir itself is
+    # world-executable, so chmodding only once the merge loop below had
+    # already written the secret would leave it readable by any other local
+    # user for the length of that loop. A test can only observe the final
+    # mode, so this window would pass every assertion while still being a
+    # real exposure.
+    [[ "$secret" == secret ]] && chmod 0600 -- "$tmp"
     if [[ -f "$file" ]]; then
         while IFS= read -r line || [[ -n "$line" ]]; do
             if [[ "$replaced" == false && "$line" == "$key="* ]]; then
