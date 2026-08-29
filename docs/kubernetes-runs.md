@@ -214,10 +214,21 @@ belong in a commit, described to the agent in `fs_emit_prompt_preamble`'s
 
 The pull-back is:
 
-- **Capped at 64 MiB.** An outbox is for a handful of screenshots or a
-  report, not a build artifact or a dataset; `run` reads the pod's tar
-  stream up to that cap plus one byte and refuses the whole thing if it is
-  over.
+- **Capped, default 64 MiB, raisable per-run.** An outbox is for a handful
+  of screenshots or a report, not a build artifact or a dataset; `run`
+  reads the pod's tar stream up to the cap plus one byte and refuses the
+  whole thing if it is over. The default lives in `FS_OUTBOX_MAX_BYTES`;
+  raise it with `--outbox-max SIZE` on `submit` or `run` (bare digits mean
+  bytes, or use a `K`/`M`/`G` suffix — `512K`, `256M`, `2G`) for a task
+  expected to produce a larger dump. There is no upper ceiling — whoever
+  raises it is the one accepting the disk cost. The effective value is
+  threaded everywhere it matters, not just the client's own check: the
+  `OUTBOX_MAX_BYTES` a pod checks itself against before its run is done,
+  the extraction guard's cap below, and the figure the "## Artifact
+  outbox" preamble section states to the agent, so a raised cap can't
+  leave any of those still quoting the default. It is also recorded
+  alongside the outbox's actual size in `run.env` and `summary.json`, so a
+  run can be read back later against the budget it actually had.
 - **Guarded before extraction.** `fork-sandbox-k8s-outbox-extract.sh` lists
   every entry in the tarball and rejects the whole archive — no partial
   extraction — if anything is an absolute path, has a `..` path component,
