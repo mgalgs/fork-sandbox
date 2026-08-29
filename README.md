@@ -125,6 +125,44 @@ models its local cache actually offers. Use `--dry-run` to print the resolved
 harness and model without creating a run, or `--model-unchecked` to send a new
 model id verbatim before it appears in the cache.
 
+## A run that refreshes itself
+
+An interactive session that fills its context window writes a hand-off and
+forks a fresh session rather than degrade into compaction. `--refresh-at`
+gives an unattended run the same move, with no human in the loop.
+
+Its default is on: `--refresh-at 0.5` nudges a session, once, when it has used
+half its model's context window, to finish the step it is on, commit, write a
+self-contained hand-off to a writable outbox, and end its turn. If it does,
+the run moves that hand-off to `<run-dir>/handoff-N.md` — the record — and
+starts a fresh session on the *same clone and branch* with it as the prompt:
+continuation N, with no memory of the session before it. That repeats, on the
+same nudge-and-check cycle, until a leg ends with nothing waiting in the
+outbox — the ordinary ending — until `--refresh-max` legs have run (default
+6), or until a nudged leg ends its turn without writing a hand-off at all.
+`--review-loop`, when both are given, then runs once, after the *last* coding
+leg, over every commit the whole chain made.
+
+```bash
+fork-sandbox.sh --branch "<branch>" "<path>" "<handoff>"                # on by default
+fork-sandbox.sh --refresh-at 0 --branch "<branch>" "<path>" "<handoff>" # disabled
+fork-sandbox.sh --refresh-at 100000 --refresh-max 3 \
+    --branch "<branch>" "<path>" "<handoff>"                           # an absolute token count
+```
+
+It costs what it looks like it costs: each continuation is another whole
+session, at the same model's price. `<run-dir>/summary.json`'s
+`continuations` array and `refresh` field say what happened — how many legs
+ran, each one's exit, cost and usage, and how the chain ended — and
+`total_cost_usd` folds every continuation in beside the review loop's own
+legs, the same way it already does for `--review-loop`.
+
+**`claude` only, for now.** The threshold is measured by a hook installed into
+the local sandbox's claude session, which reads the transcript on every tool
+call; `pi`, `pi-local` and `codex` have no hook system to measure with, so
+`--refresh-at` is refused outright on those harnesses, and on `--k8s`, whose
+pod runs a different entrypoint.
+
 ## The three network modes
 
 Every run is in exactly one of these, and the mode decides what a compromised

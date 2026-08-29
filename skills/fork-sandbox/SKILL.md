@@ -1,7 +1,7 @@
 ---
 name: fork-sandbox
 description: Fork a task to an unattended Claude Code session in a sandboxed clone of the repo. Headless, so it needs no keypress, exits on its own, fetches its branch back, and logs every event to a file this session can watch. A running session can still be steered with fork-sandbox-say.sh, which sends it an operator addendum. Use when work should run without babysitting — a refactor, a test sweep, a long build.
-argument-hint: [--branch <name>] [--model <model>] [--harness <harness>[/<model>]] [--review-loop <N>] [--review-model <model>] [--sandbox-args "..."] [--k8s [--timeout <seconds>] [--keep]] <project-path> — path to the target project (omit or use "." for the current repo). Use --branch to name the branch the session commits on. Use --model to pick the model (fable, opus, sonnet) or append it to the harness. Use --harness pi to run pi against OpenRouter, which then requires a model; --harness pi-local to run pi against a self-hosted endpoint in a sandbox with no network at all, which costs nothing; or --harness codex to run OpenAI codex on your ChatGPT sign-in. Use --review-loop N to have a fresh session review the run's commits and a third session fix what it found, up to N times; --review-model selects a different model for review legs only. Use --sandbox-args "--unpin-egress" only when the task must reach the tailnet, a VPN, or a libvirt/docker bridge. Use --k8s to run in a Kubernetes cluster instead of the local sandbox — defaults to --harness pi (the only harness it builds; still needs --model) and refuses most other flags by name; see "Kubernetes runs" below.
+argument-hint: [--branch <name>] [--model <model>] [--harness <harness>[/<model>]] [--review-loop <N>] [--review-model <model>] [--refresh-at <fraction|tokens>] [--refresh-max <n>] [--sandbox-args "..."] [--k8s [--timeout <seconds>] [--keep]] <project-path> — path to the target project (omit or use "." for the current repo). Use --branch to name the branch the session commits on. Use --model to pick the model (fable, opus, sonnet) or append it to the harness. Use --harness pi to run pi against OpenRouter, which then requires a model; --harness pi-local to run pi against a self-hosted endpoint in a sandbox with no network at all, which costs nothing; or --harness codex to run OpenAI codex on your ChatGPT sign-in. Use --review-loop N to have a fresh session review the run's commits and a third session fix what it found, up to N times; --review-model selects a different model for review legs only. --refresh-at (default 0.5, claude only) nudges a session to hand off to a fresh one when its context fills up rather than degrade into compaction; 0 disables it, and --refresh-max caps how many continuations may chain (default 6). Use --sandbox-args "--unpin-egress" only when the task must reach the tailnet, a VPN, or a libvirt/docker bridge. Use --k8s to run in a Kubernetes cluster instead of the local sandbox — defaults to --harness pi (the only harness it builds; still needs --model) and refuses most other flags by name; see "Kubernetes runs" below.
 ---
 
 # Fork Sandbox
@@ -63,6 +63,8 @@ reach it — see "What it gives up".)
    fork-sandbox.sh --task-meta '{"kind":"implement","difficulty":3,"size":"m"}' --branch "<branch>" "<path>" "<handoff>"
    fork-sandbox.sh --review-loop 2 --branch "<branch>" "<path>" "<handoff>"
    fork-sandbox.sh --review-loop 2 --review-model opus --branch "<branch>" "<path>" "<handoff>"
+   fork-sandbox.sh --refresh-at 0 --branch "<branch>" "<path>" "<handoff>"
+   fork-sandbox.sh --refresh-at 0.3 --refresh-max 3 --branch "<branch>" "<path>" "<handoff>"
    ```
    Pass `--sandbox-args "--unpin-egress"` only when the task must reach the
    tailnet, a VPN, or a libvirt/docker bridge. It removes a restriction.
@@ -112,6 +114,49 @@ reach it — see "What it gives up".)
    is worth quoting to the user when the loop ended in `cap` or
    `no-progress`, which means the branch came back with findings still
    outstanding.
+
+   ### `--refresh-at` — let a run fork a fresh session from a hand-off
+
+   On by default (`0.5`, `claude` only), so most launches never need to think
+   about it. When a coding leg's own context fills past the threshold, a hook
+   nudges it, once, to finish the step it is on, commit, write a
+   self-contained hand-off, and end its turn. If it does, the run moves that
+   hand-off to `<run-dir>/handoff-N.md` and starts a **fresh** session on the
+   same clone and branch with it as the prompt — continuation N, with no
+   memory of the session before it. That repeats until a leg ends with
+   nothing to continue from (the ordinary ending), `--refresh-max` legs have
+   run (default 6), or a nudged leg ends without writing a hand-off at all.
+   `--review-loop`, when both are given, still runs once, after the *last*
+   coding leg — it reviews every commit the whole chain made, not just the
+   first leg's.
+
+   Pass `--refresh-at 0` to disable it outright — for a task you know fits in
+   one context, or while debugging something else and one fewer moving part
+   helps. A number above `1` is an absolute token count instead of a fraction
+   of the model's context window (`--refresh-at 100000`); `--refresh-max`
+   caps how many continuations may chain before the run gives up and moves on
+   to the review loop anyway.
+
+   **It costs sessions**, the same way `--review-loop` does: each
+   continuation is a whole extra session at the same model's price.
+   `summary.json`'s `continuations` array has one entry per leg that actually
+   ran — exit, cost, usage, and which `handoff-N.md` its prompt was built
+   from — and its `refresh` field says how the chain ended: `none`
+   (disabled), `empty-outbox` (the ordinary ending), `cap`, or `no-handoff`
+   (a leg was nudged and never wrote one — worth a look, since it means the
+   run may have run out of room mid-thought). `total_cost_usd` folds every
+   continuation in beside the review loop's own legs.
+
+   **Watching one is no different**, for the same reason a review loop
+   isn't: the run counts as running until the last leg is done, so the
+   Monitor tool still fires one terminal event at the end. `--monitor` prints
+   a line when a continuation starts (`◆ fork-sandbox-refresh: leg 2 from
+   handoff-1.md`), and the summary's `review:` line gets a sibling `refresh:`
+   line when a continuation actually ran.
+
+   `pi`, `pi-local` and `codex` have no hook system to measure context with,
+   so `--refresh-at` is refused outright on those harnesses — not silently
+   ignored — and on `--k8s`.
 
    The script prints the **run directory** and the exact monitor, status and
    result commands. Keep the run directory path; everything else needs it.
@@ -199,6 +244,8 @@ The status block counts what you have sent, and `--monitor` prints a line when o
 inbox:    2 addenda
 ◆ fork-sandbox-inbox: delivered 1787718559-01.md
 ```
+
+**Steering keeps working across a `--refresh-at` continuation.** The inbox is bound at the same path for every leg of the chain — the implement leg and every continuation — so an addendum written while leg 2 is running lands on leg 2, exactly as it would on a run with no refresh at all. What does *not* carry across a continuation is anything a session only holds in its own head: an addendum sent to leg 1 and never read reaches leg 1 through the same hook that always delivers it, but a leg that already finished cannot act on a correction meant for it. If you steer a run that might already be several legs in, check `--monitor`'s output for which leg is current before assuming your addendum landed where you meant it to.
 
 ### What to send, and what not to
 
@@ -358,6 +405,7 @@ fork-sandbox.sh --k8s --model moonshotai/kimi-k3 --branch "<branch>" "<path>" "<
 What it cannot do yet, and why saying so matters: a flag this path cannot honor is refused by name rather than silently dropped, because a dropped flag looks identical to a run that used it — no error, no missing output, just a branch that is not what the flag promised.
 
 - **No review loop.** `--review-loop` and `--review-model` are refused. The loop is host-side today — the review and fix prompts are generated on the host, and the `code-review-portable` skill is not in the pod image — so review the branch yourself after fetching it, same as always.
+- **No context refresh.** `--refresh-at` and `--refresh-max` are refused, for the same reason the other harnesses refuse them: the threshold is measured by a hook installed into the local sandbox's claude session, and a pod runs a different entrypoint with no such hook.
 - **No other harness.** `--harness claude`, `pi-local` and `codex` are all refused; pi against the model proxy is the only agent this path runs, for the same sealed-network reason `--harness pi-local` is pi-only locally.
 - **No per-run services.** `.agents/sandbox-services/` never runs in a pod, so `--no-services` and `--services-trust-ref` are refused outright — there is no mechanism on this path for either to control.
 - **No operator inbox.** `fs_emit_prompt_preamble` (shared with the local path) still prepends the clone-path block and a gated-egress block naming the model proxy as the pod's only reachable destination, but the inbox section is left out — there is no `--k8s` inbox yet, so the pod is never told to poll a directory that does not exist.
@@ -393,12 +441,16 @@ clone inside it is mounted, and the log is written by the host shell.
 | `<run-dir>/events.jsonl` | every event, one JSON object per line |
 | `<run-dir>/sandbox.log` | the sandbox wrapper's messages, startup errors included |
 | `<run-dir>/summary.txt` | branch, exit code, commit list and diffstat after the fetch |
-| `<run-dir>/summary.json` | the same facts structured — harness and its version, model, exit code, commits with subjects, `cost_usd`, `total_cost_usd` (the run plus any `--review-loop` legs), `usage` token counts, and `author_email_unexpected` (empty unless a returned commit carries an address other than the repo's own) — for reading, not grepping |
+| `<run-dir>/summary.json` | the same facts structured — harness and its version, model, exit code, commits with subjects, `cost_usd`, `total_cost_usd` (the run plus any `--review-loop` or `--refresh-at` legs), `refresh` and `continuations` (`--refresh-at`'s own record), `usage` token counts, and `author_email_unexpected` (empty unless a returned commit carries an address other than the repo's own) — for reading, not grepping |
 | `<run-dir>/handoff.md` | the prompt as it was sent |
 | `<run-dir>/task-meta.json` | the `--task-meta` object, when one was given |
 | `<run-dir>/review-loop.json` | `--review-loop` only: how the loop ended, and one record per iteration |
 | `<run-dir>/review-verdict-<i>.md` | `--review-loop` only: what the reviewer wrote, verbatim |
 | `<run-dir>/events-review-<i>.jsonl`, `<run-dir>/events-fix-<i>.jsonl` | `--review-loop` only: each loop leg's own event stream |
+| `<run-dir>/handoff-<N>.md` | `--refresh-at` only: continuation N's prompt, exactly as the previous leg wrote it to the outbox |
+| `<run-dir>/continuation-prompt-<N>.md` | `--refresh-at` only: continuation N's whole rendered prompt (preamble plus the hand-off above) |
+| `<run-dir>/events-continuation-<N>.jsonl` | `--refresh-at` only: continuation N's own event stream, for its isolated cost and usage; its events also land in `events.jsonl`, unlike a review-loop leg's |
+| `<run-dir>/outbox/` | `--refresh-at` only: the one writable path outside the clone, where a nudged session leaves its hand-off; bound read-write into the sandbox |
 | `<run-dir>/inbox/` | operator addenda, written with `fork-sandbox-say.sh`; bound read-only into the sandbox |
 | `<run-dir>/exit-code` | written when the session exits |
 | `<run-dir>/pi-session` | `--harness pi` only: pi's session, with per-message cost |

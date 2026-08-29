@@ -355,9 +355,21 @@ than the correction. Steering does not repair a bad premise; it just spends the
 rest of the run acting on it. If you find yourself writing a third addendum to
 the same run, that is the signal.
 
-**There is no resume flag.** `fork-sandbox.sh` starts a fresh session every
-time, and the sandbox is destroyed with its clone. A second round is a new
-run that starts from the first one's branch:
+**A run can continue itself, but only for one reason: running out of room.**
+`fork-sandbox.sh --refresh-at` (on by default) nudges a session that fills
+its own context to write a hand-off and end its turn, then forks a fresh
+session on the *same* clone and branch to keep going from it — automatically,
+with the same handoff and the same goal, no orchestrator involvement. That is
+the whole of what it does. It does not read a review, does not change
+direction, and does not know the branch came back wrong; it exists purely so
+a long task does not degrade into compaction partway through. Nothing here
+changes because of it.
+
+What there is still no flag for is resuming with NEW instructions — a
+different handoff, a corrected approach, or one round applying what a review
+found. `fork-sandbox.sh` starts a fresh session every time, and the sandbox
+is destroyed with its clone, so THAT kind of second round is a new run that
+starts from the first one's branch:
 
 ```bash
 fork-sandbox.sh --model sonnet --branch "<branch>-2" --checkout "<branch>" \
