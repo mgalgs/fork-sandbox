@@ -67,6 +67,10 @@
 # in -- can never sweep an addendum into a commit. /work/skills, created
 # below when a review skill is shipped, is a sibling for the identical
 # reason.
+#
+# Also creates /work/outbox: the artifact outbox, read back out of the pod
+# by `fork-sandbox-k8s.sh run` over kubectl exec once the agent finishes.
+# Same sibling-of-clone_dir reasoning as /work/inbox above.
 
 set -euo pipefail
 
@@ -90,6 +94,7 @@ work_dir=/work
 repo_bare="$work_dir/repo.git"
 clone_dir="$work_dir/clone"
 inbox_dir="$work_dir/inbox"
+outbox_dir="$work_dir/outbox"
 skill_dir="$work_dir/skills/code-review-portable"
 sentinel="$work_dir/.inputs-complete"
 fetched_marker="$work_dir/.fetched"
@@ -97,6 +102,8 @@ run_complete="$work_dir/.run-complete"
 
 echo "fork-sandbox-k8s-entrypoint: creating $inbox_dir" >&2
 mkdir -p "$inbox_dir"
+echo "fork-sandbox-k8s-entrypoint: creating $outbox_dir" >&2
+mkdir -p "$outbox_dir"
 
 # The review skill, staged only when this run carries one. A ConfigMap key
 # cannot contain '/', so the skill arrives flattened at
