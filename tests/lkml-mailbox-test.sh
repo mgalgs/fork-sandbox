@@ -314,5 +314,47 @@ rc=$?
 if (( rc != 0 )); then ok "refuses an attachment over the 4 MiB cap"; else no "refuses an attachment over the 4 MiB cap" "it succeeded"; fi
 contains "the cap refusal names the byte cap" "$out" "4194304"
 
+printf '\n== init --diffstat / --smoke ==\n'
+
+diffstat_repo="$(mktemp -d)"; tmpdirs+=("$diffstat_repo")
+git -C "$diffstat_repo" init -q
+git -C "$diffstat_repo" config user.email test@example.com
+git -C "$diffstat_repo" config user.name "Test"
+printf 'base\n' > "$diffstat_repo/file.txt"
+git -C "$diffstat_repo" add file.txt
+git -C "$diffstat_repo" commit -q -m "base"
+base_sha="$(git -C "$diffstat_repo" rev-parse HEAD)"
+printf 'base\nmore\n' > "$diffstat_repo/file.txt"
+git -C "$diffstat_repo" commit -q -am "add a line"
+tip_sha="$(git -C "$diffstat_repo" rev-parse HEAD)"
+
+printf 'all tests passed: 42/42\n' > smoke.txt
+
+out="$(cd "$diffstat_repo" && "$mailbox" init widget-frob --cover "$work/cover.txt" --patches "$work/patches" \
+    --from author --harness claude --model opus --diffstat "$base_sha..$tip_sha" --smoke "$work/smoke.txt" 2>diag.txt)"
+rc=$?
+check "init --diffstat/--smoke exits 0" "0" "$rc"
+diffstat_cover_id="$out"
+raw_diffstat="$("$mailbox" show widget-frob "${diffstat_cover_id:0:7}")"
+contains "cover body gets a Diffstat section" "$raw_diffstat" "## Diffstat"
+contains "the diffstat section carries git's own output" "$raw_diffstat" "file.txt"
+contains "cover body gets a Test results section" "$raw_diffstat" "## Test results"
+contains "the Test results section carries the smoke file verbatim" "$raw_diffstat" "all tests passed: 42/42"
+
+out="$(cd "$diffstat_repo" && "$mailbox" init widget-frob --cover "$work/cover.txt" --patches "$work/patches" \
+    --from author --harness claude --model opus --smoke "$work/nosuchfile.txt" 2>&1)"
+rc=$?
+if (( rc != 0 )); then ok "refuses a --smoke file that does not exist"; else no "refuses a --smoke file that does not exist" "it succeeded"; fi
+
+out="$(cd "$diffstat_repo" && "$mailbox" init widget-frob --cover "$work/cover.txt" --patches "$work/patches" \
+    --from author --harness claude --model opus --diffstat "nonsense..alsobogus" 2>&1)"
+rc=$?
+if (( rc != 0 )); then ok "refuses a --diffstat range that fails to diff"; else no "refuses a --diffstat range that fails to diff" "it succeeded"; fi
+
+out="$("$mailbox" init widget-frob --cover "$work/cover.txt" --patches "$work/patches" \
+    --from author --harness claude --model opus --diffstat "$base_sha..$tip_sha" 2>&1)"
+rc=$?
+if (( rc != 0 )); then ok "refuses a --diffstat range when cwd is not a git repo"; else no "refuses a --diffstat range when cwd is not a git repo" "it succeeded"; fi
+
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 (( fail == 0 )) || exit 1

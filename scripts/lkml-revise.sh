@@ -351,9 +351,9 @@ if ! (cd "$real_repo" && git format-patch --quiet -o "$patch_dir" "$series_base_
     exit 1
 fi
 
-new_cover_id="$("$mailbox" init "$series" --cover "$cover_file" --patches "$patch_dir" \
+new_cover_id="$(cd "$real_repo" && "$mailbox" init "$series" --cover "$cover_file" --patches "$patch_dir" \
     --from "$author_persona" --display "$display" --version "$next_version" \
-    --harness "$harness" --model "$model")"
+    --harness "$harness" --model "$model" --diffstat "$series_base_sha..$real_branch")"
 echo "fork-sandbox lkml-revise: posted v$next_version, cover ${new_cover_id:0:7}." >&2
 
 # Same version-to-branch ledger lkml-series.sh writes for v1 -- lets

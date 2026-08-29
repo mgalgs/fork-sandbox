@@ -1,13 +1,27 @@
 #!/usr/bin/env bash
 # lkml-mailbox.sh — A Maildir-like message store for one lkml-mode series
 #
-# Usage: lkml-mailbox.sh init <series> --cover <file> --patches <dir> --from <persona> [--display <name>] [--version <n>] [--harness <h>] [--model <m>] [--attach <file>]...
+# Usage: lkml-mailbox.sh init <series> --cover <file> --patches <dir> --from <persona> [--display <name>] [--version <n>] [--harness <h>] [--model <m>] [--attach <file>]... [--diffstat <range>] [--smoke <file>]
 #        lkml-mailbox.sh post <series> --from <persona> --reply-to <id> --file <file|-> [--display <name>] [--subject <s>] [--tags <t1,t2>] [--harness <h>] [--model <m>] [--attach <file>]...
 #        lkml-mailbox.sh tree <series>
 #        lkml-mailbox.sh cover <series>
 #        lkml-mailbox.sh show <series> <id>
 #        lkml-mailbox.sh open <series> [--version <n>]
 #        lkml-mailbox.sh tally <series> --version <n>
+#
+# --diffstat <range> and --smoke <file>, on `init` only, each append a
+# section to the cover letter body AFTER whatever --cover already contains:
+# `--diffstat` appends "## Diffstat" with the output of `git diff --stat
+# <range>`, run with NO `-C` flag -- it uses THIS PROCESS'S current working
+# directory, since this script takes no --project flag. A caller that wants
+# the diffstat computed against a project other than its own cwd must `cd`
+# into that project before invoking `init`, e.g. `(cd "$project" && "$mailbox"
+# init ... --diffstat "$base..$branch")` -- which also means every OTHER path
+# argument to that same `init` call (--cover, --patches, --smoke, --attach)
+# must already be absolute. `--smoke <file>` appends "## Test results" with
+# that file's contents verbatim. Refuses cleanly if the range fails to diff
+# (e.g. cwd is not a git repo, or the range is nonsense) or the smoke file
+# does not exist.
 #
 # Attachments. --attach <file> may repeat on `init` (attaches to the cover
 # letter) or `post` (attaches to that one reply). Each file is copied into
@@ -362,6 +376,7 @@ cmd_init() {
     local series="${1:?Usage: lkml-mailbox.sh init <series> --cover <file> --patches <dir> --from <persona>}"
     shift
     local cover="" patches="" from="" display="" version="" harness="unknown" model="unknown"
+    local diffstat_range="" smoke_file=""
     local -a attach_files=()
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -373,6 +388,8 @@ cmd_init() {
             --harness) harness="${2:?--harness requires a value}"; shift 2 ;;
             --model) model="${2:?--model requires a value}"; shift 2 ;;
             --attach) attach_files+=("${2:?--attach requires a file}"); shift 2 ;;
+            --diffstat) diffstat_range="${2:?--diffstat requires a range}"; shift 2 ;;
+            --smoke) smoke_file="${2:?--smoke requires a file}"; shift 2 ;;
             -h|--help) usage; exit 0 ;;
             *) echo "Error: init: unknown option '$1'." >&2; return 1 ;;
         esac
@@ -421,6 +438,19 @@ cmd_init() {
     cover_first_line="$(head -n1 -- "$cover" | sed 's/[[:space:]]*$//')"
     cover_subject="[PATCH v$version 0/$m] $cover_first_line"
     cover_body="$(cat -- "$cover")"
+    if [[ -n "$diffstat_range" ]]; then
+        local diffstat_out
+        if ! diffstat_out="$(git diff --stat "$diffstat_range" 2>&1)"; then
+            echo "Error: init: --diffstat range '$diffstat_range' failed:" >&2
+            echo "$diffstat_out" >&2
+            return 1
+        fi
+        cover_body="$(printf '%s\n\n## Diffstat\n\n%s\n' "$cover_body" "$diffstat_out")"
+    fi
+    if [[ -n "$smoke_file" ]]; then
+        [[ -f "$smoke_file" ]] || { echo "Error: init: --smoke file '$smoke_file' not found." >&2; return 1; }
+        cover_body="$(printf '%s\n\n## Test results\n\n%s\n' "$cover_body" "$(cat -- "$smoke_file")")"
+    fi
     lkml_post_raw "$series" "$cover_id" "" "" "$version" 0 \
         "$from" "$display" "$harness" "$model" "$cover_subject" "" "$cover_body" "$attach_csv"
     echo "fork-sandbox lkml: posted cover ${cover_id:0:7} as v$version 0/$m" >&2
