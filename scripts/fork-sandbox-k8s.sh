@@ -392,11 +392,13 @@ render_review_loop_configmap_keys() {
     local pod_outbox_dir="$9"
     cat <<KEYS
   review-prompt.md: |
-$({ fs_emit_prompt_preamble "$pod_clone_dir" "$pod_inbox_dir" pi gated "$pod_outbox_dir" pod
+$({ fs_emit_prompt_preamble "$pod_clone_dir" "$pod_inbox_dir" pi gated "$pod_outbox_dir" pod \
+       "$FS_OUTBOX_MAX_BYTES"
    fs_emit_review_prompt_body "$branch" "$base_sha" "$pod_skill_dir" \
        "$pod_verdict_file" "$pod_inbox_dir"; } | indent_block)
   fix-prompt-header.md: |
-$({ fs_emit_prompt_preamble "$pod_clone_dir" "$pod_inbox_dir" pi gated "$pod_outbox_dir" pod
+$({ fs_emit_prompt_preamble "$pod_clone_dir" "$pod_inbox_dir" pi gated "$pod_outbox_dir" pod \
+       "$FS_OUTBOX_MAX_BYTES"
    fs_emit_fix_prompt_body "$branch" "$base_sha"; } | indent_block)
   code-review-portable-skill.md: |
 $(indent_block < "$review_skill_src")
@@ -653,7 +655,8 @@ $(indent_block < "$gate_sh")
   inbox-write.sh: |
 $(indent_block < "$inbox_write_sh")
   handoff.md: |
-$({ fs_emit_prompt_preamble "$pod_clone_dir" "$POD_INBOX_DIR" pi gated "$POD_OUTBOX_DIR" pod
+$({ fs_emit_prompt_preamble "$pod_clone_dir" "$POD_INBOX_DIR" pi gated "$POD_OUTBOX_DIR" pod \
+       "$FS_OUTBOX_MAX_BYTES"
    printf '\n---\n\n'
    cat -- "$handoff_file"; } | indent_block)${review_loop_configmap_keys}
 ---

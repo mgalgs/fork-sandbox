@@ -2860,7 +2860,8 @@ fs_emit_prompt_overlay() {
 }
 
 {
-    fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" "$harness" "$preamble_network" "$outbox_dir"
+    fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" "$harness" "$preamble_network" \
+        "$outbox_dir" "" "$FS_OUTBOX_MAX_BYTES"
     if (( services_enabled )); then
         cat <<EOF
 
@@ -2917,7 +2918,8 @@ if (( review_loop_cap > 0 )); then
         "$review_verdict_file" "$review_skill_dir"
     {
         fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" \
-            "$review_preamble_harness" "$review_preamble_network" "$outbox_dir"
+            "$review_preamble_harness" "$review_preamble_network" "$outbox_dir" \
+            "" "$FS_OUTBOX_MAX_BYTES"
         fs_emit_prompt_overlay review
         fs_emit_review_prompt_body "$branch" "$base_sha" "$review_skill_dir" \
             "$review_verdict_file" "$inbox_dir"
@@ -2925,7 +2927,8 @@ if (( review_loop_cap > 0 )); then
     mv -- "$review_prompt.part" "$review_prompt"
 
     {
-        fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" "$harness" "$preamble_network" "$outbox_dir"
+        fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" "$harness" "$preamble_network" \
+            "$outbox_dir" "" "$FS_OUTBOX_MAX_BYTES"
         fs_emit_prompt_overlay fix
         fs_emit_fix_prompt_body "$branch" "$base_sha"
     } > "$fix_prompt_header.part"
@@ -2944,7 +2947,7 @@ if (( refresh_enabled )); then
     continuation_prompt_header="$run_dir/continuation-prompt-header.md"
     fs_reject_unsafe_chars "$continuation_prompt_header"
     fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" "$harness" "$preamble_network" \
-        "$outbox_dir" > "$continuation_prompt_header.part"
+        "$outbox_dir" "" "$FS_OUTBOX_MAX_BYTES" > "$continuation_prompt_header.part"
     mv -- "$continuation_prompt_header.part" "$continuation_prompt_header"
 fi
 

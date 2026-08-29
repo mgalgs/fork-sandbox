@@ -978,10 +978,16 @@ fs_cache_binds() {
 #                mount namespace and nothing actually blocks a write there --
 #                see fork-sandbox-k8s.sh's `say` verb and
 #                docs/kubernetes-runs.md. Unused when $2 is empty.
+# $7  outbox_max_bytes  the outbox's effective size cap, in bytes -- what the
+#                caller actually enforces for THIS run, which may be raised
+#                above FS_OUTBOX_MAX_BYTES by --outbox-max. Defaults to
+#                FS_OUTBOX_MAX_BYTES so a caller that has no override still
+#                gets a true number. Unused when $5 is empty.
 fs_emit_prompt_preamble() {
     local clone_dir="$1" inbox_dir="$2" harness="$3" network="$4"
     local outbox_dir="$5"
     local inbox_write="${6:-}"
+    local outbox_max_bytes="${7:-$FS_OUTBOX_MAX_BYTES}"
     cat <<EOF
 # Your working directory
 
@@ -1080,7 +1086,7 @@ changes belong in commits, not here.
 **\`handoff.md\` at the root of this directory is reserved** for this run's
 own self-refresh protocol. Do not write anything named that.
 
-The whole directory has a $((FS_OUTBOX_MAX_BYTES / 1024 / 1024)) MiB budget.
+The whole directory has a $((outbox_max_bytes / 1024 / 1024)) MiB budget.
 Go over it and the outbox is refused **as a whole, not truncated** -- one
 oversized artifact means everything in here is lost, not just the large
 file. If you are about to write something big, downscale a screenshot or
