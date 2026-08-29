@@ -591,16 +591,22 @@ refuses "run rejects an unknown option" \
     --branch fs-k8s-test-branch --model moonshotai/kimi-k3 --bogus \
     "$proj_dir" "$handoff_file"
 
-if "$k8s_sh" --help 2>&1 | grep -q 'fork-sandbox-k8s.sh run'; then
-    ok "usage() mentions run"
-else
-    no "usage() mentions run" "not found in --help output"
-fi
-if "$k8s_sh" --help 2>&1 | grep -q 'fork-sandbox-k8s.sh say'; then
-    ok "usage() mentions say"
-else
-    no "usage() mentions say" "not found in --help output"
-fi
+# Captured once, then matched, rather than piped straight into `grep -q`.
+# Piping is what made this flaky: `grep -q` exits the moment it matches,
+# which closes the pipe under usage()'s `sed`, which then dies of SIGPIPE --
+# and with `set -o pipefail` above, that non-zero status fails the whole
+# pipeline even though grep found what it was looking for. It only bit the
+# `run` check, because `run` appears early enough in the help text that grep
+# reliably won the race; `say` appears further down and so usually finished
+# writing first. Same latent bug either way.
+help_out="$("$k8s_sh" --help 2>&1)"
+for verb in run say; do
+    if grep -q "fork-sandbox-k8s.sh $verb" <<< "$help_out"; then
+        ok "usage() mentions $verb"
+    else
+        no "usage() mentions $verb" "not found in --help output"
+    fi
+done
 
 printf '\n== fork-sandbox-k8s.sh say: argument validation (no cluster) ==\n'
 # Every one of these is rejected before cmd_say ever calls kubectl, so all
