@@ -1,7 +1,7 @@
 ---
 name: sandbox-coder-mode
 description: Enter a standing mode where this session stops writing code and delegates every coding and editing task to an unattended fork-sandbox run, acting as orchestrator, reviewer and integrator. Use when the user wants an expensive model to plan and review while cheap or self-hosted models do the typing, or wants unattended editing to happen somewhere that is not their own checkout. Stays on until the user ends it.
-argument-hint: [off] — no argument turns the mode on. Pass "off" (or say so in plain words) to end it.
+argument-hint: [off] [--long] — no argument turns the mode on. Pass "off" (or say so in plain words) to end it. Pass "--long" to enter the long-horizon variant, for many rounds across hours — see "Entering the mode".
 user-invocable: true
 ---
 
@@ -11,6 +11,9 @@ A standing mode, not a one-shot task. From the moment the user invokes it
 until they end it, this session writes no project code. It reads, plans,
 delegates the editing to `fork-sandbox` runs, reviews what comes back, and
 integrates it in the real repo.
+
+`--long` enters the same mode with a second layer of discipline for running
+many rounds across hours rather than one or two — see **Entering the mode**.
 
 Read the `fork-sandbox` skill before the first launch. It owns the
 mechanics — branch naming, the handoff document, the harnesses, monitoring,
@@ -44,6 +47,155 @@ Tell the user, in one or two lines:
 
 Then carry on with whatever they asked for. Do not re-announce the mode on
 every turn.
+
+### `--long` — many rounds across hours
+
+Everything above still holds. `--long` is not a different mode, it is this
+one run at a scale where a few extra failure modes show up — the handoff
+gets skimmed instead of followed, a round finishes without committing, a
+run's own summary turns out to be wrong. None of that is visible in a single
+round; it only shows up on the third or fourth one, hours in, when nobody is
+re-reading this file. The rest of this document describes the standing mode;
+this section describes what changes when it runs long.
+
+Tell the user, in one or two lines:
+
+> Sandbox coder mode is on, long-horizon. I'll run this as tiers: I plan,
+> review every diff line by line, and integrate; a cheap model does the
+> typing in the sandbox, with an optional in-sandbox reviewer ahead of me.
+> I'll report each round with its cost, and flag anything still unpushed.
+
+**The tiers.** Three, and the distinction between them is the whole point:
+
+- **Tier 1 — orchestrator and reviewer.** The expensive model: this session.
+  It reads the code, decides the design, writes the handoffs, reviews every
+  returned diff line by line, integrates, and owns all host-side git (see
+  **What stays in this session**). It writes no project code.
+- **Tier 2 — implementer.** The cheap model, in the sandbox. It types. Pin it
+  explicitly on every launch — `--harness claude --model sonnet`, or a `pi` /
+  `pi-local` harness — per **Choosing a harness and a model**.
+- **Tier 3 — in-sandbox reviewer.** Optional, via `--review-loop N`. A fresh
+  cheap session that reviews tier 2's work before it ever leaves the sandbox.
+
+**Tier 1's review is never skipped because tier 3 ran.** This is the
+load-bearing rule of the whole arrangement:
+
+> A round came back having passed its own suite, having grown a test file
+> from 88 to 125 checks, with `shellcheck` clean. Reading the diff found a
+> real defect anyway: the implementer had ported a helper from a sibling
+> script but dropped a pipe to `awk` that was masking git's exit status.
+> Under `set -euo pipefail` the rewritten version killed the script on a
+> failed `rev-parse`, making three error paths unreachable — paths the same
+> commit had written as if they were reachable. No test caught it, and no
+> test would have: the suite proves the happy path, and the failure needed a
+> reader who knew why the original had a pipeline in it.
+
+Tests prove behaviour the author thought of. Tier 1 catches the thing the
+author did not think of. Budget for that reading; it is what the expensive
+model is for, and it applies at **Reviewing and integrating** step 1 on
+every round, tier 3 or not.
+
+**Decide the open questions before delegating.** If a handoff contains an
+open question, the implementer will answer it — and it will answer as a
+cheap model with no context answers, then build on the answer for the rest
+of the round. You pay a whole round to undo that. Resolve every design
+question first, write the decision **and its rationale** into the handoff
+(see **Writing the handoff**), and say plainly "implement this, do not
+revisit it." Where a question genuinely belongs to the user, ask the user
+before launching, not the sandbox.
+
+A worked example: a round had to decide what an exit-code file should hold
+when an extra review pass had run — the coding leg's code or the review's.
+That reads like a coin flip until you notice the local equivalent already
+answers it, and matching it is what keeps the two paths analogous. The
+handoff said which, and why, and "do not revisit." The round implemented it
+correctly and left a comment explaining it to the next reader.
+
+**Front-load the commit contract.** The failure mode: a round does all its
+work correctly, never commits, and the launcher fetches an empty branch and
+deletes it. The work survives only because the clone is still on disk. This
+is not hypothetical and it is not rare: one round ran 170 turns over 25
+minutes, produced complete and correct work across six files, and ended by
+*offering* to commit. Two other rounds sat at 490 and 376 tool calls with
+zero commits until nudged by hand. Two of five local-model runs never
+committed at all.
+
+The instruction lives in the handoff, which is read once at the start —
+hundreds of tool calls before it matters. What works: put a **commit
+contract at the very top of the handoff**, before the goal, as its own
+section; state the failure with its evidence; and give an explicit
+per-section commit sequence, so committing is a step in the plan rather
+than a virtue to remember. The next round after that change produced eight
+clean commits in sequence, in 17 minutes, for a third of the cost.
+
+While a run is in flight, `fork-sandbox-say.sh` (see **Iterating on a
+run**) can nudge a session that is accumulating work without committing.
+Watch the commit count in the monitor and use it.
+
+**Verify the run's self-report.** A finished run tells you what it did. Do
+not take it at face value. Two real cases from one day:
+
+- A run reported "nothing has been committed" while the monitor had reported
+  nine commits. Both were right about different things: the monitor was
+  counting `git commit` calls inside test scaffolds' own scratch
+  repositories, and the branch genuinely had nothing on it.
+- A run reported test counts below the stated baselines and explained the
+  gap as environmental. That claim needed re-measuring on the host, where
+  the suites are actually authoritative, before it could be believed or
+  disbelieved.
+
+Re-measure on the host. Run the suites yourself, per **Reviewing and
+integrating** step 4. Read the diffstat rather than the prose summary. The
+run's own account is a lead, not a finding.
+
+**The rescue procedure.** When a run ends without committing, the work is
+still in the clone. Recover it without ever running git inside that clone
+(see the "never run git inside the clone" warning under **Reviewing and
+integrating**):
+
+```bash
+diff -rq --exclude=.git <origin-repo> <run-dir>/clone/<name>
+```
+
+then copy the differing files out and commit them in the real repo. Never
+`git -C` the clone — its config is sandbox-writable and a key such as
+`core.fsmonitor` executes on the host. Record such a round as `rescued` in
+the run log (**Tracking every round**).
+
+**One round owns one set of files.** Per **Parallelism**, two rounds may run
+at once only when they touch disjoint files, split by file and never by
+topic. The sequencing consequence over a long horizon: **merge each
+reviewed round before launching the next one that touches the same files.**
+A round branches from `HEAD` at launch and cannot see a sibling's work, so
+leaving a reviewed branch unmerged buys a conflict for nothing.
+
+**Talking to the user across a long horizon.** The user is not watching the
+run. They are doing something else and checking in. That shapes the
+reporting:
+
+- Report each round in a few lines — branch, what landed, whether tests
+  pass, the cost, and any caveat, including one that contradicts the run's
+  own summary — per **Reviewing and integrating**.
+- Quote the cost every round. It varies by an order of magnitude between
+  rounds of similar size, and it is the number that decides the next
+  round's harness. One day's rounds ranged from 0.31 to 11.12 USD.
+- A mid-turn ask is not an interrupt. When the user fires off a new idea
+  while a round is in flight, acknowledge it in one sentence, keep the
+  current work moving, and start it at the next natural break — unless it
+  changes the work in flight or corrects a premise it rests on, in which
+  case handle it now.
+- Never state a background run's outcome before it lands. A run that is
+  still going has no result to report, and a monitor event is not the user
+  speaking.
+- Say what is still unpushed. Over a long session, integrated-but-unpushed
+  work accumulates silently. Name the count.
+
+**Ending a long round.** Per round, in order: read the diff, run the suites
+on the host, integrate, record the verdict with `sandbox-run-log.py
+verdict`, and report — the same sequence as **Reviewing and integrating**.
+Keep the run directory until the branch is reviewed and merged — it is the
+only copy of the events log, and it is the evidence when something needs
+explaining later.
 
 ## What stays in this session
 
