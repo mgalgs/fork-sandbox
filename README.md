@@ -154,6 +154,10 @@ Every harness gets the same clone, the same provisioning, the same fetch-back,
 and a review kit — two skills that let the run review its own work before it
 reports back.
 
+`pi` and `pi-local` read their per-machine config (an OpenRouter key, a
+model endpoint) from `~/.config/fork-sandbox/`. `fork-sandbox.sh configure`
+discovers and installs it for you — see [docs/configure.md](docs/configure.md).
+
 ## Skills
 
 The `skills/` directory is for the agent that *orchestrates* runs, not the one
@@ -260,6 +264,9 @@ what is mounted, what is not, and a numbered list of the gaps.
 
 - [docs/sandbox-quickstart.md](docs/sandbox-quickstart.md) — start here; the
   levels, from a plain run to a sealed one with services.
+- [docs/configure.md](docs/configure.md) — `fork-sandbox.sh configure`:
+  discover and install the per-machine config above, and how to add a
+  discoverer of your own.
 - [docs/claude-sandboxed.md](docs/claude-sandboxed.md) — the sandbox itself.
 - [docs/sandbox-services.md](docs/sandbox-services.md) — the committed
   contract a repo uses to declare its service stack.

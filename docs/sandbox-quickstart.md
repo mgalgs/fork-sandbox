@@ -300,6 +300,10 @@ mkdir -p ~/.config/fork-sandbox
 echo 'MODEL_ENDPOINT=http://your-model-host:8001/v1' > ~/.config/fork-sandbox/model.env
 ```
 
+Or, if `$FORK_SANDBOX_MODEL_ENDPOINT` is already set in your shell:
+`fork-sandbox.sh configure` finds it and writes this file for you -- see
+[docs/configure.md](configure.md).
+
 It is not in the repo on purpose: an endpoint is a fact about one machine's
 network, and this checkout is shared with machines that must not reach it.
 
