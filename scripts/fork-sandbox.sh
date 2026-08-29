@@ -130,6 +130,11 @@
 # --keep:                with --k8s, leave the Job and pod in place after a
 #                        successful fetch instead of removing them (passed
 #                        to fork-sandbox-k8s.sh run). Refused without --k8s.
+# --outbox-dir <path>:   with --k8s, where to land the pod's /work/outbox
+#                        after the agent finishes (passed to
+#                        fork-sandbox-k8s.sh run). Defaults to
+#                        /var/tmp/claude-scratch/forks/k8s-<safe-branch>/outbox.
+#                        Refused without --k8s.
 # -h, --help:            print this header and exit.
 #
 # The run gets its own detached tmux session, not a window of yours, so
@@ -1025,6 +1030,7 @@ refresh_max_arg=""
 k8s_mode=false
 k8s_timeout=""
 k8s_keep=false
+k8s_outbox_dir=""
 
 while [[ "${1:-}" == -* ]]; do
     case "$1" in
@@ -1128,6 +1134,10 @@ while [[ "${1:-}" == -* ]]; do
         --keep)
             k8s_keep=true
             shift
+            ;;
+        --outbox-dir)
+            k8s_outbox_dir="${2:?--outbox-dir requires a path}"
+            shift 2
             ;;
         -h|--help)
             usage
@@ -1500,14 +1510,16 @@ if [[ "$k8s_mode" == true ]]; then
     # applies the identical check, before any kubectl call, so there is
     # nothing to duplicate here.
     [[ -n "$review_loop_arg" ]] && k8s_argv+=(--review-loop "$review_loop_arg")
+    [[ -n "$k8s_outbox_dir" ]] && k8s_argv+=(--outbox-dir "$k8s_outbox_dir")
     k8s_argv+=(--branch "$branch" --model "$model" "$project_path" "$handoff_file")
 
     exec "$script_dir/fork-sandbox-k8s.sh" "${k8s_argv[@]}"
 fi
 
-if [[ -n "$k8s_timeout" || "$k8s_keep" == true ]]; then
-    echo "Error: --timeout and --keep only apply with --k8s, which passes" >&2
-    echo "them on to fork-sandbox-k8s.sh run. Add --k8s, or drop the flag." >&2
+if [[ -n "$k8s_timeout" || "$k8s_keep" == true || -n "$k8s_outbox_dir" ]]; then
+    echo "Error: --timeout, --keep and --outbox-dir only apply with --k8s," >&2
+    echo "which passes them on to fork-sandbox-k8s.sh run. Add --k8s, or drop" >&2
+    echo "the flag." >&2
     exit 1
 fi
 
