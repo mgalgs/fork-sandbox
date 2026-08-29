@@ -6,7 +6,7 @@
 #        lkml-mailbox.sh tree <series>
 #        lkml-mailbox.sh cover <series>
 #        lkml-mailbox.sh show <series> <id>
-#        lkml-mailbox.sh open <series>
+#        lkml-mailbox.sh open <series> [--version <n>]
 #        lkml-mailbox.sh tally <series> --version <n>
 #
 # One series lives under $LKML_MAILBOX_ROOT/<series>/cur/ (default
@@ -72,7 +72,11 @@
 # tagged message was addressed to -- that lives in prose -- so it uses the
 # closest computable proxy: silence from anyone else. Deciding who should
 # actually answer an open thread is the orchestrator's job, not this
-# script's; `open` only points at candidates.
+# script's; `open` only points at candidates. With no --version, `open`
+# scans the whole series, including earlier versions -- pass --version to
+# scope it to one version, which is what "open is empty" as a convergence
+# check (see SKILL.md) needs: an unanswered item from a superseded version
+# should not keep the current version from converging.
 #
 # Design decision -- "tally": counts the LATEST tag per persona per patch
 # (by Date), not every tag ever applied, since a Changes-requested is
@@ -142,6 +146,23 @@ lkml_new_uuid() {
     fi
 }
 
+# A nanosecond-ish epoch for X-Seq (ordering only, not a contract -- see the
+# header comment above). `date +%s%N` is GNU-only: BSD/macOS date leaves the
+# literal "N" in place, which is why the result is checked rather than
+# trusted outright. Falls back to python3 (already this script's fallback
+# for uuidgen above), and finally to whole seconds -- which only degrades
+# same-second ordering to filesystem glob order, the pre-X-Seq behavior.
+lkml_now_seq() {
+    local v; v="$(date +%s%N 2>/dev/null)"
+    if [[ "$v" =~ ^[0-9]+$ ]]; then
+        printf '%s' "$v"
+    elif command -v python3 >/dev/null 2>&1; then
+        python3 -c 'import time; print(int(time.time()*1e9))'
+    else
+        date +%s
+    fi
+}
+
 lkml_default_display() {
     local p="${1//-/ }"
     printf '%s' "${p^}"
@@ -178,7 +199,10 @@ lkml_post_raw() {
     local dir; dir="$(lkml_series_dir "$series")/cur"
     local display="${display_override:-$(lkml_default_display "$persona")}"
     local email="${persona}.ai@lkml.local"
-    local date_hdr; date_hdr="$(date -R)"
+    # RFC-2822 by hand, not `date -R`: that flag is a GNU extension BSD/macOS
+    # date does not have, while %a/%d/%b/%Y/%H/%M/%S/%z are plain strftime(3)
+    # conversions both implementations support.
+    local date_hdr; date_hdr="$(date +'%a, %d %b %Y %H:%M:%S %z')"
     local tmp="$dir/.$id.msg.tmp"
     {
         printf 'Message-ID: <%s@lkml.local>\n' "$id"
@@ -194,7 +218,7 @@ lkml_post_raw() {
         printf 'X-Version: %s\n' "$version"
         printf 'X-Depth: %s\n' "$depth"
         printf 'X-Tags: %s\n' "$tags"
-        printf 'X-Seq: %s\n' "$(date +%s%N)"
+        printf 'X-Seq: %s\n' "$(lkml_now_seq)"
         printf '\n'
         printf '%s\n' "$body"
     } > "$tmp"
@@ -205,15 +229,15 @@ lkml_post_raw() {
 # indexed identically -- the same convention fork-sandbox.sh's configure
 # picker uses for its FS_CAND_* candidate table.
 LKML_ID=(); LKML_PARENT=(); LKML_DEPTH=(); LKML_VERSION=(); LKML_PERSONA=()
-LKML_DISPLAY=(); LKML_HARNESS=(); LKML_MODEL=(); LKML_SUBJECT=(); LKML_TAGS=()
-LKML_EPOCH=(); LKML_SEQ=(); LKML_FILE=()
+LKML_HARNESS=(); LKML_MODEL=(); LKML_SUBJECT=(); LKML_TAGS=()
+LKML_SEQ=(); LKML_FILE=()
 
 lkml_load_series() {
-    local series="$1" dir f id parent depth version persona display harness model
-    local subject tags datehdr epoch seq
+    local series="$1" dir f id parent depth version persona harness model
+    local subject tags seq
     LKML_ID=(); LKML_PARENT=(); LKML_DEPTH=(); LKML_VERSION=(); LKML_PERSONA=()
-    LKML_DISPLAY=(); LKML_HARNESS=(); LKML_MODEL=(); LKML_SUBJECT=(); LKML_TAGS=()
-    LKML_EPOCH=(); LKML_SEQ=(); LKML_FILE=()
+    LKML_HARNESS=(); LKML_MODEL=(); LKML_SUBJECT=(); LKML_TAGS=()
+    LKML_SEQ=(); LKML_FILE=()
     dir="$(lkml_series_dir "$series")/cur"
     [[ -d "$dir" ]] || return 0
     for f in "$dir"/*.msg; do
@@ -223,19 +247,16 @@ lkml_load_series() {
         depth="$(lkml_header "$f" X-Depth)"
         version="$(lkml_header "$f" X-Version)"
         persona="$(lkml_header "$f" X-AI-Persona)"
-        display="$(lkml_header "$f" From)"
         harness="$(lkml_header "$f" X-AI-Harness)"
         model="$(lkml_header "$f" X-AI-Model)"
         subject="$(lkml_header "$f" Subject)"
         tags="$(lkml_header "$f" X-Tags)"
-        datehdr="$(lkml_header "$f" Date)"
-        epoch="$(date -d "$datehdr" +%s 2>/dev/null || echo 0)"
         seq="$(lkml_header "$f" X-Seq)"
         [[ -n "$seq" ]] || seq=0
         LKML_ID+=("$id"); LKML_PARENT+=("$parent"); LKML_DEPTH+=("$depth")
-        LKML_VERSION+=("$version"); LKML_PERSONA+=("$persona"); LKML_DISPLAY+=("$display")
+        LKML_VERSION+=("$version"); LKML_PERSONA+=("$persona")
         LKML_HARNESS+=("$harness"); LKML_MODEL+=("$model"); LKML_SUBJECT+=("$subject")
-        LKML_TAGS+=("$tags"); LKML_EPOCH+=("$epoch"); LKML_SEQ+=("$seq"); LKML_FILE+=("$f")
+        LKML_TAGS+=("$tags"); LKML_SEQ+=("$seq"); LKML_FILE+=("$f")
     done
 }
 
@@ -509,11 +530,21 @@ cmd_show() {
 
 cmd_open() {
     local series="${1:?Usage: lkml-mailbox.sh open <series>}"
+    shift
+    local version=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --version) version="${2:?--version requires a number}"; shift 2 ;;
+            -h|--help) usage; exit 0 ;;
+            *) echo "Error: open: unknown option '$1'." >&2; return 1 ;;
+        esac
+    done
     local dir; dir="$(lkml_series_dir "$series")"
     [[ -d "$dir/cur" ]] || { echo "Error: open: series '$series' does not exist." >&2; return 1; }
     lkml_load_series "$series"
     local i j found=0 answered
     for i in "${!LKML_ID[@]}"; do
+        [[ -z "$version" || "${LKML_VERSION[$i]}" == "$version" ]] || continue
         case "${LKML_TAGS[$i]}" in
             *Question*|*Changes-requested*|*NAK*) ;;
             *) continue ;;
@@ -561,7 +592,8 @@ cmd_tally() {
         num=""
         if [[ "${LKML_DEPTH[$i]}" == "0" ]]; then
             num=0
-        elif [[ "${LKML_DEPTH[$i]}" == "1" && "$subj" =~ \[PATCH\ v[0-9]+\ ([0-9]+)/[0-9]+\] ]]; then
+        elif [[ "${LKML_DEPTH[$i]}" == "1" && "$subj" != "Re: "* \
+            && "$subj" =~ ^\[PATCH\ v[0-9]+\ ([0-9]+)/[0-9]+\] ]]; then
             num="${BASH_REMATCH[1]}"
         fi
         [[ -n "$num" ]] || continue

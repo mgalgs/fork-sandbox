@@ -228,7 +228,12 @@ for persona in "${personas[@]}"; do
         fi
     fi
 
-    handoff_file="$(mktemp /var/tmp/claude-scratch/lkml-round-XXXXXX.md)"
+    mkdir -p -- /var/tmp/claude-scratch
+    handoff_file="$(mktemp /var/tmp/claude-scratch/lkml-round-XXXXXX.md)" || {
+        echo "Error: mktemp failed for $persona's handoff file." >&2
+        launch_failed=1
+        continue
+    }
     build_handoff "$persona_file" "$cover_text" "$tree_text" > "$handoff_file"
 
     branch="lkml/${series}-v${version}-round-${persona}-$(date +%s)"
@@ -287,6 +292,21 @@ while true; do
     waited=$(( waited + 10 ))
 done
 
+# Strips optional angle brackets and the @lkml.local suffix from an
+# In-Reply-To value, mirroring lkml-mailbox.sh's own lkml_strip_id --
+# duplicated here because this script only invokes the mailbox as a
+# subprocess, never sources it. A persona shown `Message-ID: <uuid@lkml.local>`
+# in its handoff (every --reply-to round embeds `mailbox show` output) may
+# reasonably copy that RFC-822 form verbatim into its own In-Reply-To, and
+# `post --reply-to` only resolves bare ids.
+lkml_round_strip_id() {
+    local v="$1"
+    v="${v#<}"
+    v="${v%>}"
+    v="${v%%@*}"
+    printf '%s' "$v"
+}
+
 harvest_one() {
     local persona="$1" display="$2" harness="$3" model="$4" msgfile="$5"
     local reply_to="" subject="" tags="" body_file in_headers=1 line
@@ -307,6 +327,7 @@ harvest_one() {
             printf '%s\n' "$line" >> "$body_file"
         fi
     done < "$msgfile"
+    reply_to="$(lkml_round_strip_id "$reply_to")"
 
     if [[ -z "$reply_to" ]]; then
         echo "Warning: lkml-round: $msgfile (persona $persona) has no In-Reply-To" >&2
