@@ -54,7 +54,20 @@
 #                        use this model for review legs. Fix legs continue to
 #                        use --model. Requires --review-loop. Resolved and
 #                        validated the same way as --model, against the same
-#                        harness.
+#                        harness (or against --review-harness, when given).
+# --review-harness <name>[/<model>]:
+#                        use this harness for review legs -- claude, pi,
+#                        pi-local or codex, with the same combined
+#                        harness/model form --harness takes. Fix legs
+#                        continue to use --harness. Requires --review-loop.
+#                        A model given both here and via --review-model
+#                        conflicts, same as --harness/--model. --harness
+#                        pi-local (sealed, no network) with a networked
+#                        --review-harness is refused: the review leg would
+#                        send the clone's contents to that harness's model
+#                        provider, defeating the seal. The reverse --
+#                        --review-harness pi-local reviewing a networked
+#                        implement harness -- is fine. Refused with --k8s.
 # --task-meta '<json>':  one JSON object of orchestrator-supplied task
 #                        metadata -- kind, difficulty, size,
 #                        prompt_template_id, stage -- stored beside the run
@@ -164,10 +177,15 @@
 # verdict, and when that verdict lists problems a FIX leg is given them and
 # commits the fixes. That pair repeats up to N times. Each leg is a fresh
 # session of the same harness, started the same way as the main one (or with
-# --review-model for review legs), with a generated prompt on stdin. A reviewer
-# therefore never sits inside the
+# --review-model, or an entirely different harness and model via
+# --review-harness, for review legs), with a generated prompt on stdin. A
+# reviewer therefore never sits inside the
 # conversation whose work it is judging — an author defends its code, a
-# stranger reads it. The review leg follows the code-review-portable skill,
+# stranger reads it. --review-harness pushes that further: a stranger from a
+# different model family entirely catches what the implement harness's own
+# family is blind to. Fix legs always stay on the implement harness and
+# model, whichever review flags were given -- there is no --fix-harness. The
+# review leg follows the code-review-portable skill,
 # which is bound into every run already, and writes its verdict to
 # .git/review-verdict.md in the clone: the first line is APPROVED or FINDINGS,
 # and the rest is one finding per paragraph, each citing file:line. A verdict
@@ -382,7 +400,9 @@
 # after the coding leg -- see fork-sandbox-k8s-review-loop.sh and
 # docs/kubernetes-runs.md. --review-model stays refused: the pod's
 # models.json is generated with a single model entry, so a second model for
-# the review leg has nowhere to be declared yet.
+# the review leg has nowhere to be declared yet. --review-harness stays
+# refused for the same underlying reason: the pod runs pi against the model
+# proxy and nothing else, so a second harness has nowhere to run.
 #
 # One gap is not a refused flag, because no flag controls it: a --k8s run
 # never appends to the durable run log described below
