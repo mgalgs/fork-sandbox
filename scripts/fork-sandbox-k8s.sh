@@ -3,10 +3,12 @@
 #
 # Usage: fork-sandbox-k8s.sh install [--dry-run]
 #        fork-sandbox-k8s.sh submit [--dry-run] --branch NAME --model MODEL
-#                            [--review-loop N] <project-path> <handoff-file>
+#                            [--review-loop N] [--outbox-max SIZE]
+#                            <project-path> <handoff-file>
 #        fork-sandbox-k8s.sh run [--dry-run] [--timeout SECONDS] [--keep]
 #                            --branch NAME --model MODEL [--review-loop N]
-#                            [--outbox-dir DIR] <project-path> <handoff-file>
+#                            [--outbox-dir DIR] [--outbox-max SIZE]
+#                            <project-path> <handoff-file>
 #        fork-sandbox-k8s.sh fetch --branch NAME <project-path>
 #        fork-sandbox-k8s.sh say --branch NAME <text>
 #        fork-sandbox-k8s.sh say --branch NAME -        # text from stdin
@@ -81,6 +83,16 @@
 # symlinks) -- see that script's own header. Best-effort: a failure here
 # warns and falls through rather than failing the run, since retrieving
 # artifacts must never cost the branch itself.
+#
+# --outbox-max SIZE (submit, run): raise the outbox size cap above the
+# default 64 MiB (FS_OUTBOX_MAX_BYTES). Takes a plain byte count or a size
+# with a K/M/G suffix (512K, 256M, 2G); no upper ceiling -- the operator
+# raising it is the one accepting the extra disk cost. The effective value
+# is threaded everywhere the cap matters: the rendered Job's
+# OUTBOX_MAX_BYTES env var, the pod-side entrypoint check, the
+# preamble text the agent reads, run's own pull-back head -c/stat guard,
+# and the extractor's third argument -- so the pod, the client and the
+# extractor can never disagree about the number.
 #
 # --review-loop N (submit, run): after the coding leg, run a fresh review
 # session against the branch and, on findings, a fresh fix session, up to N
@@ -389,16 +401,16 @@ k8s_safe_name() {
 render_review_loop_configmap_keys() {
     local pod_clone_dir="$1" pod_inbox_dir="$2" pod_skill_dir="$3" pod_verdict_file="$4"
     local branch="$5" base_sha="$6" review_skill_src="$7" review_loop_sh="$8"
-    local pod_outbox_dir="$9"
+    local pod_outbox_dir="$9" outbox_max_bytes="${10}"
     cat <<KEYS
   review-prompt.md: |
 $({ fs_emit_prompt_preamble "$pod_clone_dir" "$pod_inbox_dir" pi gated "$pod_outbox_dir" pod \
-       "$FS_OUTBOX_MAX_BYTES"
+       "$outbox_max_bytes"
    fs_emit_review_prompt_body "$branch" "$base_sha" "$pod_skill_dir" \
        "$pod_verdict_file" "$pod_inbox_dir"; } | indent_block)
   fix-prompt-header.md: |
 $({ fs_emit_prompt_preamble "$pod_clone_dir" "$pod_inbox_dir" pi gated "$pod_outbox_dir" pod \
-       "$FS_OUTBOX_MAX_BYTES"
+       "$outbox_max_bytes"
    fs_emit_fix_prompt_body "$branch" "$base_sha"; } | indent_block)
   code-review-portable-skill.md: |
 $(indent_block < "$review_skill_src")
@@ -503,13 +515,14 @@ cmd_install() {
 }
 
 cmd_submit() {
-    local dry_run=false branch="" model="" review_loop_cap=""
+    local dry_run=false branch="" model="" review_loop_cap="" outbox_max_arg=""
     while (( $# )); do
         case "$1" in
             --dry-run) dry_run=true; shift ;;
             --branch) branch="${2:?--branch requires a name}"; shift 2 ;;
             --model) model="${2:?--model requires an OpenRouter model id}"; shift 2 ;;
             --review-loop) review_loop_cap="${2:?--review-loop requires a positive integer}"; shift 2 ;;
+            --outbox-max) outbox_max_arg="${2:?--outbox-max requires a size}"; shift 2 ;;
             -*) echo "Error: unknown option '$1' for submit." >&2; exit 1 ;;
             *) break ;;
         esac
@@ -534,6 +547,13 @@ cmd_submit() {
         exit 1
     fi
     review_loop_cap="${review_loop_cap:-0}"
+
+    # Resolved here, before anything is created, same as the checks above --
+    # fs_parse_size_bytes already prints its own error naming what was given.
+    local outbox_max_bytes="$FS_OUTBOX_MAX_BYTES"
+    if [[ -n "$outbox_max_arg" ]]; then
+        outbox_max_bytes="$(fs_parse_size_bytes "$outbox_max_arg")" || exit 1
+    fi
 
     if [[ ! -d "$project_path" ]]; then
         echo "Error: project path '$project_path' is not a directory." >&2
@@ -632,7 +652,8 @@ cmd_submit() {
     if (( review_loop_cap > 0 )); then
         review_loop_configmap_keys=$'\n'"$(render_review_loop_configmap_keys \
             "$pod_clone_dir" "$POD_INBOX_DIR" "$POD_SKILL_DIR" "$POD_VERDICT_FILE" \
-            "$branch" "$base_sha" "$review_skill_src" "$review_loop_sh" "$POD_OUTBOX_DIR")"
+            "$branch" "$base_sha" "$review_skill_src" "$review_loop_sh" "$POD_OUTBOX_DIR" \
+            "$outbox_max_bytes")"
         review_loop_env=$'\n'"$(render_review_loop_env "$review_loop_cap" "$base_sha")"
     fi
 
@@ -656,7 +677,7 @@ $(indent_block < "$gate_sh")
 $(indent_block < "$inbox_write_sh")
   handoff.md: |
 $({ fs_emit_prompt_preamble "$pod_clone_dir" "$POD_INBOX_DIR" pi gated "$POD_OUTBOX_DIR" pod \
-       "$FS_OUTBOX_MAX_BYTES"
+       "$outbox_max_bytes"
    printf '\n---\n\n'
    cat -- "$handoff_file"; } | indent_block)${review_loop_configmap_keys}
 ---
@@ -725,7 +746,9 @@ spec:
             - name: GIT_USER_EMAIL
               value: "$GIT_USER_EMAIL"
             - name: RUN_TTL
-              value: "$K8S_RUN_TTL"${review_loop_env}
+              value: "$K8S_RUN_TTL"
+            - name: OUTBOX_MAX_BYTES
+              value: "$outbox_max_bytes"${review_loop_env}
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -928,7 +951,7 @@ cmd_rm() {
 # failure handling.
 cmd_run() {
     local dry_run=false keep=false timeout=3600 branch="" model="" review_loop_cap=""
-    local outbox_dir=""
+    local outbox_dir="" outbox_max_arg=""
     while (( $# )); do
         case "$1" in
             --dry-run) dry_run=true; shift ;;
@@ -938,6 +961,7 @@ cmd_run() {
             --model) model="${2:?--model requires an OpenRouter model id}"; shift 2 ;;
             --review-loop) review_loop_cap="${2:?--review-loop requires a positive integer}"; shift 2 ;;
             --outbox-dir) outbox_dir="${2:?--outbox-dir requires a path}"; shift 2 ;;
+            --outbox-max) outbox_max_arg="${2:?--outbox-max requires a size}"; shift 2 ;;
             -*) echo "Error: unknown option '$1' for run." >&2; exit 1 ;;
             *) break ;;
         esac
@@ -956,12 +980,22 @@ cmd_run() {
         exit 1
     fi
 
+    # Resolved here, before anything is created, for run's own pull-back
+    # check below -- and forwarded to cmd_submit as a raw string beneath,
+    # which parses its own copy for the Job spec. Same value either way;
+    # fs_parse_size_bytes already prints its own error naming what was given.
+    local outbox_max_bytes="$FS_OUTBOX_MAX_BYTES"
+    if [[ -n "$outbox_max_arg" ]]; then
+        outbox_max_bytes="$(fs_parse_size_bytes "$outbox_max_arg")" || exit 1
+    fi
+
     local -a submit_argv=(--branch "$branch" --model "$model")
     # Passed through whenever the flag was given at all, "0" included --
     # cmd_submit does the actual positive-integer validation below, and a
     # bad value here must reach that error rather than silently collapse
     # into "no loop" the way an `(( review_loop_cap > 0 ))` gate would.
     [[ -n "$review_loop_cap" ]] && submit_argv+=(--review-loop "$review_loop_cap")
+    [[ -n "$outbox_max_arg" ]] && submit_argv+=(--outbox-max "$outbox_max_arg")
     submit_argv+=("$project_path" "$handoff_file")
 
     # cmd_submit does its own full validation (K8S_IMAGE, K8S_DENIED_PROBE,
@@ -1112,7 +1146,6 @@ cmd_run() {
     local outbox_dest="$outbox_dir"
     [[ -n "$outbox_dest" ]] \
         || outbox_dest="/var/tmp/claude-scratch/forks/k8s-$(k8s_safe_name_component "$branch")/outbox"
-    local outbox_max_bytes="$FS_OUTBOX_MAX_BYTES"
     local outbox_tar outbox_ok=true
     outbox_tar="$(mktemp)"
     if ! kubectl exec "$pod_name" -- tar cf - -C /work/outbox . 2>/dev/null \
