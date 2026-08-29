@@ -22,6 +22,10 @@
 #   - fetched != true: same stop condition, the other way it can trip.
 #   - commits > 0 but no cover-letter.md: refuses to post, names the
 #     branch to read by hand, exits non-zero.
+#   - lkml-mailbox.sh init itself fails (e.g. the version it would post
+#     already exists): exits non-zero and does NOT append to the
+#     version-to-branch ledger lkml-forklift.sh reads -- a failed init must
+#     not leave a ledger entry for a version with no cover letter.
 
 set -uo pipefail
 
@@ -177,6 +181,18 @@ if (( rc != 0 )); then ok "exits non-zero with commits but no cover letter"; els
 contains "refusal names the branch to read by hand" "$out" "v2-branch"
 n_after=$(find "$LKML_MAILBOX_ROOT/widget-frob/cur" -name '*.msg' | wc -l)
 check "no new version was posted (message count unchanged)" "$n_before" "$n_after"
+
+printf '\n== refusal: lkml-mailbox.sh init itself fails (v2 already exists) ==\n'
+ledger_file="$LKML_MAILBOX_ROOT/widget-frob/versions.jsonl"
+ledger_lines_before=$(wc -l < "$ledger_file" | tr -d '[:space:]')
+write_stub 1 true 1 0
+out="$(PATH="$stub_bin:$PATH" "$revise" widget-frob --project "$real_repo" \
+    --checkout somebranch --version 1 --base "$series_base_sha" 2>&1)"
+rc=$?
+if (( rc != 0 )); then ok "exits non-zero when init fails"; else no "exits non-zero when init fails" "exit 0"; fi
+contains "names the mailbox init failure" "$out" "init failed"
+ledger_lines_after=$(wc -l < "$ledger_file" | tr -d '[:space:]')
+check "no ledger entry was appended for the failed version" "$ledger_lines_before" "$ledger_lines_after"
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 (( fail == 0 )) || exit 1

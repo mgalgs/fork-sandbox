@@ -167,8 +167,9 @@ Commit as you address each item, one logical change per commit -- not one
 squash at the end. Uncommitted work is lost when this run ends, so commit
 early and often rather than saving it all for a final commit.
 
-When you are done, write the new cover letter, including a changelog
-section that says what changed because of which reviewer's comment, to:
+When you are done, write the new cover letter, including a section headed
+exactly \`## Changelog\` that says what changed because of which reviewer's
+comment, to:
 
     .git/lkml-out/cover-letter.md
 
@@ -351,8 +352,19 @@ if ! (cd "$real_repo" && git format-patch --quiet -o "$patch_dir" "$series_base_
     exit 1
 fi
 
-new_cover_id="$("$mailbox" init "$series" --cover "$cover_file" --patches "$patch_dir" \
+new_cover_id="$(cd "$real_repo" && "$mailbox" init "$series" --cover "$cover_file" --patches "$patch_dir" \
     --from "$author_persona" --display "$display" --version "$next_version" \
-    --harness "$harness" --model "$model")"
+    --harness "$harness" --model "$model" --diffstat "$series_base_sha..$real_branch")" || {
+    echo "Error: lkml-mailbox.sh init failed -- v$next_version was not posted." >&2
+    echo "Patches are sitting at $patch_dir; branch $real_branch was not" >&2
+    echo "recorded in $ledger_root/$series/versions.jsonl." >&2
+    exit 1
+}
 echo "fork-sandbox lkml-revise: posted v$next_version, cover ${new_cover_id:0:7}." >&2
+
+# Same version-to-branch ledger lkml-series.sh writes for v1 -- lets
+# lkml-forklift.sh find a version's branch without guessing its timestamp.
+jq -nc --argjson version "$next_version" --arg branch "$real_branch" \
+    '{version:$version, branch:$branch}' >> "$ledger_root/$series/versions.jsonl"
+
 rm -rf -- "$patch_dir"

@@ -30,13 +30,18 @@ one-line rendering does not make clear. Reading everything defeats the
 point of the arrangement: the mailbox exists so this session's job is
 scheduling, not reading, and the reviewers' job is reading.
 
-## The four scripts
+## The scripts
 
 - **`lkml-mailbox.sh`** — the message store. `init` posts a cover letter
   and a `git format-patch` set as v1 (or the next version); `post` replies
-  in a thread; `tree`/`cover`/`show`/`open`/`tally` read it back. Read its
-  own header comment for the full verb list and the message shape. You
-  will mostly call `tree`, `open`, `tally` and `cover` — see above.
+  in a thread; `tree`/`cover`/`show`/`open`/`tally` read it back. `init`
+  and `post` also take `--attach <file>` (repeatable) to carry a file
+  (e.g. a screenshot a reviewer persona should look at) alongside a
+  message — it lands under `<series>/attachments/`, gets an
+  `X-Attachment` header, and `tree` marks the message with a trailing
+  "📎". Read its own header comment for the full verb list, the message
+  shape, and the attachment size cap/collision rules. You will mostly call
+  `tree`, `open`, `tally` and `cover` — see above.
 - **`lkml-round.sh`** — launches one sandboxed run per persona, in
   parallel, either reviewing the whole series fresh or replying to
   specific threads you name with `--reply-to`. Every run's replies are
@@ -50,6 +55,27 @@ scheduling, not reading, and the reviewers' job is reading.
   would let a long author revision pick up where it left off instead of
   restarting from the checked-out ref on a timeout. Nothing here depends on
   it yet — this is a note for when it exists, not a requirement now.
+- **`lkml-series.sh`** — for reviewing work AFTER it already shipped: given
+  `<base>..<tip>` that already landed (a merge commit, a pile of WIP
+  commits, whatever), launches the author persona once to recreate the
+  SAME end state as thematic, individually reviewable commits, then
+  `git format-patch`es that reconstruction as v1. Verifies the
+  reconstruction's tree against `<tip>` itself before trusting it. Does
+  not post a cover letter — follow it with `lkml-cover.sh`. See "Post-hoc
+  review" below.
+- **`lkml-cover.sh`** — launches the author persona to write a cover
+  letter for patches that already exist (`lkml-series.sh`'s
+  reconstruction, or any other already-formatted patch set) and posts it
+  with `lkml-mailbox.sh init`. This is also what step 1 below means by
+  "something you ask the `author` persona to write in its own short
+  sandboxed run first."
+- **`lkml-forklift.sh`** — the post-hoc exit point: once a version has
+  converged (step 5), folds that version's reviewed delta back onto a real
+  branch in the operator's own repo (`--onto <branch>`) as one commit
+  carrying the tally and changelog, tolerating `--onto` having moved since
+  the series branched off. It is the only script here that mutates the
+  operator's real repository — read its own header comment before running
+  it.
 - **`lkml-status.sh`** — one screen: current version, its tally, every
   open thread, the deepest thread, and cost so far.
 
@@ -117,6 +143,33 @@ do not vary it round to round.
    commits — its own "a version changes nothing" line.
 6. **`lkml-status.sh <series>`** any time you want the one-screen version
    of all of the above, including cost so far.
+
+## Post-hoc review (work that already shipped)
+
+Everything above assumes a branch and a cover letter ready for step 1's
+`init`. For a range that already landed and is being reviewed AFTER THE
+FACT, get there differently, then rejoin the loop at step 2:
+
+1. **`lkml-series.sh <series> --project <path> --range <base>..<tip>`**
+   reconstructs `<base>..<tip>` as thematic, individually reviewable
+   commits on a new branch and format-patches them into `<series>/patches-
+   v1/`. It does not post anything.
+2. **`lkml-cover.sh <series> --project <path> --checkout <branch> --base
+   <base> --patches <series>/patches-v1/`** launches the author persona to
+   write v1's cover letter and posts it with `lkml-mailbox.sh init` — this
+   is step 1 of the loop, done for you.
+3. Continue at step 2 of the loop above, panel checked out against
+   `<branch>`.
+
+When the series converges (step 5), the reviewed version exists only as a
+branch in `<series>/versions.jsonl` — it still needs to land on the real
+branch it started from. **`lkml-forklift.sh <series> --project <path>
+--version <n> --onto <branch>`** does that: it folds vN's reviewed delta
+onto `<branch>`'s CURRENT tip as one commit, tolerating `<branch>` having
+moved since the series branched off, and refuses outright (moving nothing)
+if the two have genuinely diverged. Read its own header comment before
+running it — it is the only script in lkml-mode that mutates the
+operator's real repository, and it does not push or run tests for you.
 
 ## Attribution is non-negotiable, and it is not your job to enforce it
 

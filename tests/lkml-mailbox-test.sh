@@ -280,5 +280,106 @@ else
     no "refuses --version 1 a second time" "it succeeded"
 fi
 
+printf '\n== attachments ==\n'
+
+printf 'a screenshot, pretend\n' > shot.png
+out="$("$mailbox" init widget-frob --cover cover.txt --patches patches --from author \
+    --harness claude --model opus --attach shot.png 2>diag.txt)"
+rc=$?
+check "init --attach exits 0" "0" "$rc"
+attach_cover_id="$out"
+check "the attachment is copied into <series>/attachments/" "1" \
+    "$(find "$LKML_MAILBOX_ROOT/widget-frob/attachments" -name 'shot.png' | wc -l)"
+
+raw_att="$("$mailbox" show widget-frob "${attach_cover_id:0:7}")"
+contains "show prints the X-Attachment header" "$raw_att" "X-Attachment: attachments/shot.png"
+
+tree_att="$("$mailbox" tree widget-frob)"
+contains "tree marks the attachment-carrying cover with 📎" \
+    "$(printf '%s\n' "$tree_att" | grep "${attach_cover_id:0:7}")" "📎"
+
+echo "see the attached log" > note.txt
+r_att="$("$mailbox" post widget-frob --from linus --reply-to "${attach_cover_id:0:7}" \
+    --file note.txt --attach shot.png --harness claude --model opus 2>diag.txt)"
+rc=$?
+check "post --attach exits 0" "0" "$rc"
+raw_reply_att="$("$mailbox" show widget-frob "${r_att:0:7}")"
+contains "a reply's attachment also gets an X-Attachment header" "$raw_reply_att" "X-Attachment: attachments/shot.png"
+
+big="$(mktemp)"; tmpdirs+=("$big")
+dd if=/dev/zero of="$big" bs=1M count=5 >/dev/null 2>&1
+out="$("$mailbox" post widget-frob --from linus --reply-to "${attach_cover_id:0:7}" \
+    --file note.txt --attach "$big" --harness claude --model opus 2>&1)"
+rc=$?
+if (( rc != 0 )); then ok "refuses an attachment over the 4 MiB cap"; else no "refuses an attachment over the 4 MiB cap" "it succeeded"; fi
+contains "the cap refusal names the byte cap" "$out" "4194304"
+
+echo "perf numbers" > "perf,before.txt"
+echo "plain data" > plain.txt
+out="$("$mailbox" post widget-frob --from linus --reply-to "${attach_cover_id:0:7}" \
+    --file note.txt --attach "perf,before.txt" --attach plain.txt \
+    --harness claude --model opus 2>diag.txt)"
+rc=$?
+check "post with a comma in one attachment's basename exits 0" "0" "$rc"
+raw_comma="$("$mailbox" show widget-frob "${out:0:7}")"
+contains "the comma-basename file gets its own X-Attachment header" "$raw_comma" "X-Attachment: attachments/perf,before.txt"
+contains "the other attachment gets its own X-Attachment header" "$raw_comma" "X-Attachment: attachments/plain.txt"
+check "the comma-basename file actually landed on disk" "1" \
+    "$(find "$LKML_MAILBOX_ROOT/widget-frob/attachments" -name 'perf,before.txt' | wc -l)"
+
+echo "different content" > shot2.png
+mv shot2.png shot.png
+out="$("$mailbox" post widget-frob --from linus --reply-to "${attach_cover_id:0:7}" \
+    --file note.txt --attach shot.png --harness claude --model opus 2>&1)"
+rc=$?
+if (( rc != 0 )); then
+    ok "refuses an attachment basename collision with different content"
+else
+    no "refuses an attachment basename collision with different content" "it succeeded"
+fi
+contains "the collision refusal names the colliding path" "$out" "attachments/shot.png"
+
+printf '\n== init --diffstat / --smoke ==\n'
+
+diffstat_repo="$(mktemp -d)"; tmpdirs+=("$diffstat_repo")
+git -C "$diffstat_repo" init -q
+git -C "$diffstat_repo" config user.email test@example.com
+git -C "$diffstat_repo" config user.name "Test"
+printf 'base\n' > "$diffstat_repo/file.txt"
+git -C "$diffstat_repo" add file.txt
+git -C "$diffstat_repo" commit -q -m "base"
+base_sha="$(git -C "$diffstat_repo" rev-parse HEAD)"
+printf 'base\nmore\n' > "$diffstat_repo/file.txt"
+git -C "$diffstat_repo" commit -q -am "add a line"
+tip_sha="$(git -C "$diffstat_repo" rev-parse HEAD)"
+
+printf 'all tests passed: 42/42\n' > smoke.txt
+
+out="$(cd "$diffstat_repo" && "$mailbox" init widget-frob --cover "$work/cover.txt" --patches "$work/patches" \
+    --from author --harness claude --model opus --diffstat "$base_sha..$tip_sha" --smoke "$work/smoke.txt" 2>diag.txt)"
+rc=$?
+check "init --diffstat/--smoke exits 0" "0" "$rc"
+diffstat_cover_id="$out"
+raw_diffstat="$("$mailbox" show widget-frob "${diffstat_cover_id:0:7}")"
+contains "cover body gets a Diffstat section" "$raw_diffstat" "## Diffstat"
+contains "the diffstat section carries git's own output" "$raw_diffstat" "file.txt"
+contains "cover body gets a Test results section" "$raw_diffstat" "## Test results"
+contains "the Test results section carries the smoke file verbatim" "$raw_diffstat" "all tests passed: 42/42"
+
+out="$(cd "$diffstat_repo" && "$mailbox" init widget-frob --cover "$work/cover.txt" --patches "$work/patches" \
+    --from author --harness claude --model opus --smoke "$work/nosuchfile.txt" 2>&1)"
+rc=$?
+if (( rc != 0 )); then ok "refuses a --smoke file that does not exist"; else no "refuses a --smoke file that does not exist" "it succeeded"; fi
+
+out="$(cd "$diffstat_repo" && "$mailbox" init widget-frob --cover "$work/cover.txt" --patches "$work/patches" \
+    --from author --harness claude --model opus --diffstat "nonsense..alsobogus" 2>&1)"
+rc=$?
+if (( rc != 0 )); then ok "refuses a --diffstat range that fails to diff"; else no "refuses a --diffstat range that fails to diff" "it succeeded"; fi
+
+out="$("$mailbox" init widget-frob --cover "$work/cover.txt" --patches "$work/patches" \
+    --from author --harness claude --model opus --diffstat "$base_sha..$tip_sha" 2>&1)"
+rc=$?
+if (( rc != 0 )); then ok "refuses a --diffstat range when cwd is not a git repo"; else no "refuses a --diffstat range when cwd is not a git repo" "it succeeded"; fi
+
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 (( fail == 0 )) || exit 1
