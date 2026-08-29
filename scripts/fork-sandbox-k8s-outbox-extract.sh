@@ -59,18 +59,30 @@ fi
 # `tar cf - -C /work/outbox .` look like `./`, `./foo.png`, `./sub/bar.txt`
 # -- relative, with a leading `./`, no `..` component -- so those are the
 # only shapes this loop lets through.
+# Two passes over the archive, deliberately, because the two questions want
+# different output formats and mixing them is how this check gets silently
+# defeated.
+#
+# Link detection needs `tar -tvf`, whose first column carries the type bit
+# and whose hard-link entries append " link to TARGET". But `-tvf` is
+# COLUMNAR, and a path is not a column: a member named `../../pwned x.txt`
+# puts `x.txt` in the last field, so picking the last whitespace-separated
+# field passes a traversal path straight through this guard. Any filename
+# containing a space defeats it, and screenshots with spaces in their names
+# are entirely ordinary.
+#
+# So paths are read from `tar -tf` instead, which prints one member name per
+# line and nothing else. (A name containing a literal newline would still be
+# ambiguous, but GNU tar escapes control characters in listings, so it
+# cannot smuggle a line break through here.)
 while IFS= read -r line; do
-    mode="${line%% *}"
-    # tar -tvf columns are whitespace-separated; the path is the last field
-    # on every line EXCEPT a hard link's, which appends ` link to TARGET`
-    # after it -- checked for directly below rather than parsed out, since
-    # the path itself is not needed here, only whether the entry is safe.
-    path="$(printf '%s\n' "$line" | awk '{print $NF}')"
-
-    if [[ "${mode:0:1}" == "l" ]] || [[ "$line" == *" link to "* ]]; then
+    if [[ "${line:0:1}" == "l" ]] || [[ "$line" == *" link to "* ]]; then
         echo "fork-sandbox-k8s-outbox-extract: $tar_file contains a link entry; refusing the whole archive." >&2
         exit 1
     fi
+done < <(tar -tvf "$tar_file")
+
+while IFS= read -r path; do
     case "$path" in
         /*)
             echo "fork-sandbox-k8s-outbox-extract: $tar_file contains an absolute path ('$path'); refusing the whole archive." >&2
@@ -81,7 +93,7 @@ while IFS= read -r line; do
             exit 1
             ;;
     esac
-done < <(tar -tvf "$tar_file")
+done < <(tar -tf "$tar_file")
 
 # Freshly created: mkdir, not mkdir -p, so this fails loudly if dest_dir
 # already exists rather than extracting into and possibly clobbering
