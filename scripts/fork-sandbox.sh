@@ -88,6 +88,20 @@
 # --prompts-dir <dir>:   overlay model-specific prompt fragments from <dir>
 #                        onto the generated prompt for this run only. <dir>
 #                        must exist. See docs/prompt-overlays.md.
+# --refresh-at <fraction|tokens>:
+#                        nudge a session to hand off to a fresh one when its
+#                        context fills up, so a long run degrades into a new
+#                        session instead of into compaction. Default 0.5 (half
+#                        the model's context window); 0 disables it. A value
+#                        above 1 is an absolute token count instead of a
+#                        fraction. claude only for now — see "A run that
+#                        refreshes itself" below. Refused with any other
+#                        --harness, and with --k8s.
+# --refresh-max <n>:     how many continuation legs may follow the first
+#                        before the run gives up and moves on to the review
+#                        loop anyway. Default 6. Requires --refresh-at (which
+#                        is on by default), so it inherits the same harness
+#                        and --k8s restrictions.
 # --k8s:                 submit this run as a Kubernetes Job instead of a
 #                        local sandbox, by exec'ing fork-sandbox-k8s.sh run
 #                        with the arguments below. Defaults --harness to pi,
@@ -187,6 +201,34 @@
 # counts as running until the last leg is done — the exit code is published
 # after the loop — so a watcher gets one terminal event, at the end, with a
 # summary that reflects the reviewed branch.
+#
+# A run that refreshes itself. An interactive session that fills its context
+# writes a hand-off and forks a fresh session rather than degrade into
+# compaction. --refresh-at gives an unattended run the same move, with no
+# human in the loop: when a coding leg's context crosses the threshold, a hook
+# nudges it, once, through the same channel an operator addendum uses, to
+# finish the step it is on, commit, write a self-contained hand-off for a
+# fresh session to <run-dir>/outbox/handoff.md, and end its turn. If it does,
+# this script moves that file to <run-dir>/handoff-N.md (the record) and runs
+# a fresh session on the SAME clone and branch with it as the prompt —
+# continuation N. That repeats, on the same nudge-and-check cycle, until a leg
+# ends with nothing waiting in the outbox (the ordinary ending), until
+# --refresh-max legs have run, or until a nudged leg ends without writing a
+# hand-off at all. The review loop above, when both flags are given, then runs
+# once, after the LAST coding leg, over every commit the whole chain made.
+#
+# It costs what it looks like it costs: each continuation is another whole
+# session, at the same model's price. summary.json's `continuations` array
+# and `refresh` field say what happened — how many legs ran, each one's exit,
+# cost and usage, and how the chain ended (`none`, `empty-outbox`, `cap`, or
+# `no-handoff` for a nudged leg that never wrote one) — and `total_cost_usd`
+# folds every continuation in beside the review loop's own legs.
+#
+# claude only, for now. The threshold is measured in
+# fork-sandbox-inbox-hook.sh, which already runs on every tool call and reads
+# the transcript path off the hook payload — pi, pi-local and codex have no
+# hook system to measure with, so --refresh-at is refused outright on those
+# harnesses, and on --k8s, whose pod runs a different entrypoint.
 #
 # Sandboxed mode trades isolation for silence: the session never asks for
 # permission, because the sandbox is the boundary instead of the prompt.
@@ -952,6 +994,9 @@ keep_session=false
 no_services=false
 services_trust_ref=""
 prompts_dir_arg=""
+refresh_at_arg=""
+refresh_at_given=false
+refresh_max_arg=""
 k8s_mode=false
 k8s_timeout=""
 k8s_keep=false
@@ -1031,6 +1076,15 @@ while [[ "${1:-}" == -* ]]; do
             ;;
         --prompts-dir)
             prompts_dir_arg="${2:?--prompts-dir requires a directory}"
+            shift 2
+            ;;
+        --refresh-at)
+            refresh_at_arg="${2:?--refresh-at requires a fraction or a token count}"
+            refresh_at_given=true
+            shift 2
+            ;;
+        --refresh-max)
+            refresh_max_arg="${2:?--refresh-max requires a non-negative integer}"
             shift 2
             ;;
         --k8s)
@@ -1325,6 +1379,19 @@ if [[ "$k8s_mode" == true ]]; then
         echo "review leg has nowhere to be declared yet." >&2
         exit 1
     fi
+    if [[ "$refresh_at_given" == true ]]; then
+        echo "Error: --refresh-at is not supported with --k8s. It is measured by" >&2
+        echo "a hook fork-sandbox-inbox-hook.sh installs into the local" >&2
+        echo "sandbox's claude session; the pod runs a different entrypoint with" >&2
+        echo "no such hook." >&2
+        exit 1
+    fi
+    if [[ -n "$refresh_max_arg" ]]; then
+        echo "Error: --refresh-max is not supported with --k8s, for the same" >&2
+        echo "reason as --refresh-at: there is no context-refresh mechanism on" >&2
+        echo "the cluster path to cap." >&2
+        exit 1
+    fi
 
     # Same two security checks the local path applies below, applied here
     # before this run is handed to fork-sandbox-k8s.sh: this script is meant
@@ -1383,6 +1450,67 @@ if [[ -n "$review_model" && "$review_loop_cap" == "0" ]]; then
     echo "--review-loop." >&2
     exit 1
 fi
+
+# --refresh-at: refused outright, by name, on every harness but claude --
+# see the "A run that refreshes itself" section above for why. Refused only
+# when GIVEN explicitly, so the 0.5 default stays silent on a plain pi or
+# codex run rather than erroring on every launch that never mentioned it.
+if [[ "$refresh_at_given" == true && "$harness" != "claude" ]]; then
+    echo "Error: --refresh-at only works with --harness claude. The context" >&2
+    echo "threshold is measured by a hook installed into the claude session;" >&2
+    echo "the other harnesses have no hook system to measure with, and this" >&2
+    echo "is not built for them yet." >&2
+    exit 1
+fi
+if [[ -n "$refresh_max_arg" && "$harness" != "claude" ]]; then
+    echo "Error: --refresh-max only applies with --harness claude, alongside" >&2
+    echo "--refresh-at." >&2
+    exit 1
+fi
+refresh_at="0"
+[[ "$harness" == "claude" ]] && refresh_at="${refresh_at_arg:-0.5}"
+if [[ ! "$refresh_at" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+    echo "Error: --refresh-at takes a fraction (0-1) of the context window, an" >&2
+    echo "absolute token count above 1, or 0 to disable it -- not '$refresh_at'." >&2
+    exit 1
+fi
+refresh_max=6
+if [[ -n "$refresh_max_arg" ]]; then
+    if [[ ! "$refresh_max_arg" =~ ^[0-9]+$ ]]; then
+        echo "Error: --refresh-max takes a non-negative integer -- the number of" >&2
+        echo "continuation legs that may follow the first -- not '$refresh_max_arg'." >&2
+        exit 1
+    fi
+    refresh_max="$refresh_max_arg"
+fi
+# awk, not bash arithmetic, for the ">0" test: $refresh_at can be a fraction
+# ("0.5"), and bash's (( )) only understands integers.
+refresh_enabled=0
+awk -v v="$refresh_at" 'BEGIN{exit !(v>0)}' && refresh_enabled=1
+refresh_context_window=""
+refresh_threshold_tokens=""
+if (( refresh_enabled )); then
+    # A one-line, one-place guess, kept here rather than duplicated in the
+    # hook: a model whose name carries "[1m]" gets the 1,000,000-token beta
+    # window; everything else gets the standard 200,000.
+    # FORK_SANDBOX_CONTEXT_WINDOW overrides the guess outright, and
+    # --refresh-at <tokens> (an absolute count above 1) sidesteps it
+    # entirely, since the comparison below then needs no window at all.
+    refresh_context_window="${FORK_SANDBOX_CONTEXT_WINDOW:-}"
+    if [[ -z "$refresh_context_window" ]]; then
+        case "${model,,}" in
+            *'[1m]'*) refresh_context_window=1000000 ;;
+            *)        refresh_context_window=200000 ;;
+        esac
+    fi
+    if awk -v v="$refresh_at" 'BEGIN{exit !(v<=1)}'; then
+        refresh_threshold_tokens="$(awk -v f="$refresh_at" -v w="$refresh_context_window" \
+            'BEGIN{printf "%d", f*w}')"
+    else
+        refresh_threshold_tokens="$(awk -v f="$refresh_at" 'BEGIN{printf "%d", f}')"
+    fi
+fi
+
 # The resolved model values are what --dry-run prints, so they have to clear
 # the shell-safety check before it prints them. The full sweep over every
 # generated-runner value still runs below; this is the same check applied
@@ -1541,6 +1669,11 @@ if [[ "$dry_run" == true ]]; then
             "$prompt_overlay_leg" "$prompt_overlay_leg_csv"
     done
     printf 'prompt_overlay_rev=%s\n' "$prompt_overlay_rev"
+    printf 'refresh_at=%s\nrefresh_max=%s\n' "$refresh_at" "$refresh_max"
+    if (( refresh_enabled )); then
+        printf 'refresh_context_window=%s\nrefresh_threshold_tokens=%s\n' \
+            "$refresh_context_window" "$refresh_threshold_tokens"
+    fi
     exit 0
 fi
 
@@ -2397,6 +2530,38 @@ if [[ "$harness" == "claude" ]]; then
     fs_reject_unsafe_chars "$inbox_hook" "$inbox_settings"
 fi
 
+# --refresh-at's outbox: the ONE writable path outside the clone, bound
+# --bind-rw beside the read-only inbox. This adds a writable surface, unlike
+# everything above, and that is deliberate rather than an oversight -- the
+# session has to have somewhere to put a hand-off nobody proactively reads
+# out of the clone for it. It stays safe because it is read the same way the
+# workspace and PLAN.md already are: the host only ever reads a hand-off as
+# TEXT, and treats it as untrusted prompt content, never as anything to
+# execute -- see the continuation prompt this script builds further down.
+# Created and bound only when refresh is actually enabled, so a run with
+# --refresh-at 0 (or any harness but claude) gets no extra bind at all.
+outbox_dir=""
+refresh_config=""
+if (( refresh_enabled )); then
+    outbox_dir="$run_dir/outbox"
+    mkdir -p "$outbox_dir"
+    chmod 755 "$outbox_dir"
+    fs_reject_unsafe_chars "$outbox_dir"
+
+    # The hook's own settings, in the same inbox-dotfile trick .settings.json
+    # uses above: the run dir itself is never bound, so anything the hook
+    # needs to read has to live somewhere that IS. THRESHOLD_TOKENS is
+    # resolved on the host, from --refresh-at and the model's context window,
+    # so the hook does no fraction math; OUTBOX_DIR is this same directory,
+    # named so the hook can check it without knowing the run dir layout.
+    refresh_config="$inbox_dir/.refresh-config"
+    {
+        printf 'THRESHOLD_TOKENS=%s\n' "$refresh_threshold_tokens"
+        printf 'OUTBOX_DIR=%s\n' "$outbox_dir"
+    } > "$refresh_config"
+    fs_reject_unsafe_chars "$refresh_config"
+fi
+
 # The handoff is the whole prompt, so prepend the one fact the caller cannot
 # know: where the clone ended up. The session starts there, so relative paths
 # always work — but a model that writes an absolute path by hand can drop a
@@ -2507,6 +2672,22 @@ if (( review_loop_cap > 0 )); then
     mv -- "$fix_prompt_header.part" "$fix_prompt_header"
 fi
 
+# --refresh-at's continuation prompt: just the preamble, built once here for
+# the same reason review_prompt and fix_prompt_header are -- everything it
+# names (the clone, the inbox) is known now and known nowhere else, and the
+# runner has no access to fs_emit_prompt_preamble at all, since it is a
+# standalone generated script. The runner appends the "this is continuation
+# N" line and that leg's own hand-off at runtime, the same way it appends the
+# verdict to fix_prompt_header above.
+continuation_prompt_header=""
+if (( refresh_enabled )); then
+    continuation_prompt_header="$run_dir/continuation-prompt-header.md"
+    fs_reject_unsafe_chars "$continuation_prompt_header"
+    fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" "$harness" "$preamble_network" \
+        > "$continuation_prompt_header.part"
+    mv -- "$continuation_prompt_header.part" "$continuation_prompt_header"
+fi
+
 # Resolve the wrapper to an absolute path now. The generated runner executes
 # in the tmux server's environment, and that PATH may not carry
 # ~/.claude/scripts — a server started at login often predates the user's
@@ -2563,6 +2744,11 @@ fi
 # The operator inbox, for every harness. Read-only, so this widens nothing the
 # sandbox can write; it is the one path a host can put words into after launch.
 sandbox_cmd+=(--bind-ro "$inbox_dir")
+# --refresh-at's outbox: writable, and only bound at all when refresh is
+# enabled -- see the comment where it is created, above.
+if (( refresh_enabled )); then
+    sandbox_cmd+=(--bind-rw "$outbox_dir")
+fi
 if [[ -n "$sandbox_args" ]]; then
     # Deliberate word splitting: the caller passes a flag string.
     # shellcheck disable=SC2206
@@ -2807,6 +2993,10 @@ started_at="$(date +%s)"
     printf 'review_prompt=%q\n' "$review_prompt"
     printf 'fix_prompt_header=%q\n' "$fix_prompt_header"
     printf 'review_verdict_file=%q\n' "$review_verdict_file"
+    printf 'refresh_enabled=%q\n' "$refresh_enabled"
+    printf 'refresh_max=%q\n' "$refresh_max"
+    printf 'outbox_dir=%q\n' "$outbox_dir"
+    printf 'continuation_prompt_header=%q\n' "$continuation_prompt_header"
     printf 'user_shell=%q\n' "$user_shell"
     printf 'keep_open=%q\n' "$keep_open"
     printf 'services_enabled=%q\n' "$services_enabled"
@@ -2990,8 +3180,9 @@ rc="${PIPESTATUS[0]:-1}"
 # --review-loop run the exit code is published after the loop instead, where
 # the run really does end; the pid file keeps the state honest as "running"
 # until then. A run without the flag is untouched and writes it here as
-# always.
-if [[ "$review_loop_cap" == "0" ]]; then
+# always. --refresh-at defers the same way, and for the same reason: a
+# continuation leg can still change $rc below.
+if [[ "$review_loop_cap" == "0" && "$refresh_enabled" == "0" ]]; then
     printf '%s\n' "$rc" > "$run_dir/exit-code"
 fi
 
@@ -3151,6 +3342,175 @@ else
     rm -f "$run_dir/run.env.part"
 fi
 
+# Shared with the review loop below: the running total of every extra
+# session this run pays for beyond the implement leg, and whether that total
+# is still honest. A continuation leg's cost lands here first; a review-loop
+# leg's cost lands here too, once that section runs -- one accumulator, so
+# total_cost_usd at the very end is never short a leg.
+loop_cost_sum=0
+loop_cost_unknown=0
+
+# ---------------------------------------------------------------- refresh --
+# --refresh-at: when a coding leg's own context crossed the threshold,
+# fork-sandbox-inbox-hook.sh nudged it, once, to write a hand-off to
+# $outbox_dir/handoff.md and end its turn. If it did, this loop moves that
+# file to $run_dir/handoff-N.md (the record) and runs continuation N: a
+# fresh session, same clone, same branch, with that hand-off as its whole
+# prompt. It keeps going -- checking the outbox again, running another
+# continuation -- until a leg ends with nothing waiting there, which is the
+# ordinary way this ends.
+#
+# $rc is OVERWRITTEN by each continuation's own exit code, deliberately: the
+# review loop below (and the final exit code) must judge the run by its LAST
+# coding leg, not its first. It sits here, after the implement leg's own
+# run_cost/run_usage accounting above, so that accounting keeps meaning the
+# implement leg alone -- exactly as it did before this feature existed --
+# while every continuation's cost instead joins loop_cost_sum, the same
+# accumulator the review loop below adds its own legs to.
+refresh_ended=""
+continuations_json='[]'
+refresh_leg_n=0
+# The events slice to check for a nudge marker once no hand-off is waiting:
+# starts as the implement leg's own events.jsonl (nothing else has been
+# appended to it yet at this point), and becomes each continuation's own
+# events-continuation-N.jsonl in turn.
+refresh_last_events="$events"
+
+# Continuation legs share fork-sandbox-inbox-hook.sh's own tag rather than
+# invent a second one: that hook already writes it to stderr, which
+# --include-hook-events folds into this leg's own event stream as a
+# hook_response event, so it is right there in whichever file this leg wrote.
+refresh_leg_was_nudged() {
+    grep -q 'fork-sandbox-refresh: nudged' "$1" 2>/dev/null
+}
+
+# $1 leg number (2 for the first continuation, matching "leg 1" being the
+# implement leg). $2 the hand-off file, already moved to its $run_dir record.
+# $3 the destination path. Just the static preamble plus a short marker line
+# and the hand-off verbatim -- there is no verdict-style body to append here,
+# unlike the fix leg's prompt.
+refresh_build_prompt() {
+    local n="$1" handoff="$2" out="$3"
+    {
+        cat -- "$continuation_prompt_header"
+        printf '\n---\n\n# This is continuation %s of a run that refreshed its context\n\n' "$n"
+        printf 'A previous session, in this same clone and on this same branch, used up\n'
+        printf 'most of its context window and wrote the hand-off below for a fresh\n'
+        printf 'session to continue from. You are that fresh session, with none of its\n'
+        printf 'memory. Read the hand-off as your task.\n\n'
+        printf '---\n\n'
+        cat -- "$handoff"
+    } > "$out.part"
+    mv -- "$out.part" "$out"
+}
+
+if [[ "$refresh_enabled" == "1" ]]; then
+    while :; do
+        if [[ -f "$outbox_dir/handoff.md" ]]; then
+            if (( refresh_leg_n >= refresh_max )); then
+                refresh_ended="cap"
+                break
+            fi
+            # An oversized hand-off is refused rather than trusted -- moved
+            # aside so it is not silently reconsidered on the next check, and
+            # the run proceeds as if this leg had written nothing at all.
+            handoff_bytes="$(wc -c < "$outbox_dir/handoff.md" 2>/dev/null || printf 0)"
+            if (( handoff_bytes > 65536 )); then
+                printf 'fork-sandbox: outbox handoff.md is %s bytes, over the 64 KiB cap; refusing it.\n' \
+                    "$handoff_bytes" >> "$sandbox_log"
+                mv -f -- "$outbox_dir/handoff.md" "$run_dir/handoff-refused-too-large.md" 2>/dev/null
+                refresh_ended="no-handoff"
+                break
+            fi
+
+            refresh_leg_n=$(( refresh_leg_n + 1 ))
+            leg_no=$(( refresh_leg_n + 1 ))
+            record_name="handoff-$refresh_leg_n.md"
+            mv -f -- "$outbox_dir/handoff.md" "$run_dir/$record_name"
+
+            cont_prompt="$run_dir/continuation-prompt-$refresh_leg_n.md"
+            refresh_build_prompt "$leg_no" "$run_dir/$record_name" "$cont_prompt"
+
+            # A synthetic marker event, so --monitor and --follow notice a
+            # continuation starting without waiting for that leg's own first
+            # event -- see fork-sandbox-format.sh's rendering of it.
+            jq -c -n --argjson leg "$leg_no" --arg handoff "$record_name" \
+                '{type: "system", subtype: "fork_sandbox_continuation", leg: $leg, handoff: $handoff}' \
+                >> "$events" 2>/dev/null
+            printf '\n== fork-sandbox: continuation leg %s (from %s) ==\n' "$leg_no" "$record_name"
+
+            cont_events="$run_dir/events-continuation-$refresh_leg_n.jsonl"
+            : > "$cont_events"
+            # Both files: events.jsonl so --result, --follow and --monitor
+            # keep showing the whole coding phase as it happens (JQ_RESULT's
+            # "last result wins" is exactly "the LAST coding leg's result"),
+            # and this leg's own file so its cost and usage can be read in
+            # isolation below, the same way a review-loop leg's can.
+            if [[ -n "$formatter" ]]; then
+                "${sandbox_cmd[@]}" < "$cont_prompt" \
+                    2> >(tee -a "$sandbox_log" >&2) \
+                    | tee -a "$events" -a "$cont_events" \
+                    | "$formatter"
+            else
+                "${sandbox_cmd[@]}" < "$cont_prompt" \
+                    2> >(tee -a "$sandbox_log" >&2) \
+                    | tee -a "$events" -a "$cont_events"
+            fi
+            rc="${PIPESTATUS[0]:-1}"
+            refresh_last_events="$cont_events"
+
+            cont_cost="$("$formatter" --cost "$cont_events" 2>/dev/null)"
+            cont_usage="$("$formatter" --usage "$cont_events" 2>/dev/null)"
+            [[ -n "$cont_usage" ]] || cont_usage=null
+            if [[ "$cont_cost" =~ ^-?[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?$ ]]; then
+                summed="$(jq -n --argjson a "$loop_cost_sum" --argjson b "$cont_cost" \
+                    '$a + $b' 2>/dev/null)"
+                if [[ -n "$summed" ]]; then
+                    loop_cost_sum="$summed"
+                else
+                    loop_cost_unknown=1
+                fi
+            else
+                cont_cost=null
+                loop_cost_unknown=1
+            fi
+
+            merged="$(jq -c -n \
+                --argjson prev "$continuations_json" \
+                --argjson leg "$leg_no" \
+                --argjson exit "$rc" \
+                --argjson cost "$cont_cost" \
+                --argjson usage "$cont_usage" \
+                --arg handoff "$record_name" \
+                '$prev + [{leg: $leg, exit: $exit, cost_usd: $cost, usage: $usage, handoff: $handoff}]' \
+                2>/dev/null)"
+            [[ -n "$merged" ]] && continuations_json="$merged"
+
+            if [[ "$rc" != "0" ]]; then
+                refresh_ended="empty-outbox"
+                break
+            fi
+            continue
+        fi
+
+        # No hand-off is waiting. The leg that just finished -- the implement
+        # leg, the first time through -- is the run's last coding leg, unless
+        # it was nudged and still left nothing there, which is worth telling
+        # apart from a run that simply never needed to refresh at all.
+        if refresh_leg_was_nudged "$refresh_last_events"; then
+            refresh_ended="no-handoff"
+        else
+            refresh_ended="empty-outbox"
+        fi
+        break
+    done
+fi
+[[ -n "$refresh_ended" ]] || refresh_ended="none"
+if [[ "$refresh_enabled" == "1" ]]; then
+    printf 'fork-sandbox: refresh ended: %s (%s continuation leg(s) ran)\n' \
+        "$refresh_ended" "$refresh_leg_n"
+fi
+
 # ------------------------------------------------------------- review loop --
 # --review-loop N: review the commits the session just made in a FRESH session
 # of the same harness and (when supplied) --review-model, and when that review
@@ -3158,22 +3518,24 @@ fi
 # them to a fresh session that fixes them. Repeat until the review approves,
 # until a fix leg stops making progress, or until N iterations have run.
 #
-# It sits here on purpose: everything above is the implement leg's accounting,
-# including the pi stopReason check, which is the only failure detection a pi
-# run has. A main leg that died of a model error must never be reviewed as if
-# it had worked, so the loop runs downstream of the check that catches it.
+# It sits here on purpose: everything above is the implement leg's accounting
+# and, when --refresh-at ran any continuations, the refresh loop's -- including
+# the pi stopReason check, which is the only failure detection a pi run has. A
+# coding leg that died of a model error must never be reviewed as if it had
+# worked, so the loop runs downstream of the checks that catch it, and $rc by
+# now names the LAST coding leg's exit, not necessarily the implement leg's.
 #
 # The legs reuse this run's sandbox command, so they get the same harness, the
 # same clone and the same binds. Review legs may override the model; fix legs
-# retain the implementation model. They differ in the prompt on
-# stdin and in where their output goes: each leg has its own events file, so
-# events.jsonl stays the implement leg's and --result keeps showing the work
-# rather than the review of it.
+# retain the implementation model. They differ in the prompt on stdin and in
+# where their output goes: each leg has its own events file and never touches
+# events.jsonl, so it keeps showing the coding phase -- implement leg plus any
+# continuations -- and --result keeps showing the work rather than the review
+# of it. loop_cost_sum and loop_cost_unknown are shared with the refresh loop
+# above, so this section only ADDS to them.
 review_loop_ended=""
 review_loop_detail=""
 review_iters_done='[]'
-loop_cost_sum=0
-loop_cost_unknown=0
 
 # The branch head, read from the clone the one way anything here may read it:
 # over upload-pack from outside, exactly like the fetch below. Nothing runs git
@@ -3558,13 +3920,14 @@ if [[ "$review_loop_cap" != "0" && -n "$review_prompt" ]]; then
     printf 'fork-sandbox: review loop ended: %s\n' "$review_loop_ended"
 fi
 
-# The other half of the deferral above: for a --review-loop run the run is
-# over here -- the loop ran, or was skipped and said why -- so this is where
-# its exit code is published, which is what puts a watcher's terminal event
-# after the last leg rather than in the middle of the loop. The pi check
-# above may have written the same value already; writing it again costs
-# nothing and keeps this the one place that ends a loop run.
-if [[ "$review_loop_cap" != "0" ]]; then
+# The other half of the deferral above: for a --review-loop or --refresh-at
+# run the run is over here -- every loop ran, or was skipped and said why --
+# so this is where its exit code is published, which is what puts a
+# watcher's terminal event after the last leg rather than in the middle of
+# either loop. The pi check above may have written the same value already;
+# writing it again costs nothing and keeps this the one place that ends a
+# loop run.
+if [[ "$review_loop_cap" != "0" || "$refresh_enabled" == "1" ]]; then
     printf '%s\n' "$rc" > "$run_dir/exit-code"
 fi
 
@@ -3682,8 +4045,7 @@ fi
         printf 'cost:     $%s\n' "$run_cost_fmt"
     fi
     # One line for the review loop when it ran at all, including the case
-    # where it was skipped and why. The total is printed only when the loop
-    # actually spent something, so a run without one reads exactly as before.
+    # where it was skipped and why.
     if [[ -n "$review_loop_ended" ]]; then
         if [[ "$review_loop_ended" == "skipped" ]]; then
             printf 'review:   skipped -- %s\n' "$review_loop_detail"
@@ -3692,10 +4054,23 @@ fi
                 "$(jq '.iterations | length' "$run_dir/review-loop.json" 2>/dev/null || printf '?')" \
                 "$review_loop_ended"
         fi
-        if [[ -n "$total_cost_fmt" && "$total_cost_fmt" != "$run_cost_fmt" ]]; then
-            printf 'total:    $%s  (the session and every review-loop leg)\n' \
-                "$total_cost_fmt"
-        fi
+    fi
+    # Its sibling for --refresh-at, printed only when something happened --
+    # either a continuation actually ran, or a leg was nudged and never wrote
+    # one, both of which are worth a line. A run that never came near its
+    # threshold (the common case, since the flag is on by default) reads
+    # exactly as it did before this feature existed.
+    if [[ "$refresh_leg_n" -gt 0 || "$refresh_ended" == "no-handoff" ]]; then
+        printf 'refresh:  %s continuation leg(s), ended %s\n' \
+            "$refresh_leg_n" "$refresh_ended"
+    fi
+    # The total is printed only when it actually spent something beyond the
+    # coding session's own cost, so a run with neither flag -- or with
+    # neither ever doing anything -- reads exactly as it did before either
+    # feature existed.
+    if [[ -n "$total_cost_fmt" && "$total_cost_fmt" != "$run_cost_fmt" ]]; then
+        printf 'total:    $%s  (the session and every review-loop or continuation leg)\n' \
+            "$total_cost_fmt"
     fi
     if [[ -d "$run_dir/pi-session" ]]; then
         printf 'session:  %s\n' "$run_dir/pi-session"
@@ -3787,6 +4162,8 @@ jq -n \
     --argjson commits_list "$commit_list" \
     --arg author_email "$author_email_want" \
     --argjson author_email_unexpected "$author_email_bad_json" \
+    --arg refresh "$refresh_ended" \
+    --argjson continuations "$continuations_json" \
     '{
         version: $version,
         harness: $harness,
@@ -3807,6 +4184,8 @@ jq -n \
         branch_removed: $branch_removed,
         cost_usd: $cost_usd,
         total_cost_usd: $total_cost_usd,
+        refresh: $refresh,
+        continuations: $continuations,
         usage: $usage,
         usage_source: (if $usage == null then null else $usage_source end),
         session_dir: (if $session_dir == "" then null else $session_dir end),

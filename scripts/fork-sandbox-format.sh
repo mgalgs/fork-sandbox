@@ -6,8 +6,9 @@
 # --result:        print only the final result event, which carries the
 #                  session's own summary of what it did.
 # --notable:       print only the lines worth waking someone for — commits,
-#                  an operator addendum reaching the session, and the final
-#                  result. fork-sandbox-status.sh --monitor uses it.
+#                  an operator addendum reaching the session, a --refresh-at
+#                  continuation starting, and the final result.
+#                  fork-sandbox-status.sh --monitor uses it.
 # --commit-count:  print how many commits the session appears to have made.
 #                  It counts `git commit` calls, so it is an estimate: a
 #                  commit made by a script does not show, and a failed or
@@ -93,8 +94,16 @@ def inboxline:
   # firing is noise here.
   select(.type == "system" and .subtype == "hook_response")
   | ((.stderr // "") | flat)
-  | select(startswith("fork-sandbox-inbox:"))
+  | select(startswith("fork-sandbox-inbox:") or startswith("fork-sandbox-refresh:"))
   | "◆ \(.)";
+def refreshline:
+  # --refresh-at own marker, written directly into events.jsonl by
+  # fork-sandbox.sh runner (not by a hook) the moment it starts a
+  # continuation leg -- see the refresh loops own comment for why. This is
+  # the only line --monitor gets to announce one starting, since a legs own
+  # first event is otherwise indistinguishable from the implement legs.
+  select(.type == "system" and .subtype == "fork_sandbox_continuation")
+  | "◆ fork-sandbox-refresh: leg \(.leg) from \(.handoff)";
 def resulthead:
   "== result: \(.subtype // "?")\(if .is_error then " (ERROR)" else "" end)"
   + " · \(.num_turns // 0) turns"
@@ -123,6 +132,8 @@ fromjson? // empty
      | "  ⚠ tool error: \(.)")
   elif .type == "system" and .subtype == "hook_response" then
     inboxline
+  elif .type == "system" and .subtype == "fork_sandbox_continuation" then
+    refreshline
   elif .type == "result" then
     "\n\(resulthead)\n\((.result // .error // "(no text)") | clean)"
   else empty end
@@ -152,6 +163,8 @@ fromjson? // empty
      | "commit: \(. | flat | clip(140))")
   elif .type == "system" and .subtype == "hook_response" then
     inboxline
+  elif .type == "system" and .subtype == "fork_sandbox_continuation" then
+    refreshline
   elif .type == "result" then
     "\(resulthead)\n\((.result // .error // "(no text)") | clean)"
   else empty end

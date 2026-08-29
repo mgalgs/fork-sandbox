@@ -59,6 +59,29 @@ The review loop (fork-sandbox.sh --review-loop N):
                iteration, and the per-iteration costs say what that was
                worth.
 
+Context refresh (fork-sandbox.sh --refresh-at, on by default at 0.5 on the
+claude harness):
+  refresh        how the run's context-refresh chain ended: `none` (disabled,
+                 or any harness but claude), `empty-outbox` (a coding leg
+                 ended with no hand-off waiting -- the ordinary ending,
+                 whether or not any continuation ran), `cap` (--refresh-max
+                 legs ran and a hand-off was still waiting), or `no-handoff`
+                 (a leg was nudged and ended its turn without writing one).
+                 Present on every claude run made after this field existed,
+                 even one that never came near its threshold -- readers
+                 comparing against `none` do not also need to check for a
+                 missing key.
+  continuations  one object per continuation leg the run actually made --
+                 `leg` (2 for the first, matching leg 1 being the implement
+                 leg), `exit`, `cost_usd`, `usage` and `handoff` (the
+                 <run-id>/handoff-N.md record its prompt was built from).
+                 Empty for a run that never refreshed. `total_cost_usd`
+                 folds every continuation's cost in beside the review loop's;
+                 `cost_usd` stays the implement leg alone. Group on it
+                 directly: `stats --by model,refresh` says how often a model
+                 needs to refresh itself at all, and the per-leg costs in
+                 `continuations` say what each extra session was worth.
+
 The prompt overlay (fork-sandbox.sh --prompts-dir, or a machine's default
 ~/.config/fork-sandbox/prompts):
   prompt_overlay  present only when a run applied one, to at least one leg.
@@ -133,6 +156,8 @@ SUMMARY_FIELDS = [
     "branch_removed",
     "cost_usd",
     "total_cost_usd",
+    "refresh",
+    "continuations",
     "usage",
     "started_at",
     "ended_at",
