@@ -769,6 +769,16 @@ spec:
           configMap:
             name: $safe_name-scripts
         - name: work
+          # Deliberately no sizeLimit here. /work holds the outbox this
+          # file's own OUTBOX_MAX_BYTES budgets -- but an emptyDir sizeLimit
+          # is enforced by the kubelet EVICTING THE WHOLE POD the moment
+          # it's crossed, which would destroy the clone and the branch along
+          # with the oversized outbox. A refused pull-back (the outcome
+          # OUTBOX_MAX_BYTES actually produces, via cmd_run's pull-back guard
+          # and the pod-side warning in fork-sandbox-k8s-entrypoint.sh) is
+          # far cheaper than losing the whole run to eviction. If you're
+          # about to add one back: don't -- the cap already has an
+          # enforcement point, and it isn't this.
           emptyDir: {}
         - name: tmp
           emptyDir: {}
