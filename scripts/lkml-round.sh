@@ -195,11 +195,14 @@ Rules, all load-bearing:
 - **One message per distinct thing you have to say.** Do not bundle several
   separate review comments into one file.
 - **`In-Reply-To` must name a message id that already exists** in the
-  thread tree above (the full id or any unambiguous prefix of it). You
-  cannot reply to a file from earlier in this same batch -- ids are only
-  assigned once your reply is posted to the mailbox, which happens after
-  this run ends, so nothing you write in this round has an id of its own
-  yet.
+  thread tree above (the full id or any unambiguous prefix of it). That id
+  comes from the mailbox and from nowhere else. **A git commit sha is not a
+  message id**, however much the short form looks like one, and a reply
+  naming one is rejected outright -- if you have been reading git history,
+  do not reach for what you found there. You cannot reply to a file from
+  earlier in this same batch either -- ids are only assigned once your
+  reply is posted to the mailbox, which happens after this run ends, so
+  nothing you write in this round has an id of its own yet.
 - **Tag only when you mean it.** `Reviewed-by` means you would put your
   name on the patch as committed. `Acked-by` means the approach is right
   but you have not verified every line. `NAK` means this must not be
