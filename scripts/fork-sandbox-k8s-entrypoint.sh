@@ -40,6 +40,13 @@
 #   BASE_SHA        the commit the branch is measured against, for the
 #                   review loop's commit range. Required when
 #                   REVIEW_LOOP_CAP is set; unused otherwise.
+#   OUTBOX_MAX_BYTES the outbox size cap, in bytes, for the end-of-run
+#                   warning below. Default 67108864 (64 MiB) -- must match
+#                   FS_OUTBOX_MAX_BYTES in fork-sandbox-lib.sh; nothing
+#                   enforces the two staying equal, since this script does
+#                   not source that file. Set by fork-sandbox-k8s.sh's
+#                   `submit` to the effective value (default, or raised by
+#                   --outbox-max).
 #
 # Reads from /mnt/fork-sandbox/ (the scripts ConfigMap, mounted read-only):
 #   handoff.md              the run's whole prompt, on pi's stdin.
@@ -82,6 +89,7 @@ set -euo pipefail
 : "${INPUTS_TIMEOUT:=300}"
 : "${RUN_TTL:=3600}"
 : "${REVIEW_LOOP_CAP:=0}"
+: "${OUTBOX_MAX_BYTES:=67108864}"  # must match FS_OUTBOX_MAX_BYTES in fork-sandbox-lib.sh
 if [[ "$REVIEW_LOOP_CAP" =~ ^[1-9][0-9]*$ ]]; then
     : "${BASE_SHA:?BASE_SHA must be set when REVIEW_LOOP_CAP is set}"
 elif [[ "$REVIEW_LOOP_CAP" != "0" ]]; then
@@ -257,6 +265,20 @@ if [[ "$REVIEW_LOOP_CAP" =~ ^[1-9][0-9]*$ ]]; then
         # from inside it.
         commit_uncommitted_work "review loop"
     fi
+fi
+
+# Measured here, at the end of the run, same as the local path's own
+# end-of-run check in fork-sandbox.sh -- this is a heads-up only, never
+# enforced: the client's own pull-back (fork-sandbox-k8s.sh run) applies the
+# real refusal against the same cap once it has the tarball in hand, and
+# deleting anything here would destroy work the operator might still want to
+# inspect with `kubectl exec` before that pull-back runs.
+outbox_bytes="$(du -sb -- "$outbox_dir" 2>/dev/null | cut -f1)"
+[[ -n "$outbox_bytes" ]] || outbox_bytes=0
+if (( outbox_bytes > OUTBOX_MAX_BYTES )); then
+    echo "fork-sandbox-k8s-entrypoint: WARNING: outbox is $outbox_bytes bytes," >&2
+    echo "fork-sandbox-k8s-entrypoint: over the $OUTBOX_MAX_BYTES byte cap --" >&2
+    echo "fork-sandbox-k8s-entrypoint: the client will refuse to pull it back." >&2
 fi
 
 # .run-complete holds the CODING leg's exit code, never the review loop's --
