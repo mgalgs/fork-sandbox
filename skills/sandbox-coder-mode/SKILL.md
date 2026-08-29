@@ -546,6 +546,21 @@ fork-sandbox-status.sh --json <run-dir> | jq .cost_usd
 `--json` also carries the token counts and the harness version. A `pi-local`
 run reads a zero cost; a codex run reports tokens and a null cost.
 
+## When a single round of review isn't enough
+
+`--review-loop N` is one reviewer, on one model, arguing with one
+implementation until it approves or gives up. Reach for the `lkml-mode`
+skill instead when a change is substantial enough to want several
+independent, adversarial voices reading it in parallel — always including
+a blunt Linus-style reviewer — with an iterated record of what each one
+asked for, whether the author addressed it or pushed back, and why: a
+patch series posted to a shared mailbox, reviewed and revised through v2,
+v3... the way the Linux kernel mailing list works, until the right
+reviewers have signed off and no NAK stands. It costs more than one
+`--review-loop` pass — several sandboxed runs per round instead of one —
+so save it for changes where that scrutiny is worth paying for, not for
+the everyday implement-then-review cycle this mode already covers.
+
 ## When NOT to use this mode
 
 Drop out of it — for one task, without ending the mode — when the work needs

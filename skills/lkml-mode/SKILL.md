@@ -1,0 +1,149 @@
+---
+name: lkml-mode
+description: Review a patch series the way the Linux kernel mailing list does -- a cover letter and patches posted to a shared mailbox, a panel of AI-persona reviewers (always including a Linus Torvalds caricature) replying in threads from sandboxed runs, the author posting v2, v3... with a changelog answering review, converging when the right reviewers have signed off and no NAK stands. Use for a change substantial enough to want several independent, adversarial voices and an iterated record of what they asked for and why it changed -- not for a small diff you can review yourself in one pass.
+argument-hint: <series> <branch> [--personas <p1,p2,...>] — <series> is a short kebab-case slug for the mailbox; <branch> is the branch to post as v1 (format-patch against its merge-base with main, or state another base explicitly). Default personas are linus plus whichever reviewer archetypes fit the change; always include linus.
+user-invocable: true
+---
+
+# lkml-mode
+
+A patch series posted to a shared mailbox, reviewed by a panel of AI
+personas replying in threads from sandboxed runs, revised into v2, v3...
+by an author persona answering the review, converging when the right
+reviewers have signed off and nobody holds a NAK. This session is the
+**orchestrating** Claude session throughout — it never writes the code
+under review and never edits it in response to review; every reviewer and
+every revision is a separate `fork-sandbox.sh` run in its own sandboxed
+clone. Read the `fork-sandbox` skill first if you have not; this mode is
+built entirely out of its primitives.
+
+## What you read, and what you do not
+
+You see the **cover letter** and the **thread tree** — `lkml-mailbox.sh
+cover`, `lkml-mailbox.sh tree`, `lkml-mailbox.sh open`, `lkml-mailbox.sh
+tally`, and `lkml-status.sh` for the one-screen summary. That is enough to
+decide who replies to what next. You do **not** read message bodies
+(`lkml-mailbox.sh show <id>`) unless a thread demands it — a NAK whose
+reasoning you need to weigh before deciding whether the author should
+contest it, a tally that looks wrong, a reviewer whose comment the tree's
+one-line rendering does not make clear. Reading everything defeats the
+point of the arrangement: the mailbox exists so this session's job is
+scheduling, not reading, and the reviewers' job is reading.
+
+## The four scripts
+
+- **`lkml-mailbox.sh`** — the message store. `init` posts a cover letter
+  and a `git format-patch` set as v1 (or the next version); `post` replies
+  in a thread; `tree`/`cover`/`show`/`open`/`tally` read it back. Read its
+  own header comment for the full verb list and the message shape. You
+  will mostly call `tree`, `open`, `tally` and `cover` — see above.
+- **`lkml-round.sh`** — launches one sandboxed run per persona, in
+  parallel, either reviewing the whole series fresh or replying to
+  specific threads you name with `--reply-to`. Every run's replies are
+  harvested back into the mailbox when it finishes; the runs themselves
+  make no commits.
+- **`lkml-revise.sh`** — launches the author persona to answer open review
+  (fixing code and/or replying) and post the next version. A large series'
+  revision round is a single long sandboxed run with no mid-run checkpoint
+  today; a run that can resume itself from a hand-off in its own outbox
+  (see the fork-sandbox skill and `fork-sandbox.sh`'s docs once that lands)
+  would let a long author revision pick up where it left off instead of
+  restarting from the checked-out ref on a timeout. Nothing here depends on
+  it yet — this is a note for when it exists, not a requirement now.
+- **`lkml-status.sh`** — one screen: current version, its tally, every
+  open thread, the deepest thread, and cost so far.
+
+## Building a panel
+
+**`linus` is on every panel, whatever the series.** It is a caricature of
+a public reviewing style — blunt, allergic to cleverness, focused on
+whether the changelog tells the truth — explicitly an AI persona in a
+sandbox, never claiming to be the person. `skills/lkml-mode/personas/`
+ships it plus five general-purpose reviewer archetypes
+(`architecture`, `security`, `tests`, `docs`, `newcomer`) and the
+`author` persona that revises the series.
+
+Beyond Linus, **build a panel tailored to the series** rather than
+launching all five archetypes by default. A kernel-style locking change
+wants a locking-literate reviewer; a kids' game wants a child-safety
+reviewer; a data-pipeline change wants someone who has actually operated
+one. When none of the shipped archetypes fit, write a new one or two —
+copy an existing persona file's shape (a `harness`/`model`/`display`
+frontmatter block, then a short voice-and-focus body) into
+`skills/lkml-mode/personas/`. A persona is pinned to one harness and model
+for the whole series, so its voice stays consistent version over version —
+do not vary it round to round.
+
+## The loop
+
+1. **`init` the series** from a branch: `lkml-mailbox.sh init <series>
+   --cover <file> --patches <dir> --from author ...`, where `<dir>` is a
+   `git format-patch <base>..<branch>` output directory and the cover
+   letter is either something you write yourself or something you ask the
+   `author` persona to write in its own short sandboxed run first.
+2. **Build the panel** (always Linus; see above). Round 1: every persona
+   reviews the whole series — `lkml-round.sh <series> --project <path>
+   --checkout <branch> --base <base-ref> --personas <list>` with no
+   `--reply-to`.
+3. **Read `tree` and `open`.** Decide who replies to what: usually the
+   author answers a reviewer's Question or NAK, but a reviewer can also
+   reply to another reviewer's comment. Launch a round per batch of
+   replies-to-write with `--reply-to <id>` (repeatable). **There is no cap
+   on how many replies a round may contain — the only limit is depth 30
+   per thread**, enforced by `lkml-mailbox.sh post` itself.
+4. **When `open` is empty**, or everything left open can only be moved by
+   the author, run `lkml-revise.sh <series> --project <path> --checkout
+   <branch> --version <N> --base <base-ref>` to produce vN+1, where
+   `<base-ref>` is the SAME base you formatted v1 against in step 1, not
+   vN's branch -- the author's commits land on top of vN, so posting
+   against vN's tip would ship only this round's fixups as if they were
+   the whole series. This posts vN+1 on a NEW, timestamped branch named
+   `lkml/<series>-v<N+1>-<timestamp>` -- lkml-revise.sh's own report names
+   the exact branch, which you need verbatim since the timestamp makes it
+   unguessable. Go back
+   to step 2 with the whole panel checked out against THAT branch, not the
+   one you started this step with: a round launched with `--checkout
+   <branch>` still pointing at vN's branch reviews vN's code while being
+   handed vN+1's patches in its handoff, and every comment it produces is
+   against a version that has already been superseded.
+5. **Converged** when every patch in the current version has
+   `Reviewed-by` or `Acked-by` from Linus AND from at least one other
+   reviewer (`lkml-mailbox.sh tally`), no `NAK` stands unanswered, and
+   `open` is empty. At that point the series is mergeable — **the operator
+   merges it**, not this session; see "What this is not" below.
+   **Stopped** (report honestly, do not keep spending rounds) when
+   `--max-versions` (default 8, tracked by you, not enforced by any
+   script) is reached, or `lkml-revise.sh` reports the author made no
+   commits — its own "a version changes nothing" line.
+6. **`lkml-status.sh <series>`** any time you want the one-screen version
+   of all of the above, including cost so far.
+
+## Attribution is non-negotiable, and it is not your job to enforce it
+
+Every message's `From` header carries `(AI persona)`, every message
+carries `X-AI-Persona`/`X-AI-Harness`/`X-AI-Model`, and `tree` renders the
+harness/model column — all of this is baked into `lkml-mailbox.sh` itself
+(the one function that ever writes a message file), not left to a
+persona's good behavior. You do not need to check for it, and a persona
+prompt that tried to write around it would still get stamped, not
+believed. What IS your job: the cover letter you write or ask `author` to
+write states plainly, in its first paragraph, that every participant is an
+AI persona run in a sandbox — say that in your own words when you draft
+one, the mailbox cannot write your cover letter's prose for you.
+
+## What this is not
+
+This is not a substitute for a human merge. Convergence here means the
+personas agree the series is ready — it does not mean anyone with actual
+authority over the codebase has looked at it. Report convergence as "ready
+for your review," hand the operator the branch and the `lkml-status.sh`
+summary, and let them decide to merge it. Nor is it a substitute for
+running the tests: a `Reviewed-by` from a sandboxed persona is a reading of
+the diff, not a test run, and nothing here executes the suite for you.
+
+This is also not free. Every persona's every round is a real
+`fork-sandbox.sh` run at that persona's model's price, tagged
+`kind: review` or `kind: implement` and `tags: ["lkml", "<series>",
+"<persona>"]`, so `sandbox-run-log.py stats` can price a series later by
+persona and by model. `lkml-status.sh` gives you the running total; do not
+let a series run to `--max-versions` without checking it.

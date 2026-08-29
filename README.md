@@ -208,6 +208,14 @@ inside the sandbox:
   self-hosted one does the typing.
 - **`commit-then-review`**, **`code-review-portable`** — the review kit, bound
   into every run.
+- **`lkml-mode`** — review a whole patch series the way the Linux kernel
+  mailing list does: a cover letter and patches posted to a shared mailbox,
+  a panel of AI-persona reviewers (always including a Linus Torvalds
+  caricature) replying in threads from their own sandboxed runs, an author
+  persona posting v2, v3... with a changelog answering review, converging
+  when the right reviewers have signed off and no NAK stands. Reach for it
+  on a change substantial enough to want several independent voices and an
+  iterated record of why it changed, not on a diff you can review yourself.
 
 `install.sh` links them into Claude Code's skills directory, the
 `~/.agents/skills` convention, and pi's. Codex users can point at the scripts
