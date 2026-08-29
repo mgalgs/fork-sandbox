@@ -355,4 +355,10 @@ new_cover_id="$("$mailbox" init "$series" --cover "$cover_file" --patches "$patc
     --from "$author_persona" --display "$display" --version "$next_version" \
     --harness "$harness" --model "$model")"
 echo "fork-sandbox lkml-revise: posted v$next_version, cover ${new_cover_id:0:7}." >&2
+
+# Same version-to-branch ledger lkml-series.sh writes for v1 -- lets
+# lkml-forklift.sh find a version's branch without guessing its timestamp.
+jq -nc --argjson version "$next_version" --arg branch "$real_branch" \
+    '{version:$version, branch:$branch}' >> "$ledger_root/$series/versions.jsonl"
+
 rm -rf -- "$patch_dir"
