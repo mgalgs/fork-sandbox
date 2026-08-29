@@ -294,7 +294,7 @@ if [[ -n "$rd" ]]; then
     if [[ -f "$cont_prompt" ]]; then
         ok "the continuation prompt file exists"
         contains "leg 2's prompt carries the continuation line" \
-            "This is continuation 2 of a run that refreshed its context" \
+            "This is continuation 1 of a run that refreshed its context" \
             "$(cat "$cont_prompt")"
         contains "leg 2's prompt carries the hand-off text" \
             "HANDOFF from leg 1" "$(cat "$cont_prompt")"

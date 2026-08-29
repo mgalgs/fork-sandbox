@@ -166,30 +166,19 @@ fi
 payload="$(cat)"
 event="$(printf '%s' "$payload" | jq -r '.hook_event_name // empty' 2>/dev/null)"
 
-# Two tool calls can finish at once, and each fires its own hook. Without a
-# lock two could each think they are the one to nudge, or deliver the same
-# addendum twice. Take the lock, then re-decide everything inside it, so the
-# winner's marker writes are visible to the loser.
-# The redirection is scoped to the braces on purpose. `exec 9>f 2>/dev/null`
-# would apply BOTH redirections for the rest of the script, silencing the
-# delivery line this script writes to stderr at the end.
-if command -v flock >/dev/null 2>&1 && { exec 9>"$lock_file"; } 2>/dev/null; then
-    flock 9 2>/dev/null || true
-fi
-list_unread
-nudged=0
-[[ -f "$nudge_marker" ]] && nudged=1
-reminded=0
-[[ -f "$nudge_reminded_marker" ]] && reminded=1
-measure_usage=0
-[[ -n "$refresh_threshold" && "$nudged" == 0 ]] && measure_usage=1
-
 # The threshold check: the last assistant message's own usage, summed the way
 # the Claude API names it (input + cache read + cache write), against the
 # threshold the launcher already resolved from the model's context window.
 # `tail` bounds the read to the last few messages regardless of how long the
 # transcript has grown, so the cost stays "a few KB parsed", not "the whole
 # conversation so far read again on every tool call".
+#
+# Deliberately done BEFORE the lock below: this only reads the transcript,
+# which no other hook invocation writes to, so it needs no exclusivity, and
+# holding the lock across it would serialise every concurrent tool call for
+# as long as refresh stays armed. The re-check after the lock below catches
+# the case where a racing call already won the nudge while this one was
+# reading.
 nudge_now=0
 if (( measure_usage )); then
     transcript="$(printf '%s' "$payload" | jq -r '.transcript_path // empty' 2>/dev/null)"
@@ -207,6 +196,29 @@ if (( measure_usage )); then
         fi
     fi
 fi
+
+# Two tool calls can finish at once, and each fires its own hook. Without a
+# lock two could each think they are the one to nudge, or deliver the same
+# addendum twice. Take the lock, then re-decide the check-and-write state
+# inside it, so the winner's marker writes are visible to the loser. This is
+# only the re-check and the marker writes further down -- the measurement
+# above is a pure read and stays outside it.
+# The redirection is scoped to the braces on purpose. `exec 9>f 2>/dev/null`
+# would apply BOTH redirections for the rest of the script, silencing the
+# delivery line this script writes to stderr at the end.
+if command -v flock >/dev/null 2>&1 && { exec 9>"$lock_file"; } 2>/dev/null; then
+    flock 9 2>/dev/null || true
+fi
+list_unread
+nudged=0
+[[ -f "$nudge_marker" ]] && nudged=1
+reminded=0
+[[ -f "$nudge_reminded_marker" ]] && reminded=1
+# A racing call may have already won the nudge (or the leg may already have
+# been nudged before this call started) while this call was reading the
+# transcript, unlocked. Its own marker write below is what makes a nudge
+# final for the leg, so a nudge decided against stale state must not stand.
+(( nudged )) && nudge_now=0
 
 # The Stop-only reminder: this leg was nudged on an EARLIER tool call, has
 # not been reminded yet, and no hand-off has shown up in the outbox. Gated on

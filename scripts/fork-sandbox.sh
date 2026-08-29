@@ -1475,6 +1475,16 @@ if [[ ! "$refresh_at" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
     echo "absolute token count above 1, or 0 to disable it -- not '$refresh_at'." >&2
     exit 1
 fi
+# awk, not bash arithmetic, for the ">0" test: $refresh_at can be a fraction
+# ("0.5"), and bash's (( )) only understands integers.
+refresh_enabled=0
+awk -v v="$refresh_at" 'BEGIN{exit !(v>0)}' && refresh_enabled=1
+if [[ -n "$refresh_max_arg" && "$refresh_enabled" == "0" ]]; then
+    echo "Error: --refresh-max requires --refresh-at (which is on by default," >&2
+    echo "so this only happens with an explicit --refresh-at 0). With refresh" >&2
+    echo "disabled there is no continuation loop for it to cap." >&2
+    exit 1
+fi
 refresh_max=6
 if [[ -n "$refresh_max_arg" ]]; then
     if [[ ! "$refresh_max_arg" =~ ^[0-9]+$ ]]; then
@@ -1484,10 +1494,6 @@ if [[ -n "$refresh_max_arg" ]]; then
     fi
     refresh_max="$refresh_max_arg"
 fi
-# awk, not bash arithmetic, for the ">0" test: $refresh_at can be a fraction
-# ("0.5"), and bash's (( )) only understands integers.
-refresh_enabled=0
-awk -v v="$refresh_at" 'BEGIN{exit !(v>0)}' && refresh_enabled=1
 refresh_context_window=""
 refresh_threshold_tokens=""
 if (( refresh_enabled )); then
@@ -2996,6 +3002,7 @@ started_at="$(date +%s)"
     printf 'review_verdict_file=%q\n' "$review_verdict_file"
     printf 'refresh_enabled=%q\n' "$refresh_enabled"
     printf 'refresh_max=%q\n' "$refresh_max"
+    printf 'refresh_config=%q\n' "$refresh_config"
     printf 'outbox_dir=%q\n' "$outbox_dir"
     printf 'continuation_prompt_header=%q\n' "$continuation_prompt_header"
     printf 'user_shell=%q\n' "$user_shell"
@@ -3385,11 +3392,13 @@ refresh_leg_was_nudged() {
     grep -q 'fork-sandbox-refresh: nudged' "$1" 2>/dev/null
 }
 
-# $1 leg number (2 for the first continuation, matching "leg 1" being the
-# implement leg). $2 the hand-off file, already moved to its $run_dir record.
-# $3 the destination path. Just the static preamble plus a short marker line
-# and the hand-off verbatim -- there is no verdict-style body to append here,
-# unlike the fix leg's prompt.
+# $1 continuation number (1 for the first continuation -- the same count
+# named in handoff-N.md, continuation-prompt-N.md and README/SKILL.md, NOT
+# the leg number the console log and --monitor use, which counts the
+# implement leg as 1). $2 the hand-off file, already moved to its $run_dir
+# record. $3 the destination path. Just the static preamble plus a short
+# marker line and the hand-off verbatim -- there is no verdict-style body to
+# append here, unlike the fix leg's prompt.
 refresh_build_prompt() {
     local n="$1" handoff="$2" out="$3"
     {
@@ -3462,7 +3471,7 @@ if [[ "$refresh_enabled" == "1" ]]; then
             fi
 
             cont_prompt="$run_dir/continuation-prompt-$refresh_leg_n.md"
-            refresh_build_prompt "$leg_no" "$run_dir/$record_name" "$cont_prompt"
+            refresh_build_prompt "$refresh_leg_n" "$run_dir/$record_name" "$cont_prompt"
 
             # A synthetic marker event, so --monitor and --follow notice a
             # continuation starting without waiting for that leg's own first
@@ -3552,6 +3561,15 @@ fi
 if [[ "$refresh_enabled" == "1" ]]; then
     printf 'fork-sandbox: refresh ended: %s (%s continuation leg(s) ran)\n' \
         "$refresh_ended" "$refresh_leg_n"
+    # sandbox_cmd (and review_sandbox_cmd, derived from it below) still has
+    # the outbox bind and the hook settings baked in, but the review and fix
+    # legs that reuse it have no loop watching the outbox any more -- this
+    # loop just broke out of the only code that does. Remove the config the
+    # hook gates the whole nudge mechanism on so those legs' sandboxes see an
+    # inbox with no .refresh-config and never get told to hand off to nobody.
+    if [[ -n "$refresh_config" ]]; then
+        rm -f -- "$refresh_config" 2>/dev/null
+    fi
 fi
 
 # ------------------------------------------------------------- review loop --

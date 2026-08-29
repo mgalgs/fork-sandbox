@@ -220,9 +220,11 @@ reporting:
 - Say what is still unpushed. Over a long session, integrated-but-unpushed
   work accumulates silently. Name the count.
 
-**Ending a long round.** Per round, in order: read the diff, run the suites
-on the host, integrate, record the verdict with `sandbox-run-log.py
-verdict`, and report — the same sequence as **Reviewing and integrating**.
+**Ending a long round.** Per round, in order: read the diffstat and
+spot-check what runs on the host, run the suites on the host, integrate,
+record the verdict with `sandbox-run-log.py verdict`, and report — the same
+sequence as **Reviewing and integrating**, at the high-level default from
+**Stay high level**.
 Keep the run directory until the branch is reviewed and merged — it is the
 only copy of the events log, and it is the evidence when something needs
 explaining later.
@@ -235,7 +237,8 @@ Everything that is not writing project files:
   `git diff`, `find`, `grep`, the project's own read-only tooling).
 - Answering questions, explaining code, and designing the change.
 - Deciding what to delegate, and writing the handoff.
-- Reviewing the diff that comes back.
+- Reviewing what comes back — the report, the review verdicts and the
+  diffstat by default; the diff itself only per **Stay high level**.
 - **All git that writes**, in the real repo: `commit`, `merge`, `rebase`,
   `cherry-pick`, `push`, tags. A sandbox cannot push and has no credential
   for anything remote, so integration is this session's job and only this
@@ -430,16 +433,23 @@ model that misread the task will misread it again.
 
 ## Reviewing and integrating
 
-1. **Read the diff before building anything.** The fetched branch is
-   agent-written code. A `Makefile`, a `package.json` script or an `.envrc`
-   in it runs on the host the moment anyone builds it. Treat it exactly as a
-   pull request from a stranger — this is the `fork-sandbox` warning, and in
-   this mode it applies on every round rather than once.
+1. **Read the diffstat, and spot-check what runs on the host, before
+   building anything.** Per **Stay high level**, this session does not read
+   the code a sandbox writes — but a `Makefile`, a `package.json` script, a
+   shell script or an `.envrc` in the branch runs on the host the moment
+   anyone builds it. Treat those exactly as a pull request from a stranger —
+   this is the `fork-sandbox` warning, and in this mode it applies on every
+   round rather than once.
 
    ```bash
    git log --oneline HEAD.."<branch>"
-   git diff HEAD.."<branch>"
+   git diff --stat HEAD.."<branch>"
    ```
+
+   Pull the full `git diff HEAD.."<branch>"` only when something calls for
+   it: the diffstat touches a host-executed path, the review verdict flagged
+   something the fix round may not have fully settled, or the user asks to
+   see the code.
 
    **Never run git inside the clone** — not `log`, not `status`, not
    `git -C`. The clone's git config is writable by the sandbox, and a key
