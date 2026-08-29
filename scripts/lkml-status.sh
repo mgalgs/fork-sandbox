@@ -60,8 +60,8 @@ printf 'Deepest thread: depth %s (of 30 max)\n' "$deepest"
 printf '\n== Tally, v%s ==\n' "$version"
 printf '%s\n' "$tally_out"
 
-printf '\n== Open threads ==\n'
-"$mailbox" open "$series"
+printf '\n== Open threads, v%s ==\n' "$version"
+"$mailbox" open "$series" --version "$version"
 
 printf '\n== Cost ==\n'
 ledger="$LKML_ROOT/$series/runs.jsonl"

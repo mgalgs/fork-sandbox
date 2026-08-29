@@ -124,9 +124,13 @@ tree_text="$("$mailbox" tree "$series" 2>/dev/null)" || {
     echo "Error: series '$series' does not exist. Run lkml-mailbox.sh init first." >&2
     exit 1
 }
-open_text="$("$mailbox" open "$series" 2>/dev/null)"
+open_text="$("$mailbox" open "$series" --version "$version" 2>/dev/null)"
 
-handoff_file="$(mktemp /var/tmp/claude-scratch/lkml-revise-XXXXXX.md)"
+mkdir -p -- /var/tmp/claude-scratch
+handoff_file="$(mktemp /var/tmp/claude-scratch/lkml-revise-XXXXXX.md)" || {
+    echo "Error: mktemp failed for the handoff file." >&2
+    exit 1
+}
 {
     cat -- "$persona_file"
     printf '\n---\n\n# You are revising %s, currently at v%s\n\n%s\n' "$series" "$version" "$cover_text"
@@ -225,6 +229,17 @@ fetched="$(jq -r '.fetched' "$run_dir/summary.json")"
 # (reply_to, subject, tags, in_headers) is `local` and cannot leak between
 # iterations of the loop below -- a message with no X-Tags must not inherit
 # the previous message's tags.
+# Strips optional angle brackets and the @lkml.local suffix from an
+# In-Reply-To value -- same duplication of lkml-mailbox.sh's own
+# lkml_strip_id, and for the same reason, as lkml-round.sh's copy.
+lkml_revise_strip_id() {
+    local v="$1"
+    v="${v#<}"
+    v="${v%>}"
+    v="${v%%@*}"
+    printf '%s' "$v"
+}
+
 harvest_reply() {
     local msgfile="$1"
     local reply_to="" subject="" tags="" in_headers=1 line body_file
@@ -244,6 +259,7 @@ harvest_reply() {
             printf '%s\n' "$line" >> "$body_file"
         fi
     done < "$msgfile"
+    reply_to="$(lkml_revise_strip_id "$reply_to")"
     if [[ -z "$reply_to" ]]; then
         echo "Warning: lkml-revise: $msgfile has no In-Reply-To header; skipping it." >&2
         rm -f "$body_file"
@@ -273,7 +289,6 @@ out_dir="$clone_dir/.lkml-out"
 if [[ -d "$out_dir" ]]; then
     while IFS= read -r msgfile; do
         [[ -e "$msgfile" ]] || continue
-        [[ "$(basename -- "$msgfile")" == "cover-letter.md" ]] && continue
         harvest_reply "$msgfile" && harvested=$(( harvested + 1 ))
     done < <(find "$out_dir" -maxdepth 1 -name '*.msg' | sort -V)
 fi
@@ -295,7 +310,10 @@ if [[ ! -f "$cover_file" ]]; then
     exit 1
 fi
 
-patch_dir="$(mktemp -d /var/tmp/claude-scratch/lkml-revise-patches-XXXXXX)"
+patch_dir="$(mktemp -d /var/tmp/claude-scratch/lkml-revise-patches-XXXXXX)" || {
+    echo "Error: mktemp -d failed for the format-patch output directory." >&2
+    exit 1
+}
 real_repo="$(git -C "$project" rev-parse --show-toplevel)"
 if ! (cd "$real_repo" && git format-patch --quiet -o "$patch_dir" "$base_sha..$real_branch") >/dev/null; then
     echo "Error: git format-patch failed for $base_sha..$real_branch in $real_repo." >&2
