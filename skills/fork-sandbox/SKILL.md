@@ -123,12 +123,25 @@ reach it — see "What it gives up".)
    self-contained hand-off, and end its turn. If it does, the run moves that
    hand-off to `<run-dir>/handoff-N.md` and starts a **fresh** session on the
    same clone and branch with it as the prompt — continuation N, with no
-   memory of the session before it. That repeats until a leg ends with
-   nothing to continue from (the ordinary ending), `--refresh-max` legs have
-   run (default 6), or a nudged leg ends without writing a hand-off at all.
-   `--review-loop`, when both are given, still runs once, after the *last*
-   coding leg — it reviews every commit the whole chain made, not just the
-   first leg's.
+   memory of the session before it. Every continuation's prompt also embeds
+   `<run-dir>/handoff-original.md` — the hand-off this run was launched with,
+   verbatim — ahead of the previous leg's own, so a long chain of
+   continuations never loses track of the task itself; the previous leg's
+   hand-off is authoritative for progress, the original brief for what the
+   task is. That repeats until a leg ends with nothing to continue from (the
+   ordinary ending), `--refresh-max` legs have run (default 6), or a nudged
+   leg ends without writing a hand-off at all. `--review-loop`, when both are
+   given, still runs once, after the *last* coding leg — it reviews every
+   commit the whole chain made, not just the first leg's.
+
+   **A hand-off can go stale.** A session may keep working and committing for
+   a long time after writing its hand-off and never rewrite it, which would
+   start the next leg from a document that no longer matches reality. If the
+   hand-off already sitting in the outbox predates the clone's last commit by
+   the time a leg tries to end its turn, the same hook sends it back once to
+   rewrite it; if the leg ends anyway (crash, timeout), the continuation it
+   forks gets a warning in its own prompt instead, and its `summary.json`
+   entry carries `handoff_stale: true`.
 
    Pass `--refresh-at 0` to disable it outright — for a task you know fits in
    one context, or while debugging something else and one fewer moving part
@@ -444,14 +457,15 @@ clone inside it is mounted, and the log is written by the host shell.
 | `<run-dir>/events.jsonl` | every event, one JSON object per line |
 | `<run-dir>/sandbox.log` | the sandbox wrapper's messages, startup errors included |
 | `<run-dir>/summary.txt` | branch, exit code, commit list and diffstat after the fetch |
-| `<run-dir>/summary.json` | the same facts structured — harness and its version, model, exit code, commits with subjects, `cost_usd`, `total_cost_usd` (the run plus any `--review-loop` or `--refresh-at` legs), `refresh` and `continuations` (`--refresh-at`'s own record), `usage` token counts, and `author_email_unexpected` (empty unless a returned commit carries an address other than the repo's own) — for reading, not grepping |
+| `<run-dir>/summary.json` | the same facts structured — harness and its version, model, exit code, commits with subjects, `cost_usd`, `total_cost_usd` (the run plus any `--review-loop` or `--refresh-at` legs), `refresh` and `continuations` (`--refresh-at`'s own record, each entry also carrying `handoff_stale`), `usage` token counts, and `author_email_unexpected` (empty unless a returned commit carries an address other than the repo's own) — for reading, not grepping |
 | `<run-dir>/handoff.md` | the prompt as it was sent |
 | `<run-dir>/task-meta.json` | the `--task-meta` object, when one was given |
 | `<run-dir>/review-loop.json` | `--review-loop` only: how the loop ended, and one record per iteration |
 | `<run-dir>/review-verdict-<i>.md` | `--review-loop` only: what the reviewer wrote, verbatim |
 | `<run-dir>/events-review-<i>.jsonl`, `<run-dir>/events-fix-<i>.jsonl` | `--review-loop` only: each loop leg's own event stream |
+| `<run-dir>/handoff-original.md` | `--refresh-at` only: a verbatim snapshot of the hand-off this run itself was launched with, taken once at launch; embedded in every continuation's prompt |
 | `<run-dir>/handoff-<N>.md` | `--refresh-at` only: continuation N's prompt, exactly as the previous leg wrote it to the outbox |
-| `<run-dir>/continuation-prompt-<N>.md` | `--refresh-at` only: continuation N's whole rendered prompt (preamble plus the hand-off above) |
+| `<run-dir>/continuation-prompt-<N>.md` | `--refresh-at` only: continuation N's whole rendered prompt (preamble, the original brief above, an optional stale-hand-off warning, then the hand-off above) |
 | `<run-dir>/events-continuation-<N>.jsonl` | `--refresh-at` only: continuation N's own event stream, for its isolated cost and usage; its events also land in `events.jsonl`, unlike a review-loop leg's |
 | `<run-dir>/outbox/` | the one writable path outside the clone, created and bound read-write on every run; a nudged `--refresh-at` session's hand-off lands here, and it's otherwise free for anything the agent wants a human to see — a screenshot, a report. Capped at 64 MiB by default, raised with `--outbox-max` |
 | `--outbox-dir` path (`--k8s` only) | the pod's own `/work/outbox`, pulled back to the host here once the run finishes; see "Kubernetes runs" above |

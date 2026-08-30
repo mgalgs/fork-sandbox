@@ -136,12 +136,23 @@ half its model's context window, to finish the step it is on, commit, write a
 self-contained hand-off to a writable outbox, and end its turn. If it does,
 the run moves that hand-off to `<run-dir>/handoff-N.md` — the record — and
 starts a fresh session on the *same clone and branch* with it as the prompt:
-continuation N, with no memory of the session before it. That repeats, on the
-same nudge-and-check cycle, until a leg ends with nothing waiting in the
-outbox — the ordinary ending — until `--refresh-max` legs have run (default
-6), or until a nudged leg ends its turn without writing a hand-off at all.
-`--review-loop`, when both are given, then runs once, after the *last* coding
-leg, over every commit the whole chain made.
+continuation N, with no memory of the session before it. Every continuation
+also gets the original hand-off this run was launched with, embedded
+verbatim ahead of the previous leg's own, so a long chain never loses track
+of the task itself. That repeats, on the same nudge-and-check cycle, until a
+leg ends with nothing waiting in the outbox — the ordinary ending — until
+`--refresh-max` legs have run (default 6), or until a nudged leg ends its
+turn without writing a hand-off at all. `--review-loop`, when both are given,
+then runs once, after the *last* coding leg, over every commit the whole
+chain made.
+
+A session can keep working and committing for a long time after writing its
+hand-off without ever rewriting it, which would start the next leg from a
+document that no longer describes reality. If a hand-off already sitting in
+the outbox predates the clone's last commit by the time that leg tries to
+end its turn, it is sent back once to rewrite it; if the leg ends anyway
+(crash, timeout), the continuation it forks is warned in its own prompt
+instead.
 
 ```bash
 fork-sandbox.sh --branch "<branch>" "<path>" "<handoff>"                # on by default

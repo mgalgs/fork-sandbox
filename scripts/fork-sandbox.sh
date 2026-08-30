@@ -240,11 +240,21 @@
 # fresh session to <run-dir>/outbox/handoff.md, and end its turn. If it does,
 # this script moves that file to <run-dir>/handoff-N.md (the record) and runs
 # a fresh session on the SAME clone and branch with it as the prompt —
-# continuation N. That repeats, on the same nudge-and-check cycle, until a leg
-# ends with nothing waiting in the outbox (the ordinary ending), until
-# --refresh-max legs have run, or until a nudged leg ends without writing a
-# hand-off at all. The review loop above, when both flags are given, then runs
-# once, after the LAST coding leg, over every commit the whole chain made.
+# continuation N, whose prompt also embeds <run-dir>/handoff-original.md, a
+# verbatim snapshot of the hand-off this run itself was launched with, ahead
+# of the previous leg's own hand-off. That repeats, on the same nudge-and-
+# check cycle, until a leg ends with nothing waiting in the outbox (the
+# ordinary ending), until --refresh-max legs have run, or until a nudged leg
+# ends without writing a hand-off at all. The review loop above, when both
+# flags are given, then runs once, after the LAST coding leg, over every
+# commit the whole chain made.
+#
+# A hand-off can go stale: a session may keep working and committing long
+# after writing it and never rewrite it. The inbox hook sends a Stop back
+# once when the hand-off already in the outbox predates the clone's last
+# commit; if the leg ends anyway (crash, timeout), this script's own check,
+# after moving the hand-off to its handoff-N.md record, warns the
+# continuation it forks in that leg's own prompt instead.
 #
 # It costs what it looks like it costs: each continuation is another whole
 # session, at the same model's price. summary.json's `continuations` array
