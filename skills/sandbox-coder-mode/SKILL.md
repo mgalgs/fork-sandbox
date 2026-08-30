@@ -569,46 +569,25 @@ file, or a key absent from it, means the default above.
 | `CODER_MODE_REVIEW_MODEL` | `--review-model` | `opus` |
 | `CODER_MODE_REVIEW_LOOP` | `--review-loop` | `2` |
 
-One pairing is refused outright regardless of model: `CODER_MODE_HARNESS=pi-local`
-with a *networked* `CODER_MODE_REVIEW_HARNESS` (`claude`, `pi` or `codex`).
-`pi-local` is sealed for a reason — no network at all — and a networked
-review leg would send the sealed clone's contents to that harness's model
-provider, defeating the seal. `fork-sandbox.sh` refuses the combination by
-name at launch. A machine set up with `CODER_MODE_HARNESS=pi-local` needs
-`CODER_MODE_REVIEW_HARNESS` left unset or set to `pi-local` too; pairing a
-sealed implementer with a networked reviewer is a per-round choice made by
-launching a separate, non-sealed run against the branch the sealed one
-returns, not a machine-wide default.
-
-The model defaults, `sonnet` and `opus`, are claude aliases — they only
-resolve when the harness is `claude`. A machine that overrides
-`CODER_MODE_HARNESS` to anything else **must** also override
-`CODER_MODE_REVIEW_MODEL`, unconditionally — not only when it also sets
-`CODER_MODE_REVIEW_HARNESS`. The script resolves `--review-model` against
-`--review-harness` when one is given, and against `--harness` otherwise
-(`scripts/fork-sandbox.sh`'s `resolve_model review_model`), so leaving
-`CODER_MODE_REVIEW_HARNESS` unset means the review legs run under the *new*
-`CODER_MODE_HARNESS` with whatever `CODER_MODE_REVIEW_MODEL` still says —
-`opus` by default. Setting `CODER_MODE_REVIEW_HARNESS` separately only
-changes *which* harness the review model resolves against; it does not
-excuse leaving `CODER_MODE_REVIEW_MODEL` at its default. Most harnesses
-don't catch the mismatch at launch: `pi-local` takes an unresolved model
-name as-is and serves whatever the endpoint actually has behind it; `pi`
-takes it as an OpenRouter id and burns real money on 400s. `codex` is the
-exception — it checks the name against its model cache and refuses an
-unknown one. Set all the keys for a harness together, per the pairings in
-the table above.
-
-Set `CODER_MODE_REVIEW_LOOP` to `0` to mean: omit `--review-model`,
-`--review-harness`, and `--review-loop` from the launch entirely — no
-in-sandbox reviewer. All three, not just the first two: `--review-harness`
-without `--review-loop` is refused outright ("--review-harness only applies
-to review legs and requires --review-loop"), so a machine that sets
-`CODER_MODE_REVIEW_HARNESS` and then turns review off this way must drop
-that key too, or every launch dies before it clones. Omitting all three is
-the same state `fork-sandbox.sh` itself defaults to when none of them is
-passed; it is not the same as writing `--review-loop 0` on the command
-line, which the script also refuses.
+1. **A harness's keys move together.** `sonnet` and `opus` are claude model
+   names. A file that sets `CODER_MODE_HARNESS` to anything else must also
+   set `CODER_MODE_MODEL` and `CODER_MODE_REVIEW_MODEL` to names that
+   harness understands — the review model is resolved against the review
+   harness when one is set and against the implement harness otherwise, so
+   a `pi` machine that leaves the review model at `opus` sends its review
+   legs a model id that does not exist. Set `CODER_MODE_REVIEW_HARNESS`
+   only to run the review legs under a different harness than the typing;
+   it does not change which model name they need.
+2. **`pi-local` cannot pair with a networked review harness.** The script
+   refuses `CODER_MODE_HARNESS=pi-local` with a `CODER_MODE_REVIEW_HARNESS`
+   of `claude`, `pi` or `codex`, because a networked review leg would send
+   the sealed clone to a model provider. Leave the review harness unset, or
+   `pi-local`.
+3. **`CODER_MODE_REVIEW_LOOP=0` means no in-sandbox reviewer**: omit
+   `--review-loop`, `--review-model` and `--review-harness` from the
+   launch, all three — the script refuses `--review-harness` without
+   `--review-loop`, and refuses `--review-loop` set to `0` on the command
+   line.
 
 No script reads this file — `fork-sandbox.sh` itself has no idea it exists.
 Reading it is this session's job, done once per **Entering the mode**,
@@ -629,18 +608,11 @@ Pick per task, and say why in one line when you launch:
 | Work where the model quality decides the outcome | `--harness claude --model opus` | subscription |
 | A second opinion from outside the family | `--harness pi --model <openrouter-id>` or `--harness codex` | real money / ChatGPT sign-in |
 
-The review flags travel with `--harness`, not with this table — changing
-one round's `--harness` without also restating `--review-model` (and
-`--review-harness`, if the review leg should run under something other than
-this round's `--harness`) sends the review legs to whatever the machine's
-`CODER_MODE_REVIEW_MODEL` still says, resolved against the new harness (see
-**Choosing a harness and a model**). Concretely: launching the `pi-local`
-row above with the shipped defaults otherwise in place produces review legs
-asking the sealed endpoint for a model called `opus`; launching the `pi`
-row produces review legs running `pi --model opus`, an OpenRouter id that
-does not exist and burns money on 400s. Restate the review flags — or set
-`--review-loop 0` to skip the in-sandbox reviewer for the round — whenever
-this table's `--harness` differs from the machine default.
+The review flags travel with `--harness`, not with this table: a round
+that deviates from the machine's harness restates `--review-model` (and
+`--review-harness`, if the reviewer should run elsewhere) in names that
+harness understands, or omits all three review flags to skip the
+in-sandbox reviewer for that round.
 
 **Pin `--model` on every claude run.** Without it the run takes the host's
 default, which is the expensive model this session is likely running on —
