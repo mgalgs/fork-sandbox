@@ -605,6 +605,61 @@ else
 fi
 rm -f /tmp/fs-k8s-test-claude-submit.err
 
+# submit_out above carries no --review-model, so it must render no
+# REVIEW_MODEL env at all -- the flag is opt-in for both harnesses.
+if grep -q 'name: REVIEW_MODEL' "$submit_out"; then
+    no "a submit with no --review-model renders no REVIEW_MODEL env" \
+        "found 'name: REVIEW_MODEL' in $submit_out"
+else
+    ok "a submit with no --review-model renders no REVIEW_MODEL env"
+fi
+
+printf '\n== fork-sandbox-k8s.sh submit --dry-run --review-model (both harnesses) ==\n'
+# REVIEW_MODEL now renders for --harness pi too, not just claude -- the
+# review loop always runs pi and needs to know which id to prefer
+# regardless of the coding leg's own harness.
+pi_rm_submit_out="$(newdir)/pi-rm-submit.yaml"; tmpdirs+=("$(dirname "$pi_rm_submit_out")")
+if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model moonshotai/kimi-k3 --review-model opus \
+    "$proj_dir" "$handoff_file" > "$pi_rm_submit_out" 2>/tmp/fs-k8s-test-pi-rm-submit.err; then
+    ok "submit --dry-run --harness pi --review-model exits 0"
+else
+    no "submit --dry-run --harness pi --review-model exits 0" \
+        "$(cat /tmp/fs-k8s-test-pi-rm-submit.err)"
+fi
+if grep -q 'name: REVIEW_MODEL' "$pi_rm_submit_out" \
+    && grep -A1 'name: REVIEW_MODEL' "$pi_rm_submit_out" | grep -q 'value: "opus"'; then
+    ok "a pi run's rendered Job sets REVIEW_MODEL when --review-model is given"
+else
+    no "a pi run's rendered Job sets REVIEW_MODEL when --review-model is given" \
+        "not found in $pi_rm_submit_out"
+fi
+if grep -q 'name: CLAUDE_PROXY_BASE_URL' "$pi_rm_submit_out"; then
+    no "a pi run with --review-model still renders no CLAUDE_PROXY_BASE_URL" \
+        "found 'name: CLAUDE_PROXY_BASE_URL' in $pi_rm_submit_out"
+else
+    ok "a pi run with --review-model still renders no CLAUDE_PROXY_BASE_URL"
+fi
+rm -f /tmp/fs-k8s-test-pi-rm-submit.err
+
+claude_rm_submit_out="$(newdir)/claude-rm-submit.yaml"; tmpdirs+=("$(dirname "$claude_rm_submit_out")")
+if HOME="$claude_home" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model claude-sonnet-5 --harness claude --review-model opus \
+    "$proj_dir" "$handoff_file" > "$claude_rm_submit_out" 2>/tmp/fs-k8s-test-claude-rm-submit.err; then
+    ok "submit --dry-run --harness claude --review-model exits 0"
+else
+    no "submit --dry-run --harness claude --review-model exits 0" \
+        "$(cat /tmp/fs-k8s-test-claude-rm-submit.err)"
+fi
+if grep -q 'name: REVIEW_MODEL' "$claude_rm_submit_out" \
+    && grep -A1 'name: REVIEW_MODEL' "$claude_rm_submit_out" | grep -q 'value: "opus"'; then
+    ok "a claude run's rendered Job sets REVIEW_MODEL when --review-model is given"
+else
+    no "a claude run's rendered Job sets REVIEW_MODEL when --review-model is given" \
+        "not found in $claude_rm_submit_out"
+fi
+rm -f /tmp/fs-k8s-test-claude-rm-submit.err
+
 printf '\n== fork-sandbox-k8s.sh submit --dry-run --harness claude: credential expiry ==\n'
 claude_home_expired="$(newdir)"; tmpdirs+=("$claude_home_expired")
 mkdir -p "$claude_home_expired/.claude"
@@ -2348,17 +2403,35 @@ else
         "$claude_launch_missing"
 fi
 
-# The review loop always runs pi, so a claude coding leg's REVIEW_MODEL
-# (required at startup, checked above) must reach both the pi config
-# synthesis and the review-loop.sh invocation's own MODEL env.
+# The review loop always runs pi and always prefers REVIEW_MODEL over
+# MODEL when set, regardless of harness -- required at startup for
+# HARNESS=claude (checked above), optional otherwise.
 # shellcheck disable=SC2016
-if grep -qF 'review_loop_model="$REVIEW_MODEL"' "$entrypoint_sh" \
+if grep -qF 'review_loop_model="${REVIEW_MODEL:-$MODEL}"' "$entrypoint_sh" \
     && grep -qF 'synthesize_pi_config "$review_loop_model"' "$entrypoint_sh" \
     && grep -qF 'MODEL="$review_loop_model" bash "$mounts_dir/review-loop.sh"' "$entrypoint_sh"; then
     ok "entrypoint threads REVIEW_MODEL into the review loop's pi config and invocation"
 else
     no "entrypoint threads REVIEW_MODEL into the review loop's pi config and invocation" \
         "missing review_loop_model wiring in $entrypoint_sh"
+fi
+
+# A pi coding leg folds REVIEW_MODEL into models.json alongside MODEL up
+# front, via a second synthesize_pi_config argument, and the function's
+# own jq dedupes the two ids with `unique` so an unset REVIEW_MODEL (or
+# one equal to MODEL) never produces a bogus or duplicate model entry.
+# shellcheck disable=SC2016
+if grep -qF 'synthesize_pi_config "$MODEL" "$REVIEW_MODEL"' "$entrypoint_sh"; then
+    ok "entrypoint's pi coding leg folds REVIEW_MODEL into models.json up front"
+else
+    no "entrypoint's pi coding leg folds REVIEW_MODEL into models.json up front" \
+        "missing synthesize_pi_config \"\$MODEL\" \"\$REVIEW_MODEL\" call in $entrypoint_sh"
+fi
+if grep -qF '| unique | map({' "$entrypoint_sh"; then
+    ok "synthesize_pi_config's models.json dedupes MODEL/REVIEW_MODEL with jq unique"
+else
+    no "synthesize_pi_config's models.json dedupes MODEL/REVIEW_MODEL with jq unique" \
+        "missing a '| unique | map({' models array in $entrypoint_sh"
 fi
 
 printf '\n== no private-hostname shape anywhere in the repo ==\n'

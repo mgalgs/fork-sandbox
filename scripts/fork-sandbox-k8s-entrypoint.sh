@@ -55,8 +55,11 @@
 #                   should use, when it differs from MODEL. Required when
 #                   HARNESS=claude and REVIEW_LOOP_CAP is set, since
 #                   MODEL is then a Claude Code model name pi cannot use.
-#                   Optional otherwise; the review loop falls back to
-#                   MODEL when unset.
+#                   Optional otherwise -- including for a pi coding leg,
+#                   where it is folded into models.json alongside MODEL
+#                   (see synthesize_pi_config) so the review loop can
+#                   select either id; the review loop falls back to MODEL
+#                   when unset.
 #   OUTBOX_MAX_BYTES the outbox size cap, in bytes, for the end-of-run
 #                   warning below. Default 67108864 (64 MiB) -- must match
 #                   FS_OUTBOX_MAX_BYTES in fork-sandbox-lib.sh; nothing
@@ -208,39 +211,43 @@ git config user.email "$GIT_USER_EMAIL"
 git config commit.gpgsign false
 git config tag.gpgsign false
 
-# Builds ~/.pi/agent/models.json + settings.json for a single model id,
-# pointed at the pi proxy. Used for the pi harness's own coding leg below,
-# and again (with REVIEW_MODEL) right before the review loop when the
-# coding leg ran claude instead -- see that block for why a second call is
-# needed there. baseUrl is the proxy Service, not a loopback bridge --
-# there is no socket bridge here, because network policy rather than a
-# unix socket is what seals this pod. apiKey is a placeholder; the proxy
-# replaces the header on the way past, so this value is never sent
-# anywhere that checks it.
+# Builds ~/.pi/agent/models.json + settings.json pointed at the pi proxy,
+# for one primary model id and, optionally, a second (REVIEW_MODEL) --
+# both land in models.json so pi can resolve either by --model, while
+# defaultModel/defaultProvider still point at the primary one. Used for
+# the pi harness's own coding leg below (both ids, up front), and again
+# with just the review model right before the review loop when the
+# coding leg ran claude instead, which never synthesized any config at
+# all -- see that block for why a second call is needed there. baseUrl is
+# the proxy Service, not a loopback bridge -- there is no socket bridge
+# here, because network policy rather than a unix socket is what seals
+# this pod. apiKey is a placeholder; the proxy replaces the header on the
+# way past, so this value is never sent anywhere that checks it.
 synthesize_pi_config() {
     local model="$1"
+    local extra_model="${2:-}"
     echo "fork-sandbox-k8s-entrypoint: synthesizing pi config for $model" >&2
     mkdir -p "$HOME/.pi/agent"
     if [[ -f "$mounts_dir/pi-agent-settings.json" ]]; then
         cp "$mounts_dir/pi-agent-settings.json" "$HOME/.pi/agent/settings.json"
     fi
 
-    jq -n --arg base "$PROXY_BASE_URL" --arg model "$model" '
+    jq -n --arg base "$PROXY_BASE_URL" --arg model "$model" --arg extra "$extra_model" '
         {
             providers: {
                 proxy: {
                     baseUrl: $base,
                     api: "openai-completions",
                     apiKey: "sandbox",
-                    models: [{
-                        id: $model,
-                        name: ($model + " (proxy)"),
+                    models: ([$model, $extra] | map(select(. != "")) | unique | map({
+                        id: .,
+                        name: (. + " (proxy)"),
                         reasoning: true,
                         input: ["text"],
                         contextWindow: 131072,
                         maxTokens: 32768,
                         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-                    }],
+                    })),
                 },
             },
         }' > "$HOME/.pi/agent/models.json"
@@ -275,7 +282,11 @@ commit_uncommitted_work() {
 
 pi_rc=0
 if [[ "$HARNESS" == pi ]]; then
-    synthesize_pi_config "$MODEL"
+    # REVIEW_MODEL, when set, is folded in up front so the review loop
+    # below never needs a second synthesize_pi_config call for a pi
+    # coding leg -- only a claude coding leg (which skips this branch
+    # entirely) still needs one, right before the loop runs.
+    synthesize_pi_config "$MODEL" "$REVIEW_MODEL"
 
     echo "fork-sandbox-k8s-entrypoint: running pi" >&2
     pi --provider proxy --model "$MODEL" --mode json -p \
@@ -349,15 +360,16 @@ if [[ "$REVIEW_LOOP_CAP" =~ ^[1-9][0-9]*$ ]]; then
     else
         echo "fork-sandbox-k8s-entrypoint: running the review loop" >&2
         # The review loop always runs pi, regardless of the coding leg's
-        # harness. A claude coding leg never synthesized pi config at all
+        # harness, and always prefers REVIEW_MODEL over MODEL when set --
+        # required at startup when HARNESS=claude, see the validation
+        # above; optional for a pi coding leg, which already folded both
+        # ids into models.json (synthesize_pi_config above), so no
+        # override here just changes which of the two ids pi is told to
+        # use. A claude coding leg never synthesized pi config at all
         # (MODEL is a Claude Code model name pi cannot use), so it is
-        # synthesized here, for the first time, from REVIEW_MODEL --
-        # required at startup for exactly this case, see the validation
-        # above. A pi coding leg already synthesized it for MODEL; this
-        # override only matters once REVIEW_MODEL differs from MODEL.
-        review_loop_model="$MODEL"
+        # synthesized here, for the first time.
+        review_loop_model="${REVIEW_MODEL:-$MODEL}"
         if [[ "$HARNESS" == claude ]]; then
-            review_loop_model="$REVIEW_MODEL"
             synthesize_pi_config "$review_loop_model"
         fi
         loop_rc=0

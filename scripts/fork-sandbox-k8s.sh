@@ -945,12 +945,10 @@ cmd_submit() {
         review_loop_env=$'\n'"$(render_review_loop_env "$review_loop_cap" "$base_sha")"
     fi
 
-    # CLAUDE_PROXY_BASE_URL, for --harness claude only, and REVIEW_MODEL
-    # alongside it when --review-model was given -- the pi review loop's
-    # own model, since the review loop always runs pi regardless of the
-    # implement harness. A pi run's own --review-model handling is
-    # separate (see the pi-only models.json generation in the entrypoint);
-    # nothing here changes for pi.
+    # CLAUDE_PROXY_BASE_URL, for --harness claude only -- the per-run
+    # proxy Service a claude coding leg needs; a pi coding leg talks to
+    # the shared proxy via PROXY_BASE_URL instead, set unconditionally
+    # above.
     local claude_env=""
     if [[ "$harness" == claude ]]; then
         claude_env=$'\n'"$(cat <<CENV
@@ -958,13 +956,19 @@ cmd_submit() {
               value: "http://$safe_name-claude-proxy.$K8S_NAMESPACE.svc.cluster.local:8080"
 CENV
 )"
-        if [[ -n "$review_model" ]]; then
-            claude_env+=$'\n'"$(cat <<CENV
+    fi
+
+    # REVIEW_MODEL, whenever --review-model was given -- regardless of
+    # harness. The review loop always runs pi, so this is the id its
+    # models.json should carry alongside (pi) or instead of (claude) the
+    # coding leg's own MODEL; see synthesize_pi_config in the entrypoint.
+    local review_model_env=""
+    if [[ -n "$review_model" ]]; then
+        review_model_env=$'\n'"$(cat <<CENV
             - name: REVIEW_MODEL
               value: "$review_model"
 CENV
 )"
-        fi
     fi
 
     local rendered
@@ -1063,7 +1067,7 @@ spec:
             - name: RUN_TTL
               value: "$K8S_RUN_TTL"
             - name: OUTBOX_MAX_BYTES
-              value: "$outbox_max_bytes"${review_loop_env}${claude_env}
+              value: "$outbox_max_bytes"${review_loop_env}${claude_env}${review_model_env}
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
