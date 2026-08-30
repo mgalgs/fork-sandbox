@@ -163,7 +163,7 @@ resolve_run_subdir() {
     local name="$1" path="$run_dir/$1"
     RUN_SUBDIR_PATH=""
     case "$name" in
-        inbox) ;;
+        inbox|inbox-delivered) ;;
         *) die "'$name' is not a fork-sandbox run directory" ;;
     esac
     if [[ -L "$path" ]]; then
@@ -177,15 +177,33 @@ resolve_run_subdir() {
     return 0
 }
 
-# How many operator addenda have been written into this run, or nothing at all
-# for a run launched before the inbox existed. Counted rather than listed: the
+# How many operator addenda have been sent to this run, or nothing at all for
+# a run launched before the inbox existed. Counted rather than listed: the
 # names are timestamps and say nothing a reader wants in a status block.
+#
+# An addendum starts in inbox/ and is archived into inbox-delivered/leg-<N>/
+# the moment the leg it was delivered to ends (see fs_archive_inbox in
+# fork-sandbox.sh), so this count is a run-lifetime total only if it adds
+# both: inbox/ alone would drop to zero after the first leg ends even though
+# nothing was ever un-sent.
 inbox_count() {
-    resolve_run_subdir inbox 2>/dev/null || return 1
-    local n=0 f
-    for f in "$RUN_SUBDIR_PATH"/*.md; do
-        [[ -f "$f" ]] && n=$(( n + 1 ))
-    done
+    local have=0 n=0 f d
+    if resolve_run_subdir inbox 2>/dev/null; then
+        have=1
+        for f in "$RUN_SUBDIR_PATH"/*.md; do
+            [[ -f "$f" ]] && n=$(( n + 1 ))
+        done
+    fi
+    if resolve_run_subdir inbox-delivered 2>/dev/null; then
+        have=1
+        for d in "$RUN_SUBDIR_PATH"/leg-*; do
+            [[ -L "$d" || ! -d "$d" ]] && continue
+            for f in "$d"/*.md; do
+                [[ -f "$f" ]] && n=$(( n + 1 ))
+            done
+        done
+    fi
+    (( have )) || return 1
     printf '%s' "$n"
 }
 
@@ -226,6 +244,7 @@ for _name in events.jsonl sandbox.log exit-code summary.txt summary.json pid; do
     resolve_run_file "$_name" || true
 done
 resolve_run_subdir inbox || true
+resolve_run_subdir inbox-delivered || true
 
 human_duration() {
     local s="$1"

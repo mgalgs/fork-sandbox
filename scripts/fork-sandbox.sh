@@ -3459,6 +3459,44 @@ rm -f "$run_dir/exit-code"
 : > "$events"
 : > "$sandbox_log"
 
+# Every later leg of this run -- a --refresh-at continuation, a review leg, a
+# fix leg -- is a fresh sandbox with a fresh /tmp, bound to this same inbox
+# directory. fork-sandbox-inbox-hook.sh's seen-list lives in that ephemeral
+# /tmp, so without this, a later leg would re-read every addendum ever sent
+# to the run, with no memory of anyone acting on it. The hook's Stop contract
+# guarantees a session cannot end with an addendum unread, so at the moment a
+# leg ends, every '*.md' in the inbox has already been delivered to it: move
+# each one out into that leg's own record. $1 is the leg number the console
+# log and --monitor use -- the implement leg is 1, and continuation, review
+# and fix legs continue the count in the order they ran. The path is built
+# from run_dir, the same fixed-name discipline fork-sandbox-status.sh's
+# resolve_run_subdir uses, rather than threaded in as its own variable: this
+# runner is a generated, standalone script, and run_dir is the one thing
+# about the inbox it already carries. The dotfiles the hook and --refresh-at
+# share the inbox with (.inbox-hook.sh, .settings.json, .refresh-config) are
+# untouched by the '*.md' glob already. A symlink is refused rather than
+# followed -- the inbox is host-written and nothing should ever put one
+# there, but archiving is a move, and following a link out of the inbox is
+# not a mistake worth making possible.
+fs_archive_inbox() {
+    local leg_no="$1" inbox_dir="$run_dir/inbox" dest="" f moved=0
+    for f in "$inbox_dir"/*.md; do
+        [[ -e "$f" || -L "$f" ]] || continue
+        if [[ -L "$f" ]]; then
+            printf 'fork-sandbox: %s is a symlink; refusing to archive it.\n' "$f" \
+                >> "$sandbox_log"
+            continue
+        fi
+        [[ -f "$f" ]] || continue
+        if (( ! moved )); then
+            dest="$run_dir/inbox-delivered/leg-$leg_no"
+            mkdir -p "$dest"
+        fi
+        mv -f -- "$f" "$dest/"
+        moved=1
+    done
+}
+
 printf '== fork-sandbox ==\n'
 printf 'harness: %s\n' "$harness"
 printf 'branch:  %s\n' "$branch"
@@ -3621,6 +3659,9 @@ else
         | tee -a "$events"
 fi
 rc="${PIPESTATUS[0]:-1}"
+# The implement leg is leg 1. Archive right after its exit code is known,
+# same as every later leg below.
+fs_archive_inbox 1
 # exit-code is what fork-sandbox-status.sh reads as "this run is over": it
 # reports the run finished the moment the file exists, and --monitor fires its
 # one terminal event there. With a review loop still to come that would be a
@@ -3973,6 +4014,7 @@ if [[ "$refresh_enabled" == "1" ]]; then
                     | tee -a "$events" -a "$cont_events"
             fi
             rc="${PIPESTATUS[0]:-1}"
+            fs_archive_inbox "$leg_no"
             refresh_last_events="$cont_events"
 
             cont_cost="$("$formatter" --cost "$cont_events" 2>/dev/null)"
@@ -4071,6 +4113,11 @@ fi
 # continuations -- and --result keeps showing the work rather than the review
 # of it. loop_cost_sum and loop_cost_unknown are shared with the refresh loop
 # above, so this section only ADDS to them.
+#
+# Review and fix legs continue the same leg count the refresh loop above left
+# off at, for fs_archive_inbox: leg_no is the implement leg's own number (1)
+# when no continuation ran, or the last continuation's number otherwise.
+next_leg_no=$(( ${leg_no:-1} + 1 ))
 review_loop_ended=""
 review_loop_detail=""
 review_iters_done='[]'
@@ -4251,6 +4298,8 @@ run_leg() {
             | tee -a "$leg_events"
     fi
     leg_rc="${PIPESTATUS[0]:-1}"
+    fs_archive_inbox "$next_leg_no"
+    next_leg_no=$(( next_leg_no + 1 ))
 
     # The same three readers the implement leg's accounting uses, applied per
     # leg. Deliberately a copy of those walks rather than a refactor of them:

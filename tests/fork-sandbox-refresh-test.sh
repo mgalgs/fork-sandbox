@@ -268,8 +268,8 @@ cat > "$stub_bin/claude-sandboxed" <<'STUB'
 # loop reacts to. Which invocation this is (1 = implement leg, 2 = first
 # continuation, ...) comes from a counter file so a scenario can control each
 # leg independently; FAKE_NUDGE_LEGS, FAKE_HANDOFF_LEGS, FAKE_SYMLINK_LEGS,
-# FAKE_FAIL_LEGS and FAKE_STALE_LEGS are comma lists of leg numbers (or the
-# literal "all"), read fresh per call.
+# FAKE_FAIL_LEGS, FAKE_STALE_LEGS and FAKE_ADDENDUM_LEGS are comma lists of
+# leg numbers (or the literal "all"), read fresh per call.
 set -uo pipefail
 
 outbox=""
@@ -291,6 +291,19 @@ handoff_legs=",${FAKE_HANDOFF_LEGS:-},"
 symlink_legs=",${FAKE_SYMLINK_LEGS:-},"
 fail_legs=",${FAKE_FAIL_LEGS:-},"
 stale_legs=",${FAKE_STALE_LEGS:-},"
+addendum_legs=",${FAKE_ADDENDUM_LEGS:-},"
+
+# The stub bypasses bwrap and its --bind-ro entirely, so it can write into
+# the inbox the same way a real fork-sandbox-say.sh would -- found the same
+# way the outbox already is here, as the run dir's own "inbox" sibling.
+if [[ -n "$outbox" ]] \
+    && { [[ "${FAKE_ADDENDUM_LEGS:-}" == "all" ]] || [[ "$addendum_legs" == *",$n,"* ]]; }; then
+    run_dir_for_addendum="$(dirname "$outbox")"
+    if [[ -d "$run_dir_for_addendum/inbox" ]]; then
+        printf 'operator addendum for leg %s\n' "$n" \
+            > "$run_dir_for_addendum/inbox/9999999900-0$n.md"
+    fi
+fi
 
 if [[ "${FAKE_NUDGE_LEGS:-}" == "all" || "$nudge_legs" == *",$n,"* ]]; then
     printf '{"type":"system","subtype":"hook_response","stderr":"fork-sandbox-refresh: nudged (usage >= 1 tokens)\\n"}\n'
@@ -363,6 +376,7 @@ run_real() {
         FAKE_SYMLINK_TARGET="${FAKE_SYMLINK_TARGET:-}" \
         FAKE_FAIL_LEGS="${FAKE_FAIL_LEGS:-}" \
         FAKE_STALE_LEGS="${FAKE_STALE_LEGS:-}" \
+        FAKE_ADDENDUM_LEGS="${FAKE_ADDENDUM_LEGS:-}" \
         timeout 60 "$launcher" --foreground --harness claude "$@" \
         "$proj" "$handoff" 2>&1)"
     rc=$?
@@ -444,6 +458,32 @@ if [[ -n "$rd" ]]; then
         no "the continuation's leg number is 2" "no summary.json"
         no "an on-time hand-off is not marked stale in summary.json" "no summary.json"
     fi
+fi
+
+# -- an addendum delivered to leg 1: archived out of inbox/ into its own
+# inbox-delivered/leg-1 record the moment that leg ends, rather than sitting
+# there for leg 2's fresh sandbox (fresh /tmp, same inbox bind) to re-read.
+# fork-sandbox-status.sh's addenda count still sees it, from the archive.
+count_file="$(mktemp)"; tmpdirs+=("$count_file")
+FAKE_ADDENDUM_LEGS=1
+rd="$(run_real "$proj" "$count_file" 1 1 --refresh-at 0.5)"
+FAKE_ADDENDUM_LEGS=""
+[[ -n "$rd" ]] && tmpdirs+=("$rd")
+if [[ -n "$rd" ]]; then
+    leftover="$(find "$rd/inbox" -maxdepth 1 -name '*.md' 2>/dev/null | wc -l | tr -d ' ')"
+    check "the addendum is archived out of inbox/ once leg 1 ends" "0" "$leftover"
+    archived="$(find "$rd/inbox-delivered/leg-1" -maxdepth 1 -name '*.md' 2>/dev/null | head -1)"
+    if [[ -n "$archived" ]]; then
+        ok "inbox-delivered/leg-1 holds the addendum"
+        contains "the archived addendum keeps its text" \
+            "operator addendum for leg 1" "$(cat "$archived")"
+    else
+        no "inbox-delivered/leg-1 holds the addendum"
+        no "the archived addendum keeps its text"
+    fi
+    status_out="$("$repo_dir/scripts/fork-sandbox-status.sh" "$rd" 2>/dev/null)"
+    contains "fork-sandbox-status.sh still counts the archived addendum" \
+        "inbox:    1 addenda" "$status_out"
 fi
 
 # -- a hand-off that predates the clone's last commit by the time the host
