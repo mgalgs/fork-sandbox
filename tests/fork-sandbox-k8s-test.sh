@@ -80,6 +80,13 @@
 #     literal matches the pod-side entrypoint's own default; the work
 #     emptyDir volume carries no sizeLimit key. The extractor honoring an
 #     explicit non-default cap is covered in its own section below.
+#   - fork-sandbox-k8s-entrypoint.sh points the bare repo's HEAD at the
+#     pushed branch before cloning (so the clone never hits the dangling
+#     default HEAD a bare push leaves behind) and no longer uses
+#     `checkout -b` (the clone already lands on that branch); a real git
+#     bare-repo/push/symbolic-ref/clone sequence confirms the property the
+#     fix relies on: no "nonexistent ref" warning, and the clone's HEAD is
+#     the pushed branch.
 #
 # This lives in tests/ rather than scripts/tests/ on purpose: install.sh
 # iterates scripts/* and runs `sed -n 2p` on each entry to build the
@@ -1567,6 +1574,62 @@ else
     no "--k8s accepts --outbox-dir" "$(cat /tmp/fs-k8s-flag-test-outboxdir.err)"
 fi
 rm -f /tmp/fs-k8s-flag-test-outboxdir.err
+
+printf '\n== bare repo HEAD points at the pushed branch before cloning ==\n'
+# cmd_submit only ever pushes refs/heads/$branch into the pod's bare repo,
+# so its default HEAD (set by git init --bare) dangles. The entrypoint must
+# point HEAD at the pushed branch before cloning, not after -- otherwise the
+# clone still hits the dangling default and prints the warning this fix
+# exists to silence.
+symref_line="$(grep -n 'symbolic-ref HEAD "refs/heads/\$BRANCH"' "$entrypoint_sh" | head -1 | cut -d: -f1)"
+clone_line="$(grep -n 'git clone --quiet "\$repo_bare" "\$clone_dir"' "$entrypoint_sh" | head -1 | cut -d: -f1)"
+if [[ -n "$symref_line" && -n "$clone_line" ]]; then
+    ok "entrypoint sets symbolic-ref HEAD to refs/heads/\$BRANCH"
+    if (( symref_line < clone_line )); then
+        ok "the symbolic-ref line precedes the git clone line"
+    else
+        no "the symbolic-ref line precedes the git clone line" \
+            "symbolic-ref at line $symref_line, clone at line $clone_line"
+    fi
+else
+    no "entrypoint sets symbolic-ref HEAD to refs/heads/\$BRANCH" \
+        "symref_line='$symref_line' clone_line='$clone_line' in $entrypoint_sh"
+fi
+
+# Now that the clone lands directly on $BRANCH (HEAD already points there),
+# `checkout -b` would fail with "already exists" -- the entrypoint must use
+# a plain checkout instead.
+if grep -qF 'checkout --quiet -b' "$entrypoint_sh"; then
+    no "entrypoint no longer uses checkout --quiet -b" \
+        "found 'checkout --quiet -b' in $entrypoint_sh"
+else
+    ok "entrypoint no longer uses checkout --quiet -b"
+fi
+
+# The real-git property the fix relies on: pushing a branch into a bare repo
+# leaves its default HEAD dangling, and a plain `git clone` of that repo
+# warns and checks out nothing -- but pointing HEAD at the pushed branch
+# first makes the clone land directly on it, with no warning.
+symref_root="$(mktemp -d /var/tmp/claude-scratch/fs-k8s-symref-test.XXXXXX)"; tmpdirs+=("$symref_root")
+symref_bare="$symref_root/repo.git"
+symref_src="$symref_root/src"
+symref_clone="$symref_root/clone"
+git init --quiet --bare "$symref_bare"
+mkdir -p "$symref_src"
+git -C "$symref_src" init --quiet
+git -C "$symref_src" -c user.email=t@fork-sandbox.invalid -c user.name=t \
+    commit -q --allow-empty -m init
+git -C "$symref_src" push --quiet "$symref_bare" HEAD:refs/heads/x
+git --git-dir="$symref_bare" symbolic-ref HEAD refs/heads/x
+symref_clone_err="$(git clone --quiet "$symref_bare" "$symref_clone" 2>&1 1>/dev/null)"
+if [[ "$symref_clone_err" != *"nonexistent ref"* ]]; then
+    ok "cloning a bare repo with HEAD pointed at the pushed branch prints no nonexistent-ref warning"
+else
+    no "cloning a bare repo with HEAD pointed at the pushed branch prints no nonexistent-ref warning" \
+        "$symref_clone_err"
+fi
+symref_clone_branch="$(git -C "$symref_clone" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+check "the clone lands directly on branch x" "x" "$symref_clone_branch"
 
 printf '\n== no private-hostname shape anywhere in the repo ==\n'
 # Guards the public-repo leak rule (see the fork-sandbox-k8s.sh header): no

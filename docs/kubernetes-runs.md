@@ -274,6 +274,11 @@ hook happens to be installed there. Disabling hooks for the one invocation
 is what keeps a repo the script was merely pointed at from running its own
 code inside the client.
 
+Only `refs/heads/BRANCH` is ever pushed into the bare repo, so its default
+HEAD dangles; the entrypoint points the bare repo's HEAD at that pushed
+branch before cloning, so the clone lands directly on it instead of warning
+about a nonexistent ref.
+
 The fetch carries the same flag for a different reason. It writes straight
 into `refs/heads/BRANCH` in the caller's real repository rather than into a
 remote-tracking ref, and `githooks(5)` documents `reference-transaction` as

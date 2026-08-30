@@ -143,10 +143,22 @@ until [[ -f "$sentinel" ]]; do
     sleep 1
 done
 
+
+# Only refs/heads/$BRANCH was ever pushed into this bare repo (cmd_submit
+# pushes exactly "HEAD:refs/heads/$branch"), so the bare repo's default
+# HEAD (refs/heads/main or master, set by git init --bare) dangles. Left
+# alone, the clone below would print "warning: remote HEAD refers to
+# nonexistent ref, unable to checkout" and check out nothing. Point HEAD at
+# the branch that actually exists before cloning, so the clone lands
+# directly on it.
+git --git-dir="$repo_bare" symbolic-ref HEAD "refs/heads/$BRANCH"
+
 echo "fork-sandbox-k8s-entrypoint: cloning to $clone_dir" >&2
 git clone --quiet "$repo_bare" "$clone_dir"
 cd "$clone_dir"
-git checkout --quiet -b "$BRANCH"
+# The clone above already checked out $BRANCH as a local branch (HEAD now
+# points there), so this only needs to switch onto it, not create it.
+git checkout --quiet "$BRANCH"
 git config user.name "$GIT_USER_NAME"
 git config user.email "$GIT_USER_EMAIL"
 git config commit.gpgsign false
