@@ -1994,6 +1994,13 @@ new_src_project() {
     printf '%s' "$d"
 }
 k8s_flag_proj="$(new_src_project)"; tmpdirs+=("$k8s_flag_proj")
+# A project fixture rooted under claude_home's own $HOME/src, not the real
+# one -- fs_require_src_project checks the project path against $HOME/src
+# at call time, so a --harness claude case run with HOME="$claude_home" (to
+# pick up its fixture credential) needs a project under that same fixture
+# HOME, not the real one k8s_flag_proj lives under.
+mkdir -p "$claude_home/src"
+k8s_flag_claude_proj="$(HOME="$claude_home" new_src_project)"; tmpdirs+=("$k8s_flag_claude_proj")
 k8s_flag_handoff_dir="$(mktemp -d /var/tmp/claude-scratch/fs-k8s-flag-test.XXXXXX)"
 tmpdirs+=("$k8s_flag_handoff_dir")
 k8s_flag_handoff="$k8s_flag_handoff_dir/handoff.md"
@@ -2013,10 +2020,17 @@ else
         "$(cat /tmp/fs-k8s-flag-test-default-harness.err)"
 fi
 rm -f /tmp/fs-k8s-flag-test-default-harness.err
-refuses "--k8s --harness claude is refused" \
-    "only supports --harness pi" \
-    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
-    --harness claude --model moonshotai/kimi-k3 unused-project unused-handoff
+if HOME="$claude_home" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
+    --harness claude --model claude-sonnet-5 \
+    --branch fs-k8s-flag-test-claude-harness \
+    "$k8s_flag_claude_proj" "$k8s_flag_handoff" \
+    > /dev/null 2>/tmp/fs-k8s-flag-test-claude-harness.err; then
+    ok "--k8s --harness claude is accepted"
+else
+    no "--k8s --harness claude is accepted" \
+        "$(cat /tmp/fs-k8s-flag-test-claude-harness.err)"
+fi
+rm -f /tmp/fs-k8s-flag-test-claude-harness.err
 refuses "--k8s --harness pi-local is refused" \
     "only supports --harness pi" \
     env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
@@ -2122,20 +2136,89 @@ else
 fi
 rm -f /tmp/fs-k8s-flag-test-rl.err /tmp/fs-k8s-flag-test-rl.yaml
 
-refuses "--k8s --review-model is refused as not yet supported" \
-    "--review-model is not yet supported with --k8s" \
+# --review-model is now carried on both harnesses (models.json lists every
+# distinct id among --model and --review-model), but only alongside
+# --review-loop -- the same "only applies to review legs" rule the general
+# non-k8s path applies, checked first in the --k8s block, before any
+# harness-specific --review-harness rule below.
+refuses "--k8s --harness pi --review-model without --review-loop is refused" \
+    "only applies to review legs and requires" \
     env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
     --harness pi --model moonshotai/kimi-k3 --review-model opus \
     unused-project unused-handoff
-# The reason changed with this flag's own support: it used to be "no review
-# leg on the cluster path at all"; now that --review-loop IS carried, the
-# reason is that the pod's models.json is generated with a single model
-# entry, so a second model for the review leg has nowhere to be declared.
-refuses "--k8s --review-model's refusal reason names the one-model-slot limit" \
-    "single model entry" \
+refuses "--k8s --harness claude --review-model without --review-loop is refused (coherence checked before harness rules)" \
+    "only applies to review legs and requires" \
     env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
-    --harness pi --model moonshotai/kimi-k3 --review-model opus \
+    --harness claude --model claude-sonnet-5 --review-model opus \
     unused-project unused-handoff
+refuses "--k8s --harness pi --review-harness pi --review-model without --review-loop hits the coherence message first" \
+    "only applies to review legs and requires" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
+    --harness pi --model moonshotai/kimi-k3 --review-harness pi --review-model opus \
+    unused-project unused-handoff
+
+pi_review_model_out="$(newdir)/pi-review-model.yaml"; tmpdirs+=("$(dirname "$pi_review_model_out")")
+if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
+    --harness pi --model moonshotai/kimi-k3 --review-loop 2 --review-model opus \
+    --branch fs-k8s-flag-test-pi-review-model \
+    "$k8s_flag_proj" "$k8s_flag_handoff" \
+    > "$pi_review_model_out" 2>/tmp/fs-k8s-flag-test-pi-review-model.err; then
+    ok "--k8s --harness pi --review-model with --review-loop is accepted"
+else
+    no "--k8s --harness pi --review-model with --review-loop is accepted" \
+        "$(cat /tmp/fs-k8s-flag-test-pi-review-model.err)"
+fi
+if grep -q 'name: REVIEW_MODEL' "$pi_review_model_out" \
+    && grep -A1 'name: REVIEW_MODEL' "$pi_review_model_out" | grep -q 'value: "opus"'; then
+    ok "--k8s --harness pi forwards --review-model through to the rendered Job env"
+else
+    no "--k8s --harness pi forwards --review-model through to the rendered Job env" \
+        "not found in $pi_review_model_out"
+fi
+rm -f /tmp/fs-k8s-flag-test-pi-review-model.err
+
+refuses "--k8s --harness pi --review-harness is refused (the pod's review loop is always pi)" \
+    "not supported with --k8s --harness" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
+    --harness pi --model moonshotai/kimi-k3 --review-loop 2 --review-harness pi \
+    --review-model opus unused-project unused-handoff
+
+refuses "--k8s --harness claude --review-loop without --review-harness pi is refused" \
+    "needs" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
+    --harness claude --model claude-sonnet-5 --review-loop 2 \
+    unused-project unused-handoff
+refuses "--k8s --harness claude --review-harness claude is refused as pi-only, regardless of --review-loop" \
+    "pi-only" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
+    --harness claude --model claude-sonnet-5 --review-harness claude \
+    unused-project unused-handoff
+refuses "--k8s --harness claude --review-loop --review-harness claude is refused as pi-only" \
+    "pi-only" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
+    --harness claude --model claude-sonnet-5 --review-loop 2 --review-harness claude \
+    unused-project unused-handoff
+
+claude_review_out="$(newdir)/claude-review.yaml"; tmpdirs+=("$(dirname "$claude_review_out")")
+if HOME="$claude_home" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
+    --harness claude --model claude-sonnet-5 --review-loop 2 \
+    --review-harness pi --review-model moonshotai/kimi-k3 \
+    --branch fs-k8s-flag-test-claude-review \
+    "$k8s_flag_claude_proj" "$k8s_flag_handoff" \
+    > "$claude_review_out" 2>/tmp/fs-k8s-flag-test-claude-review.err; then
+    ok "--k8s --harness claude --review-loop --review-harness pi --review-model is accepted"
+else
+    no "--k8s --harness claude --review-loop --review-harness pi --review-model is accepted" \
+        "$(cat /tmp/fs-k8s-flag-test-claude-review.err)"
+fi
+if grep -q 'name: REVIEW_MODEL' "$claude_review_out" \
+    && grep -A1 'name: REVIEW_MODEL' "$claude_review_out" | grep -q 'value: "moonshotai/kimi-k3"'; then
+    ok "--k8s --harness claude forwards --review-model through to the rendered Job env"
+else
+    no "--k8s --harness claude forwards --review-model through to the rendered Job env" \
+        "not found in $claude_review_out"
+fi
+rm -f /tmp/fs-k8s-flag-test-claude-review.err
 
 refuses "--timeout without --k8s is refused" \
     "only apply with --k8s" \

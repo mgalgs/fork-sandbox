@@ -422,12 +422,17 @@
 #
 # --review-loop is the one capability in that list that IS carried: --k8s
 # passes it through to fork-sandbox-k8s.sh run, which runs the loop POD-SIDE
-# after the coding leg -- see fork-sandbox-k8s-review-loop.sh and
-# docs/kubernetes-runs.md. --review-model stays refused: the pod's
-# models.json is generated with a single model entry, so a second model for
-# the review leg has nowhere to be declared yet. --review-harness stays
-# refused for the same underlying reason: the pod runs pi against the model
-# proxy and nothing else, so a second harness has nowhere to run.
+# after the coding leg, always as pi against the model proxy -- see
+# fork-sandbox-k8s-review-loop.sh and docs/kubernetes-runs.md. --review-model
+# is carried too, on both harnesses: models.json lists every distinct id
+# among --model and --review-model, so the review leg can run a different
+# pi model than the coding leg used. --review-harness stays refused outright
+# for --harness pi (there is nothing to switch: the review loop already is
+# pi) but is required, and must be 'pi', for --harness claude with
+# --review-loop -- claude never reviews itself in the pod, so a mixed run
+# needs pi's review leg named explicitly, and named as an OpenRouter id via
+# --review-model, since a habit-typed --model-shaped value like "opus" would
+# otherwise only fail after a paid coding leg instead of at validation.
 #
 # --context-ro is the other capability that IS carried: --k8s forwards it to
 # fork-sandbox-k8s.sh run, which threads it to cmd_submit the same way a
@@ -1227,9 +1232,10 @@ if [[ "$review_harness_given" == true ]]; then
     esac
 fi
 
-# pi is the only harness the cluster path builds (see the --k8s block
-# below), so --k8s defaults to it rather than making an operator type
-# --harness pi on the one flag whose whole purpose is being the front door.
+# pi is the cluster path's default harness (see the --k8s block below,
+# which also accepts --harness claude), so --k8s defaults to it rather than
+# making an operator type --harness pi on the one flag whose whole purpose
+# is being the front door.
 # This has to run before the harness/model validation just below -- the
 # pi-needs-model check in particular -- so every downstream check sees the
 # harness this run will actually use, instead of the still-"claude" value a
@@ -1416,11 +1422,12 @@ fi
 # already resolved above, exactly as a local run resolves them, so this
 # reuses that work rather than re-implementing it.
 if [[ "$k8s_mode" == true ]]; then
-    if [[ "$harness" != "pi" ]]; then
-        echo "Error: --k8s only supports --harness pi. A cluster run is pi" >&2
-        echo "talking to a model proxy that holds the provider key; claude," >&2
-        echo "pi-local and codex have no sandboxed path in the cluster (not" >&2
-        echo "yet supported)." >&2
+    if [[ "$harness" != "pi" && "$harness" != "claude" ]]; then
+        echo "Error: --k8s only supports --harness pi or claude. A cluster run" >&2
+        echo "is pi talking to a model proxy that holds the provider key, or" >&2
+        echo "claude talking through a per-run proxy that swaps in the" >&2
+        echo "operator's own token; pi-local and codex have no sandboxed path" >&2
+        echo "in the cluster (not yet supported)." >&2
         exit 1
     fi
 
@@ -1436,7 +1443,8 @@ if [[ "$k8s_mode" == true ]]; then
     fi
     if [[ -n "$claude_extra_args" ]]; then
         echo "Error: --claude-args is not supported with --k8s. It passes flags" >&2
-        echo "to the claude CLI, and --k8s always runs --harness pi." >&2
+        echo "to the claude CLI, and the pod's own claude invocation (when" >&2
+        echo "--harness claude) is fixed -- there is no flag yet to extend it." >&2
         exit 1
     fi
     if [[ "$no_services" == true ]]; then
@@ -1489,18 +1497,43 @@ if [[ "$k8s_mode" == true ]]; then
         echo "to layer it onto." >&2
         exit 1
     fi
-    if [[ -n "$review_model" ]]; then
-        echo "Error: --review-model is not yet supported with --k8s. The pod's" >&2
-        echo "models.json is generated with a single model entry (see" >&2
-        echo "fork-sandbox-k8s-entrypoint.sh), so a second model for the" >&2
-        echo "review leg has nowhere to be declared yet." >&2
+    # Flag coherence comes before harness rules: whether the combination
+    # even makes sense at all, regardless of --harness, is checked first,
+    # exactly the same wording (and rule) as the general non-k8s path
+    # applies at the equivalent point below -- this script's own dry-run
+    # approval, above, must not approve something a real --k8s run refuses.
+    if [[ -n "$review_model" && -z "$review_loop_arg" ]]; then
+        echo "Error: --review-model only applies to review legs and requires" >&2
+        echo "--review-loop." >&2
         exit 1
     fi
-    if [[ "$review_harness_given" == true ]]; then
-        echo "Error: --review-harness is not supported with --k8s. Not yet" >&2
-        echo "supported -- the pod runs pi against the model proxy and nothing" >&2
-        echo "else, so a second harness has nowhere to run." >&2
-        exit 1
+    if [[ "$harness" == "pi" ]]; then
+        if [[ "$review_harness_given" == true ]]; then
+            echo "Error: --review-harness is not supported with --k8s --harness" >&2
+            echo "pi. The pod's review loop always runs pi against the model" >&2
+            echo "proxy; use --review-model to give it a different model, not" >&2
+            echo "--review-harness." >&2
+            exit 1
+        fi
+    else
+        # harness == claude here -- pi-local and codex were already refused
+        # above, before this point.
+        if [[ "$review_harness_given" == true && "$review_harness" != "pi" ]]; then
+            echo "Error: --review-harness $review_harness is not supported with" >&2
+            echo "--k8s --harness claude. The pod's review loop is pi-only;" >&2
+            echo "pass --review-harness pi." >&2
+            exit 1
+        fi
+        if [[ -n "$review_loop_arg" && "$review_harness_given" != true ]]; then
+            echo "Error: --k8s --harness claude --review-loop needs" >&2
+            echo "--review-harness pi and an OpenRouter review model, e.g." >&2
+            echo "--review-harness pi --review-model moonshotai/kimi-k3." >&2
+            exit 1
+        fi
+        # review_harness_given == true && review_harness == "pi" here, the
+        # only combination left. Line ~1393, which runs unconditionally
+        # before this whole --k8s block, already refused --review-harness pi
+        # with no model, so review_model is guaranteed non-empty already.
     fi
     if [[ "$refresh_at_given" == true ]]; then
         echo "Error: --refresh-at is not supported with --k8s. It is measured by" >&2
@@ -1546,6 +1579,7 @@ if [[ "$k8s_mode" == true ]]; then
     # applies the identical check, before any kubectl call, so there is
     # nothing to duplicate here.
     [[ -n "$review_loop_arg" ]] && k8s_argv+=(--review-loop "$review_loop_arg")
+    [[ -n "$review_model" ]] && k8s_argv+=(--review-model "$review_model")
     [[ -n "$k8s_outbox_dir" ]] && k8s_argv+=(--outbox-dir "$k8s_outbox_dir")
     # Forwarded as the raw string, not the byte count already parsed above:
     # fork-sandbox-k8s.sh does its own parsing, so there is one source of
@@ -1553,7 +1587,7 @@ if [[ "$k8s_mode" == true ]]; then
     # sync.
     [[ -n "$outbox_max_arg" ]] && k8s_argv+=(--outbox-max "$outbox_max_arg")
     [[ -n "$context_ro" ]] && k8s_argv+=(--context-ro "$context_ro")
-    k8s_argv+=(--branch "$branch" --model "$model" "$project_path" "$handoff_file")
+    k8s_argv+=(--harness "$harness" --branch "$branch" --model "$model" "$project_path" "$handoff_file")
 
     exec "$script_dir/fork-sandbox-k8s.sh" "${k8s_argv[@]}"
 fi
