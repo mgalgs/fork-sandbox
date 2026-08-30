@@ -9,9 +9,9 @@
 # the whole point of --dry-run existing -- see docs/kubernetes-runs.md.
 #
 # It covers:
-#   - shellcheck on the six new scripts (the client, the platform plugin,
+#   - shellcheck on the seven new scripts (the client, the platform plugin,
 #     the pod entrypoint, the egress gate, the inbox writer, the review
-#     loop).
+#     loop, the context extractor).
 #   - yamllint on manifests/k8s/ and on the install/submit/run --dry-run
 #     renders.
 #   - fork-sandbox-k8s-platform-generic's two verbs.
@@ -120,6 +120,7 @@ gate_sh="$repo_dir/scripts/fork-sandbox-k8s-egress-gate.sh"
 inbox_write_sh="$repo_dir/scripts/fork-sandbox-k8s-inbox-write.sh"
 review_loop_sh="$repo_dir/scripts/fork-sandbox-k8s-review-loop.sh"
 outbox_extract_sh="$repo_dir/scripts/fork-sandbox-k8s-outbox-extract.sh"
+context_extract_sh="$repo_dir/scripts/fork-sandbox-k8s-context-extract.sh"
 
 # Sourced directly into this shell, not a subshell: ok()/no() below have to
 # reach the pass/fail counters this file reports at the end, and a subshell
@@ -138,7 +139,7 @@ printf '== shellcheck ==\n'
 if ! command -v shellcheck >/dev/null 2>&1; then
     printf '  SKIP  shellcheck not installed\n'
 else
-    for f in "$k8s_sh" "$platform_generic" "$entrypoint_sh" "$gate_sh" "$inbox_write_sh" "$review_loop_sh" "$outbox_extract_sh"; do
+    for f in "$k8s_sh" "$platform_generic" "$entrypoint_sh" "$gate_sh" "$inbox_write_sh" "$review_loop_sh" "$outbox_extract_sh" "$context_extract_sh"; do
         out="$(shellcheck "$f" 2>&1)"
         if [[ -z "$out" ]]; then ok "shellcheck: $(basename "$f")"; else no "shellcheck: $(basename "$f")" "$out"; fi
     done
@@ -997,6 +998,145 @@ else
         "$(find "$of_cap_dest_hi" 2>&1)"
 fi
 rm -f /tmp/fs-k8s-outbox-cap.err
+
+printf '\n== fork-sandbox-k8s-context-extract.sh: extraction guards (no cluster) ==\n'
+# The pod-side half of the --context-ro push -- what stands between a
+# pushed tar stream and the pod's filesystem (see its own header comment
+# for the full threat model). Driven directly here against hand-built tar
+# fixtures on stdin, the same way the outbox-extract section above drives
+# that script directly against a tar file argument: no cluster, no
+# kubectl, no real pod involved. MAX_BYTES is a required argument for this
+# script (unlike outbox-extract.sh's optional $3), so every case below
+# passes one explicitly.
+
+# well-formed: the shape `tar cf - -C CONTEXT_DIR .` on the host produces
+# -- relative entries, no `..`, no links. Must extract cleanly.
+cf_src="$(newdir)"; tmpdirs+=("$cf_src")
+mkdir -p "$cf_src/sub"
+printf 'hello\n' > "$cf_src/foo.txt"
+printf 'world\n' > "$cf_src/sub/bar.txt"
+cf_parent="$(newdir)"; tmpdirs+=("$cf_parent")
+cf_wf_tar="$cf_parent/wf.tar"
+tar cf "$cf_wf_tar" -C "$cf_src" .
+cf_wf_dest="$cf_parent/wf_dest"
+if "$context_extract_sh" "$cf_wf_dest" 100000000 < "$cf_wf_tar" \
+        >/tmp/fs-k8s-ctx-wf.err 2>&1; then
+    ok "well-formed archive extracts"
+else
+    no "well-formed archive extracts" "$(cat /tmp/fs-k8s-ctx-wf.err)"
+fi
+if [[ "$(cat "$cf_wf_dest/foo.txt" 2>/dev/null)" == "hello" \
+    && "$(cat "$cf_wf_dest/sub/bar.txt" 2>/dev/null)" == "world" ]]; then
+    ok "well-formed archive's files land with their content intact"
+else
+    no "well-formed archive's files land with their content intact" \
+        "$(find "$cf_wf_dest" 2>&1)"
+fi
+rm -f /tmp/fs-k8s-ctx-wf.err
+
+# refuses an existing DEST_DIR: a second push must not merge into a first.
+cf_exist_dest="$cf_parent/exist_dest"
+mkdir -p "$cf_exist_dest"
+refuses "an existing DEST_DIR is refused" \
+    "" \
+    "$context_extract_sh" "$cf_exist_dest" 100000000 < "$cf_wf_tar"
+
+# absolute path: refused outright, whole archive, before anything is
+# extracted -- the dest directory must not even be created.
+cf_abs_src="$(newdir)"; tmpdirs+=("$cf_abs_src")
+mkdir -p "$cf_abs_src/a"
+printf 'x\n' > "$cf_abs_src/a/f.txt"
+cf_abs_parent="$(newdir)"; tmpdirs+=("$cf_abs_parent")
+cf_abs_tar="$cf_abs_parent/abs.tar"
+( cd "$cf_abs_src" && tar -P -cf "$cf_abs_tar" "$cf_abs_src/a/f.txt" 2>/dev/null )
+cf_abs_dest="$cf_abs_parent/abs_dest"
+refuses "absolute path is refused" \
+    "contains an absolute path" \
+    "$context_extract_sh" "$cf_abs_dest" 100000000 < "$cf_abs_tar"
+if [[ ! -e "$cf_abs_dest" ]]; then
+    ok "absolute-path archive: nothing is extracted"
+else
+    no "absolute-path archive: nothing is extracted" "$cf_abs_dest exists"
+fi
+
+# `..` path component: same refuse-the-whole-archive treatment.
+cf_dd_src="$(newdir)"; tmpdirs+=("$cf_dd_src")
+mkdir -p "$cf_dd_src/a"
+printf 'x\n' > "$cf_dd_src/a/f.txt"
+cf_dd_parent="$(newdir)"; tmpdirs+=("$cf_dd_parent")
+cf_dd_tar="$cf_dd_parent/dd.tar"
+( cd "$cf_dd_src" && tar -P -cf "$cf_dd_tar" a/../a/f.txt 2>/dev/null )
+cf_dd_dest="$cf_dd_parent/dd_dest"
+refuses "a '..' path component is refused" \
+    "contains a '..' path component" \
+    "$context_extract_sh" "$cf_dd_dest" 100000000 < "$cf_dd_tar"
+if [[ ! -e "$cf_dd_dest" ]]; then
+    ok "'..'-component archive: nothing is extracted"
+else
+    no "'..'-component archive: nothing is extracted" "$cf_dd_dest exists"
+fi
+
+# symlink: refused as a link entry, listed and rejected before extraction
+# even starts.
+cf_sym_src="$(newdir)"; tmpdirs+=("$cf_sym_src")
+ln -s /etc/passwd "$cf_sym_src/evil"
+cf_sym_parent="$(newdir)"; tmpdirs+=("$cf_sym_parent")
+cf_sym_tar="$cf_sym_parent/sym.tar"
+tar cf "$cf_sym_tar" -C "$cf_sym_src" .
+cf_sym_dest="$cf_sym_parent/sym_dest"
+refuses "a symlink entry is refused" \
+    "contains a link entry" \
+    "$context_extract_sh" "$cf_sym_dest" 100000000 < "$cf_sym_tar"
+if [[ ! -e "$cf_sym_dest" ]]; then
+    ok "symlink archive: nothing is extracted"
+else
+    no "symlink archive: nothing is extracted" "$cf_sym_dest exists"
+fi
+
+# hard link: a distinct code path from the symlink check above.
+cf_hl_src="$(newdir)"; tmpdirs+=("$cf_hl_src")
+printf 'x\n' > "$cf_hl_src/f.txt"
+ln "$cf_hl_src/f.txt" "$cf_hl_src/g.txt"
+cf_hl_parent="$(newdir)"; tmpdirs+=("$cf_hl_parent")
+cf_hl_tar="$cf_hl_parent/hl.tar"
+tar cf "$cf_hl_tar" -C "$cf_hl_src" .
+cf_hl_dest="$cf_hl_parent/hl_dest"
+refuses "a hard-link entry is refused" \
+    "contains a link entry" \
+    "$context_extract_sh" "$cf_hl_dest" 100000000 < "$cf_hl_tar"
+if [[ ! -e "$cf_hl_dest" ]]; then
+    ok "hard-link archive: nothing is extracted"
+else
+    no "hard-link archive: nothing is extracted" "$cf_hl_dest exists"
+fi
+
+# oversized: refused on the spooled byte-size cap, before tar -tvf is even
+# run over it.
+cf_big_src="$(newdir)"; tmpdirs+=("$cf_big_src")
+dd if=/dev/zero of="$cf_big_src/big.bin" bs=1M count=2 2>/dev/null
+cf_big_parent="$(newdir)"; tmpdirs+=("$cf_big_parent")
+cf_big_tar="$cf_big_parent/big.tar"
+tar cf "$cf_big_tar" -C "$cf_big_src" .
+cf_big_dest="$cf_big_parent/big_dest"
+refuses "an over-cap archive is refused" \
+    "byte cap; refusing it" \
+    "$context_extract_sh" "$cf_big_dest" 100 < "$cf_big_tar"
+if [[ ! -e "$cf_big_dest" ]]; then
+    ok "over-cap archive: nothing is extracted"
+else
+    no "over-cap archive: nothing is extracted" "$cf_big_dest exists"
+fi
+
+# the same small archive under a generous cap still extracts -- confirms
+# the cap check compares against the given MAX_BYTES, not a hidden default.
+cf_hi_dest="$cf_parent/wf_dest_hi"
+if "$context_extract_sh" "$cf_hi_dest" 1000000 < "$cf_wf_tar" \
+        >/tmp/fs-k8s-ctx-hi.err 2>&1; then
+    ok "the same well-formed archive extracts under a generous cap"
+else
+    no "the same well-formed archive extracts under a generous cap" "$(cat /tmp/fs-k8s-ctx-hi.err)"
+fi
+rm -f /tmp/fs-k8s-ctx-hi.err
 
 # git disables the ext:: transport by default, so a push or fetch built
 # without -c protocol.ext.allow=always fails at the git layer with 'fatal:
