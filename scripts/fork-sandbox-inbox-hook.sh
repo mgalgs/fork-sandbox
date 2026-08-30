@@ -347,12 +347,14 @@ The fresh session will receive your original brief verbatim alongside this hand-
 
 If you do any more work after writing the hand-off, rewrite it before you end your turn so it matches reality: the harness checks, at the end of your turn, that the hand-off is newer than the clone's last commit, and sends you back once if it is not.
 
-Do not start new work after that. End your turn: the run will continue from your hand-off automatically."
+Do not start new work after that. End your turn: the run will continue from your hand-off automatically.
+
+If the brief is already entirely done — every step committed and every verify command run — a hand-off is not needed: give your report and end your turn without writing one, and the run moves on. A hand-off that says \"nothing left\" only launches a session with nothing to do."
 fi
 
 reminder_text=""
 if (( handoff_missing )); then
-    reminder_text="You were already told, on an earlier tool call, that your context was near the point this run refreshes itself, and asked to write a hand-off to \`$outbox_dir/handoff.md\` before ending your turn. No hand-off is there yet. Write one now, in the shape already described, before you finish. This is the only reminder — if you still end your turn without one, the run ends here and nothing continues from this leg."
+    reminder_text="You were already told, on an earlier tool call, that your context was near the point this run refreshes itself, and asked to write a hand-off to \`$outbox_dir/handoff.md\` before ending your turn. No hand-off is there yet. If work remains, write one now, in the shape already described, before you finish. If the brief is entirely done — every step committed and verified — do not write one: end your turn and the run moves on. This is the only reminder — if you end your turn without a hand-off, the run continues from this leg's commits and nothing more."
 fi
 
 # Not from the repository or the operator either, same as the nudge and the
