@@ -437,10 +437,15 @@ k8s_safe_name_component() {
 
 # A Kubernetes object name: lowercase RFC 1123, <=63 chars. Branch names are
 # freeform, so this derives a safe name rather than requiring the caller to
-# pick one that already qualifies.
+# pick one that already qualifies. Capped at 50, not 63: this name is also
+# used as the base of the per-run claude-proxy Service, with a
+# "-claude-proxy" suffix appended (13 chars), and a Service name is itself
+# capped at 63 -- so the base must leave room for that suffix or a long
+# branch renders a Service name the API server rejects, aborting submit
+# after the Secret, ConfigMap and Pod for that run already exist.
 k8s_safe_name() {
     local prefix="$1" branch="$2"
-    printf '%s-%s' "$prefix" "$(k8s_safe_name_component "$branch")" | cut -c1-63 | sed 's/-$//'
+    printf '%s-%s' "$prefix" "$(k8s_safe_name_component "$branch")" | cut -c1-50 | sed 's/-$//'
 }
 
 # Renders the four --review-loop-only ConfigMap keys: the review and fix
@@ -668,6 +673,19 @@ cmd_submit() {
 
     [[ -n "$review_model" ]] && { fs_reject_unsafe_chars "$review_model" || exit 1; }
 
+    # The same cross-check fork-sandbox-k8s-entrypoint.sh enforces pod-side
+    # (HARNESS=claude and REVIEW_LOOP_CAP set but REVIEW_MODEL empty),
+    # checked here too so a caller of this direct entry point -- not just
+    # fork-sandbox.sh --k8s, which already guarantees it -- fails before the
+    # proxy Pod, the token Secret, the Job and a full repository push all
+    # happen for a run that can only fail once the pod starts.
+    if [[ "$harness" == claude && $review_loop_cap -gt 0 && -z "$review_model" ]]; then
+        echo "Error: --review-model is required with --harness claude" >&2
+        echo "--review-loop -- the review loop always runs pi, and --model" >&2
+        echo "is a Claude Code model name pi cannot use." >&2
+        exit 1
+    fi
+
     # The operator's own OAuth credential, for --harness claude only --
     # read and validated here, before anything is created, the same rule
     # every other pre-creation check in this function follows. Read once;
@@ -881,23 +899,6 @@ cmd_submit() {
             -e "s|__NAMESPACE__|$K8S_NAMESPACE|g" \
             -e "s|__RUN_NAME__|$safe_name|g" \
             "$claude_proxy_template")"$'\n'
-    fi
-
-    # The per-run Secret carrying the REAL operator access token, read by
-    # the per-run proxy above. Created the same way cmd_install creates
-    # fork-sandbox-upstream-key -- kubectl create secret generic
-    # --dry-run=client -o yaml | kubectl apply -f -, so the token never
-    # appears on any argv beyond that one --from-literal -- then labeled
-    # in a SEPARATE command, since `kubectl create secret` has no
-    # --overwrite of its own and this keeps the token off that second
-    # command's argv too. Under --dry-run this creates nothing; the
-    # dry-run print below adds one comment line instead.
-    if [[ "$harness" == claude && "$dry_run" != true ]]; then
-        kubectl create secret generic "$safe_name-claude-token" \
-            --from-literal="upstream-key.conf=set \$upstream_key \"$claude_access_token\";" \
-            --dry-run=client -o yaml | kubectl apply -f -
-        kubectl label secret "$safe_name-claude-token" \
-            fork-sandbox/branch="$safe_name" --overwrite
     fi
 
     local entrypoint_sh="$script_dir/fork-sandbox-k8s-entrypoint.sh"
@@ -1117,6 +1118,46 @@ EOF
     fi
 
     if [[ "$harness" == claude ]]; then
+        # The per-run Secret carrying the REAL operator access token, read
+        # by the per-run proxy below -- created here, as the LAST step
+        # before any cluster object for this run exists, so that every
+        # check above (executable checks, ConfigMap key rendering, YAML
+        # substitution) has already run and cannot abort submit with a
+        # bare token Secret left behind. Created the same way cmd_install
+        # creates fork-sandbox-upstream-key -- kubectl create secret
+        # generic --dry-run=client -o yaml | kubectl apply -f -, so the
+        # token never appears on any argv beyond that one --from-literal --
+        # then labeled in a SEPARATE command, since `kubectl create secret`
+        # has no --overwrite of its own and this keeps the token off that
+        # second command's argv too. The trap below covers the gap between
+        # the two commands: if the label call itself is what fails, the
+        # Secret it leaves behind carries no fork-sandbox/branch label, so
+        # the trap's own by-label delete would miss it too -- which is why
+        # the trap also deletes this Secret by name.
+        kubectl create secret generic "$safe_name-claude-token" \
+            --from-literal="upstream-key.conf=set \$upstream_key \"$claude_access_token\";" \
+            --dry-run=client -o yaml | kubectl apply -f -
+        kubectl label secret "$safe_name-claude-token" \
+            fork-sandbox/branch="$safe_name" --overwrite
+
+        # From here on, every remaining step touches the cluster and can
+        # fail: the proxy apply and its readiness wait below, the Job
+        # apply, the pod readiness wait, and the repository push further
+        # down. None of them may leave the per-run proxy Pod or the
+        # Secret holding the operator's live access token orphaned in the
+        # namespace. Cleared right before this function's own success
+        # message, once nothing is left to protect.
+        trap '
+            kubectl delete secret "$safe_name-claude-token" --ignore-not-found >&2
+            kubectl delete pod,service,secret,configmap,networkpolicy \
+                -l fork-sandbox/branch="$safe_name" --ignore-not-found >&2
+            echo "fork-sandbox-k8s: submit failed -- removed this run'"'"'s per-run" >&2
+            echo "proxy Pod/Service and token Secret (branch $branch)." >&2
+            echo "fork-sandbox-k8s: if a Job for this branch was also created," >&2
+            echo "finish cleanup with:" >&2
+            echo "  fork-sandbox-k8s.sh rm --branch $branch" >&2
+        ' EXIT
+
         # Applied, and waited on, BEFORE the Job below: the egress-gate
         # initContainer probes this proxy the moment the Job's pod starts,
         # and if both went into one `kubectl apply` stream that start could
@@ -1182,6 +1223,10 @@ EOF
     fi
 
     kubectl exec "$pod_name" -- sh -c 'touch /work/.inputs-complete'
+
+    # Everything this run needs now exists and is up -- nothing left for
+    # the cleanup trap above to protect.
+    [[ "$harness" == claude ]] && trap - EXIT
 
     echo "fork-sandbox-k8s: submitted. branch=$branch pod=$pod_name" >&2
     echo "fork-sandbox-k8s: fetch with: fork-sandbox-k8s.sh fetch --branch $branch $project_path" >&2
@@ -1291,10 +1336,27 @@ cmd_say() {
     fi
 
     printf 'wrote %s\n' "$write_out"
-    printf 'delivery: within ~25 tool calls. The pod runs pi, which has no\n'
-    printf 'hook system, so the agent reads the inbox itself -- on a\n'
-    printf 'tool-call floor, around long commands, before each commit, and\n'
-    printf 'before its final report.\n'
+    # The delivery contract differs by harness: a pi pod has no hook system
+    # and only ever polls the inbox itself, but a claude pod installs
+    # fork-sandbox-inbox-hook.sh into PostToolUse/Stop (see
+    # fork-sandbox-k8s-entrypoint.sh), so delivery is on the very next tool
+    # call and a Stop is blocked while the addendum is unread. Read back off
+    # the pod's own HARNESS env rather than assumed, since this command has
+    # no other record of which harness this run picked.
+    local say_harness
+    say_harness="$(kubectl get pod "$pod_name" \
+        -o jsonpath='{.spec.containers[?(@.name=="agent")].env[?(@.name=="HARNESS")].value}')"
+    if [[ "$say_harness" == claude ]]; then
+        printf 'delivery: on the next tool call. The pod runs claude, which\n'
+        printf 'installs the operator-inbox hook into PostToolUse and Stop --\n'
+        printf 'the agent reads the addendum right after its next tool call,\n'
+        printf 'and a Stop is blocked while it is still unread.\n'
+    else
+        printf 'delivery: within ~25 tool calls. The pod runs pi, which has no\n'
+        printf 'hook system, so the agent reads the inbox itself -- on a\n'
+        printf 'tool-call floor, around long commands, before each commit, and\n'
+        printf 'before its final report.\n'
+    fi
 }
 
 cmd_rm() {

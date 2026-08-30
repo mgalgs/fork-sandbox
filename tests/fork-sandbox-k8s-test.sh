@@ -232,18 +232,44 @@ fi
 printf '\n== shared proxy Service and static NetworkPolicy carry the role key ==\n'
 # fork-sandbox/role: model-proxy, alongside the pre-existing app:
 # fork-sandbox-proxy, on the Deployment's pod template, the Service
-# selector and the static NetworkPolicy's podSelector -- three places,
-# since a --harness claude run's per-run proxy Pod also carries
+# selector and the static NetworkPolicy's podSelector -- three SEPARATE
+# objects, since a --harness claude run's per-run proxy Pod also carries
 # app: fork-sandbox-proxy (for the platform agent-egress policy) and would
 # otherwise be picked up by either the Service (round-robining pi traffic
 # into a proxy that 403s it) or the static policy (whose ingress admits
-# every agent pod in the namespace, not just one run's own).
-role_key_count="$(grep -cF 'fork-sandbox/role: model-proxy' "$install_out")"
-if [[ "$role_key_count" -eq 3 ]]; then
-    ok "fork-sandbox/role: model-proxy appears on the Deployment template, Service selector and static NetworkPolicy podSelector"
+# every agent pod in the namespace, not just one run's own). A bare
+# occurrence count of 3 cannot tell "one per object" apart from "three
+# copies inside the Deployment's pod template, Service selector and
+# NetworkPolicy podSelector left untightened" -- so each object's own
+# rendered document is checked individually instead.
+extract_doc_by_kind() {
+    local kind="$1" file="$2"
+    awk -v k="kind: $kind" '
+        $0 == k { flag=1 }
+        flag && /^---$/ { exit }
+        flag { print }
+    ' "$file"
+}
+proxy_deployment_doc="$(extract_doc_by_kind Deployment "$install_out")"
+proxy_service_doc="$(extract_doc_by_kind Service "$install_out")"
+proxy_netpol_doc="$(extract_doc_by_kind NetworkPolicy "$install_out")"
+if grep -qF 'fork-sandbox/role: model-proxy' <<< "$proxy_deployment_doc"; then
+    ok "the Deployment's pod template carries fork-sandbox/role: model-proxy"
 else
-    no "fork-sandbox/role: model-proxy appears on the Deployment template, Service selector and static NetworkPolicy podSelector" \
-        "found $role_key_count occurrences in $install_out, want 3"
+    no "the Deployment's pod template carries fork-sandbox/role: model-proxy" \
+        "not found in Deployment doc from $install_out"
+fi
+if grep -qF 'fork-sandbox/role: model-proxy' <<< "$proxy_service_doc"; then
+    ok "the Service's own selector carries fork-sandbox/role: model-proxy"
+else
+    no "the Service's own selector carries fork-sandbox/role: model-proxy" \
+        "not found in Service doc from $install_out"
+fi
+if grep -qF 'fork-sandbox/role: model-proxy' <<< "$proxy_netpol_doc"; then
+    ok "the static NetworkPolicy's own podSelector carries fork-sandbox/role: model-proxy"
+else
+    no "the static NetworkPolicy's own podSelector carries fork-sandbox/role: model-proxy" \
+        "not found in NetworkPolicy doc from $install_out"
 fi
 
 printf '\n== namespace enforces Pod Security Admission (restricted) ==\n'
@@ -654,6 +680,34 @@ else
 fi
 rm -f /tmp/fs-k8s-test-claude-submit.err
 
+printf '\n== fork-sandbox-k8s.sh submit --dry-run --harness claude (long branch name) ==\n'
+# k8s_safe_name used to cap at 63 with no budget for the "-claude-proxy"
+# suffix appended afterward, so any branch whose sanitized form was 32+
+# characters rendered an over-63-char Service name and submit aborted after
+# the Secret, ConfigMap and Pod for the run already existed. This branch's
+# sanitized form is well past that threshold.
+long_branch="claude-harness-review-fix-round-2-with-extra-words-appended-to-push-well-past-any-reasonable-cap"
+long_submit_out="$(newdir)/claude-long-submit.yaml"; tmpdirs+=("$(dirname "$long_submit_out")")
+if HOME="$claude_home" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch "$long_branch" --model claude-sonnet-5 --harness claude \
+    "$proj_dir" "$handoff_file" > "$long_submit_out" 2>/tmp/fs-k8s-test-claude-long-submit.err; then
+    ok "submit --dry-run --harness claude (long branch) exits 0"
+else
+    no "submit --dry-run --harness claude (long branch) exits 0" \
+        "$(cat /tmp/fs-k8s-test-claude-long-submit.err)"
+fi
+# The claude-proxy Service name must still fit a Service's 63-char RFC 1035
+# label cap once the "-claude-proxy" suffix (13 chars) lands on it.
+long_proxy_name="$(grep -m1 '^kind: Service$' -A2 "$long_submit_out" \
+    | sed -n 's/^ *name: //p')"
+if [[ -n "$long_proxy_name" && ${#long_proxy_name} -le 63 ]]; then
+    ok "long-branch claude-proxy Service name fits the 63-char label cap (${#long_proxy_name} chars)"
+else
+    no "long-branch claude-proxy Service name fits the 63-char label cap" \
+        "name='$long_proxy_name' (${#long_proxy_name} chars) in $long_submit_out"
+fi
+rm -f /tmp/fs-k8s-test-claude-long-submit.err
+
 # submit_out above carries no --review-model, so it must render no
 # REVIEW_MODEL env at all -- the flag is opt-in for both harnesses.
 if grep -q 'name: REVIEW_MODEL' "$submit_out"; then
@@ -802,6 +856,18 @@ if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
 else
     no "submit --dry-run --review-loop 2 exits 0" "$(cat /tmp/fs-k8s-test-rl-submit.err)"
 fi
+# Item: --harness claude --review-loop with no --review-model is refused
+# here directly, not just by fork-sandbox.sh's own --k8s gate -- this
+# script is a documented direct entry point in its own right, and without
+# this check a bad direct invocation would only fail pod-side, after the
+# proxy Pod, the token Secret, the Job and a full repository push already
+# exist for the run.
+refuses "submit --harness claude --review-loop without --review-model is refused" \
+    "--review-model is required with --harness claude" \
+    env HOME="$claude_home" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-rl-branch --model claude-sonnet-5 --harness claude --review-loop 2 \
+    "$proj_dir" "$handoff_file"
+
 if command -v yamllint >/dev/null 2>&1; then
     # Only structural validity is asserted here, not zero warnings: the
     # rendered review/fix prompt bodies and the skill's own front matter

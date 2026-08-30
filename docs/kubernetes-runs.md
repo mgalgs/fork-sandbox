@@ -511,11 +511,12 @@ claude`, it is effectively required: `fork-sandbox.sh`'s own `--k8s` gate
 refuses a `--review-loop` on a claude run unless `--review-harness pi` is
 given explicitly together with a review model (the combined `pi/<id>` form
 or `--review-model`), because the review leg there is *always* pi against
-an OpenRouter id, never claude — naming `--review-harness pi` is what
-tells the script (and stops an operator's habit-typed `--review-model
-opus`, which would mean a claude model locally, from reaching the pod as a
-bad OpenRouter id) rather than failing only after a paid coding leg has
-already run.
+an OpenRouter id, never claude — naming `--review-harness pi` states the
+operator's intent (that the id belongs to the pi/OpenRouter table, not
+claude's) and routes alias lookup there, but validates nothing about the
+id itself: an operator's habit-typed `--review-model opus`, which would
+mean a claude model locally, is still forwarded verbatim and only fails
+pod-side, on the first review leg, after the coding leg has already run.
 
 ## Egress is sealed, except the proxy
 

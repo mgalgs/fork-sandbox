@@ -66,6 +66,13 @@ data:
         uwsgi_temp_path /tmp/uwsgi;
         scgi_temp_path /tmp/scgi;
 
+        # nginx's 1 MiB default. Claude Code POSTs the whole conversation
+        # (system prompt, tool defs, every prior turn and tool result) on
+        # every /v1/messages call, so a long-running session crosses 1 MiB
+        # well before it exhausts its context window -- the default would
+        # turn into a mid-run, unrecoverable 413.
+        client_max_body_size 0;
+
         limit_req_zone $binary_remote_addr zone=fork_sandbox:10m rate=5r/s;
 
         server {
