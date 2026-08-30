@@ -181,7 +181,11 @@
 # refuses to let it finish while one is unread; the other harnesses are told
 # to read the directory on a tool-call floor, around long commands, before
 # each commit, and before their final report. So steering a run no longer
-# means killing it and starting over.
+# means killing it and starting over. Each leg archives what it was shown
+# into <run-dir>/inbox-delivered/leg-<N>/ the moment it ends, so a later
+# leg's fresh sandbox never re-reads it; a --refresh-at continuation's
+# prompt carries every archived addendum forward, while a review or fix leg
+# gets none.
 #
 # The review loop. --review-loop N adds a quality pass after the coding
 # session: a REVIEW leg reads the commits the run just made and writes a

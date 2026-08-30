@@ -259,7 +259,7 @@ inbox:    2 addenda
 ◆ fork-sandbox-inbox: delivered 1787718559-01.md
 ```
 
-**Steering keeps working across a `--refresh-at` continuation.** The inbox is bound at the same path for every leg of the chain — the implement leg and every continuation — so an addendum written while leg 2 is running lands on leg 2, exactly as it would on a run with no refresh at all. What does *not* carry across a continuation is anything a session only holds in its own head: an addendum sent to leg 1 and never read reaches leg 1 through the same hook that always delivers it, but a leg that already finished cannot act on a correction meant for it. If you steer a run that might already be several legs in, check `--monitor`'s output for which leg is current before assuming your addendum landed where you meant it to.
+**Steering keeps working across a `--refresh-at` continuation.** The inbox is bound at the same path for every leg of the chain — the implement leg and every continuation — so an addendum written while leg 2 is running lands on leg 2, exactly as it would on a run with no refresh at all. What does *not* carry across a continuation is anything a session only holds in its own head, so the run archives an addendum into `<run-dir>/inbox-delivered/leg-<N>/` the moment the leg it was delivered to ends, and every continuation's prompt embeds every addendum archived so far, oldest first, right after the original brief. A continuation is the same task continued, so this is deliberate: a standing constraint or a correction to the brief must not vanish just because the leg that read it is gone. Review and fix legs, by contrast, get none of it — their task is the verdict, not the brief, and an addendum aimed at the coding phase is not theirs. You can still steer a running review or fix leg live with `fork-sandbox-say.sh`; what it receives is archived under that leg's own number when it ends, the same as any other leg.
 
 ### What to send, and what not to
 
@@ -465,11 +465,12 @@ clone inside it is mounted, and the log is written by the host shell.
 | `<run-dir>/events-review-<i>.jsonl`, `<run-dir>/events-fix-<i>.jsonl` | `--review-loop` only: each loop leg's own event stream |
 | `<run-dir>/handoff-original.md` | `--refresh-at` only: a verbatim snapshot of the hand-off this run itself was launched with, taken once at launch; embedded in every continuation's prompt |
 | `<run-dir>/handoff-<N>.md` | `--refresh-at` only: continuation N's prompt, exactly as the previous leg wrote it to the outbox |
-| `<run-dir>/continuation-prompt-<N>.md` | `--refresh-at` only: continuation N's whole rendered prompt (preamble, the original brief above, an optional stale-hand-off warning, then the hand-off above) |
+| `<run-dir>/continuation-prompt-<N>.md` | `--refresh-at` only: continuation N's whole rendered prompt (preamble, the original brief, any addenda archived from earlier legs, an optional stale-hand-off warning, then the hand-off above) |
 | `<run-dir>/events-continuation-<N>.jsonl` | `--refresh-at` only: continuation N's own event stream, for its isolated cost and usage; its events also land in `events.jsonl`, unlike a review-loop leg's |
 | `<run-dir>/outbox/` | the one writable path outside the clone, created and bound read-write on every run; a nudged `--refresh-at` session's hand-off lands here, and it's otherwise free for anything the agent wants a human to see — a screenshot, a report. Capped at 64 MiB by default, raised with `--outbox-max` |
 | `--outbox-dir` path (`--k8s` only) | the pod's own `/work/outbox`, pulled back to the host here once the run finishes; see "Kubernetes runs" above |
 | `<run-dir>/inbox/` | operator addenda, written with `fork-sandbox-say.sh`; bound read-only into the sandbox |
+| `<run-dir>/inbox-delivered/leg-<N>/` | addenda delivered to leg `N` (the implement leg is 1; continuation, review and fix legs continue the count), archived here the moment that leg ends |
 | `<run-dir>/exit-code` | written when the session exits |
 | `<run-dir>/pi-session` | `--harness pi` only: pi's session, with per-message cost |
 | `<run-dir>/clone/<name>` | the clone; the only path the sandbox can write |
