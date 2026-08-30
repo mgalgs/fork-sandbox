@@ -173,7 +173,11 @@ list_unread
 # doing here rather than paying the payload read on every remaining tool call
 # of a leg that has already written its hand-off and moved on. A leg settles
 # into the fully-silent fast path once it is both nudged and reminded, or
-# once it has a hand-off waiting, whichever comes first.
+# once it has a hand-off waiting that has not gone stale. A stale hand-off
+# still costs a payload read and an event check on each remaining PostToolUse
+# call -- there is no way to tell those apart from the Stop that matters
+# without reading the payload -- but not the lock beyond that; see the exit
+# before it below.
 need_work=0
 (( ${#unread[@]} > 0 )) && need_work=1
 (( measure_usage )) && need_work=1
@@ -224,6 +228,17 @@ if (( measure_usage )); then
             nudge_now=1
         fi
     fi
+fi
+
+# handoff_missing and stale_block -- the only things below worth taking the
+# lock for besides a fresh nudge -- are both Stop/SubagentStop-only (see each
+# below). A PostToolUse call with nothing unread and no nudge of its own has
+# nothing left to decide, so it exits here rather than pay the lock (and the
+# race it guards against) for the rest of a leg whose hand-off is sitting
+# stale in the outbox waiting for that leg's own Stop to send it back.
+if (( ${#unread[@]} == 0 && ! nudge_now )) \
+    && [[ "$event" != "Stop" && "$event" != "SubagentStop" ]]; then
+    exit 0
 fi
 
 # Two tool calls can finish at once, and each fires its own hook. Without a

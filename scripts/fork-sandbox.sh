@@ -2858,11 +2858,16 @@ handoff_copy="$run_dir/handoff.md"
 # overlay, taken now rather than re-read from $handoff_file later: this run's
 # --refresh-at continuations (below) embed it as the authoritative brief, and
 # the launching session may edit $handoff_file after this run starts. Taking
-# the copy here means a continuation always sees what leg 1 saw.
+# the copy here means a continuation always sees what leg 1 saw. Only
+# refresh_build_prompt reads this back, and only a refresh-enabled run ever
+# calls it, so the snapshot itself is skipped otherwise -- see SKILL.md's
+# "--refresh-at only" note on this file.
 handoff_original="$run_dir/handoff-original.md"
-fs_reject_unsafe_chars "$handoff_original"
-cat -- "$handoff_file" > "$handoff_original.part"
-mv -- "$handoff_original.part" "$handoff_original"
+if (( refresh_enabled )); then
+    fs_reject_unsafe_chars "$handoff_original"
+    cat -- "$handoff_file" > "$handoff_original.part"
+    mv -- "$handoff_original.part" "$handoff_original"
+fi
 
 # fs_emit_prompt_preamble (fork-sandbox-lib.sh) takes its network argument
 # explicitly rather than reading $harness itself, so it can also serve
@@ -3935,7 +3940,7 @@ if [[ "$refresh_enabled" == "1" ]]; then
             if [[ -f "$clone_dir/.git/logs/HEAD" \
                 && "$clone_dir/.git/logs/HEAD" -nt "$run_dir/$record_name" ]]; then
                 handoff_stale=1
-                printf "fork-sandbox: %s predates the clone's last commit; continuation %s is warned\n" \
+                printf "fork-sandbox: %s predates the clone's last commit; continuation leg %s is warned\n" \
                     "$record_name" "$leg_no" | tee -a "$sandbox_log"
             fi
 

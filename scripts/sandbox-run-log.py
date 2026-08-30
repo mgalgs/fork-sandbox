@@ -75,8 +75,10 @@ claude harness):
                  missing key.
   continuations  one object per continuation leg the run actually made --
                  `leg` (2 for the first, matching leg 1 being the implement
-                 leg), `exit`, `cost_usd`, `usage` and `handoff` (the
-                 <run-id>/handoff-N.md record its prompt was built from).
+                 leg), `exit`, `cost_usd`, `usage`, `handoff` (the
+                 <run-id>/handoff-N.md record its prompt was built from) and
+                 `handoff_stale` (true when that record predated the clone's
+                 last commit at the time this leg's prompt was built).
                  Empty for a run that never refreshed. `total_cost_usd`
                  folds every continuation's cost in beside the review loop's;
                  `cost_usd` stays the implement leg alone. Group on it
