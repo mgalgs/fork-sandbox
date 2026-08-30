@@ -440,6 +440,13 @@ if (( rc9 == 0 )) && [[ -n "$rd9" ]]; then
     else
         no "the addendum the implement leg saw is archived under inbox-delivered/leg-1"
     fi
+    # The review leg's own inbox bind is empty (checked above), so the only
+    # way it can see the implement leg's addendum at all -- and meet its own
+    # prompt's "an unfollowed addendum is a finding" contract -- is if the
+    # per-iteration review prompt embeds it, the way a continuation prompt
+    # embeds every earlier leg's archived addenda.
+    contains "the review leg's own prompt carries the implement leg's archived addendum" \
+        "do this too" "$(cat "$rd9/review-prompt-1.md" 2>/dev/null)"
 
     # next_leg_no starts at the implement leg's own number + 1 and advances
     # once per review/fix leg -- unverified until now, since the only
@@ -473,6 +480,197 @@ if (( rc9 == 0 )) && [[ -n "$rd9" ]]; then
 else
     no "run_real produced a run directory for the review/fix-inbox scenario" \
         "rc=$rc9: $out9"
+fi
+
+printf '\n== --review-loop: archiving follows the leg'"'"'s OWN harness, not the implement one ==\n'
+
+# fs_archive_inbox is gated on the harness the ENDING leg actually ran, not
+# on $harness (the implement harness) -- run_leg passes it
+# review_preamble_harness for a review leg. The scenario above never
+# exercises that: --harness claude with no --review-harness makes every
+# leg's own harness "claude" too, so leg_harness == $harness always and a
+# revert to leg_harness="$harness" would still pass every check above. The
+# two mixed pairs below -- claude/pi-local and pi/claude -- are the cases
+# that tell the two apart, since only in a mixed pair can $harness and a
+# leg's own harness disagree.
+
+# Scenario A: --harness claude --review-harness pi-local. The implement and
+# fix legs run on claude-sandboxed; the review leg alone runs on
+# agent-sandboxed, since --review-harness only overrides the review leg (a
+# fix leg "stays on the implement harness throughout", per fs_archive_inbox's
+# own comment). An addendum sent while the review leg runs must NOT be
+# archived at ITS boundary -- pi-local has no Stop hook, so archiving there
+# would risk losing a message nobody can prove was read -- and must instead
+# still be sitting in the live inbox for the fix leg to sweep up under its
+# own number when IT ends, since the fix leg is back on claude.
+mixed_a_stub="$(mktemp -d /var/tmp/claude-scratch/fs-review-harness-mixed-a.XXXXXX)"
+tmpdirs+=("$mixed_a_stub")
+# Both stubs bypass bwrap and locate the clone/outbox by content rather than
+# by argv position, since claude-sandboxed and agent-sandboxed do not agree
+# on where the clone dir falls in argv -- the clone dir is the one argument
+# that is a real directory with a .git inside it, and the outbox is the one
+# that is a real directory named "outbox". Legs are told apart by a shared
+# counter file, the same protocol the single-harness scenario above uses.
+cat > "$mixed_a_stub/claude-sandboxed" <<'STUB'
+#!/usr/bin/env bash
+set -uo pipefail
+clone_dir="" outbox=""
+for a in "$@"; do
+    if [[ -d "$a/.git" ]]; then
+        clone_dir="$a"
+    elif [[ -d "$a" && "$(basename -- "$a")" == "outbox" ]]; then
+        outbox="$a"
+    fi
+done
+cat >/dev/null
+n=0
+[[ -f "$FAKE_COUNT_FILE" ]] && n="$(cat "$FAKE_COUNT_FILE")"
+n=$(( n + 1 ))
+printf '%s' "$n" > "$FAKE_COUNT_FILE"
+inbox_dir="$(dirname "$outbox")/inbox"
+case "$n" in
+1)
+    printf 'implement addendum\n' > "$inbox_dir/9999999900-01.md"
+    git -c user.email=t@fork-sandbox.invalid -c user.name=Tester \
+        -C "$clone_dir" commit --allow-empty -q -m "leg $n"
+    ;;
+3)
+    git -c user.email=t@fork-sandbox.invalid -c user.name=Tester \
+        -C "$clone_dir" commit --allow-empty -q -m "leg $n"
+    ;;
+esac
+printf '{"type":"result","subtype":"success","total_cost_usd":0.01,"usage":{"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}\n'
+exit 0
+STUB
+cat > "$mixed_a_stub/agent-sandboxed" <<'STUB'
+#!/usr/bin/env bash
+set -uo pipefail
+clone_dir="" outbox=""
+for a in "$@"; do
+    if [[ -d "$a/.git" ]]; then
+        clone_dir="$a"
+    elif [[ -d "$a" && "$(basename -- "$a")" == "outbox" ]]; then
+        outbox="$a"
+    fi
+done
+cat >/dev/null
+n=0
+[[ -f "$FAKE_COUNT_FILE" ]] && n="$(cat "$FAKE_COUNT_FILE")"
+n=$(( n + 1 ))
+printf '%s' "$n" > "$FAKE_COUNT_FILE"
+inbox_dir="$(dirname "$outbox")/inbox"
+printf 'a message sent while the pi-local review leg ran\n' > "$inbox_dir/9999999900-02.md"
+printf 'FINDINGS\n\nfile.txt:1 not quite right\n' > "$clone_dir/.git/review-verdict.md"
+exit 0
+STUB
+chmod +x "$mixed_a_stub/claude-sandboxed" "$mixed_a_stub/agent-sandboxed"
+
+count_a="$(mktemp)"; tmpdirs+=("$count_a")
+outA="$(PATH="$mixed_a_stub:$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$real_cfg" \
+    FORK_SANDBOX_BACKEND=fake-image FAKE_COUNT_FILE="$count_a" \
+    timeout 60 "$launcher" --foreground --harness claude --review-loop 1 \
+    --review-harness pi-local --branch "sandbox-test-mixed-a-$$" \
+    "$proj" "$handoff" 2>&1)"
+rcA=$?
+rdA="$(printf '%s\n' "$outA" | sed -n 's/^  run dir:  *//p' | head -1)"
+if (( rcA == 0 )) && [[ -n "$rdA" ]]; then
+    tmpdirs+=("$rdA")
+    check "all three legs ran" "3" "$(cat "$count_a")"
+    archived_implA="$(find "$rdA/inbox-delivered/leg-1" -maxdepth 1 -name '*.md' 2>/dev/null | head -1)"
+    if [[ -n "$archived_implA" ]]; then
+        ok "the claude implement leg's addendum is archived under leg-1"
+    else
+        no "the claude implement leg's addendum is archived under leg-1"
+    fi
+    check "the pi-local review leg does NOT archive at its own boundary" \
+        "0" "$(find "$rdA/inbox-delivered/leg-2" -maxdepth 1 -name '*.md' 2>/dev/null | wc -l | tr -d ' ')"
+    archived_fixA="$(find "$rdA/inbox-delivered/leg-3" -maxdepth 1 -name '*.md' 2>/dev/null | head -1)"
+    if [[ -n "$archived_fixA" ]]; then
+        ok "the claude fix leg sweeps up the review leg's leftover addendum under leg-3"
+        contains "the swept-up addendum keeps its own text" \
+            "a message sent while the pi-local review leg ran" "$(cat "$archived_fixA")"
+    else
+        no "the claude fix leg sweeps up the review leg's leftover addendum under leg-3"
+        no "the swept-up addendum keeps its own text" "no archived file"
+    fi
+else
+    no "run_real produced a run directory for the claude/pi-local archiving scenario" \
+        "rc=$rcA: $outA"
+fi
+
+# Scenario B: --harness pi/some-model --review-harness claude. pi (not
+# pi-local) also runs through claude-sandboxed, via --exec, so this whole
+# scenario is one stub: the implement and fix legs run pi's argv under
+# --exec, and the review leg runs claude's own plain argv, and both shapes
+# are told apart by leg number, same as above. The implement leg's own
+# harness is pi, so its addendum must NOT be archived when IT ends, even
+# though the RUN's implement harness -- $harness -- is the same "pi" a
+# reverted leg_harness="$harness" would also use for the review leg. The
+# review leg's own harness is claude, so when it ends it must archive BOTH
+# its own addendum and the implement leg's leftover one, under leg-2 -- the
+# one outcome a reverted leg_harness="$harness" (which would evaluate to
+# "pi/some-model", not claude, for this leg) could not produce.
+mixed_b_stub="$(mktemp -d /var/tmp/claude-scratch/fs-review-harness-mixed-b.XXXXXX)"
+tmpdirs+=("$mixed_b_stub")
+cat > "$mixed_b_stub/claude-sandboxed" <<'STUB'
+#!/usr/bin/env bash
+set -uo pipefail
+clone_dir="" outbox=""
+for a in "$@"; do
+    if [[ -d "$a/.git" ]]; then
+        clone_dir="$a"
+    elif [[ -d "$a" && "$(basename -- "$a")" == "outbox" ]]; then
+        outbox="$a"
+    fi
+done
+cat >/dev/null
+n=0
+[[ -f "$FAKE_COUNT_FILE" ]] && n="$(cat "$FAKE_COUNT_FILE")"
+n=$(( n + 1 ))
+printf '%s' "$n" > "$FAKE_COUNT_FILE"
+inbox_dir="$(dirname "$outbox")/inbox"
+case "$n" in
+1)
+    printf 'pi implement addendum\n' > "$inbox_dir/9999999900-01.md"
+    git -c user.email=t@fork-sandbox.invalid -c user.name=Tester \
+        -C "$clone_dir" commit --allow-empty -q -m "leg $n"
+    printf 'pi text output, no JSON\n'
+    ;;
+2)
+    printf 'a message sent while the claude review leg ran\n' > "$inbox_dir/9999999900-02.md"
+    printf 'FINDINGS\n\nfile.txt:1 not quite right\n' > "$clone_dir/.git/review-verdict.md"
+    printf '{"type":"result","subtype":"success","total_cost_usd":0.01,"usage":{"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}\n'
+    ;;
+3)
+    git -c user.email=t@fork-sandbox.invalid -c user.name=Tester \
+        -C "$clone_dir" commit --allow-empty -q -m "leg $n"
+    printf 'pi text output, no JSON\n'
+    ;;
+esac
+exit 0
+STUB
+chmod +x "$mixed_b_stub/claude-sandboxed"
+
+count_b="$(mktemp)"; tmpdirs+=("$count_b")
+outB="$(PATH="$mixed_b_stub:$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$real_cfg" \
+    FORK_SANDBOX_BACKEND=fake-image FAKE_COUNT_FILE="$count_b" \
+    timeout 60 "$launcher" --foreground --harness pi/some-model --review-loop 1 \
+    --review-harness claude --branch "sandbox-test-mixed-b-$$" \
+    "$proj" "$handoff" 2>&1)"
+rcB=$?
+rdB="$(printf '%s\n' "$outB" | sed -n 's/^  run dir:  *//p' | head -1)"
+if (( rcB == 0 )) && [[ -n "$rdB" ]]; then
+    tmpdirs+=("$rdB")
+    check "all three legs ran" "3" "$(cat "$count_b")"
+    check "the pi implement leg does NOT archive at its own boundary" \
+        "0" "$(find "$rdB/inbox-delivered/leg-1" -maxdepth 1 -name '*.md' 2>/dev/null | wc -l | tr -d ' ')"
+    check "the claude review leg archives both its own and the implement leg's leftover addendum" \
+        "2" "$(find "$rdB/inbox-delivered/leg-2" -maxdepth 1 -name '*.md' 2>/dev/null | wc -l | tr -d ' ')"
+    check "the pi fix leg does NOT archive at its own boundary either" \
+        "0" "$(find "$rdB/inbox-delivered/leg-3" -maxdepth 1 -name '*.md' 2>/dev/null | wc -l | tr -d ' ')"
+else
+    no "run_real produced a run directory for the pi/claude archiving scenario" \
+        "rc=$rcB: $outB"
 fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"

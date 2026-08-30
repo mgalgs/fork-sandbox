@@ -3489,19 +3489,29 @@ rm -f "$run_dir/exit-code"
 # a numbered directory nothing but a --refresh-at continuation ever reads
 # back, so it would never reach any session at all. Skip the move on any
 # non-claude leg and leave the file where every leg's prompt already tells
-# the agent to look. The path is built from run_dir, the same fixed-name
-# discipline fork-sandbox-status.sh's resolve_run_subdir uses, rather than
-# threaded in as its own variable: this runner is a generated, standalone
-# script, and run_dir is the one thing about the inbox it already carries.
-# The dotfiles the hook and --refresh-at share the inbox with
-# (.inbox-hook.sh, .settings.json, .refresh-config) are untouched by the
-# '*.md' glob already. A symlink is refused rather than followed -- the
-# inbox is host-written and nothing should ever put one there, but archiving
-# is a move, and following a link out of the inbox is not a mistake worth
-# making possible.
+# the agent to look. $3 is that leg's own exit code: the Stop hook only runs
+# as part of the model ending its turn, so a leg that was killed, timed out,
+# or otherwise exited non-zero never ran it, and any addendum sitting in the
+# inbox at that point was never subject to the "cannot end with it unread"
+# guarantee either -- skip the move for the same reason a non-claude leg
+# does, and leave it for a later leg to actually see. This does not close
+# the narrower race where a write lands after the Stop hook already let a
+# clean-exit leg go but before this function runs (the pipeline still
+# draining through tee) -- that is a pre-existing property of any Stop-hook-
+# guarded workflow, not something archiving introduced, and closing it needs
+# the hook to record which files it actually marked seen, not a leg-level
+# rc check. The path is built from run_dir, the same fixed-name discipline
+# fork-sandbox-status.sh's resolve_run_subdir uses, rather than threaded in
+# as its own variable: this runner is a generated, standalone script, and
+# run_dir is the one thing about the inbox it already carries. The dotfiles
+# the hook and --refresh-at share the inbox with (.inbox-hook.sh,
+# .settings.json, .refresh-config) are untouched by the '*.md' glob already.
+# A symlink is refused rather than followed -- the inbox is host-written and
+# nothing should ever put one there, but archiving is a move, and following
+# a link out of the inbox is not a mistake worth making possible.
 fs_archive_inbox() {
-    local leg_no="$1" leg_harness="$2" inbox_dir="$run_dir/inbox" dest="" f moved=0
-    [[ "$leg_harness" == "claude" ]] || return 0
+    local leg_no="$1" leg_harness="$2" leg_rc="$3" inbox_dir="$run_dir/inbox" dest="" f moved=0
+    [[ "$leg_harness" == "claude" && "$leg_rc" == "0" ]] || return 0
     for f in "$inbox_dir"/*.md; do
         [[ -e "$f" || -L "$f" ]] || continue
         if [[ -L "$f" ]]; then
@@ -3517,6 +3527,22 @@ fs_archive_inbox() {
         mv -f -- "$f" "$dest/"
         moved=1
     done
+}
+
+# Every addendum fs_archive_inbox has moved out of a strictly earlier leg of
+# THIS run, oldest first: sorted by leg number rather than by directory name,
+# since "leg-10" must not sort before "leg-2". One line per inbox-delivered
+# leg directory. Shared by refresh_build_prompt below and the review loop
+# further down -- both need "every earlier leg's addenda, in order", not
+# just what happens to still be sitting in the live inbox this leg's own
+# sandbox has bound.
+fs_addenda_dirs() {
+    local d leg_n
+    for d in "$run_dir"/inbox-delivered/leg-*; do
+        [[ -d "$d" && ! -L "$d" ]] || continue
+        leg_n="${d##*/leg-}"
+        printf '%s %s\n' "$leg_n" "$d"
+    done | sort -n -k1,1 | cut -d' ' -f2-
 }
 
 printf '== fork-sandbox ==\n'
@@ -3683,7 +3709,7 @@ fi
 rc="${PIPESTATUS[0]:-1}"
 # The implement leg is leg 1. Archive right after its exit code is known,
 # same as every later leg below.
-fs_archive_inbox 1 "$harness"
+fs_archive_inbox 1 "$harness" "$rc"
 # exit-code is what fork-sandbox-status.sh reads as "this run is over": it
 # reports the run finished the moment the file exists, and --monitor fires its
 # one terminal event there. With a review loop still to come that would be a
@@ -3911,18 +3937,12 @@ refresh_build_prompt() {
     local n="$1" handoff="$2" out="$3" stale="${4:-0}"
     # Every addendum fs_archive_inbox has moved out of a strictly earlier leg
     # of THIS run, oldest first: sorted by leg number rather than by
-    # directory name, since "leg-10" must not sort before "leg-2". None of
-    # these were shown to review or fix legs, only to coding legs -- but a
-    # continuation is the same task continued, so it gets all of them, not
-    # just the ones its immediate predecessor saw.
-    local addenda_list d leg_n f
-    addenda_list="$(
-        for d in "$run_dir"/inbox-delivered/leg-*; do
-            [[ -d "$d" && ! -L "$d" ]] || continue
-            leg_n="${d##*/leg-}"
-            printf '%s %s\n' "$leg_n" "$d"
-        done | sort -n -k1,1 | cut -d' ' -f2-
-    )"
+    # directory name, since "leg-10" must not sort before "leg-2". The review
+    # loop rebuilds its own review-prompt copy with the same list, for the
+    # same reason -- a continuation is the same task continued, so it gets
+    # all of them, not just the ones its immediate predecessor saw.
+    local addenda_list f
+    addenda_list="$(fs_addenda_dirs)"
     {
         cat -- "$continuation_prompt_header"
         printf '\n---\n\n# This is continuation %s of a run that refreshed its context\n\n' "$n"
@@ -4079,7 +4099,7 @@ if [[ "$refresh_enabled" == "1" ]]; then
                     | tee -a "$events" -a "$cont_events"
             fi
             rc="${PIPESTATUS[0]:-1}"
-            fs_archive_inbox "$leg_no" "$harness"
+            fs_archive_inbox "$leg_no" "$harness" "$rc"
             refresh_last_events="$cont_events"
 
             cont_cost="$("$formatter" --cost "$cont_events" 2>/dev/null)"
@@ -4371,7 +4391,7 @@ run_leg() {
             | tee -a "$leg_events"
     fi
     leg_rc="${PIPESTATUS[0]:-1}"
-    fs_archive_inbox "$next_leg_no" "$leg_harness"
+    fs_archive_inbox "$next_leg_no" "$leg_harness" "$leg_rc"
     next_leg_no=$(( next_leg_no + 1 ))
 
     # The same three readers the implement leg's accounting uses, applied per
@@ -4484,7 +4504,43 @@ if [[ "$review_loop_cap" != "0" && -n "$review_prompt" ]]; then
         # one's, so the path starts empty whatever left something there.
         rm -f "$review_verdict_file"
 
-        run_leg review "$loop_i" "$review_prompt"
+        # review_prompt is static, built once at launch -- but the review
+        # prompt body (fs_emit_review_prompt_body) tells the review leg that
+        # an unfollowed addendum is a finding, and by the time any review
+        # leg runs, fs_archive_inbox has already moved every addendum an
+        # earlier claude leg saw out of the live inbox this sandbox binds
+        # and into inbox-delivered/, where nothing but this leg's own prompt
+        # (built fresh here, the same way refresh_build_prompt does it for a
+        # continuation) ever carries it back. Without this, the review leg's
+        # own contract is impossible to meet on exactly the harness where it
+        # is enforceable: it would approve a branch that left a claude leg's
+        # addendum unfollowed, for no reason it could see.
+        review_prompt_iter="$run_dir/review-prompt-$loop_i.md"
+        {
+            cat -- "$review_prompt"
+            rp_addenda_list="$(fs_addenda_dirs)"
+            if [[ -n "$rp_addenda_list" ]]; then
+                printf '\n---\n\n## Operator addenda delivered to earlier legs of this run\n\n'
+                printf 'The operator sent the messages below to an earlier leg of this run,\n'
+                printf 'oldest first. The live inbox bound into this sandbox no longer holds\n'
+                printf 'them -- a claude leg archives what it saw the moment it ends -- so\n'
+                printf 'this is the only copy this leg will see. Check the commit range\n'
+                printf 'under review against each one: if it asks for work the commits do\n'
+                printf 'not contain, that is a finding under "An unfollowed addendum is a\n'
+                printf 'finding" above, citing the message file itself.\n'
+                while IFS= read -r rp_dir; do
+                    [[ -n "$rp_dir" ]] || continue
+                    for rp_file in "$rp_dir"/*.md; do
+                        [[ -f "$rp_file" ]] || continue
+                        printf '\n### %s\n\n' "${rp_file##*/}"
+                        cat -- "$rp_file"
+                    done
+                done <<< "$rp_addenda_list"
+            fi
+        } > "$review_prompt_iter.part"
+        mv -- "$review_prompt_iter.part" "$review_prompt_iter"
+
+        run_leg review "$loop_i" "$review_prompt_iter"
         it_review_exit="$leg_rc"
         it_review_cost="${leg_cost:-null}"
         it_review_usage="$leg_usage"
