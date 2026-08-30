@@ -878,9 +878,23 @@ refuses "submit --context-ro on a missing directory is refused" \
 cr_sym_dir="$(mktemp -d /var/tmp/claude-scratch/forks/fs-k8s-test-cr-sym.XXXXXX)"; tmpdirs+=("$cr_sym_dir")
 ln -s /etc/passwd "$cr_sym_dir/evil"
 refuses "submit --context-ro containing a symlink is refused" \
-    "contains a" \
+    "contains a symlink" \
     env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-cr-sym --model moonshotai/kimi-k3 --context-ro "$cr_sym_dir" \
+    "$proj_dir" "$handoff_file"
+
+# A directory containing a hard link is refused on the host too -- `find
+# -type l` alone never matches a hard link (it has no distinct file type),
+# but `tar cf`'s walk still turns the second name for the same inode into a
+# link entry, which the pod-side extractor refuses just like a symlink's,
+# only after the Job exists and the repository has already been pushed.
+cr_hl_dir="$(mktemp -d /var/tmp/claude-scratch/forks/fs-k8s-test-cr-hl.XXXXXX)"; tmpdirs+=("$cr_hl_dir")
+printf 'x\n' > "$cr_hl_dir/f.txt"
+ln "$cr_hl_dir/f.txt" "$cr_hl_dir/g.txt"
+refuses "submit --context-ro containing a hard link is refused" \
+    "contains a hard-linked file" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-cr-hl --model moonshotai/kimi-k3 --context-ro "$cr_hl_dir" \
     "$proj_dir" "$handoff_file"
 
 # `run --dry-run --context-ro` forwards to submit rather than growing its
@@ -1070,8 +1084,13 @@ of_big_parent="$(newdir)"; tmpdirs+=("$of_big_parent")
 of_big_tar="$of_big_parent/big.tar"
 tar cf "$of_big_tar" -C "$of_big_src" .
 of_big_dest="$of_big_parent/big_dest"
+# The needle names both the outbox-extract label and the tar file: this is
+# a failure surfaced through the shared context-extract.sh implementation,
+# and an operator reading it must see which script and which archive were
+# rejected, not "context-extract" naming a DEST_DIR that may belong to a
+# run that never used --context-ro at all.
 refuses "an over-cap archive is refused" \
-    "byte cap; refusing it" \
+    "fork-sandbox-k8s-outbox-extract: $of_big_tar" \
     "$outbox_extract_sh" "$of_big_tar" "$of_big_dest"
 if [[ ! -e "$of_big_dest" ]]; then
     ok "over-cap archive: nothing is extracted"
@@ -1110,6 +1129,28 @@ else
         "$(find "$of_cap_dest_hi" 2>&1)"
 fi
 rm -f /tmp/fs-k8s-outbox-cap.err
+
+# A $3 above 256 MiB -- the shared context-extract.sh script's own default
+# ceiling, meant for --context-ro -- must still be honored, not silently
+# reduced to it: --outbox-max is documented as having no upper ceiling, so
+# an archive between 256 MiB and the caller's $3 must still extract. This
+# pins the regression where fork-sandbox-k8s-outbox-extract.sh became a thin
+# wrapper around fork-sandbox-k8s-context-extract.sh and inherited its
+# literal without overriding it.
+of_huge_src="$(newdir)"; tmpdirs+=("$of_huge_src")
+dd if=/dev/zero of="$of_huge_src/big.bin" bs=1M count=257 2>/dev/null
+of_huge_parent="$(newdir)"; tmpdirs+=("$of_huge_parent")
+of_huge_tar="$of_huge_parent/huge.tar"
+tar cf "$of_huge_tar" -C "$of_huge_src" .
+of_huge_dest="$of_huge_parent/huge_dest"
+if "$outbox_extract_sh" "$of_huge_tar" "$of_huge_dest" $((300 * 1024 * 1024)) \
+        >/tmp/fs-k8s-outbox-huge.err 2>&1; then
+    ok "a \$3 above 256 MiB is honored, not silently capped there"
+else
+    no "a \$3 above 256 MiB is honored, not silently capped there" \
+        "$(cat /tmp/fs-k8s-outbox-huge.err)"
+fi
+rm -f /tmp/fs-k8s-outbox-huge.err
 
 printf '\n== fork-sandbox-k8s-context-extract.sh: extraction guards (no cluster) ==\n'
 # The pod-side half of the --context-ro push -- what stands between a
@@ -1249,6 +1290,43 @@ else
     no "the same well-formed archive extracts under a generous cap" "$(cat /tmp/fs-k8s-ctx-hi.err)"
 fi
 rm -f /tmp/fs-k8s-ctx-hi.err
+
+# FS_EXTRACT_LITERAL_MAX_BYTES overrides the 256 MiB default the two cases
+# above never exercise: the effective cap is min(MAX_BYTES,
+# FS_EXTRACT_LITERAL_MAX_BYTES), so a MAX_BYTES far larger than the literal
+# must still be clamped down to it in both directions -- an archive that
+# fits under the (smaller) literal still extracts, and one that fits under
+# MAX_BYTES but not under the literal is still refused. Overriding the
+# literal down to a small, controllable value here proves the clamp itself
+# without needing a real 256 MiB fixture.
+cf_clamp_src="$(newdir)"; tmpdirs+=("$cf_clamp_src")
+printf 'clamp me\n' > "$cf_clamp_src/f.txt"
+cf_clamp_parent="$(newdir)"; tmpdirs+=("$cf_clamp_parent")
+cf_clamp_tar="$cf_clamp_parent/clamp.tar"
+tar cf "$cf_clamp_tar" -C "$cf_clamp_src" .
+cf_clamp_size="$(stat -c '%s' -- "$cf_clamp_tar")"
+
+cf_clamp_dest_fits="$cf_clamp_parent/clamp_dest_fits"
+if env FS_EXTRACT_LITERAL_MAX_BYTES=$((cf_clamp_size + 100)) \
+        "$context_extract_sh" "$cf_clamp_dest_fits" 100000000 < "$cf_clamp_tar" \
+        >/tmp/fs-k8s-ctx-clamp.err 2>&1; then
+    ok "a huge MAX_BYTES clamped down to a literal the archive still fits under extracts"
+else
+    no "a huge MAX_BYTES clamped down to a literal the archive still fits under extracts" \
+        "$(cat /tmp/fs-k8s-ctx-clamp.err)"
+fi
+rm -f /tmp/fs-k8s-ctx-clamp.err
+
+cf_clamp_dest_over="$cf_clamp_parent/clamp_dest_over"
+refuses "a huge MAX_BYTES is still clamped down to a tighter literal" \
+    "byte cap; refusing it" \
+    env FS_EXTRACT_LITERAL_MAX_BYTES=$((cf_clamp_size - 1)) \
+    "$context_extract_sh" "$cf_clamp_dest_over" 100000000 < "$cf_clamp_tar"
+if [[ ! -e "$cf_clamp_dest_over" ]]; then
+    ok "clamped-below-literal archive: nothing is extracted"
+else
+    no "clamped-below-literal archive: nothing is extracted" "$cf_clamp_dest_over exists"
+fi
 
 # git disables the ext:: transport by default, so a push or fetch built
 # without -c protocol.ext.allow=always fails at the git layer with 'fatal:

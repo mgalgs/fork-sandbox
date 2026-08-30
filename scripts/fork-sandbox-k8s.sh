@@ -648,16 +648,29 @@ cmd_submit() {
             exit 1
         fi
         # tar cf's ordinary (non -h) walk turns a symlink into a link
-        # entry, which fork-sandbox-k8s-context-extract.sh refuses --
-        # but only after the Job exists, the pod is Ready and the
-        # repository has already been pushed. Catching it here instead
-        # refuses before any of that happens.
+        # entry, which fork-sandbox-k8s-context-extract.sh refuses -- but
+        # only after the Job exists, the pod is Ready and the repository
+        # has already been pushed. Catching it here instead refuses before
+        # any of that happens. A hard link gets the same "link entry"
+        # treatment from tar (it sees the same device+inode a second time
+        # under a different name), so it needs its own check here too --
+        # `find -type l` only ever matches symlinks.
         local context_ro_symlink
         context_ro_symlink="$(find "$context_ro_real" -type l -print -quit)"
         if [[ -n "$context_ro_symlink" ]]; then
-            echo "Error: --context-ro directory '$context_ro_real' contains a" >&2
-            echo "symlink ('$context_ro_symlink'); links are not allowed in a" >&2
-            echo "pushed context directory." >&2
+            echo "Error: --context-ro directory '$context_ro_real' contains a symlink" >&2
+            echo "('$context_ro_symlink'); links are not allowed in a pushed context" >&2
+            echo "directory." >&2
+            exit 1
+        fi
+        local context_ro_hardlink
+        context_ro_hardlink="$(find "$context_ro_real" -type f -links +1 \
+                -exec "$FS_STAT" -c '%d:%i %n' {} + \
+            | awk '{ if (seen[$1]++) { print $2; exit } }')"
+        if [[ -n "$context_ro_hardlink" ]]; then
+            echo "Error: --context-ro directory '$context_ro_real' contains a hard-linked file" >&2
+            echo "('$context_ro_hardlink'); links are not allowed in a pushed context" >&2
+            echo "directory." >&2
             exit 1
         fi
         context_ro="$context_ro_real"

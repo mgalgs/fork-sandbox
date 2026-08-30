@@ -39,13 +39,14 @@
 # This is the one implementation of that guard: fork-sandbox-k8s-outbox-extract.sh
 # is a thin bash wrapper around this script, adapting its own TAR_FILE
 # argument and 64 MiB default cap onto this script's DEST_DIR/MAX_BYTES
-# stdin interface, rather than keeping a second copy of the guard in sync
-# by hand. This script itself is fed the tar directly on stdin -- it is
-# what `kubectl exec -i POD -- sh .../context-extract.sh DEST MAX_BYTES`
-# runs with `submit`'s spooled tar piped in, so the byte-cap check below
-# has to spool stdin to a temp file first rather than stat a file it was
-# handed; outbox-extract.sh's own wrapper redirects its TAR_FILE argument
-# onto this script's stdin to get the same behavior from a file path.
+# interface via the FS_EXTRACT_* env vars below, rather than keeping a
+# second copy of the guard in sync by hand. This script itself is normally
+# fed the tar directly on stdin -- it is what
+# `kubectl exec -i POD -- sh .../context-extract.sh DEST MAX_BYTES` runs
+# with `submit`'s spooled tar piped in, so the byte-cap check below spools
+# stdin to a temp file first by default, since a pipe cannot be `stat`ed in
+# place; a caller that already has the tar as a file on disk, like
+# outbox-extract.sh, sets FS_EXTRACT_INPUT_FILE to skip that copy instead.
 #
 # Written as a standalone POSIX sh script, not bash: like
 # fork-sandbox-k8s-inbox-write.sh, this runs inside the pod's image, mounted
@@ -54,35 +55,53 @@
 # fixture tarball on stdin, with no cluster and no kubectl involved.
 #
 # MAX_BYTES is a threaded value, not this script's only cap: a caller
-# passing a huge number must not be able to talk this script into
-# accepting more than LITERAL_MAX_BYTES below, the independent literal
-# fork-sandbox-k8s.sh's own CONTEXT_MAX_BYTES is checked against on the
-# host -- two literals, not one shared constant, the same way
-# FS_OUTBOX_MAX_BYTES and outbox-extract.sh's default are two literals
-# rather than one threaded value. The effective cap is
-# min(MAX_BYTES, LITERAL_MAX_BYTES): a caller may lower it, never raise it.
+# passing a huge number must not be able to talk this script into accepting
+# more than FS_EXTRACT_LITERAL_MAX_BYTES below, which defaults to 256 MiB --
+# the independent literal fork-sandbox-k8s.sh's own CONTEXT_MAX_BYTES is
+# checked against on the host for the --context-ro path, which never
+# overrides the env var and so gets that 256 MiB ceiling. The effective cap
+# is min(MAX_BYTES, FS_EXTRACT_LITERAL_MAX_BYTES): a caller may lower it,
+# never raise it above the ceiling in force for that caller.
+#
+# fork-sandbox-k8s-outbox-extract.sh's own --outbox-max is documented as
+# having no upper ceiling, so it overrides FS_EXTRACT_LITERAL_MAX_BYTES to
+# its own MAX_BYTES -- making the clamp a no-op -- rather than inheriting
+# the 256 MiB meant for --context-ro. It also sets FS_EXTRACT_LABEL so a
+# rejection here is attributed to the caller that actually ran, not always
+# to "context-extract", and FS_EXTRACT_INPUT_FILE so a tar it already has on
+# disk is read in place instead of spooled through a second temp file.
 
 set -eu
 
 dest_dir="${1:?usage: fork-sandbox-k8s-context-extract.sh DEST_DIR MAX_BYTES}"
 max_bytes="${2:?usage: fork-sandbox-k8s-context-extract.sh DEST_DIR MAX_BYTES}"
 
-# 256 MiB, matching fork-sandbox-k8s.sh's own CONTEXT_MAX_BYTES.
-literal_max_bytes=$((256 * 1024 * 1024))
+label="${FS_EXTRACT_LABEL:-context-extract}"
+
+# 256 MiB by default, matching fork-sandbox-k8s.sh's own CONTEXT_MAX_BYTES.
+literal_max_bytes="${FS_EXTRACT_LITERAL_MAX_BYTES:-$((256 * 1024 * 1024))}"
 if [ "$max_bytes" -gt "$literal_max_bytes" ]; then
     max_bytes="$literal_max_bytes"
 fi
 
-tar_file="$(mktemp)"
 tvf_out="$(mktemp)"
 tf_out="$(mktemp)"
-trap 'rm -f "$tar_file" "$tvf_out" "$tf_out"' EXIT
-
-head -c "$((max_bytes + 1))" > "$tar_file"
+if [ -n "${FS_EXTRACT_INPUT_FILE:-}" ]; then
+    # Already a file on disk (fork-sandbox-k8s-outbox-extract.sh's TAR_FILE,
+    # itself already spooled under a byte cap by cmd_run) -- stat it in
+    # place rather than paying for a second temp-file copy of bytes we
+    # already have.
+    tar_file="$FS_EXTRACT_INPUT_FILE"
+    trap 'rm -f "$tvf_out" "$tf_out"' EXIT
+else
+    tar_file="$(mktemp)"
+    trap 'rm -f "$tar_file" "$tvf_out" "$tf_out"' EXIT
+    head -c "$((max_bytes + 1))" > "$tar_file"
+fi
 
 size="$(stat -c '%s' -- "$tar_file")"
 if [ "$size" -gt "$max_bytes" ]; then
-    echo "context-extract: $size bytes, over $max_bytes byte cap; refusing it." >&2
+    echo "$label: $size bytes, over $max_bytes byte cap; refusing it." >&2
     exit 1
 fi
 
@@ -115,7 +134,7 @@ tar -tvf "$tar_file" > "$tvf_out"
 while IFS= read -r line; do
     case "$line" in
         l*|*" link to "*)
-            echo "context-extract: contains a link entry; refusing the whole archive." >&2
+            echo "$label: contains a link entry; refusing the whole archive." >&2
             exit 1
             ;;
     esac
@@ -125,11 +144,11 @@ tar -tf "$tar_file" > "$tf_out"
 while IFS= read -r path; do
     case "$path" in
         /*)
-            echo "context-extract: contains an absolute path; refusing the whole archive." >&2
+            echo "$label: contains an absolute path; refusing the whole archive." >&2
             exit 1
             ;;
         ..|../*|*/..|*/../*)
-            echo "context-extract: contains a '..' path component; refusing archive." >&2
+            echo "$label: contains a '..' path component; refusing archive." >&2
             exit 1
             ;;
     esac
@@ -140,7 +159,7 @@ done < "$tf_out"
 # explicitly here rather than left to mkdir's own generic "File exists"
 # message, so a caller (and a test) can pin what refused it.
 if [ -e "$dest_dir" ]; then
-    echo "fork-sandbox-k8s-context-extract: DEST_DIR '$dest_dir' already exists; refusing." >&2
+    echo "$label: DEST_DIR '$dest_dir' already exists; refusing." >&2
     exit 1
 fi
 mkdir -- "$dest_dir"
