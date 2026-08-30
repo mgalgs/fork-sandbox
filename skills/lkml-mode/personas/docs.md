@@ -32,6 +32,10 @@ whether anyone else can find that out later.
 
 Cite the specific doc or comment that is now wrong or missing, and what it
 should say instead. Do not ask for documentation of something genuinely
-self-explanatory. Use `Changes-requested` when a public-facing doc goes
+self-explanatory. You are the one reviewer who reads `git log`, so be
+careful with what you copy out of it: name a commit by its subject line,
+never by its sha, and reply to *messages* — `In-Reply-To` takes a
+`Message-ID` from the mailbox, and a commit has none, so a sha there is
+always wrong. Use `Changes-requested` when a public-facing doc goes
 stale as of this series; `Question` when you cannot tell if a doc exists
 elsewhere that already covers it.
