@@ -2838,6 +2838,16 @@ fi
 # nothing and removes the guess.
 handoff_copy="$run_dir/handoff.md"
 
+# A verbatim snapshot of the caller's own handoff, no preamble and no
+# overlay, taken now rather than re-read from $handoff_file later: this run's
+# --refresh-at continuations (below) embed it as the authoritative brief, and
+# the launching session may edit $handoff_file after this run starts. Taking
+# the copy here means a continuation always sees what leg 1 saw.
+handoff_original="$run_dir/handoff-original.md"
+fs_reject_unsafe_chars "$handoff_original"
+cat -- "$handoff_file" > "$handoff_original.part"
+mv -- "$handoff_original.part" "$handoff_original"
+
 # fs_emit_prompt_preamble (fork-sandbox-lib.sh) takes its network argument
 # explicitly rather than reading $harness itself, so it can also serve
 # fork-sandbox-k8s.sh's pod, which is a network situation of its own and not
@@ -3397,6 +3407,7 @@ started_at="$(date +%s)"
     printf 'outbox_dir=%q\n' "$outbox_dir"
     printf 'outbox_max_bytes=%q\n' "$outbox_max_bytes"
     printf 'continuation_prompt_header=%q\n' "$continuation_prompt_header"
+    printf 'handoff_original=%q\n' "$handoff_original"
     printf 'user_shell=%q\n' "$user_shell"
     printf 'keep_open=%q\n' "$keep_open"
     printf 'services_enabled=%q\n' "$services_enabled"
@@ -3805,19 +3816,28 @@ refresh_leg_was_nudged() {
 # named in handoff-N.md, continuation-prompt-N.md and README/SKILL.md, NOT
 # the leg number the console log and --monitor use, which counts the
 # implement leg as 1). $2 the hand-off file, already moved to its $run_dir
-# record. $3 the destination path. Just the static preamble plus a short
-# marker line and the hand-off verbatim -- there is no verdict-style body to
-# append here, unlike the fix leg's prompt.
+# record. $3 the destination path. The static preamble, then two documents in
+# full: the original brief ($handoff_original, snapshotted once at launch --
+# see above) and the previous leg's own hand-off -- there is no verdict-style
+# body to append here, unlike the fix leg's prompt.
 refresh_build_prompt() {
     local n="$1" handoff="$2" out="$3"
     {
         cat -- "$continuation_prompt_header"
         printf '\n---\n\n# This is continuation %s of a run that refreshed its context\n\n' "$n"
         printf 'A previous session, in this same clone and on this same branch, used up\n'
-        printf 'most of its context window and wrote the hand-off below for a fresh\n'
-        printf 'session to continue from. You are that fresh session, with none of its\n'
-        printf 'memory. Read the hand-off as your task.\n\n'
-        printf '---\n\n'
+        printf 'most of its context window and wrote a hand-off for a fresh session to\n'
+        printf 'continue from. You are that fresh session, with none of its memory. Two\n'
+        printf 'documents follow: the original brief this run was launched with, and\n'
+        printf 'the hand-off the previous leg wrote against it.\n\n'
+        printf 'The brief is authoritative for what the task IS -- check its own list\n'
+        printf 'of items, not the hand-off'"'"'s account of it, to decide what is left.\n'
+        printf 'The hand-off is authoritative for what has been done against the brief\n'
+        printf 'so far. Where the hand-off summarises, abbreviates or omits items the\n'
+        printf 'brief contains, the brief wins.\n\n'
+        printf '\n---\n\n## The original brief\n\n'
+        cat -- "$handoff_original"
+        printf '\n---\n\n## Hand-off from the previous leg\n\n'
         cat -- "$handoff"
     } > "$out.part"
     mv -- "$out.part" "$out"

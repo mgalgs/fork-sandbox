@@ -298,11 +298,31 @@ if [[ -n "$rd" ]]; then
             "$(cat "$cont_prompt")"
         contains "leg 2's prompt carries the hand-off text" \
             "HANDOFF from leg 1" "$(cat "$cont_prompt")"
+        contains "leg 2's prompt carries the original brief's text" \
+            "do the task" "$(cat "$cont_prompt")"
+        contains "leg 2's prompt has the original-brief heading" \
+            "## The original brief" "$(cat "$cont_prompt")"
+        contains "leg 2's prompt has the hand-off heading" \
+            "## Hand-off from the previous leg" "$(cat "$cont_prompt")"
+        brief_at="$(grep -n '## The original brief' "$cont_prompt" | head -1 | cut -d: -f1)"
+        handoff_at="$(grep -n '## Hand-off from the previous leg' "$cont_prompt" | head -1 | cut -d: -f1)"
+        if [[ -n "$brief_at" && -n "$handoff_at" && "$brief_at" -lt "$handoff_at" ]]; then
+            ok "the brief heading appears before the hand-off heading"
+        else
+            no "the brief heading appears before the hand-off heading" \
+                "brief at line $brief_at, hand-off at line $handoff_at"
+        fi
     else
         no "the continuation prompt file exists"
         no "leg 2's prompt carries the continuation line"
         no "leg 2's prompt carries the hand-off text"
+        no "leg 2's prompt carries the original brief's text"
+        no "leg 2's prompt has the original-brief heading"
+        no "leg 2's prompt has the hand-off heading"
+        no "the brief heading appears before the hand-off heading"
     fi
+    check "handoff-original.md is the raw handoff, byte for byte" \
+        "do the task" "$(cat "$rd/handoff-original.md" 2>/dev/null)"
     if [[ -f "$rd/summary.json" ]]; then
         check "summary.json has one continuation" \
             "1" "$(jq '.continuations | length' "$rd/summary.json")"
