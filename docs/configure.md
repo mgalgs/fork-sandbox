@@ -8,6 +8,7 @@ anything:
 | `pi.env` | `OPENROUTER_API_KEY` — a real secret, mode 0600 |
 | `model.env` | `MODEL_ENDPOINT`, `MODEL_ID` — a local model endpoint |
 | `k8s.env` | `K8S_CONTEXT`, `K8S_NAMESPACE`, `K8S_IMAGE`, `K8S_PROXY_UPSTREAM`, `K8S_DENIED_PROBE` |
+| `coder-mode.env` | `CODER_MODE_HARNESS`, `CODER_MODE_MODEL`, `CODER_MODE_REVIEW_HARNESS`, `CODER_MODE_REVIEW_MODEL`, `CODER_MODE_REVIEW_LOOP` — the `sandbox-coder-mode` skill's launch defaults, read by the orchestrating session, not by any script; `configure` does not write it |
 
 Assembling that by hand means copying key names out of docs and typing a
 `chmod 600`. `configure` does it instead: it discovers what is already on
