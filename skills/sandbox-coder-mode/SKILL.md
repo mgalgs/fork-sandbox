@@ -44,8 +44,7 @@ launch — see **Choosing a harness and a model**.
 
 ## Stay high level (the default; `--long`)
 
-High-level operation is the mode's default, not a special tier — learned
-from a real day of use:
+High-level operation is the mode's default, not a special tier:
 
 - **The orchestrating session reads to plan, then stops reading.** It does
   not read the code a sandbox writes; it reads the run's five-line report,
@@ -150,49 +149,35 @@ question first, write the decision **and its rationale** into the handoff
 revisit it." Where a question genuinely belongs to the user, ask the user
 before launching, not the sandbox.
 
-A worked example: a round had to decide what an exit-code file should hold
-when an extra review pass had run — the coding leg's code or the review's.
-That reads like a coin flip until you notice the local equivalent already
-answers it, and matching it is what keeps the two paths analogous. The
-handoff said which, and why, and "do not revisit." The round implemented it
-correctly and left a comment explaining it to the next reader.
+Where a question has a right answer that is not obvious, give the answer
+*and* the reason in the handoff, so the implementer neither guesses nor
+re-derives it: often the local equivalent already answers it, and matching
+it is what keeps the two paths analogous.
 
 **Front-load the commit contract.** The failure mode: a round does all its
 work correctly, never commits, and the launcher fetches an empty branch and
 deletes it. The work survives only because the clone is still on disk. This
-is not hypothetical and it is not rare: one round ran 170 turns over 25
-minutes, produced complete and correct work across six files, and ended by
-*offering* to commit. Two other rounds sat at 490 and 376 tool calls with
-zero commits until nudged by hand. Two of five local-model runs never
-committed at all.
+is neither hypothetical nor rare — rounds routinely finish complete, correct
+work and then only *offer* to commit, and some never commit at all.
 
 The instruction lives in the handoff, which is read once at the start —
-hundreds of tool calls before it matters. What works: put a **commit
-contract at the very top of the handoff**, before the goal, as its own
-section; state the failure with its evidence; and give an explicit
-per-section commit sequence, so committing is a step in the plan rather
-than a virtue to remember. The next round after that change produced eight
-clean commits in sequence, in 17 minutes, for a third of the cost.
+hundreds of tool calls before it matters. So put a **commit contract at the
+very top of the handoff**, before the goal, as its own section; state the
+failure; and give an explicit per-section commit sequence, so committing is
+a step in the plan rather than a virtue to remember.
 
 While a run is in flight, `fork-sandbox-say.sh` (see **Iterating on a
 run**) can nudge a session that is accumulating work without committing.
 Watch the commit count in the monitor and use it.
 
-**Verify the run's self-report.** A finished run tells you what it did. Do
-not take it at face value. Two real cases from one day:
-
-- A run reported "nothing has been committed" while the monitor had reported
-  nine commits. Both were right about different things: the monitor was
-  counting `git commit` calls inside test scaffolds' own scratch
-  repositories, and the branch genuinely had nothing on it.
-- A run reported test counts below the stated baselines and explained the
-  gap as environmental. That claim needed re-measuring on the host, where
-  the suites are actually authoritative, before it could be believed or
-  disbelieved.
-
-Re-measure on the host. Run the suites yourself, per **Reviewing and
-integrating** step 4. Read the diffstat rather than the prose summary. The
-run's own account is a lead, not a finding.
+**Verify the run's self-report.** A finished run tells you what it did; do
+not take it at face value. Its commit count can disagree with the monitor's
+(the monitor counts `git commit` calls inside test scaffolds' own scratch
+repositories too), and a run that explains a shortfall as "environmental" is
+making a claim only the host can settle. Re-measure on the host: run the
+suites yourself, per **Reviewing and integrating** step 4, and read the
+diffstat rather than the prose summary. The run's own account is a lead, not
+a finding.
 
 **The rescue procedure.** When a run ends without committing, the work is
 still in the clone. Recover it without ever running git inside that clone
@@ -224,7 +209,7 @@ reporting:
   own summary — per **Reviewing and integrating**.
 - Quote the cost every round. It varies by an order of magnitude between
   rounds of similar size, and it is the number that decides the next
-  round's harness. One day's rounds ranged from 0.31 to 11.12 USD. The
+  round's harness. The
   default `--review-loop 2` with `--review-model opus` means up to two
   opus review legs and two sonnet fix legs on top of the coding session
   itself, so a round at the defaults can cost materially more than a
