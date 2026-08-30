@@ -24,9 +24,14 @@ goes out, and how to run several rounds without losing the thread.
 
 **Token economics.** This session can be the expensive model, because it
 spends its tokens on reading, planning, reviewing and integrating — not on
-generating the bulk of the code. The sandboxes run whatever is cheap:
-a smaller claude model, `pi` against OpenRouter, or `pi-local` against a
-self-hosted endpoint, which costs nothing at all.
+generating the bulk of the code. The typing in the sandbox runs whatever is
+cheap: a smaller claude model, `pi` against OpenRouter, or `pi-local` against
+a self-hosted endpoint, which costs nothing at all. The in-sandbox review
+leg (tier 3, see **Entering the mode**) is the deliberate exception: it runs
+the expensive model too, by default, because catching a defect before it
+ever leaves the sandbox is worth that model's price — the economics argument
+is about where the *bulk* of the tokens go, not a ban on the expensive model
+appearing in a sandbox at all.
 
 **Permissions.** The user does not want `--dangerously-skip-permissions`, or
 even auto mode, on their own box. A sandboxed run already bypasses every
@@ -556,6 +561,21 @@ file, or a key absent from it, means the default above.
 | `CODER_MODE_REVIEW_HARNESS` | `--review-harness` | unset (same as `--harness`) |
 | `CODER_MODE_REVIEW_MODEL` | `--review-model` | `opus` |
 | `CODER_MODE_REVIEW_LOOP` | `--review-loop` | `2` |
+
+The model defaults, `sonnet` and `opus`, are claude aliases — they only
+resolve when the harness is `claude`. A machine that overrides
+`CODER_MODE_HARNESS` to anything else **must** override `CODER_MODE_MODEL`
+and, if it also sets `CODER_MODE_REVIEW_HARNESS`, `CODER_MODE_REVIEW_MODEL`
+too. Nothing catches the mismatch at launch: `pi-local` takes an unresolved
+model name as-is and serves whatever the endpoint actually has behind it;
+`pi` takes it as an OpenRouter id and burns real money on 400s. Set all the
+keys for a harness together, per the pairings in the table below.
+
+Set `CODER_MODE_REVIEW_LOOP` to `0` to mean: omit `--review-model` and
+`--review-loop` from the launch entirely — no in-sandbox reviewer. That is
+the same state `fork-sandbox.sh` itself defaults to when neither flag is
+passed; it is not the same as writing `--review-loop 0` on the command
+line, which the script refuses.
 
 No script reads this file — `fork-sandbox.sh` itself has no idea it exists.
 Reading it is this session's job, done once per **Entering the mode**,

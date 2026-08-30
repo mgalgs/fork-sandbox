@@ -14,7 +14,8 @@ Assembling that by hand means copying key names out of docs and typing a
 `chmod 600`. `configure` does it instead: it discovers what is already on
 this machine — an `OPENROUTER_API_KEY` in your environment, a local model
 endpoint, a kubectl context — shows you what it found, and writes the
-pieces you pick into the files above.
+pieces you pick into the files above, **except `coder-mode.env`**, which
+has no discoverer and is never a `configure` target — see the row above.
 
 ```
 fork-sandbox.sh configure [--remove] [--all] [--dry-run]
@@ -58,9 +59,12 @@ fork-sandbox.sh configure --remove
 
 Same picker, run against what is *currently set* instead of what a
 discoverer found: every allowlisted key that has a value in your config
-files, shown the same way (a secret masked, a plain value in full). Pick
-what to take back out. Since this deletes rather than adds, an interactive
-run asks for one more `y/N` confirmation before it writes anything.
+files, shown the same way (a secret masked, a plain value in full). This
+never includes `coder-mode.env`'s keys — they are not on the allowlist, so
+`--remove` cannot offer them; edit that file by hand to change or clear
+them. Pick what to take back out. Since this deletes rather than adds, an
+interactive run asks for one more `y/N` confirmation before it writes
+anything.
 Removing the last key from a file leaves the (possibly empty) file in
 place — deleting a file you may have hand-commented would be a surprise,
 not a convenience.
