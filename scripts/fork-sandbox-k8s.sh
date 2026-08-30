@@ -4,10 +4,12 @@
 # Usage: fork-sandbox-k8s.sh install [--dry-run]
 #        fork-sandbox-k8s.sh submit [--dry-run] --branch NAME --model MODEL
 #                            [--review-loop N] [--outbox-max SIZE]
+#                            [--context-ro DIR]
 #                            <project-path> <handoff-file>
 #        fork-sandbox-k8s.sh run [--dry-run] [--timeout SECONDS] [--keep]
 #                            --branch NAME --model MODEL [--review-loop N]
 #                            [--outbox-dir DIR] [--outbox-max SIZE]
+#                            [--context-ro DIR]
 #                            <project-path> <handoff-file>
 #        fork-sandbox-k8s.sh fetch --branch NAME <project-path>
 #        fork-sandbox-k8s.sh say --branch NAME <text>
@@ -108,6 +110,25 @@
 # the CODING leg's regardless of how the loop ended -- see
 # fork-sandbox-k8s-entrypoint.sh's comment on .run-complete for why. See
 # docs/kubernetes-runs.md for the full design.
+#
+# --context-ro DIR (submit, run): push DIR into the pod at /work/context,
+# read-only by convention, over the same gated kubectl-exec channel the
+# repository push uses -- after the repository, before the
+# .inputs-complete sentinel, so a failure here fails the run closed rather
+# than leaving a half-received context directory for the agent to find.
+# DIR must be a real directory under /var/tmp/claude-scratch/forks/, the
+# same rule fork-sandbox.sh's own local --context-ro applies to its
+# --bind-ro -- a blanket-approved script must not be pointable at an
+# arbitrary host directory. Capped at a fixed 256 MiB, checked twice,
+# independently: on the host before anything is pushed
+# (fork-sandbox-k8s.sh itself), and again pod-side by
+# fork-sandbox-k8s-context-extract.sh before it extracts anything -- no
+# --context-max flag, since a context directory is gathered notes and
+# small caches, not a size nobody has needed to raise yet. Unlike the local
+# flag's real --bind-ro, an emptyDir cannot be bound read-only per
+# subdirectory, so read-only here is enforced by the prompt text the agent
+# reads (a `## Gathered context` section appended to handoff.md), not by
+# the filesystem.
 #
 # Cluster-specific settings are never taken from this repo -- a public repo
 # must not carry a private hostname, a real cluster name or a registry
@@ -256,6 +277,24 @@ POD_INBOX_DIR=/work/inbox
 # own outbox_dir. Read by cmd_submit (to tell the preamble where to point the
 # agent) and cmd_run (to know where to pull artifacts back from).
 POD_OUTBOX_DIR=/work/outbox
+
+# The pod's gathered-context directory, populated from a --context-ro
+# push. Same sibling-of-clone reasoning as POD_INBOX_DIR and POD_OUTBOX_DIR
+# above -- it lives in the `work` emptyDir but must stay outside the clone
+# so the entrypoint's `git add -A` never sweeps it into a commit. Unlike
+# those two, read only by cmd_submit -- to tell the preamble where to point
+# the agent, and to push into -- since nothing else (cmd_say, cmd_run) ever
+# touches it.
+POD_CONTEXT_DIR=/work/context
+
+# The pod-side context-extract.sh cap: 256 MiB, fixed. A context directory
+# is gathered notes and small caches, not build artifacts or datasets, so
+# this has no --context-max flag -- see docs/kubernetes-runs.md. A second,
+# independent literal lives in fork-sandbox-k8s-context-extract.sh's own
+# body, the same way FS_OUTBOX_MAX_BYTES and outbox-extract.sh's default
+# are two literals rather than one threaded value: this script and the pod
+# script never share a sourced constant.
+CONTEXT_MAX_BYTES=$((256 * 1024 * 1024))
 
 # The identical resolution rule fs_resolve_backend uses for
 # sandbox-backend-<name>, applied to the platform plugin: PATH first, then
@@ -433,6 +472,28 @@ render_review_loop_env() {
 ENV
 }
 
+# The --context-ro-only handoff.md section, appended after the shared
+# preamble and before the operator's own handoff text -- see cmd_submit's
+# handoff.md rendering below. Not folded into fs_emit_prompt_preamble
+# itself: that function is shared with the local --context-ro flag, which
+# binds the directory at its own host path and needs no section like this
+# one, since the handoff author already knows that path. A pod's path
+# differs from the host path the caller named, so this names it instead.
+render_context_section() {
+    local pod_context_dir="$1"
+    cat <<EOF
+
+## Gathered context
+
+The directory named with \`--context-ro\` on the host is at:
+
+    $pod_context_dir
+
+here, read-only by convention. Do not write to it and do not copy it into
+the clone.
+EOF
+}
+
 cmd_install() {
     local dry_run=false
     while (( $# )); do
@@ -516,6 +577,7 @@ cmd_install() {
 
 cmd_submit() {
     local dry_run=false branch="" model="" review_loop_cap="" outbox_max_arg=""
+    local context_ro=""
     while (( $# )); do
         case "$1" in
             --dry-run) dry_run=true; shift ;;
@@ -523,6 +585,7 @@ cmd_submit() {
             --model) model="${2:?--model requires an OpenRouter model id}"; shift 2 ;;
             --review-loop) review_loop_cap="${2:?--review-loop requires a positive integer}"; shift 2 ;;
             --outbox-max) outbox_max_arg="${2:?--outbox-max requires a size}"; shift 2 ;;
+            --context-ro) context_ro="${2:?--context-ro requires a directory}"; shift 2 ;;
             -*) echo "Error: unknown option '$1' for submit." >&2; exit 1 ;;
             *) break ;;
         esac
@@ -553,6 +616,34 @@ cmd_submit() {
     local outbox_max_bytes="$FS_OUTBOX_MAX_BYTES"
     if [[ -n "$outbox_max_arg" ]]; then
         outbox_max_bytes="$(fs_parse_size_bytes "$outbox_max_arg")" || exit 1
+    fi
+
+    # The same rule fork-sandbox.sh's own local --context-ro flag applies to
+    # its --bind-ro (scripts/fork-sandbox.sh, around the FS_REALPATH check
+    # near its argument validation): the directory's real path must be
+    # under /var/tmp/claude-scratch/forks/, and it must exist. A
+    # blanket-approved script must not be pointable at an arbitrary host
+    # directory (~/.ssh, say) to ship it into a pod. Checked here, ahead of
+    # --dry-run's early exit below, so a bad path is refused with no
+    # cluster involved -- the size cap, which needs an actual tar of the
+    # directory, is checked later, alongside the real push, which --dry-run
+    # never reaches.
+    if [[ -n "$context_ro" ]]; then
+        local context_ro_real
+        context_ro_real="$("$FS_REALPATH" -m "$context_ro")"
+        if [[ "$context_ro_real" != /var/tmp/claude-scratch/forks/* ]]; then
+            echo "Error: --context-ro must name a directory under" >&2
+            echo "/var/tmp/claude-scratch/forks/ — got '$context_ro_real'. The" >&2
+            echo "pod reads it after it is pushed, so which paths may be" >&2
+            echo "handed to a pod this way is a security boundary. Stage the" >&2
+            echo "context in a mktemp directory there and rerun." >&2
+            exit 1
+        fi
+        if [[ ! -d "$context_ro_real" ]]; then
+            echo "Error: --context-ro directory '$context_ro_real' does not exist." >&2
+            exit 1
+        fi
+        context_ro="$context_ro_real"
     fi
 
     if [[ ! -d "$project_path" ]]; then
@@ -630,7 +721,8 @@ cmd_submit() {
     local entrypoint_sh="$script_dir/fork-sandbox-k8s-entrypoint.sh"
     local gate_sh="$script_dir/fork-sandbox-k8s-egress-gate.sh"
     local inbox_write_sh="$script_dir/fork-sandbox-k8s-inbox-write.sh"
-    for f in "$entrypoint_sh" "$gate_sh" "$inbox_write_sh" "$review_loop_sh"; do
+    local context_extract_sh="$script_dir/fork-sandbox-k8s-context-extract.sh"
+    for f in "$entrypoint_sh" "$gate_sh" "$inbox_write_sh" "$review_loop_sh" "$context_extract_sh"; do
         [[ -x "$f" ]] || { echo "Error: $f is missing or not executable." >&2; exit 1; }
     done
 
@@ -675,9 +767,12 @@ $(indent_block < "$entrypoint_sh")
 $(indent_block < "$gate_sh")
   inbox-write.sh: |
 $(indent_block < "$inbox_write_sh")
+  context-extract.sh: |
+$(indent_block < "$context_extract_sh")
   handoff.md: |
 $({ fs_emit_prompt_preamble "$pod_clone_dir" "$POD_INBOX_DIR" pi gated "$POD_OUTBOX_DIR" pod \
        "$outbox_max_bytes"
+   [[ -n "$context_ro" ]] && render_context_section "$POD_CONTEXT_DIR"
    printf '\n---\n\n'
    cat -- "$handoff_file"; } | indent_block)${review_loop_configmap_keys}
 ---
@@ -821,6 +916,31 @@ EOF
         "ext::kubectl --context=$K8S_CONTEXT -n $K8S_NAMESPACE exec -i $pod_name -- git-receive-pack /work/repo.git" \
         "HEAD:refs/heads/$branch")
 
+    # Pushed after the repository, before the sentinel below -- a failure
+    # here fails submit before /work/.inputs-complete exists, so the pod
+    # fails closed on its INPUTS_TIMEOUT exactly as it does for a client
+    # that died mid-push. Spooled to a temp file first (rather than piping
+    # `tar cf -` straight into the exec) so the cap below is checked before
+    # any of it reaches the pod; kubectl exec -i, never -t, for the same
+    # binary-stream reason as the repository push above.
+    if [[ -n "$context_ro" ]]; then
+        echo "fork-sandbox-k8s: pushing context ($context_ro) to pod $pod_name" >&2
+        local context_tar context_size
+        context_tar="$(mktemp)"
+        tar cf "$context_tar" -C "$context_ro" .
+        context_size="$(stat -c '%s' -- "$context_tar")"
+        if (( context_size > CONTEXT_MAX_BYTES )); then
+            rm -f -- "$context_tar"
+            echo "Error: --context-ro directory '$context_ro' tars to" >&2
+            echo "$context_size bytes, over the $CONTEXT_MAX_BYTES byte" >&2
+            echo "(256 MiB) cap." >&2
+            exit 1
+        fi
+        kubectl exec -i "$pod_name" -- sh /mnt/fork-sandbox/context-extract.sh \
+            "$POD_CONTEXT_DIR" "$CONTEXT_MAX_BYTES" < "$context_tar"
+        rm -f -- "$context_tar"
+    fi
+
     kubectl exec "$pod_name" -- sh -c 'touch /work/.inputs-complete'
 
     echo "fork-sandbox-k8s: submitted. branch=$branch pod=$pod_name" >&2
@@ -961,7 +1081,7 @@ cmd_rm() {
 # failure handling.
 cmd_run() {
     local dry_run=false keep=false timeout=3600 branch="" model="" review_loop_cap=""
-    local outbox_dir="" outbox_max_arg=""
+    local outbox_dir="" outbox_max_arg="" context_ro=""
     while (( $# )); do
         case "$1" in
             --dry-run) dry_run=true; shift ;;
@@ -972,6 +1092,7 @@ cmd_run() {
             --review-loop) review_loop_cap="${2:?--review-loop requires a positive integer}"; shift 2 ;;
             --outbox-dir) outbox_dir="${2:?--outbox-dir requires a path}"; shift 2 ;;
             --outbox-max) outbox_max_arg="${2:?--outbox-max requires a size}"; shift 2 ;;
+            --context-ro) context_ro="${2:?--context-ro requires a directory}"; shift 2 ;;
             -*) echo "Error: unknown option '$1' for run." >&2; exit 1 ;;
             *) break ;;
         esac
@@ -1006,6 +1127,7 @@ cmd_run() {
     # into "no loop" the way an `(( review_loop_cap > 0 ))` gate would.
     [[ -n "$review_loop_cap" ]] && submit_argv+=(--review-loop "$review_loop_cap")
     [[ -n "$outbox_max_arg" ]] && submit_argv+=(--outbox-max "$outbox_max_arg")
+    [[ -n "$context_ro" ]] && submit_argv+=(--context-ro "$context_ro")
     submit_argv+=("$project_path" "$handoff_file")
 
     # cmd_submit does its own full validation (K8S_IMAGE, K8S_DENIED_PROBE,

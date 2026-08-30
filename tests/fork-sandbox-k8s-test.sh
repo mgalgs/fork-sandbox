@@ -87,6 +87,17 @@
 #     bare-repo/push/symbolic-ref/clone sequence confirms the property the
 #     fix relies on: no "nonexistent ref" warning, and the clone's HEAD is
 #     the pushed branch.
+#   - `--context-ro DIR` on both submit and run, under --dry-run: the
+#     context-extract.sh ConfigMap key ships unconditionally (like
+#     inbox-write.sh), but the `## Gathered context` handoff.md section
+#     naming /work/context renders only with the flag; a directory outside
+#     /var/tmp/claude-scratch/forks/ and a directory that does not exist
+#     are both refused by name before any kubectl call; run --dry-run
+#     forwards the flag and renders byte-for-byte the same YAML submit
+#     --dry-run does. fork-sandbox-k8s-context-extract.sh's own extraction
+#     guards (well-formed, absolute path, `..`, symlink, hard link,
+#     over-cap, an existing DEST_DIR) are covered in its own section above,
+#     the pod-side half of this same mechanism.
 #
 # This lives in tests/ rather than scripts/tests/ on purpose: install.sh
 # iterates scripts/* and runs `sed -n 2p` on each entry to build the
@@ -785,6 +796,94 @@ for verb in run say; do
         no "usage() mentions $verb" "not found in --help output"
     fi
 done
+
+printf '\n== fork-sandbox-k8s.sh submit/run --dry-run --context-ro ==\n'
+# --context-ro pushes a directory into the pod at /work/context over the
+# same gated channel the repository push uses -- see
+# docs/kubernetes-runs.md's "Getting files in" section. All of this is
+# checked under --dry-run, which touches no kubectl and no cluster: the
+# path-under-/var/tmp/claude-scratch/forks/ and directory-exists checks run
+# before --dry-run's early exit, and the ConfigMap key / prompt section are
+# both computed as part of the same rendered YAML --dry-run prints.
+cr_dir="$(mktemp -d /var/tmp/claude-scratch/forks/fs-k8s-test-cr.XXXXXX)"; tmpdirs+=("$cr_dir")
+printf 'gathered notes\n' > "$cr_dir/notes.md"
+
+cr_submit_out="$(newdir)/cr-submit.yaml"; tmpdirs+=("$(dirname "$cr_submit_out")")
+if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-cr-branch --model moonshotai/kimi-k3 --context-ro "$cr_dir" \
+    "$proj_dir" "$handoff_file" > "$cr_submit_out" 2>/tmp/fs-k8s-test-cr-submit.err; then
+    ok "submit --dry-run --context-ro exits 0"
+else
+    no "submit --dry-run --context-ro exits 0" "$(cat /tmp/fs-k8s-test-cr-submit.err)"
+fi
+rm -f /tmp/fs-k8s-test-cr-submit.err
+
+if grep -q '^  context-extract.sh: |$' "$cr_submit_out"; then
+    ok "submit --context-ro renders the context-extract.sh ConfigMap key"
+else
+    no "submit --context-ro renders the context-extract.sh ConfigMap key" "not found in $cr_submit_out"
+fi
+if grep -q '## Gathered context' "$cr_submit_out"; then
+    ok "submit --context-ro renders the Gathered context section"
+else
+    no "submit --context-ro renders the Gathered context section" "not found in $cr_submit_out"
+fi
+if grep -q '/work/context' "$cr_submit_out"; then
+    ok "submit --context-ro names the pod's context path"
+else
+    no "submit --context-ro names the pod's context path" "not found in $cr_submit_out"
+fi
+
+# The context-extract.sh ConfigMap key ships unconditionally, the same way
+# inbox-write.sh does even on a run where `say` is never used -- small,
+# cheap, and simpler than a second conditionally-rendered key. Only the
+# prompt section is conditional on the flag. Reuses submit_out from the
+# earlier fixture-config dry-run section above, which was rendered with no
+# --context-ro at all.
+if grep -q '^  context-extract.sh: |$' "$submit_out"; then
+    ok "submit without --context-ro still renders the context-extract.sh ConfigMap key"
+else
+    no "submit without --context-ro still renders the context-extract.sh ConfigMap key" \
+        "not found in $submit_out"
+fi
+if grep -q '## Gathered context' "$submit_out"; then
+    no "submit without --context-ro renders no Gathered context section" \
+        "found in $submit_out"
+else
+    ok "submit without --context-ro renders no Gathered context section"
+fi
+
+# A path outside the allowed root is refused by name, before any kubectl call.
+cr_outside="$(mktemp -d)"; tmpdirs+=("$cr_outside")
+refuses "submit --context-ro outside /var/tmp/claude-scratch/forks/ is refused" \
+    "--context-ro must name a directory under" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-cr-bad --model moonshotai/kimi-k3 --context-ro "$cr_outside" \
+    "$proj_dir" "$handoff_file"
+
+# A missing directory is refused, even though its name is under the
+# allowed root.
+refuses "submit --context-ro on a missing directory is refused" \
+    "does not exist" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-cr-missing --model moonshotai/kimi-k3 \
+    --context-ro /var/tmp/claude-scratch/forks/fs-k8s-test-cr-missing-xyz \
+    "$proj_dir" "$handoff_file"
+
+# `run --dry-run --context-ro` forwards to submit rather than growing its
+# own divergent copy -- same property --outbox-max's own run/submit pair
+# already proves above, applied to this flag.
+cr_run_out="$(newdir)/cr-run.yaml"; tmpdirs+=("$(dirname "$cr_run_out")")
+if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" run --dry-run \
+    --branch fs-k8s-test-cr-branch --model moonshotai/kimi-k3 --context-ro "$cr_dir" \
+    "$proj_dir" "$handoff_file" > "$cr_run_out" 2>/tmp/fs-k8s-test-cr-run.err; then
+    ok "run --dry-run --context-ro exits 0"
+else
+    no "run --dry-run --context-ro exits 0" "$(cat /tmp/fs-k8s-test-cr-run.err)"
+fi
+rm -f /tmp/fs-k8s-test-cr-run.err
+check "run --dry-run --context-ro renders byte-for-byte the same as submit --dry-run --context-ro" \
+    "$(cat "$cr_submit_out")" "$(cat "$cr_run_out")"
 
 printf '\n== fork-sandbox-k8s.sh say: argument validation (no cluster) ==\n'
 # Every one of these is rejected before cmd_say ever calls kubectl, so all

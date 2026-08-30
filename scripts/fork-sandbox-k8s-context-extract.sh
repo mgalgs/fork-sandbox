@@ -60,7 +60,7 @@ cat > "$tar_file"
 
 size="$(stat -c '%s' -- "$tar_file")"
 if [ "$size" -gt "$max_bytes" ]; then
-    echo "fork-sandbox-k8s-context-extract: pushed context is $size bytes, over the $max_bytes byte cap; refusing it." >&2
+    echo "context-extract: $size bytes, over $max_bytes byte cap; refusing it." >&2
     exit 1
 fi
 
@@ -93,7 +93,7 @@ tar -tvf "$tar_file" > "$tvf_out"
 while IFS= read -r line; do
     case "$line" in
         l*|*" link to "*)
-            echo "fork-sandbox-k8s-context-extract: the pushed context contains a link entry ('$line'); refusing the whole archive." >&2
+            echo "context-extract: contains a link entry; refusing the whole archive." >&2
             exit 1
             ;;
     esac
@@ -103,11 +103,11 @@ tar -tf "$tar_file" > "$tf_out"
 while IFS= read -r path; do
     case "$path" in
         /*)
-            echo "fork-sandbox-k8s-context-extract: the pushed context contains an absolute path ('$path'); refusing the whole archive." >&2
+            echo "context-extract: contains an absolute path; refusing the whole archive." >&2
             exit 1
             ;;
         ..|../*|*/..|*/../*)
-            echo "fork-sandbox-k8s-context-extract: the pushed context contains a '..' path component ('$path'); refusing the whole archive." >&2
+            echo "context-extract: contains a '..' path component; refusing archive." >&2
             exit 1
             ;;
     esac
