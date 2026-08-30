@@ -36,12 +36,16 @@
 # individual entry looks unsafe on its own. Listing and rejecting symlinks
 # up front closes that regardless of what the extracting tar binary does.
 #
-# Unlike fork-sandbox-k8s-outbox-extract.sh, which takes a tar FILE PATH as
-# $1 because it runs on the host after the host has already pulled the
-# stream down, this script is fed the tar directly on stdin -- it is what
-# `kubectl exec -i POD -- sh .../context-extract.sh DEST MAX_BYTES` runs
-# with `submit`'s spooled tar piped in, so the byte-cap check below has to
-# spool stdin to a temp file first rather than stat a file it was handed.
+# This is the one implementation of that guard: fork-sandbox-k8s-outbox-extract.sh
+# is a thin bash wrapper around this script, adapting its own TAR_FILE
+# argument and 64 MiB default cap onto this script's DEST_DIR/MAX_BYTES
+# stdin interface, rather than keeping a second copy of the guard in sync
+# by hand. This script itself is fed the tar directly on stdin -- it is
+# what `kubectl exec -i POD -- sh .../context-extract.sh DEST MAX_BYTES`
+# runs with `submit`'s spooled tar piped in, so the byte-cap check below
+# has to spool stdin to a temp file first rather than stat a file it was
+# handed; outbox-extract.sh's own wrapper redirects its TAR_FILE argument
+# onto this script's stdin to get the same behavior from a file path.
 #
 # Written as a standalone POSIX sh script, not bash: like
 # fork-sandbox-k8s-inbox-write.sh, this runs inside the pod's image, mounted
