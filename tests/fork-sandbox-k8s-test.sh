@@ -1666,12 +1666,32 @@ refuses "--k8s --pi-args is refused as not yet supported" \
     env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
     --harness pi --model moonshotai/kimi-k3 --pi-args "--thinking low" \
     unused-project unused-handoff
-refuses "--k8s --context-ro is refused as not yet supported" \
-    "--context-ro is not yet supported with --k8s" \
-    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
+# --context-ro is carried through, not refused -- fork-sandbox-k8s.sh's own
+# submit applies the directory-under-/var/tmp/claude-scratch/forks/,
+# no-symlinks, 256 MiB constraints itself, so the fixture below needs a real
+# directory satisfying those, the same way k8s_flag_proj/k8s_flag_handoff
+# above stand in for --dry-run's own post-flag-parse validation.
+k8s_flag_cr_dir="$(mktemp -d /var/tmp/claude-scratch/forks/fs-k8s-flag-test-cr.XXXXXX)"
+tmpdirs+=("$k8s_flag_cr_dir")
+printf 'gathered notes\n' > "$k8s_flag_cr_dir/notes.md"
+if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
     --harness pi --model moonshotai/kimi-k3 \
-    --context-ro /var/tmp/claude-scratch/forks/somewhere \
-    unused-project unused-handoff
+    --context-ro "$k8s_flag_cr_dir" \
+    --branch fs-k8s-flag-test-cr-branch \
+    "$k8s_flag_proj" "$k8s_flag_handoff" \
+    > /tmp/fs-k8s-flag-test-cr.yaml 2>/tmp/fs-k8s-flag-test-cr.err; then
+    ok "--k8s --context-ro --dry-run is no longer refused"
+else
+    no "--k8s --context-ro --dry-run is no longer refused" \
+        "$(cat /tmp/fs-k8s-flag-test-cr.err)"
+fi
+if grep -q '## Gathered context' /tmp/fs-k8s-flag-test-cr.yaml; then
+    ok "--k8s --context-ro --dry-run forwards the flag to fork-sandbox-k8s.sh"
+else
+    no "--k8s --context-ro --dry-run forwards the flag to fork-sandbox-k8s.sh" \
+        "not found in /tmp/fs-k8s-flag-test-cr.yaml"
+fi
+rm -f /tmp/fs-k8s-flag-test-cr.err /tmp/fs-k8s-flag-test-cr.yaml
 refuses "--k8s --task-meta is refused as not yet supported" \
     "--task-meta is not yet supported with --k8s" \
     env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \

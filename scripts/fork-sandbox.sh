@@ -413,7 +413,7 @@
 # cluster run: they describe local-sandbox machinery -- bubblewrap, per-run
 # docker-compose services, the detached tmux session -- that a Kubernetes pod
 # has no equivalent of, or they describe a real capability (--checkout,
-# --context-ro, --prompts-dir, --pi-args, --task-meta) the cluster path has
+# --prompts-dir, --pi-args, --task-meta) the cluster path has
 # not been built to carry yet. --k8s refuses each of these by name instead of
 # accepting and dropping it: an operator who thinks a refused flag did
 # something, when a k8s run silently ignored it, has no way to notice from
@@ -428,6 +428,14 @@
 # the review leg has nowhere to be declared yet. --review-harness stays
 # refused for the same underlying reason: the pod runs pi against the model
 # proxy and nothing else, so a second harness has nowhere to run.
+#
+# --context-ro is the other capability that IS carried: --k8s forwards it to
+# fork-sandbox-k8s.sh run, which threads it to cmd_submit the same way a
+# local run's own --context-ro reaches the sandbox -- see 'Getting files in'
+# in docs/kubernetes-runs.md. cmd_submit applies the same directory-under-
+# /var/tmp/claude-scratch/forks/, no-symlinks, 256 MiB constraints itself, so
+# there is nothing left for this script's own local-path check, below, to
+# duplicate for a --k8s run -- it never reaches that check at all.
 #
 # One gap is not a refused flag, because no flag controls it: a --k8s run
 # never appends to the durable run log described below
@@ -1468,12 +1476,6 @@ if [[ "$k8s_mode" == true ]]; then
         echo "arguments into the pod." >&2
         exit 1
     fi
-    if [[ -n "$context_ro" ]]; then
-        echo "Error: --context-ro is not yet supported with --k8s. There is no" >&2
-        echo "bind-in mechanism for gathered context on the cluster path yet --" >&2
-        echo "see 'Getting files in' in docs/kubernetes-runs.md." >&2
-        exit 1
-    fi
     if [[ -n "$task_meta" ]]; then
         echo "Error: --task-meta is not yet supported with --k8s. It is folded" >&2
         echo "into the local run log, and a --k8s run does not append to that" >&2
@@ -1550,6 +1552,7 @@ if [[ "$k8s_mode" == true ]]; then
     # truth per process rather than a cross-process byte count to keep in
     # sync.
     [[ -n "$outbox_max_arg" ]] && k8s_argv+=(--outbox-max "$outbox_max_arg")
+    [[ -n "$context_ro" ]] && k8s_argv+=(--context-ro "$context_ro")
     k8s_argv+=(--branch "$branch" --model "$model" "$project_path" "$handoff_file")
 
     exec "$script_dir/fork-sandbox-k8s.sh" "${k8s_argv[@]}"

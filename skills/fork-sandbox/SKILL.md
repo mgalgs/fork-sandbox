@@ -428,7 +428,8 @@ What it cannot do yet, and why saying so matters: a flag this path cannot honor 
 - **No steering.** There is no cluster equivalent of `fork-sandbox-say.sh` and the operator inbox — nothing reaches a running pod after submission, so get the handoff right before launching.
 - **No run-log entry.** A local run appends cost, tokens and outcome to `~/.claude/sandbox-runs.jsonl`; a `--k8s` run does not, so `--task-meta` — which exists to be folded into that log — is refused too.
 - **`--sandbox-args` and `--claude-args` are refused** for the same reason as always: no bubblewrap and no claude CLI exist on this path to pass flags to.
-- **`--checkout`, `--context-ro`, `--pi-args` and `--prompts-dir` are refused as not-yet-built**, not as permanently unsupported — each names a real capability the cluster path has not been wired up to carry yet.
+- **`--checkout`, `--pi-args` and `--prompts-dir` are refused as not-yet-built**, not as permanently unsupported — each names a real capability the cluster path has not been wired up to carry yet.
+- **`--context-ro <dir>` IS built**: `--k8s` forwards it into the pod, same as a local run — `dir` must be under `/var/tmp/claude-scratch/forks/`, contain no symlinks, and is capped at 256 MiB.
 
 ## What the calling session must not do
 
