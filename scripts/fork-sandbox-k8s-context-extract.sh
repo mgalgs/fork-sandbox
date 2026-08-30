@@ -14,8 +14,11 @@
 # reach, and the whole containment story of this project would leak out
 # through this one convenience if it were done naively. So, in order:
 #
-#   1. Refuse the stream outright if it is over a fixed size cap, rather
-#      than extracting an unbounded amount of data into the pod.
+#   1. Spool stdin to a temp file capped at one byte over the size limit
+#      (`head -c $((max_bytes + 1))`), and refuse if the spooled file is
+#      over the cap -- rather than buffering the whole stream, however
+#      large, before anything checks it. /tmp is an emptyDir with no
+#      sizeLimit of its own, so nothing else bounds this spool.
 #   2. List every entry (`tar -tvf`) BEFORE extracting anything, and reject
 #      the whole archive -- no partial extraction -- if any entry is an
 #      absolute path, contains a `..` path component, or is a symlink or
@@ -56,7 +59,7 @@ tvf_out="$(mktemp)"
 tf_out="$(mktemp)"
 trap 'rm -f "$tar_file" "$tvf_out" "$tf_out"' EXIT
 
-cat > "$tar_file"
+head -c "$((max_bytes + 1))" > "$tar_file"
 
 size="$(stat -c '%s' -- "$tar_file")"
 if [ "$size" -gt "$max_bytes" ]; then
