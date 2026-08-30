@@ -671,7 +671,11 @@ its bind, and it is capped at a fixed 256 MiB — no `--context-max` flag,
 since gathered context is notes and small caches, not a size anyone has
 needed to raise — checked twice, independently: on the host before
 anything is pushed, and again by the pod-side extractor before it extracts
-anything.
+anything, against its own literal 256 MiB cap rather than trusting the
+byte count the host passes it. The pod-side cap is
+`min(passed value, its own literal)`, so a host that somehow passed a
+larger number could only lower the effective cap, never raise it past
+the pod's own limit.
 
 A run that needs something larger or more specific still than one pushed
 directory — a general "hand the pod any host path" mechanism, or a

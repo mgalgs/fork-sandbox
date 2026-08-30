@@ -48,11 +48,26 @@
 # from the per-run scripts ConfigMap, not on the host where GNU bash is
 # already required. It can also be driven directly by a test, against a
 # fixture tarball on stdin, with no cluster and no kubectl involved.
+#
+# MAX_BYTES is a threaded value, not this script's only cap: a caller
+# passing a huge number must not be able to talk this script into
+# accepting more than LITERAL_MAX_BYTES below, the independent literal
+# fork-sandbox-k8s.sh's own CONTEXT_MAX_BYTES is checked against on the
+# host -- two literals, not one shared constant, the same way
+# FS_OUTBOX_MAX_BYTES and outbox-extract.sh's default are two literals
+# rather than one threaded value. The effective cap is
+# min(MAX_BYTES, LITERAL_MAX_BYTES): a caller may lower it, never raise it.
 
 set -eu
 
 dest_dir="${1:?usage: fork-sandbox-k8s-context-extract.sh DEST_DIR MAX_BYTES}"
 max_bytes="${2:?usage: fork-sandbox-k8s-context-extract.sh DEST_DIR MAX_BYTES}"
+
+# 256 MiB, matching fork-sandbox-k8s.sh's own CONTEXT_MAX_BYTES.
+literal_max_bytes=$((256 * 1024 * 1024))
+if [ "$max_bytes" -gt "$literal_max_bytes" ]; then
+    max_bytes="$literal_max_bytes"
+fi
 
 tar_file="$(mktemp)"
 tvf_out="$(mktemp)"
