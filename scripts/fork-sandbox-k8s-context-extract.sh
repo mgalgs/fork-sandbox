@@ -3,7 +3,7 @@
 # directory pushed into a pod, invoked by fork-sandbox-k8s.sh's `submit`
 # verb over `kubectl exec -i`, with the tar stream on stdin.
 #
-# Usage: fork-sandbox-k8s-context-extract.sh DEST_DIR MAX_BYTES   (tar on stdin)
+# Usage: fork-sandbox-k8s-context-extract.sh DEST_DIR MAX_BYTES [CALLER]   (tar on stdin)
 #
 # Untarring a stream from an untrusted client onto the pod's filesystem is a
 # path-traversal sink, exactly like fork-sandbox-k8s-outbox-extract.sh's own
@@ -39,14 +39,14 @@
 # This is the one implementation of that guard: fork-sandbox-k8s-outbox-extract.sh
 # is a thin bash wrapper around this script, adapting its own TAR_FILE
 # argument and 64 MiB default cap onto this script's DEST_DIR/MAX_BYTES
-# interface via the FS_EXTRACT_* env vars below, rather than keeping a
-# second copy of the guard in sync by hand. This script itself is normally
-# fed the tar directly on stdin -- it is what
-# `kubectl exec -i POD -- sh .../context-extract.sh DEST MAX_BYTES` runs
-# with `submit`'s spooled tar piped in, so the byte-cap check below spools
-# stdin to a temp file first by default, since a pipe cannot be `stat`ed in
-# place; a caller that already has the tar as a file on disk, like
-# outbox-extract.sh, sets FS_EXTRACT_INPUT_FILE to skip that copy instead.
+# interface, rather than keeping a second copy of the guard in sync by
+# hand. This script itself is normally fed the tar directly on stdin -- it
+# is what `kubectl exec -i POD -- sh .../context-extract.sh DEST MAX_BYTES`
+# runs with `submit`'s spooled tar piped in, so the byte-cap check below
+# spools stdin to a temp file first by default, since a pipe cannot be
+# `stat`ed in place; a caller that already has the tar as a file on disk,
+# like outbox-extract.sh, sets FS_EXTRACT_INPUT_FILE to skip that copy
+# instead.
 #
 # Written as a standalone POSIX sh script, not bash: like
 # fork-sandbox-k8s-inbox-write.sh, this runs inside the pod's image, mounted
@@ -54,35 +54,49 @@
 # already required. It can also be driven directly by a test, against a
 # fixture tarball on stdin, with no cluster and no kubectl involved.
 #
-# MAX_BYTES is a threaded value, not this script's only cap: a caller
-# passing a huge number must not be able to talk this script into accepting
-# more than FS_EXTRACT_LITERAL_MAX_BYTES below, which defaults to 256 MiB --
-# the independent literal fork-sandbox-k8s.sh's own CONTEXT_MAX_BYTES is
-# checked against on the host for the --context-ro path, which never
-# overrides the env var and so gets that 256 MiB ceiling. The effective cap
-# is min(MAX_BYTES, FS_EXTRACT_LITERAL_MAX_BYTES): a caller may lower it,
-# never raise it above the ceiling in force for that caller.
+# MAX_BYTES is a threaded value, not this script's only cap on the
+# --context-ro path: this script also holds a 256 MiB literal of its own,
+# and MAX_BYTES can only lower the effective cap below that, never raise it
+# past it. That literal is a guardrail against a mistaken MAX_BYTES
+# argument, not a boundary against a hostile caller -- a party able to
+# choose what this script is invoked with, over kubectl exec or otherwise,
+# already has the run of the pod and does not need to talk this script into
+# a bigger number. So the choice of literal is keyed on CALLER (the third
+# argument, defaulting to "context"), a fixed table lives in this script,
+# and CALLER is always passed on argv, never read from the environment --
+# an inherited environment variable can carry a stray value into an
+# invocation nobody meant it for, and argv cannot.
 #
-# fork-sandbox-k8s-outbox-extract.sh's own --outbox-max is documented as
-# having no upper ceiling, so it overrides FS_EXTRACT_LITERAL_MAX_BYTES to
-# its own MAX_BYTES -- making the clamp a no-op -- rather than inheriting
-# the 256 MiB meant for --context-ro. It also sets FS_EXTRACT_LABEL so a
-# rejection here is attributed to the caller that actually ran, not always
-# to "context-extract", and FS_EXTRACT_INPUT_FILE so a tar it already has on
-# disk is read in place instead of spooled through a second temp file.
+#   context (default) -- fork-sandbox-k8s.sh's --context-ro push, over the
+#     kubectl-exec/stdin channel: 256 MiB, matching its own CONTEXT_MAX_BYTES.
+#   outbox -- fork-sandbox-k8s-outbox-extract.sh's own wrapper, which runs
+#     entirely on the host against a tar already on disk (FS_EXTRACT_INPUT_FILE):
+#     no ceiling, since --outbox-max is documented as having none.
 
 set -eu
 
-dest_dir="${1:?usage: fork-sandbox-k8s-context-extract.sh DEST_DIR MAX_BYTES}"
-max_bytes="${2:?usage: fork-sandbox-k8s-context-extract.sh DEST_DIR MAX_BYTES}"
+dest_dir="${1:?usage: fork-sandbox-k8s-context-extract.sh DEST_DIR MAX_BYTES [CALLER]}"
+max_bytes="${2:?usage: fork-sandbox-k8s-context-extract.sh DEST_DIR MAX_BYTES [CALLER]}"
+caller="${3:-context}"
 
 label="${FS_EXTRACT_LABEL:-context-extract}"
 
-# 256 MiB by default, matching fork-sandbox-k8s.sh's own CONTEXT_MAX_BYTES.
-literal_max_bytes="${FS_EXTRACT_LITERAL_MAX_BYTES:-$((256 * 1024 * 1024))}"
-if [ "$max_bytes" -gt "$literal_max_bytes" ]; then
-    max_bytes="$literal_max_bytes"
-fi
+case "$caller" in
+    context)
+        literal_max_bytes=$((256 * 1024 * 1024))
+        if [ "$max_bytes" -gt "$literal_max_bytes" ]; then
+            max_bytes="$literal_max_bytes"
+        fi
+        ;;
+    outbox)
+        # No literal -- MAX_BYTES (outbox-extract.sh's own --outbox-max) is
+        # the whole cap.
+        ;;
+    *)
+        echo "$label: internal error: unknown caller '$caller'." >&2
+        exit 1
+        ;;
+esac
 
 tvf_out="$(mktemp)"
 tf_out="$(mktemp)"
@@ -101,7 +115,15 @@ fi
 
 size="$(stat -c '%s' -- "$tar_file")"
 if [ "$size" -gt "$max_bytes" ]; then
-    echo "$label: $size bytes, over $max_bytes byte cap; refusing it." >&2
+    if [ -n "${FS_EXTRACT_INPUT_FILE:-}" ]; then
+        echo "$label: $size bytes, over $max_bytes byte cap; refusing it." >&2
+    else
+        # The spool above stopped at max_bytes + 1, so $size on this path is
+        # always exactly that -- never the stream's real size. Quoting it
+        # would tell an operator they are one byte over the cap when they
+        # could be gigabytes over.
+        echo "$label: stream exceeded the $max_bytes byte cap; refusing it." >&2
+    fi
     exit 1
 fi
 

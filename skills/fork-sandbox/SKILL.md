@@ -429,7 +429,7 @@ What it cannot do yet, and why saying so matters: a flag this path cannot honor 
 - **No run-log entry.** A local run appends cost, tokens and outcome to `~/.claude/sandbox-runs.jsonl`; a `--k8s` run does not, so `--task-meta` — which exists to be folded into that log — is refused too.
 - **`--sandbox-args` and `--claude-args` are refused** for the same reason as always: no bubblewrap and no claude CLI exist on this path to pass flags to.
 - **`--checkout`, `--pi-args` and `--prompts-dir` are refused as not-yet-built**, not as permanently unsupported — each names a real capability the cluster path has not been wired up to carry yet.
-- **`--context-ro <dir>` IS built**: `--k8s` forwards it into the pod, same as a local run — `dir` must be under `/var/tmp/claude-scratch/forks/`, contain no symlinks or hard links, and is capped at 256 MiB.
+- **`--context-ro <dir>` IS built**: `--k8s` forwards it into the pod — `dir` must be under `/var/tmp/claude-scratch/forks/`, contain no symlinks or hard links, and is capped at 256 MiB. Unlike a local run's real `--bind-ro`, the pod has no way to bind a subdirectory of its emptyDir read-only: read-only there is by convention (the agent is told not to write there), not enforced by the filesystem.
 
 ## What the calling session must not do
 

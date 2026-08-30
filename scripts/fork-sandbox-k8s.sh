@@ -663,10 +663,19 @@ cmd_submit() {
             echo "directory." >&2
             exit 1
         fi
+        # awk keeps reading to EOF rather than `exit`ing on the first
+        # duplicate: under this file's `set -euo pipefail`, an early exit
+        # closes the pipe out from under a still-writing `stat` (find
+        # batches -exec into more than one `stat` invocation once there are
+        # enough files), which takes SIGPIPE, makes `find` report "'stat'
+        # terminated by signal 13" and exit non-zero, and aborts this whole
+        # function at the assignment before the error below ever prints --
+        # exactly the directory shape (many hard links) this check exists
+        # for.
         local context_ro_hardlink
         context_ro_hardlink="$(find "$context_ro_real" -type f -links +1 \
                 -exec "$FS_STAT" -c '%d:%i %n' {} + \
-            | awk '{ if (seen[$1]++) { print $2; exit } }')"
+            | awk '{ if (seen[$1]++ && !found) { found=$2 } } END { if (found) print found }')"
         if [[ -n "$context_ro_hardlink" ]]; then
             echo "Error: --context-ro directory '$context_ro_real' contains a hard-linked file" >&2
             echo "('$context_ro_hardlink'); links are not allowed in a pushed context" >&2
@@ -967,7 +976,7 @@ EOF
             exit 1
         fi
         kubectl exec -i "$pod_name" -- sh /mnt/fork-sandbox/context-extract.sh \
-            "$POD_CONTEXT_DIR" "$CONTEXT_MAX_BYTES" < "$context_tar"
+            "$POD_CONTEXT_DIR" "$CONTEXT_MAX_BYTES" context < "$context_tar"
         rm -f -- "$context_tar"
     fi
 

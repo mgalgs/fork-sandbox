@@ -15,12 +15,12 @@
 # own interface -- a TAR_FILE argument already on disk rather than a stdin
 # stream, and its own 64 MiB default cap with no upper ceiling -- onto that
 # one implementation, so the project's one path-traversal boundary exists
-# once rather than twice, kept in sync by hand. It hands the shared script
-# FS_EXTRACT_INPUT_FILE (so TAR_FILE, which cmd_run already spooled to disk
-# under its own cap, is read in place rather than copied again),
-# FS_EXTRACT_LITERAL_MAX_BYTES set to its own MAX_BYTES (so the shared
-# script's 256 MiB default, meant for --context-ro, never becomes a hidden
-# ceiling on an outbox that is documented as having none), and
+# once rather than twice, kept in sync by hand. It passes the shared script
+# "outbox" as CALLER (the shared script's own table maps that to no
+# literal ceiling, so the 256 MiB meant for --context-ro never becomes a
+# hidden ceiling on an outbox that is documented as having none), and hands
+# it FS_EXTRACT_INPUT_FILE (so TAR_FILE, which cmd_run already spooled to
+# disk under its own cap, is read in place rather than copied again) and
 # FS_EXTRACT_LABEL (so a rejection is attributed to this script and names
 # TAR_FILE, not to "context-extract").
 #
@@ -49,6 +49,5 @@ dest_dir="${2:?usage: fork-sandbox-k8s-outbox-extract.sh TAR_FILE DEST_DIR [MAX_
 max_bytes="${3:-$((64 * 1024 * 1024))}"
 
 FS_EXTRACT_LABEL="fork-sandbox-k8s-outbox-extract: $tar_file" \
-FS_EXTRACT_LITERAL_MAX_BYTES="$max_bytes" \
 FS_EXTRACT_INPUT_FILE="$tar_file" \
-    sh "$script_dir/fork-sandbox-k8s-context-extract.sh" "$dest_dir" "$max_bytes"
+    sh "$script_dir/fork-sandbox-k8s-context-extract.sh" "$dest_dir" "$max_bytes" outbox

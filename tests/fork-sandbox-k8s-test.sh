@@ -897,6 +897,25 @@ refuses "submit --context-ro containing a hard link is refused" \
     --branch fs-k8s-test-cr-hl --model moonshotai/kimi-k3 --context-ro "$cr_hl_dir" \
     "$proj_dir" "$handoff_file"
 
+# A two-file fixture never queues enough `stat` output to catch this: the
+# hard-link check's `awk` used to `exit` on the first duplicate inode,
+# which, once there was more than a pipe buffer (64 KiB) of `stat` output
+# still to come, closed the pipe out from under a still-writing `stat`,
+# took it down with SIGPIPE, and made `find` (and, under this file's
+# `set -euo pipefail`, the whole script) fail before "contains a
+# hard-linked file" ever printed. A `cp -al`-provisioned cache -- exactly
+# the shape this check exists for -- reproduces it: thousands of files in
+# one call each via brace expansion and `cp -al`, no per-file forking.
+cr_hl_many_dir="$(mktemp -d /var/tmp/claude-scratch/forks/fs-k8s-test-cr-hl-many.XXXXXX)"; tmpdirs+=("$cr_hl_many_dir")
+mkdir "$cr_hl_many_dir/a"
+touch "$cr_hl_many_dir/a/f"{1..4000}
+cp -al "$cr_hl_many_dir/a" "$cr_hl_many_dir/b"
+refuses "submit --context-ro with many hard links still reports its own error" \
+    "contains a hard-linked file" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-cr-hl-many --model moonshotai/kimi-k3 --context-ro "$cr_hl_many_dir" \
+    "$proj_dir" "$handoff_file"
+
 # `run --dry-run --context-ro` forwards to submit rather than growing its
 # own divergent copy -- same property --outbox-max's own run/submit pair
 # already proves above, applied to this flag.
@@ -1138,7 +1157,7 @@ rm -f /tmp/fs-k8s-outbox-cap.err
 # wrapper around fork-sandbox-k8s-context-extract.sh and inherited its
 # literal without overriding it.
 of_huge_src="$(newdir)"; tmpdirs+=("$of_huge_src")
-dd if=/dev/zero of="$of_huge_src/big.bin" bs=1M count=257 2>/dev/null
+truncate -s 257M "$of_huge_src/big.bin"
 of_huge_parent="$(newdir)"; tmpdirs+=("$of_huge_parent")
 of_huge_tar="$of_huge_parent/huge.tar"
 tar cf "$of_huge_tar" -C "$of_huge_src" .
@@ -1151,6 +1170,11 @@ else
         "$(cat /tmp/fs-k8s-outbox-huge.err)"
 fi
 rm -f /tmp/fs-k8s-outbox-huge.err
+# These three fixtures are ~257 MiB apiece (source, tar, extracted copy);
+# /tmp is a tmpfs, so held-until-EXIT here (this suite's default cleanup)
+# means ~770 MiB of RAM for the rest of the run. Removed the moment this
+# one assertion is done rather than joining tmpdirs for EXIT-time cleanup.
+rm -rf -- "$of_huge_src" "$of_huge_parent"
 
 printf '\n== fork-sandbox-k8s-context-extract.sh: extraction guards (no cluster) ==\n'
 # The pod-side half of the --context-ro push -- what stands between a
@@ -1291,42 +1315,45 @@ else
 fi
 rm -f /tmp/fs-k8s-ctx-hi.err
 
-# FS_EXTRACT_LITERAL_MAX_BYTES overrides the 256 MiB default the two cases
-# above never exercise: the effective cap is min(MAX_BYTES,
-# FS_EXTRACT_LITERAL_MAX_BYTES), so a MAX_BYTES far larger than the literal
-# must still be clamped down to it in both directions -- an archive that
-# fits under the (smaller) literal still extracts, and one that fits under
-# MAX_BYTES but not under the literal is still refused. Overriding the
-# literal down to a small, controllable value here proves the clamp itself
-# without needing a real 256 MiB fixture.
+# The 256 MiB literal on this stdin/kubectl-exec path cannot be raised by
+# MAX_BYTES, however large -- there is deliberately no env var for that (see
+# fork-sandbox-k8s-context-extract.sh's own header): a caller able to set an
+# env var alongside MAX_BYTES on this path could raise its own ceiling, and
+# the whole point of the literal is that it cannot. First, a small archive
+# still extracts when MAX_BYTES is far above the literal -- clamping lowers
+# the effective cap, it does not error out just because the caller asked
+# for more than the literal allows.
+cf_big_max_dest="$cf_parent/wf_dest_big_max"
+if "$context_extract_sh" "$cf_big_max_dest" 100000000000 < "$cf_wf_tar" \
+        >/tmp/fs-k8s-ctx-bigmax.err 2>&1; then
+    ok "a small archive extracts under a MAX_BYTES far above the literal"
+else
+    no "a small archive extracts under a MAX_BYTES far above the literal" \
+        "$(cat /tmp/fs-k8s-ctx-bigmax.err)"
+fi
+rm -f /tmp/fs-k8s-ctx-bigmax.err
+
+# Second, an archive over the literal but comfortably under MAX_BYTES is
+# still refused -- proving the clamp itself needs a real >256 MiB fixture,
+# since there is no longer a way to shrink the literal for a cheap one.
+# Sparse and removed the moment this assertion completes, the same as the
+# of_huge_* fixture above: /tmp is a tmpfs, and this is the only place left
+# in the suite that needs a fixture this size.
 cf_clamp_src="$(newdir)"; tmpdirs+=("$cf_clamp_src")
-printf 'clamp me\n' > "$cf_clamp_src/f.txt"
+truncate -s 257M "$cf_clamp_src/big.bin"
 cf_clamp_parent="$(newdir)"; tmpdirs+=("$cf_clamp_parent")
 cf_clamp_tar="$cf_clamp_parent/clamp.tar"
 tar cf "$cf_clamp_tar" -C "$cf_clamp_src" .
-cf_clamp_size="$(stat -c '%s' -- "$cf_clamp_tar")"
-
-cf_clamp_dest_fits="$cf_clamp_parent/clamp_dest_fits"
-if env FS_EXTRACT_LITERAL_MAX_BYTES=$((cf_clamp_size + 100)) \
-        "$context_extract_sh" "$cf_clamp_dest_fits" 100000000 < "$cf_clamp_tar" \
-        >/tmp/fs-k8s-ctx-clamp.err 2>&1; then
-    ok "a huge MAX_BYTES clamped down to a literal the archive still fits under extracts"
-else
-    no "a huge MAX_BYTES clamped down to a literal the archive still fits under extracts" \
-        "$(cat /tmp/fs-k8s-ctx-clamp.err)"
-fi
-rm -f /tmp/fs-k8s-ctx-clamp.err
-
-cf_clamp_dest_over="$cf_clamp_parent/clamp_dest_over"
-refuses "a huge MAX_BYTES is still clamped down to a tighter literal" \
+cf_clamp_dest="$cf_clamp_parent/clamp_dest"
+refuses "a MAX_BYTES far above the literal is still clamped down to it" \
     "byte cap; refusing it" \
-    env FS_EXTRACT_LITERAL_MAX_BYTES=$((cf_clamp_size - 1)) \
-    "$context_extract_sh" "$cf_clamp_dest_over" 100000000 < "$cf_clamp_tar"
-if [[ ! -e "$cf_clamp_dest_over" ]]; then
-    ok "clamped-below-literal archive: nothing is extracted"
+    "$context_extract_sh" "$cf_clamp_dest" 100000000000 < "$cf_clamp_tar"
+if [[ ! -e "$cf_clamp_dest" ]]; then
+    ok "clamped-to-literal archive: nothing is extracted"
 else
-    no "clamped-below-literal archive: nothing is extracted" "$cf_clamp_dest_over exists"
+    no "clamped-to-literal archive: nothing is extracted" "$cf_clamp_dest exists"
 fi
+rm -rf -- "$cf_clamp_src" "$cf_clamp_parent"
 
 # git disables the ext:: transport by default, so a push or fetch built
 # without -c protocol.ext.allow=always fails at the git layer with 'fatal:
