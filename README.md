@@ -281,9 +281,11 @@ written down in [docs/sandbox-backend.md](docs/sandbox-backend.md).
 
 Kubernetes is deliberately **not** a third backend. In a cluster the pod is
 already the sandbox, and the contract's host-path options do not survive the
-trip to another node — so the whole *run* moves there instead of one command.
-That is designed in [docs/kubernetes-runs.md](docs/kubernetes-runs.md), and it
-is not built either.
+trip to another node — so the whole *run* moves there instead of one command:
+`fork-sandbox.sh --k8s` submits it as a Job, running pi against a shared
+model proxy or Claude Code against a per-run proxy, the pod itself holding
+no credential either way. [docs/kubernetes-runs.md](docs/kubernetes-runs.md)
+is the full design.
 
 macOS's own `sandbox-exec` is not a substitute: its network control is
 allow-all-or-nothing, so pinned egress and the sealed bridge cannot be
@@ -368,7 +370,7 @@ what is mounted, what is not, and a numbered list of the gaps.
 - [docs/sandbox-backend.md](docs/sandbox-backend.md) — the isolation contract
   and its two implementations.
 - [docs/kubernetes-runs.md](docs/kubernetes-runs.md) — running a whole run in a
-  cluster, and why that is not a backend. Design only.
+  cluster, and why that is not a backend.
 - [docs/sandbox-backend-container.md](docs/sandbox-backend-container.md) — the
   container backend: mechanism, threat model, and limits.
 
