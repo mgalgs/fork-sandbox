@@ -8,9 +8,11 @@ user-invocable: true
 # Sandbox Coder Mode
 
 A standing mode, not a one-shot task. From the moment the user invokes it
-until they end it, this session writes no project code. It reads, plans,
-delegates the editing to `fork-sandbox` runs, reviews what comes back, and
-integrates it in the real repo.
+until they end it, this session writes no project code — with the
+deliberate carve-outs **What gets delegated** makes for small compiled
+edits and for prose. It reads, plans, delegates the editing to
+`fork-sandbox` runs, reviews what comes back, and integrates it in the
+real repo.
 
 `--long` enters the same mode with a second layer of discipline for running
 many rounds across hours rather than one or two — see **Entering the mode**.
@@ -253,16 +255,44 @@ Everything that is not writing project files:
 
 ## What gets delegated
 
-Any task whose product is a change to files in the project.
+Run this mode as a **compiler**. The user↔session channel carries
+idea-space — goals, shapes, problems, including problems about code — and
+this session's whole job is compiling that into coding instructions: a
+design, a plan, a handoff. The compilation itself is never delegated. It
+is what the expensive model is for, and it is where the leverage is: a
+fork never carries an idea, only a compiled instruction, so fork quality
+IS compile quality.
 
-The exceptions are the ones where a round trip costs more than the work:
+A direct coding instruction from the user ("rename X to Y", "apply this
+diff") arrives already compiled and enters at the join. Either way the
+pipeline converges on the same state — coding instructions exist, held by
+this session — and from there the work dispatches by the instruction's
+compiled **shape**, never by its origin:
 
-- **A small, self-contained edit** — a typo, a comment, a wording fix, a few
-  lines across a file or two. A sandbox costs a clone, a run, a review and a
-  merge; that is a bad trade for a change you can read and be sure of.
-- Files outside the project: scratch files, notes, and the handoff documents
-  themselves. The sandbox cannot see them, so they can only be written here.
-- A change the user explicitly asks this session to make by hand.
+- **Small and self-contained** — right by reading, a few lines across a
+  file or two — executes in-session, whether it began as an idea or an
+  instruction. An idea that compiles to a one-liner runs here; a sandbox
+  costs a clone, a run, a review and a merge, a bad trade for a change
+  you can read and be sure of.
+- **A build** — multi-file, wants its own review loop, or has scale (a
+  migration, a sweep) — forks a sandbox carrying the compiled
+  instruction, and this session reviews what returns. A direct-but-huge
+  instruction still forks: origin does not exempt it from scale.
+- **Prose that matters** — public-facing docs, READMEs, skill text — is
+  written in-session, on the highest model available, the same shape as
+  review and with no new configuration. (Not a per-kind model registry;
+  just the one rule.)
+- **Review** never forks: it is the far end of the same pipeline — the
+  compiler checking what came back against what it emitted.
+
+This amends the mode's headline. "This session writes no project code"
+still describes every build — the bulk typing always happens in a
+sandbox — but compiled output that is small, and prose whose quality is
+the point, are written here, deliberately.
+
+Also always written here, since a sandbox cannot see them: files outside
+the project — scratch files, notes, and the handoff documents themselves.
+And a change the user explicitly asks this session to make by hand.
 
 **The threshold is confidence, not line count.** Make the edit here when you
 can tell it is right by reading it, and the whole change stays within a few
