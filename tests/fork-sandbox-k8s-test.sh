@@ -40,14 +40,16 @@
 #     public-repo leak rule every script and manifest here has to hold to.
 #   - fork-sandbox.sh --k8s: the two new lib functions it shares with the
 #     local path (fs_require_scratch_handoff, fs_require_src_project), that
-#     it defaults a bare --k8s to --harness pi (still requiring --model)
-#     and refuses --harness values other than pi and every flag the cluster
-#     path cannot honor by name (never silently dropping one), that
-#     --timeout/--keep are refused without --k8s, that a --branch is
-#     generated when none is given, and that --dry-run renders byte-for-byte
-#     the same Job YAML `fork-sandbox-k8s.sh run --dry-run` does for the
-#     same arguments -- proving the dispatcher execs rather than growing a
-#     divergent copy of anything.
+#     it defaults a bare --k8s to --harness pi (still requiring --model),
+#     that --harness claude is accepted too (also requiring --model, its
+#     own Claude Code model name) while every other --harness value and
+#     every flag the cluster path cannot honor is refused by name (never
+#     silently dropping one), that --timeout/--keep are refused without
+#     --k8s, that a --branch is generated when none is given, and that
+#     --dry-run renders byte-for-byte the same Job YAML
+#     `fork-sandbox-k8s.sh run --dry-run` does for the same arguments --
+#     proving the dispatcher execs rather than growing a divergent copy of
+#     anything.
 #   - `submit --dry-run --review-loop N`: the four review-loop ConfigMap
 #     keys (review-prompt.md, fix-prompt-header.md,
 #     code-review-portable-skill.md, review-loop.sh) and the REVIEW_LOOP_CAP
@@ -60,8 +62,13 @@
 #     POD's skill and verdict paths, never a host path; --review-loop 0 and
 #     a non-numeric value are both rejected before any kubectl call.
 #   - fork-sandbox.sh --k8s --review-loop N is no longer refused, and
-#     --review-model still is (with an updated reason: one model slot in
-#     the pod's models.json, not "no review leg at all").
+#     --review-model given without --review-loop still is, on either
+#     harness -- the same coherence rule the local path applies. On
+#     --harness claude, a --review-loop also requires --review-harness pi
+#     given explicitly (with a review model, via --review-model or the
+#     combined pi/<id> form), since the pod's review leg is always pi and
+#     never claude; --review-harness itself is refused outright on
+#     --harness pi, where there is nothing to switch.
 #   - fork-sandbox-k8s-review-loop.sh, the pod-side review/fix loop, driven
 #     directly against a scratch git repo with PI_BIN pointed at a stub --
 #     no cluster, no pod, no real pi. Covers every ended value the control
@@ -220,6 +227,23 @@ if command -v yamllint >/dev/null 2>&1; then
     if [[ -z "$out" ]]; then ok "yamllint: install --dry-run output"; else no "yamllint: install --dry-run output" "$out"; fi
     out="$(yamllint - < "$install_out" 2>&1)"
     if [[ -z "$out" ]]; then ok "yamllint: install --dry-run piped through stdin"; else no "yamllint: install --dry-run piped through stdin" "$out"; fi
+fi
+
+printf '\n== shared proxy Service and static NetworkPolicy carry the role key ==\n'
+# fork-sandbox/role: model-proxy, alongside the pre-existing app:
+# fork-sandbox-proxy, on the Deployment's pod template, the Service
+# selector and the static NetworkPolicy's podSelector -- three places,
+# since a --harness claude run's per-run proxy Pod also carries
+# app: fork-sandbox-proxy (for the platform agent-egress policy) and would
+# otherwise be picked up by either the Service (round-robining pi traffic
+# into a proxy that 403s it) or the static policy (whose ingress admits
+# every agent pod in the namespace, not just one run's own).
+role_key_count="$(grep -cF 'fork-sandbox/role: model-proxy' "$install_out")"
+if [[ "$role_key_count" -eq 3 ]]; then
+    ok "fork-sandbox/role: model-proxy appears on the Deployment template, Service selector and static NetworkPolicy podSelector"
+else
+    no "fork-sandbox/role: model-proxy appears on the Deployment template, Service selector and static NetworkPolicy podSelector" \
+        "found $role_key_count occurrences in $install_out, want 3"
 fi
 
 printf '\n== namespace enforces Pod Security Admission (restricted) ==\n'
@@ -536,6 +560,31 @@ else
     no "the claude-proxy Pod carries the shared app: fork-sandbox-proxy label" \
         "not found in $claude_submit_out"
 fi
+# fork-sandbox/role: model-proxy is the key that keeps this Pod OUT of the
+# shared proxy's own Service and NetworkPolicy selectors (both tightened to
+# require it -- see the install-render checks above). This Pod must never
+# carry it itself, or it would opt back into both.
+if grep -qF 'fork-sandbox/role: model-proxy' "$claude_submit_out"; then
+    no "the claude-proxy Pod does not carry fork-sandbox/role: model-proxy" \
+        "found in $claude_submit_out"
+else
+    ok "the claude-proxy Pod does not carry fork-sandbox/role: model-proxy"
+fi
+if grep -q "^kind: NetworkPolicy\$" "$claude_submit_out" \
+    && grep -qF "name: $claude_run_name-claude-proxy" "$claude_submit_out"; then
+    ok "rendered manifest carries the per-run claude-proxy NetworkPolicy"
+else
+    no "rendered manifest carries the per-run claude-proxy NetworkPolicy" \
+        "not found in $claude_submit_out"
+fi
+if grep -qF 'fork-sandbox/role: claude-proxy' "$claude_submit_out" \
+    && grep -qF "fork-sandbox/branch: $claude_run_name" "$claude_submit_out" \
+    && grep -qF 'app: fork-sandbox-agent' "$claude_submit_out"; then
+    ok "the per-run claude-proxy NetworkPolicy scopes ingress to this run's own agent Pod"
+else
+    no "the per-run claude-proxy NetworkPolicy scopes ingress to this run's own agent Pod" \
+        "not found in $claude_submit_out"
+fi
 # The rendered ConfigMap's claude-credentials.json: sanitized (no
 # refreshToken) and carrying the "sandbox" placeholder access token, never
 # the fixture's real one -- the whole point of the substitution.
@@ -706,10 +755,10 @@ if PATH="$kubectl_stub_bin:$PATH" FORK_SANDBOX_CONFIG_DIR="$config_dir" \
 else
     no "rm exits 0 against a stubbed kubectl" "$(cat /tmp/fs-k8s-test-rm.err)"
 fi
-if grep -q "delete pod,service,secret,configmap -l fork-sandbox/branch=$claude_run_name --ignore-not-found" "$kubectl_log"; then
-    ok "rm issues the label-based delete covering the claude-proxy Pod/Service/Secret/ConfigMap"
+if grep -q "delete pod,service,secret,configmap,networkpolicy -l fork-sandbox/branch=$claude_run_name --ignore-not-found" "$kubectl_log"; then
+    ok "rm issues the label-based delete covering the claude-proxy Pod/Service/Secret/ConfigMap/NetworkPolicy"
 else
-    no "rm issues the label-based delete covering the claude-proxy Pod/Service/Secret/ConfigMap" \
+    no "rm issues the label-based delete covering the claude-proxy Pod/Service/Secret/ConfigMap/NetworkPolicy" \
         "not found in $kubectl_log: $(cat "$kubectl_log")"
 fi
 if grep -q "delete job $claude_run_name --ignore-not-found" "$kubectl_log" \
@@ -2031,6 +2080,10 @@ else
         "$(cat /tmp/fs-k8s-flag-test-claude-harness.err)"
 fi
 rm -f /tmp/fs-k8s-flag-test-claude-harness.err
+refuses "--k8s --harness claude with no --model needs a model" \
+    "--k8s --harness claude needs --model" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
+    --harness claude "$k8s_flag_claude_proj" "$k8s_flag_handoff"
 refuses "--k8s --harness pi-local is refused" \
     "only supports --harness pi" \
     env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \

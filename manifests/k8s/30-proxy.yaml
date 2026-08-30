@@ -97,6 +97,13 @@ spec:
     metadata:
       labels:
         app: fork-sandbox-proxy
+        # Distinguishes this pod from the per-run proxy Pod a --harness
+        # claude run renders (manifests/k8s/31-*.yaml), which carries the
+        # same `app: fork-sandbox-proxy` (needed for the platform
+        # agent-egress selector, and formerly this file's own
+        # NetworkPolicy) but must NOT be picked up by the Service selector
+        # or the NetworkPolicy podSelector below -- see both.
+        fork-sandbox/role: model-proxy
       annotations:
         # A hash of the ConfigMap's nginx.conf, filled in by
         # fork-sandbox-k8s.sh at render time. A ConfigMap update alone does
@@ -161,8 +168,16 @@ metadata:
   labels:
     app: fork-sandbox-proxy
 spec:
+  # Both labels, not just `app`: a --harness claude run's per-run proxy Pod
+  # carries `app: fork-sandbox-proxy` too, for the platform agent-egress
+  # policy, which keys on that label alone. A selector of `app` by itself
+  # would silently add that Pod to this Service's endpoints the moment it
+  # went Ready, round-robining every pi run's model traffic (and that
+  # run's own review-loop traffic) into a proxy whose nginx answers
+  # everything but /v1/messages with 403.
   selector:
     app: fork-sandbox-proxy
+    fork-sandbox/role: model-proxy
   ports:
     - port: 8080
       targetPort: 8080
@@ -171,7 +186,15 @@ spec:
 # The proxy's own policy. Unlike the agent pod's, this one is ordinary and
 # portable, so it lives here as a static file rather than behind the
 # platform plugin (see docs/k8s-platform.md for why the agent pod's policy
-# cannot).
+# cannot). Selects on the role key, same as the Service above and for the
+# same reason: a --harness claude run's per-run proxy Pod carries
+# `app: fork-sandbox-proxy` too, and NetworkPolicies UNION rather than
+# intersect, so if this policy selected on `app` alone it would ALSO admit
+# ingress into that Pod from every `app: fork-sandbox-agent` pod in the
+# namespace -- not just the one run that Pod belongs to -- regardless of
+# whatever narrower policy that Pod's own manifest carries. That per-run
+# Pod is scoped by its own NetworkPolicy instead; see the file that renders
+# it.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -181,6 +204,7 @@ spec:
   podSelector:
     matchLabels:
       app: fork-sandbox-proxy
+      fork-sandbox/role: model-proxy
   policyTypes:
     - Ingress
     - Egress

@@ -971,8 +971,8 @@ CENV
 )"
     fi
 
-    local rendered
-    rendered="${claude_proxy_rendered}$(cat <<EOF
+    local job_rendered rendered
+    job_rendered="$(cat <<EOF
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -1105,6 +1105,7 @@ spec:
           emptyDir: {}
 EOF
 )"
+    rendered="${claude_proxy_rendered}${job_rendered}"
 
     if [[ "$dry_run" == true ]]; then
         printf '%s\n' "$rendered"
@@ -1115,15 +1116,18 @@ EOF
         exit 0
     fi
 
-    printf '%s\n' "$rendered" | kubectl apply -f -
-
     if [[ "$harness" == claude ]]; then
-        # The egress-gate initContainer probes this proxy (see the Job env
-        # below), so it must be up before the agent pod's own readiness is
-        # worth waiting on.
+        # Applied, and waited on, BEFORE the Job below: the egress-gate
+        # initContainer probes this proxy the moment the Job's pod starts,
+        # and if both went into one `kubectl apply` stream that start could
+        # race the proxy's own image pull and readiness, failing the gate
+        # closed on a cold node well within its default 60s GATE_TIMEOUT.
+        printf '%s\n' "$claude_proxy_rendered" | kubectl apply -f -
         echo "fork-sandbox-k8s: waiting for proxy pod ($safe_name-claude-proxy) to be ready" >&2
         kubectl wait --for=condition=Ready "pod/$safe_name-claude-proxy" --timeout=120s
     fi
+
+    printf '%s\n' "$job_rendered" | kubectl apply -f -
 
     echo "fork-sandbox-k8s: waiting for pod (job $safe_name) to be ready" >&2
     kubectl wait --for=condition=Ready "pod" -l "job-name=$safe_name" --timeout=180s
@@ -1308,11 +1312,11 @@ cmd_rm() {
     safe_name="$(k8s_safe_name fork-sandbox-agent "$branch")"
     kubectl delete job "$safe_name" --ignore-not-found
     kubectl delete configmap "$safe_name-scripts" --ignore-not-found
-    # Additionally, by label: the claude-proxy Pod, Service, ConfigMap and
-    # Secret, none of which the two deletes above name -- harmless on a pi
-    # run, which never created anything carrying this label beyond the
-    # scripts ConfigMap already deleted above.
-    kubectl delete pod,service,secret,configmap -l fork-sandbox/branch="$safe_name" --ignore-not-found
+    # Additionally, by label: the claude-proxy Pod, Service, ConfigMap,
+    # Secret and NetworkPolicy, none of which the two deletes above name --
+    # harmless on a pi run, which never created anything carrying this
+    # label beyond the scripts ConfigMap already deleted above.
+    kubectl delete pod,service,secret,configmap,networkpolicy -l fork-sandbox/branch="$safe_name" --ignore-not-found
     echo "fork-sandbox-k8s: removed job and configmap for branch $branch" >&2
 }
 

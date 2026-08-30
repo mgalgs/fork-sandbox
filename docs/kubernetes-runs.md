@@ -509,7 +509,7 @@ by `--model` without a second provider entry. On `--harness pi`,
 to the coding leg's own `MODEL` for the review leg too. On `--harness
 claude`, it is effectively required: `fork-sandbox.sh`'s own `--k8s` gate
 refuses a `--review-loop` on a claude run unless `--review-harness pi` is
-given explicitly together with a review model (the combined `pi:<id>` form
+given explicitly together with a review model (the combined `pi/<id>` form
 or `--review-model`), because the review leg there is *always* pi against
 an OpenRouter id, never claude — naming `--review-harness pi` is what
 tells the script (and stops an operator's habit-typed `--review-model
@@ -606,14 +606,30 @@ cluster-shared) into a Pod, a Secret, and a Service, all named
 namespace, so the `0.0.0.0/0:443` egress a proxy needs would be the agent's
 own route too — that inverts the headline property this whole design
 protects (the pod reaches no real internet host). A separate Pod carries
-its own network namespace and its own policy. It needs no NetworkPolicy of
-its own, either: it carries the label `app: fork-sandbox-proxy`, which the
-static `NetworkPolicy` already in `30-proxy.yaml` selects (ingress from
-agent pods on 8080, egress DNS + 443 to the real Anthropic API), and it is
-admitted by the platform-rendered agent policy the same way, via
-`--proxy-label app=fork-sandbox-proxy`. `cmd_submit` waits for this pod to
-report Ready before submitting the Job — the egress-gate initContainer
-probes it, so it has to be up first.
+its own network namespace and its own policy. It carries the label
+`app: fork-sandbox-proxy`, which is what admits it into the
+platform-rendered agent policy's egress, via `--proxy-label
+app=fork-sandbox-proxy`, and it also carries `fork-sandbox/role:
+claude-proxy` and `fork-sandbox/branch: $safe_name`. It needs, and gets, its
+OWN `NetworkPolicy`, rendered alongside it in `31-claude-proxy.yaml`: the
+shared `NetworkPolicy` in `30-proxy.yaml` selects `app: fork-sandbox-proxy`
+too, and NetworkPolicies union rather than intersect, so leaving the shared
+one selecting on `app` alone would ALSO admit ingress into this Pod from
+every agent pod in the namespace, not just this run's own — the shared
+policy's `podSelector` was tightened to require `fork-sandbox/role:
+model-proxy` (which only the shared proxy's own Pod carries) specifically
+so it stops doing that, and the per-run policy here — ingress from this
+run's own agent Pod alone, on 8080; egress DNS and `443` to the real
+Anthropic API, same as the shared policy's egress rule — is what actually
+scopes this Pod now. The same role key kept this Pod out of the shared
+proxy's own `Service` endpoints, since a `Service` selector has no
+ReplicaSet-hash-style extra key the way a `Deployment`'s does — see
+`30-proxy.yaml`. **A cluster already running `install` from before this
+change needs `install` run again after upgrading**: the shared `Service`
+and `NetworkPolicy` selectors changed, and `install` is the only thing that
+applies `30-proxy.yaml`. `cmd_submit` waits for this pod to report Ready
+before submitting the Job — the egress-gate initContainer probes it, so it
+has to be up first.
 
 **The token never appears in rendered YAML.** `cmd_submit` reads the
 operator's local OAuth access token (the same `fs_read_claude_credential`

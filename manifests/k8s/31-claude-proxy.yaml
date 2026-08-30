@@ -20,10 +20,28 @@
 # that one carries the pi proxy's OpenRouter key for every run in the
 # namespace and cannot take a per-run operator token without a reload that
 # would race every other run using it. A separate Pod, carrying the label
-# app: fork-sandbox-proxy, is selected by the EXISTING static NetworkPolicy
-# in 30-proxy.yaml (ingress from agents on 8080, egress to DNS and 443) and
-# admitted by the platform-rendered agent policy's --proxy-label
-# app=fork-sandbox-proxy -- no NetworkPolicy changes needed for this file.
+# app: fork-sandbox-proxy, is admitted by the platform-rendered agent
+# policy's --proxy-label app=fork-sandbox-proxy. That same label is NOT
+# enough on its own to keep this Pod out of the shared fork-sandbox-proxy
+# Service's endpoints, though -- a Service selector has no
+# ReplicaSet-hash-style extra key the way a Deployment's does, so a bare
+# `app: fork-sandbox-proxy` Service selector would round-robin pi's model
+# traffic into this Pod's nginx, which 403s everything but /v1/messages.
+# The Pod below carries a distinct fork-sandbox/role value specifically so
+# it does NOT match 30-proxy.yaml's Service selector, which now requires a
+# role value only that file's own Deployment carries -- see that file.
+#
+# This file DOES need its own NetworkPolicy, unlike the header this
+# replaced used to claim: 30-proxy.yaml's static policy formerly selected
+# on `app: fork-sandbox-proxy` alone, which this Pod also carries, so it
+# was ALSO admitting ingress into this Pod from every app: fork-sandbox-agent
+# pod in the namespace -- not just the one run this Pod belongs to. That
+# policy now selects on a role key that this Pod does not carry, closing
+# that hole, but leaves this Pod with no policy at all unless one is
+# rendered here. The NetworkPolicy below is that policy: ingress scoped to
+# this run's own agent Pod by fork-sandbox/branch, egress the same DNS and
+# 0.0.0.0/0:443 (private ranges excepted) rules 30-proxy.yaml's policy
+# grants its own Pod.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -190,3 +208,53 @@ spec:
     - port: 8080
       targetPort: 8080
       protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: __RUN_NAME__-claude-proxy
+  namespace: __NAMESPACE__
+  labels:
+    fork-sandbox/branch: __RUN_NAME__
+spec:
+  podSelector:
+    matchLabels:
+      fork-sandbox/role: claude-proxy
+      fork-sandbox/branch: __RUN_NAME__
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: fork-sandbox-agent
+              fork-sandbox/branch: __RUN_NAME__
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+              - 100.64.0.0/10
+      ports:
+        - protocol: TCP
+          port: 443

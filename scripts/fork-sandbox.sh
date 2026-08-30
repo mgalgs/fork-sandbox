@@ -412,10 +412,14 @@
 # That also means most of this script's flags have nothing to attach to on a
 # cluster run: they describe local-sandbox machinery -- bubblewrap, per-run
 # docker-compose services, the detached tmux session -- that a Kubernetes pod
-# has no equivalent of, or they describe a real capability (--checkout,
+# has no equivalent of, they describe a real capability (--checkout,
 # --prompts-dir, --pi-args, --task-meta) the cluster path has
-# not been built to carry yet. --k8s refuses each of these by name instead of
-# accepting and dropping it: an operator who thinks a refused flag did
+# not been built to carry yet, or -- --claude-args alone, since --harness
+# claude landed here -- the pod's own invocation of the flag's target IS
+# built, but fixed: a --harness claude pod really does run the claude CLI,
+# just with no flag yet to extend its rendered invocation the way a local
+# claude launch can be extended. --k8s refuses each of these by name instead
+# of accepting and dropping it: an operator who thinks a refused flag did
 # something, when a k8s run silently ignored it, has no way to notice from
 # the outside -- no error, no missing output, just a run that looks like it
 # honored a flag it never saw.
@@ -1428,6 +1432,13 @@ if [[ "$k8s_mode" == true ]]; then
         echo "claude talking through a per-run proxy that swaps in the" >&2
         echo "operator's own token; pi-local and codex have no sandboxed path" >&2
         echo "in the cluster (not yet supported)." >&2
+        exit 1
+    fi
+    if [[ "$harness" == "claude" && -z "$model" ]]; then
+        echo "Error: --k8s --harness claude needs --model. A local claude run" >&2
+        echo "can fall back to the claude CLI's own default, but the pod's" >&2
+        echo "entrypoint has no such fallback -- pass a Claude Code model" >&2
+        echo "name, such as opus or sonnet." >&2
         exit 1
     fi
 
