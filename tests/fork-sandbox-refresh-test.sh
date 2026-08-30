@@ -102,6 +102,7 @@ hook_run() {
         FORK_SANDBOX_INBOX_SEEN="$inbox/../seen-$$" \
         FORK_SANDBOX_NUDGE_MARKER="$nudge_marker" \
         FORK_SANDBOX_NUDGE_REMINDED="$nudge_reminded" \
+        FORK_SANDBOX_STALE_REMINDED="$stale_reminded" \
         "$hook" 2>/dev/null
 }
 
@@ -109,8 +110,8 @@ hook_run() {
 inbox="$(new_inbox)"; tmpdirs+=("$inbox")
 printf 'THRESHOLD_TOKENS=1000\nOUTBOX_DIR=%s/outbox\n' "$inbox" > "$inbox/.refresh-config"
 mkdir -p "$inbox/outbox"
-nudge_marker="$(mktemp -u)"; nudge_reminded="$(mktemp -u)"
-tmpdirs+=("$nudge_marker" "$nudge_reminded")
+nudge_marker="$(mktemp -u)"; nudge_reminded="$(mktemp -u)"; stale_reminded="$(mktemp -u)"
+tmpdirs+=("$nudge_marker" "$nudge_reminded" "$stale_reminded")
 transcript="$(new_transcript 60 30 10)"; tmpdirs+=("$(dirname "$transcript")")
 out="$(hook_run "$inbox" PostToolUse "$transcript")"
 check "usage below threshold: no nudge" "" "$out"
@@ -120,8 +121,8 @@ marker "usage below threshold: no marker written" "$nudge_marker" no
 inbox="$(new_inbox)"; tmpdirs+=("$inbox")
 printf 'THRESHOLD_TOKENS=1000\nOUTBOX_DIR=%s/outbox\n' "$inbox" > "$inbox/.refresh-config"
 mkdir -p "$inbox/outbox"
-nudge_marker="$(mktemp -u)"; nudge_reminded="$(mktemp -u)"
-tmpdirs+=("$nudge_marker" "$nudge_reminded")
+nudge_marker="$(mktemp -u)"; nudge_reminded="$(mktemp -u)"; stale_reminded="$(mktemp -u)"
+tmpdirs+=("$nudge_marker" "$nudge_reminded" "$stale_reminded")
 transcript="$(new_transcript 700 250 50)"; tmpdirs+=("$(dirname "$transcript")")
 out="$(hook_run "$inbox" PostToolUse "$transcript")"
 contains "usage at threshold: nudge fires as additionalContext" \
@@ -162,20 +163,89 @@ check "a second Stop is not blocked again" "" "$out"
 inbox="$(new_inbox)"; tmpdirs+=("$inbox")
 printf 'THRESHOLD_TOKENS=1000\nOUTBOX_DIR=%s/outbox\n' "$inbox" > "$inbox/.refresh-config"
 mkdir -p "$inbox/outbox"
-nudge_marker="$(mktemp -u)"; nudge_reminded="$(mktemp -u)"
-tmpdirs+=("$nudge_marker" "$nudge_reminded")
+nudge_marker="$(mktemp -u)"; nudge_reminded="$(mktemp -u)"; stale_reminded="$(mktemp -u)"
+tmpdirs+=("$nudge_marker" "$nudge_reminded" "$stale_reminded")
 transcript="$(new_transcript 900 100 50)"; tmpdirs+=("$(dirname "$transcript")")
 hook_run "$inbox" PostToolUse "$transcript" >/dev/null
 printf 'the hand-off\n' > "$inbox/outbox/handoff.md"
 out="$(hook_run "$inbox" Stop "$transcript")"
 check "Stop with a hand-off already written does not block" "" "$out"
 
+# --refresh-at Bug B: a hand-off older than the clone's last commit blocks
+# the next Stop once, asking for a rewrite. touch -d gives deterministic
+# mtimes rather than relying on sleeps.
+inbox="$(new_inbox)"; tmpdirs+=("$inbox")
+clone="$(mktemp -d)"; tmpdirs+=("$clone")
+mkdir -p "$clone/.git/logs"
+printf 'THRESHOLD_TOKENS=1000\nOUTBOX_DIR=%s/outbox\nCLONE_DIR=%s\n' "$inbox" "$clone" > "$inbox/.refresh-config"
+mkdir -p "$inbox/outbox"
+nudge_marker="$(mktemp -u)"; nudge_reminded="$(mktemp -u)"; stale_reminded="$(mktemp -u)"
+tmpdirs+=("$nudge_marker" "$nudge_reminded" "$stale_reminded")
+transcript="$(new_transcript 60 30 10)"; tmpdirs+=("$(dirname "$transcript")")
+printf 'the hand-off\n' > "$inbox/outbox/handoff.md"
+touch -d '2026-01-01 00:00:00' "$inbox/outbox/handoff.md"
+touch -d '2026-01-01 00:01:00' "$clone/.git/logs/HEAD"
+out="$(hook_run "$inbox" Stop "$transcript")"
+check "a hand-off older than the last commit blocks the Stop" \
+    "block" "$(printf '%s' "$out" | jq -r '.decision')"
+contains "the stale block names the hand-off path" \
+    "$inbox/outbox/handoff.md" "$(printf '%s' "$out" | jq -r '.reason')"
+contains "the stale block says it is the only one" \
+    "only such reminder" "$(printf '%s' "$out" | jq -r '.reason')"
+marker "the stale-reminded marker is written" "$stale_reminded" yes
+
+# A leg must never be trapped: the next Stop lets it through.
+out="$(hook_run "$inbox" Stop "$transcript")"
+check "a second Stop after a stale block is not blocked again" "" "$out"
+
+# A hand-off NEWER than the last commit is not stale: no block.
+inbox="$(new_inbox)"; tmpdirs+=("$inbox")
+clone="$(mktemp -d)"; tmpdirs+=("$clone")
+mkdir -p "$clone/.git/logs"
+printf 'THRESHOLD_TOKENS=1000\nOUTBOX_DIR=%s/outbox\nCLONE_DIR=%s\n' "$inbox" "$clone" > "$inbox/.refresh-config"
+mkdir -p "$inbox/outbox"
+nudge_marker="$(mktemp -u)"; nudge_reminded="$(mktemp -u)"; stale_reminded="$(mktemp -u)"
+tmpdirs+=("$nudge_marker" "$nudge_reminded" "$stale_reminded")
+touch -d '2026-01-01 00:00:00' "$clone/.git/logs/HEAD"
+printf 'the hand-off\n' > "$inbox/outbox/handoff.md"
+touch -d '2026-01-01 00:01:00' "$inbox/outbox/handoff.md"
+out="$(hook_run "$inbox" Stop "$transcript")"
+check "a hand-off newer than the last commit does not block" "" "$out"
+
+# PostToolUse never blocks, and never mentions staleness, even when the
+# hand-off IS stale -- only the actual end of turn is the boundary that
+# matters.
+inbox="$(new_inbox)"; tmpdirs+=("$inbox")
+clone="$(mktemp -d)"; tmpdirs+=("$clone")
+mkdir -p "$clone/.git/logs"
+printf 'THRESHOLD_TOKENS=1000\nOUTBOX_DIR=%s/outbox\nCLONE_DIR=%s\n' "$inbox" "$clone" > "$inbox/.refresh-config"
+mkdir -p "$inbox/outbox"
+nudge_marker="$(mktemp -u)"; nudge_reminded="$(mktemp -u)"; stale_reminded="$(mktemp -u)"
+tmpdirs+=("$nudge_marker" "$nudge_reminded" "$stale_reminded")
+printf 'the hand-off\n' > "$inbox/outbox/handoff.md"
+touch -d '2026-01-01 00:00:00' "$inbox/outbox/handoff.md"
+touch -d '2026-01-01 00:01:00' "$clone/.git/logs/HEAD"
+out="$(hook_run "$inbox" PostToolUse "$transcript")"
+check "PostToolUse with a stale hand-off emits nothing about it" "" "$out"
+
+# No .git/logs/HEAD at all (a clone that has never diverged): the check is
+# skipped rather than treated as stale.
+inbox="$(new_inbox)"; tmpdirs+=("$inbox")
+clone="$(mktemp -d)"; tmpdirs+=("$clone")
+printf 'THRESHOLD_TOKENS=1000\nOUTBOX_DIR=%s/outbox\nCLONE_DIR=%s\n' "$inbox" "$clone" > "$inbox/.refresh-config"
+mkdir -p "$inbox/outbox"
+nudge_marker="$(mktemp -u)"; nudge_reminded="$(mktemp -u)"; stale_reminded="$(mktemp -u)"
+tmpdirs+=("$nudge_marker" "$nudge_reminded" "$stale_reminded")
+printf 'the hand-off\n' > "$inbox/outbox/handoff.md"
+out="$(hook_run "$inbox" Stop "$transcript")"
+check "no .git/logs/HEAD at all means no stale block" "" "$out"
+
 # No refresh config at all: the mechanism is fully inert, and an addendum
 # still works exactly as it always did.
 inbox="$(new_inbox)"; tmpdirs+=("$inbox")
 printf 'do the other thing\n' > "$inbox/1724650001-01.md"
-nudge_marker="$(mktemp -u)"; nudge_reminded="$(mktemp -u)"
-tmpdirs+=("$nudge_marker" "$nudge_reminded")
+nudge_marker="$(mktemp -u)"; nudge_reminded="$(mktemp -u)"; stale_reminded="$(mktemp -u)"
+tmpdirs+=("$nudge_marker" "$nudge_reminded" "$stale_reminded")
 out="$(hook_run "$inbox" PostToolUse "/nonexistent/transcript.jsonl")"
 contains "with no refresh config, addenda still deliver" \
     "do the other thing" "$out"

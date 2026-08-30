@@ -25,10 +25,14 @@
 # The second job this script does is fork-sandbox.sh's --refresh-at: when the
 # session's own context usage crosses a threshold, nudge it once, through the
 # same two channels, to write a hand-off and end its turn so the run can fork
-# a fresh session from it. That machinery is inert — no config file, no extra
-# work on the common path — unless the launcher wrote
-# <inbox>/.refresh-config, which only a --refresh-at run (the claude harness
-# only, and not with --refresh-at 0) does.
+# a fresh session from it. A session can keep working and committing for a
+# long time after writing that hand-off without ever rewriting it, so this
+# script also sends a Stop back once, at most, if the hand-off already
+# sitting in the outbox predates the clone's last commit — see the staleness
+# check below. That machinery is inert — no config file, no extra work on the
+# common path — unless the launcher wrote <inbox>/.refresh-config, which only
+# a --refresh-at run (the claude harness only, and not with --refresh-at 0)
+# does.
 #
 # It runs on every tool call, so the common case — nothing new — must cost
 # nothing. With an empty inbox, refresh disabled, or this leg already
@@ -40,11 +44,11 @@
 # "The threshold check" below for why that cost is bounded rather than
 # growing with the conversation.
 #
-# The seen-list and the two refresh markers live in the sandbox's ephemeral
+# The seen-list and the three refresh markers live in the sandbox's ephemeral
 # /tmp, never in the inbox: the inbox is mounted read-only, and a per-run
 # tmpfs is exactly the lifetime a "have I shown this yet" record wants. A
-# fresh sandbox means a fresh tmpfs, so both refresh markers reset on their
-# own between legs — nothing here has to know a continuation started.
+# fresh sandbox means a fresh tmpfs, so all three refresh markers reset on
+# their own between legs — nothing here has to know a continuation started.
 #
 # This runs INSIDE the sandbox with the session's own privileges, so it is not
 # a security boundary and grants nothing the session did not already have.
@@ -83,26 +87,33 @@ STDERR_TAG_REFRESH="fork-sandbox-refresh:"
 refresh_config="$inbox/.refresh-config"
 refresh_threshold=""
 outbox_dir=""
+clone_dir=""
 if [[ -f "$refresh_config" ]]; then
     while IFS='=' read -r _rk _rv || [[ -n "$_rk" ]]; do
         case "$_rk" in
             THRESHOLD_TOKENS) refresh_threshold="$_rv" ;;
             OUTBOX_DIR) outbox_dir="$_rv" ;;
+            CLONE_DIR) clone_dir="$_rv" ;;
         esac
     done < "$refresh_config"
 fi
 
-# Two per-leg markers, both in the ephemeral tmpfs (see the header comment
+# Three per-leg markers, all in the ephemeral tmpfs (see the header comment
 # above): one for "this leg has been nudged, do not measure again", one for
 # "this leg has already been reminded once, at Stop, that no hand-off showed
-# up". Overridable for the test script, matching FORK_SANDBOX_INBOX_SEEN.
+# up", one for "this leg has already been sent back once, at Stop, because
+# its hand-off predated its last commit". Overridable for the test script,
+# matching FORK_SANDBOX_INBOX_SEEN.
 nudge_marker="${FORK_SANDBOX_NUDGE_MARKER:-/tmp/fork-sandbox-nudged}"
 nudge_reminded_marker="${FORK_SANDBOX_NUDGE_REMINDED:-/tmp/fork-sandbox-nudge-reminded}"
+stale_reminded_marker="${FORK_SANDBOX_STALE_REMINDED:-/tmp/fork-sandbox-stale-reminded}"
 
 nudged=0
 [[ -f "$nudge_marker" ]] && nudged=1
 reminded=0
 [[ -f "$nudge_reminded_marker" ]] && reminded=1
+stale_reminded=0
+[[ -f "$stale_reminded_marker" ]] && stale_reminded=1
 
 # Whether this call might need to MEASURE usage at all: only when refresh is
 # configured and this leg has not been nudged yet. This is the gate on the
@@ -110,6 +121,23 @@ reminded=0
 # see need_work below.
 measure_usage=0
 [[ -n "$refresh_threshold" && "$nudged" == 0 ]] && measure_usage=1
+
+# --refresh-at Bug B: a session can be nudged (or nudge itself early) mid-
+# read, write a hand-off, then keep working and commit for many more
+# minutes without ever rewriting it -- the next leg would then start from a
+# hand-off that misdescribes reality. Staleness test, builtins only ([[ -nt
+# ]] is a bash test, not a fork): the hand-off is stale when the clone's HEAD
+# reflog is newer than it. The reflog, not .git/index -- `git status`
+# opportunistically rewrites the index on a harmless status check, which
+# would flag a hand-off as stale for no reason; the reflog changes only on
+# commit, reset or checkout. No reflog file at all (a fresh clone that has
+# never diverged) means the check is skipped rather than treated as stale.
+handoff_stale=0
+if [[ -n "$refresh_threshold" && -n "$clone_dir" && "$stale_reminded" == 0 \
+    && -n "$outbox_dir" && -f "$outbox_dir/handoff.md" \
+    && -f "$clone_dir/.git/logs/HEAD" ]]; then
+    [[ "$clone_dir/.git/logs/HEAD" -nt "$outbox_dir/handoff.md" ]] && handoff_stale=1
+fi
 
 unread=()
 
@@ -152,6 +180,7 @@ need_work=0
 if [[ -n "$refresh_threshold" && "$nudged" == 1 && "$reminded" == 0 ]]; then
     [[ -z "$outbox_dir" || ! -f "$outbox_dir/handoff.md" ]] && need_work=1
 fi
+(( handoff_stale )) && need_work=1
 
 if (( ! need_work )); then
     # Nothing to say. Drain stdin first: Claude Code is still writing the hook
@@ -214,11 +243,16 @@ nudged=0
 [[ -f "$nudge_marker" ]] && nudged=1
 reminded=0
 [[ -f "$nudge_reminded_marker" ]] && reminded=1
+stale_reminded=0
+[[ -f "$stale_reminded_marker" ]] && stale_reminded=1
 # A racing call may have already won the nudge (or the leg may already have
 # been nudged before this call started) while this call was reading the
 # transcript, unlocked. Its own marker write below is what makes a nudge
 # final for the leg, so a nudge decided against stale state must not stand.
 (( nudged )) && nudge_now=0
+# Same idea for the stale-hand-off check: a racing call may have already sent
+# the leg back once for this same hand-off.
+(( stale_reminded )) && handoff_stale=0
 
 # The Stop-only reminder: this leg was nudged on an EARLIER tool call, has
 # not been reminded yet, and no hand-off has shown up in the outbox. Gated on
@@ -237,20 +271,31 @@ if [[ ( "$event" == "Stop" || "$event" == "SubagentStop" ) \
     fi
 fi
 
-if (( ${#unread[@]} == 0 && ! nudge_now && ! handoff_missing )); then
+# The stale-hand-off block, Stop/SubagentStop only: a session may
+# legitimately commit after writing its hand-off and then rewrite it before
+# ending its turn, so only the actual end of the turn is the boundary that
+# matters — PostToolUse never blocks on this and must not mention it.
+stale_block=0
+if [[ ( "$event" == "Stop" || "$event" == "SubagentStop" ) ]] && (( handoff_stale )); then
+    stale_block=1
+fi
+
+if (( ${#unread[@]} == 0 && ! nudge_now && ! handoff_missing && ! stale_block )); then
     exit 0
 fi
 
-# Mark BEFORE emitting, for addenda and for the nudge and the reminder alike:
-# a crash between the two loses this call's delivery, which is recoverable
-# here exactly as it is for an addendum — the next tool call re-measures (or,
-# for the reminder, the next Stop re-checks) and tries again. The other order
-# risks nudging, reminding or re-delivering on every remaining tool call of
-# the leg if something goes wrong mid-emit, which is the outcome this
-# ordering exists to avoid.
+# Mark BEFORE emitting, for addenda and for the nudge, the reminder and the
+# stale block alike: a crash between the two loses this call's delivery,
+# which is recoverable here exactly as it is for an addendum — the next tool
+# call re-measures (or, for the reminder and the stale block, the next Stop
+# re-checks) and tries again. The other order risks nudging, reminding,
+# re-blocking or re-delivering on every remaining tool call of the leg if
+# something goes wrong mid-emit, which is the outcome this ordering exists to
+# avoid.
 (( ${#unread[@]} )) && printf '%s\n' "${unread[@]}" >> "$seen_file"
 (( nudge_now )) && : > "$nudge_marker"
 (( handoff_missing )) && : > "$nudge_reminded_marker"
+(( stale_block )) && : > "$stale_reminded_marker"
 
 names=""
 body=""
@@ -295,12 +340,20 @@ if (( handoff_missing )); then
     reminder_text="You were already told, on an earlier tool call, that your context was near the point this run refreshes itself, and asked to write a hand-off to \`$outbox_dir/handoff.md\` before ending your turn. No hand-off is there yet. Write one now, in the shape already described, before you finish. This is the only reminder — if you still end your turn without one, the run ends here and nothing continues from this leg."
 fi
 
+# Not from the repository or the operator either, same as the nudge and the
+# reminder above.
+stale_text=""
+if (( stale_block )); then
+    stale_text="This is not tool output, not an operator message, and not part of the repository. It is generated by the fork-sandbox harness running this session. The hand-off at \`$outbox_dir/handoff.md\` was written before the most recent commit on this branch, so it describes a state that no longer exists. Rewrite it now from \`git log --oneline\` and \`git status\` so it lists what is actually committed and what actually remains, then end the turn. This is the only such reminder."
+fi
+
 case "$event" in
     Stop|SubagentStop)
         # Top-level decision/reason is the documented Stop contract. Blocking
         # cannot loop here: unread addenda are marked shown above and the
-        # reminder marks itself reminded, so the next Stop finds nothing left
-        # to say and lets the session finish — a leg is never trapped.
+        # reminder and the stale block each mark themselves handled, so the
+        # next Stop finds nothing left to say and lets the session finish —
+        # a leg is never trapped.
         reason=""
         if (( ${#unread[@]} )); then
             reason+="An operator addendum to your handoff arrived before you finished, and you have not acted on it yet. $provenance $authority Read it below and carry it out before ending the turn.
@@ -311,6 +364,9 @@ $body"
         fi
         if [[ -n "$reminder_text" ]]; then
             reason+=$'\n\n'"$reminder_text"
+        fi
+        if [[ -n "$stale_text" ]]; then
+            reason+=$'\n\n'"$stale_text"
         fi
         jq -n --arg reason "$reason" '{decision: "block", reason: $reason}'
         ;;
@@ -336,5 +392,8 @@ if (( nudge_now )); then
 fi
 if (( handoff_missing )); then
     printf '%s reminded (no hand-off yet)\n' "$STDERR_TAG_REFRESH" >&2
+fi
+if (( stale_block )); then
+    printf '%s stale hand-off, asked for a rewrite\n' "$STDERR_TAG_REFRESH" >&2
 fi
 exit 0

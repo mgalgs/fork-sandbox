@@ -2826,6 +2826,12 @@ if (( refresh_enabled )); then
     {
         printf 'THRESHOLD_TOKENS=%s\n' "$refresh_threshold_tokens"
         printf 'OUTBOX_DIR=%s\n' "$outbox_dir"
+        # CLONE_DIR: the clone is bound into the sandbox at this same
+        # absolute path (see fs_build_sandbox_cmd below), so the hook can
+        # stat $CLONE_DIR/.git/logs/HEAD without knowing anything else about
+        # the run's layout -- see its own comment on why the reflog and not
+        # the index.
+        printf 'CLONE_DIR=%s\n' "$clone_dir"
     } > "$refresh_config"
     fs_reject_unsafe_chars "$refresh_config"
 fi
