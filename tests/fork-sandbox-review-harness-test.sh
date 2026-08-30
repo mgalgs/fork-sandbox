@@ -394,12 +394,20 @@ case "$n" in
         -C "$clone_dir" commit --allow-empty -q -m "leg $n"
     ;;
 2)
-    # The review leg: findings, so a fix leg follows.
+    # The review leg: an addendum lands mid-leg here too, so next_leg_no's
+    # arithmetic (leg_no + 1, continued across the loop) is exercised against
+    # a leg other than the implement one -- a wrong starting value or a
+    # missing increment would otherwise never be exercised, since the only
+    # addendum in this scenario used to be the implement leg's. Findings, so
+    # a fix leg follows.
+    printf 'a message sent while the review leg ran\n' > "$inbox_dir/9999999900-02.md"
     printf 'FINDINGS\n\nfile.txt:1 not quite right\n' \
         > "$clone_dir/.git/review-verdict.md"
     ;;
 *)
-    # The fix leg: commit again, so the loop does not read as no-progress.
+    # The fix leg: an addendum lands mid-leg here too, for the same reason.
+    # Commit again, so the loop does not read as no-progress.
+    printf 'a message sent while the fix leg ran\n' > "$inbox_dir/9999999900-03.md"
     git -c user.email=t@fork-sandbox.invalid -c user.name=Tester \
         -C "$clone_dir" commit --allow-empty -q -m "leg $n"
     ;;
@@ -432,6 +440,36 @@ if (( rc9 == 0 )) && [[ -n "$rd9" ]]; then
     else
         no "the addendum the implement leg saw is archived under inbox-delivered/leg-1"
     fi
+
+    # next_leg_no starts at the implement leg's own number + 1 and advances
+    # once per review/fix leg -- unverified until now, since the only
+    # addendum in this scenario used to be the implement leg's, so the
+    # review and fix legs' own fs_archive_inbox calls were always exercised
+    # against an already-empty inbox. A wrong starting value or a missing
+    # increment would collide two of these three legs' archives into one
+    # directory; distinct, correctly-numbered directories rule that out.
+    archived_review9="$(find "$rd9/inbox-delivered/leg-2" -maxdepth 1 -name '*.md' 2>/dev/null | head -1)"
+    if [[ -n "$archived_review9" ]]; then
+        ok "the addendum sent to the review leg is archived under inbox-delivered/leg-2"
+        contains "the review leg's archived addendum keeps its own text" \
+            "a message sent while the review leg ran" "$(cat "$archived_review9")"
+    else
+        no "the addendum sent to the review leg is archived under inbox-delivered/leg-2"
+        no "the review leg's archived addendum keeps its own text" "no archived file"
+    fi
+    archived_fix9="$(find "$rd9/inbox-delivered/leg-3" -maxdepth 1 -name '*.md' 2>/dev/null | head -1)"
+    if [[ -n "$archived_fix9" ]]; then
+        ok "the addendum sent to the fix leg is archived under inbox-delivered/leg-3"
+        contains "the fix leg's archived addendum keeps its own text" \
+            "a message sent while the fix leg ran" "$(cat "$archived_fix9")"
+    else
+        no "the addendum sent to the fix leg is archived under inbox-delivered/leg-3"
+        no "the fix leg's archived addendum keeps its own text" "no archived file"
+    fi
+    review_count9="$(find "$rd9/inbox-delivered/leg-2" -maxdepth 1 -name '*.md' 2>/dev/null | wc -l | tr -d ' ')"
+    fix_count9="$(find "$rd9/inbox-delivered/leg-3" -maxdepth 1 -name '*.md' 2>/dev/null | wc -l | tr -d ' ')"
+    check "the review and fix legs' archives are separate, one file each, not merged" \
+        "1 1" "$review_count9 $fix_count9"
 else
     no "run_real produced a run directory for the review/fix-inbox scenario" \
         "rc=$rc9: $out9"

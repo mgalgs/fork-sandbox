@@ -3410,6 +3410,12 @@ started_at="$(date +%s)"
     printf 'model=%q\n' "$model"
     printf 'review_model=%q\n' "$review_model"
     printf 'review_harness=%q\n' "$review_harness"
+    # run_leg needs this to know whether a review leg's own Stop-hook
+    # invariant holds for fs_archive_inbox -- see review_preamble_harness's
+    # own definition above, beside the review preamble, for why it is not
+    # simply "$review_harness": with no --review-harness that is empty, and
+    # a review leg then runs on the implement harness instead.
+    printf 'review_preamble_harness=%q\n' "$review_preamble_harness"
     # The review leg's own accounting state, so run_leg can read a leg's
     # session dir, usage reader, formatter and credential file without
     # knowing whether --review-harness was given -- see the "rev_*"
@@ -3472,18 +3478,30 @@ rm -f "$run_dir/exit-code"
 # leg ends, every '*.md' in the inbox has already been delivered to it: move
 # each one out into that leg's own record. $1 is the leg number the console
 # log and --monitor use -- the implement leg is 1, and continuation, review
-# and fix legs continue the count in the order they ran. The path is built
-# from run_dir, the same fixed-name discipline fork-sandbox-status.sh's
-# resolve_run_subdir uses, rather than threaded in as its own variable: this
-# runner is a generated, standalone script, and run_dir is the one thing
-# about the inbox it already carries. The dotfiles the hook and --refresh-at
-# share the inbox with (.inbox-hook.sh, .settings.json, .refresh-config) are
-# untouched by the '*.md' glob already. A symlink is refused rather than
-# followed -- the inbox is host-written and nothing should ever put one
-# there, but archiving is a move, and following a link out of the inbox is
-# not a mistake worth making possible.
+# and fix legs continue the count in the order they ran. $2 is the harness
+# THAT LEG actually ran on: the Stop-contract guarantee above only holds on
+# claude, which is the only harness the hook is installed for (see the
+# harness check above the inbox_hook/inbox_settings block) -- every other
+# harness only asks the session in its prompt to go look, and cannot enforce
+# it, so a leg that ran pi/pi-local/codex may end with an addendum it never
+# read. Archiving that file anyway would not just mislabel it: it moves the
+# addendum out of the live inbox path the NEXT leg's own prompt names, into
+# a numbered directory nothing but a --refresh-at continuation ever reads
+# back, so it would never reach any session at all. Skip the move on any
+# non-claude leg and leave the file where every leg's prompt already tells
+# the agent to look. The path is built from run_dir, the same fixed-name
+# discipline fork-sandbox-status.sh's resolve_run_subdir uses, rather than
+# threaded in as its own variable: this runner is a generated, standalone
+# script, and run_dir is the one thing about the inbox it already carries.
+# The dotfiles the hook and --refresh-at share the inbox with
+# (.inbox-hook.sh, .settings.json, .refresh-config) are untouched by the
+# '*.md' glob already. A symlink is refused rather than followed -- the
+# inbox is host-written and nothing should ever put one there, but archiving
+# is a move, and following a link out of the inbox is not a mistake worth
+# making possible.
 fs_archive_inbox() {
-    local leg_no="$1" inbox_dir="$run_dir/inbox" dest="" f moved=0
+    local leg_no="$1" leg_harness="$2" inbox_dir="$run_dir/inbox" dest="" f moved=0
+    [[ "$leg_harness" == "claude" ]] || return 0
     for f in "$inbox_dir"/*.md; do
         [[ -e "$f" || -L "$f" ]] || continue
         if [[ -L "$f" ]]; then
@@ -3665,7 +3683,7 @@ fi
 rc="${PIPESTATUS[0]:-1}"
 # The implement leg is leg 1. Archive right after its exit code is known,
 # same as every later leg below.
-fs_archive_inbox 1
+fs_archive_inbox 1 "$harness"
 # exit-code is what fork-sandbox-status.sh reads as "this run is over": it
 # reports the run finished the moment the file exists, and --monitor fires its
 # one terminal event there. With a review loop still to come that would be a
@@ -3910,11 +3928,22 @@ refresh_build_prompt() {
         printf '\n---\n\n# This is continuation %s of a run that refreshed its context\n\n' "$n"
         printf 'A previous session, in this same clone and on this same branch, used up\n'
         printf 'most of its context window and wrote a hand-off for a fresh session to\n'
-        printf 'continue from. You are that fresh session, with none of its memory. Two\n'
-        printf 'documents follow: the original brief this run was launched with, and\n'
-        printf 'the hand-off the previous leg wrote against it.\n\n'
+        printf 'continue from. You are that fresh session, with none of its memory.\n'
+        if [[ -n "$addenda_list" ]]; then
+            printf 'Three documents follow: the original brief this run was launched\n'
+            printf 'with, any operator addenda delivered to earlier legs of this run,\n'
+            printf 'and the hand-off the previous leg wrote against it.\n\n'
+        else
+            printf 'Two documents follow: the original brief this run was launched with,\n'
+            printf 'and the hand-off the previous leg wrote against it.\n\n'
+        fi
         printf 'The brief is authoritative for what the task IS -- check its own list\n'
         printf 'of items, not the hand-off'"'"'s account of it, to decide what is left.\n'
+        if [[ -n "$addenda_list" ]]; then
+            printf 'The addenda carry the same authority as the brief and outrank it\n'
+            printf 'where the two conflict -- see their own section below for what each\n'
+            printf 'one asked for.\n'
+        fi
         printf 'The hand-off is authoritative for what has been done against the brief\n'
         printf 'so far. Where the hand-off summarises, abbreviates or omits items the\n'
         printf 'brief contains, the brief wins.\n\n'
@@ -4001,6 +4030,7 @@ if [[ "$refresh_enabled" == "1" ]]; then
                     "$record_name" >> "$sandbox_log"
                 rm -f -- "$run_dir/$record_name" 2>/dev/null
                 refresh_leg_n=$(( refresh_leg_n - 1 ))
+                leg_no=$(( leg_no - 1 ))
                 refresh_ended="no-handoff"
                 break
             fi
@@ -4049,7 +4079,7 @@ if [[ "$refresh_enabled" == "1" ]]; then
                     | tee -a "$events" -a "$cont_events"
             fi
             rc="${PIPESTATUS[0]:-1}"
-            fs_archive_inbox "$leg_no"
+            fs_archive_inbox "$leg_no" "$harness"
             refresh_last_events="$cont_events"
 
             cont_cost="$("$formatter" --cost "$cont_events" 2>/dev/null)"
@@ -4287,11 +4317,19 @@ run_leg() {
     local leg_pi_session_dir="$pi_session_dir"
     local leg_usage_source="$usage_source"
     local leg_formatter="$formatter"
+    # The harness THIS leg actually runs on -- $review_preamble_harness for a
+    # review leg (set above beside the review preamble: $review_harness when
+    # --review-harness was given, $harness otherwise), $harness for a fix
+    # leg, which never overrides it. fs_archive_inbox's Stop-contract
+    # invariant only holds for whichever harness this is, not for the
+    # implement harness unconditionally.
+    local leg_harness="$harness"
     if [[ "$kind" == "review" ]]; then
         cmd=("${review_sandbox_cmd[@]}")
         leg_pi_session_dir="$rev_pi_session_dir"
         leg_usage_source="$rev_usage_source"
         leg_formatter="$rev_formatter"
+        leg_harness="$review_preamble_harness"
     fi
     leg_rc=1
     leg_cost=""
@@ -4333,7 +4371,7 @@ run_leg() {
             | tee -a "$leg_events"
     fi
     leg_rc="${PIPESTATUS[0]:-1}"
-    fs_archive_inbox "$next_leg_no"
+    fs_archive_inbox "$next_leg_no" "$leg_harness"
     next_leg_no=$(( next_leg_no + 1 ))
 
     # The same three readers the implement leg's accounting uses, applied per

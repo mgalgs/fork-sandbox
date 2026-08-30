@@ -578,6 +578,60 @@ if [[ -n "$rd" ]]; then
         "cap" "$(jq -r '.refresh' "$rd/summary.json" 2>/dev/null)"
 fi
 
+# -- every leg sent its own addendum, over enough legs to reach a two-digit
+# leg number: the central claim of "carry every earlier leg's addenda, not
+# just the immediate predecessor's, oldest first" is otherwise never
+# exercised -- the single-leg addendum scenario above only ever has ONE
+# archived leg directory to embed, so an implementation that kept only the
+# immediate predecessor's addenda (instead of all of them) or that sorted
+# archive directories lexically instead of numerically ("leg-10" before
+# "leg-2") would pass every other check in this file unchanged.
+# --refresh-max 10 pushes the chain to 11 legs so a leg-10 exists to
+# mis-sort against leg-2 if the numeric sort regressed to a lexical one.
+count_file="$(mktemp)"; tmpdirs+=("$count_file")
+FAKE_ADDENDUM_LEGS=all
+rd="$(run_real "$proj" "$count_file" all all --refresh-at 0.5 --refresh-max 10)"
+FAKE_ADDENDUM_LEGS=""
+[[ -n "$rd" ]] && tmpdirs+=("$rd")
+if [[ -n "$rd" ]]; then
+    check "an always-addending run still stops at 11 legs (1 + 10 continuations)" \
+        "11" "$(cat "$count_file")"
+    last_prompt="$rd/continuation-prompt-10.md"
+    if [[ -f "$last_prompt" ]]; then
+        # Anchored, not the substring-matching `contains` helper: "operator
+        # addendum for leg 1" is itself a substring of "...leg 10", so a
+        # plain `contains` for leg 1 would pass even if leg 1's own line
+        # were missing and only leg 10's survived.
+        if grep -q 'operator addendum for leg 1$' "$last_prompt"; then
+            ok "leg 11's continuation prompt carries leg 1's addendum"
+        else
+            no "leg 11's continuation prompt carries leg 1's addendum"
+        fi
+        contains "leg 11's continuation prompt carries leg 9's addendum, not just leg 10's" \
+            "operator addendum for leg 9" "$(cat "$last_prompt")"
+        contains "leg 11's continuation prompt carries leg 10's own addendum" \
+            "operator addendum for leg 10" "$(cat "$last_prompt")"
+        leg2_at="$(grep -n 'operator addendum for leg 2$' "$last_prompt" | head -1 | cut -d: -f1)"
+        leg10_at="$(grep -n 'operator addendum for leg 10$' "$last_prompt" | head -1 | cut -d: -f1)"
+        if [[ -n "$leg2_at" && -n "$leg10_at" && "$leg2_at" -lt "$leg10_at" ]]; then
+            ok "leg 2's addendum sorts before leg 10's (numeric, not lexical, leg order)"
+        else
+            no "leg 2's addendum sorts before leg 10's (numeric, not lexical, leg order)" \
+                "leg 2 at $leg2_at, leg 10 at $leg10_at"
+        fi
+    else
+        no "leg 11's continuation prompt carries leg 1's addendum" "no continuation prompt"
+        no "leg 11's continuation prompt carries leg 9's addendum, not just leg 10's" "no continuation prompt"
+        no "leg 11's continuation prompt carries leg 10's own addendum" "no continuation prompt"
+        no "leg 2's addendum sorts before leg 10's (numeric, not lexical, leg order)" "no continuation prompt"
+    fi
+    if [[ -d "$rd/inbox-delivered/leg-10" && -d "$rd/inbox-delivered/leg-2" ]]; then
+        ok "both leg-2 and leg-10 archive directories exist"
+    else
+        no "both leg-2 and leg-10 archive directories exist"
+    fi
+fi
+
 # -- a nudge with no hand-off: the implement leg is nudged but never writes
 # to the outbox, so the chain never starts and says why.
 count_file="$(mktemp)"; tmpdirs+=("$count_file")
