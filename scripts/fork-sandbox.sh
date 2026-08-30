@@ -3822,12 +3822,15 @@ refresh_leg_was_nudged() {
 # named in handoff-N.md, continuation-prompt-N.md and README/SKILL.md, NOT
 # the leg number the console log and --monitor use, which counts the
 # implement leg as 1). $2 the hand-off file, already moved to its $run_dir
-# record. $3 the destination path. The static preamble, then two documents in
-# full: the original brief ($handoff_original, snapshotted once at launch --
-# see above) and the previous leg's own hand-off -- there is no verdict-style
-# body to append here, unlike the fix leg's prompt.
+# record. $3 the destination path. $4 (optional, default 0) whether the host-
+# side backstop found this hand-off older than the clone's last commit -- see
+# its check above. The static preamble, then two documents in full: the
+# original brief ($handoff_original, snapshotted once at launch -- see above)
+# and the previous leg's own hand-off, with a warning block between them when
+# $4 is set -- there is no verdict-style body to append here, unlike the fix
+# leg's prompt.
 refresh_build_prompt() {
-    local n="$1" handoff="$2" out="$3"
+    local n="$1" handoff="$2" out="$3" stale="${4:-0}"
     {
         cat -- "$continuation_prompt_header"
         printf '\n---\n\n# This is continuation %s of a run that refreshed its context\n\n' "$n"
@@ -3843,6 +3846,12 @@ refresh_build_prompt() {
         printf 'brief contains, the brief wins.\n\n'
         printf '\n---\n\n## The original brief\n\n'
         cat -- "$handoff_original"
+        if (( stale )); then
+            printf '\n---\n\n## Warning: this hand-off is stale\n\n'
+            printf 'It was written before the last commit on this branch, so its "done"\n'
+            printf 'and "left" lists may be wrong. Run `git log --oneline` and `git status`\n'
+            printf 'first and reconcile against the brief above before doing anything.\n'
+        fi
         printf '\n---\n\n## Hand-off from the previous leg\n\n'
         cat -- "$handoff"
     } > "$out.part"
@@ -3905,8 +3914,23 @@ if [[ "$refresh_enabled" == "1" ]]; then
                 break
             fi
 
+            # Bug B's host-side backstop: the sandbox-side Stop check cannot
+            # help a leg that died (quota, crash, timeout) right after
+            # writing an early hand-off. mv above preserves mtime, so this
+            # compares the RECORD, not the outbox path it came from. This
+            # reads an mtime only -- it does NOT run git in the clone, which
+            # stays forbidden on the host (see the review-loop commit count
+            # below, "nothing may run git in the clone to count them there").
+            handoff_stale=0
+            if [[ -f "$clone_dir/.git/logs/HEAD" \
+                && "$clone_dir/.git/logs/HEAD" -nt "$run_dir/$record_name" ]]; then
+                handoff_stale=1
+                printf "fork-sandbox: %s predates the clone's last commit; continuation %s is warned\n" \
+                    "$record_name" "$leg_no" | tee -a "$sandbox_log"
+            fi
+
             cont_prompt="$run_dir/continuation-prompt-$refresh_leg_n.md"
-            refresh_build_prompt "$refresh_leg_n" "$run_dir/$record_name" "$cont_prompt"
+            refresh_build_prompt "$refresh_leg_n" "$run_dir/$record_name" "$cont_prompt" "$handoff_stale"
 
             # A synthetic marker event, so --monitor and --follow notice a
             # continuation starting without waiting for that leg's own first
@@ -3952,6 +3976,8 @@ if [[ "$refresh_enabled" == "1" ]]; then
                 loop_cost_unknown=1
             fi
 
+            handoff_stale_json=false
+            (( handoff_stale )) && handoff_stale_json=true
             merged="$(jq -c -n \
                 --argjson prev "$continuations_json" \
                 --argjson leg "$leg_no" \
@@ -3959,7 +3985,8 @@ if [[ "$refresh_enabled" == "1" ]]; then
                 --argjson cost "$cont_cost" \
                 --argjson usage "$cont_usage" \
                 --arg handoff "$record_name" \
-                '$prev + [{leg: $leg, exit: $exit, cost_usd: $cost, usage: $usage, handoff: $handoff}]' \
+                --argjson handoff_stale "$handoff_stale_json" \
+                '$prev + [{leg: $leg, exit: $exit, cost_usd: $cost, usage: $usage, handoff: $handoff, handoff_stale: $handoff_stale}]' \
                 2>/dev/null)"
             [[ -n "$merged" ]] && continuations_json="$merged"
 

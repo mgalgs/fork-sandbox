@@ -262,9 +262,9 @@ cat > "$stub_bin/claude-sandboxed" <<'STUB'
 # session's observable effect on the parts fork-sandbox.sh's outer refresh
 # loop reacts to. Which invocation this is (1 = implement leg, 2 = first
 # continuation, ...) comes from a counter file so a scenario can control each
-# leg independently; FAKE_NUDGE_LEGS, FAKE_HANDOFF_LEGS, FAKE_SYMLINK_LEGS
-# and FAKE_FAIL_LEGS are comma lists of leg numbers (or the literal "all"),
-# read fresh per call.
+# leg independently; FAKE_NUDGE_LEGS, FAKE_HANDOFF_LEGS, FAKE_SYMLINK_LEGS,
+# FAKE_FAIL_LEGS and FAKE_STALE_LEGS are comma lists of leg numbers (or the
+# literal "all"), read fresh per call.
 set -uo pipefail
 
 outbox=""
@@ -285,6 +285,7 @@ nudge_legs=",${FAKE_NUDGE_LEGS:-},"
 handoff_legs=",${FAKE_HANDOFF_LEGS:-},"
 symlink_legs=",${FAKE_SYMLINK_LEGS:-},"
 fail_legs=",${FAKE_FAIL_LEGS:-},"
+stale_legs=",${FAKE_STALE_LEGS:-},"
 
 if [[ "${FAKE_NUDGE_LEGS:-}" == "all" || "$nudge_legs" == *",$n,"* ]]; then
     printf '{"type":"system","subtype":"hook_response","stderr":"fork-sandbox-refresh: nudged (usage >= 1 tokens)\\n"}\n'
@@ -294,6 +295,18 @@ if [[ "${FAKE_SYMLINK_LEGS:-}" == "all" || "$symlink_legs" == *",$n,"* ]]; then
 elif [[ "${FAKE_HANDOFF_LEGS:-}" == "all" || "$handoff_legs" == *",$n,"* ]]; then
     if [[ -n "$outbox" ]]; then
         printf 'HANDOFF from leg %s\n' "$n" > "$outbox/handoff.md"
+        # The host's stale-hand-off backstop compares this hand-off's mtime
+        # against the clone's HEAD reflog. The clone is the run dir's own
+        # "clone/<name>" sibling of this outbox -- touch its reflog into the
+        # future, deterministically, rather than racing a real mtime.
+        if [[ "${FAKE_STALE_LEGS:-}" == "all" || "$stale_legs" == *",$n,"* ]] \
+            && [[ -n "$outbox" ]]; then
+            run_dir="$(dirname "$outbox")"
+            clone_dir="$(find "$run_dir/clone" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -1)"
+            if [[ -n "$clone_dir" && -f "$clone_dir/.git/logs/HEAD" ]]; then
+                touch -d '+1 hour' "$clone_dir/.git/logs/HEAD"
+            fi
+        fi
     fi
 fi
 
@@ -344,6 +357,7 @@ run_real() {
         FAKE_SYMLINK_LEGS="${FAKE_SYMLINK_LEGS:-}" \
         FAKE_SYMLINK_TARGET="${FAKE_SYMLINK_TARGET:-}" \
         FAKE_FAIL_LEGS="${FAKE_FAIL_LEGS:-}" \
+        FAKE_STALE_LEGS="${FAKE_STALE_LEGS:-}" \
         timeout 60 "$launcher" --foreground --harness claude "$@" \
         "$proj" "$handoff" 2>&1)"
     rc=$?
@@ -385,6 +399,11 @@ if [[ -n "$rd" ]]; then
             "## The original brief" "$(cat "$cont_prompt")"
         contains "leg 2's prompt has the hand-off heading" \
             "## Hand-off from the previous leg" "$(cat "$cont_prompt")"
+        if grep -q '## Warning: this hand-off is stale' "$cont_prompt"; then
+            no "an on-time hand-off's prompt carries no stale warning"
+        else
+            ok "an on-time hand-off's prompt carries no stale warning"
+        fi
         brief_at="$(grep -n '## The original brief' "$cont_prompt" | head -1 | cut -d: -f1)"
         handoff_at="$(grep -n '## Hand-off from the previous leg' "$cont_prompt" | head -1 | cut -d: -f1)"
         if [[ -n "$brief_at" && -n "$handoff_at" && "$brief_at" -lt "$handoff_at" ]]; then
@@ -400,6 +419,7 @@ if [[ -n "$rd" ]]; then
         no "leg 2's prompt carries the original brief's text"
         no "leg 2's prompt has the original-brief heading"
         no "leg 2's prompt has the hand-off heading"
+        no "an on-time hand-off's prompt carries no stale warning"
         no "the brief heading appears before the hand-off heading"
     fi
     check "handoff-original.md is the raw handoff, byte for byte" \
@@ -411,11 +431,36 @@ if [[ -n "$rd" ]]; then
             "empty-outbox" "$(jq -r '.refresh' "$rd/summary.json")"
         check "the continuation's leg number is 2" \
             "2" "$(jq -r '.continuations[0].leg' "$rd/summary.json")"
+        check "an on-time hand-off is not marked stale in summary.json" \
+            "false" "$(jq -r '.continuations[0].handoff_stale' "$rd/summary.json")"
     else
         no "summary.json has one continuation" "no summary.json"
         no "summary.json's refresh field is empty-outbox" "no summary.json"
         no "the continuation's leg number is 2" "no summary.json"
+        no "an on-time hand-off is not marked stale in summary.json" "no summary.json"
     fi
+fi
+
+# -- a hand-off that predates the clone's last commit by the time the host
+# picks it up (the leg kept working after writing it and never rewrote it,
+# or died before it could): the continuation prompt gets a warning block and
+# summary.json's continuation entry is marked handoff_stale.
+count_file="$(mktemp)"; tmpdirs+=("$count_file")
+FAKE_STALE_LEGS=1
+rd="$(run_real "$proj" "$count_file" 1 1 --refresh-at 0.5)"
+FAKE_STALE_LEGS=""
+[[ -n "$rd" ]] && tmpdirs+=("$rd")
+if [[ -n "$rd" ]]; then
+    cont_prompt="$rd/continuation-prompt-1.md"
+    if [[ -f "$cont_prompt" ]]; then
+        contains "a stale hand-off's continuation prompt carries the warning heading" \
+            "## Warning: this hand-off is stale" "$(cat "$cont_prompt")"
+    else
+        no "a stale hand-off's continuation prompt carries the warning heading" \
+            "no continuation prompt"
+    fi
+    check "summary.json marks the continuation's hand-off stale" \
+        "true" "$(jq -r '.continuations[0].handoff_stale' "$rd/summary.json" 2>/dev/null)"
 fi
 
 # -- --refresh-max 0: the implement leg is nudged and writes a hand-off, but
