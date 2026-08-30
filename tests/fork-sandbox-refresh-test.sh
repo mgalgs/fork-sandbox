@@ -128,6 +128,17 @@ contains "usage at threshold: nudge fires as additionalContext" \
     "this run refreshes itself" "$(printf '%s' "$out" | jq -r '.hookSpecificOutput.additionalContext // empty')"
 contains "the nudge names the outbox hand-off path" \
     "$inbox/outbox/handoff.md" "$(printf '%s' "$out" | jq -r '.hookSpecificOutput.additionalContext // empty')"
+contains "the nudge says the hand-off must not restate the brief" \
+    "must NOT restate the brief" "$(printf '%s' "$out" | jq -r '.hookSpecificOutput.additionalContext // empty')"
+contains "the nudge asks for a per-item list against the brief's own headings" \
+    "item by item, using the brief's own numbering or headings" \
+    "$(printf '%s' "$out" | jq -r '.hookSpecificOutput.additionalContext // empty')"
+contains "the nudge forbids compressing remaining items into a summary" \
+    "Never compress remaining items into" \
+    "$(printf '%s' "$out" | jq -r '.hookSpecificOutput.additionalContext // empty')"
+contains "the nudge asks for a rewrite if more work happens before the turn ends" \
+    "rewrite it before you end your turn" \
+    "$(printf '%s' "$out" | jq -r '.hookSpecificOutput.additionalContext // empty')"
 marker "the nudge marker is written" "$nudge_marker" yes
 
 # Delivered once: the marker means the next call, even well over threshold,
