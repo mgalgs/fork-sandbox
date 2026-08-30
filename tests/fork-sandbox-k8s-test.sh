@@ -1150,7 +1150,7 @@ rm -f /tmp/fs-k8s-ctx-wf.err
 cf_exist_dest="$cf_parent/exist_dest"
 mkdir -p "$cf_exist_dest"
 refuses "an existing DEST_DIR is refused" \
-    "" \
+    "already exists; refusing" \
     "$context_extract_sh" "$cf_exist_dest" 100000000 < "$cf_wf_tar"
 
 # absolute path: refused outright, whole archive, before anything is

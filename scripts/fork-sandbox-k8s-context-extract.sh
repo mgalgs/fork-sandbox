@@ -132,7 +132,13 @@ while IFS= read -r path; do
 done < "$tf_out"
 
 # Freshly created: mkdir, not mkdir -p, so this fails loudly if dest_dir
-# already exists rather than merging a second push into a first.
+# already exists rather than merging a second push into a first. Named
+# explicitly here rather than left to mkdir's own generic "File exists"
+# message, so a caller (and a test) can pin what refused it.
+if [ -e "$dest_dir" ]; then
+    echo "fork-sandbox-k8s-context-extract: DEST_DIR '$dest_dir' already exists; refusing." >&2
+    exit 1
+fi
 mkdir -- "$dest_dir"
 
 # Never as anyone but the invoking user -- no sudo, nothing
