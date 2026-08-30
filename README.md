@@ -209,28 +209,65 @@ discovers and installs it for you — see [docs/configure.md](docs/configure.md)
 
 ## Skills
 
-The `skills/` directory is for the agent that *orchestrates* runs, not the one
-inside the sandbox:
+Five skills ship with the package. They are plain markdown, readable by any
+agent; `install.sh` links them into Claude Code's skills directory, the
+`~/.agents/skills` convention, and pi's. Codex users can point at the
+scripts directly.
 
-- **`fork-sandbox`** — how to launch a run, watch it, and read what came back.
-- **`sandbox-coder-mode`** — a standing mode: the session stops writing code
-  and becomes an orchestrator, reviewer and integrator, delegating every edit
-  to a sandboxed run. An expensive model plans and reviews while a cheap or
-  self-hosted one does the typing.
-- **`commit-then-review`**, **`code-review-portable`** — the review kit, bound
-  into every run.
-- **`lkml-mode`** — review a whole patch series the way the Linux kernel
-  mailing list does: a cover letter and patches posted to a shared mailbox,
-  a panel of AI-persona reviewers (always including a Linus Torvalds
-  caricature) replying in threads from their own sandboxed runs, an author
-  persona posting v2, v3... with a changelog answering review, converging
-  when the right reviewers have signed off and no NAK stands. Reach for it
-  on a change substantial enough to want several independent voices and an
-  iterated record of why it changed, not on a diff you can review yourself.
+For the session that orchestrates runs:
 
-`install.sh` links them into Claude Code's skills directory, the
-`~/.agents/skills` convention, and pi's. Codex users can point at the scripts
-directly; the skills are markdown, readable by anything.
+- **`sandbox-coder-mode`** — the workhorse. A standing mode: your session
+  stops writing code and becomes orchestrator, reviewer and integrator;
+  every edit happens in a sandboxed run on its own branch. The expensive
+  model plans and reviews, a cheap or self-hosted one types. See
+  [Driving sandbox-coder-mode](#driving-sandbox-coder-mode) below.
+- **`fork-sandbox`** — one run at a time: launch it, watch it, read what
+  comes back.
+- **`lkml-mode`** — review a patch series the way the Linux kernel mailing
+  list does: a shared mailbox, a panel of AI-persona reviewers (a Linus
+  Torvalds caricature always among them) replying in threads from their own
+  sandboxed runs, an author persona posting v2, v3... until the right
+  reviewers sign off and no NAK stands. For a change that deserves several
+  adversarial voices — not a diff you can read yourself.
+
+Bound into every run, for the agent inside the sandbox:
+
+- **`commit-then-review`**, **`code-review-portable`** — the review kit:
+  commit, then find and verify defects before reporting back.
+
+### Driving sandbox-coder-mode
+
+Start it, speak in goals, end it with a sentence:
+
+```
+/sandbox-coder-mode          # or: /sandbox-coder-mode --long
+
+fix the flaky tests
+...
+exit sandbox coder mode
+```
+
+What to expect while it is on:
+
+- Coding work dispatches by its shape, not its origin: a build becomes a
+  sandboxed run on an `sbx-` branch, while a small, self-contained edit —
+  right by reading, a few lines across a file or two — executes
+  in-session. The session reports each sandboxed round in a few lines —
+  branch, what landed, whether the suites pass on the host, any caveat —
+  and quotes the cost every round.
+- The composition is yours, not the session's: runs launch at the mode's
+  defaults (a light model implements, a stronger one reviews, up to two
+  review loops), overridable per machine in
+  `~/.config/fork-sandbox/coder-mode.env`. The session never lowers the
+  review on its own; a deviation is announced in one line.
+- Steer a round in flight by just saying so — the session relays the
+  correction into the running sandbox as an operator addendum, without
+  restarting it.
+- Nothing is pushed until you say "push". Integrated-but-unpushed work
+  accumulates on your working branch, and the session names the count.
+- `--long` is the many-rounds-across-hours variant: the same mode, with
+  more discipline about commits, handoffs between context windows, and
+  distrust of a run's own self-report.
 
 ## Portability
 
