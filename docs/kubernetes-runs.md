@@ -405,12 +405,22 @@ and instructs it not to write there anyway, instead of asserting an
 enforcement that does not actually exist — see `fs_emit_prompt_preamble` in
 `scripts/fork-sandbox-lib.sh`.
 
-Delivery is the hookless contract every non-`claude` harness already gets
-from that same function: pi has no hook system, so the pod's prompt tells
+Delivery depends on which harness the coding leg runs. `--harness pi` gets
+the hookless contract every non-`claude` harness gets from
+`fs_emit_prompt_preamble`: pi has no hook system, so the pod's prompt tells
 the agent to read the inbox itself — on a tool-call floor, around long
-commands, before each commit, and before its final report. Nothing new was
-needed for this: the pod already passed `pi` as the harness argument, for
-the reason `fs_emit_prompt_preamble`'s hookless branch exists at all.
+commands, before each commit, and before its final report. `--harness
+claude` gets the same hook a local claude run does:
+`scripts/fork-sandbox-inbox-hook.sh` ships in the per-run ConfigMap, the
+entrypoint installs it at `/work/inbox/.inbox-hook.sh` (mode 755 — the
+ConfigMap mount itself is read-only 0644) and wires it into `PostToolUse`
+and `Stop` via a `--settings` file built with the same `jq` shape
+`fork-sandbox.sh` uses locally, so an addendum is delivered on the next
+tool call and blocks a `Stop` while unread — no self-polling required. The
+preamble that tells the agent about the inbox is rendered with harness
+`claude` for a claude coding leg (`fs_emit_prompt_preamble`'s harness
+argument), so the hookless "read it yourself" text above is not shown to a
+harness that already has the hook.
 
 **A real gap, not yet closed: there is no cluster equivalent of
 `fork-sandbox-status.sh`'s addendum count.** The local status script reads a
@@ -490,12 +500,22 @@ the JSON back and printing an unmissable summary when the loop ended in
 one place a `--review-loop` run on this path can report a review that never
 approved, given that the exit code cannot.
 
-**`--review-model` is not supported yet.** The pod's `~/.pi/agent/models.json`
-is generated with a single model entry (see
-`fork-sandbox-k8s-entrypoint.sh`'s `jq` block), so a second model for the
-review leg has nowhere to be declared. This is a real follow-up — adding it
-needs the entrypoint to accept a second model id and register a second
-provider entry — not a permanent no.
+**`--review-model` is supported, asymmetrically between the two harnesses.**
+The pod's `~/.pi/agent/models.json` lists every distinct id among `MODEL`
+and `REVIEW_MODEL` (`fork-sandbox-k8s-entrypoint.sh`'s `jq` block dedupes
+them), so both the coding leg's model and the review leg's can be resolved
+by `--model` without a second provider entry. On `--harness pi`,
+`--review-model` is optional — a `--review-loop` with none given falls back
+to the coding leg's own `MODEL` for the review leg too. On `--harness
+claude`, it is effectively required: `fork-sandbox.sh`'s own `--k8s` gate
+refuses a `--review-loop` on a claude run unless `--review-harness pi` is
+given explicitly together with a review model (the combined `pi:<id>` form
+or `--review-model`), because the review leg there is *always* pi against
+an OpenRouter id, never claude — naming `--review-harness pi` is what
+tells the script (and stops an operator's habit-typed `--review-model
+opus`, which would mean a claude model locally, from reaching the pod as a
+bad OpenRouter id) rather than failing only after a paid coding leg has
+already run.
 
 ## Egress is sealed, except the proxy
 
@@ -567,6 +587,87 @@ Concretely, for the OpenRouter upstream v1 ships:
 
 This is the mode a real provider (OpenRouter, and by extension any API-keyed
 service) requires, because the key has to live somewhere.
+
+### 1b. proxy, per-run, for claude — **Status: built.**
+
+`--harness claude` does not fit mode 1 above: OpenRouter's key is a
+long-lived provider secret, one shared proxy can hold it for every run, and
+reload cost is a non-issue. Claude Code authenticates with the *operator's
+own* OAuth access token, which lives hours and belongs to exactly one run —
+baking it into the shared proxy's Secret would mean every concurrent run,
+whatever its own harness, shares one operator's token and its expiry.
+So a claude run gets its own proxy instead: `manifests/k8s/31-claude-proxy.yaml`,
+rendered by `cmd_submit` (never `install` — this is per-run, not
+cluster-shared) into a Pod, a Secret, and a Service, all named
+`$safe_name-claude-proxy`/`$safe_name-claude-token` and labeled
+`fork-sandbox/branch: $safe_name`.
+
+**A Pod, not a sidecar.** A sidecar shares the agent container's network
+namespace, so the `0.0.0.0/0:443` egress a proxy needs would be the agent's
+own route too — that inverts the headline property this whole design
+protects (the pod reaches no real internet host). A separate Pod carries
+its own network namespace and its own policy. It needs no NetworkPolicy of
+its own, either: it carries the label `app: fork-sandbox-proxy`, which the
+static `NetworkPolicy` already in `30-proxy.yaml` selects (ingress from
+agent pods on 8080, egress DNS + 443 to the real Anthropic API), and it is
+admitted by the platform-rendered agent policy the same way, via
+`--proxy-label app=fork-sandbox-proxy`. `cmd_submit` waits for this pod to
+report Ready before submitting the Job — the egress-gate initContainer
+probes it, so it has to be up first.
+
+**The token never appears in rendered YAML.** `cmd_submit` reads the
+operator's local OAuth access token (the same `fs_read_claude_credential`
+reader `claude-sandboxed` uses locally) and creates the per-run Secret the
+same way `cmd_install` creates the shared one: `kubectl create secret
+generic ... --dry-run=client -o yaml | kubectl apply -f -`, never inside the
+template `31-claude-proxy.yaml` renders. Under `--dry-run` nothing is
+created; one comment line says the Secret would be, with no value. Before
+creating it, `cmd_submit` refuses an already-expired token and warns on
+stderr when it has under an hour left — the same two checks and messages
+`claude-sandboxed` runs before a local sealed run, because the failure mode
+is the same: **a run that outlives its token dies partway through**, on the
+cluster exactly as it would locally. There is no refresh path in either
+place.
+
+**The pod's own credential is a placeholder.** The operator's real
+`.credentials.json` is passed through the same `jq` filter
+`claude-sandboxed` uses — `del(.mcpOAuth) | del(.claudeAiOauth.refreshToken,
+.claudeAiOauth.refreshTokenExpiresAt)` — and then
+`.claudeAiOauth.accessToken` is overwritten with the literal string
+`sandbox`. After that substitution the file holds no secret (scopes,
+subscription type, expiry survive; the one thing that could ever be spent
+does not), which is why it ships as a ConfigMap key
+(`claude-credentials.json`) in the per-run ConfigMap alongside
+`handoff.md`, rather than a Secret. Claude Code starts fine on this file and
+sends `Authorization: Bearer sandbox`; the per-run proxy is what turns that
+into the real header on the way past.
+
+**What Claude Code actually calls, measured on the host beforehand:**
+pointed at a local logging proxy configured to refuse every `CONNECT`
+(simulating the pod's sealed egress) and to swap the placeholder bearer for
+a real one, a full session called exactly one path —
+`POST /v1/messages?beta=true`, with an `anthropic-beta` header the proxy
+must pass through untouched, nothing else under the base URL — and
+separately attempted three direct `CONNECT api.anthropic.com:443` (traffic
+that ignores `ANTHROPIC_BASE_URL` entirely). All three were refused; the
+run completed normally, fast, and exited 0. So the per-run proxy's `nginx`
+conf forwards exactly two `location =` blocks, `/v1/messages` and
+`/v1/messages/count_tokens`, to the constant upstream
+`https://api.anthropic.com`, with `proxy_http_version 1.1; proxy_buffering
+off;` for the SSE stream and a long `proxy_read_timeout`; everything else,
+including the direct `CONNECT` attempts, is denied by the sealed egress the
+agent pod already runs under — nothing new had to be built to make those
+three refusals safe. Env used for the measurement:
+`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`, `DISABLE_AUTOUPDATER=1`,
+`TERM=dumb`, a synthetic `HOME` — the same env the entrypoint's claude
+branch launches with.
+
+**The review loop stays pi, even on a claude run.** `--k8s --harness claude
+--review-loop` requires `--review-harness pi` given explicitly, plus a
+review model — see "The cluster review loop" below for why the coding leg
+and the review leg can run different harnesses on the same pod, and
+`fork-sandbox.sh`'s own `--k8s` gate for why `--review-harness pi` must be
+named rather than inferred.
 
 ### 2. direct — **Status: designed, not built.**
 
@@ -900,9 +1001,10 @@ Scoped out of v1 on purpose, not overlooked:
 
 - **A second platform implementation.** Contract plus `generic` only — see
   `docs/k8s-platform.md`.
-- **The claude and codex harnesses inside a pod.** pi only, for the same
-  reason `--harness pi-local` is pi-only locally: it is the harness this
-  project's sealed-network story is built around.
+- **The codex harness inside a pod.** `--harness claude` now has its own
+  sealed-egress story (the per-run proxy — see "Model access" above), so
+  the reasoning that used to cover both no longer applies to it; codex has
+  no sandboxed credential path built at all, for either run mode.
 - **A second model-access upstream.** OpenRouter only; see "Model access"
   above for why the shape is a new proxy config file, not a rewrite, when a
   second one is added.
@@ -911,14 +1013,6 @@ Scoped out of v1 on purpose, not overlooked:
 - **`status` / `logs` subcommands.** `kubectl` already does both, against the
   Job and pod this client creates with ordinary, discoverable names and
   labels.
-- **`--review-model` for the cluster review loop.** `--k8s` refuses it by
-  name -- the pod's `models.json` is generated with a single model entry,
-  so a second model for the review leg has nowhere to be declared yet. See
-  "The cluster review loop" above. (The loop itself, `--review-loop`, IS
-  built and runs pod-side -- this is the one narrower gap left in it.)
-- **Any harness other than `pi` inside a pod.** `--k8s` refuses `--harness`
-  values other than `pi` by name — see "Model access" above for why `pi`
-  talking to the proxy is the one shape this path builds at all.
 - **Any change to `sandbox-backend-*`.** Kubernetes is explicitly not a
   backend — see "This is a run mode, not a backend" above, and
   `sandbox-backend.md`'s own "Kubernetes — deliberately not a backend"
