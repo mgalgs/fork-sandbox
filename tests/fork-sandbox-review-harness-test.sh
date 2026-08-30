@@ -338,5 +338,104 @@ else
     no "run_real produced a run directory for the pi/claude pair" "run_real failed"
 fi
 
+printf '\n== --review-loop: review and fix legs start with an empty inbox ==\n'
+
+# fs_archive_inbox (fork-sandbox.sh) moves every addendum out of the inbox
+# the moment the leg that saw it ends, so a later leg's fresh sandbox --
+# fresh /tmp, same read-only inbox bind -- never re-reads it. Drive a real,
+# full --harness claude --review-loop 1 run (implement, review and fix legs
+# all on this one stub) and have each leg record which '*.md' names it saw
+# in the inbox the moment it started, so the review and fix legs' own
+# records can be checked against the implement leg's.
+seen_dir="$(mktemp -d)"; tmpdirs+=("$seen_dir")
+inbox_stub="$(mktemp -d /var/tmp/claude-scratch/fs-review-harness-inbox-stub.XXXXXX)"
+tmpdirs+=("$inbox_stub")
+cat > "$inbox_stub/claude-sandboxed" <<'STUB'
+#!/usr/bin/env bash
+# Fake claude-sandboxed: bypasses bwrap entirely, so it reads and writes the
+# clone and the inbox directly, the way the fork-sandbox-refresh-test.sh
+# stub does. Which invocation this is comes from a counter file: 1 is the
+# implement leg, 2 the review leg, 3 the fix leg (--review-loop 1 with a
+# FINDINGS verdict runs exactly those three).
+set -uo pipefail
+
+outbox="" clone_dir="" prev=""
+for a in "$@"; do
+    [[ "$prev" == "--bind-rw" ]] && outbox="$a"
+    [[ "$a" == "--dangerously-skip-permissions" ]] && clone_dir="$prev"
+    prev="$a"
+done
+
+cat >/dev/null   # drain the prompt; its content is not needed by this stub
+
+n=0
+[[ -f "$FAKE_COUNT_FILE" ]] && n="$(cat "$FAKE_COUNT_FILE")"
+n=$(( n + 1 ))
+printf '%s' "$n" > "$FAKE_COUNT_FILE"
+
+run_dir="$(dirname "$outbox")"
+inbox_dir="$run_dir/inbox"
+
+# What this leg's own inbox bind held the moment it started -- the record
+# the test compares leg by leg.
+seen=""
+for f in "$inbox_dir"/*.md; do
+    [[ -f "$f" ]] || continue
+    seen="$seen${f##*/}"$'\n'
+done
+printf '%s' "$seen" > "$FAKE_SEEN_DIR/leg-$n"
+
+case "$n" in
+1)
+    # The implement leg: an operator addendum lands mid-leg, and the leg
+    # commits so the review loop has something to review.
+    printf 'do this too\n' > "$inbox_dir/9999999900-01.md"
+    git -c user.email=t@fork-sandbox.invalid -c user.name=Tester \
+        -C "$clone_dir" commit --allow-empty -q -m "leg $n"
+    ;;
+2)
+    # The review leg: findings, so a fix leg follows.
+    printf 'FINDINGS\n\nfile.txt:1 not quite right\n' \
+        > "$clone_dir/.git/review-verdict.md"
+    ;;
+*)
+    # The fix leg: commit again, so the loop does not read as no-progress.
+    git -c user.email=t@fork-sandbox.invalid -c user.name=Tester \
+        -C "$clone_dir" commit --allow-empty -q -m "leg $n"
+    ;;
+esac
+
+printf '{"type":"result","subtype":"success","total_cost_usd":0.01,"usage":{"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}\n'
+exit 0
+STUB
+chmod +x "$inbox_stub/claude-sandboxed"
+
+count_file9="$(mktemp)"; tmpdirs+=("$count_file9")
+out9="$(PATH="$inbox_stub:$PATH" \
+    FAKE_COUNT_FILE="$count_file9" FAKE_SEEN_DIR="$seen_dir" \
+    timeout 60 "$launcher" --foreground --harness claude --review-loop 1 \
+    "$proj" "$handoff" 2>&1)"
+rc9=$?
+rd9="$(printf '%s\n' "$out9" | sed -n 's/^  run dir:  *//p' | head -1)"
+if (( rc9 == 0 )) && [[ -n "$rd9" ]]; then
+    tmpdirs+=("$rd9")
+    check "three legs ran (implement, review, fix)" "3" "$(cat "$count_file9")"
+    check "the implement leg's inbox holds nothing yet (nothing sent before it started)" \
+        "" "$(cat "$seen_dir/leg-1" 2>/dev/null)"
+    check "the review leg's inbox is empty: the implement leg's addendum was archived" \
+        "" "$(cat "$seen_dir/leg-2" 2>/dev/null)"
+    check "the fix leg's inbox is empty too" \
+        "" "$(cat "$seen_dir/leg-3" 2>/dev/null)"
+    archived9="$(find "$rd9/inbox-delivered/leg-1" -maxdepth 1 -name '*.md' 2>/dev/null | head -1)"
+    if [[ -n "$archived9" ]]; then
+        ok "the addendum the implement leg saw is archived under inbox-delivered/leg-1"
+    else
+        no "the addendum the implement leg saw is archived under inbox-delivered/leg-1"
+    fi
+else
+    no "run_real produced a run directory for the review/fix-inbox scenario" \
+        "rc=$rc9: $out9"
+fi
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))
