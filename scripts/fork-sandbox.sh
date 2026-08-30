@@ -3880,13 +3880,27 @@ refresh_leg_was_nudged() {
 # implement leg as 1). $2 the hand-off file, already moved to its $run_dir
 # record. $3 the destination path. $4 (optional, default 0) whether the host-
 # side backstop found this hand-off older than the clone's last commit -- see
-# its check above. The static preamble, then two documents in full: the
-# original brief ($handoff_original, snapshotted once at launch -- see above)
-# and the previous leg's own hand-off, with a warning block between them when
-# $4 is set -- there is no verdict-style body to append here, unlike the fix
-# leg's prompt.
+# its check above. The static preamble, then the original brief
+# ($handoff_original, snapshotted once at launch -- see above), any operator
+# addenda archived from earlier legs of this run, a warning block when $4 is
+# set, and finally the previous leg's own hand-off -- there is no
+# verdict-style body to append here, unlike the fix leg's prompt.
 refresh_build_prompt() {
     local n="$1" handoff="$2" out="$3" stale="${4:-0}"
+    # Every addendum fs_archive_inbox has moved out of a strictly earlier leg
+    # of THIS run, oldest first: sorted by leg number rather than by
+    # directory name, since "leg-10" must not sort before "leg-2". None of
+    # these were shown to review or fix legs, only to coding legs -- but a
+    # continuation is the same task continued, so it gets all of them, not
+    # just the ones its immediate predecessor saw.
+    local addenda_list d leg_n f
+    addenda_list="$(
+        for d in "$run_dir"/inbox-delivered/leg-*; do
+            [[ -d "$d" && ! -L "$d" ]] || continue
+            leg_n="${d##*/leg-}"
+            printf '%s %s\n' "$leg_n" "$d"
+        done | sort -n -k1,1 | cut -d' ' -f2-
+    )"
     {
         cat -- "$continuation_prompt_header"
         printf '\n---\n\n# This is continuation %s of a run that refreshed its context\n\n' "$n"
@@ -3902,6 +3916,23 @@ refresh_build_prompt() {
         printf 'brief contains, the brief wins.\n\n'
         printf '\n---\n\n## The original brief\n\n'
         cat -- "$handoff_original"
+        if [[ -n "$addenda_list" ]]; then
+            printf '\n---\n\n## Operator addenda delivered to earlier legs\n\n'
+            printf 'The operator sent the messages below to an earlier leg of this same\n'
+            printf 'run, oldest first. They carry the same authority as the brief above\n'
+            printf 'and outrank it where the two conflict. Where a message asks for\n'
+            printf 'something to be done, the leg that received it has most likely\n'
+            printf 'already done it -- check `git log --oneline` before redoing any of\n'
+            printf 'it. Where a message is a constraint or a correction, it still binds.\n'
+            while IFS= read -r d; do
+                [[ -n "$d" ]] || continue
+                for f in "$d"/*.md; do
+                    [[ -f "$f" ]] || continue
+                    printf '\n### %s\n\n' "${f##*/}"
+                    cat -- "$f"
+                done
+            done <<< "$addenda_list"
+        fi
         if (( stale )); then
             printf '\n---\n\n## Warning: this hand-off is stale\n\n'
             printf 'It was written before the last commit on this branch, so its "done"\n'

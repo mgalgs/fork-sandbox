@@ -484,6 +484,48 @@ if [[ -n "$rd" ]]; then
     status_out="$("$repo_dir/scripts/fork-sandbox-status.sh" "$rd" 2>/dev/null)"
     contains "fork-sandbox-status.sh still counts the archived addendum" \
         "inbox:    1 addenda" "$status_out"
+
+    # leg 1's addendum is archived before the continuation loop builds leg
+    # 2's prompt, so it is already there to embed.
+    cont_prompt="$rd/continuation-prompt-1.md"
+    if [[ -f "$cont_prompt" ]]; then
+        contains "the continuation prompt has the addenda heading" \
+            "## Operator addenda delivered to earlier legs" "$(cat "$cont_prompt")"
+        contains "the continuation prompt carries the addendum's own file name" \
+            "9999999900-01.md" "$(cat "$cont_prompt")"
+        contains "the continuation prompt carries the addendum's text" \
+            "operator addendum for leg 1" "$(cat "$cont_prompt")"
+        brief_at="$(grep -n '## The original brief' "$cont_prompt" | head -1 | cut -d: -f1)"
+        addenda_at="$(grep -n '## Operator addenda delivered to earlier legs' "$cont_prompt" | head -1 | cut -d: -f1)"
+        handoff_at="$(grep -n '## Hand-off from the previous leg' "$cont_prompt" | head -1 | cut -d: -f1)"
+        if [[ -n "$brief_at" && -n "$addenda_at" && -n "$handoff_at" \
+            && "$brief_at" -lt "$addenda_at" && "$addenda_at" -lt "$handoff_at" ]]; then
+            ok "the addenda heading sits between the brief and the hand-off"
+        else
+            no "the addenda heading sits between the brief and the hand-off" \
+                "brief at $brief_at, addenda at $addenda_at, hand-off at $handoff_at"
+        fi
+    else
+        no "the continuation prompt has the addenda heading" "no continuation prompt"
+        no "the continuation prompt carries the addendum's own file name" "no continuation prompt"
+        no "the continuation prompt carries the addendum's text" "no continuation prompt"
+        no "the addenda heading sits between the brief and the hand-off" "no continuation prompt"
+    fi
+fi
+
+# -- no addenda at all: a continuation prompt carries no addenda heading.
+count_file="$(mktemp)"; tmpdirs+=("$count_file")
+rd="$(run_real "$proj" "$count_file" 1 1 --refresh-at 0.5)"
+[[ -n "$rd" ]] && tmpdirs+=("$rd")
+if [[ -n "$rd" && -f "$rd/continuation-prompt-1.md" ]]; then
+    if grep -q '## Operator addenda delivered to earlier legs' "$rd/continuation-prompt-1.md"; then
+        no "a run with no addenda has no addenda heading in its continuation prompt"
+    else
+        ok "a run with no addenda has no addenda heading in its continuation prompt"
+    fi
+else
+    no "a run with no addenda has no addenda heading in its continuation prompt" \
+        "no continuation prompt"
 fi
 
 # -- a hand-off that predates the clone's last commit by the time the host
