@@ -181,6 +181,11 @@ printf 'THRESHOLD_TOKENS=1000\nOUTBOX_DIR=%s/outbox\nCLONE_DIR=%s\n' "$inbox" "$
 mkdir -p "$inbox/outbox"
 nudge_marker="$(mktemp -u)"; nudge_reminded="$(mktemp -u)"; stale_reminded="$(mktemp -u)"
 tmpdirs+=("$nudge_marker" "$nudge_reminded" "$stale_reminded")
+# Already nudged, so measure_usage is 0 and the hand-off already in the
+# outbox keeps the nudged-but-not-reminded clause quiet too: the only thing
+# left that can set need_work is the staleness check itself, which is the
+# thing this block means to exercise.
+: > "$nudge_marker"
 transcript="$(new_transcript 60 30 10)"; tmpdirs+=("$(dirname "$transcript")")
 printf 'the hand-off\n' > "$inbox/outbox/handoff.md"
 touch -d '2026-01-01 00:00:00' "$inbox/outbox/handoff.md"
