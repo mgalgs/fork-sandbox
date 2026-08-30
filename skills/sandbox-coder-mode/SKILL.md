@@ -611,8 +611,44 @@ Pick per task, and say why in one line when you launch:
 The review flags travel with `--harness`, not with this table: a round
 that deviates from the machine's harness restates `--review-model` (and
 `--review-harness`, if the reviewer should run elsewhere) in names that
-harness understands, or omits all three review flags to skip the
-in-sandbox reviewer for that round.
+harness understands. Deviating on the harness never drops the review leg:
+the only round that runs without one is the medium-model one-shot in the
+next section, and that is an upward deviation on the implementer, not a
+review omission.
+
+### The review loop is the user's setting, not the orchestrator's
+
+The composition the user launched the mode with — or the machine file
+above — has two tiers in it: `--model` is the *light* model that types,
+`--review-model` is the *medium* model that reads, and `--review-loop` is
+how many times. That composition is the default for **every** round, and
+the orchestrator does not lower it: not the loop count, not the review
+model, not for a round that "looks small". An implementer cannot judge its
+own work, and the orchestrator cannot judge its own spec; neither decides
+whether a review runs.
+
+The one permitted deviation is **upward on the implementer, never downward
+on the review**: a change small enough that a loop is plainly overkill goes
+to the *medium* model one-shot, and the orchestrator reads the diff itself.
+"Light model, no review" is not a composition the orchestrator may choose.
+The bar for even that is very high confidence about the *spec*, not the
+task: the files are named, the change is written out line by line, no
+security property is touched, and the implementer is left no choice to
+make. Any latitude at all, and the default stands. Doubt resolves toward
+the user's settings.
+
+**Say what you are using whenever it is not the default.** One line at
+launch, every flag spelled out, and the reason — extremely verbose, zero
+ceremony:
+
+> Launching `sbx-review-cleared-fp` with `--harness claude --model opus`
+> and no review loop, not the session's `--model sonnet --review-loop 1
+> --review-model opus`: the handoff names both files and gives the regex,
+> the three lines, and all ten test cases, so the implementer has nothing
+> to decide; I read the diff.
+
+A launch at the default needs no such line. A launch that deviates and
+does not carry one is a launch the user cannot audit.
 
 **Pin `--model` on every claude run.** Without it the run takes the host's
 default, which is the expensive model this session is likely running on —
