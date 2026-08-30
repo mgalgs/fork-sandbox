@@ -22,10 +22,21 @@
 #
 # Env:
 #   BRANCH          the branch name the agent's commits land on. Required.
-#   MODEL           the OpenRouter model id pi should use. Required.
-#   PROXY_BASE_URL  the model proxy's base URL, e.g.
+#   HARNESS         "pi" or "claude", the coding leg's harness. Default
+#                   "pi". The review loop, when it runs, always runs pi
+#                   regardless of this -- see REVIEW_MODEL below.
+#   MODEL           the model id the coding leg's harness should use: an
+#                   OpenRouter id for pi, a Claude Code model name for
+#                   claude. Required.
+#   PROXY_BASE_URL  the pi model proxy's base URL, e.g.
 #                   http://fork-sandbox-proxy.NS.svc.cluster.local:8080/api/v1
-#                   Required.
+#                   Required regardless of HARNESS -- the review loop
+#                   always needs it, even on a claude coding leg.
+#   CLAUDE_PROXY_BASE_URL
+#                   the base URL of the per-run proxy that swaps the
+#                   placeholder credential below for the operator's real
+#                   token, a Service DNS name at port 8080. Required when
+#                   HARNESS=claude; unused otherwise.
 #   GIT_USER_NAME, GIT_USER_EMAIL
 #                   the identity commits land under. Default to a fixed
 #                   fork-sandbox identity when unset -- there is no host
@@ -40,6 +51,12 @@
 #   BASE_SHA        the commit the branch is measured against, for the
 #                   review loop's commit range. Required when
 #                   REVIEW_LOOP_CAP is set; unused otherwise.
+#   REVIEW_MODEL    the OpenRouter model id the review loop's pi runs
+#                   should use, when it differs from MODEL. Required when
+#                   HARNESS=claude and REVIEW_LOOP_CAP is set, since
+#                   MODEL is then a Claude Code model name pi cannot use.
+#                   Optional otherwise; the review loop falls back to
+#                   MODEL when unset.
 #   OUTBOX_MAX_BYTES the outbox size cap, in bytes, for the end-of-run
 #                   warning below. Default 67108864 (64 MiB) -- must match
 #                   FS_OUTBOX_MAX_BYTES in fork-sandbox-lib.sh; nothing
@@ -49,12 +66,21 @@
 #                   --outbox-max).
 #
 # Reads from /mnt/fork-sandbox/ (the scripts ConfigMap, mounted read-only):
-#   handoff.md              the run's whole prompt, on pi's stdin.
+#   handoff.md              the run's whole prompt, on the coding harness's
+#                           stdin.
 #   pi-agent-settings.json  optional; this repo's pi-agent/settings.json,
 #                           the same file agent-sandboxed seeds a sealed
 #                           local run's ~/.pi/agent from. Only the
 #                           defaultProvider/defaultModel keys are generated
 #                           fresh here; everything else in it survives.
+#   claude-credentials.json, inbox-hook.sh
+#                           present only when HARNESS=claude. The former is
+#                           the operator's own credential with the access
+#                           token replaced by a placeholder (the per-run
+#                           proxy swaps in the real one); the latter is
+#                           this repo's own operator-inbox hook, installed
+#                           and registered exactly as a local claude run's
+#                           --settings does.
 #   review-prompt.md, fix-prompt-header.md, code-review-portable-skill.md,
 #   review-loop.sh          present only when REVIEW_LOOP_CAP is set. The
 #                           first two are the review and fix leg prompts,
@@ -82,16 +108,34 @@
 set -euo pipefail
 
 : "${BRANCH:?BRANCH must be set to the branch the agent commits on}"
-: "${MODEL:?MODEL must be set to an OpenRouter model id}"
-: "${PROXY_BASE_URL:?PROXY_BASE_URL must be set to the model proxy base URL}"
+: "${HARNESS:=pi}"
+case "$HARNESS" in
+    pi|claude) ;;
+    *)
+        echo "Error: HARNESS must be 'pi' or 'claude', got '$HARNESS'." >&2
+        exit 1
+        ;;
+esac
+: "${MODEL:?MODEL must be set to a model id}"
+: "${PROXY_BASE_URL:?PROXY_BASE_URL must be set to the pi model proxy base URL}"
+if [[ "$HARNESS" == claude ]]; then
+    : "${CLAUDE_PROXY_BASE_URL:?CLAUDE_PROXY_BASE_URL must be set when HARNESS=claude}"
+fi
 : "${GIT_USER_NAME:=fork-sandbox agent}"
 : "${GIT_USER_EMAIL:=agent@fork-sandbox.invalid}"
 : "${INPUTS_TIMEOUT:=300}"
 : "${RUN_TTL:=3600}"
 : "${REVIEW_LOOP_CAP:=0}"
+: "${REVIEW_MODEL:=}"
 : "${OUTBOX_MAX_BYTES:=67108864}"  # must match FS_OUTBOX_MAX_BYTES in fork-sandbox-lib.sh
 if [[ "$REVIEW_LOOP_CAP" =~ ^[1-9][0-9]*$ ]]; then
     : "${BASE_SHA:?BASE_SHA must be set when REVIEW_LOOP_CAP is set}"
+    if [[ "$HARNESS" == claude && -z "$REVIEW_MODEL" ]]; then
+        echo "Error: REVIEW_MODEL must be set when HARNESS=claude and" >&2
+        echo "REVIEW_LOOP_CAP is set -- the review loop always runs pi, and" >&2
+        echo "MODEL is a Claude Code model name pi cannot use." >&2
+        exit 1
+    fi
 elif [[ "$REVIEW_LOOP_CAP" != "0" ]]; then
     echo "Error: REVIEW_LOOP_CAP must be a non-negative integer, got '$REVIEW_LOOP_CAP'." >&2
     exit 1
@@ -164,48 +208,56 @@ git config user.email "$GIT_USER_EMAIL"
 git config commit.gpgsign false
 git config tag.gpgsign false
 
-echo "fork-sandbox-k8s-entrypoint: synthesizing pi config" >&2
-mkdir -p "$HOME/.pi/agent"
-if [[ -f "$mounts_dir/pi-agent-settings.json" ]]; then
-    cp "$mounts_dir/pi-agent-settings.json" "$HOME/.pi/agent/settings.json"
-fi
+# Builds ~/.pi/agent/models.json + settings.json for a single model id,
+# pointed at the pi proxy. Used for the pi harness's own coding leg below,
+# and again (with REVIEW_MODEL) right before the review loop when the
+# coding leg ran claude instead -- see that block for why a second call is
+# needed there. baseUrl is the proxy Service, not a loopback bridge --
+# there is no socket bridge here, because network policy rather than a
+# unix socket is what seals this pod. apiKey is a placeholder; the proxy
+# replaces the header on the way past, so this value is never sent
+# anywhere that checks it.
+synthesize_pi_config() {
+    local model="$1"
+    echo "fork-sandbox-k8s-entrypoint: synthesizing pi config for $model" >&2
+    mkdir -p "$HOME/.pi/agent"
+    if [[ -f "$mounts_dir/pi-agent-settings.json" ]]; then
+        cp "$mounts_dir/pi-agent-settings.json" "$HOME/.pi/agent/settings.json"
+    fi
 
-# baseUrl is the proxy Service, not a loopback bridge -- there is no socket
-# bridge here, because network policy rather than a unix socket is what
-# seals this pod. apiKey is a placeholder; the proxy replaces the header on
-# the way past, so this value is never sent anywhere that checks it.
-jq -n --arg base "$PROXY_BASE_URL" --arg model "$MODEL" '
-    {
-        providers: {
-            proxy: {
-                baseUrl: $base,
-                api: "openai-completions",
-                apiKey: "sandbox",
-                models: [{
-                    id: $model,
-                    name: ($model + " (proxy)"),
-                    reasoning: true,
-                    input: ["text"],
-                    contextWindow: 131072,
-                    maxTokens: 32768,
-                    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-                }],
+    jq -n --arg base "$PROXY_BASE_URL" --arg model "$model" '
+        {
+            providers: {
+                proxy: {
+                    baseUrl: $base,
+                    api: "openai-completions",
+                    apiKey: "sandbox",
+                    models: [{
+                        id: $model,
+                        name: ($model + " (proxy)"),
+                        reasoning: true,
+                        input: ["text"],
+                        contextWindow: 131072,
+                        maxTokens: 32768,
+                        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+                    }],
+                },
             },
-        },
-    }' > "$HOME/.pi/agent/models.json"
+        }' > "$HOME/.pi/agent/models.json"
 
-settings_base='{}'
-if [[ -f "$HOME/.pi/agent/settings.json" ]]; then
-    settings_base="$(cat "$HOME/.pi/agent/settings.json")"
-fi
-if ! jq -n --argjson base "$settings_base" --arg model "$MODEL" \
-    '$base * { defaultProvider: "proxy", defaultModel: $model }' \
-    > "$HOME/.pi/agent/settings.json.new"; then
-    echo "Error: pi-agent/settings.json is not valid JSON, so the generated" >&2
-    echo "model defaults cannot be merged into it." >&2
-    exit 1
-fi
-mv "$HOME/.pi/agent/settings.json.new" "$HOME/.pi/agent/settings.json"
+    local settings_base='{}'
+    if [[ -f "$HOME/.pi/agent/settings.json" ]]; then
+        settings_base="$(cat "$HOME/.pi/agent/settings.json")"
+    fi
+    if ! jq -n --argjson base "$settings_base" --arg model "$model" \
+        '$base * { defaultProvider: "proxy", defaultModel: $model }' \
+        > "$HOME/.pi/agent/settings.json.new"; then
+        echo "Error: pi-agent/settings.json is not valid JSON, so the generated" >&2
+        echo "model defaults cannot be merged into it." >&2
+        exit 1
+    fi
+    mv "$HOME/.pi/agent/settings.json.new" "$HOME/.pi/agent/settings.json"
+}
 
 # A safety net run after both the coding leg and (when there is one) the
 # review loop: whichever left work uncommitted must not lose it. A single
@@ -221,14 +273,57 @@ commit_uncommitted_work() {
     fi
 }
 
-echo "fork-sandbox-k8s-entrypoint: running pi" >&2
 pi_rc=0
-pi --provider proxy --model "$MODEL" --mode json -p \
-    < "$mounts_dir/handoff.md" \
-    > "$work_dir/events.jsonl" \
-    2> "$work_dir/pi-stderr.log" \
-    || pi_rc=$?
-echo "fork-sandbox-k8s-entrypoint: pi exited $pi_rc" >&2
+if [[ "$HARNESS" == pi ]]; then
+    synthesize_pi_config "$MODEL"
+
+    echo "fork-sandbox-k8s-entrypoint: running pi" >&2
+    pi --provider proxy --model "$MODEL" --mode json -p \
+        < "$mounts_dir/handoff.md" \
+        > "$work_dir/events.jsonl" \
+        2> "$work_dir/pi-stderr.log" \
+        || pi_rc=$?
+    echo "fork-sandbox-k8s-entrypoint: pi exited $pi_rc" >&2
+else
+    echo "fork-sandbox-k8s-entrypoint: installing the claude credential" >&2
+    mkdir -p "$HOME/.claude"
+    install -m 600 "$mounts_dir/claude-credentials.json" "$HOME/.claude/.credentials.json"
+    # $HOME is a fresh tmpfs, so claude finds no config. Pre-accept
+    # onboarding and trust for the clone dir, same jq claude-sandboxed
+    # uses for a local sealed run, to keep this non-interactive run from
+    # stalling on a dialog nothing can answer.
+    jq -n --arg dir "$clone_dir" '{
+        hasCompletedOnboarding: true,
+        hasTrustDialogAccepted: true,
+        projects: { ($dir): { hasTrustDialogAccepted: true } },
+    }' > "$HOME/.claude.json"
+
+    # The operator-inbox hook, exactly as a local claude run's --settings
+    # installs it, so `fork-sandbox-k8s.sh say` addenda are delivered on
+    # the next tool call and block a Stop while unread.
+    install -m 755 "$mounts_dir/inbox-hook.sh" "$inbox_dir/.inbox-hook.sh"
+    jq -n --arg hook "$inbox_dir/.inbox-hook.sh" '{
+        hooks: {
+            PostToolUse: [ { matcher: "*",
+                             hooks: [ { type: "command", command: $hook, timeout: 20 } ] } ],
+            Stop: [ { hooks: [ { type: "command", command: $hook, timeout: 20 } ] } ],
+        },
+    }' > "$work_dir/inbox-settings.json"
+
+    echo "fork-sandbox-k8s-entrypoint: running claude" >&2
+    ANTHROPIC_BASE_URL="$CLAUDE_PROXY_BASE_URL" \
+        CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
+        DISABLE_AUTOUPDATER=1 \
+        TERM=dumb \
+        claude --dangerously-skip-permissions --print --verbose \
+            --output-format stream-json --model "$MODEL" \
+            --settings "$work_dir/inbox-settings.json" --include-hook-events \
+        < "$mounts_dir/handoff.md" \
+        > "$work_dir/events.jsonl" \
+        2> "$work_dir/claude-stderr.log" \
+        || pi_rc=$?
+    echo "fork-sandbox-k8s-entrypoint: claude exited $pi_rc" >&2
+fi
 
 commit_uncommitted_work "coding leg"
 
@@ -253,8 +348,20 @@ if [[ "$REVIEW_LOOP_CAP" =~ ^[1-9][0-9]*$ ]]; then
         }' > "$work_dir/review-loop.json"
     else
         echo "fork-sandbox-k8s-entrypoint: running the review loop" >&2
+        # The review loop always runs pi, regardless of the coding leg's
+        # harness. A claude coding leg never synthesized pi config at all
+        # (MODEL is a Claude Code model name pi cannot use), so it is
+        # synthesized here, for the first time, from REVIEW_MODEL --
+        # required at startup for exactly this case, see the validation
+        # above. A pi coding leg already synthesized it for MODEL; this
+        # override only matters once REVIEW_MODEL differs from MODEL.
+        review_loop_model="$MODEL"
+        if [[ "$HARNESS" == claude ]]; then
+            review_loop_model="$REVIEW_MODEL"
+            synthesize_pi_config "$review_loop_model"
+        fi
         loop_rc=0
-        bash "$mounts_dir/review-loop.sh" \
+        MODEL="$review_loop_model" bash "$mounts_dir/review-loop.sh" \
             --clone "$clone_dir" \
             --cap "$REVIEW_LOOP_CAP" \
             --base-sha "$BASE_SHA" \

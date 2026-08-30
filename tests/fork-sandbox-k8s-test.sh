@@ -2246,6 +2246,121 @@ fi
 symref_clone_branch="$(git -C "$symref_clone" rev-parse --abbrev-ref HEAD 2>/dev/null)"
 check "the clone lands directly on branch x" "x" "$symref_clone_branch"
 
+printf '\n== entrypoint: HARNESS switch and claude coding leg ==\n'
+# All the needles below are grepped as literal text against the entrypoint
+# script's own source, matching a literal "$VAR" there -- none of them are
+# meant to expand in this test script.
+# shellcheck disable=SC2016
+
+# HARNESS defaults to pi and rejects anything but pi|claude.
+if grep -qF ': "${HARNESS:=pi}"' "$entrypoint_sh" \
+    && grep -qF 'pi|claude) ;;' "$entrypoint_sh"; then
+    ok "entrypoint defaults HARNESS to pi and validates it against pi|claude"
+else
+    no "entrypoint defaults HARNESS to pi and validates it against pi|claude" \
+        "missing HARNESS default or pi|claude case arm in $entrypoint_sh"
+fi
+
+# CLAUDE_PROXY_BASE_URL is required only for HARNESS=claude.
+# shellcheck disable=SC2016
+if grep -qF 'CLAUDE_PROXY_BASE_URL:?CLAUDE_PROXY_BASE_URL must be set when HARNESS=claude' \
+    "$entrypoint_sh"; then
+    ok "entrypoint requires CLAUDE_PROXY_BASE_URL when HARNESS=claude"
+else
+    no "entrypoint requires CLAUDE_PROXY_BASE_URL when HARNESS=claude" \
+        "missing CLAUDE_PROXY_BASE_URL required-var check in $entrypoint_sh"
+fi
+
+# A claude run with REVIEW_LOOP_CAP set and no REVIEW_MODEL fails at
+# startup, before the coding leg -- the review loop always runs pi, and
+# MODEL is a Claude Code model name pi cannot use.
+# shellcheck disable=SC2016
+if grep -qF 'HARNESS" == claude && -z "$REVIEW_MODEL"' "$entrypoint_sh"; then
+    ok "entrypoint refuses HARNESS=claude with REVIEW_LOOP_CAP set and no REVIEW_MODEL"
+else
+    no "entrypoint refuses HARNESS=claude with REVIEW_LOOP_CAP set and no REVIEW_MODEL" \
+        "missing the REVIEW_MODEL startup check in $entrypoint_sh"
+fi
+
+# The claude branch installs the placeholder credential and the pre-accepted
+# onboarding/trust config at the paths claude reads from $HOME.
+# shellcheck disable=SC2016
+if grep -qF 'install -m 600 "$mounts_dir/claude-credentials.json" "$HOME/.claude/.credentials.json"' \
+    "$entrypoint_sh"; then
+    ok "entrypoint installs the placeholder claude credential"
+else
+    no "entrypoint installs the placeholder claude credential" \
+        "missing the claude-credentials.json install line in $entrypoint_sh"
+fi
+# shellcheck disable=SC2016
+if grep -qF 'hasCompletedOnboarding: true' "$entrypoint_sh" \
+    && grep -qF '> "$HOME/.claude.json"' "$entrypoint_sh"; then
+    ok "entrypoint writes a pre-accepted ~/.claude.json for the claude branch"
+else
+    no "entrypoint writes a pre-accepted ~/.claude.json for the claude branch" \
+        "missing the .claude.json synthesis in $entrypoint_sh"
+fi
+
+# The operator-inbox hook is installed executable and registered via
+# --settings, exactly as a local claude run's own inbox-hook install does.
+# shellcheck disable=SC2016
+if grep -qF 'install -m 755 "$mounts_dir/inbox-hook.sh" "$inbox_dir/.inbox-hook.sh"' \
+    "$entrypoint_sh"; then
+    ok "entrypoint installs the inbox hook mode 755"
+else
+    no "entrypoint installs the inbox hook mode 755" \
+        "missing the inbox-hook.sh install line in $entrypoint_sh"
+fi
+# shellcheck disable=SC2016
+if grep -qF '"$work_dir/inbox-settings.json"' "$entrypoint_sh"; then
+    ok "entrypoint renders an inbox-settings.json for --settings"
+else
+    no "entrypoint renders an inbox-settings.json for --settings" \
+        "missing inbox-settings.json in $entrypoint_sh"
+fi
+
+# The claude launch line itself: base URL via env, non-interactive flags,
+# the inbox-hook --settings file, and stdin/stdout/stderr wired the same
+# way as pi's own invocation but to claude-stderr.log, not pi-stderr.log.
+# shellcheck disable=SC2016
+claude_launch_checks=(
+    'ANTHROPIC_BASE_URL="$CLAUDE_PROXY_BASE_URL"'
+    'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1'
+    'DISABLE_AUTOUPDATER=1'
+    'TERM=dumb'
+    'claude --dangerously-skip-permissions --print --verbose'
+    '--output-format stream-json --model "$MODEL"'
+    '--settings "$work_dir/inbox-settings.json" --include-hook-events'
+    '< "$mounts_dir/handoff.md"'
+    '> "$work_dir/events.jsonl"'
+    '2> "$work_dir/claude-stderr.log"'
+)
+claude_launch_missing=""
+for needle in "${claude_launch_checks[@]}"; do
+    if ! grep -qF -- "$needle" "$entrypoint_sh"; then
+        claude_launch_missing+="  missing: $needle"$'\n'
+    fi
+done
+if [[ -z "$claude_launch_missing" ]]; then
+    ok "entrypoint's claude launch line carries every required flag/env/redirect"
+else
+    no "entrypoint's claude launch line carries every required flag/env/redirect" \
+        "$claude_launch_missing"
+fi
+
+# The review loop always runs pi, so a claude coding leg's REVIEW_MODEL
+# (required at startup, checked above) must reach both the pi config
+# synthesis and the review-loop.sh invocation's own MODEL env.
+# shellcheck disable=SC2016
+if grep -qF 'review_loop_model="$REVIEW_MODEL"' "$entrypoint_sh" \
+    && grep -qF 'synthesize_pi_config "$review_loop_model"' "$entrypoint_sh" \
+    && grep -qF 'MODEL="$review_loop_model" bash "$mounts_dir/review-loop.sh"' "$entrypoint_sh"; then
+    ok "entrypoint threads REVIEW_MODEL into the review loop's pi config and invocation"
+else
+    no "entrypoint threads REVIEW_MODEL into the review loop's pi config and invocation" \
+        "missing review_loop_model wiring in $entrypoint_sh"
+fi
+
 printf '\n== no private-hostname shape anywhere in the repo ==\n'
 # Guards the public-repo leak rule (see the fork-sandbox-k8s.sh header): no
 # real hostname, cluster name or LAN address may be committed, only
