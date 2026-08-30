@@ -453,8 +453,20 @@ refuses "--harness takes only pi or claude" \
     --branch fs-k8s-test-branch --model claude-sonnet-5 --harness bogus \
     "$proj_dir" "$handoff_file"
 
+# A fixture HOME carrying a Claude credential, so --harness claude never
+# reads the real operator's ~/.claude/.credentials.json. The access token
+# is a distinctive fixture string, checked below to never leak into any
+# rendered output.
+claude_home="$(newdir)"; tmpdirs+=("$claude_home")
+mkdir -p "$claude_home/.claude"
+claude_fixture_token="fixture-real-secret-token-do-not-leak"
+claude_future_ms=$(( ($(date +%s) + 7200) * 1000 ))
+cat > "$claude_home/.claude/.credentials.json" <<JSON
+{"claudeAiOauth": {"accessToken": "$claude_fixture_token", "refreshToken": "fixture-refresh-token", "refreshTokenExpiresAt": 123, "expiresAt": $claude_future_ms, "scopes": ["user:inference"]}}
+JSON
+
 claude_submit_out="$(newdir)/claude-submit.yaml"; tmpdirs+=("$(dirname "$claude_submit_out")")
-if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+if HOME="$claude_home" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-branch --model claude-sonnet-5 --harness claude \
     "$proj_dir" "$handoff_file" > "$claude_submit_out" 2>/tmp/fs-k8s-test-claude-submit.err; then
     ok "submit --dry-run --harness claude exits 0"
@@ -462,9 +474,13 @@ else
     no "submit --dry-run --harness claude exits 0" "$(cat /tmp/fs-k8s-test-claude-submit.err)"
 fi
 if command -v yamllint >/dev/null 2>&1; then
-    out="$(yamllint "$claude_submit_out" 2>&1)"
-    if [[ -z "$out" ]]; then ok "yamllint: submit --dry-run --harness claude output"
-    else no "yamllint: submit --dry-run --harness claude output" "$out"; fi
+    # Line-length excluded, same as the --review-loop render below: this
+    # ConfigMap embeds fork-sandbox-inbox-hook.sh's full prose-commented
+    # source as a block-scalar value, and long lines in that string are
+    # not a YAML structure problem -- see .yamllint's own header comment.
+    out="$(yamllint -d "{extends: default, rules: {line-length: disable}}" "$claude_submit_out" 2>&1)"
+    if [[ -z "$out" ]]; then ok "yamllint: submit --dry-run --harness claude output (line-length excluded)"
+    else no "yamllint: submit --dry-run --harness claude output (line-length excluded)" "$out"; fi
 fi
 if grep -q '__RUN_NAME__' "$claude_submit_out" || grep -q '__NAMESPACE__' "$claude_submit_out"; then
     no "submit --dry-run --harness claude leaves no unsubstituted placeholder" \
@@ -520,7 +536,134 @@ else
     no "the claude-proxy Pod carries the shared app: fork-sandbox-proxy label" \
         "not found in $claude_submit_out"
 fi
+# The rendered ConfigMap's claude-credentials.json: sanitized (no
+# refreshToken) and carrying the "sandbox" placeholder access token, never
+# the fixture's real one -- the whole point of the substitution.
+if grep -q '"accessToken": "sandbox"' "$claude_submit_out"; then
+    ok "rendered claude-credentials.json carries the sandbox placeholder access token"
+else
+    no "rendered claude-credentials.json carries the sandbox placeholder access token" \
+        "not found in $claude_submit_out"
+fi
+if grep -q 'refreshToken' "$claude_submit_out"; then
+    no "rendered claude-credentials.json carries no refreshToken" \
+        "found 'refreshToken' in $claude_submit_out"
+else
+    ok "rendered claude-credentials.json carries no refreshToken"
+fi
+if grep -qF "$claude_fixture_token" "$claude_submit_out"; then
+    no "the rendered YAML never contains the fixture's real access token" \
+        "found the fixture token in $claude_submit_out"
+else
+    ok "the rendered YAML never contains the fixture's real access token"
+fi
+if grep -q 'inbox-hook.sh: |' "$claude_submit_out"; then
+    ok "rendered ConfigMap carries the inbox-hook.sh key"
+else
+    no "rendered ConfigMap carries the inbox-hook.sh key" "not found in $claude_submit_out"
+fi
+if grep -qF 'Addenda are pushed to you automatically' "$claude_submit_out"; then
+    ok "rendered handoff.md preamble is worded for the claude harness (pushed, not polled)"
+else
+    no "rendered handoff.md preamble is worded for the claude harness (pushed, not polled)" \
+        "not found in $claude_submit_out"
+fi
+if grep -q 'name: HARNESS' "$claude_submit_out" \
+    && grep -A1 'name: HARNESS' "$claude_submit_out" | grep -q 'value: "claude"'; then
+    ok "rendered Job sets HARNESS=claude"
+else
+    no "rendered Job sets HARNESS=claude" "not found in $claude_submit_out"
+fi
+if grep -q 'name: CLAUDE_PROXY_BASE_URL' "$claude_submit_out" \
+    && grep -A1 'name: CLAUDE_PROXY_BASE_URL' "$claude_submit_out" \
+        | grep -qF "http://$claude_run_name-claude-proxy.fork-sandbox-test.svc.cluster.local:8080"; then
+    ok "rendered Job's CLAUDE_PROXY_BASE_URL names this run's own proxy Service"
+else
+    no "rendered Job's CLAUDE_PROXY_BASE_URL names this run's own proxy Service" \
+        "not found in $claude_submit_out"
+fi
+if grep -A1 'name: PROXY_HOST' "$claude_submit_out" \
+    | grep -qF "value: \"$claude_run_name-claude-proxy.fork-sandbox-test.svc.cluster.local\""; then
+    ok "the egress-gate initContainer's PROXY_HOST names this run's own proxy Service"
+else
+    no "the egress-gate initContainer's PROXY_HOST names this run's own proxy Service" \
+        "not found in $claude_submit_out"
+fi
+# The pi path's own PROXY_HOST is untouched by any of the above: a plain
+# pi run keeps probing the shared proxy.
+if grep -A1 'name: PROXY_HOST' "$submit_out" \
+    | grep -qF 'value: "fork-sandbox-proxy.fork-sandbox-test.svc.cluster.local"'; then
+    ok "a pi run's egress-gate PROXY_HOST still names the shared proxy"
+else
+    no "a pi run's egress-gate PROXY_HOST still names the shared proxy" "not found in $submit_out"
+fi
+if grep -q 'would create Secret' "$claude_submit_out"; then
+    ok "submit --dry-run --harness claude notes the Secret it would create, without a value"
+else
+    no "submit --dry-run --harness claude notes the Secret it would create, without a value" \
+        "not found in $claude_submit_out"
+fi
 rm -f /tmp/fs-k8s-test-claude-submit.err
+
+printf '\n== fork-sandbox-k8s.sh submit --dry-run --harness claude: credential expiry ==\n'
+claude_home_expired="$(newdir)"; tmpdirs+=("$claude_home_expired")
+mkdir -p "$claude_home_expired/.claude"
+claude_past_ms=$(( ($(date +%s) - 3600) * 1000 ))
+cat > "$claude_home_expired/.claude/.credentials.json" <<JSON
+{"claudeAiOauth": {"accessToken": "tok", "expiresAt": $claude_past_ms}}
+JSON
+refuses "an expired Claude credential is refused" \
+    "has expired" \
+    env HOME="$claude_home_expired" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model claude-sonnet-5 --harness claude \
+    "$proj_dir" "$handoff_file"
+
+claude_home_soon="$(newdir)"; tmpdirs+=("$claude_home_soon")
+mkdir -p "$claude_home_soon/.claude"
+claude_soon_ms=$(( ($(date +%s) + 1800) * 1000 ))
+cat > "$claude_home_soon/.claude/.credentials.json" <<JSON
+{"claudeAiOauth": {"accessToken": "tok", "expiresAt": $claude_soon_ms}}
+JSON
+soon_out="$(HOME="$claude_home_soon" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model claude-sonnet-5 --harness claude \
+    "$proj_dir" "$handoff_file" 2>&1 1>/dev/null)"
+if [[ "$soon_out" == *"expires in"*"the pod's session dies then"* ]]; then
+    ok "a credential expiring within an hour warns but still renders"
+else
+    no "a credential expiring within an hour warns but still renders" "$soon_out"
+fi
+
+printf '\n== fork-sandbox-k8s.sh rm removes the per-run claude-proxy objects ==\n'
+# No live cluster here (see this file's own header), so `rm`'s kubectl
+# calls are checked against a stub kubectl placed ahead of the real one on
+# PATH, logging its own argv rather than touching any cluster.
+kubectl_stub_bin="$(newdir)"; tmpdirs+=("$kubectl_stub_bin")
+kubectl_log="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$kubectl_log")")
+cat > "$kubectl_stub_bin/kubectl" <<STUB
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$kubectl_log"
+exit 0
+STUB
+chmod +x "$kubectl_stub_bin/kubectl"
+if PATH="$kubectl_stub_bin:$PATH" FORK_SANDBOX_CONFIG_DIR="$config_dir" \
+    "$k8s_sh" rm --branch fs-k8s-test-branch >/dev/null 2>/tmp/fs-k8s-test-rm.err; then
+    ok "rm exits 0 against a stubbed kubectl"
+else
+    no "rm exits 0 against a stubbed kubectl" "$(cat /tmp/fs-k8s-test-rm.err)"
+fi
+if grep -q "delete pod,service,secret,configmap -l fork-sandbox/branch=$claude_run_name --ignore-not-found" "$kubectl_log"; then
+    ok "rm issues the label-based delete covering the claude-proxy Pod/Service/Secret/ConfigMap"
+else
+    no "rm issues the label-based delete covering the claude-proxy Pod/Service/Secret/ConfigMap" \
+        "not found in $kubectl_log: $(cat "$kubectl_log")"
+fi
+if grep -q "delete job $claude_run_name --ignore-not-found" "$kubectl_log" \
+    && grep -q "delete configmap $claude_run_name-scripts --ignore-not-found" "$kubectl_log"; then
+    ok "rm still issues its original job/configmap deletes too"
+else
+    no "rm still issues its original job/configmap deletes too" "$(cat "$kubectl_log")"
+fi
+rm -f /tmp/fs-k8s-test-rm.err
 
 printf '\n== fork-sandbox-k8s.sh install --dry-run excludes 31-claude-proxy.yaml ==\n'
 if grep -q 'claude-proxy' "$install_out"; then

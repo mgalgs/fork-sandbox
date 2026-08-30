@@ -4,11 +4,13 @@
 # Usage: fork-sandbox-k8s.sh install [--dry-run]
 #        fork-sandbox-k8s.sh submit [--dry-run] --branch NAME --model MODEL
 #                            [--harness pi|claude]
-#                            [--review-loop N] [--outbox-max SIZE]
+#                            [--review-loop N] [--review-model MODEL]
+#                            [--outbox-max SIZE]
 #                            [--context-ro DIR]
 #                            <project-path> <handoff-file>
 #        fork-sandbox-k8s.sh run [--dry-run] [--timeout SECONDS] [--keep]
-#                            --branch NAME --model MODEL [--review-loop N]
+#                            --branch NAME --model MODEL [--harness pi|claude]
+#                            [--review-loop N] [--review-model MODEL]
 #                            [--outbox-dir DIR] [--outbox-max SIZE]
 #                            [--context-ro DIR]
 #                            <project-path> <handoff-file>
@@ -486,6 +488,23 @@ render_review_loop_env() {
 ENV
 }
 
+# The two --harness claude-only ConfigMap keys: the placeholder credential
+# (already sanitized by the caller -- see cmd_submit's credential preflight)
+# and the operator-inbox hook, shipped in so the entrypoint can copy it to
+# /work/inbox/.inbox-hook.sh and register it exactly like a local claude
+# run's --settings does (fork-sandbox.sh's own inbox-hook install, around
+# its own harness == claude guard). Indented 2 spaces to sit beside the
+# other ConfigMap data keys.
+render_claude_configmap_keys() {
+    local configmap_cred="$1" inbox_hook_src="$2"
+    cat <<KEYS
+  claude-credentials.json: |
+$(printf '%s\n' "$configmap_cred" | indent_block)
+  inbox-hook.sh: |
+$(indent_block < "$inbox_hook_src")
+KEYS
+}
+
 # The --context-ro-only handoff.md section, appended after the shared
 # preamble and before the operator's own handoff text -- see cmd_submit's
 # handoff.md rendering below. Not folded into fs_emit_prompt_preamble
@@ -596,7 +615,7 @@ cmd_install() {
 
 cmd_submit() {
     local dry_run=false branch="" model="" review_loop_cap="" outbox_max_arg=""
-    local context_ro="" harness="pi"
+    local context_ro="" harness="pi" review_model=""
     while (( $# )); do
         case "$1" in
             --dry-run) dry_run=true; shift ;;
@@ -604,6 +623,7 @@ cmd_submit() {
             --model) model="${2:?--model requires an OpenRouter model id}"; shift 2 ;;
             --harness) harness="${2:?--harness requires 'pi' or 'claude'}"; shift 2 ;;
             --review-loop) review_loop_cap="${2:?--review-loop requires a positive integer}"; shift 2 ;;
+            --review-model) review_model="${2:?--review-model requires a model id}"; shift 2 ;;
             --outbox-max) outbox_max_arg="${2:?--outbox-max requires a size}"; shift 2 ;;
             --context-ro) context_ro="${2:?--context-ro requires a directory}"; shift 2 ;;
             -*) echo "Error: unknown option '$1' for submit." >&2; exit 1 ;;
@@ -644,6 +664,60 @@ cmd_submit() {
     local outbox_max_bytes="$FS_OUTBOX_MAX_BYTES"
     if [[ -n "$outbox_max_arg" ]]; then
         outbox_max_bytes="$(fs_parse_size_bytes "$outbox_max_arg")" || exit 1
+    fi
+
+    [[ -n "$review_model" ]] && { fs_reject_unsafe_chars "$review_model" || exit 1; }
+
+    # The operator's own OAuth credential, for --harness claude only --
+    # read and validated here, before anything is created, the same rule
+    # every other pre-creation check in this function follows. Read once;
+    # both the per-run Secret below (the real access token, for the proxy)
+    # and the ConfigMap's placeholder credential (the sanitized JSON, for
+    # the pod's claude CLI) come from this single read. This is a local
+    # file read (or, on macOS, a Keychain read), so it runs even under
+    # --dry-run -- no cluster is contacted, exactly like every other
+    # validation in this function that --dry-run is meant to exercise.
+    local claude_cred_json="" claude_access_token="" claude_configmap_cred=""
+    if [[ "$harness" == claude ]]; then
+        claude_cred_json="$(fs_read_claude_credential)" || exit 1
+
+        # The pod cannot refresh the token, so a run that outlives it dies
+        # -- the same lifetime caveat a local claude-sandboxed session has.
+        # Same two messages, adapted from "the sandbox session" to "the
+        # pod's session".
+        local claude_expires_at_ms claude_mins_left
+        claude_expires_at_ms="$(jq -r '.claudeAiOauth.expiresAt // 0' <<< "$claude_cred_json")"
+        claude_mins_left=$(( claude_expires_at_ms / 60000 - $(date +%s) / 60 ))
+        if (( claude_mins_left <= 0 )); then
+            echo "Error: the access token in $(fs_claude_credential_source) has expired." >&2
+            echo "Log in with claude on the host, then retry." >&2
+            exit 1
+        elif (( claude_mins_left < 60 )); then
+            echo "Warning: the access token expires in ${claude_mins_left}m; the pod's session dies then." >&2
+        fi
+
+        claude_access_token="$(jq -r '.claudeAiOauth.accessToken // empty' <<< "$claude_cred_json")"
+        if [[ -z "$claude_access_token" ]]; then
+            echo "Error: $(fs_claude_credential_source) has no claudeAiOauth.accessToken." >&2
+            exit 1
+        fi
+        fs_reject_unsafe_chars "$claude_access_token" || exit 1
+
+        # The placeholder credential shipped into the pod's ConfigMap: the
+        # same sanitizing jq claude-sandboxed applies to a local sandbox's
+        # copy (drop mcpOAuth, and the refresh token and its expiry -- the
+        # pod needs and may hold neither), plus one substitution unique to
+        # this path -- the real access token becomes the literal string
+        # "sandbox", since Claude Code accepts any placeholder locally and
+        # the proxy supplies the real bearer on the way past. After this
+        # substitution the file holds no secret (just scopes, subscription
+        # type, expiry), which is what makes a ConfigMap -- not a Secret --
+        # the right place for it.
+        claude_configmap_cred="$(jq '
+            del(.mcpOAuth)
+            | del(.claudeAiOauth.refreshToken, .claudeAiOauth.refreshTokenExpiresAt)
+            | .claudeAiOauth.accessToken = "sandbox"
+        ' <<< "$claude_cred_json")"
     fi
 
     # The same rule fork-sandbox.sh's own local --context-ro flag applies to
@@ -781,6 +855,12 @@ cmd_submit() {
     safe_name="$(k8s_safe_name fork-sandbox-agent "$branch")"
     local proxy_base_url="http://fork-sandbox-proxy.$K8S_NAMESPACE.svc.cluster.local:8080/api/v1"
 
+    # The egress-gate initContainer's own proxy probe: the shared pi proxy
+    # for a pi run, this run's own per-run proxy for a claude run -- see
+    # the Job env below, which is what actually needs this value.
+    local egress_proxy_host="fork-sandbox-proxy.$K8S_NAMESPACE.svc.cluster.local"
+    [[ "$harness" == claude ]] && egress_proxy_host="$safe_name-claude-proxy.$K8S_NAMESPACE.svc.cluster.local"
+
     # The per-run Claude Code proxy manifest (ConfigMap + Pod + Service),
     # rendered here -- ahead of the ConfigMap+Job below, in the SAME
     # `kubectl apply` stream -- for --harness claude only. See
@@ -803,13 +883,44 @@ cmd_submit() {
             "$claude_proxy_template")"$'\n'
     fi
 
+    # The per-run Secret carrying the REAL operator access token, read by
+    # the per-run proxy above. Created the same way cmd_install creates
+    # fork-sandbox-upstream-key -- kubectl create secret generic
+    # --dry-run=client -o yaml | kubectl apply -f -, so the token never
+    # appears on any argv beyond that one --from-literal -- then labeled
+    # in a SEPARATE command, since `kubectl create secret` has no
+    # --overwrite of its own and this keeps the token off that second
+    # command's argv too. Under --dry-run this creates nothing; the
+    # dry-run print below adds one comment line instead.
+    if [[ "$harness" == claude && "$dry_run" != true ]]; then
+        kubectl create secret generic "$safe_name-claude-token" \
+            --from-literal="upstream-key.conf=set \$upstream_key \"$claude_access_token\";" \
+            --dry-run=client -o yaml | kubectl apply -f -
+        kubectl label secret "$safe_name-claude-token" \
+            fork-sandbox/branch="$safe_name" --overwrite
+    fi
+
     local entrypoint_sh="$script_dir/fork-sandbox-k8s-entrypoint.sh"
     local gate_sh="$script_dir/fork-sandbox-k8s-egress-gate.sh"
     local inbox_write_sh="$script_dir/fork-sandbox-k8s-inbox-write.sh"
     local context_extract_sh="$script_dir/fork-sandbox-k8s-context-extract.sh"
+    local inbox_hook_sh="$script_dir/fork-sandbox-inbox-hook.sh"
     for f in "$entrypoint_sh" "$gate_sh" "$inbox_write_sh" "$review_loop_sh" "$context_extract_sh"; do
         [[ -x "$f" ]] || { echo "Error: $f is missing or not executable." >&2; exit 1; }
     done
+
+    # The two --harness claude-only ConfigMap keys: the placeholder
+    # credential and the operator-inbox hook -- see
+    # render_claude_configmap_keys's own header. Same newline-prefix
+    # convention as review_loop_configmap_keys below, so an empty string
+    # here changes nothing about the no-claude render.
+    local claude_configmap_keys=""
+    if [[ "$harness" == claude ]]; then
+        [[ -x "$inbox_hook_sh" ]] \
+            || { echo "Error: $inbox_hook_sh is missing or not executable." >&2; exit 1; }
+        claude_configmap_keys=$'\n'"$(render_claude_configmap_keys \
+            "$claude_configmap_cred" "$inbox_hook_sh")"
+    fi
 
     # Must track fork-sandbox-k8s-entrypoint.sh's own work_dir/clone_dir --
     # this script renders the ConfigMap before the pod exists, so there is
@@ -834,6 +945,28 @@ cmd_submit() {
         review_loop_env=$'\n'"$(render_review_loop_env "$review_loop_cap" "$base_sha")"
     fi
 
+    # CLAUDE_PROXY_BASE_URL, for --harness claude only, and REVIEW_MODEL
+    # alongside it when --review-model was given -- the pi review loop's
+    # own model, since the review loop always runs pi regardless of the
+    # implement harness. A pi run's own --review-model handling is
+    # separate (see the pi-only models.json generation in the entrypoint);
+    # nothing here changes for pi.
+    local claude_env=""
+    if [[ "$harness" == claude ]]; then
+        claude_env=$'\n'"$(cat <<CENV
+            - name: CLAUDE_PROXY_BASE_URL
+              value: "http://$safe_name-claude-proxy.$K8S_NAMESPACE.svc.cluster.local:8080"
+CENV
+)"
+        if [[ -n "$review_model" ]]; then
+            claude_env+=$'\n'"$(cat <<CENV
+            - name: REVIEW_MODEL
+              value: "$review_model"
+CENV
+)"
+        fi
+    fi
+
     local rendered
     rendered="${claude_proxy_rendered}$(cat <<EOF
 ---
@@ -855,11 +988,11 @@ $(indent_block < "$inbox_write_sh")
   context-extract.sh: |
 $(indent_block < "$context_extract_sh")
   handoff.md: |
-$({ fs_emit_prompt_preamble "$pod_clone_dir" "$POD_INBOX_DIR" pi gated "$POD_OUTBOX_DIR" pod \
+$({ fs_emit_prompt_preamble "$pod_clone_dir" "$POD_INBOX_DIR" "$harness" gated "$POD_OUTBOX_DIR" pod \
        "$outbox_max_bytes"
    [[ -n "$context_ro" ]] && render_context_section "$POD_CONTEXT_DIR"
    printf '\n---\n\n'
-   cat -- "$handoff_file"; } | indent_block)${review_loop_configmap_keys}
+   cat -- "$handoff_file"; } | indent_block)${review_loop_configmap_keys}${claude_configmap_keys}
 ---
 apiVersion: batch/v1
 kind: Job
@@ -894,7 +1027,7 @@ spec:
             - name: DENIED_PROBE
               value: "$K8S_DENIED_PROBE"
             - name: PROXY_HOST
-              value: "fork-sandbox-proxy.$K8S_NAMESPACE.svc.cluster.local"
+              value: "$egress_proxy_host"
             - name: PROXY_PORT
               value: "8080"
             - name: ICMP_CHECK
@@ -917,6 +1050,8 @@ spec:
               value: /home/agent
             - name: BRANCH
               value: "$branch"
+            - name: HARNESS
+              value: "$harness"
             - name: MODEL
               value: "$model"
             - name: PROXY_BASE_URL
@@ -928,7 +1063,7 @@ spec:
             - name: RUN_TTL
               value: "$K8S_RUN_TTL"
             - name: OUTBOX_MAX_BYTES
-              value: "$outbox_max_bytes"${review_loop_env}
+              value: "$outbox_max_bytes"${review_loop_env}${claude_env}
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -969,6 +1104,10 @@ EOF
 
     if [[ "$dry_run" == true ]]; then
         printf '%s\n' "$rendered"
+        if [[ "$harness" == claude ]]; then
+            printf '# (dry-run) would create Secret %s-claude-token here, holding the operator access token -- not shown.\n' \
+                "$safe_name"
+        fi
         exit 0
     fi
 
@@ -1165,6 +1304,11 @@ cmd_rm() {
     safe_name="$(k8s_safe_name fork-sandbox-agent "$branch")"
     kubectl delete job "$safe_name" --ignore-not-found
     kubectl delete configmap "$safe_name-scripts" --ignore-not-found
+    # Additionally, by label: the claude-proxy Pod, Service, ConfigMap and
+    # Secret, none of which the two deletes above name -- harmless on a pi
+    # run, which never created anything carrying this label beyond the
+    # scripts ConfigMap already deleted above.
+    kubectl delete pod,service,secret,configmap -l fork-sandbox/branch="$safe_name" --ignore-not-found
     echo "fork-sandbox-k8s: removed job and configmap for branch $branch" >&2
 }
 
@@ -1174,7 +1318,7 @@ cmd_rm() {
 # failure handling.
 cmd_run() {
     local dry_run=false keep=false timeout=3600 branch="" model="" review_loop_cap=""
-    local outbox_dir="" outbox_max_arg="" context_ro=""
+    local outbox_dir="" outbox_max_arg="" context_ro="" harness="" review_model=""
     while (( $# )); do
         case "$1" in
             --dry-run) dry_run=true; shift ;;
@@ -1182,7 +1326,9 @@ cmd_run() {
             --timeout) timeout="${2:?--timeout requires a number of seconds}"; shift 2 ;;
             --branch) branch="${2:?--branch requires a name}"; shift 2 ;;
             --model) model="${2:?--model requires an OpenRouter model id}"; shift 2 ;;
+            --harness) harness="${2:?--harness requires 'pi' or 'claude'}"; shift 2 ;;
             --review-loop) review_loop_cap="${2:?--review-loop requires a positive integer}"; shift 2 ;;
+            --review-model) review_model="${2:?--review-model requires a model id}"; shift 2 ;;
             --outbox-dir) outbox_dir="${2:?--outbox-dir requires a path}"; shift 2 ;;
             --outbox-max) outbox_max_arg="${2:?--outbox-max requires a size}"; shift 2 ;;
             --context-ro) context_ro="${2:?--context-ro requires a directory}"; shift 2 ;;
@@ -1214,11 +1360,13 @@ cmd_run() {
     fi
 
     local -a submit_argv=(--branch "$branch" --model "$model")
+    [[ -n "$harness" ]] && submit_argv+=(--harness "$harness")
     # Passed through whenever the flag was given at all, "0" included --
     # cmd_submit does the actual positive-integer validation below, and a
     # bad value here must reach that error rather than silently collapse
     # into "no loop" the way an `(( review_loop_cap > 0 ))` gate would.
     [[ -n "$review_loop_cap" ]] && submit_argv+=(--review-loop "$review_loop_cap")
+    [[ -n "$review_model" ]] && submit_argv+=(--review-model "$review_model")
     [[ -n "$outbox_max_arg" ]] && submit_argv+=(--outbox-max "$outbox_max_arg")
     [[ -n "$context_ro" ]] && submit_argv+=(--context-ro "$context_ro")
     submit_argv+=("$project_path" "$handoff_file")
