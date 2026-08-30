@@ -66,12 +66,21 @@ explicit spelling of it; it is also what plain `/sandbox-coder-mode` means.
 
 ## Entering the mode
 
+Before the first launch, read `~/.config/fork-sandbox/coder-mode.env` if it
+exists — `cat` it, or use the Read tool, either is fine — and note the
+effective launch defaults; see **Choosing a harness and a model** for what
+it can override and what a missing file means. Both announcements below
+name those defaults in one clause, worded from what was actually read, not
+from the example text here, so a machine whose config overrides them
+announces what it will actually do.
+
 Tell the user, in one or two lines, stating plainly that this session will
 stay high level:
 
 > Sandbox coder mode is on. I'll read, plan, review and integrate; the actual
-> editing goes to sandboxed runs on their own branches. Say "exit sandbox
-> coder mode" when you want me writing code here again.
+> editing goes to sandboxed runs on their own branches — sonnet implements,
+> opus reviews. Say "exit sandbox coder mode" when you want me writing code
+> here again.
 
 Then carry on with whatever they asked for. Do not re-announce the mode on
 every turn.
@@ -89,9 +98,9 @@ this section describes what changes when it runs long.
 Tell the user, in one or two lines:
 
 > Sandbox coder mode is on, long-horizon. I'll run this as tiers: I plan,
-> stay high level, and integrate; a cheap model does the typing in the
-> sandbox, with an optional in-sandbox reviewer ahead of me. I'll report
-> each round with its cost, and flag anything still unpushed.
+> stay high level, and integrate; sonnet does the typing in the sandbox,
+> with opus reviewing each round ahead of me, up to two review rounds.
+> I'll report each round with its cost, and flag anything still unpushed.
 
 **The tiers.** Three, and the distinction between them is the whole point:
 
@@ -101,11 +110,13 @@ Tell the user, in one or two lines:
   and a spot-check of what executes on the host — integrates, and owns all
   host-side git (see **What stays in this session**). It writes no project
   code.
-- **Tier 2 — implementer.** The cheap model, in the sandbox. It types. Pin it
-  explicitly on every launch — `--harness claude --model sonnet`, or a `pi` /
-  `pi-local` harness — per **Choosing a harness and a model**.
-- **Tier 3 — in-sandbox reviewer.** Optional, via `--review-loop N`. A fresh
-  cheap session that reviews tier 2's work before it ever leaves the sandbox.
+- **Tier 2 — implementer.** The cheap model, in the sandbox. It types, at the
+  default `--harness claude --model sonnet` — or a `pi` / `pi-local` harness
+  when a per-round reason calls for one — per **Choosing a harness and a
+  model**.
+- **Tier 3 — in-sandbox reviewer.** On by default, via `--review-model opus
+  --review-loop 2`. A fresh opus session reviews tier 2's work before it
+  ever leaves the sandbox; drop below the default only for a stated reason.
 
 **Tier 1's review is never skipped because tier 3 ran.** This is the
 load-bearing rule of the whole arrangement:
@@ -208,7 +219,11 @@ reporting:
   own summary — per **Reviewing and integrating**.
 - Quote the cost every round. It varies by an order of magnitude between
   rounds of similar size, and it is the number that decides the next
-  round's harness. One day's rounds ranged from 0.31 to 11.12 USD.
+  round's harness. One day's rounds ranged from 0.31 to 11.12 USD. The
+  default `--review-loop 2` with `--review-model opus` means up to two
+  opus review legs and two sonnet fix legs on top of the coding session
+  itself, so a round at the defaults can cost materially more than a
+  single-pass run.
 - A mid-turn ask is not an interrupt. When the user fires off a new idea
   while a round is in flight, acknowledge it in one sentence, keep the
   current work moving, and start it at the next natural break — unless it
@@ -304,7 +319,8 @@ otherwise widen the task on its own.
 ## Launching and watching
 
 ```bash
-fork-sandbox.sh --model sonnet --branch "<branch>" \
+fork-sandbox.sh --harness claude --model sonnet --review-model opus --review-loop 2 \
+    --branch "<branch>" \
     --task-meta '{"kind":"implement","difficulty":3,"size":"m","prompt_template_id":"<slug>"}' \
     "<project-path>" "<handoff-file>"
 ```
@@ -405,7 +421,8 @@ is destroyed with its clone, so THAT kind of second round is a new run that
 starts from the first one's branch:
 
 ```bash
-fork-sandbox.sh --model sonnet --branch "<branch>-2" --checkout "<branch>" \
+fork-sandbox.sh --harness claude --model sonnet --review-model opus --review-loop 2 \
+    --branch "<branch>-2" --checkout "<branch>" \
     "<project-path>" "<handoff-file-2>"
 ```
 
@@ -520,18 +537,49 @@ sandbox-run-log.py list --days 14
 
 ## Choosing a harness and a model
 
+The default launch is:
+
+```
+--harness claude --model sonnet --review-model opus --review-loop 2
+```
+
+That is what to launch with when no per-round reason says otherwise. It is
+overridable per machine, never per repo: if
+`~/.config/fork-sandbox/coder-mode.env` exists, its keys replace the
+matching flag's default and every other flag keeps its default. A missing
+file, or a key absent from it, means the default above.
+
+| key | flag | default |
+|---|---|---|
+| `CODER_MODE_HARNESS` | `--harness` | `claude` |
+| `CODER_MODE_MODEL` | `--model` | `sonnet` |
+| `CODER_MODE_REVIEW_HARNESS` | `--review-harness` | unset (same as `--harness`) |
+| `CODER_MODE_REVIEW_MODEL` | `--review-model` | `opus` |
+| `CODER_MODE_REVIEW_LOOP` | `--review-loop` | `2` |
+
+No script reads this file — `fork-sandbox.sh` itself has no idea it exists.
+Reading it is this session's job, done once per **Entering the mode**,
+because a script that read it would make these flags the default for every
+caller of `fork-sandbox.sh`, not just coder mode. `fork-sandbox.sh configure`
+does not write it either — its target allowlist is deliberately hardcoded
+(see [configure.md](../../docs/configure.md)); this file is written by
+hand, by whoever set up the machine.
+
+### Reasons to deviate for one round
+
 Pick per task, and say why in one line when you launch:
 
 | Task | Harness | Cost |
 |---|---|---|
 | Mechanical, high-volume, exploratory — a test sweep, a rename, a data-shape investigation | `--harness pi-local` | nothing |
-| Ordinary implementation with a clear plan | `--harness claude --model sonnet` | subscription |
+| Ordinary implementation with a clear plan | `--harness claude --model sonnet` (the default) | subscription |
 | Work where the model quality decides the outcome | `--harness claude --model opus` | subscription |
 | A second opinion from outside the family | `--harness pi --model <openrouter-id>` or `--harness codex` | real money / ChatGPT sign-in |
 
 **Pin `--model` on every claude run.** Without it the run takes the host's
 default, which is the expensive model this session is likely running on —
-and the mode's whole reason for existing is gone.
+and the mode's whole reason for existing is gone. The defaults above are
+that pin; only spell the flags out again when deviating from them.
 
 `pi-local` is sealed: no network at all, so nothing can be installed or
 fetched in there. Say in the handoff what is already provided, or the run
