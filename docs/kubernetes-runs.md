@@ -119,7 +119,7 @@ idles out or is removed.
 | Agent's credentials | the model token, or none | **none** — see "Model access" below |
 | Git write credential | **none** — it commits, it cannot push | **none** — the same |
 | Repository arrives via | a `git clone --shared` of the origin | `git push` over `kubectl exec`, in — see below |
-| Files arrive via | `--bind-ro` of a host path | not yet built for a cluster run — see "Deliberately not done" |
+| Files arrive via | `--bind-ro` of a host path | `--context-ro`: `git push`-style push over `kubectl exec`, into `/work/context` — see "Getting files in" below |
 | Work leaves via | `git fetch` from the clone | `git fetch` over `kubectl exec`, from the pod's clone |
 | Services reach it via | unix-socket bridges | Services, narrowed by NetworkPolicy |
 | Egress pin | pasta, or blackhole routes | NetworkPolicy, sealed to DNS and the proxy, plus an initContainer self-test |
@@ -257,8 +257,10 @@ everyone else's runs also pull.
 things at once.** The design as first written had the pod clone from a git
 remote, and separately proposed `--copy-files` — a `kubectl cp` of a host path
 into the pod — as the answer to files a run needs that are not in the
-repository. v1 does neither. Instead, **the client pushes the repository into
-the pod**, over the same `kubectl exec` channel the work later returns on:
+repository. The repository itself still arrives by push, never by clone;
+getting other files in is a narrower, later mechanism — see "Getting files
+in" below. **The client pushes the repository into the pod**, over the same
+`kubectl exec` channel the work later returns on:
 
 ```bash
 git -c protocol.ext.allow=always push \
@@ -331,9 +333,9 @@ polls for exactly that file with a deadline, and expiry is a failure — a
 client that died mid-push must not become an agent running with a
 half-received repository.
 
-`--copy-files` itself — a general mechanism for handing a run something that
-is not the repository and not the handoff — is not built in v1. See
-"Deliberately not done" below.
+`--copy-files` itself — a general mechanism for handing a run anything else,
+rather than the one directory `--context-ro` pushes — is not built in v1.
+See "Getting files in" below.
 
 **The operator inbox breaks the "every input is gated" claim above, and it
 should say so rather than quietly stop being true.**
@@ -628,16 +630,53 @@ Reasonable for a cluster where the operator accepts that trade for the
 simplicity, but v1 does not build it — the proxy exists specifically to avoid
 this trade by default.
 
-## Getting files in — not yet built
+## Getting files in: --context-ro
 
 `--copy-files`, as a general "hand the pod a host path that is not the
-repository" mechanism, is **not built in v1**. The repository itself now
-travels the gated push channel described above, and the handoff prompt rides
-along as a small ConfigMap-mounted file, which covers the common cases. A
-run that needs something larger or more specific — a gathered-context
-directory, a provisioned cache — has no answer yet; adding one is a later
-round, following the same two-phase gate the repository push already
-established, once real usage says what shape it should take.
+repository" mechanism, is **not built in v1**. The repository itself
+travels the gated push channel described above, and the handoff prompt
+rides along as a small ConfigMap-mounted file, which covers the common
+cases. What v1 does build, narrower than that general mechanism, is
+`--context-ro DIR`: a single caller-chosen directory — gathered notes, a
+provisioned cache, anything a run needs that is not in the repository —
+pushed into the pod, following the same two-phase gate the repository push
+already established.
+
+The transport is the same gated channel, not a new one: `submit` tars the
+directory (`tar cf - -C DIR .`) and pipes it over `kubectl exec -i` into
+`fork-sandbox-k8s-context-extract.sh`, a POSIX sh script shipped in the
+per-run scripts ConfigMap alongside the entrypoint and the inbox writer.
+This runs after the repository push and before the `.inputs-complete`
+sentinel is written, so a failure pushing the context fails the submit
+before the sentinel exists — the pod fails closed on its `INPUTS_TIMEOUT`
+exactly as it does for a client that died mid-repository-push. The
+extractor applies the same guard `fork-sandbox-k8s-outbox-extract.sh` uses
+in the other direction: list the archive before extracting anything, and
+refuse the whole thing on an absolute path, a `..` component, or any
+symlink or hard link — an untrusted tar stream is never extracted naively,
+whichever direction it travels.
+
+The directory lands at `/work/context`, a **sibling** of `/work/clone`,
+never a descendant — the same structural reason `/work/inbox` and
+`/work/outbox` are siblings: the entrypoint's `git add -A` is scoped to the
+clone and must never sweep gathered context into a commit. It lives in the
+`work` emptyDir, so nothing in the pod spec changes for it. Unlike the
+local flag's real `--bind-ro`, an emptyDir cannot be bound read-only per
+subdirectory — read-only here is by convention, enforced by a `## Gathered
+context` section `submit` appends to the rendered `handoff.md`, telling the
+agent where the directory is and asking it not to write there, not by the
+filesystem. The directory's real path must be under
+`/var/tmp/claude-scratch/forks/`, the same rule the local flag applies to
+its bind, and it is capped at a fixed 256 MiB — no `--context-max` flag,
+since gathered context is notes and small caches, not a size anyone has
+needed to raise — checked twice, independently: on the host before
+anything is pushed, and again by the pod-side extractor before it extracts
+anything.
+
+A run that needs something larger or more specific still than one pushed
+directory — a general "hand the pod any host path" mechanism, or a
+provisioned cache shared across runs — has no broader answer yet; that
+remains a later round, once real usage says what shape it should take.
 
 ## The agent pod
 
@@ -850,9 +889,6 @@ Scoped out of v1 on purpose, not overlooked:
 
 - **A second platform implementation.** Contract plus `generic` only — see
   `docs/k8s-platform.md`.
-- **`--copy-files` as a general, user-facing mechanism.** The repository and
-  the handoff both travel the gated channel now; a general "copy anything
-  else in" flag is a later round once real usage says what shape it needs.
 - **The claude and codex harnesses inside a pod.** pi only, for the same
   reason `--harness pi-local` is pi-only locally: it is the harness this
   project's sealed-network story is built around.
