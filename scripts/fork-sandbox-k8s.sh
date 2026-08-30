@@ -119,7 +119,11 @@
 # DIR must be a real directory under /var/tmp/claude-scratch/forks/, the
 # same rule fork-sandbox.sh's own local --context-ro applies to its
 # --bind-ro -- a blanket-approved script must not be pointable at an
-# arbitrary host directory. Capped at a fixed 256 MiB, checked twice,
+# arbitrary host directory. DIR must not contain a symlink, refused on the
+# host before anything is pushed -- tar cf's ordinary walk turns one into
+# a link entry, which the pod-side extractor also refuses, but only after
+# the Job exists, the pod is Ready and the repository has already been
+# pushed. Capped at a fixed 256 MiB, checked twice,
 # independently: on the host before anything is pushed
 # (fork-sandbox-k8s.sh itself), and again pod-side by
 # fork-sandbox-k8s-context-extract.sh before it extracts anything -- no
@@ -641,6 +645,19 @@ cmd_submit() {
         fi
         if [[ ! -d "$context_ro_real" ]]; then
             echo "Error: --context-ro directory '$context_ro_real' does not exist." >&2
+            exit 1
+        fi
+        # tar cf's ordinary (non -h) walk turns a symlink into a link
+        # entry, which fork-sandbox-k8s-context-extract.sh refuses --
+        # but only after the Job exists, the pod is Ready and the
+        # repository has already been pushed. Catching it here instead
+        # refuses before any of that happens.
+        local context_ro_symlink
+        context_ro_symlink="$(find "$context_ro_real" -type l -print -quit)"
+        if [[ -n "$context_ro_symlink" ]]; then
+            echo "Error: --context-ro directory '$context_ro_real' contains a" >&2
+            echo "symlink ('$context_ro_symlink'); links are not allowed in a" >&2
+            echo "pushed context directory." >&2
             exit 1
         fi
         context_ro="$context_ro_real"

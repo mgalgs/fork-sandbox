@@ -654,7 +654,12 @@ extractor applies the same guard `fork-sandbox-k8s-outbox-extract.sh` uses
 in the other direction: list the archive before extracting anything, and
 refuse the whole thing on an absolute path, a `..` component, or any
 symlink or hard link — an untrusted tar stream is never extracted naively,
-whichever direction it travels.
+whichever direction it travels. A symlink anywhere in `DIR` is also
+refused on the host, before `submit` tars anything — by the time the
+pod-side extractor would catch the same link entry, the Job already
+exists, the pod is already Ready and the repository has already been
+pushed, so catching it before any of that is cheaper for the caller and
+no less safe.
 
 The directory lands at `/work/context`, a **sibling** of `/work/clone`,
 never a descendant — the same structural reason `/work/inbox` and

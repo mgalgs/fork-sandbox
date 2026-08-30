@@ -870,6 +870,19 @@ refuses "submit --context-ro on a missing directory is refused" \
     --context-ro /var/tmp/claude-scratch/forks/fs-k8s-test-cr-missing-xyz \
     "$proj_dir" "$handoff_file"
 
+# A directory containing a symlink is refused on the host, before the
+# Job is ever created -- `tar cf`'s ordinary walk would turn it into a
+# link entry the pod-side extractor also refuses, but only after the
+# repository has already been pushed. --dry-run touches no kubectl and no
+# cluster, so this check runs (and is observable) with neither.
+cr_sym_dir="$(mktemp -d /var/tmp/claude-scratch/forks/fs-k8s-test-cr-sym.XXXXXX)"; tmpdirs+=("$cr_sym_dir")
+ln -s /etc/passwd "$cr_sym_dir/evil"
+refuses "submit --context-ro containing a symlink is refused" \
+    "contains a" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-cr-sym --model moonshotai/kimi-k3 --context-ro "$cr_sym_dir" \
+    "$proj_dir" "$handoff_file"
+
 # `run --dry-run --context-ro` forwards to submit rather than growing its
 # own divergent copy -- same property --outbox-max's own run/submit pair
 # already proves above, applied to this flag.
