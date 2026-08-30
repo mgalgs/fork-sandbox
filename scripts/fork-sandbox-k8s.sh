@@ -3,6 +3,7 @@
 #
 # Usage: fork-sandbox-k8s.sh install [--dry-run]
 #        fork-sandbox-k8s.sh submit [--dry-run] --branch NAME --model MODEL
+#                            [--harness pi|claude]
 #                            [--review-loop N] [--outbox-max SIZE]
 #                            [--context-ro DIR]
 #                            <project-path> <handoff-file>
@@ -133,6 +134,15 @@
 # subdirectory, so read-only here is enforced by the prompt text the agent
 # reads (a `## Gathered context` section appended to handoff.md), not by
 # the filesystem.
+#
+# --harness pi|claude (submit): which coding harness the pod runs. Defaults
+# to pi, which talks to the shared fork-sandbox-proxy over PROXY_BASE_URL,
+# exactly as before this flag existed. claude runs Claude Code instead,
+# against a PER-RUN proxy Pod (manifests/k8s/31-claude-proxy.yaml, rendered
+# and applied alongside this run's Job) that carries the operator's own
+# access token in a per-run Secret -- the pod itself still holds no
+# credential. See docs/kubernetes-runs.md's "Model access" section for the
+# full design.
 #
 # Cluster-specific settings are never taken from this repo -- a public repo
 # must not carry a private hostname, a real cluster name or a registry
@@ -533,6 +543,11 @@ cmd_install() {
     local rendered f
     rendered=""
     for f in "$manifests_dir"/*.yaml; do
+        # 31-claude-proxy.yaml is rendered per-run by cmd_submit, keyed on
+        # that run's own __RUN_NAME__ -- a value install has no run to take
+        # it from. Applying it here would apply a broken manifest with a
+        # literal, unsubstituted __RUN_NAME__ in it.
+        [[ "$(basename "$f")" == 31-claude-proxy.yaml ]] && continue
         local file_rendered
         file_rendered="$(sed \
             -e "s|__NAMESPACE__|$K8S_NAMESPACE|g" \
@@ -581,12 +596,13 @@ cmd_install() {
 
 cmd_submit() {
     local dry_run=false branch="" model="" review_loop_cap="" outbox_max_arg=""
-    local context_ro=""
+    local context_ro="" harness="pi"
     while (( $# )); do
         case "$1" in
             --dry-run) dry_run=true; shift ;;
             --branch) branch="${2:?--branch requires a name}"; shift 2 ;;
             --model) model="${2:?--model requires an OpenRouter model id}"; shift 2 ;;
+            --harness) harness="${2:?--harness requires 'pi' or 'claude'}"; shift 2 ;;
             --review-loop) review_loop_cap="${2:?--review-loop requires a positive integer}"; shift 2 ;;
             --outbox-max) outbox_max_arg="${2:?--outbox-max requires a size}"; shift 2 ;;
             --context-ro) context_ro="${2:?--context-ro requires a directory}"; shift 2 ;;
@@ -596,6 +612,14 @@ cmd_submit() {
     done
     local project_path="${1:?Usage: fork-sandbox-k8s.sh submit [options] <project-path> <handoff-file>}"
     local handoff_file="${2:?Usage: fork-sandbox-k8s.sh submit [options] <project-path> <handoff-file>}"
+
+    case "$harness" in
+        pi|claude) ;;
+        *)
+            echo "Error: --harness takes 'pi' or 'claude', not '$harness'." >&2
+            exit 1
+            ;;
+    esac
 
     [[ -n "$model" ]] || { echo "Error: submit requires --model. There is no default:" >&2
         echo "the model is an OpenRouter id, such as moonshotai/kimi-k3." >&2; exit 1; }
@@ -757,6 +781,28 @@ cmd_submit() {
     safe_name="$(k8s_safe_name fork-sandbox-agent "$branch")"
     local proxy_base_url="http://fork-sandbox-proxy.$K8S_NAMESPACE.svc.cluster.local:8080/api/v1"
 
+    # The per-run Claude Code proxy manifest (ConfigMap + Pod + Service),
+    # rendered here -- ahead of the ConfigMap+Job below, in the SAME
+    # `kubectl apply` stream -- for --harness claude only. See
+    # manifests/k8s/31-claude-proxy.yaml's own header for why this is a
+    # separate per-run Pod rather than a sidecar or the shared proxy.
+    # __RUN_NAME__ is this run's own $safe_name, the same object-name
+    # component the agent Job and its ConfigMap use.
+    local claude_proxy_rendered=""
+    if [[ "$harness" == claude ]]; then
+        local claude_proxy_template
+        claude_proxy_template="$(dirname "$script_dir")/manifests/k8s/31-claude-proxy.yaml"
+        if [[ ! -f "$claude_proxy_template" ]]; then
+            echo "Error: $claude_proxy_template not found. Run this from a" >&2
+            echo "fork-sandbox checkout." >&2
+            exit 1
+        fi
+        claude_proxy_rendered="$(sed \
+            -e "s|__NAMESPACE__|$K8S_NAMESPACE|g" \
+            -e "s|__RUN_NAME__|$safe_name|g" \
+            "$claude_proxy_template")"$'\n'
+    fi
+
     local entrypoint_sh="$script_dir/fork-sandbox-k8s-entrypoint.sh"
     local gate_sh="$script_dir/fork-sandbox-k8s-egress-gate.sh"
     local inbox_write_sh="$script_dir/fork-sandbox-k8s-inbox-write.sh"
@@ -789,7 +835,7 @@ cmd_submit() {
     fi
 
     local rendered
-    rendered="$(cat <<EOF
+    rendered="${claude_proxy_rendered}$(cat <<EOF
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -927,6 +973,14 @@ EOF
     fi
 
     printf '%s\n' "$rendered" | kubectl apply -f -
+
+    if [[ "$harness" == claude ]]; then
+        # The egress-gate initContainer probes this proxy (see the Job env
+        # below), so it must be up before the agent pod's own readiness is
+        # worth waiting on.
+        echo "fork-sandbox-k8s: waiting for proxy pod ($safe_name-claude-proxy) to be ready" >&2
+        kubectl wait --for=condition=Ready "pod/$safe_name-claude-proxy" --timeout=120s
+    fi
 
     echo "fork-sandbox-k8s: waiting for pod (job $safe_name) to be ready" >&2
     kubectl wait --for=condition=Ready "pod" -l "job-name=$safe_name" --timeout=180s

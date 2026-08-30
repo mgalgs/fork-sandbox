@@ -1,0 +1,192 @@
+---
+# The per-run Claude Code proxy: rendered and applied by `submit` for a
+# --harness claude run only, in the same kubectl apply stream as that run's
+# Job, never by `install` -- see fork-sandbox-k8s.sh's cmd_install, which
+# skips this file by name, since the placeholders below are a value install
+# has no run to take them from. This proxy carries this one run's operator
+# access token, scoped to a Secret named after this run and torn down with
+# the rest of this run's objects by `rm`. The namespace and every object
+# name below carry placeholder tokens; fork-sandbox-k8s.sh substitutes them
+# from K8S_NAMESPACE and the run's own $safe_name before applying. The
+# token itself is never in this file -- it comes from a per-run Secret,
+# created the same way fork-sandbox-upstream-key is (see cmd_submit), and
+# included into nginx's config from a path nginx.conf never otherwise
+# names, so a `kubectl get configmap` never shows it.
+#
+# A per-run Pod, not a sidecar: a sidecar shares the agent container's
+# network namespace, so the policy admitting it 0.0.0.0/0:443 would open
+# that same route to the agent container too -- exactly the property this
+# whole design exists to prevent. And not the shared fork-sandbox-proxy:
+# that one carries the pi proxy's OpenRouter key for every run in the
+# namespace and cannot take a per-run operator token without a reload that
+# would race every other run using it. A separate Pod, carrying the label
+# app: fork-sandbox-proxy, is selected by the EXISTING static NetworkPolicy
+# in 30-proxy.yaml (ingress from agents on 8080, egress to DNS and 443) and
+# admitted by the platform-rendered agent policy's --proxy-label
+# app=fork-sandbox-proxy -- no NetworkPolicy changes needed for this file.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: __RUN_NAME__-claude-proxy-conf
+  namespace: __NAMESPACE__
+  labels:
+    fork-sandbox/branch: __RUN_NAME__
+data:
+  nginx.conf: |
+    worker_processes 1;
+    pid /tmp/nginx.pid;
+
+    events {
+        worker_connections 1024;
+    }
+
+    http {
+        resolver kube-dns.kube-system.svc.cluster.local valid=10s;
+        client_body_temp_path /tmp/client_body;
+        proxy_temp_path /tmp/proxy;
+        fastcgi_temp_path /tmp/fastcgi;
+        uwsgi_temp_path /tmp/uwsgi;
+        scgi_temp_path /tmp/scgi;
+
+        limit_req_zone $binary_remote_addr zone=fork_sandbox:10m rate=5r/s;
+
+        server {
+            listen 8080;
+
+            # Defines $upstream_key. Mounted from the Secret, never from
+            # this ConfigMap -- see the header above.
+            include /etc/nginx/upstream-key.conf;
+
+            # Deny by default. Only the two paths below are forwarded --
+            # the only two Claude Code ever calls under a base URL
+            # override (measured against a live Claude Code run pointed at
+            # a logging proxy that refused every direct connect).
+            location / {
+                return 403;
+            }
+
+            location = /v1/messages {
+                limit_req zone=fork_sandbox burst=10 nodelay;
+
+                set $upstream https://api.anthropic.com;
+                proxy_pass $upstream;
+
+                # No URI on proxy_pass, so the original request URI --
+                # including its ?beta=true query string -- passes through
+                # to the upstream unchanged, exactly as Claude Code sent it.
+                proxy_ssl_verify on;
+                proxy_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;
+                proxy_ssl_verify_depth 3;
+                proxy_ssl_server_name on;
+                proxy_ssl_name "api.anthropic.com";
+                proxy_set_header Host "api.anthropic.com";
+
+                # Overwrites whatever placeholder bearer Claude Code sent,
+                # hiding it from the upstream request entirely.
+                proxy_set_header Authorization "Bearer $upstream_key";
+                proxy_hide_header Authorization;
+
+                # anthropic-beta is deliberately untouched here: nginx
+                # passes any header it has no directive for straight
+                # through, and this request depends on that -- Claude Code
+                # sends anthropic-beta on every call and the upstream
+                # requires it verbatim.
+
+                # The response is a long-lived, unbuffered SSE stream.
+                proxy_http_version 1.1;
+                proxy_buffering off;
+                proxy_read_timeout 600s;
+            }
+
+            location = /v1/messages/count_tokens {
+                limit_req zone=fork_sandbox burst=10 nodelay;
+
+                set $upstream https://api.anthropic.com;
+                proxy_pass $upstream;
+
+                proxy_ssl_verify on;
+                proxy_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;
+                proxy_ssl_verify_depth 3;
+                proxy_ssl_server_name on;
+                proxy_ssl_name "api.anthropic.com";
+                proxy_set_header Host "api.anthropic.com";
+
+                proxy_set_header Authorization "Bearer $upstream_key";
+                proxy_hide_header Authorization;
+
+                proxy_http_version 1.1;
+                proxy_buffering off;
+                proxy_read_timeout 600s;
+            }
+        }
+    }
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: __RUN_NAME__-claude-proxy
+  namespace: __NAMESPACE__
+  labels:
+    app: fork-sandbox-proxy
+    fork-sandbox/branch: __RUN_NAME__
+    fork-sandbox/role: claude-proxy
+spec:
+  restartPolicy: Always
+  automountServiceAccountToken: false
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 101
+    runAsGroup: 101
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: nginx
+      image: nginx:1.27-alpine
+      ports:
+        - containerPort: 8080
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      volumeMounts:
+        - name: conf
+          mountPath: /etc/nginx/nginx.conf
+          subPath: nginx.conf
+          readOnly: true
+        - name: upstream-key
+          mountPath: /etc/nginx/upstream-key.conf
+          subPath: upstream-key.conf
+          readOnly: true
+        - name: tmp
+          mountPath: /tmp
+        - name: run
+          mountPath: /var/run
+  volumes:
+    - name: conf
+      configMap:
+        name: __RUN_NAME__-claude-proxy-conf
+    - name: upstream-key
+      secret:
+        secretName: __RUN_NAME__-claude-token
+    - name: tmp
+      emptyDir: {}
+    - name: run
+      emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: __RUN_NAME__-claude-proxy
+  namespace: __NAMESPACE__
+  labels:
+    app: fork-sandbox-proxy
+    fork-sandbox/branch: __RUN_NAME__
+spec:
+  selector:
+    fork-sandbox/branch: __RUN_NAME__
+    fork-sandbox/role: claude-proxy
+  ports:
+    - port: 8080
+      targetPort: 8080
+      protocol: TCP

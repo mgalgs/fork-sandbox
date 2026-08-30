@@ -437,6 +437,99 @@ else
 fi
 rm -f /tmp/fs-k8s-test-install.err /tmp/fs-k8s-test-submit.err
 
+printf '\n== fork-sandbox-k8s.sh submit --dry-run --harness claude ==\n'
+# The default (--harness pi, i.e. submit_out above) renders no claude-proxy
+# object at all -- the per-run proxy is entirely opt-in.
+if grep -q 'claude-proxy' "$submit_out"; then
+    no "a pi run (default harness) renders no claude-proxy object" \
+        "found 'claude-proxy' in $submit_out"
+else
+    ok "a pi run (default harness) renders no claude-proxy object"
+fi
+
+refuses "--harness takes only pi or claude" \
+    "--harness takes 'pi' or 'claude'" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model claude-sonnet-5 --harness bogus \
+    "$proj_dir" "$handoff_file"
+
+claude_submit_out="$(newdir)/claude-submit.yaml"; tmpdirs+=("$(dirname "$claude_submit_out")")
+if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model claude-sonnet-5 --harness claude \
+    "$proj_dir" "$handoff_file" > "$claude_submit_out" 2>/tmp/fs-k8s-test-claude-submit.err; then
+    ok "submit --dry-run --harness claude exits 0"
+else
+    no "submit --dry-run --harness claude exits 0" "$(cat /tmp/fs-k8s-test-claude-submit.err)"
+fi
+if command -v yamllint >/dev/null 2>&1; then
+    out="$(yamllint "$claude_submit_out" 2>&1)"
+    if [[ -z "$out" ]]; then ok "yamllint: submit --dry-run --harness claude output"
+    else no "yamllint: submit --dry-run --harness claude output" "$out"; fi
+fi
+if grep -q '__RUN_NAME__' "$claude_submit_out" || grep -q '__NAMESPACE__' "$claude_submit_out"; then
+    no "submit --dry-run --harness claude leaves no unsubstituted placeholder" \
+        "found __RUN_NAME__ or __NAMESPACE__ in $claude_submit_out"
+else
+    ok "submit --dry-run --harness claude leaves no unsubstituted placeholder"
+fi
+# fork-sandbox-agent-fs-k8s-test-branch is k8s_safe_name's own output for
+# prefix fork-sandbox-agent and branch fs-k8s-test-branch, the same
+# derivation the rendered Job/ConfigMap names above already rely on.
+claude_run_name="fork-sandbox-agent-fs-k8s-test-branch"
+if grep -q '^kind: Pod$' "$claude_submit_out" && grep -q "name: $claude_run_name-claude-proxy\$" "$claude_submit_out"; then
+    ok "rendered manifest carries the per-run claude-proxy Pod"
+else
+    no "rendered manifest carries the per-run claude-proxy Pod" "not found in $claude_submit_out"
+fi
+if grep -q '^kind: Service$' "$claude_submit_out"; then
+    ok "rendered manifest carries the per-run claude-proxy Service"
+else
+    no "rendered manifest carries the per-run claude-proxy Service" "not found in $claude_submit_out"
+fi
+if grep -q "name: $claude_run_name-claude-proxy-conf" "$claude_submit_out"; then
+    ok "rendered manifest carries the per-run claude-proxy ConfigMap"
+else
+    no "rendered manifest carries the per-run claude-proxy ConfigMap" "not found in $claude_submit_out"
+fi
+if grep -q "secretName: $claude_run_name-claude-token" "$claude_submit_out"; then
+    ok "rendered claude-proxy Pod mounts this run's own claude-token Secret"
+else
+    no "rendered claude-proxy Pod mounts this run's own claude-token Secret" \
+        "not found in $claude_submit_out"
+fi
+if grep -qF 'location = /v1/messages {' "$claude_submit_out" \
+    && grep -qF 'location = /v1/messages/count_tokens {' "$claude_submit_out"; then
+    ok "rendered claude-proxy nginx.conf forwards exactly the two v1/messages paths"
+else
+    no "rendered claude-proxy nginx.conf forwards exactly the two v1/messages paths" \
+        "not found in $claude_submit_out"
+fi
+# The manifest's own comments explain in prose that anthropic-beta is
+# passed through untouched, so this checks for a directive that would
+# actually intercept it (proxy_set_header/proxy_hide_header naming it),
+# not for the plain substring, which the prose itself contains.
+if grep -qiE '(proxy_set_header|proxy_hide_header)[[:space:]]+anthropic-beta' "$claude_submit_out"; then
+    no "rendered claude-proxy nginx.conf does not touch the anthropic-beta header" \
+        "found a directive naming anthropic-beta in $claude_submit_out"
+else
+    ok "rendered claude-proxy nginx.conf does not touch the anthropic-beta header"
+fi
+if grep -qF 'app: fork-sandbox-proxy' "$claude_submit_out"; then
+    ok "the claude-proxy Pod carries the shared app: fork-sandbox-proxy label"
+else
+    no "the claude-proxy Pod carries the shared app: fork-sandbox-proxy label" \
+        "not found in $claude_submit_out"
+fi
+rm -f /tmp/fs-k8s-test-claude-submit.err
+
+printf '\n== fork-sandbox-k8s.sh install --dry-run excludes 31-claude-proxy.yaml ==\n'
+if grep -q 'claude-proxy' "$install_out"; then
+    no "install --dry-run renders no claude-proxy object (per-run only)" \
+        "found 'claude-proxy' in $install_out"
+else
+    ok "install --dry-run renders no claude-proxy object (per-run only)"
+fi
+
 printf '\n== fork-sandbox-k8s.sh submit --dry-run --review-loop N ==\n'
 # Extracts one ConfigMap data key's block-scalar content, reversing
 # indent_block's 4-space indent -- the same technique extract_nginx_conf
