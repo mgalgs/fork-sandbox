@@ -1958,7 +1958,9 @@ printf '\n== bare repo HEAD points at the pushed branch before cloning ==\n'
 # point HEAD at the pushed branch before cloning, not after -- otherwise the
 # clone still hits the dangling default and prints the warning this fix
 # exists to silence.
+# shellcheck disable=SC2016  # the needles match a literal $BRANCH etc. in the entrypoint text
 symref_line="$(grep -n 'symbolic-ref HEAD "refs/heads/\$BRANCH"' "$entrypoint_sh" | head -1 | cut -d: -f1)"
+# shellcheck disable=SC2016  # ditto
 clone_line="$(grep -n 'git clone --quiet "\$repo_bare" "\$clone_dir"' "$entrypoint_sh" | head -1 | cut -d: -f1)"
 if [[ -n "$symref_line" && -n "$clone_line" ]]; then
     ok "entrypoint sets symbolic-ref HEAD to refs/heads/\$BRANCH"
