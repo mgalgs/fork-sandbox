@@ -703,8 +703,11 @@ cmd_submit() {
         # -- the same lifetime caveat a local claude-sandboxed session has.
         # Same two messages, adapted from "the sandbox session" to "the
         # pod's session".
+        # Piped with printf, never a here-string: on bash before 5.1 a
+        # here-string spills its value to a temp file, and this one holds
+        # the live token. Same rule as fs_read_claude_credential's header.
         local claude_expires_at_ms claude_mins_left
-        claude_expires_at_ms="$(jq -r '.claudeAiOauth.expiresAt // 0' <<< "$claude_cred_json")"
+        claude_expires_at_ms="$(printf '%s' "$claude_cred_json" | jq -r '.claudeAiOauth.expiresAt // 0')"
         claude_mins_left=$(( claude_expires_at_ms / 60000 - $(date +%s) / 60 ))
         if (( claude_mins_left <= 0 )); then
             echo "Error: the access token in $(fs_claude_credential_source) has expired." >&2
@@ -714,7 +717,7 @@ cmd_submit() {
             echo "Warning: the access token expires in ${claude_mins_left}m; the pod's session dies then." >&2
         fi
 
-        claude_access_token="$(jq -r '.claudeAiOauth.accessToken // empty' <<< "$claude_cred_json")"
+        claude_access_token="$(printf '%s' "$claude_cred_json" | jq -r '.claudeAiOauth.accessToken // empty')"
         if [[ -z "$claude_access_token" ]]; then
             echo "Error: $(fs_claude_credential_source) has no claudeAiOauth.accessToken." >&2
             exit 1
@@ -731,11 +734,11 @@ cmd_submit() {
         # substitution the file holds no secret (just scopes, subscription
         # type, expiry), which is what makes a ConfigMap -- not a Secret --
         # the right place for it.
-        claude_configmap_cred="$(jq '
+        claude_configmap_cred="$(printf '%s' "$claude_cred_json" | jq '
             del(.mcpOAuth)
             | del(.claudeAiOauth.refreshToken, .claudeAiOauth.refreshTokenExpiresAt)
             | .claudeAiOauth.accessToken = "sandbox"
-        ' <<< "$claude_cred_json")"
+        ')"
     fi
 
     # The same rule fork-sandbox.sh's own local --context-ro flag applies to
