@@ -172,6 +172,11 @@ git -C "$review_proj" -c user.email=t@fork-sandbox.invalid \
 git -C "$review_proj" switch -q master 2>/dev/null \
     || git -C "$review_proj" switch -q main
 old_sha="$(git -C "$review_proj" rev-parse HEAD~1)"
+git -C "$review_proj" switch -q --orphan review-unrelated
+git -C "$review_proj" commit --allow-empty -q -m unrelated
+unrelated_sha="$(git -C "$review_proj" rev-parse HEAD)"
+git -C "$review_proj" switch -q master 2>/dev/null \
+    || git -C "$review_proj" switch -q main
 
 if review_dry --review-only --harness claude --model sonnet \
     >/dev/null 2>"$err"; then
@@ -205,9 +210,29 @@ contains "default review base is the merge-base" "base_sha=$old_sha" "$out"
 contains "review-only dry-run prints the review range" \
     "range=$old_sha...review-branch" "$out"
 
+if review_dry --review-only --checkout review-branch \
+    --review-base HEAD --harness claude --model sonnet \
+    >/dev/null 2>"$err"; then
+    no "a descendant --review-base is refused"
+else
+    contains "a descendant --review-base is refused" \
+        "--review-base 'HEAD' must be an ancestor of --checkout 'review-branch'" \
+        "$(tr '\n' ' ' <"$err")"
+fi
+
+if review_dry --review-only --checkout review-branch \
+    --review-base review-unrelated --harness claude --model sonnet \
+    >/dev/null 2>"$err"; then
+    no "an unrelated --review-base is refused"
+else
+    contains "an unrelated --review-base is refused" \
+        "--review-base 'review-unrelated' must be an ancestor of --checkout 'review-branch'" \
+        "$(tr '\n' ' ' <"$err")"
+fi
+
 out="$(review_dry --review-only --checkout review-branch \
-    --review-base HEAD --harness claude --model sonnet 2>/dev/null)"
-contains "--review-base overrides the default base" "base_sha=$head_sha" "$out"
+    --review-base HEAD~1 --harness claude --model sonnet 2>/dev/null)"
+contains "a proper ancestor --review-base is accepted" "base_sha=$old_sha" "$out"
 
 if review_dry --review-only --checkout review-branch \
     --review-base review-branch --harness claude --model sonnet \

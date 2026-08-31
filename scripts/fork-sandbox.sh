@@ -1935,6 +1935,16 @@ if [[ "$review_only" == true ]]; then
         echo "Error: could not compute the merge-base of '$checkout_ref' and HEAD." >&2
         exit 1
     fi
+    # A three-dot range silently substitutes its own merge-base. Require the
+    # named review base to be an ancestor so the review cannot end up looking
+    # at an empty or different range than the caller selected.
+    if [[ -n "$review_base_ref" ]] \
+        && ! (cd "$review_only_origin_repo" \
+            && git merge-base --is-ancestor "$base_sha" "$checkout_sha"); then
+        echo "Error: --review-base '$review_base_ref' must be an ancestor of" >&2
+        echo "--checkout '$checkout_ref' (the refs have no valid review range)." >&2
+        exit 1
+    fi
     if [[ "$base_sha" == "$checkout_sha" ]]; then
         echo "Error: nothing to review between $base_sha and $checkout_ref" >&2
         exit 1
