@@ -193,6 +193,44 @@ esac
 n=$(find "$run_dir/inbox" -maxdepth 1 -name '*.part' | wc -l)
 check "no .part file is left behind" "0" "$n"
 
+# An addendum can be archived at a leg boundary before the operator sends the
+# next one. Keep date fixed so this reproduces the old same-second collision,
+# then prove the sender's run-scoped allocation record survives the archive.
+fixed_date_dir="$(mktemp -d)"; tmpdirs+=("$fixed_date_dir")
+fixed_epoch=1724650400
+cat > "$fixed_date_dir/date" <<STUB
+#!/usr/bin/env bash
+if [[ "\$1" == "+%s" ]]; then
+    printf '%s\\n' '$fixed_epoch'
+else
+    exec /usr/bin/date "\$@"
+fi
+STUB
+chmod +x "$fixed_date_dir/date"
+run_dir="$(new_run_dir claude)"
+export FORK_SANDBOX_INBOX="$run_dir/inbox"
+export FORK_SANDBOX_INBOX_SEEN="$run_dir/inbox-seen"
+PATH="$fixed_date_dir:$PATH" "$say" "$run_dir" 'archive this one' >/dev/null 2>&1
+first_file="$(find "$run_dir/inbox" -maxdepth 1 -name '*.md' -print -quit)"
+first_name="$(basename "$first_file")"
+printf '%s\n' '{"hook_event_name":"PostToolUse"}' | "$hook" >/dev/null 2>&1
+mkdir -p "$run_dir/inbox-delivered/leg-1"
+mv -- "$first_file" "$run_dir/inbox-delivered/leg-1/"
+PATH="$fixed_date_dir:$PATH" "$say" "$run_dir" 'deliver this replacement' >/dev/null 2>&1
+second_file="$(find "$run_dir/inbox" -maxdepth 1 -name '*.md' -print -quit)"
+second_name="$(basename "$second_file")"
+if [[ "$second_name" != "$first_name" ]]; then
+    ok "an archived addendum name is not recycled in the same second"
+else
+    no "an archived addendum name is not recycled in the same second" "$second_name"
+fi
+hook_out="$(printf '%s\n' '{"hook_event_name":"PostToolUse"}' | "$hook" 2>/dev/null)"
+case "$hook_out" in
+    *"deliver this replacement"*) ok "the replacement addendum is delivered after archiving" ;;
+    *) no "the replacement addendum is delivered after archiving" "$hook_out" ;;
+esac
+unset FORK_SANDBOX_INBOX FORK_SANDBOX_INBOX_SEEN
+
 # Two in the same second must not collide.
 "$say" "$run_dir" 'one' >/dev/null 2>&1
 "$say" "$run_dir" 'two' >/dev/null 2>&1

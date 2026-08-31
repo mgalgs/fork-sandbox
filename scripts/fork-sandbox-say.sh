@@ -167,16 +167,31 @@ fork-sandbox.sh from before the operator inbox existed, so there is no channel
 into it. Relaunching is the only way to change its instructions."
 
 # The name is generated, never taken from an argument — that is the property
-# that keeps a blanket approval from being an arbitrary-file-write. The
-# two-digit counter only has to break ties within one second; the epoch does
-# the ordering, and the hook and the session both read the directory sorted.
+# that keeps a blanket approval from being an arbitrary-file-write. Allocate
+# it under a per-run lock: two sends can happen in the same second, and a
+# leg boundary can archive the first file before the next send. The last
+# issued name is kept in the run directory, which archiving never touches, so
+# an addendum identity cannot be recycled during this run. The archive scan
+# also honors names written by an older sender or by a test fixture.
+say_lock="$run_dir/.inbox-say.lock"
+say_last="$run_dir/.inbox-say-last"
+[[ ! -L "$say_lock" ]] || die "'$say_lock' is a symlink; refusing to use it"
+[[ ! -L "$say_last" ]] || die "'$say_last' is a symlink; refusing to use it"
+exec {say_lock_fd}>"$say_lock" \
+    || die "could not open the addendum allocation lock"
+flock -x "$say_lock_fd" \
+    || die "could not lock the addendum allocation lock"
+
 epoch="$(date +%s)"
 name=""
 for n in $(seq -w 1 99); do
-    if [[ ! -e "$inbox/$epoch-$n.md" && ! -e "$inbox/$epoch-$n.md.part" ]]; then
-        name="$epoch-$n.md"
-        break
-    fi
+    candidate="$epoch-$n.md"
+    [[ -e "$inbox/$candidate" || -e "$inbox/$candidate.part" ]] && continue
+    [[ -f "$say_last" && "$(cat -- "$say_last")" == "$candidate" ]] && continue
+    [[ -n "$(find "$run_dir/inbox-delivered" -type f -name "$candidate" \
+        -print -quit 2>/dev/null)" ]] && continue
+    name="$candidate"
+    break
 done
 [[ -n "$name" ]] \
     || die "99 addenda already written in this second; wait a moment and retry."
@@ -192,6 +207,9 @@ chmod 644 "$part" 2>/dev/null
 if ! mv -- "$part" "$inbox/$name"; then
     rm -f -- "$part"
     die "could not place '$name' in '$inbox'"
+fi
+if ! printf '%s\n' "$name" > "$say_last"; then
+    die "could not record the addendum name in '$say_last'"
 fi
 
 harness="$(run_env_get harness)"
