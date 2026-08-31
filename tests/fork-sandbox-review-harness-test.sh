@@ -169,6 +169,7 @@ printf 'review\n' >> "$review_proj/file.txt"
 git -C "$review_proj" add file.txt
 git -C "$review_proj" -c user.email=t@fork-sandbox.invalid \
     -c user.name=Tester commit -q -m review
+review_sha="$(git -C "$review_proj" rev-parse review-branch)"
 git -C "$review_proj" switch -q master 2>/dev/null \
     || git -C "$review_proj" switch -q main
 old_sha="$(git -C "$review_proj" rev-parse HEAD~1)"
@@ -409,6 +410,13 @@ approved_rc="$(cat "$review_proj/$approved_branch.rc")"
 approved_rd="$(cat "$review_proj/$approved_branch.rd")"
 if [[ "$approved_rc" == 0 && -n "$approved_rd" ]]; then
     ok "an APPROVED review-only run exits 0"
+    contains "review-only launch report names the checkout SHA" \
+        "start:    review-branch (${review_sha:0:12})" "$approved_out"
+    if [[ "$approved_out" == *"start:    review-branch (${old_sha:0:12})"* ]]; then
+        no "review-only launch report does not name the review base SHA"
+    else
+        ok "review-only launch report does not name the review base SHA"
+    fi
     check "APPROVED review-only run ends approved" "approved" \
         "$(jq -r '.ended' "$approved_rd/review-loop.json")"
     check "APPROVED review-only summary has mode" "review-only" \

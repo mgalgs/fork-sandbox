@@ -5222,7 +5222,9 @@ fi
 # Its own leading newline, so an unused line adds nothing to the block.
 checkout_line=""
 if [[ -n "$checkout_ref" ]]; then
-    checkout_line="$(printf '\n  start:    %s (%.12s)' "$checkout_ref" "$base_sha")"
+    # Review-only keeps the requested review base separate from the commit
+    # the clone starts at; ordinary runs set both variables to the checkout.
+    checkout_line="$(printf '\n  start:    %s (%.12s)' "$checkout_ref" "$checkout_sha")"
 fi
 
 harness_line="$harness"
