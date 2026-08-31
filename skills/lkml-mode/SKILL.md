@@ -89,7 +89,17 @@ a patch has earned it. It is modeled on a standard, not on a person —
 explicitly an AI persona in a sandbox that signs as itself and never as
 any human. `skills/lkml-mode/personas/` ships it plus five
 general-purpose reviewer archetypes (`architecture`, `security`, `tests`,
-`docs`, `newcomer`) and the `author` persona that revises the series.
+`docs`, `newcomer`), the `ci` bot, and the `author` persona that revises
+the series.
+
+**`ci` runs first on every version.** It holds no opinions: it runs every
+test suite at the series' tip and posts one reply on the cover — a table
+of `N passed, M failed` per suite, the `FAIL` lines verbatim, and
+`Tested-by` or `NAK`. Every other reviewer reasons about the code; this
+is the one seat that executes it, and a reviewer who "traced the path and
+expects it to work" is not a substitute. Pin it to the cheapest harness
+you have, launch it alone before the panel, and do not let the author
+post a version the bot has not run.
 
 Beyond `core`, **build a panel tailored to the series** rather than
 launching all five archetypes by default. A kernel-style locking change
@@ -109,9 +119,10 @@ do not vary it round to round.
    `git format-patch <base>..<branch>` output directory and the cover
    letter is either something you write yourself or something you ask the
    `author` persona to write in its own short sandboxed run first.
-2. **Build the panel** (always `core`; see above). Round 1: every persona
-   reviews the whole series — `lkml-round.sh <series> --project <path>
-   --checkout <branch> --base <base-ref> --personas <list>` with no
+2. **Build the panel** (always `core`; see above). Round 0: `ci` alone,
+   `lkml-round.sh <series> --project <path> --checkout <branch> --base
+   <base-ref> --personas ci`. Round 1: every persona reviews the whole
+   series — the same command with `--personas <list>` and no
    `--reply-to`.
 3. **Read `tree` and `open`.** Decide who replies to what: usually the
    author answers a reviewer's Question or NAK, but a reviewer can also
