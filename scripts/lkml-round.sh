@@ -126,6 +126,45 @@ if [[ -z "$version" ]]; then
 fi
 [[ -n "$version" ]] || { echo "Error: could not determine which version this round is about." >&2; exit 1; }
 
+# The checkout and the mailbox version are a single review unit. Resolve the
+# checkout against the version-to-branch ledger before building any handoff;
+# accepting the branch's commit also supports detached checkouts. Resolve
+# recorded branch names explicitly under refs/heads: a short name can be
+# ambiguous with a tag, and the checkout must point at the recorded branch's
+# commit before the ledger accepts it. When more than one recorded version
+# points at that commit, the newest matching entry is the one the ledger
+# treats as current.
+ledger_root="${LKML_MAILBOX_ROOT:-/var/tmp/claude-scratch/lkml}"
+versions_file="$ledger_root/$series/versions.jsonl"
+[[ -f "$versions_file" ]] || {
+    echo "Error: no recorded checkout branches for series '$series' in $versions_file." >&2
+    exit 1
+}
+checkout_sha="$(git -C "$project" rev-parse --verify --quiet "$checkout_ref^{commit}" 2>/dev/null)" || {
+    echo "Error: checkout '$checkout_ref' does not resolve in $project." >&2
+    exit 1
+}
+matched_version=""
+while IFS=$'\t' read -r recorded_version recorded_branch; do
+    [[ -n "$recorded_version" && -n "$recorded_branch" ]] || continue
+    branch_sha="$(git -C "$project" rev-parse --verify --quiet "refs/heads/$recorded_branch^{commit}" 2>/dev/null || true)"
+    if [[ "$checkout_sha" == "$branch_sha" ]] \
+            && { [[ -z "$matched_version" ]] || (( recorded_version > matched_version )); }; then
+        matched_version="$recorded_version"
+    fi
+done < <(jq -r 'select((.version|type)=="number" and (.branch|type)=="string") | [.version,.branch] | @tsv' "$versions_file")
+if [[ -z "$matched_version" ]]; then
+    recorded_branches="$(jq -r 'select(.branch|type=="string") | .branch' "$versions_file" | paste -sd ', ' -)"
+    echo "Error: checkout '$checkout_ref' matches no recorded version branch for series '$series'." >&2
+    echo "Recorded branches: ${recorded_branches:-<none>.}" >&2
+    exit 1
+fi
+if [[ -n "$version" && "$version" != "$matched_version" ]]; then
+    echo "Error: checkout '$checkout_ref' is recorded as v$matched_version, not v$version." >&2
+    exit 1
+fi
+version="$matched_version"
+
 # Every --reply-to id must resolve before ANY persona is launched -- a
 # typo'd id would otherwise only be caught when build_handoff calls
 # `mailbox show` per-persona, and under `set -uo pipefail` (no `-e`) that
@@ -135,10 +174,15 @@ fi
 # run starts, for one `show` per id instead of one per persona per id.
 if (( ${#reply_to_ids[@]} > 0 )); then
     for id in "${reply_to_ids[@]}"; do
-        "$mailbox" show "$series" "$id" >/dev/null 2>&1 || {
+        raw="$($mailbox show "$series" "$id" 2>/dev/null)" || {
             echo "Error: --reply-to '$id' does not resolve in series '$series'." >&2
             exit 1
         }
+        reply_version="$(printf '%s\n' "$raw" | sed -n 's/^X-Version: //p')"
+        if [[ "$reply_version" != "$version" ]]; then
+            echo "Error: --reply-to '$id' belongs to v${reply_version:-unknown}, not v$version." >&2
+            exit 1
+        fi
     done
 fi
 
@@ -240,8 +284,8 @@ RULES
     printf 'one, that reply is worth more than one more agreement.\n'
 }
 
-cover_text="$("$mailbox" cover "$series" 2>/dev/null)" || cover_text="(no cover letter found)"
-tree_text="$("$mailbox" tree "$series" 2>/dev/null)" || tree_text="(no messages yet)"
+cover_text="$("$mailbox" cover "$series" --version "$version" 2>/dev/null)" || cover_text="(no cover letter found)"
+tree_text="$("$mailbox" tree "$series" --version "$version" 2>/dev/null)" || tree_text="(no messages yet)"
 
 IFS=',' read -ra personas <<< "$personas_csv"
 

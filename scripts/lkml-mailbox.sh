@@ -3,8 +3,8 @@
 #
 # Usage: lkml-mailbox.sh init <series> --cover <file> --patches <dir> --from <persona> [--display <name>] [--version <n>] [--harness <h>] [--model <m>] [--attach <file>]... [--diffstat <range>] [--smoke <file>]
 #        lkml-mailbox.sh post <series> --from <persona> --reply-to <id> --file <file|-> [--display <name>] [--subject <s>] [--tags <t1,t2>] [--harness <h>] [--model <m>] [--attach <file>]...
-#        lkml-mailbox.sh tree <series>
-#        lkml-mailbox.sh cover <series>
+#        lkml-mailbox.sh tree <series> [--version <n>]
+#        lkml-mailbox.sh cover <series> [--version <n>]
 #        lkml-mailbox.sh show <series> <id>
 #        lkml-mailbox.sh open <series> [--version <n>]
 #        lkml-mailbox.sh tally <series> --version <n>
@@ -781,7 +781,15 @@ lkml_tree_print() {
 }
 
 cmd_tree() {
-    local series="${1:?Usage: lkml-mailbox.sh tree <series>}"
+    local series="${1:?Usage: lkml-mailbox.sh tree <series>}" version=""
+    shift
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --version) version="${2:?--version requires a number}"; shift 2 ;;
+            -h|--help) usage; exit 0 ;;
+            *) echo "Error: tree: unknown option '$1'." >&2; return 1 ;;
+        esac
+    done
     local dir; dir="$(lkml_series_dir "$series")"
     [[ -d "$dir/cur" ]] || { echo "Error: tree: series '$series' does not exist." >&2; return 1; }
     lkml_load_series "$series"
@@ -793,6 +801,7 @@ cmd_tree() {
     local i v v2 already
     for i in "${!LKML_VERSION[@]}"; do
         v="${LKML_VERSION[$i]}"
+        [[ -z "$version" || "$v" == "$version" ]] || continue
         already=0
         for v2 in "${seen[@]:-}"; do
             [[ "$v2" == "$v" ]] && already=1
@@ -814,7 +823,15 @@ cmd_tree() {
 }
 
 cmd_cover() {
-    local series="${1:?Usage: lkml-mailbox.sh cover <series>}"
+    local series="${1:?Usage: lkml-mailbox.sh cover <series>}" version=""
+    shift
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --version) version="${2:?--version requires a number}"; shift 2 ;;
+            -h|--help) usage; exit 0 ;;
+            *) echo "Error: cover: unknown option '$1'." >&2; return 1 ;;
+        esac
+    done
     lkml_load_series "$series"
     if (( ${#LKML_ID[@]} == 0 )); then
         echo "Error: cover: series '$series' has no messages." >&2
@@ -822,6 +839,7 @@ cmd_cover() {
     fi
     local maxv=-1 best=-1 i
     for i in "${!LKML_VERSION[@]}"; do
+        [[ -z "$version" || "${LKML_VERSION[$i]}" == "$version" ]] || continue
         if [[ "${LKML_DEPTH[$i]}" == "0" ]] && (( LKML_VERSION[i] > maxv )); then
             maxv="${LKML_VERSION[$i]}"
             best="$i"
