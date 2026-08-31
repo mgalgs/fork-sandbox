@@ -53,6 +53,39 @@ network access).
 - **Frontier models:** `/fork-sandbox --harness claude`
 - **Most scalable:** `/fork-sandbox --k8s` — each run is a Kubernetes Job.
 
+## The three network modes
+
+Every run is in exactly one of these, and the mode decides what a compromised
+or misled agent can reach.
+
+| Mode | Reaches | Use for |
+|---|---|---|
+| **Pinned** (default) | The internet, via your default interface only. Not the VPN, not the tailnet, not host loopback. | A Claude or OpenRouter run that needs to fetch packages and read docs. |
+| **Sealed** (`--harness pi-local`) | Nothing. One OpenAI-compatible endpoint over a unix socket. | A model you host. Costs nothing, holds no credential, cannot exfiltrate. |
+| **Serviced** (`--services`) | Whichever of the above, plus a per-run compose stack on unix sockets. | A suite that needs postgres or redis to run. |
+
+Sealed mode is why a local model is worth the trouble. A local endpoint needs
+no API key, so there is no credential in the sandbox to steal, and with no
+network there is nowhere to send anything anyway. The run costs nothing, so a
+wrong answer wastes only time.
+
+## Harnesses
+
+| `--harness` | Runs | Credential in the sandbox |
+|---|---|---|
+| `claude` (default) | Claude Code | A short-lived access token |
+| `pi` | [pi](https://github.com/earendil-works/pi) against OpenRouter | Your OpenRouter key |
+| `pi-local` | pi against your own endpoint | **None** |
+| `codex` | Codex CLI | Your ChatGPT auth |
+
+Every harness gets the same clone, the same provisioning, the same fetch-back,
+and a review kit — two skills that let the run review its own work before it
+reports back.
+
+`pi` and `pi-local` read their per-machine config (an OpenRouter key, a
+model endpoint) from `~/.config/fork-sandbox/`. `fork-sandbox.sh configure`
+discovers and installs it for you — see [docs/configure.md](docs/configure.md).
+
 ## Pro Recipes
 
 Recipe: Interactive orchestrator session using a frontier model
@@ -124,37 +157,6 @@ Recipe: find out whether the cheap model is actually cheaper
 ```
 sandbox-run-log.py stats --by model,task.kind
 ```
-
-## Why
-
-There are two usual ways to run a coding agent. Approve every action by hand,
-which is slow and turns into rubber-stamping after the twentieth prompt. Or
-turn approvals off and let it work in your checkout, where a mistake — or a
-prompt injection in something it read — lands in your real repo, with your ssh
-keys, your dotfiles and your VPN in reach.
-
-fork-sandbox does neither. The agent works in a disposable clone, inside a
-sandbox that contains no `~/.ssh`, no `~/.aws`, no dotfiles, and no route to
-your VPN or tailnet. The only thing that comes out is a git branch, fetched
-back into your repo when the run ends.
-
-What you get:
-
-- **Nothing to babysit.** Headless: no keypress, no attached terminal. It
-  exits on its own and writes down what happened.
-- **Containment.** The sandbox sees the clone, the host toolchain, and nothing
-  else of yours. Egress goes out your default interface only, so a VPN or
-  tailnet the host can reach, the sandbox cannot. Or seal the network
-  entirely.
-- **Free runs against your own model.** Point it at a model you host and the
-  sandbox gets *no network at all* — the endpoint arrives over a unix socket.
-  The tokens are yours, no credential is inside, and there is nowhere to
-  exfiltrate to.
-- **Steering without attaching.** `fork-sandbox-say.sh` sends a running
-  session an addendum, delivered at its next tool call.
-- **A record.** Every run appends harness, model, tokens, cost and commits to
-  a log you can query later — which is how you find out whether the cheap
-  model was actually cheaper.
 
 ## Install
 
@@ -281,39 +283,6 @@ call; `pi`, `pi-local` and `codex` have no hook system to measure with, so
 `--refresh-at` is refused outright on those harnesses, and on `--k8s`, whose
 pod runs a different entrypoint.
 
-## The three network modes
-
-Every run is in exactly one of these, and the mode decides what a compromised
-or misled agent can reach.
-
-| Mode | Reaches | Use for |
-|---|---|---|
-| **Pinned** (default) | The internet, via your default interface only. Not the VPN, not the tailnet, not host loopback. | A Claude or OpenRouter run that needs to fetch packages and read docs. |
-| **Sealed** (`--harness pi-local`) | Nothing. One OpenAI-compatible endpoint over a unix socket. | A model you host. Costs nothing, holds no credential, cannot exfiltrate. |
-| **Serviced** (`--services`) | Whichever of the above, plus a per-run compose stack on unix sockets. | A suite that needs postgres or redis to run. |
-
-Sealed mode is why a local model is worth the trouble. A local endpoint needs
-no API key, so there is no credential in the sandbox to steal, and with no
-network there is nowhere to send anything anyway. The run costs nothing, so a
-wrong answer wastes only time.
-
-## Harnesses
-
-| `--harness` | Runs | Credential in the sandbox |
-|---|---|---|
-| `claude` (default) | Claude Code | A short-lived access token |
-| `pi` | [pi](https://github.com/earendil-works/pi) against OpenRouter | Your OpenRouter key |
-| `pi-local` | pi against your own endpoint | **None** |
-| `codex` | Codex CLI | Your ChatGPT auth |
-
-Every harness gets the same clone, the same provisioning, the same fetch-back,
-and a review kit — two skills that let the run review its own work before it
-reports back.
-
-`pi` and `pi-local` read their per-machine config (an OpenRouter key, a
-model endpoint) from `~/.config/fork-sandbox/`. `fork-sandbox.sh configure`
-discovers and installs it for you — see [docs/configure.md](docs/configure.md).
-
 ## Driving sandbox-coder-mode
 
 Stay in *idea space*: the orchestrator session is where you think — goals,
@@ -395,6 +364,37 @@ lkml-series.sh myfeature --project ~/src/proj --range main..sbx-tip   # re-roll 
 lkml-forklift.sh myfeature --project ~/src/proj --version 2 --onto main --dry-run
 lkml-render.py "$LKML_MAILBOX_ROOT/myfeature" -o threads.html         # self-contained html archive of the thread
 ```
+
+## Why
+
+There are two usual ways to run a coding agent. Approve every action by hand,
+which is slow and turns into rubber-stamping after the twentieth prompt. Or
+turn approvals off and let it work in your checkout, where a mistake — or a
+prompt injection in something it read — lands in your real repo, with your ssh
+keys, your dotfiles and your VPN in reach.
+
+fork-sandbox does neither. The agent works in a disposable clone, inside a
+sandbox that contains no `~/.ssh`, no `~/.aws`, no dotfiles, and no route to
+your VPN or tailnet. The only thing that comes out is a git branch, fetched
+back into your repo when the run ends.
+
+What you get:
+
+- **Nothing to babysit.** Headless: no keypress, no attached terminal. It
+  exits on its own and writes down what happened.
+- **Containment.** The sandbox sees the clone, the host toolchain, and nothing
+  else of yours. Egress goes out your default interface only, so a VPN or
+  tailnet the host can reach, the sandbox cannot. Or seal the network
+  entirely.
+- **Free runs against your own model.** Point it at a model you host and the
+  sandbox gets *no network at all* — the endpoint arrives over a unix socket.
+  The tokens are yours, no credential is inside, and there is nowhere to
+  exfiltrate to.
+- **Steering without attaching.** `fork-sandbox-say.sh` sends a running
+  session an addendum, delivered at its next tool call.
+- **A record.** Every run appends harness, model, tokens, cost and commits to
+  a log you can query later — which is how you find out whether the cheap
+  model was actually cheaper.
 
 ## Portability
 
