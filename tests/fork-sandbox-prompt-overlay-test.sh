@@ -662,8 +662,10 @@ Its format is fixed, because a program reads the first line:
     -- but a person, or the session that launched this run, reads the file
     to decide how far to trust the approval. So after \`APPROVED\`, add a
     short paragraph beginning \`Checked:\` -- what you read, what you ran,
-    and what you tried to refute and could not. A bare \`APPROVED\` is
-    accepted; an approval that shows its evidence is worth more.
+    and what you tried to refute and could not. The verdict should then end
+    with the \`## Report\` section described below. When present, the
+    orchestrator reads that report instead of the author's account; if it is
+    omitted, the verdict body remains the available review account.
   - \`FINDINGS\` means you found problems. After it, write **one finding per
     paragraph**, paragraphs separated by a blank line, and **cite
     \`file:line\` in each one** — the path relative to the clone, and the line
@@ -677,10 +679,31 @@ wrong and what it breaks, not as a patch.
 
 Say \`APPROVED\` when you mean it. An invented finding costs a whole extra
 session and can talk a working branch into a change it did not need.
+
+## Report
+
+After the verdict body, you may add a \`## Report\` heading and five short
+paragraphs for the orchestrator, in this order: (1) files touched; (2) tests
+— what you RAN and observed, \`N ok / M fail\`, not what the author claimed;
+(3) decisions visible in the diff that a reader would not guess, one line
+each; (4) what is left open — on a FINDINGS verdict, include the findings
+above; (5) what you are unsure of. If you include a report, use exactly one
+heading and write this account from the branch and the diff, never from the
+author's message. The orchestrator reads this report instead of the author's
+own account. Keep the \`Checked:\` paragraph where it is, in the verdict body,
+before this heading.
 EXPECTED
 )"
+    rendered_review_prompt="$(cat "$rd4/review-prompt.md" 2>/dev/null)"
     check "review prompt renders byte-for-byte" \
-        "$expected_review" "$(cat "$rd4/review-prompt.md" 2>/dev/null)"
+        "$expected_review" "$rendered_review_prompt"
+    contains "rendered review contract makes the report optional" \
+        "you may add a \`## Report\` heading" "$rendered_review_prompt"
+    if [[ "$rendered_review_prompt" == *"add exactly one \`## Report\` heading"* ]]; then
+        no "rendered review contract does not require a report heading"
+    else
+        ok "rendered review contract does not require a report heading"
+    fi
 
     expected_fix="$(cat <<EXPECTED
 # Your working directory

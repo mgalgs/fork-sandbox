@@ -1842,7 +1842,7 @@ stub_dir="$(mktemp -d /var/tmp/claude-scratch/fs-k8s-rl-stub.XXXXXX)"; tmpdirs+=
 cat > "$stub_dir/pi-approve" <<'STUB'
 #!/bin/sh
 cat >/dev/null
-echo APPROVED > "$RL_TEST_VERDICT"
+printf 'APPROVED\n\n## Report\nThe branch is sound.\n' > "$RL_TEST_VERDICT"
 exit 0
 STUB
 chmod +x "$stub_dir/pi-approve"
@@ -1857,6 +1857,42 @@ check "approved: ended=approved" "approved" "$(rl_json "$out" '.ended')"
 check "approved: one iteration recorded" "1" "$(rl_json "$out" '.iterations | length')"
 check "approved: findings=0" "0" "$(rl_json "$out" '.iterations[0].findings')"
 
+printf '\n-- malformed present report section --\n'
+stub_dir_malformed="$(mktemp -d /var/tmp/claude-scratch/fs-k8s-rl-stub.XXXXXX)"; tmpdirs+=("$stub_dir_malformed")
+cat > "$stub_dir_malformed/pi-malformed" <<'STUB'
+#!/bin/sh
+cat >/dev/null
+printf 'APPROVED\n\nChecked: useful evidence.\n\n## Report\n' > "$RL_TEST_VERDICT"
+exit 0
+STUB
+chmod +x "$stub_dir_malformed/pi-malformed"
+read -r repo base_sha work review_prompt fix_header out < <(new_rl_fixture)
+tmpdirs+=("$(dirname "$repo")")
+RL_TEST_VERDICT="$repo/.git/review-verdict.md" PI_BIN="$stub_dir_malformed/pi-malformed" MODEL=test-model \
+    "$rl_sh" --clone "$repo" --cap 2 --base-sha "$base_sha" \
+    --review-prompt "$review_prompt" --fix-header "$fix_header" \
+    --verdict "$repo/.git/review-verdict.md" --work-dir "$work" --out "$out" \
+    >/dev/null 2>&1
+check "malformed report: still ended=approved" "approved" "$(rl_json "$out" '.ended')"
+
+printf '\n-- approved without a report section --\n'
+stub_dir_no_report="$(mktemp -d /var/tmp/claude-scratch/fs-k8s-rl-stub.XXXXXX)"; tmpdirs+=("$stub_dir_no_report")
+cat > "$stub_dir_no_report/pi-approve-no-report" <<'STUB'
+#!/bin/sh
+cat >/dev/null
+printf 'APPROVED\n\nThe branch is sound.\n' > "$RL_TEST_VERDICT"
+exit 0
+STUB
+chmod +x "$stub_dir_no_report/pi-approve-no-report"
+read -r repo base_sha work review_prompt fix_header out < <(new_rl_fixture)
+tmpdirs+=("$(dirname "$repo")")
+RL_TEST_VERDICT="$repo/.git/review-verdict.md" PI_BIN="$stub_dir_no_report/pi-approve-no-report" MODEL=test-model \
+    "$rl_sh" --clone "$repo" --cap 2 --base-sha "$base_sha" \
+    --review-prompt "$review_prompt" --fix-header "$fix_header" \
+    --verdict "$repo/.git/review-verdict.md" --work-dir "$work" --out "$out" \
+    >/dev/null 2>&1
+check "approved without report: ended=approved" "approved" "$(rl_json "$out" '.ended')"
+
 printf '\n-- findings, then a fix leg that makes progress --\n'
 stub_dir2="$(mktemp -d /var/tmp/claude-scratch/fs-k8s-rl-stub.XXXXXX)"; tmpdirs+=("$stub_dir2")
 read -r repo base_sha work review_prompt fix_header out < <(new_rl_fixture)
@@ -1870,7 +1906,7 @@ n=0
 n=\$((n + 1))
 echo \$n > "$counter_file"
 if [ \$((n % 2)) -eq 1 ]; then
-    printf 'FINDINGS\n\nsomething is wrong at foo.c:12\n' > "\$RL_TEST_VERDICT"
+    printf 'FINDINGS\n\nsomething is wrong at foo.c:12\n\n## Report\nThe review found one issue.\n' > "\$RL_TEST_VERDICT"
 else
     git -C "$repo" -c user.email=t@fork-sandbox.invalid -c user.name=t \\
         commit -q --allow-empty -m "fix \$n"
@@ -1897,6 +1933,47 @@ else
         "$(cat "$work/fix-prompt-1.md" 2>/dev/null)"
 fi
 
+printf '\n-- findings without a report section --\n'
+stub_dir_no_report_findings="$(mktemp -d /var/tmp/claude-scratch/fs-k8s-rl-stub.XXXXXX)"; tmpdirs+=("$stub_dir_no_report_findings")
+read -r repo base_sha work review_prompt fix_header out < <(new_rl_fixture)
+tmpdirs+=("$(dirname "$repo")")
+cat > "$stub_dir_no_report_findings/pi-findings-no-report" <<STUB
+#!/bin/sh
+prompt=\$(cat)
+n=0
+[ -f "$stub_dir_no_report_findings/count" ] && n=\$(cat "$stub_dir_no_report_findings/count")
+n=\$((n + 1))
+echo \$n > "$stub_dir_no_report_findings/count"
+if [ \$n -eq 1 ]; then
+    printf 'FINDINGS\n\nfoo.c:12 first issue\n\nbar.c:34 second issue\n' > "\$RL_TEST_VERDICT"
+    exit 0
+fi
+case "\$prompt" in
+    *'foo.c:12 first issue'*'bar.c:34 second issue'*)
+        git -C "$repo" -c user.email=t@fork-sandbox.invalid -c user.name=t \
+            commit -q --allow-empty -m fix
+        printf '{"type":"result","subtype":"success","total_cost_usd":0.01,"usage":{"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}\n'
+        exit 0 ;;
+    *) exit 1 ;;
+esac
+STUB
+chmod +x "$stub_dir_no_report_findings/pi-findings-no-report"
+RL_TEST_VERDICT="$repo/.git/review-verdict.md" PI_BIN="$stub_dir_no_report_findings/pi-findings-no-report" MODEL=test-model \
+    "$rl_sh" --clone "$repo" --cap 1 --base-sha "$base_sha" \
+    --review-prompt "$review_prompt" --fix-header "$fix_header" \
+    --verdict "$repo/.git/review-verdict.md" --work-dir "$work" --out "$out" \
+    >/dev/null 2>&1
+check "findings without report: ended=cap" "cap" "$(rl_json "$out" '.ended')"
+check "findings without report: counts two cited paragraphs" "2" \
+    "$(rl_json "$out" '.iterations[0].findings')"
+if grep -qF 'foo.c:12 first issue' "$work/fix-prompt-1.md" \
+    && grep -qF 'bar.c:34 second issue' "$work/fix-prompt-1.md"; then
+    ok "findings without report: fix prompt carries the verdict"
+else
+    no "findings without report: fix prompt carries the verdict" \
+        "$(cat "$work/fix-prompt-1.md" 2>/dev/null)"
+fi
+
 printf '\n-- no-progress: the fix leg commits nothing --\n'
 stub_dir3="$(mktemp -d /var/tmp/claude-scratch/fs-k8s-rl-stub.XXXXXX)"; tmpdirs+=("$stub_dir3")
 read -r repo base_sha work review_prompt fix_header out < <(new_rl_fixture)
@@ -1904,7 +1981,7 @@ tmpdirs+=("$(dirname "$repo")")
 cat > "$stub_dir3/pi-findings-only" <<'STUB'
 #!/bin/sh
 cat >/dev/null
-printf 'FINDINGS\n\nsomething is wrong at foo.c:12\n' > "$RL_TEST_VERDICT"
+printf 'FINDINGS\n\nsomething is wrong at foo.c:12\n\n## Report\nThe review found one issue.\n' > "$RL_TEST_VERDICT"
 exit 0
 STUB
 chmod +x "$stub_dir3/pi-findings-only"

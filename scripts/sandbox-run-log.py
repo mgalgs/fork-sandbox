@@ -162,6 +162,7 @@ SUMMARY_FIELDS = [
     "cost_usd",
     "total_cost_usd",
     "refresh",
+    "report_from",
     "continuations",
     "usage",
     "started_at",

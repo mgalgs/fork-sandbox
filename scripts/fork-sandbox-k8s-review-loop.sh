@@ -274,6 +274,9 @@ while [[ -z "$ended" ]] && (( loop_i <= cap_n )); do
     # verdict cannot spoof a terminal reading this loop's stderr.
     verdict_line="$(head -n 1 "$verdict_copy" | tr -d '\000-\037\177' \
         | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    # Deliberately nothing here checks the "## Report" section -- see the
+    # same comment in fork-sandbox.sh's loop: the first line is the contract,
+    # and a malformed report must never fail a valid verdict.
     case "$verdict_line" in
     APPROVED)
         it_findings=0
@@ -299,6 +302,7 @@ while [[ -z "$ended" ]] && (( loop_i <= cap_n )); do
     # "findings" means between the local and cluster paths.
     it_findings="$(awk '
         NR == 1 { next }
+        /^## Report$/ { exit }
         /^[[:space:]]*$/ { if (hit) n++; hit = 0; next }
         /[^[:space:]:]+:[0-9]+/ { hit = 1 }
         END { if (hit) n++; print n + 0 }' "$verdict_copy" 2>/dev/null)"
@@ -314,7 +318,7 @@ while [[ -z "$ended" ]] && (( loop_i <= cap_n )); do
     {
         cat -- "$fix_header"
         printf '\n---\n\n'
-        cat -- "$verdict_copy"
+        awk '/^## Report$/ { exit } { print }' "$verdict_copy"
     } > "$fix_prompt.part"
     mv -f "$fix_prompt.part" "$fix_prompt"
 

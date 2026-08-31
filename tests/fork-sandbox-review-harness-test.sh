@@ -324,11 +324,27 @@ done
 cat >/dev/null
 case "${REVIEW_VERDICT:-approved}" in
 approved)
-    printf 'APPROVED\n\nThe reviewed range is sound.\n' \
+    printf 'APPROVED\n\nThe reviewed range is sound.\n\n## Report\nThe branch is sound.\n' \
+        > "$clone_dir/.git/review-verdict.md"
+    ;;
+approved-no-report)
+    printf 'APPROVED\n\nThe reviewed range is sound without an orchestrator report.\n' \
         > "$clone_dir/.git/review-verdict.md"
     ;;
 findings)
+    printf 'FINDINGS\n\nfile.txt:1 first issue\n\nfile.txt:2 second issue\n\n## Report\nThe review found two issues.\n' \
+        > "$clone_dir/.git/review-verdict.md"
+    ;;
+findings-no-report)
     printf 'FINDINGS\n\nfile.txt:1 first issue\n\nfile.txt:2 second issue\n' \
+        > "$clone_dir/.git/review-verdict.md"
+    ;;
+approved-malformed-report)
+    printf 'APPROVED\n\nChecked: useful evidence.\n\n## Report\n' \
+        > "$clone_dir/.git/review-verdict.md"
+    ;;
+approved-duplicate-report)
+    printf 'APPROVED\n\nChecked: useful evidence.\n\n## Report\nFirst report.\n\n## Report\nSecond report.\n' \
         > "$clone_dir/.git/review-verdict.md"
     ;;
 none) ;;
@@ -368,6 +384,8 @@ if [[ "$approved_rc" == 0 && -n "$approved_rd" ]]; then
         "$(jq -r '.mode' "$approved_rd/summary.json")"
     check "APPROVED review-only summary has no commits" "0" \
         "$(jq -r '.commits' "$approved_rd/summary.json")"
+    check "APPROVED review-only summary reports review provenance" "review" \
+        "$(jq -r '.report_from' "$approved_rd/summary.json")"
     check "review-only defaults task metadata to review" '{"kind":"review"}' \
         "$(cat "$approved_rd/task-meta.json")"
     contains "review-only events.jsonl is the review leg's output" \
@@ -398,6 +416,19 @@ else
     no "an APPROVED review-only run exits 0" "rc=$approved_rc rd=$approved_rd $approved_out"
 fi
 
+approved_no_report_branch="review-only-approved-no-report-$$"
+approved_no_report_out="$(review_only_run "$approved_no_report_branch" approved-no-report)"
+approved_no_report_rc="$(cat "$review_proj/$approved_no_report_branch.rc")"
+approved_no_report_rd="$(cat "$review_proj/$approved_no_report_branch.rd")"
+if [[ "$approved_no_report_rc" == 0 && -n "$approved_no_report_rd" ]]; then
+    ok "an APPROVED review-only verdict without a report exits 0"
+    check "APPROVED without a report ends approved" "approved" \
+        "$(jq -r '.ended' "$approved_no_report_rd/review-loop.json")"
+else
+    no "an APPROVED review-only verdict without a report exits 0" \
+        "rc=$approved_no_report_rc rd=$approved_no_report_rd $approved_no_report_out"
+fi
+
 findings_branch="review-only-findings-$$"
 findings_out="$(review_only_run "$findings_branch" findings)"
 findings_rc="$(cat "$review_proj/$findings_branch.rc")"
@@ -415,6 +446,45 @@ if [[ "$findings_rc" == 0 && -n "$findings_rd" ]]; then
     fi
 else
     no "a FINDINGS review-only run exits 0" "rc=$findings_rc rd=$findings_rd $findings_out"
+fi
+
+findings_no_report_branch="review-only-findings-no-report-$$"
+findings_no_report_out="$(review_only_run "$findings_no_report_branch" findings-no-report)"
+findings_no_report_rc="$(cat "$review_proj/$findings_no_report_branch.rc")"
+findings_no_report_rd="$(cat "$review_proj/$findings_no_report_branch.rd")"
+if [[ "$findings_no_report_rc" == 0 && -n "$findings_no_report_rd" ]]; then
+    ok "a FINDINGS review-only verdict without a report exits 0"
+    check "FINDINGS without a report counts two cited paragraphs" "2" \
+        "$(jq -r '.iterations[0].findings' "$findings_no_report_rd/review-loop.json")"
+else
+    no "a FINDINGS review-only verdict without a report exits 0" \
+        "rc=$findings_no_report_rc rd=$findings_no_report_rd $findings_no_report_out"
+fi
+
+malformed_report_branch="review-only-malformed-report-$$"
+malformed_report_out="$(review_only_run "$malformed_report_branch" approved-malformed-report)"
+malformed_report_rc="$(cat "$review_proj/$malformed_report_branch.rc")"
+malformed_report_rd="$(cat "$review_proj/$malformed_report_branch.rd")"
+if [[ "$malformed_report_rc" == 0 && -n "$malformed_report_rd" ]]; then
+    ok "a verdict with an empty report section still exits 0"
+    check "an empty report section does not fail the verdict" "approved" \
+        "$(jq -r '.ended' "$malformed_report_rd/review-loop.json")"
+else
+    no "a verdict with an empty report section still exits 0" \
+        "rc=$malformed_report_rc rd=$malformed_report_rd $malformed_report_out"
+fi
+
+duplicate_report_branch="review-only-duplicate-report-$$"
+duplicate_report_out="$(review_only_run "$duplicate_report_branch" approved-duplicate-report)"
+duplicate_report_rc="$(cat "$review_proj/$duplicate_report_branch.rc")"
+duplicate_report_rd="$(cat "$review_proj/$duplicate_report_branch.rd")"
+if [[ "$duplicate_report_rc" == 0 && -n "$duplicate_report_rd" ]]; then
+    ok "a verdict with duplicate report headings still exits 0"
+    check "duplicate report headings do not fail the verdict" "approved" \
+        "$(jq -r '.ended' "$duplicate_report_rd/review-loop.json")"
+else
+    no "a verdict with duplicate report headings still exits 0" \
+        "rc=$duplicate_report_rc rd=$duplicate_report_rd $duplicate_report_out"
 fi
 
 missing_branch="review-only-missing-$$"
@@ -596,7 +666,7 @@ case "$n" in
     # addendum in this scenario used to be the implement leg's. Findings, so
     # a fix leg follows.
     printf 'a message sent while the review leg ran\n' > "$inbox_dir/9999999900-02.md"
-    printf 'FINDINGS\n\nfile.txt:1 not quite right\n' \
+    printf 'FINDINGS\n\nfile.txt:1 not quite right\n\n## Report\nThe report cites report.md:99.\n' \
         > "$clone_dir/.git/review-verdict.md"
     ;;
 *)
@@ -623,6 +693,15 @@ rd9="$(printf '%s\n' "$out9" | sed -n 's/^  run dir:  *//p' | head -1)"
 if (( rc9 == 0 )) && [[ -n "$rd9" ]]; then
     tmpdirs+=("$rd9")
     check "three legs ran (implement, review, fix)" "3" "$(cat "$count_file9")"
+    check "report citations do not inflate findings" "1" \
+        "$(jq -r '.iterations[0].findings' "$rd9/review-loop.json")"
+    if ! grep -qF 'report.md:99' "$rd9/fix-prompt-1.md" 2>/dev/null; then
+        ok "fix prompt excludes the review report"
+    else
+        no "fix prompt excludes the review report"
+    fi
+    check "review-loop summary reports review provenance" "review" \
+        "$(jq -r '.report_from' "$rd9/summary.json")"
     check "the implement leg's inbox holds nothing yet (nothing sent before it started)" \
         "" "$(cat "$seen_dir/leg-1" 2>/dev/null)"
     check "the review leg's inbox is empty: the implement leg's addendum was archived" \
@@ -755,7 +834,7 @@ n=$(( n + 1 ))
 printf '%s' "$n" > "$FAKE_COUNT_FILE"
 inbox_dir="$(dirname "$outbox")/inbox"
 printf 'a message sent while the pi-local review leg ran\n' > "$inbox_dir/9999999900-02.md"
-printf 'FINDINGS\n\nfile.txt:1 not quite right\n' > "$clone_dir/.git/review-verdict.md"
+printf 'FINDINGS\n\nfile.txt:1 not quite right\n\n## Report\nThe review found one issue.\n' > "$clone_dir/.git/review-verdict.md"
 exit 0
 STUB
 chmod +x "$mixed_a_stub/claude-sandboxed" "$mixed_a_stub/agent-sandboxed"
@@ -833,7 +912,7 @@ case "$n" in
     ;;
 2)
     printf 'a message sent while the claude review leg ran\n' > "$inbox_dir/9999999900-02.md"
-    printf 'FINDINGS\n\nfile.txt:1 not quite right\n' > "$clone_dir/.git/review-verdict.md"
+    printf 'FINDINGS\n\nfile.txt:1 not quite right\n\n## Report\nThe review found one issue.\n' > "$clone_dir/.git/review-verdict.md"
     printf '{"type":"result","subtype":"success","total_cost_usd":0.01,"usage":{"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}\n'
     ;;
 3)

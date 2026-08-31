@@ -210,9 +210,10 @@
 # .git/review-verdict.md in the clone: the first line is APPROVED or FINDINGS,
 # and the rest is one finding per paragraph, each citing file:line -- or,
 # after APPROVED, a "Checked:" paragraph saying what the reviewer read, ran
-# and failed to refute, which nothing parses but a reader of the verdict
-# file wants. A verdict is data, and it reaches the fix leg the way every
-# prompt does, on stdin.
+# and failed to refute. It then ends with a five-paragraph "## Report" for
+# the orchestrator; the report is shown by --result while only the verdict
+# body reaches the fix leg. A verdict is data, and it reaches the fix leg the
+# way every prompt does, on stdin.
 #
 # The loop stops on the first of four things:
 #
@@ -4732,6 +4733,11 @@ if [[ "$review_loop_cap" != "0" && -n "$review_prompt" ]]; then
         # an ESC or a CR in the verdict cannot spoof the pane or the monitor.
         verdict_line="$(head -n 1 "$verdict_copy" | tr -d '\000-\037\177' \
             | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+        # Deliberately nothing here checks the "## Report" section. The first
+        # line is the contract; the report is a courtesy to the orchestrator,
+        # and an absent, empty or duplicated one must never turn a valid
+        # verdict into a failed loop -- fork-sandbox-status.sh falls back to
+        # printing the whole verdict when the section is not usable.
         case "$verdict_line" in
         APPROVED)
             it_findings=0
@@ -4755,6 +4761,7 @@ if [[ "$review_loop_cap" != "0" && -n "$review_prompt" ]]; then
         # and all that can be counted without reading the prose.
         it_findings="$(awk '
             NR == 1 { next }
+            /^## Report$/ { exit }
             /^[[:space:]]*$/ { if (hit) n++; hit = 0; next }
             /[^[:space:]:]+:[0-9]+/ { hit = 1 }
             END { if (hit) n++; print n + 0 }' "$verdict_copy" 2>/dev/null)"
@@ -4776,7 +4783,7 @@ if [[ "$review_loop_cap" != "0" && -n "$review_prompt" ]]; then
         {
             cat -- "$fix_prompt_header"
             printf '\n---\n\n'
-            cat -- "$verdict_copy"
+            awk '/^## Report$/ { exit } { print }' "$verdict_copy"
         } > "$fix_prompt.part"
         mv -f "$fix_prompt.part" "$fix_prompt"
 
@@ -4927,6 +4934,11 @@ elif [[ -n "$run_cost_fmt" && "$loop_cost_unknown" != "1" ]]; then
     if [[ "$total_cost_raw" =~ ^-?[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?$ ]]; then
         total_cost_fmt="$(printf '%.6f' "$total_cost_raw")"
     fi
+fi
+
+report_from="session"
+if compgen -G "$run_dir/review-verdict-*.md" >/dev/null 2>&1; then
+    report_from="review"
 fi
 
 # Did the work come back authored by this repo's own identity? The clone is
@@ -5117,6 +5129,7 @@ jq -n \
     --arg author_email "$author_email_want" \
     --argjson author_email_unexpected "$author_email_bad_json" \
     --arg refresh "$refresh_ended" \
+    --arg report_from "$report_from" \
     --argjson continuations "$continuations_json" \
     --argjson outbox_bytes "$outbox_bytes" \
     --argjson outbox_max_bytes "$outbox_max_bytes" \
@@ -5142,6 +5155,7 @@ jq -n \
         cost_usd: $cost_usd,
         total_cost_usd: $total_cost_usd,
         refresh: $refresh,
+        report_from: $report_from,
         continuations: $continuations,
         outbox_bytes: $outbox_bytes,
         outbox_max_bytes: $outbox_max_bytes,
