@@ -739,6 +739,39 @@ else
     no "short branch safe name remains unchanged" "expected pinned short name"
 fi
 
+# Normalization is lossy even for short branches. Each colliding pair must
+# receive a digest-bearing name, so submitting one cannot overwrite the
+# other's objects (and cleanup cannot remove the wrong run).
+normalized_a_out="$(newdir)/normalized-a.yaml"; tmpdirs+=("$(dirname "$normalized_a_out")")
+normalized_b_out="$(newdir)/normalized-b.yaml"; tmpdirs+=("$(dirname "$normalized_b_out")")
+FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch feature/foo --model moonshotai/kimi-k3 "$proj_dir" "$handoff_file" >"$normalized_a_out"
+FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch feature-foo --model moonshotai/kimi-k3 "$proj_dir" "$handoff_file" >"$normalized_b_out"
+normalized_a="$(awk '/^kind: Job$/{job=1} job && /^  name:/{print $2; exit}' "$normalized_a_out")"
+normalized_b="$(awk '/^kind: Job$/{job=1} job && /^  name:/{print $2; exit}' "$normalized_b_out")"
+if [[ "$normalized_a" != "$normalized_b" && "$normalized_a" =~ -[0-9a-f]{8}$ \
+        && ${#normalized_a} -le 50 && ${#normalized_b} -le 50 ]]; then
+    ok "slash and dash branch names get distinct digest-bearing safe names"
+else
+    no "slash and dash branch names get distinct digest-bearing safe names" \
+        "a='$normalized_a' b='$normalized_b'"
+fi
+
+FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch FeatureFoo --model moonshotai/kimi-k3 "$proj_dir" "$handoff_file" >"$normalized_a_out"
+FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch featurefoo --model moonshotai/kimi-k3 "$proj_dir" "$handoff_file" >"$normalized_b_out"
+normalized_a="$(awk '/^kind: Job$/{job=1} job && /^  name:/{print $2; exit}' "$normalized_a_out")"
+normalized_b="$(awk '/^kind: Job$/{job=1} job && /^  name:/{print $2; exit}' "$normalized_b_out")"
+if [[ "$normalized_a" != "$normalized_b" && "$normalized_a" =~ -[0-9a-f]{8}$ \
+        && ${#normalized_a} -le 50 && ${#normalized_b} -le 50 ]]; then
+    ok "case-colliding branch names get distinct digest-bearing safe names"
+else
+    no "case-colliding branch names get distinct digest-bearing safe names" \
+        "a='$normalized_a' b='$normalized_b'"
+fi
+
 printf '\n== fork-sandbox-k8s.sh submit --dry-run --harness claude (long branch name) ==\n'
 # k8s_safe_name used to cap at 63 with no budget for the "-claude-proxy"
 # suffix appended afterward, so any branch whose sanitized form was 32+

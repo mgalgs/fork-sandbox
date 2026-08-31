@@ -444,11 +444,14 @@ k8s_safe_name_component() {
 # capped at 63 -- so the base must leave room for that suffix or a long
 # branch renders a Service name the API server rejects, aborting submit
 # after the Secret, ConfigMap and Pod for that run already exist.
+# A normalized branch gets a digest too, even when it fits: otherwise refs
+# such as feature/foo and feature-foo (or Feature/foo and feature-foo) share
+# one set of Kubernetes objects.
 k8s_safe_name() {
     local prefix="$1" branch="$2" component candidate digest base
     component="$(k8s_safe_name_component "$branch")"
     candidate="$prefix-$component"
-    if (( ${#candidate} <= 50 )); then
+    if [[ "$component" == "$branch" ]] && (( ${#candidate} <= 50 )); then
         printf '%s' "$candidate"
         return
     fi
@@ -456,6 +459,31 @@ k8s_safe_name() {
     base="${candidate:0:41}"
     base="${base%-}"
     printf '%s-%s' "$base" "$digest"
+}
+
+# The object-name derivation used before k8s_safe_name added digests. Keep it
+# for management commands so runs submitted by that version remain fetchable,
+# sayable, and removable after this script is updated. Submit must continue to
+# use k8s_safe_name: unlike this legacy form, it distinguishes names that
+# sanitize to the same component.
+k8s_legacy_safe_name() {
+    local prefix="$1" branch="$2"
+    printf '%s-%s' "$prefix" "$(k8s_safe_name_component "$branch")" \
+        | cut -c1-50 | sed 's/-$//'
+}
+
+# Prefer the current name, then look for an object created with the legacy
+# name. The fallback is intentionally limited to management commands; a
+# submit never reuses a possibly colliding legacy name.
+k8s_find_pod() {
+    local safe_name="$1" legacy_name="$2" pod_name
+    pod_name="$(kubectl get pod -l "job-name=$safe_name" \
+        -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+    if [[ -z "$pod_name" && "$legacy_name" != "$safe_name" ]]; then
+        pod_name="$(kubectl get pod -l "job-name=$legacy_name" \
+            -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+    fi
+    printf '%s' "$pod_name"
 }
 
 # Renders the four --review-loop-only ConfigMap keys: the review and fix
@@ -1259,9 +1287,10 @@ cmd_fetch() {
     local origin_repo
     origin_repo="$(fs_repo_toplevel "$project_path")" || exit 1
 
-    local safe_name pod_name
+    local safe_name legacy_name pod_name
     safe_name="$(k8s_safe_name fork-sandbox-agent "$branch")"
-    pod_name="$(kubectl get pod -l "job-name=$safe_name" -o jsonpath='{.items[0].metadata.name}')"
+    legacy_name="$(k8s_legacy_safe_name fork-sandbox-agent "$branch")"
+    pod_name="$(k8s_find_pod "$safe_name" "$legacy_name")"
     if [[ -z "$pod_name" ]]; then
         echo "Error: no pod found for branch '$branch' (job $safe_name). It may" >&2
         echo "have already been fetched and removed, or the run never started." >&2
@@ -1321,9 +1350,10 @@ cmd_say() {
         || { echo "Error: the message is empty. A blank addendum tells the session nothing." >&2; exit 1; }
     fs_reject_unsafe_chars "$branch" || exit 1
 
-    local safe_name pod_name
+    local safe_name legacy_name pod_name
     safe_name="$(k8s_safe_name fork-sandbox-agent "$branch")"
-    pod_name="$(kubectl get pod -l "job-name=$safe_name" -o jsonpath='{.items[0].metadata.name}')"
+    legacy_name="$(k8s_legacy_safe_name fork-sandbox-agent "$branch")"
+    pod_name="$(k8s_find_pod "$safe_name" "$legacy_name")"
     if [[ -z "$pod_name" ]]; then
         echo "Error: no pod found for branch '$branch' (job $safe_name). It may" >&2
         echo "have already been fetched and removed, or the run never started." >&2
@@ -1381,15 +1411,24 @@ cmd_rm() {
     [[ -n "$branch" ]] || { echo "Error: rm requires --branch." >&2; exit 1; }
     fs_reject_unsafe_chars "$branch" || exit 1
 
-    local safe_name
+    local safe_name legacy_name
     safe_name="$(k8s_safe_name fork-sandbox-agent "$branch")"
+    legacy_name="$(k8s_legacy_safe_name fork-sandbox-agent "$branch")"
     kubectl delete job "$safe_name" --ignore-not-found
     kubectl delete configmap "$safe_name-scripts" --ignore-not-found
+    if [[ "$legacy_name" != "$safe_name" ]]; then
+        kubectl delete job "$legacy_name" --ignore-not-found
+        kubectl delete configmap "$legacy_name-scripts" --ignore-not-found
+    fi
     # Additionally, by label: the claude-proxy Pod, Service, ConfigMap,
     # Secret and NetworkPolicy, none of which the two deletes above name --
     # harmless on a pi run, which never created anything carrying this
     # label beyond the scripts ConfigMap already deleted above.
     kubectl delete pod,service,secret,configmap,networkpolicy -l fork-sandbox/branch="$safe_name" --ignore-not-found
+    if [[ "$legacy_name" != "$safe_name" ]]; then
+        kubectl delete pod,service,secret,configmap,networkpolicy \
+            -l fork-sandbox/branch="$legacy_name" --ignore-not-found
+    fi
     echo "fork-sandbox-k8s: removed job and configmap for branch $branch" >&2
 }
 
