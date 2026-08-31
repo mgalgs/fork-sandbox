@@ -589,6 +589,23 @@ Concretely, for the OpenRouter upstream v1 ships:
 This is the mode a real provider (OpenRouter, and by extension any API-keyed
 service) requires, because the key has to live somewhere.
 
+`K8S_PROXY_ENDPOINTS` is a keyless variant of this same mode, for a
+self-hosted OpenAI-compatible server (vLLM, Ollama, TGI) that needs no
+`Authorization` header at all: `K8S_PROXY_ENDPOINTS=<name>=<base-url>[,...]`
+registers one or more named upstreams instead of `K8S_PROXY_UPSTREAM`
+(mutually exclusive with it), each widening the proxy by two exact-match
+paths, `/e/<name>/v1/chat/completions` and `/e/<name>/v1/models`. `install`
+creates no Secret and injects no `Authorization` header on this path.
+`http://` is accepted here (and on `K8S_PROXY_UPSTREAM`) when the host is a
+literal private IPv4 address (RFC1918, loopback, or link-local); anything
+else still requires `https://`. The proxy's own `NetworkPolicy` egress
+otherwise defaults to any host except RFC1918/loopback/link-local/CGNAT on
+443, same as above — a private endpoint needs `K8S_PROXY_ALLOW=<cidr>:<port>[,...]`
+to actually be reachable, since the default policy excepts exactly the
+address ranges `http://` is restricted to. `submit`'s own wiring to a named
+endpoint (rather than the shared proxy's legacy `/api/v1` path) is not yet
+built.
+
 ### 1b. proxy, per-run, for claude — **Status: built.**
 
 `--harness claude` does not fit mode 1 above: OpenRouter's key is a

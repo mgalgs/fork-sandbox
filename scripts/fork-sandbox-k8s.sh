@@ -706,6 +706,12 @@ parse_proxy_endpoints() {
             return 1
         fi
         seen+="$name,"
+        # render_proxy_locations_body concatenates this straight onto
+        # "/chat/completions" and "/models" -- a trailing slash here would
+        # double up into ".../chat/completions" and 404 on vLLM and most
+        # OpenAI-compatible servers. Strip exactly one; validate_upstream_url
+        # already rejected anything that couldn't parse as a URL at all.
+        url="${url%/}"
         PROXY_ENDPOINT_NAMES+=("$name")
         PROXY_ENDPOINT_URLS+=("$url")
     done
@@ -921,6 +927,43 @@ strip_proxy_key_include() {
     printf '%s' "$stripped"
 }
 
+# Removes the Deployment's upstream-key volumeMount and volume stanzas
+# (verbatim from manifests/k8s/30-proxy.yaml) from $1, for a
+# K8S_PROXY_ENDPOINTS (keyless) render. Companion to strip_proxy_key_include
+# above: that one keeps nginx from trying to include a file that was never
+# mounted, this one keeps the Pod spec from referencing a Secret that
+# cmd_install never creates on this path (see its own Secret-creation guard).
+# Without this, kubelet refuses to start the pod at all --
+# "MountVolume.SetUp failed ... secret \"fork-sandbox-upstream-key\" not
+# found" -- which is a worse failure than the ConfigMap-only half of this
+# fix: the proxy never reaches Ready, so a keyless install never comes up.
+# Both stanzas sit between list items with no surrounding blank line, unlike
+# proxy_key_include_block's ConfigMap text, so a plain literal substitution
+# is enough here -- no blank-line bookkeeping needed.
+strip_proxy_key_volume() {
+    local text="$1" mount_block volume_block stripped
+    mount_block=$'            - name: upstream-key\n              mountPath: /etc/nginx/upstream-key.conf\n              subPath: upstream-key.conf\n              readOnly: true\n'
+    volume_block=$'        - name: upstream-key\n          secret:\n            secretName: fork-sandbox-upstream-key\n'
+
+    stripped="${text/"$mount_block"/}"
+    if [[ "$stripped" == "$text" ]]; then
+        echo "Error: could not find the upstream-key volumeMount in the" >&2
+        echo "rendered proxy Deployment -- manifests/k8s/30-proxy.yaml and" >&2
+        echo "strip_proxy_key_volume in this script have drifted apart." >&2
+        return 1
+    fi
+    text="$stripped"
+
+    stripped="${text/"$volume_block"/}"
+    if [[ "$stripped" == "$text" ]]; then
+        echo "Error: could not find the upstream-key volume in the rendered" >&2
+        echo "proxy Deployment -- manifests/k8s/30-proxy.yaml and" >&2
+        echo "strip_proxy_key_volume in this script have drifted apart." >&2
+        return 1
+    fi
+    printf '%s' "$stripped"
+}
+
 render_proxy_locations_body() {
     local upstream_host="$1"
 
@@ -1036,6 +1079,30 @@ cmd_install() {
     # explicit allowlist too.
     parse_proxy_allow "$K8S_PROXY_ALLOW" || exit 1
 
+    # A registered endpoint on http:// is, by validate_upstream_url's own
+    # rule, always a private (RFC1918/loopback/link-local) address -- and
+    # the default egress policy (unset K8S_PROXY_ALLOW) excepts exactly
+    # those ranges. So this specific combination is not just probably
+    # unreachable, it is deterministically unreachable under the policy
+    # this same install is about to apply -- worth a warning, even though
+    # K8S_PROXY_ALLOW stays a separate, unvalidated knob (see above): a
+    # renderer has no business refusing a config it cannot know is actually
+    # wrong (an https:// endpoint on a non-443 port has the same problem
+    # but isn't checkable without parsing every port out of every URL).
+    if [[ ${#PROXY_ALLOW_CIDRS[@]} -eq 0 ]]; then
+        local i
+        for (( i = 0; i < ${#PROXY_ENDPOINT_URLS[@]}; i++ )); do
+            if [[ "${PROXY_ENDPOINT_URLS[$i]}" == http://* ]]; then
+                echo "Warning: K8S_PROXY_ENDPOINTS entry '${PROXY_ENDPOINT_NAMES[$i]}'" >&2
+                echo "uses http://, which is only ever accepted to a private address --" >&2
+                echo "but K8S_PROXY_ALLOW is unset, so the proxy's default egress policy" >&2
+                echo "(any host except RFC1918/loopback/link-local/CGNAT, on 443) excepts" >&2
+                echo "exactly that address. Every request to it will be dropped. Set" >&2
+                echo "K8S_PROXY_ALLOW=<cidr>:<port> for this endpoint to fix that." >&2
+            fi
+        done
+    fi
+
     resolve_platform || exit 1
 
     local manifests_dir
@@ -1075,11 +1142,14 @@ cmd_install() {
             # A K8S_PROXY_ENDPOINTS (keyless) install creates no
             # fork-sandbox-upstream-key Secret below, so it must not include
             # a file that Secret is the only thing that ever mounts --
-            # nginx would otherwise crashloop on a missing include. The
-            # legacy K8S_PROXY_UPSTREAM path leaves this block in place
-            # untouched, which is what keeps its render byte-identical.
+            # nginx would otherwise crashloop on a missing include -- and it
+            # must not reference that Secret from the Deployment's volumes
+            # either, or kubelet refuses to start the pod at all. The
+            # legacy K8S_PROXY_UPSTREAM path leaves both in place untouched,
+            # which is what keeps its render byte-identical.
             if [[ -z "$K8S_PROXY_UPSTREAM" ]]; then
                 file_rendered="$(strip_proxy_key_include "$file_rendered")" || exit 1
+                file_rendered="$(strip_proxy_key_volume "$file_rendered")" || exit 1
             fi
 
             # A hash of the rendered nginx.conf, filled into the proxy

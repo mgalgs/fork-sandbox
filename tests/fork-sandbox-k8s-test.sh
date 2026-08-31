@@ -114,8 +114,9 @@
 #     2N EXACT-match locations (/e/<name>/v1/chat/completions,
 #     /e/<name>/v1/models, never a regex or prefix match) alongside the
 #     surviving default-deny `location /`; a K8S_PROXY_ENDPOINTS install
-#     creates no Secret, includes no upstream-key.conf, and injects no
-#     Authorization header; K8S_PROXY_ALLOW replaces the default
+#     creates no Secret, references no upstream-key Secret volume or
+#     volumeMount on the Deployment, includes no upstream-key.conf, and
+#     injects no Authorization header; K8S_PROXY_ALLOW replaces the default
 #     RFC1918-except egress block with exactly the given <cidr>:<port>
 #     entries, and a hostname there is refused with a message naming why
 #     (NetworkPolicy has no hostname field); http:// is accepted to a
@@ -610,6 +611,23 @@ if grep -q 'Authorization' "$endpoints_out"; then
         "found 'Authorization' in $endpoints_out"
 else
     ok "K8S_PROXY_ENDPOINTS install injects no Authorization header"
+fi
+# The other half of "no Secret": the Deployment must not reference one
+# either, via the volumeMount or the volume itself -- a render with no
+# `kind: Secret` doc but a surviving `secretName: fork-sandbox-upstream-key`
+# volume still fails at kubelet ("secret ... not found"), which the
+# assertions above alone would not catch.
+if grep -q 'secretName: fork-sandbox-upstream-key' "$endpoints_out"; then
+    no "K8S_PROXY_ENDPOINTS install references no upstream-key Secret volume" \
+        "found 'secretName: fork-sandbox-upstream-key' in $endpoints_out"
+else
+    ok "K8S_PROXY_ENDPOINTS install references no upstream-key Secret volume"
+fi
+if grep -q 'name: upstream-key' "$endpoints_out"; then
+    no "K8S_PROXY_ENDPOINTS install carries no upstream-key volume/volumeMount" \
+        "found 'name: upstream-key' in $endpoints_out"
+else
+    ok "K8S_PROXY_ENDPOINTS install carries no upstream-key volume/volumeMount"
 fi
 
 # K8S_PROXY_ALLOW replaces the default RFC1918-except egress block with
