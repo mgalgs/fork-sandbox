@@ -657,8 +657,13 @@ Its format is fixed, because a program reads the first line:
   - **The first line is exactly \`APPROVED\` or \`FINDINGS\`**, one word, alone
     on the line, in capitals, with no punctuation, no bullet and no heading
     marker.
-  - \`APPROVED\` means you found nothing worth another session's time. Nothing
-    after that line is read, so a verdict that approves is one word long.
+  - \`APPROVED\` means you found nothing worth another session's time. Only
+    the first line is parsed, so nothing after it changes what happens next
+    -- but a person, or the session that launched this run, reads the file
+    to decide how far to trust the approval. So after \`APPROVED\`, add a
+    short paragraph beginning \`Checked:\` -- what you read, what you ran,
+    and what you tried to refute and could not. A bare \`APPROVED\` is
+    accepted; an approval that shows its evidence is worth more.
   - \`FINDINGS\` means you found problems. After it, write **one finding per
     paragraph**, paragraphs separated by a blank line, and **cite
     \`file:line\` in each one** — the path relative to the clone, and the line

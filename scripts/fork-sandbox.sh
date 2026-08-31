@@ -203,8 +203,11 @@
 # review leg follows the code-review-portable skill,
 # which is bound into every run already, and writes its verdict to
 # .git/review-verdict.md in the clone: the first line is APPROVED or FINDINGS,
-# and the rest is one finding per paragraph, each citing file:line. A verdict
-# is data, and it reaches the fix leg the way every prompt does, on stdin.
+# and the rest is one finding per paragraph, each citing file:line -- or,
+# after APPROVED, a "Checked:" paragraph saying what the reviewer read, ran
+# and failed to refute, which nothing parses but a reader of the verdict
+# file wants. A verdict is data, and it reaches the fix leg the way every
+# prompt does, on stdin.
 #
 # The loop stops on the first of four things:
 #

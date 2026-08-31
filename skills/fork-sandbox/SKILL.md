@@ -74,7 +74,10 @@ reach it — see "What it gives up".)
    With the flag, the run does not end when the coding session does. A
    **fresh** session reviews the commits it made, following the
    `code-review-portable` skill, and writes a verdict whose first line is
-   `APPROVED` or `FINDINGS`. On `FINDINGS`, another fresh session is handed
+   `APPROVED` or `FINDINGS` (an approval is asked to follow that line with a
+   `Checked:` paragraph — what was read, run and could not be refuted — so
+   the verdict file is auditable, not just parseable; only the first line
+   is parsed either way). On `FINDINGS`, another fresh session is handed
    those findings and commits fixes. That pair repeats up to N times, and the
    loop stops on the first of: the review approves, N iterations have run, a
    fix session commits nothing (`no-progress`), or a leg fails outright
