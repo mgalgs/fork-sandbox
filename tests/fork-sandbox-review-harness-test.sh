@@ -681,7 +681,7 @@ if (( rc9pl == 0 )) && [[ -n "$rd9pl" ]]; then
         "--env-file $real_cfg/pi.env" "$review_line9pl"
 
     contains "the run's warning names the networked review harness" \
-        "seals the implement leg" "$out9pl"
+        "--review-harness pi is networked" "$out9pl"
     contains "the launch report warns the review leg does not share the seal" \
         "Its review leg does not share that seal" "$out9pl"
     case "$out9pl" in

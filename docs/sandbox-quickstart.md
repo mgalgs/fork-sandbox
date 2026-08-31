@@ -290,8 +290,12 @@ fork-sandbox.sh --harness pi-local --branch sbx-my-task ~/src/myrepo \
 
 That runs pi against a model **you** host, in a sandbox with **no network at
 all** — no internet, no LAN, no DNS. The endpoint arrives over a unix socket
-and is the only thing the session can reach. So the run costs nothing, holds no
-credential, and cannot send anything anywhere.
+and is the only thing the session can reach. So the implement leg costs
+nothing, holds no credential, and cannot send anything anywhere. That is
+specific to the implement leg: `--review-harness` can point a review leg at
+a networked, credentialed harness instead, in a separate sandbox that does
+not share this seal — see `fork-sandbox.sh --help` and the `pi-local`
+reference in `skills/fork-sandbox/SKILL.md` for that flag.
 
 Setup is one file, on each machine that has such an endpoint:
 

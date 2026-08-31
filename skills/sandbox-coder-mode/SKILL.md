@@ -678,9 +678,9 @@ hand, by whoever set up the machine.
 
 Pick per task, and say why in one line when you launch:
 
-| Task | Harness | Cost |
+| Task | Harness | Cost (this leg) |
 |---|---|---|
-| Mechanical, high-volume, exploratory — a test sweep, a rename, a data-shape investigation | `--harness pi-local` | nothing |
+| Mechanical, high-volume, exploratory — a test sweep, a rename, a data-shape investigation | `--harness pi-local` | nothing — unless the round's `--review-harness` is networked, which prices the review leg separately (see item 2 above) |
 | Ordinary implementation with a clear plan | `--harness claude --model sonnet` (the default) | subscription |
 | Work where the model quality decides the outcome | `--harness claude --model opus` | subscription |
 | A second opinion from outside the family | `--harness pi --model <openrouter-id>` or `--harness codex` | real money / ChatGPT sign-in |

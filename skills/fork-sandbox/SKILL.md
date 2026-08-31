@@ -363,11 +363,16 @@ same sandbox with egress sealed and the one endpoint bridged in over a unix
 socket. Read `agent-sandboxed`'s header for how that works.
 
 - **It costs nothing.** The tokens are yours. The summary still prints a
-  `cost:` line and it reads all zeros.
+  `cost:` line and it reads all zeros. True of the implement leg; naming a
+  networked `--review-harness` puts its own price on the review leg (see
+  `--review-loop` below).
 - **Nothing secret is inside.** A local endpoint needs no credential, so
-  unlike a `pi` or `codex` run there is no key in the sandbox at all.
+  unlike a `pi` or `codex` run there is no key in the sandbox at all. A
+  networked `--review-harness` carries its own credential into its own,
+  separate sandbox — this is about the implement leg only.
 - **It cannot exfiltrate or reach the LAN**, because there is nowhere to
-  reach. No internet, no LAN, no DNS.
+  reach. No internet, no LAN, no DNS. Again the implement leg: a networked
+  `--review-harness` runs a separate sandbox that does reach its provider.
 - **`--model` is optional.** With one model on the endpoint the script asks
   and uses it. Pass `--model` when the endpoint serves several.
 - **The endpoint comes from `~/.config/fork-sandbox/model.env`**

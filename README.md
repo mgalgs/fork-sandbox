@@ -55,19 +55,24 @@ network access).
 
 ## The three network modes
 
-Every run is in exactly one of these, and the mode decides what a compromised
-or misled agent can reach.
+Every run's implement leg is in exactly one of these, and the mode decides
+what a compromised or misled agent can reach. A `--review-harness` that
+differs from `--harness` runs its own leg in its own sandbox, which can land
+in a different mode — see the Pro Recipe below, where a sealed implement leg
+is paired with a pinned, credentialed review leg on purpose.
 
 | Mode | Reaches | Use for |
 |---|---|---|
 | **Pinned** (default) | The internet, via your default interface only. Not the VPN, not the tailnet, not host loopback. | A Claude or OpenRouter run that needs to fetch packages and read docs. |
-| **Sealed** (`--harness pi-local`) | Nothing. One OpenAI-compatible endpoint over a unix socket. | A model you host. Costs nothing, holds no credential, cannot exfiltrate. |
+| **Sealed** (`--harness pi-local`) | Nothing. One OpenAI-compatible endpoint over a unix socket. | A model you host. Costs nothing, holds no credential, cannot exfiltrate — true of the implement leg; a networked `--review-harness` reopens all three for its own leg. |
 | **Serviced** (`--services`) | Whichever of the above, plus a per-run compose stack on unix sockets. | A suite that needs postgres or redis to run. |
 
 Sealed mode is why a local model is worth the trouble. A local endpoint needs
 no API key, so there is no credential in the sandbox to steal, and with no
-network there is nowhere to send anything anyway. The run costs nothing, so a
-wrong answer wastes only time.
+network there is nowhere to send anything anyway. The implement leg costs
+nothing, so a wrong answer wastes only time — naming a networked
+`--review-harness` gives its own leg a credential, egress, and that harness's
+price, same as any other run under it.
 
 ## Harnesses
 
@@ -214,7 +219,10 @@ verdict, and if it found problems a third session fixes them and commits. That
 repeats until the review approves, until a fix session stops making progress,
 or until the count runs out. Each leg is a whole session at its selected
 model's price, so reach for it when a defect would be expensive to find later — and
-freely on a model you host yourself, where it costs nothing.
+freely on a `pi-local` run with no `--review-harness` (or `--review-harness
+pi-local`), where the price is zero either way. Naming a networked
+`--review-harness` turns that back into paid sessions on whichever model it
+names, even though `--harness` itself stays `pi-local`.
 The review verdict also carries the report shown first by `--result`; the
 session's own account follows it.
 
@@ -389,7 +397,8 @@ What you get:
 - **Free runs against your own model.** Point it at a model you host and the
   sandbox gets *no network at all* — the endpoint arrives over a unix socket.
   The tokens are yours, no credential is inside, and there is nowhere to
-  exfiltrate to.
+  exfiltrate to. That is the implement leg; a networked `--review-harness`
+  gives its own leg a credential, egress, and a price, on purpose.
 - **Steering without attaching.** `fork-sandbox-say.sh` sends a running
   session an addendum, delivered at its next tool call.
 - **A record.** Every run appends harness, model, tokens, cost and commits to
