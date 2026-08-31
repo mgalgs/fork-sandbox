@@ -582,6 +582,82 @@ the clone.
 EOF
 }
 
+# Validates an upstream base URL -- K8S_PROXY_UPSTREAM, or one
+# K8S_PROXY_ENDPOINTS entry's URL. https:// is accepted for any host,
+# unchanged from before this function existed. http:// is accepted ONLY
+# when its host is a private address (RFC1918, loopback, or link-local) --
+# plain http:// to a public host would put a request on the open internet
+# in cleartext, which stays refused. TLS and authentication are
+# independent properties: whether an upstream needs a key is never
+# inferred from its scheme, so this checks the URL alone and nothing about
+# K8S_PROXY_UPSTREAM vs K8S_PROXY_ENDPOINTS. A hostname (anything that
+# doesn't parse as a literal IPv4 address) on http:// is refused too --
+# this script has no network access to resolve one, so its privateness
+# can never be verified.
+#
+# On success, prints the bare host (scheme stripped, path cut at the first
+# /, port kept) on stdout -- the same value proxy_ssl_name/Host has always
+# used -- and returns 0. On failure, prints nothing to stdout, an
+# explanatory message to stderr, and returns non-zero. $2, when given,
+# names the setting in error messages (defaults to "URL").
+validate_upstream_url() {
+    local url="$1" label="${2:-URL}" scheme host host_only octet o1 o2
+
+    case "$url" in
+        https://*) scheme=https ;;
+        http://*) scheme=http ;;
+        *)
+            echo "Error: $label must start with https:// or http://, got" >&2
+            echo "'$url'." >&2
+            return 1
+            ;;
+    esac
+
+    host="${url#*://}"
+    host="${host%%/*}"
+    if [[ "$scheme" == https ]]; then
+        printf '%s' "$host"
+        return 0
+    fi
+
+    # ${host%:*} is a no-op when there is no ':' to split on, which is
+    # exactly right for a bare IPv4 host with no port.
+    host_only="${host%:*}"
+    if [[ ! "$host_only" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]]; then
+        echo "Error: $label uses http://, which this repo only accepts to a" >&2
+        echo "private address (RFC1918, loopback, or link-local) --" >&2
+        echo "'$host_only' is not a literal IPv4 address, so it cannot be" >&2
+        echo "verified as private without DNS. Use https://, or a literal" >&2
+        echo "private IP." >&2
+        return 1
+    fi
+    for octet in "${BASH_REMATCH[@]:1}"; do
+        if (( octet > 255 )); then
+            echo "Error: $label's host '$host_only' is not a valid IPv4" >&2
+            echo "address." >&2
+            return 1
+        fi
+    done
+    o1="${BASH_REMATCH[1]}"
+    o2="${BASH_REMATCH[2]}"
+    if ! { (( o1 == 10 )) \
+        || (( o1 == 172 && o2 >= 16 && o2 <= 31 )) \
+        || (( o1 == 192 && o2 == 168 )) \
+        || (( o1 == 127 )) \
+        || (( o1 == 169 && o2 == 254 )); }; then
+        echo "Error: $label uses http:// to '$host_only', which is not a" >&2
+        echo "private address (RFC1918 10.0.0.0/8, 172.16.0.0/12," >&2
+        echo "192.168.0.0/16, loopback 127.0.0.0/8, or link-local" >&2
+        echo "169.254.0.0/16). Plain http:// to a public address would put" >&2
+        echo "a request on the open internet in cleartext -- use https://" >&2
+        echo "instead." >&2
+        return 1
+    fi
+
+    printf '%s' "$host"
+    return 0
+}
+
 # Parses K8S_PROXY_ENDPOINTS ("name=url,name=url,...") into the
 # PROXY_ENDPOINT_NAMES / PROXY_ENDPOINT_URLS arrays (module-global, not
 # local -- callers read them back after this returns). An empty spec is not
@@ -623,6 +699,7 @@ parse_proxy_endpoints() {
             echo "base URL." >&2
             return 1
         fi
+        validate_upstream_url "$url" "K8S_PROXY_ENDPOINTS entry '$name'" >/dev/null || return 1
         if [[ "$seen" == *",$name,"* ]]; then
             echo "Error: K8S_PROXY_ENDPOINTS name '$name' is registered more" >&2
             echo "than once. Each logical name must be unique." >&2
@@ -943,13 +1020,7 @@ cmd_install() {
 
     local upstream_host=""
     if [[ -n "$K8S_PROXY_UPSTREAM" ]]; then
-        if [[ "$K8S_PROXY_UPSTREAM" != https://* ]]; then
-            echo "Error: K8S_PROXY_UPSTREAM must start with https://, got" >&2
-            echo "'$K8S_PROXY_UPSTREAM'." >&2
-            exit 1
-        fi
-        upstream_host="${K8S_PROXY_UPSTREAM#https://}"
-        upstream_host="${upstream_host%%/*}"
+        upstream_host="$(validate_upstream_url "$K8S_PROXY_UPSTREAM" K8S_PROXY_UPSTREAM)" || exit 1
     fi
 
     # Fills the module-global PROXY_ENDPOINT_NAMES / PROXY_ENDPOINT_URLS
