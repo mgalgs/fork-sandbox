@@ -512,7 +512,9 @@ model that misread the task will misread it again.
 
 3. **Integrate in the real repo**: merge, rebase or cherry-pick onto the
    working branch. These prompt for permission, and that friction is the
-   point — this is the one place host state changes.
+   point — this is the one place host state changes. When the branch
+   modifies code other things already run through, see **One more pass
+   before you merge** first.
 
 4. **Run the tests on the host.** The sandbox's pass is evidence, not proof:
    it had no network, and possibly no dependencies the suite wanted.
@@ -532,6 +534,65 @@ model that misread the task will misread it again.
 
 Report each round in a few lines — branch, head commit, files touched,
 whether tests passed, what the run cost, and any caveat the session raised.
+
+## One more pass before you merge
+
+`--review-loop` reads the diff. It is good at that, and it is not the same
+thing as reading what the diff does to the code around it — the callers,
+the sibling features, the paths that already ran through the file being
+changed. The loop never opens those, because they are not in the diff, and
+neither does a green suite: the suite exercises what someone already
+thought to write down.
+
+So, as a habit before merging: when a branch **modifies** code that other
+things already run through — an engine file, a shared helper, a state
+container, a hot path — spend one more review on the branch as it will be
+merged, with the strongest model available.
+
+```bash
+fork-sandbox.sh --review-only --checkout "<branch>" \
+    --harness claude --model opus "<project-path>" "<review-handoff>"
+```
+
+Adding a new self-contained file does not earn a pass; modifying a file
+other code depends on does. `git diff --diff-filter=M HEAD.."<branch>"` is
+the whole test — when it comes back empty, or names only the branch's own
+new tests, the loop's word is enough.
+
+This neither replaces `--review-loop` nor lowers it. The loop still runs on
+every round, in the sandbox, at the user's composition; this is one pass on
+top, at the end, over the merged shape instead of over each round's diff.
+
+**Say that in the review handoff**, or the pass drifts back into reviewing
+the branch and buys a third opinion on a diff that already has two. Tell it:
+this diff has already been reviewed, twice, line by line, so re-reading it
+for the same class of defect will find the same things; what has *not* been
+looked at is the blast radius — who calls this, what assumed the old
+behaviour, and what now runs on every frame or every request. That
+instruction is the difference between the pattern working and being an
+expensive third reviewer.
+
+> Measured on one feature, 2026-08-30. The in-sandbox reviewer passed it
+> twice, with real findings each time, and this session read the diff and
+> passed it too. One `--review-only` pass on a stronger model then found
+> eight, among them an unconditional `TypeError` that killed the join for
+> every user — the new code assumed a shape of entity that much of the
+> existing world does not have. The fix round went back through the loop,
+> which passed it twice again; a second strong pass found ten more, three
+> blocking, one a regression already visible in production. The suite was
+> green for all of it. Every miss had the same shape: not a defect in the
+> diff, a defect in what the diff did to code that was not in it.
+>
+> Read that as two passes on one feature, not two cases — and the feature
+> was picked because it already had the shape above, shared per-frame code
+> and a tick loop. It says the pass earns its money on that shape. It does
+> not say how often the shape occurs, or what a pass finds on a branch that
+> lacks it.
+
+It is a habit, not a gate. Nothing enforces it and nothing should — blocking
+a push the user asked for is its own kind of wrong. It costs roughly ten
+minutes and a few dollars, so skip it when the change does not warrant that,
+and say plainly that you skipped it.
 
 ## Tracking every round
 
