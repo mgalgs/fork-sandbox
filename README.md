@@ -280,6 +280,48 @@ What to expect while it is on:
   more discipline about commits, handoffs between context windows, and
   distrust of a run's own self-report.
 
+## Scripts
+
+The porcelain, for when there is no agent in the loop. Each prints its full
+doc with `--help`. Everything not listed here — `fork-sandbox-lib.sh`, the
+pod-side k8s scripts, `sandbox-backend-*` — is plumbing.
+
+```bash
+# Launch a run, get a branch back — the engine under /fork-sandbox and
+# /sandbox-coder-mode
+fork-sandbox.sh ~/src/proj /var/tmp/claude-scratch/handoff.md
+fork-sandbox.sh --review-loop 2 --review-model opus ~/src/proj handoff.md
+fork-sandbox.sh --harness pi-local ~/src/proj handoff.md   # sealed: your model, no network
+
+# Watch it
+fork-sandbox-status.sh <run-dir>              # status at a glance
+fork-sandbox-status.sh --result <run-dir>     # the final report
+fork-sandbox-status.sh --monitor <run-dir>    # line feed for an orchestrating agent
+
+# Steer it while it runs — delivered at the session's next tool call
+fork-sandbox-say.sh <run-dir> "stop refactoring the tests; ship the fix first"
+
+# Run in a cluster: submit from anywhere, collect from anywhere
+# (fork-sandbox.sh --k8s is the one-shot submit+wait+fetch form)
+fork-sandbox-k8s.sh submit --branch sbx-fix --model sonnet ~/src/proj handoff.md
+fork-sandbox-k8s.sh fetch --branch sbx-fix ~/src/proj
+
+# The run ledger: every run appends harness, model, tokens, cost, commits
+sandbox-run-log.py list --days 14
+sandbox-run-log.py stats --by model,task.kind
+
+# The same sandbox, interactively — you at the keyboard
+claude-sandboxed ~/src/proj
+
+# lkml-mode's toolchain — /lkml-mode drives these
+lkml-status.sh myfeature                       # one screen: tally, open threads, cost
+lkml-mailbox.sh tree myfeature                 # the thread view
+lkml-round.sh myfeature --project ~/src/proj --checkout sbx-tip --base main --personas core,ci
+lkml-revise.sh myfeature --project ~/src/proj --checkout sbx-tip --version 1 --base main
+lkml-series.sh myfeature --project ~/src/proj --range main..sbx-tip   # re-roll shipped work for post-hoc review
+lkml-forklift.sh myfeature --project ~/src/proj --version 2 --onto main --dry-run
+```
+
 ## Portability
 
 The scripts above the sandbox are ordinary bash. The sandbox itself is
