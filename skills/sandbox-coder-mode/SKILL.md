@@ -1,7 +1,7 @@
 ---
 name: sandbox-coder-mode
 description: Enter a standing mode where this session stops writing code and delegates every coding and editing task to an unattended fork-sandbox run, acting as orchestrator, reviewer and integrator. Use when the user wants an expensive model to plan and review while cheap or self-hosted models do the typing, or wants unattended editing to happen somewhere that is not their own checkout. Stays on until the user ends it.
-argument-hint: [off] [--long] — no argument turns the mode on. Pass "off" (or say so in plain words) to end it. Pass "--long" to enter the long-horizon variant, for many rounds across hours — see "Entering the mode".
+argument-hint: [off] — no argument turns the mode on. Pass "off" (or say so in plain words) to end it. "--long" is accepted and changes nothing: the long-horizon discipline is the default — see "Running long".
 user-invocable: true
 ---
 
@@ -14,8 +14,9 @@ edits and for prose. It reads, plans, delegates the editing to
 `fork-sandbox` runs, reviews what comes back, and integrates it in the
 real repo.
 
-`--long` enters the same mode with a second layer of discipline for running
-many rounds across hours rather than one or two — see **Entering the mode**.
+The mode is built to run long — many rounds across hours — and the
+discipline that takes is part of the mode, not a variant: see **Running
+long**. (`--long` is accepted for compatibility and changes nothing.)
 
 Read the `fork-sandbox` skill before the first launch. It owns the
 mechanics — branch naming, the handoff document, the harnesses, monitoring,
@@ -44,7 +45,7 @@ runs on the host needs to be more permissive than it already is.
 Both reasons collapse if the harness is unpinned. Pin the model on every
 launch — see **Choosing a harness and a model**.
 
-## Stay high level (the default; `--long`)
+## Stay high level (the default)
 
 High-level operation is the mode's default, not a special tier:
 
@@ -67,16 +68,15 @@ High-level operation is the mode's default, not a special tier:
 - **"Stay high level" only needs to be said once.** The mode does not need
   to hear it again. "Exit sandbox coder mode" is the only thing that ends it.
 
-This posture is the mode's long form. `/sandbox-coder-mode --long` is the
-explicit spelling of it; it is also what plain `/sandbox-coder-mode` means.
+This posture is the default; it does not need to be asked for.
 
 ## Entering the mode
 
 Before the first launch, read `~/.config/fork-sandbox/coder-mode.env` if it
 exists — `cat` it, or use the Read tool, either is fine — and note the
 effective launch defaults; see **Choosing a harness and a model** for what
-it can override and what a missing file means. Both announcements below
-name those defaults in one clause, worded from what was actually read, not
+it can override and what a missing file means. The announcement below
+names those defaults in one clause, worded from what was actually read, not
 from the example text here, so a machine whose config overrides them
 announces what it will actually do.
 
@@ -85,28 +85,22 @@ stay high level:
 
 > Sandbox coder mode is on. I'll read, plan, review and integrate; the actual
 > editing goes to sandboxed runs on their own branches — sonnet implements,
-> opus reviews. Say "exit sandbox coder mode" when you want me writing code
-> here again.
+> opus reviews, up to two review rounds. I'll report each round with its
+> cost and flag anything unpushed. Say "exit sandbox coder mode" when you
+> want me writing code here again.
 
 Then carry on with whatever they asked for. Do not re-announce the mode on
 every turn.
 
-### `--long` — many rounds across hours
+### Running long — many rounds across hours
 
-Everything above still holds. `--long` is not a different mode, it is this
-one run at a scale where a few extra failure modes show up — the handoff
-gets skimmed instead of followed, a round finishes without committing, a
-run's own summary turns out to be wrong. None of that is visible in a single
-round; it only shows up on the third or fourth one, hours in, when nobody is
-re-reading this file. The rest of this document describes the standing mode;
-this section describes what changes when it runs long.
-
-Tell the user, in one or two lines:
-
-> Sandbox coder mode is on, long-horizon. I'll run this as tiers: I plan,
-> stay high level, and integrate; sonnet does the typing in the sandbox,
-> with opus reviewing each round ahead of me, up to two review rounds.
-> I'll report each round with its cost, and flag anything still unpushed.
+Everything above still holds at any length. The reason it is written down
+this firmly is what happens at scale: a few extra failure modes show up —
+the handoff gets skimmed instead of followed, a round finishes without
+committing, a run's own summary turns out to be wrong. None of that is
+visible in a single round; it only shows up on the third or fourth one,
+hours in, when nobody is re-reading this file. The rest of this document
+describes the mode; this section describes what running long demands.
 
 **The tiers.** Three, and the distinction between them is the whole point:
 

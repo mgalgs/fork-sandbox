@@ -324,7 +324,7 @@ typing.
 Start it, speak in goals, end it with a sentence:
 
 ```
-/sandbox-coder-mode          # or: /sandbox-coder-mode --long
+/sandbox-coder-mode
 
 fix the flaky tests
 ...
@@ -349,9 +349,9 @@ What to expect while it is on:
   restarting it.
 - Nothing is pushed until you say "push". Integrated-but-unpushed work
   accumulates on your working branch, and the session names the count.
-- `--long` is the many-rounds-across-hours variant: the same mode, with
-  more discipline about commits, handoffs between context windows, and
-  distrust of a run's own self-report.
+- Built for long horizons: commit contracts per round, handoffs between
+  context windows, and distrust of a run's own self-report are the default
+  discipline, not a flag. (`--long` is still accepted; it changes nothing.)
 
 ## Scripts
 
