@@ -124,6 +124,29 @@ contains "reply: X-Depth is parent-depth + 1" "$raw1" "X-Depth: 2"
 contains "reply: default subject prefixes Re:" "$raw1" "Subject: Re: [PATCH v1 1/2] frob: add core"
 contains "reply: carries the requested tag" "$raw1" "X-Tags: Question"
 
+printf '\n== inferred verdict positions ==\n'
+
+infer_tags() {
+    local label="$1" body="$2" expected="$3" id raw actual
+    printf '%s' "$body" > infer.txt
+    id="$($mailbox post widget-frob --from reviewer --reply-to "$patch_id" \
+        --file infer.txt --harness claude --model opus 2>/dev/null)"
+    raw="$($mailbox show widget-frob "${id:0:7}")"
+    actual="$(printf '%s\n' "$raw" | sed -n 's/^X-Tags: //p')"
+    check "$label" "$expected" "$actual"
+}
+
+infer_tags "NAK opening the body is inferred" 'NAK.' "NAK"
+infer_tags "an opening NAK sentence is inferred" 'NAK — the test is still missing.' "NAK"
+infer_tags "a final Changes-requested sentence is inferred" $'The review is complete.\n\nChanges-requested for the above gaps.' "Changes-requested"
+infer_tags "a middle Changes-requested explanation is not inferred" \
+    $'The review starts here.\n\nChanges-requested is not warranted after the fix.\n\nThe review ends here.' ""
+infer_tags "a middle Question explanation is not inferred" \
+    $'The review starts here.\n\nQuestion: is the name of the mailbox tag, not my verdict.\n\nThe review ends here.' ""
+infer_tags "a quoted NAK is not inferred" $'The review starts here.\n\n> NAK.\n\nThe review ends here.' ""
+infer_tags "opening and closing verdicts are both inferred" \
+    $'NAK.\n\nThe test is still missing.\n\nChanges-requested for the gaps.' "Changes-requested,NAK"
+
 printf '\n== open ==\n'
 
 open_out="$("$mailbox" open widget-frob)"

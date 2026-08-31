@@ -573,14 +573,27 @@ cmd_post() {
         # that never happened. Read the body's trailers. A quoted one
         # ("> Acked-by: ...") starts with ">" and does not count.
         local inferred="" t
-        for t in Reviewed-by Acked-by Changes-requested Question; do
+        for t in Reviewed-by Acked-by; do
             if grep -qE "^$t:" <<<"$body"; then
                 inferred+="${inferred:+,}$t"
             fi
         done
-        if grep -qE '^NAK([[:space:]:.!,]|$)' <<<"$body"; then
-            inferred+="${inferred:+,}NAK"
-        fi
+        # The two request tags and NAK are verdicts more than trailers,
+        # and reviewers write them as sentences: "Changes-requested for the
+        # gaps above." A verdict opens a reply or closes it, though; words
+        # in the middle of the body are ordinary prose about the review.
+        # Ignore quoted lines so a quoted verdict is not attributed to this
+        # reply. A line-initial word with a space, colon or punctuation after
+        # it is the tag; "Questionable" is not.
+        local first_verdict_line last_verdict_line
+        first_verdict_line="$(awk 'NF && $0 !~ /^[[:space:]]*>/ { print; exit }' <<<"$body")"
+        last_verdict_line="$(awk 'NF && $0 !~ /^[[:space:]]*>/ { last=$0 } END { print last }' <<<"$body")"
+        for t in Changes-requested Question NAK; do
+            if [[ "$first_verdict_line" =~ ^$t([[:space:]:.!,]|$) ||
+                  "$last_verdict_line" =~ ^$t([[:space:]:.!,]|$) ]]; then
+                inferred+="${inferred:+,}$t"
+            fi
+        done
         tags="$inferred"
     fi
 
