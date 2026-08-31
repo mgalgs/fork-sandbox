@@ -248,13 +248,15 @@ contains "the depth refusal names the limit" "$out" "30"
 
 printf '\n== rejections ==\n'
 
-out="$("$mailbox" post widget-frob --from bot --reply-to deadbeef1234 --file m.txt 2>&1)"
+out="$("$mailbox" post widget-frob --from bot --reply-to deadbeef1234 --file m.txt 2>fallback-diag.txt)"
 rc=$?
-if (( rc != 0 )); then
-    ok "refuses an unknown parent id"
+if (( rc == 0 )); then
+    ok "unknown parent id falls back without dropping the reply"
 else
-    no "refuses an unknown parent id" "it succeeded"
+    no "unknown parent id falls back without dropping the reply" "$(cat fallback-diag.txt)"
 fi
+contains "unknown parent fallback records X-Misthreaded" \
+    "$($mailbox show widget-frob "${out:0:7}" 2>/dev/null)" "X-Misthreaded: deadbeef1234"
 
 out="$("$mailbox" post widget-frob --from bot --reply-to "${patch_id:0:7}" --file m.txt --tags Bogus 2>&1)"
 rc=$?
@@ -309,6 +311,89 @@ if (( rc != 0 )); then
 else
     no "refuses --version 1 a second time" "it succeeded"
 fi
+
+printf '\n== reply-to resolver ladder ==\n'
+
+printf '%s\n' 'Ladder v1 cover' > ladder-cover.txt
+mkdir -p ladder-patches
+printf 'Subject: [PATCH 1/1] docs: Describe addenda archiving across legs\n\nFrom abcdef1234567890 Mon Sep 17 00:00:00 2001\npatch body v1\n' > ladder-patches/0001-v1.patch
+ladder_v1_cover="$($mailbox init resolver-ladder --cover ladder-cover.txt --patches ladder-patches \
+    --from author --version 1 2>/dev/null)"
+printf '%s\n' 'Ladder v2 cover' > ladder-cover2.txt
+ladder_v2_cover="$($mailbox init resolver-ladder --cover ladder-cover2.txt --patches ladder-patches \
+    --from author --version 2 2>/dev/null)"
+ladder_tree="$($mailbox tree resolver-ladder)"
+ladder_patch7="$(printf '%s\n' "$ladder_tree" | awk '/\[PATCH v2 1\/1\]/{print $1}')"
+ladder_patch_file="$(find "$LKML_MAILBOX_ROOT/resolver-ladder/cur" -name "$ladder_patch7*.msg" -print -quit)"
+ladder_patch_id="$(basename "$ladder_patch_file" .msg)"
+
+resolver_post() {
+    local label="$1" reply="$2" expected_parent="$3" id raw
+    id="$($mailbox post resolver-ladder --from reviewer --reply-to "$reply" --file infer.txt \
+        --harness claude --model opus 2>/dev/null)"
+    raw="$($mailbox show resolver-ladder "${id:0:7}")"
+    contains "$label" "$raw" "In-Reply-To: <$expected_parent@lkml.local>"
+}
+
+resolver_post "exact id resolves" "$ladder_patch_id" "$ladder_patch_id"
+resolver_post "malformed full uuid retries its first seven hex" \
+    "${ladder_patch_id:0:7}f-0000-0000-0000-000000000000" "$ladder_patch_id"
+resolver_post "commit sha resolves to its patch" abcdef1 "$ladder_patch_id"
+resolver_post "full vN i/M position resolves" 'v2 1/1' "$ladder_patch_id"
+resolver_post "bracketed vN i/M position resolves" '[PATCH v2 1/1]' "$ladder_patch_id"
+resolver_post "bare i/M position resolves in the latest version" '1/1' "$ladder_patch_id"
+resolver_post "subject resolves without its patch prefix" \
+    'Re: docs: Describe addenda archiving across legs' "$ladder_patch_id"
+resolver_post "patch filename shape resolves by its leading sha" \
+    'abcdef1-k8s-Consolidate-reviewer-fixes-for-Claude-runs' "$ladder_patch_id"
+resolver_post "an ambiguous subject resolves within the latest version" \
+    'docs: Describe addenda archiving across legs' "$ladder_patch_id"
+
+printf '\n== commit sha matching ==\n'
+
+mkdir -p sha-patches
+printf 'Subject: [PATCH 1/2] sha: owner\n\nFrom abcdef1234567890 Mon Sep 17 00:00:00 2001\nowner patch\n' \
+    > sha-patches/0001-owner.patch
+printf 'Subject: [PATCH 2/2] sha: dependent\n\nFrom deadbeef1234567890 Mon Sep 17 00:00:00 2001\ndependency note mentions abcdef1\nFrom abcdef1234567890 Mon Sep 17 00:00:00 2001\n' \
+    > sha-patches/0002-dependent.patch
+sha_cover="$($mailbox init sha-header --cover ladder-cover.txt --patches sha-patches \
+    --from author --harness claude --model opus 2>/dev/null)"
+sha_tree="$($mailbox tree sha-header)"
+sha_owner7="$(printf '%s\n' "$sha_tree" | awk '/\[PATCH v1 1\/2\]/{print $1}')"
+sha_owner_file="$(find "$LKML_MAILBOX_ROOT/sha-header/cur" -name "$sha_owner7*.msg" -print -quit)"
+sha_owner_id="$(basename "$sha_owner_file" .msg)"
+sha_reply_id="$($mailbox post sha-header --from reviewer --reply-to abcdef1 --file infer.txt \
+    --harness claude --model opus 2>/dev/null)"
+sha_reply_raw="$($mailbox show sha-header "${sha_reply_id:0:7}")"
+contains "commit sha ignores mentions in another patch" "$sha_reply_raw" \
+    "In-Reply-To: <$sha_owner_id@lkml.local>"
+
+mkdir -p ambiguous-sha-patches
+printf 'Subject: [PATCH 1/2] sha: first\n\nFrom abcdef1234567890 Mon Sep 17 00:00:00 2001\nfirst\n' \
+    > ambiguous-sha-patches/0001-first.patch
+printf 'Subject: [PATCH 2/2] sha: second\n\nFrom abcdef1234567890 Mon Sep 17 00:00:00 2001\nsecond\n' \
+    > ambiguous-sha-patches/0002-second.patch
+"$mailbox" init sha-ambiguous --cover ladder-cover.txt --patches ambiguous-sha-patches \
+    --from author --harness claude --model opus >/dev/null 2>/dev/null
+out="$($mailbox post sha-ambiguous --from reviewer --reply-to abcdef1 --file infer.txt \
+    --harness claude --model opus 2>sha-ambiguous-diag.txt)"
+rc=$?
+if (( rc != 0 )); then
+    ok "ambiguous commit sha is rejected"
+else
+    no "ambiguous commit sha is rejected" "post unexpectedly succeeded as $out"
+fi
+contains "ambiguous sha explains the conflict" "$(cat sha-ambiguous-diag.txt)" \
+    "matches more than one patch"
+
+fallback_id="$($mailbox post resolver-ladder --from reviewer --reply-to 'not-a-parent' --file infer.txt \
+    --harness claude --model opus 2>fallback-diag.txt)"
+fallback_raw="$($mailbox show resolver-ladder "${fallback_id:0:7}")"
+contains "unknown reply-to falls back under the latest cover" "$fallback_raw" \
+    "In-Reply-To: <$ladder_v2_cover@lkml.local>"
+contains "fallback preserves the original reply-to" "$fallback_raw" \
+    "X-Misthreaded: not-a-parent"
+contains "fallback warning names the fallback" "$(cat fallback-diag.txt)" "latest cover"
 
 printf '\n== attachments ==\n'
 

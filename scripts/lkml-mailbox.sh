@@ -232,7 +232,7 @@ lkml_validate_tags() {
 lkml_post_raw() {
     local series="$1" id="$2" parent_id="$3" references="$4" version="$5" depth="$6"
     local persona="$7" display_override="$8" harness="$9" model="${10}"
-    local subject="${11}" tags="${12}" body="${13}" attachments="${14:-}"
+    local subject="${11}" tags="${12}" body="${13}" attachments="${14:-}" misthreaded="${15:-}"
     local dir; dir="$(lkml_series_dir "$series")/cur"
     local display="${display_override:-$(lkml_default_display "$persona")}"
     local email="${persona}.ai@lkml.local"
@@ -255,6 +255,7 @@ lkml_post_raw() {
         printf 'X-Version: %s\n' "$version"
         printf 'X-Depth: %s\n' "$depth"
         printf 'X-Tags: %s\n' "$tags"
+        [[ -n "$misthreaded" ]] && printf 'X-Misthreaded: %s\n' "$misthreaded"
         if [[ -n "$attachments" ]]; then
             local _att_name
             local -a _att_names=()
@@ -368,45 +369,177 @@ lkml_index_of() {
 # Resolves a (possibly abbreviated) id against the currently loaded series
 # into LKML_RESOLVED, or errors -- not found, or ambiguous.
 LKML_RESOLVED=""
+LKML_FALLBACK=0
+LKML_ALLOW_FALLBACK=0
+
+# A git format-patch message starts with an mbox separator of the form
+# "From <full-sha> <date>".  Do not search the rest of the patch: prose and
+# diffs may mention another patch's sha.
+lkml_find_patch_for_sha() {
+    local sha="$1" i best_version=-1 count=0
+    LKML_SHA_MATCH=""
+    for i in "${!LKML_ID[@]}"; do
+        [[ "${LKML_SUBJECT[$i]}" =~ ^\[PATCH[[:space:]]+v[0-9]+[[:space:]]+[0-9]+/[0-9]+\] ]] || continue
+        if awk -v sha="$sha" '/^$/{ body=1; next } body && /^From / { found=($0 ~ ("^From " sha "[0-9a-f]*[[:space:]]")); exit } END { exit !found }' \
+            "${LKML_FILE[$i]}"; then
+            if (( LKML_VERSION[i] > best_version )); then
+                best_version="${LKML_VERSION[$i]}"
+                LKML_SHA_MATCH="${LKML_ID[$i]}"
+                count=1
+            elif (( LKML_VERSION[i] == best_version )); then
+                count=$(( count + 1 ))
+            fi
+        fi
+    done
+    if (( count > 1 )); then
+        echo "Error: commit sha '$sha' matches more than one patch in the latest version." >&2
+        return 2
+    fi
+    (( count == 1 ))
+}
+
 lkml_resolve_id() {
-    local prefix="$1" match="" count=0 i
+    local original="$1" prefix match count i
+    prefix="$(lkml_strip_id "$original")"
+    match=""
+    count=0
+
+    # 1. Exact id / unique id-prefix is always preferred.
     for i in "${!LKML_ID[@]}"; do
         if [[ "${LKML_ID[$i]}" == "$prefix"* ]]; then
             match="${LKML_ID[$i]}"
             count=$(( count + 1 ))
         fi
     done
-    if (( count == 0 )) && [[ "$prefix" =~ ^[0-9a-f]{7,40}$ ]]; then
-        # Not a message id, but it could be a commit sha -- which is what a
-        # reviewer that has been reading `git log` reaches for, whatever the
-        # handoff says. Every [PATCH] message body opens with format-patch's
-        # own "From <sha> <date>" line, so a sha names the patch that carries
-        # it. When several versions carry the same commit, the newest wins:
-        # that is the one under review.
-        local best_version=-1
-        for i in "${!LKML_ID[@]}"; do
-            if grep -qE "^From ${prefix}[0-9a-f]* " "${LKML_FILE[$i]}" 2>/dev/null; then
-                if (( LKML_VERSION[i] > best_version )); then
-                    best_version="${LKML_VERSION[$i]}"
-                    match="${LKML_ID[$i]}"
-                    count=1
-                fi
-            fi
-        done
-        if (( count == 1 )); then
-            echo "lkml: '$prefix' is a commit sha, not a message id; taking the patch that carries it, ${match:0:7}." >&2
-        fi
-    fi
-    if (( count == 0 )); then
-        echo "Error: no message matching id '$prefix' in this series." >&2
-        return 1
-    fi
     if (( count > 1 )); then
         echo "Error: id '$prefix' matches more than one message; use more characters." >&2
         return 1
     fi
-    LKML_RESOLVED="$match"
-    return 0
+    if (( count == 1 )); then
+        LKML_RESOLVED="$match"
+        return 0
+    fi
+
+    # 2. A malformed full uuid can still identify a message by its first 7
+    # hex characters.
+    if [[ "$prefix" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f-]+$ ]]; then
+        local uuid_prefix="${prefix:0:7}"
+        match=""; count=0
+        for i in "${!LKML_ID[@]}"; do
+            [[ "${LKML_ID[$i]}" == "$uuid_prefix"* ]] || continue
+            match="${LKML_ID[$i]}"; count=$(( count + 1 ))
+        done
+        if (( count == 1 )); then
+            echo "lkml: '$original' is a malformed uuid; using id prefix ${match:0:7}." >&2
+            LKML_RESOLVED="$match"
+            return 0
+        fi
+        if (( count > 1 )); then
+            echo "Error: uuid '$original' has an ambiguous first-7 prefix." >&2
+            return 1
+        fi
+    fi
+
+    # 3. A git sha names the patch whose format-patch separator carries it.
+    local sha=""
+    if [[ "$prefix" =~ ^[0-9a-f]{7,40}$ ]]; then
+        sha="$prefix"
+        if lkml_find_patch_for_sha "$sha"; then
+            match="$LKML_SHA_MATCH"
+            echo "lkml: '$prefix' is a commit sha; taking patch ${match:0:7}." >&2
+            LKML_RESOLVED="$match"
+            return 0
+        elif (( $? == 2 )); then
+            return 1
+        fi
+    fi
+
+    # 4. A patch position identifies that numbered patch in its version.
+    local wanted_version="" wanted_index="" wanted_total=""
+    if [[ "$prefix" =~ ^\[PATCH[[:space:]]+v([0-9]+)[[:space:]]+([0-9]+)/([0-9]+)\]$ ]]; then
+        wanted_version="${BASH_REMATCH[1]}"; wanted_index="${BASH_REMATCH[2]}"; wanted_total="${BASH_REMATCH[3]}"
+    elif [[ "$prefix" =~ ^v([0-9]+)[[:space:]]+([0-9]+)/([0-9]+)$ ]]; then
+        wanted_version="${BASH_REMATCH[1]}"; wanted_index="${BASH_REMATCH[2]}"; wanted_total="${BASH_REMATCH[3]}"
+    elif [[ "$prefix" =~ ^([0-9]+)/([0-9]+)$ ]]; then
+        wanted_index="${BASH_REMATCH[1]}"; wanted_total="${BASH_REMATCH[2]}"
+        wanted_version="-1"
+        for i in "${!LKML_VERSION[@]}"; do
+            (( LKML_VERSION[i] > wanted_version )) && wanted_version="${LKML_VERSION[$i]}"
+        done
+    fi
+    if [[ -n "$wanted_index" ]]; then
+        for i in "${!LKML_ID[@]}"; do
+            [[ "${LKML_VERSION[$i]}" == "$wanted_version" ]] || continue
+            [[ "${LKML_SUBJECT[$i]}" == "[PATCH v$wanted_version $wanted_index/$wanted_total]"* ]] || continue
+            match="${LKML_ID[$i]}"; count=$(( count + 1 ))
+        done
+        if (( count == 1 )); then
+            LKML_RESOLVED="$match"
+            return 0
+        fi
+    fi
+
+    # 5. Match an exact subject, ignoring Re: and an optional [PATCH ...]
+    # prefix. A patches-dir basename also contributes its leading sha here.
+    local candidate="$prefix" candidate_plain message_plain latest_version=-1
+    while [[ "$candidate" == "Re: "* ]]; do candidate="${candidate#Re: }"; done
+    candidate_plain="${candidate#\[PATCH }"
+    if [[ "$candidate_plain" != "$candidate" ]]; then
+        candidate_plain="${candidate_plain#*] }"
+    fi
+    for i in "${!LKML_ID[@]}"; do
+        [[ "${LKML_SUBJECT[$i]}" =~ ^\[PATCH[[:space:]]+v[0-9]+[[:space:]]+[0-9]+/[0-9]+\] ]] || continue
+        local message="${LKML_SUBJECT[$i]}"
+        while [[ "$message" == "Re: "* ]]; do message="${message#Re: }"; done
+        message_plain="${message#\[PATCH }"
+        if [[ "$message_plain" != "$message" ]]; then
+            message_plain="${message_plain#*] }"
+        fi
+        if [[ "$candidate" == "$message" || "$candidate_plain" == "$message_plain" ]]; then
+            if (( LKML_VERSION[i] > latest_version )); then
+                latest_version="${LKML_VERSION[$i]}"; match="${LKML_ID[$i]}"; count=1
+            elif (( LKML_VERSION[i] == latest_version )); then
+                count=$(( count + 1 ))
+            fi
+        fi
+    done
+    if [[ "$candidate" == */* || "$candidate" == *-* ]]; then
+        local base="${candidate##*/}" file_sha
+        if [[ "$base" =~ ^([0-9a-f]{7,40})-.+$ ]]; then
+            file_sha="${BASH_REMATCH[1]}"
+            if lkml_find_patch_for_sha "$file_sha"; then
+                LKML_RESOLVED="$LKML_SHA_MATCH"
+                return 0
+            elif (( $? == 2 )); then
+                return 1
+            fi
+        fi
+    fi
+    if (( count == 1 )); then
+        LKML_RESOLVED="$match"
+        return 0
+    fi
+    if (( count > 1 )); then
+        echo "Error: subject '$original' matches more than one message in the latest version." >&2
+        return 1
+    fi
+
+    # 6. Preserve an unresolvable reply under the latest cover rather than
+    # dropping a seat's output. The original value is made visible to humans.
+    local latest_cover="" latest_cover_version=-1
+    for i in "${!LKML_ID[@]}"; do
+        if [[ "${LKML_DEPTH[$i]}" == 0 ]] && (( LKML_VERSION[i] > latest_cover_version )); then
+            latest_cover_version="${LKML_VERSION[$i]}"; latest_cover="${LKML_ID[$i]}"
+        fi
+    done
+    if (( LKML_ALLOW_FALLBACK )) && [[ -n "$latest_cover" ]]; then
+        LKML_RESOLVED="$latest_cover"
+        LKML_FALLBACK=1
+        echo "Warning: no parent matched '$original'; posting under latest cover ${latest_cover:0:7} with X-Misthreaded." >&2
+        return 0
+    fi
+    echo "Error: no message matching id '$prefix' in this series, and no cover exists for fallback." >&2
+    return 1
 }
 
 cmd_init() {
@@ -541,6 +674,8 @@ cmd_post() {
     fi
 
     lkml_load_series "$series"
+    LKML_FALLBACK=0
+    LKML_ALLOW_FALLBACK=1
     lkml_resolve_id "$reply_to" || return 1
     local parent="$LKML_RESOLVED"
     local pi; pi="$(lkml_index_of "$parent")"
@@ -614,8 +749,10 @@ cmd_post() {
     fi
 
     local id; id="$(lkml_new_uuid)"
+    local misthreaded=""
+    (( LKML_FALLBACK )) && misthreaded="$reply_to"
     lkml_post_raw "$series" "$id" "$parent" "$newrefs" "$pversion" "$newdepth" \
-        "$from" "$display" "$harness" "$model" "$subject" "$tags" "$body" "$attach_csv"
+        "$from" "$display" "$harness" "$model" "$subject" "$tags" "$body" "$attach_csv" "$misthreaded"
     echo "fork-sandbox lkml: posted ${id:0:7} as reply to ${parent:0:7} (depth $newdepth)" >&2
     printf '%s\n' "$id"
 }
@@ -701,6 +838,7 @@ cmd_show() {
     local series="${1:?Usage: lkml-mailbox.sh show <series> <id>}"
     local id="${2:?Usage: lkml-mailbox.sh show <series> <id>}"
     lkml_load_series "$series"
+    LKML_ALLOW_FALLBACK=0
     lkml_resolve_id "$id" || return 1
     local i; i="$(lkml_index_of "$LKML_RESOLVED")"
     cat -- "${LKML_FILE[$i]}"
