@@ -60,7 +60,7 @@
 #   X-Version: <n>
 #   X-Depth: <n>
 #   X-Tags: <comma-separated subset of Reviewed-by, Acked-by, NAK,
-#            Changes-requested, Question -- empty when none apply>
+#            Tested-by, Changes-requested, Question -- empty when none apply>
 #   X-Seq: <nanosecond epoch, for ordering only>
 #
 # X-Seq is not part of the human-facing schema above and its format is not a
@@ -208,9 +208,9 @@ lkml_validate_tags() {
         t="${t#"${t%%[![:space:]]*}"}"
         t="${t%"${t##*[![:space:]]}"}"
         case "$t" in
-            Reviewed-by|Acked-by|NAK|Changes-requested|Question) ;;
+            Reviewed-by|Acked-by|Tested-by|NAK|Changes-requested|Question) ;;
             *)
-                echo "Error: unknown tag '$t'. Valid tags: Reviewed-by, Acked-by," >&2
+                echo "Error: unknown tag '$t'. Valid tags: Reviewed-by, Acked-by, Tested-by," >&2
                 echo "NAK, Changes-requested, Question." >&2
                 return 1
                 ;;
@@ -573,7 +573,7 @@ cmd_post() {
         # that never happened. Read the body's trailers. A quoted one
         # ("> Acked-by: ...") starts with ">" and does not count.
         local inferred="" t
-        for t in Reviewed-by Acked-by; do
+        for t in Reviewed-by Acked-by Tested-by; do
             if grep -qE "^$t:" <<<"$body"; then
                 inferred+="${inferred:+,}$t"
             fi

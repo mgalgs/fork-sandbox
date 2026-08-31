@@ -212,11 +212,18 @@ echo "the changelog checks out" > ack.txt
 echo "please split patch 2 first" > cr.txt
 "$mailbox" post widget-frob --from security --reply-to "${cover_id:0:7}" --file cr.txt \
     --tags Changes-requested --harness claude --model opus >/dev/null 2>&1
+# A ci seat writes its verdict as a body trailer and no --tags at all; the
+# tag has to be read out of the body like Acked-by/Reviewed-by are.
+printf 'Suite  Result\ntests/x-test.sh  4 passed, 0 failed\n\nTested-by: The CI Bot\n' > ci.txt
+"$mailbox" post widget-frob --from ci --reply-to "${cover_id:0:7}" --file ci.txt \
+    --harness pi-local --model tiny >/dev/null 2>&1
 
 tally_cover="$("$mailbox" tally widget-frob --version 1)"
 contains "tally: patch 0 is still the cover, not the reply that clobbered it" \
     "$tally_cover" "Patch 0: (cover)"
 contains "tally: patch 0 shows core's Acked-by" "$tally_cover" "Acked-by"
+contains "tally: patch 0 shows ci's Tested-by, inferred from the body trailer" \
+    "$tally_cover" "Tested-by"
 contains "tally: patch 0 also shows security's Changes-requested (not dropped)" \
     "$tally_cover" "Changes-requested"
 
