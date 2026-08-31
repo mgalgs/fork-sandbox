@@ -376,6 +376,27 @@ lkml_resolve_id() {
             count=$(( count + 1 ))
         fi
     done
+    if (( count == 0 )) && [[ "$prefix" =~ ^[0-9a-f]{7,40}$ ]]; then
+        # Not a message id, but it could be a commit sha -- which is what a
+        # reviewer that has been reading `git log` reaches for, whatever the
+        # handoff says. Every [PATCH] message body opens with format-patch's
+        # own "From <sha> <date>" line, so a sha names the patch that carries
+        # it. When several versions carry the same commit, the newest wins:
+        # that is the one under review.
+        local best_version=-1
+        for i in "${!LKML_ID[@]}"; do
+            if grep -qE "^From ${prefix}[0-9a-f]* " "${LKML_FILE[$i]}" 2>/dev/null; then
+                if (( LKML_VERSION[i] > best_version )); then
+                    best_version="${LKML_VERSION[$i]}"
+                    match="${LKML_ID[$i]}"
+                    count=1
+                fi
+            fi
+        done
+        if (( count == 1 )); then
+            echo "lkml: '$prefix' is a commit sha, not a message id; taking the patch that carries it, ${match:0:7}." >&2
+        fi
+    fi
     if (( count == 0 )); then
         echo "Error: no message matching id '$prefix' in this series." >&2
         return 1
@@ -543,6 +564,24 @@ cmd_post() {
     if [[ -z "${body//[[:space:]]/}" ]]; then
         echo "Error: post: message body is empty." >&2
         return 1
+    fi
+    if [[ -z "$tags" ]]; then
+        # No --tags. Personas write their verdict the way the list they are
+        # imitating does -- a line-initial trailer in the body, "Acked-by: The
+        # Security Reviewer", or a bare "NAK" opening a line -- rather than
+        # in an X-Tags header, and a tag the tally never sees is a review
+        # that never happened. Read the body's trailers. A quoted one
+        # ("> Acked-by: ...") starts with ">" and does not count.
+        local inferred="" t
+        for t in Reviewed-by Acked-by Changes-requested Question; do
+            if grep -qE "^$t:" <<<"$body"; then
+                inferred+="${inferred:+,}$t"
+            fi
+        done
+        if grep -qE '^NAK([[:space:]:.!,]|$)' <<<"$body"; then
+            inferred+="${inferred:+,}NAK"
+        fi
+        tags="$inferred"
     fi
 
     local subject="$subject_override"

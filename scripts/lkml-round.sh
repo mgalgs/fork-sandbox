@@ -200,9 +200,10 @@ Rules, all load-bearing:
 - **`In-Reply-To` must name a message id that already exists** in the
   thread tree above (the full id or any unambiguous prefix of it). That id
   comes from the mailbox and from nowhere else. **A git commit sha is not a
-  message id**, however much the short form looks like one, and a reply
-  naming one is rejected outright -- if you have been reading git history,
-  do not reach for what you found there. You cannot reply to a file from
+  message id**, however much the short form looks like one -- if you have
+  been reading git history, do not reach for what you found there. (The
+  mailbox will map a sha to the [PATCH] message that carries it when it
+  can, but that is a safety net, not the address.) You cannot reply to a file from
   earlier in this same batch either -- ids are only assigned once your
   reply is posted to the mailbox, which happens after this run ends, so
   nothing you write in this round has an id of its own yet.
@@ -404,6 +405,14 @@ for persona in "${!run_dir_of[@]}"; do
     fi
     clone_dir="$(jq -r '.clone_dir' "$run_dir/summary.json")"
     out_dir="$clone_dir/.git/lkml-out"
+    # A pi-local persona names no model -- the endpoint picks one -- and
+    # `post` refuses an empty --model. The run's summary records what the
+    # endpoint actually served; stamp that.
+    model="${model_of[$persona]}"
+    if [[ -z "$model" ]]; then
+        model="$(jq -r '.model // empty' "$run_dir/summary.json" 2>/dev/null || true)"
+    fi
+    [[ -n "$model" ]] || model="unknown"
     if [[ ! -d "$out_dir" ]]; then
         echo "fork-sandbox lkml-round: $persona wrote no .git/lkml-out replies." >&2
         continue
@@ -411,7 +420,7 @@ for persona in "${!run_dir_of[@]}"; do
     while IFS= read -r msgfile; do
         [[ -e "$msgfile" ]] || continue
         harvest_one "$persona" "${display_of[$persona]}" "${harness_of[$persona]}" \
-            "${model_of[$persona]}" "$msgfile" && harvested=$(( harvested + 1 ))
+            "$model" "$msgfile" && harvested=$(( harvested + 1 ))
     done < <(find "$out_dir" -maxdepth 1 -name '*.msg' | sort -V)
 done
 
