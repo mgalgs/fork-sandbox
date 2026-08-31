@@ -221,6 +221,23 @@ Rules, all load-bearing:
 - In your final report, say how many `.git/lkml-out/*.msg` files you wrote and,
   in one line each, what each one says.
 RULES
+    # The persona is the first thing in this handoff and the thread is the
+    # last, and the thread can be long. A small model anchors on what it
+    # read last: handed another reviewer's eleven confident acks, one seat
+    # adopted that reviewer's rubric, its verdicts and its signature. Say
+    # who they are once more, after everything else.
+    local who slug
+    who="$(lkml_persona_field "$persona_file" display)"
+    slug="$(lkml_persona_field "$persona_file" persona)"
+    [[ -n "$who" ]] || who="$slug"
+    printf '\n## Who you are, once more\n\n'
+    # shellcheck disable=SC2016  # the backticks are markdown, not a command
+    printf 'You are %s (`%s`). The persona text at the top of this document is\n' "$who" "$slug"
+    printf 'your brief; the thread is other people'"'"'s work. Review through your own\n'
+    printf 'focus list, not another reviewer'"'"'s rubric or section headings, and sign\n'
+    printf 'any trailer as %s -- never as another persona. Another\n' "$who"
+    printf 'reviewer'"'"'s tag is not evidence for yours; where you can disagree with\n'
+    printf 'one, that reply is worth more than one more agreement.\n'
 }
 
 cover_text="$("$mailbox" cover "$series" 2>/dev/null)" || cover_text="(no cover letter found)"
