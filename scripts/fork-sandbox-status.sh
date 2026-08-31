@@ -6,10 +6,12 @@
 # <run-dir> is the run directory fork-sandbox.sh printed when it launched.
 #
 # (no flag):    a compact status block. When the run has finished it also
-#               prints the git summary and the session's own result text.
+#               prints the git summary, the review report, and the session's
+#               own result text.
 #               Its 'inbox:' line counts the operator addenda written into
 #               the run with fork-sandbox-say.sh.
-# --result:     the session's own summary of what it did, and nothing else.
+# --result:     the review report, when present, followed by the session's
+#               own summary of what it did.
 # --json:       the run's structured summary — harness, model, branch, exit
 #               code, commits with their subjects, cost in dollars — and
 #               nothing else, so it pipes into jq. Written when the run
@@ -35,7 +37,8 @@
 # git and no other program except fork-sandbox-format.sh, and it accepts only
 # a directory under /var/tmp/claude-scratch/forks/claude-fork-sandbox.* (or the
 # legacy /var/tmp/claude-fork-sandbox.*), resolved first, holding a run.env.
-# Inside that directory it opens a fixed list of file names and
+# Inside that directory it opens a fixed list of file names (including review
+# verdicts) and
 # refuses a symlink, so it cannot be turned into a way to read an arbitrary
 # file. It never reads stdin.
 #
@@ -136,7 +139,9 @@ resolve_run_file() {
     local name="$1" path="$run_dir/$1"
     RUN_FILE_PATH=""
     case "$name" in
-        run.env|events.jsonl|sandbox.log|exit-code|summary.txt|summary.json|pid|handoff.md) ;;
+        run.env|events.jsonl|sandbox.log|exit-code|summary.txt|summary.json|pid|handoff.md|review-loop.json) ;;
+        review-verdict-[0-9]*.md)
+            [[ "$name" =~ ^review-verdict-[0-9]+\.md$ ]] || die "'$name' is not a fork-sandbox run file" ;;
         *) die "'$name' is not a fork-sandbox run file" ;;
     esac
     if [[ -L "$path" ]]; then
@@ -176,6 +181,64 @@ resolve_run_subdir() {
     RUN_SUBDIR_PATH="$path"
     return 0
 }
+
+review_verdict_path() {
+    local n path found=""
+    for path in "$run_dir"/review-verdict-*.md; do
+        [[ -L "$path" ]] && die "'$path' is a symlink; refusing to read it"
+        [[ -e "$path" ]] || continue
+        n="${path##*/review-verdict-}"; n="${n%.md}"
+        [[ "$n" =~ ^[0-9]+$ ]] || die "'$path' is not a valid review verdict name"
+        [[ -f "$path" ]] || die "'$path' is not a regular file"
+        if [[ -z "$found" || "$n" -gt "$found" ]]; then found="$n"; fi
+    done
+    [[ -n "$found" ]] || return 1
+    printf '%s/review-verdict-%s.md' "$run_dir" "$found"
+}
+
+print_report_marker() {
+    local verdict leg status
+    if verdict="$(review_verdict_path 2>/dev/null)"; then
+        leg="${verdict##*/review-verdict-}"; leg="${leg%.md}"
+        status="$(head -n 1 -- "$verdict" | tr -d '\000-\037\177' \
+            | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+        printf 'report: review leg %s (%s)\n' "$leg" "$status"
+    else
+        printf 'report: session\n'
+    fi
+}
+
+print_review_report() {
+    local verdict leg status
+    resolve_run_file review-loop.json >/dev/null || return 1
+    verdict="$(review_verdict_path 2>/dev/null)" || return 1
+    leg="${verdict##*/review-verdict-}"; leg="${leg%.md}"
+    status="$(head -n 1 -- "$verdict" | tr -d '\000-\037\177' \
+        | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    if awk '
+        $0 == "## Report" { headings++; in_report = 1; next }
+        in_report && /[^[:space:]]/ { usable = 1 }
+        END { exit !(headings == 1 && usable) }' "$verdict" 2>/dev/null; then
+        printf '== report: review leg %s (%s) ==\n' "$leg" "$status"
+        awk '/^## Report$/ { in_report=1; next } in_report { print }' "$verdict" \
+            | tr -d '\000-\010\013-\037\177'
+    else
+        printf '== report: review leg %s (%s) — verdict, no usable report section ==\n' \
+            "$leg" "$status"
+        cat -- "$verdict" | tr -d '\000-\010\013-\037\177'
+    fi
+    printf '\n'
+}
+
+# Preflight verdicts outside command substitutions so a refusal exits this
+# process rather than only the subshell used to find the latest leg.
+for _verdict in "$run_dir"/review-verdict-*.md; do
+    [[ -L "$_verdict" ]] && die "'$_verdict' is a symlink; refusing to read it"
+    [[ -e "$_verdict" ]] || continue
+    [[ "${_verdict##*/}" =~ ^review-verdict-[0-9]+\.md$ ]] \
+        || die "'$_verdict' is not a valid review verdict name"
+    [[ -f "$_verdict" ]] || die "'$_verdict' is not a regular file"
+done
 
 # How many operator addenda have been sent to this run, or nothing at all for
 # a run launched before the inbox existed. Counted rather than listed: the
@@ -408,6 +471,9 @@ print_tail_of_log() {
 
 case "$mode" in
     result)
+        if print_review_report; then
+            printf '== the session'"'"'s own account ==\n'
+        fi
         out=""
         if have_events 2>/dev/null; then
             out="$("$formatter" --result "$RUN_FILE_PATH")"
@@ -460,6 +526,9 @@ case "$mode" in
         if [[ "$state" == "done" || "$state" == "failed" ]]; then
             if summary="$(run_file_read summary.txt 2>/dev/null)"; then
                 printf '\n%s\n' "$summary"
+            fi
+            if print_review_report; then
+                printf '== the session'"'"'s own account ==\n'
             fi
             if have_events 2>/dev/null; then
                 printf '\n'
@@ -532,6 +601,9 @@ case "$mode" in
                     else
                         printf 'No summary was written, so the branch was probably never fetched.\n'
                         print_tail_of_log
+                    fi
+                    if [[ "$mode" == "monitor" ]]; then
+                        print_report_marker
                     fi
                     exit 0
                     ;;
