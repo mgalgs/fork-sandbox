@@ -21,6 +21,11 @@
 #                        commit also becomes the base the session's work is
 #                        measured against, so a session that commits nothing
 #                        still leaves the repo unchanged.
+# --review-only:         review an existing branch once, without a coding or
+#                        fix leg. Requires --checkout; use --review-base to
+#                        choose the start of the review range.
+# --review-base <ref>:   commit the review range starts from. Defaults to the
+#                        origin repo's merge-base of --checkout and HEAD.
 # --model <model>:       model or model alias for the session (e.g. fable,
 #                        opus, sonnet, or a name from aliases.conf).
 #                        Required with --harness pi, where it names an
@@ -212,6 +217,7 @@
 # The loop stops on the first of four things:
 #
 #   approved       the review leg said APPROVED. The usual good ending.
+#   findings       review-only reported findings; there is no fix leg.
 #   cap            N iterations ran and the last review still had findings.
 #   no-progress    a fix leg left the branch head where it found it. The same
 #                  model reviews its own work here, so it can argue with
@@ -1059,6 +1065,9 @@ task_meta=""
 context_ro=""
 review_loop_arg=""
 review_loop_cap=0
+review_only=false
+mode=run
+review_base_ref=""
 foreground=false
 keep_session=false
 no_services=false
@@ -1086,6 +1095,14 @@ while [[ "${1:-}" == -* ]]; do
             ;;
         --checkout)
             checkout_ref="${2:?--checkout requires a ref}"
+            shift 2
+            ;;
+        --review-only)
+            review_only=true
+            shift
+            ;;
+        --review-base)
+            review_base_ref="${2:?--review-base requires a ref}"
             shift 2
             ;;
         --model)
@@ -1198,6 +1215,27 @@ done
 
 project_path="${1:?Usage: fork-sandbox.sh [options] <project-path> <handoff-file>}"
 handoff_file="${2:?Usage: fork-sandbox.sh [options] <project-path> <handoff-file>}"
+
+if [[ "$review_only" == true ]]; then
+    mode=review-only
+    if [[ -z "$checkout_ref" ]]; then
+        echo "Error: --review-only requires --checkout <ref>." >&2
+        exit 1
+    fi
+    if [[ -n "$review_model" || "$review_harness_given" == true || -n "$review_loop_arg" ]]; then
+        echo "Error: --review-only runs one review leg; name its harness and model" >&2
+        echo "with --harness/--model." >&2
+        exit 1
+    fi
+    if [[ "$refresh_at_given" == true ]]; then
+        echo "Error: --refresh-at is not supported with --review-only." >&2
+        exit 1
+    fi
+    if [[ "$k8s_mode" == true ]]; then
+        echo "Error: --review-only is not supported with --k8s." >&2
+        exit 1
+    fi
+fi
 
 # Split only the harness prefix. pi model ids are commonly provider/model, so
 # splitting every slash (or the last one) would corrupt the model that most
@@ -1634,6 +1672,9 @@ if [[ "$review_harness_given" == true && "$review_loop_cap" == "0" ]]; then
     echo "--review-loop." >&2
     exit 1
 fi
+if [[ "$review_only" == true ]]; then
+    review_loop_cap=1
+fi
 
 # --harness pi-local is sealed: no network at all, which is the property a
 # caller picks it for. If its review legs ran under a networked harness,
@@ -1869,6 +1910,33 @@ if [[ -d "$prompt_overlay_dir" ]]; then
     fi
 fi
 
+review_only_checkout_sha=""
+review_only_base_sha=""
+if [[ "$review_only" == true ]]; then
+    if [[ ! -d "$project_path" ]]; then
+        echo "Error: project path '$project_path' is not a directory" >&2
+        exit 1
+    fi
+    review_only_origin_repo="$(fs_repo_toplevel "$project_path")"
+    if ! review_only_checkout_sha="$(cd "$review_only_origin_repo" && git rev-parse --verify --quiet "$checkout_ref^{commit}")"; then
+        echo "Error: --checkout '$checkout_ref' does not name a commit in $review_only_origin_repo." >&2
+        exit 1
+    fi
+    if [[ -n "$review_base_ref" ]]; then
+        if ! review_only_base_sha="$(cd "$review_only_origin_repo" && git rev-parse --verify --quiet "$review_base_ref^{commit}")"; then
+            echo "Error: --review-base '$review_base_ref' does not name a commit in $review_only_origin_repo." >&2
+            exit 1
+        fi
+    elif ! review_only_base_sha="$(cd "$review_only_origin_repo" && git merge-base "$checkout_ref" HEAD)"; then
+        echo "Error: could not compute the merge-base of '$checkout_ref' and HEAD." >&2
+        exit 1
+    fi
+    if [[ "$review_only_base_sha" == "$review_only_checkout_sha" ]]; then
+        echo "Error: nothing to review between $review_only_base_sha and $checkout_ref" >&2
+        exit 1
+    fi
+fi
+
 if [[ "$dry_run" == true ]]; then
     printf 'harness=%s\nmodel=%s\n' "$harness" "$model"
     [[ -z "$review_model" ]] || printf 'review_model=%s\n' "$review_model"
@@ -1883,6 +1951,12 @@ if [[ "$dry_run" == true ]]; then
     printf 'prompt_overlay_rev=%s\n' "$prompt_overlay_rev"
     printf 'refresh_at=%s\nrefresh_max=%s\n' "$refresh_at" "$refresh_max"
     printf 'outbox_max_bytes=%s\n' "$outbox_max_bytes"
+    if [[ "$review_only" == true ]]; then
+        printf 'mode=review-only\ncheckout=%s\nbase_sha=%s\nrange=%s...%s\n' \
+            "$checkout_ref" "$review_only_base_sha" "$review_only_base_sha" "$checkout_ref"
+    else
+        printf 'mode=run\n'
+    fi
     if (( refresh_enabled )); then
         printf 'refresh_context_window=%s\nrefresh_threshold_tokens=%s\n' \
             "$refresh_context_window" "$refresh_threshold_tokens"
@@ -2508,6 +2582,9 @@ if [[ -n "$task_meta" ]]; then
         exit 1
     fi
 fi
+if [[ "$review_only" == true && -z "$task_meta" ]]; then
+    task_meta='{"kind":"review"}'
+fi
 
 origin_repo="$(fs_repo_toplevel "$project_path")"
 branch="${branch:-sandbox-$(date +%Y%m%d-%H%M%S)}"
@@ -2522,6 +2599,7 @@ fs_check_branch_free "$origin_repo" "$branch"
 # here, in the user's own repo: a clone carries refs/heads and refs/tags only,
 # so a commit held under a private ref namespace has no name inside it.
 # A repo with no commits has nothing to clone and nothing to branch from.
+checkout_sha=""
 if [[ -n "$checkout_ref" ]]; then
     if ! base_sha="$(cd "$origin_repo" && \
         git rev-parse --verify --quiet "$checkout_ref^{commit}")"; then
@@ -2529,6 +2607,24 @@ if [[ -n "$checkout_ref" ]]; then
         echo "$origin_repo. The ref is resolved there, not in the clone, so" >&2
         echo "fetch it into that repo first." >&2
         exit 1
+    fi
+    checkout_sha="$base_sha"
+    if [[ "$review_only" == true ]]; then
+        if [[ -n "$review_base_ref" ]]; then
+            if ! base_sha="$(cd "$origin_repo" && git rev-parse --verify --quiet "$review_base_ref^{commit}")"; then
+                echo "Error: --review-base '$review_base_ref' does not name a commit in $origin_repo." >&2
+                exit 1
+            fi
+        else
+            if ! base_sha="$(cd "$origin_repo" && git merge-base "$checkout_ref" HEAD)"; then
+                echo "Error: could not compute the merge-base of '$checkout_ref' and HEAD." >&2
+                exit 1
+            fi
+        fi
+        if [[ "$base_sha" == "$checkout_sha" ]]; then
+            echo "Error: nothing to review between $base_sha and $checkout_ref" >&2
+            exit 1
+        fi
     fi
 elif ! base_sha="$(cd "$origin_repo" && git rev-parse HEAD 2>/dev/null)"; then
     echo "Error: '$origin_repo' has no commits yet, so there is nothing to" >&2
@@ -2593,7 +2689,7 @@ echo "Cloning '$origin_repo' for the sandbox..." >&2
 # Take the run dir back out if the clone fails, so a bad branch name does
 # not leave an empty directory behind under the scratch root.
 if ! fs_make_clone "$origin_repo" "$branch" "$clone_dir" \
-    "${checkout_ref:+$base_sha}"; then
+    "${checkout_ref:+${checkout_sha:-$base_sha}}"; then
     rm -rf "$run_dir"
     exit 1
 fi
@@ -3410,6 +3506,11 @@ started_at="$(date +%s)"
     printf 'review_harness=%s\n' "$review_harness"
     printf 'session=%s\n' "$session_name"
     printf 'review_loop_cap=%s\n' "$review_loop_cap"
+    if [[ "$review_only" == true ]]; then
+        printf 'mode=review-only\n'
+    else
+        printf 'mode=run\n'
+    fi
     printf 'outbox_max_bytes=%s\n' "$outbox_max_bytes"
     printf 'started_at=%s\n' "$started_at"
 } > "$run_dir/run.env"
@@ -3480,6 +3581,7 @@ started_at="$(date +%s)"
     printf 'pi_session_dir=%q\n' "$pi_session_dir"
     printf 'rev_pi_session_dir=%q\n' "$rev_pi_session_dir"
     printf 'review_loop_cap=%q\n' "$review_loop_cap"
+    printf 'mode=%q\n' "$mode"
     printf 'review_prompt=%q\n' "$review_prompt"
     printf 'fix_prompt_header=%q\n' "$fix_prompt_header"
     printf 'review_verdict_file=%q\n' "$review_verdict_file"
@@ -3747,6 +3849,7 @@ fi
 # and the formatter renders it live when there is one to render. The
 # sandbox's own messages go to stderr, which is copied to the log and shown
 # here too.
+if [[ "$mode" != "review-only" ]]; then
 if [[ -n "$formatter" ]]; then
     "${sandbox_cmd[@]}" < "$handoff" \
         2> >(tee -a "$sandbox_log" >&2) \
@@ -3773,6 +3876,7 @@ fs_archive_inbox 1 "$harness" "$rc"
 # continuation leg can still change $rc below.
 if [[ "$review_loop_cap" == "0" && "$refresh_enabled" == "0" ]]; then
     printf '%s\n' "$rc" > "$run_dir/exit-code"
+fi
 fi
 
 # The credential and the services are NOT cleaned up here. --review-loop can
@@ -4376,6 +4480,7 @@ close_iter() {
 run_leg() {
     local kind="$1" n="$2" prompt="$3"
     local leg_events="$run_dir/events-$kind-$n.jsonl"
+    [[ "$mode" == "review-only" ]] && leg_events="$run_dir/events.jsonl"
     local leg_session="" leg_session_copy="" idx
     local -a cmd=("${sandbox_cmd[@]}")
     # A review leg's own harness (--review-harness, when given -- the
@@ -4661,6 +4766,12 @@ if [[ "$review_loop_cap" != "0" && -n "$review_prompt" ]]; then
             "$loop_i" "$it_findings"
         save_review_loop
 
+        if [[ "$mode" == "review-only" ]]; then
+            review_loop_ended="findings"
+            close_iter
+            break
+        fi
+
         # The fix leg's prompt: the generated header, then the verdict. Built
         # as a file and redirected -- the verdict has no size limit, and one
         # argv string is capped at 128KB.
@@ -4707,6 +4818,26 @@ if [[ "$review_loop_cap" != "0" && -n "$review_prompt" ]]; then
     [[ -n "$review_loop_ended" ]] || review_loop_ended="cap"
     save_review_loop
     printf 'fork-sandbox: review loop ended: %s\n' "$review_loop_ended"
+    if [[ "$mode" == "review-only" ]]; then
+        case "$review_loop_ended" in
+            approved) printf 'fork-sandbox: review-only: APPROVED\n' ;;
+            findings) printf 'fork-sandbox: review-only: FINDINGS (%s cited)\n' "$it_findings" ;;
+        esac
+        printf 'fork-sandbox: review verdict: %s\n' "$run_dir/review-verdict-1.md"
+    fi
+fi
+
+# In review-only mode the sole leg is the review leg, so its accounting is the
+# run accounting as well. This also makes cost_usd and total_cost_usd agree.
+if [[ "$mode" == "review-only" ]]; then
+    run_cost="$leg_cost"
+    run_usage="$leg_usage"
+    run_error="$leg_error"
+    if [[ "$run_cost" =~ ^-?[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?$ ]]; then
+        run_cost_fmt="$(printf '%.6f' "$run_cost")"
+    else
+        run_cost_fmt=""
+    fi
 fi
 
 # The other half of the deferral above: for a --review-loop or --refresh-at
@@ -4790,7 +4921,9 @@ fi
 # nowhere -- codex prices none of them -- leaves the total null rather than
 # low. cost_usd keeps meaning the implement leg alone.
 total_cost_fmt=""
-if [[ -n "$run_cost_fmt" && "$loop_cost_unknown" != "1" ]]; then
+if [[ "$mode" == "review-only" ]]; then
+    total_cost_fmt="$run_cost_fmt"
+elif [[ -n "$run_cost_fmt" && "$loop_cost_unknown" != "1" ]]; then
     total_cost_raw="$(jq -n --argjson a "$run_cost_fmt" --argjson b "$loop_cost_sum" \
         '(($a + $b) * 1000000 | round) / 1000000' 2>/dev/null)"
     if [[ "$total_cost_raw" =~ ^-?[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?$ ]]; then
@@ -4858,6 +4991,7 @@ fi
 {
     printf '== fork-sandbox summary ==\n'
     printf 'branch:   %s\n' "$branch"
+    printf 'mode:     %s\n' "$mode"
     printf 'origin:   %s\n' "$origin_repo"
     printf 'clone:    %s\n' "$clone_dir"
     printf 'exit:     %s\n' "$rc"
@@ -4960,6 +5094,7 @@ ended_at="$(date +%s)"
 
 jq -n \
     --argjson version 1 \
+    --arg mode "$mode" \
     --arg harness "$harness" \
     --arg harness_version "$harness_version" \
     --arg usage_source "$usage_source" \
@@ -4989,6 +5124,7 @@ jq -n \
     --argjson outbox_max_bytes "$outbox_max_bytes" \
     '{
         version: $version,
+        mode: $mode,
         harness: $harness,
         harness_version: (if $harness_version == "" then null else $harness_version end),
         model: (if $model == "" then null else $model end),
