@@ -1,7 +1,7 @@
 ---
 name: lkml-mode
-description: Review a patch series the way the Linux kernel mailing list does -- a cover letter and patches posted to a shared mailbox, a panel of AI-persona reviewers (always including a Linus Torvalds caricature) replying in threads from sandboxed runs, the author posting v2, v3... with a changelog answering review, converging when the right reviewers have signed off and no NAK stands. Use for a change substantial enough to want several independent, adversarial voices and an iterated record of what they asked for and why it changed -- not for a small diff you can review yourself in one pass.
-argument-hint: <series> <branch> [--personas <p1,p2,...>] — <series> is a short kebab-case slug for the mailbox; <branch> is the branch to post as v1 (format-patch against its merge-base with main, or state another base explicitly). Default personas are linus plus whichever reviewer archetypes fit the change; always include linus.
+description: Review a patch series the way the Linux kernel mailing list does -- a cover letter and patches posted to a shared mailbox, a panel of AI-persona reviewers (always including a core reviewer with the highest bar) replying in threads from sandboxed runs, the author posting v2, v3... with a changelog answering review, converging when the right reviewers have signed off and no NAK stands. Use for a change substantial enough to want several independent, adversarial voices and an iterated record of what they asked for and why it changed -- not for a small diff you can review yourself in one pass.
+argument-hint: <series> <branch> [--personas <p1,p2,...>] — <series> is a short kebab-case slug for the mailbox; <branch> is the branch to post as v1 (format-patch against its merge-base with main, or state another base explicitly). Default personas are core plus whichever reviewer archetypes fit the change; always include core.
 user-invocable: true
 ---
 
@@ -81,15 +81,17 @@ scheduling, not reading, and the reviewers' job is reading.
 
 ## Building a panel
 
-**`linus` is on every panel, whatever the series.** It is a caricature of
-a public reviewing style — blunt, allergic to cleverness, focused on
-whether the changelog tells the truth — explicitly an AI persona in a
-sandbox, never claiming to be the person. `skills/lkml-mode/personas/`
-ships it plus five general-purpose reviewer archetypes
-(`architecture`, `security`, `tests`, `docs`, `newcomer`) and the
-`author` persona that revises the series.
+**`core` is on every panel, whatever the series.** It is the reviewer with
+the highest bar: it reads the whole system rather than the diff, traces
+the error paths as carefully as the fast path, treats every new interface
+as permanent, checks the changelog against the diff, and rants only when
+a patch has earned it. It is modeled on a standard, not on a person —
+explicitly an AI persona in a sandbox that signs as itself and never as
+any human. `skills/lkml-mode/personas/` ships it plus five
+general-purpose reviewer archetypes (`architecture`, `security`, `tests`,
+`docs`, `newcomer`) and the `author` persona that revises the series.
 
-Beyond Linus, **build a panel tailored to the series** rather than
+Beyond `core`, **build a panel tailored to the series** rather than
 launching all five archetypes by default. A kernel-style locking change
 wants a locking-literate reviewer; a kids' game wants a child-safety
 reviewer; a data-pipeline change wants someone who has actually operated
@@ -107,7 +109,7 @@ do not vary it round to round.
    `git format-patch <base>..<branch>` output directory and the cover
    letter is either something you write yourself or something you ask the
    `author` persona to write in its own short sandboxed run first.
-2. **Build the panel** (always Linus; see above). Round 1: every persona
+2. **Build the panel** (always `core`; see above). Round 1: every persona
    reviews the whole series — `lkml-round.sh <series> --project <path>
    --checkout <branch> --base <base-ref> --personas <list>` with no
    `--reply-to`.
@@ -133,7 +135,7 @@ do not vary it round to round.
    handed vN+1's patches in its handoff, and every comment it produces is
    against a version that has already been superseded.
 5. **Converged** when every patch in the current version has
-   `Reviewed-by` or `Acked-by` from Linus AND from at least one other
+   `Reviewed-by` or `Acked-by` from `core` AND from at least one other
    reviewer (`lkml-mailbox.sh tally`), no `NAK` stands unanswered, and
    `open` is empty. At that point the series is mergeable — **the operator
    merges it**, not this session; see "What this is not" below.

@@ -107,14 +107,14 @@ patch_id="$(printf '%s\n' "$tree_out" | awk 'NR==3{print $1}')"
 printf '\n== post ==\n'
 
 echo "why not use a linked list here?" > q.txt
-r1="$("$mailbox" post widget-frob --from linus --display "Linus Torvalds" \
+r1="$("$mailbox" post widget-frob --from core --display "The Core Reviewer" \
     --reply-to "$patch_id" --file q.txt --tags Question \
     --harness claude --model opus 2>diag.txt)"
 rc=$?
 check "post exits 0" "0" "$rc"
 
 raw1="$("$mailbox" show widget-frob "${r1:0:7}")"
-contains "reply: From carries display name and (AI persona)" "$raw1" "Linus Torvalds (AI persona)"
+contains "reply: From carries display name and (AI persona)" "$raw1" "The Core Reviewer (AI persona)"
 # tree only ever shows the short id7, so these checks match it as a prefix
 # of the full uuid rather than expecting an exact match.
 contains "reply: In-Reply-To names the parent" "$raw1" "In-Reply-To: <$patch_id"
@@ -165,12 +165,12 @@ esac
 printf '\n== tally ==\n'
 
 echo "looks fine now" > rb.txt
-"$mailbox" post widget-frob --from linus --reply-to "${r2:0:7}" --file rb.txt \
+"$mailbox" post widget-frob --from core --reply-to "${r2:0:7}" --file rb.txt \
     --tags Reviewed-by --harness claude --model opus >/dev/null 2>&1
 
 tally_out="$("$mailbox" tally widget-frob --version 1)"
-contains "tally: patch 1 shows linus's Reviewed-by" "$tally_out" "Reviewed-by"
-contains "tally: names the reviewing persona" "$tally_out" "linus"
+contains "tally: patch 1 shows core's Reviewed-by" "$tally_out" "Reviewed-by"
+contains "tally: names the reviewing persona" "$tally_out" "core"
 
 # A later NAK from the same reviewer supersedes the earlier Reviewed-by --
 # tally reports the LATEST tag per persona per patch, not every tag ever
@@ -178,21 +178,21 @@ contains "tally: names the reviewing persona" "$tally_out" "linus"
 # output would also pass if the superseded Reviewed-by were still counted
 # alongside it (both tags surviving would make convergence look stuck
 # forever, the exact bug this rule exists to prevent) -- so pull out
-# linus's own tally line for patch 1 and check it is EXACTLY "NAK".
+# core's own tally line for patch 1 and check it is EXACTLY "NAK".
 echo "actually this leaks the buffer on the error path" > nak.txt
-"$mailbox" post widget-frob --from linus --reply-to "${r2:0:7}" --file nak.txt \
+"$mailbox" post widget-frob --from core --reply-to "${r2:0:7}" --file nak.txt \
     --tags NAK --harness claude --model opus >/dev/null 2>&1
 tally_out2="$("$mailbox" tally widget-frob --version 1)"
 # Scoped to the "Patch 1:" block specifically, not because patch 0 would
-# roll it up (a bare "line starting with linus" grep over the whole tally
+# roll it up (a bare "line starting with core" grep over the whole tally
 # is exactly the bug the next check guards against) but to pin the format.
-linus_tag="$(printf '%s\n' "$tally_out2" | awk '/^Patch 1:/{f=1;next} /^Patch [0-9]+:/{f=0} f && $1=="linus"{print $2}')"
-check "tally: a later NAK supersedes an earlier Reviewed-by (not both)" "NAK" "$linus_tag"
+core_tag="$(printf '%s\n' "$tally_out2" | awk '/^Patch 1:/{f=1;next} /^Patch [0-9]+:/{f=0} f && $1=="core"{print $2}')"
+check "tally: a later NAK supersedes an earlier Reviewed-by (not both)" "NAK" "$core_tag"
 
 # Nobody has said a word about the cover itself -- every tag so far landed
 # on patch 1 or patch 2's own threads. Patch 0's subtree walk used to reach
 # every patch's descendants too (the cover is their common ancestor), so
-# this exact scenario used to print "Patch 0: (cover) ... linus NAK" for a
+# this exact scenario used to print "Patch 0: (cover) ... core NAK" for a
 # NAK that was actually about patch 1.
 contains "tally: patch 0 (cover) is NOT contaminated by patch 1's NAK" \
     "$tally_out2" "Patch 0: (cover)"
@@ -207,7 +207,7 @@ printf '\n== tally: direct replies to the cover ==\n'
 # cover's own tally entry with the reply's id, silently dropping every
 # OTHER direct reply to the cover from the count.
 echo "the changelog checks out" > ack.txt
-"$mailbox" post widget-frob --from linus --reply-to "${cover_id:0:7}" --file ack.txt \
+"$mailbox" post widget-frob --from core --reply-to "${cover_id:0:7}" --file ack.txt \
     --tags Acked-by --harness claude --model opus >/dev/null 2>&1
 echo "please split patch 2 first" > cr.txt
 "$mailbox" post widget-frob --from security --reply-to "${cover_id:0:7}" --file cr.txt \
@@ -216,7 +216,7 @@ echo "please split patch 2 first" > cr.txt
 tally_cover="$("$mailbox" tally widget-frob --version 1)"
 contains "tally: patch 0 is still the cover, not the reply that clobbered it" \
     "$tally_cover" "Patch 0: (cover)"
-contains "tally: patch 0 shows linus's Acked-by" "$tally_cover" "Acked-by"
+contains "tally: patch 0 shows core's Acked-by" "$tally_cover" "Acked-by"
 contains "tally: patch 0 also shows security's Changes-requested (not dropped)" \
     "$tally_cover" "Changes-requested"
 
@@ -322,7 +322,7 @@ contains "tree marks the attachment-carrying cover with 📎" \
     "$(printf '%s\n' "$tree_att" | grep "${attach_cover_id:0:7}")" "📎"
 
 echo "see the attached log" > note.txt
-r_att="$("$mailbox" post widget-frob --from linus --reply-to "${attach_cover_id:0:7}" \
+r_att="$("$mailbox" post widget-frob --from core --reply-to "${attach_cover_id:0:7}" \
     --file note.txt --attach shot.png --harness claude --model opus 2>diag.txt)"
 rc=$?
 check "post --attach exits 0" "0" "$rc"
@@ -331,7 +331,7 @@ contains "a reply's attachment also gets an X-Attachment header" "$raw_reply_att
 
 big="$(mktemp)"; tmpdirs+=("$big")
 dd if=/dev/zero of="$big" bs=1M count=5 >/dev/null 2>&1
-out="$("$mailbox" post widget-frob --from linus --reply-to "${attach_cover_id:0:7}" \
+out="$("$mailbox" post widget-frob --from core --reply-to "${attach_cover_id:0:7}" \
     --file note.txt --attach "$big" --harness claude --model opus 2>&1)"
 rc=$?
 if (( rc != 0 )); then ok "refuses an attachment over the 4 MiB cap"; else no "refuses an attachment over the 4 MiB cap" "it succeeded"; fi
@@ -339,7 +339,7 @@ contains "the cap refusal names the byte cap" "$out" "4194304"
 
 echo "perf numbers" > "perf,before.txt"
 echo "plain data" > plain.txt
-out="$("$mailbox" post widget-frob --from linus --reply-to "${attach_cover_id:0:7}" \
+out="$("$mailbox" post widget-frob --from core --reply-to "${attach_cover_id:0:7}" \
     --file note.txt --attach "perf,before.txt" --attach plain.txt \
     --harness claude --model opus 2>diag.txt)"
 rc=$?
@@ -352,7 +352,7 @@ check "the comma-basename file actually landed on disk" "1" \
 
 echo "different content" > shot2.png
 mv shot2.png shot.png
-out="$("$mailbox" post widget-frob --from linus --reply-to "${attach_cover_id:0:7}" \
+out="$("$mailbox" post widget-frob --from core --reply-to "${attach_cover_id:0:7}" \
     --file note.txt --attach shot.png --harness claude --model opus 2>&1)"
 rc=$?
 if (( rc != 0 )); then

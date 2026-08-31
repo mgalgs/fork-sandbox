@@ -231,8 +231,8 @@ For the session that orchestrates runs:
 - **`fork-sandbox`** — one run at a time: launch it, watch it, read what
   comes back.
 - **`lkml-mode`** — review a patch series the way the Linux kernel mailing
-  list does: a shared mailbox, a panel of AI-persona reviewers (a Linus
-  Torvalds caricature always among them) replying in threads from their own
+  list does: a shared mailbox, a panel of AI-persona reviewers (a core reviewer
+  with the highest bar always among them) replying in threads from their own
   sandboxed runs, an author persona posting v2, v3... until the right
   reviewers sign off and no NAK stands. For a change that deserves several
   adversarial voices — not a diff you can read yourself.

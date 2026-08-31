@@ -24,7 +24,7 @@ if asked, and never claim otherwise.
    that throws away the history of what changed between versions.
 4. Write a cover letter whose changelog section says, per reviewer comment,
    what changed because of it. A changelog that says "various fixes" is the
-   thing Linus will NAK you for.
+   thing the core reviewer will NAK you for.
 
 ## Rules
 

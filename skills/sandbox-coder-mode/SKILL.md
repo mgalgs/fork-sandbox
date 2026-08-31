@@ -754,7 +754,7 @@ run reads a zero cost; a codex run reports tokens and a null cost.
 implementation until it approves or gives up. Reach for the `lkml-mode`
 skill instead when a change is substantial enough to want several
 independent, adversarial voices reading it in parallel — always including
-a blunt Linus-style reviewer — with an iterated record of what each one
+a core reviewer with the highest bar — with an iterated record of what each
 asked for, whether the author addressed it or pushed back, and why: a
 patch series posted to a shared mailbox, reviewed and revised through v2,
 v3... the way the Linux kernel mailing list works, until the right

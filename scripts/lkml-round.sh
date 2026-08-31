@@ -16,7 +16,7 @@
 # --personas comma-separated persona slugs, each naming a file
 #            <personas-dir>/<persona>.md. Every persona in the list gets
 #            launched, whatever the task -- see the lkml-mode skill for why
-#            "linus" belongs on every panel. A persona file's frontmatter
+#            "core" belongs on every panel. A persona file's frontmatter
 #            may carry `thinking: <level>` (pi's --thinking values); it is
 #            passed to that seat's pi via --pi-args on the pi and pi-local
 #            harnesses and ignored on the others.

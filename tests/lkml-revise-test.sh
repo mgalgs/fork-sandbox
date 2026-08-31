@@ -98,7 +98,7 @@ printf 'Subject: [PATCH 1/1] frob: add core\n\ndiff\n' > patches/0001.patch
     --harness claude --model opus >/dev/null 2>&1
 patch_id="$("$mailbox" tree widget-frob | awk 'NR==3{print $1}')"
 echo "please fix the return value" > q.txt
-r1="$("$mailbox" post widget-frob --from linus --reply-to "$patch_id" --file q.txt \
+r1="$("$mailbox" post widget-frob --from core --reply-to "$patch_id" --file q.txt \
     --tags Changes-requested --harness claude --model opus 2>/dev/null)"
 
 stub_bin="$(mktemp -d)"; tmpdirs+=("$stub_bin")
@@ -118,7 +118,7 @@ mkdir -p "\$clone_dir/.git/lkml-out"
 STUB
     if [[ "$write_cover" == 1 ]]; then
         cat >> "$stub_bin/fork-sandbox.sh" <<STUB
-printf 'Add the return-value fix\n\nv2: fixed frob per linus.\n' > "\$clone_dir/.git/lkml-out/cover-letter.md"
+printf 'Add the return-value fix\n\nv2: fixed frob per core.\n' > "\$clone_dir/.git/lkml-out/cover-letter.md"
 STUB
     fi
     if [[ "$write_reply" == 1 ]]; then
@@ -151,7 +151,7 @@ contains "v2 shows up in the tree" "$tree_out" "=== v2 ==="
 contains "v2's patch carries the real repo's commit message" "$tree_out" "frob: fix return value"
 contains "v2 is posted as the whole series (v1's commit plus this round's fixup), not just the fixup alone" \
     "$tree_out" "PATCH v2 2/2"
-contains "linus's Changes-requested was answered with Reviewed-by" \
+contains "core's Changes-requested was answered with Reviewed-by" \
     "$("$mailbox" tree widget-frob)" "Reviewed-by"
 
 printf '\n== stop condition: commits == 0 ==\n'

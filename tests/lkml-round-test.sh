@@ -91,14 +91,14 @@ clone_dir="$run_dir/clone/proj"
 mkdir -p "$clone_dir/.git/lkml-out"
 
 case "$persona" in
-    linus)
+    core)
         printf 'In-Reply-To: %s\nX-Tags: Reviewed-by\n\nLooks fine now.\n' "$STUB_REPLY_TO" \
             > "$clone_dir/.git/lkml-out/1.msg"
         printf 'Subject: a stray note\n\nThis one forgot In-Reply-To on purpose.\n' \
             > "$clone_dir/.git/lkml-out/2.msg"
         ;;
     security)
-        # RFC-822 bracket form, not the bare id linus's reply above uses --
+        # RFC-822 bracket form, not the bare id core's reply above uses --
         # exercises harvest_one's In-Reply-To stripping (lkml_round_strip_id).
         printf 'In-Reply-To: %s\nX-Tags: Question\n\nWhat about the empty-input case?\n' "$STUB_REPLY_TO_BRACKETED" \
             > "$clone_dir/.git/lkml-out/1.msg"
@@ -116,22 +116,22 @@ chmod +x "$stub_bin/fork-sandbox.sh"
 out="$(PATH="$stub_bin:$PATH" STUB_CAPTURE_DIR="$capture_dir" STUB_RUN_PREFIX="$run_prefix_dir" \
     STUB_REPLY_TO="$patch_id" STUB_REPLY_TO_BRACKETED="$patch_id_bracketed" \
     "$round" widget-frob --project /nonexistent/project --checkout somebranch \
-    --personas linus,security --reply-to "$patch_id" 2>&1)"
+    --personas core,security --reply-to "$patch_id" 2>&1)"
 rc=$?
 check_rc() { if (( rc == 0 )); then ok "$1"; else no "$1" "exit $rc: $out"; fi; }
 check_rc "lkml-round.sh exits 0 against the stub"
 
 printf '\n== task-meta ==\n'
-if [[ -f "$capture_dir/linus.task-meta.json" ]]; then
-    ok "linus's launch captured a --task-meta"
-    contains "linus's task-meta carries the persona tag" \
-        "$(cat "$capture_dir/linus.task-meta.json")" '"linus"'
-    contains "linus's task-meta carries the series tag" \
-        "$(cat "$capture_dir/linus.task-meta.json")" '"widget-frob"'
-    contains "linus's task-meta names kind review" \
-        "$(cat "$capture_dir/linus.task-meta.json")" '"kind":"review"'
+if [[ -f "$capture_dir/core.task-meta.json" ]]; then
+    ok "core's launch captured a --task-meta"
+    contains "core's task-meta carries the persona tag" \
+        "$(cat "$capture_dir/core.task-meta.json")" '"core"'
+    contains "core's task-meta carries the series tag" \
+        "$(cat "$capture_dir/core.task-meta.json")" '"widget-frob"'
+    contains "core's task-meta names kind review" \
+        "$(cat "$capture_dir/core.task-meta.json")" '"kind":"review"'
 else
-    no "linus's launch captured a --task-meta"
+    no "core's launch captured a --task-meta"
 fi
 if [[ -f "$capture_dir/security.task-meta.json" ]]; then
     ok "security's launch captured a --task-meta"
@@ -143,15 +143,15 @@ fi
 
 printf '\n== harvest ==\n'
 tree_out="$("$mailbox" tree widget-frob)"
-contains "linus's valid reply landed with its Reviewed-by tag" "$tree_out" "Reviewed-by"
+contains "core's valid reply landed with its Reviewed-by tag" "$tree_out" "Reviewed-by"
 contains "security's reply landed with its Question tag" "$tree_out" "Question"
-contains "the reply carries linus's AI-persona attribution" \
+contains "the reply carries core's AI-persona attribution" \
     "$("$mailbox" show widget-frob "$(printf '%s\n' "$tree_out" | grep -m1 Reviewed-by | awk '{print $1}')")" \
     "(AI persona)"
 
 n_msgs=$(find "$LKML_MAILBOX_ROOT/widget-frob/cur" -name '*.msg' | wc -l)
-# cover + patch + linus's good reply + security's reply = 4. The malformed
-# second linus file must NOT have been posted.
+# cover + patch + core's good reply + security's reply = 4. The malformed
+# second core file must NOT have been posted.
 check "exactly the well-formed replies were posted (4 messages total)" "4" "$n_msgs"
 
 contains "a .git/lkml-out file with no In-Reply-To is refused with a clear line" \
@@ -169,7 +169,7 @@ capture_dir2="$(mktemp -d)"; tmpdirs+=("$capture_dir2")
 out2="$(PATH="$stub_bin:$PATH" STUB_CAPTURE_DIR="$capture_dir2" STUB_RUN_PREFIX="$run_prefix_dir" \
     STUB_REPLY_TO="$patch_id" STUB_REPLY_TO_BRACKETED="$patch_id_bracketed" \
     "$round" widget-frob --project /nonexistent/project --checkout somebranch \
-    --personas linus,security --version 1 \
+    --personas core,security --version 1 \
     --reply-to "$patch_id" --reply-to deadbeefbad 2>&1)"
 rc2=$?
 if (( rc2 != 0 )); then ok "exits non-zero on an unresolvable --reply-to id"; else no "exits non-zero on an unresolvable --reply-to id" "exit 0: $out2"; fi
