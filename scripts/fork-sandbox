@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# fork-sandbox — Git-style dispatcher for the fork-sandbox porcelain
+#
+# Usage: fork-sandbox run [options] <project-path> <handoff-file>
+# Usage: fork-sandbox status [options] <run-dir>
+# Usage: fork-sandbox say <run-dir> <message>
+# Usage: fork-sandbox configure [options]
+# Usage: fork-sandbox k8s <sub-verb> [options]
+# Usage: fork-sandbox log <sub-verb> [options]
+#
+# Routes each verb to the existing script that implements it. Every target
+# remains callable directly under its own name.
+
+set -euo pipefail
+
+usage() {
+    sed -n '2,/^[^#]/{ /^#/s/^# \?//p }' "$0"
+}
+
+script_dir="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+
+if (($# == 0)); then
+    usage >&2
+    exit 2
+fi
+
+if [[ "$1" == '-h' || "$1" == '--help' ]]; then
+    usage
+    exit 0
+fi
+
+verb="$1"
+shift
+
+case "$verb" in
+    run)
+        target='fork-sandbox.sh'
+        ;;
+    status)
+        target='fork-sandbox-status.sh'
+        ;;
+    say)
+        target='fork-sandbox-say.sh'
+        ;;
+    configure)
+        target='fork-sandbox.sh'
+        set -- configure "$@"
+        ;;
+    k8s)
+        target='fork-sandbox-k8s.sh'
+        ;;
+    log)
+        target='sandbox-run-log.py'
+        ;;
+    *)
+        printf "fork-sandbox: unknown verb '%s'\n" "$verb" >&2
+        printf '%s\n' 'Verbs: run status say configure k8s log' >&2
+        printf '%s\n' "Try 'fork-sandbox --help'." >&2
+        exit 2
+        ;;
+esac
+
+if [[ ! -x "$script_dir/$target" ]]; then
+    printf 'fork-sandbox: cannot execute %s in %s\n' "$target" "$script_dir" >&2
+    exit 127
+fi
+
+exec "$script_dir/$target" "$@"
