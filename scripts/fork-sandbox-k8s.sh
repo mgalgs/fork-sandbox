@@ -635,6 +635,120 @@ parse_proxy_endpoints() {
     return 0
 }
 
+# Parses K8S_PROXY_ALLOW ("<cidr>:<port>,<cidr>:<port>,...") into the
+# PROXY_ALLOW_CIDRS / PROXY_ALLOW_PORTS arrays (module-global). An empty spec
+# is not an error -- cmd_install renders today's default RFC1918-except
+# egress block when it's unset, unchanged. NetworkPolicy has no hostname
+# field, so a name here (anything that doesn't parse as an IPv4 CIDR) is
+# refused outright rather than silently accepted and never matching
+# anything -- see the ipBlock section of the NetworkPolicy API: it takes a
+# CIDR, never a DNS name.
+parse_proxy_allow() {
+    local spec="$1" entry cidr port
+    PROXY_ALLOW_CIDRS=()
+    PROXY_ALLOW_PORTS=()
+    [[ -z "$spec" ]] && return 0
+
+    local -a entries
+    IFS=',' read -ra entries <<< "$spec"
+    for entry in "${entries[@]}"; do
+        if [[ "$entry" != *:* ]]; then
+            echo "Error: K8S_PROXY_ALLOW entry '$entry' is not <cidr>:<port>." >&2
+            return 1
+        fi
+        cidr="${entry%:*}"
+        port="${entry##*:}"
+        if [[ ! "$cidr" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]{1,2}$ ]]; then
+            echo "Error: K8S_PROXY_ALLOW entry '$entry' does not name a valid" >&2
+            echo "IPv4 CIDR ('$cidr'). NetworkPolicy has no hostname field --" >&2
+            echo "an egress rule can only ever match an ipBlock, never a DNS" >&2
+            echo "name, so a hostname cannot be accepted here." >&2
+            return 1
+        fi
+        if [[ ! "$port" =~ ^[0-9]{1,5}$ ]] || (( port < 1 || port > 65535 )); then
+            echo "Error: K8S_PROXY_ALLOW entry '$entry' has an invalid port" >&2
+            echo "'$port' -- must be 1-65535." >&2
+            return 1
+        fi
+        PROXY_ALLOW_CIDRS+=("$cidr")
+        PROXY_ALLOW_PORTS+=("$port")
+    done
+    return 0
+}
+
+# The NetworkPolicy egress rule(s) allowing whichever hosts model access
+# needs -- replaces the whole `- to: []  # __PROXY_EGRESS_RULES__` /
+# `ports: []` placeholder stanza in manifests/k8s/30-proxy.yaml (see
+# render_proxy_egress_rules_sub below for why a whole-stanza replacement,
+# rather than a bare token, is what keeps the raw template parseable YAML).
+# Unset K8S_PROXY_ALLOW renders exactly what this repo has always rendered
+# here (byte-for-byte): any host except RFC1918/loopback/link-local/CGNAT, on
+# 443. A set K8S_PROXY_ALLOW replaces that block with exactly the given
+# <cidr>:<port> entries (from the PROXY_ALLOW_CIDRS / PROXY_ALLOW_PORTS
+# arrays parse_proxy_allow filled in) and nothing else -- explicit egress,
+# for whatever private (or public) addresses K8S_PROXY_ENDPOINTS names.
+render_proxy_egress_rules() {
+    if [[ ${#PROXY_ALLOW_CIDRS[@]} -eq 0 ]]; then
+        cat <<'EOF'
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+              - 100.64.0.0/10
+      ports:
+        - protocol: TCP
+          port: 443
+EOF
+        return 0
+    fi
+
+    local i cidr port
+    for (( i = 0; i < ${#PROXY_ALLOW_CIDRS[@]}; i++ )); do
+        cidr="${PROXY_ALLOW_CIDRS[$i]}"
+        port="${PROXY_ALLOW_PORTS[$i]}"
+        cat <<EOF
+    - to:
+        - ipBlock:
+            cidr: $cidr
+      ports:
+        - protocol: TCP
+          port: $port
+EOF
+    done
+}
+
+# manifests/k8s/30-proxy.yaml's own __PROXY_EGRESS_RULES__ marker sits on a
+# placeholder stanza that is, by itself, valid YAML (`- to: []` / `ports:
+# []`) -- unlike __PROXY_LOCATIONS__, this one lives in a real parsed
+# NetworkPolicy list, not inside an nginx.conf block scalar, so a bare
+# dedented token here is a syntax error rather than harmless block-scalar
+# text. This substitutes the WHOLE two-line stanza (matched literally, not
+# as a token) for render_proxy_egress_rules's output, which supplies its own
+# 4-space list-item indent on every line since nothing in the template
+# indents it for us this time. No trailing newline on either side of this
+# substitution: $1 already had its own trailing newline stripped by the
+# $(sed ...) capture that produced it (this stanza is the file's last
+# line), the same convention the untouched original template's last line
+# always rendered under -- see cmd_install's own `rendered+="$file_rendered"$'\n'`
+# for where that newline comes back.
+render_proxy_egress_rules_sub() {
+    local text="$1" stanza stripped
+    stanza=$'    - to: []  # __PROXY_EGRESS_RULES__\n      ports: []'
+    stripped="${text/"$stanza"/$(render_proxy_egress_rules)}"
+    if [[ "$stripped" == "$text" ]]; then
+        echo "Error: could not find the __PROXY_EGRESS_RULES__ placeholder" >&2
+        echo "stanza in the rendered proxy NetworkPolicy --" >&2
+        echo "manifests/k8s/30-proxy.yaml and render_proxy_egress_rules_sub" >&2
+        echo "in this script have drifted apart." >&2
+        return 1
+    fi
+    printf '%s' "$stripped"
+}
+
 # The nginx location block(s) inside the proxy's server {} -- fills
 # __PROXY_LOCATIONS__ in manifests/k8s/30-proxy.yaml. Built fully-resolved in
 # bash, rather than left as sed tokens for the per-file substitution pass in
@@ -844,6 +958,13 @@ cmd_install() {
     # function.
     parse_proxy_endpoints "$K8S_PROXY_ENDPOINTS" || exit 1
 
+    # Fills the module-global PROXY_ALLOW_CIDRS / PROXY_ALLOW_PORTS arrays
+    # render_proxy_egress_rules reads below. K8S_PROXY_ALLOW is independent
+    # of which upstream mode is active -- nothing here requires
+    # K8S_PROXY_ENDPOINTS, since a legacy install could in principle want an
+    # explicit allowlist too.
+    parse_proxy_allow "$K8S_PROXY_ALLOW" || exit 1
+
     resolve_platform || exit 1
 
     local manifests_dir
@@ -874,6 +995,11 @@ cmd_install() {
             # own header for why), never left as a token for a later sed
             # pass to fill in.
             file_rendered="${file_rendered//__PROXY_LOCATIONS__/$(render_proxy_locations "$upstream_host")}"
+
+            # The proxy's own NetworkPolicy egress rule(s) -- see
+            # render_proxy_egress_rules's own header for why unset
+            # K8S_PROXY_ALLOW must render byte-identical to today's default.
+            file_rendered="$(render_proxy_egress_rules_sub "$file_rendered")" || exit 1
 
             # A K8S_PROXY_ENDPOINTS (keyless) install creates no
             # fork-sandbox-upstream-key Secret below, so it must not include
