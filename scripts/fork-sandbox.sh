@@ -1954,8 +1954,6 @@ if [[ "$dry_run" == true ]]; then
     if [[ "$review_only" == true ]]; then
         printf 'mode=review-only\ncheckout=%s\nbase_sha=%s\nrange=%s...%s\n' \
             "$checkout_ref" "$review_only_base_sha" "$review_only_base_sha" "$checkout_ref"
-    else
-        printf 'mode=run\n'
     fi
     if (( refresh_enabled )); then
         printf 'refresh_context_window=%s\nrefresh_threshold_tokens=%s\n' \
@@ -2600,6 +2598,7 @@ fs_check_branch_free "$origin_repo" "$branch"
 # so a commit held under a private ref namespace has no name inside it.
 # A repo with no commits has nothing to clone and nothing to branch from.
 checkout_sha=""
+return_base_sha=""
 if [[ -n "$checkout_ref" ]]; then
     if ! base_sha="$(cd "$origin_repo" && \
         git rev-parse --verify --quiet "$checkout_ref^{commit}")"; then
@@ -2609,6 +2608,11 @@ if [[ -n "$checkout_ref" ]]; then
         exit 1
     fi
     checkout_sha="$base_sha"
+    # The review range base is used to build review prompts, but the return
+    # path must measure changes from the commit the clone actually checked
+    # out. In particular, an unchanged review-only clone must be removable
+    # even when the reviewed range has pre-existing commits.
+    return_base_sha="$checkout_sha"
     if [[ "$review_only" == true ]]; then
         if [[ -n "$review_base_ref" ]]; then
             if ! base_sha="$(cd "$origin_repo" && git rev-parse --verify --quiet "$review_base_ref^{commit}")"; then
@@ -2630,6 +2634,9 @@ elif ! base_sha="$(cd "$origin_repo" && git rev-parse HEAD 2>/dev/null)"; then
     echo "Error: '$origin_repo' has no commits yet, so there is nothing to" >&2
     echo "clone. Make a first commit and try again." >&2
     exit 1
+else
+    checkout_sha="$base_sha"
+    return_base_sha="$base_sha"
 fi
 
 fs_warn_if_dirty "$project_path" "$origin_repo"
@@ -2736,7 +2743,7 @@ if ! $no_services && [[ -d "$services_hook_dir" ]]; then
         # could ADD a hook at the path the base lacks, and that must count as a
         # change. .agents/sandbox-services/ is current, .claude/ the fallback.
         (cd "$origin_repo" && git diff --quiet \
-            "${services_trust_ref}...${base_sha}" \
+            "${services_trust_ref}...${checkout_sha}" \
             -- .agents/sandbox-services/ .claude/sandbox-services/) || trust_diff_rc=$?
         if (( trust_diff_rc == 1 )); then
             echo "Warning: the checked-out ref changes the sandbox-services" >&2
@@ -2747,7 +2754,7 @@ if ! $no_services && [[ -d "$services_hook_dir" ]]; then
             services_trusted=0
         elif (( trust_diff_rc != 0 )); then
             echo "Error: git could not evaluate --services-trust-ref" >&2
-            echo "'$services_trust_ref' against '$base_sha' (git exited" >&2
+            echo "'$services_trust_ref' against '$checkout_sha' (git exited" >&2
             echo "$trust_diff_rc; its error is above). Fix the ref — is it" >&2
             echo "fetched? — and rerun." >&2
             exit 1
@@ -3551,6 +3558,7 @@ started_at="$(date +%s)"
     printf 'origin_repo=%q\n' "$origin_repo"
     printf 'branch=%q\n' "$branch"
     printf 'base_sha=%q\n' "$base_sha"
+    printf 'return_base_sha=%q\n' "$return_base_sha"
     printf 'handoff=%q\n' "$handoff_copy"
     printf 'formatter=%q\n' "$run_formatter"
     printf 'harness=%q\n' "$harness"
@@ -3849,6 +3857,7 @@ fi
 # and the formatter renders it live when there is one to render. The
 # sandbox's own messages go to stderr, which is copied to the log and shown
 # here too.
+rc=0
 if [[ "$mode" != "review-only" ]]; then
 if [[ -n "$formatter" ]]; then
     "${sandbox_cmd[@]}" < "$handoff" \
@@ -4361,6 +4370,9 @@ next_leg_no=$(( ${leg_no:-1} + 1 ))
 review_loop_ended=""
 review_loop_detail=""
 review_iters_done='[]'
+leg_cost=""
+leg_usage=null
+leg_error=""
 
 # The branch head, read from the clone the one way anything here may read it:
 # over upload-pack from outside, exactly like the fetch below. Nothing runs git
@@ -4838,6 +4850,7 @@ if [[ "$mode" == "review-only" ]]; then
     else
         run_cost_fmt=""
     fi
+    [[ "$review_loop_ended" == "harness-error" ]] && rc=1
 fi
 
 # The other half of the deferral above: for a --review-loop or --refresh-at
@@ -4876,12 +4889,12 @@ fi
 n_commits=0
 removed=0
 if (( fetched )); then
-    n_commits="$( (cd "$origin_repo" && git rev-list --count "$base_sha..$branch") 2>/dev/null || printf 0 )"
+    n_commits="$( (cd "$origin_repo" && git rev-list --count "$return_base_sha..$branch") 2>/dev/null || printf 0 )"
     if [[ "$n_commits" == "0" ]]; then
         # The branch is exactly where it started, so removing it leaves the
         # repo as it was. Compare the sha rather than trust the count.
         head_now="$( (cd "$origin_repo" && git rev-parse "$branch") 2>/dev/null || true )"
-        if [[ "$head_now" == "$base_sha" ]] \
+        if [[ "$head_now" == "$return_base_sha" ]] \
             && (cd "$origin_repo" && git branch -q -D "$branch") >/dev/null 2>&1; then
             removed=1
         fi
@@ -4950,7 +4963,7 @@ if (( fetched )) && [[ "$n_commits" != "0" ]]; then
     author_email_want="$( (cd "$origin_repo" && git config --get user.email) 2>/dev/null || true )"
     if [[ -n "$author_email_want" ]]; then
         author_email_bad="$( (cd "$origin_repo" \
-            && git log --format='%ae' "$base_sha..$branch") 2>/dev/null \
+            && git log --format='%ae' "$return_base_sha..$branch") 2>/dev/null \
             | tr -d '\000-\010\013-\037\177' \
             | grep -vxF -- "$author_email_want" | sort -u || true )"
     fi
@@ -5044,10 +5057,10 @@ fi
         # ESC or CR planted in a commit message cannot spoof this summary in
         # the pane or the monitor stream. Tab and newline stay.
         printf '\n'
-        (cd "$origin_repo" && git log --oneline --no-decorate "$base_sha..$branch") \
+        (cd "$origin_repo" && git log --oneline --no-decorate "$return_base_sha..$branch") \
             | tr -d '\000-\010\013-\037\177'
         printf '\n'
-        (cd "$origin_repo" && git diff --stat "$base_sha" "$branch") \
+        (cd "$origin_repo" && git diff --stat "$return_base_sha" "$branch") \
             | tr -d '\000-\010\013-\037\177'
     fi
     if (( fetched )) && [[ "$n_commits" != "0" ]]; then
@@ -5074,7 +5087,7 @@ fi
 # mangles. jq builds it, so every value is escaped properly: commit
 # subjects come from the session and are untrusted text. A jq that fails
 # leaves no file, and summary.txt, which is what a person reads, stands.
-commit_list="$( (cd "$origin_repo" && git log --format='%H %s' "$base_sha..$branch") 2>/dev/null \
+commit_list="$( (cd "$origin_repo" && git log --format='%H %s' "$return_base_sha..$branch") 2>/dev/null \
     | jq -R -s 'split("\n") | map(select(length > 0))
                 | map({sha: .[0:40], subject: .[41:]})' 2>/dev/null )"
 [[ -n "$commit_list" ]] || commit_list='[]'

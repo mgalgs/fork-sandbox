@@ -145,6 +145,7 @@ OUTCOMES = [
 
 # Fields lifted verbatim from summary.json into a run_end record.
 SUMMARY_FIELDS = [
+    "mode",
     "harness",
     "harness_version",
     "model",
