@@ -1910,29 +1910,31 @@ if [[ -d "$prompt_overlay_dir" ]]; then
     fi
 fi
 
-review_only_checkout_sha=""
-review_only_base_sha=""
+checkout_sha=""
+base_sha=""
+return_base_sha=""
 if [[ "$review_only" == true ]]; then
     if [[ ! -d "$project_path" ]]; then
         echo "Error: project path '$project_path' is not a directory" >&2
         exit 1
     fi
     review_only_origin_repo="$(fs_repo_toplevel "$project_path")"
-    if ! review_only_checkout_sha="$(cd "$review_only_origin_repo" && git rev-parse --verify --quiet "$checkout_ref^{commit}")"; then
+    if ! checkout_sha="$(cd "$review_only_origin_repo" && git rev-parse --verify --quiet "$checkout_ref^{commit}")"; then
         echo "Error: --checkout '$checkout_ref' does not name a commit in $review_only_origin_repo." >&2
         exit 1
     fi
+    return_base_sha="$checkout_sha"
     if [[ -n "$review_base_ref" ]]; then
-        if ! review_only_base_sha="$(cd "$review_only_origin_repo" && git rev-parse --verify --quiet "$review_base_ref^{commit}")"; then
+        if ! base_sha="$(cd "$review_only_origin_repo" && git rev-parse --verify --quiet "$review_base_ref^{commit}")"; then
             echo "Error: --review-base '$review_base_ref' does not name a commit in $review_only_origin_repo." >&2
             exit 1
         fi
-    elif ! review_only_base_sha="$(cd "$review_only_origin_repo" && git merge-base "$checkout_ref" HEAD)"; then
+    elif ! base_sha="$(cd "$review_only_origin_repo" && git merge-base "$checkout_ref" HEAD)"; then
         echo "Error: could not compute the merge-base of '$checkout_ref' and HEAD." >&2
         exit 1
     fi
-    if [[ "$review_only_base_sha" == "$review_only_checkout_sha" ]]; then
-        echo "Error: nothing to review between $review_only_base_sha and $checkout_ref" >&2
+    if [[ "$base_sha" == "$checkout_sha" ]]; then
+        echo "Error: nothing to review between $base_sha and $checkout_ref" >&2
         exit 1
     fi
 fi
@@ -1953,7 +1955,7 @@ if [[ "$dry_run" == true ]]; then
     printf 'outbox_max_bytes=%s\n' "$outbox_max_bytes"
     if [[ "$review_only" == true ]]; then
         printf 'mode=review-only\ncheckout=%s\nbase_sha=%s\nrange=%s...%s\n' \
-            "$checkout_ref" "$review_only_base_sha" "$review_only_base_sha" "$checkout_ref"
+            "$checkout_ref" "$base_sha" "$base_sha" "$checkout_ref"
     fi
     if (( refresh_enabled )); then
         printf 'refresh_context_window=%s\nrefresh_threshold_tokens=%s\n' \
@@ -2597,39 +2599,22 @@ fs_check_branch_free "$origin_repo" "$branch"
 # here, in the user's own repo: a clone carries refs/heads and refs/tags only,
 # so a commit held under a private ref namespace has no name inside it.
 # A repo with no commits has nothing to clone and nothing to branch from.
-checkout_sha=""
-return_base_sha=""
 if [[ -n "$checkout_ref" ]]; then
-    if ! base_sha="$(cd "$origin_repo" && \
-        git rev-parse --verify --quiet "$checkout_ref^{commit}")"; then
-        echo "Error: --checkout '$checkout_ref' does not name a commit in" >&2
-        echo "$origin_repo. The ref is resolved there, not in the clone, so" >&2
-        echo "fetch it into that repo first." >&2
-        exit 1
+    if [[ "$review_only" != true ]]; then
+        if ! checkout_sha="$(cd "$origin_repo" && \
+            git rev-parse --verify --quiet "$checkout_ref^{commit}")"; then
+            echo "Error: --checkout '$checkout_ref' does not name a commit in" >&2
+            echo "$origin_repo. The ref is resolved there, not in the clone, so" >&2
+            echo "fetch it into that repo first." >&2
+            exit 1
+        fi
+        base_sha="$checkout_sha"
+        return_base_sha="$checkout_sha"
     fi
-    checkout_sha="$base_sha"
     # The review range base is used to build review prompts, but the return
     # path must measure changes from the commit the clone actually checked
     # out. In particular, an unchanged review-only clone must be removable
     # even when the reviewed range has pre-existing commits.
-    return_base_sha="$checkout_sha"
-    if [[ "$review_only" == true ]]; then
-        if [[ -n "$review_base_ref" ]]; then
-            if ! base_sha="$(cd "$origin_repo" && git rev-parse --verify --quiet "$review_base_ref^{commit}")"; then
-                echo "Error: --review-base '$review_base_ref' does not name a commit in $origin_repo." >&2
-                exit 1
-            fi
-        else
-            if ! base_sha="$(cd "$origin_repo" && git merge-base "$checkout_ref" HEAD)"; then
-                echo "Error: could not compute the merge-base of '$checkout_ref' and HEAD." >&2
-                exit 1
-            fi
-        fi
-        if [[ "$base_sha" == "$checkout_sha" ]]; then
-            echo "Error: nothing to review between $base_sha and $checkout_ref" >&2
-            exit 1
-        fi
-    fi
 elif ! base_sha="$(cd "$origin_repo" && git rev-parse HEAD 2>/dev/null)"; then
     echo "Error: '$origin_repo' has no commits yet, so there is nothing to" >&2
     echo "clone. Make a first commit and try again." >&2
