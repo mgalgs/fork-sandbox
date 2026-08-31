@@ -652,11 +652,14 @@ file, or a key absent from it, means the default above.
    legs a model id that does not exist. Set `CODER_MODE_REVIEW_HARNESS`
    only to run the review legs under a different harness than the typing;
    it does not change which model name they need.
-2. **`pi-local` cannot pair with a networked review harness.** The script
-   refuses `CODER_MODE_HARNESS=pi-local` with a `CODER_MODE_REVIEW_HARNESS`
-   of `claude`, `pi` or `codex`, because a networked review leg would send
-   the sealed clone to a model provider. Leave the review harness unset, or
-   `pi-local`.
+2. **`pi-local` paired with a networked review harness costs money.** The
+   implement leg stays sealed either way, but `CODER_MODE_HARNESS=pi-local`
+   with a `CODER_MODE_REVIEW_HARNESS` of `claude`, `pi` or `codex` sends
+   the review leg's contents to that harness's model provider, and the
+   script only warns about this by name rather than refusing it — see
+   `README.md`'s `--harness pi-local --review-harness claude --review-model
+   opus --review-loop 2` for the recipe this exists to unblock. Leave the
+   review harness unset, or `pi-local`, to keep the whole run sealed.
 3. **`CODER_MODE_REVIEW_LOOP=0` means no in-sandbox reviewer**: omit
    `--review-loop`, `--review-model` and `--review-harness` from the
    launch, all three — the script refuses `--review-harness` without

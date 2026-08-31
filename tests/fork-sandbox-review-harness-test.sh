@@ -646,6 +646,55 @@ else
     no "run_real produced a run directory for the pi/claude pair" "run_real failed"
 fi
 
+# 9. --harness pi-local, --review-harness pi/some-model: the pair check 4
+# above only exercises through --dry-run, which exits before
+# fs_build_sandbox_cmd ever runs and before the launch report is printed.
+# This is the run_real counterpart -- the implement leg must stay sealed
+# (agent-sandboxed, no --env-file, no credential) while the review leg is
+# a separate, networked sandbox that does carry one (claude-sandboxed
+# --exec with --env-file pi.env, per the "pi" case in fs_build_sandbox_cmd
+# above), and the launch report printed at the end must say so rather than
+# claim the whole run "costs nothing".
+out9pl="$(PATH="$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$real_cfg" \
+    FORK_SANDBOX_BACKEND=fake-image \
+    timeout 60 "$launcher" --foreground --harness pi-local --review-loop 1 \
+    --review-harness pi/some-model "$proj" "$handoff" 2>&1)"
+rc9pl=$?
+rd9pl="$(printf '%s\n' "$out9pl" | sed -n 's/^  run dir:  *//p' | head -1)"
+if (( rc9pl == 0 )) && [[ -n "$rd9pl" ]]; then
+    tmpdirs+=("$rd9pl")
+    sandbox_line9pl="$(grep '^sandbox_cmd=' "$rd9pl/run.sh")"
+    review_line9pl="$(grep '^review_sandbox_cmd=' "$rd9pl/run.sh")"
+
+    contains "the pi-local implement command uses agent-sandboxed" \
+        "/agent-sandboxed " "$sandbox_line9pl"
+    case "$sandbox_line9pl" in
+        *--env-file*) no "the pi-local implement command carries no --env-file" "$sandbox_line9pl" ;;
+        *) ok "the pi-local implement command carries no --env-file" ;;
+    esac
+
+    contains "the pi review command uses claude-sandboxed" \
+        "/claude-sandboxed " "$review_line9pl"
+    contains "the pi review command carries --exec" \
+        "--exec" "$review_line9pl"
+    contains "the pi review command carries the OpenRouter --env-file" \
+        "--env-file $real_cfg/pi.env" "$review_line9pl"
+
+    contains "the run's warning names the networked review harness" \
+        "seals the implement leg" "$out9pl"
+    contains "the launch report warns the review leg does not share the seal" \
+        "Its review leg does not share that seal" "$out9pl"
+    case "$out9pl" in
+        *"holds no credential and costs nothing"*"Its review leg does not share that seal"*)
+            ok "the launch report qualifies its 'costs nothing' claim to the implement leg" ;;
+        *)
+            no "the launch report qualifies its 'costs nothing' claim to the implement leg" \
+                "$out9pl" ;;
+    esac
+else
+    no "run_real produced a run directory for the pi-local/pi pair" "rc=$rc9pl: $out9pl"
+fi
+
 printf '\n== --review-loop: review and fix legs start with an empty inbox ==\n'
 
 # fs_archive_inbox (fork-sandbox.sh) moves every addendum out of the inbox

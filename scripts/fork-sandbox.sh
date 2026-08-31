@@ -1693,11 +1693,16 @@ fi
 # contents go to that harness's model provider. Whether that is acceptable
 # is the caller's judgement call, not this script's -- a team whose code
 # already reaches that provider through ordinary daily use gains no new
-# exposure from the review leg. So warn by name, the same way this script
-# warns about every other combination that changes what a sandbox reaches
-# without a flag nobody thought to cross-check, and proceed. The reverse
-# is fine and stays silent: a networked implement harness reviewed by
-# --review-harness pi-local adds no exposure the run did not already have.
+# exposure from the review leg. Every other reach-widening combination this
+# script sees is refused outright, not warned about (--sandbox-args
+# anything but --unpin-egress, --context-ro outside the scratch root, a
+# handoff or project outside its required root); this one is different
+# because a networked review leg is often no wider than the caller's
+# everyday reach, so warn by name instead and let the caller decide, rather
+# than have the seal's whole point leak out through a flag nobody thought
+# to cross-check. The reverse is fine and stays silent: a networked
+# implement harness reviewed by --review-harness pi-local adds no exposure
+# the run did not already have.
 if [[ "$review_harness_given" == true && "$harness" == "pi-local" \
     && "$review_harness" != "pi-local" ]]; then
     echo "Warning: --harness pi-local seals the implement leg -- no network" >&2
@@ -5318,13 +5323,22 @@ EOF
 elif [[ "$harness" == "pi-local" ]]; then
     cat <<EOF
 This sandbox has no network at all, and the model it runs on is one you
-host, so the run holds no credential and costs nothing. Nothing can be
-installed or fetched in there — the clone, its provisioned dependencies
-and any per-run services are all it has. pi has the commit-then-review
-skill and the script toolbox, but writes plain text, so read
+host, so the implement leg holds no credential and costs nothing. Nothing
+can be installed or fetched in there — the clone, its provisioned
+dependencies and any per-run services are all it has. pi has the
+commit-then-review skill and the script toolbox, but writes plain text, so
+read
 $run_dir/events.jsonl rather than --result. Its session
 is copied to $run_dir/pi-session when the run ends.
 EOF
+    if [[ "$review_harness_given" == true && "$review_harness" != "pi-local" ]]; then
+        cat <<EOF
+Its review leg does not share that seal: --review-harness $review_harness
+runs in a separate, networked sandbox that carries whatever credential
+$review_harness needs and can cost money. See review_sandbox_cmd in
+$run_dir/run.sh for exactly what it sends where.
+EOF
+    fi
 elif [[ "$harness" == "codex" ]]; then
     cat <<EOF
 The sandbox carries a live Codex access token so it can reach the model, but

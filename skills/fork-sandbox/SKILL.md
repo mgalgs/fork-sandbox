@@ -98,8 +98,11 @@ reach it — see "What it gives up".)
    selected models' prices, so `--review-loop 2` can cost
    three to five times a plain run. Note the asymmetry: a review that
    approves costs one extra session, a review that finds something costs
-   two. On a `pi-local` run the price is zero either way, which is where a
-   large N is free to try.
+   two. On a `pi-local` run with no `--review-harness` (or `pi-local` given
+   explicitly) the price is zero either way, which is where a large N is
+   free to try — but naming a networked `--review-harness` turns that back
+   into N paid sessions on whichever model it names, even though `--harness`
+   itself stays `pi-local`.
 
    Pass `--review-model <model>` to use another model for review legs only.
    Fix legs keep using the implementation model selected by `--model`.
