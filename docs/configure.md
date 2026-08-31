@@ -6,7 +6,7 @@ anything:
 | file in `~/.config/fork-sandbox/` | holds |
 |---|---|
 | `pi.env` | `OPENROUTER_API_KEY` — a real secret, mode 0600 |
-| `model.env` | `MODEL_ENDPOINT`, `MODEL_ID` — a local model endpoint |
+| `model.env` | `MODEL_ENDPOINT`, `MODEL_ID`, `MODEL_CTX` — a local model endpoint |
 | `k8s.env` | `K8S_CONTEXT`, `K8S_NAMESPACE`, `K8S_IMAGE`, `K8S_PROXY_UPSTREAM`, `K8S_DENIED_PROBE` |
 | `coder-mode.env` | `CODER_MODE_HARNESS`, `CODER_MODE_MODEL`, `CODER_MODE_REVIEW_HARNESS`, `CODER_MODE_REVIEW_MODEL`, `CODER_MODE_REVIEW_LOOP` — the `sandbox-coder-mode` skill's launch defaults, read by the orchestrating session, not by any script; `configure` does not write it |
 
@@ -168,6 +168,7 @@ So a discoverer never supplies a path. It supplies a `target` string, which
 | `pi.env:OPENROUTER_API_KEY` | **yes** |
 | `model.env:MODEL_ENDPOINT` | no |
 | `model.env:MODEL_ID` | no |
+| `model.env:MODEL_CTX` | no |
 | `k8s.env:K8S_CONTEXT` | no |
 | `k8s.env:K8S_NAMESPACE` | no |
 | `k8s.env:K8S_IMAGE` | no |

@@ -529,6 +529,7 @@ declare -A FS_CONFIGURE_TARGETS=(
     [pi.env:OPENROUTER_API_KEY]=secret
     [model.env:MODEL_ENDPOINT]=plain
     [model.env:MODEL_ID]=plain
+    [model.env:MODEL_CTX]=plain
     [k8s.env:K8S_CONTEXT]=plain
     [k8s.env:K8S_NAMESPACE]=plain
     [k8s.env:K8S_IMAGE]=plain

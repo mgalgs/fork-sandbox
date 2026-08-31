@@ -33,6 +33,15 @@
 # offering exactly one model needs no flag, and its context window is read from
 # the same answer. MODEL_ID in the config file sets a default.
 #
+# MODEL_CTX in the config file pins the context window in tokens, overriding
+# whatever the endpoint reports. The endpoint is asked two ways — vLLM's
+# max_model_len in /v1/models, then llama.cpp's default_generation_settings
+# .n_ctx in /props — and only when neither answers does the 32768 guess below
+# apply. Pin it when the server's number is not the number one agent should
+# plan against: a llama.cpp server with a unified KV cache reports the whole
+# pool as every slot's n_ctx, so several agents sharing it at once each want
+# a smaller window than the one reported.
+#
 # --bridge carries one more TCP endpoint into the seal, using the same
 # unix-socket bridge the model endpoint uses: a host-side socat dials the real
 # host, a sandbox-side socat listens on loopback, and the socket between them
@@ -373,9 +382,10 @@ if [[ -f "$CONFIG_FILE" ]]; then
             # accepted, because a config file outlives a rename.
             MODEL_ENDPOINT|VLLM_ENDPOINT) cfg_endpoint="$cfg_val" ;;
             MODEL_ID|VLLM_MODEL) cfg_model="$cfg_val" ;;
+            MODEL_CTX) cfg_ctx="$cfg_val" ;;
             *)
                 echo "Warning: $CONFIG_FILE names an unknown key '$cfg_key';" >&2
-                echo "ignoring it. This file takes MODEL_ENDPOINT and MODEL_ID." >&2
+                echo "ignoring it. This file takes MODEL_ENDPOINT, MODEL_ID and MODEL_CTX." >&2
                 ;;
         esac
     done < "$CONFIG_FILE"
@@ -493,20 +503,49 @@ fi
 
 # The context window comes from the endpoint when it says, because a wrong one
 # is worse than a conservative one: too large and the agent packs a context the
-# server rejects, with the failure arriving mid-run.
-CTX="$(jq -r --arg m "$MODEL" \
-    'first(.data[] | select(.id == $m) | .max_model_len // empty) // empty' \
-    <<<"$probe" 2>/dev/null || true)"
+# server rejects, with the failure arriving mid-run. Too small is not free
+# either: pi plans its requests against this number, and an agent that has
+# read 25k tokens of tool output against a declared 32k window is sent out
+# with almost no reply room and dies on stop=length after a few tokens —
+# measured on five review seats against a llama.cpp server whose real
+# window was 128k. So: MODEL_CTX from the config file wins outright; then
+# vLLM's max_model_len in /v1/models; then llama.cpp's /props; then the guess.
+CTX=""
+if [[ "${cfg_ctx:-}" =~ ^[0-9]+$ ]]; then
+    CTX="$cfg_ctx"
+    echo "agent-sandboxed: context window $CTX tokens, from MODEL_CTX in $CONFIG_FILE" >&2
+fi
 if [[ ! "$CTX" =~ ^[0-9]+$ ]]; then
-    # Small on purpose. Only vLLM reports max_model_len here; llama.cpp, Ollama
-    # and LM Studio do not, so this is the ordinary path for those and a guess
-    # has to be made. Guess low: too small only wastes context, while too large
-    # means the agent packs a request the server rejects, and that failure
-    # arrives mid-run with the work half done.
+    CTX="$(jq -r --arg m "$MODEL" \
+        'first(.data[] | select(.id == $m) | .max_model_len // empty) // empty' \
+        <<<"$probe" 2>/dev/null || true)"
+fi
+if [[ ! "$CTX" =~ ^[0-9]+$ ]]; then
+    # llama.cpp keeps the window out of /v1/models but serves it on /props,
+    # one directory up from the /v1 base, as the per-slot n_ctx. With a
+    # unified KV cache that is the whole pool, shared by every concurrent
+    # request — see MODEL_CTX in the header for when to pin a smaller one.
+    props_url="${ENDPOINT%/}"
+    props_url="${props_url%/v1}/props"
+    props_timeout="${AGENT_SANDBOXED_PROPS_TIMEOUT:-10}"
+    if props="$(curl -sS --max-time "$props_timeout" "$props_url" 2>/dev/null)"; then
+        CTX="$(jq -r '.default_generation_settings.n_ctx // empty' <<<"$props" 2>/dev/null || true)"
+        if [[ "$CTX" =~ ^[0-9]+$ ]]; then
+            echo "agent-sandboxed: context window $CTX tokens, from $props_url" >&2
+        fi
+    fi
+fi
+if [[ ! "$CTX" =~ ^[0-9]+$ ]]; then
+    # Small on purpose. Ollama and LM Studio report the window neither way,
+    # so this is the ordinary path for those and a guess has to be made.
+    # Guess low: too small wastes context, while too large means the agent
+    # packs a request the server rejects, and that failure arrives mid-run
+    # with the work half done.
     CTX=32768
     echo "Warning: $ENDPOINT does not report a context length for '$MODEL', so" >&2
     echo "this run assumes $CTX tokens. A server that reports max_model_len in" >&2
-    echo "/v1/models — vLLM does — is used at its real size instead." >&2
+    echo "/v1/models (vLLM) or n_ctx in /props (llama.cpp) is used at its real" >&2
+    echo "size instead; MODEL_CTX in $CONFIG_FILE pins it by hand." >&2
 fi
 # Declare the window as the endpoint reports it, with no safety margin held
 # back. Overflow and compaction are pi's job to handle against the real
