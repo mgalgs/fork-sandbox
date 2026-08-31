@@ -12,8 +12,8 @@
   [Driving sandbox-coder-mode](#driving-sandbox-coder-mode).
 - `/lkml-mode` - Performs an lkml (Linux Kernel Mailing List) style patch
   series code review by using a fleet of asynchronous, sandboxed agents.
-  Output is a git branch and a maildir of the threaded "mailing list"
-  discussion.
+  Output is a git branch and a maildir (with a rendered html view of the
+  threaded "mailing list" discussion).
 
 **Scripts (porcelain) for programmatic sandbox use:**
 
@@ -25,8 +25,8 @@
   run from one machine, collect it from another
 - `sandbox-run-log.py list|stats` — the run ledger: harness, model, tokens,
   cost, outcome
-- `lkml-round.sh`, `lkml-mailbox.sh`, `lkml-revise.sh`, `lkml-forklift.sh` —
-  the lkml-mode toolchain
+- `lkml-round.sh`, `lkml-mailbox.sh`, `lkml-revise.sh`, `lkml-forklift.sh`,
+  `lkml-render.py` — the lkml-mode toolchain
 
 Usage examples for all of these: [Scripts](#scripts).
 
@@ -393,6 +393,7 @@ lkml-round.sh myfeature --project ~/src/proj --checkout sbx-tip --base main --pe
 lkml-revise.sh myfeature --project ~/src/proj --checkout sbx-tip --version 1 --base main
 lkml-series.sh myfeature --project ~/src/proj --range main..sbx-tip   # re-roll shipped work for post-hoc review
 lkml-forklift.sh myfeature --project ~/src/proj --version 2 --onto main --dry-run
+lkml-render.py "$LKML_MAILBOX_ROOT/myfeature" -o threads.html         # self-contained html archive of the thread
 ```
 
 ## Portability
