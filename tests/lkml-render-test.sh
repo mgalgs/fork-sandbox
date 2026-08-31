@@ -53,8 +53,10 @@ tree="$($mailbox tree render-fixture)"
 patch_id="$(printf '%s\n' "$tree" | awk '/\[PATCH v1 1\/2\]/{print $1}')"
 
 printf '%s\n' 'Reviewed-by: The Reviewer' > "$work/review.txt"
+printf 'not really a png, but safely embedded\n' > "$work/shot.png"
 "$mailbox" post render-fixture --from core --reply-to "$patch_id" --file "$work/review.txt" \
-    --tags Reviewed-by --harness test --model fixture >/dev/null 2>/dev/null
+    --tags Reviewed-by --attach "$work/shot.png" --harness test --model fixture >"$work/review-id" 2>/dev/null
+review_id="$(<"$work/review-id")"
 printf '%s\n' 'Tested-by: The CI Bot' > "$work/tested.txt"
 "$mailbox" post render-fixture --from ci --reply-to "$patch_id" --file "$work/tested.txt" \
     --harness test --model fixture >/dev/null 2>/dev/null
@@ -88,6 +90,10 @@ if [[ "$(grep -o '<li style=' "$stdout" | wc -l)" -eq 6 ]]; then ok "thread inde
 contains "Tested-by has its own chip class" "$html" 'class="tag t-test"'
 case "$html" in *'Tested-by</span>'*'t-q'*) no "Tested-by does not fall through to question" ;; *) ok "Tested-by does not fall through to question" ;; esac
 contains "orphaned reply is rendered" "$html" 'orphan body'
+contains "tally cell links to latest tagged reply" "$html" "href=\"#m-$review_id\" title=\"Reviewed-by\">R"
+contains "attachment reference is rendered" "$html" 'attachments/shot.png'
+contains "attachment contents are embedded" "$html" 'data:image/png;base64,'
+case "$html" in *fonts.googleapis.com*) no "output has no remote font dependency" ;; *) ok "output has no remote font dependency" ;; esac
 if cmp -s "$stdout" "$custom"; then ok "output file matches stdout"; else no "output file matches stdout"; fi
 if python3 -m py_compile "$renderer"; then ok "renderer compiles"; else no "renderer compiles"; fi
 

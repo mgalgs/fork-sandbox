@@ -9,6 +9,8 @@ A series dir is $LKML_MAILBOX_ROOT/<series> (it holds cur/*.msg). Reads
 only; never runs git.
 """
 import html
+import base64
+import mimetypes
 import os
 import re
 import sys
@@ -25,14 +27,18 @@ TAG_GLYPH = {"Reviewed-by": "R", "Acked-by": "A", "Tested-by": "T", "Changes-req
              "Question": "?", "NAK": "N"}
 
 
-def read_msg(path):
+def read_msg(path, attachment_root):
     with open(path, encoding="utf-8", errors="replace") as f:
         raw = f.read()
     head, _, body = raw.partition("\n\n")
     hdr = {}
+    attachments = []
     for line in head.splitlines():
         k, _, v = line.partition(": ")
-        hdr[k] = v
+        if k == "X-Attachment":
+            attachments.append(v.strip())
+        else:
+            hdr[k] = v
     mid = strip_id(hdr.get("Message-ID", ""))
     parent = strip_id(hdr.get("In-Reply-To", ""))
     try:
@@ -44,12 +50,30 @@ def read_msg(path):
     except Exception:
         date = None
     tags = [t.strip() for t in hdr.get("X-Tags", "").split(",") if t.strip()]
+    rendered_attachments = []
+    for ref in attachments:
+        # The mailbox writes attachments/<basename>. Keep this defensive in
+        # case a hand-written message contains an unsafe or stale reference.
+        rel = ref.removeprefix("attachments/") if ref.startswith("attachments/") else ""
+        candidate = os.path.normpath(os.path.join(attachment_root, rel)) if rel else ""
+        root_real = os.path.realpath(attachment_root)
+        candidate_real = os.path.realpath(candidate) if candidate else ""
+        inside = candidate and os.path.commonpath((candidate_real, root_real)) == root_real
+        href = None
+        mime = "application/octet-stream"
+        if inside and os.path.isfile(candidate_real):
+            with open(candidate_real, "rb") as f:
+                data = f.read()
+            mime = mimetypes.guess_type(candidate_real)[0] or mime
+            href = f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
+        rendered_attachments.append({"ref": ref, "href": href, "mime": mime})
     return {
         "id": mid, "parent": parent, "seq": seq, "date": date,
         "from": hdr.get("From", ""), "subject": hdr.get("Subject", ""),
         "persona": hdr.get("X-AI-Persona", ""), "harness": hdr.get("X-AI-Harness", ""),
         "model": hdr.get("X-AI-Model", ""), "version": int(hdr.get("X-Version", "1") or 1),
         "depth": int(hdr.get("X-Depth", "0") or 0), "tags": tags, "body": body,
+        "attachments": rendered_attachments,
         "children": [],
     }
 
@@ -201,7 +225,7 @@ def build(series_dir):
     msgs = {}
     for fn in sorted(os.listdir(cur)):
         if fn.endswith(".msg"):
-            m = read_msg(os.path.join(cur, fn))
+            m = read_msg(os.path.join(cur, fn), os.path.join(series_dir, "attachments"))
             msgs[m["id"]] = m
     roots = []
     for m in msgs.values():
@@ -233,7 +257,7 @@ def tally(cover):
             if m is t or not m["tags"] or m["persona"] == t["persona"]:
                 continue
             if m["persona"] not in latest or m["seq"] > latest[m["persona"]][0]:
-                latest[m["persona"]] = (m["seq"], m["tags"])
+                latest[m["persona"]] = (m["seq"], m["id"], m["tags"])
             personas[m["persona"]] = (m["harness"], m["model"])
         rows.append((t, latest))
     return rows, personas
@@ -274,6 +298,20 @@ def render_message(m, depth=0):
     tagchips = "".join(f"<span class=\"tag {TAG_CLASS.get(t, 't-q')}\">{esc(t)}</span>" for t in m["tags"])
     meta = f"{esc(m['harness'])}/{esc(m['model'])}" if m["harness"] else ""
     body = render_patch_body(m["body"]) if is_patch(m) else render_prose(m["body"])
+    attachment_html = ""
+    if m["attachments"]:
+        items = []
+        for attachment in m["attachments"]:
+            label = esc(attachment["ref"])
+            if attachment["href"]:
+                link = (f'<a download href="{esc(attachment["href"])}">{label}</a>'
+                        f' <span class="attachment-type">({esc(attachment["mime"])})</span>')
+                if attachment["mime"].startswith("image/") and attachment["mime"] != "image/svg+xml":
+                    link += f'<br><img class="attachment-preview" src="{esc(attachment["href"])}" alt="{label}">'
+            else:
+                link = f"{label} <span class=\"attachment-missing\">(unavailable)</span>"
+            items.append(f"<li>{link}</li>")
+        attachment_html = '<div class="attachments"><span class="attachment-label">attachments</span><ul>' + "".join(items) + "</ul></div>"
     kids = "".join(render_message(c, depth + 1) for c in m["children"])
     n = count_subtree(m)
     fold = ""
@@ -287,7 +325,7 @@ def render_message(m, depth=0):
         f"<span class=\"meta\">{meta}</span>{tagchips}"
         f"<time>{fmt_date(m['date'])}</time><a class=\"mid\" href=\"#m-{esc(m['id'])}\">{esc(m['id'][:7])}</a></header>"
         f"<h3 class=\"subj\">{esc(m['subject'])}</h3>"
-        f"<div class=\"body\">{body}</div>"
+        f"<div class=\"body\">{body}{attachment_html}</div>"
         f"{fold}"
         f"</article>"
     )
@@ -309,8 +347,8 @@ def render_series(series_dir):
             cells = []
             for p in pcols:
                 if p in latest:
-                    tg = latest[p][1][0]
-                    cells.append(f"<td><a class=\"cell {TAG_CLASS.get(tg,'t-q')}\" href=\"#m-{esc(t['id'])}\" title=\"{esc(tg)}\">{TAG_GLYPH.get(tg,'·')}</a></td>")
+                    tg = latest[p][2][0]
+                    cells.append(f"<td><a class=\"cell {TAG_CLASS.get(tg,'t-q')}\" href=\"#m-{esc(latest[p][1])}\" title=\"{esc(tg)}\">{TAG_GLYPH.get(tg,'·')}</a></td>")
                 else:
                     cells.append("<td><span class=\"cell none\">·</span></td>")
             trows.append(f"<tr><th scope=\"row\"><a href=\"#m-{esc(t['id'])}\">{esc(label)}</a></th>{''.join(cells)}</tr>")
@@ -424,6 +462,12 @@ body{margin:0;background:var(--bg);color:var(--ink);
 .body blockquote{margin:0 0 .9rem;padding:.4rem .9rem;background:var(--quote-bg);border-left:3px solid var(--quote-bar);color:var(--muted);font-size:.92rem}
 .body blockquote p{margin:0 0 .4rem}
 .body blockquote p:last-child{margin:0}
+.attachments{margin-top:1rem;padding:.6rem .8rem;background:var(--code-bg);font-family:"JetBrains Mono","SFMono-Regular",Menlo,Consolas,monospace;font-size:.78rem}
+.attachment-label{color:var(--muted);text-transform:uppercase;letter-spacing:.08em}
+.attachments ul{margin:.35rem 0 0;padding-left:1.2rem}
+.attachments a{color:var(--accent)}
+.attachment-type,.attachment-missing{color:var(--muted)}
+.attachment-preview{display:block;max-width:100%;max-height:24rem;margin-top:.5rem}
 .code,.stat,.diff{margin:0 0 .9rem;padding:.7rem .9rem;background:var(--code-bg);font-size:.78rem;line-height:1.45;overflow-x:auto;border-radius:2px}
 .diff{background:var(--diff-bg)}
 .d-add{color:var(--add)} .d-del{color:var(--del)} .d-hunk{color:var(--hunk)} .d-file{font-weight:700} .d-meta{color:var(--muted)}
@@ -482,8 +526,6 @@ def main(argv=None):
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{esc(args.title)}</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&display=swap">
 <style>{CSS}</style>
 </head>
 <body>
