@@ -1674,6 +1674,10 @@ if [[ "$review_harness_given" == true && "$review_loop_cap" == "0" ]]; then
     echo "--review-loop." >&2
     exit 1
 fi
+if [[ -n "$review_base_ref" && "$review_only" != true ]]; then
+    echo "Error: --review-base only applies with --review-only." >&2
+    exit 1
+fi
 if [[ "$review_only" == true ]]; then
     review_loop_cap=1
 fi

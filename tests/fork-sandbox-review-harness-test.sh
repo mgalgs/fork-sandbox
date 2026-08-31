@@ -201,6 +201,12 @@ refuse_review_only "--review-harness" "one review leg" --review-harness claude
 refuse_review_only "--review-loop" "one review leg" --review-loop 1
 refuse_review_only "--refresh-at" "not supported with --review-only" --refresh-at 0.3
 refuse_review_only "--k8s" "not supported with --k8s" --k8s
+if dry --harness claude --review-base HEAD >/dev/null 2>"$err"; then
+    no "--review-base without --review-only is refused"
+else
+    contains "--review-base without --review-only is refused" \
+        "--review-base" "$(cat "$err")"
+fi
 
 out="$(review_dry --review-only --checkout review-branch \
     --harness claude --model sonnet 2>/dev/null)"
