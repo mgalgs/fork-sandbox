@@ -501,8 +501,12 @@ model that misread the task will misread it again.
    the ssh keys and the tailnet. The branch is in the user's own repo now;
    read it there.
 
-2. **Read the session's own account** of what it did:
-   `fork-sandbox-status.sh --result <run-dir>` for a claude run, or
+2. **Read the report** of what the reviewer observed:
+   `fork-sandbox-status.sh --result <run-dir>` leads with the review report
+   when `--review-loop` ran, then shows the session's own account; the split
+   matters because the report is based on the branch and diff, while the
+   session account is the author's claim. For a run without a review report,
+   read the session account as before, or
    `<run-dir>/events.jsonl` for `pi`, `pi-local` and `codex`, which write
    plain text the formatted views cannot render.
 

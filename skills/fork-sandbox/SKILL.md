@@ -75,9 +75,11 @@ reach it — see "What it gives up".)
    **fresh** session reviews the commits it made, following the
    `code-review-portable` skill, and writes a verdict whose first line is
    `APPROVED` or `FINDINGS` (an approval is asked to follow that line with a
-   `Checked:` paragraph — what was read, run and could not be refuted — so
-   the verdict file is auditable, not just parseable; only the first line
-   is parsed either way). On `FINDINGS`, another fresh session is handed
+   `Checked:` paragraph — what was read, run and could not be refuted — and a
+   five-paragraph `## Report` for the orchestrator (files, observed tests,
+   non-obvious decisions, open work, and uncertainties). The report is what
+   `--result` shows first; only the verdict body reaches a fix leg. On
+   `FINDINGS`, another fresh session is handed
    those findings and commits fixes. That pair repeats up to N times, and the
    loop stops on the first of: the review approves, N iterations have run, a
    fix session commits nothing (`no-progress`), or a leg fails outright
@@ -213,7 +215,7 @@ reach it — see "What it gives up".)
    already have the summary. If you need more, read:
    ```bash
    fork-sandbox-status.sh <run-dir>            # state, branch, commits, cost, summary
-   fork-sandbox-status.sh --result <run-dir>   # the session's own summary
+   fork-sandbox-status.sh --result <run-dir>   # review report, then session account
    fork-sandbox-status.sh --json <run-dir>     # the structured summary, for jq
    fork-sandbox-status.sh --events 40 <run-dir>  # the last 40 events
    fork-sandbox-status.sh --log <run-dir>      # sandbox startup messages

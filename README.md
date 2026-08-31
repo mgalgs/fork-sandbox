@@ -113,6 +113,8 @@ repeats until the review approves, until a fix session stops making progress,
 or until the count runs out. Each leg is a whole session at its selected
 model's price, so reach for it when a defect would be expensive to find later — and
 freely on a model you host yourself, where it costs nothing.
+The review verdict also carries the report shown first by `--result`; the
+session's own account follows it.
 
 Add `--review-model <model>` to run only the review legs on a different model.
 Fix legs continue to use `--model`, keeping the original implementation model
