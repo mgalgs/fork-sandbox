@@ -675,6 +675,61 @@ render_proxy_locations() {
     printf '%s' "${body/#            /}"
 }
 
+# The server-level `include /etc/nginx/upstream-key.conf;` block (plus its
+# leading comment and the one blank line that follows it), verbatim from
+# manifests/k8s/30-proxy.yaml -- kept as a STATIC block in that file, never a
+# placeholder token, specifically so the legacy K8S_PROXY_UPSTREAM path needs
+# no substitution machinery here at all and its bytes cannot drift. A
+# K8S_PROXY_ENDPOINTS install strips this exact block out of the rendered
+# text instead (see strip_proxy_key_include below): a registered endpoint is
+# keyless by construction in this round, so it must create no Secret and
+# include no such file -- see cmd_install's own Secret-creation guard for the
+# other half of that.
+proxy_key_include_block() {
+    local block
+    # $() strips ALL trailing newlines, not just one, so the heredoc's own
+    # trailing newline cannot be relied on to produce the block's trailing
+    # blank line. A trailing sentinel (X) protects the two newlines this
+    # prints from being stripped a SECOND time by strip_proxy_key_include's
+    # own $(proxy_key_include_block) capture -- the sentinel is removed there
+    # with a parameter expansion, which does not touch trailing whitespace.
+    block="$(cat <<'BLOCK'
+            # Defines $upstream_key. Mounted from the Secret, never from this
+            # ConfigMap -- see the header above.
+            #
+            # This include sits in `server`, NOT in `http`, and that is
+            # load-bearing: the file it pulls in is a `set` directive, and
+            # nginx allows `set` only in server, location and if. At http
+            # level nginx refuses to start with
+            #   "set" directive is not allowed here
+            # which crashloops the proxy. Measured against a live cluster.
+            include /etc/nginx/upstream-key.conf;
+BLOCK
+)"
+    printf '%s\n\nX' "$block"
+}
+
+# Removes proxy_key_include_block's exact text (plus the one blank line that
+# follows it in the template) from $1, for a K8S_PROXY_ENDPOINTS
+# (keyless) render. Errors out rather than silently no-op'ing if the block
+# is not found -- a mismatch here means manifests/k8s/30-proxy.yaml's static
+# text and this function's copy of it have drifted apart, and applying a
+# keyless render that still includes upstream-key.conf would be a Secret
+# dependency this mode promises never to have.
+strip_proxy_key_include() {
+    local text="$1" block stripped
+    block="$(proxy_key_include_block)"
+    block="${block%X}"
+    stripped="${text/"$block"/}"
+    if [[ "$stripped" == "$text" ]]; then
+        echo "Error: could not find the upstream-key include block in the" >&2
+        echo "rendered proxy ConfigMap -- manifests/k8s/30-proxy.yaml and" >&2
+        echo "proxy_key_include_block in this script have drifted apart." >&2
+        return 1
+    fi
+    printf '%s' "$stripped"
+}
+
 render_proxy_locations_body() {
     local upstream_host="$1"
 
@@ -783,10 +838,8 @@ cmd_install() {
         upstream_host="${upstream_host%%/*}"
     fi
 
-    # PROXY_ENDPOINT_NAMES / PROXY_ENDPOINT_URLS (module-global, set by
-    # parse_proxy_endpoints) are not yet consumed by the render loop below --
-    # that lands with the nginx location generation. Validating them here
-    # regardless means a bad K8S_PROXY_ENDPOINTS value is refused before
+    # Fills the module-global PROXY_ENDPOINT_NAMES / PROXY_ENDPOINT_URLS
+    # arrays render_proxy_locations reads below. Validated here, before
     # anything is rendered or applied, same as every other check in this
     # function.
     parse_proxy_endpoints "$K8S_PROXY_ENDPOINTS" || exit 1
@@ -822,6 +875,16 @@ cmd_install() {
             # pass to fill in.
             file_rendered="${file_rendered//__PROXY_LOCATIONS__/$(render_proxy_locations "$upstream_host")}"
 
+            # A K8S_PROXY_ENDPOINTS (keyless) install creates no
+            # fork-sandbox-upstream-key Secret below, so it must not include
+            # a file that Secret is the only thing that ever mounts --
+            # nginx would otherwise crashloop on a missing include. The
+            # legacy K8S_PROXY_UPSTREAM path leaves this block in place
+            # untouched, which is what keeps its render byte-identical.
+            if [[ -z "$K8S_PROXY_UPSTREAM" ]]; then
+                file_rendered="$(strip_proxy_key_include "$file_rendered")" || exit 1
+            fi
+
             # A hash of the rendered nginx.conf, filled into the proxy
             # Deployment's pod-template annotation so a config change rolls
             # the proxy by itself -- see the annotation's own comment in
@@ -844,19 +907,26 @@ cmd_install() {
 
     printf '%s\n' "$rendered" | kubectl apply -f -
 
-    require_secret_file "$pi_env" || exit 1
-    local api_key
-    api_key="$(read_env_value "$pi_env" OPENROUTER_API_KEY || true)"
-    if [[ -z "$api_key" ]]; then
-        echo "Error: OPENROUTER_API_KEY not found in $pi_env. install reads" >&2
-        echo "the model proxy's key from the same file a local --harness pi" >&2
-        echo "run uses." >&2
-        exit 1
+    # OPENROUTER_API_KEY is required, and this Secret is created, ONLY on
+    # the legacy K8S_PROXY_UPSTREAM path -- a K8S_PROXY_ENDPOINTS install is
+    # keyless by construction (see proxy_key_include_block/
+    # strip_proxy_key_include above for the other half of that) and reads no
+    # credential from pi.env at all.
+    if [[ -n "$K8S_PROXY_UPSTREAM" ]]; then
+        require_secret_file "$pi_env" || exit 1
+        local api_key
+        api_key="$(read_env_value "$pi_env" OPENROUTER_API_KEY || true)"
+        if [[ -z "$api_key" ]]; then
+            echo "Error: OPENROUTER_API_KEY not found in $pi_env. install reads" >&2
+            echo "the model proxy's key from the same file a local --harness pi" >&2
+            echo "run uses." >&2
+            exit 1
+        fi
+        fs_reject_unsafe_chars "$api_key" || exit 1
+        kubectl create secret generic fork-sandbox-upstream-key \
+            --from-literal="upstream-key.conf=set \$upstream_key \"$api_key\";" \
+            --dry-run=client -o yaml | kubectl apply -f -
     fi
-    fs_reject_unsafe_chars "$api_key" || exit 1
-    kubectl create secret generic fork-sandbox-upstream-key \
-        --from-literal="upstream-key.conf=set \$upstream_key \"$api_key\";" \
-        --dry-run=client -o yaml | kubectl apply -f -
 
     echo "fork-sandbox-k8s: installed into namespace $K8S_NAMESPACE" >&2
 }
