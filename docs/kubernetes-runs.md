@@ -792,7 +792,8 @@ filesystem. The directory's real path must be under
 `/var/tmp/claude-scratch/forks/`, the same rule the local flag applies to
 its bind, and it is capped at a fixed 256 MiB — no `--context-max` flag,
 since gathered context is notes and small caches, not a size anyone has
-needed to raise — checked twice: on the host before anything is pushed,
+needed to raise — checked twice: on the host before anything is created or
+pushed,
 and again by the pod-side extractor before it extracts anything, against a
 256 MiB literal of its own rather than trusting the byte count the host
 passes it. The pod-side cap is `min(passed value, its own literal)`, so a

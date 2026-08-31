@@ -155,7 +155,7 @@ fi
 tar -tvf "$tar_file" > "$tvf_out"
 while IFS= read -r line; do
     case "$line" in
-        l*|*" link to "*)
+        l*|h*)
             echo "$label: contains a link entry; refusing the whole archive." >&2
             exit 1
             ;;

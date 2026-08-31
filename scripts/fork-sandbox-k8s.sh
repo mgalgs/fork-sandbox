@@ -123,11 +123,12 @@
 # same rule fork-sandbox.sh's own local --context-ro applies to its
 # --bind-ro -- a blanket-approved script must not be pointable at an
 # arbitrary host directory. DIR must not contain a symlink, refused on the
-# host before anything is pushed -- tar cf's ordinary walk turns one into
+# host before anything is created or pushed -- tar cf's ordinary walk turns one into
 # a link entry, which the pod-side extractor also refuses, but only after
 # the Job exists, the pod is Ready and the repository has already been
 # pushed. Capped at a fixed 256 MiB, checked twice,
-# independently: on the host before anything is pushed
+# independently: spooled and checked on the host before anything is created
+# or pushed
 # (fork-sandbox-k8s.sh itself), and again pod-side by
 # fork-sandbox-k8s-context-extract.sh before it extracts anything -- no
 # --context-max flag, since a context directory is gathered notes and
@@ -444,8 +445,17 @@ k8s_safe_name_component() {
 # branch renders a Service name the API server rejects, aborting submit
 # after the Secret, ConfigMap and Pod for that run already exist.
 k8s_safe_name() {
-    local prefix="$1" branch="$2"
-    printf '%s-%s' "$prefix" "$(k8s_safe_name_component "$branch")" | cut -c1-50 | sed 's/-$//'
+    local prefix="$1" branch="$2" component candidate digest base
+    component="$(k8s_safe_name_component "$branch")"
+    candidate="$prefix-$component"
+    if (( ${#candidate} <= 50 )); then
+        printf '%s' "$candidate"
+        return
+    fi
+    digest="$(printf '%s' "$branch" | k8s_sha256_stdin | cut -c1-8)"
+    base="${candidate:0:41}"
+    base="${base%-}"
+    printf '%s-%s' "$base" "$digest"
 }
 
 # Renders the four --review-loop-only ConfigMap keys: the review and fix
@@ -769,7 +779,7 @@ cmd_submit() {
         # tar cf's ordinary (non -h) walk turns a symlink into a link
         # entry, which fork-sandbox-k8s-context-extract.sh refuses -- but
         # only after the Job exists, the pod is Ready and the repository
-        # has already been pushed. Catching it here instead refuses before
+        # has already been pushed. Catching it here refuses before
         # any of that happens. A hard link gets the same "link entry"
         # treatment from tar (it sees the same device+inode a second time
         # under a different name), so it needs its own check here too --
@@ -782,19 +792,11 @@ cmd_submit() {
             echo "directory." >&2
             exit 1
         fi
-        # awk keeps reading to EOF rather than `exit`ing on the first
-        # duplicate: under this file's `set -euo pipefail`, an early exit
-        # closes the pipe out from under a still-writing `stat` (find
-        # batches -exec into more than one `stat` invocation once there are
-        # enough files), which takes SIGPIPE, makes `find` report "'stat'
-        # terminated by signal 13" and exit non-zero, and aborts this whole
-        # function at the assignment before the error below ever prints --
-        # exactly the directory shape (many hard links) this check exists
-        # for.
+        # Any link count above one is enough to refuse the file. Looking only
+        # for an inode seen twice inside this tree misses the dangerous case
+        # where the other name is outside the context directory.
         local context_ro_hardlink
-        context_ro_hardlink="$(find "$context_ro_real" -type f -links +1 \
-                -exec "$FS_STAT" -c '%d:%i %n' {} + \
-            | awk '{ if (seen[$1]++ && !found) { found=$2 } } END { if (found) print found }')"
+        context_ro_hardlink="$(find "$context_ro_real" -type f -links +1 -print -quit)"
         if [[ -n "$context_ro_hardlink" ]]; then
             echo "Error: --context-ro directory '$context_ro_real' contains a hard-linked file" >&2
             echo "('$context_ro_hardlink'); links are not allowed in a pushed context" >&2
@@ -1120,6 +1122,25 @@ EOF
         exit 0
     fi
 
+    # Spool and size the context before creating anything in the cluster or
+    # pushing the repository. The EXIT trap covers tar/stat failures and
+    # later submit failures, so a large temporary archive cannot leak.
+    local context_tar="" context_size=""
+    K8S_SUBMIT_CONTEXT_TAR=""
+    if [[ -n "$context_ro" ]]; then
+        context_tar="$(mktemp)"
+        K8S_SUBMIT_CONTEXT_TAR="$context_tar"
+        trap 'rm -f -- "${K8S_SUBMIT_CONTEXT_TAR:-}"' EXIT
+        tar cf "$context_tar" -C "$context_ro" .
+        context_size="$(stat -c '%s' -- "$context_tar")"
+        if (( context_size > CONTEXT_MAX_BYTES )); then
+            echo "Error: --context-ro directory '$context_ro' tars to" >&2
+            echo "$context_size bytes, over the $CONTEXT_MAX_BYTES byte" >&2
+            echo "(256 MiB) cap." >&2
+            exit 1
+        fi
+    fi
+
     if [[ "$harness" == claude ]]; then
         # The per-run Secret carrying the REAL operator access token, read
         # by the per-run proxy below -- created here, as the LAST step
@@ -1132,34 +1153,32 @@ EOF
         # token never appears on any argv beyond that one --from-literal --
         # then labeled in a SEPARATE command, since `kubectl create secret`
         # has no --overwrite of its own and this keeps the token off that
-        # second command's argv too. The trap below covers the gap between
+        # second command's argv too. Install the trap BEFORE the create
+        # command, so a failure in that command or its pipeline still cleans
+        # up. The trap covers the gap between
         # the two commands: if the label call itself is what fails, the
         # Secret it leaves behind carries no fork-sandbox/branch label, so
         # the trap's own by-label delete would miss it too -- which is why
-        # the trap also deletes this Secret by name.
+        # the trap also deletes this Secret by name. It also removes the
+        # pre-sized context archive, if this run has one.
+        K8S_SUBMIT_SAFE_NAME="$safe_name"
+        K8S_SUBMIT_BRANCH="$branch"
+        trap '
+            rm -f -- "${K8S_SUBMIT_CONTEXT_TAR:-}"
+            kubectl delete secret "$K8S_SUBMIT_SAFE_NAME-claude-token" --ignore-not-found >&2
+            kubectl delete pod,service,secret,configmap,networkpolicy \
+                -l fork-sandbox/branch="$K8S_SUBMIT_SAFE_NAME" --ignore-not-found >&2
+            echo "fork-sandbox-k8s: submit failed -- removed this run'"'"'s per-run" >&2
+            echo "proxy Pod/Service and token Secret (branch $K8S_SUBMIT_BRANCH)." >&2
+            echo "fork-sandbox-k8s: if a Job for this branch was also created," >&2
+            echo "finish cleanup with:" >&2
+            echo "  fork-sandbox-k8s.sh rm --branch $K8S_SUBMIT_BRANCH" >&2
+        ' EXIT
         kubectl create secret generic "$safe_name-claude-token" \
             --from-literal="upstream-key.conf=set \$upstream_key \"$claude_access_token\";" \
             --dry-run=client -o yaml | kubectl apply -f -
         kubectl label secret "$safe_name-claude-token" \
             fork-sandbox/branch="$safe_name" --overwrite
-
-        # From here on, every remaining step touches the cluster and can
-        # fail: the proxy apply and its readiness wait below, the Job
-        # apply, the pod readiness wait, and the repository push further
-        # down. None of them may leave the per-run proxy Pod or the
-        # Secret holding the operator's live access token orphaned in the
-        # namespace. Cleared right before this function's own success
-        # message, once nothing is left to protect.
-        trap '
-            kubectl delete secret "$safe_name-claude-token" --ignore-not-found >&2
-            kubectl delete pod,service,secret,configmap,networkpolicy \
-                -l fork-sandbox/branch="$safe_name" --ignore-not-found >&2
-            echo "fork-sandbox-k8s: submit failed -- removed this run'"'"'s per-run" >&2
-            echo "proxy Pod/Service and token Secret (branch $branch)." >&2
-            echo "fork-sandbox-k8s: if a Job for this branch was also created," >&2
-            echo "finish cleanup with:" >&2
-            echo "  fork-sandbox-k8s.sh rm --branch $branch" >&2
-        ' EXIT
 
         # Applied, and waited on, BEFORE the Job below: the egress-gate
         # initContainer probes this proxy the moment the Job's pod starts,
@@ -1209,17 +1228,6 @@ EOF
     # binary-stream reason as the repository push above.
     if [[ -n "$context_ro" ]]; then
         echo "fork-sandbox-k8s: pushing context ($context_ro) to pod $pod_name" >&2
-        local context_tar context_size
-        context_tar="$(mktemp)"
-        tar cf "$context_tar" -C "$context_ro" .
-        context_size="$(stat -c '%s' -- "$context_tar")"
-        if (( context_size > CONTEXT_MAX_BYTES )); then
-            rm -f -- "$context_tar"
-            echo "Error: --context-ro directory '$context_ro' tars to" >&2
-            echo "$context_size bytes, over the $CONTEXT_MAX_BYTES byte" >&2
-            echo "(256 MiB) cap." >&2
-            exit 1
-        fi
         kubectl exec -i "$pod_name" -- sh /mnt/fork-sandbox/context-extract.sh \
             "$POD_CONTEXT_DIR" "$CONTEXT_MAX_BYTES" context < "$context_tar"
         rm -f -- "$context_tar"

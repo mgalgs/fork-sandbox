@@ -680,6 +680,65 @@ else
 fi
 rm -f /tmp/fs-k8s-test-claude-submit.err
 
+# The cleanup trap must exist before Secret creation: a label failure leaves
+# an unlabeled Secret behind, so only the explicit by-name delete can catch
+# it. This stub makes that exact command fail and records the cleanup calls.
+printf '\n== submit cleanup trap and safe-name uniqueness ==\n'
+submit_stub_dir="$(newdir)"; tmpdirs+=("$submit_stub_dir")
+cat > "$submit_stub_dir/kubectl" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$K8S_STUB_LOG"
+verb=""; for arg in "$@"; do case "$arg" in create|apply|label|delete|wait|exec|get) verb="$arg" ;; esac; done
+case "$verb" in
+    create) printf 'apiVersion: v1\nkind: Secret\n' ;;
+    apply) cat >/dev/null ;;
+    label) exit 37 ;;
+    delete) : ;;
+    *) : ;;
+esac
+STUB
+chmod +x "$submit_stub_dir/kubectl"
+label_stub_log="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$label_stub_log")")
+PATH="$submit_stub_dir:$PATH" K8S_STUB_LOG="$label_stub_log" HOME="$claude_home" \
+    FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit \
+    --branch fs-k8s-test-label-failure --model claude-sonnet-5 --harness claude \
+    "$proj_dir" "$handoff_file" >/tmp/fs-k8s-test-label.out 2>&1
+label_rc=$?
+if (( label_rc == 0 )); then
+    no "label failure makes submit fail and invokes by-name Secret cleanup" "submit unexpectedly succeeded"
+else
+    if grep -q 'label secret fork-sandbox-agent-fs-k8s-test-label-failure-claude-token' "$label_stub_log" \
+        && grep -q 'delete secret fork-sandbox-agent-fs-k8s-test-label-failure-claude-token' "$label_stub_log"; then
+        ok "label failure makes submit fail and invokes by-name Secret cleanup"
+    else
+        no "label failure makes submit fail and invokes by-name Secret cleanup" "$(cat "$label_stub_log")"
+    fi
+fi
+rm -f /tmp/fs-k8s-test-label.out
+
+# Long branches with the same truncated prefix must still name distinct
+# objects, while the already-pinned short naming rule remains unchanged.
+name_branch_a="same-prefix-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-branch-one"
+name_branch_b="same-prefix-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-branch-two"
+name_a_out="$(newdir)/a.yaml"; tmpdirs+=("$(dirname "$name_a_out")")
+name_b_out="$(newdir)/b.yaml"; tmpdirs+=("$(dirname "$name_b_out")")
+FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch "$name_branch_a" --model moonshotai/kimi-k3 "$proj_dir" "$handoff_file" >"$name_a_out"
+FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch "$name_branch_b" --model moonshotai/kimi-k3 "$proj_dir" "$handoff_file" >"$name_b_out"
+safe_a="$(awk '/^kind: Job$/{job=1} job && /^  name:/{print $2; exit}' "$name_a_out")"
+safe_b="$(awk '/^kind: Job$/{job=1} job && /^  name:/{print $2; exit}' "$name_b_out")"
+if [[ "$safe_a" != "$safe_b" && ${#safe_a} -le 50 && ${#safe_b} -le 50 ]]; then
+    ok "long branch names get distinct safe names within the 50-byte cap"
+else
+    no "long branch names get distinct safe names within the 50-byte cap" "a='$safe_a' b='$safe_b'"
+fi
+if grep -q 'name: fork-sandbox-agent-fs-k8s-test-branch$' "$submit_out"; then
+    ok "short branch safe name remains unchanged"
+else
+    no "short branch safe name remains unchanged" "expected pinned short name"
+fi
+
 printf '\n== fork-sandbox-k8s.sh submit --dry-run --harness claude (long branch name) ==\n'
 # k8s_safe_name used to cap at 63 with no budget for the "-claude-proxy"
 # suffix appended afterward, so any branch whose sanitized form was 32+
@@ -1293,7 +1352,7 @@ refuses "submit --context-ro containing a symlink is refused" \
 # -type l` alone never matches a hard link (it has no distinct file type),
 # but `tar cf`'s walk still turns the second name for the same inode into a
 # link entry, which the pod-side extractor refuses just like a symlink's,
-# only after the Job exists and the repository has already been pushed.
+# before the Job exists or the repository is pushed.
 cr_hl_dir="$(mktemp -d /var/tmp/claude-scratch/forks/fs-k8s-test-cr-hl.XXXXXX)"; tmpdirs+=("$cr_hl_dir")
 printf 'x\n' > "$cr_hl_dir/f.txt"
 ln "$cr_hl_dir/f.txt" "$cr_hl_dir/g.txt"
@@ -1301,6 +1360,19 @@ refuses "submit --context-ro containing a hard link is refused" \
     "contains a hard-linked file" \
     env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-cr-hl --model moonshotai/kimi-k3 --context-ro "$cr_hl_dir" \
+    "$proj_dir" "$handoff_file"
+
+# A single hard-linked file is refused even when its other name is outside
+# the context tree; link count, rather than duplicate in-tree inodes, is the
+# security property being checked.
+cr_ext_parent="$(mktemp -d /var/tmp/claude-scratch/forks/fs-k8s-test-cr-ext.XXXXXX)"; tmpdirs+=("$cr_ext_parent")
+cr_ext_dir="$cr_ext_parent/context"; mkdir "$cr_ext_dir"
+printf 'outside-linked\n' > "$cr_ext_parent/outside.txt"
+ln "$cr_ext_parent/outside.txt" "$cr_ext_dir/inside.txt"
+refuses "submit --context-ro refuses a file hard-linked outside the tree" \
+    "inside.txt" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-cr-external-link --model moonshotai/kimi-k3 --context-ro "$cr_ext_dir" \
     "$proj_dir" "$handoff_file"
 
 # A two-file fixture never queues enough `stat` output to catch this: the
@@ -1336,6 +1408,83 @@ fi
 rm -f /tmp/fs-k8s-test-cr-run.err
 check "run --dry-run --context-ro renders byte-for-byte the same as submit --dry-run --context-ro" \
     "$(cat "$cr_submit_out")" "$(cat "$cr_run_out")"
+
+# The host-side archive cap is checked before any kubectl apply. A tar stub
+# makes a sparse over-cap archive without allocating 256 MiB of test data.
+cr_big_dir="$(mktemp -d /var/tmp/claude-scratch/forks/fs-k8s-test-cr-big.XXXXXX)"; tmpdirs+=("$cr_big_dir")
+printf 'too large\n' > "$cr_big_dir/file.txt"
+cr_order_stub="$(newdir)"; tmpdirs+=("$cr_order_stub")
+cat > "$cr_order_stub/tar" <<'STUB'
+#!/usr/bin/env bash
+truncate -s $((256 * 1024 * 1024 + 1)) "$2"
+STUB
+chmod +x "$cr_order_stub/tar"
+cr_order_log="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$cr_order_log")")
+cr_order_kubectl="$(newdir)/kubectl"; tmpdirs+=("$(dirname "$cr_order_kubectl")")
+cat > "$cr_order_kubectl" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$K8S_STUB_LOG"
+STUB
+chmod +x "$cr_order_kubectl"
+PATH="$cr_order_stub:$(dirname "$cr_order_kubectl"):$PATH" K8S_STUB_LOG="$cr_order_log" \
+    FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit \
+    --branch fs-k8s-test-cr-over-cap --model moonshotai/kimi-k3 --context-ro "$cr_big_dir" \
+    "$proj_dir" "$handoff_file" >/tmp/fs-k8s-test-cr-big.out 2>&1
+cr_order_rc=$?
+if (( cr_order_rc == 0 )); then
+    no "oversized context is refused before kubectl apply" "submit unexpectedly succeeded"
+else
+    if [[ ! -s "$cr_order_log" ]] && grep -q 'over the .* byte' /tmp/fs-k8s-test-cr-big.out; then
+        ok "oversized context is refused before kubectl apply"
+    else
+        no "oversized context is refused before kubectl apply" "log=$(cat "$cr_order_log") out=$(cat /tmp/fs-k8s-test-cr-big.out)"
+    fi
+fi
+rm -f /tmp/fs-k8s-test-cr-big.out
+
+# A context exec failure must remove the already-sized host archive. The git
+# wrapper lets validation and the repository push complete without a remote;
+# the kubectl stub fails only the context exec and records every call.
+cr_exec_tmp="$(newdir)"; tmpdirs+=("$cr_exec_tmp")
+cr_exec_git="$(newdir)/git"; tmpdirs+=("$(dirname "$cr_exec_git")")
+cat > "$cr_exec_git" <<'STUB'
+#!/usr/bin/env bash
+case " $* " in
+    *" push "*) exit 0 ;;
+esac
+exec /usr/bin/git "$@"
+STUB
+chmod +x "$cr_exec_git"
+cr_exec_kubectl="$(newdir)/kubectl"; tmpdirs+=("$(dirname "$cr_exec_kubectl")")
+cat > "$cr_exec_kubectl" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$K8S_STUB_LOG"
+verb=""; for arg in "$@"; do case "$arg" in apply|wait|exec|get) verb="$arg" ;; esac; done
+case "$verb" in
+    apply|wait) cat >/dev/null ;;
+    get) printf 'stub-pod\n' ;;
+    exec) cat >/dev/null; exit 19 ;;
+esac
+STUB
+chmod +x "$cr_exec_kubectl"
+cr_exec_log="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$cr_exec_log")")
+PATH="$(dirname "$cr_exec_git"):$(dirname "$cr_exec_kubectl"):$PATH" \
+    TMPDIR="$cr_exec_tmp" K8S_STUB_LOG="$cr_exec_log" \
+    FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit \
+    --branch fs-k8s-test-cr-exec-failure --model moonshotai/kimi-k3 --context-ro "$cr_dir" \
+    "$proj_dir" "$handoff_file" >/tmp/fs-k8s-test-cr-exec.out 2>&1
+cr_exec_rc=$?
+if (( cr_exec_rc == 0 )); then
+    no "context exec failure removes the temporary archive" "submit unexpectedly succeeded"
+else
+    if [[ -z "$(find "$cr_exec_tmp" -type f -print -quit)" ]] \
+        && grep -q 'exec -i stub-pod' "$cr_exec_log"; then
+        ok "context exec failure removes the temporary archive"
+    else
+        no "context exec failure removes the temporary archive" "tmp=$(find "$cr_exec_tmp" -type f) log=$(cat "$cr_exec_log")"
+    fi
+fi
+rm -f /tmp/fs-k8s-test-cr-exec.out
 
 printf '\n== fork-sandbox-k8s.sh say: argument validation (no cluster) ==\n'
 # Every one of these is rejected before cmd_say ever calls kubectl, so all
@@ -1616,6 +1765,22 @@ else
         "$(find "$cf_wf_dest" 2>&1)"
 fi
 rm -f /tmp/fs-k8s-ctx-wf.err
+
+# A regular member whose filename contains the words " link to " is not a
+# link entry; only tar's leading type character identifies links here.
+cf_phrase_src="$(newdir)"; tmpdirs+=("$cf_phrase_src")
+printf 'ordinary\n' > "$cf_phrase_src/notes link to cache"
+cf_phrase_parent="$(newdir)"; tmpdirs+=("$cf_phrase_parent")
+cf_phrase_tar="$cf_phrase_parent/phrase.tar"
+tar cf "$cf_phrase_tar" -C "$cf_phrase_src" .
+cf_phrase_dest="$cf_phrase_parent/phrase_dest"
+if "$context_extract_sh" "$cf_phrase_dest" 100000000 < "$cf_phrase_tar" \
+        >/tmp/fs-k8s-ctx-phrase.err 2>&1; then
+    ok "a regular filename containing ' link to ' extracts"
+else
+    no "a regular filename containing ' link to ' extracts" "$(cat /tmp/fs-k8s-ctx-phrase.err)"
+fi
+rm -f /tmp/fs-k8s-ctx-phrase.err
 
 # refuses an existing DEST_DIR: a second push must not merge into a first.
 cf_exist_dest="$cf_parent/exist_dest"
