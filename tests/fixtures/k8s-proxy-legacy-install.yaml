@@ -1,0 +1,383 @@
+---
+# The namespace a fork-sandbox Kubernetes deployment lives in, plus the two
+# objects that bound it: a ResourceQuota, so an unbounded run of Jobs cannot
+# starve the rest of the cluster, and a LimitRange, so a Job that names no
+# resources of its own still gets one. fork-sandbox-test is a placeholder token;
+# fork-sandbox-k8s.sh substitutes it with K8S_NAMESPACE before applying.
+#
+# Pod Security Admission is enforced at `restricted`, not left to the pod
+# specs alone -- both the agent Job and the proxy Deployment already comply
+# (runAsNonRoot, allowPrivilegeEscalation: false, capabilities dropped to
+# ALL, seccompProfile RuntimeDefault), so this label makes that containment
+# a cluster-enforced floor instead of something a future edit could weaken
+# silently. warn and audit are held to the same level, so a violation is
+# visible before it is ever admitted.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: fork-sandbox-test
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/audit: restricted
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: fork-sandbox-quota
+  namespace: fork-sandbox-test
+spec:
+  hard:
+    pods: "10"
+    requests.cpu: "10"
+    requests.memory: 20Gi
+    limits.cpu: "20"
+    limits.memory: 40Gi
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: fork-sandbox-limits
+  namespace: fork-sandbox-test
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: "1"
+        memory: 2Gi
+      defaultRequest:
+        cpu: 250m
+        memory: 512Mi
+      max:
+        cpu: "4"
+        memory: 8Gi
+---
+# The identity a fork-sandbox client runs as: enough to submit a Job, fetch
+# its result over kubectl exec, and clean up, and nothing more. It holds no
+# secret of its own -- the provider key lives in a Secret this ServiceAccount
+# cannot read, since submit, fetch and rm never need to. A CI pipeline can
+# bind a kubeconfig to this ServiceAccount's token exactly as a workstation
+# operator binds their own kubectl context to it.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fork-sandbox-client
+  namespace: fork-sandbox-test
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: fork-sandbox-client
+  namespace: fork-sandbox-test
+rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "list", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "delete"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["create", "get", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: fork-sandbox-client
+  namespace: fork-sandbox-test
+subjects:
+  - kind: ServiceAccount
+    name: fork-sandbox-client
+    namespace: fork-sandbox-test
+roleRef:
+  kind: Role
+  name: fork-sandbox-client
+  apiGroup: rbac.authorization.k8s.io
+---
+# The model-access proxy: the one thing in this namespace that ever reaches
+# the public internet, and the reason the agent pod does not have to. It
+# holds the provider key, injects it as the run passes through, and forwards
+# exactly one path. fork-sandbox-test, https://openrouter.ai and
+# openrouter.ai are placeholder tokens; fork-sandbox-k8s.sh
+# substitutes them from K8S_NAMESPACE and K8S_PROXY_UPSTREAM before applying.
+# The key itself is never in this file -- it comes from the
+# fork-sandbox-upstream-key Secret, which `install` creates separately from
+# ~/.config/fork-sandbox/pi.env, and is included into nginx's config from a
+# path nginx.conf never otherwise names, so a `kubectl get configmap` never
+# shows it.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fork-sandbox-proxy-conf
+  namespace: fork-sandbox-test
+data:
+  nginx.conf: |
+    worker_processes 1;
+    pid /tmp/nginx.pid;
+
+    events {
+        worker_connections 1024;
+    }
+
+    http {
+        resolver kube-dns.kube-system.svc.cluster.local valid=10s;
+        client_body_temp_path /tmp/client_body;
+        proxy_temp_path /tmp/proxy;
+        fastcgi_temp_path /tmp/fastcgi;
+        uwsgi_temp_path /tmp/uwsgi;
+        scgi_temp_path /tmp/scgi;
+
+        # See the per-run proxy manifest's own copy of this directive for
+        # why: nginx's 1 MiB default 413s a long-running coding session
+        # well before it exhausts its context window.
+        client_max_body_size 0;
+
+        limit_req_zone $binary_remote_addr zone=fork_sandbox:10m rate=5r/s;
+
+        server {
+            listen 8080;
+
+            # Defines $upstream_key. Mounted from the Secret, never from this
+            # ConfigMap -- see the header above.
+            #
+            # This include sits in `server`, NOT in `http`, and that is
+            # load-bearing: the file it pulls in is a `set` directive, and
+            # nginx allows `set` only in server, location and if. At http
+            # level nginx refuses to start with
+            #   "set" directive is not allowed here
+            # which crashloops the proxy. Measured against a live cluster.
+            include /etc/nginx/upstream-key.conf;
+
+            # Deny by default. Only the one path below is forwarded.
+            location / {
+                return 403;
+            }
+
+            location = /api/v1/chat/completions {
+                limit_req zone=fork_sandbox burst=10 nodelay;
+
+                set $upstream "https://openrouter.ai";
+                proxy_pass $upstream/api/v1/chat/completions;
+
+                # A variable in proxy_pass makes nginx resolve at request
+                # time through the resolver above, rather than once at
+                # startup -- so the upstream's DNS record can rotate
+                # without a restart here.
+                # proxy_ssl_verify without a trusted certificate is a
+                # startup error, not a silent downgrade -- nginx refuses
+                # with "no proxy_ssl_trusted_certificate for
+                # proxy_ssl_verify". The path is the CA bundle shipped in
+                # the nginx alpine image. Measured against a live cluster.
+                proxy_ssl_verify on;
+                proxy_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;
+                proxy_ssl_verify_depth 3;
+                proxy_ssl_server_name on;
+                proxy_ssl_name "openrouter.ai";
+                proxy_set_header Host "openrouter.ai";
+
+                proxy_set_header Authorization "Bearer $upstream_key";
+                proxy_hide_header Authorization;
+            }
+        }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fork-sandbox-proxy
+  namespace: fork-sandbox-test
+  labels:
+    app: fork-sandbox-proxy
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: fork-sandbox-proxy
+  template:
+    metadata:
+      labels:
+        app: fork-sandbox-proxy
+        # Distinguishes this pod from the per-run proxy Pod a --harness
+        # claude run renders (manifests/k8s/31-*.yaml), which carries the
+        # same `app: fork-sandbox-proxy` (needed for the platform
+        # agent-egress selector, and formerly this file's own
+        # NetworkPolicy) but must NOT be picked up by the Service selector
+        # or the NetworkPolicy podSelector below -- see both.
+        fork-sandbox/role: model-proxy
+      annotations:
+        # A hash of the ConfigMap's nginx.conf, filled in by
+        # fork-sandbox-k8s.sh at render time. A ConfigMap update alone does
+        # not restart the pods reading it -- the mounted file eventually
+        # updates on disk, but nginx does not reload on its own, and the
+        # Deployment is otherwise unchanged so nothing restarts it either.
+        # Annotating the POD TEMPLATE (not the Deployment's own metadata)
+        # changes the template on a config change, which is what makes
+        # Kubernetes roll the pods by itself. Measured against a live
+        # cluster: without this, `install` reported the ConfigMap
+        # "configured" and the Deployment "unchanged", and the proxy kept
+        # crashlooping on its stale config until a manual rollout restart.
+        checksum/nginx-conf: "bab8a1df2619f59a59ca689e6c693fc6ea3442efb0153075b15dacccc6a06ac6"
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 101
+        runAsGroup: 101
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: nginx
+          image: nginx:1.27-alpine
+          ports:
+            - containerPort: 8080
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: conf
+              mountPath: /etc/nginx/nginx.conf
+              subPath: nginx.conf
+              readOnly: true
+            - name: upstream-key
+              mountPath: /etc/nginx/upstream-key.conf
+              subPath: upstream-key.conf
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+            - name: run
+              mountPath: /var/run
+      volumes:
+        - name: conf
+          configMap:
+            name: fork-sandbox-proxy-conf
+        - name: upstream-key
+          secret:
+            secretName: fork-sandbox-upstream-key
+        - name: tmp
+          emptyDir: {}
+        - name: run
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fork-sandbox-proxy
+  namespace: fork-sandbox-test
+  labels:
+    app: fork-sandbox-proxy
+spec:
+  # Both labels, not just `app`: a --harness claude run's per-run proxy Pod
+  # carries `app: fork-sandbox-proxy` too, for the platform agent-egress
+  # policy, which keys on that label alone. A selector of `app` by itself
+  # would silently add that Pod to this Service's endpoints the moment it
+  # went Ready, round-robining every pi run's model traffic (and that
+  # run's own review-loop traffic) into a proxy whose nginx answers
+  # everything but /v1/messages with 403.
+  selector:
+    app: fork-sandbox-proxy
+    fork-sandbox/role: model-proxy
+  ports:
+    - port: 8080
+      targetPort: 8080
+      protocol: TCP
+---
+# The proxy's own policy. Unlike the agent pod's, this one is ordinary and
+# portable, so it lives here as a static file rather than behind the
+# platform plugin (see docs/k8s-platform.md for why the agent pod's policy
+# cannot). Selects on the role key, same as the Service above and for the
+# same reason: a --harness claude run's per-run proxy Pod carries
+# `app: fork-sandbox-proxy` too, and NetworkPolicies UNION rather than
+# intersect, so if this policy selected on `app` alone it would ALSO admit
+# ingress into that Pod from every `app: fork-sandbox-agent` pod in the
+# namespace -- not just the one run that Pod belongs to -- regardless of
+# whatever narrower policy that Pod's own manifest carries. That per-run
+# Pod is scoped by its own NetworkPolicy instead; see the file that renders
+# it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: fork-sandbox-proxy
+  namespace: fork-sandbox-test
+spec:
+  podSelector:
+    matchLabels:
+      app: fork-sandbox-proxy
+      fork-sandbox/role: model-proxy
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: fork-sandbox-agent
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+              - 100.64.0.0/10
+      ports:
+        - protocol: TCP
+          port: 443
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: fork-sandbox-agent-egress
+  namespace: fork-sandbox-test
+spec:
+  podSelector:
+    matchLabels:
+      app: fork-sandbox-agent
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress: []
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - podSelector:
+            matchLabels:
+              app: fork-sandbox-proxy
+      ports:
+        - protocol: TCP
+          port: 8080

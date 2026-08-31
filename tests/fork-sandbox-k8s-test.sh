@@ -105,6 +105,22 @@
 #     guards (well-formed, absolute path, `..`, symlink, hard link,
 #     over-cap, an existing DEST_DIR) are covered in its own section above,
 #     the pod-side half of this same mechanism.
+#   - K8S_PROXY_ENDPOINTS, the named-keyless-endpoint registry: a legacy
+#     K8S_PROXY_UPSTREAM install renders byte-identical to
+#     tests/fixtures/k8s-proxy-legacy-install.yaml, a render captured before
+#     this feature existed; K8S_PROXY_UPSTREAM and K8S_PROXY_ENDPOINTS set
+#     together are refused as mutually exclusive; neither set is still
+#     refused with a useful message; N registered endpoints render exactly
+#     2N EXACT-match locations (/e/<name>/v1/chat/completions,
+#     /e/<name>/v1/models, never a regex or prefix match) alongside the
+#     surviving default-deny `location /`; a K8S_PROXY_ENDPOINTS install
+#     creates no Secret, includes no upstream-key.conf, and injects no
+#     Authorization header; K8S_PROXY_ALLOW replaces the default
+#     RFC1918-except egress block with exactly the given <cidr>:<port>
+#     entries, and a hostname there is refused with a message naming why
+#     (NetworkPolicy has no hostname field); http:// is accepted to a
+#     private address and refused to a public one, checked on both the
+#     legacy K8S_PROXY_UPSTREAM path and a K8S_PROXY_ENDPOINTS entry.
 #
 # This lives in tests/ rather than scripts/tests/ on purpose: install.sh
 # iterates scripts/* and runs `sed -n 2p` on each entry to build the
@@ -486,6 +502,222 @@ else
         "not found in $submit_out"
 fi
 rm -f /tmp/fs-k8s-test-install.err /tmp/fs-k8s-test-submit.err
+
+printf '\n== K8S_PROXY_ENDPOINTS: named keyless endpoints ==\n'
+# Byte-identical legacy render: the load-bearing backward-compatibility
+# guarantee for this whole feature. tests/fixtures/k8s-proxy-legacy-install.yaml
+# is a render captured before K8S_PROXY_ENDPOINTS/K8S_PROXY_ALLOW/the
+# optional-key/the http-private-address work started, using the exact same
+# k8s.env as $config_dir/$install_out above -- an existing
+# K8S_PROXY_UPSTREAM install must still render exactly this.
+if diff -q "$repo_dir/tests/fixtures/k8s-proxy-legacy-install.yaml" "$install_out" >/dev/null 2>&1; then
+    ok "legacy K8S_PROXY_UPSTREAM install renders byte-identical to the pre-change fixture"
+else
+    no "legacy K8S_PROXY_UPSTREAM install renders byte-identical to the pre-change fixture" \
+        "$(diff "$repo_dir/tests/fixtures/k8s-proxy-legacy-install.yaml" "$install_out" 2>&1 | head -20)"
+fi
+
+# K8S_PROXY_UPSTREAM and K8S_PROXY_ENDPOINTS are mutually exclusive -- an
+# error, never a precedence rule.
+both_config_dir="$(newdir)"; tmpdirs+=("$both_config_dir")
+cat > "$both_config_dir/k8s.env" <<'CONF'
+K8S_CONTEXT=test-context
+K8S_NAMESPACE=fork-sandbox-test
+K8S_IMAGE=registry.example/you/fork-sandbox:latest
+K8S_PROXY_UPSTREAM=https://openrouter.ai
+K8S_PROXY_ENDPOINTS=primary=http://10.0.0.5:8001/v1
+K8S_DENIED_PROBE=10.0.0.1:443
+CONF
+refuses "K8S_PROXY_UPSTREAM and K8S_PROXY_ENDPOINTS together are refused" \
+    "mutually" \
+    env FORK_SANDBOX_CONFIG_DIR="$both_config_dir" "$k8s_sh" install --dry-run
+
+# Neither a key (K8S_PROXY_UPSTREAM) nor K8S_PROXY_ENDPOINTS: still a clear
+# error, not a silent default.
+neither_config_dir="$(newdir)"; tmpdirs+=("$neither_config_dir")
+cat > "$neither_config_dir/k8s.env" <<'CONF'
+K8S_CONTEXT=test-context
+K8S_NAMESPACE=fork-sandbox-test
+K8S_IMAGE=registry.example/you/fork-sandbox:latest
+K8S_DENIED_PROBE=10.0.0.1:443
+CONF
+refuses "install with neither K8S_PROXY_UPSTREAM nor K8S_PROXY_ENDPOINTS errors usefully" \
+    "K8S_PROXY_ENDPOINTS" \
+    env FORK_SANDBOX_CONFIG_DIR="$neither_config_dir" "$k8s_sh" install --dry-run
+
+# N registered endpoints render exactly 2N EXACT-match locations
+# (/e/<name>/v1/chat/completions, /e/<name>/v1/models), never a regex or
+# prefix match, and the default-deny location / survives unchanged.
+endpoints_config_dir="$(newdir)"; tmpdirs+=("$endpoints_config_dir")
+cat > "$endpoints_config_dir/k8s.env" <<'CONF'
+K8S_CONTEXT=test-context
+K8S_NAMESPACE=fork-sandbox-test
+K8S_IMAGE=registry.example/you/fork-sandbox:latest
+K8S_PROXY_ENDPOINTS=primary=http://10.0.0.5:8001/v1,secondary=http://10.0.0.6:8000/v1
+K8S_DENIED_PROBE=10.0.0.1:443
+CONF
+endpoints_out="$(newdir)/endpoints-install.yaml"; tmpdirs+=("$(dirname "$endpoints_out")")
+if FORK_SANDBOX_CONFIG_DIR="$endpoints_config_dir" "$k8s_sh" install --dry-run \
+    > "$endpoints_out" 2>/tmp/fs-k8s-test-endpoints-install.err; then
+    ok "K8S_PROXY_ENDPOINTS install --dry-run exits 0"
+else
+    no "K8S_PROXY_ENDPOINTS install --dry-run exits 0" "$(cat /tmp/fs-k8s-test-endpoints-install.err)"
+fi
+if command -v yamllint >/dev/null 2>&1; then
+    out="$(yamllint "$endpoints_out" 2>&1)"
+    if [[ -z "$out" ]]; then
+        ok "yamllint: K8S_PROXY_ENDPOINTS install --dry-run output"
+    else
+        no "yamllint: K8S_PROXY_ENDPOINTS install --dry-run output" "$out"
+    fi
+fi
+location_count="$(grep -c '^            location = /e/' "$endpoints_out")"
+check "two registered endpoints render exactly 4 (2N) locations" 4 "$location_count"
+non_exact_count="$(grep -c '^            location [^=]' "$endpoints_out")"
+check "the only non-exact-match location is the default-deny location /" 1 "$non_exact_count"
+regex_count="$(grep -c 'location ~' "$endpoints_out")"
+check "no endpoint location uses a regex match" 0 "$regex_count"
+for path in /e/primary/v1/chat/completions /e/primary/v1/models \
+    /e/secondary/v1/chat/completions /e/secondary/v1/models; do
+    if grep -qF "location = $path {" "$endpoints_out"; then
+        ok "renders an exact-match location for $path"
+    else
+        no "renders an exact-match location for $path" "not found in $endpoints_out"
+    fi
+done
+if grep -q 'location / {' "$endpoints_out"; then
+    ok "the default-deny location / survives a K8S_PROXY_ENDPOINTS install"
+else
+    no "the default-deny location / survives a K8S_PROXY_ENDPOINTS install" \
+        "not found in $endpoints_out"
+fi
+
+# Keyless by construction: no Secret, no upstream-key.conf include, no
+# Authorization header anywhere in the render.
+if grep -q 'kind: Secret' "$endpoints_out"; then
+    no "K8S_PROXY_ENDPOINTS install creates no Secret" "found 'kind: Secret' in $endpoints_out"
+else
+    ok "K8S_PROXY_ENDPOINTS install creates no Secret"
+fi
+if grep -q 'include /etc/nginx/upstream-key.conf' "$endpoints_out"; then
+    no "K8S_PROXY_ENDPOINTS install includes no upstream-key.conf" \
+        "found the include in $endpoints_out"
+else
+    ok "K8S_PROXY_ENDPOINTS install includes no upstream-key.conf"
+fi
+if grep -q 'Authorization' "$endpoints_out"; then
+    no "K8S_PROXY_ENDPOINTS install injects no Authorization header" \
+        "found 'Authorization' in $endpoints_out"
+else
+    ok "K8S_PROXY_ENDPOINTS install injects no Authorization header"
+fi
+
+# K8S_PROXY_ALLOW replaces the default RFC1918-except egress block with
+# exactly the given <cidr>:<port> entries.
+allow_config_dir="$(newdir)"; tmpdirs+=("$allow_config_dir")
+cat > "$allow_config_dir/k8s.env" <<'CONF'
+K8S_CONTEXT=test-context
+K8S_NAMESPACE=fork-sandbox-test
+K8S_IMAGE=registry.example/you/fork-sandbox:latest
+K8S_PROXY_ENDPOINTS=primary=http://10.0.0.5:8001/v1,secondary=http://10.0.0.6:8000/v1
+K8S_PROXY_ALLOW=10.0.0.5/32:8001,10.0.0.6/32:8000
+K8S_DENIED_PROBE=10.0.0.1:443
+CONF
+allow_out="$(newdir)/allow-install.yaml"; tmpdirs+=("$(dirname "$allow_out")")
+FORK_SANDBOX_CONFIG_DIR="$allow_config_dir" "$k8s_sh" install --dry-run \
+    > "$allow_out" 2>/tmp/fs-k8s-test-allow-install.err
+proxy_netpol_allow_doc="$(extract_doc_by_kind NetworkPolicy "$allow_out")"
+if grep -q 'cidr: 0.0.0.0/0' <<< "$proxy_netpol_allow_doc"; then
+    no "K8S_PROXY_ALLOW replaces the default RFC1918-except block" \
+        "still found 'cidr: 0.0.0.0/0' in the NetworkPolicy doc"
+else
+    ok "K8S_PROXY_ALLOW replaces the default RFC1918-except block"
+fi
+if grep -q 'cidr: 10.0.0.5/32' <<< "$proxy_netpol_allow_doc" \
+    && grep -q 'port: 8001' <<< "$proxy_netpol_allow_doc" \
+    && grep -q 'cidr: 10.0.0.6/32' <<< "$proxy_netpol_allow_doc" \
+    && grep -q 'port: 8000' <<< "$proxy_netpol_allow_doc"; then
+    ok "K8S_PROXY_ALLOW renders exactly the given cidr:port entries"
+else
+    no "K8S_PROXY_ALLOW renders exactly the given cidr:port entries" "$proxy_netpol_allow_doc"
+fi
+
+# A hostname in K8S_PROXY_ALLOW is refused -- NetworkPolicy has no hostname
+# field, so the error says so rather than just "invalid".
+hostname_allow_config_dir="$(newdir)"; tmpdirs+=("$hostname_allow_config_dir")
+cat > "$hostname_allow_config_dir/k8s.env" <<'CONF'
+K8S_CONTEXT=test-context
+K8S_NAMESPACE=fork-sandbox-test
+K8S_IMAGE=registry.example/you/fork-sandbox:latest
+K8S_PROXY_ENDPOINTS=primary=http://10.0.0.5:8001/v1
+K8S_PROXY_ALLOW=vllm.internal.example.com:8001
+K8S_DENIED_PROBE=10.0.0.1:443
+CONF
+refuses "a hostname in K8S_PROXY_ALLOW is refused" \
+    "NetworkPolicy has no hostname field" \
+    env FORK_SANDBOX_CONFIG_DIR="$hostname_allow_config_dir" "$k8s_sh" install --dry-run
+
+# http:// is accepted to a private address and refused to a public one, on
+# both the legacy K8S_PROXY_UPSTREAM path and a K8S_PROXY_ENDPOINTS entry.
+http_private_config_dir="$(newdir)"; tmpdirs+=("$http_private_config_dir")
+cat > "$http_private_config_dir/k8s.env" <<'CONF'
+K8S_CONTEXT=test-context
+K8S_NAMESPACE=fork-sandbox-test
+K8S_IMAGE=registry.example/you/fork-sandbox:latest
+K8S_PROXY_UPSTREAM=http://10.0.0.5:8001
+K8S_DENIED_PROBE=10.0.0.1:443
+CONF
+if FORK_SANDBOX_CONFIG_DIR="$http_private_config_dir" "$k8s_sh" install --dry-run \
+    >/tmp/fs-k8s-test-http-private.out 2>/tmp/fs-k8s-test-http-private.err; then
+    ok "K8S_PROXY_UPSTREAM http:// to a private address is accepted"
+else
+    no "K8S_PROXY_UPSTREAM http:// to a private address is accepted" \
+        "$(cat /tmp/fs-k8s-test-http-private.err)"
+fi
+
+http_public_config_dir="$(newdir)"; tmpdirs+=("$http_public_config_dir")
+cat > "$http_public_config_dir/k8s.env" <<'CONF'
+K8S_CONTEXT=test-context
+K8S_NAMESPACE=fork-sandbox-test
+K8S_IMAGE=registry.example/you/fork-sandbox:latest
+K8S_PROXY_UPSTREAM=http://8.8.8.8
+K8S_DENIED_PROBE=10.0.0.1:443
+CONF
+refuses "K8S_PROXY_UPSTREAM http:// to a public address is refused" \
+    "open internet in cleartext" \
+    env FORK_SANDBOX_CONFIG_DIR="$http_public_config_dir" "$k8s_sh" install --dry-run
+
+endpoints_http_private_config_dir="$(newdir)"; tmpdirs+=("$endpoints_http_private_config_dir")
+cat > "$endpoints_http_private_config_dir/k8s.env" <<'CONF'
+K8S_CONTEXT=test-context
+K8S_NAMESPACE=fork-sandbox-test
+K8S_IMAGE=registry.example/you/fork-sandbox:latest
+K8S_PROXY_ENDPOINTS=primary=http://10.0.0.5:8001/v1
+K8S_DENIED_PROBE=10.0.0.1:443
+CONF
+if FORK_SANDBOX_CONFIG_DIR="$endpoints_http_private_config_dir" "$k8s_sh" install --dry-run \
+    >/tmp/fs-k8s-test-endpoints-http-private.out 2>/tmp/fs-k8s-test-endpoints-http-private.err; then
+    ok "K8S_PROXY_ENDPOINTS http:// to a private address is accepted"
+else
+    no "K8S_PROXY_ENDPOINTS http:// to a private address is accepted" \
+        "$(cat /tmp/fs-k8s-test-endpoints-http-private.err)"
+fi
+
+endpoints_http_public_config_dir="$(newdir)"; tmpdirs+=("$endpoints_http_public_config_dir")
+cat > "$endpoints_http_public_config_dir/k8s.env" <<'CONF'
+K8S_CONTEXT=test-context
+K8S_NAMESPACE=fork-sandbox-test
+K8S_IMAGE=registry.example/you/fork-sandbox:latest
+K8S_PROXY_ENDPOINTS=primary=http://1.2.3.4:8001/v1
+K8S_DENIED_PROBE=10.0.0.1:443
+CONF
+refuses "K8S_PROXY_ENDPOINTS http:// to a public address is refused" \
+    "open internet in cleartext" \
+    env FORK_SANDBOX_CONFIG_DIR="$endpoints_http_public_config_dir" "$k8s_sh" install --dry-run
+
+rm -f /tmp/fs-k8s-test-endpoints-install.err /tmp/fs-k8s-test-allow-install.err \
+    /tmp/fs-k8s-test-http-private.out /tmp/fs-k8s-test-http-private.err \
+    /tmp/fs-k8s-test-endpoints-http-private.out /tmp/fs-k8s-test-endpoints-http-private.err
 
 printf '\n== fork-sandbox-k8s.sh submit --dry-run --harness claude ==\n'
 # The default (--harness pi, i.e. submit_out above) renders no claude-proxy
