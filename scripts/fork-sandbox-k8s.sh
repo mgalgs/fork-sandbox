@@ -635,6 +635,119 @@ parse_proxy_endpoints() {
     return 0
 }
 
+# The nginx location block(s) inside the proxy's server {} -- fills
+# __PROXY_LOCATIONS__ in manifests/k8s/30-proxy.yaml. Built fully-resolved in
+# bash, rather than left as sed tokens for the per-file substitution pass in
+# cmd_install to fill in later, because a K8S_PROXY_ENDPOINTS registry can
+# name the same base URL more than once under different logical names, and a
+# global sed token has only one value per render.
+#
+# Legacy K8S_PROXY_UPSTREAM (upstream_host given as $1) renders exactly what
+# this repo has always rendered here -- byte-for-byte, Authorization header
+# included -- to hold the backward-compatibility guarantee: an existing
+# install using K8S_PROXY_UPSTREAM must render identically after this
+# function existed as after it didn't.
+#
+# K8S_PROXY_ENDPOINTS (read from the PROXY_ENDPOINT_NAMES / PROXY_ENDPOINT_URLS
+# arrays parse_proxy_endpoints filled in) renders two EXACT-match locations
+# per registered name -- /e/<name>/v1/chat/completions and
+# /e/<name>/v1/models -- never a regex or prefix match: N endpoints must
+# widen the surface by exactly 2N known paths and nothing else. Neither
+# carries an Authorization header -- a registered endpoint is keyless by
+# construction in this round; see cmd_install's Secret/include handling for
+# the other half of that. Preserves the same $upstream variable-in-proxy_pass
+# trick and resolver the legacy block uses (see manifests/k8s/30-proxy.yaml's
+# own comment on it) so nginx resolves each endpoint's host at request time
+# rather than pinning a DNS answer at startup.
+#
+# manifests/k8s/30-proxy.yaml's own __PROXY_LOCATIONS__ placeholder line
+# carries the block's 12-space indent already, so the raw template stays
+# valid YAML block-scalar content before substitution -- a token dedented to
+# column 0 ends the block scalar as far as a YAML parser is concerned, even
+# though nothing downstream of that indentation actually needs it (the
+# rendered, fully-substituted output is valid either way). This wrapper
+# strips that same 12-space indent from just the first line of
+# render_proxy_locations_body's output, so it isn't doubled up; every other
+# line supplies its own indent, since nothing in the template indents them.
+render_proxy_locations() {
+    local body
+    body="$(render_proxy_locations_body "$@")" || return 1
+    printf '%s' "${body/#            /}"
+}
+
+render_proxy_locations_body() {
+    local upstream_host="$1"
+
+    if [[ -n "$K8S_PROXY_UPSTREAM" ]]; then
+        cat <<EOF
+            location = /api/v1/chat/completions {
+                limit_req zone=fork_sandbox burst=10 nodelay;
+
+                set \$upstream "$K8S_PROXY_UPSTREAM";
+                proxy_pass \$upstream/api/v1/chat/completions;
+
+                # A variable in proxy_pass makes nginx resolve at request
+                # time through the resolver above, rather than once at
+                # startup -- so the upstream's DNS record can rotate
+                # without a restart here.
+                # proxy_ssl_verify without a trusted certificate is a
+                # startup error, not a silent downgrade -- nginx refuses
+                # with "no proxy_ssl_trusted_certificate for
+                # proxy_ssl_verify". The path is the CA bundle shipped in
+                # the nginx alpine image. Measured against a live cluster.
+                proxy_ssl_verify on;
+                proxy_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;
+                proxy_ssl_verify_depth 3;
+                proxy_ssl_server_name on;
+                proxy_ssl_name "$upstream_host";
+                proxy_set_header Host "$upstream_host";
+
+                proxy_set_header Authorization "Bearer \$upstream_key";
+                proxy_hide_header Authorization;
+            }
+EOF
+        return 0
+    fi
+
+    local i name base host
+    for (( i = 0; i < ${#PROXY_ENDPOINT_NAMES[@]}; i++ )); do
+        name="${PROXY_ENDPOINT_NAMES[$i]}"
+        base="${PROXY_ENDPOINT_URLS[$i]}"
+        host="${base#*://}"
+        host="${host%%/*}"
+        (( i > 0 )) && printf '\n'
+        cat <<EOF
+            location = /e/$name/v1/chat/completions {
+                limit_req zone=fork_sandbox burst=10 nodelay;
+
+                set \$upstream "$base";
+                proxy_pass \$upstream/chat/completions;
+
+                proxy_ssl_verify on;
+                proxy_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;
+                proxy_ssl_verify_depth 3;
+                proxy_ssl_server_name on;
+                proxy_ssl_name "$host";
+                proxy_set_header Host "$host";
+            }
+
+            location = /e/$name/v1/models {
+                limit_req zone=fork_sandbox burst=10 nodelay;
+
+                set \$upstream "$base";
+                proxy_pass \$upstream/models;
+
+                proxy_ssl_verify on;
+                proxy_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;
+                proxy_ssl_verify_depth 3;
+                proxy_ssl_server_name on;
+                proxy_ssl_name "$host";
+                proxy_set_header Host "$host";
+            }
+EOF
+    done
+}
+
 cmd_install() {
     local dry_run=false
     while (( $# )); do
@@ -703,6 +816,12 @@ cmd_install() {
             -e "s|__PROXY_UPSTREAM__|$K8S_PROXY_UPSTREAM|g" \
             "$f")"
         if [[ "$(basename "$f")" == 30-proxy.yaml ]]; then
+            # The nginx location block(s) for whichever upstream mode is
+            # active -- built fully-resolved (see render_proxy_locations's
+            # own header for why), never left as a token for a later sed
+            # pass to fill in.
+            file_rendered="${file_rendered//__PROXY_LOCATIONS__/$(render_proxy_locations "$upstream_host")}"
+
             # A hash of the rendered nginx.conf, filled into the proxy
             # Deployment's pod-template annotation so a config change rolls
             # the proxy by itself -- see the annotation's own comment in
