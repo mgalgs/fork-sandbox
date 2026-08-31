@@ -1,46 +1,129 @@
 # fork-sandbox
 
-Run a coding agent unattended, in a sandbox, on a throwaway clone of your repo —
-then get the work back as a branch.
+*Sandboxed agents and orchestration framework*
 
-```bash
-fork-sandbox.sh ~/src/myproject /var/tmp/claude-scratch/handoff.md
+**Skills:**
+
+- `/fork-sandbox` - Runs an agent in a sandbox and gets a result back as a
+  git branch and assets outbox. Multi-harness, multi-model. Includes a
+  built-in review+fix loop (optional).
+- `/sandbox-coder-mode` - For interactive orchestrator sessions where all
+  implementation tasks are delegated to `/fork-sandbox` agents. See
+  [Driving sandbox-coder-mode](#driving-sandbox-coder-mode).
+- `/lkml-mode` - Performs an lkml (Linux Kernel Mailing List) style patch
+  series code review by using a fleet of asynchronous, sandboxed agents.
+  Output is a git branch and a maildir of the threaded "mailing list"
+  discussion.
+
+**Scripts (porcelain) for programmatic sandbox use:**
+
+- `fork-sandbox.sh <project-dir> <handoff-file>` — launch a run
+  (`--harness`, `--review-loop`, `--refresh-at`, `--k8s`, ...)
+- `fork-sandbox-status.sh <run-dir>` — watch it (`--result`, `--monitor`)
+- `fork-sandbox-say.sh <run-dir> <text>` — steer a running agent
+- `fork-sandbox-k8s.sh submit|fetch --branch <name> ...` — start a cluster
+  run from one machine, collect it from another
+- `sandbox-run-log.py list|stats` — the run ledger: harness, model, tokens,
+  cost, outcome
+- `lkml-round.sh`, `lkml-mailbox.sh`, `lkml-revise.sh`, `lkml-forklift.sh` —
+  the lkml-mode toolchain
+
+Usage examples for all of these: [Scripts](#scripts).
+
+**Sandbox runtimes**
+
+The above scripts and skills require a "sandbox runtime". This repo ships
+support for:
+
+- Linux (`bwrap`)
+- macOS (containers — so actually just Linux)
+- Kubernetes (NetworkPolicy egress, honoured by Calico, Cilium, kube-router
+  and friends; details in [docs/kubernetes-runs.md](docs/kubernetes-runs.md))
+
+**Agent harnesses**
+
+Claude, Codex, and Pi are currently supported. Pi also has a `pi-local`
+variant which is configured to run against your own LLM endpoint (zero
+network access).
+
+- **Most secure:** `/fork-sandbox --harness pi-local` under Linux. Runs
+  without any network whatsoever. External services (docker compose stack,
+  other endpoints) can be individually mounted into the sandbox as unix
+  sockets.
+- **Frontier models:** `/fork-sandbox --harness claude`
+- **Most scalable:** `/fork-sandbox --k8s` — each run is a Kubernetes Job.
+
+## Pro Recipes
+
+Recipe: Interactive orchestrator session using a frontier model
+(claude+fable or codex+sol) with implementation delegated to a zero-cost,
+self-hosted endpoint, but with 2 rounds of claude+opus (paid) review:
+
+```
+/sandbox-coder-mode --harness pi-local --review-harness claude --review-model opus --review-loop 2
 ```
 
-That command clones the project, starts a headless agent inside a bubblewrap
-sandbox with no access to your home directory, waits for it to finish, fetches
-its branch back into your repo, and appends what it cost to a run log. You get
-a run directory to watch and a branch to review. Your checkout is never
-touched.
+(you can ask your agent to save these as your machine-local defaults for
+`/sandbox-coder-mode` so that in future sessions you just have to run
+`/sandbox-coder-mode`)
 
-Or from an interactive session, where the skill writes the handoff for you:
+---
 
-```
-/fork-sandbox fix the flaky tests
-```
-
-You can also tell your agent to delegate all implementation tasks to sandboxed
-agents with `/sandbox-coder-mode`:
+Recipe: fan out implementation experiments
 
 ```
-/sandbox-coder-mode
-
-fix the flaky tests
-...
-juice up the flux capacitor
-...
-rule the world
+Implement alternatives B, C, and E in parallel with /fork-sandbox --k8s
 ```
 
-It runs **Claude Code**, **pi**, or **codex**, against a hosted API or against
-a model on your own hardware.
+---
 
-> **Linux by default; macOS through a container.** The default isolation is
-> bubblewrap plus a network namespace, which macOS has no equivalent for. A
-> container backend implements the same contract and is the macOS path: build
-> the sandbox image, set two environment variables, and the same commands work.
-> Two macOS-specific properties are still unverified, and both fail closed —
-> see [Portability](#portability).
+Recipe: course-correct a run that is already going — delivered at the
+agent's next tool call, with the same authority as the handoff:
+
+```
+fork-sandbox-say.sh <run-dir> "stop refactoring the tests; ship the fix first"
+```
+
+(in `/sandbox-coder-mode` you just say it — the session relays your words
+into the running sandbox as an operator addendum)
+
+---
+
+Recipe: hand it a task too big for one context window. A run that fills
+its window writes a handoff and forks a fresh session on the same clone
+and branch — `--refresh-at`, on by default — so one launch chains
+sessions until the work is done instead of degrading into compaction
+(see [A run that refreshes itself](#a-run-that-refreshes-itself)):
+
+```
+/fork-sandbox implement the whole migration plan in PLAN.md, checking off items as you go
+```
+
+---
+
+Recipe: adversarial review of a whole branch before a public push
+
+```
+Re-roll origin/main..HEAD into a reviewable patch series with /lkml-mode and
+run the panel on it. I want the defect list before this goes public.
+```
+
+---
+
+Recipe: a cold second opinion on an existing branch — one review leg, no
+coding, no fix:
+
+```
+/fork-sandbox --review-only --checkout feature-x --review-base main
+```
+
+---
+
+Recipe: find out whether the cheap model is actually cheaper
+
+```
+sandbox-run-log.py stats --by model,task.kind
+```
 
 ## Why
 
@@ -75,6 +158,13 @@ What you get:
 
 ## Install
 
+> **Linux by default; macOS through a container.** The default isolation is
+> bubblewrap plus a network namespace, which macOS has no equivalent for. A
+> container backend implements the same contract and is the macOS path: build
+> the sandbox image, set two environment variables, and the same commands work.
+> Two macOS-specific properties are still unverified, and both fail closed —
+> see [Portability](#portability).
+
 ```bash
 git clone https://github.com/mgalgs/fork-sandbox ~/src/fork-sandbox
 cd ~/src/fork-sandbox
@@ -93,6 +183,16 @@ rules. A blanket approval is permanent, and the doc explains what each script
 does and does not let a caller do.
 
 ## How a run works
+
+```bash
+fork-sandbox.sh ~/src/myproject /var/tmp/claude-scratch/handoff.md
+```
+
+That command clones the project, starts a headless agent inside a bubblewrap
+sandbox with no access to your home directory, waits for it to finish, fetches
+its branch back into your repo, and appends what it cost to a run log. You get
+a run directory to watch and a branch to review. Your checkout is never
+touched. In detail:
 
 1. **Write a handoff.** A markdown file: the task, the constraints, what
    "done" means. It is the run's entire prompt — there is nobody to ask a
@@ -214,34 +314,7 @@ reports back.
 model endpoint) from `~/.config/fork-sandbox/`. `fork-sandbox.sh configure`
 discovers and installs it for you — see [docs/configure.md](docs/configure.md).
 
-## Skills
-
-Five, in plain markdown; `install.sh` links them into Claude Code's skills
-directory, the `~/.agents/skills` convention, and pi's. Codex users drive
-the scripts directly.
-
-For the session that orchestrates runs:
-
-- **`sandbox-coder-mode`** — the workhorse. A standing mode: your session
-  stops writing code and becomes orchestrator, reviewer and integrator;
-  every edit happens in a sandboxed run. *Stay in idea space when you drive
-  it* — see [below](#driving-sandbox-coder-mode).
-- **`fork-sandbox`** — one run at a time: writes the handoff, launches,
-  watches, reads the branch back. *Say what "done" means — the handoff is
-  the run's entire prompt.*
-- **`lkml-mode`** — kernel-style review of a patch series: a shared mailbox,
-  AI-persona reviewers replying in threads, v2, v3... until the right
-  reviewers sign off and no NAK stands. *For a change that deserves several
-  adversarial voices, not a diff you can read yourself.*
-
-Bound into every run, for the agent inside the sandbox:
-
-- **`commit-then-review`** — commit, then review the work before reporting
-  back.
-- **`code-review-portable`** — the review itself, for a harness with no
-  built-in reviewer.
-
-### Driving sandbox-coder-mode
+## Driving sandbox-coder-mode
 
 Stay in *idea space*: the orchestrator session is where you think — goals,
 constraints, verdicts on what comes back. The moment you catch yourself
