@@ -16,7 +16,10 @@
 # --personas comma-separated persona slugs, each naming a file
 #            <personas-dir>/<persona>.md. Every persona in the list gets
 #            launched, whatever the task -- see the lkml-mode skill for why
-#            "linus" belongs on every panel.
+#            "linus" belongs on every panel. A persona file's frontmatter
+#            may carry `thinking: <level>` (pi's --thinking values); it is
+#            passed to that seat's pi via --pi-args on the pi and pi-local
+#            harnesses and ignored on the others.
 # --reply-to may repeat. With none given, every launched persona reviews the
 #            WHOLE series fresh. With one or more given, every launched
 #            persona is told to reply ONLY to those specific threads --
@@ -242,6 +245,7 @@ for persona in "${personas[@]}"; do
     harness="$(lkml_persona_field "$persona_file" harness)"
     model="$(lkml_persona_field "$persona_file" model)"
     display="$(lkml_persona_field "$persona_file" display)"
+    thinking="$(lkml_persona_field "$persona_file" thinking)"
     [[ -n "$harness" ]] || harness="claude"
     [[ -n "$display" ]] || display="$persona"
     if [[ -n "$model_override" ]]; then
@@ -268,8 +272,21 @@ for persona in "${personas[@]}"; do
     harness_spec="$harness"
     [[ -n "$model" ]] && harness_spec="$harness/$model"
 
-    echo "fork-sandbox lkml-round: launching $persona ($harness_spec)..." >&2
+    # A persona's `thinking:` field sets pi's reasoning level for its seat.
+    # It only means something on a harness that starts pi; fork-sandbox.sh
+    # refuses --pi-args elsewhere, so it is dropped for claude and codex.
+    # A small local thinking model left at its default has been measured
+    # spending its whole reply budget reasoning (stop=length, repeatedly)
+    # and writing no .git/lkml-out file at all — a reviewer that says
+    # nothing. `thinking: low` is the fix for that seat, not a smaller panel.
+    pi_args=()
+    if [[ -n "$thinking" && ( "$harness" == "pi" || "$harness" == "pi-local" ) ]]; then
+        pi_args=(--pi-args "--thinking $thinking")
+    fi
+
+    echo "fork-sandbox lkml-round: launching $persona ($harness_spec${thinking:+, thinking $thinking})..." >&2
     launch_out="$(fork-sandbox.sh --harness "$harness_spec" --checkout "$checkout_ref" \
+        "${pi_args[@]}" \
         --branch "$branch" --task-meta "$task_meta" "$project" "$handoff_file" 2>&1)"
     rc=$?
     run_dir="$(printf '%s\n' "$launch_out" | sed -n 's/^  run dir:  *//p' | head -n1)"
