@@ -3555,6 +3555,7 @@ started_at="$(date +%s)"
     fi
     printf '\n'
     printf 'run_dir=%q\n' "$run_dir"
+    printf 'script_dir=%q\n' "$script_dir"
     printf 'clone_dir=%q\n' "$clone_dir"
     printf 'origin_repo=%q\n' "$origin_repo"
     printf 'branch=%q\n' "$branch"
@@ -3621,6 +3622,10 @@ started_at="$(date +%s)"
     printf '%q ' "${review_sandbox_cmd[@]}"
     printf ')\n\n'
     cat <<'RUNNER'
+# Load shared predicates used by the status script as well as this runner, so
+# report display and summary provenance cannot drift between processes.
+source "$script_dir/fork-sandbox-lib.sh"
+
 events="$run_dir/events.jsonl"
 sandbox_log="$run_dir/sandbox.log"
 
@@ -4952,7 +4957,20 @@ elif [[ -n "$run_cost_fmt" && "$loop_cost_unknown" != "1" ]]; then
 fi
 
 report_from="session"
-if compgen -G "$run_dir/review-verdict-*.md" >/dev/null 2>&1; then
+latest_report_verdict=""
+latest_report_n=""
+for report_verdict in "$run_dir"/review-verdict-*.md; do
+    [[ -f "$report_verdict" ]] || continue
+    report_n="${report_verdict##*/review-verdict-}"
+    report_n="${report_n%.md}"
+    [[ "$report_n" =~ ^[0-9]+$ ]] || continue
+    if [[ -z "$latest_report_n" || "$report_n" -gt "$latest_report_n" ]]; then
+        latest_report_n="$report_n"
+        latest_report_verdict="$report_verdict"
+    fi
+done
+if [[ -n "$latest_report_verdict" ]] \
+    && fs_verdict_has_usable_report "$latest_report_verdict"; then
     report_from="review"
 fi
 

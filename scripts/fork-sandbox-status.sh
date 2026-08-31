@@ -215,10 +215,7 @@ print_review_report() {
     leg="${verdict##*/review-verdict-}"; leg="${leg%.md}"
     status="$(head -n 1 -- "$verdict" | tr -d '\000-\037\177' \
         | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-    if awk '
-        $0 == "## Report" { headings++; in_report = 1; next }
-        in_report && /[^[:space:]]/ { usable = 1 }
-        END { exit !(headings == 1 && usable) }' "$verdict" 2>/dev/null; then
+    if fs_verdict_has_usable_report "$verdict"; then
         printf '== report: review leg %s (%s) ==\n' "$leg" "$status"
         awk '/^## Report$/ { in_report=1; next } in_report { print }' "$verdict" \
             | tr -d '\000-\010\013-\037\177'

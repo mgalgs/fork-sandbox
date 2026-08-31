@@ -463,6 +463,8 @@ if [[ "$approved_no_report_rc" == 0 && -n "$approved_no_report_rd" ]]; then
     ok "an APPROVED review-only verdict without a report exits 0"
     check "APPROVED without a report ends approved" "approved" \
         "$(jq -r '.ended' "$approved_no_report_rd/review-loop.json")"
+    check "APPROVED without a report keeps session provenance" "session" \
+        "$(jq -r '.report_from' "$approved_no_report_rd/summary.json")"
 else
     no "an APPROVED review-only verdict without a report exits 0" \
         "rc=$approved_no_report_rc rd=$approved_no_report_rd $approved_no_report_out"

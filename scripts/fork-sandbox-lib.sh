@@ -73,6 +73,17 @@ fs_require_gnu_tools() {
     return 0
 }
 
+# A report is usable only when the verdict has exactly one Report heading and
+# non-whitespace content after it. Keep this decision in one place because
+# status display and summary provenance must describe the same report.
+fs_verdict_has_usable_report() {
+    local verdict="$1"
+    awk '
+        $0 == "## Report" { headings++; in_report = 1; next }
+        in_report && /[^[:space:]]/ { usable = 1 }
+        END { exit !(headings == 1 && usable) }' "$verdict" 2>/dev/null
+}
+
 # The artifact outbox's size budget, shared by every path that enforces or
 # reports it: fork-sandbox-k8s.sh's own pull-back cap, the default handed to
 # fork-sandbox-k8s-outbox-extract.sh when it is invoked without an explicit
