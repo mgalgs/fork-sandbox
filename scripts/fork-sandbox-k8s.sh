@@ -168,7 +168,16 @@
 #                         registry you control; see docs/kubernetes-runs.md
 #                         for concrete options.
 #   K8S_PROXY_UPSTREAM=   https://<provider host>, e.g. https://openrouter.ai.
-#                         Required for install.
+#                         The legacy single, API-keyed upstream. install
+#                         requires this or K8S_PROXY_ENDPOINTS, never both.
+#   K8S_PROXY_ENDPOINTS=  <name>=<base-url>[,<name>=<base-url>...] -- one or
+#                         more named, keyless, OpenAI-compatible endpoints
+#                         (vLLM, Ollama, TGI), e.g.
+#                         primary=http://10.0.0.5:8001/v1. Mutually
+#                         exclusive with K8S_PROXY_UPSTREAM.
+#   K8S_PROXY_ALLOW=      <cidr>:<port>[,<cidr>:<port>...] egress allowlist
+#                         for K8S_PROXY_ENDPOINTS hosts. Unset keeps the
+#                         default policy (any host except RFC1918, on 443).
 #   K8S_DENIED_PROBE=     host:port the egress gate must NOT reach.
 #                         Required for submit.
 #   K8S_RUN_TTL=          seconds the pod idles after the agent exits.
@@ -253,6 +262,8 @@ K8S_NAMESPACE="$(read_env_value "$k8s_env" K8S_NAMESPACE || true)"
 K8S_NAMESPACE="${K8S_NAMESPACE:-fork-sandbox}"
 K8S_IMAGE="$(read_env_value "$k8s_env" K8S_IMAGE || true)"
 K8S_PROXY_UPSTREAM="$(read_env_value "$k8s_env" K8S_PROXY_UPSTREAM || true)"
+K8S_PROXY_ENDPOINTS="$(read_env_value "$k8s_env" K8S_PROXY_ENDPOINTS || true)"
+K8S_PROXY_ALLOW="$(read_env_value "$k8s_env" K8S_PROXY_ALLOW || true)"
 K8S_DENIED_PROBE="$(read_env_value "$k8s_env" K8S_DENIED_PROBE || true)"
 K8S_RUN_TTL="$(read_env_value "$k8s_env" K8S_RUN_TTL || true)"
 K8S_RUN_TTL="${K8S_RUN_TTL:-3600}"
@@ -271,7 +282,8 @@ if [[ -n "$K8S_RUN_TTL" && ! "$K8S_RUN_TTL" =~ ^[0-9]+$ ]]; then
 fi
 
 fs_reject_unsafe_chars "$K8S_CONTEXT" "$K8S_NAMESPACE" "$K8S_IMAGE" \
-    "$K8S_PROXY_UPSTREAM" "$K8S_DENIED_PROBE" "$GIT_USER_NAME" "$GIT_USER_EMAIL" \
+    "$K8S_PROXY_UPSTREAM" "$K8S_PROXY_ENDPOINTS" "$K8S_PROXY_ALLOW" \
+    "$K8S_DENIED_PROBE" "$GIT_USER_NAME" "$GIT_USER_EMAIL" \
     || exit 1
 
 kubectl() {
@@ -570,6 +582,59 @@ the clone.
 EOF
 }
 
+# Parses K8S_PROXY_ENDPOINTS ("name=url,name=url,...") into the
+# PROXY_ENDPOINT_NAMES / PROXY_ENDPOINT_URLS arrays (module-global, not
+# local -- callers read them back after this returns). An empty spec is not
+# an error here; cmd_install is what decides whether an empty registry is
+# acceptable, since that depends on K8S_PROXY_UPSTREAM too. Each name
+# becomes a path segment (/e/<name>/v1/...) on the rendered proxy, so it is
+# validated against the same RFC1123-label shape K8S_NAMESPACE already
+# uses above -- one registry entry, one deliberate config roll; the model
+# behind it is free to change without touching this.
+parse_proxy_endpoints() {
+    local spec="$1" entry name url seen=","
+    PROXY_ENDPOINT_NAMES=()
+    PROXY_ENDPOINT_URLS=()
+    [[ -z "$spec" ]] && return 0
+
+    local -a entries
+    IFS=',' read -ra entries <<< "$spec"
+    for entry in "${entries[@]}"; do
+        if [[ "$entry" != *=* ]]; then
+            echo "Error: K8S_PROXY_ENDPOINTS entry '$entry' is not" >&2
+            echo "<logical-name>=<base-url>." >&2
+            return 1
+        fi
+        name="${entry%%=*}"
+        url="${entry#*=}"
+        if [[ -z "$name" ]]; then
+            echo "Error: K8S_PROXY_ENDPOINTS entry '$entry' has an empty" >&2
+            echo "name." >&2
+            return 1
+        fi
+        if [[ ! "$name" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]]; then
+            echo "Error: K8S_PROXY_ENDPOINTS name '$name' is not valid -- it" >&2
+            echo "becomes a path segment (/e/$name/v1/...) and must match" >&2
+            echo '^[a-z0-9]([a-z0-9-]*[a-z0-9])?$.' >&2
+            return 1
+        fi
+        if [[ -z "$url" ]]; then
+            echo "Error: K8S_PROXY_ENDPOINTS entry '$name' has an empty" >&2
+            echo "base URL." >&2
+            return 1
+        fi
+        if [[ "$seen" == *",$name,"* ]]; then
+            echo "Error: K8S_PROXY_ENDPOINTS name '$name' is registered more" >&2
+            echo "than once. Each logical name must be unique." >&2
+            return 1
+        fi
+        seen+="$name,"
+        PROXY_ENDPOINT_NAMES+=("$name")
+        PROXY_ENDPOINT_URLS+=("$url")
+    done
+    return 0
+}
+
 cmd_install() {
     local dry_run=false
     while (( $# )); do
@@ -579,18 +644,39 @@ cmd_install() {
         esac
     done
 
-    if [[ -z "$K8S_PROXY_UPSTREAM" ]]; then
-        echo "Error: K8S_PROXY_UPSTREAM is not set in $k8s_env." >&2
-        echo "Add a line: K8S_PROXY_UPSTREAM=https://openrouter.ai" >&2
+    if [[ -n "$K8S_PROXY_UPSTREAM" && -n "$K8S_PROXY_ENDPOINTS" ]]; then
+        echo "Error: K8S_PROXY_UPSTREAM and K8S_PROXY_ENDPOINTS are mutually" >&2
+        echo "exclusive -- set one or the other, never both. K8S_PROXY_UPSTREAM" >&2
+        echo "is the legacy single API-keyed upstream; K8S_PROXY_ENDPOINTS" >&2
+        echo "registers one or more named, keyless endpoints instead." >&2
         exit 1
     fi
-    if [[ "$K8S_PROXY_UPSTREAM" != https://* ]]; then
-        echo "Error: K8S_PROXY_UPSTREAM must start with https://, got" >&2
-        echo "'$K8S_PROXY_UPSTREAM'." >&2
+    if [[ -z "$K8S_PROXY_UPSTREAM" && -z "$K8S_PROXY_ENDPOINTS" ]]; then
+        echo "Error: neither K8S_PROXY_UPSTREAM nor K8S_PROXY_ENDPOINTS is set" >&2
+        echo "in $k8s_env. Add one of:" >&2
+        echo "  K8S_PROXY_UPSTREAM=https://openrouter.ai" >&2
+        echo "  K8S_PROXY_ENDPOINTS=primary=http://10.0.0.5:8001/v1" >&2
         exit 1
     fi
-    local upstream_host="${K8S_PROXY_UPSTREAM#https://}"
-    upstream_host="${upstream_host%%/*}"
+
+    local upstream_host=""
+    if [[ -n "$K8S_PROXY_UPSTREAM" ]]; then
+        if [[ "$K8S_PROXY_UPSTREAM" != https://* ]]; then
+            echo "Error: K8S_PROXY_UPSTREAM must start with https://, got" >&2
+            echo "'$K8S_PROXY_UPSTREAM'." >&2
+            exit 1
+        fi
+        upstream_host="${K8S_PROXY_UPSTREAM#https://}"
+        upstream_host="${upstream_host%%/*}"
+    fi
+
+    # PROXY_ENDPOINT_NAMES / PROXY_ENDPOINT_URLS (module-global, set by
+    # parse_proxy_endpoints) are not yet consumed by the render loop below --
+    # that lands with the nginx location generation. Validating them here
+    # regardless means a bad K8S_PROXY_ENDPOINTS value is refused before
+    # anything is rendered or applied, same as every other check in this
+    # function.
+    parse_proxy_endpoints "$K8S_PROXY_ENDPOINTS" || exit 1
 
     resolve_platform || exit 1
 
