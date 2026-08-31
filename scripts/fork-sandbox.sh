@@ -68,11 +68,14 @@
 #                        A model given both here and via --review-model
 #                        conflicts, same as --harness/--model. --harness
 #                        pi-local (sealed, no network) with a networked
-#                        --review-harness is refused: the review leg would
-#                        send the clone's contents to that harness's model
-#                        provider, defeating the seal. The reverse --
+#                        --review-harness warns and proceeds: the implement
+#                        leg stays sealed, but the review leg is a separate,
+#                        networked sandbox that sends the clone's contents
+#                        to that harness's model provider -- a tradeoff left
+#                        to the caller's judgement. The reverse --
 #                        --review-harness pi-local reviewing a networked
-#                        implement harness -- is fine. Refused with --k8s.
+#                        implement harness -- is fine and silent. Refused
+#                        with --k8s.
 # --task-meta '<json>':  one JSON object of orchestrator-supplied task
 #                        metadata -- kind, difficulty, size,
 #                        prompt_template_id, stage -- stored beside the run
@@ -1683,24 +1686,24 @@ if [[ "$review_only" == true ]]; then
 fi
 
 # --harness pi-local is sealed: no network at all, which is the property a
-# caller picks it for. If its review legs ran under a networked harness,
-# the same clone's contents -- the code a sealed run was chosen to keep
-# local -- would go to that harness's model provider, silently defeating
-# the seal. Refuse the combination by name, the same way this script
-# refuses every other combination that would quietly widen what a sandbox
-# can reach, rather than honor it and let the seal's whole point leak out
-# through a flag nobody thought to cross-check. The reverse is fine: a
-# networked implement harness reviewed by --review-harness pi-local adds
-# no exposure the run did not already have.
+# caller picks it for. Its implement leg stays sealed regardless of
+# --review-harness -- it holds no credential and has no egress. But if the
+# review leg runs under a networked harness, that leg is a separate,
+# networked sandbox (see fs_build_sandbox_cmd rev), and the same clone's
+# contents go to that harness's model provider. Whether that is acceptable
+# is the caller's judgement call, not this script's -- a team whose code
+# already reaches that provider through ordinary daily use gains no new
+# exposure from the review leg. So warn by name, the same way this script
+# warns about every other combination that changes what a sandbox reaches
+# without a flag nobody thought to cross-check, and proceed. The reverse
+# is fine and stays silent: a networked implement harness reviewed by
+# --review-harness pi-local adds no exposure the run did not already have.
 if [[ "$review_harness_given" == true && "$harness" == "pi-local" \
     && "$review_harness" != "pi-local" ]]; then
-    echo "Error: --harness pi-local seals this run -- no network at all -- and" >&2
-    echo "--review-harness $review_harness is networked. Its review leg would" >&2
-    echo "send the clone's contents to $review_harness's model provider," >&2
-    echo "defeating the seal this run was chosen for. If a networked second" >&2
-    echo "opinion is genuinely wanted, run it as a separate fork-sandbox.sh" >&2
-    echo "invocation against the branch this run returns." >&2
-    exit 1
+    echo "Warning: --harness pi-local seals the implement leg -- no network" >&2
+    echo "at all -- but --review-harness $review_harness is networked. Its" >&2
+    echo "review leg is a separate sandbox and will send the clone's" >&2
+    echo "contents to $review_harness's model provider. Proceeding." >&2
 fi
 
 # --refresh-at: refused outright, by name, on every harness but claude --
