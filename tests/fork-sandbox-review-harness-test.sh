@@ -9,6 +9,7 @@ set -uo pipefail
 
 repo_dir="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 launcher="$repo_dir/scripts/fork-sandbox.sh"
+run_log="$repo_dir/scripts/sandbox-run-log.py"
 
 pass=0
 fail=0
@@ -52,6 +53,10 @@ mkdir -p "$FORK_SANDBOX_CONFIG_DIR"
 # needs, and none of it needs a real project or handoff.
 dry() {
     "$launcher" --dry-run "$@" unused-project unused-handoff
+}
+
+review_dry() {
+    "$launcher" --dry-run "$@" "$review_proj" unused-handoff
 }
 
 printf '== --review-harness: parsing and validation (--dry-run) ==\n'
@@ -146,6 +151,79 @@ out="$(dry --harness claude --review-loop 2 --review-model sonnet 2>/dev/null \
 check "--review-model alone still resolves as before (no review_harness line)" \
     $'harness=claude\nreview_model=sonnet' "$out"
 
+printf '\n== --review-only: validation and base resolution ==\n'
+
+mkdir -p "$HOME/src"
+review_proj="$(mktemp -d "$HOME/src/fs-review-only-test.XXXXXX")"; tmpdirs+=("$review_proj")
+(
+    cd "$review_proj" && git init -q . \
+        && git config user.email t@fork-sandbox.invalid \
+        && git config user.name Tester \
+        && printf 'base\n' > file.txt && git add file.txt \
+        && git commit -q -m base \
+        && printf 'head\n' >> file.txt && git commit -q -am head
+) || exit 1
+head_sha="$(git -C "$review_proj" rev-parse HEAD)"
+git -C "$review_proj" switch -q -c review-branch HEAD~1
+printf 'review\n' >> "$review_proj/file.txt"
+git -C "$review_proj" add file.txt
+git -C "$review_proj" -c user.email=t@fork-sandbox.invalid \
+    -c user.name=Tester commit -q -m review
+git -C "$review_proj" switch -q master 2>/dev/null \
+    || git -C "$review_proj" switch -q main
+old_sha="$(git -C "$review_proj" rev-parse HEAD~1)"
+
+if review_dry --review-only --harness claude --model sonnet \
+    >/dev/null 2>"$err"; then
+    no "--review-only without --checkout is refused"
+else
+    contains "--review-only without --checkout is refused" \
+        "requires --checkout" "$(cat "$err")"
+fi
+
+refuse_review_only() {
+    local label="$1" needle="$2"
+    shift 2
+    if review_dry --review-only --checkout review-branch \
+        --harness claude --model sonnet "$@" >/dev/null 2>"$err"; then
+        no "--review-only refuses $label"
+    else
+        contains "--review-only refuses $label" "$needle" "$(cat "$err")"
+    fi
+}
+refuse_review_only "--review-model" "one review leg" --review-model sonnet
+refuse_review_only "--review-harness" "one review leg" --review-harness claude
+refuse_review_only "--review-loop" "one review leg" --review-loop 1
+refuse_review_only "--refresh-at" "not supported with --review-only" --refresh-at 0.3
+refuse_review_only "--k8s" "not supported with --k8s" --k8s
+
+out="$(review_dry --review-only --checkout review-branch \
+    --harness claude --model sonnet 2>/dev/null)"
+contains "review-only dry-run prints its mode" "mode=review-only" "$out"
+contains "review-only dry-run prints its checkout" "checkout=review-branch" "$out"
+contains "default review base is the merge-base" "base_sha=$old_sha" "$out"
+contains "review-only dry-run prints the review range" \
+    "range=$old_sha...review-branch" "$out"
+
+out="$(review_dry --review-only --checkout review-branch \
+    --review-base HEAD --harness claude --model sonnet 2>/dev/null)"
+contains "--review-base overrides the default base" "base_sha=$head_sha" "$out"
+
+if review_dry --review-only --checkout review-branch \
+    --review-base review-branch --harness claude --model sonnet \
+    >/dev/null 2>"$err"; then
+    no "an empty review range is refused"
+else
+    contains "an empty review range is refused" "nothing to review" "$(cat "$err")"
+fi
+
+plain_out="$(dry --harness claude 2>/dev/null)"
+if [[ "$plain_out" != *"mode="* && "$plain_out" != *"range="* ]]; then
+    ok "a plain dry-run has no review-only fields"
+else
+    no "a plain dry-run has no review-only fields" "$plain_out"
+fi
+
 printf '\n== --review-harness: credentials checked before the clone ==\n'
 
 # claude-sandboxed only, no pi.env: the IMPLEMENT harness (claude) needs no
@@ -233,6 +311,123 @@ real_cfg="$(mktemp -d)"; tmpdirs+=("$real_cfg")
 install -m 600 /dev/null "$real_cfg/pi.env"
 printf 'OPENROUTER_API_KEY=fake\n' > "$real_cfg/pi.env"
 printf 'MODEL_ENDPOINT=http://localhost:1/v1\n' > "$real_cfg/model.env"
+
+review_only_stub="$(mktemp -d /var/tmp/claude-scratch/fs-review-only-stub.XXXXXX)"
+tmpdirs+=("$review_only_stub")
+cat > "$review_only_stub/claude-sandboxed" <<'STUB'
+#!/usr/bin/env bash
+set -uo pipefail
+clone_dir=""
+for a in "$@"; do
+    [[ -d "$a/.git" ]] && clone_dir="$a"
+done
+cat >/dev/null
+case "${REVIEW_VERDICT:-approved}" in
+approved)
+    printf 'APPROVED\n\nThe reviewed range is sound.\n' \
+        > "$clone_dir/.git/review-verdict.md"
+    ;;
+findings)
+    printf 'FINDINGS\n\nfile.txt:1 first issue\n\nfile.txt:2 second issue\n' \
+        > "$clone_dir/.git/review-verdict.md"
+    ;;
+none) ;;
+esac
+printf '{"type":"result","subtype":"success","total_cost_usd":0.01,"usage":{"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}\n'
+exit 0
+STUB
+chmod +x "$review_only_stub/claude-sandboxed"
+
+review_only_run() {
+    local branch="$1" verdict="$2" out rc rd
+    out="$(PATH="$review_only_stub:$real_stub:$PATH" \
+        FORK_SANDBOX_CONFIG_DIR="$real_cfg" FORK_SANDBOX_BACKEND=fake-image \
+        REVIEW_VERDICT="$verdict" timeout 60 "$launcher" --foreground \
+        --review-only --harness claude --model sonnet \
+        --checkout review-branch --branch "$branch" \
+        "$review_proj" "$handoff" 2>&1)"
+    rc=$?
+    rd="$(printf '%s\n' "$out" | sed -n 's/^  run dir:  *//p' | head -1)"
+    printf '%s\n' "$rc" > "$review_proj/$branch.rc"
+    printf '%s\n' "$rd" > "$review_proj/$branch.rd"
+    [[ -n "$rd" ]] && tmpdirs+=("$rd")
+    printf '%s\n' "$out"
+}
+
+printf '\n== --review-only: end-to-end verdicts ==\n'
+
+approved_branch="review-only-approved-$$"
+approved_out="$(review_only_run "$approved_branch" approved)"
+approved_rc="$(cat "$review_proj/$approved_branch.rc")"
+approved_rd="$(cat "$review_proj/$approved_branch.rd")"
+if [[ "$approved_rc" == 0 && -n "$approved_rd" ]]; then
+    ok "an APPROVED review-only run exits 0"
+    check "APPROVED review-only run ends approved" "approved" \
+        "$(jq -r '.ended' "$approved_rd/review-loop.json")"
+    check "APPROVED review-only summary has mode" "review-only" \
+        "$(jq -r '.mode' "$approved_rd/summary.json")"
+    check "APPROVED review-only summary has no commits" "0" \
+        "$(jq -r '.commits' "$approved_rd/summary.json")"
+    check "review-only defaults task metadata to review" '{"kind":"review"}' \
+        "$(cat "$approved_rd/task-meta.json")"
+    contains "review-only events.jsonl is the review leg's output" \
+        '"subtype":"success"' "$(cat "$approved_rd/events.jsonl")"
+    if [[ ! -e "$approved_rd/events-review-1.jsonl" ]]; then
+        ok "review-only does not create a separate review events file"
+    else
+        no "review-only does not create a separate review events file"
+    fi
+    if git -C "$review_proj" show-ref --verify --quiet "refs/heads/$approved_branch"; then
+        no "an APPROVED review-only run removes its branch"
+    else
+        ok "an APPROVED review-only run removes its branch"
+    fi
+    log_home="$(mktemp -d /var/tmp/claude-scratch/fs-review-only-log-home.XXXXXX)"
+    tmpdirs+=("$log_home")
+    mkdir -p "$log_home/.claude"
+    if HOME="$log_home" "$run_log" record --run-dir "$approved_rd" \
+        >/dev/null 2>&1; then
+        ok "sandbox-run-log records a review-only run"
+        check "the run-log record carries review-only mode" "review-only" \
+            "$(HOME="$log_home" "$run_log" show "$(basename "$approved_rd")" \
+                | jq -r '.mode')"
+    else
+        no "sandbox-run-log records a review-only run"
+    fi
+else
+    no "an APPROVED review-only run exits 0" "rc=$approved_rc rd=$approved_rd $approved_out"
+fi
+
+findings_branch="review-only-findings-$$"
+findings_out="$(review_only_run "$findings_branch" findings)"
+findings_rc="$(cat "$review_proj/$findings_branch.rc")"
+findings_rd="$(cat "$review_proj/$findings_branch.rd")"
+if [[ "$findings_rc" == 0 && -n "$findings_rd" ]]; then
+    ok "a FINDINGS review-only run exits 0"
+    check "FINDINGS review-only run ends findings" "findings" \
+        "$(jq -r '.ended' "$findings_rd/review-loop.json")"
+    check "FINDINGS review-only counts two cited paragraphs" "2" \
+        "$(jq -r '.iterations[0].findings' "$findings_rd/review-loop.json")"
+    if [[ ! -e "$findings_rd/fix-prompt-1.md" ]]; then
+        ok "FINDINGS review-only writes no fix prompt"
+    else
+        no "FINDINGS review-only writes no fix prompt"
+    fi
+else
+    no "a FINDINGS review-only run exits 0" "rc=$findings_rc rd=$findings_rd $findings_out"
+fi
+
+missing_branch="review-only-missing-$$"
+missing_out="$(review_only_run "$missing_branch" none)"
+missing_rc="$(cat "$review_proj/$missing_branch.rc")"
+missing_rd="$(cat "$review_proj/$missing_branch.rd")"
+if [[ "$missing_rc" == 1 && -n "$missing_rd" ]]; then
+    ok "a review leg with no verdict exits 1"
+    check "a missing verdict ends with harness-error" "harness-error" \
+        "$(jq -r '.ended' "$missing_rd/review-loop.json")"
+else
+    no "a review leg with no verdict exits 1" "rc=$missing_rc rd=$missing_rd $missing_out"
+fi
 
 # Runs fork-sandbox.sh for real, foreground, with every wrapper stubbed and
 # the backend faked into image mode, and echoes the run directory
