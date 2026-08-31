@@ -116,12 +116,23 @@
 #     surviving default-deny `location /`; a K8S_PROXY_ENDPOINTS install
 #     creates no Secret, references no upstream-key Secret volume or
 #     volumeMount on the Deployment, includes no upstream-key.conf, and
-#     injects no Authorization header; K8S_PROXY_ALLOW replaces the default
-#     RFC1918-except egress block with exactly the given <cidr>:<port>
-#     entries, and a hostname there is refused with a message naming why
-#     (NetworkPolicy has no hostname field); http:// is accepted to a
-#     private address and refused to a public one, checked on both the
-#     legacy K8S_PROXY_UPSTREAM path and a K8S_PROXY_ENDPOINTS entry.
+#     injects no Authorization header; its rendered nginx.conf passes
+#     `nginx -t`, the same check the legacy render gets above; submit
+#     refuses outright against a K8S_PROXY_ENDPOINTS namespace, since it
+#     has no /api/v1 wiring to a named endpoint yet; K8S_PROXY_ALLOW
+#     replaces the default RFC1918-except egress block with exactly the
+#     given <cidr>:<port> entries, and a hostname there is refused with a
+#     message naming why (NetworkPolicy has no hostname field); a partial
+#     K8S_PROXY_ALLOW (covering some registered endpoints but not others)
+#     warns by name about the ones it does not cover; http:// is accepted
+#     to a private address and refused to a public one, checked on both
+#     the legacy K8S_PROXY_UPSTREAM path and a K8S_PROXY_ENDPOINTS entry,
+#     and each of those warns that it is unreachable when K8S_PROXY_ALLOW
+#     is unset; an IPv4 octet with a leading zero is never read as octal
+#     (nor spews a bash arithmetic error) when classifying an address as
+#     private; a duplicate name, a non-RFC1123 name, and an empty base URL
+#     in K8S_PROXY_ENDPOINTS are each refused, as is a K8S_PROXY_ALLOW
+#     port outside 1-65535.
 #
 # This lives in tests/ rather than scripts/tests/ on purpose: install.sh
 # iterates scripts/* and runs `sed -n 2p` on each entry to build the
@@ -381,11 +392,14 @@ else
         nginx_mode=docker
     fi
 
-    # Runs `nginx -t` against $nginx_check_dir/nginx.conf, with
-    # upstream-key.conf staged at the literal absolute path the include
-    # names (/etc/nginx/upstream-key.conf). Prints combined output; returns
-    # nginx's exit status.
+    # Runs `nginx -t` against $1/nginx.conf ($nginx_check_dir when $1 is
+    # omitted, the legacy-render caller below), with upstream-key.conf
+    # staged at the literal absolute path the include names
+    # (/etc/nginx/upstream-key.conf) -- harmless to stage even against a
+    # keyless render's config, which never includes it. Prints combined
+    # output; returns nginx's exit status.
     run_nginx_t() {
+        local check_dir="${1:-$nginx_check_dir}"
         case "$nginx_mode" in
             native)
                 # The include and proxy_ssl_trusted_certificate directives
@@ -393,10 +407,10 @@ else
                 # stub staged at the literal path -- which needs root. Fall
                 # back to docker rather than fail outright when that is not
                 # available.
-                if install -Dm644 "$nginx_check_dir/upstream-key.conf" \
+                if install -Dm644 "$check_dir/upstream-key.conf" \
                         /etc/nginx/upstream-key.conf 2>/dev/null; then
                     local rc
-                    nginx -t -c "$nginx_check_dir/nginx.conf" 2>&1
+                    nginx -t -c "$check_dir/nginx.conf" 2>&1
                     rc=$?
                     rm -f /etc/nginx/upstream-key.conf
                     return "$rc"
@@ -404,7 +418,7 @@ else
                 if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
                     echo "(cannot stage /etc/nginx/upstream-key.conf without root; falling back to docker)"
                     nginx_mode=docker
-                    run_nginx_t
+                    run_nginx_t "$check_dir"
                     return $?
                 fi
                 echo "nginx is on PATH but /etc/nginx/upstream-key.conf could not be staged, and no docker fallback is available"
@@ -412,8 +426,8 @@ else
                 ;;
             docker)
                 docker run --rm \
-                    -v "$nginx_check_dir/nginx.conf:/etc/nginx/nginx.conf:ro" \
-                    -v "$nginx_check_dir/upstream-key.conf:/etc/nginx/upstream-key.conf:ro" \
+                    -v "$check_dir/nginx.conf:/etc/nginx/nginx.conf:ro" \
+                    -v "$check_dir/upstream-key.conf:/etc/nginx/upstream-key.conf:ro" \
                     "$proxy_image" nginx -t 2>&1
                 return $?
                 ;;
@@ -546,6 +560,59 @@ refuses "install with neither K8S_PROXY_UPSTREAM nor K8S_PROXY_ENDPOINTS errors 
     "K8S_PROXY_ENDPOINTS" \
     env FORK_SANDBOX_CONFIG_DIR="$neither_config_dir" "$k8s_sh" install --dry-run
 
+# parse_proxy_endpoints' own refusal branches: a name registered twice, a
+# name that doesn't match the RFC1123-label shape it becomes a path
+# segment from, and an entry with no base URL at all.
+dup_name_config_dir="$(newdir)"; tmpdirs+=("$dup_name_config_dir")
+cat > "$dup_name_config_dir/k8s.env" <<'CONF'
+K8S_CONTEXT=test-context
+K8S_NAMESPACE=fork-sandbox-test
+K8S_IMAGE=registry.example/you/fork-sandbox:latest
+K8S_PROXY_ENDPOINTS=primary=http://10.0.0.5:8001/v1,primary=http://10.0.0.6:8001/v1
+K8S_DENIED_PROBE=10.0.0.1:443
+CONF
+refuses "a K8S_PROXY_ENDPOINTS name registered twice is refused" \
+    "must be unique" \
+    env FORK_SANDBOX_CONFIG_DIR="$dup_name_config_dir" "$k8s_sh" install --dry-run
+
+bad_name_config_dir="$(newdir)"; tmpdirs+=("$bad_name_config_dir")
+cat > "$bad_name_config_dir/k8s.env" <<'CONF'
+K8S_CONTEXT=test-context
+K8S_NAMESPACE=fork-sandbox-test
+K8S_IMAGE=registry.example/you/fork-sandbox:latest
+K8S_PROXY_ENDPOINTS=Primary_1=http://10.0.0.5:8001/v1
+K8S_DENIED_PROBE=10.0.0.1:443
+CONF
+refuses "a K8S_PROXY_ENDPOINTS name that is not RFC1123-label shaped is refused" \
+    "is not valid" \
+    env FORK_SANDBOX_CONFIG_DIR="$bad_name_config_dir" "$k8s_sh" install --dry-run
+
+empty_url_config_dir="$(newdir)"; tmpdirs+=("$empty_url_config_dir")
+cat > "$empty_url_config_dir/k8s.env" <<'CONF'
+K8S_CONTEXT=test-context
+K8S_NAMESPACE=fork-sandbox-test
+K8S_IMAGE=registry.example/you/fork-sandbox:latest
+K8S_PROXY_ENDPOINTS=primary=
+K8S_DENIED_PROBE=10.0.0.1:443
+CONF
+refuses "a K8S_PROXY_ENDPOINTS entry with an empty base URL is refused" \
+    "has an empty" \
+    env FORK_SANDBOX_CONFIG_DIR="$empty_url_config_dir" "$k8s_sh" install --dry-run
+
+# parse_proxy_allow's own port-range branch.
+bad_port_allow_config_dir="$(newdir)"; tmpdirs+=("$bad_port_allow_config_dir")
+cat > "$bad_port_allow_config_dir/k8s.env" <<'CONF'
+K8S_CONTEXT=test-context
+K8S_NAMESPACE=fork-sandbox-test
+K8S_IMAGE=registry.example/you/fork-sandbox:latest
+K8S_PROXY_ENDPOINTS=primary=http://10.0.0.5:8001/v1
+K8S_PROXY_ALLOW=10.0.0.5/32:70000
+K8S_DENIED_PROBE=10.0.0.1:443
+CONF
+refuses "a K8S_PROXY_ALLOW port outside 1-65535 is refused" \
+    "must be 1-65535" \
+    env FORK_SANDBOX_CONFIG_DIR="$bad_port_allow_config_dir" "$k8s_sh" install --dry-run
+
 # N registered endpoints render exactly 2N EXACT-match locations
 # (/e/<name>/v1/chat/completions, /e/<name>/v1/models), never a regex or
 # prefix match, and the default-deny location / survives unchanged.
@@ -564,6 +631,15 @@ if FORK_SANDBOX_CONFIG_DIR="$endpoints_config_dir" "$k8s_sh" install --dry-run \
 else
     no "K8S_PROXY_ENDPOINTS install --dry-run exits 0" "$(cat /tmp/fs-k8s-test-endpoints-install.err)"
 fi
+
+# submit only ever wires a run to the shared proxy's legacy /api/v1 path
+# (see cmd_submit's proxy_base_url) -- a K8S_PROXY_ENDPOINTS install
+# renders no such path, so submit must refuse rather than let a run get a
+# silent 403 on its first model call and burn its whole timeout.
+refuses "submit refuses a K8S_PROXY_ENDPOINTS namespace (no /api/v1 wiring yet)" \
+    "K8S_PROXY_ENDPOINTS" \
+    env FORK_SANDBOX_CONFIG_DIR="$endpoints_config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model moonshotai/kimi-k3 "$proj_dir" "$handoff_file"
 if command -v yamllint >/dev/null 2>&1; then
     out="$(yamllint "$endpoints_out" 2>&1)"
     if [[ -z "$out" ]]; then
@@ -591,6 +667,36 @@ if grep -q 'location / {' "$endpoints_out"; then
 else
     no "the default-deny location / survives a K8S_PROXY_ENDPOINTS install" \
         "not found in $endpoints_out"
+fi
+
+# Same coverage as 'nginx -t on the rendered proxy config' above, against
+# the K8S_PROXY_ENDPOINTS (keyless) render this time -- a genuinely
+# different nginx.conf shape (no upstream-key.conf include, no
+# $upstream_key, 2N exact-match locations, $upstream values carrying a
+# path component that proxy_pass then concatenates onto) that every other
+# assertion in this section only greps YAML text for, so a keyless config
+# nginx refuses to start on could ship fully green otherwise. Reuses
+# nginx_mode/run_nginx_t/proxy_image from the legacy check above --
+# staging upstream-key.conf here is harmless even though this render never
+# includes it.
+endpoints_nginx_conf="$(extract_nginx_conf "$endpoints_out")"
+if [[ -z "$endpoints_nginx_conf" ]]; then
+    no "extracted nginx.conf from K8S_PROXY_ENDPOINTS install --dry-run output" \
+        "no nginx.conf block found in $endpoints_out"
+elif [[ -z "${nginx_mode:-}" ]]; then
+    printf '  SKIP  neither nginx nor a working docker on PATH\n'
+else
+    endpoints_nginx_check_dir="$(newdir)"; tmpdirs+=("$endpoints_nginx_check_dir")
+    printf '%s\n' "${endpoints_nginx_conf//kube-dns.kube-system.svc.cluster.local/127.0.0.1}" \
+        > "$endpoints_nginx_check_dir/nginx.conf"
+    # shellcheck disable=SC2016  # $upstream_key is nginx config, not shell
+    printf 'set $upstream_key "dummy";\n' > "$endpoints_nginx_check_dir/upstream-key.conf"
+    out="$(run_nginx_t "$endpoints_nginx_check_dir")"; rc=$?
+    if (( rc == 0 )); then
+        ok "nginx -t accepts the rendered K8S_PROXY_ENDPOINTS (keyless) proxy config"
+    else
+        no "nginx -t accepts the rendered K8S_PROXY_ENDPOINTS (keyless) proxy config" "$out"
+    fi
 fi
 
 # Keyless by construction: no Secret, no upstream-key.conf include, no
@@ -660,6 +766,34 @@ else
     no "K8S_PROXY_ALLOW renders exactly the given cidr:port entries" "$proxy_netpol_allow_doc"
 fi
 
+# A set K8S_PROXY_ALLOW REPLACES the default egress rule wholesale rather
+# than extending it -- so an entry it does not literally cover is just as
+# unreachable as an http:// endpoint under the unset-K8S_PROXY_ALLOW
+# default, and install must warn about it by name, not just the one entry
+# that happened to prompt setting K8S_PROXY_ALLOW in the first place.
+partial_allow_config_dir="$(newdir)"; tmpdirs+=("$partial_allow_config_dir")
+cat > "$partial_allow_config_dir/k8s.env" <<'CONF'
+K8S_CONTEXT=test-context
+K8S_NAMESPACE=fork-sandbox-test
+K8S_IMAGE=registry.example/you/fork-sandbox:latest
+K8S_PROXY_ENDPOINTS=a=http://10.0.0.5:8001/v1,b=http://10.0.0.6:9000/v1
+K8S_PROXY_ALLOW=10.0.0.5/32:8001
+K8S_DENIED_PROBE=10.0.0.1:443
+CONF
+partial_allow_err="$(FORK_SANDBOX_CONFIG_DIR="$partial_allow_config_dir" "$k8s_sh" install --dry-run \
+    2>&1 >/dev/null)"
+if [[ "$partial_allow_err" == *"'b'"* && "$partial_allow_err" == *"10.0.0.6"* ]]; then
+    ok "a partial K8S_PROXY_ALLOW warns about the endpoint it does not cover"
+else
+    no "a partial K8S_PROXY_ALLOW warns about the endpoint it does not cover" "$partial_allow_err"
+fi
+if [[ "$partial_allow_err" == *"'a'"* ]]; then
+    no "a partial K8S_PROXY_ALLOW does not also warn about the endpoint it does cover" \
+        "$partial_allow_err"
+else
+    ok "a partial K8S_PROXY_ALLOW does not also warn about the endpoint it does cover"
+fi
+
 # A hostname in K8S_PROXY_ALLOW is refused -- NetworkPolicy has no hostname
 # field, so the error says so rather than just "invalid".
 hostname_allow_config_dir="$(newdir)"; tmpdirs+=("$hostname_allow_config_dir")
@@ -692,6 +826,16 @@ else
     no "K8S_PROXY_UPSTREAM http:// to a private address is accepted" \
         "$(cat /tmp/fs-k8s-test-http-private.err)"
 fi
+# Accepted is not the same as reachable: this exact config's default
+# egress policy excepts the only address it can ever dial (see
+# validate_upstream_url's own header), so install must say so rather than
+# render a NetworkPolicy that provably never lets this proxy connect.
+if grep -q 'K8S_PROXY_ALLOW=<cidr>:<port> for this endpoint' /tmp/fs-k8s-test-http-private.err; then
+    ok "K8S_PROXY_UPSTREAM http:// to a private address with no K8S_PROXY_ALLOW warns it is unreachable"
+else
+    no "K8S_PROXY_UPSTREAM http:// to a private address with no K8S_PROXY_ALLOW warns it is unreachable" \
+        "$(cat /tmp/fs-k8s-test-http-private.err)"
+fi
 
 http_public_config_dir="$(newdir)"; tmpdirs+=("$http_public_config_dir")
 cat > "$http_public_config_dir/k8s.env" <<'CONF'
@@ -720,6 +864,13 @@ else
     no "K8S_PROXY_ENDPOINTS http:// to a private address is accepted" \
         "$(cat /tmp/fs-k8s-test-endpoints-http-private.err)"
 fi
+# Same reachability warning as the legacy K8S_PROXY_UPSTREAM case above.
+if grep -q 'K8S_PROXY_ALLOW=<cidr>:<port> for this endpoint' /tmp/fs-k8s-test-endpoints-http-private.err; then
+    ok "K8S_PROXY_ENDPOINTS http:// to a private address with no K8S_PROXY_ALLOW warns it is unreachable"
+else
+    no "K8S_PROXY_ENDPOINTS http:// to a private address with no K8S_PROXY_ALLOW warns it is unreachable" \
+        "$(cat /tmp/fs-k8s-test-endpoints-http-private.err)"
+fi
 
 endpoints_http_public_config_dir="$(newdir)"; tmpdirs+=("$endpoints_http_public_config_dir")
 cat > "$endpoints_http_public_config_dir/k8s.env" <<'CONF'
@@ -732,6 +883,48 @@ CONF
 refuses "K8S_PROXY_ENDPOINTS http:// to a public address is refused" \
     "open internet in cleartext" \
     env FORK_SANDBOX_CONFIG_DIR="$endpoints_http_public_config_dir" "$k8s_sh" install --dry-run
+
+# An octet with a leading zero must never be read as octal by the (( ))
+# arithmetic validate_upstream_url uses to classify an address as private
+# -- "012" is decimal 12 (a public address), not octal 10 (private
+# 10.5.6.7), so this must still be refused as public.
+octal_octet_config_dir="$(newdir)"; tmpdirs+=("$octal_octet_config_dir")
+cat > "$octal_octet_config_dir/k8s.env" <<'CONF'
+K8S_CONTEXT=test-context
+K8S_NAMESPACE=fork-sandbox-test
+K8S_IMAGE=registry.example/you/fork-sandbox:latest
+K8S_PROXY_ENDPOINTS=primary=http://012.5.6.7:8001/v1
+K8S_DENIED_PROBE=10.0.0.1:443
+CONF
+refuses "an octet with a leading zero is not read as octal (012 stays decimal 12, public)" \
+    "open internet in cleartext" \
+    env FORK_SANDBOX_CONFIG_DIR="$octal_octet_config_dir" "$k8s_sh" install --dry-run
+
+# A leading-zero octet that isn't valid octal ("08", "09") must not spew
+# a bash arithmetic error instead of this function's own message.
+invalid_octal_octet_config_dir="$(newdir)"; tmpdirs+=("$invalid_octal_octet_config_dir")
+cat > "$invalid_octal_octet_config_dir/k8s.env" <<'CONF'
+K8S_CONTEXT=test-context
+K8S_NAMESPACE=fork-sandbox-test
+K8S_IMAGE=registry.example/you/fork-sandbox:latest
+K8S_PROXY_ENDPOINTS=primary=http://08.0.0.1:8001/v1
+K8S_DENIED_PROBE=10.0.0.1:443
+CONF
+invalid_octal_err="$(FORK_SANDBOX_CONFIG_DIR="$invalid_octal_octet_config_dir" "$k8s_sh" install --dry-run \
+    2>&1 >/dev/null)"
+# "not a private address" itself is not checked here -- validate_upstream_url
+# wraps it across a line break ("...is not a\nprivate address...") that a
+# plain substring match can't span; "is not a valid IPv4" is this
+# function's other (unwrapped) message and proves the same thing.
+if [[ "$invalid_octal_err" == *"value too great for base"* ]]; then
+    no "a leading-zero octet that isn't valid octal fails with this function's own message" \
+        "$invalid_octal_err"
+elif [[ "$invalid_octal_err" == *"K8S_PROXY_ENDPOINTS entry 'primary'"* ]]; then
+    ok "a leading-zero octet that isn't valid octal fails with this function's own message"
+else
+    no "a leading-zero octet that isn't valid octal fails with this function's own message" \
+        "$invalid_octal_err"
+fi
 
 rm -f /tmp/fs-k8s-test-endpoints-install.err /tmp/fs-k8s-test-allow-install.err \
     /tmp/fs-k8s-test-http-private.out /tmp/fs-k8s-test-http-private.err \

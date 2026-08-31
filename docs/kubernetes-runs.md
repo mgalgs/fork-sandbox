@@ -602,9 +602,13 @@ else still requires `https://`. The proxy's own `NetworkPolicy` egress
 otherwise defaults to any host except RFC1918/loopback/link-local/CGNAT on
 443, same as above — a private endpoint needs `K8S_PROXY_ALLOW=<cidr>:<port>[,...]`
 to actually be reachable, since the default policy excepts exactly the
-address ranges `http://` is restricted to. `submit`'s own wiring to a named
-endpoint (rather than the shared proxy's legacy `/api/v1` path) is not yet
-built.
+address ranges `http://` is restricted to. A set `K8S_PROXY_ALLOW`
+*replaces* that default policy wholesale rather than extending it, so
+every endpoint host — not just the one that prompted setting it — needs
+its own `<cidr>:<port>` entry, or it becomes unreachable too; `install`
+warns when it detects this. `submit`'s own wiring to a named endpoint
+(rather than the shared proxy's legacy `/api/v1` path) is not yet built,
+so `submit` refuses outright against a `K8S_PROXY_ENDPOINTS` install.
 
 ### 1b. proxy, per-run, for claude — **Status: built.**
 

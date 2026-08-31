@@ -177,7 +177,11 @@
 #                         exclusive with K8S_PROXY_UPSTREAM.
 #   K8S_PROXY_ALLOW=      <cidr>:<port>[,<cidr>:<port>...] egress allowlist
 #                         for K8S_PROXY_ENDPOINTS hosts. Unset keeps the
-#                         default policy (any host except RFC1918, on 443).
+#                         default policy (any host except RFC1918, on 443);
+#                         a set value REPLACES that default wholesale --
+#                         it does not add to it -- so every endpoint host
+#                         needs its own <cidr>:<port> entry here or it is
+#                         unreachable.
 #   K8S_DENIED_PROBE=     host:port the egress gate must NOT reach.
 #                         Required for submit.
 #   K8S_RUN_TTL=          seconds the pod idles after the agent exits.
@@ -631,8 +635,15 @@ validate_upstream_url() {
         echo "private IP." >&2
         return 1
     fi
+    # Forced base 10 (10#$octet): plain (( octet > 255 )) hands bash
+    # arithmetic a string it parses as C-style integer literals, so a
+    # leading zero is octal -- "012" reads as 10, and "08"/"09" aren't
+    # valid octal digits at all and abort with a bash error. Both let an
+    # octet with a leading zero either misclassify (letting a public
+    # address like 012.5.6.7 -> 10.5.6.7 pass the private-address gate) or
+    # spew interpreter noise instead of this function's own message.
     for octet in "${BASH_REMATCH[@]:1}"; do
-        if (( octet > 255 )); then
+        if (( 10#$octet > 255 )); then
             echo "Error: $label's host '$host_only' is not a valid IPv4" >&2
             echo "address." >&2
             return 1
@@ -640,11 +651,11 @@ validate_upstream_url() {
     done
     o1="${BASH_REMATCH[1]}"
     o2="${BASH_REMATCH[2]}"
-    if ! { (( o1 == 10 )) \
-        || (( o1 == 172 && o2 >= 16 && o2 <= 31 )) \
-        || (( o1 == 192 && o2 == 168 )) \
-        || (( o1 == 127 )) \
-        || (( o1 == 169 && o2 == 254 )); }; then
+    if ! { (( 10#$o1 == 10 )) \
+        || (( 10#$o1 == 172 && 10#$o2 >= 16 && 10#$o2 <= 31 )) \
+        || (( 10#$o1 == 192 && 10#$o2 == 168 )) \
+        || (( 10#$o1 == 127 )) \
+        || (( 10#$o1 == 169 && 10#$o2 == 254 )); }; then
         echo "Error: $label uses http:// to '$host_only', which is not a" >&2
         echo "private address (RFC1918 10.0.0.0/8, 172.16.0.0/12," >&2
         echo "192.168.0.0/16, loopback 127.0.0.0/8, or link-local" >&2
@@ -757,6 +768,29 @@ parse_proxy_allow() {
         PROXY_ALLOW_PORTS+=("$port")
     done
     return 0
+}
+
+# Packs a literal IPv4 address (no validation -- callers already matched one
+# with the ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ regex
+# validate_upstream_url uses) into a 32-bit integer for cidr_contains below.
+# 10#$octet forces base 10 for the same reason validate_upstream_url does --
+# see its own header -- a leading zero in $1 must never be read as octal.
+ipv4_to_int() {
+    local ip="$1" a b c d
+    IFS='.' read -r a b c d <<< "$ip"
+    printf '%d' "$(( (10#$a << 24) | (10#$b << 16) | (10#$c << 8) | 10#$d ))"
+}
+
+# True (0) if the literal IPv4 address $2 falls inside the literal IPv4
+# CIDR $1 ("<a.b.c.d>/<prefix>"), used by cmd_install's K8S_PROXY_ALLOW
+# coverage warning below. $1 is already known to match
+# parse_proxy_allow's own CIDR regex.
+cidr_contains() {
+    local cidr="$1" ip="$2" net prefix mask
+    net="${cidr%/*}"
+    prefix="${cidr#*/}"
+    mask=$(( prefix == 0 ? 0 : (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF ))
+    (( ($(ipv4_to_int "$net") & mask) == ($(ipv4_to_int "$ip") & mask) ))
 }
 
 # The NetworkPolicy egress rule(s) allowing whichever hosts model access
@@ -1079,26 +1113,77 @@ cmd_install() {
     # explicit allowlist too.
     parse_proxy_allow "$K8S_PROXY_ALLOW" || exit 1
 
-    # A registered endpoint on http:// is, by validate_upstream_url's own
-    # rule, always a private (RFC1918/loopback/link-local) address -- and
-    # the default egress policy (unset K8S_PROXY_ALLOW) excepts exactly
-    # those ranges. So this specific combination is not just probably
-    # unreachable, it is deterministically unreachable under the policy
-    # this same install is about to apply -- worth a warning, even though
-    # K8S_PROXY_ALLOW stays a separate, unvalidated knob (see above): a
-    # renderer has no business refusing a config it cannot know is actually
-    # wrong (an https:// endpoint on a non-443 port has the same problem
-    # but isn't checkable without parsing every port out of every URL).
+    # Every URL this install's proxy will dial -- the legacy
+    # K8S_PROXY_UPSTREAM (if set) plus each K8S_PROXY_ENDPOINTS entry --
+    # checked below against whichever egress policy this same install is
+    # about to apply, so a config that can never reach one of its own
+    # upstreams gets a warning instead of a silent, always-timing-out
+    # install.
+    local -a warn_labels=() warn_urls=()
+    if [[ -n "$K8S_PROXY_UPSTREAM" ]]; then
+        warn_labels+=("K8S_PROXY_UPSTREAM")
+        warn_urls+=("$K8S_PROXY_UPSTREAM")
+    fi
+    local i
+    for (( i = 0; i < ${#PROXY_ENDPOINT_URLS[@]}; i++ )); do
+        warn_labels+=("K8S_PROXY_ENDPOINTS entry '${PROXY_ENDPOINT_NAMES[$i]}'")
+        warn_urls+=("${PROXY_ENDPOINT_URLS[$i]}")
+    done
+
     if [[ ${#PROXY_ALLOW_CIDRS[@]} -eq 0 ]]; then
-        local i
-        for (( i = 0; i < ${#PROXY_ENDPOINT_URLS[@]}; i++ )); do
-            if [[ "${PROXY_ENDPOINT_URLS[$i]}" == http://* ]]; then
-                echo "Warning: K8S_PROXY_ENDPOINTS entry '${PROXY_ENDPOINT_NAMES[$i]}'" >&2
-                echo "uses http://, which is only ever accepted to a private address --" >&2
-                echo "but K8S_PROXY_ALLOW is unset, so the proxy's default egress policy" >&2
-                echo "(any host except RFC1918/loopback/link-local/CGNAT, on 443) excepts" >&2
-                echo "exactly that address. Every request to it will be dropped. Set" >&2
+        # A warn_urls entry on http:// is, by validate_upstream_url's own
+        # rule, always a private (RFC1918/loopback/link-local) address --
+        # and the default egress policy (unset K8S_PROXY_ALLOW) excepts
+        # exactly those ranges. So this specific combination is not just
+        # probably unreachable, it is deterministically unreachable under
+        # the policy this same install is about to apply -- worth a
+        # warning, even though K8S_PROXY_ALLOW stays a separate,
+        # unvalidated knob (see above): a renderer has no business
+        # refusing a config it cannot know is actually wrong (an https://
+        # endpoint on a non-443 port has the same problem but isn't
+        # checkable without parsing every port out of every URL).
+        for (( i = 0; i < ${#warn_urls[@]}; i++ )); do
+            if [[ "${warn_urls[$i]}" == http://* ]]; then
+                echo "Warning: ${warn_labels[$i]} uses http://, which is only" >&2
+                echo "ever accepted to a private address -- but K8S_PROXY_ALLOW is" >&2
+                echo "unset, so the proxy's default egress policy (any host except" >&2
+                echo "RFC1918/loopback/link-local/CGNAT, on 443) excepts exactly that" >&2
+                echo "address. Every request to it will be dropped. Set" >&2
                 echo "K8S_PROXY_ALLOW=<cidr>:<port> for this endpoint to fix that." >&2
+            fi
+        done
+    else
+        # A set K8S_PROXY_ALLOW REPLACES the default egress rule wholesale
+        # (render_proxy_egress_rules's own header) rather than extending
+        # it, so an endpoint the allowlist doesn't literally cover is just
+        # as unreachable as the default-policy case above -- checkable for
+        # any endpoint whose host is a literal IPv4 address (a hostname
+        # can't be checked without DNS, the same caveat
+        # validate_upstream_url documents).
+        local url host host_only port covered j
+        for (( i = 0; i < ${#warn_urls[@]}; i++ )); do
+            url="${warn_urls[$i]}"
+            host="${url#*://}"
+            host="${host%%/*}"
+            [[ "$host" =~ ^([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3})(:([0-9]+))?$ ]] || continue
+            host_only="${BASH_REMATCH[1]}"
+            port="${BASH_REMATCH[3]}"
+            if [[ -z "$port" ]]; then
+                if [[ "$url" == https://* ]]; then port=443; else port=80; fi
+            fi
+            covered=false
+            for (( j = 0; j < ${#PROXY_ALLOW_CIDRS[@]}; j++ )); do
+                if (( port == PROXY_ALLOW_PORTS[j] )) && cidr_contains "${PROXY_ALLOW_CIDRS[$j]}" "$host_only"; then
+                    covered=true
+                    break
+                fi
+            done
+            if ! $covered; then
+                echo "Warning: ${warn_labels[$i]} resolves to $host_only:$port, which" >&2
+                echo "no K8S_PROXY_ALLOW entry covers -- a set K8S_PROXY_ALLOW replaces" >&2
+                echo "the default egress rule wholesale rather than extending it, so" >&2
+                echo "every request to this endpoint will be dropped. Add" >&2
+                echo "$host_only/32:$port to K8S_PROXY_ALLOW to fix that." >&2
             fi
         done
     fi
@@ -1225,6 +1310,20 @@ cmd_submit() {
             exit 1
             ;;
     esac
+
+    # submit only ever wires a run to the shared proxy's legacy /api/v1
+    # path (see proxy_base_url below) -- a K8S_PROXY_ENDPOINTS install has
+    # no such path, only /e/<name>/v1/..., so a run submitted against one
+    # would get a 403 on its first model call and burn its whole timeout
+    # with no error from either verb. Refuse here instead, until submit
+    # gains its own --endpoint (or similar) wiring to a named endpoint.
+    if [[ -n "$K8S_PROXY_ENDPOINTS" ]]; then
+        echo "Error: this namespace was installed with K8S_PROXY_ENDPOINTS," >&2
+        echo "which submit cannot yet target -- it only ever wires a run to" >&2
+        echo "the shared proxy's legacy /api/v1 path, which a K8S_PROXY_ENDPOINTS" >&2
+        echo "install never renders. See docs/kubernetes-runs.md." >&2
+        exit 1
+    fi
 
     [[ -n "$model" ]] || { echo "Error: submit requires --model. There is no default:" >&2
         echo "the model is an OpenRouter id, such as moonshotai/kimi-k3." >&2; exit 1; }
