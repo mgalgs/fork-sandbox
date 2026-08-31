@@ -1018,6 +1018,8 @@ Scoped out of v1 on purpose, not overlooked:
 
 - **A second platform implementation.** Contract plus `generic` only — see
   `docs/k8s-platform.md`.
+- **`--review-only` on Kubernetes.** It is refused with `--k8s` until the
+  cluster path can review an existing checkout.
 - **The codex harness inside a pod.** `--harness claude` now has its own
   sealed-egress story (the per-run proxy — see "Model access" above), so
   the reasoning that used to cover both no longer applies to it; codex has

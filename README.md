@@ -118,6 +118,11 @@ Add `--review-model <model>` to run only the review legs on a different model.
 Fix legs continue to use `--model`, keeping the original implementation model
 responsible for applying the findings.
 
+Use `--review-only --checkout <ref>` to review an existing branch after the
+fact. It runs one review leg and returns no coding or fix changes; use
+`--review-base <ref>` to choose the start of the reviewed range. This also
+supports comparing two reviewers on the same branch.
+
 The launcher accepts either `--model sol --harness codex` or the pasteable
 combined form `--harness codex/sol`. It resolves personal aliases from
 `~/.config/fork-sandbox/aliases.conf` first, then Codex aliases against the
