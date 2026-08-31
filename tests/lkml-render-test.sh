@@ -91,6 +91,19 @@ contains "Tested-by has its own chip class" "$html" 'class="tag t-test"'
 case "$html" in *'Tested-by</span>'*'t-q'*) no "Tested-by does not fall through to question" ;; *) ok "Tested-by does not fall through to question" ;; esac
 contains "orphaned reply is rendered" "$html" 'orphan body'
 contains "tally cell links to latest tagged reply" "$html" "href=\"#m-$review_id\" title=\"Reviewed-by\">R"
+if python3 - "$stdout" <<'PY'
+import re
+import sys
+
+html = open(sys.argv[1], encoding="utf-8").read()
+row = re.search(r'<tr><th scope="row"><a href="#[^"]*">cover</a>(.*?)</tr>', html).group(1)
+raise SystemExit("cover row contains a patch reviewer" if "t-rev" in row else 0)
+PY
+then
+    ok "cover tally excludes patch reviewer"
+else
+    no "cover tally excludes patch reviewer"
+fi
 contains "attachment reference is rendered" "$html" 'attachments/shot.png'
 contains "attachment contents are embedded" "$html" 'data:image/png;base64,'
 case "$html" in *fonts.googleapis.com*) no "output has no remote font dependency" ;; *) ok "output has no remote font dependency" ;; esac

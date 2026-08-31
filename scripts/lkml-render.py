@@ -246,14 +246,25 @@ def subtree(m):
         yield from subtree(c)
 
 
+def subtree_before(m, stop_ids):
+    """Walk a thread, stopping before any nested patch root."""
+    yield m
+    for c in m["children"]:
+        if c["id"] in stop_ids:
+            continue
+        yield from subtree_before(c, stop_ids)
+
+
 def tally(cover):
     """Latest tag per persona per patch (and the cover), in cover order."""
     rows = []
     personas = {}
     targets = [cover] + [c for c in cover["children"] if c["subject"].startswith("[PATCH")]
+    patch_roots = {c["id"] for c in targets[1:]}
     for t in targets:
         latest = {}
-        for m in subtree(t):
+        walk = subtree_before(t, patch_roots) if t is cover else subtree(t)
+        for m in walk:
             if m is t or not m["tags"] or m["persona"] == t["persona"]:
                 continue
             if m["persona"] not in latest or m["seq"] > latest[m["persona"]][0]:
