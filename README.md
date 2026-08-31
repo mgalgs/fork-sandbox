@@ -216,33 +216,37 @@ discovers and installs it for you — see [docs/configure.md](docs/configure.md)
 
 ## Skills
 
-Five skills ship with the package. They are plain markdown, readable by any
-agent; `install.sh` links them into Claude Code's skills directory, the
-`~/.agents/skills` convention, and pi's. Codex users can point at the
-scripts directly.
+Five, in plain markdown; `install.sh` links them into Claude Code's skills
+directory, the `~/.agents/skills` convention, and pi's. Codex users drive
+the scripts directly.
 
 For the session that orchestrates runs:
 
 - **`sandbox-coder-mode`** — the workhorse. A standing mode: your session
   stops writing code and becomes orchestrator, reviewer and integrator;
-  every edit happens in a sandboxed run on its own branch. The expensive
-  model plans and reviews, a cheap or self-hosted one types. See
-  [Driving sandbox-coder-mode](#driving-sandbox-coder-mode) below.
-- **`fork-sandbox`** — one run at a time: launch it, watch it, read what
-  comes back.
-- **`lkml-mode`** — review a patch series the way the Linux kernel mailing
-  list does: a shared mailbox, a panel of AI-persona reviewers (a core reviewer
-  with the highest bar always among them) replying in threads from their own
-  sandboxed runs, an author persona posting v2, v3... until the right
-  reviewers sign off and no NAK stands. For a change that deserves several
-  adversarial voices — not a diff you can read yourself.
+  every edit happens in a sandboxed run. *Stay in idea space when you drive
+  it* — see [below](#driving-sandbox-coder-mode).
+- **`fork-sandbox`** — one run at a time: writes the handoff, launches,
+  watches, reads the branch back. *Say what "done" means — the handoff is
+  the run's entire prompt.*
+- **`lkml-mode`** — kernel-style review of a patch series: a shared mailbox,
+  AI-persona reviewers replying in threads, v2, v3... until the right
+  reviewers sign off and no NAK stands. *For a change that deserves several
+  adversarial voices, not a diff you can read yourself.*
 
 Bound into every run, for the agent inside the sandbox:
 
-- **`commit-then-review`**, **`code-review-portable`** — the review kit:
-  commit, then find and verify defects before reporting back.
+- **`commit-then-review`** — commit, then review the work before reporting
+  back.
+- **`code-review-portable`** — the review itself, for a harness with no
+  built-in reviewer.
 
 ### Driving sandbox-coder-mode
+
+Stay in *idea space*: the orchestrator session is where you think — goals,
+constraints, verdicts on what comes back. The moment you catch yourself
+dictating edits, hand the thought to the mode instead and let a run do the
+typing.
 
 Start it, speak in goals, end it with a sentence:
 
