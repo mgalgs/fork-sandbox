@@ -797,6 +797,80 @@ else
         "rc=$rc9: $out9"
 fi
 
+printf '\n== --review-loop 2: archived addenda reach the second review ==\n'
+
+# A first review can find work, causing a fix leg and a second review. Keep
+# this separate from the loop-1 coverage above: a prompt builder that only
+# refreshed addenda for iteration 1 would still pass that scenario.
+loop2_stub="$(mktemp -d /var/tmp/claude-scratch/fs-review-harness-loop2.XXXXXX)"
+tmpdirs+=("$loop2_stub")
+cat > "$loop2_stub/claude-sandboxed" <<'STUB'
+#!/usr/bin/env bash
+set -uo pipefail
+
+outbox="" clone_dir="" prev=""
+for a in "$@"; do
+    [[ "$prev" == "--bind-rw" ]] && outbox="$a"
+    [[ "$a" == "--dangerously-skip-permissions" ]] && clone_dir="$prev"
+    prev="$a"
+done
+
+cat >/dev/null
+n=0
+[[ -f "$FAKE_COUNT_FILE" ]] && n="$(cat "$FAKE_COUNT_FILE")"
+n=$(( n + 1 ))
+printf '%s' "$n" > "$FAKE_COUNT_FILE"
+run_dir="$(dirname "$outbox")"
+inbox_dir="$run_dir/inbox"
+
+case "$n" in
+1)
+    # This is archived when the implement leg ends, before either review.
+    printf 'carry this through both reviews\n' > "$inbox_dir/9999999800-01.md"
+    git -c user.email=t@fork-sandbox.invalid -c user.name=Tester \
+        -C "$clone_dir" commit --allow-empty -q -m "loop2 implement"
+    ;;
+2)
+    printf 'FINDINGS\n\nfile.txt:1 still needs work\n' > "$clone_dir/.git/review-verdict.md"
+    ;;
+3)
+    git -c user.email=t@fork-sandbox.invalid -c user.name=Tester \
+        -C "$clone_dir" commit --allow-empty -q -m "loop2 fix"
+    ;;
+4)
+    printf 'APPROVED\n' > "$clone_dir/.git/review-verdict.md"
+    ;;
+esac
+
+printf '{"type":"result","subtype":"success","total_cost_usd":0.01,"usage":{"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}\n'
+exit 0
+STUB
+chmod +x "$loop2_stub/claude-sandboxed"
+
+count10="$(mktemp)"; tmpdirs+=("$count10")
+out10="$(PATH="$loop2_stub:$PATH" FAKE_COUNT_FILE="$count10" \
+    timeout 60 "$launcher" --foreground --harness claude --review-loop 2 \
+    --branch "sandbox-test-loop2-$$" \
+    "$proj" "$handoff" 2>&1)"
+rc10=$?
+rd10="$(printf '%s\n' "$out10" | sed -n 's/^  run dir:  *//p' | head -1)"
+if (( rc10 == 0 )) && [[ -n "$rd10" ]]; then
+    tmpdirs+=("$rd10")
+    check "four legs ran across two review iterations" "4" "$(cat "$count10")"
+    check "the second review approved after the fix" "approved" \
+        "$(jq -r '.ended' "$rd10/review-loop.json")"
+    if [[ -f "$rd10/review-prompt-2.md" ]]; then
+        ok "review-prompt-2.md exists"
+        contains "the second review prompt carries the archived implement addendum" \
+            "carry this through both reviews" "$(cat "$rd10/review-prompt-2.md")"
+    else
+        no "review-prompt-2.md exists"
+    fi
+else
+    no "run_real produced a run directory for the two-iteration addenda scenario" \
+        "rc=$rc10: $out10"
+fi
+
 printf '\n== --review-loop: archiving follows the leg'"'"'s OWN harness, not the implement one ==\n'
 
 # fs_archive_inbox is gated on the harness the ENDING leg actually ran, not
