@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # fork-sandbox-review-harness-test.sh — Exercise --review-harness: parsing,
-# validation, the pi-local seal refusal, and the two sandbox_cmd builds it
-# produces (one per harness) once past --dry-run.
+# validation, the pi-local networked-review warning, and the two sandbox_cmd
+# builds it produces (one per harness) once past --dry-run.
 #
 # Usage: tests/fork-sandbox-review-harness-test.sh
 
@@ -98,17 +98,19 @@ else
 fi
 
 # 4. The seal: --harness pi-local (no network at all) with a networked
-# --review-harness must be refused, by name, with the seal as the reason.
-# The reverse -- a networked implement harness reviewed by pi-local -- adds
-# no exposure the run did not already have, so it is accepted.
+# --review-harness is accepted, but warns by name that the review leg sends
+# the clone's contents to that harness's model provider. The reverse -- a
+# networked implement harness reviewed by pi-local -- adds no exposure the
+# run did not already have, so it is accepted silently (checked below).
 for networked in claude "pi/some-model" codex; do
-    if dry --harness pi-local --review-loop 2 --review-harness "$networked" \
-        >/dev/null 2>"$err"; then
-        no "--harness pi-local + --review-harness $networked is refused"
+    if ! out="$(dry --harness pi-local --review-loop 2 \
+        --review-harness "$networked" 2>"$err")"; then
+        no "--harness pi-local + --review-harness $networked is accepted"
     else
-        contains "--harness pi-local + --review-harness $networked is refused" \
-            "seals this run" "$(cat "$err")"
+        ok "--harness pi-local + --review-harness $networked is accepted"
     fi
+    contains "--harness pi-local + --review-harness $networked warns of the exposure" \
+        "seals the implement leg" "$(cat "$err")"
 done
 out="$(dry --harness claude --review-loop 2 --review-harness pi-local 2>"$err" \
     | grep -E '^review_harness=')"
