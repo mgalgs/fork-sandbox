@@ -73,8 +73,9 @@ scheduling, not reading, and the reviewers' job is reading.
   questions, cross-reply duplicates), then a **synthesis** run (default
   `claude/opus`) gets that intermediate plus the version's tally section
   inline and writes the human-facing markdown — a `# Summary` section
-  held to ~200 words for the collapsed-card slot (the script warns on
-  stderr when it overruns) and a `# Details` section. Both tiers are
+  held to ~200 words for the small collapsed-card slot a render round
+  is meant to fill (the script warns on stderr when it overruns) and a
+  `# Details` section. Both tiers are
   read-only, no-commit runs on a throwaway
   branch; the outputs land in the series dir as `results-v<N>.json` and
   `results-v<N>.md` (latest recorded version by default, `--version <N>`

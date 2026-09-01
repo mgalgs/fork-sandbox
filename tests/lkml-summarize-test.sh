@@ -13,8 +13,9 @@
 # summary.json immediately (so the wait loop never actually sleeps)
 # and prints the same "  run dir:  <path>" line the real launcher does.
 # It also creates the run's branch in the "origin" repo, standing in
-# for what the real launcher's clone/fetch cycle leaves behind, so the
-# branch cleanup under test has something to delete.
+# for a launcher that left the branch behind (a no-commit run's branch
+# is deleted by the real launcher itself, and STUB_NO_BRANCH=1 models
+# that: no branch created, matching a fetched commits:0 run).
 #
 # Covers:
 #   - argument validation: unknown option, missing --project,
@@ -28,6 +29,12 @@
 #   - outbox harvest to results-v<N>.{json,md}, latest-version default,
 #     --version pin, overwrite behavior.
 #   - the Summary-section length warning.
+#   - tier-setting errors name the source (flag vs env key) and echo
+#     the offending value.
+#   - an already-deleted throwaway branch (the no-commit case the real
+#     launcher produces) warns nothing.
+#   - a low run that leaves an empty intermediate is fatal, and a
+#     failed high run leaves the previous results pair untouched.
 #   - loud failures: missing series, empty --text render, no version
 #     ledger, unrecorded version, a low run that leaves no results.json.
 
@@ -121,12 +128,20 @@ tier="$(printf '%s' "$task_meta" | jq -r '.tags[2]')"
 cp -- "$handoff" "$STUB_CAPTURE_DIR/$tier.handoff.md"
 printf '%s\n' "$tier" >> "$STUB_CAPTURE_DIR/order"
 git -C "$project" branch -f "$branch"
-
+if [[ "${STUB_NO_BRANCH:-0}" == 1 ]]; then
+    git -C "$project" branch -q -D "$branch"
+fi
 run_dir="$(mktemp -d "$STUB_RUN_PREFIX/run.XXXXXX")"
 mkdir -p "$run_dir/outbox"
 case "$tier" in
     summarize-low)
-        if [[ "${STUB_SKIP_JSON:-0}" != 1 ]]; then
+        if [[ "${STUB_SKIP_JSON:-0}" == 1 ]]; then
+            :
+        elif [[ "${STUB_JSON_EMPTY:-0}" == 1 ]]; then
+            # Whitespace only, as a low tier that died after touching
+            # the file (not before creating it) would leave.
+            printf ' \n' > "$run_dir/outbox/results.json"
+        else
             # ${STUB_JSON:-{}} would NOT work: bash closes the expansion at
             # the first brace, appending a literal "}" to every write.
             stub_json_default="{}"
@@ -134,7 +149,9 @@ case "$tier" in
         fi
         ;;
     summarize-high)
-        printf '%s\n' "${STUB_MD:-}" > "$run_dir/outbox/results.md"
+        if [[ "${STUB_SKIP_MD:-0}" != 1 ]]; then
+            printf '%s\n' "${STUB_MD:-}" > "$run_dir/outbox/results.md"
+        fi
         ;;
 esac
 jq -n --arg clone_dir "$run_dir/clone" --arg branch "$branch" \
@@ -186,6 +203,8 @@ run "non-integer --version" 1 widget-frob --project "$project_dir" --version v1
 contains "non-integer --version is refused" "$(cat "$out_file")" "plain integer"
 run "whitespace tier spec" 1 widget-frob --project "$project_dir" --low "claude /sonnet"
 contains "whitespace in a tier spec is refused" "$(cat "$out_file")" "whitespace"
+contains "the whitespace error names the flag the value came from" "$(cat "$out_file")" "--low"
+contains "the whitespace error echoes the offending value" "$(cat "$out_file")" "claude /sonnet"
 run "non-integer --timeout" 1 widget-frob --project "$project_dir" --timeout soon
 contains "non-integer --timeout is refused" "$(cat "$out_file")" "--timeout must be a number"
 if bash "$summarize" widget-frob -h > "$out_file" 2>&1; then
@@ -250,6 +269,12 @@ LKML_SUMMARIZE_ENV_FILE="$env_file" run "one flag, one env" 0 widget-frob --proj
 contains "a flagged tier comes from the flag" "$(cat "$out_file")" "high: codex/fast"
 contains "an unflagged tier comes from the env file" "$(cat "$out_file")" "low: pi-local/nano-local,"
 
+env_ws="$work/lkml-summarize-ws.env"
+printf 'LKML_SUMMARIZE_LOW=claude /sonnet\n' > "$env_ws"
+LKML_SUMMARIZE_ENV_FILE="$env_ws" run "whitespace tier spec from env" 1 widget-frob --project "$project_dir"
+contains "an env-sourced whitespace error names the env key" "$(cat "$out_file")" "LKML_SUMMARIZE_LOW"
+contains "the env error echoes the offending value too" "$(cat "$out_file")" "claude /sonnet"
+
 printf '\n== the pipeline: sequential low-then-high, harvest, cleanup ==\n'
 series_dir="$LKML_MAILBOX_ROOT/widget-frob"
 # The tier-resolution section above already ran the full pipeline a few
@@ -309,9 +334,10 @@ contains "the low handoff carries the full --text render (a reply body, not just
     "$low_handoff" "the frob looks flaky under load"
 contains "the low handoff names the version the summary is about" \
     "$low_handoff" '"widget-frob v1"'
-# shellcheck disable=SC2016  # literal $, not a variable
-contains "the low handoff names its outbox output file" \
-    "$low_handoff" '$OUTBOX_DIR/results.json'
+# shellcheck disable=SC2016  # literal backtick in the needle
+contains "the low handoff names the outbox the way the preamble does" \
+    "$low_handoff" "results.json\` at the
+root of the artifact outbox directory named in your prompt"
 contains "the low handoff carries no commit permission" \
     "$low_handoff" "Make NO commits"
 
@@ -322,9 +348,9 @@ contains "the high handoff carries the tally section" \
     "$high_handoff" "Latest tag per reviewer per patch"
 contains "the high handoff says the intermediate should spare a source-dive" \
     "$high_handoff" "should make a source-dive"
-# shellcheck disable=SC2016  # literal $, not a variable
-contains "the high handoff names its outbox output file" \
-    "$high_handoff" '$OUTBOX_DIR/results.md'
+# shellcheck disable=SC2016  # literal backtick in the needle
+contains "the high handoff names the outbox the way the preamble does" \
+    "$high_handoff" "results.md\` at the root of the artifact outbox"
 contains "the high handoff fixes the Summary word budget" \
     "$high_handoff" "hard-capped at 200"
 
@@ -441,6 +467,53 @@ leftover="$(git -C "$project_dir" branch --list 'lkml/*' | tr -d '[:space:]')"
 check "the low run's throwaway branch is still deleted on failure" "" "$leftover"
 check "no partial results-v1.json was harvested from a failed low run" \
     "$DEFAULT_JSON" "$(jq -c . "$series_dir/results-v1.json" 2>/dev/null)"
+
+printf '\n== a low run that leaves an empty intermediate ==\n'
+# At this point results-v2.json holds cap8's unparseable text and
+# results-v2.md holds DEFAULT_MD: a refused run must leave that pair
+# as it found it.
+cap9="$(mktemp -d)"; tmpdirs+=("$cap9")
+out_full="$(PATH="$stub_bin:$PATH" STUB_CAPTURE_DIR="$cap9" STUB_RUN_PREFIX="$run_prefix_dir" \
+    STUB_JSON_EMPTY=1 STUB_JSON="$DEFAULT_JSON" STUB_MD="$DEFAULT_MD" \
+    "$summarize" widget-frob --project "$project_dir" 2>&1)"
+rc=$?
+if (( rc != 0 )); then ok "a whitespace-only intermediate exits non-zero (fatal, not a warning)"; else no "a whitespace-only intermediate exits non-zero (fatal, not a warning)" "exit 0: $out_full"; fi
+contains "the failure names the empty outbox file" "$out_full" "outbox/results.json"
+contains "the failure says there is nothing to synthesize" "$out_full" "nothing to synthesize"
+check "the high tier was not launched on an empty intermediate" \
+    "summarize-low" "$(tr -d '\r' < "$cap9/order")"
+check "a refused empty intermediate did not clobber results-v2.json" \
+    "not json at all" "$(cat "$series_dir/results-v2.json")"
+check "a refused empty intermediate did not touch results-v2.md" \
+    "$DEFAULT_MD" "$(cat "$series_dir/results-v2.md")"
+
+printf '\n== a failed high run leaves the previous results pair ==\n'
+cap10="$(mktemp -d)"; tmpdirs+=("$cap10")
+before_md="$(cat "$series_dir/results-v2.md")"
+out_full="$(PATH="$stub_bin:$PATH" STUB_CAPTURE_DIR="$cap10" STUB_RUN_PREFIX="$run_prefix_dir" \
+    STUB_JSON="$DEFAULT_JSON" STUB_MD="$DEFAULT_MD" STUB_SKIP_MD=1 \
+    "$summarize" widget-frob --project "$project_dir" 2>&1)"
+rc=$?
+if (( rc != 0 )); then ok "a high run that leaves no results.md exits non-zero"; else no "a high run that leaves no results.md exits non-zero" "exit 0: $out_full"; fi
+contains "the failure names the missing outbox file" "$out_full" "outbox/results.md"
+check "the previous results-v2.md survived the failed high run" \
+    "$before_md" "$(cat "$series_dir/results-v2.md")"
+check "the fresh intermediate was not landed beside the stale md" \
+    "not json at all" "$(cat "$series_dir/results-v2.json")"
+leftover="$(git -C "$project_dir" branch --list 'lkml/*' | tr -d '[:space:]')"
+check "both throwaway branches are deleted when the high run leaves no md" "" "$leftover"
+
+printf '\n== a no-commit run: the launcher already deleted the branch ==\n'
+cap11="$(mktemp -d)"; tmpdirs+=("$cap11")
+out_full="$(PATH="$stub_bin:$PATH" STUB_CAPTURE_DIR="$cap11" STUB_RUN_PREFIX="$run_prefix_dir" \
+    STUB_NO_BRANCH=1 STUB_JSON="$DEFAULT_JSON" STUB_MD="$DEFAULT_MD" \
+    "$summarize" widget-frob --project "$project_dir" 2>&1)"
+rc=$?
+if (( rc == 0 )); then ok "an already-gone branch does not fail the run"; else no "an already-gone branch does not fail the run" "exit $rc: $out_full"; fi
+case "$out_full" in
+    *"delete it by hand"*) no "no hand-cleanup warning when the branch is already gone" ;;
+    *) ok "no hand-cleanup warning when the branch is already gone" ;;
+esac
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 (( fail == 0 )) || exit 1

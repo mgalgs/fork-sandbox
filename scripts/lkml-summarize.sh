@@ -43,20 +43,22 @@
 #      plus the render's tally section for this version, inline to
 #   2. HIGH tier (synthesis): which writes the results document to its
 #      run's OUTBOX, harvested as <series>/results-v<N>.md.
-# Re-summarizing a version overwrites both files; the written paths
-# are the last stdout lines.
+# Re-summarizing a version overwrites both files once both tiers have
+# delivered their outbox files (a failed high tier leaves the previous
+# pair untouched); the written paths are the last stdout lines.
 #
-# results-v<N>.md is a FORMAT CONTRACT, not a free-form essay -- the
-# lkml-render round renders it as a collapsed card:
+# results-v<N>.md is a FORMAT CONTRACT, not a free-form essay -- a
+# render round is meant to show # Summary as a small collapsed card
+# (nothing in the tree depends on that yet):
 #     # Summary
-#     (1-2 short paragraphs, roughly the pixel height of the Reviewers
-#      panel: ~120 words max; this script WARNS on stderr above ~200)
+#     (1-2 short paragraphs: ~120 words; this script WARNS on stderr
+#      above ~200)
 #     # Details
 #     (free-form: defect list with severity/status and message-id
 #      citations, per-patch disposition, recommended next actions)
 # Message ids are cited as bare 7-hex tokens (e.g. 9d67f5e) -- no
-# brackets, no anchors; the renderer autolinks ids that exist in the
-# mailbox.
+# brackets, no anchors: a plain convention that keeps the id greppable
+# against the --text render.
 
 set -uo pipefail
 
@@ -124,29 +126,34 @@ env_file="${LKML_SUMMARIZE_ENV_FILE:-$HOME/.config/fork-sandbox/lkml-summarize.e
 # endpoint itself. See the usage header for the --model-override 404
 # lesson this refusal to invent names protects against.
 resolve_tier() {
-    local flag_value="$1" env_key="$2" default="$3" spec
-    spec="$flag_value"
-    if [[ -z "$spec" ]]; then
+    local flag_name="$1" flag_value="$2" env_key="$3" default="$4" spec source raw
+    if [[ -n "$flag_value" ]]; then
+        spec="$flag_value"
+        source="the $flag_name flag"
+    else
         spec="$(lkml_summarize_env_value "$env_file" "$env_key" || true)"
+        source="the $env_key env key"
+        if [[ -z "$spec" ]]; then
+            spec="$default"
+            source="the shipped default"
+        fi
     fi
-    if [[ -z "$spec" ]]; then
-        spec="$default"
-    fi
+    raw="$spec"
     spec="${spec#"${spec%%[![:space:]]*}"}"
     spec="${spec%"${spec##*[![:space:]]}"}"
     if [[ -z "$spec" || "$spec" == *[[:space:]]* ]]; then
-        echo "Error: tier setting '$env_key' is empty or contains whitespace." >&2
+        echo "Error: tier setting '$source' is '${raw}' -- empty or contains whitespace; expected a harness or harness/model." >&2
         return 1
     fi
     if [[ ! "$spec" =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)?$ ]]; then
-        echo "Error: tier setting '$env_key' is '$spec', not a harness or harness/model." >&2
+        echo "Error: tier setting '$source' is '$spec', not a harness or harness/model." >&2
         return 1
     fi
     printf '%s' "$spec"
 }
 
-high_spec="$(resolve_tier "$high_spec" LKML_SUMMARIZE_HIGH claude/opus)" || exit 1
-low_spec="$(resolve_tier "$low_spec" LKML_SUMMARIZE_LOW claude/sonnet)" || exit 1
+high_spec="$(resolve_tier --high "$high_spec" LKML_SUMMARIZE_HIGH claude/opus)" || exit 1
+low_spec="$(resolve_tier --low "$low_spec" LKML_SUMMARIZE_LOW claude/sonnet)" || exit 1
 
 ledger_root="${LKML_MAILBOX_ROOT:-/var/tmp/claude-scratch/lkml}"
 series_dir="$ledger_root/$series"
@@ -221,16 +228,20 @@ if [[ -z "$tally_text" ]]; then
 fi
 
 # The throwaway branches carry no commits (the tiers are forbidden to
-# make any), so each one is deleted as soon as its run returns -- the
-# branches fork-sandbox.sh's clone/fetch cycle leaves in the project
-# repo. A run that never finished has nothing fetched back and no
-# branch to delete; the warning then is informational, not fatal.
+# make any), and fork-sandbox.sh already deletes such a branch itself
+# the moment its fetch finds none: on a normal run "the branch is
+# gone" is the expected outcome, not a failure. A branch survives only
+# if a tier disobeyed and committed, and branch -D is how that one goes
+# away; warn only when the branch is still there AND the delete fails.
 delete_branch() {
     local branch="$1"
+    if ! git -C "$project" show-ref --verify -q "refs/heads/$branch"; then
+        return 0
+    fi
     if git -C "$project" branch -D "$branch" >/dev/null 2>&1; then
         echo "fork-sandbox lkml-summarize: deleted throwaway branch $branch." >&2
     else
-        echo "Warning: could not delete throwaway branch '$branch' from $project (the run may not have fetched it back); delete it by hand." >&2
+        echo "Warning: throwaway branch '$branch' is still in $project and could not be deleted; delete it by hand." >&2
     fi
 }
 
@@ -291,8 +302,9 @@ posted version; THIS summary is about the section headed
 "$series v$version" -- earlier versions are there as context for what
 changed.
 
-Read the whole thread, then write ONE file, \$OUTBOX_DIR/results.json,
-shaped like this:
+Read the whole thread, then write ONE file: \`results.json\` at the
+root of the artifact outbox directory named in your prompt, shaped
+like this:
 
     {
       "series": "$series",
@@ -352,8 +364,8 @@ ids the render prints for each message. Record ONLY what the thread
 states: do not review the code and do not invent findings.
 
 Make NO commits and no other changes to the clone: writing
-\$OUTBOX_DIR/results.json is the whole job. In your final report, say
-how many patches you covered and how many defects you recorded.
+results.json to the outbox is the whole job. In your final report,
+say how many patches you covered and how many defects you recorded.
 BRIEF
     printf '\n## The thread (the mailbox --text render, all versions)\n\n'
     printf '%s\n' "$render_text"
@@ -373,7 +385,8 @@ section for v$version. The intermediate was built from the entire
 unnecessary: you MAY read this clone to chase a lead, but start from
 the intermediate, not from the code.
 
-Write ONE file, \$OUTBOX_DIR/results.md, EXACTLY this shape:
+Write ONE file: \`results.md\` at the root of the artifact outbox
+directory named in your prompt, EXACTLY this shape:
 
     # Summary
     <one or two short paragraphs>
@@ -381,22 +394,21 @@ Write ONE file, \$OUTBOX_DIR/results.md, EXACTLY this shape:
     # Details
     <free-form subsections>
 
-The # Summary section is rendered as a collapsed card on the series
-page, roughly the pixel height of the Reviewers panel: at most about
-120 words, hard-capped at 200. One or two short paragraphs: the state
-of the series (how the tally stands), the defects that still matter,
-and what happens next. Nothing else.
+The # Summary section is a small collapsed card in the intended final
+layout: at most about 120 words, hard-capped at 200. One or two short
+paragraphs: the state of the series (how the tally stands), the
+defects that still matter, and what happens next. Nothing else.
 
 # Details is free-form subsections: a defect list with severity,
 status and its message-id citation, a per-patch disposition, and
 recommended next actions.
 
 Cite message ids as BARE 7-hex tokens, for example 9d67f5e -- no
-brackets, no anchors, no <id@lkml.local>: the renderer autolinks ids
-that exist in the mailbox, and anything fancier breaks the link.
+brackets, no anchors, no <id@lkml.local>: a plain convention, and it
+keeps the id greppable against the thread.
 
 Make NO commits and no other changes to the clone: writing
-\$OUTBOX_DIR/results.md is the whole job. In your final report, say
+results.md to the outbox is the whole job. In your final report, say
 how many words the Summary section is.
 BRIEF
     printf '\n## The extraction intermediate (results-v%s.json, verbatim)\n\n' "$version"
@@ -427,15 +439,20 @@ if [[ ! -f "$low_outbox_json" ]]; then
     echo "Error: the low tier's run left no $low_outbox_json; there is no intermediate to synthesize." >&2
     exit 1
 fi
-# Verbatim by contract: the synthesis tier gets exactly what the
-# extraction tier wrote, unmodified. A parse warning is enough to keep
-# the harvest moving -- the synthesis tier reads it as text either way.
-cp -f -- "$low_outbox_json" "$json_path"
-echo "fork-sandbox lkml-summarize: harvested $json_path" >&2
-if ! jq -e . "$json_path" >/dev/null 2>&1; then
-    echo "Warning: $json_path is not parseable JSON; the synthesis tier will get it verbatim anyway." >&2
+# Empty (or whitespace only) is fatal, not a warning: a low tier that
+died after touching the outbox file leaves nothing to synthesize, and
+summing nothing is not a summary, so the expensive tier must not run
+on an empty intermediate. Unparseable-but-non-empty is a warning
+instead -- the synthesis tier reads it as text either way, and it is
+carried verbatim by contract.
+if [[ -z "$(tr -d '[:space:]' < "$low_outbox_json")" ]]; then
+    echo "Error: the low tier's run left $low_outbox_json empty (or whitespace only); there is nothing to synthesize." >&2
+    exit 1
 fi
-low_intermediate="$(cat -- "$json_path")"
+if ! jq -e . "$low_outbox_json" >/dev/null 2>&1; then
+    echo "Warning: $low_outbox_json is not parseable JSON; it will be harvested as $json_path and the synthesis tier will get it verbatim anyway." >&2
+fi
+low_intermediate="$(cat -- "$low_outbox_json")"
 
 high_handoff_file="$(mktemp /var/tmp/claude-scratch/lkml-summarize-high-XXXXXX.md)" || {
     echo "Error: mktemp failed for the high tier's handoff file." >&2
@@ -455,15 +472,22 @@ if [[ ! -f "$high_outbox_md" ]]; then
     echo "Error: the high tier's run left no $high_outbox_md." >&2
     exit 1
 fi
+# The json and md are a pair for THIS run: land the json only now,
+# once the md is in hand, so a failed high run leaves the previous
+# run's pair untouched instead of a fresh intermediate beside a stale
+# md.
+cp -f -- "$low_outbox_json" "$json_path"
+echo "fork-sandbox lkml-summarize: harvested $json_path" >&2
 cp -f -- "$high_outbox_md" "$md_path"
 echo "fork-sandbox lkml-summarize: harvested $md_path" >&2
 
-# The format is a contract -- the collapsed card renders this section
-# at roughly the Reviewers panel's pixel height, so an over-long
-# Summary is worth a warning even though the file is written anyway.
+# The format is a contract -- the Summary is meant to render as a
+# small collapsed card once a render step exists for it, so an
+# over-long Summary is worth a warning even though the file is written
+# anyway.
 summary_words="$(awk '/^# Summary/ { f = 1; next } f && /^# / { exit } f' "$md_path" | wc -w | tr -d '[:space:]')"
 if [[ -n "$summary_words" && "$summary_words" -gt 200 ]]; then
-    echo "Warning: the Summary section of $md_path is $summary_words words; the collapsed-card cap is ~200 (aim for ~120)." >&2
+    echo "Warning: the Summary section of $md_path is $summary_words words; the Summary cap is ~200 (aim for ~120)." >&2
 fi
 
 # The written paths are the whole stdout of this script; everything
