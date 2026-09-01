@@ -141,5 +141,22 @@ contains "persona brief is html-escaped (ampersand)" "$phtml" 'A &amp; B'
 case "$phtml" in *'<script>alert(2)</script>'*) no "persona brief script payload is never raw" ;; *) ok "persona brief script payload is never raw" ;; esac
 contains "reviewer rollup counts NAK" "$phtml" '<span>1 NAK</span>'
 
+printf '\n== persona brief containment ==\n'
+# The persona header comes verbatim out of the .msg file; a hand-written
+# message can set it to a traversal or absolute path. Neither may pull a
+# file outside <series>/personas/ into the page.
+printf '%s\n' 'TRAVERSAL LEAK CANARY' > "$LKML_MAILBOX_ROOT/traversal.md"
+printf '%s\n' 'ABSOLUTE LEAK CANARY' > "$work/absolute.md"
+"$mailbox" post render-fixture --from "../../traversal" --reply-to "$patch_id" \
+    --file "$work/review.txt" --harness test --model fixture >/dev/null 2>/dev/null
+"$mailbox" post render-fixture --from "$work/absolute" --reply-to "$patch_id" \
+    --file "$work/review.txt" --harness test --model fixture >/dev/null 2>/dev/null
+contain_html="$work/contain.html"
+python3 "$renderer" "$LKML_MAILBOX_ROOT/render-fixture" -o "$contain_html"
+chtml="$(<"$contain_html")"
+case "$chtml" in *'TRAVERSAL LEAK CANARY'*) no "traversal persona does not leak a brief" ;; *) ok "traversal persona does not leak a brief" ;; esac
+case "$chtml" in *'ABSOLUTE LEAK CANARY'*) no "absolute-path persona does not leak a brief" ;; *) ok "absolute-path persona does not leak a brief" ;; esac
+contains "legit brief still inlined alongside" "$chtml" '<pre class="persona-brief">Core reviewer brief.'
+
 printf '%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))

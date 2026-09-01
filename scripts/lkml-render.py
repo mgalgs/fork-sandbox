@@ -326,11 +326,19 @@ def reviewer_rollup(version_msgs, author):
 
 def render_reviewer(r, series_dir):
     brief = ""
-    brief_path = os.path.join(series_dir, "personas", r["persona"] + ".md")
-    if os.path.isfile(brief_path):
+    personas_dir = os.path.join(series_dir, "personas")
+    # The X-AI-Persona header comes straight out of the .msg file, which a
+    # hand-written message can set to anything, including traversal or an
+    # absolute path. Keep the brief read inside <series>/personas/ the way
+    # the attachment reader does.
+    brief_path = os.path.normpath(os.path.join(personas_dir, r["persona"] + ".md"))
+    personas_real = os.path.realpath(personas_dir)
+    brief_real = os.path.realpath(brief_path)
+    if (os.path.commonpath((brief_real, personas_real)) == personas_real
+            and os.path.isfile(brief_real)):
         # The persona brief is plain markdown; inlined as escaped
         # preformatted text, never rendered or executed.
-        with open(brief_path, encoding="utf-8", errors="replace") as f:
+        with open(brief_real, encoding="utf-8", errors="replace") as f:
             brief = '<pre class="persona-brief">' + esc(f.read()) + "</pre>"
     counts = [f"{r['count']} message" + ("s" if r["count"] != 1 else "")]
     if r["rev"]:
