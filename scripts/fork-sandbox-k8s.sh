@@ -2,18 +2,24 @@
 # fork-sandbox-k8s.sh -- run a sandboxed agent as a Kubernetes Job
 #
 # Usage: fork-sandbox-k8s.sh install [--dry-run]
-#        fork-sandbox-k8s.sh submit [--dry-run] --branch NAME --model MODEL
-#                            [--harness pi|claude]
+#        fork-sandbox-k8s.sh submit [--dry-run] --branch NAME [--model MODEL]
+#                            [--endpoint NAME] [--harness pi|claude]
 #                            [--review-loop N] [--review-model MODEL]
 #                            [--outbox-max SIZE]
 #                            [--context-ro DIR]
 #                            <project-path> <handoff-file>
 #        fork-sandbox-k8s.sh run [--dry-run] [--timeout SECONDS] [--keep]
-#                            --branch NAME --model MODEL [--harness pi|claude]
+#                            --branch NAME [--model MODEL] [--endpoint NAME]
+#                            [--harness pi|claude]
 #                            [--review-loop N] [--review-model MODEL]
 #                            [--outbox-dir DIR] [--outbox-max SIZE]
 #                            [--context-ro DIR]
 #                            <project-path> <handoff-file>
+#
+# --model MODEL is REQUIRED on a K8S_PROXY_UPSTREAM (legacy) install. On a
+# K8S_PROXY_ENDPOINTS install it is optional: the pod discovers the model
+# (and its context window) from the proxy's /v1/models at startup -- see
+# --endpoint below and fork-sandbox-k8s-entrypoint.sh.
 #        fork-sandbox-k8s.sh fetch --branch NAME <project-path>
 #        fork-sandbox-k8s.sh say --branch NAME <text>
 #        fork-sandbox-k8s.sh say --branch NAME -        # text from stdin
@@ -113,6 +119,21 @@
 # the CODING leg's regardless of how the loop ended -- see
 # fork-sandbox-k8s-entrypoint.sh's comment on .run-complete for why. See
 # docs/kubernetes-runs.md for the full design.
+#
+# --endpoint NAME (submit, run): the registered K8S_PROXY_ENDPOINTS entry
+# the run is wired to -- the pod's PROXY_BASE_URL becomes the proxy's
+# /e/NAME/v1 location instead of the legacy /api/v1 path. A name that is
+# not registered is an error listing the registered names. Omitted, it
+# resolves to the single registered endpoint when there is exactly one
+# (announced on stderr) and is an error, listing the names, when there
+# are several -- the same one-candidate rule agent-sandboxed applies when
+# resolving a model. On a legacy K8S_PROXY_UPSTREAM install it is an
+# error: that render has no named endpoints. It is what makes --model
+# optional on an endpoints install (see the note above); --harness
+# claude keeps the requirement even on an endpoints install, because
+# discovery only lists the pi endpoint's model ids, never a Claude Code
+# model name. fork-sandbox.sh --k8s still requires --model on its own
+# path; only this direct entry point accepts the omission.
 #
 # --context-ro DIR (submit, run): push DIR into the pod at /work/context,
 # read-only by convention, over the same gated kubectl-exec channel the
@@ -1285,12 +1306,13 @@ cmd_install() {
 
 cmd_submit() {
     local dry_run=false branch="" model="" review_loop_cap="" outbox_max_arg=""
-    local context_ro="" harness="pi" review_model=""
+    local context_ro="" harness="pi" review_model="" endpoint=""
     while (( $# )); do
         case "$1" in
             --dry-run) dry_run=true; shift ;;
             --branch) branch="${2:?--branch requires a name}"; shift 2 ;;
             --model) model="${2:?--model requires an OpenRouter model id}"; shift 2 ;;
+            --endpoint) endpoint="${2:?--endpoint requires a name}"; shift 2 ;;
             --harness) harness="${2:?--harness requires 'pi' or 'claude'}"; shift 2 ;;
             --review-loop) review_loop_cap="${2:?--review-loop requires a positive integer}"; shift 2 ;;
             --review-model) review_model="${2:?--review-model requires a model id}"; shift 2 ;;
@@ -1311,22 +1333,64 @@ cmd_submit() {
             ;;
     esac
 
-    # submit only ever wires a run to the shared proxy's legacy /api/v1
-    # path (see proxy_base_url below) -- a K8S_PROXY_ENDPOINTS install has
-    # no such path, only /e/<name>/v1/..., so a run submitted against one
-    # would get a 403 on its first model call and burn its whole timeout
-    # with no error from either verb. Refuse here instead, until submit
-    # gains its own --endpoint (or similar) wiring to a named endpoint.
+    # The named endpoint this run is wired to, on a K8S_PROXY_ENDPOINTS
+    # install (see proxy_base_url below, which this resolves into).
+    # install is what validates the registry's shape at config-roll time;
+    # submit reuses the same parser here so an unregistered --endpoint
+    # name is an error now, not a 404 inside the pod.
+    local proxy_endpoint="" known_endpoint
     if [[ -n "$K8S_PROXY_ENDPOINTS" ]]; then
-        echo "Error: this namespace was installed with K8S_PROXY_ENDPOINTS," >&2
-        echo "which submit cannot yet target -- it only ever wires a run to" >&2
-        echo "the shared proxy's legacy /api/v1 path, which a K8S_PROXY_ENDPOINTS" >&2
-        echo "install never renders. See docs/kubernetes-runs.md." >&2
+        parse_proxy_endpoints "$K8S_PROXY_ENDPOINTS" || exit 1
+        if [[ -n "$endpoint" ]]; then
+            for known_endpoint in "${PROXY_ENDPOINT_NAMES[@]}"; do
+                if [[ "$known_endpoint" == "$endpoint" ]]; then
+                    proxy_endpoint="$endpoint"
+                    break
+                fi
+            done
+            if [[ -z "$proxy_endpoint" ]]; then
+                echo "Error: --endpoint '$endpoint' is not registered. The" >&2
+                echo "registered endpoints are:" >&2
+                printf '%s\n' "${PROXY_ENDPOINT_NAMES[@]}" | sed 's/^/  /' >&2
+                exit 1
+            fi
+        elif (( ${#PROXY_ENDPOINT_NAMES[@]} == 1 )); then
+            # The same one-candidate rule agent-sandboxed applies when
+            # resolving a model: exactly one choice is usable unnamed,
+            # and says so rather than staying silent about it.
+            proxy_endpoint="${PROXY_ENDPOINT_NAMES[0]}"
+            echo "fork-sandbox-k8s: no --endpoint given; using the single" >&2
+            echo "registered endpoint '$proxy_endpoint'." >&2
+        else
+            echo "Error: this namespace registers more than one endpoint, so" >&2
+            echo "one must be named with --endpoint. The registered endpoints" >&2
+            echo "are:" >&2
+            printf '%s\n' "${PROXY_ENDPOINT_NAMES[@]}" | sed 's/^/  /' >&2
+            exit 1
+        fi
+    elif [[ -n "$endpoint" ]]; then
+        echo "Error: --endpoint is not available: this namespace was" >&2
+        echo "installed with K8S_PROXY_UPSTREAM; there are no named" >&2
+        echo "endpoints." >&2
         exit 1
     fi
 
-    [[ -n "$model" ]] || { echo "Error: submit requires --model. There is no default:" >&2
-        echo "the model is an OpenRouter id, such as moonshotai/kimi-k3." >&2; exit 1; }
+    # --model stays required on a legacy K8S_PROXY_UPSTREAM install, where
+    # there is no model to discover. On a K8S_PROXY_ENDPOINTS install it is
+    # optional -- the pod discovers it from the proxy's /v1/models at
+    # startup (fork-sandbox-k8s-entrypoint.sh) -- with one carve-out:
+    # --harness claude, because discovery lists the pi endpoint's model
+    # ids, never a Claude Code model name.
+    if [[ -z "$K8S_PROXY_ENDPOINTS" ]]; then
+        [[ -n "$model" ]] || { echo "Error: submit requires --model. There is no default:" >&2
+            echo "the model is an OpenRouter id, such as moonshotai/kimi-k3." >&2; exit 1; }
+    elif [[ -z "$model" && "$harness" == claude ]]; then
+        echo "Error: --harness claude requires --model even on a" >&2
+        echo "K8S_PROXY_ENDPOINTS install -- the pod's model discovery" >&2
+        echo "lists the pi endpoint's model ids, not Claude Code model" >&2
+        echo "names." >&2
+        exit 1
+    fi
     branch="${branch:-k8s-$(date +%Y%m%d-%H%M%S)}"
     fs_reject_unsafe_chars "$branch" "$model" || exit 1
 
@@ -1545,7 +1609,16 @@ cmd_submit() {
 
     local safe_name
     safe_name="$(k8s_safe_name fork-sandbox-agent "$branch")"
-    local proxy_base_url="http://fork-sandbox-proxy.$K8S_NAMESPACE.svc.cluster.local:8080/api/v1"
+    local proxy_base_url
+    if [[ -n "$proxy_endpoint" ]]; then
+        # The named endpoint's exact-match location. A K8S_PROXY_ENDPOINTS
+        # install renders no /api/v1 path at all -- this is the wiring the
+        # old "submit cannot yet target K8S_PROXY_ENDPOINTS" refusal
+        # guard stood in for, and is why that guard is gone.
+        proxy_base_url="http://fork-sandbox-proxy.$K8S_NAMESPACE.svc.cluster.local:8080/e/$proxy_endpoint/v1"
+    else
+        proxy_base_url="http://fork-sandbox-proxy.$K8S_NAMESPACE.svc.cluster.local:8080/api/v1"
+    fi
 
     # The egress-gate initContainer's own proxy probe: the shared pi proxy
     # for a pi run, this run's own per-run proxy for a claude run -- see
@@ -2079,7 +2152,7 @@ cmd_rm() {
 # failure handling.
 cmd_run() {
     local dry_run=false keep=false timeout=3600 branch="" model="" review_loop_cap=""
-    local outbox_dir="" outbox_max_arg="" context_ro="" harness="" review_model=""
+    local outbox_dir="" outbox_max_arg="" context_ro="" harness="" review_model="" endpoint=""
     while (( $# )); do
         case "$1" in
             --dry-run) dry_run=true; shift ;;
@@ -2087,6 +2160,7 @@ cmd_run() {
             --timeout) timeout="${2:?--timeout requires a number of seconds}"; shift 2 ;;
             --branch) branch="${2:?--branch requires a name}"; shift 2 ;;
             --model) model="${2:?--model requires an OpenRouter model id}"; shift 2 ;;
+            --endpoint) endpoint="${2:?--endpoint requires a name}"; shift 2 ;;
             --harness) harness="${2:?--harness requires 'pi' or 'claude'}"; shift 2 ;;
             --review-loop) review_loop_cap="${2:?--review-loop requires a positive integer}"; shift 2 ;;
             --review-model) review_model="${2:?--review-model requires a model id}"; shift 2 ;;
@@ -2104,8 +2178,20 @@ cmd_run() {
     # the name up front so the same name can be used to poll, fetch and
     # clean up this one run.
     [[ -n "$branch" ]] || { echo "Error: run requires --branch." >&2; exit 1; }
-    [[ -n "$model" ]] || { echo "Error: run requires --model. There is no default:" >&2
-        echo "the model is an OpenRouter id, such as moonshotai/kimi-k3." >&2; exit 1; }
+    # --model, like in cmd_submit, is required on a legacy install and
+    # optional on a K8S_PROXY_ENDPOINTS install (the pod discovers it).
+    # --harness claude keeps the requirement, for the same reason submit
+    # does.
+    if [[ -z "$K8S_PROXY_ENDPOINTS" ]]; then
+        [[ -n "$model" ]] || { echo "Error: run requires --model. There is no default:" >&2
+            echo "the model is an OpenRouter id, such as moonshotai/kimi-k3." >&2; exit 1; }
+    elif [[ -z "$model" && "$harness" == claude ]]; then
+        echo "Error: --harness claude requires --model even on a" >&2
+        echo "K8S_PROXY_ENDPOINTS install -- the pod's model discovery" >&2
+        echo "lists the pi endpoint's model ids, not Claude Code model" >&2
+        echo "names." >&2
+        exit 1
+    fi
     if [[ ! "$timeout" =~ ^[0-9]+$ ]]; then
         echo "Error: --timeout must be a whole number of seconds, got '$timeout'." >&2
         exit 1
@@ -2120,7 +2206,14 @@ cmd_run() {
         outbox_max_bytes="$(fs_parse_size_bytes "$outbox_max_arg")" || exit 1
     fi
 
-    local -a submit_argv=(--branch "$branch" --model "$model")
+    local -a submit_argv=(--branch "$branch")
+    # Forwarded only when given: on a K8S_PROXY_ENDPOINTS install a run
+    # may omit --model, and cmd_submit's own discovery-based optionality
+    # is what applies -- forwarding an empty value would be a different
+    # thing. --endpoint follows the same pass-through-when-given rule as
+    # --review-loop below.
+    [[ -n "$model" ]] && submit_argv+=(--model "$model")
+    [[ -n "$endpoint" ]] && submit_argv+=(--endpoint "$endpoint")
     [[ -n "$harness" ]] && submit_argv+=(--harness "$harness")
     # Passed through whenever the flag was given at all, "0" included --
     # cmd_submit does the actual positive-integer validation below, and a
