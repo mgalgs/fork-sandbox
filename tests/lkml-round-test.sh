@@ -227,6 +227,15 @@ contains "a .git/lkml-out file with no In-Reply-To is refused with a clear line"
     "$out" "has no In-Reply-To"
 contains "the refusal names the file it skipped" "$out" "2.msg"
 
+printf '\n== persona archiving ==\n'
+for p in core security pi-local codex; do
+    if cmp -s "$work/$p.md" "$LKML_MAILBOX_ROOT/widget-frob/personas/$p.md"; then
+        ok "persona $p archived into the series mailbox"
+    else
+        no "persona $p archived into the series mailbox" "missing or differs"
+    fi
+done
+
 printf '\n== bad --reply-to id is caught before any persona launches ==\n'
 
 # Before the fix this required for two things to line up to go unchecked:

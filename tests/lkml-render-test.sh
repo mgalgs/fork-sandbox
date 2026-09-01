@@ -110,5 +110,36 @@ case "$html" in *fonts.googleapis.com*) no "output has no remote font dependency
 if cmp -s "$stdout" "$custom"; then ok "output file matches stdout"; else no "output file matches stdout"; fi
 if python3 -m py_compile "$renderer"; then ok "renderer compiles"; else no "renderer compiles"; fi
 
+printf '\n== matrix row labels ==\n'
+contains "patch row label is standard series numbering" "$html" '>Patch v1 1/2</a></th>'
+contains "second patch row label is numbered too" "$html" '>Patch v1 2/2</a></th>'
+contains "row label title carries the full subject" "$html" '<th scope="row" title="[PATCH v1 1/2] demo: add one">'
+case "$html" in *'>demo: add one</a></th>'*|*'>demo: add two</a></th>'*) no "truncated subjects are no longer row labels" ;; *) ok "truncated subjects are no longer row labels" ;; esac
+
+printf '\n== reviewers section (headers only, no persona files yet) ==\n'
+if [[ "$(grep -o '<details class="reviewer"' "$stdout" | wc -l)" -eq 3 ]]; then ok "one expand-o per reviewer (core, ci, newcomer)"; else no "one expand-o per reviewer (core, ci, newcomer)"; fi
+contains "reviewer summary carries display name and persona slug" "$html" '<span class="who">Core</span> <span class="slug mono">core</span>'
+contains "reviewer rollup shows harness and model" "$html" 'test · fixture'
+contains "reviewer rollup counts messages" "$html" '<span>1 message</span>'
+contains "reviewer rollup counts Reviewed-by" "$html" '<span>1 Reviewed-by</span>'
+case "$html" in *'<span class="slug mono">author</span>'*) no "author persona is excluded from reviewers" ;; *) ok "author persona is excluded from reviewers" ;; esac
+case "$html" in *'<pre class="persona-brief">'*) no "no persona brief when the file is absent" ;; *) ok "no persona brief when the file is absent" ;; esac
+
+printf '\n== persona brief inlining ==\n'
+mkdir -p "$LKML_MAILBOX_ROOT/render-fixture/personas"
+printf '%s\n' 'Core reviewer brief.' '<script>alert(2)</script>' 'A & B' \
+    > "$LKML_MAILBOX_ROOT/render-fixture/personas/core.md"
+printf '%s\n' 'Not this time.' > "$work/nak.txt"
+"$mailbox" post render-fixture --from core --reply-to "$patch_id" --file "$work/nak.txt" \
+    --tags NAK --harness test --model fixture >/dev/null 2>/dev/null
+persona_html="$work/persona.html"
+python3 "$renderer" "$LKML_MAILBOX_ROOT/render-fixture" -o "$persona_html"
+phtml="$(<"$persona_html")"
+contains "persona brief is inlined" "$phtml" '<pre class="persona-brief">Core reviewer brief.'
+contains "persona brief is html-escaped (script)" "$phtml" '&lt;script&gt;alert(2)&lt;/script&gt;'
+contains "persona brief is html-escaped (ampersand)" "$phtml" 'A &amp; B'
+case "$phtml" in *'<script>alert(2)</script>'*) no "persona brief script payload is never raw" ;; *) ok "persona brief script payload is never raw" ;; esac
+contains "reviewer rollup counts NAK" "$phtml" '<span>1 NAK</span>'
+
 printf '%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))
