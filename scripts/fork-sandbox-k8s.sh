@@ -15,15 +15,15 @@
 #                            [--outbox-dir DIR] [--outbox-max SIZE]
 #                            [--context-ro DIR]
 #                            <project-path> <handoff-file>
+#        fork-sandbox-k8s.sh fetch --branch NAME <project-path>
+#        fork-sandbox-k8s.sh say --branch NAME <text>
+#        fork-sandbox-k8s.sh say --branch NAME -        # text from stdin
+#        fork-sandbox-k8s.sh rm --branch NAME
 #
 # --model MODEL is REQUIRED on a K8S_PROXY_UPSTREAM (legacy) install. On a
 # K8S_PROXY_ENDPOINTS install it is optional: the pod discovers the model
 # (and its context window) from the proxy's /v1/models at startup -- see
 # --endpoint below and fork-sandbox-k8s-entrypoint.sh.
-#        fork-sandbox-k8s.sh fetch --branch NAME <project-path>
-#        fork-sandbox-k8s.sh say --branch NAME <text>
-#        fork-sandbox-k8s.sh say --branch NAME -        # text from stdin
-#        fork-sandbox-k8s.sh rm --branch NAME
 #
 # The Kubernetes analogue of fork-sandbox.sh: submit a task from anywhere
 # with cluster access, and a few minutes later fetch a branch. See
@@ -1719,6 +1719,24 @@ CENV
 )"
     fi
 
+    # MODEL_DISCOVERY, set only when this run is wired to a named
+    # endpoint: it is the host's half of the pod-side model-discovery
+    # gate. The pod cannot tell the two proxy renders apart from
+    # PROXY_BASE_URL alone -- on a legacy K8S_PROXY_UPSTREAM install the
+    # proxy forwards only /api/v1/chat/completions, so the discovery
+    # probe would 403 and die the pod before the repository push. Set
+    # here, where the install kind is already resolved, is the only
+    # place that cannot guess wrong. See the MODEL_DISCOVERY entry in
+    # fork-sandbox-k8s-entrypoint.sh's env header.
+    local model_discovery_env=""
+    if [[ -n "$proxy_endpoint" ]]; then
+        model_discovery_env=$'\n'"$(cat <<CENV
+            - name: MODEL_DISCOVERY
+              value: "1"
+CENV
+)"
+    fi
+
     local job_rendered rendered
     job_rendered="$(cat <<EOF
 ---
@@ -1815,7 +1833,7 @@ spec:
             - name: RUN_TTL
               value: "$K8S_RUN_TTL"
             - name: OUTBOX_MAX_BYTES
-              value: "$outbox_max_bytes"${review_loop_env}${claude_env}${review_model_env}
+              value: "$outbox_max_bytes"${model_discovery_env}${review_loop_env}${claude_env}${review_model_env}
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -1957,9 +1975,26 @@ EOF
     # to this one invocation, never set globally.
     # kubectl exec -i, never -t: a tty applies line-discipline translation
     # to what must stay a binary pack stream, and would corrupt it.
+    # The `|| push_rc=$?` rather than a bare call under set -e is what
+    # lets the failure branch below dump the pod's log: the agent
+    # container has no readinessProbe, so the wait above returns the
+    # moment it starts, and an entrypoint that dies early (model
+    # discovery against a dead endpoint on an K8S_PROXY_ENDPOINTS
+    # install) can terminate the container BEFORE this push lands. git's
+    # or kubectl's own error there is a bare "connection refused" that
+    # tells the operator nothing -- the entrypoint's fail-fast message
+    # is in the container's log, which is what the branch prints.
+    local push_rc=0
     (cd "$origin_repo" && git -c protocol.ext.allow=always -c core.hooksPath=/dev/null push --quiet \
         "ext::kubectl --context=$K8S_CONTEXT -n $K8S_NAMESPACE exec -i $pod_name -- git-receive-pack /work/repo.git" \
-        "HEAD:refs/heads/$branch")
+        "HEAD:refs/heads/$branch") || push_rc=$?
+    if (( push_rc != 0 )); then
+        echo "Error: the repository push to pod $pod_name failed (git exit $push_rc)." >&2
+        echo "fork-sandbox-k8s: the pod's agent container log, for the reason:" >&2
+        kubectl logs "$pod_name" 2>/dev/null \
+            || echo "fork-sandbox-k8s: (the container log is not available yet)" >&2
+        exit 1
+    fi
 
     # Pushed after the repository, before the sentinel below -- a failure
     # here fails submit before /work/.inputs-complete exists, so the pod
@@ -2171,8 +2206,8 @@ cmd_run() {
             *) break ;;
         esac
     done
-    local project_path="${1:?Usage: fork-sandbox-k8s.sh run [options] --branch NAME --model MODEL <project-path> <handoff-file>}"
-    local handoff_file="${2:?Usage: fork-sandbox-k8s.sh run [options] --branch NAME --model MODEL <project-path> <handoff-file>}"
+    local project_path="${1:?Usage: fork-sandbox-k8s.sh run [options] --branch NAME [--model MODEL] <project-path> <handoff-file>}"
+    local handoff_file="${2:?Usage: fork-sandbox-k8s.sh run [options] --branch NAME [--model MODEL] <project-path> <handoff-file>}"
 
     # Unlike submit, run has no auto-generated branch name: it needs to know
     # the name up front so the same name can be used to poll, fetch and

@@ -625,20 +625,35 @@ repository to arrive — the health check the `direct` section below
 records as a requirement, now satisfied for the proxy path: a dead
 endpoint fails in seconds with a message that treats a connection
 refusal from a workstation-class host as the expected, ordinary state
-it is, not a bug to chase. When `--model` was omitted, exactly one
-model in the listing is used (and said so); zero or several is an error
-listing what was found. When `--model` was given but the listing does
-not contain it, that is a warning, not an error — the listing may be
-stale, and refusing would strand a legitimate run. The same response's
-`max_model_len` for the chosen model becomes `models.json`'s
-`contextWindow` (a missing value falls back to a deliberately low 32768
-guess, with a warning), and `maxTokens` is derived the same way
-`agent-sandboxed` derives it: a 32768 floor capped at a quarter of the
-window. `REVIEW_MODEL`, when set, gets the same discovered window. On a
-legacy install `--model` stays required (the same error text as before),
-and `--harness claude` keeps the requirement even on an endpoints
-install: discovery lists the pi endpoint's model ids, never a Claude
-Code model name.
+it is, not a bug to chase. Discovery runs only on this path: the host
+sets the `MODEL_DISCOVERY` env var only when the run is wired to a
+named endpoint, because a legacy `K8S_PROXY_UPSTREAM` proxy forwards
+only `/api/v1/chat/completions`, and a `/models` probe there would 403
+and die the pod at startup with nginx's error page. When `--model` was
+omitted, exactly one model in the listing is used (and said so); zero
+or several is an error listing what was found. When `--model` was
+given but the listing does not contain it, that is a warning, not an
+error — the listing may be stale, and refusing would strand a
+legitimate run. The same response's `max_model_len` for the chosen
+model becomes `models.json`'s `contextWindow` (a missing value falls
+back to a deliberately low 32768 guess, with a warning), and `maxTokens`
+is derived the same way `agent-sandboxed` derives it: a 32768 floor
+capped at a quarter of the window. `REVIEW_MODEL`, when set, gets the
+window discovered for *its own id* rather than sharing the coding
+model's — on a `--harness claude` run `MODEL` is a Claude Code model
+name the listing never contains, and the review loop runs pi with
+`REVIEW_MODEL`, so the coding model's absent value must not stand in
+for the review model's window. On a legacy install `--model` stays
+required (the same error text as before), the pod skips discovery
+entirely and keeps the 131072/32768 constants the pre-discovery
+`models.json` carried, and `--harness claude` keeps the requirement
+even on an endpoints install: discovery lists the pi endpoint's model
+ids, never a Claude Code model name. Because the agent container has
+no readiness probe, a pod that dies in that early discovery can
+terminate before submit's repository push lands; when the push fails
+for that reason, submit prints the pod's container log — where the
+entrypoint's fail-fast message actually is — instead of leaving the
+operator with git's bare "connection refused".
 
 ### 1b. proxy, per-run, for claude — **Status: built.**
 
@@ -789,8 +804,9 @@ model call that will never return. A connection refusal from
 `K8S_MODEL_ENDPOINT` is an expected, ordinary state to design for, not a bug
 to chase down each time it happens. (The built `proxy` mode performs this
 same check for `K8S_PROXY_ENDPOINTS` runs: the pod queries the endpoint's
-`/models` path through the proxy at startup, before the repository arrives —
-see the mode-1 section above.)
+`/models` path through the proxy at startup, before the repository arrives,
+and submit surfaces the pod's log if that failure takes the container down
+before the repository push lands — see the mode-1 section above.)
 
 ### 3. secret — **Status: designed, not built.**
 

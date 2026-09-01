@@ -39,12 +39,33 @@
 #                   (max_model_len for the chosen model; a missing value
 #                   falls back to 32768, a deliberately low guess, with a
 #                   warning) and MAX_TOKENS (agent-sandboxed's rule: a
-#                   32768 floor, capped at a quarter of the window). Both
-#                   feed synthesize_pi_config below.
+#                   32768 floor, capped at a quarter of the window). The
+#                   review model gets the window discovered for ITS OWN
+#                   id, not this model's -- on a --harness claude run this
+#                   model is a Claude Code model name the listing never
+#                   contains, and the review loop runs pi with
+#                   REVIEW_MODEL. All of it feeds synthesize_pi_config
+#                   below.
+#                   On a legacy K8S_PROXY_UPSTREAM install the host does
+#                   not set MODEL_DISCOVERY, so none of this discovery
+#                   runs: synthesize_pi_config below gets the constants
+#                   131072/32768 the pre-discovery config used.
 #   PROXY_BASE_URL  the pi model proxy's base URL, e.g.
 #                   http://fork-sandbox-proxy.NS.svc.cluster.local:8080/api/v1
 #                   Required regardless of HARNESS -- the review loop
 #                   always needs it, even on a claude coding leg.
+#   MODEL_DISCOVERY  set to 1 by fork-sandbox-k8s.sh only for a
+#                   K8S_PROXY_ENDPOINTS install -- i.e. only when
+#                   PROXY_BASE_URL above is an /e/<name>/v1 location,
+#                   whose render forwards /models as well as
+#                   /chat/completions. Never set on a legacy
+#                   K8S_PROXY_UPSTREAM install: that render forwards ONLY
+#                   /api/v1/chat/completions, so a $PROXY_BASE_URL/models
+#                   probe there would 403 with nginx's error page, and
+#                   running discovery unconditionally would kill every
+#                   legacy run at pod start. The host, which knows which
+#                   install it is, gates the call on this variable
+#                   instead of the pod guessing from the URL.
 #   CLAUDE_PROXY_BASE_URL
 #                   the base URL of the per-run proxy that swaps the
 #                   placeholder credential below for the operator's real
@@ -133,6 +154,7 @@ case "$HARNESS" in
         ;;
 esac
 : "${MODEL:=}"
+: "${MODEL_DISCOVERY:=}"
 : "${PROXY_BASE_URL:?PROXY_BASE_URL must be set to the pi model proxy base URL}"
 if [[ "$HARNESS" == claude ]]; then
     : "${CLAUDE_PROXY_BASE_URL:?CLAUDE_PROXY_BASE_URL must be set when HARNESS=claude}"
@@ -165,8 +187,15 @@ fi
 # reachable only through the proxy's /e/<name>/v1/models location. curl
 # and jq are both in the image (the review loop already uses curl); the
 # function is self-contained so the test suite can exercise it by
-# stubbing curl on PATH. Sets MODEL (when unset), CTX and MAX_TOKENS,
-# which synthesize_pi_config below reads.
+# stubbing curl on PATH. Sets MODEL (when unset), CTX and MAX_TOKENS for
+# the coding leg's model, and, when REVIEW_MODEL differs from MODEL,
+# REVIEW_CTX and REVIEW_MAX_TOKENS for the review loop's model --
+# synthesize_pi_config below reads them. Run ONLY when the host set
+# MODEL_DISCOVERY (the K8S_PROXY_ENDPOINTS install): on a legacy
+# K8S_PROXY_UPSTREAM install the proxy's render forwards only
+# /api/v1/chat/completions, so /api/v1/models would 403 and discovery
+# would die every legacy run at pod start. The legacy branch keeps the
+# constants synthesize_pi_config used before discovery existed.
 discover_model_facts() {
     local url="$PROXY_BASE_URL/models" body probe_ids count
     if ! body="$(curl -sS --max-time 20 "$url" 2>&1)"; then
@@ -209,26 +238,70 @@ discover_model_facts() {
     # The /props fallback agent-sandboxed tries for llama.cpp is
     # deliberately NOT probed here: the proxy forwards only the two paths
     # /chat/completions and /models, so /props would 403.
-    CTX="$(jq -r --arg m "$MODEL" \
-        'first(.data[] | select(.id == $m) | .max_model_len // empty) // empty' \
-        <<<"$body" 2>/dev/null || true)"
-    if [[ ! "$CTX" =~ ^[0-9]+$ ]]; then
-        # Guess low: too small wastes context, while too large means a
-        # rejection that arrives mid-run with the work half done.
-        CTX=32768
-        echo "Warning: $url does not report a context length for '$MODEL'," >&2
-        echo "so this run assumes $CTX tokens, a deliberately low guess." >&2
-    fi
-    # MAX_TOKENS from CTX, the same rule agent-sandboxed applies: a 32768
-    # floor, capped at a quarter of the window.
-    MAX_TOKENS=32768
-    if (( CTX / 4 < MAX_TOKENS )); then
-        MAX_TOKENS=$(( CTX / 4 ))
+    #
+    # One window PER MODEL ID, looked up separately for the coding leg's
+    # model and the review loop's model: on a --harness claude run MODEL
+    # is a Claude Code model name this listing never contains, and letting
+    # its (absent) value stand in for REVIEW_MODEL's window would give the
+    # review loop a quarter of the context it used to have. The helper is
+    # nested in this function, not top-level, because the test suite
+    # extracts exactly this function's source and runs it alone. Sets the
+    # globals FACTS_CTX / FACTS_MAX for the id in $1.
+    _model_context_facts() {
+        local model="$1" len
+        len="$(jq -r --arg m "$model" \
+            'first(.data[] | select(.id == $m) | .max_model_len // empty) // empty' \
+            <<<"$body" 2>/dev/null || true)"
+        if [[ ! "$len" =~ ^[0-9]+$ ]]; then
+            # Guess low: too small wastes context, while too large means a
+            # rejection that arrives mid-run with the work half done.
+            len=32768
+            echo "Warning: $url does not report a context length for" >&2
+            echo "'$model', so the run using it assumes $len tokens, a" >&2
+            echo "deliberately low guess." >&2
+        fi
+        FACTS_CTX="$len"
+        # MAX_TOKENS from CTX, the same rule agent-sandboxed applies: a
+        # 32768 floor, capped at a quarter of the window.
+        FACTS_MAX=32768
+        if (( len / 4 < FACTS_MAX )); then
+            FACTS_MAX=$(( len / 4 ))
+        fi
+    }
+    _model_context_facts "$MODEL"
+    CTX="$FACTS_CTX"
+    MAX_TOKENS="$FACTS_MAX"
+    if [[ -n "$REVIEW_MODEL" && "$REVIEW_MODEL" != "$MODEL" ]]; then
+        _model_context_facts "$REVIEW_MODEL"
+        REVIEW_CTX="$FACTS_CTX"
+        REVIEW_MAX_TOKENS="$FACTS_MAX"
+    else
+        # No separate review model (or the same one) -- the review loop
+        # falls back to MODEL and gets MODEL's window with it.
+        REVIEW_CTX="$CTX"
+        REVIEW_MAX_TOKENS="$MAX_TOKENS"
     fi
     echo "fork-sandbox-k8s-entrypoint: model $MODEL at $PROXY_BASE_URL" >&2
     echo "(${CTX} token context, $MAX_TOKENS token reply room)" >&2
 }
-discover_model_facts
+if [[ -n "$MODEL_DISCOVERY" ]]; then
+    discover_model_facts
+else
+    # Legacy K8S_PROXY_UPSTREAM install (see the MODEL_DISCOVERY env
+    # header above): no discovery, and MODEL is set -- the host requires
+    # --model on this install -- so the pre-discovery constants stand in
+    # for the window synthesize_pi_config's models.json entries carry.
+    if [[ -z "$MODEL" ]]; then
+        echo "Error: MODEL must be set on a legacy K8S_PROXY_UPSTREAM" >&2
+        echo "install -- there is no /v1/models location to discover it" >&2
+        echo "from (that proxy forwards only /api/v1/chat/completions)." >&2
+        exit 1
+    fi
+    CTX=131072
+    MAX_TOKENS=32768
+    REVIEW_CTX=131072
+    REVIEW_MAX_TOKENS=32768
+fi
 
 mounts_dir=/mnt/fork-sandbox
 work_dir=/work
@@ -310,12 +383,16 @@ git config tag.gpgsign false
 # this pod. apiKey is a placeholder; the proxy replaces the header on the
 # way past, so this value is never sent anywhere that checks it.
 # contextWindow/maxTokens are the values discover_model_facts established
-# from the endpoint's own /v1/models (or its documented fallbacks), so
-# both ids -- the coding leg's and REVIEW_MODEL's -- get the same
-# discovered context window.
+# from the endpoint's own /v1/models (or its documented fallbacks), one
+# pair PER ID: $3/$4 for $model, $5/$6 for $extra_model -- on a
+# --harness claude run $model is the review loop's REVIEW_MODEL and the
+# coding leg's Claude Code model name never lands in models.json at all.
+# A legacy K8S_PROXY_UPSTREAM install passes the pre-discovery constants
+# instead (see the MODEL_DISCOVERY branch above).
 synthesize_pi_config() {
     local model="$1"
     local extra_model="${2:-}"
+    local ctx="$3" maxtok="$4" extra_ctx="${5:-$3}" extra_maxtok="${6:-$4}"
     echo "fork-sandbox-k8s-entrypoint: synthesizing pi config for $model" >&2
     mkdir -p "$HOME/.pi/agent"
     if [[ -f "$mounts_dir/pi-agent-settings.json" ]]; then
@@ -323,22 +400,25 @@ synthesize_pi_config() {
     fi
 
     jq -n --arg base "$PROXY_BASE_URL" --arg model "$model" --arg extra "$extra_model" \
-        --argjson ctx "$CTX" --argjson maxtok "$MAX_TOKENS" '
+        --argjson ctx "$ctx" --argjson maxtok "$maxtok" \
+        --argjson extra_ctx "$extra_ctx" --argjson extra_maxtok "$extra_maxtok" '
         {
             providers: {
                 proxy: {
                     baseUrl: $base,
                     api: "openai-completions",
                     apiKey: "sandbox",
-                    models: ([$model, $extra] | map(select(. != "")) | unique | map({
-                        id: .,
-                        name: (. + " (proxy)"),
-                        reasoning: true,
-                        input: ["text"],
-                        contextWindow: $ctx,
-                        maxTokens: $maxtok,
-                        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-                    })),
+                    models: ([$model, $extra] | map(select(. != "")) | unique | map(
+                        . as $id | {
+                            id: $id,
+                            name: ($id + " (proxy)"),
+                            reasoning: true,
+                            input: ["text"],
+                            contextWindow: (if $id == $model then $ctx else $extra_ctx end),
+                            maxTokens: (if $id == $model then $maxtok else $extra_maxtok end),
+                            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+                        }
+                    )),
                 },
             },
         }' > "$HOME/.pi/agent/models.json"
@@ -377,7 +457,8 @@ if [[ "$HARNESS" == pi ]]; then
     # below never needs a second synthesize_pi_config call for a pi
     # coding leg -- only a claude coding leg (which skips this branch
     # entirely) still needs one, right before the loop runs.
-    synthesize_pi_config "$MODEL" "$REVIEW_MODEL"
+    synthesize_pi_config "$MODEL" "$REVIEW_MODEL" \
+        "$CTX" "$MAX_TOKENS" "$REVIEW_CTX" "$REVIEW_MAX_TOKENS"
 
     echo "fork-sandbox-k8s-entrypoint: running pi" >&2
     pi --provider proxy --model "$MODEL" --mode json -p \
@@ -461,7 +542,12 @@ if [[ "$REVIEW_LOOP_CAP" =~ ^[1-9][0-9]*$ ]]; then
         # synthesized here, for the first time.
         review_loop_model="${REVIEW_MODEL:-$MODEL}"
         if [[ "$HARNESS" == claude ]]; then
-            synthesize_pi_config "$review_loop_model"
+            # $review_loop_model is REVIEW_MODEL here (required at startup
+            # for a claude coding leg), so it gets the window discovered
+            # for its own id -- never MODEL's, which is a Claude Code
+            # model name the pi endpoint's listing never contains.
+            synthesize_pi_config "$review_loop_model" "" \
+                "$REVIEW_CTX" "$REVIEW_MAX_TOKENS"
         fi
         loop_rc=0
         MODEL="$review_loop_model" bash "$mounts_dir/review-loop.sh" \
