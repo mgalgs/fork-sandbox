@@ -123,11 +123,60 @@ case "$html" in *fonts.googleapis.com*) no "output has no remote font dependency
 if cmp -s "$stdout" "$custom"; then ok "output file matches stdout"; else no "output file matches stdout"; fi
 if python3 -m py_compile "$renderer"; then ok "renderer compiles"; else no "renderer compiles"; fi
 
+printf '\n== patch_label: lore-style normalizer ==\n'
+# The row-label normalizer, exercised directly: the bracketed numbering is
+# a prefix ON the subject, not a label beside it.
+if python3 - "$renderer" <<'PY'
+import importlib.util
+import sys
+
+spec = importlib.util.spec_from_file_location("lkml_render", sys.argv[1])
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+
+failures = []
+
+def msg(subject, version=1):
+    return {"subject": subject, "version": version}
+
+def check(label, got, want):
+    if got != want:
+        failures.append(f"{label}: {got!r} != {want!r}")
+
+check("zero-pad i to the width of M",
+      mod.patch_label(msg("[PATCH v1 2/14] demo: add two")),
+      "[PATCH v1 02/14] demo: add two")
+check("an already-padded number is not re-padded",
+      mod.patch_label(msg("[PATCH v1 02/14] demo: add two")),
+      "[PATCH v1 02/14] demo: add two")
+check("an already-canonical subject round-trips byte-identical",
+      mod.patch_label(msg("[PATCH v11 03/24] dt-bindings: ufs: mediatek,ufs: Add mt8196 variant")),
+      "[PATCH v11 03/24] dt-bindings: ufs: mediatek,ufs: Add mt8196 variant")
+check("a no-version prefix falls back to the message's X-Version",
+      mod.patch_label(msg("[PATCH 2/14] demo: add two")),
+      "[PATCH v1 02/14] demo: add two")
+check("the fallback follows a non-default X-Version",
+      mod.patch_label(msg("[PATCH 2/14] demo: add two", 3)),
+      "[PATCH v3 02/14] demo: add two")
+check("a no-prefix subject is returned verbatim",
+      mod.patch_label(msg("just a subject")),
+      "just a subject")
+
+if failures:
+    print("\n".join(failures))
+sys.exit(1 if failures else 0)
+PY
+then
+    ok "patch_label normalizes zero-padding, round-trip, no-version fallback, no-prefix verbatim"
+else
+    no "patch_label normalizes zero-padding, round-trip, no-version fallback, no-prefix verbatim"
+fi
+
 printf '\n== matrix row labels ==\n'
-contains "patch row label is standard series numbering" "$html" '>Patch v1 1/2</a></th>'
-contains "second patch row label is numbered too" "$html" '>Patch v1 2/2</a></th>'
+contains "patch row label is the lore-style prefixed subject" "$html" '>[PATCH v1 1/2] demo: add one</a></th>'
+contains "second patch row label is prefixed too" "$html" '>[PATCH v1 2/2] demo: add two</a></th>'
 contains "row label title carries the full subject" "$html" '<th scope="row" title="[PATCH v1 1/2] demo: add one">'
-case "$html" in *'>demo: add one</a></th>'*|*'>demo: add two</a></th>'*) no "truncated subjects are no longer row labels" ;; *) ok "truncated subjects are no longer row labels" ;; esac
+case "$html" in *'>demo: add one</a></th>'*|*'>demo: add two</a></th>'*|*'Patch v1 1/2</a>'*) no "truncated and demoted subjects are no longer row labels" ;; *) ok "truncated and demoted subjects are no longer row labels" ;; esac
 
 printf '\n== reviewers section (headers only, no persona files yet) ==\n'
 if [[ "$(grep -o '<details class="reviewer"' "$stdout" | wc -l)" -eq 3 ]]; then ok "one expand-o per reviewer (core, ci, newcomer)"; else no "one expand-o per reviewer (core, ci, newcomer)"; fi
@@ -265,11 +314,11 @@ fi
 printf '\n== text mode: tally and reviewers ==\n'
 contains "text: header count line includes reviewers" "$ttext" '2 patches · 7 replies · 5 reviewers'
 contains "text: tally legend is plain text" "$ttext" 'Latest tag per reviewer per patch. R reviewed, A acked, C changes requested, ? question, N nak.'
-contains "text: patch rows use the HTML row labels" "$ttext" 'Patch v1 1/2'
-contains "text: second patch row is labeled too" "$ttext" 'Patch v1 2/2'
+contains "text: patch rows use the HTML row labels" "$ttext" '[PATCH v1 1/2] demo: add one'
+contains "text: second patch row is labeled too" "$ttext" '[PATCH v1 2/2] demo: add two'
 # The tagged patch's row carries the latest tag per reviewer: R for
 # core's superseding Reviewed-by, T for the CI bot, · where untagged.
-patch_row="$(grep -F 'Patch v1 1/2' "$text_out" | head -1)"
+patch_row="$(grep -F '[PATCH v1 1/2] demo: add one' "$text_out" | grep -v '^Subject:' | head -1)"
 contains "text: tally row carries per-reviewer letters" "$patch_row" 'R'
 contains "text: tally row carries the Tested-by letter" "$patch_row" 'T'
 contains "text: untagged reviewer is a dot in the row" "$patch_row" '·'
@@ -286,7 +335,7 @@ contains "text: brief is a pointer, not inlined" "$ttext" 'brief: render-fixture
 case "$ttext" in *'Core reviewer brief.'*) no "persona brief is not inlined in text mode" ;; *) ok "persona brief is not inlined in text mode" ;; esac
 # The same line-level markup check for the tally table's rows, which
 # carry the most markup in HTML mode.
-if grep -F 'Patch v1 1/2' "$text_out" | grep -q '<'; then no "tally rows have no HTML tags"; else ok "tally rows have no HTML tags"; fi
+if grep -F '[PATCH v1 1/2] demo: add one' "$text_out" | grep -v '^Subject:' | grep -q '<'; then no "tally rows have no HTML tags"; else ok "tally rows have no HTML tags"; fi
 
 printf '\n== text mode: -o is refused ==\n'
 # --text renders to stdout; combining it with -o must fail loudly rather

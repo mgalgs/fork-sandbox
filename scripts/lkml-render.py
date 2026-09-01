@@ -287,13 +287,19 @@ def short_subject(s):
 
 
 def patch_label(m):
-    """Standard series numbering for a patch row label: 'Patch vN i/M'.
-    Tolerates prefixes with no explicit version and zero-padded numbering;
-    falls back to the message's own X-Version for those."""
-    mm = re.match(r"^\[PATCH (?:v(\d+) )?(\d+)/(\d+)\]", m["subject"])
+    """The patch subject in canonical lore style: '[PATCH vN i/M] subject'.
+    N comes from the subject's own prefix; a series posted as bare
+    '[PATCH i/M]' (no version) falls back to the message's own X-Version.
+    i is zero-padded to the width of M, lore-style (02/14, 03/24), even
+    when the source subject was not padded. An already-canonical subject
+    round-trips byte-identical; a subject with no [PATCH] prefix is
+    returned verbatim."""
+    mm = re.match(r"^\[PATCH (?:v(\d+) )?(\d+)/(\d+)\]\s*(.*)$", m["subject"])
     if not mm:
-        return short_subject(m["subject"])
-    return f"Patch v{mm.group(1) or m['version']} {mm.group(2)}/{mm.group(3)}"
+        return m["subject"]
+    version = mm.group(1) or str(m["version"])
+    idx = mm.group(2).zfill(len(mm.group(3)))
+    return f"[PATCH v{version} {idx}/{mm.group(3)}] {mm.group(4)}"
 
 
 def is_patch(m):
