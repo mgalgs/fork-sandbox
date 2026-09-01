@@ -59,6 +59,18 @@ The review loop (fork-sandbox.sh --review-loop N):
                iteration, and the per-iteration costs say what that was
                worth.
 
+The maintainer loop (fork-sandbox.sh --maintainer-loop N): the outer
+sibling of the review loop, on its own model and harness, reading the
+branch after the review loop ended.
+  maintainer_loop  present only when the run used the flag. Same shape as
+               review_loop -- `cap`, `maintainer_model`,
+               `maintainer_harness`, `ended` (approved | cap | no-progress |
+               harness-error | skipped), `detail`, and `iterations` with
+               each maintainer/fix leg's exit code, cost, heads and the
+               commits the fix leg added. A fix leg's commits go to the
+               maintainer's next iteration, never to the review loop.
+               Group on it directly: `stats --by model,maintainer_loop.ended`
+
 Context refresh (fork-sandbox.sh --refresh-at, on by default at 0.5 on the
 claude harness):
   refresh        how the run's context-refresh chain ended: `none` (disabled,
@@ -329,6 +341,13 @@ def cmd_record(args):
     review_loop = load_json_file(os.path.join(rd, "review-loop.json"))
     if review_loop is not None:
         rec["review_loop"] = review_loop
+
+    # --maintainer-loop's record, when the run had one: the outer tier's
+    # cost, iterations and ending. Same absence convention: no key at all
+    # when the file is absent, which is every run without the flag.
+    maintainer_loop = load_json_file(os.path.join(rd, "maintainer-loop.json"))
+    if maintainer_loop is not None:
+        rec["maintainer_loop"] = maintainer_loop
 
     # The prompt overlay's provenance, when the run applied one: which
     # machine-local fragments, from where, at what rev (marked -dirty if the

@@ -572,5 +572,131 @@ else
     no "a failed session leaves a run dir" "rc=$rcf: $outf"
 fi
 
+printf '\n== maintainer surfacing: summary, run.env, status, run log ==\n'
+
+if [[ -n "$rd2" && -d "$rd2" ]]; then
+    contains "run.env records the maintainer harness" \
+        "maintainer_harness=claude" "$(cat "$rd2/run.env")"
+    contains "run.env records the maintainer model" \
+        "maintainer_model=sonnet" "$(cat "$rd2/run.env")"
+    contains "run.env records the maintainer cap" \
+        "maintainer_loop=2" "$(cat "$rd2/run.env")"
+    contains "the summary has the maintainer line" \
+        "maintainer: 2 iteration(s), ended approved" \
+        "$(cat "$rd2/summary.txt")"
+    check "summary.json takes the report from the maintainer" "maintainer" \
+        "$(jq -r '.report_from' "$rd2/summary.json" 2>/dev/null)"
+    st_out="$("$repo_dir/scripts/fork-sandbox-status.sh" "$rd2" 2>&1)"
+    contains "status prints the maintainer line" \
+        "maintainer: 2 iteration(s), ended approved" "$st_out"
+    contains "status prints the maintainer report" \
+        "== report: maintainer leg 2 (APPROVED) ==" "$st_out"
+    contains "status prints the maintainer report body" \
+        "All five paragraphs." "$st_out"
+    res_out="$("$repo_dir/scripts/fork-sandbox-status.sh" --result "$rd2" 2>&1)"
+    contains "--result prints the maintainer report" \
+        "== report: maintainer leg 2 (APPROVED) ==" "$res_out"
+    check "--json reports the maintainer as report source" "maintainer" \
+        "$("$repo_dir/scripts/fork-sandbox-status.sh" --json "$rd2" 2>/dev/null | jq -r '.report_from')"
+    mon_out="$(timeout 30 "$repo_dir/scripts/fork-sandbox-status.sh" --monitor "$rd2" 2>&1)"
+    contains "--monitor ends with the maintainer marker" \
+        "report: maintainer leg 2 (APPROVED)" "$mon_out"
+fi
+
+if [[ -n "$rd_s" && -d "$rd_s" ]]; then
+    contains "a skipped loop gets its summary line" \
+        "maintainer: skipped -- " "$(cat "$rd_s/summary.txt")"
+fi
+
+if [[ -n "$rd_nm" && -d "$rd_nm" ]]; then
+    # The test project's own name contains "maintainer", so grep the
+    # specific line shapes, not the word.
+    if [[ "$(grep -c '^maintainer:' "$rd_nm/summary.txt" 2>/dev/null)" == "0"
+        && "$(grep -c '^maintainer_' "$rd_nm/run.env" 2>/dev/null)" == "0" ]]; then
+        ok "a no-maintainer summary and run.env name no maintainer"
+    else
+        no "a no-maintainer summary and run.env name no maintainer" \
+            "$(grep -h '^maintainer' "$rd_nm/summary.txt" "$rd_nm/run.env" 2>/dev/null)"
+    fi
+fi
+
+# The durable run log: the maintainer tier is on the record when the run had
+# one, and absent when it did not. A scratch HOME keeps the test out of the
+# operator's own log.
+log_home="$tmp/log-home"
+mkdir -p "$log_home"
+if [[ -n "$rd2" && -d "$rd2" ]]; then
+    HOME="$log_home" python3 "$repo_dir/scripts/sandbox-run-log.py" \
+        record --run-dir "$rd2" >/dev/null 2>&1
+    check "the run log carries the maintainer loop" "approved" \
+        "$(tail -1 "$log_home/.claude/sandbox-runs.jsonl" 2>/dev/null | jq -r '.maintainer_loop.ended')"
+fi
+if [[ -n "$rd_nm" && -d "$rd_nm" ]]; then
+    HOME="$log_home" python3 "$repo_dir/scripts/sandbox-run-log.py" \
+        record --run-dir "$rd_nm" >/dev/null 2>&1
+    check "a no-maintainer record has no maintainer key" "null" \
+        "$(tail -1 "$log_home/.claude/sandbox-runs.jsonl" 2>/dev/null | jq -r '.maintainer_loop // null')"
+fi
+
+# status.sh on a synthetic run dir: the maintainer report, the review
+# report, and their order. The maintainer's verdict outranks the review's
+# in the monitor marker; in a finished status both print, maintainer first.
+status="$repo_dir/scripts/fork-sandbox-status.sh"
+rd_m="$(mktemp -d /var/tmp/claude-scratch/forks/claude-fork-sandbox.statusm.XXXXXX)"
+tmpdirs+=("$rd_m")
+cat > "$rd_m/run.env" <<EOF
+version=1
+branch=test
+origin_repo=/tmp/origin
+clone_dir=/tmp/clone
+started_at=$(date +%s)
+session=sess
+EOF
+cat > "$rd_m/review-loop.json" <<'EOF'
+{"ended":"approved","iterations":[]}
+EOF
+cat > "$rd_m/maintainer-loop.json" <<'EOF'
+{"ended":"approved","iterations":[]}
+EOF
+printf 'APPROVED\nChecked: the diff.\n\n## Report\nreview body\n' > "$rd_m/review-verdict-1.md"
+printf 'APPROVED\nChecked: the branch.\n\n## Report\nmaintainer body\n' > "$rd_m/maintainer-verdict-1.md"
+printf 'done\n' > "$rd_m/summary.txt"
+printf '0\n' > "$rd_m/exit-code"
+
+out="$("$status" "$rd_m" 2>&1)"
+contains "status prints the maintainer report" \
+    "== report: maintainer leg 1 (APPROVED) ==" "$out"
+contains "status prints the maintainer report body" "maintainer body" "$out"
+contains "status still prints the review report" \
+    "== report: review leg 1 (APPROVED) ==" "$out"
+if [[ "${out%%'== report: maintainer'*}" != "$out" \
+    && "${out%%'== report: review leg'*}" == *"maintainer body"* ]]; then
+    ok "the maintainer report precedes the review report"
+else
+    no "the maintainer report precedes the review report" "$out"
+fi
+
+out="$("$status" --result "$rd_m" 2>&1)"
+if [[ "${out%%'== report: maintainer'*}" != "$out" \
+    && "${out%%'== report: review leg'*}" == *"maintainer body"* ]]; then
+    ok "--result prints maintainer before review"
+else
+    no "--result prints maintainer before review" "$out"
+fi
+
+mon_out="$(timeout 30 "$status" --monitor "$rd_m" 2>&1)"
+contains "the monitor marker prefers the maintainer verdict" \
+    "report: maintainer leg 1 (APPROVED)" "$mon_out"
+
+# And a run with only a review loop still reports exactly as before.
+rm -f "$rd_m/maintainer-loop.json" "$rd_m"/maintainer-verdict-*.md
+out="$("$status" "$rd_m" 2>&1)"
+if [[ "$out" == *"== report: review leg 1 (APPROVED) =="* \
+    && "$out" != *"maintainer"* ]]; then
+    ok "a review-only run prints no maintainer report"
+else
+    no "a review-only run prints no maintainer report" "$out"
+fi
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))

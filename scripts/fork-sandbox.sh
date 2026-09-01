@@ -3829,6 +3829,13 @@ started_at="$(date +%s)"
     printf 'review_harness=%s\n' "$review_harness"
     printf 'session=%s\n' "$session_name"
     printf 'review_loop_cap=%s\n' "$review_loop_cap"
+    # The maintainer tier's record of itself: printed only when the loop is
+    # on, so a no-maintainer run.env is what it has always been.
+    if (( maintainer_loop_cap > 0 )); then
+        printf 'maintainer_harness=%s\n' "$maintainer_harness"
+        printf 'maintainer_model=%s\n' "$maintainer_model"
+        printf 'maintainer_loop=%s\n' "$maintainer_loop_cap"
+    fi
     if [[ "$review_only" == true ]]; then
         printf 'mode=review-only\n'
     else
@@ -5668,6 +5675,26 @@ if [[ -n "$latest_report_verdict" ]] \
     && fs_verdict_has_usable_report "$latest_report_verdict"; then
     report_from="review"
 fi
+# The maintainer's verdict outranks the review's: it read the branch after
+# the review loop ended, including everything the review's fix legs
+# committed, so when it has a usable report that is the account a reader
+# wants in place of the session's.
+latest_maintainer_report_verdict=""
+latest_maintainer_report_n=""
+for report_verdict in "$run_dir"/maintainer-verdict-*.md; do
+    [[ -f "$report_verdict" ]] || continue
+    report_n="${report_verdict##*/maintainer-verdict-}"
+    report_n="${report_n%.md}"
+    [[ "$report_n" =~ ^[0-9]+$ ]] || continue
+    if [[ -z "$latest_maintainer_report_n" || "$report_n" -gt "$latest_maintainer_report_n" ]]; then
+        latest_maintainer_report_n="$report_n"
+        latest_maintainer_report_verdict="$report_verdict"
+    fi
+done
+if [[ -n "$latest_maintainer_report_verdict" ]] \
+    && fs_verdict_has_usable_report "$latest_maintainer_report_verdict"; then
+    report_from="maintainer"
+fi
 
 # Did the work come back authored by this repo's own identity? The clone is
 # seeded with the origin's effective user.email (fs_make_clone in the lib says
@@ -5746,6 +5773,18 @@ fi
             printf 'review:   %s iteration(s), ended %s\n' \
                 "$(jq '.iterations | length' "$run_dir/review-loop.json" 2>/dev/null || printf '?')" \
                 "$review_loop_ended"
+        fi
+    fi
+    # The maintainer loop's line, the review line's sibling and the run's
+    # last word on the branch. Its variables exist only in a run.sh that
+    # emitted them, so the test carries a default.
+    if [[ -n "${maintainer_loop_ended:-}" ]]; then
+        if [[ "${maintainer_loop_ended}" == "skipped" ]]; then
+            printf 'maintainer: skipped -- %s\n' "${maintainer_loop_detail:-}"
+        else
+            printf 'maintainer: %s iteration(s), ended %s\n' \
+                "$(jq '.iterations | length' "$run_dir/maintainer-loop.json" 2>/dev/null || printf '?')" \
+                "$maintainer_loop_ended"
         fi
     fi
     # Its sibling for --refresh-at, printed only when something happened --
@@ -6024,6 +6063,14 @@ Its review leg does not share that seal: --review-harness $review_harness
 runs in a separate, networked sandbox that carries whatever credential
 $review_harness needs and can cost money. See review_sandbox_cmd in
 $run_dir/run.sh for exactly what it sends where.
+EOF
+    fi
+    if [[ "${maintainer_loop_cap:-0}" != "0" && "$maintainer_harness" != "pi-local" ]]; then
+        cat <<EOF
+Its maintainer legs do not share that seal either: --maintainer-harness
+$maintainer_harness runs in a separate, networked sandbox that carries
+whatever credential $maintainer_harness needs and can cost money. See
+maintainer_sandbox_cmd in $run_dir/run.sh for exactly what it sends where.
 EOF
     fi
 elif [[ "$harness" == "codex" ]]; then

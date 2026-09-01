@@ -6,12 +6,12 @@
 # <run-dir> is the run directory fork-sandbox.sh printed when it launched.
 #
 # (no flag):    a compact status block. When the run has finished it also
-#               prints the git summary, the review report, and the session's
-#               own result text.
+#               prints the git summary, the maintainer report, the review
+#               report, and the session's own result text.
 #               Its 'inbox:' line counts the operator addenda written into
 #               the run with fork-sandbox-say.sh.
-# --result:     the review report, when present, followed by the session's
-#               own summary of what it did.
+# --result:     the maintainer report, then the review report, when present,
+#               followed by the session's own summary of what it did.
 # --json:       the run's structured summary — harness, model, branch, exit
 #               code, commits with their subjects, cost in dollars — and
 #               nothing else, so it pipes into jq. Written when the run
@@ -139,9 +139,11 @@ resolve_run_file() {
     local name="$1" path="$run_dir/$1"
     RUN_FILE_PATH=""
     case "$name" in
-        run.env|events.jsonl|sandbox.log|exit-code|summary.txt|summary.json|pid|handoff.md|review-loop.json) ;;
+        run.env|events.jsonl|sandbox.log|exit-code|summary.txt|summary.json|pid|handoff.md|review-loop.json|maintainer-loop.json) ;;
         review-verdict-[0-9]*.md)
             [[ "$name" =~ ^review-verdict-[0-9]+\.md$ ]] || die "'$name' is not a fork-sandbox run file" ;;
+        maintainer-verdict-[0-9]*.md)
+            [[ "$name" =~ ^maintainer-verdict-[0-9]+\.md$ ]] || die "'$name' is not a fork-sandbox run file" ;;
         *) die "'$name' is not a fork-sandbox run file" ;;
     esac
     if [[ -L "$path" ]]; then
@@ -198,7 +200,12 @@ review_verdict_path() {
 
 print_report_marker() {
     local verdict leg status
-    if verdict="$(review_verdict_path 2>/dev/null)"; then
+    if verdict="$(maintainer_verdict_path 2>/dev/null)"; then
+        leg="${verdict##*/maintainer-verdict-}"; leg="${leg%.md}"
+        status="$(head -n 1 -- "$verdict" | tr -d '\000-\037\177' \
+            | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+        printf 'report: maintainer leg %s (%s)\n' "$leg" "$status"
+    elif verdict="$(review_verdict_path 2>/dev/null)"; then
         leg="${verdict##*/review-verdict-}"; leg="${leg%.md}"
         status="$(head -n 1 -- "$verdict" | tr -d '\000-\037\177' \
             | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
@@ -227,13 +234,51 @@ print_review_report() {
     printf '\n'
 }
 
+maintainer_verdict_path() {
+    local n path found=""
+    for path in "$run_dir"/maintainer-verdict-*.md; do
+        [[ -L "$path" ]] && die "'$path' is a symlink; refusing to read it"
+        [[ -e "$path" ]] || continue
+        n="${path##*/maintainer-verdict-}"; n="${n%.md}"
+        [[ "$n" =~ ^[0-9]+$ ]] || die "'$path' is not a valid maintainer verdict name"
+        [[ -f "$path" ]] || die "'$path' is not a regular file"
+        if [[ -z "$found" || "$n" -gt "$found" ]]; then found="$n"; fi
+    done
+    [[ -n "$found" ]] || return 1
+    printf '%s/maintainer-verdict-%s.md' "$run_dir" "$found"
+}
+
+# The maintainer's report, the review report's outer sibling: the maintainer
+# loop's last verdict, printed when the loop ran. Same shape and refusal
+# discipline as the review one -- the file name comes only from the fixed
+# pattern, never from an argument.
+print_maintainer_report() {
+    local verdict leg status
+    resolve_run_file maintainer-loop.json >/dev/null || return 1
+    verdict="$(maintainer_verdict_path 2>/dev/null)" || return 1
+    leg="${verdict##*/maintainer-verdict-}"; leg="${leg%.md}"
+    status="$(head -n 1 -- "$verdict" | tr -d '\000-\037\177' \
+        | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    if fs_verdict_has_usable_report "$verdict"; then
+        printf '== report: maintainer leg %s (%s) ==\n' "$leg" "$status"
+        awk '/^## Report$/ { in_report=1; next } in_report { print }' "$verdict" \
+            | tr -d '\000-\010\013-\037\177'
+    else
+        printf '== report: maintainer leg %s (%s) — verdict, no usable report section ==\n' \
+            "$leg" "$status"
+        cat -- "$verdict" | tr -d '\000-\010\013-\037\177'
+    fi
+    printf '\n'
+}
+
 # Preflight verdicts outside command substitutions so a refusal exits this
 # process rather than only the subshell used to find the latest leg.
-for _verdict in "$run_dir"/review-verdict-*.md; do
+for _verdict in "$run_dir"/review-verdict-*.md "$run_dir"/maintainer-verdict-*.md; do
     [[ -L "$_verdict" ]] && die "'$_verdict' is a symlink; refusing to read it"
     [[ -e "$_verdict" ]] || continue
-    [[ "${_verdict##*/}" =~ ^review-verdict-[0-9]+\.md$ ]] \
-        || die "'$_verdict' is not a valid review verdict name"
+    [[ "${_verdict##*/}" =~ ^review-verdict-[0-9]+\.md$ \
+        || "${_verdict##*/}" =~ ^maintainer-verdict-[0-9]+\.md$ ]] \
+        || die "'$_verdict' is not a valid verdict name"
     [[ -f "$_verdict" ]] || die "'$_verdict' is not a regular file"
 done
 
@@ -468,7 +513,14 @@ print_tail_of_log() {
 
 case "$mode" in
     result)
+        report_printed=false
+        if print_maintainer_report; then
+            report_printed=true
+        fi
         if print_review_report; then
+            report_printed=true
+        fi
+        if $report_printed; then
             printf '== the session'"'"'s own account ==\n'
         fi
         out=""
@@ -524,7 +576,14 @@ case "$mode" in
             if summary="$(run_file_read summary.txt 2>/dev/null)"; then
                 printf '\n%s\n' "$summary"
             fi
+            report_printed=false
+            if print_maintainer_report; then
+                report_printed=true
+            fi
             if print_review_report; then
+                report_printed=true
+            fi
+            if $report_printed; then
                 printf '== the session'"'"'s own account ==\n'
             fi
             if have_events 2>/dev/null; then
