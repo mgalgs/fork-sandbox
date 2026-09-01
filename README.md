@@ -371,6 +371,7 @@ lkml-revise.sh myfeature --project ~/src/proj --checkout sbx-tip --version 1 --b
 lkml-series.sh myfeature --project ~/src/proj --range main..sbx-tip   # re-roll shipped work for post-hoc review
 lkml-forklift.sh myfeature --project ~/src/proj --version 2 --onto main --dry-run
 lkml-render.py "$LKML_MAILBOX_ROOT/myfeature" -o threads.html         # self-contained html archive of the thread
+lkml-render.py --text "$LKML_MAILBOX_ROOT/myfeature"                  # the same thread as plain text — the agent view
 ```
 
 ## Why

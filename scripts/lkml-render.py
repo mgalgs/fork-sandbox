@@ -8,9 +8,10 @@ Usage: lkml-render.py <series-dir> [<series-dir> ...] > out.html
 
 The default HTML render is the human view. --text is the agent view:
 the same thread selection and ordering as plain text on stdout, with
-[PATCH] message bodies cut at their first '---' line so the commit
-message and diffstat stay and the diff goes (it lives in the series
-branch).
+message bodies indented under their headers (so a body cannot forge a
+message header) and [PATCH] message bodies cut at their first
+diff --git line, so the commit message and diffstat stay and the
+diff goes (it lives in the series branch).
 
 A series dir is $LKML_MAILBOX_ROOT/<series> (it holds cur/*.msg). Reads
 only; never runs git.
@@ -395,15 +396,15 @@ def render_reviewer(r, series_dir):
 
 def text_body(m):
     """The message body for --text mode. Cover letters and replies go
-    out verbatim; a [PATCH] message (is_patch: a depth-1 [PATCH]-
+    out in full; a [PATCH] message (is_patch: a depth-1 [PATCH]-
     subjected message with a format-patch body) keeps the commit
     message and the diffstat -- the format-patch body separates them
-    from the diff at the first '---' line, and the diff lives in git
-    on the series branch, so it is summarized, not inlined. A reply
-    that happens to carry a [PATCH] subject (the reply Subject: is
-    optional and used verbatim) goes out in full. The cover letter is
-    itself a [PATCH x 0/N] subject but, like every reply, goes out in
-    full."""
+    from the diff at the first 'diff --git' line, and the diff lives
+    in git on the series branch, so it is summarized, not inlined. A
+    reply that happens to carry a [PATCH] subject (the reply Subject:
+    is optional and used verbatim) goes out in full. The cover letter
+    is itself a [PATCH x 0/N] subject but, like every reply, goes out
+    in full."""
     if not is_patch(m):
         return m["body"].rstrip("\n")
     lines = m["body"].splitlines()
@@ -417,10 +418,12 @@ def text_body(m):
         msg = msg[blank + 1:]
     # format-patch puts the diffstat between '---' and the first
     # 'diff --git'; keep it (the HTML render does) and summarize only
-    # the diff itself.
+    # the diff itself. Trim only newlines: a diffstat's first line
+    # carries the leading space its | column is aligned on, and
+    # .strip() would dedent just that line.
     rest = lines[cut + 1:]
     d = next((i for i, ln in enumerate(rest) if ln.startswith("diff --git")), None)
-    stat = "\n".join(rest[:d] if d is not None else rest).strip()
+    stat = "\n".join(rest[:d] if d is not None else rest).strip("\n")
     diff = rest[d:] if d is not None else []
     out = "\n".join(msg).strip("\n")
     if stat:
@@ -455,7 +458,18 @@ def render_text_message(out, m, nums, depth):
         out.append("Tags: " + ", ".join(m["tags"]))
     if m["attachments"]:
         out.append("Attachments: " + ", ".join(a["ref"] for a in m["attachments"]))
-    out.append(text_body(m))
+    # The body is indented under its header: a message block here is
+    # the 72-dash separator, the '== #' line, the From/Subject/Tags
+    # lines, then the body, and a body that carried a line of 72
+    # dashes and its own '== #99 ...' line would otherwise read as a
+    # second message. Every body line is prefixed, so the header
+    # grammar stays unforgeable from the body; the prefix is uniform,
+    # so the diffstat's fixed-width alignment survives it.
+    body = text_body(m)
+    if body:
+        out.extend("  " + ln for ln in body.split("\n"))
+    else:
+        out.append("")
     for c in m["children"]:
         render_text_message(out, c, nums, depth + 1)
 
@@ -810,7 +824,9 @@ def main(argv=None):
                         help="write HTML to FILE instead of stdout")
     parser.add_argument("--text", action="store_true",
                         help="render the threads as plain text to stdout "
-                             "(for agents; [PATCH] bodies cut at their first --- line)")
+                             "(for agents; bodies indented under their headers, and "
+                             "[PATCH] bodies keep the commit message and diffstat, "
+                             "the diff cut at the first diff --git line)")
     args = parser.parse_args(argv)
     if args.text:
         # One flag, one backend: plain text to stdout, UTF-8, no ANSI.

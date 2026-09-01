@@ -48,7 +48,11 @@
 # What this launches, per persona: a fork-sandbox.sh run, --checkout at the
 # series' tip, with a handoff built from the persona file, the mailbox's
 # `cover` and `tree` output, and (with --reply-to) the specific threads to
-# answer. The run makes NO commits -- it writes its replies as
+# answer. The secretary seat additionally gets the whole thread's message
+# bodies, as a `lkml-render.py --text` render: it summarizes the
+# discussion rather than reviewing the diff, and its sandbox cannot read
+# the mailbox, so the handoff itself must carry the thread. The run
+# makes NO commits -- it writes its replies as
 # .git/lkml-out/<n>.msg files in its own clone -- .git/ rather than the
 # working tree because git tracks nothing under it, so this project's
 # "commit early and often" instinct cannot sweep it into a commit by
@@ -210,14 +214,24 @@ lkml_persona_field() {
 }
 
 # Builds one persona's handoff on stdout: the persona file verbatim, the
-# series' cover letter and full thread tree, then either the specific
-# threads to answer or instructions to review the whole diff, then the
-# fixed rules for writing .git/lkml-out replies.
+# series' cover letter and full thread tree, (for the secretary seat)
+# the whole thread's message bodies, then either the specific threads to
+# answer or instructions to review the whole diff, then the fixed rules
+# for writing .git/lkml-out replies.
 build_handoff() {
-    local persona_file="$1" cover="$2" tree="$3"
+    local persona_file="$1" cover="$2" tree="$3" thread="${4:-}"
     cat -- "$persona_file"
     printf '\n---\n\n# The series you are reviewing: %s, v%s\n\n%s\n' "$series" "$version" "$cover"
     printf '\n## The full thread tree so far\n\n%s\n' "$tree"
+    if [[ -n "$thread" ]]; then
+        printf "\n## The thread's messages, bodies included\n\n"
+        printf 'The tree above is one line per message: id, persona, harness/model,\n'
+        printf 'tags and subject. This is the same thread with every message body,\n'
+        printf 'in thread order -- [PATCH] bodies keep the commit message and the\n'
+        printf 'diffstat, their diff is omitted (the patches are applied in this\n'
+        printf 'clone). This round is about v%s -- the section headed \"%s v%s\";\n' "$version" "$series" "$version"
+        printf 'earlier versions are there as context.\n\n%s\n' "$thread"
+    fi
     if (( ${#reply_to_ids[@]} > 0 )); then
         printf '\n## What to do this round\n\n'
         printf 'Only reply to the specific thread(s) below. Another round already\n'
@@ -346,7 +360,17 @@ for persona in "${personas[@]}"; do
         launch_failed=1
         continue
     }
-    build_handoff "$persona_file" "$cover_text" "$tree_text" > "$handoff_file"
+    # The secretary summarizes the discussion instead of reviewing the
+    # diff, so unlike the reviewer seats it needs the message bodies.
+    # Its sandbox cannot read the mailbox (fork-sandbox.sh binds only
+    # its own run dir under /var/tmp/claude-scratch/forks/), so the
+    # handoff carries the thread: the --text render of the mailbox,
+    # which the seat would otherwise have no way to obtain.
+    thread_text=""
+    if [[ "$persona" == "secretary" ]]; then
+        thread_text="$(python3 "$script_dir/lkml-render.py" --text "$ledger_root/$series" 2>/dev/null)" || thread_text=""
+    fi
+    build_handoff "$persona_file" "$cover_text" "$tree_text" "$thread_text" > "$handoff_file"
 
     branch="lkml/${series}-v${version}-round-${persona}-$(date +%s)"
     task_meta="$(jq -nc --arg series "$series" --arg persona "$persona" \

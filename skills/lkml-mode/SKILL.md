@@ -46,9 +46,10 @@ scheduling, not reading, and the reviewers' job is reading.
   threads and review tally: `lkml-render.py "$LKML_MAILBOX_ROOT/<series>" > threads.html`.
   The HTML is the human view; `lkml-render.py --text "$LKML_MAILBOX_ROOT/<series>"`
   renders the same thread as plain text on stdout (series header, tally table,
-  reviewer blocks, then every message in thread order with [PATCH] bodies
-  keeping the commit message and diffstat, the diff cut at their first
-  `---`) — the view for agents and `grep` that would otherwise
+  reviewer blocks, then every message in thread order, bodies indented under
+  their headers, with [PATCH] bodies keeping the commit message and diffstat,
+  the diff cut at the first `diff --git`) — the view for agents and `grep`
+  that would otherwise
   fight 500KB of markup.
 - **`lkml-round.sh`** — launches one sandboxed run per persona, in
   parallel, either reviewing the whole series fresh or replying to
@@ -105,7 +106,11 @@ the series, and the `secretary` persona that summarizes it.
 in. It reads the whole thread and posts one structured summary (key
 takeaways, defects and their standing, notable exchanges, state of the
 series) as a reply to the cover letter, so someone not on the list can
-act on the discussion without reading it. Running it alongside the panel
+act on the discussion without reading it. The seat's sandbox cannot read
+the mailbox, so `lkml-round.sh` hands a `secretary` seat the whole thread
+in its handoff — the `--text` render of the mailbox, bodies included; the
+reviewer seats do not get it, they read the diff in their own clone.
+Running it alongside the panel
 defeats it: there is no thread to summarize yet.
 
 **`ci` runs first on every version.** It holds no opinions: it runs every

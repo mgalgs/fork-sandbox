@@ -286,5 +286,35 @@ if (( rc4 != 0 )); then ok "ambiguous checkout ref exits non-zero"; else no "amb
 contains "ambiguous checkout ref is rejected as a mismatched commit" "$out4" \
     "matches no recorded version branch"
 
+printf '\n== secretary handoff carries the whole thread ==\n'
+# The secretary summarizes the discussion instead of reviewing the diff,
+# and its sandbox cannot read the mailbox, so its handoff must carry the
+# thread's message bodies (the --text render). Reviewer seats do not get
+# it: their handoff is cover + tree and they read the diff in the clone.
+cp -- "$repo_dir/skills/lkml-mode/personas/secretary.md" "$work/secretary.md"
+cap_sec="$(mktemp -d)"; tmpdirs+=("$cap_sec")
+out_sec="$(PATH="$stub_bin:$PATH" STUB_CAPTURE_DIR="$cap_sec" STUB_RUN_PREFIX="$run_prefix_dir" \
+    STUB_REPLY_TO="$patch_id" STUB_REPLY_TO_BRACKETED="$patch_id_bracketed" \
+    "$round" widget-frob --project "$project_dir" --checkout otherbranch --base otherbranch \
+    --personas core,secretary --personas-dir "$work" 2>&1)"
+rc_sec=$?
+if (( rc_sec == 0 )); then ok "secretary round exits 0 against the stub"; else no "secretary round exits 0 against the stub" "exit $rc_sec: $out_sec"; fi
+sec_handoff="$cap_sec/secretary.handoff.md"
+if [[ -f "$sec_handoff" ]]; then ok "secretary's launch captured a handoff"; else no "secretary's launch captured a handoff"; fi
+sec_text="$(cat -- "$sec_handoff" 2>/dev/null)"
+contains "secretary handoff has the thread section" "$sec_text" "## The thread's messages, bodies included"
+# core's reply body landed in the mailbox during the harvest section:
+# it is not in the tree (subjects only) or the cover, so its presence
+# means the handoff carries message bodies, not just the tree.
+contains "secretary handoff carries a reply body, not just the tree" "$sec_text" "Looks fine now."
+contains "secretary handoff names the version the round is about" "$sec_text" 'widget-frob v1'
+contains "secretary handoff carries the other version as context" "$sec_text" 'widget-frob v2'
+core_handoff="$(cat -- "$cap_sec/core.handoff.md" 2>/dev/null)"
+contains "reviewer handoff still has the tree" "$core_handoff" "## The full thread tree so far"
+case "$core_handoff" in
+    *"Looks fine now."*) no "reviewer handoff does not carry message bodies" ;;
+    *) ok "reviewer handoff does not carry message bodies" ;;
+esac
+
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 (( fail == 0 )) || exit 1
