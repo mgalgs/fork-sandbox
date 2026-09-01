@@ -46,26 +46,35 @@
 #                   contains, and the review loop runs pi with
 #                   REVIEW_MODEL. All of it feeds synthesize_pi_config
 #                   below.
-#                   On a legacy K8S_PROXY_UPSTREAM install the host does
-#                   not set MODEL_DISCOVERY, so none of this discovery
-#                   runs: synthesize_pi_config below gets the constants
+#                   On a legacy K8S_PROXY_UPSTREAM install, or for a
+#                   --harness claude run with no --review-loop (no pi leg
+#                   of that run talks to this proxy), the host does not
+#                   set MODEL_DISCOVERY, so none of this discovery runs:
+#                   synthesize_pi_config below gets the constants
 #                   131072/32768 the pre-discovery config used.
 #   PROXY_BASE_URL  the pi model proxy's base URL, e.g.
 #                   http://fork-sandbox-proxy.NS.svc.cluster.local:8080/api/v1
 #                   Required regardless of HARNESS -- the review loop
 #                   always needs it, even on a claude coding leg.
 #   MODEL_DISCOVERY  set to 1 by fork-sandbox-k8s.sh only for a
-#                   K8S_PROXY_ENDPOINTS install -- i.e. only when
-#                   PROXY_BASE_URL above is an /e/<name>/v1 location,
-#                   whose render forwards /models as well as
-#                   /chat/completions. Never set on a legacy
+#                   K8S_PROXY_ENDPOINTS install (where PROXY_BASE_URL
+#                   above is an /e/<name>/v1 location, whose render
+#                   forwards /models as well as /chat/completions) in
+#                   which this run will actually use the pi proxy -- a
+#                   pi coding leg, or any run carrying a --review-loop
+#                   (the loop always runs pi). Never set on a legacy
 #                   K8S_PROXY_UPSTREAM install: that render forwards ONLY
 #                   /api/v1/chat/completions, so a $PROXY_BASE_URL/models
 #                   probe there would 403 with nginx's error page, and
 #                   running discovery unconditionally would kill every
-#                   legacy run at pod start. The host, which knows which
-#                   install it is, gates the call on this variable
-#                   instead of the pod guessing from the URL.
+#                   legacy run at pod start. Also never set for a
+#                   --harness claude run with no review loop: that leg
+#                   talks to CLAUDE_PROXY_BASE_URL, not this proxy, and
+#                   the run must not die at pod start because a
+#                   workstation-class endpoint is down -- the expected,
+#                   ordinary state. The host, which knows the install
+#                   kind and the harness, gates the call on this
+#                   variable instead of the pod guessing from the URL.
 #   CLAUDE_PROXY_BASE_URL
 #                   the base URL of the per-run proxy that swaps the
 #                   placeholder credential below for the operator's real
@@ -180,22 +189,29 @@ elif [[ "$REVIEW_LOOP_CAP" != "0" ]]; then
 fi
 
 # Model discovery against the proxy, run once, early, BEFORE the
-# repository-receive wait below: a dead endpoint must fail in seconds with
-# a clear message, not after the whole submit dance. It doubles as the
-# health check docs/kubernetes-runs.md's "direct" section records as a
-# requirement -- satisfied here for the proxy path, where the endpoint is
-# reachable only through the proxy's /e/<name>/v1/models location. curl
-# and jq are both in the image (the review loop already uses curl); the
-# function is self-contained so the test suite can exercise it by
-# stubbing curl on PATH. Sets MODEL (when unset), CTX and MAX_TOKENS for
-# the coding leg's model, and, when REVIEW_MODEL differs from MODEL,
-# REVIEW_CTX and REVIEW_MAX_TOKENS for the review loop's model --
-# synthesize_pi_config below reads them. Run ONLY when the host set
-# MODEL_DISCOVERY (the K8S_PROXY_ENDPOINTS install): on a legacy
+# repository-receive wait and AFTER the bare repository's git init --
+# see the call site below for why each half of that ordering holds. A
+# dead endpoint must fail in seconds with a clear message, not after the
+# whole submit dance, but the host's repository push can land the moment
+# this container starts, so /work/repo.git must already exist when it
+# does. It doubles as the health check docs/kubernetes-runs.md's
+# "direct" section records as a requirement -- satisfied here for the
+# proxy path, where the endpoint is reachable only through the proxy's
+# /e/<name>/v1/models location. curl and jq are both in the image (the
+# review loop already uses curl); the function is self-contained so the
+# test suite can exercise it by stubbing curl on PATH. Sets MODEL (when
+# unset), CTX and MAX_TOKENS for the coding leg's model, and, when
+# REVIEW_MODEL differs from MODEL, REVIEW_CTX and REVIEW_MAX_TOKENS for
+# the review loop's model -- synthesize_pi_config below reads them.
+# Run ONLY when the host set MODEL_DISCOVERY (a K8S_PROXY_ENDPOINTS
+# install in which this run uses the pi proxy): on a legacy
 # K8S_PROXY_UPSTREAM install the proxy's render forwards only
 # /api/v1/chat/completions, so /api/v1/models would 403 and discovery
-# would die every legacy run at pod start. The legacy branch keeps the
-# constants synthesize_pi_config used before discovery existed.
+# would die every legacy run at pod start, and a --harness claude run
+# with no review loop never talks to this proxy at all, so it must not
+# die at pod start when the endpoint is down. The no-discovery branch
+# keeps the constants synthesize_pi_config used before discovery
+# existed.
 discover_model_facts() {
     local url="$PROXY_BASE_URL/models" body probe_ids count
     if ! body="$(curl -sS --max-time 20 "$url" 2>&1)"; then
@@ -224,7 +240,9 @@ discover_model_facts() {
         MODEL="$probe_ids"
         echo "fork-sandbox-k8s-entrypoint: no --model given; the endpoint" >&2
         echo "serves exactly one model, so using $MODEL." >&2
-    elif ! printf '%s\n' "$probe_ids" | grep -qxF "$MODEL"; then
+    elif [[ "$HARNESS" != claude ]] && ! printf '%s\n' "$probe_ids" | grep -qxF "$MODEL"; then
+        # (HARNESS=claude: MODEL is a Claude Code name this listing never
+        # contains and no pi leg uses, so it is never checked here.)
         # The listing may be stale -- the model behind an endpoint is free
         # to change -- and refusing here would strand a legitimate run.
         echo "Warning: $url does not list a model called '$MODEL'." >&2
@@ -268,9 +286,21 @@ discover_model_facts() {
             FACTS_MAX=$(( len / 4 ))
         fi
     }
-    _model_context_facts "$MODEL"
-    CTX="$FACTS_CTX"
-    MAX_TOKENS="$FACTS_MAX"
+    if [[ "$HARNESS" == claude ]]; then
+        # MODEL is a Claude Code model name: no pi leg of this run uses
+        # it (the coding leg runs claude against CLAUDE_PROXY_BASE_URL,
+        # the review loop runs REVIEW_MODEL), so it gets no per-model
+        # lookup -- one would only print warnings about a name this
+        # listing never contains. The values below stand in and are
+        # never consumed: a claude run synthesizes pi config only for
+        # the review model, whose window is looked up for its own id.
+        CTX=32768
+        MAX_TOKENS=8192
+    else
+        _model_context_facts "$MODEL"
+        CTX="$FACTS_CTX"
+        MAX_TOKENS="$FACTS_MAX"
+    fi
     if [[ -n "$REVIEW_MODEL" && "$REVIEW_MODEL" != "$MODEL" ]]; then
         _model_context_facts "$REVIEW_MODEL"
         REVIEW_CTX="$FACTS_CTX"
@@ -281,27 +311,18 @@ discover_model_facts() {
         REVIEW_CTX="$CTX"
         REVIEW_MAX_TOKENS="$MAX_TOKENS"
     fi
-    echo "fork-sandbox-k8s-entrypoint: model $MODEL at $PROXY_BASE_URL" >&2
-    echo "(${CTX} token context, $MAX_TOKENS token reply room)" >&2
-}
-if [[ -n "$MODEL_DISCOVERY" ]]; then
-    discover_model_facts
-else
-    # Legacy K8S_PROXY_UPSTREAM install (see the MODEL_DISCOVERY env
-    # header above): no discovery, and MODEL is set -- the host requires
-    # --model on this install -- so the pre-discovery constants stand in
-    # for the window synthesize_pi_config's models.json entries carry.
-    if [[ -z "$MODEL" ]]; then
-        echo "Error: MODEL must be set on a legacy K8S_PROXY_UPSTREAM" >&2
-        echo "install -- there is no /v1/models location to discover it" >&2
-        echo "from (that proxy forwards only /api/v1/chat/completions)." >&2
-        exit 1
+    if [[ "$HARNESS" == claude ]]; then
+        # REVIEW_MODEL is non-empty here (required at startup for a
+        # claude coding leg with a loop). The summary names the review
+        # model, which is the id this run actually uses through this
+        # proxy -- not the coding leg's Claude Code name.
+        echo "fork-sandbox-k8s-entrypoint: review model $REVIEW_MODEL at $PROXY_BASE_URL" >&2
+        echo "(${REVIEW_CTX} token context, ${REVIEW_MAX_TOKENS} token reply room)" >&2
+    else
+        echo "fork-sandbox-k8s-entrypoint: model $MODEL at $PROXY_BASE_URL" >&2
+        echo "(${CTX} token context, $MAX_TOKENS token reply room)" >&2
     fi
-    CTX=131072
-    MAX_TOKENS=32768
-    REVIEW_CTX=131072
-    REVIEW_MAX_TOKENS=32768
-fi
+}
 
 mounts_dir=/mnt/fork-sandbox
 work_dir=/work
@@ -335,6 +356,38 @@ fi
 
 echo "fork-sandbox-k8s-entrypoint: initializing $repo_bare" >&2
 git init --quiet --bare "$repo_bare"
+
+# Model discovery, deliberately placed AFTER the bare repository above
+# and BEFORE the repository-receive wait below. The ordering is
+# load-bearing in both directions: the agent container has no
+# readinessProbe, so the host's repository push can land the moment this
+# container starts -- a discovery that preceded `git init --bare` would
+# race that push against a nonexistent /work/repo.git and fail a healthy
+# run -- while a dead endpoint must still fail in seconds, well before
+# the INPUTS_TIMEOUT deadline below, not after the whole submit dance.
+if [[ -n "$MODEL_DISCOVERY" ]]; then
+    discover_model_facts
+else
+    # No discovery: either a legacy K8S_PROXY_UPSTREAM install (whose
+    # proxy forwards only /api/v1/chat/completions), or a --harness
+    # claude run with no review loop on a K8S_PROXY_ENDPOINTS install
+    # (no pi leg of that run talks to the proxy). In both cases MODEL
+    # is set -- the host requires --model for either -- so the
+    # pre-discovery constants stand in for the window
+    # synthesize_pi_config's models.json entries carry (unused on a
+    # claude run, which synthesizes pi config only for the review
+    # model).
+    if [[ -z "$MODEL" ]]; then
+        echo "Error: MODEL must be set on a legacy K8S_PROXY_UPSTREAM" >&2
+        echo "install -- there is no /v1/models location to discover it" >&2
+        echo "from (that proxy forwards only /api/v1/chat/completions)." >&2
+        exit 1
+    fi
+    CTX=131072
+    MAX_TOKENS=32768
+    REVIEW_CTX=131072
+    REVIEW_MAX_TOKENS=32768
+fi
 
 echo "fork-sandbox-k8s-entrypoint: waiting for $sentinel (deadline ${INPUTS_TIMEOUT}s)" >&2
 deadline=$(( $(date +%s) + INPUTS_TIMEOUT ))

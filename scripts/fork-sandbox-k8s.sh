@@ -1720,16 +1720,24 @@ CENV
     fi
 
     # MODEL_DISCOVERY, set only when this run is wired to a named
-    # endpoint: it is the host's half of the pod-side model-discovery
-    # gate. The pod cannot tell the two proxy renders apart from
-    # PROXY_BASE_URL alone -- on a legacy K8S_PROXY_UPSTREAM install the
-    # proxy forwards only /api/v1/chat/completions, so the discovery
-    # probe would 403 and die the pod before the repository push. Set
-    # here, where the install kind is already resolved, is the only
-    # place that cannot guess wrong. See the MODEL_DISCOVERY entry in
+    # endpoint AND will actually use the pi proxy -- a pi coding leg,
+    # or any run carrying a --review-loop (the loop always runs pi): it
+    # is the host's half of the pod-side model-discovery gate. The
+    # install kind alone is not enough: a --harness claude run without
+    # a loop never reads PROXY_BASE_URL (its leg talks to
+    # CLAUDE_PROXY_BASE_URL), so gating on the install alone would turn
+    # such a run into a hard dependency on an endpoint it never talks
+    # to -- dying at pod start when a workstation-class endpoint is
+    # down, the expected ordinary state. The pod cannot tell the two
+    # proxy renders apart from PROXY_BASE_URL alone -- on a legacy
+    # K8S_PROXY_UPSTREAM install the proxy forwards only
+    # /api/v1/chat/completions, so the discovery probe would 403 and die
+    # the pod before the repository push. Set here, where the install
+    # kind and the harness are already resolved, is the only place that
+    # cannot guess wrong. See the MODEL_DISCOVERY entry in
     # fork-sandbox-k8s-entrypoint.sh's env header.
     local model_discovery_env=""
-    if [[ -n "$proxy_endpoint" ]]; then
+    if [[ -n "$proxy_endpoint" && ( "$harness" == pi || $review_loop_cap -gt 0 ) ]]; then
         model_discovery_env=$'\n'"$(cat <<CENV
             - name: MODEL_DISCOVERY
               value: "1"

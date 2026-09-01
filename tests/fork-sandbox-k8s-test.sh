@@ -157,11 +157,14 @@
 #     synthesize_pi_config's render. The call itself is gated on the
 #     host-set MODEL_DISCOVERY env: a legacy K8S_PROXY_UPSTREAM install
 #     (whose proxy forwards only /api/v1/chat/completions, so /models
-#     would 403) renders no MODEL_DISCOVERY env and the pod keeps the
-#     pre-discovery 131072/32768 constants, while an endpoints render
-#     carries it. A failed repository push in submit surfaces the pod's
-#     container log, since a pod that died in early discovery would
-#     otherwise only show git's bare "connection refused".
+#     would 403) and a --harness claude run without a --review-loop
+#     (no pi leg talks to the proxy, so the run must not hard-depend on
+#     the endpoint being up) render no MODEL_DISCOVERY env and the pod
+#     keeps the pre-discovery 131072/32768 constants, while an endpoints
+#     render for a run that uses the pi proxy carries it. A failed
+#     repository push in submit surfaces the pod's container log, since
+#     a pod that died in early discovery would otherwise only show
+#     git's bare "connection refused".
 #
 # This lives in tests/ rather than scripts/tests/ on purpose: install.sh
 # iterates scripts/* and runs `sed -n 2p` on each entry to build the
@@ -808,6 +811,54 @@ if [[ "$(grep -cF -- '- name: MODEL_DISCOVERY' "$no_model_submit_out")" == 1 ]] 
 else
     no "an endpoints install's rendered Job carries MODEL_DISCOVERY=1" \
         "$(grep -A1 -F -- '- name: MODEL_DISCOVERY' "$no_model_submit_out")"
+fi
+# A --harness claude run on an endpoints install WITHOUT a --review-loop
+# never talks to the pi proxy (its leg uses CLAUDE_PROXY_BASE_URL), so
+# the render carries no MODEL_DISCOVERY env: the run must not die at pod
+# start just because a workstation-class endpoint is down. WITH a
+# --review-loop the loop runs pi, so the env is back.
+claude_gate_home="$(newdir)"; tmpdirs+=("$claude_gate_home")
+mkdir -p "$claude_gate_home/.claude"
+claude_gate_future_ms=$(( ($(date +%s) + 7200) * 1000 ))
+cat > "$claude_gate_home/.claude/.credentials.json" <<JSON
+{"claudeAiOauth": {"accessToken": "fixture-gate-token", "refreshToken": "fixture-refresh-token", "refreshTokenExpiresAt": 123, "expiresAt": $claude_gate_future_ms, "scopes": ["user:inference"]}}
+JSON
+claude_gate_out="$(newdir)/claude-gate.yaml"; tmpdirs+=("$(dirname "$claude_gate_out")")
+if HOME="$claude_gate_home" FORK_SANDBOX_CONFIG_DIR="$single_ep_config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model claude-opus-5 --harness claude \
+    "$proj_dir" "$handoff_file" > "$claude_gate_out" 2>/dev/null; then
+    ok "submit --dry-run --harness claude on an endpoints install exits 0"
+else
+    no "submit --dry-run --harness claude on an endpoints install exits 0" \
+        "$(HOME="$claude_gate_home" FORK_SANDBOX_CONFIG_DIR="$single_ep_config_dir" "$k8s_sh" submit --dry-run \
+            --branch fs-k8s-test-branch --model claude-opus-5 --harness claude \
+            "$proj_dir" "$handoff_file" 2>&1)"
+fi
+if [[ "$(grep -cF -- '- name: MODEL_DISCOVERY' "$claude_gate_out")" == 0 ]]; then
+    ok "a claude run without a review loop carries no MODEL_DISCOVERY env"
+else
+    no "a claude run without a review loop carries no MODEL_DISCOVERY env" \
+        "found MODEL_DISCOVERY in the claude render: $(grep -A1 -F -- '- name: MODEL_DISCOVERY' "$claude_gate_out")"
+fi
+claude_gate_loop_out="$(newdir)/claude-gate-loop.yaml"; tmpdirs+=("$(dirname "$claude_gate_loop_out")")
+if HOME="$claude_gate_home" FORK_SANDBOX_CONFIG_DIR="$single_ep_config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model claude-opus-5 --harness claude \
+    --review-loop 1 --review-model qwen3-8b \
+    "$proj_dir" "$handoff_file" > "$claude_gate_loop_out" 2>/dev/null; then
+    ok "submit --dry-run --harness claude --review-loop on an endpoints install exits 0"
+else
+    no "submit --dry-run --harness claude --review-loop on an endpoints install exits 0" \
+        "$(HOME="$claude_gate_home" FORK_SANDBOX_CONFIG_DIR="$single_ep_config_dir" "$k8s_sh" submit --dry-run \
+            --branch fs-k8s-test-branch --model claude-opus-5 --harness claude \
+            --review-loop 1 --review-model qwen3-8b \
+            "$proj_dir" "$handoff_file" 2>&1)"
+fi
+if [[ "$(grep -cF -- '- name: MODEL_DISCOVERY' "$claude_gate_loop_out")" == 1 ]] \
+    && grep -A1 -F -- '- name: MODEL_DISCOVERY' "$claude_gate_loop_out" | grep -qF 'value: "1"'; then
+    ok "a claude run with a --review-loop carries MODEL_DISCOVERY=1 (the loop runs pi)"
+else
+    no "a claude run with a --review-loop carries MODEL_DISCOVERY=1 (the loop runs pi)" \
+        "$(grep -A1 -F -- '- name: MODEL_DISCOVERY' "$claude_gate_loop_out")"
 fi
 
 # run forwards --endpoint (and the omitted --model) to submit rather than
@@ -3565,8 +3616,9 @@ fi
 
 # Runs the extracted function in a subshell: $1 is the stub curl's stdout
 # (or "FAIL" for a connection-refused stub), $2 the MODEL value (or "")
-# it is handed, $3 the REVIEW_MODEL value (or ""). Captures combined
-# output and the subshell's exit status in $discover_out / $discover_rc.
+# it is handed, $3 the REVIEW_MODEL value (or ""), $4 the HARNESS value
+# (default pi). Captures combined output and the subshell's exit status
+# in $discover_out / $discover_rc.
 discover_run() {
     local stub_dir
     stub_dir="$(newdir)"; tmpdirs+=("$stub_dir")
@@ -3578,7 +3630,7 @@ discover_run() {
         printf '%s\n' '#!/usr/bin/env bash' 'cat <<JSON' "$1" 'JSON' > "$stub_dir/curl"
     fi
     chmod +x "$stub_dir/curl"
-    discover_out="$(PATH="$stub_dir:$PATH" MODEL="$2" REVIEW_MODEL="${3-}" \
+    discover_out="$(PATH="$stub_dir:$PATH" MODEL="$2" REVIEW_MODEL="${3-}" HARNESS="${4:-pi}" \
         PROXY_BASE_URL="http://fork-sandbox-proxy.fork-sandbox-test.svc.cluster.local:8080/e/primary/v1" \
         bash -c 'source "$1"; discover_model_facts; \
             printf "MODEL=%s CTX=%s MAX_TOKENS=%s REVIEW_CTX=%s REVIEW_MAX_TOKENS=%s\n" \
@@ -3655,15 +3707,20 @@ else
 fi
 
 # The --harness claude case: MODEL is a Claude Code model name the pi
-# endpoint's listing never contains, but REVIEW_MODEL IS in it -- the
+# endpoint's listing never contains and no pi leg of this run uses, so
+# it is neither checked against the listing nor looked up per-model --
+# no warning about it, and the summary names the review model. The
 # review loop's window must come from REVIEW_MODEL's own entry, not
-# inherit MODEL's (absent) 32768 fallback.
-discover_run '{"data":[{"id":"qwen3-8b","max_model_len":24576}]}' "claude-opus-5" "qwen3-8b"
+# inherit MODEL's.
+discover_run '{"data":[{"id":"qwen3-8b","max_model_len":24576}]}' "claude-opus-5" "qwen3-8b" claude
 if (( discover_rc == 0 )) && [[ "$discover_out" == *"MODEL=claude-opus-5 CTX=32768 MAX_TOKENS=8192"* \
-        && "$discover_out" == *"REVIEW_CTX=24576 REVIEW_MAX_TOKENS=6144"* ]]; then
-    ok "discovery: REVIEW_MODEL gets its own listed window, not MODEL's fallback"
+        && "$discover_out" == *"REVIEW_CTX=24576 REVIEW_MAX_TOKENS=6144"* \
+        && "$discover_out" == *"review model qwen3-8b at"* \
+        && "$discover_out" != *"does not list"* \
+        && "$discover_out" != *"does not report a context length"* ]]; then
+    ok "discovery: on a claude run the Claude Code name is not probed and the review model's window stands"
 else
-    no "discovery: REVIEW_MODEL gets its own listed window, not MODEL's fallback" \
+    no "discovery: on a claude run the Claude Code name is not probed and the review model's window stands" \
         "rc=$discover_rc: $discover_out"
 fi
 # ...and a REVIEW_MODEL absent from the listing gets the low-guess
@@ -3703,20 +3760,22 @@ fi
 
 # The ordering the design doc's health-check requirement records: discovery
 # runs BEFORE the repository-receive wait, so a dead endpoint fails in
-# seconds instead of after the whole submit dance. And the call itself is
-# gated on the host-set MODEL_DISCOVERY env: a legacy K8S_PROXY_UPSTREAM
-# install (whose proxy forwards only /api/v1/chat/completions, so a
-# /models probe would 403) never runs it, and keeps the pre-discovery
-# constants instead.
+# seconds instead of after the whole submit dance. It must ALSO run
+# AFTER the bare repository's git init: the agent container has no
+# readinessProbe, so the host's push can land the moment the container
+# starts, and a discovery ahead of the git init would race that push
+# against a nonexistent /work/repo.git and fail a healthy run.
 # shellcheck disable=SC2016  # needle is literal entrypoint text
 discover_call_line="$(grep -nE '^[[:space:]]*discover_model_facts[[:space:]]*$' "$entrypoint_sh" | head -n1 | cut -d: -f1)"
 sentinel_wait_line="$(grep -nF 'waiting for $sentinel' "$entrypoint_sh" | head -n1 | cut -d: -f1)"
-if [[ -n "$discover_call_line" && -n "$sentinel_wait_line" \
+git_init_line="$(grep -nF 'git init --quiet --bare "$repo_bare"' "$entrypoint_sh" | head -n1 | cut -d: -f1)"
+if [[ -n "$git_init_line" && -n "$discover_call_line" && -n "$sentinel_wait_line" \
+        && "$git_init_line" -lt "$discover_call_line" \
         && "$discover_call_line" -lt "$sentinel_wait_line" ]]; then
-    ok "discovery runs before the repository-receive wait"
+    ok "discovery runs after git init and before the repository-receive wait"
 else
-    no "discovery runs before the repository-receive wait" \
-        "discovery call line '$discover_call_line', sentinel wait line '$sentinel_wait_line'"
+    no "discovery runs after git init and before the repository-receive wait" \
+        "git init line '$git_init_line', discovery call line '$discover_call_line', sentinel wait line '$sentinel_wait_line'"
 fi
 if grep -qF 'if [[ -n "$MODEL_DISCOVERY" ]]; then' "$entrypoint_sh" \
     && grep -qF 'CTX=131072' "$entrypoint_sh" \
@@ -3752,17 +3811,63 @@ else
     no "a failed repository push surfaces the pod's container log" \
         "the push failure branch in $k8s_sh does not dump the container log"
 fi
-# Per-model windows: each id in models.json carries the window discovered
-# for ITS OWN id (the pi leg passes both pairs; a claude coding leg passes
-# the review model's pair for the review model, which is the only id in
-# that models.json at all), never one id's value stamped onto the other.
-if grep -A1 -qF -- '--argjson extra_ctx "$extra_ctx" --argjson extra_maxtok "$extra_maxtok"' "$entrypoint_sh" \
-    && grep -qF 'contextWindow: (if $id == $model then $ctx else $extra_ctx end),' "$entrypoint_sh" \
-    && grep -qF 'maxTokens: (if $id == $model then $maxtok else $extra_maxtok end),' "$entrypoint_sh"; then
-    ok "synthesize_pi_config renders each models.json id from its own discovered window"
+# Per-model windows, EXECUTED rather than grepped: the real
+# synthesize_pi_config, extracted from the entrypoint's own source the
+# same way discover_model_facts above is, run in a subshell against a
+# throwaway HOME with two ids and DISTINCT coding/review windows. A
+# models.json that is never written, a jq program that does not parse,
+# or one id's window stamped onto the other all fail this; grepping the
+# function's own source text would pass all three.
+synth_fn="$(sed -n '/^synthesize_pi_config() {/,/^}/p' "$entrypoint_sh")"
+synth_fn_file="$(newdir)/synthesize.sh"; tmpdirs+=("$(dirname "$synth_fn_file")")
+if [[ -n "$synth_fn" ]]; then
+    printf '%s\n' "$synth_fn" > "$synth_fn_file"
+    ok "synthesize_pi_config is a standalone function in the entrypoint"
 else
-    no "synthesize_pi_config renders each models.json id from its own discovered window" \
-        "missing a per-id discovered-value wiring in $entrypoint_sh"
+    no "synthesize_pi_config is a standalone function in the entrypoint" \
+        "function not found in $entrypoint_sh"
+fi
+
+# Runs the extracted function in a subshell (so its `exit 1` kills only
+# the subshell); the six arguments are passed through as-is. The
+# rendered models.json is left in a throwaway HOME, captured in
+# $synth_home, and $synth_out / $synth_rc hold the combined output and
+# the subshell's exit status.
+synth_run() {
+    local home mounts
+    home="$(newdir)"; tmpdirs+=("$home")
+    mounts="$(newdir)"; tmpdirs+=("$mounts")
+    synth_home="$home"
+    synth_out="$(HOME="$home" mounts_dir="$mounts" \
+        PROXY_BASE_URL="http://fork-sandbox-proxy.fork-sandbox-test.svc.cluster.local:8080/e/primary/v1" \
+        bash -c 'source "$1"; synthesize_pi_config \
+            "${2-}" "${3-}" "${4-}" "${5-}" "${6-}" "${7-}"' \
+        _ "$synth_fn_file" "$@" 2>&1)"
+    synth_rc=$?
+}
+
+# Two ids with distinct windows: each entry in models.json must carry
+# the window for ITS OWN id, never one id's value stamped onto the
+# other.
+synth_run coder reviewer 24576 6144 98304 24576
+synth_models="$(jq -r '.providers.proxy.models[] | "\(.id)=\(.contextWindow)/\(.maxTokens)"' \
+    "$synth_home/.pi/agent/models.json" 2>/dev/null | sort)"
+if (( synth_rc == 0 )) \
+    && [[ "$synth_models" == *"coder=24576/6144"* && "$synth_models" == *"reviewer=98304/24576"* ]]; then
+    ok "synthesize_pi_config renders each models.json id from its own window (executed)"
+else
+    no "synthesize_pi_config renders each models.json id from its own window (executed)" \
+        "rc=$synth_rc: $synth_out; models.json: $synth_models"
+fi
+# ...and with no second model, exactly one entry, from the first pair.
+synth_run coder "" 8192 2048 "" ""
+synth_models="$(jq -r '.providers.proxy.models[] | "\(.id)=\(.contextWindow)/\(.maxTokens)"' \
+    "$synth_home/.pi/agent/models.json" 2>/dev/null | sort)"
+if (( synth_rc == 0 )) && [[ "$synth_models" == "coder=8192/2048" ]]; then
+    ok "synthesize_pi_config with no second model renders exactly one entry (executed)"
+else
+    no "synthesize_pi_config with no second model renders exactly one entry (executed)" \
+        "rc=$synth_rc: $synth_out; models.json: $synth_models"
 fi
 if grep -A1 -qF -- 'synthesize_pi_config "$MODEL" "$REVIEW_MODEL"' "$entrypoint_sh" \
     && grep -A1 -F 'synthesize_pi_config "$MODEL" "$REVIEW_MODEL"' "$entrypoint_sh" \

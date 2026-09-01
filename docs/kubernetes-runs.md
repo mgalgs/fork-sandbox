@@ -620,16 +620,23 @@ when resolving a model. On a legacy `K8S_PROXY_UPSTREAM` install
 
 **`--model` is optional on an endpoints install; the pod discovers the
 model facts itself.** `fork-sandbox-k8s-entrypoint.sh` queries
-`$PROXY_BASE_URL/models` once, early, *before* it waits for the
-repository to arrive — the health check the `direct` section below
+`$PROXY_BASE_URL/models` once, early — after the bare repository is
+created but *before* the pod waits for the repository to arrive, so the
+probe can never race the host's push landing on a repository that does
+not exist yet — the health check the `direct` section below
 records as a requirement, now satisfied for the proxy path: a dead
 endpoint fails in seconds with a message that treats a connection
 refusal from a workstation-class host as the expected, ordinary state
-it is, not a bug to chase. Discovery runs only on this path: the host
-sets the `MODEL_DISCOVERY` env var only when the run is wired to a
-named endpoint, because a legacy `K8S_PROXY_UPSTREAM` proxy forwards
-only `/api/v1/chat/completions`, and a `/models` probe there would 403
-and die the pod at startup with nginx's error page. When `--model` was
+it is, not a bug to chase. Discovery runs only on this path, and only
+for a run that will actually use the pi proxy — a pi coding leg or a
+`--review-loop` run (the loop always runs pi): the host sets the
+`MODEL_DISCOVERY` env var only when the run is wired to a named
+endpoint *and* carries one of those, because a legacy
+`K8S_PROXY_UPSTREAM` proxy forwards only `/api/v1/chat/completions`,
+and a `/models` probe there would 403 and die the pod at startup with
+nginx's error page — and a `--harness claude` run without a review
+loop talks only to its own per-run proxy, so it must not hard-depend
+on the endpoint being up. When `--model` was
 omitted, exactly one model in the listing is used (and said so); zero
 or several is an error listing what was found. When `--model` was
 given but the listing does not contain it, that is a warning, not an
@@ -641,14 +648,18 @@ is derived the same way `agent-sandboxed` derives it: a 32768 floor
 capped at a quarter of the window. `REVIEW_MODEL`, when set, gets the
 window discovered for *its own id* rather than sharing the coding
 model's — on a `--harness claude` run `MODEL` is a Claude Code model
-name the listing never contains, and the review loop runs pi with
+name the listing never contains and no pi leg uses (so it is never
+checked or looked up against the listing, and the pod's summary names
+the review model instead), and the review loop runs pi with
 `REVIEW_MODEL`, so the coding model's absent value must not stand in
 for the review model's window. On a legacy install `--model` stays
 required (the same error text as before), the pod skips discovery
 entirely and keeps the 131072/32768 constants the pre-discovery
 `models.json` carried, and `--harness claude` keeps the requirement
 even on an endpoints install: discovery lists the pi endpoint's model
-ids, never a Claude Code model name. Because the agent container has
+ids, never a Claude Code model name. A `--harness claude` run without
+a `--review-loop` skips discovery entirely too, for the same reason
+it must not require the endpoint to be up. Because the agent container has
 no readiness probe, a pod that dies in that early discovery can
 terminate before submit's repository push lands; when the push fails
 for that reason, submit prints the pod's container log — where the
