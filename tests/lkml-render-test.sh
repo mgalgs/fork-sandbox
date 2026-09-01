@@ -681,5 +681,126 @@ n_seps="$(grep -cxF -- "$sep" "$forged_out")"
 if [[ "$n_seps" -eq 11 ]]; then ok "forged 72-dash body line is not a separator"; else no "forged 72-dash body line is not a separator" "$n_seps"; fi
 contains "forged body content is still in the thread, prefixed" "$(<"$forged_out")" '  == #99 · reply to #2 · depth 2'
 
+printf '\n== results card: discovery, placement, escaping ==\n'
+# The per-version results file (results-v<N>.md, written by the
+# summarizer) renders as a Results card between the Reviewers panel and
+# the Thread Index. Without the file there is no card and no results CSS:
+# the early $html render (taken before any results file existed) must be
+# the card-free baseline, and dropping the file again must return to it.
+case "$html" in *'class="results"'*) no "no results card without a results file" ;; *) ok "no results card without a results file" ;; esac
+case "$html" in *'.results{'*) no "no results CSS without a results file" ;; *) ok "no results CSS without a results file" ;; esac
+# The fixture deliberately carries a <script> payload, so the escaping
+# checks below scope to the card's own regions.
+RESULTS_MD="$LKML_MAILBOX_ROOT/render-fixture/results-v1.md"
+{
+    printf '%s\n' \
+        '# Summary' \
+        'v1 converged: two patches reviewed, one NAK withdrawn.' \
+        '' \
+        '# Details' \
+        '<script>alert(3)</script>' \
+        '== #99 · reply to #2 · depth 2' \
+        'From: Forger (AI persona) <forger@lkml.local>' \
+        'A & B < 1'
+} > "$RESULTS_MD"
+# A companion .json may sit next to the .md; the card renders the .md only.
+printf '%s\n' 'JSON CANARY' > "$LKML_MAILBOX_ROOT/render-fixture/results-v1.json"
+results_html="$work/results.html"
+python3 "$renderer" "$LKML_MAILBOX_ROOT/render-fixture" -o "$results_html"
+rhtml="$(<"$results_html")"
+contains "results card is present with the file" "$rhtml" '<div class="results">'
+contains "results card carries an eyebrow" "$rhtml" '<p class="eyebrow">results</p>'
+contains "summary text sits outside the collapse" "$rhtml" '<div class="results-summary">v1 converged: two patches reviewed, one NAK withdrawn.</div>'
+contains "details sits inside a 'show details' summary" "$rhtml" '<details class="results-fold">'
+case "$rhtml" in *'<summary>show details</summary>'*) ok "details summary element reads 'show details'" ;; *) no "details summary element reads 'show details'" ;; esac
+case "$rhtml" in *'JSON CANARY'*) no "results-v1.json is ignored" ;; *) ok "results-v1.json is ignored" ;; esac
+if python3 - "$results_html" <<'PY'
+import sys
+
+html = open(sys.argv[1], encoding="utf-8").read()
+i_rev = html.index('<div class="reviewers">')
+i_res = html.index('<div class="results">')
+i_idx = html.index('<details class="index-fold"')
+i_sum = html.index('<div class="results-summary">')
+i_fold = html.index('<details class="results-fold">')
+i_pre = html.index('<pre class="results-details">')
+i_pre_end = html.index('</pre>', i_pre)
+pre = html[i_pre:i_pre_end]
+summary_region = html[i_sum:i_fold]
+errors = []
+if not i_rev < i_res < i_idx:
+    errors.append("card is not between the reviewers panel and the thread index")
+if not i_res < i_sum < i_fold < i_pre:
+    errors.append("summary is not outside the collapse with details inside")
+if 'alert(3)' not in pre:
+    errors.append("details body missing from the pre")
+if 'v1 converged' in pre:
+    errors.append("summary text leaked into the details pre")
+if 'alert(3)' in summary_region or '== #99' in summary_region:
+    errors.append("details text leaked into the summary region")
+if '== #99 · reply to #2 · depth 2' not in pre or 'From: Forger (AI persona) &lt;forger@lkml.local&gt;' not in pre:
+    errors.append("forged header lines are not rendered as plain preformatted text")
+if html.count('<div class="results">') != 1:
+    errors.append("expected exactly one results card")
+for e in errors:
+    print(e)
+sys.exit(1 if errors else 0)
+PY
+then
+    ok "results card placement: summary outside the collapse, details inside, card in position"
+else
+    no "results card placement: summary outside the collapse, details inside, card in position"
+fi
+contains "results details is escaped (script)" "$rhtml" '&lt;script&gt;alert(3)&lt;/script&gt;'
+contains "results details is escaped (ampersand)" "$rhtml" 'A &amp; B &lt; 1'
+case "$rhtml" in *'<script>alert(3)</script>'*) no "results script payload is never raw" ;; *) ok "results script payload is never raw" ;; esac
+# Dropping the file drops the card (and the CSS that rides on it): the
+# card-free render must come back with no trace of the feature.
+case "$html" in *'results-summary'*) no "baseline render has no results markup" ;; *) ok "baseline render has no results markup" ;; esac
+rm "$RESULTS_MD" "$LKML_MAILBOX_ROOT/render-fixture/results-v1.json"
+results_gone="$work/results-gone.html"
+python3 "$renderer" "$LKML_MAILBOX_ROOT/render-fixture" -o "$results_gone"
+rhgone="$(<"$results_gone")"
+case "$rhgone" in *'class="results"'*) no "removing the results file removes the card" ;; *) ok "removing the results file removes the card" ;; esac
+case "$rhgone" in *'.results{'*) no "removing the results file removes the results CSS" ;; *) ok "removing the results file removes the results CSS" ;; esac
+
+printf '\n== results card: one card per version, absent file = absent card ==\n'
+# A two-version series with a results file for v1 only: v1 gets its card,
+# v2 renders as it did without the feature.
+"$mailbox" init res-two --cover "$work/cover.txt" --patches "$work/patches" \
+    --from author --harness test --model fixture >/dev/null 2>/dev/null
+"$mailbox" init res-two --cover "$work/cover.txt" --patches "$work/patches" \
+    --from author --harness test --model fixture >/dev/null 2>/dev/null
+printf '%s\n' '# Summary' 'v1 results summary.' '' '# Details' 'v1 results details.' \
+    > "$LKML_MAILBOX_ROOT/res-two/results-v1.md"
+two_html="$work/res-two.html"
+python3 "$renderer" "$LKML_MAILBOX_ROOT/res-two" -o "$two_html"
+if python3 - "$two_html" <<'PY'
+import sys
+
+html = open(sys.argv[1], encoding="utf-8").read()
+i_v1 = html.index('<section class="series" id="res-two-v1">')
+i_v2 = html.index('<section class="series" id="res-two-v2">')
+errors = []
+if html.count('<div class="results">') != 1:
+    errors.append(f"expected exactly one card, got {html.count('<div class=\"results\">')}")
+else:
+    i_res = html.index('<div class="results">')
+    if not i_v1 < i_res < i_v2:
+        errors.append("card is not in the v1 section")
+    if 'v1 results summary.' not in html[i_res:i_v2] or 'v1 results details.' not in html[i_res:i_v2]:
+        errors.append("v1 card does not carry its own results file")
+if html.count('class="results-summary"') != 1:
+    errors.append("v2 section rendered a summary region")
+for e in errors:
+    print(e)
+sys.exit(1 if errors else 0)
+PY
+then
+    ok "each version renders its own results file; absent file = absent card"
+else
+    no "each version renders its own results file; absent file = absent card"
+fi
+
 printf '%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))

@@ -15,6 +15,14 @@ diff goes (it lives in the series branch).
 
 A series dir is $LKML_MAILBOX_ROOT/<series> (it holds cur/*.msg). Reads
 only; never runs git.
+
+When a series dir holds results-v<N>.md (the per-version results file,
+written by the summarizer; a results-v<N>.json may sit next to it and is
+ignored), the HTML render adds a per-version Results card between the
+Reviewers panel and the Thread Index: the "# Summary" section sits
+outside a native <details>, the "# Details" section inside it. Without
+the file there is no card and the render is byte-identical to a mailbox
+without results.
 """
 import html
 import base64
@@ -392,6 +400,55 @@ def persona_brief_path(series_dir, persona):
     return None
 
 
+def read_results(series_dir, version):
+    """The per-version results file <series>/results-v<N>.md split into
+    ("# Summary" body, "# Details" body), or None when absent. The
+    filename is built from the integer version, so nothing in the
+    mailbox can steer the read outside the series dir. A companion
+    results-v<N>.json is ignored: the card renders the .md only."""
+    path = os.path.join(series_dir, f"results-v{version}.md")
+    if not os.path.isfile(path):
+        return None
+    with open(path, encoding="utf-8", errors="replace") as f:
+        return split_results(f.read())
+
+
+def split_results(text):
+    """Split a results file into ("# Summary" body, "# Details" body).
+    The bodies are verbatim, stripped of nothing but trailing newlines;
+    a missing section is empty, and a file with no recognized header is
+    all Summary."""
+    lines = text.splitlines()
+    s = next((i for i, ln in enumerate(lines) if ln == "# Summary"), None)
+    d = next((i for i, ln in enumerate(lines) if ln == "# Details"), None)
+    if s is None:
+        s = d if d is not None else len(lines)
+    if d is None:
+        d = len(lines)
+    return "\n".join(lines[s + 1:d]).rstrip("\n"), "\n".join(lines[d + 1:]).rstrip("\n")
+
+
+def render_results_card(series_dir, version):
+    """The per-version Results card, placed between the Reviewers panel
+    and the Thread Index: the Summary section is visible in the
+    collapsed state, only Details sits inside the "show details"
+    summary. Both sections are escaped preformatted text in the file's
+    own layout (the persona-briefs treatment) -- never rendered or
+    executed. Returns "" when the results file is absent."""
+    res = read_results(series_dir, version)
+    if res is None:
+        return ""
+    summary, details = res
+    return (f'  <div class="results">\n'
+            f'    <p class="eyebrow">results</p>\n'
+            f'    <div class="results-summary">{esc(summary)}</div>\n'
+            f'    <details class="results-fold">\n'
+            f'      <summary>show details</summary>\n'
+            f'      <pre class="results-details">{esc(details)}</pre>\n'
+            f'    </details>\n'
+            f'  </div>')
+
+
 def render_reviewer(r, series_dir):
     brief = ""
     brief_real = persona_brief_path(series_dir, r["persona"])
@@ -723,6 +780,11 @@ def render_series(series_dir):
             reviewers_block = (f'  <div class="reviewers">\n'
                                f'    <p class="eyebrow">reviewers</p>\n'
                                f'    {reviewers}\n  </div>')
+        # The card is its own block; with no results file it is the empty
+        # string, so the section is byte-identical to a render without the
+        # card (the results CSS below is likewise emitted only when at
+        # least one card is present).
+        results_block = render_results_card(series_dir, v)
         sections.append(f"""
 <section class="series" id="{esc(name)}-v{v}">
   <div class="series-head">
@@ -737,7 +799,7 @@ def render_series(series_dir):
       <tbody>{''.join(trows)}</tbody>
     </table>
   </div>
-  {reviewers_block}
+  {reviewers_block}{results_block}
   <details class="index-fold" open>
     <summary>thread index — {n_messages} messages</summary>
     <div class="index-wrap"><ol class="tidx">{index}</ol></div>
@@ -877,6 +939,17 @@ body{margin:0;background:var(--bg);color:var(--ink);
 @media (max-width:640px){.page{padding:1.5rem .9rem 4rem}.msg{padding:.8rem .9rem}.replies{padding-left:.6rem}}
 @media (prefers-reduced-motion: no-preference){html{scroll-behavior:smooth}}
 """
+# Appended to CSS only when a results card is rendered, so a mailbox
+# without results files renders byte-identically with and without this
+# feature.
+RESULTS_CSS = """
+.results{margin:0 0 2rem;border:1px solid var(--rule);background:var(--surface)}
+.results .eyebrow{padding:.6rem .8rem .35rem}
+.results-summary{margin:0 0 .35rem;padding:0 .8rem;font-size:.82rem;white-space:pre-wrap;overflow-wrap:anywhere}
+.results-fold{border-top:1px solid var(--rule)}
+.results-fold summary{cursor:pointer;padding:.4rem .8rem;font-family:"JetBrains Mono",monospace;font-size:.72rem;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
+.results-details{margin:.4rem 0 .65rem;padding:0 .8rem;background:var(--code-bg);font-size:.78rem;line-height:1.45;white-space:pre-wrap;overflow-wrap:anywhere}
+"""
 
 
 def main(argv=None):
@@ -911,6 +984,9 @@ def main(argv=None):
         name, sec = render_series(d)
         names.append(name)
         sections.append(sec)
+    # The card's rules ride on the card: without a results file the
+    # document is byte-identical to a render without this feature.
+    css = CSS + (RESULTS_CSS if any('class="results"' in s for s in sections) else "")
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     toc = " · ".join(f"<a href=\"#{esc(n)}-v1\">{esc(n)}</a>" for n in names)
     document = f"""<!doctype html>
@@ -919,7 +995,7 @@ def main(argv=None):
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{esc(args.title)}</title>
-<style>{CSS}</style>
+<style>{css}</style>
 </head>
 <body>
 <div class="page">
