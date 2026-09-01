@@ -348,6 +348,46 @@ if [[ -n "$rd_p" ]]; then
         "--model some-local-model" "$mnt_line"
 fi
 
+# The operator-inbox hook: installed for every claude leg the run has, and
+# --maintainer-harness claude is a claude leg even when nothing else in the
+# run is. The leg runs claude with the Stop hook that fs_archive_inbox's
+# addendum archiving trusts, and its command carries --settings; a run with
+# no claude leg anywhere gets neither file.
+rd_mc="$(run_real --harness pi-local --model some-local-model \
+    --maintainer-loop 1 --maintainer-harness claude --maintainer-model sonnet)" \
+    && tmpdirs+=("$rd_mc")
+if [[ -n "$rd_mc" ]]; then
+    if [[ -f "$rd_mc/inbox/.inbox-hook.sh" && -f "$rd_mc/inbox/.settings.json" ]]; then
+        ok "a claude maintainer leg gets the inbox hook and settings"
+    else
+        no "a claude maintainer leg gets the inbox hook and settings" \
+            "$(ls -A "$rd_mc/inbox" 2>/dev/null | tr '\n' ' ')"
+    fi
+    contains "the maintainer settings file names the hook" \
+        "$rd_mc/inbox/.inbox-hook.sh" "$(cat "$rd_mc/inbox/.settings.json" 2>/dev/null)"
+    mnt_line="$(grep '^maintainer_sandbox_cmd=' "$rd_mc/run.sh")"
+    contains "the claude maintainer command carries the inbox settings" \
+        "--settings $rd_mc/inbox/.settings.json" "$mnt_line"
+    contains "the claude maintainer command includes hook events" \
+        "--include-hook-events" "$mnt_line"
+else
+    no "a pi-local/claude-maintainer run produced a run directory" "run_real failed"
+fi
+rd_pl="$(run_real --harness pi-local --model some-local-model \
+    --maintainer-loop 1 --maintainer-harness pi-local \
+    --maintainer-model some-other-local-model)" \
+    && tmpdirs+=("$rd_pl")
+if [[ -n "$rd_pl" ]]; then
+    if [[ ! -e "$rd_pl/inbox/.inbox-hook.sh" && ! -e "$rd_pl/inbox/.settings.json" ]]; then
+        ok "an all-non-claude run installs no inbox hook"
+    else
+        no "an all-non-claude run installs no inbox hook" \
+            "$(ls -A "$rd_pl/inbox" 2>/dev/null | tr '\n' ' ')"
+    fi
+else
+    no "an all-non-claude run produced a run directory" "run_real failed"
+fi
+
 printf '\n== --maintainer-loop: the loop, end to end ==\n'
 
 # A four-leg scenario under --maintainer-loop 2: the implement leg commits,
@@ -463,6 +503,22 @@ if (( rc2 == 0 )) && [[ -n "$rd2" ]]; then
         no "a no-review-loop prompt embeds no inner-review verdict" \
             "$(grep 'The inner review' "$rd2/maintainer-prompt-1.md")"
     fi
+    # Iteration 2 must not be handed the static prompt's "no review has
+    # read that diff yet -- you are the first review it gets" uncorrected:
+    # the first iteration's own verdict is embedded, and only from the
+    # second iteration on.
+    contains "the second iteration's prompt embeds the first verdict" \
+        "## The previous maintainer iteration's verdict" \
+        "$(cat "$rd2/maintainer-prompt-2.md")"
+    contains "the embedded predecessor verdict is iteration 1's" \
+        "file.txt:1 the new line breaks the invariant it sits next to" \
+        "$(cat "$rd2/maintainer-prompt-2.md")"
+    if ! grep -q "The previous maintainer iteration" "$rd2/maintainer-prompt-1.md" 2>/dev/null; then
+        ok "the first iteration's prompt embeds no predecessor verdict"
+    else
+        no "the first iteration's prompt embeds no predecessor verdict" \
+            "$(grep 'The previous maintainer iteration' "$rd2/maintainer-prompt-1.md")"
+    fi
     contains "the fix prompt carries the verdict body" \
         "file.txt:1 the new line breaks the invariant it sits next to" \
         "$(cat "$rd2/maintainer-fix-prompt-1.md")"
@@ -472,14 +528,20 @@ if (( rc2 == 0 )) && [[ -n "$rd2" ]]; then
     contains "the summary's total names the tiers it includes" \
         "(the session and every review-, maintainer- or continuation leg)" \
         "$(cat "$rd2/summary.txt")"
-    if grep -q '^branch:    ' "$rd2/summary.txt" \
-        && grep -q '^maintainer: ' "$rd2/summary.txt"; then
-        ok "the summary's value column aligns across all labels"
-    else
-        no "the summary's value column aligns across all labels" \
-            "$(grep -E '^(branch|maintainer):' "$rd2/summary.txt")"
-    fi
-    contains "events.jsonl still shows the coding session" \
+    # Every label line of the summary header block puts its value at
+    # column 12 -- including 'maintainer:', the longest label, which is
+    # why it carries no padding at all (and the 'fetched:' wrap
+    # continuation below it, at eleven spaces, keeps it).
+    misaligned=""
+    while IFS= read -r sline; do
+        [[ "$sline" =~ ^([a-z]+):(.*)$ ]] || continue
+        srest="${BASH_REMATCH[2]}"
+        snospace="${srest#"${srest%%[![:space:]]*}"}"
+        scol=$(( ${#BASH_REMATCH[1]} + 1 + ${#srest} - ${#snospace} + 1 ))
+        (( scol == 12 )) || misaligned+="$sline;"
+    done < <(sed -n '/^== fork-sandbox summary ==$/,/^$/p' "$rd2/summary.txt")
+    check "the summary's value column aligns at 12 across all labels" \
+        "" "$misaligned"    contains "events.jsonl still shows the coding session" \
         '"subtype":"success"' "$(cat "$rd2/events.jsonl")"
     if [[ -f "$rd2/exit-code" ]]; then
         ok "the exit code was published"
@@ -694,13 +756,13 @@ if [[ -n "$rd2" && -d "$rd2" ]]; then
     contains "run.env records the maintainer cap" \
         "maintainer_loop=2" "$(cat "$rd2/run.env")"
     contains "the summary has the maintainer line" \
-        "maintainer: 2 iteration(s), ended approved" \
+        "maintainer:2 iteration(s), ended approved" \
         "$(cat "$rd2/summary.txt")"
     check "summary.json takes the report from the maintainer" "maintainer" \
         "$(jq -r '.report_from' "$rd2/summary.json" 2>/dev/null)"
     st_out="$("$repo_dir/scripts/fork-sandbox-status.sh" "$rd2" 2>&1)"
     contains "status prints the maintainer line" \
-        "maintainer: 2 iteration(s), ended approved" "$st_out"
+        "maintainer:2 iteration(s), ended approved" "$st_out"
     contains "status prints the maintainer report" \
         "== report: maintainer leg 2 (APPROVED) ==" "$st_out"
     contains "status prints the maintainer report body" \
@@ -717,7 +779,7 @@ fi
 
 if [[ -n "$rd_s" && -d "$rd_s" ]]; then
     contains "a skipped loop gets its summary line" \
-        "maintainer: skipped -- " "$(cat "$rd_s/summary.txt")"
+        "maintainer:skipped -- " "$(cat "$rd_s/summary.txt")"
 fi
 
 if [[ -n "$rd_nm" && -d "$rd_nm" ]]; then

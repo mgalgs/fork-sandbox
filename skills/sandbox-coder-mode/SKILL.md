@@ -541,7 +541,13 @@ thought to write down.
 So, as a habit before merging: when a branch **modifies** code that other
 things already run through — an engine file, a shared helper, a state
 container, a hot path — spend one more review on the branch as it will be
-merged, with the strongest model available.
+merged, with the strongest model available. Launching the run with
+`--maintainer-loop 1 --maintainer-model opus` does exactly this pass at
+the end of the run — a fresh session reviewing the merged shape the way a
+maintainer would, after the loop's verdict — with no hand-off to write.
+
+For a branch that is already back and was not launched with that tier,
+the pass is one review-only run over it:
 
 ```bash
 fork-sandbox.sh --review-only --checkout "<branch>" \
@@ -557,8 +563,10 @@ This neither replaces `--review-loop` nor lowers it. The loop still runs on
 every round, in the sandbox, at the user's composition; this is one pass on
 top, at the end, over the merged shape instead of over each round's diff.
 
-**Say that in the review handoff**, or the pass drifts back into reviewing
-the branch and buys a third opinion on a diff that already has two. Tell it:
+**On the manual pass, say that in the review handoff** — the
+`--maintainer-loop` prompt already carries the framing — or the pass
+drifts back into reviewing the branch and buys a third opinion on a diff
+that already has two. Tell it:
 this diff has already been reviewed, twice, line by line, so re-reading it
 for the same class of defect will find the same things; what has *not* been
 looked at is the blast radius — who calls this, what assumed the old

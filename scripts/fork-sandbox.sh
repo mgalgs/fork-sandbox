@@ -3150,13 +3150,20 @@ inbox_settings=""
 # One hook and one settings file cover every claude leg this run has, not
 # just the implement one: --review-harness claude (with a non-claude
 # implement harness) still starts a claude session for its review leg, and
-# that leg needs the same delivery mechanism the implement leg would have
-# gotten. fs_build_sandbox_cmd only wires --settings/--include-hook-events
+# --maintainer-harness claude does the same for its legs, and each needs the
+# same delivery mechanism the implement leg would have gotten.
+# fs_build_sandbox_cmd only wires --settings/--include-hook-events
 # into a build whose OWN harness is claude, so creating these unconditionally
-# whenever either harness is claude, rather than only the implement one,
-# is what makes a claude review leg (implement pi, say) receive addenda at
-# all instead of running the "no hook" harness it happens not to be.
-if [[ "$harness" == "claude" || "$review_harness" == "claude" ]]; then
+# whenever any leg's harness is claude, rather than only the implement one,
+# is what makes a claude review or maintainer leg (implement pi, say)
+# receive addenda at all instead of running the "no hook" harness it
+# happens not to be. The maintainer is load-bearing here, not just for
+# delivery: fs_archive_inbox below trusts the Stop hook's "cannot end with
+# an addendum unread" guarantee for every leg whose harness is claude, so
+# a claude maintainer leg with no hook installed would be archived as if
+# it had delivered an addendum the session never saw.
+if [[ "$harness" == "claude" || "$review_harness" == "claude" \
+    || "$maintainer_harness" == "claude" ]]; then
     inbox_hook_src="$script_dir/fork-sandbox-inbox-hook.sh"
     if [[ ! -r "$inbox_hook_src" ]]; then
         echo "Error: $inbox_hook_src is missing. It delivers operator addenda" >&2
@@ -5485,6 +5492,35 @@ if [[ "${maintainer_loop_cap:-0}" != "0" && -n "${maintainer_prompt:-}" ]]; then
                     printf 'yourself.\n'
                 fi
             fi
+            # The loop's own predecessor, for the same reason: the static
+            # prompt was written for the loop's first pass, where "no review
+            # has read that diff yet" (and, with a review loop, "build on
+            # the inner review's verdict, a line-by-line reread is not the
+            # job") is true, and the immediately previous maintainer leg's
+            # verdict is what its fix leg just acted on -- without it, a
+            # later iteration cannot tell which of the findings in front of
+            # it were already addressed. The previous iteration's is the one
+            # to show: it is the most recent review of the branch, having
+            # read it after every earlier fix leg. Only ever reached with
+            # one in hand -- the loop advances only on a FINDINGS verdict --
+            # but the guard costs nothing.
+            if (( loop_i > 1 )); then
+                mp_mnt_prev="$run_dir/maintainer-verdict-$(( loop_i - 1 )).md"
+                if [[ -f "$mp_mnt_prev" ]]; then
+                    printf '\n---\n\n## The previous maintainer iteration'\''s verdict\n\n'
+                    printf 'The prompt above was written for this loop'\''s first pass, and its\n'
+                    printf 'account of what has already been read is stale now: maintainer\n'
+                    printf 'iteration %s has already reviewed this branch, and its\n' "$(( loop_i - 1 ))"
+                    printf 'verdict, in full, is below. It is a FINDINGS verdict -- had it\n'
+                    printf 'approved, the loop would have ended -- and the fix leg that has\n'
+                    printf 'committed since was handed exactly those findings. It is the\n'
+                    printf 'most recent review this branch has had, ahead of the review\n'
+                    printf 'loop'\''s verdict above where one was appended. Read it to know\n'
+                    printf 'which of the problems you find were already seen, and what was\n'
+                    printf 'committed in answer, then review the branch as it stands now.\n\n'
+                    cat -- "$mp_mnt_prev"
+                fi
+            fi
         } > "$maintainer_prompt_iter.part"
         mv -- "$maintainer_prompt_iter.part" "$maintainer_prompt_iter"
 
@@ -5860,9 +5896,9 @@ fi
     # emitted them, so the test carries a default.
     if [[ -n "${maintainer_loop_ended:-}" ]]; then
         if [[ "${maintainer_loop_ended}" == "skipped" ]]; then
-            printf 'maintainer: skipped -- %s\n' "${maintainer_loop_detail:-}"
+            printf 'maintainer:skipped -- %s\n' "${maintainer_loop_detail:-}"
         else
-            printf 'maintainer: %s iteration(s), ended %s\n' \
+            printf 'maintainer:%s iteration(s), ended %s\n' \
                 "$(jq '.iterations | length' "$run_dir/maintainer-loop.json" 2>/dev/null || printf '?')" \
                 "$maintainer_loop_ended"
         fi
@@ -5891,7 +5927,7 @@ fi
         printf 'fetched:   NO -- the work is in the clone only\n'
     elif (( removed )); then
         printf 'fetched:   nothing. The session made no commits, so branch %s\n' "$branch"
-        printf '            was removed again and %s is unchanged.\n' "$origin_repo"
+        printf '           was removed again and %s is unchanged.\n' "$origin_repo"
     else
         printf 'fetched:   yes. Branch %s is now in %s\n' "$branch" "$origin_repo"
     fi

@@ -230,6 +230,20 @@ Add `--review-model <model>` to run only the review legs on a different model.
 Fix legs continue to use `--model`, keeping the original implementation model
 responsible for applying the findings.
 
+Pass `--maintainer-loop N` for the tier that decides whether the branch
+lands: after the coding leg — and after `--review-loop`, when both are
+given — a fresh session reviews the branch the way a maintainer judging a
+pull request would, reading the surrounding code rather than the diff, and
+on findings another fresh session commits the fixes; the pair repeats up
+to N times, stopping on approval, the count, a fix session that commits
+nothing, or a failed leg. Unlike the review loop it has no default model —
+`--maintainer-model` is required (or the combined
+`--maintainer-harness pi/<id>` form) — because the maintainer's verdict is
+the run's last word on the branch, reported ahead of the review's. Its
+`--maintainer-harness` takes the same `claude`/`pi`/`pi-local`/`codex`
+choices as `--review-harness`, and a sealed `--harness pi-local` with a
+networked maintainer harness warns by name, as `--review-harness` does.
+
 Use `--review-only --checkout <ref>` to review an existing branch after the
 fact. It runs one review leg and returns no coding or fix changes; use
 `--review-base <ref>` to choose the start of the reviewed range. This also
