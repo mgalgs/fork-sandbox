@@ -278,6 +278,16 @@ def short_subject(s):
     return re.sub(r"^\[PATCH v\d+ \d+/\d+\]\s*", "", s)
 
 
+def patch_label(m):
+    """Standard series numbering for a patch row label: 'Patch vN i/M'.
+    Tolerates prefixes with no explicit version and zero-padded numbering;
+    falls back to the message's own X-Version for those."""
+    mm = re.match(r"^\[PATCH (?:v(\d+) )?(\d+)/(\d+)\]", m["subject"])
+    if not mm:
+        return short_subject(m["subject"])
+    return f"Patch v{mm.group(1) or m['version']} {mm.group(2)}/{mm.group(3)}"
+
+
 def is_patch(m):
     return m["depth"] == 1 and m["subject"].startswith("[PATCH") and m["body"].startswith("From ")
 
@@ -354,7 +364,6 @@ def render_series(series_dir):
         thead = "".join(f"<th title=\"{esc(personas[p][0])}/{esc(personas[p][1])}\">{esc(p)}</th>" for p in pcols)
         trows = []
         for t, latest in rows:
-            label = "cover" if t is cover else short_subject(t["subject"])
             cells = []
             for p in pcols:
                 if p in latest:
@@ -362,7 +371,14 @@ def render_series(series_dir):
                     cells.append(f"<td><a class=\"cell {TAG_CLASS.get(tg,'t-q')}\" href=\"#m-{esc(latest[p][1])}\" title=\"{esc(tg)}\">{TAG_GLYPH.get(tg,'·')}</a></td>")
                 else:
                     cells.append("<td><span class=\"cell none\">·</span></td>")
-            trows.append(f"<tr><th scope=\"row\"><a href=\"#m-{esc(t['id'])}\">{esc(label)}</a></th>{''.join(cells)}</tr>")
+            if t is cover:
+                rowcell = f'<th scope="row"><a href="#m-{esc(t["id"])}">cover</a></th>'
+            else:
+                # Standard series numbering as the row label; the full
+                # subject stays on the row for hover.
+                rowcell = (f'<th scope="row" title="{esc(t["subject"])}">'
+                           f'<a href="#m-{esc(t["id"])}">{esc(patch_label(t))}</a></th>')
+            trows.append(f"<tr>{rowcell}{''.join(cells)}</tr>")
         n_patches = len(rows) - 1
         n_replies = sum(1 for m in msgs.values() if m["version"] == v and m["depth"] >= 1 and not is_patch(m))
         index = "".join(render_index(root) for root in version_roots)
