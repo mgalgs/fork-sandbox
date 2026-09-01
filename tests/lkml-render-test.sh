@@ -780,7 +780,25 @@ fallback_html="$work/results-fallback.html"
 python3 "$renderer" "$LKML_MAILBOX_ROOT/render-fixture" -o "$fallback_html"
 rf="$(<"$fallback_html")"
 contains "no recognized header: the whole file is Summary" "$rf" $'## Summary\nv1 plain prose summary.\nmore prose, no recognized header.'
-case "$rf" in *'<pre class="results-details"></pre>'*) ok "no recognized header: details is empty" ;; *) no "no recognized header: details is empty" ;; esac
+# An empty Details section omits the fold itself: an empty <pre> would
+# be a control the reader clicks to reveal nothing, and the --text
+# block omits the same empty section.
+case "$rf" in *'class="results-fold"'*) no "no recognized header: empty details omits the fold" ;; *) ok "no recognized header: empty details omits the fold" ;; esac
+# A '# Details' with no exact '# Summary' line ('## Summary' is not a
+# recognized header): the prose above the details header is the
+# Summary, not dropped prose.
+printf '%s\n' '## Summary' 'THE OVERVIEW TEXT' '' '# Details' 'detail line' > "$RESULTS_MD"
+python3 "$renderer" "$LKML_MAILBOX_ROOT/render-fixture" -o "$fallback_html"
+rf="$(<"$fallback_html")"
+contains "no '# Summary' above '# Details': the prose above it is the summary" "$rf" $'## Summary\nTHE OVERVIEW TEXT</div>'
+contains "no '# Summary' above '# Details': its own section renders" "$rf" '<pre class="results-details">detail line</pre>'
+# A zero-byte results file still renders the card: an empty summary
+# and no fold.
+: > "$RESULTS_MD"
+python3 "$renderer" "$LKML_MAILBOX_ROOT/render-fixture" -o "$fallback_html"
+rf="$(<"$fallback_html")"
+contains "a zero-byte results file renders an empty summary" "$rf" '<div class="results-summary"></div>'
+case "$rf" in *'class="results-fold"'*) no "a zero-byte results file renders no fold" ;; *) ok "a zero-byte results file renders no fold" ;; esac
 printf '# Summary \nspaced header line.\n' > "$RESULTS_MD"
 python3 "$renderer" "$LKML_MAILBOX_ROOT/render-fixture" -o "$fallback_html"
 rf="$(<"$fallback_html")"
@@ -830,8 +848,9 @@ html = open(sys.argv[1], encoding="utf-8").read()
 i_v1 = html.index('<section class="series" id="res-two-v1">')
 i_v2 = html.index('<section class="series" id="res-two-v2">')
 errors = []
-if html.count('<div class="results">') != 1:
-    errors.append(f"expected exactly one card, got {html.count('<div class=\"results\">')}")
+card = '<div class="results">'
+if html.count(card) != 1:
+    errors.append("expected exactly one card, got %d" % html.count(card))
 else:
     i_res = html.index('<div class="results">')
     if not i_v1 < i_res < i_v2:
@@ -866,7 +885,9 @@ review_prefix="${review_id:0:7}"
         '' \
         '# Details' \
         "Reviewed-by core ($review_prefix)." \
-        'The fake id 0000000 stays plain.'
+        'The fake id 0000000 stays plain.' \
+        '# Summary' \
+        'SPOOFED SUMMARY CLAIMING ALL GREEN'
 } > "$RESULTS_MD"
 results_link="$work/results-link.html"
 python3 "$renderer" "$LKML_MAILBOX_ROOT/render-fixture" -o "$results_link"
@@ -878,6 +899,27 @@ contains "autolink: a fake id stays plain text" "$rl" '; 0000000 and 0123456780 
 case "$rl" in *'href="#m-012345678"'*|*'>1234567</a>'*) no "a hex run longer than 7 is not a 7-hex token" ;; *) ok "a hex run longer than 7 is not a 7-hex token" ;; esac
 contains "results markup is escaped before the linker runs" "$rl" '&lt;/a&gt;&lt;script&gt;alert(4)&lt;/script&gt;'
 case "$rl" in *'<script>alert(4)</script>'*) no "results script payload is never raw" ;; *) ok "results script payload is never raw" ;; esac
+
+# id_prefix_map drops an ambiguous prefix (two ids sharing their first
+# seven hex chars) instead of guessing, so a colliding token stays
+# plain text while an unambiguous token of the same shape links.
+if python3 - "$renderer" <<'PY'
+import importlib.util
+import sys
+
+spec = importlib.util.spec_from_file_location("lkml_render", sys.argv[1])
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+msgs = {"a": {"id": "abcdef01111111"}, "b": {"id": "abcdef02222222"}, "c": {"id": "1111111aaaaaaaa"}}
+m = mod.id_prefix_map(msgs)
+assert m == {"1111111": "1111111aaaaaaaa"}, m
+assert mod.link_ids("abcdef0 and 1111111", m) == "abcdef0 and <a href=\"#m-1111111aaaaaaaa\">1111111</a>"
+PY
+then
+    ok "autolink: an ambiguous 7-hex prefix is dropped, not guessed"
+else
+    no "autolink: an ambiguous 7-hex prefix is dropped, not guessed"
+fi
 
 # --text: the same sections as a 'results' block in the card's position
 # (after the reviewers block, before the thread), bodies indented like
@@ -898,12 +940,12 @@ i_first = next(i for i, ln in enumerate(lines) if ln.startswith('== #'))
 errors = []
 if not i_rev < i_res < i_first:
     errors.append("results block is not between the reviewers block and the thread")
-if lines[i_res + 1] != '  # Summary':
+if lines[i_res + 1] != '# Summary':
     errors.append("summary label is not directly under the results header")
 if not lines[i_res + 2].startswith('  v1:'):
     errors.append("summary body line is not indented under the label")
 try:
-    i_det = lines.index('  # Details', i_res)
+    i_det = lines.index('# Details', i_res)
 except ValueError:
     errors.append("details label missing")
 else:
@@ -921,6 +963,35 @@ then
     ok "text: results block position and indentation"
 else
     no "text: results block position and indentation"
+fi
+# The '# Summary' line in the Details body is a body line: it keeps its
+# two-space body prefix and must not read as the section label (labels
+# sit at column 0, like every other header in the text render).
+if [[ "$(grep -cxF -- '# Summary' "$results_text")" -eq 1 ]]; then ok "text: a '# Summary' body line cannot forge the section label"; else no "text: a '# Summary' body line cannot forge the section label"; fi
+contains "text: a '# Summary' body line keeps its body prefix" "$rt" '  # Summary'
+# An empty Summary section omits its label and body: the Details label
+# sits directly under the 'results' header.
+printf '%s\n' '# Summary' '' '# Details' 'details only.' > "$RESULTS_MD"
+results_empty="$work/results-empty.txt"
+python3 "$renderer" --text "$LKML_MAILBOX_ROOT/render-fixture" > "$results_empty"
+if python3 - "$results_empty" <<'PY'
+import sys
+
+lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+i_res = lines.index('results')
+errors = []
+if lines[i_res + 1] != '# Details':
+    errors.append("an empty summary does not omit its label")
+if not lines[i_res + 2].startswith('  details only.'):
+    errors.append("details body is not right under its label")
+for e in errors:
+    print(e)
+sys.exit(1 if errors else 0)
+PY
+then
+    ok "text: an empty summary omits its label and body"
+else
+    no "text: an empty summary omits its label and body"
 fi
 rm "$RESULTS_MD"
 

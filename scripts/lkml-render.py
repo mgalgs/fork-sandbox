@@ -23,7 +23,8 @@ Reviewers panel and the Thread Index: the "# Summary" section sits
 outside a native <details>, the "# Details" section inside it, and
 7-hex message-id tokens that match a message in the mailbox link to
 that message. --text prints the same sections as a bare 'results'
-block (no links). Without the file there is no card and the render is
+block (no links); an empty section is omitted in both backends.
+Without the file there is no card and the render is
 byte-identical to a mailbox without results.
 """
 import html
@@ -422,16 +423,18 @@ def read_results(series_dir, version):
 
 def split_results(text):
     """Split a results file into ("# Summary" body, "# Details" body).
-    The bodies are verbatim, stripped of nothing but trailing newlines;
-    a missing section is empty, and a file with no recognized header is
-    all Summary. Each body ends where the other section's header sits,
+    The bodies are verbatim, stripped of nothing but trailing newlines.
+    A missing '# Summary' means the summary is everything above the
+    '# Details' header (the whole file when there is no header at
+    all); a missing '# Details' means the details body is empty.
+    Each body ends where the other section's header sits,
     in either order, so a # Details that precedes # Summary cannot
     swallow the summary header and body into the details."""
     lines = text.splitlines()
     s = next((i for i, ln in enumerate(lines) if ln == "# Summary"), None)
     d = next((i for i, ln in enumerate(lines) if ln == "# Details"), None)
     if s is None:
-        s = d - 1 if d is not None else -1
+        s = -1
     if d is None:
         d = len(lines)
     end_s = d if d > s else len(lines)
@@ -470,22 +473,25 @@ def render_results_card(series_dir, version, id_map):
     """The per-version Results card, placed between the Reviewers panel
     and the Thread Index: the Summary section is visible in the
     collapsed state, only Details sits inside the "show details"
-    summary. Both sections are escaped preformatted text in the file's
-    own layout (the persona-briefs treatment) -- never rendered or
-    executed -- with 7-hex message-id tokens autolinked. Returns "" when
-    the results file is absent."""
+    summary -- omitted entirely when the Details body is empty, the
+    way the --text block omits its empty sections. Both sections are
+    escaped preformatted text in the file's own layout (the
+    persona-briefs treatment) -- never rendered or executed -- with
+    7-hex message-id tokens autolinked. Returns "" when the results
+    file is absent."""
     res = read_results(series_dir, version)
     if res is None:
         return ""
     summary, details = res
-    return (f'  <div class="results">\n'
+    card = (f'  <div class="results">\n'
             f'    <p class="eyebrow">results</p>\n'
-            f'    <div class="results-summary">{link_ids(esc(summary), id_map)}</div>\n'
-            f'    <details class="results-fold">\n'
-            f'      <summary>show details</summary>\n'
-            f'      <pre class="results-details">{link_ids(esc(details), id_map)}</pre>\n'
-            f'    </details>\n'
-            f'  </div>')
+            f'    <div class="results-summary">{link_ids(esc(summary), id_map)}</div>\n')
+    if details:
+        card += (f'    <details class="results-fold">\n'
+                 f'      <summary>show details</summary>\n'
+                 f'      <pre class="results-details">{link_ids(esc(details), id_map)}</pre>\n'
+                 f'    </details>\n')
+    return card + '  </div>'
 
 
 def render_reviewer(r, series_dir):
@@ -687,21 +693,25 @@ def render_text_series(series_dir):
             render_text_reviewers(lines, name, series_dir, reviewer_entries)
             lines.append("")
         # The Results card's sections as a text block in the same
-        # position: bare 'results' header, then the two labeled sections
-        # ('  # Summary', '  # Details'), bodies verbatim, every line
-        # indented like a message body's (so a line in the file cannot
-        # forge the block's header or a section label; the labels are
-        # what keep 'end of summary' distinguishable from a blank line
-        # inside it once trailing spaces are trimmed). No links in text
-        # mode.
+        # position: bare 'results' header, then the section labels
+        # ('# Summary', '# Details') and the verbatim bodies. The
+        # labels sit at column 0 -- like the 'results' header and the
+        # message headers -- while every body line carries its
+        # two-space prefix, so a body line that reads '# Summary' or
+        # '# Details' cannot forge a label (the same rule that keeps a
+        # body line from forging a message header). An empty section
+        # omits its label and body, the way the HTML card omits its
+        # empty details fold. No links in text mode.
         res = read_results(series_dir, v)
         if res is not None:
             lines.append("results")
-            lines.append("  # Summary")
-            lines.extend("  " + ln for ln in res[0].split("\n"))
+            if res[0]:
+                lines.append("# Summary")
+                lines.extend("  " + ln for ln in res[0].split("\n"))
             if res[1]:
-                lines.append("")
-                lines.append("  # Details")
+                if res[0]:
+                    lines.append("")
+                lines.append("# Details")
                 lines.extend("  " + ln for ln in res[1].split("\n"))
             lines.append("")
         # Number the thread pre-order, matching the HTML nesting order.
