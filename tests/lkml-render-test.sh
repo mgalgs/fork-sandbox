@@ -169,6 +169,9 @@ python3 "$renderer" "$LKML_MAILBOX_ROOT/render-empty" -o "$empty_html"
 ehtml="$(<"$empty_html")"
 case "$ehtml" in *'<div class="reviewers"'*) no "no reviewers box on a fresh series" ;; *) ok "no reviewers box on a fresh series" ;; esac
 contains "fresh series still reports zero reviewers" "$ehtml" '<span>0 reviewers</span>'
+# .reviewers .counts{display:flex;gap:1rem} restated only what the global
+# .counts rule already sets; make sure it does not come back.
+case "$html" in *'.reviewers .counts'*) no "no dead .reviewers .counts rule" ;; *) ok "no dead .reviewers .counts rule" ;; esac
 
 printf '%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))

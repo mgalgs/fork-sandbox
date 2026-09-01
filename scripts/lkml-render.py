@@ -541,7 +541,6 @@ body{margin:0;background:var(--bg);color:var(--ink);
 .reviewer>summary .who{font-weight:600}
 .reviewer>summary .slug{color:var(--accent);font-size:.75rem}
 .reviewer-body{padding:0 .8rem .65rem;font-size:.82rem}
-.reviewers .counts{display:flex;gap:1rem}
 .rv-line{color:var(--muted);margin:0 0 .35rem;font-size:.78rem}
 .persona-brief{margin:.5rem 0 0;padding:.6rem .8rem;background:var(--code-bg);font-size:.78rem;line-height:1.45;white-space:pre-wrap;overflow-wrap:anywhere;border-radius:2px}
 .t-rev{color:var(--rev);background:var(--rev-bg)}
