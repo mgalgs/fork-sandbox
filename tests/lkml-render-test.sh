@@ -276,6 +276,71 @@ contains "fresh series still reports zero reviewers" "$ehtml" '<span>0 reviewers
 # .counts rule already sets; make sure it does not come back.
 case "$html" in *'.reviewers .counts'*) no "no dead .reviewers .counts rule" ;; *) ok "no dead .reviewers .counts rule" ;; esac
 
+printf '\n== row labels: a 14-patch series zero-pads the position ==\n'
+# The mailbox stores the position unpadded ('2/14'); the renderer must
+# zero-pad it lore-style in the row label.
+mkdir -p "$work/patches14"
+for i in $(seq 1 14); do
+    printf '%s\n' \
+        "From $(printf '%040d' "$i") Mon Sep 17 00:00:00 2001" \
+        'From: Author <author@example.com>' \
+        'Date: Mon, 17 Sep 2001 00:00:00 +0000' \
+        "Subject: [PATCH $i/14] demo: patch number $i" '' \
+        "Commit message for patch $i." '' '---' ' demo.c | 1 +' ' 1 file changed, 1 insertion(+)' '' \
+        'diff --git a/demo.c b/demo.c' "+line$i" > "$work/patches14/$(printf '%04d' "$i")-p$i.patch"
+done
+"$mailbox" init pad-14 --cover "$work/cover.txt" --patches "$work/patches14" \
+    --from author --harness test --model fixture >/dev/null 2>/dev/null
+pad_out="$work/pad.html"
+python3 "$renderer" "$LKML_MAILBOX_ROOT/pad-14" -o "$pad_out"
+ph="$(<"$pad_out")"
+contains "14-patch row 2 reads 02/14 in the HTML row label" "$ph" '>[PATCH v1 02/14] demo: patch number 2</a></th>'
+contains "14-patch row 14 is not over-padded" "$ph" '>[PATCH v1 14/14] demo: patch number 14</a></th>'
+case "$ph" in *'>Patch v1 2/14</a>'*) no "the demoted 'Patch vN i/M' form is gone" ;; *) ok "the demoted 'Patch vN i/M' form is gone" ;; esac
+
+printf '\n== text tally: the 120-column cap truncates the subject part ==\n'
+# A 150-char subject must truncate the SUBJECT part of the label (prefix
+# intact, trailing ellipsis), not the table: no tally line exceeds ~120
+# columns.
+longsubj="$(printf 'x%.0s' $(seq 1 150))"
+mkdir -p "$work/patches-long"
+printf '%s\n' \
+    'From ffffffff Mon Sep 17 00:00:00 2001' \
+    'From: Author <author@example.com>' \
+    'Date: Mon, 17 Sep 2001 00:00:00 +0000' \
+    "Subject: [PATCH 1/1] demo: a very long subject $longsubj" '' \
+    'Commit message.' '' '---' ' demo.c | 1 +' ' 1 file changed, 1 insertion(+)' '' \
+    'diff --git a/demo.c b/demo.c' '+x' > "$work/patches-long/0001-long.patch"
+"$mailbox" init long-subj --cover "$work/cover.txt" --patches "$work/patches-long" \
+    --from author --harness test --model fixture >/dev/null 2>/dev/null
+long_out="$work/long.txt"
+python3 "$renderer" --text "$LKML_MAILBOX_ROOT/long-subj" > "$long_out"
+lt="$(<"$long_out")"
+contains "text: the truncated label carries a trailing ellipsis" "$lt" '…'
+if python3 - "$long_out" <<'PY'
+import sys
+
+lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+i = next(i for i, ln in enumerate(lines) if ln.startswith("Latest tag per reviewer"))
+block = []
+for ln in lines[i + 1:]:
+    if not ln:
+        break
+    block.append(ln)
+bad = [len(ln) for ln in block if len(ln) > 120]
+if bad:
+    print("tally lines over 120 columns:", bad)
+sys.exit(1 if bad else 0)
+PY
+then
+    ok "text: no tally line exceeds 120 columns"
+else
+    no "text: no tally line exceeds 120 columns"
+fi
+contains "text: truncation keeps the prefix and subject start intact" "$lt" '[PATCH v1 1/1] demo: a very long subject xxx'
+contains "text: truncation is marked with a trailing ellipsis" "$lt" 'xxx…'
+case "$lt" in *'Patch v1 1/1 '*|*'Patch v1 1/1\n'*) no "text: the demoted 'Patch vN i/M' form never appears" ;; *) ok "text: the demoted 'Patch vN i/M' form never appears" ;; esac
+
 printf '\n== text mode: thread walk and message rendering ==\n'
 # The agent view: same thread selection and ordering as the HTML render,
 # as plain text on stdout.

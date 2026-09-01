@@ -480,15 +480,39 @@ def render_text_message(out, m, nums, depth):
         render_text_message(out, c, nums, depth + 1)
 
 
+def fit_tally_label(label, budget):
+    """Truncate a text-tally row label to `budget` columns: the
+    [PATCH vN i/M] prefix survives intact and the cut is marked with a
+    trailing ellipsis on the SUBJECT part. Never falls back to the bare
+    'Patch vN i/M' form."""
+    if len(label) <= budget:
+        return label
+    mm = re.match(r"^(\[PATCH v\d+ \d+/\d+\] )(.*)$", label)
+    if mm and budget > len(mm.group(1)) + 1:
+        keep = budget - len(mm.group(1)) - 1
+        return mm.group(1) + mm.group(2)[:keep] + "\u2026"
+    return label[:budget]
+
+
 def render_text_tally(out, rows, pcols):
     """The per-version tally as a fixed-width table: a row per patch
     (same labels as the HTML rows), a column per listed reviewer, cells
-    the same latest-tag-per-reviewer-per-patch letters."""
+    the same latest-tag-per-reviewer-per-patch letters. The first column
+    sizes from the longest label; when that would push the table past
+    ~120 columns, the subject part of the label is truncated (the
+    prefix intact) rather than the table."""
     grid = [["patch"] + list(pcols)]
     for t, latest in rows:
         label = "cover" if t is rows[0][0] else patch_label(t)
         grid.append([label] + [TAG_GLYPH.get(latest[p][2][0], "·") if p in latest else "·" for p in pcols])
     widths = [max(len(row[i]) for row in grid) for i in range(len(grid[0]))]
+    # Gap is two spaces between columns; the label column alone absorbs
+    # the overflow, so the tag columns stay readable.
+    budget = 120 - sum(widths[1:]) - 2 * (len(widths) - 1)
+    if widths[0] > budget:
+        for row in grid:
+            row[0] = fit_tally_label(row[0], budget)
+        widths[0] = max(len(row[0]) for row in grid)
     out.append("Latest tag per reviewer per patch. R reviewed, A acked, "
                "C changes requested, ? question, N nak.")
     for row in grid:
@@ -649,10 +673,15 @@ def render_series(series_dir):
             if t is cover:
                 rowcell = f'<th scope="row"><a href="#m-{esc(t["id"])}">cover</a></th>'
             else:
-                # Standard series numbering as the row label; the full
-                # subject stays on the row for hover.
-                rowcell = (f'<th scope="row" title="{esc(t["subject"])}">'
-                           f'<a href="#m-{esc(t["id"])}">{esc(patch_label(t))}</a></th>')
+                # The full lore-style subject (numbering as prefix) is the
+                # row text. The .tally CSS already ellipsizes the
+                # row-header column at its max-width, so the title attr
+                # stays as the hover for a clipped label; it is always
+                # set, since deciding from Python whether the CSS
+                # actually clipped is awkward.
+                label = patch_label(t)
+                rowcell = (f'<th scope="row" title="{esc(label)}">'
+                           f'<a href="#m-{esc(t["id"])}">{esc(label)}</a></th>')
             trows.append(f"<tr>{rowcell}{''.join(cells)}</tr>")
         n_patches = len(rows) - 1
         index = "".join(render_index(root) for root in version_roots)
