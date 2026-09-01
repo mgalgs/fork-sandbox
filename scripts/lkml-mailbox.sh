@@ -468,12 +468,20 @@ lkml_resolve_id() {
         done
     fi
     if [[ -n "$wanted_index" ]]; then
-        # Stored positions are zero-padded to the width of the total; pad
-        # the wanted index the same way before the subject match.
-        local wanted_pos; wanted_pos="$(printf '%0*d' "${#wanted_total}" "$wanted_index")"
+        # Normalize the wanted position as a base-10 number: the canonical
+        # padded form carries a leading zero ('08'), which printf '%d'
+        # treats as an invalid octal number and would print as '00'. Then
+        # match the stored subject in BOTH forms: init stores positions
+        # zero-padded to the width of the total, but a mailbox created
+        # before that change holds them unpadded, and the renderer's
+        # padded label must resolve against either.
+        local wanted_num wanted_pos
+        wanted_num=$((10#$wanted_index))
+        wanted_pos="$(printf '%0*d' "${#wanted_total}" "$wanted_num")"
         for i in "${!LKML_ID[@]}"; do
             [[ "${LKML_VERSION[$i]}" == "$wanted_version" ]] || continue
-            [[ "${LKML_SUBJECT[$i]}" == "[PATCH v$wanted_version $wanted_pos/$wanted_total]"* ]] || continue
+            [[ "${LKML_SUBJECT[$i]}" == "[PATCH v$wanted_version $wanted_pos/$wanted_total]"* \
+                || "${LKML_SUBJECT[$i]}" == "[PATCH v$wanted_version $wanted_num/$wanted_total]"* ]] || continue
             match="${LKML_ID[$i]}"; count=$(( count + 1 ))
         done
         if (( count == 1 )); then

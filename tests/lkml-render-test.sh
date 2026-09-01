@@ -279,8 +279,9 @@ contains "fresh series still reports zero reviewers" "$ehtml" '<span>0 reviewers
 case "$html" in *'.reviewers .counts'*) no "no dead .reviewers .counts rule" ;; *) ok "no dead .reviewers .counts rule" ;; esac
 
 printf '\n== row labels: a 14-patch series zero-pads the position ==\n'
-# The mailbox stores the position unpadded ('2/14'); the renderer must
-# zero-pad it lore-style in the row label.
+# The mailbox stores the position zero-padded ('02/14'); the renderer
+# must zero-pad lore-style in the row label too, so a mailbox created
+# before the padding change (unpadded stored subjects) labels the same.
 mkdir -p "$work/patches14"
 for i in $(seq 1 14); do
     printf '%s\n' \
@@ -302,14 +303,21 @@ case "$ph" in *'>Patch v1 2/14</a>'*) no "the demoted 'Patch vN i/M' form is gon
 # One document, one subject: the mailbox stores the position zero-padded
 # too, so the patch's own Subject: line in the agent view is the same
 # string the tally labels (an agent can grep the label to find the patch).
-# This post also proves the mailbox resolver still matches an UNPADDED
-# '2/14' against the padded stored subject.
-if "$mailbox" post pad-14 --from core --reply-to '[PATCH v1 2/14]' --file "$work/review.txt" \
-    --tags Reviewed-by --harness test --model fixture >/dev/null 2>/dev/null; then
-    ok "mailbox: unpadded '2/14' resolves against the padded stored subject"
-else
-    no "mailbox: unpadded '2/14' resolves against the padded stored subject"
-fi
+# The resolver must match BOTH forms: an unpadded '2/14' typed by hand,
+# and the padded '[PATCH v1 08/14]' form the tally labels emit (whose
+# leading-zero index is an invalid octal to printf's %d and would pad to
+# '00'). Verify by reading the posted replies back: 'post' exits 0 even
+# when the parent does not resolve at all (it falls back under the cover
+# with X-Misthreaded), so an exit-status check passes either way.
+"$mailbox" post pad-14 --from core --reply-to '[PATCH v1 2/14]' --file "$work/review.txt" \
+    --tags Reviewed-by --harness test --model fixture >/dev/null 2>/dev/null
+"$mailbox" post pad-14 --from core --reply-to '[PATCH v1 08/14]' --file "$work/review.txt" \
+    --tags Reviewed-by --harness test --model fixture >/dev/null 2>/dev/null
+pad_tree="$("$mailbox" tree pad-14)"
+contains "mailbox: unpadded '2/14' resolves to patch 2, not the cover fallback" \
+    "$pad_tree" "Re: [PATCH v1 02/14] demo: patch number 2"
+contains "mailbox: padded '08/14' (leading zero) resolves to patch 8, not the cover fallback" \
+    "$pad_tree" "Re: [PATCH v1 08/14] demo: patch number 8"
 pad_text="$work/pad.txt"
 python3 "$renderer" --text "$LKML_MAILBOX_ROOT/pad-14" > "$pad_text"
 contains "text: patch 2 Subject: line is zero-padded like its tally label" "$(<"$pad_text")" 'Subject: [PATCH v1 02/14] demo: patch number 2'
@@ -364,12 +372,51 @@ else
 fi
 contains "text: truncation keeps the prefix and subject start intact" "$ltally" '[PATCH v1 1/1] demo: a very long subject xxx'
 contains "text: truncation is marked with a trailing ellipsis" "$ltally" 'xxx…'
+
+printf '\n== html tally: the row label is capped, the title keeps the full label ==\n'
+# The text path caps its row labels at 120 columns; the HTML path used to
+# rely on the .tally CSS max-width, which auto table layout only treats
+# as a suggestion. The label must be capped in Python: the row shows an
+# ellipsized label, the full subject never sits inline, and the title
+# attribute still carries the full label.
+long_html="$work/long.html"
+python3 "$renderer" "$LKML_MAILBOX_ROOT/long-subj" -o "$long_html" >/dev/null 2>/dev/null
+if python3 - "$long_html" <<'PY'
+import re, sys
+
+html = open(sys.argv[1], encoding="utf-8").read()
+th = re.search(r'<th scope="row" title="([^"]*)"><a href="[^"]*">([^<]*)</a></th>', html)
+if not th:
+    print("no patch row cell found in the HTML tally")
+    sys.exit(1)
+title, shown = th.group(1), th.group(2)
+full = "x" * 150
+errors = []
+if len(shown) > 64:
+    errors.append(f"row label not capped ({len(shown)} chars)")
+if "…" not in shown:
+    errors.append("row label cut is unmarked (no ellipsis)")
+if full in shown:
+    errors.append("full 150-char subject sits inline in the row label")
+if full not in title:
+    errors.append("title attribute lost the full label")
+for e in errors:
+    print(e)
+sys.exit(1 if errors else 0)
+PY
+then
+    ok "html: the long tally row label is capped, ellipsized, full label on hover"
+else
+    no "html: the long tally row label is capped, ellipsized, full label on hover"
+fi
 nl=$'\n'
 # The old demoted form would sit at the start of a tally row: followed by
-# the column gap, or at end of line when no tag columns exist. A quoted
-# '\n' in a case pattern is a literal backslash-n, so the newline comes
-# from a variable.
-endpat="$nl Patch v1 1/1$nl"
+# the column gap, or at the start of a row when no tag columns exist. A
+# quoted '\n' in a case pattern is a literal backslash-n, so the newline
+# comes from a variable; the row starts at column 0 (it is rstrip()'d),
+# so there is no leading space, and the last line of the file carries no
+# trailing newline, so the pattern has none either.
+endpat="${nl}Patch v1 1/1"
 case "$lt" in *'Patch v1 1/1 '*|*"$endpat"*) no "text: the demoted 'Patch vN i/M' form never appears" ;; *) ok "text: the demoted 'Patch vN i/M' form never appears" ;; esac
 
 printf '\n== text tally: the tag columns squeeze the label budget ==\n'

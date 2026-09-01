@@ -33,6 +33,13 @@ TAG_CLASS = {
 }
 TAG_GLYPH = {"Reviewed-by": "R", "Acked-by": "A", "Tested-by": "T", "Changes-requested": "C",
              "Question": "?", "NAK": "N"}
+# Max characters for an HTML tally row label. The .tally table is in auto
+# layout, where a browser treats max-width on a <th> as a suggestion and
+# grows the column to fit the content, so the CSS ellipsis is not a
+# reliable cap; the label is capped here instead, mirroring the text
+# tally's column budget. The full label stays on hover via the title
+# attribute.
+HTML_TALLY_LABEL_CAP = 64
 
 
 def read_msg(path, attachment_root):
@@ -682,14 +689,16 @@ def render_series(series_dir):
                 rowcell = f'<th scope="row"><a href="#m-{esc(t["id"])}">cover</a></th>'
             else:
                 # The full lore-style subject (numbering as prefix) is the
-                # row text. The .tally CSS already ellipsizes the
-                # row-header column at its max-width, so the title attr
-                # stays as the hover for a clipped label; it is always
-                # set, since deciding from Python whether the CSS
-                # actually clipped is awkward.
+                # row text, capped to HTML_TALLY_LABEL_CAP like the text
+                # tally caps its rows: in the table's auto layout the CSS
+                # max-width on the <th> is only a suggestion, so an
+                # uncapped subject would overflow .tally-wrap's scroller
+                # at full width and make the title tooltip duplicate
+                # fully visible text. The cut is marked with an
+                # ellipsis and the full label stays on hover.
                 label = patch_label(t)
                 rowcell = (f'<th scope="row" title="{esc(label)}">'
-                           f'<a href="#m-{esc(t["id"])}">{esc(label)}</a></th>')
+                           f'<a href="#m-{esc(t["id"])}">{esc(fit_tally_label(label, HTML_TALLY_LABEL_CAP))}</a></th>')
             trows.append(f"<tr>{rowcell}{''.join(cells)}</tr>")
         n_patches = len(rows) - 1
         index = "".join(render_index(root) for root in version_roots)

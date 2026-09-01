@@ -349,6 +349,72 @@ resolver_post "patch filename shape resolves by its leading sha" \
 resolver_post "an ambiguous subject resolves within the latest version" \
     'docs: Describe addenda archiving across legs' "$ladder_patch_id"
 
+printf '\n== position padding: padded and legacy (unpadded) mailboxes ==\n'
+# A series with a two-digit total exercises what a two-patch series never
+# can: the stored position is zero-padded to the width of the total, the
+# resolver must pad an unpadded wanted index before the subject match,
+# must read a leading-zero wanted index as base-10 (printf %d treats
+# '08' as an invalid octal and would print '00'), and must still resolve
+# a mailbox that predates the padding (unpadded stored subjects), in BOTH
+# wanted forms.
+pad_post() {
+    local series="$1" label="$2" reply="$3" expected_parent="$4" id raw
+    id="$("$mailbox" post "$series" --from reviewer --reply-to "$reply" --file infer.txt \
+        --harness claude --model opus 2>/dev/null)"
+    raw="$("$mailbox" show "$series" "${id:0:7}")"
+    # The tree only ever shows the short id7, so match it as a prefix
+    # rather than expecting the closing '@lkml.local' on a 7-char id.
+    contains "$label" "$raw" "In-Reply-To: <$expected_parent"
+}
+
+mkdir -p pad-patches
+for i in $(seq 1 14); do
+    printf 'Subject: [PATCH %s/14] pad: patch number %s\n\nFrom %s Mon Sep 17 00:00:00 2001\nbody %s\n' \
+        "$i" "$i" "$(printf '%040d' "$i")" "$i" > "pad-patches/$(printf '%04d' "$i")-p$i.patch"
+done
+"$mailbox" init pad-resolve --cover ladder-cover.txt --patches pad-patches \
+    --from author --harness claude --model opus >/dev/null 2>/dev/null
+pad_tree="$("$mailbox" tree pad-resolve)"
+pad_id_for() { printf '%s\n' "$pad_tree" | awk -v pat="$1" 'index($0, pat) { print $1; exit }'; }
+pad2_id="$(pad_id_for '[PATCH v1 02/14]')"
+pad8_id="$(pad_id_for '[PATCH v1 08/14]')"
+[[ -n "$pad2_id" && -n "$pad8_id" ]] || { no "pad-resolve fixture: patch ids found"; exit 1; }
+pad_post pad-resolve "new mailbox: unpadded '2/14' resolves to patch 2" '2/14' "$pad2_id"
+pad_post pad-resolve "new mailbox: padded '02/14' resolves to patch 2" '[PATCH v1 02/14]' "$pad2_id"
+pad_post pad-resolve "new mailbox: padded '08/14' (leading zero) resolves to patch 8" '[PATCH v1 08/14]' "$pad8_id"
+
+# A mailbox created before init stored positions zero-padded: its stored
+# subjects are unpadded. Craft one by hand with the same .msg layout.
+mkdir -p "$LKML_MAILBOX_ROOT/legacy-pad/cur"
+leg_cover="11111111-1111-4111-8111-111111111111"
+leg_id() { printf '22222222-2222-4222-8222-%012d' "$1"; }
+printf '%s\n' \
+    "Message-ID: <$leg_cover@lkml.local>" \
+    'Date: Mon, 17 Sep 2001 00:00:00 +0000' \
+    'From: Author (AI persona) <author.ai@lkml.local>' \
+    'Subject: [PATCH v1 0/14] legacy cover' \
+    'X-AI-Persona: author' 'X-AI-Harness: test' 'X-AI-Model: fixture' \
+    'X-Series: legacy-pad' 'X-Version: 1' 'X-Depth: 0' 'X-Tags: ' 'X-Seq: 1' '' \
+    'legacy cover body' > "$LKML_MAILBOX_ROOT/legacy-pad/cur/$leg_cover.msg"
+for i in $(seq 1 14); do
+    lid="$(leg_id "$i")"
+    printf '%s\n' \
+        "Message-ID: <$lid@lkml.local>" \
+        "In-Reply-To: <$leg_cover@lkml.local>" \
+        "References: <$leg_cover@lkml.local>" \
+        'Date: Mon, 17 Sep 2001 00:00:00 +0000' \
+        'From: Author (AI persona) <author.ai@lkml.local>' \
+        "Subject: [PATCH v1 $i/14] legacy: patch number $i" \
+        'X-AI-Persona: author' 'X-AI-Harness: test' 'X-AI-Model: fixture' \
+        'X-Series: legacy-pad' 'X-Version: 1' 'X-Depth: 1' 'X-Tags: ' "X-Seq: $(( i + 1 ))" '' \
+        "legacy body $i" > "$LKML_MAILBOX_ROOT/legacy-pad/cur/$lid.msg"
+done
+leg2_id="$(leg_id 2)"
+leg8_id="$(leg_id 8)"
+pad_post legacy-pad "legacy mailbox: unpadded '2/14' resolves to patch 2" '[PATCH v1 2/14]' "$leg2_id"
+pad_post legacy-pad "legacy mailbox: padded '02/14' (the renderer's label) resolves to patch 2" '[PATCH v1 02/14]' "$leg2_id"
+pad_post legacy-pad "legacy mailbox: padded '08/14' (the renderer's label) resolves to patch 8" '[PATCH v1 08/14]' "$leg8_id"
+
 printf '\n== commit sha matching ==\n'
 
 mkdir -p sha-patches
