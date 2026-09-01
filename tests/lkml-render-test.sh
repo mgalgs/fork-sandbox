@@ -764,6 +764,54 @@ rhgone="$(<"$results_gone")"
 case "$rhgone" in *'class="results"'*) no "removing the results file removes the card" ;; *) ok "removing the results file removes the card" ;; esac
 case "$rhgone" in *'.results{'*) no "removing the results file removes the results CSS" ;; *) ok "removing the results file removes the results CSS" ;; esac
 
+printf '\n== results card: no-header fallback, reversed headers, read containment ==\n'
+# A file with no recognized "# Summary"/"# Details" line is all Summary
+# per the split contract -- "## Summary" (a heading level the renderer's
+# own render_prose accepts), a trailing space, or plain prose must not
+# be silently dropped.
+RESULTS_MD="$LKML_MAILBOX_ROOT/render-fixture/results-v1.md"
+{
+    printf '%s\n' \
+        '## Summary' \
+        'v1 plain prose summary.' \
+        'more prose, no recognized header.'
+} > "$RESULTS_MD"
+fallback_html="$work/results-fallback.html"
+python3 "$renderer" "$LKML_MAILBOX_ROOT/render-fixture" -o "$fallback_html"
+rf="$(<"$fallback_html")"
+contains "no recognized header: the whole file is Summary" "$rf" $'## Summary\nv1 plain prose summary.\nmore prose, no recognized header.'
+case "$rf" in *'<pre class="results-details"></pre>'*) ok "no recognized header: details is empty" ;; *) no "no recognized header: details is empty" ;; esac
+printf '# Summary \nspaced header line.\n' > "$RESULTS_MD"
+python3 "$renderer" "$LKML_MAILBOX_ROOT/render-fixture" -o "$fallback_html"
+rf="$(<"$fallback_html")"
+contains "a '# Summary ' with a trailing space is all Summary" "$rf" $'# Summary \nspaced header line.'
+# A # Details that precedes # Summary must not swallow the summary
+# header and body into the details fold.
+printf '%s\n' '# Details' 'detail line' '' '# Summary' 'THE HEADLINE' > "$RESULTS_MD"
+reversed_html="$work/results-reversed.html"
+python3 "$renderer" "$LKML_MAILBOX_ROOT/render-fixture" -o "$reversed_html"
+rr="$(<"$reversed_html")"
+contains "reversed headers: summary body keeps the headline" "$rr" '<div class="results-summary">THE HEADLINE</div>'
+contains "reversed headers: details body is only its own section" "$rr" '<pre class="results-details">detail line</pre>'
+case "$rr" in *'# Summary\nTHE HEADLINE</pre>'*) no "reversed headers: summary is not folded into details" ;; *) ok "reversed headers: summary is not folded into details" ;; esac
+# A results file planted as a symlink escaping the series dir is
+# refused the way the persona-brief and attachment readers refuse
+# theirs; a symlink that stays inside the series dir still renders.
+printf 'SYMLINK ESCAPE CANARY\n' > "$work/outside-results.md"
+rm "$RESULTS_MD"
+ln -s "$work/outside-results.md" "$RESULTS_MD"
+sym_html="$work/results-sym.html"
+python3 "$renderer" "$LKML_MAILBOX_ROOT/render-fixture" -o "$sym_html"
+sym_out="$(<"$sym_html")"
+case "$sym_out" in *'SYMLINK ESCAPE CANARY'*) no "escaping results symlink is refused" ;; *) ok "escaping results symlink is refused" ;; esac
+case "$sym_out" in *'class="results"'*) no "escaping results symlink renders no card" ;; *) ok "escaping results symlink renders no card" ;; esac
+ln -sf "$LKML_MAILBOX_ROOT/render-fixture/inside-results.md" "$RESULTS_MD"
+printf 'inside summary.\n' > "$LKML_MAILBOX_ROOT/render-fixture/inside-results.md"
+python3 "$renderer" "$LKML_MAILBOX_ROOT/render-fixture" -o "$sym_html"
+sym_out="$(<"$sym_html")"
+contains "a symlink inside the series dir still renders" "$sym_out" 'inside summary.'
+rm "$RESULTS_MD" "$LKML_MAILBOX_ROOT/render-fixture/inside-results.md"
+
 printf '\n== results card: one card per version, absent file = absent card ==\n'
 # A two-version series with a results file for v1 only: v1 gets its card,
 # v2 renders as it did without the feature.
@@ -850,8 +898,19 @@ i_first = next(i for i, ln in enumerate(lines) if ln.startswith('== #'))
 errors = []
 if not i_rev < i_res < i_first:
     errors.append("results block is not between the reviewers block and the thread")
-if not lines[i_res + 1].startswith('  v1:'):
-    errors.append("summary body line is not indented under the header")
+if lines[i_res + 1] != '  # Summary':
+    errors.append("summary label is not directly under the results header")
+if not lines[i_res + 2].startswith('  v1:'):
+    errors.append("summary body line is not indented under the label")
+try:
+    i_det = lines.index('  # Details', i_res)
+except ValueError:
+    errors.append("details label missing")
+else:
+    if not i_res < i_det < i_first:
+        errors.append("details label out of position")
+    elif not lines[i_det + 1].startswith('  Reviewed-by core'):
+        errors.append("details body is not indented under the label")
 if lines[i_first - 1] != '-' * 72 or lines[i_first - 2] != '':
     errors.append("thread does not start right after the results block")
 for e in errors:

@@ -405,29 +405,38 @@ def persona_brief_path(series_dir, persona):
 def read_results(series_dir, version):
     """The per-version results file <series>/results-v<N>.md split into
     ("# Summary" body, "# Details" body), or None when absent. The
-    filename is built from the integer version, so nothing in the
-    mailbox can steer the read outside the series dir. A companion
+    filename is built from the integer version, and the path is
+    realpath-contained in the series dir the way persona_brief_path and
+    the attachment reader contain theirs, so a file planted as a
+    symlink outside the mailbox cannot steer the read. A companion
     results-v<N>.json is ignored: the card renders the .md only."""
     path = os.path.join(series_dir, f"results-v{version}.md")
-    if not os.path.isfile(path):
-        return None
-    with open(path, encoding="utf-8", errors="replace") as f:
-        return split_results(f.read())
+    series_real = os.path.realpath(series_dir)
+    path_real = os.path.realpath(path)
+    if (os.path.commonpath((path_real, series_real)) == series_real
+            and os.path.isfile(path_real)):
+        with open(path_real, encoding="utf-8", errors="replace") as f:
+            return split_results(f.read())
+    return None
 
 
 def split_results(text):
     """Split a results file into ("# Summary" body, "# Details" body).
     The bodies are verbatim, stripped of nothing but trailing newlines;
     a missing section is empty, and a file with no recognized header is
-    all Summary."""
+    all Summary. Each body ends where the other section's header sits,
+    in either order, so a # Details that precedes # Summary cannot
+    swallow the summary header and body into the details."""
     lines = text.splitlines()
     s = next((i for i, ln in enumerate(lines) if ln == "# Summary"), None)
     d = next((i for i, ln in enumerate(lines) if ln == "# Details"), None)
     if s is None:
-        s = d if d is not None else len(lines)
+        s = d - 1 if d is not None else -1
     if d is None:
         d = len(lines)
-    return "\n".join(lines[s + 1:d]).rstrip("\n"), "\n".join(lines[d + 1:]).rstrip("\n")
+    end_s = d if d > s else len(lines)
+    end_d = s if s > d else len(lines)
+    return "\n".join(lines[s + 1:end_s]).rstrip("\n"), "\n".join(lines[d + 1:end_d]).rstrip("\n")
 
 
 def id_prefix_map(msgs):
@@ -678,16 +687,21 @@ def render_text_series(series_dir):
             render_text_reviewers(lines, name, series_dir, reviewer_entries)
             lines.append("")
         # The Results card's sections as a text block in the same
-        # position: bare 'results' header, then Summary and Details
-        # verbatim, every body line indented like a message body's (so a
-        # line in the file cannot forge the block's header). No links in
-        # text mode.
+        # position: bare 'results' header, then the two labeled sections
+        # ('  # Summary', '  # Details'), bodies verbatim, every line
+        # indented like a message body's (so a line in the file cannot
+        # forge the block's header or a section label; the labels are
+        # what keep 'end of summary' distinguishable from a blank line
+        # inside it once trailing spaces are trimmed). No links in text
+        # mode.
         res = read_results(series_dir, v)
         if res is not None:
             lines.append("results")
+            lines.append("  # Summary")
             lines.extend("  " + ln for ln in res[0].split("\n"))
             if res[1]:
                 lines.append("")
+                lines.append("  # Details")
                 lines.extend("  " + ln for ln in res[1].split("\n"))
             lines.append("")
         # Number the thread pre-order, matching the HTML nesting order.
