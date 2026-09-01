@@ -123,6 +123,26 @@ contains "reviewer rollup shows harness and model" "$html" 'test · fixture'
 contains "reviewer rollup counts messages" "$html" '<span>1 message</span>'
 contains "reviewer rollup counts Reviewed-by" "$html" '<span>1 Reviewed-by</span>'
 contains "reviewer count matches the reviewers box" "$html" '<span>3 reviewers</span>'
+# The header count, the matrix's reviewer columns and the box must
+# describe the same set: newcomer commented but never tagged, and still
+# gets a (dot) column rather than vanishing from the matrix.
+if [[ "$(grep -o '<th title=' "$stdout" | wc -l)" -eq 3 ]]; then ok "matrix has a column per listed reviewer, tag or no tag"; else no "matrix has a column per listed reviewer, tag or no tag"; fi
+contains "untagged reviewer's column is present" "$html" '<th title="test/fixture">newcomer</th>'
+if python3 - "$stdout" <<'PY'
+import re
+import sys
+
+html = open(sys.argv[1], encoding="utf-8").read()
+thead = re.search(r'<thead><tr><th scope="col">patch</th>(.*?)</tr></thead>', html).group(1)
+col_order = re.findall(r'<th title="[^"]*">([^<]+)</th>', thead)
+box_order = re.findall(r'<span class="slug mono">([^<]+)</span>', html)
+raise SystemExit("box order %s != column order %s" % (box_order, col_order) if box_order != col_order else 0)
+PY
+then
+    ok "box lists reviewers in matrix column order"
+else
+    no "box lists reviewers in matrix column order"
+fi
 case "$html" in *'<span class="slug mono">author</span>'*) no "author persona is excluded from reviewers" ;; *) ok "author persona is excluded from reviewers" ;; esac
 case "$html" in *'<pre class="persona-brief">'*) no "no persona brief when the file is absent" ;; *) ok "no persona brief when the file is absent" ;; esac
 

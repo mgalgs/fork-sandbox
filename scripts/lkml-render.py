@@ -297,8 +297,9 @@ def who_of(m):
 
 
 def reviewer_rollup(version_msgs, author, tally_rows):
-    """One entry per non-author persona, in first-seen order: display name,
-    harness, model, message count in this version, and how many patches
+    """One entry per non-author persona, sorted by persona slug (the same
+    order the matrix's columns are in): display name, harness, model,
+    message count in this version, and how many patches
     their LATEST tag is a Reviewed-by / NAK. The verdict counts reuse the
     tally's latest-tag-per-persona-per-patch supersession instead of
     counting every tag ever posted -- a NAK withdrawn by a later
@@ -329,6 +330,7 @@ def reviewer_rollup(version_msgs, author, tally_rows):
         if not r["name"]:
             r["name"] = r["persona"]
         r["rev"], r["nak"] = open_verdicts.get(r["persona"], (0, 0))
+    out.sort(key=lambda r: r["persona"])
     return out
 
 
@@ -426,8 +428,19 @@ def render_series(series_dir):
         v = cover["version"]
         version_roots = [r for r in roots if r["version"] == v]
         rows, personas = tally(cover)
-        pcols = sorted(personas)
-        thead = "".join(f"<th title=\"{esc(personas[p][0])}/{esc(personas[p][1])}\">{esc(p)}</th>" for p in pcols)
+        version_msgs = [m for root in version_roots for m in subtree(root)]
+        n_replies = sum(1 for m in version_msgs if m["depth"] >= 1 and not is_patch(m))
+        reviewer_entries = reviewer_rollup(version_msgs, cover["persona"], rows)
+        # One matrix column per reviewer the box lists -- including
+        # reviewers who commented without attaching a tag, whose column
+        # is all dots ("reviewed, no verdict yet"). That way the header
+        # count, the table's columns and the box describe the same set
+        # in the same (alphabetical) order, so all three read off against
+        # each other.
+        pcols = sorted(set(personas) | {r["persona"] for r in reviewer_entries})
+        entry_info = {r["persona"]: (r["harness"], r["model"]) for r in reviewer_entries}
+        col_info = {p: personas.get(p, entry_info.get(p, ("", ""))) for p in pcols}
+        thead = "".join(f"<th title=\"{esc(col_info[p][0])}/{esc(col_info[p][1])}\">{esc(p)}</th>" for p in pcols)
         trows = []
         for t, latest in rows:
             cells = []
@@ -446,15 +459,9 @@ def render_series(series_dir):
                            f'<a href="#m-{esc(t["id"])}">{esc(patch_label(t))}</a></th>')
             trows.append(f"<tr>{rowcell}{''.join(cells)}</tr>")
         n_patches = len(rows) - 1
-        version_msgs = [m for root in version_roots for m in subtree(root)]
-        n_replies = sum(1 for m in version_msgs if m["depth"] >= 1 and not is_patch(m))
         index = "".join(render_index(root) for root in version_roots)
         thread = "".join(render_message(root) for root in version_roots)
         n_messages = len(version_msgs)
-        # Count the same set the box below lists: every non-author persona
-        # that posted in this version, not just the ones that tagged a
-        # patch (the tally's set), so header and box never disagree.
-        reviewer_entries = reviewer_rollup(version_msgs, cover["persona"], rows)
         reviewers = "".join(render_reviewer(r, series_dir) for r in reviewer_entries)
         reviewers_block = ""
         if reviewer_entries:
