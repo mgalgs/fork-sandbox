@@ -199,5 +199,273 @@ if [[ -z "$checkout_branch" ]]; then
 fi
 
 echo "fork-sandbox lkml-summarize: summarizing $series v$version (low: $low_spec, high: $high_spec)" >&2
-echo "fork-sandbox lkml-summarize: launch pipeline not wired yet (see the next commit)." >&2
-exit 1
+
+# The tally section of the --text render for this version: the section
+# header line through the first 72-dash message separator -- the
+# counts, the latest-tag-per-reviewer-per-patch table and the reviewer
+# block. The synthesis tier gets THIS instead of the whole thread: the
+# extraction intermediate already carries the message-level detail.
+tally_text=""
+in_section=0
+while IFS= read -r ln; do
+    if (( in_section )) && [[ "$ln" =~ ^-{72}$ ]]; then
+        in_section=0
+        break
+    fi
+    [[ "$ln" == "$series v$version" ]] && in_section=1
+    (( in_section )) && tally_text+="$ln"$'\n'
+done <<< "$render_text"
+if [[ -z "$tally_text" ]]; then
+    echo "Error: the --text render has no section for '$series v$version'; the version ledger and the mailbox disagree." >&2
+    exit 1
+fi
+
+# The throwaway branches carry no commits (the tiers are forbidden to
+# make any), so each one is deleted as soon as its run returns -- the
+# branches fork-sandbox.sh's clone/fetch cycle leaves in the project
+# repo. A run that never finished has nothing fetched back and no
+# branch to delete; the warning then is informational, not fatal.
+delete_branch() {
+    local branch="$1"
+    if git -C "$project" branch -D "$branch" >/dev/null 2>&1; then
+        echo "fork-sandbox lkml-summarize: deleted throwaway branch $branch." >&2
+    else
+        echo "Warning: could not delete throwaway branch '$branch' from $project (the run may not have fetched it back); delete it by hand." >&2
+    fi
+}
+
+# launch_tier <tier> <spec> <handoff_file>: launches one tier on its
+# own throwaway branch at the series' tip, waits for its summary.json
+# (fork-sandbox.sh's own "the run, including its fetch, is fully over"
+# signal), and leaves the run dir in $tier_run_dir.
+launch_tier() {
+    local tier="$1" spec="$2" handoff_file="$3"
+    local branch task_meta launch_out rc run_dir waited
+    branch="lkml/${series}-v${version}-summarize-${tier}-$(date +%s)"
+    task_meta="$(jq -nc --arg series "$series" --arg tier "summarize-$tier" \
+        '{kind:"summarize", tags:["lkml", $series, $tier]}')"
+    echo "fork-sandbox lkml-summarize: launching $tier tier ($spec) on $branch..." >&2
+    launch_out="$(fork-sandbox.sh --harness "$spec" --checkout "$checkout_branch" \
+        --branch "$branch" --task-meta "$task_meta" "$project" "$handoff_file" 2>&1)"
+    rc=$?
+    run_dir="$(printf '%s\n' "$launch_out" | sed -n 's/^  run dir:  *//p' | head -n1)"
+    if (( rc != 0 )) || [[ -z "$run_dir" ]]; then
+        echo "Error: launching the $tier tier failed:" >&2
+        printf '%s\n' "$launch_out" >&2
+        delete_branch "$branch"
+        return 1
+    fi
+    echo "fork-sandbox lkml-summarize: $tier tier -> $run_dir" >&2
+    # The same cost ledger lkml-round.sh and lkml-revise.sh append to,
+    # so a series' summarize runs price into the same totals.
+    jq -nc --arg persona "summarize-$tier" --arg run_dir "$run_dir" --arg kind summarize \
+        '{persona:$persona, run_dir:$run_dir, kind:$kind}' >> "$series_dir/runs.jsonl"
+
+    echo "fork-sandbox lkml-summarize: waiting up to ${timeout}s for the $tier tier's run to finish..." >&2
+    waited=0
+    while [[ ! -f "$run_dir/summary.json" ]]; do
+        if (( waited >= timeout )); then
+            echo "Error: timed out after ${timeout}s waiting for the $tier tier's run to finish." >&2
+            delete_branch "$branch"
+            return 1
+        fi
+        sleep 10
+        waited=$(( waited + 10 ))
+    done
+    delete_branch "$branch"
+    tier_run_dir="$run_dir"
+    return 0
+}
+
+# The LOW tier's handoff: a persona-style brief, then the whole --text
+# render inline -- the sandbox cannot read the mailbox, the same reason
+# lkml-round.sh hands its secretary seat the thread.
+build_low_handoff() {
+    cat <<BRIEF
+You are the EXTRACTION tier of a two-tier summary of the lkml-mode
+review series $series, version $version.
+
+You are handed the whole thread below, as the mailbox's own --text
+render, inlined: this sandbox cannot read the mailbox. It covers every
+posted version; THIS summary is about the section headed
+"$series v$version" -- earlier versions are there as context for what
+changed.
+
+Read the whole thread, then write ONE file, \$OUTBOX_DIR/results.json,
+shaped like this:
+
+    {
+      "series": "$series",
+      "version": $version,
+      "cover": {
+        "verdicts": {
+          "<reviewer>": {
+            "latest": { "tags": ["Reviewed-by"], "id": "9d67f5e" },
+            "superseded": [ { "tags": ["NAK"], "id": "a1b2c3d" } ]
+          }
+        },
+        "duplicates": [ { "ids": ["9d67f5e", "a1b2c3d"], "note": "same point raised twice" } ]
+      },
+      "patches": [
+        {
+          "subject": "[PATCH v$version 1/2] ...",
+          "verdicts": { "...": "same shape as cover" },
+          "defects": [
+            { "severity": "high", "claim": "...", "file": "path", "line": 123,
+              "status": "confirmed", "id": "9d67f5e" }
+          ],
+          "responses": [
+            { "to": "9d67f5e", "stance": "accepted", "id": "b4c5d6e" }
+          ],
+          "open_questions": [
+            { "question": "...", "asked_by": "core", "id": "9d67f5e" }
+          ],
+          "duplicates": [ "...same shape as cover" ]
+        }
+      ]
+    }
+
+The shape is a contract: a synthesis tier and a later render step
+consume this JSON verbatim, so it must parse with jq and every field
+must mean exactly what its name says:
+
+- verdicts: per reviewer, the LATEST tag on this target is the current
+  verdict; the tags its earlier messages on the same target carried,
+  in thread order, go under superseded. Omit reviewers who never
+  tagged.
+- defects: every defect a reviewer claimed: severity (your read of its
+  weight: high/medium/low), the claim in one sentence, file and line
+  ONLY when the thread states them (omit otherwise), and status
+  "confirmed" (someone verified it in the clone or by running the
+  code) or "asserted" (claimed only, not verified).
+- responses: for each defect or question the author answered, the
+  stance "accepted" (fixed or conceded) or "pushed-back" (contested,
+  with or without the reviewer's concession). A claim nobody answered
+  gets stance "unanswered" and id null.
+- open_questions: questions still standing -- tagged Question or
+  simply never answered.
+- duplicates: the same defect or question raised in more than one
+  place (two reviewers, or one reviewer across versions).
+
+Every single item carries the 7-hex message id(s) it comes from -- the
+ids the render prints for each message. Record ONLY what the thread
+states: do not review the code and do not invent findings.
+
+Make NO commits and no other changes to the clone: writing
+\$OUTBOX_DIR/results.json is the whole job. In your final report, say
+how many patches you covered and how many defects you recorded.
+BRIEF
+    printf '\n## The thread (the mailbox --text render, all versions)\n\n'
+    printf '%s\n' "$render_text"
+}
+
+# The HIGH tier's handoff: a persona-style brief, then the extraction
+# intermediate verbatim and the tally section for this version.
+build_high_handoff() {
+    cat <<BRIEF
+You are the SYNTHESIS tier of a two-tier summary of the lkml-mode
+review series $series, version $version.
+
+You are handed (1) the structured intermediate the extraction tier
+pulled from the whole thread, verbatim, and (2) the thread's tally
+section for v$version. The intermediate was built from the entire
+--text render of the mailbox, and it should make a source-dive
+unnecessary: you MAY read this clone to chase a lead, but start from
+the intermediate, not from the code.
+
+Write ONE file, \$OUTBOX_DIR/results.md, EXACTLY this shape:
+
+    # Summary
+    <one or two short paragraphs>
+
+    # Details
+    <free-form subsections>
+
+The # Summary section is rendered as a collapsed card on the series
+page, roughly the pixel height of the Reviewers panel: at most about
+120 words, hard-capped at 200. One or two short paragraphs: the state
+of the series (how the tally stands), the defects that still matter,
+and what happens next. Nothing else.
+
+# Details is free-form subsections: a defect list with severity,
+status and its message-id citation, a per-patch disposition, and
+recommended next actions.
+
+Cite message ids as BARE 7-hex tokens, for example 9d67f5e -- no
+brackets, no anchors, no <id@lkml.local>: the renderer autolinks ids
+that exist in the mailbox, and anything fancier breaks the link.
+
+Make NO commits and no other changes to the clone: writing
+\$OUTBOX_DIR/results.md is the whole job. In your final report, say
+how many words the Summary section is.
+BRIEF
+    printf '\n## The extraction intermediate (results-v%s.json, verbatim)\n\n' "$version"
+    printf '%s\n' "$low_intermediate"
+    printf '\n## The tally for v%s (from the --text render)\n\n' "$version"
+    printf '%s\n' "$tally_text"
+}
+
+json_path="$series_dir/results-v${version}.json"
+md_path="$series_dir/results-v${version}.md"
+
+mkdir -p -- /var/tmp/claude-scratch
+low_handoff_file="$(mktemp /var/tmp/claude-scratch/lkml-summarize-low-XXXXXX.md)" || {
+    echo "Error: mktemp failed for the low tier's handoff file." >&2
+    exit 1
+}
+build_low_handoff > "$low_handoff_file"
+
+if ! launch_tier low "$low_spec" "$low_handoff_file"; then
+    rm -f -- "$low_handoff_file"
+    exit 1
+fi
+low_run_dir="$tier_run_dir"
+rm -f -- "$low_handoff_file"
+
+low_outbox_json="$low_run_dir/outbox/results.json"
+if [[ ! -f "$low_outbox_json" ]]; then
+    echo "Error: the low tier's run left no $low_outbox_json; there is no intermediate to synthesize." >&2
+    exit 1
+fi
+# Verbatim by contract: the synthesis tier gets exactly what the
+# extraction tier wrote, unmodified. A parse warning is enough to keep
+# the harvest moving -- the synthesis tier reads it as text either way.
+cp -f -- "$low_outbox_json" "$json_path"
+echo "fork-sandbox lkml-summarize: harvested $json_path" >&2
+if ! jq -e . "$json_path" >/dev/null 2>&1; then
+    echo "Warning: $json_path is not parseable JSON; the synthesis tier will get it verbatim anyway." >&2
+fi
+low_intermediate="$(cat -- "$json_path")"
+
+high_handoff_file="$(mktemp /var/tmp/claude-scratch/lkml-summarize-high-XXXXXX.md)" || {
+    echo "Error: mktemp failed for the high tier's handoff file." >&2
+    exit 1
+}
+build_high_handoff > "$high_handoff_file"
+
+if ! launch_tier high "$high_spec" "$high_handoff_file"; then
+    rm -f -- "$high_handoff_file"
+    exit 1
+fi
+high_run_dir="$tier_run_dir"
+rm -f -- "$high_handoff_file"
+
+high_outbox_md="$high_run_dir/outbox/results.md"
+if [[ ! -f "$high_outbox_md" ]]; then
+    echo "Error: the high tier's run left no $high_outbox_md." >&2
+    exit 1
+fi
+cp -f -- "$high_outbox_md" "$md_path"
+echo "fork-sandbox lkml-summarize: harvested $md_path" >&2
+
+# The format is a contract -- the collapsed card renders this section
+# at roughly the Reviewers panel's pixel height, so an over-long
+# Summary is worth a warning even though the file is written anyway.
+summary_words="$(awk '/^# Summary/ { f = 1; next } f && /^# / { exit } f' "$md_path" | wc -w | tr -d '[:space:]')"
+if [[ -n "$summary_words" && "$summary_words" -gt 200 ]]; then
+    echo "Warning: the Summary section of $md_path is $summary_words words; the collapsed-card cap is ~200 (aim for ~120)." >&2
+fi
+
+# The written paths are the whole stdout of this script; everything
+# else went to stderr.
+printf '%s\n' "$json_path" "$md_path"
