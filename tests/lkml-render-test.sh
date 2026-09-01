@@ -122,6 +122,7 @@ contains "reviewer summary carries display name and persona slug" "$html" '<span
 contains "reviewer rollup shows harness and model" "$html" 'test · fixture'
 contains "reviewer rollup counts messages" "$html" '<span>1 message</span>'
 contains "reviewer rollup counts Reviewed-by" "$html" '<span>1 Reviewed-by</span>'
+contains "reviewer count matches the reviewers box" "$html" '<span>3 reviewers</span>'
 case "$html" in *'<span class="slug mono">author</span>'*) no "author persona is excluded from reviewers" ;; *) ok "author persona is excluded from reviewers" ;; esac
 case "$html" in *'<pre class="persona-brief">'*) no "no persona brief when the file is absent" ;; *) ok "no persona brief when the file is absent" ;; esac
 
@@ -157,6 +158,17 @@ chtml="$(<"$contain_html")"
 case "$chtml" in *'TRAVERSAL LEAK CANARY'*) no "traversal persona does not leak a brief" ;; *) ok "traversal persona does not leak a brief" ;; esac
 case "$chtml" in *'ABSOLUTE LEAK CANARY'*) no "absolute-path persona does not leak a brief" ;; *) ok "absolute-path persona does not leak a brief" ;; esac
 contains "legit brief still inlined alongside" "$chtml" '<pre class="persona-brief">Core reviewer brief.'
+
+printf '\n== reviewers box is omitted when empty ==\n'
+# A freshly init-ed series (no replies yet) must not render an empty
+# labelled box.
+"$mailbox" init render-empty --cover "$work/cover.txt" --patches "$work/patches" \
+    --from author --harness test --model fixture >/dev/null 2>/dev/null
+empty_html="$work/empty.html"
+python3 "$renderer" "$LKML_MAILBOX_ROOT/render-empty" -o "$empty_html"
+ehtml="$(<"$empty_html")"
+case "$ehtml" in *'<div class="reviewers"'*) no "no reviewers box on a fresh series" ;; *) ok "no reviewers box on a fresh series" ;; esac
+contains "fresh series still reports zero reviewers" "$ehtml" '<span>0 reviewers</span>'
 
 printf '%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))

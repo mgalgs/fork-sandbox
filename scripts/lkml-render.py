@@ -443,14 +443,22 @@ def render_series(series_dir):
         index = "".join(render_index(root) for root in version_roots)
         thread = "".join(render_message(root) for root in version_roots)
         n_messages = len(version_msgs)
-        reviewers = "".join(render_reviewer(r, series_dir)
-                            for r in reviewer_rollup(version_msgs, cover["persona"]))
+        # Count the same set the box below lists: every non-author persona
+        # that posted in this version, not just the ones that tagged a
+        # patch (the tally's set), so header and box never disagree.
+        reviewer_entries = reviewer_rollup(version_msgs, cover["persona"])
+        reviewers = "".join(render_reviewer(r, series_dir) for r in reviewer_entries)
+        reviewers_block = ""
+        if reviewer_entries:
+            reviewers_block = (f'  <div class="reviewers">\n'
+                               f'    <p class="eyebrow">reviewers</p>\n'
+                               f'    {reviewers}\n  </div>')
         sections.append(f"""
 <section class="series" id="{esc(name)}-v{v}">
   <div class="series-head">
     <p class="eyebrow">series</p>
     <h2>{esc(name)} <span class="v">v{v}</span></h2>
-    <p class="counts"><span>{n_patches} patches</span><span>{n_replies} replies</span><span>{len(pcols)} reviewers</span></p>
+    <p class="counts"><span>{n_patches} patches</span><span>{n_replies} replies</span><span>{len(reviewer_entries)} reviewers</span></p>
   </div>
   <div class="tally-wrap">
     <table class="tally">
@@ -459,10 +467,7 @@ def render_series(series_dir):
       <tbody>{''.join(trows)}</tbody>
     </table>
   </div>
-  <div class="reviewers">
-    <p class="eyebrow">reviewers</p>
-    {reviewers}
-  </div>
+  {reviewers_block}
   <details class="index-fold" open>
     <summary>thread index — {n_messages} messages</summary>
     <div class="index-wrap"><ol class="tidx">{index}</ol></div>
