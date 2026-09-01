@@ -27,7 +27,20 @@
 #                   regardless of this -- see REVIEW_MODEL below.
 #   MODEL           the model id the coding leg's harness should use: an
 #                   OpenRouter id for pi, a Claude Code model name for
-#                   claude. Required.
+#                   claude. Required on a legacy K8S_PROXY_UPSTREAM
+#                   install. On a K8S_PROXY_ENDPOINTS install submit may
+#                   omit it, in which case discover_model_facts below
+#                   resolves it from the proxy's /v1/models: exactly one
+#                   model in the listing is used (and said so), zero or
+#                   several is an error. When submit DID give one and the
+#                   listing does not contain it, that is a warning, not
+#                   an error -- the listing may be stale.
+#                   The same discovery reads the context window
+#                   (max_model_len for the chosen model; a missing value
+#                   falls back to 32768, a deliberately low guess, with a
+#                   warning) and MAX_TOKENS (agent-sandboxed's rule: a
+#                   32768 floor, capped at a quarter of the window). Both
+#                   feed synthesize_pi_config below.
 #   PROXY_BASE_URL  the pi model proxy's base URL, e.g.
 #                   http://fork-sandbox-proxy.NS.svc.cluster.local:8080/api/v1
 #                   Required regardless of HARNESS -- the review loop
@@ -119,7 +132,7 @@ case "$HARNESS" in
         exit 1
         ;;
 esac
-: "${MODEL:?MODEL must be set to a model id}"
+: "${MODEL:=}"
 : "${PROXY_BASE_URL:?PROXY_BASE_URL must be set to the pi model proxy base URL}"
 if [[ "$HARNESS" == claude ]]; then
     : "${CLAUDE_PROXY_BASE_URL:?CLAUDE_PROXY_BASE_URL must be set when HARNESS=claude}"
@@ -143,6 +156,79 @@ elif [[ "$REVIEW_LOOP_CAP" != "0" ]]; then
     echo "Error: REVIEW_LOOP_CAP must be a non-negative integer, got '$REVIEW_LOOP_CAP'." >&2
     exit 1
 fi
+
+# Model discovery against the proxy, run once, early, BEFORE the
+# repository-receive wait below: a dead endpoint must fail in seconds with
+# a clear message, not after the whole submit dance. It doubles as the
+# health check docs/kubernetes-runs.md's "direct" section records as a
+# requirement -- satisfied here for the proxy path, where the endpoint is
+# reachable only through the proxy's /e/<name>/v1/models location. curl
+# and jq are both in the image (the review loop already uses curl); the
+# function is self-contained so the test suite can exercise it by
+# stubbing curl on PATH. Sets MODEL (when unset), CTX and MAX_TOKENS,
+# which synthesize_pi_config below reads.
+discover_model_facts() {
+    local url="$PROXY_BASE_URL/models" body probe_ids count
+    if ! body="$(curl -sS --max-time 20 "$url" 2>&1)"; then
+        echo "Error: model discovery failed -- $url did not answer:" >&2
+        echo "  $body" >&2
+        echo "A connection refusal here is an expected, ordinary state, not" >&2
+        echo "a bug to chase: the endpoint is often a workstation-class" >&2
+        echo "host, and this simply means it is not running right now." >&2
+        echo "Start the endpoint and resubmit the run." >&2
+        exit 1
+    fi
+    if ! probe_ids="$(jq -r '.data[].id' <<<"$body" 2>/dev/null)" || [[ -z "$probe_ids" ]]; then
+        echo "Error: model discovery failed -- $url did not answer with a" >&2
+        echo "model list. It answered:" >&2
+        printf '%s\n' "${body:0:400}" >&2
+        exit 1
+    fi
+    if [[ -z "$MODEL" ]]; then
+        count="$(printf '%s\n' "$probe_ids" | wc -l)"
+        if (( count > 1 )); then
+            echo "Error: the endpoint serves more than one model, so one" >&2
+            echo "has to be named. Resubmit with --model. It offers:" >&2
+            printf '%s\n' "$probe_ids" | sed 's/^/  /' >&2
+            exit 1
+        fi
+        MODEL="$probe_ids"
+        echo "fork-sandbox-k8s-entrypoint: no --model given; the endpoint" >&2
+        echo "serves exactly one model, so using $MODEL." >&2
+    elif ! printf '%s\n' "$probe_ids" | grep -qxF "$MODEL"; then
+        # The listing may be stale -- the model behind an endpoint is free
+        # to change -- and refusing here would strand a legitimate run.
+        echo "Warning: $url does not list a model called '$MODEL'." >&2
+        echo "Continuing anyway; the endpoint may serve more than it" >&2
+        echo "advertises." >&2
+    fi
+
+    # The context window, from the endpoint when it says so: too large and
+    # the agent packs a request the server rejects, with the failure
+    # arriving mid-run -- agent-sandboxed's rationale, applied verbatim.
+    # The /props fallback agent-sandboxed tries for llama.cpp is
+    # deliberately NOT probed here: the proxy forwards only the two paths
+    # /chat/completions and /models, so /props would 403.
+    CTX="$(jq -r --arg m "$MODEL" \
+        'first(.data[] | select(.id == $m) | .max_model_len // empty) // empty' \
+        <<<"$body" 2>/dev/null || true)"
+    if [[ ! "$CTX" =~ ^[0-9]+$ ]]; then
+        # Guess low: too small wastes context, while too large means a
+        # rejection that arrives mid-run with the work half done.
+        CTX=32768
+        echo "Warning: $url does not report a context length for '$MODEL'," >&2
+        echo "so this run assumes $CTX tokens, a deliberately low guess." >&2
+    fi
+    # MAX_TOKENS from CTX, the same rule agent-sandboxed applies: a 32768
+    # floor, capped at a quarter of the window.
+    MAX_TOKENS=32768
+    if (( CTX / 4 < MAX_TOKENS )); then
+        MAX_TOKENS=$(( CTX / 4 ))
+    fi
+    echo "fork-sandbox-k8s-entrypoint: model $MODEL at $PROXY_BASE_URL" >&2
+    echo "(${CTX} token context, $MAX_TOKENS token reply room)" >&2
+}
+discover_model_facts
 
 mounts_dir=/mnt/fork-sandbox
 work_dir=/work
@@ -223,6 +309,10 @@ git config tag.gpgsign false
 # here, because network policy rather than a unix socket is what seals
 # this pod. apiKey is a placeholder; the proxy replaces the header on the
 # way past, so this value is never sent anywhere that checks it.
+# contextWindow/maxTokens are the values discover_model_facts established
+# from the endpoint's own /v1/models (or its documented fallbacks), so
+# both ids -- the coding leg's and REVIEW_MODEL's -- get the same
+# discovered context window.
 synthesize_pi_config() {
     local model="$1"
     local extra_model="${2:-}"
@@ -232,7 +322,8 @@ synthesize_pi_config() {
         cp "$mounts_dir/pi-agent-settings.json" "$HOME/.pi/agent/settings.json"
     fi
 
-    jq -n --arg base "$PROXY_BASE_URL" --arg model "$model" --arg extra "$extra_model" '
+    jq -n --arg base "$PROXY_BASE_URL" --arg model "$model" --arg extra "$extra_model" \
+        --argjson ctx "$CTX" --argjson maxtok "$MAX_TOKENS" '
         {
             providers: {
                 proxy: {
@@ -244,8 +335,8 @@ synthesize_pi_config() {
                         name: (. + " (proxy)"),
                         reasoning: true,
                         input: ["text"],
-                        contextWindow: 131072,
-                        maxTokens: 32768,
+                        contextWindow: $ctx,
+                        maxTokens: $maxtok,
                         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
                     })),
                 },
