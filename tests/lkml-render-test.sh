@@ -100,6 +100,8 @@ contains "patch diffstat is shown in HTML" "$html" 'class="stat"'
 contains "patch diff is folded in HTML" "$html" 'class="fold"'
 contains "patch commit message survives header strip in HTML" "$html" 'Commit message for patch one.'
 if [[ "$(grep -o '<li style=' "$stdout" | wc -l)" -eq 6 ]]; then ok "thread index has one line per message"; else no "thread index has one line per message"; fi
+contains "thread index patch line carries the prefixed subject" "$html" 'class="ix-subj">[PATCH v1 1/2] demo: add one</span>'
+case "$html" in *'class="ix-subj">demo: add one</span>'*|*'class="ix-subj">demo: add two</span>'*) no "thread index no longer demotes the prefix to nothing" ;; *) ok "thread index no longer demotes the prefix to nothing" ;; esac
 contains "Tested-by has its own chip class" "$html" 'class="tag t-test"'
 case "$html" in *'Tested-by</span>'*'t-q'*) no "Tested-by does not fall through to question" ;; *) ok "Tested-by does not fall through to question" ;; esac
 contains "orphaned reply is rendered" "$html" 'orphan body'

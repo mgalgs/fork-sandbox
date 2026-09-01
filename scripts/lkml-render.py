@@ -282,10 +282,6 @@ def tally(cover):
     return rows, personas
 
 
-def short_subject(s):
-    return re.sub(r"^\[PATCH v\d+ \d+/\d+\]\s*", "", s)
-
-
 def patch_label(m):
     """The patch subject in canonical lore style: '[PATCH vN i/M] subject'.
     N comes from the subject's own prefix; a series posted as bare
@@ -592,7 +588,9 @@ def render_index(m, depth=0):
     """The thread as an indented list of one-liners, lore-style: every
     message in reply order, click to jump."""
     glyphs = "".join(f"<span class=\"g {TAG_CLASS.get(t,'t-q')}\" title=\"{esc(t)}\">{TAG_GLYPH.get(t,'·')}</span>" for t in m["tags"])
-    subj = short_subject(m["subject"]) if is_patch(m) else m["subject"]
+    # Like the tally rows, a patch row carries the full lore-style
+    # subject (numbering as prefix), lore's index-style.
+    subj = patch_label(m) if is_patch(m) else m["subject"]
     if depth > 1 and subj.startswith("Re: "):
         subj = "Re: …" if len(subj) > 70 else subj
     label = "cover" if depth == 0 else ""
