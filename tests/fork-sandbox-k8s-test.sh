@@ -118,8 +118,16 @@
 #     volumeMount on the Deployment, includes no upstream-key.conf, and
 #     injects no Authorization header; its rendered nginx.conf passes
 #     `nginx -t`, the same check the legacy render gets above; submit
-#     refuses outright against a K8S_PROXY_ENDPOINTS namespace, since it
-#     has no /api/v1 wiring to a named endpoint yet; K8S_PROXY_ALLOW
+#     --endpoint NAME renders a Job whose PROXY_BASE_URL is the
+#     endpoint's /e/NAME/v1 location, an unregistered name and an omitted
+#     --endpoint against a multi-endpoint install are both errors listing
+#     the registered names, an omitted --endpoint against a single-
+#     endpoint install resolves to it (and says so on stderr), and
+#     --endpoint against a legacy K8S_PROXY_UPSTREAM install is refused;
+#     --model is optional on an endpoints install (submit accepts it and
+#     renders an empty MODEL env) but stays required on a legacy install,
+#     and --harness claude keeps the requirement even on an endpoints
+#     install; K8S_PROXY_ALLOW
 #     replaces the default RFC1918-except egress block with exactly the
 #     given <cidr>:<port> entries, and a hostname there is refused with a
 #     message naming why (NetworkPolicy has no hostname field); a partial
@@ -133,6 +141,17 @@
 #     private; a duplicate name, a non-RFC1123 name, and an empty base URL
 #     in K8S_PROXY_ENDPOINTS are each refused, as is a K8S_PROXY_ALLOW
 #     port outside 1-65535.
+#   - fork-sandbox-k8s-entrypoint.sh's pod-side model discovery
+#     (discover_model_facts), driven with curl stubbed on PATH: a
+#     single-model /v1/models response resolves MODEL and sets CTX /
+#     MAX_TOKENS from max_model_len (agent-sandboxed's rules: a 32768
+#     MAX_TOKENS floor capped at a quarter of the window); a multi-model
+#     response with no MODEL is an error listing the ids; a curl failure
+#     (the ordinary connection-refused state) errors naming the URL; a
+#     missing max_model_len warns and falls back to 32768; a MODEL absent
+#     from the listing warns and continues; and discovery runs in the
+#     script BEFORE the repository-receive wait, with no hardcoded
+#     contextWindow/maxTokens left in synthesize_pi_config's render.
 #
 # This lives in tests/ rather than scripts/tests/ on purpose: install.sh
 # iterates scripts/* and runs `sed -n 2p` on each entry to build the
@@ -632,14 +651,158 @@ else
     no "K8S_PROXY_ENDPOINTS install --dry-run exits 0" "$(cat /tmp/fs-k8s-test-endpoints-install.err)"
 fi
 
-# submit only ever wires a run to the shared proxy's legacy /api/v1 path
-# (see cmd_submit's proxy_base_url) -- a K8S_PROXY_ENDPOINTS install
-# renders no such path, so submit must refuse rather than let a run get a
-# silent 403 on its first model call and burn its whole timeout.
-refuses "submit refuses a K8S_PROXY_ENDPOINTS namespace (no /api/v1 wiring yet)" \
-    "K8S_PROXY_ENDPOINTS" \
+# submit --endpoint wires the run to the named endpoint's /e/<name>/v1
+# location instead of the legacy /api/v1 path -- the wiring the old
+# "submit refuses endpoints installs" refusal stood in for, now proven
+# by rendering.
+ep_submit_out="$(newdir)/ep-submit.yaml"; tmpdirs+=("$(dirname "$ep_submit_out")")
+if FORK_SANDBOX_CONFIG_DIR="$endpoints_config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model moonshotai/kimi-k3 --endpoint secondary \
+    "$proj_dir" "$handoff_file" > "$ep_submit_out" 2>/tmp/fs-k8s-test-ep-submit.err; then
+    ok "submit --dry-run --endpoint against a K8S_PROXY_ENDPOINTS namespace exits 0"
+else
+    no "submit --dry-run --endpoint against a K8S_PROXY_ENDPOINTS namespace exits 0" \
+        "$(cat /tmp/fs-k8s-test-ep-submit.err)"
+fi
+if grep -qF 'value: "http://fork-sandbox-proxy.fork-sandbox-test.svc.cluster.local:8080/e/secondary/v1"' "$ep_submit_out" \
+    && ! grep -qF 'value: "http://fork-sandbox-proxy.fork-sandbox-test.svc.cluster.local:8080/api/v1"' "$ep_submit_out"; then
+    ok "submit --endpoint renders PROXY_BASE_URL at the endpoint's /e/<name>/v1"
+else
+    no "submit --endpoint renders PROXY_BASE_URL at the endpoint's /e/<name>/v1" \
+        "$(grep -A1 'name: PROXY_BASE_URL' "$ep_submit_out")"
+fi
+
+# An unregistered name is an error listing the registered ones.
+refuses "submit --endpoint with an unregistered name errors listing the registered ones" \
+    "--endpoint 'bogus' is not registered" \
+    env FORK_SANDBOX_CONFIG_DIR="$endpoints_config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model moonshotai/kimi-k3 --endpoint bogus \
+    "$proj_dir" "$handoff_file"
+unreg_out="$(FORK_SANDBOX_CONFIG_DIR="$endpoints_config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model moonshotai/kimi-k3 --endpoint bogus \
+    "$proj_dir" "$handoff_file" 2>&1 >/dev/null || true)"
+if [[ "$unreg_out" == *primary* && "$unreg_out" == *secondary* ]]; then
+    ok "the unregistered --endpoint error lists the registered names"
+else
+    no "the unregistered --endpoint error lists the registered names" "$unreg_out"
+fi
+
+# An omitted --endpoint against a multi-endpoint install is an error
+# listing the names (the one-candidate rule, mirrored from
+# agent-sandboxed's model resolution).
+refuses "submit with no --endpoint against a multi-endpoint install errors" \
+    "more than one endpoint" \
     env FORK_SANDBOX_CONFIG_DIR="$endpoints_config_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-branch --model moonshotai/kimi-k3 "$proj_dir" "$handoff_file"
+multi_out="$(FORK_SANDBOX_CONFIG_DIR="$endpoints_config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model moonshotai/kimi-k3 \
+    "$proj_dir" "$handoff_file" 2>&1 >/dev/null || true)"
+if [[ "$multi_out" == *primary* && "$multi_out" == *secondary* ]]; then
+    ok "the multi-endpoint no-\`--endpoint\` error lists the registered names"
+else
+    no "the multi-endpoint no-\`--endpoint\` error lists the registered names" "$multi_out"
+fi
+
+# ...and against a single-endpoint install it resolves to the one
+# endpoint, says so on stderr, and renders that endpoint's location.
+single_ep_config_dir="$(newdir)"; tmpdirs+=("$single_ep_config_dir")
+cat > "$single_ep_config_dir/k8s.env" <<'CONF'
+K8S_CONTEXT=test-context
+K8S_NAMESPACE=fork-sandbox-test
+K8S_IMAGE=registry.example/you/fork-sandbox:latest
+K8S_PROXY_ENDPOINTS=primary=http://10.0.0.5:8001/v1
+K8S_DENIED_PROBE=10.0.0.1:443
+CONF
+single_ep_submit_out="$(newdir)/single-ep-submit.yaml"; tmpdirs+=("$(dirname "$single_ep_submit_out")")
+single_ep_submit_err="$(newdir)/single-ep-submit.err"; tmpdirs+=("$(dirname "$single_ep_submit_err")")
+if FORK_SANDBOX_CONFIG_DIR="$single_ep_config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model moonshotai/kimi-k3 \
+    "$proj_dir" "$handoff_file" > "$single_ep_submit_out" 2>"$single_ep_submit_err"; then
+    ok "submit with no --endpoint against a single-endpoint install exits 0"
+else
+    no "submit with no --endpoint against a single-endpoint install exits 0" \
+        "$(cat "$single_ep_submit_err")"
+fi
+if grep -q 'using the single' "$single_ep_submit_err" \
+    && grep -q "'primary'" "$single_ep_submit_err"; then
+    ok "the single-endpoint resolution announces itself on stderr"
+else
+    no "the single-endpoint resolution announces itself on stderr" \
+        "$(cat "$single_ep_submit_err")"
+fi
+if grep -qF 'value: "http://fork-sandbox-proxy.fork-sandbox-test.svc.cluster.local:8080/e/primary/v1"' "$single_ep_submit_out"; then
+    ok "the single-endpoint resolution renders that endpoint's /e/<name>/v1"
+else
+    no "the single-endpoint resolution renders that endpoint's /e/<name>/v1" \
+        "$(grep -A1 'name: PROXY_BASE_URL' "$single_ep_submit_out")"
+fi
+
+# --model is optional on an endpoints install: accepted, and the rendered
+# Job carries an empty MODEL env (the pod will discover it).
+no_model_submit_out="$(newdir)/no-model-submit.yaml"; tmpdirs+=("$(dirname "$no_model_submit_out")")
+no_model_err="$(FORK_SANDBOX_CONFIG_DIR="$single_ep_config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch "$proj_dir" "$handoff_file" 2>&1 >/dev/null || true)"
+if FORK_SANDBOX_CONFIG_DIR="$single_ep_config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch "$proj_dir" "$handoff_file" \
+    > "$no_model_submit_out" 2>/dev/null; then
+    ok "submit without --model on an endpoints install is accepted"
+else
+    no "submit without --model on an endpoints install is accepted" "$no_model_err"
+fi
+model_env="$(grep -A1 'name: MODEL' "$no_model_submit_out" | tail -n1)"
+check "the no-\`--model\` endpoints render carries an empty MODEL env" \
+    '              value: ""' "$model_env"
+# ...but stays required on a legacy install, with the same error text.
+refuses "submit without --model on a legacy install is still refused" \
+    "submit requires --model. There is no default:" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch "$proj_dir" "$handoff_file"
+# ...and --harness claude keeps the requirement even on an endpoints
+# install: discovery lists the pi endpoint's model ids, never a Claude
+# Code model name.
+refuses "submit --harness claude without --model on an endpoints install is refused" \
+    "not Claude Code model" \
+    env FORK_SANDBOX_CONFIG_DIR="$single_ep_config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --harness claude "$proj_dir" "$handoff_file"
+
+# --endpoint against a legacy K8S_PROXY_UPSTREAM install is an error.
+refuses "submit --endpoint against a legacy K8S_PROXY_UPSTREAM install errors" \
+    "K8S_PROXY_UPSTREAM; there are no named" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model moonshotai/kimi-k3 --endpoint primary \
+    "$proj_dir" "$handoff_file"
+# And the legacy render keeps the /api/v1 literal, untouched by all of
+# the above (already asserted by the byte-identical fixture render and
+# the submit_out checks above; named here so the pair reads together).
+if grep -qF 'value: "http://fork-sandbox-proxy.fork-sandbox-test.svc.cluster.local:8080/api/v1"' "$submit_out"; then
+    ok "a legacy install's rendered PROXY_BASE_URL is still the /api/v1 literal"
+else
+    no "a legacy install's rendered PROXY_BASE_URL is still the /api/v1 literal" \
+        "$(grep -A1 'name: PROXY_BASE_URL' "$submit_out")"
+fi
+
+# run forwards --endpoint (and the omitted --model) to submit rather than
+# growing its own copy of either: the same arguments must render
+# byte-for-byte the same YAML as the direct submit call.
+ep_run_out="$(newdir)/ep-run.yaml"; tmpdirs+=("$(dirname "$ep_run_out")")
+ep_run_err="$(newdir)/ep-run.err"; tmpdirs+=("$(dirname "$ep_run_err")")
+ep_run_submit_out="$(newdir)/ep-run-submit.yaml"; tmpdirs+=("$(dirname "$ep_run_submit_out")")
+if FORK_SANDBOX_CONFIG_DIR="$single_ep_config_dir" "$k8s_sh" run --dry-run \
+    --branch fs-k8s-test-branch --endpoint primary \
+    "$proj_dir" "$handoff_file" > "$ep_run_out" 2>"$ep_run_err" \
+    && FORK_SANDBOX_CONFIG_DIR="$single_ep_config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --endpoint primary \
+    "$proj_dir" "$handoff_file" > "$ep_run_submit_out" 2>/dev/null; then
+    ok "run --dry-run --endpoint (no --model) exits 0"
+else
+    no "run --dry-run --endpoint (no --model) exits 0" "$(cat "$ep_run_err")"
+fi
+if diff -q "$ep_run_out" "$ep_run_submit_out" >/dev/null 2>&1; then
+    ok "run --dry-run --endpoint renders byte-for-byte the same YAML as submit"
+else
+    no "run --dry-run --endpoint renders byte-for-byte the same YAML as submit" \
+        "$(diff "$ep_run_out" "$ep_run_submit_out" 2>&1 | head -n 20)"
+fi
 if command -v yamllint >/dev/null 2>&1; then
     out="$(yamllint "$endpoints_out" 2>&1)"
     if [[ -z "$out" ]]; then
@@ -3352,6 +3515,167 @@ if grep -qF '| unique | map({' "$entrypoint_sh"; then
 else
     no "synthesize_pi_config's models.json dedupes MODEL/REVIEW_MODEL with jq unique" \
         "missing a '| unique | map({' models array in $entrypoint_sh"
+fi
+
+printf '\n== entrypoint: pod-side model discovery (curl stubbed) ==\n'
+# discover_model_facts, the real function extracted from the entrypoint's
+# own source and run in a subshell with a stubbed curl on PATH -- the
+# same PATH-stubbing the suite already uses for kubectl. The subshell is
+# what makes the function's own `exit 1` safe (it kills only the
+# subshell), and on success the subshell prints the values the function
+# established for the rest of the script to consume.
+discover_fn="$(sed -n '/^discover_model_facts() {/,/^}/p' "$entrypoint_sh")"
+discover_fn_file="$(newdir)/discover.sh"; tmpdirs+=("$(dirname "$discover_fn_file")")
+if [[ -n "$discover_fn" ]]; then
+    printf '%s\n' "$discover_fn" > "$discover_fn_file"
+    ok "discover_model_facts is a standalone function in the entrypoint"
+else
+    no "discover_model_facts is a standalone function in the entrypoint" \
+        "function not found in $entrypoint_sh"
+fi
+
+# Runs the extracted function in a subshell: $1 is the stub curl's stdout
+# (or "FAIL" for a connection-refused stub), $2 the MODEL value (or "")
+# it is handed. Captures combined output and the subshell's exit status in
+# $discover_out / $discover_rc.
+discover_run() {
+    local stub_dir
+    stub_dir="$(newdir)"; tmpdirs+=("$stub_dir")
+    if [[ "$1" == FAIL ]]; then
+        printf '%s\n' '#!/usr/bin/env bash' \
+            'echo "curl: (7) Failed to connect to 10.0.0.5 port 8001: Connection refused" >&2' \
+            'exit 7' > "$stub_dir/curl"
+    else
+        printf '%s\n' '#!/usr/bin/env bash' 'cat <<JSON' "$1" 'JSON' > "$stub_dir/curl"
+    fi
+    chmod +x "$stub_dir/curl"
+    discover_out="$(PATH="$stub_dir:$PATH" MODEL="$2" \
+        PROXY_BASE_URL="http://fork-sandbox-proxy.fork-sandbox-test.svc.cluster.local:8080/e/primary/v1" \
+        bash -c 'source "$1"; discover_model_facts; \
+            printf "MODEL=%s CTX=%s MAX_TOKENS=%s\n" "$MODEL" "$CTX" "$MAX_TOKENS"' \
+        _ "$discover_fn_file" 2>&1)"
+    discover_rc=$?
+}
+
+# A single-model response resolves MODEL and takes the context window
+# from max_model_len; MAX_TOKENS is agent-sandboxed's rule -- a 32768
+# floor, capped at a quarter of the window (24576/4 = 6144).
+discover_run '{"data":[{"id":"qwen3-8b","max_model_len":24576}]}' ""
+if (( discover_rc == 0 )) && [[ "$discover_out" == *"MODEL=qwen3-8b CTX=24576 MAX_TOKENS=6144"* ]]; then
+    ok "discovery: single-model response resolves MODEL and CTX from max_model_len"
+else
+    no "discovery: single-model response resolves MODEL and CTX from max_model_len" \
+        "rc=$discover_rc: $discover_out"
+fi
+if [[ "$discover_out" == *"serves exactly one model"* ]]; then
+    ok "discovery: the resolved single model is announced on stderr"
+else
+    no "discovery: the resolved single model is announced on stderr" "$discover_out"
+fi
+
+# A large window keeps the 32768 MAX_TOKENS floor (131072/4 = 32768,
+# not below the floor, so it stays).
+discover_run '{"data":[{"id":"big","max_model_len":131072}]}' ""
+if [[ "$discover_out" == *"CTX=131072 MAX_TOKENS=32768"* ]]; then
+    ok "discovery: MAX_TOKENS keeps the 32768 floor when the window is large"
+else
+    no "discovery: MAX_TOKENS keeps the 32768 floor when the window is large" \
+        "rc=$discover_rc: $discover_out"
+fi
+
+# A missing max_model_len warns and falls back to the low 32768 guess.
+discover_run '{"data":[{"id":"solo"}]}' ""
+if (( discover_rc == 0 )) && [[ "$discover_out" == *"assumes 32768"* \
+        && "$discover_out" == *"MODEL=solo CTX=32768 MAX_TOKENS=8192"* ]]; then
+    ok "discovery: missing max_model_len warns and falls back to 32768"
+else
+    no "discovery: missing max_model_len warns and falls back to 32768" \
+        "rc=$discover_rc: $discover_out"
+fi
+
+# Several models, no MODEL: an error naming the situation and listing
+# what was found.
+discover_run '{"data":[{"id":"a-model"},{"id":"b-model"}]}' ""
+if (( discover_rc != 0 )) && [[ "$discover_out" == *"more than one model"* \
+        && "$discover_out" == *a-model* && "$discover_out" == *b-model* ]]; then
+    ok "discovery: multi-model response without MODEL errors listing the ids"
+else
+    no "discovery: multi-model response without MODEL errors listing the ids" \
+        "rc=$discover_rc: $discover_out"
+fi
+
+# ...but a MODEL that IS in the listing goes through, unchanged.
+discover_run '{"data":[{"id":"a-model","max_model_len":8192},{"id":"b-model"}]}' "a-model"
+if (( discover_rc == 0 )) && [[ "$discover_out" == *"MODEL=a-model CTX=8192 MAX_TOKENS=2048"* ]]; then
+    ok "discovery: a MODEL present in the listing passes through unchanged"
+else
+    no "discovery: a MODEL present in the listing passes through unchanged" \
+        "rc=$discover_rc: $discover_out"
+fi
+
+# A MODEL absent from the listing warns and continues -- the listing may
+# be stale, and refusing would strand a legitimate run.
+discover_run '{"data":[{"id":"a-model","max_model_len":8192}]}' "other-model"
+if (( discover_rc == 0 )) && [[ "$discover_out" == *"does not list a model called 'other-model'"* \
+        && "$discover_out" == *"MODEL=other-model CTX=32768"* ]]; then
+    ok "discovery: a MODEL absent from the listing warns and continues"
+else
+    no "discovery: a MODEL absent from the listing warns and continues" \
+        "rc=$discover_rc: $discover_out"
+fi
+
+# A curl failure -- the ordinary connection-refused state of a
+# workstation-class endpoint -- errors naming the URL, and reads like
+# operations rather than a stack trace.
+discover_run FAIL ""
+if (( discover_rc != 0 )) \
+    && [[ "$discover_out" == *"/e/primary/v1/models"* \
+        && "$discover_out" == *"Connection refused"* \
+        && "$discover_out" == *"expected, ordinary state"* ]]; then
+    ok "discovery: a curl failure errors naming the URL, ops-flavoured"
+else
+    no "discovery: a curl failure errors naming the URL, ops-flavoured" \
+        "rc=$discover_rc: $discover_out"
+fi
+
+# The ordering the design doc's health-check requirement records: discovery
+# runs BEFORE the repository-receive wait, so a dead endpoint fails in
+# seconds instead of after the whole submit dance. And the hardcoded
+# model facts are gone from the entrypoint entirely.
+# shellcheck disable=SC2016  # both needles are literal entrypoint text
+discover_call_line="$(grep -n '^discover_model_facts$' "$entrypoint_sh" | head -n1 | cut -d: -f1)"
+sentinel_wait_line="$(grep -nF 'waiting for $sentinel' "$entrypoint_sh" | head -n1 | cut -d: -f1)"
+if [[ -n "$discover_call_line" && -n "$sentinel_wait_line" \
+        && "$discover_call_line" -lt "$sentinel_wait_line" ]]; then
+    ok "discovery runs before the repository-receive wait"
+else
+    no "discovery runs before the repository-receive wait" \
+        "discovery call line '$discover_call_line', sentinel wait line '$sentinel_wait_line'"
+fi
+if grep -qF ': "${MODEL:?MODEL must be set to a model id}"' "$entrypoint_sh"; then
+    no "the entrypoint no longer hard-requires MODEL at startup" \
+        "the old MODEL:? required-var check is still there"
+else
+    ok "the entrypoint no longer hard-requires MODEL at startup"
+fi
+if grep -qF 'contextWindow: 131072' "$entrypoint_sh" \
+    || grep -qF 'maxTokens: 32768' "$entrypoint_sh"; then
+    no "synthesize_pi_config carries no hardcoded contextWindow/maxTokens" \
+        "a hardcoded 131072/32768 is still in $entrypoint_sh"
+else
+    ok "synthesize_pi_config carries no hardcoded contextWindow/maxTokens"
+fi
+# Both ids -- the coding leg's and REVIEW_MODEL's -- are rendered from the
+# same discovered values (the same --argjson ctx/maxtok feed the whole
+# models array), which is what gives REVIEW_MODEL the same window.
+if grep -qF -- '--argjson ctx "$CTX"' "$entrypoint_sh" \
+    && grep -qF -- '--argjson maxtok "$MAX_TOKENS"' "$entrypoint_sh" \
+    && grep -qF 'contextWindow: $ctx,' "$entrypoint_sh" \
+    && grep -qF 'maxTokens: $maxtok,' "$entrypoint_sh"; then
+    ok "synthesize_pi_config renders both ids from the discovered CTX/MAX_TOKENS"
+else
+    no "synthesize_pi_config renders both ids from the discovered CTX/MAX_TOKENS" \
+        "missing a discovered-value wiring in $entrypoint_sh"
 fi
 
 printf '\n== no private-hostname shape anywhere in the repo ==\n'
