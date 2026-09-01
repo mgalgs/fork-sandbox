@@ -333,24 +333,38 @@ contains "text: patch 2 Subject: line is zero-padded like its tally label" "$(<"
 
 printf '\n== legacy mailbox: unpadded stored subjects are normalized everywhere they display ==\n'
 # A mailbox created before the padding change stores unpadded positions:
-# the patch roots as '[PATCH i/14]' (no version) and the replies as
-# 'Re: [PATCH vN i/14]'. The current mailbox always writes the padded
-# form, so emulate the legacy store by rewriting the stored Subject:
-# lines of pad-14 (its checks above already ran) and adding a doubly
-# nested 'Re: Re:' reply and a no-version reply. Resolution is by
-# Message-ID, not subject, so nothing else changes.
+# the patch roots as '[PATCH v1 i/14]', the cover as '[PATCH v1 0/14]'
+# (the mailbox has always stored the version; only the zero-padding
+# changed), and the replies as 'Re: [PATCH vN i/14]'. The current
+# mailbox always writes the padded form, so emulate the legacy store by
+# rewriting the stored Subject: lines of pad-14 (its checks above
+# already ran) and adding a doubly nested 'Re: Re:' reply, a no-version
+# reply, and a depth-2 reply that merely carries a [PATCH] subject.
+# Resolution is by Message-ID, not subject, so nothing else changes.
 sed -i -E \
-    -e 's/^Subject: \[PATCH v1 0([1-9])\/14\]/Subject: [PATCH \1\/14]/' \
-    -e 's/^Subject: \[PATCH v1 ([1-9][0-9])\/14\]/Subject: [PATCH \1\/14]/' \
+    -e 's/^Subject: \[PATCH v1 00\/14\]/Subject: [PATCH v1 0\/14]/' \
+    -e 's/^Subject: \[PATCH v1 0([1-9])\/14\]/Subject: [PATCH v1 \1\/14]/' \
+    -e 's/^Subject: \[PATCH v1 ([1-9][0-9])\/14\]/Subject: [PATCH v1 \1\/14]/' \
     -e 's/^Subject: Re: \[PATCH v1 (0)?([0-9])\/14\] demo: patch number 2/Subject: Re: Re: [PATCH v1 \2\/14] demo: patch number 2/' \
     -e 's/^Subject: Re: \[PATCH v1 (0)?([0-9])\/14\] demo: patch number 8/Subject: Re: [PATCH \2\/14] demo: patch number 8/' \
     -e 's/^Subject: Re: \[PATCH v1 (0)?([0-9])\/14\]/Subject: Re: [PATCH v1 \2\/14]/' \
     "$LKML_MAILBOX_ROOT/pad-14/cur"/*.msg
-grep -q '^Subject: \[PATCH 8/14\] demo: patch number 8$' "$LKML_MAILBOX_ROOT/pad-14/cur"/*.msg \
+grep -q '^Subject: \[PATCH v1 0/14\] <script>alert(1)</script>$' "$LKML_MAILBOX_ROOT/pad-14/cur"/*.msg \
+    && grep -q '^Subject: \[PATCH v1 8/14\] demo: patch number 8$' "$LKML_MAILBOX_ROOT/pad-14/cur"/*.msg \
     && grep -q '^Subject: Re: Re: \[PATCH v1 2/14\] demo: patch number 2$' "$LKML_MAILBOX_ROOT/pad-14/cur"/*.msg \
     && grep -q '^Subject: Re: \[PATCH 8/14\] demo: patch number 8$' "$LKML_MAILBOX_ROOT/pad-14/cur"/*.msg \
-    && ok "legacy store emulation: roots and replies stored unpadded" \
-    || no "legacy store emulation: roots and replies stored unpadded"
+    && ok "legacy store emulation: cover, roots and replies stored unpadded" \
+    || no "legacy store emulation: cover, roots and replies stored unpadded"
+# A message that merely CARRIES a [PATCH] subject -- a depth-2 reply
+# with a non-format-patch body, so is_patch is false -- is no longer
+# left verbatim in the index: patch_label pads it and takes the version
+# from the message's own X-Version. (This is the behavior change made
+# by dropping the is_patch gate at render_index, which that commit
+# message miscalled a no-op; the M=2 reply elsewhere in this file
+# cannot see it, but M=14 can.)
+printf 'This depth-2 reply merely carries a [PATCH] subject.\n' > "$work/carried.txt"
+"$mailbox" post pad-14 --from core --reply-to '[PATCH v1 8/14]' --file "$work/carried.txt" \
+    --subject '[PATCH 9/14] demo: carried subject' --harness test --model fixture >/dev/null 2>/dev/null
 legacy_html="$work/legacy-pad.html"
 legacy_text="$work/legacy-pad.txt"
 python3 "$renderer" "$LKML_MAILBOX_ROOT/pad-14" -o "$legacy_html"
@@ -359,7 +373,9 @@ lh="$(<"$legacy_html")"
 lt="$(<"$legacy_text")"
 # The total is two digits (14), so an unpadded position is unambiguous:
 # a padded '09/14' cannot match the single-digit-before-slash regex, but
-# an unpadded '9/14' always does. Zero hits in BOTH output modes.
+# an unpadded '9/14' -- or '0/14' in the cover -- always does. Zero
+# hits in BOTH output modes. (The rewritten roots keep their 'v1', so
+# the version-bearing regex below sees every rewritten subject.)
 if grep -Eq '\[PATCH v[0-9]+ [0-9]/[0-9]+\]' "$legacy_html" "$legacy_text"; then
     no "legacy render: zero unpadded [PATCH vN i/M] subjects in both modes" \
         "$(grep -hEo '\[PATCH v[0-9]+ [0-9]/[0-9]+\]' "$legacy_html" "$legacy_text" | sort -u | tr '\n' ' ')"
@@ -370,8 +386,12 @@ contains "legacy: the patch's own HTML header is padded" "$lh" 'class="subj">[PA
 contains "legacy: a double Re: reply header collapses to one Re:" "$lh" 'class="subj">Re: [PATCH v1 02/14] demo: patch number 2</h3>'
 contains "legacy: a no-version reply prefix uses the message's X-Version" "$lh" 'class="subj">Re: [PATCH v1 08/14] demo: patch number 8</h3>'
 contains "legacy: the index reply one-liner is padded under one Re:" "$lh" 'class="ix-subj">Re: [PATCH v1 02/14] demo: patch number 2</span>'
+contains "legacy: the cover's unpadded 0/14 re-pads to 00/14" "$lh" 'class="subj">[PATCH v1 00/14] &lt;script&gt;alert(1)&lt;/script&gt;</h3>'
+contains "legacy index: a carried [PATCH] subject is normalized, not verbatim" "$lh" 'ix-subj">[PATCH v1 09/14] demo: carried subject</span>'
 contains "legacy text: the patch's Subject: line is padded" "$lt" 'Subject: [PATCH v1 08/14] demo: patch number 8'
 contains "legacy text: the double Re: reply's Subject: line is one Re:" "$lt" 'Subject: Re: [PATCH v1 02/14] demo: patch number 2'
+contains "legacy text: the cover's Subject: line is re-padded" "$lt" 'Subject: [PATCH v1 00/14] <script>alert(1)</script>'
+contains "legacy text: the carried subject's Subject: line is normalized" "$lt" 'Subject: [PATCH v1 09/14] demo: carried subject'
 
 printf '\n== text tally: the 120-column cap truncates the subject part ==\n'
 # A 150-char subject must truncate the SUBJECT part of the label (prefix
