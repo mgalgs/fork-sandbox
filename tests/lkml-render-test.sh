@@ -214,5 +214,36 @@ contains "fresh series still reports zero reviewers" "$ehtml" '<span>0 reviewers
 # .counts rule already sets; make sure it does not come back.
 case "$html" in *'.reviewers .counts'*) no "no dead .reviewers .counts rule" ;; *) ok "no dead .reviewers .counts rule" ;; esac
 
+printf '\n== text mode: thread walk and message rendering ==\n'
+# The agent view: same thread selection and ordering as the HTML render,
+# as plain text on stdout.
+text_out="$work/text.txt"
+python3 "$renderer" --text "$LKML_MAILBOX_ROOT/render-fixture" > "$text_out"
+ttext="$(<"$text_out")"
+contains "text: series header is name and version" "$ttext" 'render-fixture v1'
+contains "text: header shows the same counts as the HTML header" "$ttext" '2 patches · 9 replies'
+contains "text: cover is message #1 at depth 0" "$ttext" '== #1 · depth 0'
+contains "text: patch is numbered and links its parent" "$ttext" '== #2 · reply to #1 · depth 1'
+contains "text: reply carries its number, parent and depth" "$ttext" '== #3 · reply to #2 · depth 2'
+contains "text: From line carries persona, harness and model" "$ttext" '[persona: core · harness: test · model: fixture]'
+contains "text: tags line is plain text" "$ttext" 'Tags: Reviewed-by'
+contains "text: cover letter body is verbatim" "$ttext" 'fenced *markdown*'
+contains "text: reply body is verbatim, in full" "$ttext" 'Reviewed-by: The Reviewer'
+contains "text: orphan reply is in the thread too" "$ttext" 'orphan body'
+contains "text: patch keeps its commit message" "$ttext" 'Commit message for patch one.'
+contains "text: patch diff is summarized, not inlined" "$ttext" '[diff omitted: 6 lines -- see the series branch]'
+case "$ttext" in *'+one'*) no "patch diff lines are not inlined in text mode" ;; *) ok "patch diff lines are not inlined in text mode" ;; esac
+# The fixture's cover subject and body deliberately carry a <script>
+# payload, so a whole-output check would false-positive. Check the lines
+# that carry markup in HTML mode: the header and each message header.
+if grep -F 'render-fixture v1' "$text_out" | grep -q '<'; then no "header line has no HTML tags"; else ok "header line has no HTML tags"; fi
+if grep -F '== #' "$text_out" | grep -q '<'; then no "message headers have no HTML tags"; else ok "message headers have no HTML tags"; fi
+case "$ttext" in *'<article'*|*'<table'*|*'<html'*) no "no HTML structure in the text output" ;; *) ok "no HTML structure in the text output" ;; esac
+if python3 "$renderer" --text render-fixture-dir-does-not-exist >/dev/null 2>/dev/null; then
+    no "missing mailbox fails in text mode"
+else
+    ok "missing mailbox fails in text mode"
+fi
+
 printf '%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))

@@ -4,6 +4,12 @@ single self-contained HTML page: a threaded archive with a per-version
 tally, patch bodies folded, quotes and trailers styled.
 
 Usage: lkml-render.py <series-dir> [<series-dir> ...] > out.html
+       lkml-render.py --text <series-dir> [<series-dir> ...] > out.txt
+
+The default HTML render is the human view. --text is the agent view:
+the same thread selection and ordering as plain text on stdout, with
+[PATCH] message bodies cut at their first '---' line so the commit
+message stays and the diff goes (it lives in the series branch).
 
 A series dir is $LKML_MAILBOX_ROOT/<series> (it holds cur/*.msg). Reads
 only; never runs git.
@@ -378,6 +384,97 @@ def render_reviewer(r, series_dir):
             f'<div class="reviewer-body">{body}</div></details>')
 
 
+def text_body(m):
+    """The message body for --text mode. Cover letters and replies go
+    out verbatim; a [PATCH] message keeps only the commit-message part
+    -- the format-patch body separates that from the diffstat + diff at
+    the first '---' line, and the diff lives in git on the series
+    branch, so it is summarized, not inlined. The cover letter is
+    itself a [PATCH x 0/N] subject but, like every reply, goes out in
+    full."""
+    if m["depth"] == 0 or not m["subject"].startswith("[PATCH"):
+        return m["body"].rstrip("\n")
+    lines = m["body"].splitlines()
+    cut = next((i for i, ln in enumerate(lines) if ln == "---"), None)
+    if cut is None:
+        return m["body"].rstrip("\n")
+    msg = lines[:cut]
+    # drop format-patch's own From/From:/Date:/Subject: header block
+    if msg and msg[0].startswith("From "):
+        blank = next((i for i, ln in enumerate(msg) if not ln.strip()), 0)
+        msg = msg[blank + 1:]
+    omitted = len(lines) - cut
+    out = "\n".join(msg).strip("\n")
+    if omitted:
+        out += f"\n[diff omitted: {omitted} lines -- see the series branch]"
+    return out
+
+
+def render_text_message(out, m, nums, depth):
+    """One message of the --text thread: separator, numbered header, the
+    From/Subject/Tags lines, then the body. `nums` maps id to
+    (number, parent number) from a pre-order walk, so this prints the
+    thread in the same order the HTML render nests it in."""
+    num, parent_num = nums[m["id"]]
+    rel = f" · reply to #{parent_num}" if parent_num else ""
+    out.append("-" * 72)
+    out.append(f"== #{num}{rel} · depth {depth}")
+    line = f"From: {m['from']}"
+    meta = []
+    if m["persona"]:
+        meta.append(f"persona: {m['persona']}")
+    if m["harness"]:
+        meta.append(f"harness: {m['harness']}")
+    if m["model"]:
+        meta.append(f"model: {m['model']}")
+    if meta:
+        line += "  [" + " · ".join(meta) + "]"
+    out.append(line)
+    out.append(f"Subject: {m['subject']}")
+    if m["tags"]:
+        out.append("Tags: " + ", ".join(m["tags"]))
+    if m["attachments"]:
+        out.append("Attachments: " + ", ".join(a["ref"] for a in m["attachments"]))
+    out.append(text_body(m))
+    for c in m["children"]:
+        render_text_message(out, c, nums, depth + 1)
+
+
+def render_text_series(series_dir):
+    """One series dir as plain text: a header with the same counts the
+    HTML header shows, then every message in thread order."""
+    name, msgs, roots = build(series_dir)
+    sections = []
+    covers = [r for r in roots if r["depth"] == 0 and r["subject"].startswith("[PATCH")]
+    for cover in covers:
+        v = cover["version"]
+        version_roots = [r for r in roots if r["version"] == v]
+        version_msgs = [m for root in version_roots for m in subtree(root)]
+        rows, _ = tally(cover)
+        # The same counts the HTML header shows, computed the same way:
+        # patches from the tally's targets, replies as everything at
+        # depth >= 1 that is not a patch.
+        n_replies = sum(1 for m in version_msgs if m["depth"] >= 1 and not is_patch(m))
+        n_patches = len(rows) - 1
+        lines = [f"{name} v{v}", f"{n_patches} patches · {n_replies} replies", ""]
+        # Number the thread pre-order, matching the HTML nesting order.
+        nums = {}
+        counter = [0]
+
+        def assign(m, parent_id):
+            counter[0] += 1
+            nums[m["id"]] = (counter[0], parent_id and nums[parent_id][0])
+            for c in m["children"]:
+                assign(c, m["id"])
+
+        for root in version_roots:
+            assign(root, None)
+        for root in version_roots:
+            render_text_message(lines, root, nums, 0)
+        sections.append("\n".join(lines))
+    return "\n\n".join(sections) + ("\n" if sections else "")
+
+
 def count_subtree(m):
     return sum(1 for _ in subtree(m)) - 1
 
@@ -646,7 +743,17 @@ def main(argv=None):
                         help="document title and masthead (default: %(default)s)")
     parser.add_argument("-o", "--output", metavar="FILE",
                         help="write HTML to FILE instead of stdout")
+    parser.add_argument("--text", action="store_true",
+                        help="render the threads as plain text to stdout "
+                             "(for agents; [PATCH] bodies cut at their first --- line)")
     args = parser.parse_args(argv)
+    if args.text:
+        # One flag, one backend: plain text to stdout, UTF-8, no ANSI.
+        # -o and --title are the HTML interface and are ignored here.
+        sys.stdout.reconfigure(encoding="utf-8")
+        for d in args.series_dirs:
+            sys.stdout.write(render_text_series(d))
+        return
     sections = []
     names = []
     for d in args.series_dirs:
