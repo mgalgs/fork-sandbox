@@ -141,6 +141,18 @@ contains "persona brief is html-escaped (script)" "$phtml" '&lt;script&gt;alert(
 contains "persona brief is html-escaped (ampersand)" "$phtml" 'A &amp; B'
 case "$phtml" in *'<script>alert(2)</script>'*) no "persona brief script payload is never raw" ;; *) ok "persona brief script payload is never raw" ;; esac
 contains "reviewer rollup counts NAK" "$phtml" '<span>1 NAK</span>'
+# The reviewer's reproduction: the same persona then signs off the same
+# patch. The matrix cell already rendered R; the rollup must stop
+# reporting the withdrawn NAK as outstanding.
+printf '%s\n' 'Reviewed-by: The Reviewer' > "$work/review2.txt"
+"$mailbox" post render-fixture --from core --reply-to "$patch_id" --file "$work/review2.txt" \
+    --tags Reviewed-by --harness test --model fixture >/dev/null 2>/dev/null
+after_html="$work/after.html"
+python3 "$renderer" "$LKML_MAILBOX_ROOT/render-fixture" -o "$after_html"
+ahtml="$(<"$after_html")"
+contains "message count keeps counting every post" "$ahtml" '<span>3 messages</span>'
+contains "superseding Reviewed-by is counted" "$ahtml" '<span>1 Reviewed-by</span>'
+case "$ahtml" in *'<span>1 NAK</span>'*) no "withdrawn NAK is not reported as open" ;; *) ok "withdrawn NAK is not reported as open" ;; esac
 
 printf '\n== persona brief containment ==\n'
 # The persona header comes verbatim out of the .msg file; a hand-written

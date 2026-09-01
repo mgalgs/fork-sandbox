@@ -296,10 +296,22 @@ def who_of(m):
     return esc(m["from"].split(" (AI persona)")[0].split(" <")[0]) or esc(m["persona"])
 
 
-def reviewer_rollup(version_msgs, author):
+def reviewer_rollup(version_msgs, author, tally_rows):
     """One entry per non-author persona, in first-seen order: display name,
-    harness, model, message count in this version, and how many
-    Reviewed-by / NAK tags they issued (from the already-parsed X-Tags)."""
+    harness, model, message count in this version, and how many patches
+    their LATEST tag is a Reviewed-by / NAK. The verdict counts reuse the
+    tally's latest-tag-per-persona-per-patch supersession instead of
+    counting every tag ever posted -- a NAK withdrawn by a later
+    Reviewed-by on the same patch is not an open NAK, and this page
+    reports current state, not history."""
+    open_verdicts = {}
+    for _t, latest in tally_rows:
+        for p, (_seq, _mid, tags) in latest.items():
+            v = open_verdicts.setdefault(p, [0, 0])
+            if "Reviewed-by" in tags:
+                v[0] += 1
+            if "NAK" in tags:
+                v[1] += 1
     out = []
     for m in version_msgs:
         p = m["persona"]
@@ -313,14 +325,10 @@ def reviewer_rollup(version_msgs, author):
         if not r["name"]:
             r["name"] = m["from"].split(" (AI persona)")[0].split(" <")[0]
         r["count"] += 1
-        for t in m["tags"]:
-            if t == "Reviewed-by":
-                r["rev"] += 1
-            elif t == "NAK":
-                r["nak"] += 1
     for r in out:
         if not r["name"]:
             r["name"] = r["persona"]
+        r["rev"], r["nak"] = open_verdicts.get(r["persona"], (0, 0))
     return out
 
 
@@ -446,7 +454,7 @@ def render_series(series_dir):
         # Count the same set the box below lists: every non-author persona
         # that posted in this version, not just the ones that tagged a
         # patch (the tally's set), so header and box never disagree.
-        reviewer_entries = reviewer_rollup(version_msgs, cover["persona"])
+        reviewer_entries = reviewer_rollup(version_msgs, cover["persona"], rows)
         reviewers = "".join(render_reviewer(r, series_dir) for r in reviewer_entries)
         reviewers_block = ""
         if reviewer_entries:
