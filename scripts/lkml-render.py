@@ -473,7 +473,7 @@ def render_text_message(out, m, nums, depth):
     if meta:
         line += "  [" + " · ".join(meta) + "]"
     out.append(line)
-    out.append(f"Subject: {m['subject']}")
+    out.append(f"Subject: {patch_label(m)}")
     if m["tags"]:
         out.append("Tags: " + ", ".join(m["tags"]))
     if m["attachments"]:
@@ -617,8 +617,10 @@ def render_index(m, depth=0):
     message in reply order, click to jump."""
     glyphs = "".join(f"<span class=\"g {TAG_CLASS.get(t,'t-q')}\" title=\"{esc(t)}\">{TAG_GLYPH.get(t,'·')}</span>" for t in m["tags"])
     # Like the tally rows, a patch row carries the full lore-style
-    # subject (numbering as prefix), lore's index-style.
-    subj = patch_label(m) if is_patch(m) else m["subject"]
+    # subject (numbering as prefix), lore's index-style. Replies go
+    # through the same normalizer: a 'Re: [PATCH ...]' subject comes back
+    # padded under a single 'Re: '; anything else is verbatim.
+    subj = patch_label(m)
     if depth > 1 and subj.startswith("Re: "):
         subj = "Re: …" if len(subj) > 70 else subj
     label = "cover" if depth == 0 else ""
@@ -659,7 +661,7 @@ def render_message(m, depth=0):
         f"<header><span class=\"who\">{who_of(m)}</span>"
         f"<span class=\"meta\">{meta}</span>{tagchips}"
         f"<time>{fmt_date(m['date'])}</time><a class=\"mid\" href=\"#m-{esc(m['id'])}\">{esc(m['id'][:7])}</a></header>"
-        f"<h3 class=\"subj\">{esc(m['subject'])}</h3>"
+        f"<h3 class=\"subj\">{esc(patch_label(m))}</h3>"
         f"<div class=\"body\">{body}{attachment_html}</div>"
         f"{fold}"
         f"</article>"
