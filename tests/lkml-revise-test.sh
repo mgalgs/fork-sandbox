@@ -113,6 +113,7 @@ write_stub() {
 #!/usr/bin/env bash
 set -euo pipefail
 run_dir="\$(mktemp -d "$run_prefix_dir/run.XXXXXX")"
+printf '%s\n' "\$@" > "$run_prefix_dir/last-args"
 clone_dir="\$run_dir/clone/proj"
 mkdir -p "\$clone_dir/.git/lkml-out"
 STUB
@@ -193,6 +194,30 @@ if (( rc != 0 )); then ok "exits non-zero when init fails"; else no "exits non-z
 contains "names the mailbox init failure" "$out" "init failed"
 ledger_lines_after=$(wc -l < "$ledger_file" | tr -d '[:space:]')
 check "no ledger entry was appended for the failed version" "$ledger_lines_before" "$ledger_lines_after"
+
+
+printf '\n== --services-trust-ref is forwarded to the launch ==\n'
+write_stub 1 true 1 1
+out="$(PATH="$stub_bin:$PATH" "$revise" widget-frob --project "$real_repo" \
+    --checkout somebranch --version 2 --base "$series_base_sha" \
+    --services-trust-ref refs/heads/main 2>&1)"
+check "exits 0 with --services-trust-ref" "0" "$?"
+if grep -qx -- '--services-trust-ref' "$run_prefix_dir/last-args" \
+    && grep -qx -- 'refs/heads/main' "$run_prefix_dir/last-args"; then
+    ok "--services-trust-ref and its ref reach fork-sandbox.sh"
+else
+    no "--services-trust-ref and its ref reach fork-sandbox.sh" "$(cat "$run_prefix_dir/last-args")"
+fi
+printf '\n== without the flag, no trust-ref argument is forwarded ==\n'
+write_stub 1 true 1 1
+out="$(PATH="$stub_bin:$PATH" "$revise" widget-frob --project "$real_repo" \
+    --checkout somebranch --version 3 --base "$series_base_sha" 2>&1)"
+check "exits 0 without the flag" "0" "$?"
+if grep -qx -- '--services-trust-ref' "$run_prefix_dir/last-args"; then
+    no "no --services-trust-ref forwarded when the flag is absent" "$(cat "$run_prefix_dir/last-args")"
+else
+    ok "no --services-trust-ref forwarded when the flag is absent"
+fi
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 (( fail == 0 )) || exit 1

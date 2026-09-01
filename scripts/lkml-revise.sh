@@ -4,11 +4,17 @@
 #
 # Usage: lkml-revise.sh <series> --project <path> --checkout <ref> --version <n> --base <ref>
 #            [--personas-dir <dir>] [--author <persona>] [--model-override <harness/model>]
-#            [--timeout <seconds>]
+#            [--timeout <seconds>] [--services-trust-ref <ref>]
 #
 # <project>   the repo fork-sandbox.sh clones.
 # --checkout  the ref to revise from -- normally the branch vN was posted
 #             from, so the author's clone already holds vN's commits.
+# --services-trust-ref <ref> is passed through to the author's
+#             fork-sandbox.sh launch. Without it, fork-sandbox.sh disables
+#             the repo's .agents/sandbox-services hook on a --checkout run
+#             (its warning lands in the captured launch output, unseen), so
+#             the author gets no per-run services and cannot run suites
+#             that need them. Pass the trusted base the series came from.
 # --version   the CURRENT version being revised (an integer N). This launch
 #             produces vN+1, posted under that version by lkml-mailbox.sh
 #             init; the branch is named lkml/<series>-vN+1-<timestamp> (see
@@ -80,6 +86,7 @@ personas_dir="$default_personas_dir"
 author_persona="author"
 model_override=""
 timeout=3600
+services_trust_ref=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -91,6 +98,7 @@ while [[ $# -gt 0 ]]; do
         --author) author_persona="${2:?--author requires a persona name}"; shift 2 ;;
         --model-override) model_override="${2:?--model-override requires harness or harness/model}"; shift 2 ;;
         --timeout) timeout="${2:?--timeout requires seconds}"; shift 2 ;;
+        --services-trust-ref) services_trust_ref="${2:?--services-trust-ref requires a ref}"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Error: unknown option '$1'." >&2; exit 1 ;;
     esac
@@ -98,6 +106,9 @@ done
 
 [[ -n "$project" ]] || { echo "Error: --project is required." >&2; exit 1; }
 [[ -n "$checkout_ref" ]] || { echo "Error: --checkout is required." >&2; exit 1; }
+
+trust_args=()
+[[ -n "$services_trust_ref" ]] && trust_args=(--services-trust-ref "$services_trust_ref")
 [[ -n "$version" ]] || { echo "Error: --version is required (the version being revised)." >&2; exit 1; }
 [[ "$version" =~ ^[0-9]+$ ]] || { echo "Error: --version must be a plain integer." >&2; exit 1; }
 [[ -n "$base_ref" ]] || { echo "Error: --base is required (the series' original base, the same ref v1 was formatted against)." >&2; exit 1; }
@@ -220,6 +231,7 @@ harness_spec="$harness"
 
 echo "fork-sandbox lkml-revise: launching $author_persona ($harness_spec) for v$next_version..." >&2
 launch_out="$(fork-sandbox.sh --harness "$harness_spec" --checkout "$checkout_ref" \
+    "${trust_args[@]}" \
     --branch "$branch" --task-meta "$task_meta" "$project" "$handoff_file" 2>&1)"
 rc=$?
 run_dir="$(printf '%s\n' "$launch_out" | sed -n 's/^  run dir:  *//p' | head -n1)"
