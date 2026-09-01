@@ -44,6 +44,11 @@ scheduling, not reading, and the reviewers' job is reading.
   `tree`, `open`, `tally` and `cover` — see above.
 - **`scripts/lkml-render.py`** — renders a self-contained HTML archive of the
   threads and review tally: `lkml-render.py "$LKML_MAILBOX_ROOT/<series>" > threads.html`.
+  The HTML is the human view; `lkml-render.py --text "$LKML_MAILBOX_ROOT/<series>"`
+  renders the same thread as plain text on stdout (series header, tally table,
+  reviewer blocks, then every message in thread order with [PATCH] bodies cut
+  at their first `---`) — the view for agents and `grep` that would otherwise
+  fight 500KB of markup.
 - **`lkml-round.sh`** — launches one sandboxed run per persona, in
   parallel, either reviewing the whole series fresh or replying to
   specific threads you name with `--reply-to`. Every run's replies are
@@ -91,8 +96,16 @@ a patch has earned it. It is modeled on a standard, not on a person —
 explicitly an AI persona in a sandbox that signs as itself and never as
 any human. `skills/lkml-mode/personas/` ships it plus five
 general-purpose reviewer archetypes (`architecture`, `security`, `tests`,
-`docs`, `newcomer`), the `ci` bot, and the `author` persona that revises
-the series.
+`docs`, `newcomer`), the `ci` bot, the `author` persona that revises
+the series, and the `secretary` persona that summarizes it.
+
+**`secretary` runs as a solo seat AFTER the review rounds it summarizes** —
+`lkml-round.sh <series> --personas secretary` once the panel's replies are
+in. It reads the whole thread and posts one structured summary (key
+takeaways, defects and their standing, notable exchanges, state of the
+series) as a reply to the cover letter, so someone not on the list can
+act on the discussion without reading it. Running it alongside the panel
+defeats it: there is no thread to summarize yet.
 
 **`ci` runs first on every version.** It holds no opinions: it runs every
 test suite at the series' tip and posts one reply on the cover — a table
