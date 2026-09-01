@@ -324,7 +324,14 @@ def reviewer_rollup(version_msgs, author):
     return out
 
 
-def render_reviewer(r):
+def render_reviewer(r, series_dir):
+    brief = ""
+    brief_path = os.path.join(series_dir, "personas", r["persona"] + ".md")
+    if os.path.isfile(brief_path):
+        # The persona brief is plain markdown; inlined as escaped
+        # preformatted text, never rendered or executed.
+        with open(brief_path, encoding="utf-8", errors="replace") as f:
+            brief = '<pre class="persona-brief">' + esc(f.read()) + "</pre>"
     counts = [f"{r['count']} message" + ("s" if r["count"] != 1 else "")]
     if r["rev"]:
         counts.append(f"{r['rev']} Reviewed-by")
@@ -332,7 +339,7 @@ def render_reviewer(r):
         counts.append(f"{r['nak']} NAK")
     meta = " · ".join(x for x in (esc(r["harness"]), esc(r["model"])) if x)
     body = (f'<p class="rv-line mono">{meta}</p>'
-            f'<p class="counts">{"".join(f"<span>{c}</span>" for c in counts)}</p>')
+            f'<p class="counts">{"".join(f"<span>{c}</span>" for c in counts)}</p>{brief}')
     return (f'<details class="reviewer">'
             f'<summary><span class="who">{esc(r["name"])}</span> '
             f'<span class="slug mono">{esc(r["persona"])}</span></summary>'
@@ -428,7 +435,7 @@ def render_series(series_dir):
         index = "".join(render_index(root) for root in version_roots)
         thread = "".join(render_message(root) for root in version_roots)
         n_messages = len(version_msgs)
-        reviewers = "".join(render_reviewer(r)
+        reviewers = "".join(render_reviewer(r, series_dir)
                             for r in reviewer_rollup(version_msgs, cover["persona"]))
         sections.append(f"""
 <section class="series" id="{esc(name)}-v{v}">
@@ -523,6 +530,7 @@ body{margin:0;background:var(--bg);color:var(--ink);
 .reviewer-body{padding:0 .8rem .65rem;font-size:.82rem}
 .reviewers .counts{display:flex;gap:1rem}
 .rv-line{color:var(--muted);margin:0 0 .35rem;font-size:.78rem}
+.persona-brief{margin:.5rem 0 0;padding:.6rem .8rem;background:var(--code-bg);font-size:.78rem;line-height:1.45;white-space:pre-wrap;overflow-wrap:anywhere;border-radius:2px}
 .t-rev{color:var(--rev);background:var(--rev-bg)}
 .t-ack{color:var(--ack);background:var(--ack-bg)}
 .t-test{color:var(--test);background:var(--test-bg)}

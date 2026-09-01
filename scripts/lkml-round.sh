@@ -318,6 +318,13 @@ for persona in "${personas[@]}"; do
         continue
     fi
 
+    # Archive a copy of the persona file in the series mailbox so the
+    # render can inline each reviewer's brief. Overwrite is intentional:
+    # personas rarely change mid-series, and the latest wins.
+    archive_root="${LKML_MAILBOX_ROOT:-/var/tmp/claude-scratch/lkml}/$series"
+    mkdir -p -- "$archive_root/personas"
+    cp -f -- "$persona_file" "$archive_root/personas/$persona.md"
+
     harness="$(lkml_persona_field "$persona_file" harness)"
     model="$(lkml_persona_field "$persona_file" model)"
     display="$(lkml_persona_field "$persona_file" display)"
