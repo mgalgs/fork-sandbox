@@ -296,6 +296,49 @@ def who_of(m):
     return esc(m["from"].split(" (AI persona)")[0].split(" <")[0]) or esc(m["persona"])
 
 
+def reviewer_rollup(version_msgs, author):
+    """One entry per non-author persona, in first-seen order: display name,
+    harness, model, message count in this version, and how many
+    Reviewed-by / NAK tags they issued (from the already-parsed X-Tags)."""
+    out = []
+    for m in version_msgs:
+        p = m["persona"]
+        if not p or p == author:
+            continue
+        r = next((x for x in out if x["persona"] == p), None)
+        if r is None:
+            r = {"persona": p, "name": "", "harness": m["harness"], "model": m["model"],
+                 "count": 0, "rev": 0, "nak": 0}
+            out.append(r)
+        if not r["name"]:
+            r["name"] = m["from"].split(" (AI persona)")[0].split(" <")[0]
+        r["count"] += 1
+        for t in m["tags"]:
+            if t == "Reviewed-by":
+                r["rev"] += 1
+            elif t == "NAK":
+                r["nak"] += 1
+    for r in out:
+        if not r["name"]:
+            r["name"] = r["persona"]
+    return out
+
+
+def render_reviewer(r):
+    counts = [f"{r['count']} message" + ("s" if r["count"] != 1 else "")]
+    if r["rev"]:
+        counts.append(f"{r['rev']} Reviewed-by")
+    if r["nak"]:
+        counts.append(f"{r['nak']} NAK")
+    meta = " · ".join(x for x in (esc(r["harness"]), esc(r["model"])) if x)
+    body = (f'<p class="rv-line mono">{meta}</p>'
+            f'<p class="counts">{"".join(f"<span>{c}</span>" for c in counts)}</p>')
+    return (f'<details class="reviewer">'
+            f'<summary><span class="who">{esc(r["name"])}</span> '
+            f'<span class="slug mono">{esc(r["persona"])}</span></summary>'
+            f'<div class="reviewer-body">{body}</div></details>')
+
+
 def count_subtree(m):
     return sum(1 for _ in subtree(m)) - 1
 
@@ -380,10 +423,13 @@ def render_series(series_dir):
                            f'<a href="#m-{esc(t["id"])}">{esc(patch_label(t))}</a></th>')
             trows.append(f"<tr>{rowcell}{''.join(cells)}</tr>")
         n_patches = len(rows) - 1
-        n_replies = sum(1 for m in msgs.values() if m["version"] == v and m["depth"] >= 1 and not is_patch(m))
+        version_msgs = [m for root in version_roots for m in subtree(root)]
+        n_replies = sum(1 for m in version_msgs if m["depth"] >= 1 and not is_patch(m))
         index = "".join(render_index(root) for root in version_roots)
         thread = "".join(render_message(root) for root in version_roots)
-        n_messages = sum(1 for root in version_roots for _ in subtree(root))
+        n_messages = len(version_msgs)
+        reviewers = "".join(render_reviewer(r)
+                            for r in reviewer_rollup(version_msgs, cover["persona"]))
         sections.append(f"""
 <section class="series" id="{esc(name)}-v{v}">
   <div class="series-head">
@@ -397,6 +443,10 @@ def render_series(series_dir):
       <thead><tr><th scope="col">patch</th>{thead}</tr></thead>
       <tbody>{''.join(trows)}</tbody>
     </table>
+  </div>
+  <div class="reviewers">
+    <p class="eyebrow">reviewers</p>
+    {reviewers}
   </div>
   <details class="index-fold" open>
     <summary>thread index — {n_messages} messages</summary>
@@ -464,6 +514,15 @@ body{margin:0;background:var(--bg);color:var(--ink);
 .tally td{text-align:center}
 .cell{display:inline-block;min-width:1.6rem;padding:.05rem .3rem;border-radius:2px;text-decoration:none;font-weight:600}
 .cell.none{color:var(--rule)}
+.reviewers{margin:0 0 2rem;border:1px solid var(--rule);background:var(--surface)}
+.reviewers .eyebrow{padding:.6rem .8rem .35rem}
+.reviewer{border-top:1px solid var(--rule)}
+.reviewer>summary{cursor:pointer;display:flex;flex-wrap:wrap;align-items:baseline;gap:.15rem .5rem;padding:.55rem .8rem;font-size:.85rem}
+.reviewer>summary .who{font-weight:600}
+.reviewer>summary .slug{color:var(--accent);font-size:.75rem}
+.reviewer-body{padding:0 .8rem .65rem;font-size:.82rem}
+.reviewers .counts{display:flex;gap:1rem}
+.rv-line{color:var(--muted);margin:0 0 .35rem;font-size:.78rem}
 .t-rev{color:var(--rev);background:var(--rev-bg)}
 .t-ack{color:var(--ack);background:var(--ack-bg)}
 .t-test{color:var(--test);background:var(--test-bg)}
