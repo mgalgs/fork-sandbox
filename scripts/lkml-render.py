@@ -354,18 +354,26 @@ def strip_frontmatter(text):
     return text
 
 
-def render_reviewer(r, series_dir):
-    brief = ""
+def persona_brief_path(series_dir, persona):
+    """The on-disk persona brief for a message's X-AI-Persona value, or
+    None. The header comes straight out of the .msg file, which a
+    hand-written message can set to anything, including traversal or an
+    absolute path; keep the read inside <series>/personas/ the way the
+    attachment reader does."""
     personas_dir = os.path.join(series_dir, "personas")
-    # The X-AI-Persona header comes straight out of the .msg file, which a
-    # hand-written message can set to anything, including traversal or an
-    # absolute path. Keep the brief read inside <series>/personas/ the way
-    # the attachment reader does.
-    brief_path = os.path.normpath(os.path.join(personas_dir, r["persona"] + ".md"))
+    brief_path = os.path.normpath(os.path.join(personas_dir, persona + ".md"))
     personas_real = os.path.realpath(personas_dir)
     brief_real = os.path.realpath(brief_path)
     if (os.path.commonpath((brief_real, personas_real)) == personas_real
             and os.path.isfile(brief_real)):
+        return brief_real
+    return None
+
+
+def render_reviewer(r, series_dir):
+    brief = ""
+    brief_real = persona_brief_path(series_dir, r["persona"])
+    if brief_real:
         # The persona brief is plain markdown; inlined as escaped
         # preformatted text, never rendered or executed.
         with open(brief_real, encoding="utf-8", errors="replace") as f:
@@ -440,6 +448,40 @@ def render_text_message(out, m, nums, depth):
         render_text_message(out, c, nums, depth + 1)
 
 
+def render_text_tally(out, rows, pcols):
+    """The per-version tally as a fixed-width table: a row per patch
+    (same labels as the HTML rows), a column per listed reviewer, cells
+    the same latest-tag-per-reviewer-per-patch letters."""
+    grid = [["patch"] + list(pcols)]
+    for t, latest in rows:
+        label = "cover" if t is rows[0][0] else patch_label(t)
+        grid.append([label] + [TAG_GLYPH.get(latest[p][2][0], "·") if p in latest else "·" for p in pcols])
+    widths = [max(len(row[i]) for row in grid) for i in range(len(grid[0]))]
+    out.append("Latest tag per reviewer per patch. R reviewed, A acked, "
+               "C changes requested, ? question, N nak.")
+    for row in grid:
+        out.append("  ".join(cell.ljust(widths[i]) for i, cell in enumerate(row)).rstrip())
+
+
+def render_text_reviewers(out, name, series_dir, reviewer_entries):
+    """One block per reviewer, in the box's order. No brief inlining in
+    text mode -- just a pointer to the file, when it exists."""
+    out.append("reviewers")
+    for r in reviewer_entries:
+        out.append(f"  {r['name']} ({r['persona']})")
+        meta = " · ".join(x for x in (r["harness"], r["model"]) if x)
+        if meta:
+            out.append(f"    {meta}")
+        counts = [f"{r['count']} message" + ("s" if r["count"] != 1 else "")]
+        if r["rev"]:
+            counts.append(f"{r['rev']} Reviewed-by")
+        if r["nak"]:
+            counts.append(f"{r['nak']} NAK")
+        out.append(f"    {', '.join(counts)}")
+        if persona_brief_path(series_dir, r["persona"]):
+            out.append(f"    brief: {name}/personas/{r['persona']}.md")
+
+
 def render_text_series(series_dir):
     """One series dir as plain text: a header with the same counts the
     HTML header shows, then every message in thread order."""
@@ -450,13 +492,25 @@ def render_text_series(series_dir):
         v = cover["version"]
         version_roots = [r for r in roots if r["version"] == v]
         version_msgs = [m for root in version_roots for m in subtree(root)]
-        rows, _ = tally(cover)
+        rows, personas = tally(cover)
         # The same counts the HTML header shows, computed the same way:
         # patches from the tally's targets, replies as everything at
         # depth >= 1 that is not a patch.
         n_replies = sum(1 for m in version_msgs if m["depth"] >= 1 and not is_patch(m))
         n_patches = len(rows) - 1
-        lines = [f"{name} v{v}", f"{n_patches} patches · {n_replies} replies", ""]
+        reviewer_entries = reviewer_rollup(version_msgs, cover["persona"], rows)
+        # One matrix column per reviewer the box lists, same set and
+        # (alphabetical) order as the HTML table.
+        pcols = sorted(set(personas) | {r["persona"] for r in reviewer_entries})
+        entry_info = {r["persona"]: (r["harness"], r["model"]) for r in reviewer_entries}
+        lines = [f"{name} v{v}",
+                 f"{n_patches} patches · {n_replies} replies · {len(reviewer_entries)} reviewers",
+                 ""]
+        render_text_tally(lines, rows, pcols)
+        lines.append("")
+        if reviewer_entries:
+            render_text_reviewers(lines, name, series_dir, reviewer_entries)
+            lines.append("")
         # Number the thread pre-order, matching the HTML nesting order.
         nums = {}
         counter = [0]

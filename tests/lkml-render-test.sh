@@ -245,5 +245,29 @@ else
     ok "missing mailbox fails in text mode"
 fi
 
+printf '\n== text mode: tally and reviewers ==\n'
+contains "text: header count line includes reviewers" "$ttext" '2 patches · 9 replies · 5 reviewers'
+contains "text: tally legend is plain text" "$ttext" 'Latest tag per reviewer per patch. R reviewed, A acked, C changes requested, ? question, N nak.'
+contains "text: patch rows use the HTML row labels" "$ttext" 'Patch v1 1/2'
+contains "text: second patch row is labeled too" "$ttext" 'Patch v1 2/2'
+# The tagged patch's row carries the latest tag per reviewer: R for
+# core's superseding Reviewed-by, T for the CI bot, · where untagged.
+patch_row="$(grep -F 'Patch v1 1/2' "$text_out" | head -1)"
+contains "text: tally row carries per-reviewer letters" "$patch_row" 'R'
+contains "text: tally row carries the Tested-by letter" "$patch_row" 'T'
+contains "text: untagged reviewer is a dot in the row" "$patch_row" '·'
+contains "text: untagged reviewer still gets a column" "$ttext" 'newcomer'
+contains "text: reviewers section is present" "$ttext" 'reviewers'
+contains "text: reviewer block has display name and slug" "$ttext" 'Core (core)'
+contains "text: reviewer block carries harness and model" "$ttext" 'test · fixture'
+contains "text: reviewer block counts messages" "$ttext" '3 messages'
+contains "text: reviewer block counts open Reviewed-by" "$ttext" '1 Reviewed-by'
+case "$ttext" in *'1 NAK'*) no "withdrawn NAK is not reported open in text mode" ;; *) ok "withdrawn NAK is not reported open in text mode" ;; esac
+contains "text: brief is a pointer, not inlined" "$ttext" 'brief: render-fixture/personas/core.md'
+case "$ttext" in *'Core reviewer brief.'*) no "persona brief is not inlined in text mode" ;; *) ok "persona brief is not inlined in text mode" ;; esac
+# The same line-level markup check for the tally table's rows, which
+# carry the most markup in HTML mode.
+if grep -F 'Patch v1 1/2' "$text_out" | grep -q '<'; then no "tally rows have no HTML tags"; else ok "tally rows have no HTML tags"; fi
+
 printf '%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))
