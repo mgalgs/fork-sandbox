@@ -334,6 +334,20 @@ def reviewer_rollup(version_msgs, author, tally_rows):
     return out
 
 
+def strip_frontmatter(text):
+    """Drop a leading '---' ... '---' YAML frontmatter block, if present.
+    The archived persona file's frontmatter names the persona's DEFAULT
+    harness/model; under lkml-round.sh --model-override (the documented
+    cheap smoke round) the messages in the version were in fact run on a
+    different one, so printing the block next to the message headers'
+    harness/model line would state two different models for the same
+    reviewer."""
+    m = re.match(r"\A---\n.*?\n---\n?", text, re.DOTALL)
+    if m:
+        return text[m.end():].lstrip("\n")
+    return text
+
+
 def render_reviewer(r, series_dir):
     brief = ""
     personas_dir = os.path.join(series_dir, "personas")
@@ -349,7 +363,7 @@ def render_reviewer(r, series_dir):
         # The persona brief is plain markdown; inlined as escaped
         # preformatted text, never rendered or executed.
         with open(brief_real, encoding="utf-8", errors="replace") as f:
-            brief = '<pre class="persona-brief">' + esc(f.read()) + "</pre>"
+            brief = '<pre class="persona-brief">' + esc(strip_frontmatter(f.read())) + "</pre>"
     counts = [f"{r['count']} message" + ("s" if r["count"] != 1 else "")]
     if r["rev"]:
         counts.append(f"{r['rev']} Reviewed-by")

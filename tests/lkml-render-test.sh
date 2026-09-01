@@ -148,7 +148,12 @@ case "$html" in *'<pre class="persona-brief">'*) no "no persona brief when the f
 
 printf '\n== persona brief inlining ==\n'
 mkdir -p "$LKML_MAILBOX_ROOT/render-fixture/personas"
-printf '%s\n' 'Core reviewer brief.' '<script>alert(2)</script>' 'A & B' \
+# Frontmatter exactly as the shipped persona files carry it: its
+# harness/model are the persona's defaults, which under --model-override
+# are the WRONG harness/model for this version's messages, so the block
+# must not be printed next to the message headers' line above it.
+printf '%s\n' '---' 'persona: core' 'role: reviewer' 'harness: claude' 'model: opus' '---' '' \
+    'Core reviewer brief.' '<script>alert(2)</script>' 'A & B' \
     > "$LKML_MAILBOX_ROOT/render-fixture/personas/core.md"
 printf '%s\n' 'Not this time.' > "$work/nak.txt"
 "$mailbox" post render-fixture --from core --reply-to "$patch_id" --file "$work/nak.txt" \
@@ -157,6 +162,10 @@ persona_html="$work/persona.html"
 python3 "$renderer" "$LKML_MAILBOX_ROOT/render-fixture" -o "$persona_html"
 phtml="$(<"$persona_html")"
 contains "persona brief is inlined" "$phtml" '<pre class="persona-brief">Core reviewer brief.'
+case "$phtml" in *'<pre class="persona-brief">---'*) no "frontmatter is not inlined verbatim" ;; *) ok "frontmatter is not inlined verbatim" ;; esac
+case "$phtml" in *'persona: core'*) no "frontmatter persona field is stripped" ;; *) ok "frontmatter persona field is stripped" ;; esac
+case "$phtml" in *'harness: claude'*) no "frontmatter harness field is stripped" ;; *) ok "frontmatter harness field is stripped" ;; esac
+case "$phtml" in *'model: opus'*) no "frontmatter model field is stripped" ;; *) ok "frontmatter model field is stripped" ;; esac
 contains "persona brief is html-escaped (script)" "$phtml" '&lt;script&gt;alert(2)&lt;/script&gt;'
 contains "persona brief is html-escaped (ampersand)" "$phtml" 'A &amp; B'
 case "$phtml" in *'<script>alert(2)</script>'*) no "persona brief script payload is never raw" ;; *) ok "persona brief script payload is never raw" ;; esac
