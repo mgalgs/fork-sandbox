@@ -20,9 +20,11 @@ When a series dir holds results-v<N>.md (the per-version results file,
 written by the summarizer; a results-v<N>.json may sit next to it and is
 ignored), the HTML render adds a per-version Results card between the
 Reviewers panel and the Thread Index: the "# Summary" section sits
-outside a native <details>, the "# Details" section inside it. Without
-the file there is no card and the render is byte-identical to a mailbox
-without results.
+outside a native <details>, the "# Details" section inside it, and
+7-hex message-id tokens that match a message in the mailbox link to
+that message. --text prints the same sections as a bare 'results'
+block (no links). Without the file there is no card and the render is
+byte-identical to a mailbox without results.
 """
 import html
 import base64
@@ -428,23 +430,51 @@ def split_results(text):
     return "\n".join(lines[s + 1:d]).rstrip("\n"), "\n".join(lines[d + 1:]).rstrip("\n")
 
 
-def render_results_card(series_dir, version):
+def id_prefix_map(msgs):
+    """Seven-hex message-id prefix to full id, for the results card's
+    autolinker. Ambiguous prefixes (two messages sharing their first
+    seven hex characters) are dropped rather than guessed at."""
+    by_prefix = {}
+    for m in msgs.values():
+        p = m["id"][:7]
+        if len(p) == 7:
+            by_prefix.setdefault(p, set()).add(m["id"])
+    return {p: next(iter(full)) for p, full in by_prefix.items() if len(full) == 1}
+
+
+HEX_TOKEN_RE = re.compile(r"(?<![0-9a-fA-F])[0-9a-f]{7}(?![0-9a-fA-F])")
+
+
+def link_ids(escaped, id_map):
+    """Turn bare 7-hex message-id tokens in already-escaped text into
+    links to the #m-<id> anchors the renderer itself constructs. The
+    match runs on the ESCAPED text and inserts only those anchors, so a
+    results file cannot smuggle markup through the linker; a token that
+    matches no id (or matches ambiguously) stays plain text."""
+    def sub(match):
+        full = id_map.get(match.group(0))
+        return f'<a href="#m-{esc(full)}">{match.group(0)}</a>' if full else match.group(0)
+    return HEX_TOKEN_RE.sub(sub, escaped)
+
+
+def render_results_card(series_dir, version, id_map):
     """The per-version Results card, placed between the Reviewers panel
     and the Thread Index: the Summary section is visible in the
     collapsed state, only Details sits inside the "show details"
     summary. Both sections are escaped preformatted text in the file's
     own layout (the persona-briefs treatment) -- never rendered or
-    executed. Returns "" when the results file is absent."""
+    executed -- with 7-hex message-id tokens autolinked. Returns "" when
+    the results file is absent."""
     res = read_results(series_dir, version)
     if res is None:
         return ""
     summary, details = res
     return (f'  <div class="results">\n'
             f'    <p class="eyebrow">results</p>\n'
-            f'    <div class="results-summary">{esc(summary)}</div>\n'
+            f'    <div class="results-summary">{link_ids(esc(summary), id_map)}</div>\n'
             f'    <details class="results-fold">\n'
             f'      <summary>show details</summary>\n'
-            f'      <pre class="results-details">{esc(details)}</pre>\n'
+            f'      <pre class="results-details">{link_ids(esc(details), id_map)}</pre>\n'
             f'    </details>\n'
             f'  </div>')
 
@@ -647,6 +677,19 @@ def render_text_series(series_dir):
         if reviewer_entries:
             render_text_reviewers(lines, name, series_dir, reviewer_entries)
             lines.append("")
+        # The Results card's sections as a text block in the same
+        # position: bare 'results' header, then Summary and Details
+        # verbatim, every body line indented like a message body's (so a
+        # line in the file cannot forge the block's header). No links in
+        # text mode.
+        res = read_results(series_dir, v)
+        if res is not None:
+            lines.append("results")
+            lines.extend("  " + ln for ln in res[0].split("\n"))
+            if res[1]:
+                lines.append("")
+                lines.extend("  " + ln for ln in res[1].split("\n"))
+            lines.append("")
         # Number the thread pre-order, matching the HTML nesting order.
         nums = {}
         counter = [0]
@@ -729,6 +772,7 @@ def render_series(series_dir):
     name, msgs, roots = build(series_dir)
     sections = []
     covers = [r for r in roots if r["depth"] == 0 and r["subject"].startswith("[PATCH")]
+    id_map = id_prefix_map(msgs)
     for cover in covers:
         v = cover["version"]
         version_roots = [r for r in roots if r["version"] == v]
@@ -784,7 +828,7 @@ def render_series(series_dir):
         # string, so the section is byte-identical to a render without the
         # card (the results CSS below is likewise emitted only when at
         # least one card is present).
-        results_block = render_results_card(series_dir, v)
+        results_block = render_results_card(series_dir, v, id_map)
         sections.append(f"""
 <section class="series" id="{esc(name)}-v{v}">
   <div class="series-head">

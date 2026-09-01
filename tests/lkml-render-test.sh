@@ -802,5 +802,68 @@ else
     no "each version renders its own results file; absent file = absent card"
 fi
 
+printf '\n== results: autolink (HTML) and the --text block ==\n'
+# The card autolinks bare 7-hex message-id tokens to the existing
+# #m-<id> anchors: a token matching a message links in BOTH sections,
+# a token matching nothing stays plain, and a hex run longer than seven
+# is not a 7-hex token. The linker runs on already-escaped text and
+# inserts only the renderer's own anchors, so markup carried by the
+# results file cannot pass through it.
+review_prefix="${review_id:0:7}"
+{
+    printf '%s\n' \
+        '# Summary' \
+        "v1: $review_prefix reviewed; 0000000 and 0123456780 did not." \
+        '</a><script>alert(4)</script>' \
+        '' \
+        '# Details' \
+        "Reviewed-by core ($review_prefix)." \
+        'The fake id 0000000 stays plain.'
+} > "$RESULTS_MD"
+results_link="$work/results-link.html"
+python3 "$renderer" "$LKML_MAILBOX_ROOT/render-fixture" -o "$results_link"
+rl="$(<"$results_link")"
+contains "autolink: real 7-hex id links to its #m-<id> anchor" "$rl" "<a href=\"#m-$review_id\">$review_prefix</a>"
+if [[ "$(grep -cF "<a href=\"#m-$review_id\">$review_prefix</a>" "$results_link")" -eq 2 ]]; then ok "autolink hits both the summary and the details sections"; else no "autolink hits both the summary and the details sections"; fi
+case "$rl" in *'href="#m-0000000"'*) no "autolink: a fake id is not linked" ;; *) ok "autolink: a fake id is not linked" ;; esac
+contains "autolink: a fake id stays plain text" "$rl" '; 0000000 and 0123456780 did not.'
+case "$rl" in *'href="#m-012345678"'*|*'>1234567</a>'*) no "a hex run longer than 7 is not a 7-hex token" ;; *) ok "a hex run longer than 7 is not a 7-hex token" ;; esac
+contains "results markup is escaped before the linker runs" "$rl" '&lt;/a&gt;&lt;script&gt;alert(4)&lt;/script&gt;'
+case "$rl" in *'<script>alert(4)</script>'*) no "results script payload is never raw" ;; *) ok "results script payload is never raw" ;; esac
+
+# --text: the same sections as a 'results' block in the card's position
+# (after the reviewers block, before the thread), bodies indented like
+# message bodies, no links.
+results_text="$work/results.txt"
+python3 "$renderer" --text "$LKML_MAILBOX_ROOT/render-fixture" > "$results_text"
+rt="$(<"$results_text")"
+contains "text: summary body is indented like message bodies" "$rt" "  v1: $review_prefix reviewed; 0000000 and 0123456780 did not."
+contains "text: details body is indented too" "$rt" '  The fake id 0000000 stays plain.'
+case "$rt" in *'href='*|*'<a '*) no "text mode has no links" ;; *) ok "text mode has no links" ;; esac
+if python3 - "$results_text" <<'PY'
+import sys
+
+lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+i_res = lines.index('results')
+i_rev = lines.index('reviewers')
+i_first = next(i for i, ln in enumerate(lines) if ln.startswith('== #'))
+errors = []
+if not i_rev < i_res < i_first:
+    errors.append("results block is not between the reviewers block and the thread")
+if not lines[i_res + 1].startswith('  v1:'):
+    errors.append("summary body line is not indented under the header")
+if lines[i_first - 1] != '-' * 72 or lines[i_first - 2] != '':
+    errors.append("thread does not start right after the results block")
+for e in errors:
+    print(e)
+sys.exit(1 if errors else 0)
+PY
+then
+    ok "text: results block position and indentation"
+else
+    no "text: results block position and indentation"
+fi
+rm "$RESULTS_MD"
+
 printf '%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))
