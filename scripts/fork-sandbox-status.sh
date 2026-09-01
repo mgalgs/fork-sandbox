@@ -37,8 +37,9 @@
 # git and no other program except fork-sandbox-format.sh, and it accepts only
 # a directory under /var/tmp/claude-scratch/forks/claude-fork-sandbox.* (or the
 # legacy /var/tmp/claude-fork-sandbox.*), resolved first, holding a run.env.
-# Inside that directory it opens a fixed list of file names (including review
-# verdicts) and
+# Inside that directory it opens a fixed list of file names (including the
+# review and maintainer loop records and the review and maintainer verdicts)
+# and
 # refuses a symlink, so it cannot be turned into a way to read an arbitrary
 # file. It never reads stdin.
 #

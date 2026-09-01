@@ -1,12 +1,14 @@
 # Prompt overlays: model-specific corrections, machine-local
 
-`fork-sandbox.sh` renders up to three prompts per run: the implement prompt
+`fork-sandbox.sh` renders up to four prompts per run: the implement prompt
 (`handoff.md`), always, and — under `--review-loop` — a review prompt and a
-fix prompt, one pair per review-then-fix iteration's shared template. Each
-starts with the same preamble describing the sandbox, the services block
-when a repo has them, and that leg's own task text (the operator's handoff
-for implement, "review this branch" for review, "fix what a reviewer found"
-for fix). Every model reads the same text for a given leg. That is right for
+fix prompt, one pair per review-then-fix iteration's shared template, and —
+under `--maintainer-loop` — a maintainer prompt (whose fix legs reuse the
+fix template). Each starts with the same preamble describing the sandbox,
+the services block when a repo has them, and that leg's own task text (the
+operator's handoff for implement, "review this branch" for review, "fix
+what a reviewer found" for fix, "review this branch the way a maintainer
+would" for maintainer). Every model reads the same text for a given leg. That is right for
 most of it — the sandbox does not change per model — but some corrections
 are genuinely model-specific, and pasting them into the shared preamble
 either wastes tokens on a model that never needed them or, worse, becomes a
@@ -86,7 +88,8 @@ said:
 ```
 
 `<harness>` is one of `claude`, `pi`, `pi-local`, `codex`. `<leg>` is exactly
-one of `implement`, `review`, `fix` — the prompt currently being rendered.
+one of `implement`, `review`, `fix`, `maintainer` — the prompt currently
+being rendered.
 Any file that does not exist is skipped silently — a directory holding only
 `all.md` is a perfectly normal setup. The ones that do exist are
 concatenated, in that order, under one heading, into the rendered prompt.
@@ -96,18 +99,20 @@ mean what they meant: every leg reads them. A fragment saying how a model
 should write a commit is as true in the fix leg as in the implement leg, so
 `all.md`, `harness/<harness>.md` and `model/<model>.md` apply everywhere,
 unchanged, and an existing prompts directory keeps working exactly as it did
-before this layer existed — it now simply applies to all three legs instead
-of one. The last two narrow that baseline to one leg: `<leg>/all.md` for
-every model in this leg, `<leg>/model/<model>.md` for this model in this leg
-alone, general first within the leg-scoped pair too.
+before this layer existed — it now simply applies to every leg instead of
+one. The last two narrow that baseline to one leg: `<leg>/all.md` for every
+model in this leg, `<leg>/model/<model>.md` for this model in this leg
+alone, general first within the leg-scoped pair too. A `maintainer/`
+directory is how you correct the maintainer leg's prompt specifically — the
+leg that runs only under `--maintainer-loop`.
 
-`implement`, `review` and `fix` are reserved directory names at the root of a
-prompts directory — a model can never be called `review`. There is no actual
-collision to worry about: a model id is always sanitised into `model/<id>.md`
-(below), never written at the root, so a model literally named `review`
-still cannot shadow the leg directory. But a reader should not have to work
-that out to know a model id is safe to pick; treat the three leg names as
-off-limits at the root, full stop.
+`implement`, `review`, `fix` and `maintainer` are reserved directory names at
+the root of a prompts directory — a model can never be called `review`.
+There is no actual collision to worry about: a model id is always sanitised
+into `model/<id>.md` (below), never written at the root, so a model literally
+named `review` still cannot shadow the leg directory. But a reader should not
+have to work that out to know a model id is safe to pick; treat the four leg
+names as off-limits at the root, full stop.
 
 There is no glob or family matching (`qwen*.md` for a whole model family is
 tempting, but the override order gets fiddly fast, and this project prefers
@@ -166,12 +171,15 @@ prompt_overlay_fragments[fix]=all.md,fix/all.md,fix/model/qwen3.5-9b.md
 prompt_overlay_rev=abc1234
 ```
 
-`--dry-run` knows, from `--review-loop`, exactly which legs a real run would
-generate — the same flag the real run reads — so it reports exactly those
-legs and no others. Without `--review-loop`, only `implement` is printed;
-review and fix never ran, so there is nothing to report for them. This is
-what lets a reader see, at a glance, that the fix leg gets a fragment the
-review leg does not: check `--prompts-dir` before it is spent on a real run.
+`--dry-run` knows, from `--review-loop` and `--maintainer-loop`, exactly
+which legs a real run would generate — the same flags the real run reads —
+so it reports exactly those legs and no others: `implement` always, `review`
+under `--review-loop`, `fix` under either loop (a maintainer fix leg runs on
+the implement harness and shares the fix template), and `maintainer` under
+`--maintainer-loop`. With neither flag, only `implement` is printed; the
+other legs never ran, so there is nothing to report for them. This is what
+lets a reader see, at a glance, that the fix leg gets a fragment the review
+leg does not: check `--prompts-dir` before it is spent on a real run.
 
 ## Provenance: what the run record carries
 
@@ -211,10 +219,12 @@ least one leg, `fork-sandbox.sh` writes `<run-dir>/prompt-overlay.json`, and
   `dir`, one rev covers every leg — the directory did not change git state
   between rendering the implement prompt and rendering the fix prompt.
 - **`legs`** — one key per leg that matched at least one fragment:
-  `implement`, `review`, `fix`. A leg that matched nothing is absent from
-  `legs` entirely, and `review`/`fix` are absent altogether from a run made
-  without `--review-loop`, since those legs never rendered a prompt to carry
-  provenance for. Each present leg holds:
+  `implement`, `review`, `fix`, `maintainer`. A leg that matched nothing is
+  absent from `legs` entirely, and a leg that never rendered a prompt is
+  absent from a run made without the flag that turns it on — `review`
+  without `--review-loop`, `fix` with neither loop, `maintainer` without
+  `--maintainer-loop` — since a prompt that was never rendered carries no
+  provenance. Each present leg holds:
   - **`fragments`** — the relative paths that matched for that leg, in
     composition order (the five-file search order above, filtered to what
     existed).

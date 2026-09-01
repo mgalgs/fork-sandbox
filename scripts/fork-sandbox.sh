@@ -80,10 +80,14 @@
 #                        after the review loop -- or after the session,
 #                        when there is no --review-loop -- an OUTER pass:
 #                        a MAINTAINER leg reviews the branch the way a
-#                        maintainer would (the inner review already read the
-#                        diff line by line, so it reads the surrounding code
-#                        instead), and a fix leg on the implement harness
-#                        addresses its findings, up to N times. N must be a
+#                        maintainer would (when the inner review already
+#                        read the diff line by line it reads the surrounding
+#                        code instead, building on the review's final
+#                        verdict, which the runner appends to its prompt;
+#                        without --review-loop it is the branch's only
+#                        review, so the prompt tells it to read the diff
+#                        close as well), and a fix leg on the implement
+#                        harness addresses its findings, up to N times. N must be a
 #                        positive integer. Fix legs never re-enter the
 #                        review loop. Requires a named model -- see
 #                        --maintainer-model. See "The maintainer loop"
@@ -282,10 +286,14 @@
 # after the review loop (or after the coding session when there is no
 # --review-loop): a MAINTAINER leg reviews the same commit range as a
 # maintainer deciding whether the branch is ready to land. Its prompt says
-# so out loud: the inner review already read the diff line by line, so the
+# so out loud: when a --review-loop read the diff line by line first, the
 # maintainer reads the surrounding code instead — the callers of what the
 # change touches, the conventions the touched files follow, the invariants
-# the area holds. When its verdict lists problems, a fix leg addresses them
+# the area holds — and builds on the review's final verdict, which the
+# runner appends to the prompt the way it embeds the earlier legs' addenda.
+# Without --review-loop the maintainer is the branch's only review, so the
+# prompt's other wording tells it to read the diff close as well. When its
+# verdict lists problems, a fix leg addresses them
 # — on the IMPLEMENT harness and model, exactly like a review-loop fix leg —
 # and the pair repeats up to N times. A fix leg's commits are reviewed by
 # the maintainer's own next iteration, never by the review loop: the inner
@@ -2688,9 +2696,15 @@ codex)
         harness_version="$("${codex_argv0[@]}" --version 2>/dev/null | head -1 || true)"
     fi
     # The credential is built by the runner, into a file this script only
-    # names. See the runner for why it is made there and not here.
+    # names. See the runner for why it is made there and not here. Every
+    # codex resolution makes a FRESH directory: --review-harness and
+    # --maintainer-harness each resolve a second/third time, so the runner
+    # deletes the whole list of them when it ends, not the last one -- a
+    # directory left behind is a mode-0600 file holding a live codex access
+    # token (see codex_auth_dirs, below).
     codex_auth_dir="$(mktemp -d /var/tmp/claude-scratch/forks/claude-fork-codex.XXXXXX)"
     chmod 700 "$codex_auth_dir"
+    codex_auth_dirs+=("$codex_auth_dir")
     harness_env_file="$codex_auth_dir/env"
 
     #   --json                 events as JSONL, which is where the token
@@ -2728,6 +2742,10 @@ codex)
     fs_reject_unsafe_chars "$harness_bin" "$harness_version"
 }
 
+# Every codex credential directory this run's resolutions create, in order.
+# The generated runner deletes all of them when it ends (run_cleanup) --
+# see the codex arm of fs_resolve_harness for why the list and not one.
+codex_auth_dirs=()
 fs_resolve_harness "$harness" "$model" impl
 # Compatibility copy: the run record (run.env, the generated runner) and
 # the review-loop accounting below still read these bare names -- moving
@@ -3376,13 +3394,19 @@ if (( maintainer_loop_cap > 0 )); then
     maintainer_prompt="$run_dir/maintainer-prompt.md"
     maintainer_verdict_file="$clone_dir/.git/maintainer-verdict.md"
     fs_reject_unsafe_chars "$maintainer_prompt" "$maintainer_verdict_file"
+    # Whether the prompt may tell the leg that an inner review already read
+    # the diff. --maintainer-loop is supported without --review-loop, where
+    # the maintainer is the branch's only review; the lib carries the two
+    # wordings (see fs_emit_maintainer_prompt_body).
+    mnt_inner_review=no
+    (( review_loop_cap > 0 )) && mnt_inner_review=yes
     {
         fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" \
             "$maintainer_preamble_harness" "$maintainer_preamble_network" \
             "$outbox_dir" "" "$outbox_max_bytes"
         fs_emit_prompt_overlay maintainer
         fs_emit_maintainer_prompt_body "$branch" "$base_sha" \
-            "$maintainer_verdict_file" "$inbox_dir"
+            "$maintainer_verdict_file" "$inbox_dir" "$mnt_inner_review"
     } > "$maintainer_prompt.part"
     mv -- "$maintainer_prompt.part" "$maintainer_prompt"
 fi
@@ -3890,7 +3914,11 @@ started_at="$(date +%s)"
     printf 'usage_source=%q\n' "$usage_source"
     printf 'harness_env_file=%q\n' "$harness_env_file"
     printf 'codex_auth_src=%q\n' "${codex_auth_src:-}"
-    printf 'codex_auth_dir=%q\n' "${codex_auth_dir:-}"
+    printf 'codex_auth_dirs=('
+    if [[ "${#codex_auth_dirs[@]}" -gt 0 ]]; then
+        printf '%q ' "${codex_auth_dirs[@]}"
+    fi
+    printf ')\n'
     printf 'model=%q\n' "$model"
     printf 'review_model=%q\n' "$review_model"
     printf 'review_harness=%q\n' "$review_harness"
@@ -4078,16 +4106,22 @@ printf '\nHeadless. Nothing here needs a keypress; the session exits on its own.
 # real one is single-use, so a sandbox that spent it would silently log the
 # host out of codex. codex only refreshes when the access token has
 # expired, so this run works and simply cannot rotate the host's
-# credential. The file is 0600 and goes when this script does.
+# credential. The file is 0600 and goes, with its directory, when this
+# script does. Up to three legs (implement, review, maintainer) each
+# resolved their own codex harness, so codex_auth_dirs holds every such
+# directory the launcher made.
 # Cleanup that must run however this session ends — a normal exit, an error, or
-# a kill. It removes the codex credential and tears the per-run services down.
+# a kill. It removes every codex credential directory and tears the per-run
+# services down.
 # It runs its body once (a --keep-session run calls it inline before the exec,
 # which never reaches an EXIT trap; the trap catches every other ending).
 run_cleanup() {
     [[ -n "${_cleanup_done:-}" ]] && return 0
     _cleanup_done=1
-    if [[ -n "$codex_auth_dir" ]]; then
-        rm -rf "$codex_auth_dir"
+    if [[ "${#codex_auth_dirs[@]}" -gt 0 ]]; then
+        for codex_auth_dir in "${codex_auth_dirs[@]}"; do
+            rm -rf "$codex_auth_dir"
+        done
     fi
     if [[ "$services_enabled" == "1" && -n "$services_script" ]]; then
         # timeout on every docker-touching command here: this function is the
@@ -5233,8 +5267,11 @@ fi
 
 # --maintainer-loop: the outer tier, after the review loop (or after the
 # coding session when there is no review loop). A maintainer leg reviews the
-# branch as a maintainer would -- the inner review already read the diff line
-# by line, so it reads the surrounding code -- and a fix leg on the implement
+# branch as a maintainer would -- when a review loop ran, the inner review
+# already read the diff line by line, so it reads the surrounding code and
+# builds on the review's final verdict, appended to the per-iteration prompt
+# below; when none did, it reads the diff close too, since it is the
+# branch's only review -- and a fix leg on the implement
 # harness addresses its findings. The mechanism is the review loop's, one for
 # one; only the harness, the prompt and the record differ. Fix legs never
 # re-enter the review loop: the inner loop is over by the time this one
@@ -5407,6 +5444,46 @@ if [[ "${maintainer_loop_cap:-0}" != "0" && -n "${maintainer_prompt:-}" ]]; then
                         cat -- "$mp_file"
                     done
                 done <<< "$mp_addenda_list"
+            fi
+            # The static prompt's "the inner review's final verdict is
+            # appended to this prompt" promise, kept: the run dir is never
+            # bound into the sandbox, so without this the leg is told it
+            # holds findings it cannot read. The highest-numbered verdict is
+            # the one to show -- it read the branch after every earlier
+            # review and fix. A review loop that ended without a usable
+            # verdict (its leg died) gets a correction instead, so the leg
+            # knows to read the diff itself.
+            if [[ "${review_loop_cap:-0}" != "0" ]]; then
+                mp_review_verdict=""
+                mp_review_n=0
+                for mp_v in "$run_dir"/review-verdict-*.md; do
+                    [[ -f "$mp_v" ]] || continue
+                    mp_v_n="${mp_v##*/review-verdict-}"
+                    mp_v_n="${mp_v_n%.md}"
+                    [[ "$mp_v_n" =~ ^[0-9]+$ ]] || continue
+                    if (( mp_v_n > mp_review_n )); then
+                        mp_review_n="$mp_v_n"
+                        mp_review_verdict="$mp_v"
+                    fi
+                done
+                if [[ -n "$mp_review_verdict" ]]; then
+                    printf '\n---\n\n## The inner review'\''s final verdict\n\n'
+                    printf 'The review loop read the diff line by line before this loop\n'
+                    printf 'started. Its verdict from iteration %s is below, in full: this\n' "$mp_review_n"
+                    printf 'is the "findings to build on" the prompt above names. Build on\n'
+                    printf 'it rather than re-review what the loop already reviewed -- but\n'
+                    printf 'it is the loop'\''s account of the branch as it stood when the\n'
+                    printf 'loop ended, and the fix legs have committed since, so check\n'
+                    printf 'each finding against what is there now.\n\n'
+                    cat -- "$mp_review_verdict"
+                else
+                    printf '\n---\n\n## The inner review left no verdict\n\n'
+                    printf 'The review loop was requested, but it ended (%s) without\n' \
+                        "${review_loop_ended:-unknown}"
+                    printf 'leaving a usable verdict, so there are no findings to build\n'
+                    printf 'on despite what the prompt above says: read the diff\n'
+                    printf 'yourself.\n'
+                fi
             fi
         } > "$maintainer_prompt_iter.part"
         mv -- "$maintainer_prompt_iter.part" "$maintainer_prompt_iter"
@@ -5754,23 +5831,26 @@ else
 fi
 
 {
+    # The value column is 12, not 10: 'maintainer:' is 11 characters, the
+    # longest label in the block, and the block reads as two aligned
+    # columns only if the whole block shares its width.
     printf '== fork-sandbox summary ==\n'
-    printf 'branch:   %s\n' "$branch"
-    printf 'mode:     %s\n' "$mode"
-    printf 'origin:   %s\n' "$origin_repo"
-    printf 'clone:    %s\n' "$clone_dir"
-    printf 'exit:     %s\n' "$rc"
-    printf 'commits:  %s\n' "$n_commits"
+    printf 'branch:    %s\n' "$branch"
+    printf 'mode:      %s\n' "$mode"
+    printf 'origin:    %s\n' "$origin_repo"
+    printf 'clone:     %s\n' "$clone_dir"
+    printf 'exit:      %s\n' "$rc"
+    printf 'commits:   %s\n' "$n_commits"
     if [[ -n "$run_cost_fmt" ]]; then
-        printf 'cost:     $%s\n' "$run_cost_fmt"
+        printf 'cost:      $%s\n' "$run_cost_fmt"
     fi
     # One line for the review loop when it ran at all, including the case
     # where it was skipped and why.
     if [[ -n "$review_loop_ended" ]]; then
         if [[ "$review_loop_ended" == "skipped" ]]; then
-            printf 'review:   skipped -- %s\n' "$review_loop_detail"
+            printf 'review:    skipped -- %s\n' "$review_loop_detail"
         else
-            printf 'review:   %s iteration(s), ended %s\n' \
+            printf 'review:    %s iteration(s), ended %s\n' \
                 "$(jq '.iterations | length' "$run_dir/review-loop.json" 2>/dev/null || printf '?')" \
                 "$review_loop_ended"
         fi
@@ -5793,7 +5873,7 @@ fi
     # threshold (the common case, since the flag is on by default) reads
     # exactly as it did before this feature existed.
     if [[ "$refresh_leg_n" -gt 0 || "$refresh_ended" == "no-handoff" ]]; then
-        printf 'refresh:  %s continuation leg(s), ended %s\n' \
+        printf 'refresh:   %s continuation leg(s), ended %s\n' \
             "$refresh_leg_n" "$refresh_ended"
     fi
     # The total is printed only when it actually spent something beyond the
@@ -5801,19 +5881,19 @@ fi
     # neither ever doing anything -- reads exactly as it did before either
     # feature existed.
     if [[ -n "$total_cost_fmt" && "$total_cost_fmt" != "$run_cost_fmt" ]]; then
-        printf 'total:    $%s  (the session and every review-loop or continuation leg)\n' \
+        printf 'total:     $%s  (the session and every review-, maintainer- or continuation leg)\n' \
             "$total_cost_fmt"
     fi
     if [[ -d "$run_dir/pi-session" ]]; then
-        printf 'session:  %s\n' "$run_dir/pi-session"
+        printf 'session:   %s\n' "$run_dir/pi-session"
     fi
     if (( ! fetched )); then
-        printf 'fetched:  NO -- the work is in the clone only\n'
+        printf 'fetched:   NO -- the work is in the clone only\n'
     elif (( removed )); then
-        printf 'fetched:  nothing. The session made no commits, so branch %s\n' "$branch"
-        printf '          was removed again and %s is unchanged.\n' "$origin_repo"
+        printf 'fetched:   nothing. The session made no commits, so branch %s\n' "$branch"
+        printf '            was removed again and %s is unchanged.\n' "$origin_repo"
     else
-        printf 'fetched:  yes. Branch %s is now in %s\n' "$branch" "$origin_repo"
+        printf 'fetched:   yes. Branch %s is now in %s\n' "$branch" "$origin_repo"
     fi
     if (( fetched )) && [[ "$n_commits" != "0" ]]; then
         # The commits are untrusted, and git passes a subject through

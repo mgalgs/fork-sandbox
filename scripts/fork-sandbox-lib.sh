@@ -1291,24 +1291,49 @@ before this heading.
 EOF
 }
 
+# inner_review is "yes" when a --review-loop ran before this one and "no"
+# otherwise: the two wordings are the difference between "the diff was
+# already read line by line, read around it" and "you are the branch's only
+# review, so read the diff too". --maintainer-loop is supported without
+# --review-loop, where the maintainer is the first and last review the
+# branch gets, and the "no" wording is the one that has to be true there.
+# In the "yes" case the runner appends the inner review's final verdict to
+# the per-iteration prompt (or a correction when it left none), the way it
+# embeds the earlier legs' addenda — the run dir is never bound into the
+# sandbox, so the static prompt alone could not promise the leg a file it
+# can read.
 fs_emit_maintainer_prompt_body() {
     local branch="$1" base_sha="$2"
     local maintainer_verdict_file="$3" inbox_dir="$4"
+    local inner_review="$5"
+    local mnt_role_para
+    if [[ "$inner_review" == "yes" ]]; then
+        mnt_role_para="Another session worked in this same clone and committed to the branch
+\`$branch\`, and an inner review loop has already read that diff line by line
+— bugs, broken tests, style. That pass is done. You are the MAINTAINER, a
+different session deciding whether the branch is ready to land. So read the
+surrounding code, not the diff: the callers of what the change touches, the
+conventions the touched files follow, the invariants the area holds, and how
+this change interacts with what already exists. The inner review's final
+verdict is appended to this prompt, so you have its findings to build on,
+not to redo — a line-by-line reread of the diff is not the job here."
+    else
+        mnt_role_para="Another session worked in this same clone and committed to the branch
+\`$branch\`, and no review has read that diff yet — you are the first review
+it gets, and the last. You are the MAINTAINER, deciding whether the branch
+is ready to land, so your review covers both sides: read the diff close —
+bugs, broken tests, style — and read the surrounding code too: the callers
+of what the change touches, the conventions the touched files follow, the
+invariants the area holds, and how this change interacts with what already
+exists."
+    fi
     cat <<EOF
 
 ---
 
 # Your task: review this branch the way a maintainer would, and only review it
 
-Another session worked in this same clone and committed to the branch
-\`$branch\`, and an inner review loop has already read that diff line by line
-— bugs, broken tests, style. That pass is done. You are the MAINTAINER, a
-different session deciding whether the branch is ready to land. So read the
-surrounding code, not the diff: the callers of what the change touches, the
-conventions the touched files follow, the invariants the area holds, and how
-this change interacts with what already exists. A line-by-line reread of the
-diff is not the job here — the inner review did it, and you have its
-findings to build on, not to redo.
+$mnt_role_para
 
 The change is the commit range:
 

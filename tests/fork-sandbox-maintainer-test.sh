@@ -449,9 +449,36 @@ if (( rc2 == 0 )) && [[ -n "$rd2" ]]; then
         "the way a maintainer would" "$(cat "$rd2/maintainer-prompt.md")"
     contains "the maintainer prompt names the verdict path" \
         ".git/maintainer-verdict.md" "$(cat "$rd2/maintainer-prompt.md")"
+    # This run has no --review-loop, so the prompt must NOT claim an inner
+    # review read the diff: the maintainer is the branch's only review.
+    contains "a no-review-loop prompt says the maintainer is the first review" \
+        "no review has read that diff yet" \
+        "$(cat "$rd2/maintainer-prompt.md")"
+    contains "a no-review-loop prompt tells the leg to read the diff close" \
+        "read the diff close" \
+        "$(cat "$rd2/maintainer-prompt.md")"
+    if ! grep -q "The inner review" "$rd2/maintainer-prompt-1.md" 2>/dev/null; then
+        ok "a no-review-loop prompt embeds no inner-review verdict"
+    else
+        no "a no-review-loop prompt embeds no inner-review verdict" \
+            "$(grep 'The inner review' "$rd2/maintainer-prompt-1.md")"
+    fi
     contains "the fix prompt carries the verdict body" \
         "file.txt:1 the new line breaks the invariant it sits next to" \
         "$(cat "$rd2/maintainer-fix-prompt-1.md")"
+    # The total now spends maintainer-tier money too, so the line that
+    # explains it names that tier, and the summary's value column stays
+    # aligned even though 'maintainer:' is the longest label.
+    contains "the summary's total names the tiers it includes" \
+        "(the session and every review-, maintainer- or continuation leg)" \
+        "$(cat "$rd2/summary.txt")"
+    if grep -q '^branch:    ' "$rd2/summary.txt" \
+        && grep -q '^maintainer: ' "$rd2/summary.txt"; then
+        ok "the summary's value column aligns across all labels"
+    else
+        no "the summary's value column aligns across all labels" \
+            "$(grep -E '^(branch|maintainer):' "$rd2/summary.txt")"
+    fi
     contains "events.jsonl still shows the coding session" \
         '"subtype":"success"' "$(cat "$rd2/events.jsonl")"
     if [[ -f "$rd2/exit-code" ]]; then
@@ -461,6 +488,91 @@ if (( rc2 == 0 )) && [[ -n "$rd2" ]]; then
     fi
 else
     no "the four-leg maintainer run exits 0" "rc=$rc2 rd=$rd2: $out2"
+fi
+
+# --review-loop and --maintainer-loop together: the static prompt may claim
+# the inner review read the diff, and the "findings to build on" it promises
+# exist only if the runner carries the review loop's final verdict into the
+# per-iteration prompt -- the run dir is never bound into a leg's sandbox.
+loop3_stub="$(mktemp -d /var/tmp/claude-scratch/fs-maintainer-loop3.XXXXXX)"
+tmpdirs+=("$loop3_stub")
+cat > "$loop3_stub/claude-sandboxed" <<'STUB'
+#!/usr/bin/env bash
+set -uo pipefail
+
+outbox="" clone_dir="" prev=""
+for a in "$@"; do
+    [[ "$prev" == "--bind-rw" ]] && outbox="$a"
+    [[ "$a" == "--dangerously-skip-permissions" ]] && clone_dir="$prev"
+    prev="$a"
+done
+
+cat >/dev/null
+n=0
+[[ -f "$FAKE_COUNT_FILE" ]] && n="$(cat "$FAKE_COUNT_FILE")"
+n=$(( n + 1 ))
+printf '%s' "$n" > "$FAKE_COUNT_FILE"
+
+case "$n" in
+1)
+    git -c user.email=t@fork-sandbox.invalid -c user.name=Tester \
+        -C "$clone_dir" commit --allow-empty -q -m "loop3 implement"
+    ;;
+2)
+    printf 'FINDINGS\n\nfile.txt:1 the review found a problem\n' \
+        > "$clone_dir/.git/review-verdict.md"
+    ;;
+3)
+    git -c user.email=t@fork-sandbox.invalid -c user.name=Tester \
+        -C "$clone_dir" commit --allow-empty -q -m "loop3 review fix"
+    ;;
+4)
+    printf 'APPROVED\nChecked: the whole diff line by line.\n\n## Report\nreview report\n' \
+        > "$clone_dir/.git/review-verdict.md"
+    ;;
+5)
+    printf 'APPROVED\n\nChecked: the surrounding callers.\n\n## Report\nAll five paragraphs.\n' \
+        > "$clone_dir/.git/maintainer-verdict.md"
+    ;;
+esac
+
+printf '{"type":"result","subtype":"success","total_cost_usd":0.01,"usage":{"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}\n'
+exit 0
+STUB
+chmod +x "$loop3_stub/claude-sandboxed"
+
+count3="$(mktemp)"; tmpdirs+=("$count3")
+out3="$(PATH="$loop3_stub:$real_stub:$PATH" FAKE_COUNT_FILE="$count3" \
+    FORK_SANDBOX_CONFIG_DIR="$real_cfg" FORK_SANDBOX_BACKEND=fake-image \
+    timeout 60 "$launcher" --foreground --harness claude \
+    --review-loop 2 --review-model sonnet \
+    --maintainer-loop 1 --maintainer-model opus \
+    --branch "sandbox-test-loop3-$$" \
+    "$proj" "$handoff" 2>&1)"
+rc3=$?
+rd3="$(printf '%s\n' "$out3" | sed -n 's/^  run dir:  *//p' | head -1)"
+if (( rc3 == 0 )) && [[ -n "$rd3" ]]; then
+    tmpdirs+=("$rd3")
+    ok "the five-leg combined run exits 0"
+    check "five legs ran: impl, review, fix, review, maintainer" "5" \
+        "$(cat "$count3")"
+    contains "a review-looped prompt claims the inner review" \
+        "an inner review loop has already read that diff line by line" \
+        "$(cat "$rd3/maintainer-prompt.md")"
+    contains "that prompt names the verdict it will be given" \
+        "verdict is appended to this prompt" \
+        "$(cat "$rd3/maintainer-prompt.md")"
+    contains "the per-iter prompt embeds the inner review's verdict" \
+        "## The inner review's final verdict" \
+        "$(cat "$rd3/maintainer-prompt-1.md")"
+    contains "the embedded verdict is the loop's final one" \
+        "Its verdict from iteration 2 is below" \
+        "$(cat "$rd3/maintainer-prompt-1.md")"
+    contains "the embedded verdict carries the review leg's account" \
+        "Checked: the whole diff line by line." \
+        "$(cat "$rd3/maintainer-prompt-1.md")"
+else
+    no "the five-leg combined run exits 0" "rc=$rc3 rd=$rd3: $out3"
 fi
 
 # A branch with no commits skips the loop, and says why.
