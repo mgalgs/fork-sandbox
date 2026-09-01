@@ -186,6 +186,14 @@ run "non-integer --version" 1 widget-frob --project "$project_dir" --version v1
 contains "non-integer --version is refused" "$(cat "$out_file")" "plain integer"
 run "whitespace tier spec" 1 widget-frob --project "$project_dir" --low "claude /sonnet"
 contains "whitespace in a tier spec is refused" "$(cat "$out_file")" "whitespace"
+run "non-integer --timeout" 1 widget-frob --project "$project_dir" --timeout soon
+contains "non-integer --timeout is refused" "$(cat "$out_file")" "--timeout must be a number"
+if bash "$summarize" widget-frob -h > "$out_file" 2>&1; then
+    ok "-h after the series prints usage and exits 0"
+else
+    no "-h after the series prints usage and exits 0" "exit $?"
+fi
+contains "the usage names the tier flags" "$(cat "$out_file")" "--high"
 
 printf '\n== loud failures before any launch ==\n'
 run "missing series" 1 nosuchseries --project "$project_dir"
@@ -402,6 +410,22 @@ case "$out_full" in
     *200\ words*) no "a short Summary does not warn" ;;
     *) ok "a short Summary does not warn" ;;
 esac
+
+printf '\n== a low run that leaves unparseable JSON ==\n'
+cap8="$(mktemp -d)"; tmpdirs+=("$cap8")
+out_full="$(PATH="$stub_bin:$PATH" STUB_CAPTURE_DIR="$cap8" STUB_RUN_PREFIX="$run_prefix_dir" \
+    STUB_JSON='not json at all' STUB_MD="$DEFAULT_MD" \
+    "$summarize" widget-frob --project "$project_dir" 2>&1)"
+rc=$?
+if (( rc == 0 )); then ok "unparseable intermediate still exits 0 (warn, don't die)"; else no "unparseable intermediate still exits 0 (warn, don't die)" "exit $rc: $out_full"; fi
+contains "the warning names the harvested file" "$out_full" "not parseable JSON"
+contains "the high tier got the unparseable intermediate verbatim" \
+    "$(cat "$cap8/summarize-high.handoff.md")" "not json at all"
+if cmp -s <(printf '%s\n' 'not json at all') "$series_dir/results-v2.json"; then
+    ok "the unparseable intermediate is still harvested verbatim"
+else
+    no "the unparseable intermediate is still harvested verbatim" "$(cat "$series_dir/results-v2.json")"
+fi
 
 printf '\n== a low run that leaves no intermediate ==\n'
 cap7="$(mktemp -d)"; tmpdirs+=("$cap7")
