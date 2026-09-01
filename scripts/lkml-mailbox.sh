@@ -468,9 +468,12 @@ lkml_resolve_id() {
         done
     fi
     if [[ -n "$wanted_index" ]]; then
+        # Stored positions are zero-padded to the width of the total; pad
+        # the wanted index the same way before the subject match.
+        local wanted_pos; wanted_pos="$(printf '%0*d' "${#wanted_total}" "$wanted_index")"
         for i in "${!LKML_ID[@]}"; do
             [[ "${LKML_VERSION[$i]}" == "$wanted_version" ]] || continue
-            [[ "${LKML_SUBJECT[$i]}" == "[PATCH v$wanted_version $wanted_index/$wanted_total]"* ]] || continue
+            [[ "${LKML_SUBJECT[$i]}" == "[PATCH v$wanted_version $wanted_pos/$wanted_total]"* ]] || continue
             match="${LKML_ID[$i]}"; count=$(( count + 1 ))
         done
         if (( count == 1 )); then
@@ -606,7 +609,9 @@ cmd_init() {
     local cover_id cover_subject cover_body cover_first_line
     cover_id="$(lkml_new_uuid)"
     cover_first_line="$(head -n1 -- "$cover" | sed 's/[[:space:]]*$//')"
-    cover_subject="[PATCH v$version 0/$m] $cover_first_line"
+    # Zero-padded like the patch positions below, so the cover's stored
+    # subject is canonical lore style too.
+    cover_subject="[PATCH v$version $(printf '%0*d' "${#m}" 0)/$m] $cover_first_line"
     cover_body="$(cat -- "$cover")"
     if [[ -n "$diffstat_range" ]]; then
         local diffstat_out
@@ -625,15 +630,20 @@ cmd_init() {
         "$from" "$display" "$harness" "$model" "$cover_subject" "" "$cover_body" "$attach_csv"
     echo "fork-sandbox lkml: posted cover ${cover_id:0:7} as v$version 0/$m" >&2
 
-    local n=0 pf subj body id
+    local n=0 pf subj body id pos
+    # The position is zero-padded to the width of $m (lore-style), so the
+    # stored subject is the canonical form the renderer's tally rows and
+    # thread index show: a patch's --text Subject: line and its tally
+    # label then agree, and an agent can grep the label to find the patch.
     for pf in "${patch_files[@]}"; do
         n=$(( n + 1 ))
+        pos="$(printf '%0*d' "${#m}" "$n")"
         subj="$(grep -m1 '^Subject: ' -- "$pf" | sed 's/^Subject: //; s/^\[PATCH[^]]*\] *//')"
         [[ -n "$subj" ]] || subj="$(basename -- "$pf")"
         body="$(cat -- "$pf")"
         id="$(lkml_new_uuid)"
         lkml_post_raw "$series" "$id" "$cover_id" "<$cover_id@lkml.local>" "$version" 1 \
-            "$from" "$display" "$harness" "$model" "[PATCH v$version $n/$m] $subj" "" "$body"
+            "$from" "$display" "$harness" "$model" "[PATCH v$version $pos/$m] $subj" "" "$body"
         echo "fork-sandbox lkml: posted patch ${id:0:7} as v$version $n/$m" >&2
     done
     printf '%s\n' "$cover_id"

@@ -477,17 +477,23 @@ def render_text_message(out, m, nums, depth):
 
 
 def fit_tally_label(label, budget):
-    """Truncate a text-tally row label to `budget` columns: the
-    [PATCH vN i/M] prefix survives intact and the cut is marked with a
-    trailing ellipsis on the SUBJECT part. Never falls back to the bare
-    'Patch vN i/M' form."""
+    """Truncate a text-tally row label to at most `budget` columns, always
+    marking the cut with a trailing ellipsis. When the [PATCH vN i/M]
+    prefix fits the budget it survives intact and the cut lands on the
+    SUBJECT part; a smaller budget cuts the prefix itself, and a zero
+    budget drops the label entirely (the tag columns, not the label,
+    are the overflow then). Either way the returned label never takes
+    more than `budget` columns. Never falls back to the bare 'Patch vN
+    i/M' form."""
     if len(label) <= budget:
         return label
+    if budget <= 0:
+        return ""
     mm = re.match(r"^(\[PATCH v\d+ \d+/\d+\] )(.*)$", label)
     if mm and budget > len(mm.group(1)) + 1:
         keep = budget - len(mm.group(1)) - 1
         return mm.group(1) + mm.group(2)[:keep] + "\u2026"
-    return label[:budget]
+    return label[:budget - 1] + "\u2026"
 
 
 def render_text_tally(out, rows, pcols):
@@ -503,8 +509,12 @@ def render_text_tally(out, rows, pcols):
         grid.append([label] + [TAG_GLYPH.get(latest[p][2][0], "·") if p in latest else "·" for p in pcols])
     widths = [max(len(row[i]) for row in grid) for i in range(len(grid[0]))]
     # Gap is two spaces between columns; the label column alone absorbs
-    # the overflow, so the tag columns stay readable.
-    budget = 120 - sum(widths[1:]) - 2 * (len(widths) - 1)
+    # the overflow, so the tag columns stay readable. Floor at zero: when
+    # the tag columns alone eat the whole 120, no label can fit and the
+    # overflow lives in the configured panel width, not in a mangled
+    # label (a negative slice would chop the label's END and push the
+    # rows far past 120).
+    budget = max(0, 120 - sum(widths[1:]) - 2 * (len(widths) - 1))
     if widths[0] > budget:
         for row in grid:
             row[0] = fit_tally_label(row[0], budget)

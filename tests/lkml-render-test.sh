@@ -299,6 +299,20 @@ ph="$(<"$pad_out")"
 contains "14-patch row 2 reads 02/14 in the HTML row label" "$ph" '>[PATCH v1 02/14] demo: patch number 2</a></th>'
 contains "14-patch row 14 is not over-padded" "$ph" '>[PATCH v1 14/14] demo: patch number 14</a></th>'
 case "$ph" in *'>Patch v1 2/14</a>'*) no "the demoted 'Patch vN i/M' form is gone" ;; *) ok "the demoted 'Patch vN i/M' form is gone" ;; esac
+# One document, one subject: the mailbox stores the position zero-padded
+# too, so the patch's own Subject: line in the agent view is the same
+# string the tally labels (an agent can grep the label to find the patch).
+# This post also proves the mailbox resolver still matches an UNPADDED
+# '2/14' against the padded stored subject.
+if "$mailbox" post pad-14 --from core --reply-to '[PATCH v1 2/14]' --file "$work/review.txt" \
+    --tags Reviewed-by --harness test --model fixture >/dev/null 2>/dev/null; then
+    ok "mailbox: unpadded '2/14' resolves against the padded stored subject"
+else
+    no "mailbox: unpadded '2/14' resolves against the padded stored subject"
+fi
+pad_text="$work/pad.txt"
+python3 "$renderer" --text "$LKML_MAILBOX_ROOT/pad-14" > "$pad_text"
+contains "text: patch 2 Subject: line is zero-padded like its tally label" "$(<"$pad_text")" 'Subject: [PATCH v1 02/14] demo: patch number 2'
 
 printf '\n== text tally: the 120-column cap truncates the subject part ==\n'
 # A 150-char subject must truncate the SUBJECT part of the label (prefix
@@ -318,7 +332,11 @@ printf '%s\n' \
 long_out="$work/long.txt"
 python3 "$renderer" --text "$LKML_MAILBOX_ROOT/long-subj" > "$long_out"
 lt="$(<"$long_out")"
-contains "text: the truncated label carries a trailing ellipsis" "$lt" '…'
+# The tally block is the run of non-blank lines after the legend. Scope
+# the checks to it: the patch's own Subject: line carries the same label
+# text, so a whole-output check would still pass if the table were gone.
+ltally="$(awk '/^Latest tag per reviewer/{ f = 1; next } f && /^$/{ exit } f' "$long_out")"
+contains "text: the truncated label carries a trailing ellipsis" "$ltally" '…'
 if python3 - "$long_out" <<'PY'
 import sys
 
@@ -329,6 +347,11 @@ for ln in lines[i + 1:]:
     if not ln:
         break
     block.append(ln)
+# The grid must actually be there: header row, cover row, the truncated
+# patch row. An empty block would pass the width check vacuously.
+if len(block) != 3 or not block[0].startswith("patch") or not block[2].startswith("[PATCH"):
+    print("tally grid missing or malformed:", block)
+    sys.exit(1)
 bad = [len(ln) for ln in block if len(ln) > 120]
 if bad:
     print("tally lines over 120 columns:", bad)
@@ -339,9 +362,79 @@ then
 else
     no "text: no tally line exceeds 120 columns"
 fi
-contains "text: truncation keeps the prefix and subject start intact" "$lt" '[PATCH v1 1/1] demo: a very long subject xxx'
-contains "text: truncation is marked with a trailing ellipsis" "$lt" 'xxx…'
-case "$lt" in *'Patch v1 1/1 '*|*'Patch v1 1/1\n'*) no "text: the demoted 'Patch vN i/M' form never appears" ;; *) ok "text: the demoted 'Patch vN i/M' form never appears" ;; esac
+contains "text: truncation keeps the prefix and subject start intact" "$ltally" '[PATCH v1 1/1] demo: a very long subject xxx'
+contains "text: truncation is marked with a trailing ellipsis" "$ltally" 'xxx…'
+nl=$'\n'
+# The old demoted form would sit at the start of a tally row: followed by
+# the column gap, or at end of line when no tag columns exist. A quoted
+# '\n' in a case pattern is a literal backslash-n, so the newline comes
+# from a variable.
+endpat="$nl Patch v1 1/1$nl"
+case "$lt" in *'Patch v1 1/1 '*|*"$endpat"*) no "text: the demoted 'Patch vN i/M' form never appears" ;; *) ok "text: the demoted 'Patch vN i/M' form never appears" ;; esac
+
+printf '\n== text tally: the tag columns squeeze the label budget ==\n'
+# Four 24-char reviewer slugs (user-configurable panel width) leave the
+# label column 16 columns: the [PATCH vN i/M] prefix no longer fits, but
+# the cut must still be marked and no line may pass 120.
+"$mailbox" init squeeze --cover "$work/cover.txt" --patches "$work/patches-long" \
+    --from author --harness test --model fixture >/dev/null 2>/dev/null
+sq_tree="$("$mailbox" tree squeeze)"
+sq_patch_id="$(printf '%s\n' "$sq_tree" | awk '/\[PATCH v1 1\/1\]/{print $1}')"
+sl4() { printf '%s%s' "$(printf 'a%.0s' $(seq 1 22))" "$1"; }
+for k in 01 02 03 04; do
+    "$mailbox" post squeeze --from "$(sl4 "$k")" --reply-to "$sq_patch_id" \
+        --file "$work/review.txt" --tags Reviewed-by --harness test --model fixture >/dev/null 2>/dev/null
+done
+sq_out="$work/squeeze.txt"
+python3 "$renderer" --text "$LKML_MAILBOX_ROOT/squeeze" > "$sq_out"
+sqally="$(awk '/^Latest tag per reviewer/{ f = 1; next } f && /^$/{ exit } f' "$sq_out")"
+contains "text: mid-prefix cut is marked with a trailing ellipsis" "$sqally" '…'
+if [[ -z "$(awk 'length > 120' <<<"$sqally")" ]]; then ok "text: no tally line exceeds 120 columns when the budget is 16"; else no "text: no tally line exceeds 120 columns when the budget is 16"; fi
+# Sixteen 6-char reviewer slugs take 128 of the 120 columns: no label can
+# fit at all. The label column must collapse to nothing, not emit a
+# negative-sliced fragment of the label (which would push the rows far
+# past 120 and drop the label's tail unmarked).
+"$mailbox" init panel --cover "$work/cover.txt" --patches "$work/patches-long" \
+    --from author --harness test --model fixture >/dev/null 2>/dev/null
+pn_tree="$("$mailbox" tree panel)"
+pn_patch_id="$(printf '%s\n' "$pn_tree" | awk '/\[PATCH v1 1\/1\]/{print $1}')"
+for i in $(seq 0 15); do
+    "$mailbox" post panel --from "$(printf 'r%05d' "$i")" --reply-to "$pn_patch_id" \
+        --file "$work/review.txt" --tags Reviewed-by --harness test --model fixture >/dev/null 2>/dev/null
+done
+pn_out="$work/panel.txt"
+python3 "$renderer" --text "$LKML_MAILBOX_ROOT/panel" > "$pn_out"
+if python3 - "$pn_out" <<'PY'
+import sys
+
+lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+i = next(i for i, ln in enumerate(lines) if ln.startswith("Latest tag per reviewer"))
+block = []
+for ln in lines[i + 1:]:
+    if not ln:
+        break
+    block.append(ln)
+# Grid still there: header, cover, patch rows.
+if len(block) != 3:
+    print("tally grid missing or malformed:", block)
+    sys.exit(1)
+# 16 x 6-char tag columns + gaps take 128 columns, so no row may be
+# wider: the label column contributed nothing.
+wide = [len(ln) for ln in block if len(ln) > 128]
+if wide:
+    print("tally rows wider than the tag columns:", wide)
+    sys.exit(1)
+# The label text is gone, not truncated into the table.
+leaked = [ln for ln in block if "subject" in ln]
+if leaked:
+    print("label fragment leaked into the table:", leaked)
+    sys.exit(1)
+PY
+then
+    ok "text: negative label budget collapses the label column, no mangled rows"
+else
+    no "text: negative label budget collapses the label column, no mangled rows"
+fi
 
 printf '\n== text mode: thread walk and message rendering ==\n'
 # The agent view: same thread selection and ordering as the HTML render,
@@ -379,10 +472,13 @@ else
 fi
 
 printf '\n== text mode: tally and reviewers ==\n'
+# Same scoping as the long-subj checks above: these labels also appear in
+# each patch's own Subject: line, so the tally block is the haystack.
+ttally="$(awk '/^Latest tag per reviewer/{ f = 1; next } f && /^$/{ exit } f' "$text_out")"
 contains "text: header count line includes reviewers" "$ttext" '2 patches · 7 replies · 5 reviewers'
 contains "text: tally legend is plain text" "$ttext" 'Latest tag per reviewer per patch. R reviewed, A acked, C changes requested, ? question, N nak.'
-contains "text: patch rows use the HTML row labels" "$ttext" '[PATCH v1 1/2] demo: add one'
-contains "text: second patch row is labeled too" "$ttext" '[PATCH v1 2/2] demo: add two'
+contains "text: patch rows use the HTML row labels" "$ttally" '[PATCH v1 1/2] demo: add one'
+contains "text: second patch row is labeled too" "$ttally" '[PATCH v1 2/2] demo: add two'
 # The tagged patch's row carries the latest tag per reviewer: R for
 # core's superseding Reviewed-by, T for the CI bot, · where untagged.
 patch_row="$(grep -F '[PATCH v1 1/2] demo: add one' "$text_out" | grep -v '^Subject:' | head -1)"
