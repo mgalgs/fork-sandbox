@@ -163,15 +163,24 @@ check("the fallback follows a non-default X-Version",
 check("a no-prefix subject is returned verbatim",
       mod.patch_label(msg("just a subject")),
       "just a subject")
+check("a Re: carrier is normalized and re-attached once",
+      mod.patch_label(msg("Re: [PATCH v1 2/14] demo: add two")),
+      "Re: [PATCH v1 02/14] demo: add two")
+check("a double Re: carrier collapses to a single Re: and falls back to X-Version",
+      mod.patch_label(msg("Re: Re: [PATCH 2/14] demo: add two", 3)),
+      "Re: [PATCH v3 02/14] demo: add two")
+check("a no-prefix Re: subject stays verbatim, its Re: runs untouched",
+      mod.patch_label(msg("Re: Re: a plain reply")),
+      "Re: Re: a plain reply")
 
 if failures:
     print("\n".join(failures))
 sys.exit(1 if failures else 0)
 PY
 then
-    ok "patch_label normalizes zero-padding, round-trip, no-version fallback, no-prefix verbatim"
+    ok "patch_label normalizes zero-padding, round-trip, no-version fallback, no-prefix and Re: carriers"
 else
-    no "patch_label normalizes zero-padding, round-trip, no-version fallback, no-prefix verbatim"
+    no "patch_label normalizes zero-padding, round-trip, no-version fallback, no-prefix and Re: carriers"
 fi
 
 printf '\n== matrix row labels ==\n'

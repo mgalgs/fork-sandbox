@@ -296,13 +296,24 @@ def patch_label(m):
     i is zero-padded to the width of M, lore-style (02/14, 03/24), even
     when the source subject was not padded. An already-canonical subject
     round-trips byte-identical; a subject with no [PATCH] prefix is
-    returned verbatim."""
-    mm = re.match(r"^\[PATCH (?:v(\d+) )?(\d+)/(\d+)\]\s*(.*)$", m["subject"])
+    returned verbatim.
+
+    A subject wrapped in a 'Re: ' carrier (a reply whose stored subject is
+    'Re: [PATCH ...]', however many 'Re: ' layers deep) is normalized the
+    same way and comes back under a single 'Re: '. Collapsing the Re: run
+    is part of the PATCH normalization: a no-prefix subject stays verbatim,
+    'Re: Re: ' and all."""
+    subj = m["subject"]
+    re_prefix = ""
+    while subj.startswith("Re: "):
+        re_prefix = "Re: "
+        subj = subj[4:]
+    mm = re.match(r"^\[PATCH (?:v(\d+) )?(\d+)/(\d+)\]\s*(.*)$", subj)
     if not mm:
         return m["subject"]
     version = mm.group(1) or str(m["version"])
     idx = mm.group(2).zfill(len(mm.group(3)))
-    return f"[PATCH v{version} {idx}/{mm.group(3)}] {mm.group(4)}"
+    return re_prefix + f"[PATCH v{version} {idx}/{mm.group(3)}] {mm.group(4)}"
 
 
 def is_patch(m):
