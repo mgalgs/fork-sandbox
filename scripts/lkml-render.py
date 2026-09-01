@@ -9,7 +9,8 @@ Usage: lkml-render.py <series-dir> [<series-dir> ...] > out.html
 The default HTML render is the human view. --text is the agent view:
 the same thread selection and ordering as plain text on stdout, with
 [PATCH] message bodies cut at their first '---' line so the commit
-message stays and the diff goes (it lives in the series branch).
+message and diffstat stay and the diff goes (it lives in the series
+branch).
 
 A series dir is $LKML_MAILBOX_ROOT/<series> (it holds cur/*.msg). Reads
 only; never runs git.
@@ -394,13 +395,16 @@ def render_reviewer(r, series_dir):
 
 def text_body(m):
     """The message body for --text mode. Cover letters and replies go
-    out verbatim; a [PATCH] message keeps only the commit-message part
-    -- the format-patch body separates that from the diffstat + diff at
-    the first '---' line, and the diff lives in git on the series
-    branch, so it is summarized, not inlined. The cover letter is
+    out verbatim; a [PATCH] message (is_patch: a depth-1 [PATCH]-
+    subjected message with a format-patch body) keeps the commit
+    message and the diffstat -- the format-patch body separates them
+    from the diff at the first '---' line, and the diff lives in git
+    on the series branch, so it is summarized, not inlined. A reply
+    that happens to carry a [PATCH] subject (the reply Subject: is
+    optional and used verbatim) goes out in full. The cover letter is
     itself a [PATCH x 0/N] subject but, like every reply, goes out in
     full."""
-    if m["depth"] == 0 or not m["subject"].startswith("[PATCH"):
+    if not is_patch(m):
         return m["body"].rstrip("\n")
     lines = m["body"].splitlines()
     cut = next((i for i, ln in enumerate(lines) if ln == "---"), None)
@@ -411,10 +415,18 @@ def text_body(m):
     if msg and msg[0].startswith("From "):
         blank = next((i for i, ln in enumerate(msg) if not ln.strip()), 0)
         msg = msg[blank + 1:]
-    omitted = len(lines) - cut
+    # format-patch puts the diffstat between '---' and the first
+    # 'diff --git'; keep it (the HTML render does) and summarize only
+    # the diff itself.
+    rest = lines[cut + 1:]
+    d = next((i for i, ln in enumerate(rest) if ln.startswith("diff --git")), None)
+    stat = "\n".join(rest[:d] if d is not None else rest).strip()
+    diff = rest[d:] if d is not None else []
     out = "\n".join(msg).strip("\n")
-    if omitted:
-        out += f"\n[diff omitted: {omitted} lines -- see the series branch]"
+    if stat:
+        out += "\n" + stat
+    if diff:
+        out += f"\n[diff omitted: {len(diff)} lines -- see the series branch]"
     return out
 
 
@@ -502,7 +514,6 @@ def render_text_series(series_dir):
         # One matrix column per reviewer the box lists, same set and
         # (alphabetical) order as the HTML table.
         pcols = sorted(set(personas) | {r["persona"] for r in reviewer_entries})
-        entry_info = {r["persona"]: (r["harness"], r["model"]) for r in reviewer_entries}
         lines = [f"{name} v{v}",
                  f"{n_patches} patches · {n_replies} replies · {len(reviewer_entries)} reviewers",
                  ""]
@@ -803,10 +814,15 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.text:
         # One flag, one backend: plain text to stdout, UTF-8, no ANSI.
-        # -o and --title are the HTML interface and are ignored here.
+        # -o is the HTML interface and is refused, not silently ignored;
+        # --title is likewise ignored here.
+        if args.output:
+            parser.error("--text renders to stdout and cannot be combined with -o/--output")
         sys.stdout.reconfigure(encoding="utf-8")
-        for d in args.series_dirs:
-            sys.stdout.write(render_text_series(d))
+        parts = [render_text_series(d).rstrip("\n") for d in args.series_dirs]
+        # A blank line between series, like the one between version
+        # sections within a series, so two series do not run together.
+        sys.stdout.write("\n\n".join(parts) + ("\n" if parts else ""))
         return
     sections = []
     names = []

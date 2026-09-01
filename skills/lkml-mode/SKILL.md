@@ -46,8 +46,9 @@ scheduling, not reading, and the reviewers' job is reading.
   threads and review tally: `lkml-render.py "$LKML_MAILBOX_ROOT/<series>" > threads.html`.
   The HTML is the human view; `lkml-render.py --text "$LKML_MAILBOX_ROOT/<series>"`
   renders the same thread as plain text on stdout (series header, tally table,
-  reviewer blocks, then every message in thread order with [PATCH] bodies cut
-  at their first `---`) — the view for agents and `grep` that would otherwise
+  reviewer blocks, then every message in thread order with [PATCH] bodies
+  keeping the commit message and diffstat, the diff cut at their first
+  `---`) — the view for agents and `grep` that would otherwise
   fight 500KB of markup.
 - **`lkml-round.sh`** — launches one sandboxed run per persona, in
   parallel, either reviewing the whole series fresh or replying to

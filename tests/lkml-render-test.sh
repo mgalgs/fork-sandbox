@@ -36,14 +36,22 @@ export LKML_MAILBOX_ROOT="$work/mailbox"
 mkdir -p "$work/patches"
 
 printf '%s\n' '<script>alert(1)</script>' '' '```' 'fenced *markdown*' '```' > "$work/cover.txt"
+# The patch files are real format-patch output, first line 'From <sha>
+# Mon Sep 17 00:00:00 2001': the header block (including the Subject: the
+# mailbox reads), the commit message, '---', diffstat, then the diff.
+# Both backends key their patch treatment on exactly this shape.
 printf '%s\n' \
-    'Subject: [PATCH 1/2] demo: add one' '' \
     'From abcdef1234567890 Mon Sep 17 00:00:00 2001' \
+    'From: Author <author@example.com>' \
+    'Date: Mon, 17 Sep 2001 00:00:00 +0000' \
+    'Subject: [PATCH 1/2] demo: add one' '' \
     'Commit message for patch one.' '' '---' ' demo.c | 1 +' ' 1 file changed, 1 insertion(+)' '' \
     'diff --git a/demo.c b/demo.c' '+one' > "$work/patches/0001-one.patch"
 printf '%s\n' \
-    'Subject: [PATCH 2/2] demo: add two' '' \
     'From deadbeef1234567890 Mon Sep 17 00:00:00 2001' \
+    'From: Author <author@example.com>' \
+    'Date: Mon, 17 Sep 2001 00:00:00 +0000' \
+    'Subject: [PATCH 2/2] demo: add two' '' \
     'Commit message for patch two.' '' '---' ' demo.c | 1 +' ' 1 file changed, 1 insertion(+)' '' \
     'diff --git a/demo.c b/demo.c' '+two' > "$work/patches/0002-two.patch"
 
@@ -86,6 +94,11 @@ contains "custom title appears escaped" "$custom_html" '<title>Demo &amp; Review
 contains "script payload is escaped" "$html" '&lt;script&gt;alert(1)&lt;/script&gt;'
 case "$html" in *'<script>alert(1)</script>'*) no "script payload is never raw" ;; *) ok "script payload is never raw" ;; esac
 if [[ "$(grep -o '<tr><th scope="row"' "$stdout" | wc -l)" -eq 3 ]]; then ok "tally has cover plus two patch rows"; else no "tally has cover plus two patch rows"; fi
+# The fixture patches are real format-patch bodies, so the HTML must take
+# the patch path: diffstat shown, diff folded.
+contains "patch diffstat is shown in HTML" "$html" 'class="stat"'
+contains "patch diff is folded in HTML" "$html" 'class="fold"'
+contains "patch commit message survives header strip in HTML" "$html" 'Commit message for patch one.'
 if [[ "$(grep -o '<li style=' "$stdout" | wc -l)" -eq 6 ]]; then ok "thread index has one line per message"; else no "thread index has one line per message"; fi
 contains "Tested-by has its own chip class" "$html" 'class="tag t-test"'
 case "$html" in *'Tested-by</span>'*'t-q'*) no "Tested-by does not fall through to question" ;; *) ok "Tested-by does not fall through to question" ;; esac
@@ -221,7 +234,7 @@ text_out="$work/text.txt"
 python3 "$renderer" --text "$LKML_MAILBOX_ROOT/render-fixture" > "$text_out"
 ttext="$(<"$text_out")"
 contains "text: series header is name and version" "$ttext" 'render-fixture v1'
-contains "text: header shows the same counts as the HTML header" "$ttext" '2 patches · 9 replies'
+contains "text: header shows the same counts as the HTML header" "$ttext" '2 patches · 7 replies'
 contains "text: cover is message #1 at depth 0" "$ttext" '== #1 · depth 0'
 contains "text: patch is numbered and links its parent" "$ttext" '== #2 · reply to #1 · depth 1'
 contains "text: reply carries its number, parent and depth" "$ttext" '== #3 · reply to #2 · depth 2'
@@ -231,7 +244,11 @@ contains "text: cover letter body is verbatim" "$ttext" 'fenced *markdown*'
 contains "text: reply body is verbatim, in full" "$ttext" 'Reviewed-by: The Reviewer'
 contains "text: orphan reply is in the thread too" "$ttext" 'orphan body'
 contains "text: patch keeps its commit message" "$ttext" 'Commit message for patch one.'
-contains "text: patch diff is summarized, not inlined" "$ttext" '[diff omitted: 6 lines -- see the series branch]'
+contains "text: patch keeps its diffstat" "$ttext" '1 file changed, 1 insertion(+)'
+# The omitted count is the diff's own line count, not the whole tail
+# after '---' (which on a real format-patch body also holds the
+# diffstat).
+contains "text: patch diff is summarized, not inlined" "$ttext" '[diff omitted: 2 lines -- see the series branch]'
 case "$ttext" in *'+one'*) no "patch diff lines are not inlined in text mode" ;; *) ok "patch diff lines are not inlined in text mode" ;; esac
 # The fixture's cover subject and body deliberately carry a <script>
 # payload, so a whole-output check would false-positive. Check the lines
@@ -246,7 +263,7 @@ else
 fi
 
 printf '\n== text mode: tally and reviewers ==\n'
-contains "text: header count line includes reviewers" "$ttext" '2 patches · 9 replies · 5 reviewers'
+contains "text: header count line includes reviewers" "$ttext" '2 patches · 7 replies · 5 reviewers'
 contains "text: tally legend is plain text" "$ttext" 'Latest tag per reviewer per patch. R reviewed, A acked, C changes requested, ? question, N nak.'
 contains "text: patch rows use the HTML row labels" "$ttext" 'Patch v1 1/2'
 contains "text: second patch row is labeled too" "$ttext" 'Patch v1 2/2'
@@ -257,7 +274,9 @@ contains "text: tally row carries per-reviewer letters" "$patch_row" 'R'
 contains "text: tally row carries the Tested-by letter" "$patch_row" 'T'
 contains "text: untagged reviewer is a dot in the row" "$patch_row" '·'
 contains "text: untagged reviewer still gets a column" "$ttext" 'newcomer'
-contains "text: reviewers section is present" "$ttext" 'reviewers'
+# The section header is its own line; the '... N reviewers' count in the
+# header line above must not satisfy this.
+if grep -qx 'reviewers' "$text_out"; then ok "text: reviewers section is present"; else no "text: reviewers section is present" 'no line that is exactly "reviewers"'; fi
 contains "text: reviewer block has display name and slug" "$ttext" 'Core (core)'
 contains "text: reviewer block carries harness and model" "$ttext" 'test · fixture'
 contains "text: reviewer block counts messages" "$ttext" '3 messages'
@@ -268,6 +287,43 @@ case "$ttext" in *'Core reviewer brief.'*) no "persona brief is not inlined in t
 # The same line-level markup check for the tally table's rows, which
 # carry the most markup in HTML mode.
 if grep -F 'Patch v1 1/2' "$text_out" | grep -q '<'; then no "tally rows have no HTML tags"; else ok "tally rows have no HTML tags"; fi
+
+printf '\n== text mode: -o is refused ==\n'
+# --text renders to stdout; combining it with -o must fail loudly rather
+# than exit 0 and silently produce no file.
+if python3 "$renderer" --text "$LKML_MAILBOX_ROOT/render-fixture" -o "$work/text-should-not-exist.txt" >/dev/null 2>&1; then
+    no "--text and -o are rejected together"
+else
+    ok "--text and -o are rejected together"
+fi
+[[ -e "$work/text-should-not-exist.txt" ]] && no "no output file when -o is refused" || ok "no output file when -o is refused"
+
+printf '\n== text mode: [PATCH]-subjected reply and series separation ==\n'
+# The reply Subject: is optional and, when supplied, used verbatim (no
+# forced 'Re: ' prefix). A reply that carries a [PATCH] subject and a
+# '---' in its body is still a reply: it goes out verbatim, and only the
+# real patches of the second series carry the diff-omitted note.
+printf '%s\n' 's-two cover.' > "$work/cover2.txt"
+"$mailbox" init s-two --cover "$work/cover2.txt" --patches "$work/patches" \
+    --from author --harness test --model fixture >/dev/null 2>/dev/null
+s2_tree="$("$mailbox" tree s-two)"
+s2_patch_id="$(printf '%s\n' "$s2_tree" | awk '/\[PATCH v1 1\/2\]/{print $1}')"
+printf '%s\n' 'This reply carries a [PATCH] subject, but it is a reply.' '' \
+    '---' 'and this tail used to be cut away with a fake diff note.' \
+    'Reviewed-by: The Reviewer' > "$work/pretend.txt"
+"$mailbox" post s-two --from core --reply-to "$s2_patch_id" --file "$work/pretend.txt" \
+    --subject '[PATCH v1 1/2] demo: add one' --harness test --model fixture >/dev/null 2>/dev/null
+text2="$work/text2.txt"
+python3 "$renderer" --text "$LKML_MAILBOX_ROOT/render-fixture" "$LKML_MAILBOX_ROOT/s-two" > "$text2"
+t2="$(<"$text2")"
+contains "text: [PATCH]-subjected reply body is verbatim, in full" "$t2" 'This reply carries a [PATCH] subject, but it is a reply.'
+contains "text: text after the reply's own --- survives" "$t2" 'and this tail used to be cut away with a fake diff note.'
+# Two patches per series, the reply is no patch: exactly four notes.
+if [[ "$(grep -cF '[diff omitted:' "$text2")" -eq 4 ]]; then ok "text: only real patches carry the diff-omitted note"; else no "text: only real patches carry the diff-omitted note"; fi
+contains "text: real series header counts patches and replies separately" "$t2" '2 patches · 1 replies · 1 reviewers'
+# Two series dirs must not run together: a blank line separates them,
+# like the one between version sections within a series.
+if [[ -z "$(grep -B1 '^s-two v1$' "$text2" | head -n1)" ]]; then ok "text: series are separated by a blank line"; else no "text: series are separated by a blank line"; fi
 
 printf '%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))
