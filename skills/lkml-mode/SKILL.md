@@ -64,6 +64,28 @@ scheduling, not reading, and the reviewers' job is reading.
   would let a long author revision pick up where it left off instead of
   restarting from the checked-out ref on a timeout. Nothing here depends on
   it yet — this is a note for when it exists, not a requirement now.
+- **`lkml-summarize.sh <series> --project <path>`** — a standalone
+  two-tier summary of the thread, for when a human wants the story as a
+  document rather than a message. It runs two sequential
+  `fork-sandbox.sh` runs over `lkml-render.py --text`'s output: an
+  **extraction** run (default `claude/sonnet`) writes a structured
+  intermediate (verdicts, defects with severities and reply ids, open
+  questions, cross-reply duplicates), then a **synthesis** run (default
+  `claude/opus`) gets that intermediate plus the version's tally section
+  inline and writes the human-facing markdown — a `# Summary` section
+  held to ~200 words for the collapsed-card slot (the script warns on
+  stderr when it overruns) and a `# Details` section. Both tiers are
+  read-only, no-commit runs on a throwaway
+  branch; the outputs land in the series dir as `results-v<N>.json` and
+  `results-v<N>.md` (latest recorded version by default, `--version <N>`
+  to pin; re-summarizing overwrites in place). It is deliberately not the
+  `secretary` seat: secretary posts one summary as a reply to the cover
+  letter INSIDE the thread; this writes files OUTSIDE the thread and
+  touches nothing in the mailbox. The tier harnesses/models are
+  overridable with `--high`/`--low` or a
+  `~/.config/fork-sandbox/lkml-summarize.env` file; a bare harness
+  (e.g. `--high pi-local`) passes through bare, exactly like a reviewer
+  persona's.
 - **`lkml-series.sh`** — for reviewing work AFTER it already shipped: given
   `<base>..<tip>` that already landed (a merge commit, a pile of WIP
   commits, whatever), launches the author persona once to recreate the
@@ -230,7 +252,8 @@ the diff, not a test run, and nothing here executes the suite for you.
 
 This is also not free. Every persona's every round is a real
 `fork-sandbox.sh` run at that persona's model's price, tagged
-`kind: review` or `kind: implement` and `tags: ["lkml", "<series>",
+`kind: review`, `kind: implement` or `kind: summarize` (the two
+`lkml-summarize.sh` tiers) and `tags: ["lkml", "<series>",
 "<persona>"]`, so `sandbox-run-log.py stats` can price a series later by
 persona and by model. `lkml-status.sh` gives you the running total; do not
 let a series run to `--max-versions` without checking it.
