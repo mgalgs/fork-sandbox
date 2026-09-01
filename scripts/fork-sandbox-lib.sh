@@ -1291,7 +1291,110 @@ before this heading.
 EOF
 }
 
-# The fix leg's task text, for fork-sandbox.sh's --review-loop: apply the
+fs_emit_maintainer_prompt_body() {
+    local branch="$1" base_sha="$2"
+    local maintainer_verdict_file="$3" inbox_dir="$4"
+    cat <<EOF
+
+---
+
+# Your task: review this branch the way a maintainer would, and only review it
+
+Another session worked in this same clone and committed to the branch
+\`$branch\`, and an inner review loop has already read that diff line by line
+— bugs, broken tests, style. That pass is done. You are the MAINTAINER, a
+different session deciding whether the branch is ready to land. So read the
+surrounding code, not the diff: the callers of what the change touches, the
+conventions the touched files follow, the invariants the area holds, and how
+this change interacts with what already exists. A line-by-line reread of the
+diff is not the job here — the inner review did it, and you have its
+findings to build on, not to redo.
+
+The change is the commit range:
+
+    $base_sha...HEAD
+
+## Method
+
+Start from the diff, then leave it. For each file the range touches, read
+the code around it: who calls it, who it calls, what the neighbouring code
+looks like, what the area's invariants are. Judge the branch the way a
+maintainer judging a pull request does — does it fit the codebase, does it
+hold up against the code it changes, is the whole thing worth landing — not
+the way a line-by-line checker does.
+
+## An unfollowed addendum is a finding
+
+You read the operator inbox as part of every session; this leg is where that
+reading has to show up in the verdict. If an addendum asks for work that the
+commits under review do not contain, that is a finding. Report it as one,
+with the addendum quoted, so the fix leg can carry it out. Do not approve a
+branch that leaves an operator instruction unfollowed. You are reporting the
+gap here, not closing it — the next section still applies.
+
+## Do not touch the code
+
+Do not fix anything. Do not edit, stage, commit, amend, rebase or revert.
+Another session applies the fixes; a review that quietly repaired what it
+found leaves nobody able to tell the two apart. Reading, building and running
+the tests is fine — changing tracked files is not.
+
+## Your verdict is a file
+
+Write it to exactly this path:
+
+    $maintainer_verdict_file
+
+That file is the only thing read back. A report written anywhere else — your
+final message included — is discarded, so put the whole verdict in the file.
+
+Its format is fixed, because a program reads the first line:
+
+  - **The first line is exactly \`APPROVED\` or \`FINDINGS\`**, one word, alone
+    on the line, in capitals, with no punctuation, no bullet and no heading
+    marker.
+  - \`APPROVED\` means you would land this branch. Only the first line is
+    parsed, so nothing after it changes what happens next -- but this
+    verdict is the run's last word on the branch, so make it count: after
+    \`APPROVED\`, add a short paragraph beginning \`Checked:\` -- what you read
+    around the diff, what you ran, and what you tried to refute and could
+    not. The verdict should then end with the \`## Report\` section described
+    below. When present, the orchestrator reads that report instead of the
+    author's account; if it is omitted, the verdict body remains the
+    available review account.
+  - \`FINDINGS\` means the branch is not ready to land as it stands. After it,
+    write **one finding per paragraph**, paragraphs separated by a blank
+    line, and **cite \`file:line\` in each one** — the path relative to the
+    clone, and the line the problem is at. A finding with no such citation
+    is not counted as one. A finding built from an addendum rather than the
+    diff can cite the addendum file itself — its path under \`$inbox_dir\`,
+    plus \`:1\` — since that file, not a line of code, is what the finding is
+    about.
+
+Order the findings worst first, and write each as a sentence or two of what
+is wrong and what it breaks, not as a patch.
+
+Say \`APPROVED\` when you mean it. An invented finding costs a whole extra
+fix session and can talk a working branch into a change it did not need —
+and there is no inner review left behind you to catch it.
+
+## Report
+
+After the verdict body, you may add a \`## Report\` heading and five short
+paragraphs for the orchestrator, in this order: (1) files touched; (2) tests
+— what you RAN and observed, \`N ok / M fail\`, not what the author claimed;
+(3) decisions visible in the diff that a reader would not guess, one line
+each; (4) what is left open — on a FINDINGS verdict, include the findings
+above; (5) what you are unsure of. If you include a report, use exactly one
+heading and write this account from the branch and the diff, never from the
+author's message. The orchestrator reads this report instead of the
+author's own account. Keep the \`Checked:\` paragraph where it is, in the
+verdict body, before this heading.
+EOF
+}
+
+# The fix leg's task text, for fork-sandbox.sh's --review-loop and the
+# maintainer loop's fix legs (same harness, same job, same text): apply the
 # reviewer's findings against the same branch and commit range, on the
 # understanding that an addendum-sourced finding is carried out rather than
 # weighed like an ordinary one. The runner appends the verdict's FINDINGS

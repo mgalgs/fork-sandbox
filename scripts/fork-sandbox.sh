@@ -1985,7 +1985,14 @@ fi
 # resolved above, before this section, so a dry run knows this exactly as
 # well as a real run does, and reports only the legs that would exist.
 prompt_overlay_legs=(implement)
-(( review_loop_cap > 0 )) && prompt_overlay_legs+=(review fix)
+(( review_loop_cap > 0 )) && prompt_overlay_legs+=(review)
+# Every fix leg of either loop runs on the implement harness and shares the
+# fix header, so the fix overlay is needed when either loop is on. The
+# order above is the historical one for the review-loop case; the
+# maintainer leg's own overlay comes last, so a no-maintainer leg list is
+# unchanged.
+(( review_loop_cap > 0 || maintainer_loop_cap > 0 )) && prompt_overlay_legs+=(fix)
+(( maintainer_loop_cap > 0 )) && prompt_overlay_legs+=(maintainer)
 
 # Per-leg relative fragment paths (composition order, newline-joined) and
 # per-leg content hashes, keyed by leg name. Empty on a machine with no
@@ -2756,6 +2763,13 @@ if [[ "$review_harness_given" == true ]]; then
     fs_resolve_harness "$review_harness" "$review_model" rev
 fi
 
+# Same for the maintainer harness when --maintainer-harness named one.
+# (It cannot be named without --maintainer-loop, which always carries a
+# model, so this always has a model to resolve with.)
+if [[ "$maintainer_harness_given" == true ]]; then
+    fs_resolve_harness "$maintainer_harness" "$maintainer_model" mnt
+fi
+
 # Check every value that goes into the generated runner or the run record
 # before anything is created, so a bad name cannot leave a clone behind on
 # the way out.
@@ -3232,6 +3246,23 @@ if [[ "$review_harness_given" == true ]]; then
     [[ "$review_harness" == "pi-local" ]] && review_preamble_network=sealed
 fi
 
+# The maintainer leg's own preamble follows the review leg's: it describes
+# whichever harness is ABOUT TO RUN that leg. Without --maintainer-harness
+# the default is the implement harness -- set here, once, so the prompt,
+# the runner, run.env and the summary all read a concrete maintainer_harness
+# rather than branching on maintainer_harness_given at every use site.
+maintainer_preamble_harness="$harness"
+maintainer_preamble_network="$preamble_network"
+if (( maintainer_loop_cap > 0 )); then
+    if [[ "$maintainer_harness_given" != true ]]; then
+        maintainer_harness="$harness"
+    else
+        maintainer_preamble_harness="$maintainer_harness"
+        maintainer_preamble_network=""
+        [[ "$maintainer_harness" == "pi-local" ]] && maintainer_preamble_network=sealed
+    fi
+fi
+
 # The model-specific layer, applied after every generated block above and
 # immediately before that leg's own task text: the environment blocks say
 # where the agent is, this says how THIS model should behave in THIS leg,
@@ -3293,11 +3324,12 @@ EOF
 # beside the destination keeps it correct instead.
 mv -- "$handoff_copy.part" "$handoff_copy"
 
-# The --review-loop prompts. Both are generated here, beside the handoff and
-# with the same build-then-rename discipline, because everything they have to
-# name — the clone, the inbox, the bound skill, the base commit — is known now
-# and known nowhere else. The runner only feeds them to a session; it composes
-# no prompt text of its own beyond appending the verdict to the fix header.
+# The --review-loop and --maintainer-loop prompts. All are generated here,
+# beside the handoff and with the same build-then-rename discipline, because
+# everything they have to name — the clone, the inbox, the bound skill, the
+# base commit — is known now and known nowhere else. The runner only feeds
+# them to a session; it composes no prompt text of its own beyond appending
+# the verdict to the fix header.
 #
 # The verdict lands in the clone's .git. That directory is writable, and git
 # tracks nothing under it, so a leg running `git add -A` cannot commit the
@@ -3305,12 +3337,13 @@ mv -- "$handoff_copy.part" "$handoff_copy"
 review_prompt=""
 fix_prompt_header=""
 review_verdict_file=""
+maintainer_prompt=""
+maintainer_verdict_file=""
 if (( review_loop_cap > 0 )); then
     review_prompt="$run_dir/review-prompt.md"
-    fix_prompt_header="$run_dir/fix-prompt-header.md"
     review_verdict_file="$clone_dir/.git/review-verdict.md"
-    fs_reject_unsafe_chars "$review_prompt" "$fix_prompt_header" \
-        "$review_verdict_file" "$review_skill_dir"
+    fs_reject_unsafe_chars "$review_prompt" "$review_verdict_file" \
+        "$review_skill_dir"
     {
         fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" \
             "$review_preamble_harness" "$review_preamble_network" "$outbox_dir" \
@@ -3320,7 +3353,13 @@ if (( review_loop_cap > 0 )); then
             "$review_verdict_file" "$inbox_dir"
     } > "$review_prompt.part"
     mv -- "$review_prompt.part" "$review_prompt"
-
+fi
+# The fix header is shared by every fix leg of both loops -- all of them
+# run on the implement harness, which is why the one header serves all of
+# them -- so it is built when either loop is on.
+if (( review_loop_cap > 0 || maintainer_loop_cap > 0 )); then
+    fix_prompt_header="$run_dir/fix-prompt-header.md"
+    fs_reject_unsafe_chars "$fix_prompt_header"
     {
         fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" "$harness" "$preamble_network" \
             "$outbox_dir" "" "$outbox_max_bytes"
@@ -3328,6 +3367,24 @@ if (( review_loop_cap > 0 )); then
         fs_emit_fix_prompt_body "$branch" "$base_sha"
     } > "$fix_prompt_header.part"
     mv -- "$fix_prompt_header.part" "$fix_prompt_header"
+fi
+# The maintainer prompt is the static base of every maintainer leg's prompt:
+# its per-iteration copy is built in the runner the way the review leg's is,
+# with the earlier legs' unfollowed addenda embedded, because the same
+# fs_archive_inbox move applies to a maintainer leg as to a review leg.
+if (( maintainer_loop_cap > 0 )); then
+    maintainer_prompt="$run_dir/maintainer-prompt.md"
+    maintainer_verdict_file="$clone_dir/.git/maintainer-verdict.md"
+    fs_reject_unsafe_chars "$maintainer_prompt" "$maintainer_verdict_file"
+    {
+        fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" \
+            "$maintainer_preamble_harness" "$maintainer_preamble_network" \
+            "$outbox_dir" "" "$outbox_max_bytes"
+        fs_emit_prompt_overlay maintainer
+        fs_emit_maintainer_prompt_body "$branch" "$base_sha" \
+            "$maintainer_verdict_file" "$inbox_dir"
+    } > "$maintainer_prompt.part"
+    mv -- "$maintainer_prompt.part" "$maintainer_prompt"
 fi
 
 # --refresh-at's continuation prompt: just the preamble, built once here for
@@ -3645,6 +3702,85 @@ else
     rev_harness_version="$impl_harness_version"
 fi
 
+# Maintainer legs follow the review legs' split one-for-one: a named
+# --maintainer-harness builds its full command fresh from the "mnt_*" state
+# fs_resolve_harness resolved above; the default -- the implement harness --
+# reuses the implement sandbox command with only the model patched in. The
+# placement of --model is per-harness, and the maintainer model always
+# exists (it is required), so this is the review fallback's same walks
+# without its empty-model branch.
+if (( maintainer_loop_cap > 0 )); then
+    if [[ "$maintainer_harness_given" == true ]]; then
+        fs_build_sandbox_cmd mnt maintainer_sandbox_cmd
+    else
+        # "sandbox_cmd" was populated above by fs_build_sandbox_cmd's nameref
+        # -- the same false positive as the review fallback's.
+        # shellcheck disable=SC2154
+        maintainer_sandbox_cmd=("${sandbox_cmd[@]}")
+        if [[ "$harness" == "claude" ]]; then
+            # Last occurrence wins, including over one supplied in --claude-args.
+            maintainer_sandbox_cmd+=(--model "$maintainer_model")
+        elif [[ "$harness" == "pi-local" ]]; then
+            model_flag_i=-1
+            workdir_i=-1
+            for i in "${!maintainer_sandbox_cmd[@]}"; do
+                if [[ "${maintainer_sandbox_cmd[$i]}" == "$clone_dir" ]]; then
+                    workdir_i="$i"
+                    break
+                fi
+                [[ "${maintainer_sandbox_cmd[$i]}" == "--model" ]] && model_flag_i="$i"
+            done
+            if (( model_flag_i >= 0 )); then
+                maintainer_sandbox_cmd[model_flag_i+1]="$maintainer_model"
+            elif (( workdir_i >= 0 )); then
+                maintainer_sandbox_cmd=("${maintainer_sandbox_cmd[@]:0:workdir_i}" --model "$maintainer_model" "${maintainer_sandbox_cmd[@]:workdir_i}")
+            else
+                echo "Error: cannot place --maintainer-model in the pi-local" >&2
+                echo "command: neither --model nor the clone directory was found" >&2
+                echo "in it." >&2
+                exit 1
+            fi
+        elif [[ "$harness" == "codex" ]]; then
+            model_flag_i=-1
+            prompt_i=-1
+            for i in "${!maintainer_sandbox_cmd[@]}"; do
+                if [[ "${maintainer_sandbox_cmd[$i]}" == "-" ]]; then
+                    prompt_i="$i"
+                    break
+                fi
+                [[ "${maintainer_sandbox_cmd[$i]}" == "--model" ]] && model_flag_i="$i"
+            done
+            if (( model_flag_i >= 0 )); then
+                maintainer_sandbox_cmd[model_flag_i+1]="$maintainer_model"
+            elif (( prompt_i >= 0 )); then
+                maintainer_sandbox_cmd=("${maintainer_sandbox_cmd[@]:0:prompt_i}" --model "$maintainer_model" "${maintainer_sandbox_cmd[@]:prompt_i}")
+            else
+                echo "Error: cannot place --maintainer-model in the codex" >&2
+                echo "command: neither --model nor the '-' prompt marker was" >&2
+                echo "found in it." >&2
+                exit 1
+            fi
+        else
+            # OpenRouter pi always has this flag, immediately after its provider.
+            for i in "${!maintainer_sandbox_cmd[@]}"; do
+                if [[ "${maintainer_sandbox_cmd[$i]}" == "--provider" && "${maintainer_sandbox_cmd[$((i+2))]:-}" == "--model" ]]; then
+                    maintainer_sandbox_cmd[i+3]="$maintainer_model"
+                    break
+                fi
+            done
+        fi
+        # No --maintainer-harness, so the maintainer leg stays on the
+        # implement harness in every respect -- the same "mnt_*" fallback set
+        # as the review leg's, so run_leg can always read it for a maintainer
+        # leg.
+        mnt_pi_session_dir="$impl_pi_session_dir"
+        mnt_usage_source="$impl_usage_source"
+        mnt_run_formatter="$impl_run_formatter"
+        mnt_harness_env_file="$impl_harness_env_file"
+        mnt_harness_version="$impl_harness_version"
+    fi
+fi
+
 # tmux rewrites ':' and '.' in a session name without saying so, and a branch
 # name may hold either. Fold every character tmux would touch to '-' here, so
 # the name this script records is the name tmux actually uses.
@@ -3770,6 +3906,30 @@ started_at="$(date +%s)"
     printf 'pi_session_dir=%q\n' "$pi_session_dir"
     printf 'rev_pi_session_dir=%q\n' "$rev_pi_session_dir"
     printf 'review_loop_cap=%q\n' "$review_loop_cap"
+    # Every maintainer-tier variable the runner reads is emitted only when
+    # the loop is on, so a no-maintainer run.sh stays byte-identical to one
+    # built before the tier existed. run_leg and the maintainer loop below
+    # guard their references to match: kind "maintainer" is only ever run
+    # when this block emitted its state, and the loop itself tests
+    # ${maintainer_loop_cap:-0}.
+    if (( maintainer_loop_cap > 0 )); then
+        printf 'maintainer_loop_cap=%q\n' "$maintainer_loop_cap"
+        printf 'maintainer_harness=%q\n' "$maintainer_harness"
+        printf 'maintainer_model=%q\n' "$maintainer_model"
+        # Same split as review_preamble_harness above, for the maintainer leg:
+        # the harness that actually runs it, for fs_archive_inbox.
+        printf 'maintainer_preamble_harness=%q\n' "$maintainer_preamble_harness"
+        # The maintainer leg's own accounting state -- the "mnt_*" values,
+        # which fall back to the implement ones without --maintainer-harness,
+        # set beside maintainer_sandbox_cmd above.
+        printf 'mnt_pi_session_dir=%q\n' "$mnt_pi_session_dir"
+        printf 'mnt_usage_source=%q\n' "$mnt_usage_source"
+        printf 'mnt_formatter=%q\n' "$mnt_run_formatter"
+        printf 'mnt_harness_version=%q\n' "$mnt_harness_version"
+        printf 'mnt_harness_env_file=%q\n' "$mnt_harness_env_file"
+        printf 'maintainer_prompt=%q\n' "$maintainer_prompt"
+        printf 'maintainer_verdict_file=%q\n' "$maintainer_verdict_file"
+    fi
     printf 'mode=%q\n' "$mode"
     printf 'review_prompt=%q\n' "$review_prompt"
     printf 'fix_prompt_header=%q\n' "$fix_prompt_header"
@@ -3799,7 +3959,13 @@ started_at="$(date +%s)"
     printf ')\n'
     printf 'review_sandbox_cmd=('
     printf '%q ' "${review_sandbox_cmd[@]}"
-    printf ')\n\n'
+    printf ')\n'
+    if (( maintainer_loop_cap > 0 )); then
+        printf 'maintainer_sandbox_cmd=('
+        printf '%q ' "${maintainer_sandbox_cmd[@]}"
+        printf ')\n'
+    fi
+    printf '\n'
     cat <<'RUNNER'
 # Load shared predicates used by the status script as well as this runner, so
 # report display and summary provenance cannot drift between processes.
@@ -3998,6 +4164,23 @@ if [[ "$review_codex_harness" == "codex" && -n "$rev_harness_env_file" \
             "$codex_auth_src"
     } > "$rev_harness_env_file"
 fi
+# And the maintainer leg's own credential file, the third of the same
+# pattern: when --maintainer-harness names its own codex independently of
+# the implement harness (and of a separately named review harness, which
+# its own block above already covered). The path-equality check skips the
+# write when the maintainer codex is the implement codex. maintainer_harness
+# and mnt_harness_env_file are unset in a no-maintainer run.sh, so both
+# reads carry defaults: without the loop the whole condition is false.
+if [[ "${maintainer_harness:-$harness}" == "codex" \
+    && -n "${mnt_harness_env_file:-}" \
+    && "$mnt_harness_env_file" != "$harness_env_file" ]]; then
+    install -m 600 /dev/null "$mnt_harness_env_file"
+    {
+        printf 'CODEX_AUTH_JSON='
+        jq -c '.tokens.refresh_token = "sandbox-placeholder-cannot-refresh"' \
+            "$codex_auth_src"
+    } > "$mnt_harness_env_file"
+fi
 
 # Per-run services: stand them up before the session and point the project's
 # config at the sockets. The teardown is already armed, so a failure here still
@@ -4068,7 +4251,8 @@ fs_archive_inbox 1 "$harness" "$rc"
 # until then. A run without the flag is untouched and writes it here as
 # always. --refresh-at defers the same way, and for the same reason: a
 # continuation leg can still change $rc below.
-if [[ "$review_loop_cap" == "0" && "$refresh_enabled" == "0" ]]; then
+if [[ "$review_loop_cap" == "0" && "$refresh_enabled" == "0" \
+    && "${maintainer_loop_cap:-0}" == "0" ]]; then
     printf '%s\n' "$rc" > "$run_dir/exit-code"
 fi
 fi
@@ -4703,7 +4887,17 @@ run_leg() {
         leg_usage_source="$rev_usage_source"
         leg_formatter="$rev_formatter"
         leg_harness="$review_preamble_harness"
+    elif [[ "$kind" == "maintainer" ]]; then
+        # Only ever reached when --maintainer-loop is on, which is what made
+        # the launcher emit maintainer_sandbox_cmd and the "mnt_*" state.
+        cmd=("${maintainer_sandbox_cmd[@]}")
+        leg_pi_session_dir="$mnt_pi_session_dir"
+        leg_usage_source="$mnt_usage_source"
+        leg_formatter="$mnt_formatter"
+        leg_harness="$maintainer_preamble_harness"
     fi
+    # "fix" and "mntfix" both fall through to the implement defaults above:
+    # every fix leg of either loop runs the implement harness and model.
     leg_rc=1
     leg_cost=""
     leg_usage=""
@@ -5030,6 +5224,302 @@ if [[ "$review_loop_cap" != "0" && -n "$review_prompt" ]]; then
     fi
 fi
 
+# --maintainer-loop: the outer tier, after the review loop (or after the
+# coding session when there is no review loop). A maintainer leg reviews the
+# branch as a maintainer would -- the inner review already read the diff line
+# by line, so it reads the surrounding code -- and a fix leg on the implement
+# harness addresses its findings. The mechanism is the review loop's, one for
+# one; only the harness, the prompt and the record differ. Fix legs never
+# re-enter the review loop: the inner loop is over by the time this one
+# starts, and the maintainer's next iteration is what reads the fix.
+#
+# Everything this block reads was emitted by the launcher only when the loop
+# is on, so the guard tests ${maintainer_loop_cap:-0}: a no-maintainer
+# run.sh has none of these variables at all.
+if [[ "${maintainer_loop_cap:-0}" != "0" && -n "${maintainer_prompt:-}" ]]; then
+    maintainer_loop_ended=""
+    maintainer_loop_detail=""
+    maintainer_iters_done='[]'
+
+    # The branch head the loop measures progress against, read from the
+    # clone the one way anything here may read it (see clone_branch_head).
+    mnt_head="$(clone_branch_head)"
+
+    # One iteration's record, built leg by leg -- the same "not established is
+    # null, never 0" rule the review loop's iterations follow. The maintainer
+    # leg's fields are named after the leg that produces them, not after
+    # "review": this is the run's last word, and the record should say which
+    # leg said it.
+    mit_i=""
+    mit_findings=null
+    mit_mnt_exit=null
+    mit_fix_exit=null
+    mit_head_before=""
+    mit_head_after=""
+    mit_mnt_cost=null
+    mit_fix_cost=null
+    mit_mnt_usage=null
+    mit_fix_usage=null
+
+    mit_reset() {
+        mit_i="$1"
+        mit_findings=null
+        mit_mnt_exit=null
+        mit_fix_exit=null
+        mit_head_before=""
+        mit_head_after=""
+        mit_mnt_cost=null
+        mit_fix_cost=null
+        mit_mnt_usage=null
+        mit_fix_usage=null
+    }
+
+    # The current iteration as a one-element array, or nothing when there is
+    # no current iteration -- the review loop's iter_json with the leg names
+    # changed (see iter_json's own comment for why commits_added is filled
+    # in after the fetch below).
+    mit_iter_json() {
+        [[ -n "$mit_i" ]] || return 1
+        jq -c -n \
+            --argjson i "$mit_i" \
+            --argjson findings "$mit_findings" \
+            --argjson maintainer_exit "$mit_mnt_exit" \
+            --argjson fix_exit "$mit_fix_exit" \
+            --arg head_before "$mit_head_before" \
+            --arg head_after "$mit_head_after" \
+            --argjson maintainer_cost "$mit_mnt_cost" \
+            --argjson fix_cost "$mit_fix_cost" \
+            --argjson maintainer_usage "$mit_mnt_usage" \
+            --argjson fix_usage "$mit_fix_usage" \
+            '[{
+                i: $i,
+                findings: $findings,
+                maintainer_exit: $maintainer_exit,
+                fix_exit: $fix_exit,
+                head_before: (if $head_before == "" then null else $head_before end),
+                head_after: (if $head_after == "" then null else $head_after end),
+                commits_added: null,
+                maintainer_cost_usd: $maintainer_cost,
+                fix_cost_usd: $fix_cost,
+                maintainer_usage: $maintainer_usage,
+                fix_usage: $fix_usage,
+            }]' 2>/dev/null
+    }
+
+    # Write maintainer-loop.json from what is known right now, the same way
+    # review-loop.json is written: after every leg, built beside the file
+    # and renamed, so a runner killed mid-loop still leaves the iterations
+    # it finished.
+    save_maintainer_loop() {
+        local cur
+        cur="$(mit_iter_json)" || cur='[]'
+        [[ -n "$cur" ]] || cur='[]'
+        if jq -n \
+            --argjson cap "$maintainer_loop_cap" \
+            --arg maintainer_model "$maintainer_model" \
+            --arg maintainer_harness "$maintainer_harness" \
+            --arg ended "$maintainer_loop_ended" \
+            --arg detail "$maintainer_loop_detail" \
+            --argjson prev "$maintainer_iters_done" \
+            --argjson cur "$cur" \
+            '{
+                cap: $cap,
+                maintainer_model: (if $maintainer_model == "" then null else $maintainer_model end),
+                maintainer_harness: (if $maintainer_harness == "" then null else $maintainer_harness end),
+                ended: (if $ended == "" then null else $ended end),
+                detail: (if $detail == "" then null else $detail end),
+                iterations: ($prev + $cur),
+            }' > "$run_dir/maintainer-loop.json.part" 2>/dev/null; then
+            mv -f "$run_dir/maintainer-loop.json.part" "$run_dir/maintainer-loop.json"
+        else
+            rm -f "$run_dir/maintainer-loop.json.part"
+        fi
+    }
+
+    # Move the current iteration into the finished list and write again --
+    # the review loop's close_iter, pointed at this record.
+    close_mit() {
+        local cur merged
+        if cur="$(mit_iter_json)" && [[ -n "$cur" ]]; then
+            merged="$(jq -c -n --argjson d "$maintainer_iters_done" --argjson c "$cur" \
+                '$d + $c' 2>/dev/null)"
+            [[ -n "$merged" ]] && maintainer_iters_done="$merged"
+        fi
+        mit_i=""
+        save_maintainer_loop
+    }
+
+    # The same three skip conditions the review loop records, applied to the
+    # branch as it stands once the review loop is over.
+    if [[ "$rc" != "0" ]]; then
+        maintainer_loop_ended="skipped"
+        maintainer_loop_detail="the session exited $rc, so there is nothing worth reviewing"
+    else
+        if [[ -z "$mnt_head" ]]; then
+            maintainer_loop_ended="skipped"
+            maintainer_loop_detail="branch $branch could not be read from the clone"
+        elif [[ "$mnt_head" == "$base_sha" ]]; then
+            maintainer_loop_ended="skipped"
+            maintainer_loop_detail="the branch holds no commits, so there is nothing to review"
+        fi
+    fi
+
+    loop_i=1
+    while [[ -z "$maintainer_loop_ended" ]] && (( loop_i <= maintainer_loop_cap )); do
+        mit_reset "$loop_i"
+        mit_head_before="$mnt_head"
+        save_maintainer_loop
+
+        # A verdict from a previous iteration must never be read as this
+        # one's -- the same rule as the review loop, for the same reason.
+        rm -f "$maintainer_verdict_file"
+
+        # maintainer_prompt is static, built once at launch -- but the same
+        # unfollowed-addendum rule the review prompt carries applies to a
+        # maintainer leg as to a review leg, and fs_archive_inbox has moved
+        # every earlier leg's addendum out of the live inbox by now, so the
+        # per-iteration copy embeds them the way the review loop's does.
+        maintainer_prompt_iter="$run_dir/maintainer-prompt-$loop_i.md"
+        {
+            cat -- "$maintainer_prompt"
+            mp_addenda_list="$(fs_addenda_dirs)"
+            if [[ -n "$mp_addenda_list" ]]; then
+                printf '\n---\n\n## Operator addenda delivered to earlier legs of this run\n\n'
+                printf 'The operator sent the messages below to an earlier leg of this run,\n'
+                printf 'oldest first. The live inbox bound into this sandbox no longer holds\n'
+                printf 'them -- a claude leg archives what it saw the moment it ends -- so\n'
+                printf 'this is the only copy this leg will see. Check the commit range\n'
+                printf 'under review against each one: if it asks for work the commits do\n'
+                printf 'not contain, that is a finding under "An unfollowed addendum is a\n'
+                printf 'finding" above, citing the message file itself.\n'
+                while IFS= read -r mp_dir; do
+                    [[ -n "$mp_dir" ]] || continue
+                    for mp_file in "$mp_dir"/*.md; do
+                        [[ -f "$mp_file" ]] || continue
+                        printf '\n### %s\n\n' "${mp_file##*/}"
+                        cat -- "$mp_file"
+                    done
+                done <<< "$mp_addenda_list"
+            fi
+        } > "$maintainer_prompt_iter.part"
+        mv -- "$maintainer_prompt_iter.part" "$maintainer_prompt_iter"
+
+        run_leg maintainer "$loop_i" "$maintainer_prompt_iter"
+        mit_mnt_exit="$leg_rc"
+        mit_mnt_cost="${leg_cost:-null}"
+        mit_mnt_usage="$leg_usage"
+        save_maintainer_loop
+        if [[ "$leg_rc" != "0" ]]; then
+            maintainer_loop_ended="harness-error"
+            maintainer_loop_detail="the maintainer leg of iteration $loop_i exited $leg_rc${leg_error:+ ($leg_error)}"
+            close_mit
+            break
+        fi
+
+        # The verdict is DATA, exactly as the review loop treats its own: it
+        # is copied, counted and concatenated into a prompt file -- never
+        # sourced, never evaluated, never put on a command line. A symlink at
+        # the path is not a verdict.
+        verdict_copy="$run_dir/maintainer-verdict-$loop_i.md"
+        if [[ -L "$maintainer_verdict_file" || ! -f "$maintainer_verdict_file" ]]; then
+            maintainer_loop_ended="harness-error"
+            maintainer_loop_detail="the maintainer leg of iteration $loop_i left no verdict at $maintainer_verdict_file"
+            close_mit
+            break
+        fi
+        # The run dir outlives the clone, so the copy is the record. Take the
+        # original away in the same breath, so iteration i+1 cannot re-read it.
+        cp -- "$maintainer_verdict_file" "$verdict_copy" 2>/dev/null
+        rm -f "$maintainer_verdict_file"
+        if [[ ! -s "$verdict_copy" ]]; then
+            maintainer_loop_ended="harness-error"
+            maintainer_loop_detail="the maintainer leg of iteration $loop_i wrote an empty verdict"
+            close_mit
+            break
+        fi
+
+        # Untrusted text on its way to a terminal: strip control characters.
+        verdict_line="$(head -n 1 "$verdict_copy" | tr -d '\000-\037\177' \
+            | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+        case "$verdict_line" in
+        APPROVED)
+            mit_findings=0
+            maintainer_loop_ended="approved"
+            printf 'fork-sandbox: maintainer iteration %s: APPROVED\n' "$loop_i"
+            close_mit
+            break
+            ;;
+        FINDINGS)
+            ;;
+        *)
+            maintainer_loop_ended="harness-error"
+            maintainer_loop_detail="the maintainer leg of iteration $loop_i wrote a first line that is neither APPROVED nor FINDINGS"
+            close_mit
+            break
+            ;;
+        esac
+
+        # One finding per paragraph, each citing file:line -- the same count
+        # the review loop takes, without reading the prose.
+        mit_findings="$(awk '
+            NR == 1 { next }
+            /^## Report$/ { exit }
+            /^[[:space:]]*$/ { if (hit) n++; hit = 0; next }
+            /[^[:space:]:]+:[0-9]+/ { hit = 1 }
+            END { if (hit) n++; print n + 0 }' "$verdict_copy" 2>/dev/null)"
+        [[ "$mit_findings" =~ ^[0-9]+$ ]] || mit_findings=null
+        printf 'fork-sandbox: maintainer iteration %s: FINDINGS (%s cited)\n' \
+            "$loop_i" "$mit_findings"
+        save_maintainer_loop
+
+        # The fix leg's prompt: the shared generated header, then the
+        # verdict. Built as a file and redirected -- the verdict has no size
+        # limit, and one argv string is capped at 128KB.
+        mnt_fix_prompt="$run_dir/maintainer-fix-prompt-$loop_i.md"
+        {
+            cat -- "$fix_prompt_header"
+            printf '\n---\n\n'
+            awk '/^## Report$/ { exit } { print }' "$verdict_copy"
+        } > "$mnt_fix_prompt.part"
+        mv -f "$mnt_fix_prompt.part" "$mnt_fix_prompt"
+
+        run_leg mntfix "$loop_i" "$mnt_fix_prompt"
+        mit_fix_exit="$leg_rc"
+        mit_fix_cost="${leg_cost:-null}"
+        mit_fix_usage="$leg_usage"
+        mit_head_after="$(clone_branch_head)"
+        save_maintainer_loop
+        if [[ "$leg_rc" != "0" ]]; then
+            maintainer_loop_ended="harness-error"
+            maintainer_loop_detail="the fix leg of iteration $loop_i exited $leg_rc${leg_error:+ ($leg_error)}"
+            close_mit
+            break
+        fi
+        if [[ -z "$mit_head_after" ]]; then
+            maintainer_loop_ended="harness-error"
+            maintainer_loop_detail="branch $branch could not be read from the clone after the fix leg of iteration $loop_i"
+            close_mit
+            break
+        fi
+        if [[ "$mit_head_after" == "$mit_head_before" ]]; then
+            # An iteration that committed nothing is the end of the argument,
+            # not a reason to run another one: the maintainer would read
+            # exactly the same branch it just read.
+            maintainer_loop_ended="no-progress"
+            printf 'fork-sandbox: maintainer iteration %s: the fix leg committed nothing\n' \
+                "$loop_i"
+            close_mit
+            break
+        fi
+        mnt_head="$mit_head_after"
+        close_mit
+        loop_i=$(( loop_i + 1 ))
+    done
+    [[ -n "$maintainer_loop_ended" ]] || maintainer_loop_ended="cap"
+    save_maintainer_loop
+    printf 'fork-sandbox: maintainer loop ended: %s\n' "$maintainer_loop_ended"
+fi
+
 # In review-only mode the sole leg is the review leg, so its accounting is the
 # run accounting as well. This also makes cost_usd and total_cost_usd agree.
 if [[ "$mode" == "review-only" ]]; then
@@ -5051,7 +5541,8 @@ fi
 # either loop. The pi check above may have written the same value already;
 # writing it again costs nothing and keeps this the one place that ends a
 # loop run.
-if [[ "$review_loop_cap" != "0" || "$refresh_enabled" == "1" ]]; then
+if [[ "$review_loop_cap" != "0" || "$refresh_enabled" == "1" \
+    || "${maintainer_loop_cap:-0}" != "0" ]]; then
     printf '%s\n' "$rc" > "$run_dir/exit-code"
 fi
 
@@ -5117,6 +5608,31 @@ if (( fetched )) && [[ -s "$run_dir/review-loop.json" ]]; then
         mv -f "$run_dir/review-loop.json.part" "$run_dir/review-loop.json"
     else
         rm -f "$run_dir/review-loop.json.part"
+    fi
+fi
+
+# The same backfill for the maintainer loop's record: the same rule, the same
+# reason, applied to maintainer-loop.json.
+if (( fetched )) && [[ -s "$run_dir/maintainer-loop.json" ]]; then
+    mnt_counts=""
+    while IFS="$(printf '\t')" read -r hb ha; do
+        c=null
+        if [[ -n "$hb" && -n "$ha" ]]; then
+            c="$( (cd "$origin_repo" && git rev-list --count "$hb..$ha") 2>/dev/null || printf null )"
+            [[ "$c" =~ ^[0-9]+$ ]] || c=null
+        fi
+        mnt_counts+="$c"$'\n'
+    done < <(jq -r '.iterations[]? | [(.head_before // ""), (.head_after // "")] | @tsv' \
+                "$run_dir/maintainer-loop.json" 2>/dev/null)
+    mnt_counts_json="$(printf '%s' "$mnt_counts" | jq -R -s -c \
+        'split("\n") | map(select(length > 0) | fromjson)' 2>/dev/null)"
+    if [[ -n "$mnt_counts_json" ]] \
+        && jq --argjson c "$mnt_counts_json" \
+            '.iterations |= [range(0; length) as $i | .[$i] + {commits_added: $c[$i]}]' \
+            "$run_dir/maintainer-loop.json" > "$run_dir/maintainer-loop.json.part" 2>/dev/null; then
+        mv -f "$run_dir/maintainer-loop.json.part" "$run_dir/maintainer-loop.json"
+    else
+        rm -f "$run_dir/maintainer-loop.json.part"
     fi
 fi
 

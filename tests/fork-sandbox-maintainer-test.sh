@@ -243,5 +243,334 @@ refuse_review_only "--maintainer-harness" "not supported with --review-only" \
 # pre-maintainer message.
 refuse_review_only "--review-loop" "one review leg" --review-loop 1
 
+printf '\n== --maintainer-loop: the built commands (--foreground, stubs) ==\n'
+
+# Real foreground runs with every wrapper stubbed and the backend faked into
+# image mode -- the same machinery fork-sandbox-review-harness-test.sh uses.
+real_stub="$(mktemp -d /var/tmp/claude-scratch/fs-maintainer-real-stub.XXXXXX)"
+tmpdirs+=("$real_stub")
+cat > "$real_stub/claude-sandboxed" <<'STUB'
+#!/usr/bin/env bash
+cat >/dev/null
+exit 0
+STUB
+cat > "$real_stub/agent-sandboxed" <<'STUB'
+#!/usr/bin/env bash
+cat >/dev/null
+exit 0
+STUB
+cat > "$real_stub/sandbox-backend-fake-image" <<'STUB'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "--capabilities" ]]; then
+    printf 'toolchain=image\n'
+    exit 0
+fi
+exit 0
+STUB
+chmod +x "$real_stub"/*
+
+real_cfg="$(mktemp -d)"; tmpdirs+=("$real_cfg")
+install -m 600 /dev/null "$real_cfg/pi.env"
+printf 'OPENROUTER_API_KEY=fake\n' > "$real_cfg/pi.env"
+printf 'MODEL_ENDPOINT=http://localhost:1/v1\n' > "$real_cfg/model.env"
+
+new_project() {
+    local d
+    d="$(mktemp -d "$HOME/src/fs-maintainer-test.XXXXXX")"
+    (
+        cd "$d" \
+            && git init -q . \
+            && git config user.email t@fork-sandbox.invalid \
+            && git config user.name Tester \
+            && printf 'hello\n' > file.txt \
+            && git add file.txt \
+            && git commit -q -m init
+    ) >/dev/null 2>&1
+    printf '%s' "$d"
+}
+
+proj="$(new_project)"; tmpdirs+=("$proj")
+handoff_dir="$(mktemp -d /var/tmp/claude-scratch/fs-maintainer-handoff.XXXXXX)"
+tmpdirs+=("$handoff_dir")
+handoff="$handoff_dir/handoff.md"
+printf 'do the task\n' > "$handoff"
+
+run_real() {
+    local out rc rd
+    out="$(PATH="$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$real_cfg" \
+        FORK_SANDBOX_BACKEND=fake-image \
+        timeout 60 "$launcher" --foreground "$@" "$proj" "$handoff" 2>&1)"
+    rc=$?
+    rd="$(printf '%s\n' "$out" | sed -n 's/^  run dir:  *//p' | head -1)"
+    if (( rc != 0 )) || [[ -z "$rd" ]]; then
+        printf 'run_real failed (rc=%s):\n%s\n' "$rc" "$out" >&2
+        return 1
+    fi
+    printf '%s' "$rd"
+}
+
+# A default-harness run: the maintainer command reuses the implement command
+# with the model substituted in; a no-maintainer run.sh stays free of the
+# tier's variables altogether.
+rd_d="$(run_real --harness claude --maintainer-loop 1 --maintainer-model sonnet)" \
+    && tmpdirs+=("$rd_d")
+if [[ -n "$rd_d" ]]; then
+    mnt_line="$(grep '^maintainer_sandbox_cmd=' "$rd_d/run.sh")"
+    contains "the default maintainer command reuses the implement wrapper" \
+        "/claude-sandboxed " "$mnt_line"
+    contains "the default maintainer command carries the maintainer model" \
+        "--model sonnet" "$mnt_line"
+    check "the runner state names the loop cap" "maintainer_loop_cap=1" \
+        "$(grep '^maintainer_loop_cap=' "$rd_d/run.sh")"
+fi
+rd_nm="$(run_real --harness claude)" && tmpdirs+=("$rd_nm")
+if [[ -n "$rd_nm" ]]; then
+    # The static runner text mentions the tier (its loop is compiled in for
+    # every run); what is emitted only when the loop is on is the STATE --
+    # the launcher's column-0 variable assignments.
+    if [[ "$(grep -cE '^(maintainer_|mnt_)[a-z_]+=' "$rd_nm/run.sh")" == "0" ]]; then
+        ok "a plain run.sh emits no maintainer state"
+    else
+        no "a plain run.sh emits no maintainer state" \
+            "$(grep -E '^(maintainer_|mnt_)[a-z_]+=' "$rd_nm/run.sh")"
+    fi
+fi
+
+# A named pi-local maintainer harness: a different wrapper, its own model.
+rd_p="$(run_real --harness claude --maintainer-loop 1 \
+    --maintainer-harness pi-local --maintainer-model some-local-model)" \
+    && tmpdirs+=("$rd_p")
+if [[ -n "$rd_p" ]]; then
+    mnt_line="$(grep '^maintainer_sandbox_cmd=' "$rd_p/run.sh")"
+    contains "a pi-local maintainer command uses agent-sandboxed" \
+        "/agent-sandboxed " "$mnt_line"
+    contains "a pi-local maintainer command carries its own model" \
+        "--model some-local-model" "$mnt_line"
+fi
+
+printf '\n== --maintainer-loop: the loop, end to end ==\n'
+
+# A four-leg scenario under --maintainer-loop 2: the implement leg commits,
+# the first maintainer leg finds problems, the fix leg commits, the second
+# maintainer leg approves. The call counter plays the part the stub's
+# harness/model split cannot.
+mnt2_stub="$(mktemp -d /var/tmp/claude-scratch/fs-maintainer-loop2.XXXXXX)"
+tmpdirs+=("$mnt2_stub")
+cat > "$mnt2_stub/claude-sandboxed" <<'STUB'
+#!/usr/bin/env bash
+set -uo pipefail
+
+outbox="" clone_dir="" prev=""
+for a in "$@"; do
+    [[ "$prev" == "--bind-rw" ]] && outbox="$a"
+    [[ "$a" == "--dangerously-skip-permissions" ]] && clone_dir="$prev"
+    prev="$a"
+done
+
+cat >/dev/null
+n=0
+[[ -f "$FAKE_COUNT_FILE" ]] && n="$(cat "$FAKE_COUNT_FILE")"
+n=$(( n + 1 ))
+printf '%s' "$n" > "$FAKE_COUNT_FILE"
+run_dir="$(dirname "$outbox")"
+
+case "$n" in
+1)
+    git -c user.email=t@fork-sandbox.invalid -c user.name=Tester \
+        -C "$clone_dir" commit --allow-empty -q -m "mnt2 implement"
+    ;;
+2)
+    printf 'FINDINGS\n\nfile.txt:1 the new line breaks the invariant it sits next to\n' \
+        > "$clone_dir/.git/maintainer-verdict.md"
+    ;;
+3)
+    git -c user.email=t@fork-sandbox.invalid -c user.name=Tester \
+        -C "$clone_dir" commit --allow-empty -q -m "mnt2 fix"
+    ;;
+4)
+    printf 'APPROVED\n\nChecked: the surrounding callers and the touched file.\n\n## Report\nAll five paragraphs.\n' \
+        > "$clone_dir/.git/maintainer-verdict.md"
+    ;;
+esac
+
+printf '{"type":"result","subtype":"success","total_cost_usd":0.01,"usage":{"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}\n'
+exit 0
+STUB
+chmod +x "$mnt2_stub/claude-sandboxed"
+
+count2="$(mktemp)"; tmpdirs+=("$count2")
+out2="$(PATH="$mnt2_stub:$real_stub:$PATH" FAKE_COUNT_FILE="$count2" \
+    FORK_SANDBOX_CONFIG_DIR="$real_cfg" FORK_SANDBOX_BACKEND=fake-image \
+    timeout 60 "$launcher" --foreground --harness claude \
+    --maintainer-loop 2 --maintainer-model sonnet \
+    --branch "sandbox-test-mnt2-$$" \
+    "$proj" "$handoff" 2>&1)"
+rc2=$?
+rd2="$(printf '%s\n' "$out2" | sed -n 's/^  run dir:  *//p' | head -1)"
+if (( rc2 == 0 )) && [[ -n "$rd2" ]]; then
+    tmpdirs+=("$rd2")
+    ok "the four-leg maintainer run exits 0"
+    check "four legs ran: implement, maintainer, fix, maintainer" "4" \
+        "$(cat "$count2")"
+    check "the loop ended approved" "approved" \
+        "$(jq -r '.ended' "$rd2/maintainer-loop.json")"
+    check "the record names the cap" "2" \
+        "$(jq -r '.cap' "$rd2/maintainer-loop.json")"
+    check "the record names the model" "sonnet" \
+        "$(jq -r '.maintainer_model' "$rd2/maintainer-loop.json")"
+    check "the record names the (defaulted) harness" "claude" \
+        "$(jq -r '.maintainer_harness' "$rd2/maintainer-loop.json")"
+    check "the loop finished two iterations" "2" \
+        "$(jq -r '.iterations | length' "$rd2/maintainer-loop.json")"
+    check "iteration 1 counted the one cited finding" "1" \
+        "$(jq -r '.iterations[0].findings' "$rd2/maintainer-loop.json")"
+    check "iteration 1's maintainer leg exited 0" "0" \
+        "$(jq -r '.iterations[0].maintainer_exit' "$rd2/maintainer-loop.json")"
+    check "iteration 1's fix leg exited 0" "0" \
+        "$(jq -r '.iterations[0].fix_exit' "$rd2/maintainer-loop.json")"
+    check "iteration 2 approved with no findings" "0" \
+        "$(jq -r '.iterations[1].findings' "$rd2/maintainer-loop.json")"
+    check "iteration 1's fix added exactly one commit" "1" \
+        "$(jq -r '.iterations[0].commits_added' "$rd2/maintainer-loop.json")"
+    check "iteration 2 added nothing" "null" \
+        "$(jq -r '.iterations[1].commits_added' "$rd2/maintainer-loop.json")"
+    for f in maintainer-prompt.md maintainer-prompt-1.md \
+        maintainer-prompt-2.md maintainer-verdict-1.md \
+        maintainer-verdict-2.md maintainer-fix-prompt-1.md \
+        events-maintainer-1.jsonl events-maintainer-2.jsonl \
+        events-mntfix-1.jsonl; do
+        if [[ -f "$rd2/$f" ]]; then
+            ok "run dir holds $f"
+        else
+            no "run dir holds $f"
+        fi
+    done
+    contains "the maintainer prompt takes the maintainer framing" \
+        "the way a maintainer would" "$(cat "$rd2/maintainer-prompt.md")"
+    contains "the maintainer prompt names the verdict path" \
+        ".git/maintainer-verdict.md" "$(cat "$rd2/maintainer-prompt.md")"
+    contains "the fix prompt carries the verdict body" \
+        "file.txt:1 the new line breaks the invariant it sits next to" \
+        "$(cat "$rd2/maintainer-fix-prompt-1.md")"
+    contains "events.jsonl still shows the coding session" \
+        '"subtype":"success"' "$(cat "$rd2/events.jsonl")"
+    if [[ -f "$rd2/exit-code" ]]; then
+        ok "the exit code was published"
+    else
+        no "the exit code was published"
+    fi
+else
+    no "the four-leg maintainer run exits 0" "rc=$rc2 rd=$rd2: $out2"
+fi
+
+# A branch with no commits skips the loop, and says why.
+rd_s="$(run_real --harness claude --maintainer-loop 1 --maintainer-model sonnet \
+    --branch "sandbox-test-mnt-skip-$$")" && tmpdirs+=("$rd_s")
+if [[ -n "$rd_s" ]]; then
+    check "a commitless branch skips the maintainer loop" "skipped" \
+        "$(jq -r '.ended' "$rd_s/maintainer-loop.json")"
+    contains "the skip says why" "holds no commits" \
+        "$(jq -r '.detail' "$rd_s/maintainer-loop.json")"
+    if [[ ! -e "$rd_s/events-maintainer-1.jsonl" ]]; then
+        ok "a skipped loop runs no maintainer leg"
+    else
+        no "a skipped loop runs no maintainer leg"
+    fi
+    check "a skipped loop has no iterations" "0" \
+        "$(jq -r '.iterations | length' "$rd_s/maintainer-loop.json")"
+fi
+
+# A fix leg that commits nothing ends the loop with no-progress: the
+# maintainer would only reread the same branch.
+mntnp_stub="$(mktemp -d /var/tmp/claude-scratch/fs-maintainer-noprog.XXXXXX)"
+tmpdirs+=("$mntnp_stub")
+cat > "$mntnp_stub/claude-sandboxed" <<'STUB'
+#!/usr/bin/env bash
+set -uo pipefail
+
+outbox="" clone_dir="" prev=""
+for a in "$@"; do
+    [[ "$prev" == "--bind-rw" ]] && outbox="$a"
+    [[ "$a" == "--dangerously-skip-permissions" ]] && clone_dir="$prev"
+    prev="$a"
+done
+
+cat >/dev/null
+n=0
+[[ -f "$FAKE_COUNT_FILE" ]] && n="$(cat "$FAKE_COUNT_FILE")"
+n=$(( n + 1 ))
+printf '%s' "$n" > "$FAKE_COUNT_FILE"
+
+case "$n" in
+1)
+    git -c user.email=t@fork-sandbox.invalid -c user.name=Tester \
+        -C "$clone_dir" commit --allow-empty -q -m "noprog implement"
+    ;;
+2)
+    printf 'FINDINGS\n\nfile.txt:2 a finding the fix leg will ignore\n' \
+        > "$clone_dir/.git/maintainer-verdict.md"
+    ;;
+3)
+    # The fix leg commits nothing.
+    ;;
+esac
+
+printf '{"type":"result","subtype":"success","total_cost_usd":0.01,"usage":{"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}\n'
+exit 0
+STUB
+chmod +x "$mntnp_stub/claude-sandboxed"
+
+countnp="$(mktemp)"; tmpdirs+=("$countnp")
+outnp="$(PATH="$mntnp_stub:$real_stub:$PATH" FAKE_COUNT_FILE="$countnp" \
+    FORK_SANDBOX_CONFIG_DIR="$real_cfg" FORK_SANDBOX_BACKEND=fake-image \
+    timeout 60 "$launcher" --foreground --harness claude \
+    --maintainer-loop 3 --maintainer-model sonnet \
+    --branch "sandbox-test-mnt-noprog-$$" \
+    "$proj" "$handoff" 2>&1)"
+rcnp=$?
+rdnp="$(printf '%s\n' "$outnp" | sed -n 's/^  run dir:  *//p' | head -1)"
+if (( rcnp == 0 )) && [[ -n "$rdnp" ]]; then
+    tmpdirs+=("$rdnp")
+    ok "the no-progress run exits 0"
+    check "no-progress stopped the loop at one iteration" "1" \
+        "$(jq -r '.iterations | length' "$rdnp/maintainer-loop.json")"
+    check "no-progress is recorded as the end" "no-progress" \
+        "$(jq -r '.ended' "$rdnp/maintainer-loop.json")"
+    check "three legs ran: implement, maintainer, fix" "3" "$(cat "$countnp")"
+else
+    no "the no-progress run exits 0" "rc=$rcnp rd=$rdnp: $outnp"
+fi
+
+# A failed session is not reviewed: the loop is skipped, and the session's
+# exit code is the run's.
+mntfail_stub="$(mktemp -d /var/tmp/claude-scratch/fs-maintainer-fail.XXXXXX)"
+tmpdirs+=("$mntfail_stub")
+cat > "$mntfail_stub/claude-sandboxed" <<'STUB'
+#!/usr/bin/env bash
+cat >/dev/null
+exit 3
+STUB
+chmod +x "$mntfail_stub/claude-sandboxed"
+
+outf="$(PATH="$mntfail_stub:$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$real_cfg" \
+    FORK_SANDBOX_BACKEND=fake-image \
+    timeout 60 "$launcher" --foreground --harness claude \
+    --maintainer-loop 1 --maintainer-model sonnet \
+    --branch "sandbox-test-mnt-fail-$$" \
+    "$proj" "$handoff" 2>&1)"
+rcf=$?
+rdf="$(printf '%s\n' "$outf" | sed -n 's/^  run dir:  *//p' | head -1)"
+if [[ -n "$rdf" ]]; then
+    tmpdirs+=("$rdf")
+    check "a failed session is reported as the run's exit code" "3" \
+        "$(cat "$rdf/exit-code")"
+    check "a failed session skips the maintainer loop" "skipped" \
+        "$(jq -r '.ended' "$rdf/maintainer-loop.json")"
+    contains "the skip says the session failed" "exited 3" \
+        "$(jq -r '.detail' "$rdf/maintainer-loop.json")"
+else
+    no "a failed session leaves a run dir" "rc=$rcf: $outf"
+fi
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))
