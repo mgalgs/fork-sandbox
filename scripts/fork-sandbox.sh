@@ -76,6 +76,36 @@
 #                        --review-harness pi-local reviewing a networked
 #                        implement harness -- is fine and silent. Refused
 #                        with --k8s.
+# --maintainer-loop <N>:
+#                        after the review loop -- or after the session,
+#                        when there is no --review-loop -- an OUTER pass:
+#                        a MAINTAINER leg reviews the branch the way a
+#                        maintainer would (the inner review already read the
+#                        diff line by line, so it reads the surrounding code
+#                        instead), and a fix leg on the implement harness
+#                        addresses its findings, up to N times. N must be a
+#                        positive integer. Fix legs never re-enter the
+#                        review loop. Requires a named model -- see
+#                        --maintainer-model. See "The maintainer loop"
+#                        below.
+# --maintainer-model <model>:
+#                        the model the maintainer legs run on. Required by
+#                        --maintainer-loop, which has no default to fall
+#                        back on: the maintainer's verdict is the run's
+#                        last word, so it must come from a model you named.
+#                        Resolved and validated the same way as --model,
+#                        against --maintainer-harness when given.
+# --maintainer-harness <name>[/<model>]:
+#                        the harness the maintainer legs run on -- claude,
+#                        pi, pi-local or codex, in the same combined
+#                        harness/model form --harness takes. Defaults to
+#                        --harness. Requires --maintainer-loop. A model
+#                        given both here and via --maintainer-model
+#                        conflicts, same as --harness/--model. --harness
+#                        pi-local with a networked --maintainer-harness
+#                        warns and proceeds, the same tradeoff as
+#                        --review-harness. Refused with --k8s and
+#                        --review-only.
 # --task-meta '<json>':  one JSON object of orchestrator-supplied task
 #                        metadata -- kind, difficulty, size,
 #                        prompt_template_id, stage -- stored beside the run
@@ -247,6 +277,32 @@
 # counts as running until the last leg is done — the exit code is published
 # after the loop — so a watcher gets one terminal event, at the end, with a
 # summary that reflects the reviewed branch.
+#
+# The maintainer loop. --maintainer-loop N adds a second, OUTER review tier
+# after the review loop (or after the coding session when there is no
+# --review-loop): a MAINTAINER leg reviews the same commit range as a
+# maintainer deciding whether the branch is ready to land. Its prompt says
+# so out loud: the inner review already read the diff line by line, so the
+# maintainer reads the surrounding code instead — the callers of what the
+# change touches, the conventions the touched files follow, the invariants
+# the area holds. When its verdict lists problems, a fix leg addresses them
+# — on the IMPLEMENT harness and model, exactly like a review-loop fix leg —
+# and the pair repeats up to N times. A fix leg's commits are reviewed by
+# the maintainer's own next iteration, never by the review loop: the inner
+# loop has already ended by the time the outer one starts, and re-entering
+# it would let two reviewers argue through fix legs indefinitely.
+#
+# The maintainer harness defaults to the implement harness, but its model
+# has no default: --maintainer-loop refuses to run until --maintainer-model
+# (or the combined --maintainer-harness <harness>/<model> form) names one.
+# The review loop may quietly fall back to the implement model because a
+# same-model review is still a fresh session; a maintainer pass that
+# silently ran the implement model would judge the work as its author does,
+# which is the point the tier exists to avoid. The loop records itself in
+# <run-dir>/maintainer-loop.json the way review-loop.json does, and its
+# cost folds into total_cost_usd the same way. Refused with --k8s (the
+# cluster path has no maintainer tier yet) and with --review-only (there is
+# no coding leg whose branch a maintainer would review).
 #
 # A run that refreshes itself. An interactive session that fills its context
 # writes a hand-off and forks a fresh session rather than degrade into
@@ -1070,6 +1126,13 @@ task_meta=""
 context_ro=""
 review_loop_arg=""
 review_loop_cap=0
+maintainer_loop_arg=""
+maintainer_loop_cap=0
+maintainer_harness_spec=""
+maintainer_harness_given=false
+maintainer_harness=""
+maintainer_combined_model=""
+maintainer_model=""
 review_only=false
 mode=run
 review_base_ref=""
@@ -1156,6 +1219,19 @@ while [[ "${1:-}" == -* ]]; do
             review_loop_arg="${2:?--review-loop requires a positive integer}"
             shift 2
             ;;
+        --maintainer-loop)
+            maintainer_loop_arg="${2:?--maintainer-loop requires a positive integer}"
+            shift 2
+            ;;
+        --maintainer-model)
+            maintainer_model="${2:?--maintainer-model requires a value}"
+            shift 2
+            ;;
+        --maintainer-harness)
+            maintainer_harness_spec="${2:?--maintainer-harness requires claude, pi, pi-local or codex}"
+            maintainer_harness_given=true
+            shift 2
+            ;;
         --foreground|--no-window)
             # --no-window is the old name, kept so existing callers work.
             foreground=true
@@ -1232,6 +1308,12 @@ if [[ "$review_only" == true ]]; then
         echo "with --harness/--model." >&2
         exit 1
     fi
+    if [[ -n "$maintainer_model" || "$maintainer_harness_given" == true || -n "$maintainer_loop_arg" ]]; then
+        echo "Error: --review-only runs one review leg and has no coding leg" >&2
+        echo "whose branch a maintainer would review -- --maintainer-loop and" >&2
+        echo "its harness and model flags are not supported with --review-only." >&2
+        exit 1
+    fi
     if [[ "$refresh_at_given" == true ]]; then
         echo "Error: --refresh-at is not supported with --review-only." >&2
         exit 1
@@ -1282,6 +1364,27 @@ if [[ "$review_harness_given" == true ]]; then
     esac
 fi
 
+# --maintainer-harness takes the identical harness[/model] shape as
+# --harness and --review-harness, split the identical way for the identical
+# reason.
+if [[ "$maintainer_harness_given" == true ]]; then
+    if [[ "$maintainer_harness_spec" == */* ]]; then
+        maintainer_harness="${maintainer_harness_spec%%/*}"
+        maintainer_combined_model="${maintainer_harness_spec#*/}"
+    else
+        maintainer_harness="$maintainer_harness_spec"
+    fi
+
+    case "$maintainer_harness" in
+        claude|pi|pi-local|codex) ;;
+        *)
+            echo "Error: --maintainer-harness takes 'claude', 'pi', 'pi-local'" >&2
+            echo "or 'codex', not '$maintainer_harness'." >&2
+            exit 1
+            ;;
+    esac
+fi
+
 # pi is the cluster path's default harness (see the --k8s block below,
 # which also accepts --harness claude), so --k8s defaults to it rather than
 # making an operator type --harness pi on the one flag whose whole purpose
@@ -1314,6 +1417,14 @@ if [[ -n "$review_combined_model" && -n "$review_model" ]]; then
     exit 1
 fi
 [[ -n "$review_combined_model" ]] && review_model="$review_combined_model"
+
+if [[ -n "$maintainer_combined_model" && -n "$maintainer_model" ]]; then
+    echo "Error: combined maintainer-harness model '$maintainer_combined_model'" >&2
+    echo "conflicts with --maintainer-model '$maintainer_model'. Drop one of" >&2
+    echo "the two model values." >&2
+    exit 1
+fi
+[[ -n "$maintainer_combined_model" ]] && maintainer_model="$maintainer_combined_model"
 
 if [[ "$model_unchecked" == true && "$model_given" != true ]]; then
     echo "Error: --model-unchecked requires a model, since it sends that" >&2
@@ -1441,6 +1552,13 @@ review_model_given=false
 # implement harness otherwise, exactly as before --review-harness existed.
 resolve_model review_model "$review_model_given" "${review_harness:-$harness}" || exit 1
 
+# The maintainer model resolves against the maintainer harness when one was
+# given -- its aliases and codex cache are its own -- and against the
+# implement harness otherwise, exactly as the review model does.
+maintainer_model_given=false
+[[ -n "$maintainer_model" ]] && maintainer_model_given=true
+resolve_model maintainer_model "$maintainer_model_given" "${maintainer_harness:-$harness}" || exit 1
+
 if [[ "$harness" == "pi" && -z "$model" ]]; then
     echo "Error: --harness pi needs --model. There is no default: the model" >&2
     echo "is an OpenRouter id, such as moonshotai/kimi-k3." >&2
@@ -1564,6 +1682,16 @@ if [[ "$k8s_mode" == true ]]; then
         echo "--review-loop." >&2
         exit 1
     fi
+    # The maintainer tier is local-only this round: the cluster path carries
+    # the pod review loop and nothing above it yet, so rather than accept
+    # the flags and drop them, refuse all three of them by name at once.
+    if [[ -n "$maintainer_loop_arg" || "$maintainer_harness_given" == true || -n "$maintainer_model" ]]; then
+        echo "Error: --maintainer-loop is not yet supported with --k8s, nor" >&2
+        echo "are its --maintainer-harness and --maintainer-model flags. The" >&2
+        echo "cluster path has no maintainer tier yet -- the pod's own review" >&2
+        echo "loop is the only review it carries." >&2
+        exit 1
+    fi
     if [[ "$harness" == "pi" ]]; then
         if [[ "$review_harness_given" == true ]]; then
             echo "Error: --review-harness is not supported with --k8s --harness" >&2
@@ -1677,6 +1805,32 @@ if [[ "$review_harness_given" == true && "$review_loop_cap" == "0" ]]; then
     echo "--review-loop." >&2
     exit 1
 fi
+if [[ -n "$maintainer_loop_arg" ]]; then
+    if [[ ! "$maintainer_loop_arg" =~ ^[1-9][0-9]*$ ]]; then
+        echo "Error: --maintainer-loop takes a positive integer — the maximum" >&2
+        echo "number of maintainer-then-fix iterations — not '$maintainer_loop_arg'." >&2
+        exit 1
+    fi
+    maintainer_loop_cap="$maintainer_loop_arg"
+fi
+if [[ -n "$maintainer_model" && "$maintainer_loop_cap" == "0" ]]; then
+    echo "Error: --maintainer-model only applies to maintainer legs and requires" >&2
+    echo "--maintainer-loop." >&2
+    exit 1
+fi
+if [[ "$maintainer_harness_given" == true && "$maintainer_loop_cap" == "0" ]]; then
+    echo "Error: --maintainer-harness only applies to maintainer legs and requires" >&2
+    echo "--maintainer-loop." >&2
+    exit 1
+fi
+if [[ "$maintainer_loop_cap" != "0" && -z "$maintainer_model" ]]; then
+    echo "Error: --maintainer-loop needs a model for its legs -- either" >&2
+    echo "--maintainer-model, or in the combined harness/model form" >&2
+    echo "(--maintainer-harness pi/moonshotai/kimi-k3). Unlike --review-model" >&2
+    echo "there is no default: the maintainer's verdict is the run's last" >&2
+    echo "word, so it must come from a model you named." >&2
+    exit 1
+fi
 if [[ -n "$review_base_ref" && "$review_only" != true ]]; then
     echo "Error: --review-base only applies with --review-only." >&2
     exit 1
@@ -1709,6 +1863,17 @@ if [[ "$review_harness_given" == true && "$harness" == "pi-local" \
     echo "at all -- but --review-harness $review_harness is networked. Its" >&2
     echo "review leg is a separate sandbox and will send the clone's" >&2
     echo "contents to $review_harness's model provider. Proceeding." >&2
+fi
+# The same seal tradeoff for the maintainer tier: a sealed implement leg is
+# fine, a networked maintainer leg widens the run's reach, and that is the
+# caller's judgement call for the same reason as above.
+if [[ "$maintainer_harness_given" == true && "$harness" == "pi-local" \
+    && "$maintainer_harness" != "pi-local" ]]; then
+    echo "Warning: --harness pi-local seals the implement leg -- no network" >&2
+    echo "at all -- but --maintainer-harness $maintainer_harness is networked." >&2
+    echo "Its maintainer legs are separate sandboxes and will send the" >&2
+    echo "clone's contents to $maintainer_harness's model provider." >&2
+    echo "Proceeding." >&2
 fi
 
 # --refresh-at: refused outright, by name, on every harness but claude --
@@ -1967,6 +2132,11 @@ if [[ "$dry_run" == true ]]; then
     printf 'harness=%s\nmodel=%s\n' "$harness" "$model"
     [[ -z "$review_model" ]] || printf 'review_model=%s\n' "$review_model"
     [[ "$review_harness_given" != true ]] || printf 'review_harness=%s\n' "$review_harness"
+    if [[ "$maintainer_loop_cap" != "0" ]]; then
+        printf 'maintainer_loop=%s\n' "$maintainer_loop_cap"
+        printf 'maintainer_model=%s\n' "$maintainer_model"
+        [[ "$maintainer_harness_given" != true ]] || printf 'maintainer_harness=%s\n' "$maintainer_harness"
+    fi
     printf 'prompt_overlay_dir=%s\n' "$prompt_overlay_dir"
     for prompt_overlay_leg in "${prompt_overlay_legs[@]}"; do
         prompt_overlay_leg_csv="${prompt_overlay_fragments[$prompt_overlay_leg]:-}"
@@ -2590,7 +2760,8 @@ fi
 # before anything is created, so a bad name cannot leave a clone behind on
 # the way out.
 fs_reject_unsafe_chars "$project_path" "$handoff_file" "$branch" "$checkout_ref" \
-    "$model" "$review_model" "$review_harness" "$claude_extra_args" "$sandbox_args"
+    "$model" "$review_model" "$review_harness" "$maintainer_model" \
+    "$maintainer_harness" "$claude_extra_args" "$sandbox_args"
 
 # --task-meta never enters the generated runner -- it is written straight to
 # a file in the run dir -- so the check it needs is JSON validity, not shell
