@@ -47,6 +47,11 @@ tmp="$(mktemp -d)"
 tmpdirs+=("$tmp")
 export FORK_SANDBOX_CONFIG_DIR="$tmp/config"
 mkdir -p "$FORK_SANDBOX_CONFIG_DIR"
+# The codex model check reads $CODEX_HOME/models_cache.json, so on a host
+# with a populated real cache the named test models would be refused.
+# Point it at scratch: no cache means every codex model is sent verbatim
+# (with a warning), the same on every host.
+export CODEX_HOME="$tmp/codex-home"
 
 # --dry-run resolves and validates the flags, then exits before the clone --
 # exactly what every parsing/validation check needs, and none of it needs a
