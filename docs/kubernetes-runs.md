@@ -606,9 +606,39 @@ address ranges `http://` is restricted to. A set `K8S_PROXY_ALLOW`
 *replaces* that default policy wholesale rather than extending it, so
 every endpoint host — not just the one that prompted setting it — needs
 its own `<cidr>:<port>` entry, or it becomes unreachable too; `install`
-warns when it detects this. `submit`'s own wiring to a named endpoint
-(rather than the shared proxy's legacy `/api/v1` path) is not yet built,
-so `submit` refuses outright against a `K8S_PROXY_ENDPOINTS` install.
+warns when it detects this. `submit` (and `run`) against such an install is wired to a named
+endpoint with `--endpoint NAME`: the pod's `PROXY_BASE_URL` becomes
+the shared proxy's `/e/NAME/v1` location instead of the legacy `/api/v1`
+path, which a keyless install never renders. A name that is not
+registered is an error listing the registered names; omitted, the flag
+resolves to the single registered endpoint when there is exactly one
+(announced on stderr) and is an error, listing the names, when there
+are several — the same one-candidate rule `agent-sandboxed` applies
+when resolving a model. On a legacy `K8S_PROXY_UPSTREAM` install
+`--endpoint` is an error, since that render has no named endpoints, and
+`PROXY_BASE_URL` stays the `/api/v1` literal.
+
+**`--model` is optional on an endpoints install; the pod discovers the
+model facts itself.** `fork-sandbox-k8s-entrypoint.sh` queries
+`$PROXY_BASE_URL/models` once, early, *before* it waits for the
+repository to arrive — the health check the `direct` section below
+records as a requirement, now satisfied for the proxy path: a dead
+endpoint fails in seconds with a message that treats a connection
+refusal from a workstation-class host as the expected, ordinary state
+it is, not a bug to chase. When `--model` was omitted, exactly one
+model in the listing is used (and said so); zero or several is an error
+listing what was found. When `--model` was given but the listing does
+not contain it, that is a warning, not an error — the listing may be
+stale, and refusing would strand a legitimate run. The same response's
+`max_model_len` for the chosen model becomes `models.json`'s
+`contextWindow` (a missing value falls back to a deliberately low 32768
+guess, with a warning), and `maxTokens` is derived the same way
+`agent-sandboxed` derives it: a 32768 floor capped at a quarter of the
+window. `REVIEW_MODEL`, when set, gets the same discovered window. On a
+legacy install `--model` stays required (the same error text as before),
+and `--harness claude` keeps the requirement even on an endpoints
+install: discovery lists the pi endpoint's model ids, never a Claude
+Code model name.
 
 ### 1b. proxy, per-run, for claude — **Status: built.**
 
@@ -757,7 +787,10 @@ tries to dispatch to it. `direct` therefore has to health-check the endpoint
 before dispatch and fail with a clear message rather than hang waiting on a
 model call that will never return. A connection refusal from
 `K8S_MODEL_ENDPOINT` is an expected, ordinary state to design for, not a bug
-to chase down each time it happens.
+to chase down each time it happens. (The built `proxy` mode performs this
+same check for `K8S_PROXY_ENDPOINTS` runs: the pod queries the endpoint's
+`/models` path through the proxy at startup, before the repository arrives —
+see the mode-1 section above.)
 
 ### 3. secret — **Status: designed, not built.**
 
