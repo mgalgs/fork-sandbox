@@ -6,6 +6,7 @@
 # Usage: lkml-round.sh <series> --project <path> --checkout <ref> --base <ref>
 #            --personas <p1,p2,...> [--reply-to <id>]... [--personas-dir <dir>]
 #            [--version <n>] [--timeout <seconds>] [--model-override <harness/model>]
+#            [--services-trust-ref <ref>]
 #
 # <project>  the repo fork-sandbox.sh clones -- same argument it takes.
 # --checkout the ref each persona's clone starts at: the series' tip, with
@@ -35,6 +36,14 @@
 # --model-override <harness>[/<model>] overrides every persona's own
 #            harness/model for this round only -- useful for a cheap
 #            smoke-test round before spending on the real panel.
+# --services-trust-ref <ref> is passed through to every seat's
+#            fork-sandbox.sh launch. Without it, fork-sandbox.sh disables
+#            the repo's .agents/sandbox-services hook on a --checkout run
+#            (its warning lands in the captured launch output, unseen), so
+#            seats get no per-run services and no provision-ro binds. Pass
+#            the trusted base the series came from (e.g. the --base ref);
+#            each seat's hook then runs iff its checkout did not change the
+#            sandbox-services contract relative to that ref.
 #
 # What this launches, per persona: a fork-sandbox.sh run, --checkout at the
 # series' tip, with a handoff built from the persona file, the mailbox's
@@ -81,6 +90,7 @@ personas_dir="$default_personas_dir"
 version=""
 timeout=3600
 model_override=""
+services_trust_ref=""
 reply_to_ids=()
 
 while [[ $# -gt 0 ]]; do
@@ -94,6 +104,7 @@ while [[ $# -gt 0 ]]; do
         --version) version="${2:?--version requires a number}"; shift 2 ;;
         --timeout) timeout="${2:?--timeout requires seconds}"; shift 2 ;;
         --model-override) model_override="${2:?--model-override requires harness or harness/model}"; shift 2 ;;
+        --services-trust-ref) services_trust_ref="${2:?--services-trust-ref requires a ref}"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Error: unknown option '$1'." >&2; exit 1 ;;
     esac
@@ -108,6 +119,9 @@ fi
 [[ -d "$personas_dir" ]] || { echo "Error: --personas-dir '$personas_dir' not found." >&2; exit 1; }
 command -v fork-sandbox.sh >/dev/null 2>&1 || { echo "Error: fork-sandbox.sh not found on PATH." >&2; exit 1; }
 command -v jq >/dev/null 2>&1 || { echo "Error: jq not found on PATH." >&2; exit 1; }
+
+trust_args=()
+[[ -n "$services_trust_ref" ]] && trust_args=(--services-trust-ref "$services_trust_ref")
 
 if [[ -z "$version" ]]; then
     if (( ${#reply_to_ids[@]} > 0 )); then
@@ -348,7 +362,7 @@ for persona in "${personas[@]}"; do
 
     echo "fork-sandbox lkml-round: launching $persona ($harness_spec${thinking:+, thinking $thinking})..." >&2
     launch_out="$(fork-sandbox.sh --harness "$harness_spec" --checkout "$checkout_ref" \
-        "${pi_args[@]}" \
+        "${pi_args[@]}" "${trust_args[@]}" \
         --branch "$branch" --task-meta "$task_meta" "$project" "$handoff_file" 2>&1)"
     rc=$?
     run_dir="$(printf '%s\n' "$launch_out" | sed -n 's/^  run dir:  *//p' | head -n1)"
