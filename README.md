@@ -53,6 +53,52 @@ network access).
 - **Frontier models:** `/fork-sandbox --harness claude`
 - **Most scalable:** `/fork-sandbox --k8s` — each run is a Kubernetes Job.
 
+**Pipelines as presets**
+
+The whole multi-agent pipeline — who codes, who reviews, who maintains,
+who fixes what each finds, with what loop caps — can be one named YAML
+file instead of a fistful of flags:
+
+```yaml
+# ~/.config/fork-sandbox/presets/deep.yaml
+agents:
+  haiku-coder:
+    harness: claude
+    model: haiku
+    repeat: 3           # every coding leg by this agent runs 3 passes
+    refresh-at: 0.6
+  reviewer:
+    harness: pi
+    model: moonshotai/kimi-k3
+  coder:
+    harness: claude
+    model: fable
+  elder:
+    harness: claude
+    model: opus
+
+pipeline:
+  - action: code
+    agent: haiku-coder
+
+  - action: review
+    repeat: 3
+    agent: reviewer
+    fix_agent: haiku-coder   # findings re-run this agent, x3 (its repeat)
+
+  - action: maintain
+    repeat: 2
+    agent: elder
+    fix_agent: coder         # the maintainer's findings get the strong fixer
+```
+
+Then `fork-sandbox.sh --preset deep <project> <handoff>` runs it: a cheap
+model types (and re-checks its own premature "done" — that is the
+`repeat`), a cross-family reviewer reads the diff, and a maintainer with
+a strong fixer has the last word. Explicit flags still override the
+preset key by key. [docs/presets.md](docs/presets.md) has the format,
+the precedence rules, and the sharp edges.
+
 ## The three network modes
 
 Every run's implement leg is in exactly one of these, and the mode decides
