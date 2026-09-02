@@ -122,6 +122,10 @@ fi
 contains "attachment reference is rendered" "$html" 'attachments/shot.png'
 contains "attachment contents are embedded" "$html" 'data:image/png;base64,'
 case "$html" in *fonts.googleapis.com*) no "output has no remote font dependency" ;; *) ok "output has no remote font dependency" ;; esac
+contains "prose uses the system sans stack" "$html" 'font-family:system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif'
+case "$html" in *"Source Serif"*|*"Times New Roman"*) no "no serif stack remains (the Times regression)" ;; *) ok "no serif stack remains (the Times regression)" ;; esac
+contains "message body is 1rem at 72ch" "$html" '.body{max-width:72ch;font-size:1rem;line-height:1.6}'
+contains "thread index rows have a hover background" "$html" '.tidx li:hover{background:var(--code-bg)}'
 if cmp -s "$stdout" "$custom"; then ok "output file matches stdout"; else no "output file matches stdout"; fi
 if python3 -m py_compile "$renderer"; then ok "renderer compiles"; else no "renderer compiles"; fi
 
