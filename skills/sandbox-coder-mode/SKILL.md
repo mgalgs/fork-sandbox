@@ -334,9 +334,10 @@ otherwise widen the task on its own.
 
 The flags below are the shipped defaults from **Choosing a harness and a
 model** — substitute the effective values noted at **Entering the mode** if
-`coder-mode.env` overrides any of them (including adding `--review-harness`,
-which the shipped defaults don't set), and see **Reasons to deviate for one
-round** before changing `--harness` for a single launch.
+`coder-mode.env` overrides any of them (including adding `--review-harness`
+or the `--maintainer-*` trio, which the shipped defaults don't set), and see
+**Reasons to deviate for one round** before changing `--harness` for a
+single launch.
 
 ```bash
 fork-sandbox.sh --harness claude --model sonnet --review-model opus --review-loop 2 \
@@ -650,6 +651,9 @@ file, or a key absent from it, means the default above.
 | `CODER_MODE_REVIEW_HARNESS` | `--review-harness` | unset (same as `--harness`) |
 | `CODER_MODE_REVIEW_MODEL` | `--review-model` | `opus` |
 | `CODER_MODE_REVIEW_LOOP` | `--review-loop` | `2` |
+| `CODER_MODE_MAINTAINER_HARNESS` | `--maintainer-harness` | unset (same as `--harness`) |
+| `CODER_MODE_MAINTAINER_MODEL` | `--maintainer-model` | unset — **required** to run the tier |
+| `CODER_MODE_MAINTAINER_LOOP` | `--maintainer-loop` | unset (no maintainer tier) |
 
 1. **A harness's keys move together.** `sonnet` and `opus` are claude model
    names. A file that sets `CODER_MODE_HARNESS` to anything else must also
@@ -673,6 +677,17 @@ file, or a key absent from it, means the default above.
    launch, all three — the script refuses `--review-harness` without
    `--review-loop`, and refuses `--review-loop` set to `0` on the command
    line.
+4. **The maintainer keys follow the same rules, with one inversion.**
+   Unset (or `0`) `CODER_MODE_MAINTAINER_LOOP` means no maintainer tier:
+   omit all three `--maintainer-*` flags, as in item 3. When the loop is
+   set, `CODER_MODE_MAINTAINER_MODEL` is **required** — unlike the review
+   model, the maintainer model has no default, because its verdict is the
+   run's last word on the branch (`fork-sandbox.sh` refuses the loop
+   without a model). The harness key resolves the model name exactly as
+   item 1 describes for review, and a sealed `pi-local` implement with a
+   networked maintainer harness warns by name exactly as item 2 describes
+   — a maintainer leg sends the clone's contents to that harness's
+   provider just as a review leg does.
 
 No script reads this file — `fork-sandbox.sh` itself has no idea it exists.
 Reading it is this session's job, done once per **Entering the mode**,
@@ -706,11 +721,14 @@ review omission.
 The composition the user launched the mode with — or the machine file
 above — has two tiers in it: `--model` is the *light* model that types,
 `--review-model` is the *medium* model that reads, and `--review-loop` is
-how many times. That composition is the default for **every** round, and
-the orchestrator does not lower it: not the loop count, not the review
-model, not for a round that "looks small". An implementer cannot judge its
-own work, and the orchestrator cannot judge its own spec; neither decides
-whether a review runs.
+how many times. A machine file that sets the maintainer keys adds a third:
+the model that judges the branch the way a maintainer judging a pull
+request would, after the inner loop has finished arguing. That composition
+is the default for **every** round, and the orchestrator does not lower
+it: not the loop count, not the review model, not the maintainer tier, not
+for a round that "looks small". An implementer cannot judge its own work,
+and the orchestrator cannot judge its own spec; neither decides whether a
+review — inner or maintainer — runs.
 
 The one permitted deviation is **upward on the implementer, never downward
 on the review**: a change small enough that a loop is plainly overkill goes
