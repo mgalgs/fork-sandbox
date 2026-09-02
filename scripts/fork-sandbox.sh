@@ -193,8 +193,10 @@
 #                        the pod talks to (passed to fork-sandbox-k8s.sh
 #                        run, which resolves it against the registered
 #                        endpoints). A preset's code seat may carry an
-#                        endpoint key that --endpoint overrides, like every
-#                        other preset key. Refused without --k8s.
+#                        endpoint key: an explicit --endpoint overrides it,
+#                        but a --harness override does NOT drop it -- unlike
+#                        the seat's other keys, it names the run's cluster,
+#                        not the agent. Refused without --k8s.
 # --outbox-max <size>:   raise the outbox size cap above the default 64 MiB.
 #                        Takes a plain byte count or a size with a K/M/G
 #                        suffix (512K, 256M, 2G). Applies to both the local

@@ -997,6 +997,27 @@ fi
 contains "the --endpoint override is announced on stderr" \
     "$(cat "$err_ep2")" "--endpoint overrides the code seat's endpoint"
 
+# A --harness override moves the code seat but does NOT drop the seat's
+# endpoint key (unlike model/args/repeat): the k8s dispatch still
+# forwards it, and the seat-override note never claims it was dropped.
+err_ep3="$tmp/err-ep3"
+out_ep3="$(TMPDIR="$stage_tmp_k8s" PATH="$real_stub:$PATH" \
+    FORK_SANDBOX_CONFIG_DIR="$real_cfg" FORK_SANDBOX_BACKEND=fake-image \
+    timeout 60 "$k8s_scripts/fork-sandbox.sh" --preset ep \
+    --harness pi --model moonshotai/kimi-k3 --k8s "$proj" "$handoff" 2>"$err_ep3")"
+rc_ep3=$?
+ep_argv3="$(printf '%s\n' "$out_ep3" | sed 's/^k8s-stub //' | tr '\n' ' ')"
+if (( rc_ep3 == 0 )) && [[ "$ep_argv3" == *"--endpoint llm"* ]]; then
+    ok "a --harness override keeps the code seat's endpoint"
+else
+    no "a --harness override keeps the code seat's endpoint" \
+        "rc=$rc_ep3 out=$(printf '%s' "$out_ep3" | head -3) err=$(head -3 "$err_ep3")"
+fi
+contains "the seat override fires for the moved seat" \
+    "$(cat "$err_ep3")" "--harness overrides the code seat"
+lacks "the seat-override note does not claim the endpoint was dropped" \
+    "$(cat "$err_ep3")" "endpoint"
+
 # B. A fix seat of its own, with repeat: the review loop's fix legs run the
 # fix agent's model, twice per iteration.
 cat > "$real_presets/fixseat.yaml" <<'EOF'
