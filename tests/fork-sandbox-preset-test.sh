@@ -906,6 +906,29 @@ if [[ -n "${rd_a:-}" && -x "$run_log" ]]; then
     else
         no "a run dir without preset.yaml still records"
     fi
+
+    # A hand-crafted preset.json whose sha256 is missing must skip the
+    # archive, not the record: the whole run_end entry survives, with no
+    # archive key. (The same guard also covers a non-string sha256, which
+    # raises TypeError.)
+    rd_bad="$(mktemp -d /var/tmp/claude-scratch/forks/claude-fork-sandbox.XXXXXX)"
+    tmpdirs+=("$rd_bad")
+    cp -a -- "$rd_a/". "$rd_bad/"
+    printf '%s\n' '{"name":"rep3","file":"/nonexistent/presets/rep3.yaml"}' \
+        > "$rd_bad/preset.json"
+    err_bad="$tmp/err-preset-bad"
+    if HOME="$fakehome" "$run_log" record --run-dir "$rd_bad" \
+        >/dev/null 2>"$err_bad"; then
+        ok "a preset.json without a sha256 still records"
+        contains "its missing archive is warned on stderr" \
+            "$(cat "$err_bad")" "preset not archived"
+        rec_bad="$(HOME="$fakehome" "$run_log" show "$(basename "$rd_bad")")"
+        check "the entry keeps the run but has no preset.archive" \
+            'rep3/null' \
+            "$(printf '%s' "$rec_bad" | jq -r '.preset.name + "/" + (.preset.archive // "null")')"
+    else
+        no "a preset.json without a sha256 still records"
+    fi
 else
     no "sandbox-run-log.py record archives the preset definition" \
         "prior stubbed run failed, or $run_log is not executable"

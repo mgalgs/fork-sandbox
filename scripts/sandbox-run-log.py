@@ -376,12 +376,15 @@ def cmd_record(args):
         # cannot race it.
         preset_yaml = os.path.join(rd, "preset.yaml")
         if os.path.isfile(preset_yaml) and not os.path.islink(preset_yaml):
-            dest = os.path.join(
-                ARCHIVE_DIR, "presets",
-                rec["preset"]["sha256"] + ".yaml")
             try:
                 with open(preset_yaml, "rb") as f:
                     data = f.read()
+                # A hand-crafted or corrupted preset.json may be any JSON
+                # value: keep this read inside the guard so a missing or
+                # non-string sha256 skips the archive, not the record.
+                dest = os.path.join(
+                    ARCHIVE_DIR, "presets",
+                    rec["preset"]["sha256"] + ".yaml")
                 os.makedirs(os.path.dirname(dest), exist_ok=True)
                 # A second run of the same definition is a no-op: the key
                 # is the hash, so its existence is the dedup.
@@ -389,7 +392,7 @@ def cmd_record(args):
                     with open(dest, "wb") as f:
                         f.write(data)
                 rec["preset"]["archive"] = dest
-            except (OSError, KeyError) as e:
+            except (OSError, KeyError, TypeError) as e:
                 print(f"sandbox-run-log: preset not archived: {e}",
                       file=sys.stderr)
         else:
