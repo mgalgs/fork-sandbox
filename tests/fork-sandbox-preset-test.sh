@@ -9,6 +9,7 @@ set -uo pipefail
 
 repo_dir="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 launcher="$repo_dir/scripts/fork-sandbox.sh"
+run_log="$repo_dir/scripts/sandbox-run-log.py"
 
 pass=0
 fail=0
@@ -763,6 +764,12 @@ if [[ -n "${rd_a:-}" ]]; then
     fi
     contains "run.env records the repeat" "$(cat "$rd_a/run.env")" \
         "code_repeat=3"
+    if cmp -s "$rd_a/preset.yaml" "$real_presets/rep3.yaml"; then
+        ok "a --preset launch leaves the definition in the run dir, byte-identical"
+    else
+        no "a --preset launch leaves the definition in the run dir, byte-identical" \
+            "$rd_a/preset.yaml differs from $real_presets/rep3.yaml"
+    fi
     check "a noop middle pass does not stop the passes" "3" "$(cat "$count")"
 fi
 

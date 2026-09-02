@@ -3281,6 +3281,12 @@ if [[ -n "$preset_name" ]]; then
         --arg sha256 "$preset_sha256" \
         '{name: $name, file: $file, sha256: $sha256}' \
         > "$run_dir/preset.json"
+    # And the definition's own bytes, AS LAUNCHED, beside the provenance
+    # record. record runs at run END, and the preset may be edited in
+    # between -- so the launch-time copy is the only archive source that
+    # cannot race the edit. sandbox-run-log.py archives it under the
+    # sha256 above, deduplicated for free by that key.
+    cp -- "$preset_file" "$run_dir/preset.yaml"
 fi
 # The prompt overlay's provenance, beside the run for the same reason: what
 # was applied has to be queryable later, not just present in the rendered
