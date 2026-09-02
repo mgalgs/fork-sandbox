@@ -132,8 +132,11 @@
 # optional on an endpoints install (see the note above); --harness
 # claude keeps the requirement even on an endpoints install, because
 # discovery only lists the pi endpoint's model ids, never a Claude Code
-# model name. fork-sandbox.sh --k8s still requires --model on its own
-# path; only this direct entry point accepts the omission.
+# model name. fork-sandbox.sh --k8s accepts the same omission on its
+# own path: a pi run that names an endpoint -- the flag or the preset's
+# code-seat key -- skips the launcher's own --model requirement and
+# lands here, where this install-mode-aware validation is the one that
+# decides.
 #
 # --context-ro DIR (submit, run): push DIR into the pod at /work/context,
 # read-only by convention, over the same gated kubectl-exec channel the

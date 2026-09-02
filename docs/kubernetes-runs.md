@@ -63,8 +63,11 @@ agent does finish. `--keep` skips the final `rm`, for a caller who wants
 the Job and pod left in place after a successful fetch.
 
 `fork-sandbox.sh --k8s` dispatches to exactly this `run` verb: it resolves
-and validates the harness and model the same way a local run does, builds
-the argument list above, and `exec`s this script — no local clone or tmux
+and validates the harness and model the same way a local run does — the
+one exception a pi run that names an `--endpoint`, whose model it leaves
+for this script's install-mode-aware validation to resolve (or refuse on
+a legacy install) — then builds the argument list above, and `exec`s
+this script — no local clone or tmux
 runner ever starts (the review loop, unlike those two, DOES run on this
 path — see "The cluster review loop" below). Most of `fork-sandbox.sh`'s
 other flags describe that local machinery and have nothing to attach to on

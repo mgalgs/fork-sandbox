@@ -195,11 +195,14 @@ repeat too, with a note — they were tuned to the agent the preset named,
 not to the override. An explicit `fix_agent` is its own seat and
 survives a code-seat override; a *defaulted* fix seat follows the
 implement command wherever the flags took it, dropping the preset
-agent's repeat along the way (also with a note). The one key a
-`--harness` override does not drop is the code seat's `endpoint`, and
-only an explicit `--endpoint` replaces it — it names a fact about the
+agent's repeat along the way (also with a note). What a `--harness`
+override does not drop: the code seat's `endpoint`, always — only an
+explicit `--endpoint` replaces it, because it names a fact about the
 run's cluster (which named proxy endpoint the pod talks to), not about
-the agent the preset named. No flag names a fix
+the agent the preset named; and the seat's refresh keys, whenever the
+override lands on claude — refresh is claude-only and is gated on the
+harness the seat ends up on, so an override off claude drops the keys
+with a note of its own. No flag names a fix
 seat or a repeat, so nothing overrides those two — they are the first
 preset-only knobs.
 

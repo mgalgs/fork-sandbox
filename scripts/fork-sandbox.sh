@@ -29,7 +29,11 @@
 # --model <model>:       model or model alias for the session (e.g. fable,
 #                        opus, sonnet, or a name from aliases.conf).
 #                        Required with --harness pi, where it names an
-#                        OpenRouter model such as moonshotai/kimi-k3.
+#                        OpenRouter model such as moonshotai/kimi-k3 --
+#                        except a --k8s run that also names an
+#                        --endpoint: the pod discovers its model there, and
+#                        fork-sandbox-k8s.sh refuses the combination on a
+#                        legacy install with its own message.
 #                        Optional with --harness pi-local, which asks the
 #                        endpoint what it serves, and with --harness codex,
 #                        which passes it to `codex exec --model`.
@@ -196,7 +200,13 @@
 #                        endpoint key: an explicit --endpoint overrides it,
 #                        but a --harness override does NOT drop it -- unlike
 #                        the seat's other keys, it names the run's cluster,
-#                        not the agent. Refused without --k8s.
+#                        not the agent. It is also what makes --model
+#                        optional on a --k8s run of pi: the pod discovers
+#                        its model, and fork-sandbox-k8s.sh's own
+#                        install-mode-aware validation decides (it refuses
+#                        the combination on a legacy install); --harness
+#                        claude keeps the --model requirement either way.
+#                        Refused without --k8s.
 # --outbox-max <size>:   raise the outbox size cap above the default 64 MiB.
 #                        Takes a plain byte count or a size with a K/M/G
 #                        suffix (512K, 256M, 2G). Applies to both the local
@@ -501,7 +511,9 @@
 # Kubernetes Job, waits for it to finish, fetches the branch back and (unless
 # --keep) tears the Job down. See docs/kubernetes-runs.md for the design.
 # It is a thin dispatcher, not a second implementation: this script resolves
-# and validates the harness and model exactly as it does locally, builds the
+# and validates the harness and model as it does locally -- the one
+# exception a pi run that names an --endpoint, whose model it leaves for
+# fork-sandbox-k8s.sh's install-mode-aware validation -- then builds the
 # argument list fork-sandbox-k8s.sh run already accepts, and execs it. None
 # of the clone, tmux-runner or review-loop machinery below this point ever
 # runs for a --k8s call.
