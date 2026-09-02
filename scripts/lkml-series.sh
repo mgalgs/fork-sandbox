@@ -23,7 +23,22 @@
 # --author    which persona file speaks for the series. Defaults to
 #             "author" -- see skills/lkml-mode/personas/author.md.
 # --model-override <harness>[/<model>] overrides the author persona's own
-#             harness/model for this run only.
+#             harness/model for this run only. A BARE harness (no /model)
+#             drops the persona's frontmatter model -- a model name belongs
+#             to its harness (a bare pi-local resolves from the endpoint,
+#             a bare claude takes the harness default); a combined
+#             harness/model passes through verbatim. The frontmatter pins
+#             are defaults, not policy: this machine's seats file
+#             (LKML_SEATS_FILE, else ~/.config/fork-sandbox/lkml-seats.yaml)
+#             may re-seat the persona, key by key -- precedence
+#             --model-override > seats personas.<p> > seats default: >
+#             frontmatter (a seats harness without a model drops the
+#             frontmatter's model). A missing file means the pins stand;
+#             an unreadable or unparseable one refuses the run before the
+#             launch. A seat the seats file changes is announced on stderr,
+#             e.g. `lkml-series: seat author: pi-local (lkml-seats.yaml,
+#             was claude/opus)`; --model-override wins over the seats file
+#             silently.
 # --timeout   seconds to wait for the run to finish. Default 3600.
 #
 # Launches ONE fork-sandbox.sh run, --checkout at <tip>, on a new branch
@@ -120,6 +135,7 @@ lkml_persona_field() {
 
 harness="$(lkml_persona_field "$persona_file" harness)"
 model="$(lkml_persona_field "$persona_file" model)"
+thinking="$(lkml_persona_field "$persona_file" thinking)"
 display="$(lkml_persona_field "$persona_file" display)"
 [[ -n "$harness" ]] || harness="claude"
 [[ -n "$display" ]] || display="$author_persona"
@@ -128,8 +144,32 @@ if [[ -n "$model_override" ]]; then
         harness="${model_override%%/*}"
         model="${model_override#*/}"
     else
+        # Bare harness: the persona's frontmatter model is DROPPED, not
+        # composed onto the bare harness -- pi-local/opus asks the endpoint
+        # for a model named 'opus' and the leg dies with zero replies (the
+        # --model-override 404 lesson; a seats-file harness without a model
+        # drops it the same way).
         harness="$model_override"
+        model=""
     fi
+else
+    # The seats file re-seats this persona, key by key; the frontmatter
+    # values are the lowest-priority inputs (lkml-seats-resolve owns the
+    # precedence). Single launch, no prior work to protect, so a bad seats
+    # file refuses here rather than in a pre-check.
+    {
+        read -r harness
+        read -r model
+        read -r thinking
+        read -r seat_note
+    } < <(
+        "$script_dir/lkml-seats-resolve" resolve "$personas_dir" "$author_persona" \
+            "$harness" "$model" "$thinking")
+    [[ -n "$harness" ]] || {
+        echo "Error: seats resolution for $author_persona failed." >&2
+        exit 1
+    }
+    [[ -n "$seat_note" ]] && echo "fork-sandbox lkml-series: $seat_note" >&2
 fi
 
 parts_text="your own call -- a sensible split is usually 6 to 10 commits"
@@ -193,8 +233,17 @@ task_meta="$(jq -nc --arg series "$series" --arg persona "$author_persona" \
 harness_spec="$harness"
 [[ -n "$model" ]] && harness_spec="$harness/$model"
 
-echo "fork-sandbox lkml-series: launching $author_persona ($harness_spec) for v1..." >&2
+# Same rule as lkml-round.sh: the `thinking:` seat fact only means
+# something on a harness that starts pi; fork-sandbox.sh refuses
+# --pi-args elsewhere, so it is dropped for claude and codex.
+pi_args=()
+if [[ -n "$thinking" && ( "$harness" == "pi" || "$harness" == "pi-local" ) ]]; then
+    pi_args=(--pi-args "--thinking $thinking")
+fi
+
+echo "fork-sandbox lkml-series: launching $author_persona ($harness_spec${thinking:+, thinking $thinking}) for v1..." >&2
 launch_out="$(fork-sandbox.sh --harness "$harness_spec" --checkout "$tip_ref" \
+    "${pi_args[@]}" \
     --branch "$branch" --task-meta "$task_meta" "$project" "$handoff_file" 2>&1)"
 rc=$?
 run_dir="$(printf '%s\n' "$launch_out" | sed -n 's/^  run dir:  *//p' | head -n1)"

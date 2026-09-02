@@ -393,5 +393,100 @@ contains "typo'd persona name is named" "$OUT" "personas.corr"
 n_launches=$(find "$capture_dir" -name '*.argv' | wc -l | tr -d '[:space:]')
 check "typo'd persona name launches no persona" "0" "$n_launches"
 
+printf '\n== the author scripts consume the same seats resolution ==\n'
+# Same seats file for all three: the author persona (claude/opus in
+# frontmatter) moves to a pi-local seat with a thinking level, so the
+# launch line shows harness, model drop and thinking in one string.
+cat > "$work/seats-author.yaml" <<'YAML'
+default:
+  harness: pi-local
+  thinking: low
+YAML
+
+launch_author() {  # launch_author <script> <seats-file | ABSENT> [script args...]
+    local script="$1" file="$2"; shift 2
+    local env=()
+    if [[ "$file" == ABSENT ]]; then
+        env=(HOME="$home_dir" LKML_SEATS_FILE='')
+    else
+        env=(HOME="$home_dir" LKML_SEATS_FILE="$file")
+    fi
+    OUT="$(env "${env[@]}" PATH="$stub_bin:$PATH" "$script" "$@" 2>&1)"
+    RC=$?
+}
+
+# The stub's commits-0 summary takes each script to its own downstream
+# stop condition (no commits / no cover letter), exit 1 -- the launch
+# lines under test print before the wait, and a seats file must not
+# change how a run that produced nothing is refused.
+printf '\n-- revise --\n'
+launch_author "$repo_dir/scripts/lkml-revise.sh" "$work/seats-author.yaml" \
+    widget-seats --project "$project_dir" --checkout somebranch --version 1 \
+    --base somebranch --personas-dir "$personas_test_dir"
+contains "revise: the seats file re-seats the author" "$OUT" \
+    "launching author (pi-local, thinking low) for v2"
+contains "revise: the moved seat is announced" "$OUT" \
+    "lkml-revise: seat author: pi-local (seats-author.yaml, was claude/opus)"
+launch_author "$repo_dir/scripts/lkml-revise.sh" ABSENT \
+    widget-seats --project "$project_dir" --checkout somebranch --version 1 \
+    --base somebranch --personas-dir "$personas_test_dir" --model-override pi-local
+contains "revise: bare override drops the persona model" "$OUT" \
+    "launching author (pi-local) for v2"
+case "$OUT" in
+    *"pi-local/opus"*) no "revise: bare override never composes the frontmatter model" "$OUT" ;;
+    *) ok "revise: bare override never composes the frontmatter model" ;;
+esac
+launch_author "$repo_dir/scripts/lkml-revise.sh" ABSENT \
+    widget-seats --project "$project_dir" --checkout somebranch --version 1 \
+    --base somebranch --personas-dir "$personas_test_dir" --model-override claude/sonnet
+contains "revise: combined override passes through verbatim" "$OUT" \
+    "launching author (claude/sonnet) for v2"
+
+printf '\n-- cover --\n'
+launch_author "$repo_dir/scripts/lkml-cover.sh" "$work/seats-author.yaml" \
+    widget-seats --project "$project_dir" --checkout somebranch --base somebranch \
+    --patches "$work/patches" --personas-dir "$personas_test_dir"
+contains "cover: the seats file re-seats the author" "$OUT" \
+    "launching author (pi-local, thinking low)"
+contains "cover: the moved seat is announced" "$OUT" \
+    "lkml-cover: seat author: pi-local (seats-author.yaml, was claude/opus)"
+launch_author "$repo_dir/scripts/lkml-cover.sh" ABSENT \
+    widget-seats --project "$project_dir" --checkout somebranch --base somebranch \
+    --patches "$work/patches" --personas-dir "$personas_test_dir" --model-override pi-local
+contains "cover: bare override drops the persona model" "$OUT" \
+    "launching author (pi-local)"
+case "$OUT" in
+    *"pi-local/opus"*) no "cover: bare override never composes the frontmatter model" "$OUT" ;;
+    *) ok "cover: bare override never composes the frontmatter model" ;;
+esac
+launch_author "$repo_dir/scripts/lkml-cover.sh" ABSENT \
+    widget-seats --project "$project_dir" --checkout somebranch --base somebranch \
+    --patches "$work/patches" --personas-dir "$personas_test_dir" --model-override claude/sonnet
+contains "cover: combined override passes through verbatim" "$OUT" \
+    "launching author (claude/sonnet)"
+
+printf '\n-- series --\n'
+launch_author "$repo_dir/scripts/lkml-series.sh" "$work/seats-author.yaml" \
+    widget-seats --project "$project_dir" --range "HEAD..somebranch" \
+    --personas-dir "$personas_test_dir"
+contains "series: the seats file re-seats the author" "$OUT" \
+    "launching author (pi-local, thinking low) for v1"
+contains "series: the moved seat is announced" "$OUT" \
+    "lkml-series: seat author: pi-local (seats-author.yaml, was claude/opus)"
+launch_author "$repo_dir/scripts/lkml-series.sh" ABSENT \
+    widget-seats --project "$project_dir" --range "HEAD..somebranch" \
+    --personas-dir "$personas_test_dir" --model-override pi-local
+contains "series: bare override drops the persona model" "$OUT" \
+    "launching author (pi-local) for v1"
+case "$OUT" in
+    *"pi-local/opus"*) no "series: bare override never composes the frontmatter model" "$OUT" ;;
+    *) ok "series: bare override never composes the frontmatter model" ;;
+esac
+launch_author "$repo_dir/scripts/lkml-series.sh" ABSENT \
+    widget-seats --project "$project_dir" --range "HEAD..somebranch" \
+    --personas-dir "$personas_test_dir" --model-override claude/sonnet
+contains "series: combined override passes through verbatim" "$OUT" \
+    "launching author (claude/sonnet) for v1"
+
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 (( fail == 0 )) || exit 1

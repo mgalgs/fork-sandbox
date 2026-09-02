@@ -45,7 +45,22 @@
 # --personas-dir defaults to skills/lkml-mode/personas beside this repo's
 #              own scripts/ directory.
 # --model-override <harness>[/<model>] overrides the author persona's own
-#              harness/model for this run only.
+#              harness/model for this run only. A BARE harness (no /model)
+#              drops the persona's frontmatter model -- a model name belongs
+#              to its harness (a bare pi-local resolves from the endpoint,
+#              a bare claude takes the harness default); a combined
+#              harness/model passes through verbatim. The frontmatter pins
+#              are defaults, not policy: this machine's seats file
+#              (LKML_SEATS_FILE, else ~/.config/fork-sandbox/lkml-seats.yaml)
+#              may re-seat the persona, key by key -- precedence
+#              --model-override > seats personas.<p> > seats default: >
+#              frontmatter (a seats harness without a model drops the
+#              frontmatter's model). A missing file means the pins stand;
+#              an unreadable or unparseable one refuses the run before the
+#              launch. A seat the seats file changes is announced on stderr,
+#              e.g. `lkml-cover: seat author: pi-local (lkml-seats.yaml, was
+#              claude/opus)`; --model-override wins over the seats file
+#              silently.
 # --timeout    seconds to wait for the run to finish. Default 3600.
 #
 # This run is NOT allowed to make commits -- same convention as
@@ -193,6 +208,7 @@ lkml_persona_field() {
 
 harness="$(lkml_persona_field "$persona_file" harness)"
 model="$(lkml_persona_field "$persona_file" model)"
+thinking="$(lkml_persona_field "$persona_file" thinking)"
 display="$(lkml_persona_field "$persona_file" display)"
 [[ -n "$harness" ]] || harness="claude"
 [[ -n "$display" ]] || display="$author_persona"
@@ -201,8 +217,32 @@ if [[ -n "$model_override" ]]; then
         harness="${model_override%%/*}"
         model="${model_override#*/}"
     else
+        # Bare harness: the persona's frontmatter model is DROPPED, not
+        # composed onto the bare harness -- pi-local/opus asks the endpoint
+        # for a model named 'opus' and the leg dies with zero replies (the
+        # --model-override 404 lesson; a seats-file harness without a model
+        # drops it the same way).
         harness="$model_override"
+        model=""
     fi
+else
+    # The seats file re-seats this persona, key by key; the frontmatter
+    # values are the lowest-priority inputs (lkml-seats-resolve owns the
+    # precedence). Single launch, no prior work to protect, so a bad seats
+    # file refuses here rather than in a pre-check.
+    {
+        read -r harness
+        read -r model
+        read -r thinking
+        read -r seat_note
+    } < <(
+        "$script_dir/lkml-seats-resolve" resolve "$personas_dir" "$author_persona" \
+            "$harness" "$model" "$thinking")
+    [[ -n "$harness" ]] || {
+        echo "Error: seats resolution for $author_persona failed." >&2
+        exit 1
+    }
+    [[ -n "$seat_note" ]] && echo "fork-sandbox lkml-cover: $seat_note" >&2
 fi
 
 patch_files=()
@@ -269,8 +309,17 @@ task_meta="$(jq -nc --arg series "$series" --arg persona "$author_persona" \
 harness_spec="$harness"
 [[ -n "$model" ]] && harness_spec="$harness/$model"
 
-echo "fork-sandbox lkml-cover: launching $author_persona ($harness_spec)..." >&2
+# Same rule as lkml-round.sh: the `thinking:` seat fact only means
+# something on a harness that starts pi; fork-sandbox.sh refuses
+# --pi-args elsewhere, so it is dropped for claude and codex.
+pi_args=()
+if [[ -n "$thinking" && ( "$harness" == "pi" || "$harness" == "pi-local" ) ]]; then
+    pi_args=(--pi-args "--thinking $thinking")
+fi
+
+echo "fork-sandbox lkml-cover: launching $author_persona ($harness_spec${thinking:+, thinking $thinking})..." >&2
 launch_out="$(fork-sandbox.sh --harness "$harness_spec" --checkout "$checkout_ref" \
+    "${pi_args[@]}" \
     --branch "$branch" --task-meta "$task_meta" "$project" "$handoff_file" 2>&1)"
 rc=$?
 run_dir="$(printf '%s\n' "$launch_out" | sed -n 's/^  run dir:  *//p' | head -n1)"
@@ -321,6 +370,13 @@ if (( ${#attach_files[@]} > 0 )); then
         done
     } >> "$completed_cover"
 fi
+
+# A bare pi-local seat names no model -- the endpoint picks one -- and
+# the posted cover would otherwise be stamped with an empty model: the
+# run's summary records what the endpoint actually served (same fallback
+# as lkml-round.sh's harvest).
+[[ -n "$model" ]] || model="$(jq -r '.model // empty' "$run_dir/summary.json" 2>/dev/null || true)"
+[[ -n "$model" ]] || model="unknown"
 
 init_args=(init "$series" --cover "$completed_cover" --patches "$patches_dir" \
     --from "$author_persona" --display "$display" --harness "$harness" --model "$model" \
