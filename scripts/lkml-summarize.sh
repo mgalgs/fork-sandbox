@@ -440,11 +440,11 @@ if [[ ! -f "$low_outbox_json" ]]; then
     exit 1
 fi
 # Empty (or whitespace only) is fatal, not a warning: a low tier that
-died after touching the outbox file leaves nothing to synthesize, and
-summing nothing is not a summary, so the expensive tier must not run
-on an empty intermediate. Unparseable-but-non-empty is a warning
-instead -- the synthesis tier reads it as text either way, and it is
-carried verbatim by contract.
+# died after touching the outbox file leaves nothing to synthesize, and
+# summing nothing is not a summary, so the expensive tier must not run
+# on an empty intermediate. Unparseable-but-non-empty is a warning
+# instead -- the synthesis tier reads it as text either way, and it is
+# carried verbatim by contract.
 if [[ -z "$(tr -d '[:space:]' < "$low_outbox_json")" ]]; then
     echo "Error: the low tier's run left $low_outbox_json empty (or whitespace only); there is nothing to synthesize." >&2
     exit 1
