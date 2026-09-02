@@ -110,6 +110,18 @@
 #                        warns and proceeds, the same tradeoff as
 #                        --review-harness. Refused with --k8s and
 #                        --review-only.
+# --preset <name>:       load agents and a pipeline from
+#                        ~/.config/fork-sandbox/presets/<name>.yaml and apply
+#                        them as this run's launch configuration: which agent
+#                        codes, and the review/maintain loops that re-run it,
+#                        with their caps. A loop may seat a fix agent of its
+#                        own (fix_agent), and a coding agent may declare
+#                        repeat: N to run every coding leg as N passes --
+#                        both are preset-only, with no flag equivalent. A
+#                        preset value passes through exactly the validation
+#                        the equivalent flag would, and every explicit flag
+#                        overrides its preset counterpart. Needs PyYAML. See
+#                        docs/presets.md for the file format.
 # --task-meta '<json>':  one JSON object of orchestrator-supplied task
 #                        metadata -- kind, difficulty, size,
 #                        prompt_template_id, stage -- stored beside the run
@@ -1111,6 +1123,17 @@ usage() {
     sed -n '2,/^[^#]/{ /^#/s/^# \?//p }' "$0"
 }
 
+display_config_path() {
+    local path="$1"
+    if [[ "$path" == "$HOME"/* ]]; then
+        # Literal display text, not a path for the shell to expand.
+        # shellcheck disable=SC2088
+        printf '~/%s' "${path#"$HOME"/}"
+    else
+        printf '%s' "$path"
+    fi
+}
+
 branch=""
 checkout_ref=""
 model=""
@@ -1141,6 +1164,20 @@ maintainer_harness_given=false
 maintainer_harness=""
 maintainer_combined_model=""
 maintainer_model=""
+preset_name=""
+preset_file=""
+preset_sha256=""
+# Preset-only pipeline knobs -- no flag sets these, the preset compiler
+# below does (docs/presets.md): a fix seat of its own per loop, and repeat
+# counts for coding legs. Empty harness / repeat 1 is the engine's old
+# behavior exactly.
+fix_harness=""
+fix_model=""
+fix_repeat=1
+mntfix_harness=""
+mntfix_model=""
+mntfix_repeat=1
+code_repeat=1
 review_only=false
 mode=run
 review_base_ref=""
@@ -1240,6 +1277,10 @@ while [[ "${1:-}" == -* ]]; do
             maintainer_harness_given=true
             shift 2
             ;;
+        --preset)
+            preset_name="${2:?--preset requires a preset name}"
+            shift 2
+            ;;
         --foreground|--no-window)
             # --no-window is the old name, kept so existing callers work.
             foreground=true
@@ -1305,6 +1346,314 @@ done
 project_path="${1:?Usage: fork-sandbox.sh [options] <project-path> <handoff-file>}"
 handoff_file="${2:?Usage: fork-sandbox.sh [options] <project-path> <handoff-file>}"
 
+# --preset: agents and a pipeline in a machine-local file, compiled onto the
+# same variables the flags above set, BEFORE any validation below runs. A
+# preset value therefore passes through exactly the checks the equivalent
+# flag would -- alias resolution, harness rules, the --k8s refusals -- and an
+# explicit flag overrides its preset counterpart key by key. The file format
+# and the flag mapping are documented in docs/presets.md.
+if [[ -n "$preset_name" ]]; then
+    preset_dir="${FORK_SANDBOX_PRESETS_DIR:-$config_dir/presets}"
+    # The same single-path-component rule discoverer ids follow: with no
+    # slash and no leading dot, the name cannot climb out of the presets
+    # directory.
+    if [[ ! "$preset_name" =~ ^[a-z0-9][a-z0-9_-]*$ ]]; then
+        echo "Error: --preset takes a name matching ^[a-z0-9][a-z0-9_-]*\$," >&2
+        echo "not '$preset_name'. The name selects" >&2
+        echo "$(display_config_path "$preset_dir")/<name>.yaml and is never" >&2
+        echo "a path of its own." >&2
+        exit 1
+    fi
+    preset_file="$preset_dir/$preset_name.yaml"
+    if [[ ! -f "$preset_file" ]]; then
+        echo "Error: no preset '$preset_name' at $(display_config_path "$preset_file")." >&2
+        if [[ -d "$preset_dir" ]]; then
+            preset_available=""
+            for preset_f in "$preset_dir"/*.yaml; do
+                [[ -e "$preset_f" ]] || continue
+                preset_f="$(basename "$preset_f" .yaml)"
+                preset_available+="  $preset_f"$'\n'
+            done
+            if [[ -n "$preset_available" ]]; then
+                echo "Available presets:" >&2
+                printf '%s' "$preset_available" >&2
+            else
+                echo "The presets directory exists but holds no .yaml file." >&2
+            fi
+        else
+            echo "There is no presets directory yet; create it and see" >&2
+            echo "docs/presets.md for the file format." >&2
+        fi
+        exit 1
+    fi
+
+    # ---- parse ----
+    # The file is YAML, and everything about the FILE -- validity, the
+    # schema, the repeat-loop pipeline structure, the engine-shape rules --
+    # lives in the parser beside this script, which emits the result as
+    # tab-separated lines (its header documents the contract). This side
+    # only compiles those lines onto the flag variables.
+    declare -A preset_agent_harness=()
+    declare -A preset_agent_model=()
+    declare -A preset_agent_cargs=()
+    declare -A preset_agent_pargs=()
+    preset_impl_agent=""
+    preset_impl_refresh_at=""
+    preset_impl_refresh_max=""
+    preset_impl_repeat=1
+    preset_review_agent=""
+    preset_review_max=""
+    preset_review_fix_default=""
+    preset_review_fix_name=""
+    preset_review_fix_harness=""
+    preset_review_fix_model=""
+    preset_review_fix_repeat=1
+    preset_maintain_agent=""
+    preset_maintain_max=""
+    preset_maintain_fix_default=""
+    preset_maintain_fix_name=""
+    preset_maintain_fix_harness=""
+    preset_maintain_fix_model=""
+    preset_maintain_fix_repeat=1
+
+    # The parser already wrote its error to stderr when this fails.
+    if ! preset_tsv="$(python3 "$script_dir/fork-sandbox-preset-parse.py" \
+        "$preset_file" "$preset_name" "$(display_config_path "$preset_file")")"; then
+        exit 1
+    fi
+    while IFS=$'\t' read -r preset_f1 preset_f2 preset_f3 preset_f4; do
+        [[ -n "$preset_f1" ]] || continue
+        case "$preset_f1" in
+            agent)
+                case "$preset_f3" in
+                    harness) preset_agent_harness[$preset_f2]="$preset_f4" ;;
+                    model) preset_agent_model[$preset_f2]="$preset_f4" ;;
+                    claude_args) preset_agent_cargs[$preset_f2]="$preset_f4" ;;
+                    pi_args) preset_agent_pargs[$preset_f2]="$preset_f4" ;;
+                esac
+                ;;
+            implement)
+                case "$preset_f2" in
+                    agent) preset_impl_agent="$preset_f3" ;;
+                    repeat) preset_impl_repeat="$preset_f3" ;;
+                    refresh_at) preset_impl_refresh_at="$preset_f3" ;;
+                    refresh_max) preset_impl_refresh_max="$preset_f3" ;;
+                esac
+                ;;
+            review)
+                case "$preset_f2" in
+                    agent) preset_review_agent="$preset_f3" ;;
+                    max) preset_review_max="$preset_f3" ;;
+                    fix_default) preset_review_fix_default="$preset_f3" ;;
+                    fix_agent) preset_review_fix_name="$preset_f3" ;;
+                    fix_harness) preset_review_fix_harness="$preset_f3" ;;
+                    fix_model) preset_review_fix_model="$preset_f3" ;;
+                    fix_repeat) preset_review_fix_repeat="$preset_f3" ;;
+                esac
+                ;;
+            maintain)
+                case "$preset_f2" in
+                    agent) preset_maintain_agent="$preset_f3" ;;
+                    max) preset_maintain_max="$preset_f3" ;;
+                    fix_default) preset_maintain_fix_default="$preset_f3" ;;
+                    fix_agent) preset_maintain_fix_name="$preset_f3" ;;
+                    fix_harness) preset_maintain_fix_harness="$preset_f3" ;;
+                    fix_model) preset_maintain_fix_model="$preset_f3" ;;
+                    fix_repeat) preset_maintain_fix_repeat="$preset_f3" ;;
+                esac
+                ;;
+            warn)
+                echo "Warning: preset '$preset_name': $preset_f2" >&2
+                ;;
+        esac
+    done <<< "$preset_tsv"
+
+    preset_seat_desc() {
+        local agent="$1" h m
+        h="${preset_agent_harness[$agent]}"
+        m="${preset_agent_model[$agent]}"
+        if [[ -n "$m" ]]; then
+            printf '%s (%s/%s)' "$agent" "$h" "$m"
+        else
+            printf '%s (%s)' "$agent" "$h"
+        fi
+    }
+
+    # Announced before the compile below, so the picture of what the preset
+    # says comes first and any "--x overrides ..." notes read against it.
+    preset_summary="code $(preset_seat_desc "$preset_impl_agent")"
+    [[ "$preset_impl_repeat" == "1" ]] || preset_summary+=" x$preset_impl_repeat"
+    if [[ -n "$preset_review_agent" ]]; then
+        preset_summary+=", review $(preset_seat_desc "$preset_review_agent") repeat=$preset_review_max"
+        [[ -z "$preset_review_fix_name" ]] || preset_summary+=" fix=$preset_review_fix_name"
+    fi
+    if [[ -n "$preset_maintain_agent" ]]; then
+        preset_summary+=", maintain $(preset_seat_desc "$preset_maintain_agent") repeat=$preset_maintain_max"
+        [[ -z "$preset_maintain_fix_name" ]] || preset_summary+=" fix=$preset_maintain_fix_name"
+    fi
+    echo "fork-sandbox: preset '$preset_name' ($(display_config_path "$preset_file")): $preset_summary" >&2
+
+    # ---- compile, flags winning key by key ----
+    # Snapshot what the FLAGS gave before any preset value lands, counting a
+    # combined harness/model form as having given the model.
+    preset_flag_model_given="$model_given"
+    [[ "$harness_given" == true && "$harness_spec" == */* ]] && preset_flag_model_given=true
+    preset_flag_review_model_given=false
+    [[ -n "$review_model" ]] && preset_flag_review_model_given=true
+    [[ "$review_harness_given" == true && "$review_harness_spec" == */* ]] \
+        && preset_flag_review_model_given=true
+    preset_flag_maintainer_model_given=false
+    [[ -n "$maintainer_model" ]] && preset_flag_maintainer_model_given=true
+    [[ "$maintainer_harness_given" == true && "$maintainer_harness_spec" == */* ]] \
+        && preset_flag_maintainer_model_given=true
+
+    preset_note() {
+        echo "fork-sandbox: preset '$preset_name': $*" >&2
+    }
+
+    # The code seat. A flag that overrides the seat's harness orphans the
+    # seat's model, extra arguments and repeat -- all tuned to the agent it
+    # named -- so they are dropped together, said out loud, rather than
+    # resolved against a harness they were never tuned for.
+    preset_impl_overridden=false
+    if [[ "$harness_given" == true ]]; then
+        preset_impl_overridden=true
+        preset_note "--harness overrides the code seat; the preset's model, arguments and repeat for it are not applied"
+    else
+        code_repeat="$preset_impl_repeat"
+        harness_spec="${preset_agent_harness[$preset_impl_agent]}"
+        harness_given=true
+        if [[ -n "${preset_agent_model[$preset_impl_agent]}" ]]; then
+            if [[ "$preset_flag_model_given" == true ]]; then
+                preset_note "--model overrides the code seat's model"
+            else
+                model_option="${preset_agent_model[$preset_impl_agent]}"
+                model_given=true
+            fi
+        fi
+        if [[ -n "${preset_agent_cargs[$preset_impl_agent]}" ]]; then
+            if [[ -n "$claude_extra_args" ]]; then
+                preset_note "--claude-args overrides the code seat's claude-args"
+            else
+                claude_extra_args="${preset_agent_cargs[$preset_impl_agent]}"
+            fi
+        fi
+        if [[ -n "${preset_agent_pargs[$preset_impl_agent]}" ]]; then
+            if [[ -n "$pi_extra_args" ]]; then
+                preset_note "--pi-args overrides the code seat's pi-args"
+            else
+                pi_extra_args="${preset_agent_pargs[$preset_impl_agent]}"
+            fi
+        fi
+    fi
+
+    # The refresh keys ride the code step, and refresh is claude-only. The
+    # parser already refused a preset that pairs them with its own
+    # non-claude code harness, so a non-claude harness here means a FLAG
+    # moved the seat -- the keys are merely dropped, with a note: the
+    # override is the caller's, the pairing was not.
+    preset_eff_harness="${harness_spec%%/*}"
+    if [[ -n "$preset_impl_refresh_at" || -n "$preset_impl_refresh_max" ]]; then
+        if [[ "$preset_eff_harness" != "claude" ]]; then
+            preset_note "the code seat's harness is '$preset_eff_harness' after flag overrides, so the preset's refresh keys are not applied (refresh is claude-only)"
+        else
+            if [[ -n "$preset_impl_refresh_at" ]]; then
+                if [[ "$refresh_at_given" == true ]]; then
+                    preset_note "--refresh-at overrides the code step's refresh-at"
+                else
+                    refresh_at_arg="$preset_impl_refresh_at"
+                    refresh_at_given=true
+                fi
+            fi
+            if [[ -n "$preset_impl_refresh_max" ]]; then
+                if [[ -n "$refresh_max_arg" ]]; then
+                    preset_note "--refresh-max overrides the code step's refresh-max"
+                else
+                    refresh_max_arg="$preset_impl_refresh_max"
+                fi
+            fi
+        fi
+    fi
+
+    # The review seat: the inner repeat loop. Findings return to in-loop
+    # code steps on the code seat; the loop's final verdict is forwarded to
+    # the maintain loop when one follows -- the same wiring the flags build.
+    if [[ -n "$preset_review_agent" ]]; then
+        if [[ -n "$review_loop_arg" ]]; then
+            preset_note "--review-loop overrides the review loop's repeat"
+        else
+            review_loop_arg="$preset_review_max"
+        fi
+        if [[ "$review_harness_given" == true ]]; then
+            preset_note "--review-harness overrides the review seat; the preset's reviewer model is not applied"
+        else
+            review_harness_spec="${preset_agent_harness[$preset_review_agent]}"
+            review_harness_given=true
+            if [[ -n "${preset_agent_model[$preset_review_agent]}" ]]; then
+                if [[ "$preset_flag_review_model_given" == true ]]; then
+                    preset_note "--review-model overrides the review seat's model"
+                else
+                    review_model="${preset_agent_model[$preset_review_agent]}"
+                fi
+            fi
+        fi
+        # This loop's fix seat. An explicit fix_agent is always honored as
+        # the preset defines it -- no flag names a fix seat, so nothing
+        # overrides it. The default (the code seat's agent) rides the
+        # implement command wherever it ended up, and carries that agent's
+        # repeat only while the seat itself is the preset's.
+        if [[ "$preset_review_fix_default" == "1" ]]; then
+            if [[ "$preset_impl_overridden" == true ]]; then
+                [[ "$preset_review_fix_repeat" == "1" ]] || preset_note \
+                    "--harness overrides the code seat, so its repeat is not applied to review fix legs either"
+            else
+                fix_repeat="$preset_review_fix_repeat"
+            fi
+        else
+            fix_harness="$preset_review_fix_harness"
+            fix_model="$preset_review_fix_model"
+            fix_repeat="$preset_review_fix_repeat"
+        fi
+    fi
+
+    # The maintain seat: the outer repeat loop. Same shape, one level up.
+    if [[ -n "$preset_maintain_agent" ]]; then
+        if [[ -n "$maintainer_loop_arg" ]]; then
+            preset_note "--maintainer-loop overrides the maintain loop's repeat"
+        else
+            maintainer_loop_arg="$preset_maintain_max"
+        fi
+        if [[ "$maintainer_harness_given" == true ]]; then
+            preset_note "--maintainer-harness overrides the maintain seat; the preset's maintainer model is not applied"
+        else
+            maintainer_harness_spec="${preset_agent_harness[$preset_maintain_agent]}"
+            maintainer_harness_given=true
+            if [[ -n "${preset_agent_model[$preset_maintain_agent]}" ]]; then
+                if [[ "$preset_flag_maintainer_model_given" == true ]]; then
+                    preset_note "--maintainer-model overrides the maintain seat's model"
+                else
+                    maintainer_model="${preset_agent_model[$preset_maintain_agent]}"
+                fi
+            fi
+        fi
+        # The maintain loop's fix seat, same rules as the review loop's.
+        if [[ "$preset_maintain_fix_default" == "1" ]]; then
+            if [[ "$preset_impl_overridden" == true ]]; then
+                [[ "$preset_maintain_fix_repeat" == "1" ]] || preset_note \
+                    "--harness overrides the code seat, so its repeat is not applied to maintain fix legs either"
+            else
+                mntfix_repeat="$preset_maintain_fix_repeat"
+            fi
+        else
+            mntfix_harness="$preset_maintain_fix_harness"
+            mntfix_model="$preset_maintain_fix_model"
+            mntfix_repeat="$preset_maintain_fix_repeat"
+        fi
+    fi
+
+    preset_sha256="$(sha256sum -- "$preset_file" | cut -d' ' -f1)"
+fi
+
 if [[ "$review_only" == true ]]; then
     mode=review-only
     if [[ -z "$checkout_ref" ]]; then
@@ -1320,6 +1669,11 @@ if [[ "$review_only" == true ]]; then
         echo "Error: --review-only runs one review leg and has no coding leg" >&2
         echo "whose branch a maintainer would review -- --maintainer-loop and" >&2
         echo "its harness and model flags are not supported with --review-only." >&2
+        exit 1
+    fi
+    if [[ "$code_repeat" != "1" ]]; then
+        echo "Error: --review-only runs one review leg and no coding leg, so" >&2
+        echo "the preset's repeat has nothing to repeat." >&2
         exit 1
     fi
     if [[ "$refresh_at_given" == true ]]; then
@@ -1441,17 +1795,6 @@ if [[ "$model_unchecked" == true && "$model_given" != true ]]; then
     exit 1
 fi
 
-display_config_path() {
-    local path="$1"
-    if [[ "$path" == "$HOME"/* ]]; then
-        # Literal display text, not a path for the shell to expand.
-        # shellcheck disable=SC2088
-        printf '~/%s' "${path#"$HOME"/}"
-    else
-        printf '%s' "$path"
-    fi
-}
-
 # Resolves the model named by $1 (a variable name — "model" or
 # "review_model"), in place, when $2 is true, against harness $3. Shared by
 # --model and --review-model: both go through the same alias file and
@@ -1566,6 +1909,26 @@ resolve_model review_model "$review_model_given" "${review_harness:-$harness}" |
 maintainer_model_given=false
 [[ -n "$maintainer_model" ]] && maintainer_model_given=true
 resolve_model maintainer_model "$maintainer_model_given" "${maintainer_harness:-$harness}" || exit 1
+
+# A codex fix seat needs the per-seat credential file the runner writes for
+# the implement, review and maintainer seats -- a fourth copy of that block
+# no run has needed yet. Refuse it by name rather than let the fix leg fail
+# inside the sandbox with a missing credential.
+if [[ "$fix_harness" == "codex" || "$mntfix_harness" == "codex" ]]; then
+    echo "Error: a codex fix seat is not yet supported -- the runner does not" >&2
+    echo "write a codex credential for fix legs. Seat the fix agent on claude," >&2
+    echo "pi or pi-local." >&2
+    exit 1
+fi
+
+# The preset fix seats' models, through the same resolution as every other
+# seat's, against their own harness.
+fix_model_given=false
+[[ -n "$fix_model" ]] && fix_model_given=true
+resolve_model fix_model "$fix_model_given" "${fix_harness:-$harness}" || exit 1
+mntfix_model_given=false
+[[ -n "$mntfix_model" ]] && mntfix_model_given=true
+resolve_model mntfix_model "$mntfix_model_given" "${mntfix_harness:-$harness}" || exit 1
 
 if [[ "$harness" == "pi" && -z "$model" ]]; then
     echo "Error: --harness pi needs --model. There is no default: the model" >&2
@@ -1698,6 +2061,14 @@ if [[ "$k8s_mode" == true ]]; then
         echo "are its --maintainer-harness and --maintainer-model flags. The" >&2
         echo "cluster path has no maintainer tier yet -- the pod's own review" >&2
         echo "loop is the only review it carries." >&2
+        exit 1
+    fi
+    if [[ -n "$fix_harness" || -n "$mntfix_harness" || "$code_repeat" != "1" \
+        || "$fix_repeat" != "1" || "$mntfix_repeat" != "1" ]]; then
+        echo "Error: preset fix seats and repeat are not yet supported with" >&2
+        echo "--k8s. The pod's own review loop runs its fix legs on the" >&2
+        echo "coding model, once each; a cluster run wants a preset shaped" >&2
+        echo "for the cluster." >&2
         exit 1
     fi
     if [[ "$harness" == "pi" ]]; then
@@ -1875,6 +2246,20 @@ fi
 # The same seal tradeoff for the maintainer tier: a sealed implement leg is
 # fine, a networked maintainer leg widens the run's reach, and that is the
 # caller's judgement call for the same reason as above.
+if [[ -n "$fix_harness" && "$harness" == "pi-local" \
+    && "$fix_harness" != "pi-local" ]]; then
+    echo "Warning: --harness pi-local seals the implement leg -- no network" >&2
+    echo "at all -- but the preset's review fix seat runs $fix_harness, which" >&2
+    echo "is networked. Its fix legs will send the clone's contents to" >&2
+    echo "$fix_harness's model provider. Proceeding." >&2
+fi
+if [[ -n "$mntfix_harness" && "$harness" == "pi-local" \
+    && "$mntfix_harness" != "pi-local" ]]; then
+    echo "Warning: --harness pi-local seals the implement leg -- no network" >&2
+    echo "at all -- but the preset's maintain fix seat runs $mntfix_harness," >&2
+    echo "which is networked. Its fix legs will send the clone's contents to" >&2
+    echo "$mntfix_harness's model provider. Proceeding." >&2
+fi
 if [[ "$maintainer_harness_given" == true && "$harness" == "pi-local" \
     && "$maintainer_harness" != "pi-local" ]]; then
     echo "Warning: --harness pi-local seals the implement leg -- no network" >&2
@@ -1955,7 +2340,8 @@ fi
 # generated-runner value still runs below; this is the same check applied
 # early to dry-run's own subject, so a model the real run refuses cannot get
 # a green light here first.
-fs_reject_unsafe_chars "$model" "$review_model" "$review_harness" || exit 1
+fs_reject_unsafe_chars "$model" "$review_model" "$review_harness" \
+    "$fix_model" "$fix_harness" "$mntfix_model" "$mntfix_harness" || exit 1
 
 # --- Prompt overlay -------------------------------------------------------
 # A machine-local directory of prompt fragments, layered onto each generated
@@ -2144,6 +2530,7 @@ if [[ "$review_only" == true ]]; then
 fi
 
 if [[ "$dry_run" == true ]]; then
+    [[ -z "$preset_name" ]] || printf 'preset=%s\n' "$preset_name"
     printf 'harness=%s\nmodel=%s\n' "$harness" "$model"
     [[ -z "$review_model" ]] || printf 'review_model=%s\n' "$review_model"
     [[ "$review_harness_given" != true ]] || printf 'review_harness=%s\n' "$review_harness"
@@ -2152,6 +2539,16 @@ if [[ "$dry_run" == true ]]; then
         printf 'maintainer_model=%s\n' "$maintainer_model"
         [[ "$maintainer_harness_given" != true ]] || printf 'maintainer_harness=%s\n' "$maintainer_harness"
     fi
+    [[ "$code_repeat" == "1" ]] || printf 'code_repeat=%s\n' "$code_repeat"
+    if [[ -n "$fix_harness" ]]; then
+        printf 'fix_harness=%s\nfix_model=%s\n' "$fix_harness" "$fix_model"
+    fi
+    [[ "$fix_repeat" == "1" ]] || printf 'fix_repeat=%s\n' "$fix_repeat"
+    if [[ -n "$mntfix_harness" ]]; then
+        printf 'maintainer_fix_harness=%s\nmaintainer_fix_model=%s\n' \
+            "$mntfix_harness" "$mntfix_model"
+    fi
+    [[ "$mntfix_repeat" == "1" ]] || printf 'maintainer_fix_repeat=%s\n' "$mntfix_repeat"
     printf 'prompt_overlay_dir=%s\n' "$prompt_overlay_dir"
     for prompt_overlay_leg in "${prompt_overlay_legs[@]}"; do
         prompt_overlay_leg_csv="${prompt_overlay_fragments[$prompt_overlay_leg]:-}"
@@ -2777,6 +3174,12 @@ fs_resolve_harness "$harness" "$model" impl
 # expensive) coding leg, then die at the very first review leg with
 # nothing to show for it -- precisely the failure "fail before the clone"
 # exists to prevent for the implement harness alone.
+if [[ -n "$fix_harness" ]]; then
+    fs_resolve_harness "$fix_harness" "$fix_model" fxr
+fi
+if [[ -n "$mntfix_harness" ]]; then
+    fs_resolve_harness "$mntfix_harness" "$mntfix_model" fxm
+fi
 if [[ "$review_harness_given" == true ]]; then
     fs_resolve_harness "$review_harness" "$review_model" rev
 fi
@@ -2793,7 +3196,8 @@ fi
 # the way out.
 fs_reject_unsafe_chars "$project_path" "$handoff_file" "$branch" "$checkout_ref" \
     "$model" "$review_model" "$review_harness" "$maintainer_model" \
-    "$maintainer_harness" "$claude_extra_args" "$sandbox_args"
+    "$maintainer_harness" "$fix_model" "$fix_harness" "$mntfix_model" \
+    "$mntfix_harness" "$claude_extra_args" "$sandbox_args"
 
 # --task-meta never enters the generated runner -- it is written straight to
 # a file in the run dir -- so the check it needs is JSON validity, not shell
@@ -2863,6 +3267,20 @@ fs_reject_unsafe_chars "$run_dir"
 # cannot see or edit it.
 if [[ -n "$task_meta" ]]; then
     printf '%s\n' "$task_meta" > "$run_dir/task-meta.json"
+fi
+# The preset's provenance, when the run was launched with one: its name, the
+# machine-local file it came from and a hash of that file's bytes at launch --
+# the compiled result (harness, models, loop caps) is already in the run
+# record, so what needs pinning is which document produced it. Same absence
+# convention as prompt-overlay.json: no file when no preset, and
+# sandbox-run-log.py reads that as "no preset key".
+if [[ -n "$preset_name" ]]; then
+    jq -n \
+        --arg name "$preset_name" \
+        --arg file "$preset_file" \
+        --arg sha256 "$preset_sha256" \
+        '{name: $name, file: $file, sha256: $sha256}' \
+        > "$run_dir/preset.json"
 fi
 # The prompt overlay's provenance, beside the run for the same reason: what
 # was applied has to be queryable later, not just present in the rendered
@@ -3163,7 +3581,8 @@ inbox_settings=""
 # a claude maintainer leg with no hook installed would be archived as if
 # it had delivered an addendum the session never saw.
 if [[ "$harness" == "claude" || "$review_harness" == "claude" \
-    || "$maintainer_harness" == "claude" ]]; then
+    || "$maintainer_harness" == "claude" || "$fix_harness" == "claude" \
+    || "$mntfix_harness" == "claude" ]]; then
     inbox_hook_src="$script_dir/fork-sandbox-inbox-hook.sh"
     if [[ ! -r "$inbox_hook_src" ]]; then
         echo "Error: $inbox_hook_src is missing. It delivers operator addenda" >&2
@@ -3259,16 +3678,28 @@ preamble_network=""
 # describes claude's automatic addendum push or the "you have to look"
 # instructions every other harness gets, and $network decides whether it
 # describes a sealed sandbox -- both are true facts about whichever harness
-# is ABOUT TO RUN that leg, not necessarily the implement harness. The fix
-# leg has no such split: it always stays on the implement harness (the
-# existing rule --review-model never changed), so its own preamble below
-# keeps reading $harness/$preamble_network directly.
+# is ABOUT TO RUN that leg, not necessarily the implement harness. A fix
+# leg stays on the implement harness unless a preset seats its own fix
+# agent, so the default fix header below keeps reading
+# $harness/$preamble_network directly and a preset fix seat gets a header
+# of its own.
 review_preamble_harness="$harness"
 review_preamble_network="$preamble_network"
 if [[ "$review_harness_given" == true ]]; then
     review_preamble_harness="$review_harness"
     review_preamble_network=""
     [[ "$review_harness" == "pi-local" ]] && review_preamble_network=sealed
+fi
+
+# The preset fix seats' preambles, same rule: describe the harness that is
+# about to run the leg.
+fxr_preamble_network=""
+if [[ -n "$fix_harness" ]]; then
+    [[ "$fix_harness" == "pi-local" ]] && fxr_preamble_network=sealed
+fi
+fxm_preamble_network=""
+if [[ -n "$mntfix_harness" ]]; then
+    [[ "$mntfix_harness" == "pi-local" ]] && fxm_preamble_network=sealed
 fi
 
 # The maintainer leg's own preamble follows the review leg's: it describes
@@ -3379,9 +3810,11 @@ if (( review_loop_cap > 0 )); then
     } > "$review_prompt.part"
     mv -- "$review_prompt.part" "$review_prompt"
 fi
-# The fix header is shared by every fix leg of both loops -- all of them
-# run on the implement harness, which is why the one header serves all of
-# them -- so it is built when either loop is on.
+# The fix header serves every fix leg that runs on the implement harness --
+# the default for both loops -- so it is built when either loop is on. A
+# preset fix seat runs its legs on its own harness, whose addendum-delivery
+# and network facts may differ, so each seat that is set gets a header of
+# its own, built the same way with its own preamble arguments.
 if (( review_loop_cap > 0 || maintainer_loop_cap > 0 )); then
     fix_prompt_header="$run_dir/fix-prompt-header.md"
     fs_reject_unsafe_chars "$fix_prompt_header"
@@ -3392,6 +3825,30 @@ if (( review_loop_cap > 0 || maintainer_loop_cap > 0 )); then
         fs_emit_fix_prompt_body "$branch" "$base_sha"
     } > "$fix_prompt_header.part"
     mv -- "$fix_prompt_header.part" "$fix_prompt_header"
+fi
+fxr_fix_prompt_header=""
+if [[ -n "$fix_harness" ]] && (( review_loop_cap > 0 )); then
+    fxr_fix_prompt_header="$run_dir/fix-prompt-header-fxr.md"
+    fs_reject_unsafe_chars "$fxr_fix_prompt_header"
+    {
+        fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" "$fix_harness" \
+            "$fxr_preamble_network" "$outbox_dir" "" "$outbox_max_bytes"
+        fs_emit_prompt_overlay fix
+        fs_emit_fix_prompt_body "$branch" "$base_sha"
+    } > "$fxr_fix_prompt_header.part"
+    mv -- "$fxr_fix_prompt_header.part" "$fxr_fix_prompt_header"
+fi
+fxm_fix_prompt_header=""
+if [[ -n "$mntfix_harness" ]] && (( maintainer_loop_cap > 0 )); then
+    fxm_fix_prompt_header="$run_dir/fix-prompt-header-fxm.md"
+    fs_reject_unsafe_chars "$fxm_fix_prompt_header"
+    {
+        fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" "$mntfix_harness" \
+            "$fxm_preamble_network" "$outbox_dir" "" "$outbox_max_bytes"
+        fs_emit_prompt_overlay fix
+        fs_emit_fix_prompt_body "$branch" "$base_sha"
+    } > "$fxm_fix_prompt_header.part"
+    mv -- "$fxm_fix_prompt_header.part" "$fxm_fix_prompt_header"
 fi
 # The maintainer prompt is the static base of every maintainer leg's prompt:
 # its per-iteration copy is built in the runner the way the review leg's is,
@@ -3812,6 +4269,18 @@ if (( maintainer_loop_cap > 0 )); then
     fi
 fi
 
+# The preset fix seats, when set: each is a full independent build from the
+# "fxr_"/"fxm_" state fs_resolve_harness resolved above, exactly as a named
+# --review-harness or --maintainer-harness builds fresh. Without a seat, fix
+# legs keep reusing the implement command verbatim, as they always have --
+# run_leg falls through to it.
+if [[ -n "$fix_harness" ]]; then
+    fs_build_sandbox_cmd fxr fix_sandbox_cmd
+fi
+if [[ -n "$mntfix_harness" ]]; then
+    fs_build_sandbox_cmd fxm mntfix_sandbox_cmd
+fi
+
 # tmux rewrites ':' and '.' in a session name without saying so, and a branch
 # name may hold either. Fold every character tmux would touch to '-' here, so
 # the name this script records is the name tmux actually uses.
@@ -3867,6 +4336,18 @@ started_at="$(date +%s)"
         printf 'maintainer_model=%s\n' "$maintainer_model"
         printf 'maintainer_loop=%s\n' "$maintainer_loop_cap"
     fi
+    # The preset-only knobs, printed only when set, same convention.
+    [[ "$code_repeat" == "1" ]] || printf 'code_repeat=%s\n' "$code_repeat"
+    if [[ -n "$fix_harness" ]]; then
+        printf 'fix_harness=%s\n' "$fix_harness"
+        printf 'fix_model=%s\n' "$fix_model"
+    fi
+    [[ "$fix_repeat" == "1" ]] || printf 'fix_repeat=%s\n' "$fix_repeat"
+    if [[ -n "$mntfix_harness" ]]; then
+        printf 'maintainer_fix_harness=%s\n' "$mntfix_harness"
+        printf 'maintainer_fix_model=%s\n' "$mntfix_model"
+    fi
+    [[ "$mntfix_repeat" == "1" ]] || printf 'maintainer_fix_repeat=%s\n' "$mntfix_repeat"
     if [[ "$review_only" == true ]]; then
         printf 'mode=review-only\n'
     else
@@ -3972,6 +4453,33 @@ started_at="$(date +%s)"
         printf 'maintainer_prompt=%q\n' "$maintainer_prompt"
         printf 'maintainer_verdict_file=%q\n' "$maintainer_verdict_file"
     fi
+    # The preset-only pipeline knobs, emitted only when set so a run without
+    # them stays byte-identical to one built before they existed. run_leg and
+    # the loop bodies below guard every read with ${...:-} defaults to match.
+    [[ "$code_repeat" == "1" ]] || printf 'code_repeat=%q\n' "$code_repeat"
+    [[ "$fix_repeat" == "1" ]] || printf 'fix_repeat=%q\n' "$fix_repeat"
+    [[ "$mntfix_repeat" == "1" ]] || printf 'mntfix_repeat=%q\n' "$mntfix_repeat"
+    # The "fxr_*"/"fxm_*" values were written by fs_resolve_harness and
+    # fs_build_sandbox_cmd through namerefs shellcheck cannot see through --
+    # the same false positive as every prefixed output of those functions.
+    # shellcheck disable=SC2154
+    if [[ -n "$fix_harness" ]]; then
+        printf 'fix_harness=%q\n' "$fix_harness"
+        printf 'fix_model=%q\n' "$fix_model"
+        printf 'fxr_pi_session_dir=%q\n' "$fxr_pi_session_dir"
+        printf 'fxr_usage_source=%q\n' "$fxr_usage_source"
+        printf 'fxr_formatter=%q\n' "$fxr_run_formatter"
+        printf 'fxr_fix_prompt_header=%q\n' "$fxr_fix_prompt_header"
+    fi
+    # shellcheck disable=SC2154
+    if [[ -n "$mntfix_harness" ]]; then
+        printf 'mntfix_harness=%q\n' "$mntfix_harness"
+        printf 'mntfix_model=%q\n' "$mntfix_model"
+        printf 'fxm_pi_session_dir=%q\n' "$fxm_pi_session_dir"
+        printf 'fxm_usage_source=%q\n' "$fxm_usage_source"
+        printf 'fxm_formatter=%q\n' "$fxm_run_formatter"
+        printf 'fxm_fix_prompt_header=%q\n' "$fxm_fix_prompt_header"
+    fi
     printf 'mode=%q\n' "$mode"
     printf 'review_prompt=%q\n' "$review_prompt"
     printf 'fix_prompt_header=%q\n' "$fix_prompt_header"
@@ -4005,6 +4513,20 @@ started_at="$(date +%s)"
     if (( maintainer_loop_cap > 0 )); then
         printf 'maintainer_sandbox_cmd=('
         printf '%q ' "${maintainer_sandbox_cmd[@]}"
+        printf ')\n'
+    fi
+    # Both arrays were populated by fs_build_sandbox_cmd's out-nameref --
+    # the same false positive as sandbox_cmd's own emission above.
+    # shellcheck disable=SC2154
+    if [[ -n "$fix_harness" ]]; then
+        printf 'fix_sandbox_cmd=('
+        printf '%q ' "${fix_sandbox_cmd[@]}"
+        printf ')\n'
+    fi
+    # shellcheck disable=SC2154
+    if [[ -n "$mntfix_harness" ]]; then
+        printf 'mntfix_sandbox_cmd=('
+        printf '%q ' "${mntfix_sandbox_cmd[@]}"
         printf ')\n'
     fi
     printf '\n'
@@ -4300,7 +4822,7 @@ fs_archive_inbox 1 "$harness" "$rc"
 # always. --refresh-at defers the same way, and for the same reason: a
 # continuation leg can still change $rc below.
 if [[ "$review_loop_cap" == "0" && "$refresh_enabled" == "0" \
-    && "${maintainer_loop_cap:-0}" == "0" ]]; then
+    && "${maintainer_loop_cap:-0}" == "0" && "${code_repeat:-1}" == "1" ]]; then
     printf '%s\n' "$rc" > "$run_dir/exit-code"
 fi
 fi
@@ -4872,6 +5394,9 @@ save_review_loop() {
         --argjson cap "$review_loop_cap" \
         --arg review_model "$review_model" \
         --arg review_harness "$review_harness" \
+        --arg fix_harness "${fix_harness:-}" \
+        --arg fix_model "${fix_model:-}" \
+        --argjson fix_repeat "${fix_repeat:-1}" \
         --arg ended "$review_loop_ended" \
         --arg detail "$review_loop_detail" \
         --argjson prev "$review_iters_done" \
@@ -4880,6 +5405,9 @@ save_review_loop() {
             cap: $cap,
             review_model: (if $review_model == "" then null else $review_model end),
             review_harness: (if $review_harness == "" then null else $review_harness end),
+            fix_harness: (if $fix_harness == "" then null else $fix_harness end),
+            fix_model: (if $fix_model == "" then null else $fix_model end),
+            fix_repeat: (if $fix_repeat == 1 then null else $fix_repeat end),
             ended: (if $ended == "" then null else $ended end),
             detail: (if $detail == "" then null else $detail end),
             iterations: ($prev + $cur),
@@ -4943,9 +5471,25 @@ run_leg() {
         leg_usage_source="$mnt_usage_source"
         leg_formatter="$mnt_formatter"
         leg_harness="$maintainer_preamble_harness"
+    elif [[ "$kind" == "fix" && -n "${fix_harness:-}" ]]; then
+        # A preset seated its own review-tier fix agent; the launcher
+        # emitted its command and "fxr_*" state. Without one this branch is
+        # never taken and fix falls through to the implement defaults.
+        cmd=("${fix_sandbox_cmd[@]}")
+        leg_pi_session_dir="${fxr_pi_session_dir:-}"
+        leg_usage_source="${fxr_usage_source:-}"
+        leg_formatter="${fxr_formatter:-}"
+        leg_harness="$fix_harness"
+    elif [[ "$kind" == "mntfix" && -n "${mntfix_harness:-}" ]]; then
+        cmd=("${mntfix_sandbox_cmd[@]}")
+        leg_pi_session_dir="${fxm_pi_session_dir:-}"
+        leg_usage_source="${fxm_usage_source:-}"
+        leg_formatter="${fxm_formatter:-}"
+        leg_harness="$mntfix_harness"
     fi
-    # "fix" and "mntfix" both fall through to the implement defaults above:
-    # every fix leg of either loop runs the implement harness and model.
+    # "fix" and "mntfix" without a preset fix seat, and "code" (a repeat
+    # pass of the coding leg), all fall through to the implement defaults
+    # above: those legs run the implement harness and model.
     leg_rc=1
     leg_cost=""
     leg_usage=""
@@ -5072,6 +5616,31 @@ run_leg() {
         loop_cost_unknown=1
     fi
 }
+
+# Repeat passes of the coding leg -- a preset code agent with repeat: N.
+# The point is to distrust a cheap model's premature "done": every pass
+# re-reads the same prompt, finds the work already in place, and checks,
+# polishes and fixes -- so there is deliberately no early exit on a pass
+# that "looks finished". Passes stop early only on a harness error: a dead
+# run is not polished, it is dead. Each pass is an ordinary leg (its own
+# events-code-N.jsonl, its own accounting through run_leg), and rc ends as
+# the LAST pass's exit, which is what the review loop below gates on. A
+# pass does not context-refresh: the refresh loop above belongs to the
+# first pass alone.
+if [[ "${code_repeat:-1}" != "1" && "$mode" != "review-only" ]]; then
+    code_pass=2
+    while (( code_pass <= ${code_repeat:-1} )) && [[ "$rc" == "0" ]]; do
+        run_leg code "$code_pass" "$handoff"
+        rc="$leg_rc"
+        code_pass=$(( code_pass + 1 ))
+    done
+    # The exit-code deferral above skipped publishing while repeat passes
+    # were pending; when nothing else follows, this is where the run ends.
+    if [[ "$review_loop_cap" == "0" && "$refresh_enabled" == "0" \
+        && "${maintainer_loop_cap:-0}" == "0" ]]; then
+        printf '%s\n' "$rc" > "$run_dir/exit-code"
+    fi
+fi
 
 if [[ "$review_loop_cap" != "0" && -n "$review_prompt" ]]; then
     # Three reasons not to start at all, each recorded rather than silent.
@@ -5217,21 +5786,58 @@ if [[ "$review_loop_cap" != "0" && -n "$review_prompt" ]]; then
             break
         fi
 
-        # The fix leg's prompt: the generated header, then the verdict. Built
-        # as a file and redirected -- the verdict has no size limit, and one
-        # argv string is capped at 128KB.
+        # The fix leg's prompt: the generated header (the fix seat's own,
+        # when a preset seated one), then the verdict. Built as a file and
+        # redirected -- the verdict has no size limit, and one argv string
+        # is capped at 128KB.
         fix_prompt="$run_dir/fix-prompt-$loop_i.md"
+        fix_header="$fix_prompt_header"
+        [[ -n "${fxr_fix_prompt_header:-}" ]] && fix_header="$fxr_fix_prompt_header"
         {
-            cat -- "$fix_prompt_header"
+            cat -- "$fix_header"
             printf '\n---\n\n'
             awk '/^## Report$/ { exit } { print }' "$verdict_copy"
         } > "$fix_prompt.part"
         mv -f "$fix_prompt.part" "$fix_prompt"
 
-        run_leg fix "$loop_i" "$fix_prompt"
-        it_fix_exit="$leg_rc"
-        it_fix_cost="${leg_cost:-null}"
-        it_fix_usage="$leg_usage"
+        # A fix agent with repeat: N runs the fix as N passes on the same
+        # prompt -- the same distrust of a cheap model's premature "done"
+        # the code seat's repeat carries (see the repeat block above), so
+        # there is no early exit on a pass that looks finished; only a
+        # harness error stops the passes. The iteration records the LAST
+        # pass's exit, the SUM of the passes' costs (null when any pass
+        # went unpriced), and -- for a single pass -- its usage; multi-pass
+        # usage stays null, each pass's own events file carrying the detail.
+        fix_passes="${fix_repeat:-1}"
+        fix_pass=1
+        it_fix_cost=null
+        fix_cost_known=1
+        while :; do
+            fix_leg_id="$loop_i"
+            (( fix_pass > 1 )) && fix_leg_id="$loop_i-p$fix_pass"
+            run_leg fix "$fix_leg_id" "$fix_prompt"
+            it_fix_exit="$leg_rc"
+            if [[ -n "$leg_cost" ]]; then
+                if [[ "$it_fix_cost" == null ]]; then
+                    it_fix_cost="$leg_cost"
+                else
+                    it_fix_cost="$(jq -n --argjson a "$it_fix_cost" \
+                        --argjson b "$leg_cost" '$a + $b' 2>/dev/null)" \
+                        || fix_cost_known=0
+                fi
+            else
+                fix_cost_known=0
+            fi
+            [[ "$leg_rc" == "0" ]] || break
+            (( fix_pass < fix_passes )) || break
+            fix_pass=$(( fix_pass + 1 ))
+        done
+        (( fix_cost_known )) && [[ -n "$it_fix_cost" ]] || it_fix_cost=null
+        if (( fix_passes == 1 )); then
+            it_fix_usage="$leg_usage"
+        else
+            it_fix_usage=null
+        fi
         it_head_after="$(clone_branch_head)"
         save_review_loop
         if [[ "$leg_rc" != "0" ]]; then
@@ -5369,6 +5975,9 @@ if [[ "${maintainer_loop_cap:-0}" != "0" && -n "${maintainer_prompt:-}" ]]; then
             --argjson cap "$maintainer_loop_cap" \
             --arg maintainer_model "$maintainer_model" \
             --arg maintainer_harness "$maintainer_harness" \
+            --arg fix_harness "${mntfix_harness:-}" \
+            --arg fix_model "${mntfix_model:-}" \
+            --argjson fix_repeat "${mntfix_repeat:-1}" \
             --arg ended "$maintainer_loop_ended" \
             --arg detail "$maintainer_loop_detail" \
             --argjson prev "$maintainer_iters_done" \
@@ -5377,6 +5986,9 @@ if [[ "${maintainer_loop_cap:-0}" != "0" && -n "${maintainer_prompt:-}" ]]; then
                 cap: $cap,
                 maintainer_model: (if $maintainer_model == "" then null else $maintainer_model end),
                 maintainer_harness: (if $maintainer_harness == "" then null else $maintainer_harness end),
+                fix_harness: (if $fix_harness == "" then null else $fix_harness end),
+                fix_model: (if $fix_model == "" then null else $fix_model end),
+                fix_repeat: (if $fix_repeat == 1 then null else $fix_repeat end),
                 ended: (if $ended == "" then null else $ended end),
                 detail: (if $detail == "" then null else $detail end),
                 iterations: ($prev + $cur),
@@ -5592,21 +6204,52 @@ if [[ "${maintainer_loop_cap:-0}" != "0" && -n "${maintainer_prompt:-}" ]]; then
             "$loop_i" "$mit_findings"
         save_maintainer_loop
 
-        # The fix leg's prompt: the shared generated header, then the
-        # verdict. Built as a file and redirected -- the verdict has no size
-        # limit, and one argv string is capped at 128KB.
+        # The fix leg's prompt: the generated header (this tier's own fix
+        # seat's, when a preset seated one), then the verdict. Built as a
+        # file and redirected -- the verdict has no size limit, and one
+        # argv string is capped at 128KB.
         mnt_fix_prompt="$run_dir/maintainer-fix-prompt-$loop_i.md"
+        mnt_fix_header="$fix_prompt_header"
+        [[ -n "${fxm_fix_prompt_header:-}" ]] && mnt_fix_header="$fxm_fix_prompt_header"
         {
-            cat -- "$fix_prompt_header"
+            cat -- "$mnt_fix_header"
             printf '\n---\n\n'
             awk '/^## Report$/ { exit } { print }' "$verdict_copy"
         } > "$mnt_fix_prompt.part"
         mv -f "$mnt_fix_prompt.part" "$mnt_fix_prompt"
 
-        run_leg mntfix "$loop_i" "$mnt_fix_prompt"
-        mit_fix_exit="$leg_rc"
-        mit_fix_cost="${leg_cost:-null}"
-        mit_fix_usage="$leg_usage"
+        # The same pass loop as the review tier's fix -- see the comment
+        # there for the repeat semantics and what the iteration records.
+        mnt_fix_passes="${mntfix_repeat:-1}"
+        mnt_fix_pass=1
+        mit_fix_cost=null
+        mnt_fix_cost_known=1
+        while :; do
+            mnt_fix_leg_id="$loop_i"
+            (( mnt_fix_pass > 1 )) && mnt_fix_leg_id="$loop_i-p$mnt_fix_pass"
+            run_leg mntfix "$mnt_fix_leg_id" "$mnt_fix_prompt"
+            mit_fix_exit="$leg_rc"
+            if [[ -n "$leg_cost" ]]; then
+                if [[ "$mit_fix_cost" == null ]]; then
+                    mit_fix_cost="$leg_cost"
+                else
+                    mit_fix_cost="$(jq -n --argjson a "$mit_fix_cost" \
+                        --argjson b "$leg_cost" '$a + $b' 2>/dev/null)" \
+                        || mnt_fix_cost_known=0
+                fi
+            else
+                mnt_fix_cost_known=0
+            fi
+            [[ "$leg_rc" == "0" ]] || break
+            (( mnt_fix_pass < mnt_fix_passes )) || break
+            mnt_fix_pass=$(( mnt_fix_pass + 1 ))
+        done
+        (( mnt_fix_cost_known )) && [[ -n "$mit_fix_cost" ]] || mit_fix_cost=null
+        if (( mnt_fix_passes == 1 )); then
+            mit_fix_usage="$leg_usage"
+        else
+            mit_fix_usage=null
+        fi
         mit_head_after="$(clone_branch_head)"
         save_maintainer_loop
         if [[ "$leg_rc" != "0" ]]; then

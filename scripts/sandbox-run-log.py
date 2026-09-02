@@ -359,6 +359,15 @@ def cmd_record(args):
     if prompt_overlay is not None:
         rec["prompt_overlay"] = prompt_overlay
 
+    # The preset's provenance, when the run was launched with --preset: its
+    # name, the machine-local file it came from and a hash of that file's
+    # bytes at launch. Same absence convention -- no key at all when the run
+    # used no preset. Group on it with e.g. `stats --by preset.name`. See
+    # docs/presets.md.
+    preset = load_json_file(os.path.join(rd, "preset.json"))
+    if preset is not None:
+        rec["preset"] = preset
+
     # The handoff is the prompt, and the run dir it lives in gets deleted
     # after review -- archive it, so prompt iteration has the actual text to
     # study, and hash it, so identical prompts are identifiable.
