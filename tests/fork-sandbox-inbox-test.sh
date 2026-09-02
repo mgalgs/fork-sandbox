@@ -243,6 +243,26 @@ printf 'from stdin\n' | "$say" "$run_dir" - >/dev/null 2>&1
 f="$(find "$run_dir/inbox" -maxdepth 1 -name '*.md' -print -quit)"
 check "reads the text from stdin with '-'" "from stdin" "$(cat "$f")"
 
+# A large stdin message must land promptly. The emptiness check once ran a
+# whole-string glob substitution that walked the entire message per
+# multibyte character under a UTF-8 locale — ~24s of CPU on 360KB, which
+# read as a wedged pipe. ~500KB against a 10s bound separates the two
+# cleanly: the fixed check takes milliseconds, the broken one needs ~45s.
+run_dir="$(new_run_dir claude)"
+big="$(mktemp)"
+printf 'große addenda line — %d\n' $(seq 20000) > "$big"
+if LC_ALL=C.UTF-8 timeout 10 "$say" "$run_dir" - < "$big" >/dev/null 2>&1; then
+    f="$(find "$run_dir/inbox" -maxdepth 1 -name '*.md' -print -quit)"
+    if [[ -n "$f" ]] && cmp -s -- "$big" "$f"; then
+        ok "a large multibyte stdin message lands promptly and intact"
+    else
+        no "a large multibyte stdin message lands promptly and intact" "content mismatch"
+    fi
+else
+    no "a large multibyte stdin message lands promptly and intact" "timed out or failed"
+fi
+rm -f -- "$big"
+
 # A pi run is told the slower truth.
 run_dir="$(new_run_dir pi)"
 out="$("$say" "$run_dir" 'switch to the other approach' 2>&1)"

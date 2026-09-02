@@ -111,7 +111,12 @@ done
     || die "usage: fork-sandbox-say.sh <run-dir> <text>   (or '-' to read stdin)"
 (( have_text )) \
     || die "nothing to say. Give the message as one quoted argument, or '-' to read it from stdin."
-[[ -n "${text_arg//[[:space:]]/}" ]] \
+# A regex find-one-non-space, NOT ${text_arg//[[:space:]]/}: that glob
+# substitution rewrites the whole string just to test emptiness, and under
+# a UTF-8 locale bash walks it per multibyte character — ~24s of CPU on a
+# 360KB stdin message, which reads as a hang. The regex stops at the first
+# non-space byte (measured ~5ms on the same input).
+[[ "$text_arg" =~ [^[:space:]] ]] \
     || die "the message is empty. A blank addendum tells the session nothing."
 
 # Resolve first, then check the prefix, so a symlink cannot point the write
