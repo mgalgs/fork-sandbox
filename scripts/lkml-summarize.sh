@@ -4,7 +4,7 @@
 #
 # Usage: lkml-summarize.sh <series> --project <path> [--version <n>]
 #            [--high <harness[/model]>] [--low <harness[/model]>]
-#            [--timeout <seconds>]
+#            [--timeout <seconds>] [--series]
 #
 # <series>   the mailbox series; its dir is $LKML_MAILBOX_ROOT/<series>.
 # --project  the repo fork-sandbox.sh clones. Both tiers start at the
@@ -29,6 +29,18 @@
 #            then to the shipped defaults high=claude/opus,
 #            low=claude/sonnet. Flags beat env, env beats default.
 # --timeout  seconds to wait for each tier's run to finish. Default 3600.
+# --series   synthesize the WHOLE series instead of one version: a
+#            single synthesis run, no extraction tier. Its handoff
+#            carries, inline, every recorded version's results-v<N>.
+#            json intermediate (which must all exist already) verbatim
+#            in version order, every version's tally section, and the
+#            latest version's cover letter; it writes the whole-series
+#            narrative to <series>/results-series.md -- what the series
+#            does, the review arc v1 to vN, where it stands, what
+#            happens next. Refuses --version ("pick one") and --low
+#            (there is no extraction tier; --high still selects the
+#            synthesis model), and refuses when any recorded version
+#            lacks its results-v<N>.json.
 #
 # Input is `lkml-render.py --text <series-dir>` output ONLY -- never
 # the HTML view. The render is carried inline in each tier's handoff
@@ -74,6 +86,7 @@ shift
 
 project=""
 version=""
+series_mode=""
 high_spec=""
 low_spec=""
 timeout=3600
@@ -82,6 +95,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --project) project="${2:?--project requires a path}"; shift 2 ;;
         --version) version="${2:?--version requires a number}"; shift 2 ;;
+        --series) series_mode=1; shift ;;
         --high) high_spec="${2:?--high requires a harness or harness/model}"; shift 2 ;;
         --low) low_spec="${2:?--low requires a harness or harness/model}"; shift 2 ;;
         --timeout) timeout="${2:?--timeout requires seconds}"; shift 2 ;;
@@ -91,6 +105,16 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -n "$project" ]] || { echo "Error: --project is required." >&2; exit 1; }
+if [[ -n "$series_mode" ]]; then
+    if [[ -n "$version" ]]; then
+        echo "Error: --series summarizes the whole series and --version picks one; pick one." >&2
+        exit 1
+    fi
+    if [[ -n "$low_spec" ]]; then
+        echo "Error: --series takes no --low: the series run is a single synthesis run with no extraction tier (--high still selects its model)." >&2
+        exit 1
+    fi
+fi
 [[ "$timeout" =~ ^[0-9]+$ ]] || { echo "Error: --timeout must be a number of seconds." >&2; exit 1; }
 if [[ -n "$version" ]]; then
     [[ "$version" =~ ^[0-9]+$ ]] || { echo "Error: --version must be a plain integer." >&2; exit 1; }
@@ -153,7 +177,11 @@ resolve_tier() {
 }
 
 high_spec="$(resolve_tier --high "$high_spec" LKML_SUMMARIZE_HIGH claude/opus)" || exit 1
-low_spec="$(resolve_tier --low "$low_spec" LKML_SUMMARIZE_LOW claude/sonnet)" || exit 1
+# --low is meaningless in series mode (refused above); its env key is
+# likewise unused there, so do not resolve it.
+if [[ -z "$series_mode" ]]; then
+    low_spec="$(resolve_tier --low "$low_spec" LKML_SUMMARIZE_LOW claude/sonnet)" || exit 1
+fi
 
 ledger_root="${LKML_MAILBOX_ROOT:-/var/tmp/claude-scratch/lkml}"
 series_dir="$ledger_root/$series"
@@ -205,27 +233,91 @@ if [[ -z "$checkout_branch" ]]; then
     exit 1
 fi
 
-echo "fork-sandbox lkml-summarize: summarizing $series v$version (low: $low_spec, high: $high_spec)" >&2
-
-# The tally section of the --text render for this version: the section
+# The tally section of the --text render for <version>: the section
 # header line through the first 72-dash message separator -- the
 # counts, the latest-tag-per-reviewer-per-patch table and the reviewer
 # block. The synthesis tier gets THIS instead of the whole thread: the
 # extraction intermediate already carries the message-level detail.
-tally_text=""
-in_section=0
-while IFS= read -r ln; do
-    if (( in_section )) && [[ "$ln" =~ ^-{72}$ ]]; then
-        in_section=0
-        break
+extract_tally() {
+    local v="$1" t="" in_section=0 ln
+    while IFS= read -r ln; do
+        if (( in_section )) && [[ "$ln" =~ ^-{72}$ ]]; then
+            in_section=0
+            break
+        fi
+        [[ "$ln" == "$series v$v" ]] && in_section=1
+        (( in_section )) && t+="$ln"$'\n'
+    done <<< "$render_text"
+    printf '%s' "$t"
+}
+
+# The cover letter of the --text render's <version> section: from the
+# section's first message (its 72-dash separator) through the
+# separator that opens the section's second message -- the cover is
+# the first message of the section. An all-remaining section (no
+# other messages) runs to the end of the render.
+extract_cover() {
+    local v="$1" t="" in_section=0 in_cover=0 ln
+    while IFS= read -r ln; do
+        [[ "$ln" == "$series v$v" ]] && in_section=1
+        (( in_section )) || continue
+        if [[ "$ln" =~ ^-{72}$ ]]; then
+            if (( in_cover )); then
+                in_cover=0
+                break
+            fi
+            in_cover=1
+        fi
+        (( in_cover )) && t+="$ln"$'\n'
+    done <<< "$render_text"
+    printf '%s' "$t"
+}
+
+if [[ -n "$series_mode" ]]; then
+    # Series mode: version is already the latest recorded one. The
+    # inputs are the per-version intermediates already on disk, every
+    # version's tally section and the latest version's cover letter --
+    # the per-version pipeline's own loud checks above all still apply.
+    recorded_versions=()
+    while IFS= read -r v; do
+        [[ -n "$v" ]] && recorded_versions+=("$v")
+    done < <(jq -r 'select((.version|type)=="number") | .version' "$versions_file" | sort -n)
+    missing=()
+    for v in "${recorded_versions[@]}"; do
+        [[ -f "$series_dir/results-v${v}.json" ]] || missing+=("$v")
+    done
+    if (( ${#missing[@]} > 0 )); then
+        echo "Error: --series needs every recorded version's results-v<N>.json intermediate; missing for: ${missing[*]}." >&2
+        for v in "${missing[@]}"; do
+            echo "  run lkml-summarize.sh $series --project $project --version $v first." >&2
+        done
+        exit 1
     fi
-    [[ "$ln" == "$series v$version" ]] && in_section=1
-    (( in_section )) && tally_text+="$ln"$'\n'
-done <<< "$render_text"
+    tallies=()
+    for v in "${recorded_versions[@]}"; do
+        t="$(extract_tally "$v")"
+        if [[ -z "$t" ]]; then
+            echo "Error: the --text render has no section for '$series v$v'; the version ledger and the mailbox disagree." >&2
+            exit 1
+        fi
+        tallies+=("$t")
+    done
+    cover_text="$(extract_cover "$version")"
+    if [[ -z "$cover_text" ]]; then
+        echo "Error: the --text render's '$series v$version' section has no cover letter; the version ledger and the mailbox disagree." >&2
+        exit 1
+    fi
+    echo "fork-sandbox lkml-summarize: summarizing $series, whole series (v${recorded_versions[0]} to v$version; high: $high_spec)" >&2
+else
+    echo "fork-sandbox lkml-summarize: summarizing $series v$version (low: $low_spec, high: $high_spec)" >&2
+fi
+
+tally_text="$(extract_tally "$version")"
 if [[ -z "$tally_text" ]]; then
     echo "Error: the --text render has no section for '$series v$version'; the version ledger and the mailbox disagree." >&2
     exit 1
 fi
+
 
 # The throwaway branches carry no commits (the tiers are forbidden to
 # make any), and fork-sandbox.sh already deletes such a branch itself
@@ -417,6 +509,128 @@ BRIEF
     printf '%s\n' "$tally_text"
 }
 
+# The series run's handoff: a persona-style brief, then, in version
+# order, each recorded version's extraction intermediate verbatim and
+# its tally section, then the latest version's cover letter. The
+# per-version intermediates are the message-level detail: the series
+# run synthesizes the arc from them, not from the raw thread.
+build_series_handoff() {
+    local v i=0
+    cat <<BRIEF
+You are the SYNTHESIS run of a whole-series summary of the lkml-mode
+review series $series, versions ${recorded_versions[0]} to $version.
+
+You are handed (1) each recorded version's extraction intermediate
+(results-v<N>.json), verbatim, in version order, (2) each version's
+tally section from the thread's --text render, and (3) the cover
+letter of the LATEST version (v$version), verbatim. The
+intermediates were built from the entire --text render of the
+mailbox, and they are the message-level detail: you MAY read this
+clone to chase a lead, but start from them, not from the code.
+
+Write ONE file: \`results.md\` at the root of the artifact outbox
+directory named in your prompt, EXACTLY this shape:
+
+    # Summary
+    <two to three short paragraphs>
+
+    # Details
+    <one short paragraph per version, in version order>
+    Open items
+    <the latest version's standing items>
+    Recommended next actions
+    <for the latest version>
+
+The # Summary is the deliverable: two to three short paragraphs,
+about 150 words, hard cap 200, written as a brief to a maintainer
+deciding whether to read further. Plain declarative sentences, no
+bullet lists. It carries the whole story: what the series does (one
+sentence, from the cover letter), the review arc (how many versions
+were posted, what the review panel found at each version, what the
+author changed in response -- from the intermediates and the
+tallies), where the series stands now (the latest version's tally
+state), and what happens next. Do NOT explain the review mechanism
+(AI personas, sandboxes, how the review was run) -- the rendered
+page's footer already carries that disclosure.
+
+# Details is one short paragraph per version, in version order (v1:
+posted N patches, the panel raised X, of which Y were confirmed; v2:
+...), then "Open items" and "Recommended next actions" subsections
+for the latest version.
+
+Cite message ids as BARE 7-hex tokens, for example 9d67f5e -- no
+brackets, no anchors, no <id@lkml.local>: a plain convention, and it
+keeps the id greppable against the thread.
+
+Make NO commits and no other changes to the clone: writing
+results.md to the outbox is the whole job. In your final report, say
+how many words the Summary section is.
+BRIEF
+    for v in "${recorded_versions[@]}"; do
+        printf '\n## v%s: the extraction intermediate (results-v%s.json, verbatim)\n\n' "$v" "$v"
+        cat -- "$series_dir/results-v${v}.json"
+    done
+    for v in "${recorded_versions[@]}"; do
+        printf '\n## v%s: the tally section (from the --text render)\n\n' "$v"
+        printf '%s\n' "${tallies[$i]}"
+        i=$(( i + 1 ))
+    done
+    printf "\n## v%s: the cover letter (the section's first message, verbatim)\n\n" "$version"
+    printf '%s\n' "$cover_text"
+}
+
+# The Summary section is a small collapsed card in the intended final
+# layout, so an over-long Summary is worth a warning even though the
+# file is written anyway.
+warn_summary_length() {
+    local path="$1" aim="$2" words
+    words="$(awk '/^# Summary/ { f = 1; next } f && /^# / { exit } f' "$path" | wc -w | tr -d '[:space:]')"
+    if [[ -n "$words" && "$words" -gt 200 ]]; then
+        echo "Warning: the Summary section of $path is $words words; the Summary cap is ~200 (aim for ~$aim)." >&2
+    fi
+}
+
+if [[ -n "$series_mode" ]]; then
+    # One synthesis run, no extraction tier: the inputs are already on
+    # disk per version, and the outbox's results.md is harvested as
+    # results-series.md ONLY -- there is no json companion, the
+    # per-version json/md pairs stay as they are.
+    series_handoff_file="$(mktemp /var/tmp/claude-scratch/lkml-summarize-series-XXXXXX.md)" || {
+        echo "Error: mktemp failed for the series run's handoff file." >&2
+        exit 1
+    }
+    build_series_handoff > "$series_handoff_file"
+
+    if ! launch_tier series "$high_spec" "$series_handoff_file"; then
+        rm -f -- "$series_handoff_file"
+        exit 1
+    fi
+    series_run_dir="$tier_run_dir"
+    rm -f -- "$series_handoff_file"
+
+    series_outbox_md="$series_run_dir/outbox/results.md"
+    if [[ ! -f "$series_outbox_md" ]]; then
+        echo "Error: the series run left no $series_outbox_md." >&2
+        exit 1
+    fi
+    # Same empty/whitespace-only refusal as the per-version path: a run
+    # that died after touching the outbox file leaves nothing to
+    # harvest, and summing nothing is not a summary.
+    if [[ -z "$(tr -d '[:space:]' < "$series_outbox_md")" ]]; then
+        echo "Error: the series run left $series_outbox_md empty (or whitespace only); there is nothing to synthesize." >&2
+        exit 1
+    fi
+    md_path="$series_dir/results-series.md"
+    cp -f -- "$series_outbox_md" "$md_path"
+    echo "fork-sandbox lkml-summarize: harvested $md_path" >&2
+    warn_summary_length "$md_path" 150
+
+    # The written path is the whole stdout of this script; everything
+    # else went to stderr.
+    printf '%s\n' "$md_path"
+    exit 0
+fi
+
 json_path="$series_dir/results-v${version}.json"
 md_path="$series_dir/results-v${version}.md"
 
@@ -480,15 +694,7 @@ cp -f -- "$low_outbox_json" "$json_path"
 echo "fork-sandbox lkml-summarize: harvested $json_path" >&2
 cp -f -- "$high_outbox_md" "$md_path"
 echo "fork-sandbox lkml-summarize: harvested $md_path" >&2
-
-# The format is a contract -- the Summary is meant to render as a
-# small collapsed card once a render step exists for it, so an
-# over-long Summary is worth a warning even though the file is written
-# anyway.
-summary_words="$(awk '/^# Summary/ { f = 1; next } f && /^# / { exit } f' "$md_path" | wc -w | tr -d '[:space:]')"
-if [[ -n "$summary_words" && "$summary_words" -gt 200 ]]; then
-    echo "Warning: the Summary section of $md_path is $summary_words words; the Summary cap is ~200 (aim for ~120)." >&2
-fi
+warn_summary_length "$md_path" 120
 
 # The written paths are the whole stdout of this script; everything
 # else went to stderr.

@@ -35,6 +35,12 @@
 #     launcher produces) warns nothing.
 #   - a low run that leaves an empty intermediate is fatal, and a
 #     failed high run leaves the previous results pair untouched.
+#   - --series mode: the single synthesis run, its handoff (per-version
+#     intermediates and tallies in version order, latest cover letter),
+#     harvest to results-series.md only, the -series- throwaway branch
+#     and the summarize-series cost-ledger persona; the refusals
+#     (--series with --version, --series with --low, a missing
+#     per-version intermediate) and the empty/whitespace-only outbox.
 #   - loud failures: missing series, empty --text render, no version
 #     ledger, unrecorded version, a low run that leaves no results.json.
 
@@ -150,6 +156,18 @@ case "$tier" in
         ;;
     summarize-high)
         if [[ "${STUB_SKIP_MD:-0}" != 1 ]]; then
+            printf '%s\n' "${STUB_MD:-}" > "$run_dir/outbox/results.md"
+        fi
+        ;;
+    summarize-series)
+        # The series run is synthesis-only: results.md in the outbox,
+        # no json companion. STUB_MD_EMPTY models a run that died after
+        # touching the file; STUB_SKIP_MD one that never got there.
+        if [[ "${STUB_SKIP_MD:-0}" == 1 ]]; then
+            :
+        elif [[ "${STUB_MD_EMPTY:-0}" == 1 ]]; then
+            printf ' \n' > "$run_dir/outbox/results.md"
+        else
             printf '%s\n' "${STUB_MD:-}" > "$run_dir/outbox/results.md"
         fi
         ;;
@@ -514,6 +532,176 @@ case "$out_full" in
     *"delete it by hand"*) no "no hand-cleanup warning when the branch is already gone" ;;
     *) ok "no hand-cleanup warning when the branch is already gone" ;;
 esac
+
+printf '\n== --series mode: one synthesis run, series handoff, series harvest ==\n'
+# widget-frob records v1 and v2 (both posted to the mailbox, both with
+# their per-version intermediates on disk from the sections above), so
+# the --series happy path can run against it: exactly one launch, the
+# series handoff assembled from on-disk inputs, harvest to
+# results-series.md only.
+SERIES_MD='# Summary
+The series adds the frobnicator across two versions; v2 stands with the v1 flakiness claim still open.
+
+# Details
+v1: posted 1 patch, the panel raised 1, of which 0 were confirmed.
+
+v2: posted 1 patch, the panel was quiet.
+
+Open items
+Flakiness under load (deadbee) still stands.
+
+Recommended next actions
+Author to address the flakiness claim and post v3.'
+
+capS="$(mktemp -d)"; tmpdirs+=("$capS")
+stdout="$(PATH="$stub_bin:$PATH" STUB_CAPTURE_DIR="$capS" STUB_RUN_PREFIX="$run_prefix_dir" \
+    STUB_JSON="$DEFAULT_JSON" STUB_MD="$SERIES_MD" \
+    "$summarize" widget-frob --project "$project_dir" --series 2>"$capS/err")"
+rc=$?
+if (( rc == 0 )); then ok "--series: exits 0 against the stub"; else no "--series: exits 0 against the stub" "exit $rc: $(cat "$capS/err")"; fi
+check "--series stdout is exactly the written path (no json companion)" \
+    "$series_dir/results-series.md" "$(tr -d '\r' <<< "$stdout")"
+if [[ -e "$series_dir/results-series.json" ]]; then
+    no "no results-series.json companion is written"
+else
+    ok "no results-series.json companion is written"
+fi
+if cmp -s <(printf '%s\n' "$SERIES_MD") "$series_dir/results-series.md"; then
+    ok "results-series.md is the series run's outbox file, verbatim"
+else
+    no "results-series.md is the series run's outbox file, verbatim" "$(cat "$series_dir/results-series.md")"
+fi
+check "exactly one run launched, the series run" "summarize-series" "$(tr -d '\r' < "$capS/order")"
+series_branch="$(sed -n 's/^BRANCH=//p' "$capS/summarize-series.argv")"
+case "$series_branch" in
+    lkml/widget-frob-v2-summarize-series-*) ok "the series run's branch carries the -series- token" ;;
+    *) no "the series run's branch carries the -series- token" "$series_branch" ;;
+esac
+check "the series run checks out the LATEST version's recorded branch" \
+    "main" "$(sed -n 's/^.*--checkout \([^ ]*\).*/\1/p' "$capS/summarize-series.argv" | head -n1)"
+check "the series run runs on the high spec (shipped default claude/opus)" \
+    "claude/opus" "$(sed -n 's/^.*--harness \([^ ]*\).*/\1/p' "$capS/summarize-series.argv" | head -n1)"
+leftover="$(git -C "$project_dir" branch --list 'lkml/*' | tr -d '[:space:]')"
+check "the series throwaway branch is deleted after the run returns" "" "$leftover"
+check "the series run is logged with persona summarize-series and kind summarize" \
+    "summarize-series" "$(jq -r 'select(.kind=="summarize") | select(.persona=="summarize-series") | .persona' "$series_dir/runs.jsonl" | tail -n1)"
+check "the series run did not touch results-v1.md" \
+    "$DEFAULT_MD" "$(cat "$series_dir/results-v1.md")"
+check "the series run did not touch results-v2.json" \
+    "$DEFAULT_JSON" "$(jq -c . "$series_dir/results-v2.json")"
+
+shandoff="$(cat -- "$capS/summarize-series.handoff.md")"
+contains "the series handoff spans the arc, first to latest version" "$shandoff" "versions 1 to 2"
+contains "the series handoff carries v1's intermediate under its own heading" \
+    "$shandoff" "## v1: the extraction intermediate (results-v1.json, verbatim)"
+contains "the series handoff carries v2's intermediate under its own heading" \
+    "$shandoff" "## v2: the extraction intermediate (results-v2.json, verbatim)"
+contains "the series handoff carries the intermediate content verbatim" \
+    "$shandoff" '"claim":"frob looks flaky under load"'
+contains "the series handoff carries v1's tally section" "$shandoff" "widget-frob v1"
+contains "the series handoff carries v2's tally section" "$shandoff" "frob: second"
+contains "the series handoff carries the LATEST version's cover letter body" \
+    "$shandoff" "  Add the second frobnicator"
+contains "the series handoff carries the cover letter as a message (its header line)" \
+    "$shandoff" "Subject: [PATCH v2 0/1] Add the second frobnicator"
+contains "the series handoff pins the Summary register" "$shandoff" "hard cap 200"
+contains "the series handoff pins ~150 words" "$shandoff" "about 150 words"
+contains "the series handoff bans the mechanism explanation" \
+    "$shandoff" "Do NOT explain the review mechanism"
+contains "the series handoff demands per-version Details paragraphs" \
+    "$shandoff" "one short paragraph per version, in version order"
+# shellcheck disable=SC2016  # literal backtick in the needle
+contains "the series handoff names the outbox the way the preamble does" \
+    "$shandoff" "results.md\` at the root of the artifact outbox"
+contains "the series handoff carries no commit permission" "$shandoff" "Make NO commits"
+if python3 - "$capS/summarize-series.handoff.md" <<'PY'
+import sys
+
+text = open(sys.argv[1], encoding="utf-8").read()
+i1 = text.index("## v1: the extraction intermediate")
+i2 = text.index("## v2: the extraction intermediate")
+j1 = text.index("## v1: the tally section")
+j2 = text.index("## v2: the tally section")
+k = text.index("## v2: the cover letter")
+errors = []
+if not i1 < i2:
+    errors.append("v1's intermediate does not precede v2's")
+if not j1 < j2:
+    errors.append("v1's tally does not precede v2's")
+if not (i1 < j1 and i2 < j2):
+    errors.append("intermediates are not in front of the tallies")
+if not j2 < k:
+    errors.append("the cover letter is not last")
+for e in errors:
+    print(e)
+sys.exit(1 if errors else 0)
+PY
+then
+    ok "the series handoff orders the inputs: intermediates, tallies, cover"
+else
+    no "the series handoff orders the inputs: intermediates, tallies, cover"
+fi
+
+printf '\n== --series mode: refusals ==\n'
+capR="$(mktemp -d)"; tmpdirs+=("$capR")
+run "series with --version is refused" 1 widget-frob --project "$project_dir" --series --version 2
+contains "the --series + --version refusal says pick one" "$(cat "$out_file")" "pick one"
+run "series with --low is refused" 1 widget-frob --project "$project_dir" --series --low claude/sonnet
+contains "the --series + --low refusal says there is no extraction tier" \
+    "$(cat "$out_file")" "no extraction tier"
+contains "the --series + --low refusal points at --high" "$(cat "$out_file")" "--high"
+if [[ -e "$capR/order" ]]; then
+    no "a refused --series run launches nothing" "$(cat "$capR/order")"
+else
+    ok "a refused --series run launches nothing"
+fi
+
+mv "$series_dir/results-v2.json" "$capR/hidden-v2.json"
+mv "$series_dir/results-v1.json" "$capR/hidden-v1.json"
+run "missing per-version intermediates are refused" 1 widget-frob --project "$project_dir" --series
+contains "the refusal names both missing versions' files" "$(cat "$out_file")" "missing for: 1 2"
+contains "the refusal gives the remedial command for v1" \
+    "$(cat "$out_file")" "run lkml-summarize.sh widget-frob --project $project_dir --version 1 first"
+contains "the refusal gives the remedial command for v2" \
+    "$(cat "$out_file")" "run lkml-summarize.sh widget-frob --project $project_dir --version 2 first"
+mv "$capR/hidden-v1.json" "$series_dir/results-v1.json"
+run "a single missing intermediate names just that version" 1 widget-frob --project "$project_dir" --series
+contains "a single missing version is named" "$(cat "$out_file")" "missing for: 2"
+case "$(cat "$out_file")" in
+    *"--version 1 first"*) no "the remedial command list covers only the missing versions" ;;
+    *) ok "the remedial command list covers only the missing versions" ;;
+esac
+mv "$capR/hidden-v2.json" "$series_dir/results-v2.json"
+
+printf '\n== --series mode: outbox failures ==\n'
+capE="$(mktemp -d)"; tmpdirs+=("$capE")
+before_series_md="$(cat "$series_dir/results-series.md")"
+out_full="$(PATH="$stub_bin:$PATH" STUB_CAPTURE_DIR="$capE" STUB_RUN_PREFIX="$run_prefix_dir" \
+    STUB_JSON="$DEFAULT_JSON" STUB_MD="$SERIES_MD" STUB_MD_EMPTY=1 \
+    "$summarize" widget-frob --project "$project_dir" --series 2>&1)"
+rc=$?
+if (( rc != 0 )); then ok "a whitespace-only series outbox exits non-zero (fatal, not a warning)"; else no "a whitespace-only series outbox exits non-zero (fatal, not a warning)" "exit 0: $out_full"; fi
+contains "the failure names the empty outbox file" "$out_full" "outbox/results.md"
+contains "the failure says there is nothing to synthesize" "$out_full" "nothing to synthesize"
+check "a refused empty outbox did not clobber results-series.md" \
+    "$before_series_md" "$(cat "$series_dir/results-series.md")"
+out_full="$(PATH="$stub_bin:$PATH" STUB_CAPTURE_DIR="$capE" STUB_RUN_PREFIX="$run_prefix_dir" \
+    STUB_JSON="$DEFAULT_JSON" STUB_MD="$SERIES_MD" STUB_SKIP_MD=1 \
+    "$summarize" widget-frob --project "$project_dir" --series 2>&1)"
+rc=$?
+if (( rc != 0 )); then ok "a series run that leaves no results.md exits non-zero"; else no "a series run that leaves no results.md exits non-zero" "exit 0: $out_full"; fi
+contains "the failure names the missing outbox file" "$out_full" "outbox/results.md"
+leftover="$(git -C "$project_dir" branch --list 'lkml/*' | tr -d '[:space:]')"
+check "the series throwaway branch is deleted when the outbox is empty" "" "$leftover"
+# The word-count warning applies exactly as in the per-version path.
+capW="$(mktemp -d)"; tmpdirs+=("$capW")
+out_full="$(PATH="$stub_bin:$PATH" STUB_CAPTURE_DIR="$capW" STUB_RUN_PREFIX="$run_prefix_dir" \
+    STUB_JSON="$DEFAULT_JSON" STUB_MD="$LONG_MD" \
+    "$summarize" widget-frob --project "$project_dir" --series 2>&1)"
+rc=$?
+if (( rc == 0 )); then ok "an over-long series Summary still exits 0"; else no "an over-long series Summary still exits 0" "exit $rc: $out_full"; fi
+contains "an over-long series Summary warns on stderr with the word count" "$out_full" "210 words"
+contains "the series warning aims for ~150" "$out_full" "aim for ~150"
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 (( fail == 0 )) || exit 1
