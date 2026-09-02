@@ -26,6 +26,17 @@ that message. --text prints the same sections as a bare 'results'
 block (no links); an empty section is omitted in both backends.
 Without the file there is no card and the render is
 byte-identical to a mailbox without results.
+
+When a series dir holds results-series.md (the whole-series narrative,
+written by the summarizer's --series mode), the HTML render adds a
+page-level card immediately after the masthead, before the first
+series section -- the same treatment, but the eyebrow reads
+'series summary' and the wrapper class is 'results results-series'
+so the card can be styled independently later. Its id autolink map
+covers ALL versions' messages in the series dir. --text prints it as
+a 'series-summary' block at the very top, before the first version
+section. Without the file the render is byte-identical to a mailbox
+without it.
 """
 import html
 import base64
@@ -403,15 +414,14 @@ def persona_brief_path(series_dir, persona):
     return None
 
 
-def read_results(series_dir, version):
-    """The per-version results file <series>/results-v<N>.md split into
-    ("# Summary" body, "# Details" body), or None when absent. The
-    filename is built from the integer version, and the path is
+def read_results_file(series_dir, filename):
+    """A results markdown file in <series> split into ("# Summary" body,
+    "# Details" body), or None when absent. The filename is fixed by
+    the caller (never a message-derived value), and the path is
     realpath-contained in the series dir the way persona_brief_path and
     the attachment reader contain theirs, so a file planted as a
-    symlink outside the mailbox cannot steer the read. A companion
-    results-v<N>.json is ignored: the card renders the .md only."""
-    path = os.path.join(series_dir, f"results-v{version}.md")
+    symlink outside the mailbox cannot steer the read."""
+    path = os.path.join(series_dir, filename)
     series_real = os.path.realpath(series_dir)
     path_real = os.path.realpath(path)
     if (os.path.commonpath((path_real, series_real)) == series_real
@@ -419,6 +429,19 @@ def read_results(series_dir, version):
         with open(path_real, encoding="utf-8", errors="replace") as f:
             return split_results(f.read())
     return None
+
+
+def read_results(series_dir, version):
+    """The per-version results file <series>/results-v<N>.md (N built
+    from the integer version), or None when absent. A companion
+    results-v<N>.json is ignored: the card renders the .md only."""
+    return read_results_file(series_dir, f"results-v{version}.md")
+
+
+def read_series_results(series_dir):
+    """The whole-series results file <series>/results-series.md (written
+    by the summarizer's --series mode), or None when absent."""
+    return read_results_file(series_dir, "results-series.md")
 
 
 def split_results(text):
@@ -485,6 +508,31 @@ def render_results_card(series_dir, version, id_map):
     summary, details = res
     card = (f'  <div class="results">\n'
             f'    <p class="eyebrow">results</p>\n'
+            f'    <div class="results-summary">{link_ids(esc(summary), id_map)}</div>\n')
+    if details:
+        card += (f'    <details class="results-fold">\n'
+                 f'      <summary>show details</summary>\n'
+                 f'      <pre class="results-details">{link_ids(esc(details), id_map)}</pre>\n'
+                 f'    </details>\n')
+    return card + '  </div>'
+
+
+def render_series_card(series_dir, id_map):
+    """The page-level series summary card, placed immediately after
+    the masthead, before the first series section: the same treatment
+    as the per-version card (Summary outside the "show details"
+    fold, Details inside it, escaped preformatted, autolinked, empty
+    sections omitted). Two differences: the eyebrow reads 'series
+    summary' and the wrapper class is 'results results-series', so
+    the card can be styled independently later without markup surgery.
+    The id_map must cover ALL versions' messages (the caller builds it
+    over the whole series dir). Returns "" when the file is absent."""
+    res = read_series_results(series_dir)
+    if res is None:
+        return ""
+    summary, details = res
+    card = (f'  <div class="results results-series">\n'
+            f'    <p class="eyebrow">series summary</p>\n'
             f'    <div class="results-summary">{link_ids(esc(summary), id_map)}</div>\n')
     if details:
         card += (f'    <details class="results-fold">\n'
@@ -669,6 +717,23 @@ def render_text_series(series_dir):
     HTML header shows, then every message in thread order."""
     name, msgs, roots = build(series_dir)
     sections = []
+    # The whole-series results file, if any: a 'series-summary' block
+    # at the very top, before the first version section, with the same
+    # column-0 labels / two-space body rules as the per-version
+    # 'results' block (a body line cannot forge a label, no links in
+    # text mode, empty sections omit their label and body).
+    series_res = read_series_results(series_dir)
+    if series_res is not None:
+        lines = ["series-summary"]
+        if series_res[0]:
+            lines.append("# Summary")
+            lines.extend("  " + ln for ln in series_res[0].split("\n"))
+        if series_res[1]:
+            if series_res[0]:
+                lines.append("")
+            lines.append("# Details")
+            lines.extend("  " + ln for ln in series_res[1].split("\n"))
+        sections.append("\n".join(lines))
     covers = [r for r in roots if r["depth"] == 0 and r["subject"].startswith("[PATCH")]
     for cover in covers:
         v = cover["version"]
@@ -1058,9 +1123,23 @@ def main(argv=None):
         name, sec = render_series(d)
         names.append(name)
         sections.append(sec)
-    # The card's rules ride on the card: without a results file the
+    # The page-level series card sits after the masthead, before the
+    # first series section. Its id autolink map covers ALL versions'
+    # messages in the series dir: build() reads every .msg file, so
+    # the map an earlier version's card already uses is the one this
+    # card needs (a union is only a union in a single series dir).
+    series_cards = []
+    for d in args.series_dirs:
+        _name, all_msgs, _roots = build(d)
+        card = render_series_card(d, id_prefix_map(all_msgs))
+        if card:
+            # Section strings lead with a newline (the masthead's own
+            # trailing newline then ends its line); the card gets the
+            # same lead so the page layout is unchanged.
+            series_cards.append("\n" + card)
+    # The card's rules ride on the card: without any results file the
     # document is byte-identical to a render without this feature.
-    css = CSS + (RESULTS_CSS if any('class="results"' in s for s in sections) else "")
+    css = CSS + (RESULTS_CSS if any('class="results' in s for s in sections + series_cards) else "")
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     toc = " · ".join(f"<a href=\"#{esc(n)}-v1\">{esc(n)}</a>" for n in names)
     document = f"""<!doctype html>
@@ -1078,7 +1157,7 @@ def main(argv=None):
     <span class="sub mono">{toc}</span>
     <span class="sub mono">rendered {now}</span>
   </div>
-  {''.join(sections)}
+  {''.join(series_cards + sections)}
   <p class="foot">Every message on these threads is stamped by the mailbox with its persona, harness and model. Reviewers are AI personas running in sandboxed clones, and only the operator merges anything.</p>
 </div>
 </body>

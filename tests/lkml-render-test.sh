@@ -1001,5 +1001,198 @@ else
 fi
 rm "$RESULTS_MD"
 
+printf '\n== series card: page-level card, --text block, byte-identical absence ==\n'
+# A two-version series with a tagged v1 reply: the card sits after the
+# masthead and before the first series section, its eyebrow reads
+# 'series summary', its wrapper carries results-series, and its id
+# autolink map covers ALL versions -- a token from an EARLIER version
+# than the latest still links.
+"$mailbox" init ser-card --cover "$work/cover.txt" --patches "$work/patches" \
+    --from author --harness test --model fixture >/dev/null 2>/dev/null
+sc_tree="$("$mailbox" tree ser-card)"
+sc_patch_id="$(printf '%s\n' "$sc_tree" | awk '/\[PATCH v1 1\/2\]/{print $1}')"
+printf '%s\n' 'Reviewed-by: The Reviewer' > "$work/sc-review.txt"
+"$mailbox" post ser-card --from core --reply-to "$sc_patch_id" --file "$work/sc-review.txt" \
+    --tags Reviewed-by --harness test --model fixture > "$work/sc-review-id" 2>/dev/null
+sc_review_id="$(<"$work/sc-review-id")"
+"$mailbox" init ser-card --cover "$work/cover.txt" --patches "$work/patches" \
+    --from author --harness test --model fixture --version 2 >/dev/null 2>/dev/null
+SERIES_RESULTS="$LKML_MAILBOX_ROOT/ser-card/results-series.md"
+
+# The absence baseline, before any results-series.md exists: both
+# backends must be byte-identical to it once the file is gone again.
+series_before_html="$work/ser-before.html"
+series_before_text="$work/ser-before.txt"
+python3 "$renderer" "$LKML_MAILBOX_ROOT/ser-card" -o "$series_before_html"
+python3 "$renderer" --text "$LKML_MAILBOX_ROOT/ser-card" > "$series_before_text"
+
+sc_prefix="${sc_review_id:0:7}"
+{
+    printf '%s\n' \
+        '# Summary' \
+        "Series story: v1 converged with $sc_prefix; v2 stands untagged." \
+        '' \
+        '# Details' \
+        'v1: posted 2 patches, the panel raised 1, of which 1 was confirmed.' \
+        'v2: posted 2 patches, the panel was quiet.' \
+        '<script>alert(5)</script>' \
+        '' \
+        'Open items' \
+        'None.' \
+        '' \
+        'Recommended next actions' \
+        'Merge when the tag holds.'
+} > "$SERIES_RESULTS"
+
+series_html="$work/ser.html"
+python3 "$renderer" "$LKML_MAILBOX_ROOT/ser-card" -o "$series_html"
+shtml="$(<"$series_html")"
+contains "series card is present with the file" "$shtml" '<div class="results results-series">'
+contains "series card eyebrow reads 'series summary'" "$shtml" '<p class="eyebrow">series summary</p>'
+contains "series card autolinks a message id from an EARLIER version than the latest" \
+    "$shtml" "<a href=\"#m-$sc_review_id\">$sc_prefix</a>"
+case "$shtml" in *'<div class="results">'*) no "no per-version card sneaks in (the fixture has none)" ;; *) ok "no per-version card sneaks in (the fixture has none)" ;; esac
+contains "the results CSS rides on the series card alone" "$shtml" '.results{'
+if python3 - "$series_html" <<'PY'
+import sys
+
+html = open(sys.argv[1], encoding="utf-8").read()
+i_mast = html.index('<div class="masthead">')
+i_card = html.index('<div class="results results-series">')
+i_v1 = html.index('<section class="series" id="ser-card-v1">')
+i_v2 = html.index('<section class="series" id="ser-card-v2">')
+i_sum = html.index('<div class="results-summary">')
+i_fold = html.index('<details class="results-fold">')
+i_pre = html.index('<pre class="results-details">')
+i_pre_end = html.index('</pre>', i_pre)
+pre = html[i_pre:i_pre_end]
+summary_region = html[i_card:i_fold]
+errors = []
+if not i_mast < i_card < i_v1 < i_v2:
+    errors.append("card is not after the masthead and before the first series section")
+if html.count('<div class="results results-series">') != 1:
+    errors.append("expected exactly one series card")
+if not i_card < i_sum < i_fold < i_pre:
+    errors.append("summary is not outside the collapse with details inside")
+if 'converged with' not in summary_region or 'alert(5)' in summary_region:
+    errors.append("series card carries the wrong summary content")
+if 'v1: posted 2 patches' not in pre:
+    errors.append("details body missing from the pre")
+if 'converged with' in pre:
+    errors.append("summary text leaked into the details pre")
+for e in errors:
+    print(e)
+sys.exit(1 if errors else 0)
+PY
+then
+    ok "series card placement: after masthead, before the first section, summary outside the fold"
+else
+    no "series card placement: after masthead, before the first section, summary outside the fold"
+fi
+contains "series details is escaped (script)" "$shtml" '&lt;script&gt;alert(5)&lt;/script&gt;'
+case "$shtml" in *'<script>alert(5)</script>'*) no "series script payload is never raw" ;; *) ok "series script payload is never raw" ;; esac
+
+# --text: a 'series-summary' block at the very top, before the first
+# version section, column-0 labels, two-space bodies, no links.
+series_text="$work/ser.txt"
+python3 "$renderer" --text "$LKML_MAILBOX_ROOT/ser-card" > "$series_text"
+stext="$(<"$series_text")"
+if python3 - "$series_text" <<PY
+import sys
+
+lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+i_v1 = lines.index('ser-card v1')
+errors = []
+if lines[0] != 'series-summary':
+    errors.append("first line is not the 'series-summary' header")
+if lines[1] != '# Summary':
+    errors.append("summary label is not directly under the header, at column 0")
+if not lines[2].startswith('  Series story:'):
+    errors.append("summary body line is not indented under the label")
+try:
+    i_det = lines.index('# Details')
+except ValueError:
+    errors.append("details label missing")
+else:
+    if not lines[i_det + 1].startswith('  v1: posted 2 patches'):
+        errors.append("details body is not indented under the label")
+if not 0 < i_det < i_v1:
+    errors.append("details label is not between the header and the first version section")
+if lines[i_v1 - 1] != '' or (i_v1 - 2 >= 0 and lines[i_v1 - 2] != '  Merge when the tag holds.'):
+    errors.append("exactly one blank line does not separate the block from the first section")
+if any('<a ' in ln or 'href=' in ln for ln in lines):
+    errors.append("text mode has no links")
+for e in errors:
+    print(e)
+sys.exit(1 if errors else 0)
+PY
+then
+    ok "text: series-summary block at the top with column-0 labels and two-space bodies"
+else
+    no "text: series-summary block at the top with column-0 labels and two-space bodies"
+fi
+
+# Empty-section omission, same rules as the per-version block: a file
+# whose Summary section is empty keeps its label off in --text and
+# renders an empty summary in HTML; a Summary-only file drops the fold.
+printf '%s\n' '# Details' 'details only, no summary.' > "$SERIES_RESULTS"
+python3 "$renderer" --text "$LKML_MAILBOX_ROOT/ser-card" > "$series_text"
+stext="$(<"$series_text")"
+if python3 - "$series_text" <<PY
+import sys
+
+lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+errors = []
+if lines[0] != 'series-summary' or lines[1] != '# Details':
+    errors.append("an empty summary does not omit its label")
+if not lines[2].startswith('  details only'):
+    errors.append("details body is not right under its label")
+for e in errors:
+    print(e)
+sys.exit(1 if errors else 0)
+PY
+then
+    ok "text: an empty series summary omits its label and body"
+else
+    no "text: an empty series summary omits its label and body"
+fi
+printf '%s\n' '# Summary' 'summary only, no details.' > "$SERIES_RESULTS"
+series_fold_html="$work/ser-nofold.html"
+python3 "$renderer" "$LKML_MAILBOX_ROOT/ser-card" -o "$series_fold_html"
+sf="$(<"$series_fold_html")"
+contains "series card: summary-only file renders an empty-details omission" \
+    "$sf" '<div class="results-summary">summary only, no details.</div>'
+case "$sf" in *'class="results-fold"'*) no "series card: summary-only file drops the fold" ;; *) ok "series card: summary-only file drops the fold" ;; esac
+
+# A results-series.md planted as a symlink escaping the series dir is
+# refused the way the per-version reader refuses its; one that stays
+# inside still renders.
+printf 'SERIES SYMLINK ESCAPE CANARY\n' > "$work/outside-series-results.md"
+rm "$SERIES_RESULTS"
+ln -s "$work/outside-series-results.md" "$SERIES_RESULTS"
+series_sym_html="$work/ser-sym.html"
+python3 "$renderer" "$LKML_MAILBOX_ROOT/ser-card" -o "$series_sym_html"
+ssym="$(<"$series_sym_html")"
+case "$ssym" in *'SERIES SYMLINK ESCAPE CANARY'*) no "escaping results-series symlink is refused" ;; *) ok "escaping results-series symlink is refused" ;; esac
+case "$ssym" in *'class="results"'*) no "escaping results-series symlink renders no card" ;; *) ok "escaping results-series symlink renders no card" ;; esac
+ln -sf "$LKML_MAILBOX_ROOT/ser-card/inside-series-results.md" "$SERIES_RESULTS"
+printf 'inside series summary.\n' > "$LKML_MAILBOX_ROOT/ser-card/inside-series-results.md"
+python3 "$renderer" "$LKML_MAILBOX_ROOT/ser-card" -o "$series_sym_html"
+ssym="$(<"$series_sym_html")"
+contains "a symlink inside the series dir still renders" "$ssym" 'inside series summary.'
+rm "$SERIES_RESULTS" "$LKML_MAILBOX_ROOT/ser-card/inside-series-results.md"
+
+# Absent file = byte-identical, both backends: removing the file
+# returns the render to the pre-feature baseline taken above.
+series_after_html="$work/ser-after.html"
+series_after_text="$work/ser-after.txt"
+python3 "$renderer" "$LKML_MAILBOX_ROOT/ser-card" -o "$series_after_html"
+python3 "$renderer" --text "$LKML_MAILBOX_ROOT/ser-card" > "$series_after_text"
+if cmp -s "$series_before_html" "$series_after_html"; then ok "HTML: absent results-series.md is byte-identical to the baseline"; else no "HTML: absent results-series.md is byte-identical to the baseline"; fi
+if cmp -s "$series_before_text" "$series_after_text"; then ok "--text: absent results-series.md is byte-identical to the baseline"; else no "--text: absent results-series.md is byte-identical to the baseline"; fi
+shtml="$(<"$series_after_html")"
+case "$shtml" in *'results-series'*) no "baseline HTML has no series-card markup" ;; *) ok "baseline HTML has no series-card markup" ;; esac
+case "$shtml" in *'.results{'*) no "baseline HTML has no results CSS (the card is gone)" ;; *) ok "baseline HTML has no results CSS (the card is gone)" ;; esac
+
 printf '%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))
