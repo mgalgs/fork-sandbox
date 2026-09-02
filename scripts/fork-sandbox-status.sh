@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # fork-sandbox-status.sh — :approved: Read the state and result of a fork-sandbox run
 #
-# Usage: fork-sandbox-status.sh [--result | --json | --events N | --log | --monitor | --follow] <run-dir>
+# Usage: fork-sandbox-status.sh [--result | --json | --events N | --log | --monitor | --monitor-terminal | --follow] <run-dir>
 #
 # <run-dir> is the run directory fork-sandbox.sh printed when it launched.
 #
@@ -28,6 +28,11 @@
 #               emits on every terminal state, crashes and abandoned runs
 #               included, so silence never means success.
 # -h, --help:   print this header and exit.
+# --monitor-terminal: like --monitor, but prints nothing until the run
+#               reaches a terminal state, then prints exactly what --monitor
+#               prints for it. For the Monitor tool of an orchestrating
+#               session that acts on terminal events only: every mid-run
+#               line there is a notification that goes nowhere.
 # --follow:     watch the run and print EVERY event, rendered — the same
 #               stream the run's tmux pane shows. For a human at a terminal;
 #               the Monitor tool wants --monitor. Ends like --monitor does,
@@ -89,6 +94,7 @@ usage() {
 mode="status"
 events_n=""
 run_dir_arg=""
+terminal_only=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -96,6 +102,7 @@ while [[ $# -gt 0 ]]; do
         --json) mode="json"; shift ;;
         --log) mode="log"; shift ;;
         --monitor) mode="monitor"; shift ;;
+        --monitor-terminal) mode="monitor"; terminal_only=1; shift ;;
         --follow) mode="follow"; shift ;;
         --events)
             mode="events"
@@ -112,7 +119,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-[[ -n "$run_dir_arg" ]] || die "usage: fork-sandbox-status.sh [--result | --events N | --log | --monitor | --follow] <run-dir>"
+[[ -n "$run_dir_arg" ]] || die "usage: fork-sandbox-status.sh [--result | --events N | --log | --monitor | --monitor-terminal | --follow] <run-dir>"
 if [[ -n "$events_n" && ! "$events_n" =~ ^[0-9]+$ ]]; then
     die "--events takes a number"
 fi
@@ -613,9 +620,12 @@ case "$mode" in
         # commits — a review, say — has nothing to report until the first
         # heartbeat, a full interval away; without this line the monitor
         # looks dead for exactly that long. A terminal state says nothing
-        # here; the loop below reports it in its first pass.
+        # here; the loop below reports it in its first pass. In terminal-only
+        # mode this line is skipped: the Monitor tool already confirms
+        # arming, and silence is the expected steady state there, so the
+        # anti-looks-dead rationale does not apply.
         state="$(run_state)"
-        if [[ "$state" == "starting" || "$state" == "running" ]]; then
+        if [[ "$state" == "starting" || "$state" == "running" ]] && (( ! terminal_only )); then
             printf 'watching: %s, %s elapsed, %s events so far\n' \
                 "$state" "$(elapsed_human)" "$(event_count)"
             if [[ "$mode" == "monitor" ]]; then
@@ -629,7 +639,9 @@ case "$mode" in
                 exit 0
             fi
 
-            if have_events; then
+            # The mid-run stream is noise in terminal-only mode; nothing
+            # else reads offset, so the whole block is skipped there.
+            if (( ! terminal_only )) && have_events; then
                 total="$(wc -l < "$RUN_FILE_PATH")"
                 if (( total > offset )); then
                     # Stop at the line count read above, so a line still being
@@ -686,7 +698,8 @@ case "$mode" in
             # itself shows liveness, and a quiet stretch means exactly what
             # it means in the tmux pane: one long-running tool call.
             now="$(date +%s)"
-            if [[ "$mode" == "monitor" ]] && (( now - last_beat >= HEARTBEAT_SECONDS )); then
+            if [[ "$mode" == "monitor" ]] && (( ! terminal_only )) \
+                    && (( now - last_beat >= HEARTBEAT_SECONDS )); then
                 printf 'running: %s elapsed, %s commits so far, %s events\n' \
                     "$(elapsed_human)" "$(commit_count)" "$(event_count)"
                 # The event count proves liveness; the last event says what
