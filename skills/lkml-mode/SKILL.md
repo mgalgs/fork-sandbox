@@ -175,6 +175,40 @@ frontmatter block, then a short voice-and-focus body) into
 for the whole series, so its voice stays consistent version over version —
 do not vary it round to round.
 
+**Persona pins are defaults, not policy — a machine seats file re-seats the panel.**
+Each persona file's `harness`/`model`/`thinking` frontmatter is the seat the
+persona runs on by default. On a machine where the panel should run
+elsewhere (every reviewer on a self-hosted `pi-local` endpoint, `author`
+staying on `claude/opus`), write the machine seats file at
+`~/.config/fork-sandbox/lkml-seats.yaml` (overridable via `LKML_SEATS_FILE`):
+
+```yaml
+# which harness/model each lkml persona seat runs on this machine
+---
+default:
+  harness: pi-local
+personas:
+  author:
+    harness: claude
+    model: opus
+```
+
+Entries carry only `harness`, `model` and `thinking`. Precedence, per
+persona, key by key: the script's `--model-override` flag > a
+`personas.<name>` entry > `default:` > the persona's frontmatter. A
+`harness` without a `model` DROPS the frontmatter's model (a bare
+`pi-local` resolves from the endpoint, a bare `claude` takes the harness
+default); `thinking` inherits from frontmatter unless an entry sets it.
+A missing file means the frontmatter pins stand exactly as shipped; an
+unreadable or unparseable one refuses the run loudly — a typo never
+silently re-seats the panel onto the expensive endpoint. Every seat the
+file changes is announced on stderr (`lkml-round: seat core: pi-local
+(lkml-seats.yaml, was claude/opus)`), and `--model-override` wins over the
+seats file quietly, as it flattens the whole roster. `lkml-round.sh`,
+`lkml-revise.sh`, `lkml-cover.sh` and `lkml-series.sh` all consume the same
+resolution (the `lkml-seats-resolve` helper); `lkml-summarize.sh`'s tiers
+are not personas and keep their own env file.
+
 ## The loop
 
 1. **`init` the series** from a branch: `lkml-mailbox.sh init <series>

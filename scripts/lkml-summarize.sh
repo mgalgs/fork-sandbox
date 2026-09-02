@@ -20,8 +20,9 @@
 #            bare, and nothing is expanded here -- pi-local resolves
 #            its model from the endpoint itself. A combined
 #            harness/model passes through verbatim. Do NOT hand a bare
-#            harness a persona-style model name: that is the
-#            lkml-round.sh --model-override 404 lesson. Without the
+#            harness a persona-style model name: the endpoint is asked
+#            for it verbatim and the leg dies with zero replies -- what
+#            the lkml-round.sh --model-override 404 lesson was about. Without the
 #            flag, each tier falls back to the machine default in
 #            ~/.config/fork-sandbox/lkml-summarize.env (keys
 #            LKML_SUMMARIZE_HIGH / LKML_SUMMARIZE_LOW, same form; the
