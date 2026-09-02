@@ -1650,8 +1650,6 @@ if [[ -n "$preset_name" ]]; then
             mntfix_repeat="$preset_maintain_fix_repeat"
         fi
     fi
-
-    preset_sha256="$(sha256sum -- "$preset_file" | cut -d' ' -f1)"
 fi
 
 if [[ "$review_only" == true ]]; then
@@ -3269,24 +3267,30 @@ if [[ -n "$task_meta" ]]; then
     printf '%s\n' "$task_meta" > "$run_dir/task-meta.json"
 fi
 # The preset's provenance, when the run was launched with one: its name, the
-# machine-local file it came from and a hash of that file's bytes at launch --
+# machine-local file it came from and a hash of the definition's bytes at
+# launch --
 # the compiled result (harness, models, loop caps) is already in the run
 # record, so what needs pinning is which document produced it. Same absence
 # convention as prompt-overlay.json: no file when no preset, and
 # sandbox-run-log.py reads that as "no preset key".
 if [[ -n "$preset_name" ]]; then
+    # The definition's own bytes, AS LAUNCHED: copy first, then hash the
+    # copy, so preset.json's sha256 identifies the copied bytes exactly.
+    # The live file could be edited between preset compilation and now --
+    # the edit this feature exists around -- and hashing it then would
+    # file the new definition under the old bytes' name. The copy is also
+    # what record runs at run END archives from, since by then the preset
+    # may have been edited again: it is the only archive source that
+    # cannot race that edit, and sandbox-run-log.py archives it under
+    # this sha256, deduplicated for free by that key.
+    cp -- "$preset_file" "$run_dir/preset.yaml"
+    preset_sha256="$(sha256sum -- "$run_dir/preset.yaml" | cut -d' ' -f1)"
     jq -n \
         --arg name "$preset_name" \
         --arg file "$preset_file" \
         --arg sha256 "$preset_sha256" \
         '{name: $name, file: $file, sha256: $sha256}' \
         > "$run_dir/preset.json"
-    # And the definition's own bytes, AS LAUNCHED, beside the provenance
-    # record. record runs at run END, and the preset may be edited in
-    # between -- so the launch-time copy is the only archive source that
-    # cannot race the edit. sandbox-run-log.py archives it under the
-    # sha256 above, deduplicated for free by that key.
-    cp -- "$preset_file" "$run_dir/preset.yaml"
 fi
 # The prompt overlay's provenance, beside the run for the same reason: what
 # was applied has to be queryable later, not just present in the rendered

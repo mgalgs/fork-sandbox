@@ -770,6 +770,9 @@ if [[ -n "${rd_a:-}" ]]; then
         no "a --preset launch leaves the definition in the run dir, byte-identical" \
             "$rd_a/preset.yaml differs from $real_presets/rep3.yaml"
     fi
+    check "preset.json's sha256 is the run-dir copy's hash" \
+        "$(jq -r '.sha256' "$rd_a/preset.json")" \
+        "$(sha256sum "$rd_a/preset.yaml" | cut -d' ' -f1)"
     check "a noop middle pass does not stop the passes" "3" "$(cat "$count")"
 fi
 
@@ -928,6 +931,30 @@ if [[ -n "${rd_a:-}" && -x "$run_log" ]]; then
             "$(printf '%s' "$rec_bad" | jq -r '.preset.name + "/" + (.preset.archive // "null")')"
     else
         no "a preset.json without a sha256 still records"
+    fi
+
+    # A hand-crafted run dir whose preset.json sha256 does not match
+    # preset.yaml's bytes must skip the archive, not the record: the
+    # entry survives with provenance but no archive key, so a ledger
+    # entry's preset.sha256 always identifies its archived bytes.
+    rd_mm="$(mktemp -d /var/tmp/claude-scratch/forks/claude-fork-sandbox.XXXXXX)"
+    tmpdirs+=("$rd_mm")
+    cp -a -- "$rd_a/". "$rd_mm/"
+    jq '.sha256 = "0000000000000000000000000000000000000000000000000000000000000000"' \
+        "$rd_mm/preset.json" > "$rd_mm/preset.json.tmp" \
+        && mv "$rd_mm/preset.json.tmp" "$rd_mm/preset.json"
+    err_mm="$tmp/err-preset-mismatch"
+    if HOME="$fakehome" "$run_log" record --run-dir "$rd_mm" \
+        >/dev/null 2>"$err_mm"; then
+        ok "a preset.json sha256 that does not match preset.yaml still records"
+        contains "its mismatched archive is warned on stderr" \
+            "$(cat "$err_mm")" "preset not archived"
+        rec_mm="$(HOME="$fakehome" "$run_log" show "$(basename "$rd_mm")")"
+        check "the entry keeps the run but has no preset.archive" \
+            'rep3/null' \
+            "$(printf '%s' "$rec_mm" | jq -r '.preset.name + "/" + (.preset.archive // "null")')"
+    else
+        no "a preset.json sha256 that does not match preset.yaml still records"
     fi
 else
     no "sandbox-run-log.py record archives the preset definition" \

@@ -305,9 +305,12 @@ seat, and a maintainer whose findings get a strong fixer.
 
 A preset is part of what produced a result, so a run launched with one
 writes `<run-dir>/preset.json` — the preset's name, the file it came
-from, and a sha256 of that file's bytes at launch — and
-`sandbox-run-log.py record` folds it into the run's log entry under
-`preset`. The compiled outcome is already in the record: `run.env`
+from, and a sha256 of the definition's bytes at launch — alongside
+`<run-dir>/preset.yaml`, a byte-identical copy of the definition as
+launched, and `sandbox-run-log.py record` folds the provenance into the
+run's log entry under `preset` and, since the live file may be edited
+during the run, archives that copy under `preset.archive`, deduplicated
+by the sha256. The compiled outcome is already in the record: `run.env`
 carries `code_repeat`, `fix_harness`/`fix_model`/`fix_repeat` and their
 `maintainer_fix_*` counterparts when set, and `review-loop.json` /
 `maintainer-loop.json` name their loop's fix seat beside the reviewer.

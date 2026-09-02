@@ -382,6 +382,12 @@ def cmd_record(args):
                 # A hand-crafted or corrupted preset.json may be any JSON
                 # value: keep this read inside the guard so a missing or
                 # non-string sha256 skips the archive, not the record.
+                # And the recorded sha256 must identify the bytes about to
+                # be filed: archiving under a hash the data does not have
+                # would make the ledger key a lie, so warn and skip.
+                if hashlib.sha256(data).hexdigest() != rec["preset"]["sha256"]:
+                    raise ValueError(
+                        "preset.yaml does not match the recorded sha256")
                 dest = os.path.join(
                     ARCHIVE_DIR, "presets",
                     rec["preset"]["sha256"] + ".yaml")
@@ -392,7 +398,7 @@ def cmd_record(args):
                     with open(dest, "wb") as f:
                         f.write(data)
                 rec["preset"]["archive"] = dest
-            except (OSError, KeyError, TypeError) as e:
+            except (OSError, KeyError, TypeError, ValueError) as e:
                 print(f"sandbox-run-log: preset not archived: {e}",
                       file=sys.stderr)
         else:
