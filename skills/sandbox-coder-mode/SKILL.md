@@ -177,13 +177,13 @@ a step in the plan rather than a virtue to remember.
 
 While a run is in flight, `fork-sandbox-say.sh` (see **Iterating on a
 run**) can nudge a session that is accumulating work without committing.
-Watch the commit count in the monitor and use it.
+Watch the commit count in the run's status block and use it.
 
 **Verify the run's self-report.** A finished run tells you what it did; do
-not take it at face value. Its commit count can disagree with the monitor's
-(the monitor counts `git commit` calls inside test scaffolds' own scratch
-repositories too), and a run that explains a shortfall as "environmental" is
-making a claim only the host can settle. Re-measure on the host: run the
+not take it at face value. Its commit count can disagree with the event
+stream's (the stream includes `git commit` calls inside test scaffolds' own
+scratch repositories too), and a run that explains a shortfall as
+"environmental" is making a claim only the host can settle. Re-measure on the host: run the
 suites yourself, per **Reviewing and integrating** step 4, and read the
 diffstat rather than the prose summary. The run's own account is a lead, not
 a finding.
@@ -378,12 +378,12 @@ Keep the run directory the launcher prints — every later command takes it.
 Then arm the Monitor tool on the command it printed:
 
 ```
-fork-sandbox-status.sh --monitor <run-dir>
+fork-sandbox-status.sh --monitor-terminal <run-dir>
 ```
 
 Never hand-roll a poll loop. When the user wants to watch a run live in
 their own terminal, give them `fork-sandbox-status.sh --follow <run-dir>`
-and keep the Monitor on `--monitor`.
+and keep the Monitor on `--monitor-terminal`.
 
 For a long run on the `claude` or `codex` harness, check the access token
 right after launch: the sandbox snapshots it and cannot refresh it, so a run

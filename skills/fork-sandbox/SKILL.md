@@ -243,10 +243,11 @@ reach it — see "What it gives up".)
 
    **Watching one is no different**, for the same reason a review loop
    isn't: the run counts as running until the last leg is done, so the
-   Monitor tool still fires one terminal event at the end. `--monitor` prints
-   a line when a continuation starts (`◆ fork-sandbox-refresh: leg 2 from
-   handoff-1.md`), and the summary's `review:` line gets a sibling `refresh:`
-   line when a continuation actually ran.
+   Monitor tool still fires one terminal event at the end. A continuation
+   starting adds a line to the event log (`◆ fork-sandbox-refresh: leg 2
+   from handoff-1.md`) — `--monitor` prints it, but the armed
+   `--monitor-terminal` does not — and the summary's `review:` line gets a
+   sibling `refresh:` line when a continuation actually ran.
 
    `pi`, `pi-local` and `codex` have no hook system to measure context with,
    so `--refresh-at` is refused outright on those harnesses — not silently
@@ -263,21 +264,22 @@ reach it — see "What it gives up".)
 4. **Arm the monitor.** Do not hand-roll a poll loop. Use the Monitor tool
    with the command the launcher printed:
    ```
-   fork-sandbox-status.sh --monitor <run-dir>
+   fork-sandbox-status.sh --monitor-terminal <run-dir>
    ```
    Set `timeout_ms` to cover the work — 1800000 (30 min) is a good default,
-   and use `persistent: true` for anything longer. The monitor confirms itself
-   with a `watching:` line when it arms, then prints one line per commit, a
-   heartbeat every five minutes with the session's last event, and a full
-   summary when the run ends. It emits on **every** terminal state — a clean
-   exit, a non-zero exit, and a runner that vanished without writing an exit
-   code — so silence never means success.
+   and use `persistent: true` for anything longer. It prints nothing until
+   the terminal state — no `watching:` line, no per-commit lines, no
+   heartbeats; every mid-run line would be a notification that goes nowhere
+   for a session that acts on terminal events only. At the terminal state it
+   prints the final result event, when the session wrote one, then the full
+   summary. It emits on **every** terminal state — a clean exit, a non-zero
+   exit, and a runner that vanished without writing an exit code — so
+   silence never means success.
 
-   `--monitor` is deliberately near-silent between those signals. When the
-   **user** wants to watch the run live in their own terminal, give them
-   `fork-sandbox-status.sh --follow <run-dir>` instead — every event,
-   rendered, ending with the same summary. Keep the Monitor tool on
-   `--monitor`.
+   When the **user** wants to watch the run live in their own terminal,
+   give them `fork-sandbox-status.sh --follow <run-dir>` instead — every
+   event, rendered, ending with the same summary. Keep the Monitor tool on
+   `--monitor-terminal`.
 
 5. **Report back, briefly.** When the monitor fires its terminal event you
    already have the summary. If you need more, read:
@@ -404,7 +406,7 @@ What carries over, and what does not:
   to render. `--result` and `--follow` print nothing useful. Use
   `fork-sandbox-status.sh <run-dir>` for state and the summary, and read
   `<run-dir>/events.jsonl` directly for what the session actually said.
-  `--monitor` still works for the terminal event, but reports no commits
+  The monitor still fires its terminal event, but reports no commits
   along the way.
 - **Cost still gets reported, and here it is real money.** A claude run
   spends the subscription; a pi run spends OpenRouter credit. Both put a

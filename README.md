@@ -19,7 +19,7 @@
 
 - `fork-sandbox.sh <project-dir> <handoff-file>` — launch a run
   (`--harness`, `--review-loop`, `--refresh-at`, `--k8s`, ...)
-- `fork-sandbox-status.sh <run-dir>` — watch it (`--result`, `--monitor`)
+- `fork-sandbox-status.sh <run-dir>` — watch it (`--result`, `--monitor`, `--monitor-terminal`)
 - `fork-sandbox-say.sh <run-dir> <text>` — steer a running agent
 - `fork-sandbox-k8s.sh submit|fetch --branch <name> ...` — start a cluster
   run from one machine, collect it from another
@@ -254,7 +254,9 @@ touched. In detail:
    (`node_modules`, a venv, a service stack), and starts the agent detached.
 3. **Watch, or don't.** `fork-sandbox-status.sh <run-dir>` prints the state,
    `--result` the final report, `--events N` the last N events, and
-   `--monitor` a line-oriented feed an orchestrating agent can poll.
+   `--monitor` a line-oriented feed an orchestrating agent can poll;
+   `--monitor-terminal` is that feed reduced to the terminal event, for an
+   orchestrating session that acts on terminal events only.
 4. **Read the branch.** It is fetched back into your repo. Review it like a
    pull request from a stranger — a `Makefile` or a `package.json` script in
    it runs on *your* host the moment you build.
@@ -408,6 +410,7 @@ fork-sandbox.sh --preset deep ~/src/proj handoff.md        # a named pipeline (d
 fork-sandbox-status.sh <run-dir>              # status at a glance
 fork-sandbox-status.sh --result <run-dir>     # the final report
 fork-sandbox-status.sh --monitor <run-dir>    # line feed for an orchestrating agent
+fork-sandbox-status.sh --monitor-terminal <run-dir>  # the arm the skills use: the terminal event only
 
 # Steer it while it runs — delivered at the session's next tool call
 fork-sandbox-say.sh <run-dir> "stop refactoring the tests; ship the fix first"

@@ -6758,13 +6758,13 @@ EOF
 # promise a rendered log it does not produce.
 if [[ -z "$run_formatter" ]]; then
     cat <<EOF
-  watch:    $status_cmd --monitor $run_dir   (state and the final summary)
+  watch:    $status_cmd --monitor-terminal $run_dir   (silent until the run ends, then the summary)
   status:   $status_cmd $run_dir
   output:   $run_dir/events.jsonl   ($harness's own output, whatever the name says)
 EOF
 else
     cat <<EOF
-  watch:    $status_cmd --monitor $run_dir
+  watch:    $status_cmd --monitor-terminal $run_dir
   follow:   $status_cmd --follow $run_dir   (every event, live, for a terminal)
   status:   $status_cmd $run_dir
   result:   $status_cmd --result $run_dir
