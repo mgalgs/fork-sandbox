@@ -63,8 +63,10 @@ High-level operation is the mode's default, not a special tier:
 - **Findings from a review are split by file ownership into fix rounds**;
   this session never fixes them by hand, except the few-line case the
   threshold already allows.
-- **Screenshots and shape summaries go to the user; heartbeats do not.** A
-  monitor event that changes nothing gets one line, or none.
+- **Screenshots and shape summaries go to the user; mid-run noise does not.**
+  The monitor this mode arms on `--monitor-terminal` is silent until the
+  terminal state, so a mid-run update that changes nothing gets no line at
+  all.
 - **"Stay high level" only needs to be said once.** The mode does not need
   to hear it again. "Exit sandbox coder mode" is the only thing that ends it.
 
@@ -440,7 +442,7 @@ skill.
 
 Prefer an addendum when the run is broadly on track and one fact changed: a
 detail you got wrong in the handoff, a file it should not touch, an extra
-acceptance criterion, a dead end you can see it walking into from the monitor.
+acceptance criterion, a dead end you can see it walking into in the run's status block.
 The run keeps everything it has already done.
 
 Prefer a **new round** when the handoff itself was wrong — the wrong goal, the

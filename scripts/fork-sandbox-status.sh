@@ -38,7 +38,8 @@
 #               in either argument order.
 # --follow:     watch the run and print EVERY event, rendered — the same
 #               stream the run's tmux pane shows. For a human at a terminal;
-#               the Monitor tool wants --monitor. Ends like --monitor does,
+#               the Monitor tool wants --monitor-terminal. Ends like
+#               --monitor does,
 #               with the summary, on every terminal state.
 #
 # Why this is safe to blanket-approve. It reads and never writes, it runs no
