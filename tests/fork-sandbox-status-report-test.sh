@@ -112,16 +112,44 @@ tail_monterm="$(sed -n '/^finished:/,$p' <<<"$monterm")"
 [[ "$monterm" == *"finished: done, exit 0, "* && "$monterm" == *"summary body line"* ]] \
     || { echo "monitor-terminal missing finished line or summary: $monterm"; exit 1; }
 
-# 4. An abandoned run: --monitor-terminal prints the abandoned: lines.
+# 4. An abandoned run whose session did write its result before the
+# runner died: --monitor-terminal must flush that result event, before
+# the abandoned: lines — the runner-killed-after-result case the flush
+# exists for. Without events.jsonl here, have_events fails inside the
+# flush and a removed or broken flush would still pass this test.
 sleep 0.1 & dead_pid=$!
 wait "$dead_pid"
 new_run_dir
 printf '%s\n' "$dead_pid" > "$rd_new/pid"
+cat > "$rd_new/events.jsonl" <<'EOF'
+{"type":"result","subtype":"success","result":"session account"}
+EOF
 out="$(timeout 30 "$status" --monitor-terminal "$rd_new" 2>&1)"
-[[ "$out" == "abandoned: the runner is gone and wrote no exit code, after "* ]] \
-    || { echo "monitor-terminal did not report abandonment: $out"; exit 1; }
+[[ "$(head -1 <<<"$out")" == "== result: success"* ]] \
+    || { echo "monitor-terminal did not flush the result event first: $out"; exit 1; }
+[[ "$out" == *"session account"* ]] \
+    || { echo "monitor-terminal dropped the session's result text: $out"; exit 1; }
+[[ "$out" == *$'session account\nabandoned: the runner is gone and wrote no exit code, after '* ]] \
+    || { echo "result flush did not precede abandoned line: $out"; exit 1; }
 [[ "$out" == *"Nothing was fetched. The clone is still at /tmp/clone"* ]] \
     || { echo "monitor-terminal abandoned report incomplete: $out"; exit 1; }
+
+# 4b. A failed run with a result event: same flush on the done|failed
+# arm, but with a nonzero exit code.
+new_run_dir
+printf '%s\n' "$dead_pid" > "$rd_new/pid"
+cat > "$rd_new/events.jsonl" <<'EOF'
+{"type":"result","subtype":"success","result":"failed session account"}
+EOF
+printf '3\n' > "$rd_new/exit-code"
+printf 'failed run summary\n' > "$rd_new/summary.txt"
+out="$(timeout 30 "$status" --monitor-terminal "$rd_new" 2>&1)"
+[[ "$(head -1 <<<"$out")" == "== result: success"* ]] \
+    || { echo "monitor-terminal did not flush the result event on a failed run: $out"; exit 1; }
+[[ "$out" == *"failed session account"* ]] \
+    || { echo "monitor-terminal dropped the failed run's result text: $out"; exit 1; }
+[[ "$out" == *"finished: failed, exit 3, "* && "$out" == *"failed run summary"* ]] \
+    || { echo "monitor-terminal missing failed finished line or summary: $out"; exit 1; }
 
 # 5. --monitor-terminal followed by another mode flag is refused, instead
 # of leaving terminal_only straddling modes — a --follow that prints
@@ -135,4 +163,4 @@ fi
 [[ "$out" == *"cannot be combined with --monitor-terminal"* ]] \
     || { echo "no conflict message: $out"; exit 1; }
 
-echo "6 passed, 0 failed"
+echo "7 passed, 0 failed"
