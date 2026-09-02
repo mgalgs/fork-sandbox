@@ -847,5 +847,69 @@ if [[ -n "${rd_c:-}" ]]; then
     fi
 fi
 
+printf '\n== sandbox-run-log.py: the preset definition in the archive ==\n'
+
+if [[ -n "${rd_a:-}" && -x "$run_log" ]]; then
+    # HOME redirection moves both the ledger and ARCHIVE_DIR, the same
+    # way the prompt-overlay test records into a fake home.
+    fakehome="$(mktemp -d /var/tmp/claude-scratch/fs-preset-fakehome.XXXXXX)"
+    tmpdirs+=("$fakehome")
+    mkdir -p "$fakehome/.claude"
+    psha="$(jq -r '.sha256' "$rd_a/preset.json")"
+    arch_dir="$fakehome/.claude/sandbox-handoffs/presets"
+
+    if HOME="$fakehome" "$run_log" record --run-dir "$rd_a" >/dev/null 2>&1; then
+        ok "sandbox-run-log.py record archives the preset definition"
+        if cmp -s "$arch_dir/$psha.yaml" "$rd_a/preset.yaml"; then
+            ok "the archive holds the definition bytes, keyed by the record's sha256"
+        else
+            no "the archive holds the definition bytes, keyed by the record's sha256" \
+                "missing or wrong $arch_dir/$psha.yaml"
+        fi
+        rec="$(HOME="$fakehome" "$run_log" show "$(basename "$rd_a")")"
+        check "the ledger entry carries preset.archive" \
+            "$arch_dir/$psha.yaml" \
+            "$(printf '%s' "$rec" | jq -r '.preset.archive')"
+
+        # Same definition, second record: the existing archive must not
+        # be rewritten (dedup is free because the key is the hash).
+        before="$(stat -c %y "$arch_dir/$psha.yaml")"
+        sleep 1
+        if HOME="$fakehome" "$run_log" record --run-dir "$rd_a" >/dev/null 2>&1; then
+            after="$(stat -c %y "$arch_dir/$psha.yaml")"
+            check "a second record of the same preset does not rewrite the archive" \
+                "$before" "$after"
+        else
+            no "a second record of the same preset does not rewrite the archive"
+            "second record failed"
+        fi
+    else
+        no "sandbox-run-log.py record archives the preset definition"
+    fi
+
+    # A run dir with preset.json but no preset.yaml (an older run):
+    # records fine, warns, and the entry has no archive key.
+    rd_old="$(mktemp -d /var/tmp/claude-scratch/forks/claude-fork-sandbox.XXXXXX)"
+    tmpdirs+=("$rd_old")
+    cp -a -- "$rd_a/". "$rd_old/"
+    rm -- "$rd_old/preset.yaml"
+    err_old="$tmp/err-preset-old"
+    if HOME="$fakehome" "$run_log" record --run-dir "$rd_old" \
+        >/dev/null 2>"$err_old"; then
+        ok "a run dir without preset.yaml still records"
+        contains "its missing archive is warned on stderr" \
+            "$(cat "$err_old")" "preset not archived"
+        rec_old="$(HOME="$fakehome" "$run_log" show "$(basename "$rd_old")")"
+        check "the entry keeps the provenance but has no preset.archive" \
+            'rep3/null' \
+            "$(printf '%s' "$rec_old" | jq -r '.preset.name + "/" + (.preset.archive // "null")')"
+    else
+        no "a run dir without preset.yaml still records"
+    fi
+else
+    no "sandbox-run-log.py record archives the preset definition" \
+        "prior stubbed run failed, or $run_log is not executable"
+fi
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))

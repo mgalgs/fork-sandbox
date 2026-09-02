@@ -367,6 +367,35 @@ def cmd_record(args):
     preset = load_json_file(os.path.join(rd, "preset.json"))
     if preset is not None:
         rec["preset"] = preset
+        # The definition's bytes AS LAUNCHED, when the run dir carries them:
+        # archive under the sha256 the record already records, so identical
+        # definitions dedup for free and an edited preset's old epochs keep
+        # resolving from the ledger alone. This never reads the live file in
+        # the config dir -- record runs at run end, by which time the preset
+        # may have been edited; the launch-time copy is the only source that
+        # cannot race it.
+        preset_yaml = os.path.join(rd, "preset.yaml")
+        if os.path.isfile(preset_yaml) and not os.path.islink(preset_yaml):
+            dest = os.path.join(
+                ARCHIVE_DIR, "presets",
+                rec["preset"]["sha256"] + ".yaml")
+            try:
+                with open(preset_yaml, "rb") as f:
+                    data = f.read()
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                # A second run of the same definition is a no-op: the key
+                # is the hash, so its existence is the dedup.
+                if not os.path.exists(dest):
+                    with open(dest, "wb") as f:
+                        f.write(data)
+                rec["preset"]["archive"] = dest
+            except (OSError, KeyError) as e:
+                print(f"sandbox-run-log: preset not archived: {e}",
+                      file=sys.stderr)
+        else:
+            # An older run dir: provenance recorded, definition gone.
+            print("sandbox-run-log: preset not archived: no preset.yaml "
+                  "in the run directory", file=sys.stderr)
 
     # The handoff is the prompt, and the run dir it lives in gets deleted
     # after review -- archive it, so prompt iteration has the actual text to
