@@ -282,6 +282,57 @@ refuses "fix seats and repeat are refused with --k8s by name" \
     "preset fix seats and repeat are not yet supported" \
     --preset fast3 --k8s
 
+# The code seat's endpoint: a k8s-only key, so a local launch refuses it
+# before the dry-run exit -- the k8s-side behavior is the stubbed dispatch
+# test in section G.
+cat > "$presets_dir/ep.yaml" <<'EOF'
+agents:
+  coder:
+    harness: claude
+    model: haiku
+    endpoint: llm
+pipeline:
+  - action: code
+    agent: coder
+EOF
+refuses "a local launch of a code-seat endpoint preset is refused" \
+    "only apply with --k8s" \
+    --preset ep
+
+cat > "$presets_dir/ep-bad-seat.yaml" <<'EOF'
+agents:
+  coder:
+    harness: claude
+    model: haiku
+  reviewer:
+    harness: claude
+    model: opus
+    endpoint: llm
+pipeline:
+  - action: code
+    agent: coder
+  - action: review
+    repeat: 1
+    agent: reviewer
+EOF
+refuses "endpoint on a review-only agent is refused and names the agent" \
+    "agents.reviewer" \
+    --preset ep-bad-seat
+
+cat > "$presets_dir/ep-badname.yaml" <<'EOF'
+agents:
+  coder:
+    harness: claude
+    model: haiku
+    endpoint: LLM-1
+pipeline:
+  - action: code
+    agent: coder
+EOF
+refuses "a bad endpoint name shape is refused" \
+    "endpoint names match" \
+    --preset ep-badname
+
 cat > "$presets_dir/codex-fix.yaml" <<'EOF'
 agents:
   coder:
@@ -879,6 +930,51 @@ else
     no "the --k8s launch reaches the stubbed fork-sandbox-k8s.sh, as the test needs" \
         "rc=$rc_k8s out=$(printf '%s' "$out" | head -3) err=$(head -3 "$err_k8s")"
 fi
+
+# G. The code seat's endpoint key compiles onto the --endpoint value the
+# k8s dispatch forwards, and an explicit --endpoint beats the key key by
+# key, announced on stderr. Reuses F's stubbed fork-sandbox-k8s.sh and
+# asserts on the argv the stub prints.
+cat > "$real_presets/ep.yaml" <<'EOF'
+agents:
+  coder:
+    harness: claude
+    model: haiku
+    endpoint: llm
+pipeline:
+  - action: code
+    agent: coder
+EOF
+err_ep="$tmp/err-ep"
+out_ep="$(TMPDIR="$stage_tmp_k8s" PATH="$real_stub:$PATH" \
+    FORK_SANDBOX_CONFIG_DIR="$real_cfg" FORK_SANDBOX_BACKEND=fake-image \
+    timeout 60 "$k8s_scripts/fork-sandbox.sh" --preset ep \
+    --k8s "$proj" "$handoff" 2>"$err_ep")"
+rc_ep=$?
+# The stub prints one argument per line; strip its prefix and join, then
+# match the flag and its value as one string.
+ep_argv="$(printf '%s\n' "$out_ep" | sed 's/^k8s-stub //' | tr '\n' ' ')"
+if (( rc_ep == 0 )) && [[ "$ep_argv" == *"--endpoint llm"* ]]; then
+    ok "a --k8s launch of a code-seat endpoint preset forwards it to fork-sandbox-k8s.sh"
+else
+    no "a --k8s launch of a code-seat endpoint preset forwards it to fork-sandbox-k8s.sh" \
+        "rc=$rc_ep out=$(printf '%s' "$out_ep" | head -3) err=$(head -3 "$err_ep")"
+fi
+err_ep2="$tmp/err-ep2"
+out_ep2="$(TMPDIR="$stage_tmp_k8s" PATH="$real_stub:$PATH" \
+    FORK_SANDBOX_CONFIG_DIR="$real_cfg" FORK_SANDBOX_BACKEND=fake-image \
+    timeout 60 "$k8s_scripts/fork-sandbox.sh" --preset ep \
+    --endpoint other --k8s "$proj" "$handoff" 2>"$err_ep2")"
+rc_ep2=$?
+ep_argv2="$(printf '%s\n' "$out_ep2" | sed 's/^k8s-stub //' | tr '\n' ' ')"
+if (( rc_ep2 == 0 )) && [[ "$ep_argv2" == *"--endpoint other"* ]]; then
+    ok "--endpoint beats the preset's endpoint and forwards the flag"
+else
+    no "--endpoint beats the preset's endpoint and forwards the flag" \
+        "rc=$rc_ep2 out=$(printf '%s' "$out_ep2" | head -3) err=$(head -3 "$err_ep2")"
+fi
+contains "the --endpoint override is announced on stderr" \
+    "$(cat "$err_ep2")" "--endpoint overrides the code seat's endpoint"
 
 # B. A fix seat of its own, with repeat: the review loop's fix legs run the
 # fix agent's model, twice per iteration.

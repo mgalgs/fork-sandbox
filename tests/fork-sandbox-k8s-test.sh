@@ -3182,6 +3182,28 @@ else
         "not found in /tmp/fs-k8s-flag-test-cr.yaml"
 fi
 rm -f /tmp/fs-k8s-flag-test-cr.err /tmp/fs-k8s-flag-test-cr.yaml
+# --endpoint is carried through, not refused -- on a K8S_PROXY_ENDPOINTS
+# install the forwarded flag must reach the render: the Job's PROXY_BASE_URL
+# lands at the named endpoint's /e/<name>/v1 instead of the legacy /api/v1
+# path. Reuses endpoints_config_dir's primary/secondary registry above.
+k8s_flag_ep_out="$(newdir)/k8s-flag-ep.yaml"; tmpdirs+=("$(dirname "$k8s_flag_ep_out")")
+if FORK_SANDBOX_CONFIG_DIR="$endpoints_config_dir" "$fs_sh" --k8s --dry-run \
+    --harness pi --model moonshotai/kimi-k3 --endpoint secondary \
+    --branch fs-k8s-flag-test-ep-branch \
+    "$k8s_flag_proj" "$k8s_flag_handoff" \
+    > "$k8s_flag_ep_out" 2>/tmp/fs-k8s-flag-test-ep.err; then
+    ok "--k8s --endpoint --dry-run exits 0"
+else
+    no "--k8s --endpoint --dry-run exits 0" "$(cat /tmp/fs-k8s-flag-test-ep.err)"
+fi
+if grep -qF 'value: "http://fork-sandbox-proxy.fork-sandbox-test.svc.cluster.local:8080/e/secondary/v1"' "$k8s_flag_ep_out" \
+    && ! grep -qF 'value: "http://fork-sandbox-proxy.fork-sandbox-test.svc.cluster.local:8080/api/v1"' "$k8s_flag_ep_out"; then
+    ok "--k8s --endpoint --dry-run forwards the flag to fork-sandbox-k8s.sh"
+else
+    no "--k8s --endpoint --dry-run forwards the flag to fork-sandbox-k8s.sh" \
+        "$(grep -A1 'name: PROXY_BASE_URL' "$k8s_flag_ep_out")"
+fi
+rm -f /tmp/fs-k8s-flag-test-ep.err
 refuses "--k8s --task-meta is refused as not yet supported" \
     "--task-meta is not yet supported with --k8s" \
     env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
@@ -3312,6 +3334,14 @@ refuses "--outbox-dir without --k8s is refused" \
     "only apply with --k8s" \
     env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --dry-run \
     --outbox-dir /tmp/fs-k8s-flag-test-outbox unused-project unused-handoff
+refuses "--endpoint without --k8s is refused" \
+    "only apply with --k8s" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --dry-run \
+    --endpoint llm unused-project unused-handoff
+refuses "--endpoint with a bad name shape is refused" \
+    "takes a name matching" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --dry-run \
+    --endpoint LLM-1 unused-project unused-handoff
 
 refuses "--k8s refuses a handoff outside the scratch dir" \
     "must live under /var/tmp/claude-scratch" \

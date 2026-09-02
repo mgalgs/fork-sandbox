@@ -16,6 +16,7 @@ fork-sandbox.sh to compile onto its flag variables:
     agent <name> model <value>          (empty value when unset)
     agent <name> claude_args <value>
     agent <name> pi_args <value>
+    agent <name> endpoint <value>       (empty value when unset)
     implement agent <name>
     implement repeat <n>                (only when the code agent repeats)
     implement refresh_at <value>        (from the code agent, when set)
@@ -140,7 +141,8 @@ def main():
         if not isinstance(props, dict):
             fail(f"agents.{name}: expected a mapping of properties")
         agent = {"harness": "", "model": "", "claude_args": "", "pi_args": "",
-                 "repeat": 1, "refresh_at": "", "refresh_max": ""}
+                 "repeat": 1, "refresh_at": "", "refresh_max": "",
+                 "endpoint": ""}
         for prop, value in props.items():
             path = f"agents.{name}.{prop}"
             if prop == "harness":
@@ -172,10 +174,19 @@ def main():
                 agent["repeat"] = positive_int(value, path)
             elif prop in ("refresh-at", "refresh-max"):
                 agent[prop.replace("-", "_")] = scalar(value, path)
+            elif prop == "endpoint":
+                # The named K8S_PROXY_ENDPOINTS entry this seat talks to on a
+                # --k8s run; the engine-shape rule below is what keeps it on
+                # the code seat's agent only.
+                value = scalar(value, path)
+                if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", value):
+                    fail(f"{path}: endpoint names match "
+                         f"^[a-z0-9][a-z0-9_-]*$")
+                agent["endpoint"] = value
             else:
                 fail(f"{path}: unknown agent property; agents take 'harness', "
                      f"'model', 'claude-args', 'pi-args', 'repeat', "
-                     f"'refresh-at' and 'refresh-max'")
+                     f"'refresh-at', 'refresh-max' and 'endpoint'")
         if not agent["harness"]:
             fail(f"agents.{name}: has no harness")
         agents[name] = agent
@@ -282,6 +293,10 @@ def main():
             fail(f"agents.{name}: has 'repeat' but never codes -- repeat "
                  f"re-runs coding legs, and this agent sits neither the "
                  f"code seat nor a fix seat")
+        if agent["endpoint"] and name != impl_agent:
+            fail(f"agents.{name}: has 'endpoint' but does not sit the code "
+                 f"seat -- the run has one proxy base URL for the whole "
+                 f"run, so only the code seat's endpoint can be honored")
         if agent["harness"] == "pi" and not agent["model"] and name in seated:
             fail(f"agents.{name}: harness pi needs a model -- pi has no "
                  f"default of its own")
@@ -291,7 +306,8 @@ def main():
     # ---- emit ----
     out = []
     for name, agent in agents.items():
-        for prop in ("harness", "model", "claude_args", "pi_args"):
+        for prop in ("harness", "model", "claude_args", "pi_args",
+                    "endpoint"):
             out.append(f"agent\t{name}\t{prop}\t{agent[prop]}")
     out.append(f"implement\tagent\t{impl_agent}")
     if impl["repeat"] != 1:

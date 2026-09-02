@@ -189,6 +189,12 @@
 #                        fork-sandbox-k8s.sh run). Defaults to
 #                        /var/tmp/claude-scratch/forks/k8s-<safe-branch>/outbox.
 #                        Refused without --k8s.
+# --endpoint <name>:     with --k8s, which named K8S_PROXY_ENDPOINTS entry
+#                        the pod talks to (passed to fork-sandbox-k8s.sh
+#                        run, which resolves it against the registered
+#                        endpoints). A preset's code seat may carry an
+#                        endpoint key that --endpoint overrides, like every
+#                        other preset key. Refused without --k8s.
 # --outbox-max <size>:   raise the outbox size cap above the default 64 MiB.
 #                        Takes a plain byte count or a size with a K/M/G
 #                        suffix (512K, 256M, 2G). Applies to both the local
@@ -1194,6 +1200,7 @@ k8s_mode=false
 k8s_timeout=""
 k8s_keep=false
 k8s_outbox_dir=""
+k8s_endpoint=""
 outbox_max_arg=""
 
 while [[ "${1:-}" == -* ]]; do
@@ -1328,6 +1335,17 @@ while [[ "${1:-}" == -* ]]; do
             k8s_outbox_dir="${2:?--outbox-dir requires a path}"
             shift 2
             ;;
+        --endpoint)
+            k8s_endpoint="${2:?--endpoint requires a name}"
+            if [[ ! "$k8s_endpoint" =~ ^[a-z0-9][a-z0-9_-]*$ ]]; then
+                echo "Error: --endpoint takes a name matching ^[a-z0-9][a-z0-9_-]*\$," >&2
+                echo "not '$k8s_endpoint'. It names a K8S_PROXY_ENDPOINTS" >&2
+                echo "entry, which are named in that shape (see" >&2
+                echo "fork-sandbox-k8s.sh)." >&2
+                exit 1
+            fi
+            shift 2
+            ;;
         --outbox-max)
             outbox_max_arg="${2:?--outbox-max requires a size}"
             shift 2
@@ -1407,6 +1425,7 @@ if [[ -n "$preset_name" ]]; then
     declare -A preset_agent_model=()
     declare -A preset_agent_cargs=()
     declare -A preset_agent_pargs=()
+    declare -A preset_agent_endpoint=()
     preset_impl_agent=""
     preset_impl_refresh_at=""
     preset_impl_refresh_max=""
@@ -1457,6 +1476,7 @@ if [[ -n "$preset_name" ]]; then
                     model) preset_agent_model[$preset_f2]="$preset_f4" ;;
                     claude_args) preset_agent_cargs[$preset_f2]="$preset_f4" ;;
                     pi_args) preset_agent_pargs[$preset_f2]="$preset_f4" ;;
+                    endpoint) preset_agent_endpoint[$preset_f2]="$preset_f4" ;;
                 esac
                 ;;
             implement)
@@ -1571,6 +1591,20 @@ if [[ -n "$preset_name" ]]; then
             else
                 pi_extra_args="${preset_agent_pargs[$preset_impl_agent]}"
             fi
+        fi
+    fi
+
+    # The code seat's endpoint, landing in the same variable --endpoint
+    # sets, before any validation below runs. Unlike the seat's model,
+    # arguments and repeat it survives a --harness override: which named
+    # proxy endpoint the pod talks to is a fact about this run's cluster,
+    # not about the agent the preset named. An explicit flag beats the key,
+    # the same key-by-key rule, announced on stderr.
+    if [[ -n "${preset_agent_endpoint[$preset_impl_agent]}" ]]; then
+        if [[ -n "$k8s_endpoint" ]]; then
+            preset_note "--endpoint overrides the code seat's endpoint"
+        else
+            k8s_endpoint="${preset_agent_endpoint[$preset_impl_agent]}"
         fi
     fi
 
@@ -2169,6 +2203,7 @@ if [[ "$k8s_mode" == true ]]; then
     # nothing to duplicate here.
     [[ -n "$review_loop_arg" ]] && k8s_argv+=(--review-loop "$review_loop_arg")
     [[ -n "$review_model" ]] && k8s_argv+=(--review-model "$review_model")
+    [[ -n "$k8s_endpoint" ]] && k8s_argv+=(--endpoint "$k8s_endpoint")
     [[ -n "$k8s_outbox_dir" ]] && k8s_argv+=(--outbox-dir "$k8s_outbox_dir")
     # Forwarded as the raw string, not the byte count already parsed above:
     # fork-sandbox-k8s.sh does its own parsing, so there is one source of
@@ -2188,8 +2223,9 @@ if [[ "$k8s_mode" == true ]]; then
     exec "$script_dir/fork-sandbox-k8s.sh" "${k8s_argv[@]}"
 fi
 
-if [[ -n "$k8s_timeout" || "$k8s_keep" == true || -n "$k8s_outbox_dir" ]]; then
-    echo "Error: --timeout, --keep and --outbox-dir only apply with --k8s," >&2
+if [[ -n "$k8s_timeout" || "$k8s_keep" == true || -n "$k8s_outbox_dir" \
+    || -n "$k8s_endpoint" ]]; then
+    echo "Error: --timeout, --keep, --outbox-dir and --endpoint only apply with --k8s," >&2
     echo "which passes them on to fork-sandbox-k8s.sh run. Add --k8s, or drop" >&2
     echo "the flag." >&2
     exit 1
