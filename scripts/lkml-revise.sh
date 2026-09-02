@@ -312,6 +312,15 @@ real_branch="$(jq -r '.branch' "$run_dir/summary.json")"
 commits="$(jq -r '.commits' "$run_dir/summary.json")"
 fetched="$(jq -r '.fetched' "$run_dir/summary.json")"
 
+# A bare pi-local seat names no model -- the endpoint picks one -- and
+# `post`/`init` refuse an empty --model. The run's summary records what
+# the endpoint actually served; stamp that (same fallback as
+# lkml-round.sh's harvest and lkml-cover.sh's init).
+if [[ -z "$model" ]]; then
+    model="$(jq -r '.model // empty' "$run_dir/summary.json" 2>/dev/null || true)"
+fi
+[[ -n "$model" ]] || model="unknown"
+
 # Harvest one .git/lkml-out/*.msg file as a reply from the author persona.
 # Kept as a function, not inline, specifically so its per-message state
 # (reply_to, subject, tags, in_headers) is `local` and cannot leak between

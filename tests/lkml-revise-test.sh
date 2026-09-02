@@ -89,6 +89,12 @@ git -C "$real_repo" checkout - -q
 
 # A minimal v1 series to revise.
 work="$(mktemp -d)"; tmpdirs+=("$work")
+# The launcher resolves its seats file from $HOME by default -- pin a
+# controlled HOME and an empty LKML_SEATS_FILE so neither a real
+# ~/.config/fork-sandbox/lkml-seats.yaml nor the machine's own HOME can
+# leak in (tests/lkml-seats-test.sh does the same).
+home_dir="$work/home"; mkdir -p -- "$home_dir"
+export HOME="$home_dir" LKML_SEATS_FILE=''
 export LKML_MAILBOX_ROOT; LKML_MAILBOX_ROOT="$(mktemp -d)"; tmpdirs+=("$LKML_MAILBOX_ROOT")
 cd "$work" || exit 1
 printf 'Add the frobnicator\n\nBody.\n' > cover.txt
@@ -218,6 +224,34 @@ if grep -qx -- '--services-trust-ref' "$run_prefix_dir/last-args"; then
 else
     ok "no --services-trust-ref forwarded when the flag is absent"
 fi
+
+printf '\n== bare seat: an empty model falls back before stamping the mailbox ==\n'
+# --model-override with a BARE harness drops the persona's frontmatter
+# model, so the mailbox stamp must fall back to the run summary's model
+# (the stub writes none) and then 'unknown' -- never an empty --model,
+# which lkml-mailbox.sh refuses and which lost the harvested replies.
+write_stub 1 true 1 1
+out="$(PATH="$stub_bin:$PATH" "$revise" widget-frob --project "$real_repo" \
+    --checkout somebranch --version 4 --base "$series_base_sha" \
+    --model-override pi-local 2>&1)"
+rc=$?
+check "bare override exits 0 and posts v5" "0" "$rc"
+contains "bare override harvests the reply" "$out" "harvested 1 repl"
+contains "bare override posts v5" "$out" "posted v5"
+case "$out" in
+    *"failed to post"*|*"init failed"*) no "bare override never refuses the mailbox stamp" "$out" ;;
+    *) ok "bare override never refuses the mailbox stamp" ;;
+esac
+n_pi=0; n_pi_unknown=0; bare_reply=0
+while IFS= read -r f; do
+    grep -q -- 'X-AI-Harness: pi-local' "$f" || continue
+    n_pi=$(( n_pi + 1 ))
+    grep -q -- 'X-AI-Model: unknown' "$f" && n_pi_unknown=$(( n_pi_unknown + 1 ))
+    grep -q -- 'Fixed, see v2' "$f" && bare_reply=1
+done < <(find "$LKML_MAILBOX_ROOT/widget-frob/cur" -name '*.msg')
+check "the bare seat posted the harvested reply and v5's three messages" "4" "$n_pi"
+check "every bare-seat message is stamped with the fallback model" "$n_pi" "$n_pi_unknown"
+check "the harvested reply landed with the bare seat" "1" "$bare_reply"
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 (( fail == 0 )) || exit 1
