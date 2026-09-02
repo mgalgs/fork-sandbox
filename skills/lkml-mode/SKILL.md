@@ -50,7 +50,11 @@ scheduling, not reading, and the reviewers' job is reading.
   their headers, with [PATCH] bodies keeping the commit message and diffstat,
   the diff cut at the first `diff --git`) — the view for agents and `grep`
   that would otherwise
-  fight 500KB of markup.
+  fight 500KB of markup. When the series dir holds the summarizer's
+  outputs, the render carries them: a per-version results card per
+  `results-v<N>.md` and a page-level series-summary card for
+  `results-series.md` in HTML, the same sections as blocks in `--text`;
+  without the files the render is unchanged.
 - **`lkml-round.sh`** — launches one sandboxed run per persona, in
   parallel, either reviewing the whole series fresh or replying to
   specific threads you name with `--reply-to`. Every run's replies are
@@ -86,7 +90,21 @@ scheduling, not reading, and the reviewers' job is reading.
   overridable with `--high`/`--low` or a
   `~/.config/fork-sandbox/lkml-summarize.env` file; a bare harness
   (e.g. `--high pi-local`) passes through bare, exactly like a reviewer
-  persona's.
+  persona's. `--series` instead summarizes the whole series with one
+  synthesis-only run: the handoff carries every recorded version's
+  `results-v<N>.json` verbatim in version order plus each version's tally
+  section and the latest version's cover letter, and the model writes the
+  story — the arc in a few lines, one short paragraph per version, and the
+  open items and recommended next actions. Every recorded version must
+  already have its `results-v<N>.json` (the refusal names each missing one
+  and the remedial `--version <N>` run), because extraction is the only
+  source of the tags, claim statuses and duplicate facts a series story
+  may cite — so every version must be summarized before `--series`
+  can run. `--series` refuses `--version` (pick one) and `--low` (there is
+  no extraction tier), and its outbox file lands as
+  `results-series.md` — a page-level "series summary" card right after the
+  masthead in the HTML render and a `series-summary` block at the top of
+  the `--text` render.
 - **`lkml-series.sh`** — for reviewing work AFTER it already shipped: given
   `<base>..<tip>` that already landed (a merge commit, a pile of WIP
   commits, whatever), launches the author persona once to recreate the
