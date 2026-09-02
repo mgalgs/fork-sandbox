@@ -1201,6 +1201,7 @@ k8s_timeout=""
 k8s_keep=false
 k8s_outbox_dir=""
 k8s_endpoint=""
+k8s_endpoint_given=false
 outbox_max_arg=""
 
 while [[ "${1:-}" == -* ]]; do
@@ -1337,11 +1338,17 @@ while [[ "${1:-}" == -* ]]; do
             ;;
         --endpoint)
             k8s_endpoint="${2:?--endpoint requires a name}"
-            if [[ ! "$k8s_endpoint" =~ ^[a-z0-9][a-z0-9_-]*$ ]]; then
-                echo "Error: --endpoint takes a name matching ^[a-z0-9][a-z0-9_-]*\$," >&2
-                echo "not '$k8s_endpoint'. It names a K8S_PROXY_ENDPOINTS" >&2
-                echo "entry, which are named in that shape (see" >&2
-                echo "fork-sandbox-k8s.sh)." >&2
+            k8s_endpoint_given=true
+            # The RFC 1123 label shape fork-sandbox-k8s.sh's
+            # parse_proxy_endpoints registers names under: no underscore,
+            # no trailing hyphen. Validate the same shape here, so a name
+            # the registry can never hold fails at parse with the right
+            # reason instead of at submit with 'not registered'.
+            if [[ ! "$k8s_endpoint" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]]; then
+                echo "Error: --endpoint takes a name matching ^[a-z0-9]([a-z0-9-]*[a-z0-9])?\$," >&2
+                echo "not '$k8s_endpoint'. It names a K8S_PROXY_ENDPOINTS entry, and" >&2
+                echo "fork-sandbox-k8s.sh refuses to register a name that does not" >&2
+                echo "match that shape (it becomes a /e/<name>/v1 path segment)." >&2
                 exit 1
             fi
             shift 2
@@ -2228,6 +2235,13 @@ if [[ -n "$k8s_timeout" || "$k8s_keep" == true || -n "$k8s_outbox_dir" \
     echo "Error: --timeout, --keep, --outbox-dir and --endpoint only apply with --k8s," >&2
     echo "which passes them on to fork-sandbox-k8s.sh run. Add --k8s, or drop" >&2
     echo "the flag." >&2
+    # The preset's endpoint key lands in the same variable --endpoint sets
+    # (an explicit flag wins when both are present), so when the preset
+    # supplied it, "drop the flag" names a flag the user never passed.
+    if [[ -n "$k8s_endpoint" && "$k8s_endpoint_given" != true ]]; then
+        echo "(The endpoint '$k8s_endpoint' came from the code seat of" >&2
+        echo "preset '$preset_name', not a flag.)" >&2
+    fi
     exit 1
 fi
 

@@ -179,9 +179,12 @@ def main():
                 # --k8s run; the engine-shape rule below is what keeps it on
                 # the code seat's agent only.
                 value = scalar(value, path)
-                if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", value):
+                # The RFC 1123 label shape fork-sandbox-k8s.sh's
+                # parse_proxy_endpoints registers names under: no
+                # underscore, no trailing hyphen.
+                if not re.fullmatch(r"[a-z0-9]([a-z0-9-]*[a-z0-9])?", value):
                     fail(f"{path}: endpoint names match "
-                         f"^[a-z0-9][a-z0-9_-]*$")
+                         f"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$")
                 agent["endpoint"] = value
             else:
                 fail(f"{path}: unknown agent property; agents take 'harness', "

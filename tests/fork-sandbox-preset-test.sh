@@ -298,6 +298,10 @@ EOF
 refuses "a local launch of a code-seat endpoint preset is refused" \
     "only apply with --k8s" \
     --preset ep
+contains "the refusal names the preset that supplied the endpoint, not a flag to drop" \
+    "$(cat "$err")" "The endpoint 'llm' came from"
+contains "the refusal says the endpoint came from the preset's code seat" \
+    "$(cat "$err")" "preset 'ep', not a flag."
 
 cat > "$presets_dir/ep-bad-seat.yaml" <<'EOF'
 agents:
@@ -332,6 +336,23 @@ EOF
 refuses "a bad endpoint name shape is refused" \
     "endpoint names match" \
     --preset ep-badname
+
+cat > "$presets_dir/ep-badname2.yaml" <<'EOF'
+agents:
+  coder:
+    harness: claude
+    model: haiku
+    endpoint: my_ep
+pipeline:
+  - action: code
+    agent: coder
+EOF
+# An underscore is legal in an agent name but not in a K8S_PROXY_ENDPOINTS
+# registration, so this used to pass every validation and only die at
+# submit as 'not registered'.
+refuses "an underscore in a preset endpoint name is refused" \
+    "endpoint names match" \
+    --preset ep-badname2
 
 cat > "$presets_dir/codex-fix.yaml" <<'EOF'
 agents:

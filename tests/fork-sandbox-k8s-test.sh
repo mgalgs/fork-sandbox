@@ -3342,6 +3342,17 @@ refuses "--endpoint with a bad name shape is refused" \
     "takes a name matching" \
     env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --dry-run \
     --endpoint LLM-1 unused-project unused-handoff
+# Names parse_proxy_endpoints would itself refuse (underscore, trailing
+# hyphen) must be refused at the same shape, not only at submit as
+# 'not registered'.
+refuses "--endpoint with an underscore is refused as a bad shape" \
+    "takes a name matching" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --dry-run \
+    --endpoint my_ep unused-project unused-handoff
+refuses "--endpoint with a trailing hyphen is refused as a bad shape" \
+    "takes a name matching" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --dry-run \
+    --endpoint a- unused-project unused-handoff
 
 refuses "--k8s refuses a handoff outside the scratch dir" \
     "must live under /var/tmp/claude-scratch" \
