@@ -535,13 +535,17 @@
 # --review-model, since a habit-typed --model-shaped value like "opus" would
 # otherwise only fail after a paid coding leg instead of at validation.
 #
-# --context-ro is the other capability that IS carried: --k8s forwards it to
-# fork-sandbox-k8s.sh run, which threads it to cmd_submit the same way a
-# local run's own --context-ro reaches the sandbox -- see 'Getting files in'
-# in docs/kubernetes-runs.md. cmd_submit applies the same directory-under-
-# /var/tmp/claude-scratch/forks/, no-symlinks, 256 MiB constraints itself, so
-# there is nothing left for this script's own local-path check, below, to
-# duplicate for a --k8s run -- it never reaches that check at all.
+# --context-ro and --endpoint are the remaining capabilities that ARE
+# carried: --k8s forwards --context-ro to fork-sandbox-k8s.sh run, which
+# threads it to cmd_submit the same way a local run's own --context-ro
+# reaches the sandbox -- see 'Getting files in' in docs/kubernetes-runs.md.
+# cmd_submit applies the same directory-under-/var/tmp/claude-scratch/forks/,
+# no-symlinks, 256 MiB constraints itself, so there is nothing left for this
+# script's own local-path check, below, to duplicate for a --k8s run -- it
+# never reaches that check at all. --endpoint names which
+# K8S_PROXY_ENDPOINTS entry the pod talks to, and it rides the same
+# dispatch: forwarded as-is, resolved against the registry on the
+# fork-sandbox-k8s.sh side, where the registered names are known.
 #
 # One gap is not a refused flag, because no flag controls it: a --k8s run
 # never appends to the durable run log described below

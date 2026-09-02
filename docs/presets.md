@@ -104,12 +104,15 @@ An agent is a named seat: who types, on what, and how. Names match
 | `refresh-at` / `refresh-max` | context refresh for this agent's coding, same values and claude-only rule as the flags of these names. |
 | `endpoint` | which named `K8S_PROXY_ENDPOINTS` entry the seat talks to on a `--k8s` run, passed on to `fork-sandbox-k8s.sh run`, which resolves it against the registered endpoints. Refused on an agent that does not sit the code seat — the run has one proxy base URL for the whole run — and refused without `--k8s`: it names a cluster proxy path and means nothing locally. |
 
-Three of these reach less far than an agent definition suggests, and the
+Four of these reach less far than an agent definition suggests, and the
 parser refuses the cases the engine cannot honor rather than trimming
 them silently: `claude-args`/`pi-args` reach only the first code seat's
 legs (there is no per-seat argument plumbing for any other leg yet), the
-refresh keys reach only the first code seat's *first pass*, and `repeat`
-is refused on an agent that never codes.
+refresh keys reach only the first code seat's *first pass*, `repeat`
+is refused on an agent that never codes, and `endpoint` is refused on
+an agent that does not sit the code seat (the run has one proxy base
+URL for the whole run) and without `--k8s` (it names a cluster proxy
+path and means nothing there).
 
 ### `pipeline`
 
