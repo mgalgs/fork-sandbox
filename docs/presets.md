@@ -102,6 +102,7 @@ An agent is a named seat: who types, on what, and how. Names match
 | `pi-args` | extra arguments for pi — e.g. `--thinking low`. |
 | `repeat` | run every coding leg this agent sits — the code step, or a loop's fix legs — as N passes on the same prompt. See "Repeat passes" below. |
 | `refresh-at` / `refresh-max` | context refresh for this agent's coding, same values and claude-only rule as the flags of these names. |
+| `endpoint` | which named `K8S_PROXY_ENDPOINTS` entry the seat talks to on a `--k8s` run, passed on to `fork-sandbox-k8s.sh run`, which resolves it against the registered endpoints. Refused on an agent that does not sit the code seat — the run has one proxy base URL for the whole run — and refused without `--k8s`: it names a cluster proxy path and means nothing locally. |
 
 Three of these reach less far than an agent definition suggests, and the
 parser refuses the cases the engine cannot honor rather than trimming
@@ -205,8 +206,10 @@ edges are the flags' own — plus the edges of the two preset-only knobs:
   cluster path refuses (a `maintain` step, `claude-args`, `pi-args`, the
   refresh keys) is refused exactly as those flags are, and fix seats and
   `repeat` are refused there by name too: the pod's own review loop runs
-  its fix legs on the coding model, once each. A cluster run wants a
-  preset shaped for the cluster.
+  its fix legs on the coding model, once each. A code seat may carry an
+  `endpoint` key, which wires the run to that named proxy endpoint on a
+  `K8S_PROXY_ENDPOINTS` install, with `--endpoint` overriding it like
+  every other key. A cluster run wants a preset shaped for the cluster.
 - **`--review-only` refuses review and maintainer flags**, so it refuses
   a preset that carries loops — and one whose code seat repeats, since
   there is no coding leg to repeat. A preset with only a code step works
@@ -218,7 +221,7 @@ edges are the flags' own — plus the edges of the two preset-only knobs:
   cache) says `sol` means on the day of the run.
 - **Validation messages speak flag vocabulary** where a flag exists. The
   mapping is one-to-one: code seat ⇢ `--harness`/`--model`/
-  `--claude-args`/`--pi-args`, the review step ⇢ `--review-harness`/
+  `--claude-args`/`--pi-args`/`--endpoint`, the review step ⇢ `--review-harness`/
   `--review-model`/`--review-loop`, the maintain step ⇢ the maintainer
   trio, refresh keys ⇢ `--refresh-at`/`--refresh-max`.
 
