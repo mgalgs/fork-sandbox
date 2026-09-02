@@ -319,8 +319,12 @@ pipeline:
     repeat: 1
     agent: reviewer
 EOF
+# The needle spans the agent name AND the endpoint seat rule: a bare
+# 'agents.reviewer' would match any per-agent parser error, so this
+# refusal would still pass the test if the endpoint rule were deleted
+# and some other refusal fired.
 refuses "endpoint on a review-only agent is refused and names the agent" \
-    "agents.reviewer" \
+    "agents.reviewer: has 'endpoint' but does not sit the code seat" \
     --preset ep-bad-seat
 
 cat > "$presets_dir/ep-badname.yaml" <<'EOF'
