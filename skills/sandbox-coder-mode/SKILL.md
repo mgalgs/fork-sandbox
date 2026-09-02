@@ -1,7 +1,7 @@
 ---
 name: sandbox-coder-mode
 description: Enter a standing mode where this session stops writing code and delegates every coding and editing task to an unattended fork-sandbox run, acting as orchestrator, reviewer and integrator. Use when the user wants an expensive model to plan and review while cheap or self-hosted models do the typing, or wants unattended editing to happen somewhere that is not their own checkout. Stays on until the user ends it.
-argument-hint: [off] — no argument turns the mode on. Pass "off" (or say so in plain words) to end it. "--long" is accepted and changes nothing: the long-horizon discipline is the default — see "Running long".
+argument-hint: [off|--auto-preset-router] — no argument turns the mode on. Pass "off" (or say so in plain words) to end it. "--auto-preset-router" lets the orchestrator route each round to the machine preset that fits the task — see "The auto-preset router". "--long" is accepted and changes nothing: the long-horizon discipline is the default — see "Running long".
 user-invocable: true
 ---
 
@@ -79,6 +79,19 @@ it can override and what a missing file means. The announcement below
 names those defaults in one clause, worded from what was actually read, not
 from the example text here, so a machine whose config overrides them
 announces what it will actually do.
+
+When the file sets `CODER_MODE_PRESET`, the composition lives in
+`~/.config/fork-sandbox/presets/<name>.yaml` instead of in per-flag keys:
+read that file too, and word the announcement from what it says — see
+**The machine's composition can be a preset** for the key's rules.
+
+When the mode is invoked with `--auto-preset-router` (or the machine sets
+`CODER_MODE_AUTO_PRESET_ROUTER=1`), also list
+`~/.config/fork-sandbox/presets/` and read every preset there — the header
+comment is its author's statement of intent, the `agents`/`pipeline` body
+is what it actually runs — and name the roster in the announcement, so the
+user hears which presets rounds will be routed among. See **The
+auto-preset router** for the routing rules.
 
 Tell the user, in one or two lines, stating plainly that this session will
 stay high level:
@@ -341,6 +354,17 @@ single launch.
 
 ```bash
 fork-sandbox.sh --harness claude --model sonnet --review-model opus --review-loop 2 \
+    --branch "<branch>" \
+    --task-meta '{"kind":"implement","difficulty":3,"size":"m","prompt_template_id":"<slug>"}' \
+    "<project-path>" "<handoff-file>"
+```
+
+On a machine whose `coder-mode.env` names a preset, the composition flags
+collapse into it — the task-shaped flags stay on the command line, since a
+preset deliberately cannot carry them (see `docs/presets.md`):
+
+```bash
+fork-sandbox.sh --preset <name> \
     --branch "<branch>" \
     --task-meta '{"kind":"implement","difficulty":3,"size":"m","prompt_template_id":"<slug>"}' \
     "<project-path>" "<handoff-file>"
@@ -697,6 +721,25 @@ does not write it either — its target allowlist is deliberately hardcoded
 (see [configure.md](../../docs/configure.md)); this file is written by
 hand, by whoever set up the machine.
 
+### The machine's composition can be a preset
+
+`CODER_MODE_PRESET=<name>` replaces the whole table above: the composition
+then lives in `~/.config/fork-sandbox/presets/<name>.yaml` (the format and
+override rules are `docs/presets.md`), and every launch passes `--preset
+<name>` in place of the per-flag spelling. The per-flag keys must not also
+be set — a file carrying both is a config error to surface to the user,
+never to resolve silently, because two sources for one composition is
+exactly what this key exists to remove. `coder-mode.env` then holds only
+the pointer, plus any mode keys that are not composition (the router key,
+for one).
+
+Everything else in this section applies unchanged. A per-round deviation
+is flags stacked on top of `--preset` — a flag beats its preset
+counterpart key by key, and a harness override drops that seat's preset
+model, arguments and repeat ("Flags override, key by key" in
+`docs/presets.md`) — announced with its reason exactly as before, and the
+review composition is still never lowered: see the next sections.
+
 ### Reasons to deviate for one round
 
 Pick per task, and say why in one line when you launch:
@@ -752,6 +795,40 @@ ceremony:
 
 A launch at the default needs no such line. A launch that deviates and
 does not carry one is a launch the user cannot audit.
+
+### The auto-preset router
+
+`--auto-preset-router` on the mode's invocation — or
+`CODER_MODE_AUTO_PRESET_ROUTER=1` in `coder-mode.env` as the machine
+default — moves one decision, *which preset*, from the user to the
+orchestrator. On entering the mode, read every preset in
+`~/.config/fork-sandbox/presets/` (see **Entering the mode**). Then route
+each round to the preset whose shape fits the task's — the same judgement
+`--task-meta` already records: a mechanical sweep or rename to the
+cheapest single-leg preset, an ordinary implement to the machine's
+default, a change that modifies code other things already run through to
+the deepest composition available (one with a maintain step, when one
+exists).
+
+This does not repeal the previous section; it relocates it. Every preset
+in the roster was authored by the user for this machine — that authorship
+is the consent the previous section demands — and the router picks whole
+presets, never composes flags of its own and never edits a preset
+downward. Two rules keep it auditable:
+
+- **Announce every routing decision.** One line at launch: the preset
+  chosen and the task-shape reason. A routed launch always gets the line,
+  even to the default preset — with the router on, silence would leave
+  the user unable to tell a decision from a habit.
+- **Doubt resolves upward.** When the task's shape is ambiguous, or no
+  preset fits it, launch on the machine's default composition — never on
+  a cheaper preset because the task "looks small". The one permitted
+  deviation above (upward on the implementer, never downward on the
+  review) binds the router exactly as it binds a flag deviation.
+
+Without the flag or the env key, nothing changes: the machine's one
+composition is the default for every round, and preset choice is not the
+orchestrator's to make.
 
 **Pin `--model` on every claude run.** Without it the run takes the host's
 default, which is the expensive model this session is likely running on —
