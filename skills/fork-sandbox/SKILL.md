@@ -1,7 +1,7 @@
 ---
 name: fork-sandbox
 description: Fork a task to an unattended Claude Code session in a sandboxed clone of the repo. Headless, so it needs no keypress, exits on its own, fetches its branch back, and logs every event to a file this session can watch. A running session can still be steered with fork-sandbox-say.sh, which sends it an operator addendum. Use when work should run without babysitting — a refactor, a test sweep, a long build.
-argument-hint: [--branch <name>] [--checkout <ref>] [--review-only] [--review-base <ref>] [--model <model>] [--harness <harness>[/<model>]] [--review-loop <N>] [--review-model <model>] [--maintainer-loop <N>] [--maintainer-model <model>] [--maintainer-harness <harness>[/<model>]] [--refresh-at <fraction|tokens>] [--refresh-max <n>] [--sandbox-args "..."] [--outbox-max <size>] [--k8s [--timeout <seconds>] [--keep]] <project-path> — path to the target project (omit or use "." for the current repo). Use --branch to name the branch the session commits on. Use --model to pick the model (fable, opus, sonnet) or append it to the harness. Use --harness pi to run pi against OpenRouter, which then requires a model; --harness pi-local to run pi against a self-hosted endpoint in a sandbox with no network at all, which costs nothing; or --harness codex to run OpenAI codex on your ChatGPT sign-in. Use --review-loop N to have a fresh session review the run's commits and a third session fix what it found, up to N times; --review-model selects a different model for review legs only. Use --maintainer-loop N (with a required --maintainer-model — its verdict is the run's last word on the branch, so it has no default) to run the tier that decides whether the branch lands, after the review loop when both are given: a fresh session reviews the branch the way a maintainer judging a pull request would — the surrounding code, not just the diff — and a fix session commits what it finds, up to N times; --maintainer-harness takes the same claude/pi/pi-local/codex choices as --review-harness. --refresh-at (default 0.5, claude only) nudges a session to hand off to a fresh one when its context fills up rather than degrade into compaction; 0 disables it, and --refresh-max caps how many continuations may chain (default 6). Use --sandbox-args "--unpin-egress" only when the task must reach the tailnet, a VPN, or a libvirt/docker bridge. Use --outbox-max SIZE to raise the outbox cap above its default 64 MiB (bare digits for bytes, or a K/M/G suffix — no upper ceiling); applies whether or not --k8s is given. Use --k8s to run in a Kubernetes cluster instead of the local sandbox — defaults to --harness pi, also accepts --harness claude (each still needs --model), and refuses most other flags by name; see "Kubernetes runs" below.
+argument-hint: [--branch <name>] [--checkout <ref>] [--review-only] [--review-base <ref>] [--model <model>] [--harness <harness>[/<model>]] [--review-loop <N>] [--review-model <model>] [--maintainer-loop <N>] [--maintainer-model <model>] [--maintainer-harness <harness>[/<model>]] [--preset <name>] [--refresh-at <fraction|tokens>] [--refresh-max <n>] [--sandbox-args "..."] [--outbox-max <size>] [--k8s [--timeout <seconds>] [--keep]] <project-path> — path to the target project (omit or use "." for the current repo). Use --branch to name the branch the session commits on. Use --model to pick the model (fable, opus, sonnet) or append it to the harness. Use --harness pi to run pi against OpenRouter, which then requires a model; --harness pi-local to run pi against a self-hosted endpoint in a sandbox with no network at all, which costs nothing; or --harness codex to run OpenAI codex on your ChatGPT sign-in. Use --review-loop N to have a fresh session review the run's commits and a third session fix what it found, up to N times; --review-model selects a different model for review legs only. Use --maintainer-loop N (with a required --maintainer-model — its verdict is the run's last word on the branch, so it has no default) to run the tier that decides whether the branch lands, after the review loop when both are given: a fresh session reviews the branch the way a maintainer judging a pull request would — the surrounding code, not just the diff — and a fix session commits what it finds, up to N times; --maintainer-harness takes the same claude/pi/pi-local/codex choices as --review-harness. --refresh-at (default 0.5, claude only) nudges a session to hand off to a fresh one when its context fills up rather than degrade into compaction; 0 disables it, and --refresh-max caps how many continuations may chain (default 6). Use --preset <name> to load the whole pipeline shape — who codes, who reviews and maintains, who fixes what each finds (fix_agent), and how many passes a coding agent repeats (repeat) — from ~/.config/fork-sandbox/presets/<name>.yaml instead of spelling it in flags; explicit flags override the preset key by key, and fix seats and repeat are preset-only (see docs/presets.md). Use --sandbox-args "--unpin-egress" only when the task must reach the tailnet, a VPN, or a libvirt/docker bridge. Use --outbox-max SIZE to raise the outbox cap above its default 64 MiB (bare digits for bytes, or a K/M/G suffix — no upper ceiling); applies whether or not --k8s is given. Use --k8s to run in a Kubernetes cluster instead of the local sandbox — defaults to --harness pi, also accepts --harness claude (each still needs --model), and refuses most other flags by name; see "Kubernetes runs" below.
 ---
 
 # Fork Sandbox
@@ -68,6 +68,7 @@ reach it — see "What it gives up".)
        --branch "<branch>" "<path>" "<handoff>"
    fork-sandbox.sh --refresh-at 0 --branch "<branch>" "<path>" "<handoff>"
    fork-sandbox.sh --refresh-at 0.3 --refresh-max 3 --branch "<branch>" "<path>" "<handoff>"
+   fork-sandbox.sh --preset deep --branch "<branch>" "<path>" "<handoff>"
    ```
    Pass `--sandbox-args "--unpin-egress"` only when the task must reach the
    tailnet, a VPN, or a libvirt/docker bridge. It removes a restriction.
@@ -150,6 +151,26 @@ reach it — see "What it gives up".)
    `review-loop.json` does, `<run-dir>/maintainer-verdict-<i>.md` holds
    each verdict verbatim, the summary carries a `maintainer:` line beside
    `review:`'s, and `total_cost_usd` folds the legs in.
+
+   ### `--preset <name>` — the whole pipeline as one word
+
+   A preset file (`~/.config/fork-sandbox/presets/<name>.yaml`, needs
+   PyYAML) defines named agents (harness, model, extra args, and a
+   per-agent `repeat` that turns each of that agent's coding legs into N
+   unconditional passes — a cheap model re-checking its own premature
+   "done") and a pipeline of uniform action steps: a code step, then at
+   most one review step and one maintain step, each with a `repeat` loop
+   cap and an optional `fix_agent` whose seat runs the fix legs on its
+   own harness and model. Launching with `--preset deep` compiles onto
+   the same run the flags build — preset values pass through the
+   identical validation, any explicit flag overrides its preset
+   counterpart key by key, announced on stderr, and fix seats and
+   repeat are preset-only, with no flag equivalent. Check what a preset
+   compiles to with `--dry-run` before spending a run. The file format,
+   the flag mapping and worked examples (`fast`, `cheap-passes`,
+   `smart`, `deep`) are in docs/presets.md. Presets carry only pipeline
+   shape — never task-shaped flags like `--branch`, `--checkout` or
+   `--k8s`, which stay on the command line.
 
    ### `--review-only` — review a branch after the fact
 

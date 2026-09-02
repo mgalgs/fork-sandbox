@@ -356,6 +356,7 @@ pod-side k8s scripts, `sandbox-backend-*` — is plumbing.
 fork-sandbox.sh ~/src/proj /var/tmp/claude-scratch/handoff.md
 fork-sandbox.sh --review-loop 2 --review-model opus ~/src/proj handoff.md
 fork-sandbox.sh --harness pi-local ~/src/proj handoff.md   # sealed: your model, no network
+fork-sandbox.sh --preset deep ~/src/proj handoff.md        # a named pipeline (docs/presets.md)
 
 # Watch it
 fork-sandbox-status.sh <run-dir>              # status at a glance
@@ -515,6 +516,8 @@ what is mounted, what is not, and a numbered list of the gaps.
   discover and install the per-machine config above, and how to add a
   discoverer of your own.
 - [docs/claude-sandboxed.md](docs/claude-sandboxed.md) — the sandbox itself.
+- [docs/presets.md](docs/presets.md) — agents and a pipeline in a named
+  file (`--preset deep`) instead of a fistful of flags.
 - [docs/sandbox-services.md](docs/sandbox-services.md) — the committed
   contract a repo uses to declare its service stack.
 - [docs/permissions.md](docs/permissions.md) — running these without a prompt.

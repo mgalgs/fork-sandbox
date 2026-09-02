@@ -75,9 +75,18 @@ per node, decision logic per edge), there is a middle rung:
   its edges would need. Those two are one project seen from two ends;
   neither should be built separately from the other.
 
-Parked because: one configuration (the three-tier default) still covers
-every round run so far, and a DSL built from a single use case encodes
-that use case's assumptions. Trigger: the second concrete "it'd be nice
-to configure the pipeline this other way" — a shape the leg-list-as-data
-rung cannot express with the nodes that already exist, or a
+The middle rung is built: **presets** ([presets.md](presets.md)) — named
+YAML files defining agents and the pipeline that seats them: a code
+step, then review/maintain loops with a `repeat` cap and a `fix_agent`
+of their own, plus per-agent `repeat` passes for coding legs. Compiled
+onto the existing execution machinery, with flags as per-key overrides —
+and the fix seats and repeat passes are the first knobs with no flag at
+all, new capability landing preset-first as this entry predicted.
+
+Still parked: the general DSL — per-edge decision logic, `feed=`
+wiring beyond return-within-a-tier/forward-between-tiers, summarize
+legs, tiers past two, arbitrary graphs. A DSL built from a single use
+case encodes that use case's assumptions. Trigger: the second concrete
+"it'd be nice to configure the pipeline this other way" — a shape the
+preset vocabulary cannot express with the legs that already exist, or a
 multi-implementer experiment (above) that earns permanence.
