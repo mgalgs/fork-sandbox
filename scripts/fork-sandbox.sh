@@ -1426,25 +1426,28 @@ if [[ -n "$preset_name" ]]; then
     preset_maintain_fix_model=""
     preset_maintain_fix_repeat=1
 
-    # The parser already wrote its error to stderr when this fails.
-    if ! preset_tsv="$(python3 "$script_dir/fork-sandbox-preset-parse.py" \
-        "$preset_file" "$preset_name" "$(display_config_path "$preset_file")")"; then
-        exit 1
-    fi
-    # Snapshot the definition's bytes while the parse above still describes
-    # them: launch resolves the backend, the harness and the clone's base
-    # for a while yet, and a preset edit in that window -- the edit this
-    # provenance exists around -- must not change what the recorded sha256
-    # identifies. The staged file is what the run dir later keeps as
-    # preset.yaml, and preset_sha256 is computed over it, so the hash, the
-    # archived copy and the parsed definition are provably one document.
+    # Stage the definition's bytes before parsing, so the parser, the
+    # hash and the run dir's copy all describe that one staged file, the
+    # live file's single read: launch resolves the backend, the harness
+    # and the clone's base for a while yet, and a preset edit in that
+    # window -- the edit this provenance exists around -- must not change
+    # what the recorded sha256 identifies. The parser takes its <file>
+    # argument only to open it (every message addresses the separate
+    # <name> and <label>), so handing it the staged copy instead of the
+    # live file is behaviour-identical, and the hash, the archived copy
+    # and the parsed definition are one document.
     preset_staged_bytes="$(mktemp "${TMPDIR:-/tmp}/claude-fork-sandbox-preset.XXXXXX")"
-    cp -- "$preset_file" "$preset_staged_bytes"
-    preset_sha256="$(sha256sum -- "$preset_staged_bytes" | cut -d' ' -f1)"
     # A failed launch before the run dir exists never reaches the later
     # trap; this one removes the staged bytes on any such exit. run_cleanup
     # does the same for the endings that do reach it.
     trap preset_stage_cleanup EXIT
+    cp -- "$preset_file" "$preset_staged_bytes"
+    preset_sha256="$(sha256sum -- "$preset_staged_bytes" | cut -d' ' -f1)"
+    # The parser already wrote its error to stderr when this fails.
+    if ! preset_tsv="$(python3 "$script_dir/fork-sandbox-preset-parse.py" \
+        "$preset_staged_bytes" "$preset_name" "$(display_config_path "$preset_file")")"; then
+        exit 1
+    fi
     while IFS=$'\t' read -r preset_f1 preset_f2 preset_f3 preset_f4; do
         [[ -n "$preset_f1" ]] || continue
         case "$preset_f1" in
@@ -2175,6 +2178,13 @@ if [[ "$k8s_mode" == true ]]; then
     [[ -n "$context_ro" ]] && k8s_argv+=(--context-ro "$context_ro")
     k8s_argv+=(--harness "$harness" --branch "$branch" --model "$model" "$project_path" "$handoff_file")
 
+    # This path ends in exec, which replaces the shell image and discards
+    # the EXIT trap the preset staging set -- the same hazard the
+    # --keep-session path calls run_cleanup out for near the end of this
+    # script -- so the staged bytes are removed inline. The k8s run keeps
+    # no run dir and appends no ledger entry, so nothing downstream
+    # needed them.
+    preset_stage_cleanup
     exec "$script_dir/fork-sandbox-k8s.sh" "${k8s_argv[@]}"
 fi
 

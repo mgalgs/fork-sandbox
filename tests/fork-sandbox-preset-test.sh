@@ -646,7 +646,8 @@ cat > "$real_stub/sandbox-backend-fake-image" <<'STUB'
 #!/usr/bin/env bash
 if [[ "${1:-}" == "--capabilities" ]]; then
     # The race test: edit the live definition from inside the launch
-    # window (the parse has read it, the run dir does not exist yet).
+    # window (the definition has been staged, the run dir does not exist
+    # yet).
     if [[ -n "${RACE_PRESET_FILE:-}" \
             && ! -e "${RACE_PRESET_FILE}.edited" ]]; then
         printf '# edited mid-launch\n' >> "$RACE_PRESET_FILE"
@@ -783,9 +784,9 @@ if [[ -n "${rd_a:-}" ]]; then
     check "a noop middle pass does not stop the passes" "3" "$(cat "$count")"
 fi
 
-# D. A definition edited between the parse and the run dir -- the race the
-# provenance exists around: the recorded sha256 must identify the bytes the
-# parse compiled, not the edit, and the run-dir copy must be those bytes.
+# D. A definition edited between the staging and the run dir -- the race the
+# provenance exists around: the recorded sha256 must identify the staged
+# bytes, not the edit, and the run-dir copy must be those bytes.
 # The fake backend's --capabilities probe runs inside that window, so it
 # performs the edit when RACE_PRESET_FILE names the live file.
 race_live="$real_presets/race.yaml"
@@ -806,7 +807,7 @@ rd_d="$(RACE_PRESET_FILE="$race_live" run_stubbed \
 if [[ -n "${rd_d:-}" ]]; then
     contains "the test's race actually happened" \
         "$(cat "$race_live")" "edited mid-launch"
-    check "the recorded sha256 is the parse-time bytes' hash, not the edit's" \
+    check "the recorded sha256 is the staged bytes' hash, not the edit's" \
         "$(sha256sum "$race_orig" | cut -d' ' -f1)" \
         "$(jq -r '.sha256' "$rd_d/preset.json")"
     if cmp -s "$rd_d/preset.yaml" "$race_orig"; then
@@ -846,6 +847,37 @@ if (( rc_stage != 0 )) && [[ -n "$out" || -s "$err_stage" ]]; then
         "$(cat "$err_stage")" "handoff files must live under"
 else
     no "the handoff-boundary launch fails, as the test needs"
+fi
+
+# F. The --k8s dispatch ends in exec, which discards the EXIT trap the
+# preset staging set: a --preset --k8s launch must still leave no staged
+# file in its TMPDIR. The scripts dir is copied with its
+# fork-sandbox-k8s.sh replaced by a stub, so the exec lands somewhere the
+# test controls.
+k8s_scripts="$tmp/k8s-scripts"
+cp -r "$repo_dir/scripts" "$k8s_scripts"
+printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'printf "k8s-stub %s\n" "$@"' \
+    > "$k8s_scripts/fork-sandbox-k8s.sh"
+chmod +x "$k8s_scripts/fork-sandbox-k8s.sh"
+stage_tmp_k8s="$(mktemp -d)"; tmpdirs+=("$stage_tmp_k8s")
+err_k8s="$tmp/err-k8s"
+out="$(TMPDIR="$stage_tmp_k8s" PATH="$real_stub:$PATH" \
+    FORK_SANDBOX_CONFIG_DIR="$real_cfg" FORK_SANDBOX_BACKEND=fake-image \
+    timeout 60 "$k8s_scripts/fork-sandbox.sh" --preset race \
+    --k8s "$proj" "$handoff" 2>"$err_k8s")"
+rc_k8s=$?
+if (( rc_k8s == 0 )) && [[ "$out" == *k8s-stub* ]]; then
+    if [[ -z "$(find "$stage_tmp_k8s" -name 'claude-fork-sandbox-preset.*')" ]]; then
+        ok "a --preset --k8s launch cleans up the staged preset bytes"
+    else
+        no "a --preset --k8s launch cleans up the staged preset bytes" \
+            "$(find "$stage_tmp_k8s" -name 'claude-fork-sandbox-preset.*')"
+    fi
+else
+    no "the --k8s launch reaches the stubbed fork-sandbox-k8s.sh, as the test needs" \
+        "rc=$rc_k8s out=$(printf '%s' "$out" | head -3) err=$(head -3 "$err_k8s")"
 fi
 
 # B. A fix seat of its own, with repeat: the review loop's fix legs run the
