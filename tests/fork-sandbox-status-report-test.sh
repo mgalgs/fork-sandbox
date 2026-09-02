@@ -151,9 +151,11 @@ out="$(timeout 30 "$status" --monitor-terminal "$rd_new" 2>&1)"
 [[ "$out" == *"finished: failed, exit 3, "* && "$out" == *"failed run summary"* ]] \
     || { echo "monitor-terminal missing failed finished line or summary: $out"; exit 1; }
 
-# 5. --monitor-terminal followed by another mode flag is refused, instead
-# of leaving terminal_only straddling modes — a --follow that prints
-# nothing at all.
+# 5. --monitor-terminal combined with another mode flag is refused in
+# either argument order. A mode flag after it would switch the mode out from
+# under terminal_only — a --follow that prints nothing at all, and an
+# explicit --monitor that stays silent for its whole window; a mode flag
+# before it is the same broken combination with the arguments swapped.
 new_run_dir
 printf '%s\n' "$$" > "$rd_new/pid"
 : > "$rd_new/events.jsonl"
@@ -163,4 +165,21 @@ fi
 [[ "$out" == *"cannot be combined with --monitor-terminal"* ]] \
     || { echo "no conflict message: $out"; exit 1; }
 
-echo "7 passed, 0 failed"
+# 5b. The same combination with the arguments swapped: a mode flag before
+# --monitor-terminal used to be silently overridden.
+if out="$(timeout 12 "$status" --follow --monitor-terminal "$rd_new" 2>&1)"; then
+    echo "follow before monitor-terminal was accepted"; exit 1
+fi
+[[ "$out" == *"--monitor-terminal cannot be combined with --follow"* ]] \
+    || { echo "no conflict message (reversed order): $out"; exit 1; }
+
+# 5c. An explicit --monitor after --monitor-terminal is refused too — the
+# one direction the old exemption swallowed, leaving a monitor that prints
+# nothing for its whole window.
+if out="$(timeout 12 "$status" --monitor-terminal --monitor "$rd_new" 2>&1)"; then
+    echo "monitor-terminal plus monitor was accepted"; exit 1
+fi
+[[ "$out" == *"cannot be combined with --monitor-terminal"* ]] \
+    || { echo "no conflict message (explicit monitor): $out"; exit 1; }
+
+echo "9 passed, 0 failed"

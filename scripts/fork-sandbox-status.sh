@@ -34,7 +34,8 @@
 #               that acts on terminal events only. At the terminal state it
 #               prints the final result event, when the session wrote one,
 #               then the same finished line, summary, and report marker
-#               --monitor prints. Cannot be combined with another mode flag.
+#               --monitor prints. Cannot be combined with another mode flag
+#               in either argument order.
 # --follow:     watch the run and print EVERY event, rendered — the same
 #               stream the run's tmux pane shows. For a human at a terminal;
 #               the Monitor tool wants --monitor. Ends like --monitor does,
@@ -88,14 +89,18 @@ die() {
 }
 
 set_mode() {
-    # --monitor-terminal arms terminal_only, which only means anything in
-    # monitor mode. A mode flag after it would switch the mode out from
-    # under that flag (a --follow that prints nothing at all), so refuse
-    # the combination; --monitor-terminal last is the fix.
-    if (( terminal_only )) && [[ "$1" != "monitor" ]]; then
+    # A mode flag after --monitor-terminal would switch the mode out from
+    # under its terminal_only flag — a --follow that prints nothing at all,
+    # a --monitor that stays silent for its whole window — so
+    # --monitor-terminal cannot be combined with another mode flag in either
+    # order. This catches the flag-after case; the flag-before case is caught
+    # where --monitor-terminal is parsed, against the mode flag set_mode
+    # recorded.
+    if (( terminal_only )); then
         die "$2 cannot be combined with --monitor-terminal"
     fi
     mode="$1"
+    explicit_mode="$2"
 }
 
 usage() {
@@ -108,6 +113,10 @@ mode="status"
 events_n=""
 run_dir_arg=""
 terminal_only=0
+# The name of a mode flag already parsed, so --monitor-terminal can refuse
+# to follow one — the reverse of the case set_mode refuses, the same broken
+# combination with the arguments swapped.
+explicit_mode=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -115,7 +124,11 @@ while [[ $# -gt 0 ]]; do
         --json) set_mode json --json; shift ;;
         --log) set_mode log --log; shift ;;
         --monitor) set_mode monitor --monitor; shift ;;
-        --monitor-terminal) mode="monitor"; terminal_only=1; shift ;;
+        --monitor-terminal)
+            [[ -z "$explicit_mode" ]] \
+                || die "--monitor-terminal cannot be combined with $explicit_mode"
+            mode="monitor"; terminal_only=1; shift
+            ;;
         --follow) set_mode follow --follow; shift ;;
         --events)
             set_mode events --events
