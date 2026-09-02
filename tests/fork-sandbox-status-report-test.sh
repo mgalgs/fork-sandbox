@@ -85,10 +85,12 @@ out="$(timeout 12 "$status" --monitor "$rd_new" 2>&1)"
 [[ "$out" == "watching: running, "* ]] || { echo "monitor did not announce a running run: $out"; exit 1; }
 
 # 3. A finished run: --monitor-terminal stays silent until the terminal
-# state, then prints exactly what --monitor prints for it. The finished
-# run already has an exit code, so neither mode announces itself, and
-# --monitor additionally streams the notable events first; compare from
-# the finished: line down.
+# state. The finished run already has an exit code, so neither mode
+# announces itself, and --monitor additionally streams the notable events
+# first. The one terminal line the suppressed stream would have carried is
+# the result event: --monitor-terminal must still flush it, before the
+# finished: line, so the orchestrator sees the session's account. From the
+# finished: line down, the two modes print the same thing.
 new_run_dir
 printf '%s\n' "$$" > "$rd_new/pid"
 cat > "$rd_new/events.jsonl" <<'EOF'
@@ -98,8 +100,10 @@ printf '0\n' > "$rd_new/exit-code"
 printf 'summary body line\n' > "$rd_new/summary.txt"
 mon="$(timeout 30 "$status" --monitor "$rd_new" 2>&1)"
 monterm="$(timeout 30 "$status" --monitor-terminal "$rd_new" 2>&1)"
-[[ "$(head -1 <<<"$monterm")" == "finished: done, exit 0, "* ]] \
-    || { echo "monitor-terminal printed something before the terminal state: $monterm"; exit 1; }
+[[ "$(head -1 <<<"$monterm")" == "== result: success"* ]] \
+    || { echo "monitor-terminal did not flush the result event first: $monterm"; exit 1; }
+[[ "$monterm" == *"session account"* ]] \
+    || { echo "monitor-terminal dropped the session's result text: $monterm"; exit 1; }
 tail_mon="$(sed -n '/^finished:/,$p' <<<"$mon")"
 tail_monterm="$(sed -n '/^finished:/,$p' <<<"$monterm")"
 [[ -n "$tail_mon" ]] || { echo "monitor printed no finished: line: $mon"; exit 1; }
@@ -119,4 +123,16 @@ out="$(timeout 30 "$status" --monitor-terminal "$rd_new" 2>&1)"
 [[ "$out" == *"Nothing was fetched. The clone is still at /tmp/clone"* ]] \
     || { echo "monitor-terminal abandoned report incomplete: $out"; exit 1; }
 
-echo "5 passed, 0 failed"
+# 5. --monitor-terminal followed by another mode flag is refused, instead
+# of leaving terminal_only straddling modes — a --follow that prints
+# nothing at all.
+new_run_dir
+printf '%s\n' "$$" > "$rd_new/pid"
+: > "$rd_new/events.jsonl"
+if out="$(timeout 12 "$status" --monitor-terminal --follow "$rd_new" 2>&1)"; then
+    echo "monitor-terminal plus follow was accepted"; exit 1
+fi
+[[ "$out" == *"cannot be combined with --monitor-terminal"* ]] \
+    || { echo "no conflict message: $out"; exit 1; }
+
+echo "6 passed, 0 failed"

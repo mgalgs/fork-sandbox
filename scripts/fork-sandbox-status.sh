@@ -28,11 +28,13 @@
 #               emits on every terminal state, crashes and abandoned runs
 #               included, so silence never means success.
 # -h, --help:   print this header and exit.
-# --monitor-terminal: like --monitor, but prints nothing until the run
-#               reaches a terminal state, then prints exactly what --monitor
-#               prints for it. For the Monitor tool of an orchestrating
-#               session that acts on terminal events only: every mid-run
-#               line there is a notification that goes nowhere.
+# --monitor-terminal: like --monitor, but with the mid-run stream
+#               suppressed: every mid-run line is a notification that goes
+#               nowhere for the Monitor tool of an orchestrating session
+#               that acts on terminal events only. At the terminal state it
+#               prints the final result event, when the session wrote one,
+#               then the same finished line, summary, and report marker
+#               --monitor prints. Cannot be combined with another mode flag.
 # --follow:     watch the run and print EVERY event, rendered — the same
 #               stream the run's tmux pane shows. For a human at a terminal;
 #               the Monitor tool wants --monitor. Ends like --monitor does,
@@ -85,6 +87,17 @@ die() {
     exit 1
 }
 
+set_mode() {
+    # --monitor-terminal arms terminal_only, which only means anything in
+    # monitor mode. A mode flag after it would switch the mode out from
+    # under that flag (a --follow that prints nothing at all), so refuse
+    # the combination; --monitor-terminal last is the fix.
+    if (( terminal_only )) && [[ "$1" != "monitor" ]]; then
+        die "$2 cannot be combined with --monitor-terminal"
+    fi
+    mode="$1"
+}
+
 usage() {
     # The header block is the documentation: print it from line 2 down to the
     # first non-comment line.
@@ -98,14 +111,14 @@ terminal_only=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --result) mode="result"; shift ;;
-        --json) mode="json"; shift ;;
-        --log) mode="log"; shift ;;
-        --monitor) mode="monitor"; shift ;;
+        --result) set_mode result --result; shift ;;
+        --json) set_mode json --json; shift ;;
+        --log) set_mode log --log; shift ;;
+        --monitor) set_mode monitor --monitor; shift ;;
         --monitor-terminal) mode="monitor"; terminal_only=1; shift ;;
-        --follow) mode="follow"; shift ;;
+        --follow) set_mode follow --follow; shift ;;
         --events)
-            mode="events"
+            set_mode events --events
             events_n="${2:?--events requires a count}"
             shift 2
             ;;
@@ -519,6 +532,16 @@ print_tail_of_log() {
     fi
 }
 
+# In terminal-only mode the notable stream is suppressed for the whole
+# watch, and that stream is the only other place a final result event is
+# printed. Flush it at the terminal state so the output carries the
+# session's own account, exactly as --monitor's does.
+flush_result_if_terminal_only() {
+    if (( terminal_only )) && have_events; then
+        "$formatter" --result "$RUN_FILE_PATH"
+    fi
+}
+
 case "$mode" in
     result)
         report_printed=false
@@ -656,6 +679,7 @@ case "$mode" in
             state="$(run_state)"
             case "$state" in
                 done|failed)
+                    flush_result_if_terminal_only
                     # exit-code is written before the fetch, so wait a bounded
                     # while for the summary the fetch produces.
                     waited=0
@@ -677,6 +701,7 @@ case "$mode" in
                     exit 0
                     ;;
                 abandoned)
+                    flush_result_if_terminal_only
                     printf 'abandoned: the runner is gone and wrote no exit code, after %s\n' \
                         "$(elapsed_human)"
                     printf 'Nothing was fetched. The clone is still at %s\n' "$clone_dir"
