@@ -35,7 +35,29 @@
 #            up on harvesting the stragglers. Default 3600.
 # --model-override <harness>[/<model>] overrides every persona's own
 #            harness/model for this round only -- useful for a cheap
-#            smoke-test round before spending on the real panel.
+#            smoke-test round before spending on the real panel. A BARE
+#            harness (no /model) drops each persona's frontmatter model --
+#            a model name belongs to its harness, the same rule as a
+#            seats-file harness without a model: composing it onto the bare
+#            harness would ask the endpoint for e.g. 'opus' on pi-local
+#            and the leg dies with zero replies (the --model-override 404
+#            lesson); a bare pi-local resolves its model from the endpoint,
+#            a bare claude takes the harness default. A combined
+#            harness/model passes through verbatim. The
+#            persona frontmatter pins are defaults, not policy: this
+#            machine's seats file (LKML_SEATS_FILE, else
+#            ~/.config/fork-sandbox/lkml-seats.yaml) may re-seat any
+#            persona, per persona, key by key -- precedence
+#            --model-override > seats personas.<p> > seats default: >
+#            frontmatter (lkml-seats-resolve owns the rules; a seats
+#            harness without a model drops the frontmatter's model). A
+#            missing file means the pins stand; an unreadable or
+#            unparseable one refuses the whole round before any launch.
+#            Every seat the seats file changes is announced on stderr,
+#            e.g. `lkml-round: seat core: pi-local (lkml-seats.yaml, was
+#            claude/opus)`; --model-override wins over the seats file
+#            silently -- it flattens the whole roster, so per-persona
+#            seat announcements would be noise.
 # --services-trust-ref <ref> is passed through to every seat's
 #            fork-sandbox.sh launch. Without it, fork-sandbox.sh disables
 #            the repo's .agents/sandbox-services hook on a --checkout run
@@ -123,6 +145,17 @@ fi
 [[ -d "$personas_dir" ]] || { echo "Error: --personas-dir '$personas_dir' not found." >&2; exit 1; }
 command -v fork-sandbox.sh >/dev/null 2>&1 || { echo "Error: fork-sandbox.sh not found on PATH." >&2; exit 1; }
 command -v jq >/dev/null 2>&1 || { echo "Error: jq not found on PATH." >&2; exit 1; }
+
+seats_active=0
+if [[ -z "$model_override" ]]; then
+    # Validated once, before ANY persona launches: the launcher below is
+    # launch-as-you-go, so a typo in the seats file must refuse the whole
+    # round, not half a panel. --model-override flattens the roster
+    # regardless, so the seats file is not consulted at all.
+    "$script_dir/lkml-seats-resolve" check "$personas_dir" || exit 1
+    seats_file="${LKML_SEATS_FILE:-$HOME/.config/fork-sandbox/lkml-seats.yaml}"
+    [[ -e "$seats_file" ]] && seats_active=1
+fi
 
 trust_args=()
 [[ -n "$services_trust_ref" ]] && trust_args=(--services-trust-ref "$services_trust_ref")
@@ -350,8 +383,35 @@ for persona in "${personas[@]}"; do
             harness="${model_override%%/*}"
             model="${model_override#*/}"
         else
+            # Bare harness: the persona's frontmatter model is DROPPED, not
+            # composed onto the bare harness -- pi-local/opus asks the
+            # endpoint for a model named 'opus' and the leg dies with zero
+            # replies (the --model-override 404 lesson; a seats-file
+            # harness without a model drops it the same way).
             harness="$model_override"
+            model=""
         fi
+    elif (( seats_active )); then
+        # The seats file re-seats this persona, key by key; the frontmatter
+        # values are the lowest-priority inputs (lkml-seats-resolve owns
+        # the precedence). seat_note is non-empty iff the seat changed, in
+        # which case the launch must be auditable.
+        # { read; ... } rather than `read -r a b c d` from one line: the
+        # fields may be empty, and a whitespace IFS would collapse them.
+        {
+            read -r harness
+            read -r model
+            read -r thinking
+            read -r seat_note
+        } < <(
+            "$script_dir/lkml-seats-resolve" resolve "$personas_dir" "$persona" \
+                "$harness" "$model" "$thinking")
+        [[ -n "$harness" ]] || {
+            echo "Error: seats resolution for $persona failed." >&2
+            launch_failed=1
+            continue
+        }
+        [[ -n "$seat_note" ]] && echo "fork-sandbox lkml-round: $seat_note" >&2
     fi
 
     mkdir -p -- /var/tmp/claude-scratch

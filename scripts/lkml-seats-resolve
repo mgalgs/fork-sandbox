@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+# lkml-seats-resolve — Resolve which harness/model/thinking one lkml-mode
+# persona seat runs on this machine, applying the machine seats file.
+#
+# Usage: lkml-seats-resolve check <personas-dir>
+#        lkml-seats-resolve resolve <personas-dir> <persona> <fm-harness>
+#                                            <fm-model> <fm-thinking>
+#
+# The seats file is the per-machine, per-persona override for the
+# harness/model pins checked into each persona's frontmatter -- see
+# skills/lkml-mode/SKILL.md, "Building a panel". Its path is
+# $LKML_SEATS_FILE when set (the test hook, same pattern as
+# LKML_SUMMARIZE_ENV_FILE), else ~/.config/fork-sandbox/lkml-seats.yaml.
+#
+# The seats file's schema is validated by lkml-seats-parse.py (the same
+# "small python3 parser that fails with precise paths and emits
+# tab-separated lines" precedent as fork-sandbox-preset-parse.py): a
+# mapping with an optional `default` entry and an optional `personas`
+# mapping, each carrying only `harness`, `model` and `thinking`.
+#
+# `check` validates the file (or its explicit absence) and exits 0.
+# Launchers that may launch more than one persona call it once, before
+# ANY launch, so a typo refuses the whole round instead of half a panel.
+#
+# `resolve` prints exactly four lines on stdout, one field per line
+# (one-per-line rather than delimited: fields may be empty, and a
+# whitespace IFS would collapse the empty middle fields):
+#
+#     <harness>
+#     <model>
+#     <thinking>
+#     <announce>
+#
+# <announce> is empty unless the seats file changed the seat; it is the
+# line the launcher prints on stderr with its own prefix, e.g. a launcher
+# prints `lkml-round: seat core: pi-local (lkml-seats.yaml, was claude/opus)`
+# so the operator can audit every seat a seats file moved.
+#
+# Precedence, per persona, key by key: the launcher's --model-override
+# flag (which callers apply themselves, before calling this -- it wins
+# over everything and keeps its own announcement) > a `personas.<p>`
+# entry > `default:` > the persona frontmatter (the <fm-*> arguments).
+# A model name belongs to its harness, the same rule as the preset
+# compiler's harness override in fork-sandbox.sh: when the resolved
+# harness came from the seats file, the frontmatter's model is DROPPED,
+# not inherited -- a bare pi-local resolves its model from the endpoint,
+# and a bare claude takes the harness default. `thinking` is
+# harness-portable between pi flavors, so it inherits from frontmatter
+# unless a seats entry sets it.
+#
+# A missing file at the DEFAULT path is not an error: everything falls
+# back to the frontmatter values verbatim (the fm-* arguments are
+# printed unchanged, no announce). An LKML_SEATS_FILE that is set to a
+# path with no file there IS an error -- the operator meant for a file
+# to be there, and guessing that it was a typo would turn the typo into
+# the frontmatter pins. An unreadable or unparseable file is always an
+# error (the parser refuses loudly; we never fall back silently).
+
+set -euo pipefail
+
+usage() {
+    sed -n '2,/^set -euo/{ /^#/s/^# \?//p }' "$0"
+}
+
+(( $# == 2 || $# == 6 )) || { usage >&2; exit 1; }
+mode="$1"
+personas_dir="$2"
+
+seats_file="${LKML_SEATS_FILE:-$HOME/.config/fork-sandbox/lkml-seats.yaml}"
+
+if [[ ! -e "$seats_file" ]]; then
+    if [[ -n "${LKML_SEATS_FILE:-}" ]]; then
+        echo "Error: LKML_SEATS_FILE points at '$seats_file', which does not" >&2
+        echo "exist. Fix the path or unset it so the persona frontmatter" >&2
+        echo "pins stand." >&2
+        exit 1
+    fi
+    if [[ "$mode" == "resolve" ]]; then
+        # No seats file: today's behavior, the frontmatter pins verbatim
+        # (resolve mode's $4/$5/$6 are the fm-* arguments).
+        printf '%s\n%s\n%s\n\n' "$4" "$5" "$6"
+    fi
+    exit 0
+fi
+
+script_dir="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+parsed="$(python3 "$script_dir/lkml-seats-parse.py" "$seats_file" "$seats_file" "$personas_dir")"
+
+# The parser emits at most one line per (section, key); `default` lines
+# are 3 fields, `personas` lines are 4. Collect the default: entry now;
+# the per-persona pick happens after the mode split, where the persona
+# argument exists.
+def_harness="" def_model="" def_thinking=""
+while IFS=$'\t' read -r f1 f2 f3 f4; do
+    [[ "$f1" == "default" ]] || continue
+    case "$f2" in
+        harness) def_harness="$f3" ;;
+        model) def_model="$f3" ;;
+        thinking) def_thinking="$f3" ;;
+    esac
+done <<< "$parsed"
+
+if [[ "$mode" == "check" ]]; then
+    exit 0
+fi
+
+# resolve: $3 = persona, $4 = fm-harness, $5 = fm-model, $6 = fm-thinking
+persona="$3" fm_harness="$4" fm_model="$5" fm_thinking="$6"
+p_harness="" p_model="" p_thinking=""
+while IFS=$'\t' read -r f1 f2 f3 f4; do
+    [[ "$f1" == "personas" && "$f2" == "$persona" ]] || continue
+    case "$f3" in
+        harness) p_harness="$f4" ;;
+        model) p_model="$f4" ;;
+        thinking) p_thinking="$f4" ;;
+    esac
+done <<< "$parsed"
+
+if [[ -n "$p_harness" || -n "$def_harness" ]]; then
+    # A seats entry set the harness: the frontmatter's model belongs to
+    # its own harness and is dropped, not inherited.
+    harness="${p_harness:-$def_harness}"
+    model="${p_model:-$def_model}"
+else
+    harness="$fm_harness"
+    model="${p_model:-${def_model:-$fm_model}}"
+fi
+thinking="${p_thinking:-${def_thinking:-$fm_thinking}}"
+
+announce=""
+if [[ "$harness" != "$fm_harness" || "$model" != "$fm_model" || "$thinking" != "$fm_thinking" ]]; then
+    new_spec="$harness"
+    [[ -n "$model" ]] && new_spec="$harness/$model"
+    old_spec="$fm_harness"
+    [[ -n "$fm_model" ]] && old_spec="$fm_harness/$fm_model"
+    announce="seat $persona: $new_spec ($(basename -- "$seats_file"), was $old_spec)"
+    [[ -n "$fm_thinking" && "$thinking" != "$fm_thinking" ]] \
+        && announce="$announce; thinking $thinking, was $fm_thinking"
+    [[ -z "$fm_thinking" && -n "$thinking" ]] \
+        && announce="$announce; thinking $thinking"
+fi
+
+printf '%s\n%s\n%s\n%s\n' "$harness" "$model" "$thinking" "$announce"
