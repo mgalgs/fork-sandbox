@@ -102,8 +102,9 @@ scheduling, not reading, and the reviewers' job is reading.
   may cite — so every version must be summarized before `--series`
   can run. `--series` refuses `--version` (pick one) and `--low` (there is
   no extraction tier), and its outbox file lands as
-  `results-series.md` — a page-level "series summary" card right after the
-  masthead in the HTML render and a `series-summary` block at the top of
+  `results-series.md` — a page-level "series summary" card directly above
+  the series' own section (right after the masthead when a single dir is
+  rendered) in the HTML render and a `series-summary` block at the top of
   the `--text` render.
 - **`lkml-series.sh`** — for reviewing work AFTER it already shipped: given
   `<base>..<tip>` that already landed (a merge commit, a pile of WIP

@@ -29,8 +29,9 @@ byte-identical to a mailbox without results.
 
 When a series dir holds results-series.md (the whole-series narrative,
 written by the summarizer's --series mode), the HTML render adds a
-page-level card immediately after the masthead, before the first
-series section -- the same treatment, but the eyebrow reads
+page-level card directly above the series' own section (right after
+the masthead when a single dir is rendered) -- the same treatment, but
+the eyebrow reads
 'series summary' and the wrapper class is 'results results-series'
 so the card can be styled independently later. Its id autolink map
 covers ALL versions' messages in the series dir. --text prints it as
@@ -518,8 +519,9 @@ def render_results_card(series_dir, version, id_map):
 
 
 def render_series_card(series_dir, id_map):
-    """The page-level series summary card, placed immediately after
-    the masthead, before the first series section: the same treatment
+    """The page-level series summary card, placed directly above the
+    series' own section (right after the masthead when a single dir
+    is rendered): the same treatment
     as the per-version card (Summary outside the "show details"
     fold, Details inside it, escaped preformatted, autolinked, empty
     sections omitted). Two differences: the eyebrow reads 'series
@@ -939,7 +941,11 @@ def render_series(series_dir):
   </details>
   <div class="thread">{thread}</div>
 </section>""")
-    return name, "\n".join(sections)
+    # id_map is returned, not recomputed by the caller: it covers ALL
+    # versions' messages in the series dir (build() read every .msg
+    # file), which is exactly the map the series card needs, and a
+    # second build() would re-parse the whole mailbox for it.
+    return name, "\n".join(sections), id_map
 
 
 CSS = """
@@ -1120,26 +1126,26 @@ def main(argv=None):
     sections = []
     names = []
     for d in args.series_dirs:
-        name, sec = render_series(d)
+        name, sec, id_map = render_series(d)
         names.append(name)
-        sections.append(sec)
-    # The page-level series card sits after the masthead, before the
-    # first series section. Its id autolink map covers ALL versions'
-    # messages in the series dir: build() reads every .msg file, so
-    # the map an earlier version's card already uses is the one this
-    # card needs (a union is only a union in a single series dir).
-    series_cards = []
-    for d in args.series_dirs:
-        _name, all_msgs, _roots = build(d)
-        card = render_series_card(d, id_prefix_map(all_msgs))
+        # The page-level series card sits directly above THIS dir's
+        # own section, so in a multi-dir render a card's narrative
+        # cannot precede another series' content: the section head
+        # (name, version) that follows it attributes it. In a
+        # single-dir render this is right after the masthead, as
+        # before. id_map covers ALL versions' messages in the series
+        # dir -- render_series already built it over the whole dir, so
+        # no second build() re-parses the mailbox here.
+        card = render_series_card(d, id_map)
         if card:
             # Section strings lead with a newline (the masthead's own
             # trailing newline then ends its line); the card gets the
             # same lead so the page layout is unchanged.
-            series_cards.append("\n" + card)
+            sec = "\n" + card + sec
+        sections.append(sec)
     # The card's rules ride on the card: without any results file the
     # document is byte-identical to a render without this feature.
-    css = CSS + (RESULTS_CSS if any('class="results' in s for s in sections + series_cards) else "")
+    css = CSS + (RESULTS_CSS if any('class="results' in s for s in sections) else "")
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     toc = " · ".join(f"<a href=\"#{esc(n)}-v1\">{esc(n)}</a>" for n in names)
     document = f"""<!doctype html>
@@ -1157,7 +1163,7 @@ def main(argv=None):
     <span class="sub mono">{toc}</span>
     <span class="sub mono">rendered {now}</span>
   </div>
-  {''.join(series_cards + sections)}
+  {''.join(sections)}
   <p class="foot">Every message on these threads is stamped by the mailbox with its persona, harness and model. Reviewers are AI personas running in sandboxed clones, and only the operator merges anything.</p>
 </div>
 </body>

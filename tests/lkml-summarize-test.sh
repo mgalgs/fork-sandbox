@@ -642,6 +642,27 @@ else
     no "the series handoff orders the inputs: intermediates, tallies, cover"
 fi
 
+# The version ledger is append-only, so a version can appear in it
+# twice; --series must feed the handoff that version ONCE, not pay
+# double tokens for the same intermediate and tally.
+printf '{"version":2,"branch":"main"}\n' >> "$series_dir/versions.jsonl"
+capD="$(mktemp -d)"; tmpdirs+=("$capD")
+dup_rc=0
+PATH="$stub_bin:$PATH" STUB_CAPTURE_DIR="$capD" STUB_RUN_PREFIX="$run_prefix_dir" \
+    STUB_JSON="$DEFAULT_JSON" STUB_MD="$SERIES_MD" \
+    "$summarize" widget-frob --project "$project_dir" --series >/dev/null 2>"$capD/err" || dup_rc=$?
+if (( dup_rc == 0 )); then ok "--series with a duplicated ledger entry exits 0"; else no "--series with a duplicated ledger entry exits 0" "exit $dup_rc: $(cat "$capD/err")"; fi
+dup_handoff="$(cat -- "$capD/summarize-series.handoff.md")"
+check "a duplicated ledger entry feeds v2's intermediate once" \
+    "1" "$(grep -c -- '## v2: the extraction intermediate' <<< "$dup_handoff")"
+check "a duplicated ledger entry feeds v2's tally once" \
+    "1" "$(grep -c -- '## v2: the tally section' <<< "$dup_handoff")"
+# Restore the ledger for the sections below (the run above left
+# results-series.md with identical content, so only the ledger needs
+# the duplicate line back off).
+head -n -1 -- "$series_dir/versions.jsonl" > "$series_dir/versions.jsonl.tmp"
+mv -- "$series_dir/versions.jsonl.tmp" "$series_dir/versions.jsonl"
+
 printf '\n== --series mode: refusals ==\n'
 capR="$(mktemp -d)"; tmpdirs+=("$capR")
 run "series with --version is refused" 1 widget-frob --project "$project_dir" --series --version 2

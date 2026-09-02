@@ -1096,7 +1096,6 @@ case "$shtml" in *'<script>alert(5)</script>'*) no "series script payload is nev
 # version section, column-0 labels, two-space bodies, no links.
 series_text="$work/ser.txt"
 python3 "$renderer" --text "$LKML_MAILBOX_ROOT/ser-card" > "$series_text"
-stext="$(<"$series_text")"
 if python3 - "$series_text" <<PY
 import sys
 
@@ -1137,7 +1136,6 @@ fi
 # renders an empty summary in HTML; a Summary-only file drops the fold.
 printf '%s\n' '# Details' 'details only, no summary.' > "$SERIES_RESULTS"
 python3 "$renderer" --text "$LKML_MAILBOX_ROOT/ser-card" > "$series_text"
-stext="$(<"$series_text")"
 if python3 - "$series_text" <<PY
 import sys
 
@@ -1163,6 +1161,40 @@ sf="$(<"$series_fold_html")"
 contains "series card: summary-only file renders an empty-details omission" \
     "$sf" '<div class="results-summary">summary only, no details.</div>'
 case "$sf" in *'class="results-fold"'*) no "series card: summary-only file drops the fold" ;; *) ok "series card: summary-only file drops the fold" ;; esac
+
+# Multi-dir: rendering two series dirs that each hold a
+# results-series.md attributes each card to its own series -- each
+# card sits directly above its own section, never above the other
+# series' content (where it would read as that series' summary).
+printf '%s\n' '# Summary' 'Card A narrative: converged.' > "$SERIES_RESULTS"
+"$mailbox" init ser-card-b --cover "$work/cover.txt" --patches "$work/patches" \
+    --from author --harness test --model fixture >/dev/null 2>/dev/null
+printf '%s\n' '# Summary' 'Card B narrative: still open.' > "$LKML_MAILBOX_ROOT/ser-card-b/results-series.md"
+multi_html="$work/ser-multi.html"
+python3 "$renderer" "$LKML_MAILBOX_ROOT/ser-card" "$LKML_MAILBOX_ROOT/ser-card-b" -o "$multi_html"
+if python3 - "$multi_html" <<'PY'
+import sys
+
+html = open(sys.argv[1], encoding="utf-8").read()
+errors = []
+if html.count('<div class="results results-series">') != 2:
+    errors.append("expected two series cards, one per dir")
+i_card_a = html.index('Card A narrative: converged.')
+i_card_b = html.index('Card B narrative: still open.')
+i_a1 = html.index('<section class="series" id="ser-card-v1">')
+i_b1 = html.index('<section class="series" id="ser-card-b-v1">')
+if not i_card_a < i_a1 < i_card_b < i_b1:
+    errors.append("each card is not directly above its own series section")
+for e in errors:
+    print(e)
+sys.exit(1 if errors else 0)
+PY
+then
+    ok "multi-dir: each series card sits above its own section"
+else
+    no "multi-dir: each series card sits above its own section"
+fi
+rm "$LKML_MAILBOX_ROOT/ser-card-b/results-series.md"
 
 # A results-series.md planted as a symlink escaping the series dir is
 # refused the way the per-version reader refuses its; one that stays

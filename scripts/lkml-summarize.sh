@@ -281,7 +281,11 @@ if [[ -n "$series_mode" ]]; then
     recorded_versions=()
     while IFS= read -r v; do
         [[ -n "$v" ]] && recorded_versions+=("$v")
-    done < <(jq -r 'select((.version|type)=="number") | .version' "$versions_file" | sort -n)
+    # -u: the version ledger is append-only, so a version can carry
+    # two entries; the newest one already won every per-version run,
+    # and feeding the same version into the handoff twice would pay
+    # double tokens for the same section.
+    done < <(jq -r 'select((.version|type)=="number") | .version' "$versions_file" | sort -n -u)
     missing=()
     for v in "${recorded_versions[@]}"; do
         [[ -f "$series_dir/results-v${v}.json" ]] || missing+=("$v")
@@ -312,10 +316,16 @@ else
     echo "fork-sandbox lkml-summarize: summarizing $series v$version (low: $low_spec, high: $high_spec)" >&2
 fi
 
-tally_text="$(extract_tally "$version")"
-if [[ -z "$tally_text" ]]; then
-    echo "Error: the --text render has no section for '$series v$version'; the version ledger and the mailbox disagree." >&2
-    exit 1
+# Per-version mode only: in --series mode every recorded version's tally
+# was already extracted and checked in the loop above, and the series
+# handoff carries them from $tallies, so the latest one would be read
+# twice for no consumer.
+if [[ -z "$series_mode" ]]; then
+    tally_text="$(extract_tally "$version")"
+    if [[ -z "$tally_text" ]]; then
+        echo "Error: the --text render has no section for '$series v$version'; the version ledger and the mailbox disagree." >&2
+        exit 1
+    fi
 fi
 
 
@@ -595,6 +605,7 @@ if [[ -n "$series_mode" ]]; then
     # disk per version, and the outbox's results.md is harvested as
     # results-series.md ONLY -- there is no json companion, the
     # per-version json/md pairs stay as they are.
+    mkdir -p -- /var/tmp/claude-scratch
     series_handoff_file="$(mktemp /var/tmp/claude-scratch/lkml-summarize-series-XXXXXX.md)" || {
         echo "Error: mktemp failed for the series run's handoff file." >&2
         exit 1
