@@ -125,6 +125,8 @@ case "$html" in *fonts.googleapis.com*) no "output has no remote font dependency
 contains "prose uses the system sans stack" "$html" 'font-family:system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif'
 case "$html" in *"Source Serif"*|*"Times New Roman"*) no "no serif stack remains (the Times regression)" ;; *) ok "no serif stack remains (the Times regression)" ;; esac
 contains "message body is 1rem at 72ch" "$html" '.body{max-width:72ch;font-size:1rem;line-height:1.6}'
+contains "body markdown h3 keeps the message's voice" "$html" '.body h3{margin:1.2rem 0 .5rem;font-size:1.05rem;font-weight:650}'
+case "$html" in *"letter-spacing:.12em"*) no "uppercase-mono eyebrow treatment is not applied to body headings" ;; *) ok "uppercase-mono eyebrow treatment is not applied to body headings" ;; esac
 contains "thread index rows have a hover background" "$html" '.tidx li:hover{background:var(--code-bg)}'
 if cmp -s "$stdout" "$custom"; then ok "output file matches stdout"; else no "output file matches stdout"; fi
 if python3 -m py_compile "$renderer"; then ok "renderer compiles"; else no "renderer compiles"; fi

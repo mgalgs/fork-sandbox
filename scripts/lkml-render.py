@@ -961,7 +961,12 @@ body{margin:0;background:var(--bg);color:var(--ink);
 .subj{margin:0 0 .75rem;font-size:1.15rem;font-weight:600;line-height:1.3;text-wrap:balance}
 .body{max-width:72ch;font-size:1rem;line-height:1.6}
 .body p{margin:0 0 .8rem}
-.body h3,.body h4,.body h5,.body h6{margin:1.1rem 0 .4rem;font-size:.72rem;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);font-weight:600;font-family:"JetBrains Mono",monospace}
+/* Markdown headings from a message body are content, not page chrome:
+   they keep the message's own voice (prose family, normal case, inherited
+   color). The uppercase-mono eyebrow treatment lives on .eyebrow, fold
+   summaries, and tally headers only. */
+.body h3{margin:1.2rem 0 .5rem;font-size:1.05rem;font-weight:650}
+.body h4,.body h5,.body h6{margin:1.2rem 0 .5rem;font-size:.95rem;font-weight:650}
 .body ul,.body ol{margin:0 0 .8rem;padding-left:1.4rem}
 .body li{margin:.15rem 0}
 .body code{font-size:.875em;background:var(--code-bg);padding:.1em .35em;border-radius:3px}
