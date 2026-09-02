@@ -1167,6 +1167,7 @@ maintainer_model=""
 preset_name=""
 preset_file=""
 preset_sha256=""
+preset_staged_bytes=""
 # Preset-only pipeline knobs -- no flag sets these, the preset compiler
 # below does (docs/presets.md): a fix seat of its own per loop, and repeat
 # counts for coding legs. Empty harness / repeat 1 is the engine's old
@@ -1352,6 +1353,15 @@ handoff_file="${2:?Usage: fork-sandbox.sh [options] <project-path> <handoff-file
 # flag would -- alias resolution, harness rules, the --k8s refusals -- and an
 # explicit flag overrides its preset counterpart key by key. The file format
 # and the flag mapping are documented in docs/presets.md.
+# Remove the staged preset bytes, if any. The mv into the run dir at launch
+# is the other way out of this path; after that move the path is gone and
+# rm -f is a no-op.
+preset_stage_cleanup() {
+    if [[ -n "${preset_staged_bytes:-}" ]]; then
+        rm -f -- "$preset_staged_bytes"
+        preset_staged_bytes=""
+    fi
+}
 if [[ -n "$preset_name" ]]; then
     preset_dir="${FORK_SANDBOX_PRESETS_DIR:-$config_dir/presets}"
     # The same single-path-component rule discoverer ids follow: with no
@@ -1421,6 +1431,20 @@ if [[ -n "$preset_name" ]]; then
         "$preset_file" "$preset_name" "$(display_config_path "$preset_file")")"; then
         exit 1
     fi
+    # Snapshot the definition's bytes while the parse above still describes
+    # them: launch resolves the backend, the harness and the clone's base
+    # for a while yet, and a preset edit in that window -- the edit this
+    # provenance exists around -- must not change what the recorded sha256
+    # identifies. The staged file is what the run dir later keeps as
+    # preset.yaml, and preset_sha256 is computed over it, so the hash, the
+    # archived copy and the parsed definition are provably one document.
+    preset_staged_bytes="$(mktemp "${TMPDIR:-/tmp}/claude-fork-sandbox-preset.XXXXXX")"
+    cp -- "$preset_file" "$preset_staged_bytes"
+    preset_sha256="$(sha256sum -- "$preset_staged_bytes" | cut -d' ' -f1)"
+    # A failed launch before the run dir exists never reaches the later
+    # trap; this one removes the staged bytes on any such exit. run_cleanup
+    # does the same for the endings that do reach it.
+    trap preset_stage_cleanup EXIT
     while IFS=$'\t' read -r preset_f1 preset_f2 preset_f3 preset_f4; do
         [[ -n "$preset_f1" ]] || continue
         case "$preset_f1" in
@@ -3274,17 +3298,17 @@ fi
 # convention as prompt-overlay.json: no file when no preset, and
 # sandbox-run-log.py reads that as "no preset key".
 if [[ -n "$preset_name" ]]; then
-    # The definition's own bytes, AS LAUNCHED: copy first, then hash the
-    # copy, so preset.json's sha256 identifies the copied bytes exactly.
-    # The live file could be edited between preset compilation and now --
-    # the edit this feature exists around -- and hashing it then would
-    # file the new definition under the old bytes' name. The copy is also
-    # what record runs at run END archives from, since by then the preset
-    # may have been edited again: it is the only archive source that
-    # cannot race that edit, and sandbox-run-log.py archives it under
-    # this sha256, deduplicated for free by that key.
-    cp -- "$preset_file" "$run_dir/preset.yaml"
-    preset_sha256="$(sha256sum -- "$run_dir/preset.yaml" | cut -d' ' -f1)"
+    # The definition's own bytes, AS LAUNCHED: the staged copy made beside
+    # the parse -- before backend resolution, the clone's base and the
+    # prompt overlays, and so before any edit of the live file could race
+    # them -- is moved in here, and preset_sha256 was computed over that
+    # same file, so preset.json's sha256 identifies the bytes that
+    # compiled this run. The copy is also what record runs at run END
+    # archives from, since by then the preset may have been edited again:
+    # it is the only archive source that cannot race that edit, and
+    # sandbox-run-log.py archives it under this sha256, deduplicated for
+    # free by that key.
+    mv -- "$preset_staged_bytes" "$run_dir/preset.yaml"
     jq -n \
         --arg name "$preset_name" \
         --arg file "$preset_file" \
@@ -4657,6 +4681,9 @@ printf '\nHeadless. Nothing here needs a keypress; the session exits on its own.
 run_cleanup() {
     [[ -n "${_cleanup_done:-}" ]] && return 0
     _cleanup_done=1
+    # The staged preset bytes, when a --preset launch never reached the mv
+    # into the run dir; after that move this is a no-op.
+    preset_stage_cleanup
     if [[ "${#codex_auth_dirs[@]}" -gt 0 ]]; then
         for codex_auth_dir in "${codex_auth_dirs[@]}"; do
             rm -rf "$codex_auth_dir"

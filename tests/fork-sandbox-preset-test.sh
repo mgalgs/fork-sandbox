@@ -645,6 +645,13 @@ tmpdirs+=("$real_stub")
 cat > "$real_stub/sandbox-backend-fake-image" <<'STUB'
 #!/usr/bin/env bash
 if [[ "${1:-}" == "--capabilities" ]]; then
+    # The race test: edit the live definition from inside the launch
+    # window (the parse has read it, the run dir does not exist yet).
+    if [[ -n "${RACE_PRESET_FILE:-}" \
+            && ! -e "${RACE_PRESET_FILE}.edited" ]]; then
+        printf '# edited mid-launch\n' >> "$RACE_PRESET_FILE"
+        touch "${RACE_PRESET_FILE}.edited"
+    fi
     printf 'toolchain=image\n'
     exit 0
 fi
@@ -776,6 +783,71 @@ if [[ -n "${rd_a:-}" ]]; then
     check "a noop middle pass does not stop the passes" "3" "$(cat "$count")"
 fi
 
+# D. A definition edited between the parse and the run dir -- the race the
+# provenance exists around: the recorded sha256 must identify the bytes the
+# parse compiled, not the edit, and the run-dir copy must be those bytes.
+# The fake backend's --capabilities probe runs inside that window, so it
+# performs the edit when RACE_PRESET_FILE names the live file.
+race_live="$real_presets/race.yaml"
+cat > "$race_live" <<'EOF'
+agents:
+  coder:
+    harness: claude
+    model: haiku
+pipeline:
+  - action: code
+    agent: coder
+EOF
+race_orig="$tmp/race.orig"
+cp -- "$race_live" "$race_orig"
+prep_stub 'commit'
+rd_d="$(RACE_PRESET_FILE="$race_live" run_stubbed \
+    --preset race --branch "sandbox-test-race-$$")" && tmpdirs+=("$rd_d")
+if [[ -n "${rd_d:-}" ]]; then
+    contains "the test's race actually happened" \
+        "$(cat "$race_live")" "edited mid-launch"
+    check "the recorded sha256 is the parse-time bytes' hash, not the edit's" \
+        "$(sha256sum "$race_orig" | cut -d' ' -f1)" \
+        "$(jq -r '.sha256' "$rd_d/preset.json")"
+    if cmp -s "$rd_d/preset.yaml" "$race_orig"; then
+        ok "the run-dir copy is the pre-edit definition"
+    else
+        no "the run-dir copy is the pre-edit definition" \
+            "$rd_d/preset.yaml differs from $race_orig"
+    fi
+    check "the run still compiled the pre-edit document" \
+        "0" "$(cat "$rd_d/exit-code" 2>/dev/null)"
+    contains "run.env carries the pre-edit harness" \
+        "$(cat "$rd_d/run.env")" "harness=claude"
+    contains "run.env carries the pre-edit model" \
+        "$(cat "$rd_d/run.env")" "model=haiku"
+fi
+
+# E. A launch that fails after staging the bytes (this one at the handoff
+# boundary, between the parse and the run dir) leaves no staged file in
+# its TMPDIR behind.
+stage_tmp="$(mktemp -d)"; tmpdirs+=("$stage_tmp")
+err_stage="$tmp/err-stage"
+bad_handoff="$tmp/not-a-scratch-handoff.md"
+printf 'do the task\n' > "$bad_handoff"
+out="$(TMPDIR="$stage_tmp" PATH="$real_stub:$PATH" \
+    FORK_SANDBOX_CONFIG_DIR="$real_cfg" FORK_SANDBOX_BACKEND=fake-image \
+    timeout 60 "$launcher" --foreground --preset race "$proj" \
+    "$bad_handoff" 2>"$err_stage")"
+rc_stage=$?
+if (( rc_stage != 0 )) && [[ -n "$out" || -s "$err_stage" ]]; then
+    if [[ -z "$(find "$stage_tmp" -name 'claude-fork-sandbox-preset.*')" ]]; then
+        ok "a failed launch cleans up the staged preset bytes"
+    else
+        no "a failed launch cleans up the staged preset bytes" \
+            "$(find "$stage_tmp" -name 'claude-fork-sandbox-preset.*')"
+    fi
+    contains "the failure is the handoff boundary, not the preset" \
+        "$(cat "$err_stage")" "handoff files must live under"
+else
+    no "the handoff-boundary launch fails, as the test needs"
+fi
+
 # B. A fix seat of its own, with repeat: the review loop's fix legs run the
 # fix agent's model, twice per iteration.
 cat > "$real_presets/fixseat.yaml" <<'EOF'
@@ -883,8 +955,8 @@ if [[ -n "${rd_a:-}" && -x "$run_log" ]]; then
             check "a second record of the same preset does not rewrite the archive" \
                 "$before" "$after"
         else
-            no "a second record of the same preset does not rewrite the archive"
-            "second record failed"
+            no "a second record of the same preset does not rewrite the archive" \
+                "second record failed"
         fi
     else
         no "sandbox-run-log.py record archives the preset definition"
