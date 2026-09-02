@@ -3204,6 +3204,41 @@ else
         "$(grep -A1 'name: PROXY_BASE_URL' "$k8s_flag_ep_out")"
 fi
 rm -f /tmp/fs-k8s-flag-test-ep.err
+# --endpoint is also the launcher-side way off the pi model requirement:
+# on a K8S_PROXY_ENDPOINTS install the pod discovers its model, so a
+# model-less --k8s --endpoint --dry-run must reach the render with the
+# discovery gate on and an empty MODEL env, mirroring the submit-level
+# no-model assertions above.
+k8s_flag_ep_nm_out="$(newdir)/k8s-flag-ep-nomodel.yaml"; tmpdirs+=("$(dirname "$k8s_flag_ep_nm_out")")
+if FORK_SANDBOX_CONFIG_DIR="$endpoints_config_dir" "$fs_sh" --k8s --dry-run \
+    --endpoint secondary \
+    --branch fs-k8s-flag-test-ep-nomodel-branch \
+    "$k8s_flag_proj" "$k8s_flag_handoff" \
+    > "$k8s_flag_ep_nm_out" 2>/tmp/fs-k8s-flag-test-ep-nomodel.err; then
+    ok "--k8s --endpoint --dry-run without --model exits 0"
+else
+    no "--k8s --endpoint --dry-run without --model exits 0" \
+        "$(cat /tmp/fs-k8s-flag-test-ep-nomodel.err)"
+fi
+if [[ "$(grep -cF -- '- name: MODEL_DISCOVERY' "$k8s_flag_ep_nm_out")" == 1 ]] \
+    && grep -A1 -F -- '- name: MODEL_DISCOVERY' "$k8s_flag_ep_nm_out" | grep -qF 'value: "1"'; then
+    ok "the no-model --k8s --endpoint render carries MODEL_DISCOVERY=1"
+else
+    no "the no-model --k8s --endpoint render carries MODEL_DISCOVERY=1" \
+        "$(grep -A1 -F -- '- name: MODEL_DISCOVERY' "$k8s_flag_ep_nm_out")"
+fi
+model_env="$(grep -A1 'name: MODEL$' "$k8s_flag_ep_nm_out" | tail -n1)"
+check "the no-model --k8s --endpoint render carries an empty MODEL env" \
+    '              value: ""' "$model_env"
+rm -f /tmp/fs-k8s-flag-test-ep-nomodel.err "$k8s_flag_ep_nm_out"
+# --harness claude keeps the model requirement even with --endpoint --
+# the pod's discovery lists the pi endpoint's model ids, never a Claude
+# Code model name -- and the launcher refuses it before any render.
+refuses "--k8s --harness claude --endpoint without --model is still refused" \
+    "--k8s --harness claude needs --model" \
+    env FORK_SANDBOX_CONFIG_DIR="$endpoints_config_dir" "$fs_sh" --k8s --dry-run \
+    --harness claude --endpoint secondary \
+    "$k8s_flag_proj" "$k8s_flag_handoff"
 refuses "--k8s --task-meta is refused as not yet supported" \
     "--task-meta is not yet supported with --k8s" \
     env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \

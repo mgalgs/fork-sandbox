@@ -1999,9 +1999,21 @@ mntfix_model_given=false
 resolve_model mntfix_model "$mntfix_model_given" "${mntfix_harness:-$harness}" || exit 1
 
 if [[ "$harness" == "pi" && -z "$model" ]]; then
-    echo "Error: --harness pi needs --model. There is no default: the model" >&2
-    echo "is an OpenRouter id, such as moonshotai/kimi-k3." >&2
-    exit 1
+    # The one allowed model-less pi run: a --k8s run that names an
+    # endpoint. On an K8S_PROXY_ENDPOINTS install the pod discovers its
+    # model, and fork-sandbox-k8s.sh's own install-mode-aware validation
+    # decides -- it accepts the combination there and refuses it on a
+    # legacy install with its own message, so this launcher does not
+    # pre-empt either. A preset's code-seat endpoint key qualifies too:
+    # it has already landed in k8s_endpoint. claude keeps its
+    # unconditional requirement below, at both layers.
+    if [[ "$k8s_mode" != true || -z "$k8s_endpoint" ]]; then
+        echo "Error: --harness pi needs --model. There is no default: the model" >&2
+        echo "is an OpenRouter id, such as moonshotai/kimi-k3. A --k8s run on" >&2
+        echo "an endpoints install may instead name the install's entry with" >&2
+        echo "--endpoint, and the pod discovers its model." >&2
+        exit 1
+    fi
 fi
 if [[ "$review_harness_given" == true && "$review_harness" == "pi" && -z "$review_model" ]]; then
     echo "Error: --review-harness pi needs a model, either in the combined" >&2
@@ -2220,7 +2232,13 @@ if [[ "$k8s_mode" == true ]]; then
     # sync.
     [[ -n "$outbox_max_arg" ]] && k8s_argv+=(--outbox-max "$outbox_max_arg")
     [[ -n "$context_ro" ]] && k8s_argv+=(--context-ro "$context_ro")
-    k8s_argv+=(--harness "$harness" --branch "$branch" --model "$model" "$project_path" "$handoff_file")
+    # --model is forwarded only when set: a model-less pi run is the one
+    # legitimate combination (an endpoints install where the pod
+    # discovers its model), and run omits an empty --model from its own
+    # submit argv the same way -- an empty value at run's parse would be
+    # an argument error, not "no model".
+    [[ -n "$model" ]] && k8s_argv+=(--model "$model")
+    k8s_argv+=(--harness "$harness" --branch "$branch" "$project_path" "$handoff_file")
 
     # This path ends in exec, which replaces the shell image and discards
     # the EXIT trap the preset staging set -- the same hazard the
