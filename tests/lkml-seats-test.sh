@@ -152,6 +152,41 @@ resolve_helper "$work/seats-harnonmodel.yaml" thinky pi-local "" high
 check "personas without an entry keep their own seat" "pi-local" "$(resolved_field RES_OUT 1)"
 check "personas without an entry keep their thinking" "high" "$(resolved_field RES_OUT 3)"
 
+printf '\n== a personas.<p> harness drops EVERY lower-scope model ==\n'
+cat > "$work/seats-pdrop.yaml" <<'YAML'
+default:
+  harness: claude
+  model: sonnet
+personas:
+  core:
+    harness: pi-local
+YAML
+resolve_helper "$work/seats-pdrop.yaml" core claude opus ""
+check "persona harness overrides the default harness" "pi-local" "$(resolved_field RES_OUT 1)"
+check "persona harness drops the default's model" "" "$(resolved_field RES_OUT 2)"
+cat > "$work/seats-pdrop2.yaml" <<'YAML'
+default:
+  model: sonnet
+personas:
+  core:
+    harness: pi-local
+    model: tiny
+YAML
+resolve_helper "$work/seats-pdrop2.yaml" core claude opus ""
+check "a same-scope model rides with its harness" "pi-local" "$(resolved_field RES_OUT 1)"
+check "a same-scope model wins over the default's" "tiny" "$(resolved_field RES_OUT 2)"
+cat > "$work/seats-pdefmodel.yaml" <<'YAML'
+default:
+  harness: claude
+  model: sonnet
+personas:
+  author:
+    model: opus
+YAML
+resolve_helper "$work/seats-pdefmodel.yaml" author claude opus ""
+check "a higher-scope model rides a lower-scope harness" "claude" "$(resolved_field RES_OUT 1)"
+check "the higher-scope model wins the model key" "opus" "$(resolved_field RES_OUT 2)"
+
 printf '\n== a seats model without a harness keeps the frontmatter harness ==\n'
 cat > "$work/seats-modelonly.yaml" <<'YAML'
 personas:
@@ -274,8 +309,8 @@ echo "  run dir:  $run_dir"
 STUB
 chmod +x "$stub_bin/fork-sandbox.sh"
 
-launch_round() {  # launch_round <seats-file | ABSENT> [extra round args...] -> OUT/RC
-    local file="$1"; shift
+launch_round() {  # launch_round <seats-file | ABSENT> <personas-csv> [extra round args...] -> OUT/RC
+    local file="$1" personas_csv="$2"; shift 2
     local env_seats=ABSENT
     [[ "$file" != ABSENT ]] && env_seats="$file"
     local env=()
@@ -287,19 +322,32 @@ launch_round() {  # launch_round <seats-file | ABSENT> [extra round args...] -> 
     OUT="$(env "${env[@]}" PATH="$stub_bin:$PATH" \
         STUB_CAPTURE_DIR="$capture_dir" STUB_RUN_PREFIX="$run_prefix_dir" \
         "$round" widget-seats --project "$project_dir" --checkout somebranch \
-        --base somebranch --personas core,author,ci --personas-dir "$personas_test_dir" \
+        --base somebranch --personas "$personas_csv" --personas-dir "$personas_test_dir" \
         "$@" 2>&1)"
     RC=$?
 }
 argv_of() { cat "$capture_dir/$1.argv" 2>/dev/null; }
+# harness_of <persona> — the exact value of the stub's --harness argument,
+# i.e. the full harness/model token. Substring matches on the flag (e.g.
+# "--harness pi-local") also match the wrong composition "--harness
+# pi-local/opus"; the cross-scope model drop survived the suite exactly
+# that way, so every harness assertion below checks the whole token.
+harness_of() {
+    local prev="" a
+    for a in $(argv_of "$1"); do
+        if [[ "$prev" == "--harness" ]]; then printf '%s' "$a"; return 0; fi
+        prev="$a"
+    done
+    return 1
+}
 
 printf '\n== seats file absent: today%s behavior, no announcements ==\n' "'"
 rm -f -- "$capture_dir"/*.argv
-launch_round ABSENT
+launch_round ABSENT core,author,ci
 check "absent seats file: round exits 0" "0" "$RC"
 contains "absent seats file: core launches with its frontmatter pin" "$(argv_of core)" "--harness claude/opus"
 contains "absent seats file: author launches with its frontmatter pin" "$(argv_of author)" "--harness claude/opus"
-contains "absent seats file: ci launches with its frontmatter pin" "$(argv_of ci)" "--harness pi-local"
+check "absent seats file: ci launches with its frontmatter pin" "pi-local" "$(harness_of ci)"
 case "$OUT" in
     *"seat "*) no "absent seats file announces nothing" "$OUT" ;;
     *) ok "absent seats file announces nothing" ;;
@@ -311,11 +359,11 @@ default:
   harness: pi-local
 YAML
 rm -f -- "$capture_dir"/*.argv
-launch_round "$work/seats-round.yaml"
+launch_round "$work/seats-round.yaml" core,author,ci
 check "seats default: round exits 0" "0" "$RC"
-contains "seats default: core is launched on pi-local" "$(argv_of core)" "--harness pi-local"
-contains "seats default: author is launched on pi-local" "$(argv_of author)" "--harness pi-local"
-contains "seats default: ci is launched on pi-local" "$(argv_of ci)" "--harness pi-local"
+check "seats default: core is launched on pi-local" "pi-local" "$(harness_of core)"
+check "seats default: author is launched on pi-local" "pi-local" "$(harness_of author)"
+check "seats default: ci is launched on pi-local" "pi-local" "$(harness_of ci)"
 contains "core's moved seat is announced" "$OUT" \
     "lkml-round: seat core: pi-local (seats-round.yaml, was claude/opus)"
 contains "author's moved seat is announced" "$OUT" \
@@ -335,10 +383,28 @@ personas:
     model: opus
 YAML
 rm -f -- "$capture_dir"/*.argv
-launch_round "$work/seats-round-perp.yaml"
+launch_round "$work/seats-round-perp.yaml" core,author,ci
 check "per-persona round exits 0" "0" "$RC"
 contains "per-persona entry: author stays on claude/opus" "$(argv_of author)" "--harness claude/opus"
-contains "per-persona entry: core still goes to pi-local" "$(argv_of core)" "--harness pi-local"
+check "per-persona entry: core still goes to pi-local" "pi-local" "$(harness_of core)"
+
+printf '\n== a personas.<p> harness drops the default%s model, in the round ==\n' "'"
+cat > "$work/seats-round-pdrop.yaml" <<'YAML'
+default:
+  harness: claude
+  model: sonnet
+personas:
+  core:
+    harness: pi-local
+YAML
+rm -f -- "$capture_dir"/*.argv
+launch_round "$work/seats-round-pdrop.yaml" core,author,ci
+check "persona-harness round exits 0" "0" "$RC"
+check "core's persona harness is the bare harness" "pi-local" "$(harness_of core)"
+check "author takes the default's model" "claude/sonnet" "$(harness_of author)"
+check "ci takes the default's model" "claude/sonnet" "$(harness_of ci)"
+contains "core's re-seat to the bare harness is announced" "$OUT" \
+    "lkml-round: seat core: pi-local (seats-round-pdrop.yaml, was claude/opus)"
 
 printf '\n== a seats thinking reaches the seat via --pi-args ==\n'
 cat > "$work/seats-round-thinking.yaml" <<'YAML'
@@ -347,17 +413,17 @@ default:
   thinking: low
 YAML
 rm -f -- "$capture_dir"/*.argv
-launch_round "$work/seats-round-thinking.yaml"
+launch_round "$work/seats-round-thinking.yaml" core,author,ci
 contains "seats thinking is passed to a pi-local seat via --pi-args" \
     "$(argv_of core)" "--pi-args --thinking low"
 
 printf '\n== --model-override still beats the seats file, and stays quiet ==\n'
 rm -f -- "$capture_dir"/*.argv
-launch_round "$work/seats-round.yaml" --model-override pi-local
+launch_round "$work/seats-round.yaml" core,author,ci --model-override pi-local
 check "bare override beats seats: round exits 0" "0" "$RC"
-contains "bare override wins: core launches on the bare harness" "$(argv_of core)" "--harness pi-local"
-contains "bare override wins: author launches on the bare harness" "$(argv_of author)" "--harness pi-local"
-contains "bare override wins: ci launches on the bare harness" "$(argv_of ci)" "--harness pi-local"
+check "bare override wins: core launches on the bare harness" "pi-local" "$(harness_of core)"
+check "bare override wins: author launches on the bare harness" "pi-local" "$(harness_of author)"
+check "bare override wins: ci launches on the bare harness" "pi-local" "$(harness_of ci)"
 case "$(argv_of core)" in
     *"pi-local/opus"*) no "bare override drops the persona's frontmatter model" "$(argv_of core)" ;;
     *) ok "bare override drops the persona's frontmatter model" ;;
@@ -367,7 +433,7 @@ case "$OUT" in
     *) ok "bare override does not double-announce the seats file" ;;
 esac
 rm -f -- "$capture_dir"/*.argv
-launch_round "$work/seats-round.yaml" --model-override claude/sonnet
+launch_round "$work/seats-round.yaml" core,author,ci --model-override claude/sonnet
 check "combined override wins: round exits 0" "0" "$RC"
 contains "combined override wins: core launches on the override verbatim" "$(argv_of core)" "--harness claude/sonnet"
 contains "combined override wins: author launches on the override verbatim" "$(argv_of author)" "--harness claude/sonnet"
@@ -380,14 +446,14 @@ esac
 printf '\n== a bad seats file refuses the round before any launch ==\n'
 printf 'defaults:\n  harness: pi-local\n' > "$work/seats-bad.yaml"
 rm -f -- "$capture_dir"/*.argv
-launch_round "$work/seats-bad.yaml"
+launch_round "$work/seats-bad.yaml" core,author,ci
 if (( RC != 0 )); then ok "bad seats file exits non-zero"; else no "bad seats file exits non-zero" "exit 0: $OUT"; fi
 contains "bad seats file refusal names the key" "$OUT" "unknown top-level key 'defaults'"
 n_launches=$(find "$capture_dir" -name '*.argv' | wc -l | tr -d '[:space:]')
 check "bad seats file launches no persona" "0" "$n_launches"
 printf 'personas:\n  corr:\n    harness: claude\n' > "$work/seats-bad.yaml"
 rm -f -- "$capture_dir"/*.argv
-launch_round "$work/seats-bad.yaml"
+launch_round "$work/seats-bad.yaml" core,author,ci
 if (( RC != 0 )); then ok "a typo'd persona name exits non-zero"; else no "a typo'd persona name exits non-zero" "exit 0: $OUT"; fi
 contains "typo'd persona name is named" "$OUT" "personas.corr"
 n_launches=$(find "$capture_dir" -name '*.argv' | wc -l | tr -d '[:space:]')

@@ -41,10 +41,17 @@
 # over everything and keeps its own announcement) > a `personas.<p>`
 # entry > `default:` > the persona frontmatter (the <fm-*> arguments).
 # A model name belongs to its harness, the same rule as the preset
-# compiler's harness override in fork-sandbox.sh: when the resolved
-# harness came from the seats file, the frontmatter's model is DROPPED,
-# not inherited -- a bare pi-local resolves its model from the endpoint,
-# and a bare claude takes the harness default. `thinking` is
+# compiler's harness override in fork-sandbox.sh: setting `harness` at
+# any scope DROPS `model` from every lower-precedence scope --
+# `personas.<p>.harness` drops both `default.model` and the frontmatter
+# model, and `default.harness` drops the frontmatter model. A model
+# survives only from the same scope as the effective harness or a
+# higher-precedence one (a `personas.<p>.model` riding a `default:`
+# harness is the operator composing both in one file, and stays allowed).
+# Composing a lower scope's model onto a new harness is what asks the
+# endpoint for a model it does not serve: a bare pi-local resolves its
+# model from the endpoint, and a bare claude takes the harness default.
+# `thinking` is
 # harness-portable between pi flavors, so it inherits from frontmatter
 # unless a seats entry sets it.
 #
@@ -116,10 +123,18 @@ while IFS=$'\t' read -r f1 f2 f3 f4; do
     esac
 done <<< "$parsed"
 
-if [[ -n "$p_harness" || -n "$def_harness" ]]; then
-    # A seats entry set the harness: the frontmatter's model belongs to
-    # its own harness and is dropped, not inherited.
-    harness="${p_harness:-$def_harness}"
+if [[ -n "$p_harness" ]]; then
+    # The persona's own entry re-seats the harness: every model below
+    # this scope belongs to its own harness and is DROPPED, not composed
+    # -- only a model from this same entry may ride with it.
+    harness="$p_harness"
+    model="$p_model"
+elif [[ -n "$def_harness" ]]; then
+    # The default: entry re-seats the harness: its own model rides with
+    # it (as does a higher-scope personas.<p> model, which the operator
+    # composed in one file); the frontmatter's belongs to the
+    # frontmatter's harness and is dropped, not inherited.
+    harness="$def_harness"
     model="${p_model:-$def_model}"
 else
     harness="$fm_harness"
