@@ -6,7 +6,7 @@
 # Usage: lkml-round.sh <series> --project <path> --checkout <ref> --base <ref>
 #            --personas <p1,p2,...> [--reply-to <id>]... [--personas-dir <dir>]
 #            [--version <n>] [--timeout <seconds>] [--model-override <harness/model>]
-#            [--services-trust-ref <ref>]
+#            [--services-trust-ref <ref>] [--no-summarize]
 #
 # <project>  the repo fork-sandbox.sh clones -- same argument it takes.
 # --checkout the ref each persona's clone starts at: the series' tip, with
@@ -32,7 +32,19 @@
 #            the version of the first --reply-to id, or the series' current
 #            (highest) version when reviewing fresh.
 # --timeout  seconds to wait for every launched run to finish before giving
-#            up on harvesting the stragglers. Default 3600.
+#            up on harvesting the stragglers. Default 3600. Also the value
+#            passed to the post-round summarizer: a round the operator
+#            tightened for is a tail the operator tightened for.
+# --no-summarize skip the automatic post-round summary. By default, once
+#            the harvest is done and harvested at least one reply, the round
+#            runs lkml-summarize.sh (resolved from PATH) with the series,
+#            --project, the round's own resolved --version and --timeout,
+#            so the operator sees where the thread stands after every round
+#            instead of at the end. A summary skipped because nothing was
+#            harvested costs nothing; a FAILED summary never fails the round
+#            -- the replies are already posted to the mailbox, and the
+#            summary can be re-run by hand. Refused at startup if
+#            lkml-summarize.sh is not on PATH.
 # --model-override <harness>[/<model>] overrides every persona's own
 #            harness/model for this round only -- useful for a cheap
 #            smoke-test round before spending on the real panel. A BARE
@@ -117,6 +129,7 @@ version=""
 timeout=3600
 model_override=""
 services_trust_ref=""
+summarize=1
 reply_to_ids=()
 
 while [[ $# -gt 0 ]]; do
@@ -131,6 +144,7 @@ while [[ $# -gt 0 ]]; do
         --timeout) timeout="${2:?--timeout requires seconds}"; shift 2 ;;
         --model-override) model_override="${2:?--model-override requires harness or harness/model}"; shift 2 ;;
         --services-trust-ref) services_trust_ref="${2:?--services-trust-ref requires a ref}"; shift 2 ;;
+        --no-summarize) summarize=0; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Error: unknown option '$1'." >&2; exit 1 ;;
     esac
@@ -145,6 +159,15 @@ fi
 [[ -d "$personas_dir" ]] || { echo "Error: --personas-dir '$personas_dir' not found." >&2; exit 1; }
 command -v fork-sandbox.sh >/dev/null 2>&1 || { echo "Error: fork-sandbox.sh not found on PATH." >&2; exit 1; }
 command -v jq >/dev/null 2>&1 || { echo "Error: jq not found on PATH." >&2; exit 1; }
+# Refused at startup, before any persona launches: a panel that spends real
+# cost and only then discovers it cannot deliver the summary is the wrong
+# failure. Skipped when --no-summarize, which means no summary is owed.
+if (( summarize )); then
+    command -v lkml-summarize.sh >/dev/null 2>&1 || {
+        echo "Error: lkml-summarize.sh not found on PATH (pass --no-summarize to skip the post-round summary)." >&2
+        exit 1
+    }
+fi
 
 seats_active=0
 if [[ -z "$model_override" ]]; then
@@ -636,4 +659,28 @@ for persona in "${!run_dir_of[@]}"; do
 done
 
 echo "fork-sandbox lkml-round: harvested $harvested repl$( (( harvested == 1 )) && echo y || echo ies )." >&2
+
+# The per-round summary: it takes as long as two sequential sandbox runs, so
+# the operator watching stderr must not think the round hung.
+if (( summarize )); then
+    if (( harvested == 0 )); then
+        # Zero replies means the thread is unchanged: re-deriving the same
+        # document at the cost of two sandbox runs would be pure waste.
+        echo "fork-sandbox lkml-round: nothing harvested; skipping the summary for $series v$version." >&2
+    else
+        # A launch failure does NOT suppress the summary: if two of five
+        # personas launched and both replied, the thread changed and the
+        # summary should reflect it. Only harvested == 0 suppresses.
+        echo "fork-sandbox lkml-round: summarizing $series v$version (two sequential sandbox runs)..." >&2
+        # Bare name, resolved from PATH, like the fork-sandbox.sh launcher
+        # above -- it is a launcher-orchestrator, not a shipped helper.
+        # lkml-summarize.env owns the tier selection, so no tier is passed.
+        # A failure must NOT fail the round: the replies are already posted
+        # and that work is durable; the round's exit status stays exactly
+        # what launch_failed says.
+        if ! lkml-summarize.sh "$series" --project "$project" --version "$version" --timeout "$timeout"; then
+            echo "Warning: lkml-round: summarizing $series v$version failed; the replies are already posted to the mailbox -- re-run lkml-summarize.sh by hand." >&2
+        fi
+    fi
+fi
 (( launch_failed == 0 ))

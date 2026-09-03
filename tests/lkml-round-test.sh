@@ -151,6 +151,23 @@ echo "  run dir:  $run_dir"
 STUB
 chmod +x "$stub_bin/fork-sandbox.sh"
 
+# The stub lkml-summarize.sh records its own argv to a file the test can
+# read, the same "stub the external command on PATH" pattern as above --
+# lkml-round.sh invokes it by bare name, resolved from PATH. STUB_SUMMARIZE_FAIL
+# makes it fail so the test can check a failed summary does not fail the
+# round.
+cat > "$stub_bin/lkml-summarize.sh" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ -n "${STUB_SUMMARIZE_FAIL:-}" ]]; then
+    echo "stub lkml-summarize: forced failure" >&2
+    exit 1
+fi
+printf '%s\n' "$*" > "$STUB_CAPTURE_DIR/lkml-summarize.argv"
+echo "stub lkml-summarize: summarized $*"
+STUB
+chmod +x "$stub_bin/lkml-summarize.sh"
+
 cat > "$work/pi-local.md" <<'PERSONA'
 ---
 persona: pi-local
@@ -321,6 +338,82 @@ case "$core_handoff" in
     *"Looks fine now."*) no "reviewer handoff does not carry message bodies" ;;
     *) ok "reviewer handoff does not carry message bodies" ;;
 esac
+
+printf '\n== post-round summarize ==\n'
+# The default-on round at the top harvested core's and security's replies,
+# so the stub summarizer must have been invoked with the round's own facts.
+if [[ -f "$capture_dir/lkml-summarize.argv" ]]; then
+    ok "a harvested round invokes the summarizer by default"
+    sum_argv="$(cat "$capture_dir/lkml-summarize.argv")"
+    contains "summarizer argv carries the series" "$sum_argv" "widget-frob"
+    contains "summarizer argv carries --project" "$sum_argv" "--project $project_dir"
+    contains "summarizer argv carries the round's resolved version" "$sum_argv" "--version 1"
+    contains "summarizer argv carries the round's --timeout" "$sum_argv" "--timeout 3600"
+else
+    no "a harvested round invokes the summarizer by default" "no argv capture file"
+fi
+contains "the summary is announced on stderr before it starts" "$out" "summarizing widget-frob v1"
+
+# All rounds below use the v2 checkout and its v2 reply-to id: the
+# ambiguous-ref section above records the same commit as v3 as well, and
+# the ledger resolves a shared commit to its newest recorded version.
+cap_ns="$(mktemp -d)"; tmpdirs+=("$cap_ns")
+out_ns="$(PATH="$stub_bin:$PATH" STUB_CAPTURE_DIR="$cap_ns" STUB_RUN_PREFIX="$run_prefix_dir" \
+    STUB_REPLY_TO="$patch2_id" STUB_REPLY_TO_BRACKETED="$patch_id_bracketed" \
+    "$round" widget-frob --project "$project_dir" --checkout otherbranch \
+    --personas core,security,pi-local,codex --personas-dir "$work" \
+    --reply-to "$patch2_id" --no-summarize 2>&1)"
+rc_ns=$?
+if (( rc_ns == 0 )); then ok "--no-summarize round exits 0"; else no "--no-summarize round exits 0" "exit $rc_ns: $out_ns"; fi
+if [[ ! -f "$cap_ns/lkml-summarize.argv" ]]; then
+    ok "--no-summarize round does not invoke the summarizer"
+else
+    no "--no-summarize round does not invoke the summarizer" "argv capture file exists"
+fi
+
+cap_zero="$(mktemp -d)"; tmpdirs+=("$cap_zero")
+# pi-local's stub run writes no .git/lkml-out replies at all, so this round
+# harvests nothing: the summary must be skipped and announced on stderr.
+out_zero="$(PATH="$stub_bin:$PATH" STUB_CAPTURE_DIR="$cap_zero" STUB_RUN_PREFIX="$run_prefix_dir" \
+    STUB_REPLY_TO="$patch2_id" STUB_REPLY_TO_BRACKETED="$patch_id_bracketed" \
+    "$round" widget-frob --project "$project_dir" --checkout otherbranch \
+    --personas pi-local --personas-dir "$work" \
+    --reply-to "$patch2_id" 2>&1)"
+rc_zero=$?
+if (( rc_zero == 0 )); then ok "nothing-harvested round still exits 0"; else no "nothing-harvested round still exits 0" "exit $rc_zero: $out_zero"; fi
+contains "nothing harvested announces the skipped summary" "$out_zero" "skipping the summary for widget-frob v2"
+if [[ ! -f "$cap_zero/lkml-summarize.argv" ]]; then
+    ok "nothing-harvested round does not invoke the summarizer"
+else
+    no "nothing-harvested round does not invoke the summarizer" "argv capture file exists"
+fi
+
+cap_fail="$(mktemp -d)"; tmpdirs+=("$cap_fail")
+# A failed summary must warn, not fail the round: the replies are already
+# posted and the round's exit status stays what launch_failed says.
+out_fail="$(PATH="$stub_bin:$PATH" STUB_CAPTURE_DIR="$cap_fail" STUB_RUN_PREFIX="$run_prefix_dir" \
+    STUB_REPLY_TO="$patch2_id" STUB_REPLY_TO_BRACKETED="$patch_id_bracketed" \
+    STUB_SUMMARIZE_FAIL=1 \
+    "$round" widget-frob --project "$project_dir" --checkout otherbranch \
+    --personas core,security --personas-dir "$work" \
+    --reply-to "$patch2_id" 2>&1)"
+rc_fail=$?
+if (( rc_fail == 0 )); then ok "a failing summarizer does not fail the round"; else no "a failing summarizer does not fail the round" "exit $rc_fail: $out_fail"; fi
+contains "the failing summarizer warns that the replies are already posted" "$out_fail" "already posted to the mailbox"
+
+cap_missing="$(mktemp -d)"; tmpdirs+=("$cap_missing")
+no_sum_bin="$(mktemp -d)"; tmpdirs+=("$no_sum_bin")
+cp -- "$stub_bin/fork-sandbox.sh" "$no_sum_bin/"
+out_missing="$(PATH="$no_sum_bin:$PATH" STUB_CAPTURE_DIR="$cap_missing" STUB_RUN_PREFIX="$run_prefix_dir" \
+    STUB_REPLY_TO="$patch2_id" STUB_REPLY_TO_BRACKETED="$patch_id_bracketed" \
+    "$round" widget-frob --project "$project_dir" --checkout otherbranch \
+    --personas core --personas-dir "$work" \
+    --reply-to "$patch2_id" 2>&1)"
+rc_missing=$?
+if (( rc_missing != 0 )); then ok "a missing lkml-summarize.sh refuses the round at startup"; else no "a missing lkml-summarize.sh refuses the round at startup" "exit 0: $out_missing"; fi
+contains "the missing-summarizer error names --no-summarize" "$out_missing" "--no-summarize"
+n_launches=$(find "$cap_missing" -name '*.task-meta.json' | wc -l)
+check "a missing summarizer launches no personas" "0" "$n_launches"
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 (( fail == 0 )) || exit 1
