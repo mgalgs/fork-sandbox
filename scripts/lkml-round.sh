@@ -153,8 +153,13 @@ if [[ -z "$model_override" ]]; then
     # round, not half a panel. --model-override flattens the roster
     # regardless, so the seats file is not consulted at all.
     "$script_dir/lkml-seats-resolve" check "$personas_dir" || exit 1
-    seats_file="${LKML_SEATS_FILE:-$HOME/.config/fork-sandbox/lkml-seats.yaml}"
-    [[ -e "$seats_file" ]] && seats_active=1
+    # Whether a seats file is in effect (and where) is owned by the
+    # resolver, the single owner of the LKML_SEATS_FILE default path and
+    # its set-but-empty-means-unset semantics: if this launcher
+    # re-derived the path and drifted, it would silently launch the
+    # whole panel on the frontmatter pins, the fallback the seats file
+    # exists to prevent.
+    "$script_dir/lkml-seats-resolve" active "$personas_dir" && seats_active=1
 fi
 
 trust_args=()

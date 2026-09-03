@@ -3,6 +3,7 @@
 # persona seat runs on this machine, applying the machine seats file.
 #
 # Usage: lkml-seats-resolve check <personas-dir>
+#        lkml-seats-resolve active <personas-dir>
 #        lkml-seats-resolve resolve <personas-dir> <persona> <fm-harness>
 #                                            <fm-model> <fm-thinking>
 #
@@ -21,6 +22,14 @@
 # `check` validates the file (or its explicit absence) and exits 0.
 # Launchers that may launch more than one persona call it once, before
 # ANY launch, so a typo refuses the whole round instead of half a panel.
+#
+# `active` reports whether a seats file is in effect at the owned path:
+# exit 0 when the file exists, exit 1 when it does not (an explicit
+# LKML_SEATS_FILE pointing at a missing path is still an error, not a
+# mere inactivity). Launchers query it instead of re-deriving the path:
+# the default and the set-but-empty-means-unset semantics live here
+# only, so a launcher cannot drift into a silent frontmatter fallback
+# the seats file was meant to prevent.
 #
 # `resolve` prints exactly four lines on stdout, one field per line
 # (one-per-line rather than delimited: fields may be empty, and a
@@ -77,6 +86,11 @@ usage() {
     sed -n '2,/^set -euo/{ /^#/s/^# \?//p }' "$0"
 }
 
+if [[ "${1-}" == -h || "${1-}" == --help ]]; then
+    usage
+    exit 0
+fi
+
 (( $# == 2 || $# == 6 )) || { usage >&2; exit 1; }
 mode="$1"
 personas_dir="$2"
@@ -90,6 +104,9 @@ if [[ ! -e "$seats_file" ]]; then
         echo "pins stand." >&2
         exit 1
     fi
+    if [[ "$mode" == "active" ]]; then
+        exit 1
+    fi
     if [[ "$mode" == "resolve" ]]; then
         # No seats file: today's behavior, the frontmatter pins verbatim
         # (resolve mode's $4/$5/$6 are the fm-* arguments).
@@ -99,6 +116,12 @@ if [[ ! -e "$seats_file" ]]; then
 fi
 
 script_dir="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+
+if [[ "$mode" == "active" ]]; then
+    # Presence is all this mode answers; `check` does the parsing.
+    exit 0
+fi
+
 parsed="$(python3 "$script_dir/lkml-seats-parse.py" "$seats_file" "$seats_file" "$personas_dir")"
 
 # The parser emits at most one line per (section, key); `default` lines

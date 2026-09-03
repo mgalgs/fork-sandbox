@@ -298,6 +298,29 @@ else
 fi
 contains "unparseable YAML is named as such" "$(cat "$work/err")" "not valid YAML"
 
+printf '\n== -h and --help print the header to stdout and exit 0 ==\n'
+help_out="$(HOME="$home_dir" "$resolver" -h 2>"$work/err")"; help_rc=$?
+check "-h exits 0" "0" "$help_rc"
+contains "-h prints the usage to stdout" "$help_out" "Usage: lkml-seats-resolve check"
+check "-h prints nothing to stderr" "" "$(cat "$work/err")"
+help_out="$(HOME="$home_dir" "$resolver" --help 2>"$work/err")"; help_rc=$?
+check "--help exits 0" "0" "$help_rc"
+contains "--help prints the usage to stdout" "$help_out" "lkml-seats-resolve active"
+
+printf '\n== active: the seats-file path rule lives in the resolver ==\n'
+HOME="$home_dir" LKML_SEATS_FILE='' "$resolver" active "$personas_test_dir"
+check "active: no file anywhere is inactive" "1" "$?"
+mkdir -p -- "$home_dir/.config/fork-sandbox"
+printf 'default:\n  harness: pi-local\n' > "$home_dir/.config/fork-sandbox/lkml-seats.yaml"
+HOME="$home_dir" LKML_SEATS_FILE='' "$resolver" active "$personas_test_dir"
+check "active: the default path is honored" "0" "$?"
+res_out="$(HOME="$home_dir" LKML_SEATS_FILE='' "$resolver" resolve "$personas_test_dir" core claude opus "")"
+check "set-but-empty LKML_SEATS_FILE consults the default path" "pi-local" "$(printf '%s\n' "$res_out" | sed -n 1p)"
+rm -f -- "$home_dir/.config/fork-sandbox/lkml-seats.yaml"
+HOME="$home_dir" LKML_SEATS_FILE="$work/nope.yaml" "$resolver" active "$personas_test_dir" 2>"$work/err"
+check "active: an explicit missing path errors, not just inactivates" "1" "$?"
+contains "active: the error names the path" "$(cat "$work/err")" "nope.yaml"
+
 printf '\n== integration: lkml-round.sh against the stub ==\n'
 
 # A minimal series to round on, same shape as tests/lkml-round-test.sh.
@@ -522,6 +545,26 @@ if (( RC != 0 )); then ok "a typo'd persona name exits non-zero"; else no "a typ
 contains "typo'd persona name is named" "$OUT" "personas.corr"
 n_launches=$(find "$capture_dir" -name '*.argv' | wc -l | tr -d '[:space:]')
 check "typo'd persona name launches no persona" "0" "$n_launches"
+
+printf '\n== round consults the default seats path without the env hook ==\n'
+# The seats file sits at the resolver's owned default path under the
+# controlled HOME and no LKML_SEATS_FILE is set: the round must find
+# and announce it, proving the launcher did not re-derive the path.
+cat > "$home_dir/.config/fork-sandbox/lkml-seats.yaml" <<'YAML'
+default:
+  harness: pi-local
+YAML
+rm -f -- "$capture_dir"/*.argv
+OUT="$(env HOME="$home_dir" PATH="$stub_bin:$PATH" \
+    STUB_CAPTURE_DIR="$capture_dir" STUB_RUN_PREFIX="$run_prefix_dir" \
+    "$round" widget-seats --project "$project_dir" --checkout somebranch \
+    --base somebranch --personas core,author,ci --personas-dir "$personas_test_dir" \
+    2>&1)"
+RC=$?
+check "default-path round exits 0" "0" "$RC"
+contains "default-path round re-seats the panel and announces it" "$OUT" \
+    "lkml-round: seat core: pi-local (lkml-seats.yaml, was claude/opus)"
+rm -f -- "$home_dir/.config/fork-sandbox/lkml-seats.yaml"
 
 printf '\n== the author scripts consume the same seats resolution ==\n'
 # Same seats file for all three: the author persona (claude/opus in
