@@ -383,6 +383,13 @@ What to expect while it is on:
   review loops), overridable per machine in
   `~/.config/fork-sandbox/coder-mode.env`. The session never lowers the
   review on its own; a deviation is announced in one line.
+- To pin one composition for a whole session, name it on the invocation:
+  `/sandbox-coder-mode --preset <name>` runs every round on that preset
+  from `~/.config/fork-sandbox/presets/`, whatever the machine file says.
+  It is the flag for a standing constraint the machine default does not
+  know about — a nearly exhausted subscription, a provider to stay off.
+  `--auto-preset-router` is the opposite choice: let the session pick a
+  preset per round from that directory. A pin wins over the router.
 - Steer a round in flight by just saying so — the session relays the
   correction into the running sandbox as an operator addendum, without
   restarting it.

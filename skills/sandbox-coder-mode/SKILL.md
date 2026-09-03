@@ -1,7 +1,7 @@
 ---
 name: sandbox-coder-mode
 description: Enter a standing mode where this session stops writing code and delegates every coding and editing task to an unattended fork-sandbox run, acting as orchestrator, reviewer and integrator. Use when the user wants an expensive model to plan and review while cheap or self-hosted models do the typing, or wants unattended editing to happen somewhere that is not their own checkout. Stays on until the user ends it.
-argument-hint: [off|--auto-preset-router] — no argument turns the mode on. Pass "off" (or say so in plain words) to end it. "--auto-preset-router" lets the orchestrator route each round to the machine preset that fits the task — see "The auto-preset router". "--long" is accepted and changes nothing: the long-horizon discipline is the default — see "Running long".
+argument-hint: [off|--preset <name>|--auto-preset-router] — no argument turns the mode on. Pass "off" (or say so in plain words) to end it. "--preset <name>" pins every round of this session to that machine preset — see "Pinning one preset for the session". "--auto-preset-router" instead lets the orchestrator route each round to the machine preset that fits the task — see "The auto-preset router". "--long" is accepted and changes nothing: the long-horizon discipline is the default — see "Running long".
 user-invocable: true
 ---
 
@@ -86,6 +86,12 @@ When the file sets `CODER_MODE_PRESET`, the composition lives in
 `~/.config/fork-sandbox/presets/<name>.yaml` instead of in per-flag keys:
 read that file too, and word the announcement from what it says — see
 **The machine's composition can be a preset** for the key's rules.
+
+When the mode is invoked with `--preset <name>`, that preset is the
+composition for every round instead of whatever the machine file says —
+read it and word the announcement from it, saying which preset is pinned
+and that it overrides the machine default. See **Pinning one preset for
+the session**.
 
 When the mode is invoked with `--auto-preset-router` (or the machine sets
 `CODER_MODE_AUTO_PRESET_ROUTER=1`), also list
@@ -797,6 +803,36 @@ ceremony:
 
 A launch at the default needs no such line. A launch that deviates and
 does not carry one is a launch the user cannot audit.
+
+### Pinning one preset for the session
+
+`--preset <name>` on the mode's invocation pins that preset as the
+composition for **every** round, in place of whatever
+`~/.config/fork-sandbox/presets/` composition the machine file names. It
+is the flag for a session with a standing constraint the machine default
+does not know about — a nearly exhausted subscription, a provider to stay
+off, an endpoint to exercise — where the answer is the same for every
+round and the user has already decided it.
+
+The preset must exist in `~/.config/fork-sandbox/presets/`. The flag
+selects among the user's own presets; it never composes one, and a name
+with no file behind it is an error to surface, not to approximate with
+the nearest match.
+
+Read the pinned file on entering the mode and announce it — which preset,
+and that it overrides the machine default — since the whole point is that
+this session composes rounds differently from every other session on the
+machine.
+
+**A pin turns the router off for the session.** A pinned composition and
+a router that chooses compositions are two answers to one question, so
+`--preset` wins over `CODER_MODE_AUTO_PRESET_ROUTER=1` and over
+`--auto-preset-router` typed alongside it; say so in the announcement
+rather than leaving the user to wonder which one is in force. Everything
+else stands unchanged: a pin is still not a licence to lower the review
+composition, and a per-round deviation is still flags stacked on top of
+`--preset` with its reason announced (**The review loop is the user's
+setting, not the orchestrator's**).
 
 ### The auto-preset router
 
