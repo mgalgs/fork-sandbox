@@ -63,14 +63,18 @@
 # `thinking` is harness-portable between pi flavors, so it inherits
 # from frontmatter unless a seats entry sets it -- but it only reaches
 # a seat on pi and pi-local (the launchers pass it via --pi-args, and
-# nothing else). An EXPLICIT seats-file `thinking` on a persona whose
+# nothing else). An EXPLICIT seats-file `thinking` set at the effective
+# harness's scope or a higher-precedence one on a persona whose
 # resolved harness is not a pi flavor is a refusal in `resolve` (naming
-# the persona, the key and the resolved harness): announcing it would
-# report a no-op as a change. An INHERITED frontmatter `thinking` is
-# dropped silently when the seats file moves the harness off pi, the
-# same logic as the model drop -- it was written for the frontmatter's
-# harness. The announce and launch lines mention `thinking` only when
-# it will actually be passed.
+# the key by its seats-file path -- `default.thinking` or
+# `personas.<p>.thinking` -- plus the persona and the resolved
+# harness): announcing it would report a no-op as a change. A `default:`
+# thinking UNDER a `personas.<p>` harness is a lower-scope key, and the
+# scope rule above drops it with the re-seat instead -- the same logic
+# as the model drop -- as is an INHERITED frontmatter `thinking` when
+# the seats file moves the harness off pi; both were written for a
+# different seat. The announce and launch lines mention `thinking` only
+# when it will actually be passed.
 #
 # A missing file at the DEFAULT path is not an error: everything falls
 # back to the frontmatter values verbatim (the fm-* arguments are
@@ -180,16 +184,27 @@ if (( pi_flavor )); then
     thinking="${p_thinking:-${def_thinking:-$fm_thinking}}"
 else
     # thinking only reaches a seat via --pi-args, which the launchers
-    # pass only to pi and pi-local. An explicit seats-file thinking
-    # that lands on a non-pi seat would be announced as if it took
-    # effect and then silently dropped, so it is refused; the
-    # frontmatter's was written for the frontmatter's harness, so it
-    # is dropped silently, the same logic as the model drop.
-    if [[ -n "$p_thinking" || -n "$def_thinking" ]]; then
-        echo "Error: seats file '$seats_file': persona '$persona' sets" >&2
-        echo "'thinking', but its resolved harness is '$harness', which is" >&2
-        echo "not a pi flavor. Thinking reaches a seat only via --pi-args" >&2
-        echo "on pi and pi-local; remove the key or move the seat." >&2
+    # pass only to pi and pi-local. An explicit seats-file thinking set
+    # at the effective harness's scope or a higher-precedence one would
+    # be announced as if it took effect and then silently dropped, so
+    # it is refused; the frontmatter's was written for the
+    # frontmatter's harness, and a default: thinking under a
+    # personas.<p> harness was re-seated out of scope (the same logic
+    # as the model drop), so both are dropped silently.
+    bad_key=""
+    if [[ -n "$p_thinking" ]]; then
+        # the persona's own scope is at or above the effective
+        # harness's scope, wherever that harness was set
+        bad_key="personas.$persona.thinking"
+    elif [[ -z "$p_harness" && -n "$def_thinking" ]]; then
+        # only when no persona-scope harness re-seats the seat below it
+        bad_key="default.thinking"
+    fi
+    if [[ -n "$bad_key" ]]; then
+        echo "Error: seats file '$seats_file': $bad_key sets 'thinking'" >&2
+        echo "for persona '$persona', but its resolved harness is '$harness'," >&2
+        echo "which is not a pi flavor. Thinking reaches a seat only via" >&2
+        echo "--pi-args on pi and pi-local; remove the key or move the seat." >&2
         exit 1
     fi
 fi

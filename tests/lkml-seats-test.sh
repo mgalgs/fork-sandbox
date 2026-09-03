@@ -220,7 +220,8 @@ default:
 YAML
 resolve_helper "$work/seats-thinknopy.yaml" core claude opus ""
 check "explicit seats thinking on a non-pi seat is refused" "1" "$RES_RC"
-contains "the refusal names the persona" "$RES_ERR" "'core'"
+contains "the refusal names the key's default-scope path" "$RES_ERR" "default.thinking"
+contains "the refusal names the persona the seat affects" "$RES_ERR" "for persona 'core'"
 contains "the refusal names the key" "$RES_ERR" "'thinking'"
 contains "the refusal names the resolved harness" "$RES_ERR" "'claude'"
 contains "the refusal names the file" "$RES_ERR" "seats-thinknopy.yaml"
@@ -232,6 +233,7 @@ personas:
 YAML
 resolve_helper "$work/seats-thinknop2.yaml" core claude opus ""
 check "persona-level explicit thinking is refused too" "1" "$RES_RC"
+contains "the persona-scope refusal names the key's path" "$RES_ERR" "personas.core.thinking"
 resolve_helper "$work/seats-thinknop2.yaml" thinky pi-local "" high
 check "the same file still re-seats a pi seat" "pi-local" "$(resolved_field RES_OUT 1)"
 check "the pi seat keeps its own thinking" "high" "$(resolved_field RES_OUT 3)"
@@ -248,6 +250,39 @@ case "$(resolved_field RES_OUT 4)" in
     *thinking*) no "the announce does not mention the dropped thinking" "$(resolved_field RES_OUT 4)" ;;
     *) ok "the announce does not mention the dropped thinking" ;;
 esac
+
+printf '\n== a lower-scope thinking is dropped with the re-seat, not refused ==\n'
+# The scope rule the model drop follows: a personas.<p> harness DROPS
+# keys from lower-precedence scopes. A default: thinking under a
+# personas.<p> harness is that lower scope -- the mixed pi/non-pi roster
+# (panel local, one expensive reviewer) must resolve, not refuse.
+cat > "$work/seats-crossscope.yaml" <<'YAML'
+default:
+  harness: pi-local
+  thinking: low
+personas:
+  core:
+    harness: claude
+    model: opus
+YAML
+resolve_helper "$work/seats-crossscope.yaml" core claude opus ""
+check "the persona harness re-seats core to claude" "claude" "$(resolved_field RES_OUT 1)"
+check "the persona's model rides the persona's harness" "opus" "$(resolved_field RES_OUT 2)"
+check "a lower-scope thinking does not refuse the seat" "0" "$RES_RC"
+check "the lower-scope thinking reaches no seat" "" "$(resolved_field RES_OUT 3)"
+check "the lower-scope thinking prints nothing to stderr" "" "$RES_ERR"
+resolve_helper "$work/seats-crossscope.yaml" author claude opus ""
+check "the default's harness still re-seats a pi seat" "pi-local" "$(resolved_field RES_OUT 1)"
+check "the default's thinking still applies on a pi seat" "low" "$(resolved_field RES_OUT 3)"
+cat > "$work/seats-crosspi.yaml" <<'YAML'
+default:
+  thinking: low
+personas:
+  thinky:
+    harness: pi-local
+YAML
+resolve_helper "$work/seats-crosspi.yaml" thinky pi-local "" high
+check "a lower-scope thinking composes on a pi seat" "low" "$(resolved_field RES_OUT 3)"
 
 printf '\n== refusals name the file and the offending key ==\n'
 bad() {  # bad <label> <yaml> <expected-needle>
@@ -498,7 +533,7 @@ YAML
 rm -f -- "$capture_dir"/*.argv
 launch_round "$work/seats-round-perpthink.yaml" core,thinky
 if (( RC != 0 )); then ok "persona-scoped refusal refuses the round"; else no "persona-scoped refusal refuses the round" "exit 0: $OUT"; fi
-contains "the persona-scoped refusal names the persona" "$OUT" "'core'"
+contains "the persona-scoped refusal names the key's path" "$OUT" "personas.core.thinking"
 case "$OUT" in
     *"launching thinky"*) no "a neighbor of the refused seat is not launched" "$OUT" ;;
     *) ok "a neighbor of the refused seat is not launched" ;;

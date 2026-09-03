@@ -200,10 +200,14 @@ Setting `harness` at any scope DROPS `model` from every
 lower-precedence scope (a bare `pi-local` resolves from the endpoint, a
 bare `claude` takes the harness default); a model survives only from
 the same scope as the effective harness or a higher one. `thinking`
-inherits from frontmatter unless an entry sets it, but it only reaches
-a seat on `pi`/`pi-local`: an explicit `thinking` on a persona whose
-resolved harness is not a pi flavor refuses the run, and the
-frontmatter's is dropped silently when the seat moves off pi.
+inherits from frontmatter unless an entry sets it, but it only
+reaches a seat on `pi`/`pi-local`: an explicit `thinking` set at the
+effective seat's scope or a higher one (a `personas.<name>` thinking,
+or a `default:` thinking with no persona entry re-seating the harness)
+refuses the run on a resolved non-pi harness, naming the key's path;
+a lower-scope one (a `default:` thinking under a `personas.<name>`
+harness) is dropped with the re-seat, and the frontmatter's is dropped
+silently when the seat moves off pi.
 A missing file means the frontmatter pins stand exactly as shipped; an
 unreadable or unparseable one refuses the run loudly — a typo never
 silently re-seats the panel onto the expensive endpoint. Every seat the
