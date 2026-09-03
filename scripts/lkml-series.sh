@@ -235,13 +235,16 @@ harness_spec="$harness"
 
 # Same rule as lkml-round.sh: the `thinking:` seat fact only means
 # something on a harness that starts pi; fork-sandbox.sh refuses
-# --pi-args elsewhere, so it is dropped for claude and codex.
+# --pi-args elsewhere, so it is dropped for claude and codex -- and so
+# is its launch-line mention, which would announce a no-op.
 pi_args=()
+thinking_note=""
 if [[ -n "$thinking" && ( "$harness" == "pi" || "$harness" == "pi-local" ) ]]; then
     pi_args=(--pi-args "--thinking $thinking")
+    thinking_note=", thinking $thinking"
 fi
 
-echo "fork-sandbox lkml-series: launching $author_persona ($harness_spec${thinking:+, thinking $thinking}) for v1..." >&2
+echo "fork-sandbox lkml-series: launching $author_persona ($harness_spec$thinking_note) for v1..." >&2
 launch_out="$(fork-sandbox.sh --harness "$harness_spec" --checkout "$tip_ref" \
     "${pi_args[@]}" \
     --branch "$branch" --task-meta "$task_meta" "$project" "$handoff_file" 2>&1)"

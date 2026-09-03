@@ -212,6 +212,43 @@ contains "an overridden thinking is announced" "$RES_OUT" "thinking low, was hig
 resolve_helper "$work/seats-thinking.yaml" core claude opus ""
 check "a seats thinking applies to personas whose frontmatter has none" "low" "$(resolved_field RES_OUT 3)"
 
+printf '\n== thinking on a non-pi seat: explicit refused, inherited dropped ==\n'
+cat > "$work/seats-thinknopy.yaml" <<'YAML'
+default:
+  harness: claude
+  thinking: low
+YAML
+resolve_helper "$work/seats-thinknopy.yaml" core claude opus ""
+check "explicit seats thinking on a non-pi seat is refused" "1" "$RES_RC"
+contains "the refusal names the persona" "$RES_ERR" "'core'"
+contains "the refusal names the key" "$RES_ERR" "'thinking'"
+contains "the refusal names the resolved harness" "$RES_ERR" "'claude'"
+contains "the refusal names the file" "$RES_ERR" "seats-thinknopy.yaml"
+cat > "$work/seats-thinknop2.yaml" <<'YAML'
+personas:
+  core:
+    harness: claude
+    thinking: low
+YAML
+resolve_helper "$work/seats-thinknop2.yaml" core claude opus ""
+check "persona-level explicit thinking is refused too" "1" "$RES_RC"
+resolve_helper "$work/seats-thinknop2.yaml" thinky pi-local "" high
+check "the same file still re-seats a pi seat" "pi-local" "$(resolved_field RES_OUT 1)"
+check "the pi seat keeps its own thinking" "high" "$(resolved_field RES_OUT 3)"
+cat > "$work/seats-harnoffpi.yaml" <<'YAML'
+default:
+  harness: claude
+YAML
+resolve_helper "$work/seats-harnoffpi.yaml" thinky pi-local "" high
+check "moving a seat off pi is not itself an error" "0" "$RES_RC"
+check "the inherited frontmatter thinking is dropped" "" "$(resolved_field RES_OUT 3)"
+contains "the harness move is still announced" "$RES_OUT" \
+    "seat thinky: claude (seats-harnoffpi.yaml, was pi-local)"
+case "$(resolved_field RES_OUT 4)" in
+    *thinking*) no "the announce does not mention the dropped thinking" "$(resolved_field RES_OUT 4)" ;;
+    *) ok "the announce does not mention the dropped thinking" ;;
+esac
+
 printf '\n== refusals name the file and the offending key ==\n'
 bad() {  # bad <label> <yaml> <expected-needle>
     local file="$work/bad.yaml"
@@ -417,6 +454,33 @@ launch_round "$work/seats-round-thinking.yaml" core,author,ci
 contains "seats thinking is passed to a pi-local seat via --pi-args" \
     "$(argv_of core)" "--pi-args --thinking low"
 
+printf '\n== a seats thinking that cannot apply refuses the round ==\n'
+rm -f -- "$capture_dir"/*.argv
+launch_round "$work/seats-thinknopy.yaml" core,author,ci
+if (( RC != 0 )); then ok "explicit thinking on a non-pi seat refuses the round"; else no "explicit thinking on a non-pi seat refuses the round" "exit 0: $OUT"; fi
+contains "the round prints the refusal" "$OUT" "not a pi flavor"
+n_launches=$(find "$capture_dir" -name '*.argv' | wc -l | tr -d '[:space:]')
+check "the refusal launches no persona" "0" "$n_launches"
+
+printf '\n== a seat moved off pi drops the launch line%s thinking ==\n' "'"
+rm -f -- "$capture_dir"/*.argv
+launch_round "$work/seats-harnoffpi.yaml" core,thinky
+check "off-pi round exits 0" "0" "$RC"
+contains "the launch line does not mention the dropped thinking" "$OUT" \
+    "launching thinky (claude)..."
+case "$(argv_of thinky)" in
+    *--pi-args*) no "no --pi-args reaches a claude seat" "$(argv_of thinky)" ;;
+    *) ok "no --pi-args reaches a claude seat" ;;
+esac
+rm -f -- "$capture_dir"/*.argv
+launch_round ABSENT thinky --model-override claude
+contains "a bare override off pi drops the launch line thinking" "$OUT" \
+    "launching thinky (claude)..."
+case "$(argv_of thinky)" in
+    *--pi-args*) no "a bare override off pi passes no --pi-args" "$(argv_of thinky)" ;;
+    *) ok "a bare override off pi passes no --pi-args" ;;
+esac
+
 printf '\n== --model-override still beats the seats file, and stays quiet ==\n'
 rm -f -- "$capture_dir"/*.argv
 launch_round "$work/seats-round.yaml" core,author,ci --model-override pi-local
@@ -493,6 +557,16 @@ contains "revise: the seats file re-seats the author" "$OUT" \
     "launching author (pi-local, thinking low) for v2"
 contains "revise: the moved seat is announced" "$OUT" \
     "lkml-revise: seat author: pi-local (seats-author.yaml, was claude/opus)"
+launch_author "$repo_dir/scripts/lkml-revise.sh" "$work/seats-harnoffpi.yaml" \
+    widget-seats --project "$project_dir" --checkout somebranch --version 1 \
+    --base somebranch --personas-dir "$personas_test_dir" --author thinky
+contains "revise: a seat moved off pi keeps the launch line clean" "$OUT" \
+    "launching thinky (claude) for v2"
+launch_author "$repo_dir/scripts/lkml-revise.sh" "$work/seats-thinknopy.yaml" \
+    widget-seats --project "$project_dir" --checkout somebranch --version 1 \
+    --base somebranch --personas-dir "$personas_test_dir" --author thinky
+if (( RC != 0 )); then ok "revise: explicit thinking on a non-pi seat refuses"; else no "revise: explicit thinking on a non-pi seat refuses" "exit 0: $OUT"; fi
+contains "revise: the refusal names the persona" "$OUT" "'thinky'"
 launch_author "$repo_dir/scripts/lkml-revise.sh" ABSENT \
     widget-seats --project "$project_dir" --checkout somebranch --version 1 \
     --base somebranch --personas-dir "$personas_test_dir" --model-override pi-local
@@ -516,6 +590,11 @@ contains "cover: the seats file re-seats the author" "$OUT" \
     "launching author (pi-local, thinking low)"
 contains "cover: the moved seat is announced" "$OUT" \
     "lkml-cover: seat author: pi-local (seats-author.yaml, was claude/opus)"
+launch_author "$repo_dir/scripts/lkml-cover.sh" "$work/seats-harnoffpi.yaml" \
+    widget-seats --project "$project_dir" --checkout somebranch --base somebranch \
+    --patches "$work/patches" --personas-dir "$personas_test_dir" --author thinky
+contains "cover: a seat moved off pi keeps the launch line clean" "$OUT" \
+    "launching thinky (claude)"
 launch_author "$repo_dir/scripts/lkml-cover.sh" ABSENT \
     widget-seats --project "$project_dir" --checkout somebranch --base somebranch \
     --patches "$work/patches" --personas-dir "$personas_test_dir" --model-override pi-local
@@ -539,6 +618,11 @@ contains "series: the seats file re-seats the author" "$OUT" \
     "launching author (pi-local, thinking low) for v1"
 contains "series: the moved seat is announced" "$OUT" \
     "lkml-series: seat author: pi-local (seats-author.yaml, was claude/opus)"
+launch_author "$repo_dir/scripts/lkml-series.sh" "$work/seats-harnoffpi.yaml" \
+    widget-seats --project "$project_dir" --range "HEAD..somebranch" \
+    --personas-dir "$personas_test_dir" --author thinky
+contains "series: a seat moved off pi keeps the launch line clean" "$OUT" \
+    "launching thinky (claude) for v1"
 launch_author "$repo_dir/scripts/lkml-series.sh" ABSENT \
     widget-seats --project "$project_dir" --range "HEAD..somebranch" \
     --personas-dir "$personas_test_dir" --model-override pi-local

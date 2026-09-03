@@ -441,17 +441,20 @@ for persona in "${personas[@]}"; do
 
     # A persona's `thinking:` field sets pi's reasoning level for its seat.
     # It only means something on a harness that starts pi; fork-sandbox.sh
-    # refuses --pi-args elsewhere, so it is dropped for claude and codex.
+    # refuses --pi-args elsewhere, so it is dropped for claude and codex --
+    # and so is its launch-line mention, which would announce a no-op.
     # A small local thinking model left at its default has been measured
     # spending its whole reply budget reasoning (stop=length, repeatedly)
     # and writing no .git/lkml-out file at all — a reviewer that says
     # nothing. `thinking: low` is the fix for that seat, not a smaller panel.
     pi_args=()
+    thinking_note=""
     if [[ -n "$thinking" && ( "$harness" == "pi" || "$harness" == "pi-local" ) ]]; then
         pi_args=(--pi-args "--thinking $thinking")
+        thinking_note=", thinking $thinking"
     fi
 
-    echo "fork-sandbox lkml-round: launching $persona ($harness_spec${thinking:+, thinking $thinking})..." >&2
+    echo "fork-sandbox lkml-round: launching $persona ($harness_spec$thinking_note)..." >&2
     launch_out="$(fork-sandbox.sh --harness "$harness_spec" --checkout "$checkout_ref" \
         "${pi_args[@]}" "${trust_args[@]}" \
         --branch "$branch" --task-meta "$task_meta" "$project" "$handoff_file" 2>&1)"

@@ -51,9 +51,17 @@
 # Composing a lower scope's model onto a new harness is what asks the
 # endpoint for a model it does not serve: a bare pi-local resolves its
 # model from the endpoint, and a bare claude takes the harness default.
-# `thinking` is
-# harness-portable between pi flavors, so it inherits from frontmatter
-# unless a seats entry sets it.
+# `thinking` is harness-portable between pi flavors, so it inherits
+# from frontmatter unless a seats entry sets it -- but it only reaches
+# a seat on pi and pi-local (the launchers pass it via --pi-args, and
+# nothing else). An EXPLICIT seats-file `thinking` on a persona whose
+# resolved harness is not a pi flavor is a refusal in `resolve` (naming
+# the persona, the key and the resolved harness): announcing it would
+# report a no-op as a change. An INHERITED frontmatter `thinking` is
+# dropped silently when the seats file moves the harness off pi, the
+# same logic as the model drop -- it was written for the frontmatter's
+# harness. The announce and launch lines mention `thinking` only when
+# it will actually be passed.
 #
 # A missing file at the DEFAULT path is not an error: everything falls
 # back to the frontmatter values verbatim (the fm-* arguments are
@@ -140,18 +148,48 @@ else
     harness="$fm_harness"
     model="${p_model:-${def_model:-$fm_model}}"
 fi
-thinking="${p_thinking:-${def_thinking:-$fm_thinking}}"
+thinking=""
+pi_flavor=0
+case "$harness" in
+    pi|pi-local) pi_flavor=1 ;;
+esac
+if (( pi_flavor )); then
+    thinking="${p_thinking:-${def_thinking:-$fm_thinking}}"
+else
+    # thinking only reaches a seat via --pi-args, which the launchers
+    # pass only to pi and pi-local. An explicit seats-file thinking
+    # that lands on a non-pi seat would be announced as if it took
+    # effect and then silently dropped, so it is refused; the
+    # frontmatter's was written for the frontmatter's harness, so it
+    # is dropped silently, the same logic as the model drop.
+    if [[ -n "$p_thinking" || -n "$def_thinking" ]]; then
+        echo "Error: seats file '$seats_file': persona '$persona' sets" >&2
+        echo "'thinking', but its resolved harness is '$harness', which is" >&2
+        echo "not a pi flavor. Thinking reaches a seat only via --pi-args" >&2
+        echo "on pi and pi-local; remove the key or move the seat." >&2
+        exit 1
+    fi
+fi
 
 announce=""
-if [[ "$harness" != "$fm_harness" || "$model" != "$fm_model" || "$thinking" != "$fm_thinking" ]]; then
+changed=0
+[[ "$harness" != "$fm_harness" ]] && changed=1
+[[ "$model" != "$fm_model" ]] && changed=1
+# A dropped frontmatter thinking (non-pi seat) is a silent drop, not a
+# change to announce; on a pi seat it is compared as before.
+(( pi_flavor )) && [[ "$thinking" != "$fm_thinking" ]] && changed=1
+if (( changed )); then
     new_spec="$harness"
     [[ -n "$model" ]] && new_spec="$harness/$model"
     old_spec="$fm_harness"
     [[ -n "$fm_model" ]] && old_spec="$fm_harness/$fm_model"
     announce="seat $persona: $new_spec ($(basename -- "$seats_file"), was $old_spec)"
-    [[ -n "$fm_thinking" && "$thinking" != "$fm_thinking" ]] \
+    # Mention thinking in the announce only when it will actually be
+    # passed to the seat; the launchers drop it elsewhere, and
+    # announcing a no-op is exactly what this refusal exists to stop.
+    (( pi_flavor )) && [[ -n "$fm_thinking" && "$thinking" != "$fm_thinking" ]] \
         && announce="$announce; thinking $thinking, was $fm_thinking"
-    [[ -z "$fm_thinking" && -n "$thinking" ]] \
+    (( pi_flavor )) && [[ -z "$fm_thinking" && -n "$thinking" ]] \
         && announce="$announce; thinking $thinking"
 fi
 
