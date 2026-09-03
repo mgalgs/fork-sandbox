@@ -47,7 +47,15 @@
 #             e.g. `lkml-revise: seat author: pi-local (lkml-seats.yaml,
 #             was claude/opus)`; --model-override wins over the seats file
 #             silently.
-# --timeout   seconds to wait for the run to finish. Default 3600.
+# --timeout   seconds to wait for the run to finish. Default 3600, which
+#             an author round routinely outlives -- measured repeatedly on
+#             v6/v7-scale revisions, each still working an hour past the
+#             default. Pass something like 10800 for a real revision. What
+#             the deadline bounds is only THIS SCRIPT'S WAIT: the run is a
+#             detached session that keeps going, commits, and fetches its
+#             branch back regardless, so a timeout costs the harvest and
+#             the changelog post, not the work. Re-harvest by hand from the
+#             run dir named in the error.
 #
 # Unlike lkml-round.sh, this run is allowed to commit -- that is the whole
 # point. The handoff hands the author the full thread tree and everything
@@ -303,7 +311,18 @@ echo "fork-sandbox lkml-revise: waiting up to ${timeout}s..." >&2
 waited=0
 while [[ ! -f "$run_dir/summary.json" ]]; do
     if (( waited >= timeout )); then
+        # The run outliving this wait is the common case, not a failure of
+        # the run: it is a detached session that keeps working, commits and
+        # fetches its branch back on its own. Say so, because the bare
+        # timeout reads as "the author round died" and sends the operator
+        # off to relaunch work that is still in progress.
         echo "Error: timed out after ${timeout}s waiting for the run to finish." >&2
+        echo "The run is probably still going -- this wait is the only thing" >&2
+        echo "that ended. It will still commit and fetch its branch back." >&2
+        echo "Watch it:      fork-sandbox-status.sh --follow $run_dir" >&2
+        echo "Then harvest:  re-run this command once summary.json exists," >&2
+        echo "or post the changelog by hand from the branch it fetched." >&2
+        echo "An author round on a real revision wants --timeout 10800." >&2
         exit 1
     fi
     sleep 10
