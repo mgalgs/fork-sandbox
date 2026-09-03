@@ -485,6 +485,34 @@ contains "the round prints the refusal" "$OUT" "not a pi flavor"
 n_launches=$(find "$capture_dir" -name '*.argv' | wc -l | tr -d '[:space:]')
 check "the refusal launches no persona" "0" "$n_launches"
 
+printf '\n== a persona-scoped refusal refuses before any launch too ==\n'
+# The refusal above sets thinking at default: scope, which refuses every
+# persona; this one refuses only core (a non-pi seat with an explicit
+# thinking), and the round must not launch thinky first and fail after.
+cat > "$work/seats-round-perpthink.yaml" <<'YAML'
+personas:
+  core:
+    harness: claude
+    thinking: low
+YAML
+rm -f -- "$capture_dir"/*.argv
+launch_round "$work/seats-round-perpthink.yaml" core,thinky
+if (( RC != 0 )); then ok "persona-scoped refusal refuses the round"; else no "persona-scoped refusal refuses the round" "exit 0: $OUT"; fi
+contains "the persona-scoped refusal names the persona" "$OUT" "'core'"
+case "$OUT" in
+    *"launching thinky"*) no "a neighbor of the refused seat is not launched" "$OUT" ;;
+    *) ok "a neighbor of the refused seat is not launched" ;;
+esac
+n_launches=$(find "$capture_dir" -name '*.argv' | wc -l | tr -d '[:space:]')
+check "the persona-scoped refusal launches no persona" "0" "$n_launches"
+# The refusal must not be persona-order-dependent: the same file with the
+# refused seat last in the roster still launches nothing.
+rm -f -- "$capture_dir"/*.argv
+launch_round "$work/seats-round-perpthink.yaml" thinky,core
+if (( RC != 0 )); then ok "persona-scoped refusal is order-independent"; else no "persona-scoped refusal is order-independent" "exit 0: $OUT"; fi
+n_launches=$(find "$capture_dir" -name '*.argv' | wc -l | tr -d '[:space:]')
+check "order-independent refusal launches no persona" "0" "$n_launches"
+
 printf '\n== a seat moved off pi drops the launch line%s thinking ==\n' "'"
 rm -f -- "$capture_dir"/*.argv
 launch_round "$work/seats-harnoffpi.yaml" core,thinky

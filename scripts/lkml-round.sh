@@ -358,24 +358,25 @@ IFS=',' read -ra personas <<< "$personas_csv"
 declare -A run_dir_of=() harness_of=() model_of=() display_of=()
 launch_failed=0
 
+# Resolve every seat before ANY launch, and let the launch loop below
+# reuse the results. `check` above catches the seats file's parse and
+# schema errors; the remaining refusal class is persona-scoped -- an
+# explicit seats `thinking:` on a seat that resolves to a non-pi
+# harness -- and it is only checkable once that persona's resolved
+# harness is known, i.e. per persona, which is why it lives in `resolve`
+# rather than in the parser. Resolving inside the launch loop would turn
+# that refusal into a per-persona skip, with the rest of the panel
+# launched at real cost first; resolving here keeps the same whole-round
+# guarantee `check` has for parse errors. (A missing persona FILE stays
+# a per-persona skip in the launch loop: a roster typo the operator can
+# re-run without touching the seats file.)
+declare -A seat_harness=() seat_model=() seat_thinking=() seat_display=()
 for persona in "${personas[@]}"; do
     persona="${persona#"${persona%%[![:space:]]*}"}"
     persona="${persona%"${persona##*[![:space:]]}"}"
     [[ -n "$persona" ]] || continue
-
     persona_file="$personas_dir/$persona.md"
-    if [[ ! -f "$persona_file" ]]; then
-        echo "Error: no persona file '$persona_file' for persona '$persona'." >&2
-        launch_failed=1
-        continue
-    fi
-
-    # Archive a copy of the persona file in the series mailbox so the
-    # render can inline each reviewer's brief. Overwrite is intentional:
-    # personas rarely change mid-series, and the latest wins.
-    archive_root="${LKML_MAILBOX_ROOT:-/var/tmp/claude-scratch/lkml}/$series"
-    mkdir -p -- "$archive_root/personas"
-    cp -f -- "$persona_file" "$archive_root/personas/$persona.md"
+    [[ -f "$persona_file" ]] || continue
 
     harness="$(lkml_persona_field "$persona_file" harness)"
     model="$(lkml_persona_field "$persona_file" model)"
@@ -412,12 +413,48 @@ for persona in "${personas[@]}"; do
             "$script_dir/lkml-seats-resolve" resolve "$personas_dir" "$persona" \
                 "$harness" "$model" "$thinking")
         [[ -n "$harness" ]] || {
-            echo "Error: seats resolution for $persona failed." >&2
-            launch_failed=1
-            continue
+            # The resolver already printed the refusal with the persona,
+            # key and file named; this refuses the WHOLE round, not just
+            # this seat -- the loop below launches as it goes, so a
+            # failure there would mean the rest of the panel spends real
+            # cost before the round fails.
+            echo "Error: seats resolution for $persona failed; no persona was launched." >&2
+            exit 1
         }
         [[ -n "$seat_note" ]] && echo "fork-sandbox lkml-round: $seat_note" >&2
     fi
+    seat_harness["$persona"]="$harness"
+    seat_model["$persona"]="$model"
+    seat_thinking["$persona"]="$thinking"
+    seat_display["$persona"]="$display"
+done
+
+for persona in "${personas[@]}"; do
+    persona="${persona#"${persona%%[![:space:]]*}"}"
+    persona="${persona%"${persona##*[![:space:]]}"}"
+    [[ -n "$persona" ]] || continue
+
+    persona_file="$personas_dir/$persona.md"
+    if [[ ! -f "$persona_file" ]]; then
+        echo "Error: no persona file '$persona_file' for persona '$persona'." >&2
+        launch_failed=1
+        continue
+    fi
+
+    # Archive a copy of the persona file in the series mailbox so the
+    # render can inline each reviewer's brief. Overwrite is intentional:
+    # personas rarely change mid-series, and the latest wins.
+    archive_root="${LKML_MAILBOX_ROOT:-/var/tmp/claude-scratch/lkml}/$series"
+    mkdir -p -- "$archive_root/personas"
+    cp -f -- "$persona_file" "$archive_root/personas/$persona.md"
+
+    # Seat facts resolved for the whole roster before any launch (the
+    # pre-pass above); this loop is launch-as-you-go, so nothing here may
+    # newly refuse a seat.
+    harness="${seat_harness[$persona]}"
+    model="${seat_model[$persona]}"
+    display="${seat_display[$persona]}"
+    thinking="${seat_thinking[$persona]}"
 
     mkdir -p -- /var/tmp/claude-scratch
     handoff_file="$(mktemp /var/tmp/claude-scratch/lkml-round-XXXXXX.md)" || {
