@@ -195,10 +195,15 @@ personas:
 
 Entries carry only `harness`, `model` and `thinking`. Precedence, per
 persona, key by key: the script's `--model-override` flag > a
-`personas.<name>` entry > `default:` > the persona's frontmatter. A
-`harness` without a `model` DROPS the frontmatter's model (a bare
-`pi-local` resolves from the endpoint, a bare `claude` takes the harness
-default); `thinking` inherits from frontmatter unless an entry sets it.
+`personas.<name>` entry > `default:` > the persona's frontmatter.
+Setting `harness` at any scope DROPS `model` from every
+lower-precedence scope (a bare `pi-local` resolves from the endpoint, a
+bare `claude` takes the harness default); a model survives only from
+the same scope as the effective harness or a higher one. `thinking`
+inherits from frontmatter unless an entry sets it, but it only reaches
+a seat on `pi`/`pi-local`: an explicit `thinking` on a persona whose
+resolved harness is not a pi flavor refuses the run, and the
+frontmatter's is dropped silently when the seat moves off pi.
 A missing file means the frontmatter pins stand exactly as shipped; an
 unreadable or unparseable one refuses the run loudly — a typo never
 silently re-seats the panel onto the expensive endpoint. Every seat the
