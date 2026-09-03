@@ -59,7 +59,16 @@ scheduling, not reading, and the reviewers' job is reading.
   parallel, either reviewing the whole series fresh or replying to
   specific threads you name with `--reply-to`. Every run's replies are
   harvested back into the mailbox when it finishes; the runs themselves
-  make no commits.
+  make no commits. After the harvest, the round also runs
+  `lkml-summarize.sh` (resolved from PATH) with its own `--project`,
+  resolved version and `--timeout`, so the thread's summary is current
+  after every round instead of only when someone remembers to run it:
+  a round that harvested nothing skips it (announced on stderr), a
+  failed summary only warns — the replies are already posted — and a
+  launch failure does not suppress it, because a partial panel that
+  replied still changed the thread. `--no-summarize` opts out; without
+  it the round refuses at startup if `lkml-summarize.sh` is not on PATH,
+  before any persona launches.
 - **`lkml-revise.sh`** — launches the author persona to answer open review
   (fixing code and/or replying) and post the next version. A large series'
   revision round is a single long sandboxed run with no mid-run checkpoint
@@ -70,7 +79,12 @@ scheduling, not reading, and the reviewers' job is reading.
   it yet — this is a note for when it exists, not a requirement now.
 - **`lkml-summarize.sh <series> --project <path>`** — a standalone
   two-tier summary of the thread, for when a human wants the story as a
-  document rather than a message. It runs two sequential
+  document rather than a message. It also runs automatically at the end
+  of every `lkml-round.sh` round that harvested at least one reply (see
+  that entry) — re-summarizing per round sidesteps its own convergence
+  detection, so the operator sees where the thread stands after each
+  round — and you run it by hand to re-summarize after a failed one or
+  to catch up a version. It runs two sequential
   `fork-sandbox.sh` runs over `lkml-render.py --text`'s output: an
   **extraction** run (default `claude/sonnet`) writes a structured
   intermediate (verdicts, defects with severities and reply ids, open
