@@ -404,7 +404,19 @@ contains "the failing summarizer warns that the replies are already posted" "$ou
 cap_missing="$(mktemp -d)"; tmpdirs+=("$cap_missing")
 no_sum_bin="$(mktemp -d)"; tmpdirs+=("$no_sum_bin")
 cp -- "$stub_bin/fork-sandbox.sh" "$no_sum_bin/"
-out_missing="$(PATH="$no_sum_bin:$PATH" STUB_CAPTURE_DIR="$cap_missing" STUB_RUN_PREFIX="$run_prefix_dir" \
+# A controlled PATH, not "$no_sum_bin:$PATH": this case asserts that
+# lkml-summarize.sh does NOT resolve, so it must not be able to resolve
+# anywhere in the ambient PATH -- on an installed machine (install.sh
+# symlinks scripts/ onto PATH) the ambient lookup would find the real
+# two-tier summarizer and drag it into the suite, the same class of
+# ambient leakage the pinned HOME / LKML_SEATS_FILE / LKML_MAILBOX_ROOT
+# above avoid. Symlink only the tools the refusal path itself needs.
+missing_path_bin="$(mktemp -d)"; tmpdirs+=("$missing_path_bin")
+for tool in bash readlink dirname sed git jq python3; do
+    tool_path="$(command -v "$tool" 2>/dev/null)" || continue
+    ln -s -- "$tool_path" "$missing_path_bin/$tool"
+done
+out_missing="$(PATH="$no_sum_bin:$missing_path_bin" STUB_CAPTURE_DIR="$cap_missing" STUB_RUN_PREFIX="$run_prefix_dir" \
     STUB_REPLY_TO="$patch2_id" STUB_REPLY_TO_BRACKETED="$patch_id_bracketed" \
     "$round" widget-frob --project "$project_dir" --checkout otherbranch \
     --personas core --personas-dir "$work" \
