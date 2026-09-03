@@ -81,10 +81,11 @@ scheduling, not reading, and the reviewers' job is reading.
   two-tier summary of the thread, for when a human wants the story as a
   document rather than a message. It also runs automatically at the end
   of every `lkml-round.sh` round that harvested at least one reply (see
-  that entry) — re-summarizing per round sidesteps its own convergence
-  detection, so the operator sees where the thread stands after each
-  round — and you run it by hand to re-summarize after a failed one or
-  to catch up a version. It runs two sequential
+  that entry) — it re-derives the document on every invocation, so the
+  operator sees where the thread stands after each round, tally and open
+  set included, long before the step 5 convergence check would judge it
+  — and you run it by hand to re-summarize after a failed one or to
+  catch up a version. It runs two sequential
   `fork-sandbox.sh` runs over `lkml-render.py --text`'s output: an
   **extraction** run (default `claude/sonnet`) writes a structured
   intermediate (verdicts, defects with severities and reply ids, open

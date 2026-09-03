@@ -414,11 +414,15 @@ launch_round() {  # launch_round <seats-file | ABSENT> <personas-csv> [extra rou
     else
         env=(HOME="$home_dir" LKML_SEATS_FILE="$env_seats")
     fi
+    # The stub's harvest collects nothing, so the post-round summary would
+    # always skip anyway; --no-summarize additionally keeps the round from
+    # refusing at startup on a bare checkout, where the (unstubbed)
+    # lkml-summarize.sh is not on PATH.
     OUT="$(env "${env[@]}" PATH="$stub_bin:$PATH" \
         STUB_CAPTURE_DIR="$capture_dir" STUB_RUN_PREFIX="$run_prefix_dir" \
         "$round" widget-seats --project "$project_dir" --checkout somebranch \
         --base somebranch --personas "$personas_csv" --personas-dir "$personas_test_dir" \
-        "$@" 2>&1)"
+        --no-summarize "$@" 2>&1)"
     RC=$?
 }
 argv_of() { cat "$capture_dir/$1.argv" 2>/dev/null; }
@@ -622,7 +626,7 @@ OUT="$(env HOME="$home_dir" PATH="$stub_bin:$PATH" \
     STUB_CAPTURE_DIR="$capture_dir" STUB_RUN_PREFIX="$run_prefix_dir" \
     "$round" widget-seats --project "$project_dir" --checkout somebranch \
     --base somebranch --personas core,author,ci --personas-dir "$personas_test_dir" \
-    2>&1)"
+    --no-summarize 2>&1)"
 RC=$?
 check "default-path round exits 0" "0" "$RC"
 contains "default-path round re-seats the panel and announces it" "$OUT" \

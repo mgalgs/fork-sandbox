@@ -354,9 +354,11 @@ else
 fi
 contains "the summary is announced on stderr before it starts" "$out" "summarizing widget-frob v1"
 
-# All rounds below use the v2 checkout and its v2 reply-to id: the
-# ambiguous-ref section above records the same commit as v3 as well, and
-# the ledger resolves a shared commit to its newest recorded version.
+# All rounds below use the v2 checkout and its v2 reply-to id. The ledger
+# matches the checkout's commit against every recorded version's branch,
+# and v2's otherbranch commit is recorded only under v2: the ambiguous-ref
+# section's v3 "release" branch points at v1's somebranch commit, not at
+# otherbranch's, so v2 resolves without any shared-commit tie-break.
 cap_ns="$(mktemp -d)"; tmpdirs+=("$cap_ns")
 out_ns="$(PATH="$stub_bin:$PATH" STUB_CAPTURE_DIR="$cap_ns" STUB_RUN_PREFIX="$run_prefix_dir" \
     STUB_REPLY_TO="$patch2_id" STUB_REPLY_TO_BRACKETED="$patch_id_bracketed" \

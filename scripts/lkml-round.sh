@@ -673,7 +673,8 @@ if (( summarize )); then
         # summary should reflect it. Only harvested == 0 suppresses.
         echo "fork-sandbox lkml-round: summarizing $series v$version (two sequential sandbox runs)..." >&2
         # Bare name, resolved from PATH, like the fork-sandbox.sh launcher
-        # above -- it is a launcher-orchestrator, not a shipped helper.
+        # above: parity with that PATH requirement, and the stubbable seam
+        # tests/lkml-round-test.sh uses (a capturing stub on PATH).
         # lkml-summarize.env owns the tier selection, so no tier is passed.
         # A failure must NOT fail the round: the replies are already posted
         # and that work is durable; the round's exit status stays exactly
