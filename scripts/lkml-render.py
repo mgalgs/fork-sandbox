@@ -1,41 +1,54 @@
 #!/usr/bin/env python3
 """lkml-render.py — render one or more lkml-mode series mailboxes as a
-single self-contained HTML page: a threaded archive with a per-version
-tally, patch bodies folded, quotes and trailers styled.
+single self-contained HTML page, or as plain text for agents.
 
 Usage: lkml-render.py <series-dir> [<series-dir> ...] > out.html
        lkml-render.py --text <series-dir> [<series-dir> ...] > out.txt
 
-The default HTML render is the human view. --text is the agent view:
-the same thread selection and ordering as plain text on stdout, with
-message bodies indented under their headers (so a body cannot forge a
-message header) and [PATCH] message bodies cut at their first
-diff --git line, so the commit message and diffstat stay and the
-diff goes (it lives in the series branch).
+The default HTML render is the human view: a sticky state rail (the
+version list with the current version marked aria-current, a
+reviewer-to-verdict matrix, a per-patch verdict matrix, and an
+open-thread counter block) beside a main column that carries, in
+order, a blocking banner (a standing NAK, or every open thread sitting
+on one patch), the auto-summary card when a per-version results file
+exists, and the thread itself. The thread is an expandable trace: every
+message collapses to one scannable line (persona monogram, name, short
+id, verdict chip, subject) and opens in place. Depth is an indent plus
+a hairline rail. Patch bodies show the stat line with the diff folded.
+Verdicts are chips that encode strength in form as well as hue: a
+solid green Reviewed-by, the same hue hollow for the weaker Acked-by,
+amber for Changes-requested, hollow amber for a Question, and a solid
+red NAK. The blue accent is structural chrome only, never a verdict.
+An unrecorded model is stamped 'model unknown' in the warning colour on
+purpose -- surfacing a real defect, not hiding it.
+
+--text is the agent view and a stable interface consumed by
+lkml-round.sh and lkml-summarize.sh: the same thread selection and
+ordering as plain text on stdout, with message bodies indented under
+their headers (so a body cannot forge a message header) and [PATCH]
+message bodies cut at their first diff --git line, so the commit
+message and diffstat stay and the diff goes (it lives in the series
+branch). The HTML path may be redesigned freely; --text must not
+change out from under the panel scripts.
 
 A series dir is $LKML_MAILBOX_ROOT/<series> (it holds cur/*.msg). Reads
 only; never runs git.
 
 When a series dir holds results-v<N>.md (the per-version results file,
-written by the summarizer; a results-v<N>.json may sit next to it and is
-ignored), the HTML render adds a per-version Results card between the
-Reviewers panel and the Thread Index: the "# Summary" section sits
-outside a native <details>, the "# Details" section inside it, and
-7-hex message-id tokens that match a message in the mailbox link to
-that message. --text prints the same sections as a bare 'results'
-block (no links); an empty section is omitted in both backends.
-Without the file there is no card and the render is
-byte-identical to a mailbox without results.
+written by the summarizer; a results-v<N>.json may sit next to it and
+is ignored except for the card's presence when the .md is absent), the
+HTML render adds an auto-summary card above the thread: the "# Summary"
+section sits in the visible card head, the "# Details" section inside a
+fold, and 7-hex message-id tokens that match a message in the mailbox
+link to that message. --text prints the same sections as a bare
+'results' block (no links); an empty section is omitted in both
+backends. Without any results file there is no card at all.
 
 When a series dir holds results-series.md (the whole-series narrative,
 written by the summarizer's --series mode), the HTML render adds a
-page-level card directly above the series' own section (right after
-the masthead when a single dir is rendered) -- the same treatment, but
-the eyebrow reads
-'series summary' and the wrapper class is 'results results-series'
-so the card can be styled independently later. Its id autolink map
-covers ALL versions' messages in the series dir. --text prints it as
-a 'series-summary' block at the very top, before the first version
+page-level card directly above the series' own shell. Its id autolink
+map covers ALL versions' messages in the series dir. --text prints it
+as a 'series-summary' block at the very top, before the first version
 section. Without the file the render is byte-identical to a mailbox
 without it.
 """
@@ -56,6 +69,34 @@ TAG_CLASS = {
 }
 TAG_GLYPH = {"Reviewed-by": "R", "Acked-by": "A", "Tested-by": "T", "Changes-requested": "C",
              "Question": "?", "NAK": "N"}
+# Verdict strength order, strongest first: a NAK outranks a
+# Changes-requested, which outranks a Question, which outranks a sign-off.
+TAG_PRIORITY = ["NAK", "Changes-requested", "Question", "Acked-by", "Tested-by", "Reviewed-by"]
+# Tags that close a thread (the sign-offs). A thread whose subtree
+# carries none of these is still open.
+POSITIVE_TAGS = {"Reviewed-by", "Acked-by", "Tested-by"}
+# Chip class and label per tag. Strength is encoded in form as well as
+# hue: Reviewed-by is solid green, Acked-by the same hue but hollow,
+# Changes-requested amber, Question hollow amber, NAK solid red.
+CHIP_CLASS = {
+    "Reviewed-by": "reviewed", "Acked-by": "acked", "Tested-by": "tested",
+    "Changes-requested": "changes", "Question": "question", "NAK": "nak",
+}
+CHIP_LABEL = {
+    "Reviewed-by": "reviewed-by", "Acked-by": "acked-by", "Tested-by": "tested-by",
+    "Changes-requested": "changes", "Question": "question", "NAK": "nak",
+}
+# A small hand-picked palette for persona monograms: a stable hash of the
+# persona name picks one, so any roster renders, the same persona gets
+# the same colour twice in one page, and the colour is stable between
+# runs for the same persona (djb2 over the name, not the per-process
+# randomized hash()).
+MONOGRAM_PALETTE = [
+    "#6d3fb8", "#1f7a5f", "#b4560e", "#2b3a42",
+    "#b32218", "#2f6fec", "#7a5c10", "#5c3d7a",
+]
+
+
 # Max characters for an HTML tally row label. The .tally table is in auto
 # layout, where a browser treats max-width on a <th> as a suggestion and
 # grows the column to fit the content, so the CSS ellipsis is not a
@@ -255,6 +296,51 @@ def fmt_date(d):
 
 def persona_class(p):
     return "p-" + re.sub(r"[^a-z0-9]+", "-", p.lower())
+
+
+def strongest_tag(tags):
+    """The strongest tag in a set, per TAG_PRIORITY, or None."""
+    for t in TAG_PRIORITY:
+        if t in tags:
+            return t
+    return None
+
+
+def chip_html(tag):
+    """The verdict chip for one tag; '' when the tag maps to no chip.
+    A message with no verdict renders no chip at all, never an empty
+    one."""
+    cls = CHIP_CLASS.get(tag)
+    if not cls:
+        return ""
+    return f'<span class="chip {cls}">{CHIP_LABEL[tag]}</span>'
+
+
+def mono_color(persona):
+    """A stable palette index per persona name (djb2; not hash(), which
+    is salted per process)."""
+    if not persona:
+        return 0
+    h = 5381
+    for ch in persona:
+        h = ((h * 33) + ord(ch)) & 0xFFFFFFFF
+    return h % len(MONOGRAM_PALETTE)
+
+
+def monogram(persona):
+    """The monogram letters for a persona: the first letter of each
+    word, two wide ('core-team' -> 'CT'), or the first two characters
+    of one long word; 'AI' for an un-stamped message."""
+    if not persona:
+        return "AI"
+    words = [w for w in re.split(r"[-_ ]+", persona) if w]
+    letters = "".join(w[0] for w in words)[:2] or persona[:2]
+    return letters.upper()
+
+
+def badge(persona):
+    cls = "" if persona else " mono-none"
+    return f'<span class="mono-badge{cls} p-color-{mono_color(persona)}">{esc(monogram(persona))}</span>'
 
 
 def build(series_dir):
@@ -949,151 +1035,380 @@ def render_series(series_dir):
 
 
 CSS = """
-:root{
-  --bg:#F4F5F7; --surface:#FFFFFF; --ink:#1C2130; --muted:#5C6478; --rule:#D9DCE3;
-  --accent:#3B4A7A; --accent-ink:#FFFFFF; --quote-bg:#EEF0F4; --quote-bar:#B8C0D4;
-  --code-bg:#EDEFF3; --diff-bg:#F7F8FA;
-  --rev:#2E7D4F; --rev-bg:#E4F3EA; --ack:#3A7D5E; --ack-bg:#E9F4EE;
-  --test:#357A75; --test-bg:#E2F2F0;
-  --chg:#B26A00; --chg-bg:#FBF0DA; --q:#2F6FC1; --q-bg:#E6EEF9; --nak:#B3261E; --nak-bg:#FBE4E2;
-  --add:#1F6E3D; --del:#A8261F; --hunk:#5A6C9E;
+:root {
+  --ground:      #f6f8f9;
+  --surface:     #ffffff;
+  --surface-2:   #eef1f3;
+  --ink:         #0f1417;
+  --ink-2:       #47555c;
+  --ink-3:       #71828b;
+  --rule:        #d9e0e4;
+  --rule-soft:   #e8edef;
+
+  --accent:      #2f6fec;
+  --accent-soft: #e4ecfd;
+  --ok:          #1f7a5f;
+  --ok-soft:     #ddf1e9;
+  --warn:        #b4560e;
+  --warn-soft:   #fbeade;
+  --crit:        #b32218;
+  --crit-soft:   #fbe3e0;
+
+  --add:         #1f6e3d;
+  --del:         #a8261f;
+  --hunk:        #5a6c9e;
+
+  --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  --ui:   "Archivo", ui-sans-serif, system-ui, sans-serif;
+  --read: "Source Serif 4", Georgia, "Times New Roman", serif;
+
+  --r: 10px;
+  --shadow: 0 1px 2px rgba(15,20,23,.05), 0 8px 24px -16px rgba(15,20,23,.18);
 }
-@media (prefers-color-scheme: dark){
-  :root:not([data-theme="light"]){
-    --bg:#14171F; --surface:#1B1F29; --ink:#E4E6EC; --muted:#9AA1B2; --rule:#2A2F3B;
-    --accent:#8FA0D6; --accent-ink:#14171F; --quote-bg:#1F2430; --quote-bar:#3E4863;
-    --code-bg:#222735; --diff-bg:#181C25;
-    --rev:#6FCF97; --rev-bg:#1B2E24; --ack:#7CC9A3; --ack-bg:#1A2A22;
-    --test:#78C8BF; --test-bg:#19302E;
-    --chg:#F4B860; --chg-bg:#2E2618; --q:#8AB4F8; --q-bg:#1B2536; --nak:#F28B82; --nak-bg:#331D1B;
-    --add:#7BD88F; --del:#F08A84; --hunk:#8FA0D6;
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --ground:      #0b1013;
+    --surface:     #121a1e;
+    --surface-2:   #182328;
+    --ink:         #e7eef1;
+    --ink-2:       #a2b2ba;
+    --ink-3:       #778890;
+    --rule:        #24333a;
+    --rule-soft:   #1b262b;
+
+    --accent:      #7ea8ff;
+    --accent-soft: #16273f;
+    --ok:          #63c9a4;
+    --ok-soft:     #102a22;
+    --warn:        #e79a5c;
+    --warn-soft:   #2c1d11;
+    --crit:        #f08b80;
+    --crit-soft:   #2f1512;
+
+    --add:         #7bd88f;
+    --del:         #f08a84;
+    --hunk:        #8fa0d6;
+
+    --shadow: 0 1px 2px rgba(0,0,0,.4), 0 8px 24px -16px rgba(0,0,0,.7);
   }
 }
-:root[data-theme="dark"]{
-  --bg:#14171F; --surface:#1B1F29; --ink:#E4E6EC; --muted:#9AA1B2; --rule:#2A2F3B;
-  --accent:#8FA0D6; --accent-ink:#14171F; --quote-bg:#1F2430; --quote-bar:#3E4863;
-  --code-bg:#222735; --diff-bg:#181C25;
-  --rev:#6FCF97; --rev-bg:#1B2E24; --ack:#7CC9A3; --ack-bg:#1A2A22;
-  --test:#78C8BF; --test-bg:#19302E;
-  --chg:#F4B860; --chg-bg:#2E2618; --q:#8AB4F8; --q-bg:#1B2536; --nak:#F28B82; --nak-bg:#331D1B;
-  --add:#7BD88F; --del:#F08A84; --hunk:#8FA0D6;
+
+:root[data-theme="dark"] {
+    --ground:      #0b1013;
+    --surface:     #121a1e;
+    --surface-2:   #182328;
+    --ink:         #e7eef1;
+    --ink-2:       #a2b2ba;
+    --ink-3:       #778890;
+    --rule:        #24333a;
+    --rule-soft:   #1b262b;
+
+    --accent:      #7ea8ff;
+    --accent-soft: #16273f;
+    --ok:          #63c9a4;
+    --ok-soft:     #102a22;
+    --warn:        #e79a5c;
+    --warn-soft:   #2c1d11;
+    --crit:        #f08b80;
+    --crit-soft:   #2f1512;
+
+    --add:         #7bd88f;
+    --del:         #f08a84;
+    --hunk:        #8fa0d6;
+
+    --shadow: 0 1px 2px rgba(0,0,0,.4), 0 8px 24px -16px rgba(0,0,0,.7);
 }
-*{box-sizing:border-box}
-html{font-size:16px}
-body{margin:0;background:var(--bg);color:var(--ink);
-  font-family:system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;line-height:1.55;}
-.mono, header, .mid, .meta, .tag, .tally thead th, .eyebrow, .counts, time, .stat, .diff, .code, code, .trailer{
-  font-family:"JetBrains Mono","SFMono-Regular",Menlo,Consolas,monospace;}
-.page{max-width:76rem;margin:0 auto;padding:2.5rem 1.25rem 6rem}
-.masthead{display:flex;flex-wrap:wrap;align-items:baseline;gap:.75rem 1.5rem;border-bottom:2px solid var(--ink);padding-bottom:1rem;margin-bottom:2.5rem}
-.masthead h1{margin:0;font-size:1.75rem;font-weight:600;letter-spacing:-.01em;text-wrap:balance}
-.masthead .sub{color:var(--muted);font-size:.9rem}
-.eyebrow{margin:0;font-size:.75rem;letter-spacing:.14em;text-transform:uppercase;color:var(--muted)}
-.series{margin-bottom:4rem}
-.series-head{display:flex;flex-wrap:wrap;align-items:baseline;gap:.5rem 1.25rem;margin-bottom:1rem}
-.series-head h2{margin:0;font-size:1.5rem;font-weight:600}
-.series-head .v{color:var(--accent);font-weight:500}
-.counts{margin:0;display:flex;gap:1rem;font-size:.85rem;color:var(--muted)}
-.tally-wrap{overflow-x:auto;margin:0 0 2rem;border:1px solid var(--rule);background:var(--surface)}
-.tally{border-collapse:collapse;font-size:.85rem;min-width:100%}
-.tally caption{text-align:left;padding:.6rem .8rem;color:var(--muted);font-size:.78rem;border-bottom:1px solid var(--rule)}
-.tally th,.tally td{padding:.4rem .6rem;border-bottom:1px solid var(--rule);text-align:left;white-space:nowrap}
-.tally thead th{color:var(--muted);font-weight:500;font-size:.75rem;letter-spacing:.06em;text-transform:uppercase}
-.tally tbody th{font-weight:500;max-width:34rem;overflow:hidden;text-overflow:ellipsis}
-.tally tbody th a{color:inherit;text-decoration:none}
-.tally tbody th a:hover{text-decoration:underline}
-.tally td{text-align:center}
-.cell{display:inline-block;min-width:1.6rem;padding:.05rem .3rem;border-radius:2px;text-decoration:none;font-weight:600}
-.cell.none{color:var(--rule)}
-.reviewers{margin:0 0 2rem;border:1px solid var(--rule);background:var(--surface)}
-.reviewers .eyebrow{padding:.6rem .8rem .35rem}
-.reviewer{border-top:1px solid var(--rule)}
-.reviewer>summary{cursor:pointer;display:flex;flex-wrap:wrap;align-items:baseline;gap:.15rem .5rem;padding:.55rem .8rem;font-size:.95rem}
-.reviewer>summary .who{font-weight:600}
-.reviewer>summary .slug{color:var(--accent);font-size:.8rem}
-.reviewer-body{padding:0 .8rem .65rem;font-size:.9rem}
-.rv-line{color:var(--muted);margin:0 0 .35rem;font-size:.85rem}
-.persona-brief{margin:.5rem 0 0;padding:.6rem .8rem;background:var(--code-bg);font-size:.85rem;line-height:1.45;white-space:pre-wrap;overflow-wrap:anywhere;border-radius:2px}
-.t-rev{color:var(--rev);background:var(--rev-bg)}
-.t-ack{color:var(--ack);background:var(--ack-bg)}
-.t-test{color:var(--test);background:var(--test-bg)}
-.t-chg{color:var(--chg);background:var(--chg-bg)}
-.t-q{color:var(--q);background:var(--q-bg)}
-.t-nak{color:var(--nak);background:var(--nak-bg)}
-.thread{display:flex;flex-direction:column;gap:1rem}
-.msg{background:var(--surface);border:1px solid var(--rule);padding:1rem 1.25rem 1.1rem;scroll-margin-top:1rem}
-.msg header{display:flex;flex-wrap:wrap;align-items:center;gap:.4rem .7rem;font-size:.8rem;color:var(--muted);margin-bottom:.35rem}
-.msg header .who{color:var(--ink);font-weight:600}
-.msg header .meta{opacity:.85}
-.msg header time{margin-left:auto}
-.msg header .mid{color:var(--muted);text-decoration:none}
-.msg header .mid:hover{color:var(--accent)}
-.tag{padding:.05rem .4rem;border-radius:2px;font-size:.7rem;font-weight:600}
-.subj{margin:0 0 .75rem;font-size:1.15rem;font-weight:600;line-height:1.3;text-wrap:balance}
-.body{max-width:72ch;font-size:1rem;line-height:1.6}
-.body p{margin:0 0 .8rem}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--ground);
+  color: var(--ink);
+  font-family: var(--ui);
+  font-size: 15px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
+
+.eyebrow {
+  font-size: 10.5px; font-weight: 600; letter-spacing: .1em;
+  text-transform: uppercase; color: var(--ink-3); margin: 0;
+}
+
+.masthead { border-bottom: 1px solid var(--rule); background: var(--surface); }
+.masthead-in {
+  max-width: 1240px; margin: 0 auto; padding: 20px 24px 18px;
+  display: flex; flex-wrap: wrap; gap: 16px 28px; align-items: flex-end;
+}
+.masthead h1 {
+  font-size: 21px; font-weight: 700; letter-spacing: -.015em;
+  margin: 4px 0 0; text-wrap: balance;
+}
+.masthead .sub { font-family: var(--mono); font-size: 12px; color: var(--ink-2); margin: 6px 0 0; }
+.masthead .grow { flex: 1 1 260px; }
+
+.facts { display: flex; gap: 22px; flex-wrap: wrap; }
+.fact { display: flex; flex-direction: column; gap: 3px; }
+.fact b { font-family: var(--mono); font-size: 13px; font-weight: 500; font-variant-numeric: tabular-nums; }
+
+.series { scroll-margin-top: 1rem; }
+
+.shell {
+  max-width: 1240px; margin: 0 auto; padding: 22px 24px 40px;
+  display: grid; grid-template-columns: 286px minmax(0, 1fr); gap: 26px; align-items: start;
+}
+@media (max-width: 900px) {
+  .shell { grid-template-columns: minmax(0, 1fr); }
+  .rail { position: static !important; }
+}
+
+.rail { position: sticky; top: 22px; display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+
+.panel {
+  background: var(--surface); border: 1px solid var(--rule);
+  border-radius: var(--r); padding: 14px 15px; box-shadow: var(--shadow);
+}
+.panel > .eyebrow { margin-bottom: 11px; }
+
+.versions { display: flex; flex-direction: column; gap: 2px; }
+.vrow {
+  display: grid; grid-template-columns: 30px minmax(0,1fr) auto;
+  align-items: center; gap: 9px; padding: 7px 8px; border-radius: 7px;
+  border: 1px solid transparent; font-size: 13px; color: var(--ink-2); text-decoration: none;
+}
+.vrow:hover { background: var(--surface-2); color: var(--ink); }
+.vrow .vn { font-family: var(--mono); font-weight: 700; font-size: 12px; color: var(--ink-3); }
+.vrow .vmeta { font-size: 11.5px; color: var(--ink-3); font-variant-numeric: tabular-nums; }
+.vrow[aria-current="true"] {
+  background: var(--accent-soft);
+  border-color: color-mix(in srgb, var(--accent) 34%, transparent);
+  color: var(--ink);
+}
+.vrow[aria-current="true"] .vn { color: var(--accent); }
+
+.matrix { display: flex; flex-direction: column; gap: 1px; }
+.mrow {
+  display: grid; grid-template-columns: 22px minmax(0,1fr) auto;
+  align-items: center; gap: 9px; padding: 6px 2px;
+}
+.mrow + .mrow { border-top: 1px solid var(--rule-soft); }
+.who { font-size: 13px; font-weight: 500; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.who small {
+  display: block; font-size: 10.5px; font-weight: 400;
+  color: var(--ink-3); letter-spacing: .01em;
+}
+
+.mono-badge {
+  width: 22px; height: 22px; border-radius: 6px; display: grid; place-items: center;
+  font-family: var(--mono); font-size: 10.5px; font-weight: 700;
+  color: #fff; background: var(--ink-2); flex: none;
+}
+/* Stable persona monogram palette: one slot per persona name, chosen by
+   a hash of the name (lkml-render.py's mono_color), so any roster
+   renders and the colour is stable across a page and between runs. */
+.p-color-0 { background: #6d3fb8; }
+.p-color-1 { background: #1f7a5f; }
+.p-color-2 { background: #b4560e; }
+.p-color-3 { background: #2b3a42; }
+.p-color-4 { background: #b32218; }
+.p-color-5 { background: #2f6fec; }
+.p-color-6 { background: #7a5c10; }
+.p-color-7 { background: #5c3d7a; }
+.mono-none { background: var(--ink-2); }
+
+.chip {
+  font-family: var(--ui); font-size: 10.5px; font-weight: 600; letter-spacing: .04em;
+  text-transform: uppercase; padding: 3px 7px; border-radius: 999px;
+  border: 1px solid transparent; white-space: nowrap; flex: none;
+}
+/* Strength is encoded in form as well as hue: Reviewed-by is solid
+   green, Acked-by the same hue hollow (it is genuinely the weaker
+   claim), Changes-requested amber, Question hollow amber, NAK solid
+   red. The blue accent is chrome only, never a verdict. */
+.chip.reviewed { background: var(--ok); color: #fff; border-color: var(--ok); }
+.chip.acked    { background: var(--ok-soft); color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, transparent); }
+.chip.changes  { background: var(--warn-soft); color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, transparent); }
+.chip.question { background: transparent; color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, transparent); }
+.chip.nak      { background: var(--crit); color: #fff; border-color: var(--crit); }
+.chip.tested   { background: var(--surface-2); color: var(--ink-2); border-color: var(--rule); }
+.chip.pending  { background: var(--surface-2); color: var(--ink-3); border-color: var(--rule); }
+
+.counts { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.count { border: 1px solid var(--rule); border-radius: 8px; padding: 9px 10px; background: var(--surface); }
+.count b {
+  display: block; font-family: var(--mono); font-size: 19px; font-weight: 700;
+  line-height: 1.1; font-variant-numeric: tabular-nums;
+}
+.count.is-warn { border-color: color-mix(in srgb, var(--warn) 40%, transparent); background: var(--warn-soft); }
+.count.is-warn b { color: var(--warn); }
+.count.is-ok { border-color: color-mix(in srgb, var(--ok) 40%, transparent); background: var(--ok-soft); }
+.count.is-ok b { color: var(--ok); }
+.count span { font-size: 11px; color: var(--ink-2); }
+
+.main { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+.section { display: flex; flex-direction: column; gap: 7px; min-width: 0; scroll-margin-top: 1rem; }
+
+.banner {
+  display: flex; gap: 12px; align-items: flex-start; border-radius: var(--r);
+  padding: 13px 15px; border: 1px solid color-mix(in srgb, var(--warn) 42%, transparent);
+  background: var(--warn-soft);
+}
+.banner .bar { width: 3px; align-self: stretch; border-radius: 2px; background: var(--warn); flex: none; }
+.banner h2 { font-size: 13.5px; font-weight: 700; margin: 0 0 3px; color: var(--warn); letter-spacing: -.005em; }
+.banner p { margin: 0; font-size: 13px; color: var(--ink-2); }
+.banner.crit { border-color: color-mix(in srgb, var(--crit) 42%, transparent); background: var(--crit-soft); }
+.banner.crit .bar { background: var(--crit); }
+.banner.crit h2 { color: var(--crit); }
+
+.summary { padding: 0; overflow: hidden; }
+.summary-head {
+  padding: 14px 17px 12px; border-bottom: 1px solid var(--rule-soft);
+  display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap;
+}
+.summary-head h2 { font-size: 15px; font-weight: 700; margin: 0; letter-spacing: -.01em; }
+.summary-body {
+  padding: 15px 17px; font-family: var(--read); font-size: 16.5px;
+  line-height: 1.6; color: var(--ink); max-width: 68ch;
+}
+.summary-body p { margin: 0 0 .8em; }
+.summary-body p:last-child { margin-bottom: 0; }
+.summary-body strong { font-weight: 600; }
+.results-fold { border-top: 1px solid var(--rule-soft); }
+.results-fold summary {
+  cursor: pointer; padding: 9px 17px; list-style: none;
+  font-family: var(--mono); font-size: 11px; letter-spacing: .06em;
+  text-transform: uppercase; color: var(--ink-3);
+}
+.results-fold summary:hover { background: var(--surface-2); }
+.results-fold summary::-webkit-details-marker { display: none; }
+.results-details {
+  margin: 0 17px 15px; padding: 12px 14px; background: var(--surface-2);
+  border-radius: 8px; font-family: var(--mono); font-size: 11.5px; line-height: 1.5;
+  white-space: pre-wrap; overflow-wrap: anywhere; color: var(--ink-2);
+}
+
+.trace { display: flex; flex-direction: column; gap: 7px; }
+.trace-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 3px; }
+.trace-head h2 { font-size: 15px; font-weight: 700; margin: 0; letter-spacing: -.01em; }
+
+.msg {
+  position: relative; background: var(--surface); border: 1px solid var(--rule);
+  border-radius: 9px; box-shadow: var(--shadow);
+}
+.msg[data-depth="1"] { margin-left: 19px; }
+.msg[data-depth="2"] { margin-left: 38px; }
+.msg[data-depth="1"]::before, .msg[data-depth="2"]::before {
+  content: ""; position: absolute; left: -10px; top: 15px; bottom: 15px;
+  width: 1px; background: var(--rule);
+}
+
+.msg > summary {
+  cursor: pointer; list-style: none; display: grid;
+  grid-template-columns: 22px minmax(0, 1fr) auto;
+  align-items: center; gap: 10px; padding: 10px 13px; border-radius: 9px;
+}
+.msg > summary::-webkit-details-marker { display: none; }
+.msg > summary:hover { background: var(--surface-2); }
+.msg[open] > summary { border-bottom: 1px solid var(--rule-soft); border-radius: 9px 9px 0 0; }
+
+.line { min-width: 0; }
+.line .from { font-size: 13px; font-weight: 600; display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+.line .from .id { font-family: var(--mono); font-size: 10.5px; font-weight: 400; color: var(--ink-3); }
+.line .gist { font-size: 12.5px; color: var(--ink-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.msg[open] .line .gist { white-space: normal; overflow: visible; }
+
+.meta { display: flex; align-items: center; gap: 8px; }
+.model {
+  font-family: var(--mono); font-size: 10px; color: var(--ink-3);
+  white-space: nowrap; border: 1px solid var(--rule); border-radius: 4px; padding: 2px 5px;
+}
+.model.unknown { color: var(--crit); border-color: color-mix(in srgb, var(--crit) 40%, transparent); }
+@media (max-width: 700px) { .model { display: none; } }
+
+.body { padding: 14px 15px 16px; font-family: var(--read); font-size: 16px; line-height: 1.62; max-width: 68ch; }
+.body p { margin: 0 0 .75em; }
+.body p:last-child { margin-bottom: 0; }
 /* Markdown headings from a message body are content, not page chrome:
-   they keep the message's own voice (prose family, normal case, inherited
-   color). The uppercase-mono eyebrow treatment lives on .eyebrow, fold
-   summaries, and tally headers only. */
-.body h3{margin:1.2rem 0 .5rem;font-size:1.05rem;font-weight:650}
-.body h4,.body h5,.body h6{margin:1.2rem 0 .5rem;font-size:.95rem;font-weight:650}
-.body ul,.body ol{margin:0 0 .8rem;padding-left:1.4rem}
-.body li{margin:.15rem 0}
-.body code{font-size:.875em;background:var(--code-bg);padding:.1em .35em;border-radius:3px}
-.body blockquote{margin:0 0 .9rem;padding:.4rem .9rem;background:var(--quote-bg);border-left:3px solid var(--quote-bar);color:var(--muted);font-size:.95rem}
-.body blockquote p{margin:0 0 .4rem}
-.body blockquote p:last-child{margin:0}
-.attachments{margin-top:1rem;padding:.6rem .8rem;background:var(--code-bg);font-family:"JetBrains Mono","SFMono-Regular",Menlo,Consolas,monospace;font-size:.82rem}
-.attachment-label{color:var(--muted);text-transform:uppercase;letter-spacing:.08em}
-.attachments ul{margin:.35rem 0 0;padding-left:1.2rem}
-.attachments a{color:var(--accent)}
-.attachment-type,.attachment-missing{color:var(--muted)}
-.attachment-preview{display:block;max-width:100%;max-height:24rem;margin-top:.5rem}
-.code,.stat,.diff{margin:0 0 .9rem;padding:.7rem .9rem;background:var(--code-bg);font-size:.82rem;line-height:1.45;overflow-x:auto;border-radius:2px}
-.diff{background:var(--diff-bg)}
-.d-add{color:var(--add)} .d-del{color:var(--del)} .d-hunk{color:var(--hunk)} .d-file{font-weight:700} .d-meta{color:var(--muted)}
-.trailer{font-size:.85rem;font-weight:600;padding:.15rem .5rem;display:inline-block;border-radius:2px;margin-right:.4rem}
-.fold summary{cursor:pointer;font-family:"JetBrains Mono",monospace;font-size:.75rem;color:var(--accent);margin:0 0 .5rem}
-.fold summary:focus-visible,a:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
-.index-fold{margin:0 0 2rem;border:1px solid var(--rule);background:var(--surface)}
-.index-fold summary{cursor:pointer;padding:.6rem .8rem;font-family:"JetBrains Mono",monospace;font-size:.75rem;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
-.index-wrap{overflow-x:auto;border-top:1px solid var(--rule)}
-.tidx{list-style:none;margin:0;padding:.4rem 0;font-size:.85rem;line-height:1.6;min-width:max-content}
-.tidx li{padding:.1rem .8rem .1rem calc(.8rem + var(--d) * 1.25rem);position:relative;white-space:nowrap}
-.tidx li:hover{background:var(--code-bg)}
-.tidx li a{color:inherit;text-decoration:none;display:inline-flex;align-items:center;gap:.55rem}
-.tidx li a:hover .ix-subj{text-decoration:underline}
-.tidx li[style*="--d:0"]{font-weight:600}
-.tidx li:not([style*="--d:0"])::before{content:"";position:absolute;left:calc(.8rem + var(--d) * 1.25rem - .8rem);top:0;bottom:50%;width:.55rem;border-left:1px solid var(--quote-bar);border-bottom:1px solid var(--quote-bar)}
-.tidx .ix-id{color:var(--muted)}
-.tidx .ix-who{color:var(--accent);min-width:7.5rem}
-.tidx .ix-patch .ix-who{color:var(--muted)}
-.tidx .ix-subj{color:var(--ink)}
-.tidx .g{display:inline-block;min-width:1.1rem;text-align:center;padding:0 .2rem;border-radius:2px;font-weight:700;font-size:.75rem}
-.thread-fold{margin-top:1rem}
-.thread-fold>summary{cursor:pointer;font-family:"JetBrains Mono",monospace;font-size:.75rem;color:var(--muted);letter-spacing:.04em;margin-bottom:.6rem}
-.thread-fold>summary:hover{color:var(--accent)}
-.replies{padding-left:1rem;border-left:2px solid var(--quote-bar);display:flex;flex-direction:column;gap:.9rem}
-.msg.d0{border-color:var(--ink)}
-.msg.patch{background:var(--bg)}
-.msg.patch>header .who{color:var(--muted)}
-.msg .msg{border-color:var(--rule)}
-.p-core header .who{color:var(--accent)}
-.foot{margin-top:4rem;padding-top:1rem;border-top:1px solid var(--rule);color:var(--muted);font-size:.85rem;max-width:68ch}
-@media (max-width:640px){.page{padding:1.5rem .9rem 4rem}.msg{padding:.8rem .9rem}.replies{padding-left:.6rem}}
-@media (prefers-reduced-motion: no-preference){html{scroll-behavior:smooth}}
-"""
-# Appended to CSS only when a results card is rendered, so a mailbox
-# without results files renders byte-identically with and without this
-# feature.
-RESULTS_CSS = """
-.results{margin:0 0 2rem;border:1px solid var(--rule);background:var(--surface)}
-.results .eyebrow{padding:.6rem .8rem .35rem}
-.results-summary{margin:0 0 .35rem;padding:0 .8rem;font-size:.95rem;white-space:pre-wrap;overflow-wrap:anywhere}
-.results-fold{border-top:1px solid var(--rule)}
-.results-fold summary{cursor:pointer;padding:.4rem .8rem;font-family:"JetBrains Mono",monospace;font-size:.75rem;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
-.results-details{margin:.4rem 0 .65rem;padding:0 .8rem;background:var(--code-bg);font-size:.78rem;line-height:1.45;white-space:pre-wrap;overflow-wrap:anywhere}
+   they keep the message's own voice (prose family, normal case,
+   inherited color). The uppercase-mono eyebrow treatment lives on
+   .eyebrow, fold summaries, and panel heads only. */
+.body h3 { margin: 1.2rem 0 .5rem; font-size: 1.05rem; font-weight: 600; }
+.body h4,.body h5,.body h6 { margin: 1.2rem 0 .5rem; font-size: .95rem; font-weight: 600; }
+.body ul,.body ol { margin: 0 0 .8rem; padding-left: 1.4rem; }
+.body li { margin: .15rem 0; }
+.body code,.body code.inline {
+  font-family: var(--mono); font-size: .86em; background: var(--surface-2);
+  border: 1px solid var(--rule-soft); border-radius: 4px; padding: .08em .32em;
+}
+.body blockquote {
+  margin: 0 0 .8em; padding-left: 12px; border-left: 2px solid var(--rule);
+  color: var(--ink-3); font-style: italic;
+}
+.body blockquote p { margin: 0 0 .5em; }
+.body blockquote p:last-child { margin: 0; }
+.body .placeholder { font-family: var(--ui); font-size: 12.5px; color: var(--ink-3); }
+.body pre.code {
+  margin: 0 0 .9rem; padding: 12px 14px; background: var(--surface-2);
+  border-radius: 8px; font-family: var(--mono); font-size: 12px; line-height: 1.5;
+  overflow-x: auto;
+}
+pre.stat {
+  margin: 0; font-family: var(--mono); font-size: 11.5px; line-height: 1.62;
+  overflow-x: auto; padding: 12px 15px; background: var(--surface-2);
+  color: var(--ink-2); border-radius: 9px 9px 0 0;
+}
+.fold summary {
+  cursor: pointer; list-style: none; padding: 8px 15px;
+  font-family: var(--mono); font-size: 11px; letter-spacing: .06em;
+  text-transform: uppercase; color: var(--ink-3); background: var(--surface-2);
+  border-bottom: 1px solid var(--rule-soft);
+}
+.fold summary::-webkit-details-marker { display: none; }
+.fold summary:hover { color: var(--ink); }
+.diff {
+  margin: 0; padding: 12px 15px; font-family: var(--mono); font-size: 11.5px; line-height: 1.62;
+  overflow-x: auto; background: var(--surface-2); color: var(--ink-2);
+}
+.d-add{color:var(--add)} .d-del{color:var(--del)} .d-hunk{color:var(--hunk)}
+.d-file{font-weight:700;color:var(--ink)} .d-meta{color:var(--ink-3)}
+
+/* Trailers in a body read as verdict chips in the same semantic
+   colour; the blue accent never colours a verdict. */
+.trailer {
+  font-family: var(--ui); font-size: 11.5px; font-weight: 600; letter-spacing: .04em;
+  text-transform: uppercase; padding: 2px 8px; border-radius: 999px;
+  display: inline-block; margin: 0 0 .5em .4rem; border: 1px solid transparent;
+}
+.t-rev{background:var(--ok);color:#fff;border-color:var(--ok)}
+.t-ack{background:var(--ok-soft);color:var(--ok);border-color:color-mix(in srgb, var(--ok) 40%, transparent)}
+.t-test{background:var(--surface-2);color:var(--ink-2);border-color:var(--rule)}
+.t-chg{background:var(--warn-soft);color:var(--warn);border-color:color-mix(in srgb, var(--warn) 40%, transparent)}
+.t-q{background:transparent;color:var(--warn);border-color:color-mix(in srgb, var(--warn) 40%, transparent)}
+.t-nak{background:var(--crit);color:#fff;border-color:var(--crit)}
+
+.attachments {
+  margin-top: 1rem; padding: 9px 11px; background: var(--surface-2);
+  border-radius: 8px; font-family: var(--mono); font-size: 11.5px;
+}
+.attachment-label {
+  display: block; color: var(--ink-3); text-transform: uppercase;
+  letter-spacing: .08em; font-size: 10.5px;
+}
+.attachments ul { margin: .4rem 0 0; padding-left: 1.1rem; }
+.attachments a { color: var(--accent); }
+.attachment-type, .attachment-missing { color: var(--ink-3); }
+.attachment-preview { display: block; max-width: 100%; max-height: 24rem; margin-top: .5rem; }
+
+footer.foot {
+  max-width: 1240px; margin: 0 auto; padding: 24px 24px 40px;
+  color: var(--ink-3); font-size: 11.5px; font-family: var(--mono);
+}
 """
 
 
@@ -1128,44 +1443,39 @@ def main(argv=None):
     for d in args.series_dirs:
         name, sec, id_map = render_series(d)
         names.append(name)
-        # The page-level series card sits directly above THIS dir's
-        # own section, so in a multi-dir render a card's narrative
-        # cannot precede another series' content: the section head
-        # (name, version) that follows it attributes it. In a
-        # single-dir render this is right after the masthead, as
-        # before. id_map covers ALL versions' messages in the series
-        # dir -- render_series already built it over the whole dir, so
-        # no second build() re-parses the mailbox here.
+        # The page-level series card sits directly above THIS dir's own
+        # section, as before; its render changes with the summary card
+        # in a later step, its placement does not.
         card = render_series_card(d, id_map)
         if card:
-            # Section strings lead with a newline (the masthead's own
-            # trailing newline then ends its line); the card gets the
-            # same lead so the page layout is unchanged.
             sec = "\n" + card + sec
         sections.append(sec)
-    # The card's rules ride on the card: without any results file the
-    # document is byte-identical to a render without this feature.
-    css = CSS + (RESULTS_CSS if any('class="results' in s for s in sections) else "")
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
-    toc = " · ".join(f"<a href=\"#{esc(n)}-v1\">{esc(n)}</a>" for n in names)
+    if len(sections) == 1:
+        head = ""
+    else:
+        toc = " \u00b7 ".join(f'<a href="#{esc(n)}">{esc(n)}</a>' for n in names)
+        head = ('<div class="masthead">\n  <div class="masthead-in">\n'
+                f'    <div class="grow"><h1>{esc(args.title)}</h1>'
+                f'<p class="sub">{toc}</p></div>\n'
+                f'    <div class="facts"><div class="fact">'
+                f'<span class="eyebrow">rendered</span><b>{now}</b></div></div>\n'
+                '  </div>\n</div>\n')
+    footers = "  \u00b7  ".join(esc(n) for n in names)
     document = f"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{esc(args.title)}</title>
-<style>{css}</style>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&family=JetBrains+Mono:wght@400;500;700&display=swap">
+<style>{CSS}</style>
 </head>
 <body>
-<div class="page">
-  <div class="masthead">
-    <h1>{esc(args.title)}</h1>
-    <span class="sub mono">{toc}</span>
-    <span class="sub mono">rendered {now}</span>
-  </div>
-  {''.join(sections)}
-  <p class="foot">Every message on these threads is stamped by the mailbox with its persona, harness and model. Reviewers are AI personas running in sandboxed clones, and only the operator merges anything.</p>
-</div>
+{head}{''.join(sections)}
+<footer class="foot">{esc(footers)} \u00b7 rendered {now}</footer>
 </body>
 </html>
 """
