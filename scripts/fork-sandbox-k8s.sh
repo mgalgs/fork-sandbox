@@ -341,6 +341,7 @@ K8S_NAMESPACE="${K8S_NAMESPACE:-fork-sandbox}"
 K8S_IMAGE="$(read_env_value "$k8s_env" K8S_IMAGE || true)"
 K8S_PROXY_UPSTREAM="$(read_env_value "$k8s_env" K8S_PROXY_UPSTREAM || true)"
 K8S_PROXY_ENDPOINTS="$(read_env_value "$k8s_env" K8S_PROXY_ENDPOINTS || true)"
+K8S_DEFAULT_ENDPOINT="$(read_env_value "$k8s_env" K8S_DEFAULT_ENDPOINT || true)"
 K8S_PROXY_ALLOW="$(read_env_value "$k8s_env" K8S_PROXY_ALLOW || true)"
 K8S_DENIED_PROBE="$(read_env_value "$k8s_env" K8S_DENIED_PROBE || true)"
 K8S_RUN_TTL="$(read_env_value "$k8s_env" K8S_RUN_TTL || true)"
@@ -1426,6 +1427,8 @@ cmd_submit() {
     # install is what validates the registry's shape at config-roll time;
     # submit reuses the same parser here so an unregistered --endpoint
     # name is an error now, not a 404 inside the pod.
+    # Precedence: an explicit --endpoint wins over K8S_DEFAULT_ENDPOINT
+    # in k8s.env, which wins over the one-candidate rule below.
     local proxy_endpoint="" known_endpoint
     if [[ -n "$K8S_PROXY_ENDPOINTS" ]]; then
         parse_proxy_endpoints "$K8S_PROXY_ENDPOINTS" || exit 1
@@ -1442,6 +1445,29 @@ cmd_submit() {
                 printf '%s\n' "${PROXY_ENDPOINT_NAMES[@]}" | sed 's/^/  /' >&2
                 exit 1
             fi
+        elif [[ -n "$K8S_DEFAULT_ENDPOINT" ]]; then
+            # Validated exactly as the flag above: a default naming an
+            # unregistered endpoint is a config error that must be loud
+            # here, not a silent fallthrough to the one-candidate rule --
+            # and the error names k8s.env, because the reader is looking
+            # at a command line that never mentions the bad name.
+            for known_endpoint in "${PROXY_ENDPOINT_NAMES[@]}"; do
+                if [[ "$known_endpoint" == "$K8S_DEFAULT_ENDPOINT" ]]; then
+                    proxy_endpoint="$known_endpoint"
+                    break
+                fi
+            done
+            if [[ -z "$proxy_endpoint" ]]; then
+                echo "Error: K8S_DEFAULT_ENDPOINT '$K8S_DEFAULT_ENDPOINT' in" >&2
+                echo "$k8s_env is not registered. The registered endpoints are:" >&2
+                printf '%s\n' "${PROXY_ENDPOINT_NAMES[@]}" | sed 's/^/  /' >&2
+                exit 1
+            fi
+            # The single registered endpoint announces itself on the next
+            # branch; this one must too -- silent magic in the layer that
+            # picks which model answers is not a kindness.
+            echo "fork-sandbox-k8s: no --endpoint given; using '$proxy_endpoint'" >&2
+            echo "(K8S_DEFAULT_ENDPOINT in $k8s_env)." >&2
         elif (( ${#PROXY_ENDPOINT_NAMES[@]} == 1 )); then
             # The same one-candidate rule agent-sandboxed applies when
             # resolving a model: exactly one choice is usable unnamed,
@@ -1458,6 +1484,14 @@ cmd_submit() {
         fi
     elif [[ -n "$endpoint" ]]; then
         echo "Error: --endpoint is not available: this namespace was" >&2
+        echo "installed with K8S_PROXY_UPSTREAM; there are no named" >&2
+        echo "endpoints." >&2
+        exit 1
+    elif [[ -n "$K8S_DEFAULT_ENDPOINT" ]]; then
+        # Same shape as the --endpoint refusal above: a legacy install has
+        # no named endpoints, so a default naming one is a config error,
+        # not something to ignore.
+        echo "Error: K8S_DEFAULT_ENDPOINT is not available: this namespace was" >&2
         echo "installed with K8S_PROXY_UPSTREAM; there are no named" >&2
         echo "endpoints." >&2
         exit 1
