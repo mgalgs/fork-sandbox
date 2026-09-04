@@ -335,6 +335,17 @@ EOF
 out="$(timeout 12 "$status" "$rd_new" 2>&1)"
 [[ "$out" == *"commits:  2 (seen so far"* ]] || { echo "pi commits not summed: $out"; exit 1; }
 
+# 7d. The --notable commit line fires for the pi shape too: it was left on
+# the claude shape, so a pi run's --monitor stream stayed silent for the
+# whole run even though the counter saw the commits.
+cat > "$pi_events" <<'EOF'
+{"type":"tool_execution_start","toolCallId":"a1","toolName":"bash","args":{"command":"git commit -m one"}}
+{"type":"result","subtype":"success","result":"done"}
+EOF
+out="$("$repo_dir/scripts/fork-sandbox-format.sh" --notable "$pi_events")"
+[[ "$out" == *"commit: git commit -m one"* ]] \
+    || { echo "notable pi commit line missing: $out"; exit 1; }
+
 # 8. The activity line names the active leg and how long since it moved, so
 # a healthy multi-leg run no longer reads as wedged.
 
@@ -370,4 +381,91 @@ out="$(timeout 12 "$status" "$rd_new" 2>&1)"
 [[ "$out" != *"activity:"* ]] || { echo "activity line printed with no event files: $out"; exit 1; }
 [[ "$out" == *"events:   0"* ]] || { echo "no-event-file count wrong: $out"; exit 1; }
 
-echo "22 passed, 0 failed"
+# 9. The runner's remaining leg file shapes: a repeat pass of a fix or
+# mntfix round names its file <kind>-<N>-p<P>, and the code leg's own repeat
+# passes write events-code-<N>.jsonl. The first shape used to die the whole
+# status script before anything was printed; the second was silently
+# dropped from every counter and the activity line.
+
+# 9a. A multi-pass fix leg is accepted in every mode and counted.
+new_run_dir
+cat > "$rd_new/events.jsonl" <<'EOF'
+{"type":"result","subtype":"success","result":"code account"}
+EOF
+cat > "$rd_new/events-fix-1.jsonl" <<'EOF'
+{"type":"result","subtype":"success","result":"fix pass 1 account"}
+EOF
+cat > "$rd_new/events-fix-1-p2.jsonl" <<'EOF'
+{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"git commit -m two"}}]}}
+{"type":"result","subtype":"success","result":"fix pass 2 account"}
+EOF
+cat > "$rd_new/events-mntfix-1-p2.jsonl" <<'EOF'
+{"type":"result","subtype":"success","result":"mntfix pass 2 account"}
+EOF
+now_s=$(date +%s)
+touch -d "@$((now_s - 600))" "$rd_new/events.jsonl"
+touch -d "@$((now_s - 300))" "$rd_new/events-fix-1.jsonl"
+touch -d "@$((now_s - 30))" "$rd_new/events-mntfix-1-p2.jsonl"
+touch -d "@$((now_s - 5))" "$rd_new/events-fix-1-p2.jsonl"
+out="$(timeout 12 "$status" "$rd_new" 2>&1)"
+rc=$?
+if (( rc != 0 )); then echo "events-fix-1-p2.jsonl killed the status script (rc=$rc): $out"; exit 1; fi
+[[ "$out" == *"events:   5"* ]] || { echo "multi-pass fix leg not counted: $out"; exit 1; }
+[[ "$out" == *"commits:  1 (seen so far"* ]] || { echo "multi-pass fix leg commit not counted: $out"; exit 1; }
+[[ "$out" == *"activity: fix-1-p2, last event "* ]] || { echo "activity did not name the pass file: $out"; exit 1; }
+# The refusal ran in the startup pre-check before any mode dispatch, so one
+# more mode on the same dir proves the others print as well.
+"$status" --result "$rd_new" >/dev/null 2>&1 \
+    || { echo "--result still died on a pass leg file"; exit 1; }
+
+# 9b. The code leg's repeat passes (events-code-<N>.jsonl) are counted.
+new_run_dir
+cat > "$rd_new/events.jsonl" <<'EOF'
+{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"git commit -m one"}}]}}
+EOF
+cat > "$rd_new/events-code-2.jsonl" <<'EOF'
+{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"git commit -m two"}}]}}
+{"type":"assistant","message":{"content":[{"type":"text","text":"polish"}]}}
+{"type":"result","subtype":"success","result":"pass 2 account"}
+EOF
+now_s=$(date +%s)
+touch -d "@$((now_s - 600))" "$rd_new/events.jsonl"
+touch -d "@$((now_s - 5))" "$rd_new/events-code-2.jsonl"
+out="$(timeout 12 "$status" "$rd_new" 2>&1)"
+[[ "$out" == *"events:   4"* ]] || { echo "code repeat pass not counted: $out"; exit 1; }
+[[ "$out" == *"commits:  2 (seen so far"* ]] || { echo "code repeat pass commit not counted: $out"; exit 1; }
+[[ "$out" == *"activity: code-2, last event "* ]] || { echo "activity did not name the code pass: $out"; exit 1; }
+
+# 9c. A continuation leg's file is accepted, and its events are counted
+# exactly once: the runner tees the leg into events.jsonl AND its own file,
+# so the file is a copy of an events.jsonl slice, not new events.
+new_run_dir
+cat > "$rd_new/events.jsonl" <<'EOF'
+{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"git commit -m one"}}]}}
+{"type":"assistant","message":{"content":[{"type":"text","text":"continuation line"}]}}
+EOF
+cat > "$rd_new/events-continuation-1.jsonl" <<'EOF'
+{"type":"assistant","message":{"content":[{"type":"text","text":"continuation line"}]}}
+EOF
+out="$(timeout 12 "$status" "$rd_new" 2>&1)"
+rc=$?
+if (( rc != 0 )); then echo "events-continuation-1.jsonl was not accepted (rc=$rc): $out"; exit 1; fi
+[[ "$out" == *"events:   2"* ]] || { echo "continuation leg double-counted: $out"; exit 1; }
+[[ "$out" == *"commits:  1 (seen so far"* ]] || { echo "continuation leg commit miscounted: $out"; exit 1; }
+
+# 9d. A name in the new shapes that still fails the pattern is refused.
+new_run_dir
+cat > "$rd_new/events.jsonl" <<'EOF'
+{"type":"result","subtype":"success","result":"account"}
+EOF
+cat > "$rd_new/events-code-x.jsonl" <<'EOF'
+{"type":"result","subtype":"success","result":"should not appear"}
+EOF
+out="$(timeout 12 "$status" "$rd_new" 2>&1)"
+rc=$?
+if (( rc == 0 )); then echo "events-code-x.jsonl was accepted (rc=0)"; exit 1; fi
+[[ "$out" == *"'events-code-x.jsonl' is not a fork-sandbox run file"* ]] \
+    || { echo "no refusal for a malformed code leg name: $out"; exit 1; }
+[[ "$out" != *"should not appear"* ]] || { echo "malformed code leg file was read: $out"; exit 1; }
+
+echo "27 passed, 0 failed"

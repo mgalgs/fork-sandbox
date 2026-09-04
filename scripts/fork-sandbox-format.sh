@@ -152,15 +152,22 @@ fromjson? // empty
 #
 # The commit line comes from the Bash call, because that is where the message
 # is. A commit made some other way — a wrapper script, a Makefile target —
-# shows no line. The count below is the same heuristic, so it is an estimate
-# while the work runs. The real number comes from git, in the summary the
-# runner writes after it fetches the branch.
+# shows no line. The count below is the same heuristic, on both harness
+# shapes: claude carries the call in an assistant message's tool_use, pi in a
+# tool_execution_start's args. The line is an estimate while the work runs;
+# the real number comes from git, in the summary the runner writes after it
+# fetches the branch.
 JQ_NOTABLE="$JQ_PRELUDE"'
 fromjson? // empty
 | if .type == "assistant" then
     ((.message.content // [])[]
      | select(.type == "tool_use" and .name == "Bash")
      | (.input.command // "")
+     | select(test("\\bgit\\b[^|;&]*\\bcommit\\b"))
+     | "commit: \(. | flat | clip(140))")
+  elif .type == "tool_execution_start" then
+    (select(.toolName == "bash")
+     | (.args // {} | if type == "object" then (.command // "") else "" end)
      | select(test("\\bgit\\b[^|;&]*\\bcommit\\b"))
      | "commit: \(. | flat | clip(140))")
   elif .type == "system" and .subtype == "hook_response" then

@@ -175,13 +175,15 @@ resolve_run_file() {
     RUN_FILE_PATH=""
     case "$name" in
         run.env|events.jsonl|sandbox.log|exit-code|summary.txt|summary.json|pid|handoff.md|review-loop.json|maintainer-loop.json) ;;
-        # One file per leg, named by the runner. The four leg kinds are
+        # One file per leg, named by the runner. The leg kinds are
         # enumerated literally and the name is re-checked against the exact
         # pattern: a loose events-*.jsonl would let any name that starts
         # events- through, which is the property this allowlist exists to
-        # deny.
-        events-review-[0-9]*.jsonl|events-fix-[0-9]*.jsonl|events-maintainer-[0-9]*.jsonl|events-mntfix-[0-9]*.jsonl)
-            [[ "$name" =~ ^events-(review|fix|maintainer|mntfix)-[0-9]+\.jsonl$ ]] \
+        # deny. A repeat pass of a leg appends -p<P> to the leg number, and
+        # the refresh loop's continuation legs and the code leg's repeat
+        # passes have their own kinds.
+        events-review-[0-9]*.jsonl|events-fix-[0-9]*.jsonl|events-maintainer-[0-9]*.jsonl|events-mntfix-[0-9]*.jsonl|events-code-[0-9]*.jsonl|events-continuation-[0-9]*.jsonl)
+            [[ "$name" =~ ^events-(review|fix|maintainer|mntfix|code|continuation)-[0-9]+(-p[0-9]+)?\.jsonl$ ]] \
                 || die "'$name' is not a fork-sandbox run file" ;;
         review-verdict-[0-9]*.md)
             [[ "$name" =~ ^review-verdict-[0-9]+\.md$ ]] || die "'$name' is not a fork-sandbox run file" ;;
@@ -373,10 +375,10 @@ all_event_files() {
     EVENT_FILES=()
     local path name
     resolve_run_file events.jsonl 2>/dev/null && EVENT_FILES+=("$RUN_FILE_PATH")
-    for path in "$run_dir"/events-{review,fix,maintainer,mntfix}-*.jsonl; do
+    for path in "$run_dir"/events-{review,fix,maintainer,mntfix,code,continuation}-*.jsonl; do
         [[ -e "$path" ]] || continue
         name="${path##*/}"
-        [[ "$name" =~ ^events-(review|fix|maintainer|mntfix)-[0-9]+\.jsonl$ ]] \
+        [[ "$name" =~ ^events-(review|fix|maintainer|mntfix|code|continuation)-[0-9]+(-p[0-9]+)?\.jsonl$ ]] \
             || die "'$name' is not a valid event file name"
         resolve_run_file "$name" || die "'$name' is not a readable event file"
         EVENT_FILES+=("$RUN_FILE_PATH")
@@ -407,7 +409,8 @@ latest_event_file() {
 }
 
 # Which leg an event file belongs to: events.jsonl is the code leg,
-# events-<kind>-<N>.jsonl is <kind>-<N>.
+# events-<kind>-<N>.jsonl is <kind>-<N> (a repeat pass's -p<P> stays in the
+# name, so a fix round's second pass reads as fix-1-p2).
 event_file_leg_name() {
     local base
     base="${1##*/}"
@@ -450,10 +453,10 @@ for _name in events.jsonl sandbox.log exit-code summary.txt summary.json pid; do
     resolve_run_file "$_name" || true
 done
 # The same check for the leg event files, globbed instead of named: the
-# runner only writes events-<kind>-<N>.jsonl, so a name in that shape that
-# fails the pattern is not a run file, and any symlink is refused before
-# anything is printed.
-for _leg_events in "$run_dir"/events-{review,fix,maintainer,mntfix}-*.jsonl; do
+# runner only writes events-<kind>-<N>(-p<P>).jsonl for the leg kinds above,
+# so a name in that shape that fails the pattern is not a run file, and any
+# symlink is refused before anything is printed.
+for _leg_events in "$run_dir"/events-{review,fix,maintainer,mntfix,code,continuation}-*.jsonl; do
     [[ -e "$_leg_events" ]] || continue
     resolve_run_file "${_leg_events##*/}" || die "'$_leg_events' is not a readable event file"
 done
@@ -527,15 +530,28 @@ exit_code() {
     printf '%s' "${rc//[^0-9-]/}"
 }
 
+# The refresh loop's continuation legs tee into events.jsonl AND their own
+# file, so their events are already counted through events.jsonl. Skipping
+# the copy here keeps the total exact; counting both would double every
+# continuation leg.
+event_files_counted() {
+    local f
+    for f in "${EVENT_FILES[@]}"; do
+        [[ "${f##*/}" == events-continuation-* ]] && continue
+        printf '%s\n' "$f"
+    done
+}
+
 # Summed across every leg: a run's activity keeps moving in the leg files
 # after events.jsonl has gone quiet, so counting one file would report a
-# healthy multi-leg run as frozen.
+# healthy multi-leg run as frozen. (events-continuation-*.jsonl is a copy of
+# an events.jsonl slice, not new events -- see event_files_counted.)
 event_count() {
     all_event_files 2>/dev/null || { printf '0'; return; }
     local f total=0
-    for f in "${EVENT_FILES[@]}"; do
+    while IFS= read -r f; do
         total=$(( total + $(wc -l < "$f") ))
-    done
+    done < <(event_files_counted)
     printf '%s' "$total"
 }
 
@@ -552,15 +568,16 @@ commits_from_summary() {
     printf '%s' "$n"
 }
 
-# Summed across every leg, so a commit made by a fix leg is not invisible.
+# Summed across every leg, so a commit made by a fix leg is not invisible
+# (and, as in event_count, the continuation legs' copy is skipped).
 commit_count() {
     all_event_files 2>/dev/null || { printf '0'; return; }
     local f n total=0
-    for f in "${EVENT_FILES[@]}"; do
+    while IFS= read -r f; do
         n="$("$formatter" --commit-count "$f" 2>/dev/null)"
         [[ "$n" =~ ^[0-9]+$ ]] || n=0
         total=$(( total + n ))
-    done
+    done < <(event_files_counted)
     printf '%s' "$total"
 }
 
