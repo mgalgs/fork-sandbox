@@ -2416,6 +2416,27 @@ refuses "say rejects an unknown option" \
     "unknown option" \
     env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" say --branch fs-k8s-test-branch --bogus "hello"
 
+# A large addendum must clear the emptiness check promptly. That check once
+# used a whole-string glob substitution, which walks the message per
+# multibyte character under a UTF-8 locale: 7.5s at 64KB, 33s at 128KB,
+# 139s at 256KB, against ~6ms for the regex form. An addendum is exactly
+# the input that gets large -- a thread, a diff, a log pasted in for the
+# session to read. There is no cluster here, so this say fails at pod
+# lookup either way; what is under test is that it FAILS rather than
+# hangs. Exit 124 is timeout's own code, so it distinguishes the two.
+say_big_dir="$(newdir)"; tmpdirs+=("$say_big_dir")
+say_big="$say_big_dir/addendum.txt"
+printf 'große Zeile mit Umlauten — %d\n' $(seq 6000) > "$say_big"
+LC_ALL=C.UTF-8 timeout 20 env FORK_SANDBOX_CONFIG_DIR="$config_dir" \
+    "$k8s_sh" say --branch fs-k8s-test-branch - < "$say_big" >/dev/null 2>&1
+say_big_rc=$?
+if (( say_big_rc != 124 )); then
+    ok "say clears the emptiness check on a large multibyte message"
+else
+    no "say clears the emptiness check on a large multibyte message" \
+        "timed out -- the check may have regressed to a glob substitution"
+fi
+
 printf '\n== fork-sandbox-k8s-inbox-write.sh: naming and no-collision (no cluster) ==\n'
 # This is the exact script the pod mounts and `say` execs over kubectl exec
 # -i -- run directly here, against a plain directory, so its naming and

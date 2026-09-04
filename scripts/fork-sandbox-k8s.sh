@@ -2129,7 +2129,14 @@ cmd_say() {
     [[ -n "$branch" ]] || { echo "Error: say requires --branch." >&2; exit 1; }
     (( have_text )) \
         || { echo "Error: nothing to say. Give the message as one quoted argument, or '-' to read it from stdin." >&2; exit 1; }
-    [[ -n "${text//[[:space:]]/}" ]] \
+    # A regex find-one-non-space, NOT ${text//[[:space:]]/}: that glob
+    # substitution walks the whole message per multibyte character under a
+    # UTF-8 locale, which is quadratic -- 7.5s at 64KB, 33s at 128KB, 139s
+    # at 256KB, against ~6ms for this form. An addendum is exactly the
+    # input that gets large (a thread, a diff, a log pasted in for the
+    # session to read), and fork-sandbox-say.sh's identical check on the
+    # local path is where that was first measured.
+    [[ "$text" =~ [^[:space:]] ]] \
         || { echo "Error: the message is empty. A blank addendum tells the session nothing." >&2; exit 1; }
     fs_reject_unsafe_chars "$branch" || exit 1
 
