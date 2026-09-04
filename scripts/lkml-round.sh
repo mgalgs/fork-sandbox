@@ -6,7 +6,7 @@
 # Usage: lkml-round.sh <series> --project <path> --checkout <ref> --base <ref>
 #            --personas <p1,p2,...> [--reply-to <id>]... [--personas-dir <dir>]
 #            [--version <n>] [--timeout <seconds>] [--model-override <harness/model>]
-#            [--services-trust-ref <ref>] [--no-summarize]
+#            [--services-trust-ref <ref>] [--k8s] [--endpoint <name>] [--no-summarize]
 #
 # <project>  the repo fork-sandbox.sh clones -- same argument it takes.
 # --checkout the ref each persona's clone starts at: the series' tip, with
@@ -45,6 +45,38 @@
 #            -- the replies are already posted to the mailbox, and the
 #            summary can be re-run by hand. Refused at startup if
 #            lkml-summarize.sh is not on PATH.
+# --k8s        run the whole panel as Kubernetes Jobs through
+#            fork-sandbox-k8s.sh instead of local fork-sandbox.sh runs;
+#            requires --endpoint. The seats are submitted back to back
+#            (submit is non-blocking), then every uncollected seat is
+#            PROBED with a short `wait` in a round-robin loop and
+#            collected the moment it completes: a pod idles after its
+#            agent exits and then exits at its TTL, and once the
+#            container is gone neither the branch nor the outbox can be
+#            pulled back, so waiting each seat out in turn would lose
+#            every seat that finished before its turn came. --timeout is
+#            the overall deadline; on hitting it the round warns and
+#            harvests what has been collected, the same as the local
+#            path. Each seat's replies are pulled back to its own outbox
+#            directory, named after its branch under
+#            /var/tmp/claude-scratch/forks/lkml-round-k8s/ and harvested
+#            from there, so one seat can never stamp another's replies.
+#            A pi-local seat is translated to pi against --endpoint (a
+#            pod has no sealed local endpoint; the endpoint reaches the
+#            same self-hosted model through the in-cluster proxy), not
+#            refused. Any other harness that is not pi or claude
+#            (e.g. codex) refuses the whole round in the seats
+#            pre-pass, before any seat is submitted. A cluster run has
+#            no summary.json, so a seat's replies are stamped with its
+#            configured model, or "unknown" when the seat names none
+#            (post refuses an empty model), and its runs.jsonl ledger
+#            line records the branch, marked cluster, with no cost --
+#            a cluster run's cost is unknown, not free.
+# --endpoint <name> the registered K8S_PROXY_ENDPOINTS entry the pi
+#            seats (including translated pi-local ones) are wired to,
+#            via fork-sandbox-k8s.sh submit --endpoint. Required with
+#            --k8s: endpoint names are site-specific configuration, so
+#            this repo ships none and refuses to guess.
 # --model-override <harness>[/<model>] overrides every persona's own
 #            harness/model for this round only -- useful for a cheap
 #            smoke-test round before spending on the real panel. A BARE
@@ -79,7 +111,9 @@
 #            each seat's hook then runs iff its checkout did not change the
 #            sandbox-services contract relative to that ref.
 #
-# What this launches, per persona: a fork-sandbox.sh run, --checkout at the
+# What this launches, per persona: a fork-sandbox.sh run (or, with
+# --k8s, a fork-sandbox-k8s.sh submit of the same seat as a cluster Job
+# -- same handoff, same branch, no local tmux), --checkout at the
 # series' tip, with a handoff built from the persona file, the mailbox's
 # `cover` and `tree` output, and (with --reply-to) the specific threads to
 # answer. The secretary seat additionally gets the whole thread's message
@@ -90,9 +124,9 @@
 # run's artifact outbox (the absolute path its own prompt preamble
 # gives it), which sits outside the clone: the project's "commit early
 # and often" instinct cannot sweep a reply into a commit by accident --
-# and, if a Kubernetes mode is ever added, the same harvest would serve
-# a cluster run: the outbox is the only channel that carries a file out
-# of a pod. Launches are started back to
+# and the --k8s mode serves a cluster run the same way: the outbox is
+# the only channel that carries a file out of a pod, and collect pulls
+# it back to the seat's own directory. Launches are started back to
 # back rather than backgrounded with `&`: each fork-sandbox.sh call returns
 # as soon as its own detached tmux session exists, so by the time the last
 # one is launched every session is already running concurrently -- the same
@@ -101,7 +135,9 @@
 #
 # After every launched run has written summary.json -- fork-sandbox.sh's
 # own signal that the run is fully over, including its (possibly empty)
-# fetch back into the real repo, written strictly after exit-code -- each
+# fetch back into the real repo, written strictly after exit-code (the
+# --k8s mode's analogue is the wait/collect loop: each seat is probed
+# with a short `wait` and collected the moment it completes) -- each
 # run's artifact outbox is read directly -- `cat`, never git -- for
 # *.msg files, with a fall back to the old .git/lkml-out/ directory in
 # the run's clone for a seat that ignored the outbox instruction in its
@@ -146,6 +182,8 @@ model_override=""
 services_trust_ref=""
 summarize=1
 reply_to_ids=()
+k8s=0
+endpoint=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -159,6 +197,8 @@ while [[ $# -gt 0 ]]; do
         --timeout) timeout="${2:?--timeout requires seconds}"; shift 2 ;;
         --model-override) model_override="${2:?--model-override requires harness or harness/model}"; shift 2 ;;
         --services-trust-ref) services_trust_ref="${2:?--services-trust-ref requires a ref}"; shift 2 ;;
+        --k8s) k8s=1; shift ;;
+        --endpoint) endpoint="${2:?--endpoint requires a name}"; shift 2 ;;
         --no-summarize) summarize=0; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Error: unknown option '$1'." >&2; exit 1 ;;
@@ -172,7 +212,20 @@ if (( ${#reply_to_ids[@]} == 0 )); then
     [[ -n "$base_ref" ]] || { echo "Error: --base is required for a fresh-review round (no --reply-to)." >&2; exit 1; }
 fi
 [[ -d "$personas_dir" ]] || { echo "Error: --personas-dir '$personas_dir' not found." >&2; exit 1; }
-command -v fork-sandbox.sh >/dev/null 2>&1 || { echo "Error: fork-sandbox.sh not found on PATH." >&2; exit 1; }
+if (( k8s )); then
+    # A pod has no sealed local endpoint for pi-local seats to reach the
+    # self-hosted model through, so the mode refuses without a named one;
+    # the name itself is site-specific configuration this repo never
+    # carries.
+    [[ -n "$endpoint" ]] || { echo "Error: --k8s requires --endpoint <name>: a cluster seat's pi (including a translated pi-local) run is wired to a registered proxy endpoint, and none may be guessed." >&2; exit 1; }
+    command -v fork-sandbox-k8s.sh >/dev/null 2>&1 || { echo "Error: fork-sandbox-k8s.sh not found on PATH." >&2; exit 1; }
+    if [[ -n "$services_trust_ref" ]]; then
+        echo "Warning: --services-trust-ref is ignored with --k8s: a cluster submit has no sandbox-services hook to trust." >&2
+    fi
+else
+    [[ -z "$endpoint" ]] || { echo "Error: --endpoint <name> is only used with --k8s." >&2; exit 1; }
+    command -v fork-sandbox.sh >/dev/null 2>&1 || { echo "Error: fork-sandbox.sh not found on PATH." >&2; exit 1; }
+fi
 command -v jq >/dev/null 2>&1 || { echo "Error: jq not found on PATH." >&2; exit 1; }
 # Refused at startup, before any persona launches: a panel that spends real
 # cost and only then discovers it cannot deliver the summary is the wrong
@@ -463,6 +516,27 @@ for persona in "${personas[@]}"; do
             exit 1
         }
         [[ -n "$seat_note" ]] && echo "fork-sandbox lkml-round: $seat_note" >&2
+    fi
+    if (( k8s )); then
+        # The cluster refuses pi-local (a pod has no sealed local
+        # endpoint) -- the zero-cost equivalent is pi against the
+        # endpoint, the same self-hosted model through the in-cluster
+        # proxy. Translate rather than fail the seat. Anything that is
+        # not pi, pi-local or claude refuses the WHOLE round here, in
+        # the same pre-pass that validates the seats file: the launch
+        # loop below submits as it goes, so a refusal there would mean
+        # the rest of the panel spends real cluster cost first.
+        case "$harness" in
+            pi-local)
+                echo "fork-sandbox lkml-round: seat $persona: pi-local runs as pi via endpoint '$endpoint' on the cluster" >&2
+                harness="pi"
+                ;;
+            pi|claude) ;;
+            *)
+                echo "Error: seat $persona asks for harness '$harness', which the cluster cannot run (pi, pi-local and claude only); no persona was launched." >&2
+                exit 1
+                ;;
+        esac
     fi
     seat_harness["$persona"]="$harness"
     seat_model["$persona"]="$model"
