@@ -49,7 +49,8 @@
 # on, and writes the sentinel that lets the pod's entrypoint proceed. The
 # pod holds no git credential and never pushes anywhere; it only receives.
 #
-# run is submit, then wait, then fetch, then rm: the one-shot equivalent of
+# run is submit + wait + collect, literally -- the three phases are their
+# own verbs (below) and run composes them: the one-shot equivalent of
 # a local fork-sandbox.sh launch, for anywhere with cluster access. submit
 # and fetch remain available on their own for when you want to start a run
 # from one place and collect it later from somewhere else, rather than
@@ -60,12 +61,12 @@
 # at --timeout is left in place, never fetched and never removed, and the
 # error names the fetch command to run by hand once it completes.
 #
-# wait is the wait phase of a run as a standalone verb: it polls the same
-# sentinel and, on success, prints the agent's exit code to stdout -- and
-# nothing else to stdout -- and exits 0. A non-zero exit from wait means the
-# wait itself failed (dead pod, timeout, malformed sentinel), never the
-# agent's exit status: an agent that ran to completion and exited 3 is a
-# successful wait that prints 3.
+# wait is run's second phase on its own: it polls the same sentinel and,
+# on success, prints the agent's exit code to stdout -- and nothing else to
+# stdout -- and exits 0. A non-zero exit from wait means the wait itself
+# failed (dead pod, timeout, malformed sentinel), never the agent's exit
+# status: an agent that ran to completion and exited 3 is a successful wait
+# that prints 3.
 #
 # collect is run's third and last phase on its own: it reads the review
 # loop's outcome (only when --review-loop N is given and non-zero), pulls
@@ -100,9 +101,9 @@
 # Contacts nothing -- no kubectl, no git push, no cluster reachability
 # check. This is how the rendering logic is tested without a cluster.
 #
-# --timeout SECONDS (run, wait): how long to wait for the agent before
-# giving up. Defaults to 3600, matching the entrypoint's own RUN_TTL default
-# -- waiting longer than the pod itself will idle is pointless.
+# --timeout SECONDS (run, wait): how long to wait for the agent before giving
+# up. Defaults to 3600, matching the entrypoint's own RUN_TTL default --
+# waiting longer than the pod itself will idle is pointless.
 #
 # --keep (run, collect): skip the final rm, leaving the Job and pod in place
 # after a successful fetch.
@@ -147,7 +148,7 @@
 # local loop uses -- and shipped in alongside handoff.md, never composed a
 # second time inside the pod. The outcome lands in the pod at
 # /work/review-loop.json; `run` reads it back and prints a summary before
-# fetching (see cmd_run below), because the container's own exit code stays
+# fetching (see cmd_collect below), because the container's own exit code stays
 # the CODING leg's regardless of how the loop ended -- see
 # fork-sandbox-k8s-entrypoint.sh's comment on .run-complete for why. See
 # docs/kubernetes-runs.md for the full design.
@@ -387,7 +388,7 @@ POD_INBOX_DIR=/work/inbox
 # The pod's artifact outbox. Same tracking requirement and sibling-of-clone
 # reasoning as POD_INBOX_DIR above, mirrored on fork-sandbox-k8s-entrypoint.sh's
 # own outbox_dir. Read by cmd_submit (to tell the preamble where to point the
-# agent) and cmd_run (to know where to pull artifacts back from).
+# agent) and cmd_collect (to know where to pull artifacts back from).
 POD_OUTBOX_DIR=/work/outbox
 
 # The pod's gathered-context directory, populated from a --context-ro
@@ -395,7 +396,7 @@ POD_OUTBOX_DIR=/work/outbox
 # above -- it lives in the `work` emptyDir but must stay outside the clone
 # so the entrypoint's `git add -A` never sweeps it into a commit. Unlike
 # those two, read only by cmd_submit -- to tell the preamble where to point
-# the agent, and to push into -- since nothing else (cmd_say, cmd_run) ever
+# the agent, and to push into -- since nothing else (cmd_say, cmd_collect) ever
 # touches it.
 POD_CONTEXT_DIR=/work/context
 
@@ -1950,7 +1951,7 @@ spec:
           # is enforced by the kubelet EVICTING THE WHOLE POD the moment
           # it's crossed, which would destroy the clone and the branch along
           # with the oversized outbox. A refused pull-back (the outcome
-          # OUTBOX_MAX_BYTES actually produces, via cmd_run's pull-back guard
+          # OUTBOX_MAX_BYTES actually produces, via cmd_collect's pull-back guard
           # and the pod-side warning in fork-sandbox-k8s-entrypoint.sh) is
           # far cheaper than losing the whole run to eviction. If you're
           # about to add one back: don't -- the cap already has an
@@ -2572,10 +2573,12 @@ cmd_collect() {
     fi
 }
 
-# submit, then wait, then fetch, then rm -- see the header comment above for
-# why. Reuses cmd_submit/cmd_fetch/cmd_rm rather than growing a second copy
-# of any of their bodies; the only new logic here is the poll loop and its
-# failure handling.
+# submit, then wait, then collect -- see the header comment above for why.
+# Each phase's body lives in its own verb (cmd_wait, cmd_collect, plus
+# cmd_fetch and cmd_rm inside cmd_collect), so a caller fanning out several
+# runs can drive the phases separately; nothing here duplicates any of
+# their logic. The only new logic in this function is the phase sequence
+# itself and the final completion line.
 cmd_run() {
     local dry_run=false keep=false timeout=3600 branch="" model="" review_loop_cap=""
     local outbox_dir="" outbox_max_arg="" context_ro="" harness="" review_model="" endpoint=""
@@ -2625,10 +2628,10 @@ cmd_run() {
         exit 1
     fi
 
-    # Resolved here, before anything is created, for run's own pull-back
-    # check below -- and forwarded to cmd_submit as a raw string beneath,
-    # which parses its own copy for the Job spec. Same value either way;
-    # fs_parse_size_bytes already prints its own error naming what was given.
+    # Resolved here, before anything is created, so a bad --outbox-max is
+    # refused before submit creates anything -- and forwarded to cmd_collect
+    # below as the parsed byte count, which is all collect needs. fs_parse_
+    # size_bytes already prints its own error naming what was given.
     local outbox_max_bytes="$FS_OUTBOX_MAX_BYTES"
     if [[ -n "$outbox_max_arg" ]]; then
         outbox_max_bytes="$(fs_parse_size_bytes "$outbox_max_arg")" || exit 1
@@ -2668,202 +2671,31 @@ cmd_run() {
     fi
     cmd_submit "${submit_argv[@]}"
 
-    local safe_name pod_name
-    safe_name="$(k8s_safe_name fork-sandbox-agent "$branch")"
-    pod_name="$(kubectl get pod -l "job-name=$safe_name" -o jsonpath='{.items[0].metadata.name}')"
-    if [[ -z "$pod_name" ]]; then
-        echo "Error: could not find the pod for job $safe_name right after submit." >&2
-        exit 1
-    fi
+    # The wait runs in a $(...) subshell to capture the agent's exit code
+    # from its stdout. An `exit` inside a subshell stops only the
+    # subshell, so a dead-pod, timeout or malformed-sentinel failure would
+    # otherwise be swallowed and the run would carry on with an empty code:
+    # propagate it explicitly. cmd_collect below is NOT captured -- it is
+    # called normally, so its own exit paths behave exactly as they did
+    # inline before this extraction.
+    local agent_rc
+    agent_rc="$(cmd_wait --branch "$branch" --timeout "$timeout")" || exit $?
 
-    echo "fork-sandbox-k8s: waiting for branch $branch to finish (polling" >&2
-    echo "every 10s, timeout ${timeout}s)" >&2
+    local -a collect_argv=(--branch "$branch")
+    [[ -n "$outbox_dir" ]] && collect_argv+=(--outbox-dir "$outbox_dir")
+    # The parsed byte count, always: it is either the operator's --outbox-max
+    # or the same default collect would apply itself, so there is nothing to
+    # distinguish at the forwarding point.
+    collect_argv+=(--outbox-max "$outbox_max_bytes")
+    # Passed through whenever the flag was given at all, "0" included --
+    # cmd_submit already did the positive-integer validation above, and
+    # collect's own copy only decides whether the loop read happens.
+    [[ -n "$review_loop_cap" ]] && collect_argv+=(--review-loop "$review_loop_cap")
+    [[ "$keep" == true ]] && collect_argv+=(--keep)
+    cmd_collect "${collect_argv[@]}" "$project_path"
 
-    local start_ts now elapsed last_report_ts run_complete phase job_failed
-    start_ts=$(date +%s)
-    last_report_ts=$start_ts
-    run_complete=""
-    while true; do
-        # One kubectl exec per probe, as the header comment promises -- this
-        # single call both checks for the sentinel and reads it, so a
-        # completed run needs no second round trip.
-        if run_complete="$(kubectl exec "$pod_name" -- cat /work/.run-complete 2>/dev/null)"; then
-            break
-        fi
-
-        # A pod that dies before writing the sentinel (OOM, crash, image
-        # pull failure, node eviction) must not be polled for the full
-        # timeout -- check its state every iteration and stop as soon as it
-        # is clearly dead, rather than waiting out the deadline on a corpse.
-        phase="$(kubectl get pod "$pod_name" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
-        if [[ "$phase" == Failed ]]; then
-            echo "Error: pod $pod_name is Failed -- it died before writing" >&2
-            echo "/work/.run-complete. Inspect it with:" >&2
-            echo "  kubectl --context=$K8S_CONTEXT -n $K8S_NAMESPACE describe pod $pod_name" >&2
-            echo "fork-sandbox-k8s: the job and pod are left in place for" >&2
-            echo "inspection. Remove them with:" >&2
-            echo "  fork-sandbox-k8s.sh rm --branch $branch" >&2
-            exit 1
-        fi
-        job_failed="$(kubectl get job "$safe_name" \
-            -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null || true)"
-        if [[ "$job_failed" == True ]]; then
-            echo "Error: job $safe_name reports a Failed condition -- it" >&2
-            echo "died before /work/.run-complete appeared. Inspect it with:" >&2
-            echo "  kubectl --context=$K8S_CONTEXT -n $K8S_NAMESPACE describe job $safe_name" >&2
-            echo "fork-sandbox-k8s: the job and pod are left in place for" >&2
-            echo "inspection. Remove them with:" >&2
-            echo "  fork-sandbox-k8s.sh rm --branch $branch" >&2
-            exit 1
-        fi
-
-        now=$(date +%s)
-        elapsed=$(( now - start_ts ))
-        if (( elapsed >= timeout )); then
-            echo "Error: timed out after ${timeout}s waiting for branch" >&2
-            echo "$branch to finish. The pod is still running, holding its" >&2
-            echo "work -- run does not fetch a half-finished branch and does" >&2
-            echo "not remove a still-running pod. Fetch by hand once it" >&2
-            echo "completes:" >&2
-            echo "  fork-sandbox-k8s.sh fetch --branch $branch $project_path" >&2
-            echo "and clean up afterwards with:" >&2
-            echo "  fork-sandbox-k8s.sh rm --branch $branch" >&2
-            exit 1
-        fi
-        if (( now - last_report_ts >= 60 )); then
-            echo "fork-sandbox-k8s: still waiting on branch $branch (${elapsed}s elapsed)" >&2
-            last_report_ts=$now
-        fi
-        sleep 10
-    done
-
-    if [[ ! "$run_complete" =~ ^[0-9]+$ ]]; then
-        echo "Error: /work/.run-complete on pod $pod_name does not hold an" >&2
-        echo "integer exit code (got: '$run_complete'). Treating this as a" >&2
-        echo "malformed run rather than guessing at an exit code." >&2
-        echo "Inspect it, then fetch by hand if there is anything worth" >&2
-        echo "keeping:" >&2
-        echo "  fork-sandbox-k8s.sh fetch --branch $branch $project_path" >&2
-        echo "and clean up afterwards with:" >&2
-        echo "  fork-sandbox-k8s.sh rm --branch $branch" >&2
-        exit 1
-    fi
-    local agent_rc="$run_complete"
-
-    echo "fork-sandbox-k8s: agent finished (exit $agent_rc)" >&2
-
-    # The review loop's outcome, when this run carried one. This is the
-    # ONLY place a bad loop outcome ever surfaces: agent_rc below stays the
-    # CODING leg's exit code (see fork-sandbox-k8s-entrypoint.sh's own
-    # comment on .run-complete for why), so a `--k8s --review-loop` run
-    # that hit its cap with findings still open would otherwise report
-    # success and say nothing about it. Read before cmd_fetch, so this
-    # prints even if the fetch itself fails partway through. It is the
-    # same kind of exec as the outbox read below -- runnable while the
-    # pod is idle -- so it carries the same request-timeout bound.
-    if (( review_loop_cap > 0 )); then
-        local loop_json loop_err
-        loop_err="$(mktemp)"
-        if loop_json="$(kubectl exec --request-timeout=60s "$pod_name" -- cat /work/review-loop.json 2> "$loop_err")" \
-            && jq -e . >/dev/null 2>&1 <<< "$loop_json"; then
-            local loop_ended loop_detail loop_iters loop_last_findings
-            loop_ended="$(jq -r '.ended // "unknown"' <<< "$loop_json")"
-            loop_detail="$(jq -r '.detail // empty' <<< "$loop_json")"
-            loop_iters="$(jq -r '.iterations | length' <<< "$loop_json")"
-            loop_last_findings="$(jq -r '.iterations[-1].findings // "unknown"' <<< "$loop_json")"
-            case "$loop_ended" in
-                approved)
-                    echo "fork-sandbox-k8s: review loop: APPROVED after $loop_iters iteration(s)" >&2
-                    ;;
-                cap|no-progress)
-                    echo "fork-sandbox-k8s: ################################################" >&2
-                    echo "fork-sandbox-k8s: *** review loop ended '$loop_ended' after" >&2
-                    echo "fork-sandbox-k8s: *** $loop_iters iteration(s) -- the branch was NOT" >&2
-                    echo "fork-sandbox-k8s: *** approved, with $loop_last_findings finding(s)" >&2
-                    echo "fork-sandbox-k8s: *** outstanding as of the last iteration." >&2
-                    echo "fork-sandbox-k8s: ################################################" >&2
-                    ;;
-                skipped)
-                    echo "fork-sandbox-k8s: review loop skipped${loop_detail:+: $loop_detail}" >&2
-                    ;;
-                *)
-                    echo "fork-sandbox-k8s: ################################################" >&2
-                    echo "fork-sandbox-k8s: *** review loop ended '$loop_ended'${loop_detail:+: $loop_detail}" >&2
-                    echo "fork-sandbox-k8s: ################################################" >&2
-                    ;;
-            esac
-        else
-            echo "fork-sandbox-k8s: warning: could not read /work/review-loop.json" >&2
-            echo "from pod $pod_name -- the branch is still worth fetching." >&2
-            fs_report_captured_stderr "kubectl exec into pod $pod_name (review-loop.json read)" "$loop_err"
-        fi
-        rm -f -- "$loop_err"
-    fi
-
-    # Pull /work/outbox back, symmetric with the local path's run_dir/outbox
-    # (see fs_emit_prompt_preamble's "## Artifact outbox" section). This is
-    # best-effort: retrieving artifacts must never cost the branch fetch
-    # that follows, or block the --keep/rm step below, so every failure here
-    # warns and falls through rather than exiting. It runs BEFORE that
-    # fetch, not after it, because cmd_fetch touches /work/.fetched -- the
-    # pod's own signal to stop idling and exit (see the entrypoint's idle
-    # loop) -- and a kubectl exec into a completed pod fails. This read
-    # and the review-loop.json read above are the kubectl execs in this
-    # sequence that can run while the pod is otherwise idle, so both are
-    # bounded with --request-timeout: a hung connection may now delay the
-    # fetch, but it cannot hang indefinitely.
-    local outbox_dest="$outbox_dir"
-    [[ -n "$outbox_dest" ]] \
-        || outbox_dest="/var/tmp/claude-scratch/forks/k8s-$(k8s_safe_name_component "$branch")/outbox"
-    local outbox_tar outbox_err outbox_ok=true outbox_rc=0
-    outbox_tar="$(mktemp)"
-    outbox_err="$(mktemp)"
-    kubectl exec --request-timeout=60s "$pod_name" -- tar cf - -C /work/outbox . 2> "$outbox_err" \
-            | head -c "$((outbox_max_bytes + 1))" > "$outbox_tar" \
-            || outbox_rc=$?
-    # Size check BEFORE exit status: an outbox well past the cap makes
-    # head -c exit early, kubectl then dies of EPIPE and the pipeline is
-    # non-zero under pipefail -- but that IS the over-cap case, not a
-    # read failure, because by the time head has had to close, outbox_tar
-    # is always filled to cap+1 bytes. Only a non-zero pipeline that
-    # leaves the tarball under the cap is a genuine read error.
-    if (( $(stat -c '%s' -- "$outbox_tar") > outbox_max_bytes )); then
-        echo "fork-sandbox-k8s: warning: pod $pod_name's outbox is over the $outbox_max_bytes byte cap; refusing to pull it back." >&2
-        outbox_ok=false
-    elif (( outbox_rc != 0 )); then
-        echo "fork-sandbox-k8s: warning: could not read the outbox from pod $pod_name; nothing pulled back." >&2
-        fs_report_captured_stderr "kubectl exec into pod $pod_name (outbox read)" "$outbox_err"
-        outbox_ok=false
-    fi
-    rm -f -- "$outbox_err"
-    if [[ "$outbox_ok" == true ]] && ! mkdir -p -- "$(dirname -- "$outbox_dest")"; then
-        echo "fork-sandbox-k8s: warning: could not create $(dirname -- "$outbox_dest"); outbox not pulled back." >&2
-        outbox_ok=false
-    fi
-    if [[ "$outbox_ok" == true ]]; then
-        if "$script_dir/fork-sandbox-k8s-outbox-extract.sh" "$outbox_tar" "$outbox_dest" "$outbox_max_bytes"; then
-            local outbox_count
-            outbox_count="$(find "$outbox_dest" -type f | wc -l)"
-            if (( outbox_count > 0 )); then
-                echo "fork-sandbox-k8s: outbox: $outbox_count file(s) at $outbox_dest" >&2
-            else
-                echo "fork-sandbox-k8s: outbox: empty (nothing written)" >&2
-            fi
-        else
-            echo "fork-sandbox-k8s: warning: could not extract the outbox tarball; nothing pulled back to $outbox_dest" >&2
-        fi
-    fi
-    rm -f -- "$outbox_tar"
-
-    echo "fork-sandbox-k8s: fetching branch $branch" >&2
-    cmd_fetch --branch "$branch" "$project_path"
-
-    if [[ "$keep" == true ]]; then
-        echo "fork-sandbox-k8s: --keep set; leaving job and pod for branch $branch in place" >&2
-    else
-        cmd_rm --branch "$branch"
-    fi
-
+    # The one line this verb prints that none of its three phases can: it
+    # reports the agent's exit code, which collect does not know.
     echo "fork-sandbox-k8s: run complete. branch=$branch agent_exit=$agent_rc landed_in=$project_path" >&2
     exit "$agent_rc"
 }
