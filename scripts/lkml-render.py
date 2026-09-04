@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 """lkml-render.py — render one or more lkml-mode series mailboxes as a
-single self-contained HTML page, or as plain text for agents.
+single-file HTML page, or as plain text for agents.
 
 Usage: lkml-render.py <series-dir> [<series-dir> ...] > out.html
        lkml-render.py --text <series-dir> [<series-dir> ...] > out.txt
+
+The HTML is one file: all markup and styles are inlined. The only
+external dependency is the typefaces, loaded from the Google Fonts
+CDN (Archivo, Source Serif 4, JetBrains Mono); on a machine without
+network the page renders in the local fallback stacks the --ui / --read
+/ --mono tokens declare.
 
 The default HTML render is the human view: a sticky state rail (the
 version list with the current version marked aria-current, a
@@ -583,19 +589,20 @@ def link_ids(escaped, id_map):
     return HEX_TOKEN_RE.sub(sub, escaped)
 
 
-def render_summary_card(series_dir, version, id_map):
+def render_summary_card(series_dir, version, id_map, series_name):
     """The per-version auto-summary card, rendered when the version's
     results file exists (results-v<N>.md, or a bare results-v<N>.json
     when the .md is absent). The '# Summary' section sits visible in
     the card body, only the '# Details' section inside the fold, and
     7-hex message-id tokens autolink to the thread's #m-<id> anchors.
     Empty sections are omitted; with NO results file this returns ""
-    -- no card at all, not an empty one."""
+    -- no card at all, not an empty one. The id is namespaced per
+    series (a multi-series page carries the same version twice)."""
     res = read_results(series_dir, version)
     if res is None and not has_results_json(series_dir, version):
         return ""
     summary, details = res if res is not None else ("", "")
-    card = (f'  <section class="panel summary" id="summary-v{version}">\n'
+    card = (f'  <section class="panel summary" id="{esc(series_name)}-summary-v{version}">\n'
             f'    <div class="summary-head"><h2>Where this stands</h2>'
             f'<span class="chip pending">auto-summary \u00b7 v{version}</span></div>\n')
     if summary:
@@ -656,7 +663,7 @@ def render_banner(naks, nak_names, nak_patch_idx, n_open, open_patch_idx):
     return ""
 
 
-def render_versions_panel(versions, current, version_counts):
+def render_versions_panel(versions, current, version_counts, series_name):
     rows = []
     for v in versions:
         cur = ' aria-current="true"' if v == current else ""
@@ -668,7 +675,7 @@ def render_versions_panel(versions, current, version_counts):
             label = "latest posting"
         else:
             label = "interim"
-        rows.append(f'<a class="vrow" href="#v-{v}"{cur}>'
+        rows.append(f'<a class="vrow" href="#{esc(series_name)}-v{v}"{cur}>'
                     f'<span class="vn">v{v}</span><span>{label}</span>'
                     f'<span class="vmeta">{version_counts[v]} msg</span></a>')
     return (f'    <section class="panel">\n'
@@ -705,6 +712,13 @@ def render_patch_panel(series_dir, version, rows, reviewer_entries):
              for r in reviewer_entries}
     rows_html = []
     for i, (patch, latest) in enumerate(patches, start=1):
+        # The row is numbered from the SUBJECT's index, not its
+        # position: with a gapped mailbox (1/2 and 3/2) the second
+        # row is patch 3, and a positional badge would disagree with
+        # the banner. A subject without an index falls back to the
+        # position, marked '?' so the fallback is visible.
+        subj_idx = patch_index(patch)
+        num = str(subj_idx) if subj_idx is not None else f"{i}?"
         pos = [p for p, (_s, _m, tags) in latest.items()
                if any(t in POSITIVE_TAGS for t in tags)]
         names = [roles.get(p, p) for p in pos]
@@ -720,7 +734,7 @@ def render_patch_panel(series_dir, version, rows, reviewer_entries):
         mm = re.match(r"^\[PATCH v\d+ \d+/\d+\]\s*(.*)$", subj)
         title = mm.group(1).strip() if mm else subj.strip() or f"patch {i}"
         rows_html.append(f'        <div class="mrow">\n'
-                         f'          <span class="mono-badge mono-none">{i}</span>\n'
+                         f'          <span class="mono-badge mono-none">{num}</span>\n'
                          f'          <span class="who">{esc(title[:60])}<small>{esc(sub)}</small></span>\n'
                          f'          {chip}\n'
                          f'        </div>')
@@ -841,7 +855,6 @@ def render_series(series_dir):
     current = versions[-1] if versions else 1
     # The current version's state drives the rail, the banner and the
     # state chip: the page reports where the series stands NOW.
-    cur_cover = next((c for c in covers if c["version"] == current), None)
     version_data = {}
     for v in versions:
         cover = next(c for c in covers if c["version"] == v)
@@ -897,8 +910,11 @@ def render_series(series_dir):
                     d1 = d1map.get(_mid)
                     if d1 is not None:
                         nak_d1.add(d1["id"])
-        nak_idx = sorted(i for i in (patch_index(d) for d in
-                                     (next(t[0] for t in rows[1:] if t[0]["id"] == k) for k in nak_d1)) if i)
+        # A NAK whose depth-1 ancestor is not a patch root (a reply to
+        # the cover, or nested under one) anchors to no patch: the
+        # banner already falls back to "the series", so the index skips
+        # it rather than looking it up in the patch rows.
+        nak_idx = sorted(i for i in (patch_index(patch_msgs[k]) for k in nak_d1 if k in patch_msgs) if i)
         version_data[v] = {
             "cover": cover, "rows": rows, "version_roots": version_roots,
             "version_msgs": version_msgs, "reviewer_entries": reviewer_entries,
@@ -959,13 +975,14 @@ def render_series(series_dir):
                                      max((m["depth"] for m in cur["version_msgs"]), default=0),
                                      cur["n_naks"])
         rail = [render_versions_panel(versions, current,
-                                      {v: len(d["version_msgs"]) for v, d in version_data.items()}),
+                                      {v: len(d["version_msgs"]) for v, d in version_data.items()},
+                                      name),
                 render_reviewer_panel(series_dir, current, cur["reviewer_entries"], cur["strongest"]),
                 render_patch_panel(series_dir, current, cur["rows"], cur["reviewer_entries"]),
                 counts]
         banner = render_banner(cur["n_naks"], cur["nak_names"], cur["nak_idx"],
                                cur["n_open"], cur["open_patch_idx"])
-        sump = render_summary_card(series_dir, current, id_map)
+        sump = render_summary_card(series_dir, current, id_map, name)
         shell = '  <div class="shell">\n\n  <aside class="rail">\n' + "\n".join(p for p in rail if p) + "\n  </aside>\n\n  <main class=\"main\">\n"
         if banner:
             shell += banner + "\n"
@@ -975,7 +992,7 @@ def render_series(series_dir):
             d = version_data[v]
             thread = "\n".join(render_trace(r, 0, name) for r in d["version_roots"])
             maxd = max((m["depth"] for m in d["version_msgs"]), default=0)
-            shell += (f'    <section class="section" id="v-{v}">\n'
+            shell += (f'    <section class="section" id="{esc(name)}-v{v}">\n'
                       f'      <div class="trace-head"><h2>Thread \u00b7 v{v}</h2>'
                       f'<span class="eyebrow">{len(d["version_msgs"])} messages \u00b7 depth {maxd} \u00b7 click any line to open</span></div>\n'
                       f'      <div class="trace">\n{thread}\n      </div>\n'

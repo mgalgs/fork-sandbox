@@ -140,7 +140,7 @@ fi
 printf '\n== state rail: versions ==\n'
 contains "versions panel eyebrow" "$html" '<p class="eyebrow">versions</p>'
 contains "the current version row is marked current" "$html" \
-    '<a class="vrow" href="#v-1" aria-current="true"><span class="vn">v1</span><span>first posting</span><span class="vmeta">6 msg</span></a>'
+    '<a class="vrow" href="#render-fixture-v1" aria-current="true"><span class="vn">v1</span><span>first posting</span><span class="vmeta">6 msg</span></a>'
 
 printf '\n== state rail: where each reviewer stands ==\n'
 contains "reviewer panel eyebrow names the version" "$html" '<p class="eyebrow">where each reviewer stands · v1</p>'
@@ -223,6 +223,60 @@ contains "counts: one open thread (the untagged orphan reply)" "$html" '<div cla
 contains "counts: two sign-off messages" "$html" '<div class="count is-ok"><b>2</b><span>sign-offs</span></div>'
 contains "counts: deepest depth 2" "$html" '<div class="count"><b>2</b><span>deepest depth</span></div>'
 contains "counts: zero NAKs standing" "$html" '<div class="count"><b>0</b><span>NAKs standing</span></div>'
+
+# The per-patch rail numbers its rows from the SUBJECT's index, not
+# their position: with a gapped mailbox (1/2 and 3/2) the rail and a
+# "sit on patch 3" banner must agree. init renumbers what it is given,
+# so the gap is restored in the stored msg -- a mailbox is a directory
+# of .msg files and the renderer must render what is stored.
+"$mailbox" init gap-fixture --cover "$work/cover.txt" --patches "$work/patches" \
+    --from author --harness test --model fixture >/dev/null 2>/dev/null
+gap_p3="$(printf '%s\n' "$("$mailbox" tree gap-fixture)" | awk '/\[PATCH v1 2\/2\]/{print $1}')"
+sed -i 's/^Subject: \[PATCH v1 2\/2\].*$/Subject: [PATCH v1 3\/2] demo: add two/' \
+    "$LKML_MAILBOX_ROOT/gap-fixture/cur/${gap_p3}"*.msg  # tree truncates ids; the file is the full uuid
+gap_html="$work/gap.html"
+python3 "$renderer" "$LKML_MAILBOX_ROOT/gap-fixture" -o "$gap_html"
+ghtml="$(<"$gap_html")"
+contains "gapped mailbox: the rail keeps the first patch's 1" "$ghtml" '<span class="mono-badge mono-none">1</span>'
+contains "gapped mailbox: the second row is numbered 3 from its subject, not 2 from its position" "$ghtml" '<span class="mono-badge mono-none">3</span>'
+# A patch subject with no index falls back to the row's position,
+# marked '?' so the fallback is visible. Hand-written msg, depth-1 child
+# of the cover, format-patch body (is_patch keys on 'From ').
+gap_cover="$(printf '%s\n' "$("$mailbox" tree gap-fixture)" | awk '/\[PATCH v1 0\/2\]/{print $1}')"
+# tree truncates message ids to seven chars; the file name is the full
+# uuid the In-Reply-To header needs.
+gap_cover_msgs=("$LKML_MAILBOX_ROOT/gap-fixture/cur/${gap_cover}"*.msg)
+gap_cover_full="$(basename "${gap_cover_msgs[0]}" .msg)"
+bare_uuid="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+# A seq after the init'd messages, so the bare patch is the LAST row
+# (position 3) whatever the clock reads.
+bare_seq="$(( $(date +%s) * 1000000000 + 999999999 ))"
+printf '%s\n' \
+    "Message-ID: <${bare_uuid}@lkml.local>" \
+    "In-Reply-To: <${gap_cover_full}@lkml.local>" \
+    "References: <${gap_cover_full}@lkml.local>" \
+    'Date: Mon, 17 Sep 2001 00:00:00 +0000' \
+    'From: Author (AI persona) <author.ai@lkml.local>' \
+    'Subject: [PATCH] demo: bare' \
+    'X-AI-Persona: author' \
+    'X-AI-Harness: test' \
+    'X-Series: gap-fixture' \
+    'X-Version: 1' \
+    'X-Depth: 1' \
+    'X-Tags: ' \
+    "X-Seq: ${bare_seq}" \
+    '' \
+    'From 0123456789abcdef Mon Sep 17 00:00:00 2001' \
+    'From: Author <author@example.com>' \
+    'Date: Mon, 17 Sep 2001 00:00:00 +0000' \
+    'Subject: [PATCH] demo: bare' '' \
+    'Commit message for the unnumbered patch.' '' \
+    '---' ' demo.c | 1 +' ' 1 file changed, 1 insertion(+)' '' \
+    'diff --git a/demo.c b/demo.c' '+three' \
+    > "$LKML_MAILBOX_ROOT/gap-fixture/cur/${bare_uuid}.msg"
+python3 "$renderer" "$LKML_MAILBOX_ROOT/gap-fixture" -o "$gap_html"
+ghtml="$(<"$gap_html")"
+contains "an unindexed patch subject falls back to its position, marked '?'" "$ghtml" '<span class="mono-badge mono-none">3?</span>'
 
 printf '\n== thread trace: one collapsed details per message ==\n'
 if [[ "$(grep -o '<details class="msg"' "$stdout" | wc -l)" -eq 6 ]]; then
@@ -313,6 +367,30 @@ case "$ahtml" in *'class="banner'*) no "withdrawn NAK raises no banner" ;; *) ok
 contains "withdrawn NAK: the state chip is converged again" "$ahtml" '<span class="chip reviewed">converged</span>'
 contains "withdrawn NAK: the counts panel reports zero" "$ahtml" '<div class="count"><b>0</b><span>NAKs standing</span></div>'
 contains "withdrawn NAK: core's chip is reviewed-by again" "$ahtml" '<span class="chip reviewed">reviewed-by</span>'
+
+# A NAK whose depth-1 ancestor is not a [PATCH] root (a reply to the
+# cover, or nested under one) anchors to no patch. That used to crash
+# the render (StopIteration raised inside the banner's generator); now
+# the index skips it and the banner falls back to "the series", the
+# same way a NAK on the cover already does.
+"$mailbox" init nak-cover --cover "$work/cover.txt" --patches "$work/patches" \
+    --from author --harness test --model fixture >/dev/null 2>/dev/null
+nc_tree="$("$mailbox" tree nak-cover)"
+nc_cover="$(printf '%s\n' "$nc_tree" | awk '/\[PATCH v1 0\/2\]/{print $1}')"
+nc_d1="$("$mailbox" post nak-cover --from core --reply-to "$nc_cover" --file "$work/review.txt" \
+    --harness test --model fixture 2>/dev/null)"
+nc_d2="$("$mailbox" post nak-cover --from ci --reply-to "$nc_d1" --file "$work/nak.txt" \
+    --tags NAK --harness test --model fixture 2>/dev/null)"
+"$mailbox" post nak-cover --from newcomer --reply-to "$nc_d2" --file "$work/nak.txt" \
+    --tags NAK --harness test --model fixture >/dev/null 2>/dev/null
+nakc_html="$work/nak-cover.html"
+if python3 "$renderer" "$LKML_MAILBOX_ROOT/nak-cover" -o "$nakc_html"; then
+    ok "a NAK anchored to no patch does not crash the render"
+else
+    no "a NAK anchored to no patch does not crash the render"
+fi
+contains "the banner names the series when no NAK anchors to a patch" \
+    "$(<"$nakc_html")" '<h2>2 NAKs stand on the series</h2>'
 
 printf '\n== persona path containment ==\n'
 # The persona header comes verbatim out of the .msg file; a hand-written
@@ -958,7 +1036,7 @@ printf '%s\n' 'JSON CANARY' > "$LKML_MAILBOX_ROOT/render-fixture/results-v1.json
 results_html="$work/results.html"
 python3 "$renderer" "$LKML_MAILBOX_ROOT/render-fixture" -o "$results_html"
 rhtml="$(<"$results_html")"
-contains "summary card is present with the file" "$rhtml" '<section class="panel summary" id="summary-v1">'
+contains "summary card is present with the file" "$rhtml" '<section class="panel summary" id="render-fixture-summary-v1">'
 contains "summary card head reads 'Where this stands'" "$rhtml" '<h2>Where this stands</h2>'
 contains "summary card carries its auto-summary chip" "$rhtml" '<span class="chip pending">auto-summary · v1</span>'
 contains "summary text sits outside the collapse" "$rhtml" '<div class="summary-body">'
@@ -969,8 +1047,8 @@ if python3 - "$results_html" <<'PY'
 import sys
 
 html = open(sys.argv[1], encoding="utf-8").read()
-i_card = html.index('<section class="panel summary" id="summary-v1">')
-i_thread = html.index('<section class="section" id="v-1">')
+i_card = html.index('<section class="panel summary" id="render-fixture-summary-v1">')
+i_thread = html.index('<section class="section" id="render-fixture-v1">')
 i_sum = html.index('<div class="summary-body">')
 i_fold = html.index('<details class="results-fold">')
 i_pre = html.index('<pre class="results-details">')
@@ -1053,7 +1131,7 @@ contains "no '# Summary' above '# Details': its own section renders" "$rf" '<pre
 : > "$RESULTS_MD"
 python3 "$renderer" "$LKML_MAILBOX_ROOT/render-fixture" -o "$fallback_html"
 rf="$(<"$fallback_html")"
-contains "a zero-byte results file renders the card head" "$rf" '<section class="panel summary" id="summary-v1">'
+contains "a zero-byte results file renders the card head" "$rf" '<section class="panel summary" id="render-fixture-summary-v1">'
 case "$rf" in *'class="summary-body"'*|*'class="results-fold"'*) no "a zero-byte results file renders no summary body and no fold" ;; *) ok "a zero-byte results file renders no summary body and no fold" ;; esac
 printf '# Summary \nspaced header line.\n' > "$RESULTS_MD"
 python3 "$renderer" "$LKML_MAILBOX_ROOT/render-fixture" -o "$fallback_html"
@@ -1101,10 +1179,10 @@ two_html="$work/res-two.html"
 python3 "$renderer" "$LKML_MAILBOX_ROOT/res-two" -o "$two_html"
 t2h="$(<"$two_html")"
 case "$t2h" in *'class="panel summary"'*) no "an older version's results file raises no card" ;; *) ok "an older version's results file raises no card" ;; esac
-contains "both versions still render as sections" "$t2h" '<section class="section" id="v-1">'
-contains "both versions render their section for v2 too" "$t2h" '<section class="section" id="v-2">'
-contains "the versions panel lists both, marking v2 current" "$t2h" '<a class="vrow" href="#v-2" aria-current="true"><span class="vn">v2</span><span>latest posting</span>'
-contains "the versions panel links v1 without the current mark" "$t2h" '<a class="vrow" href="#v-1">'
+contains "both versions still render as sections" "$t2h" '<section class="section" id="res-two-v1">'
+contains "both versions render their section for v2 too" "$t2h" '<section class="section" id="res-two-v2">'
+contains "the versions panel lists both, marking v2 current" "$t2h" '<a class="vrow" href="#res-two-v2" aria-current="true"><span class="vn">v2</span><span>latest posting</span>'
+contains "the versions panel links v1 without the current mark" "$t2h" '<a class="vrow" href="#res-two-v1">'
 printf '%s\n' '# Summary' 'v2 results summary.' '' '# Details' 'v2 results details.' \
     > "$LKML_MAILBOX_ROOT/res-two/results-v2.md"
 two_html2="$work/res-two2.html"
@@ -1118,7 +1196,7 @@ if html.count('<section class="panel summary"') != 1:
     errors.append("expected exactly one card, got %d" % html.count('<section class="panel summary"'))
 else:
     i_res = html.index('<section class="panel summary"')
-    i_v1 = html.index('<section class="section" id="v-1">')
+    i_v1 = html.index('<section class="section" id="res-two-v1">')
     if not i_res < i_v1:
         errors.append("card is not in the main column above the thread")
     region = html[i_res:i_v1]
@@ -1503,6 +1581,51 @@ contains "the TOC carries the second series too" "$m2" '<a href="#ser-card-b">se
 contains "the page masthead carries a rendered stamp" "$m2" '<span class="eyebrow">rendered</span>'
 if [[ "$(grep -o '<div class="series"' "$multi2" | wc -l)" -eq 2 ]]; then ok "one series wrapper per dir"; else no "one series wrapper per dir"; fi
 contains "the footer carries one line per series (current-version reply counts)" "$m2" 'ser-card · v2 · 0 replies  ·  ser-card-b · v1 · 0 replies'
+
+# Both series post a v1: per-version sections and the versions panel's
+# links must be namespaced per series, and every id in the document
+# must be unique (a bare v-1 id collides, and the second series' link
+# would jump into the first series' section). The summary card's id
+# must be namespaced the same way: two series carrying a current-version
+# results file both at v1 would otherwise carry two summary-v1 ids.
+"$mailbox" init ser-card-c --cover "$work/cover.txt" --patches "$work/patches" \
+    --from author --harness test --model fixture >/dev/null 2>/dev/null
+printf '%s\n' '# Summary' 'sum b' > "$LKML_MAILBOX_ROOT/ser-card-b/results-v1.md"
+printf '%s\n' '# Summary' 'sum c' > "$LKML_MAILBOX_ROOT/ser-card-c/results-v1.md"
+multi3="$work/multi3.html"
+python3 "$renderer" "$LKML_MAILBOX_ROOT/ser-card-b" "$LKML_MAILBOX_ROOT/ser-card-c" -o "$multi3"
+rm "$LKML_MAILBOX_ROOT/ser-card-b/results-v1.md" "$LKML_MAILBOX_ROOT/ser-card-c/results-v1.md"
+if python3 - "$multi2" "$multi3" <<'PY'
+import collections
+import re
+import sys
+
+for path in sys.argv[1:]:
+    html = open(path, encoding="utf-8").read()
+    ids = re.findall(r'\sid="([^"]*)"', html)
+    dups = sorted(i for i, n in collections.Counter(ids).items() if n > 1)
+    if dups:
+        print(path, "duplicate ids:", ", ".join(dups))
+        sys.exit(1)
+# The second series' v1 link resolves to its own section: the
+# namespaced id exists and sits inside that series' wrapper.
+html = open(sys.argv[1], encoding="utf-8").read()
+i_b = html.index('<div class="series" id="ser-card-b">')
+i_b_v1 = html.find('id="ser-card-b-v1"')
+if i_b_v1 < i_b or 'href="#ser-card-b-v1"' not in html[i_b:]:
+    print("second series' v1 section or link is not its own")
+    sys.exit(1)
+# The summary cards are namespaced per series, one per dir.
+html = open(sys.argv[2], encoding="utf-8").read()
+if 'id="ser-card-b-summary-v1"' not in html or 'id="ser-card-c-summary-v1"' not in html:
+    print("summary card ids are not namespaced per series")
+    sys.exit(1)
+PY
+then
+    ok "multi-series: every id is unique, version and summary ids namespaced per series"
+else
+    no "multi-series: every id is unique, version and summary ids namespaced per series"
+fi
 
 printf '%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))

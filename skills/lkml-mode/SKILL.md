@@ -42,8 +42,9 @@ scheduling, not reading, and the reviewers' job is reading.
   "📎". Read its own header comment for the full verb list, the message
   shape, and the attachment size cap/collision rules. You will mostly call
   `tree`, `open`, `tally` and `cover` — see above.
-- **`scripts/lkml-render.py`** — renders a self-contained HTML archive of the
-  threads and review tally: `lkml-render.py "$LKML_MAILBOX_ROOT/<series>" > threads.html`.
+- **`scripts/lkml-render.py`** — renders a single-file HTML archive of the
+  threads and review tally (typefaces load from the Google Fonts CDN; the
+  local fallback stacks apply when there is no network): `lkml-render.py "$LKML_MAILBOX_ROOT/<series>" > threads.html`.
   The HTML is the human view; `lkml-render.py --text "$LKML_MAILBOX_ROOT/<series>"`
   renders the same thread as plain text on stdout (series header, tally table,
   reviewer blocks, then every message in thread order, bodies indented under
