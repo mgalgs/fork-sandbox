@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# lkml-render-test.sh — render a real mailbox fixture and check the HTML.
+# lkml-render-test.sh — render real mailbox fixtures and check the HTML
+# (the token-based page shell, state rail, thread trace, patch bodies,
+# summary cards and banners) and the --text agent view.
 
 set -uo pipefail
 
@@ -39,7 +41,7 @@ printf '%s\n' '<script>alert(1)</script>' '' '```' 'fenced *markdown*' '```' > "
 # The patch files are real format-patch output, first line 'From <sha>
 # Mon Sep 17 00:00:00 2001': the header block (including the Subject: the
 # mailbox reads), the commit message, '---', diffstat, then the diff.
-# Both backends key their patch treatment on exactly this shape.
+# The patch-body renderer keys on exactly this shape.
 printf '%s\n' \
     'From abcdef1234567890 Mon Sep 17 00:00:00 2001' \
     'From: Author <author@example.com>' \
@@ -85,6 +87,7 @@ python3 "$renderer" --title 'Demo & Review' "$LKML_MAILBOX_ROOT/render-fixture" 
 python3 "$renderer" --title 'Demo & Review' "$LKML_MAILBOX_ROOT/render-fixture" > "$stdout"
 html="$(<"$default")"
 
+printf '\n== page shell and tokens ==\n'
 if [[ "$(grep -o '<!doctype html>' "$stdout" | wc -l)" -eq 1 ]]; then ok "starts with doctype"; else no "starts with doctype"; fi
 if [[ "$(grep -o '<title>' "$stdout" | wc -l)" -eq 1 ]]; then ok "has exactly one title"; else no "has exactly one title"; fi
 contains "default title is generic" "$html" '<title>Review Threads</title>'
@@ -93,43 +96,318 @@ custom_html="$(<"$stdout")"
 contains "custom title appears escaped" "$custom_html" '<title>Demo &amp; Review</title>'
 contains "script payload is escaped" "$html" '&lt;script&gt;alert(1)&lt;/script&gt;'
 case "$html" in *'<script>alert(1)</script>'*) no "script payload is never raw" ;; *) ok "script payload is never raw" ;; esac
-if [[ "$(grep -o '<tr><th scope="row"' "$stdout" | wc -l)" -eq 3 ]]; then ok "tally has cover plus two patch rows"; else no "tally has cover plus two patch rows"; fi
-# The fixture patches are real format-patch bodies, so the HTML must take
-# the patch path: diffstat shown, diff folded.
-contains "patch diffstat is shown in HTML" "$html" 'class="stat"'
-contains "patch diff is folded in HTML" "$html" 'class="fold"'
-contains "patch commit message survives header strip in HTML" "$html" 'Commit message for patch one.'
-if [[ "$(grep -o '<li style=' "$stdout" | wc -l)" -eq 6 ]]; then ok "thread index has one line per message"; else no "thread index has one line per message"; fi
-contains "thread index patch line carries the prefixed subject" "$html" 'class="ix-subj">[PATCH v1 1/2] demo: add one</span>'
-case "$html" in *'class="ix-subj">demo: add one</span>'*|*'class="ix-subj">demo: add two</span>'*) no "thread index no longer demotes the prefix to nothing" ;; *) ok "thread index no longer demotes the prefix to nothing" ;; esac
-contains "Tested-by has its own chip class" "$html" 'class="tag t-test"'
-case "$html" in *'Tested-by</span>'*'t-q'*) no "Tested-by does not fall through to question" ;; *) ok "Tested-by does not fall through to question" ;; esac
-contains "orphaned reply is rendered" "$html" 'orphan body'
-contains "tally cell links to latest tagged reply" "$html" "href=\"#m-$review_id\" title=\"Reviewed-by\">R"
+# The page shell loads the typefaces (Archivo, Source Serif 4, JetBrains
+# Mono) from the web-font CDN; the CSS itself only ever references the
+# --ui / --read / --mono tokens, so the families swap in one place.
+contains "page shell preconnects the font CDN" "$html" '<link rel="preconnect" href="https://fonts.googleapis.com">'
+contains "page shell loads the three typefaces" "$html" 'family=Archivo:wght@400;500;600;700&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&family=JetBrains+Mono'
+contains "CSS declares the token set" "$html" '--ground:'
+contains "CSS declares the verdict hue tokens" "$html" '--ok:'
+contains "CSS declares the mono token" "$html" '--mono:'
+contains "dark mode retunes the same tokens" "$html" '@media (prefers-color-scheme: dark)'
+contains "a data-theme override is honoured too" "$html" ':root[data-theme="dark"]'
+contains "prose reads in the serif token" "$html" '.body { padding: 14px 15px 16px; font-family: var(--read);'
+if grep -o '.body h3{[^}]*}' "$stdout" | grep -q 'letter-spacing'; then
+    no "uppercase-mono eyebrow treatment is not applied to body headings"
+else
+    ok "uppercase-mono eyebrow treatment is not applied to body headings"
+fi
+if cmp -s "$stdout" "$custom"; then ok "output file matches stdout"; else no "output file matches stdout"; fi
+if python3 -m py_compile "$renderer"; then ok "renderer compiles"; else no "renderer compiles"; fi
+
+printf '\n== masthead: the series stands now ==\n'
+# Six messages in the fixture: cover + two patches (the posting) and
+# three replies. The masthead reports the CURRENT version's state: with
+# a Reviewed-by and a Tested-by standing and nothing blocking, the state
+# chip reads converged.
+contains "masthead eyebrow names the series, version and reply count" "$html" \
+    '<p class="eyebrow">lkml-mode series · render-fixture · v1 · 3 replies</p>'
+# The cover's [PATCH v1 0/2] prefix is numbering, not the title: the h1
+# is the rest of its subject, escaped like everything else.
+contains "masthead h1 is the cover subject minus its [PATCH] prefix" \
+    "$html" '<h1>&lt;script&gt;alert(1)&lt;/script&gt;</h1>'
+contains "masthead sub counts versions and messages" "$html" '1 version · 6 messages in v1'
+contains "masthead fact: version" "$html" '<div class="fact"><span class="eyebrow">version</span><b>v1</b></div>'
+contains "masthead fact: replies" "$html" '<div class="fact"><span class="eyebrow">replies</span><b>3</b></div>'
+contains "masthead state chip: sign-offs standing, nothing blocking" \
+    "$html" '<div class="fact"><span class="eyebrow">state</span><b><span class="chip reviewed">converged</span></b></div>'
+if [[ "$(grep -o '<header class="masthead">' "$stdout" | wc -l)" -eq 1 ]]; then
+    ok "a single series gets exactly one masthead (its own, no duplicate page header)"
+else
+    no "a single series gets exactly one masthead (its own, no duplicate page header)"
+fi
+
+printf '\n== state rail: versions ==\n'
+contains "versions panel eyebrow" "$html" '<p class="eyebrow">versions</p>'
+contains "the current version row is marked current" "$html" \
+    '<a class="vrow" href="#v-1" aria-current="true"><span class="vn">v1</span><span>first posting</span><span class="vmeta">6 msg</span></a>'
+
+printf '\n== state rail: where each reviewer stands ==\n'
+contains "reviewer panel eyebrow names the version" "$html" '<p class="eyebrow">where each reviewer stands · v1</p>'
 if python3 - "$stdout" <<'PY'
 import re
 import sys
 
 html = open(sys.argv[1], encoding="utf-8").read()
-row = re.search(r'<tr><th scope="row"><a href="#[^"]*">cover</a>(.*?)</tr>', html).group(1)
-raise SystemExit("cover row contains a patch reviewer" if "t-rev" in row else 0)
+i = html.index('where each reviewer stands')
+panel = html[i:html.index('</section>', i)]
+n = len(re.findall(r'<div class="mrow">', panel))
+if n != 3:
+    print("reviewer panel has %d mrows, want 3 (core, ci, newcomer)" % n)
+    sys.exit(1)
+for who in ("Core", "Ci", "Newcomer"):
+    if f'<span class="who">{who}<small>' not in panel:
+        print("reviewer panel missing row for", who)
+        sys.exit(1)
 PY
 then
-    ok "cover tally excludes patch reviewer"
+    ok "one mrow per reviewer (core, ci, newcomer), none for the author"
 else
-    no "cover tally excludes patch reviewer"
+    no "one mrow per reviewer (core, ci, newcomer), none for the author"
 fi
+contains "reviewer row carries the display name and a role small" "$html" '<span class="who">Core<small>core</small></span>'
+contains "reviewer row carries a stable-colour monogram badge" "$html" '<span class="mono-badge p-color-'
+contains "core's verdict chip is reviewed-by" "$html" '<span class="chip reviewed">reviewed-by</span>'
+contains "ci's verdict chip is tested-by" "$html" '<span class="chip tested">tested-by</span>'
+# newcomer commented but never tagged: pending, not absent.
+contains "untagged reviewer is pending, not vanished" "$html" '<span class="chip pending">pending</span>'
+case "$html" in *'<span class="who">author'*) no "author persona is excluded from the reviewer panel" ;; *) ok "author persona is excluded from the reviewer panel" ;; esac
+# The monogram colour is a stable djb2 of the persona name: the same
+# persona gets the same colour on a second render (two processes, so a
+# per-process salted hash() would be caught), and different personas
+# are not forced to collide.
+if python3 -c '
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("lkml_render", sys.argv[1])
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+print(mod.mono_color("core"))' "$renderer" > "$work/mono1" \
+   && python3 -c '
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("lkml_render", sys.argv[1])
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+print(mod.mono_color("core"))' "$renderer" > "$work/mono2"; then
+    if cmp -s "$work/mono1" "$work/mono2"; then ok "monogram colour is stable across processes"; else no "monogram colour is stable across processes"; fi
+else
+    no "monogram colour is stable across processes"
+fi
+
+printf '\n== state rail: per patch and what is unresolved ==\n'
+contains "patch panel eyebrow names the version" "$html" '<p class="eyebrow">per patch · v1</p>'
+contains "patch row title is the subject minus its [PATCH] prefix" "$html" '<span class="who">demo: add one'
+contains "patch row names its sign-off personas" "$html" '<small>core + ci</small>'
+contains "patch chip is the strongest standing verdict" "$html" '<span class="chip tested">tested-by</span>'
+contains "counts panel eyebrow" "$html" '<p class="eyebrow">what is unresolved</p>'
+contains "counts: one open thread (the untagged orphan reply)" "$html" '<div class="count is-warn"><b>1</b><span>open threads</span></div>'
+contains "counts: two sign-off messages" "$html" '<div class="count is-ok"><b>2</b><span>sign-offs</span></div>'
+contains "counts: deepest depth 2" "$html" '<div class="count"><b>2</b><span>deepest depth</span></div>'
+contains "counts: zero NAKs standing" "$html" '<div class="count"><b>0</b><span>NAKs standing</span></div>'
+
+printf '\n== thread trace: one collapsed details per message ==\n'
+if [[ "$(grep -o '<details class="msg"' "$stdout" | wc -l)" -eq 6 ]]; then
+    ok "thread trace has one line per message"
+else
+    no "thread trace has one line per message"
+fi
+# The trace is a flat pre-order list: the depth rides on data-depth, and
+# the hairline rail indents depth >= 1 (the CSS styles only
+# [data-depth="1"] and above; the depth-0 cover, the two patch roots and
+# the orphaned root reply get none).
+# The orphaned reply's target does not exist, so the mailbox threads it
+# under the cover with X-Misthreaded: depth 1, not a second root.
+# (The CSS also mentions data-depth; scope the count to the details.)
+if python3 - "$stdout" <<'PY'
+import re
+import sys
+
+html = open(sys.argv[1], encoding="utf-8").read()
+depths = sorted(re.findall(r'<details class="msg" data-depth="(\d+)"', html))
+if depths != ["0", "1", "1", "1", "2", "2"]:
+    print("depths %s, want ['0', '1', '1', '1', '2', '2']" % depths)
+    sys.exit(1)
+PY
+then
+    ok "depths: cover 0, the two patch roots plus the misthreaded orphan 1, the two replies 2"
+else
+    no "depths: cover 0, the two patch roots plus the misthreaded orphan 1, the two replies 2"
+fi
+contains "the trace-head names the version and how to read the lines" "$html" '<div class="trace-head"><h2>Thread · v1</h2>'
+contains "every message carries its #m-<id> anchor" "$html" "id=\"m-$review_id\""
+# The scannable line: name and 7-hex id, the verdict chip on the from
+# line, the lore-normalised subject as the gist.
+contains "trace line carries name and 7-hex id" "$html" ">Core <span class=\"id\">${review_id:0:7}</span>"
+contains "tagged reply's verdict chip rides on the from line" "$html" \
+    "<span class=\"chip reviewed\">reviewed-by</span></span>"
+contains "trace gist is the prefixed subject" "$html" '<span class="gist">[PATCH v1 1/2] demo: add one</span>'
+contains "second patch gist is prefixed too" "$html" '<span class="gist">[PATCH v1 2/2] demo: add two</span>'
+contains "orphaned reply is in the trace" "$html" 'orphan body'
+contains "the model stamp shows the harness model" "$html" '<span class="model">fixture</span>'
+contains "message bodies are collapsed: the CSS styles the summary hover" "$html" '.msg > summary:hover'
+
+printf '\n== patch bodies: commit message, diffstat, the diff fold ==\n'
+contains "patch diffstat is shown" "$html" '<pre class="stat">demo.c | 1 +'
+contains "the diff sits behind the 'show diff' fold" "$html" '<details class="fold"><summary>show diff</summary>'
+contains "patch commit message survives the header strip" "$html" 'Commit message for patch one.'
+contains "the folded diff carries its syntax classes" "$html" '<span class="d-add">+one</span>'
 contains "attachment reference is rendered" "$html" 'attachments/shot.png'
-contains "attachment contents are embedded" "$html" 'data:image/png;base64,'
-case "$html" in *fonts.googleapis.com*) no "output has no remote font dependency" ;; *) ok "output has no remote font dependency" ;; esac
-contains "prose uses the system sans stack" "$html" 'font-family:system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif'
-case "$html" in *"Source Serif"*|*"Times New Roman"*) no "no serif stack remains (the Times regression)" ;; *) ok "no serif stack remains (the Times regression)" ;; esac
-contains "message body is 1rem at 72ch" "$html" '.body{max-width:72ch;font-size:1rem;line-height:1.6}'
-contains "body markdown h3 keeps the message's voice" "$html" '.body h3{margin:1.2rem 0 .5rem;font-size:1.05rem;font-weight:650}'
-case "$html" in *"letter-spacing:.12em"*) no "uppercase-mono eyebrow treatment is not applied to body headings" ;; *) ok "uppercase-mono eyebrow treatment is not applied to body headings" ;; esac
-contains "thread index rows have a hover background" "$html" '.tidx li:hover{background:var(--code-bg)}'
-if cmp -s "$stdout" "$custom"; then ok "output file matches stdout"; else no "output file matches stdout"; fi
-if python3 -m py_compile "$renderer"; then ok "renderer compiles"; else no "renderer compiles"; fi
+contains "image attachment is embedded as a data uri preview" "$html" 'data:image/png;base64,'
+
+printf '\n== persona roles, verdicts and containment ==\n'
+mkdir -p "$LKML_MAILBOX_ROOT/render-fixture/personas"
+# Frontmatter exactly as the shipped persona files carry it: role feeds
+# the rail's small line; harness/model are the persona's defaults and are
+# not the version's, so they must not ride into the page.
+printf '%s\n' '---' 'persona: core' 'role: highest bar' 'harness: claude' 'model: opus' '---' '' \
+    'Core reviewer brief.' '<script>alert(2)</script>' 'A & B' \
+    > "$LKML_MAILBOX_ROOT/render-fixture/personas/core.md"
+# The new rail does not inline the brief: it shows the role. The brief
+# file's payload must not reach the page at all.
+printf '%s\n' 'Not this time.' > "$work/nak.txt"
+"$mailbox" post render-fixture --from core --reply-to "$patch_id" --file "$work/nak.txt" \
+    --tags NAK --harness test --model fixture >/dev/null 2>/dev/null
+persona_html="$work/persona.html"
+python3 "$renderer" "$LKML_MAILBOX_ROOT/render-fixture" -o "$persona_html"
+phtml="$(<"$persona_html")"
+case "$phtml" in *'Core reviewer brief.'*) no "the brief itself is not inlined into the page" ;; *) ok "the brief itself is not inlined into the page" ;; esac
+case "$phtml" in *'<script>alert(2)</script>'*|*'harness: claude'*) no "brief payload and frontmatter never reach the page" ;; *) ok "brief payload and frontmatter never reach the page" ;; esac
+contains "the persona role feeds the reviewer row's small line" "$phtml" '<span class="who">Core<small>highest bar</small></span>'
+# A standing NAK blocks: the critical banner, the state chip and the
+# counts panel all agree.
+contains "standing NAK: the critical banner appears" "$phtml" '<div class="banner crit">'
+contains "the NAK banner names the patch" "$phtml" '<h2>A NAK stands on patch 1</h2>'
+contains "the NAK banner names the persona" "$phtml" 'core stands as a NAK'
+contains "the state chip turns to nak" "$phtml" '<div class="fact"><span class="eyebrow">state</span><b><span class="chip nak">nak</span></b></div>'
+contains "the counts panel reports one NAK standing" "$phtml" '<div class="count is-warn"><b>1</b><span>NAKs standing</span></div>'
+contains "core's chip is the NAK while it stands" "$phtml" '<span class="chip nak">nak</span>'
+# The reviewer's reproduction: the same persona then signs off the same
+# patch. The NAK is withdrawn: it drops out of the chip, the banner and
+# the counts, and the page reports current state, not history.
+printf '%s\n' 'Reviewed-by: The Reviewer' > "$work/review2.txt"
+"$mailbox" post render-fixture --from core --reply-to "$patch_id" --file "$work/review2.txt" \
+    --tags Reviewed-by --harness test --model fixture >/dev/null 2>/dev/null
+after_html="$work/after.html"
+python3 "$renderer" "$LKML_MAILBOX_ROOT/render-fixture" -o "$after_html"
+ahtml="$(<"$after_html")"
+case "$ahtml" in *'class="banner'*) no "withdrawn NAK raises no banner" ;; *) ok "withdrawn NAK raises no banner" ;; esac
+contains "withdrawn NAK: the state chip is converged again" "$ahtml" '<span class="chip reviewed">converged</span>'
+contains "withdrawn NAK: the counts panel reports zero" "$ahtml" '<div class="count"><b>0</b><span>NAKs standing</span></div>'
+contains "withdrawn NAK: core's chip is reviewed-by again" "$ahtml" '<span class="chip reviewed">reviewed-by</span>'
+
+printf '\n== persona path containment ==\n'
+# The persona header comes verbatim out of the .msg file; a hand-written
+# message can set it to a traversal or absolute path. Neither may pull a
+# file outside <series>/personas/ into the page (the role small line
+# reads the brief file's role field, so the reader runs on both paths).
+printf '%s\n' 'TRAVERSAL LEAK CANARY' > "$LKML_MAILBOX_ROOT/traversal.md"
+printf '%s\n' 'ABSOLUTE LEAK CANARY' > "$work/absolute.md"
+"$mailbox" post render-fixture --from "../../traversal" --reply-to "$patch_id" \
+    --file "$work/review.txt" --harness test --model fixture >/dev/null 2>/dev/null
+"$mailbox" post render-fixture --from "$work/absolute" --reply-to "$patch_id" \
+    --file "$work/review.txt" --harness test --model fixture >/dev/null 2>/dev/null
+contain_html="$work/contain.html"
+python3 "$renderer" "$LKML_MAILBOX_ROOT/render-fixture" -o "$contain_html"
+chtml="$(<"$contain_html")"
+case "$chtml" in *'TRAVERSAL LEAK CANARY'*) no "traversal persona does not leak a brief" ;; *) ok "traversal persona does not leak a brief" ;; esac
+case "$chtml" in *'ABSOLUTE LEAK CANARY'*) no "absolute-path persona does not leak a brief" ;; *) ok "absolute-path persona does not leak a brief" ;; esac
+contains "the legit role still renders alongside" "$chtml" '<span class="who">Core<small>highest bar</small></span>'
+
+printf '\n== fresh series: no panels of its own, honest zeros ==\n'
+# A freshly init-ed series (no replies yet) must not render an empty
+# reviewer panel; the counts panel still stands, with true zeros.
+"$mailbox" init render-empty --cover "$work/cover.txt" --patches "$work/patches" \
+    --from author --harness test --model fixture >/dev/null 2>/dev/null
+empty_html="$work/empty.html"
+python3 "$renderer" "$LKML_MAILBOX_ROOT/render-empty" -o "$empty_html"
+ehtml="$(<"$empty_html")"
+case "$ehtml" in *'where each reviewer stands'*) no "no reviewer panel on a fresh series" ;; *) ok "no reviewer panel on a fresh series" ;; esac
+contains "fresh series reports zero open threads" "$ehtml" '<div class="count"><b>0</b><span>open threads</span></div>'
+contains "fresh series reports zero sign-offs" "$ehtml" '<div class="count"><b>0</b><span>sign-offs</span></div>'
+# A reply whose .msg has no X-AI-Model header (the mailbox refuses to
+# post an empty body through the CLI, so the message is written by hand
+# in the store's own format) gets the 'model unknown' stamp, and its
+# empty body renders the pointer back into the mailbox.
+re_tree="$("$mailbox" tree render-empty)"
+re_p1="$(printf '%s\n' "$re_tree" | awk '/\[PATCH v1 1\/2\]/{print $1}')"
+re_uuid="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+printf '%s\n' \
+    "Message-ID: <${re_uuid}@lkml.local>" \
+    "In-Reply-To: <${re_p1}@lkml.local>" \
+    "References: <${re_p1}@lkml.local>" \
+    'Date: Mon, 17 Sep 2001 00:00:00 +0000' \
+    'From: Anon (AI persona) <anon.ai@lkml.local>' \
+    'Subject: Re: [PATCH v1 1/2] demo: add one' \
+    'X-AI-Persona: anon' \
+    'X-AI-Harness: test' \
+    'X-Series: render-empty' \
+    'X-Version: 1' \
+    'X-Depth: 2' \
+    'X-Tags: ' \
+    'X-Seq: 1788550326073416999' \
+    '' > "$LKML_MAILBOX_ROOT/render-empty/cur/${re_uuid}.msg"
+nomodel_html="$work/nomodel.html"
+python3 "$renderer" "$LKML_MAILBOX_ROOT/render-empty" -o "$nomodel_html"
+nmhtml="$(<"$nomodel_html")"
+contains "an unrecorded model is stamped 'model unknown'" "$nmhtml" '<span class="model unknown">model unknown</span>'
+contains "an empty body renders the mailbox pointer, not an empty body" "$nmhtml" 'No body. Open this thread in the mailbox: '
+contains "the pointer names the series and the message id" "$nmhtml" 'lkml-mailbox.sh show render-empty'
+
+printf '\n== the blocking banner ==\n'
+# A fresh two-patch series: two untagged replies to patch 1 and one to
+# patch 2. No NAK, and the open threads span two patches, so nothing
+# blocks: no banner.
+mkdir -p "$work/patches-b"
+cp "$work/patches/0001-one.patch" "$work/patches/0002-two.patch" "$work/patches-b/"
+"$mailbox" init banner-fixture --cover "$work/cover.txt" --patches "$work/patches-b" \
+    --from author --harness test --model fixture >/dev/null 2>/dev/null
+b_tree="$("$mailbox" tree banner-fixture)"
+b_p1="$(printf '%s\n' "$b_tree" | awk '/\[PATCH v1 1\/2\]/{print $1}')"
+b_p2="$(printf '%s\n' "$b_tree" | awk '/\[PATCH v1 2\/2\]/{print $1}')"
+printf '%s\n' 'one open question' > "$work/q1.txt"
+printf '%s\n' 'another open question' > "$work/q2.txt"
+printf '%s\n' 'a third open question' > "$work/q3.txt"
+"$mailbox" post banner-fixture --from core --reply-to "$b_p1" --file "$work/q1.txt" --harness test --model fixture >/dev/null 2>/dev/null
+"$mailbox" post banner-fixture --from ci --reply-to "$b_p1" --file "$work/q2.txt" --harness test --model fixture >/dev/null 2>/dev/null
+"$mailbox" post banner-fixture --from newcomer --reply-to "$b_p2" --file "$work/q3.txt" --harness test --model fixture >/dev/null 2>/dev/null
+no_banner="$work/no-banner.html"
+python3 "$renderer" "$LKML_MAILBOX_ROOT/banner-fixture" -o "$no_banner"
+nhtml="$(<"$no_banner")"
+case "$nhtml" in *'class="banner'*) no "open threads on two patches raise no banner" ;; *) ok "open threads on two patches raise no banner" ;; esac
+contains "the counts panel counts all three open threads" "$nhtml" '<div class="count is-warn"><b>3</b><span>open threads</span></div>'
+# A NAK on the same patch now blocks, critical-styled, over the
+# convergence that would otherwise hold.
+"$mailbox" post banner-fixture --from core --reply-to "$b_p1" --file "$work/nak.txt" \
+    --tags NAK --harness test --model fixture >/dev/null 2>/dev/null
+nak_banner="$work/nak-banner.html"
+python3 "$renderer" "$LKML_MAILBOX_ROOT/banner-fixture" -o "$nak_banner"
+khtml="$(<"$nak_banner")"
+contains "the NAK banner outranks the convergence" "$khtml" '<div class="banner crit">'
+contains "the NAK banner keeps the colour bar" "$khtml" '<span class="bar"></span>'
+contains "the NAK banner still names the patch" "$khtml" '<h2>A NAK stands on patch 1</h2>'
+# Remove the NAK by re-signing the patch... the simplest true story: a
+# fresh series where every open thread sits on one patch and nothing is
+# signed off: the warning banner.
+"$mailbox" init banner-one --cover "$work/cover.txt" --patches "$work/patches-b" \
+    --from author --harness test --model fixture >/dev/null 2>/dev/null
+o_tree="$("$mailbox" tree banner-one)"
+o_p1="$(printf '%s\n' "$o_tree" | awk '/\[PATCH v1 1\/2\]/{print $1}')"
+"$mailbox" post banner-one --from core --reply-to "$o_p1" --file "$work/q1.txt" --harness test --model fixture >/dev/null 2>/dev/null
+"$mailbox" post banner-one --from ci --reply-to "$o_p1" --file "$work/q2.txt" --harness test --model fixture >/dev/null 2>/dev/null
+one_banner="$work/one-banner.html"
+python3 "$renderer" "$LKML_MAILBOX_ROOT/banner-one" -o "$one_banner"
+ohtml="$(<"$one_banner")"
+contains "all open threads on one patch: the warning banner" "$ohtml" '<div class="banner">'
+contains "the convergence banner names the patch and the count" "$ohtml" '<h2>All 2 open threads sit on patch 1</h2>'
+case "$ohtml" in *'banner crit'*) no "the warning banner is not styled critical" ;; *) ok "the warning banner is not styled critical" ;; esac
+# A single open thread is not convergence.
+"$mailbox" init banner-solo --cover "$work/cover.txt" --patches "$work/patches-b" \
+    --from author --harness test --model fixture >/dev/null 2>/dev/null
+s_tree="$("$mailbox" tree banner-solo)"
+s_p1="$(printf '%s\n' "$s_tree" | awk '/\[PATCH v1 1\/2\]/{print $1}')"
+"$mailbox" post banner-solo --from core --reply-to "$s_p1" --file "$work/q1.txt" --harness test --model fixture >/dev/null 2>/dev/null
+solo_html="$work/solo.html"
+python3 "$renderer" "$LKML_MAILBOX_ROOT/banner-solo" -o "$solo_html"
+case "$(<"$solo_html")" in *'class="banner'*) no "one open thread raises no banner" ;; *) ok "one open thread raises no banner" ;; esac
 
 printf '\n== patch_label: lore-style normalizer ==\n'
 # The row-label normalizer, exercised directly: the bracketed numbering is
@@ -189,114 +467,11 @@ else
     no "patch_label normalizes zero-padding, round-trip, no-version fallback, no-prefix and Re: carriers"
 fi
 
-printf '\n== matrix row labels ==\n'
-contains "patch row label is the lore-style prefixed subject" "$html" '>[PATCH v1 1/2] demo: add one</a></th>'
-contains "second patch row label is prefixed too" "$html" '>[PATCH v1 2/2] demo: add two</a></th>'
-contains "row label title carries the full subject" "$html" '<th scope="row" title="[PATCH v1 1/2] demo: add one">'
-case "$html" in *'>demo: add one</a></th>'*|*'>demo: add two</a></th>'*|*'Patch v1 1/2</a>'*) no "truncated and demoted subjects are no longer row labels" ;; *) ok "truncated and demoted subjects are no longer row labels" ;; esac
-
-printf '\n== reviewers section (headers only, no persona files yet) ==\n'
-if [[ "$(grep -o '<details class="reviewer"' "$stdout" | wc -l)" -eq 3 ]]; then ok "one expand-o per reviewer (core, ci, newcomer)"; else no "one expand-o per reviewer (core, ci, newcomer)"; fi
-contains "reviewer summary carries display name and persona slug" "$html" '<span class="who">Core</span> <span class="slug mono">core</span>'
-contains "reviewer rollup shows harness and model" "$html" 'test · fixture'
-contains "reviewer rollup counts messages" "$html" '<span>1 message</span>'
-contains "reviewer rollup counts Reviewed-by" "$html" '<span>1 Reviewed-by</span>'
-contains "reviewer count matches the reviewers box" "$html" '<span>3 reviewers</span>'
-# The header count, the matrix's reviewer columns and the box must
-# describe the same set: newcomer commented but never tagged, and still
-# gets a (dot) column rather than vanishing from the matrix.
-if [[ "$(grep -o '<th title=' "$stdout" | wc -l)" -eq 3 ]]; then ok "matrix has a column per listed reviewer, tag or no tag"; else no "matrix has a column per listed reviewer, tag or no tag"; fi
-contains "untagged reviewer's column is present" "$html" '<th title="test/fixture">newcomer</th>'
-if python3 - "$stdout" <<'PY'
-import re
-import sys
-
-html = open(sys.argv[1], encoding="utf-8").read()
-thead = re.search(r'<thead><tr><th scope="col">patch</th>(.*?)</tr></thead>', html).group(1)
-col_order = re.findall(r'<th title="[^"]*">([^<]+)</th>', thead)
-box_order = re.findall(r'<span class="slug mono">([^<]+)</span>', html)
-raise SystemExit("box order %s != column order %s" % (box_order, col_order) if box_order != col_order else 0)
-PY
-then
-    ok "box lists reviewers in matrix column order"
-else
-    no "box lists reviewers in matrix column order"
-fi
-case "$html" in *'<span class="slug mono">author</span>'*) no "author persona is excluded from reviewers" ;; *) ok "author persona is excluded from reviewers" ;; esac
-case "$html" in *'<pre class="persona-brief">'*) no "no persona brief when the file is absent" ;; *) ok "no persona brief when the file is absent" ;; esac
-
-printf '\n== persona brief inlining ==\n'
-mkdir -p "$LKML_MAILBOX_ROOT/render-fixture/personas"
-# Frontmatter exactly as the shipped persona files carry it: its
-# harness/model are the persona's defaults, which under --model-override
-# are the WRONG harness/model for this version's messages, so the block
-# must not be printed next to the message headers' line above it.
-printf '%s\n' '---' 'persona: core' 'role: reviewer' 'harness: claude' 'model: opus' '---' '' \
-    'Core reviewer brief.' '<script>alert(2)</script>' 'A & B' \
-    > "$LKML_MAILBOX_ROOT/render-fixture/personas/core.md"
-printf '%s\n' 'Not this time.' > "$work/nak.txt"
-"$mailbox" post render-fixture --from core --reply-to "$patch_id" --file "$work/nak.txt" \
-    --tags NAK --harness test --model fixture >/dev/null 2>/dev/null
-persona_html="$work/persona.html"
-python3 "$renderer" "$LKML_MAILBOX_ROOT/render-fixture" -o "$persona_html"
-phtml="$(<"$persona_html")"
-contains "persona brief is inlined" "$phtml" '<pre class="persona-brief">Core reviewer brief.'
-case "$phtml" in *'<pre class="persona-brief">---'*) no "frontmatter is not inlined verbatim" ;; *) ok "frontmatter is not inlined verbatim" ;; esac
-case "$phtml" in *'persona: core'*) no "frontmatter persona field is stripped" ;; *) ok "frontmatter persona field is stripped" ;; esac
-case "$phtml" in *'harness: claude'*) no "frontmatter harness field is stripped" ;; *) ok "frontmatter harness field is stripped" ;; esac
-case "$phtml" in *'model: opus'*) no "frontmatter model field is stripped" ;; *) ok "frontmatter model field is stripped" ;; esac
-contains "persona brief is html-escaped (script)" "$phtml" '&lt;script&gt;alert(2)&lt;/script&gt;'
-contains "persona brief is html-escaped (ampersand)" "$phtml" 'A &amp; B'
-case "$phtml" in *'<script>alert(2)</script>'*) no "persona brief script payload is never raw" ;; *) ok "persona brief script payload is never raw" ;; esac
-contains "reviewer rollup counts NAK" "$phtml" '<span>1 NAK</span>'
-# The reviewer's reproduction: the same persona then signs off the same
-# patch. The matrix cell already rendered R; the rollup must stop
-# reporting the withdrawn NAK as outstanding.
-printf '%s\n' 'Reviewed-by: The Reviewer' > "$work/review2.txt"
-"$mailbox" post render-fixture --from core --reply-to "$patch_id" --file "$work/review2.txt" \
-    --tags Reviewed-by --harness test --model fixture >/dev/null 2>/dev/null
-after_html="$work/after.html"
-python3 "$renderer" "$LKML_MAILBOX_ROOT/render-fixture" -o "$after_html"
-ahtml="$(<"$after_html")"
-contains "message count keeps counting every post" "$ahtml" '<span>3 messages</span>'
-contains "superseding Reviewed-by is counted" "$ahtml" '<span>1 Reviewed-by</span>'
-case "$ahtml" in *'<span>1 NAK</span>'*) no "withdrawn NAK is not reported as open" ;; *) ok "withdrawn NAK is not reported as open" ;; esac
-
-printf '\n== persona brief containment ==\n'
-# The persona header comes verbatim out of the .msg file; a hand-written
-# message can set it to a traversal or absolute path. Neither may pull a
-# file outside <series>/personas/ into the page.
-printf '%s\n' 'TRAVERSAL LEAK CANARY' > "$LKML_MAILBOX_ROOT/traversal.md"
-printf '%s\n' 'ABSOLUTE LEAK CANARY' > "$work/absolute.md"
-"$mailbox" post render-fixture --from "../../traversal" --reply-to "$patch_id" \
-    --file "$work/review.txt" --harness test --model fixture >/dev/null 2>/dev/null
-"$mailbox" post render-fixture --from "$work/absolute" --reply-to "$patch_id" \
-    --file "$work/review.txt" --harness test --model fixture >/dev/null 2>/dev/null
-contain_html="$work/contain.html"
-python3 "$renderer" "$LKML_MAILBOX_ROOT/render-fixture" -o "$contain_html"
-chtml="$(<"$contain_html")"
-case "$chtml" in *'TRAVERSAL LEAK CANARY'*) no "traversal persona does not leak a brief" ;; *) ok "traversal persona does not leak a brief" ;; esac
-case "$chtml" in *'ABSOLUTE LEAK CANARY'*) no "absolute-path persona does not leak a brief" ;; *) ok "absolute-path persona does not leak a brief" ;; esac
-contains "legit brief still inlined alongside" "$chtml" '<pre class="persona-brief">Core reviewer brief.'
-
-printf '\n== reviewers box is omitted when empty ==\n'
-# A freshly init-ed series (no replies yet) must not render an empty
-# labelled box.
-"$mailbox" init render-empty --cover "$work/cover.txt" --patches "$work/patches" \
-    --from author --harness test --model fixture >/dev/null 2>/dev/null
-empty_html="$work/empty.html"
-python3 "$renderer" "$LKML_MAILBOX_ROOT/render-empty" -o "$empty_html"
-ehtml="$(<"$empty_html")"
-case "$ehtml" in *'<div class="reviewers"'*) no "no reviewers box on a fresh series" ;; *) ok "no reviewers box on a fresh series" ;; esac
-contains "fresh series still reports zero reviewers" "$ehtml" '<span>0 reviewers</span>'
-# .reviewers .counts{display:flex;gap:1rem} restated only what the global
-# .counts rule already sets; make sure it does not come back.
-case "$html" in *'.reviewers .counts'*) no "no dead .reviewers .counts rule" ;; *) ok "no dead .reviewers .counts rule" ;; esac
-
 printf '\n== row labels: a 14-patch series zero-pads the position ==\n'
 # The mailbox stores the position zero-padded ('02/14'); the renderer
-# must zero-pad lore-style in the row label too, so a mailbox created
-# before the padding change (unpadded stored subjects) labels the same.
+# must zero-pad lore-style in the displayed label too, so a mailbox
+# created before the padding change (unpadded stored subjects) labels
+# the same.
 mkdir -p "$work/patches14"
 for i in $(seq 1 14); do
     printf '%s\n' \
@@ -312,14 +487,14 @@ done
 pad_out="$work/pad.html"
 python3 "$renderer" "$LKML_MAILBOX_ROOT/pad-14" -o "$pad_out"
 ph="$(<"$pad_out")"
-contains "14-patch row 2 reads 02/14 in the HTML row label" "$ph" '>[PATCH v1 02/14] demo: patch number 2</a></th>'
-contains "14-patch row 14 is not over-padded" "$ph" '>[PATCH v1 14/14] demo: patch number 14</a></th>'
-case "$ph" in *'>Patch v1 2/14</a>'*) no "the demoted 'Patch vN i/M' form is gone" ;; *) ok "the demoted 'Patch vN i/M' form is gone" ;; esac
+contains "14-patch trace gist 2 reads 02/14" "$ph" '<span class="gist">[PATCH v1 02/14] demo: patch number 2</span>'
+contains "14-patch trace gist 14 is not over-padded" "$ph" '<span class="gist">[PATCH v1 14/14] demo: patch number 14</span>'
+case "$ph" in *'>Patch v1 2/14<'*) no "the demoted 'Patch vN i/M' form is gone" ;; *) ok "the demoted 'Patch vN i/M' form is gone" ;; esac
 # One document, one subject: the mailbox stores the position zero-padded
 # too, so the patch's own Subject: line in the agent view is the same
-# string the tally labels (an agent can grep the label to find the patch).
-# The resolver must match BOTH forms: an unpadded '2/14' typed by hand,
-# and the padded '[PATCH v1 08/14]' form the tally labels emit (whose
+# string the labels display (an agent can grep the label to find the
+# patch). The resolver must match BOTH forms: an unpadded '2/14' typed
+# by hand, and the padded '[PATCH v1 08/14]' form the labels emit (whose
 # leading-zero index is an invalid octal to printf's %d and would pad to
 # '00'). Verify by reading the posted replies back: 'post' exits 0 even
 # when the parent does not resolve at all (it falls back under the cover
@@ -335,7 +510,7 @@ contains "mailbox: padded '08/14' (leading zero) resolves to patch 8, not the co
     "$pad_tree" "Re: [PATCH v1 08/14] demo: patch number 8"
 pad_text="$work/pad.txt"
 python3 "$renderer" --text "$LKML_MAILBOX_ROOT/pad-14" > "$pad_text"
-contains "text: patch 2 Subject: line is zero-padded like its tally label" "$(<"$pad_text")" 'Subject: [PATCH v1 02/14] demo: patch number 2'
+contains "text: patch 2 Subject: line is zero-padded like its label" "$(<"$pad_text")" 'Subject: [PATCH v1 02/14] demo: patch number 2'
 
 printf '\n== legacy mailbox: unpadded stored subjects are normalized everywhere they display ==\n'
 # A mailbox created before the padding change stores unpadded positions:
@@ -355,19 +530,18 @@ sed -i -E \
     -e 's/^Subject: Re: \[PATCH v1 (0)?([0-9])\/14\] demo: patch number 8/Subject: Re: [PATCH \2\/14] demo: patch number 8/' \
     -e 's/^Subject: Re: \[PATCH v1 (0)?([0-9])\/14\]/Subject: Re: [PATCH v1 \2\/14]/' \
     "$LKML_MAILBOX_ROOT/pad-14/cur"/*.msg
-grep -q '^Subject: \[PATCH v1 0/14\] <script>alert(1)</script>$' "$LKML_MAILBOX_ROOT/pad-14/cur"/*.msg \
+if grep -q '^Subject: \[PATCH v1 0/14\] <script>alert(1)</script>$' "$LKML_MAILBOX_ROOT/pad-14/cur"/*.msg \
     && grep -q '^Subject: \[PATCH v1 8/14\] demo: patch number 8$' "$LKML_MAILBOX_ROOT/pad-14/cur"/*.msg \
     && grep -q '^Subject: Re: Re: \[PATCH v1 2/14\] demo: patch number 2$' "$LKML_MAILBOX_ROOT/pad-14/cur"/*.msg \
-    && grep -q '^Subject: Re: \[PATCH 8/14\] demo: patch number 8$' "$LKML_MAILBOX_ROOT/pad-14/cur"/*.msg \
-    && ok "legacy store emulation: cover, roots and replies stored unpadded" \
-    || no "legacy store emulation: cover, roots and replies stored unpadded"
+    && grep -q '^Subject: Re: \[PATCH 8/14\] demo: patch number 8$' "$LKML_MAILBOX_ROOT/pad-14/cur"/*.msg; then
+    ok "legacy store emulation: cover, roots and replies stored unpadded"
+else
+    no "legacy store emulation: cover, roots and replies stored unpadded"
+fi
 # A message that merely CARRIES a [PATCH] subject -- a depth-2 reply
 # with a non-format-patch body, so is_patch is false -- is no longer
-# left verbatim in the index: patch_label pads it and takes the version
-# from the message's own X-Version. (This is the behavior change made
-# by dropping the is_patch gate at render_index, which that commit
-# message miscalled a no-op; the M=2 reply elsewhere in this file
-# cannot see it, but M=14 can.)
+# left verbatim in the trace: patch_label pads it and takes the version
+# from the message's own X-Version.
 printf 'This depth-2 reply merely carries a [PATCH] subject.\n' > "$work/carried.txt"
 "$mailbox" post pad-14 --from core --reply-to '[PATCH v1 8/14]' --file "$work/carried.txt" \
     --subject '[PATCH 9/14] demo: carried subject' --harness test --model fixture >/dev/null 2>/dev/null
@@ -388,12 +562,11 @@ if grep -Eq '\[PATCH v[0-9]+ [0-9]/[0-9]+\]' "$legacy_html" "$legacy_text"; then
 else
     ok "legacy render: zero unpadded [PATCH vN i/M] subjects in both modes"
 fi
-contains "legacy: the patch's own HTML header is padded" "$lh" 'class="subj">[PATCH v1 08/14] demo: patch number 8</h3>'
-contains "legacy: a double Re: reply header collapses to one Re:" "$lh" 'class="subj">Re: [PATCH v1 02/14] demo: patch number 2</h3>'
-contains "legacy: a no-version reply prefix uses the message's X-Version" "$lh" 'class="subj">Re: [PATCH v1 08/14] demo: patch number 8</h3>'
-contains "legacy: the index reply one-liner is padded under one Re:" "$lh" 'class="ix-subj">Re: [PATCH v1 02/14] demo: patch number 2</span>'
-contains "legacy: the cover's unpadded 0/14 re-pads to 00/14" "$lh" 'class="subj">[PATCH v1 00/14] &lt;script&gt;alert(1)&lt;/script&gt;</h3>'
-contains "legacy index: a carried [PATCH] subject is normalized, not verbatim" "$lh" 'ix-subj">[PATCH v1 09/14] demo: carried subject</span>'
+contains "legacy: the patch's own trace gist is padded" "$lh" '<span class="gist">[PATCH v1 08/14] demo: patch number 8</span>'
+contains "legacy: a double Re: reply gist collapses to one Re:" "$lh" '<span class="gist">Re: [PATCH v1 02/14] demo: patch number 2</span>'
+contains "legacy: a no-version reply gist uses the message's X-Version" "$lh" '<span class="gist">Re: [PATCH v1 08/14] demo: patch number 8</span>'
+contains "legacy: the cover's unpadded 0/14 re-pads to 00/14" "$lh" '<span class="gist">[PATCH v1 00/14] &lt;script&gt;alert(1)&lt;/script&gt;</span>'
+contains "legacy trace: a carried [PATCH] subject is normalized, not verbatim" "$lh" '<span class="gist">[PATCH v1 09/14] demo: carried subject</span>'
 contains "legacy text: the patch's Subject: line is padded" "$lt" 'Subject: [PATCH v1 08/14] demo: patch number 8'
 contains "legacy text: the double Re: reply's Subject: line is one Re:" "$lt" 'Subject: Re: [PATCH v1 02/14] demo: patch number 2'
 contains "legacy text: the cover's Subject: line is re-padded" "$lt" 'Subject: [PATCH v1 00/14] <script>alert(1)</script>'
@@ -449,43 +622,14 @@ else
 fi
 contains "text: truncation keeps the prefix and subject start intact" "$ltally" '[PATCH v1 1/1] demo: a very long subject xxx'
 contains "text: truncation is marked with a trailing ellipsis" "$ltally" 'xxx…'
-
-printf '\n== html tally: the row label is capped, the title keeps the full label ==\n'
-# The text path caps its row labels at 120 columns; the HTML path used to
-# rely on the .tally CSS max-width, which auto table layout only treats
-# as a suggestion. The label must be capped in Python: the row shows an
-# ellipsized label, the full subject never sits inline, and the title
-# attribute still carries the full label.
+# The HTML patch panel shows a 60-char title with no cap of its own:
+# the full label still sits nowhere past the panel, and the gist of the
+# trace carries the full label (the trace is for reading, not fitting).
 long_html="$work/long.html"
 python3 "$renderer" "$LKML_MAILBOX_ROOT/long-subj" -o "$long_html" >/dev/null 2>/dev/null
-if python3 - "$long_html" <<'PY'
-import re, sys
+lhtml="$(<"$long_html")"
+contains "html: the trace gist carries the full long label" "$lhtml" "a very long subject ${longsubj:0:40}"
 
-html = open(sys.argv[1], encoding="utf-8").read()
-th = re.search(r'<th scope="row" title="([^"]*)"><a href="[^"]*">([^<]*)</a></th>', html)
-if not th:
-    print("no patch row cell found in the HTML tally")
-    sys.exit(1)
-title, shown = th.group(1), th.group(2)
-full = "x" * 150
-errors = []
-if len(shown) > 64:
-    errors.append(f"row label not capped ({len(shown)} chars)")
-if "…" not in shown:
-    errors.append("row label cut is unmarked (no ellipsis)")
-if full in shown:
-    errors.append("full 150-char subject sits inline in the row label")
-if full not in title:
-    errors.append("title attribute lost the full label")
-for e in errors:
-    print(e)
-sys.exit(1 if errors else 0)
-PY
-then
-    ok "html: the long tally row label is capped, ellipsized, full label on hover"
-else
-    no "html: the long tally row label is capped, ellipsized, full label on hover"
-fi
 nl=$'\n'
 # The old demoted form would sit at the start of a tally row: followed by
 # the column gap, or at the start of a row when no tag columns exist. A
@@ -601,7 +745,7 @@ printf '\n== text mode: tally and reviewers ==\n'
 ttally="$(awk '/^Latest tag per reviewer/{ f = 1; next } f && /^$/{ exit } f' "$text_out")"
 contains "text: header count line includes reviewers" "$ttext" '2 patches · 7 replies · 5 reviewers'
 contains "text: tally legend is plain text" "$ttext" 'Latest tag per reviewer per patch. R reviewed, A acked, C changes requested, ? question, N nak.'
-contains "text: patch rows use the HTML row labels" "$ttally" '[PATCH v1 1/2] demo: add one'
+contains "text: patch rows use the lore-style labels" "$ttally" '[PATCH v1 1/2] demo: add one'
 contains "text: second patch row is labeled too" "$ttally" '[PATCH v1 2/2] demo: add two'
 # The tagged patch's row carries the latest tag per reviewer: R for
 # core's superseding Reviewed-by, T for the CI bot, · where untagged.
@@ -632,7 +776,7 @@ if python3 "$renderer" --text "$LKML_MAILBOX_ROOT/render-fixture" -o "$work/text
 else
     ok "--text and -o are rejected together"
 fi
-[[ -e "$work/text-should-not-exist.txt" ]] && no "no output file when -o is refused" || ok "no output file when -o is refused"
+if [[ -e "$work/text-should-not-exist.txt" ]]; then no "no output file when -o is refused"; else ok "no output file when -o is refused"; fi
 
 printf '\n== text mode: [PATCH]-subjected reply and series separation ==\n'
 # The reply Subject: is optional and, when supplied, used verbatim (no
@@ -687,14 +831,15 @@ n_seps="$(grep -cxF -- "$sep" "$forged_out")"
 if [[ "$n_seps" -eq 11 ]]; then ok "forged 72-dash body line is not a separator"; else no "forged 72-dash body line is not a separator" "$n_seps"; fi
 contains "forged body content is still in the thread, prefixed" "$(<"$forged_out")" '  == #99 · reply to #2 · depth 2'
 
-printf '\n== results card: discovery, placement, escaping ==\n'
-# The per-version results file (results-v<N>.md, written by the
-# summarizer) renders as a Results card between the Reviewers panel and
-# the Thread Index. Without the file there is no card and no results CSS:
-# the early $html render (taken before any results file existed) must be
-# the card-free baseline, and dropping the file again must return to it.
-case "$html" in *'class="results"'*) no "no results card without a results file" ;; *) ok "no results card without a results file" ;; esac
-case "$html" in *'.results{'*) no "no results CSS without a results file" ;; *) ok "no results CSS without a results file" ;; esac
+printf '\n== summary card: discovery, placement, escaping ==\n'
+# The per-version results file (results-v<N>.md, or a bare
+# results-v<N>.json when the .md is absent) renders as the 'Where this
+# stands' card in the main column, above the thread. Without the file
+# there is no card at all: the early $html render (taken before any
+# results file existed) is the card-free baseline, and dropping the
+# file again must return to it.
+case "$html" in *'class="panel summary"'*) no "no summary card without a results file" ;; *) ok "no summary card without a results file" ;; esac
+case "$html" in *'<h2>Where this stands</h2>'*) no "baseline render has no summary card head" ;; *) ok "baseline render has no summary card head" ;; esac
 # The fixture deliberately carries a <script> payload, so the escaping
 # checks below scope to the card's own regions.
 RESULTS_MD="$LKML_MAILBOX_ROOT/render-fixture/results-v1.md"
@@ -714,30 +859,28 @@ printf '%s\n' 'JSON CANARY' > "$LKML_MAILBOX_ROOT/render-fixture/results-v1.json
 results_html="$work/results.html"
 python3 "$renderer" "$LKML_MAILBOX_ROOT/render-fixture" -o "$results_html"
 rhtml="$(<"$results_html")"
-contains "results card is present with the file" "$rhtml" '<div class="results">'
-contains "results card carries an eyebrow" "$rhtml" '<p class="eyebrow">results</p>'
-contains "summary text sits outside the collapse" "$rhtml" '<div class="results-summary">v1 converged: two patches reviewed, one NAK withdrawn.</div>'
-contains "details sits inside a 'show details' summary" "$rhtml" '<details class="results-fold">'
-case "$rhtml" in *'<summary>show details</summary>'*) ok "details summary element reads 'show details'" ;; *) no "details summary element reads 'show details'" ;; esac
-case "$rhtml" in *'JSON CANARY'*) no "results-v1.json is ignored" ;; *) ok "results-v1.json is ignored" ;; esac
+contains "summary card is present with the file" "$rhtml" '<section class="panel summary" id="summary-v1">'
+contains "summary card head reads 'Where this stands'" "$rhtml" '<h2>Where this stands</h2>'
+contains "summary card carries its auto-summary chip" "$rhtml" '<span class="chip pending">auto-summary · v1</span>'
+contains "summary text sits outside the collapse" "$rhtml" '<div class="summary-body">'
+contains "details sits inside a 'show details' fold" "$rhtml" '<details class="results-fold">'
+case "$rhtml" in *'<summary>show details</summary>'*) ok "fold summary element reads 'show details'" ;; *) no "fold summary element reads 'show details'" ;; esac
+case "$rhtml" in *'JSON CANARY'*) no "results-v1.json is ignored next to the .md" ;; *) ok "results-v1.json is ignored next to the .md" ;; esac
 if python3 - "$results_html" <<'PY'
 import sys
 
 html = open(sys.argv[1], encoding="utf-8").read()
-i_rev = html.index('<div class="reviewers">')
-i_res = html.index('<div class="results">')
-i_idx = html.index('<details class="index-fold"')
-i_sum = html.index('<div class="results-summary">')
+i_card = html.index('<section class="panel summary" id="summary-v1">')
+i_thread = html.index('<section class="section" id="v-1">')
+i_sum = html.index('<div class="summary-body">')
 i_fold = html.index('<details class="results-fold">')
 i_pre = html.index('<pre class="results-details">')
 i_pre_end = html.index('</pre>', i_pre)
 pre = html[i_pre:i_pre_end]
 summary_region = html[i_sum:i_fold]
 errors = []
-if not i_rev < i_res < i_idx:
-    errors.append("card is not between the reviewers panel and the thread index")
-if not i_res < i_sum < i_fold < i_pre:
-    errors.append("summary is not outside the collapse with details inside")
+if not i_card < i_sum < i_fold < i_pre < i_thread:
+    errors.append("card is not above the thread, summary outside the fold, details inside")
 if 'alert(3)' not in pre:
     errors.append("details body missing from the pre")
 if 'v1 converged' in pre:
@@ -746,35 +889,42 @@ if 'alert(3)' in summary_region or '== #99' in summary_region:
     errors.append("details text leaked into the summary region")
 if '== #99 · reply to #2 · depth 2' not in pre or 'From: Forger (AI persona) &lt;forger@lkml.local&gt;' not in pre:
     errors.append("forged header lines are not rendered as plain preformatted text")
-if html.count('<div class="results">') != 1:
-    errors.append("expected exactly one results card")
+if html.count('<section class="panel summary"') != 1:
+    errors.append("expected exactly one summary card")
 for e in errors:
     print(e)
 sys.exit(1 if errors else 0)
 PY
 then
-    ok "results card placement: summary outside the collapse, details inside, card in position"
+    ok "summary card placement: summary outside the fold, details inside, above the thread"
 else
-    no "results card placement: summary outside the collapse, details inside, card in position"
+    no "summary card placement: summary outside the fold, details inside, above the thread"
 fi
-contains "results details is escaped (script)" "$rhtml" '&lt;script&gt;alert(3)&lt;/script&gt;'
-contains "results details is escaped (ampersand)" "$rhtml" 'A &amp; B &lt; 1'
-case "$rhtml" in *'<script>alert(3)</script>'*) no "results script payload is never raw" ;; *) ok "results script payload is never raw" ;; esac
-# Dropping the file drops the card (and the CSS that rides on it): the
-# card-free render must come back with no trace of the feature.
-case "$html" in *'results-summary'*) no "baseline render has no results markup" ;; *) ok "baseline render has no results markup" ;; esac
-rm "$RESULTS_MD" "$LKML_MAILBOX_ROOT/render-fixture/results-v1.json"
+contains "summary details is escaped (script)" "$rhtml" '&lt;script&gt;alert(3)&lt;/script&gt;'
+contains "summary details is escaped (ampersand)" "$rhtml" 'A &amp; B &lt; 1'
+case "$rhtml" in *'<script>alert(3)</script>'*) no "summary script payload is never raw" ;; *) ok "summary script payload is never raw" ;; esac
+# A bare .json (no .md) still raises the card: the .md may never have
+# been written, the .json always is.
+rm "$RESULTS_MD"
+json_only="$work/json-only.html"
+python3 "$renderer" "$LKML_MAILBOX_ROOT/render-fixture" -o "$json_only"
+jhtml="$(<"$json_only")"
+case "$jhtml" in *'class="panel summary"'*) ok "a bare .json still raises the card" ;; *) no "a bare .json still raises the card" ;; esac
+case "$jhtml" in *'class="summary-body"'*) no "a bare .json renders no summary body" ;; *) ok "a bare .json renders no summary body" ;; esac
+rm "$LKML_MAILBOX_ROOT/render-fixture/results-v1.json"
+# Dropping the file drops the card: the card-free render must come back
+# with no trace of the feature.
 results_gone="$work/results-gone.html"
 python3 "$renderer" "$LKML_MAILBOX_ROOT/render-fixture" -o "$results_gone"
 rhgone="$(<"$results_gone")"
-case "$rhgone" in *'class="results"'*) no "removing the results file removes the card" ;; *) ok "removing the results file removes the card" ;; esac
-case "$rhgone" in *'.results{'*) no "removing the results file removes the results CSS" ;; *) ok "removing the results file removes the results CSS" ;; esac
+case "$rhgone" in *'class="panel summary"'*) no "removing the results file removes the card" ;; *) ok "removing the results file removes the card" ;; esac
+case "$rhgone" in *'<h2>Where this stands</h2>'*) no "removing the results file removes the summary card head" ;; *) ok "removing the results file removes the summary card head" ;; esac
 
-printf '\n== results card: no-header fallback, reversed headers, read containment ==\n'
+printf '\n== summary card: no-header fallback, reversed headers, read containment ==\n'
 # A file with no recognized "# Summary"/"# Details" line is all Summary
-# per the split contract -- "## Summary" (a heading level the renderer's
-# own render_prose accepts), a trailing space, or plain prose must not
-# be silently dropped.
+# per the split contract -- "## Summary" (a heading level the split
+# does not recognise), a trailing space, or plain prose must not be
+# silently dropped.
 RESULTS_MD="$LKML_MAILBOX_ROOT/render-fixture/results-v1.md"
 {
     printf '%s\n' \
@@ -785,7 +935,8 @@ RESULTS_MD="$LKML_MAILBOX_ROOT/render-fixture/results-v1.md"
 fallback_html="$work/results-fallback.html"
 python3 "$renderer" "$LKML_MAILBOX_ROOT/render-fixture" -o "$fallback_html"
 rf="$(<"$fallback_html")"
-contains "no recognized header: the whole file is Summary" "$rf" $'## Summary\nv1 plain prose summary.\nmore prose, no recognized header.'
+contains "no recognized header: the whole file is Summary" "$rf" 'v1 plain prose summary.'
+contains "no recognized header: the second line is not dropped" "$rf" 'more prose, no recognized header.'
 # An empty Details section omits the fold itself: an empty <pre> would
 # be a control the reader clicks to reveal nothing, and the --text
 # block omits the same empty section.
@@ -796,28 +947,28 @@ case "$rf" in *'class="results-fold"'*) no "no recognized header: empty details 
 printf '%s\n' '## Summary' 'THE OVERVIEW TEXT' '' '# Details' 'detail line' > "$RESULTS_MD"
 python3 "$renderer" "$LKML_MAILBOX_ROOT/render-fixture" -o "$fallback_html"
 rf="$(<"$fallback_html")"
-contains "no '# Summary' above '# Details': the prose above it is the summary" "$rf" $'## Summary\nTHE OVERVIEW TEXT</div>'
+contains "no '# Summary' above '# Details': the prose above it is the summary" "$rf" 'THE OVERVIEW TEXT'
 contains "no '# Summary' above '# Details': its own section renders" "$rf" '<pre class="results-details">detail line</pre>'
 # A zero-byte results file still renders the card: an empty summary
 # and no fold.
 : > "$RESULTS_MD"
 python3 "$renderer" "$LKML_MAILBOX_ROOT/render-fixture" -o "$fallback_html"
 rf="$(<"$fallback_html")"
-contains "a zero-byte results file renders an empty summary" "$rf" '<div class="results-summary"></div>'
-case "$rf" in *'class="results-fold"'*) no "a zero-byte results file renders no fold" ;; *) ok "a zero-byte results file renders no fold" ;; esac
+contains "a zero-byte results file renders the card head" "$rf" '<section class="panel summary" id="summary-v1">'
+case "$rf" in *'class="summary-body"'*|*'class="results-fold"'*) no "a zero-byte results file renders no summary body and no fold" ;; *) ok "a zero-byte results file renders no summary body and no fold" ;; esac
 printf '# Summary \nspaced header line.\n' > "$RESULTS_MD"
 python3 "$renderer" "$LKML_MAILBOX_ROOT/render-fixture" -o "$fallback_html"
 rf="$(<"$fallback_html")"
-contains "a '# Summary ' with a trailing space is all Summary" "$rf" $'# Summary \nspaced header line.'
+contains "a '# Summary ' with a trailing space is all Summary" "$rf" 'spaced header line.'
 # A # Details that precedes # Summary must not swallow the summary
 # header and body into the details fold.
 printf '%s\n' '# Details' 'detail line' '' '# Summary' 'THE HEADLINE' > "$RESULTS_MD"
 reversed_html="$work/results-reversed.html"
 python3 "$renderer" "$LKML_MAILBOX_ROOT/render-fixture" -o "$reversed_html"
 rr="$(<"$reversed_html")"
-contains "reversed headers: summary body keeps the headline" "$rr" '<div class="results-summary">THE HEADLINE</div>'
+contains "reversed headers: summary body keeps the headline" "$rr" 'THE HEADLINE'
 contains "reversed headers: details body is only its own section" "$rr" '<pre class="results-details">detail line</pre>'
-case "$rr" in *'# Summary\nTHE HEADLINE</pre>'*) no "reversed headers: summary is not folded into details" ;; *) ok "reversed headers: summary is not folded into details" ;; esac
+case "$rr" in *'# Summary<THE HEADLINE</pre>'*|*'>THE HEADLINE</pre>'*) no "reversed headers: summary is not folded into details" ;; *) ok "reversed headers: summary is not folded into details" ;; esac
 # A results file planted as a symlink escaping the series dir is
 # refused the way the persona-brief and attachment readers refuse
 # theirs; a symlink that stays inside the series dir still renders.
@@ -828,7 +979,7 @@ sym_html="$work/results-sym.html"
 python3 "$renderer" "$LKML_MAILBOX_ROOT/render-fixture" -o "$sym_html"
 sym_out="$(<"$sym_html")"
 case "$sym_out" in *'SYMLINK ESCAPE CANARY'*) no "escaping results symlink is refused" ;; *) ok "escaping results symlink is refused" ;; esac
-case "$sym_out" in *'class="results"'*) no "escaping results symlink renders no card" ;; *) ok "escaping results symlink renders no card" ;; esac
+case "$sym_out" in *'class="panel summary"'*) no "escaping results symlink renders no card" ;; *) ok "escaping results symlink renders no card" ;; esac
 ln -sf "$LKML_MAILBOX_ROOT/render-fixture/inside-results.md" "$RESULTS_MD"
 printf 'inside summary.\n' > "$LKML_MAILBOX_ROOT/render-fixture/inside-results.md"
 python3 "$renderer" "$LKML_MAILBOX_ROOT/render-fixture" -o "$sym_html"
@@ -836,46 +987,57 @@ sym_out="$(<"$sym_html")"
 contains "a symlink inside the series dir still renders" "$sym_out" 'inside summary.'
 rm "$RESULTS_MD" "$LKML_MAILBOX_ROOT/render-fixture/inside-results.md"
 
-printf '\n== results card: one card per version, absent file = absent card ==\n'
-# A two-version series with a results file for v1 only: v1 gets its card,
-# v2 renders as it did without the feature.
+printf '\n== summary card: the current version only ==\n'
+# The card reports where the series stands NOW: only the current
+# version's results file raises a card. A two-version series with a
+# results file for v1 only renders without a card (v2 stands current
+# and unsummarized), and the file moves to v2 when v2 is summarized.
 "$mailbox" init res-two --cover "$work/cover.txt" --patches "$work/patches" \
     --from author --harness test --model fixture >/dev/null 2>/dev/null
 "$mailbox" init res-two --cover "$work/cover.txt" --patches "$work/patches" \
-    --from author --harness test --model fixture >/dev/null 2>/dev/null
+    --from author --harness test --model fixture --version 2 >/dev/null 2>/dev/null
 printf '%s\n' '# Summary' 'v1 results summary.' '' '# Details' 'v1 results details.' \
     > "$LKML_MAILBOX_ROOT/res-two/results-v1.md"
 two_html="$work/res-two.html"
 python3 "$renderer" "$LKML_MAILBOX_ROOT/res-two" -o "$two_html"
-if python3 - "$two_html" <<'PY'
+t2h="$(<"$two_html")"
+case "$t2h" in *'class="panel summary"'*) no "an older version's results file raises no card" ;; *) ok "an older version's results file raises no card" ;; esac
+contains "both versions still render as sections" "$t2h" '<section class="section" id="v-1">'
+contains "both versions render their section for v2 too" "$t2h" '<section class="section" id="v-2">'
+contains "the versions panel lists both, marking v2 current" "$t2h" '<a class="vrow" href="#v-2" aria-current="true"><span class="vn">v2</span><span>latest posting</span>'
+contains "the versions panel links v1 without the current mark" "$t2h" '<a class="vrow" href="#v-1">'
+printf '%s\n' '# Summary' 'v2 results summary.' '' '# Details' 'v2 results details.' \
+    > "$LKML_MAILBOX_ROOT/res-two/results-v2.md"
+two_html2="$work/res-two2.html"
+python3 "$renderer" "$LKML_MAILBOX_ROOT/res-two" -o "$two_html2"
+if python3 - "$two_html2" <<'PY'
 import sys
 
 html = open(sys.argv[1], encoding="utf-8").read()
-i_v1 = html.index('<section class="series" id="res-two-v1">')
-i_v2 = html.index('<section class="series" id="res-two-v2">')
 errors = []
-card = '<div class="results">'
-if html.count(card) != 1:
-    errors.append("expected exactly one card, got %d" % html.count(card))
+if html.count('<section class="panel summary"') != 1:
+    errors.append("expected exactly one card, got %d" % html.count('<section class="panel summary"'))
 else:
-    i_res = html.index('<div class="results">')
-    if not i_v1 < i_res < i_v2:
-        errors.append("card is not in the v1 section")
-    if 'v1 results summary.' not in html[i_res:i_v2] or 'v1 results details.' not in html[i_res:i_v2]:
-        errors.append("v1 card does not carry its own results file")
-if html.count('class="results-summary"') != 1:
-    errors.append("v2 section rendered a summary region")
+    i_res = html.index('<section class="panel summary"')
+    i_v1 = html.index('<section class="section" id="v-1">')
+    if not i_res < i_v1:
+        errors.append("card is not in the main column above the thread")
+    region = html[i_res:i_v1]
+    if 'v2 results summary.' not in region or 'v2 results details.' not in region:
+        errors.append("card does not carry the current version's results file")
+    if 'v1 results summary.' in html:
+        errors.append("the older version's results file leaked into the page")
 for e in errors:
     print(e)
 sys.exit(1 if errors else 0)
 PY
 then
-    ok "each version renders its own results file; absent file = absent card"
+    ok "the card carries the current version's results file, only"
 else
-    no "each version renders its own results file; absent file = absent card"
+    no "the card carries the current version's results file, only"
 fi
 
-printf '\n== results: autolink (HTML) and the --text block ==\n'
+printf '\n== summary card: autolink (HTML) and the --text block ==\n'
 # The card autolinks bare 7-hex message-id tokens to the existing
 # #m-<id> anchors: a token matching a message links in BOTH sections,
 # a token matching nothing stays plain, and a hex run longer than seven
@@ -903,8 +1065,8 @@ if [[ "$(grep -cF "<a href=\"#m-$review_id\">$review_prefix</a>" "$results_link"
 case "$rl" in *'href="#m-0000000"'*) no "autolink: a fake id is not linked" ;; *) ok "autolink: a fake id is not linked" ;; esac
 contains "autolink: a fake id stays plain text" "$rl" '; 0000000 and 0123456780 did not.'
 case "$rl" in *'href="#m-012345678"'*|*'>1234567</a>'*) no "a hex run longer than 7 is not a 7-hex token" ;; *) ok "a hex run longer than 7 is not a 7-hex token" ;; esac
-contains "results markup is escaped before the linker runs" "$rl" '&lt;/a&gt;&lt;script&gt;alert(4)&lt;/script&gt;'
-case "$rl" in *'<script>alert(4)</script>'*) no "results script payload is never raw" ;; *) ok "results script payload is never raw" ;; esac
+contains "summary markup is escaped before the linker runs" "$rl" '&lt;/a&gt;&lt;script&gt;alert(4)&lt;/script&gt;'
+case "$rl" in *'<script>alert(4)</script>'*) no "summary script payload is never raw" ;; *) ok "summary script payload is never raw" ;; esac
 
 # id_prefix_map drops an ambiguous prefix (two ids sharing their first
 # seven hex chars) instead of guessing, so a colliding token stays
@@ -1003,10 +1165,10 @@ rm "$RESULTS_MD"
 
 printf '\n== series card: page-level card, --text block, byte-identical absence ==\n'
 # A two-version series with a tagged v1 reply: the card sits after the
-# masthead and before the first series section, its eyebrow reads
-# 'series summary', its wrapper carries results-series, and its id
-# autolink map covers ALL versions -- a token from an EARLIER version
-# than the latest still links.
+# series' own masthead and before the shell, its head reads 'Series
+# summary', its wrapper carries results-series, and its id autolink map
+# covers ALL versions -- a token from an EARLIER version than the latest
+# still links.
 "$mailbox" init ser-card --cover "$work/cover.txt" --patches "$work/patches" \
     --from author --harness test --model fixture >/dev/null 2>/dev/null
 sc_tree="$("$mailbox" tree ser-card)"
@@ -1047,30 +1209,27 @@ sc_prefix="${sc_review_id:0:7}"
 series_html="$work/ser.html"
 python3 "$renderer" "$LKML_MAILBOX_ROOT/ser-card" -o "$series_html"
 shtml="$(<"$series_html")"
-contains "series card is present with the file" "$shtml" '<div class="results results-series">'
-contains "series card eyebrow reads 'series summary'" "$shtml" '<p class="eyebrow">series summary</p>'
+contains "series card is present with the file" "$shtml" '<section class="panel summary results-series">'
+contains "series card head reads 'Series summary'" "$shtml" '<h2>Series summary</h2>'
 contains "series card autolinks a message id from an EARLIER version than the latest" \
     "$shtml" "<a href=\"#m-$sc_review_id\">$sc_prefix</a>"
-case "$shtml" in *'<div class="results">'*) no "no per-version card sneaks in (the fixture has none)" ;; *) ok "no per-version card sneaks in (the fixture has none)" ;; esac
-contains "the results CSS rides on the series card alone" "$shtml" '.results{'
 if python3 - "$series_html" <<'PY'
 import sys
 
 html = open(sys.argv[1], encoding="utf-8").read()
-i_mast = html.index('<div class="masthead">')
-i_card = html.index('<div class="results results-series">')
-i_v1 = html.index('<section class="series" id="ser-card-v1">')
-i_v2 = html.index('<section class="series" id="ser-card-v2">')
-i_sum = html.index('<div class="results-summary">')
+i_mast = html.index('<header class="masthead">')
+i_card = html.index('<section class="panel summary results-series">')
+i_shell = html.index('<div class="shell">')
+i_sum = html.index('<div class="summary-body">')
 i_fold = html.index('<details class="results-fold">')
 i_pre = html.index('<pre class="results-details">')
 i_pre_end = html.index('</pre>', i_pre)
 pre = html[i_pre:i_pre_end]
 summary_region = html[i_card:i_fold]
 errors = []
-if not i_mast < i_card < i_v1 < i_v2:
-    errors.append("card is not after the masthead and before the first series section")
-if html.count('<div class="results results-series">') != 1:
+if not i_mast < i_card < i_shell:
+    errors.append("card is not after the series masthead and before the shell")
+if html.count('<section class="panel summary results-series">') != 1:
     errors.append("expected exactly one series card")
 if not i_card < i_sum < i_fold < i_pre:
     errors.append("summary is not outside the collapse with details inside")
@@ -1085,9 +1244,9 @@ for e in errors:
 sys.exit(1 if errors else 0)
 PY
 then
-    ok "series card placement: after masthead, before the first section, summary outside the fold"
+    ok "series card placement: after the masthead, before the shell, summary outside the fold"
 else
-    no "series card placement: after masthead, before the first section, summary outside the fold"
+    no "series card placement: after the masthead, before the shell, summary outside the fold"
 fi
 contains "series details is escaped (script)" "$shtml" '&lt;script&gt;alert(5)&lt;/script&gt;'
 case "$shtml" in *'<script>alert(5)</script>'*) no "series script payload is never raw" ;; *) ok "series script payload is never raw" ;; esac
@@ -1158,13 +1317,13 @@ printf '%s\n' '# Summary' 'summary only, no details.' > "$SERIES_RESULTS"
 series_fold_html="$work/ser-nofold.html"
 python3 "$renderer" "$LKML_MAILBOX_ROOT/ser-card" -o "$series_fold_html"
 sf="$(<"$series_fold_html")"
-contains "series card: summary-only file renders an empty-details omission" \
-    "$sf" '<div class="results-summary">summary only, no details.</div>'
+contains "series card: summary-only file renders the visible summary" \
+    "$sf" 'summary only, no details.'
 case "$sf" in *'class="results-fold"'*) no "series card: summary-only file drops the fold" ;; *) ok "series card: summary-only file drops the fold" ;; esac
 
 # Multi-dir: rendering two series dirs that each hold a
 # results-series.md attributes each card to its own series -- each
-# card sits directly above its own section, never above the other
+# card sits directly above its own shell, never above the other
 # series' content (where it would read as that series' summary).
 printf '%s\n' '# Summary' 'Card A narrative: converged.' > "$SERIES_RESULTS"
 "$mailbox" init ser-card-b --cover "$work/cover.txt" --patches "$work/patches" \
@@ -1177,22 +1336,24 @@ import sys
 
 html = open(sys.argv[1], encoding="utf-8").read()
 errors = []
-if html.count('<div class="results results-series">') != 2:
+if html.count('<section class="panel summary results-series">') != 2:
     errors.append("expected two series cards, one per dir")
 i_card_a = html.index('Card A narrative: converged.')
 i_card_b = html.index('Card B narrative: still open.')
-i_a1 = html.index('<section class="series" id="ser-card-v1">')
-i_b1 = html.index('<section class="series" id="ser-card-b-v1">')
-if not i_card_a < i_a1 < i_card_b < i_b1:
-    errors.append("each card is not directly above its own series section")
+i_a1 = html.index('<div class="series" id="ser-card">')
+i_b1 = html.index('<div class="series" id="ser-card-b">')
+if not i_a1 < i_card_a < i_b1 < i_card_b:
+    errors.append("each card is not inside its own series dir")
+if not i_card_a < i_b1:
+    errors.append("card A is not directly above its own series shell, before series B")
 for e in errors:
     print(e)
 sys.exit(1 if errors else 0)
 PY
 then
-    ok "multi-dir: each series card sits above its own section"
+    ok "multi-dir: each series card sits above its own shell"
 else
-    no "multi-dir: each series card sits above its own section"
+    no "multi-dir: each series card sits above its own shell"
 fi
 rm "$LKML_MAILBOX_ROOT/ser-card-b/results-series.md"
 
@@ -1206,7 +1367,7 @@ series_sym_html="$work/ser-sym.html"
 python3 "$renderer" "$LKML_MAILBOX_ROOT/ser-card" -o "$series_sym_html"
 ssym="$(<"$series_sym_html")"
 case "$ssym" in *'SERIES SYMLINK ESCAPE CANARY'*) no "escaping results-series symlink is refused" ;; *) ok "escaping results-series symlink is refused" ;; esac
-case "$ssym" in *'class="results"'*) no "escaping results-series symlink renders no card" ;; *) ok "escaping results-series symlink renders no card" ;; esac
+case "$ssym" in *'class="panel summary"'*) no "escaping results-series symlink renders no card" ;; *) ok "escaping results-series symlink renders no card" ;; esac
 ln -sf "$LKML_MAILBOX_ROOT/ser-card/inside-series-results.md" "$SERIES_RESULTS"
 printf 'inside series summary.\n' > "$LKML_MAILBOX_ROOT/ser-card/inside-series-results.md"
 python3 "$renderer" "$LKML_MAILBOX_ROOT/ser-card" -o "$series_sym_html"
@@ -1224,7 +1385,25 @@ if cmp -s "$series_before_html" "$series_after_html"; then ok "HTML: absent resu
 if cmp -s "$series_before_text" "$series_after_text"; then ok "--text: absent results-series.md is byte-identical to the baseline"; else no "--text: absent results-series.md is byte-identical to the baseline"; fi
 shtml="$(<"$series_after_html")"
 case "$shtml" in *'results-series'*) no "baseline HTML has no series-card markup" ;; *) ok "baseline HTML has no series-card markup" ;; esac
-case "$shtml" in *'.results{'*) no "baseline HTML has no results CSS (the card is gone)" ;; *) ok "baseline HTML has no results CSS (the card is gone)" ;; esac
+
+printf '\n== multi-series page: the TOC masthead and the footer ==\n'
+# Two series dirs get a page-level masthead (the title and a TOC of
+# links down to each series) ON TOP of each series' own masthead, and
+# the footer carries one line per series.
+multi2="$work/multi2.html"
+python3 "$renderer" "$LKML_MAILBOX_ROOT/ser-card" "$LKML_MAILBOX_ROOT/ser-card-b" --title 'Two Series' -o "$multi2"
+m2="$(<"$multi2")"
+if [[ "$(grep -o 'class="masthead"' "$multi2" | wc -l)" -eq 3 ]]; then
+    ok "page masthead plus one per series"
+else
+    no "page masthead plus one per series"
+fi
+contains "page masthead h1 is the page title, escaped" "$m2" '<h1>Two Series</h1>'
+contains "the TOC links down to each series" "$m2" '<a href="#ser-card">ser-card</a>'
+contains "the TOC carries the second series too" "$m2" '<a href="#ser-card-b">ser-card-b</a>'
+contains "the page masthead carries a rendered stamp" "$m2" '<span class="eyebrow">rendered</span>'
+if [[ "$(grep -o '<div class="series"' "$multi2" | wc -l)" -eq 2 ]]; then ok "one series wrapper per dir"; else no "one series wrapper per dir"; fi
+contains "the footer carries one line per series (current-version reply counts)" "$m2" 'ser-card · v2 · 0 replies  ·  ser-card-b · v1 · 0 replies'
 
 printf '%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))
