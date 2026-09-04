@@ -86,6 +86,14 @@ What never reaches it: uncommitted files, `.env`, ssh keys, tokens, your
 global `~/.claude`, the tailnet or any VPN. The sandbox has ordinary internet
 egress pinned to your default route, and no way to authenticate anywhere.
 
+Services are a separate mechanism from egress, and neither constrains the
+other. A repo can hand every run its own postgres, redis, object store or
+search index over a bound unix-socket directory whatever the egress pin says
+— including in a fully sealed run with no network at all, which is precisely
+where the socket path matters most. "No network" does not mean "no services".
+See [Level 2: databases and services](#level-2-databases-and-services--sandbox-services)
+below and [docs/sandbox-services.md](sandbox-services.md).
+
 ## The opt-in ladder for a project
 
 ### Level 0: nothing
@@ -289,8 +297,10 @@ fork-sandbox.sh --harness pi-local --branch sbx-my-task ~/src/myrepo \
 ```
 
 That runs pi against a model **you** host, in a sandbox with **no network at
-all** — no internet, no LAN, no DNS. The endpoint arrives over a unix socket
-and is the only thing the session can reach. So the implement leg costs
+all** — no internet, no LAN, no DNS. The endpoint arrives over a unix socket,
+and unix sockets are the only channel in: the model endpoint always, plus the
+per-run services of "Level 2" above when the repo provides them, bound the
+same way. Nothing beyond those sockets is reachable. So the implement leg costs
 nothing, holds no credential, and cannot send anything anywhere. That is
 specific to the implement leg: `--review-harness` can point a review leg at
 a networked, credentialed harness instead, in a separate sandbox that does
