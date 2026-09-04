@@ -406,6 +406,19 @@ latest_event_file() {
     [[ -n "$LATEST_EVENT_FILE" ]]
 }
 
+# Which leg an event file belongs to: events.jsonl is the code leg,
+# events-<kind>-<N>.jsonl is <kind>-<N>.
+event_file_leg_name() {
+    local base
+    base="${1##*/}"
+    if [[ "$base" == "events.jsonl" ]]; then
+        printf 'code'
+    else
+        base="${base#events-}"
+        printf '%s' "${base%.jsonl}"
+    fi
+}
+
 # run.env is a fixed set of key=value lines. Read it with a match, never with
 # `source`, so nothing in it can run.
 run_env_get() {
@@ -583,6 +596,19 @@ print_status_block() {
     printf 'run dir:  %s\n' "$run_dir"
     printf 'commits:  %s\n' "$(commit_count_labelled)"
     printf 'events:   %s\n' "$(event_count)"
+    # The line that tells a healthy multi-leg run from a wedge: when the code
+    # leg ends, events.jsonl's mtime, the event count, the commit count and
+    # the inbox all go quiet at once and read as a hang, while the next leg is
+    # still moving. Which leg is active and how long since it moved is the
+    # signal that does not go stale with the others. Nothing at all when the
+    # run has written no event files yet.
+    if latest_event_file 2>/dev/null; then
+        age=$(( $(date +%s) - LATEST_EVENT_MTIME ))
+        (( age < 0 )) && age=0
+        printf 'activity: %s, last event %s ago\n' \
+            "$(event_file_leg_name "$LATEST_EVENT_FILE")" \
+            "$(human_duration "$age")"
+    fi
     # Printed even at zero, whenever the run has an inbox at all: it tells a
     # reader the steering channel exists and is empty, which is a different
     # fact from a run too old to have one. A run without an inbox prints

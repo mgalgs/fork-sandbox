@@ -335,4 +335,39 @@ EOF
 out="$(timeout 12 "$status" "$rd_new" 2>&1)"
 [[ "$out" == *"commits:  2 (seen so far"* ]] || { echo "pi commits not summed: $out"; exit 1; }
 
-echo "19 passed, 0 failed"
+# 8. The activity line names the active leg and how long since it moved, so
+# a healthy multi-leg run no longer reads as wedged.
+
+# 8a. It names the newest leg, not the code leg.
+new_run_dir
+cat > "$rd_new/events.jsonl" <<'EOF'
+{"type":"result","subtype":"success","result":"account"}
+EOF
+cat > "$rd_new/events-review-2.jsonl" <<'EOF'
+{"type":"result","subtype":"success","result":"review account"}
+EOF
+now_s=$(date +%s)
+touch -d "@$((now_s - 600))" "$rd_new/events.jsonl"
+touch -d "@$((now_s - 5))" "$rd_new/events-review-2.jsonl"
+out="$(timeout 12 "$status" "$rd_new" 2>&1)"
+[[ "$out" == *"activity: review-2, last event "* ]] \
+    || { echo "activity line did not name the active leg: $out"; exit 1; }
+[[ "$out" != *"activity: code,"* && "$out" != *"activity: review-2, last event 10m"* ]] \
+    || { echo "activity line named the wrong leg or stale age: $out"; exit 1; }
+
+# 8b. A run with only events.jsonl names the code leg.
+new_run_dir
+cat > "$rd_new/events.jsonl" <<'EOF'
+{"type":"result","subtype":"success","result":"account"}
+EOF
+out="$(timeout 12 "$status" "$rd_new" 2>&1)"
+[[ "$out" == *"activity: code, last event "* ]] \
+    || { echo "activity line did not name the code leg: $out"; exit 1; }
+
+# 8c. A run with no event files yet prints no activity line at all.
+new_run_dir
+out="$(timeout 12 "$status" "$rd_new" 2>&1)"
+[[ "$out" != *"activity:"* ]] || { echo "activity line printed with no event files: $out"; exit 1; }
+[[ "$out" == *"events:   0"* ]] || { echo "no-event-file count wrong: $out"; exit 1; }
+
+echo "22 passed, 0 failed"
