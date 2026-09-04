@@ -4467,6 +4467,7 @@ co_proj="$(mktemp -d "$HOME/src/fs-k8s-checkout-test.XXXXXX")"; tmpdirs+=("$co_p
 # chain then silently skips the second commit. The identity below is set
 # locally, so dropping the global config costs the fixture nothing.
 (
+    # shellcheck disable=SC2030,SC2031  # scoped to this subshell only
     export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
     cd "$co_proj" \
         && git init -q . \
@@ -5219,6 +5220,404 @@ fi
 readlink_count="$(grep -c 'readlink -f' "$k8s_sh" || true)"
 check "fork-sandbox-k8s.sh: exactly one 'readlink -f' (the pre-library bootstrap)" \
     1 "$readlink_count"
+
+printf '\n== per-run services (cluster path) ==\n'
+# .agents/sandbox-services/services.yaml is declarative data the harness
+# synthesizes sidecars from -- never a hook the repo could execute -- see
+# docs/sandbox-services.md's cluster section. Every fixture below commits a
+# spec at HEAD and calls submit --dry-run directly (no --checkout), which
+# is the "trusted, operator's own HEAD" case (services_trusted defaults to
+# 1 in fork-sandbox-k8s.sh's cmd_submit): rejections are asserted this way
+# without needing a stubbed kubectl, since the parser runs and can fail
+# before any Job is even assembled, --dry-run or not.
+svc_mk_repo() {
+    local content="$1" d
+    d="$(newdir)"; tmpdirs+=("$d")
+    mkdir -p "$d/.agents/sandbox-services"
+    printf '%s' "$content" > "$d/.agents/sandbox-services/services.yaml"
+    git -C "$d" init -q
+    git -C "$d" -c user.email=t@example -c user.name=t add -A
+    git -C "$d" -c user.email=t@example -c user.name=t commit -q -m spec
+    printf '%s\n' "$d"
+}
+svc_initcontainers_count() {
+    awk '/^      initContainers:/{f=1} f&&/^      containers:/{f=0} f' "$1" | grep -c '^        - name:'
+}
+svc_volumes_count() {
+    awk '/^      volumes:/{f=1} f' "$1" | grep -c '^        - name:'
+}
+svc_refuses() {
+    local label="$1" needle="$2" spec="$3" d
+    d="$(svc_mk_repo "$spec")"
+    refuses "$label" "$needle" \
+        env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+        --branch fs-k8s-test-svc-rej --model moonshotai/kimi-k3 "$d" "$handoff_file"
+}
+
+# No spec file: byte-for-byte the same regression proof as every existing
+# repo is in today -- proj_dir (built above) has no
+# .agents/sandbox-services/ at all. This is the case that matters most: it
+# must render exactly as before and never warn.
+svc_nosvc_out="$(newdir)/svc-nosvc.yaml"; tmpdirs+=("$(dirname "$svc_nosvc_out")")
+if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-svc-none --model moonshotai/kimi-k3 \
+    "$proj_dir" "$handoff_file" > "$svc_nosvc_out" 2>/tmp/fs-k8s-test-svc-none.err; then
+    ok "submit --dry-run with no services spec exits 0"
+else
+    no "submit --dry-run with no services spec exits 0" "$(cat /tmp/fs-k8s-test-svc-none.err)"
+fi
+if [[ -s /tmp/fs-k8s-test-svc-none.err ]]; then
+    no "no services spec: nothing warns on stderr" "$(cat /tmp/fs-k8s-test-svc-none.err)"
+else
+    ok "no services spec: nothing warns on stderr"
+fi
+for needle in 'sandbox-env:' '## Per-run services' 'terminationGracePeriodSeconds'; do
+    if grep -qF -- "$needle" "$svc_nosvc_out"; then
+        no "no services spec: rendered Job has no '$needle'" "found it"
+    else
+        ok "no services spec: rendered Job has no '$needle'"
+    fi
+done
+check "no services spec: initContainers has exactly one entry (egress-gate only)" \
+    1 "$(svc_initcontainers_count "$svc_nosvc_out")"
+
+# A valid one-service spec: one initContainers entry, restartPolicy:
+# Always, the harness security context present, port/env/writableDirs/
+# readyWhen/resources all rendered as given.
+svc1_dir="$(svc_mk_repo 'version: 1
+services:
+  - name: postgres
+    image: registry.example/rootless/postgres:16
+    port: 5432
+    env:
+      POSTGRES_PASSWORD: dev
+    writableDirs:
+      - /var/lib/postgresql/data
+    readyWhen:
+      tcpPort: 5432
+    resources:
+      cpu: 500m
+      memory: 512Mi
+sandboxEnv:
+  DATABASE_URL: "postgres://dev:dev@127.0.0.1:5432/dev"
+')"
+svc1_out="$(newdir)/svc1.yaml"; tmpdirs+=("$(dirname "$svc1_out")")
+if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-svc1 --model moonshotai/kimi-k3 \
+    "$svc1_dir" "$handoff_file" > "$svc1_out" 2>/tmp/fs-k8s-test-svc1.err; then
+    ok "submit --dry-run with a valid one-service spec exits 0"
+else
+    no "submit --dry-run with a valid one-service spec exits 0" "$(cat /tmp/fs-k8s-test-svc1.err)"
+fi
+if command -v yamllint >/dev/null 2>&1; then
+    out="$(yamllint "$svc1_out" 2>&1)"
+    if [[ -z "$out" ]]; then ok "yamllint: one-service submit --dry-run output"; else no "yamllint: one-service submit --dry-run output" "$out"; fi
+fi
+check "one-service spec: initContainers has exactly two entries (egress-gate, postgres)" \
+    2 "$(svc_initcontainers_count "$svc1_out")"
+if grep -qF -- '        - name: postgres' "$svc1_out" \
+    && grep -A1 -F -- '        - name: postgres' "$svc1_out" | grep -qF 'image: "registry.example/rootless/postgres:16"'; then
+    ok "one-service spec: the sidecar's name and image render as given"
+else
+    no "one-service spec: the sidecar's name and image render as given" "$(cat "$svc1_out")"
+fi
+if grep -A3 -F -- '        - name: postgres' "$svc1_out" | grep -qF 'restartPolicy: Always'; then
+    ok "one-service spec: the sidecar carries restartPolicy: Always (native sidecar)"
+else
+    no "one-service spec: the sidecar carries restartPolicy: Always (native sidecar)" "$(cat "$svc1_out")"
+fi
+svc1_postgres_block="$(awk '/^        - name: postgres$/{f=1} f&&/^        - name:/&&!/^        - name: postgres$/{exit} f&&/^      [a-zA-Z]/{exit} f' "$svc1_out")"
+if grep -qF 'allowPrivilegeEscalation: false' <<< "$svc1_postgres_block" \
+    && grep -qF 'readOnlyRootFilesystem: true' <<< "$svc1_postgres_block" \
+    && grep -qF 'drop: ["ALL"]' <<< "$svc1_postgres_block"; then
+    ok "one-service spec: the harness's security context is present on the sidecar"
+else
+    no "one-service spec: the harness's security context is present on the sidecar" "$svc1_postgres_block"
+fi
+if grep -A2 -F 'env:' "$svc1_out" | grep -qF -- '- name: POSTGRES_PASSWORD'; then
+    ok "one-service spec: env renders the given key"
+else
+    no "one-service spec: env renders the given key" "$(cat "$svc1_out")"
+fi
+if grep -qF 'value: "dev"' "$svc1_out"; then
+    ok "one-service spec: env renders the given literal value"
+else
+    no "one-service spec: env renders the given literal value" "$(cat "$svc1_out")"
+fi
+if grep -A2 -F 'startupProbe:' "$svc1_out" | grep -qF 'port: 5432'; then
+    ok "readyWhen.tcpPort renders a startupProbe"
+else
+    no "readyWhen.tcpPort renders a startupProbe" "$(cat "$svc1_out")"
+fi
+if grep -qF -- '- name: postgres-wd0' "$svc1_out" \
+    && grep -A1 -F -- '- name: postgres-wd0' "$svc1_out" | grep -qF 'mountPath: "/var/lib/postgresql/data"'; then
+    ok "writableDirs renders a volumeMount"
+else
+    no "writableDirs renders a volumeMount" "$(cat "$svc1_out")"
+fi
+if [[ "$(svc_volumes_count "$svc1_out")" -eq 5 ]] \
+    && grep -A1 -F -- '        - name: postgres-wd0' "$svc1_out" | grep -qF 'emptyDir: {}'; then
+    ok "writableDirs renders exactly one emptyDir volume for the one entry given"
+else
+    no "writableDirs renders exactly one emptyDir volume for the one entry given" "$(cat "$svc1_out")"
+fi
+if grep -qF '  sandbox-env: |' "$svc1_out" \
+    && grep -A1 -F '  sandbox-env: |' "$svc1_out" | grep -qF 'DATABASE_URL=postgres://dev:dev@127.0.0.1:5432/dev'; then
+    ok ".env.sandbox content (sandbox-env ConfigMap key) matches sandboxEnv"
+else
+    no ".env.sandbox content (sandbox-env ConfigMap key) matches sandboxEnv" "$(cat "$svc1_out")"
+fi
+if grep -qF '## Per-run services' "$svc1_out" \
+    && grep -qF '    postgres 127.0.0.1:5432' "$svc1_out"; then
+    ok "the prompt names the service and its 127.0.0.1:<port>"
+else
+    no "the prompt names the service and its 127.0.0.1:<port>" "$(cat "$svc1_out")"
+fi
+if grep -qF 'terminationGracePeriodSeconds: 10' "$svc1_out"; then
+    ok "terminationGracePeriodSeconds is set to 10 when services are present"
+else
+    no "terminationGracePeriodSeconds is set to 10 when services are present" "$(cat "$svc1_out")"
+fi
+
+# Two services: both present, both ports distinct, and no readyWhen means
+# no startupProbe.
+svc2_dir="$(svc_mk_repo 'version: 1
+services:
+  - name: a
+    image: registry.example/a:1
+    port: 5432
+  - name: b
+    image: registry.example/b:1
+    port: 6379
+')"
+svc2_out="$(newdir)/svc2.yaml"; tmpdirs+=("$(dirname "$svc2_out")")
+if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-svc2 --model moonshotai/kimi-k3 \
+    "$svc2_dir" "$handoff_file" > "$svc2_out" 2>/tmp/fs-k8s-test-svc2.err; then
+    ok "submit --dry-run with a valid two-service spec exits 0"
+else
+    no "submit --dry-run with a valid two-service spec exits 0" "$(cat /tmp/fs-k8s-test-svc2.err)"
+fi
+check "two-service spec: initContainers has exactly three entries (egress-gate, a, b)" \
+    3 "$(svc_initcontainers_count "$svc2_out")"
+if grep -qF '    a 127.0.0.1:5432' "$svc2_out" && grep -qF '    b 127.0.0.1:6379' "$svc2_out"; then
+    ok "two-service spec: both services' ports render, both distinct"
+else
+    no "two-service spec: both services' ports render, both distinct" "$(cat "$svc2_out")"
+fi
+if grep -qF 'startupProbe:' "$svc2_out"; then
+    no "no readyWhen renders no startupProbe" "found startupProbe: with no readyWhen given"
+else
+    ok "no readyWhen renders no startupProbe"
+fi
+
+printf '\n== per-run services: --services-trust-ref gates the spec like the local hook ==\n'
+svc_trust_dir="$(mktemp -d "$HOME/src/fs-k8s-svc-trust-test.XXXXXX")"; tmpdirs+=("$svc_trust_dir")
+(
+    # shellcheck disable=SC2030,SC2031  # scoped to this subshell only, same as the co_proj fixture above
+    export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
+    cd "$svc_trust_dir" \
+        && git init -q . \
+        && git config user.email t@fork-sandbox.invalid \
+        && git config user.name Tester \
+        && mkdir -p .agents/sandbox-services \
+        && printf 'version: 1\nservices:\n  - name: a\n    image: registry.example/a:1\n    port: 5432\n' \
+            > .agents/sandbox-services/services.yaml \
+        && git add -A && git commit -q -m base \
+        && git tag fs-k8s-svc-trust-v1 \
+        && printf 'x\n' > unrelated.txt && git add -A && git commit -q -m unrelated
+) >/dev/null 2>&1
+svc_trust_tag=fs-k8s-svc-trust-v1
+svc_trust_unchanged_sha="$(git -C "$svc_trust_dir" rev-parse --verify --quiet HEAD)"
+
+svc_trust_a_out="$(newdir)/svc-trust-a.yaml"; tmpdirs+=("$(dirname "$svc_trust_a_out")")
+FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-svc-trust-a --model moonshotai/kimi-k3 \
+    --checkout "$svc_trust_unchanged_sha" --services-trust-ref "$svc_trust_tag" \
+    "$svc_trust_dir" "$handoff_file" > "$svc_trust_a_out" 2>/tmp/fs-k8s-test-svc-trust-a.err
+check "--services-trust-ref, unchanged relative to it: services stay enabled" \
+    2 "$(svc_initcontainers_count "$svc_trust_a_out")"
+
+(
+    cd "$svc_trust_dir" \
+        && printf 'version: 1\nservices:\n  - name: a\n    image: registry.example/a:1\n    port: 5433\n' \
+            > .agents/sandbox-services/services.yaml \
+        && git -c user.email=t@fork-sandbox.invalid -c user.name=Tester add -A \
+        && git -c user.email=t@fork-sandbox.invalid -c user.name=Tester commit -q -m changed
+) >/dev/null 2>&1
+svc_trust_changed_sha="$(git -C "$svc_trust_dir" rev-parse --verify --quiet HEAD)"
+
+svc_trust_b_out="$(newdir)/svc-trust-b.yaml"; tmpdirs+=("$(dirname "$svc_trust_b_out")")
+FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-svc-trust-b --model moonshotai/kimi-k3 \
+    --checkout "$svc_trust_changed_sha" --services-trust-ref "$svc_trust_tag" \
+    "$svc_trust_dir" "$handoff_file" > "$svc_trust_b_out" 2>/tmp/fs-k8s-test-svc-trust-b.err
+check "--services-trust-ref, changed relative to it: services disabled" \
+    1 "$(svc_initcontainers_count "$svc_trust_b_out")"
+if grep -qF 'relative to the trusted' /tmp/fs-k8s-test-svc-trust-b.err; then
+    ok "--services-trust-ref, changed relative to it: warns naming the trust gate"
+else
+    no "--services-trust-ref, changed relative to it: warns naming the trust gate" \
+        "$(cat /tmp/fs-k8s-test-svc-trust-b.err)"
+fi
+
+svc_trust_c_out="$(newdir)/svc-trust-c.yaml"; tmpdirs+=("$(dirname "$svc_trust_c_out")")
+FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-svc-trust-c --model moonshotai/kimi-k3 \
+    --checkout "$svc_trust_changed_sha" \
+    "$svc_trust_dir" "$handoff_file" > "$svc_trust_c_out" 2>/tmp/fs-k8s-test-svc-trust-c.err
+check "--checkout with no --services-trust-ref: services disabled" \
+    1 "$(svc_initcontainers_count "$svc_trust_c_out")"
+if grep -qF 'unanchored ref' /tmp/fs-k8s-test-svc-trust-c.err; then
+    ok "--checkout with no --services-trust-ref: warns that the ref is unanchored"
+else
+    no "--checkout with no --services-trust-ref: warns that the ref is unanchored" \
+        "$(cat /tmp/fs-k8s-test-svc-trust-c.err)"
+fi
+
+printf '\n== per-run services: every rejection in the spec names the offending field ==\n'
+svc_refuses "unknown top-level key" \
+    "unknown top-level key 'unknownTop'" \
+    'version: 1
+services: []
+unknownTop: 1
+'
+svc_refuses "wrong version" \
+    "version: must be one of [1], got 2" \
+    'version: 2
+services: []
+'
+svc_refuses "bad name" \
+    "services[0].name: 'Bad_Name' must match" \
+    'version: 1
+services:
+  - name: Bad_Name
+    image: registry.example/x:1
+    port: 5432
+'
+svc_refuses "reserved name" \
+    "is reserved by the harness's own pod containers" \
+    'version: 1
+services:
+  - name: egress-gate
+    image: registry.example/x:1
+    port: 5432
+'
+svc_refuses "duplicate name across services" \
+    "is used by more than one service; names must be unique" \
+    'version: 1
+services:
+  - name: a
+    image: registry.example/x:1
+    port: 5432
+  - name: a
+    image: registry.example/y:1
+    port: 5433
+'
+svc_refuses "bad image" \
+    "value may not contain a quote or a backslash" \
+    'version: 1
+services:
+  - name: db
+    image: "registry.example/db'"'"'x:1"
+    port: 5432
+'
+svc_refuses "port out of range" \
+    "must be between 1025 and 65535, got 80" \
+    'version: 1
+services:
+  - name: db
+    image: registry.example/x:1
+    port: 80
+'
+svc_refuses "duplicate port" \
+    "is also used by service 'a'; ports must be unique" \
+    'version: 1
+services:
+  - name: a
+    image: registry.example/x:1
+    port: 5432
+  - name: b
+    image: registry.example/y:1
+    port: 5432
+'
+svc_refuses "relative writableDirs" \
+    "must be an absolute path" \
+    'version: 1
+services:
+  - name: db
+    image: registry.example/x:1
+    port: 5432
+    writableDirs:
+      - relative/path
+'
+svc_refuses ".. in writableDirs" \
+    "must not contain '..'" \
+    'version: 1
+services:
+  - name: db
+    image: registry.example/x:1
+    port: 5432
+    writableDirs:
+      - /var/../etc
+'
+svc_refuses "duplicate writableDirs entry" \
+    "is already listed for this service" \
+    'version: 1
+services:
+  - name: db
+    image: registry.example/x:1
+    port: 5432
+    writableDirs:
+      - /data
+      - /data
+'
+svc_refuses "readyWhen unknown key" \
+    "unknown key 'execCommand'; only 'tcpPort' is supported" \
+    'version: 1
+services:
+  - name: db
+    image: registry.example/x:1
+    port: 5432
+    readyWhen:
+      execCommand: foo
+'
+svc_refuses "readyWhen missing tcpPort" \
+    "readyWhen: needs 'tcpPort'" \
+    'version: 1
+services:
+  - name: db
+    image: registry.example/x:1
+    port: 5432
+    readyWhen: {}
+'
+svc_refuses "too many services" \
+    "more than the 8 allowed" \
+    "version: 1
+services:
+$(for i in 1 2 3 4 5 6 7 8 9; do printf '  - name: svc%d\n    image: registry.example/x:1\n    port: %d\n' "$i" $((5432 + i)); done)
+"
+svc_refuses "over-cap resources" \
+    "exceeds the per-service cap" \
+    'version: 1
+services:
+  - name: db
+    image: registry.example/x:1
+    port: 5432
+    resources:
+      cpu: 2000m
+'
+for key in securityContext hostPath privileged; do
+    svc_refuses "spec attempting '$key:' is rejected as an unknown key, not expressible" \
+        "unknown key '$key'" \
+        "version: 1
+services:
+  - name: db
+    image: registry.example/x:1
+    port: 5432
+    $key: {}
+"
+done
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))
