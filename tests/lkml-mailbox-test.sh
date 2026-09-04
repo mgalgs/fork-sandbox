@@ -562,5 +562,30 @@ out="$("$mailbox" init widget-frob --cover "$work/cover.txt" --patches "$work/pa
 rc=$?
 if (( rc != 0 )); then ok "refuses a --diffstat range when cwd is not a git repo"; else no "refuses a --diffstat range when cwd is not a git repo" "it succeeded"; fi
 
+printf '\n== large body performance ==\n'
+# post's emptiness check once ran a whole-string glob substitution that walked
+# the body per multibyte character under a UTF-8 locale. Measured on this
+# machine: 7.5s at 64KB, 33s at 128KB, 139s at 256KB -- cleanly quadratic,
+# so a reviewer quoting a long thread back could stall the harvest for
+# minutes. The regex find-one-non-space form is 6ms at 256KB. A ~256KB body
+# against a 20s bound separates the two with a wide margin either way.
+export LKML_MAILBOX_ROOT; LKML_MAILBOX_ROOT="$(new_root)"
+fixture_cover cover.txt
+fixture_patches patches
+"$mailbox" init widget-frob --cover cover.txt --patches patches --from author \
+    --harness claude --model opus >/dev/null 2>&1
+perf_patch_id="$("$mailbox" tree widget-frob | awk 'NR==3{print $1}')"
+big_body="$(mktemp)"
+printf 'große Antwort mit Umlauten — %d\n' $(seq 6000) > "$big_body"
+if LC_ALL=C.UTF-8 timeout 20 "$mailbox" post widget-frob --from core \
+        --reply-to "$perf_patch_id" --file "$big_body" --tags Changes-requested \
+        --harness claude --model opus >/dev/null 2>&1; then
+    ok "a large multibyte reply body posts promptly"
+else
+    no "a large multibyte reply body posts promptly" \
+        "timed out or failed -- the emptiness check may have regressed to a glob substitution"
+fi
+rm -f -- "$big_body"
+
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 (( fail == 0 )) || exit 1

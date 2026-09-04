@@ -714,7 +714,13 @@ cmd_post() {
         [[ -f "$file" ]] || { echo "Error: post: --file '$file' not found." >&2; return 1; }
         body="$(cat -- "$file")"
     fi
-    if [[ -z "${body//[[:space:]]/}" ]]; then
+    # A regex find-one-non-space, not a whole-string glob substitution: the
+    # latter walks the body per multibyte character under a UTF-8 locale
+    # (~24s of CPU on 360KB, measured on fork-sandbox-say.sh's identical
+    # check). Every harvested reply is posted through here, and a reviewer
+    # that quotes a long thread back is exactly the large body that made
+    # this expensive.
+    if [[ ! "$body" =~ [^[:space:]] ]]; then
         echo "Error: post: message body is empty." >&2
         return 1
     fi
