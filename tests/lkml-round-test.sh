@@ -157,11 +157,15 @@ case "$persona" in
             > "$clone_dir/.git/lkml-out/1.msg"
         ;;
     codex)
+        # One reply per location, with DISTINCT subject suffixes: whichever
+        # directory the harvest picks, its copy is the one that posts, so
+        # the test can pin the outbox-over-fallback direction (identical
+        # bodies would pass no matter which directory won).
         mkdir -p "$clone_dir/.git/lkml-out"
-        for dir in "$run_dir/outbox" "$clone_dir/.git/lkml-out"; do
-            printf 'In-Reply-To: %s\nSubject: a both-places reply\nX-Tags: Acked-by\n\nPosted from both places; must land exactly once.\n' "$STUB_REPLY_TO" \
-                > "$dir/1.msg"
-        done
+        printf 'In-Reply-To: %s\nSubject: a both-places reply (outbox copy)\nX-Tags: Acked-by\n\nPosted from the outbox; must be the one that lands.\n' "$STUB_REPLY_TO" \
+            > "$run_dir/outbox/1.msg"
+        printf 'In-Reply-To: %s\nSubject: a both-places reply (fallback copy)\nX-Tags: Acked-by\n\nPosted from the fallback; must NOT land.\n' "$STUB_REPLY_TO" \
+            > "$clone_dir/.git/lkml-out/1.msg"
         printf '# self-refresh handoff\n\nThis file must never be harvested.\n' \
             > "$run_dir/outbox/handoff.md"
         ;;
@@ -263,6 +267,12 @@ contains "core's valid outbox reply landed with its Reviewed-by tag" "$tree_out"
 contains "security's fallback-directory reply landed with its Question tag" "$tree_out" "Question"
 check "codex's both-places reply landed exactly once (outbox wins)" "1" \
     "$(printf '%s\n' "$tree_out" | grep -c 'a both-places reply')"
+contains "the outbox copy of codex's both-places reply is the one that posted" \
+    "$tree_out" "a both-places reply (outbox copy)"
+case "$tree_out" in
+    *"a both-places reply (fallback copy)"*) no "codex's fallback copy posted; the outbox must win when it holds a reply" ;;
+    *) ok "codex's fallback copy did not post" ;;
+esac
 case "$tree_out" in
     *"self-refresh"*) no "the outbox handoff.md alongside 1.msg was not harvested" ;;
     *) ok "the outbox handoff.md alongside 1.msg was not harvested" ;;
