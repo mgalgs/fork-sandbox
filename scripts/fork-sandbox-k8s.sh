@@ -17,6 +17,7 @@
 #                            [--context-ro DIR]
 #                            [--checkout REF]
 #                            <project-path> <handoff-file>
+#        fork-sandbox-k8s.sh wait --branch NAME [--timeout SECONDS]
 #        fork-sandbox-k8s.sh fetch --branch NAME <project-path>
 #        fork-sandbox-k8s.sh say --branch NAME <text>
 #        fork-sandbox-k8s.sh say --branch NAME -        # text from stdin
@@ -56,6 +57,13 @@
 # at --timeout is left in place, never fetched and never removed, and the
 # error names the fetch command to run by hand once it completes.
 #
+# wait is the wait phase of a run as a standalone verb: it polls the same
+# sentinel and, on success, prints the agent's exit code to stdout -- and
+# nothing else to stdout -- and exits 0. A non-zero exit from wait means the
+# wait itself failed (dead pod, timeout, malformed sentinel), never the
+# agent's exit status: an agent that ran to completion and exited 3 is a
+# successful wait that prints 3.
+#
 # fetch runs `git fetch` against the pod's clone, the same channel in
 # reverse, landing the branch in your real repo. It also signals the pod
 # that the run has been collected, so it does not idle out its full TTL.
@@ -80,9 +88,9 @@
 # Contacts nothing -- no kubectl, no git push, no cluster reachability
 # check. This is how the rendering logic is tested without a cluster.
 #
-# --timeout SECONDS (run): how long to wait for the agent before giving up.
-# Defaults to 3600, matching the entrypoint's own RUN_TTL default --
-# waiting longer than the pod itself will idle is pointless.
+# --timeout SECONDS (run, wait): how long to wait for the agent before
+# giving up. Defaults to 3600, matching the entrypoint's own RUN_TTL default
+# -- waiting longer than the pod itself will idle is pointless.
 #
 # --keep (run): skip the final rm, leaving the Job and pod in place after a
 # successful fetch.
@@ -2265,6 +2273,131 @@ cmd_rm() {
     echo "fork-sandbox-k8s: removed job and configmap for branch $branch" >&2
 }
 
+# cmd_run's wait phase, standalone: poll the run's pod until its entrypoint
+# writes /work/.run-complete (which holds the agent's own exit code),
+# failing fast on a dead pod, a Failed job condition, a timeout or a
+# malformed sentinel. It exists so a caller fanning out several runs can
+# submit them all before waiting on any -- see cmd_run, which composes this
+# verb.
+#
+# On success it prints the agent's exit code to stdout, and nothing else:
+# every message in this function goes to stderr, and stdout is unused by
+# every other verb in this script, which is what makes it available as the
+# machine-readable channel. The distinction that makes this verb worth
+# having: a non-zero exit means the WAIT failed (dead pod, timeout, garbage
+# sentinel). An agent that ran to completion and exited 3 is a successful
+# wait that prints 3 and exits 0.
+cmd_wait() {
+    local timeout=3600 branch="" project_path="${project_path-}"
+    while (( $# )); do
+        case "$1" in
+            --branch) branch="${2:?--branch requires a name}"; shift 2 ;;
+            --timeout) timeout="${2:?--timeout requires a number of seconds}"; shift 2 ;;
+            -*) echo "Error: unknown option '$1' for wait." >&2; exit 1 ;;
+            *) break ;;
+        esac
+    done
+    [[ -n "$branch" ]] || { echo "Error: wait requires --branch." >&2; exit 1; }
+    fs_reject_unsafe_chars "$branch" || exit 1
+    if [[ ! "$timeout" =~ ^[0-9]+$ ]]; then
+        echo "Error: --timeout must be a whole number of seconds, got '$timeout'." >&2
+        exit 1
+    fi
+
+    # $project_path is not an option: it appears only in the "fetch by hand"
+    # advice, and when cmd_run drives this verb through a $(...) capture the
+    # run's own local is already in scope in that subshell. ${project_path-}
+    # keeps a standalone wait from tripping set -u; the advice line drops the
+    # path in that case, since this verb cannot know it.
+    local safe_name legacy_name pod_name
+    safe_name="$(k8s_safe_name fork-sandbox-agent "$branch")"
+    legacy_name="$(k8s_legacy_safe_name fork-sandbox-agent "$branch")"
+    pod_name="$(k8s_find_pod "$safe_name" "$legacy_name")"
+    if [[ -z "$pod_name" ]]; then
+        echo "Error: no pod found for branch '$branch' (job $safe_name). It may" >&2
+        echo "have already been fetched and removed, or the run never started." >&2
+        exit 1
+    fi
+
+    echo "fork-sandbox-k8s: waiting for branch $branch to finish (polling" >&2
+    echo "every 10s, timeout ${timeout}s)" >&2
+
+    local start_ts now elapsed last_report_ts run_complete phase job_failed
+    start_ts=$(date +%s)
+    last_report_ts=$start_ts
+    run_complete=""
+    while true; do
+        # One kubectl exec per probe, as the header comment promises -- this
+        # single call both checks for the sentinel and reads it, so a
+        # completed run needs no second round trip.
+        if run_complete="$(kubectl exec "$pod_name" -- cat /work/.run-complete 2>/dev/null)"; then
+            break
+        fi
+
+        # A pod that dies before writing the sentinel (OOM, crash, image
+        # pull failure, node eviction) must not be polled for the full
+        # timeout -- check its state every iteration and stop as soon as it
+        # is clearly dead, rather than waiting out the deadline on a corpse.
+        phase="$(kubectl get pod "$pod_name" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+        if [[ "$phase" == Failed ]]; then
+            echo "Error: pod $pod_name is Failed -- it died before writing" >&2
+            echo "/work/.run-complete. Inspect it with:" >&2
+            echo "  kubectl --context=$K8S_CONTEXT -n $K8S_NAMESPACE describe pod $pod_name" >&2
+            echo "fork-sandbox-k8s: the job and pod are left in place for" >&2
+            echo "inspection. Remove them with:" >&2
+            echo "  fork-sandbox-k8s.sh rm --branch $branch" >&2
+            exit 1
+        fi
+        job_failed="$(kubectl get job "$safe_name" \
+            -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null || true)"
+        if [[ "$job_failed" == True ]]; then
+            echo "Error: job $safe_name reports a Failed condition -- it" >&2
+            echo "died before /work/.run-complete appeared. Inspect it with:" >&2
+            echo "  kubectl --context=$K8S_CONTEXT -n $K8S_NAMESPACE describe job $safe_name" >&2
+            echo "fork-sandbox-k8s: the job and pod are left in place for" >&2
+            echo "inspection. Remove them with:" >&2
+            echo "  fork-sandbox-k8s.sh rm --branch $branch" >&2
+            exit 1
+        fi
+
+        now=$(date +%s)
+        elapsed=$(( now - start_ts ))
+        if (( elapsed >= timeout )); then
+            echo "Error: timed out after ${timeout}s waiting for branch" >&2
+            echo "$branch to finish. The pod is still running, holding its" >&2
+            echo "work -- run does not fetch a half-finished branch and does" >&2
+            echo "not remove a still-running pod. Fetch by hand once it" >&2
+            echo "completes:" >&2
+            echo "  fork-sandbox-k8s.sh fetch --branch $branch${project_path:+ $project_path}" >&2
+            echo "and clean up afterwards with:" >&2
+            echo "  fork-sandbox-k8s.sh rm --branch $branch" >&2
+            exit 1
+        fi
+        if (( now - last_report_ts >= 60 )); then
+            echo "fork-sandbox-k8s: still waiting on branch $branch (${elapsed}s elapsed)" >&2
+            last_report_ts=$now
+        fi
+        sleep 10
+    done
+
+    if [[ ! "$run_complete" =~ ^[0-9]+$ ]]; then
+        echo "Error: /work/.run-complete on pod $pod_name does not hold an" >&2
+        echo "integer exit code (got: '$run_complete'). Treating this as a" >&2
+        echo "malformed run rather than guessing at an exit code." >&2
+        echo "Inspect it, then fetch by hand if there is anything worth" >&2
+        echo "keeping:" >&2
+        echo "  fork-sandbox-k8s.sh fetch --branch $branch${project_path:+ $project_path}" >&2
+        echo "and clean up afterwards with:" >&2
+        echo "  fork-sandbox-k8s.sh rm --branch $branch" >&2
+        exit 1
+    fi
+    local agent_rc="$run_complete"
+
+    echo "fork-sandbox-k8s: agent finished (exit $agent_rc)" >&2
+
+    printf '%s\n' "$agent_rc"
+}
+
 # submit, then wait, then fetch, then rm -- see the header comment above for
 # why. Reuses cmd_submit/cmd_fetch/cmd_rm rather than growing a second copy
 # of any of their bodies; the only new logic here is the poll loop and its
@@ -2569,11 +2702,12 @@ case "$verb" in
     install) cmd_install "$@" ;;
     submit) cmd_submit "$@" ;;
     run) cmd_run "$@" ;;
+    wait) cmd_wait "$@" ;;
     fetch) cmd_fetch "$@" ;;
     say) cmd_say "$@" ;;
     rm) cmd_rm "$@" ;;
     *)
-        echo "Error: unknown command '$verb'. Use install, submit, run, fetch, say or rm." >&2
+        echo "Error: unknown command '$verb'. Use install, submit, run, wait, fetch, say or rm." >&2
         exit 1
         ;;
 esac
