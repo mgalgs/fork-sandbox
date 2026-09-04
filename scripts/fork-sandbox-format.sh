@@ -12,8 +12,10 @@
 # --commit-count:  print how many commits the session appears to have made.
 #                  It counts `git commit` calls, so it is an estimate: a
 #                  commit made by a script does not show, and a failed or
-#                  amended commit still counts. The exact number comes from
-#                  git, in the run's summary.txt.
+#                  amended commit still counts. It understands the claude and
+#                  the pi event shapes; a log in a shape it does not know
+#                  counts as zero. The exact number comes from git, in the
+#                  run's summary.txt.
 # --cost:          print what the session cost in dollars, from the result
 #                  event, or nothing when there is no result to read. The
 #                  figure is cumulative for the session, so a log holding
@@ -170,13 +172,24 @@ fromjson? // empty
   else empty end
 '
 
+# The same heuristic as the notable commit line, per harness: claude carries
+# the call in an assistant message's tool_use content, pi in a
+# tool_execution_start's args — pi's tool_execution_end carries the result
+# but not the arguments, so the start is the record that has the command.
+# A log in any other shape (codex's, today) matches neither and counts as
+# zero; the exact number still comes from git, in the summary the runner
+# writes after it fetches the branch.
 JQ_COMMIT_COUNT='
 [ inputs
   | fromjson? // empty
-  | select(.type == "assistant")
-  | (.message.content // [])[]
-  | select(.type == "tool_use" and .name == "Bash")
-  | (.input.command // "")
+  | ( (select(.type == "assistant")
+       | (.message.content // [])[]
+       | select(.type == "tool_use" and .name == "Bash")
+       | (.input.command // "")),
+      (select(.type == "tool_execution_start")
+       | select(.toolName == "bash")
+       | (.args // {} | if type == "object" then (.command // "") else "" end)) )
+  | select(type == "string" and . != "")
   | select(test("\\bgit\\b[^|;&]*\\bcommit\\b")) ]
 | length
 '

@@ -299,4 +299,40 @@ fi
 [[ "$out" == *"events-review-1.jsonl' is a symlink; refusing to read it"* ]] \
     || { echo "no symlink refusal for a leg file: $out"; exit 1; }
 
-echo "16 passed, 0 failed"
+# 7. The commit count understands the pi event shape: pi puts the bash call
+# in a tool_execution_start's args, not in an assistant tool_use, so a pi
+# run used to count zero no matter how many commits it made.
+
+# 7a. The formatter counts pi-shaped commits.
+pi_events="$(mktemp)"
+run_dirs+=("$pi_events")
+cat > "$pi_events" <<'EOF'
+{"type":"agent_start"}
+{"type":"tool_execution_start","toolCallId":"a1","toolName":"bash","args":{"command":"git commit -m one"}}
+{"type":"tool_execution_end","toolCallId":"a1","toolName":"bash","result":{"content":[]},"isError":false}
+{"type":"tool_execution_start","toolCallId":"a2","toolName":"bash","args":{"command":"git log --oneline"}}
+{"type":"tool_execution_start","toolCallId":"a3","toolName":"bash","args":{"command":"git commit --amend -m two"}}
+EOF
+count="$("$repo_dir/scripts/fork-sandbox-format.sh" --commit-count "$pi_events")"
+[[ "$count" == "2" ]] || { echo "pi commit count wrong: $count"; exit 1; }
+
+# 7b. The claude shape still counts, and non-JSON lines are dropped.
+cat > "$pi_events" <<'EOF'
+not json at all
+{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"git commit -m one"}}]}}
+EOF
+count="$("$repo_dir/scripts/fork-sandbox-format.sh" --commit-count "$pi_events")"
+[[ "$count" == "1" ]] || { echo "claude commit count regressed: $count"; exit 1; }
+
+# 7c. Through the status script, a pi run's commits are seen in every leg.
+new_run_dir
+cat > "$rd_new/events.jsonl" <<'EOF'
+{"type":"tool_execution_start","toolCallId":"a1","toolName":"bash","args":{"command":"git commit -m one"}}
+EOF
+cat > "$rd_new/events-review-1.jsonl" <<'EOF'
+{"type":"tool_execution_start","toolCallId":"b1","toolName":"bash","args":{"command":"git commit -m two"}}
+EOF
+out="$(timeout 12 "$status" "$rd_new" 2>&1)"
+[[ "$out" == *"commits:  2 (seen so far"* ]] || { echo "pi commits not summed: $out"; exit 1; }
+
+echo "19 passed, 0 failed"
