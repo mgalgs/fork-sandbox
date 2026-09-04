@@ -180,8 +180,9 @@ fi
 # local sandbox never runs at all -- no container runtime, no sandbox image,
 # no FORK_SANDBOX_BACKEND. Nothing here changes what the local backend
 # requires, and a missing kubectl is not a broken install: it means only the
-# cluster road is unavailable on this machine. Presence of a binary and of a
-# file only: this installs nothing and must not contact a cluster.
+# cluster road is unavailable on this machine. Presence of a binary and the
+# reported contents of a file only: this installs nothing and must not contact
+# a cluster.
 echo ""
 echo "Cluster path (fork-sandbox.sh --k8s) -- a different road, informational only:"
 echo "The sandbox is a pod, so this machine supplies neither a container"
@@ -201,9 +202,40 @@ if kubectl_bin="$(command -v kubectl 2>/dev/null)"; then
 else
     echo "  kubectl: not found on PATH (cluster road unavailable; local backend unaffected)"
 fi
+# scripts/fork-sandbox-k8s.sh is authoritative for which keys exist and what
+# they default to. This deliberately minimal re-read is for reporting only.
+read_k8s_env_value() {
+    local file="$1" key="$2" line
+    [[ -f "$file" ]] || return 1
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        if [[ "$line" == "$key="* ]]; then
+            printf '%s\n' "${line#*=}"
+            return 0
+        fi
+    done < "$file"
+    return 1
+}
+
 k8s_config_dir="${FORK_SANDBOX_CONFIG_DIR:-$HOME/.config/fork-sandbox}"
-if [[ -e "$k8s_config_dir/k8s.env" ]]; then
+k8s_env="$k8s_config_dir/k8s.env"
+if [[ -e "$k8s_env" ]]; then
     echo "  $k8s_config_dir/k8s.env: present"
+    if k8s_context="$(read_k8s_env_value "$k8s_env" K8S_CONTEXT)" && [[ -n "$k8s_context" ]]; then
+        echo "    K8S_CONTEXT: set"
+    else
+        echo "    K8S_CONTEXT: MISSING -- a --k8s run will fail"
+    fi
+    if k8s_image="$(read_k8s_env_value "$k8s_env" K8S_IMAGE)" && [[ -n "$k8s_image" ]]; then
+        echo "    K8S_IMAGE: set"
+    else
+        echo "    K8S_IMAGE: MISSING -- a --k8s run will fail at submit"
+    fi
+    if k8s_namespace="$(read_k8s_env_value "$k8s_env" K8S_NAMESPACE)" && [[ -n "$k8s_namespace" ]]; then
+        echo "    K8S_NAMESPACE: $k8s_namespace"
+    else
+        echo "    K8S_NAMESPACE: fork-sandbox (default)"
+    fi
 else
     echo "  $k8s_config_dir/k8s.env: not present"
 fi
