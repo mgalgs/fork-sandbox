@@ -751,9 +751,14 @@ if (( k8s )); then
         # $k8s_probe_timeout seconds, so a once-per-cycle check would let
         # the round overrun --timeout by roughly one probe window per
         # pending seat (the local path bounds the same overrun to under
-        # one 10s tick). On the deadline the warning below names EVERY
-        # seat still pending, including ones probed earlier in this very
-        # cycle: those too are still running.
+        # one 10s tick). On the deadline the warning below names every
+        # seat that is STILL running: a seat probed earlier in this very
+        # cycle that finished (or died) by then is already recorded in
+        # k8s_collected/k8s_failed and skipped, because it was collected
+        # or reported lost before the deadline hit -- naming it "still
+        # running" with a by-hand collect would advise a command that
+        # cannot work (its job/pod are gone on a collected seat; its
+        # container is gone on a dead one).
         deadline=0
         for i in "${!pending[@]}"; do
             persona="${pending[$i]}"
@@ -806,6 +811,7 @@ if (( k8s )); then
             # collected, and name what is still running.
             echo "Warning: timed out after ${timeout}s; harvesting whatever has been collected." >&2
             for persona in "${pending[@]}"; do
+                [[ -n "${k8s_collected[$persona]:-}" || -n "${k8s_failed[$persona]:-}" ]] && continue
                 echo "Warning: $persona's job (branch ${branch_of[$persona]}) is still running; its replies will not be harvested this round." >&2
                 echo "Collect it by hand when it completes: fork-sandbox-k8s.sh collect --branch ${branch_of[$persona]} $project" >&2
             done

@@ -776,7 +776,8 @@ printf '\n== --k8s: a seat that outruns the deadline is named, and the probe sto
 # probe -- a once-per-outer-cycle check would have probed both seats
 # in one cycle, past the deadline -- and the timeout warning must then
 # name BOTH still-running seats with a by-hand collect, while core
-# (done in time) is harvested and the round still exits 0.
+# (done in time, in the SAME cycle as the deadline hits) is harvested
+# and NOT named as a straggler, and the round still exits 0.
 cap_k8s_slow="$(mktemp -d)"; tmpdirs+=("$cap_k8s_slow")
 k8s_state_slow="$(mktemp -d)"; tmpdirs+=("$k8s_state_slow")
 out_k8s_slow="$(PATH="$stub_bin:$PATH" STUB_CAPTURE_DIR="$cap_k8s_slow" STUB_RUN_PREFIX="$run_prefix_dir" \
@@ -802,6 +803,13 @@ n_collects_slow="$(grep -c '^collect security\|^collect pi-local' "$cap_k8s_slow
 check "the stragglers were never collected" "0" "$n_collects_slow"
 n_collects_slow_core="$(grep -c '^collect core' "$cap_k8s_slow/call-order" 2>/dev/null)"; n_collects_slow_core="${n_collects_slow_core:-0}"
 check "the seat that finished in time was collected" "1" "$n_collects_slow_core"
+case "$out_k8s_slow" in
+    # core was collected earlier in the deadline cycle itself: the warning
+    # must not name it "still running" (and its by-hand collect, which
+    # would target an already-removed job, must not be printed either).
+    *"core's job"*) no "the in-time seat is not named as a straggler at the deadline" "$(grep -n "core's job" <<<"$out_k8s_slow")" ;;
+    *) ok "the in-time seat is not named as a straggler at the deadline" ;;
+esac
 k8s_tree_slow="$("$mailbox" tree widget-frob)"
 # The count is 3, not 1: the main k8s run above and the dead-pod run
 # each posted a "k8s core reply" into the same shared series mailbox
