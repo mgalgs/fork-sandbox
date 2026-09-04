@@ -278,6 +278,47 @@ are not personas and keep their own env file.
 6. **`lkml-status.sh <series>`** any time you want the one-screen version
    of all of the above, including cost so far.
 
+## Running the panel in a cluster (`--k8s`)
+
+The same rounds can run as Kubernetes Jobs instead of local sandbox
+runs: `lkml-round.sh <series> ... --k8s --endpoint <name>`. `--endpoint`
+names the registered `K8S_PROXY_ENDPOINTS` entry the pi seats are wired
+to (via `fork-sandbox-k8s.sh submit --endpoint`). Endpoint names are
+site-specific configuration, read from `~/.config/fork-sandbox/k8s.env`,
+never shipped in this repo, so the flag is required with `--k8s`
+rather than guessed.
+
+The shape is submit-all, then collect-as-each-completes: every seat is
+submitted back to back (`submit` is non-blocking), then the round
+probes each uncollected seat with a short `wait` in a round-robin loop
+and collects it the moment it finishes, under `--timeout` as the
+overall deadline. That ordering is not an implementation detail -- a
+pod idles after its agent exits and then EXITS at its TTL, and once
+the container is gone neither the branch nor the outbox can be pulled
+back, so a seat that finished before its turn came in a sequential
+wait would be lost for good. On the deadline the round warns,
+harvests what has been collected, and names the still-running seats
+and the `collect` command to finish them by hand.
+
+Each seat's replies are pulled back to its own outbox directory
+(named after its branch under
+`/var/tmp/claude-scratch/forks/lkml-round-k8s/`) and harvested from
+there, so five seats can never stamp one another's replies.
+
+Seats map onto the cluster as follows: a `pi-local` seat is
+translated to `pi` against the endpoint, not refused (a pod has no
+sealed local endpoint; the endpoint reaches the same self-hosted model
+through the in-cluster proxy), so those seats stay zero-cost; a
+`claude` seat runs unchanged against its own per-run proxy. Any other
+harness (e.g. `codex`) refuses the whole round in the seats pre-pass,
+before any seat is submitted.
+
+A cluster run has no `summary.json`, so a seat that names no model
+posts its replies stamped with `unknown`, and the seat's
+`runs.jsonl` ledger line records its branch with a cluster marker
+instead of a run dir and carries no cost: a cluster run's cost is
+currently unknown, not free.
+
 ## Post-hoc review (work that already shipped)
 
 Everything above assumes a branch and a cover letter ready for step 1's
