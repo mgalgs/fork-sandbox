@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # lkml-round-test.sh — Exercise lkml-round.sh's launch and harvest logic
 # against a stub fork-sandbox.sh, the same "stub the external command on
-# PATH" pattern tests/fork-sandbox-k8s-test.sh uses for pi.
+# PATH" pattern tests/fork-sandbox-k8s-test.sh uses for pi; the --k8s
+# mode is exercised the same way against a stub fork-sandbox-k8s.sh that
+# records its verb calls in order.
 #
 # Usage: tests/lkml-round-test.sh
 #
@@ -478,6 +480,249 @@ if (( rc_missing != 0 )); then ok "a missing lkml-summarize.sh refuses the round
 contains "the missing-summarizer error names --no-summarize" "$out_missing" "--no-summarize"
 n_launches=$(find "$cap_missing" -name '*.task-meta.json' | wc -l)
 check "a missing summarizer launches no personas" "0" "$n_launches"
+
+printf '\n== --k8s: the panel runs as cluster jobs ==\n'
+# The stub replaces fork-sandbox-k8s.sh entirely, the same "stub the
+# external command on PATH" pattern as fork-sandbox.sh above. It records
+# every verb call in order (call-order -- the submit-before-wait and
+# collect-ordering assertions read it), captures each seat's argv, and
+# models the pod: a seat's wait succeeds once it has been probed the
+# number of times STUB_K8S_DONE_AFTER names for it (persona:N pairs,
+# space-separated; default 1). collect fabricates the pulled-back
+# outbox, with a DISTINCT reply per seat, so a cross-seat mix-up is
+# visible in the mailbox.
+cat > "$stub_bin/fork-sandbox-k8s.sh" <<'STUB'
+#!/usr/bin/env bash
+set -uo pipefail
+verb="$1"; shift
+args=("$@")
+branch=""
+outbox_dir=""
+i=0; n=${#args[@]}
+while (( i < n )); do
+    case "${args[$i]}" in
+        --branch) branch="${args[$((i+1))]}" ;;
+        --outbox-dir) outbox_dir="${args[$((i+1))]}" ;;
+    esac
+    i=$(( i + 1 ))
+done
+# The branch is lkml/<series>-v<N>-round-<persona>-<epoch>: the persona is
+# the part between the last "-round-" and the trailing epoch.
+persona="$(printf '%s' "${branch##*/}" | sed -e 's/.*-round-//' -e 's/-[0-9]*$//')"
+capture_dir="$STUB_K8S_CAPTURE_DIR"
+state_dir="$STUB_K8S_STATE_DIR"
+printf '%s %s\n' "$verb" "$persona" >> "$capture_dir/call-order"
+printf '%s\n' "${args[*]}" > "$capture_dir/$persona.$verb.argv"
+case "$verb" in
+    submit)
+        echo "stub fork-sandbox-k8s: submitted $branch" >&2
+        ;;
+    wait)
+        counter_file="$state_dir/$persona.wait-count"
+        c=0
+        [[ -f "$counter_file" ]] && c="$(cat "$counter_file")"
+        c=$(( c + 1 ))
+        printf '%s\n' "$c" > "$counter_file"
+        after=1
+        for pair in ${STUB_K8S_DONE_AFTER:-}; do
+            [[ "${pair%%:*}" == "$persona" ]] && after="${pair#*:}"
+        done
+        if (( c >= after )); then
+            # The real wait prints the agent's exit code ALONE on stdout
+            # and exits 0; an agent that exited 3 is a successful wait
+            # printing 3. This stub's agents all exit 0.
+            printf '0\n'
+            exit 0
+        fi
+        # Still running at the probe timeout: the wait itself failed.
+        exit 1
+        ;;
+    collect)
+        mkdir -p -- "$outbox_dir"
+        case "$persona" in
+            core)
+                printf 'In-Reply-To: %s\nSubject: k8s core reply\nX-Tags: Reviewed-by\n\nCluster reply from core.\n' "$STUB_REPLY_TO" \
+                    > "$outbox_dir/1.msg"
+                ;;
+            security)
+                printf 'In-Reply-To: %s\nSubject: k8s security reply\nX-Tags: Acked-by\n\nCluster reply from security.\n' "$STUB_REPLY_TO" \
+                    > "$outbox_dir/1.msg"
+                ;;
+            pi-local)
+                printf 'In-Reply-To: %s\nSubject: k8s pi-local reply\n\nCluster reply from the translated pi seat.\n' "$STUB_REPLY_TO" \
+                    > "$outbox_dir/1.msg"
+                ;;
+        esac
+        echo "stub fork-sandbox-k8s: collected $branch" >&2
+        ;;
+esac
+exit 0
+STUB
+chmod +x "$stub_bin/fork-sandbox-k8s.sh"
+
+cap_k8s="$(mktemp -d)"; tmpdirs+=("$cap_k8s")
+k8s_state="$(mktemp -d)"; tmpdirs+=("$k8s_state")
+# Submission order is the CSV order: core, pi-local, security. Completion
+# order is deliberately the reverse (core:3, pi-local:2, security:1), so
+# security was submitted last and must be collected first -- the
+# data-loss guard the whole submit-then-probe shape exists for.
+out_k8s="$(PATH="$stub_bin:$PATH" STUB_CAPTURE_DIR="$cap_k8s" STUB_RUN_PREFIX="$run_prefix_dir" \
+    STUB_K8S_CAPTURE_DIR="$cap_k8s" STUB_K8S_STATE_DIR="$k8s_state" \
+    STUB_K8S_DONE_AFTER="core:3 pi-local:2 security:1" \
+    STUB_REPLY_TO="$patch2_id" STUB_REPLY_TO_BRACKETED="$patch_id_bracketed" \
+    "$round" widget-frob --project "$project_dir" --checkout otherbranch \
+    --personas core,pi-local,security --personas-dir "$work" \
+    --reply-to "$patch2_id" --no-summarize --timeout 10 \
+    --k8s --endpoint test-endpoint 2>&1)"
+rc_k8s=$?
+if (( rc_k8s == 0 )); then ok "--k8s round exits 0 against the k8s stub"; else no "--k8s round exits 0 against the k8s stub" "exit $rc_k8s: $out_k8s"; fi
+
+k8s_order="$cap_k8s/call-order"
+n_submits="$(grep -c '^submit ' "$k8s_order" 2>/dev/null)"; n_submits="${n_submits:-0}"
+check "every seat got exactly one submit" "3" "$n_submits"
+n_collects="$(grep -c '^collect ' "$k8s_order" 2>/dev/null)"; n_collects="${n_collects:-0}"
+check "every completed seat was collected" "3" "$n_collects"
+first_wait_line="$(grep -n '^wait ' "$k8s_order" | head -n1 | cut -d: -f1)"
+submits_before_first_wait="$(head -n "$(( first_wait_line - 1 ))" "$k8s_order" | grep -c '^submit ' || true)"
+check "all submits precede the first wait" "3" "$submits_before_first_wait"
+collect_security_ln="$(grep -n '^collect security' "$k8s_order" | head -n1 | cut -d: -f1)"
+collect_pilocal_ln="$(grep -n '^collect pi-local' "$k8s_order" | head -n1 | cut -d: -f1)"
+collect_core_ln="$(grep -n '^collect core' "$k8s_order" | head -n1 | cut -d: -f1)"
+if [[ -n "$collect_security_ln" && -n "$collect_pilocal_ln" && -n "$collect_core_ln" \
+      && "$collect_security_ln" -lt "$collect_pilocal_ln" \
+      && "$collect_pilocal_ln" -lt "$collect_core_ln" ]]; then
+    ok "seats are collected in completion order; the seat submitted last was collected first"
+else
+    no "seats are collected in completion order; the seat submitted last was collected first" \
+        "call order: $(tr '\n' ' ' < "$k8s_order")"
+fi
+
+k8s_outbox_of() { awk '{ for (i = 1; i < NF; i++) if ($i == "--outbox-dir") print $(i+1) }' "$1"; }
+core_outbox_dir="$(k8s_outbox_of "$cap_k8s/core.collect.argv")"
+pi_outbox_dir="$(k8s_outbox_of "$cap_k8s/pi-local.collect.argv")"
+sec_outbox_dir="$(k8s_outbox_of "$cap_k8s/security.collect.argv")"
+if [[ -n "$core_outbox_dir" && -n "$pi_outbox_dir" && -n "$sec_outbox_dir" \
+      && "$core_outbox_dir" != "$pi_outbox_dir" && "$pi_outbox_dir" != "$sec_outbox_dir" \
+      && "$core_outbox_dir" != "$sec_outbox_dir" ]]; then
+    ok "each seat was collected into its own --outbox-dir"
+else
+    no "each seat was collected into its own --outbox-dir" \
+        "core=$core_outbox_dir pi-local=$pi_outbox_dir security=$sec_outbox_dir"
+fi
+contains "core's outbox dir is named after its own branch" "$core_outbox_dir" "round-core-"
+contains "pi-local's outbox dir is named after its own branch" "$pi_outbox_dir" "round-pi-local-"
+contains "security's outbox dir is named after its own branch" "$sec_outbox_dir" "round-security-"
+
+pi_submit_argv="$(cat "$cap_k8s/pi-local.submit.argv")"
+case "$pi_submit_argv" in
+    *"--harness pi-local"*) no "pi-local is translated to pi on the cluster path" "$pi_submit_argv" ;;
+    *) ok "pi-local is translated to pi on the cluster path" ;;
+esac
+contains "the translated pi seat is wired to the endpoint" "$pi_submit_argv" "--endpoint test-endpoint"
+contains "pi-local's thinking still reaches pi's args" "$pi_submit_argv" "--pi-args --thinking low"
+case "$pi_submit_argv" in
+    *"--model"*) no "the translated pi seat carries no model" "$pi_submit_argv" ;;
+    *) ok "the translated pi seat carries no model" ;;
+esac
+contains "the same seat is still pi-local on the local path" \
+    "$(cat "$capture_dir/pi-local.argv")" "--harness pi-local"
+core_submit_argv="$(cat "$cap_k8s/core.submit.argv")"
+contains "a claude seat is submitted unchanged, with its model" "$core_submit_argv" "--harness claude"
+contains "a claude seat keeps its model" "$core_submit_argv" "--model opus"
+case "$core_submit_argv" in
+    *"--endpoint"*) no "a claude seat is not wired to the pi endpoint" "$core_submit_argv" ;;
+    *) ok "a claude seat is not wired to the pi endpoint" ;;
+esac
+
+k8s_tree_out="$("$mailbox" tree widget-frob)"
+check "core's cluster reply landed exactly once" "1" \
+    "$(printf '%s\n' "$k8s_tree_out" | grep -c 'k8s core reply')"
+check "pi-local's cluster reply landed exactly once" "1" \
+    "$(printf '%s\n' "$k8s_tree_out" | grep -c 'k8s pi-local reply')"
+check "security's cluster reply landed exactly once" "1" \
+    "$(printf '%s\n' "$k8s_tree_out" | grep -c 'k8s security reply')"
+core_reply_line="$(printf '%s\n' "$k8s_tree_out" | grep 'k8s core reply')"
+check "core's reply is posted under core's persona, not another seat's" "core" \
+    "$(awk '{print $2}' <<<"$core_reply_line")"
+check "core's reply is stamped with core's own harness/model" "(claude/opus)" \
+    "$(awk '{print $3}' <<<"$core_reply_line")"
+pi_reply_line="$(printf '%s\n' "$k8s_tree_out" | grep 'k8s pi-local reply')"
+check "pi-local's reply is posted under pi-local's persona, not another seat's" "pi-local" \
+    "$(awk '{print $2}' <<<"$pi_reply_line")"
+check "pi-local's reply is stamped pi/unknown -- no summary.json to consult" "(pi/unknown)" \
+    "$(awk '{print $3}' <<<"$pi_reply_line")"
+sec_reply_line="$(printf '%s\n' "$k8s_tree_out" | grep 'k8s security reply')"
+check "security's reply is posted under security's persona, not another seat's" "security" \
+    "$(awk '{print $2}' <<<"$sec_reply_line")"
+check "security's reply is stamped with its own harness/model" "(claude/opus)" \
+    "$(awk '{print $3}' <<<"$sec_reply_line")"
+
+jq_expect() { # label, filter, json
+    if jq -e "$2" >/dev/null <<<"$3"; then ok "$1"; else no "$1" "filter '$2' failed on: $3"; fi
+}
+k8s_ledger_file="$LKML_MAILBOX_ROOT/widget-frob/runs.jsonl"
+check "the k8s round wrote one ledger line per submitted seat" "3" \
+    "$(jq -c 'select(.cluster == true)' "$k8s_ledger_file" | wc -l | tr -d '[:space:]')"
+core_k8s_ledger_line="$(jq -c 'select(.persona == "core" and .cluster == true)' "$k8s_ledger_file" | head -n1)"
+if [[ -n "$core_k8s_ledger_line" ]]; then
+    ok "core's k8s ledger line exists"
+    jq_expect "the k8s ledger line records the seat's branch" '.branch | type == "string" and test("round-core-")' "$core_k8s_ledger_line"
+    jq_expect "the k8s ledger line carries the cluster marker" '.cluster == true' "$core_k8s_ledger_line"
+    jq_expect "the k8s ledger line keeps kind review" '.kind == "review"' "$core_k8s_ledger_line"
+    jq_expect "the k8s ledger line has no run_dir" 'has("run_dir") | not' "$core_k8s_ledger_line"
+    jq_expect "the k8s ledger line sets no cost to zero" 'has("cost") | not' "$core_k8s_ledger_line"
+else
+    no "core's k8s ledger line exists" "no cluster:true line for core in $k8s_ledger_file"
+fi
+
+n_local_launches="$(find "$cap_k8s" -name '*.task-meta.json' | wc -l | tr -d '[:space:]')"
+check "the k8s round never touches the local launcher" "0" "$n_local_launches"
+contains "the pi-local translation is announced on stderr" "$out_k8s" \
+    "seat pi-local: pi-local runs as pi via endpoint 'test-endpoint' on the cluster"
+
+printf '\n== --k8s validation ==\n'
+cap_k8s_noe="$(mktemp -d)"; tmpdirs+=("$cap_k8s_noe")
+k8s_state_noe="$(mktemp -d)"; tmpdirs+=("$k8s_state_noe")
+out_k8s_noe="$(PATH="$stub_bin:$PATH" STUB_CAPTURE_DIR="$cap_k8s_noe" STUB_RUN_PREFIX="$run_prefix_dir" \
+    STUB_K8S_CAPTURE_DIR="$cap_k8s_noe" STUB_K8S_STATE_DIR="$k8s_state_noe" \
+    STUB_REPLY_TO="$patch2_id" STUB_REPLY_TO_BRACKETED="$patch_id_bracketed" \
+    "$round" widget-frob --project "$project_dir" --checkout otherbranch \
+    --personas core --personas-dir "$work" \
+    --reply-to "$patch2_id" --no-summarize --k8s 2>&1)"
+rc_k8s_noe=$?
+if (( rc_k8s_noe != 0 )); then ok "--k8s without --endpoint is refused"; else no "--k8s without --endpoint is refused" "exit 0: $out_k8s_noe"; fi
+contains "the --k8s-without-endpoint refusal names --endpoint" "$out_k8s_noe" "--endpoint"
+n_k8s_calls="$(find "$cap_k8s_noe" -name '*.argv' | wc -l | tr -d '[:space:]')"
+check "a refused --k8s round makes no k8s call" "0" "$n_k8s_calls"
+
+cap_k8s_ep="$(mktemp -d)"; tmpdirs+=("$cap_k8s_ep")
+out_k8s_ep="$(PATH="$stub_bin:$PATH" STUB_CAPTURE_DIR="$cap_k8s_ep" STUB_RUN_PREFIX="$run_prefix_dir" \
+    STUB_K8S_CAPTURE_DIR="$cap_k8s_ep" STUB_K8S_STATE_DIR="$k8s_state_noe" \
+    STUB_REPLY_TO="$patch2_id" STUB_REPLY_TO_BRACKETED="$patch_id_bracketed" \
+    "$round" widget-frob --project "$project_dir" --checkout otherbranch \
+    --personas core --personas-dir "$work" \
+    --reply-to "$patch2_id" --no-summarize --endpoint test-endpoint 2>&1)"
+rc_k8s_ep=$?
+if (( rc_k8s_ep != 0 )); then ok "--endpoint without --k8s is refused"; else no "--endpoint without --k8s is refused" "exit 0: $out_k8s_ep"; fi
+contains "the --endpoint-without-k8s refusal names --k8s" "$out_k8s_ep" "--k8s"
+
+cap_k8s_bad="$(mktemp -d)"; tmpdirs+=("$cap_k8s_bad")
+k8s_state_bad="$(mktemp -d)"; tmpdirs+=("$k8s_state_bad")
+out_k8s_bad="$(PATH="$stub_bin:$PATH" STUB_CAPTURE_DIR="$cap_k8s_bad" STUB_RUN_PREFIX="$run_prefix_dir" \
+    STUB_K8S_CAPTURE_DIR="$cap_k8s_bad" STUB_K8S_STATE_DIR="$k8s_state_bad" \
+    STUB_REPLY_TO="$patch2_id" STUB_REPLY_TO_BRACKETED="$patch_id_bracketed" \
+    "$round" widget-frob --project "$project_dir" --checkout otherbranch \
+    --personas core,codex --personas-dir "$work" \
+    --reply-to "$patch2_id" --no-summarize --k8s --endpoint test-endpoint 2>&1)"
+rc_k8s_bad=$?
+if (( rc_k8s_bad != 0 )); then ok "a cluster-unsupported harness refuses the round"; else no "a cluster-unsupported harness refuses the round" "exit 0: $out_k8s_bad"; fi
+contains "the refusal names the seat" "$out_k8s_bad" "seat codex"
+contains "the refusal names the harness" "$out_k8s_bad" "'codex'"
+contains "the refusal states that nothing was launched" "$out_k8s_bad" "no persona was launched"
+n_submits_bad="$(grep -c '^submit ' "$cap_k8s_bad/call-order" 2>/dev/null)"; n_submits_bad="${n_submits_bad:-0}"
+check "an unsupported harness submits nothing at all" "0" "$n_submits_bad"
+n_local_launches_bad="$(find "$cap_k8s_bad" -name '*.task-meta.json' | wc -l | tr -d '[:space:]')"
+check "an unsupported harness launches nothing locally either" "0" "$n_local_launches_bad"
 
 printf '\n== --help ==\n'
 h_out="$("$round" --help 2>&1)"; h_rc=$?
