@@ -69,6 +69,7 @@ TAG_CLASS = {
 }
 TAG_GLYPH = {"Reviewed-by": "R", "Acked-by": "A", "Tested-by": "T", "Changes-requested": "C",
              "Question": "?", "NAK": "N"}
+
 # Verdict strength order, strongest first: a NAK outranks a
 # Changes-requested, which outranks a Question, which outranks a sign-off.
 TAG_PRIORITY = ["NAK", "Changes-requested", "Question", "Acked-by", "Tested-by", "Reviewed-by"]
@@ -95,15 +96,6 @@ MONOGRAM_PALETTE = [
     "#6d3fb8", "#1f7a5f", "#b4560e", "#2b3a42",
     "#b32218", "#2f6fec", "#7a5c10", "#5c3d7a",
 ]
-
-
-# Max characters for an HTML tally row label. The .tally table is in auto
-# layout, where a browser treats max-width on a <th> as a suggestion and
-# grows the column to fit the content, so the CSS ellipsis is not a
-# reliable cap; the label is capped here instead, mirroring the text
-# tally's column budget. The full label stays on hover via the title
-# attribute.
-HTML_TALLY_LABEL_CAP = 64
 
 
 def read_msg(path, attachment_root):
@@ -172,7 +164,7 @@ def esc(s):
 
 def inline(s):
     s = esc(s)
-    s = re.sub(r"`([^`]+)`", r"<code>\1</code>", s)
+    s = re.sub(r"`([^`]+)`", r"<code class=\"inline\">\1</code>", s)
     s = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", s)
     return s
 
@@ -273,7 +265,7 @@ def render_diff(text):
 def render_patch_body(body):
     """A [PATCH] message body is format-patch output: mail headers, commit
     message, '---', diffstat + diff. Show the message as prose and fold
-    the diff."""
+    the diff under the stat line."""
     msg, sep, diff = body.partition("\n---\n")
     # drop format-patch's own From/From:/Date:/Subject: header block
     parts = msg.split("\n\n", 1)
@@ -286,16 +278,6 @@ def render_patch_body(body):
             out.append("<details class=\"fold\"><summary>show diff</summary>"
                        + render_diff("diff --git" + rest) + "</details>")
     return "\n".join(out)
-
-
-def fmt_date(d):
-    if not d:
-        return ""
-    return d.strftime("%b %d %H:%M")
-
-
-def persona_class(p):
-    return "p-" + re.sub(r"[^a-z0-9]+", "-", p.lower())
 
 
 def strongest_tag(tags):
@@ -540,8 +522,22 @@ def read_results_file(series_dir, filename):
 def read_results(series_dir, version):
     """The per-version results file <series>/results-v<N>.md (N built
     from the integer version), or None when absent. A companion
-    results-v<N>.json is ignored: the card renders the .md only."""
+    results-v<N>.json may sit next to it; has_results_json reports on
+    it separately."""
     return read_results_file(series_dir, f"results-v{version}.md")
+
+
+def has_results_json(series_dir, version):
+    """True when <series>/results-v<N>.json exists (realpath-contained
+    the same way the .md reader is). The card renders the .md's text;
+    the .json only keeps the card present when the .md was never
+    written, so a run that produced a results file renders a card
+    rather than a bare thread."""
+    path = os.path.join(series_dir, f"results-v{version}.json")
+    series_real = os.path.realpath(series_dir)
+    path_real = os.path.realpath(path)
+    return (os.path.commonpath((path_real, series_real)) == series_real
+            and os.path.isfile(path_real))
 
 
 def read_series_results(series_dir):
@@ -596,6 +592,57 @@ def link_ids(escaped, id_map):
         full = id_map.get(match.group(0))
         return f'<a href="#m-{esc(full)}">{match.group(0)}</a>' if full else match.group(0)
     return HEX_TOKEN_RE.sub(sub, escaped)
+
+
+def render_summary_card(series_dir, version, id_map):
+    """The per-version auto-summary card, rendered when the version's
+    results file exists (results-v<N>.md, or a bare results-v<N>.json
+    when the .md is absent). The '# Summary' section sits visible in
+    the card body, only the '# Details' section inside the fold, and
+    7-hex message-id tokens autolink to the thread's #m-<id> anchors.
+    Empty sections are omitted; with NO results file this returns ""
+    -- no card at all, not an empty one."""
+    res = read_results(series_dir, version)
+    if res is None and not has_results_json(series_dir, version):
+        return ""
+    summary, details = res if res is not None else ("", "")
+    card = (f'  <section class="panel summary" id="summary-v{version}">\n'
+            f'    <div class="summary-head"><h2>Where this stands</h2>'
+            f'<span class="chip pending">auto-summary \u00b7 v{version}</span></div>\n')
+    if summary:
+        card += f'    <div class="summary-body">{link_ids(render_prose(summary), id_map)}</div>\n'
+    if details:
+        card += (f'    <details class="results-fold">\n'
+                 f'      <summary>show details</summary>\n'
+                 f'      <pre class="results-details">{link_ids(esc(details), id_map)}</pre>\n'
+                 f'    </details>\n')
+    return card + '  </section>'
+
+
+def render_series_card(series_dir, id_map):
+    """The page-level series summary card, placed directly above the
+    series' own shell: the same treatment as the per-version card
+    (Summary visible, Details inside the fold, autolinked, empty
+    sections omitted), but the head reads 'Series summary' and the
+    wrapper carries results-series, so the card can be styled
+    independently later without markup surgery. The id_map must cover
+    ALL versions' messages (the caller builds it over the whole series
+    dir). Returns "" when the file is absent."""
+    res = read_series_results(series_dir)
+    if res is None:
+        return ""
+    summary, details = res
+    card = (f'  <section class="panel summary results-series">\n'
+            f'    <div class="summary-head"><h2>Series summary</h2>'
+            f'<span class="chip pending">series</span></div>\n')
+    if summary:
+        card += f'    <div class="summary-body">{link_ids(render_prose(summary), id_map)}</div>\n'
+    if details:
+        card += (f'    <details class="results-fold">\n'
+                 f'      <summary>show details</summary>\n'
+                 f'      <pre class="results-details">{link_ids(esc(details), id_map)}</pre>\n'
+                 f'    </details>\n')
+    return card + '  </section>'
 
 
 def render_banner(naks, nak_names, nak_patch_idx, n_open, open_patch_idx):
@@ -729,290 +776,6 @@ def patch_index(patch):
     """The 1-based position of a patch root from its subject, or None."""
     mm = re.match(r"^\[PATCH v\d+ (\d+)/", patch_label(patch))
     return int(mm.group(1)) if mm else None
-
-
-def render_results_card(series_dir, version, id_map):
-    """The per-version Results card, placed between the Reviewers panel
-    and the Thread Index: the Summary section is visible in the
-    collapsed state, only Details sits inside the "show details"
-    summary -- omitted entirely when the Details body is empty, the
-    way the --text block omits its empty sections. Both sections are
-    escaped preformatted text in the file's own layout (the
-    persona-briefs treatment) -- never rendered or executed -- with
-    7-hex message-id tokens autolinked. Returns "" when the results
-    file is absent."""
-    res = read_results(series_dir, version)
-    if res is None:
-        return ""
-    summary, details = res
-    card = (f'  <div class="results">\n'
-            f'    <p class="eyebrow">results</p>\n'
-            f'    <div class="results-summary">{link_ids(esc(summary), id_map)}</div>\n')
-    if details:
-        card += (f'    <details class="results-fold">\n'
-                 f'      <summary>show details</summary>\n'
-                 f'      <pre class="results-details">{link_ids(esc(details), id_map)}</pre>\n'
-                 f'    </details>\n')
-    return card + '  </div>'
-
-
-def render_series_card(series_dir, id_map):
-    """The page-level series summary card, placed directly above the
-    series' own section (right after the masthead when a single dir
-    is rendered): the same treatment
-    as the per-version card (Summary outside the "show details"
-    fold, Details inside it, escaped preformatted, autolinked, empty
-    sections omitted). Two differences: the eyebrow reads 'series
-    summary' and the wrapper class is 'results results-series', so
-    the card can be styled independently later without markup surgery.
-    The id_map must cover ALL versions' messages (the caller builds it
-    over the whole series dir). Returns "" when the file is absent."""
-    res = read_series_results(series_dir)
-    if res is None:
-        return ""
-    summary, details = res
-    card = (f'  <div class="results results-series">\n'
-            f'    <p class="eyebrow">series summary</p>\n'
-            f'    <div class="results-summary">{link_ids(esc(summary), id_map)}</div>\n')
-    if details:
-        card += (f'    <details class="results-fold">\n'
-                 f'      <summary>show details</summary>\n'
-                 f'      <pre class="results-details">{link_ids(esc(details), id_map)}</pre>\n'
-                 f'    </details>\n')
-    return card + '  </div>'
-
-
-def text_body(m):
-    """The message body for --text mode. Cover letters and replies go
-    out in full; a [PATCH] message (is_patch: a depth-1 [PATCH]-
-    subjected message with a format-patch body) keeps the commit
-    message and the diffstat -- the format-patch body separates them
-    from the diff at the first 'diff --git' line, and the diff lives
-    in git on the series branch, so it is summarized, not inlined. A
-    reply that happens to carry a [PATCH] subject (the reply Subject:
-    is optional and used verbatim) goes out in full. The cover letter
-    is itself a [PATCH x 0/N] subject but, like every reply, goes out
-    in full."""
-    if not is_patch(m):
-        return m["body"].rstrip("\n")
-    lines = m["body"].splitlines()
-    cut = next((i for i, ln in enumerate(lines) if ln == "---"), None)
-    if cut is None:
-        return m["body"].rstrip("\n")
-    msg = lines[:cut]
-    # drop format-patch's own From/From:/Date:/Subject: header block
-    if msg and msg[0].startswith("From "):
-        blank = next((i for i, ln in enumerate(msg) if not ln.strip()), 0)
-        msg = msg[blank + 1:]
-    # format-patch puts the diffstat between '---' and the first
-    # 'diff --git'; keep it (the HTML render does) and summarize only
-    # the diff itself. Trim only newlines: a diffstat's first line
-    # carries the leading space its | column is aligned on, and
-    # .strip() would dedent just that line.
-    rest = lines[cut + 1:]
-    d = next((i for i, ln in enumerate(rest) if ln.startswith("diff --git")), None)
-    stat = "\n".join(rest[:d] if d is not None else rest).strip("\n")
-    diff = rest[d:] if d is not None else []
-    out = "\n".join(msg).strip("\n")
-    if stat:
-        out += "\n" + stat
-    if diff:
-        out += f"\n[diff omitted: {len(diff)} lines -- see the series branch]"
-    return out
-
-
-def render_text_message(out, m, nums, depth):
-    """One message of the --text thread: separator, numbered header, the
-    From/Subject/Tags lines, then the body. `nums` maps id to
-    (number, parent number) from a pre-order walk, so this prints the
-    thread in the same order the HTML render nests it in."""
-    num, parent_num = nums[m["id"]]
-    rel = f" · reply to #{parent_num}" if parent_num else ""
-    out.append("-" * 72)
-    out.append(f"== #{num}{rel} · depth {depth}")
-    line = f"From: {m['from']}"
-    meta = []
-    if m["persona"]:
-        meta.append(f"persona: {m['persona']}")
-    if m["harness"]:
-        meta.append(f"harness: {m['harness']}")
-    if m["model"]:
-        meta.append(f"model: {m['model']}")
-    if meta:
-        line += "  [" + " · ".join(meta) + "]"
-    out.append(line)
-    out.append(f"Subject: {patch_label(m)}")
-    if m["tags"]:
-        out.append("Tags: " + ", ".join(m["tags"]))
-    if m["attachments"]:
-        out.append("Attachments: " + ", ".join(a["ref"] for a in m["attachments"]))
-    # The body is indented under its header: a message block here is
-    # the 72-dash separator, the '== #' line, the From/Subject/Tags
-    # lines, then the body, and a body that carried a line of 72
-    # dashes and its own '== #99 ...' line would otherwise read as a
-    # second message. Every body line is prefixed, so the header
-    # grammar stays unforgeable from the body; the prefix is uniform,
-    # so the diffstat's fixed-width alignment survives it.
-    body = text_body(m)
-    if body:
-        out.extend("  " + ln for ln in body.split("\n"))
-    else:
-        out.append("")
-    for c in m["children"]:
-        render_text_message(out, c, nums, depth + 1)
-
-
-def fit_tally_label(label, budget):
-    """Truncate a text-tally row label to at most `budget` columns, always
-    marking the cut with a trailing ellipsis. When the [PATCH vN i/M]
-    prefix fits the budget it survives intact and the cut lands on the
-    SUBJECT part; a smaller budget cuts the prefix itself, and a zero
-    budget drops the label entirely (the tag columns, not the label,
-    are the overflow then). Either way the returned label never takes
-    more than `budget` columns. Never falls back to the bare 'Patch vN
-    i/M' form."""
-    if len(label) <= budget:
-        return label
-    if budget <= 0:
-        return ""
-    mm = re.match(r"^(\[PATCH v\d+ \d+/\d+\] )(.*)$", label)
-    if mm and budget > len(mm.group(1)) + 1:
-        keep = budget - len(mm.group(1)) - 1
-        return mm.group(1) + mm.group(2)[:keep] + "\u2026"
-    return label[:budget - 1] + "\u2026"
-
-
-def render_text_tally(out, rows, pcols):
-    """The per-version tally as a fixed-width table: a row per patch
-    (same labels as the HTML rows), a column per listed reviewer, cells
-    the same latest-tag-per-reviewer-per-patch letters. The first column
-    sizes from the longest label; when that would push the table past
-    ~120 columns, the subject part of the label is truncated (the
-    prefix intact) rather than the table."""
-    grid = [["patch"] + list(pcols)]
-    for t, latest in rows:
-        label = "cover" if t is rows[0][0] else patch_label(t)
-        grid.append([label] + [TAG_GLYPH.get(latest[p][2][0], "·") if p in latest else "·" for p in pcols])
-    widths = [max(len(row[i]) for row in grid) for i in range(len(grid[0]))]
-    # Gap is two spaces between columns; the label column alone absorbs
-    # the overflow, so the tag columns stay readable. Floor at zero: when
-    # the tag columns alone eat the whole 120, no label can fit and the
-    # overflow lives in the configured panel width, not in a mangled
-    # label (a negative slice would chop the label's END and push the
-    # rows far past 120).
-    budget = max(0, 120 - sum(widths[1:]) - 2 * (len(widths) - 1))
-    if widths[0] > budget:
-        for row in grid:
-            row[0] = fit_tally_label(row[0], budget)
-        widths[0] = max(len(row[0]) for row in grid)
-    out.append("Latest tag per reviewer per patch. R reviewed, A acked, "
-               "C changes requested, ? question, N nak.")
-    for row in grid:
-        out.append("  ".join(cell.ljust(widths[i]) for i, cell in enumerate(row)).rstrip())
-
-
-def render_text_reviewers(out, name, series_dir, reviewer_entries):
-    """One block per reviewer, in the box's order. No brief inlining in
-    text mode -- just a pointer to the file, when it exists."""
-    out.append("reviewers")
-    for r in reviewer_entries:
-        out.append(f"  {r['name']} ({r['persona']})")
-        meta = " · ".join(x for x in (r["harness"], r["model"]) if x)
-        if meta:
-            out.append(f"    {meta}")
-        counts = [f"{r['count']} message" + ("s" if r["count"] != 1 else "")]
-        if r["rev"]:
-            counts.append(f"{r['rev']} Reviewed-by")
-        if r["nak"]:
-            counts.append(f"{r['nak']} NAK")
-        out.append(f"    {', '.join(counts)}")
-        if persona_brief_path(series_dir, r["persona"]):
-            out.append(f"    brief: {name}/personas/{r['persona']}.md")
-
-
-def render_text_series(series_dir):
-    """One series dir as plain text: a header with the same counts the
-    HTML header shows, then every message in thread order."""
-    name, msgs, roots = build(series_dir)
-    sections = []
-    # The whole-series results file, if any: a 'series-summary' block
-    # at the very top, before the first version section, with the same
-    # column-0 labels / two-space body rules as the per-version
-    # 'results' block (a body line cannot forge a label, no links in
-    # text mode, empty sections omit their label and body).
-    series_res = read_series_results(series_dir)
-    if series_res is not None:
-        lines = ["series-summary"]
-        if series_res[0]:
-            lines.append("# Summary")
-            lines.extend("  " + ln for ln in series_res[0].split("\n"))
-        if series_res[1]:
-            if series_res[0]:
-                lines.append("")
-            lines.append("# Details")
-            lines.extend("  " + ln for ln in series_res[1].split("\n"))
-        sections.append("\n".join(lines))
-    covers = [r for r in roots if r["depth"] == 0 and r["subject"].startswith("[PATCH")]
-    for cover in covers:
-        v = cover["version"]
-        version_roots = [r for r in roots if r["version"] == v]
-        version_msgs = [m for root in version_roots for m in subtree(root)]
-        rows, personas = tally(cover)
-        # The same counts the HTML header shows, computed the same way:
-        # patches from the tally's targets, replies as everything at
-        # depth >= 1 that is not a patch.
-        n_replies = sum(1 for m in version_msgs if m["depth"] >= 1 and not is_patch(m))
-        n_patches = len(rows) - 1
-        reviewer_entries = reviewer_rollup(version_msgs, cover["persona"], rows)
-        # One matrix column per reviewer the box lists, same set and
-        # (alphabetical) order as the HTML table.
-        pcols = sorted(set(personas) | {r["persona"] for r in reviewer_entries})
-        lines = [f"{name} v{v}",
-                 f"{n_patches} patches · {n_replies} replies · {len(reviewer_entries)} reviewers",
-                 ""]
-        render_text_tally(lines, rows, pcols)
-        lines.append("")
-        if reviewer_entries:
-            render_text_reviewers(lines, name, series_dir, reviewer_entries)
-            lines.append("")
-        # The Results card's sections as a text block in the same
-        # position: bare 'results' header, then the section labels
-        # ('# Summary', '# Details') and the verbatim bodies. The
-        # labels sit at column 0 -- like the 'results' header and the
-        # message headers -- while every body line carries its
-        # two-space prefix, so a body line that reads '# Summary' or
-        # '# Details' cannot forge a label (the same rule that keeps a
-        # body line from forging a message header). An empty section
-        # omits its label and body, the way the HTML card omits its
-        # empty details fold. No links in text mode.
-        res = read_results(series_dir, v)
-        if res is not None:
-            lines.append("results")
-            if res[0]:
-                lines.append("# Summary")
-                lines.extend("  " + ln for ln in res[0].split("\n"))
-            if res[1]:
-                if res[0]:
-                    lines.append("")
-                lines.append("# Details")
-                lines.extend("  " + ln for ln in res[1].split("\n"))
-            lines.append("")
-        # Number the thread pre-order, matching the HTML nesting order.
-        nums = {}
-        counter = [0]
-
-        def assign(m, parent_id):
-            counter[0] += 1
-            nums[m["id"]] = (counter[0], parent_id and nums[parent_id][0])
-            for c in m["children"]:
-                assign(c, m["id"])
-
-        for root in version_roots:
-            assign(root, None)
-        for root in version_roots:
-            render_text_message(lines, root, nums, 0)
-        sections.append("\n".join(lines))
-    return "\n\n".join(sections) + ("\n" if sections else "")
 
 
 def render_message(m, depth=0, series_name=""):
@@ -1190,7 +953,15 @@ def render_series(series_dir):
                 render_reviewer_panel(series_dir, current, cur["reviewer_entries"], cur["strongest"]),
                 render_patch_panel(series_dir, current, cur["rows"], cur["reviewer_entries"]),
                 counts]
+        banner = render_banner(cur["n_naks"], cur["nak_names"], cur["nak_idx"],
+                               cur["n_open"],
+                               patch_index(cur["open_one"]) if cur["open_one"] else None)
+        sump = render_summary_card(series_dir, current, id_map)
         shell = '  <div class="shell">\n\n  <aside class="rail">\n' + "\n".join(p for p in rail if p) + "\n  </aside>\n\n  <main class=\"main\">\n"
+        if banner:
+            shell += banner + "\n"
+        if sump:
+            shell += sump + "\n"
         for v in versions:
             d = version_data[v]
             thread = "\n".join(render_trace(r, 0, name) for r in d["version_roots"])
@@ -1587,6 +1358,239 @@ footer.foot {
   color: var(--ink-3); font-size: 11.5px; font-family: var(--mono);
 }
 """
+
+def text_body(m):
+    """The message body for --text mode. Cover letters and replies go
+    out in full; a [PATCH] message (is_patch: a depth-1 [PATCH]-
+    subjected message with a format-patch body) keeps the commit
+    message and the diffstat -- the format-patch body separates them
+    from the diff at the first 'diff --git' line, and the diff lives
+    in git on the series branch, so it is summarized, not inlined. A
+    reply that happens to carry a [PATCH] subject (the reply Subject:
+    is optional and used verbatim) goes out in full. The cover letter
+    is itself a [PATCH x 0/N] subject but, like every reply, goes out
+    in full."""
+    if not is_patch(m):
+        return m["body"].rstrip("\n")
+    lines = m["body"].splitlines()
+    cut = next((i for i, ln in enumerate(lines) if ln == "---"), None)
+    if cut is None:
+        return m["body"].rstrip("\n")
+    msg = lines[:cut]
+    # drop format-patch's own From/From:/Date:/Subject: header block
+    if msg and msg[0].startswith("From "):
+        blank = next((i for i, ln in enumerate(msg) if not ln.strip()), 0)
+        msg = msg[blank + 1:]
+    # format-patch puts the diffstat between '---' and the first
+    # 'diff --git'; keep it (the HTML render does) and summarize only
+    # the diff itself. Trim only newlines: a diffstat's first line
+    # carries the leading space its | column is aligned on, and
+    # .strip() would dedent just that line.
+    rest = lines[cut + 1:]
+    d = next((i for i, ln in enumerate(rest) if ln.startswith("diff --git")), None)
+    stat = "\n".join(rest[:d] if d is not None else rest).strip("\n")
+    diff = rest[d:] if d is not None else []
+    out = "\n".join(msg).strip("\n")
+    if stat:
+        out += "\n" + stat
+    if diff:
+        out += f"\n[diff omitted: {len(diff)} lines -- see the series branch]"
+    return out
+
+
+def render_text_message(out, m, nums, depth):
+    """One message of the --text thread: separator, numbered header, the
+    From/Subject/Tags lines, then the body. `nums` maps id to
+    (number, parent number) from a pre-order walk, so this prints the
+    thread in the same order the HTML render nests it in."""
+    num, parent_num = nums[m["id"]]
+    rel = f" · reply to #{parent_num}" if parent_num else ""
+    out.append("-" * 72)
+    out.append(f"== #{num}{rel} · depth {depth}")
+    line = f"From: {m['from']}"
+    meta = []
+    if m["persona"]:
+        meta.append(f"persona: {m['persona']}")
+    if m["harness"]:
+        meta.append(f"harness: {m['harness']}")
+    if m["model"]:
+        meta.append(f"model: {m['model']}")
+    if meta:
+        line += "  [" + " · ".join(meta) + "]"
+    out.append(line)
+    out.append(f"Subject: {patch_label(m)}")
+    if m["tags"]:
+        out.append("Tags: " + ", ".join(m["tags"]))
+    if m["attachments"]:
+        out.append("Attachments: " + ", ".join(a["ref"] for a in m["attachments"]))
+    # The body is indented under its header: a message block here is
+    # the 72-dash separator, the '== #' line, the From/Subject/Tags
+    # lines, then the body, and a body that carried a line of 72
+    # dashes and its own '== #99 ...' line would otherwise read as a
+    # second message. Every body line is prefixed, so the header
+    # grammar stays unforgeable from the body; the prefix is uniform,
+    # so the diffstat's fixed-width alignment survives it.
+    body = text_body(m)
+    if body:
+        out.extend("  " + ln for ln in body.split("\n"))
+    else:
+        out.append("")
+    for c in m["children"]:
+        render_text_message(out, c, nums, depth + 1)
+
+
+def fit_tally_label(label, budget):
+    """Truncate a text-tally row label to at most `budget` columns, always
+    marking the cut with a trailing ellipsis. When the [PATCH vN i/M]
+    prefix fits the budget it survives intact and the cut lands on the
+    SUBJECT part; a smaller budget cuts the prefix itself, and a zero
+    budget drops the label entirely (the tag columns, not the label,
+    are the overflow then). Either way the returned label never takes
+    more than `budget` columns. Never falls back to the bare 'Patch vN
+    i/M' form."""
+    if len(label) <= budget:
+        return label
+    if budget <= 0:
+        return ""
+    mm = re.match(r"^(\[PATCH v\d+ \d+/\d+\] )(.*)$", label)
+    if mm and budget > len(mm.group(1)) + 1:
+        keep = budget - len(mm.group(1)) - 1
+        return mm.group(1) + mm.group(2)[:keep] + "\u2026"
+    return label[:budget - 1] + "\u2026"
+
+
+def render_text_tally(out, rows, pcols):
+    """The per-version tally as a fixed-width table: a row per patch
+    (same labels as the HTML rows), a column per listed reviewer, cells
+    the same latest-tag-per-reviewer-per-patch letters. The first column
+    sizes from the longest label; when that would push the table past
+    ~120 columns, the subject part of the label is truncated (the
+    prefix intact) rather than the table."""
+    grid = [["patch"] + list(pcols)]
+    for t, latest in rows:
+        label = "cover" if t is rows[0][0] else patch_label(t)
+        grid.append([label] + [TAG_GLYPH.get(latest[p][2][0], "·") if p in latest else "·" for p in pcols])
+    widths = [max(len(row[i]) for row in grid) for i in range(len(grid[0]))]
+    # Gap is two spaces between columns; the label column alone absorbs
+    # the overflow, so the tag columns stay readable. Floor at zero: when
+    # the tag columns alone eat the whole 120, no label can fit and the
+    # overflow lives in the configured panel width, not in a mangled
+    # label (a negative slice would chop the label's END and push the
+    # rows far past 120).
+    budget = max(0, 120 - sum(widths[1:]) - 2 * (len(widths) - 1))
+    if widths[0] > budget:
+        for row in grid:
+            row[0] = fit_tally_label(row[0], budget)
+        widths[0] = max(len(row[0]) for row in grid)
+    out.append("Latest tag per reviewer per patch. R reviewed, A acked, "
+               "C changes requested, ? question, N nak.")
+    for row in grid:
+        out.append("  ".join(cell.ljust(widths[i]) for i, cell in enumerate(row)).rstrip())
+
+
+def render_text_reviewers(out, name, series_dir, reviewer_entries):
+    """One block per reviewer, in the box's order. No brief inlining in
+    text mode -- just a pointer to the file, when it exists."""
+    out.append("reviewers")
+    for r in reviewer_entries:
+        out.append(f"  {r['name']} ({r['persona']})")
+        meta = " · ".join(x for x in (r["harness"], r["model"]) if x)
+        if meta:
+            out.append(f"    {meta}")
+        counts = [f"{r['count']} message" + ("s" if r["count"] != 1 else "")]
+        if r["rev"]:
+            counts.append(f"{r['rev']} Reviewed-by")
+        if r["nak"]:
+            counts.append(f"{r['nak']} NAK")
+        out.append(f"    {', '.join(counts)}")
+        if persona_brief_path(series_dir, r["persona"]):
+            out.append(f"    brief: {name}/personas/{r['persona']}.md")
+
+
+def render_text_series(series_dir):
+    """One series dir as plain text: a header with the same counts the
+    HTML header shows, then every message in thread order."""
+    name, msgs, roots = build(series_dir)
+    sections = []
+    # The whole-series results file, if any: a 'series-summary' block
+    # at the very top, before the first version section, with the same
+    # column-0 labels / two-space body rules as the per-version
+    # 'results' block (a body line cannot forge a label, no links in
+    # text mode, empty sections omit their label and body).
+    series_res = read_series_results(series_dir)
+    if series_res is not None:
+        lines = ["series-summary"]
+        if series_res[0]:
+            lines.append("# Summary")
+            lines.extend("  " + ln for ln in series_res[0].split("\n"))
+        if series_res[1]:
+            if series_res[0]:
+                lines.append("")
+            lines.append("# Details")
+            lines.extend("  " + ln for ln in series_res[1].split("\n"))
+        sections.append("\n".join(lines))
+    covers = [r for r in roots if r["depth"] == 0 and r["subject"].startswith("[PATCH")]
+    for cover in covers:
+        v = cover["version"]
+        version_roots = [r for r in roots if r["version"] == v]
+        version_msgs = [m for root in version_roots for m in subtree(root)]
+        rows, personas = tally(cover)
+        # The same counts the HTML header shows, computed the same way:
+        # patches from the tally's targets, replies as everything at
+        # depth >= 1 that is not a patch.
+        n_replies = sum(1 for m in version_msgs if m["depth"] >= 1 and not is_patch(m))
+        n_patches = len(rows) - 1
+        reviewer_entries = reviewer_rollup(version_msgs, cover["persona"], rows)
+        # One matrix column per reviewer the box lists, same set and
+        # (alphabetical) order as the HTML table.
+        pcols = sorted(set(personas) | {r["persona"] for r in reviewer_entries})
+        lines = [f"{name} v{v}",
+                 f"{n_patches} patches · {n_replies} replies · {len(reviewer_entries)} reviewers",
+                 ""]
+        render_text_tally(lines, rows, pcols)
+        lines.append("")
+        if reviewer_entries:
+            render_text_reviewers(lines, name, series_dir, reviewer_entries)
+            lines.append("")
+        # The Results card's sections as a text block in the same
+        # position: bare 'results' header, then the section labels
+        # ('# Summary', '# Details') and the verbatim bodies. The
+        # labels sit at column 0 -- like the 'results' header and the
+        # message headers -- while every body line carries its
+        # two-space prefix, so a body line that reads '# Summary' or
+        # '# Details' cannot forge a label (the same rule that keeps a
+        # body line from forging a message header). An empty section
+        # omits its label and body, the way the HTML card omits its
+        # empty details fold. No links in text mode.
+        res = read_results(series_dir, v)
+        if res is not None:
+            lines.append("results")
+            if res[0]:
+                lines.append("# Summary")
+                lines.extend("  " + ln for ln in res[0].split("\n"))
+            if res[1]:
+                if res[0]:
+                    lines.append("")
+                lines.append("# Details")
+                lines.extend("  " + ln for ln in res[1].split("\n"))
+            lines.append("")
+        # Number the thread pre-order, matching the HTML nesting order.
+        nums = {}
+        counter = [0]
+
+        def assign(m, parent_id):
+            counter[0] += 1
+            nums[m["id"]] = (counter[0], parent_id and nums[parent_id][0])
+            for c in m["children"]:
+                assign(c, m["id"])
+
+        for root in version_roots:
+            assign(root, None)
+        for root in version_roots:
+            render_text_message(lines, root, nums, 0)
+        sections.append("\n".join(lines))
+    return "\n\n".join(sections) + ("\n" if sections else "")
+
 
 
 def main(argv=None):
