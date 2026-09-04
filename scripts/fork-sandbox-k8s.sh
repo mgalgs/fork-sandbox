@@ -64,9 +64,13 @@
 # wait is run's second phase on its own: it polls the same sentinel and,
 # on success, prints the agent's exit code to stdout -- and nothing else to
 # stdout -- and exits 0. A non-zero exit from wait means the wait itself
-# failed (dead pod, timeout, malformed sentinel), never the agent's exit
-# status: an agent that ran to completion and exited 3 is a successful wait
-# that prints 3.
+# failed, never the agent's exit status: an agent that ran to completion
+# and exited 3 is a successful wait that prints 3. A caller probing in a
+# loop must read the code: exit 2 is TERMINAL -- the run can never
+# complete through this wait again (pod Failed, pod Succeeded and exited,
+# job Failed condition, pod gone, malformed sentinel) -- give the run up;
+# exit 1 is the probe's own deadline with the run possibly still going (or
+# a usage error): probe again.
 #
 # collect is run's third and last phase on its own: it reads the review
 # loop's outcome (only when --review-loop N is given and non-zero), pulls
@@ -2298,9 +2302,14 @@ cmd_rm() {
 # every message in this function goes to stderr, and stdout is unused by
 # every other verb in this script, which is what makes it available as the
 # machine-readable channel. The distinction that makes this verb worth
-# having: a non-zero exit means the WAIT failed (dead pod, timeout, garbage
-# sentinel). An agent that ran to completion and exited 3 is a successful
-# wait that prints 3 and exits 0.
+# having: a non-zero exit means the WAIT failed, never the agent's exit
+# status -- an agent that ran to completion and exited 3 is a successful
+# wait that prints 3 and exits 0. The code carries a second,
+# machine-readable distinction a probe loop depends on: exit 2 is
+# TERMINAL (the pod is dead, gone, or its sentinel unusable -- no further
+# wait can succeed, and whatever is left in the pod is at best already
+# fetched), while exit 1 is the probe's own deadline (the run may still be
+# going) or a usage error.
 cmd_wait() {
     local timeout=3600 branch="" project_path="${project_path-}"
     while (( $# )); do
@@ -2330,7 +2339,7 @@ cmd_wait() {
     if [[ -z "$pod_name" ]]; then
         echo "Error: no pod found for branch '$branch' (job $safe_name). It may" >&2
         echo "have already been fetched and removed, or the run never started." >&2
-        exit 1
+        exit 2
     fi
 
     echo "fork-sandbox-k8s: waiting for branch $branch to finish (polling" >&2
@@ -2372,7 +2381,7 @@ cmd_wait() {
             echo "fork-sandbox-k8s: the job and pod are left in place for" >&2
             echo "inspection. Remove them with:" >&2
             echo "  fork-sandbox-k8s.sh rm --branch $branch" >&2
-            exit 1
+            exit 2
         fi
         if [[ "$phase" == Succeeded ]]; then
             echo "Error: pod $pod_name is Succeeded -- the run completed and" >&2
@@ -2387,7 +2396,7 @@ cmd_wait() {
             echo "work cannot be recovered through fetch. Remove the job and pod" >&2
             echo "with:" >&2
             echo "  fork-sandbox-k8s.sh rm --branch $branch" >&2
-            exit 1
+            exit 2
         fi
         job_failed="$(kubectl get job "$safe_name" \
             -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null || true)"
@@ -2398,7 +2407,7 @@ cmd_wait() {
             echo "fork-sandbox-k8s: the job and pod are left in place for" >&2
             echo "inspection. Remove them with:" >&2
             echo "  fork-sandbox-k8s.sh rm --branch $branch" >&2
-            exit 1
+            exit 2
         fi
 
         now=$(date +%s)
@@ -2430,7 +2439,7 @@ cmd_wait() {
         echo "  fork-sandbox-k8s.sh fetch --branch $branch${project_path:+ $project_path}" >&2
         echo "and clean up afterwards with:" >&2
         echo "  fork-sandbox-k8s.sh rm --branch $branch" >&2
-        exit 1
+        exit 2
     fi
     local agent_rc="$run_complete"
 

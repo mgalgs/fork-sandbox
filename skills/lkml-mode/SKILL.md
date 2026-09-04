@@ -298,7 +298,12 @@ the container is gone neither the branch nor the outbox can be pulled
 back, so a seat that finished before its turn came in a sequential
 wait would be lost for good. On the deadline the round warns,
 harvests what has been collected, and names the still-running seats
-and the `collect` command to finish them by hand.
+and the `collect` command to finish them by hand. A seat whose pod
+dies or exits before it is collected is the same data-loss, seen from
+the other side: the moment the probe's `wait` reports it dead, the
+round marks the seat lost, stops probing it, says so plainly, and
+fails the round -- it does not re-probe a corpse to the deadline and
+then call it "still running".
 
 Each seat's replies are pulled back to its own outbox directory
 (named after its branch under
@@ -311,7 +316,9 @@ sealed local endpoint; the endpoint reaches the same self-hosted model
 through the in-cluster proxy), so those seats stay zero-cost; a
 `claude` seat runs unchanged against its own per-run proxy. Any other
 harness (e.g. `codex`) refuses the whole round in the seats pre-pass,
-before any seat is submitted.
+before any seat is submitted. A persona's `thinking:` cannot be
+expressed in a cluster `submit` (there is no pi-args channel), so it
+is dropped for cluster seats and the drop is announced per seat.
 
 A cluster run has no `summary.json`, so a seat that names no model
 posts its replies stamped with `unknown`, and the seat's

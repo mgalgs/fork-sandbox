@@ -622,12 +622,22 @@ for persona in "${personas[@]}"; do
         # seat's replies and stamp them all with whichever persona was
         # harvested first.
         outbox_of["$persona"]="/var/tmp/claude-scratch/forks/lkml-round-k8s/$branch/outbox"
+        if (( ${#pi_args[@]} > 0 )); then
+            # `submit` has no pi-args channel (it has no --pi-args
+            # option), so a persona's `thinking:` cannot be expressed
+            # for a cluster seat: drop it and say so, as the local path
+            # drops it for a non-pi harness -- and drop the launch-line
+            # mention with it, or the announce would claim a setting
+            # the seat does not run with.
+            echo "fork-sandbox lkml-round: seat $persona: thinking $thinking cannot be expressed on the cluster (submit has no pi-args channel); the seat runs without it." >&2
+            pi_args=()
+            thinking_note=""
+        fi
         submit_argv=(submit --branch "$branch" --harness "$harness" --checkout "$checkout_ref")
         [[ -n "$model" ]] && submit_argv+=(--model "$model")
         # pi (and a translated pi-local) seat is wired to the endpoint;
         # a claude seat runs against its own per-run proxy and is not.
         [[ "$harness" == "pi" ]] && submit_argv+=(--endpoint "$endpoint")
-        (( ${#pi_args[@]} > 0 )) && submit_argv+=("${pi_args[@]}")
         submit_argv+=("$project" "$handoff_file")
 
         echo "fork-sandbox lkml-round: submitting $persona ($harness${model:+/$model}$thinking_note) to the cluster as $branch..." >&2
@@ -708,7 +718,15 @@ if (( k8s )); then
     echo "fork-sandbox lkml-round: ${#branch_of[@]} seat(s) submitted; collecting each as it completes (deadline ${timeout}s)..." >&2
     while true; do
         pending=()
+        # The branch_of keys were built from TRIMMED CSV entries (every
+        # other loop here trims each entry before using it), so this
+        # lookup must trim too: an un-trimmed " security" never matches
+        # its trimmed key, that seat is never probed or collected, and
+        # the round would exit 0 with its replies silently lost.
         for persona in "${personas[@]}"; do
+            persona="${persona#"${persona%%[![:space:]]*}"}"
+            persona="${persona%"${persona##*[![:space:]]}"}"
+            [[ -n "$persona" ]] || continue
             [[ -n "${branch_of[$persona]:-}" ]] || continue
             [[ -n "${k8s_collected[$persona]:-}" || -n "${k8s_failed[$persona]:-}" ]] && continue
             pending+=("$persona")
@@ -728,11 +746,18 @@ if (( k8s )); then
             branch="${branch_of[$persona]}"
             # A probe, not a real wait: on success it prints the
             # agent's exit code alone and exits 0 (an agent that
-            # exited 3 is a successful wait printing 3); a non-zero
-            # exit means the wait itself failed (still running at the
-            # probe timeout, dead pod, ...) and the seat is simply
-            # probed again next cycle.
-            if agent_code="$(fork-sandbox-k8s.sh wait --branch "$branch" --timeout "$k8s_probe_timeout")"; then
+            # exited 3 is a successful wait printing 3). Its exit code
+            # then reads as: 2 = TERMINAL -- the pod is dead (Failed,
+            # or Succeeded and exited past its TTL), gone, or its
+            # sentinel unusable; nothing can reach what is left in it,
+            # so the seat is marked lost and never probed again. Any
+            # other non-zero exit is the probe's own deadline: the run
+            # may still be going, and the seat is simply probed again
+            # next cycle. wait's own pod-specific diagnosis is already
+            # on stderr.
+            wait_rc=0
+            agent_code="$(fork-sandbox-k8s.sh wait --branch "$branch" --timeout "$k8s_probe_timeout")" || wait_rc=$?
+            if (( wait_rc == 0 )); then
                 echo "fork-sandbox lkml-round: $persona finished (agent exit $agent_code); collecting $branch..." >&2
                 # Reviewer seats run no review loop, so no --review-loop
                 # here; if submit is ever given one, the same value must
@@ -745,6 +770,10 @@ if (( k8s )); then
                     k8s_failed["$persona"]=1
                     launch_failed=1
                 fi
+            elif (( wait_rc == 2 )); then
+                echo "Error: $persona's job (branch $branch) cannot finish -- see wait's diagnosis above; its replies will not be harvested this round." >&2
+                k8s_failed["$persona"]=1
+                launch_failed=1
             fi
         done
     done

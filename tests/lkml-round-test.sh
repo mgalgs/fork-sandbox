@@ -518,6 +518,16 @@ case "$verb" in
         echo "stub fork-sandbox-k8s: submitted $branch" >&2
         ;;
     wait)
+        for dead in ${STUB_K8S_DEAD:-}; do
+            if [[ "$dead" == "$persona" ]]; then
+                # The real wait exits 2 (not 1) when the run can never
+                # complete again: pod Failed/Succeeded, job Failed,
+                # pod gone, malformed sentinel. A dead seat is not
+                # "still running".
+                echo "stub fork-sandbox-k8s: pod for $branch is Succeeded -- the run completed and its container has since exited" >&2
+                exit 2
+            fi
+        done
         counter_file="$state_dir/$persona.wait-count"
         c=0
         [[ -f "$counter_file" ]] && c="$(cat "$counter_file")"
@@ -565,13 +575,17 @@ k8s_state="$(mktemp -d)"; tmpdirs+=("$k8s_state")
 # Submission order is the CSV order: core, pi-local, security. Completion
 # order is deliberately the reverse (core:3, pi-local:2, security:1), so
 # security was submitted last and must be collected first -- the
-# data-loss guard the whole submit-then-probe shape exists for.
+# data-loss guard the whole submit-then-probe shape exists for. The CSV
+# entries carry spaces after their commas on purpose: the map keys the
+# collect loop looks up (branch_of & co) are built from TRIMMED names, so
+# any loop that iterates the raw, un-trimmed CSV silently skips every
+# seat but the first.
 out_k8s="$(PATH="$stub_bin:$PATH" STUB_CAPTURE_DIR="$cap_k8s" STUB_RUN_PREFIX="$run_prefix_dir" \
     STUB_K8S_CAPTURE_DIR="$cap_k8s" STUB_K8S_STATE_DIR="$k8s_state" \
     STUB_K8S_DONE_AFTER="core:3 pi-local:2 security:1" \
     STUB_REPLY_TO="$patch2_id" STUB_REPLY_TO_BRACKETED="$patch_id_bracketed" \
     "$round" widget-frob --project "$project_dir" --checkout otherbranch \
-    --personas core,pi-local,security --personas-dir "$work" \
+    --personas "core, pi-local, security" --personas-dir "$work" \
     --reply-to "$patch2_id" --no-summarize --timeout 10 \
     --k8s --endpoint test-endpoint 2>&1)"
 rc_k8s=$?
@@ -619,7 +633,20 @@ case "$pi_submit_argv" in
     *) ok "pi-local is translated to pi on the cluster path" ;;
 esac
 contains "the translated pi seat is wired to the endpoint" "$pi_submit_argv" "--endpoint test-endpoint"
-contains "pi-local's thinking still reaches pi's args" "$pi_submit_argv" "--pi-args --thinking low"
+# `submit` has no --pi-args option, so the persona's thinking: cannot be
+# forwarded to the cluster: the seat must be submitted WITHOUT it (the old
+# code appended it and submit hard-refused the whole submit) and the drop
+# must be announced instead of silent.
+case "$pi_submit_argv" in
+    *"--pi-args"*) no "the cluster submit carries no --pi-args (submit has no such option)" "$pi_submit_argv" ;;
+    *) ok "the cluster submit carries no --pi-args (submit has no such option)" ;;
+esac
+contains "the dropped thinking is announced for the cluster seat" "$out_k8s" \
+    "seat pi-local: thinking low cannot be expressed on the cluster"
+case "$out_k8s" in
+    *"submitting pi-local (pi, thinking low)"*) no "the submit line does not claim a thinking the seat does not run with" ;;
+    *) ok "the submit line does not claim a thinking the seat does not run with" ;;
+esac
 case "$pi_submit_argv" in
     *"--model"*) no "the translated pi seat carries no model" "$pi_submit_argv" ;;
     *) ok "the translated pi seat carries no model" ;;
@@ -679,6 +706,42 @@ n_local_launches="$(find "$cap_k8s" -name '*.task-meta.json' | wc -l | tr -d '[:
 check "the k8s round never touches the local launcher" "0" "$n_local_launches"
 contains "the pi-local translation is announced on stderr" "$out_k8s" \
     "seat pi-local: pi-local runs as pi via endpoint 'test-endpoint' on the cluster"
+
+printf '\n== --k8s: a dead pod is marked lost, not re-probed ==\n'
+# A seat whose pod died (or Succeeded and exited past its TTL): the
+# real wait exits 2, the terminal code, and the round must mark the
+# seat lost and STOP probing it -- not re-probe a corpse to the deadline
+# and then call it "still running" and advise a collect that cannot
+# work. core completes normally in the same round, so the round must
+# still harvest what it can and fail on the lost seat. (This run also
+# uses spaces in the CSV, the same shape the main k8s run above uses.)
+cap_k8s_dead="$(mktemp -d)"; tmpdirs+=("$cap_k8s_dead")
+k8s_state_dead="$(mktemp -d)"; tmpdirs+=("$k8s_state_dead")
+out_k8s_dead="$(PATH="$stub_bin:$PATH" STUB_CAPTURE_DIR="$cap_k8s_dead" STUB_RUN_PREFIX="$run_prefix_dir" \
+    STUB_K8S_CAPTURE_DIR="$cap_k8s_dead" STUB_K8S_STATE_DIR="$k8s_state_dead" \
+    STUB_K8S_DONE_AFTER="core:1" STUB_K8S_DEAD="security" \
+    STUB_REPLY_TO="$patch2_id" STUB_REPLY_TO_BRACKETED="$patch_id_bracketed" \
+    "$round" widget-frob --project "$project_dir" --checkout otherbranch \
+    --personas "core, security" --personas-dir "$work" \
+    --reply-to "$patch2_id" --no-summarize --timeout 10 \
+    --k8s --endpoint test-endpoint 2>&1)"
+rc_k8s_dead=$?
+if (( rc_k8s_dead != 0 )); then ok "a dead seat fails the round"; else no "a dead seat fails the round" "exit 0: $out_k8s_dead"; fi
+contains "the dead seat is named in the round's error" "$out_k8s_dead" "security's job"
+contains "the dead seat's loss is stated" "$out_k8s_dead" "will not be harvested"
+n_waits_dead="$(grep -c '^wait security' "$cap_k8s_dead/call-order" 2>/dev/null)"; n_waits_dead="${n_waits_dead:-0}"
+check "the dead seat was probed exactly once, then dropped" "1" "$n_waits_dead"
+n_collects_dead="$(grep -c '^collect security' "$cap_k8s_dead/call-order" 2>/dev/null)"; n_collects_dead="${n_collects_dead:-0}"
+check "the dead seat was never collected" "0" "$n_collects_dead"
+n_collects_live="$(grep -c '^collect core' "$cap_k8s_dead/call-order" 2>/dev/null)"; n_collects_live="${n_collects_live:-0}"
+check "the live seat in the same round was still collected" "1" "$n_collects_live"
+case "$out_k8s_dead" in
+    *"is still running"*) no "the dead seat is not reported as still running at the deadline" "$(grep 'still running' <<<"$out_k8s_dead")" ;;
+    *) ok "the dead seat is not reported as still running at the deadline" ;;
+esac
+k8s_tree_dead="$("$mailbox" tree widget-frob)"
+check "the live seat's reply still landed alongside the dead seat" "2" \
+    "$(printf '%s\n' "$k8s_tree_dead" | grep -c 'k8s core reply')"
 
 printf '\n== --k8s validation ==\n'
 cap_k8s_noe="$(mktemp -d)"; tmpdirs+=("$cap_k8s_noe")

@@ -88,9 +88,14 @@ at a time.
 same timeout, pod-death and job-failure detection, and on success prints
 the agent's exit code to stdout — and nothing else to stdout — and exits
 0. A non-zero exit from `wait` is reserved for the wait itself having
-failed (dead pod, timeout, malformed sentinel): an agent that ran to
-completion and exited 3 is a *successful* `wait` that prints `3`, the
-same distinction a local harness makes between the run and its child.
+failed, never the agent's exit status: an agent that ran to completion
+and exited 3 is a *successful* `wait` that prints `3`, the same
+distinction a local harness makes between the run and its child. A
+caller probing in a loop must read the code: exit `2` is *terminal* —
+the run can never complete through this `wait` again (pod `Failed`, pod
+`Succeeded` and exited, Job `Failed` condition, pod gone, malformed
+sentinel) — give the run up; exit `1` is the probe's own deadline with
+the run possibly still going, or a usage error — probe again.
 
 Because a *standalone* `wait` may begin after the run already finished,
 it also treats a `Succeeded` pod as terminal: at that point the entrypoint

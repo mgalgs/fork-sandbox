@@ -36,8 +36,10 @@
 #     stubbed kubectl pair: a completed wait prints the agent's exit code
 #     to stdout and nothing else (a non-zero AGENT exit is a successful
 #     wait that exits 0), while a Failed pod, a Succeeded pod (run
-#     completed, then idled out its TTL), a Failed job condition, a
-#     timeout and a malformed sentinel each fail the wait itself; collect
+#     completed, then idled out its TTL), a Failed job condition and a
+#     malformed sentinel each fail the wait with the terminal code 2
+#     (the run can never complete through it again) and a timeout fails
+#     it with code 1 (the run may still be going); collect
 #     lands the outbox at --outbox-dir, refuses an over-cap one without
 #     costing the fetch, warns on an unreadable one and still fetches,
 #     reports an approved and a cap review-loop outcome under
@@ -2476,66 +2478,65 @@ else
     no "a completed wait prints the agent exit code to stdout, alone" "wait exited nonzero: $(cat "$wait_err1")"
 fi
 
-# 2. A Failed pod: the wait itself fails, naming the pod.
+# 2. A Failed pod: the wait itself fails with the TERMINAL code 2 (the
+# run can never complete through this wait again -- a probe loop must
+# give the seat up, not re-probe it), naming the pod.
 wait_log2="$(newdir)/kubectl.log"; wait_out2="$(newdir)/out2.txt"; wait_err2="$(newdir)/err2.txt"
 tmpdirs+=("$(dirname "$wait_log2")")
-if K8S_STUB_POD_PHASE=Failed \
+rc=0
+K8S_STUB_POD_PHASE=Failed \
     waitstub_wait "$wait_log2" "$wait_out2" "$wait_err2" \
-    --branch fs-k8s-test-wait-podfailed --timeout 5; then
-    no "a Failed pod fails the wait" "wait unexpectedly succeeded"
+    --branch fs-k8s-test-wait-podfailed --timeout 5 || rc=$?
+if (( rc == 2 )) && grep -q 'pod stub-pod is Failed -- it died before writing' "$wait_err2"; then
+    ok "a Failed pod fails the wait with the terminal code 2"
 else
-    if grep -q 'pod stub-pod is Failed -- it died before writing' "$wait_err2"; then
-        ok "a Failed pod fails the wait"
-    else
-        no "a Failed pod fails the wait" "$(cat "$wait_err2")"
-    fi
+    no "a Failed pod fails the wait with the terminal code 2" "rc=$rc: $(cat "$wait_err2")"
 fi
 
-# 3. A Failed job condition: the wait itself fails, naming the job.
+# 3. A Failed job condition: the wait itself fails with the terminal
+# code 2, naming the job.
 wait_log3="$(newdir)/kubectl.log"; wait_out3="$(newdir)/out3.txt"; wait_err3="$(newdir)/err3.txt"
 tmpdirs+=("$(dirname "$wait_log3")")
-if K8S_STUB_JOB_FAILED=True \
+rc=0
+K8S_STUB_JOB_FAILED=True \
     waitstub_wait "$wait_log3" "$wait_out3" "$wait_err3" \
-    --branch fs-k8s-test-wait-jobfailed --timeout 5; then
-    no "a Failed job condition fails the wait" "wait unexpectedly succeeded"
+    --branch fs-k8s-test-wait-jobfailed --timeout 5 || rc=$?
+if (( rc == 2 )) && grep -q 'reports a Failed condition' "$wait_err3"; then
+    ok "a Failed job condition fails the wait with the terminal code 2"
 else
-    if grep -q 'reports a Failed condition' "$wait_err3"; then
-        ok "a Failed job condition fails the wait"
-    else
-        no "a Failed job condition fails the wait" "$(cat "$wait_err3")"
-    fi
+    no "a Failed job condition fails the wait with the terminal code 2" "rc=$rc: $(cat "$wait_err3")"
 fi
 
-# 4. No sentinel by the deadline: the wait itself fails with the fetch-by
-# hand advice. --timeout 0 trips on the first probe, so no 10s poll sleep.
+# 4. No sentinel by the deadline: the wait itself fails with code 1 --
+# NOT the terminal 2, because the run may still be going and a probe
+# loop must try again -- with the fetch-by-hand advice. --timeout 0
+# trips on the first probe, so no 10s poll sleep.
 wait_log4="$(newdir)/kubectl.log"; wait_out4="$(newdir)/out4.txt"; wait_err4="$(newdir)/err4.txt"
 tmpdirs+=("$(dirname "$wait_log4")")
-if waitstub_wait "$wait_log4" "$wait_out4" "$wait_err4" \
-    --branch fs-k8s-test-wait-timeout --timeout 0; then
-    no "a timed-out wait fails" "wait unexpectedly succeeded"
+rc=0
+waitstub_wait "$wait_log4" "$wait_out4" "$wait_err4" \
+    --branch fs-k8s-test-wait-timeout --timeout 0 || rc=$?
+if (( rc == 1 )) && grep -q 'timed out after 0s waiting for branch' "$wait_err4" \
+    && grep -q 'Fetch by hand once it' "$wait_err4"; then
+    ok "a timed-out wait fails with code 1 and the fetch-by-hand advice"
 else
-    if grep -q 'timed out after 0s waiting for branch' "$wait_err4" \
-        && grep -q 'Fetch by hand once it' "$wait_err4"; then
-        ok "a timed-out wait fails with the fetch-by-hand advice"
-    else
-        no "a timed-out wait fails with the fetch-by-hand advice" "$(cat "$wait_err4")"
-    fi
+    no "a timed-out wait fails with code 1 and the fetch-by-hand advice" "rc=$rc: $(cat "$wait_err4")"
 fi
 
-# 5. A malformed sentinel: the wait itself fails rather than guessing.
+# 5. A malformed sentinel: the wait fails rather than guessing, with the
+# terminal code 2 (the sentinel will not repair itself; no further wait
+# can succeed).
 wait_log5="$(newdir)/kubectl.log"; wait_out5="$(newdir)/out5.txt"; wait_err5="$(newdir)/err5.txt"
 tmpdirs+=("$(dirname "$wait_log5")")
-if K8S_STUB_RUN_COMPLETE='not-a-number' K8S_STUB_SENTINEL_RC=0 \
+rc=0
+K8S_STUB_RUN_COMPLETE='not-a-number' K8S_STUB_SENTINEL_RC=0 \
     waitstub_wait "$wait_log5" "$wait_out5" "$wait_err5" \
-    --branch fs-k8s-test-wait-malformed --timeout 5; then
-    no "a malformed sentinel fails the wait" "wait unexpectedly succeeded"
+    --branch fs-k8s-test-wait-malformed --timeout 5 || rc=$?
+if (( rc == 2 )) && grep -q 'does not hold an' "$wait_err5" \
+    && grep -q "integer exit code (got: 'not-a-number')" "$wait_err5"; then
+    ok "a malformed sentinel fails the wait with the terminal code 2"
 else
-    if grep -q 'does not hold an' "$wait_err5" \
-        && grep -q "integer exit code (got: 'not-a-number')" "$wait_err5"; then
-        ok "a malformed sentinel fails the wait"
-    else
-        no "a malformed sentinel fails the wait" "$(cat "$wait_err5")"
-    fi
+    no "a malformed sentinel fails the wait with the terminal code 2" "rc=$rc: $(cat "$wait_err5")"
 fi
 
 # 6. A Succeeded pod: the run finished and its container has since exited
@@ -2547,19 +2548,17 @@ fi
 # by-hand steps left are the logs pointer and the rm.
 wait_log6="$(newdir)/kubectl.log"; wait_out6="$(newdir)/out6.txt"; wait_err6="$(newdir)/err6.txt"
 tmpdirs+=("$(dirname "$wait_log6")")
-if K8S_STUB_POD_PHASE=Succeeded \
+rc=0
+K8S_STUB_POD_PHASE=Succeeded \
     waitstub_wait "$wait_log6" "$wait_out6" "$wait_err6" \
-    --branch fs-k8s-test-wait-podsucceeded --timeout 0; then
-    no "a Succeeded pod fails the wait" "wait unexpectedly succeeded"
+    --branch fs-k8s-test-wait-podsucceeded --timeout 0 || rc=$?
+if (( rc == 2 )) && grep -q 'pod stub-pod is Succeeded -- the run completed and' "$wait_err6" \
+    && grep -q 'unreachable through this tool' "$wait_err6" \
+    && ! grep -q 'fetch --branch' "$wait_err6" \
+    && ! grep -q 'timed out' "$wait_err6"; then
+    ok "a Succeeded pod fails the wait with the terminal code 2, without fetch advice"
 else
-    if grep -q 'pod stub-pod is Succeeded -- the run completed and' "$wait_err6" \
-        && grep -q 'unreachable through this tool' "$wait_err6" \
-        && ! grep -q 'fetch --branch' "$wait_err6" \
-        && ! grep -q 'timed out' "$wait_err6"; then
-        ok "a Succeeded pod fails the wait without fetch advice"
-    else
-        no "a Succeeded pod fails the wait without fetch advice" "$(cat "$wait_err6")"
-    fi
+    no "a Succeeded pod fails the wait with the terminal code 2, without fetch advice" "rc=$rc: $(cat "$wait_err6")"
 fi
 
 printf '\n== fork-sandbox-k8s.sh collect: direct drive vs stubbed kubectl ==\n'
