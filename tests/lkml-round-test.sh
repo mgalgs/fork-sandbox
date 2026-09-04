@@ -429,5 +429,13 @@ contains "the missing-summarizer error names --no-summarize" "$out_missing" "--n
 n_launches=$(find "$cap_missing" -name '*.task-meta.json' | wc -l)
 check "a missing summarizer launches no personas" "0" "$n_launches"
 
+printf '\n== --help ==\n'
+h_out="$("$round" --help 2>&1)"; h_rc=$?
+if (( h_rc == 0 )); then ok "--help alone exits 0"; else no "--help alone exits 0" "exit $h_rc: $h_out"; fi
+contains "--help prints the header usage" "$h_out" "lkml-round.sh — Launch one fork-sandbox run per persona"
+h2_out="$("$round" -h 2>&1)"; h2_rc=$?
+if (( h2_rc == 0 )); then ok "-h alone exits 0"; else no "-h alone exits 0" "exit $h2_rc: $h2_out"; fi
+contains "-h prints the header usage" "$h2_out" "lkml-round.sh — Launch one fork-sandbox run per persona"
+
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 (( fail == 0 )) || exit 1
