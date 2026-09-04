@@ -112,6 +112,19 @@
 #     guards (well-formed, absolute path, `..`, symlink, hard link,
 #     over-cap, an existing DEST_DIR) are covered in its own section above,
 #     the pod-side half of this same mechanism.
+#   - `--checkout REF` on submit and run: the push's source side is no
+#     longer hardcoded to HEAD. A resolvable ref renders (exits 0) under
+#     --dry-run; an unresolvable one fails with the ref named and the
+#     stubbed kubectl's own log still empty (nothing created), under
+#     --dry-run and not; a value with a single quote is refused by
+#     fs_reject_unsafe_chars before any kubectl call, like every other
+#     rejected input; the push refspec carries the resolved sha of the
+#     named ref (not HEAD), and the push line reports it; under
+#     --review-loop, the BASE_SHA the loop measures against is that same
+#     sha; without the flag the refspec and the base are HEAD, exactly as
+#     before; and `fork-sandbox.sh --k8s --checkout REF` is no longer
+#     refused -- it forwards the flag, and its render matches a direct
+#     `run --dry-run --checkout REF` byte-for-byte.
 #   - K8S_PROXY_ENDPOINTS, the named-keyless-endpoint registry: a legacy
 #     K8S_PROXY_UPSTREAM install renders byte-identical to
 #     tests/fixtures/k8s-proxy-legacy-install.yaml, a render captured before
@@ -3357,11 +3370,9 @@ refuses "--k8s --keep-session is refused" \
     --harness pi --model moonshotai/kimi-k3 --keep-session \
     unused-project unused-handoff
 
-refuses "--k8s --checkout is refused as not yet supported" \
-    "--checkout is not yet supported with --k8s" \
-    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
-    --harness pi --model moonshotai/kimi-k3 --checkout HEAD \
-    unused-project unused-handoff
+# --checkout is carried through, not refused -- its own section below
+# drives both verbs, stubbed, and proves the flag reaches the dispatcher's
+# render.
 refuses "--k8s --pi-args is refused as not yet supported" \
     "--pi-args is not yet supported with --k8s" \
     env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
@@ -3692,6 +3703,220 @@ else
     no "--k8s accepts --outbox-dir" "$(cat /tmp/fs-k8s-flag-test-outboxdir.err)"
 fi
 rm -f /tmp/fs-k8s-flag-test-outboxdir.err
+
+printf '\n== --checkout: a named ref as the branch start (no cluster) ==\n'
+# The push's source side was hardcoded HEAD, so a cluster run could only
+# start from the origin repo's current HEAD. --checkout REF must instead
+# resolve REF in the origin repo BEFORE anything is created, and push the
+# resolved sha -- the one the push line reports and the review loop
+# measures against. Driven with a stubbed kubectl (logs every invocation)
+# and a stubbed git (records the push's own arguments, otherwise the real
+# git): that pair is what makes "nothing was created" assertable against
+# the stub's own log rather than by eyeballing the output.
+co_proj="$(mktemp -d "$HOME/src/fs-k8s-checkout-test.XXXXXX")"; tmpdirs+=("$co_proj")
+(
+    cd "$co_proj" \
+        && git init -q . \
+        && git config user.email t@fork-sandbox.invalid \
+        && git config user.name Tester \
+        && printf 'one\n' > file.txt \
+        && git add file.txt \
+        && git commit -q -m one \
+        && git tag fs-k8s-checkout-v1 \
+        && printf 'two\n' >> file.txt \
+        && git add file.txt \
+        && git commit -q -m two
+) >/dev/null 2>&1
+co_tag="fs-k8s-checkout-v1"
+co_tag_sha="$(git -C "$co_proj" rev-parse "${co_tag}^{commit}")"
+co_head_sha="$(git -C "$co_proj" rev-parse HEAD)"
+if [[ -n "$co_tag_sha" && "$co_tag_sha" != "$co_head_sha" ]]; then
+    ok "the checkout fixture's tag is a commit distinct from HEAD"
+else
+    no "the checkout fixture's tag is a commit distinct from HEAD" \
+        "tag=$co_tag_sha head=$co_head_sha"
+fi
+co_stub="$(newdir)"; tmpdirs+=("$co_stub")
+cat > "$co_stub/git" <<'STUB'
+#!/usr/bin/env bash
+case " $* " in
+    *" push "*) printf '%s\n' "$*" >> "$GIT_STUB_LOG"; exit 0 ;;
+esac
+exec /usr/bin/git "$@"
+STUB
+cat > "$co_stub/kubectl" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$K8S_STUB_LOG"
+case " $* " in
+    *" apply -f -"*) cat >/dev/null; exit 0 ;;
+    *" wait "*) exit 0 ;;
+    *" get "*) printf 'stub-pod\n' ;;
+esac
+exit 0
+STUB
+chmod +x "$co_stub/git" "$co_stub/kubectl"
+
+# 1. A ref that resolves renders cleanly under --dry-run, which touches
+# nothing beyond the validation this flag lives in.
+co_out1="$(newdir)/co-1.yaml"; tmpdirs+=("$(dirname "$co_out1")")
+if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-co-dryrun --model moonshotai/kimi-k3 --checkout "$co_tag" \
+    "$co_proj" "$handoff_file" > "$co_out1" 2>&1; then
+    ok "submit --dry-run --checkout with a resolvable ref exits 0"
+else
+    no "submit --dry-run --checkout with a resolvable ref exits 0" "$(cat "$co_out1")"
+fi
+
+# 2. The important one: a ref that does NOT resolve must fail, name the
+# ref, and create nothing -- asserted against the stub kubectl's own log
+# (it records every invocation) and the stub git's push log, on the
+# NON-dry-run path where a Job, Secret and proxy Pod would otherwise go
+# down.
+co_dir2="$(newdir)"; tmpdirs+=("$co_dir2")
+PATH="$co_stub:$PATH" K8S_STUB_LOG="$co_dir2/kubectl.log" GIT_STUB_LOG="$co_dir2/git.log" \
+    FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit \
+    --branch fs-k8s-test-co-badref --model moonshotai/kimi-k3 \
+    --checkout fs-k8s-checkout-nosuch \
+    "$co_proj" "$handoff_file" > "$co_dir2/out.txt" 2>&1
+co_rc2=$?
+if (( co_rc2 != 0 )) \
+    && [[ "$(cat "$co_dir2/out.txt")" == *"fs-k8s-checkout-nosuch"* && "$(cat "$co_dir2/out.txt")" == *"does not name a commit"* ]] \
+    && [[ ! -s "$co_dir2/kubectl.log" && ! -s "$co_dir2/git.log" ]]; then
+    ok "submit --checkout with an unresolvable ref fails with the ref named and creates nothing (stub logs empty)"
+else
+    no "submit --checkout with an unresolvable ref fails with the ref named and creates nothing (stub logs empty)" \
+        "rc=$co_rc2 kubectl=$(cat "$co_dir2/kubectl.log") git=$(cat "$co_dir2/git.log") out=$(cat "$co_dir2/out.txt")"
+fi
+# The same refusal holds under --dry-run: the check is validation, and
+# --dry-run exists to exercise exactly those.
+refuses "submit --dry-run --checkout with an unresolvable ref is refused before the render" \
+    "does not name a commit" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-co-dryrun-bad --model moonshotai/kimi-k3 \
+    --checkout fs-k8s-checkout-nosuch \
+    "$co_proj" "$handoff_file"
+
+# 3. A value with a single quote is refused by fs_reject_unsafe_chars, the
+# same way the suite already tests other rejected inputs -- on the
+# non-dry-run path, with the stub's log still empty: the value is
+# interpolated into a git command line, so it is treated as hostile.
+co_dir3="$(newdir)"; tmpdirs+=("$co_dir3")
+PATH="$co_stub:$PATH" K8S_STUB_LOG="$co_dir3/kubectl.log" GIT_STUB_LOG="$co_dir3/git.log" \
+    FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit \
+    --branch fs-k8s-test-co-quote --model moonshotai/kimi-k3 \
+    --checkout "no'such-ref" \
+    "$co_proj" "$handoff_file" > "$co_dir3/out.txt" 2>&1
+co_rc3=$?
+if (( co_rc3 != 0 )) && [[ "$(cat "$co_dir3/out.txt")" == *"single quote"* ]] \
+    && [[ ! -s "$co_dir3/kubectl.log" && ! -s "$co_dir3/git.log" ]]; then
+    ok "submit --checkout with a single quote is refused before any kubectl call"
+else
+    no "submit --checkout with a single quote is refused before any kubectl call" \
+        "rc=$co_rc3 kubectl=$(cat "$co_dir3/kubectl.log") out=$(cat "$co_dir3/out.txt")"
+fi
+
+# 4. The push refspec carries the RESOLVED SHA of the named ref, not HEAD
+# or the ref name -- read from the stub git's record of the push's own
+# arguments -- and the push line reports the same sha.
+co_dir4="$(newdir)"; tmpdirs+=("$co_dir4")
+PATH="$co_stub:$PATH" K8S_STUB_LOG="$co_dir4/kubectl.log" GIT_STUB_LOG="$co_dir4/git.log" \
+    FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit \
+    --branch fs-k8s-test-co-sha --model moonshotai/kimi-k3 --checkout "$co_tag" \
+    "$co_proj" "$handoff_file" > "$co_dir4/out.txt" 2>&1
+co_rc4=$?
+if (( co_rc4 == 0 )) \
+    && grep -qF -- "$co_tag_sha:refs/heads/fs-k8s-test-co-sha" "$co_dir4/git.log" \
+    && ! grep -qF 'HEAD:refs/heads/' "$co_dir4/git.log" \
+    && [[ "$(cat "$co_dir4/out.txt")" == *"branch starts at $co_tag_sha"* ]]; then
+    ok "the push refspec carries the resolved sha of the named ref, not HEAD, and the push line reports it"
+else
+    no "the push refspec carries the resolved sha of the named ref, not HEAD, and the push line reports it" \
+        "rc=$co_rc4 git=$(cat "$co_dir4/git.log") out=$(cat "$co_dir4/out.txt")"
+fi
+
+# 5. No --checkout: the refspec and the review base are exactly what they
+# are today -- HEAD, resolved the same way.
+co_dir5="$(newdir)"; tmpdirs+=("$co_dir5")
+PATH="$co_stub:$PATH" K8S_STUB_LOG="$co_dir5/kubectl.log" GIT_STUB_LOG="$co_dir5/git.log" \
+    FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit \
+    --branch fs-k8s-test-co-head --model moonshotai/kimi-k3 \
+    "$co_proj" "$handoff_file" > "$co_dir5/out.txt" 2>&1
+co_rc5=$?
+if (( co_rc5 == 0 )) \
+    && grep -qF -- "HEAD:refs/heads/fs-k8s-test-co-head" "$co_dir5/git.log" \
+    && [[ "$(cat "$co_dir5/out.txt")" == *"branch starts at HEAD"* ]]; then
+    ok "no --checkout: the push refspec and the push line are HEAD, exactly as before"
+else
+    no "no --checkout: the push refspec and the push line are HEAD, exactly as before" \
+        "rc=$co_rc5 git=$(cat "$co_dir5/git.log") out=$(cat "$co_dir5/out.txt")"
+fi
+co_out6="$(newdir)/co-6.yaml"; tmpdirs+=("$(dirname "$co_out6")")
+if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-co-rl-checkout --model moonshotai/kimi-k3 \
+    --review-loop 1 --checkout "$co_tag" \
+    "$co_proj" "$handoff_file" > "$co_out6" 2>/dev/null; then
+    ok "submit --dry-run --review-loop 1 --checkout exits 0"
+else
+    no "submit --dry-run --review-loop 1 --checkout exits 0" "$(cat "$co_out6")"
+fi
+if grep -A1 'name: BASE_SHA' "$co_out6" | grep -qF "value: \"$co_tag_sha\""; then
+    ok "under --checkout, the review base is the same revision the push sends"
+else
+    no "under --checkout, the review base is the same revision the push sends" \
+        "$(grep -A1 'name: BASE_SHA' "$co_out6")"
+fi
+co_out7="$(newdir)/co-7.yaml"; tmpdirs+=("$(dirname "$co_out7")")
+if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-co-rl-head --model moonshotai/kimi-k3 \
+    --review-loop 1 \
+    "$co_proj" "$handoff_file" > "$co_out7" 2>/dev/null; then
+    ok "submit --dry-run --review-loop 1 (no --checkout) exits 0"
+else
+    no "submit --dry-run --review-loop 1 (no --checkout) exits 0" "$(cat "$co_out7")"
+fi
+if grep -A1 'name: BASE_SHA' "$co_out7" | grep -qF "value: \"$co_head_sha\""; then
+    ok "no --checkout: the review base is HEAD's sha, exactly as before"
+else
+    no "no --checkout: the review base is HEAD's sha, exactly as before" \
+        "$(grep -A1 'name: BASE_SHA' "$co_out7")"
+fi
+
+# 6. The dispatcher: fork-sandbox.sh --k8s --checkout no longer errors, and
+# the flag actually reaches fork-sandbox-k8s.sh run -- proved the same way
+# this file proves every other carried flag, by diffing the dispatcher's
+# render against a direct run --dry-run with the same arguments. --review-loop
+# rides along so the pushed revision is visible in the render (BASE_SHA):
+# a dispatcher that dropped --checkout would render HEAD's sha, and the tag
+# is a different commit, so the diff would fail.
+co_out8="$(newdir)/co-8.yaml"; tmpdirs+=("$(dirname "$co_out8")")
+if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
+    --harness pi --model moonshotai/kimi-k3 --review-loop 1 --checkout "$co_tag" \
+    --branch fs-k8s-test-co-dispatch \
+    "$co_proj" "$k8s_flag_handoff" \
+    > "$co_out8" 2>/tmp/fs-k8s-co-dispatch.err; then
+    ok "fork-sandbox.sh --k8s --checkout --dry-run is no longer refused"
+else
+    no "fork-sandbox.sh --k8s --checkout --dry-run is no longer refused" \
+        "$(cat /tmp/fs-k8s-co-dispatch.err)"
+fi
+co_out9="$(newdir)/co-9.yaml"; tmpdirs+=("$(dirname "$co_out9")")
+if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" run --dry-run \
+    --branch fs-k8s-test-co-dispatch --model moonshotai/kimi-k3 \
+    --review-loop 1 --checkout "$co_tag" \
+    "$co_proj" "$k8s_flag_handoff" \
+    > "$co_out9" 2>/dev/null; then
+    ok "direct run --dry-run --checkout (matching args) exits 0"
+else
+    no "direct run --dry-run --checkout (matching args) exits 0" "$(cat "$co_out9")"
+fi
+if diff -q "$co_out8" "$co_out9" >/dev/null 2>&1 \
+    && grep -A1 'name: BASE_SHA' "$co_out8" | grep -qF "value: \"$co_tag_sha\""; then
+    ok "--k8s --checkout forwards the flag (render matches the direct run --checkout call, base is the checkout sha)"
+else
+    no "--k8s --checkout forwards the flag (render matches the direct run --checkout call, base is the checkout sha)" \
+        "$(diff "$co_out8" "$co_out9" 2>&1 | head -n 20)"
+fi
+rm -f /tmp/fs-k8s-co-dispatch.err
 
 printf '\n== bare repo HEAD points at the pushed branch before cloning ==\n'
 # cmd_submit only ever pushes refs/heads/$branch into the pod's bare repo,
@@ -4090,7 +4315,7 @@ fi
 # install with a dead endpoint) must surface the container's log -- git's
 # own "connection refused" tells the operator nothing, and nothing else
 # in this script reads the pod log.
-if grep -qF -- '"HEAD:refs/heads/$branch") || push_rc=$?' "$k8s_sh" \
+if grep -qF -- '"$push_src:refs/heads/$branch") || push_rc=$?' "$k8s_sh" \
     && grep -A4 -F 'if (( push_rc != 0 )); then' "$k8s_sh" \
         | grep -qF 'kubectl logs "$pod_name"'; then
     ok "a failed repository push surfaces the pod's container log"
