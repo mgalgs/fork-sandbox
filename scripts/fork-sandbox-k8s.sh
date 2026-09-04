@@ -377,7 +377,7 @@ kubectl() {
 # a fact: it says so explicitly rather than printing an empty block.
 fs_report_captured_stderr() {
     local what="$1" file="$2" size cap=4096
-    size="$(stat -c '%s' -- "$file")"
+    size="$("$FS_STAT" -c '%s' -- "$file")"
     if (( size == 0 )); then
         echo "fork-sandbox-k8s: $what wrote nothing to stderr." >&2
         return 0
@@ -2046,7 +2046,7 @@ EOF
         K8S_SUBMIT_CONTEXT_TAR="$context_tar"
         trap 'rm -f -- "${K8S_SUBMIT_CONTEXT_TAR:-}"' EXIT
         tar cf "$context_tar" -C "$context_ro" .
-        context_size="$(stat -c '%s' -- "$context_tar")"
+        context_size="$("$FS_STAT" -c '%s' -- "$context_tar")"
         if (( context_size > CONTEXT_MAX_BYTES )); then
             echo "Error: --context-ro directory '$context_ro' tars to" >&2
             echo "$context_size bytes, over the $CONTEXT_MAX_BYTES byte" >&2
@@ -2629,7 +2629,7 @@ cmd_collect() {
     # read failure, because by the time head has had to close, outbox_tar
     # is always filled to cap+1 bytes. Only a non-zero pipeline that
     # leaves the tarball under the cap is a genuine read error.
-    if (( $(stat -c '%s' -- "$outbox_tar") > outbox_max_bytes )); then
+    if (( $("$FS_STAT" -c '%s' -- "$outbox_tar") > outbox_max_bytes )); then
         echo "fork-sandbox-k8s: warning: pod $pod_name's outbox is over the $outbox_max_bytes byte cap; refusing to pull it back." >&2
         outbox_ok=false
     elif (( outbox_rc != 0 )); then
