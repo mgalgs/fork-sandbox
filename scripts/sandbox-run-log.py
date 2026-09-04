@@ -35,6 +35,21 @@ Events:
             a runner appends again; queries take the LAST run_end per run id.
   verdict   appended by the orchestrator after review. Also last-wins.
 
+Provenance (source):
+  Every run_end carries `source` -- where the run came from. The launcher's
+  default is "fork-sandbox"; a run launched with
+  FORK_SANDBOX_RUN_SOURCE=<token> (a token matching
+  ^[a-z][a-z0-9-]{0,31}$, validated at launch) carries that token instead.
+  The marker is written by the launching shell into the run directory, which
+  is never bound into the sandbox, so it says where the run came from, not
+  what the run claimed. "test" is what a test suite's fixture runs declare,
+  so fabricated runs do not skew the harness/model numbers the stats exist
+  for: list and stats exclude records whose source is exactly "test" by
+  default, and say on stderr how many they dropped when they drop any.
+  --include-tests shows them. show is unaffected: a test run displays
+  exactly like any other run. Only "test" is hidden -- any other source
+  value appears in the stats by default rather than vanishing silently.
+
 Recommended --task-meta fields (documented here, enforced nowhere):
   kind                implement | fix | refactor | test | docs |
                       investigate | review | pr-review
