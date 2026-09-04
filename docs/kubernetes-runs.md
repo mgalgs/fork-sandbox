@@ -35,7 +35,22 @@ scripts/fork-sandbox-k8s.sh run --branch my-branch --model moonshotai/kimi-k3 \
     ~/src/myproject ~/handoff.md
 ```
 
-`run` is `submit`, then a wait, then `fetch`, then `rm` — it exists so a
+Or, for a fan-out, the phases on their own — submit every run up front,
+wait on them, collect them:
+
+```
+scripts/fork-sandbox-k8s.sh submit --branch my-branch-a --model moonshotai/kimi-k3 \
+    ~/src/myproject ~/handoff-a.md
+scripts/fork-sandbox-k8s.sh submit --branch my-branch-b --model moonshotai/kimi-k3 \
+    ~/src/myproject ~/handoff-b.md
+rc_a=$(scripts/fork-sandbox-k8s.sh wait --branch my-branch-a)
+rc_b=$(scripts/fork-sandbox-k8s.sh wait --branch my-branch-b)
+scripts/fork-sandbox-k8s.sh collect --branch my-branch-a ~/src/myproject
+scripts/fork-sandbox-k8s.sh collect --branch my-branch-b ~/src/myproject
+```
+
+`run` is `submit` + `wait` + `collect`, literally: the second and third
+phases are their own verbs (below) and `run` composes them. It exists so a
 caller never has to hand-roll the polling loop in between `submit` and
 `fetch` themselves. `submit`/`fetch` stay available on their own for the
 case they were built for: starting a run from one place — a workstation
@@ -61,6 +76,29 @@ fetch a half-finished branch and does not remove a still-running pod, and
 its error message prints the exact `fetch` command to run by hand once the
 agent does finish. `--keep` skips the final `rm`, for a caller who wants
 the Job and pod left in place after a successful fetch.
+
+`wait` and `collect` are those second and third phases as first-class
+verbs, and they exist for the fan-out that `run`'s single blocking call
+cannot serve: a caller launching five runs at once wants to submit all
+five, then wait, then collect — and the only way to get the wait and
+collect logic before these verbs existed was to block on `run`, one run
+at a time.
+
+`wait --branch NAME [--timeout SECONDS]` polls the same sentinel with the
+same timeout, pod-death and job-failure detection, and on success prints
+the agent's exit code to stdout — and nothing else to stdout — and exits
+0. A non-zero exit from `wait` is reserved for the wait itself having
+failed (dead pod, timeout, malformed sentinel): an agent that ran to
+completion and exited 3 is a *successful* `wait` that prints `3`, the
+same distinction a local harness makes between the run and its child.
+
+`collect --branch NAME [--outbox-dir DIR] [--outbox-max SIZE]
+[--review-loop N] [--keep] <project-path>` does everything `run` does
+after the wait: the review-loop outcome read (only when `--review-loop N`
+is given and non-zero — an omitted or zero flag reads nothing at all),
+the outbox pull-back, the `fetch`, and the final `rm` (skipped under
+`--keep`). It prints no agent exit code — it does not know it — and the
+`run complete` line stays with `run` for exactly that reason.
 
 `fork-sandbox.sh --k8s` dispatches to exactly this `run` verb: it resolves
 and validates the harness and model the same way a local run does — the
