@@ -3714,7 +3714,15 @@ printf '\n== --checkout: a named ref as the branch start (no cluster) ==\n'
 # git): that pair is what makes "nothing was created" assertable against
 # the stub's own log rather than by eyeballing the output.
 co_proj="$(mktemp -d "$HOME/src/fs-k8s-checkout-test.XXXXXX")"; tmpdirs+=("$co_proj")
+# Built with the operator's global and system git config neutralised. An
+# operator who sets commit.gpgsign or tag.gpgSign (both are common, and both
+# are set on at least one machine this suite runs on) otherwise gets a
+# fixture that fails to build: `git tag <name>` with signing on is an
+# ANNOTATED tag, which dies "fatal: no tag message?" without -m, and the &&
+# chain then silently skips the second commit. The identity below is set
+# locally, so dropping the global config costs the fixture nothing.
 (
+    export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
     cd "$co_proj" \
         && git init -q . \
         && git config user.email t@fork-sandbox.invalid \
@@ -3728,8 +3736,11 @@ co_proj="$(mktemp -d "$HOME/src/fs-k8s-checkout-test.XXXXXX")"; tmpdirs+=("$co_p
         && git commit -q -m two
 ) >/dev/null 2>&1
 co_tag="fs-k8s-checkout-v1"
-co_tag_sha="$(git -C "$co_proj" rev-parse "${co_tag}^{commit}")"
-co_head_sha="$(git -C "$co_proj" rev-parse HEAD)"
+# --verify --quiet, so an unbuilt fixture yields an EMPTY sha and the check
+# below fails loudly. A bare `git rev-parse <bad-ref>` echoes the ref back on
+# stdout, which made this assertion pass against a tag that did not exist.
+co_tag_sha="$(git -C "$co_proj" rev-parse --verify --quiet "${co_tag}^{commit}")"
+co_head_sha="$(git -C "$co_proj" rev-parse --verify --quiet HEAD)"
 if [[ -n "$co_tag_sha" && "$co_tag_sha" != "$co_head_sha" ]]; then
     ok "the checkout fixture's tag is a commit distinct from HEAD"
 else
