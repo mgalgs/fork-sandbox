@@ -211,7 +211,14 @@ if (( render_rc != 0 )); then
     echo "Error: lkml-render.py --text $series_dir failed (exit $render_rc)." >&2
     exit 1
 fi
-if [[ -z "${render_text//[[:space:]]/}" ]]; then
+# A regex find-one-non-space, NOT ${render_text//[[:space:]]/}: that glob
+# substitution walks the whole string per multibyte character under a UTF-8
+# locale, and $render_text is the ENTIRE thread -- megabytes on a long
+# series. Measured elsewhere in this repo at ~24s of CPU on 360KB, which is
+# hours on a multi-megabyte render, spent before the first tier ever
+# launches. See fork-sandbox-say.sh's identical check for the original
+# measurement.
+if [[ ! "$render_text" =~ [^[:space:]] ]]; then
     echo "Error: the --text render of series '$series' is empty; there is no thread to summarize." >&2
     exit 1
 fi

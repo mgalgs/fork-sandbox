@@ -732,5 +732,29 @@ h2_out="$("$summarize" -h 2>&1)"; h2_rc=$?
 if (( h2_rc == 0 )); then ok "-h alone exits 0"; else no "-h alone exits 0" "exit $h2_rc: $h2_out"; fi
 contains "-h prints the header usage" "$h2_out" "lkml-summarize.sh — Turn a finished lkml-mode review thread into"
 
+printf '\n== large render performance ==\n'
+# The emptiness check on $render_text once ran a whole-string glob
+# substitution, which walks the string per multibyte character under a UTF-8
+# locale. Measured on this machine: 7.5s at 64KB, 33s at 128KB, 139s at
+# 256KB -- quadratic, and $render_text is the WHOLE thread, so a real series
+# stalled here for over half an hour before the first tier ever launched,
+# with no output to say so. The regex find-one-non-space form is 6ms at
+# 256KB. This posts a large multibyte reply, which lands in the render, and
+# bounds the whole stubbed pipeline at 25s.
+big_reply="$(mktemp)"
+printf 'große Antwort mit Umlauten — %d\n' $(seq 6000) > "$big_reply"
+"$mailbox" post widget-frob --from core --reply-to "$patch_id" --file "$big_reply" \
+    --tags Changes-requested --harness claude --model opus >/dev/null 2>&1
+capP="$(mktemp -d)"; tmpdirs+=("$capP")
+if LC_ALL=C.UTF-8 timeout 25 env PATH="$stub_bin:$PATH" STUB_CAPTURE_DIR="$capP" \
+        STUB_RUN_PREFIX="$run_prefix_dir" STUB_JSON="$DEFAULT_JSON" STUB_MD="$DEFAULT_MD" \
+        "$summarize" widget-frob --project "$project_dir" >/dev/null 2>&1; then
+    ok "a large multibyte thread render summarizes promptly"
+else
+    no "a large multibyte thread render summarizes promptly" \
+        "timed out or failed -- the emptiness check may have regressed to a glob substitution"
+fi
+rm -f -- "$big_reply"
+
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 (( fail == 0 )) || exit 1
