@@ -834,55 +834,84 @@ harvest_one() {
 }
 
 harvested=0
-for persona in "${!run_dir_of[@]}"; do
-    run_dir="${run_dir_of[$persona]}"
-    if [[ ! -f "$run_dir/summary.json" ]]; then
-        echo "Warning: $persona's run never finished; nothing harvested from it." >&2
-        continue
-    fi
-    clone_dir="$(jq -r '.clone_dir' "$run_dir/summary.json")"
-    # The seat's prompt names the run's artifact outbox (which a
-    # future Kubernetes mode would harvest the same way: it is the only
-    # channel that carries a reply out of a pod). .git/lkml-out in the
-    # clone is the location the prompt used to name; a current seat that
-    # ignores the instruction (or a persona prompt that still names the
-    # old path) may write there, so it stays a fallback. The fallback
-    # cannot rescue a run launched by an older copy of this script --
-    # this harvest sees only this invocation's own launches
-    # (run_dir_of is never read from the runs.jsonl ledger; that file is
-    # lkml-status.sh's cost ledger). The outbox wins
-    # when it holds any reply -- an "else", not an "and": a seat that
-    # somehow wrote to both must be posted once, not twice, and a
-    # duplicated review comment is a worse failure than a missed
-    # fallback.
-    # A pi-local persona names no model -- the endpoint picks one -- and
-    # `post` refuses an empty --model. The run's summary records what the
-    # endpoint actually served; stamp that.
-    model="${model_of[$persona]}"
-    if [[ -z "$model" ]]; then
-        model="$(jq -r '.model // empty' "$run_dir/summary.json" 2>/dev/null || true)"
-    fi
-    [[ -n "$model" ]] || model="unknown"
-    outbox_dir="$run_dir/outbox"
-    fallback_dir="$clone_dir/.git/lkml-out"
-    # A missing outbox is not an error -- fork-sandbox.sh creates one
-    # for every run, so this should not happen; treat it the same as an
-    # empty one.
-    if [[ -d "$outbox_dir" ]] && [[ -n "$(find "$outbox_dir" -maxdepth 1 -name '*.msg' -print -quit)" ]]; then
-        out_dir="$outbox_dir"
-    else
-        out_dir="$fallback_dir"
-    fi
-    if [[ ! -d "$out_dir" ]] || [[ -z "$(find "$out_dir" -maxdepth 1 -name '*.msg' -print -quit)" ]]; then
-        echo "fork-sandbox lkml-round: $persona wrote no replies (checked $outbox_dir, and $fallback_dir as a fallback)." >&2
-        continue
-    fi
-    while IFS= read -r msgfile; do
-        [[ -e "$msgfile" ]] || continue
-        harvest_one "$persona" "${display_of[$persona]}" "${harness_of[$persona]}" \
-            "$model" "$msgfile" && harvested=$(( harvested + 1 ))
-    done < <(find "$out_dir" -maxdepth 1 -name '*.msg' | sort -V)
-done
+if (( k8s )); then
+    # The local harvest reads <run_dir>/outbox and falls back to the
+    # clone's .git/lkml-out; a cluster seat has neither a run dir nor a
+    # host-side clone -- collect already pulled each seat's outbox back
+    # to its own per-seat directory, and that is the only place its
+    # replies can be (the same outbox channel that carries a reply out
+    # of a pod).
+    for persona in "${!k8s_collected[@]}"; do
+        out_dir="${outbox_of[$persona]}"
+        if [[ ! -d "$out_dir" ]] || [[ -z "$(find "$out_dir" -maxdepth 1 -name '*.msg' -print -quit)" ]]; then
+            echo "fork-sandbox lkml-round: $persona wrote no replies (checked $out_dir)." >&2
+            continue
+        fi
+        # No summary.json to ask what the endpoint actually served: stamp
+        # the seat's configured model when it has one, falling back to
+        # the same "unknown" the local path uses when it cannot tell --
+        # post refuses an empty model, and a model name is not
+        # something to invent.
+        model="${model_of[$persona]}"
+        [[ -n "$model" ]] || model="unknown"
+        while IFS= read -r msgfile; do
+            [[ -e "$msgfile" ]] || continue
+            harvest_one "$persona" "${display_of[$persona]}" "${harness_of[$persona]}" \
+                "$model" "$msgfile" && harvested=$(( harvested + 1 ))
+        done < <(find "$out_dir" -maxdepth 1 -name '*.msg' | sort -V)
+    done
+else
+    for persona in "${!run_dir_of[@]}"; do
+        run_dir="${run_dir_of[$persona]}"
+        if [[ ! -f "$run_dir/summary.json" ]]; then
+            echo "Warning: $persona's run never finished; nothing harvested from it." >&2
+            continue
+        fi
+        clone_dir="$(jq -r '.clone_dir' "$run_dir/summary.json")"
+        # The seat's prompt names the run's artifact outbox (the --k8s
+        # mode harvests the same way, from the outbox directory its
+        # collect pulled back: it is the only channel that carries a
+        # reply out of a pod). .git/lkml-out in the
+        # clone is the location the prompt used to name; a current seat that
+        # ignores the instruction (or a persona prompt that still names the
+        # old path) may write there, so it stays a fallback. The fallback
+        # cannot rescue a run launched by an older copy of this script --
+        # this harvest sees only this invocation's own launches
+        # (run_dir_of is never read from the runs.jsonl ledger; that file is
+        # lkml-status.sh's cost ledger). The outbox wins
+        # when it holds any reply -- an "else", not an "and": a seat that
+        # somehow wrote to both must be posted once, not twice, and a
+        # duplicated review comment is a worse failure than a missed
+        # fallback.
+        # A pi-local persona names no model -- the endpoint picks one -- and
+        # `post` refuses an empty --model. The run's summary records what the
+        # endpoint actually served; stamp that.
+        model="${model_of[$persona]}"
+        if [[ -z "$model" ]]; then
+            model="$(jq -r '.model // empty' "$run_dir/summary.json" 2>/dev/null || true)"
+        fi
+        [[ -n "$model" ]] || model="unknown"
+        outbox_dir="$run_dir/outbox"
+        fallback_dir="$clone_dir/.git/lkml-out"
+        # A missing outbox is not an error -- fork-sandbox.sh creates one
+        # for every run, so this should not happen; treat it the same as an
+        # empty one.
+        if [[ -d "$outbox_dir" ]] && [[ -n "$(find "$outbox_dir" -maxdepth 1 -name '*.msg' -print -quit)" ]]; then
+            out_dir="$outbox_dir"
+        else
+            out_dir="$fallback_dir"
+        fi
+        if [[ ! -d "$out_dir" ]] || [[ -z "$(find "$out_dir" -maxdepth 1 -name '*.msg' -print -quit)" ]]; then
+            echo "fork-sandbox lkml-round: $persona wrote no replies (checked $outbox_dir, and $fallback_dir as a fallback)." >&2
+            continue
+        fi
+        while IFS= read -r msgfile; do
+            [[ -e "$msgfile" ]] || continue
+            harvest_one "$persona" "${display_of[$persona]}" "${harness_of[$persona]}" \
+                "$model" "$msgfile" && harvested=$(( harvested + 1 ))
+        done < <(find "$out_dir" -maxdepth 1 -name '*.msg' | sort -V)
+    done
+fi
 
 echo "fork-sandbox lkml-round: harvested $harvested repl$( (( harvested == 1 )) && echo y || echo ies )." >&2
 
