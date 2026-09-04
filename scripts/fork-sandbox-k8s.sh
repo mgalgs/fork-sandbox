@@ -2261,12 +2261,14 @@ cmd_rm() {
 cmd_run() {
     local dry_run=false keep=false timeout=3600 branch="" model="" review_loop_cap=""
     local outbox_dir="" outbox_max_arg="" context_ro="" harness="" review_model="" endpoint=""
+    local checkout_ref=""
     while (( $# )); do
         case "$1" in
             --dry-run) dry_run=true; shift ;;
             --keep) keep=true; shift ;;
             --timeout) timeout="${2:?--timeout requires a number of seconds}"; shift 2 ;;
             --branch) branch="${2:?--branch requires a name}"; shift 2 ;;
+            --checkout) checkout_ref="${2:?--checkout requires a ref}"; shift 2 ;;
             --model) model="${2:?--model requires an OpenRouter model id}"; shift 2 ;;
             --endpoint) endpoint="${2:?--endpoint requires a name}"; shift 2 ;;
             --harness) harness="${2:?--harness requires 'pi' or 'claude'}"; shift 2 ;;
@@ -2331,6 +2333,11 @@ cmd_run() {
     [[ -n "$review_model" ]] && submit_argv+=(--review-model "$review_model")
     [[ -n "$outbox_max_arg" ]] && submit_argv+=(--outbox-max "$outbox_max_arg")
     [[ -n "$context_ro" ]] && submit_argv+=(--context-ro "$context_ro")
+    # Passed through only when given, like every other optional option
+    # above: an empty --checkout at submit's parse would be an argument
+    # error, not "no checkout". cmd_submit does the resolution and the
+    # rev-parse check itself, before anything is created.
+    [[ -n "$checkout_ref" ]] && submit_argv+=(--checkout "$checkout_ref")
     submit_argv+=("$project_path" "$handoff_file")
 
     # cmd_submit does its own full validation (K8S_IMAGE, K8S_DENIED_PROBE,
