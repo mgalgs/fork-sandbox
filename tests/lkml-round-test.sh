@@ -133,7 +133,8 @@ clone_dir="$run_dir/clone/proj"
 # Where each seat writes its replies decides which harvest path this
 # launch exercises:
 #   core     -> the outbox (the seat prompt's location)
-#   security -> .git/lkml-out only (the fallback for older in-flight runs)
+#   security -> .git/lkml-out only (the fallback for a seat that
+#               ignored the outbox instruction and used the old path)
 #   codex    -> BOTH places, plus a handoff.md in the outbox: the outbox
 #               must win (each reply posted exactly once, never twice) and
 #               the handoff.md must be ignored (only *.msg is harvested)

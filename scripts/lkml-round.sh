@@ -104,8 +104,8 @@
 # fetch back into the real repo, written strictly after exit-code -- each
 # run's artifact outbox is read directly -- `cat`, never git -- for
 # *.msg files, with a fall back to the old .git/lkml-out/ directory in
-# the run's clone for a run launched by an older copy of this script
-# whose seat was still told that location: the outbox wins when it
+# the run's clone for a seat that ignored the outbox instruction in its
+# prompt and wrote to the old location instead: the outbox wins when it
 # holds any reply, so a seat that somehow wrote to both is posted once,
 # never twice. The replies are posted into the mailbox via
 # lkml-mailbox.sh post,
@@ -658,10 +658,14 @@ for persona in "${!run_dir_of[@]}"; do
     clone_dir="$(jq -r '.clone_dir' "$run_dir/summary.json")"
     # The seat's prompt names the run's artifact outbox (which a
     # future Kubernetes mode would harvest the same way: it is the only
-    # channel that carries a reply out of a pod). .git/lkml-out
-    # in the clone is where a seat was told to write before that prompt
-    # existed; a run launched by an older copy of this script may still be
-    # in flight writing there, so it stays a fallback. The outbox wins
+    # channel that carries a reply out of a pod). .git/lkml-out in the
+    # clone is the location the prompt used to name; a current seat that
+    # ignores the instruction (or a persona prompt that still names the
+    # old path) may write there, so it stays a fallback. The fallback
+    # cannot rescue a run launched by an older copy of this script --
+    # this harvest sees only this invocation's own launches
+    # (run_dir_of is never read from the runs.jsonl ledger; that file is
+    # lkml-status.sh's cost ledger). The outbox wins
     # when it holds any reply -- an "else", not an "and": a seat that
     # somehow wrote to both must be posted once, not twice, and a
     # duplicated review comment is a worse failure than a missed
@@ -676,8 +680,9 @@ for persona in "${!run_dir_of[@]}"; do
     [[ -n "$model" ]] || model="unknown"
     outbox_dir="$run_dir/outbox"
     fallback_dir="$clone_dir/.git/lkml-out"
-    # A missing outbox is not an error: fork-sandbox.sh creates it for
-    # every run, but an older in-flight run's directory may predate it.
+    # A missing outbox is not an error -- fork-sandbox.sh creates one
+    # for every run, so this should not happen; treat it the same as an
+    # empty one.
     if [[ -d "$outbox_dir" ]] && [[ -n "$(find "$outbox_dir" -maxdepth 1 -name '*.msg' -print -quit)" ]]; then
         out_dir="$outbox_dir"
     else
