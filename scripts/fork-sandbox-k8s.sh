@@ -1332,11 +1332,12 @@ cmd_install() {
 
 cmd_submit() {
     local dry_run=false branch="" model="" review_loop_cap="" outbox_max_arg=""
-    local context_ro="" harness="pi" review_model="" endpoint=""
+    local context_ro="" harness="pi" review_model="" endpoint="" checkout_ref=""
     while (( $# )); do
         case "$1" in
             --dry-run) dry_run=true; shift ;;
             --branch) branch="${2:?--branch requires a name}"; shift 2 ;;
+            --checkout) checkout_ref="${2:?--checkout requires a ref}"; shift 2 ;;
             --model) model="${2:?--model requires an OpenRouter model id}"; shift 2 ;;
             --endpoint) endpoint="${2:?--endpoint requires a name}"; shift 2 ;;
             --harness) harness="${2:?--harness requires 'pi' or 'claude'}"; shift 2 ;;
@@ -1418,7 +1419,10 @@ cmd_submit() {
         exit 1
     fi
     branch="${branch:-k8s-$(date +%Y%m%d-%H%M%S)}"
-    fs_reject_unsafe_chars "$branch" "$model" || exit 1
+    # checkout_ref is caller-supplied and interpolated into a git command
+    # line below (the push refspec), so it gets the same treatment as
+    # branch and model: rejected before anything is created.
+    fs_reject_unsafe_chars "$branch" "$model" "$checkout_ref" || exit 1
 
     # --review-loop takes a positive integer, the same shape and the same
     # message fork-sandbox.sh's own local flag uses, so a bad value reads
@@ -1573,15 +1577,36 @@ cmd_submit() {
     origin_repo="$(fs_repo_toplevel "$project_path")" || exit 1
     fs_check_branch_free "$origin_repo" "$branch" || exit 1
 
+    # --checkout names the commit the branch starts from instead of the
+    # repo's HEAD. Resolved to a sha here, before the Job, the Secret and
+    # the proxy Pod exist, for the same reason every other pre-creation
+    # check in this function runs: an unresolvable ref must fail now, not
+    # after cluster objects for a run that cannot work already exist. The
+    # sha is also what the push below sends, so the ref cannot move
+    # between this check and the push, and the pushed revision is the one
+    # the push line reports and (under --review-loop) the base the review
+    # leg measures against.
+    local checkout_sha=""
+    if [[ -n "$checkout_ref" ]]; then
+        if ! checkout_sha="$(cd "$origin_repo" && git rev-parse --verify --quiet "$checkout_ref^{commit}" 2>/dev/null)"; then
+            echo "Error: --checkout '$checkout_ref' does not name a commit in $origin_repo." >&2
+            exit 1
+        fi
+    fi
+
     # base_sha, the review skill and the loop script itself are only needed
     # under --review-loop, but resolved here, before anything is created,
     # so a missing one fails now rather than after the pod is up.
     local base_sha="" review_skill_src="" review_loop_sh="$script_dir/fork-sandbox-k8s-review-loop.sh"
     if (( review_loop_cap > 0 )); then
-        # submit pushes this repo's current HEAD as the branch's starting
-        # point (see the push below), so that HEAD is the base the review
+        # submit pushes the branch's starting revision -- this repo's
+        # current HEAD, or the commit --checkout names when one is given
+        # (resolved to a sha above) -- as the branch's starting point
+        # (see the push below), so that revision is the base the review
         # leg's commit range is measured from.
-        if ! base_sha="$(cd "$origin_repo" && git rev-parse HEAD 2>/dev/null)"; then
+        if [[ -n "$checkout_ref" ]]; then
+            base_sha="$checkout_sha"
+        elif ! base_sha="$(cd "$origin_repo" && git rev-parse HEAD 2>/dev/null)"; then
             echo "Error: could not read HEAD in $origin_repo. --review-loop" >&2
             echo "needs the commit the branch is measured against, and submit" >&2
             echo "pushes this repo's current HEAD as that base." >&2
@@ -1996,7 +2021,14 @@ EOF
         exit 1
     fi
 
-    echo "fork-sandbox-k8s: pushing $origin_repo to pod $pod_name" >&2
+    # The push line names the revision the branch starts from, so an
+    # operator reading the log can tell a --checkout run from a HEAD run
+    # without inspecting the pod.
+    local push_src="HEAD"
+    if [[ -n "$checkout_ref" ]]; then
+        push_src="$checkout_sha"
+    fi
+    echo "fork-sandbox-k8s: pushing $origin_repo to pod $pod_name (branch starts at $push_src)" >&2
     # -c protocol.ext.allow=always: git disables the ext:: transport by
     # default (post-CVE-2017-1000117 hardening), so an unadorned push here
     # fails with 'fatal: transport "ext" not allowed'. Scoped to this one
@@ -2021,7 +2053,7 @@ EOF
     local push_rc=0
     (cd "$origin_repo" && git -c protocol.ext.allow=always -c core.hooksPath=/dev/null push --quiet \
         "ext::kubectl --context=$K8S_CONTEXT -n $K8S_NAMESPACE exec -i $pod_name -- git-receive-pack /work/repo.git" \
-        "HEAD:refs/heads/$branch") || push_rc=$?
+        "$push_src:refs/heads/$branch") || push_rc=$?
     if (( push_rc != 0 )); then
         echo "Error: the repository push to pod $pod_name failed (git exit $push_rc)." >&2
         echo "fork-sandbox-k8s: the pod's agent container log, for the reason:" >&2
