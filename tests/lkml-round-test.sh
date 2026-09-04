@@ -6,13 +6,15 @@
 # Usage: tests/lkml-round-test.sh
 #
 # No sandbox, no bwrap, no real agent: the stub fork-sandbox.sh captures its
-# own --task-meta, fabricates a run directory with a clone_dir already
-# holding .git/lkml-out/*.msg replies, writes summary.json immediately (so
-# lkml-round.sh's wait loop never actually sleeps), and prints the same
-# "  run dir:  <path>" line the real launcher does. What is under test is
-# entirely lkml-round.sh's own logic: parsing that line, waiting for
-# summary.json, harvesting .git/lkml-out files, and posting them through
-# lkml-mailbox.sh with the launching persona's own attribution.
+# own --task-meta, fabricates a run directory whose outbox (and, for some
+# seats, whose clone's .git/lkml-out) already holds *.msg replies, writes
+# summary.json immediately (so lkml-round.sh's wait loop never actually
+# sleeps), and prints the same "  run dir:  <path>" line the real launcher
+# does. What is under test is entirely lkml-round.sh's own logic: parsing
+# that line, waiting for summary.json, harvesting *.msg replies from the
+# outbox (falling back to .git/lkml-out for a seat that wrote there
+# instead), and posting them through lkml-mailbox.sh with the launching
+# persona's own attribution.
 
 set -uo pipefail
 
@@ -102,10 +104,11 @@ printf '{"version":2,"branch":"otherbranch"}\n' >> "$LKML_MAILBOX_ROOT/widget-fr
 
 # The stub replaces fork-sandbox.sh entirely: no clone, no sandbox, no
 # network. It reads its own --task-meta (captured for the test to inspect),
-# fabricates a run directory holding a clone_dir with .git/lkml-out replies that
-# depend on which persona this launch was for, and writes summary.json
-# before it ever prints anything -- so lkml-round.sh's wait loop sees
-# summary.json on its very first check and never sleeps.
+# fabricates a run directory whose outbox -- and, per the persona below,
+# whose clone's .git/lkml-out -- already holds replies that depend on
+# which persona this launch was for, and writes summary.json before it
+# ever prints anything -- so lkml-round.sh's wait loop sees summary.json
+# on its very first check and never sleeps.
 cat > "$stub_bin/fork-sandbox.sh" <<'STUB'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -126,20 +129,41 @@ cp -- "${args[$((n-1))]}" "$STUB_CAPTURE_DIR/$persona.handoff.md"
 
 run_dir="$(mktemp -d "$STUB_RUN_PREFIX/run.XXXXXX")"
 clone_dir="$run_dir/clone/proj"
-mkdir -p "$clone_dir/.git/lkml-out"
+# fork-sandbox.sh creates the outbox for every run; mirror that here.
+# Where each seat writes its replies decides which harvest path this
+# launch exercises:
+#   core     -> the outbox (the seat prompt's location)
+#   security -> .git/lkml-out only (the fallback for older in-flight runs)
+#   codex    -> BOTH places, plus a handoff.md in the outbox: the outbox
+#               must win (each reply posted exactly once, never twice) and
+#               the handoff.md must be ignored (only *.msg is harvested)
+#   pi-local -> nowhere (empty outbox, no fallback directory): the
+#               "wrote no replies" warning path
+mkdir -p "$run_dir/outbox"
 
 case "$persona" in
     core)
         printf 'In-Reply-To: %s\nX-Tags: Reviewed-by\n\nLooks fine now.\n' "$STUB_REPLY_TO" \
-            > "$clone_dir/.git/lkml-out/1.msg"
+            > "$run_dir/outbox/1.msg"
         printf 'Subject: a stray note\n\nThis one forgot In-Reply-To on purpose.\n' \
-            > "$clone_dir/.git/lkml-out/2.msg"
+            > "$run_dir/outbox/2.msg"
         ;;
     security)
         # RFC-822 bracket form, not the bare id core's reply above uses --
         # exercises harvest_one's In-Reply-To stripping (lkml_round_strip_id).
+        # Written to the OLD location on purpose: the fallback path.
+        mkdir -p "$clone_dir/.git/lkml-out"
         printf 'In-Reply-To: %s\nX-Tags: Question\n\nWhat about the empty-input case?\n' "$STUB_REPLY_TO_BRACKETED" \
             > "$clone_dir/.git/lkml-out/1.msg"
+        ;;
+    codex)
+        mkdir -p "$clone_dir/.git/lkml-out"
+        for dir in "$run_dir/outbox" "$clone_dir/.git/lkml-out"; do
+            printf 'In-Reply-To: %s\nSubject: a both-places reply\nX-Tags: Acked-by\n\nPosted from both places; must land exactly once.\n' "$STUB_REPLY_TO" \
+                > "$dir/1.msg"
+        done
+        printf '# self-refresh handoff\n\nThis file must never be harvested.\n' \
+            > "$run_dir/outbox/handoff.md"
         ;;
 esac
 
@@ -235,20 +259,33 @@ esac
 
 printf '\n== harvest ==\n'
 tree_out="$("$mailbox" tree widget-frob)"
-contains "core's valid reply landed with its Reviewed-by tag" "$tree_out" "Reviewed-by"
-contains "security's reply landed with its Question tag" "$tree_out" "Question"
+contains "core's valid outbox reply landed with its Reviewed-by tag" "$tree_out" "Reviewed-by"
+contains "security's fallback-directory reply landed with its Question tag" "$tree_out" "Question"
+check "codex's both-places reply landed exactly once (outbox wins)" "1" \
+    "$(printf '%s\n' "$tree_out" | grep -c 'a both-places reply')"
+case "$tree_out" in
+    *"self-refresh"*) no "the outbox handoff.md alongside 1.msg was not harvested" ;;
+    *) ok "the outbox handoff.md alongside 1.msg was not harvested" ;;
+esac
 contains "the reply carries core's AI-persona attribution" \
     "$("$mailbox" show widget-frob "$(printf '%s\n' "$tree_out" | grep -m1 Reviewed-by | awk '{print $1}')")" \
     "(AI persona)"
 
 n_msgs=$(find "$LKML_MAILBOX_ROOT/widget-frob/cur" -name '*.msg' | wc -l)
-# two versions (cover + patch each) + core's good reply + security's reply = 6.
-# The malformed second core file must NOT have been posted.
-check "exactly the well-formed replies were posted (6 messages total)" "6" "$n_msgs"
+# two versions (cover + patch each) + core's good outbox reply +
+# security's fallback reply + codex's both-places reply posted ONCE
+# (the outbox wins; a second harvest of the fallback copy would make
+# this 8) = 7. The malformed second core file must NOT have been
+# posted, and codex's handoff.md must not be either.
+check "exactly the well-formed replies were posted, once each (7 messages total)" "7" "$n_msgs"
 
-contains "a .git/lkml-out file with no In-Reply-To is refused with a clear line" \
+contains "a reply file with no In-Reply-To is refused with a clear line" \
     "$out" "has no In-Reply-To"
 contains "the refusal names the file it skipped" "$out" "2.msg"
+contains "an empty outbox with no fallback directory warns of no replies" \
+    "$out" "pi-local wrote no replies"
+contains "the no-replies warning names the outbox it checked" "$out" "/outbox, and"
+contains "the no-replies warning names the fallback it checked" "$out" ".git/lkml-out as a fallback"
 
 printf '\n== persona archiving ==\n'
 for p in core security pi-local codex; do
@@ -374,8 +411,9 @@ else
 fi
 
 cap_zero="$(mktemp -d)"; tmpdirs+=("$cap_zero")
-# pi-local's stub run writes no .git/lkml-out replies at all, so this round
-# harvests nothing: the summary must be skipped and announced on stderr.
+# pi-local's stub run writes no replies at all (empty outbox, no fallback
+# directory), so this round harvests nothing: the summary must be skipped
+# and announced on stderr.
 out_zero="$(PATH="$stub_bin:$PATH" STUB_CAPTURE_DIR="$cap_zero" STUB_RUN_PREFIX="$run_prefix_dir" \
     STUB_REPLY_TO="$patch2_id" STUB_REPLY_TO_BRACKETED="$patch_id_bracketed" \
     "$round" widget-frob --project "$project_dir" --checkout otherbranch \
@@ -384,6 +422,7 @@ out_zero="$(PATH="$stub_bin:$PATH" STUB_CAPTURE_DIR="$cap_zero" STUB_RUN_PREFIX=
 rc_zero=$?
 if (( rc_zero == 0 )); then ok "nothing-harvested round still exits 0"; else no "nothing-harvested round still exits 0" "exit $rc_zero: $out_zero"; fi
 contains "nothing harvested announces the skipped summary" "$out_zero" "skipping the summary for widget-frob v2"
+contains "the empty seat's no-replies warning fired in this round too" "$out_zero" "pi-local wrote no replies"
 if [[ ! -f "$cap_zero/lkml-summarize.argv" ]]; then
     ok "nothing-harvested round does not invoke the summarizer"
 else

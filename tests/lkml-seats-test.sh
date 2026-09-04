@@ -377,8 +377,8 @@ printf '{"version":1,"branch":"somebranch"}\n' > "$LKML_MAILBOX_ROOT/widget-seat
 # The stub replaces fork-sandbox.sh entirely: no clone, no sandbox, no
 # network. It captures its own argv for the test to inspect and writes
 # summary.json immediately (so lkml-round.sh's wait loop never sleeps);
-# the clone_dir it names holds no .git/lkml-out, so the harvest finds
-# nothing to post.
+# the run dir it names holds no outbox and the clone_dir it names no
+# .git/lkml-out, so the harvest finds nothing to post.
 cat > "$stub_bin/fork-sandbox.sh" <<'STUB'
 #!/usr/bin/env bash
 set -euo pipefail

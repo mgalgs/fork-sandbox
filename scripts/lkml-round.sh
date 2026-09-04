@@ -287,7 +287,7 @@ lkml_persona_field() {
 # series' cover letter and full thread tree, (for the secretary seat)
 # the whole thread's message bodies, then either the specific threads to
 # answer or instructions to review the whole diff, then the fixed rules
-# for writing .git/lkml-out replies.
+# for writing replies into the artifact outbox.
 build_handoff() {
     local persona_file="$1" cover="$2" tree="$3" thread="${4:-}"
     cat -- "$persona_file"
@@ -323,11 +323,13 @@ build_handoff() {
 
 ## How to reply
 
-Write each thing you have to say as its own file under `.git/lkml-out/` in
-this clone (create the directory if it does not exist), named `1.msg`,
-`2.msg`, `3.msg` ... Under `.git/`, not the working tree: git tracks
-nothing there, so it cannot end up staged or committed by accident. Each
-file looks like:
+Write each thing you have to say as its own file under the artifact
+outbox directory whose absolute path is given in the "Artifact outbox"
+section above, named `1.msg`, `2.msg`, `3.msg` ... The outbox is outside
+this clone entirely, so nothing written there can end up staged or
+committed by accident. Never write anything named `handoff.md` there --
+that name is reserved for the run's own self-refresh protocol, and the
+`.msg` naming already keeps you clear of it. Each file looks like:
 
     In-Reply-To: <id>
     Subject: <optional -- default is "Re: <the parent's subject>">
@@ -358,10 +360,11 @@ Rules, all load-bearing:
   quoted line, the way an email reply does.
 - **Ask a question rather than guess** when you are not sure.
 - **Make no commits and no other repository changes.** Do not edit, stage
-  or commit anything. Writing `.git/lkml-out/*.msg` files is the whole
-  job this round.
-- In your final report, say how many `.git/lkml-out/*.msg` files you wrote and,
-  in one line each, what each one says.
+  or commit anything. The outbox is outside the clone entirely, so there
+  is no reason to touch the repository at all: writing the `.msg` files
+  to the artifact outbox is the whole job this round.
+- In your final report, say how many `.msg` files you wrote in the
+  artifact outbox and, in one line each, what each one says.
 RULES
     # The persona is the first thing in this handoff and the thread is the
     # last, and the thread can be long. A small model anchors on what it
@@ -519,7 +522,7 @@ for persona in "${personas[@]}"; do
     # and so is its launch-line mention, which would announce a no-op.
     # A small local thinking model left at its default has been measured
     # spending its whole reply budget reasoning (stop=length, repeatedly)
-    # and writing no .git/lkml-out file at all — a reviewer that says
+    # and writing no `.msg` reply at all — a reviewer that says
     # nothing. `thinking: low` is the fix for that seat, not a smaller panel.
     pi_args=()
     thinking_note=""
@@ -647,7 +650,15 @@ for persona in "${!run_dir_of[@]}"; do
         continue
     fi
     clone_dir="$(jq -r '.clone_dir' "$run_dir/summary.json")"
-    out_dir="$clone_dir/.git/lkml-out"
+    # The seat's prompt names the run's artifact outbox -- the only
+    # channel that carries a reply out of a Kubernetes pod. .git/lkml-out
+    # in the clone is where a seat was told to write before that prompt
+    # existed; a run launched by an older copy of this script may still be
+    # in flight writing there, so it stays a fallback. The outbox wins
+    # when it holds any reply -- an "else", not an "and": a seat that
+    # somehow wrote to both must be posted once, not twice, and a
+    # duplicated review comment is a worse failure than a missed
+    # fallback.
     # A pi-local persona names no model -- the endpoint picks one -- and
     # `post` refuses an empty --model. The run's summary records what the
     # endpoint actually served; stamp that.
@@ -656,8 +667,17 @@ for persona in "${!run_dir_of[@]}"; do
         model="$(jq -r '.model // empty' "$run_dir/summary.json" 2>/dev/null || true)"
     fi
     [[ -n "$model" ]] || model="unknown"
-    if [[ ! -d "$out_dir" ]]; then
-        echo "fork-sandbox lkml-round: $persona wrote no .git/lkml-out replies." >&2
+    outbox_dir="$run_dir/outbox"
+    fallback_dir="$clone_dir/.git/lkml-out"
+    # A missing outbox is not an error: fork-sandbox.sh creates it for
+    # every run, but an older in-flight run's directory may predate it.
+    if [[ -d "$outbox_dir" ]] && [[ -n "$(find "$outbox_dir" -maxdepth 1 -name '*.msg' -print -quit)" ]]; then
+        out_dir="$outbox_dir"
+    else
+        out_dir="$fallback_dir"
+    fi
+    if [[ ! -d "$out_dir" ]] || [[ -z "$(find "$out_dir" -maxdepth 1 -name '*.msg' -print -quit)" ]]; then
+        echo "fork-sandbox lkml-round: $persona wrote no replies (checked $outbox_dir, and $fallback_dir as a fallback)." >&2
         continue
     fi
     while IFS= read -r msgfile; do
