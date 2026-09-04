@@ -132,6 +132,22 @@
 #                        and folded into the run-log record. See
 #                        sandbox-run-log.py's header for the recommended
 #                        fields.
+# FORK_SANDBOX_RUN_SOURCE=<token>:
+#                        environment variable read at launch time: the
+#                        run's provenance declaration. When set and
+#                        non-empty it is validated against ^[a-z][a-z0-9-]{0,31}$
+#                        -- a token, not free text: it ends up in the durable
+#                        run log, so anything else is refused before the run
+#                        is created -- and written to <run-dir>/run-source,
+#                        where sandbox-run-log.py picks it up as the
+#                        record's `source` field. The value `test` is how a
+#                        test suite keeps its fixture runs out of the
+#                        operator's performance stats: `list` and `stats`
+#                        omit such runs by default, and
+#                        `--include-tests` shows them. Unset or empty means
+#                        the record carries the default source, and the
+#                        run directory carries no file at all.
+# --sandbox-args "...":  extra arguments passed to claude-sandboxed itself.
 # --sandbox-args "...":  extra arguments passed to claude-sandboxed itself.
 #                        Only --unpin-egress is accepted. Refused outright
 #                        with --harness pi-local, which is sealed and so has
@@ -2351,6 +2367,20 @@ fi
 if [[ "$review_only" == true ]]; then
     review_loop_cap=1
 fi
+# FORK_SANDBOX_RUN_SOURCE is a token that ends up in the durable run log,
+# not free text: it must be groupable in stats, so it is refused, with a
+# clear message, before the run is created. Validated here, above the
+# dry-run exit, for the same reason the loop caps are: --dry-run exists
+# to say whether a launch is good, so it must not approve one the real
+# run refuses.
+if [[ -n "${FORK_SANDBOX_RUN_SOURCE:-}" ]] \
+    && ! [[ "$FORK_SANDBOX_RUN_SOURCE" =~ ^[a-z][a-z0-9-]{0,31}$ ]]; then
+    echo "Error: FORK_SANDBOX_RUN_SOURCE is a provenance token that ends up" >&2
+    echo "in the run log, so it must start with a lowercase letter and be" >&2
+    echo "only lowercase letters, digits and hyphens, at most 32 chars" >&2
+    echo "(^[a-z][a-z0-9-]{0,31}$) -- not '$FORK_SANDBOX_RUN_SOURCE'." >&2
+    exit 1
+fi
 
 # --harness pi-local is sealed: no network at all, which is the property a
 # caller picks it for. Its implement leg stays sealed regardless of
@@ -3401,6 +3431,17 @@ fs_reject_unsafe_chars "$run_dir"
 # cannot see or edit it.
 if [[ -n "$task_meta" ]]; then
     printf '%s\n' "$task_meta" > "$run_dir/task-meta.json"
+fi
+# The run's provenance, when the launching shell declared one:
+# sandbox-run-log.py reads it back as the record's `source`. Same absence
+# convention as task-meta.json -- no file when the variable is unset or
+# empty, which the recorder reads as "no declaration". Written here, by
+# THIS shell, not from the generated runner: the runner executes in the
+# tmux server's environment, which does not necessarily carry the
+# launcher's variables, and the token must reflect what the launching
+# shell declared.
+if [[ -n "${FORK_SANDBOX_RUN_SOURCE:-}" ]]; then
+    printf '%s\n' "$FORK_SANDBOX_RUN_SOURCE" > "$run_dir/run-source"
 fi
 # The preset's provenance, when the run was launched with one: its name, the
 # machine-local file it came from and a hash of the definition's bytes at
