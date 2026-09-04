@@ -67,7 +67,11 @@
 #     is sourced.
 #   - fork-sandbox.sh --k8s: the two new lib functions it shares with the
 #     local path (fs_require_scratch_handoff, fs_require_src_project), that
-#     it defaults a bare --k8s to --harness pi (still requiring --model),
+#     it defaults a bare --k8s to --harness pi, that a model-less --k8s run
+#     passes the launcher on ANY install -- on a legacy install the
+#     refusal is fork-sandbox-k8s.sh's own run verb, and on an endpoints
+#     install the render lands on K8S_DEFAULT_ENDPOINT's endpoint when
+#     k8s.env names one --
 #     that --harness claude is accepted too (also requiring --model, its
 #     own Claude Code model name) while every other --harness value and
 #     every flag the cluster path cannot honor is refused by name (never
@@ -176,6 +180,12 @@
 #     the registered names, an omitted --endpoint against a single-
 #     endpoint install resolves to it (and says so on stderr), and
 #     --endpoint against a legacy K8S_PROXY_UPSTREAM install is refused;
+#     K8S_DEFAULT_ENDPOINT in k8s.env sits between the flag and the
+#     one-candidate rule -- an explicit --endpoint wins over it, a default
+#     naming an unregistered endpoint is a parse-time error naming k8s.env
+#     and listing the registered names (never a fallthrough), and a default
+#     on a legacy K8S_PROXY_UPSTREAM install is refused with the same shape
+#     as the --endpoint refusal;
 #     --model is optional on an endpoints install (submit accepts it and
 #     renders an empty MODEL env) but stays required on a legacy install,
 #     and --harness claude keeps the requirement even on an endpoints
@@ -775,6 +785,94 @@ if [[ "$multi_out" == *primary* && "$multi_out" == *secondary* ]]; then
 else
     no "the multi-endpoint no-\`--endpoint\` error lists the registered names" "$multi_out"
 fi
+
+# K8S_DEFAULT_ENDPOINT in k8s.env is the site's preferred named
+# endpoint. Precedence: an explicit --endpoint, then the default, then
+# the one-candidate rule, then the error listing the names.
+default_ep_config_dir="$(newdir)"; tmpdirs+=("$default_ep_config_dir")
+cat > "$default_ep_config_dir/k8s.env" <<'CONF'
+K8S_CONTEXT=test-context
+K8S_NAMESPACE=fork-sandbox-test
+K8S_IMAGE=registry.example/you/fork-sandbox:latest
+K8S_PROXY_ENDPOINTS=primary=http://10.0.0.5:8001/v1,secondary=http://10.0.0.6:8000/v1
+K8S_DEFAULT_ENDPOINT=secondary
+K8S_DENIED_PROBE=10.0.0.1:443
+CONF
+
+# An explicit --endpoint wins over K8S_DEFAULT_ENDPOINT.
+def_flag_out="$(newdir)/def-flag-submit.yaml"; tmpdirs+=("$(dirname "$def_flag_out")")
+def_flag_err="$(newdir)/def-flag-submit.err"; tmpdirs+=("$(dirname "$def_flag_err")")
+if FORK_SANDBOX_CONFIG_DIR="$default_ep_config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model moonshotai/kimi-k3 --endpoint primary \
+    "$proj_dir" "$handoff_file" > "$def_flag_out" 2>"$def_flag_err"; then
+    ok "submit --endpoint wins over K8S_DEFAULT_ENDPOINT and exits 0"
+else
+    no "submit --endpoint wins over K8S_DEFAULT_ENDPOINT and exits 0" \
+        "$(cat "$def_flag_err")"
+fi
+if grep -qF 'value: "http://fork-sandbox-proxy.fork-sandbox-test.svc.cluster.local:8080/e/primary/v1"' "$def_flag_out" \
+    && ! grep -qF '/e/secondary/v1' "$def_flag_out"; then
+    ok "the --endpoint-over-default render is wired to the flagged endpoint"
+else
+    no "the --endpoint-over-default render is wired to the flagged endpoint" \
+        "$(grep -A1 'name: PROXY_BASE_URL' "$def_flag_out")"
+fi
+
+# No flag, several registered: the default is used and announced.
+def_default_out="$(newdir)/def-default-submit.yaml"; tmpdirs+=("$(dirname "$def_default_out")")
+def_default_err="$(newdir)/def-default-submit.err"; tmpdirs+=("$(dirname "$def_default_err")")
+if FORK_SANDBOX_CONFIG_DIR="$default_ep_config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model moonshotai/kimi-k3 \
+    "$proj_dir" "$handoff_file" > "$def_default_out" 2>"$def_default_err"; then
+    ok "submit with no --endpoint uses K8S_DEFAULT_ENDPOINT against a multi-endpoint install"
+else
+    no "submit with no --endpoint uses K8S_DEFAULT_ENDPOINT against a multi-endpoint install" \
+        "$(cat "$def_default_err")"
+fi
+if grep -qF 'value: "http://fork-sandbox-proxy.fork-sandbox-test.svc.cluster.local:8080/e/secondary/v1"' "$def_default_out"; then
+    ok "the K8S_DEFAULT_ENDPOINT resolution renders that endpoint's /e/<name>/v1"
+else
+    no "the K8S_DEFAULT_ENDPOINT resolution renders that endpoint's /e/<name>/v1" \
+        "$(grep -A1 'name: PROXY_BASE_URL' "$def_default_out")"
+fi
+if grep -q 'K8S_DEFAULT_ENDPOINT' "$def_default_err" && grep -q "'secondary'" "$def_default_err"; then
+    ok "the K8S_DEFAULT_ENDPOINT resolution announces itself on stderr"
+else
+    no "the K8S_DEFAULT_ENDPOINT resolution announces itself on stderr" \
+        "$(cat "$def_default_err")"
+fi
+
+# A default naming an unregistered endpoint is a parse-time error that
+# names k8s.env (the command line never mentions the bad name) and lists
+# the registered names -- never a fallthrough to the one-candidate rule.
+bad_default_config_dir="$(newdir)"; tmpdirs+=("$bad_default_config_dir")
+sed 's/^K8S_DEFAULT_ENDPOINT=.*/K8S_DEFAULT_ENDPOINT=bogus/' \
+    "$default_ep_config_dir/k8s.env" > "$bad_default_config_dir/k8s.env"
+refuses "submit with an unregistered K8S_DEFAULT_ENDPOINT errors" \
+    "K8S_DEFAULT_ENDPOINT 'bogus'" \
+    env FORK_SANDBOX_CONFIG_DIR="$bad_default_config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model moonshotai/kimi-k3 \
+    "$proj_dir" "$handoff_file"
+bad_default_out="$(FORK_SANDBOX_CONFIG_DIR="$bad_default_config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model moonshotai/kimi-k3 \
+    "$proj_dir" "$handoff_file" 2>&1 >/dev/null || true)"
+if [[ "$bad_default_out" == *k8s.env* && "$bad_default_out" == *"is not registered"* \
+    && "$bad_default_out" == *primary* && "$bad_default_out" == *secondary* ]]; then
+    ok "the unregistered K8S_DEFAULT_ENDPOINT error names k8s.env and the registered names"
+else
+    no "the unregistered K8S_DEFAULT_ENDPOINT error names k8s.env and the registered names" "$bad_default_out"
+fi
+
+# A default on a legacy K8S_PROXY_UPSTREAM install is a config error, not
+# something to ignore -- the same shape as the --endpoint refusal.
+legacy_default_config_dir="$(newdir)"; tmpdirs+=("$legacy_default_config_dir")
+sed 's/^K8S_PROXY_ENDPOINTS=.*/K8S_PROXY_UPSTREAM=https:\/\/openrouter.ai/' \
+    "$default_ep_config_dir/k8s.env" > "$legacy_default_config_dir/k8s.env"
+refuses "K8S_DEFAULT_ENDPOINT on a legacy K8S_PROXY_UPSTREAM install errors" \
+    "K8S_DEFAULT_ENDPOINT is not available" \
+    env FORK_SANDBOX_CONFIG_DIR="$legacy_default_config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model moonshotai/kimi-k3 \
+    "$proj_dir" "$handoff_file"
 
 # ...and against a single-endpoint install it resolves to the one
 # endpoint, says so on stderr, and renders that endpoint's location.
@@ -3924,10 +4022,16 @@ tmpdirs+=("$k8s_flag_handoff_dir")
 k8s_flag_handoff="$k8s_flag_handoff_dir/handoff.md"
 printf 'Do the k8s thing.\n' > "$k8s_flag_handoff"
 
-refuses "--k8s with no --harness and no --model needs a model" \
-    "--harness pi needs --model" \
+# A model-less pi --k8s run passes the launcher on ANY install: the
+# endpoint question belongs to fork-sandbox-k8s.sh's install-mode-aware
+# validation, and on a legacy K8S_PROXY_UPSTREAM install the refusal is
+# its run verb's own -- after the launcher's project/handoff checks, so
+# this case needs the real fixtures, not the placeholders the flag-
+# refusal cases use.
+refuses "--k8s with no --harness and no --model on a legacy install is refused by fork-sandbox-k8s.sh" \
+    "run requires --model" \
     env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
-    unused-project unused-handoff
+    "$k8s_flag_proj" "$k8s_flag_handoff"
 if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
     --model moonshotai/kimi-k3 --branch fs-k8s-flag-test-default-harness \
     "$k8s_flag_proj" "$k8s_flag_handoff" \
@@ -4071,6 +4175,29 @@ model_env="$(grep -A1 'name: MODEL$' "$k8s_flag_ep_nm_out" | tail -n1)"
 check "the no-model --k8s --endpoint render carries an empty MODEL env" \
     '              value: ""' "$model_env"
 rm -f /tmp/fs-k8s-flag-test-ep-nomodel.err "$k8s_flag_ep_nm_out"
+# And the launcher no longer pre-empts the endpoint rule at all: with no
+# --model and no --endpoint, K8S_DEFAULT_ENDPOINT in k8s.env alone is
+# enough for a pi --k8s run to pass the launcher's own validation and
+# reach the render, wired to the default's endpoint. Reuses
+# default_ep_config_dir's primary/secondary registry + default above.
+k8s_flag_def_out="$(newdir)/k8s-flag-def.yaml"; tmpdirs+=("$(dirname "$k8s_flag_def_out")")
+if FORK_SANDBOX_CONFIG_DIR="$default_ep_config_dir" "$fs_sh" --k8s --dry-run \
+    --branch fs-k8s-flag-test-def-branch \
+    "$k8s_flag_proj" "$k8s_flag_handoff" \
+    > "$k8s_flag_def_out" 2>/tmp/fs-k8s-flag-test-def.err; then
+    ok "--k8s --dry-run with neither --model nor --endpoint passes the launcher when k8s.env names a default"
+else
+    no "--k8s --dry-run with neither --model nor --endpoint passes the launcher when k8s.env names a default" \
+        "$(cat /tmp/fs-k8s-flag-test-def.err)"
+fi
+if grep -qF 'value: "http://fork-sandbox-proxy.fork-sandbox-test.svc.cluster.local:8080/e/secondary/v1"' "$k8s_flag_def_out" \
+    && ! grep -qF '/e/primary/v1' "$k8s_flag_def_out"; then
+    ok "the no-model no-endpoint --k8s render is wired to K8S_DEFAULT_ENDPOINT's endpoint"
+else
+    no "the no-model no-endpoint --k8s render is wired to K8S_DEFAULT_ENDPOINT's endpoint" \
+        "$(grep -A1 'name: PROXY_BASE_URL' "$k8s_flag_def_out")"
+fi
+rm -f /tmp/fs-k8s-flag-test-def.err
 # --harness claude keeps the model requirement even with --endpoint --
 # the pod's discovery lists the pi endpoint's model ids, never a Claude
 # Code model name -- and the launcher refuses it before any render.
