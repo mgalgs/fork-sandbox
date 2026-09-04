@@ -88,9 +88,10 @@
 #     entrypoint's pi invocation (run_pi_coding_leg, extracted from the
 #     entrypoint's own source and run against a stubbed pi that records
 #     its argv) receives "--thinking low" as two separate arguments and
-#     an unset or empty PI_ARGS as none; a value containing a shell
-#     metacharacter is refused at parse time with nothing created (the
-#     stubbed kubectl's log stays empty), --harness claude is refused,
+#     an unset or empty PI_ARGS as none; a value containing a single
+#     quote, a double quote, or a backslash is refused at parse time
+#     with nothing created (the stubbed kubectl's log stays empty),
+#     --harness claude is refused,
 #     and run's copy forwards to submit unchanged (byte-for-byte the same
 #     dry-run render).
 #   - fork-sandbox.sh --k8s --review-loop N is no longer refused, and
@@ -1706,7 +1707,7 @@ for case_none in "none:$pialg_none" "empty:$pialg_empty"; do
     fi
 done
 
-# A shell metacharacter in the value is refused at parse time -- and the
+# An unsafe character in the value is refused at parse time -- and the
 # refusal is before any Job, Secret or proxy Pod exists. Proven against a
 # stubbed kubectl (no --dry-run here) whose log must stay empty.
 refuses "submit --pi-args with a single quote is refused" \
@@ -1714,6 +1715,22 @@ refuses "submit --pi-args with a single quote is refused" \
     env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-branch --model moonshotai/kimi-k3 \
     --pi-args "--thinking it's" \
+    "$proj_dir" "$handoff_file"
+# A double quote and a backslash are refused too: the rendered Job embeds
+# the value as a double-quoted YAML scalar, where a quote would break the
+# manifest and a backslash would be re-escaped by the YAML parser into a
+# value different from the one split and passed to pi.
+refuses "submit --pi-args with a double quote is refused" \
+    "double quote" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model moonshotai/kimi-k3 \
+    --pi-args 'a"b' \
+    "$proj_dir" "$handoff_file"
+refuses "submit --pi-args with a backslash is refused" \
+    "backslash" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model moonshotai/kimi-k3 \
+    --pi-args 'a\nb' \
     "$proj_dir" "$handoff_file"
 pialg_stub_bin="$(newdir)"; tmpdirs+=("$pialg_stub_bin")
 pialg_klog="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$pialg_klog")")
@@ -1730,6 +1747,36 @@ if (( pialg_rc != 0 )) && [[ ! -s "$pialg_klog" ]] \
     ok "a refused --pi-args value creates nothing (the stubbed kubectl recorded no call)"
 else
     no "a refused --pi-args value creates nothing (the stubbed kubectl recorded no call)" \
+        "rc=$pialg_rc log=$(cat "$pialg_klog") out=$(cat /tmp/fs-k8s-test-pialg-unsafe.out)"
+fi
+rm -f /tmp/fs-k8s-test-pialg-unsafe.out
+# Same "nothing created" proof for the YAML-scalar rejections: a double
+# quote and a backslash must also die before the first kubectl call.
+pialg_rc=0
+PATH="$pialg_stub_bin:$PATH" K8S_STUB_LOG="$pialg_klog" \
+    FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit \
+    --branch fs-k8s-test-branch --model moonshotai/kimi-k3 \
+    --pi-args 'a"b' \
+    "$proj_dir" "$handoff_file" >/tmp/fs-k8s-test-pialg-unsafe.out 2>&1 || pialg_rc=$?
+if (( pialg_rc != 0 )) && [[ ! -s "$pialg_klog" ]] \
+    && grep -q 'double quote' /tmp/fs-k8s-test-pialg-unsafe.out; then
+    ok "a --pi-args value with a double quote creates nothing (the stubbed kubectl recorded no call)"
+else
+    no "a --pi-args value with a double quote creates nothing (the stubbed kubectl recorded no call)" \
+        "rc=$pialg_rc log=$(cat "$pialg_klog") out=$(cat /tmp/fs-k8s-test-pialg-unsafe.out)"
+fi
+rm -f /tmp/fs-k8s-test-pialg-unsafe.out
+pialg_rc=0
+PATH="$pialg_stub_bin:$PATH" K8S_STUB_LOG="$pialg_klog" \
+    FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit \
+    --branch fs-k8s-test-branch --model moonshotai/kimi-k3 \
+    --pi-args 'a\nb' \
+    "$proj_dir" "$handoff_file" >/tmp/fs-k8s-test-pialg-unsafe.out 2>&1 || pialg_rc=$?
+if (( pialg_rc != 0 )) && [[ ! -s "$pialg_klog" ]] \
+    && grep -q 'backslash' /tmp/fs-k8s-test-pialg-unsafe.out; then
+    ok "a --pi-args value with a backslash creates nothing (the stubbed kubectl recorded no call)"
+else
+    no "a --pi-args value with a backslash creates nothing (the stubbed kubectl recorded no call)" \
         "rc=$pialg_rc log=$(cat "$pialg_klog") out=$(cat /tmp/fs-k8s-test-pialg-unsafe.out)"
 fi
 rm -f /tmp/fs-k8s-test-pialg-unsafe.out

@@ -501,8 +501,10 @@ synthesize_pi_config() {
 # The pi coding leg's own invocation. The argv is built from MODEL and
 # PI_ARGS: PI_ARGS is split on whitespace and appended as an array --
 # splitting, never evaluation (no eval, no interpolation into a shell
-# string), and submit already refused shell metacharacters in the value
-# with fs_reject_unsafe_chars before any Job, Secret or proxy Pod existed.
+# string), and submit already refused a single quote or newline in the
+# value (fs_reject_unsafe_chars), plus a double quote or backslash
+# because the rendered Job carries it as a double-quoted YAML scalar,
+# before any Job, Secret or proxy Pod existed.
 # An unset or empty PI_ARGS appends nothing: an empty string argument
 # would be a positional pi rejects.
 run_pi_coding_leg() {

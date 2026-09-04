@@ -204,8 +204,10 @@
 # frontmatter carries `thinking:`. Only the pi harness starts pi, so
 # --harness claude is refused with it -- the same refusal fork-sandbox.sh's
 # own --pi-args applies. The value passes the same fs_reject_unsafe_chars
-# guard as --branch/--model/--checkout, at parse time, before any Job,
-# Secret or proxy Pod exists. It travels into the pod as the PI_ARGS env
+# guard as --branch/--model/--checkout, plus a double quote or backslash
+# of its own, because the rendered Job embeds it as a double-quoted YAML
+# scalar, at parse time, before any Job, Secret or proxy Pod exists. It
+# travels into the pod as the PI_ARGS env
 # var (exactly the path --model takes) and is split on whitespace into an
 # array the entrypoint expands as arguments: splitting, never eval, never
 # a shell-string interpolation. Unset or empty adds no arguments at all.
@@ -1482,9 +1484,25 @@ cmd_submit() {
     # line below (the push refspec), so it gets the same treatment as
     # branch and model: rejected before anything is created. pi_args is
     # caller-supplied command-line text that becomes arguments for the
-    # pod's pi invocation, so it is refused by the same guard here rather
-    # than anywhere pod-side.
+    # pod's pi invocation, so it is refused by the same guard here, plus
+    # the double quote and backslash, rather than anywhere pod-side.
     fs_reject_unsafe_chars "$branch" "$model" "$checkout_ref" "$pi_args" || exit 1
+    # pi_args is additionally embedded in the rendered Job's PI_ARGS env
+    # var as a YAML double-quoted scalar, so a double quote or a
+    # backslash is refused on top of the guard above: an unescaped quote
+    # would end the scalar and leave a manifest that dies at kubectl
+    # apply instead of at this parse-time refusal, and a backslash is an
+    # escape the YAML parser rewrites -- "a\nb" would reach pi as "a"
+    # plus a real newline, and the entrypoint's whitespace split would
+    # then drop the rest, wrong output with no diagnostic anywhere.
+    local backslash=$'\\'
+    if [[ "$pi_args" == *'"'* || "$pi_args" == *"$backslash"* ]]; then
+        echo "Error: --pi-args must not contain a double quote or a" >&2
+        echo "backslash: it is embedded in the rendered Job's PI_ARGS env" >&2
+        echo "var as a double-quoted YAML scalar, where either changes" >&2
+        echo "what pi receives." >&2
+        exit 1
+    fi
 
     # --review-loop takes a positive integer, the same shape and the same
     # message fork-sandbox.sh's own local flag uses, so a bad value reads

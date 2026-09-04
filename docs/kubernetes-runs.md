@@ -757,9 +757,11 @@ value lands in the rendered Job's `PI_ARGS` env var, and the entrypoint
 splits it on whitespace into an array and expands that array as
 arguments — splitting, never eval, never a shell-string interpolation.
 Because the value becomes command-line text inside the pod, it is
-refused at parse time by the same guard the branch, model and checkout
-values get (shell metacharacters), with nothing created for a refused
-value, and `--harness claude` is refused with it: only the pi harness
+refused at parse time — a single quote or newline by the same guard the
+branch, model and checkout values get, and additionally a double quote
+or backslash, because the rendered Job embeds the value as a
+double-quoted YAML scalar — with nothing created for a refused value,
+and `--harness claude` is refused with it: only the pi harness
 starts pi. Unset or empty means the flag was not given — no env var is
 rendered and no arguments are added, since an empty string argument
 would be a positional pi rejects. `fork-sandbox.sh --k8s` still refuses
