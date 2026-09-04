@@ -1001,6 +1001,38 @@ directory — a general "hand the pod any host path" mechanism, or a
 provisioned cache shared across runs — has no broader answer yet; that
 remains a later round, once real usage says what shape it should take.
 
+## Per-run services
+
+A repo commits `.agents/sandbox-services/services.yaml` to get throwaway
+services on `localhost` — postgres, redis, whatever a run needs beyond a
+checkout. The schema, its validation, and the two hard constraints (rootless
+images, `SIGTERM`) live in [docs/sandbox-services.md](sandbox-services.md)'s
+cluster section, since that file already documents the local path's own hook
+contract and this is the same idea for a different backend. What follows
+here is specific to this backend.
+
+Absent file, nothing changes: that is the state every existing repo is in.
+
+`submit` and `run` gate this exactly as they gate `--checkout`: pass
+`--services-trust-ref REF` to enable it under `--checkout`, naming the
+trusted base the checked-out ref is diffed against for changes under
+`.agents/sandbox-services/`. `--checkout` with no `--services-trust-ref`
+disables per-run services for that run, with a warning naming why — the
+spec is data an operator's own `kubectl apply` acts on, and an unanchored ref
+may be untrusted.
+
+Three `k8s.env` keys cap what a spec can claim, since a repo — the thing
+`services.yaml` lives in — is also the thing an agent can edit:
+
+- `K8S_SERVICES_MAX` — the most services one spec may declare. Default `8`.
+- `K8S_SERVICE_MAX_CPU` — the per-service CPU cap, a Kubernetes CPU quantity
+  (`500m`, `1`). Default `1000m`.
+- `K8S_SERVICE_MAX_MEMORY` — the per-service memory cap, a Kubernetes memory
+  quantity (`512Mi`, `1Gi`). Default `1Gi`.
+
+A spec over any of these is refused before the Job is even assembled, naming
+the offending field and which `k8s.env` key raises it.
+
 ## The agent pod
 
 The image is the one the container backend already uses,

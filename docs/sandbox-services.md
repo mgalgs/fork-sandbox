@@ -129,3 +129,143 @@ TCP-only services to sockets, `ports: !override []` throughout, and
 label-scoped teardown. Where a project already has a service-management
 script of its own, the hook is best written as a thin adapter over it plus a
 compose overlay that swaps published ports for socket mounts.
+
+## The cluster path: a committed spec, not a hook
+
+Everything above is the local path: an executable hook the harness invokes.
+The `--k8s` cluster path takes different input for the same idea — committed
+data, never code the harness would run with its own credentials. Two
+reasons, both load-bearing:
+
+1. The harness can then **guarantee** the sidecar's security context outright
+   instead of hoping a hook script emitted one.
+2. A spec is backend-agnostic, unlike a hook: the same file is meant to grow
+   into driving the local path too, later. The hook above is not going away
+   and is not being migrated by this section.
+
+### Where it lives
+
+    .agents/sandbox-services/services.yaml
+
+Same directory as the hook above, so a repo keeps one services directory
+regardless of which backend it runs under. Absent file means no services and
+no behaviour change — silent, not a warning, since that is the case every
+existing repo is in.
+
+### The schema, version 1
+
+```yaml
+version: 1
+services:
+  - name: postgres
+    image: registry.example/rootless/postgres:16
+    port: 5432
+    env:
+      POSTGRES_PASSWORD: dev
+    writableDirs:
+      - /var/lib/postgresql/data
+    readyWhen:
+      tcpPort: 5432
+    resources:
+      cpu: 500m
+      memory: 512Mi
+sandboxEnv:
+  DATABASE_URL: "postgres://dev:dev@127.0.0.1:5432/dev"
+```
+
+- `version` — required, must be `1`. Any other value is refused, naming the
+  supported versions — this is how the schema changes later without a repo
+  silently getting the wrong parse.
+- `services[].name` — required, `^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`, unique,
+  and not one of the harness's own pod container names. Becomes the
+  sidecar's container name.
+- `services[].image` — required, a fully qualified image ref.
+- `services[].port` — required, an integer **1025-65535**. Every service
+  container runs non-root (below), and a non-root process cannot bind a port
+  under 1024. Must not collide with another service's port.
+- `services[].env` — optional, a flat map of string to string. Literal
+  values only — no `valueFrom`, no secret reference, no substitution.
+- `services[].writableDirs` — optional, a list of absolute paths, each
+  mounted as its own `emptyDir`. Needed because the container runs with
+  `readOnlyRootFilesystem: true` and a service still needs somewhere to
+  write. Each must be absolute and must not contain a `..` component.
+- `services[].readyWhen.tcpPort` — optional. Renders a `startupProbe` so the
+  agent does not race the service coming up. There is no `exec` form: a
+  command here would be repo-controlled execution, which is exactly what a
+  spec (as opposed to a hook) removes.
+- `services[].resources` — optional, `cpu` and `memory`; capped by the
+  harness — see `docs/kubernetes-runs.md`'s `K8S_SERVICES_MAX` /
+  `K8S_SERVICE_MAX_CPU` / `K8S_SERVICE_MAX_MEMORY`.
+- `sandboxEnv` — optional, a flat string map, written verbatim to
+  `.env.sandbox` in the clone — the same filename the local hook path
+  writes. No templating and no substitution: the repo already chose the
+  ports, so it writes the literal connection URL itself. The port appearing
+  twice (once in a service's own `port`, again inside a `sandboxEnv` URL) is
+  deliberate — it buys away an entire class of injection surface a
+  templating step would reintroduce.
+
+**Unknown keys anywhere are an error, not ignored.** A typo'd `writeableDirs`
+that silently does nothing is exactly how a repo ends up debugging a service
+that has no disk.
+
+There is no field for `securityContext`, `hostPath`, `hostNetwork`,
+`privileged`, `capabilities`, or a service account — attempting any of them
+is rejected as an unknown key. Not merely refused: **not expressible**, so
+there is nothing to bypass.
+
+### Validation is the security boundary
+
+The spec comes from the repo, and the repo is something the agent itself can
+edit — every field is treated as hostile. Rejections name the offending
+field, e.g. `services[0].port: must be between 1025 and 65535, got 80`.
+`--services-trust-ref REF` gates the spec exactly as `--checkout` is gated
+for the rest of a run — see `docs/kubernetes-runs.md`'s "Per-run services"
+section for the three-way trust rule.
+
+### What the harness guarantees on every sidecar, never from the spec
+
+```yaml
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  capabilities:
+    drop: ["ALL"]
+```
+
+The namespace also enforces PodSecurity `restricted`; a pod missing this is
+rejected outright by the cluster, with no pod ever scheduled. `runAsUser`,
+`runAsGroup`, `fsGroup` and the seccomp profile come from the pod's own
+`securityContext`, which already applies to every container in the pod,
+sidecars included — they are not restated per service.
+
+Each service renders as a **native sidecar**: an `initContainers` entry with
+`restartPolicy: Always`, never a plain `containers:` entry. A Job pod is
+`Complete` only once every container has terminated, and a service never
+exits on its own — a regular container would hang the run until its TTL. A
+native sidecar starts before the main container, runs alongside it, and is
+terminated by the kubelet when the agent's own container exits.
+
+Two consequences worth knowing before reaching for this:
+
+- **A service image that needs root at startup cannot run here.** The stock
+  `postgres` image is the headline case — it starts as root to `chown` its
+  data directory before dropping privileges. Bring a rootless-capable image
+  instead; there is no way to relax the security context above for one
+  service.
+- **A service that ignores `SIGTERM` costs every run 30 extra seconds.** The
+  pod sets `terminationGracePeriodSeconds: 10` whenever services are
+  present, but a sidecar that does not handle `SIGTERM` as PID 1 rides out
+  the grace period and then still eats the kubelet's default wait before
+  `SIGKILL` — a run that finishes its actual work in seconds still pays the
+  full teardown. A service image that reaps `SIGTERM` avoids this entirely.
+
+### Telling the agent
+
+The clone gets `.env.sandbox` written pod-side, before the agent starts,
+from the spec's `sandboxEnv` — absent `sandboxEnv` writes nothing. The
+generated prompt gets a `## Per-run services` section naming each service's
+`127.0.0.1:<port>` and the `.env.sandbox` convention, in the same register as
+the local path's own "Per-run services are up" section above, minus the
+sockets directory and socat relay recipe — a sidecar shares the pod's
+network namespace, so it is reachable directly.

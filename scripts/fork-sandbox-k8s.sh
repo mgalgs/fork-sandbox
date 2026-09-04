@@ -7,7 +7,7 @@
 #                            [--pi-args ARGS] [--review-loop N] [--review-model MODEL]
 #                            [--outbox-max SIZE]
 #                            [--context-ro DIR]
-#                            [--checkout REF]
+#                            [--checkout REF] [--services-trust-ref REF]
 #                            <project-path> <handoff-file>
 #        fork-sandbox-k8s.sh run [--dry-run] [--timeout SECONDS] [--keep]
 #                            --branch NAME [--model MODEL] [--endpoint NAME]
@@ -15,7 +15,7 @@
 #                            [--review-loop N] [--review-model MODEL]
 #                            [--outbox-dir DIR] [--outbox-max SIZE]
 #                            [--context-ro DIR]
-#                            [--checkout REF]
+#                            [--checkout REF] [--services-trust-ref REF]
 #                            <project-path> <handoff-file>
 #        fork-sandbox-k8s.sh wait --branch NAME [--timeout SECONDS]
 #        fork-sandbox-k8s.sh collect --branch NAME [--outbox-dir DIR]
@@ -120,6 +120,17 @@
 # push, the pushed revision is the one the push line reports, and (under
 # --review-loop) the review base is the same revision the branch starts
 # from. With no --checkout, HEAD is resolved and pushed as before.
+#
+# --services-trust-ref REF (submit, run): the trusted base a per-run
+# services spec (.agents/sandbox-services/services.yaml) is diffed against
+# before it is honored -- exactly the trust gate --services-trust-ref
+# applies to the local path's own hook. Only meaningful alongside
+# --checkout: with no --checkout, the pushed revision is already the
+# operator's own HEAD and the spec is trusted as-is; a --checkout with no
+# --services-trust-ref disables per-run services for that run rather than
+# trusting an unanchored ref, and a --checkout whose ref changed
+# .agents/sandbox-services/ relative to REF disables them too -- both cases
+# warn naming why. See docs/kubernetes-runs.md's "Per-run services" section.
 #
 # --outbox-dir DIR (run, collect): where to land the pod's /work/outbox after the
 # agent finishes. Defaults to
