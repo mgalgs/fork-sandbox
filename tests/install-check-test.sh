@@ -31,12 +31,36 @@ trap 'rm -rf -- "$scratch"' EXIT
 
 fake_bin="$scratch/bin"
 mkdir -p "$fake_bin"
+
+# Keep the check independent of the host's local-backend installation. The
+# cluster-reporting assertions below should not fail just because this host
+# lacks bwrap, pasta, jq, or a particular GNU coreutils spelling.
+cat > "$fake_bin/dependency-stub" <<'EOF'
+#!/usr/bin/env bash
+case "${0##*/}" in
+    grealpath|gstat|gtimeout|realpath|stat|timeout)
+        if [[ "${1:-}" == --version ]]; then
+            echo "GNU coreutils test stub"
+        elif [[ "${0##*/}" == gtimeout || "${0##*/}" == timeout ]]; then
+            shift
+            exec "$@"
+        fi
+        ;;
+esac
+EOF
+chmod 755 "$fake_bin/dependency-stub"
+for tool in git jq bwrap pasta docker flock realpath stat gtimeout; do
+    ln -s dependency-stub "$fake_bin/$tool"
+done
+
 cat > "$fake_bin/kubectl" <<'EOF'
 #!/usr/bin/env bash
 if [[ "$*" == "version --client" ]]; then
     echo "Client Version: test"
 elif [[ "$*" == "config get-contexts -o name" ]]; then
-    [[ -n "${FAKE_CONTEXTS:-}" ]] && printf '%s\n' "$FAKE_CONTEXTS"
+    if [[ -n "${FAKE_CONTEXTS:-}" ]]; then
+        printf '%s\n' "$FAKE_CONTEXTS"
+    fi
 fi
 EOF
 chmod 755 "$fake_bin/kubectl"
@@ -102,6 +126,12 @@ unknown_output="$(PATH="$fake_bin:$PATH" FORK_SANDBOX_CONFIG_DIR="$context_dir" 
 unknown_rc=$?
 check_rc "unknown context check exits 0" 0 "$unknown_rc"
 contains "unknown context is reported" "is not in this machine's kubeconfig" "$unknown_output"
+
+empty_output="$(PATH="$fake_bin:$PATH" FORK_SANDBOX_CONFIG_DIR="$context_dir" \
+    FAKE_CONTEXTS='' "$repo_dir/install.sh" --check 2>&1)"
+empty_rc=$?
+check_rc "empty context check exits 0" 0 "$empty_rc"
+contains "empty kubeconfig reports unknown context" "is not in this machine's kubeconfig" "$empty_output"
 
 printf '\n%d ok / %d fail\n' "$pass" "$fail"
 (( fail == 0 ))

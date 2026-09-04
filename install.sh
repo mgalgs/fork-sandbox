@@ -110,6 +110,7 @@ fi
 # reports a match as a failure. Trying the bare name after a g-prefixed one
 # that turned out not to be GNU matters too -- `g`-prefixed is a convention,
 # not a guarantee.
+gnu_timeout=""
 for gnu_tool in realpath stat timeout; do
     gnu_found=""
     for gnu_cand in "g$gnu_tool" "$gnu_tool"; do
@@ -121,6 +122,8 @@ for gnu_tool in realpath stat timeout; do
     done
     if [[ -z "$gnu_found" ]]; then
         missing_required+=("GNU $gnu_tool — the scripts need it (brew install coreutils)")
+    elif [[ "$gnu_tool" == timeout ]]; then
+        gnu_timeout="$gnu_found"
     fi
 done
 
@@ -236,8 +239,8 @@ if [[ -e "$k8s_env" ]]; then
     else
         echo "    K8S_NAMESPACE: fork-sandbox (default)"
     fi
-    if [[ -n "${k8s_context:-}" ]] && command -v timeout >/dev/null 2>&1; then
-        if k8s_contexts="$(timeout 2s kubectl config get-contexts -o name 2>/dev/null)"; then
+    if [[ -n "${k8s_context:-}" && -n "$gnu_timeout" ]]; then
+        if k8s_contexts="$($gnu_timeout 2s kubectl config get-contexts -o name 2>/dev/null)"; then
             k8s_context_found=0
             while IFS= read -r context_name; do
                 if [[ "$context_name" == "$k8s_context" ]]; then
@@ -247,7 +250,7 @@ if [[ -e "$k8s_env" ]]; then
             done <<< "$k8s_contexts"
             if (( k8s_context_found )); then
                 echo "    K8S_CONTEXT: $k8s_context (found in this machine's kubeconfig)"
-            elif [[ -n "$k8s_contexts" ]]; then
+            else
                 echo "    K8S_CONTEXT: $k8s_context is not in this machine's kubeconfig; run 'kubectl config get-contexts' to see available contexts"
             fi
         fi
