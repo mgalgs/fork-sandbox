@@ -152,5 +152,13 @@ contains "dry-run: says no commit created" "$out3" "no commit created"
 onto_after3="$(git -C "$real_repo" rev-parse main)"
 check "dry-run: main's ref never moved" "$onto_before3" "$onto_after3"
 
+printf '\n== --help ==\n'
+h_out="$("$forklift" --help 2>&1)"; h_rc=$?
+if (( h_rc == 0 )); then ok "--help alone exits 0"; else no "--help alone exits 0" "exit $h_rc: $h_out"; fi
+contains "--help prints the header usage" "$h_out" "lkml-forklift.sh — Fold a reviewed version's delta back onto a real branch"
+h2_out="$("$forklift" -h 2>&1)"; h2_rc=$?
+if (( h2_rc == 0 )); then ok "-h alone exits 0"; else no "-h alone exits 0" "exit $h2_rc: $h2_out"; fi
+contains "-h prints the header usage" "$h2_out" "lkml-forklift.sh — Fold a reviewed version's delta back onto a real branch"
+
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 (( fail == 0 )) || exit 1

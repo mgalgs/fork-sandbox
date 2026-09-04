@@ -170,5 +170,13 @@ check "no patches-v1/ directory was created" "0" \
 check "versions.jsonl was never written" "0" \
     "$(find "$LKML_MAILBOX_ROOT/widget-frob" -maxdepth 1 -name 'versions.jsonl' 2>/dev/null | wc -l)"
 
+printf '\n== --help ==\n'
+h_out="$("$series_script" --help 2>&1)"; h_rc=$?
+if (( h_rc == 0 )); then ok "--help alone exits 0"; else no "--help alone exits 0" "exit $h_rc: $h_out"; fi
+contains "--help prints the header usage" "$h_out" "lkml-series.sh — Re-roll an already-merged range into a reviewable series"
+h2_out="$("$series_script" -h 2>&1)"; h2_rc=$?
+if (( h2_rc == 0 )); then ok "-h alone exits 0"; else no "-h alone exits 0" "exit $h2_rc: $h2_out"; fi
+contains "-h prints the header usage" "$h2_out" "lkml-series.sh — Re-roll an already-merged range into a reviewable series"
+
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 (( fail == 0 )) || exit 1

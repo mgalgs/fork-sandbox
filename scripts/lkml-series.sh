@@ -74,6 +74,15 @@ usage() {
     sed -n '2,/^set -uo/{ /^#/s/^# \?//p }' "$0"
 }
 
+# --help must be scanned over "$@" before the positional <series> is
+# consumed: a bare `--help` would otherwise bind to <series> and die on
+# the required-flag validation before the flag loop ever sees it.
+for arg in "$@"; do
+    case "$arg" in
+        -h|--help) usage; exit 0 ;;
+    esac
+done
+
 series="${1:?Usage: lkml-series.sh <series> --project <path> --range <base>..<tip>}"
 shift
 
