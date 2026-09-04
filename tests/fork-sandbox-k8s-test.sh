@@ -32,6 +32,17 @@
 #     substantially-over-cap outbox is diagnosed as over the cap (not as
 #     a read failure) even when kubectl dies of EPIPE, and the
 #     review-loop.json read carries the same request-timeout bound.
+#   - the `wait` and `collect` verbs, driven directly against the same
+#     stubbed kubectl pair: a completed wait prints the agent's exit code
+#     to stdout and nothing else (a non-zero AGENT exit is a successful
+#     wait that exits 0), while a Failed pod, a Failed job condition, a
+#     timeout and a malformed sentinel each fail the wait itself; collect
+#     lands the outbox at --outbox-dir, refuses an over-cap one without
+#     costing the fetch, warns on an unreadable one and still fetches,
+#     reports an approved and a cap review-loop outcome under
+#     --review-loop 1, never reads review-loop.json when --review-loop is
+#     omitted, removes the job unless --keep, and reads the outbox before
+#     the fetch touches /work/.fetched.
 #   - `submit --dry-run`'s rendered handoff.md carries the operator-inbox
 #     section, names /work/inbox, and never claims that directory is
 #     read-only -- it is not, in a pod (see docs/kubernetes-runs.md).
@@ -2406,6 +2417,338 @@ if runstub_run "$runstub_log5" "$runstub_out5" \
     fi
 else
     no "the review-loop.json kubectl exec carries a request-timeout bound" "run exited nonzero: $(cat "$runstub_out5")"
+fi
+
+printf '\n== fork-sandbox-k8s.sh wait: direct drive vs stubbed kubectl ==\n'
+# The extracted wait verb, driven directly against a stubbed kubectl that
+# serves canned pod/job answers through the environment. The distinction
+# under test is the whole reason the verb exists: a non-zero AGENT exit is
+# a successful wait that prints the code to stdout, while a non-zero wait
+# exit means the wait itself failed.
+waitstub_dir="$(newdir)"; tmpdirs+=("$waitstub_dir")
+cat > "$waitstub_dir/kubectl" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$K8S_STUB_LOG"
+case " $* " in
+    *" get pod -l job-name="*)
+        [[ -n "${K8S_STUB_POD_NAME:-}" ]] && printf '%s\n' "$K8S_STUB_POD_NAME"
+        exit 0 ;;
+    *" get pod "*)
+        printf '%s' "${K8S_STUB_POD_PHASE:-Running}"
+        exit 0 ;;
+    *" get job "*)
+        printf '%s' "${K8S_STUB_JOB_FAILED:-False}"
+        exit 0 ;;
+    *" cat /work/.run-complete "*)
+        [[ -n "${K8S_STUB_RUN_COMPLETE:-}" ]] && printf '%s\n' "$K8S_STUB_RUN_COMPLETE"
+        exit "${K8S_STUB_SENTINEL_RC:-1}" ;;
+esac
+exit 0
+STUB
+chmod +x "$waitstub_dir/kubectl"
+waitstub_wait() {
+    # $1 = kubectl log, $2 = stdout file, $3 = stderr file, rest = wait
+    # args. K8S_STUB_* env vars, set by the caller, control the pod's
+    # answers (sentinel value/rc, pod phase, job condition).
+    local log="$1" out="$2" err="$3"; shift 3
+    K8S_STUB_POD_NAME="${K8S_STUB_POD_NAME:-stub-pod}" \
+    PATH="$waitstub_dir:$PATH" K8S_STUB_LOG="$log" \
+    FORK_SANDBOX_CONFIG_DIR="$config_dir" \
+    "$k8s_sh" wait "$@" > "$out" 2> "$err"
+}
+
+# 1. Sentinel present: the agent's exit code lands on stdout, alone, and
+# the wait exits 0 even though the agent itself exited non-zero.
+wait_log1="$(newdir)/kubectl.log"; wait_out1="$(newdir)/out1.txt"; wait_err1="$(newdir)/err1.txt"
+tmpdirs+=("$(dirname "$wait_log1")")
+if K8S_STUB_RUN_COMPLETE=3 K8S_STUB_SENTINEL_RC=0 \
+    waitstub_wait "$wait_log1" "$wait_out1" "$wait_err1" \
+    --branch fs-k8s-test-wait-rc --timeout 5; then
+    if [[ "$(cat "$wait_out1")" == "3" ]] \
+        && grep -q 'agent finished (exit 3)' "$wait_err1"; then
+        ok "a completed wait prints the agent exit code to stdout, alone"
+    else
+        no "a completed wait prints the agent exit code to stdout, alone" \
+            "stdout='$(cat "$wait_out1")' stderr='$(cat "$wait_err1")'"
+    fi
+else
+    no "a completed wait prints the agent exit code to stdout, alone" "wait exited nonzero: $(cat "$wait_err1")"
+fi
+
+# 2. A Failed pod: the wait itself fails, naming the pod.
+wait_log2="$(newdir)/kubectl.log"; wait_out2="$(newdir)/out2.txt"; wait_err2="$(newdir)/err2.txt"
+tmpdirs+=("$(dirname "$wait_log2")")
+if K8S_STUB_POD_PHASE=Failed \
+    waitstub_wait "$wait_log2" "$wait_out2" "$wait_err2" \
+    --branch fs-k8s-test-wait-podfailed --timeout 5; then
+    no "a Failed pod fails the wait" "wait unexpectedly succeeded"
+else
+    if grep -q 'pod stub-pod is Failed -- it died before writing' "$wait_err2"; then
+        ok "a Failed pod fails the wait"
+    else
+        no "a Failed pod fails the wait" "$(cat "$wait_err2")"
+    fi
+fi
+
+# 3. A Failed job condition: the wait itself fails, naming the job.
+wait_log3="$(newdir)/kubectl.log"; wait_out3="$(newdir)/out3.txt"; wait_err3="$(newdir)/err3.txt"
+tmpdirs+=("$(dirname "$wait_log3")")
+if K8S_STUB_JOB_FAILED=True \
+    waitstub_wait "$wait_log3" "$wait_out3" "$wait_err3" \
+    --branch fs-k8s-test-wait-jobfailed --timeout 5; then
+    no "a Failed job condition fails the wait" "wait unexpectedly succeeded"
+else
+    if grep -q 'reports a Failed condition' "$wait_err3"; then
+        ok "a Failed job condition fails the wait"
+    else
+        no "a Failed job condition fails the wait" "$(cat "$wait_err3")"
+    fi
+fi
+
+# 4. No sentinel by the deadline: the wait itself fails with the fetch-by
+# hand advice. --timeout 0 trips on the first probe, so no 10s poll sleep.
+wait_log4="$(newdir)/kubectl.log"; wait_out4="$(newdir)/out4.txt"; wait_err4="$(newdir)/err4.txt"
+tmpdirs+=("$(dirname "$wait_log4")")
+if waitstub_wait "$wait_log4" "$wait_out4" "$wait_err4" \
+    --branch fs-k8s-test-wait-timeout --timeout 0; then
+    no "a timed-out wait fails" "wait unexpectedly succeeded"
+else
+    if grep -q 'timed out after 0s waiting for branch' "$wait_err4" \
+        && grep -q 'Fetch by hand once it' "$wait_err4"; then
+        ok "a timed-out wait fails with the fetch-by-hand advice"
+    else
+        no "a timed-out wait fails with the fetch-by-hand advice" "$(cat "$wait_err4")"
+    fi
+fi
+
+# 5. A malformed sentinel: the wait itself fails rather than guessing.
+wait_log5="$(newdir)/kubectl.log"; wait_out5="$(newdir)/out5.txt"; wait_err5="$(newdir)/err5.txt"
+tmpdirs+=("$(dirname "$wait_log5")")
+if K8S_STUB_RUN_COMPLETE='not-a-number' K8S_STUB_SENTINEL_RC=0 \
+    waitstub_wait "$wait_log5" "$wait_out5" "$wait_err5" \
+    --branch fs-k8s-test-wait-malformed --timeout 5; then
+    no "a malformed sentinel fails the wait" "wait unexpectedly succeeded"
+else
+    if grep -q 'does not hold an' "$wait_err5" \
+        && grep -q "integer exit code (got: 'not-a-number')" "$wait_err5"; then
+        ok "a malformed sentinel fails the wait"
+    else
+        no "a malformed sentinel fails the wait" "$(cat "$wait_err5")"
+    fi
+fi
+
+printf '\n== fork-sandbox-k8s.sh collect: direct drive vs stubbed kubectl ==\n'
+# The extracted collect verb, driven directly against a stubbed git+kubectl
+# pair: the same outbox machinery run drives, with the pod's answers
+# controlled through the environment.
+collectstub_dir="$(newdir)"; tmpdirs+=("$collectstub_dir")
+cat > "$collectstub_dir/git" <<'STUB'
+#!/usr/bin/env bash
+case " $* " in
+    *" push "*) exit 0 ;;
+    *" fetch "*) exit 0 ;;
+esac
+exec /usr/bin/git "$@"
+STUB
+cat > "$collectstub_dir/kubectl" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$K8S_STUB_LOG"
+case " $* " in
+    *" get pod -l job-name="*)
+        [[ -n "${K8S_STUB_POD_NAME:-}" ]] && printf '%s\n' "$K8S_STUB_POD_NAME"
+        exit 0 ;;
+    *" cat /work/review-loop.json "*)
+        [[ -n "${K8S_STUB_REVIEW_LOOP_JSON:-}" ]] && printf '%s' "$K8S_STUB_REVIEW_LOOP_JSON"
+        exit "${K8S_STUB_REVIEW_LOOP_RC:-0}" ;;
+    *" tar cf - -C /work/outbox "*)
+        # Serve the fixture stream whenever K8S_STUB_OUTBOX_DIR is set,
+        # independently of the exit status -- same trick the runstub uses
+        # above.
+        if [[ -n "${K8S_STUB_OUTBOX_DIR:-}" ]]; then
+            ( cd "$K8S_STUB_OUTBOX_DIR" && tar cf - . ) || true
+        fi
+        [[ -n "${K8S_STUB_OUTBOX_STDERR:-}" ]] && printf '%s' "$K8S_STUB_OUTBOX_STDERR" >&2
+        exit "${K8S_STUB_OUTBOX_RC:-1}" ;;
+    *" delete "*) exit 0 ;;
+esac
+exit 0
+STUB
+chmod +x "$collectstub_dir/git" "$collectstub_dir/kubectl"
+collectstub_collect() {
+    # $1 = kubectl log, $2 = output file, rest = collect args.
+    local log="$1" out="$2"; shift 2
+    K8S_STUB_POD_NAME="${K8S_STUB_POD_NAME:-stub-pod}" \
+    PATH="$collectstub_dir:$PATH" K8S_STUB_LOG="$log" \
+    K8S_STUB_OUTBOX_DIR="${K8S_STUB_OUTBOX_DIR:-$runstub_pod_outbox}" \
+    FORK_SANDBOX_CONFIG_DIR="$config_dir" \
+    "$k8s_sh" collect "$@" > "$out" 2>&1
+}
+
+# 1. A readable outbox lands at the --outbox-dir path, and the fetch still
+# happens.
+collect_log1="$(newdir)/kubectl.log"; collect_out1="$(newdir)/out1.txt"; collect_dest1="$(newdir)/outbox-1"
+tmpdirs+=("$(dirname "$collect_log1")" "$(dirname "$collect_dest1")")
+if K8S_STUB_OUTBOX_RC=0 \
+    collectstub_collect "$collect_log1" "$collect_out1" \
+    --branch fs-k8s-test-collect-outbox --outbox-dir "$collect_dest1" "$proj_dir"; then
+    if [[ -f "$collect_dest1/hello.txt" ]] \
+        && grep -q "outbox: 1 file(s) at $collect_dest1" "$collect_out1" \
+        && grep -q 'fetched into' "$collect_out1"; then
+        ok "collect lands the outbox at --outbox-dir and fetches"
+    else
+        no "collect lands the outbox at --outbox-dir and fetches" \
+            "dest=$(find "$collect_dest1" 2>/dev/null) out=$(cat "$collect_out1")"
+    fi
+else
+    no "collect lands the outbox at --outbox-dir and fetches" "collect exited nonzero: $(cat "$collect_out1")"
+fi
+
+# 2. An over-cap outbox is refused -- and only the pull-back is refused:
+# the fetch must still complete and collect must still exit 0.
+collect_log2="$(newdir)/kubectl.log"; collect_out2="$(newdir)/out2.txt"; collect_dest2="$(newdir)/outbox-2"
+tmpdirs+=("$(dirname "$collect_log2")" "$(dirname "$collect_dest2")")
+if K8S_STUB_OUTBOX_DIR="$runstub_big_outbox" K8S_STUB_OUTBOX_RC=141 \
+    collectstub_collect "$collect_log2" "$collect_out2" \
+    --branch fs-k8s-test-collect-overcap --outbox-max 128 --outbox-dir "$collect_dest2" "$proj_dir"; then
+    if grep -q 'over the 128 byte cap; refusing to pull it back' "$collect_out2" \
+        && ! grep -q 'could not read the outbox' "$collect_out2" \
+        && [[ ! -d "$collect_dest2" ]] \
+        && grep -q 'fetched into' "$collect_out2"; then
+        ok "collect refuses an over-cap outbox without costing the fetch"
+    else
+        no "collect refuses an over-cap outbox without costing the fetch" \
+            "dest=$(find "$collect_dest2" 2>/dev/null) out=$(cat "$collect_out2")"
+    fi
+else
+    no "collect refuses an over-cap outbox without costing the fetch" "collect exited nonzero: $(cat "$collect_out2")"
+fi
+
+# 3. An unreadable outbox warns, falls through, and the fetch succeeds.
+collect_log3="$(newdir)/kubectl.log"; collect_out3="$(newdir)/out3.txt"; collect_dest3="$(newdir)/outbox-3"
+tmpdirs+=("$(dirname "$collect_log3")" "$(dirname "$collect_dest3")")
+if K8S_STUB_OUTBOX_STDERR='stub-kubectl says: outbox read exploded' K8S_STUB_OUTBOX_RC=1 \
+    collectstub_collect "$collect_log3" "$collect_out3" \
+    --branch fs-k8s-test-collect-outbox-err --outbox-dir "$collect_dest3" "$proj_dir"; then
+    if grep -q 'warning: could not read the outbox' "$collect_out3" \
+        && grep -q 'stub-kubectl says: outbox read exploded' "$collect_out3" \
+        && grep -q 'fetched into' "$collect_out3"; then
+        ok "collect warns on an unreadable outbox and still fetches"
+    else
+        no "collect warns on an unreadable outbox and still fetches" "$(cat "$collect_out3")"
+    fi
+else
+    no "collect warns on an unreadable outbox and still fetches" "collect exited nonzero: $(cat "$collect_out3")"
+fi
+
+# 4. --review-loop 1 reports an approved outcome.
+collect_log4="$(newdir)/kubectl.log"; collect_out4="$(newdir)/out4.txt"; collect_dest4="$(newdir)/outbox-4"
+tmpdirs+=("$(dirname "$collect_log4")" "$(dirname "$collect_dest4")")
+if K8S_STUB_OUTBOX_RC=0 K8S_STUB_REVIEW_LOOP_JSON='{"ended":"approved","iterations":[{},{}]}' \
+    collectstub_collect "$collect_log4" "$collect_out4" \
+    --branch fs-k8s-test-collect-loop-approved --review-loop 1 \
+    --outbox-dir "$collect_dest4" "$proj_dir"; then
+    if grep -q 'review loop: APPROVED after 2 iteration(s)' "$collect_out4"; then
+        ok "collect --review-loop 1 reports an approved outcome"
+    else
+        no "collect --review-loop 1 reports an approved outcome" "$(cat "$collect_out4")"
+    fi
+else
+    no "collect --review-loop 1 reports an approved outcome" "collect exited nonzero: $(cat "$collect_out4")"
+fi
+
+# 5. --review-loop 1 reports a cap outcome, with the last iteration's
+# finding count.
+collect_log5="$(newdir)/kubectl.log"; collect_out5="$(newdir)/out5.txt"; collect_dest5="$(newdir)/outbox-5"
+tmpdirs+=("$(dirname "$collect_log5")" "$(dirname "$collect_dest5")")
+if K8S_STUB_OUTBOX_RC=0 \
+    K8S_STUB_REVIEW_LOOP_JSON='{"ended":"cap","iterations":[{"findings":5},{"findings":4}]}' \
+    collectstub_collect "$collect_log5" "$collect_out5" \
+    --branch fs-k8s-test-collect-loop-cap --review-loop 1 \
+    --outbox-dir "$collect_dest5" "$proj_dir"; then
+    if grep -q "review loop ended 'cap' after" "$collect_out5" \
+        && grep -q '2 iteration(s)' "$collect_out5" \
+        && grep -q '4 finding(s)' "$collect_out5"; then
+        ok "collect --review-loop 1 reports a cap outcome"
+    else
+        no "collect --review-loop 1 reports a cap outcome" "$(cat "$collect_out5")"
+    fi
+else
+    no "collect --review-loop 1 reports a cap outcome" "collect exited nonzero: $(cat "$collect_out5")"
+fi
+
+# 6. --review-loop omitted: no review-loop.json read at all -- a loop
+# outcome that was never going to be printed must not be read "just in
+# case" and turned into silence.
+collect_log6="$(newdir)/kubectl.log"; collect_out6="$(newdir)/out6.txt"; collect_dest6="$(newdir)/outbox-6"
+tmpdirs+=("$(dirname "$collect_log6")" "$(dirname "$collect_dest6")")
+if K8S_STUB_OUTBOX_RC=0 \
+    collectstub_collect "$collect_log6" "$collect_out6" \
+    --branch fs-k8s-test-collect-no-loop --outbox-dir "$collect_dest6" "$proj_dir"; then
+    if ! grep -q 'review-loop.json' "$collect_log6"; then
+        ok "collect without --review-loop reads no review-loop.json"
+    else
+        no "collect without --review-loop reads no review-loop.json" \
+            "log=$(grep 'review-loop.json' "$collect_log6")"
+    fi
+else
+    no "collect without --review-loop reads no review-loop.json" "collect exited nonzero: $(cat "$collect_out6")"
+fi
+
+# 7. --keep leaves the job and pod in place.
+collect_log7="$(newdir)/kubectl.log"; collect_out7="$(newdir)/out7.txt"; collect_dest7="$(newdir)/outbox-7"
+tmpdirs+=("$(dirname "$collect_log7")" "$(dirname "$collect_dest7")")
+if K8S_STUB_OUTBOX_RC=0 \
+    collectstub_collect "$collect_log7" "$collect_out7" \
+    --branch fs-k8s-test-collect-keep --outbox-dir "$collect_dest7" --keep "$proj_dir"; then
+    if grep -q -- '--keep set; leaving job and pod' "$collect_out7" \
+        && ! grep -q 'delete job' "$collect_log7"; then
+        ok "collect --keep leaves the job in place"
+    else
+        no "collect --keep leaves the job in place" \
+            "log=$(grep 'delete' "$collect_log7") out=$(cat "$collect_out7")"
+    fi
+else
+    no "collect --keep leaves the job in place" "collect exited nonzero: $(cat "$collect_out7")"
+fi
+
+# 8. Without --keep the job is removed.
+collect_log8="$(newdir)/kubectl.log"; collect_out8="$(newdir)/out8.txt"; collect_dest8="$(newdir)/outbox-8"
+tmpdirs+=("$(dirname "$collect_log8")" "$(dirname "$collect_dest8")")
+if K8S_STUB_OUTBOX_RC=0 \
+    collectstub_collect "$collect_log8" "$collect_out8" \
+    --branch fs-k8s-test-collect-rm --outbox-dir "$collect_dest8" "$proj_dir"; then
+    if grep -q 'delete job' "$collect_log8" \
+        && ! grep -q -- '--keep set' "$collect_out8"; then
+        ok "collect without --keep removes the job"
+    else
+        no "collect without --keep removes the job" \
+            "log=$(grep 'delete' "$collect_log8") out=$(cat "$collect_out8")"
+    fi
+else
+    no "collect without --keep removes the job" "collect exited nonzero: $(cat "$collect_out8")"
+fi
+
+# 9. The ordering invariant holds on the collect path too: the outbox tar
+# read must appear in the kubectl log BEFORE the fetch's touch
+# /work/.fetched.
+collect_log9="$(newdir)/kubectl.log"; collect_out9="$(newdir)/out9.txt"; collect_dest9="$(newdir)/outbox-9"
+tmpdirs+=("$(dirname "$collect_log9")" "$(dirname "$collect_dest9")")
+if K8S_STUB_OUTBOX_RC=0 \
+    collectstub_collect "$collect_log9" "$collect_out9" \
+    --branch fs-k8s-test-collect-ordering --outbox-dir "$collect_dest9" "$proj_dir"; then
+    # || true: under pipefail a grep that finds nothing would otherwise
+    # take the whole suite down at the assignment rather than failing the
+    # assertion below.
+    tar_ln="$(grep -n 'tar cf - -C /work/outbox' "$collect_log9" | head -n 1 | cut -d: -f1 || true)"
+    fetched_ln="$(grep -n 'touch /work/.fetched' "$collect_log9" | head -n 1 | cut -d: -f1 || true)"
+    if [[ -n "$tar_ln" && -n "$fetched_ln" ]] && (( tar_ln < fetched_ln )); then
+        ok "collect pulls the outbox back before the fetch touches /work/.fetched"
+    else
+        no "collect pulls the outbox back before the fetch touches /work/.fetched" \
+            "tar_ln=$tar_ln fetched_ln=$fetched_ln out=$(cat "$collect_out9")"
+    fi
+else
+    no "collect pulls the outbox back before the fetch touches /work/.fetched" "collect exited nonzero: $(cat "$collect_out9")"
 fi
 
 printf '\n== fork-sandbox-k8s.sh say: argument validation (no cluster) ==\n'
