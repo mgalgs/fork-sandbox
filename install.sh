@@ -17,7 +17,9 @@
 #
 # --check reports what is missing and installs nothing. Run it first; the
 # sandbox needs bubblewrap and pasta, and neither is usually present by
-# default.
+# default. Every run also prints a separate, informational section reporting
+# what the cluster path (fork-sandbox.sh --k8s) needs on this machine, because
+# the two roads need different things.
 #
 # This does NOT touch settings.json. The three commands meant to run without a
 # permission prompt are listed in docs/permissions.md, with the reasoning for
@@ -170,6 +172,42 @@ if [[ -r /proc/sys/kernel/unprivileged_userns_clone ]] &&
     echo "  sudo sysctl -w kernel.unprivileged_userns_clone=1"
     echo ""
 fi
+
+# --- Cluster path: a different road, reported separately ---------------------
+#
+# Informational only, and about a DIFFERENT road than the requirements above:
+# fork-sandbox.sh --k8s runs the whole sandbox as a pod, so on that road the
+# local sandbox never runs at all -- no container runtime, no sandbox image,
+# no FORK_SANDBOX_BACKEND. Nothing here changes what the local backend
+# requires, and a missing kubectl is not a broken install: it means only the
+# cluster road is unavailable on this machine. Presence of a binary and of a
+# file only: this installs nothing and must not contact a cluster.
+echo ""
+echo "Cluster path (fork-sandbox.sh --k8s) -- a different road, informational only:"
+echo "The sandbox is a pod, so this machine supplies neither a container"
+echo "runtime (bwrap or docker) nor a locally-built sandbox image -- the pod"
+echo "runs K8S_IMAGE from a registry. Nothing in this section is a required tool."
+if kubectl_bin="$(command -v kubectl 2>/dev/null)"; then
+    # --client reaches no cluster, and newer kubectl dropped -o short, so no
+    # -o at all: take the first line, which is the Client version, and leave
+    # the Kustomize line out of the report.
+    kubectl_version="$(kubectl version --client 2>/dev/null | grep -m1 '^Client Version:' || true)"
+    if [[ -n "$kubectl_version" ]]; then
+        echo "  kubectl: found ($kubectl_bin)"
+        echo "    $kubectl_version"
+    else
+        echo "  kubectl: found ($kubectl_bin)"
+    fi
+else
+    echo "  kubectl: not found on PATH (cluster road unavailable; local backend unaffected)"
+fi
+k8s_config_dir="${FORK_SANDBOX_CONFIG_DIR:-$HOME/.config/fork-sandbox}"
+if [[ -e "$k8s_config_dir/k8s.env" ]]; then
+    echo "  $k8s_config_dir/k8s.env: present"
+else
+    echo "  $k8s_config_dir/k8s.env: not present"
+fi
+echo "  Usage: docs/kubernetes-runs.md."
 
 if (( CHECK_ONLY )); then
     if (( ${#missing_required[@]} )); then
