@@ -746,6 +746,25 @@ for that reason, submit prints the pod's container log — where the
 entrypoint's fail-fast message actually is — instead of leaving the
 operator with git's bare "connection refused".
 
+**`--pi-args ARGS` appends extra arguments to the pi coding leg's
+invocation.** `submit` and `run` accept it and pass it, verbatim, to the
+pod's own pi command line — e.g. `--thinking low` for a persona whose
+frontmatter carries `thinking:`. That is not cosmetic: a small local
+thinking model left at its default can spend its entire reply budget
+reasoning and produce no output at all, so such a seat cannot launch on
+the cluster without it. It travels exactly the path `--model` takes: the
+value lands in the rendered Job's `PI_ARGS` env var, and the entrypoint
+splits it on whitespace into an array and expands that array as
+arguments — splitting, never eval, never a shell-string interpolation.
+Because the value becomes command-line text inside the pod, it is
+refused at parse time by the same guard the branch, model and checkout
+values get (shell metacharacters), with nothing created for a refused
+value, and `--harness claude` is refused with it: only the pi harness
+starts pi. Unset or empty means the flag was not given — no env var is
+rendered and no arguments are added, since an empty string argument
+would be a positional pi rejects. `fork-sandbox.sh --k8s` still refuses
+`--pi-args` by name; use `fork-sandbox-k8s.sh` directly for it.
+
 ### 1b. proxy, per-run, for claude — **Status: built.**
 
 `--harness claude` does not fit mode 1 above: OpenRouter's key is a
