@@ -450,6 +450,7 @@ tree_text="$("$mailbox" tree "$series" --version "$version" 2>/dev/null)" || tre
 IFS=',' read -ra personas <<< "$personas_csv"
 
 declare -A run_dir_of=() harness_of=() model_of=() display_of=()
+declare -A branch_of=() outbox_of=()
 launch_failed=0
 
 # Resolve every seat before ANY launch, and let the launch loop below
@@ -609,6 +610,52 @@ for persona in "${personas[@]}"; do
     if [[ -n "$thinking" && ( "$harness" == "pi" || "$harness" == "pi-local" ) ]]; then
         pi_args=(--pi-args "--thinking $thinking")
         thinking_note=", thinking $thinking"
+    fi
+
+    if (( k8s )); then
+        # The cluster analogue of the local launch, in two phases: this
+        # phase only SUBMITS (non-blocking); the wait/collect loop after
+        # the last submit collects each seat as it completes. The seat's
+        # replies are pulled back to its OWN outbox directory, named
+        # after its branch (unique per seat) under the run root this
+        # script already uses: one shared directory would mix every
+        # seat's replies and stamp them all with whichever persona was
+        # harvested first.
+        outbox_of["$persona"]="/var/tmp/claude-scratch/forks/lkml-round-k8s/$branch/outbox"
+        submit_argv=(submit --branch "$branch" --harness "$harness" --checkout "$checkout_ref")
+        [[ -n "$model" ]] && submit_argv+=(--model "$model")
+        # pi (and a translated pi-local) seat is wired to the endpoint;
+        # a claude seat runs against its own per-run proxy and is not.
+        [[ "$harness" == "pi" ]] && submit_argv+=(--endpoint "$endpoint")
+        (( ${#pi_args[@]} > 0 )) && submit_argv+=("${pi_args[@]}")
+        submit_argv+=("$project" "$handoff_file")
+
+        echo "fork-sandbox lkml-round: submitting $persona ($harness${model:+/$model}$thinking_note) to the cluster as $branch..." >&2
+        submit_out="$(fork-sandbox-k8s.sh "${submit_argv[@]}" 2>&1)"
+        rc=$?
+        if (( rc != 0 )); then
+            echo "Error: submitting $persona to the cluster failed:" >&2
+            printf '%s\n' "$submit_out" >&2
+            launch_failed=1
+            continue
+        fi
+        branch_of["$persona"]="$branch"
+        harness_of["$persona"]="$harness"
+        model_of["$persona"]="$model"
+        display_of["$persona"]="$display"
+        # Cost ledger: a cluster run has no run dir, so its line records
+        # the seat's branch instead, marked cluster so a reader knows
+        # why there is no cost. The cost of a cluster run is currently
+        # UNKNOWN, not free -- do not write a zero that would make
+        # lkml-status.sh under-report a real number later. (Making
+        # cluster runs appear in lkml-status.sh's run log at all is a
+        # separate, blocked round.)
+        ledger_root="${LKML_MAILBOX_ROOT:-/var/tmp/claude-scratch/lkml}"
+        mkdir -p -- "$ledger_root/$series"
+        jq -nc --arg persona "$persona" --arg branch "$branch" --arg kind review \
+            '{persona:$persona, branch:$branch, kind:$kind, cluster:true}' \
+            >> "$ledger_root/$series/runs.jsonl"
+        continue
     fi
 
     echo "fork-sandbox lkml-round: launching $persona ($harness_spec$thinking_note)..." >&2
