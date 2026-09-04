@@ -318,6 +318,29 @@ kubectl() {
     command kubectl --context="$K8S_CONTEXT" -n "$K8S_NAMESPACE" "$@"
 }
 
+# Report the stderr a failed kubectl read captured to $file, instead of
+# discarding it (a 2>/dev/null on the read throws away the only thing that
+# would explain the failure). Prints a labeled heading line, then the
+# captured text indented so it reads as kubectl's own output; the body is
+# capped at 4 KiB so a pathological stderr cannot flood the operator's
+# terminal, with a note when it was truncated. An empty capture is itself
+# a fact: it says so explicitly rather than printing an empty block.
+fs_report_captured_stderr() {
+    local what="$1" file="$2" size cap=4096
+    size="$(stat -c '%s' -- "$file")"
+    if (( size == 0 )); then
+        echo "fork-sandbox-k8s: $what wrote nothing to stderr." >&2
+        return 0
+    fi
+    echo "fork-sandbox-k8s: $what reported, on stderr:" >&2
+    if (( size > cap )); then
+        sed 's/^/    /' <(head -c "$cap" -- "$file") >&2
+        echo "fork-sandbox-k8s:    (... truncated; $size bytes total)" >&2
+    else
+        sed 's/^/    /' "$file" >&2
+    fi
+}
+
 # The pod's operator inbox. Must track fork-sandbox-k8s-entrypoint.sh's own
 # work_dir/inbox_dir, for the same reason cmd_submit's pod_clone_dir must
 # track its work_dir/clone_dir: this script renders and writes before the
@@ -2373,8 +2396,9 @@ cmd_run() {
     # success and say nothing about it. Read before cmd_fetch, so this
     # prints even if the fetch itself fails partway through.
     if (( review_loop_cap > 0 )); then
-        local loop_json
-        if loop_json="$(kubectl exec "$pod_name" -- cat /work/review-loop.json 2>/dev/null)" \
+        local loop_json loop_err
+        loop_err="$(mktemp)"
+        if loop_json="$(kubectl exec "$pod_name" -- cat /work/review-loop.json 2> "$loop_err")" \
             && jq -e . >/dev/null 2>&1 <<< "$loop_json"; then
             local loop_ended loop_detail loop_iters loop_last_findings
             loop_ended="$(jq -r '.ended // "unknown"' <<< "$loop_json")"
@@ -2405,7 +2429,9 @@ cmd_run() {
         else
             echo "fork-sandbox-k8s: warning: could not read /work/review-loop.json" >&2
             echo "from pod $pod_name -- the branch is still worth fetching." >&2
+            fs_report_captured_stderr "kubectl exec into pod $pod_name (review-loop.json read)" "$loop_err"
         fi
+        rm -f -- "$loop_err"
     fi
 
     echo "fork-sandbox-k8s: fetching branch $branch" >&2
@@ -2419,13 +2445,16 @@ cmd_run() {
     local outbox_dest="$outbox_dir"
     [[ -n "$outbox_dest" ]] \
         || outbox_dest="/var/tmp/claude-scratch/forks/k8s-$(k8s_safe_name_component "$branch")/outbox"
-    local outbox_tar outbox_ok=true
+    local outbox_tar outbox_err outbox_ok=true
     outbox_tar="$(mktemp)"
-    if ! kubectl exec "$pod_name" -- tar cf - -C /work/outbox . 2>/dev/null \
+    outbox_err="$(mktemp)"
+    if ! kubectl exec "$pod_name" -- tar cf - -C /work/outbox . 2> "$outbox_err" \
             | head -c "$((outbox_max_bytes + 1))" > "$outbox_tar"; then
         echo "fork-sandbox-k8s: warning: could not read the outbox from pod $pod_name; nothing pulled back." >&2
+        fs_report_captured_stderr "kubectl exec into pod $pod_name (outbox read)" "$outbox_err"
         outbox_ok=false
     fi
+    rm -f -- "$outbox_err"
     if [[ "$outbox_ok" == true ]] && (( $(stat -c '%s' -- "$outbox_tar") > outbox_max_bytes )); then
         echo "fork-sandbox-k8s: warning: pod $pod_name's outbox is over the $outbox_max_bytes byte cap; refusing to pull it back." >&2
         outbox_ok=false
