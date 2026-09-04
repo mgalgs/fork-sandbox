@@ -510,6 +510,7 @@ def cmd_verdict(args):
 
 def apply_filters(runs, args):
     out = []
+    excluded_tests = 0
     since = None
     if getattr(args, "days", None):
         since = dt.datetime.now().astimezone() - dt.timedelta(days=args.days)
@@ -532,8 +533,23 @@ def apply_filters(runs, args):
             continue
         if args.outcome and get_path(rec, "verdict.outcome") != args.outcome:
             continue
+        # Only the exact value "test" is hidden -- a test suite's fixture
+        # runs, kept out of the operator's performance stats. Deliberately
+        # not "anything but fork-sandbox": a future source value must
+        # appear in the stats by default rather than vanish silently. show
+        # does not filter at all; per-run inspection is unaffected.
+        if rec.get("source") == TEST_SOURCE \
+                and not getattr(args, "include_tests", False):
+            excluded_tests += 1
+            continue
         out.append(rec)
     out.sort(key=lambda r: r.get("ts", ""))
+    if excluded_tests:
+        # A bounded result says what it dropped: silent exclusion reads as
+        # "covered everything" when it did not. stderr, so a piped list
+        # stays machine-readable on stdout.
+        print(f"sandbox-run-log: {excluded_tests} test run(s) excluded; "
+              f"pass --include-tests to include them", file=sys.stderr)
     return out
 
 
@@ -647,6 +663,9 @@ def add_filter_args(p):
     p.add_argument("--outcome", choices=OUTCOMES, help="verdict outcome")
     p.add_argument("--days", type=int, help="only runs from the last N days")
     p.add_argument("--since", help="only runs since YYYY-MM-DD")
+    p.add_argument("--include-tests", action="store_true",
+                   help="include records whose source is 'test' "
+                        "(excluded by default)")
 
 
 def main():
