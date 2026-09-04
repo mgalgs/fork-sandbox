@@ -27,8 +27,11 @@
 #     end against a stubbed kubectl+git pair (the stub cannot prove what a
 #     real pod does with the .fetched marker, only what the client does in
 #     what order): a failed outbox read reports kubectl's own stderr,
-#     a failed read with empty stderr says so explicitly, and the outbox
-#     read happens BEFORE the fetch touches /work/.fetched.
+#     a failed read with empty stderr says so explicitly, the outbox
+#     read happens BEFORE the fetch touches /work/.fetched, a
+#     substantially-over-cap outbox is diagnosed as over the cap (not as
+#     a read failure) even when kubectl dies of EPIPE, and the
+#     review-loop.json read carries the same request-timeout bound.
 #   - `submit --dry-run`'s rendered handoff.md carries the operator-inbox
 #     section, names /work/inbox, and never claims that directory is
 #     read-only -- it is not, in a pod (see docs/kubernetes-runs.md).
@@ -2215,8 +2218,10 @@ printf '\n== fork-sandbox-k8s.sh run: poll/fetch/pull-back vs stubbed kubectl ==
 # end with a stubbed git (no-ops the ext:: push/fetch) and a stubbed
 # kubectl (logs every invocation, serves canned answers). The outbox read
 # -- the kubectl exec that tars /work/outbox -- is controlled through the
-# environment: K8S_STUB_OUTBOX_RC is its exit status, K8S_STUB_OUTBOX_STDERR
-# what it writes to stderr, and on success it tars K8S_STUB_OUTBOX_DIR.
+# environment: it always tars K8S_STUB_OUTBOX_DIR when that is set, then
+# exits with K8S_STUB_OUTBOX_RC and writes K8S_STUB_OUTBOX_STDERR to stderr
+# -- RC is independent of the streaming, which is what lets a test pair a
+# large stream with EPIPE's status.
 runstub_dir="$(newdir)"; tmpdirs+=("$runstub_dir")
 cat > "$runstub_dir/git" <<'STUB'
 #!/usr/bin/env bash
@@ -2235,8 +2240,12 @@ case " $* " in
     *" get "*) printf 'stub-pod\n' ;;
     *" delete "*) exit 0 ;;
     *" tar cf - -C /work/outbox "*)
-        if [[ "${K8S_STUB_OUTBOX_RC:-1}" == 0 ]]; then
-            cd "$K8S_STUB_OUTBOX_DIR" && tar cf - .
+        # Serve the fixture stream whenever K8S_STUB_OUTBOX_DIR is set,
+        # independently of the exit status -- a kubectl exec that dies of
+        # EPIPE partway through an over-cap stream has already streamed
+        # data, so callers can pair a large fixture with a non-zero RC.
+        if [[ -n "${K8S_STUB_OUTBOX_DIR:-}" ]]; then
+            ( cd "$K8S_STUB_OUTBOX_DIR" && tar cf - . ) || true
         fi
         [[ -n "${K8S_STUB_OUTBOX_STDERR:-}" ]] && printf '%s' "$K8S_STUB_OUTBOX_STDERR" >&2
         exit "${K8S_STUB_OUTBOX_RC:-1}"
@@ -2250,9 +2259,11 @@ runstub_pod_outbox="$(newdir)"; tmpdirs+=("$runstub_pod_outbox")
 printf 'an artifact\n' > "$runstub_pod_outbox/hello.txt"
 runstub_run() {
     # $1 = kubectl log, $2 = output file, rest = fork-sandbox-k8s.sh run args.
+    # K8S_STUB_OUTBOX_DIR may be set by the caller to serve a different
+    # pod-side outbox fixture than the default one.
     local log="$1" out="$2"; shift 2
     PATH="$runstub_dir:$PATH" K8S_STUB_LOG="$log" \
-        K8S_STUB_OUTBOX_DIR="$runstub_pod_outbox" \
+        K8S_STUB_OUTBOX_DIR="${K8S_STUB_OUTBOX_DIR:-$runstub_pod_outbox}" \
         FORK_SANDBOX_CONFIG_DIR="$config_dir" \
         "$k8s_sh" run "$@" > "$out" 2>&1
 }
@@ -2327,6 +2338,61 @@ if K8S_STUB_OUTBOX_RC=0 runstub_run "$runstub_log3" "$runstub_out3" \
     fi
 else
     no "outbox is pulled back before the fetch touches /work/.fetched" "run exited nonzero: $(cat "$runstub_out3")"
+fi
+
+# 4. A substantially-over-cap outbox is the over-cap case, not a read
+# failure: with set -o pipefail in force, head -c exiting early makes
+# kubectl die of EPIPE and the pipeline non-zero. K8S_STUB_OUTBOX_RC=141
+# (bash's SIGPIPE status) emulates that EPIPE on a stream that is well
+# past the cap -- the run must warn about the cap, not report a failed
+# read, and must not extract anything.
+runstub_big_outbox="$(newdir)"; tmpdirs+=("$runstub_big_outbox")
+head -c 4096 /dev/zero > "$runstub_big_outbox/big.bin"
+runstub_log4="$(newdir)/kubectl.log"; runstub_out4="$(newdir)/out4.txt"; runstub_dest4="$(newdir)/outbox-4"
+tmpdirs+=("$(dirname "$runstub_log4")" "$(dirname "$runstub_out4")" "$(dirname "$runstub_dest4")")
+if K8S_STUB_OUTBOX_DIR="$runstub_big_outbox" K8S_STUB_OUTBOX_RC=141 \
+    runstub_run "$runstub_log4" "$runstub_out4" \
+    --branch fs-k8s-test-run-outbox-overcap --model moonshotai/kimi-k3 \
+    --outbox-max 128 \
+    --outbox-dir "$runstub_dest4" \
+    "$proj_dir" "$handoff_file"; then
+    if grep -q 'over the 128 byte cap; refusing to pull it back' "$runstub_out4" \
+        && ! grep -q 'could not read the outbox' "$runstub_out4" \
+        && [[ ! -d "$runstub_dest4" ]] \
+        && grep -q 'run complete' "$runstub_out4"; then
+        ok "substantially-over-cap outbox is diagnosed as over the cap, not a read failure"
+    else
+        no "substantially-over-cap outbox is diagnosed as over the cap, not a read failure" \
+            "dest=$(find "$runstub_dest4" 2>/dev/null) out=$(cat "$runstub_out4")"
+    fi
+else
+    no "substantially-over-cap outbox is diagnosed as over the cap, not a read failure" "run exited nonzero: $(cat "$runstub_out4")"
+fi
+
+# 5. The review-loop.json read is the second kubectl exec in run's tail
+# sequence that can execute while the pod is idle, so it must carry the
+# same --request-timeout bound as the outbox read: a --review-loop run's
+# kubectl log shows the bound on that exec too.
+runstub_log5="$(newdir)/kubectl.log"; runstub_out5="$(newdir)/out5.txt"
+tmpdirs+=("$(dirname "$runstub_log5")" "$(dirname "$runstub_out5")")
+if runstub_run "$runstub_log5" "$runstub_out5" \
+    --branch fs-k8s-test-run-loop-timeout --model moonshotai/kimi-k3 \
+    --review-loop 1 \
+    --outbox-dir "$(dirname "$runstub_out5")/outbox-5" \
+    "$proj_dir" "$handoff_file"; then
+    # || true: under pipefail a grep that finds nothing would otherwise
+    # take the whole suite down at the assignment rather than failing the
+    # assertion below.
+    loop_ln="$(grep -n 'cat /work/review-loop.json' "$runstub_log5" | head -n 1 | cut -d: -f1 || true)"
+    if [[ -n "$loop_ln" ]] \
+        && grep -q -- '--request-timeout=60s' <(sed -n "${loop_ln}p" "$runstub_log5"); then
+        ok "the review-loop.json kubectl exec carries a request-timeout bound"
+    else
+        no "the review-loop.json kubectl exec carries a request-timeout bound" \
+            "loop_ln=$loop_ln out=$(cat "$runstub_out5")"
+    fi
+else
+    no "the review-loop.json kubectl exec carries a request-timeout bound" "run exited nonzero: $(cat "$runstub_out5")"
 fi
 
 printf '\n== fork-sandbox-k8s.sh say: argument validation (no cluster) ==\n'

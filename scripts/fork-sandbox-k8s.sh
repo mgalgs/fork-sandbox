@@ -2394,11 +2394,13 @@ cmd_run() {
     # comment on .run-complete for why), so a `--k8s --review-loop` run
     # that hit its cap with findings still open would otherwise report
     # success and say nothing about it. Read before cmd_fetch, so this
-    # prints even if the fetch itself fails partway through.
+    # prints even if the fetch itself fails partway through. It is the
+    # same kind of exec as the outbox read below -- runnable while the
+    # pod is idle -- so it carries the same request-timeout bound.
     if (( review_loop_cap > 0 )); then
         local loop_json loop_err
         loop_err="$(mktemp)"
-        if loop_json="$(kubectl exec "$pod_name" -- cat /work/review-loop.json 2> "$loop_err")" \
+        if loop_json="$(kubectl exec --request-timeout=60s "$pod_name" -- cat /work/review-loop.json 2> "$loop_err")" \
             && jq -e . >/dev/null 2>&1 <<< "$loop_json"; then
             local loop_ended loop_detail loop_iters loop_last_findings
             loop_ended="$(jq -r '.ended // "unknown"' <<< "$loop_json")"
@@ -2441,27 +2443,35 @@ cmd_run() {
     # warns and falls through rather than exiting. It runs BEFORE that
     # fetch, not after it, because cmd_fetch touches /work/.fetched -- the
     # pod's own signal to stop idling and exit (see the entrypoint's idle
-    # loop) -- and a kubectl exec into a completed pod fails. The read is
-    # the one kubectl exec in this sequence that can run while the pod is
-    # otherwise idle, so it is bounded with --request-timeout: a hung
-    # connection may now delay the fetch, but it cannot hang indefinitely.
+    # loop) -- and a kubectl exec into a completed pod fails. This read
+    # and the review-loop.json read above are the kubectl execs in this
+    # sequence that can run while the pod is otherwise idle, so both are
+    # bounded with --request-timeout: a hung connection may now delay the
+    # fetch, but it cannot hang indefinitely.
     local outbox_dest="$outbox_dir"
     [[ -n "$outbox_dest" ]] \
         || outbox_dest="/var/tmp/claude-scratch/forks/k8s-$(k8s_safe_name_component "$branch")/outbox"
-    local outbox_tar outbox_err outbox_ok=true
+    local outbox_tar outbox_err outbox_ok=true outbox_rc=0
     outbox_tar="$(mktemp)"
     outbox_err="$(mktemp)"
-    if ! kubectl exec --request-timeout=60s "$pod_name" -- tar cf - -C /work/outbox . 2> "$outbox_err" \
-            | head -c "$((outbox_max_bytes + 1))" > "$outbox_tar"; then
+    kubectl exec --request-timeout=60s "$pod_name" -- tar cf - -C /work/outbox . 2> "$outbox_err" \
+            | head -c "$((outbox_max_bytes + 1))" > "$outbox_tar" \
+            || outbox_rc=$?
+    # Size check BEFORE exit status: an outbox well past the cap makes
+    # head -c exit early, kubectl then dies of EPIPE and the pipeline is
+    # non-zero under pipefail -- but that IS the over-cap case, not a
+    # read failure, because by the time head has had to close, outbox_tar
+    # is always filled to cap+1 bytes. Only a non-zero pipeline that
+    # leaves the tarball under the cap is a genuine read error.
+    if (( $(stat -c '%s' -- "$outbox_tar") > outbox_max_bytes )); then
+        echo "fork-sandbox-k8s: warning: pod $pod_name's outbox is over the $outbox_max_bytes byte cap; refusing to pull it back." >&2
+        outbox_ok=false
+    elif (( outbox_rc != 0 )); then
         echo "fork-sandbox-k8s: warning: could not read the outbox from pod $pod_name; nothing pulled back." >&2
         fs_report_captured_stderr "kubectl exec into pod $pod_name (outbox read)" "$outbox_err"
         outbox_ok=false
     fi
     rm -f -- "$outbox_err"
-    if [[ "$outbox_ok" == true ]] && (( $(stat -c '%s' -- "$outbox_tar") > outbox_max_bytes )); then
-        echo "fork-sandbox-k8s: warning: pod $pod_name's outbox is over the $outbox_max_bytes byte cap; refusing to pull it back." >&2
-        outbox_ok=false
-    fi
     if [[ "$outbox_ok" == true ]] && ! mkdir -p -- "$(dirname -- "$outbox_dest")"; then
         echo "fork-sandbox-k8s: warning: could not create $(dirname -- "$outbox_dest"); outbox not pulled back." >&2
         outbox_ok=false
