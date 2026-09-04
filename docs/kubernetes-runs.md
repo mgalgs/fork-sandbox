@@ -217,6 +217,12 @@ belong in a commit, described to the agent in `fs_emit_prompt_preamble`'s
 
 The pull-back is:
 
+- **Before the branch fetch.** `run` reads the pod's outbox over `kubectl
+  exec` before it fetches the branch, because the fetch is what ends the
+  pod: it touches `/work/.fetched`, the marker the pod's idle loop exits
+  on, and a `kubectl exec` into a completed pod fails. The read is
+  therefore bounded with a kubectl request timeout so a hung connection
+  can delay the fetch but not hang it.
 - **Capped, default 64 MiB, raisable per-run.** An outbox is for a handful
   of screenshots or a report, not a build artifact or a dataset; `run`
   reads the pod's tar stream up to the cap plus one byte and refuses the
