@@ -20,6 +20,44 @@ export FORK_SANDBOX_CONTAINER_IMAGE=fork-sandbox:latest
 
 From there every command is the same as on Linux.
 
+## The short road: the cluster path
+
+If you have access to a Kubernetes cluster you are authorised to use, the
+cluster path (`fork-sandbox.sh --k8s`) is the easier way to run this from a
+Mac, and the rest of this document is about the harder road.
+
+The reason is simple: on that road the sandbox is a pod, so nothing on the
+Mac has to be Linux, and nothing container-shaped runs *on the Mac* at all:
+no bubblewrap, no docker, no `FORK_SANDBOX_BACKEND`, no image built here —
+and by extension, no gap 1 (toolchain: the pod brings its own userland, so
+there is no host tree to bind or mismatch) and no gap 3 (Keychain credential:
+a pod authenticates its own way, and the host credential is never read).
+
+What it does need, on the Mac:
+
+- `kubectl`, and a kubeconfig with access to a cluster you are authorised
+  to use;
+- `$HOME/.config/fork-sandbox/k8s.env` — see docs/kubernetes-runs.md for
+  the keys and for why the provider key is read from `pi.env`, not from
+  it. `K8S_IMAGE` in that file is the pod's image, run from a registry:
+  build it once with the project's Dockerfile on any machine that has
+  docker (a CI job, say — not the Mac) and push it somewhere the cluster
+  can pull;
+- `brew install bash coreutils` — everything *above* the sandbox still runs
+  on the Mac and uses GNU flags; `install.sh --check` reports both roads.
+
+One floor: **macOS 12.3 or later**. The script's first line canonicalizes
+its own path with `readlink -f`, and BSD `readlink` only gained `-f` in
+12.3; every currently supported macOS is at or above it.
+
+**This has not been run on a Mac.** Everything in this section is a read of
+the code, made on a Linux host: the cluster path has no platform gate
+anywhere in it, and its host-side tools go through the resolved GNU names
+that gap 2 fixed. The honest claim is *expected to work*; nobody has
+run it on a Mac yet. See the last section.
+
+Usage: docs/kubernetes-runs.md.
+
 ## Three gaps, not one
 
 The README used to name two blockers. There were three; the third had not been
@@ -249,3 +287,9 @@ a sandbox quietly holding less than it claims.
    not been exercised on macOS — in particular whether the sockets the services
    publish survive Docker Desktop's filesystem sharing, which is the same
    open question as the bridges above. `--no-services` turns them off.
+5. **The cluster path on a Mac**, the short road from the top of this
+   document. It has never run on one, and confirming it would consist of one
+   `fork-sandbox.sh --k8s run` from a Mac at or above 12.3, with Homebrew
+   `bash` and `coreutils` installed, `kubectl` and a kubeconfig that reach a
+   cluster, and `$HOME/.config/fork-sandbox/k8s.env` filled in — a run that
+   submits, completes, and has its branch fetched back.
