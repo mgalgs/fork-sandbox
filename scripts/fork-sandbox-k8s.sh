@@ -161,19 +161,21 @@
 # the run is wired to -- the pod's PROXY_BASE_URL becomes the proxy's
 # /e/NAME/v1 location instead of the legacy /api/v1 path. A name that is
 # not registered is an error listing the registered names. Omitted, it
-# resolves to the single registered endpoint when there is exactly one
-# (announced on stderr) and is an error, listing the names, when there
-# are several -- the same one-candidate rule agent-sandboxed applies when
-# resolving a model. On a legacy K8S_PROXY_UPSTREAM install it is an
+# resolves to K8S_DEFAULT_ENDPOINT in k8s.env when that names a
+# registered entry (announced on stderr), then to the single registered
+# endpoint when there is exactly one (announced on stderr), and is an
+# error, listing the names, when there are several -- the same
+# one-candidate rule agent-sandboxed applies when resolving a model, with
+# the site default sitting between the flag and the one-candidate rule.
+# On a legacy K8S_PROXY_UPSTREAM install it is an
 # error: that render has no named endpoints. It is what makes --model
 # optional on an endpoints install (see the note above); --harness
 # claude keeps the requirement even on an endpoints install, because
 # discovery only lists the pi endpoint's model ids, never a Claude Code
 # model name. fork-sandbox.sh --k8s accepts the same omission on its
-# own path: a pi run that names an endpoint -- the flag or the preset's
-# code-seat key -- skips the launcher's own --model requirement and
-# lands here, where this install-mode-aware validation is the one that
-# decides.
+# own path: a model-less pi --k8s run skips the launcher's own --model
+# requirement and lands here, where this install-mode-aware validation is
+# the one that decides.
 #
 # --context-ro DIR (submit, run): push DIR into the pod at /work/context,
 # read-only by convention, over the same gated kubectl-exec channel the
@@ -249,6 +251,18 @@
 #                         (vLLM, Ollama, TGI), e.g.
 #                         primary=http://10.0.0.5:8001/v1. Mutually
 #                         exclusive with K8S_PROXY_UPSTREAM.
+#   K8S_DEFAULT_ENDPOINT= the K8S_PROXY_ENDPOINTS entry a run is wired to
+#                         when neither submit nor run names one with
+#                         --endpoint. Optional, and only meaningful on an
+#                         endpoints install -- on a legacy
+#                         K8S_PROXY_UPSTREAM install a set value is a
+#                         parse-time error, same shape as --endpoint.
+#                         The name it gives must be registered (a
+#                         parse-time error listing the names otherwise,
+#                         pointing at this file rather than a command
+#                         line that never mentions it). Precedence:
+#                         --endpoint, then this key, then the single
+#                         registered endpoint.
 #   K8S_PROXY_ALLOW=      <cidr>:<port>[,<cidr>:<port>...] egress allowlist
 #                         for K8S_PROXY_ENDPOINTS hosts. Unset keeps the
 #                         default policy (any host except RFC1918, on 443);

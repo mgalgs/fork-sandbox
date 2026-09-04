@@ -120,9 +120,11 @@ the outbox pull-back, the `fetch`, and the final `rm` (skipped under
 
 `fork-sandbox.sh --k8s` dispatches to exactly this `run` verb: it resolves
 and validates the harness and model the same way a local run does — the
-one exception a pi run that names an `--endpoint`, whose model it leaves
-for this script's install-mode-aware validation to resolve (or refuse on
-a legacy install) — then builds the argument list above, and `exec`s
+one exception a model-less pi run, whose model the pod discovers and
+whose endpoint this script's install-mode-aware validation resolves
+(`--endpoint`, `K8S_DEFAULT_ENDPOINT` in `k8s.env`, or the single
+registered endpoint — refused on a legacy install) — then builds the
+argument list above, and `exec`s
 this script — no local clone or tmux
 runner ever starts (the review loop, unlike those two, DOES run on this
 path — see "The cluster review loop" below). Most of `fork-sandbox.sh`'s
@@ -690,13 +692,22 @@ warns when it detects this. `submit` (and `run`) against such an install is wire
 endpoint with `--endpoint NAME`: the pod's `PROXY_BASE_URL` becomes
 the shared proxy's `/e/NAME/v1` location instead of the legacy `/api/v1`
 path, which a keyless install never renders. A name that is not
-registered is an error listing the registered names; omitted, the flag
-resolves to the single registered endpoint when there is exactly one
-(announced on stderr) and is an error, listing the names, when there
-are several — the same one-candidate rule `agent-sandboxed` applies
-when resolving a model. On a legacy `K8S_PROXY_UPSTREAM` install
-`--endpoint` is an error, since that render has no named endpoints, and
-`PROXY_BASE_URL` stays the `/api/v1` literal.
+registered is an error listing the registered names. Omitted, `--endpoint`
+resolves to `K8S_DEFAULT_ENDPOINT` in `~/.config/fork-sandbox/k8s.env`
+when that names a registered entry (announced on stderr), then to the
+single registered endpoint when there is exactly one (announced on
+stderr), and is an error, listing the names, when there are several —
+the same one-candidate rule `agent-sandboxed` applies when resolving a
+model, with the site default sitting between the flag and the
+one-candidate rule. `K8S_DEFAULT_ENDPOINT` is optional and only
+meaningful on an endpoints install: a name it gives must be registered,
+or `submit`/`run` is a parse-time error that names `k8s.env` — the
+command line never mentions the bad name — and lists the registered
+names, never a silent fallthrough to the one-candidate rule. On a
+legacy `K8S_PROXY_UPSTREAM` install a set `K8S_DEFAULT_ENDPOINT` is an
+error with the same shape as the `--endpoint` refusal there, since that
+render has no named endpoints. On a legacy install `PROXY_BASE_URL`
+stays the `/api/v1` literal.
 
 **`--model` is optional on an endpoints install; the pod discovers the
 model facts itself.** `fork-sandbox-k8s-entrypoint.sh` queries
