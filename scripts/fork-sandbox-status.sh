@@ -175,6 +175,14 @@ resolve_run_file() {
     RUN_FILE_PATH=""
     case "$name" in
         run.env|events.jsonl|sandbox.log|exit-code|summary.txt|summary.json|pid|handoff.md|review-loop.json|maintainer-loop.json) ;;
+        # One file per leg, named by the runner. The four leg kinds are
+        # enumerated literally and the name is re-checked against the exact
+        # pattern: a loose events-*.jsonl would let any name that starts
+        # events- through, which is the property this allowlist exists to
+        # deny.
+        events-review-[0-9]*.jsonl|events-fix-[0-9]*.jsonl|events-maintainer-[0-9]*.jsonl|events-mntfix-[0-9]*.jsonl)
+            [[ "$name" =~ ^events-(review|fix|maintainer|mntfix)-[0-9]+\.jsonl$ ]] \
+                || die "'$name' is not a fork-sandbox run file" ;;
         review-verdict-[0-9]*.md)
             [[ "$name" =~ ^review-verdict-[0-9]+\.md$ ]] || die "'$name' is not a fork-sandbox run file" ;;
         maintainer-verdict-[0-9]*.md)
@@ -353,6 +361,51 @@ have_events() {
     resolve_run_file events.jsonl
 }
 
+# Every event file the run has written: the code leg's events.jsonl first, then
+# one file per later leg, in leg-number order within each kind. Every name is
+# resolved through resolve_run_file, so a leg file gets the same allowlist and
+# the same symlink refusal as events.jsonl — no reader may bypass it. The
+# answer comes back in EVENT_FILES rather than on stdout, for the same reason
+# RUN_FILE_PATH exists: a die inside a command substitution would kill only
+# the subshell and the caller would carry on.
+EVENT_FILES=()
+all_event_files() {
+    EVENT_FILES=()
+    local path name
+    resolve_run_file events.jsonl 2>/dev/null && EVENT_FILES+=("$RUN_FILE_PATH")
+    for path in "$run_dir"/events-{review,fix,maintainer,mntfix}-*.jsonl; do
+        [[ -e "$path" ]] || continue
+        name="${path##*/}"
+        [[ "$name" =~ ^events-(review|fix|maintainer|mntfix)-[0-9]+\.jsonl$ ]] \
+            || die "'$name' is not a valid event file name"
+        resolve_run_file "$name" || die "'$name' is not a readable event file"
+        EVENT_FILES+=("$RUN_FILE_PATH")
+    done
+    (( ${#EVENT_FILES[@]} > 0 )) || return 1
+}
+
+# The newest event file by mtime is the active leg: the code leg stops writing
+# events.jsonl when it ends, so that file's mtime no longer moves while a
+# healthy multi-leg run goes on, and it is the one an operator wants. The mtime
+# comes back in LATEST_EVENT_MTIME for the same reason as RUN_FILE_PATH.
+LATEST_EVENT_FILE=""
+LATEST_EVENT_MTIME=""
+latest_event_file() {
+    LATEST_EVENT_FILE=""
+    LATEST_EVENT_MTIME=""
+    all_event_files 2>/dev/null || return 1
+    local f m
+    for f in "${EVENT_FILES[@]}"; do
+        m="$("$FS_STAT" -c %Y -- "$f" 2>/dev/null)"
+        [[ "$m" =~ ^[0-9]+$ ]] || continue
+        if [[ -z "$LATEST_EVENT_FILE" ]] || (( m > LATEST_EVENT_MTIME )); then
+            LATEST_EVENT_FILE="$f"
+            LATEST_EVENT_MTIME="$m"
+        fi
+    done
+    [[ -n "$LATEST_EVENT_FILE" ]]
+}
+
 # run.env is a fixed set of key=value lines. Read it with a match, never with
 # `source`, so nothing in it can run.
 run_env_get() {
@@ -382,6 +435,14 @@ tmux_target="$(run_env_get session)"
 # run has not written yet is fine and is checked again when it appears.
 for _name in events.jsonl sandbox.log exit-code summary.txt summary.json pid; do
     resolve_run_file "$_name" || true
+done
+# The same check for the leg event files, globbed instead of named: the
+# runner only writes events-<kind>-<N>.jsonl, so a name in that shape that
+# fails the pattern is not a run file, and any symlink is refused before
+# anything is printed.
+for _leg_events in "$run_dir"/events-{review,fix,maintainer,mntfix}-*.jsonl; do
+    [[ -e "$_leg_events" ]] || continue
+    resolve_run_file "${_leg_events##*/}" || die "'$_leg_events' is not a readable event file"
 done
 resolve_run_subdir inbox || true
 resolve_run_subdir inbox-delivered || true
@@ -453,12 +514,16 @@ exit_code() {
     printf '%s' "${rc//[^0-9-]/}"
 }
 
+# Summed across every leg: a run's activity keeps moving in the leg files
+# after events.jsonl has gone quiet, so counting one file would report a
+# healthy multi-leg run as frozen.
 event_count() {
-    if have_events 2>/dev/null; then
-        wc -l < "$RUN_FILE_PATH"
-    else
-        printf '0'
-    fi
+    all_event_files 2>/dev/null || { printf '0'; return; }
+    local f total=0
+    for f in "${EVENT_FILES[@]}"; do
+        total=$(( total + $(wc -l < "$f") ))
+    done
+    printf '%s' "$total"
 }
 
 # While the work runs the only evidence is the event log, where counting
@@ -474,12 +539,16 @@ commits_from_summary() {
     printf '%s' "$n"
 }
 
+# Summed across every leg, so a commit made by a fix leg is not invisible.
 commit_count() {
-    if have_events 2>/dev/null; then
-        "$formatter" --commit-count "$RUN_FILE_PATH" 2>/dev/null || printf '0'
-    else
-        printf '0'
-    fi
+    all_event_files 2>/dev/null || { printf '0'; return; }
+    local f n total=0
+    for f in "${EVENT_FILES[@]}"; do
+        n="$("$formatter" --commit-count "$f" 2>/dev/null)"
+        [[ "$n" =~ ^[0-9]+$ ]] || n=0
+        total=$(( total + n ))
+    done
+    printf '%s' "$total"
 }
 
 commit_count_labelled() {
@@ -493,8 +562,8 @@ commit_count_labelled() {
 }
 
 last_event_line() {
-    if have_events 2>/dev/null; then
-        "$formatter" --tail 1 "$RUN_FILE_PATH" 2>/dev/null | tail -1
+    if latest_event_file 2>/dev/null; then
+        "$formatter" --tail 1 "$LATEST_EVENT_FILE" 2>/dev/null | tail -1
     fi
 }
 

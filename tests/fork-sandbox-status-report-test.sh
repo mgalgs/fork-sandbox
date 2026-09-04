@@ -182,4 +182,121 @@ fi
 [[ "$out" == *"cannot be combined with --monitor-terminal"* ]] \
     || { echo "no conflict message (explicit monitor): $out"; exit 1; }
 
-echo "9 passed, 0 failed"
+# 6. Multi-leg event files. A run writes one event file per leg, and
+# events.jsonl stops moving the moment the code leg ends, so every counter
+# in the status block must span every leg, and the 'last:' line must come
+# from the newest one, not from events.jsonl.
+
+# 6a. A run with only events.jsonl reports the same numbers as before.
+new_run_dir
+cat > "$rd_new/events.jsonl" <<'EOF'
+{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"git commit -m first"}}]}}
+{"type":"result","subtype":"success","result":"code leg account"}
+EOF
+out="$(timeout 12 "$status" "$rd_new" 2>&1)"
+[[ "$out" == *"events:   2"* ]] || { echo "single-file event count wrong: $out"; exit 1; }
+[[ "$out" == *"commits:  1 (seen so far"* ]] || { echo "single-file commit count wrong: $out"; exit 1; }
+
+# 6b. The event count sums across the code leg and the later legs.
+new_run_dir
+cat > "$rd_new/events.jsonl" <<'EOF'
+{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"git commit -m one"}}]}}
+{"type":"result","subtype":"success","result":"code leg account"}
+EOF
+cat > "$rd_new/events-review-1.jsonl" <<'EOF'
+{"type":"assistant","message":{"content":[{"type":"text","text":"looking"}]}}
+{"type":"assistant","message":{"content":[{"type":"text","text":"at the diff"}]}}
+{"type":"result","subtype":"success","result":"review leg account"}
+EOF
+cat > "$rd_new/events-fix-1.jsonl" <<'EOF'
+{"type":"result","subtype":"success","result":"fix leg account"}
+EOF
+now_s=$(date +%s)
+touch -d "@$((now_s - 600))" "$rd_new/events.jsonl"
+touch -d "@$((now_s - 120))" "$rd_new/events-review-1.jsonl"
+touch -d "@$((now_s - 5))" "$rd_new/events-fix-1.jsonl"
+out="$(timeout 12 "$status" "$rd_new" 2>&1)"
+[[ "$out" == *"events:   6"* ]] || { echo "summed event count wrong: $out"; exit 1; }
+
+# 6c. The commit count sums across legs too, so a fix-leg commit is seen.
+new_run_dir
+cat > "$rd_new/events.jsonl" <<'EOF'
+{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"git commit -m one"}}]}}
+EOF
+cat > "$rd_new/events-review-1.jsonl" <<'EOF'
+{"type":"assistant","message":{"content":[{"type":"text","text":"looking"}]}}
+EOF
+cat > "$rd_new/events-fix-1.jsonl" <<'EOF'
+{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"git commit -m two"}}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"git status"}}]}}
+EOF
+out="$(timeout 12 "$status" "$rd_new" 2>&1)"
+[[ "$out" == *"commits:  2 (seen so far"* ]] || { echo "summed commit count wrong: $out"; exit 1; }
+
+# 6d. The 'last:' line comes from the newest event file, the active leg,
+# not from events.jsonl.
+new_run_dir
+cat > "$rd_new/events.jsonl" <<'EOF'
+{"type":"assistant","message":{"content":[{"type":"text","text":"code leg line"}]}}
+EOF
+cat > "$rd_new/events-review-1.jsonl" <<'EOF'
+{"type":"assistant","message":{"content":[{"type":"text","text":"review leg line"}]}}
+EOF
+now_s=$(date +%s)
+touch -d "@$((now_s - 600))" "$rd_new/events.jsonl"
+touch -d "@$((now_s - 5))" "$rd_new/events-review-1.jsonl"
+out="$(timeout 12 "$status" "$rd_new" 2>&1)"
+[[ "$out" == *"last:     review leg line"* ]] \
+    || { echo "last event not from the newest leg: $out"; exit 1; }
+[[ "$out" != *"last:     code leg line"* ]] \
+    || { echo "last event still from events.jsonl: $out"; exit 1; }
+
+# 6e. A file that merely starts events- is not an event file: it is not
+# read, and the counts are unaffected.
+new_run_dir
+cat > "$rd_new/events.jsonl" <<'EOF'
+{"type":"result","subtype":"success","result":"account"}
+EOF
+cat > "$rd_new/events-bogus.jsonl" <<'EOF'
+{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"git commit -m no"}}]}}
+{"type":"assistant","message":{"content":[{"type":"text","text":"should not be counted"}]}}
+EOF
+out="$(timeout 12 "$status" "$rd_new" 2>&1)" || { echo "events-bogus.jsonl was not tolerated: $out"; exit 1; }
+[[ "$out" == *"events:   1"* ]] || { echo "events-bogus.jsonl was counted: $out"; exit 1; }
+[[ "$out" == *"commits:  0 (seen so far"* ]] || { echo "events-bogus.jsonl was counted for commits: $out"; exit 1; }
+
+# 6f. A leg name with a non-number is refused rather than read: the strict
+# pattern is what makes 6e's shape a non-issue, and a tampered run directory
+# gets rejected before anything is printed.
+new_run_dir
+cat > "$rd_new/events.jsonl" <<'EOF'
+{"type":"result","subtype":"success","result":"account"}
+EOF
+cat > "$rd_new/events-review-x.jsonl" <<'EOF'
+{"type":"result","subtype":"success","result":"should not appear"}
+EOF
+out="$(timeout 12 "$status" "$rd_new" 2>&1)"
+rc=$?
+if (( rc == 0 )); then
+    echo "events-review-x.jsonl was accepted (rc=0): $out"; exit 1
+fi
+[[ "$out" == *"'events-review-x.jsonl' is not a fork-sandbox run file"* ]] \
+    || { echo "no refusal for a malformed leg name: $out"; exit 1; }
+[[ "$out" != *"should not appear"* ]] || { echo "malformed leg file was read: $out"; exit 1; }
+
+# 6g. A symlinked leg event file is refused exactly as a symlinked
+# events.jsonl is: the security property, not a convenience.
+new_run_dir
+cat > "$rd_new/events.jsonl" <<'EOF'
+{"type":"result","subtype":"success","result":"account"}
+EOF
+ln -s /etc/passwd "$rd_new/events-review-1.jsonl"
+out="$(timeout 12 "$status" "$rd_new" 2>&1)"
+rc=$?
+if (( rc == 0 )); then
+    echo "symlinked leg event file was accepted (rc=0)"; exit 1
+fi
+[[ "$out" == *"events-review-1.jsonl' is a symlink; refusing to read it"* ]] \
+    || { echo "no symlink refusal for a leg file: $out"; exit 1; }
+
+echo "16 passed, 0 failed"
