@@ -30,10 +30,13 @@
 #                        opus, sonnet, or a name from aliases.conf).
 #                        Required with --harness pi, where it names an
 #                        OpenRouter model such as moonshotai/kimi-k3 --
-#                        except a --k8s run that also names an
-#                        --endpoint: the pod discovers its model there, and
-#                        fork-sandbox-k8s.sh refuses the combination on a
-#                        legacy install with its own message.
+#                        except a --k8s run, where the pod discovers its
+#                        model: fork-sandbox-k8s.sh's own install-mode-aware
+#                        validation is the one authority (it resolves the
+#                        endpoint from --endpoint, K8S_DEFAULT_ENDPOINT in
+#                        k8s.env, or the single registered endpoint, and
+#                        refuses a model-less run on a legacy install with
+#                        its own message).
 #                        Optional with --harness pi-local, which asks the
 #                        endpoint what it serves, and with --harness codex,
 #                        which passes it to `codex exec --model`.
@@ -215,9 +218,12 @@
 #                        endpoint key: an explicit --endpoint overrides it,
 #                        but a --harness override does NOT drop it -- unlike
 #                        the seat's other keys, it names the run's cluster,
-#                        not the agent. It is also what makes --model
-#                        optional on a --k8s run of pi: the pod discovers
-#                        its model, and fork-sandbox-k8s.sh's own
+#                        not the agent. It also overrides the site default,
+#                        K8S_DEFAULT_ENDPOINT in k8s.env, which fork-
+#                        sandbox-k8s.sh applies when no endpoint is named
+#                        here. A model-less --k8s run of pi is legal on an
+#                        endpoints install with or without it: the pod
+#                        discovers its model, and fork-sandbox-k8s.sh's own
 #                        install-mode-aware validation decides (it refuses
 #                        the combination on a legacy install); --harness
 #                        claude keeps the --model requirement either way.
@@ -527,8 +533,9 @@
 # --keep) tears the Job down. See docs/kubernetes-runs.md for the design.
 # It is a thin dispatcher, not a second implementation: this script resolves
 # and validates the harness and model as it does locally -- the one
-# exception a pi run that names an --endpoint, whose model it leaves for
-# fork-sandbox-k8s.sh's install-mode-aware validation -- then builds the
+# exception a model-less pi --k8s run, whose model the pod discovers and
+# whose endpoint fork-sandbox-k8s.sh's install-mode-aware validation
+# resolves -- then builds the
 # argument list fork-sandbox-k8s.sh run already accepts, and execs it. None
 # of the clone, tmux-runner or review-loop machinery below this point ever
 # runs for a --k8s call.
@@ -2045,19 +2052,23 @@ mntfix_model_given=false
 resolve_model mntfix_model "$mntfix_model_given" "${mntfix_harness:-$harness}" || exit 1
 
 if [[ "$harness" == "pi" && -z "$model" ]]; then
-    # The one allowed model-less pi run: a --k8s run that names an
-    # endpoint. On an K8S_PROXY_ENDPOINTS install the pod discovers its
-    # model, and fork-sandbox-k8s.sh's own install-mode-aware validation
-    # decides -- it accepts the combination there and refuses it on a
-    # legacy install with its own message, so this launcher does not
-    # pre-empt either. A preset's code-seat endpoint key qualifies too:
-    # it has already landed in k8s_endpoint. claude keeps its
-    # unconditional requirement below, at both layers.
-    if [[ "$k8s_mode" != true || -z "$k8s_endpoint" ]]; then
+    # The one allowed model-less pi run: any --k8s run. On an
+    # K8S_PROXY_ENDPOINTS install the pod discovers its model, and
+    # fork-sandbox-k8s.sh's own install-mode-aware validation is the one
+    # authority on whether an endpoint can be resolved at all -- the
+    # --endpoint flag, a preset's code-seat key, K8S_DEFAULT_ENDPOINT in
+    # k8s.env, or the single registered endpoint -- and it refuses a
+    # model-less run on a legacy install with its own message, so this
+    # launcher does not pre-empt either. It does not read k8s.env: the
+    # endpoint is resolved where the registry lives, and the cluster
+    # configuration stays in one place. claude keeps its unconditional
+    # requirement below, at both layers.
+    if [[ "$k8s_mode" != true ]]; then
         echo "Error: --harness pi needs --model. There is no default: the model" >&2
         echo "is an OpenRouter id, such as moonshotai/kimi-k3. A --k8s run on" >&2
-        echo "an endpoints install may instead name the install's entry with" >&2
-        echo "--endpoint, and the pod discovers its model." >&2
+        echo "an endpoints install may instead omit it: name the install's" >&2
+        echo "entry with --endpoint or K8S_DEFAULT_ENDPOINT in k8s.env, and" >&2
+        echo "the pod discovers its model." >&2
         exit 1
     fi
 fi
