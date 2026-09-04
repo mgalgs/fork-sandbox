@@ -488,9 +488,15 @@ printf '\n== --k8s: the panel runs as cluster jobs ==\n'
 # collect-ordering assertions read it), captures each seat's argv, and
 # models the pod: a seat's wait succeeds once it has been probed the
 # number of times STUB_K8S_DONE_AFTER names for it (persona:N pairs,
-# space-separated; default 1). collect fabricates the pulled-back
-# outbox, with a DISTINCT reply per seat, so a cross-seat mix-up is
-# visible in the mailbox.
+# space-separated; default 1), STUB_K8S_DEAD names seats whose pod is
+# terminal (wait exits 2, the real terminal code), and STUB_K8S_NEVER
+# names seats that stay running past the round's deadline: wait BLOCKS
+# a short sleep (standing in for the real wait's full probe window,
+# which is 30s) and then exits 1, the real probe-deadline code, every
+# time. collect
+# fabricates the pulled-back outbox, with a DISTINCT reply per seat, so
+# a cross-seat mix-up is visible in the mailbox; STUB_K8S_COLLECT_FAIL
+# names seats whose collect fails instead of exiting 0.
 cat > "$stub_bin/fork-sandbox-k8s.sh" <<'STUB'
 #!/usr/bin/env bash
 set -uo pipefail
@@ -518,6 +524,17 @@ case "$verb" in
         echo "stub fork-sandbox-k8s: submitted $branch" >&2
         ;;
     wait)
+        for never in ${STUB_K8S_NEVER:-}; do
+            if [[ "$never" == "$persona" ]]; then
+                # Still running at the probe's own deadline, forever:
+                # the real wait's exit 1 (the transient code), after
+                # blocking for the probe window (a 1s stand-in). Never
+                # counted against the probe counter, so the round's
+                # --timeout deadline is what ends its probing.
+                sleep 1
+                exit 1
+            fi
+        done
         for dead in ${STUB_K8S_DEAD:-}; do
             if [[ "$dead" == "$persona" ]]; then
                 # The real wait exits 2 (not 1) when the run can never
@@ -548,6 +565,15 @@ case "$verb" in
         exit 1
         ;;
     collect)
+        for failing in ${STUB_K8S_COLLECT_FAIL:-}; do
+            if [[ "$failing" == "$persona" ]]; then
+                # The real collect fetches, then removes the job and
+                # pod only on success: a failure leaves them in the
+                # cluster, which the round's error must acknowledge.
+                echo "stub fork-sandbox-k8s: fetching $branch failed (forced)" >&2
+                exit 1
+            fi
+        done
         mkdir -p -- "$outbox_dir"
         case "$persona" in
             core)
@@ -742,6 +768,111 @@ esac
 k8s_tree_dead="$("$mailbox" tree widget-frob)"
 check "the live seat's reply still landed alongside the dead seat" "2" \
     "$(printf '%s\n' "$k8s_tree_dead" | grep -c 'k8s core reply')"
+
+printf '\n== --k8s: a seat that outruns the deadline is named, and the probe stops at the deadline ==\n'
+# security and pi-local never finish: each of their probes blocks the
+# probe window (1s in the stub) and exits with the probe-deadline code,
+# so with --timeout 1 the round must stop BEFORE pi-local''s first
+# probe -- a once-per-outer-cycle check would have probed both seats
+# in one cycle, past the deadline -- and the timeout warning must then
+# name BOTH still-running seats with a by-hand collect, while core
+# (done in time) is harvested and the round still exits 0.
+cap_k8s_slow="$(mktemp -d)"; tmpdirs+=("$cap_k8s_slow")
+k8s_state_slow="$(mktemp -d)"; tmpdirs+=("$k8s_state_slow")
+out_k8s_slow="$(PATH="$stub_bin:$PATH" STUB_CAPTURE_DIR="$cap_k8s_slow" STUB_RUN_PREFIX="$run_prefix_dir" \
+    STUB_K8S_CAPTURE_DIR="$cap_k8s_slow" STUB_K8S_STATE_DIR="$k8s_state_slow" \
+    STUB_K8S_DONE_AFTER="core:1" STUB_K8S_NEVER="security pi-local" \
+    STUB_REPLY_TO="$patch2_id" STUB_REPLY_TO_BRACKETED="$patch_id_bracketed" \
+    "$round" widget-frob --project "$project_dir" --checkout otherbranch \
+    --personas "core, security, pi-local" --personas-dir "$work" \
+    --reply-to "$patch2_id" --no-summarize --timeout 1 \
+    --k8s --endpoint test-endpoint 2>&1)"
+rc_k8s_slow=$?
+if (( rc_k8s_slow == 0 )); then ok "hitting the deadline with live seats does not fail the round"; else no "hitting the deadline with live seats does not fail the round" "exit $rc_k8s_slow: $out_k8s_slow"; fi
+contains "the deadline warning is printed" "$out_k8s_slow" "Warning: timed out after 1s"
+contains "the seat probed in the deadline cycle is named as still running" "$out_k8s_slow" "security's job"
+contains "the seat not probed at the deadline is named too" "$out_k8s_slow" "pi-local's job"
+contains "the stragglers are told they will not be harvested this round" "$out_k8s_slow" "will not be harvested this round"
+contains "the stragglers get a by-hand collect with their branch" "$out_k8s_slow" "collect --branch"
+n_waits_slow_sec="$(grep -c '^wait security' "$cap_k8s_slow/call-order" 2>/dev/null)"; n_waits_slow_sec="${n_waits_slow_sec:-0}"
+check "the first straggler was probed exactly once" "1" "$n_waits_slow_sec"
+n_waits_slow_pi="$(grep -c '^wait pi-local' "$cap_k8s_slow/call-order" 2>/dev/null)"; n_waits_slow_pi="${n_waits_slow_pi:-0}"
+check "the second straggler was never probed -- the deadline stopped the cycle" "0" "$n_waits_slow_pi"
+n_collects_slow="$(grep -c '^collect security\|^collect pi-local' "$cap_k8s_slow/call-order" 2>/dev/null)"; n_collects_slow="${n_collects_slow:-0}"
+check "the stragglers were never collected" "0" "$n_collects_slow"
+n_collects_slow_core="$(grep -c '^collect core' "$cap_k8s_slow/call-order" 2>/dev/null)"; n_collects_slow_core="${n_collects_slow_core:-0}"
+check "the seat that finished in time was collected" "1" "$n_collects_slow_core"
+k8s_tree_slow="$("$mailbox" tree widget-frob)"
+# The count is 3, not 1: the main k8s run above and the dead-pod run
+# each posted a "k8s core reply" into the same shared series mailbox
+# first (the dead-pod test counts 2 on the same basis).
+check "the in-time seat's reply still landed despite the stragglers" "3" \
+    "$(printf '%s\n' "$k8s_tree_slow" | grep -c 'k8s core reply')"
+
+printf '\n== --k8s: a failed collect fails the round and points at rm ==\n'
+# core's collect fails after its wait succeeded: the round must mark
+# the seat lost, fail (launch_failed), and name the cleanup -- while
+# the other seat in the same round is still collected, not abandoned.
+cap_k8s_cf="$(mktemp -d)"; tmpdirs+=("$cap_k8s_cf")
+k8s_state_cf="$(mktemp -d)"; tmpdirs+=("$k8s_state_cf")
+out_k8s_cf="$(PATH="$stub_bin:$PATH" STUB_CAPTURE_DIR="$cap_k8s_cf" STUB_RUN_PREFIX="$run_prefix_dir" \
+    STUB_K8S_CAPTURE_DIR="$cap_k8s_cf" STUB_K8S_STATE_DIR="$k8s_state_cf" \
+    STUB_K8S_DONE_AFTER="core:1 security:1" STUB_K8S_COLLECT_FAIL="core" \
+    STUB_REPLY_TO="$patch2_id" STUB_REPLY_TO_BRACKETED="$patch_id_bracketed" \
+    "$round" widget-frob --project "$project_dir" --checkout otherbranch \
+    --personas "core, security" --personas-dir "$work" \
+    --reply-to "$patch2_id" --no-summarize --timeout 10 \
+    --k8s --endpoint test-endpoint 2>&1)"
+rc_k8s_cf=$?
+if (( rc_k8s_cf != 0 )); then ok "a failed collect fails the round"; else no "a failed collect fails the round" "exit 0: $out_k8s_cf"; fi
+contains "the failed collect is named" "$out_k8s_cf" "collecting core"
+contains "the failed seat is told its replies will not be harvested" "$out_k8s_cf" "will not be harvested"
+contains "the failed collect points at the rm cleanup" "$out_k8s_cf" "fork-sandbox-k8s.sh rm --branch"
+n_collects_cf="$(grep -c '^collect core' "$cap_k8s_cf/call-order" 2>/dev/null)"; n_collects_cf="${n_collects_cf:-0}"
+check "the failing seat was collected exactly once (no retry loop)" "1" "$n_collects_cf"
+n_collects_cf_sec="$(grep -c '^collect security' "$cap_k8s_cf/call-order" 2>/dev/null)"; n_collects_cf_sec="${n_collects_cf_sec:-0}"
+check "the other seat in the round was still collected" "1" "$n_collects_cf_sec"
+k8s_tree_cf="$("$mailbox" tree widget-frob)"
+# Shared-mailbox counts, as above: the main k8s run posted one security
+# reply, and the main + dead-pod + deadline runs posted one core reply
+# each -- so this run's healthy seat must make security 2, and its
+# failed collect must leave core at 3, not 4.
+check "the healthy seat's reply landed despite the failed collect" "2" \
+    "$(printf '%s\n' "$k8s_tree_cf" | grep -c 'k8s security reply')"
+check "the failed seat's reply did not land" "3" \
+    "$(printf '%s\n' "$k8s_tree_cf" | grep -c 'k8s core reply')"
+
+printf '\n== --k8s: a model-less claude seat is refused in the pre-pass ==\n'
+# submit requires --model for a claude seat (pod model discovery lists
+# pi endpoint model ids, never a Claude Code model name). The pre-pass
+# must catch it BEFORE any seat is submitted -- refusing at submit
+# would spend real cluster cost on the seats ahead of it, contradicting
+# the launch loop's own "nothing here may newly refuse a seat" note.
+cat > "$work/nomodel.md" <<'PERSONA'
+---
+persona: nomodel
+harness: claude
+---
+Reviewer with no model in its frontmatter.
+PERSONA
+cap_k8s_nm="$(mktemp -d)"; tmpdirs+=("$cap_k8s_nm")
+k8s_state_nm="$(mktemp -d)"; tmpdirs+=("$k8s_state_nm")
+out_k8s_nm="$(PATH="$stub_bin:$PATH" STUB_CAPTURE_DIR="$cap_k8s_nm" STUB_RUN_PREFIX="$run_prefix_dir" \
+    STUB_K8S_CAPTURE_DIR="$cap_k8s_nm" STUB_K8S_STATE_DIR="$k8s_state_nm" \
+    STUB_REPLY_TO="$patch2_id" STUB_REPLY_TO_BRACKETED="$patch_id_bracketed" \
+    "$round" widget-frob --project "$project_dir" --checkout otherbranch \
+    --personas "nomodel, core" --personas-dir "$work" \
+    --reply-to "$patch2_id" --no-summarize --timeout 10 \
+    --k8s --endpoint test-endpoint 2>&1)"
+rc_k8s_nm=$?
+if (( rc_k8s_nm != 0 )); then ok "a model-less claude seat refuses the round"; else no "a model-less claude seat refuses the round" "exit 0: $out_k8s_nm"; fi
+contains "the refusal names the seat" "$out_k8s_nm" "seat nomodel"
+contains "the refusal says the cluster cannot discover a model" "$out_k8s_nm" "cannot discover one"
+contains "the refusal states that nothing was launched" "$out_k8s_nm" "no persona was launched"
+n_submits_nm="$(grep -c '^submit ' "$cap_k8s_nm/call-order" 2>/dev/null)"; n_submits_nm="${n_submits_nm:-0}"
+check "a model-less claude seat submits nothing, even the healthy seat beside it" "0" "$n_submits_nm"
+n_local_nm="$(find "$cap_k8s_nm" -name '*.task-meta.json' | wc -l | tr -d '[:space:]')"
+check "a refused model-less claude seat launches nothing locally either" "0" "$n_local_nm"
 
 printf '\n== --k8s validation ==\n'
 cap_k8s_noe="$(mktemp -d)"; tmpdirs+=("$cap_k8s_noe")

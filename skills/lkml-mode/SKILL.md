@@ -315,8 +315,10 @@ translated to `pi` against the endpoint, not refused (a pod has no
 sealed local endpoint; the endpoint reaches the same self-hosted model
 through the in-cluster proxy), so those seats stay zero-cost; a
 `claude` seat runs unchanged against its own per-run proxy. Any other
-harness (e.g. `codex`) refuses the whole round in the seats pre-pass,
-before any seat is submitted. A persona's `thinking:` cannot be
+harness (e.g. `codex`) -- and a model-less `claude` seat, which
+`submit` would refuse on its own (the pod's model discovery lists pi
+endpoint model ids, never a Claude Code model name) -- refuses the
+whole round in the seats pre-pass, before any seat is submitted. A persona's `thinking:` cannot be
 expressed in a cluster `submit` (there is no pi-args channel), so it
 is dropped for cluster seats and the drop is announced per seat.
 

@@ -65,7 +65,9 @@
 #            pod has no sealed local endpoint; the endpoint reaches the
 #            same self-hosted model through the in-cluster proxy), not
 #            refused. Any other harness that is not pi or claude
-#            (e.g. codex) refuses the whole round in the seats
+#            (e.g. codex) -- and a model-less claude seat, which submit
+#            would refuse once the seats ahead of it had already been
+#            submitted -- refuses the whole round in the seats
 #            pre-pass, before any seat is submitted. A cluster run has
 #            no summary.json, so a seat's replies are stamped with its
 #            configured model, or "unknown" when the seat names none
@@ -538,6 +540,18 @@ for persona in "${personas[@]}"; do
                 exit 1
                 ;;
         esac
+        # A model-less claude seat passes every other check here and
+        # would be refused only by `submit` itself (pod model discovery
+        # lists pi endpoint model ids, not Claude Code model names) --
+        # INSIDE the launch loop, which violates that loop's invariant
+        # that nothing there may newly refuse a seat: the seats ahead
+        # of it would already be submitted and spending real cluster
+        # cost before the round fails. Refuse here, where the whole
+        # round is still zero-cost.
+        if [[ "$harness" == "claude" && -z "$model" ]]; then
+            echo "Error: seat $persona runs claude with no model, and the cluster cannot discover one for it (pod model discovery lists pi endpoint model ids, not Claude Code model names); no persona was launched." >&2
+            exit 1
+        fi
     fi
     seat_harness["$persona"]="$harness"
     seat_model["$persona"]="$model"
@@ -732,17 +746,21 @@ if (( k8s )); then
             pending+=("$persona")
         done
         (( ${#pending[@]} == 0 )) && break
-        if (( $(date +%s) - k8s_started >= timeout )); then
-            # Mirrors the local path's timeout: warn, keep what was
-            # collected, and name what is still running.
-            echo "Warning: timed out after ${timeout}s; harvesting whatever has been collected." >&2
-            for persona in "${pending[@]}"; do
-                echo "Warning: $persona's job (branch ${branch_of[$persona]}) is still running; its replies will not be harvested this round." >&2
-                echo "Collect it by hand when it completes: fork-sandbox-k8s.sh collect --branch ${branch_of[$persona]} $project" >&2
-            done
-            break
-        fi
-        for persona in "${pending[@]}"; do
+        # The deadline is checked before EVERY probe, not once per outer
+        # cycle: each probe of a still-running seat blocks up to
+        # $k8s_probe_timeout seconds, so a once-per-cycle check would let
+        # the round overrun --timeout by roughly one probe window per
+        # pending seat (the local path bounds the same overrun to under
+        # one 10s tick). On the deadline the warning below names EVERY
+        # seat still pending, including ones probed earlier in this very
+        # cycle: those too are still running.
+        deadline=0
+        for i in "${!pending[@]}"; do
+            persona="${pending[$i]}"
+            if (( $(date +%s) - k8s_started >= timeout )); then
+                deadline=1
+                break
+            fi
             branch="${branch_of[$persona]}"
             # A probe, not a real wait: on success it prints the
             # agent's exit code alone and exits 0 (an agent that
@@ -767,6 +785,13 @@ if (( k8s )); then
                     k8s_collected["$persona"]=1
                 else
                     echo "Error: collecting $persona (branch $branch) failed; its replies will not be harvested." >&2
+                    # collect removes the job and pod only on success: a
+                    # fetch that failed after wait succeeded (the pod's
+                    # TTL expired between the two, say) leaves them in
+                    # the cluster. The seat's work is lost either way, so
+                    # the round cannot retry -- but the residue should
+                    # not be left anonymous.
+                    echo "If its job is still in the cluster, remove it with: fork-sandbox-k8s.sh rm --branch $branch" >&2
                     k8s_failed["$persona"]=1
                     launch_failed=1
                 fi
@@ -776,6 +801,16 @@ if (( k8s )); then
                 launch_failed=1
             fi
         done
+        if (( deadline )); then
+            # Mirrors the local path's timeout: warn, keep what was
+            # collected, and name what is still running.
+            echo "Warning: timed out after ${timeout}s; harvesting whatever has been collected." >&2
+            for persona in "${pending[@]}"; do
+                echo "Warning: $persona's job (branch ${branch_of[$persona]}) is still running; its replies will not be harvested this round." >&2
+                echo "Collect it by hand when it completes: fork-sandbox-k8s.sh collect --branch ${branch_of[$persona]} $project" >&2
+            done
+            break
+        fi
     done
 else
     if (( ${#run_dir_of[@]} == 0 )); then
