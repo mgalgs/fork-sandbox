@@ -686,27 +686,91 @@ for persona in "${personas[@]}"; do
         '{persona:$persona, run_dir:$run_dir, kind:$kind}' >> "$ledger_root/$series/runs.jsonl"
 done
 
-if (( ${#run_dir_of[@]} == 0 )); then
-    echo "Error: no persona was launched successfully." >&2
-    exit 1
-fi
-
-echo "fork-sandbox lkml-round: waiting up to ${timeout}s for ${#run_dir_of[@]} run(s)..." >&2
-waited=0
-while true; do
-    all_done=1
-    for persona in "${!run_dir_of[@]}"; do
-        [[ -f "${run_dir_of[$persona]}/summary.json" ]] || all_done=0
-    done
-    (( all_done )) && break
-    if (( waited >= timeout )); then
-        echo "Warning: timed out after ${timeout}s waiting for every run; harvesting" >&2
-        echo "whatever has finished so far." >&2
-        break
+if (( k8s )); then
+    if (( ${#branch_of[@]} == 0 )); then
+        echo "Error: no persona was submitted successfully." >&2
+        exit 1
     fi
-    sleep 10
-    waited=$(( waited + 10 ))
-done
+    # The cluster analogue of the summary.json wait above -- and
+    # deliberately a different shape. Every seat was already submitted
+    # before this loop starts; from here each uncollected seat is
+    # PROBED with a short wait, round-robin, and collected the moment
+    # it completes. A pod idles after its agent exits and then EXITS
+    # when its TTL runs out, and once the container has exited
+    # kubectl exec cannot reach it, so neither the branch nor the
+    # outbox can be pulled back and the seat's review is lost for good
+    # (fork-sandbox-k8s.sh wait's own Succeeded-pod diagnostic exists
+    # for exactly this hazard). Waiting each seat out in turn would
+    # lose every seat that finished before its turn came.
+    k8s_probe_timeout=30
+    declare -A k8s_collected=() k8s_failed=()
+    k8s_started="$(date +%s)"
+    echo "fork-sandbox lkml-round: ${#branch_of[@]} seat(s) submitted; collecting each as it completes (deadline ${timeout}s)..." >&2
+    while true; do
+        pending=()
+        for persona in "${personas[@]}"; do
+            [[ -n "${branch_of[$persona]:-}" ]] || continue
+            [[ -n "${k8s_collected[$persona]:-}" || -n "${k8s_failed[$persona]:-}" ]] && continue
+            pending+=("$persona")
+        done
+        (( ${#pending[@]} == 0 )) && break
+        if (( $(date +%s) - k8s_started >= timeout )); then
+            # Mirrors the local path's timeout: warn, keep what was
+            # collected, and name what is still running.
+            echo "Warning: timed out after ${timeout}s; harvesting whatever has been collected." >&2
+            for persona in "${pending[@]}"; do
+                echo "Warning: $persona's job (branch ${branch_of[$persona]}) is still running; its replies will not be harvested this round." >&2
+                echo "Collect it by hand when it completes: fork-sandbox-k8s.sh collect --branch ${branch_of[$persona]} $project" >&2
+            done
+            break
+        fi
+        for persona in "${pending[@]}"; do
+            branch="${branch_of[$persona]}"
+            # A probe, not a real wait: on success it prints the
+            # agent's exit code alone and exits 0 (an agent that
+            # exited 3 is a successful wait printing 3); a non-zero
+            # exit means the wait itself failed (still running at the
+            # probe timeout, dead pod, ...) and the seat is simply
+            # probed again next cycle.
+            if agent_code="$(fork-sandbox-k8s.sh wait --branch "$branch" --timeout "$k8s_probe_timeout")"; then
+                echo "fork-sandbox lkml-round: $persona finished (agent exit $agent_code); collecting $branch..." >&2
+                # Reviewer seats run no review loop, so no --review-loop
+                # here; if submit is ever given one, the same value must
+                # be repeated on collect, or a cap outcome with open
+                # findings is silently unreported.
+                if fork-sandbox-k8s.sh collect --branch "$branch" --outbox-dir "${outbox_of[$persona]}" "$project"; then
+                    k8s_collected["$persona"]=1
+                else
+                    echo "Error: collecting $persona (branch $branch) failed; its replies will not be harvested." >&2
+                    k8s_failed["$persona"]=1
+                    launch_failed=1
+                fi
+            fi
+        done
+    done
+else
+    if (( ${#run_dir_of[@]} == 0 )); then
+        echo "Error: no persona was launched successfully." >&2
+        exit 1
+    fi
+
+    echo "fork-sandbox lkml-round: waiting up to ${timeout}s for ${#run_dir_of[@]} run(s)..." >&2
+    waited=0
+    while true; do
+        all_done=1
+        for persona in "${!run_dir_of[@]}"; do
+            [[ -f "${run_dir_of[$persona]}/summary.json" ]] || all_done=0
+        done
+        (( all_done )) && break
+        if (( waited >= timeout )); then
+            echo "Warning: timed out after ${timeout}s waiting for every run; harvesting" >&2
+            echo "whatever has finished so far." >&2
+            break
+        fi
+        sleep 10
+        waited=$(( waited + 10 ))
+    done
+fi
 
 # Strips optional angle brackets and the @lkml.local suffix from an
 # In-Reply-To value, mirroring lkml-mailbox.sh's own lkml_strip_id --
