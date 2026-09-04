@@ -133,6 +133,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import statistics
 import sys
 
@@ -146,6 +147,18 @@ ARCHIVE_DIR = os.path.expanduser("~/.claude/sandbox-handoffs")
 # fork-sandbox.sh enforces for what it stages. Anything else is refused.
 FORKS_ROOT = "/var/tmp/claude-scratch/forks"
 RUN_DIR_PREFIX = "claude-fork-sandbox."
+
+# A run's provenance token (fork-sandbox.sh's FORK_SANDBOX_RUN_SOURCE,
+# written to <run-dir>/run-source at launch). A token, not free text: it
+# ends up in the durable log and is grouped on in stats.
+RUN_SOURCE_RE = re.compile(r"[a-z][a-z0-9-]{0,31}")
+
+# The one source value that list and stats exclude by default -- test
+# suites' fixture runs, so they do not skew the operator's performance
+# stats. Deliberately an exact value, not "anything but fork-sandbox":
+# a future source must appear in the stats by default rather than vanish
+# silently.
+TEST_SOURCE = "test"
 
 OUTCOMES = [
     "integrated",
@@ -309,6 +322,35 @@ def cmd_record(args):
         "ts": now_iso(),
         "source": "fork-sandbox",
     }
+
+    # The launcher's provenance declaration, when the run dir carries it:
+    # the token the launching shell put in FORK_SANDBOX_RUN_SOURCE,
+    # written to run-source at launch. Same absence convention as
+    # task-meta.json -- no file means the default. A marker that is
+    # missing, unreadable, or off-pattern must NOT fail the record: warn
+    # and fall back to the default, the way the preset archiving does.
+    # Losing a whole run record because a marker file was garbage would
+    # be a worse bug than a mislabeled source.
+    run_source = os.path.join(rd, "run-source")
+    if os.path.isfile(run_source) and not os.path.islink(run_source):
+        try:
+            with open(run_source, encoding="utf-8") as f:
+                declared = f.read().strip()
+        except (OSError, UnicodeDecodeError) as e:
+            print(f"sandbox-run-log: run-source marker unreadable ({e}); "
+                  f"keeping source 'fork-sandbox'", file=sys.stderr)
+        else:
+            if RUN_SOURCE_RE.fullmatch(declared):
+                rec["source"] = declared
+            else:
+                print(f"sandbox-run-log: run-source marker {declared!r} "
+                      f"does not match {RUN_SOURCE_RE.pattern}; keeping "
+                      f"source 'fork-sandbox'", file=sys.stderr)
+    elif os.path.exists(run_source) or os.path.islink(run_source):
+        # Present but not a regular file we can trust (a symlink, a
+        # directory): fall back with a warning, not silently.
+        print("sandbox-run-log: run-source marker is not a regular file; "
+              "keeping source 'fork-sandbox'", file=sys.stderr)
 
     summary = load_json_file(os.path.join(rd, "summary.json"))
     if summary:
