@@ -58,7 +58,9 @@ cat > "$fake_bin/kubectl" <<'EOF'
 if [[ "$*" == "version --client" ]]; then
     echo "Client Version: test"
 elif [[ "$*" == "config get-contexts -o name" ]]; then
-    if [[ -n "${FAKE_CONTEXTS:-}" ]]; then
+    if [[ "${FAKE_KUBECTL_FAIL:-}" == 1 ]]; then
+        exit 1
+    elif [[ -n "${FAKE_CONTEXTS:-}" ]]; then
         printf '%s\n' "$FAKE_CONTEXTS"
     fi
 fi
@@ -92,6 +94,7 @@ contains "absent k8s.env is reported" "k8s.env: not present" "$RUN_OUTPUT"
 run_check complete $'K8S_CONTEXT=kind\nK8S_IMAGE=registry.example/sandbox:v1\n'
 contains "context is reported set" "K8S_CONTEXT: set" "$RUN_OUTPUT"
 contains "image is reported set" "K8S_IMAGE: set" "$RUN_OUTPUT"
+contains "missing denied probe is obvious" "K8S_DENIED_PROBE: MISSING" "$RUN_OUTPUT"
 contains "namespace defaults" "K8S_NAMESPACE: fork-sandbox (default)" "$RUN_OUTPUT"
 
 run_check image-missing $'K8S_CONTEXT=kind\n'
@@ -126,6 +129,12 @@ unknown_output="$(PATH="$fake_bin:$PATH" FORK_SANDBOX_CONFIG_DIR="$context_dir" 
 unknown_rc=$?
 check_rc "unknown context check exits 0" 0 "$unknown_rc"
 contains "unknown context is reported" "is not in this machine's kubeconfig" "$unknown_output"
+
+failed_output="$(PATH="$fake_bin:$PATH" FORK_SANDBOX_CONFIG_DIR="$context_dir" \
+    FAKE_CONTEXTS='' FAKE_KUBECTL_FAIL=1 "$repo_dir/install.sh" --check 2>&1)"
+failed_rc=$?
+check_rc "failed context check exits 0" 0 "$failed_rc"
+contains "failed context inspection is reported" "unable to inspect contexts" "$failed_output"
 
 empty_output="$(PATH="$fake_bin:$PATH" FORK_SANDBOX_CONFIG_DIR="$context_dir" \
     FAKE_CONTEXTS='' "$repo_dir/install.sh" --check 2>&1)"

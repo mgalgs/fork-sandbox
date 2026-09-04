@@ -234,6 +234,11 @@ if [[ -e "$k8s_env" ]]; then
     else
         echo "    K8S_IMAGE: MISSING -- a --k8s run will fail at submit"
     fi
+    if k8s_denied_probe="$(read_k8s_env_value "$k8s_env" K8S_DENIED_PROBE)" && [[ -n "$k8s_denied_probe" ]]; then
+        echo "    K8S_DENIED_PROBE: set"
+    else
+        echo "    K8S_DENIED_PROBE: MISSING -- a --k8s run will fail at submit"
+    fi
     if k8s_namespace="$(read_k8s_env_value "$k8s_env" K8S_NAMESPACE)" && [[ -n "$k8s_namespace" ]]; then
         echo "    K8S_NAMESPACE: $k8s_namespace"
     else
@@ -253,6 +258,8 @@ if [[ -e "$k8s_env" ]]; then
             else
                 echo "    K8S_CONTEXT: $k8s_context is not in this machine's kubeconfig; run 'kubectl config get-contexts' to see available contexts"
             fi
+        else
+            echo "    K8S_CONTEXT: unable to inspect contexts (kubectl config get-contexts failed or timed out)"
         fi
     fi
 else
