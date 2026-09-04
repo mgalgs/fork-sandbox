@@ -18,6 +18,9 @@
 #                            [--checkout REF]
 #                            <project-path> <handoff-file>
 #        fork-sandbox-k8s.sh wait --branch NAME [--timeout SECONDS]
+#        fork-sandbox-k8s.sh collect --branch NAME [--outbox-dir DIR]
+#                            [--outbox-max SIZE] [--review-loop N]
+#                            [--keep] <project-path>
 #        fork-sandbox-k8s.sh fetch --branch NAME <project-path>
 #        fork-sandbox-k8s.sh say --branch NAME <text>
 #        fork-sandbox-k8s.sh say --branch NAME -        # text from stdin
@@ -64,6 +67,15 @@
 # agent's exit status: an agent that ran to completion and exited 3 is a
 # successful wait that prints 3.
 #
+# collect is run's third and last phase on its own: it reads the review
+# loop's outcome (only when --review-loop N is given and non-zero), pulls
+# the pod's /work/outbox back, fetches the branch into the named project,
+# and removes the Job and pod unless --keep.
+#
+# wait and collect exist so a caller fanning out several runs can submit
+# them all up front and then wait on and collect them independently, rather
+# than blocking one run at a time through run.
+#
 # fetch runs `git fetch` against the pod's clone, the same channel in
 # reverse, landing the branch in your real repo. It also signals the pod
 # that the run has been collected, so it does not idle out its full TTL.
@@ -92,8 +104,8 @@
 # giving up. Defaults to 3600, matching the entrypoint's own RUN_TTL default
 # -- waiting longer than the pod itself will idle is pointless.
 #
-# --keep (run): skip the final rm, leaving the Job and pod in place after a
-# successful fetch.
+# --keep (run, collect): skip the final rm, leaving the Job and pod in place
+# after a successful fetch.
 #
 # --checkout REF (submit, run): start the branch at the commit REF names
 # instead of the repo's HEAD. REF is resolved in the origin repo before
@@ -104,7 +116,7 @@
 # --review-loop) the review base is the same revision the branch starts
 # from. With no --checkout, HEAD is resolved and pushed as before.
 #
-# --outbox-dir DIR (run): where to land the pod's /work/outbox after the
+# --outbox-dir DIR (run, collect): where to land the pod's /work/outbox after the
 # agent finishes. Defaults to
 # /var/tmp/claude-scratch/forks/k8s-<safe-branch>/outbox. Pulled back over
 # the same kubectl exec channel fetch uses, through
@@ -114,7 +126,7 @@
 # warns and falls through rather than failing the run, since retrieving
 # artifacts must never cost the branch itself.
 #
-# --outbox-max SIZE (submit, run): raise the outbox size cap above the
+# --outbox-max SIZE (submit, run, collect): raise the outbox size cap above the
 # default 64 MiB (FS_OUTBOX_MAX_BYTES). Takes a plain byte count or a size
 # with a K/M/G suffix (512K, 256M, 2G); no upper ceiling -- the operator
 # raising it is the one accepting the extra disk cost. The effective value
@@ -124,9 +136,10 @@
 # and the extractor's third argument -- so the pod, the client and the
 # extractor can never disagree about the number.
 #
-# --review-loop N (submit, run): after the coding leg, run a fresh review
-# session against the branch and, on findings, a fresh fix session, up to N
-# times -- the cluster analogue of fork-sandbox.sh's own --review-loop. The
+# --review-loop N (submit, run, collect): on submit and run, after the coding
+# leg, run a fresh review session against the branch and, on findings, a
+# fresh fix session, up to N times -- the cluster analogue of
+# fork-sandbox.sh's own --review-loop. The
 # loop runs POD-SIDE, in fork-sandbox-k8s-review-loop.sh, shipped in the
 # same per-run ConfigMap as the entrypoint; the review and fix prompts
 # themselves are rendered HOST-SIDE, by fs_emit_review_prompt_body /
@@ -2398,6 +2411,167 @@ cmd_wait() {
     printf '%s\n' "$agent_rc"
 }
 
+# cmd_run's collect phase, standalone: read the review loop's outcome (when
+# --review-loop N is given and non-zero), pull the pod's /work/outbox back,
+# fetch the branch into the named project, and remove the Job and pod unless
+# --keep. It exists so a caller fanning out several runs can submit them all,
+# wait on them all, and collect them one at a time -- see cmd_run, which
+# composes this verb.
+cmd_collect() {
+    local keep=false branch="" outbox_dir="" outbox_max_arg="" review_loop_cap=""
+    while (( $# )); do
+        case "$1" in
+            --branch) branch="${2:?--branch requires a name}"; shift 2 ;;
+            --outbox-dir) outbox_dir="${2:?--outbox-dir requires a path}"; shift 2 ;;
+            --outbox-max) outbox_max_arg="${2:?--outbox-max requires a size}"; shift 2 ;;
+            --review-loop) review_loop_cap="${2:?--review-loop requires a positive integer}"; shift 2 ;;
+            --keep) keep=true; shift ;;
+            -*) echo "Error: unknown option '$1' for collect." >&2; exit 1 ;;
+            *) break ;;
+        esac
+    done
+    local project_path="${1:?Usage: fork-sandbox-k8s.sh collect [options] --branch NAME <project-path>}"
+    [[ -n "$branch" ]] || { echo "Error: collect requires --branch." >&2; exit 1; }
+    fs_reject_unsafe_chars "$branch" || exit 1
+    # Nothing else on this path validates the cap (cmd_submit's validation
+    # only applies to a run), so a garbage value must not reach the
+    # `(( review_loop_cap > 0 ))` gate and silently collapse into "no loop
+    # read". "0" is accepted and means skip, like an omitted flag: the gate
+    # below decides whether the read happens at all.
+    if [[ -n "$review_loop_cap" && ! "$review_loop_cap" =~ ^[0-9]+$ ]]; then
+        echo "Error: --review-loop takes an integer of review-then-fix iterations" >&2
+        echo "(0 or omitted: none), not '$review_loop_cap'." >&2
+        exit 1
+    fi
+
+    local outbox_max_bytes="$FS_OUTBOX_MAX_BYTES"
+    if [[ -n "$outbox_max_arg" ]]; then
+        outbox_max_bytes="$(fs_parse_size_bytes "$outbox_max_arg")" || exit 1
+    fi
+
+    local safe_name legacy_name pod_name
+    safe_name="$(k8s_safe_name fork-sandbox-agent "$branch")"
+    legacy_name="$(k8s_legacy_safe_name fork-sandbox-agent "$branch")"
+    pod_name="$(k8s_find_pod "$safe_name" "$legacy_name")"
+    if [[ -z "$pod_name" ]]; then
+        echo "Error: no pod found for branch '$branch' (job $safe_name). It may" >&2
+        echo "have already been fetched and removed, or the run never started." >&2
+        exit 1
+    fi
+
+    # The review loop's outcome, when this run carried one. This is the
+    # ONLY place a bad loop outcome ever surfaces: the agent's exit code
+    # stays the CODING leg's exit code (see fork-sandbox-k8s-entrypoint.sh's
+    # own comment on .run-complete for why), so a `--k8s --review-loop` run
+    # that hit its cap with findings still open would otherwise report
+    # success and say nothing about it. Read before cmd_fetch, so this
+    # prints even if the fetch itself fails partway through. It is the
+    # same kind of exec as the outbox read below -- runnable while the
+    # pod is idle -- so it carries the same request-timeout bound.
+    if (( review_loop_cap > 0 )); then
+        local loop_json loop_err
+        loop_err="$(mktemp)"
+        if loop_json="$(kubectl exec --request-timeout=60s "$pod_name" -- cat /work/review-loop.json 2> "$loop_err")" \
+            && jq -e . >/dev/null 2>&1 <<< "$loop_json"; then
+            local loop_ended loop_detail loop_iters loop_last_findings
+            loop_ended="$(jq -r '.ended // "unknown"' <<< "$loop_json")"
+            loop_detail="$(jq -r '.detail // empty' <<< "$loop_json")"
+            loop_iters="$(jq -r '.iterations | length' <<< "$loop_json")"
+            loop_last_findings="$(jq -r '.iterations[-1].findings // "unknown"' <<< "$loop_json")"
+            case "$loop_ended" in
+                approved)
+                    echo "fork-sandbox-k8s: review loop: APPROVED after $loop_iters iteration(s)" >&2
+                    ;;
+                cap|no-progress)
+                    echo "fork-sandbox-k8s: ################################################" >&2
+                    echo "fork-sandbox-k8s: *** review loop ended '$loop_ended' after" >&2
+                    echo "fork-sandbox-k8s: *** $loop_iters iteration(s) -- the branch was NOT" >&2
+                    echo "fork-sandbox-k8s: *** approved, with $loop_last_findings finding(s)" >&2
+                    echo "fork-sandbox-k8s: *** outstanding as of the last iteration." >&2
+                    echo "fork-sandbox-k8s: ################################################" >&2
+                    ;;
+                skipped)
+                    echo "fork-sandbox-k8s: review loop skipped${loop_detail:+: $loop_detail}" >&2
+                    ;;
+                *)
+                    echo "fork-sandbox-k8s: ################################################" >&2
+                    echo "fork-sandbox-k8s: *** review loop ended '$loop_ended'${loop_detail:+: $loop_detail}" >&2
+                    echo "fork-sandbox-k8s: ################################################" >&2
+                    ;;
+            esac
+        else
+            echo "fork-sandbox-k8s: warning: could not read /work/review-loop.json" >&2
+            echo "from pod $pod_name -- the branch is still worth fetching." >&2
+            fs_report_captured_stderr "kubectl exec into pod $pod_name (review-loop.json read)" "$loop_err"
+        fi
+        rm -f -- "$loop_err"
+    fi
+
+    # Pull /work/outbox back, symmetric with the local path's run_dir/outbox
+    # (see fs_emit_prompt_preamble's "## Artifact outbox" section). This is
+    # best-effort: retrieving artifacts must never cost the branch fetch
+    # that follows, or block the --keep/rm step below, so every failure here
+    # warns and falls through rather than exiting. It runs BEFORE that
+    # fetch, not after it, because cmd_fetch touches /work/.fetched -- the
+    # pod's own signal to stop idling and exit (see the entrypoint's idle
+    # loop) -- and a kubectl exec into a completed pod fails. This read
+    # and the review-loop.json read above are the kubectl execs in this
+    # sequence that can run while the pod is otherwise idle, so both are
+    # bounded with --request-timeout: a hung connection may now delay the
+    # fetch, but it cannot hang indefinitely.
+    local outbox_dest="$outbox_dir"
+    [[ -n "$outbox_dest" ]] \
+        || outbox_dest="/var/tmp/claude-scratch/forks/k8s-$(k8s_safe_name_component "$branch")/outbox"
+    local outbox_tar outbox_err outbox_ok=true outbox_rc=0
+    outbox_tar="$(mktemp)"
+    outbox_err="$(mktemp)"
+    kubectl exec --request-timeout=60s "$pod_name" -- tar cf - -C /work/outbox . 2> "$outbox_err" \
+            | head -c "$((outbox_max_bytes + 1))" > "$outbox_tar" \
+            || outbox_rc=$?
+    # Size check BEFORE exit status: an outbox well past the cap makes
+    # head -c exit early, kubectl then dies of EPIPE and the pipeline is
+    # non-zero under pipefail -- but that IS the over-cap case, not a
+    # read failure, because by the time head has had to close, outbox_tar
+    # is always filled to cap+1 bytes. Only a non-zero pipeline that
+    # leaves the tarball under the cap is a genuine read error.
+    if (( $(stat -c '%s' -- "$outbox_tar") > outbox_max_bytes )); then
+        echo "fork-sandbox-k8s: warning: pod $pod_name's outbox is over the $outbox_max_bytes byte cap; refusing to pull it back." >&2
+        outbox_ok=false
+    elif (( outbox_rc != 0 )); then
+        echo "fork-sandbox-k8s: warning: could not read the outbox from pod $pod_name; nothing pulled back." >&2
+        fs_report_captured_stderr "kubectl exec into pod $pod_name (outbox read)" "$outbox_err"
+        outbox_ok=false
+    fi
+    rm -f -- "$outbox_err"
+    if [[ "$outbox_ok" == true ]] && ! mkdir -p -- "$(dirname -- "$outbox_dest")"; then
+        echo "fork-sandbox-k8s: warning: could not create $(dirname -- "$outbox_dest"); outbox not pulled back." >&2
+        outbox_ok=false
+    fi
+    if [[ "$outbox_ok" == true ]]; then
+        if "$script_dir/fork-sandbox-k8s-outbox-extract.sh" "$outbox_tar" "$outbox_dest" "$outbox_max_bytes"; then
+            local outbox_count
+            outbox_count="$(find "$outbox_dest" -type f | wc -l)"
+            if (( outbox_count > 0 )); then
+                echo "fork-sandbox-k8s: outbox: $outbox_count file(s) at $outbox_dest" >&2
+            else
+                echo "fork-sandbox-k8s: outbox: empty (nothing written)" >&2
+            fi
+        else
+            echo "fork-sandbox-k8s: warning: could not extract the outbox tarball; nothing pulled back to $outbox_dest" >&2
+        fi
+    fi
+    rm -f -- "$outbox_tar"
+
+    echo "fork-sandbox-k8s: fetching branch $branch" >&2
+    cmd_fetch --branch "$branch" "$project_path"
+
+    if [[ "$keep" == true ]]; then
+        echo "fork-sandbox-k8s: --keep set; leaving job and pod for branch $branch in place" >&2
+    else
+        cmd_rm --branch "$branch"
+    fi
+}
+
 # submit, then wait, then fetch, then rm -- see the header comment above for
 # why. Reuses cmd_submit/cmd_fetch/cmd_rm rather than growing a second copy
 # of any of their bodies; the only new logic here is the poll loop and its
@@ -2703,11 +2877,12 @@ case "$verb" in
     submit) cmd_submit "$@" ;;
     run) cmd_run "$@" ;;
     wait) cmd_wait "$@" ;;
+    collect) cmd_collect "$@" ;;
     fetch) cmd_fetch "$@" ;;
     say) cmd_say "$@" ;;
     rm) cmd_rm "$@" ;;
     *)
-        echo "Error: unknown command '$verb'. Use install, submit, run, wait, fetch, say or rm." >&2
+        echo "Error: unknown command '$verb'. Use install, submit, run, wait, collect, fetch, say or rm." >&2
         exit 1
         ;;
 esac
