@@ -11,6 +11,12 @@ repo_dir="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 launcher="$repo_dir/scripts/fork-sandbox.sh"
 run_log="$repo_dir/scripts/sandbox-run-log.py"
 
+# Every run this suite launches is a fixture, not real work. Mark it so
+# sandbox-run-log.py's list/stats exclude it by default: without this the
+# operator's own log fills with synthetic runs, and the harness stats the
+# sandbox-coder-mode skill tells orchestrators to consult become misleading.
+export FORK_SANDBOX_RUN_SOURCE=test
+
 pass=0
 fail=0
 tmpdirs=()

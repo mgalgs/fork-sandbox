@@ -53,6 +53,12 @@ mkdir -p "$FORK_SANDBOX_CONFIG_DIR"
 # (with a warning), the same on every host.
 export CODEX_HOME="$tmp/codex-home"
 
+# Every run this suite launches is a fixture, not real work. Mark it so
+# sandbox-run-log.py's list/stats exclude it by default: without this the
+# operator's own log fills with synthetic runs, and the harness stats the
+# sandbox-coder-mode skill tells orchestrators to consult become misleading.
+export FORK_SANDBOX_RUN_SOURCE=test
+
 # --dry-run resolves and validates the flags, then exits before the clone --
 # exactly what every parsing/validation check needs, and none of it needs a
 # real project or handoff.

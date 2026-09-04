@@ -28,6 +28,12 @@ repo_dir="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 launcher="$repo_dir/scripts/fork-sandbox.sh"
 run_log="$repo_dir/scripts/sandbox-run-log.py"
 
+# Every run this suite launches is a fixture, not real work. Mark it so
+# sandbox-run-log.py's list/stats exclude it by default: without this the
+# operator's own log fills with synthetic runs, and the harness stats the
+# sandbox-coder-mode skill tells orchestrators to consult become misleading.
+export FORK_SANDBOX_RUN_SOURCE=test
+
 pass=0
 fail=0
 tmpdirs=()
@@ -817,7 +823,11 @@ if [[ -n "$rd2" && -x "$run_log" ]]; then
         check "the record carries prompt_overlay.legs.implement.fragments" \
             '["all.md","model/vendor_model-y.md"]' \
             "$(printf '%s' "$rec" | jq -c '.prompt_overlay.legs.implement.fragments')"
-        stats_out="$(HOME="$fakehome" "$run_log" stats --by prompt_overlay.rev 2>&1)"
+        # --include-tests is required here, not optional: this suite exports
+        # FORK_SANDBOX_RUN_SOURCE=test, so the run it just recorded is marked
+        # source=test and `stats` excludes it by default. The assertion is
+        # about this suite's OWN fixture run, so it has to ask for it.
+        stats_out="$(HOME="$fakehome" "$run_log" stats --include-tests --by prompt_overlay.rev 2>&1)"
         contains "stats --by prompt_overlay.rev groups on it" \
             "PROMPT_OVERLAY.REV" "$stats_out"
     else

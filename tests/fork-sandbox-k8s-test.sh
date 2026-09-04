@@ -219,6 +219,14 @@
 set -uo pipefail
 
 repo_dir="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+
+# Every run this suite launches is a fixture, not real work. Mark it so
+# sandbox-run-log.py's list/stats exclude it by default. A cluster run does
+# not append to the run log at all today, so this changes nothing yet -- it
+# is here so that whenever the k8s path does gain a run-log entry, this
+# suite's fixtures do not silently start polluting the operator's stats.
+export FORK_SANDBOX_RUN_SOURCE=test
+
 pass=0; fail=0; tmpdirs=()
 cleanup() { local d; for d in "${tmpdirs[@]-}"; do [[ -n "$d" && -d "$d" ]] && rm -rf -- "$d"; done; }
 trap cleanup EXIT
