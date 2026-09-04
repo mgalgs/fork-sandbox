@@ -82,6 +82,17 @@
 #     second copy of the prompt text; the rendered review prompt names the
 #     POD's skill and verdict paths, never a host path; --review-loop 0 and
 #     a non-numeric value are both rejected before any kubectl call.
+#   - `--pi-args ARGS` on submit and run: the value renders verbatim into
+#     the rendered Job's PI_ARGS env var when given, and the flag's
+#     absence renders no PI_ARGS env at all (not an empty value); the
+#     entrypoint's pi invocation (run_pi_coding_leg, extracted from the
+#     entrypoint's own source and run against a stubbed pi that records
+#     its argv) receives "--thinking low" as two separate arguments and
+#     an unset or empty PI_ARGS as none; a value containing a shell
+#     metacharacter is refused at parse time with nothing created (the
+#     stubbed kubectl's log stays empty), --harness claude is refused,
+#     and run's copy forwards to submit unchanged (byte-for-byte the same
+#     dry-run render).
 #   - fork-sandbox.sh --k8s --review-loop N is no longer refused, and
 #     --review-model given without --review-loop still is, on either
 #     harness -- the same coherence rule the local path applies. On
@@ -1574,6 +1585,185 @@ else
         "not found in $claude_rm_submit_out"
 fi
 rm -f /tmp/fs-k8s-test-claude-rm-submit.err
+
+printf '\n== fork-sandbox-k8s.sh submit/run --pi-args ==\n'
+# --pi-args is extra arguments for the pod's pi coding leg. It travels
+# the same path --model takes: into the rendered Job's env (PI_ARGS),
+# then into the pi command line in the entrypoint -- and is refused, at
+# parse time, on a claude run and for values fs_reject_unsafe_chars
+# rejects, before anything is created.
+pialg_submit_out="$(newdir)/pialg-submit.yaml"; tmpdirs+=("$(dirname "$pialg_submit_out")")
+if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model moonshotai/kimi-k3 \
+    --pi-args "--thinking low" \
+    "$proj_dir" "$handoff_file" > "$pialg_submit_out" 2>/tmp/fs-k8s-test-pialg-submit.err; then
+    ok "submit --dry-run --pi-args exits 0 and prints the rendered YAML"
+else
+    no "submit --dry-run --pi-args exits 0 and prints the rendered YAML" \
+        "$(cat /tmp/fs-k8s-test-pialg-submit.err)"
+fi
+if grep -q 'name: PI_ARGS' "$pialg_submit_out" \
+    && grep -A1 'name: PI_ARGS' "$pialg_submit_out" | grep -q 'value: "--thinking low"'; then
+    ok "the rendered Job carries PI_ARGS with the value verbatim"
+else
+    no "the rendered Job carries PI_ARGS with the value verbatim" \
+        "$(grep -A1 'name: PI_ARGS' "$pialg_submit_out")"
+fi
+rm -f /tmp/fs-k8s-test-pialg-submit.err
+
+# submit_out above carries no --pi-args, so it must render no PI_ARGS env
+# at all -- absence asserted, not an empty value.
+if grep -q 'name: PI_ARGS' "$submit_out"; then
+    no "a submit with no --pi-args renders no PI_ARGS env" \
+        "found 'name: PI_ARGS' in $submit_out"
+else
+    ok "a submit with no --pi-args renders no PI_ARGS env"
+fi
+
+# The pod-side half of the contract: run_pi_coding_leg, extracted from
+# the entrypoint's own source and run against a stubbed pi that records
+# its argv -- the same function-extraction this suite uses for
+# discover_model_facts. The stub's record is its own argv count first, so
+# an empty-string argument (which pi would see as a positional) is
+# visible even at the end of the line.
+pialg_fn="$(sed -n '/^run_pi_coding_leg() {/,/^}/p' "$entrypoint_sh")"
+pialg_fn_file="$(newdir)/run-pi-leg.sh"; tmpdirs+=("$(dirname "$pialg_fn_file")")
+if [[ -n "$pialg_fn" ]]; then
+    printf '%s\n' 'set -euo pipefail' \
+        ': "${PI_ARGS:=}"' \
+        "$pialg_fn" \
+        'run_pi_coding_leg' > "$pialg_fn_file"
+    ok "run_pi_coding_leg is a standalone function in the entrypoint"
+else
+    no "run_pi_coding_leg is a standalone function in the entrypoint" \
+        "function not found in $entrypoint_sh"
+fi
+# $1 = the PI_ARGS value to pass (unset when called with no argument).
+# PIALG_RECORD ends up holding the stub pi's recorded argv (count line
+# first, then one argument per line). Called directly, never inside a
+# command substitution, so the tmpdirs it registers are not lost in a
+# subshell.
+PIALG_RECORD=""
+pialg_run() {
+    local stub_dir record mounts work
+    stub_dir="$(newdir)"; tmpdirs+=("$stub_dir")
+    record="$(newdir)/pi-argv.txt"; tmpdirs+=("$(dirname "$record")")
+    printf '%s\n' '#!/usr/bin/env bash' \
+        'printf "%s\n" "$#" > "$PI_ARGV_RECORD"' \
+        'printf "%s\n" "$@" >> "$PI_ARGV_RECORD"' \
+        'exit 0' > "$stub_dir/pi"
+    chmod +x "$stub_dir/pi"
+    mounts="$(newdir)"; tmpdirs+=("$mounts")
+    work="$(newdir)"; tmpdirs+=("$work")
+    printf 'Do the thing.\n' > "$mounts/handoff.md"
+    PIALG_RECORD="$record"
+    if [[ $# -gt 0 ]]; then
+        PI_ARGS="$1" PI_ARGV_RECORD="$record" PATH="$stub_dir:$PATH" \
+            MODEL="moonshotai/kimi-k3" mounts_dir="$mounts" work_dir="$work" \
+            bash "$pialg_fn_file" >/dev/null
+    else
+        PI_ARGV_RECORD="$record" PATH="$stub_dir:$PATH" \
+            MODEL="moonshotai/kimi-k3" mounts_dir="$mounts" work_dir="$work" \
+            bash "$pialg_fn_file" >/dev/null
+    fi
+}
+# The stub's $@ never includes the command name itself, so the base
+# invocation records seven arguments.
+pialg_base="--provider
+proxy
+--model
+moonshotai/kimi-k3
+--mode
+json
+-p"
+pialg_run "--thinking low"
+pialg_two="$(cat "$PIALG_RECORD")"
+pialg_expected_two="$pialg_base"$'\n--thinking\nlow'
+if [[ "$(printf '%s\n' "$pialg_two" | head -n1)" == 9 ]] \
+    && [[ "$(printf '%s\n' "$pialg_two" | tail -n2)" == $'--thinking\nlow' ]] \
+    && printf '%s\n' "$pialg_two" | grep -qx -- '--thinking' \
+    && printf '%s\n' "$pialg_two" | grep -qx -- 'low' \
+    && ! printf '%s\n' "$pialg_two" | grep -qxF -- '--thinking low' \
+    && [[ "$(printf '%s\n' "$pialg_two" | tail -n +2)" == "$pialg_expected_two" ]]; then
+    ok "the entrypoint's pi line receives PI_ARGS as two arguments, appended to the base flags"
+else
+    no "the entrypoint's pi line receives PI_ARGS as two arguments, appended to the base flags" \
+        "record: $(printf '%s\n' "$pialg_two" | tr '\n' '|')"
+fi
+pialg_run
+pialg_none="$(cat "$PIALG_RECORD")"
+pialg_run ""
+pialg_empty="$(cat "$PIALG_RECORD")"
+for case_none in "none:$pialg_none" "empty:$pialg_empty"; do
+    pialg_case_name="${case_none%%:*}"
+    pialg_case_val="${case_none#*:}"
+    if [[ "$(printf '%s\n' "$pialg_case_val" | head -n1)" == 7 ]] \
+        && [[ "$(printf '%s\n' "$pialg_case_val" | tail -n +2)" == "$pialg_base" ]]; then
+        ok "an unset/empty PI_ARGS adds no arguments at all ($pialg_case_name)"
+    else
+        no "an unset/empty PI_ARGS adds no arguments at all ($pialg_case_name)" \
+            "record: $(printf '%s\n' "$pialg_case_val" | tr '\n' '|')"
+    fi
+done
+
+# A shell metacharacter in the value is refused at parse time -- and the
+# refusal is before any Job, Secret or proxy Pod exists. Proven against a
+# stubbed kubectl (no --dry-run here) whose log must stay empty.
+refuses "submit --pi-args with a single quote is refused" \
+    "single quote" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model moonshotai/kimi-k3 \
+    --pi-args "--thinking it's" \
+    "$proj_dir" "$handoff_file"
+pialg_stub_bin="$(newdir)"; tmpdirs+=("$pialg_stub_bin")
+pialg_klog="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$pialg_klog")")
+printf '%s\n' '#!/usr/bin/env bash' 'printf "%s\n" "$*" >> "$K8S_STUB_LOG"' > "$pialg_stub_bin/kubectl"
+chmod +x "$pialg_stub_bin/kubectl"
+pialg_rc=0
+PATH="$pialg_stub_bin:$PATH" K8S_STUB_LOG="$pialg_klog" \
+    FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit \
+    --branch fs-k8s-test-branch --model moonshotai/kimi-k3 \
+    --pi-args "--thinking it's" \
+    "$proj_dir" "$handoff_file" >/tmp/fs-k8s-test-pialg-unsafe.out 2>&1 || pialg_rc=$?
+if (( pialg_rc != 0 )) && [[ ! -s "$pialg_klog" ]] \
+    && grep -q 'single quote' /tmp/fs-k8s-test-pialg-unsafe.out; then
+    ok "a refused --pi-args value creates nothing (the stubbed kubectl recorded no call)"
+else
+    no "a refused --pi-args value creates nothing (the stubbed kubectl recorded no call)" \
+        "rc=$pialg_rc log=$(cat "$pialg_klog") out=$(cat /tmp/fs-k8s-test-pialg-unsafe.out)"
+fi
+rm -f /tmp/fs-k8s-test-pialg-unsafe.out
+
+refuses "submit --pi-args with --harness claude is refused" \
+    "passes flags to pi, which a claude run" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model claude-sonnet-5 --harness claude \
+    --pi-args "--thinking low" \
+    "$proj_dir" "$handoff_file"
+
+# run forwards --pi-args to submit unchanged: the same arguments must
+# render byte-for-byte the same YAML as the direct submit call.
+pialg_run_out="$(newdir)/pialg-run.yaml"; tmpdirs+=("$(dirname "$pialg_run_out")")
+pialg_run_err="$(newdir)/pialg-run.err"; tmpdirs+=("$(dirname "$pialg_run_err")")
+pialg_run_submit_out="$(newdir)/pialg-run-submit.yaml"; tmpdirs+=("$(dirname "$pialg_run_submit_out")")
+if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" run --dry-run \
+    --branch fs-k8s-test-branch --model moonshotai/kimi-k3 \
+    --pi-args "--thinking low" \
+    "$proj_dir" "$handoff_file" > "$pialg_run_out" 2>"$pialg_run_err" \
+    && FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model moonshotai/kimi-k3 \
+    --pi-args "--thinking low" \
+    "$proj_dir" "$handoff_file" > "$pialg_run_submit_out" 2>/dev/null; then
+    ok "run --dry-run --pi-args exits 0"
+else
+    no "run --dry-run --pi-args exits 0" "$(cat "$pialg_run_err")"
+fi
+if diff -q "$pialg_run_out" "$pialg_run_submit_out" >/dev/null 2>&1; then
+    ok "run --dry-run --pi-args renders byte-for-byte the same YAML as submit (forwarded unchanged)"
+else
+    no "run --dry-run --pi-args renders byte-for-byte the same YAML as submit (forwarded unchanged)" \
+        "$(diff "$pialg_run_out" "$pialg_run_submit_out" 2>&1 | head -n 20)"
+fi
 
 printf '\n== fork-sandbox-k8s.sh submit --dry-run --harness claude: credential expiry ==\n'
 claude_home_expired="$(newdir)"; tmpdirs+=("$claude_home_expired")
