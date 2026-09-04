@@ -197,7 +197,27 @@ printf '\n== state rail: per patch and what is unresolved ==\n'
 contains "patch panel eyebrow names the version" "$html" '<p class="eyebrow">per patch · v1</p>'
 contains "patch row title is the subject minus its [PATCH] prefix" "$html" '<span class="who">demo: add one'
 contains "patch row names its sign-off personas" "$html" '<small>core + ci</small>'
-contains "patch chip is the strongest standing verdict" "$html" '<span class="chip tested">tested-by</span>'
+# The strongest standing verdict on patch 1 is the Reviewed-by (core),
+# not the Tested-by (ci): a review outranks a test run. Scoped to the
+# patch panel: the same chip text stands elsewhere on the page.
+if python3 - "$stdout" <<'PY'
+import sys
+
+html = open(sys.argv[1], encoding="utf-8").read()
+i = html.index('per patch')
+panel = html[i:html.index('</section>', i)]
+if '<span class="chip reviewed">reviewed-by</span>' not in panel:
+    print("patch panel does not carry the reviewed-by chip")
+    sys.exit(1)
+if '<span class="chip tested">tested-by</span>' in panel:
+    print("patch panel shows the weaker tested-by chip instead")
+    sys.exit(1)
+PY
+then
+    ok "patch chip is the strongest standing verdict (reviewed-by over tested-by)"
+else
+    no "patch chip is the strongest standing verdict (reviewed-by over tested-by)"
+fi
 contains "counts panel eyebrow" "$html" '<p class="eyebrow">what is unresolved</p>'
 contains "counts: one open thread (the untagged orphan reply)" "$html" '<div class="count is-warn"><b>1</b><span>open threads</span></div>'
 contains "counts: two sign-off messages" "$html" '<div class="count is-ok"><b>2</b><span>sign-offs</span></div>'
@@ -408,6 +428,85 @@ s_p1="$(printf '%s\n' "$s_tree" | awk '/\[PATCH v1 1\/2\]/{print $1}')"
 solo_html="$work/solo.html"
 python3 "$renderer" "$LKML_MAILBOX_ROOT/banner-solo" -o "$solo_html"
 case "$(<"$solo_html")" in *'class="banner'*) no "one open thread raises no banner" ;; *) ok "one open thread raises no banner" ;; esac
+
+printf '\n== verdict strength: reviewed-by outranks acked-by ==\n'
+# A reviewer who posts Reviewed-by on patch 1 and Acked-by on patch 2
+# stands at their STRONGEST tag: the solid reviewed-by chip, never the
+# hollow acked-by (the chip forms say the same: the CSS calls Acked-by
+# the genuinely weaker claim).
+mkdir -p "$work/patches-prio"
+cp "$work/patches/0001-one.patch" "$work/patches/0002-two.patch" "$work/patches-prio/"
+"$mailbox" init prio-fixture --cover "$work/cover.txt" --patches "$work/patches-prio" \
+    --from author --harness test --model fixture >/dev/null 2>/dev/null
+pr_tree="$("$mailbox" tree prio-fixture)"
+pr_p1="$(printf '%s\n' "$pr_tree" | awk '/\[PATCH v1 1\/2\]/{print $1}')"
+pr_p2="$(printf '%s\n' "$pr_tree" | awk '/\[PATCH v1 2\/2\]/{print $1}')"
+"$mailbox" post prio-fixture --from core --reply-to "$pr_p1" --file "$work/review.txt" \
+    --tags Reviewed-by --harness test --model fixture >/dev/null 2>/dev/null
+printf '%s\n' 'Acked-by: The Reviewer' > "$work/ack.txt"
+"$mailbox" post prio-fixture --from core --reply-to "$pr_p2" --file "$work/ack.txt" \
+    --tags Acked-by --harness test --model fixture >/dev/null 2>/dev/null
+prio_html="$work/prio.html"
+python3 "$renderer" "$LKML_MAILBOX_ROOT/prio-fixture" -o "$prio_html"
+if python3 - "$prio_html" <<'PY'
+import sys
+
+html = open(sys.argv[1], encoding="utf-8").read()
+i = html.index('where each reviewer stands')
+panel = html[i:html.index('</section>', i)]
+if '<span class="chip reviewed">reviewed-by</span>' not in panel:
+    print("reviewer panel does not carry the reviewed-by chip")
+    sys.exit(1)
+if '<span class="chip acked">acked-by</span>' in panel:
+    print("reviewer panel shows the weaker acked-by chip instead")
+    sys.exit(1)
+PY
+then
+    ok "a reviewer's strongest standing verdict is reviewed-by, over their own acked-by"
+else
+    no "a reviewer's strongest standing verdict is reviewed-by, over their own acked-by"
+fi
+
+printf '\n== deep threads: one chain is one open thread, and it keeps its indent ==\n'
+# The shipped fixtures max out at depth 2; a reply chain nested under a
+# patch (depth 2 -> 3 -> 4) must count as ONE open thread (not one per
+# message), and every depth >= 1 gets the indent and rail -- the CSS
+# caps the indent at depth 6 rather than stopping at depth 2.
+mkdir -p "$work/patches-d"
+cp "$work/patches/0001-one.patch" "$work/patches/0002-two.patch" "$work/patches-d/"
+"$mailbox" init deep-fixture --cover "$work/cover.txt" --patches "$work/patches-d" \
+    --from author --harness test --model fixture >/dev/null 2>/dev/null
+d_tree="$("$mailbox" tree deep-fixture)"
+d_p1="$(printf '%s\n' "$d_tree" | awk '/\[PATCH v1 1\/2\]/{print $1}')"
+d_r1="$("$mailbox" post deep-fixture --from core --reply-to "$d_p1" --file "$work/q1.txt" \
+    --harness test --model fixture 2>/dev/null)"
+d_r2="$("$mailbox" post deep-fixture --from ci --reply-to "$d_r1" --file "$work/q2.txt" \
+    --harness test --model fixture 2>/dev/null)"
+"$mailbox" post deep-fixture --from newcomer --reply-to "$d_r2" --file "$work/q3.txt" \
+    --harness test --model fixture >/dev/null 2>/dev/null
+deep_html="$work/deep.html"
+python3 "$renderer" "$LKML_MAILBOX_ROOT/deep-fixture" -o "$deep_html"
+dhtml="$(<"$deep_html")"
+contains "a three-deep untagged chain is ONE open thread" "$dhtml" \
+    '<div class="count is-warn"><b>1</b><span>open threads</span></div>'
+if python3 - "$deep_html" <<'PY'
+import re
+import sys
+
+html = open(sys.argv[1], encoding="utf-8").read()
+depths = sorted(set(re.findall(r'<details class="msg" data-depth="(\d+)"', html)))
+if depths != ["0", "1", "2", "3", "4"]:
+    print("depths %s, want ['0', '1', '2', '3', '4']" % depths)
+    sys.exit(1)
+PY
+then
+    ok "the deep chain renders data-depth 3 and 4"
+else
+    no "the deep chain renders data-depth 3 and 4"
+fi
+contains "CSS indents depth 3" "$dhtml" '.msg[data-depth="3"] { margin-left: 57px; }'
+contains "CSS indents depth 4" "$dhtml" '.msg[data-depth="4"] { margin-left: 76px; }'
+contains "CSS caps the deep indent at depth 6" "$dhtml" '.msg[data-depth="6"] { margin-left: 114px; }'
 
 printf '\n== patch_label: lore-style normalizer ==\n'
 # The row-label normalizer, exercised directly: the bracketed numbering is

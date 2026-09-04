@@ -71,8 +71,11 @@ TAG_GLYPH = {"Reviewed-by": "R", "Acked-by": "A", "Tested-by": "T", "Changes-req
              "Question": "?", "NAK": "N"}
 
 # Verdict strength order, strongest first: a NAK outranks a
-# Changes-requested, which outranks a Question, which outranks a sign-off.
-TAG_PRIORITY = ["NAK", "Changes-requested", "Question", "Acked-by", "Tested-by", "Reviewed-by"]
+# Changes-requested, which outranks a Question, which outranks a
+# sign-off; among the sign-offs Reviewed-by is the strongest claim,
+# then Acked-by, then Tested-by (the same strength the chips encode
+# in form: solid green over hollow green).
+TAG_PRIORITY = ["NAK", "Changes-requested", "Question", "Reviewed-by", "Acked-by", "Tested-by"]
 # Tags that close a thread (the sign-offs). A thread whose subtree
 # carries none of these is still open.
 POSITIVE_TAGS = {"Reviewed-by", "Acked-by", "Tested-by"}
@@ -453,20 +456,6 @@ def reviewer_rollup(version_msgs, author, tally_rows):
     return out
 
 
-def strip_frontmatter(text):
-    """Drop a leading '---' ... '---' YAML frontmatter block, if present.
-    The archived persona file's frontmatter names the persona's DEFAULT
-    harness/model; under lkml-round.sh --model-override (the documented
-    cheap smoke round) the messages in the version were in fact run on a
-    different one, so printing the block next to the message headers'
-    harness/model line would state two different models for the same
-    reviewer."""
-    m = re.match(r"\A---\n.*?\n---\n?", text, re.DOTALL)
-    if m:
-        return text[m.end():].lstrip("\n")
-    return text
-
-
 def persona_brief_path(series_dir, persona):
     """The on-disk persona brief for a message's X-AI-Persona value, or
     None. The header comes straight out of the .msg file, which a
@@ -759,12 +748,16 @@ def render_counts_panel(n_open, n_signoffs, max_depth, n_naks):
             f'    </section>')
 
 
-def open_threads_of(version_msgs, patch_root_ids):
-    """The replies (depth >= 1, not a patch root) whose thread carries no
-    sign-off tag anywhere: the threads that are still open."""
+def open_threads_of(version_msgs, patch_root_ids, root_ids):
+    """The open threads: the topmost reply of each reply chain (a message
+    whose parent is a patch root or a series root, so a nested chain
+    under a patch is ONE thread, not one per message) whose subtree
+    carries no sign-off tag anywhere."""
     out = []
     for m in version_msgs:
         if m["depth"] < 1 or m["id"] in patch_root_ids:
+            continue
+        if m["parent"] not in patch_root_ids and m["parent"] not in root_ids:
             continue
         if any(any(t in POSITIVE_TAGS for t in x["tags"]) for x in subtree(m)):
             continue
@@ -782,8 +775,9 @@ def render_message(m, depth=0, series_name=""):
     """One message of the thread as a collapsed <details>: monogram,
     name, short id, verdict chip, subject as the scannable line; the
     body opens in place. data-depth drives the indent and the hairline
-    rail (a depth-0 message gets neither -- the CSS styles only
-    [data-depth="1"] and above). An unrecorded model is stamped
+    rail (a depth-0 message gets neither -- the CSS styles
+    [data-depth="1"] and above, capping the indent at depth 6). An
+    unrecorded model is stamped
     'model unknown' in the warning colour: surfacing a real defect,
     deliberately, not hiding it."""
     chip = chip_html(strongest_tag(m["tags"]))
@@ -841,6 +835,7 @@ def render_trace(m, depth=0, series_name=""):
 def render_series(series_dir):
     name, msgs, roots = build(series_dir)
     id_map = id_prefix_map(msgs)
+    root_ids = {r["id"] for r in roots}
     covers = [r for r in roots if r["depth"] == 0 and r["subject"].startswith("[PATCH")]
     versions = sorted({c["version"] for c in covers})
     current = versions[-1] if versions else 1
@@ -875,10 +870,24 @@ def render_series(series_dir):
 
         for r in version_roots:
             d1walk(r, None)
-        opens = open_threads_of(version_msgs, patch_root_ids)
+        opens = open_threads_of(version_msgs, patch_root_ids, root_ids)
         n_open = len(opens)
-        open_d1 = {d1map[m["id"]]["id"] for m in opens if d1map[m["id"]] is not None}
-        open_one = (next((d1map[i] for i in open_d1), None) if len(open_d1) == 1 else None)
+        # The banner names the patch every open thread sits on; that is
+        # one patch only when EVERY open thread parents to a patch and
+        # they all agree (an untagged orphan reply to the cover anchors
+        # nowhere, so its presence keeps the banner quiet).
+        patch_msgs = {t["id"]: t for t, _l in rows[1:]}
+        open_pidx = set()
+        all_on_patch = True
+        for m in opens:
+            p = patch_msgs.get(m["parent"])
+            if p is None:
+                all_on_patch = False
+                break
+            open_pidx.add(patch_index(p))
+        open_pidx.discard(None)
+        open_patch_idx = (next(iter(open_pidx))
+                          if all_on_patch and len(open_pidx) == 1 else None)
         naks = sum(r["nak"] for r in reviewer_entries)
         nak_names = sorted(r["persona"] for r in reviewer_entries if r["nak"])
         nak_d1 = set()
@@ -893,7 +902,8 @@ def render_series(series_dir):
         version_data[v] = {
             "cover": cover, "rows": rows, "version_roots": version_roots,
             "version_msgs": version_msgs, "reviewer_entries": reviewer_entries,
-            "strongest": strongest, "n_open": n_open, "open_one": open_one,
+            "strongest": strongest, "n_open": n_open,
+            "open_patch_idx": open_patch_idx,
             "n_naks": naks, "nak_idx": nak_idx, "nak_names": nak_names,
         }
     cur = version_data.get(current)
@@ -954,8 +964,7 @@ def render_series(series_dir):
                 render_patch_panel(series_dir, current, cur["rows"], cur["reviewer_entries"]),
                 counts]
         banner = render_banner(cur["n_naks"], cur["nak_names"], cur["nak_idx"],
-                               cur["n_open"],
-                               patch_index(cur["open_one"]) if cur["open_one"] else None)
+                               cur["n_open"], cur["open_patch_idx"])
         sump = render_summary_card(series_dir, current, id_map)
         shell = '  <div class="shell">\n\n  <aside class="rail">\n' + "\n".join(p for p in rail if p) + "\n  </aside>\n\n  <main class=\"main\">\n"
         if banner:
@@ -1249,12 +1258,23 @@ a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset:
   position: relative; background: var(--surface); border: 1px solid var(--rule);
   border-radius: 9px; box-shadow: var(--shadow);
 }
+/* The indent steps 19px per level below the posting and caps at 6:
+   a depth-7-or-deeper reply keeps the depth-6 indent rather than
+   flushing left. The cap rule matches every depth; the explicit ones
+   below, at equal specificity and later in the sheet, win. */
+.msg[data-depth] { margin-left: 114px; }
+.msg[data-depth="0"] { margin-left: 0; }
 .msg[data-depth="1"] { margin-left: 19px; }
 .msg[data-depth="2"] { margin-left: 38px; }
-.msg[data-depth="1"]::before, .msg[data-depth="2"]::before {
+.msg[data-depth="3"] { margin-left: 57px; }
+.msg[data-depth="4"] { margin-left: 76px; }
+.msg[data-depth="5"] { margin-left: 95px; }
+.msg[data-depth="6"] { margin-left: 114px; }
+.msg[data-depth]::before {
   content: ""; position: absolute; left: -10px; top: 15px; bottom: 15px;
   width: 1px; background: var(--rule);
 }
+.msg[data-depth="0"]::before { content: none; }
 
 .msg > summary {
   cursor: pointer; list-style: none; display: grid;
