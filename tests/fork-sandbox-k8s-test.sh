@@ -59,6 +59,12 @@
 #     implementation under test, not a duplicate of its logic.
 #   - no file in the repo matches a private-hostname shape, guarding the
 #     public-repo leak rule every script and manifest here has to hold to.
+#   - fork-sandbox-k8s.sh keeps spelling its GNU tools through the
+#     resolved names fork-sandbox-lib.sh sets ($FS_STAT, $FS_REALPATH,
+#     $FS_TIMEOUT) rather than the bare names, which on macOS are the BSD
+#     tools that reject the GNU flags -- with exactly one documented
+#     exception, the readlink -f bootstrap that runs before the library
+#     is sourced.
 #   - fork-sandbox.sh --k8s: the two new lib functions it shares with the
 #     local path (fs_require_scratch_handoff, fs_require_src_project), that
 #     it defaults a bare --k8s to --harness pi (still requiring --model),
@@ -5040,6 +5046,52 @@ if [[ -z "$hits" ]]; then
 else
     no "no private-hostname shape in the repo" "$hits"
 fi
+
+printf '\n== fork-sandbox-k8s.sh: the GNU tools go through their resolved names ==\n'
+# Guards the fork-sandbox-lib.sh name resolution: on macOS the bare names
+# are BSD tools that reject the GNU flags (stat -c) or don't exist at all
+# (timeout), so every call site must use the $FS_* names. What counts as a
+# match, per pattern:
+#   - "stat -c" and "realpath -m/-s/-e": any literal occurrence, comment
+#     lines included -- the shimmed form ("$FS_STAT" -c) cannot spell the
+#     raw form, and a comment describing the raw form would steer the next
+#     edit back to it, so it is caught too. The grep -vF is a belt: it
+#     would exclude a line literally containing the shimmed form.
+#   - "timeout": command position only -- start of line (indented or not)
+#     or immediately after ;, &, | or $(. --timeout, --request-timeout,
+#     and the word in echo prose ("every 10s, timeout ...") all begin or
+#     continue from other characters and do not match.
+#   - "readlink -f": counted over the whole file, expected to be EXACTLY
+#     one -- the script_dir bootstrap, which runs before the library is
+#     sourced and structurally cannot use $FS_REALPATH. BSD readlink
+#     gained -f in macOS 12.3, so every supported macOS has it. Asserting
+#     1 rather than 0 documents the exception: if the bootstrap moves or
+#     a second raw readlink appears, this test says so instead of passing
+#     silently.
+# shellcheck disable=SC2016  # the shimmed form is meant literally, not expanded
+raw_stat_hits="$(grep -n 'stat -c' "$k8s_sh" | grep -vF -- '"$FS_STAT" ' || true)"
+if [[ -z "$raw_stat_hits" ]]; then
+    ok "fork-sandbox-k8s.sh: no raw 'stat -c' outside the $FS_STAT shim"
+else
+    no "fork-sandbox-k8s.sh: no raw 'stat -c' outside the $FS_STAT shim" "$raw_stat_hits"
+fi
+# shellcheck disable=SC2016  # the shimmed form is meant literally, not expanded
+raw_realpath_hits="$(grep -nE 'realpath -[mse]' "$k8s_sh" | grep -vF -- '"$FS_REALPATH" ' || true)"
+if [[ -z "$raw_realpath_hits" ]]; then
+    ok "fork-sandbox-k8s.sh: no raw 'realpath -m/-s/-e' outside the $FS_REALPATH shim"
+else
+    no "fork-sandbox-k8s.sh: no raw 'realpath -m/-s/-e' outside the $FS_REALPATH shim" "$raw_realpath_hits"
+fi
+# shellcheck disable=SC2016  # the pattern is meant literally, not expanded
+raw_timeout_hits="$(grep -nE '(^|[;&|(])[[:space:]]*timeout[[:space:]]' "$k8s_sh" || true)"
+if [[ -z "$raw_timeout_hits" ]]; then
+    ok "fork-sandbox-k8s.sh: no bare 'timeout' command outside the $FS_TIMEOUT shim"
+else
+    no "fork-sandbox-k8s.sh: no bare 'timeout' command outside the $FS_TIMEOUT shim" "$raw_timeout_hits"
+fi
+readlink_count="$(grep -c 'readlink -f' "$k8s_sh" || true)"
+check "fork-sandbox-k8s.sh: exactly one 'readlink -f' (the pre-library bootstrap)" \
+    1 "$readlink_count"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))
