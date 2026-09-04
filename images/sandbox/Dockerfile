@@ -25,6 +25,10 @@ FROM node:22-bookworm-slim
 # probe wants real iproute2, not BusyBox's applet. socat, because a sealed
 # run's bridges are socat relays. ca-certificates, because every agent CLI
 # talks TLS. ripgrep and less because the agents shell out to them.
+# shellcheck, because a repo whose contribution rules require it -- this one
+# does -- otherwise hands an agent a rule it cannot follow: the sandbox has no
+# network, so a run that finds shellcheck missing cannot install it and can
+# only report that it skipped the check.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         bash \
@@ -37,6 +41,7 @@ RUN apt-get update \
         procps \
         python3 \
         ripgrep \
+        shellcheck \
         socat \
     && rm -rf /var/lib/apt/lists/*
 
