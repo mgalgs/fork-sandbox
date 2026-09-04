@@ -22,9 +22,13 @@
 #   - `run --dry-run` renders byte-for-byte the same Job YAML as
 #     `submit --dry-run`, proving run delegates rather than growing its own
 #     divergent copy of the rendering, and rejects the same argument
-#     mistakes the other verbs reject. The poll/wait/fetch/rm sequence
-#     itself needs a live cluster and is not covered here -- see the header
-#     comment on cmd_run in fork-sandbox-k8s.sh.
+#     mistakes the other verbs reject.
+#   - `run`'s whole poll/wait/fetch/pull-back/rm sequence, driven end to
+#     end against a stubbed kubectl+git pair (the stub cannot prove what a
+#     real pod does with the .fetched marker, only what the client does in
+#     what order): a failed outbox read reports kubectl's own stderr,
+#     a failed read with empty stderr says so explicitly, and the outbox
+#     read happens BEFORE the fetch touches /work/.fetched.
 #   - `submit --dry-run`'s rendered handoff.md carries the operator-inbox
 #     section, names /work/inbox, and never claims that directory is
 #     read-only -- it is not, in a pod (see docs/kubernetes-runs.md).
@@ -2204,6 +2208,126 @@ else
     fi
 fi
 rm -f /tmp/fs-k8s-test-cr-exec.out
+
+printf '\n== fork-sandbox-k8s.sh run: poll/fetch/pull-back vs stubbed kubectl ==\n'
+# The sequence cmd_run drives after submit was previously only executable
+# against a live cluster (see this file's header); it is now driven end to
+# end with a stubbed git (no-ops the ext:: push/fetch) and a stubbed
+# kubectl (logs every invocation, serves canned answers). The outbox read
+# -- the kubectl exec that tars /work/outbox -- is controlled through the
+# environment: K8S_STUB_OUTBOX_RC is its exit status, K8S_STUB_OUTBOX_STDERR
+# what it writes to stderr, and on success it tars K8S_STUB_OUTBOX_DIR.
+runstub_dir="$(newdir)"; tmpdirs+=("$runstub_dir")
+cat > "$runstub_dir/git" <<'STUB'
+#!/usr/bin/env bash
+case " $* " in
+    *" push "*) exit 0 ;;
+    *" fetch "*) exit 0 ;;
+esac
+exec /usr/bin/git "$@"
+STUB
+cat > "$runstub_dir/kubectl" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$K8S_STUB_LOG"
+case " $* " in
+    *" apply -f -"*) cat >/dev/null; exit 0 ;;
+    *" wait "*) exit 0 ;;
+    *" get "*) printf 'stub-pod\n' ;;
+    *" delete "*) exit 0 ;;
+    *" tar cf - -C /work/outbox "*)
+        if [[ "${K8S_STUB_OUTBOX_RC:-1}" == 0 ]]; then
+            cd "$K8S_STUB_OUTBOX_DIR" && tar cf - .
+        fi
+        [[ -n "${K8S_STUB_OUTBOX_STDERR:-}" ]] && printf '%s' "$K8S_STUB_OUTBOX_STDERR" >&2
+        exit "${K8S_STUB_OUTBOX_RC:-1}"
+        ;;
+    *" cat /work/.run-complete "*) printf '0\n' ;;
+esac
+exit 0
+STUB
+chmod +x "$runstub_dir/git" "$runstub_dir/kubectl"
+runstub_pod_outbox="$(newdir)"; tmpdirs+=("$runstub_pod_outbox")
+printf 'an artifact\n' > "$runstub_pod_outbox/hello.txt"
+runstub_run() {
+    # $1 = kubectl log, $2 = output file, rest = fork-sandbox-k8s.sh run args.
+    local log="$1" out="$2"; shift 2
+    PATH="$runstub_dir:$PATH" K8S_STUB_LOG="$log" \
+        K8S_STUB_OUTBOX_DIR="$runstub_pod_outbox" \
+        FORK_SANDBOX_CONFIG_DIR="$config_dir" \
+        "$k8s_sh" run "$@" > "$out" 2>&1
+}
+
+# 1. A failed outbox read must surface kubectl's own stderr: the stub's
+# exec writes a recognizable string to stderr and exits non-zero, and the
+# operator sees both the existing warning and that string.
+runstub_log1="$(newdir)/kubectl.log"; runstub_out1="$(newdir)/out1.txt"
+tmpdirs+=("$(dirname "$runstub_log1")" "$(dirname "$runstub_out1")")
+if K8S_STUB_OUTBOX_STDERR='stub-kubectl says: pod stub-pod is already Completed' \
+    K8S_STUB_OUTBOX_RC=1 runstub_run "$runstub_log1" "$runstub_out1" \
+    --branch fs-k8s-test-run-outbox-err --model moonshotai/kimi-k3 \
+    --outbox-dir "$(dirname "$runstub_out1")/outbox-1" \
+    "$proj_dir" "$handoff_file"; then
+    if grep -q 'warning: could not read the outbox' "$runstub_out1" \
+        && grep -q 'stub-kubectl says: pod stub-pod is already Completed' "$runstub_out1" \
+        && grep -q 'run complete' "$runstub_out1"; then
+        ok "failed outbox read surfaces kubectl's own stderr"
+    else
+        no "failed outbox read surfaces kubectl's own stderr" "$(cat "$runstub_out1")"
+    fi
+else
+    no "failed outbox read surfaces kubectl's own stderr" "run exited nonzero: $(cat "$runstub_out1")"
+fi
+
+# 2. A failed read with NOTHING on stderr is reported as silent, not as an
+# empty block: the explicit "wrote nothing" line, and not the heading the
+# non-empty case prints.
+runstub_log2="$(newdir)/kubectl.log"; runstub_out2="$(newdir)/out2.txt"
+tmpdirs+=("$(dirname "$runstub_log2")" "$(dirname "$runstub_out2")")
+if K8S_STUB_OUTBOX_STDERR='' K8S_STUB_OUTBOX_RC=1 \
+    runstub_run "$runstub_log2" "$runstub_out2" \
+    --branch fs-k8s-test-run-outbox-silent --model moonshotai/kimi-k3 \
+    --outbox-dir "$(dirname "$runstub_out2")/outbox-2" \
+    "$proj_dir" "$handoff_file"; then
+    if grep -q 'wrote nothing to stderr' "$runstub_out2" \
+        && ! grep -q 'reported, on stderr:' "$runstub_out2"; then
+        ok "failed outbox read with empty stderr is reported as silent"
+    else
+        no "failed outbox read with empty stderr is reported as silent" "$(cat "$runstub_out2")"
+    fi
+else
+    no "failed outbox read with empty stderr is reported as silent" "run exited nonzero: $(cat "$runstub_out2")"
+fi
+
+# 3. The regression test for the ordering: the stubbed kubectl logs every
+# invocation, and the outbox tar read must appear in that log BEFORE the
+# fetch's touch /work/.fetched -- which is what makes the pod exit, and a
+# kubectl exec into a completed pod fails. The same log line must carry
+# the request-timeout bound that keeps a hung read from delaying the
+# fetch indefinitely.
+runstub_log3="$(newdir)/kubectl.log"; runstub_out3="$(newdir)/out3.txt"; runstub_dest3="$(newdir)/outbox-3"
+tmpdirs+=("$(dirname "$runstub_log3")" "$(dirname "$runstub_out3")" "$(dirname "$runstub_dest3")")
+if K8S_STUB_OUTBOX_RC=0 runstub_run "$runstub_log3" "$runstub_out3" \
+    --branch fs-k8s-test-run-ordering --model moonshotai/kimi-k3 \
+    --outbox-dir "$runstub_dest3" \
+    "$proj_dir" "$handoff_file"; then
+    # || true: under pipefail a grep that finds nothing would otherwise
+    # take the whole suite down at the assignment rather than failing the
+    # assertion below.
+    tar_ln="$(grep -n 'tar cf - -C /work/outbox' "$runstub_log3" | head -n 1 | cut -d: -f1 || true)"
+    fetched_ln="$(grep -n 'touch /work/.fetched' "$runstub_log3" | head -n 1 | cut -d: -f1 || true)"
+    if [[ -n "$tar_ln" && -n "$fetched_ln" ]] && (( tar_ln < fetched_ln )) \
+        && grep -q -- '--request-timeout=60s' <(sed -n "${tar_ln}p" "$runstub_log3") \
+        && [[ -f "$runstub_dest3/hello.txt" ]] \
+        && grep -q 'outbox: 1 file(s) at' "$runstub_out3"; then
+        ok "outbox is pulled back before the fetch touches /work/.fetched"
+        ok "the outbox kubectl exec carries a request-timeout bound"
+    else
+        no "outbox is pulled back before the fetch touches /work/.fetched" \
+            "tar_ln=$tar_ln fetched_ln=$fetched_ln dest=$(find "$runstub_dest3" 2>/dev/null) out=$(cat "$runstub_out3")"
+    fi
+else
+    no "outbox is pulled back before the fetch touches /work/.fetched" "run exited nonzero: $(cat "$runstub_out3")"
+fi
 
 printf '\n== fork-sandbox-k8s.sh say: argument validation (no cluster) ==\n'
 # Every one of these is rejected before cmd_say ever calls kubectl, so all
