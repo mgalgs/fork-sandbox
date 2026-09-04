@@ -92,6 +92,15 @@ failed (dead pod, timeout, malformed sentinel): an agent that ran to
 completion and exited 3 is a *successful* `wait` that prints `3`, the
 same distinction a local harness makes between the run and its child.
 
+Because a *standalone* `wait` may begin after the run already finished,
+it also treats a `Succeeded` pod as terminal: at that point the entrypoint
+has idled out its TTL and exited, its container is gone, and the sentinel
+can no longer be read through `kubectl exec`. `wait` fails fast with a
+by-hand `fetch`/`rm` sequence instead of polling a run that can never
+become executable again — the exit code is unrecoverable, but the branch
+work still is. `run` never reaches this case, since it waits while the
+run executes.
+
 `collect --branch NAME [--outbox-dir DIR] [--outbox-max SIZE]
 [--review-loop N] [--keep] <project-path>` does everything `run` does
 after the wait: the review-loop outcome read (only when `--review-loop N`

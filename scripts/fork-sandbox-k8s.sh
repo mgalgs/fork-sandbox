@@ -2352,6 +2352,12 @@ cmd_wait() {
         # pull failure, node eviction) must not be polled for the full
         # timeout -- check its state every iteration and stop as soon as it
         # is clearly dead, rather than waiting out the deadline on a corpse.
+        # A Succeeded pod is dead in the other direction: it ran to
+        # completion and then idled out its TTL, so its container has
+        # exited and the sentinel can no longer be read via exec. cmd_run
+        # never reaches this (it waits while the run executes), but a
+        # standalone wait may begin after the fact, in the fan-out
+        # workflow this verb exists for.
         phase="$(kubectl get pod "$pod_name" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
         if [[ "$phase" == Failed ]]; then
             echo "Error: pod $pod_name is Failed -- it died before writing" >&2
@@ -2359,6 +2365,17 @@ cmd_wait() {
             echo "  kubectl --context=$K8S_CONTEXT -n $K8S_NAMESPACE describe pod $pod_name" >&2
             echo "fork-sandbox-k8s: the job and pod are left in place for" >&2
             echo "inspection. Remove them with:" >&2
+            echo "  fork-sandbox-k8s.sh rm --branch $branch" >&2
+            exit 1
+        fi
+        if [[ "$phase" == Succeeded ]]; then
+            echo "Error: pod $pod_name is Succeeded -- the run completed and" >&2
+            echo "then idled out its TTL, so its container has exited and" >&2
+            echo "/work/.run-complete can no longer be read. This wait began" >&2
+            echo "after the run finished; the branch work is still there." >&2
+            echo "Fetch it by hand:" >&2
+            echo "  fork-sandbox-k8s.sh fetch --branch $branch${project_path:+ $project_path}" >&2
+            echo "and clean up afterwards with:" >&2
             echo "  fork-sandbox-k8s.sh rm --branch $branch" >&2
             exit 1
         fi

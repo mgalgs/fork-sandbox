@@ -35,7 +35,8 @@
 #   - the `wait` and `collect` verbs, driven directly against the same
 #     stubbed kubectl pair: a completed wait prints the agent's exit code
 #     to stdout and nothing else (a non-zero AGENT exit is a successful
-#     wait that exits 0), while a Failed pod, a Failed job condition, a
+#     wait that exits 0), while a Failed pod, a Succeeded pod (run
+#     completed, then idled out its TTL), a Failed job condition, a
 #     timeout and a malformed sentinel each fail the wait itself; collect
 #     lands the outbox at --outbox-dir, refuses an over-cap one without
 #     costing the fetch, warns on an unreadable one and still fetches,
@@ -2534,6 +2535,27 @@ else
         ok "a malformed sentinel fails the wait"
     else
         no "a malformed sentinel fails the wait" "$(cat "$wait_err5")"
+    fi
+fi
+
+# 6. A Succeeded pod: the run finished and idled out its TTL, so the
+# container has exited and the sentinel can no longer be read via exec.
+# The wait must fail fast on the first probe -- not poll to its own
+# timeout on a run that can never become executable again -- and point at
+# a by-hand fetch, since the branch work is still there.
+wait_log6="$(newdir)/kubectl.log"; wait_out6="$(newdir)/out6.txt"; wait_err6="$(newdir)/err6.txt"
+tmpdirs+=("$(dirname "$wait_log6")")
+if K8S_STUB_POD_PHASE=Succeeded \
+    waitstub_wait "$wait_log6" "$wait_out6" "$wait_err6" \
+    --branch fs-k8s-test-wait-podsucceeded --timeout 0; then
+    no "a Succeeded pod fails the wait" "wait unexpectedly succeeded"
+else
+    if grep -q 'pod stub-pod is Succeeded -- the run completed and' "$wait_err6" \
+        && grep -q 'Fetch it by hand' "$wait_err6" \
+        && ! grep -q 'timed out' "$wait_err6"; then
+        ok "a Succeeded pod fails the wait"
+    else
+        no "a Succeeded pod fails the wait" "$(cat "$wait_err6")"
     fi
 fi
 
