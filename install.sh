@@ -236,6 +236,22 @@ if [[ -e "$k8s_env" ]]; then
     else
         echo "    K8S_NAMESPACE: fork-sandbox (default)"
     fi
+    if [[ -n "${k8s_context:-}" ]] && command -v timeout >/dev/null 2>&1; then
+        if k8s_contexts="$(timeout 2s kubectl config get-contexts -o name 2>/dev/null)"; then
+            k8s_context_found=0
+            while IFS= read -r context_name; do
+                if [[ "$context_name" == "$k8s_context" ]]; then
+                    k8s_context_found=1
+                    break
+                fi
+            done <<< "$k8s_contexts"
+            if (( k8s_context_found )); then
+                echo "    K8S_CONTEXT: $k8s_context (found in this machine's kubeconfig)"
+            elif [[ -n "$k8s_contexts" ]]; then
+                echo "    K8S_CONTEXT: $k8s_context is not in this machine's kubeconfig; run 'kubectl config get-contexts' to see available contexts"
+            fi
+        fi
+    fi
 else
     echo "  $k8s_config_dir/k8s.env: not present"
 fi
