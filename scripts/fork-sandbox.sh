@@ -521,8 +521,8 @@
 # That also means most of this script's flags have nothing to attach to on a
 # cluster run: they describe local-sandbox machinery -- bubblewrap, per-run
 # docker-compose services, the detached tmux session -- that a Kubernetes pod
-# has no equivalent of, they describe a real capability (--checkout,
-# --prompts-dir, --pi-args, --task-meta) the cluster path has
+# has no equivalent of, they describe a real capability (--prompts-dir,
+# --pi-args, --task-meta) the cluster path has
 # not been built to carry yet, or -- --claude-args alone, since --harness
 # claude landed here -- the pod's own invocation of the flag's target IS
 # built, but fixed: a --harness claude pod really does run the claude CLI,
@@ -558,6 +558,12 @@
 # K8S_PROXY_ENDPOINTS entry the pod talks to, and it rides the same
 # dispatch: forwarded as-is, resolved against the registry on the
 # fork-sandbox-k8s.sh side, where the registered names are known.
+# --checkout is carried the same way: forwarded as-is, and
+# fork-sandbox-k8s.sh's cmd_submit resolves it in the origin repo before
+# anything is created and pushes the resolved sha as the branch's starting
+# revision (and, under --review-loop, as the review base) -- so a cluster
+# run can start from any ref the origin repo names, not only the repo's
+# current HEAD.
 #
 # One gap is not a refused flag, because no flag controls it: a --k8s run
 # never appends to the durable run log described below
@@ -2113,13 +2119,6 @@ if [[ "$k8s_mode" == true ]]; then
 
     # Flags that name a real, wanted capability the cluster path has not been
     # built to carry yet -- a later round of work, not a permanent no.
-    if [[ -n "$checkout_ref" ]]; then
-        echo "Error: --checkout is not yet supported with --k8s. submit always" >&2
-        echo "pushes the origin repo's current HEAD into the pod; starting a" >&2
-        echo "cluster run from another ref needs submit to take one, which it" >&2
-        echo "does not yet." >&2
-        exit 1
-    fi
     if [[ -n "$pi_extra_args" ]]; then
         echo "Error: --pi-args is not yet supported with --k8s." >&2
         echo "fork-sandbox-k8s.sh run has no flag yet to carry extra pi" >&2
@@ -2242,6 +2241,11 @@ if [[ "$k8s_mode" == true ]]; then
     [[ -n "$review_model" ]] && k8s_argv+=(--review-model "$review_model")
     [[ -n "$k8s_endpoint" ]] && k8s_argv+=(--endpoint "$k8s_endpoint")
     [[ -n "$k8s_outbox_dir" ]] && k8s_argv+=(--outbox-dir "$k8s_outbox_dir")
+    # Forwarded as the raw ref, like --endpoint: fork-sandbox-k8s.sh's
+    # cmd_submit resolves it (and refuses it by name if it does not name a
+    # commit in the origin repo) before anything is created, so there is
+    # nothing to validate here.
+    [[ -n "$checkout_ref" ]] && k8s_argv+=(--checkout "$checkout_ref")
     # Forwarded as the raw string, not the byte count already parsed above:
     # fork-sandbox-k8s.sh does its own parsing, so there is one source of
     # truth per process rather than a cross-process byte count to keep in
