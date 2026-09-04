@@ -2434,21 +2434,24 @@ cmd_run() {
         rm -f -- "$loop_err"
     fi
 
-    echo "fork-sandbox-k8s: fetching branch $branch" >&2
-    cmd_fetch --branch "$branch" "$project_path"
-
     # Pull /work/outbox back, symmetric with the local path's run_dir/outbox
     # (see fs_emit_prompt_preamble's "## Artifact outbox" section). This is
-    # best-effort: retrieving artifacts must never cost the branch just
-    # fetched, or block the --keep/rm step below, so every failure here
-    # warns and falls through rather than exiting.
+    # best-effort: retrieving artifacts must never cost the branch fetch
+    # that follows, or block the --keep/rm step below, so every failure here
+    # warns and falls through rather than exiting. It runs BEFORE that
+    # fetch, not after it, because cmd_fetch touches /work/.fetched -- the
+    # pod's own signal to stop idling and exit (see the entrypoint's idle
+    # loop) -- and a kubectl exec into a completed pod fails. The read is
+    # the one kubectl exec in this sequence that can run while the pod is
+    # otherwise idle, so it is bounded with --request-timeout: a hung
+    # connection may now delay the fetch, but it cannot hang indefinitely.
     local outbox_dest="$outbox_dir"
     [[ -n "$outbox_dest" ]] \
         || outbox_dest="/var/tmp/claude-scratch/forks/k8s-$(k8s_safe_name_component "$branch")/outbox"
     local outbox_tar outbox_err outbox_ok=true
     outbox_tar="$(mktemp)"
     outbox_err="$(mktemp)"
-    if ! kubectl exec "$pod_name" -- tar cf - -C /work/outbox . 2> "$outbox_err" \
+    if ! kubectl exec --request-timeout=60s "$pod_name" -- tar cf - -C /work/outbox . 2> "$outbox_err" \
             | head -c "$((outbox_max_bytes + 1))" > "$outbox_tar"; then
         echo "fork-sandbox-k8s: warning: could not read the outbox from pod $pod_name; nothing pulled back." >&2
         fs_report_captured_stderr "kubectl exec into pod $pod_name (outbox read)" "$outbox_err"
@@ -2477,6 +2480,9 @@ cmd_run() {
         fi
     fi
     rm -f -- "$outbox_tar"
+
+    echo "fork-sandbox-k8s: fetching branch $branch" >&2
+    cmd_fetch --branch "$branch" "$project_path"
 
     if [[ "$keep" == true ]]; then
         echo "fork-sandbox-k8s: --keep set; leaving job and pod for branch $branch in place" >&2
