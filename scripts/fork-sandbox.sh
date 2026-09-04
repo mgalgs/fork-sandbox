@@ -2371,9 +2371,12 @@ fi
 # clear message, before the run is created. Validated here, above the
 # dry-run exit, for the same reason the loop caps are: --dry-run exists
 # to say whether a launch is good, so it must not approve one the real
-# run refuses.
+# run refuses. The =~ test runs under LC_ALL=C: in a UTF-8 locale a
+# [a-z] range matches accented characters (e.g. 'é'), which the
+# recorder's ASCII-only check would then silently reject -- the two
+# gates must refuse exactly the same set.
 if [[ -n "${FORK_SANDBOX_RUN_SOURCE:-}" ]] \
-    && ! [[ "$FORK_SANDBOX_RUN_SOURCE" =~ ^[a-z][a-z0-9-]{0,31}$ ]]; then
+    && (LC_ALL=C; [[ ! "$FORK_SANDBOX_RUN_SOURCE" =~ ^[a-z][a-z0-9-]{0,31}$ ]]); then
     echo "Error: FORK_SANDBOX_RUN_SOURCE is a provenance token that ends up" >&2
     echo "in the run log, so it must start with a lowercase letter and be" >&2
     echo "only lowercase letters, digits and hyphens, at most 32 chars" >&2

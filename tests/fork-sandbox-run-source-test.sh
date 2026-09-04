@@ -268,6 +268,28 @@ bad_env "a12345678901234567890123456789012" "33 characters, one over the maximum
 bad_env "a234567890123456789012345678901234567890" "40 characters"
 bad_env "-leading-hyphen" "a leading hyphen"
 bad_env "1leading-digit" "a leading digit"
+# Locale-gated: in a UTF-8 locale a bare [a-z] =~ range matches accented
+# characters, so 'é' would slip past the launcher while the recorder's
+# ASCII-only check still refuses it. The launcher's test must be pinned
+# to LC_ALL=C, so 'é' is refused in a UTF-8 locale exactly as under C.
+utf8_locale=""
+for cand in en_US.utf8 en_US.UTF-8 C.utf8 C.UTF-8; do
+    if locale -a 2>/dev/null | grep -qx "$cand"; then utf8_locale="$cand"; break; fi
+done
+if [[ -n "$utf8_locale" ]]; then
+    rc=0
+    FORK_SANDBOX_RUN_SOURCE='é' LC_ALL="$utf8_locale" \
+        "$launcher" --dry-run unused-project unused-handoff \
+        >/dev/null 2>"$err" || rc=$?
+    if (( rc != 0 )); then
+        ok "an accented value is refused in a UTF-8 locale ($utf8_locale)"
+    else
+        no "an accented value is refused in a UTF-8 locale ($utf8_locale)" \
+            "dry-run exited 0"
+    fi
+else
+    ok "an accented value is refused in a UTF-8 locale (skipped: no UTF-8 locale installed)"
+fi
 # Nothing is created: the refusal happens above run-directory creation.
 before="$(find /var/tmp/claude-scratch/forks -maxdepth 1 \
     -name 'claude-fork-sandbox.*' -type d | wc -l)"
