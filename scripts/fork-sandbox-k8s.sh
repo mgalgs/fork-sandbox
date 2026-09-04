@@ -11,7 +11,7 @@
 #                            <project-path> <handoff-file>
 #        fork-sandbox-k8s.sh run [--dry-run] [--timeout SECONDS] [--keep]
 #                            --branch NAME [--model MODEL] [--endpoint NAME]
-#                            [--harness pi|claude]
+#                            [--harness pi|claude] [--pi-args ARGS]
 #                            [--review-loop N] [--review-model MODEL]
 #                            [--outbox-dir DIR] [--outbox-max SIZE]
 #                            [--context-ro DIR]
@@ -2658,7 +2658,7 @@ cmd_collect() {
 cmd_run() {
     local dry_run=false keep=false timeout=3600 branch="" model="" review_loop_cap=""
     local outbox_dir="" outbox_max_arg="" context_ro="" harness="" review_model="" endpoint=""
-    local checkout_ref=""
+    local checkout_ref="" pi_args=""
     while (( $# )); do
         case "$1" in
             --dry-run) dry_run=true; shift ;;
@@ -2669,6 +2669,7 @@ cmd_run() {
             --model) model="${2:?--model requires an OpenRouter model id}"; shift 2 ;;
             --endpoint) endpoint="${2:?--endpoint requires a name}"; shift 2 ;;
             --harness) harness="${2:?--harness requires 'pi' or 'claude'}"; shift 2 ;;
+            --pi-args) pi_args="${2:?--pi-args requires a value}"; shift 2 ;;
             --review-loop) review_loop_cap="${2:?--review-loop requires a positive integer}"; shift 2 ;;
             --review-model) review_model="${2:?--review-model requires a model id}"; shift 2 ;;
             --outbox-dir) outbox_dir="${2:?--outbox-dir requires a path}"; shift 2 ;;
@@ -2722,6 +2723,12 @@ cmd_run() {
     [[ -n "$model" ]] && submit_argv+=(--model "$model")
     [[ -n "$endpoint" ]] && submit_argv+=(--endpoint "$endpoint")
     [[ -n "$harness" ]] && submit_argv+=(--harness "$harness")
+    # Same pass-through-when-given rule as --harness above: the value is
+    # forwarded UNCHANGED, and cmd_submit re-runs its own refusal (the
+    # claude-harness cross-check and fs_reject_unsafe_chars) before
+    # anything is created. An empty --pi-args means "absent", not an
+    # empty argument the pod's pi would see as a positional.
+    [[ -n "$pi_args" ]] && submit_argv+=(--pi-args "$pi_args")
     # Passed through whenever the flag was given at all, "0" included --
     # cmd_submit does the actual positive-integer validation below, and a
     # bad value here must reach that error rather than silently collapse
