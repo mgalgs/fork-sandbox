@@ -253,5 +253,13 @@ check "the bare seat posted the harvested reply and v5's three messages" "4" "$n
 check "every bare-seat message is stamped with the fallback model" "$n_pi" "$n_pi_unknown"
 check "the harvested reply landed with the bare seat" "1" "$bare_reply"
 
+printf '\n== --help ==\n'
+h_out="$("$revise" --help 2>&1)"; h_rc=$?
+if (( h_rc == 0 )); then ok "--help alone exits 0"; else no "--help alone exits 0" "exit $h_rc: $h_out"; fi
+contains "--help prints the header usage" "$h_out" "lkml-revise.sh — Launch the author persona to answer review and produce"
+h2_out="$("$revise" -h 2>&1)"; h2_rc=$?
+if (( h2_rc == 0 )); then ok "-h alone exits 0"; else no "-h alone exits 0" "exit $h2_rc: $h2_out"; fi
+contains "-h prints the header usage" "$h2_out" "lkml-revise.sh — Launch the author persona to answer review and produce"
+
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 (( fail == 0 )) || exit 1

@@ -222,5 +222,13 @@ contains "names the bad --base" "$out" "no-such-ref"
 n_runs_after=$(find "$run_prefix_dir" -maxdepth 1 -name 'run.*' | wc -l)
 check "no run was launched" "$n_runs_before" "$n_runs_after"
 
+printf '\n== --help ==\n'
+h_out="$("$cover" --help 2>&1)"; h_rc=$?
+if (( h_rc == 0 )); then ok "--help alone exits 0"; else no "--help alone exits 0" "exit $h_rc: $h_out"; fi
+contains "--help prints the header usage" "$h_out" "lkml-cover.sh — Launch the author persona to write a cover letter for"
+h2_out="$("$cover" -h 2>&1)"; h2_rc=$?
+if (( h2_rc == 0 )); then ok "-h alone exits 0"; else no "-h alone exits 0" "exit $h2_rc: $h2_out"; fi
+contains "-h prints the header usage" "$h2_out" "lkml-cover.sh — Launch the author persona to write a cover letter for"
+
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 (( fail == 0 )) || exit 1

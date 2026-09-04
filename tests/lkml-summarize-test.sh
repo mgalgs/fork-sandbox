@@ -724,5 +724,13 @@ if (( rc == 0 )); then ok "an over-long series Summary still exits 0"; else no "
 contains "an over-long series Summary warns on stderr with the word count" "$out_full" "210 words"
 contains "the series warning aims for ~150" "$out_full" "aim for ~150"
 
+printf '\n== --help ==\n'
+h_out="$("$summarize" --help 2>&1)"; h_rc=$?
+if (( h_rc == 0 )); then ok "--help alone exits 0"; else no "--help alone exits 0" "exit $h_rc: $h_out"; fi
+contains "--help prints the header usage" "$h_out" "lkml-summarize.sh — Turn a finished lkml-mode review thread into"
+h2_out="$("$summarize" -h 2>&1)"; h2_rc=$?
+if (( h2_rc == 0 )); then ok "-h alone exits 0"; else no "-h alone exits 0" "exit $h2_rc: $h2_out"; fi
+contains "-h prints the header usage" "$h2_out" "lkml-summarize.sh — Turn a finished lkml-mode review thread into"
+
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 (( fail == 0 )) || exit 1
