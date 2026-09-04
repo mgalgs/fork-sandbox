@@ -3977,8 +3977,8 @@ refuses "--k8s --keep-session is refused" \
 # --checkout is carried through, not refused -- its own section below
 # drives both verbs, stubbed, and proves the flag reaches the dispatcher's
 # render.
-refuses "--k8s --pi-args is refused as not yet supported" \
-    "--pi-args is not yet supported with --k8s" \
+refuses "--k8s --pi-args is refused (the dispatcher does not forward it)" \
+    "--pi-args is not supported with --k8s" \
     env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
     --harness pi --model moonshotai/kimi-k3 --pi-args "--thinking low" \
     unused-project unused-handoff

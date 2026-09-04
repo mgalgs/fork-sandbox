@@ -522,7 +522,7 @@
 # cluster run: they describe local-sandbox machinery -- bubblewrap, per-run
 # docker-compose services, the detached tmux session -- that a Kubernetes pod
 # has no equivalent of, they describe a real capability (--prompts-dir,
-# --pi-args, --task-meta) the cluster path has
+# --task-meta) the cluster path has
 # not been built to carry yet, or -- --claude-args alone, since --harness
 # claude landed here -- the pod's own invocation of the flag's target IS
 # built, but fixed: a --harness claude pod really does run the claude CLI,
@@ -564,6 +564,15 @@
 # revision (and, under --review-loop, as the review base) -- so a cluster
 # run can start from any ref the origin repo names, not only the repo's
 # current HEAD.
+#
+# --pi-args is the one capability this script refuses even though
+# fork-sandbox-k8s.sh carries it: submit and run both accept --pi-args and
+# thread it into the pod's pi invocation -- see '--pi-args' under
+# 'Model access' in docs/kubernetes-runs.md. This dispatcher simply does
+# not forward it, and refuses by name rather than dropping it: an operator
+# who wants it has a working path one hop away, in fork-sandbox-k8s.sh
+# directly, and a silent drop here would look identical to a run that
+# honored it.
 #
 # One gap is not a refused flag, because no flag controls it: a --k8s run
 # never appends to the durable run log described below
@@ -2117,12 +2126,15 @@ if [[ "$k8s_mode" == true ]]; then
         exit 1
     fi
 
-    # Flags that name a real, wanted capability the cluster path has not been
-    # built to carry yet -- a later round of work, not a permanent no.
+    # Flags that name a real capability this --k8s path does not carry yet
+    # -- a later round of work, not a permanent no. Each message says what
+    # is missing and, where the capability exists elsewhere, where it is.
     if [[ -n "$pi_extra_args" ]]; then
-        echo "Error: --pi-args is not yet supported with --k8s." >&2
-        echo "fork-sandbox-k8s.sh run has no flag yet to carry extra pi" >&2
-        echo "arguments into the pod." >&2
+        echo "Error: --pi-args is not supported with --k8s: this dispatcher" >&2
+        echo "does not forward it to fork-sandbox-k8s.sh. The capability" >&2
+        echo "exists there -- fork-sandbox-k8s.sh submit and run both accept" >&2
+        echo "--pi-args and carry the extra arguments into the pod. Use" >&2
+        echo "fork-sandbox-k8s.sh directly for it." >&2
         exit 1
     fi
     if [[ -n "$task_meta" ]]; then
