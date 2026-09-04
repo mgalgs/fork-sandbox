@@ -2353,11 +2353,17 @@ cmd_wait() {
         # timeout -- check its state every iteration and stop as soon as it
         # is clearly dead, rather than waiting out the deadline on a corpse.
         # A Succeeded pod is dead in the other direction: it ran to
-        # completion and then idled out its TTL, so its container has
-        # exited and the sentinel can no longer be read via exec. cmd_run
+        # completion and then its container exited -- either idling out
+        # its TTL or exiting right after a successful fetch. cmd_run
         # never reaches this (it waits while the run executes), but a
         # standalone wait may begin after the fact, in the fan-out
         # workflow this verb exists for.
+        #
+        # Note for the message below: do not advise a by-hand fetch here.
+        # cmd_fetch moves git objects through `kubectl exec` and cmd_
+        # collect reads the outbox the same way, and exec cannot run
+        # against an exited container -- so nothing this tool offers can
+        # reach what is left in the pod's /work volume.
         phase="$(kubectl get pod "$pod_name" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
         if [[ "$phase" == Failed ]]; then
             echo "Error: pod $pod_name is Failed -- it died before writing" >&2
@@ -2370,12 +2376,16 @@ cmd_wait() {
         fi
         if [[ "$phase" == Succeeded ]]; then
             echo "Error: pod $pod_name is Succeeded -- the run completed and" >&2
-            echo "then idled out its TTL, so its container has exited and" >&2
-            echo "/work/.run-complete can no longer be read. This wait began" >&2
-            echo "after the run finished; the branch work is still there." >&2
-            echo "Fetch it by hand:" >&2
-            echo "  fork-sandbox-k8s.sh fetch --branch $branch${project_path:+ $project_path}" >&2
-            echo "and clean up afterwards with:" >&2
+            echo "its container has since exited (it idled out its TTL, or it" >&2
+            echo "was fetched and left in place). kubectl exec cannot reach an" >&2
+            echo "exited container, so neither fetch nor collect can pull the" >&2
+            echo "branch or outbox back: whatever is still in the pod's /work" >&2
+            echo "volume is unreachable through this tool. This wait began" >&2
+            echo "after the run finished. Inspect the pod's logs with:" >&2
+            echo "  kubectl --context=$K8S_CONTEXT -n $K8S_NAMESPACE logs $pod_name" >&2
+            echo "If the branch was not fetched before the container exited, the" >&2
+            echo "work cannot be recovered through fetch. Remove the job and pod" >&2
+            echo "with:" >&2
             echo "  fork-sandbox-k8s.sh rm --branch $branch" >&2
             exit 1
         fi

@@ -94,11 +94,15 @@ same distinction a local harness makes between the run and its child.
 
 Because a *standalone* `wait` may begin after the run already finished,
 it also treats a `Succeeded` pod as terminal: at that point the entrypoint
-has idled out its TTL and exited, its container is gone, and the sentinel
-can no longer be read through `kubectl exec`. `wait` fails fast with a
-by-hand `fetch`/`rm` sequence instead of polling a run that can never
-become executable again — the exit code is unrecoverable, but the branch
-work still is. `run` never reaches this case, since it waits while the
+has exited — idled out its TTL, or exited right after a successful fetch —
+its container is gone, and the sentinel can no longer be read through
+`kubectl exec`. `wait` fails fast instead of polling a run that can never
+become executable again. Note that the exit code is not the only thing
+unrecoverable in this state: `fetch` and `collect` move data through that
+same `kubectl exec`, which cannot run against an exited container, so work
+that was not fetched before the container exited is unreachable through
+this tool. The by-hand advice is a `kubectl logs` pointer for inspection
+and then the `rm`. `run` never reaches this case, since it waits while the
 run executes.
 
 `collect --branch NAME [--outbox-dir DIR] [--outbox-max SIZE]

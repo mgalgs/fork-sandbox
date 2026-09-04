@@ -2538,11 +2538,13 @@ else
     fi
 fi
 
-# 6. A Succeeded pod: the run finished and idled out its TTL, so the
-# container has exited and the sentinel can no longer be read via exec.
-# The wait must fail fast on the first probe -- not poll to its own
-# timeout on a run that can never become executable again -- and point at
-# a by-hand fetch, since the branch work is still there.
+# 6. A Succeeded pod: the run finished and its container has since exited
+# (TTL idled out, or already fetched), so the sentinel can no longer be
+# read via exec. The wait must fail fast on the first probe -- not poll to
+# its own timeout on a run that can never become executable again -- and
+# must NOT advise a by-hand fetch: fetch and collect both run through
+# kubectl exec, which cannot reach an exited container, so the only
+# by-hand steps left are the logs pointer and the rm.
 wait_log6="$(newdir)/kubectl.log"; wait_out6="$(newdir)/out6.txt"; wait_err6="$(newdir)/err6.txt"
 tmpdirs+=("$(dirname "$wait_log6")")
 if K8S_STUB_POD_PHASE=Succeeded \
@@ -2551,11 +2553,12 @@ if K8S_STUB_POD_PHASE=Succeeded \
     no "a Succeeded pod fails the wait" "wait unexpectedly succeeded"
 else
     if grep -q 'pod stub-pod is Succeeded -- the run completed and' "$wait_err6" \
-        && grep -q 'Fetch it by hand' "$wait_err6" \
+        && grep -q 'unreachable through this tool' "$wait_err6" \
+        && ! grep -q 'fetch --branch' "$wait_err6" \
         && ! grep -q 'timed out' "$wait_err6"; then
-        ok "a Succeeded pod fails the wait"
+        ok "a Succeeded pod fails the wait without fetch advice"
     else
-        no "a Succeeded pod fails the wait" "$(cat "$wait_err6")"
+        no "a Succeeded pod fails the wait without fetch advice" "$(cat "$wait_err6")"
     fi
 fi
 
