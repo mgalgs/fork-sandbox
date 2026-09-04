@@ -501,6 +501,25 @@ def persona_brief_path(series_dir, persona):
     return None
 
 
+def persona_role(series_dir, persona):
+    """The persona brief's 'role:' frontmatter field, or None. The rail's
+    reviewer rows show it under the name; a brief without the field (or
+    with no brief at all) shows the persona slug instead."""
+    path = persona_brief_path(series_dir, persona)
+    if not path:
+        return None
+    with open(path, encoding="utf-8", errors="replace") as f:
+        text = f.read()
+    m = re.match(r"\A---\n(.*?)\n---", text, re.DOTALL)
+    if not m:
+        return None
+    for ln in m.group(1).splitlines():
+        if ln.startswith("role:"):
+            role = ln[5:].strip()
+            return role or None
+    return None
+
+
 def read_results_file(series_dir, filename):
     """A results markdown file in <series> split into ("# Summary" body,
     "# Details" body), or None when absent. The filename is fixed by
@@ -577,6 +596,139 @@ def link_ids(escaped, id_map):
         full = id_map.get(match.group(0))
         return f'<a href="#m-{esc(full)}">{match.group(0)}</a>' if full else match.group(0)
     return HEX_TOKEN_RE.sub(sub, escaped)
+
+
+def render_banner(naks, nak_names, nak_patch_idx, n_open, open_patch_idx):
+    """The blocking banner, when something blocks: a standing NAK
+    (critical styling), or every open thread sitting on a single
+    patch (warning styling). '' when neither applies."""
+    if naks:
+        where = "patch " + ", ".join(str(i) for i in nak_patch_idx) if nak_patch_idx else "the series"
+        h = f"A NAK stands on {where}" if naks == 1 else f"{naks} NAKs stand on {where}"
+        body = (f"{', '.join(nak_names)} {'stands' if naks == 1 else 'stand'} as "
+                f"{'a NAK' if naks == 1 else 'NAKs'}. Nothing merges until "
+                f"{'it is' if naks == 1 else 'they are'} resolved or withdrawn.")
+        return (f'<div class="banner crit">\n  <span class="bar"></span>\n  <div>\n'
+                f'    <h2>{esc(h)}</h2>\n    <p>{esc(body)}</p>\n  </div>\n</div>')
+    if n_open >= 2 and open_patch_idx is not None:
+        h = f"All {n_open} open threads sit on patch {open_patch_idx}"
+        body = (f"Every open thread is on patch {open_patch_idx}; the rest of the "
+                f"series is signed off. Convergence is a revise away rather than "
+                f"an argument.")
+        return (f'<div class="banner">\n  <span class="bar"></span>\n  <div>\n'
+                f'    <h2>{esc(h)}</h2>\n    <p>{esc(body)}</p>\n  </div>\n</div>')
+    return ""
+
+
+def render_versions_panel(versions, current, version_counts):
+    rows = []
+    for v in versions:
+        cur = ' aria-current="true"' if v == current else ""
+        if len(versions) == 1:
+            label = "first posting"
+        elif v == versions[0]:
+            label = "first posting"
+        elif v == versions[-1]:
+            label = "latest posting"
+        else:
+            label = "interim"
+        rows.append(f'<a class="vrow" href="#v-{v}"{cur}>'
+                    f'<span class="vn">v{v}</span><span>{label}</span>'
+                    f'<span class="vmeta">{version_counts[v]} msg</span></a>')
+    return (f'    <section class="panel">\n'
+            f'      <p class="eyebrow">versions</p>\n'
+            f'      <nav class="versions">\n        ' + "\n        ".join(rows) + "\n      </nav>\n"
+            f'    </section>')
+
+
+def render_reviewer_panel(series_dir, version, reviewer_entries, strongest):
+    if not reviewer_entries:
+        return ""
+    rows = []
+    for r in reviewer_entries:
+        role = persona_role(series_dir, r["persona"]) or r["persona"]
+        small = f'<small>{esc(role)}</small>'
+        tag = strongest.get(r["persona"])
+        chip = chip_html(tag) if tag else '<span class="chip pending">pending</span>'
+        rows.append(f'        <div class="mrow">\n'
+                    f'          {badge(r["persona"])}\n'
+                    f'          <span class="who">{esc(r["name"])}{small}</span>\n'
+                    f'          {chip}\n'
+                    f'        </div>')
+    return (f'    <section class="panel">\n'
+            f'      <p class="eyebrow">where each reviewer stands \u00b7 v{version}</p>\n'
+            f'      <div class="matrix">\n' + "\n".join(rows) + "\n      </div>\n"
+            f'    </section>')
+
+
+def render_patch_panel(series_dir, version, rows, reviewer_entries):
+    patches = rows[1:]
+    if not patches:
+        return ""
+    roles = {r["persona"]: (persona_role(series_dir, r["persona"]) or r["persona"])
+             for r in reviewer_entries}
+    rows_html = []
+    for i, (patch, latest) in enumerate(patches, start=1):
+        pos = [p for p, (_s, _m, tags) in latest.items()
+               if any(t in POSITIVE_TAGS for t in tags)]
+        names = [roles.get(p, p) for p in pos]
+        if len(names) == 1:
+            sub = f"{names[0]} signed off"
+        elif names:
+            sub = " + ".join(names)
+        else:
+            sub = "no sign-offs"
+        tag = strongest_tag([t for _p, _m, tags in latest.values() for t in tags])
+        chip = chip_html(tag) if tag else '<span class="chip pending">pending</span>'
+        subj = re.sub(r"^Re: ", "", patch_label(patch))
+        mm = re.match(r"^\[PATCH v\d+ \d+/\d+\]\s*(.*)$", subj)
+        title = mm.group(1).strip() if mm else subj.strip() or f"patch {i}"
+        rows_html.append(f'        <div class="mrow">\n'
+                         f'          <span class="mono-badge mono-none">{i}</span>\n'
+                         f'          <span class="who">{esc(title[:60])}<small>{esc(sub)}</small></span>\n'
+                         f'          {chip}\n'
+                         f'        </div>')
+    return (f'    <section class="panel">\n'
+            f'      <p class="eyebrow">per patch \u00b7 v{version}</p>\n'
+            f'      <div class="matrix">\n' + "\n".join(rows_html) + "\n      </div>\n"
+            f'    </section>')
+
+
+def render_counts_panel(n_open, n_signoffs, max_depth, n_naks):
+    def state(n, warn_when, ok_when):
+        if warn_when(n):
+            return " is-warn"
+        if ok_when(n):
+            return " is-ok"
+        return ""
+    return (f'    <section class="panel">\n'
+            f'      <p class="eyebrow">what is unresolved</p>\n'
+            f'      <div class="counts">\n'
+            f'        <div class="count{state(n_open, lambda n: n > 0, lambda n: False)}"><b>{n_open}</b><span>open threads</span></div>\n'
+            f'        <div class="count{state(n_signoffs, lambda n: False, lambda n: n > 0)}"><b>{n_signoffs}</b><span>sign-offs</span></div>\n'
+            f'        <div class="count"><b>{max_depth}</b><span>deepest depth</span></div>\n'
+            f'        <div class="count{state(n_naks, lambda n: n > 0, lambda n: False)}"><b>{n_naks}</b><span>NAKs standing</span></div>\n'
+            f'      </div>\n'
+            f'    </section>')
+
+
+def open_threads_of(version_msgs, patch_root_ids):
+    """The replies (depth >= 1, not a patch root) whose thread carries no
+    sign-off tag anywhere: the threads that are still open."""
+    out = []
+    for m in version_msgs:
+        if m["depth"] < 1 or m["id"] in patch_root_ids:
+            continue
+        if any(any(t in POSITIVE_TAGS for t in x["tags"]) for x in subtree(m)):
+            continue
+        out.append(m)
+    return out
+
+
+def patch_index(patch):
+    """The 1-based position of a patch root from its subject, or None."""
+    mm = re.match(r"^\[PATCH v\d+ (\d+)/", patch_label(patch))
+    return int(mm.group(1)) if mm else None
 
 
 def render_results_card(series_dir, version, id_map):
@@ -945,93 +1097,427 @@ def render_message(m, depth=0):
     )
 
 
+def render_series_card(series_dir, id_map):
+    """The page-level series summary card, placed directly above the
+    series' own shell: the same treatment as the per-version card
+    (Summary visible, Details inside the fold, autolinked, empty
+    sections omitted), but the head reads 'Series summary' and the
+    wrapper carries results-series, so the card can be styled
+    independently later without markup surgery. The id_map must cover
+    ALL versions' messages (the caller builds it over the whole series
+    dir). Returns "" when the file is absent."""
+    res = read_series_results(series_dir)
+    if res is None:
+        return ""
+    summary, details = res
+    card = (f'  <section class="panel summary results-series">\n'
+            f'    <div class="summary-head"><h2>Series summary</h2>'
+            f'<span class="chip pending">series</span></div>\n')
+    if summary:
+        card += f'    <div class="summary-body">{link_ids(render_prose(summary), id_map)}</div>\n'
+    if details:
+        card += (f'    <details class="results-fold">\n'
+                 f'      <summary>show details</summary>\n'
+                 f'      <pre class="results-details">{link_ids(esc(details), id_map)}</pre>\n'
+                 f'    </details>\n')
+    return card + '  </section>'
+
+
+def render_banner(naks, nak_names, nak_patch_idx, n_open, open_patch_idx):
+    """The blocking banner, when something blocks: a standing NAK
+    (critical styling), or every open thread sitting on a single
+    patch (warning styling). '' when neither applies."""
+    if naks:
+        where = "patch " + ", ".join(str(i) for i in nak_patch_idx) if nak_patch_idx else "the series"
+        h = f"A NAK stands on {where}" if naks == 1 else f"{naks} NAKs stand on {where}"
+        body = (f"{', '.join(nak_names)} {'stands' if naks == 1 else 'stand'} as "
+                f"{'a NAK' if naks == 1 else 'NAKs'}. Nothing merges until "
+                f"{'it is' if naks == 1 else 'they are'} resolved or withdrawn.")
+        return (f'<div class="banner crit">\n  <span class="bar"></span>\n  <div>\n'
+                f'    <h2>{esc(h)}</h2>\n    <p>{esc(body)}</p>\n  </div>\n</div>')
+    if n_open >= 2 and open_patch_idx is not None:
+        h = f"All {n_open} open threads sit on patch {open_patch_idx}"
+        body = (f"Every open thread is on patch {open_patch_idx}; the rest of the "
+                f"series is signed off. Convergence is a revise away rather than "
+                f"an argument.")
+        return (f'<div class="banner">\n  <span class="bar"></span>\n  <div>\n'
+                f'    <h2>{esc(h)}</h2>\n    <p>{esc(body)}</p>\n  </div>\n</div>')
+    return ""
+
+
+def render_versions_panel(versions, current, version_counts):
+    rows = []
+    for v in versions:
+        cur = ' aria-current="true"' if v == current else ""
+        if len(versions) == 1:
+            label = "first posting"
+        elif v == versions[0]:
+            label = "first posting"
+        elif v == versions[-1]:
+            label = "latest posting"
+        else:
+            label = "interim"
+        rows.append(f'<a class="vrow" href="#v-{v}"{cur}>'
+                    f'<span class="vn">v{v}</span><span>{label}</span>'
+                    f'<span class="vmeta">{version_counts[v]} msg</span></a>')
+    return (f'    <section class="panel">\n'
+            f'      <p class="eyebrow">versions</p>\n'
+            f'      <nav class="versions">\n        ' + "\n        ".join(rows) + "\n      </nav>\n"
+            f'    </section>')
+
+
+def render_reviewer_panel(series_dir, version, reviewer_entries, strongest):
+    if not reviewer_entries:
+        return ""
+    rows = []
+    for r in reviewer_entries:
+        role = persona_role(series_dir, r["persona"]) or r["persona"]
+        small = f'<small>{esc(role)}</small>'
+        tag = strongest.get(r["persona"])
+        chip = chip_html(tag) if tag else '<span class="chip pending">pending</span>'
+        rows.append(f'        <div class="mrow">\n'
+                    f'          {badge(r["persona"])}\n'
+                    f'          <span class="who">{esc(r["name"])}{small}</span>\n'
+                    f'          {chip}\n'
+                    f'        </div>')
+    return (f'    <section class="panel">\n'
+            f'      <p class="eyebrow">where each reviewer stands \u00b7 v{version}</p>\n'
+            f'      <div class="matrix">\n' + "\n".join(rows) + "\n      </div>\n"
+            f'    </section>')
+
+
+def render_patch_panel(series_dir, version, rows, reviewer_entries):
+    patches = rows[1:]
+    if not patches:
+        return ""
+    roles = {r["persona"]: (persona_role(series_dir, r["persona"]) or r["persona"])
+             for r in reviewer_entries}
+    rows_html = []
+    for i, (patch, latest) in enumerate(patches, start=1):
+        pos = [p for p, (_s, _m, tags) in latest.items()
+               if any(t in POSITIVE_TAGS for t in tags)]
+        names = [roles.get(p, p) for p in pos]
+        if len(names) == 1:
+            sub = f"{names[0]} signed off"
+        elif names:
+            sub = " + ".join(names)
+        else:
+            sub = "no sign-offs"
+        tag = strongest_tag([t for _p, _m, tags in latest.values() for t in tags])
+        chip = chip_html(tag) if tag else '<span class="chip pending">pending</span>'
+        subj = re.sub(r"^Re: ", "", patch_label(patch))
+        mm = re.match(r"^\[PATCH v\d+ \d+/\d+\]\s*(.*)$", subj)
+        title = mm.group(1).strip() if mm else subj.strip() or f"patch {i}"
+        rows_html.append(f'        <div class="mrow">\n'
+                         f'          <span class="mono-badge mono-none">{i}</span>\n'
+                         f'          <span class="who">{esc(title[:60])}<small>{esc(sub)}</small></span>\n'
+                         f'          {chip}\n'
+                         f'        </div>')
+    return (f'    <section class="panel">\n'
+            f'      <p class="eyebrow">per patch \u00b7 v{version}</p>\n'
+            f'      <div class="matrix">\n' + "\n".join(rows_html) + "\n      </div>\n"
+            f'    </section>')
+
+
+def render_counts_panel(n_open, n_signoffs, max_depth, n_naks):
+    def state(n, warn_when, ok_when):
+        if warn_when(n):
+            return " is-warn"
+        if ok_when(n):
+            return " is-ok"
+        return ""
+    return (f'    <section class="panel">\n'
+            f'      <p class="eyebrow">what is unresolved</p>\n'
+            f'      <div class="counts">\n'
+            f'        <div class="count{state(n_open, lambda n: n > 0, lambda n: False)}"><b>{n_open}</b><span>open threads</span></div>\n'
+            f'        <div class="count{state(n_signoffs, lambda n: False, lambda n: n > 0)}"><b>{n_signoffs}</b><span>sign-offs</span></div>\n'
+            f'        <div class="count"><b>{max_depth}</b><span>deepest depth</span></div>\n'
+            f'        <div class="count{state(n_naks, lambda n: n > 0, lambda n: False)}"><b>{n_naks}</b><span>NAKs standing</span></div>\n'
+            f'      </div>\n'
+            f'    </section>')
+
+
+def open_threads_of(version_msgs, patch_root_ids):
+    """The replies (depth >= 1, not a patch root) whose thread carries no
+    sign-off tag anywhere: the threads that are still open."""
+    out = []
+    for m in version_msgs:
+        if m["depth"] < 1 or m["id"] in patch_root_ids:
+            continue
+        if any(any(t in POSITIVE_TAGS for t in x["tags"]) for x in subtree(m)):
+            continue
+        out.append(m)
+    return out
+
+
+def patch_index(patch):
+    """The 1-based position of a patch root from its subject, or None."""
+    mm = re.match(r"^\[PATCH v\d+ (\d+)/", patch_label(patch))
+    return int(mm.group(1)) if mm else None
+
+
+def render_message(m, depth=0, series_name=""):
+    """One message of the thread as a collapsed <details>: monogram,
+    name, short id, verdict chip, subject as the scannable line; the
+    body opens in place. data-depth drives the indent and the hairline
+    rail (a depth-0 message gets neither -- the CSS styles only
+    [data-depth="1"] and above). An unrecorded model is stamped
+    'model unknown' in the warning colour: surfacing a real defect,
+    deliberately, not hiding it."""
+    chip = chip_html(strongest_tag(m["tags"]))
+    model = m["model"]
+    if model:
+        model_chip = f'<span class="model">{esc(model)}</span>'
+    else:
+        model_chip = '<span class="model unknown">model unknown</span>'
+    if m["body"].strip():
+        body_html = render_patch_body(m["body"]) if is_patch(m) else render_prose(m["body"])
+    else:
+        body_html = (f'<p class="placeholder">No body. Open this thread in the mailbox: '
+                     f'<code class="inline">lkml-mailbox.sh show {esc(series_name)} {esc(m["id"])}</code></p>')
+    attachment_html = ""
+    if m["attachments"]:
+        items = []
+        for attachment in m["attachments"]:
+            label = esc(attachment["ref"])
+            if attachment["href"]:
+                link = (f'<a download href="{esc(attachment["href"])}">{label}</a>'
+                        f' <span class="attachment-type">({esc(attachment["mime"])})</span>')
+                if attachment["mime"].startswith("image/") and attachment["mime"] != "image/svg+xml":
+                    link += f'<br><img class="attachment-preview" src="{esc(attachment["href"])}" alt="{label}">'
+            else:
+                link = f"{label} <span class=\"attachment-missing\">(unavailable)</span>"
+            items.append(f"<li>{link}</li>")
+        attachment_html = ('<div class="attachments"><span class="attachment-label">attachments</span><ul>'
+                           + "".join(items) + "</ul></div>")
+    return (
+        f'<details class="msg" data-depth="{depth}" id="m-{esc(m["id"])}">\n'
+        f'  <summary>\n'
+        f'    {badge(m["persona"])}\n'
+        f'    <span class="line">\n'
+        f'      <span class="from">{who_of(m)} <span class="id">{esc(m["id"][:7])}</span>{chip}</span>\n'
+        f'      <span class="gist">{esc(patch_label(m))}</span>\n'
+        f'    </span>\n'
+        f'    <span class="meta">{model_chip}</span>\n'
+        f'  </summary>\n'
+        f'  <div class="body">{body_html}{attachment_html}</div>\n'
+        f'</details>'
+    )
+
+
+def render_trace(m, depth=0, series_name=""):
+    """The thread as a flat pre-order list of collapsed <details>, one
+    per message, in reply order: the trace is the list, the depth is
+    the indent (render_message's data-depth), and every message opens
+    in place regardless of nesting."""
+    out = [render_message(m, depth, series_name)]
+    for c in m["children"]:
+        out.append(render_trace(c, depth + 1, series_name))
+    return "\n".join(out)
+
+
 def render_series(series_dir):
     name, msgs, roots = build(series_dir)
-    sections = []
-    covers = [r for r in roots if r["depth"] == 0 and r["subject"].startswith("[PATCH")]
     id_map = id_prefix_map(msgs)
-    for cover in covers:
-        v = cover["version"]
+    covers = [r for r in roots if r["depth"] == 0 and r["subject"].startswith("[PATCH")]
+    versions = sorted({c["version"] for c in covers})
+    current = versions[-1] if versions else 1
+    # The current version's state drives the rail, the banner and the
+    # state chip: the page reports where the series stands NOW.
+    cur_cover = next((c for c in covers if c["version"] == current), None)
+    version_data = {}
+    for v in versions:
+        cover = next(c for c in covers if c["version"] == v)
         version_roots = [r for r in roots if r["version"] == v]
-        rows, personas = tally(cover)
         version_msgs = [m for root in version_roots for m in subtree(root)]
-        n_replies = sum(1 for m in version_msgs if m["depth"] >= 1 and not is_patch(m))
+        rows, _personas = tally(cover)
+        patch_root_ids = {t[0]["id"] for t in rows[1:]}
         reviewer_entries = reviewer_rollup(version_msgs, cover["persona"], rows)
-        # One matrix column per reviewer the box lists -- including
-        # reviewers who commented without attaching a tag, whose column
-        # is all dots ("reviewed, no verdict yet"). That way the header
-        # count, the table's columns and the box describe the same set
-        # in the same (alphabetical) order, so all three read off against
-        # each other.
-        pcols = sorted(set(personas) | {r["persona"] for r in reviewer_entries})
-        entry_info = {r["persona"]: (r["harness"], r["model"]) for r in reviewer_entries}
-        col_info = {p: personas.get(p, entry_info.get(p, ("", ""))) for p in pcols}
-        thead = "".join(f"<th title=\"{esc(col_info[p][0])}/{esc(col_info[p][1])}\">{esc(p)}</th>" for p in pcols)
-        trows = []
-        for t, latest in rows:
-            cells = []
-            for p in pcols:
-                if p in latest:
-                    tg = latest[p][2][0]
-                    cells.append(f"<td><a class=\"cell {TAG_CLASS.get(tg,'t-q')}\" href=\"#m-{esc(latest[p][1])}\" title=\"{esc(tg)}\">{TAG_GLYPH.get(tg,'·')}</a></td>")
+        # The strongest latest tag per persona across the version's
+        # rows (latest per patch already, so a withdrawn NAK is not
+        # counted as standing).
+        strongest = {}
+        for _t, latest in rows:
+            for p, (_seq, _mid, tags) in latest.items():
+                s = strongest_tag(tags)
+                if s and (p not in strongest or TAG_PRIORITY.index(s) < TAG_PRIORITY.index(strongest[p])):
+                    strongest[p] = s
+        d1map = {}
+
+        def d1walk(m, cur_d1):
+            if m["depth"] == 1:
+                cur_d1 = m
+            d1map[m["id"]] = cur_d1
+            for c in m["children"]:
+                d1walk(c, cur_d1)
+
+        for r in version_roots:
+            d1walk(r, None)
+        opens = open_threads_of(version_msgs, patch_root_ids)
+        n_open = len(opens)
+        open_d1 = {d1map[m["id"]]["id"] for m in opens if d1map[m["id"]] is not None}
+        open_one = (next((d1map[i] for i in open_d1), None) if len(open_d1) == 1 else None)
+        naks = sum(r["nak"] for r in reviewer_entries)
+        nak_names = sorted(r["persona"] for r in reviewer_entries if r["nak"])
+        nak_d1 = set()
+        for _t, latest in rows:
+            for _p, (_seq, _mid, tags) in latest.items():
+                if "NAK" in tags:
+                    d1 = d1map.get(_mid)
+                    if d1 is not None:
+                        nak_d1.add(d1["id"])
+        nak_idx = sorted(i for i in (patch_index(d) for d in
+                                     (next(t[0] for t in rows[1:] if t[0]["id"] == k) for k in nak_d1)) if i)
+        version_data[v] = {
+            "cover": cover, "rows": rows, "version_roots": version_roots,
+            "version_msgs": version_msgs, "reviewer_entries": reviewer_entries,
+            "strongest": strongest, "n_open": n_open, "open_one": open_one,
+            "n_naks": naks, "nak_idx": nak_idx, "nak_names": nak_names,
+        }
+    cur = version_data.get(current)
+    n_replies_cur = (sum(1 for m in cur["version_msgs"] if m["depth"] >= 1 and not is_patch(m))
+                     if cur else 0)
+    n_msgs_cur = len(cur["version_msgs"]) if cur else 0
+
+    # Masthead: the series' own cover subject (its [PATCH vN 0/M] prefix
+    # is the numbering, not the title).
+    series_title = name
+    if covers:
+        cover_subj = covers[0]["subject"]
+        mm = re.match(r"^\[PATCH v\d+ \d+/\d+\]\s*(.*)$", cover_subj)
+        if mm and mm.group(1).strip():
+            series_title = mm.group(1).strip()
+    state = ""
+    if cur:
+        s = strongest_tag([t for _t, latest in cur["rows"]
+                           for _p, _m, tags in latest.values() for t in tags])
+        if s == "NAK":
+            state = '<span class="chip nak">nak</span>'
+        elif s == "Changes-requested":
+            state = '<span class="chip changes">changes requested</span>'
+        elif s == "Question":
+            state = '<span class="chip question">question</span>'
+        elif s is not None:
+            state = '<span class="chip reviewed">converged</span>'
+        else:
+            state = '<span class="chip pending">pending</span>'
+    masthead = (f'<header class="masthead">\n'
+                f'  <div class="masthead-in">\n'
+                f'    <div class="grow">\n'
+                f'      <p class="eyebrow">lkml-mode series \u00b7 {esc(name)} \u00b7 v{current} \u00b7 {n_replies_cur} replies</p>\n'
+                f'      <h1>{esc(series_title)}</h1>\n'
+                f'      <p class="sub">{len(versions)} version{"s" if len(versions) != 1 else ""} \u00b7 {n_msgs_cur} messages in v{current}</p>\n'
+                f'    </div>\n'
+                f'    <div class="facts">\n'
+                f'      <div class="fact"><span class="eyebrow">version</span><b>v{current}</b></div>\n'
+                f'      <div class="fact"><span class="eyebrow">replies</span><b>{n_replies_cur}</b></div>\n'
+                f'      <div class="fact"><span class="eyebrow">state</span><b>{state}</b></div>\n'
+                f'    </div>\n'
+                f'  </div>\n'
+                f'</header>')
+
+    parts = [f'<div class="series" id="{esc(name)}">\n  {masthead}\n']
+    card = render_series_card(series_dir, id_map)
+    if card:
+        parts.append(card + "\n")
+    if cur:
+        counts = render_counts_panel(cur["n_open"],
+                                     sum(1 for m in cur["version_msgs"]
+                                         if m["depth"] >= 1 and any(t in POSITIVE_TAGS for t in m["tags"])),
+                                     max((m["depth"] for m in cur["version_msgs"]), default=0),
+                                     cur["n_naks"])
+        rail = [render_versions_panel(versions, current,
+                                      {v: len(d["version_msgs"]) for v, d in version_data.items()}),
+                render_reviewer_panel(series_dir, current, cur["reviewer_entries"], cur["strongest"]),
+                render_patch_panel(series_dir, current, cur["rows"], cur["reviewer_entries"]),
+                counts]
+        shell = '  <div class="shell">\n\n  <aside class="rail">\n' + "\n".join(p for p in rail if p) + "\n  </aside>\n\n  <main class=\"main\">\n"
+        for cover in covers:
+            v = cover["version"]
+            version_roots = [r for r in roots if r["version"] == v]
+            rows, personas = tally(cover)
+            version_msgs = [m for root in version_roots for m in subtree(root)]
+            n_replies = sum(1 for m in version_msgs if m["depth"] >= 1 and not is_patch(m))
+            reviewer_entries = reviewer_rollup(version_msgs, cover["persona"], rows)
+            # One matrix column per reviewer the box lists -- including
+            # reviewers who commented without attaching a tag, whose column
+            # is all dots ("reviewed, no verdict yet"). That way the header
+            # count, the table's columns and the box describe the same set
+            # in the same (alphabetical) order, so all three read off against
+            # each other.
+            pcols = sorted(set(personas) | {r["persona"] for r in reviewer_entries})
+            entry_info = {r["persona"]: (r["harness"], r["model"]) for r in reviewer_entries}
+            col_info = {p: personas.get(p, entry_info.get(p, ("", ""))) for p in pcols}
+            thead = "".join(f"<th title=\"{esc(col_info[p][0])}/{esc(col_info[p][1])}\">{esc(p)}</th>" for p in pcols)
+            trows = []
+            for t, latest in rows:
+                cells = []
+                for p in pcols:
+                    if p in latest:
+                        tg = latest[p][2][0]
+                        cells.append(f"<td><a class=\"cell {TAG_CLASS.get(tg,'t-q')}\" href=\"#m-{esc(latest[p][1])}\" title=\"{esc(tg)}\">{TAG_GLYPH.get(tg,'·')}</a></td>")
+                    else:
+                        cells.append("<td><span class=\"cell none\">·</span></td>")
+                if t is cover:
+                    rowcell = f'<th scope="row"><a href="#m-{esc(t["id"])}">cover</a></th>'
                 else:
-                    cells.append("<td><span class=\"cell none\">·</span></td>")
-            if t is cover:
-                rowcell = f'<th scope="row"><a href="#m-{esc(t["id"])}">cover</a></th>'
-            else:
-                # The full lore-style subject (numbering as prefix) is the
-                # row text, capped to HTML_TALLY_LABEL_CAP like the text
-                # tally caps its rows: in the table's auto layout the CSS
-                # max-width on the <th> is only a suggestion, so an
-                # uncapped subject would overflow .tally-wrap's scroller
-                # at full width and make the title tooltip duplicate
-                # fully visible text. The cut is marked with an
-                # ellipsis and the full label stays on hover.
-                label = patch_label(t)
-                rowcell = (f'<th scope="row" title="{esc(label)}">'
-                           f'<a href="#m-{esc(t["id"])}">{esc(fit_tally_label(label, HTML_TALLY_LABEL_CAP))}</a></th>')
-            trows.append(f"<tr>{rowcell}{''.join(cells)}</tr>")
-        n_patches = len(rows) - 1
-        index = "".join(render_index(root) for root in version_roots)
-        thread = "".join(render_message(root) for root in version_roots)
-        n_messages = len(version_msgs)
-        reviewers = "".join(render_reviewer(r, series_dir) for r in reviewer_entries)
-        reviewers_block = ""
-        if reviewer_entries:
-            reviewers_block = (f'  <div class="reviewers">\n'
-                               f'    <p class="eyebrow">reviewers</p>\n'
-                               f'    {reviewers}\n  </div>')
-        # The card is its own block; with no results file it is the empty
-        # string, so the section is byte-identical to a render without the
-        # card (the results CSS below is likewise emitted only when at
-        # least one card is present).
-        results_block = render_results_card(series_dir, v, id_map)
-        sections.append(f"""
-<section class="series" id="{esc(name)}-v{v}">
-  <div class="series-head">
-    <p class="eyebrow">series</p>
-    <h2>{esc(name)} <span class="v">v{v}</span></h2>
-    <p class="counts"><span>{n_patches} patches</span><span>{n_replies} replies</span><span>{len(reviewer_entries)} reviewers</span></p>
-  </div>
-  <div class="tally-wrap">
-    <table class="tally">
-      <caption>Latest tag per reviewer per patch. R reviewed, A acked, C changes requested, ? question, N nak.</caption>
-      <thead><tr><th scope="col">patch</th>{thead}</tr></thead>
-      <tbody>{''.join(trows)}</tbody>
-    </table>
-  </div>
-  {reviewers_block}{results_block}
-  <details class="index-fold" open>
-    <summary>thread index — {n_messages} messages</summary>
-    <div class="index-wrap"><ol class="tidx">{index}</ol></div>
-  </details>
-  <div class="thread">{thread}</div>
-</section>""")
+                    # The full lore-style subject (numbering as prefix) is the
+                    # row text, capped to HTML_TALLY_LABEL_CAP like the text
+                    # tally caps its rows: in the table's auto layout the CSS
+                    # max-width on the <th> is only a suggestion, so an
+                    # uncapped subject would overflow .tally-wrap's scroller
+                    # at full width and make the title tooltip duplicate
+                    # fully visible text. The cut is marked with an
+                    # ellipsis and the full label stays on hover.
+                    label = patch_label(t)
+                    rowcell = (f'<th scope="row" title="{esc(label)}">'
+                               f'<a href="#m-{esc(t["id"])}">{esc(fit_tally_label(label, HTML_TALLY_LABEL_CAP))}</a></th>')
+                trows.append(f"<tr>{rowcell}{''.join(cells)}</tr>")
+            n_patches = len(rows) - 1
+            index = "".join(render_index(root) for root in version_roots)
+            thread = "".join(render_message(root) for root in version_roots)
+            n_messages = len(version_msgs)
+            reviewers = "".join(render_reviewer(r, series_dir) for r in reviewer_entries)
+            reviewers_block = ""
+            if reviewer_entries:
+                reviewers_block = (f'  <div class="reviewers">\n'
+                                   f'    <p class="eyebrow">reviewers</p>\n'
+                                   f'    {reviewers}\n  </div>')
+            # The card is its own block; with no results file it is the empty
+            # string, so the section is byte-identical to a render without the
+            # card (the results CSS below is likewise emitted only when at
+            # least one card is present).
+            results_block = render_results_card(series_dir, v, id_map)
+            shell += f"""
+    <section class="section" id="v-{v}">
+      <div class="series-head">
+        <p class="eyebrow">series</p>
+        <h2>{esc(name)} <span class="v">v{v}</span></h2>
+        <p class="counts"><span>{n_patches} patches</span><span>{n_replies} replies</span><span>{len(reviewer_entries)} reviewers</span></p>
+      </div>
+      <div class="tally-wrap">
+        <table class="tally">
+          <caption>Latest tag per reviewer per patch. R reviewed, A acked, C changes requested, ? question, N nak.</caption>
+          <thead><tr><th scope="col">patch</th>{thead}</tr></thead>
+          <tbody>{''.join(trows)}</tbody>
+        </table>
+      </div>
+      {reviewers_block}{results_block}
+      <details class="index-fold" open>
+        <summary>thread index — {n_messages} messages</summary>
+        <div class="index-wrap"><ol class="tidx">{index}</ol></div>
+      </details>
+      <div class="thread">{thread}</div>
+    </section>"""
+        shell += '  </main>\n  </div>\n'
+        parts.append(shell)
+    parts.append('</div>')
+    footer = f"{name} \u00b7 v{current} \u00b7 {n_replies_cur} replies"
     # id_map is returned, not recomputed by the caller: it covers ALL
     # versions' messages in the series dir (build() read every .msg
     # file), which is exactly the map the series card needs, and a
     # second build() would re-parse the whole mailbox for it.
-    return name, "\n".join(sections), id_map
+    return name, "\n".join(parts), id_map, footer
 
 
 CSS = """
@@ -1438,30 +1924,25 @@ def main(argv=None):
         # sections within a series, so two series do not run together.
         sys.stdout.write("\n\n".join(parts) + ("\n" if parts else ""))
         return
-    sections = []
-    names = []
+    series = []
+    footers = []
     for d in args.series_dirs:
-        name, sec, id_map = render_series(d)
-        names.append(name)
-        # The page-level series card sits directly above THIS dir's own
-        # section, as before; its render changes with the summary card
-        # in a later step, its placement does not.
-        card = render_series_card(d, id_map)
-        if card:
-            sec = "\n" + card + sec
-        sections.append(sec)
+        name, sec, _id_map, footer = render_series(d)
+        series.append((name, sec))
+        footers.append(footer)
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
-    if len(sections) == 1:
+    if len(series) == 1:
+        # The single series' own masthead IS the page masthead; a second
+        # generic header would only duplicate it.
         head = ""
     else:
-        toc = " \u00b7 ".join(f'<a href="#{esc(n)}">{esc(n)}</a>' for n in names)
+        toc = " \u00b7 ".join(f'<a href="#{esc(n)}">{esc(n)}</a>' for n, _s in series)
         head = ('<div class="masthead">\n  <div class="masthead-in">\n'
                 f'    <div class="grow"><h1>{esc(args.title)}</h1>'
                 f'<p class="sub">{toc}</p></div>\n'
                 f'    <div class="facts"><div class="fact">'
                 f'<span class="eyebrow">rendered</span><b>{now}</b></div></div>\n'
                 '  </div>\n</div>\n')
-    footers = "  \u00b7  ".join(esc(n) for n in names)
     document = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -1474,8 +1955,8 @@ def main(argv=None):
 <style>{CSS}</style>
 </head>
 <body>
-{head}{''.join(sections)}
-<footer class="foot">{esc(footers)} \u00b7 rendered {now}</footer>
+{head}{''.join(s for _n, s in series)}
+<footer class="foot">{esc("  \u00b7  ".join(footers))} \u00b7 rendered {now}</footer>
 </body>
 </html>
 """
