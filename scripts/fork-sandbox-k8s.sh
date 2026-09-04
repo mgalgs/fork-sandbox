@@ -360,6 +360,17 @@ K8S_PROXY_ALLOW="$(read_env_value "$k8s_env" K8S_PROXY_ALLOW || true)"
 K8S_DENIED_PROBE="$(read_env_value "$k8s_env" K8S_DENIED_PROBE || true)"
 K8S_RUN_TTL="$(read_env_value "$k8s_env" K8S_RUN_TTL || true)"
 K8S_RUN_TTL="${K8S_RUN_TTL:-3600}"
+# Per-run services caps -- see docs/sandbox-services.md's cluster section.
+# A repo must not be able to claim the namespace: these bound how many
+# services and how much cpu/memory a committed services.yaml can ask for.
+# The cpu/memory shapes are validated by fork-sandbox-k8s-services-parse.py
+# itself (the only place that needs a Kubernetes-quantity parser), not here.
+K8S_SERVICES_MAX="$(read_env_value "$k8s_env" K8S_SERVICES_MAX || true)"
+K8S_SERVICES_MAX="${K8S_SERVICES_MAX:-8}"
+K8S_SERVICE_MAX_CPU="$(read_env_value "$k8s_env" K8S_SERVICE_MAX_CPU || true)"
+K8S_SERVICE_MAX_CPU="${K8S_SERVICE_MAX_CPU:-1000m}"
+K8S_SERVICE_MAX_MEMORY="$(read_env_value "$k8s_env" K8S_SERVICE_MAX_MEMORY || true)"
+K8S_SERVICE_MAX_MEMORY="${K8S_SERVICE_MAX_MEMORY:-1Gi}"
 GIT_USER_NAME="$(read_env_value "$k8s_env" GIT_USER_NAME || true)"
 GIT_USER_NAME="${GIT_USER_NAME:-fork-sandbox agent}"
 GIT_USER_EMAIL="$(read_env_value "$k8s_env" GIT_USER_EMAIL || true)"
@@ -373,10 +384,15 @@ if [[ -n "$K8S_RUN_TTL" && ! "$K8S_RUN_TTL" =~ ^[0-9]+$ ]]; then
     echo "Error: K8S_RUN_TTL must be a number of seconds, got '$K8S_RUN_TTL'." >&2
     exit 1
 fi
+if [[ ! "$K8S_SERVICES_MAX" =~ ^[0-9]+$ ]]; then
+    echo "Error: K8S_SERVICES_MAX must be a positive integer, got '$K8S_SERVICES_MAX'." >&2
+    exit 1
+fi
 
 fs_reject_unsafe_chars "$K8S_CONTEXT" "$K8S_NAMESPACE" "$K8S_IMAGE" \
     "$K8S_PROXY_UPSTREAM" "$K8S_PROXY_ENDPOINTS" "$K8S_PROXY_ALLOW" \
     "$K8S_DENIED_PROBE" "$GIT_USER_NAME" "$GIT_USER_EMAIL" \
+    "$K8S_SERVICE_MAX_CPU" "$K8S_SERVICE_MAX_MEMORY" \
     || exit 1
 
 kubectl() {
@@ -695,6 +711,34 @@ The directory named with \`--context-ro\` on the host is at:
 
 here, read-only by convention. Do not write to it and do not copy it into
 the clone.
+EOF
+}
+
+# The per-run-services-only handoff.md section: names each service and its
+# 127.0.0.1:<port>, and the .env.sandbox convention -- mirrors the register
+# of the local path's own "Per-run services are up" section
+# (fork-sandbox.sh's fs_emit_prompt_overlay context), minus the sockets
+# directory and socat relay recipe, since a sidecar shares the pod's
+# network namespace and is reachable directly. services_lines is
+# prompt-services.txt's content, one "<name> 127.0.0.1:<port>" per line.
+render_services_section() {
+    local services_lines="$1"
+    cat <<EOF
+
+## Per-run services
+
+This repository declares per-run services (.agents/sandbox-services/services.yaml),
+running now, reachable directly on localhost:
+
+$(printf '%s\n' "$services_lines" | sed 's/^/    /')
+
+The clone holds an env file, \`.env.sandbox\`, with the connection settings
+from the spec's \`sandboxEnv\`. Use it the way the project expects -- most
+projects read it as \`ENVFILE=.env.sandbox <command>\`, or by sourcing it;
+check the project's own CLAUDE.md.
+
+These come up empty. Copy no developer data in. The session migrates and
+loads its own fixtures.
 EOF
 }
 
@@ -1398,12 +1442,13 @@ cmd_install() {
 cmd_submit() {
     local dry_run=false branch="" model="" review_loop_cap="" outbox_max_arg=""
     local context_ro="" harness="pi" review_model="" endpoint="" checkout_ref=""
-    local pi_args=""
+    local pi_args="" services_trust_ref=""
     while (( $# )); do
         case "$1" in
             --dry-run) dry_run=true; shift ;;
             --branch) branch="${2:?--branch requires a name}"; shift 2 ;;
             --checkout) checkout_ref="${2:?--checkout requires a ref}"; shift 2 ;;
+            --services-trust-ref) services_trust_ref="${2:?--services-trust-ref requires a ref}"; shift 2 ;;
             --model) model="${2:?--model requires an OpenRouter model id}"; shift 2 ;;
             --endpoint) endpoint="${2:?--endpoint requires a name}"; shift 2 ;;
             --harness) harness="${2:?--harness requires 'pi' or 'claude'}"; shift 2 ;;
@@ -1534,7 +1579,8 @@ cmd_submit() {
     # caller-supplied command-line text that becomes arguments for the
     # pod's pi invocation, so it is refused by the same guard here, plus
     # the double quote and backslash, rather than anywhere pod-side.
-    fs_reject_unsafe_chars "$branch" "$model" "$checkout_ref" "$pi_args" || exit 1
+    fs_reject_unsafe_chars "$branch" "$model" "$checkout_ref" "$pi_args" \
+        "$services_trust_ref" || exit 1
     # pi_args is additionally embedded in the rendered Job's PI_ARGS env
     # var as a YAML double-quoted scalar, so a double quote or a
     # backslash is refused on top of the guard above: an unescaped quote
@@ -1719,6 +1765,84 @@ cmd_submit() {
         if ! checkout_sha="$(cd "$origin_repo" && git rev-parse --verify --quiet "$checkout_ref^{commit}" 2>/dev/null)"; then
             echo "Error: --checkout '$checkout_ref' does not name a commit in $origin_repo." >&2
             exit 1
+        fi
+    fi
+
+    # Per-run services: a repo commits a SPEC, never a hook, so the harness
+    # (not repo-controlled code) synthesizes the sidecars from it -- see
+    # docs/sandbox-services.md's cluster section. Read from the EXACT
+    # revision being pushed (never the working tree, which under
+    # --checkout may not even be at that revision) so an operator's own
+    # dirty tree cannot influence what a pinned run gets. Absent file
+    # means no services and no behaviour change -- silent, not a warning,
+    # since that is the case every existing repo is in.
+    local services_rev="${checkout_sha:-HEAD}"
+    local services_containers="" services_volumes=""
+    local services_grace_env="" services_prompt_text="" sandbox_env_content=""
+    if git -C "$origin_repo" cat-file -e \
+            "${services_rev}:.agents/sandbox-services/services.yaml" 2>/dev/null; then
+        # --services-trust-ref gates this exactly as the local path's hook
+        # is gated (fork-sandbox.sh:3546-3604): a checkout that changed
+        # .agents/sandbox-services/ relative to the given ref does not get
+        # services. Data is still input to an apply made with the
+        # operator's credentials.
+        local services_trusted=1
+        if [[ -n "$checkout_ref" && -z "$services_trust_ref" ]]; then
+            echo "Warning: --checkout names an unanchored ref, so its" >&2
+            echo "per-run services spec is NOT used -- the spec is data" >&2
+            echo "the operator's own apply acts on, and the ref may be" >&2
+            echo "untrusted. Pass --services-trust-ref <trusted-base> to" >&2
+            echo "enable it." >&2
+            services_trusted=0
+        elif [[ -n "$services_trust_ref" ]]; then
+            local trust_compare_sha="${checkout_sha:-$(cd "$origin_repo" && git rev-parse HEAD)}"
+            local trust_diff_rc=0
+            (cd "$origin_repo" && git diff --quiet \
+                "${services_trust_ref}...${trust_compare_sha}" \
+                -- .agents/sandbox-services/) || trust_diff_rc=$?
+            if (( trust_diff_rc == 1 )); then
+                echo "Warning: the checked-out ref changes" >&2
+                echo ".agents/sandbox-services/ relative to the trusted" >&2
+                echo "base, so per-run services are disabled for this run." >&2
+                services_trusted=0
+            elif (( trust_diff_rc != 0 )); then
+                echo "Error: git could not evaluate --services-trust-ref" >&2
+                echo "'$services_trust_ref' against '$trust_compare_sha'" >&2
+                echo "(git exited $trust_diff_rc; its error is above)." >&2
+                exit 1
+            fi
+        fi
+
+        if (( services_trusted )); then
+            local services_dir
+            services_dir="$(mktemp -d)"
+            local services_spec_file="$services_dir/services.yaml"
+            git -C "$origin_repo" show \
+                "${services_rev}:.agents/sandbox-services/services.yaml" \
+                > "$services_spec_file"
+            local services_out="$services_dir/out"
+            if ! python3 "$script_dir/fork-sandbox-k8s-services-parse.py" \
+                    "$services_spec_file" "$services_out" "$K8S_SERVICES_MAX" \
+                    "$K8S_SERVICE_MAX_CPU" "$K8S_SERVICE_MAX_MEMORY"; then
+                rm -rf -- "$services_dir"
+                exit 1
+            fi
+            # Everything needed is read into shell variables here, and the
+            # temp dir removed immediately after -- nothing below this
+            # block depends on it, so there is no cleanup to defer onto an
+            # EXIT trap (this function already juggles more than one of
+            # those further down, each of which replaces the last).
+            [[ -f "$services_out/containers.yaml" ]] && \
+                services_containers=$'\n'"$(cat "$services_out/containers.yaml")"
+            [[ -f "$services_out/volumes.yaml" ]] && \
+                services_volumes=$'\n'"$(cat "$services_out/volumes.yaml")"
+            [[ -f "$services_out/grace" ]] && \
+                services_grace_env=$'\n'"      terminationGracePeriodSeconds: 10"
+            [[ -f "$services_out/prompt-services.txt" ]] && \
+                services_prompt_text="$(cat "$services_out/prompt-services.txt")"
+            [[ -f "$services_out/sandbox-env" ]] && \
+                sandbox_env_content="$(cat "$services_out/sandbox-env")"
+            rm -rf -- "$services_dir"
         fi
     fi
 
@@ -1913,6 +2037,19 @@ CENV
 )"
     fi
 
+    # The sandbox-env ConfigMap key, present only when the services spec
+    # carried a `sandboxEnv` map -- copied verbatim, pod-side, to
+    # .env.sandbox in the clone (fork-sandbox-k8s-entrypoint.sh), the same
+    # filename the local services path uses.
+    local services_env_configmap_key=""
+    if [[ -n "$sandbox_env_content" ]]; then
+        services_env_configmap_key=$'\n'"$(cat <<KEYS
+  sandbox-env: |
+$(printf '%s' "$sandbox_env_content" | indent_block)
+KEYS
+)"
+    fi
+
     # MODEL_DISCOVERY, set only when this run is wired to a named
     # endpoint AND will actually use the pi proxy -- a pi coding leg,
     # or any run carrying a --review-loop (the loop always runs pi): it
@@ -1963,8 +2100,9 @@ $(indent_block < "$context_extract_sh")
 $({ fs_emit_prompt_preamble "$pod_clone_dir" "$POD_INBOX_DIR" "$harness" gated "$POD_OUTBOX_DIR" pod \
        "$outbox_max_bytes"
    [[ -n "$context_ro" ]] && render_context_section "$POD_CONTEXT_DIR"
+   [[ -n "$services_prompt_text" ]] && render_services_section "$services_prompt_text"
    printf '\n---\n\n'
-   cat -- "$handoff_file"; } | indent_block)${review_loop_configmap_keys}${claude_configmap_keys}
+   cat -- "$handoff_file"; } | indent_block)${review_loop_configmap_keys}${claude_configmap_keys}${services_env_configmap_key}
 ---
 apiVersion: batch/v1
 kind: Job
@@ -1982,7 +2120,7 @@ spec:
         app: fork-sandbox-agent
         fork-sandbox/branch: $safe_name
     spec:
-      restartPolicy: Never
+      restartPolicy: Never${services_grace_env}
       automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
@@ -2012,7 +2150,7 @@ spec:
           volumeMounts:
             - name: scripts
               mountPath: /mnt/fork-sandbox
-              readOnly: true
+              readOnly: true${services_containers}
       containers:
         - name: agent
           image: $K8S_IMAGE
@@ -2070,7 +2208,7 @@ spec:
         - name: tmp
           emptyDir: {}
         - name: home
-          emptyDir: {}
+          emptyDir: {}${services_volumes}
 EOF
 )"
     rendered="${claude_proxy_rendered}${job_rendered}"
@@ -2724,7 +2862,7 @@ cmd_collect() {
 cmd_run() {
     local dry_run=false keep=false timeout=3600 branch="" model="" review_loop_cap=""
     local outbox_dir="" outbox_max_arg="" context_ro="" harness="" review_model="" endpoint=""
-    local checkout_ref="" pi_args=""
+    local checkout_ref="" pi_args="" services_trust_ref=""
     while (( $# )); do
         case "$1" in
             --dry-run) dry_run=true; shift ;;
@@ -2732,6 +2870,7 @@ cmd_run() {
             --timeout) timeout="${2:?--timeout requires a number of seconds}"; shift 2 ;;
             --branch) branch="${2:?--branch requires a name}"; shift 2 ;;
             --checkout) checkout_ref="${2:?--checkout requires a ref}"; shift 2 ;;
+            --services-trust-ref) services_trust_ref="${2:?--services-trust-ref requires a ref}"; shift 2 ;;
             --model) model="${2:?--model requires an OpenRouter model id}"; shift 2 ;;
             --endpoint) endpoint="${2:?--endpoint requires a name}"; shift 2 ;;
             --harness) harness="${2:?--harness requires 'pi' or 'claude'}"; shift 2 ;;
@@ -2808,6 +2947,7 @@ cmd_run() {
     # error, not "no checkout". cmd_submit does the resolution and the
     # rev-parse check itself, before anything is created.
     [[ -n "$checkout_ref" ]] && submit_argv+=(--checkout "$checkout_ref")
+    [[ -n "$services_trust_ref" ]] && submit_argv+=(--services-trust-ref "$services_trust_ref")
     submit_argv+=("$project_path" "$handoff_file")
 
     # cmd_submit does its own full validation (K8S_IMAGE, K8S_DENIED_PROBE,

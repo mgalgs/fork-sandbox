@@ -426,6 +426,15 @@ cd "$clone_dir"
 # The clone above already checked out $BRANCH as a local branch (HEAD now
 # points there), so this only needs to switch onto it, not create it.
 git checkout --quiet "$BRANCH"
+
+# Per-run services' sandboxEnv, staged only when the submitted services
+# spec carried one -- see render_services_env_configmap_key in
+# fork-sandbox-k8s.sh. Same filename the local sandbox-services path
+# writes, so a repo reads one file either way.
+if [[ -f "$mounts_dir/sandbox-env" ]]; then
+    echo "fork-sandbox-k8s-entrypoint: writing $clone_dir/.env.sandbox" >&2
+    cp "$mounts_dir/sandbox-env" "$clone_dir/.env.sandbox"
+fi
 git config user.name "$GIT_USER_NAME"
 git config user.email "$GIT_USER_EMAIL"
 git config commit.gpgsign false
