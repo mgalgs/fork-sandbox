@@ -86,12 +86,13 @@
 # bodies, as a `lkml-render.py --text` render: it summarizes the
 # discussion rather than reviewing the diff, and its sandbox cannot read
 # the mailbox, so the handoff itself must carry the thread. The run
-# makes NO commits -- it writes its replies as
-# .git/lkml-out/<n>.msg files in its own clone -- .git/ rather than the
-# working tree because git tracks nothing under it, so this project's
-# "commit early and often" instinct cannot sweep it into a commit by
-# accident (see fork-sandbox.sh's own review-verdict.md and pi-session
-# for the same convention). Launches are started back to
+# makes NO commits -- it writes its replies as <n>.msg files in the
+# run's artifact outbox (the absolute path its own prompt preamble
+# gives it), which sits outside the clone: the project's "commit early
+# and often" instinct cannot sweep a reply into a commit by accident --
+# and, if a Kubernetes mode is ever added, the same harvest would serve
+# a cluster run: the outbox is the only channel that carries a file out
+# of a pod. Launches are started back to
 # back rather than backgrounded with `&`: each fork-sandbox.sh call returns
 # as soon as its own detached tmux session exists, so by the time the last
 # one is launched every session is already running concurrently -- the same
@@ -101,10 +102,15 @@
 # After every launched run has written summary.json -- fork-sandbox.sh's
 # own signal that the run is fully over, including its (possibly empty)
 # fetch back into the real repo, written strictly after exit-code -- each
-# run's clone is read directly -- `cat`, never git -- for .git/lkml-out/*.msg
-# files, which are posted into the mailbox via lkml-mailbox.sh post,
+# run's artifact outbox is read directly -- `cat`, never git -- for
+# *.msg files, with a fall back to the old .git/lkml-out/ directory in
+# the run's clone for a run launched by an older copy of this script
+# whose seat was still told that location: the outbox wins when it
+# holds any reply, so a seat that somehow wrote to both is posted once,
+# never twice. The replies are posted into the mailbox via
+# lkml-mailbox.sh post,
 # stamped with that persona's own harness/model and display name. A
-# .git/lkml-out file with no In-Reply-To header is skipped with a clear
+# reply file with no In-Reply-To header is skipped with a clear
 # warning; the rest of that run's replies still land.
 
 set -uo pipefail
@@ -650,8 +656,9 @@ for persona in "${!run_dir_of[@]}"; do
         continue
     fi
     clone_dir="$(jq -r '.clone_dir' "$run_dir/summary.json")"
-    # The seat's prompt names the run's artifact outbox -- the only
-    # channel that carries a reply out of a Kubernetes pod. .git/lkml-out
+    # The seat's prompt names the run's artifact outbox (which a
+    # future Kubernetes mode would harvest the same way: it is the only
+    # channel that carries a reply out of a pod). .git/lkml-out
     # in the clone is where a seat was told to write before that prompt
     # existed; a run launched by an older copy of this script may still be
     # in flight writing there, so it stays a fallback. The outbox wins
