@@ -75,6 +75,13 @@
 #                   ordinary state. The host, which knows the install
 #                   kind and the harness, gates the call on this
 #                   variable instead of the pod guessing from the URL.
+#   PI_ARGS         extra arguments for the pi coding-leg invocation,
+#                   verbatim from fork-sandbox-k8s.sh's --pi-args, e.g.
+#                   "--thinking low". Rendered only when non-empty, so
+#                   unset and empty both mean "no extra arguments" -- an
+#                   empty string argument would be a positional pi
+#                   rejects; see run_pi_coding_leg for how it is split
+#                   into an argv and never evaluated.
 #   CLAUDE_PROXY_BASE_URL
 #                   the base URL of the per-run proxy that swaps the
 #                   placeholder credential below for the operator's real
@@ -164,6 +171,7 @@ case "$HARNESS" in
 esac
 : "${MODEL:=}"
 : "${MODEL_DISCOVERY:=}"
+: "${PI_ARGS:=}"
 : "${PROXY_BASE_URL:?PROXY_BASE_URL must be set to the pi model proxy base URL}"
 if [[ "$HARNESS" == claude ]]; then
     : "${CLAUDE_PROXY_BASE_URL:?CLAUDE_PROXY_BASE_URL must be set when HARNESS=claude}"
@@ -490,6 +498,28 @@ synthesize_pi_config() {
     mv "$HOME/.pi/agent/settings.json.new" "$HOME/.pi/agent/settings.json"
 }
 
+# The pi coding leg's own invocation. The argv is built from MODEL and
+# PI_ARGS: PI_ARGS is split on whitespace and appended as an array --
+# splitting, never evaluation (no eval, no interpolation into a shell
+# string), and submit already refused shell metacharacters in the value
+# with fs_reject_unsafe_chars before any Job, Secret or proxy Pod existed.
+# An unset or empty PI_ARGS appends nothing: an empty string argument
+# would be a positional pi rejects.
+run_pi_coding_leg() {
+    local -a pi_argv=(pi --provider proxy --model "$MODEL" --mode json -p)
+    local -a pi_extra_argv=()
+    if [[ -n "$PI_ARGS" ]]; then
+        read -r -a pi_extra_argv <<< "$PI_ARGS"
+    fi
+    if (( ${#pi_extra_argv[@]} )); then
+        pi_argv+=("${pi_extra_argv[@]}")
+    fi
+    "${pi_argv[@]}" \
+        < "$mounts_dir/handoff.md" \
+        > "$work_dir/events.jsonl" \
+        2> "$work_dir/pi-stderr.log"
+}
+
 # A safety net run after both the coding leg and (when there is one) the
 # review loop: whichever left work uncommitted must not lose it. A single
 # function rather than two copies, so the call at each site stays short --
@@ -514,11 +544,7 @@ if [[ "$HARNESS" == pi ]]; then
         "$CTX" "$MAX_TOKENS" "$REVIEW_CTX" "$REVIEW_MAX_TOKENS"
 
     echo "fork-sandbox-k8s-entrypoint: running pi" >&2
-    pi --provider proxy --model "$MODEL" --mode json -p \
-        < "$mounts_dir/handoff.md" \
-        > "$work_dir/events.jsonl" \
-        2> "$work_dir/pi-stderr.log" \
-        || pi_rc=$?
+    run_pi_coding_leg || pi_rc=$?
     echo "fork-sandbox-k8s-entrypoint: pi exited $pi_rc" >&2
 else
     echo "fork-sandbox-k8s-entrypoint: installing the claude credential" >&2

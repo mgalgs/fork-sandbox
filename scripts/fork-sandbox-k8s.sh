@@ -4,7 +4,7 @@
 # Usage: fork-sandbox-k8s.sh install [--dry-run]
 #        fork-sandbox-k8s.sh submit [--dry-run] --branch NAME [--model MODEL]
 #                            [--endpoint NAME] [--harness pi|claude]
-#                            [--review-loop N] [--review-model MODEL]
+#                            [--pi-args ARGS] [--review-loop N] [--review-model MODEL]
 #                            [--outbox-max SIZE]
 #                            [--context-ro DIR]
 #                            [--checkout REF]
@@ -198,6 +198,17 @@
 # subdirectory, so read-only here is enforced by the prompt text the agent
 # reads (a `## Gathered context` section appended to handoff.md), not by
 # the filesystem.
+#
+# --pi-args ARGS (submit, run): extra arguments, verbatim, for the pod's
+# pi coding-leg invocation -- e.g. "--thinking low" for a persona whose
+# frontmatter carries `thinking:`. Only the pi harness starts pi, so
+# --harness claude is refused with it -- the same refusal fork-sandbox.sh's
+# own --pi-args applies. The value passes the same fs_reject_unsafe_chars
+# guard as --branch/--model/--checkout, at parse time, before any Job,
+# Secret or proxy Pod exists. It travels into the pod as the PI_ARGS env
+# var (exactly the path --model takes) and is split on whitespace into an
+# array the entrypoint expands as arguments: splitting, never eval, never
+# a shell-string interpolation. Unset or empty adds no arguments at all.
 #
 # --harness pi|claude (submit): which coding harness the pod runs. Defaults
 # to pi, which talks to the shared fork-sandbox-proxy over PROXY_BASE_URL,
@@ -1370,6 +1381,7 @@ cmd_install() {
 cmd_submit() {
     local dry_run=false branch="" model="" review_loop_cap="" outbox_max_arg=""
     local context_ro="" harness="pi" review_model="" endpoint="" checkout_ref=""
+    local pi_args=""
     while (( $# )); do
         case "$1" in
             --dry-run) dry_run=true; shift ;;
@@ -1378,6 +1390,7 @@ cmd_submit() {
             --model) model="${2:?--model requires an OpenRouter model id}"; shift 2 ;;
             --endpoint) endpoint="${2:?--endpoint requires a name}"; shift 2 ;;
             --harness) harness="${2:?--harness requires 'pi' or 'claude'}"; shift 2 ;;
+            --pi-args) pi_args="${2:?--pi-args requires a value}"; shift 2 ;;
             --review-loop) review_loop_cap="${2:?--review-loop requires a positive integer}"; shift 2 ;;
             --review-model) review_model="${2:?--review-model requires a model id}"; shift 2 ;;
             --outbox-max) outbox_max_arg="${2:?--outbox-max requires a size}"; shift 2 ;;
@@ -1396,6 +1409,15 @@ cmd_submit() {
             exit 1
             ;;
     esac
+
+    # --pi-args names pi, which only the pi harness starts -- the same
+    # refusal fork-sandbox.sh's own --pi-args applies to its non-pi
+    # harnesses, checked here before anything is created.
+    if [[ -n "$pi_args" && "$harness" == claude ]]; then
+        echo "Error: --pi-args passes flags to pi, which a claude run" >&2
+        echo "never starts. Drop it, or use --harness pi." >&2
+        exit 1
+    fi
 
     # The named endpoint this run is wired to, on a K8S_PROXY_ENDPOINTS
     # install (see proxy_base_url below, which this resolves into).
@@ -1458,8 +1480,11 @@ cmd_submit() {
     branch="${branch:-k8s-$(date +%Y%m%d-%H%M%S)}"
     # checkout_ref is caller-supplied and interpolated into a git command
     # line below (the push refspec), so it gets the same treatment as
-    # branch and model: rejected before anything is created.
-    fs_reject_unsafe_chars "$branch" "$model" "$checkout_ref" || exit 1
+    # branch and model: rejected before anything is created. pi_args is
+    # caller-supplied command-line text that becomes arguments for the
+    # pod's pi invocation, so it is refused by the same guard here rather
+    # than anywhere pod-side.
+    fs_reject_unsafe_chars "$branch" "$model" "$checkout_ref" "$pi_args" || exit 1
 
     # --review-loop takes a positive integer, the same shape and the same
     # message fork-sandbox.sh's own local flag uses, so a bad value reads
@@ -1807,6 +1832,21 @@ CENV
 )"
     fi
 
+    # PI_ARGS, whenever --pi-args was given (pi harness only -- a claude
+    # run is refused with it above): the extra arguments for the pod's pi
+    # coding-leg invocation, split on whitespace in the entrypoint and
+    # passed to pi as an array. Rendered only when non-empty, so a run
+    # without --pi-args renders no PI_ARGS at all -- the entrypoint treats
+    # an unset or empty PI_ARGS as "no arguments".
+    local pi_args_env=""
+    if [[ -n "$pi_args" ]]; then
+        pi_args_env=$'\n'"$(cat <<CENV
+            - name: PI_ARGS
+              value: "$pi_args"
+CENV
+)"
+    fi
+
     # MODEL_DISCOVERY, set only when this run is wired to a named
     # endpoint AND will actually use the pi proxy -- a pi coding leg,
     # or any run carrying a --review-loop (the loop always runs pi): it
@@ -1929,7 +1969,7 @@ spec:
             - name: RUN_TTL
               value: "$K8S_RUN_TTL"
             - name: OUTBOX_MAX_BYTES
-              value: "$outbox_max_bytes"${model_discovery_env}${review_loop_env}${claude_env}${review_model_env}
+              value: "$outbox_max_bytes"${model_discovery_env}${review_loop_env}${claude_env}${review_model_env}${pi_args_env}
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
