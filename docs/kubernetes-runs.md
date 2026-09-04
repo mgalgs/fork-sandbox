@@ -72,8 +72,11 @@ runner ever starts (the review loop, unlike those two, DOES run on this
 path — see "The cluster review loop" below). Most of `fork-sandbox.sh`'s
 other flags describe that local machinery and have nothing to attach to on
 a cluster run, so `--k8s` refuses each of them by name (`--harness` values
-other than `pi`, `--checkout`, `--prompts-dir`, and several more) rather
-than accepting and silently dropping it. See the `--k8s` entry in
+other than `pi`, `--pi-args`, `--prompts-dir`, and several more) rather
+than accepting and silently dropping it. The flags `run` itself accepts are
+the ones that are carried, `--checkout REF` among them — the dispatcher
+forwards it, and the push description below says what it does. See the
+`--k8s` entry in
 `fork-sandbox.sh`'s own header for the full list and the reasoning, and
 `skills/fork-sandbox/SKILL.md` for when a cluster run is the right choice.
 This script itself stays the direct entry point either way — `install`,
@@ -285,6 +288,17 @@ hook happens to be installed there. Disabling hooks for the one invocation
 is what keeps a repo the script was merely pointed at from running its own
 code inside the client.
 
+The left side of that refspec is `HEAD` by default, which is what the
+branch starts at and (under `--review-loop`) the base the review leg
+measures against. `submit` and `run` also take `--checkout REF`, which
+names any other commit the origin repo knows: the ref is resolved in the
+origin repo before the Job or proxy Pod exists (an unresolvable ref is
+refused with nothing created), and it is the resolved sha — not the ref
+name -- that goes on the left side of the colon, so the ref cannot move
+between the check and the push, and the push line on stderr reports the
+exact revision. Under `--review-loop`, the review base is that same sha,
+so the pushed branch and the base are the same revision, always.
+
 Only `refs/heads/BRANCH` is ever pushed into the bare repo, so its default
 HEAD dangles; the entrypoint points the bare repo's HEAD at that pushed
 branch before cloning, so the clone lands directly on it instead of warning
@@ -308,9 +322,10 @@ Three things follow, and all three are improvements over the original plan:
 
 - **It resolves open question 3 outright.** The original design could not run
   against a repository with no reachable remote, and called that "a real
-  capability loss." A pushed repository needs no remote at all — whatever
-  `HEAD` in the client's working tree is becomes the pod's starting point,
-  exactly as a local sandboxed run's `git clone --shared` does.
+  capability loss." A pushed repository needs no remote at all — the commit
+  the run starts from, `HEAD` in the client's working tree unless
+  `--checkout` names another, becomes the pod's starting point, exactly as
+  a local sandboxed run's `git clone --shared` does.
 - **No git credential exists anywhere in this system.** The original plan's
   pod dialed out to a remote to clone, which means naming a remote and
   usually authenticating to it. A pod that only ever receives a push

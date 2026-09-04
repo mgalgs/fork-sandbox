@@ -7,6 +7,7 @@
 #                            [--review-loop N] [--review-model MODEL]
 #                            [--outbox-max SIZE]
 #                            [--context-ro DIR]
+#                            [--checkout REF]
 #                            <project-path> <handoff-file>
 #        fork-sandbox-k8s.sh run [--dry-run] [--timeout SECONDS] [--keep]
 #                            --branch NAME [--model MODEL] [--endpoint NAME]
@@ -14,6 +15,7 @@
 #                            [--review-loop N] [--review-model MODEL]
 #                            [--outbox-dir DIR] [--outbox-max SIZE]
 #                            [--context-ro DIR]
+#                            [--checkout REF]
 #                            <project-path> <handoff-file>
 #        fork-sandbox-k8s.sh fetch --branch NAME <project-path>
 #        fork-sandbox-k8s.sh say --branch NAME <text>
@@ -84,6 +86,15 @@
 #
 # --keep (run): skip the final rm, leaving the Job and pod in place after a
 # successful fetch.
+#
+# --checkout REF (submit, run): start the branch at the commit REF names
+# instead of the repo's HEAD. REF is resolved in the origin repo before
+# anything is created (an unresolvable ref is refused with no Job, Secret
+# or proxy Pod left behind), and the resolved sha -- not the ref name -- is
+# what the push sends, so the ref cannot move between the check and the
+# push, the pushed revision is the one the push line reports, and (under
+# --review-loop) the review base is the same revision the branch starts
+# from. With no --checkout, HEAD is resolved and pushed as before.
 #
 # --outbox-dir DIR (run): where to land the pod's /work/outbox after the
 # agent finishes. Defaults to
