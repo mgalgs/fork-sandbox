@@ -143,6 +143,18 @@ record "$rd_other" >/dev/null 2>"$err" \
     && check "a well-formed non-test marker becomes the source" "fixture" \
         "$(tail -1 "$log_home/.claude/sandbox-runs.jsonl" | jq -r .source)"
 
+# The other side of the pattern's length boundary: 32 characters is the
+# maximum and must record cleanly, not fall back.
+rd_max="$(mk_run_dir max)"
+tmpdirs+=("$rd_max")
+printf 'a1234567890123456789012345678901\n' > "$rd_max/run-source"
+record "$rd_max" >/dev/null 2>"$err" \
+    && check "a 32-character marker (the pattern's maximum) is accepted" \
+        "a1234567890123456789012345678901" \
+        "$(tail -1 "$log_home/.claude/sandbox-runs.jsonl" | jq -r .source)"
+not_contains "a 32-character marker prints no warning" \
+    "run-source marker" "$(cat "$err")"
+
 printf '\n== record: a malformed marker warns and falls back ==\n'
 rd_bad="$(mk_run_dir bad)"
 tmpdirs+=("$rd_bad")
@@ -159,9 +171,10 @@ bad_source() {  # $1 = marker bytes to write; record must fall back
         no "a malformed marker does not fail the record ($2)" "record exited non-zero"
     fi
 }
-bad_source 'TEST\n' "uppercase"
-bad_source 'has space\n' "embedded space"
-bad_source 'a2345678901234567890123456789012345678901\n' "40 characters"
+bad_source 'TEST' "uppercase"
+bad_source 'has space' "embedded space"
+bad_source 'a234567890123456789012345678901234567890' "40 characters"
+bad_source 'a12345678901234567890123456789012' "33 characters"
 bad_source 'test
 extra
 ' "embedded newline"
@@ -251,7 +264,8 @@ bad_env() {  # $1 = value, $2 = description
 }
 bad_env "Bad Value" "a space"
 bad_env "Test" "uppercase"
-bad_env "a2345678901234567890123456789012345678901" "40 characters"
+bad_env "a12345678901234567890123456789012" "33 characters, one over the maximum"
+bad_env "a234567890123456789012345678901234567890" "40 characters"
 bad_env "-leading-hyphen" "a leading hyphen"
 bad_env "1leading-digit" "a leading digit"
 # Nothing is created: the refusal happens above run-directory creation.
@@ -261,11 +275,19 @@ FORK_SANDBOX_RUN_SOURCE="Bad Value" dry >/dev/null 2>&1 || true
 after="$(find /var/tmp/claude-scratch/forks -maxdepth 1 \
     -name 'claude-fork-sandbox.*' -type d | wc -l)"
 check "a refused value creates no run directory" "$before" "$after"
-# A well-formed value passes, and so does an unset variable.
-if FORK_SANDBOX_RUN_SOURCE="test" dry >/dev/null 2>&1; then
+# A well-formed value passes, and so does an unset variable. The
+# 32-character value is the pattern's maximum: exactly at the boundary
+# it passes, one character over was refused above.
+if FORK_SANDBOX_RUN_SOURCE="a1234567890123456789012345678901" dry >/dev/null 2>&1; then
     ok "a well-formed value passes --dry-run"
 else
     no "a well-formed value passes --dry-run" "dry-run failed"
+fi
+if FORK_SANDBOX_RUN_SOURCE="a1234567890123456789012345678901" dry >/dev/null 2>&1; then
+    ok "a 32-character value (the pattern's maximum) passes --dry-run"
+else
+    no "a 32-character value (the pattern's maximum) passes --dry-run" \
+        "dry-run failed"
 fi
 if dry >/dev/null 2>&1; then
     ok "an unset variable passes --dry-run"

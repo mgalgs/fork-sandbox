@@ -148,7 +148,6 @@
 #                        the record carries the default source, and the
 #                        run directory carries no file at all.
 # --sandbox-args "...":  extra arguments passed to claude-sandboxed itself.
-# --sandbox-args "...":  extra arguments passed to claude-sandboxed itself.
 #                        Only --unpin-egress is accepted. Refused outright
 #                        with --harness pi-local, which is sealed and so has
 #                        no egress to unpin.
