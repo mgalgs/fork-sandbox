@@ -70,8 +70,10 @@
 #            submitted -- refuses the whole round in the seats
 #            pre-pass, before any seat is submitted. A cluster run has
 #            no summary.json, so a seat's replies are stamped with its
-#            configured model, or "unknown" when the seat names none
-#            (post refuses an empty model), and its runs.jsonl ledger
+#            configured model; a model-less seat is stamped with the
+#            model the pod itself discovered (brought home in the
+#            outbox), or "unknown" when even that is absent (post
+#            refuses an empty model), and its runs.jsonl ledger
 #            line records the branch, marked cluster, with no cost --
 #            a cluster run's cost is unknown, not free.
 # --endpoint <name> the registered K8S_PROXY_ENDPOINTS entry the pi

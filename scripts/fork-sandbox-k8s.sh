@@ -2694,7 +2694,10 @@ cmd_wait() {
             echo "  fork-sandbox-k8s.sh rm --branch $branch" >&2
             exit 1
         fi
-        if (( now - last_report_ts >= 60 )); then
+        # Probe mode promises quiet transient waits, so the progress
+        # heartbeat is gated exactly like the startup and timeout messages
+        # -- a --probe --timeout over 60s would otherwise leak it.
+        if [[ "$probe" != true ]] && (( now - last_report_ts >= 60 )); then
             echo "fork-sandbox-k8s: still waiting on branch $branch (${elapsed}s elapsed)" >&2
             last_report_ts=$now
         fi

@@ -399,6 +399,12 @@ fi
 
 # Harness metadata, not a reply: collect pulls this dotfile back with the
 # outbox so cluster harvests can stamp replies from a discovered model.
+# The outbox is seat-writable, so a seat could forge this value. That is
+# ACCEPTED, deliberately: the stamp is bookkeeping on content the seat
+# authors wholesale, for models this operator configured -- protecting it
+# would mean a second container and a read-only volume in every cluster
+# pod, real lifecycle complexity for a non-threat. Do not "harden" this
+# without reopening that decision.
 if [[ -n "$MODEL" ]]; then
     printf '%s\n' "$MODEL" > "$outbox_dir/.fork-sandbox-model"
 fi
