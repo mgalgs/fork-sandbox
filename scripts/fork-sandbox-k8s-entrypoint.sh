@@ -432,6 +432,11 @@ git checkout --quiet "$BRANCH"
 # fork-sandbox-k8s.sh. Same filename the local sandbox-services path
 # writes, so a repo reads one file either way.
 if [[ -f "$mounts_dir/sandbox-env" ]]; then
+    if git ls-files --error-unmatch -- .env.sandbox >/dev/null 2>&1; then
+        echo "Error: .env.sandbox is tracked in the submitted repository;" >&2
+        echo "refusing to overwrite it with generated sandboxEnv content." >&2
+        exit 1
+    fi
     echo "fork-sandbox-k8s-entrypoint: writing $clone_dir/.env.sandbox" >&2
     cp "$mounts_dir/sandbox-env" "$clone_dir/.env.sandbox"
     # Keep the generated connection file clone-local so the end-of-leg

@@ -148,6 +148,11 @@ def parse_memory(value, path):
 
 
 def parse_doc(doc):
+    # Validate configured defaults even when a service omits one or both
+    # resource members. Otherwise a malformed cap would be copied into the
+    # rendered Job and only rejected later by Kubernetes.
+    max_cpu_milli = parse_cpu(MAX_CPU, "K8S_SERVICE_MAX_CPU")
+    max_memory_bytes = parse_memory(MAX_MEMORY, "K8S_SERVICE_MAX_MEMORY")
     if not isinstance(doc, dict):
         fail("the document must be a mapping with 'version' and 'services'")
     for key in doc:
@@ -276,15 +281,13 @@ def parse_doc(doc):
                          f"'cpu' and 'memory' are supported")
             if "cpu" in res_doc:
                 cpu = text_field(res_doc["cpu"], f"{path}.resources.cpu")
-                if parse_cpu(cpu, f"{path}.resources.cpu") > parse_cpu(
-                        MAX_CPU, "K8S_SERVICE_MAX_CPU"):
+                if parse_cpu(cpu, f"{path}.resources.cpu") > max_cpu_milli:
                     fail(f"{path}.resources.cpu: '{cpu}' exceeds the "
                          f"per-service cap {MAX_CPU} (K8S_SERVICE_MAX_CPU "
                          f"in k8s.env)")
             if "memory" in res_doc:
                 memory = text_field(res_doc["memory"], f"{path}.resources.memory")
-                if parse_memory(memory, f"{path}.resources.memory") > parse_memory(
-                        MAX_MEMORY, "K8S_SERVICE_MAX_MEMORY"):
+                if parse_memory(memory, f"{path}.resources.memory") > max_memory_bytes:
                     fail(f"{path}.resources.memory: '{memory}' exceeds the "
                          f"per-service cap {MAX_MEMORY} "
                          f"(K8S_SERVICE_MAX_MEMORY in k8s.env)")

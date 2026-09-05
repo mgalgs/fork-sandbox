@@ -176,9 +176,9 @@ sandboxEnv:
 - `version` — required, must be `1`. Any other value is refused, naming the
   supported versions — this is how the schema changes later without a repo
   silently getting the wrong parse.
-- `services[].name` — required, `^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`, unique,
-  and not one of the harness's own pod container names. Becomes the
-  sidecar's container name.
+- `services[].name` — required, at most **40 characters**, matching
+  `^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`, unique, and not one of the harness's own
+  pod container names. Becomes the sidecar's container name.
 - `services[].image` — required, an image ref. An unqualified image resolves
   wherever the cluster's container runtime points (commonly Docker Hub);
   fully qualify the ref to pin the registry.

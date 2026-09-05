@@ -4737,6 +4737,13 @@ else
     no "entrypoint excludes .env.sandbox from end-of-leg commits without duplicate entries" \
         "missing clone-local info/exclude guard in $entrypoint_sh"
 fi
+if grep -qF 'git ls-files --error-unmatch -- .env.sandbox' "$entrypoint_sh" \
+    && grep -qF 'refusing to overwrite it with generated sandboxEnv content' "$entrypoint_sh"; then
+    ok "entrypoint refuses to overwrite a tracked .env.sandbox"
+else
+    no "entrypoint refuses to overwrite a tracked .env.sandbox" \
+        "missing tracked-file refusal in $entrypoint_sh"
+fi
 
 # The real-git property the fix relies on: pushing a branch into a bare repo
 # leaves its default HEAD dangling, and a plain `git clone` of that repo
@@ -5435,7 +5442,7 @@ if grep -qF '    a 127.0.0.1:5432' "$svc2_out" && grep -qF '    b 127.0.0.1:6379
 else
     no "two-service spec: both services' ports render, both distinct" "$(cat "$svc2_out")"
 fi
-if grep -qF 'The clone holds an env file, \.env.sandbox' "$svc2_out"; then
+if grep -qF 'The clone holds an env file, `.env.sandbox`' "$svc2_out"; then
     no "service-only spec: prompt does not name a nonexistent env file" "found env-file paragraph"
 else
     ok "service-only spec: prompt does not name a nonexistent env file"
