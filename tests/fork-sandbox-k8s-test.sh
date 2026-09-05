@@ -5578,6 +5578,27 @@ services:
     image: registry.example/x:1
     port: 5432
 '
+svc_refuses "41-character name" \
+    "must be at most 40 characters, got 41" \
+    "version: 1
+services:
+  - name: $(printf 'a%.0s' {1..41})
+    image: registry.example/x:1
+    port: 5432
+"
+svc_name40_dir="$(svc_mk_repo "version: 1
+services:
+  - name: $(printf 'a%.0s' {1..40})
+    image: registry.example/x:1
+    port: 5432
+")"
+if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-svc-name40 --model moonshotai/kimi-k3 \
+    "$svc_name40_dir" "$handoff_file" >/dev/null 2>/tmp/fs-k8s-test-svc-name40.err; then
+    ok "40-character service name is accepted"
+else
+    no "40-character service name is accepted" "$(cat /tmp/fs-k8s-test-svc-name40.err)"
+fi
 svc_refuses "reserved name" \
     "is reserved by the harness's own pod containers" \
     'version: 1
