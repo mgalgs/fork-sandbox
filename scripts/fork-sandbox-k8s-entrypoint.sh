@@ -397,6 +397,12 @@ else
     REVIEW_MAX_TOKENS=32768
 fi
 
+# Harness metadata, not a reply: collect pulls this dotfile back with the
+# outbox so cluster harvests can stamp replies from a discovered model.
+if [[ -n "$MODEL" ]]; then
+    printf '%s\n' "$MODEL" > "$outbox_dir/.fork-sandbox-model"
+fi
+
 echo "fork-sandbox-k8s-entrypoint: waiting for $sentinel (deadline ${INPUTS_TIMEOUT}s)" >&2
 deadline=$(( $(date +%s) + INPUTS_TIMEOUT ))
 until [[ -f "$sentinel" ]]; do
