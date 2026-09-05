@@ -2116,8 +2116,8 @@ if [[ "$k8s_mode" == true ]]; then
 
     # Flags that name local-sandbox machinery a cluster run has no
     # equivalent of AT ALL, and never will: bubblewrap arguments, the claude
-    # CLI, per-run docker-compose services and their trust anchor, and the
-    # detached tmux session this script normally launches.
+    # CLI, per-run docker-compose services, and the detached tmux session this
+    # script normally launches.
     if [[ -n "$sandbox_args" ]]; then
         echo "Error: --sandbox-args is not supported with --k8s. It passes flags" >&2
         echo "to claude-sandboxed, the bubblewrap wrapper -- a Kubernetes pod has" >&2
@@ -2134,12 +2134,6 @@ if [[ "$k8s_mode" == true ]]; then
         echo "Error: --no-services is not supported with --k8s. There is no" >&2
         echo "per-run services mechanism on the cluster path to skip in the" >&2
         echo "first place." >&2
-        exit 1
-    fi
-    if [[ -n "$services_trust_ref" ]]; then
-        echo "Error: --services-trust-ref is not supported with --k8s, for the" >&2
-        echo "same reason as --no-services: there is no per-run services" >&2
-        echo "mechanism on the cluster path to trust or distrust." >&2
         exit 1
     fi
     if [[ "$keep_session" == true ]]; then
@@ -2284,6 +2278,7 @@ if [[ "$k8s_mode" == true ]]; then
     # commit in the origin repo) before anything is created, so there is
     # nothing to validate here.
     [[ -n "$checkout_ref" ]] && k8s_argv+=(--checkout "$checkout_ref")
+    [[ -n "$services_trust_ref" ]] && k8s_argv+=(--services-trust-ref "$services_trust_ref")
     # Forwarded as the raw string, not the byte count already parsed above:
     # fork-sandbox-k8s.sh does its own parsing, so there is one source of
     # truth per process rather than a cross-process byte count to keep in

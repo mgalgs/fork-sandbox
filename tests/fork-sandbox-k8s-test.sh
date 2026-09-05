@@ -4081,11 +4081,31 @@ refuses "--k8s --no-services is refused" \
     env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
     --harness pi --model moonshotai/kimi-k3 --no-services \
     unused-project unused-handoff
-refuses "--k8s --services-trust-ref is refused" \
-    "--services-trust-ref is not supported with --k8s" \
-    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
-    --harness pi --model moonshotai/kimi-k3 --services-trust-ref main \
-    unused-project unused-handoff
+# --services-trust-ref is carried through to the dispatched run. A checked-out
+# service spec is disabled without the trust ref, so the rendered sidecar
+# proves the launcher passed this flag rather than merely accepting it.
+k8s_flag_svc_dir="$k8s_flag_proj/.agents/sandbox-services"
+mkdir -p "$k8s_flag_svc_dir"
+printf 'version: 1\nservices:\n  - name: launcher-svc\n    image: registry.example/x:1\n    port: 5432\n' > "$k8s_flag_svc_dir/services.yaml"
+git -C "$k8s_flag_proj" add .agents/sandbox-services/services.yaml
+git -C "$k8s_flag_proj" -c user.email=t@fork-sandbox.invalid -c user.name=Tester commit -q -m services
+git -C "$k8s_flag_proj" tag fs-k8s-launcher-services
+k8s_flag_services_sha="$(git -C "$k8s_flag_proj" rev-parse HEAD)"
+k8s_flag_services_out="$(newdir)/k8s-flag-services.yaml"; tmpdirs+=("$(dirname "$k8s_flag_services_out")")
+if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
+    --harness pi --model moonshotai/kimi-k3 \
+    --checkout "$k8s_flag_services_sha" \
+    --services-trust-ref fs-k8s-launcher-services \
+    --branch fs-k8s-flag-test-services-branch \
+    "$k8s_flag_proj" "$k8s_flag_handoff" > "$k8s_flag_services_out" 2>/tmp/fs-k8s-flag-test-services.err; then
+    ok "--k8s --services-trust-ref --dry-run reaches the dispatched command"
+else
+    no "--k8s --services-trust-ref --dry-run reaches the dispatched command" \
+        "$(cat /tmp/fs-k8s-flag-test-services.err)"
+fi
+check "--k8s --services-trust-ref forwards the flag and enables the checked-out spec" \
+    2 "$(awk '/^      initContainers:/{f=1} f&&/^      containers:/{f=0} f' "$k8s_flag_services_out" | grep -c '^        - name:')"
+rm -f /tmp/fs-k8s-flag-test-services.err
 refuses "--k8s --keep-session is refused" \
     "--keep-session is not supported with --k8s" \
     env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
