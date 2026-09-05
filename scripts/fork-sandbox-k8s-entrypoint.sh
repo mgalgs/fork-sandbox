@@ -434,6 +434,11 @@ git checkout --quiet "$BRANCH"
 if [[ -f "$mounts_dir/sandbox-env" ]]; then
     echo "fork-sandbox-k8s-entrypoint: writing $clone_dir/.env.sandbox" >&2
     cp "$mounts_dir/sandbox-env" "$clone_dir/.env.sandbox"
+    # Keep the generated connection file clone-local so the end-of-leg
+    # git add -A safety net never sweeps it into the repo's source commits.
+    if ! grep -qxF '.env.sandbox' "$clone_dir/.git/info/exclude"; then
+        printf '%s\n' '.env.sandbox' >> "$clone_dir/.git/info/exclude"
+    fi
 fi
 git config user.name "$GIT_USER_NAME"
 git config user.email "$GIT_USER_EMAIL"

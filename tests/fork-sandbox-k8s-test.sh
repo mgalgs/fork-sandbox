@@ -4728,6 +4728,16 @@ else
     ok "entrypoint no longer uses checkout --quiet -b"
 fi
 
+# A generated sandbox env file is ignored through the clone-local exclude
+# file, and the exact entry is guarded so repeated setup does not duplicate it.
+if grep -qF '>> "$clone_dir/.git/info/exclude"' "$entrypoint_sh" \
+    && grep -qF "grep -qxF '.env.sandbox' \"\$clone_dir/.git/info/exclude\"" "$entrypoint_sh"; then
+    ok "entrypoint excludes .env.sandbox from end-of-leg commits without duplicate entries"
+else
+    no "entrypoint excludes .env.sandbox from end-of-leg commits without duplicate entries" \
+        "missing clone-local info/exclude guard in $entrypoint_sh"
+fi
+
 # The real-git property the fix relies on: pushing a branch into a bare repo
 # leaves its default HEAD dangling, and a plain `git clone` of that repo
 # warns and checks out nothing -- but pointing HEAD at the pushed branch
