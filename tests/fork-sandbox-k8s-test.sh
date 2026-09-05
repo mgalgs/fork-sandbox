@@ -2849,7 +2849,7 @@ tmpdirs+=("$(dirname "$wait_log3")")
 rc=0
 K8S_STUB_JOB_FAILED=True \
     waitstub_wait "$wait_log3" "$wait_out3" "$wait_err3" \
-    --branch fs-k8s-test-wait-jobfailed --timeout 5 || rc=$?
+    --branch fs-k8s-test-wait-jobfailed --timeout 5 --probe || rc=$?
 if (( rc == 2 )) && grep -q 'reports a Failed condition' "$wait_err3"; then
     ok "a Failed job condition fails the wait with the terminal code 2"
 else
@@ -2870,6 +2870,19 @@ if (( rc == 1 )) && grep -q 'timed out after 0s waiting for branch' "$wait_err4"
     ok "a timed-out wait fails with code 1 and the fetch-by-hand advice"
 else
     no "a timed-out wait fails with code 1 and the fetch-by-hand advice" "rc=$rc: $(cat "$wait_err4")"
+fi
+
+# The poller form keeps a still-running seat quiet: only the caller knows
+# that this was an expected transient result.
+wait_log_probe="$(newdir)/kubectl.log"; wait_out_probe="$(newdir)/out-probe.txt"; wait_err_probe="$(newdir)/err-probe.txt"
+tmpdirs+=("$(dirname "$wait_log_probe")")
+rc=0
+waitstub_wait "$wait_log_probe" "$wait_out_probe" "$wait_err_probe" \
+    --branch fs-k8s-test-wait-probe --timeout 0 --probe || rc=$?
+if (( rc == 1 )) && [[ ! -s "$wait_err_probe" ]]; then
+    ok "a probe timeout exits 1 with empty stderr"
+else
+    no "a probe timeout exits 1 with empty stderr" "rc=$rc: $(cat "$wait_err_probe")"
 fi
 
 # 5. A malformed sentinel: the wait fails rather than guessing, with the
@@ -2974,6 +2987,24 @@ if K8S_STUB_OUTBOX_RC=0 \
     fi
 else
     no "collect lands the outbox at --outbox-dir and fetches" "collect exited nonzero: $(cat "$collect_out1")"
+fi
+
+# tar's `.` walk must carry the harness metadata dotfile home too.
+collect_log_meta="$(newdir)/kubectl.log"; collect_out_meta="$(newdir)/out-meta.txt"; collect_dest_meta="$(newdir)/outbox-meta"
+collect_meta_src="$(newdir)/pod-outbox-meta"
+tmpdirs+=("$(dirname "$collect_log_meta")" "$collect_meta_src" "$(dirname "$collect_dest_meta")")
+mkdir -p -- "$collect_meta_src"
+printf 'discovered-model\n' > "$collect_meta_src/.fork-sandbox-model"
+if K8S_STUB_OUTBOX_DIR="$collect_meta_src" K8S_STUB_OUTBOX_RC=0 \
+    collectstub_collect "$collect_log_meta" "$collect_out_meta" \
+    --branch fs-k8s-test-collect-dotfile --outbox-dir "$collect_dest_meta" "$proj_dir"; then
+    if [[ "$(cat "$collect_dest_meta/.fork-sandbox-model" 2>/dev/null)" == discovered-model ]]; then
+        ok "collect brings the model metadata dotfile home"
+    else
+        no "collect brings the model metadata dotfile home" "dest=$(find "$collect_dest_meta" 2>/dev/null)"
+    fi
+else
+    no "collect brings the model metadata dotfile home" "collect exited nonzero: $(cat "$collect_out_meta")"
 fi
 
 # 2. An over-cap outbox is refused -- and only the pull-back is refused:

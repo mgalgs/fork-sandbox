@@ -17,7 +17,7 @@
 #                            [--context-ro DIR]
 #                            [--checkout REF] [--services-trust-ref REF]
 #                            <project-path> <handoff-file>
-#        fork-sandbox-k8s.sh wait --branch NAME [--timeout SECONDS]
+#        fork-sandbox-k8s.sh wait --branch NAME [--timeout SECONDS] [--probe]
 #        fork-sandbox-k8s.sh collect --branch NAME [--outbox-dir DIR]
 #                            [--outbox-max SIZE] [--review-loop N]
 #                            [--keep] <project-path>
@@ -2576,11 +2576,12 @@ cmd_rm() {
 # fetched), while exit 1 is the probe's own deadline (the run may still be
 # going) or a usage error.
 cmd_wait() {
-    local timeout=3600 branch="" project_path="${project_path-}"
+    local timeout=3600 branch="" project_path="${project_path-}" probe=false
     while (( $# )); do
         case "$1" in
             --branch) branch="${2:?--branch requires a name}"; shift 2 ;;
             --timeout) timeout="${2:?--timeout requires a number of seconds}"; shift 2 ;;
+            --probe) probe=true; shift ;;
             -*) echo "Error: unknown option '$1' for wait." >&2; exit 1 ;;
             *) break ;;
         esac
@@ -2607,8 +2608,10 @@ cmd_wait() {
         exit 2
     fi
 
-    echo "fork-sandbox-k8s: waiting for branch $branch to finish (polling" >&2
-    echo "every 10s, timeout ${timeout}s)" >&2
+    if [[ "$probe" != true ]]; then
+        echo "fork-sandbox-k8s: waiting for branch $branch to finish (polling" >&2
+        echo "every 10s, timeout ${timeout}s)" >&2
+    fi
 
     local start_ts now elapsed last_report_ts run_complete phase job_failed
     start_ts=$(date +%s)
@@ -2678,6 +2681,9 @@ cmd_wait() {
         now=$(date +%s)
         elapsed=$(( now - start_ts ))
         if (( elapsed >= timeout )); then
+            if [[ "$probe" == true ]]; then
+                exit 1
+            fi
             echo "Error: timed out after ${timeout}s waiting for branch" >&2
             echo "$branch to finish. The pod is still running, holding its" >&2
             echo "work -- run does not fetch a half-finished branch and does" >&2
