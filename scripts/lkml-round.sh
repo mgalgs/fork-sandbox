@@ -777,7 +777,7 @@ if (( k8s )); then
             # next cycle. wait's own pod-specific diagnosis is already
             # on stderr.
             wait_rc=0
-            agent_code="$(fork-sandbox-k8s.sh wait --branch "$branch" --timeout "$k8s_probe_timeout")" || wait_rc=$?
+            agent_code="$(fork-sandbox-k8s.sh wait --branch "$branch" --timeout "$k8s_probe_timeout" --probe)" || wait_rc=$?
             if (( wait_rc == 0 )); then
                 echo "fork-sandbox lkml-round: $persona finished (agent exit $agent_code); collecting $branch..." >&2
                 # Reviewer seats run no review loop, so no --review-loop
@@ -915,12 +915,16 @@ if (( k8s )); then
             echo "fork-sandbox lkml-round: $persona wrote no replies (checked $out_dir)." >&2
             continue
         fi
-        # No summary.json to ask what the endpoint actually served: stamp
-        # the seat's configured model when it has one, falling back to
-        # the same "unknown" the local path uses when it cannot tell --
-        # post refuses an empty model, and a model name is not
-        # something to invent.
+        # No summary.json to ask what the endpoint actually served: when the
+        # seat discovered its model in the pod, collect brought this metadata
+        # file home beside the replies. It is harness metadata, not a reply.
         model="${model_of[$persona]}"
+        if [[ -z "$model" && -f "$out_dir/.fork-sandbox-model" ]]; then
+            discovered_model="$(cat -- "$out_dir/.fork-sandbox-model" 2>/dev/null || true)"
+            if [[ -n "$discovered_model" && ! "$discovered_model" =~ [[:space:]] ]]; then
+                model="$discovered_model"
+            fi
+        fi
         [[ -n "$model" ]] || model="unknown"
         while IFS= read -r msgfile; do
             [[ -e "$msgfile" ]] || continue

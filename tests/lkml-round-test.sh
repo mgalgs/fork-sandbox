@@ -587,6 +587,7 @@ case "$verb" in
             pi-local)
                 printf 'In-Reply-To: %s\nSubject: k8s pi-local reply\n\nCluster reply from the translated pi seat.\n' "$STUB_REPLY_TO" \
                     > "$outbox_dir/1.msg"
+                printf 'qwen3-8b\n' > "$outbox_dir/.fork-sandbox-model"
                 ;;
         esac
         echo "stub fork-sandbox-k8s: collected $branch" >&2
@@ -617,6 +618,11 @@ out_k8s="$(PATH="$stub_bin:$PATH" STUB_CAPTURE_DIR="$cap_k8s" STUB_RUN_PREFIX="$
     --k8s --endpoint test-endpoint 2>&1)"
 rc_k8s=$?
 if (( rc_k8s == 0 )); then ok "--k8s round exits 0 against the k8s stub"; else no "--k8s round exits 0 against the k8s stub" "exit $rc_k8s: $out_k8s"; fi
+if [[ "$out_k8s" != *"Error:"* ]] && ! find "$cap_k8s" -name '*.wait.argv' -exec grep -L -- '--probe' {} + | grep -q .; then
+    ok "unfinished cluster seats are probed quietly with --probe"
+else
+    no "unfinished cluster seats are probed quietly with --probe" "output=$out_k8s"
+fi
 
 k8s_order="$cap_k8s/call-order"
 n_submits="$(grep -c '^submit ' "$k8s_order" 2>/dev/null)"; n_submits="${n_submits:-0}"
@@ -710,7 +716,7 @@ check "core's reply is stamped with core's own harness/model" "(claude/opus)" \
 pi_reply_line="$(printf '%s\n' "$k8s_tree_out" | grep 'k8s pi-local reply')"
 check "pi-local's reply is posted under pi-local's persona, not another seat's" "pi-local" \
     "$(awk '{print $2}' <<<"$pi_reply_line")"
-check "pi-local's reply is stamped pi/unknown -- no summary.json to consult" "(pi/unknown)" \
+check "pi-local's reply is stamped with the discovered model" "(pi/qwen3-8b)" \
     "$(awk '{print $3}' <<<"$pi_reply_line")"
 sec_reply_line="$(printf '%s\n' "$k8s_tree_out" | grep 'k8s security reply')"
 check "security's reply is posted under security's persona, not another seat's" "security" \
