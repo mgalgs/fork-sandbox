@@ -185,6 +185,8 @@ def parse_doc(doc):
         if "name" not in item:
             fail(f"{path}: needs a 'name'")
         name = text_field(item["name"], f"{path}.name")
+        if len(name) > 40:
+            fail(f"{path}.name: must be at most 40 characters, got {len(name)}")
         if not NAME_RE.fullmatch(name):
             fail(f"{path}.name: '{name}' must match "
                  f"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$")
@@ -263,7 +265,7 @@ def parse_doc(doc):
             ready_tcp_port = positive_int(
                 rw_doc["tcpPort"], f"{path}.readyWhen.tcpPort", 1, 65535)
 
-        cpu = memory = None
+        cpu, memory = MAX_CPU, MAX_MEMORY
         if "resources" in item:
             res_doc = item["resources"]
             if not isinstance(res_doc, dict):
@@ -331,14 +333,11 @@ def render_container(svc):
         lines += [f"{I3}startupProbe:",
                   f"{I4}tcpSocket:",
                   f'{I5}port: {svc["readyTcpPort"]}']
-    if svc["cpu"] or svc["memory"]:
-        lines.append(f"{I3}resources:")
-        for block in ("requests", "limits"):
-            lines.append(f"{I4}{block}:")
-            if svc["cpu"]:
-                lines.append(f'{I5}cpu: "{svc["cpu"]}"')
-            if svc["memory"]:
-                lines.append(f'{I5}memory: "{svc["memory"]}"')
+    lines.append(f"{I3}resources:")
+    for block in ("requests", "limits"):
+        lines.append(f"{I4}{block}:")
+        lines.append(f'{I5}cpu: "{svc["cpu"]}"')
+        lines.append(f'{I5}memory: "{svc["memory"]}"')
     return "\n".join(lines)
 
 

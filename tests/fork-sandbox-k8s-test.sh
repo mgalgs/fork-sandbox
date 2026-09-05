@@ -5431,6 +5431,54 @@ else
     ok "no readyWhen renders no startupProbe"
 fi
 
+# Resources are always rendered, including when the spec omits them or gives
+# only one member: omitted members take the configured per-service cap.
+svc_cap_dir="$(svc_mk_repo 'version: 1
+services:
+  - name: capped
+    image: registry.example/capped:1
+    port: 5432
+  - name: partial
+    image: registry.example/partial:1
+    port: 5433
+    resources:
+      cpu: 250m
+')"
+svc_cap_out="$(newdir)/svc-cap.yaml"; tmpdirs+=("$(dirname "$svc_cap_out")")
+if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-svc-cap --model moonshotai/kimi-k3 \
+    "$svc_cap_dir" "$handoff_file" > "$svc_cap_out" 2>/tmp/fs-k8s-test-svc-cap.err; then
+    ok "omitted and partial resources render successfully"
+else
+    no "omitted and partial resources render successfully" "$(cat /tmp/fs-k8s-test-svc-cap.err)"
+fi
+svc_cap_block="$(awk '/^        - name: capped$/{f=1} f&&/^        - name:/&&!/^        - name: capped$/{exit} f' "$svc_cap_out")"
+svc_partial_block="$(awk '/^        - name: partial$/{f=1} f&&/^        - name:/&&!/^        - name: partial$/{exit} f' "$svc_cap_out")"
+if [[ "$(grep -c '^            requests:$' <<<"$svc_cap_block")" == 1 \
+    && "$(grep -c '^            limits:$' <<<"$svc_cap_block")" == 1 ]]; then
+    ok "no-resources service renders both resource blocks"
+else
+    no "no-resources service renders both resource blocks" "$svc_cap_block"
+fi
+if [[ "$(grep -c '^            requests:$' <<<"$svc_partial_block")" == 1 \
+    && "$(grep -c '^            limits:$' <<<"$svc_partial_block")" == 1 ]]; then
+    ok "partial resources service renders both resource blocks"
+else
+    no "partial resources service renders both resource blocks" "$svc_partial_block"
+fi
+if grep -A12 -F -- '        - name: capped' "$svc_cap_out" | grep -qF 'cpu: "1000m"' \
+    && grep -A12 -F -- '        - name: capped' "$svc_cap_out" | grep -qF 'memory: "1Gi"'; then
+    ok "no-resources service defaults cpu and memory to their caps"
+else
+    no "no-resources service defaults cpu and memory to their caps" "$svc_cap_block"
+fi
+if grep -A12 -F -- '        - name: partial' "$svc_cap_out" | grep -qF 'cpu: "250m"' \
+    && grep -A12 -F -- '        - name: partial' "$svc_cap_out" | grep -qF 'memory: "1Gi"'; then
+    ok "partial resources preserves cpu and defaults memory to its cap"
+else
+    no "partial resources preserves cpu and defaults memory to its cap" "$svc_partial_block"
+fi
+
 printf '\n== per-run services: --services-trust-ref gates the spec like the local hook ==\n'
 svc_trust_dir="$(mktemp -d "$HOME/src/fs-k8s-svc-trust-test.XXXXXX")"; tmpdirs+=("$svc_trust_dir")
 (

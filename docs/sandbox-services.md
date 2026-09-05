@@ -193,8 +193,9 @@ sandboxEnv:
   agent does not race the service coming up. There is no `exec` form: a
   command here would be repo-controlled execution, which is exactly what a
   spec (as opposed to a hook) removes.
-- `services[].resources` — optional, `cpu` and `memory`; capped by the
-  harness — see `docs/kubernetes-runs.md`'s `K8S_SERVICES_MAX` /
+- `services[].resources` — optional, `cpu` and `memory`; omitted members
+  default to the configured cap, and all values are capped by the harness —
+  see `docs/kubernetes-runs.md`'s `K8S_SERVICES_MAX` /
   `K8S_SERVICE_MAX_CPU` / `K8S_SERVICE_MAX_MEMORY`.
 - `sandboxEnv` — optional, a flat string map, written verbatim to
   `.env.sandbox` in the clone — the same filename the local hook path
