@@ -611,6 +611,7 @@ out_k8s="$(PATH="$stub_bin:$PATH" STUB_CAPTURE_DIR="$cap_k8s" STUB_RUN_PREFIX="$
     STUB_K8S_DONE_AFTER="core:3 pi-local:2 security:1" \
     STUB_REPLY_TO="$patch2_id" STUB_REPLY_TO_BRACKETED="$patch_id_bracketed" \
     "$round" widget-frob --project "$project_dir" --checkout otherbranch \
+    --services-trust-ref some-trusted-base \
     --personas "core, pi-local, security" --personas-dir "$work" \
     --reply-to "$patch2_id" --no-summarize --timeout 10 \
     --k8s --endpoint test-endpoint 2>&1)"
@@ -654,6 +655,8 @@ contains "pi-local's outbox dir is named after its own branch" "$pi_outbox_dir" 
 contains "security's outbox dir is named after its own branch" "$sec_outbox_dir" "round-security-"
 
 pi_submit_argv="$(cat "$cap_k8s/pi-local.submit.argv")"
+contains "the pi-local cluster submit carries the services trust ref" \
+    "$pi_submit_argv" "--services-trust-ref some-trusted-base"
 case "$pi_submit_argv" in
     *"--harness pi-local"*) no "pi-local is translated to pi on the cluster path" "$pi_submit_argv" ;;
     *) ok "pi-local is translated to pi on the cluster path" ;;
@@ -680,12 +683,17 @@ esac
 contains "the same seat is still pi-local on the local path" \
     "$(cat "$capture_dir/pi-local.argv")" "--harness pi-local"
 core_submit_argv="$(cat "$cap_k8s/core.submit.argv")"
+contains "the core cluster submit carries the services trust ref" \
+    "$core_submit_argv" "--services-trust-ref some-trusted-base"
 contains "a claude seat is submitted unchanged, with its model" "$core_submit_argv" "--harness claude"
 contains "a claude seat keeps its model" "$core_submit_argv" "--model opus"
 case "$core_submit_argv" in
     *"--endpoint"*) no "a claude seat is not wired to the pi endpoint" "$core_submit_argv" ;;
     *) ok "a claude seat is not wired to the pi endpoint" ;;
 esac
+security_submit_argv="$(cat "$cap_k8s/security.submit.argv")"
+contains "the security cluster submit carries the services trust ref" \
+    "$security_submit_argv" "--services-trust-ref some-trusted-base"
 
 k8s_tree_out="$("$mailbox" tree widget-frob)"
 check "core's cluster reply landed exactly once" "1" \

@@ -221,9 +221,6 @@ if (( k8s )); then
     # carries.
     [[ -n "$endpoint" ]] || { echo "Error: --k8s requires --endpoint <name>: a cluster seat's pi (including a translated pi-local) run is wired to a registered proxy endpoint, and none may be guessed." >&2; exit 1; }
     command -v fork-sandbox-k8s.sh >/dev/null 2>&1 || { echo "Error: fork-sandbox-k8s.sh not found on PATH." >&2; exit 1; }
-    if [[ -n "$services_trust_ref" ]]; then
-        echo "Warning: --services-trust-ref is ignored with --k8s: a cluster submit has no sandbox-services hook to trust." >&2
-    fi
 else
     [[ -z "$endpoint" ]] || { echo "Error: --endpoint <name> is only used with --k8s." >&2; exit 1; }
     command -v fork-sandbox.sh >/dev/null 2>&1 || { echo "Error: fork-sandbox.sh not found on PATH." >&2; exit 1; }
@@ -648,6 +645,7 @@ for persona in "${personas[@]}"; do
             thinking_note=""
         fi
         submit_argv=(submit --branch "$branch" --harness "$harness" --checkout "$checkout_ref")
+        [[ -n "$services_trust_ref" ]] && submit_argv+=(--services-trust-ref "$services_trust_ref")
         [[ -n "$model" ]] && submit_argv+=(--model "$model")
         # pi (and a translated pi-local) seat is wired to the endpoint;
         # a claude seat runs against its own per-run proxy and is not.
