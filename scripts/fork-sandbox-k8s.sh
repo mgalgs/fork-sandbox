@@ -734,6 +734,7 @@ EOF
 # prompt-services.txt's content, one "<name> 127.0.0.1:<port>" per line.
 render_services_section() {
     local services_lines="$1"
+    local sandbox_env_present="$2"
     cat <<EOF
 
 ## Per-run services
@@ -743,11 +744,17 @@ running now, reachable directly on localhost:
 
 $(printf '%s\n' "$services_lines" | sed 's/^/    /')
 
+EOF
+    if (( sandbox_env_present )); then
+        cat <<EOF
 The clone holds an env file, \`.env.sandbox\`, with the connection settings
 from the spec's \`sandboxEnv\`. Use it the way the project expects -- most
 projects read it as \`ENVFILE=.env.sandbox <command>\`, or by sourcing it;
 check the project's own CLAUDE.md.
+EOF
+    fi
 
+    cat <<EOF
 These come up empty. Copy no developer data in. The session migrates and
 loads its own fixtures.
 EOF
@@ -1790,6 +1797,7 @@ cmd_submit() {
     local services_rev="${checkout_sha:-HEAD}"
     local services_containers="" services_volumes=""
     local services_grace_env="" services_prompt_text="" sandbox_env_content=""
+    local sandbox_env_present=0
     if git -C "$origin_repo" cat-file -e \
             "${services_rev}:.agents/sandbox-services/services.yaml" 2>/dev/null; then
         # --services-trust-ref gates this exactly as the local path's hook
@@ -1851,8 +1859,10 @@ cmd_submit() {
                 services_grace_env=$'\n'"      terminationGracePeriodSeconds: 10"
             [[ -f "$services_out/prompt-services.txt" ]] && \
                 services_prompt_text="$(cat "$services_out/prompt-services.txt")"
-            [[ -f "$services_out/sandbox-env" ]] && \
+            if [[ -f "$services_out/sandbox-env" ]]; then
+                sandbox_env_present=1
                 sandbox_env_content="$(cat "$services_out/sandbox-env")"
+            fi
             rm -rf -- "$services_dir"
         fi
     fi
@@ -2111,7 +2121,7 @@ $(indent_block < "$context_extract_sh")
 $({ fs_emit_prompt_preamble "$pod_clone_dir" "$POD_INBOX_DIR" "$harness" gated "$POD_OUTBOX_DIR" pod \
        "$outbox_max_bytes"
    [[ -n "$context_ro" ]] && render_context_section "$POD_CONTEXT_DIR"
-   [[ -n "$services_prompt_text" ]] && render_services_section "$services_prompt_text"
+   [[ -n "$services_prompt_text" ]] && render_services_section "$services_prompt_text" "$sandbox_env_present"
    printf '\n---\n\n'
    cat -- "$handoff_file"; } | indent_block)${review_loop_configmap_keys}${claude_configmap_keys}${services_env_configmap_key}
 ---

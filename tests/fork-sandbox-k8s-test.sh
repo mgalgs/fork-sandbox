@@ -5435,6 +5435,11 @@ if grep -qF '    a 127.0.0.1:5432' "$svc2_out" && grep -qF '    b 127.0.0.1:6379
 else
     no "two-service spec: both services' ports render, both distinct" "$(cat "$svc2_out")"
 fi
+if grep -qF 'The clone holds an env file, \.env.sandbox' "$svc2_out"; then
+    no "service-only spec: prompt does not name a nonexistent env file" "found env-file paragraph"
+else
+    ok "service-only spec: prompt does not name a nonexistent env file"
+fi
 if grep -qF 'startupProbe:' "$svc2_out"; then
     no "no readyWhen renders no startupProbe" "found startupProbe: with no readyWhen given"
 else
