@@ -267,8 +267,9 @@ Two consequences worth knowing before reaching for this:
 
 The clone gets `.env.sandbox` written pod-side, before the agent starts,
 from the spec's `sandboxEnv` — absent `sandboxEnv` writes nothing. The
-When `sandboxEnv` is present, the generated prompt gets a `## Per-run services`
-section naming each service's `127.0.0.1:<port>` and the `.env.sandbox`
-convention, in the same register as the local path's own "Per-run services are
-up" section above, minus the sockets directory and socat relay recipe — a
-sidecar shares the pod's network namespace, so it is reachable directly.
+generated prompt gets a `## Per-run services` section naming each service's
+`127.0.0.1:<port>`, in the same register as the local path's own "Per-run
+services are up" section above, minus the sockets directory and socat relay
+recipe — a sidecar shares the pod's network namespace, so it is reachable
+directly. The section mentions `.env.sandbox` only when `sandboxEnv` was
+given, so the agent is never pointed at a file that does not exist.
