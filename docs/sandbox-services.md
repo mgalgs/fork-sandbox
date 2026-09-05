@@ -179,7 +179,9 @@ sandboxEnv:
 - `services[].name` — required, `^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`, unique,
   and not one of the harness's own pod container names. Becomes the
   sidecar's container name.
-- `services[].image` — required, a fully qualified image ref.
+- `services[].image` — required, an image ref. An unqualified image resolves
+  wherever the cluster's container runtime points (commonly Docker Hub);
+  fully qualify the ref to pin the registry.
 - `services[].port` — required, an integer **1025-65535**. Every service
   container runs non-root (below), and a non-root process cannot bind a port
   under 1024. Must not collide with another service's port.
