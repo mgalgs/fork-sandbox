@@ -234,6 +234,9 @@
 
 set -uo pipefail
 
+# Keep git fixtures independent of the operator's global and system config.
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
+
 repo_dir="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 
 # Every run this suite launches is a fixture, not real work. Mark it so
@@ -341,7 +344,9 @@ refuses "unknown platform name fails with a clear error" \
 
 proj_dir="$(newdir)"; tmpdirs+=("$proj_dir")
 git -C "$proj_dir" init -q
-git -C "$proj_dir" -c user.email=t@example -c user.name=t commit -q --allow-empty -m init
+git -C "$proj_dir" config user.email t@fork-sandbox.invalid
+git -C "$proj_dir" config user.name Tester
+git -C "$proj_dir" commit -q --allow-empty -m init
 
 handoff_file="$(newdir)/handoff.md"; tmpdirs+=("$(dirname "$handoff_file")")
 printf 'Do the thing.\n' > "$handoff_file"
@@ -3676,10 +3681,12 @@ new_rl_fixture() {
     repo="$d/repo"
     mkdir -p "$repo"
     git -C "$repo" init -q
-    git -C "$repo" -c user.email=t@fork-sandbox.invalid -c user.name=t \
+    git -C "$repo" config user.email t@fork-sandbox.invalid
+    git -C "$repo" config user.name Tester
+    git -C "$repo" -c user.email=t@fork-sandbox.invalid -c user.name=Tester \
         commit -q --allow-empty -m init
     base_sha="$(git -C "$repo" rev-parse HEAD)"
-    git -C "$repo" -c user.email=t@fork-sandbox.invalid -c user.name=t \
+    git -C "$repo" -c user.email=t@fork-sandbox.invalid -c user.name=Tester \
         commit -q --allow-empty -m "the coding leg's work"
     printf 'review prompt fixture\n' > "$d/review-prompt.md"
     printf 'fix header fixture\n' > "$d/fix-header.md"
@@ -3763,7 +3770,7 @@ echo \$n > "$counter_file"
 if [ \$((n % 2)) -eq 1 ]; then
     printf 'FINDINGS\n\nsomething is wrong at foo.c:12\n\n## Report\nThe review found one issue.\n' > "\$RL_TEST_VERDICT"
 else
-    git -C "$repo" -c user.email=t@fork-sandbox.invalid -c user.name=t \\
+    git -C "$repo" -c user.email=t@fork-sandbox.invalid -c user.name=Tester \\
         commit -q --allow-empty -m "fix \$n"
 fi
 exit 0
@@ -3805,7 +3812,7 @@ if [ \$n -eq 1 ]; then
 fi
 case "\$prompt" in
     *'foo.c:12 first issue'*'bar.c:34 second issue'*)
-        git -C "$repo" -c user.email=t@fork-sandbox.invalid -c user.name=t \
+        git -C "$repo" -c user.email=t@fork-sandbox.invalid -c user.name=Tester \
             commit -q --allow-empty -m fix
         printf '{"type":"result","subtype":"success","total_cost_usd":0.01,"usage":{"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}\n'
         exit 0 ;;
@@ -4521,8 +4528,6 @@ co_proj="$(mktemp -d "$HOME/src/fs-k8s-checkout-test.XXXXXX")"; tmpdirs+=("$co_p
 # chain then silently skips the second commit. The identity below is set
 # locally, so dropping the global config costs the fixture nothing.
 (
-    # shellcheck disable=SC2030,SC2031  # scoped to this subshell only
-    export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
     cd "$co_proj" \
         && git init -q . \
         && git config user.email t@fork-sandbox.invalid \
@@ -4790,7 +4795,7 @@ symref_clone="$symref_root/clone"
 git init --quiet --bare "$symref_bare"
 mkdir -p "$symref_src"
 git -C "$symref_src" init --quiet
-git -C "$symref_src" -c user.email=t@fork-sandbox.invalid -c user.name=t \
+git -C "$symref_src" -c user.email=t@fork-sandbox.invalid -c user.name=Tester \
     commit -q --allow-empty -m init
 git -C "$symref_src" push --quiet "$symref_bare" HEAD:refs/heads/x
 git --git-dir="$symref_bare" symbolic-ref HEAD refs/heads/x
@@ -5307,8 +5312,10 @@ svc_mk_repo() {
     mkdir -p "$d/.agents/sandbox-services"
     printf '%s' "$content" > "$d/.agents/sandbox-services/services.yaml"
     git -C "$d" init -q
-    git -C "$d" -c user.email=t@example -c user.name=t add -A
-    git -C "$d" -c user.email=t@example -c user.name=t commit -q -m spec
+    git -C "$d" config user.email t@fork-sandbox.invalid
+    git -C "$d" config user.name Tester
+    git -C "$d" add -A
+    git -C "$d" commit -q -m spec
     printf '%s\n' "$d"
 }
 svc_initcontainers_count() {
@@ -5538,8 +5545,6 @@ fi
 printf '\n== per-run services: --services-trust-ref gates the spec like the local hook ==\n'
 svc_trust_dir="$(mktemp -d "$HOME/src/fs-k8s-svc-trust-test.XXXXXX")"; tmpdirs+=("$svc_trust_dir")
 (
-    # shellcheck disable=SC2030,SC2031  # scoped to this subshell only, same as the co_proj fixture above
-    export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
     cd "$svc_trust_dir" \
         && git init -q . \
         && git config user.email t@fork-sandbox.invalid \
