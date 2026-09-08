@@ -82,6 +82,11 @@ fi
 work="$(mktemp -d)"; tmpdirs+=("$work")
 export LKML_MAILBOX_ROOT; LKML_MAILBOX_ROOT="$(mktemp -d)"; tmpdirs+=("$LKML_MAILBOX_ROOT")
 cd "$work" || exit 1
+# Point shipped-default cases at an empty fixture file so a real
+# ~/.config/fork-sandbox/lkml-summarize.env cannot pin either tier.
+default_env_file="$work/lkml-summarize-empty.env"
+: > "$default_env_file"
+export LKML_SUMMARIZE_ENV_FILE="$default_env_file"
 
 # A throwaway repo for --project: the series' tip branch the ledger
 # records.
