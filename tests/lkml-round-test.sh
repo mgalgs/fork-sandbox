@@ -20,6 +20,9 @@
 
 set -uo pipefail
 
+# Keep git fixtures independent of the operator's global and system config.
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
+
 repo_dir="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 round="$repo_dir/scripts/lkml-round.sh"
 mailbox="$repo_dir/scripts/lkml-mailbox.sh"
@@ -60,8 +63,8 @@ stub_bin="$(mktemp -d)"; tmpdirs+=("$stub_bin")
 project_dir="$(mktemp -d)"; tmpdirs+=("$project_dir")
 
 git -C "$project_dir" init -q
-git -C "$project_dir" config user.email test@example.invalid
-git -C "$project_dir" config user.name Test
+git -C "$project_dir" config user.email t@fork-sandbox.invalid
+git -C "$project_dir" config user.name Tester
 printf 'checkout tree\n' > "$project_dir/file"
 git -C "$project_dir" add file
 git -C "$project_dir" commit -qm base

@@ -9,6 +9,9 @@
 
 set -uo pipefail
 
+# Keep git fixtures independent of the operator's global and system config.
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
+
 repo_dir="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 mailbox="$repo_dir/scripts/lkml-mailbox.sh"
 
@@ -524,8 +527,8 @@ printf '\n== init --diffstat / --smoke ==\n'
 
 diffstat_repo="$(mktemp -d)"; tmpdirs+=("$diffstat_repo")
 git -C "$diffstat_repo" init -q
-git -C "$diffstat_repo" config user.email test@example.com
-git -C "$diffstat_repo" config user.name "Test"
+git -C "$diffstat_repo" config user.email t@fork-sandbox.invalid
+git -C "$diffstat_repo" config user.name Tester
 printf 'base\n' > "$diffstat_repo/file.txt"
 git -C "$diffstat_repo" add file.txt
 git -C "$diffstat_repo" commit -q -m "base"

@@ -22,6 +22,9 @@
 
 set -uo pipefail
 
+# Keep git fixtures independent of the operator's global and system config.
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
+
 repo_dir="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 series_script="$repo_dir/scripts/lkml-series.sh"
 
@@ -55,8 +58,8 @@ fi
 # A real, throwaway repo standing in for the operator's actual project.
 real_repo="$(mktemp -d)"; tmpdirs+=("$real_repo")
 git -C "$real_repo" init -q
-git -C "$real_repo" config user.email test@example.com
-git -C "$real_repo" config user.name "Test"
+git -C "$real_repo" config user.email t@fork-sandbox.invalid
+git -C "$real_repo" config user.name Tester
 printf 'trunk\n' > "$real_repo/base.txt"
 git -C "$real_repo" add base.txt
 git -C "$real_repo" commit -q -m "repo: base"

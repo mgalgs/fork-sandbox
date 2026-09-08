@@ -20,6 +20,9 @@
 
 set -uo pipefail
 
+# Keep git fixtures independent of the operator's global and system config.
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
+
 repo_dir="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 forklift="$repo_dir/scripts/lkml-forklift.sh"
 mailbox="$repo_dir/scripts/lkml-mailbox.sh"
@@ -71,8 +74,8 @@ export LKML_MAILBOX_ROOT; LKML_MAILBOX_ROOT="$(mktemp -d)"; tmpdirs+=("$LKML_MAI
 # --- happy path: --onto moves on a file the version never touched -------
 real_repo="$(mktemp -d)"; tmpdirs+=("$real_repo")
 git -C "$real_repo" init -q
-git -C "$real_repo" config user.email test@example.com
-git -C "$real_repo" config user.name "Test"
+git -C "$real_repo" config user.email t@fork-sandbox.invalid
+git -C "$real_repo" config user.name Tester
 printf 'l1\nl2\nl3\n' > "$real_repo/a.txt"
 printf 'unrelated\n' > "$real_repo/b.txt"
 git -C "$real_repo" add a.txt b.txt
@@ -111,8 +114,8 @@ contains "reports the fold" "$out" "now at $onto_after"
 # --- divergence guard: main and the version touch the SAME line ---------
 real_repo2="$(mktemp -d)"; tmpdirs+=("$real_repo2")
 git -C "$real_repo2" init -q
-git -C "$real_repo2" config user.email test@example.com
-git -C "$real_repo2" config user.name "Test"
+git -C "$real_repo2" config user.email t@fork-sandbox.invalid
+git -C "$real_repo2" config user.name Tester
 printf 'l1\nl2\nl3\n' > "$real_repo2/a.txt"
 git -C "$real_repo2" add a.txt
 git -C "$real_repo2" commit -q -m "repo: base"

@@ -29,6 +29,9 @@
 
 set -uo pipefail
 
+# Keep git fixtures independent of the operator's global and system config.
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
+
 repo_dir="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 revise="$repo_dir/scripts/lkml-revise.sh"
 mailbox="$repo_dir/scripts/lkml-mailbox.sh"
@@ -67,8 +70,8 @@ fi
 # many patches v2 contains -- see the "whole series" assertion below.
 real_repo="$(mktemp -d)"; tmpdirs+=("$real_repo")
 git -C "$real_repo" init -q
-git -C "$real_repo" config user.email test@example.com
-git -C "$real_repo" config user.name "Test"
+git -C "$real_repo" config user.email t@fork-sandbox.invalid
+git -C "$real_repo" config user.name Tester
 printf 'this is the trunk the series branches from\n' > "$real_repo/base.txt"
 git -C "$real_repo" add base.txt
 git -C "$real_repo" commit -q -m "repo: pre-series base"
