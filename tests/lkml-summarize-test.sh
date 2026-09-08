@@ -180,9 +180,31 @@ case "$tier" in
         fi
         ;;
 esac
-jq -n --arg clone_dir "$run_dir/clone" --arg branch "$branch" \
-    '{clone_dir: $clone_dir, branch: $branch, commits: 0, fetched: true}' \
-    > "$run_dir/summary.json"
+jq_summary() {
+    jq -n --arg clone_dir "$run_dir/clone" --arg branch "$branch" \
+        '{clone_dir: $clone_dir, branch: $branch, commits: 0, fetched: true}' \
+        > "$run_dir/summary.json"
+}
+if [[ -n "${STUB_DELAY_SECONDS:-}" ]]; then
+    python3 - "$run_dir/summary.json" "$run_dir/clone" "$branch" "$STUB_DELAY_SECONDS" <<'PY' &
+import os
+import sys
+import time
+
+if os.fork():
+    os._exit(0)
+devnull = os.open(os.devnull, os.O_RDWR)
+os.dup2(devnull, 0)
+os.dup2(devnull, 1)
+os.dup2(devnull, 2)
+time.sleep(float(sys.argv[4]))
+with open(sys.argv[1], "w", encoding="utf-8") as f:
+    f.write('{"clone_dir":"%s","branch":"%s","commits":0,"fetched":true}\n' % (sys.argv[2], sys.argv[3]))
+PY
+    disown || true
+else
+    jq_summary
+fi
 echo "fork-sandbox: launched in a stub"
 echo "  run dir:  $run_dir"
 STUB
@@ -381,6 +403,16 @@ contains "the high handoff names the outbox the way the preamble does" \
     "$high_handoff" "results.md\` at the root of the artifact outbox"
 contains "the high handoff fixes the Summary word budget" \
     "$high_handoff" "hard-capped at 200"
+
+printf '\n== wait-loop heartbeat ==\n'
+capH="$(mktemp -d)"; tmpdirs+=("$capH")
+heartbeat_rc=0
+PATH="$stub_bin:$PATH" STUB_CAPTURE_DIR="$capH" STUB_RUN_PREFIX="$run_prefix_dir" \
+    STUB_JSON="$DEFAULT_JSON" STUB_MD="$DEFAULT_MD" STUB_DELAY_SECONDS=3 \
+    LKML_SUMMARIZE_HEARTBEAT_SECS=1 \
+    "$summarize" widget-frob --project "$project_dir" --timeout 30 >/dev/null 2>"$capH/err" || heartbeat_rc=$?
+if (( heartbeat_rc == 0 )); then ok "a delayed run exits 0"; else no "a delayed run exits 0" "exit $heartbeat_rc: $(cat "$capH/err")"; fi
+contains "a delayed run emits a heartbeat" "$(cat "$capH/err")" "still running"
 
 printf '\n== version selection: latest default and --version pin ==\n'
 printf 'Add the second frobnicator\n\nV2 body.\n' > cover3.txt

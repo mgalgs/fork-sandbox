@@ -102,6 +102,7 @@ series_mode=""
 high_spec=""
 low_spec=""
 timeout=3600
+heartbeat_secs="${LKML_SUMMARIZE_HEARTBEAT_SECS:-60}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -128,6 +129,10 @@ if [[ -n "$series_mode" ]]; then
     fi
 fi
 [[ "$timeout" =~ ^[0-9]+$ ]] || { echo "Error: --timeout must be a number of seconds." >&2; exit 1; }
+[[ "$heartbeat_secs" =~ ^[1-9][0-9]*$ ]] || {
+    echo "Error: LKML_SUMMARIZE_HEARTBEAT_SECS must be a positive number of seconds." >&2
+    exit 1
+}
 if [[ -n "$version" ]]; then
     [[ "$version" =~ ^[0-9]+$ ]] || { echo "Error: --version must be a plain integer." >&2; exit 1; }
 fi
@@ -374,7 +379,7 @@ delete_branch() {
 # signal), and leaves the run dir in $tier_run_dir.
 launch_tier() {
     local tier="$1" spec="$2" handoff_file="$3"
-    local branch task_meta launch_out rc run_dir waited
+    local branch task_meta launch_out rc run_dir waited poll_secs
     branch="lkml/${series}-v${version}-summarize-${tier}-$(date +%s)"
     task_meta="$(jq -nc --arg series "$series" --arg tier "summarize-$tier" \
         '{kind:"summarize", tags:["lkml", $series, $tier]}')"
@@ -397,14 +402,21 @@ launch_tier() {
 
     echo "fork-sandbox lkml-summarize: waiting up to ${timeout}s for the $tier tier's run to finish..." >&2
     waited=0
+    poll_secs=10
+    if (( heartbeat_secs < poll_secs )); then
+        poll_secs=$heartbeat_secs
+    fi
     while [[ ! -f "$run_dir/summary.json" ]]; do
         if (( waited >= timeout )); then
             echo "Error: timed out after ${timeout}s waiting for the $tier tier's run to finish." >&2
             delete_branch "$branch"
             return 1
         fi
-        sleep 10
-        waited=$(( waited + 10 ))
+        sleep "$poll_secs"
+        waited=$(( waited + poll_secs ))
+        if (( waited % heartbeat_secs == 0 )); then
+            echo "fork-sandbox lkml-summarize: $tier tier still running ($(( waited / 60 ))m elapsed, timeout $(( timeout / 60 ))m)..." >&2
+        fi
     done
     delete_branch "$branch"
     tier_run_dir="$run_dir"
