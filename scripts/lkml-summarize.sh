@@ -44,6 +44,8 @@
 #            lacks its results-v<N>.json.
 # LKML_SUMMARIZE_HEARTBEAT_SECS controls the wait-loop progress heartbeat
 # (default 60); it is read from the environment for tests and odd terminals.
+# LKML_SUMMARIZE_MAX_INPUT_BYTES caps each tier handoff (default 409600);
+# it is site config read from lkml-summarize.env, with the environment taking precedence.
 #
 # Input is `lkml-render.py --text <series-dir>` output ONLY -- never
 # the HTML view. The render is carried inline in each tier's handoff
@@ -159,6 +161,17 @@ lkml_summarize_env_value() {
 }
 
 env_file="${LKML_SUMMARIZE_ENV_FILE:-$HOME/.config/fork-sandbox/lkml-summarize.env}"
+
+if [[ -v LKML_SUMMARIZE_MAX_INPUT_BYTES ]]; then
+    max_input_bytes="$LKML_SUMMARIZE_MAX_INPUT_BYTES"
+else
+    max_input_bytes="$(lkml_summarize_env_value "$env_file" LKML_SUMMARIZE_MAX_INPUT_BYTES || true)"
+    [[ -n "$max_input_bytes" ]] || max_input_bytes=409600
+fi
+if [[ ! "$max_input_bytes" =~ ^[1-9][0-9]*$ ]]; then
+    echo "fork-sandbox lkml-summarize: Error: LKML_SUMMARIZE_MAX_INPUT_BYTES must be a positive number of bytes (got '$max_input_bytes')." >&2
+    exit 1
+fi
 
 # Flag beats env beats shipped default. The value is either a bare
 # harness or a combined harness/model, and passes through to
@@ -370,6 +383,15 @@ delete_branch() {
         echo "fork-sandbox lkml-summarize: deleted throwaway branch $branch." >&2
     else
         echo "Warning: throwaway branch '$branch' is still in $project and could not be deleted; delete it by hand." >&2
+    fi
+}
+
+check_handoff_size() {
+    local tier="$1" handoff_file="$2" handoff_bytes
+    handoff_bytes="$(wc -c < "$handoff_file" | tr -d '[:space:]')"
+    if (( handoff_bytes > max_input_bytes )); then
+        echo "fork-sandbox lkml-summarize: Error: the $tier tier's handoff is $handoff_bytes bytes; the cap is $max_input_bytes (LKML_SUMMARIZE_MAX_INPUT_BYTES in lkml-summarize.env). The thread no longer fits a tier's context window; see the hardening backlog's size-scaling item." >&2
+        return 1
     fi
 }
 
@@ -644,6 +666,10 @@ if [[ -n "$series_mode" ]]; then
         exit 1
     }
     build_series_handoff > "$series_handoff_file"
+    if ! check_handoff_size series "$series_handoff_file"; then
+        rm -f -- "$series_handoff_file"
+        exit 1
+    fi
 
     if ! launch_tier series "$high_spec" "$series_handoff_file"; then
         rm -f -- "$series_handoff_file"
@@ -684,6 +710,10 @@ low_handoff_file="$(mktemp /var/tmp/claude-scratch/lkml-summarize-low-XXXXXX.md)
     exit 1
 }
 build_low_handoff > "$low_handoff_file"
+if ! check_handoff_size low "$low_handoff_file"; then
+    rm -f -- "$low_handoff_file"
+    exit 1
+fi
 
 if ! launch_tier low "$low_spec" "$low_handoff_file"; then
     rm -f -- "$low_handoff_file"
@@ -717,6 +747,10 @@ high_handoff_file="$(mktemp /var/tmp/claude-scratch/lkml-summarize-high-XXXXXX.m
     exit 1
 }
 build_high_handoff > "$high_handoff_file"
+if ! check_handoff_size high "$high_handoff_file"; then
+    rm -f -- "$high_handoff_file"
+    exit 1
+fi
 
 if ! launch_tier high "$high_spec" "$high_handoff_file"; then
     rm -f -- "$high_handoff_file"

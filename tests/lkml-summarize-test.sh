@@ -404,6 +404,33 @@ contains "the high handoff names the outbox the way the preamble does" \
 contains "the high handoff fixes the Summary word budget" \
     "$high_handoff" "hard-capped at 200"
 
+printf '\n== handoff input-size cap ==\n'
+capC="$(mktemp -d)"; tmpdirs+=("$capC")
+small_cap_env="$work/lkml-summarize-small-cap.env"
+printf 'LKML_SUMMARIZE_MAX_INPUT_BYTES=1024\n' > "$small_cap_env"
+cap_rc=0
+PATH="$stub_bin:$PATH" STUB_CAPTURE_DIR="$capC" STUB_RUN_PREFIX="$run_prefix_dir" \
+    STUB_JSON="$DEFAULT_JSON" STUB_MD="$DEFAULT_MD" LKML_SUMMARIZE_ENV_FILE="$small_cap_env" \
+    "$summarize" widget-frob --project "$project_dir" >/dev/null 2>"$capC/err" || cap_rc=$?
+if (( cap_rc != 0 )); then ok "an oversized low handoff exits non-zero"; else no "an oversized low handoff exits non-zero"; fi
+cap_error="$(cat "$capC/err")"
+contains "the cap error names the measured handoff size" "$cap_error" "bytes"
+contains "the cap error names the configured cap" "$cap_error" "cap is 1024"
+contains "the cap error names the config key" "$cap_error" "LKML_SUMMARIZE_MAX_INPUT_BYTES"
+if [[ -e "$capC/order" ]]; then no "an oversized handoff launches no tier" "$(cat "$capC/order")"; else ok "an oversized handoff launches no tier"; fi
+
+invalid_cap_env="$work/lkml-summarize-invalid-cap.env"
+printf 'LKML_SUMMARIZE_MAX_INPUT_BYTES=abc\n' > "$invalid_cap_env"
+LKML_SUMMARIZE_ENV_FILE="$invalid_cap_env" run "non-numeric input cap" 1 widget-frob --project "$project_dir"
+contains "the invalid cap is a config error" "$(cat "$out_file")" "must be a positive number"
+override_cap_env="$work/lkml-summarize-override-cap.env"
+printf 'LKML_SUMMARIZE_MAX_INPUT_BYTES=1024\n' > "$override_cap_env"
+override_rc=0
+PATH="$stub_bin:$PATH" STUB_CAPTURE_DIR="$capC" STUB_RUN_PREFIX="$run_prefix_dir" \
+    STUB_JSON="$DEFAULT_JSON" STUB_MD="$DEFAULT_MD" LKML_SUMMARIZE_ENV_FILE="$override_cap_env" \
+    LKML_SUMMARIZE_MAX_INPUT_BYTES=10000000 "$summarize" widget-frob --project "$project_dir" >/dev/null 2>"$capC/override.err" || override_rc=$?
+if (( override_rc == 0 )); then ok "the environment cap overrides the env-file cap"; else no "the environment cap overrides the env-file cap" "$(cat "$capC/override.err")"; fi
+
 printf '\n== wait-loop heartbeat ==\n'
 capH="$(mktemp -d)"; tmpdirs+=("$capH")
 heartbeat_rc=0
@@ -685,6 +712,15 @@ then
 else
     no "the series handoff orders the inputs: intermediates, tallies, cover"
 fi
+
+capSeries="$(mktemp -d)"; tmpdirs+=("$capSeries")
+series_cap_rc=0
+PATH="$stub_bin:$PATH" STUB_CAPTURE_DIR="$capSeries" STUB_RUN_PREFIX="$run_prefix_dir" \
+    STUB_JSON="$DEFAULT_JSON" STUB_MD="$SERIES_MD" LKML_SUMMARIZE_ENV_FILE="$small_cap_env" \
+    "$summarize" widget-frob --project "$project_dir" --series >/dev/null 2>"$capSeries/err" || series_cap_rc=$?
+if (( series_cap_rc != 0 )); then ok "an oversized series handoff exits non-zero"; else no "an oversized series handoff exits non-zero"; fi
+contains "the series cap error names the measured size and cap" "$(cat "$capSeries/err")" "cap is 1024"
+if [[ -e "$capSeries/order" ]]; then no "an oversized series handoff launches no tier" "$(cat "$capSeries/order")"; else ok "an oversized series handoff launches no tier"; fi
 
 # The version ledger is append-only, so a version can appear in it
 # twice; --series must feed the handoff that version ONCE, not pay
