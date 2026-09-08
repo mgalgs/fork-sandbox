@@ -401,7 +401,7 @@ check_handoff_size() {
 # signal), and leaves the run dir in $tier_run_dir.
 launch_tier() {
     local tier="$1" spec="$2" handoff_file="$3"
-    local branch task_meta launch_out rc run_dir waited poll_secs
+    local branch task_meta launch_out rc run_dir waited poll_secs next_heartbeat
     branch="lkml/${series}-v${version}-summarize-${tier}-$(date +%s)"
     task_meta="$(jq -nc --arg series "$series" --arg tier "summarize-$tier" \
         '{kind:"summarize", tags:["lkml", $series, $tier]}')"
@@ -428,6 +428,7 @@ launch_tier() {
     if (( heartbeat_secs < poll_secs )); then
         poll_secs=$heartbeat_secs
     fi
+    next_heartbeat=$heartbeat_secs
     while [[ ! -f "$run_dir/summary.json" ]]; do
         if (( waited >= timeout )); then
             echo "Error: timed out after ${timeout}s waiting for the $tier tier's run to finish." >&2
@@ -436,8 +437,12 @@ launch_tier() {
         fi
         sleep "$poll_secs"
         waited=$(( waited + poll_secs ))
-        if (( waited % heartbeat_secs == 0 )); then
+        if [[ -f "$run_dir/summary.json" ]]; then
+            break
+        fi
+        if (( waited >= next_heartbeat )); then
             echo "fork-sandbox lkml-summarize: $tier tier still running ($(( waited / 60 ))m elapsed, timeout $(( timeout / 60 ))m)..." >&2
+            next_heartbeat=$(( next_heartbeat + heartbeat_secs ))
         fi
     done
     delete_branch "$branch"

@@ -441,6 +441,28 @@ PATH="$stub_bin:$PATH" STUB_CAPTURE_DIR="$capH" STUB_RUN_PREFIX="$run_prefix_dir
 if (( heartbeat_rc == 0 )); then ok "a delayed run exits 0"; else no "a delayed run exits 0" "exit $heartbeat_rc: $(cat "$capH/err")"; fi
 contains "a delayed run emits a heartbeat" "$(cat "$capH/err")" "still running"
 
+nondiv_capH="$(mktemp -d)"; tmpdirs+=("$nondiv_capH")
+nondiv_rc=0
+PATH="$stub_bin:$PATH" STUB_CAPTURE_DIR="$nondiv_capH" STUB_RUN_PREFIX="$run_prefix_dir" \
+    STUB_JSON="$DEFAULT_JSON" STUB_MD="$DEFAULT_MD" STUB_DELAY_SECONDS=4 \
+    LKML_SUMMARIZE_HEARTBEAT_SECS=3 \
+    "$summarize" widget-frob --project "$project_dir" --timeout 30 >/dev/null 2>"$nondiv_capH/err" || nondiv_rc=$?
+if (( nondiv_rc == 0 )); then ok "a non-divisible heartbeat run exits 0"; else no "a non-divisible heartbeat run exits 0" "exit $nondiv_rc: $(cat "$nondiv_capH/err")"; fi
+contains "a non-divisible heartbeat emits progress" "$(cat "$nondiv_capH/err")" "still running"
+
+completion_capH="$(mktemp -d)"; tmpdirs+=("$completion_capH")
+completion_rc=0
+PATH="$stub_bin:$PATH" STUB_CAPTURE_DIR="$completion_capH" STUB_RUN_PREFIX="$run_prefix_dir" \
+    STUB_JSON="$DEFAULT_JSON" STUB_MD="$DEFAULT_MD" STUB_DELAY_SECONDS=1 \
+    LKML_SUMMARIZE_HEARTBEAT_SECS=2 \
+    "$summarize" widget-frob --project "$project_dir" --timeout 30 >/dev/null 2>"$completion_capH/err" || completion_rc=$?
+if (( completion_rc == 0 )); then ok "completion during a poll exits 0"; else no "completion during a poll exits 0" "exit $completion_rc: $(cat "$completion_capH/err")"; fi
+if [[ "$(cat "$completion_capH/err")" == *"still running"* ]]; then
+    no "completion during a poll emits no false heartbeat" "$(cat "$completion_capH/err")"
+else
+    ok "completion during a poll emits no false heartbeat"
+fi
+
 printf '\n== version selection: latest default and --version pin ==\n'
 printf 'Add the second frobnicator\n\nV2 body.\n' > cover3.txt
 mkdir patches3
