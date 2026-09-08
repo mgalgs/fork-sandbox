@@ -520,6 +520,16 @@ What it cannot do yet, and why saying so matters: a flag this path cannot honor 
 - **`--pi-args` is refused by `fork-sandbox.sh --k8s` by name, but the capability exists**: `fork-sandbox-k8s.sh submit` and `run` both accept it and carry the extra arguments into the pod's pi invocation — use `fork-sandbox-k8s.sh` directly for it. **`--prompts-dir` is refused as not-yet-built**, not as permanently unsupported — it names a real capability the cluster path has not been wired up to carry yet.
 - **`--context-ro <dir>` IS built**: `--k8s` forwards it into the pod — `dir` must be under `/var/tmp/claude-scratch/forks/`, contain no symlinks or hard links, and is capped at 256 MiB. Unlike a local run's real `--bind-ro`, the pod has no way to bind a subdirectory of its emptyDir read-only: read-only there is by convention (the agent is told not to write there), not enforced by the filesystem.
 
+### Review-shaped tasks on the cluster
+
+`--review-only` is refused with `--k8s`, but that refuses a flag, not the task: a cluster review is an ordinary run whose handoff is a review brief. The recipe, proven end to end:
+
+1. **Gather the evidence on the host**, where the credentials are — the pull request description, comments and diff via the forge CLI, CI logs, whatever the review needs. Stage it in a directory under `/var/tmp/claude-scratch/forks/`. The pod holds no forge credential and has no route to one, so anything not gathered here does not exist for the reviewer.
+2. **Launch with `--checkout <ref-under-review>` and `--context-ro <that dir>`**, so the clone sits on the code being reviewed and the evidence rides along (the pod's handoff gains a "Gathered context" section naming where it landed).
+3. **Route the report through the artifact outbox**: tell the session in the handoff to write its review to a file in the outbox (the preamble names the directory), to repeat it as its final message, and **not to commit** — an uncommitted file in the clone dies with the pod, and a review branch with no commits leaves the origin repo untouched. The report comes home at the `--outbox-dir` path the run prints (default `/var/tmp/claude-scratch/forks/k8s-<safe-branch>/outbox/`).
+
+One method note: the pod stages the `code-review-portable` skill only for `--review-loop` legs, so a review-as-the-coding-leg run that wants that method must copy the skill file into the context directory and point the handoff at it — or simply spell the review criteria out in the handoff.
+
 ## What the calling session must not do
 
 - **Do not run git inside the clone.** Not `git log`, not `git status`, not
