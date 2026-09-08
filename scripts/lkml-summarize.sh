@@ -42,6 +42,8 @@
 #            (there is no extraction tier; --high still selects the
 #            synthesis model), and refuses when any recorded version
 #            lacks its results-v<N>.json.
+# LKML_SUMMARIZE_HEARTBEAT_SECS controls the wait-loop progress heartbeat
+# (default 60); it is read from the environment for tests and odd terminals.
 #
 # Input is `lkml-render.py --text <series-dir>` output ONLY -- never
 # the HTML view. The render is carried inline in each tier's handoff
@@ -332,6 +334,8 @@ if [[ -n "$series_mode" ]]; then
 else
     echo "fork-sandbox lkml-summarize: summarizing $series v$version (low: $low_spec, high: $high_spec)" >&2
 fi
+
+echo "fork-sandbox lkml-summarize: assembling summary input (the whole thread render)..." >&2
 
 # Per-version mode only: in --series mode every recorded version's tally
 # was already extracted and checked in the loop above, and the series

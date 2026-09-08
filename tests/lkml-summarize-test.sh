@@ -313,6 +313,8 @@ stdout="$(PATH="$stub_bin:$PATH" STUB_CAPTURE_DIR="$cap" STUB_RUN_PREFIX="$run_p
 rc=$?
 stderr="$(cat "$cap/err")"
 if (( rc == 0 )); then ok "the full pipeline exits 0 against the stub"; else no "the full pipeline exits 0 against the stub" "exit $rc: $stderr"; fi
+contains "the per-version run announces handoff assembly" "$stderr" \
+    "assembling summary input (the whole thread render)"
 
 check "the two written paths are the last stdout lines" \
     "$series_dir/results-v1.json
@@ -567,6 +569,8 @@ stdout="$(PATH="$stub_bin:$PATH" STUB_CAPTURE_DIR="$capS" STUB_RUN_PREFIX="$run_
     "$summarize" widget-frob --project "$project_dir" --series 2>"$capS/err")"
 rc=$?
 if (( rc == 0 )); then ok "--series: exits 0 against the stub"; else no "--series: exits 0 against the stub" "exit $rc: $(cat "$capS/err")"; fi
+contains "the series run announces handoff assembly" "$(cat "$capS/err")" \
+    "assembling summary input (the whole thread render)"
 check "--series stdout is exactly the written path (no json companion)" \
     "$series_dir/results-series.md" "$(tr -d '\r' <<< "$stdout")"
 if [[ -e "$series_dir/results-series.json" ]]; then
