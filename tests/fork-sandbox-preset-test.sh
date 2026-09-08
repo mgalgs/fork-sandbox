@@ -1103,6 +1103,15 @@ if [[ -n "${rd_c:-}" ]]; then
         no "a plain run.env records none of the preset-only knobs" \
             "$(grep -E '^(fix_|maintainer_fix_|code_repeat)' "$rd_c/run.env")"
     fi
+    # preset_stage_cleanup is a launcher-only function (the launcher's own
+    # EXIT trap); a run.sh that calls it hits "command not found" in every
+    # teardown, since the generated runner never defines it.
+    if ! grep -q 'preset_stage_cleanup' "$rd_c/run.sh"; then
+        ok "run.sh never references the launcher-only preset_stage_cleanup"
+    else
+        no "run.sh never references the launcher-only preset_stage_cleanup" \
+            "$(grep -n 'preset_stage_cleanup' "$rd_c/run.sh")"
+    fi
 fi
 
 printf '\n== sandbox-run-log.py: the preset definition in the archive ==\n'

@@ -4842,9 +4842,6 @@ printf '\nHeadless. Nothing here needs a keypress; the session exits on its own.
 run_cleanup() {
     [[ -n "${_cleanup_done:-}" ]] && return 0
     _cleanup_done=1
-    # The staged preset bytes, when a --preset launch never reached the mv
-    # into the run dir; after that move this is a no-op.
-    preset_stage_cleanup
     if [[ "${#codex_auth_dirs[@]}" -gt 0 ]]; then
         for codex_auth_dir in "${codex_auth_dirs[@]}"; do
             rm -rf "$codex_auth_dir"
