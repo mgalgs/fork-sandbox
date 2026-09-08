@@ -112,10 +112,14 @@ real checkout into the clone at the same path:
 .venv
 ```
 
-A relocated venv runs fine (`sys.prefix` follows the binary). The one
-casualty is console-script shebangs, which hardcode your real checkout's
-path: invoke tools as `.venv/bin/python -m pytest`, never `.venv/bin/pytest`.
-Say so in the project's `CLAUDE.md`.
+A relocated venv runs fine (`sys.prefix` follows the binary), and so do its
+console scripts. `pip` bakes your real checkout's path into every shebang, so
+`.venv/bin/pytest` starts `#!/home/you/src/proj/.venv/bin/python` and cannot be
+rewritten in a read-only mount. Each entry is therefore bound **twice** — at
+the clone path, and at the origin's own absolute path — so that literal shebang
+resolves. `.venv/bin/pytest` and `.venv/bin/python -m pytest` both work; no
+project needs a `CLAUDE.md` note about it. The second mount is the same bytes,
+also read-only, behind exactly the same escape checks as the first.
 
 The venv's **interpreter** must also be reachable inside the sandbox. A venv
 built on the system python needs nothing (`/usr` is mounted), but `uv` and

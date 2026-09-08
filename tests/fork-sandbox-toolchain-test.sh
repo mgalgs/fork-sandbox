@@ -253,6 +253,56 @@ check "image mode binds no interpreter" "0" "${#FS_PROVISION_RO_FLAGS[@]}"
 contains "image mode says why" "userland comes from an" "$err"
 
 echo ""
+echo "== fs_provision_ro =="
+
+# A provisioned entry is bound TWICE: at the clone path, where tools look for
+# it, and at the origin's own absolute path, because pip bakes the origin
+# interpreter into every console script's shebang and a relocated venv cannot
+# rewrite them. Without the second mount `.venv/bin/black` dies with "bad
+# interpreter" while `.venv/bin/python -m black` works -- a difference no
+# project should have to teach its agents about.
+FS_BACKEND_TOOLCHAIN=host
+pr_origin="$scratch/pr-origin"
+pr_clone="$scratch/pr-clone"
+mkdir -p "$pr_origin/.agents/sandbox-services" "$pr_origin/.venv/bin" \
+         "$pr_clone/.agents/sandbox-services"
+# No pyvenv.cfg: the interpreter bind is fs_venv_interpreter_bind's business and
+# has its own cases above. Leaving it out keeps these assertions to one subject.
+printf '#!%s/.venv/bin/python\n' "$pr_origin" > "$pr_origin/.venv/bin/black"
+printf '.venv\n' > "$pr_origin/.agents/sandbox-services/provision-ro"
+cp "$pr_origin/.agents/sandbox-services/provision-ro" \
+   "$pr_clone/.agents/sandbox-services/provision-ro"
+
+fs_provision_ro "$pr_origin" "$pr_clone"
+check "one entry yields two binds" "6" "${#FS_PROVISION_RO_FLAGS[@]}"
+contains "the clone path is bound" "$pr_origin/.venv $pr_clone/.venv" \
+    "${FS_PROVISION_RO_FLAGS[*]}"
+contains "the origin path is bound too" "$pr_origin/.venv $pr_origin/.venv" \
+    "${FS_PROVISION_RO_FLAGS[*]}"
+
+# The origin-path mount is the same content under a second name, so it must sit
+# BEHIND every check the clone-path mount sits behind. An entry refused for the
+# clone but granted at its own path would undo the guard entirely.
+mkdir -p "$scratch/pr-outside"
+printf 'a secret the sandbox must not read\n' > "$scratch/pr-outside/token"
+ln -sfn "$scratch/pr-outside" "$pr_origin/escape"
+printf '.venv\nescape\n/etc\n' > "$pr_clone/.agents/sandbox-services/provision-ro"
+fs_provision_ro "$pr_origin" "$pr_clone" 2>"$scratch/pr-err.log"
+pr_err="$(cat "$scratch/pr-err.log")"
+contains "an escaping symlink is still refused" "resolves outside the repo" "$pr_err"
+contains "an absolute entry is still refused" "not a repo-relative path" "$pr_err"
+lacks "a refused symlink gets no origin-path bind" "$scratch/pr-outside" \
+    "${FS_PROVISION_RO_FLAGS[*]}"
+lacks "a refused absolute entry gets no origin-path bind" " /etc " \
+    "${FS_PROVISION_RO_FLAGS[*]} "
+check "only the surviving entry is bound" "6" "${#FS_PROVISION_RO_FLAGS[@]}"
+
+# A caller whose clone IS the origin needs no second mount, and emitting one
+# would ask the backend to bind a path over itself.
+fs_provision_ro "$pr_origin" "$pr_origin"
+check "origin == clone yields a single bind" "3" "${#FS_PROVISION_RO_FLAGS[@]}"
+
+echo ""
 echo "== fs_read_claude_credential =="
 
 # The Keychain is NOT addressed through $HOME, so overriding HOME does not

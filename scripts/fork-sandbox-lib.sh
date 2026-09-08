@@ -414,8 +414,17 @@ fs_node_provision() {
 # relative path, so tools find it where they expect it. Read-only because the
 # sandbox must never write back into the user's real checkout. A relocated
 # virtualenv still runs — .venv/bin/python is a symlink and sys.prefix follows
-# the binary's own path — the one casualty being console-script shebangs, which
-# hardcode the origin path.
+# the binary's own path.
+#
+# Each entry is bound a SECOND time, at the origin's own absolute path, because
+# a relocated venv's console scripts are not relocatable: pip writes the origin
+# interpreter into every shebang, so .venv/bin/black starts
+# '#!/home/you/src/proj/.venv/bin/python' and dies with "bad interpreter" in a
+# sandbox that only has the clone's copy. The second mount makes that literal
+# path resolve, so `.venv/bin/<tool>` works without every project having to
+# teach its agents to say `.venv/bin/python -m <tool>` instead. It costs no new
+# exposure: same bytes, same read-only flag, a second mountpoint on content the
+# sandbox can already read at the clone path.
 #
 # This is a security boundary, not a convenience. The provision-ro file is
 # committed content, and for a pull-request review it can be attacker-authored.
@@ -502,6 +511,12 @@ fs_provision_ro() {
         # Pass the resolved source, so claude-sandboxed binds exactly what was
         # checked and not a symlink that could differ.
         FS_PROVISION_RO_FLAGS+=(--bind-ro-at "$src_real" "$dest_real")
+        # The same content again at its origin path, so hardcoded console-script
+        # shebangs resolve. Guarded on the two paths differing: a caller whose
+        # clone IS the origin would otherwise emit a self-bind.
+        if [[ "$src_real" != "$dest_real" ]]; then
+            FS_PROVISION_RO_FLAGS+=(--bind-ro-at "$src_real" "$src_real")
+        fi
         fs_venv_interpreter_bind "$src_real"
     done < "$list"
     return 0

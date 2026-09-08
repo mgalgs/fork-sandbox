@@ -693,9 +693,9 @@ The contract, all under `.agents/sandbox-services/`:
     here: the copy the wrapper runs has no clone.
 - **`provision-ro`** — optional. A newline list of untracked, repo-relative
   paths (a `.venv`, say) to bind read-only from the origin into the clone at
-  the same path. A relocated venv still runs; only console-script shebangs,
-  which hardcode the origin path, break — invoke tools as
-  `.venv/bin/python -m <tool>`, never as `.venv/bin/<tool>`.
+  the same path, and a second time at the origin's own absolute path so that
+  console-script shebangs — which hardcode it — still resolve. A relocated
+  venv runs, and so does `.venv/bin/<tool>`.
 
 **Permissions.** The sockets directory must be writable by the container's uid.
 Prefer running the service as the host uid — `user: "${SANDBOX_UID}"` in the
