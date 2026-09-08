@@ -188,12 +188,12 @@ printf '\n== the rest of the contract ==\n'
 # runs on that path as well. Callers pass a sha for --checkout runs.
 origin="$(new_origin)"
 (cd "$origin" && git config user.email "$LOCAL_EMAIL")
-first="$(cd "$origin" && git rev-parse HEAD)"
+first="$(git -C "$origin" rev-parse --verify --quiet HEAD)"
 env_commit "$origin" second >/dev/null 2>&1
 clone="$(new_clone_path)"
 fs_make_clone "$origin" "sandbox/four" "$clone" "$first" >/dev/null 2>&1
 check "a start sha still places the branch" \
-    "$first" "$(cd "$clone" && git rev-parse HEAD)"
+    "$first" "$(git -C "$clone" rev-parse --verify --quiet HEAD)"
 check "the identity is seeded on that path too" \
     "$LOCAL_EMAIL" "$(cd "$clone" && git config --local --get user.email)"
 

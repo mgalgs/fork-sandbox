@@ -532,10 +532,10 @@ git -C "$diffstat_repo" config user.name Tester
 printf 'base\n' > "$diffstat_repo/file.txt"
 git -C "$diffstat_repo" add file.txt
 git -C "$diffstat_repo" commit -q -m "base"
-base_sha="$(git -C "$diffstat_repo" rev-parse HEAD)"
+base_sha="$(git -C "$diffstat_repo" rev-parse --verify --quiet HEAD)"
 printf 'base\nmore\n' > "$diffstat_repo/file.txt"
 git -C "$diffstat_repo" commit -q -am "add a line"
-tip_sha="$(git -C "$diffstat_repo" rev-parse HEAD)"
+tip_sha="$(git -C "$diffstat_repo" rev-parse --verify --quiet HEAD)"
 
 printf 'all tests passed: 42/42\n' > smoke.txt
 

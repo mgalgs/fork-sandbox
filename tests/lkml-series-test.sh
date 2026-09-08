@@ -63,14 +63,14 @@ git -C "$real_repo" config user.name Tester
 printf 'trunk\n' > "$real_repo/base.txt"
 git -C "$real_repo" add base.txt
 git -C "$real_repo" commit -q -m "repo: base"
-base_sha="$(git -C "$real_repo" rev-parse HEAD)"
+base_sha="$(git -C "$real_repo" rev-parse --verify --quiet HEAD)"
 
 # A messy "shipped" tip -- one commit, standing in for a pile of WIP commits
 # that already landed on main.
 printf 'int frob(void) { return 0; }\n' > "$real_repo/frob.c"
 git -C "$real_repo" add frob.c
 git -C "$real_repo" commit -q -m "WIP: frobnicator dump"
-tip_sha="$(git -C "$real_repo" rev-parse HEAD)"
+tip_sha="$(git -C "$real_repo" rev-parse --verify --quiet HEAD)"
 git -C "$real_repo" checkout -q "$base_sha"
 
 stub_bin="$(mktemp -d)"; tmpdirs+=("$stub_bin")

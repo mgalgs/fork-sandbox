@@ -197,7 +197,7 @@ gdir="$(mktemp -d)"; tmpdirs+=("$gdir")
 ) >/dev/null 2>&1
 
 out="$(dry "$config" --harness claude --prompts-dir "$gdir" 2>/dev/null)"
-head_sha="$(git -C "$gdir" rev-parse HEAD)"
+head_sha="$(git -C "$gdir" rev-parse --verify --quiet HEAD)"
 check "a clean prompts repo records its plain HEAD" \
     "$head_sha" "$(printf '%s\n' "$out" | sed -n 's/^prompt_overlay_rev=//p')"
 

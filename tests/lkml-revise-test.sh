@@ -75,7 +75,7 @@ git -C "$real_repo" config user.name Tester
 printf 'this is the trunk the series branches from\n' > "$real_repo/base.txt"
 git -C "$real_repo" add base.txt
 git -C "$real_repo" commit -q -m "repo: pre-series base"
-series_base_sha="$(git -C "$real_repo" rev-parse HEAD)"
+series_base_sha="$(git -C "$real_repo" rev-parse --verify --quiet HEAD)"
 
 printf 'int frob(void) { return 0; }\n' > "$real_repo/frob.c"
 git -C "$real_repo" add frob.c

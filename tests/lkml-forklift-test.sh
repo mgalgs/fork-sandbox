@@ -80,7 +80,7 @@ printf 'l1\nl2\nl3\n' > "$real_repo/a.txt"
 printf 'unrelated\n' > "$real_repo/b.txt"
 git -C "$real_repo" add a.txt b.txt
 git -C "$real_repo" commit -q -m "repo: base"
-base_sha="$(git -C "$real_repo" rev-parse HEAD)"
+base_sha="$(git -C "$real_repo" rev-parse --verify --quiet HEAD)"
 
 git -C "$real_repo" checkout -q -b main
 printf 'l1\nl2\nl3\nmain moves\n' > "$real_repo/a.txt"
@@ -94,11 +94,11 @@ git -C "$real_repo" commit -q -am "feature: change to b.txt"
 post_version happy 1 "$base_sha" lkml/happy-v1 "$real_repo"
 
 git -C "$real_repo" checkout -q main
-onto_before="$(git -C "$real_repo" rev-parse main)"
+onto_before="$(git -C "$real_repo" rev-parse --verify --quiet main)"
 out="$("$forklift" happy --project "$real_repo" --version 1 --onto main 2>&1)"
 rc=$?
 check "happy path: exits 0" "0" "$rc"
-onto_after="$(git -C "$real_repo" rev-parse main)"
+onto_after="$(git -C "$real_repo" rev-parse --verify --quiet main)"
 if [[ "$onto_after" != "$onto_before" ]]; then ok "main moved forward"; else no "main moved forward" "still at $onto_before"; fi
 check "main:a.txt keeps main's OWN change" "l1
 l2
@@ -106,9 +106,9 @@ l3
 main moves" "$(git -C "$real_repo" show main:a.txt)"
 check "main:b.txt gets the version's change" "feature stuff" "$(git -C "$real_repo" show main:b.txt)"
 check "fold commit has main's original tip as its sole parent" "$onto_before" \
-    "$(git -C "$real_repo" rev-parse "main^")"
+    "$(git -C "$real_repo" rev-parse --verify --quiet "main^")"
 check "working tree was reset to the new commit (HEAD was main)" "$onto_after" \
-    "$(git -C "$real_repo" rev-parse HEAD)"
+    "$(git -C "$real_repo" rev-parse --verify --quiet HEAD)"
 contains "reports the fold" "$out" "now at $onto_after"
 
 # --- divergence guard: main and the version touch the SAME line ---------
@@ -119,7 +119,7 @@ git -C "$real_repo2" config user.name Tester
 printf 'l1\nl2\nl3\n' > "$real_repo2/a.txt"
 git -C "$real_repo2" add a.txt
 git -C "$real_repo2" commit -q -m "repo: base"
-base_sha2="$(git -C "$real_repo2" rev-parse HEAD)"
+base_sha2="$(git -C "$real_repo2" rev-parse --verify --quiet HEAD)"
 
 git -C "$real_repo2" checkout -q -b main
 printf 'l1\nCHANGED-BY-MAIN\nl3\n' > "$real_repo2/a.txt"
@@ -133,12 +133,12 @@ git -C "$real_repo2" commit -q -am "feature: conflicting change"
 post_version conflict 1 "$base_sha2" lkml/conflict-v1 "$real_repo2"
 
 git -C "$real_repo2" checkout -q main
-onto_before2="$(git -C "$real_repo2" rev-parse main)"
+onto_before2="$(git -C "$real_repo2" rev-parse --verify --quiet main)"
 out2="$("$forklift" conflict --project "$real_repo2" --version 1 --onto main 2>&1)"
 rc2=$?
 if (( rc2 != 0 )); then ok "divergence: exits non-zero"; else no "divergence: exits non-zero" "exit 0"; fi
 contains "divergence: names the refusal" "$out2" "too far"
-onto_after2="$(git -C "$real_repo2" rev-parse main)"
+onto_after2="$(git -C "$real_repo2" rev-parse --verify --quiet main)"
 check "divergence: main's ref never moved" "$onto_before2" "$onto_after2"
 check "divergence: main:a.txt is untouched" "l1
 CHANGED-BY-MAIN
@@ -146,13 +146,13 @@ l3" "$(git -C "$real_repo2" show main:a.txt)"
 
 # --- --dry-run: prints the message, moves no ref -------------------------
 git -C "$real_repo" checkout -q main
-onto_before3="$(git -C "$real_repo" rev-parse main)"
+onto_before3="$(git -C "$real_repo" rev-parse --verify --quiet main)"
 post_version happy 2 "$base_sha" lkml/happy-v1 "$real_repo"
 out3="$("$forklift" happy --project "$real_repo" --version 2 --onto main --dry-run 2>&1)"
 rc3=$?
 check "dry-run: exits 0" "0" "$rc3"
 contains "dry-run: says no commit created" "$out3" "no commit created"
-onto_after3="$(git -C "$real_repo" rev-parse main)"
+onto_after3="$(git -C "$real_repo" rev-parse --verify --quiet main)"
 check "dry-run: main's ref never moved" "$onto_before3" "$onto_after3"
 
 printf '\n== --help ==\n'

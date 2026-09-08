@@ -2013,7 +2013,7 @@ extract_configmap_key() {
     ' "$file"
 }
 
-proj_base_sha="$(git -C "$proj_dir" rev-parse HEAD)"
+proj_base_sha="$(git -C "$proj_dir" rev-parse --verify --quiet HEAD)"
 rl_submit_out="$(newdir)/rl-submit.yaml"; tmpdirs+=("$(dirname "$rl_submit_out")")
 if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-rl-branch --model moonshotai/kimi-k3 --review-loop 2 \
@@ -3685,7 +3685,7 @@ new_rl_fixture() {
     git -C "$repo" config user.name Tester
     git -C "$repo" -c user.email=t@fork-sandbox.invalid -c user.name=Tester \
         commit -q --allow-empty -m init
-    base_sha="$(git -C "$repo" rev-parse HEAD)"
+    base_sha="$(git -C "$repo" rev-parse --verify --quiet HEAD)"
     git -C "$repo" -c user.email=t@fork-sandbox.invalid -c user.name=Tester \
         commit -q --allow-empty -m "the coding leg's work"
     printf 'review prompt fixture\n' > "$d/review-prompt.md"
@@ -3929,7 +3929,7 @@ printf '\n-- skipped: branch head already at --base-sha --\n'
 stub_dir7="$(mktemp -d /var/tmp/claude-scratch/fs-k8s-rl-stub.XXXXXX)"; tmpdirs+=("$stub_dir7")
 read -r repo base_sha work review_prompt fix_header out < <(new_rl_fixture)
 tmpdirs+=("$(dirname "$repo")")
-current_head="$(git -C "$repo" rev-parse HEAD)"
+current_head="$(git -C "$repo" rev-parse --verify --quiet HEAD)"
 RL_TEST_VERDICT="$repo/.git/review-verdict.md" PI_BIN="$stub_dir7/should-never-run" MODEL=test-model \
     "$rl_sh" --clone "$repo" --cap 2 --base-sha "$current_head" \
     --review-prompt "$review_prompt" --fix-header "$fix_header" \
@@ -4131,7 +4131,7 @@ git -C "$k8s_flag_proj" -c user.email=t@fork-sandbox.invalid -c user.name=Tester
 # ANNOTATED tag here, which dies "fatal: no tag message?" and leaves the
 # ref unborn -- the same hazard the fs-k8s-checkout fixture documents.
 git -C "$k8s_flag_proj" -c tag.gpgSign=false tag fs-k8s-launcher-services
-k8s_flag_services_sha="$(git -C "$k8s_flag_proj" rev-parse HEAD)"
+k8s_flag_services_sha="$(git -C "$k8s_flag_proj" rev-parse --verify --quiet HEAD)"
 k8s_flag_services_out="$(newdir)/k8s-flag-services.yaml"; tmpdirs+=("$(dirname "$k8s_flag_services_out")")
 if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
     --harness pi --model moonshotai/kimi-k3 \

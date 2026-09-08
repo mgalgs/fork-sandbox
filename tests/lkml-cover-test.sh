@@ -70,7 +70,7 @@ git -C "$real_repo" config user.name Tester
 printf 'trunk\n' > "$real_repo/base.txt"
 git -C "$real_repo" add base.txt
 git -C "$real_repo" commit -q -m "repo: base"
-base_sha="$(git -C "$real_repo" rev-parse HEAD)"
+base_sha="$(git -C "$real_repo" rev-parse --verify --quiet HEAD)"
 
 printf 'int frob(void) { return 0; }\n' > "$real_repo/frob.c"
 git -C "$real_repo" add frob.c
