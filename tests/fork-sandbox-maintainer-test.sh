@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2012  # fixture diagnostics list controlled temporary paths
 # fork-sandbox-maintainer-test.sh — Exercise the maintainer tier:
 # --maintainer-loop with its --maintainer-harness and --maintainer-model,
 # the parsing and validation rules, the pi-local seal warning, and the loop's

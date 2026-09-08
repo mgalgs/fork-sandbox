@@ -320,8 +320,8 @@ printf '\n== reply-to resolver ladder ==\n'
 printf '%s\n' 'Ladder v1 cover' > ladder-cover.txt
 mkdir -p ladder-patches
 printf 'Subject: [PATCH 1/1] docs: Describe addenda archiving across legs\n\nFrom abcdef1234567890 Mon Sep 17 00:00:00 2001\npatch body v1\n' > ladder-patches/0001-v1.patch
-ladder_v1_cover="$($mailbox init resolver-ladder --cover ladder-cover.txt --patches ladder-patches \
-    --from author --version 1 2>/dev/null)"
+$mailbox init resolver-ladder --cover ladder-cover.txt --patches ladder-patches \
+    --from author --version 1 >/dev/null 2>&1
 printf '%s\n' 'Ladder v2 cover' > ladder-cover2.txt
 ladder_v2_cover="$($mailbox init resolver-ladder --cover ladder-cover2.txt --patches ladder-patches \
     --from author --version 2 2>/dev/null)"
@@ -425,8 +425,8 @@ printf 'Subject: [PATCH 1/2] sha: owner\n\nFrom abcdef1234567890 Mon Sep 17 00:0
     > sha-patches/0001-owner.patch
 printf 'Subject: [PATCH 2/2] sha: dependent\n\nFrom deadbeef1234567890 Mon Sep 17 00:00:00 2001\ndependency note mentions abcdef1\nFrom abcdef1234567890 Mon Sep 17 00:00:00 2001\n' \
     > sha-patches/0002-dependent.patch
-sha_cover="$($mailbox init sha-header --cover ladder-cover.txt --patches sha-patches \
-    --from author --harness claude --model opus 2>/dev/null)"
+$mailbox init sha-header --cover ladder-cover.txt --patches sha-patches \
+    --from author --harness claude --model opus >/dev/null 2>&1
 sha_tree="$($mailbox tree sha-header)"
 sha_owner7="$(printf '%s\n' "$sha_tree" | awk '/\[PATCH v1 1\/2\]/{print $1}')"
 sha_owner_file="$(find "$LKML_MAILBOX_ROOT/sha-header/cur" -name "$sha_owner7*.msg" -print -quit)"

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2016  # literal shell snippets and source-text needles are intentional
 # fork-sandbox-k8s-test.sh — the Kubernetes run mode holds its own contract
 #
 # Usage: tests/fork-sandbox-k8s-test.sh

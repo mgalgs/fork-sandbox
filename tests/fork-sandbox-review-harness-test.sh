@@ -174,7 +174,6 @@ review_proj="$(mktemp -d "$HOME/src/fs-review-only-test.XXXXXX")"; tmpdirs+=("$r
         && git commit -q -m base \
         && printf 'head\n' >> file.txt && git commit -q -am head
 ) || exit 1
-head_sha="$(git -C "$review_proj" rev-parse --verify --quiet HEAD)"
 git -C "$review_proj" switch -q -c review-branch HEAD~1
 printf 'review\n' >> "$review_proj/file.txt"
 git -C "$review_proj" add file.txt
@@ -186,7 +185,6 @@ git -C "$review_proj" switch -q master 2>/dev/null \
 old_sha="$(git -C "$review_proj" rev-parse --verify --quiet HEAD~1)"
 git -C "$review_proj" switch -q --orphan review-unrelated
 git -C "$review_proj" commit --allow-empty -q -m unrelated
-unrelated_sha="$(git -C "$review_proj" rev-parse --verify --quiet HEAD)"
 git -C "$review_proj" switch -q master 2>/dev/null \
     || git -C "$review_proj" switch -q main
 
