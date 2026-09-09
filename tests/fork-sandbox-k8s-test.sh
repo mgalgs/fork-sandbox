@@ -1004,6 +1004,40 @@ refuses "submit --harness claude with K8S_DEFAULT_MODEL set still requires --mod
 # empty MODEL env" against single_ep_config_dir, which sets no
 # K8S_DEFAULT_MODEL; named here so the pair reads together).
 
+# K8S_DEFAULT_MODEL on a legacy K8S_PROXY_UPSTREAM install: there is no
+# model discovery for it to stand in for, so it must be refused explicitly
+# -- like K8S_DEFAULT_ENDPOINT is on the same kind of install -- rather
+# than silently ignored and then flatly denied by the generic "there is no
+# default" message, which would contradict the operator's own k8s.env.
+legacy_default_model_config_dir="$(newdir)"; tmpdirs+=("$legacy_default_model_config_dir")
+cat > "$legacy_default_model_config_dir/k8s.env" <<'CONF'
+K8S_CONTEXT=test-context
+K8S_NAMESPACE=fork-sandbox-test
+K8S_IMAGE=registry.example/you/fork-sandbox:latest
+K8S_PROXY_UPSTREAM=https://openrouter.ai
+K8S_DEFAULT_MODEL=qwen3-8b
+K8S_DENIED_PROBE=10.0.0.1:443
+CONF
+refuses "submit: K8S_DEFAULT_MODEL on a legacy K8S_PROXY_UPSTREAM install is refused" \
+    "K8S_DEFAULT_MODEL is not available" \
+    env FORK_SANDBOX_CONFIG_DIR="$legacy_default_model_config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch "$proj_dir" "$handoff_file"
+refuses "run: K8S_DEFAULT_MODEL on a legacy K8S_PROXY_UPSTREAM install is refused" \
+    "K8S_DEFAULT_MODEL is not available" \
+    env FORK_SANDBOX_CONFIG_DIR="$legacy_default_model_config_dir" "$k8s_sh" run --dry-run \
+    --branch fs-k8s-test-branch "$proj_dir" "$handoff_file"
+# --model still works on that same install -- the refusal above is about
+# the unset --model + set K8S_DEFAULT_MODEL combination specifically, not
+# about K8S_DEFAULT_MODEL merely being present in k8s.env.
+if FORK_SANDBOX_CONFIG_DIR="$legacy_default_model_config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model moonshotai/kimi-k3 \
+    "$proj_dir" "$handoff_file" > /dev/null 2>/dev/null; then
+    ok "submit --model still works on a legacy install with K8S_DEFAULT_MODEL set"
+else
+    no "submit --model still works on a legacy install with K8S_DEFAULT_MODEL set" \
+        "(see rendered output)"
+fi
+
 # --endpoint against a legacy K8S_PROXY_UPSTREAM install is an error.
 refuses "submit --endpoint against a legacy K8S_PROXY_UPSTREAM install errors" \
     "K8S_PROXY_UPSTREAM; there are no named" \
@@ -1490,6 +1524,41 @@ else
     no "K8S_PROXY_ALLOW_NS=<ns>:<port> adds a namespaceSelector rule alongside the default egress block" \
         "$proxy_netpol_allow_ns_doc"
 fi
+# The reachability check must know a K8S_PROXY_ALLOW_NS entry can cover a
+# Service DNS endpoint -- an install matching this one's own K8S_PROXY_ALLOW_NS
+# entry must print no reachability warning at all, unlike the false positive
+# this used to print (judged only against K8S_PROXY_ALLOW/the default ipBlock
+# policy, which can never reach a ClusterIP -- see parse_proxy_allow_ns).
+if grep -q 'Warning:' /tmp/fs-k8s-test-allow-ns-install.err; then
+    no "a K8S_PROXY_ALLOW_NS-covered Service endpoint prints no reachability warning" \
+        "$(cat /tmp/fs-k8s-test-allow-ns-install.err)"
+else
+    ok "a K8S_PROXY_ALLOW_NS-covered Service endpoint prints no reachability warning"
+fi
+
+# A K8S_PROXY_ALLOW_NS entry naming the right namespace but the wrong port
+# does NOT cover the endpoint -- the reachability warning must still fire,
+# and must point at K8S_PROXY_ALLOW_NS (never K8S_PROXY_ALLOW, which cannot
+# reach a ClusterIP at all).
+allow_ns_wrongport_config_dir="$(newdir)"; tmpdirs+=("$allow_ns_wrongport_config_dir")
+cat > "$allow_ns_wrongport_config_dir/k8s.env" <<'CONF'
+K8S_CONTEXT=test-context
+K8S_NAMESPACE=fork-sandbox-test
+K8S_IMAGE=registry.example/you/fork-sandbox:latest
+K8S_PROXY_ENDPOINTS=primary=http://svc-a.example-ns.svc.cluster.local:8001/v1
+K8S_PROXY_ALLOW_NS=example-ns:9999
+K8S_DENIED_PROBE=10.0.0.1:443
+CONF
+FORK_SANDBOX_CONFIG_DIR="$allow_ns_wrongport_config_dir" "$k8s_sh" install --dry-run \
+    > /dev/null 2>/tmp/fs-k8s-test-allow-ns-wrongport-install.err
+if grep -qF 'to K8S_PROXY_ALLOW_NS to fix that.' /tmp/fs-k8s-test-allow-ns-wrongport-install.err \
+    && ! grep -qF 'K8S_PROXY_ALLOW=<cidr>' /tmp/fs-k8s-test-allow-ns-wrongport-install.err; then
+    ok "a K8S_PROXY_ALLOW_NS entry on the wrong port still warns, naming K8S_PROXY_ALLOW_NS"
+else
+    no "a K8S_PROXY_ALLOW_NS entry on the wrong port still warns, naming K8S_PROXY_ALLOW_NS" \
+        "$(cat /tmp/fs-k8s-test-allow-ns-wrongport-install.err)"
+fi
+rm -f /tmp/fs-k8s-test-allow-ns-wrongport-install.err
 
 # A set K8S_PROXY_ALLOW_NS=<namespace> with no port renders the
 # namespaceSelector rule with no ports: key at all (every port).
@@ -1519,6 +1588,12 @@ if [[ "$ns_line_after" == *'ports:'* ]]; then
 else
     ok "K8S_PROXY_ALLOW_NS=<ns> (no port) omits the ports: key entirely"
 fi
+if grep -q 'Warning:' /tmp/fs-k8s-test-allow-ns-noport-install.err; then
+    no "a K8S_PROXY_ALLOW_NS=<ns> (every port) covered Service endpoint prints no reachability warning" \
+        "$(cat /tmp/fs-k8s-test-allow-ns-noport-install.err)"
+else
+    ok "a K8S_PROXY_ALLOW_NS=<ns> (every port) covered Service endpoint prints no reachability warning"
+fi
 
 # K8S_PROXY_ALLOW and K8S_PROXY_ALLOW_NS compose: both an ipBlock rule (from
 # K8S_PROXY_ALLOW, replacing the default) and a namespaceSelector rule (from
@@ -1545,6 +1620,12 @@ if grep -qF 'cidr: 10.0.0.5/32' <<< "$proxy_netpol_combined_doc" \
 else
     no "K8S_PROXY_ALLOW and K8S_PROXY_ALLOW_NS compose in the same NetworkPolicy" \
         "$proxy_netpol_combined_doc"
+fi
+if grep -q 'Warning:' /tmp/fs-k8s-test-combined-allow-install.err; then
+    no "K8S_PROXY_ALLOW and K8S_PROXY_ALLOW_NS composing covers both endpoints with no warning" \
+        "$(cat /tmp/fs-k8s-test-combined-allow-install.err)"
+else
+    ok "K8S_PROXY_ALLOW and K8S_PROXY_ALLOW_NS composing covers both endpoints with no warning"
 fi
 
 # A bad namespace shape in K8S_PROXY_ALLOW_NS is a parse-time error, nothing
@@ -1575,6 +1656,24 @@ CONF
 refuses "a bad port in K8S_PROXY_ALLOW_NS is refused" \
     "has an invalid port" \
     env FORK_SANDBOX_CONFIG_DIR="$bad_ns_port_config_dir" "$k8s_sh" install --dry-run
+
+# A trailing ':' with no port after it must not silently mean "every
+# port" -- that would grant broader egress than a typo'd entry ever asked
+# for, the one input where this parser could otherwise grant more access
+# than requested (see parse_proxy_endpoint_keys's sibling empty-half
+# checks for the established convention).
+trailing_colon_config_dir="$(newdir)"; tmpdirs+=("$trailing_colon_config_dir")
+cat > "$trailing_colon_config_dir/k8s.env" <<'CONF'
+K8S_CONTEXT=test-context
+K8S_NAMESPACE=fork-sandbox-test
+K8S_IMAGE=registry.example/you/fork-sandbox:latest
+K8S_PROXY_ENDPOINTS=primary=http://10.0.0.5:8001/v1
+K8S_PROXY_ALLOW_NS=example-ns:
+K8S_DENIED_PROBE=10.0.0.1:443
+CONF
+refuses "K8S_PROXY_ALLOW_NS with a trailing ':' and no port is refused" \
+    "trailing ':'" \
+    env FORK_SANDBOX_CONFIG_DIR="$trailing_colon_config_dir" "$k8s_sh" install --dry-run
 
 rm -f /tmp/fs-k8s-test-allow-ns-install.err /tmp/fs-k8s-test-allow-ns-noport-install.err \
     /tmp/fs-k8s-test-combined-allow-install.err
@@ -1653,6 +1752,38 @@ if grep -q 'secretName: fork-sandbox-upstream-key' "$keyed_out"; then
     ok "a keyed endpoints install keeps the upstream-key Secret volume"
 else
     no "a keyed endpoints install keeps the upstream-key Secret volume" "$keyed_out"
+fi
+
+# Same coverage as 'nginx -t on the rendered proxy config' above, against
+# the keyed render this time -- a genuinely third nginx.conf shape (the
+# upstream-key.conf include restored, 'Authorization "Bearer
+# $upstream_key_secondary"' in both of 'secondary's locations, and
+# $upstream_key_secondary itself a per-endpoint variable that must be
+# defined at server level before any location references it), which every
+# assertion above this only greps YAML text for. The stub the two checks
+# above stage defines only $upstream_key (the legacy/keyless shape) --
+# this render never references that name, so it needs its own stub
+# defining $upstream_key_secondary, or nginx would fail to start on an
+# unknown variable. Reuses nginx_mode/run_nginx_t/proxy_image from the
+# legacy check above.
+keyed_nginx_conf="$(extract_nginx_conf "$keyed_out")"
+if [[ -z "$keyed_nginx_conf" ]]; then
+    no "extracted nginx.conf from keyed endpoints install --dry-run output" \
+        "no nginx.conf block found in $keyed_out"
+elif [[ -z "${nginx_mode:-}" ]]; then
+    printf '  SKIP  neither nginx nor a working docker on PATH\n'
+else
+    keyed_nginx_check_dir="$(newdir)"; tmpdirs+=("$keyed_nginx_check_dir")
+    printf '%s\n' "${keyed_nginx_conf//kube-dns.kube-system.svc.cluster.local/127.0.0.1}" \
+        > "$keyed_nginx_check_dir/nginx.conf"
+    # shellcheck disable=SC2016  # $upstream_key_secondary is nginx config, not shell
+    printf 'set $upstream_key_secondary "dummy";\n' > "$keyed_nginx_check_dir/upstream-key.conf"
+    out="$(run_nginx_t "$keyed_nginx_check_dir")"; rc=$?
+    if (( rc == 0 )); then
+        ok "nginx -t accepts the rendered keyed endpoints proxy config"
+    else
+        no "nginx -t accepts the rendered keyed endpoints proxy config" "$out"
+    fi
 fi
 
 # A real (non-dry-run) install, against a stubbed kubectl (no live cluster
@@ -5923,8 +6054,21 @@ printf '\n== no private-hostname shape anywhere in the repo ==\n'
 # 100.64.0.0/10 are excluded when they appear as CIDR examples (a trailing
 # /N) -- this project's own docs and manifests document those ranges by
 # name, deliberately, as the excluded set in an egress policy.
+#
+# K8S_PROXY_ALLOW_NS/K8S_PROXY_ENDPOINTS (see e950fdbb31/d1a6c7f71f/
+# 6d2bf0b0e9) made a new class of leak possible: an in-cluster Service DNS
+# name, <svc>.<ns>.svc.<K8S_CLUSTER_DOMAIN>, carries real service/namespace
+# names and, when K8S_CLUSTER_DOMAIN is overridden, a real cluster domain
+# -- neither shape existed in this tool's config surface before. The
+# placeholder convention this repo already uses everywhere for that shape
+# (cluster.local as the domain, invented names like svc-a/example-ns) has
+# no recognizable real-world TLD, so a `.svc.<label>.<real TLD>` occurrence
+# is what a future commit pasting a real cluster's domain into a doc,
+# fixture or commit message would look like; caught here, distinctly from
+# the LAN/CIDR shapes above.
 # shellcheck disable=SC2016  # the regex is meant literally, not expanded
 leak_pattern='[[:alnum:]-]+\.home\.lan\b|[[:alnum:]-]+\.lan\b|192\.168\.[0-9]+\.[0-9]+'
+leak_pattern+='|\.svc\.[a-z0-9-]+\.(com|net|org|io|dev|ai|corp|internal)\b'
 hits="$(grep -rEn --exclude-dir=.git --exclude='fork-sandbox-k8s-test.sh' \
     "$leak_pattern" "$repo_dir" 2>/dev/null \
     | grep -Ev '192\.168\.0\.0/16' || true)"
@@ -5932,6 +6076,21 @@ if [[ -z "$hits" ]]; then
     ok "no private-hostname shape in the repo"
 else
     no "no private-hostname shape in the repo" "$hits"
+fi
+# A synthetic check that the new Service-DNS branch of leak_pattern is
+# live, not silently inert -- proves a real-TLD-shaped Service DNS name
+# would be caught, without writing one into the repo itself.
+if grep -qE "$leak_pattern" <<< 'upstream: my-svc.some-team.svc.internal-cluster.com:8080'; then
+    ok "leak_pattern catches a real-TLD-shaped in-cluster Service DNS name"
+else
+    no "leak_pattern catches a real-TLD-shaped in-cluster Service DNS name" \
+        "regex did not match the synthetic fixture string"
+fi
+if grep -qE "$leak_pattern" <<< 'upstream: my-svc.some-team.svc.cluster.local:8080'; then
+    no "leak_pattern does not flag the safe svc.cluster.local placeholder" \
+        "regex matched the placeholder-domain string"
+else
+    ok "leak_pattern does not flag the safe svc.cluster.local placeholder"
 fi
 
 printf '\n== fork-sandbox-k8s.sh: the GNU tools go through their resolved names ==\n'

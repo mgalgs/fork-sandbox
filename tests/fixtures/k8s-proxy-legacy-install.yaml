@@ -103,9 +103,10 @@ roleRef:
 # The model-access proxy: the one thing in this namespace that ever reaches
 # the public internet, and the reason the agent pod does not have to. It
 # holds the provider key, injects it as the run passes through, and forwards
-# exactly one path. fork-sandbox-test, https://openrouter.ai and
-# openrouter.ai are placeholder tokens; fork-sandbox-k8s.sh
-# substitutes them from K8S_NAMESPACE and K8S_PROXY_UPSTREAM before applying.
+# exactly one path. fork-sandbox-test, https://openrouter.ai,
+# openrouter.ai and cluster.local are placeholder tokens;
+# fork-sandbox-k8s.sh substitutes them from K8S_NAMESPACE,
+# K8S_PROXY_UPSTREAM and K8S_CLUSTER_DOMAIN before applying.
 # The key itself is never in this file -- it comes from the
 # fork-sandbox-upstream-key Secret, which `install` creates separately from
 # ~/.config/fork-sandbox/pi.env, and is included into nginx's config from a

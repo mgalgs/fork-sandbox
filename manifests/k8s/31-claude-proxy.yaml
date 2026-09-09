@@ -7,11 +7,12 @@
 # access token, scoped to a Secret named after this run and torn down with
 # the rest of this run's objects by `rm`. The namespace and every object
 # name below carry placeholder tokens; fork-sandbox-k8s.sh substitutes them
-# from K8S_NAMESPACE and the run's own $safe_name before applying. The
-# token itself is never in this file -- it comes from a per-run Secret,
-# created the same way fork-sandbox-upstream-key is (see cmd_submit), and
-# included into nginx's config from a path nginx.conf never otherwise
-# names, so a `kubectl get configmap` never shows it.
+# from K8S_NAMESPACE, the run's own $safe_name and K8S_CLUSTER_DOMAIN
+# before applying. The token itself is never in this file -- it comes
+# from a per-run Secret, created the same way fork-sandbox-upstream-key
+# is (see cmd_submit), and included into nginx's config from a path
+# nginx.conf never otherwise names, so a `kubectl get configmap` never
+# shows it.
 #
 # A per-run Pod, not a sidecar: a sidecar shares the agent container's
 # network namespace, so the policy admitting it 0.0.0.0/0:443 would open
@@ -60,7 +61,7 @@ data:
     }
 
     http {
-        resolver kube-dns.kube-system.svc.cluster.local valid=10s;
+        resolver kube-dns.kube-system.svc.__CLUSTER_DOMAIN__ valid=10s;
         client_body_temp_path /tmp/client_body;
         proxy_temp_path /tmp/proxy;
         fastcgi_temp_path /tmp/fastcgi;

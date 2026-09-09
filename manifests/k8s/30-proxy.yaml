@@ -2,9 +2,10 @@
 # The model-access proxy: the one thing in this namespace that ever reaches
 # the public internet, and the reason the agent pod does not have to. It
 # holds the provider key, injects it as the run passes through, and forwards
-# exactly one path. __NAMESPACE__, __PROXY_UPSTREAM__ and
-# __PROXY_UPSTREAM_HOST__ are placeholder tokens; fork-sandbox-k8s.sh
-# substitutes them from K8S_NAMESPACE and K8S_PROXY_UPSTREAM before applying.
+# exactly one path. __NAMESPACE__, __PROXY_UPSTREAM__,
+# __PROXY_UPSTREAM_HOST__ and __CLUSTER_DOMAIN__ are placeholder tokens;
+# fork-sandbox-k8s.sh substitutes them from K8S_NAMESPACE,
+# K8S_PROXY_UPSTREAM and K8S_CLUSTER_DOMAIN before applying.
 # The key itself is never in this file -- it comes from the
 # fork-sandbox-upstream-key Secret, which `install` creates separately from
 # ~/.config/fork-sandbox/pi.env, and is included into nginx's config from a
@@ -25,7 +26,7 @@ data:
     }
 
     http {
-        resolver kube-dns.kube-system.svc.cluster.local valid=10s;
+        resolver kube-dns.kube-system.svc.__CLUSTER_DOMAIN__ valid=10s;
         client_body_temp_path /tmp/client_body;
         proxy_temp_path /tmp/proxy;
         fastcgi_temp_path /tmp/fastcgi;

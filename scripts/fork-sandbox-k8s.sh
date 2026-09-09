@@ -1407,6 +1407,12 @@ parse_proxy_allow_ns() {
         if [[ "$entry" == *:* ]]; then
             ns="${entry%:*}"
             port="${entry##*:}"
+            if [[ -z "$port" ]]; then
+                echo "Error: K8S_PROXY_ALLOW_NS entry '$entry' has a trailing ':'" >&2
+                echo "with no port after it -- omit the ':' entirely for every port," >&2
+                echo "or name one, such as '$ns:8001'." >&2
+                return 1
+            fi
         else
             ns="$entry"
             port=""
@@ -1878,6 +1884,50 @@ cmd_install() {
         warn_urls+=("${PROXY_ENDPOINT_URLS[$i]}")
     done
 
+    # A Service DNS name (host ending in .svc.$K8S_CLUSTER_DOMAIN) is
+    # reachable only through the namespaceSelector rule K8S_PROXY_ALLOW_NS
+    # renders (render_proxy_egress_rules_ns) -- never through
+    # K8S_PROXY_ALLOW or the default ipBlock policy the two checks below
+    # judge, which cannot reliably reach a ClusterIP at all
+    # (parse_proxy_allow_ns's own header explains why). Judged here
+    # instead, against PROXY_ALLOW_NS_NAMESPACES/PORTS, and marked in
+    # is_svc_url so neither check below re-judges it by a policy that was
+    # never going to carry it -- otherwise every Service-mode endpoint,
+    # correctly covered by K8S_PROXY_ALLOW_NS or not, gets the wrong
+    # warning below (or the right warning for the wrong reason).
+    local -a is_svc_url=()
+    local url host host_only svc_ns port covered j
+    for (( i = 0; i < ${#warn_urls[@]}; i++ )); do
+        is_svc_url[i]=false
+        url="${warn_urls[$i]}"
+        host="${url#*://}"
+        host="${host%%/*}"
+        host_only="${host%:*}"
+        [[ "$host_only" == *".svc.$K8S_CLUSTER_DOMAIN" ]] || continue
+        is_svc_url[i]=true
+        svc_ns="${host_only#*.}"
+        svc_ns="${svc_ns%%.*}"
+        port="${host#*:}"
+        [[ "$port" == "$host" ]] && port=""
+        if [[ -z "$port" ]]; then
+            if [[ "$url" == https://* ]]; then port=443; else port=80; fi
+        fi
+        covered=false
+        for (( j = 0; j < ${#PROXY_ALLOW_NS_NAMESPACES[@]}; j++ )); do
+            if [[ "${PROXY_ALLOW_NS_NAMESPACES[$j]}" == "$svc_ns" ]] \
+                && { [[ -z "${PROXY_ALLOW_NS_PORTS[$j]}" ]] || (( port == PROXY_ALLOW_NS_PORTS[j] )); }; then
+                covered=true
+                break
+            fi
+        done
+        if ! $covered; then
+            echo "Warning: ${warn_labels[$i]} names an in-cluster Service in" >&2
+            echo "namespace '$svc_ns' on port $port, which no K8S_PROXY_ALLOW_NS" >&2
+            echo "entry covers -- every request to it will be dropped. Add" >&2
+            echo "$svc_ns:$port to K8S_PROXY_ALLOW_NS to fix that." >&2
+        fi
+    done
+
     if [[ ${#PROXY_ALLOW_CIDRS[@]} -eq 0 ]]; then
         # A warn_urls entry on http:// is, by validate_upstream_url's own
         # rule, always a private (RFC1918/loopback/link-local) address --
@@ -1891,6 +1941,7 @@ cmd_install() {
         # endpoint on a non-443 port has the same problem but isn't
         # checkable without parsing every port out of every URL).
         for (( i = 0; i < ${#warn_urls[@]}; i++ )); do
+            ${is_svc_url[$i]} && continue
             if [[ "${warn_urls[$i]}" == http://* ]]; then
                 echo "Warning: ${warn_labels[$i]} uses http://, which is only" >&2
                 echo "ever accepted to a private address -- but K8S_PROXY_ALLOW is" >&2
@@ -1959,6 +2010,7 @@ cmd_install() {
             -e "s|__NAMESPACE__|$K8S_NAMESPACE|g" \
             -e "s|__PROXY_UPSTREAM_HOST__|$upstream_host|g" \
             -e "s|__PROXY_UPSTREAM__|$K8S_PROXY_UPSTREAM|g" \
+            -e "s|__CLUSTER_DOMAIN__|$K8S_CLUSTER_DOMAIN|g" \
             "$f")"
         if [[ "$(basename "$f")" == 30-proxy.yaml ]]; then
             # The nginx location block(s) for whichever upstream mode is
@@ -2197,6 +2249,19 @@ cmd_submit() {
     # --harness claude, because discovery lists the pi endpoint's model
     # ids, never a Claude Code model name.
     if [[ -z "$K8S_PROXY_ENDPOINTS" ]]; then
+        if [[ -z "$model" && -n "$K8S_DEFAULT_MODEL" ]]; then
+            # Same shape as the K8S_DEFAULT_ENDPOINT refusal above: a
+            # legacy install has no model discovery for K8S_DEFAULT_MODEL
+            # to stand in for, so naming it here is a config error, not
+            # something to ignore -- an error claiming "there is no
+            # default" while k8s.env sets one would contradict the
+            # operator's own config file.
+            echo "Error: K8S_DEFAULT_MODEL is not available: this namespace" >&2
+            echo "was installed with K8S_PROXY_UPSTREAM, which has no model" >&2
+            echo "discovery for K8S_DEFAULT_MODEL to stand in for. Pass" >&2
+            echo "--model explicitly." >&2
+            exit 1
+        fi
         [[ -n "$model" ]] || { echo "Error: submit requires --model. There is no default:" >&2
             echo "the model is an OpenRouter id, such as moonshotai/kimi-k3." >&2; exit 1; }
     elif [[ -z "$model" && "$harness" == claude ]]; then
@@ -2565,16 +2630,16 @@ cmd_submit() {
         # install renders no /api/v1 path at all -- this is the wiring the
         # old "submit cannot yet target K8S_PROXY_ENDPOINTS" refusal
         # guard stood in for, and is why that guard is gone.
-        proxy_base_url="http://fork-sandbox-proxy.$K8S_NAMESPACE.svc.cluster.local:8080/e/$proxy_endpoint/v1"
+        proxy_base_url="http://fork-sandbox-proxy.$K8S_NAMESPACE.svc.$K8S_CLUSTER_DOMAIN:8080/e/$proxy_endpoint/v1"
     else
-        proxy_base_url="http://fork-sandbox-proxy.$K8S_NAMESPACE.svc.cluster.local:8080/api/v1"
+        proxy_base_url="http://fork-sandbox-proxy.$K8S_NAMESPACE.svc.$K8S_CLUSTER_DOMAIN:8080/api/v1"
     fi
 
     # The egress-gate initContainer's own proxy probe: the shared pi proxy
     # for a pi run, this run's own per-run proxy for a claude run -- see
     # the Job env below, which is what actually needs this value.
-    local egress_proxy_host="fork-sandbox-proxy.$K8S_NAMESPACE.svc.cluster.local"
-    [[ "$harness" == claude ]] && egress_proxy_host="$safe_name-claude-proxy.$K8S_NAMESPACE.svc.cluster.local"
+    local egress_proxy_host="fork-sandbox-proxy.$K8S_NAMESPACE.svc.$K8S_CLUSTER_DOMAIN"
+    [[ "$harness" == claude ]] && egress_proxy_host="$safe_name-claude-proxy.$K8S_NAMESPACE.svc.$K8S_CLUSTER_DOMAIN"
 
     # The fork-sandbox/owner label plus this run's free-form labels --
     # resolved once here, ahead of both the claude-proxy template
@@ -2611,6 +2676,7 @@ cmd_submit() {
         claude_proxy_rendered="$(sed \
             -e "s|__NAMESPACE__|$K8S_NAMESPACE|g" \
             -e "s|__RUN_NAME__|$safe_name|g" \
+            -e "s|__CLUSTER_DOMAIN__|$K8S_CLUSTER_DOMAIN|g" \
             "$claude_proxy_template")"$'\n'
         # A literal (non-regex) global replace, not another sed -- the
         # replacement can hold embedded newlines (one per extra label),
@@ -2687,7 +2753,7 @@ cmd_submit() {
     if [[ "$harness" == claude ]]; then
         claude_env=$'\n'"$(cat <<CENV
             - name: CLAUDE_PROXY_BASE_URL
-              value: "http://$safe_name-claude-proxy.$K8S_NAMESPACE.svc.cluster.local:8080"
+              value: "http://$safe_name-claude-proxy.$K8S_NAMESPACE.svc.$K8S_CLUSTER_DOMAIN:8080"
 CENV
 )"
     fi
@@ -3604,6 +3670,16 @@ cmd_run() {
     # --harness claude keeps the requirement, for the same reason submit
     # does.
     if [[ -z "$K8S_PROXY_ENDPOINTS" ]]; then
+        if [[ -z "$model" && -n "$K8S_DEFAULT_MODEL" ]]; then
+            # Same refusal cmd_submit gives, checked here too since this
+            # is the fail-fast duplicate of cmd_submit's own --model
+            # requirement, ahead of the submit_argv forwarding below.
+            echo "Error: K8S_DEFAULT_MODEL is not available: this namespace" >&2
+            echo "was installed with K8S_PROXY_UPSTREAM, which has no model" >&2
+            echo "discovery for K8S_DEFAULT_MODEL to stand in for. Pass" >&2
+            echo "--model explicitly." >&2
+            exit 1
+        fi
         [[ -n "$model" ]] || { echo "Error: run requires --model. There is no default:" >&2
             echo "the model is an OpenRouter id, such as moonshotai/kimi-k3." >&2; exit 1; }
     elif [[ -z "$model" && "$harness" == claude ]]; then
