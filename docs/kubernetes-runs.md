@@ -1033,6 +1033,57 @@ Three `k8s.env` keys cap what a spec can claim, since a repo — the thing
 A spec over any of these is refused before the Job is even assembled, naming
 the offending field and which `k8s.env` key raises it.
 
+## Attribution: fork-sandbox/owner and free-form labels
+
+`kubectl get pods -n fork-sandbox` otherwise shows a pile of
+`fork-sandbox-agent-<branch>` objects and nothing says whose run is whose —
+fine with one operator, a real problem once teammates share a namespace.
+Every object a run creates carries a `fork-sandbox/owner` label, plus
+whatever free-form labels the operator opts into, so the namespace reads as
+attributed rather than anonymous.
+
+**`fork-sandbox/owner`** is resolved once per `submit`, in order:
+
+1. `K8S_RUN_OWNER` in `~/.config/fork-sandbox/k8s.env`, if set.
+2. Otherwise `$USER`, sanitized (lowercased, disallowed characters mapped to
+   `-`, trimmed, capped at 63 — the same transform object names already
+   apply to a branch).
+3. If neither yields a value, the label is simply omitted — never invented.
+
+A site sets `K8S_RUN_OWNER=ci-blast-radius` so a CI runner's submissions read
+as themselves rather than as `runner` or `ubuntu`; a devbox usually needs no
+setting at all, since a sanitized `$USER` is already informative. An
+explicit `K8S_RUN_OWNER` that is not a valid label value (at most 63
+characters, matching `[a-zA-Z0-9]([-_.a-zA-Z0-9]*[a-zA-Z0-9])?`) is refused
+before anything is created — an operator-typed value that fails this is a
+mistake worth reporting, unlike a generic-but-valid `$USER`, which this
+script sanitizes rather than refuses.
+
+**`--label key=value`** (`submit`, `run`; repeatable) and **`K8S_RUN_LABELS`**
+(`k8s.env`, `key=value,key=value` — a machine-wide default) add free-form
+labels for slicing by purpose, app, or device. Every one of these labels
+renders under the fixed prefix `fork-sandbox.io/<key>`, never as a bare key.
+A `--label` overrides a `K8S_RUN_LABELS` entry for the same key (announced
+on stderr); a key only in the file is left alone. For example,
+`K8S_RUN_LABELS=team=example-team` plus `--label app-purpose=demo` on a run
+renders both `fork-sandbox.io/team: example-team` and
+`fork-sandbox.io/app-purpose: demo`.
+
+The fixed prefix is load-bearing, not decoration: `app` and
+`fork-sandbox/branch` are the exact labels this run's per-run claude-proxy
+NetworkPolicy selects on to admit ingress to the pod holding the operator's
+real Anthropic access token (see "1b. proxy, per-run, for claude" below). A
+`--label`/`K8S_RUN_LABELS` entry may never set `app`, `fork-sandbox/branch`,
+`fork-sandbox/role`, or `fork-sandbox/owner` — each is refused by name, even
+though the prefix already makes a real collision impossible. Every other
+validation failure (a key or value that is not a legal Kubernetes label
+shape, a missing `=`, a key repeated on the command line or within
+`K8S_RUN_LABELS`) is refused the same way, before any object is created.
+
+What these labels are **not**: they are invisible to the model proxy and to
+anything upstream of it, so they never attribute model usage or cost — only
+who, inside the cluster, a run belongs to.
+
 ## The agent pod
 
 The image is the one the container backend already uses,
