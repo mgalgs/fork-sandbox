@@ -5182,9 +5182,13 @@ refuses "--k8s --harness claude with no --model needs a model" \
     env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
     --harness claude "$k8s_flag_claude_proj" "$k8s_flag_handoff"
 refuses "--k8s --harness pi-local is refused" \
-    "only supports --harness pi" \
+    "--network sealed is not supported with --k8s" \
     env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
     --harness pi-local unused-project unused-handoff
+refuses "--k8s --harness pi --network sealed is refused" \
+    "--network sealed is not supported with --k8s" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
+    --harness pi --network sealed unused-project unused-handoff
 refuses "--k8s --harness codex is refused" \
     "only supports --harness pi" \
     env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \

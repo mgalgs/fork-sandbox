@@ -2194,8 +2194,21 @@ if [[ "$k8s_mode" == true ]]; then
         echo "Error: --k8s only supports --harness pi or claude. A cluster run" >&2
         echo "is pi talking to a model proxy that holds the provider key, or" >&2
         echo "claude talking through a per-run proxy that swaps in the" >&2
-        echo "operator's own token; pi-local and codex have no sandboxed path" >&2
-        echo "in the cluster (not yet supported)." >&2
+        echo "operator's own token; codex has no sandboxed path in the" >&2
+        echo "cluster (not yet supported)." >&2
+        exit 1
+    fi
+    # A cluster pod still reaches the in-cluster model proxy regardless of
+    # harness, so "sealed" would be a false claim there -- cluster isolation
+    # is enforced by NetworkPolicy instead, a separate axis this flag does
+    # not cover and that this round does not build a cluster-sealed
+    # counterpart for.
+    if [[ "$network" == "sealed" ]]; then
+        echo "Error: --network sealed is not supported with --k8s. A" >&2
+        echo "cluster pod still reaches the in-cluster model proxy, so" >&2
+        echo "\"sealed\" would be a false claim there -- cluster isolation" >&2
+        echo "is enforced by NetworkPolicy instead, a separate axis this" >&2
+        echo "flag does not cover." >&2
         exit 1
     fi
     if [[ "$harness" == "claude" && -z "$model" ]]; then
