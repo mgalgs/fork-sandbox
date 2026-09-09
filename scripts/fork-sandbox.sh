@@ -1210,6 +1210,12 @@ review_harness_spec=""
 review_harness_given=false
 review_harness=""
 review_combined_model=""
+# The per-leg network value ("pinned" or "sealed"). Empty/unset means
+# "not sealed" everywhere it is compared -- there is no --review-network
+# or --maintainer-network flag, so review/maintainer/fix legs only become
+# sealed via the pi-local alias or a preset's per-seat network: key.
+network=""
+review_network=""
 dry_run=false
 claude_extra_args=""
 pi_extra_args=""
@@ -1225,6 +1231,7 @@ maintainer_harness_given=false
 maintainer_harness=""
 maintainer_combined_model=""
 maintainer_model=""
+maintainer_network=""
 preset_name=""
 preset_file=""
 preset_sha256=""
@@ -1236,9 +1243,11 @@ preset_staged_bytes=""
 fix_harness=""
 fix_model=""
 fix_repeat=1
+fix_network=""
 mntfix_harness=""
 mntfix_model=""
 mntfix_repeat=1
+mntfix_network=""
 code_repeat=1
 review_only=false
 mode=run
@@ -1258,6 +1267,7 @@ k8s_outbox_dir=""
 k8s_endpoint=""
 k8s_endpoint_given=false
 outbox_max_arg=""
+network_arg="pinned"
 
 while [[ "${1:-}" == -* ]]; do
     case "$1" in
@@ -1266,7 +1276,7 @@ while [[ "${1:-}" == -* ]]; do
             shift 2
             ;;
         --harness)
-            harness_spec="${2:?--harness requires claude, pi, pi-local or codex}"
+            harness_spec="${2:?--harness requires claude, pi or codex}"
             harness_given=true
             shift 2
             ;;
@@ -1300,7 +1310,7 @@ while [[ "${1:-}" == -* ]]; do
             shift 2
             ;;
         --review-harness)
-            review_harness_spec="${2:?--review-harness requires claude, pi, pi-local or codex}"
+            review_harness_spec="${2:?--review-harness requires claude, pi or codex}"
             review_harness_given=true
             shift 2
             ;;
@@ -1337,7 +1347,7 @@ while [[ "${1:-}" == -* ]]; do
             shift 2
             ;;
         --maintainer-harness)
-            maintainer_harness_spec="${2:?--maintainer-harness requires claude, pi, pi-local or codex}"
+            maintainer_harness_spec="${2:?--maintainer-harness requires claude, pi or codex}"
             maintainer_harness_given=true
             shift 2
             ;;
@@ -1410,6 +1420,18 @@ while [[ "${1:-}" == -* ]]; do
             ;;
         --outbox-max)
             outbox_max_arg="${2:?--outbox-max requires a size}"
+            shift 2
+            ;;
+        --network)
+            network_arg="${2:?--network requires 'pinned' or 'sealed'}"
+            case "$network_arg" in
+                pinned|sealed) ;;
+                *)
+                    echo "Error: --network takes 'pinned' or 'sealed', not" >&2
+                    echo "'$network_arg'." >&2
+                    exit 1
+                    ;;
+            esac
             shift 2
             ;;
         -h|--help)
@@ -1736,6 +1758,13 @@ if [[ -n "$preset_name" ]]; then
             fix_harness="$preset_review_fix_harness"
             fix_model="$preset_review_fix_model"
             fix_repeat="$preset_review_fix_repeat"
+            # Same permanent alias as --harness pi-local, expanded the same
+            # way. There is no --fix-harness flag; a preset's fix_harness
+            # key is the only route here.
+            if [[ "$fix_harness" == "pi-local" ]]; then
+                fix_harness="pi"
+                fix_network="sealed"
+            fi
         fi
     fi
 
@@ -1771,6 +1800,13 @@ if [[ -n "$preset_name" ]]; then
             mntfix_harness="$preset_maintain_fix_harness"
             mntfix_model="$preset_maintain_fix_model"
             mntfix_repeat="$preset_maintain_fix_repeat"
+            # Same permanent alias, expanded the same way. There is no
+            # --mntfix-harness flag; a preset's fix_harness key on the
+            # maintain seat is the only route here.
+            if [[ "$mntfix_harness" == "pi-local" ]]; then
+                mntfix_harness="pi"
+                mntfix_network="sealed"
+            fi
         fi
     fi
 fi
@@ -1817,10 +1853,19 @@ else
     harness="$harness_spec"
 fi
 
+# --harness pi-local is a permanent, undocumented alias for
+# --harness pi --network sealed, kept forever for compatibility. Expand it
+# here, before validation, so nothing downstream ever sees "pi-local" as a
+# harness value.
+if [[ "$harness" == "pi-local" ]]; then
+    harness="pi"
+    network_arg="sealed"
+fi
+
 case "$harness" in
-    claude|pi|pi-local|codex) ;;
+    claude|pi|codex) ;;
     *)
-        echo "Error: --harness takes 'claude', 'pi', 'pi-local' or 'codex'," >&2
+        echo "Error: --harness takes 'claude', 'pi' or 'codex'," >&2
         echo "not '$harness'." >&2
         exit 1
         ;;
@@ -1837,10 +1882,18 @@ if [[ "$review_harness_given" == true ]]; then
         review_harness="$review_harness_spec"
     fi
 
+    # --review-harness pi-local is the same permanent alias as --harness
+    # pi-local, expanded the same way: there is no --review-network flag,
+    # so this remains the only way to seat a sealed review leg.
+    if [[ "$review_harness" == "pi-local" ]]; then
+        review_harness="pi"
+        review_network="sealed"
+    fi
+
     case "$review_harness" in
-        claude|pi|pi-local|codex) ;;
+        claude|pi|codex) ;;
         *)
-            echo "Error: --review-harness takes 'claude', 'pi', 'pi-local' or" >&2
+            echo "Error: --review-harness takes 'claude', 'pi' or" >&2
             echo "'codex', not '$review_harness'." >&2
             exit 1
             ;;
@@ -1858,10 +1911,18 @@ if [[ "$maintainer_harness_given" == true ]]; then
         maintainer_harness="$maintainer_harness_spec"
     fi
 
+    # --maintainer-harness pi-local is the same permanent alias, expanded the
+    # same way. There is no --maintainer-network flag, so this remains the
+    # only way to seat a sealed maintainer leg.
+    if [[ "$maintainer_harness" == "pi-local" ]]; then
+        maintainer_harness="pi"
+        maintainer_network="sealed"
+    fi
+
     case "$maintainer_harness" in
-        claude|pi|pi-local|codex) ;;
+        claude|pi|codex) ;;
         *)
-            echo "Error: --maintainer-harness takes 'claude', 'pi', 'pi-local'" >&2
+            echo "Error: --maintainer-harness takes 'claude', 'pi'" >&2
             echo "or 'codex', not '$maintainer_harness'." >&2
             exit 1
             ;;
@@ -1881,6 +1942,11 @@ fi
 if [[ "$k8s_mode" == true && "$harness_given" != true ]]; then
     harness="pi"
 fi
+
+# The implement leg's resolved network value, set here (before the model
+# checks just below, which must already know whether this is a sealed pi
+# run) rather than beside the --k8s dispatch further down.
+network="$network_arg"
 
 if [[ -n "$combined_model" && "$model_given" == true ]]; then
     echo "Error: combined harness model '$combined_model' conflicts with" >&2
@@ -1954,7 +2020,7 @@ resolve_model() {
     fi
 
     case "$resolve_harness" in
-        claude|pi|pi-local)
+        claude|pi)
             return 0
             ;;
         codex)
@@ -2037,8 +2103,8 @@ resolve_model maintainer_model "$maintainer_model_given" "${maintainer_harness:-
 # inside the sandbox with a missing credential.
 if [[ "$fix_harness" == "codex" || "$mntfix_harness" == "codex" ]]; then
     echo "Error: a codex fix seat is not yet supported -- the runner does not" >&2
-    echo "write a codex credential for fix legs. Seat the fix agent on claude," >&2
-    echo "pi or pi-local." >&2
+    echo "write a codex credential for fix legs. Seat the fix agent on claude" >&2
+    echo "or pi." >&2
     exit 1
 fi
 
@@ -2051,9 +2117,13 @@ mntfix_model_given=false
 [[ -n "$mntfix_model" ]] && mntfix_model_given=true
 resolve_model mntfix_model "$mntfix_model_given" "${mntfix_harness:-$harness}" || exit 1
 
-if [[ "$harness" == "pi" && -z "$model" ]]; then
-    # The one allowed model-less pi run: any --k8s run. On an
-    # K8S_PROXY_ENDPOINTS install the pod discovers its model, and
+if [[ "$harness" == "pi" && "$network" != "sealed" && -z "$model" ]]; then
+    # A sealed pi run (--network sealed) is model-less by construction --
+    # its own arm above sets the model flag only if given one, and
+    # agent-sandboxed can discover it -- so this check applies only to a
+    # pinned pi run. Within that, a --k8s run is the one allowed
+    # model-less case: on a K8S_PROXY_ENDPOINTS install the pod discovers
+    # its model, and
     # fork-sandbox-k8s.sh's own install-mode-aware validation is the one
     # authority on whether an endpoint can be resolved at all -- the
     # --endpoint flag, a preset's code-seat key, K8S_DEFAULT_ENDPOINT in
@@ -2072,7 +2142,8 @@ if [[ "$harness" == "pi" && -z "$model" ]]; then
         exit 1
     fi
 fi
-if [[ "$review_harness_given" == true && "$review_harness" == "pi" && -z "$review_model" ]]; then
+if [[ "$review_harness_given" == true && "$review_harness" == "pi" \
+    && "${review_network:-}" != "sealed" && -z "$review_model" ]]; then
     echo "Error: --review-harness pi needs a model, either in the combined" >&2
     echo "harness/model form (--review-harness pi/moonshotai/kimi-k3) or via" >&2
     echo "--review-model. There is no default." >&2
@@ -2086,6 +2157,27 @@ fi
 outbox_max_bytes="$FS_OUTBOX_MAX_BYTES"
 if [[ -n "$outbox_max_arg" ]]; then
     outbox_max_bytes="$(fs_parse_size_bytes "$outbox_max_arg")" || exit 1
+fi
+
+# --network sealed means "no network at all", which today only pi against
+# a self-hosted endpoint (agent-sandboxed) can deliver -- see
+# fs_resolve_harness's pi-local arm, below, which refuses a missing
+# model.env for exactly this combination. claude and codex have no
+# sandboxed path that talks to a self-hosted endpoint instead of their
+# vendor; a local vendor-proxy for them is tabled work, not built, so
+# sealed is refused here rather than silently falling back to pinned.
+if [[ "$harness" == "claude" && "$network" == "sealed" ]]; then
+    echo "Error: --network sealed is not supported with --harness claude." >&2
+    echo "A local proxy that lets claude talk to a self-hosted endpoint is" >&2
+    echo "tabled, not built -- sealed currently means pi against a" >&2
+    echo "self-hosted endpoint only." >&2
+    exit 1
+fi
+if [[ "$harness" == "codex" && "$network" == "sealed" ]]; then
+    echo "Error: --network sealed is not supported with --harness codex," >&2
+    echo "for the same reason as claude: no self-hosted-endpoint path" >&2
+    echo "exists for it yet." >&2
+    exit 1
 fi
 
 # --k8s dispatches the whole run to fork-sandbox-k8s.sh run, which submits it
@@ -2823,14 +2915,15 @@ if [[ -n "$context_ro" ]]; then
     context_ro="$context_ro_real"
 fi
 
-# A pi-local run is sealed, and --unpin-egress — the one value permitted below
-# — is the one flag agent-sandboxed refuses outright. So there is nothing this
-# option can legally carry for that harness; say so here rather than let it fail
-# after the clone.
-if [[ -n "$sandbox_args" && "$harness" == "pi-local" ]]; then
-    echo "Error: --sandbox-args does nothing for --harness pi-local. The only" >&2
-    echo "value allowed here is --unpin-egress, and a sealed sandbox refuses" >&2
-    echo "it: there is no network to unpin. Drop the flag." >&2
+# A sealed run has no network at all, and --unpin-egress — the one value
+# permitted below — is the one flag agent-sandboxed refuses outright. So
+# there is nothing this option can legally carry for a sealed run; say so
+# here rather than let it fail after the clone.
+if [[ -n "$sandbox_args" && "$network" == "sealed" ]]; then
+    echo "Error: --sandbox-args does nothing for a sealed run (--network" >&2
+    echo "sealed). The only value allowed here is --unpin-egress, and a" >&2
+    echo "sealed sandbox refuses it: there is no network to unpin. Drop" >&2
+    echo "the flag." >&2
     exit 1
 fi
 if [[ -n "$sandbox_args" && "$sandbox_args" != "--unpin-egress" ]]; then
@@ -2923,10 +3016,11 @@ if [[ -n "$claude_extra_args" && "$harness" != "claude" ]]; then
     exit 1
 fi
 
-# --pi-args names pi, which only the pi harnesses start.
-if [[ -n "$pi_extra_args" && "$harness" != "pi" && "$harness" != "pi-local" ]]; then
+# --pi-args names pi, which only a pi harness starts (--network sealed or
+# not -- both run the pi binary).
+if [[ -n "$pi_extra_args" && "$harness" != "pi" ]]; then
     echo "Error: --pi-args passes flags to pi, which a $harness run" >&2
-    echo "never starts. Drop it, or use --harness pi / pi-local." >&2
+    echo "never starts. Drop it, or use --harness pi." >&2
     exit 1
 fi
 pi_extra_argv=()
@@ -2947,24 +3041,36 @@ fs_backend_capabilities "$FS_BACKEND_BIN"
 # never into a decision, and a backend that does not set it says "unnamed".
 image_toolchain_version="image:${FORK_SANDBOX_CONTAINER_IMAGE:-unnamed}"
 
-# Resolves one harness (claude, pi, pi-local or codex) into a run's worth
-# of command-building state -- the same case statement a single-harness run
-# always ran, wrapped so it can run TWICE in one invocation: once for the
-# implement harness, and again for --review-harness, without either call
-# seeing or overwriting the other's result. $1 is the harness name, $2 its
-# model (already resolved by resolve_model), $3 a prefix ("impl" or "rev")
-# naming where the output lands.
+# Resolves one harness+network combination (claude, pi/pinned, pi/sealed
+# or codex) into a run's worth of command-building state -- the same case
+# statement a single-harness run always ran, wrapped so it can run TWICE
+# in one invocation: once for the implement harness, and again for
+# --review-harness, without either call seeing or overwriting the other's
+# result. $1 is the harness name, $2 its model (already resolved by
+# resolve_model), $3 a prefix ("impl" or "rev") naming where the output
+# lands, $4 the leg's network value ("pinned" or "sealed", or empty --
+# empty means "not sealed", same as "pinned").
+#
+# $rh_harness is never literally "pi-local": every caller has already
+# expanded that alias to harness "pi" plus network "sealed". The two
+# sub-cases dispatch on a purely-local rh_kind instead, so the case arms
+# below -- moved here unchanged from the single-harness block this
+# replaced -- keep running the exact bodies they always did; only the
+# dispatch key changed from the old literal "pi-local" harness value to
+# this function's own harness+network combination. rh_kind never leaks
+# outside this function.
 #
 # Every output is a bash nameref bound to "${prefix}_<name>", so the case
-# arms below -- moved here unchanged from the single-harness block this
-# replaced -- read and write the exact same bare names (harness_bin,
+# arms below read and write the exact same bare names (harness_bin,
 # harness_cmd, ...) they always did; only the declarations here say which
 # prefixed global those names actually resolve to. $model is the one thing
 # the old arms read from outside their own scope, so it becomes the local
 # $rh_model parameter instead -- everything else below is untouched,
 # comments included.
 fs_resolve_harness() {
-    local rh_harness="$1" rh_model="$2" prefix="$3"
+    local rh_harness="$1" rh_model="$2" prefix="$3" rh_network="${4:-}"
+    local rh_kind="$rh_harness"
+    [[ "$rh_harness" == "pi" && "$rh_network" == "sealed" ]] && rh_kind="pi-local"
 
     local -n harness_bin="${prefix}_harness_bin"
     local -n harness_version="${prefix}_harness_version"
@@ -3000,14 +3106,14 @@ fs_resolve_harness() {
     harness_exec=0
     harness_sandbox_bin=""
     run_formatter="$formatter"
-    usage_source="$rh_harness"
+    usage_source="$rh_kind"
     # shellcheck disable=SC2034  # read by fs_build_sandbox_cmd, across the
     # same nameref-name boundary shellcheck cannot see through.
-    out_prefix_harness="$rh_harness"
+    out_prefix_harness="$rh_kind"
     # shellcheck disable=SC2034
     out_prefix_model="$rh_model"
 
-    case "$rh_harness" in
+    case "$rh_kind" in
     claude)
     # claude-sandboxed resolves and starts claude itself, and has done
     # since before there was more than one harness. Leave it that way:
@@ -3315,7 +3421,7 @@ codex)
 # The generated runner deletes all of them when it ends (run_cleanup) --
 # see the codex arm of fs_resolve_harness for why the list and not one.
 codex_auth_dirs=()
-fs_resolve_harness "$harness" "$model" impl
+fs_resolve_harness "$harness" "$model" impl "$network"
 # Compatibility copy: the run record (run.env, the generated runner) and
 # the review-loop accounting below still read these bare names -- moving
 # THEM onto "impl_"/"rev_" is per-leg accounting, a later commit's job, not
@@ -3347,20 +3453,20 @@ fs_resolve_harness "$harness" "$model" impl
 # nothing to show for it -- precisely the failure "fail before the clone"
 # exists to prevent for the implement harness alone.
 if [[ -n "$fix_harness" ]]; then
-    fs_resolve_harness "$fix_harness" "$fix_model" fxr
+    fs_resolve_harness "$fix_harness" "$fix_model" fxr "$fix_network"
 fi
 if [[ -n "$mntfix_harness" ]]; then
-    fs_resolve_harness "$mntfix_harness" "$mntfix_model" fxm
+    fs_resolve_harness "$mntfix_harness" "$mntfix_model" fxm "$mntfix_network"
 fi
 if [[ "$review_harness_given" == true ]]; then
-    fs_resolve_harness "$review_harness" "$review_model" rev
+    fs_resolve_harness "$review_harness" "$review_model" rev "$review_network"
 fi
 
 # Same for the maintainer harness when --maintainer-harness named one.
 # (It cannot be named without --maintainer-loop, which always carries a
 # model, so this always has a model to resolve with.)
 if [[ "$maintainer_harness_given" == true ]]; then
-    fs_resolve_harness "$maintainer_harness" "$maintainer_model" mnt
+    fs_resolve_harness "$maintainer_harness" "$maintainer_model" mnt "$maintainer_network"
 fi
 
 # Check every value that goes into the generated runner or the run record
