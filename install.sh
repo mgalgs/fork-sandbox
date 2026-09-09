@@ -373,7 +373,11 @@ else
 fi
 
 unclassified=()
-for script in "${scripts_to_check[@]}"; do
+# "${a[@]-}", not "${a[@]}": an empty array under `set -u` is an unbound
+# variable on bash before 4.4, which includes the 3.2 this whole branch
+# exists to keep working. git ls-files comes back empty if scripts/ is
+# untracked. The empty string it expands to instead fails the -f test below.
+for script in "${scripts_to_check[@]-}"; do
     # Skip directories (e.g. an untracked __pycache__) -- only files (and
     # symlinks to files) are candidates for installation.
     [[ -f "$script" ]] || continue
