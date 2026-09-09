@@ -684,19 +684,22 @@ require_secret_file() {
 
 # Refuses a credential that would break the nginx `set $var "...";` line
 # cmd_install renders it into: a literal '"' ends the string early (the rest
-# of the value spills out as bare nginx syntax), and a literal '$' starts
-# nginx variable interpolation even inside the double quotes, both making a
-# config nginx refuses to load -- crashlooping the proxy for every run in
-# the namespace, not just the one that supplied the bad value.
+# of the value spills out as bare nginx syntax), a literal '$' starts
+# nginx variable interpolation even inside the double quotes, and a literal
+# '\' is nginx's own escape character inside a quoted string (so a trailing
+# one escapes the closing quote and swallows the line's terminator) -- all
+# three making a config nginx refuses to load, crashlooping the proxy for
+# every run in the namespace, not just the one that supplied the bad value.
 # fs_reject_unsafe_chars (single quote / newline) guards a different set of
 # sinks -- the shell commands and run records this script builds -- and
 # does not cover this one.
 reject_nginx_unsafe_chars() {
     local v="$1" label="$2"
-    if [[ "$v" == *'"'* || "$v" == *'$'* ]]; then
-        echo "Error: $label contains a '\"' or a '\$', which would break the" >&2
-        echo "nginx config line it is rendered into (set \$var \"...\";)." >&2
-        echo "Use a credential without those characters." >&2
+    if [[ "$v" == *'"'* || "$v" == *'$'* || "$v" == *\\* ]]; then
+        echo "Error: $label contains a '\"', a '\$' or a backslash, which" >&2
+        echo "would break the nginx config line it is rendered into" >&2
+        echo "(set \$var \"...\";). Use a credential without those" >&2
+        echo "characters." >&2
         return 1
     fi
     return 0

@@ -1923,7 +1923,7 @@ refuses "a keyed endpoint whose pi.env variable is empty is refused, naming both
     env PATH="$missing_var_stub_bin:$PATH" FORK_SANDBOX_CONFIG_DIR="$empty_var_config_dir" \
     "$k8s_sh" install
 
-# A keyed credential containing '"' or '$' would break the nginx `set
+# A keyed credential containing '"', '$' or '\' would break the nginx `set
 # $var "...";` line it renders into -- refused by name at install time
 # instead of shipping a crashlooping proxy with nothing in the install
 # output to point at the cause.
@@ -1934,6 +1934,19 @@ printf 'MY_API_KEY=sk-a$b"c\n' >> "$unsafe_key_config_dir/pi.env"
 refuses "a keyed credential containing a double quote or \$ is refused" \
     "would break the" \
     env PATH="$missing_var_stub_bin:$PATH" FORK_SANDBOX_CONFIG_DIR="$unsafe_key_config_dir" \
+    "$k8s_sh" install --dry-run
+
+# A backslash is nginx's own escape character inside a quoted string, so a
+# trailing one escapes the closing quote of the rendered `set` line and
+# makes a config nginx refuses to load -- the same crashloop the '"'/'$'
+# check above prevents, and the same refusal.
+backslash_key_config_dir="$(newdir)"; tmpdirs+=("$backslash_key_config_dir")
+cp "$keyed_config_dir/k8s.env" "$backslash_key_config_dir/k8s.env"
+install -m 600 /dev/null "$backslash_key_config_dir/pi.env"
+printf 'MY_API_KEY=sk-trailing\\\n' >> "$backslash_key_config_dir/pi.env"
+refuses "a keyed credential containing a backslash is refused" \
+    "would break the" \
+    env PATH="$missing_var_stub_bin:$PATH" FORK_SANDBOX_CONFIG_DIR="$backslash_key_config_dir" \
     "$k8s_sh" install --dry-run
 
 # An unregistered endpoint name in K8S_PROXY_ENDPOINT_KEYS is an
