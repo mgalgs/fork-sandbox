@@ -1517,6 +1517,180 @@ refuses "a bad port in K8S_PROXY_ALLOW_NS is refused" \
 rm -f /tmp/fs-k8s-test-allow-ns-install.err /tmp/fs-k8s-test-allow-ns-noport-install.err \
     /tmp/fs-k8s-test-combined-allow-install.err
 
+printf '\n== K8S_PROXY_ENDPOINT_KEYS -- optionally-keyed named endpoints ==\n'
+# 'primary' stays keyless; 'secondary' is keyed by MY_API_KEY in pi.env --
+# invented names, per this repo's leak guard.
+keyed_config_dir="$(newdir)"; tmpdirs+=("$keyed_config_dir")
+cat > "$keyed_config_dir/k8s.env" <<'CONF'
+K8S_CONTEXT=test-context
+K8S_NAMESPACE=fork-sandbox-test
+K8S_IMAGE=registry.example/you/fork-sandbox:latest
+K8S_PROXY_ENDPOINTS=primary=http://10.0.0.5:8001/v1,secondary=http://10.0.0.6:8000/v1
+K8S_PROXY_ENDPOINT_KEYS=secondary=MY_API_KEY
+K8S_DENIED_PROBE=10.0.0.1:443
+CONF
+install -m 600 /dev/null "$keyed_config_dir/pi.env"
+printf 'MY_API_KEY=sk-secondary-test-dummy\n' >> "$keyed_config_dir/pi.env"
+
+keyed_out="$(newdir)/keyed-install.yaml"; tmpdirs+=("$(dirname "$keyed_out")")
+if FORK_SANDBOX_CONFIG_DIR="$keyed_config_dir" "$k8s_sh" install --dry-run \
+    > "$keyed_out" 2>/tmp/fs-k8s-test-keyed-install.err; then
+    ok "a keyed endpoints install --dry-run exits 0"
+else
+    no "a keyed endpoints install --dry-run exits 0" "$(cat /tmp/fs-k8s-test-keyed-install.err)"
+fi
+
+if grep -qF "would create/update Secret fork-sandbox-upstream-key entry for K8S_PROXY_ENDPOINTS endpoint 'secondary'" "$keyed_out"; then
+    ok "install --dry-run announces the keyed Secret entry, naming the endpoint"
+else
+    no "install --dry-run announces the keyed Secret entry, naming the endpoint" "$keyed_out"
+fi
+if grep -qF 'sk-secondary-test-dummy' "$keyed_out"; then
+    no "the keyed value never appears in --dry-run output" "found the fixture value in $keyed_out"
+else
+    ok "the keyed value never appears in --dry-run output"
+fi
+if grep -q 'kind: Secret' "$keyed_out"; then
+    no "install --dry-run renders no Secret object itself (created separately, after apply)" \
+        "found 'kind: Secret' in $keyed_out"
+else
+    ok "install --dry-run renders no Secret object itself (created separately, after apply)"
+fi
+
+# Both of 'secondary's locations carry the Authorization header (the
+# brief's own "both paths" trap); 'primary' (keyless) carries neither.
+secondary_chat_block="$(awk '/location = \/e\/secondary\/v1\/chat\/completions \{/,/^            \}/' "$keyed_out")"
+secondary_models_block="$(awk '/location = \/e\/secondary\/v1\/models \{/,/^            \}/' "$keyed_out")"
+primary_chat_block="$(awk '/location = \/e\/primary\/v1\/chat\/completions \{/,/^            \}/' "$keyed_out")"
+primary_models_block="$(awk '/location = \/e\/primary\/v1\/models \{/,/^            \}/' "$keyed_out")"
+if grep -qF 'Authorization "Bearer $upstream_key_secondary"' <<< "$secondary_chat_block"; then
+    ok "the keyed endpoint's chat/completions location carries the Authorization header"
+else
+    no "the keyed endpoint's chat/completions location carries the Authorization header" "$secondary_chat_block"
+fi
+if grep -qF 'Authorization "Bearer $upstream_key_secondary"' <<< "$secondary_models_block"; then
+    ok "the keyed endpoint's models location ALSO carries the Authorization header"
+else
+    no "the keyed endpoint's models location ALSO carries the Authorization header" "$secondary_models_block"
+fi
+if grep -q 'Authorization' <<< "$primary_chat_block"$'\n'"$primary_models_block"; then
+    no "the unkeyed sibling endpoint carries no Authorization header" \
+        "$primary_chat_block"$'\n'"$primary_models_block"
+else
+    ok "the unkeyed sibling endpoint carries no Authorization header"
+fi
+
+# The upstream-key include and volume stay in place (needed by the keyed
+# endpoint), unlike an all-keyless install.
+if grep -q 'include /etc/nginx/upstream-key.conf' "$keyed_out"; then
+    ok "a keyed endpoints install keeps the upstream-key.conf include"
+else
+    no "a keyed endpoints install keeps the upstream-key.conf include" "$keyed_out"
+fi
+if grep -q 'secretName: fork-sandbox-upstream-key' "$keyed_out"; then
+    ok "a keyed endpoints install keeps the upstream-key Secret volume"
+else
+    no "a keyed endpoints install keeps the upstream-key Secret volume" "$keyed_out"
+fi
+
+# A real (non-dry-run) install, against a stubbed kubectl (no live cluster
+# needed -- same technique as the 'rm' section elsewhere in this file): the
+# Secret this creates carries one 'set $upstream_key_<name> "value";' line
+# for the keyed endpoint, and the value never appears anywhere else.
+keyed_install_stub_bin="$(newdir)"; tmpdirs+=("$keyed_install_stub_bin")
+keyed_install_log="$(newdir)/kubectl-keyed-install.log"; tmpdirs+=("$(dirname "$keyed_install_log")")
+cat > "$keyed_install_stub_bin/kubectl" <<STUB
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$keyed_install_log"
+case "\$*" in
+    *"create secret"*) printf 'apiVersion: v1\nkind: Secret\n' ;;
+    *) cat >/dev/null ;;
+esac
+exit 0
+STUB
+chmod +x "$keyed_install_stub_bin/kubectl"
+if PATH="$keyed_install_stub_bin:$PATH" FORK_SANDBOX_CONFIG_DIR="$keyed_config_dir" \
+    "$k8s_sh" install >/dev/null 2>/tmp/fs-k8s-test-keyed-real-install.err; then
+    ok "a real (non-dry-run) keyed endpoints install exits 0 against a stubbed kubectl"
+else
+    no "a real (non-dry-run) keyed endpoints install exits 0 against a stubbed kubectl" \
+        "$(cat /tmp/fs-k8s-test-keyed-real-install.err)"
+fi
+# shellcheck disable=SC2016  # $upstream_key_secondary is nginx config, not shell
+if grep -qF 'create secret generic fork-sandbox-upstream-key --from-literal=upstream-key.conf=set $upstream_key_secondary "sk-secondary-test-dummy";' "$keyed_install_log"; then
+    ok "the real install creates the Secret with one 'set \$upstream_key_<name>' line for the keyed endpoint"
+else
+    no "the real install creates the Secret with one 'set \$upstream_key_<name>' line for the keyed endpoint" \
+        "$(cat "$keyed_install_log")"
+fi
+if grep -qF 'sk-secondary-test-dummy' /tmp/fs-k8s-test-keyed-real-install.err; then
+    no "the real install's own stderr never carries the keyed value" \
+        "$(cat /tmp/fs-k8s-test-keyed-real-install.err)"
+else
+    ok "the real install's own stderr never carries the keyed value"
+fi
+
+# An endpoint declared keyed but missing (or empty) in pi.env is a
+# install-time error naming both the endpoint and the variable. This check
+# runs after the main manifest `kubectl apply` (same as the legacy
+# OPENROUTER_API_KEY check it mirrors), so a stubbed kubectl stands in for
+# a live cluster -- same technique as the real-install Secret-content test
+# above.
+missing_var_stub_bin="$(newdir)"; tmpdirs+=("$missing_var_stub_bin")
+cat > "$missing_var_stub_bin/kubectl" <<'STUB'
+#!/usr/bin/env bash
+cat >/dev/null
+exit 0
+STUB
+chmod +x "$missing_var_stub_bin/kubectl"
+
+missing_var_config_dir="$(newdir)"; tmpdirs+=("$missing_var_config_dir")
+cp "$keyed_config_dir/k8s.env" "$missing_var_config_dir/k8s.env"
+install -m 600 /dev/null "$missing_var_config_dir/pi.env"
+refuses "a keyed endpoint whose pi.env variable is missing is refused, naming both" \
+    "'secondary' keyed by MY_API_KEY, but MY_API_KEY is not set" \
+    env PATH="$missing_var_stub_bin:$PATH" FORK_SANDBOX_CONFIG_DIR="$missing_var_config_dir" \
+    "$k8s_sh" install
+
+empty_var_config_dir="$(newdir)"; tmpdirs+=("$empty_var_config_dir")
+cp "$keyed_config_dir/k8s.env" "$empty_var_config_dir/k8s.env"
+install -m 600 /dev/null "$empty_var_config_dir/pi.env"
+printf 'MY_API_KEY=\n' >> "$empty_var_config_dir/pi.env"
+refuses "a keyed endpoint whose pi.env variable is empty is refused, naming both" \
+    "'secondary' keyed by MY_API_KEY, but MY_API_KEY is not set" \
+    env PATH="$missing_var_stub_bin:$PATH" FORK_SANDBOX_CONFIG_DIR="$empty_var_config_dir" \
+    "$k8s_sh" install
+
+# An unregistered endpoint name in K8S_PROXY_ENDPOINT_KEYS is an
+# install-time error, nothing created.
+unreg_key_config_dir="$(newdir)"; tmpdirs+=("$unreg_key_config_dir")
+sed 's/^K8S_PROXY_ENDPOINT_KEYS=.*/K8S_PROXY_ENDPOINT_KEYS=bogus=MY_API_KEY/' \
+    "$keyed_config_dir/k8s.env" > "$unreg_key_config_dir/k8s.env"
+install -m 600 /dev/null "$unreg_key_config_dir/pi.env"
+printf 'MY_API_KEY=sk-secondary-test-dummy\n' >> "$unreg_key_config_dir/pi.env"
+refuses "an unregistered K8S_PROXY_ENDPOINT_KEYS endpoint name is refused" \
+    "but 'bogus' is not" \
+    env FORK_SANDBOX_CONFIG_DIR="$unreg_key_config_dir" "$k8s_sh" install --dry-run
+
+# A duplicate endpoint name in K8S_PROXY_ENDPOINT_KEYS is a parse-time error.
+dup_key_config_dir="$(newdir)"; tmpdirs+=("$dup_key_config_dir")
+sed 's/^K8S_PROXY_ENDPOINT_KEYS=.*/K8S_PROXY_ENDPOINT_KEYS=secondary=MY_API_KEY,secondary=OTHER_KEY/' \
+    "$keyed_config_dir/k8s.env" > "$dup_key_config_dir/k8s.env"
+refuses "a K8S_PROXY_ENDPOINT_KEYS name registered twice is refused" \
+    "endpoint 'secondary' more" \
+    env FORK_SANDBOX_CONFIG_DIR="$dup_key_config_dir" "$k8s_sh" install --dry-run
+
+# A K8S_PROXY_ENDPOINT_KEYS entry with a malformed VAR_NAME is a
+# parse-time error.
+bad_var_config_dir="$(newdir)"; tmpdirs+=("$bad_var_config_dir")
+sed 's/^K8S_PROXY_ENDPOINT_KEYS=.*/K8S_PROXY_ENDPOINT_KEYS=secondary=not-a-valid-name/' \
+    "$keyed_config_dir/k8s.env" > "$bad_var_config_dir/k8s.env"
+refuses "a K8S_PROXY_ENDPOINT_KEYS entry with a malformed VAR_NAME is refused" \
+    "is not a valid environment variable name" \
+    env FORK_SANDBOX_CONFIG_DIR="$bad_var_config_dir" "$k8s_sh" install --dry-run
+
+rm -f /tmp/fs-k8s-test-keyed-install.err /tmp/fs-k8s-test-keyed-real-install.err
+
 rm -f /tmp/fs-k8s-test-endpoints-install.err /tmp/fs-k8s-test-allow-install.err \
     /tmp/fs-k8s-test-http-private.out /tmp/fs-k8s-test-http-private.err \
     /tmp/fs-k8s-test-endpoints-http-private.out /tmp/fs-k8s-test-endpoints-http-private.err \

@@ -274,10 +274,23 @@
 #                         The legacy single, API-keyed upstream. install
 #                         requires this or K8S_PROXY_ENDPOINTS, never both.
 #   K8S_PROXY_ENDPOINTS=  <name>=<base-url>[,<name>=<base-url>...] -- one or
-#                         more named, keyless, OpenAI-compatible endpoints
-#                         (vLLM, Ollama, TGI), e.g.
-#                         primary=http://10.0.0.5:8001/v1. Mutually
-#                         exclusive with K8S_PROXY_UPSTREAM.
+#                         more named OpenAI-compatible endpoints (vLLM,
+#                         Ollama, TGI, or a keyed in-cluster gateway), e.g.
+#                         primary=http://10.0.0.5:8001/v1. Keyless by
+#                         default; see K8S_PROXY_ENDPOINT_KEYS below to key
+#                         one. Mutually exclusive with K8S_PROXY_UPSTREAM.
+#   K8S_PROXY_ENDPOINT_KEYS=
+#                         <name>=<VAR_NAME>[,<name>=<VAR_NAME>...] -- keys a
+#                         K8S_PROXY_ENDPOINTS entry. <name> must already be
+#                         registered there; <VAR_NAME> is the NAME of a
+#                         variable in pi.env holding the credential -- never
+#                         the value itself, since this file is published for
+#                         onboarding. install refuses if the named variable
+#                         is missing or empty in pi.env, naming both the
+#                         endpoint and the variable. The value is stored in
+#                         a Secret, mounted into the proxy only, and never
+#                         reaches the agent pod -- same handling as
+#                         K8S_PROXY_UPSTREAM's own key, one layer down.
 #   K8S_DEFAULT_ENDPOINT= the K8S_PROXY_ENDPOINTS entry a run is wired to
 #                         when neither submit nor run names one with
 #                         --endpoint. Optional, and only meaningful on an
@@ -434,6 +447,9 @@ K8S_NAMESPACE="${K8S_NAMESPACE:-fork-sandbox}"
 K8S_IMAGE="$(read_env_value "$k8s_env" K8S_IMAGE || true)"
 K8S_PROXY_UPSTREAM="$(read_env_value "$k8s_env" K8S_PROXY_UPSTREAM || true)"
 K8S_PROXY_ENDPOINTS="$(read_env_value "$k8s_env" K8S_PROXY_ENDPOINTS || true)"
+# Keys a K8S_PROXY_ENDPOINTS entry -- holds the VAR_NAME only, never the
+# value; see parse_proxy_endpoint_keys and cmd_install's Secret handling.
+K8S_PROXY_ENDPOINT_KEYS="$(read_env_value "$k8s_env" K8S_PROXY_ENDPOINT_KEYS || true)"
 K8S_DEFAULT_ENDPOINT="$(read_env_value "$k8s_env" K8S_DEFAULT_ENDPOINT || true)"
 K8S_PROXY_ALLOW="$(read_env_value "$k8s_env" K8S_PROXY_ALLOW || true)"
 # Namespace-selector egress allowlist, composing with K8S_PROXY_ALLOW --
@@ -500,7 +516,8 @@ if [[ ! "$K8S_SERVICES_MAX" =~ ^[0-9]+$ ]]; then
 fi
 
 fs_reject_unsafe_chars "$K8S_CONTEXT" "$K8S_NAMESPACE" "$K8S_IMAGE" \
-    "$K8S_PROXY_UPSTREAM" "$K8S_PROXY_ENDPOINTS" "$K8S_PROXY_ALLOW" \
+    "$K8S_PROXY_UPSTREAM" "$K8S_PROXY_ENDPOINTS" "$K8S_PROXY_ENDPOINT_KEYS" \
+    "$K8S_PROXY_ALLOW" \
     "$K8S_PROXY_ALLOW_NS" "$K8S_CLUSTER_DOMAIN" \
     "$K8S_DENIED_PROBE" "$GIT_USER_NAME" "$GIT_USER_EMAIL" \
     "$K8S_SERVICE_MAX_CPU" "$K8S_SERVICE_MAX_MEMORY" \
@@ -1241,6 +1258,73 @@ parse_proxy_endpoints() {
     return 0
 }
 
+# Parses K8S_PROXY_ENDPOINT_KEYS ("<name>=<VAR_NAME>,<name>=<VAR_NAME>,...")
+# into the KEYED_ENDPOINT_NAMES / KEYED_ENDPOINT_VARS arrays (module-global,
+# same convention as PROXY_ENDPOINT_NAMES/_URLS above). <name> is meant to be
+# a K8S_PROXY_ENDPOINTS entry, but that is NOT cross-checked here -- callers
+# (cmd_install) do that separately, after both parsers have run, so an
+# unregistered name can be reported naming both halves (the endpoint and the
+# pi.env variable) at once, which this parser alone cannot do. <VAR_NAME> is
+# the NAME of a variable in pi.env holding the credential -- this file holds
+# only the name, never the value, since k8s.env is published for onboarding
+# (see docs/kubernetes-runs.md). An empty spec is not an error -- an install
+# with no keyed endpoints is the common case.
+parse_proxy_endpoint_keys() {
+    local spec="$1" entry name var_name seen=","
+    KEYED_ENDPOINT_NAMES=()
+    KEYED_ENDPOINT_VARS=()
+    [[ -z "$spec" ]] && return 0
+
+    local -a entries
+    IFS=',' read -ra entries <<< "$spec"
+    for entry in "${entries[@]}"; do
+        if [[ "$entry" != *=* ]]; then
+            echo "Error: K8S_PROXY_ENDPOINT_KEYS entry '$entry' is not" >&2
+            echo "<endpoint-name>=<VAR_NAME>." >&2
+            return 1
+        fi
+        name="${entry%%=*}"
+        var_name="${entry#*=}"
+        if [[ -z "$name" ]]; then
+            echo "Error: K8S_PROXY_ENDPOINT_KEYS entry '$entry' has an empty" >&2
+            echo "endpoint name." >&2
+            return 1
+        fi
+        if [[ -z "$var_name" ]]; then
+            echo "Error: K8S_PROXY_ENDPOINT_KEYS entry '$name' has an empty" >&2
+            echo "variable name." >&2
+            return 1
+        fi
+        if [[ ! "$var_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+            echo "Error: K8S_PROXY_ENDPOINT_KEYS variable name '$var_name' (for" >&2
+            echo "endpoint '$name') is not a valid environment variable name --" >&2
+            echo 'it must match ^[A-Za-z_][A-Za-z0-9_]*$.' >&2
+            return 1
+        fi
+        if [[ "$seen" == *",$name,"* ]]; then
+            echo "Error: K8S_PROXY_ENDPOINT_KEYS names endpoint '$name' more" >&2
+            echo "than once. Each endpoint can be keyed at most once." >&2
+            return 1
+        fi
+        seen+="$name,"
+        KEYED_ENDPOINT_NAMES+=("$name")
+        KEYED_ENDPOINT_VARS+=("$var_name")
+    done
+    return 0
+}
+
+# True (0) if $1 is a K8S_PROXY_ENDPOINT_KEYS-registered endpoint name, per
+# the KEYED_ENDPOINT_NAMES array parse_proxy_endpoint_keys filled in. Used by
+# render_proxy_locations_body to decide which endpoint's location blocks get
+# an Authorization header.
+is_keyed_endpoint() {
+    local name="$1" k
+    for k in "${KEYED_ENDPOINT_NAMES[@]}"; do
+        [[ "$k" == "$name" ]] && return 0
+    done
+    return 1
+}
+
 # Parses K8S_PROXY_ALLOW ("<cidr>:<port>,<cidr>:<port>,...") into the
 # PROXY_ALLOW_CIDRS / PROXY_ALLOW_PORTS arrays (module-global). An empty spec
 # is not an error -- cmd_install renders today's default RFC1918-except
@@ -1478,10 +1562,16 @@ render_proxy_egress_rules_sub() {
 # arrays parse_proxy_endpoints filled in) renders two EXACT-match locations
 # per registered name -- /e/<name>/v1/chat/completions and
 # /e/<name>/v1/models -- never a regex or prefix match: N endpoints must
-# widen the surface by exactly 2N known paths and nothing else. Neither
-# carries an Authorization header -- a registered endpoint is keyless by
-# construction in this round; see cmd_install's Secret/include handling for
-# the other half of that. Preserves the same $upstream variable-in-proxy_pass
+# widen the surface by exactly 2N known paths and nothing else. An endpoint
+# is keyless by default -- neither location carries an Authorization header
+# -- unless it is named in K8S_PROXY_ENDPOINT_KEYS (is_keyed_endpoint above),
+# in which case BOTH of its locations get
+# `proxy_set_header Authorization "Bearer $upstream_key_<name>"` -- an
+# endpoint whose key is only on the completions path leaves model discovery
+# 401ing, which surfaces pod-side as a dead run rather than a config error,
+# so both paths matter equally here. See cmd_install's Secret/include
+# handling for the other half of that. Preserves the same
+# $upstream variable-in-proxy_pass
 # trick and resolver the legacy block uses (see manifests/k8s/30-proxy.yaml's
 # own comment on it) so nginx resolves each endpoint's host at request time
 # rather than pinning a DNS answer at startup.
@@ -1506,11 +1596,13 @@ render_proxy_locations() {
 # manifests/k8s/30-proxy.yaml -- kept as a STATIC block in that file, never a
 # placeholder token, specifically so the legacy K8S_PROXY_UPSTREAM path needs
 # no substitution machinery here at all and its bytes cannot drift. A
-# K8S_PROXY_ENDPOINTS install strips this exact block out of the rendered
-# text instead (see strip_proxy_key_include below): a registered endpoint is
-# keyless by construction in this round, so it must create no Secret and
-# include no such file -- see cmd_install's own Secret-creation guard for the
-# other half of that.
+# K8S_PROXY_ENDPOINTS install with no K8S_PROXY_ENDPOINT_KEYS entries strips
+# this exact block out of the rendered text instead (see
+# strip_proxy_key_include below): a keyless registry must create no Secret
+# and include no such file -- see cmd_install's own Secret-creation guard
+# for the other half of that. An endpoints install with at least one keyed
+# endpoint keeps this block, same as the legacy path -- both need
+# $upstream_key* defined from the mounted Secret.
 proxy_key_include_block() {
     local block
     # $() strips ALL trailing newlines, not just one, so the heredoc's own
@@ -1627,12 +1719,23 @@ EOF
         return 0
     fi
 
-    local i name base host
+    local i name base host nginx_var auth_header
     for (( i = 0; i < ${#PROXY_ENDPOINT_NAMES[@]}; i++ )); do
         name="${PROXY_ENDPOINT_NAMES[$i]}"
         base="${PROXY_ENDPOINT_URLS[$i]}"
         host="${base#*://}"
         host="${host%%/*}"
+        # Only a K8S_PROXY_ENDPOINT_KEYS-registered name gets an
+        # Authorization header, on BOTH of its locations below -- an empty
+        # auth_header leaves the rendered text byte-identical to a keyless
+        # endpoint's, which is what keeps the no-K8S_PROXY_ENDPOINT_KEYS
+        # case unchanged.
+        auth_header=""
+        if is_keyed_endpoint "$name"; then
+            nginx_var="upstream_key_${name//-/_}"
+            printf -v auth_header '\n                proxy_set_header Authorization "Bearer $%s";\n                proxy_hide_header Authorization;' \
+                "$nginx_var"
+        fi
         (( i > 0 )) && printf '\n'
         cat <<EOF
             location = /e/$name/v1/chat/completions {
@@ -1646,7 +1749,7 @@ EOF
                 proxy_ssl_verify_depth 3;
                 proxy_ssl_server_name on;
                 proxy_ssl_name "$host";
-                proxy_set_header Host "$host";
+                proxy_set_header Host "$host";${auth_header}
             }
 
             location = /e/$name/v1/models {
@@ -1660,7 +1763,7 @@ EOF
                 proxy_ssl_verify_depth 3;
                 proxy_ssl_server_name on;
                 proxy_ssl_name "$host";
-                proxy_set_header Host "$host";
+                proxy_set_header Host "$host";${auth_header}
             }
 EOF
     done
@@ -1700,6 +1803,30 @@ cmd_install() {
     # anything is rendered or applied, same as every other check in this
     # function.
     parse_proxy_endpoints "$K8S_PROXY_ENDPOINTS" || exit 1
+
+    # Fills the module-global KEYED_ENDPOINT_NAMES / KEYED_ENDPOINT_VARS
+    # arrays render_proxy_locations (is_keyed_endpoint) and the Secret
+    # creation below both read. Cross-checking each keyed name against the
+    # registry parse_proxy_endpoints just filled happens here, not inside
+    # the parser itself, so the error can name both halves at once.
+    parse_proxy_endpoint_keys "$K8S_PROXY_ENDPOINT_KEYS" || exit 1
+    local key_i key_name key_found key_known
+    for (( key_i = 0; key_i < ${#KEYED_ENDPOINT_NAMES[@]}; key_i++ )); do
+        key_name="${KEYED_ENDPOINT_NAMES[$key_i]}"
+        key_found=false
+        for key_known in "${PROXY_ENDPOINT_NAMES[@]}"; do
+            if [[ "$key_known" == "$key_name" ]]; then
+                key_found=true
+                break
+            fi
+        done
+        if ! $key_found; then
+            echo "Error: K8S_PROXY_ENDPOINT_KEYS names endpoint '$key_name'," >&2
+            echo "keyed by ${KEYED_ENDPOINT_VARS[$key_i]}, but '$key_name' is not" >&2
+            echo "registered in K8S_PROXY_ENDPOINTS." >&2
+            exit 1
+        fi
+    done
 
     # Fills the module-global PROXY_ALLOW_CIDRS / PROXY_ALLOW_PORTS arrays
     # render_proxy_egress_rules reads below. K8S_PROXY_ALLOW is independent
@@ -1826,15 +1953,18 @@ cmd_install() {
             # K8S_PROXY_ALLOW must render byte-identical to today's default.
             file_rendered="$(render_proxy_egress_rules_sub "$file_rendered")" || exit 1
 
-            # A K8S_PROXY_ENDPOINTS (keyless) install creates no
-            # fork-sandbox-upstream-key Secret below, so it must not include
-            # a file that Secret is the only thing that ever mounts --
-            # nginx would otherwise crashloop on a missing include -- and it
-            # must not reference that Secret from the Deployment's volumes
-            # either, or kubelet refuses to start the pod at all. The
-            # legacy K8S_PROXY_UPSTREAM path leaves both in place untouched,
-            # which is what keeps its render byte-identical.
-            if [[ -z "$K8S_PROXY_UPSTREAM" ]]; then
+            # A K8S_PROXY_ENDPOINTS install with no keyed endpoints creates
+            # no fork-sandbox-upstream-key Secret below, so it must not
+            # include a file that Secret is the only thing that ever mounts
+            # -- nginx would otherwise crashloop on a missing include -- and
+            # it must not reference that Secret from the Deployment's
+            # volumes either, or kubelet refuses to start the pod at all.
+            # The legacy K8S_PROXY_UPSTREAM path, and an endpoints install
+            # with at least one K8S_PROXY_ENDPOINT_KEYS entry, both leave
+            # both in place untouched -- either one needs the same Secret
+            # mounted, just with different content -- which is what keeps a
+            # keyless install's render byte-identical.
+            if [[ -z "$K8S_PROXY_UPSTREAM" && ${#KEYED_ENDPOINT_NAMES[@]} -eq 0 ]]; then
                 file_rendered="$(strip_proxy_key_include "$file_rendered")" || exit 1
                 file_rendered="$(strip_proxy_key_volume "$file_rendered")" || exit 1
             fi
@@ -1856,16 +1986,22 @@ cmd_install() {
 
     if [[ "$dry_run" == true ]]; then
         printf '%s\n' "$rendered"
+        local dry_key_name
+        for dry_key_name in "${KEYED_ENDPOINT_NAMES[@]}"; do
+            printf '# (dry-run) would create/update Secret fork-sandbox-upstream-key entry for K8S_PROXY_ENDPOINTS endpoint '\''%s'\'' here -- not shown.\n' \
+                "$dry_key_name"
+        done
         exit 0
     fi
 
     printf '%s\n' "$rendered" | kubectl apply -f -
 
-    # OPENROUTER_API_KEY is required, and this Secret is created, ONLY on
-    # the legacy K8S_PROXY_UPSTREAM path -- a K8S_PROXY_ENDPOINTS install is
-    # keyless by construction (see proxy_key_include_block/
-    # strip_proxy_key_include above for the other half of that) and reads no
-    # credential from pi.env at all.
+    # OPENROUTER_API_KEY is required, and this Secret is created, on the
+    # legacy K8S_PROXY_UPSTREAM path. On a K8S_PROXY_ENDPOINTS install the
+    # Secret is created only when at least one endpoint is named in
+    # K8S_PROXY_ENDPOINT_KEYS -- a keyless endpoints install (see
+    # proxy_key_include_block/strip_proxy_key_include above for the other
+    # half of that) reads no credential from pi.env at all.
     if [[ -n "$K8S_PROXY_UPSTREAM" ]]; then
         require_secret_file "$pi_env" || exit 1
         local api_key
@@ -1879,6 +2015,37 @@ cmd_install() {
         fs_reject_unsafe_chars "$api_key" || exit 1
         kubectl create secret generic fork-sandbox-upstream-key \
             --from-literal="upstream-key.conf=set \$upstream_key \"$api_key\";" \
+            --dry-run=client -o yaml | kubectl apply -f -
+    elif [[ ${#KEYED_ENDPOINT_NAMES[@]} -gt 0 ]]; then
+        require_secret_file "$pi_env" || exit 1
+        local secret_content="" key_j key_endpoint key_var key_value key_nginx_var
+        for (( key_j = 0; key_j < ${#KEYED_ENDPOINT_NAMES[@]}; key_j++ )); do
+            key_endpoint="${KEYED_ENDPOINT_NAMES[$key_j]}"
+            key_var="${KEYED_ENDPOINT_VARS[$key_j]}"
+            key_value="$(read_env_value "$pi_env" "$key_var" || true)"
+            if [[ -z "$key_value" ]]; then
+                echo "Error: K8S_PROXY_ENDPOINT_KEYS declares endpoint" >&2
+                echo "'$key_endpoint' keyed by $key_var, but $key_var is not set" >&2
+                echo "(or is empty) in $pi_env." >&2
+                exit 1
+            fi
+            fs_reject_unsafe_chars "$key_value" || exit 1
+            # Endpoint names are already validated as RFC1123 labels by
+            # parse_proxy_endpoints, so '-' is the only character this
+            # mapping ever needs to rewrite -- but assert the result is a
+            # legal nginx variable name anyway, rather than trust that
+            # invariant silently: a future loosening of the endpoint-name
+            # regex should fail loudly here, not render broken nginx config.
+            key_nginx_var="upstream_key_${key_endpoint//-/_}"
+            if [[ ! "$key_nginx_var" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+                echo "Error: endpoint name '$key_endpoint' does not map to a" >&2
+                echo "legal nginx variable name ('\$$key_nginx_var')." >&2
+                exit 1
+            fi
+            secret_content+="set \$$key_nginx_var \"$key_value\";"$'\n'
+        done
+        kubectl create secret generic fork-sandbox-upstream-key \
+            --from-literal="upstream-key.conf=$secret_content" \
             --dry-run=client -o yaml | kubectl apply -f -
     fi
 

@@ -671,13 +671,34 @@ Concretely, for the OpenRouter upstream v1 ships:
 This is the mode a real provider (OpenRouter, and by extension any API-keyed
 service) requires, because the key has to live somewhere.
 
-`K8S_PROXY_ENDPOINTS` is a keyless variant of this same mode, for a
-self-hosted OpenAI-compatible server (vLLM, Ollama, TGI) that needs no
-`Authorization` header at all: `K8S_PROXY_ENDPOINTS=<name>=<base-url>[,...]`
-registers one or more named upstreams instead of `K8S_PROXY_UPSTREAM`
-(mutually exclusive with it), each widening the proxy by two exact-match
-paths, `/e/<name>/v1/chat/completions` and `/e/<name>/v1/models`. `install`
-creates no Secret and injects no `Authorization` header on this path.
+`K8S_PROXY_ENDPOINTS` is a variant of this same mode for one or more named
+upstreams instead of a single one: `K8S_PROXY_ENDPOINTS=<name>=<base-url>[,...]`
+registers them instead of `K8S_PROXY_UPSTREAM` (mutually exclusive with
+it), each widening the proxy by two exact-match paths,
+`/e/<name>/v1/chat/completions` and `/e/<name>/v1/models`. A registered
+endpoint is keyless by default (`install` creates no Secret and injects no
+`Authorization` header for it) — the common case for a self-hosted
+OpenAI-compatible server (vLLM, Ollama, TGI) that needs no credential at
+all. An endpoint that does need one — an in-cluster gateway sitting in
+front of several models, for instance — can be keyed instead:
+`K8S_PROXY_ENDPOINT_KEYS=<name>=<VAR_NAME>[,...]` names a registered
+endpoint and the NAME of a variable in `pi.env` holding its credential.
+The value itself is never written to `k8s.env` (only the variable's name
+is) — `k8s.env` is published for onboarding, so a credential there would
+be a credential on a web server. `install` reads `VAR_NAME`'s value from
+`pi.env` (permission-checked the same way `OPENROUTER_API_KEY` is),
+refusing — naming both the endpoint and the variable — if it is missing or
+empty, and renders it into the same `fork-sandbox-upstream-key` Secret as
+the legacy path, one `set $upstream_key_<name> "...";` entry per keyed
+endpoint (`-` mapped to `_` for the nginx variable name). Both of a keyed
+endpoint's locations carry the `Authorization` header — model discovery
+would otherwise 401 even though chat completions worked — and every other
+registered endpoint (keyless, or keyed under a different name) is
+untouched. `install --dry-run` never shows the value: it prints that a
+Secret entry *would be created*, naming only the endpoint. One key per
+endpoint, shared by every run using it — there is no per-run or
+per-operator credential here.
+
 `http://` is accepted here (and on `K8S_PROXY_UPSTREAM`) when the host is a
 literal private IPv4 address (RFC1918, loopback, or link-local), or when it
 is a Kubernetes Service DNS name — a host ending in
