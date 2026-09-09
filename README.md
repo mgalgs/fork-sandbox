@@ -415,17 +415,17 @@ gets out of the way, so `fork-sandbox status --result <run-dir>` and
 spellings work — the verbs keep one name on your PATH instead of six. Each
 prints its full doc with `--help`, and a `--help` after a verb reaches the
 underlying script. Everything not listed here — `fork-sandbox-lib.sh`, the
-pod-side k8s scripts, `sandbox-backend-*` — is plumbing you reach through
-`script_dir`, not by typing its name.
+pod-side k8s scripts, `sandbox-backend-*` — is plumbing, reached through the
+calling script's own directory rather than by typing its name.
 
-This list is "commands worth typing," not the full porcelain/plumbing split.
-`install.sh` holds that authoritative split — the PORCELAIN/PLUMBING lists
-that decide what it links onto PATH — and it includes a few names this list
-omits because they're invoked by another script rather than typed directly:
-`agent-sandboxed`, `pi-sandboxed`, `build-sandbox-image.sh`,
-`ensure-scratch-dirs.sh`, `sandbox-run-log.py`, `lkml-cover.sh` and
-`lkml-summarize.sh`. Classify a new script by reading `install.sh`, not this
-list.
+The examples below are the ones worth showing, not the list that decides
+what lands on your PATH. `install.sh` decides that, in its `PORCELAIN` and
+`PLUMBING` arrays, and it draws the line by a stricter test: porcelain means
+something has to find this **without** a `script_dir` to search from — a
+hook that invokes it by bare name, or another script with its installed path
+hardcoded. That catches names nobody ever types, which is why `lkml-round.sh`
+refuses to start when `lkml-summarize.sh` is missing from PATH. Classify a
+new script in `install.sh`, not here.
 
 ```bash
 # Launch a run, get a branch back — the engine under /fork-sandbox and
