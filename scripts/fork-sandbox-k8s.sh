@@ -303,6 +303,21 @@
 #                         line that never mentions it). Precedence:
 #                         --endpoint, then this key, then the single
 #                         registered endpoint.
+#   K8S_DEFAULT_MODEL=    the model a run uses when neither submit nor run
+#                         names one with --model. Optional, and only
+#                         meaningful on an endpoints install where the pod
+#                         would otherwise discover the model from the
+#                         endpoint's /v1/models at startup -- a --harness
+#                         claude run still requires --model regardless,
+#                         since discovery lists the pi endpoint's model
+#                         ids, never a Claude Code model name. Precedence:
+#                         --model, then this key, then the pod's own
+#                         single-candidate discovery rule, then that
+#                         discovery's error listing what it found. A value
+#                         the endpoint's listing does not contain is a
+#                         warning at pod start, not an error -- the
+#                         listing may be stale, and refusing would strand
+#                         a legitimate run.
 #   K8S_CLUSTER_DOMAIN=   the cluster's own DNS domain, defaults to
 #                         cluster.local. A K8S_PROXY_UPSTREAM or
 #                         K8S_PROXY_ENDPOINTS URL on http:// to a host
@@ -451,6 +466,10 @@ K8S_PROXY_ENDPOINTS="$(read_env_value "$k8s_env" K8S_PROXY_ENDPOINTS || true)"
 # value; see parse_proxy_endpoint_keys and cmd_install's Secret handling.
 K8S_PROXY_ENDPOINT_KEYS="$(read_env_value "$k8s_env" K8S_PROXY_ENDPOINT_KEYS || true)"
 K8S_DEFAULT_ENDPOINT="$(read_env_value "$k8s_env" K8S_DEFAULT_ENDPOINT || true)"
+# Default model for a run with no --model, on a K8S_PROXY_ENDPOINTS
+# install; see the model-requirement block in cmd_submit, which resolves
+# it with the same precedence shape as K8S_DEFAULT_ENDPOINT above.
+K8S_DEFAULT_MODEL="$(read_env_value "$k8s_env" K8S_DEFAULT_MODEL || true)"
 K8S_PROXY_ALLOW="$(read_env_value "$k8s_env" K8S_PROXY_ALLOW || true)"
 # Namespace-selector egress allowlist, composing with K8S_PROXY_ALLOW --
 # see parse_proxy_allow_ns and render_proxy_egress_rules_ns below.
@@ -2186,6 +2205,16 @@ cmd_submit() {
         echo "lists the pi endpoint's model ids, not Claude Code model" >&2
         echo "names." >&2
         exit 1
+    elif [[ -z "$model" && -n "$K8S_DEFAULT_MODEL" ]]; then
+        # Same precedence shape as K8S_DEFAULT_ENDPOINT one layer up:
+        # --model wins, then this key, then the pod's own single-candidate
+        # discovery rule (fork-sandbox-k8s-entrypoint.sh), which only runs
+        # when MODEL still arrives at the pod empty. The claude-harness
+        # branch above must stay ahead of this one, so a claude run still
+        # requires --model even with K8S_DEFAULT_MODEL set.
+        model="$K8S_DEFAULT_MODEL"
+        echo "fork-sandbox-k8s: no --model given; using '$model'" >&2
+        echo "(K8S_DEFAULT_MODEL in $k8s_env)." >&2
     fi
     branch="${branch:-k8s-$(date +%Y%m%d-%H%M%S)}"
     # checkout_ref is caller-supplied and interpolated into a git command

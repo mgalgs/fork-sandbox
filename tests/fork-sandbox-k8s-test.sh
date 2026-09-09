@@ -942,6 +942,68 @@ refuses "submit --harness claude without --model on an endpoints install is refu
     env FORK_SANDBOX_CONFIG_DIR="$single_ep_config_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-branch --harness claude "$proj_dir" "$handoff_file"
 
+# == K8S_DEFAULT_MODEL -- a default model for a run with no --model ==
+# Precedence: --model, then K8S_DEFAULT_MODEL, then the pod's own
+# single-candidate discovery rule, mirroring K8S_DEFAULT_ENDPOINT one
+# layer up.
+default_model_config_dir="$(newdir)"; tmpdirs+=("$default_model_config_dir")
+cat > "$default_model_config_dir/k8s.env" <<'CONF'
+K8S_CONTEXT=test-context
+K8S_NAMESPACE=fork-sandbox-test
+K8S_IMAGE=registry.example/you/fork-sandbox:latest
+K8S_PROXY_ENDPOINTS=primary=http://10.0.0.5:8001/v1
+K8S_DEFAULT_MODEL=qwen3-8b
+K8S_DENIED_PROBE=10.0.0.1:443
+CONF
+
+# An explicit --model wins over K8S_DEFAULT_MODEL.
+def_model_flag_out="$(newdir)/def-model-flag-submit.yaml"; tmpdirs+=("$(dirname "$def_model_flag_out")")
+if FORK_SANDBOX_CONFIG_DIR="$default_model_config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model moonshotai/kimi-k3 \
+    "$proj_dir" "$handoff_file" > "$def_model_flag_out" 2>/dev/null; then
+    ok "submit --model wins over K8S_DEFAULT_MODEL and exits 0"
+else
+    no "submit --model wins over K8S_DEFAULT_MODEL and exits 0" "(see rendered output)"
+fi
+model_env="$(grep -A1 'name: MODEL$' "$def_model_flag_out" | tail -n1)"
+check "the --model-over-default render carries the flagged model" \
+    '              value: "moonshotai/kimi-k3"' "$model_env"
+
+# No --model: K8S_DEFAULT_MODEL is used and announced on stderr.
+def_model_default_out="$(newdir)/def-model-default-submit.yaml"; tmpdirs+=("$(dirname "$def_model_default_out")")
+def_model_default_err="$(newdir)/def-model-default-submit.err"; tmpdirs+=("$(dirname "$def_model_default_err")")
+if FORK_SANDBOX_CONFIG_DIR="$default_model_config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch \
+    "$proj_dir" "$handoff_file" > "$def_model_default_out" 2>"$def_model_default_err"; then
+    ok "submit with no --model uses K8S_DEFAULT_MODEL against an endpoints install"
+else
+    no "submit with no --model uses K8S_DEFAULT_MODEL against an endpoints install" \
+        "$(cat "$def_model_default_err")"
+fi
+model_env="$(grep -A1 'name: MODEL$' "$def_model_default_out" | tail -n1)"
+check "the K8S_DEFAULT_MODEL resolution renders that model into MODEL" \
+    '              value: "qwen3-8b"' "$model_env"
+if grep -q 'K8S_DEFAULT_MODEL' "$def_model_default_err" && grep -q "'qwen3-8b'" "$def_model_default_err"; then
+    ok "the K8S_DEFAULT_MODEL resolution announces itself on stderr"
+else
+    no "the K8S_DEFAULT_MODEL resolution announces itself on stderr" \
+        "$(cat "$def_model_default_err")"
+fi
+
+# --harness claude still requires --model even with K8S_DEFAULT_MODEL set:
+# discovery lists the pi endpoint's model ids, never a Claude Code model
+# name, so the claude-harness branch must be checked before the default
+# falls in.
+refuses "submit --harness claude with K8S_DEFAULT_MODEL set still requires --model" \
+    "not Claude Code model" \
+    env FORK_SANDBOX_CONFIG_DIR="$default_model_config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --harness claude "$proj_dir" "$handoff_file"
+
+# Unset K8S_DEFAULT_MODEL + no --model: MODEL stays empty (no regression --
+# already covered above by "the no-`--model` endpoints render carries an
+# empty MODEL env" against single_ep_config_dir, which sets no
+# K8S_DEFAULT_MODEL; named here so the pair reads together).
+
 # --endpoint against a legacy K8S_PROXY_UPSTREAM install is an error.
 refuses "submit --endpoint against a legacy K8S_PROXY_UPSTREAM install errors" \
     "K8S_PROXY_UPSTREAM; there are no named" \
