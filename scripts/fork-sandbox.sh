@@ -2482,8 +2482,8 @@ if [[ -n "${FORK_SANDBOX_RUN_SOURCE:-}" ]] \
     exit 1
 fi
 
-# --harness pi-local is sealed: no network at all, which is the property a
-# caller picks it for. Its implement leg stays sealed regardless of
+# --network sealed means no network at all, which is the property a caller
+# picks it for. The implement leg stays sealed regardless of
 # --review-harness -- it holds no credential and has no egress. But if the
 # review leg runs under a networked harness, that leg is a separate,
 # networked sandbox (see fs_build_sandbox_cmd rev), and the same clone's
@@ -2498,39 +2498,38 @@ fi
 # everyday reach, so warn by name instead and let the caller decide, rather
 # than have the seal's whole point leak out through a flag nobody thought
 # to cross-check. The reverse is fine and stays silent: a networked
-# implement harness reviewed by --review-harness pi-local adds no exposure
-# the run did not already have.
-if [[ "$review_harness_given" == true && "$harness" == "pi-local" \
-    && "$review_harness" != "pi-local" ]]; then
-    echo "Warning: --harness pi-local seals the implement leg -- no network" >&2
-    echo "at all -- but --review-harness $review_harness is networked. Its" >&2
-    echo "review leg is a separate sandbox and will send the clone's" >&2
-    echo "contents to $review_harness's model provider. Proceeding." >&2
+# implement harness reviewed by a sealed review leg adds no exposure the
+# run did not already have.
+if [[ "$review_harness_given" == true && "$network" == "sealed" \
+    && "${review_network:-}" != "sealed" ]]; then
+    echo "Warning: the implement leg is sealed -- no network at all -- but" >&2
+    echo "--review-harness $review_harness is networked. Its review leg is" >&2
+    echo "a separate sandbox and will send the clone's contents to" >&2
+    echo "$review_harness's model provider. Proceeding." >&2
 fi
 # The same seal tradeoff for the maintainer tier: a sealed implement leg is
 # fine, a networked maintainer leg widens the run's reach, and that is the
 # caller's judgement call for the same reason as above.
-if [[ -n "$fix_harness" && "$harness" == "pi-local" \
-    && "$fix_harness" != "pi-local" ]]; then
-    echo "Warning: --harness pi-local seals the implement leg -- no network" >&2
-    echo "at all -- but the preset's review fix seat runs $fix_harness, which" >&2
-    echo "is networked. Its fix legs will send the clone's contents to" >&2
+if [[ -n "$fix_harness" && "$network" == "sealed" \
+    && "${fix_network:-}" != "sealed" ]]; then
+    echo "Warning: the implement leg is sealed -- no network at all -- but" >&2
+    echo "the preset's review fix seat runs $fix_harness, which is" >&2
+    echo "networked. Its fix legs will send the clone's contents to" >&2
     echo "$fix_harness's model provider. Proceeding." >&2
 fi
-if [[ -n "$mntfix_harness" && "$harness" == "pi-local" \
-    && "$mntfix_harness" != "pi-local" ]]; then
-    echo "Warning: --harness pi-local seals the implement leg -- no network" >&2
-    echo "at all -- but the preset's maintain fix seat runs $mntfix_harness," >&2
-    echo "which is networked. Its fix legs will send the clone's contents to" >&2
+if [[ -n "$mntfix_harness" && "$network" == "sealed" \
+    && "${mntfix_network:-}" != "sealed" ]]; then
+    echo "Warning: the implement leg is sealed -- no network at all -- but" >&2
+    echo "the preset's maintain fix seat runs $mntfix_harness, which is" >&2
+    echo "networked. Its fix legs will send the clone's contents to" >&2
     echo "$mntfix_harness's model provider. Proceeding." >&2
 fi
-if [[ "$maintainer_harness_given" == true && "$harness" == "pi-local" \
-    && "$maintainer_harness" != "pi-local" ]]; then
-    echo "Warning: --harness pi-local seals the implement leg -- no network" >&2
-    echo "at all -- but --maintainer-harness $maintainer_harness is networked." >&2
-    echo "Its maintainer legs are separate sandboxes and will send the" >&2
-    echo "clone's contents to $maintainer_harness's model provider." >&2
-    echo "Proceeding." >&2
+if [[ "$maintainer_harness_given" == true && "$network" == "sealed" \
+    && "${maintainer_network:-}" != "sealed" ]]; then
+    echo "Warning: the implement leg is sealed -- no network at all -- but" >&2
+    echo "--maintainer-harness $maintainer_harness is networked. Its" >&2
+    echo "maintainer legs are separate sandboxes and will send the clone's" >&2
+    echo "contents to $maintainer_harness's model provider. Proceeding." >&2
 fi
 
 # --refresh-at: refused outright, by name, on every harness but claude --
@@ -7112,7 +7111,7 @@ It sees committed state only, has no global ~/.claude, no ssh keys and no
 tailnet, and it cannot push.
 EOF
 
-if [[ "$harness" == "pi" ]]; then
+if [[ "$harness" == "pi" && "$network" != "sealed" ]]; then
     cat <<EOF
 The OpenRouter key in $harness_env_file is the one
 credential inside. No Claude token is copied, so this run cannot spend
@@ -7122,7 +7121,7 @@ $run_dir/events.jsonl rather than --result. Its session
 is copied to $run_dir/pi-session when the run
 ends, and the summary reports what the run cost from it.
 EOF
-elif [[ "$harness" == "pi-local" ]]; then
+elif [[ "$harness" == "pi" && "$network" == "sealed" ]]; then
     cat <<EOF
 This sandbox has no network at all, and the model it runs on is one you
 host, so the implement leg holds no credential and costs nothing. Nothing
@@ -7133,7 +7132,8 @@ read
 $run_dir/events.jsonl rather than --result. Its session
 is copied to $run_dir/pi-session when the run ends.
 EOF
-    if [[ "$review_harness_given" == true && "$review_harness" != "pi-local" ]]; then
+    if [[ "$review_harness_given" == true \
+        && "${review_network:-}" != "sealed" ]]; then
         cat <<EOF
 Its review leg does not share that seal: --review-harness $review_harness
 runs in a separate, networked sandbox that carries whatever credential
@@ -7141,7 +7141,8 @@ $review_harness needs and can cost money. See review_sandbox_cmd in
 $run_dir/run.sh for exactly what it sends where.
 EOF
     fi
-    if [[ "${maintainer_loop_cap:-0}" != "0" && "$maintainer_harness" != "pi-local" ]]; then
+    if [[ "${maintainer_loop_cap:-0}" != "0" \
+        && "${maintainer_network:-}" != "sealed" ]]; then
         cat <<EOF
 Its maintainer legs do not share that seal either: --maintainer-harness
 $maintainer_harness runs in a separate, networked sandbox that carries

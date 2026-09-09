@@ -119,7 +119,7 @@ for networked in claude "pi/some-model" codex; do
         ok "--harness pi-local + --review-harness $networked is accepted"
     fi
     contains "--harness pi-local + --review-harness $networked warns of the exposure" \
-        "seals the implement leg" "$(cat "$err")"
+        "the implement leg is sealed" "$(cat "$err")"
 done
 out="$(dry --harness claude --review-loop 2 --review-harness pi-local 2>"$err" \
     | grep -E '^review_harness=')"

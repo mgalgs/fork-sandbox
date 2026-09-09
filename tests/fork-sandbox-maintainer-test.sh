@@ -207,7 +207,7 @@ for networked in claude "pi/some-model" codex; do
         ok "--harness pi-local + --maintainer-harness $networked is accepted"
     fi
     contains "--harness pi-local + --maintainer-harness $networked warns of the exposure" \
-        "seals the implement leg" "$(cat "$err")"
+        "the implement leg is sealed" "$(cat "$err")"
 done
 out="$(dry --harness claude --maintainer-loop 2 \
     --maintainer-harness pi-local --maintainer-model some-local-model 2>"$err" \
