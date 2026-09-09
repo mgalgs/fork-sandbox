@@ -516,6 +516,18 @@ if [[ ! "$K8S_NAMESPACE" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]]; then
     echo "Error: K8S_NAMESPACE='$K8S_NAMESPACE' is not a valid namespace name." >&2
     exit 1
 fi
+# Substituted straight into manifests and into nginx's `resolver` directive
+# (validate_upstream_url's own header, and both manifest render sites) with
+# no quoting of its own, so a shape check belongs here, the same as every
+# other key of this kind (K8S_NAMESPACE above) -- not just the generic
+# fs_reject_unsafe_chars pass below, which lets through characters (a
+# space, a `;`, a `|`) that break the sed substitution or the rendered
+# nginx directive without ever naming this key as the cause.
+if [[ ! "$K8S_CLUSTER_DOMAIN" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]]; then
+    echo "Error: K8S_CLUSTER_DOMAIN='$K8S_CLUSTER_DOMAIN' is not a valid DNS" >&2
+    echo "domain name." >&2
+    exit 1
+fi
 if [[ -n "$K8S_RUN_TTL" && ! "$K8S_RUN_TTL" =~ ^[0-9]+$ ]]; then
     echo "Error: K8S_RUN_TTL must be a number of seconds, got '$K8S_RUN_TTL'." >&2
     exit 1
@@ -665,6 +677,26 @@ require_secret_file() {
     if (( 8#$perms & 0077 )); then
         echo "Error: '$file' is mode $perms. It holds a secret, so it must" >&2
         echo "be 0600 or stricter. Run: chmod 600 '$file'" >&2
+        return 1
+    fi
+    return 0
+}
+
+# Refuses a credential that would break the nginx `set $var "...";` line
+# cmd_install renders it into: a literal '"' ends the string early (the rest
+# of the value spills out as bare nginx syntax), and a literal '$' starts
+# nginx variable interpolation even inside the double quotes, both making a
+# config nginx refuses to load -- crashlooping the proxy for every run in
+# the namespace, not just the one that supplied the bad value.
+# fs_reject_unsafe_chars (single quote / newline) guards a different set of
+# sinks -- the shell commands and run records this script builds -- and
+# does not cover this one.
+reject_nginx_unsafe_chars() {
+    local v="$1" label="$2"
+    if [[ "$v" == *'"'* || "$v" == *'$'* ]]; then
+        echo "Error: $label contains a '\"' or a '\$', which would break the" >&2
+        echo "nginx config line it is rendered into (set \$var \"...\";)." >&2
+        echo "Use a credential without those characters." >&2
         return 1
     fi
     return 0
@@ -1167,9 +1199,16 @@ validate_upstream_url() {
     host_only="${host%:*}"
 
     # A Service DNS name (the .svc. segment is what marks it as one,
-    # narrower than just "ends in the cluster domain") can never resolve
-    # outside the cluster, so it is accepted here before the IPv4-only
-    # path below even runs -- everything past this point is unchanged.
+    # narrower than just "ends in the cluster domain") resolves only inside
+    # the cluster's own DNS -- but an ExternalName Service can still CNAME
+    # that name to an arbitrary public host, so the name itself is not a
+    # guarantee of privateness. What actually blocks that path is the
+    # proxy's own NetworkPolicy egress (render_proxy_egress_rules /
+    # render_proxy_egress_rules_ns): a public IP matches neither the
+    # default ipBlock rule nor a namespaceSelector rule, so a Service name
+    # CNAMEd off-cluster still can't get a request out. Accepted here
+    # before the IPv4-only path below even runs -- everything past this
+    # point is unchanged.
     if [[ "$host_only" == *".svc.$K8S_CLUSTER_DOMAIN" ]]; then
         printf '%s' "$host"
         return 0
@@ -1424,11 +1463,25 @@ parse_proxy_allow_ns() {
             echo "kubernetes.io/metadata.name label shape." >&2
             return 1
         fi
-        if [[ -n "$port" ]] && { [[ ! "$port" =~ ^[0-9]{1,5}$ ]] || (( port < 1 || port > 65535 )); }; then
+        # Forced base 10 (10#$port): plain (( port < 1 || port > 65535 ))
+        # hands bash arithmetic a string it parses as a C-style integer
+        # literal, so a leading zero is octal -- "08"/"09" aren't valid
+        # octal digits at all and abort with a bash arithmetic error instead
+        # of this function's own message, leaving the port unvalidated and
+        # rendered as-is. validate_upstream_url's own header documents this
+        # same trap.
+        if [[ -n "$port" ]] && { [[ ! "$port" =~ ^[0-9]{1,5}$ ]] || (( 10#$port < 1 || 10#$port > 65535 )); }; then
             echo "Error: K8S_PROXY_ALLOW_NS entry '$entry' has an invalid port" >&2
             echo "'$port' -- must be 1-65535." >&2
             return 1
         fi
+        # Re-rendered below as a bare YAML `port: $port` (and compared with
+        # plain (( )) arithmetic by cmd_install's reachability check) --
+        # normalized to canonical decimal here so a leading-zero input like
+        # "08" never carries into either as a string the Kubernetes API
+        # reads as a named port (or crashes the same unforced-base
+        # arithmetic this parser just avoided).
+        [[ -n "$port" ]] && port="$(( 10#$port ))"
         PROXY_ALLOW_NS_NAMESPACES+=("$ns")
         PROXY_ALLOW_NS_PORTS+=("$port")
     done
@@ -1987,6 +2040,65 @@ cmd_install() {
         done
     fi
 
+    # Every credential this install's proxy needs, read from pi.env and
+    # validated, before anything is rendered or applied (and ahead of the
+    # --dry-run exit below, so --dry-run surfaces the same failure a real
+    # install would hit instead of certifying a config that cannot actually
+    # apply). A missing or unsafe credential caught only after `kubectl
+    # apply -f -` leaves the shared proxy's manifests applied -- including
+    # the upstream-key.conf include and Secret volume restored above
+    # whenever KEYED_ENDPOINT_NAMES is non-empty -- with no working Secret
+    # behind them: exactly the "MountVolume.SetUp failed ... secret not
+    # found" state strip_proxy_key_volume's own header says a keyless
+    # install must never reach, and on a K8S_PROXY_ENDPOINTS install this
+    # can take down a previously-working keyless proxy on a single typo'd
+    # K8S_PROXY_ENDPOINT_KEYS variable.
+    local api_key=""
+    local -a keyed_endpoint_values=() keyed_endpoint_nginx_vars=()
+    if [[ -n "$K8S_PROXY_UPSTREAM" ]]; then
+        require_secret_file "$pi_env" || exit 1
+        api_key="$(read_env_value "$pi_env" OPENROUTER_API_KEY || true)"
+        if [[ -z "$api_key" ]]; then
+            echo "Error: OPENROUTER_API_KEY not found in $pi_env. install reads" >&2
+            echo "the model proxy's key from the same file a local --harness pi" >&2
+            echo "run uses." >&2
+            exit 1
+        fi
+        fs_reject_unsafe_chars "$api_key" || exit 1
+        reject_nginx_unsafe_chars "$api_key" "OPENROUTER_API_KEY" || exit 1
+    elif [[ ${#KEYED_ENDPOINT_NAMES[@]} -gt 0 ]]; then
+        require_secret_file "$pi_env" || exit 1
+        local key_j key_endpoint key_var key_value key_nginx_var
+        for (( key_j = 0; key_j < ${#KEYED_ENDPOINT_NAMES[@]}; key_j++ )); do
+            key_endpoint="${KEYED_ENDPOINT_NAMES[$key_j]}"
+            key_var="${KEYED_ENDPOINT_VARS[$key_j]}"
+            key_value="$(read_env_value "$pi_env" "$key_var" || true)"
+            if [[ -z "$key_value" ]]; then
+                echo "Error: K8S_PROXY_ENDPOINT_KEYS declares endpoint" >&2
+                echo "'$key_endpoint' keyed by $key_var, but $key_var is not set" >&2
+                echo "(or is empty) in $pi_env." >&2
+                exit 1
+            fi
+            fs_reject_unsafe_chars "$key_value" || exit 1
+            reject_nginx_unsafe_chars "$key_value" \
+                "$key_var (K8S_PROXY_ENDPOINT_KEYS endpoint '$key_endpoint')" || exit 1
+            # Endpoint names are already validated as RFC1123 labels by
+            # parse_proxy_endpoints, so '-' is the only character this
+            # mapping ever needs to rewrite -- but assert the result is a
+            # legal nginx variable name anyway, rather than trust that
+            # invariant silently: a future loosening of the endpoint-name
+            # regex should fail loudly here, not render broken nginx config.
+            key_nginx_var="upstream_key_${key_endpoint//-/_}"
+            if [[ ! "$key_nginx_var" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+                echo "Error: endpoint name '$key_endpoint' does not map to a" >&2
+                echo "legal nginx variable name ('\$$key_nginx_var')." >&2
+                exit 1
+            fi
+            keyed_endpoint_values+=("$key_value")
+            keyed_endpoint_nginx_vars+=("$key_nginx_var")
+        done
+    fi
+
     resolve_platform || exit 1
 
     local manifests_dir
@@ -2067,53 +2179,23 @@ cmd_install() {
 
     printf '%s\n' "$rendered" | kubectl apply -f -
 
-    # OPENROUTER_API_KEY is required, and this Secret is created, on the
-    # legacy K8S_PROXY_UPSTREAM path. On a K8S_PROXY_ENDPOINTS install the
-    # Secret is created only when at least one endpoint is named in
-    # K8S_PROXY_ENDPOINT_KEYS -- a keyless endpoints install (see
+    # OPENROUTER_API_KEY/K8S_PROXY_ENDPOINT_KEYS credentials (api_key /
+    # keyed_endpoint_values) were already read from pi.env and validated
+    # above, before anything was rendered or applied -- this just builds
+    # and applies the Secret from those already-checked values. This Secret
+    # is created on the legacy K8S_PROXY_UPSTREAM path, or on a
+    # K8S_PROXY_ENDPOINTS install only when at least one endpoint is named
+    # in K8S_PROXY_ENDPOINT_KEYS -- a keyless endpoints install (see
     # proxy_key_include_block/strip_proxy_key_include above for the other
     # half of that) reads no credential from pi.env at all.
     if [[ -n "$K8S_PROXY_UPSTREAM" ]]; then
-        require_secret_file "$pi_env" || exit 1
-        local api_key
-        api_key="$(read_env_value "$pi_env" OPENROUTER_API_KEY || true)"
-        if [[ -z "$api_key" ]]; then
-            echo "Error: OPENROUTER_API_KEY not found in $pi_env. install reads" >&2
-            echo "the model proxy's key from the same file a local --harness pi" >&2
-            echo "run uses." >&2
-            exit 1
-        fi
-        fs_reject_unsafe_chars "$api_key" || exit 1
         kubectl create secret generic fork-sandbox-upstream-key \
             --from-literal="upstream-key.conf=set \$upstream_key \"$api_key\";" \
             --dry-run=client -o yaml | kubectl apply -f -
     elif [[ ${#KEYED_ENDPOINT_NAMES[@]} -gt 0 ]]; then
-        require_secret_file "$pi_env" || exit 1
-        local secret_content="" key_j key_endpoint key_var key_value key_nginx_var
+        local secret_content="" key_j
         for (( key_j = 0; key_j < ${#KEYED_ENDPOINT_NAMES[@]}; key_j++ )); do
-            key_endpoint="${KEYED_ENDPOINT_NAMES[$key_j]}"
-            key_var="${KEYED_ENDPOINT_VARS[$key_j]}"
-            key_value="$(read_env_value "$pi_env" "$key_var" || true)"
-            if [[ -z "$key_value" ]]; then
-                echo "Error: K8S_PROXY_ENDPOINT_KEYS declares endpoint" >&2
-                echo "'$key_endpoint' keyed by $key_var, but $key_var is not set" >&2
-                echo "(or is empty) in $pi_env." >&2
-                exit 1
-            fi
-            fs_reject_unsafe_chars "$key_value" || exit 1
-            # Endpoint names are already validated as RFC1123 labels by
-            # parse_proxy_endpoints, so '-' is the only character this
-            # mapping ever needs to rewrite -- but assert the result is a
-            # legal nginx variable name anyway, rather than trust that
-            # invariant silently: a future loosening of the endpoint-name
-            # regex should fail loudly here, not render broken nginx config.
-            key_nginx_var="upstream_key_${key_endpoint//-/_}"
-            if [[ ! "$key_nginx_var" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
-                echo "Error: endpoint name '$key_endpoint' does not map to a" >&2
-                echo "legal nginx variable name ('\$$key_nginx_var')." >&2
-                exit 1
-            fi
-            secret_content+="set \$$key_nginx_var \"$key_value\";"$'\n'
+            secret_content+="set \$${keyed_endpoint_nginx_vars[$key_j]} \"${keyed_endpoint_values[$key_j]}\";"$'\n'
         done
         kubectl create secret generic fork-sandbox-upstream-key \
             --from-literal="upstream-key.conf=$secret_content" \

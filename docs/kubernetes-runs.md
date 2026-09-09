@@ -704,13 +704,19 @@ literal private IPv4 address (RFC1918, loopback, or link-local), or when it
 is a Kubernetes Service DNS name — a host ending in
 `.svc.$K8S_CLUSTER_DOMAIN` (`K8S_CLUSTER_DOMAIN` defaults to `cluster.local`,
 overridable in `k8s.env` for a cluster with a different domain). A Service
-name resolves only inside the cluster, so unlike an arbitrary hostname its
-privateness needs no DNS lookup to verify — it can never route to the open
-internet. The `.svc.` segment is required (not just any name under the
-domain), since that is what marks a Service name specifically. Anything
-else still requires `https://`. The proxy's own `NetworkPolicy` egress
-otherwise defaults to any host except RFC1918/loopback/link-local/CGNAT on
-443, same as above — a private endpoint needs `K8S_PROXY_ALLOW=<cidr>:<port>[,...]`
+name resolves only inside the cluster's own DNS, so unlike an arbitrary
+hostname its privateness needs no DNS lookup to verify — but an
+`ExternalName` Service can still CNAME that name to an arbitrary public
+host, so the name alone is not a guarantee. What actually blocks that path
+is the proxy's own `NetworkPolicy` egress described below: a public IP
+matches neither the default ipBlock rule nor a `K8S_PROXY_ALLOW_NS`
+namespaceSelector rule, so a Service name CNAMEd off-cluster still can't
+get a request out. The `.svc.` segment is required (not just any name
+under the domain), since that is what marks a Service name specifically.
+Anything else still requires `https://`. The proxy's own `NetworkPolicy`
+egress otherwise defaults to any host except
+RFC1918/loopback/link-local/CGNAT on 443, same as above — a private
+endpoint needs `K8S_PROXY_ALLOW=<cidr>:<port>[,...]`
 to actually be reachable, since the default policy excepts exactly the
 address ranges `http://` is restricted to. A set `K8S_PROXY_ALLOW`
 *replaces* that default policy wholesale rather than extending it, so

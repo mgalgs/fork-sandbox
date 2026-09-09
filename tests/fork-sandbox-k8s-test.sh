@@ -1322,6 +1322,8 @@ K8S_IMAGE=registry.example/you/fork-sandbox:latest
 K8S_PROXY_UPSTREAM=http://10.0.0.5:8001
 K8S_DENIED_PROBE=10.0.0.1:443
 CONF
+install -m 600 /dev/null "$http_private_config_dir/pi.env"
+printf 'OPENROUTER_API_KEY=sk-test-dummy\n' >> "$http_private_config_dir/pi.env"
 if FORK_SANDBOX_CONFIG_DIR="$http_private_config_dir" "$k8s_sh" install --dry-run \
     >/tmp/fs-k8s-test-http-private.out 2>/tmp/fs-k8s-test-http-private.err; then
     ok "K8S_PROXY_UPSTREAM http:// to a private address is accepted"
@@ -1430,9 +1432,11 @@ else
 fi
 
 # http:// to an in-cluster Service DNS name (host ends in
-# .svc.$K8S_CLUSTER_DOMAIN) is accepted -- it can never route to the open
-# internet, so it needs no IPv4-privateness check at all. Default
-# K8S_CLUSTER_DOMAIN is cluster.local.
+# .svc.$K8S_CLUSTER_DOMAIN) is accepted without the IPv4-privateness check
+# below -- the proxy's own NetworkPolicy egress is what actually keeps this
+# safe even against an ExternalName Service CNAMEd off-cluster (see
+# validate_upstream_url's own header). Default K8S_CLUSTER_DOMAIN is
+# cluster.local.
 svc_dns_config_dir="$(newdir)"; tmpdirs+=("$svc_dns_config_dir")
 cat > "$svc_dns_config_dir/k8s.env" <<'CONF'
 K8S_CONTEXT=test-context
@@ -1467,6 +1471,24 @@ else
     no "http:// to a .svc.<K8S_CLUSTER_DOMAIN> name is accepted with a custom domain" \
         "$(cat /tmp/fs-k8s-test-custom-domain.err)"
 fi
+
+# K8S_CLUSTER_DOMAIN is substituted unquoted into manifests, a sed
+# expression, and nginx's `resolver` directive -- a bad shape must be a
+# named, load-time error (like K8S_NAMESPACE's own shape check), not a
+# `sed: unknown option` or a broken NetworkPolicy/nginx render.
+bad_domain_config_dir="$(newdir)"; tmpdirs+=("$bad_domain_config_dir")
+cp "$custom_domain_config_dir/k8s.env" "$bad_domain_config_dir/k8s.env"
+sed -i 's/^K8S_CLUSTER_DOMAIN=.*/K8S_CLUSTER_DOMAIN=clus|ter.local/' "$bad_domain_config_dir/k8s.env"
+refuses "a K8S_CLUSTER_DOMAIN with an invalid shape is refused" \
+    "K8S_CLUSTER_DOMAIN='clus|ter.local' is not a valid DNS" \
+    env FORK_SANDBOX_CONFIG_DIR="$bad_domain_config_dir" "$k8s_sh" install --dry-run
+
+injected_domain_config_dir="$(newdir)"; tmpdirs+=("$injected_domain_config_dir")
+cp "$custom_domain_config_dir/k8s.env" "$injected_domain_config_dir/k8s.env"
+sed -i 's/^K8S_CLUSTER_DOMAIN=.*/K8S_CLUSTER_DOMAIN=cluster.local; deny all/' "$injected_domain_config_dir/k8s.env"
+refuses "a K8S_CLUSTER_DOMAIN that would inject into the rendered nginx resolver line is refused" \
+    "is not a valid DNS" \
+    env FORK_SANDBOX_CONFIG_DIR="$injected_domain_config_dir" "$k8s_sh" install --dry-run
 
 # A host merely ending in the cluster domain, without the .svc. segment
 # that marks it as a Service name, is still refused -- the narrowest rule
@@ -1657,6 +1679,39 @@ refuses "a bad port in K8S_PROXY_ALLOW_NS is refused" \
     "has an invalid port" \
     env FORK_SANDBOX_CONFIG_DIR="$bad_ns_port_config_dir" "$k8s_sh" install --dry-run
 
+# A leading-zero port ("08") must not hit bash's unforced-base arithmetic
+# ("08": value too great for base) instead of this function's own range
+# check -- the same trap validate_upstream_url's own header documents and
+# guards against with 10#$octet. Left unguarded, the (( )) test's raw
+# arithmetic error leaves the && short-circuited to false, so no error is
+# raised and the literal string "08" renders straight into the
+# NetworkPolicy -- which the Kubernetes API reads as a *named* port (it
+# contains no letter, so it isn't one) and rejects the whole policy.
+# Correctly interpreted as decimal port 8 (in range), it must be accepted
+# -- but normalized to "8" in the render, never carried through as the
+# literal "08" string.
+leading_zero_ns_port_config_dir="$(newdir)"; tmpdirs+=("$leading_zero_ns_port_config_dir")
+cp "$bad_ns_port_config_dir/k8s.env" "$leading_zero_ns_port_config_dir/k8s.env"
+sed -i 's/^K8S_PROXY_ALLOW_NS=.*/K8S_PROXY_ALLOW_NS=example-ns:08/' \
+    "$leading_zero_ns_port_config_dir/k8s.env"
+leading_zero_ns_port_out="$(newdir)/leading-zero-ns-port-install.yaml"
+tmpdirs+=("$(dirname "$leading_zero_ns_port_out")")
+if FORK_SANDBOX_CONFIG_DIR="$leading_zero_ns_port_config_dir" "$k8s_sh" install --dry-run \
+    > "$leading_zero_ns_port_out" 2>/tmp/fs-k8s-test-leading-zero-ns-port.err; then
+    ok "a leading-zero port in K8S_PROXY_ALLOW_NS (decimal-valid) is accepted, not crashed on"
+else
+    no "a leading-zero port in K8S_PROXY_ALLOW_NS (decimal-valid) is accepted, not crashed on" \
+        "$(cat /tmp/fs-k8s-test-leading-zero-ns-port.err)"
+fi
+leading_zero_ns_port_netpol="$(extract_doc_by_kind NetworkPolicy "$leading_zero_ns_port_out")"
+if grep -qF 'port: 8' <<< "$leading_zero_ns_port_netpol" \
+    && ! grep -qF 'port: 08' <<< "$leading_zero_ns_port_netpol"; then
+    ok "a leading-zero K8S_PROXY_ALLOW_NS port renders normalized to decimal, never the literal '08'"
+else
+    no "a leading-zero K8S_PROXY_ALLOW_NS port renders normalized to decimal, never the literal '08'" \
+        "$leading_zero_ns_port_netpol"
+fi
+
 # A trailing ':' with no port after it must not silently mean "every
 # port" -- that would grant broader egress than a typo'd entry ever asked
 # for, the one input where this parser could otherwise grant more access
@@ -1823,15 +1878,19 @@ else
     ok "the real install's own stderr never carries the keyed value"
 fi
 
-# An endpoint declared keyed but missing (or empty) in pi.env is a
+# An endpoint declared keyed but missing (or empty) in pi.env is an
 # install-time error naming both the endpoint and the variable. This check
-# runs after the main manifest `kubectl apply` (same as the legacy
-# OPENROUTER_API_KEY check it mirrors), so a stubbed kubectl stands in for
-# a live cluster -- same technique as the real-install Secret-content test
-# above.
+# now runs BEFORE the main manifest is rendered or `kubectl apply`'d (a
+# typo'd K8S_PROXY_ENDPOINT_KEYS variable must never leave a namespace's
+# shared proxy partially applied with no Secret behind it -- see
+# strip_proxy_key_volume's own header), so the stubbed kubectl below must
+# never be invoked at all; a log file, rather than just exit-0, proves
+# that.
 missing_var_stub_bin="$(newdir)"; tmpdirs+=("$missing_var_stub_bin")
-cat > "$missing_var_stub_bin/kubectl" <<'STUB'
+missing_var_kubectl_log="$(newdir)/kubectl-missing-var.log"; tmpdirs+=("$(dirname "$missing_var_kubectl_log")")
+cat > "$missing_var_stub_bin/kubectl" <<STUB
 #!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$missing_var_kubectl_log"
 cat >/dev/null
 exit 0
 STUB
@@ -1844,6 +1903,16 @@ refuses "a keyed endpoint whose pi.env variable is missing is refused, naming bo
     "'secondary' keyed by MY_API_KEY, but MY_API_KEY is not set" \
     env PATH="$missing_var_stub_bin:$PATH" FORK_SANDBOX_CONFIG_DIR="$missing_var_config_dir" \
     "$k8s_sh" install
+if [[ -s "$missing_var_kubectl_log" ]]; then
+    no "a keyed endpoint whose pi.env variable is missing never invokes kubectl (checked before render/apply)" \
+        "$(cat "$missing_var_kubectl_log")"
+else
+    ok "a keyed endpoint whose pi.env variable is missing never invokes kubectl (checked before render/apply)"
+fi
+refuses "install --dry-run also refuses a keyed endpoint whose pi.env variable is missing" \
+    "'secondary' keyed by MY_API_KEY, but MY_API_KEY is not set" \
+    env PATH="$missing_var_stub_bin:$PATH" FORK_SANDBOX_CONFIG_DIR="$missing_var_config_dir" \
+    "$k8s_sh" install --dry-run
 
 empty_var_config_dir="$(newdir)"; tmpdirs+=("$empty_var_config_dir")
 cp "$keyed_config_dir/k8s.env" "$empty_var_config_dir/k8s.env"
@@ -1853,6 +1922,19 @@ refuses "a keyed endpoint whose pi.env variable is empty is refused, naming both
     "'secondary' keyed by MY_API_KEY, but MY_API_KEY is not set" \
     env PATH="$missing_var_stub_bin:$PATH" FORK_SANDBOX_CONFIG_DIR="$empty_var_config_dir" \
     "$k8s_sh" install
+
+# A keyed credential containing '"' or '$' would break the nginx `set
+# $var "...";` line it renders into -- refused by name at install time
+# instead of shipping a crashlooping proxy with nothing in the install
+# output to point at the cause.
+unsafe_key_config_dir="$(newdir)"; tmpdirs+=("$unsafe_key_config_dir")
+cp "$keyed_config_dir/k8s.env" "$unsafe_key_config_dir/k8s.env"
+install -m 600 /dev/null "$unsafe_key_config_dir/pi.env"
+printf 'MY_API_KEY=sk-a$b"c\n' >> "$unsafe_key_config_dir/pi.env"
+refuses "a keyed credential containing a double quote or \$ is refused" \
+    "would break the" \
+    env PATH="$missing_var_stub_bin:$PATH" FORK_SANDBOX_CONFIG_DIR="$unsafe_key_config_dir" \
+    "$k8s_sh" install --dry-run
 
 # An unregistered endpoint name in K8S_PROXY_ENDPOINT_KEYS is an
 # install-time error, nothing created.
