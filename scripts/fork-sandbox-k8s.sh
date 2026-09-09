@@ -338,6 +338,23 @@ read_env_value() {
     return 1
 }
 
+# A Kubernetes label VALUE: empty, or up to 63 characters matching
+# [a-zA-Z0-9]([-_.a-zA-Z0-9]*[a-zA-Z0-9])?. Shared by the owner label
+# (K8S_RUN_OWNER, below) and every free-form --label/K8S_RUN_LABELS value.
+k8s_valid_label_value() {
+    local value="$1"
+    [[ -z "$value" ]] && return 0
+    (( ${#value} <= 63 )) && [[ "$value" =~ ^[a-zA-Z0-9]([-_.a-zA-Z0-9]*[a-zA-Z0-9])?$ ]]
+}
+
+# A Kubernetes label KEY's local part -- the same shape as a value above,
+# but never empty.
+k8s_valid_label_key() {
+    local key="$1"
+    [[ -n "$key" ]] || return 1
+    (( ${#key} <= 63 )) && [[ "$key" =~ ^[a-zA-Z0-9]([-_.a-zA-Z0-9]*[a-zA-Z0-9])?$ ]]
+}
+
 if [[ ! -f "$k8s_env" ]]; then
     echo "Error: $k8s_env not found. A Kubernetes run reads cluster-specific" >&2
     echo "settings from that file, one NAME=VALUE per line:" >&2
@@ -386,6 +403,19 @@ GIT_USER_NAME="$(read_env_value "$k8s_env" GIT_USER_NAME || true)"
 GIT_USER_NAME="${GIT_USER_NAME:-fork-sandbox agent}"
 GIT_USER_EMAIL="$(read_env_value "$k8s_env" GIT_USER_EMAIL || true)"
 GIT_USER_EMAIL="${GIT_USER_EMAIL:-agent@fork-sandbox.invalid}"
+# The fork-sandbox/owner label's value -- see resolve_run_owner below for
+# how an unset key falls back to a sanitized $USER. K8S_RUN_LABELS is the
+# free-form labels' file-level default registry; parsed per-submit by
+# resolve_run_labels, not here, the same way K8S_PROXY_ENDPOINTS is read
+# here but parsed by parse_proxy_endpoints inside cmd_install/cmd_submit.
+K8S_RUN_OWNER="$(read_env_value "$k8s_env" K8S_RUN_OWNER || true)"
+K8S_RUN_LABELS="$(read_env_value "$k8s_env" K8S_RUN_LABELS || true)"
+# Free-form labels for this run, populated by resolve_run_labels in
+# cmd_submit. Declared empty here (module-global) so build_extra_label_lines
+# can read them under `set -u` even on a verb that never calls
+# resolve_run_labels.
+RUN_LABEL_KEYS=()
+RUN_LABEL_VALUES=()
 
 if [[ ! "$K8S_NAMESPACE" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]]; then
     echo "Error: K8S_NAMESPACE='$K8S_NAMESPACE' is not a valid namespace name." >&2
@@ -393,6 +423,15 @@ if [[ ! "$K8S_NAMESPACE" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]]; then
 fi
 if [[ -n "$K8S_RUN_TTL" && ! "$K8S_RUN_TTL" =~ ^[0-9]+$ ]]; then
     echo "Error: K8S_RUN_TTL must be a number of seconds, got '$K8S_RUN_TTL'." >&2
+    exit 1
+fi
+if [[ -n "$K8S_RUN_OWNER" ]] && ! k8s_valid_label_value "$K8S_RUN_OWNER"; then
+    echo "Error: K8S_RUN_OWNER='$K8S_RUN_OWNER' in $k8s_env is not a valid" >&2
+    echo "Kubernetes label value -- it must be at most 63 characters and" >&2
+    echo 'match [a-zA-Z0-9]([-_.a-zA-Z0-9]*[a-zA-Z0-9])?. An operator-typed' >&2
+    echo "value that fails this is a mistake worth reporting, unlike a" >&2
+    echo "generic \$USER value, which this script sanitizes instead of" >&2
+    echo "refusing -- see docs/kubernetes-runs.md." >&2
     exit 1
 fi
 if [[ ! "$K8S_SERVICES_MAX" =~ ^[0-9]+$ ]]; then
@@ -404,6 +443,7 @@ fs_reject_unsafe_chars "$K8S_CONTEXT" "$K8S_NAMESPACE" "$K8S_IMAGE" \
     "$K8S_PROXY_UPSTREAM" "$K8S_PROXY_ENDPOINTS" "$K8S_PROXY_ALLOW" \
     "$K8S_DENIED_PROBE" "$GIT_USER_NAME" "$GIT_USER_EMAIL" \
     "$K8S_SERVICE_MAX_CPU" "$K8S_SERVICE_MAX_MEMORY" \
+    "$K8S_RUN_OWNER" "$K8S_RUN_LABELS" \
     || exit 1
 
 kubectl() {
@@ -589,6 +629,77 @@ k8s_safe_name_component() {
     safe="${safe##-}"
     safe="${safe%%-}"
     printf '%s' "$safe"
+}
+
+# Resolves the fork-sandbox/owner label value: an explicit K8S_RUN_OWNER
+# (already validated above, used as-is -- an operator-typed value is
+# trusted, never re-sanitized on top of that), else a sanitized $USER,
+# else nothing. k8s_safe_name_component's output (lowercase alnum and
+# hyphens, no leading/trailing hyphen) is already a strict subset of a
+# valid label value, so it is reused as-is rather than writing a second
+# sanitizer.
+#
+# Omitting the label is reserved for a genuinely absent value -- neither
+# K8S_RUN_OWNER nor $USER set, or $USER sanitizes to the empty string
+# (e.g. every character in it is outside [a-z0-9-]). It is NOT for a value
+# that merely looks generic: 'runner' correctly says a run came from CI
+# and 'ubuntu' says it came from a devbox, and both are more useful than
+# no label at all -- never add a check that omits the label because the
+# name looks uninformative.
+resolve_run_owner() {
+    if [[ -n "$K8S_RUN_OWNER" ]]; then
+        printf '%s' "$K8S_RUN_OWNER"
+        return 0
+    fi
+    [[ -n "${USER:-}" ]] || return 0
+    k8s_safe_name_component "$USER"
+}
+
+# Builds the ordered list of already-qualified "key: value" label lines
+# this run's resolved owner and free-form labels render as on every
+# object: EXTRA_LABEL_LINES (module-global), owner first (bare
+# fork-sandbox/owner key, only when $1 is non-empty) followed by each
+# free-form label under the fixed fork-sandbox.io/ prefix, in
+# RUN_LABEL_KEYS/RUN_LABEL_VALUES order (populated by resolve_run_labels).
+build_extra_label_lines() {
+    local owner="$1" i
+    EXTRA_LABEL_LINES=()
+    [[ -n "$owner" ]] && EXTRA_LABEL_LINES+=("fork-sandbox/owner: $owner")
+    for i in "${!RUN_LABEL_KEYS[@]}"; do
+        EXTRA_LABEL_LINES+=("fork-sandbox.io/${RUN_LABEL_KEYS[$i]}: ${RUN_LABEL_VALUES[$i]}")
+    done
+}
+
+# Renders EXTRA_LABEL_LINES for interpolation directly after an existing
+# "fork-sandbox/branch: $safe_name" line inside a heredoc, indented by $1
+# spaces: "" when there are no extra labels (adds nothing to the render),
+# or a leading newline plus one indented "key: value" line per entry with
+# NO trailing newline -- the same optional-trailing-content shape
+# $model_discovery_env and its neighbors above already use, so
+# interpolating it straight after existing text produces no stray blank
+# line either way.
+render_extra_labels_indent() {
+    local indent="$1" pad line out=""
+    (( ${#EXTRA_LABEL_LINES[@]} == 0 )) && { printf '%s' ""; return 0; }
+    pad="$(printf "%${indent}s" '')"
+    for line in "${EXTRA_LABEL_LINES[@]}"; do
+        out+=$'\n'"$pad$line"
+    done
+    printf '%s' "$out"
+}
+
+# Same label lines, for the claude-proxy static-template's __EXTRA_LABELS__
+# marker substitution: each line indented by $1 spaces WITH a trailing
+# newline (including the last), so a literal ${var//search/replace} can
+# swap the whole marker line -- trailing newline included -- for either
+# nothing (marker vanishes, no blank line left behind) or this block.
+render_extra_labels_block() {
+    local indent="$1" pad line out=""
+    pad="$(printf "%${indent}s" '')"
+    for line in "${EXTRA_LABEL_LINES[@]}"; do
+        out+="$pad$line"$'\n'
+    done
+    printf '%s' "$out"
 }
 
 # A Kubernetes object name: lowercase RFC 1123, <=63 chars. Branch names are
@@ -1950,6 +2061,18 @@ cmd_submit() {
     local egress_proxy_host="fork-sandbox-proxy.$K8S_NAMESPACE.svc.cluster.local"
     [[ "$harness" == claude ]] && egress_proxy_host="$safe_name-claude-proxy.$K8S_NAMESPACE.svc.cluster.local"
 
+    # The fork-sandbox/owner label plus (once resolve_run_labels exists)
+    # this run's free-form labels -- resolved once here, ahead of both the
+    # claude-proxy template substitution below and the job_rendered heredoc
+    # further down, since both need EXTRA_LABEL_LINES. See resolve_run_owner
+    # and build_extra_label_lines above.
+    local run_owner
+    run_owner="$(resolve_run_owner)"
+    build_extra_label_lines "$run_owner"
+    local extra_labels_4 extra_labels_8
+    extra_labels_4="$(render_extra_labels_indent 4)"
+    extra_labels_8="$(render_extra_labels_indent 8)"
+
     # The per-run Claude Code proxy manifest (ConfigMap + Pod + Service),
     # rendered here -- ahead of the ConfigMap+Job below, in the SAME
     # `kubectl apply` stream -- for --harness claude only. See
@@ -1970,6 +2093,26 @@ cmd_submit() {
             -e "s|__NAMESPACE__|$K8S_NAMESPACE|g" \
             -e "s|__RUN_NAME__|$safe_name|g" \
             "$claude_proxy_template")"$'\n'
+        # A literal (non-regex) global replace, not another sed -- the
+        # replacement can hold embedded newlines (one per extra label),
+        # which sed's own s|from|to| cannot take without escaping. The
+        # placeholder itself is a real "key: value" pair (not a bare
+        # word) so the unsubstituted template stays valid YAML on its
+        # own -- see the yamllint check in the test suite. The search
+        # string includes the placeholder's own leading whitespace and
+        # trailing newline, so an empty replacement (no extra labels)
+        # removes the whole marker line cleanly, with no blank line left
+        # behind, in all four labels: blocks at once.
+        local extra_labels_marker=$'    __EXTRA_LABELS__: "true"\n'
+        local extra_labels_proxy_block
+        # Command substitution strips ALL trailing newlines from its
+        # capture, including the one render_extra_labels_block always puts
+        # after its last line -- put it back (only when there is a last
+        # line at all) so the replacement still ends in \n, matching the
+        # marker it replaces.
+        extra_labels_proxy_block="$(render_extra_labels_block 4)"
+        [[ -n "$extra_labels_proxy_block" ]] && extra_labels_proxy_block+=$'\n'
+        claude_proxy_rendered="${claude_proxy_rendered//$extra_labels_marker/$extra_labels_proxy_block}"
     fi
 
     local entrypoint_sh="$script_dir/fork-sandbox-k8s-entrypoint.sh"
@@ -2107,7 +2250,7 @@ metadata:
   namespace: $K8S_NAMESPACE
   labels:
     app: fork-sandbox-agent
-    fork-sandbox/branch: $safe_name
+    fork-sandbox/branch: $safe_name${extra_labels_4}
 data:
   entrypoint.sh: |
 $(indent_block < "$entrypoint_sh")
@@ -2132,14 +2275,14 @@ metadata:
   namespace: $K8S_NAMESPACE
   labels:
     app: fork-sandbox-agent
-    fork-sandbox/branch: $safe_name
+    fork-sandbox/branch: $safe_name${extra_labels_4}
 spec:
   backoffLimit: 0
   template:
     metadata:
       labels:
         app: fork-sandbox-agent
-        fork-sandbox/branch: $safe_name
+        fork-sandbox/branch: $safe_name${extra_labels_8}
     spec:
       restartPolicy: Never${services_grace_env}
       automountServiceAccountToken: false

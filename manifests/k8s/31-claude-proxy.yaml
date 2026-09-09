@@ -49,6 +49,7 @@ metadata:
   namespace: __NAMESPACE__
   labels:
     fork-sandbox/branch: __RUN_NAME__
+    __EXTRA_LABELS__: "true"
 data:
   nginx.conf: |
     worker_processes 1;
@@ -155,6 +156,7 @@ metadata:
     app: fork-sandbox-proxy
     fork-sandbox/branch: __RUN_NAME__
     fork-sandbox/role: claude-proxy
+    __EXTRA_LABELS__: "true"
 spec:
   restartPolicy: Always
   automountServiceAccountToken: false
@@ -207,6 +209,7 @@ metadata:
   labels:
     app: fork-sandbox-proxy
     fork-sandbox/branch: __RUN_NAME__
+    __EXTRA_LABELS__: "true"
 spec:
   selector:
     fork-sandbox/branch: __RUN_NAME__
@@ -223,6 +226,7 @@ metadata:
   namespace: __NAMESPACE__
   labels:
     fork-sandbox/branch: __RUN_NAME__
+    __EXTRA_LABELS__: "true"
 spec:
   podSelector:
     matchLabels:
