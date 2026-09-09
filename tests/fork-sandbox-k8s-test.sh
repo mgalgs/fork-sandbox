@@ -1333,9 +1333,65 @@ else
         "$invalid_octal_err"
 fi
 
+# http:// to an in-cluster Service DNS name (host ends in
+# .svc.$K8S_CLUSTER_DOMAIN) is accepted -- it can never route to the open
+# internet, so it needs no IPv4-privateness check at all. Default
+# K8S_CLUSTER_DOMAIN is cluster.local.
+svc_dns_config_dir="$(newdir)"; tmpdirs+=("$svc_dns_config_dir")
+cat > "$svc_dns_config_dir/k8s.env" <<'CONF'
+K8S_CONTEXT=test-context
+K8S_NAMESPACE=fork-sandbox-test
+K8S_IMAGE=registry.example/you/fork-sandbox:latest
+K8S_PROXY_ENDPOINTS=primary=http://svc-a.example-ns.svc.cluster.local:8001/v1
+K8S_DENIED_PROBE=10.0.0.1:443
+CONF
+if FORK_SANDBOX_CONFIG_DIR="$svc_dns_config_dir" "$k8s_sh" install --dry-run \
+    >/tmp/fs-k8s-test-svc-dns.out 2>/tmp/fs-k8s-test-svc-dns.err; then
+    ok "K8S_PROXY_ENDPOINTS http:// to a .svc.cluster.local name is accepted"
+else
+    no "K8S_PROXY_ENDPOINTS http:// to a .svc.cluster.local name is accepted" \
+        "$(cat /tmp/fs-k8s-test-svc-dns.err)"
+fi
+
+# A custom K8S_CLUSTER_DOMAIN is honored -- cluster.local is only the
+# common default, not hardcoded.
+custom_domain_config_dir="$(newdir)"; tmpdirs+=("$custom_domain_config_dir")
+cat > "$custom_domain_config_dir/k8s.env" <<'CONF'
+K8S_CONTEXT=test-context
+K8S_NAMESPACE=fork-sandbox-test
+K8S_IMAGE=registry.example/you/fork-sandbox:latest
+K8S_PROXY_ENDPOINTS=primary=http://svc-a.example-ns.svc.some-other.domain:8001/v1
+K8S_CLUSTER_DOMAIN=some-other.domain
+K8S_DENIED_PROBE=10.0.0.1:443
+CONF
+if FORK_SANDBOX_CONFIG_DIR="$custom_domain_config_dir" "$k8s_sh" install --dry-run \
+    >/tmp/fs-k8s-test-custom-domain.out 2>/tmp/fs-k8s-test-custom-domain.err; then
+    ok "http:// to a .svc.<K8S_CLUSTER_DOMAIN> name is accepted with a custom domain"
+else
+    no "http:// to a .svc.<K8S_CLUSTER_DOMAIN> name is accepted with a custom domain" \
+        "$(cat /tmp/fs-k8s-test-custom-domain.err)"
+fi
+
+# A host merely ending in the cluster domain, without the .svc. segment
+# that marks it as a Service name, is still refused -- the narrowest rule
+# that covers the case, not "anything under the domain".
+non_svc_domain_config_dir="$(newdir)"; tmpdirs+=("$non_svc_domain_config_dir")
+cat > "$non_svc_domain_config_dir/k8s.env" <<'CONF'
+K8S_CONTEXT=test-context
+K8S_NAMESPACE=fork-sandbox-test
+K8S_IMAGE=registry.example/you/fork-sandbox:latest
+K8S_PROXY_ENDPOINTS=primary=http://svc-a.cluster.local:8001/v1
+K8S_DENIED_PROBE=10.0.0.1:443
+CONF
+refuses "http:// to a host merely ending in the cluster domain, without .svc., is refused" \
+    "verified as private without DNS" \
+    env FORK_SANDBOX_CONFIG_DIR="$non_svc_domain_config_dir" "$k8s_sh" install --dry-run
+
 rm -f /tmp/fs-k8s-test-endpoints-install.err /tmp/fs-k8s-test-allow-install.err \
     /tmp/fs-k8s-test-http-private.out /tmp/fs-k8s-test-http-private.err \
-    /tmp/fs-k8s-test-endpoints-http-private.out /tmp/fs-k8s-test-endpoints-http-private.err
+    /tmp/fs-k8s-test-endpoints-http-private.out /tmp/fs-k8s-test-endpoints-http-private.err \
+    /tmp/fs-k8s-test-svc-dns.out /tmp/fs-k8s-test-svc-dns.err \
+    /tmp/fs-k8s-test-custom-domain.out /tmp/fs-k8s-test-custom-domain.err
 
 printf '\n== fork-sandbox-k8s.sh submit --dry-run --harness claude ==\n'
 # The default (--harness pi, i.e. submit_out above) renders no claude-proxy

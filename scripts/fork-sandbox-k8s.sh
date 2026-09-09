@@ -290,6 +290,13 @@
 #                         line that never mentions it). Precedence:
 #                         --endpoint, then this key, then the single
 #                         registered endpoint.
+#   K8S_CLUSTER_DOMAIN=   the cluster's own DNS domain, defaults to
+#                         cluster.local. A K8S_PROXY_UPSTREAM or
+#                         K8S_PROXY_ENDPOINTS URL on http:// to a host
+#                         ending in .svc.$K8S_CLUSTER_DOMAIN is accepted --
+#                         a Service name resolves only inside the cluster,
+#                         so it can never route to the open internet the
+#                         way a plain hostname could.
 #   K8S_PROXY_ALLOW=      <cidr>:<port>[,<cidr>:<port>...] egress allowlist
 #                         for K8S_PROXY_ENDPOINTS hosts. Unset keeps the
 #                         default policy (any host except RFC1918, on 443);
@@ -414,6 +421,12 @@ K8S_PROXY_UPSTREAM="$(read_env_value "$k8s_env" K8S_PROXY_UPSTREAM || true)"
 K8S_PROXY_ENDPOINTS="$(read_env_value "$k8s_env" K8S_PROXY_ENDPOINTS || true)"
 K8S_DEFAULT_ENDPOINT="$(read_env_value "$k8s_env" K8S_DEFAULT_ENDPOINT || true)"
 K8S_PROXY_ALLOW="$(read_env_value "$k8s_env" K8S_PROXY_ALLOW || true)"
+# The cluster's own DNS domain -- a Service's in-cluster name is
+# <svc>.<ns>.svc.$K8S_CLUSTER_DOMAIN, and that domain is set at cluster
+# install time, so cluster.local (the common default) cannot be assumed.
+# See validate_upstream_url's own header for what this unlocks.
+K8S_CLUSTER_DOMAIN="$(read_env_value "$k8s_env" K8S_CLUSTER_DOMAIN || true)"
+K8S_CLUSTER_DOMAIN="${K8S_CLUSTER_DOMAIN:-cluster.local}"
 K8S_DENIED_PROBE="$(read_env_value "$k8s_env" K8S_DENIED_PROBE || true)"
 K8S_RUN_TTL="$(read_env_value "$k8s_env" K8S_RUN_TTL || true)"
 K8S_RUN_TTL="${K8S_RUN_TTL:-3600}"
@@ -470,6 +483,7 @@ fi
 
 fs_reject_unsafe_chars "$K8S_CONTEXT" "$K8S_NAMESPACE" "$K8S_IMAGE" \
     "$K8S_PROXY_UPSTREAM" "$K8S_PROXY_ENDPOINTS" "$K8S_PROXY_ALLOW" \
+    "$K8S_CLUSTER_DOMAIN" \
     "$K8S_DENIED_PROBE" "$GIT_USER_NAME" "$GIT_USER_EMAIL" \
     "$K8S_SERVICE_MAX_CPU" "$K8S_SERVICE_MAX_MEMORY" \
     "$K8S_RUN_OWNER" "$K8S_RUN_LABELS" \
@@ -1063,7 +1077,11 @@ EOF
 # K8S_PROXY_UPSTREAM vs K8S_PROXY_ENDPOINTS. A hostname (anything that
 # doesn't parse as a literal IPv4 address) on http:// is refused too --
 # this script has no network access to resolve one, so its privateness
-# can never be verified.
+# can never be verified. One hostname shape IS structurally verifiable
+# without DNS, though: a Kubernetes Service name, <svc>.<ns>.svc.<cluster
+# domain>, resolves only inside the cluster and can never route to the
+# open internet -- so a host ending in .svc.$K8S_CLUSTER_DOMAIN is
+# accepted on http:// too, checked before the IPv4 path below ever runs.
 #
 # On success, prints the bare host (scheme stripped, path cut at the first
 # /, port kept) on stdout -- the same value proxy_ssl_name/Host has always
@@ -1093,6 +1111,16 @@ validate_upstream_url() {
     # ${host%:*} is a no-op when there is no ':' to split on, which is
     # exactly right for a bare IPv4 host with no port.
     host_only="${host%:*}"
+
+    # A Service DNS name (the .svc. segment is what marks it as one,
+    # narrower than just "ends in the cluster domain") can never resolve
+    # outside the cluster, so it is accepted here before the IPv4-only
+    # path below even runs -- everything past this point is unchanged.
+    if [[ "$host_only" == *".svc.$K8S_CLUSTER_DOMAIN" ]]; then
+        printf '%s' "$host"
+        return 0
+    fi
+
     if [[ ! "$host_only" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]]; then
         echo "Error: $label uses http://, which this repo only accepts to a" >&2
         echo "private address (RFC1918, loopback, or link-local) --" >&2
