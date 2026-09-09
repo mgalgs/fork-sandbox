@@ -5,6 +5,17 @@
 
 set -uo pipefail
 
+# The fixtures below are real git repositories holding a copy of scripts/,
+# and the gate cases depend on their commits actually landing. Take the
+# operator's own git configuration out of the picture, the way the other
+# fixture-building suites here do: a global core.hooksPath (a pre-commit
+# leak check, say) refuses a commit whose content it dislikes, and every
+# later `git rm` then fails on the still-staged index -- leaving the file
+# on disk and the gate correctly reporting nothing wrong. That failure
+# appears only on a machine that has such a hook, which is exactly the
+# machine these suites have to pass on.
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
+
 repo_dir="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 pass=0
 fail=0
