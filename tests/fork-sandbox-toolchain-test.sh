@@ -302,6 +302,34 @@ check "only the surviving entry is bound" "6" "${#FS_PROVISION_RO_FLAGS[@]}"
 fs_provision_ro "$pr_origin" "$pr_origin"
 check "origin == clone yields a single bind" "3" "${#FS_PROVISION_RO_FLAGS[@]}"
 
+# Nothing activates a venv in the sandbox, so a venv entry also puts its bin
+# first on PATH. Without it `black` is not found and bare `python` is the
+# system one -- the sandbox stops matching the activated shell every project's
+# docs are written for. Marked by pyvenv.cfg, so a non-venv entry stays out.
+mkdir -p "$pr_origin/node_modules/.bin"
+printf 'home = %s\n' "$scratch/pr-interp/bin" > "$pr_origin/.venv/pyvenv.cfg"
+printf '.venv\nnode_modules\n' > "$pr_clone/.agents/sandbox-services/provision-ro"
+fs_provision_ro "$pr_origin" "$pr_clone" 2>/dev/null
+contains "a venv puts its origin bin on PATH" "--prepend-path $pr_origin/.venv/bin" \
+    "${FS_PROVISION_RO_FLAGS[*]}"
+lacks "a non-venv entry does not" "node_modules/.bin" "${FS_PROVISION_RO_FLAGS[*]}"
+
+# Under an image backend the venv cannot execute at all, so its bin must NOT
+# go first -- that would shadow the image's working python with a broken one.
+FS_BACKEND_TOOLCHAIN=image
+fs_provision_ro "$pr_origin" "$pr_clone" 2>/dev/null
+lacks "image mode keeps the venv bin off PATH" "--prepend-path" \
+    "${FS_PROVISION_RO_FLAGS[*]}"
+FS_BACKEND_TOOLCHAIN=host
+
+# The real-checkout path has no clone to bind into, but the venv there is just
+# as inert, so it gets the same PATH treatment.
+fs_workdir_venv_binds "$pr_origin" 2>/dev/null
+contains "a real checkout's venv bin goes on PATH too" \
+    "--prepend-path $pr_origin/.venv/bin" "${FS_PROVISION_RO_FLAGS[*]}"
+lacks "and it binds nothing into a tree that already has it" "--bind-ro-at $pr_origin/.venv " \
+    "${FS_PROVISION_RO_FLAGS[*]} "
+
 echo ""
 echo "== fs_read_claude_credential =="
 

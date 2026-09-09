@@ -696,8 +696,10 @@ The contract, all under `.agents/sandbox-services/`:
 - **`provision-ro`** — optional. A newline list of untracked, repo-relative
   paths (a `.venv`, say) to bind read-only from the origin into the clone at
   the same path, and a second time at the origin's own absolute path so that
-  console-script shebangs — which hardcode it — still resolve. A relocated
-  venv runs, and so does `.venv/bin/<tool>`.
+  console-script shebangs — which hardcode it — still resolve. A venv's `bin`
+  also goes first on PATH, since nothing activates it in the sandbox. Net
+  effect: a sandbox behaves like an activated venv, so bare `python` and bare
+  `<tool>` work and no repo needs `.venv/bin/` prefixes in its docs.
 
 **Permissions.** The sockets directory must be writable by the container's uid.
 Prefer running the service as the host uid — `user: "${SANDBOX_UID}"` in the

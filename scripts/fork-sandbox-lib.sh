@@ -432,8 +432,9 @@ fs_node_provision() {
 # rides into a sandbox with internet access. So every entry is checked — no
 # absolute path, no '..', and both the resolved source and the resolved
 # destination must stay inside the repo they belong to. A symlink that escapes
-# is refused, not followed. Fills FS_PROVISION_RO_FLAGS as claude-sandboxed
-# --bind-ro-at pairs; a repo without the file leaves it empty.
+# is refused, not followed. Fills FS_PROVISION_RO_FLAGS with claude-sandboxed
+# flags — --bind-ro-at pairs, plus a --prepend-path for a venv's bin; a repo
+# without the file leaves it empty.
 # shellcheck disable=SC2034  # written here, read by the sourcing scripts
 FS_PROVISION_RO_FLAGS=()
 
@@ -518,6 +519,7 @@ fs_provision_ro() {
             FS_PROVISION_RO_FLAGS+=(--bind-ro-at "$src_real" "$src_real")
         fi
         fs_venv_interpreter_bind "$src_real"
+        fs_venv_bin_on_path "$src_real"
     done < "$list"
     return 0
 }
@@ -574,6 +576,37 @@ fs_venv_interpreter_bind() {
     return 0
 }
 
+# A provisioned venv is only useful if its tools can be FOUND, not just run.
+# Nothing activates a venv inside the sandbox — $HOME is a tmpfs, so there is
+# no shell profile and no VIRTUAL_ENV — which leaves bare `python` as the
+# system interpreter and bare `black` as nothing at all. An agent then either
+# rediscovers the venv and hand-prefixes .venv/bin/ onto every command, or
+# concludes the tool is unavailable and skips the check.
+#
+# So put the venv's bin first on PATH, which is what activation does and all
+# it needs to do here. The effect is that a sandbox looks like the activated
+# shell the project's own docs are written for, and no repo has to spell out
+# interpreter paths for the sandbox's benefit. This mirrors the node bin dir
+# fork-sandbox.sh already prepends so a repo with no .nvmrc still has a node.
+#
+# The path prepended is the venv's own, on the host — not the clone's copy of
+# it. claude-sandboxed checks every --prepend-path against the host filesystem,
+# and a clone's .venv/bin does not exist there: it comes into being only when
+# the bind lands, inside. The origin path passes that check, and the bind at
+# the origin path — the one that makes console-script shebangs resolve — is
+# exactly what makes it resolve inside too. The two travel together.
+#
+# The entry has to actually be a venv (pyvenv.cfg) with a bin dir. Host
+# toolchain only: under an image backend the venv cannot execute at all —
+# fs_venv_interpreter_bind has already warned — and putting its bin first
+# would shadow the image's working python with a broken one.
+fs_venv_bin_on_path() {
+    local venv="$1"
+    [[ -f "$venv/pyvenv.cfg" && -d "$venv/bin" ]] || return 0
+    [[ "$FS_BACKEND_TOOLCHAIN" == host ]] || return 0
+    FS_PROVISION_RO_FLAGS+=(--prepend-path "$venv/bin")
+}
+
 # The venv-interpreter binds for a REAL checkout, as agent-sandboxed needs them.
 # fs_provision_ro exists for a CLONE, which carries committed state only, so it
 # binds every untracked path provision-ro names from the origin into the clone.
@@ -583,10 +616,12 @@ fs_venv_interpreter_bind() {
 # missing is what lives OUTSIDE the tree — a uv or pyenv virtualenv's
 # interpreter, since .venv/bin/python is a symlink into an interpreter store
 # under $HOME and $HOME is a tmpfs in the sandbox. So read the same provision-ro
-# list, but do only the interpreter bind for each entry that is a venv; a
-# non-venv entry adds nothing. fs_venv_interpreter_bind keeps the store
-# allowlist that makes this safe from an untracked source. Fills
-# FS_PROVISION_RO_FLAGS; a repo without the file leaves it empty.
+# list, but for each entry that is a venv do only the two things a present-but-
+# inert venv still needs: bind its interpreter, and put its bin on PATH, since
+# no more here than in a clone does anything activate it. A non-venv entry adds
+# nothing. fs_venv_interpreter_bind keeps the store allowlist that makes this
+# safe from an untracked source. Fills FS_PROVISION_RO_FLAGS; a repo without
+# the file leaves it empty.
 fs_workdir_venv_binds() {
     local work_dir="$1" list rel
     FS_PROVISION_RO_FLAGS=()
@@ -610,6 +645,9 @@ fs_workdir_venv_binds() {
         fi
         [[ -e "$work_dir/$rel" ]] || continue
         fs_venv_interpreter_bind "$work_dir/$rel"
+        # The tree's own venv is already at this path; it still needs to be on
+        # PATH, for the same reason a clone's does — nothing activates it here.
+        fs_venv_bin_on_path "$work_dir/$rel"
     done < "$list"
     return 0
 }

@@ -117,9 +117,18 @@ console scripts. `pip` bakes your real checkout's path into every shebang, so
 `.venv/bin/pytest` starts `#!/home/you/src/proj/.venv/bin/python` and cannot be
 rewritten in a read-only mount. Each entry is therefore bound **twice** — at
 the clone path, and at the origin's own absolute path — so that literal shebang
-resolves. `.venv/bin/pytest` and `.venv/bin/python -m pytest` both work; no
-project needs a `CLAUDE.md` note about it. The second mount is the same bytes,
-also read-only, behind exactly the same escape checks as the first.
+resolves. The second mount is the same bytes, also read-only, behind exactly
+the same escape checks as the first.
+
+The venv's `bin` also goes **first on PATH**, which is the other half of the
+same idea: nothing activates a venv in the sandbox — `$HOME` is a tmpfs, so
+there is no profile and no `VIRTUAL_ENV` — which would otherwise leave bare
+`python` as the system interpreter and bare `pytest` as nothing at all. With
+both in place a sandbox looks like the activated shell your docs are already
+written for: `pytest`, `.venv/bin/pytest` and `.venv/bin/python -m pytest` all
+work. **No project needs to spell out interpreter paths for the sandbox's
+benefit, and none should** — a `CLAUDE.md` full of `.venv/bin/` prefixes is
+noise in the interactive case, which is the common one.
 
 The venv's **interpreter** must also be reachable inside the sandbox. A venv
 built on the system python needs nothing (`/usr` is mounted), but `uv` and
