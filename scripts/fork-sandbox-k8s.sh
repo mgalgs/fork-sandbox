@@ -1168,9 +1168,14 @@ EOF
 # this script has no network access to resolve one, so its privateness
 # can never be verified. One hostname shape IS structurally verifiable
 # without DNS, though: a Kubernetes Service name, <svc>.<ns>.svc.<cluster
-# domain>, resolves only inside the cluster and can never route to the
-# open internet -- so a host ending in .svc.$K8S_CLUSTER_DOMAIN is
-# accepted on http:// too, checked before the IPv4 path below ever runs.
+# domain>, resolves only inside the cluster's own DNS -- though an
+# ExternalName Service can still CNAME it to a public host, so the name
+# alone is not a privateness guarantee. A host ending in
+# .svc.$K8S_CLUSTER_DOMAIN is still accepted on http:// (checked before
+# the IPv4 path below ever runs), refused outright on port 443 (the only
+# port the default egress policy ever carries to a public address), and
+# left to cmd_install's reachability review to warn about on any other
+# port a custom K8S_PROXY_ALLOW opens publicly.
 #
 # On success, prints the bare host (scheme stripped, path cut at the first
 # /, port kept) on stdout -- the same value proxy_ssl_name/Host has always
@@ -1205,14 +1210,42 @@ validate_upstream_url() {
     # narrower than just "ends in the cluster domain") resolves only inside
     # the cluster's own DNS -- but an ExternalName Service can still CNAME
     # that name to an arbitrary public host, so the name itself is not a
-    # guarantee of privateness. What actually blocks that path is the
+    # guarantee of privateness. What actually holds the gate up is the
     # proxy's own NetworkPolicy egress (render_proxy_egress_rules /
-    # render_proxy_egress_rules_ns): a public IP matches neither the
-    # default ipBlock rule nor a namespaceSelector rule, so a Service name
-    # CNAMEd off-cluster still can't get a request out. Accepted here
-    # before the IPv4-only path below even runs -- everything past this
-    # point is unchanged.
+    # render_proxy_egress_rules_ns): a .svc. name only stays inside the
+    # cluster if the rendered egress policy does not also carry its port to
+    # a public address. The default policy (unset K8S_PROXY_ALLOW) carries
+    # ANY address on port 443 and nothing else, so http:// to a .svc. name
+    # on 443 is refused outright below -- a CNAME to a public host would
+    # otherwise leak this endpoint's Authorization header to the open
+    # internet in cleartext, exactly what this http:// gate exists to
+    # prevent. A custom K8S_PROXY_ALLOW can legitimately open some other
+    # port publicly on purpose; cmd_install's own reachability review warns
+    # (rather than refuses) when a .svc. http:// endpoint's port matches
+    # such an entry, since that check needs PROXY_ALLOW_CIDRS/PORTS, which
+    # are not parsed yet at validation time. Accepted here before the
+    # IPv4-only path below even runs -- everything past this point is
+    # unchanged.
     if [[ "$host_only" == *".svc.$K8S_CLUSTER_DOMAIN" ]]; then
+        # Forced base 10 (10#$svc_port): same unforced-base trap this
+        # function's own IPv4-octet loop below (and parse_proxy_allow_ns's
+        # header) document. A malformed port here just skips this 443
+        # check rather than erroring -- full port validation for a
+        # Service-DNS URL is cmd_install's reachability review's job, not
+        # this function's.
+        local svc_port
+        svc_port="${host#*:}"
+        [[ "$svc_port" == "$host" ]] && svc_port=""
+        if [[ "$svc_port" =~ ^[0-9]{1,5}$ ]] && (( 10#$svc_port == 443 )); then
+            echo "Error: $label uses http:// to '$host_only' on port" >&2
+            echo "443 -- the default egress policy (unset" >&2
+            echo "K8S_PROXY_ALLOW) carries any address on port 443, so" >&2
+            echo "if this Service name ever CNAMEs off-cluster the" >&2
+            echo "request would leave the cluster in cleartext," >&2
+            echo "credential included. Use https://, or a non-443 port" >&2
+            echo "if this really is a plaintext in-cluster Service." >&2
+            return 1
+        fi
         printf '%s' "$host"
         return 0
     fi
@@ -1512,6 +1545,35 @@ cidr_contains() {
     prefix="${cidr#*/}"
     mask=$(( prefix == 0 ? 0 : (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF ))
     (( ($(ipv4_to_int "$net") & mask) == ($(ipv4_to_int "$ip") & mask) ))
+}
+
+# True (0) if the literal IPv4 CIDR $1 ("<a.b.c.d>/<prefix>") is wholly
+# inside RFC1918 (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16), loopback
+# (127.0.0.0/8), link-local (169.254.0.0/16) or CGNAT (100.64.0.0/10) --
+# used by cmd_install's reachability review to decide whether a
+# K8S_PROXY_ALLOW entry that carries a .svc. http:// endpoint's port is
+# itself public. A prefix check on the network address's own octets, not
+# full CIDR-containment arithmetic (cidr_contains above): exactly right
+# for a CIDR that is wholly inside one of these ranges -- the only shape
+# a hand-written K8S_PROXY_ALLOW entry ever takes here -- but would call a
+# supernet like 0.0.0.0/0 "private" too, which cidr_contains's approach
+# would not. Accepted because this is a warning, not a refusal (see
+# validate_upstream_url's 1a/1b split), and a hand-typed allowlist entry
+# is never a supernet route table in practice. 10#$o1/10#$o2 force base
+# 10 for the same unforced-base reason validate_upstream_url's own header
+# documents -- parse_proxy_allow does not itself normalize its CIDR
+# octets (a pre-existing, out-of-scope gap in that parser), so a
+# leading-zero octet can still reach here.
+cidr_is_private() {
+    local cidr="$1" net o1 o2
+    net="${cidr%/*}"
+    IFS='.' read -r o1 o2 _ _ <<< "$net"
+    (( 10#$o1 == 10 )) \
+        || (( 10#$o1 == 172 && 10#$o2 >= 16 && 10#$o2 <= 31 )) \
+        || (( 10#$o1 == 192 && 10#$o2 == 168 )) \
+        || (( 10#$o1 == 127 )) \
+        || (( 10#$o1 == 169 && 10#$o2 == 254 )) \
+        || (( 10#$o1 == 100 && 10#$o2 >= 64 && 10#$o2 <= 127 ))
 }
 
 # The NetworkPolicy egress rule(s) allowing whichever hosts model access
@@ -1953,6 +2015,7 @@ cmd_install() {
     # warning below (or the right warning for the wrong reason).
     local -a is_svc_url=()
     local url host host_only svc_ns port covered j
+    local port_carried port_carried_reason public_allow_cidr
     for (( i = 0; i < ${#warn_urls[@]}; i++ )); do
         is_svc_url[i]=false
         url="${warn_urls[$i]}"
@@ -1965,9 +2028,63 @@ cmd_install() {
         svc_ns="${svc_ns%%.*}"
         port="${host#*:}"
         [[ "$port" == "$host" ]] && port=""
-        if [[ -z "$port" ]]; then
+        if [[ -n "$port" ]]; then
+            # Forced base 10 (10#$port): this port comes straight out of
+            # the endpoint's URL and, unlike PROXY_ALLOW_NS_PORTS (already
+            # normalized by parse_proxy_allow_ns), has never been
+            # validated -- plain arithmetic on an unforced leading-zero
+            # value hands bash a C-style integer literal (see
+            # validate_upstream_url's own header for the same trap), so
+            # this is the one call site that does arithmetic on an
+            # untrusted URL port and must validate it first.
+            if [[ ! "$port" =~ ^[0-9]{1,5}$ ]] \
+                || (( 10#$port < 1 || 10#$port > 65535 )); then
+                echo "Error: ${warn_labels[$i]} has an invalid port" >&2
+                echo "'$port' -- must be 1-65535." >&2
+                exit 1
+            fi
+            port=$(( 10#$port ))
+        else
             if [[ "$url" == https://* ]]; then port=443; else port=80; fi
         fi
+
+        # Whether the egress policy this install is about to render
+        # carries this endpoint's port to ANY address, and whether that
+        # "any" is non-private -- computed once here and read by both the
+        # NS-coverage warning below and the cleartext warning after this
+        # loop, so the two never disagree about the same endpoint's
+        # config. Port 443 on an unset K8S_PROXY_ALLOW is the only way the
+        # default policy carries a .svc. endpoint's port; a set
+        # K8S_PROXY_ALLOW replaces that wholesale, so it is checked
+        # against PROXY_ALLOW_CIDRS/PORTS instead (validate_upstream_url's
+        # 1a already refuses http:// on 443 unconditionally, so a .svc.
+        # http:// endpoint reaching this point never has port 443 --
+        # public_allow_cidr is therefore only ever set by the
+        # K8S_PROXY_ALLOW branch, never the default-policy one).
+        port_carried=false
+        port_carried_reason=""
+        public_allow_cidr=""
+        if [[ ${#PROXY_ALLOW_CIDRS[@]} -eq 0 ]]; then
+            if (( port == 443 )); then
+                port_carried=true
+                port_carried_reason="the default egress policy, which"
+                port_carried_reason+=" carries any address on port 443"
+            fi
+        else
+            for (( j = 0; j < ${#PROXY_ALLOW_CIDRS[@]}; j++ )); do
+                if (( port == PROXY_ALLOW_PORTS[j] )); then
+                    port_carried=true
+                    if [[ -z "$port_carried_reason" ]]; then
+                        port_carried_reason="K8S_PROXY_ALLOW entry"
+                        port_carried_reason+=" ${PROXY_ALLOW_CIDRS[$j]}:$port"
+                    fi
+                    if ! cidr_is_private "${PROXY_ALLOW_CIDRS[$j]}"; then
+                        public_allow_cidr="${PROXY_ALLOW_CIDRS[$j]}"
+                    fi
+                fi
+            done
+        fi
+
         covered=false
         for (( j = 0; j < ${#PROXY_ALLOW_NS_NAMESPACES[@]}; j++ )); do
             if [[ "${PROXY_ALLOW_NS_NAMESPACES[$j]}" == "$svc_ns" ]] \
@@ -1977,10 +2094,35 @@ cmd_install() {
             fi
         done
         if ! $covered; then
-            echo "Warning: ${warn_labels[$i]} names an in-cluster Service in" >&2
-            echo "namespace '$svc_ns' on port $port, which no K8S_PROXY_ALLOW_NS" >&2
-            echo "entry covers -- every request to it will be dropped. Add" >&2
-            echo "$svc_ns:$port to K8S_PROXY_ALLOW_NS to fix that." >&2
+            if $port_carried; then
+                echo "Warning: ${warn_labels[$i]} names an in-cluster Service in" >&2
+                echo "namespace '$svc_ns' on port $port, which no K8S_PROXY_ALLOW_NS" >&2
+                echo "entry covers -- a normal in-cluster Service on this port would" >&2
+                echo "be dropped, but $port_carried_reason, so if this Service name" >&2
+                echo "ever resolves off-cluster (an ExternalName CNAME) requests to" >&2
+                echo "it WILL go through. Add $svc_ns:$port to K8S_PROXY_ALLOW_NS if" >&2
+                echo "this is meant to stay a normal in-cluster Service." >&2
+            else
+                echo "Warning: ${warn_labels[$i]} names an in-cluster Service in" >&2
+                echo "namespace '$svc_ns' on port $port, which no K8S_PROXY_ALLOW_NS" >&2
+                echo "entry covers -- every request to it will be dropped. Add" >&2
+                echo "$svc_ns:$port to K8S_PROXY_ALLOW_NS to fix that." >&2
+            fi
+        fi
+        # A separate, physically distinct path from the ClusterIP path
+        # $covered judges above: this is the CNAME-to-public-address case
+        # validate_upstream_url's 1b defers here (it needs
+        # PROXY_ALLOW_CIDRS/PORTS, not populated yet at validation time).
+        # Not nested inside `if ! $covered`, since a Service can be both
+        # NS-covered for its normal in-cluster address AND have its port
+        # opened to a public CIDR -- the two are unrelated egress paths to
+        # the same name.
+        if [[ "$url" == http://* && -n "$public_allow_cidr" ]]; then
+            echo "Warning: ${warn_labels[$i]} uses http:// to an in-cluster" >&2
+            echo "Service name on port $port, and K8S_PROXY_ALLOW entry" >&2
+            echo "$public_allow_cidr:$port opens that port to a non-private" >&2
+            echo "address -- if this Service name ever CNAMEs off-cluster, its" >&2
+            echo "Authorization header would leave the cluster in cleartext." >&2
         fi
     done
 

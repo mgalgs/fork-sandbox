@@ -1505,6 +1505,92 @@ refuses "http:// to a host merely ending in the cluster domain, without .svc., i
     "verified as private without DNS" \
     env FORK_SANDBOX_CONFIG_DIR="$non_svc_domain_config_dir" "$k8s_sh" install --dry-run
 
+# http:// to a .svc. name on port 443 is refused unconditionally -- the
+# default egress policy carries ANY address on 443, so a Service name
+# CNAMEd off-cluster would leak this endpoint's Authorization header in
+# cleartext. Named the port, per validate_upstream_url's own message.
+svc_dns_443_config_dir="$(newdir)"; tmpdirs+=("$svc_dns_443_config_dir")
+cat > "$svc_dns_443_config_dir/k8s.env" <<'CONF'
+K8S_CONTEXT=test-context
+K8S_NAMESPACE=fork-sandbox-test
+K8S_IMAGE=registry.example/you/fork-sandbox:latest
+K8S_PROXY_ENDPOINTS=primary=http://svc-a.example-ns.svc.cluster.local:443/v1
+K8S_DENIED_PROBE=10.0.0.1:443
+CONF
+refuses "http:// to a .svc. name on port 443 is refused, naming the port" \
+    "on port" \
+    env FORK_SANDBOX_CONFIG_DIR="$svc_dns_443_config_dir" "$k8s_sh" install --dry-run
+
+# https:// to a .svc. name on port 443 stays accepted -- the gate above is
+# about cleartext, not the port number itself.
+svc_dns_https_443_config_dir="$(newdir)"; tmpdirs+=("$svc_dns_https_443_config_dir")
+cat > "$svc_dns_https_443_config_dir/k8s.env" <<'CONF'
+K8S_CONTEXT=test-context
+K8S_NAMESPACE=fork-sandbox-test
+K8S_IMAGE=registry.example/you/fork-sandbox:latest
+K8S_PROXY_ENDPOINTS=primary=https://svc-a.example-ns.svc.cluster.local:443/v1
+K8S_DENIED_PROBE=10.0.0.1:443
+CONF
+if FORK_SANDBOX_CONFIG_DIR="$svc_dns_https_443_config_dir" "$k8s_sh" install --dry-run \
+    >/tmp/fs-k8s-test-svc-dns-https-443.out 2>/tmp/fs-k8s-test-svc-dns-https-443.err; then
+    ok "https:// to a .svc. name on port 443 is still accepted"
+else
+    no "https:// to a .svc. name on port 443 is still accepted" \
+        "$(cat /tmp/fs-k8s-test-svc-dns-https-443.err)"
+fi
+
+# A custom K8S_PROXY_ALLOW that opens this endpoint's port to a NON-private
+# CIDR is a deliberate operator choice (K8S_PROXY_ALLOW replaces the
+# default policy wholesale), so a .svc. http:// endpoint on that port is a
+# warning, not a refusal -- naming the endpoint and the matching entry.
+# 192.0.2.0/24 is this repo's RFC 5737 documentation range, a safe stand-in
+# for "a real public CIDR" in a test fixture.
+svc_dns_public_allow_config_dir="$(newdir)"; tmpdirs+=("$svc_dns_public_allow_config_dir")
+cat > "$svc_dns_public_allow_config_dir/k8s.env" <<'CONF'
+K8S_CONTEXT=test-context
+K8S_NAMESPACE=fork-sandbox-test
+K8S_IMAGE=registry.example/you/fork-sandbox:latest
+K8S_PROXY_ENDPOINTS=primary=http://svc-a.example-ns.svc.cluster.local:8080/v1
+K8S_PROXY_ALLOW=192.0.2.0/24:8080
+K8S_DENIED_PROBE=10.0.0.1:443
+CONF
+if FORK_SANDBOX_CONFIG_DIR="$svc_dns_public_allow_config_dir" "$k8s_sh" install --dry-run \
+    >/tmp/fs-k8s-test-svc-dns-public-allow.out 2>/tmp/fs-k8s-test-svc-dns-public-allow.err; then
+    ok "a .svc. http:// endpoint whose port a public K8S_PROXY_ALLOW CIDR opens is accepted, not refused"
+else
+    no "a .svc. http:// endpoint whose port a public K8S_PROXY_ALLOW CIDR opens is accepted, not refused" \
+        "$(cat /tmp/fs-k8s-test-svc-dns-public-allow.err)"
+fi
+if grep -qF "K8S_PROXY_ENDPOINTS entry 'primary'" /tmp/fs-k8s-test-svc-dns-public-allow.err \
+    && grep -qF '192.0.2.0/24:8080' /tmp/fs-k8s-test-svc-dns-public-allow.err \
+    && grep -qF 'leave the cluster in cleartext' /tmp/fs-k8s-test-svc-dns-public-allow.err; then
+    ok "the public-CIDR warning names the endpoint and the matching K8S_PROXY_ALLOW entry"
+else
+    no "the public-CIDR warning names the endpoint and the matching K8S_PROXY_ALLOW entry" \
+        "$(cat /tmp/fs-k8s-test-svc-dns-public-allow.err)"
+fi
+
+# The same shape, but the matching K8S_PROXY_ALLOW entry's CIDR is private
+# -- no cleartext-leak warning, since a private CIDR can never route to a
+# public CNAME target regardless of what the .svc. name resolves to.
+svc_dns_private_allow_config_dir="$(newdir)"; tmpdirs+=("$svc_dns_private_allow_config_dir")
+cat > "$svc_dns_private_allow_config_dir/k8s.env" <<'CONF'
+K8S_CONTEXT=test-context
+K8S_NAMESPACE=fork-sandbox-test
+K8S_IMAGE=registry.example/you/fork-sandbox:latest
+K8S_PROXY_ENDPOINTS=primary=http://svc-a.example-ns.svc.cluster.local:8080/v1
+K8S_PROXY_ALLOW=10.0.0.0/24:8080
+K8S_DENIED_PROBE=10.0.0.1:443
+CONF
+svc_dns_private_allow_err="$(FORK_SANDBOX_CONFIG_DIR="$svc_dns_private_allow_config_dir" "$k8s_sh" \
+    install --dry-run 2>&1 >/dev/null)"
+if [[ "$svc_dns_private_allow_err" == *'leave the cluster in cleartext'* ]]; then
+    no "a .svc. http:// endpoint whose matching K8S_PROXY_ALLOW CIDR is private does not warn about a leak" \
+        "$svc_dns_private_allow_err"
+else
+    ok "a .svc. http:// endpoint whose matching K8S_PROXY_ALLOW CIDR is private does not warn about a leak"
+fi
+
 # K8S_PROXY_ALLOW_NS -- selector-based egress for an in-cluster Service.
 # The static DNS egress rule already carries its own namespaceSelector
 # (kube-system/kube-dns), so "adds none" is checked as an unchanged
@@ -1729,6 +1815,105 @@ CONF
 refuses "K8S_PROXY_ALLOW_NS with a trailing ':' and no port is refused" \
     "trailing ':'" \
     env FORK_SANDBOX_CONFIG_DIR="$trailing_colon_config_dir" "$k8s_sh" install --dry-run
+
+# The port parsed straight out of a K8S_PROXY_ENDPOINTS URL, unlike
+# K8S_PROXY_ALLOW_NS's own port (already normalized by parse_proxy_allow_ns),
+# was never validated before cmd_install's reachability review does (( port
+# == PROXY_ALLOW_NS_PORTS[j] )) arithmetic on it -- a non-numeric port must
+# be this function's own clean error, not a raw bash arithmetic message.
+url_bad_port_config_dir="$(newdir)"; tmpdirs+=("$url_bad_port_config_dir")
+cat > "$url_bad_port_config_dir/k8s.env" <<'CONF'
+K8S_CONTEXT=test-context
+K8S_NAMESPACE=fork-sandbox-test
+K8S_IMAGE=registry.example/you/fork-sandbox:latest
+K8S_PROXY_ENDPOINTS=primary=http://svc-a.example-ns.svc.cluster.local:abc/v1
+K8S_PROXY_ALLOW_NS=example-ns
+K8S_DENIED_PROBE=10.0.0.1:443
+CONF
+refuses "a non-numeric port in a K8S_PROXY_ENDPOINTS URL is refused, naming the endpoint" \
+    "K8S_PROXY_ENDPOINTS entry 'primary' has an invalid port" \
+    env FORK_SANDBOX_CONFIG_DIR="$url_bad_port_config_dir" "$k8s_sh" install --dry-run
+
+# An out-of-range port (> 65535) in the URL is refused the same way.
+url_out_of_range_port_config_dir="$(newdir)"; tmpdirs+=("$url_out_of_range_port_config_dir")
+cp "$url_bad_port_config_dir/k8s.env" "$url_out_of_range_port_config_dir/k8s.env"
+sed -i 's/:abc\/v1/:99999\/v1/' "$url_out_of_range_port_config_dir/k8s.env"
+refuses "an out-of-range port in a K8S_PROXY_ENDPOINTS URL is refused" \
+    "K8S_PROXY_ENDPOINTS entry 'primary' has an invalid port" \
+    env FORK_SANDBOX_CONFIG_DIR="$url_out_of_range_port_config_dir" "$k8s_sh" install --dry-run
+
+# A leading-zero port in the URL itself (e.g. ":08") must normalize to
+# decimal 8 the same way parse_proxy_allow_ns already does for its own
+# side -- before this fix, "08" != 8 under plain (( )) arithmetic (a raw
+# bash error, in fact), so install told the operator to add "example-ns:08"
+# to K8S_PROXY_ALLOW_NS, which the parser then normalizes right back to 8,
+# reproducing the same false warning forever. Normalized, "8" covers "8"
+# and no warning (and no crash) appears at all.
+url_leading_zero_port_config_dir="$(newdir)"; tmpdirs+=("$url_leading_zero_port_config_dir")
+cat > "$url_leading_zero_port_config_dir/k8s.env" <<'CONF'
+K8S_CONTEXT=test-context
+K8S_NAMESPACE=fork-sandbox-test
+K8S_IMAGE=registry.example/you/fork-sandbox:latest
+K8S_PROXY_ENDPOINTS=primary=http://svc-a.example-ns.svc.cluster.local:08/v1
+K8S_PROXY_ALLOW_NS=example-ns:8
+K8S_DENIED_PROBE=10.0.0.1:443
+CONF
+url_leading_zero_port_err="$(FORK_SANDBOX_CONFIG_DIR="$url_leading_zero_port_config_dir" "$k8s_sh" \
+    install --dry-run 2>&1 >/dev/null)"
+if [[ "$url_leading_zero_port_err" == *'value too great for base'* ]]; then
+    no "a leading-zero URL port normalizes to decimal instead of raising a bash arithmetic error" \
+        "$url_leading_zero_port_err"
+elif [[ "$url_leading_zero_port_err" == *'K8S_PROXY_ALLOW_NS'* ]]; then
+    no "a leading-zero URL port normalizes to decimal instead of raising a bash arithmetic error" \
+        "$url_leading_zero_port_err"
+else
+    ok "a leading-zero URL port normalizes to decimal instead of raising a bash arithmetic error"
+fi
+
+# The reachability warning for an uncovered .svc. endpoint must say what
+# will actually happen under the egress policy in hand. An https:// .svc.
+# endpoint on port 443, with K8S_PROXY_ALLOW unset and no covering
+# K8S_PROXY_ALLOW_NS entry, is NOT dropped -- the default policy carries
+# any address on 443 -- so the warning must say requests WILL go through,
+# not that they will be dropped.
+uncovered_carried_config_dir="$(newdir)"; tmpdirs+=("$uncovered_carried_config_dir")
+cat > "$uncovered_carried_config_dir/k8s.env" <<'CONF'
+K8S_CONTEXT=test-context
+K8S_NAMESPACE=fork-sandbox-test
+K8S_IMAGE=registry.example/you/fork-sandbox:latest
+K8S_PROXY_ENDPOINTS=primary=https://svc-a.example-ns.svc.cluster.local:443/v1
+K8S_DENIED_PROBE=10.0.0.1:443
+CONF
+uncovered_carried_err="$(FORK_SANDBOX_CONFIG_DIR="$uncovered_carried_config_dir" "$k8s_sh" \
+    install --dry-run 2>&1 >/dev/null)"
+if [[ "$uncovered_carried_err" == *'WILL go through'* ]] \
+    && [[ "$uncovered_carried_err" != *'every request to it will be dropped'* ]]; then
+    ok "an uncovered .svc. endpoint the default policy carries (https on 443) warns it WILL go through"
+else
+    no "an uncovered .svc. endpoint the default policy carries (https on 443) warns it WILL go through" \
+        "$uncovered_carried_err"
+fi
+
+# The same shape, but on a port neither the default policy nor any
+# K8S_PROXY_ALLOW entry carries -- the original "will be dropped" wording
+# must still apply unchanged, since that remains true for this port.
+uncovered_dropped_config_dir="$(newdir)"; tmpdirs+=("$uncovered_dropped_config_dir")
+cat > "$uncovered_dropped_config_dir/k8s.env" <<'CONF'
+K8S_CONTEXT=test-context
+K8S_NAMESPACE=fork-sandbox-test
+K8S_IMAGE=registry.example/you/fork-sandbox:latest
+K8S_PROXY_ENDPOINTS=primary=https://svc-a.example-ns.svc.cluster.local:9000/v1
+K8S_DENIED_PROBE=10.0.0.1:443
+CONF
+uncovered_dropped_err="$(FORK_SANDBOX_CONFIG_DIR="$uncovered_dropped_config_dir" "$k8s_sh" \
+    install --dry-run 2>&1 >/dev/null)"
+if [[ "$uncovered_dropped_err" == *'every request to it will be dropped'* ]] \
+    && [[ "$uncovered_dropped_err" != *'WILL go through'* ]]; then
+    ok "an uncovered .svc. endpoint on a port no policy carries still warns it will be dropped"
+else
+    no "an uncovered .svc. endpoint on a port no policy carries still warns it will be dropped" \
+        "$uncovered_dropped_err"
+fi
 
 rm -f /tmp/fs-k8s-test-allow-ns-install.err /tmp/fs-k8s-test-allow-ns-noport-install.err \
     /tmp/fs-k8s-test-combined-allow-install.err

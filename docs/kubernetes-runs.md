@@ -707,13 +707,19 @@ overridable in `k8s.env` for a cluster with a different domain). A Service
 name resolves only inside the cluster's own DNS, so unlike an arbitrary
 hostname its privateness needs no DNS lookup to verify — but an
 `ExternalName` Service can still CNAME that name to an arbitrary public
-host, so the name alone is not a guarantee. What actually blocks that path
-is the proxy's own `NetworkPolicy` egress described below: a public IP
-matches neither the default ipBlock rule nor a `K8S_PROXY_ALLOW_NS`
-namespaceSelector rule, so a Service name CNAMEd off-cluster still can't
-get a request out. The `.svc.` segment is required (not just any name
-under the domain), since that is what marks a Service name specifically.
-Anything else still requires `https://`. The proxy's own `NetworkPolicy`
+host, so the name alone is not a guarantee. What actually holds that gate
+up is the proxy's own `NetworkPolicy` egress described below: a `.svc.`
+name only stays inside the cluster if the rendered egress policy does not
+also carry its port to a public address. The default policy carries any
+address on port 443 and nothing else, so `http://` to a `.svc.` name on
+443 is refused outright (a CNAME to a public host would otherwise leak the
+request's credential in cleartext); a custom `K8S_PROXY_ALLOW` that opens
+some other port publicly on purpose gets a warning instead, naming the
+endpoint and the matching allow entry, since that is a deliberate operator
+choice rather than a mistake. The `.svc.` segment is required (not just
+any name under the domain), since that is what marks a Service name
+specifically. Anything else still requires `https://`. The proxy's own
+`NetworkPolicy`
 egress otherwise defaults to any host except
 RFC1918/loopback/link-local/CGNAT on 443, same as above — a private
 endpoint needs `K8S_PROXY_ALLOW=<cidr>:<port>[,...]`
