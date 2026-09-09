@@ -276,6 +276,103 @@ if (( CHECK_ONLY )); then
 fi
 
 # --- Symlinks ---------------------------------------------------------------
+#
+# Only the porcelain goes on PATH. Everything else is plumbing that every
+# caller already reaches through its own script_dir (dirname of its own
+# resolved path), which finds this checkout regardless of PATH -- so linking
+# it too would just be 20 more names cluttering someone's shell completion.
+#
+# PORCELAIN and PLUMBING are the traced result of following every call site;
+# do not add a name to either by guessing from what it looks like.
+
+PORCELAIN=(
+    agent-sandboxed
+    build-sandbox-image.sh
+    claude-sandboxed
+    ensure-scratch-dirs.sh    # UserPromptSubmit hook command: settings.json invokes it by bare name
+    fork-sandbox
+    fork-sandbox-k8s.sh
+    fork-sandbox-say.sh
+    fork-sandbox-status.sh
+    fork-sandbox.sh
+    lkml-cover.sh
+    lkml-forklift.sh
+    lkml-mailbox.sh
+    lkml-render.py
+    lkml-revise.sh
+    lkml-round.sh
+    lkml-series.sh
+    lkml-status.sh
+    lkml-summarize.sh
+    pi-sandboxed
+    sandbox-run-log.py        # fork-sandbox.sh looks it up on PATH before falling back to this hardcoded path
+)
+
+PLUMBING=(
+    fork-sandbox-discover-claude
+    fork-sandbox-discover-k8s
+    fork-sandbox-discover-model
+    fork-sandbox-discover-openrouter
+    fork-sandbox-format.sh
+    fork-sandbox-inbox-hook.sh
+    fork-sandbox-k8s-context-extract.sh
+    fork-sandbox-k8s-egress-gate.sh
+    fork-sandbox-k8s-entrypoint.sh
+    fork-sandbox-k8s-inbox-write.sh
+    fork-sandbox-k8s-outbox-extract.sh
+    fork-sandbox-k8s-platform-generic
+    fork-sandbox-k8s-review-loop.sh
+    fork-sandbox-k8s-services-parse.py
+    fork-sandbox-lib.sh
+    fork-sandbox-preset-parse.py
+    lkml-seats-parse.py
+    lkml-seats-resolve
+    sandbox-backend-bwrap
+    sandbox-backend-container
+)
+
+# claude-sandboxed is hardcoded as $HOME/.claude/scripts/claude-sandboxed in
+# fork-sandbox-lib.sh and fork-sandbox.sh. agent-sandboxed is hardcoded the
+# same way in fork-sandbox.sh (pi-sandboxed is a repo symlink to it). Both
+# require the link to exist at that exact path, not just somewhere on PATH.
+
+# Fail closed: every regular file (or symlink to one) in scripts/ must be in
+# exactly one list, and every name in a list must exist in scripts/. This
+# forces a conscious classification decision on every new or renamed script
+# instead of letting it silently land on, or vanish from, PATH.
+declare -A classified=()
+for name in "${PORCELAIN[@]}" "${PLUMBING[@]}"; do
+    classified["$name"]=1
+done
+
+unclassified=()
+for script in "$REPO_DIR"/scripts/*; do
+    # Skip directories (e.g. an untracked __pycache__) -- only files (and
+    # symlinks to files) are candidates for installation.
+    [[ -f "$script" ]] || continue
+    script_name="$(basename "$script")"
+    if [[ -z "${classified[$script_name]:-}" ]]; then
+        unclassified+=("$script_name")
+    fi
+done
+
+missing_from_scripts=()
+for name in "${PORCELAIN[@]}" "${PLUMBING[@]}"; do
+    [[ -e "$REPO_DIR/scripts/$name" ]] || missing_from_scripts+=("$name")
+done
+
+if (( ${#unclassified[@]} || ${#missing_from_scripts[@]} )); then
+    if (( ${#unclassified[@]} )); then
+        echo "install.sh: scripts/ has files not classified as porcelain or plumbing:" >&2
+        printf '  %s\n' "${unclassified[@]}" >&2
+    fi
+    if (( ${#missing_from_scripts[@]} )); then
+        echo "install.sh: PORCELAIN/PLUMBING name no longer in scripts/:" >&2
+        printf '  %s\n' "${missing_from_scripts[@]}" >&2
+    fi
+    echo "Refusing to install anything until every script is classified." >&2
+    exit 1
+fi
 
 ensure_link() {
     local source="$1" target="$2" label="$3"
@@ -297,8 +394,8 @@ mkdir -p "$SCRIPTS_DIR" "${SKILL_FARMS[@]}"
 
 # Per file, not per directory: the farm is shared with whatever else you keep
 # there, so this only ever owns the names it installs.
-for script in "$REPO_DIR"/scripts/*; do
-    ensure_link "$script" "$SCRIPTS_DIR/$(basename "$script")" "$(basename "$script")"
+for name in "${PORCELAIN[@]}"; do
+    ensure_link "$REPO_DIR/scripts/$name" "$SCRIPTS_DIR/$name" "$name"
 done
 
 for skill_dir in "$REPO_DIR"/skills/*/; do
