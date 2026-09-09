@@ -2363,6 +2363,46 @@ else
 fi
 rm -f /tmp/fs-k8s-test-claude-submit.err
 
+# A claude_access_token containing '"', '$' or '\' renders into the exact
+# same nginx `set $var "...";` sink as OPENROUTER_API_KEY and a keyed
+# endpoint's credential above, so it must be refused the same way instead
+# of shipping a per-run proxy Pod that crashloops with nothing in the
+# install output pointing at the cause. Each fake token is an obvious
+# dummy value, and the check below confirms it never appears verbatim in
+# the command's combined output -- the value must never leak, even in an
+# error message naming the credential.
+for claude_unsafe_case in \
+    'dquote:sk-ant-test-dummy\"broken' \
+    'dollar:sk-ant-test-dummy$broken' \
+    'backslash:sk-ant-test-dummy\\broken'; do
+    claude_unsafe_label="${claude_unsafe_case%%:*}"
+    claude_unsafe_json_token="${claude_unsafe_case#*:}"
+    claude_unsafe_home="$(newdir)"; tmpdirs+=("$claude_unsafe_home")
+    mkdir -p "$claude_unsafe_home/.claude"
+    cat > "$claude_unsafe_home/.claude/.credentials.json" <<JSON
+{"claudeAiOauth": {"accessToken": "$claude_unsafe_json_token", "refreshToken": "fixture-refresh-token", "refreshTokenExpiresAt": 123, "expiresAt": $claude_future_ms, "scopes": ["user:inference"]}}
+JSON
+    claude_unsafe_out="$(HOME="$claude_unsafe_home" \
+        FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+        --branch fs-k8s-test-branch --model claude-sonnet-5 --harness claude \
+        "$proj_dir" "$handoff_file" 2>&1)"
+    claude_unsafe_rc=$?
+    claude_unsafe_raw_token="$(printf '%s' "$claude_unsafe_json_token" | sed 's/\\"/"/g; s/\\\\/\\/g')"
+    if (( claude_unsafe_rc != 0 )) && [[ "$claude_unsafe_out" == *"access token"* ]] \
+        && [[ "$claude_unsafe_out" == *"would break the"* ]]; then
+        ok "a claude access token containing a $claude_unsafe_label is refused"
+    else
+        no "a claude access token containing a $claude_unsafe_label is refused" \
+            "status $claude_unsafe_rc: $claude_unsafe_out"
+    fi
+    if [[ "$claude_unsafe_out" == *"$claude_unsafe_raw_token"* ]]; then
+        no "a claude access token containing a $claude_unsafe_label never leaks into the output" \
+            "found the fake token in the command's output"
+    else
+        ok "a claude access token containing a $claude_unsafe_label never leaks into the output"
+    fi
+done
+
 # The cleanup trap must exist before Secret creation: a label failure leaves
 # an unlabeled Secret behind, so only the explicit by-name delete can catch
 # it. This stub makes that exact command fail and records the cleanup calls.

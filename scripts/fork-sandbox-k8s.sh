@@ -692,7 +692,10 @@ require_secret_file() {
 # every run in the namespace, not just the one that supplied the bad value.
 # fs_reject_unsafe_chars (single quote / newline) guards a different set of
 # sinks -- the shell commands and run records this script builds -- and
-# does not cover this one.
+# does not cover this one. Three call sites render into this exact nginx
+# sink: OPENROUTER_API_KEY and a K8S_PROXY_ENDPOINT_KEYS value in
+# cmd_install, and the per-run claude_access_token Secret built for a
+# --harness claude run.
 reject_nginx_unsafe_chars() {
     local v="$1" label="$2"
     if [[ "$v" == *'"'* || "$v" == *'$'* || "$v" == *\\* ]]; then
@@ -2606,6 +2609,8 @@ cmd_submit() {
             exit 1
         fi
         fs_reject_unsafe_chars "$claude_access_token" || exit 1
+        reject_nginx_unsafe_chars "$claude_access_token" \
+            "the access token in $(fs_claude_credential_source)" || exit 1
 
         # The placeholder credential shipped into the pod's ConfigMap: the
         # same sanitizing jq claude-sandboxed applies to a local sandbox's
