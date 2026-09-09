@@ -3721,19 +3721,30 @@ done
 if [[ -d "$HOME/.claude/scripts" ]]; then
     review_kit_flags+=(--bind-ro "$HOME/.claude/scripts"
                        --prepend-path "$HOME/.claude/scripts")
-    # The farm is per-file symlinks into a checkout (install.sh's doing), so
+    # The farm is per-file symlinks into checkouts (install.sh's doing), so
     # binding the farm alone mounts dangling links. It is also shared: other
-    # projects link their own scripts into the same directory, so which
-    # checkout a given link in the farm points at cannot be inferred from the
-    # farm itself. But this script's own directory IS the checkout whose
-    # links must resolve here, so bind that directly rather than guessing
-    # from the farm's contents. Links belonging to other projects stay
-    # dangling inside the sandbox -- correctly: the sandbox has no business
-    # resolving another project's tooling, and mounting an unrelated tree
-    # into it was never intended.
-    if [[ -d "$script_dir" && "$script_dir" != "$HOME/.claude/scripts" ]]; then
-        review_kit_flags+=(--bind-ro "$script_dir")
-    fi
+    # projects link their own scripts into the same directory, and on a
+    # machine with more than one checkout linked in, picking a single
+    # directory -- whether "whichever link readdir returns first" or "this
+    # script's own directory" -- drops every other checkout's links, and the
+    # script a skill actually names (review-context.sh, for
+    # commit-then-review) can easily be one of the dropped ones. There is no
+    # way to know from here which checkout a skill will reach for, so bind
+    # all of them: resolve every symlink in the farm to its target
+    # directory, dedup, and bind each one. This script's own directory is
+    # included even when the farm holds no links to it (or none at all),
+    # since it is always a checkout whose scripts may be needed.
+    declare -A _fs_farm_target_dirs=()
+    _fs_farm_target_dirs["$script_dir"]=1
+    while IFS= read -r -d '' _fs_farm_link; do
+        _fs_farm_target_dir="$(dirname "$(readlink -f "$_fs_farm_link")")"
+        [[ -d "$_fs_farm_target_dir" ]] && _fs_farm_target_dirs["$_fs_farm_target_dir"]=1
+    done < <(find "$HOME/.claude/scripts" -maxdepth 1 -type l -print0)
+    for _fs_farm_target_dir in "${!_fs_farm_target_dirs[@]}"; do
+        [[ "$_fs_farm_target_dir" != "$HOME/.claude/scripts" ]] || continue
+        review_kit_flags+=(--bind-ro "$_fs_farm_target_dir")
+    done
+    unset _fs_farm_target_dirs _fs_farm_target_dir _fs_farm_link
 fi
 
 # The operator inbox: the one channel that reaches a run after it has started.

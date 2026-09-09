@@ -8,16 +8,18 @@
 # reachable. The farm holds per-file symlinks install.sh makes into a
 # checkout's scripts/ directory, and other projects link their own scripts
 # into the same farm -- so binding the farm alone mounts dangling links
-# unless the checkout each entry resolves into is bound too, at its real
+# unless every checkout an entry resolves into is bound too, at its real
 # path.
 #
 # Which checkout owns a given farm entry cannot be inferred by picking
-# "whichever link readdir returns first" (the bug this suite guards
-# against): that answer depends on directory order, not on which checkout
-# this script actually is. The fix binds this launcher's OWN directory
-# instead, since that IS the one checkout whose links need to resolve here.
-# A foreign project's links in the same farm are expected to stay dangling
-# inside the sandbox -- mounting them was never intended.
+# "whichever link readdir returns first" (the original bug this suite
+# guards against), nor by assuming this launcher's own directory is the
+# only one that matters (a second bug the same fix introduced and this
+# suite was rewritten to catch): a farm can hold links from several
+# checkouts at once, and the script a skill actually names -- e.g.
+# review-context.sh, for commit-then-review -- may live in any of them. The
+# fix resolves every symlink in the farm to its target directory, dedups,
+# and binds all of them, so no checkout's links are left dangling.
 #
 # claude-sandboxed is stubbed out entirely -- it drains stdin, records its
 # own argv, and exits 0 -- so no sandbox backend is ever exercised. This
@@ -49,7 +51,7 @@ tmpdirs=()
 cleanup() {
     local d
     for d in "${tmpdirs[@]-}"; do
-        [[ -n "$d" && -d "$d" ]] && rm -rf -- "$d"
+        [[ -n "$d" && -e "$d" ]] && rm -rf -- "$d"
     done
 }
 trap cleanup EXIT
@@ -104,50 +106,69 @@ new_project() {
 }
 
 # Runs fork-sandbox.sh for real, foreground, against a fixture $HOME, and
-# prints the path to the file the stub recorded its argv into. Every path it
-# creates is registered with tmpdirs itself -- this runs in the caller's own
-# shell, not inside a command substitution subshell, so an append here does
-# reach the trap.
+# prints the paths it created (argv file, handoff dir, config dir, run dir --
+# one per line, run dir may be empty on failure) for the CALLER to register
+# with tmpdirs. This function's own body runs inside the caller's
+# `$(run_and_capture_argv ...)` command substitution, hence a subshell of
+# its own, so a tmpdirs+= made here would update only that subshell's copy
+# of the array and never reach the trap -- register_run_paths below exists
+# to do the registration back in the shell that owns the real array.
 run_and_capture_argv() {
     local home="$1"
     local proj handoff_dir handoff argv_file cfg out rc rd
     proj="$(new_project "$home")"
     handoff_dir="$(mktemp -d /var/tmp/claude-scratch/fs-review-kit-bind-handoff.XXXXXX)"
-    tmpdirs+=("$handoff_dir")
     handoff="$handoff_dir/handoff.md"
     printf 'do the task\n' > "$handoff"
     argv_file="$(mktemp /var/tmp/claude-scratch/fs-review-kit-bind-argv.XXXXXX)"
-    tmpdirs+=("$argv_file")
     cfg="$(mktemp -d)"
-    tmpdirs+=("$cfg")
     out="$(HOME="$home" PATH="$stub_bin:$PATH" FORK_SANDBOX_CONFIG_DIR="$cfg" \
         FAKE_ARGV_FILE="$argv_file" \
         timeout 60 "$launcher" --foreground --harness claude "$proj" "$handoff" 2>&1)"
     rc=$?
+    rd=""
     if (( rc != 0 )); then
         printf 'run failed (rc=%s):\n%s\n' "$rc" "$out" >&2
-        return 1
+    else
+        rd="$(printf '%s\n' "$out" | sed -n 's/^  run dir:  *//p' | head -1)"
     fi
-    rd="$(printf '%s\n' "$out" | sed -n 's/^  run dir:  *//p' | head -1)"
-    [[ -n "$rd" ]] && tmpdirs+=("$rd")
-    printf '%s' "$argv_file"
+    printf '%s\n%s\n%s\n%s\n' "$argv_file" "$handoff_dir" "$cfg" "$rd"
+    (( rc == 0 ))
 }
 
-printf '== the shared farm: this checkout is bound, a foreign one is not ==\n'
+# Splits a run_and_capture_argv result and registers every non-empty path
+# with tmpdirs (the argv file is always created, win or lose, so it is
+# registered unconditionally), then leaves it in REGISTERED_ARGV_FILE for
+# the caller. Called directly -- never through a command substitution -- so
+# the tmpdirs+= here lands in the real array the EXIT trap reads.
+register_run_paths() {
+    local result="$1"
+    local -a fields
+    mapfile -t fields <<<"$result"
+    REGISTERED_ARGV_FILE="${fields[0]:-}"
+    local handoff_dir="${fields[1]:-}" cfg="${fields[2]:-}" rd="${fields[3]:-}"
+    [[ -n "$REGISTERED_ARGV_FILE" ]] && tmpdirs+=("$REGISTERED_ARGV_FILE")
+    [[ -n "$handoff_dir" ]] && tmpdirs+=("$handoff_dir")
+    [[ -n "$cfg" ]] && tmpdirs+=("$cfg")
+    [[ -n "$rd" ]] && tmpdirs+=("$rd")
+}
+
+printf '== the shared farm: both checkouts it holds links for are bound ==\n'
 
 # A fixture $HOME whose farm holds a symlink into THIS repo's own scripts/
 # directory (the checkout under test, and the one fork-sandbox.sh's own
 # script_dir resolves to) plus a symlink into an unrelated directory,
 # standing in for a different project's checkout sharing the same farm.
-# ORDER controls which link is created first, so cases 1-3 below can be
-# proven order-independent -- the whole point of the fix.
+# Creation order is varied between cases 1 and 2 below only as a light
+# regression guard against a future "pick one link" reintroduction --
+# find's own readdir order is not something this fixture controls, and the
+# current fix does not depend on it: every symlink in the farm is resolved
+# and its target dir bound, so which one is created first cannot matter.
 new_farm_home() {
     local order="$1" home foreign_dir
     home="$(mktemp -d)"
-    tmpdirs+=("$home")
     mkdir -p "$home/.claude/scripts"
     foreign_dir="$(mktemp -d /var/tmp/claude-scratch/fs-review-kit-bind-foreign.XXXXXX)"
-    tmpdirs+=("$foreign_dir")
     printf '#!/usr/bin/env bash\nexit 0\n' > "$foreign_dir/foreign-tool.sh"
     chmod +x "$foreign_dir/foreign-tool.sh"
     if [[ "$order" == foreign-first ]]; then
@@ -157,16 +178,23 @@ new_farm_home() {
         ln -s "$repo_dir/scripts/fork-sandbox.sh" "$home/.claude/scripts/fork-sandbox.sh"
         ln -s "$foreign_dir/foreign-tool.sh" "$home/.claude/scripts/foreign-tool.sh"
     fi
-    printf '%s|%s' "$home" "$foreign_dir"
+    printf '%s\n%s\n' "$home" "$foreign_dir"
 }
 
 check_farm_case() {
-    local order="$1" label_suffix="$2" pair home foreign_dir argv_file
-    pair="$(new_farm_home "$order")"
-    home="${pair%%|*}"
-    foreign_dir="${pair#*|}"
-    argv_file="$(run_and_capture_argv "$home")"
-    if [[ -z "$argv_file" ]]; then
+    local order="$1" label_suffix="$2" pair_result home foreign_dir argv_file
+    local -a pair_fields
+    local run_result run_rc
+    pair_result="$(new_farm_home "$order")"
+    mapfile -t pair_fields <<<"$pair_result"
+    home="${pair_fields[0]:-}"
+    foreign_dir="${pair_fields[1]:-}"
+    tmpdirs+=("$home" "$foreign_dir")
+    run_result="$(run_and_capture_argv "$home")"
+    run_rc=$?
+    register_run_paths "$run_result"
+    argv_file="$REGISTERED_ARGV_FILE"
+    if (( run_rc != 0 )); then
         no "run_and_capture_argv produced an argv file$label_suffix" "run failed"
         return
     fi
@@ -175,10 +203,10 @@ check_farm_case() {
     else
         no "this checkout's scripts dir is bound$label_suffix" "$(cat "$argv_file")"
     fi
-    if argv_lacks_bind_ro "$argv_file" "$foreign_dir"; then
-        ok "the foreign checkout's dir is NOT bound$label_suffix"
+    if argv_has_flag_value "$argv_file" --bind-ro "$foreign_dir"; then
+        ok "the foreign checkout's dir is ALSO bound$label_suffix"
     else
-        no "the foreign checkout's dir is NOT bound$label_suffix" "$(cat "$argv_file")"
+        no "the foreign checkout's dir is ALSO bound$label_suffix" "$(cat "$argv_file")"
     fi
     if argv_has_flag_value "$argv_file" --bind-ro "$home/.claude/scripts"; then
         ok "the farm itself is bound$label_suffix"
@@ -192,20 +220,22 @@ check_farm_case() {
     fi
 }
 
-# Case 1+2+4: repo-checkout bound, foreign checkout not, farm bound+prepended.
+# Case 1: repo checkout and foreign checkout both bound, farm bound+prepended.
 check_farm_case repo-first " (repo link created first)"
 
-# Case 3: order-independence -- the same assertions must hold when the
-# foreign link is the one readdir would see first. A test that only passed
-# in the lucky ordering would prove nothing about the fix.
+# Case 2: the same assertions must hold with the links created in the
+# opposite order -- see the note on new_farm_home above.
 check_farm_case foreign-first " (foreign link created first)"
 
 printf '\n== no farm: neither bind fires ==\n'
 
 no_farm_home="$(mktemp -d)"
 tmpdirs+=("$no_farm_home")
-argv_file_nofarm="$(run_and_capture_argv "$no_farm_home")"
-if [[ -n "$argv_file_nofarm" ]]; then
+run_result_nofarm="$(run_and_capture_argv "$no_farm_home")"
+run_rc_nofarm=$?
+register_run_paths "$run_result_nofarm"
+argv_file_nofarm="$REGISTERED_ARGV_FILE"
+if (( run_rc_nofarm == 0 )); then
     if argv_lacks_bind_ro "$argv_file_nofarm" "$no_farm_home/.claude/scripts"; then
         ok "no --bind-ro for a farm that does not exist"
     else
@@ -231,8 +261,11 @@ tmpdirs+=("$plain_farm_home")
 mkdir -p "$plain_farm_home/.claude/scripts"
 printf '#!/usr/bin/env bash\nexit 0\n' > "$plain_farm_home/.claude/scripts/plain-tool.sh"
 chmod +x "$plain_farm_home/.claude/scripts/plain-tool.sh"
-argv_file_plain="$(run_and_capture_argv "$plain_farm_home")"
-if [[ -n "$argv_file_plain" ]]; then
+run_result_plain="$(run_and_capture_argv "$plain_farm_home")"
+run_rc_plain=$?
+register_run_paths "$run_result_plain"
+argv_file_plain="$REGISTERED_ARGV_FILE"
+if (( run_rc_plain == 0 )); then
     if argv_has_flag_value "$argv_file_plain" --bind-ro "$repo_dir/scripts"; then
         ok "the checkout is bound even when the farm holds only regular files"
     else
