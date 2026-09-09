@@ -695,7 +695,23 @@ address ranges `http://` is restricted to. A set `K8S_PROXY_ALLOW`
 *replaces* that default policy wholesale rather than extending it, so
 every endpoint host — not just the one that prompted setting it — needs
 its own `<cidr>:<port>` entry, or it becomes unreachable too; `install`
-warns when it detects this. `submit` (and `run`) against such an install is wired to a named
+warns when it detects this.
+
+`K8S_PROXY_ALLOW` cannot reliably express "reach a Service inside this
+cluster": kube-proxy DNATs a `ClusterIP` to a pod IP *before* egress policy
+is evaluated on most CNIs, so an `ipBlock` naming the `ClusterIP` may never
+match. `K8S_PROXY_ALLOW_NS=<namespace>[:<port>][,...]` is the DNAT-agnostic
+construct for that case: it renders an egress rule selecting the given
+namespace by the standard `kubernetes.io/metadata.name` label, on the given
+port when one is given, or every port when it is omitted. It *composes
+with* `K8S_PROXY_ALLOW` rather than replacing it — a site may need both a
+LAN endpoint and an in-cluster one — so both an `ipBlock` rule (from
+`K8S_PROXY_ALLOW`, or the default policy when it is unset) and a
+`namespaceSelector` rule (from `K8S_PROXY_ALLOW_NS`) can appear in the same
+`NetworkPolicy`. Each namespace is validated at parse time against the
+`kubernetes.io/metadata.name` label shape, and each port (when given)
+against 1-65535; a bad entry is a parse-time error, nothing created.
+`submit` (and `run`) against such an install is wired to a named
 endpoint with `--endpoint NAME`: the pod's `PROXY_BASE_URL` becomes
 the shared proxy's `/e/NAME/v1` location instead of the legacy `/api/v1`
 path, which a keyless install never renders. A name that is not

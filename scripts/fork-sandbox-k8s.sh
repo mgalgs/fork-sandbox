@@ -303,7 +303,22 @@
 #                         a set value REPLACES that default wholesale --
 #                         it does not add to it -- so every endpoint host
 #                         needs its own <cidr>:<port> entry here or it is
-#                         unreachable.
+#                         unreachable. See also K8S_PROXY_ALLOW_NS, below,
+#                         for a Service living inside the cluster.
+#   K8S_PROXY_ALLOW_NS=   <namespace>[:<port>][,<namespace>[:<port>]...]
+#                         egress allowlist by namespace, for an in-cluster
+#                         Service K8S_PROXY_ENDPOINTS points at. kube-proxy
+#                         DNATs a ClusterIP to a pod IP before egress policy
+#                         is evaluated on most CNIs, so K8S_PROXY_ALLOW's
+#                         ipBlock cannot reliably express "reach this
+#                         Service" -- a namespaceSelector can, since it
+#                         matches the pod's own namespace label regardless
+#                         of DNAT. Port is optional; omitted means every
+#                         port. Composes WITH K8S_PROXY_ALLOW -- both apply
+#                         at once -- rather than replacing it, since a site
+#                         may need both a LAN endpoint and an in-cluster
+#                         one. Each namespace is validated against the
+#                         standard kubernetes.io/metadata.name label shape.
 #   K8S_DENIED_PROBE=     host:port the egress gate must NOT reach.
 #                         Required for submit.
 #   K8S_RUN_TTL=          seconds the pod idles after the agent exits.
@@ -421,6 +436,9 @@ K8S_PROXY_UPSTREAM="$(read_env_value "$k8s_env" K8S_PROXY_UPSTREAM || true)"
 K8S_PROXY_ENDPOINTS="$(read_env_value "$k8s_env" K8S_PROXY_ENDPOINTS || true)"
 K8S_DEFAULT_ENDPOINT="$(read_env_value "$k8s_env" K8S_DEFAULT_ENDPOINT || true)"
 K8S_PROXY_ALLOW="$(read_env_value "$k8s_env" K8S_PROXY_ALLOW || true)"
+# Namespace-selector egress allowlist, composing with K8S_PROXY_ALLOW --
+# see parse_proxy_allow_ns and render_proxy_egress_rules_ns below.
+K8S_PROXY_ALLOW_NS="$(read_env_value "$k8s_env" K8S_PROXY_ALLOW_NS || true)"
 # The cluster's own DNS domain -- a Service's in-cluster name is
 # <svc>.<ns>.svc.$K8S_CLUSTER_DOMAIN, and that domain is set at cluster
 # install time, so cluster.local (the common default) cannot be assumed.
@@ -483,7 +501,7 @@ fi
 
 fs_reject_unsafe_chars "$K8S_CONTEXT" "$K8S_NAMESPACE" "$K8S_IMAGE" \
     "$K8S_PROXY_UPSTREAM" "$K8S_PROXY_ENDPOINTS" "$K8S_PROXY_ALLOW" \
-    "$K8S_CLUSTER_DOMAIN" \
+    "$K8S_PROXY_ALLOW_NS" "$K8S_CLUSTER_DOMAIN" \
     "$K8S_DENIED_PROBE" "$GIT_USER_NAME" "$GIT_USER_EMAIL" \
     "$K8S_SERVICE_MAX_CPU" "$K8S_SERVICE_MAX_MEMORY" \
     "$K8S_RUN_OWNER" "$K8S_RUN_LABELS" \
@@ -1264,6 +1282,50 @@ parse_proxy_allow() {
     return 0
 }
 
+# Parses K8S_PROXY_ALLOW_NS ("<namespace>[:<port>],<namespace>[:<port>],...")
+# into the PROXY_ALLOW_NS_NAMESPACES / PROXY_ALLOW_NS_PORTS arrays
+# (module-global; an empty string in PROXY_ALLOW_NS_PORTS means "every
+# port"). An empty spec is not an error -- it renders no namespaceSelector
+# rule at all, see render_proxy_egress_rules_ns. Unlike K8S_PROXY_ALLOW, the
+# port here is optional: kube-proxy DNATs a ClusterIP to a pod IP before
+# egress policy is evaluated on most CNIs, so this exists specifically to
+# reach an in-cluster Service by the namespace label a NetworkPolicy can
+# actually match, and a site pointing at such a Service may not know (or
+# want to pin) which port it listens on.
+parse_proxy_allow_ns() {
+    local spec="$1" entry ns port
+    PROXY_ALLOW_NS_NAMESPACES=()
+    PROXY_ALLOW_NS_PORTS=()
+    [[ -z "$spec" ]] && return 0
+
+    local -a entries
+    IFS=',' read -ra entries <<< "$spec"
+    for entry in "${entries[@]}"; do
+        if [[ "$entry" == *:* ]]; then
+            ns="${entry%:*}"
+            port="${entry##*:}"
+        else
+            ns="$entry"
+            port=""
+        fi
+        if [[ ! "$ns" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]]; then
+            echo "Error: K8S_PROXY_ALLOW_NS entry '$entry' does not name a valid" >&2
+            echo "namespace ('$ns') -- it must match" >&2
+            echo '[a-z0-9]([a-z0-9-]*[a-z0-9])?, the standard' >&2
+            echo "kubernetes.io/metadata.name label shape." >&2
+            return 1
+        fi
+        if [[ -n "$port" ]] && { [[ ! "$port" =~ ^[0-9]{1,5}$ ]] || (( port < 1 || port > 65535 )); }; then
+            echo "Error: K8S_PROXY_ALLOW_NS entry '$entry' has an invalid port" >&2
+            echo "'$port' -- must be 1-65535." >&2
+            return 1
+        fi
+        PROXY_ALLOW_NS_NAMESPACES+=("$ns")
+        PROXY_ALLOW_NS_PORTS+=("$port")
+    done
+    return 0
+}
+
 # Packs a literal IPv4 address (no validation -- callers already matched one
 # with the ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ regex
 # validate_upstream_url uses) into a 32-bit integer for cidr_contains below.
@@ -1298,6 +1360,12 @@ cidr_contains() {
 # <cidr>:<port> entries (from the PROXY_ALLOW_CIDRS / PROXY_ALLOW_PORTS
 # arrays parse_proxy_allow filled in) and nothing else -- explicit egress,
 # for whatever private (or public) addresses K8S_PROXY_ENDPOINTS names.
+# K8S_PROXY_ALLOW_NS's namespaceSelector rule(s), rendered by
+# render_proxy_egress_rules_ns below, always append after whichever of the
+# two blocks above ran -- it composes with K8S_PROXY_ALLOW rather than being
+# replaced by it, since the two express different, non-overlapping things
+# (an ipBlock can't reliably match a Service's DNAT'd traffic; see that
+# function's own header).
 render_proxy_egress_rules() {
     if [[ ${#PROXY_ALLOW_CIDRS[@]} -eq 0 ]]; then
         cat <<'EOF'
@@ -1314,14 +1382,12 @@ render_proxy_egress_rules() {
         - protocol: TCP
           port: 443
 EOF
-        return 0
-    fi
-
-    local i cidr port
-    for (( i = 0; i < ${#PROXY_ALLOW_CIDRS[@]}; i++ )); do
-        cidr="${PROXY_ALLOW_CIDRS[$i]}"
-        port="${PROXY_ALLOW_PORTS[$i]}"
-        cat <<EOF
+    else
+        local i cidr port
+        for (( i = 0; i < ${#PROXY_ALLOW_CIDRS[@]}; i++ )); do
+            cidr="${PROXY_ALLOW_CIDRS[$i]}"
+            port="${PROXY_ALLOW_PORTS[$i]}"
+            cat <<EOF
     - to:
         - ipBlock:
             cidr: $cidr
@@ -1329,6 +1395,41 @@ EOF
         - protocol: TCP
           port: $port
 EOF
+        done
+    fi
+    render_proxy_egress_rules_ns
+}
+
+# K8S_PROXY_ALLOW_NS's egress rule(s) -- one namespaceSelector rule per
+# <namespace>[:<port>] entry in PROXY_ALLOW_NS_NAMESPACES /
+# PROXY_ALLOW_NS_PORTS (parse_proxy_allow_ns). Prints nothing when that
+# array is empty, which is what keeps render_proxy_egress_rules's output
+# byte-identical to today's whenever K8S_PROXY_ALLOW_NS is unset, regardless
+# of whether K8S_PROXY_ALLOW is set. kube-proxy DNATs a ClusterIP to a pod
+# IP before egress policy is evaluated on most CNIs, so an ipBlock naming
+# the ClusterIP may never match -- a namespaceSelector matches the
+# destination pod's own namespace label instead, which survives the DNAT.
+# An empty port (see parse_proxy_allow_ns) omits the `ports:` key entirely
+# rather than rendering an empty list -- NetworkPolicy treats a rule with no
+# `ports:` key as every port and protocol.
+render_proxy_egress_rules_ns() {
+    local i ns port
+    for (( i = 0; i < ${#PROXY_ALLOW_NS_NAMESPACES[@]}; i++ )); do
+        ns="${PROXY_ALLOW_NS_NAMESPACES[$i]}"
+        port="${PROXY_ALLOW_NS_PORTS[$i]}"
+        cat <<EOF
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: $ns
+EOF
+        if [[ -n "$port" ]]; then
+            cat <<EOF
+      ports:
+        - protocol: TCP
+          port: $port
+EOF
+        fi
     done
 }
 
@@ -1606,6 +1707,13 @@ cmd_install() {
     # K8S_PROXY_ENDPOINTS, since a legacy install could in principle want an
     # explicit allowlist too.
     parse_proxy_allow "$K8S_PROXY_ALLOW" || exit 1
+
+    # Fills the module-global PROXY_ALLOW_NS_NAMESPACES / PROXY_ALLOW_NS_PORTS
+    # arrays render_proxy_egress_rules_ns reads below. Composes with
+    # K8S_PROXY_ALLOW rather than replacing it -- see that function's own
+    # header for why an ipBlock alone cannot reliably reach an in-cluster
+    # Service.
+    parse_proxy_allow_ns "$K8S_PROXY_ALLOW_NS" || exit 1
 
     # Every URL this install's proxy will dial -- the legacy
     # K8S_PROXY_UPSTREAM (if set) plus each K8S_PROXY_ENDPOINTS entry --

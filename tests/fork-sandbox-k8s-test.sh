@@ -1387,6 +1387,136 @@ refuses "http:// to a host merely ending in the cluster domain, without .svc., i
     "verified as private without DNS" \
     env FORK_SANDBOX_CONFIG_DIR="$non_svc_domain_config_dir" "$k8s_sh" install --dry-run
 
+# K8S_PROXY_ALLOW_NS -- selector-based egress for an in-cluster Service.
+# The static DNS egress rule already carries its own namespaceSelector
+# (kube-system/kube-dns), so "adds none" is checked as an unchanged
+# occurrence count (exactly that one), not a bare absence check.
+if [[ "$(grep -c 'namespaceSelector' <<< "$proxy_netpol_doc")" == 1 ]]; then
+    ok "unset K8S_PROXY_ALLOW_NS renders no additional namespaceSelector rule (default egress)"
+else
+    no "unset K8S_PROXY_ALLOW_NS renders no additional namespaceSelector rule (default egress)" \
+        "$proxy_netpol_doc"
+fi
+if [[ "$(grep -c 'namespaceSelector' <<< "$proxy_netpol_allow_doc")" == 1 ]]; then
+    ok "unset K8S_PROXY_ALLOW_NS renders no additional namespaceSelector rule (K8S_PROXY_ALLOW set)"
+else
+    no "unset K8S_PROXY_ALLOW_NS renders no additional namespaceSelector rule (K8S_PROXY_ALLOW set)" \
+        "$proxy_netpol_allow_doc"
+fi
+
+# A set K8S_PROXY_ALLOW_NS=<namespace>:<port>, with K8S_PROXY_ALLOW unset,
+# composes with (does not replace) the default egress rule.
+allow_ns_config_dir="$(newdir)"; tmpdirs+=("$allow_ns_config_dir")
+cat > "$allow_ns_config_dir/k8s.env" <<'CONF'
+K8S_CONTEXT=test-context
+K8S_NAMESPACE=fork-sandbox-test
+K8S_IMAGE=registry.example/you/fork-sandbox:latest
+K8S_PROXY_ENDPOINTS=primary=http://svc-a.example-ns.svc.cluster.local:8001/v1
+K8S_PROXY_ALLOW_NS=example-ns:8001
+K8S_DENIED_PROBE=10.0.0.1:443
+CONF
+allow_ns_out="$(newdir)/allow-ns-install.yaml"; tmpdirs+=("$(dirname "$allow_ns_out")")
+FORK_SANDBOX_CONFIG_DIR="$allow_ns_config_dir" "$k8s_sh" install --dry-run \
+    > "$allow_ns_out" 2>/tmp/fs-k8s-test-allow-ns-install.err
+proxy_netpol_allow_ns_doc="$(extract_doc_by_kind NetworkPolicy "$allow_ns_out")"
+if grep -qF 'cidr: 0.0.0.0/0' <<< "$proxy_netpol_allow_ns_doc" \
+    && grep -q 'namespaceSelector' <<< "$proxy_netpol_allow_ns_doc" \
+    && grep -qF 'kubernetes.io/metadata.name: example-ns' <<< "$proxy_netpol_allow_ns_doc" \
+    && grep -q 'port: 8001' <<< "$proxy_netpol_allow_ns_doc"; then
+    ok "K8S_PROXY_ALLOW_NS=<ns>:<port> adds a namespaceSelector rule alongside the default egress block"
+else
+    no "K8S_PROXY_ALLOW_NS=<ns>:<port> adds a namespaceSelector rule alongside the default egress block" \
+        "$proxy_netpol_allow_ns_doc"
+fi
+
+# A set K8S_PROXY_ALLOW_NS=<namespace> with no port renders the
+# namespaceSelector rule with no ports: key at all (every port).
+allow_ns_noport_config_dir="$(newdir)"; tmpdirs+=("$allow_ns_noport_config_dir")
+cat > "$allow_ns_noport_config_dir/k8s.env" <<'CONF'
+K8S_CONTEXT=test-context
+K8S_NAMESPACE=fork-sandbox-test
+K8S_IMAGE=registry.example/you/fork-sandbox:latest
+K8S_PROXY_ENDPOINTS=primary=http://svc-a.example-ns.svc.cluster.local:8001/v1
+K8S_PROXY_ALLOW_NS=example-ns
+K8S_DENIED_PROBE=10.0.0.1:443
+CONF
+allow_ns_noport_out="$(newdir)/allow-ns-noport-install.yaml"; tmpdirs+=("$(dirname "$allow_ns_noport_out")")
+FORK_SANDBOX_CONFIG_DIR="$allow_ns_noport_config_dir" "$k8s_sh" install --dry-run \
+    > "$allow_ns_noport_out" 2>/tmp/fs-k8s-test-allow-ns-noport-install.err
+proxy_netpol_allow_ns_noport_doc="$(extract_doc_by_kind NetworkPolicy "$allow_ns_noport_out")"
+if grep -qF 'kubernetes.io/metadata.name: example-ns' <<< "$proxy_netpol_allow_ns_noport_doc"; then
+    ok "K8S_PROXY_ALLOW_NS=<ns> (no port) renders the namespaceSelector rule"
+else
+    no "K8S_PROXY_ALLOW_NS=<ns> (no port) renders the namespaceSelector rule" \
+        "$proxy_netpol_allow_ns_noport_doc"
+fi
+ns_line_after="$(grep -A1 -F 'kubernetes.io/metadata.name: example-ns' <<< "$proxy_netpol_allow_ns_noport_doc" | tail -1)"
+if [[ "$ns_line_after" == *'ports:'* ]]; then
+    no "K8S_PROXY_ALLOW_NS=<ns> (no port) omits the ports: key entirely" \
+        "line after matchLabels was: $ns_line_after"
+else
+    ok "K8S_PROXY_ALLOW_NS=<ns> (no port) omits the ports: key entirely"
+fi
+
+# K8S_PROXY_ALLOW and K8S_PROXY_ALLOW_NS compose: both an ipBlock rule (from
+# K8S_PROXY_ALLOW, replacing the default) and a namespaceSelector rule (from
+# K8S_PROXY_ALLOW_NS) appear in the same NetworkPolicy.
+combined_allow_config_dir="$(newdir)"; tmpdirs+=("$combined_allow_config_dir")
+cat > "$combined_allow_config_dir/k8s.env" <<'CONF'
+K8S_CONTEXT=test-context
+K8S_NAMESPACE=fork-sandbox-test
+K8S_IMAGE=registry.example/you/fork-sandbox:latest
+K8S_PROXY_ENDPOINTS=primary=http://10.0.0.5:8001/v1,secondary=http://svc-a.example-ns.svc.cluster.local:9000/v1
+K8S_PROXY_ALLOW=10.0.0.5/32:8001
+K8S_PROXY_ALLOW_NS=example-ns:9000
+K8S_DENIED_PROBE=10.0.0.1:443
+CONF
+combined_allow_out="$(newdir)/combined-allow-install.yaml"; tmpdirs+=("$(dirname "$combined_allow_out")")
+FORK_SANDBOX_CONFIG_DIR="$combined_allow_config_dir" "$k8s_sh" install --dry-run \
+    > "$combined_allow_out" 2>/tmp/fs-k8s-test-combined-allow-install.err
+proxy_netpol_combined_doc="$(extract_doc_by_kind NetworkPolicy "$combined_allow_out")"
+if grep -qF 'cidr: 10.0.0.5/32' <<< "$proxy_netpol_combined_doc" \
+    && grep -q 'namespaceSelector' <<< "$proxy_netpol_combined_doc" \
+    && grep -qF 'kubernetes.io/metadata.name: example-ns' <<< "$proxy_netpol_combined_doc" \
+    && grep -q 'port: 9000' <<< "$proxy_netpol_combined_doc"; then
+    ok "K8S_PROXY_ALLOW and K8S_PROXY_ALLOW_NS compose in the same NetworkPolicy"
+else
+    no "K8S_PROXY_ALLOW and K8S_PROXY_ALLOW_NS compose in the same NetworkPolicy" \
+        "$proxy_netpol_combined_doc"
+fi
+
+# A bad namespace shape in K8S_PROXY_ALLOW_NS is a parse-time error, nothing
+# created.
+bad_ns_config_dir="$(newdir)"; tmpdirs+=("$bad_ns_config_dir")
+cat > "$bad_ns_config_dir/k8s.env" <<'CONF'
+K8S_CONTEXT=test-context
+K8S_NAMESPACE=fork-sandbox-test
+K8S_IMAGE=registry.example/you/fork-sandbox:latest
+K8S_PROXY_ENDPOINTS=primary=http://10.0.0.5:8001/v1
+K8S_PROXY_ALLOW_NS=-bad-:8001
+K8S_DENIED_PROBE=10.0.0.1:443
+CONF
+refuses "a bad namespace shape in K8S_PROXY_ALLOW_NS is refused" \
+    "does not name a valid" \
+    env FORK_SANDBOX_CONFIG_DIR="$bad_ns_config_dir" "$k8s_sh" install --dry-run
+
+# A bad port in K8S_PROXY_ALLOW_NS is a parse-time error, nothing created.
+bad_ns_port_config_dir="$(newdir)"; tmpdirs+=("$bad_ns_port_config_dir")
+cat > "$bad_ns_port_config_dir/k8s.env" <<'CONF'
+K8S_CONTEXT=test-context
+K8S_NAMESPACE=fork-sandbox-test
+K8S_IMAGE=registry.example/you/fork-sandbox:latest
+K8S_PROXY_ENDPOINTS=primary=http://10.0.0.5:8001/v1
+K8S_PROXY_ALLOW_NS=example-ns:99999
+K8S_DENIED_PROBE=10.0.0.1:443
+CONF
+refuses "a bad port in K8S_PROXY_ALLOW_NS is refused" \
+    "has an invalid port" \
+    env FORK_SANDBOX_CONFIG_DIR="$bad_ns_port_config_dir" "$k8s_sh" install --dry-run
+
+rm -f /tmp/fs-k8s-test-allow-ns-install.err /tmp/fs-k8s-test-allow-ns-noport-install.err \
+    /tmp/fs-k8s-test-combined-allow-install.err
+
 rm -f /tmp/fs-k8s-test-endpoints-install.err /tmp/fs-k8s-test-allow-install.err \
     /tmp/fs-k8s-test-http-private.out /tmp/fs-k8s-test-http-private.err \
     /tmp/fs-k8s-test-endpoints-http-private.out /tmp/fs-k8s-test-endpoints-http-private.err \
