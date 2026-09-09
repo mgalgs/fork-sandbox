@@ -392,10 +392,32 @@ ensure_link() {
 
 mkdir -p "$SCRIPTS_DIR" "${SKILL_FARMS[@]}"
 
+is_porcelain() {
+    local name="$1" p
+    for p in "${PORCELAIN[@]}"; do
+        [[ "$p" == "$name" ]] && return 0
+    done
+    return 1
+}
+
 # Per file, not per directory: the farm is shared with whatever else you keep
 # there, so this only ever owns the names it installs.
 for name in "${PORCELAIN[@]}"; do
     ensure_link "$REPO_DIR/scripts/$name" "$SCRIPTS_DIR/$name" "$name"
+done
+
+# Prune links this repo made for names that are now plumbing. Only ever touch
+# a symlink that resolves into THIS repo's scripts/ directory -- the farm is
+# shared with other repos and possibly the user's own files, so anything else
+# in there, symlink or not, is none of this installer's business.
+for target in "$SCRIPTS_DIR"/*; do
+    [[ -L "$target" ]] || continue
+    target_name="$(basename "$target")"
+    is_porcelain "$target_name" && continue
+    resolved="$(readlink -f "$target" 2>/dev/null || true)"
+    [[ -n "$resolved" && "$resolved" == "$REPO_DIR/scripts/"* ]] || continue
+    rm "$target"
+    echo "  $target_name: unlinked (now plumbing)"
 done
 
 for skill_dir in "$REPO_DIR"/skills/*/; do
