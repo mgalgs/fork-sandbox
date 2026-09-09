@@ -771,12 +771,20 @@ endpoint *and* carries one of those, because a legacy
 and a `/models` probe there would 403 and die the pod at startup with
 nginx's error page — and a `--harness claude` run without a review
 loop talks only to its own per-run proxy, so it must not hard-depend
-on the endpoint being up. When `--model` was
+on the endpoint being up. `K8S_DEFAULT_MODEL` in `k8s.env`, when set,
+resolves before this discovery ever runs: `submit`/`run` fill in a
+missing `--model` from it (announced on stderr) the same way
+`--endpoint` falls back to `K8S_DEFAULT_ENDPOINT` above, so the
+site-configured model reaches the pod as if `--model` had been given.
+When `--model` (or `K8S_DEFAULT_MODEL`) was
 omitted, exactly one model in the listing is used (and said so); zero
 or several is an error listing what was found. When `--model` was
-given but the listing does not contain it, that is a warning, not an
+given (directly or via `K8S_DEFAULT_MODEL`) but the listing does not
+contain it, that is a warning, not an
 error — the listing may be stale, and refusing would strand a
-legitimate run. The same response's `max_model_len` for the chosen
+legitimate run. `--harness claude` keeps requiring `--model` regardless
+of `K8S_DEFAULT_MODEL` — the claude check runs first specifically so a
+claude run never silently picks up a pi endpoint's model id. The same response's `max_model_len` for the chosen
 model becomes `models.json`'s `contextWindow` (a missing value falls
 back to a deliberately low 32768 guess, with a warning), and `maxTokens`
 is derived the same way `agent-sandboxed` derives it: a 32768 floor
