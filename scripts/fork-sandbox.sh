@@ -3981,11 +3981,12 @@ fi
 
 # fs_emit_prompt_preamble (fork-sandbox-lib.sh) takes its network argument
 # explicitly rather than reading $harness itself, so it can also serve
-# fork-sandbox-k8s.sh's pod, which is a network situation of its own and not
-# "pi-local". Resolve it once here: "sealed" for a pi-local run (no network
-# at all), empty for every other local harness (unrestricted).
+# fork-sandbox-k8s.sh's pod, which is a network situation of its own. Each
+# leg carries its own network value already (set alongside its harness);
+# resolve the preamble's copy of it here: "sealed" when that leg's network
+# is sealed (no network at all), empty for pinned (unrestricted).
 preamble_network=""
-[[ "$harness" == "pi-local" ]] && preamble_network=sealed
+[[ "$network" == "sealed" ]] && preamble_network=sealed
 
 # The review leg's own preamble, separate from the implement/fix one above:
 # fs_emit_prompt_preamble's $harness argument decides whether the prompt
@@ -4002,34 +4003,36 @@ review_preamble_network="$preamble_network"
 if [[ "$review_harness_given" == true ]]; then
     review_preamble_harness="$review_harness"
     review_preamble_network=""
-    [[ "$review_harness" == "pi-local" ]] && review_preamble_network=sealed
+    [[ "${review_network:-}" == "sealed" ]] && review_preamble_network=sealed
 fi
 
 # The preset fix seats' preambles, same rule: describe the harness that is
 # about to run the leg.
 fxr_preamble_network=""
 if [[ -n "$fix_harness" ]]; then
-    [[ "$fix_harness" == "pi-local" ]] && fxr_preamble_network=sealed
+    [[ "${fix_network:-}" == "sealed" ]] && fxr_preamble_network=sealed
 fi
 fxm_preamble_network=""
 if [[ -n "$mntfix_harness" ]]; then
-    [[ "$mntfix_harness" == "pi-local" ]] && fxm_preamble_network=sealed
+    [[ "${mntfix_network:-}" == "sealed" ]] && fxm_preamble_network=sealed
 fi
 
 # The maintainer leg's own preamble follows the review leg's: it describes
 # whichever harness is ABOUT TO RUN that leg. Without --maintainer-harness
 # the default is the implement harness -- set here, once, so the prompt,
-# the runner, run.env and the summary all read a concrete maintainer_harness
-# rather than branching on maintainer_harness_given at every use site.
+# the runner, run.env and the summary all read a concrete
+# maintainer_harness/maintainer_network rather than branching on
+# maintainer_harness_given at every use site.
 maintainer_preamble_harness="$harness"
 maintainer_preamble_network="$preamble_network"
 if (( maintainer_loop_cap > 0 )); then
     if [[ "$maintainer_harness_given" != true ]]; then
         maintainer_harness="$harness"
+        maintainer_network="$network"
     else
         maintainer_preamble_harness="$maintainer_harness"
         maintainer_preamble_network=""
-        [[ "$maintainer_harness" == "pi-local" ]] && maintainer_preamble_network=sealed
+        [[ "${maintainer_network:-}" == "sealed" ]] && maintainer_preamble_network=sealed
     fi
 fi
 
