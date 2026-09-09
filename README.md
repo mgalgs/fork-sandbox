@@ -111,7 +111,7 @@ is paired with a pinned, credentialed review leg on purpose.
 |---|---|---|
 | **Pinned** (default) | The internet, via your default interface only. Not the VPN, not the tailnet, not host loopback. | A Claude or OpenRouter run that needs to fetch packages and read docs. |
 | **Sealed** (`--harness pi-local`) | Nothing. One OpenAI-compatible endpoint over a unix socket. | A model you host. Costs nothing, holds no credential, cannot exfiltrate — true of the implement leg; a networked `--review-harness` reopens all three for its own leg. |
-| **Serviced** (`--services`) | Whichever of the above, plus a per-run compose stack on unix sockets. | A suite that needs postgres or redis to run. |
+| **Serviced** (repo opt-in; `--no-services` skips) | Whichever of the above, plus a per-run compose stack on unix sockets. | A suite that needs postgres or redis to run. |
 
 Sealed mode is why a local model is worth the trouble. A local endpoint needs
 no API key, so there is no credential in the sandbox to steal, and with no
@@ -581,6 +581,10 @@ what is mounted, what is not, and a numbered list of the gaps.
   and its two implementations.
 - [docs/kubernetes-runs.md](docs/kubernetes-runs.md) — running a whole run in a
   cluster, and why that is not a backend.
+- [docs/k8s-platform.md](docs/k8s-platform.md) — teaching the cluster path
+  about your platform, with a `fork-sandbox-k8s-platform-<name>` plugin.
+- [docs/prompt-overlays.md](docs/prompt-overlays.md) — overriding what a run
+  is told, from `~/.config/fork-sandbox/prompts/`.
 - [docs/sandbox-backend-container.md](docs/sandbox-backend-container.md) — the
   container backend: mechanism, threat model, and limits.
 
