@@ -4679,15 +4679,18 @@ started_at="$(date +%s)"
     printf 'checkout=%s\n' "$checkout_ref"
     printf 'harness=%s\n' "$harness"
     printf 'harness_version=%s\n' "$harness_version"
+    printf 'network=%s\n' "$network"
     printf 'model=%s\n' "$model"
     printf 'review_model=%s\n' "$review_model"
     printf 'review_harness=%s\n' "$review_harness"
+    printf 'review_network=%s\n' "$review_network"
     printf 'session=%s\n' "$session_name"
     printf 'review_loop_cap=%s\n' "$review_loop_cap"
     # The maintainer tier's record of itself: printed only when the loop is
     # on, so a no-maintainer run.env is what it has always been.
     if (( maintainer_loop_cap > 0 )); then
         printf 'maintainer_harness=%s\n' "$maintainer_harness"
+        printf 'maintainer_network=%s\n' "$maintainer_network"
         printf 'maintainer_model=%s\n' "$maintainer_model"
         printf 'maintainer_loop=%s\n' "$maintainer_loop_cap"
     fi
@@ -4695,11 +4698,13 @@ started_at="$(date +%s)"
     [[ "$code_repeat" == "1" ]] || printf 'code_repeat=%s\n' "$code_repeat"
     if [[ -n "$fix_harness" ]]; then
         printf 'fix_harness=%s\n' "$fix_harness"
+        printf 'fix_network=%s\n' "$fix_network"
         printf 'fix_model=%s\n' "$fix_model"
     fi
     [[ "$fix_repeat" == "1" ]] || printf 'fix_repeat=%s\n' "$fix_repeat"
     if [[ -n "$mntfix_harness" ]]; then
         printf 'maintainer_fix_harness=%s\n' "$mntfix_harness"
+        printf 'maintainer_fix_network=%s\n' "$mntfix_network"
         printf 'maintainer_fix_model=%s\n' "$mntfix_model"
     fi
     [[ "$mntfix_repeat" == "1" ]] || printf 'maintainer_fix_repeat=%s\n' "$mntfix_repeat"
@@ -4754,6 +4759,7 @@ started_at="$(date +%s)"
     printf 'formatter=%q\n' "$run_formatter"
     printf 'harness=%q\n' "$harness"
     printf 'harness_version=%q\n' "$harness_version"
+    printf 'network=%q\n' "$network"
     printf 'usage_source=%q\n' "$usage_source"
     printf 'harness_env_file=%q\n' "$harness_env_file"
     printf 'codex_auth_src=%q\n' "${codex_auth_src:-}"
@@ -4765,6 +4771,7 @@ started_at="$(date +%s)"
     printf 'model=%q\n' "$model"
     printf 'review_model=%q\n' "$review_model"
     printf 'review_harness=%q\n' "$review_harness"
+    printf 'review_network=%q\n' "$review_network"
     # run_leg needs this to know whether a review leg's own Stop-hook
     # invariant holds for fs_archive_inbox -- see review_preamble_harness's
     # own definition above, beside the review preamble, for why it is not
@@ -4793,6 +4800,7 @@ started_at="$(date +%s)"
     if (( maintainer_loop_cap > 0 )); then
         printf 'maintainer_loop_cap=%q\n' "$maintainer_loop_cap"
         printf 'maintainer_harness=%q\n' "$maintainer_harness"
+        printf 'maintainer_network=%q\n' "$maintainer_network"
         printf 'maintainer_model=%q\n' "$maintainer_model"
         # Same split as review_preamble_harness above, for the maintainer leg:
         # the harness that actually runs it, for fs_archive_inbox.
@@ -4820,6 +4828,7 @@ started_at="$(date +%s)"
     # shellcheck disable=SC2154
     if [[ -n "$fix_harness" ]]; then
         printf 'fix_harness=%q\n' "$fix_harness"
+        printf 'fix_network=%q\n' "$fix_network"
         printf 'fix_model=%q\n' "$fix_model"
         printf 'fxr_pi_session_dir=%q\n' "$fxr_pi_session_dir"
         printf 'fxr_usage_source=%q\n' "$fxr_usage_source"
@@ -4829,6 +4838,7 @@ started_at="$(date +%s)"
     # shellcheck disable=SC2154
     if [[ -n "$mntfix_harness" ]]; then
         printf 'mntfix_harness=%q\n' "$mntfix_harness"
+        printf 'mntfix_network=%q\n' "$mntfix_network"
         printf 'mntfix_model=%q\n' "$mntfix_model"
         printf 'fxm_pi_session_dir=%q\n' "$fxm_pi_session_dir"
         printf 'fxm_usage_source=%q\n' "$fxm_usage_source"
@@ -6988,6 +6998,7 @@ jq -n \
     --arg mode "$mode" \
     --arg harness "$harness" \
     --arg harness_version "$harness_version" \
+    --arg network "$network" \
     --arg usage_source "$usage_source" \
     --argjson usage "$run_usage" \
     --arg model "$model" \
@@ -7019,6 +7030,7 @@ jq -n \
         mode: $mode,
         harness: $harness,
         harness_version: (if $harness_version == "" then null else $harness_version end),
+        network: $network,
         model: (if $model == "" then null else $model end),
         branch: $branch,
         origin_repo: $origin_repo,

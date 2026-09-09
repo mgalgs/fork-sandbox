@@ -50,6 +50,16 @@ Provenance (source):
   exactly like any other run. Only "test" is hidden -- any other source
   value appears in the stats by default rather than vanishing silently.
 
+Network (isolation):
+  Every run_end carries `network` alongside `harness` -- `harness` names
+  the binary (claude, pi, codex), `network` says what it could reach
+  (pinned | sealed). A record from before the two were split carries only
+  harness="pi-local"; list, show and stats normalize that on read to
+  harness="pi", network="sealed" -- the log file itself is never rewritten,
+  so old rows keep their original bytes. Group on it directly: `stats --by
+  network` answers the isolation question, and `stats --by harness` stops
+  splitting one binary across two names.
+
 Recommended --task-meta fields (documented here, enforced nowhere):
   kind                implement | fix | refactor | test | docs |
                       investigate | review | pr-review
@@ -188,6 +198,7 @@ SUMMARY_FIELDS = [
     "mode",
     "harness",
     "harness_version",
+    "network",
     "model",
     "usage_source",
     "branch",
@@ -255,6 +266,20 @@ def read_log():
     return recs
 
 
+def normalize_network(rec):
+    """A run_end recorded before harness and network were split carries
+    harness="pi-local" and no network key at all. Normalize that shape on
+    read only -- never rewrite the log file, which is append-only -- so
+    harness always means the binary and network always means what the run
+    could reach: `stats --by harness` stops splitting one binary across two
+    names, and `stats --by network` answers the isolation question for old
+    and new records alike."""
+    if rec.get("harness") == "pi-local" and "network" not in rec:
+        rec["harness"] = "pi"
+        rec["network"] = "sealed"
+    return rec
+
+
 def merged_runs(recs):
     """One dict per run id: the last run_end, with the last verdict (if any)
     attached under 'verdict'. Ordered by appearance in the log."""
@@ -265,7 +290,7 @@ def merged_runs(recs):
         if not rid:
             continue
         if rec.get("event") == "run_end":
-            runs[rid] = dict(rec)
+            runs[rid] = normalize_network(dict(rec))
         elif rec.get("event") == "verdict":
             verdicts[rid] = rec
     for rid, v in verdicts.items():
@@ -379,7 +404,7 @@ def cmd_record(args):
         # is still worth a record. run.env and exit-code carry the basics.
         rec["summary_missing"] = True
         env = load_run_env(os.path.join(rd, "run.env"))
-        for k in ("harness", "harness_version", "model", "branch",
+        for k in ("harness", "harness_version", "network", "model", "branch",
                   "origin_repo", "base_sha"):
             if env.get(k):
                 rec[k] = env[k]

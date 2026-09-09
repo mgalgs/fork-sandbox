@@ -213,7 +213,7 @@ out="$(dry --harness claude --maintainer-loop 2 \
     --maintainer-harness pi-local --maintainer-model some-local-model 2>"$err" \
     | grep -E '^maintainer_harness=')"
 check "--harness claude + --maintainer-harness pi-local is accepted" \
-    "maintainer_harness=pi-local" "$out"
+    "maintainer_harness=pi" "$out"
 [[ -s "$err" ]] && no "--harness claude + --maintainer-harness pi-local prints no error" "$(cat "$err")"
 
 # 12. --k8s refuses the maintainer tier by name, all three flags at once.

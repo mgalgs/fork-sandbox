@@ -124,7 +124,7 @@ done
 out="$(dry --harness claude --review-loop 2 --review-harness pi-local 2>"$err" \
     | grep -E '^review_harness=')"
 check "--harness claude + --review-harness pi-local is accepted" \
-    "review_harness=pi-local" "$out"
+    "review_harness=pi" "$out"
 [[ -s "$err" ]] && no "--harness claude + --review-harness pi-local prints no error" "$(cat "$err")"
 
 # 5. --k8s refuses --review-harness by name, alongside --review-model.
