@@ -142,5 +142,5 @@ empty_rc=$?
 check_rc "empty context check exits 0" 0 "$empty_rc"
 contains "empty kubeconfig reports unknown context" "is not in this machine's kubeconfig" "$empty_output"
 
-printf '\n%d ok / %d fail\n' "$pass" "$fail"
+printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))
