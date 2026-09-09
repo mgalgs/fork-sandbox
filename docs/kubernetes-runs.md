@@ -671,6 +671,12 @@ Concretely, for the OpenRouter upstream v1 ships:
 This is the mode a real provider (OpenRouter, and by extension any API-keyed
 service) requires, because the key has to live somewhere.
 
+`install --dry-run` on this legacy `K8S_PROXY_UPSTREAM` path requires a
+mode-0600 `pi.env` carrying `OPENROUTER_API_KEY`, the same as a real
+install — every `pi.env` credential lookup runs before the `--dry-run`
+exit, not after it, so a dry-run cannot certify a config a real install
+would then reject.
+
 `K8S_PROXY_ENDPOINTS` is a variant of this same mode for one or more named
 upstreams instead of a single one: `K8S_PROXY_ENDPOINTS=<name>=<base-url>[,...]`
 registers them instead of `K8S_PROXY_UPSTREAM` (mutually exclusive with
