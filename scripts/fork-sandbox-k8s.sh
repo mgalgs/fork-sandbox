@@ -8,6 +8,7 @@
 #                            [--outbox-max SIZE]
 #                            [--context-ro DIR]
 #                            [--checkout REF] [--services-trust-ref REF]
+#                            [--label key=value]...
 #                            <project-path> <handoff-file>
 #        fork-sandbox-k8s.sh run [--dry-run] [--timeout SECONDS] [--keep]
 #                            --branch NAME [--model MODEL] [--endpoint NAME]
@@ -16,6 +17,7 @@
 #                            [--outbox-dir DIR] [--outbox-max SIZE]
 #                            [--context-ro DIR]
 #                            [--checkout REF] [--services-trust-ref REF]
+#                            [--label key=value]...
 #                            <project-path> <handoff-file>
 #        fork-sandbox-k8s.sh wait --branch NAME [--timeout SECONDS] [--probe]
 #        fork-sandbox-k8s.sh collect --branch NAME [--outbox-dir DIR]
@@ -225,6 +227,20 @@
 # array the entrypoint expands as arguments: splitting, never eval, never
 # a shell-string interpolation. Unset or empty adds no arguments at all.
 #
+# --label key=value (submit, run): an opt-in free-form label for this run's
+# objects, repeatable. Renders as fork-sandbox.io/<key>: <value> on the Job,
+# ConfigMap, Pod template and (--harness claude) the per-run claude-proxy
+# objects -- the fixed fork-sandbox.io/ prefix is not optional, since app and
+# fork-sandbox/branch are the NetworkPolicy selector keys that isolate one
+# run's claude-proxy (and the operator's real access token behind it) from
+# another's, and a free-form label must never be able to land on one of
+# those keys instead. Setting app, fork-sandbox/branch, fork-sandbox/role or
+# fork-sandbox/owner directly is refused by name, before anything is
+# created, even though the prefix already makes the collision impossible --
+# see docs/kubernetes-runs.md. K8S_RUN_LABELS in k8s.env supplies file-level
+# defaults; a --label for the same key overrides the file's value (announced
+# on stderr), a file-only key survives unchanged.
+#
 # --harness pi|claude (submit): which coding harness the pod runs. Defaults
 # to pi, which talks to the shared fork-sandbox-proxy over PROXY_BASE_URL,
 # exactly as before this flag existed. claude runs Claude Code instead,
@@ -288,6 +304,19 @@
 #   GIT_USER_NAME=, GIT_USER_EMAIL=
 #                         identity the pod's commits land under. Optional;
 #                         default to a fixed fork-sandbox identity.
+#   K8S_RUN_OWNER=        value for this run's fork-sandbox/owner label.
+#                         Optional; defaults to a sanitized $USER, and is
+#                         omitted entirely when neither yields a value. An
+#                         explicit value here must already be a valid label
+#                         value (refused otherwise, nothing created) --
+#                         unlike $USER, which this script sanitizes instead
+#                         of refusing. For attribution inside a shared
+#                         namespace; see docs/kubernetes-runs.md.
+#   K8S_RUN_LABELS=       <key>=<value>[,<key>=<value>...] free-form labels
+#                         applied to every run by default, each rendered as
+#                         fork-sandbox.io/<key>: <value>. Optional; overridden
+#                         key-by-key by --label on a given invocation. See
+#                         --label above.
 #
 # The provider key is NOT in this file. install reads it from
 # ~/.config/fork-sandbox/pi.env (OPENROUTER_API_KEY=...), the same file a
@@ -700,6 +729,137 @@ render_extra_labels_block() {
         out+="$pad$line"$'\n'
     done
     printf '%s' "$out"
+}
+
+# Refuses a free-form label's key/value, in the order that gives the best
+# error: (1) a reserved key -- app and fork-sandbox/branch are the
+# NetworkPolicy selector keys that isolate one run's claude-proxy (and the
+# operator's real access token behind it) from another's, fork-sandbox/role
+# and fork-sandbox/owner are this script's own labels. The fixed
+# fork-sandbox.io/ prefix already makes a collision with any of these
+# impossible, but a caller who tries one gets a specific reason instead of a
+# generic shape error. (2) the key's shape, since it becomes
+# fork-sandbox.io/$key. (3) the value's shape. $what names the caller's
+# source for the error message, e.g. "--label 'key=value'".
+k8s_validate_label_kv() {
+    local key="$1" value="$2" what="$3"
+    case "$key" in
+        app|fork-sandbox/branch|fork-sandbox/role|fork-sandbox/owner)
+            echo "Error: $what sets '$key', which is reserved -- this script" >&2
+            echo "renders it itself (app and fork-sandbox/branch select which" >&2
+            echo "pods may reach a run's claude-proxy and its operator access" >&2
+            echo "token; fork-sandbox/role and fork-sandbox/owner are its own" >&2
+            echo "labels). Every free-form label already renders under" >&2
+            echo "fork-sandbox.io/, so this can never collide in practice --" >&2
+            echo "pick a different key." >&2
+            return 1
+            ;;
+    esac
+    if ! k8s_valid_label_key "$key"; then
+        echo "Error: $what has key '$key', which is not a valid label key --" >&2
+        echo 'it must be at most 63 characters and match' >&2
+        echo '[a-zA-Z0-9]([-_.a-zA-Z0-9]*[a-zA-Z0-9])?, since it renders as' >&2
+        echo "fork-sandbox.io/$key." >&2
+        return 1
+    fi
+    if ! k8s_valid_label_value "$value"; then
+        echo "Error: $what has value '$value', which is not a valid label" >&2
+        echo 'value -- it must be at most 63 characters and match' >&2
+        echo '[a-zA-Z0-9]([-_.a-zA-Z0-9]*[a-zA-Z0-9])?, or be empty.' >&2
+        return 1
+    fi
+    return 0
+}
+
+# Splits one key=value entry and validates it, setting the scratch globals
+# PARSED_LABEL_KEY / PARSED_LABEL_VALUE on success -- the same "module-global
+# out params" idiom parse_proxy_endpoints' PROXY_ENDPOINT_NAMES/_URLS already
+# use in this file, rather than a bash nameref (unused anywhere else here).
+# $what names the entry's source for the error, e.g. "--label 'key=value'".
+k8s_parse_label_entry() {
+    local entry="$1" what="$2" key value
+    if [[ "$entry" != *=* ]]; then
+        echo "Error: $what has no '='. Expected key=value." >&2
+        return 1
+    fi
+    key="${entry%%=*}"
+    value="${entry#*=}"
+    k8s_validate_label_kv "$key" "$value" "$what" || return 1
+    PARSED_LABEL_KEY="$key"
+    PARSED_LABEL_VALUE="$value"
+    return 0
+}
+
+# Parses K8S_RUN_LABELS ("key=value,key=value,...") into the
+# RUN_LABELS_FILE_KEYS / RUN_LABELS_FILE_VALUES arrays (module-global, not
+# local -- callers read them back after this returns), mirroring
+# parse_proxy_endpoints above. An empty spec is not an error. A key repeated
+# within the file itself is refused -- unlike a --label overriding a file
+# key at resolve_run_labels below, two file entries for the same key is not
+# an override, just an ambiguous file.
+parse_run_labels_file() {
+    local spec="$1" entry seen=","
+    RUN_LABELS_FILE_KEYS=()
+    RUN_LABELS_FILE_VALUES=()
+    [[ -z "$spec" ]] && return 0
+
+    local -a entries
+    IFS=',' read -ra entries <<< "$spec"
+    for entry in "${entries[@]}"; do
+        k8s_parse_label_entry "$entry" "K8S_RUN_LABELS entry '$entry'" || return 1
+        if [[ "$seen" == *",$PARSED_LABEL_KEY,"* ]]; then
+            echo "Error: K8S_RUN_LABELS entry '$entry' repeats key" >&2
+            echo "'$PARSED_LABEL_KEY', already set earlier in K8S_RUN_LABELS." >&2
+            return 1
+        fi
+        seen+="$PARSED_LABEL_KEY,"
+        RUN_LABELS_FILE_KEYS+=("$PARSED_LABEL_KEY")
+        RUN_LABELS_FILE_VALUES+=("$PARSED_LABEL_VALUE")
+    done
+    return 0
+}
+
+# Resolves this run's free-form labels: K8S_RUN_LABELS supplies file-level
+# defaults, each optionally overridden key-by-key by a --label given on this
+# invocation ($@, in flag order) -- an override is announced on stderr, the
+# way the --endpoint resolution above announces its own defaults; a
+# file-only key is left alone. Populates the module-global
+# RUN_LABEL_KEYS/RUN_LABEL_VALUES arrays build_extra_label_lines reads.
+# Returns 1 (not exit) on any validation failure, matching
+# parse_proxy_endpoints, so cmd_submit can `|| exit 1` it before anything is
+# created.
+resolve_run_labels() {
+    local -a labels_raw=("$@")
+    parse_run_labels_file "$K8S_RUN_LABELS" || return 1
+    RUN_LABEL_KEYS=("${RUN_LABELS_FILE_KEYS[@]}")
+    RUN_LABEL_VALUES=("${RUN_LABELS_FILE_VALUES[@]}")
+
+    local entry seen_cli="," i found
+    for entry in "${labels_raw[@]}"; do
+        k8s_parse_label_entry "$entry" "--label '$entry'" || return 1
+        if [[ "$seen_cli" == *",$PARSED_LABEL_KEY,"* ]]; then
+            echo "Error: --label '$entry' repeats key '$PARSED_LABEL_KEY'," >&2
+            echo "already given earlier with --label." >&2
+            return 1
+        fi
+        seen_cli+="$PARSED_LABEL_KEY,"
+
+        found=false
+        for i in "${!RUN_LABEL_KEYS[@]}"; do
+            if [[ "${RUN_LABEL_KEYS[$i]}" == "$PARSED_LABEL_KEY" ]]; then
+                echo "fork-sandbox-k8s: --label '$PARSED_LABEL_KEY=$PARSED_LABEL_VALUE'" >&2
+                echo "overrides K8S_RUN_LABELS's '$PARSED_LABEL_KEY=${RUN_LABEL_VALUES[$i]}'." >&2
+                RUN_LABEL_VALUES[i]="$PARSED_LABEL_VALUE"
+                found=true
+                break
+            fi
+        done
+        if [[ "$found" == false ]]; then
+            RUN_LABEL_KEYS+=("$PARSED_LABEL_KEY")
+            RUN_LABEL_VALUES+=("$PARSED_LABEL_VALUE")
+        fi
+    done
+    return 0
 }
 
 # A Kubernetes object name: lowercase RFC 1123, <=63 chars. Branch names are
@@ -1572,6 +1732,7 @@ cmd_submit() {
     local dry_run=false branch="" model="" review_loop_cap="" outbox_max_arg=""
     local context_ro="" harness="pi" review_model="" endpoint="" checkout_ref=""
     local pi_args="" services_trust_ref=""
+    local -a labels_raw=()
     while (( $# )); do
         case "$1" in
             --dry-run) dry_run=true; shift ;;
@@ -1586,6 +1747,7 @@ cmd_submit() {
             --review-model) review_model="${2:?--review-model requires a model id}"; shift 2 ;;
             --outbox-max) outbox_max_arg="${2:?--outbox-max requires a size}"; shift 2 ;;
             --context-ro) context_ro="${2:?--context-ro requires a directory}"; shift 2 ;;
+            --label) labels_raw+=("${2:?--label requires key=value}"); shift 2 ;;
             -*) echo "Error: unknown option '$1' for submit." >&2; exit 1 ;;
             *) break ;;
         esac
@@ -2061,13 +2223,17 @@ cmd_submit() {
     local egress_proxy_host="fork-sandbox-proxy.$K8S_NAMESPACE.svc.cluster.local"
     [[ "$harness" == claude ]] && egress_proxy_host="$safe_name-claude-proxy.$K8S_NAMESPACE.svc.cluster.local"
 
-    # The fork-sandbox/owner label plus (once resolve_run_labels exists)
-    # this run's free-form labels -- resolved once here, ahead of both the
-    # claude-proxy template substitution below and the job_rendered heredoc
-    # further down, since both need EXTRA_LABEL_LINES. See resolve_run_owner
-    # and build_extra_label_lines above.
+    # The fork-sandbox/owner label plus this run's free-form labels --
+    # resolved once here, ahead of both the claude-proxy template
+    # substitution below and the job_rendered heredoc further down, since
+    # both need EXTRA_LABEL_LINES. resolve_run_labels validates and merges
+    # K8S_RUN_LABELS with this invocation's --label flags before anything is
+    # created, matching every other submit-time validation. See
+    # resolve_run_owner, resolve_run_labels and build_extra_label_lines
+    # above.
     local run_owner
     run_owner="$(resolve_run_owner)"
+    resolve_run_labels "${labels_raw[@]}" || exit 1
     build_extra_label_lines "$run_owner"
     local extra_labels_4 extra_labels_8
     extra_labels_4="$(render_extra_labels_indent 4)"
@@ -3036,6 +3202,7 @@ cmd_run() {
     local dry_run=false keep=false timeout=3600 branch="" model="" review_loop_cap=""
     local outbox_dir="" outbox_max_arg="" context_ro="" harness="" review_model="" endpoint=""
     local checkout_ref="" pi_args="" services_trust_ref=""
+    local -a labels_raw=()
     while (( $# )); do
         case "$1" in
             --dry-run) dry_run=true; shift ;;
@@ -3053,6 +3220,7 @@ cmd_run() {
             --outbox-dir) outbox_dir="${2:?--outbox-dir requires a path}"; shift 2 ;;
             --outbox-max) outbox_max_arg="${2:?--outbox-max requires a size}"; shift 2 ;;
             --context-ro) context_ro="${2:?--context-ro requires a directory}"; shift 2 ;;
+            --label) labels_raw+=("${2:?--label requires key=value}"); shift 2 ;;
             -*) echo "Error: unknown option '$1' for run." >&2; exit 1 ;;
             *) break ;;
         esac
@@ -3121,6 +3289,11 @@ cmd_run() {
     # rev-parse check itself, before anything is created.
     [[ -n "$checkout_ref" ]] && submit_argv+=(--checkout "$checkout_ref")
     [[ -n "$services_trust_ref" ]] && submit_argv+=(--services-trust-ref "$services_trust_ref")
+    # Unconditional, unlike the scalar flags above: an empty labels_raw
+    # array is itself the "no --label given" signal, so the loop simply
+    # forwards nothing rather than needing a separate -n guard.
+    local l
+    for l in "${labels_raw[@]}"; do submit_argv+=(--label "$l"); done
     submit_argv+=("$project_path" "$handoff_file")
 
     # cmd_submit does its own full validation (K8S_IMAGE, K8S_DENIED_PROBE,
