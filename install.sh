@@ -6,10 +6,15 @@
 # Everything is a symlink back into this checkout, so `git pull` is the whole
 # upgrade path and nothing is copied anywhere to go stale.
 #
-#   scripts/*   ->  ~/.claude/scripts/          (and that directory onto PATH)
-#   skills/*    ->  ~/.claude/skills/           Claude Code
-#               ->  ~/.agents/skills/           the Agent Skills convention
-#               ->  ~/.pi/agent/skills/         pi
+#   scripts/<porcelain>  ->  ~/.claude/scripts/     (and that directory onto PATH)
+#   skills/*             ->  ~/.claude/skills/      Claude Code
+#                        ->  ~/.agents/skills/      the Agent Skills convention
+#                        ->  ~/.pi/agent/skills/    pi
+#
+# Only the porcelain (the PORCELAIN list below) is linked onto PATH. Plumbing
+# is reached through its own script_dir regardless of PATH, so it is never
+# linked -- and a plumbing link this installer previously created is removed
+# the next time it runs.
 #
 # The scripts are harness-neutral: fork-sandbox.sh runs claude, pi or codex.
 # The skills are for the agent that ORCHESTRATES runs, which is why they land
@@ -340,18 +345,40 @@ PLUMBING=(
 # exactly one list, and every name in a list must exist in scripts/. This
 # forces a conscious classification decision on every new or renamed script
 # instead of letting it silently land on, or vanish from, PATH.
-declare -A classified=()
-for name in "${PORCELAIN[@]}" "${PLUMBING[@]}"; do
-    classified["$name"]=1
-done
+#
+# Indexed arrays and a linear scan, not an associative array: this script
+# runs under whatever bash the shebang resolves to, which on macOS is the
+# system's bash 3.2 -- and `declare -A` is a bash-4 construct that aborts
+# 3.2 under `set -e` before anything is installed.
+is_classified() {
+    local name="$1" candidate
+    for candidate in "${PORCELAIN[@]}" "${PLUMBING[@]}"; do
+        [[ "$candidate" == "$name" ]] && return 0
+    done
+    return 1
+}
+
+# Enumerate tracked files, not everything sitting in the directory -- an
+# untracked stray (an editor backup, a `git mergetool` .orig, a
+# merge-conflict reject) was never classified by anyone and must not block
+# installation of every script that was. Fall back to a plain directory scan
+# when scripts/ is not inside a git checkout (e.g. a fixture copy in tests).
+scripts_to_check=()
+if git -C "$REPO_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    while IFS= read -r tracked; do
+        scripts_to_check+=("$REPO_DIR/$tracked")
+    done < <(git -C "$REPO_DIR" ls-files -- scripts)
+else
+    scripts_to_check=("$REPO_DIR"/scripts/*)
+fi
 
 unclassified=()
-for script in "$REPO_DIR"/scripts/*; do
+for script in "${scripts_to_check[@]}"; do
     # Skip directories (e.g. an untracked __pycache__) -- only files (and
     # symlinks to files) are candidates for installation.
     [[ -f "$script" ]] || continue
     script_name="$(basename "$script")"
-    if [[ -z "${classified[$script_name]:-}" ]]; then
+    if ! is_classified "$script_name"; then
         unclassified+=("$script_name")
     fi
 done
@@ -407,15 +434,18 @@ for name in "${PORCELAIN[@]}"; do
 done
 
 # Prune links this repo made for names that are now plumbing. Only ever touch
-# a symlink that resolves into THIS repo's scripts/ directory -- the farm is
-# shared with other repos and possibly the user's own files, so anything else
-# in there, symlink or not, is none of this installer's business.
+# a symlink whose name and target are EXACTLY what ensure_link would have
+# created -- name N resolving to this repo's scripts/N. The farm is shared
+# with other repos and possibly the user's own shorthands (a `fs` pointed at
+# scripts/fork-sandbox.sh, say), and a link merely resolving somewhere under
+# scripts/ matches those too, which this installer never made and must not
+# touch.
 for target in "$SCRIPTS_DIR"/*; do
     [[ -L "$target" ]] || continue
     target_name="$(basename "$target")"
     is_porcelain "$target_name" && continue
     resolved="$(readlink -f "$target" 2>/dev/null || true)"
-    [[ -n "$resolved" && "$resolved" == "$REPO_DIR/scripts/"* ]] || continue
+    [[ -n "$resolved" && "$resolved" == "$REPO_DIR/scripts/$target_name" ]] || continue
     rm "$target"
     echo "  $target_name: unlinked (now plumbing)"
 done

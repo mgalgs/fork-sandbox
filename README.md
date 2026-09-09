@@ -415,7 +415,17 @@ gets out of the way, so `fork-sandbox status --result <run-dir>` and
 spellings work — the verbs keep one name on your PATH instead of six. Each
 prints its full doc with `--help`, and a `--help` after a verb reaches the
 underlying script. Everything not listed here — `fork-sandbox-lib.sh`, the
-pod-side k8s scripts, `sandbox-backend-*` — is plumbing.
+pod-side k8s scripts, `sandbox-backend-*` — is plumbing you reach through
+`script_dir`, not by typing its name.
+
+This list is "commands worth typing," not the full porcelain/plumbing split.
+`install.sh` holds that authoritative split — the PORCELAIN/PLUMBING lists
+that decide what it links onto PATH — and it includes a few names this list
+omits because they're invoked by another script rather than typed directly:
+`agent-sandboxed`, `pi-sandboxed`, `build-sandbox-image.sh`,
+`ensure-scratch-dirs.sh`, `sandbox-run-log.py`, `lkml-cover.sh` and
+`lkml-summarize.sh`. Classify a new script by reading `install.sh`, not this
+list.
 
 ```bash
 # Launch a run, get a branch back — the engine under /fork-sandbox and

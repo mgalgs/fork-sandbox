@@ -199,6 +199,99 @@ else
     no "a link resolving outside this repo survives pruning, even named as plumbing" "expected $prune_scripts/$foreign_plumbing_name to still point at $outside_dir/$owned_plumbing_name.decoy"
 fi
 
+# A user's own shorthand for a PORCELAIN script -- name doesn't match the
+# script's own basename, so it resolves into this repo's scripts/ directory
+# without being a link this installer could have created itself.
+echo "== a user's own shorthand for a porcelain script survives pruning =="
+shorthand_home="$scratch/shorthand-home"
+shorthand_scripts="$shorthand_home/.claude/scripts"
+mkdir -p "$shorthand_scripts"
+
+shorthand_target_name="${porcelain[0]}"
+ln -s "$(resolved_source "$shorthand_target_name")" "$shorthand_scripts/my-shorthand"
+
+run_install "$shorthand_home"
+
+if [[ -L "$shorthand_scripts/my-shorthand" ]] && [[ "$(readlink "$shorthand_scripts/my-shorthand")" == "$(resolved_source "$shorthand_target_name")" ]]; then
+    ok "the user's shorthand for a porcelain script survives pruning"
+else
+    no "the user's shorthand for a porcelain script survives pruning" "expected $shorthand_scripts/my-shorthand to still point at $(resolved_source "$shorthand_target_name")"
+fi
+
+# --- Case 11, 12 & 13: the fail-closed gate itself, run through install.sh -
+#
+# Cases 1 and 2 above re-derive the check in bash against the extracted
+# lists, so they would stay green even if the gate inside install.sh were
+# deleted outright. These run install.sh for real, against a git fixture
+# (the gate enumerates tracked files, so it needs one), to prove: a tracked
+# but unclassified script blocks the whole install; an untracked file next
+# to it does not; and removing a classified name from scripts/ also blocks.
+
+echo "== the fail-closed gate: tracked-unclassified blocks, untracked does not =="
+gate_base="$scratch/gate-base"
+mkdir -p "$gate_base"
+cp -a "$repo_dir/scripts" "$gate_base/scripts"
+cp "$repo_dir/install.sh" "$gate_base/install.sh"
+git -C "$gate_base" init -q
+git -C "$gate_base" add -A
+git -C "$gate_base" -c user.email=t@t -c user.name=t commit -q -m init
+
+gate_untracked="$scratch/gate-untracked"
+cp -a "$gate_base" "$gate_untracked"
+touch "$gate_untracked/scripts/leftover.sh.orig"
+gate_untracked_home="$scratch/gate-untracked-home"
+mkdir -p "$gate_untracked_home"
+gate_untracked_output="$(HOME="$gate_untracked_home" "$gate_untracked/install.sh" 2>&1)"
+gate_untracked_rc=$?
+if [[ "$gate_untracked_rc" == 0 ]]; then
+    ok "an untracked file next to tracked scripts does not block install"
+else
+    no "an untracked file next to tracked scripts does not block install" "got rc=$gate_untracked_rc: $gate_untracked_output"
+fi
+case "$gate_untracked_output" in
+    *leftover.sh.orig*) no "the untracked file is not reported unclassified" "found a mention of leftover.sh.orig: $gate_untracked_output" ;;
+    *) ok "the untracked file is not reported unclassified" ;;
+esac
+
+gate_tracked="$scratch/gate-tracked"
+cp -a "$gate_base" "$gate_tracked"
+echo '#!/bin/bash' > "$gate_tracked/scripts/mystery-script.sh"
+chmod +x "$gate_tracked/scripts/mystery-script.sh"
+git -C "$gate_tracked" add scripts/mystery-script.sh
+git -C "$gate_tracked" -c user.email=t@t -c user.name=t commit -q -m "add mystery script"
+gate_tracked_home="$scratch/gate-tracked-home"
+mkdir -p "$gate_tracked_home"
+gate_tracked_output="$(HOME="$gate_tracked_home" "$gate_tracked/install.sh" 2>&1)"
+gate_tracked_rc=$?
+if [[ "$gate_tracked_rc" == 1 ]]; then
+    ok "a tracked but unclassified script blocks install"
+else
+    no "a tracked but unclassified script blocks install" "got rc=$gate_tracked_rc: $gate_tracked_output"
+fi
+contains "the unclassified name is reported" "mystery-script.sh" "$gate_tracked_output"
+if [[ -e "$gate_tracked_home/.claude/scripts" ]] && [[ -n "$(ls -A "$gate_tracked_home/.claude/scripts" 2>/dev/null)" ]]; then
+    no "nothing is installed while a script is unclassified" "found entries under $gate_tracked_home/.claude/scripts"
+else
+    ok "nothing is installed while a script is unclassified"
+fi
+
+echo "== the fail-closed gate: a classified name missing from scripts/ blocks =="
+gate_missing="$scratch/gate-missing"
+cp -a "$gate_base" "$gate_missing"
+missing_plumbing_name="${plumbing[0]}"
+git -C "$gate_missing" rm -q "scripts/$missing_plumbing_name"
+git -C "$gate_missing" -c user.email=t@t -c user.name=t commit -q -m "remove $missing_plumbing_name"
+gate_missing_home="$scratch/gate-missing-home"
+mkdir -p "$gate_missing_home"
+gate_missing_output="$(HOME="$gate_missing_home" "$gate_missing/install.sh" 2>&1)"
+gate_missing_rc=$?
+if [[ "$gate_missing_rc" == 1 ]]; then
+    ok "a classified name missing from scripts/ blocks install"
+else
+    no "a classified name missing from scripts/ blocks install" "got rc=$gate_missing_rc: $gate_missing_output"
+fi
+contains "the missing name is reported" "$missing_plumbing_name" "$gate_missing_output"
+
 # --- Case 8: a regular file occupying a porcelain name is left alone -------
 
 echo "== a regular file occupying a porcelain name is never touched =="
