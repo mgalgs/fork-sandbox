@@ -692,10 +692,15 @@ require_secret_file() {
 # every run in the namespace, not just the one that supplied the bad value.
 # fs_reject_unsafe_chars (single quote / newline) guards a different set of
 # sinks -- the shell commands and run records this script builds -- and
-# does not cover this one. Three call sites render into this exact nginx
-# sink: OPENROUTER_API_KEY and a K8S_PROXY_ENDPOINT_KEYS value in
-# cmd_install, and the per-run claude_access_token Secret built for a
-# --harness claude run.
+# does not cover this one. Every value that ends up inside a `set $var
+# "...";` line in the rendered nginx config goes through this:
+# OPENROUTER_API_KEY and a K8S_PROXY_ENDPOINT_KEYS value in cmd_install,
+# the per-run claude_access_token Secret built for a --harness claude run,
+# and K8S_PROXY_UPSTREAM / each K8S_PROXY_ENDPOINTS URL
+# (validate_upstream_url only checks scheme and host, never the path, so
+# the raw value still needs this check before render_proxy_locations_body
+# renders it into
+# `set $upstream "...";`).
 reject_nginx_unsafe_chars() {
     local v="$1" label="$2"
     if [[ "$v" == *'"'* || "$v" == *'$'* || "$v" == *\\* ]]; then
@@ -1219,16 +1224,20 @@ validate_upstream_url() {
     # cluster if the rendered egress policy does not also carry its port to
     # a public address. The default policy (unset K8S_PROXY_ALLOW) carries
     # ANY address on port 443 and nothing else, so http:// to a .svc. name
-    # on 443 is refused outright below -- a CNAME to a public host would
-    # otherwise leak this endpoint's Authorization header to the open
-    # internet in cleartext, exactly what this http:// gate exists to
-    # prevent. A custom K8S_PROXY_ALLOW can legitimately open some other
-    # port publicly on purpose; cmd_install's own reachability review warns
-    # (rather than refuses) when a .svc. http:// endpoint's port matches
-    # such an entry, since that check needs PROXY_ALLOW_CIDRS/PORTS, which
-    # are not parsed yet at validation time. Accepted here before the
-    # IPv4-only path below even runs -- everything past this point is
-    # unchanged.
+    # on 443 is refused outright below WHEN K8S_PROXY_ALLOW IS UNSET -- a
+    # CNAME to a public host would otherwise leak this endpoint's
+    # Authorization header to the open internet in cleartext, exactly what
+    # this http:// gate exists to prevent. A set K8S_PROXY_ALLOW replaces
+    # that default policy wholesale (render_proxy_egress_rules's own
+    # header), so whether port 443 still carries to a public address then
+    # depends on the operator's own entries, not this function's hardcoded
+    # assumption -- checking that needs PROXY_ALLOW_CIDRS/PORTS, which are
+    # not parsed yet at validation time (parse_proxy_endpoints, and thus
+    # this function, runs before parse_proxy_allow). So a set
+    # K8S_PROXY_ALLOW skips this refusal entirely and defers to
+    # cmd_install's reachability review, exactly like every other port
+    # already does. Accepted here before the IPv4-only path below even
+    # runs -- everything past this point is unchanged.
     if [[ "$host_only" == *".svc.$K8S_CLUSTER_DOMAIN" ]]; then
         # Forced base 10 (10#$svc_port): same unforced-base trap this
         # function's own IPv4-octet loop below (and parse_proxy_allow_ns's
@@ -1239,7 +1248,8 @@ validate_upstream_url() {
         local svc_port
         svc_port="${host#*:}"
         [[ "$svc_port" == "$host" ]] && svc_port=""
-        if [[ "$svc_port" =~ ^[0-9]{1,5}$ ]] && (( 10#$svc_port == 443 )); then
+        if [[ "$svc_port" =~ ^[0-9]{1,5}$ ]] && (( 10#$svc_port == 443 )) \
+            && [[ -z "$K8S_PROXY_ALLOW" ]]; then
             echo "Error: $label uses http:// to '$host_only' on port" >&2
             echo "443 -- the default egress policy (unset" >&2
             echo "K8S_PROXY_ALLOW) carries any address on port 443, so" >&2
@@ -1337,6 +1347,11 @@ parse_proxy_endpoints() {
             return 1
         fi
         validate_upstream_url "$url" "K8S_PROXY_ENDPOINTS entry '$name'" >/dev/null || return 1
+        # validate_upstream_url only inspects scheme and host; the full raw
+        # value (path included) is what render_proxy_locations_body renders
+        # into `set $upstream "...";`, so it needs reject_nginx_unsafe_chars
+        # too (see that function's own header).
+        reject_nginx_unsafe_chars "$url" "K8S_PROXY_ENDPOINTS entry '$name' URL" || return 1
         if [[ "$seen" == *",$name,"* ]]; then
             echo "Error: K8S_PROXY_ENDPOINTS name '$name' is registered more" >&2
             echo "than once. Each logical name must be unique." >&2
@@ -1452,11 +1467,21 @@ parse_proxy_allow() {
             echo "name, so a hostname cannot be accepted here." >&2
             return 1
         fi
-        if [[ ! "$port" =~ ^[0-9]{1,5}$ ]] || (( port < 1 || port > 65535 )); then
+        # Forced base 10 (10#$port), and normalized to canonical decimal
+        # below: plain (( port < 1 || port > 65535 )) hands bash arithmetic
+        # a string it parses as a C-style integer literal, so a leading
+        # zero is octal -- the same trap validate_upstream_url's own header
+        # documents. Left unnormalized, a value like "08080" would still
+        # crash cmd_install's reachability review later, at the
+        # (( port == PROXY_ALLOW_PORTS[j] )) comparisons that assume this
+        # array already holds clean decimal ports (same reasoning as
+        # parse_proxy_allow_ns's own normalization, below).
+        if [[ ! "$port" =~ ^[0-9]{1,5}$ ]] || (( 10#$port < 1 || 10#$port > 65535 )); then
             echo "Error: K8S_PROXY_ALLOW entry '$entry' has an invalid port" >&2
             echo "'$port' -- must be 1-65535." >&2
             return 1
         fi
+        port="$(( 10#$port ))"
         PROXY_ALLOW_CIDRS+=("$cidr")
         PROXY_ALLOW_PORTS+=("$port")
     done
@@ -1555,28 +1580,34 @@ cidr_contains() {
 # (127.0.0.0/8), link-local (169.254.0.0/16) or CGNAT (100.64.0.0/10) --
 # used by cmd_install's reachability review to decide whether a
 # K8S_PROXY_ALLOW entry that carries a .svc. http:// endpoint's port is
-# itself public. A prefix check on the network address's own octets, not
-# full CIDR-containment arithmetic (cidr_contains above): exactly right
-# for a CIDR that is wholly inside one of these ranges -- the only shape
-# a hand-written K8S_PROXY_ALLOW entry ever takes here -- but would call a
-# supernet like 0.0.0.0/0 "private" too, which cidr_contains's approach
-# would not. Accepted because this is a warning, not a refusal (see
-# validate_upstream_url's 1a/1b split), and a hand-typed allowlist entry
-# is never a supernet route table in practice. 10#$o1/10#$o2 force base
-# 10 for the same unforced-base reason validate_upstream_url's own header
-# documents -- parse_proxy_allow does not itself normalize its CIDR
-# octets (a pre-existing, out-of-scope gap in that parser), so a
-# leading-zero octet can still reach here.
+# itself public. Subset containment against each reference range (its own
+# prefix included), not just a check on the network address's own octets:
+# the prefix matters too, since a supernet like 10.0.0.0/7 has a network
+# address that looks private (o1=10) but actually spans into 11.0.0.0/8,
+# which is public -- a plain octet check would call that CIDR private and
+# suppress the cleartext warning for it. Accepted because this is a
+# warning, not a refusal (see validate_upstream_url's 1a/1b split).
+# 10#$prefix forces base 10 for the same unforced-base reason
+# validate_upstream_url's own header documents -- parse_proxy_allow does
+# not itself normalize its CIDR (a pre-existing, out-of-scope gap in that
+# parser), so a leading-zero prefix can still reach here; ipv4_to_int
+# already forces base 10 on each octet it packs.
 cidr_is_private() {
-    local cidr="$1" net o1 o2
+    local cidr="$1" net prefix net_int ref refnet refprefix refmask
     net="${cidr%/*}"
-    IFS='.' read -r o1 o2 _ _ <<< "$net"
-    (( 10#$o1 == 10 )) \
-        || (( 10#$o1 == 172 && 10#$o2 >= 16 && 10#$o2 <= 31 )) \
-        || (( 10#$o1 == 192 && 10#$o2 == 168 )) \
-        || (( 10#$o1 == 127 )) \
-        || (( 10#$o1 == 169 && 10#$o2 == 254 )) \
-        || (( 10#$o1 == 100 && 10#$o2 >= 64 && 10#$o2 <= 127 ))
+    prefix="${cidr#*/}"
+    net_int="$(ipv4_to_int "$net")"
+    for ref in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 127.0.0.0/8 \
+        169.254.0.0/16 100.64.0.0/10; do
+        refnet="${ref%/*}"
+        refprefix="${ref#*/}"
+        refmask=$(( (0xFFFFFFFF << (32 - refprefix)) & 0xFFFFFFFF ))
+        if (( 10#$prefix >= refprefix )) \
+            && (( (net_int & refmask) == ($(ipv4_to_int "$refnet") & refmask) )); then
+            return 0
+        fi
+    done
+    return 1
 }
 
 # The NetworkPolicy egress rule(s) allowing whichever hosts model access
@@ -1942,6 +1973,11 @@ cmd_install() {
     local upstream_host=""
     if [[ -n "$K8S_PROXY_UPSTREAM" ]]; then
         upstream_host="$(validate_upstream_url "$K8S_PROXY_UPSTREAM" K8S_PROXY_UPSTREAM)" || exit 1
+        # validate_upstream_url only inspects scheme and host; the full raw
+        # value (path included) is what render_proxy_locations_body renders
+        # into `set $upstream "...";` on the legacy path, so it needs
+        # reject_nginx_unsafe_chars too (see that function's own header).
+        reject_nginx_unsafe_chars "$K8S_PROXY_UPSTREAM" K8S_PROXY_UPSTREAM || exit 1
     fi
 
     # Fills the module-global PROXY_ENDPOINT_NAMES / PROXY_ENDPOINT_URLS
@@ -2037,9 +2073,13 @@ cmd_install() {
             # normalized by parse_proxy_allow_ns), has never been
             # validated -- plain arithmetic on an unforced leading-zero
             # value hands bash a C-style integer literal (see
-            # validate_upstream_url's own header for the same trap), so
-            # this is the one call site that does arithmetic on an
-            # untrusted URL port and must validate it first.
+            # validate_upstream_url's own header for the same trap). This
+            # branch also reports an out-of-range port by name instead of
+            # just forcing the base, since a .svc. URL's port is otherwise
+            # unvalidated anywhere upstream; the plain-IPv4-literal path
+            # below forces base 10 the same way but doesn't re-report range
+            # itself -- an unforced leading zero there would still misfire
+            # the same way, so it forces base 10 too, just silently.
             if [[ ! "$port" =~ ^[0-9]{1,5}$ ]] \
                 || (( 10#$port < 1 || 10#$port > 65535 )); then
                 echo "Error: ${warn_labels[$i]} has an invalid port" >&2
@@ -2079,7 +2119,8 @@ cmd_install() {
                     port_carried=true
                     if [[ -z "$port_carried_reason" ]]; then
                         port_carried_reason="K8S_PROXY_ALLOW entry"
-                        port_carried_reason+=" ${PROXY_ALLOW_CIDRS[$j]}:$port"
+                        port_carried_reason+=" ${PROXY_ALLOW_CIDRS[$j]}:$port, which"
+                        port_carried_reason+=" carries port $port to ${PROXY_ALLOW_CIDRS[$j]}"
                     fi
                     if ! cidr_is_private "${PROXY_ALLOW_CIDRS[$j]}"; then
                         public_allow_cidr="${PROXY_ALLOW_CIDRS[$j]}"
@@ -2170,6 +2211,14 @@ cmd_install() {
             port="${BASH_REMATCH[3]}"
             if [[ -z "$port" ]]; then
                 if [[ "$url" == https://* ]]; then port=443; else port=80; fi
+            else
+                # Forced base 10 (10#$port): this port comes straight out
+                # of the endpoint's URL and has never been validated --
+                # same leading-zero trap validate_upstream_url's own
+                # header documents, and the same reason the .svc. branch
+                # above forces it before its own (( port == ... ))
+                # comparisons.
+                port="$(( 10#$port ))"
             fi
             covered=false
             for (( j = 0; j < ${#PROXY_ALLOW_CIDRS[@]}; j++ )); do

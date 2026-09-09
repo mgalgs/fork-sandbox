@@ -1518,8 +1518,36 @@ K8S_PROXY_ENDPOINTS=primary=http://svc-a.example-ns.svc.cluster.local:443/v1
 K8S_DENIED_PROBE=10.0.0.1:443
 CONF
 refuses "http:// to a .svc. name on port 443 is refused, naming the port" \
-    "on port" \
+    "would leave the cluster in cleartext" \
     env FORK_SANDBOX_CONFIG_DIR="$svc_dns_443_config_dir" "$k8s_sh" install --dry-run
+
+# The port-443 refusal above only holds when K8S_PROXY_ALLOW is unset: a
+# set K8S_PROXY_ALLOW replaces the default egress policy wholesale, so
+# whether port 443 still carries ANY address depends on the operator's own
+# entries, not the hardcoded default-policy assumption. This fixture's
+# K8S_PROXY_ALLOW is a private CIDR, so a CNAME to a public host is
+# dropped by the policy and no cleartext leak is possible -- install must
+# succeed instead of citing the unset-K8S_PROXY_ALLOW default policy, which
+# is not the config in hand.
+svc_dns_443_allow_config_dir="$(newdir)"; tmpdirs+=("$svc_dns_443_allow_config_dir")
+cat > "$svc_dns_443_allow_config_dir/k8s.env" <<'CONF'
+K8S_CONTEXT=test-context
+K8S_NAMESPACE=fork-sandbox-test
+K8S_IMAGE=registry.example/you/fork-sandbox:latest
+K8S_PROXY_ENDPOINTS=primary=http://svc-a.example-ns.svc.cluster.local:443/v1
+K8S_PROXY_ALLOW=10.0.0.0/8:443
+K8S_DENIED_PROBE=10.0.0.1:443
+CONF
+svc_dns_443_allow_err="$(FORK_SANDBOX_CONFIG_DIR="$svc_dns_443_allow_config_dir" "$k8s_sh" \
+    install --dry-run 2>&1 >/dev/null)"
+svc_dns_443_allow_rc=$?
+if (( svc_dns_443_allow_rc == 0 )) \
+    && [[ "$svc_dns_443_allow_err" != *'would leave the cluster in cleartext'* ]]; then
+    ok "http:// to a .svc. name on port 443 is accepted when K8S_PROXY_ALLOW replaces the default policy"
+else
+    no "http:// to a .svc. name on port 443 is accepted when K8S_PROXY_ALLOW replaces the default policy" \
+        "status $svc_dns_443_allow_rc: $svc_dns_443_allow_err"
+fi
 
 # https:// to a .svc. name on port 443 stays accepted -- the gate above is
 # about cleartext, not the port number itself.
@@ -1589,6 +1617,81 @@ if [[ "$svc_dns_private_allow_err" == *'leave the cluster in cleartext'* ]]; the
         "$svc_dns_private_allow_err"
 else
     ok "a .svc. http:// endpoint whose matching K8S_PROXY_ALLOW CIDR is private does not warn about a leak"
+fi
+
+# cidr_is_private must reject a supernet whose network address merely
+# starts with a private-looking octet -- 10.0.0.0/7 is a canonical,
+# parser-accepted CIDR, but it actually spans into 11.0.0.0/8, which is
+# public. A check on the network address's own octets alone (ignoring the
+# prefix) would call this CIDR private and suppress the cleartext warning
+# even though it is exactly the shape that warning exists to catch.
+svc_dns_supernet_allow_config_dir="$(newdir)"; tmpdirs+=("$svc_dns_supernet_allow_config_dir")
+cat > "$svc_dns_supernet_allow_config_dir/k8s.env" <<'CONF'
+K8S_CONTEXT=test-context
+K8S_NAMESPACE=fork-sandbox-test
+K8S_IMAGE=registry.example/you/fork-sandbox:latest
+K8S_PROXY_ENDPOINTS=primary=http://svc-a.example-ns.svc.cluster.local:8080/v1
+K8S_PROXY_ALLOW=10.0.0.0/7:8080
+K8S_DENIED_PROBE=10.0.0.1:443
+CONF
+svc_dns_supernet_allow_err="$(FORK_SANDBOX_CONFIG_DIR="$svc_dns_supernet_allow_config_dir" "$k8s_sh" \
+    install --dry-run 2>&1 >/dev/null)"
+if [[ "$svc_dns_supernet_allow_err" == *'leave the cluster in cleartext'* ]]; then
+    ok "a .svc. http:// endpoint whose matching K8S_PROXY_ALLOW CIDR is a private-looking public supernet still warns"
+else
+    no "a .svc. http:// endpoint whose matching K8S_PROXY_ALLOW CIDR is a private-looking public supernet still warns" \
+        "$svc_dns_supernet_allow_err"
+fi
+
+# parse_proxy_allow must normalize a leading-zero port the same way
+# parse_proxy_allow_ns already does -- left unnormalized, cmd_install's
+# reachability review's (( port == PROXY_ALLOW_PORTS[j] )) comparison hands
+# bash an octal-looking literal and crashes instead of rendering the
+# public-CIDR cleartext warning this K8S_PROXY_ALLOW entry should trigger.
+leading_zero_allow_port_config_dir="$(newdir)"; tmpdirs+=("$leading_zero_allow_port_config_dir")
+cat > "$leading_zero_allow_port_config_dir/k8s.env" <<'CONF'
+K8S_CONTEXT=test-context
+K8S_NAMESPACE=fork-sandbox-test
+K8S_IMAGE=registry.example/you/fork-sandbox:latest
+K8S_PROXY_ENDPOINTS=primary=http://svc-a.example-ns.svc.cluster.local:8080/v1
+K8S_PROXY_ALLOW=192.0.2.0/24:08080
+K8S_DENIED_PROBE=10.0.0.1:443
+CONF
+leading_zero_allow_port_err="$(FORK_SANDBOX_CONFIG_DIR="$leading_zero_allow_port_config_dir" "$k8s_sh" \
+    install --dry-run 2>&1 >/dev/null)"
+if [[ "$leading_zero_allow_port_err" == *'value too great for base'* ]]; then
+    no "a leading-zero K8S_PROXY_ALLOW port normalizes instead of crashing the reachability review" \
+        "$leading_zero_allow_port_err"
+elif [[ "$leading_zero_allow_port_err" != *'leave the cluster in cleartext'* ]]; then
+    no "a leading-zero K8S_PROXY_ALLOW port normalizes instead of crashing the reachability review" \
+        "$leading_zero_allow_port_err"
+else
+    ok "a leading-zero K8S_PROXY_ALLOW port normalizes instead of crashing the reachability review"
+fi
+
+# The same leading-zero-port normalization is needed on the non-.svc
+# IPv4-literal reachability path (K8S_PROXY_ALLOW set, endpoint host a
+# literal IPv4 address) -- a separate loop from the .svc. one above, and
+# the one the original fix's own leading-zero test never reached.
+leading_zero_ipv4_port_config_dir="$(newdir)"; tmpdirs+=("$leading_zero_ipv4_port_config_dir")
+cat > "$leading_zero_ipv4_port_config_dir/k8s.env" <<'CONF'
+K8S_CONTEXT=test-context
+K8S_NAMESPACE=fork-sandbox-test
+K8S_IMAGE=registry.example/you/fork-sandbox:latest
+K8S_PROXY_ENDPOINTS=primary=http://10.0.0.5:08080/v1
+K8S_PROXY_ALLOW=10.0.0.0/8:8080
+K8S_DENIED_PROBE=10.0.0.1:443
+CONF
+leading_zero_ipv4_port_err="$(FORK_SANDBOX_CONFIG_DIR="$leading_zero_ipv4_port_config_dir" "$k8s_sh" \
+    install --dry-run 2>&1 >/dev/null)"
+if [[ "$leading_zero_ipv4_port_err" == *'value too great for base'* ]]; then
+    no "a leading-zero URL port on the IPv4-literal K8S_PROXY_ALLOW path normalizes instead of crashing" \
+        "$leading_zero_ipv4_port_err"
+elif [[ "$leading_zero_ipv4_port_err" == *'will be dropped'* ]]; then
+    no "a leading-zero URL port on the IPv4-literal K8S_PROXY_ALLOW path normalizes instead of crashing" \
+        "$leading_zero_ipv4_port_err"
+else
+    ok "a leading-zero URL port on the IPv4-literal K8S_PROXY_ALLOW path normalizes instead of crashing"
 fi
 
 # K8S_PROXY_ALLOW_NS -- selector-based egress for an in-cluster Service.
@@ -1915,6 +2018,29 @@ else
         "$uncovered_dropped_err"
 fi
 
+# The same "WILL go through" shape, but the port is carried by a set
+# K8S_PROXY_ALLOW entry rather than the default policy -- the reason
+# clause spliced into the warning must read as a full clause with a
+# predicate ("carries port ... to ..."), not a bare noun phrase.
+uncovered_carried_allow_config_dir="$(newdir)"; tmpdirs+=("$uncovered_carried_allow_config_dir")
+cat > "$uncovered_carried_allow_config_dir/k8s.env" <<'CONF'
+K8S_CONTEXT=test-context
+K8S_NAMESPACE=fork-sandbox-test
+K8S_IMAGE=registry.example/you/fork-sandbox:latest
+K8S_PROXY_ENDPOINTS=primary=https://svc-a.example-ns.svc.cluster.local:8080/v1
+K8S_PROXY_ALLOW=172.16.0.0/12:8080
+K8S_DENIED_PROBE=10.0.0.1:443
+CONF
+uncovered_carried_allow_err="$(FORK_SANDBOX_CONFIG_DIR="$uncovered_carried_allow_config_dir" "$k8s_sh" \
+    install --dry-run 2>&1 >/dev/null)"
+if [[ "$uncovered_carried_allow_err" == *'WILL go through'* ]] \
+    && [[ "$uncovered_carried_allow_err" == *'carries port 8080 to 172.16.0.0/12'* ]]; then
+    ok "the K8S_PROXY_ALLOW-carried reason clause reads as a full sentence, not a bare noun phrase"
+else
+    no "the K8S_PROXY_ALLOW-carried reason clause reads as a full sentence, not a bare noun phrase" \
+        "$uncovered_carried_allow_err"
+fi
+
 rm -f /tmp/fs-k8s-test-allow-ns-install.err /tmp/fs-k8s-test-allow-ns-noport-install.err \
     /tmp/fs-k8s-test-combined-allow-install.err
 
@@ -2133,6 +2259,39 @@ refuses "a keyed credential containing a backslash is refused" \
     "would break the" \
     env PATH="$missing_var_stub_bin:$PATH" FORK_SANDBOX_CONFIG_DIR="$backslash_key_config_dir" \
     "$k8s_sh" install --dry-run
+
+# K8S_PROXY_UPSTREAM and a K8S_PROXY_ENDPOINTS URL render into the exact
+# same nginx `set $upstream "...";` sink as OPENROUTER_API_KEY and a keyed
+# credential above -- validate_upstream_url only inspects scheme and host,
+# never the path, so a '"' in the URL's path must be refused the same way
+# instead of injecting arbitrary nginx directives into the shared proxy's
+# server block (a real, previously-unguarded injection: an unvalidated URL
+# path here used to render straight into that sink).
+nginx_unsafe_upstream_config_dir="$(newdir)"; tmpdirs+=("$nginx_unsafe_upstream_config_dir")
+cat > "$nginx_unsafe_upstream_config_dir/k8s.env" <<'CONF'
+K8S_CONTEXT=test-context
+K8S_NAMESPACE=fork-sandbox-test
+K8S_IMAGE=registry.example/you/fork-sandbox:latest
+K8S_PROXY_UPSTREAM=https://api.example.com/v1";return 302 "http://evil.example/x
+K8S_DENIED_PROBE=10.0.0.1:443
+CONF
+install -m 600 /dev/null "$nginx_unsafe_upstream_config_dir/pi.env"
+printf 'OPENROUTER_API_KEY=sk-test-dummy\n' >> "$nginx_unsafe_upstream_config_dir/pi.env"
+refuses "a K8S_PROXY_UPSTREAM URL with a nginx-unsafe character is refused" \
+    "would break the" \
+    env FORK_SANDBOX_CONFIG_DIR="$nginx_unsafe_upstream_config_dir" "$k8s_sh" install --dry-run
+
+nginx_unsafe_endpoint_config_dir="$(newdir)"; tmpdirs+=("$nginx_unsafe_endpoint_config_dir")
+cat > "$nginx_unsafe_endpoint_config_dir/k8s.env" <<'CONF'
+K8S_CONTEXT=test-context
+K8S_NAMESPACE=fork-sandbox-test
+K8S_IMAGE=registry.example/you/fork-sandbox:latest
+K8S_PROXY_ENDPOINTS=primary=http://10.0.0.5:8001/v1";return 302 "http://evil.example/x
+K8S_DENIED_PROBE=10.0.0.1:443
+CONF
+refuses "a K8S_PROXY_ENDPOINTS URL with a nginx-unsafe character is refused" \
+    "would break the" \
+    env FORK_SANDBOX_CONFIG_DIR="$nginx_unsafe_endpoint_config_dir" "$k8s_sh" install --dry-run
 
 # An unregistered endpoint name in K8S_PROXY_ENDPOINT_KEYS is an
 # install-time error, nothing created.
