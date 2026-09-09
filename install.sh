@@ -366,6 +366,11 @@ is_classified() {
 scripts_to_check=()
 if git -C "$REPO_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     while IFS= read -r tracked; do
+        # Only a direct child of scripts/ is installable, so only a direct
+        # child is classifiable. ls-files also reports tracked files nested
+        # deeper (a committed __pycache__/*.pyc, say), and those would
+        # otherwise be judged by their leaf name and fail the gate.
+        [[ "$tracked" == scripts/*/* ]] && continue
         scripts_to_check+=("$REPO_DIR/$tracked")
     done < <(git -C "$REPO_DIR" ls-files -- scripts)
 else
