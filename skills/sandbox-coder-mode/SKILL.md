@@ -183,7 +183,7 @@ very top of the handoff**, before the goal, as its own section; state the
 failure; and give an explicit per-section commit sequence, so committing is
 a step in the plan rather than a virtue to remember.
 
-While a run is in flight, `fork-sandbox-say.sh` (see **Iterating on a
+While a run is in flight, `fork-sandbox say` (see **Iterating on a
 run**) can nudge a session that is accumulating work without committing.
 Watch the commit count in the run's status block and use it.
 
@@ -244,7 +244,7 @@ reporting:
 
 **Ending a long round.** Per round, in order: read the diffstat and
 spot-check what runs on the host, run the suites on the host, integrate,
-record the verdict with `sandbox-run-log.py verdict`, and report — the same
+record the verdict with `fork-sandbox log verdict`, and report — the same
 sequence as **Reviewing and integrating**, at the high-level default from
 **Stay high level**.
 Keep the run directory until the branch is reviewed and merged — it is the
@@ -361,7 +361,7 @@ or the `--maintainer-*` trio, which the shipped defaults don't set), and see
 single launch.
 
 ```bash
-fork-sandbox.sh --harness claude --model sonnet --review-model opus --review-loop 2 \
+fork-sandbox run --harness claude --model sonnet --review-model opus --review-loop 2 \
     --branch "<branch>" \
     --task-meta '{"kind":"implement","difficulty":3,"size":"m","prompt_template_id":"<slug>"}' \
     "<project-path>" "<handoff-file>"
@@ -372,7 +372,7 @@ collapse into it — the task-shaped flags stay on the command line, since a
 preset deliberately cannot carry them (see `docs/presets.md`):
 
 ```bash
-fork-sandbox.sh --preset <name> \
+fork-sandbox run --preset <name> \
     --branch "<branch>" \
     --task-meta '{"kind":"implement","difficulty":3,"size":"m","prompt_template_id":"<slug>"}' \
     "<project-path>" "<handoff-file>"
@@ -386,11 +386,11 @@ Keep the run directory the launcher prints — every later command takes it.
 Then arm the Monitor tool on the command it printed:
 
 ```
-fork-sandbox-status.sh --monitor-terminal <run-dir>
+fork-sandbox status --monitor-terminal <run-dir>
 ```
 
 Never hand-roll a poll loop. When the user wants to watch a run live in
-their own terminal, give them `fork-sandbox-status.sh --follow <run-dir>`
+their own terminal, give them `fork-sandbox status --follow <run-dir>`
 and keep the Monitor on `--monitor-terminal`.
 
 For a long run on the `claude` or `codex` harness, check the access token
@@ -399,7 +399,7 @@ started late in a token's life dies partway with nothing committed.
 
 Both warn only when the token is nearly spent, so silence is the good case,
 not a missing reading. `claude-sandboxed` prints a warning under 60 minutes
-and refuses outright at zero; it reaches `fork-sandbox-status.sh --log
+and refuses outright at zero; it reaches `fork-sandbox status --log
 <run-dir>`, which otherwise says nothing about the token. codex's warning
 lands on the launcher's own output. Neither reports the lifetime when there
 is plenty left, so an empty log means "over an hour", not "unknown" — and
@@ -438,7 +438,7 @@ tmux list-sessions
 can be steered:
 
 ```bash
-fork-sandbox-say.sh <run-dir> "The API changed under you — parse() takes a dict now, not a string."
+fork-sandbox say <run-dir> "The API changed under you — parse() takes a dict now, not a string."
 ```
 
 It lands on the session's next tool call (`claude`) or within ~25 tool calls
@@ -458,7 +458,7 @@ rest of the run acting on it. If you find yourself writing a third addendum to
 the same run, that is the signal.
 
 **A run can continue itself, but only for one reason: running out of room.**
-`fork-sandbox.sh --refresh-at` (on by default) nudges a session that fills
+`fork-sandbox run --refresh-at` (on by default) nudges a session that fills
 its own context to write a hand-off and end its turn, then forks a fresh
 session on the *same* clone and branch to keep going from it — automatically,
 with the same handoff and the same goal, no orchestrator involvement. That is
@@ -475,7 +475,7 @@ starts from the first one's branch. Same shipped-default flags as
 **Launching and watching** above, substituted the same way:
 
 ```bash
-fork-sandbox.sh --harness claude --model sonnet --review-model opus --review-loop 2 \
+fork-sandbox run --harness claude --model sonnet --review-model opus --review-loop 2 \
     --branch "<branch>-2" --checkout "<branch>" \
     "<project-path>" "<handoff-file-2>"
 ```
@@ -529,7 +529,7 @@ model that misread the task will misread it again.
    read it there.
 
 2. **Read the report** of what the reviewer observed:
-   `fork-sandbox-status.sh --result <run-dir>` leads with the review report
+   `fork-sandbox status --result <run-dir>` leads with the review report
    when `--review-loop` ran, then shows the session's own account; the split
    matters because the report is based on the branch and diff, while the
    session account is the author's claim. For a run without a review report,
@@ -553,7 +553,7 @@ model that misread the task will misread it again.
    the cleanup below deletes the directory:
 
    ```bash
-   sandbox-run-log.py verdict <run-id> --outcome integrated-with-fixes \
+   fork-sandbox log verdict <run-id> --outcome integrated-with-fixes \
        --defects 2 --notes "selection off-by-one; missing test for empty set"
    ```
 
@@ -583,7 +583,7 @@ For a branch that is already back and was not launched with that tier,
 the pass is one review-only run over it:
 
 ```bash
-fork-sandbox.sh --review-only --checkout "<branch>" \
+fork-sandbox run --review-only --checkout "<branch>" \
     --harness claude --model opus "<project-path>" "<review-handoff>"
 ```
 
@@ -657,9 +657,9 @@ Consult the record when picking the next round's harness, model or prompt
 shape:
 
 ```bash
-sandbox-run-log.py stats --by model,task.kind
-sandbox-run-log.py stats --by task.prompt_template_id --kind implement
-sandbox-run-log.py list --days 14
+fork-sandbox log stats --by model,task.kind
+fork-sandbox log stats --by task.prompt_template_id --kind implement
+fork-sandbox log list --days 14
 ```
 
 ## Choosing a harness and a model
@@ -724,7 +724,7 @@ file, or a key absent from it, means the default above.
 No script reads this file — `fork-sandbox.sh` itself has no idea it exists.
 Reading it is this session's job, done once per **Entering the mode**,
 because a script that read it would make these flags the default for every
-caller of `fork-sandbox.sh`, not just coder mode. `fork-sandbox.sh configure`
+caller of `fork-sandbox.sh`, not just coder mode. `fork-sandbox configure`
 does not write it either — its target allowlist is deliberately hardcoded
 (see [configure.md](../../docs/configure.md)); this file is written by
 hand, by whoever set up the machine.
@@ -880,7 +880,7 @@ spends itself discovering it cannot `npm install`.
 Check what a round actually cost before choosing the next one's harness:
 
 ```bash
-fork-sandbox-status.sh --json <run-dir> | jq .cost_usd
+fork-sandbox status --json <run-dir> | jq .cost_usd
 ```
 
 `--json` also carries the token counts and the harness version. A `pi-local`

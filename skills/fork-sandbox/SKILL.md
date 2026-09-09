@@ -1,6 +1,6 @@
 ---
 name: fork-sandbox
-description: Fork a task to an unattended Claude Code session in a sandboxed clone of the repo. Headless, so it needs no keypress, exits on its own, fetches its branch back, and logs every event to a file this session can watch. A running session can still be steered with fork-sandbox-say.sh, which sends it an operator addendum. Use when work should run without babysitting — a refactor, a test sweep, a long build.
+description: Fork a task to an unattended Claude Code session in a sandboxed clone of the repo. Headless, so it needs no keypress, exits on its own, fetches its branch back, and logs every event to a file this session can watch. A running session can still be steered with fork-sandbox say, which sends it an operator addendum. Use when work should run without babysitting — a refactor, a test sweep, a long build.
 argument-hint: [--branch <name>] [--checkout <ref>] [--review-only] [--review-base <ref>] [--model <model>] [--harness <harness>[/<model>]] [--review-loop <N>] [--review-model <model>] [--maintainer-loop <N>] [--maintainer-model <model>] [--maintainer-harness <harness>[/<model>]] [--preset <name>] [--refresh-at <fraction|tokens>] [--refresh-max <n>] [--sandbox-args "..."] [--outbox-max <size>] [--k8s [--timeout <seconds>] [--keep] [--endpoint <name>] [--checkout <ref>]] <project-path> — path to the target project (omit or use "." for the current repo). Use --branch to name the branch the session commits on. Use --model to pick the model (fable, opus, sonnet) or append it to the harness. Use --harness pi to run pi against OpenRouter, which then requires a model; --harness pi-local to run pi against a self-hosted endpoint in a sandbox with no network at all, which costs nothing; or --harness codex to run OpenAI codex on your ChatGPT sign-in. Use --review-loop N to have a fresh session review the run's commits and a third session fix what it found, up to N times; --review-model selects a different model for review legs only. Use --maintainer-loop N (with a required --maintainer-model — its verdict is the run's last word on the branch, so it has no default) to run the tier that decides whether the branch lands, after the review loop when both are given: a fresh session reviews the branch the way a maintainer judging a pull request would — the surrounding code, not just the diff — and a fix session commits what it finds, up to N times; --maintainer-harness takes the same claude/pi/pi-local/codex choices as --review-harness. --refresh-at (default 0.5, claude only) nudges a session to hand off to a fresh one when its context fills up rather than degrade into compaction; 0 disables it, and --refresh-max caps how many continuations may chain (default 6). Use --preset <name> to load the whole pipeline shape — who codes, who reviews and maintains, who fixes what each finds (fix_agent), and how many passes a coding agent repeats (repeat) — from ~/.config/fork-sandbox/presets/<name>.yaml instead of spelling it in flags; explicit flags override the preset key by key, and fix seats and repeat are preset-only (see docs/presets.md). Use --sandbox-args "--unpin-egress" only when the task must reach the tailnet, a VPN, or a libvirt/docker bridge. Use --outbox-max SIZE to raise the outbox cap above its default 64 MiB (bare digits for bytes, or a K/M/G suffix — no upper ceiling); applies whether or not --k8s is given. Use --k8s to run in a Kubernetes cluster instead of the local sandbox — defaults to --harness pi, also accepts --harness claude; --model is required on both, except a pi run on an install with named endpoints, where --endpoint <name> stands in for it and the pod discovers its model (a pi run without --model but with --endpoint is the one shape the launcher accepts) — and refuses most other flags by name; see "Kubernetes runs" below.
 ---
 
@@ -52,23 +52,23 @@ reach it — see "What it gives up".)
 
 3. **Launch it.**
    ```bash
-   fork-sandbox.sh --branch "<branch>" "<project-path>" "<handoff-file>"
+   fork-sandbox run --branch "<branch>" "<project-path>" "<handoff-file>"
    ```
    Extra flags, all optional:
    ```bash
-   fork-sandbox.sh --model sonnet --branch "<branch>" "<path>" "<handoff>"
-   fork-sandbox.sh --dry-run --harness codex/sol "<path>" "<handoff>"
-   fork-sandbox.sh --sandbox-args "--unpin-egress" --branch "<branch>" "<path>" "<handoff>"
-   fork-sandbox.sh --claude-args "--effort high" --branch "<branch>" "<path>" "<handoff>"
-   fork-sandbox.sh --task-meta '{"kind":"implement","difficulty":3,"size":"m"}' --branch "<branch>" "<path>" "<handoff>"
-   fork-sandbox.sh --review-loop 2 --branch "<branch>" "<path>" "<handoff>"
-   fork-sandbox.sh --review-loop 2 --review-model opus --branch "<branch>" "<path>" "<handoff>"
-   fork-sandbox.sh --maintainer-loop 1 --maintainer-model opus --branch "<branch>" "<path>" "<handoff>"
-   fork-sandbox.sh --review-loop 2 --maintainer-loop 1 --maintainer-model opus \
+   fork-sandbox run --model sonnet --branch "<branch>" "<path>" "<handoff>"
+   fork-sandbox run --dry-run --harness codex/sol "<path>" "<handoff>"
+   fork-sandbox run --sandbox-args "--unpin-egress" --branch "<branch>" "<path>" "<handoff>"
+   fork-sandbox run --claude-args "--effort high" --branch "<branch>" "<path>" "<handoff>"
+   fork-sandbox run --task-meta '{"kind":"implement","difficulty":3,"size":"m"}' --branch "<branch>" "<path>" "<handoff>"
+   fork-sandbox run --review-loop 2 --branch "<branch>" "<path>" "<handoff>"
+   fork-sandbox run --review-loop 2 --review-model opus --branch "<branch>" "<path>" "<handoff>"
+   fork-sandbox run --maintainer-loop 1 --maintainer-model opus --branch "<branch>" "<path>" "<handoff>"
+   fork-sandbox run --review-loop 2 --maintainer-loop 1 --maintainer-model opus \
        --branch "<branch>" "<path>" "<handoff>"
-   fork-sandbox.sh --refresh-at 0 --branch "<branch>" "<path>" "<handoff>"
-   fork-sandbox.sh --refresh-at 0.3 --refresh-max 3 --branch "<branch>" "<path>" "<handoff>"
-   fork-sandbox.sh --preset deep --branch "<branch>" "<path>" "<handoff>"
+   fork-sandbox run --refresh-at 0 --branch "<branch>" "<path>" "<handoff>"
+   fork-sandbox run --refresh-at 0.3 --refresh-max 3 --branch "<branch>" "<path>" "<handoff>"
+   fork-sandbox run --preset deep --branch "<branch>" "<path>" "<handoff>"
    ```
    Pass `--sandbox-args "--unpin-egress"` only when the task must reach the
    tailnet, a VPN, or a libvirt/docker bridge. It removes a restriction.
@@ -264,7 +264,7 @@ reach it — see "What it gives up".)
 4. **Arm the monitor.** Do not hand-roll a poll loop. Use the Monitor tool
    with the command the launcher printed:
    ```
-   fork-sandbox-status.sh --monitor-terminal <run-dir>
+   fork-sandbox status --monitor-terminal <run-dir>
    ```
    Set `timeout_ms` to cover the work — 1800000 (30 min) is a good default,
    and use `persistent: true` for anything longer. It prints nothing until
@@ -277,25 +277,25 @@ reach it — see "What it gives up".)
    silence never means success.
 
    When the **user** wants to watch the run live in their own terminal,
-   give them `fork-sandbox-status.sh --follow <run-dir>` instead — every
+   give them `fork-sandbox status --follow <run-dir>` instead — every
    event, rendered, ending with the same summary. Keep the Monitor tool on
    `--monitor-terminal`.
 
 5. **Report back, briefly.** When the monitor fires its terminal event you
    already have the summary. If you need more, read:
    ```bash
-   fork-sandbox-status.sh <run-dir>            # state, branch, commits, cost, summary
-   fork-sandbox-status.sh --result <run-dir>   # review report, then session account
-   fork-sandbox-status.sh --json <run-dir>     # the structured summary, for jq
-   fork-sandbox-status.sh --events 40 <run-dir>  # the last 40 events
-   fork-sandbox-status.sh --log <run-dir>      # sandbox startup messages
+   fork-sandbox status <run-dir>            # state, branch, commits, cost, summary
+   fork-sandbox status --result <run-dir>   # review report, then session account
+   fork-sandbox status --json <run-dir>     # the structured summary, for jq
+   fork-sandbox status --events 40 <run-dir>  # the last 40 events
+   fork-sandbox status --log <run-dir>      # sandbox startup messages
    ```
 
    Read a single fact with `--json` rather than grepping the prose — the
    cost is a decimal with a currency prefix, and the obvious
    strip-to-digits mangling turns it into `076198`:
    ```bash
-   fork-sandbox-status.sh --json <run-dir> | jq .cost_usd
+   fork-sandbox status --json <run-dir> | jq .cost_usd
    ```
 
    `--json` also carries `harness_version` and a `usage` object —
@@ -317,15 +317,15 @@ reach it — see "What it gives up".)
 A run is not sealed off once it starts. Every run directory has an **operator inbox** — `<run-dir>/inbox`, bound read-only into the sandbox — and one command puts a message in it:
 
 ```bash
-fork-sandbox-say.sh <run-dir> "Also cover the empty-input case in the tests."
-fork-sandbox-say.sh <run-dir> -      # long message from stdin
+fork-sandbox say <run-dir> "Also cover the empty-input case in the tests."
+fork-sandbox say <run-dir> -      # long message from stdin
 ```
 
 That is the whole interface. The file is timestamped and generated; you never name it.
 
 **An addendum carries the same authority as the handoff.** It may override the handoff, not merely append to it — where the two conflict, the addendum is the newer instruction and wins. Both the generated prompt and the delivery hook say so out loud, because without that a session reads a course change as a footnote and carries on with the original plan.
 
-**When it lands depends on the harness.** `fork-sandbox-say.sh` prints this on every write, so you never have to remember:
+**When it lands depends on the harness.** `fork-sandbox say` prints this on every write, so you never have to remember:
 
 | Harness | Delivery | How |
 |---|---|---|
@@ -341,7 +341,7 @@ inbox:    2 addenda
 ◆ fork-sandbox-inbox: delivered 1787718559-01.md
 ```
 
-**Steering keeps working across a `--refresh-at` continuation.** The inbox is bound at the same path for every leg of the chain — the implement leg and every continuation — so an addendum written while leg 2 is running lands on leg 2, exactly as it would on a run with no refresh at all. What does *not* carry across a continuation is anything a session only holds in its own head, so the run archives an addendum into `<run-dir>/inbox-delivered/leg-<N>/` the moment the leg it was delivered to ends, and every continuation's prompt embeds every addendum archived so far, oldest first, right after the original brief. A continuation is the same task continued, so this is deliberate: a standing constraint or a correction to the brief must not vanish just because the leg that read it is gone. Each review leg's prompt is rebuilt fresh, right before it runs, with the same embedded list — its own task requires it, since it is asked to report an unfollowed addendum as a finding and cannot do that against addenda it never sees. A fix leg, by contrast, gets none of it directly: its task is to act on the reviewer's verdict, and a verdict that cites an addendum-sourced finding already quotes the addendum text into the fix prompt that way. You can still steer a running review or fix leg live with `fork-sandbox-say.sh`; what it receives is archived under that leg's own number when it ends, but only when that leg's own harness is `claude` -- the same Stop-hook guarantee that lets any leg's archiving happen at all. Under `--review-harness`, a review or fix leg can run on a different harness than the implement leg, and an addendum sent to a `pi`/`pi-local`/`codex` leg is left in the live inbox instead, to be picked up by whichever later leg's prompt still names that path. This archiving is a local-run feature only: a `--k8s` run's review and fix legs execute pod-side, in a separate script that never calls back into it, so their prompts still carry the inbox section but nothing dedupes it — a `--k8s --review-loop` review leg can still see every addendum the implement leg already acted on.
+**Steering keeps working across a `--refresh-at` continuation.** The inbox is bound at the same path for every leg of the chain — the implement leg and every continuation — so an addendum written while leg 2 is running lands on leg 2, exactly as it would on a run with no refresh at all. What does *not* carry across a continuation is anything a session only holds in its own head, so the run archives an addendum into `<run-dir>/inbox-delivered/leg-<N>/` the moment the leg it was delivered to ends, and every continuation's prompt embeds every addendum archived so far, oldest first, right after the original brief. A continuation is the same task continued, so this is deliberate: a standing constraint or a correction to the brief must not vanish just because the leg that read it is gone. Each review leg's prompt is rebuilt fresh, right before it runs, with the same embedded list — its own task requires it, since it is asked to report an unfollowed addendum as a finding and cannot do that against addenda it never sees. A fix leg, by contrast, gets none of it directly: its task is to act on the reviewer's verdict, and a verdict that cites an addendum-sourced finding already quotes the addendum text into the fix prompt that way. You can still steer a running review or fix leg live with `fork-sandbox say`; what it receives is archived under that leg's own number when it ends, but only when that leg's own harness is `claude` -- the same Stop-hook guarantee that lets any leg's archiving happen at all. Under `--review-harness`, a review or fix leg can run on a different harness than the implement leg, and an addendum sent to a `pi`/`pi-local`/`codex` leg is left in the live inbox instead, to be picked up by whichever later leg's prompt still names that path. This archiving is a local-run feature only: a `--k8s` run's review and fix legs execute pod-side, in a separate script that never calls back into it, so their prompts still carry the inbox section but nothing dedupes it — a `--k8s --review-loop` review leg can still see every addendum the implement leg already acted on.
 
 ### What to send, and what not to
 
@@ -380,7 +380,7 @@ The same sandbox, the same clone, the same fetch-back — but the session is
 claude:
 
 ```bash
-fork-sandbox.sh --harness pi --model moonshotai/kimi-k3 \
+fork-sandbox run --harness pi --model moonshotai/kimi-k3 \
     --branch "<branch>" "<path>" "<handoff>"
 ```
 
@@ -404,7 +404,7 @@ What carries over, and what does not:
 - **The rendered log does not.** pi writes plain text, not stream-json, so
   `events.jsonl` holds its raw output and the formatted views have nothing
   to render. `--result` and `--follow` print nothing useful. Use
-  `fork-sandbox-status.sh <run-dir>` for state and the summary, and read
+  `fork-sandbox status <run-dir>` for state and the summary, and read
   `<run-dir>/events.jsonl` directly for what the session actually said.
   The monitor still fires its terminal event, but reports no commits
   along the way.
@@ -422,7 +422,7 @@ What carries over, and what does not:
 pi against a model **you** host, in a sandbox with **no network at all**:
 
 ```bash
-fork-sandbox.sh --harness pi-local --branch "<branch>" "<path>" "<handoff>"
+fork-sandbox run --harness pi-local --branch "<branch>" "<path>" "<handoff>"
 ```
 
 The wrapper here is `agent-sandboxed` rather than `claude-sandboxed` — the
@@ -464,7 +464,7 @@ the work needs the stronger model.
 ### `--harness codex`
 
 ```bash
-fork-sandbox.sh --harness codex --branch "<branch>" "<path>" "<handoff>"
+fork-sandbox run --harness codex --branch "<branch>" "<path>" "<handoff>"
 ```
 
 - **`--model` is optional** — codex has a default of its own. Pass one to
@@ -494,10 +494,10 @@ report.
 `--k8s` runs the session as a Kubernetes Job instead of a local sandbox, by handing the whole run to `fork-sandbox-k8s.sh run` — submit, wait, fetch, and clean up, in one blocking call. Reach for it when the machine you are on should not have to stay awake for the run (a CI job, a workstation you are about to close the lid on) or when you want a fleet of runs going at once rather than one tmux session at a time; reach for the plain local launch above for everything else, since it is simpler and has every capability this path is still missing.
 
 ```bash
-fork-sandbox.sh --k8s --model moonshotai/kimi-k3 --branch "<branch>" "<path>" "<handoff>"
+fork-sandbox run --k8s --model moonshotai/kimi-k3 --branch "<branch>" "<path>" "<handoff>"
 ```
 
-**`--k8s` defaults `--harness` to `pi`**, so leaving `--harness` off just runs pi rather than erroring. `--model` is required on that default shared proxy, since pi has no default model; the one shape that stands in for it is `--endpoint <name>` on an install that registers named endpoints, where the pod discovers its model instead (and a `fork-sandbox.sh --k8s` call accepts the flag through, so the launcher skips its own model requirement and defers to `fork-sandbox-k8s.sh`'s install-mode-aware validation — it refuses the combination on a legacy install with its own message). `--harness claude` keeps the requirement even there, because model discovery lists only the pi endpoint's ids. This is the baseline shape a Kubernetes run *is*: pi talking to a shared model proxy that holds the OpenRouter key, the same key `~/.config/fork-sandbox/pi.env` supplies locally. `--harness claude` is also accepted: the pod runs Claude Code instead, against a per-run proxy this run's own submit spins up, carrying the operator's own OAuth access token (never the OpenRouter key) — see `docs/kubernetes-runs.md`'s "Model access" (subsection "1b") for the full mechanism and why it needs its own proxy rather than reusing the shared one. `pi-local` and `codex` are still refused outright. The cluster itself needs a one-time `fork-sandbox-k8s.sh install` and `~/.config/fork-sandbox/k8s.env` configured with the cluster context, image and proxy upstream — see `docs/kubernetes-runs.md` for the full setup.
+**`--k8s` defaults `--harness` to `pi`**, so leaving `--harness` off just runs pi rather than erroring. `--model` is required on that default shared proxy, since pi has no default model; the one shape that stands in for it is `--endpoint <name>` on an install that registers named endpoints, where the pod discovers its model instead (and a `fork-sandbox run --k8s` call accepts the flag through, so the launcher skips its own model requirement and defers to `fork-sandbox-k8s.sh`'s install-mode-aware validation — it refuses the combination on a legacy install with its own message). `--harness claude` keeps the requirement even there, because model discovery lists only the pi endpoint's ids. This is the baseline shape a Kubernetes run *is*: pi talking to a shared model proxy that holds the OpenRouter key, the same key `~/.config/fork-sandbox/pi.env` supplies locally. `--harness claude` is also accepted: the pod runs Claude Code instead, against a per-run proxy this run's own submit spins up, carrying the operator's own OAuth access token (never the OpenRouter key) — see `docs/kubernetes-runs.md`'s "Model access" (subsection "1b") for the full mechanism and why it needs its own proxy rather than reusing the shared one. `pi-local` and `codex` are still refused outright. The cluster itself needs a one-time `fork-sandbox-k8s.sh install` and `~/.config/fork-sandbox/k8s.env` configured with the cluster context, image and proxy upstream — see `docs/kubernetes-runs.md` for the full setup.
 
 **`--branch` is optional here too**, unlike a direct `fork-sandbox-k8s.sh run` call, which requires it up front to poll, fetch and clean up by. Leave it off and `--k8s` generates one the same way `submit` itself does, `k8s-<timestamp>`, so an auto-named branch is recognizable as a cluster run at a glance.
 
@@ -514,10 +514,10 @@ What it cannot do yet, and why saying so matters: a flag this path cannot honor 
 - **`pi-local` and `codex` are refused.** `--harness pi` and `--harness claude` are the two agents this path runs — see "Model access" in `docs/kubernetes-runs.md` for why each needs the network shape it gets.
 - **Per-run services ARE built, from the committed spec.** A repo's `.agents/sandbox-services/services.yaml` (the declarative spec — see `docs/sandbox-services.md`'s cluster section) is synthesized into sidecar containers in the agent's own pod; the executable hook never runs in a pod, and a repo that commits only the hook gets no services on this path. `--services-trust-ref <ref>` is carried, and is required to keep services enabled under `--checkout` — it names the trusted base the checked-out ref is diffed against for changes under `.agents/sandbox-services/`. `--no-services` is still refused: there is no compose project on this path for it to skip, and a run that must not have services simply targets a repo whose checkout commits no spec.
 - **The operator inbox exists, but delivery differs by harness.** `fork-sandbox-k8s.sh say --branch <name> "..."` writes an addendum into the pod the same way locally, over `kubectl exec`. On `--harness pi`, delivery is the hookless contract `fs_emit_prompt_preamble` gives every non-claude harness: pi has no hook system, so the pod's prompt tells it to read the inbox itself, on a tool-call floor and before committing or reporting. On `--harness claude`, the pod's claude session runs with the same inbox hook a local claude run gets (`fork-sandbox-inbox-hook.sh`, wired into `PostToolUse`/`Stop` via `--settings`), so an addendum is delivered on the next tool call and blocks a `Stop` while unread — no self-polling needed.
-- **No addendum count.** There is no cluster equivalent of `fork-sandbox-status.sh`'s addendum count — an operator who calls `say` has no way to confirm what a pod has already received short of its eventual commit or final report.
+- **No addendum count.** There is no cluster equivalent of `fork-sandbox status`'s addendum count — an operator who calls `say` has no way to confirm what a pod has already received short of its eventual commit or final report.
 - **No run-log entry.** A local run appends cost, tokens and outcome to `~/.claude/sandbox-runs.jsonl`; a `--k8s` run does not, so `--task-meta` — which exists to be folded into that log — is refused too.
 - **`--sandbox-args` is refused**: no bubblewrap runs on this path to pass flags to. **`--claude-args` is refused too**, but for a different reason on `--harness claude` — the pod's claude invocation is fixed (flags, model, `--settings`, all rendered by the entrypoint), not user-extensible the way a local claude launch is.
-- **`--pi-args` is refused by `fork-sandbox.sh --k8s` by name, but the capability exists**: `fork-sandbox-k8s.sh submit` and `run` both accept it and carry the extra arguments into the pod's pi invocation — use `fork-sandbox-k8s.sh` directly for it. **`--prompts-dir` is refused as not-yet-built**, not as permanently unsupported — it names a real capability the cluster path has not been wired up to carry yet.
+- **`--pi-args` is refused by `fork-sandbox run --k8s` by name, but the capability exists**: `fork-sandbox-k8s.sh submit` and `run` both accept it and carry the extra arguments into the pod's pi invocation — use `fork-sandbox-k8s.sh` directly for it. **`--prompts-dir` is refused as not-yet-built**, not as permanently unsupported — it names a real capability the cluster path has not been wired up to carry yet.
 - **`--context-ro <dir>` IS built**: `--k8s` forwards it into the pod — `dir` must be under `/var/tmp/claude-scratch/forks/`, contain no symlinks or hard links, and is capped at 256 MiB. Unlike a local run's real `--bind-ro`, the pod has no way to bind a subdirectory of its emptyDir read-only: read-only there is by convention (the agent is told not to write there), not enforced by the filesystem.
 
 ### Review-shaped tasks on the cluster
@@ -537,12 +537,12 @@ One method note: the pod stages the `code-review-portable` skill only for `--rev
 - **Do not run git inside the clone.** Not `git log`, not `git status`, not
   `git -C`. The clone's git config is writable by the sandbox, and a key such
   as `core.fsmonitor` makes any git command there run on the **host**, outside
-  the sandbox, with the ssh keys and the tailnet. `fork-sandbox-status.sh`
+  the sandbox, with the ssh keys and the tailnet. `fork-sandbox status`
   runs no git at all for this reason. Once the branch is fetched, inspect it
   in the user's own repo, which is where it now lives.
 - **Do not `tmux send-keys` into the session.** Nothing in it wants input, and
-  to say something to it you have `fork-sandbox-say.sh` — see "Steering a run".
-- **Do not write into `<run-dir>/inbox` by hand.** `fork-sandbox-say.sh`
+  to say something to it you have `fork-sandbox say` — see "Steering a run".
+- **Do not write into `<run-dir>/inbox` by hand.** `fork-sandbox say`
   generates the name and writes atomically; a hand-placed file can be read
   half-written, or never read at all if the name is wrong.
 - **Do not scrape the pane.** The log file is the record; the pane is a view.
@@ -571,7 +571,7 @@ clone inside it is mounted, and the log is written by the host shell.
 | `<run-dir>/events-continuation-<N>.jsonl` | `--refresh-at` only: continuation N's own event stream, for its isolated cost and usage; its events also land in `events.jsonl`, unlike a review-loop leg's |
 | `<run-dir>/outbox/` | the one writable path outside the clone, created and bound read-write on every run; a nudged `--refresh-at` session's hand-off lands here, and it's otherwise free for anything the agent wants a human to see — a screenshot, a report. Capped at 64 MiB by default, raised with `--outbox-max` |
 | `--outbox-dir` path (`--k8s` only) | the pod's own `/work/outbox`, pulled back to the host here once the run finishes; see "Kubernetes runs" above |
-| `<run-dir>/inbox/` | operator addenda, written with `fork-sandbox-say.sh`; bound read-only into the sandbox |
+| `<run-dir>/inbox/` | operator addenda, written with `fork-sandbox say`; bound read-only into the sandbox |
 | `<run-dir>/inbox-delivered/leg-<N>/` (non-`--k8s` only) | addenda delivered to leg `N` (the implement leg is 1; continuation, review and fix legs continue the count), archived here the moment that leg ends. Not created on a `--k8s` run: its review and fix legs run pod-side and never archive |
 | `<run-dir>/exit-code` | written when the session exits |
 | `<run-dir>/pi-session` | `--harness pi` only: pi's session, with per-message cost |
@@ -747,11 +747,11 @@ knows is whether the work was any good; record that after review, joined by
 the run directory's basename:
 
 ```bash
-sandbox-run-log.py verdict <run-id> --outcome integrated
+fork-sandbox log verdict <run-id> --outcome integrated
 ```
 
 Outcomes: `integrated`, `integrated-with-fixes`, `rescued`, `rejected`,
-`abandoned`. `sandbox-run-log.py list` and `stats` read the log back.
+`abandoned`. `fork-sandbox log list` and `stats` read the log back.
 
 The clone stays at the path the launcher printed. Delete the run directory
 when the branch has been reviewed:
@@ -766,7 +766,7 @@ up there. Everything it printed is in the run directory.
 ## If it goes wrong
 
 - **No commits, branch removed.** The session did work but never committed, or
-  it failed early. Read `fork-sandbox-status.sh --result <run-dir>` and
+  it failed early. Read `fork-sandbox status --result <run-dir>` and
   `--log <run-dir>`. The clone still holds whatever it wrote.
 - **`abandoned`.** The tmux session was killed, or the runner was. Nothing was
   fetched; the clone still holds the work.
@@ -776,5 +776,5 @@ up there. Everything it printed is in the run directory.
   against the `◆ fork-sandbox-inbox: delivered` lines in `--monitor` or
   `--follow`: written but never delivered means the run ended first, while
   delivered but ignored usually means it was worded like a prompt injection —
-  see "Steering a run". `fork-sandbox-say.sh` refuses a run that has already
+  see "Steering a run". `fork-sandbox say` refuses a run that has already
   ended, so a message it accepted did reach a live session.

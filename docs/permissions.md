@@ -19,12 +19,23 @@ For Claude Code, in `~/.claude/settings.json`:
     "allow": [
       "Bash(fork-sandbox.sh:*)",
       "Bash(fork-sandbox-status.sh:*)",
-      "Bash(fork-sandbox-say.sh:*)"
+      "Bash(fork-sandbox-say.sh:*)",
+      "Bash(fork-sandbox run:*)",
+      "Bash(fork-sandbox status:*)",
+      "Bash(fork-sandbox say:*)"
     ],
     "additionalDirectories": ["/var/tmp/claude-scratch/"]
   }
 }
 ```
+
+The last three are the same three programs reached through the `fork-sandbox`
+dispatcher, so they grant nothing the first three do not. Approve them
+**per verb**, never as a bare `Bash(fork-sandbox:*)`: rules are literal
+prefix matches, so that one string would also match every `fork-sandbox-*`
+name on your PATH — including plumbing nobody meant to approve, like the
+pod-side k8s scripts and the `fork-sandbox-discover-*` executables, and
+including any such script added in a later release.
 
 Permission rules match on the literal command text, so if you also invoke a
 script by an absolute path, that spelling needs its own rule. The
