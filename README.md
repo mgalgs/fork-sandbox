@@ -99,7 +99,7 @@ pipeline:
     fix_agent: coder         # the maintainer's findings get the strong fixer
 ```
 
-Then `fork-sandbox.sh --preset deep <project> <handoff>` runs it: a cheap
+Then `fork-sandbox run --preset deep <project> <handoff>` runs it: a cheap
 model types (and re-checks its own premature "done" — that is the
 `repeat`), a cross-family reviewer reads the diff, and a maintainer with
 a strong fixer has the last word. Explicit flags still override the
@@ -141,7 +141,7 @@ and a review kit — two skills that let the run review its own work before it
 reports back.
 
 `pi` and `pi-local` read their per-machine config (an OpenRouter key, a
-model endpoint) from `~/.config/fork-sandbox/`. `fork-sandbox.sh configure`
+model endpoint) from `~/.config/fork-sandbox/`. `fork-sandbox configure`
 discovers and installs it for you — see [docs/configure.md](docs/configure.md).
 
 ## Pro Recipes
@@ -172,7 +172,7 @@ Recipe: course-correct a run that is already going — delivered at the
 agent's next tool call, with the same authority as the handoff:
 
 ```
-fork-sandbox-say.sh <run-dir> "stop refactoring the tests; ship the fix first"
+fork-sandbox say <run-dir> "stop refactoring the tests; ship the fix first"
 ```
 
 (in `/sandbox-coder-mode` you just say it — the session relays your words
@@ -213,7 +213,7 @@ coding, no fix:
 Recipe: find out whether the cheap model is actually cheaper
 
 ```
-sandbox-run-log.py stats --by model,task.kind
+fork-sandbox log stats --by model,task.kind
 ```
 
 ## Install
@@ -245,7 +245,7 @@ does and does not let a caller do.
 ## How a run works
 
 ```bash
-fork-sandbox.sh ~/src/myproject /var/tmp/claude-scratch/handoff.md
+fork-sandbox run ~/src/myproject /var/tmp/claude-scratch/handoff.md
 ```
 
 That command clones the project, starts a headless agent inside a bubblewrap
@@ -257,9 +257,9 @@ touched. In detail:
 1. **Write a handoff.** A markdown file: the task, the constraints, what
    "done" means. It is the run's entire prompt — there is nobody to ask a
    follow-up.
-2. **Launch it.** `fork-sandbox.sh <project> <handoff>`. It clones, provisions
+2. **Launch it.** `fork-sandbox run <project> <handoff>`. It clones, provisions
    (`node_modules`, a venv, a service stack), and starts the agent detached.
-3. **Watch, or don't.** `fork-sandbox-status.sh <run-dir>` prints the state,
+3. **Watch, or don't.** `fork-sandbox status <run-dir>` prints the state,
    `--result` the final report, `--events N` the last N events, and
    `--monitor` a line-oriented feed an orchestrating agent can poll;
    `--monitor-terminal` is that feed reduced to the terminal event, for an
@@ -341,9 +341,9 @@ end its turn, it is sent back once to rewrite it; if the leg ends anyway
 instead.
 
 ```bash
-fork-sandbox.sh --branch "<branch>" "<path>" "<handoff>"                # on by default
-fork-sandbox.sh --refresh-at 0 --branch "<branch>" "<path>" "<handoff>" # disabled
-fork-sandbox.sh --refresh-at 100000 --refresh-max 3 \
+fork-sandbox run --branch "<branch>" "<path>" "<handoff>"                # on by default
+fork-sandbox run --refresh-at 0 --branch "<branch>" "<path>" "<handoff>" # disabled
+fork-sandbox run --refresh-at 100000 --refresh-max 3 \
     --branch "<branch>" "<path>" "<handoff>"                           # an absolute token count
 ```
 
@@ -486,7 +486,7 @@ What you get:
   The tokens are yours, no credential is inside, and there is nowhere to
   exfiltrate to. That is the implement leg; a networked `--review-harness`
   gives its own leg a credential, egress, and a price, on purpose.
-- **Steering without attaching.** `fork-sandbox-say.sh` sends a running
+- **Steering without attaching.** `fork-sandbox say` sends a running
   session an addendum, delivered at its next tool call.
 - **A record.** Every run appends harness, model, tokens, cost and commits to
   a log you can query later — which is how you find out whether the cheap
@@ -505,7 +505,7 @@ written down in [docs/sandbox-backend.md](docs/sandbox-backend.md).
 Kubernetes is deliberately **not** a third backend. In a cluster the pod is
 already the sandbox, and the contract's host-path options do not survive the
 trip to another node — so the whole *run* moves there instead of one command:
-`fork-sandbox.sh --k8s` submits it as a Job, running pi against a shared
+`fork-sandbox run --k8s` submits it as a Job, running pi against a shared
 model proxy or Claude Code against a per-run proxy, the pod itself holding
 no credential either way. [docs/kubernetes-runs.md](docs/kubernetes-runs.md)
 is the full design.
@@ -583,7 +583,7 @@ what is mounted, what is not, and a numbered list of the gaps.
 
 - [docs/sandbox-quickstart.md](docs/sandbox-quickstart.md) — start here; the
   levels, from a plain run to a sealed one with services.
-- [docs/configure.md](docs/configure.md) — `fork-sandbox.sh configure`:
+- [docs/configure.md](docs/configure.md) — `fork-sandbox configure`:
   discover and install the per-machine config above, and how to add a
   discoverer of your own.
 - [docs/claude-sandboxed.md](docs/claude-sandboxed.md) — the sandbox itself.
