@@ -6385,10 +6385,17 @@ printf '\n== no private-hostname shape anywhere in the repo ==\n'
 # no recognizable real-world TLD, so a `.svc.<label>.<real TLD>` occurrence
 # is what a future commit pasting a real cluster's domain into a doc,
 # fixture or commit message would look like; caught here, distinctly from
-# the LAN/CIDR shapes above.
+# the LAN/CIDR shapes above. A real cluster domain is very often itself
+# multi-label (e.g. k8s.acme.com, cluster.prod.example.com), so the
+# `.svc.` branch allows one or more labels before the TLD rather than
+# exactly one. A bare `K8S_CLUSTER_DOMAIN=` assignment gets its own
+# alternative, with no `.svc.` prefix required: a site's k8s.env could
+# paste a real domain into that line, or a doc/commit message could quote
+# the value, without ever forming a `.svc.` string anywhere.
 # shellcheck disable=SC2016  # the regex is meant literally, not expanded
 leak_pattern='[[:alnum:]-]+\.home\.lan\b|[[:alnum:]-]+\.lan\b|192\.168\.[0-9]+\.[0-9]+'
-leak_pattern+='|\.svc\.[a-z0-9-]+\.(com|net|org|io|dev|ai|corp|internal)\b'
+leak_pattern+='|\.svc\.([a-z0-9-]+\.)+(com|net|org|io|dev|ai|corp|internal)\b'
+leak_pattern+='|\bK8S_CLUSTER_DOMAIN=([a-z0-9-]+\.)+(com|net|org|io|dev|ai|corp|internal)\b'
 hits="$(grep -rEn --exclude-dir=.git --exclude='fork-sandbox-k8s-test.sh' \
     "$leak_pattern" "$repo_dir" 2>/dev/null \
     | grep -Ev '192\.168\.0\.0/16' || true)"
@@ -6411,6 +6418,36 @@ if grep -qE "$leak_pattern" <<< 'upstream: my-svc.some-team.svc.cluster.local:80
         "regex matched the placeholder-domain string"
 else
     ok "leak_pattern does not flag the safe svc.cluster.local placeholder"
+fi
+# Multi-label cluster domains: a real cluster domain is very often itself
+# more than one label before the TLD, and the single-label alternation
+# above would miss both of these.
+if grep -qE "$leak_pattern" <<< 'upstream: my-svc.some-team.svc.k8s.acme.com:8080'; then
+    ok "leak_pattern catches a two-label cluster domain (svc.k8s.acme.com)"
+else
+    no "leak_pattern catches a two-label cluster domain (svc.k8s.acme.com)" \
+        "regex did not match the synthetic fixture string"
+fi
+if grep -qE "$leak_pattern" <<< 'upstream: my-svc.some-team.svc.cluster.prod.example.com:8080'; then
+    ok "leak_pattern catches a three-label cluster domain (svc.cluster.prod.example.com)"
+else
+    no "leak_pattern catches a three-label cluster domain (svc.cluster.prod.example.com)" \
+        "regex did not match the synthetic fixture string"
+fi
+# A bare K8S_CLUSTER_DOMAIN= assignment, with no .svc. prefix anywhere in
+# the string -- the shape a k8s.env line or a doc quoting its value would
+# take.
+if grep -qE "$leak_pattern" <<< 'K8S_CLUSTER_DOMAIN=k8s.acme.com'; then
+    ok "leak_pattern catches a bare K8S_CLUSTER_DOMAIN= real-domain assignment"
+else
+    no "leak_pattern catches a bare K8S_CLUSTER_DOMAIN= real-domain assignment" \
+        "regex did not match the synthetic fixture string"
+fi
+if grep -qE "$leak_pattern" <<< 'K8S_CLUSTER_DOMAIN=cluster.local'; then
+    no "leak_pattern does not flag the safe K8S_CLUSTER_DOMAIN=cluster.local default" \
+        "regex matched the placeholder-domain assignment"
+else
+    ok "leak_pattern does not flag the safe K8S_CLUSTER_DOMAIN=cluster.local default"
 fi
 
 printf '\n== fork-sandbox-k8s.sh: the GNU tools go through their resolved names ==\n'
