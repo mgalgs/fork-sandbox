@@ -3721,16 +3721,18 @@ done
 if [[ -d "$HOME/.claude/scripts" ]]; then
     review_kit_flags+=(--bind-ro "$HOME/.claude/scripts"
                        --prepend-path "$HOME/.claude/scripts")
-    # The farm is per-file symlinks into a checkout (install.sh's doing),
-    # so binding the farm alone mounts dangling links. Bind the checkout's
-    # scripts directory too, at its real path, so the links resolve. One
-    # readlink suffices: every script resolves into the one directory.
-    first_link="$(find "$HOME/.claude/scripts" -maxdepth 1 -type l -print -quit)"
-    if [[ -n "$first_link" ]]; then
-        link_target_dir="$(dirname "$(readlink -f "$first_link")")"
-        if [[ -d "$link_target_dir" && "$link_target_dir" != "$HOME/.claude/scripts" ]]; then
-            review_kit_flags+=(--bind-ro "$link_target_dir")
-        fi
+    # The farm is per-file symlinks into a checkout (install.sh's doing), so
+    # binding the farm alone mounts dangling links. It is also shared: other
+    # projects link their own scripts into the same directory, so which
+    # checkout a given link in the farm points at cannot be inferred from the
+    # farm itself. But this script's own directory IS the checkout whose
+    # links must resolve here, so bind that directly rather than guessing
+    # from the farm's contents. Links belonging to other projects stay
+    # dangling inside the sandbox -- correctly: the sandbox has no business
+    # resolving another project's tooling, and mounting an unrelated tree
+    # into it was never intended.
+    if [[ -d "$script_dir" && "$script_dir" != "$HOME/.claude/scripts" ]]; then
+        review_kit_flags+=(--bind-ro "$script_dir")
     fi
 fi
 
