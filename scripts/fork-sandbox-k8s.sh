@@ -1467,6 +1467,14 @@ parse_proxy_allow() {
             echo "name, so a hostname cannot be accepted here." >&2
             return 1
         fi
+        # Forced base 10 (10#$prefix), normalized to canonical decimal: a
+        # leading-zero prefix like "/08" passes the regex above (it's
+        # [0-9]{1,2}) and would otherwise reach cidr_contains's and
+        # cidr_is_private's own arithmetic unnormalized -- the same
+        # unforced-base trap validate_upstream_url's header documents,
+        # except here it aborts the whole install with a bare interpreter
+        # error instead of either function's own message.
+        cidr="${cidr%/*}/$(( 10#${cidr#*/} ))"
         # Forced base 10 (10#$port), and normalized to canonical decimal
         # below: plain (( port < 1 || port > 65535 )) hands bash arithmetic
         # a string it parses as a C-style integer literal, so a leading
@@ -1588,9 +1596,10 @@ cidr_contains() {
 # suppress the cleartext warning for it. Accepted because this is a
 # warning, not a refusal (see validate_upstream_url's 1a/1b split).
 # 10#$prefix forces base 10 for the same unforced-base reason
-# validate_upstream_url's own header documents -- parse_proxy_allow does
-# not itself normalize its CIDR (a pre-existing, out-of-scope gap in that
-# parser), so a leading-zero prefix can still reach here; ipv4_to_int
+# validate_upstream_url's own header documents -- parse_proxy_allow now
+# normalizes every CIDR it accepts, so a leading-zero prefix should never
+# reach here in practice, but this function has no way to enforce that on
+# a caller and the cost of forcing it again is one extra "10#"; ipv4_to_int
 # already forces base 10 on each octet it packs.
 cidr_is_private() {
     local cidr="$1" net prefix net_int ref refnet refprefix refmask
@@ -2054,7 +2063,7 @@ cmd_install() {
     # warning below (or the right warning for the wrong reason).
     local -a is_svc_url=()
     local url host host_only svc_ns port covered j
-    local port_carried port_carried_reason public_allow_cidr
+    local port_carried_public port_carried_reason public_allow_cidr
     for (( i = 0; i < ${#warn_urls[@]}; i++ )); do
         is_svc_url[i]=false
         url="${warn_urls[$i]}"
@@ -2092,38 +2101,39 @@ cmd_install() {
         fi
 
         # Whether the egress policy this install is about to render
-        # carries this endpoint's port to ANY address, and whether that
-        # "any" is non-private -- computed once here and read by both the
-        # NS-coverage warning below and the cleartext warning after this
-        # loop, so the two never disagree about the same endpoint's
-        # config. Port 443 on an unset K8S_PROXY_ALLOW is the only way the
-        # default policy carries a .svc. endpoint's port; a set
-        # K8S_PROXY_ALLOW replaces that wholesale, so it is checked
-        # against PROXY_ALLOW_CIDRS/PORTS instead (validate_upstream_url's
-        # 1a already refuses http:// on 443 unconditionally, so a .svc.
-        # http:// endpoint reaching this point never has port 443 --
-        # public_allow_cidr is therefore only ever set by the
-        # K8S_PROXY_ALLOW branch, never the default-policy one).
-        port_carried=false
+        # carries this endpoint's port to ANY address, and separately
+        # whether it carries that port to a non-private address --
+        # computed once here and read by both the NS-coverage warning
+        # below and the cleartext warning after this loop, so the two
+        # never disagree about the same endpoint's config. A .svc. http://
+        # endpoint CAN still reach this point with port 443 when
+        # K8S_PROXY_ALLOW is set: validate_upstream_url's 1a only refuses
+        # that unconditionally when K8S_PROXY_ALLOW is unset, and defers
+        # to this review otherwise (see that function's own header). The
+        # "WILL go through" warning below must fire only when the carrying
+        # match is itself non-private (port_carried_public) -- a
+        # K8S_PROXY_ALLOW entry that only opens a private CIDR (e.g.
+        # 172.16.0.0/12) carries the port, but a CNAME resolving off-cluster
+        # to a public host still hits no matching ipBlock and is dropped,
+        # same as if nothing had matched at all.
+        port_carried_public=false
         port_carried_reason=""
         public_allow_cidr=""
         if [[ ${#PROXY_ALLOW_CIDRS[@]} -eq 0 ]]; then
             if (( port == 443 )); then
-                port_carried=true
-                port_carried_reason="the default egress policy, which"
-                port_carried_reason+=" carries any address on port 443"
+                port_carried_public=true
+                port_carried_reason="the default egress policy carries"
+                port_carried_reason+=" any address on port 443"
             fi
         else
             for (( j = 0; j < ${#PROXY_ALLOW_CIDRS[@]}; j++ )); do
                 if (( port == PROXY_ALLOW_PORTS[j] )); then
-                    port_carried=true
-                    if [[ -z "$port_carried_reason" ]]; then
-                        port_carried_reason="K8S_PROXY_ALLOW entry"
-                        port_carried_reason+=" ${PROXY_ALLOW_CIDRS[$j]}:$port, which"
-                        port_carried_reason+=" carries port $port to ${PROXY_ALLOW_CIDRS[$j]}"
-                    fi
                     if ! cidr_is_private "${PROXY_ALLOW_CIDRS[$j]}"; then
                         public_allow_cidr="${PROXY_ALLOW_CIDRS[$j]}"
+                        port_carried_public=true
+                        port_carried_reason="K8S_PROXY_ALLOW entry"
+                        port_carried_reason+=" ${PROXY_ALLOW_CIDRS[$j]}:$port carries"
+                        port_carried_reason+=" port $port to ${PROXY_ALLOW_CIDRS[$j]}"
                     fi
                 fi
             done
@@ -2138,7 +2148,7 @@ cmd_install() {
             fi
         done
         if ! $covered; then
-            if $port_carried; then
+            if $port_carried_public; then
                 echo "Warning: ${warn_labels[$i]} names an in-cluster Service in" >&2
                 echo "namespace '$svc_ns' on port $port, which no K8S_PROXY_ALLOW_NS" >&2
                 echo "entry covers -- a normal in-cluster Service on this port would" >&2

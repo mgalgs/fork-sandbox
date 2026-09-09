@@ -1694,6 +1694,29 @@ else
     ok "a leading-zero URL port on the IPv4-literal K8S_PROXY_ALLOW path normalizes instead of crashing"
 fi
 
+# parse_proxy_allow must normalize a leading-zero CIDR *prefix* the same
+# way it now normalizes the port -- left unnormalized, cidr_contains's
+# unforced-base `mask=$(( ... << (32 - prefix) ...))` arithmetic hands
+# bash an octal-looking literal and crashes the whole install instead of
+# rendering the coverage warning this K8S_PROXY_ALLOW entry should trigger.
+leading_zero_allow_prefix_config_dir="$(newdir)"; tmpdirs+=("$leading_zero_allow_prefix_config_dir")
+cat > "$leading_zero_allow_prefix_config_dir/k8s.env" <<'CONF'
+K8S_CONTEXT=test-context
+K8S_NAMESPACE=fork-sandbox-test
+K8S_IMAGE=registry.example/you/fork-sandbox:latest
+K8S_PROXY_ENDPOINTS=primary=http://10.0.0.5:8080/v1
+K8S_PROXY_ALLOW=10.0.0.0/08:8080
+K8S_DENIED_PROBE=10.0.0.1:443
+CONF
+leading_zero_allow_prefix_err="$(FORK_SANDBOX_CONFIG_DIR="$leading_zero_allow_prefix_config_dir" "$k8s_sh" \
+    install --dry-run 2>&1 >/dev/null)"
+if [[ "$leading_zero_allow_prefix_err" == *'value too great for base'* ]]; then
+    no "a leading-zero K8S_PROXY_ALLOW CIDR prefix normalizes instead of crashing the install" \
+        "$leading_zero_allow_prefix_err"
+else
+    ok "a leading-zero K8S_PROXY_ALLOW CIDR prefix normalizes instead of crashing the install"
+fi
+
 # K8S_PROXY_ALLOW_NS -- selector-based egress for an in-cluster Service.
 # The static DNS egress rule already carries its own namespaceSelector
 # (kube-system/kube-dns), so "adds none" is checked as an unchanged
@@ -2018,12 +2041,42 @@ else
         "$uncovered_dropped_err"
 fi
 
-# The same "WILL go through" shape, but the port is carried by a set
-# K8S_PROXY_ALLOW entry rather than the default policy -- the reason
-# clause spliced into the warning must read as a full clause with a
-# predicate ("carries port ... to ..."), not a bare noun phrase.
+# The same "WILL go through" shape, but the port is carried by a set,
+# genuinely public K8S_PROXY_ALLOW entry rather than the default policy --
+# the reason clause spliced into the warning must read as a full clause
+# with its own subject and verb ("K8S_PROXY_ALLOW entry ... carries port
+# ... to ..."), not a noun phrase dangling off a "which". 192.0.2.0/24 is
+# this repo's RFC 5737 documentation range, a safe stand-in for a public
+# CIDR (see the other K8S_PROXY_ALLOW=192.0.2.0/24 fixtures above).
 uncovered_carried_allow_config_dir="$(newdir)"; tmpdirs+=("$uncovered_carried_allow_config_dir")
 cat > "$uncovered_carried_allow_config_dir/k8s.env" <<'CONF'
+K8S_CONTEXT=test-context
+K8S_NAMESPACE=fork-sandbox-test
+K8S_IMAGE=registry.example/you/fork-sandbox:latest
+K8S_PROXY_ENDPOINTS=primary=https://svc-a.example-ns.svc.cluster.local:8080/v1
+K8S_PROXY_ALLOW=192.0.2.0/24:8080
+K8S_DENIED_PROBE=10.0.0.1:443
+CONF
+uncovered_carried_allow_err="$(FORK_SANDBOX_CONFIG_DIR="$uncovered_carried_allow_config_dir" "$k8s_sh" \
+    install --dry-run 2>&1 >/dev/null)"
+if [[ "$uncovered_carried_allow_err" == *'WILL go through'* ]] \
+    && [[ "$uncovered_carried_allow_err" == \
+        *'K8S_PROXY_ALLOW entry 192.0.2.0/24:8080 carries port 8080 to 192.0.2.0/24, so'* ]]; then
+    ok "the K8S_PROXY_ALLOW-carried reason clause reads as a full sentence, not a bare noun phrase"
+else
+    no "the K8S_PROXY_ALLOW-carried reason clause reads as a full sentence, not a bare noun phrase" \
+        "$uncovered_carried_allow_err"
+fi
+
+# A K8S_PROXY_ALLOW entry that carries the port but only to a PRIVATE CIDR
+# must NOT claim "WILL go through" -- an ExternalName CNAME to a public
+# host still matches no ipBlock in that entry and is dropped, same as if
+# nothing had matched the port at all. This is the fixture the previous
+# test used to use (172.16.0.0/12, itself private) while asserting the
+# public-carry wording -- moved here to assert the wording it should
+# actually get.
+uncovered_carried_private_allow_config_dir="$(newdir)"; tmpdirs+=("$uncovered_carried_private_allow_config_dir")
+cat > "$uncovered_carried_private_allow_config_dir/k8s.env" <<'CONF'
 K8S_CONTEXT=test-context
 K8S_NAMESPACE=fork-sandbox-test
 K8S_IMAGE=registry.example/you/fork-sandbox:latest
@@ -2031,14 +2084,14 @@ K8S_PROXY_ENDPOINTS=primary=https://svc-a.example-ns.svc.cluster.local:8080/v1
 K8S_PROXY_ALLOW=172.16.0.0/12:8080
 K8S_DENIED_PROBE=10.0.0.1:443
 CONF
-uncovered_carried_allow_err="$(FORK_SANDBOX_CONFIG_DIR="$uncovered_carried_allow_config_dir" "$k8s_sh" \
+uncovered_carried_private_allow_err="$(FORK_SANDBOX_CONFIG_DIR="$uncovered_carried_private_allow_config_dir" "$k8s_sh" \
     install --dry-run 2>&1 >/dev/null)"
-if [[ "$uncovered_carried_allow_err" == *'WILL go through'* ]] \
-    && [[ "$uncovered_carried_allow_err" == *'carries port 8080 to 172.16.0.0/12'* ]]; then
-    ok "the K8S_PROXY_ALLOW-carried reason clause reads as a full sentence, not a bare noun phrase"
+if [[ "$uncovered_carried_private_allow_err" == *'every request to it will be dropped'* ]] \
+    && [[ "$uncovered_carried_private_allow_err" != *'WILL go through'* ]]; then
+    ok "a K8S_PROXY_ALLOW entry carrying the port to a private-only CIDR still warns it will be dropped"
 else
-    no "the K8S_PROXY_ALLOW-carried reason clause reads as a full sentence, not a bare noun phrase" \
-        "$uncovered_carried_allow_err"
+    no "a K8S_PROXY_ALLOW entry carrying the port to a private-only CIDR still warns it will be dropped" \
+        "$uncovered_carried_private_allow_err"
 fi
 
 rm -f /tmp/fs-k8s-test-allow-ns-install.err /tmp/fs-k8s-test-allow-ns-noport-install.err \

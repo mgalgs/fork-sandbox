@@ -716,13 +716,18 @@ hostname its privateness needs no DNS lookup to verify — but an
 host, so the name alone is not a guarantee. What actually holds that gate
 up is the proxy's own `NetworkPolicy` egress described below: a `.svc.`
 name only stays inside the cluster if the rendered egress policy does not
-also carry its port to a public address. The default policy carries any
-address on port 443 and nothing else, so `http://` to a `.svc.` name on
-443 is refused outright (a CNAME to a public host would otherwise leak the
-request's credential in cleartext); a custom `K8S_PROXY_ALLOW` that opens
-some other port publicly on purpose gets a warning instead, naming the
-endpoint and the matching allow entry, since that is a deliberate operator
-choice rather than a mistake. The `.svc.` segment is required (not just
+also carry its port to a public address. The default policy (unset
+`K8S_PROXY_ALLOW`) carries any host except
+RFC1918/loopback/link-local/CGNAT on port 443, and nothing else, so
+`http://` to a `.svc.` name on 443 is refused outright *only while
+`K8S_PROXY_ALLOW` is unset* (a CNAME to a public host would otherwise leak
+the request's credential in cleartext). Setting `K8S_PROXY_ALLOW` at all —
+even an entry that itself opens port 443 publicly — replaces that hard
+refusal with `install`'s reachability review, which warns instead of
+refusing whenever a matching allow entry actually carries the port to a
+public address, naming the endpoint and the matching allow entry, since
+opening that port is then a deliberate operator choice rather than a
+mistake. The `.svc.` segment is required (not just
 any name under the domain), since that is what marks a Service name
 specifically. Anything else still requires `https://`. The proxy's own
 `NetworkPolicy`
