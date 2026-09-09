@@ -663,10 +663,10 @@ k8s_safe_name_component() {
 # Resolves the fork-sandbox/owner label value: an explicit K8S_RUN_OWNER
 # (already validated above, used as-is -- an operator-typed value is
 # trusted, never re-sanitized on top of that), else a sanitized $USER,
-# else nothing. k8s_safe_name_component's output (lowercase alnum and
-# hyphens, no leading/trailing hyphen) is already a strict subset of a
-# valid label value, so it is reused as-is rather than writing a second
-# sanitizer.
+# else nothing. k8s_safe_name_component does most of the sanitizing, but
+# its output is NOT already a valid label value in every case -- see the
+# trim and length notes in the body -- so this tightens it and then gates
+# on k8s_valid_label_value rather than assuming.
 #
 # Omitting the label is reserved for a genuinely absent value -- neither
 # K8S_RUN_OWNER nor $USER set, or $USER sanitizes to the empty string
@@ -676,12 +676,33 @@ k8s_safe_name_component() {
 # no label at all -- never add a check that omits the label because the
 # name looks uninformative.
 resolve_run_owner() {
+    local owner
     if [[ -n "$K8S_RUN_OWNER" ]]; then
         printf '%s' "$K8S_RUN_OWNER"
         return 0
     fi
     [[ -n "${USER:-}" ]] || return 0
-    k8s_safe_name_component "$USER"
+    owner="$(k8s_safe_name_component "$USER")"
+    # k8s_safe_name_component's own trim is ${x##-}/${x%%-}, which removes
+    # exactly ONE hyphen from each end. That is enough where it is normally
+    # used -- an object name renders as "prefix-component", so a leftover
+    # hyphen lands interior -- and not enough here, where the value stands
+    # alone and must begin and end alphanumeric. A login name of "..bob"
+    # sanitizes to "--bob" and survives that trim as "-bob", which the API
+    # server rejects at submit. There is no length cap there either, and a
+    # label value stops at 63.
+    while [[ "$owner" == -* ]]; do owner="${owner#-}"; done
+    while [[ "$owner" == *- ]]; do owner="${owner%-}"; done
+    owner="${owner:0:63}"
+    # Truncation can land on a hyphen, so trim again after it, not before.
+    while [[ "$owner" == *- ]]; do owner="${owner%-}"; done
+    # Belt and braces against a $USER shape not anticipated here: gate on the
+    # same validator an operator-typed K8S_RUN_OWNER is refused by, and omit
+    # the label rather than render one the API server will reject. Omitting
+    # on an unrenderable value is the "genuinely absent" case above; it is
+    # still never a judgement about the name looking uninformative.
+    k8s_valid_label_value "$owner" || return 0
+    printf '%s' "$owner"
 }
 
 # Builds the ordered list of already-qualified "key: value" label lines
@@ -2607,8 +2628,22 @@ EOF
         kubectl create secret generic "$safe_name-claude-token" \
             --from-literal="upstream-key.conf=set \$upstream_key \"$claude_access_token\";" \
             --dry-run=client -o yaml | kubectl apply -f -
+        # The attribution labels go on here too, not just fork-sandbox/branch:
+        # this Secret is one of the run's objects, and the docs promise every
+        # one of them carries the owner. kubectl label takes key=value, where
+        # EXTRA_LABEL_LINES holds rendered YAML, so the pairs are rebuilt from
+        # the same two sources build_extra_label_lines reads.
+        # The branch label seeds the array so it is never empty, which keeps
+        # the expansion below safe under `set -u` on every bash this project
+        # supports.
+        local run_label_pairs label_i
+        run_label_pairs=("fork-sandbox/branch=$safe_name")
+        [[ -n "$run_owner" ]] && run_label_pairs+=("fork-sandbox/owner=$run_owner")
+        for label_i in "${!RUN_LABEL_KEYS[@]}"; do
+            run_label_pairs+=("fork-sandbox.io/${RUN_LABEL_KEYS[$label_i]}=${RUN_LABEL_VALUES[$label_i]}")
+        done
         kubectl label secret "$safe_name-claude-token" \
-            fork-sandbox/branch="$safe_name" --overwrite
+            "${run_label_pairs[@]}" --overwrite
 
         # Applied, and waited on, BEFORE the Job below: the egress-gate
         # initContainer probes this proxy the moment the Job's pod starts,

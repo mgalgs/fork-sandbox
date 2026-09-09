@@ -1045,10 +1045,17 @@ attributed rather than anonymous.
 **`fork-sandbox/owner`** is resolved once per `submit`, in order:
 
 1. `K8S_RUN_OWNER` in `~/.config/fork-sandbox/k8s.env`, if set.
-2. Otherwise `$USER`, sanitized (lowercased, disallowed characters mapped to
-   `-`, trimmed, capped at 63 — the same transform object names already
-   apply to a branch).
-3. If neither yields a value, the label is simply omitted — never invented.
+2. Otherwise `$USER`, sanitized: lowercased and disallowed characters mapped
+   to `-` (the transform object names already apply to a branch), then
+   tightened for a standalone label value — every leading and trailing `-`
+   removed, capped at 63, and trimmed again after the cap in case it landed
+   on a `-`. A branch's sanitized form only ever appears as
+   `prefix-component`, so a leftover edge hyphen is harmless there and is not
+   here; the extra step is what makes an odd login name such as `..bob`
+   render as `bob` rather than as an invalid `-bob`.
+3. If neither yields a value — or a sanitized `$USER` still would not be a
+   valid label value — the label is simply omitted, never invented and never
+   rendered invalid.
 
 A site sets `K8S_RUN_OWNER=ci-blast-radius` so a CI runner's submissions read
 as themselves rather than as `runner` or `ubuntu`; a devbox usually needs no

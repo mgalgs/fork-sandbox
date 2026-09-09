@@ -5283,6 +5283,42 @@ USER='Alice.Smith$' FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry
 check "a \$USER needing sanitizing renders sanitized as fork-sandbox/owner" 3 \
     "$(grep -cF 'fork-sandbox/owner: alice-smith' "$sanitize_owner_out")"
 
+# 3b. A $USER whose sanitized form would begin with a hyphen. This is the
+# case k8s_safe_name_component alone does NOT handle: its trim removes one
+# hyphen per end, which suffices for an object name (rendered as
+# "prefix-component", so a leftover hyphen lands interior) and not for a
+# standalone label value, which the API server requires to begin and end
+# alphanumeric. '..bob' sanitizes to '--bob' and must render as 'bob'.
+edge_owner_out="$(newdir)/edge-owner.yaml"; tmpdirs+=("$(dirname "$edge_owner_out")")
+USER='..bob' FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model moonshotai/kimi-k3 \
+    "$proj_dir" "$handoff_file" > "$edge_owner_out" 2>/tmp/fs-k8s-test-edge-owner.err
+check "a \$USER sanitizing to a leading hyphen renders trimmed" 3 \
+    "$(grep -cF 'fork-sandbox/owner: bob' "$edge_owner_out")"
+if grep -q 'fork-sandbox/owner: -' "$edge_owner_out"; then
+    no "no fork-sandbox/owner value begins with a hyphen" \
+        "found a hyphen-leading owner value in $edge_owner_out"
+else
+    ok "no fork-sandbox/owner value begins with a hyphen"
+fi
+
+# 3c. A $USER over the 63-character label-value cap is truncated, and the
+# truncation itself must not leave a trailing hyphen. 62 'a's then '-xy'
+# truncates at 63 to 62 'a's plus '-', whose trailing hyphen is trimmed.
+long_owner_out="$(newdir)/long-owner.yaml"; tmpdirs+=("$(dirname "$long_owner_out")")
+long_user="$(printf 'a%.0s' $(seq 62))-xy"
+USER="$long_user" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model moonshotai/kimi-k3 \
+    "$proj_dir" "$handoff_file" > "$long_owner_out" 2>/tmp/fs-k8s-test-long-owner.err
+check "an over-long \$USER renders capped at 63 with no trailing hyphen" 3 \
+    "$(grep -cF "fork-sandbox/owner: $(printf 'a%.0s' $(seq 62))" "$long_owner_out")"
+if grep -qE 'fork-sandbox/owner: .{64,}' "$long_owner_out"; then
+    no "no fork-sandbox/owner value exceeds 63 characters" \
+        "found an over-long owner value in $long_owner_out"
+else
+    ok "no fork-sandbox/owner value exceeds 63 characters"
+fi
+
 # 4. Neither K8S_RUN_OWNER nor a usable $USER: the label is omitted entirely,
 # never invented -- see resolve_run_owner's own header comment.
 no_owner_out="$(newdir)/no-owner.yaml"; tmpdirs+=("$(dirname "$no_owner_out")")
