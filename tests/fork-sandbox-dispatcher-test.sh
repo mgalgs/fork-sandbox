@@ -137,5 +137,5 @@ else
     no 'missing target names script' "$(cat "$tmp/missing-err")"
 fi
 
-printf '\n%d ok / %d fail\n' "$pass" "$fail"
+printf '\n%d passed, %d failed\n' "$pass" "$fail"
 ((fail == 0))
