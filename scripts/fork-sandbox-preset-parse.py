@@ -17,6 +17,7 @@ fork-sandbox.sh to compile onto its flag variables:
     agent <name> claude_args <value>
     agent <name> pi_args <value>
     agent <name> endpoint <value>       (empty value when unset)
+    agent <name> network <value>        (empty value when unset)
     implement agent <name>
     implement repeat <n>                (only when the code agent repeats)
     implement refresh_at <value>        (from the code agent, when set)
@@ -28,6 +29,7 @@ fork-sandbox.sh to compile onto its flag variables:
     review fix_harness <value>          (the effective fix agent's, resolved)
     review fix_model <value>
     review fix_repeat <n>
+    review fix_network <value>          (empty value when unset)
     maintain agent <name>               (same shape as review)
     ...
     warn <message>                      (advisory; fork-sandbox.sh prints it)
@@ -142,7 +144,7 @@ def main():
             fail(f"agents.{name}: expected a mapping of properties")
         agent = {"harness": "", "model": "", "claude_args": "", "pi_args": "",
                  "repeat": 1, "refresh_at": "", "refresh_max": "",
-                 "endpoint": ""}
+                 "endpoint": "", "network": ""}
         for prop, value in props.items():
             path = f"agents.{name}.{prop}"
             if prop == "harness":
@@ -186,10 +188,18 @@ def main():
                     fail(f"{path}: endpoint names match "
                          f"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$")
                 agent["endpoint"] = value
+            elif prop == "network":
+                # An axis independent of harness (see docs/presets.md):
+                # 'sealed' can pair with any harness, not just pi-local.
+                value = scalar(value, path)
+                if value not in ("pinned", "sealed"):
+                    fail(f"{path}: takes 'pinned' or 'sealed', not "
+                         f"'{value}'")
+                agent["network"] = value
             else:
                 fail(f"{path}: unknown agent property; agents take 'harness', "
                      f"'model', 'claude-args', 'pi-args', 'repeat', "
-                     f"'refresh-at', 'refresh-max' and 'endpoint'")
+                     f"'refresh-at', 'refresh-max', 'endpoint' and 'network'")
         if not agent["harness"]:
             fail(f"agents.{name}: has no harness")
         agents[name] = agent
@@ -300,9 +310,15 @@ def main():
             fail(f"agents.{name}: has 'endpoint' but does not sit the code "
                  f"seat -- the run has one proxy base URL for the whole "
                  f"run, so only the code seat's endpoint can be honored")
-        if agent["harness"] == "pi" and not agent["model"] and name in seated:
+        if agent["harness"] == "pi" and agent["network"] != "sealed" \
+                and not agent["model"] and name in seated:
             fail(f"agents.{name}: harness pi needs a model -- pi has no "
                  f"default of its own")
+        if agent["harness"] == "pi-local" and agent["network"] not in (
+                "", "sealed"):
+            fail(f"agents.{name}: harness 'pi-local' is already sealed; "
+                 f"its 'network' key can only be 'sealed' or omitted, not "
+                 f"'{agent['network']}'")
         if name not in seated:
             warns.append(f"agent '{name}' is defined but sits no seat")
 
@@ -310,7 +326,7 @@ def main():
     out = []
     for name, agent in agents.items():
         for prop in ("harness", "model", "claude_args", "pi_args",
-                    "endpoint"):
+                    "endpoint", "network"):
             out.append(f"agent\t{name}\t{prop}\t{agent[prop]}")
     out.append(f"implement\tagent\t{impl_agent}")
     if impl["repeat"] != 1:
@@ -330,6 +346,7 @@ def main():
         out.append(f"{kind}\tfix_harness\t{fixer['harness']}")
         out.append(f"{kind}\tfix_model\t{fixer['model']}")
         out.append(f"{kind}\tfix_repeat\t{fixer['repeat']}")
+        out.append(f"{kind}\tfix_network\t{fixer['network']}")
     for warn in warns:
         out.append(f"warn\t{warn}")
     sys.stdout.write("".join(line + "\n" for line in out))

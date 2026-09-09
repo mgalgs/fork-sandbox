@@ -1268,6 +1268,7 @@ k8s_endpoint=""
 k8s_endpoint_given=false
 outbox_max_arg=""
 network_arg="pinned"
+network_given=false
 
 while [[ "${1:-}" == -* ]]; do
     case "$1" in
@@ -1424,6 +1425,7 @@ while [[ "${1:-}" == -* ]]; do
             ;;
         --network)
             network_arg="${2:?--network requires 'pinned' or 'sealed'}"
+            network_given=true
             case "$network_arg" in
                 pinned|sealed) ;;
                 *)
@@ -1510,6 +1512,7 @@ if [[ -n "$preset_name" ]]; then
     declare -A preset_agent_cargs=()
     declare -A preset_agent_pargs=()
     declare -A preset_agent_endpoint=()
+    declare -A preset_agent_network=()
     preset_impl_agent=""
     preset_impl_refresh_at=""
     preset_impl_refresh_max=""
@@ -1521,6 +1524,7 @@ if [[ -n "$preset_name" ]]; then
     preset_review_fix_harness=""
     preset_review_fix_model=""
     preset_review_fix_repeat=1
+    preset_review_fix_network=""
     preset_maintain_agent=""
     preset_maintain_max=""
     preset_maintain_fix_default=""
@@ -1528,6 +1532,7 @@ if [[ -n "$preset_name" ]]; then
     preset_maintain_fix_harness=""
     preset_maintain_fix_model=""
     preset_maintain_fix_repeat=1
+    preset_maintain_fix_network=""
 
     # Stage the definition's bytes before parsing, so the parser, the
     # hash and the run dir's copy all describe that one staged file, the
@@ -1561,6 +1566,7 @@ if [[ -n "$preset_name" ]]; then
                     claude_args) preset_agent_cargs[$preset_f2]="$preset_f4" ;;
                     pi_args) preset_agent_pargs[$preset_f2]="$preset_f4" ;;
                     endpoint) preset_agent_endpoint[$preset_f2]="$preset_f4" ;;
+                    network) preset_agent_network[$preset_f2]="$preset_f4" ;;
                 esac
                 ;;
             implement)
@@ -1580,6 +1586,7 @@ if [[ -n "$preset_name" ]]; then
                     fix_harness) preset_review_fix_harness="$preset_f3" ;;
                     fix_model) preset_review_fix_model="$preset_f3" ;;
                     fix_repeat) preset_review_fix_repeat="$preset_f3" ;;
+                    fix_network) preset_review_fix_network="$preset_f3" ;;
                 esac
                 ;;
             maintain)
@@ -1591,6 +1598,7 @@ if [[ -n "$preset_name" ]]; then
                     fix_harness) preset_maintain_fix_harness="$preset_f3" ;;
                     fix_model) preset_maintain_fix_model="$preset_f3" ;;
                     fix_repeat) preset_maintain_fix_repeat="$preset_f3" ;;
+                    fix_network) preset_maintain_fix_network="$preset_f3" ;;
                 esac
                 ;;
             warn)
@@ -1660,6 +1668,13 @@ if [[ -n "$preset_name" ]]; then
             else
                 model_option="${preset_agent_model[$preset_impl_agent]}"
                 model_given=true
+            fi
+        fi
+        if [[ -n "${preset_agent_network[$preset_impl_agent]}" ]]; then
+            if [[ "$network_given" == true ]]; then
+                preset_note "--network overrides the code seat's network"
+            else
+                network_arg="${preset_agent_network[$preset_impl_agent]}"
             fi
         fi
         if [[ -n "${preset_agent_cargs[$preset_impl_agent]}" ]]; then
@@ -1741,6 +1756,11 @@ if [[ -n "$preset_name" ]]; then
                     review_model="${preset_agent_model[$preset_review_agent]}"
                 fi
             fi
+            # There is no --review-network flag to defer to, so the
+            # preset's key always takes effect here.
+            if [[ -n "${preset_agent_network[$preset_review_agent]}" ]]; then
+                review_network="${preset_agent_network[$preset_review_agent]}"
+            fi
         fi
         # This loop's fix seat. An explicit fix_agent is always honored as
         # the preset defines it -- no flag names a fix seat, so nothing
@@ -1758,6 +1778,7 @@ if [[ -n "$preset_name" ]]; then
             fix_harness="$preset_review_fix_harness"
             fix_model="$preset_review_fix_model"
             fix_repeat="$preset_review_fix_repeat"
+            fix_network="$preset_review_fix_network"
             # Same permanent alias as --harness pi-local, expanded the same
             # way. There is no --fix-harness flag; a preset's fix_harness
             # key is the only route here.
@@ -1787,6 +1808,10 @@ if [[ -n "$preset_name" ]]; then
                     maintainer_model="${preset_agent_model[$preset_maintain_agent]}"
                 fi
             fi
+            # There is no --maintainer-network flag to defer to, so the
+            # preset's key always takes effect here.
+            preset_mnt_nw="${preset_agent_network[$preset_maintain_agent]}"
+            [[ -n "$preset_mnt_nw" ]] && maintainer_network="$preset_mnt_nw"
         fi
         # The maintain loop's fix seat, same rules as the review loop's.
         if [[ "$preset_maintain_fix_default" == "1" ]]; then
@@ -1800,6 +1825,7 @@ if [[ -n "$preset_name" ]]; then
             mntfix_harness="$preset_maintain_fix_harness"
             mntfix_model="$preset_maintain_fix_model"
             mntfix_repeat="$preset_maintain_fix_repeat"
+            mntfix_network="$preset_maintain_fix_network"
             # Same permanent alias, expanded the same way. There is no
             # --mntfix-harness flag; a preset's fix_harness key on the
             # maintain seat is the only route here.

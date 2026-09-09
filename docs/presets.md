@@ -97,7 +97,8 @@ An agent is a named seat: who types, on what, and how. Names match
 | property | meaning |
 |---|---|
 | `harness` | required — `claude`, `pi`, `pi-local` or `codex`. The combined `harness/model` form the flags accept works here too, split at the first slash for the same reason (an OpenRouter model id carries its own slash). |
-| `model` | the seat's model or model alias. Optional where the flag is optional, required where it is required (`pi` needs one, on any seat); conflicts with a combined `harness` form, exactly as `--model` conflicts with `--harness pi/x`. |
+| `network` | `pinned` (the default) or `sealed`, the same axis as `--network`: whether this seat's harness reaches the network at all. Independent of `harness` — `{harness: pi, network: sealed}` is `--harness pi --network sealed`. |
+| `model` | the seat's model or model alias. Optional where the flag is optional, required where it is required (`pi` needs one, on any seat, unless `network: sealed`); conflicts with a combined `harness` form, exactly as `--model` conflicts with `--harness pi/x`. |
 | `claude-args` | extra arguments for the claude CLI — e.g. `--effort high`. |
 | `pi-args` | extra arguments for pi — e.g. `--thinking low`. |
 | `repeat` | run every coding leg this agent sits — the code step, or a loop's fix legs — as N passes on the same prompt. See "Repeat passes" below. |

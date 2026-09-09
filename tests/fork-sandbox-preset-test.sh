@@ -203,6 +203,78 @@ out="$(run --preset aliased 2>"$err")"
 check "a preset model goes through alias resolution" \
     $'preset=aliased\nharness=codex\nmodel=gpt-5.6-sol' "$out"
 
+# network: sealed on the code seat must compile identically to the
+# permanent harness: pi-local alias -- the central §5 parity case.
+cat > "$presets_dir/sealed-alias.yaml" <<'EOF'
+agents:
+  coder:
+    harness: pi-local
+  reviewer:
+    harness: claude
+    model: opus
+pipeline:
+  - action: code
+    agent: coder
+  - action: review
+    repeat: 2
+    agent: reviewer
+EOF
+cat > "$presets_dir/sealed-explicit.yaml" <<'EOF'
+agents:
+  coder:
+    harness: pi
+    network: sealed
+  reviewer:
+    harness: claude
+    model: opus
+pipeline:
+  - action: code
+    agent: coder
+  - action: review
+    repeat: 2
+    agent: reviewer
+EOF
+out_alias="$(run --preset sealed-alias 2>/dev/null | sed 's/^preset=.*/preset=X/')"
+out_explicit="$(run --preset sealed-explicit 2>/dev/null | sed 's/^preset=.*/preset=X/')"
+check "a code-seat network: sealed key compiles like harness: pi-local" \
+    "$out_alias" "$out_explicit"
+
+# The same equivalence on the review seat, the only route to a sealed
+# review leg besides the undocumented --review-harness pi-local alias.
+cat > "$presets_dir/rev-sealed-alias.yaml" <<'EOF'
+agents:
+  coder:
+    harness: claude
+    model: opus
+  reviewer:
+    harness: pi-local
+pipeline:
+  - action: code
+    agent: coder
+  - action: review
+    repeat: 2
+    agent: reviewer
+EOF
+cat > "$presets_dir/rev-sealed-explicit.yaml" <<'EOF'
+agents:
+  coder:
+    harness: claude
+    model: opus
+  reviewer:
+    harness: pi
+    network: sealed
+pipeline:
+  - action: code
+    agent: coder
+  - action: review
+    repeat: 2
+    agent: reviewer
+EOF
+out_alias="$(run --preset rev-sealed-alias 2>/dev/null | sed 's/^preset=.*/preset=X/')"
+out_explicit="$(run --preset rev-sealed-explicit 2>/dev/null | sed 's/^preset=.*/preset=X/')"
+check "a review-seat network: sealed key compiles like harness: pi-local" \
+    "$out_alias" "$out_explicit"
+
 printf '\n== flags override their preset counterparts ==\n'
 
 out="$(run --preset deep --model opus 2>"$err")"
@@ -269,6 +341,35 @@ refuses "a path-shaped preset name is refused" \
 refuses "a preset with loops is refused with --review-only" \
     "--review-only runs one review leg" \
     --preset deep --review-only --checkout HEAD
+
+# harness: pi-local already means sealed; a conflicting explicit key is
+# refused rather than silently resolved one way or the other.
+cat > "$presets_dir/net-conflict.yaml" <<'EOF'
+agents:
+  coder:
+    harness: pi-local
+    network: pinned
+pipeline:
+  - action: code
+    agent: coder
+EOF
+refuses "harness: pi-local with a conflicting network: key is refused" \
+    "is already sealed" \
+    --preset net-conflict
+
+cat > "$presets_dir/net-bad.yaml" <<'EOF'
+agents:
+  coder:
+    harness: pi
+    model: moonshotai/kimi-k3
+    network: bogus
+pipeline:
+  - action: code
+    agent: coder
+EOF
+refuses "an invalid network: value is refused" \
+    "takes 'pinned' or 'sealed'" \
+    --preset net-bad
 
 cat > "$presets_dir/fast3.yaml" <<'EOF'
 agents:
