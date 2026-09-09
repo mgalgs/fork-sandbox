@@ -2,14 +2,26 @@
 # fork-sandbox — Git-style dispatcher for the fork-sandbox porcelain
 #
 # Usage: fork-sandbox run [options] <project-path> <handoff-file>
-# Usage: fork-sandbox status [options] <run-dir>
-# Usage: fork-sandbox say <run-dir> <message>
-# Usage: fork-sandbox configure [options]
-# Usage: fork-sandbox k8s <sub-verb> [options]
-# Usage: fork-sandbox log <sub-verb> [options]
+#        fork-sandbox status [options] <run-dir>
+#        fork-sandbox say <run-dir> <message>
+#        fork-sandbox k8s <sub-verb> [options]
+#        fork-sandbox log <sub-verb> [options]
+#        fork-sandbox configure [options]
 #
-# Routes each verb to the existing script that implements it. Every target
-# remains callable directly under its own name.
+# Each verb routes to the script that implements it, and every one of those
+# scripts stays installed and callable under its own name:
+#
+#   run        fork-sandbox.sh
+#   status     fork-sandbox-status.sh
+#   say        fork-sandbox-say.sh
+#   k8s        fork-sandbox-k8s.sh
+#   log        sandbox-run-log.py
+#   configure  fork-sandbox.sh configure
+#
+# The dispatcher parses nothing of its own beyond a leading -h/--help, so a
+# --help after a verb reaches that verb's script and the sub-verbs of k8s
+# and log pass straight through. The lkml-mode toolchain (lkml-*.sh,
+# lkml-render.py) is deliberately outside the dispatcher.
 
 set -euo pipefail
 
