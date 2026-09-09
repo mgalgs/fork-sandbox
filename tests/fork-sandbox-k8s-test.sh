@@ -5231,6 +5231,230 @@ else
         "missing the REVIEW_CTX/REVIEW_MAX_TOKENS wiring in the claude branch of $entrypoint_sh"
 fi
 
+printf '\n== fork-sandbox-k8s.sh: fork-sandbox/owner and free-form --label ==\n'
+# A fresh config dir carrying the same base k8s.env as $config_dir above, plus
+# whatever extra lines this test needs appended (K8S_RUN_OWNER, K8S_RUN_LABELS)
+# -- kept separate from $config_dir so these fixtures never interact with the
+# many other tests that already depend on that dir's exact k8s.env content.
+mk_label_config() {
+    local d; d="$(newdir)"; tmpdirs+=("$d")
+    {
+        cat <<'CONF'
+K8S_CONTEXT=test-context
+K8S_NAMESPACE=fork-sandbox-test
+K8S_IMAGE=registry.example/you/fork-sandbox:latest
+K8S_PROXY_UPSTREAM=https://openrouter.ai
+K8S_DENIED_PROBE=10.0.0.1:443
+K8S_RUN_TTL=1800
+CONF
+        printf '%s\n' "$@"
+    } > "$d/k8s.env"
+    install -m 600 /dev/null "$d/pi.env"
+    printf 'OPENROUTER_API_KEY=sk-test-dummy\n' >> "$d/pi.env"
+    chmod 600 "$d/pi.env"
+    printf '%s' "$d"
+}
+
+# 1. K8S_RUN_OWNER renders on the ConfigMap, Job and Pod-template labels (3
+# render sites -- see build_extra_label_lines/render_extra_labels_indent).
+owner_env_dir="$(mk_label_config 'K8S_RUN_OWNER=example-team')"
+owner_env_out="$(newdir)/owner-env.yaml"; tmpdirs+=("$(dirname "$owner_env_out")")
+FORK_SANDBOX_CONFIG_DIR="$owner_env_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model moonshotai/kimi-k3 \
+    "$proj_dir" "$handoff_file" > "$owner_env_out" 2>/tmp/fs-k8s-test-owner.err
+check "K8S_RUN_OWNER renders fork-sandbox/owner on all 3 render sites" 3 \
+    "$(grep -cF 'fork-sandbox/owner: example-team' "$owner_env_out")"
+
+# 2. $USER fallback when K8S_RUN_OWNER is unset.
+user_owner_out="$(newdir)/user-owner.yaml"; tmpdirs+=("$(dirname "$user_owner_out")")
+USER=alice FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model moonshotai/kimi-k3 \
+    "$proj_dir" "$handoff_file" > "$user_owner_out" 2>/tmp/fs-k8s-test-user-owner.err
+check "\$USER is used as fork-sandbox/owner when K8S_RUN_OWNER is unset" 3 \
+    "$(grep -cF 'fork-sandbox/owner: alice' "$user_owner_out")"
+
+# 3. A $USER needing sanitizing (uppercase, a dot, a trailing '$') is
+# lowercased, has disallowed characters mapped to '-', and is trimmed --
+# k8s_safe_name_component's own transform, reused as the owner sanitizer.
+sanitize_owner_out="$(newdir)/sanitize-owner.yaml"; tmpdirs+=("$(dirname "$sanitize_owner_out")")
+USER='Alice.Smith$' FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model moonshotai/kimi-k3 \
+    "$proj_dir" "$handoff_file" > "$sanitize_owner_out" 2>/tmp/fs-k8s-test-sanitize-owner.err
+check "a \$USER needing sanitizing renders sanitized as fork-sandbox/owner" 3 \
+    "$(grep -cF 'fork-sandbox/owner: alice-smith' "$sanitize_owner_out")"
+
+# 4. Neither K8S_RUN_OWNER nor a usable $USER: the label is omitted entirely,
+# never invented -- see resolve_run_owner's own header comment.
+no_owner_out="$(newdir)/no-owner.yaml"; tmpdirs+=("$(dirname "$no_owner_out")")
+USER='' FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model moonshotai/kimi-k3 \
+    "$proj_dir" "$handoff_file" > "$no_owner_out" 2>/tmp/fs-k8s-test-no-owner.err
+if grep -q 'fork-sandbox/owner:' "$no_owner_out"; then
+    no "the fork-sandbox/owner label is omitted when neither K8S_RUN_OWNER nor \$USER yields a value" \
+        "found a fork-sandbox/owner label in $no_owner_out"
+else
+    ok "the fork-sandbox/owner label is omitted when neither K8S_RUN_OWNER nor \$USER yields a value"
+fi
+
+# 5. An invalid explicit K8S_RUN_OWNER (a space) is refused before anything is
+# created -- the asymmetry with $USER (sanitized, never refused) is deliberate.
+bad_owner_dir="$(mk_label_config 'K8S_RUN_OWNER=bad owner')"
+refuses "an invalid explicit K8S_RUN_OWNER is refused, naming the key and the rule" \
+    "K8S_RUN_OWNER='bad owner'" \
+    env FORK_SANDBOX_CONFIG_DIR="$bad_owner_dir" "$k8s_sh" install --dry-run
+
+# 6. A --label pair renders under the fixed fork-sandbox.io/ prefix on the
+# same 3 render sites as the owner label.
+plain_label_out="$(newdir)/plain-label.yaml"; tmpdirs+=("$(dirname "$plain_label_out")")
+FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model moonshotai/kimi-k3 --label extra=example-value \
+    "$proj_dir" "$handoff_file" > "$plain_label_out" 2>/tmp/fs-k8s-test-plain-label.err
+check "--label renders fork-sandbox.io/<key> on all 3 render sites" 3 \
+    "$(grep -cF 'fork-sandbox.io/extra: example-value' "$plain_label_out")"
+
+# 7. The same --label also renders on the per-run claude-proxy's 4 objects
+# (ConfigMap, Pod, Service, NetworkPolicy), for a total of 7 -- and the
+# __EXTRA_LABELS__ marker never survives into real output, with or without a
+# label set.
+claude_label_out="$(newdir)/claude-label.yaml"; tmpdirs+=("$(dirname "$claude_label_out")")
+HOME="$claude_home" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model claude-sonnet-5 --harness claude \
+    --label extra=example-value \
+    "$proj_dir" "$handoff_file" > "$claude_label_out" 2>/tmp/fs-k8s-test-claude-label.err
+check "--label renders on the claude-proxy objects too (7 render sites total)" 7 \
+    "$(grep -cF 'fork-sandbox.io/extra: example-value' "$claude_label_out")"
+if grep -q '__EXTRA_LABELS__' "$claude_label_out"; then
+    no "the __EXTRA_LABELS__ marker never survives into real output (labels set)" \
+        "found __EXTRA_LABELS__ in $claude_label_out"
+else
+    ok "the __EXTRA_LABELS__ marker never survives into real output (labels set)"
+fi
+if grep -q '__EXTRA_LABELS__' "$claude_submit_out"; then
+    no "the __EXTRA_LABELS__ marker never survives into real output (no labels set)" \
+        "found __EXTRA_LABELS__ in $claude_submit_out"
+else
+    ok "the __EXTRA_LABELS__ marker never survives into real output (no labels set)"
+fi
+
+# 8. K8S_RUN_LABELS supplies file-level defaults with no --label flag at all.
+run_labels_dir="$(mk_label_config 'K8S_RUN_LABELS=team=example-team,purpose=demo')"
+run_labels_out="$(newdir)/run-labels.yaml"; tmpdirs+=("$(dirname "$run_labels_out")")
+FORK_SANDBOX_CONFIG_DIR="$run_labels_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model moonshotai/kimi-k3 \
+    "$proj_dir" "$handoff_file" > "$run_labels_out" 2>/tmp/fs-k8s-test-run-labels.err
+if grep -qF 'fork-sandbox.io/team: example-team' "$run_labels_out" \
+    && grep -qF 'fork-sandbox.io/purpose: demo' "$run_labels_out"; then
+    ok "K8S_RUN_LABELS supplies file-level label defaults"
+else
+    no "K8S_RUN_LABELS supplies file-level label defaults" "not found in $run_labels_out"
+fi
+
+# 9. A --label overrides one key from K8S_RUN_LABELS while a file-only key
+# survives, and the override is announced on stderr.
+override_out="$(newdir)/override.yaml"; tmpdirs+=("$(dirname "$override_out")")
+FORK_SANDBOX_CONFIG_DIR="$run_labels_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model moonshotai/kimi-k3 --label team=override-team \
+    "$proj_dir" "$handoff_file" > "$override_out" 2>/tmp/fs-k8s-test-override.err
+if grep -qF 'fork-sandbox.io/team: override-team' "$override_out" \
+    && ! grep -qF 'fork-sandbox.io/team: example-team' "$override_out" \
+    && grep -qF 'fork-sandbox.io/purpose: demo' "$override_out"; then
+    ok "--label overrides one K8S_RUN_LABELS key while a file-only key survives"
+else
+    no "--label overrides one K8S_RUN_LABELS key while a file-only key survives" \
+        "not found in $override_out"
+fi
+if grep -qF "overrides K8S_RUN_LABELS's 'team=example-team'." /tmp/fs-k8s-test-override.err; then
+    ok "the --label override is announced on stderr"
+else
+    no "the --label override is announced on stderr" "$(cat /tmp/fs-k8s-test-override.err)"
+fi
+rm -f /tmp/fs-k8s-test-owner.err /tmp/fs-k8s-test-user-owner.err \
+    /tmp/fs-k8s-test-sanitize-owner.err /tmp/fs-k8s-test-no-owner.err \
+    /tmp/fs-k8s-test-plain-label.err /tmp/fs-k8s-test-claude-label.err \
+    /tmp/fs-k8s-test-run-labels.err /tmp/fs-k8s-test-override.err
+
+# 10. Refusals, each naming the offending entry, nothing created.
+refuses "--label with the reserved key 'app' is refused" \
+    "'app', which is reserved" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model moonshotai/kimi-k3 --label app=x \
+    "$proj_dir" "$handoff_file"
+refuses "--label with the reserved key 'fork-sandbox/branch' is refused" \
+    "'fork-sandbox/branch', which is reserved" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model moonshotai/kimi-k3 --label fork-sandbox/branch=x \
+    "$proj_dir" "$handoff_file"
+refuses "a --label entry with no '=' is refused" \
+    "has no '='" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model moonshotai/kimi-k3 --label noequals \
+    "$proj_dir" "$handoff_file"
+refuses "a --label with a space in the key is refused" \
+    "not a valid label key" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model moonshotai/kimi-k3 --label "bad key=x" \
+    "$proj_dir" "$handoff_file"
+refuses "a --label with a leading hyphen in the key is refused" \
+    "not a valid label key" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model moonshotai/kimi-k3 --label "-badkey=x" \
+    "$proj_dir" "$handoff_file"
+refuses "a --label with a space in the value is refused" \
+    "not a valid label" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model moonshotai/kimi-k3 --label "key=bad value" \
+    "$proj_dir" "$handoff_file"
+long_value="$(printf 'a%.0s' {1..70})"
+refuses "a --label value over 63 characters is refused" \
+    "not a valid label" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model moonshotai/kimi-k3 --label "key=$long_value" \
+    "$proj_dir" "$handoff_file"
+refuses "a duplicate key among --label flags on one invocation is refused" \
+    "repeats key 'dup'" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model moonshotai/kimi-k3 --label dup=1 --label dup=2 \
+    "$proj_dir" "$handoff_file"
+dup_labels_dir="$(mk_label_config 'K8S_RUN_LABELS=dup=1,dup=2')"
+refuses "a duplicate key within K8S_RUN_LABELS itself is refused" \
+    "already set earlier in K8S_RUN_LABELS" \
+    env FORK_SANDBOX_CONFIG_DIR="$dup_labels_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model moonshotai/kimi-k3 \
+    "$proj_dir" "$handoff_file"
+
+# 11. Regression: the existing selector labels are unchanged, with and
+# without owner/free-form labels set -- this is the check that matters most,
+# since app/fork-sandbox/branch gate access to a run's claude-proxy and its
+# operator access token (see k8s_validate_label_kv's own header comment).
+check "app: fork-sandbox-agent is unchanged with no labels set" 3 \
+    "$(grep -cF 'app: fork-sandbox-agent' "$submit_out")"
+check "fork-sandbox/branch is unchanged with no labels set" 3 \
+    "$(grep -cF 'fork-sandbox/branch: fork-sandbox-agent-fs-k8s-test-branch' "$submit_out")"
+check "app: fork-sandbox-agent is unchanged with owner+labels set" 3 \
+    "$(grep -cF 'app: fork-sandbox-agent' "$plain_label_out")"
+check "fork-sandbox/branch is unchanged with owner+labels set" 3 \
+    "$(grep -cF 'fork-sandbox/branch: fork-sandbox-agent-fs-k8s-test-branch' "$plain_label_out")"
+
+# 12. The load-bearing isolation property: a claude-proxy render with BOTH
+# K8S_RUN_OWNER and --label set on the same invocation must not leak either
+# into any selector/matchLabels/podSelector block -- a run whose pod could
+# carry another run's fork-sandbox/branch value would be admitted to that
+# run's proxy and could spend that operator's real Anthropic token.
+combined_dir="$(mk_label_config 'K8S_RUN_OWNER=example-team')"
+combined_out="$(newdir)/combined.yaml"; tmpdirs+=("$(dirname "$combined_out")")
+HOME="$claude_home" FORK_SANDBOX_CONFIG_DIR="$combined_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model claude-sonnet-5 --harness claude \
+    --label extra=example-value \
+    "$proj_dir" "$handoff_file" > "$combined_out" 2>/tmp/fs-k8s-test-combined.err
+selector_block="$(grep -A4 -E 'selector:|matchLabels:' "$combined_out" || true)"
+if grep -qF 'fork-sandbox/owner' <<< "$selector_block" || grep -qF 'fork-sandbox.io/' <<< "$selector_block"; then
+    no "no selector/matchLabels block leaks fork-sandbox/owner or a fork-sandbox.io/ label" \
+        "$selector_block"
+else
+    ok "no selector/matchLabels block leaks fork-sandbox/owner or a fork-sandbox.io/ label"
+fi
+rm -f /tmp/fs-k8s-test-combined.err
+
 printf '\n== no private-hostname shape anywhere in the repo ==\n'
 # Guards the public-repo leak rule (see the fork-sandbox-k8s.sh header): no
 # real hostname, cluster name or LAN address may be committed, only
