@@ -69,6 +69,14 @@
 #     message says why, since that map is written into a shell-sourced
 #     .env.sandbox; and the parser's 6-positional-argument render form
 #     still renders as before.
+#   - the parser's validate-only mode (the verb fork-sandbox
+#     validate-services routes to): exit 0 with the limits it applied
+#     printed (built-in defaults when the config's k8s.env names none of
+#     the cap keys, the k8s.env values when it does -- so a local pass is
+#     never mistaken for a guarantee under a different site's
+#     configuration), non-zero with the same field-naming message on an
+#     invalid spec, and it writes nothing; an invalid spec's message
+#     names the file the user actually gave.
 #   - fork-sandbox-k8s.sh keeps spelling its GNU tools through the
 #     resolved names fork-sandbox-lib.sh sets ($FS_STAT, $FS_REALPATH,
 #     $FS_TIMEOUT) rather than the bare names, which on macOS are the BSD
@@ -7408,6 +7416,127 @@ else
     no "sandboxEnv: DISABLE_SECURITY_PLUGIN renders into the env file" \
         "not found in render"
 fi
+
+printf '\n== per-run services: the parser validate-only mode ==\n'
+# The cluster path calls the parser with 6 positional arguments and renders
+# into an out-dir. The validate-only form (reached as `fork-sandbox
+# validate-services <file>`) takes just the file, applies the same limits
+# the cluster path would, prints which it applied, and writes nothing.
+svc_parse_py="$repo_dir/scripts/fork-sandbox-k8s-services-parse.py"
+svc_validate_dir="$(newdir)"; tmpdirs+=("$svc_validate_dir")
+printf 'version: 1\nservices:\n  - name: search\n    image: registry.example/rootless/search:1\n    port: 5601\n    env:\n      discovery.type: single-node\n' \
+    > "$svc_validate_dir/services.yaml"
+svc_val_out="$(newdir)/svc-validate.out"; tmpdirs+=("$(dirname "$svc_val_out")")
+if env FORK_SANDBOX_CONFIG_DIR="$config_dir" python3 "$svc_parse_py" \
+    "$svc_validate_dir/services.yaml" > "$svc_val_out" \
+    2>/tmp/fs-k8s-test-svc-val.err; then
+    ok "validate-only: a valid spec exits 0"
+else
+    no "validate-only: a valid spec exits 0" "$(cat /tmp/fs-k8s-test-svc-val.err)"
+fi
+if grep -qF 'valid services spec' "$svc_val_out"; then
+    ok "validate-only: success says the spec is valid"
+else
+    no "validate-only: success says the spec is valid" "$(cat "$svc_val_out")"
+fi
+# The fixture k8s.env names none of the cap keys, so the built-in defaults
+# apply -- and the output must say so, not just be silent about it.
+check "validate-only: prints the limits it applied (built-in defaults)" \
+    'K8S_SERVICES_MAX=8 (built-in default), K8S_SERVICE_MAX_CPU=1000m (built-in default), K8S_SERVICE_MAX_MEMORY=1Gi (built-in default)' \
+    "$(sed -n 's/^limits applied: //p' "$svc_val_out")"
+if [[ "$(find "$svc_validate_dir" -mindepth 1 -maxdepth 1 | wc -l)" == 1 \
+    && -f "$svc_validate_dir/services.yaml" ]]; then
+    ok "validate-only: writes no output (only the spec remains)"
+else
+    no "validate-only: writes no output (only the spec remains)" \
+        "$(find "$svc_validate_dir" -mindepth 1)"
+fi
+
+printf 'version: 1\nservices:\n  - name: db\n    image: registry.example/x:1\n    port: 80\n' \
+    > "$svc_validate_dir/invalid.yaml"
+svc_val_bad_out=""; svc_val_bad_rc=0
+svc_val_bad_out="$(env FORK_SANDBOX_CONFIG_DIR="$config_dir" python3 "$svc_parse_py" \
+    "$svc_validate_dir/invalid.yaml" 2>&1)" || svc_val_bad_rc=$?
+if (( svc_val_bad_rc != 0 )) \
+    && [[ "$svc_val_bad_out" == *"must be between 1025 and 65535, got 80"* ]]; then
+    ok "validate-only: an invalid spec fails with the field-naming message"
+else
+    no "validate-only: an invalid spec fails with the field-naming message" \
+        "rc=$svc_val_bad_rc: $svc_val_bad_out"
+fi
+if [[ "$svc_val_bad_out" == *"$svc_validate_dir/invalid.yaml"* ]]; then
+    ok "validate-only: the failure names the file the user gave"
+else
+    no "validate-only: the failure names the file the user gave" \
+        "$svc_val_bad_out"
+fi
+
+# The whole point of the mode: the limits are the site's, not a hidden
+# copy. A config whose k8s.env tightens K8S_SERVICES_MAX must tighten
+# validate-only identically, and the output must name k8s.env as the
+# source.
+svc_val_cfg_dir="$(newdir)"; tmpdirs+=("$svc_val_cfg_dir")
+printf 'K8S_SERVICES_MAX=2\nK8S_SERVICE_MAX_CPU=500m\n' > "$svc_val_cfg_dir/k8s.env"
+svc_val_cfg_out="$(newdir)/svc-validate-cfg.out"; tmpdirs+=("$(dirname "$svc_val_cfg_out")")
+printf 'version: 1\nservices:\n  - name: a\n    image: registry.example/x:1\n    port: 5432\n  - name: b\n    image: registry.example/x:1\n    port: 5433\n  - name: c\n    image: registry.example/x:1\n    port: 5434\n' \
+    > "$svc_validate_dir/three.yaml"
+svc_val_three_out=""; svc_val_three_rc=0
+svc_val_three_out="$(env FORK_SANDBOX_CONFIG_DIR="$svc_val_cfg_dir" python3 "$svc_parse_py" \
+    "$svc_validate_dir/three.yaml" 2>&1)" || svc_val_three_rc=$?
+if (( svc_val_three_rc != 0 )) \
+    && [[ "$svc_val_three_out" == *"more than the 2 allowed"* ]]; then
+    ok "validate-only: a k8s.env K8S_SERVICES_MAX=2 refuses three services"
+else
+    no "validate-only: a k8s.env K8S_SERVICES_MAX=2 refuses three services" \
+        "rc=$svc_val_three_rc: $svc_val_three_out"
+fi
+printf 'version: 1\nservices:\n  - name: a\n    image: registry.example/x:1\n    port: 5432\n  - name: b\n    image: registry.example/x:1\n    port: 5433\n' \
+    > "$svc_validate_dir/two.yaml"
+if env FORK_SANDBOX_CONFIG_DIR="$svc_val_cfg_dir" python3 "$svc_parse_py" \
+    "$svc_validate_dir/two.yaml" > "$svc_val_cfg_out" \
+    2>/tmp/fs-k8s-test-svc-val-cfg.err; then
+    ok "validate-only: two services pass under K8S_SERVICES_MAX=2"
+else
+    no "validate-only: two services pass under K8S_SERVICES_MAX=2" \
+        "$(cat /tmp/fs-k8s-test-svc-val-cfg.err)"
+fi
+if grep -qF "K8S_SERVICES_MAX=2 (from $svc_val_cfg_dir/k8s.env)" \
+        "$svc_val_cfg_out" \
+    && grep -qF "K8S_SERVICE_MAX_CPU=500m (from $svc_val_cfg_dir/k8s.env)" \
+        "$svc_val_cfg_out" \
+    && grep -qF "K8S_SERVICE_MAX_MEMORY=1Gi (built-in default)" \
+        "$svc_val_cfg_out"; then
+    ok "validate-only: names k8s.env as the source for the keys it read"
+else
+    no "validate-only: names k8s.env as the source for the keys it read" \
+        "$(cat "$svc_val_cfg_out")"
+fi
+
+# The 6-positional-argument form the cluster path uses must render exactly
+# as before, and a wrong argument count still fails with usage.
+svc_val_render_dir="$(newdir)/out"; tmpdirs+=("$(dirname "$svc_val_render_dir")")
+if python3 "$svc_parse_py" "$svc_validate_dir/services.yaml" \
+    "$svc_val_render_dir" 8 1000m 1Gi; then
+    ok "render form: 6 positional arguments still exits 0"
+else
+    no "render form: 6 positional arguments still exits 0"
+fi
+for f in containers.yaml prompt-services.txt grace; do
+    if [[ -f "$svc_val_render_dir/$f" ]]; then
+        ok "render form: $f is written"
+    else
+        no "render form: $f is written" "missing"
+    fi
+done
+if grep -qF -- '- name: discovery.type' "$svc_val_render_dir/containers.yaml"; then
+    ok "render form: the dotted env name renders"
+else
+    no "render form: the dotted env name renders" \
+        "$(cat "$svc_val_render_dir/containers.yaml")"
+fi
+svc_val_usage_rc=0
+python3 "$svc_parse_py" a b c d > /dev/null 2>&1 || svc_val_usage_rc=$?
+check "render form: a wrong argument count is refused" 1 "$svc_val_usage_rc"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))

@@ -4,6 +4,15 @@ fork-sandbox-k8s.sh.
 
 Usage: fork-sandbox-k8s-services-parse.py <file> <out-dir> <max-services>
                                            <max-cpu> <max-memory>
+       fork-sandbox-k8s-services-parse.py <file>    (validate only)
+
+The validate-only form (reached as `fork-sandbox validate-services <file>`)
+checks the spec and exits 0/1 without writing anything. It applies the same
+limits the cluster path would -- K8S_SERVICES_MAX / K8S_SERVICE_MAX_CPU /
+K8S_SERVICE_MAX_MEMORY from the site's k8s.env when available, otherwise
+the same built-in defaults -- and prints which limits it applied, so a
+passing result is never mistaken for a guarantee under a different site's
+configuration.
 
 The cluster path takes declarative data, never an executable hook: the repo
 commits this file, and the harness (not the repo) synthesizes the Job's
@@ -105,8 +114,10 @@ DupKeyLoader.add_constructor(
 )
 
 
-def fail(msg):
-    sys.stderr.write(f"Error: {SPEC_PATH}: {msg}\n")
+def fail(msg, spec_path=None):
+    if spec_path is None:
+        spec_path = SPEC_PATH
+    sys.stderr.write(f"Error: {spec_path}: {msg}\n")
     sys.exit(1)
 
 
@@ -389,13 +400,7 @@ def write_if(path, content):
 
 
 def main():
-    try:
-        with open(FILE, encoding="utf-8") as f:
-            doc = yaml.load(f, Loader=DupKeyLoader)
-    except OSError as e:
-        fail(f"unreadable: {e}")
-    except yaml.YAMLError as e:
-        fail(f"not valid YAML: {e}")
+    doc = load_doc(FILE)
 
     services, sandbox_env = parse_doc(doc)
 
@@ -411,13 +416,94 @@ def main():
     write_if(os.path.join(OUT_DIR, "grace"), "10\n" if services else "")
 
 
+def load_doc(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return yaml.load(f, Loader=DupKeyLoader)
+    except OSError as e:
+        fail(f"unreadable: {e}", spec_path=path)
+    except yaml.YAMLError as e:
+        fail(f"not valid YAML: {e}", spec_path=path)
+
+
+def read_env_key(file, key):
+    """One NAME=VALUE line from an env file, first match wins, None when
+    the file or key is absent. Mirrors fork-sandbox-k8s.sh's read_env_value:
+    the file is parsed line by line, never source'd."""
+    try:
+        with open(file, encoding="utf-8") as f:
+            lines = f.readlines()
+    except OSError:
+        return None
+    for line in lines:
+        line = line.rstrip("\n")
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith(key + "="):
+            return line.split("=", 1)[1]
+    return None
+
+
+def resolve_limits():
+    """The per-run caps, resolved the same way the cluster path resolves
+    them (fork-sandbox-k8s.sh): K8S_SERVICES_MAX / K8S_SERVICE_MAX_CPU /
+    K8S_SERVICE_MAX_MEMORY from the config's k8s.env when available,
+    otherwise the same built-in defaults. Returns the three values plus a
+    line naming which limits came from where, so a passing result is never
+    mistaken for a guarantee under a different site's configuration."""
+    config_dir = (os.environ.get("FORK_SANDBOX_CONFIG_DIR") or
+                  os.path.join(os.path.expanduser("~"),
+                               ".config", "fork-sandbox"))
+    k8s_env = os.path.join(config_dir, "k8s.env")
+    values, where = [], []
+    for key, default in (("K8S_SERVICES_MAX", "8"),
+                         ("K8S_SERVICE_MAX_CPU", "1000m"),
+                         ("K8S_SERVICE_MAX_MEMORY", "1Gi")):
+        cfg = read_env_key(k8s_env, key)
+        if cfg is not None:
+            values.append(cfg)
+            where.append(f"{key}={cfg} (from {k8s_env})")
+        else:
+            values.append(default)
+            where.append(f"{key}={default} (built-in default)")
+    return values[0], values[1], values[2], ", ".join(where)
+
+
+def validate_only():
+    """Validate-only mode (fork-sandbox validate-services <file>): checks
+    the spec under exactly the limits the cluster path would apply, and
+    prints which limits it applied. Writes nothing."""
+    global SPEC_PATH
+    # Failure messages should name the file the user actually gave, not
+    # the in-repo path the cluster path reads.
+    SPEC_PATH = FILE
+    global MAX_SERVICES, MAX_CPU, MAX_MEMORY
+    MAX_SERVICES, MAX_CPU, MAX_MEMORY, limits_line = resolve_limits()
+    try:
+        MAX_SERVICES = int(MAX_SERVICES)
+    except ValueError:
+        fail(f"K8S_SERVICES_MAX must be a positive integer, got "
+             f"'{MAX_SERVICES}'")
+    doc = load_doc(FILE)
+    parse_doc(doc)
+    sys.stdout.write(f"{FILE}: valid services spec\n")
+    sys.stdout.write(f"limits applied: {limits_line}\n")
+
+
 if __name__ == "__main__":
-    if len(sys.argv) != 6:
+    if len(sys.argv) == 2:
+        # Validate-only mode: no out-dir, no rendering.
+        FILE = sys.argv[1]
+        validate_only()
+    elif len(sys.argv) == 6:
+        FILE, OUT_DIR = sys.argv[1], sys.argv[2]
+        MAX_SERVICES = int(sys.argv[3])
+        MAX_CPU, MAX_MEMORY = sys.argv[4], sys.argv[5]
+        main()
+    else:
         sys.stderr.write(
             "Usage: fork-sandbox-k8s-services-parse.py <file> <out-dir> "
-            "<max-services> <max-cpu> <max-memory>\n")
+            "<max-services> <max-cpu> <max-memory>\n"
+            "       or: fork-sandbox-k8s-services-parse.py <file>  "
+            "(validate only: checks the spec, writes nothing)\n")
         sys.exit(1)
-    FILE, OUT_DIR = sys.argv[1], sys.argv[2]
-    MAX_SERVICES = int(sys.argv[3])
-    MAX_CPU, MAX_MEMORY = sys.argv[4], sys.argv[5]
-    main()
