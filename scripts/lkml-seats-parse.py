@@ -7,7 +7,7 @@ Usage: lkml-seats-parse.py <file> <label> <personas-dir>
 A seats file is the per-machine override for which harness/model each
 lkml-mode persona seat runs on: an optional `default` entry plus a
 `personas` mapping, each carrying only the seat facts a persona's
-frontmatter carries -- `harness`, `model` and `thinking` (see
+frontmatter carries -- `harness`, `network`, `model` and `thinking` (see
 skills/lkml-mode/SKILL.md, "Building a panel"). This script owns
 everything about the FILE -- YAML validity, the schema, and the check
 that every name under `personas` names a real
@@ -16,9 +16,11 @@ to no seat) -- and emits the result as tab-separated lines for
 lkml-seats-resolve to apply its precedence rules:
 
     default	harness	<value>             (only when the key is set)
+    default	network	<value>
     default	model	<value>
     default	thinking	<value>
     personas	<name>	harness	<value>
+    personas	<name>	network	<value>
     personas	<name>	model	<value>
     personas	<name>	thinking	<value>
 
@@ -58,7 +60,8 @@ except ImportError:
     sys.exit(1)
 
 HARNESSES = ("claude", "pi", "pi-local", "codex")
-SEAT_KEYS = ("harness", "model", "thinking")
+NETWORKS = ("pinned", "sealed")
+SEAT_KEYS = ("harness", "network", "model", "thinking")
 
 
 class DupKeyLoader(yaml.SafeLoader):
@@ -108,21 +111,28 @@ def entry(entry_doc, path):
         fail(f"{path}: expected a mapping of 'harness', 'model' and 'thinking'")
     if not entry_doc:
         fail(f"{path}: sets no key; an entry carries at least one of "
-             f"'harness', 'model' or 'thinking'")
+             f"'harness', 'network', 'model' or 'thinking'")
     set_keys = []
     for prop, value in entry_doc.items():
         ppath = f"{path}.{prop}"
         if prop not in SEAT_KEYS:
             fail(f"{ppath}: unknown key; a seats entry takes 'harness', "
-                 f"'model' and 'thinking'")
+                 f"'network', 'model' and 'thinking'")
         if prop == "harness":
             value = scalar(value, ppath)
             if value not in HARNESSES:
                 fail(f"{ppath}: takes 'claude', 'pi', 'pi-local' or 'codex', "
                      f"not '{value}'")
+        elif prop == "network":
+            value = scalar(value, ppath)
+            if value not in NETWORKS:
+                fail(f"{ppath}: takes 'pinned' or 'sealed', not '{value}'")
         else:
             scalar(value, ppath)
         set_keys.append(prop)
+    if entry_doc.get("harness") == "pi-local" and entry_doc.get("network") == "pinned":
+        fail(f"{path}: 'harness: pi-local' is already sealed; 'network' may "
+             f"only be 'sealed' or omitted in the same entry, not 'pinned'")
     return sorted(set_keys, key=SEAT_KEYS.index)
 
 

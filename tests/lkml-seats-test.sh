@@ -75,8 +75,8 @@ Local thinker.
 PERSONA
 
 # resolve_helper <seats-file | ABSENT> <persona> <fm-harness> <fm-model>
-# <fm-thinking> — call the helper with a controlled HOME and seats file,
-# capturing RES_OUT (stdout), RES_ERR (stderr) and RES_RC.
+# <fm-thinking> <fm-network> — call the helper with a controlled HOME and
+# seats file, capturing RES_OUT (stdout), RES_ERR (stderr) and RES_RC.
 resolve_helper() {
     local file="$1"
     if [[ "$file" == ABSENT ]]; then
@@ -89,20 +89,23 @@ resolve_helper() {
     RES_ERR="$(cat "$work/err")"
 }
 # fields of the resolved output (one field per line): 1=harness 2=model
-# 3=thinking 4=announce
+# 3=thinking 4=network 5=announce
 resolved_field() { printf '%s\n' "$RES_OUT" | sed -n "${2}p"; }
 
 printf '\n== no seats file: frontmatter pins verbatim (today%s behavior) ==\n' "'"
-resolve_helper ABSENT core claude opus ""
+resolve_helper ABSENT core claude opus "" ""
 check "absent file exits 0" "0" "$RES_RC"
 check "absent file resolves the frontmatter harness" "claude" "$(resolved_field RES_OUT 1)"
 check "absent file resolves the frontmatter model" "opus" "$(resolved_field RES_OUT 2)"
 check "absent file keeps the frontmatter thinking" "" "$(resolved_field RES_OUT 3)"
-check "absent file announces nothing" "" "$(resolved_field RES_OUT 4)"
+check "absent file keeps the frontmatter network" "" "$(resolved_field RES_OUT 4)"
+check "absent file announces nothing" "" "$(resolved_field RES_OUT 5)"
 check "absent file prints nothing to stderr" "" "$RES_ERR"
 
-resolve_helper ABSENT thinky pi-local "" high
+resolve_helper ABSENT thinky pi-local "" high ""
 check "absent file keeps a persona's thinking pin" "high" "$(resolved_field RES_OUT 3)"
+check "absent file expands a frontmatter pi-local to pi" "pi" "$(resolved_field RES_OUT 1)"
+check "absent file expands a frontmatter pi-local to sealed" "sealed" "$(resolved_field RES_OUT 4)"
 
 printf '\n== LKML_SEATS_FILE set to a missing path is an error ==\n'
 resolve_helper "$work/does-not-exist.yaml" core claude opus ""
