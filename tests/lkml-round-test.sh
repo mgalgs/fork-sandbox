@@ -689,8 +689,8 @@ case "$pi_submit_argv" in
     *"--model"*) no "the translated pi seat carries no model" "$pi_submit_argv" ;;
     *) ok "the translated pi seat carries no model" ;;
 esac
-contains "the same seat is still pi-local on the local path" \
-    "$(cat "$capture_dir/pi-local.argv")" "--harness pi-local"
+contains "the local path spells the seat as pi with --network sealed" \
+    "$(cat "$capture_dir/pi-local.argv")" "--harness pi --network sealed"
 core_submit_argv="$(cat "$cap_k8s/core.submit.argv")"
 contains "the core cluster submit carries the services trust ref" \
     "$core_submit_argv" "--services-trust-ref some-trusted-base"
