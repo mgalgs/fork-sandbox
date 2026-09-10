@@ -45,13 +45,23 @@
 #                        reaches a harness's local cache. Requires a model.
 #                        Governs --review-model too, when both are given.
 # --harness <name>[/<model>]:
-#                        claude (the default), pi, pi-local, or codex. A model
-#                        may follow the first slash, so a displayed
-#                        harness/model value can be pasted back in. Claude
-#                        model names are passed to its CLI, which resolves
+#                        claude (the default), pi, or codex. A model may
+#                        follow the first slash, so a displayed harness/model
+#                        value can be pasted back in. Claude model names are
+#                        passed to its CLI, which resolves
 #                        opus/sonnet/haiku/fable itself; pi model ids are also
 #                        passed through because neither has a local model list.
 #                        See below.
+# --network <pinned|sealed>:
+#                        pinned (the default) reaches the model provider over
+#                        the ordinary internet. sealed drops all network
+#                        access for the implement leg and requires a
+#                        self-hosted endpoint, which today only --harness pi
+#                        can talk to -- claude and codex are refused with
+#                        sealed. Chosen independently of --harness: it is a
+#                        separate flag, not derived from the harness name.
+#                        --harness pi-local is a permanent alias for
+#                        --harness pi --network sealed.
 # --dry-run:             resolve and print the harness and model, then exit
 #                        without creating a clone, run directory or session.
 # --claude-args "...":   extra arguments passed verbatim to the claude CLI
@@ -152,8 +162,8 @@
 #                        run directory carries no file at all.
 # --sandbox-args "...":  extra arguments passed to claude-sandboxed itself.
 #                        Only --unpin-egress is accepted. Refused outright
-#                        with --harness pi-local, which is sealed and so has
-#                        no egress to unpin.
+#                        with --network sealed, which has no egress to
+#                        unpin.
 # --context-ro <dir>:    bind <dir> read-only into the sandbox as gathered
 #                        context. The directory must live under
 #                        /var/tmp/claude-scratch/forks/ — a staging path a
@@ -1269,6 +1279,7 @@ k8s_endpoint_given=false
 outbox_max_arg=""
 network_arg="pinned"
 network_given=false
+harness_alias_pi_local=false
 
 while [[ "${1:-}" == -* ]]; do
     case "$1" in
@@ -1886,6 +1897,7 @@ fi
 if [[ "$harness" == "pi-local" ]]; then
     harness="pi"
     network_arg="sealed"
+    harness_alias_pi_local=true
 fi
 
 case "$harness" in
@@ -2270,7 +2282,11 @@ if [[ "$k8s_mode" == true ]]; then
     # not cover and that this round does not build a cluster-sealed
     # counterpart for.
     if [[ "$network" == "sealed" ]]; then
-        echo "Error: --network sealed is not supported with --k8s. A" >&2
+        if [[ "$harness_alias_pi_local" == true ]]; then
+            echo "Error: --harness pi-local is not supported with --k8s. A" >&2
+        else
+            echo "Error: --network sealed is not supported with --k8s. A" >&2
+        fi
         echo "cluster pod still reaches the in-cluster model proxy, so" >&2
         echo "\"sealed\" would be a false claim there -- cluster isolation" >&2
         echo "is enforced by NetworkPolicy instead, a separate axis this" >&2
@@ -3295,8 +3311,9 @@ pi-local)
     # config file: it names the model, and there is no flag here that can
     # carry an endpoint.
     if [[ ! -f "$config_dir/model.env" ]]; then
-        echo "Error: --harness pi-local needs an endpoint to talk to. It is a" >&2
-        echo "fact about this machine's network, so it lives in a config file:" >&2
+        echo "Error: harness pi with network sealed needs an endpoint to" >&2
+        echo "talk to. It is a fact about this machine's network, so it" >&2
+        echo "lives in a config file:" >&2
         echo "  mkdir -p $config_dir" >&2
         echo "  echo 'MODEL_ENDPOINT=http://your-host:8001/v1' > $config_dir/model.env" >&2
         exit 1

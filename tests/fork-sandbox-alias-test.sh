@@ -265,5 +265,38 @@ case "$(cat "$err")" in
     *) no "missing model cache warns that validation was skipped" "$(cat "$err")" ;;
 esac
 
+printf '\n== --network header and message staleness ==\n'
+
+help_out="$("$launcher" --help 2>/dev/null)"
+if [[ "$help_out" == *'--network <pinned|sealed>:'* ]]; then
+    ok "--help documents --network"
+else
+    no "--help documents --network" "$help_out"
+fi
+
+if "$launcher" --dry-run --harness pi-local --k8s \
+    unused-project unused-handoff > /dev/null 2>"$err"; then
+    no "--k8s refuses --harness pi-local"
+else
+    case "$(cat "$err")" in
+        *"--harness pi-local is not supported with --k8s"*)
+            ok "--k8s refusal names the pi-local alias when typed" ;;
+        *) no "--k8s refusal names the pi-local alias when typed" \
+            "$(cat "$err")" ;;
+    esac
+fi
+
+if "$launcher" --dry-run --harness pi --network sealed --k8s \
+    unused-project unused-handoff > /dev/null 2>"$err"; then
+    no "--k8s refuses --network sealed"
+else
+    case "$(cat "$err")" in
+        *"--network sealed is not supported with --k8s"*)
+            ok "--k8s refusal names --network sealed when typed directly" ;;
+        *) no "--k8s refusal names --network sealed when typed directly" \
+            "$(cat "$err")" ;;
+    esac
+fi
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))
