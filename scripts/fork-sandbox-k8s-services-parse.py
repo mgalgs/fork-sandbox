@@ -121,20 +121,23 @@ def fail(msg, spec_path=None):
     sys.exit(1)
 
 
-def text_field(value, path, yaml_safe=True):
+def text_field(value, path, yaml_safe=True, spec_path=None):
     """A string-ish scalar. Every value the harness later embeds in the
     rendered Job's YAML is double-quoted, so yaml_safe values additionally
     refuse the characters that would let one break out of that quoting or
     corrupt a KEY=VALUE line in .env.sandbox."""
     if isinstance(value, bool) or not isinstance(value, (str, int, float)):
-        fail(f"{path}: expected a string, got {type(value).__name__}")
+        fail(f"{path}: expected a string, got {type(value).__name__}",
+             spec_path=spec_path)
     value = str(value)
     if not value:
-        fail(f"{path}: empty value")
+        fail(f"{path}: empty value", spec_path=spec_path)
     if "\t" in value or "\n" in value:
-        fail(f"{path}: value may not contain tabs or newlines")
+        fail(f"{path}: value may not contain tabs or newlines",
+             spec_path=spec_path)
     if yaml_safe and ("'" in value or '"' in value or "\\" in value):
-        fail(f"{path}: value may not contain a quote or a backslash")
+        fail(f"{path}: value may not contain a quote or a backslash",
+             spec_path=spec_path)
     return value
 
 
@@ -146,13 +149,14 @@ def positive_int(value, path, lo=None, hi=None):
     return value
 
 
-def parse_cpu(value, path):
-    value = text_field(value, path)
+def parse_cpu(value, path, spec_path=None):
+    value = text_field(value, path, spec_path=spec_path)
     if re.fullmatch(r"[0-9]+m", value):
         return int(value[:-1])
     if re.fullmatch(r"[0-9]+(\.[0-9]+)?", value):
         return int(float(value) * 1000)
-    fail(f"{path}: not a valid CPU quantity, e.g. '500m' or '1'")
+    fail(f"{path}: not a valid CPU quantity, e.g. '500m' or '1'",
+         spec_path=spec_path)
 
 
 MEMORY_RE = re.compile(r"^([0-9]+)(Ki|Mi|Gi|Ti|K|M|G|T)?$")
@@ -163,11 +167,12 @@ MEMORY_MULT = {
 }
 
 
-def parse_memory(value, path):
-    value = text_field(value, path)
+def parse_memory(value, path, spec_path=None):
+    value = text_field(value, path, spec_path=spec_path)
     m = MEMORY_RE.fullmatch(value)
     if not m:
-        fail(f"{path}: not a valid memory quantity, e.g. '512Mi' or '1Gi'")
+        fail(f"{path}: not a valid memory quantity, e.g. '512Mi' or '1Gi'",
+             spec_path=spec_path)
     return int(m.group(1)) * MEMORY_MULT[m.group(2)]
 
 
@@ -431,7 +436,11 @@ def read_env_key(file, key):
     the file or key is absent. Mirrors fork-sandbox-k8s.sh's read_env_value:
     the file is parsed line by line, never source'd."""
     try:
-        with open(file, encoding="utf-8") as f:
+        # newline="\n": no universal-newlines translation. The bash side's
+        # read -r keeps a trailing \r in the value on a CRLF file, so this
+        # side must too -- a cap it rejects there is a k8s.env error here,
+        # not a silently cleaned-up value validate-only would pass under.
+        with open(file, encoding="utf-8", newline="\n") as f:
             lines = f.readlines()
     except OSError:
         return None
@@ -457,22 +466,26 @@ def resolve_limits():
     """The per-run caps, resolved the same way the cluster path resolves
     them (fork-sandbox-k8s.sh): K8S_SERVICES_MAX / K8S_SERVICE_MAX_CPU /
     K8S_SERVICE_MAX_MEMORY from the config's k8s.env when available,
-    otherwise the same built-in defaults. Returns the three values plus a
+    otherwise the same built-in defaults. Returns the three values, a flag
+    per value saying whether it came from the config's k8s.env (so a
+    malformed one can be blamed on the config file, not the spec), plus a
     line naming which limits came from where, so a passing result is never
     mistaken for a guarantee under a different site's configuration."""
     k8s_env = k8s_env_path()
-    values, where = [], []
+    values, from_cfg, where = [], [], []
     for key, default in (("K8S_SERVICES_MAX", "8"),
                          ("K8S_SERVICE_MAX_CPU", "1000m"),
                          ("K8S_SERVICE_MAX_MEMORY", "1Gi")):
         cfg = read_env_key(k8s_env, key)
         if cfg:  # empty value == unset, the way ${VAR:-default} treats it
             values.append(cfg)
+            from_cfg.append(True)
             where.append(f"{key}={cfg} (from {k8s_env})")
         else:
             values.append(default)
+            from_cfg.append(False)
             where.append(f"{key}={default} (built-in default)")
-    return values[0], values[1], values[2], ", ".join(where)
+    return values[0], values[1], values[2], from_cfg, ", ".join(where)
 
 
 def validate_only():
@@ -484,7 +497,7 @@ def validate_only():
     # the in-repo path the cluster path reads.
     SPEC_PATH = FILE
     global MAX_SERVICES, MAX_CPU, MAX_MEMORY
-    MAX_SERVICES, MAX_CPU, MAX_MEMORY, limits_line = resolve_limits()
+    MAX_SERVICES, MAX_CPU, MAX_MEMORY, from_cfg, limits_line = resolve_limits()
     # The cluster path (fork-sandbox-k8s.sh) validates this key against
     # ^[0-9]+$ at config load, so a shape it rejects there is a k8s.env
     # error, not a spec error: check the string with the same pattern
@@ -494,6 +507,15 @@ def validate_only():
         fail(f"K8S_SERVICES_MAX must be a positive integer, got "
              f"'{MAX_SERVICES}'", spec_path=k8s_env_path())
     MAX_SERVICES = int(MAX_SERVICES)
+    # The other two caps are checked inside parse_doc, which names the
+    # spec file. When one of them came from k8s.env, the config file is
+    # what is wrong, not the spec: pre-check it here with the config file
+    # named, the same attribution the K8S_SERVICES_MAX check above does.
+    if from_cfg[1]:
+        parse_cpu(MAX_CPU, "K8S_SERVICE_MAX_CPU", spec_path=k8s_env_path())
+    if from_cfg[2]:
+        parse_memory(MAX_MEMORY, "K8S_SERVICE_MAX_MEMORY",
+                     spec_path=k8s_env_path())
     doc = load_doc(FILE)
     parse_doc(doc)
     sys.stdout.write(f"{FILE}: valid services spec\n")

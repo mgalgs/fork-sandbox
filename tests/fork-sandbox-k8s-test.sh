@@ -7561,6 +7561,62 @@ else
         "$(cat "$svc_val_empty_out")"
 fi
 
+# The parser must see the same bytes the bash side's read_env_value sees:
+# read -r keeps a trailing \r on a CRLF line, so a cap key written with
+# CRLF endings is a k8s.env error the cluster path refuses at config load,
+# not a silently cleaned-up value validate-only would pass under.
+printf 'K8S_SERVICES_MAX=2\r\n' > "$svc_val_cfg_bad/k8s.env"
+svc_val_crlf_out=""; svc_val_crlf_rc=0
+svc_val_crlf_out="$(env FORK_SANDBOX_CONFIG_DIR="$svc_val_cfg_bad" python3 "$svc_parse_py" \
+    "$svc_validate_dir/services.yaml" 2>&1)" || svc_val_crlf_rc=$?
+if (( svc_val_crlf_rc != 0 )) \
+    && [[ "$svc_val_crlf_out" == *"K8S_SERVICES_MAX must be a positive integer"* \
+    && "$svc_val_crlf_out" == *"$svc_val_cfg_bad/k8s.env"* \
+    && "$svc_val_crlf_out" != *"valid services spec"* ]]; then
+    ok "validate-only: a CRLF cap key in k8s.env is refused like the cluster path"
+else
+    no "validate-only: a CRLF cap key in k8s.env is refused like the cluster path" \
+        "rc=$svc_val_crlf_rc: $svc_val_crlf_out"
+fi
+# The refusal is about the \r inside a value, not CRLF files wholesale: a
+# CRLF file naming no cap key still validates under the built-in defaults.
+printf 'K8S_CONTEXT=ctx\r\nK8S_NAMESPACE=ns\r\n' > "$svc_val_cfg_bad/k8s.env"
+if env FORK_SANDBOX_CONFIG_DIR="$svc_val_cfg_bad" python3 "$svc_parse_py" \
+    "$svc_validate_dir/services.yaml" > /dev/null 2>&1; then
+    ok "validate-only: a CRLF k8s.env naming no cap key still passes"
+else
+    no "validate-only: a CRLF k8s.env naming no cap key still passes"
+fi
+# A malformed cap from k8s.env is a config error, not a spec error -- the
+# same attribution the K8S_SERVICES_MAX check above gets, applied to the
+# other two keys resolve_limits reads.
+printf 'K8S_SERVICE_MAX_CPU=abc\n' > "$svc_val_cfg_bad/k8s.env"
+svc_val_badcpu_out=""; svc_val_badcpu_rc=0
+svc_val_badcpu_out="$(env FORK_SANDBOX_CONFIG_DIR="$svc_val_cfg_bad" python3 "$svc_parse_py" \
+    "$svc_validate_dir/services.yaml" 2>&1)" || svc_val_badcpu_rc=$?
+if (( svc_val_badcpu_rc != 0 )) \
+    && [[ "$svc_val_badcpu_out" == *"K8S_SERVICE_MAX_CPU: not a valid CPU quantity"* \
+    && "$svc_val_badcpu_out" == *"$svc_val_cfg_bad/k8s.env"* \
+    && "$svc_val_badcpu_out" != *"services.yaml"* ]]; then
+    ok "validate-only: a malformed K8S_SERVICE_MAX_CPU names k8s.env, not the spec"
+else
+    no "validate-only: a malformed K8S_SERVICE_MAX_CPU names k8s.env, not the spec" \
+        "rc=$svc_val_badcpu_rc: $svc_val_badcpu_out"
+fi
+printf 'K8S_SERVICE_MAX_MEMORY=xyz\n' > "$svc_val_cfg_bad/k8s.env"
+svc_val_badmem_out=""; svc_val_badmem_rc=0
+svc_val_badmem_out="$(env FORK_SANDBOX_CONFIG_DIR="$svc_val_cfg_bad" python3 "$svc_parse_py" \
+    "$svc_validate_dir/services.yaml" 2>&1)" || svc_val_badmem_rc=$?
+if (( svc_val_badmem_rc != 0 )) \
+    && [[ "$svc_val_badmem_out" == *"K8S_SERVICE_MAX_MEMORY: not a valid memory quantity"* \
+    && "$svc_val_badmem_out" == *"$svc_val_cfg_bad/k8s.env"* \
+    && "$svc_val_badmem_out" != *"services.yaml"* ]]; then
+    ok "validate-only: a malformed K8S_SERVICE_MAX_MEMORY names k8s.env, not the spec"
+else
+    no "validate-only: a malformed K8S_SERVICE_MAX_MEMORY names k8s.env, not the spec" \
+        "rc=$svc_val_badmem_rc: $svc_val_badmem_out"
+fi
+
 # The 6-positional-argument form the cluster path uses must render exactly
 # as before, and a wrong argument count still fails with usage.
 svc_val_render_dir="$(newdir)/out"; tmpdirs+=("$(dirname "$svc_val_render_dir")")
