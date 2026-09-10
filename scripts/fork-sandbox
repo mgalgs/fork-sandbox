@@ -7,6 +7,7 @@
 #        fork-sandbox k8s <sub-verb> [options]
 #        fork-sandbox log <sub-verb> [options]
 #        fork-sandbox configure [options]
+#        fork-sandbox validate-services <file>
 #
 # Each verb routes to the script that implements it, and every one of those
 # scripts stays installed and callable under its own name:
@@ -17,6 +18,7 @@
 #   k8s        fork-sandbox-k8s.sh
 #   log        sandbox-run-log.py
 #   configure  fork-sandbox.sh configure
+#   validate-services  fork-sandbox-k8s-services-parse.py
 #
 # The dispatcher parses nothing of its own beyond a leading -h/--help, so a
 # --help after a verb reaches that verb's script and the sub-verbs of k8s
@@ -64,9 +66,12 @@ case "$verb" in
     log)
         target='sandbox-run-log.py'
         ;;
+    validate-services)
+        target='fork-sandbox-k8s-services-parse.py'
+        ;;
     *)
         printf "fork-sandbox: unknown verb '%s'\n" "$verb" >&2
-        printf '%s\n' 'Verbs: run status say configure k8s log' >&2
+        printf '%s\n' 'Verbs: run status say configure k8s log validate-services' >&2
         printf '%s\n' "Try 'fork-sandbox --help'." >&2
         exit 2
         ;;

@@ -2,6 +2,17 @@
 # fork-sandbox-dispatcher-test.sh — Exercise the git-style fork-sandbox router
 #
 # Usage: tests/fork-sandbox-dispatcher-test.sh
+#
+# It covers:
+#   - every verb routes to its implementing script with its arguments
+#     passed through unchanged, including option order, spaces, and empty
+#     arguments.
+#   - a leading -h/--help prints the usage (which names every verb) and a
+#     -h/--help after a verb reaches the verb's own script.
+#   - no arguments, and an unknown verb, both exit 2 with the usage or the
+#     full verb list on stderr -- the list names every verb.
+#   - a target's exit code propagates, and a missing target fails with a
+#     message naming the script.
 
 set -uo pipefail
 
@@ -38,7 +49,7 @@ cp "$dispatcher" "$tmp/fork-sandbox"
 chmod +x "$tmp/fork-sandbox"
 
 for target in fork-sandbox.sh fork-sandbox-status.sh fork-sandbox-say.sh \
-    fork-sandbox-k8s.sh sandbox-run-log.py; do
+    fork-sandbox-k8s.sh sandbox-run-log.py fork-sandbox-k8s-services-parse.py; do
     cat > "$tmp/$target" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "${0##*/}"
@@ -81,13 +92,17 @@ run_case 'k8s sub-verb passes through' \
     k8s submit --branch x proj handoff
 run_case 'log passes arguments' $'sandbox-run-log.py\nlist\n--days\n14' \
     log list --days 14
+run_case 'validate-services passes the file through' \
+    $'fork-sandbox-k8s-services-parse.py\n.agents/sandbox-services/services.yaml' \
+    validate-services .agents/sandbox-services/services.yaml
 run_case 'configure prepends configure' $'fork-sandbox.sh\nconfigure\n--dry-run' \
     configure --dry-run
 run_case 'help after verb reaches target' $'fork-sandbox.sh\n--help' run --help
 
 help="$("$tmp"/fork-sandbox --help)"
 if [[ "$help" == *'run'* && "$help" == *'status'* && "$help" == *'say'* &&
-    "$help" == *'configure'* && "$help" == *'k8s'* && "$help" == *'log'* ]]; then
+    "$help" == *'configure'* && "$help" == *'k8s'* && "$help" == *'log'* &&
+    "$help" == *'validate-services'* ]]; then
     ok '--help names all verbs'
 else
     no '--help names all verbs' "$help"
@@ -115,6 +130,12 @@ if grep -Fq "unknown verb 'frobnicate'" "$tmp/unknown-err"; then
     ok 'unknown verb names offender'
 else
     no 'unknown verb names offender' "$(cat "$tmp/unknown-err")"
+fi
+if grep -qF 'Verbs: run status say configure k8s log validate-services' \
+        "$tmp/unknown-err"; then
+    ok 'unknown verb lists every verb'
+else
+    no 'unknown verb lists every verb' "$(cat "$tmp/unknown-err")"
 fi
 
 printf '#!/usr/bin/env bash\nexit 3\n' > "$tmp/fork-sandbox.sh"
