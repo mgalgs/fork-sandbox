@@ -118,6 +118,29 @@ out="$("$repo_dir/scripts/sandbox-backend-container" --capabilities 2>&1)"
 lacks "--capabilities needs no other option" "Error" "$out"
 
 echo ""
+echo "== claude-sandboxed remapped writable bind pass-through =="
+
+capture_backend="$scratch/sandbox-backend-capture"
+cat > "$capture_backend" <<'BACKEND'
+#!/usr/bin/env bash
+if [[ "${1:-}" == --capabilities ]]; then
+    printf 'toolchain=host\n'
+    exit 0
+fi
+printf '%s\n' "$@"
+BACKEND
+chmod 755 "$capture_backend"
+rw_src="$scratch/codex-sessions"
+rw_dest="$HOME/.codex/sessions"
+rw_work="$scratch/remap-work"
+mkdir -p "$rw_src" "$rw_work"
+out="$(PATH="$scratch:$PATH" FORK_SANDBOX_BACKEND=capture \
+    "$repo_dir/scripts/claude-sandboxed" --exec --seal-egress \
+    --bind-rw-at "$rw_src" "$rw_dest" "$rw_work" /bin/true)"
+contains "--bind-rw-at reaches the selected backend" \
+    $'--bind-rw-at\n'"$rw_src"$'\n'"$rw_dest" "$out"
+
+echo ""
 echo "== fs_backend_capabilities =="
 
 bin="$(fake_backend host-decl 'echo toolchain=host')"
@@ -338,6 +361,7 @@ echo "== fs_read_claude_credential =="
 # every assertion below would compare against it, and a failure message would
 # print it. Point the lookup at a service that cannot exist instead. That keeps
 # the cases running on every platform AND keeps a live token out of them.
+# shellcheck disable=SC2034  # read by fs_read_claude_credential after this test sources the library
 FS_CLAUDE_KEYCHAIN_SERVICES=("fork-sandbox-test-service-that-does-not-exist")
 
 cred_home="$scratch/cred-home"

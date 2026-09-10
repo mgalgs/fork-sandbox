@@ -66,6 +66,14 @@ contains() {
     esac
 }
 
+lacks() {
+    local label="$1" needle="$2" hay="$3"
+    case "$hay" in
+        *"$needle"*) no "$label" "did not expect '$needle' in: $hay" ;;
+        *) ok "$label" ;;
+    esac
+}
+
 tmp="$(mktemp -d)"
 tmpdirs+=("$tmp")
 export FORK_SANDBOX_CONFIG_DIR="$tmp/config"
@@ -307,6 +315,9 @@ real_cfg="$(mktemp -d)"; tmpdirs+=("$real_cfg")
 install -m 600 /dev/null "$real_cfg/pi.env"
 printf 'OPENROUTER_API_KEY=fake\n' > "$real_cfg/pi.env"
 printf 'MODEL_ENDPOINT=http://localhost:1/v1\n' > "$real_cfg/model.env"
+real_codex_home="$(mktemp -d)"; tmpdirs+=("$real_codex_home")
+printf '{"tokens":{"access_token":"e30.eyJleHAiOjQxMDI0NDQ4MDB9.sig","refresh_token":"fixture"}}\n' \
+    > "$real_codex_home/auth.json"
 
 new_project() {
     local d
@@ -332,6 +343,7 @@ printf 'do the task\n' > "$handoff"
 run_real() {
     local out rc rd
     out="$(PATH="$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$real_cfg" \
+        CODEX_HOME="$real_codex_home" \
         FORK_SANDBOX_BACKEND=fake-image \
         timeout 60 "$launcher" --foreground "$@" "$proj" "$handoff" 2>&1)"
     rc=$?
@@ -380,6 +392,23 @@ if [[ -n "$rd_p" ]]; then
         "/agent-sandboxed " "$mnt_line"
     contains "a pi-local maintainer command carries its own model" \
         "--model some-local-model" "$mnt_line"
+fi
+
+# A named Codex maintainer gets the rollout-log mount, while the Claude
+# implement leg stays free of Codex state.
+rd_c="$(run_real --harness claude --maintainer-loop 1 \
+    --maintainer-harness codex --maintainer-model fixture-model)" \
+    && tmpdirs+=("$rd_c")
+if [[ -n "$rd_c" ]]; then
+    impl_line="$(grep '^sandbox_cmd=' "$rd_c/run.sh")"
+    mnt_line="$(grep '^maintainer_sandbox_cmd=' "$rd_c/run.sh")"
+    lacks "a claude implement command has no Codex maintainer mount" \
+        "codex-sessions" "$impl_line"
+    contains "a Codex maintainer mounts its per-run sessions directory" \
+        "--bind-rw-at $rd_c/codex-sessions $HOME/.codex/sessions" "$mnt_line"
+else
+    no "a run with a Codex maintainer produced a run directory" \
+        "run_real failed"
 fi
 
 # The operator-inbox hook: installed for every claude leg the run has, and

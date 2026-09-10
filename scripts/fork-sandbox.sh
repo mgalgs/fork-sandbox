@@ -3702,14 +3702,15 @@ fi
 
 fs_warn_if_dirty "$project_path" "$origin_repo"
 
-# Everything about this run lives under one directory. The clone sits inside
-# it, and only the clone is bind-mounted into the sandbox, so the log, the
-# handoff and the summary are all out of the sandbox's reach.
+# Everything about this run lives under one directory. The clone and narrow,
+# purpose-built inbox, outbox, and Codex-session subdirectories are the only
+# pieces mounted into a sandbox; the log, handoff, summary, and directory as a
+# whole stay out of its reach.
 run_dir="$(mktemp -d /var/tmp/claude-scratch/forks/claude-fork-sandbox.XXXXXX)"
 fs_reject_unsafe_chars "$run_dir"
 # The task metadata rides beside the run, where sandbox-run-log.py picks it
-# up at the end. The run dir is never bound into the sandbox, so the session
-# cannot see or edit it.
+# up at the end. The run dir as a whole is never bound into the sandbox, so
+# the session cannot see or edit this file.
 if [[ -n "$task_meta" ]]; then
     printf '%s\n' "$task_meta" > "$run_dir/task-meta.json"
 fi
@@ -4101,6 +4102,24 @@ mkdir -p "$outbox_dir"
 chmod 755 "$outbox_dir"
 fs_reject_unsafe_chars "$outbox_dir"
 
+# Codex writes account quota snapshots only to its private rollout logs; its
+# --json stdout carries token counts but omits rate limits. Preserve the
+# narrow sessions subtree in this run's own record so a host-side reader can
+# observe those snapshots while the run is live. Never bind the user's real
+# ~/.codex: it also holds the credential and unrelated interactive history.
+codex_sessions_dir=""
+for leg_harness in "$harness" "$review_harness" "$maintainer_harness" \
+                   "$fix_harness" "$mntfix_harness"; do
+    if [[ "$leg_harness" == codex ]]; then
+        codex_sessions_dir="$run_dir/codex-sessions"
+        mkdir -p "$codex_sessions_dir"
+        chmod 700 "$codex_sessions_dir"
+        fs_reject_unsafe_chars "$codex_sessions_dir"
+        break
+    fi
+done
+unset leg_harness
+
 refresh_config=""
 if (( refresh_enabled )); then
     # The hook's own settings, in the same inbox-dotfile trick .settings.json
@@ -4476,6 +4495,9 @@ fs_build_sandbox_cmd() {
     # The artifact outbox: writable, bound on every run -- see the comment
     # where it is created, above.
     out+=(--bind-rw "$outbox_dir")
+    if [[ "$b_harness" == codex ]]; then
+        out+=(--bind-rw-at "$codex_sessions_dir" "$HOME/.codex/sessions")
+    fi
     if [[ -n "$sandbox_args" ]]; then
         # Deliberate word splitting: the caller passes a flag string.
         # shellcheck disable=SC2206

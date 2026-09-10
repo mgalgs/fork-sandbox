@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run claude in a sandbox, provisioned with a throwaway copy of its credential.
 #
-# Usage: claude-sandboxed [--unpin-egress | --seal-egress] [--bind-ro PATH]... [--bind-rw PATH]... [--bind-ro-at SRC DEST]... [--prepend-path DIR]... [--env-file FILE] [--exec] [work-dir] [claude-args... | CMD ARG...]
+# Usage: claude-sandboxed [--unpin-egress | --seal-egress] [--bind-ro PATH]... [--bind-rw PATH]... [--bind-ro-at SRC DEST]... [--bind-rw-at SRC DEST]... [--prepend-path DIR]... [--env-file FILE] [--exec] [work-dir] [claude-args... | CMD ARG...]
 #
 # This is the Claude client of the sandbox backend. The isolation itself —
 # the mount allowlist, the network namespace, the egress pin, the seal — is
@@ -53,6 +53,11 @@
 # which the bind then re-protects read-only. It exists so a directory the
 # sandbox needs under the work dir — a provisioned virtualenv, say — can be
 # served read-only from elsewhere on the host.
+#
+# --bind-rw-at SRC DEST is its writable counterpart. SRC is checked with the
+# same refusal rules as --bind-rw; DEST must be absolute. It is for isolated,
+# caller-created state that a command expects at a fixed path under its
+# otherwise ephemeral home.
 #
 # --prepend-path puts DIR at the front of the sandbox PATH. Repeat it for
 # more; later flags end up earlier on PATH. It changes lookup order only —
@@ -162,6 +167,8 @@ BIND_RO=()
 BIND_RW=()
 BIND_RO_AT_SRC=()
 BIND_RO_AT_DEST=()
+BIND_RW_AT_SRC=()
+BIND_RW_AT_DEST=()
 PREPEND_PATH=()
 EXEC_MODE=0
 ENV_FILE=""
@@ -185,6 +192,11 @@ while [[ $# -gt 0 ]]; do
         --bind-ro-at)
             BIND_RO_AT_SRC+=("${2:?--bind-ro-at requires a source path}")
             BIND_RO_AT_DEST+=("${3:?--bind-ro-at requires a destination path}")
+            shift 3
+            ;;
+        --bind-rw-at)
+            BIND_RW_AT_SRC+=("${2:?--bind-rw-at requires a source path}")
+            BIND_RW_AT_DEST+=("${3:?--bind-rw-at requires a destination path}")
             shift 3
             ;;
         --prepend-path)
@@ -510,6 +522,9 @@ for d in "${BIND_RW[@]}"; do
 done
 for i in "${!BIND_RO_AT_SRC[@]}"; do
     BACKEND_ARGS+=(--bind-ro-at "${BIND_RO_AT_SRC[$i]}" "${BIND_RO_AT_DEST[$i]}")
+done
+for i in "${!BIND_RW_AT_SRC[@]}"; do
+    BACKEND_ARGS+=(--bind-rw-at "${BIND_RW_AT_SRC[$i]}" "${BIND_RW_AT_DEST[$i]}")
 done
 for d in "${PREPEND_PATH[@]}"; do
     BACKEND_ARGS+=(--prepend-path "$d")

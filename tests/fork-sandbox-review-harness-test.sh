@@ -52,6 +52,14 @@ contains() {
     esac
 }
 
+lacks() {
+    local label="$1" needle="$2" hay="$3"
+    case "$hay" in
+        *"$needle"*) no "$label" "did not expect '$needle' in: $hay" ;;
+        *) ok "$label" ;;
+    esac
+}
+
 tmp="$(mktemp -d)"
 tmpdirs+=("$tmp")
 export FORK_SANDBOX_CONFIG_DIR="$tmp/config"
@@ -352,6 +360,9 @@ real_cfg="$(mktemp -d)"; tmpdirs+=("$real_cfg")
 install -m 600 /dev/null "$real_cfg/pi.env"
 printf 'OPENROUTER_API_KEY=fake\n' > "$real_cfg/pi.env"
 printf 'MODEL_ENDPOINT=http://localhost:1/v1\n' > "$real_cfg/model.env"
+real_codex_home="$(mktemp -d)"; tmpdirs+=("$real_codex_home")
+printf '{"tokens":{"access_token":"e30.eyJleHAiOjQxMDI0NDQ4MDB9.sig","refresh_token":"fixture"}}\n' \
+    > "$real_codex_home/auth.json"
 
 review_only_stub="$(mktemp -d /var/tmp/claude-scratch/fs-review-only-stub.XXXXXX)"
 tmpdirs+=("$review_only_stub")
@@ -558,6 +569,7 @@ fi
 run_real() {
     local out rc rd
     out="$(PATH="$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$real_cfg" \
+        CODEX_HOME="$real_codex_home" \
         FORK_SANDBOX_BACKEND=fake-image \
         timeout 60 "$launcher" --foreground "$@" "$proj" "$handoff" 2>&1)"
     rc=$?
@@ -621,6 +633,10 @@ if [[ -n "$rd7" ]]; then
         "$clone_dir7" "$sandbox_line"
     contains "the review command names the same clone dir" \
         "$clone_dir7" "$review_line"
+    lacks "a claude implement leg has no Codex sessions mount" \
+        "codex-sessions" "$sandbox_line"
+    lacks "a pi-local review leg has no Codex sessions mount" \
+        "codex-sessions" "$review_line"
 else
     no "run_real produced a run directory for the claude/pi-local pair" "run_real failed"
 fi
@@ -651,6 +667,41 @@ if [[ -n "$rd8" ]]; then
         "--settings" "$review_line8"
 else
     no "run_real produced a run directory for the pi/claude pair" "run_real failed"
+fi
+
+# A Codex implement leg persists its rollout logs in the run directory. A
+# named Codex review leg gets the same mount without adding it to a non-Codex
+# implement command.
+rd_codex_impl="$(run_real --harness codex)"
+if [[ -n "$rd_codex_impl" ]]; then
+    tmpdirs+=("$rd_codex_impl")
+    sandbox_codex_impl="$(grep '^sandbox_cmd=' "$rd_codex_impl/run.sh")"
+    contains "a Codex implement leg mounts its per-run sessions directory" \
+        "--bind-rw-at $rd_codex_impl/codex-sessions $HOME/.codex/sessions" \
+        "$sandbox_codex_impl"
+    if [[ -d "$rd_codex_impl/codex-sessions" ]]; then
+        ok "a Codex implement run creates its sessions directory"
+    else
+        no "a Codex implement run creates its sessions directory"
+    fi
+else
+    no "run_real produced a run directory for Codex" "run_real failed"
+fi
+
+rd_codex_review="$(run_real --harness claude --review-loop 1 \
+    --review-harness codex)"
+if [[ -n "$rd_codex_review" ]]; then
+    tmpdirs+=("$rd_codex_review")
+    sandbox_codex_review="$(grep '^sandbox_cmd=' "$rd_codex_review/run.sh")"
+    review_codex_review="$(grep '^review_sandbox_cmd=' "$rd_codex_review/run.sh")"
+    lacks "a claude implement command does not inherit its Codex review mount" \
+        "codex-sessions" "$sandbox_codex_review"
+    contains "a named Codex review leg mounts its per-run sessions directory" \
+        "--bind-rw-at $rd_codex_review/codex-sessions $HOME/.codex/sessions" \
+        "$review_codex_review"
+else
+    no "run_real produced a run directory for a Codex review leg" \
+        "run_real failed"
 fi
 
 # 9. --harness pi-local, --review-harness pi/some-model: the pair check 4

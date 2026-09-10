@@ -551,8 +551,9 @@ One method note: the pod stages the `code-review-portable` skill only for `--rev
 
 ## Where everything lives
 
-The run directory holds the whole run. The sandbox cannot see it — only the
-clone inside it is mounted, and the log is written by the host shell.
+The run directory holds the whole run. The sandbox cannot see it as a whole;
+only the purpose-built clone, inbox, outbox, and harness session subdirectories
+described below are mounted. The log is written by the host shell.
 
 | Path | What it is |
 |------|------------|
@@ -575,7 +576,8 @@ clone inside it is mounted, and the log is written by the host shell.
 | `<run-dir>/inbox-delivered/leg-<N>/` (non-`--k8s` only) | addenda delivered to leg `N` (the implement leg is 1; continuation, review and fix legs continue the count), archived here the moment that leg ends. Not created on a `--k8s` run: its review and fix legs run pod-side and never archive |
 | `<run-dir>/exit-code` | written when the session exits |
 | `<run-dir>/pi-session` | `--harness pi` only: pi's session, with per-message cost |
-| `<run-dir>/clone/<name>` | the clone; the only path the sandbox can write |
+| `<run-dir>/codex-sessions` | local Codex legs only: Codex rollout logs, persisted so host-side quota readers can see rate-limit snapshots; contains session transcripts and shares the run directory's lifecycle |
+| `<run-dir>/clone/<name>` | the writable throwaway clone where the task runs |
 
 ## What it gives up
 
