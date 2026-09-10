@@ -145,6 +145,7 @@ lkml_persona_field() {
 harness="$(lkml_persona_field "$persona_file" harness)"
 model="$(lkml_persona_field "$persona_file" model)"
 thinking="$(lkml_persona_field "$persona_file" thinking)"
+network="$(lkml_persona_field "$persona_file" network)"
 display="$(lkml_persona_field "$persona_file" display)"
 [[ -n "$harness" ]] || harness="claude"
 [[ -n "$display" ]] || display="$author_persona"
@@ -161,6 +162,9 @@ if [[ -n "$model_override" ]]; then
         harness="$model_override"
         model=""
     fi
+    # --model-override has no channel of its own for network: a network
+    # belongs to its harness the same way a model does.
+    network=""
 else
     # The seats file re-seats this persona, key by key; the frontmatter
     # values are the lowest-priority inputs (lkml-seats-resolve owns the
@@ -170,15 +174,29 @@ else
         read -r harness
         read -r model
         read -r thinking
+        read -r network
         read -r seat_note
     } < <(
         "$script_dir/lkml-seats-resolve" resolve "$personas_dir" "$author_persona" \
-            "$harness" "$model" "$thinking")
+            "$harness" "$model" "$thinking" "$network")
     [[ -n "$harness" ]] || {
         echo "Error: seats resolution for $author_persona failed." >&2
         exit 1
     }
     [[ -n "$seat_note" ]] && echo "fork-sandbox lkml-series: $seat_note" >&2
+fi
+
+# A literal pi-local (frontmatter or --model-override -- lkml-seats-resolve
+# already expands the alias for every path that goes through it) is the
+# same seat as harness pi with network sealed. Same-entry contradiction is
+# refused rather than silently dropped, per lkml-seats-resolve's own rule.
+if [[ "$harness" == "pi-local" ]]; then
+    if [[ "$network" == "pinned" ]]; then
+        echo "Error: persona '$author_persona' asks for harness 'pi-local' with network 'pinned'; pi-local is already sealed. Fix the persona frontmatter or the --model-override before relaunching." >&2
+        exit 1
+    fi
+    harness="pi"
+    network="sealed"
 fi
 
 parts_text="your own call -- a sensible split is usually 6 to 10 commits"
@@ -241,15 +259,13 @@ task_meta="$(jq -nc --arg series "$series" --arg persona "$author_persona" \
 
 harness_spec="$harness"
 [[ -n "$model" ]] && harness_spec="$harness/$model"
-# A resolved pi-local seat is spelled out as harness pi with an explicit
-# --network sealed rather than passed through as the pi-local alias --
-# fork-sandbox.sh still honors the alias, but this is the first-party
-# call site and should read like the modern spelling.
+# A sealed seat is spelled out with an explicit --network sealed rather
+# than the pi-local alias -- fork-sandbox.sh still honors the alias, but
+# this is the first-party call site and should read like the modern
+# spelling. By this point harness is never literally "pi-local" (expanded
+# above), so harness_spec already reads "pi" with no rewrite needed.
 network_args=()
-if [[ "$harness" == "pi-local" ]]; then
-    harness_spec="pi${model:+/$model}"
-    network_args=(--network sealed)
-fi
+[[ "$network" == "sealed" ]] && network_args=(--network sealed)
 # harness_announce is display-only, never passed to fork-sandbox.sh: the
 # argv split above moves "sealed" into network_args, but the launch line
 # should still tell the operator whether this seat is sealed or networked.
@@ -262,7 +278,7 @@ harness_announce="$harness_spec"
 # is its launch-line mention, which would announce a no-op.
 pi_args=()
 thinking_note=""
-if [[ -n "$thinking" && ( "$harness" == "pi" || "$harness" == "pi-local" ) ]]; then
+if [[ -n "$thinking" && "$harness" == "pi" ]]; then
     pi_args=(--pi-args "--thinking $thinking")
     thinking_note=", thinking $thinking"
 fi

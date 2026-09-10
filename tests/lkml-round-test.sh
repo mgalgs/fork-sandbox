@@ -747,8 +747,8 @@ fi
 
 n_local_launches="$(find "$cap_k8s" -name '*.task-meta.json' | wc -l | tr -d '[:space:]')"
 check "the k8s round never touches the local launcher" "0" "$n_local_launches"
-contains "the pi-local translation is announced on stderr" "$out_k8s" \
-    "seat pi-local: pi-local runs as pi via endpoint 'test-endpoint' on the cluster"
+contains "the sealed translation is announced on stderr" "$out_k8s" \
+    "seat pi-local: a sealed seat runs as pi via endpoint 'test-endpoint' on the cluster"
 
 printf '\n== --k8s: a dead pod is marked lost, not re-probed ==\n'
 # A seat whose pod died (or Succeeded and exited past its TTL): the
