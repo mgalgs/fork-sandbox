@@ -435,17 +435,10 @@ new script in `install.sh`, not here.
 ```bash
 # Launch a run, get a branch back — the engine under /fork-sandbox and
 # /sandbox-coder-mode
-<<<<<<< HEAD
 fork-sandbox run ~/src/proj /var/tmp/claude-scratch/handoff.md
 fork-sandbox run --review-loop 2 --review-model opus ~/src/proj handoff.md
-fork-sandbox run --harness pi-local ~/src/proj handoff.md   # sealed: your model, no network
+fork-sandbox run --harness pi --network sealed ~/src/proj handoff.md   # your model, no network
 fork-sandbox run --preset deep ~/src/proj handoff.md        # a named pipeline (docs/presets.md)
-=======
-fork-sandbox.sh ~/src/proj /var/tmp/claude-scratch/handoff.md
-fork-sandbox.sh --review-loop 2 --review-model opus ~/src/proj handoff.md
-fork-sandbox.sh --harness pi --network sealed ~/src/proj handoff.md   # your model, no network
-fork-sandbox.sh --preset deep ~/src/proj handoff.md        # a named pipeline (docs/presets.md)
->>>>>>> 0378e1fa03 (Move the docs to the --network spelling)
 
 # Watch it
 fork-sandbox status <run-dir>              # status at a glance
