@@ -591,7 +591,7 @@ contains "bare override wins: author launches on the bare harness, sealed" \
 contains "bare override wins: ci launches on the bare harness, sealed" \
     "$(argv_of ci)" "--harness pi --network sealed"
 case "$(argv_of core)" in
-    *"pi-local/opus"*) no "bare override drops the persona's frontmatter model" "$(argv_of core)" ;;
+    *"pi/opus"*) no "bare override drops the persona's frontmatter model" "$(argv_of core)" ;;
     *) ok "bare override drops the persona's frontmatter model" ;;
 esac
 case "$OUT" in
@@ -676,7 +676,7 @@ launch_author "$repo_dir/scripts/lkml-revise.sh" "$work/seats-author.yaml" \
     widget-seats --project "$project_dir" --checkout somebranch --version 1 \
     --base somebranch --personas-dir "$personas_test_dir"
 contains "revise: the seats file re-seats the author" "$OUT" \
-    "launching author (pi-local, thinking low) for v2"
+    "launching author (pi, sealed, thinking low) for v2"
 contains "revise: the moved seat is announced" "$OUT" \
     "lkml-revise: seat author: pi-local (seats-author.yaml, was claude/opus)"
 launch_author "$repo_dir/scripts/lkml-revise.sh" "$work/seats-harnoffpi.yaml" \
@@ -693,9 +693,9 @@ launch_author "$repo_dir/scripts/lkml-revise.sh" ABSENT \
     widget-seats --project "$project_dir" --checkout somebranch --version 1 \
     --base somebranch --personas-dir "$personas_test_dir" --model-override pi-local
 contains "revise: bare override drops the persona model" "$OUT" \
-    "launching author (pi-local) for v2"
+    "launching author (pi, sealed) for v2"
 case "$OUT" in
-    *"pi-local/opus"*) no "revise: bare override never composes the frontmatter model" "$OUT" ;;
+    *"pi/opus"*) no "revise: bare override never composes the frontmatter model" "$OUT" ;;
     *) ok "revise: bare override never composes the frontmatter model" ;;
 esac
 launch_author "$repo_dir/scripts/lkml-revise.sh" ABSENT \
@@ -709,7 +709,7 @@ launch_author "$repo_dir/scripts/lkml-cover.sh" "$work/seats-author.yaml" \
     widget-seats --project "$project_dir" --checkout somebranch --base somebranch \
     --patches "$work/patches" --personas-dir "$personas_test_dir"
 contains "cover: the seats file re-seats the author" "$OUT" \
-    "launching author (pi, thinking low)"
+    "launching author (pi, sealed, thinking low)"
 contains "cover: the moved seat is announced" "$OUT" \
     "lkml-cover: seat author: pi-local (seats-author.yaml, was claude/opus)"
 launch_author "$repo_dir/scripts/lkml-cover.sh" "$work/seats-harnoffpi.yaml" \
@@ -721,9 +721,9 @@ launch_author "$repo_dir/scripts/lkml-cover.sh" ABSENT \
     widget-seats --project "$project_dir" --checkout somebranch --base somebranch \
     --patches "$work/patches" --personas-dir "$personas_test_dir" --model-override pi-local
 contains "cover: bare override drops the persona model" "$OUT" \
-    "launching author (pi)"
+    "launching author (pi, sealed)"
 case "$OUT" in
-    *"pi-local/opus"*) no "cover: bare override never composes the frontmatter model" "$OUT" ;;
+    *"pi/opus"*) no "cover: bare override never composes the frontmatter model" "$OUT" ;;
     *) ok "cover: bare override never composes the frontmatter model" ;;
 esac
 launch_author "$repo_dir/scripts/lkml-cover.sh" ABSENT \
@@ -737,7 +737,7 @@ launch_author "$repo_dir/scripts/lkml-series.sh" "$work/seats-author.yaml" \
     widget-seats --project "$project_dir" --range "HEAD..somebranch" \
     --personas-dir "$personas_test_dir"
 contains "series: the seats file re-seats the author" "$OUT" \
-    "launching author (pi, thinking low) for v1"
+    "launching author (pi, sealed, thinking low) for v1"
 contains "series: the moved seat is announced" "$OUT" \
     "lkml-series: seat author: pi-local (seats-author.yaml, was claude/opus)"
 launch_author "$repo_dir/scripts/lkml-series.sh" "$work/seats-harnoffpi.yaml" \
@@ -749,9 +749,9 @@ launch_author "$repo_dir/scripts/lkml-series.sh" ABSENT \
     widget-seats --project "$project_dir" --range "HEAD..somebranch" \
     --personas-dir "$personas_test_dir" --model-override pi-local
 contains "series: bare override drops the persona model" "$OUT" \
-    "launching author (pi) for v1"
+    "launching author (pi, sealed) for v1"
 case "$OUT" in
-    *"pi-local/opus"*) no "series: bare override never composes the frontmatter model" "$OUT" ;;
+    *"pi/opus"*) no "series: bare override never composes the frontmatter model" "$OUT" ;;
     *) ok "series: bare override never composes the frontmatter model" ;;
 esac
 launch_author "$repo_dir/scripts/lkml-series.sh" ABSENT \

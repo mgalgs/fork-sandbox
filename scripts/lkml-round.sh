@@ -618,6 +618,14 @@ for persona in "${personas[@]}"; do
         harness_spec="pi${model:+/$model}"
         network_args=(--network sealed)
     fi
+    # The argv split above moves "sealed" out of harness_spec and into
+    # network_args -- correct for --harness, but it would silently drop the
+    # one fact an operator reading the launch line most needs: whether this
+    # seat ships the clone's contents to a networked provider or runs
+    # sealed against a local endpoint. harness_announce is display-only and
+    # is never passed to fork-sandbox.sh.
+    harness_announce="$harness_spec"
+    (( ${#network_args[@]} )) && harness_announce="$harness_spec, sealed"
 
     # A persona's `thinking:` field sets pi's reasoning level for its seat.
     # It only means something on a harness that starts pi; fork-sandbox.sh
@@ -691,7 +699,7 @@ for persona in "${personas[@]}"; do
         continue
     fi
 
-    echo "fork-sandbox lkml-round: launching $persona ($harness_spec$thinking_note)..." >&2
+    echo "fork-sandbox lkml-round: launching $persona ($harness_announce$thinking_note)..." >&2
     launch_out="$(fork-sandbox.sh --harness "$harness_spec" \
         "${network_args[@]}" --checkout "$checkout_ref" \
         "${pi_args[@]}" "${trust_args[@]}" \

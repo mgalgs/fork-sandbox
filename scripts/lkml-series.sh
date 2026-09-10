@@ -250,6 +250,11 @@ if [[ "$harness" == "pi-local" ]]; then
     harness_spec="pi${model:+/$model}"
     network_args=(--network sealed)
 fi
+# harness_announce is display-only, never passed to fork-sandbox.sh: the
+# argv split above moves "sealed" into network_args, but the launch line
+# should still tell the operator whether this seat is sealed or networked.
+harness_announce="$harness_spec"
+(( ${#network_args[@]} )) && harness_announce="$harness_spec, sealed"
 
 # Same rule as lkml-round.sh: the `thinking:` seat fact only means
 # something on a harness that starts pi; fork-sandbox.sh refuses
@@ -262,7 +267,7 @@ if [[ -n "$thinking" && ( "$harness" == "pi" || "$harness" == "pi-local" ) ]]; t
     thinking_note=", thinking $thinking"
 fi
 
-echo "fork-sandbox lkml-series: launching $author_persona ($harness_spec$thinking_note) for v1..." >&2
+echo "fork-sandbox lkml-series: launching $author_persona ($harness_announce$thinking_note) for v1..." >&2
 launch_out="$(fork-sandbox.sh --harness "$harness_spec" "${network_args[@]}" \
     --checkout "$tip_ref" \
     "${pi_args[@]}" \

@@ -198,6 +198,40 @@ check "a pinned pi run picks up network/pinned.md but neither the sealed nor the
     "harness/pi.md,network/pinned.md,model/demo-model.md" \
     "$(printf '%s\n' "$out" | sed -n 's/^prompt_overlay_fragments\[implement\]=//p')"
 
+printf '\n== --dry-run: network/<network>.md is per-leg, not the implement leg%s ==\n' "'"
+
+# A sealed implement leg (--harness pi-local) with a networked review or
+# maintainer leg (--review-harness / --maintainer-harness) must not inject
+# network/sealed.md -- "no internet available" -- into a leg that has
+# internet. Each leg's own effective harness/network decides its candidates.
+out="$(dry "$config" --harness pi-local --review-loop 1 \
+    --review-harness claude/opus --prompts-dir "$netdir" 2>/dev/null)"
+check "a sealed implement leg still gets network/sealed.md" \
+    "harness/pi.md,harness/pi-local.md,network/sealed.md" \
+    "$(printf '%s\n' "$out" | sed -n 's/^prompt_overlay_fragments\[implement\]=//p')"
+# harness/pi.md still shows up here: harness/<harness>.md is keyed on the
+# implement leg's own harness for every leg, a pre-existing limitation this
+# round does not fix (see the comment above the candidate loop). Only the
+# network axis -- the one this round's docs actively point at sealed-only
+# content -- is asserted leg-aware below.
+check "a networked review leg over a sealed implement leg gets network/pinned.md, not sealed" \
+    "harness/pi.md,network/pinned.md" \
+    "$(printf '%s\n' "$out" | sed -n 's/^prompt_overlay_fragments\[review\]=//p')"
+
+out="$(dry "$config" --harness pi-local --maintainer-loop 1 \
+    --maintainer-harness claude/opus --prompts-dir "$netdir" 2>/dev/null)"
+check "a networked maintainer leg over a sealed implement leg gets network/pinned.md, not sealed" \
+    "harness/pi.md,network/pinned.md" \
+    "$(printf '%s\n' "$out" | sed -n 's/^prompt_overlay_fragments\[maintainer\]=//p')"
+
+# The reverse -- a networked implement leg with a sealed review leg --
+# must still pick up network/sealed.md for that review leg alone.
+out="$(dry "$config" --harness claude --review-loop 1 \
+    --review-harness pi-local --prompts-dir "$netdir" 2>/dev/null)"
+check "a sealed review leg over a networked implement leg gets network/sealed.md" \
+    "harness/pi-local.md,network/sealed.md" \
+    "$(printf '%s\n' "$out" | sed -n 's/^prompt_overlay_fragments\[review\]=//p')"
+
 printf '\n== --dry-run: model id sanitisation ==\n'
 
 mkdir -p "$pdir/model"

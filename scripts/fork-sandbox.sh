@@ -30,16 +30,17 @@
 #                        opus, sonnet, or a name from aliases.conf).
 #                        Required with --harness pi, where it names an
 #                        OpenRouter model such as moonshotai/kimi-k3 --
-#                        except a --k8s run, where the pod discovers its
-#                        model: fork-sandbox-k8s.sh's own install-mode-aware
-#                        validation is the one authority (it resolves the
-#                        endpoint from --endpoint, K8S_DEFAULT_ENDPOINT in
-#                        k8s.env, or the single registered endpoint, and
-#                        refuses a model-less run on a legacy install with
-#                        its own message).
-#                        Optional with --harness pi-local, which asks the
-#                        endpoint what it serves, and with --harness codex,
-#                        which passes it to `codex exec --model`.
+#                        except with --network sealed, which asks the
+#                        endpoint what it serves, and a --k8s run, where
+#                        the pod discovers its model: fork-sandbox-k8s.sh's
+#                        own install-mode-aware validation is the one
+#                        authority (it resolves the endpoint from
+#                        --endpoint, K8S_DEFAULT_ENDPOINT in k8s.env, or
+#                        the single registered endpoint, and refuses a
+#                        model-less run on a legacy install with its own
+#                        message).
+#                        Optional with --harness codex, which passes it to
+#                        `codex exec --model`.
 # --model-unchecked:     send the selected model verbatim, without alias
 #                        resolution or validation. Useful before a new model
 #                        reaches a harness's local cache. Requires a model.
@@ -2773,6 +2774,37 @@ if [[ -d "$prompt_overlay_dir" ]]; then
     [[ -n "$model" ]] && prompt_overlay_model_frag="${model//\//_}"
 
     for prompt_overlay_leg in "${prompt_overlay_legs[@]}"; do
+        # network/<network>.md (and the legacy harness/pi-local.md name it
+        # replaces) describe the network THIS leg actually runs under, which
+        # can differ from the implement leg's -- --review-harness or
+        # --maintainer-harness (or a preset's per-seat network: key) may seat
+        # a networked review or maintainer leg on top of a sealed implement
+        # leg. Falling back to the implement leg's own harness/network is
+        # also the right answer for "implement" itself, and for "fix" (which
+        # shares one overlay bucket across the review-fix and maintain-fix
+        # seats regardless of which harness runs it -- the harness/ axis has
+        # this same blindness already and is not this round's fix).
+        prompt_overlay_leg_harness="$harness"
+        prompt_overlay_leg_network="$network"
+        case "$prompt_overlay_leg" in
+            review)
+                if [[ "$review_harness_given" == true ]]; then
+                    prompt_overlay_leg_harness="$review_harness"
+                    prompt_overlay_leg_network="pinned"
+                    [[ "${review_network:-}" == "sealed" ]] \
+                        && prompt_overlay_leg_network="sealed"
+                fi
+                ;;
+            maintainer)
+                if [[ "$maintainer_harness_given" == true ]]; then
+                    prompt_overlay_leg_harness="$maintainer_harness"
+                    prompt_overlay_leg_network="pinned"
+                    [[ "${maintainer_network:-}" == "sealed" ]] \
+                        && prompt_overlay_leg_network="sealed"
+                fi
+                ;;
+        esac
+
         # General first, specific last: a later fragment can override an
         # earlier one. The root-level trio applies to every leg -- a
         # fragment saying how this model should write a commit is as true
@@ -2786,10 +2818,11 @@ if [[ -d "$prompt_overlay_dir" ]]; then
         # just because the alias now expands before this list is built.
         # Undocumented on purpose -- new overlays should target
         # network/sealed.md (below) instead.
-        if [[ "$harness" == "pi" && "$network" == "sealed" ]]; then
+        if [[ "$prompt_overlay_leg_harness" == "pi" \
+            && "$prompt_overlay_leg_network" == "sealed" ]]; then
             prompt_overlay_candidates+=("harness/pi-local.md")
         fi
-        prompt_overlay_candidates+=("network/$network.md")
+        prompt_overlay_candidates+=("network/$prompt_overlay_leg_network.md")
         [[ -n "$prompt_overlay_model_frag" ]] \
             && prompt_overlay_candidates+=("model/$prompt_overlay_model_frag.md")
         prompt_overlay_candidates+=("$prompt_overlay_leg/all.md")
