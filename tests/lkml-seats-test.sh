@@ -449,7 +449,8 @@ launch_round ABSENT core,author,ci
 check "absent seats file: round exits 0" "0" "$RC"
 contains "absent seats file: core launches with its frontmatter pin" "$(argv_of core)" "--harness claude/opus"
 contains "absent seats file: author launches with its frontmatter pin" "$(argv_of author)" "--harness claude/opus"
-check "absent seats file: ci launches with its frontmatter pin" "pi-local" "$(harness_of ci)"
+contains "absent seats file: ci launches with its frontmatter pin" \
+    "$(argv_of ci)" "--harness pi --network sealed"
 case "$OUT" in
     *"seat "*) no "absent seats file announces nothing" "$OUT" ;;
     *) ok "absent seats file announces nothing" ;;
@@ -463,9 +464,12 @@ YAML
 rm -f -- "$capture_dir"/*.argv
 launch_round "$work/seats-round.yaml" core,author,ci
 check "seats default: round exits 0" "0" "$RC"
-check "seats default: core is launched on pi-local" "pi-local" "$(harness_of core)"
-check "seats default: author is launched on pi-local" "pi-local" "$(harness_of author)"
-check "seats default: ci is launched on pi-local" "pi-local" "$(harness_of ci)"
+contains "seats default: core is launched on pi, sealed" \
+    "$(argv_of core)" "--harness pi --network sealed"
+contains "seats default: author is launched on pi, sealed" \
+    "$(argv_of author)" "--harness pi --network sealed"
+contains "seats default: ci is launched on pi, sealed" \
+    "$(argv_of ci)" "--harness pi --network sealed"
 contains "core's moved seat is announced" "$OUT" \
     "lkml-round: seat core: pi-local (seats-round.yaml, was claude/opus)"
 contains "author's moved seat is announced" "$OUT" \
@@ -488,7 +492,8 @@ rm -f -- "$capture_dir"/*.argv
 launch_round "$work/seats-round-perp.yaml" core,author,ci
 check "per-persona round exits 0" "0" "$RC"
 contains "per-persona entry: author stays on claude/opus" "$(argv_of author)" "--harness claude/opus"
-check "per-persona entry: core still goes to pi-local" "pi-local" "$(harness_of core)"
+contains "per-persona entry: core still goes to pi, sealed" \
+    "$(argv_of core)" "--harness pi --network sealed"
 
 printf '\n== a personas.<p> harness drops the default%s model, in the round ==\n' "'"
 cat > "$work/seats-round-pdrop.yaml" <<'YAML'
@@ -502,7 +507,8 @@ YAML
 rm -f -- "$capture_dir"/*.argv
 launch_round "$work/seats-round-pdrop.yaml" core,author,ci
 check "persona-harness round exits 0" "0" "$RC"
-check "core's persona harness is the bare harness" "pi-local" "$(harness_of core)"
+contains "core's persona harness is the bare harness, sealed" \
+    "$(argv_of core)" "--harness pi --network sealed"
 check "author takes the default's model" "claude/sonnet" "$(harness_of author)"
 check "ci takes the default's model" "claude/sonnet" "$(harness_of ci)"
 contains "core's re-seat to the bare harness is announced" "$OUT" \
@@ -578,9 +584,12 @@ printf '\n== --model-override still beats the seats file, and stays quiet ==\n'
 rm -f -- "$capture_dir"/*.argv
 launch_round "$work/seats-round.yaml" core,author,ci --model-override pi-local
 check "bare override beats seats: round exits 0" "0" "$RC"
-check "bare override wins: core launches on the bare harness" "pi-local" "$(harness_of core)"
-check "bare override wins: author launches on the bare harness" "pi-local" "$(harness_of author)"
-check "bare override wins: ci launches on the bare harness" "pi-local" "$(harness_of ci)"
+contains "bare override wins: core launches on the bare harness, sealed" \
+    "$(argv_of core)" "--harness pi --network sealed"
+contains "bare override wins: author launches on the bare harness, sealed" \
+    "$(argv_of author)" "--harness pi --network sealed"
+contains "bare override wins: ci launches on the bare harness, sealed" \
+    "$(argv_of ci)" "--harness pi --network sealed"
 case "$(argv_of core)" in
     *"pi-local/opus"*) no "bare override drops the persona's frontmatter model" "$(argv_of core)" ;;
     *) ok "bare override drops the persona's frontmatter model" ;;
@@ -700,7 +709,7 @@ launch_author "$repo_dir/scripts/lkml-cover.sh" "$work/seats-author.yaml" \
     widget-seats --project "$project_dir" --checkout somebranch --base somebranch \
     --patches "$work/patches" --personas-dir "$personas_test_dir"
 contains "cover: the seats file re-seats the author" "$OUT" \
-    "launching author (pi-local, thinking low)"
+    "launching author (pi, thinking low)"
 contains "cover: the moved seat is announced" "$OUT" \
     "lkml-cover: seat author: pi-local (seats-author.yaml, was claude/opus)"
 launch_author "$repo_dir/scripts/lkml-cover.sh" "$work/seats-harnoffpi.yaml" \
@@ -712,7 +721,7 @@ launch_author "$repo_dir/scripts/lkml-cover.sh" ABSENT \
     widget-seats --project "$project_dir" --checkout somebranch --base somebranch \
     --patches "$work/patches" --personas-dir "$personas_test_dir" --model-override pi-local
 contains "cover: bare override drops the persona model" "$OUT" \
-    "launching author (pi-local)"
+    "launching author (pi)"
 case "$OUT" in
     *"pi-local/opus"*) no "cover: bare override never composes the frontmatter model" "$OUT" ;;
     *) ok "cover: bare override never composes the frontmatter model" ;;
@@ -728,7 +737,7 @@ launch_author "$repo_dir/scripts/lkml-series.sh" "$work/seats-author.yaml" \
     widget-seats --project "$project_dir" --range "HEAD..somebranch" \
     --personas-dir "$personas_test_dir"
 contains "series: the seats file re-seats the author" "$OUT" \
-    "launching author (pi-local, thinking low) for v1"
+    "launching author (pi, thinking low) for v1"
 contains "series: the moved seat is announced" "$OUT" \
     "lkml-series: seat author: pi-local (seats-author.yaml, was claude/opus)"
 launch_author "$repo_dir/scripts/lkml-series.sh" "$work/seats-harnoffpi.yaml" \
@@ -740,7 +749,7 @@ launch_author "$repo_dir/scripts/lkml-series.sh" ABSENT \
     widget-seats --project "$project_dir" --range "HEAD..somebranch" \
     --personas-dir "$personas_test_dir" --model-override pi-local
 contains "series: bare override drops the persona model" "$OUT" \
-    "launching author (pi-local) for v1"
+    "launching author (pi) for v1"
 case "$OUT" in
     *"pi-local/opus"*) no "series: bare override never composes the frontmatter model" "$OUT" ;;
     *) ok "series: bare override never composes the frontmatter model" ;;
