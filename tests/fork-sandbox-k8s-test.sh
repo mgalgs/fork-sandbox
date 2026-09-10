@@ -1059,6 +1059,52 @@ else
         "(see rendered output)"
 fi
 
+# == K8S_ALLOW_UNLISTED_MODEL -- the escape hatch from the pod's unlisted-
+# == model refusal. Only 1 is accepted; set to 1 it renders the pod's
+# ALLOW_UNLISTED_MODEL env, unset it renders nothing so the pod-side
+# default stays refuse.
+allow_model_config_dir="$(newdir)"; tmpdirs+=("$allow_model_config_dir")
+cat > "$allow_model_config_dir/k8s.env" <<'CONF'
+K8S_CONTEXT=test-context
+K8S_NAMESPACE=fork-sandbox-test
+K8S_IMAGE=registry.example/you/fork-sandbox:latest
+K8S_PROXY_ENDPOINTS=primary=http://10.0.0.5:8001/v1
+K8S_DEFAULT_MODEL=qwen3-8b
+K8S_ALLOW_UNLISTED_MODEL=1
+K8S_DENIED_PROBE=10.0.0.1:443
+CONF
+allow_model_submit_out="$(newdir)/allow-model-submit.yaml"; tmpdirs+=("$(dirname "$allow_model_submit_out")")
+if FORK_SANDBOX_CONFIG_DIR="$allow_model_config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch \
+    "$proj_dir" "$handoff_file" > "$allow_model_submit_out" 2>/dev/null; then
+    ok "submit with K8S_ALLOW_UNLISTED_MODEL=1 exits 0"
+else
+    no "submit with K8S_ALLOW_UNLISTED_MODEL=1 exits 0" "(see rendered output)"
+fi
+if [[ "$(grep -cF -- '- name: ALLOW_UNLISTED_MODEL' "$allow_model_submit_out")" == 1 ]] \
+    && grep -A1 -F -- '- name: ALLOW_UNLISTED_MODEL' "$allow_model_submit_out" | grep -qF 'value: "1"'; then
+    ok "a K8S_ALLOW_UNLISTED_MODEL=1 render carries the ALLOW_UNLISTED_MODEL=1 env"
+else
+    no "a K8S_ALLOW_UNLISTED_MODEL=1 render carries the ALLOW_UNLISTED_MODEL=1 env" \
+        "$(grep -A1 'name: ALLOW_UNLISTED_MODEL' "$allow_model_submit_out")"
+fi
+# Unset: the render carries no ALLOW_UNLISTED_MODEL env at all (the pod's
+# default is refuse; nothing in k8s.env opts out of it by omission).
+if [[ "$(grep -cF -- '- name: ALLOW_UNLISTED_MODEL' "$no_model_submit_out")" == 0 ]]; then
+    ok "a render without K8S_ALLOW_UNLISTED_MODEL carries no ALLOW_UNLISTED_MODEL env"
+else
+    no "a render without K8S_ALLOW_UNLISTED_MODEL carries no ALLOW_UNLISTED_MODEL env" \
+        "found it in the single-endpoint render"
+fi
+# Anything other than 1 (or unset) is a parse-time error naming the key.
+allow_bad_config_dir="$(newdir)"; tmpdirs+=("$allow_bad_config_dir")
+cp "$allow_model_config_dir/k8s.env" "$allow_bad_config_dir/k8s.env"
+sed -i 's/^K8S_ALLOW_UNLISTED_MODEL=1$/K8S_ALLOW_UNLISTED_MODEL=2/' "$allow_bad_config_dir/k8s.env"
+refuses "submit with K8S_ALLOW_UNLISTED_MODEL=2 is refused" \
+    "K8S_ALLOW_UNLISTED_MODEL" \
+    env FORK_SANDBOX_CONFIG_DIR="$allow_bad_config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch "$proj_dir" "$handoff_file"
+
 # --endpoint against a legacy K8S_PROXY_UPSTREAM install is an error.
 refuses "submit --endpoint against a legacy K8S_PROXY_UPSTREAM install errors" \
     "K8S_PROXY_UPSTREAM; there are no named" \
@@ -4216,13 +4262,42 @@ printf 'discovered-model\n' > "$collect_meta_src/.fork-sandbox-model"
 if K8S_STUB_OUTBOX_DIR="$collect_meta_src" K8S_STUB_OUTBOX_RC=0 \
     collectstub_collect "$collect_log_meta" "$collect_out_meta" \
     --branch fs-k8s-test-collect-dotfile --outbox-dir "$collect_dest_meta" "$proj_dir"; then
-    if [[ "$(cat "$collect_dest_meta/.fork-sandbox-model" 2>/dev/null)" == discovered-model ]]; then
-        ok "collect brings the model metadata dotfile home"
+    if [[ "$(cat "$collect_dest_meta/.fork-sandbox-model" 2>/dev/null)" == discovered-model ]] \
+        && grep -qF 'model: discovered-model' "$collect_out_meta" \
+        && ! grep -q 'context_source' "$collect_out_meta"; then
+        ok "collect brings the model metadata dotfile home and records a bare-id run without facts"
     else
-        no "collect brings the model metadata dotfile home" "dest=$(find "$collect_dest_meta" 2>/dev/null)"
+        no "collect brings the model metadata dotfile home and records a bare-id run without facts" "dest=$(find "$collect_dest_meta" 2>/dev/null)"
     fi
 else
-    no "collect brings the model metadata dotfile home" "collect exited nonzero: $(cat "$collect_out_meta")"
+    no "collect brings the model metadata dotfile home and records a bare-id run without facts" "collect exited nonzero: $(cat "$collect_out_meta")"
+fi
+
+# ...and the same dotfile carrying the context facts an entrypoint that
+# ran model discovery appends: a completed run's record must say whether
+# its context was reported or guessed, so the fallback's 32768/8192
+# signature is readable after the pod is reaped. An unrecognized extra
+# line is tolerated, not an error.
+collect_log_meta2="$(newdir)/kubectl.log"; collect_out_meta2="$(newdir)/out-meta2.txt"; collect_dest_meta2="$(newdir)/outbox-meta2"
+collect_meta_src2="$(newdir)/pod-outbox-meta2"
+tmpdirs+=("$(dirname "$collect_log_meta2")" "$collect_meta_src2" "$(dirname "$collect_dest_meta2")")
+mkdir -p -- "$collect_meta_src2"
+printf 'discovered-model\ncontext=131072\nmax_tokens=32768\ncontext_source=reported\nunknown_key=x\n' \
+    > "$collect_meta_src2/.fork-sandbox-model"
+if K8S_STUB_OUTBOX_DIR="$collect_meta_src2" K8S_STUB_OUTBOX_RC=0 \
+    collectstub_collect "$collect_log_meta2" "$collect_out_meta2" \
+    --branch fs-k8s-test-collect-dotfile-facts --outbox-dir "$collect_dest_meta2" "$proj_dir"; then
+    if grep -qF 'model: discovered-model (context=131072, max_tokens=32768, context_source=reported)' \
+        "$collect_out_meta2" \
+        && ! grep -q 'unknown_key' "$collect_out_meta2"; then
+        ok "collect surfaces the context facts from a recorded model, tolerating unknown lines"
+    else
+        no "collect surfaces the context facts from a recorded model, tolerating unknown lines" \
+            "out=$(cat "$collect_out_meta2")"
+    fi
+else
+    no "collect surfaces the context facts from a recorded model, tolerating unknown lines" \
+        "collect exited nonzero: $(cat "$collect_out_meta2")"
 fi
 
 # 2. An over-cap outbox is refused -- and only the pull-back is refused:
@@ -6179,8 +6254,9 @@ fi
 # Runs the extracted function in a subshell: $1 is the stub curl's stdout
 # (or "FAIL" for a connection-refused stub), $2 the MODEL value (or "")
 # it is handed, $3 the REVIEW_MODEL value (or ""), $4 the HARNESS value
-# (default pi). Captures combined output and the subshell's exit status
-# in $discover_out / $discover_rc.
+# (default pi), $5 the ALLOW_UNLISTED_MODEL value (default unset).
+# Captures combined output and the subshell's exit status in $discover_out
+# / $discover_rc.
 discover_run() {
     local stub_dir
     stub_dir="$(newdir)"; tmpdirs+=("$stub_dir")
@@ -6193,10 +6269,11 @@ discover_run() {
     fi
     chmod +x "$stub_dir/curl"
     discover_out="$(PATH="$stub_dir:$PATH" MODEL="$2" REVIEW_MODEL="${3-}" HARNESS="${4:-pi}" \
+        ALLOW_UNLISTED_MODEL="${5-}" \
         PROXY_BASE_URL="http://fork-sandbox-proxy.fork-sandbox-test.svc.cluster.local:8080/e/primary/v1" \
         bash -c 'source "$1"; discover_model_facts; \
-            printf "MODEL=%s CTX=%s MAX_TOKENS=%s REVIEW_CTX=%s REVIEW_MAX_TOKENS=%s\n" \
-                "$MODEL" "$CTX" "$MAX_TOKENS" "$REVIEW_CTX" "$REVIEW_MAX_TOKENS"' \
+            printf "MODEL=%s CTX=%s MAX_TOKENS=%s MODEL_CTX_SOURCE=%s REVIEW_CTX=%s REVIEW_MAX_TOKENS=%s\n" \
+                "$MODEL" "$CTX" "$MAX_TOKENS" "${MODEL_CTX_SOURCE:-}" "$REVIEW_CTX" "$REVIEW_MAX_TOKENS"' \
         _ "$discover_fn_file" 2>&1)"
     discover_rc=$?
 }
@@ -6218,22 +6295,25 @@ else
 fi
 
 # A large window keeps the 32768 MAX_TOKENS floor (131072/4 = 32768,
-# not below the floor, so it stays).
+# not below the floor, so it stays) -- and the window came from the
+# listing, so the context source is reported.
 discover_run '{"data":[{"id":"big","max_model_len":131072}]}' ""
-if [[ "$discover_out" == *"CTX=131072 MAX_TOKENS=32768"* ]]; then
+if [[ "$discover_out" == *"CTX=131072 MAX_TOKENS=32768 MODEL_CTX_SOURCE=reported"* ]]; then
     ok "discovery: MAX_TOKENS keeps the 32768 floor when the window is large"
 else
     no "discovery: MAX_TOKENS keeps the 32768 floor when the window is large" \
         "rc=$discover_rc: $discover_out"
 fi
 
-# A missing max_model_len warns and falls back to the low 32768 guess.
+# A missing max_model_len warns, falls back to the low 32768 guess, and
+# marks the context source guessed -- the recorded facts must be able to
+# tell this apart from a 32768 that is a healthy large window's reply room.
 discover_run '{"data":[{"id":"solo"}]}' ""
 if (( discover_rc == 0 )) && [[ "$discover_out" == *"assumes 32768"* \
-        && "$discover_out" == *"MODEL=solo CTX=32768 MAX_TOKENS=8192"* ]]; then
-    ok "discovery: missing max_model_len warns and falls back to 32768"
+        && "$discover_out" == *"MODEL=solo CTX=32768 MAX_TOKENS=8192 MODEL_CTX_SOURCE=guessed"* ]]; then
+    ok "discovery: missing max_model_len warns, falls back to 32768, and records context_source=guessed"
 else
-    no "discovery: missing max_model_len warns and falls back to 32768" \
+    no "discovery: missing max_model_len warns, falls back to 32768, and records context_source=guessed" \
         "rc=$discover_rc: $discover_out"
 fi
 
@@ -6257,14 +6337,44 @@ else
         "rc=$discover_rc: $discover_out"
 fi
 
-# A MODEL absent from the listing warns and continues -- the listing may
-# be stale, and refusing would strand a legitimate run.
+# A MODEL absent from the listing is REFUSED by default: the renamed-
+# catalog-entry incident it exists for. The error names the requested id,
+# lists the ids the endpoint DOES offer, points at K8S_DEFAULT_MODEL in
+# k8s.env, and names the escape hatch.
 discover_run '{"data":[{"id":"a-model","max_model_len":8192}]}' "other-model"
-if (( discover_rc == 0 )) && [[ "$discover_out" == *"does not list a model called 'other-model'"* \
-        && "$discover_out" == *"MODEL=other-model CTX=32768"* ]]; then
-    ok "discovery: a MODEL absent from the listing warns and continues"
+if (( discover_rc != 0 )) \
+    && [[ "$discover_out" == *"Error: "* ]] \
+    && [[ "$discover_out" != *"Warning: "* ]] \
+    && [[ "$discover_out" == *"does not list a model called 'other-model'"* ]] \
+    && [[ "$discover_out" == *"  a-model"* ]] \
+    && [[ "$discover_out" == *"K8S_DEFAULT_MODEL in k8s.env"* ]] \
+    && [[ "$discover_out" == *"K8S_ALLOW_UNLISTED_MODEL=1"* ]] \
+    && [[ "$discover_out" != *"MODEL=other-model"* ]]; then
+    ok "discovery: a MODEL absent from the listing refuses, naming the offered ids and K8S_DEFAULT_MODEL"
 else
-    no "discovery: a MODEL absent from the listing warns and continues" \
+    no "discovery: a MODEL absent from the listing refuses, naming the offered ids and K8S_DEFAULT_MODEL" \
+        "rc=$discover_rc: $discover_out"
+fi
+# ...with more than one offered id, the error lists them all, not just the
+# first.
+discover_run '{"data":[{"id":"a-model","max_model_len":8192},{"id":"b-model"}]}' "other-model"
+if (( discover_rc != 0 )) \
+    && [[ "$discover_out" == *"  a-model"* && "$discover_out" == *"  b-model"* ]]; then
+    ok "discovery: the refusal lists every id the endpoint offers"
+else
+    no "discovery: the refusal lists every id the endpoint offers" \
+        "rc=$discover_rc: $discover_out"
+fi
+# ALLOW_UNLISTED_MODEL=1 restores the old warn-and-proceed for the same
+# situation -- the explicit door for a stale listing.
+discover_run '{"data":[{"id":"a-model","max_model_len":8192}]}' "other-model" "" pi 1
+if (( discover_rc == 0 )) \
+    && [[ "$discover_out" == *"does not list a model called 'other-model'"* ]] \
+    && [[ "$discover_out" == *"ALLOW_UNLISTED_MODEL=1"* ]] \
+    && [[ "$discover_out" == *"MODEL=other-model CTX=32768"* ]]; then
+    ok "discovery: ALLOW_UNLISTED_MODEL=1 restores warn-and-proceed for an unlisted MODEL"
+else
+    no "discovery: ALLOW_UNLISTED_MODEL=1 restores warn-and-proceed for an unlisted MODEL" \
         "rc=$discover_rc: $discover_out"
 fi
 
@@ -6346,6 +6456,19 @@ if grep -qF 'if [[ -n "$MODEL_DISCOVERY" ]]; then' "$entrypoint_sh" \
 else
     no "discovery is gated on MODEL_DISCOVERY, with the legacy constants kept in the else branch" \
         "missing the MODEL_DISCOVERY gate or the legacy 131072/32768 constants in $entrypoint_sh"
+fi
+# .fork-sandbox-model: line 1 stays the bare model id (an existing
+# reader), the discovered context facts append as key=value lines, and
+# they append ONLY when MODEL's own discovery produced them -- a
+# claude run's stand-in constants do not belong to the Claude Code name
+# line 1 carries, and a legacy run has no facts at all.
+if grep -qF "printf '%s\n' \"\$MODEL\"" "$entrypoint_sh" \
+    && grep -qF "printf 'context=%s\nmax_tokens=%s\ncontext_source=%s\n'" "$entrypoint_sh" \
+    && grep -qF 'if [[ -n "${MODEL_CTX_SOURCE:-}" ]]; then' "$entrypoint_sh"; then
+    ok "the model metadata dotfile keeps a bare id on line 1 and appends context facts only when discovered"
+else
+    no "the model metadata dotfile keeps a bare id on line 1 and appends context facts only when discovered" \
+        "missing the bare-first-line write or the MODEL_CTX_SOURCE guard in $entrypoint_sh"
 fi
 if grep -qF ': "${MODEL:?MODEL must be set to a model id}"' "$entrypoint_sh"; then
     no "the entrypoint no longer hard-requires MODEL at startup" \

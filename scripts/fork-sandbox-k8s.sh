@@ -314,10 +314,23 @@
 #                         --model, then this key, then the pod's own
 #                         single-candidate discovery rule, then that
 #                         discovery's error listing what it found. A value
-#                         the endpoint's listing does not contain is a
-#                         warning at pod start, not an error -- the
-#                         listing may be stale, and refusing would strand
-#                         a legitimate run.
+#                         the endpoint's listing does not contain is an
+#                         error at pod start that names the requested id,
+#                         lists the ids the endpoint does offer, and points
+#                         back to this key -- unless K8S_ALLOW_UNLISTED_MODEL
+#                         is set, in which case it is the old warning.
+#   K8S_ALLOW_UNLISTED_MODEL=
+#                         set to 1 to turn the pod-side refusal of an
+#                         unlisted model id back into a warning. The
+#                         listing may be stale -- the model behind an
+#                         endpoint is free to change -- and this is the
+#                         explicit door for a known-good id the listing
+#                         does not yet show. Unset (the default) means
+#                         refuse: a warning that proceeds is
+#                         indistinguishable from success once the pod is
+#                         reaped, and the guess-low context window that
+#                         follows from the missing id would then stand
+#                         silently for a real one. May only be 1 or unset.
 #   K8S_CLUSTER_DOMAIN=   the cluster's own DNS domain, defaults to
 #                         cluster.local. A K8S_PROXY_UPSTREAM or
 #                         K8S_PROXY_ENDPOINTS URL on http:// to a host
@@ -470,6 +483,11 @@ K8S_DEFAULT_ENDPOINT="$(read_env_value "$k8s_env" K8S_DEFAULT_ENDPOINT || true)"
 # install; see the model-requirement block in cmd_submit, which resolves
 # it with the same precedence shape as K8S_DEFAULT_ENDPOINT above.
 K8S_DEFAULT_MODEL="$(read_env_value "$k8s_env" K8S_DEFAULT_MODEL || true)"
+# Refuse-or-warn switch for a model id the endpoint's /v1/models listing
+# does not contain; see the key's header entry above. Empty means unset,
+# meaning the pod refuses -- the same read_env_value empty-means-unset
+# convention as every other K8S_* key.
+K8S_ALLOW_UNLISTED_MODEL="$(read_env_value "$k8s_env" K8S_ALLOW_UNLISTED_MODEL || true)"
 K8S_PROXY_ALLOW="$(read_env_value "$k8s_env" K8S_PROXY_ALLOW || true)"
 # Namespace-selector egress allowlist, composing with K8S_PROXY_ALLOW --
 # see parse_proxy_allow_ns and render_proxy_egress_rules_ns below.
@@ -530,6 +548,11 @@ if [[ ! "$K8S_CLUSTER_DOMAIN" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]]; then
 fi
 if [[ -n "$K8S_RUN_TTL" && ! "$K8S_RUN_TTL" =~ ^[0-9]+$ ]]; then
     echo "Error: K8S_RUN_TTL must be a number of seconds, got '$K8S_RUN_TTL'." >&2
+    exit 1
+fi
+if [[ -n "$K8S_ALLOW_UNLISTED_MODEL" && "$K8S_ALLOW_UNLISTED_MODEL" != 1 ]]; then
+    echo "Error: K8S_ALLOW_UNLISTED_MODEL in $k8s_env must be 1 (or unset)," >&2
+    echo "got '$K8S_ALLOW_UNLISTED_MODEL'." >&2
     exit 1
 fi
 if [[ -n "$K8S_RUN_OWNER" ]] && ! k8s_valid_label_value "$K8S_RUN_OWNER"; then
@@ -3172,6 +3195,19 @@ CENV
 )"
     fi
 
+    # ALLOW_UNLISTED_MODEL, rendered only when k8s.env sets
+    # K8S_ALLOW_UNLISTED_MODEL=1 (validated at parse time above): the pod's
+    # half of the refusal's escape hatch. Unset renders nothing, so the
+    # pod-side default stays refuse without this script spelling "0".
+    local allow_unlisted_model_env=""
+    if [[ "$K8S_ALLOW_UNLISTED_MODEL" == 1 ]]; then
+        allow_unlisted_model_env=$'\n'"$(cat <<CENV
+            - name: ALLOW_UNLISTED_MODEL
+              value: "1"
+CENV
+)"
+    fi
+
     local job_rendered rendered
     job_rendered="$(cat <<EOF
 ---
@@ -3269,7 +3305,7 @@ spec:
             - name: RUN_TTL
               value: "$K8S_RUN_TTL"
             - name: OUTBOX_MAX_BYTES
-              value: "$outbox_max_bytes"${model_discovery_env}${review_loop_env}${claude_env}${review_model_env}${pi_args_env}
+              value: "$outbox_max_bytes"${model_discovery_env}${allow_unlisted_model_env}${review_loop_env}${claude_env}${review_model_env}${pi_args_env}
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -3958,6 +3994,29 @@ cmd_collect() {
             fi
         else
             echo "fork-sandbox-k8s: warning: could not extract the outbox tarball; nothing pulled back to $outbox_dest" >&2
+        fi
+    fi
+    # The pod's harness metadata dotfile, when the outbox came back:
+    # line 1 is the bare model id (the pre-existing shape), and an
+    # entrypoint that ran model discovery appends the context facts it
+    # established for that id as key=value lines. Absent extra lines are
+    # not an error -- an older pod image predates them -- and neither is
+    # an unrecognized line. Surface whatever is there so a completed run's
+    # record says whether its context was reported or guessed; the
+    # entrypoint's own comment on the file records why (the 32768
+    # fingerprint that makes a bare number unreadable).
+    if [[ -f "$outbox_dest/.fork-sandbox-model" ]]; then
+        local model_record model_facts="" model_line
+        model_record="$(head -n 1 -- "$outbox_dest/.fork-sandbox-model")"
+        while IFS= read -r model_line || [[ -n "$model_line" ]]; do
+            case "$model_line" in
+                context=*) model_facts+="${model_facts:+, }$model_line" ;;
+                max_tokens=*) model_facts+="${model_facts:+, }$model_line" ;;
+                context_source=*) model_facts+="${model_facts:+, }$model_line" ;;
+            esac
+        done < <(tail -n +2 -- "$outbox_dest/.fork-sandbox-model")
+        if [[ -n "$model_record" ]]; then
+            echo "fork-sandbox-k8s: model: $model_record${model_facts:+ ($model_facts)}" >&2
         fi
     fi
     rm -f -- "$outbox_tar"

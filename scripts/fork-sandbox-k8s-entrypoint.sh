@@ -33,8 +33,12 @@
 #                   resolves it from the proxy's /v1/models: exactly one
 #                   model in the listing is used (and said so), zero or
 #                   several is an error. When submit DID give one and the
-#                   listing does not contain it, that is a warning, not
-#                   an error -- the listing may be stale.
+#                   listing does not contain it, that is an ERROR that
+#                   refuses the run (naming the requested id, listing the
+#                   ids the endpoint does offer, and pointing at
+#                   K8S_DEFAULT_MODEL in k8s.env) -- unless the host set
+#                   ALLOW_UNLISTED_MODEL, in which case it is the old
+#                   warn-and-proceed.
 #                   The same discovery reads the context window
 #                   (max_model_len for the chosen model; a missing value
 #                   falls back to 32768, a deliberately low guess, with a
@@ -75,6 +79,13 @@
 #                   ordinary state. The host, which knows the install
 #                   kind and the harness, gates the call on this
 #                   variable instead of the pod guessing from the URL.
+#   ALLOW_UNLISTED_MODEL
+#                   set to 1 by fork-sandbox-k8s.sh when k8s.env carries
+#                   K8S_ALLOW_UNLISTED_MODEL=1: it turns the unlisted-
+#                   model refusal in discover_model_facts below back into
+#                   a warning, for the case where the listing is stale
+#                   and the configured id is known good. Unset (the
+#                   default) means refuse.
 #   PI_ARGS         extra arguments for the pi coding-leg invocation,
 #                   verbatim from fork-sandbox-k8s.sh's --pi-args, e.g.
 #                   "--thinking low". Rendered only when non-empty, so
@@ -171,6 +182,7 @@ case "$HARNESS" in
 esac
 : "${MODEL:=}"
 : "${MODEL_DISCOVERY:=}"
+: "${ALLOW_UNLISTED_MODEL:=}"
 : "${PI_ARGS:=}"
 : "${PROXY_BASE_URL:?PROXY_BASE_URL must be set to the pi model proxy base URL}"
 if [[ "$HARNESS" == claude ]]; then
@@ -251,11 +263,37 @@ discover_model_facts() {
     elif [[ "$HARNESS" != claude ]] && ! printf '%s\n' "$probe_ids" | grep -qxF "$MODEL"; then
         # (HARNESS=claude: MODEL is a Claude Code name this listing never
         # contains and no pi leg uses, so it is never checked here.)
-        # The listing may be stale -- the model behind an endpoint is free
-        # to change -- and refusing here would strand a legitimate run.
-        echo "Warning: $url does not list a model called '$MODEL'." >&2
-        echo "Continuing anyway; the endpoint may serve more than it" >&2
-        echo "advertises." >&2
+        # The requested id is not in the endpoint's own listing. Warn
+        # and proceed, and once the pod is reaped with the round
+        # reported green, the two warnings are indistinguishable from
+        # success -- the renamed-catalog-entry incident this refusal
+        # exists for: the guess-low context window below then stands in
+        # silently for a real one, a quarter of the size. So the default
+        # is to REFUSE: failing at pod start costs one launch; proceeding
+        # on the wrong context costs a whole round of empty seats.
+        # The listing CAN be stale and a legitimate run can name a model
+        # the listing does not yet show -- that case keeps an explicit
+        # door, ALLOW_UNLISTED_MODEL=1 (the host's K8S_ALLOW_UNLISTED_MODEL
+        # in k8s.env), which restores the old warn-and-proceed. Silence
+        # is no longer the default.
+        if [[ "$ALLOW_UNLISTED_MODEL" == 1 ]]; then
+            echo "Warning: $url does not list a model called '$MODEL'." >&2
+            echo "Continuing anyway because ALLOW_UNLISTED_MODEL=1; the" >&2
+            echo "endpoint may serve more than it advertises." >&2
+        else
+            echo "Error: $url does not list a model called '$MODEL'." >&2
+            echo "The endpoint offers:" >&2
+            printf '%s\n' "$probe_ids" | sed 's/^/  /' >&2
+            echo "A renamed or removed catalog entry is the usual cause: the" >&2
+            echo "configured id was right when written and the endpoint's" >&2
+            echo "catalog changed since. Fix the id -- most often" >&2
+            echo "K8S_DEFAULT_MODEL in k8s.env, the value submit fell back" >&2
+            echo "to when --model was omitted -- and resubmit. If the id" >&2
+            echo "is known good and the listing is stale, setting" >&2
+            echo "K8S_ALLOW_UNLISTED_MODEL=1 in k8s.env restores the old" >&2
+            echo "warn-and-proceed." >&2
+            exit 1
+        fi
     fi
 
     # The context window, from the endpoint when it says so: too large and
@@ -272,9 +310,11 @@ discover_model_facts() {
     # review loop a quarter of the context it used to have. The helper is
     # nested in this function, not top-level, because the test suite
     # extracts exactly this function's source and runs it alone. Sets the
-    # globals FACTS_CTX / FACTS_MAX for the id in $1.
+    # globals FACTS_CTX / FACTS_MAX / FACTS_SRC (reported or guessed, the
+    # source of FACTS_CTX) for the id in $1.
     _model_context_facts() {
         local model="$1" len
+        FACTS_SRC=reported
         len="$(jq -r --arg m "$model" \
             'first(.data[] | select(.id == $m) | .max_model_len // empty) // empty' \
             <<<"$body" 2>/dev/null || true)"
@@ -282,6 +322,7 @@ discover_model_facts() {
             # Guess low: too small wastes context, while too large means a
             # rejection that arrives mid-run with the work half done.
             len=32768
+            FACTS_SRC=guessed
             echo "Warning: $url does not report a context length for" >&2
             echo "'$model', so the run using it assumes $len tokens, a" >&2
             echo "deliberately low guess." >&2
@@ -308,6 +349,10 @@ discover_model_facts() {
         _model_context_facts "$MODEL"
         CTX="$FACTS_CTX"
         MAX_TOKENS="$FACTS_MAX"
+        # MODEL's own facts, recorded in .fork-sandbox-model below
+        # alongside MODEL's id -- only when they belong to that id (a
+        # claude run's stand-in values do not).
+        MODEL_CTX_SOURCE="$FACTS_SRC"
     fi
     if [[ -n "$REVIEW_MODEL" && "$REVIEW_MODEL" != "$MODEL" ]]; then
         _model_context_facts "$REVIEW_MODEL"
@@ -395,6 +440,10 @@ else
     MAX_TOKENS=32768
     REVIEW_CTX=131072
     REVIEW_MAX_TOKENS=32768
+    # No discovery ran, so MODEL's context facts are not recorded: the
+    # constants above are what the pre-discovery config used, not facts
+    # the endpoint reported.
+    MODEL_CTX_SOURCE=""
 fi
 
 # Harness metadata, not a reply: collect pulls this dotfile back with the
@@ -406,7 +455,24 @@ fi
 # pod, real lifecycle complexity for a non-threat. Do not "harden" this
 # without reopening that decision.
 if [[ -n "$MODEL" ]]; then
-    printf '%s\n' "$MODEL" > "$outbox_dir/.fork-sandbox-model"
+    # Line 1 stays the bare model id, exactly as before: any existing
+    # reader of the file keeps working unchanged. The context facts an
+    # entrypoint that ran model discovery established for THAT id append
+    # as key=value lines (absent on legacy-install and claude-harness
+    # runs, where the values are stand-in constants, not facts).
+    #
+    # Why record them at all: max_tokens = min(32768, context/4), so
+    # 32768 is BOTH the correct reply room on a healthy 131072 window
+    # AND the broken fallback context -- a reader grepping for 32768
+    # cannot tell the two apart. context=32768 with max_tokens=8192 is
+    # the unambiguous signature of the fallback.
+    {
+        printf '%s\n' "$MODEL"
+        if [[ -n "${MODEL_CTX_SOURCE:-}" ]]; then
+            printf 'context=%s\nmax_tokens=%s\ncontext_source=%s\n' \
+                "$CTX" "$MAX_TOKENS" "$MODEL_CTX_SOURCE"
+        fi
+    } > "$outbox_dir/.fork-sandbox-model"
 fi
 
 echo "fork-sandbox-k8s-entrypoint: waiting for $sentinel (deadline ${INPUTS_TIMEOUT}s)" >&2
