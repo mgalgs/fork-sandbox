@@ -32,6 +32,8 @@ installed and callable under its own name — `fork-sandbox status` and
   cost, outcome
 - `fork-sandbox configure` — install the per-machine config this host can
   discover
+- `fork-sandbox validate-services <file>` — check the repo's services spec
+  without a cluster
 - `lkml-round.sh`, `lkml-mailbox.sh`, `lkml-revise.sh`, `lkml-forklift.sh`,
   `lkml-render.py` — the lkml-mode toolchain, outside the dispatcher
 
@@ -417,7 +419,7 @@ The porcelain, for when there is no agent in the loop. `fork-sandbox` is a
 git-style dispatcher: it routes a verb to the script that implements it and
 gets out of the way, so `fork-sandbox status --result <run-dir>` and
 `fork-sandbox-status.sh --result <run-dir>` are the same command. Both
-spellings work — the verbs keep one name on your PATH instead of six. Each
+spellings work — the verbs keep one name on your PATH instead of seven. Each
 prints its full doc with `--help`, and a `--help` after a verb reaches the
 underlying script. Everything not listed here — `fork-sandbox-lib.sh`, the
 pod-side k8s scripts, `sandbox-backend-*` — is plumbing, reached through the
