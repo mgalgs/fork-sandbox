@@ -62,7 +62,20 @@ except ImportError:
 SPEC_PATH = ".agents/sandbox-services/services.yaml"
 SUPPORTED_VERSIONS = (1,)
 NAME_RE = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$")
-ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+# Two deliberately different patterns for two different call sites -- one
+# pattern serving both was exactly the defect this split removes:
+#
+# SERVICE_ENV_KEY_RE matches Kubernetes' own IsEnvVarName: dots and dashes
+# included, and '.' and '..' refused (checked separately, below). These
+# names are rendered into the Job manifest and validated by Kubernetes
+# itself; no shell is in the path.
+#
+# SANDBOX_ENV_KEY_RE is the shell-safe form. Those names land in
+# <clone>/.env.sandbox, the same file the local hook path writes and repo
+# tooling commonly reads by sourcing -- 'discovery.type=single-node' in a
+# sourced file is a bash syntax error.
+SERVICE_ENV_KEY_RE = re.compile(r"^[-._a-zA-Z][-._a-zA-Z0-9]*$")
+SANDBOX_ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 RESERVED_NAMES = ("egress-gate", "agent")
 
 # 8/10/12/14-space indents matching the Job's existing initContainers /
@@ -228,9 +241,19 @@ def parse_doc(doc):
                 fail(f"{path}.env: must be a mapping of env var name to value")
             for key, value in env_doc.items():
                 key = text_field(key, f"{path}.env", yaml_safe=False)
-                if not ENV_KEY_RE.fullmatch(key):
+                # '.' and '..' match the character class, but Kubernetes'
+                # own validation refuses them (its CIdentifier check), so
+                # refuse them here rather than pushing the failure to
+                # apply time.
+                if key in (".", ".."):
+                    fail(f"{path}.env.{key}: '{key}' is not a valid env "
+                         f"var name -- Kubernetes itself refuses '.' "
+                         f"and '..'")
+                if not SERVICE_ENV_KEY_RE.fullmatch(key):
                     fail(f"{path}.env.{key}: env var names match "
-                         f"^[A-Za-z_][A-Za-z0-9_]*$")
+                         f"[-._a-zA-Z][-._a-zA-Z0-9]* -- Kubernetes' "
+                         f"IsEnvVarName set, dots and dashes allowed, "
+                         f"except the names '.' and '..'")
                 env[key] = text_field(value, f"{path}.env.{key}")
 
         writable_dirs = []
@@ -305,9 +328,14 @@ def parse_doc(doc):
             fail("'sandboxEnv' must be a mapping of env var name to value")
         for key, value in se_doc.items():
             key = text_field(key, "sandboxEnv", yaml_safe=False)
-            if not ENV_KEY_RE.fullmatch(key):
+            if not SANDBOX_ENV_KEY_RE.fullmatch(key):
                 fail(f"sandboxEnv.{key}: env var names match "
-                     f"^[A-Za-z_][A-Za-z0-9_]*$")
+                     f"^[A-Za-z_][A-Za-z0-9_]*$ here -- deliberately "
+                     f"stricter than the services[].env rule above, "
+                     f"because this map lands in <clone>/.env.sandbox, "
+                     f"a shell-sourced env file, and a name like "
+                     f"'discovery.type' would break any repo that "
+                     f"sources it")
             sandbox_env[key] = text_field(value, f"sandboxEnv.{key}")
 
     return services, sandbox_env

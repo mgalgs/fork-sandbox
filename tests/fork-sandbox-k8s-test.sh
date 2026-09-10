@@ -60,6 +60,15 @@
 #     implementation under test, not a duplicate of its logic.
 #   - no file in the repo matches a private-hostname shape, guarding the
 #     public-repo leak rule every script and manifest here has to hold to.
+#   - the per-run services spec's env var name rules: services[].env
+#     accepts Kubernetes' IsEnvVarName set -- dotted names
+#     (discovery.type, bootstrap.memory_lock, node.store.allow_mmap) and a
+#     dashed name -- while refusing the literal names '.' and '..' and
+#     still refusing a space, a '$' and a leading digit; sandboxEnv is
+#     deliberately stricter (shell-safe names only) and its refusal
+#     message says why, since that map is written into a shell-sourced
+#     .env.sandbox; and the parser's 6-positional-argument render form
+#     still renders as before.
 #   - fork-sandbox-k8s.sh keeps spelling its GNU tools through the
 #     resolved names fork-sandbox-lib.sh sets ($FS_STAT, $FS_REALPATH,
 #     $FS_TIMEOUT) rather than the bare names, which on macOS are the BSD
@@ -7293,6 +7302,112 @@ services:
     $key: {}
 "
 done
+
+printf '\n== per-run services: env var name rules ==\n'
+# services[].env names are rendered into the Job manifest and validated by
+# Kubernetes itself: the IsEnvVarName set, dots and dashes included (the
+# OpenSearch/Elasticsearch style: discovery.type, path.repo). sandboxEnv
+# names land in a shell-sourced .env.sandbox and stay shell-safe only.
+svc_envnames_dir="$(svc_mk_repo 'version: 1
+services:
+  - name: search
+    image: registry.example/rootless/search:1
+    port: 5601
+    env:
+      discovery.type: single-node
+      bootstrap.memory_lock: "true"
+      node.store.allow_mmap: "true"
+      my-env-name: v
+')"
+svc_envnames_out="$(newdir)/svc-envnames.yaml"; tmpdirs+=("$(dirname "$svc_envnames_out")")
+if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-svc-envnames --model moonshotai/kimi-k3 \
+    "$svc_envnames_dir" "$handoff_file" > "$svc_envnames_out" \
+    2>/tmp/fs-k8s-test-svc-envnames.err; then
+    ok "services[].env with dotted and dashed names renders"
+else
+    no "services[].env with dotted and dashed names renders" \
+        "$(cat /tmp/fs-k8s-test-svc-envnames.err)"
+fi
+for needle in '- name: discovery.type' '- name: bootstrap.memory_lock' \
+    '- name: node.store.allow_mmap' '- name: my-env-name'; do
+    if grep -qF -- "$needle" "$svc_envnames_out"; then
+        ok "services[].env: '$needle' renders into the sidecar's env"
+    else
+        no "services[].env: '$needle' renders into the sidecar's env" \
+            "not found in render"
+    fi
+done
+svc_refuses "services[].env: the literal name '.' is refused" \
+    "'.' is not a valid env var name" \
+    'version: 1
+services:
+  - name: db
+    image: registry.example/x:1
+    port: 5432
+    env:
+      ".": v
+'
+svc_refuses "services[].env: the literal name '..' is refused" \
+    "'..' is not a valid env var name" \
+    'version: 1
+services:
+  - name: db
+    image: registry.example/x:1
+    port: 5432
+    env:
+      "..": v
+'
+for bad in 'has space' 'has$dollar' '1leading'; do
+    svc_refuses "services[].env: '$bad' is still refused" \
+        "env var names match" \
+        "version: 1
+services:
+  - name: db
+    image: registry.example/x:1
+    port: 5432
+    env:
+      $bad: v
+"
+done
+# The case the split exists for: the same dotted name that services[].env
+# now accepts must be refused in sandboxEnv, and the message must say WHY
+# (the shell-sourced env file) -- not merely that the name is bad.
+svc_refuses "sandboxEnv: a dotted name is refused with the why" \
+    "stricter than the services[].env rule above" \
+    'version: 1
+services: []
+sandboxEnv:
+  discovery.type: single-node
+'
+svc_refuses "sandboxEnv: the refusal names the shell-sourced env file" \
+    "shell-sourced env file" \
+    'version: 1
+services: []
+sandboxEnv:
+  node.store.allow_mmap: "true"
+'
+svc_sbx_env_dir="$(svc_mk_repo 'version: 1
+services: []
+sandboxEnv:
+  DISABLE_SECURITY_PLUGIN: "true"
+')"
+svc_sbx_env_out="$(newdir)/svc-sbx-env.yaml"; tmpdirs+=("$(dirname "$svc_sbx_env_out")")
+if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-svc-sbxenv --model moonshotai/kimi-k3 \
+    "$svc_sbx_env_dir" "$handoff_file" > "$svc_sbx_env_out" \
+    2>/tmp/fs-k8s-test-svc-sbxenv.err; then
+    ok "sandboxEnv: a shell-safe name still renders"
+else
+    no "sandboxEnv: a shell-safe name still renders" \
+        "$(cat /tmp/fs-k8s-test-svc-sbxenv.err)"
+fi
+if grep -qF 'DISABLE_SECURITY_PLUGIN=true' "$svc_sbx_env_out"; then
+    ok "sandboxEnv: DISABLE_SECURITY_PLUGIN renders into the env file"
+else
+    no "sandboxEnv: DISABLE_SECURITY_PLUGIN renders into the env file" \
+        "not found in render"
+fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))
