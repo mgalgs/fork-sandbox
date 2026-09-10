@@ -1467,6 +1467,62 @@ parse_proxy_allow() {
             echo "name, so a hostname cannot be accepted here." >&2
             return 1
         fi
+        # Each octet range-checked 0-255: the regex above admits both a
+        # leading-zero octet ("010") and an out-of-range one ("999"). An
+        # out-of-range octet is a correctness bug, not a style one: it
+        # overflows ipv4_to_int's 32-bit packing (999 << 24 masked to 32
+        # bits is 231, so 999.0.0.0 would be classified as the DIFFERENT
+        # real network 231.0.0.0). This deliberately re-implements the
+        # octet check that sandbox-backend-container's is_valid_ipv4
+        # performs inline rather than sharing it: the shared predicate
+        # reports validity only, and this message names the failing
+        # octet; the pair also lives in that standalone backend script,
+        # not in fork-sandbox-lib.sh, so reusing it would mean lifting
+        # it there first.
+        local -a octets
+        IFS='.' read -ra octets <<< "${cidr%/*}"
+        local o
+        for o in "${octets[@]}"; do
+            if (( 10#$o > 255 )); then
+                echo "Error: K8S_PROXY_ALLOW entry '$entry' has an octet '$o'" >&2
+                echo "outside the valid range 0-255 (in CIDR '$cidr')." >&2
+                return 1
+            fi
+        done
+        # The prefix is range-checked 0-32 BEFORE the octets are
+        # normalized below, so -- like the octet refusal above -- this
+        # message quotes the CIDR exactly as the operator wrote it, not
+        # the parser's normalized internal state. The regex admits "33"
+        # through "99", and cidr_contains's and cidr_is_private's
+        # 0xFFFFFFFF << (32 - prefix) arithmetic assumes a 0-32 prefix.
+        if (( 10#${cidr#*/} > 32 )); then
+            echo "Error: K8S_PROXY_ALLOW entry '$entry' has a prefix length" >&2
+            echo "'${cidr#*/}' outside the valid range 0-32 (in CIDR '$cidr')." >&2
+            return 1
+        fi
+        # Canonical decimal address, so 192.000.002.015/32 is stored (and
+        # rendered) as 192.0.2.15/32. Two independent reasons, and the
+        # first one is load-bearing:
+        #
+        # The manifest renders the stored CIDR verbatim, and a current
+        # Kubernetes API server REFUSES a leading-zero octet in
+        # NetworkPolicy ipBlock.cidr. Verified by server-side dry-run
+        # against a live v1.36.1 API server, which answered:
+        #   spec.egress[0].to[0].ipBlock.cidr: Invalid value:
+        #   "192.000.002.015/32": must not have leading 0s in IP or
+        #   prefix length
+        # So without this normalization the install dies at apply time
+        # with an API error instead of this function's own message.
+        # Do not weaken this to "cosmetic" on the argument that
+        # k8s.io/utils/net's lenient ParseCIDRSloppy accepts leading
+        # zeros: whatever the historical parse path, the server observed
+        # above rejects it. Older servers may well be lenient, which is
+        # an argument for normalizing here rather than against it.
+        #
+        # Second, independent of any API behaviour: the canonical form
+        # is what this function range-checked, and it matches the prefix
+        # and port normalization below.
+        cidr="$(( 10#${octets[0]} )).$(( 10#${octets[1]} )).$(( 10#${octets[2]} )).$(( 10#${octets[3]} ))/${cidr#*/}"
         # Forced base 10 (10#$prefix), normalized to canonical decimal: a
         # leading-zero prefix like "/08" passes the regex above (it's
         # [0-9]{1,2}) and would otherwise reach cidr_contains's and

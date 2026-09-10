@@ -203,7 +203,11 @@
 #     (nor spews a bash arithmetic error) when classifying an address as
 #     private; a duplicate name, a non-RFC1123 name, and an empty base URL
 #     in K8S_PROXY_ENDPOINTS are each refused, as is a K8S_PROXY_ALLOW
-#     port outside 1-65535.
+#     port outside 1-65535, a K8S_PROXY_ALLOW CIDR octet outside 0-255, or
+#     a K8S_PROXY_ALLOW prefix outside 0-32 (both refusals quoting the
+#     entry as written, even for a leading-zero spelling), and a
+#     leading-zero CIDR octet normalizes to canonical decimal in the
+#     rendered policy; a 0.0.0.0/0 K8S_PROXY_ALLOW entry stays accepted.
 #   - fork-sandbox-k8s-entrypoint.sh's pod-side model discovery
 #     (discover_model_facts), driven with curl stubbed on PATH: a
 #     single-model /v1/models response resolves MODEL and sets CTX /
@@ -1715,6 +1719,112 @@ if [[ "$leading_zero_allow_prefix_err" == *'value too great for base'* ]]; then
         "$leading_zero_allow_prefix_err"
 else
     ok "a leading-zero K8S_PROXY_ALLOW CIDR prefix normalizes instead of crashing the install"
+fi
+
+# parse_proxy_allow must normalize leading-zero *octets* to canonical
+# decimal and store (and render) them that way. The manifest renders the
+# stored CIDR verbatim, and a current Kubernetes API server refuses a
+# leading-zero octet in NetworkPolicy ipBlock.cidr -- verified by
+# server-side dry-run against a live v1.36.1 API server: "must not have
+# leading 0s in IP or prefix length". Unnormalized, the install would die
+# at apply time with an API error instead of the parser's own message.
+# (See the rationale at parse_proxy_allow's normalization line for why
+# ParseCIDRSloppy's leniency is not a counter-argument.)
+leading_zero_allow_octet_config_dir="$(newdir)"; tmpdirs+=("$leading_zero_allow_octet_config_dir")
+cat > "$leading_zero_allow_octet_config_dir/k8s.env" <<'CONF'
+K8S_CONTEXT=test-context
+K8S_NAMESPACE=fork-sandbox-test
+K8S_IMAGE=registry.example/you/fork-sandbox:latest
+K8S_PROXY_ENDPOINTS=primary=http://svc-a.example-ns.svc.cluster.local:8080/v1
+K8S_PROXY_ALLOW=192.000.002.015/32:8080
+K8S_DENIED_PROBE=10.0.0.1:443
+CONF
+leading_zero_allow_octet_out="$(newdir)/leading-zero-octet-install.yaml"; tmpdirs+=("$(dirname "$leading_zero_allow_octet_out")")
+FORK_SANDBOX_CONFIG_DIR="$leading_zero_allow_octet_config_dir" "$k8s_sh" install --dry-run \
+    > "$leading_zero_allow_octet_out" 2>/tmp/fs-k8s-test-leading-zero-octet-install.err
+leading_zero_allow_octet_netpol_doc="$(extract_doc_by_kind NetworkPolicy "$leading_zero_allow_octet_out")"
+if grep -q 'cidr: 192.0.2.15/32' <<< "$leading_zero_allow_octet_netpol_doc" \
+    && ! grep -qF '192.000.002.015' "$leading_zero_allow_octet_out"; then
+    ok "a leading-zero K8S_PROXY_ALLOW CIDR octet normalizes to canonical decimal in the rendered policy"
+else
+    no "a leading-zero K8S_PROXY_ALLOW CIDR octet normalizes to canonical decimal in the rendered policy" \
+        "$leading_zero_allow_octet_netpol_doc"
+fi
+
+# parse_proxy_allow must refuse an out-of-range octet (the regex admits
+# up to 3 digits per octet, so 256 and 999 both pass it) -- an
+# out-of-range octet overflows ipv4_to_int's 32-bit packing and would be
+# classified against a different real network than the one written.
+for bad_octet in 256.0.0.1/32 999.999.999.999/32; do
+    bad_octet_allow_config_dir="$(newdir)"; tmpdirs+=("$bad_octet_allow_config_dir")
+    cat > "$bad_octet_allow_config_dir/k8s.env" <<CONF
+K8S_CONTEXT=test-context
+K8S_NAMESPACE=fork-sandbox-test
+K8S_IMAGE=registry.example/you/fork-sandbox:latest
+K8S_PROXY_ENDPOINTS=primary=http://10.0.0.5:8080/v1
+K8S_PROXY_ALLOW=${bad_octet}:8080
+K8S_DENIED_PROBE=10.0.0.1:443
+CONF
+    refuses "a K8S_PROXY_ALLOW CIDR with an out-of-range octet ($bad_octet) is refused" \
+        "outside the valid range 0-255" \
+        env FORK_SANDBOX_CONFIG_DIR="$bad_octet_allow_config_dir" "$k8s_sh" install --dry-run
+done
+
+# parse_proxy_allow must refuse an out-of-range prefix length (the regex
+# admits 1-2 digits, so 33 through 99 all pass it) -- cidr_contains's and
+# cidr_is_private's << (32 - prefix) shift arithmetic assumes 0-32.
+for bad_prefix in 10.0.0.0/33 10.0.0.0/99; do
+    bad_prefix_allow_config_dir="$(newdir)"; tmpdirs+=("$bad_prefix_allow_config_dir")
+    cat > "$bad_prefix_allow_config_dir/k8s.env" <<CONF
+K8S_CONTEXT=test-context
+K8S_NAMESPACE=fork-sandbox-test
+K8S_IMAGE=registry.example/you/fork-sandbox:latest
+K8S_PROXY_ENDPOINTS=primary=http://10.0.0.5:8080/v1
+K8S_PROXY_ALLOW=${bad_prefix}:8080
+K8S_DENIED_PROBE=10.0.0.1:443
+CONF
+    refuses "a K8S_PROXY_ALLOW CIDR with an out-of-range prefix ($bad_prefix) is refused" \
+        "outside the valid range 0-32" \
+        env FORK_SANDBOX_CONFIG_DIR="$bad_prefix_allow_config_dir" "$k8s_sh" install --dry-run
+done
+
+# The prefix refusal must quote the CIDR exactly as the operator wrote
+# it, not the parser's normalized internal state: the check sits before
+# the octet normalization, so a leading-zero spelling comes back raw.
+bad_prefix_raw_config_dir="$(newdir)"; tmpdirs+=("$bad_prefix_raw_config_dir")
+cat > "$bad_prefix_raw_config_dir/k8s.env" <<'CONF'
+K8S_CONTEXT=test-context
+K8S_NAMESPACE=fork-sandbox-test
+K8S_IMAGE=registry.example/you/fork-sandbox:latest
+K8S_PROXY_ENDPOINTS=primary=http://10.0.0.5:8080/v1
+K8S_PROXY_ALLOW=192.000.002.015/33:8080
+K8S_DENIED_PROBE=10.0.0.1:443
+CONF
+refuses "a K8S_PROXY_ALLOW prefix refusal quotes the operator's raw CIDR" \
+    "outside the valid range 0-32 (in CIDR '192.000.002.015/33')" \
+    env FORK_SANDBOX_CONFIG_DIR="$bad_prefix_raw_config_dir" "$k8s_sh" install --dry-run
+
+# 0.0.0.0/0 stays accepted and stored unchanged: it is a legitimate
+# "open everything" entry that cmd_install's reachability review warns
+# about, and it must not become a parse-time refusal.
+open_all_allow_config_dir="$(newdir)"; tmpdirs+=("$open_all_allow_config_dir")
+cat > "$open_all_allow_config_dir/k8s.env" <<'CONF'
+K8S_CONTEXT=test-context
+K8S_NAMESPACE=fork-sandbox-test
+K8S_IMAGE=registry.example/you/fork-sandbox:latest
+K8S_PROXY_ENDPOINTS=primary=http://10.0.0.5:8080/v1
+K8S_PROXY_ALLOW=0.0.0.0/0:8080
+K8S_DENIED_PROBE=10.0.0.1:443
+CONF
+open_all_allow_out="$(newdir)/open-all-install.yaml"; tmpdirs+=("$(dirname "$open_all_allow_out")")
+FORK_SANDBOX_CONFIG_DIR="$open_all_allow_config_dir" "$k8s_sh" install --dry-run \
+    > "$open_all_allow_out" 2>/tmp/fs-k8s-test-open-all-install.err
+open_all_netpol_doc="$(extract_doc_by_kind NetworkPolicy "$open_all_allow_out")"
+if grep -q 'cidr: 0.0.0.0/0' <<< "$open_all_netpol_doc"; then
+    ok "a 0.0.0.0/0 K8S_PROXY_ALLOW entry is still accepted and rendered unchanged"
+else
+    no "a 0.0.0.0/0 K8S_PROXY_ALLOW entry is still accepted and rendered unchanged" \
+        "$open_all_netpol_doc"
 fi
 
 # K8S_PROXY_ALLOW_NS -- selector-based egress for an in-cluster Service.
