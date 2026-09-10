@@ -22,8 +22,7 @@
 #
 # The dispatcher parses nothing of its own beyond a leading -h/--help, so a
 # --help after a verb reaches that verb's script and the sub-verbs of k8s
-# and log pass straight through. The lkml-mode toolchain (lkml-*.sh,
-# lkml-render.py) is deliberately outside the dispatcher.
+# and log pass straight through.
 
 set -euo pipefail
 

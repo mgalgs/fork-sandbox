@@ -10,10 +10,6 @@
 - `/sandbox-coder-mode` - For interactive orchestrator sessions where all
   implementation tasks are delegated to `/fork-sandbox` agents. See
   [Driving sandbox-coder-mode](#driving-sandbox-coder-mode).
-- `/lkml-mode` - Performs an lkml (Linux Kernel Mailing List) style patch
-  series code review by using a fleet of asynchronous, sandboxed agents.
-  Output is a git branch and a maildir (with a rendered html view of the
-  threaded "mailing list" discussion).
 
 **Scripts (porcelain) for programmatic sandbox use:**
 
@@ -34,8 +30,8 @@ installed and callable under its own name — `fork-sandbox status` and
   discover
 - `fork-sandbox validate-services <file>` — check the repo's services spec
   without a cluster
-- `lkml-round.sh`, `lkml-mailbox.sh`, `lkml-revise.sh`, `lkml-forklift.sh`,
-  `lkml-render.py` — the lkml-mode toolchain, outside the dispatcher
+- the lkml-mode review toolchain now lives in its own repo:
+  https://github.com/mgalgs/lkml-review
 
 Usage examples for all of these: [Scripts](#scripts).
 
@@ -202,8 +198,9 @@ sessions until the work is done instead of degrading into compaction
 Recipe: adversarial review of a whole branch before a public push
 
 ```
-Re-roll origin/main..HEAD into a reviewable patch series with /lkml-mode and
-run the panel on it. I want the defect list before this goes public.
+Re-roll origin/main..HEAD into a reviewable patch series with the lkml-mode
+toolchain (https://github.com/mgalgs/lkml-review) and run the panel on it.
+I want the defect list before this goes public.
 ```
 
 ---
@@ -430,8 +427,9 @@ what lands on your PATH. `install.sh` decides that, in its `PORCELAIN` and
 `PLUMBING` arrays, and it draws the line by a stricter test: porcelain means
 something has to find this **without** a `script_dir` to search from — a
 hook that invokes it by bare name, or another script with its installed path
-hardcoded. That catches names nobody ever types, which is why `lkml-round.sh`
-refuses to start when `lkml-summarize.sh` is missing from PATH. Classify a
+hardcoded. That catches names nobody ever types, which is why `fork-sandbox
+run` refuses to launch a run when `claude-sandboxed` is missing from PATH
+(its hardcoded install path is the only fallback). Classify a
 new script in `install.sh`, not here.
 
 ```bash
@@ -465,16 +463,6 @@ fork-sandbox log stats --by model,task.kind
 
 # The same sandbox, interactively — you at the keyboard
 claude-sandboxed ~/src/proj
-
-# lkml-mode's toolchain — /lkml-mode drives these (not dispatcher verbs)
-lkml-status.sh myfeature                       # one screen: tally, open threads, cost
-lkml-mailbox.sh tree myfeature                 # the thread view
-lkml-round.sh myfeature --project ~/src/proj --checkout sbx-tip --base main --personas core,ci
-lkml-revise.sh myfeature --project ~/src/proj --checkout sbx-tip --version 1 --base main
-lkml-series.sh myfeature --project ~/src/proj --range main..sbx-tip   # re-roll shipped work for post-hoc review
-lkml-forklift.sh myfeature --project ~/src/proj --version 2 --onto main --dry-run
-lkml-render.py "$LKML_MAILBOX_ROOT/myfeature" -o threads.html         # single-file html archive of the thread (typefaces from the Google Fonts CDN)
-lkml-render.py --text "$LKML_MAILBOX_ROOT/myfeature"                  # the same thread as plain text — the agent view
 ```
 
 ## Why

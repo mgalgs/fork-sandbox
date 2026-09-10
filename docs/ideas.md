@@ -40,7 +40,8 @@ What the design discussion settled before parking it:
 - **There is a competing hypothesis worth testing first.** On rounds
   where a self-hosted model types for free, nearly all the measured
   value came from the paid review legs — which suggests review-diversity
-  over ONE implementation (the lkml-mode panel) may beat
+  over ONE implementation (the lkml-mode panel, now an external tool:
+  https://github.com/mgalgs/lkml-review) may beat
   implementation-diversity under one judge at the same token spend.
 - **The experiment needs no new code.** An orchestrating session can run
   the whole block by hand: launch N implementers off the same
@@ -50,7 +51,7 @@ What the design discussion settled before parking it:
   single-implementation round of similar size.
 
 Parked because: token cost is N× the implement-plus-review legs for a
-benefit that is unproven against the cheaper lkml-mode alternative.
+benefit that is unproven against the cheaper external lkml-mode panel.
 Trigger: a task where the approach is genuinely contested and one
 implementation keeps coming back plausible-but-wrong — run the manual
 experiment on it before building anything.

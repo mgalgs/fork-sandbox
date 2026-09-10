@@ -19,7 +19,6 @@ constant:
 - **Kubernetes platform plugins** — `fork-sandbox-k8s-platform-<name>`
   (see docs/k8s-platform.md)
 - **prompt overlays** — `~/.config/fork-sandbox/prompts/`
-- **lkml personas** — a persona `.md` file, pinned to its own harness/model
 - **per-machine launch defaults** — `~/.config/fork-sandbox/coder-mode.env`,
   read by the orchestrating session, never by scripts
 

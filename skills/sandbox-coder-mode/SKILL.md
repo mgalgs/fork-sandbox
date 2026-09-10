@@ -919,8 +919,10 @@ run reads a zero cost; a codex run reports tokens and a null cost.
 ## When a single round of review isn't enough
 
 `--review-loop N` is one reviewer, on one model, arguing with one
-implementation until it approves or gives up. Reach for the `lkml-mode`
-skill instead when a change is substantial enough to want several
+implementation until it approves or gives up. Reach for the lkml-mode
+toolchain instead — it has moved to its own repo,
+https://github.com/mgalgs/lkml-review — when a change is substantial
+enough to want several
 independent, adversarial voices reading it in parallel — always including
 a core reviewer with the highest bar — with an iterated record of what each
 asked for, whether the author addressed it or pushed back, and why: a
