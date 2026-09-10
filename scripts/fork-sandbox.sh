@@ -2759,6 +2759,16 @@ if [[ -d "$prompt_overlay_dir" ]]; then
         # narrows it for this leg alone. No glob or family matching --
         # deliberately deferred, see docs/prompt-overlays.md.
         prompt_overlay_candidates=("all.md" "harness/$harness.md")
+        # harness/pi-local.md is a legacy candidate name: before the network
+        # mode split, a sealed pi run was "--harness pi-local", and an
+        # operator's overlay filed under that name must not go silently dead
+        # just because the alias now expands before this list is built.
+        # Undocumented on purpose -- new overlays should target
+        # network/sealed.md (below) instead.
+        if [[ "$harness" == "pi" && "$network" == "sealed" ]]; then
+            prompt_overlay_candidates+=("harness/pi-local.md")
+        fi
+        prompt_overlay_candidates+=("network/$network.md")
         [[ -n "$prompt_overlay_model_frag" ]] \
             && prompt_overlay_candidates+=("model/$prompt_overlay_model_frag.md")
         prompt_overlay_candidates+=("$prompt_overlay_leg/all.md")

@@ -168,6 +168,36 @@ out="$(dry "$config" --harness codex --prompts-dir "$pdir" 2>/dev/null)"
 check "no model given: only harness-independent fragments match" \
     "all.md" "$(printf '%s\n' "$out" | sed -n 's/^prompt_overlay_fragments\[implement\]=//p')"
 
+printf '\n== --dry-run: harness/pi-local.md and network/<network>.md candidates ==\n'
+
+# The pi-local alias expands to harness=pi, network=sealed before the overlay
+# candidate list is built. Both the legacy harness/pi-local.md name and the
+# new network/<network>.md axis have to survive that expansion, and a plain
+# pinned pi run must pick up neither.
+netdir="$(mktemp -d)"; tmpdirs+=("$netdir")
+mkdir -p "$netdir/harness" "$netdir/network" "$netdir/model"
+printf 'pi\n' > "$netdir/harness/pi.md"
+printf 'legacy\n' > "$netdir/harness/pi-local.md"
+printf 'sealed\n' > "$netdir/network/sealed.md"
+printf 'pinned\n' > "$netdir/network/pinned.md"
+printf 'model\n' > "$netdir/model/demo-model.md"
+
+out="$(dry "$config" --harness pi --network sealed --prompts-dir "$netdir" 2>/dev/null)"
+check "a sealed pi run picks up harness/pi.md, harness/pi-local.md and network/sealed.md, in that order" \
+    "harness/pi.md,harness/pi-local.md,network/sealed.md" \
+    "$(printf '%s\n' "$out" | sed -n 's/^prompt_overlay_fragments\[implement\]=//p')"
+
+out="$(dry "$config" --harness pi-local --prompts-dir "$netdir" 2>/dev/null)"
+check "the pi-local alias resolves the same overlay set as --harness pi --network sealed" \
+    "harness/pi.md,harness/pi-local.md,network/sealed.md" \
+    "$(printf '%s\n' "$out" | sed -n 's/^prompt_overlay_fragments\[implement\]=//p')"
+
+out="$(dry "$config" --harness pi --network pinned --model demo-model \
+    --prompts-dir "$netdir" 2>/dev/null)"
+check "a pinned pi run picks up network/pinned.md but neither the sealed nor the legacy pi-local overlay" \
+    "harness/pi.md,network/pinned.md,model/demo-model.md" \
+    "$(printf '%s\n' "$out" | sed -n 's/^prompt_overlay_fragments\[implement\]=//p')"
+
 printf '\n== --dry-run: model id sanitisation ==\n'
 
 mkdir -p "$pdir/model"

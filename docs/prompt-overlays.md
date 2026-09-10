@@ -76,35 +76,42 @@ before this mechanism existed.
 
 ## Search order
 
-Five files, general first so a later one can override what an earlier one
+Six files, general first so a later one can override what an earlier one
 said:
 
 ```
 <prompts-dir>/all.md
 <prompts-dir>/harness/<harness>.md
+<prompts-dir>/network/<network>.md
 <prompts-dir>/model/<model>.md
 <prompts-dir>/<leg>/all.md
 <prompts-dir>/<leg>/model/<model>.md
 ```
 
-`<harness>` is one of `claude`, `pi`, `codex`. `<leg>` is exactly
-one of `implement`, `review`, `fix`, `maintainer` — the prompt currently
-being rendered.
+`<harness>` is one of `claude`, `pi`, `codex`. `<network>` is one of
+`pinned`, `sealed` — the same axis `--network` takes, chosen independently
+of `<harness>`. `<leg>` is exactly one of `implement`, `review`, `fix`,
+`maintainer` — the prompt currently being rendered.
 Any file that does not exist is skipped silently — a directory holding only
 `all.md` is a perfectly normal setup. The ones that do exist are
 concatenated, in that order, under one heading, into the rendered prompt.
 
-The first three are the same three this mechanism always had, and they still
+The first four are the same shape this mechanism always had, and they still
 mean what they meant: every leg reads them. A fragment saying how a model
 should write a commit is as true in the fix leg as in the implement leg, so
-`all.md`, `harness/<harness>.md` and `model/<model>.md` apply everywhere,
-unchanged, and an existing prompts directory keeps working exactly as it did
-before this layer existed — it now simply applies to every leg instead of
-one. The last two narrow that baseline to one leg: `<leg>/all.md` for every
-model in this leg, `<leg>/model/<model>.md` for this model in this leg
-alone, general first within the leg-scoped pair too. A `maintainer/`
-directory is how you correct the maintainer leg's prompt specifically — the
-leg that runs only under `--maintainer-loop`.
+`all.md`, `harness/<harness>.md`, `network/<network>.md` and
+`model/<model>.md` apply everywhere, unchanged, and an existing prompts
+directory keeps working exactly as it did before this layer existed — it now
+simply applies to every leg instead of one. `network/<network>.md` narrows by
+the network axis directly, the distinction splitting `--network` away from
+`--harness` was meant to buy back: a fragment that only makes sense with no
+internet available (mentioning there is no LAN or DNS, say) belongs in
+`network/sealed.md`, not duplicated into every sealed harness's own file. The
+last two narrow the whole baseline to one leg: `<leg>/all.md` for every model
+in this leg, `<leg>/model/<model>.md` for this model in this leg alone,
+general first within the leg-scoped pair too. A `maintainer/` directory is
+how you correct the maintainer leg's prompt specifically — the leg that runs
+only under `--maintainer-loop`.
 
 `implement`, `review`, `fix` and `maintainer` are reserved directory names at
 the root of a prompts directory — a model can never be called `review`.
