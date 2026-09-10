@@ -259,15 +259,14 @@ else
     [[ -n "$seat_note" ]] && echo "fork-sandbox lkml-cover: $seat_note" >&2
 fi
 
-# A literal pi-local (frontmatter or --model-override -- lkml-seats-resolve
-# already expands the alias for every path that goes through it) is the
-# same seat as harness pi with network sealed. Same-entry contradiction is
-# refused rather than silently dropped, per lkml-seats-resolve's own rule.
+# pi-local is a permanent alias for harness pi + network sealed. Only
+# --model-override reaches this block with the literal alias: the other
+# branch always goes through lkml-seats-resolve, which expands the alias
+# (refusing the pinned contradiction itself, even with no seats file --
+# the expansion runs before that early exit), and --model-override always
+# arrives with an empty network, the only value that can reach the
+# expansion here.
 if [[ "$harness" == "pi-local" ]]; then
-    if [[ "$network" == "pinned" ]]; then
-        echo "Error: persona '$author_persona' asks for harness 'pi-local' with network 'pinned'; pi-local is already sealed. Fix the persona frontmatter or the --model-override before relaunching." >&2
-        exit 1
-    fi
     harness="pi"
     network="sealed"
 fi
