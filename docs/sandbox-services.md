@@ -187,6 +187,11 @@ sandboxEnv:
   under 1024. Must not collide with another service's port.
 - `services[].env` — optional, a flat map of string to string. Literal
   values only — no `valueFrom`, no secret reference, no substitution.
+  Key names follow Kubernetes' own env-var name set
+  `[-._a-zA-Z][-._a-zA-Z0-9]*` — dots and dashes included, so
+  `discovery.type`, `bootstrap.memory_lock` and `path.repo` all work —
+  with the two literal names `.` and `..` refused, as Kubernetes itself
+  refuses them.
 - `services[].writableDirs` — optional, a list of absolute paths, each
   mounted as its own `emptyDir`. Needed because the container runs with
   `readOnlyRootFilesystem: true` and a service still needs somewhere to
@@ -205,7 +210,11 @@ sandboxEnv:
   ports, so it writes the literal connection URL itself. The port appearing
   twice (once in a service's own `port`, again inside a `sandboxEnv` URL) is
   deliberate — it buys away an entire class of injection surface a
-  templating step would reintroduce.
+  templating step would reintroduce. Key names here are deliberately
+  stricter than `services[].env`'s Kubernetes set: shell-safe
+  `^[A-Za-z_][A-Za-z0-9_]*$` only. The map lands in a file repo tooling
+  commonly reads by sourcing, and `discovery.type=single-node` in a
+  sourced file is a bash syntax error.
 
 **Unknown keys anywhere are an error, not ignored.** A typo'd `writeableDirs`
 that silently does nothing is exactly how a repo ends up debugging a service
@@ -224,6 +233,22 @@ field, e.g. `services[0].port: must be between 1025 and 65535, got 80`.
 `--services-trust-ref REF` gates the spec exactly as `--checkout` is gated
 for the rest of a run — see `docs/kubernetes-runs.md`'s "Per-run services"
 section for the three-way trust rule.
+
+### Checking the spec without a cluster
+
+The same parser the cluster path runs can check a spec on its own:
+
+    fork-sandbox validate-services .agents/sandbox-services/services.yaml
+
+    .agents/sandbox-services/services.yaml: valid services spec
+    limits applied: K8S_SERVICES_MAX=8 (built-in default), K8S_SERVICE_MAX_CPU=1000m (built-in default), K8S_SERVICE_MAX_MEMORY=1Gi (built-in default)
+
+It applies the per-run caps the cluster path would — `K8S_SERVICES_MAX` /
+`K8S_SERVICE_MAX_CPU` / `K8S_SERVICE_MAX_MEMORY` from this machine's
+`k8s.env` when set, otherwise the same built-in defaults — and prints which
+limits it applied with their source, so a pass is only a guarantee under the
+limits it names. On failure it exits non-zero with the same field-naming
+messages the cluster path gives.
 
 ### What the harness guarantees on every sidecar, never from the spec
 
