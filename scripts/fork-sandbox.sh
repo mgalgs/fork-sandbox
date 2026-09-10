@@ -61,14 +61,12 @@
 #                        can talk to -- claude and codex are refused with
 #                        sealed. Chosen independently of --harness: it is a
 #                        separate flag, not derived from the harness name.
-#                        --harness pi-local is a permanent alias for
-#                        --harness pi --network sealed.
 # --dry-run:             resolve and print the harness and model, then exit
 #                        without creating a clone, run directory or session.
 # --claude-args "...":   extra arguments passed verbatim to the claude CLI
 # --pi-args "...":       extra arguments passed verbatim to pi, e.g.
-#                        "--thinking low". Only with --harness pi or
-#                        pi-local, which are the harnesses that start pi.
+#                        "--thinking low". Only with --harness pi, the
+#                        harness that starts pi.
 # --review-loop <N>:     after the session ends, review its commits in a fresh
 #                        session and let a third one fix what the review
 #                        found, up to N times. N must be a positive integer.
@@ -79,19 +77,19 @@
 #                        validated the same way as --model, against the same
 #                        harness (or against --review-harness, when given).
 # --review-harness <name>[/<model>]:
-#                        use this harness for review legs -- claude, pi,
-#                        pi-local or codex, with the same combined
+#                        use this harness for review legs -- claude, pi
+#                        or codex, with the same combined
 #                        harness/model form --harness takes. Fix legs
 #                        continue to use --harness. Requires --review-loop.
 #                        A model given both here and via --review-model
-#                        conflicts, same as --harness/--model. --harness
-#                        pi-local (sealed, no network) with a networked
+#                        conflicts, same as --harness/--model. A sealed
+#                        implement leg with a networked
 #                        --review-harness warns and proceeds: the implement
 #                        leg stays sealed, but the review leg is a separate,
 #                        networked sandbox that sends the clone's contents
 #                        to that harness's model provider -- a tradeoff left
-#                        to the caller's judgement. The reverse --
-#                        --review-harness pi-local reviewing a networked
+#                        to the caller's judgement. The reverse -- a
+#                        sealed review leg reviewing a networked
 #                        implement harness -- is fine and silent. Refused
 #                        with --k8s.
 # --maintainer-loop <N>:
@@ -119,12 +117,12 @@
 #                        against --maintainer-harness when given.
 # --maintainer-harness <name>[/<model>]:
 #                        the harness the maintainer legs run on -- claude,
-#                        pi, pi-local or codex, in the same combined
+#                        pi or codex, in the same combined
 #                        harness/model form --harness takes. Defaults to
 #                        --harness. Requires --maintainer-loop. A model
 #                        given both here and via --maintainer-model
-#                        conflicts, same as --harness/--model. --harness
-#                        pi-local with a networked --maintainer-harness
+#                        conflicts, same as --harness/--model. A sealed
+#                        implement leg with a networked --maintainer-harness
 #                        warns and proceeds, the same tradeoff as
 #                        --review-harness. Refused with --k8s and
 #                        --review-only.
@@ -205,8 +203,8 @@
 # --k8s:                 submit this run as a Kubernetes Job instead of a
 #                        local sandbox, by exec'ing fork-sandbox-k8s.sh run
 #                        with the arguments below. Defaults --harness to pi,
-#                        the only harness the cluster path builds; claude,
-#                        pi-local and codex are still refused if named
+#                        the only harness the cluster path builds; claude
+#                        and codex are still refused if named
 #                        explicitly. Most other flags describe LOCAL sandbox
 #                        machinery this run never touches and are refused by
 #                        name rather than silently dropped -- see
@@ -409,7 +407,7 @@
 #
 # claude only, for now. The threshold is measured in
 # fork-sandbox-inbox-hook.sh, which already runs on every tool call and reads
-# the transcript path off the hook payload — pi, pi-local and codex have no
+# the transcript path off the hook payload — pi and codex have no
 # hook system to measure with, so --refresh-at is refused outright on those
 # harnesses, and on --k8s, whose pod runs a different entrypoint.
 #
@@ -490,8 +488,8 @@
 # --result above all — still have nothing to render. Read events.jsonl
 # directly, with --log and the summary alongside it.
 #
-# --harness pi-local runs pi against a model YOU host, in a sandbox with no
-# network at all. The wrapper is agent-sandboxed rather than
+# --harness pi --network sealed runs pi against a model YOU host, in a
+# sandbox with no network at all. The wrapper is agent-sandboxed rather than
 # claude-sandboxed: same clone, same services, same fetch-back, but egress
 # is sealed and the one endpoint arrives over a unix socket. Read its
 # header for how the bridge works.
