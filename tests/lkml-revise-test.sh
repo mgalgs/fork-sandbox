@@ -256,6 +256,36 @@ check "the bare seat posted the harvested reply and v5's three messages" "4" "$n
 check "every bare-seat message is stamped with the fallback model" "$n_pi" "$n_pi_unknown"
 check "the harvested reply landed with the bare seat" "1" "$bare_reply"
 
+printf '\n== a pi-local author with an explicit pinned network is refused before any launch ==\n'
+# The pi-local + network: pinned contradiction is refused inside
+# lkml-seats-resolve (the frontmatter check runs before the seats-file
+# early exit, so it fires even with no seats file). Pin it through the
+# launcher itself, not just the resolver unit test, so a launcher that
+# ever stops calling the resolver cannot silently launch a sealed seat.
+pin_personas="$(mktemp -d)"; tmpdirs+=("$pin_personas")
+cat > "$pin_personas/author.md" <<'EOF'
+---
+persona: author
+role: author
+display: The Author
+harness: pi-local
+network: pinned
+---
+
+# The Author (AI persona)
+
+Body.
+EOF
+n_runs_before=$(find "$run_prefix_dir" -maxdepth 1 -name 'run.*' | wc -l)
+out="$(PATH="$stub_bin:$PATH" "$revise" widget-frob --project "$real_repo" \
+    --checkout somebranch --version 1 --base "$series_base_sha" \
+    --personas-dir "$pin_personas" 2>&1)"
+rc=$?
+if (( rc != 0 )); then ok "exits non-zero on pi-local with network: pinned"; else no "exits non-zero on pi-local with network: pinned" "exit 0"; fi
+contains "refusal names the already-sealed alias" "$out" "already sealed"
+n_runs_after=$(find "$run_prefix_dir" -maxdepth 1 -name 'run.*' | wc -l)
+check "no run was launched" "$n_runs_before" "$n_runs_after"
+
 printf '\n== --help ==\n'
 h_out="$("$revise" --help 2>&1)"; h_rc=$?
 if (( h_rc == 0 )); then ok "--help alone exits 0"; else no "--help alone exits 0" "exit $h_rc: $h_out"; fi

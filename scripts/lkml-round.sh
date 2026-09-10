@@ -65,11 +65,12 @@
 #            pi-local alias that expands to it -- is translated to pi
 #            against --endpoint (a pod has no sealed local endpoint; the
 #            endpoint reaches the same self-hosted model through the
-#            in-cluster proxy), not refused. Any other harness that is not pi or claude
-#            (e.g. codex) -- and a model-less claude seat, which submit
-#            would refuse once the seats ahead of it had already been
-#            submitted -- refuses the whole round in the seats
-#            pre-pass, before any seat is submitted. A cluster run has
+#            in-cluster proxy), not refused. Any other seat -- a
+#            harness that is not pi or claude (e.g. codex), or a
+#            model-less claude seat, which submit would refuse once
+#            the seats ahead of it had already been submitted -- is
+#            refused in the seats pre-pass, before any seat is
+#            submitted. A cluster run has
 #            no summary.json, so a seat's replies are stamped with its
 #            configured model; a model-less seat is stamped with the
 #            model the pod itself discovered (brought home in the
@@ -79,10 +80,10 @@
 #            a cluster run's cost is unknown, not free.
 # --endpoint <name> the registered K8S_PROXY_ENDPOINTS entry the pi
 #            seats (including sealed seats translated to pi for the
-#            cluster) are wired to,
-#            via fork-sandbox-k8s.sh submit --endpoint. Required with
-#            --k8s: endpoint names are site-specific configuration, so
-#            this repo ships none and refuses to guess.
+#            cluster) are wired to via fork-sandbox-k8s.sh submit
+#            --endpoint. Required with --k8s: endpoint names are
+#            site-specific configuration, so this repo ships none and
+#            refuses to guess.
 # --model-override <harness>[/<model>] overrides every persona's own
 #            harness/model for this round only -- useful for a cheap
 #            smoke-test round before spending on the real panel. A BARE

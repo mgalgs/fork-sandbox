@@ -86,7 +86,7 @@ n=$(find "$LKML_MAILBOX_ROOT/widget-frob/cur" -name '*.msg' | wc -l)
 check "posts the cover plus two patches (3 files)" "3" "$n"
 
 tree_out="$("$mailbox" tree widget-frob)"
-contains "tree shows the AI-attributed harness/model column" "$tree_out" "(claude/opus)"
+contains "tree shows a sealed seat's (harness/model) with its seal" "$tree_out" "(claude/opus, sealed)"
 contains "tree groups by version" "$tree_out" "=== v1 ==="
 contains "tree shows the cover subject" "$tree_out" "[PATCH v1 0/2]"
 contains "tree shows patch 1/2" "$tree_out" "[PATCH v1 1/2] frob: add core"
@@ -128,6 +128,13 @@ contains "reply: X-Depth is parent-depth + 1" "$raw1" "X-Depth: 2"
 contains "reply: X-AI-Network is stamped" "$raw1" "X-AI-Network: pinned"
 contains "reply: default subject prefixes Re:" "$raw1" "Subject: Re: [PATCH v1 1/2] frob: add core"
 contains "reply: carries the requested tag" "$raw1" "X-Tags: Question"
+
+# A pinned seat stays (harness/model) unmarked in the tree: the seal mark
+# is the sealed-vs-networked distinction, and absence is not a value.
+tree_out2="$("$mailbox" tree widget-frob)"
+r1_row="$(printf '%s\n' "$tree_out2" | grep "^[[:space:]]*${r1:0:7}")"
+check "a pinned seat's tree row is plain (harness/model)" "(claude/opus)" \
+    "$(printf '%s' "$r1_row" | awk '{print $3}')"
 
 printf '\n== inferred verdict positions ==\n'
 

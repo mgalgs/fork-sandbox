@@ -427,8 +427,8 @@ def who_of(m):
 
 def reviewer_rollup(version_msgs, author, tally_rows):
     """One entry per non-author persona, sorted by persona slug (the same
-    order the matrix's columns are in): display name, harness, model,
-    message count in this version, and how many patches
+    order the matrix's columns are in): display name, harness, network,
+    model, message count in this version, and how many patches
     their LATEST tag is a Reviewed-by / NAK. The verdict counts reuse the
     tally's latest-tag-per-persona-per-patch supersession instead of
     counting every tag ever posted -- a NAK withdrawn by a later

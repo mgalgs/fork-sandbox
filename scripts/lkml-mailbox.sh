@@ -336,10 +336,10 @@ LKML_SEQ=(); LKML_FILE=(); LKML_ATTACH=()
 
 lkml_load_series() {
     local series="$1" dir f id parent depth version persona harness model
-    local subject tags seq attach
+    local subject tags seq attach network
     LKML_ID=(); LKML_PARENT=(); LKML_DEPTH=(); LKML_VERSION=(); LKML_PERSONA=()
     LKML_HARNESS=(); LKML_MODEL=(); LKML_SUBJECT=(); LKML_TAGS=()
-    LKML_SEQ=(); LKML_FILE=(); LKML_ATTACH=()
+    LKML_SEQ=(); LKML_FILE=(); LKML_ATTACH=(); LKML_NETWORK=()
     dir="$(lkml_series_dir "$series")/cur"
     [[ -d "$dir" ]] || return 0
     for f in "$dir"/*.msg; do
@@ -351,6 +351,7 @@ lkml_load_series() {
         persona="$(lkml_header "$f" X-AI-Persona)"
         harness="$(lkml_header "$f" X-AI-Harness)"
         model="$(lkml_header "$f" X-AI-Model)"
+        network="$(lkml_header "$f" X-AI-Network)"
         subject="$(lkml_header "$f" Subject)"
         tags="$(lkml_header "$f" X-Tags)"
         seq="$(lkml_header "$f" X-Seq)"
@@ -360,6 +361,7 @@ lkml_load_series() {
         LKML_VERSION+=("$version"); LKML_PERSONA+=("$persona")
         LKML_HARNESS+=("$harness"); LKML_MODEL+=("$model"); LKML_SUBJECT+=("$subject")
         LKML_TAGS+=("$tags"); LKML_SEQ+=("$seq"); LKML_FILE+=("$f"); LKML_ATTACH+=("$attach")
+        LKML_NETWORK+=("$network")
     done
 }
 
@@ -803,8 +805,15 @@ lkml_tree_print() {
     [[ -n "$tags" ]] || tags="-"
     attach_mark=""
     [[ "${LKML_ATTACH[$i]:-0}" -gt 0 ]] && attach_mark=" 📎"
+    # The sealed fact rides the tree the way lkml-render.py --text carries
+    # it: a sealed pi seat and a networked one both stamp harness 'pi',
+    # so harness alone no longer shows the zero-cost local seat, and this
+    # tree is embedded verbatim in reviewer handoffs. A message with no
+    # X-AI-Network header (a pre-axis archive) renders exactly as before.
+    local seat="${LKML_HARNESS[$i]}/${LKML_MODEL[$i]}"
+    [[ "${LKML_NETWORK[$i]:-}" == "sealed" ]] && seat="$seat, sealed"
     printf '%s%s  %-14s %-16s %-20s %s%s\n' "$indent" "${id:0:7}" \
-        "${LKML_PERSONA[$i]}" "(${LKML_HARNESS[$i]}/${LKML_MODEL[$i]})" "$tags" "${LKML_SUBJECT[$i]}" "$attach_mark"
+        "${LKML_PERSONA[$i]}" "($seat)" "$tags" "${LKML_SUBJECT[$i]}" "$attach_mark"
     local -a child_idx=()
     local j
     for j in "${!LKML_PARENT[@]}"; do

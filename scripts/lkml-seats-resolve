@@ -254,7 +254,7 @@ if (( pi_flavor )); then
     thinking="${p_thinking:-${def_thinking:-$fm_thinking}}"
 else
     # thinking only reaches a seat via --pi-args, which the launchers
-    # pass only to pi and pi-local. An explicit seats-file thinking set
+    # pass only to pi. An explicit seats-file thinking set
     # at the effective harness's scope or a higher-precedence one would
     # be announced as if it took effect and then silently dropped, so
     # it is refused; the frontmatter's was written for the
