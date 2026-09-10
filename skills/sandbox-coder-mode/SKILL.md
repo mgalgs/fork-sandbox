@@ -28,8 +28,8 @@ goes out, and how to run several rounds without losing the thread.
 **Token economics.** This session can be the expensive model, because it
 spends its tokens on reading, planning, reviewing and integrating — not on
 generating the bulk of the code. The typing in the sandbox runs whatever is
-cheap: a smaller claude model, `pi` against OpenRouter, or `pi-local` against
-a self-hosted endpoint, which costs nothing at all. The in-sandbox review
+cheap: a smaller claude model, `pi` against OpenRouter, or a sealed `pi`
+against a self-hosted endpoint, which costs nothing at all. The in-sandbox review
 leg (tier 3, see **Entering the mode**) is the deliberate exception: it runs
 the expensive model too, by default, because catching a defect before it
 ever leaves the sandbox is worth that model's price — the economics argument
@@ -132,7 +132,7 @@ describes the mode; this section describes what running long demands.
   host-side git (see **What stays in this session**). It writes no project
   code.
 - **Tier 2 — implementer.** The cheap model, in the sandbox. It types, at the
-  default `--harness claude --model sonnet` — or a `pi` / `pi-local` harness
+  default `--harness claude --model sonnet` — or a `pi` / sealed-`pi` harness
   when a per-round reason calls for one — per **Choosing a harness and a
   model**.
 - **Tier 3 — in-sandbox reviewer.** On by default, via `--review-model opus
@@ -442,7 +442,7 @@ fork-sandbox say <run-dir> "The API changed under you — parse() takes a dict n
 ```
 
 It lands on the session's next tool call (`claude`) or within ~25 tool calls
-(`pi`, `pi-local`, `codex`), and it carries the same authority as the
+(`pi`, `codex`), and it carries the same authority as the
 handoff, so it may override it. See "Steering a run" in the `fork-sandbox`
 skill.
 
@@ -534,7 +534,7 @@ model that misread the task will misread it again.
    matters because the report is based on the branch and diff, while the
    session account is the author's claim. For a run without a review report,
    read the session account as before, or
-   `<run-dir>/events.jsonl` for `pi`, `pi-local` and `codex`, which write
+   `<run-dir>/events.jsonl` for `pi` and `codex`, which write
    plain text the formatted views cannot render.
 
 3. **Integrate in the real repo**: merge, rebase or cherry-pick onto the
@@ -696,14 +696,14 @@ file, or a key absent from it, means the default above.
    legs a model id that does not exist. Set `CODER_MODE_REVIEW_HARNESS`
    only to run the review legs under a different harness than the typing;
    it does not change which model name they need.
-2. **`pi-local` paired with a networked review harness costs money.** The
-   implement leg stays sealed either way, but `CODER_MODE_HARNESS=pi-local`
+2. **A sealed run paired with a networked review harness costs money.** The
+   implement leg stays sealed either way, but a sealed implement leg
    with a `CODER_MODE_REVIEW_HARNESS` of `claude`, `pi` or `codex` sends
    the review leg's contents to that harness's model provider, and the
    script only warns about this by name rather than refusing it — see
-   `README.md`'s `--harness pi-local --review-harness claude --review-model
-   opus --review-loop 2` for the recipe this exists to unblock. Leave the
-   review harness unset, or `pi-local`, to keep the whole run sealed.
+   `README.md`'s `--harness pi --network sealed --review-harness claude
+   --review-model opus --review-loop 2` for the recipe this exists to unblock. Leave the
+   review harness unset, or sealed, to keep the whole run sealed.
 3. **`CODER_MODE_REVIEW_LOOP=0` means no in-sandbox reviewer**: omit
    `--review-loop`, `--review-model` and `--review-harness` from the
    launch, all three — the script refuses `--review-harness` without
@@ -716,7 +716,7 @@ file, or a key absent from it, means the default above.
    model, the maintainer model has no default, because its verdict is the
    run's last word on the branch (`fork-sandbox.sh` refuses the loop
    without a model). The harness key resolves the model name exactly as
-   item 1 describes for review, and a sealed `pi-local` implement with a
+   item 1 describes for review, and a sealed implement leg with a
    networked maintainer harness warns by name exactly as item 2 describes
    — a maintainer leg sends the clone's contents to that harness's
    provider just as a review leg does.
@@ -754,7 +754,7 @@ Pick per task, and say why in one line when you launch:
 
 | Task | Harness | Cost (this leg) |
 |---|---|---|
-| Mechanical, high-volume, exploratory — a test sweep, a rename, a data-shape investigation | `--harness pi-local` | nothing — unless the round's `--review-harness` is networked, which prices the review leg separately (see item 2 above) |
+| Mechanical, high-volume, exploratory — a test sweep, a rename, a data-shape investigation | `--harness pi --network sealed` | nothing — unless the round's `--review-harness` is networked, which prices the review leg separately (see item 2 above) |
 | Ordinary implementation with a clear plan | `--harness claude --model sonnet` (the default) | subscription |
 | Work where the model quality decides the outcome | `--harness claude --model opus` | subscription |
 | A second opinion from outside the family | `--harness pi --model <openrouter-id>` or `--harness codex` | real money / ChatGPT sign-in |
@@ -873,7 +873,7 @@ default, which is the expensive model this session is likely running on —
 and the mode's whole reason for existing is gone. The defaults above are
 that pin; only spell the flags out again when deviating from them.
 
-`pi-local` is sealed: no network at all, so nothing can be installed or
+A sealed run has no network at all, so nothing can be installed or
 fetched in there. Say in the handoff what is already provided, or the run
 spends itself discovering it cannot `npm install`.
 
@@ -883,7 +883,7 @@ Check what a round actually cost before choosing the next one's harness:
 fork-sandbox status --json <run-dir> | jq .cost_usd
 ```
 
-`--json` also carries the token counts and the harness version. A `pi-local`
+`--json` also carries the token counts and the harness version. A sealed
 run reads a zero cost; a codex run reports tokens and a null cost.
 
 ## When a single round of review isn't enough
@@ -911,7 +911,7 @@ something the sandbox does not have:
 - **A push**, or anything else touching a remote.
 - **The tailnet or a VPN.** (`--sandbox-args "--unpin-egress"` reaches them,
   but it removes a restriction — use it only when the task genuinely needs
-  it, and never on a `pi-local` run, which refuses it outright.)
+  it, and never on a sealed run, which refuses it outright.)
 - **An interactive session** — anything where someone has to answer a
   question mid-run, or watch a UI. That is `fork-task`, not `fork-sandbox`.
 - **A change small enough to prove by reading**, per the threshold above.

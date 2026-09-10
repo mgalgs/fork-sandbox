@@ -317,8 +317,8 @@ same way. Nothing beyond those sockets is reachable. So the implement leg costs
 nothing, holds no credential, and cannot send anything anywhere. That is
 specific to the implement leg: `--review-harness` can point a review leg at
 a networked, credentialed harness instead, in a separate sandbox that does
-not share this seal — see `fork-sandbox.sh --help` and the `--network`
-reference in `skills/fork-sandbox/SKILL.md` for that flag.
+not share this seal — see `fork-sandbox.sh --help` for `--network` and
+`--review-harness`.
 
 Setup is one file, on each machine that has such an endpoint:
 

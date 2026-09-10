@@ -1,6 +1,6 @@
 ---
 name: code-review-portable
-description: Portable code review of a local commit range — find correctness bugs and reuse/simplification/efficiency cleanups, verify each finding before reporting, and scale depth by effort level. A harness-agnostic stand-in for the built-in /code-review, for agents that do not have it (pi, pi-local, codex).
+description: Portable code review of a local commit range — find correctness bugs and reuse/simplification/efficiency cleanups, verify each finding before reporting, and scale depth by effort level. A harness-agnostic stand-in for the built-in /code-review, for agents that do not have it (pi, codex).
 argument-hint: "<level> <base>...<head> — level is low|medium|high|xhigh|max; the range is a local git range such as abc123...HEAD"
 ---
 
@@ -11,7 +11,7 @@ worth cleaning up. Report it concretely.
 
 This skill is a portable stand-in for the built-in `/code-review`, which is
 compiled into Claude Code and so exists only on the `claude` harness. Every
-other harness — `pi`, `pi-local`, `codex` — gets this instead. The method is
+other harness — `pi`, `codex` — gets this instead. The method is
 the same; only the engine differs. Follow the steps in order.
 
 You need no network for any of this. The review is entirely local: the clone
