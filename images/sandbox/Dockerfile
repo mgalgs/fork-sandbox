@@ -28,10 +28,17 @@ FROM node:22-bookworm-slim
 # shellcheck, because a repo whose contribution rules require it -- this one
 # does -- otherwise hands an agent a rule it cannot follow: the sandbox has no
 # network, so a run that finds shellcheck missing cannot install it and can
-# only report that it skipped the check.
+# only report that it skipped the check. bsdextrautils for the same reason,
+# one layer worse: it carries `column`, which shell test suites reach for
+# routinely and which Debian leaves out of the slim base, and a seat that
+# finds it missing has been observed writing its own stand-in and reporting
+# the suite green -- a missing tool an agent can fake is worse than one it
+# cannot. The package name is not util-linux on Debian: bookworm ships
+# /usr/bin/column in bsdextrautils.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         bash \
+        bsdextrautils \
         ca-certificates \
         curl \
         git \
