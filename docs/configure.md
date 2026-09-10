@@ -8,7 +8,7 @@ anything:
 | `pi.env` | `OPENROUTER_API_KEY` — a real secret, mode 0600 |
 | `model.env` | `MODEL_ENDPOINT`, `MODEL_ID`, `MODEL_CTX` — a local model endpoint |
 | `k8s.env` | `K8S_CONTEXT`, `K8S_NAMESPACE`, `K8S_IMAGE`, `K8S_PROXY_UPSTREAM`, `K8S_DENIED_PROBE` |
-| `coder-mode.env` | `CODER_MODE_HARNESS`, `CODER_MODE_MODEL`, `CODER_MODE_REVIEW_HARNESS`, `CODER_MODE_REVIEW_MODEL`, `CODER_MODE_REVIEW_LOOP` — the `sandbox-coder-mode` skill's launch defaults, read by the orchestrating session, not by any script; `configure` does not write it |
+| `coder-mode.env` | `CODER_MODE_*` — the `sandbox-coder-mode` skill's launch defaults: a composition spelled key-per-flag (`CODER_MODE_HARNESS`, `CODER_MODE_MODEL`, `CODER_MODE_NETWORK`, the `REVIEW` and `MAINTAINER` sets), or `CODER_MODE_PRESET` naming one preset in place of all of them. The skill owns the key list; these are read by the orchestrating session, not by any script, and `configure` does not write the file |
 
 Assembling that by hand means copying key names out of docs and typing a
 `chmod 600`. `configure` does it instead: it discovers what is already on

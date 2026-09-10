@@ -680,6 +680,7 @@ file, or a key absent from it, means the default above.
 |---|---|---|
 | `CODER_MODE_HARNESS` | `--harness` | `claude` |
 | `CODER_MODE_MODEL` | `--model` | `sonnet` |
+| `CODER_MODE_NETWORK` | `--network` | `pinned` |
 | `CODER_MODE_REVIEW_HARNESS` | `--review-harness` | unset (same as `--harness`) |
 | `CODER_MODE_REVIEW_MODEL` | `--review-model` | `opus` |
 | `CODER_MODE_REVIEW_LOOP` | `--review-loop` | `2` |
@@ -696,7 +697,35 @@ file, or a key absent from it, means the default above.
    legs a model id that does not exist. Set `CODER_MODE_REVIEW_HARNESS`
    only to run the review legs under a different harness than the typing;
    it does not change which model name they need.
-2. **A sealed run paired with a networked review harness costs money.** The
+2. **`CODER_MODE_NETWORK=sealed` is how a machine defaults to a sealed
+   run**, and it drags `CODER_MODE_HARNESS=pi` along with it: sealed means
+   pi against a model you host, and the script refuses it outright on
+   `claude` and on `codex`, neither of which has a self-hosted-endpoint
+   path. It also needs `~/.config/fork-sandbox/model.env` to name that
+   endpoint — checked before the clone, so a machine missing the file
+   fails at launch rather than an hour in. `CODER_MODE_MODEL` becomes
+   optional on such a machine, since `model.env` already carries a model,
+   and is still honoured when set.
+
+   The key sets the **code seat only**, because `--network` is the code
+   seat's flag and no `--review-network` or `--maintainer-network` exists
+   to pair with it. That is not the hole it looks like: with
+   `CODER_MODE_REVIEW_HARNESS` unset, review legs reuse the implement
+   leg's sandbox command wholesale, so they come out sealed too — which
+   is why `CODER_MODE_REVIEW_MODEL` on a sealed machine must name a model
+   the endpoint actually serves, `opus` there being a model id that does
+   not exist (item 1). What these keys genuinely cannot express is a
+   *mixed* composition — sealed on one seat, networked on another. That
+   is a preset's per-seat `network:` key, below.
+
+   Two things a sealed default cannot do, both worth knowing before
+   setting it: a `--k8s` round, which refuses sealed because a pod
+   reaches the in-cluster model proxy and its isolation is the
+   NetworkPolicy's job instead; and `--sandbox-args`, whose only legal
+   value is `--unpin-egress` and which a sealed sandbox has no network to
+   unpin. Both are ordinary per-round deviations, announced with their
+   reason like any other.
+3. **A sealed run paired with a networked review harness costs money.** The
    implement leg stays sealed either way, but a sealed implement leg
    with a `CODER_MODE_REVIEW_HARNESS` of `claude`, `pi` or `codex` sends
    the review leg's contents to that harness's model provider, and the
@@ -704,20 +733,20 @@ file, or a key absent from it, means the default above.
    `README.md`'s `--harness pi --network sealed --review-harness claude
    --review-model opus --review-loop 2` for the recipe this exists to unblock. Leave the
    review harness unset, or sealed, to keep the whole run sealed.
-3. **`CODER_MODE_REVIEW_LOOP=0` means no in-sandbox reviewer**: omit
+4. **`CODER_MODE_REVIEW_LOOP=0` means no in-sandbox reviewer**: omit
    `--review-loop`, `--review-model` and `--review-harness` from the
    launch, all three — the script refuses `--review-harness` without
    `--review-loop`, and refuses `--review-loop` set to `0` on the command
    line.
-4. **The maintainer keys follow the same rules, with one inversion.**
+5. **The maintainer keys follow the same rules, with one inversion.**
    Unset (or `0`) `CODER_MODE_MAINTAINER_LOOP` means no maintainer tier:
-   omit all three `--maintainer-*` flags, as in item 3. When the loop is
+   omit all three `--maintainer-*` flags, as in item 4. When the loop is
    set, `CODER_MODE_MAINTAINER_MODEL` is **required** — unlike the review
    model, the maintainer model has no default, because its verdict is the
    run's last word on the branch (`fork-sandbox.sh` refuses the loop
    without a model). The harness key resolves the model name exactly as
    item 1 describes for review, and a sealed implement leg with a
-   networked maintainer harness warns by name exactly as item 2 describes
+   networked maintainer harness warns by name exactly as item 3 describes
    — a maintainer leg sends the clone's contents to that harness's
    provider just as a review leg does.
 
@@ -754,7 +783,7 @@ Pick per task, and say why in one line when you launch:
 
 | Task | Harness | Cost (this leg) |
 |---|---|---|
-| Mechanical, high-volume, exploratory — a test sweep, a rename, a data-shape investigation | `--harness pi --network sealed` | nothing — unless the round's `--review-harness` is networked, which prices the review leg separately (see item 2 above) |
+| Mechanical, high-volume, exploratory — a test sweep, a rename, a data-shape investigation | `--harness pi --network sealed` | nothing — unless the round's `--review-harness` is networked, which prices the review leg separately (see item 3 above) |
 | Ordinary implementation with a clear plan | `--harness claude --model sonnet` (the default) | subscription |
 | Work where the model quality decides the outcome | `--harness claude --model opus` | subscription |
 | A second opinion from outside the family | `--harness pi --model <openrouter-id>` or `--harness codex` | real money / ChatGPT sign-in |
