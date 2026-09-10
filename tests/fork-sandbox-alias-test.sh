@@ -298,5 +298,26 @@ else
     esac
 fi
 
+printf '\n== --harness pi-local vs an explicit --network ==\n'
+
+if "$launcher" --dry-run --harness pi-local --network pinned \
+    unused-project unused-handoff > /dev/null 2>"$err"; then
+    no "pi-local conflicts with an explicit --network pinned"
+else
+    case "$(cat "$err")" in
+        *"harness 'pi-local' is already sealed"*"'pinned'"*)
+            ok "pi-local conflicts with an explicit --network pinned" ;;
+        *) no "pi-local conflicts with an explicit --network pinned" \
+            "$(cat "$err")" ;;
+    esac
+fi
+
+out="$(run --harness pi-local --network sealed 2>"$err")"
+check "pi-local with a redundant --network sealed still resolves" \
+    $'harness=pi\nmodel=' "$out"
+
+out="$(run --harness pi-local 2>"$err")"
+check "bare --harness pi-local still resolves" $'harness=pi\nmodel=' "$out"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))

@@ -1895,6 +1895,11 @@ fi
 # here, before validation, so nothing downstream ever sees "pi-local" as a
 # harness value.
 if [[ "$harness" == "pi-local" ]]; then
+    if [[ "$network_given" == true && "$network_arg" != "sealed" ]]; then
+        echo "Error: harness 'pi-local' is already sealed; --network can" >&2
+        echo "only be 'sealed' or omitted, not '$network_arg'." >&2
+        exit 1
+    fi
     harness="pi"
     network_arg="sealed"
     harness_alias_pi_local=true
