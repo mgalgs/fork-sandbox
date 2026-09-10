@@ -311,17 +311,18 @@ And a change the user explicitly asks this session to make by hand.
 
 **The threshold is confidence, not line count.** Make the edit here when you
 can tell it is right by reading it, and the whole change stays within a few
-lines across a file or two. Send it to a sandbox when it needs a plan, spans
-several files, or can only be shown correct by running something — a test
-suite, a build, a render.
+lines across a file or two. Delegate when the work has scale — several files,
+a sweep, a migration — or when it wants its own review loop, or when it will
+run long enough that nobody should sit through it.
 
-Do not stand up a sandbox to fix three lines. The overhead is real and it is
-paid in wall-clock, tokens and your own attention; a round trip that costs
-more than the work is not caution, it is ceremony.
+"It needs a test run, a build, a browser" is not a reason to delegate: this
+session can run those too. Nor is a change you have only imagined the tests
+for — size the production change, not the test file you might write.
 
-When a "small" edit turns out to need a second and a third, stop and delegate
-the rest. The signal is not the size you estimated, but the size it is turning
-into.
+**When the two look close, do it here.** The costs are asymmetric: a
+misjudged edit costs minutes, and when it turns out to need a second and a
+third you stop and delegate the rest. A misjudged round costs wall-clock, a
+review cycle and the user's attention, and cannot be recalled.
 
 ## Before every launch
 
