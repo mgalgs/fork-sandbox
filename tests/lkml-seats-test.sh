@@ -73,6 +73,23 @@ thinking: high
 ---
 Local thinker.
 PERSONA
+cat > "$personas_test_dir/sealy.md" <<'PERSONA'
+---
+persona: sealy
+harness: pi
+network: sealed
+---
+Explicitly sealed, no alias.
+PERSONA
+cat > "$personas_test_dir/badseal.md" <<'PERSONA'
+---
+persona: badseal
+harness: claude
+network: sealed
+---
+An impossible seat: a non-pi harness paired with sealed, straight in
+its own frontmatter, with no seats file to blame.
+PERSONA
 
 # resolve_helper <seats-file | ABSENT> <persona> <fm-harness> <fm-model>
 # <fm-thinking> <fm-network> — call the helper with a controlled HOME and
@@ -107,8 +124,19 @@ check "absent file keeps a persona's thinking pin" "high" "$(resolved_field RES_
 check "absent file expands a frontmatter pi-local to pi" "pi" "$(resolved_field RES_OUT 1)"
 check "absent file expands a frontmatter pi-local to sealed" "sealed" "$(resolved_field RES_OUT 4)"
 
+resolve_helper ABSENT thinky pi-local "" high pinned
+check "frontmatter pi-local with an explicit pinned is refused" "1" "$RES_RC"
+contains "the refusal names the contradiction" "$RES_ERR" "already sealed"
+contains "the refusal names pi-local" "$RES_ERR" "pi-local"
+
+printf '\n== a frontmatter network: sealed with no alias reaches the seat ==\n'
+resolve_helper ABSENT sealy pi "" "" sealed
+check "an explicit frontmatter sealed is not itself an error" "0" "$RES_RC"
+check "an explicit frontmatter sealed passes through" "sealed" "$(resolved_field RES_OUT 4)"
+check "an explicit frontmatter sealed on pi is not refused" "pi" "$(resolved_field RES_OUT 1)"
+
 printf '\n== LKML_SEATS_FILE set to a missing path is an error ==\n'
-resolve_helper "$work/does-not-exist.yaml" core claude opus ""
+resolve_helper "$work/does-not-exist.yaml" core claude opus "" ""
 check "explicit missing seats file exits non-zero" "1" "$RES_RC"
 contains "explicit missing seats file names the path" "$RES_ERR" "does-not-exist.yaml"
 
@@ -117,16 +145,19 @@ cat > "$work/seats-default.yaml" <<'YAML'
 default:
   harness: pi-local
 YAML
-resolve_helper "$work/seats-default.yaml" core claude opus ""
-check "default re-seats core on pi-local" "pi-local" "$(resolved_field RES_OUT 1)"
+resolve_helper "$work/seats-default.yaml" core claude opus "" ""
+check "default re-seats core on pi" "pi" "$(resolved_field RES_OUT 1)"
+check "default re-seats core sealed" "sealed" "$(resolved_field RES_OUT 4)"
 check "default's harness drops core's frontmatter model" "" "$(resolved_field RES_OUT 2)"
-contains "default re-seat is announced" "$RES_OUT" "seat core: pi-local (seats-default.yaml, was claude/opus)"
-resolve_helper "$work/seats-default.yaml" author claude opus ""
-check "default re-seats author on pi-local" "pi-local" "$(resolved_field RES_OUT 1)"
+contains "default re-seat is announced" "$RES_OUT" "seat core: pi, sealed (seats-default.yaml, was claude/opus)"
+resolve_helper "$work/seats-default.yaml" author claude opus "" ""
+check "default re-seats author on pi" "pi" "$(resolved_field RES_OUT 1)"
+check "default re-seats author sealed" "sealed" "$(resolved_field RES_OUT 4)"
 check "default's harness drops author's frontmatter model" "" "$(resolved_field RES_OUT 2)"
-resolve_helper "$work/seats-default.yaml" ci pi-local "" ""
-check "a persona already at the default's seat stays put" "pi-local" "$(resolved_field RES_OUT 1)"
-check "an unchanged seat is not announced" "" "$(resolved_field RES_OUT 4)"
+resolve_helper "$work/seats-default.yaml" ci pi-local "" "" ""
+check "a persona already at the default's seat stays put" "pi" "$(resolved_field RES_OUT 1)"
+check "a persona already at the default's seat stays sealed" "sealed" "$(resolved_field RES_OUT 4)"
+check "an unchanged seat is not announced" "" "$(resolved_field RES_OUT 5)"
 
 printf '\n== per-persona entry beats default: ==\n'
 cat > "$work/seats-perp.yaml" <<'YAML'
@@ -137,12 +168,13 @@ personas:
     harness: claude
     model: opus
 YAML
-resolve_helper "$work/seats-perp.yaml" author claude opus ""
+resolve_helper "$work/seats-perp.yaml" author claude opus "" ""
 check "per-persona entry keeps author on claude" "claude" "$(resolved_field RES_OUT 1)"
 check "per-persona entry keeps author on opus" "opus" "$(resolved_field RES_OUT 2)"
-check "an unchanged seat stays unannounced" "" "$(resolved_field RES_OUT 4)"
-resolve_helper "$work/seats-perp.yaml" core claude opus ""
-check "core still falls through to the default" "pi-local" "$(resolved_field RES_OUT 1)"
+check "an unchanged seat stays unannounced" "" "$(resolved_field RES_OUT 5)"
+resolve_helper "$work/seats-perp.yaml" core claude opus "" ""
+check "core still falls through to the default" "pi" "$(resolved_field RES_OUT 1)"
+check "core falling through to the default is sealed" "sealed" "$(resolved_field RES_OUT 4)"
 
 printf '\n== a seats harness without a model drops the frontmatter model ==\n'
 cat > "$work/seats-harnonmodel.yaml" <<'YAML'
@@ -150,12 +182,13 @@ personas:
   core:
     harness: claude
 YAML
-resolve_helper "$work/seats-harnonmodel.yaml" core claude opus ""
+resolve_helper "$work/seats-harnonmodel.yaml" core claude opus "" ""
 check "harness-only entry keeps the same harness" "claude" "$(resolved_field RES_OUT 1)"
 check "harness-only entry drops the frontmatter model" "" "$(resolved_field RES_OUT 2)"
 contains "a model drop is announced" "$RES_OUT" "seat core: claude (seats-harnonmodel.yaml, was claude/opus)"
-resolve_helper "$work/seats-harnonmodel.yaml" thinky pi-local "" high
-check "personas without an entry keep their own seat" "pi-local" "$(resolved_field RES_OUT 1)"
+resolve_helper "$work/seats-harnonmodel.yaml" thinky pi-local "" high ""
+check "personas without an entry keep their own seat" "pi" "$(resolved_field RES_OUT 1)"
+check "personas without an entry keep their own seat sealed" "sealed" "$(resolved_field RES_OUT 4)"
 check "personas without an entry keep their thinking" "high" "$(resolved_field RES_OUT 3)"
 
 printf '\n== a personas.<p> harness drops EVERY lower-scope model ==\n'
@@ -167,8 +200,9 @@ personas:
   core:
     harness: pi-local
 YAML
-resolve_helper "$work/seats-pdrop.yaml" core claude opus ""
-check "persona harness overrides the default harness" "pi-local" "$(resolved_field RES_OUT 1)"
+resolve_helper "$work/seats-pdrop.yaml" core claude opus "" ""
+check "persona harness overrides the default harness" "pi" "$(resolved_field RES_OUT 1)"
+check "persona harness overrides the default harness sealed" "sealed" "$(resolved_field RES_OUT 4)"
 check "persona harness drops the default's model" "" "$(resolved_field RES_OUT 2)"
 cat > "$work/seats-pdrop2.yaml" <<'YAML'
 default:
@@ -178,8 +212,9 @@ personas:
     harness: pi-local
     model: tiny
 YAML
-resolve_helper "$work/seats-pdrop2.yaml" core claude opus ""
-check "a same-scope model rides with its harness" "pi-local" "$(resolved_field RES_OUT 1)"
+resolve_helper "$work/seats-pdrop2.yaml" core claude opus "" ""
+check "a same-scope model rides with its harness" "pi" "$(resolved_field RES_OUT 1)"
+check "a same-scope model rides with its harness sealed" "sealed" "$(resolved_field RES_OUT 4)"
 check "a same-scope model wins over the default's" "tiny" "$(resolved_field RES_OUT 2)"
 cat > "$work/seats-pdefmodel.yaml" <<'YAML'
 default:
@@ -189,7 +224,7 @@ personas:
   author:
     model: opus
 YAML
-resolve_helper "$work/seats-pdefmodel.yaml" author claude opus ""
+resolve_helper "$work/seats-pdefmodel.yaml" author claude opus "" ""
 check "a higher-scope model rides a lower-scope harness" "claude" "$(resolved_field RES_OUT 1)"
 check "the higher-scope model wins the model key" "opus" "$(resolved_field RES_OUT 2)"
 
@@ -199,23 +234,23 @@ personas:
   core:
     model: sonnet
 YAML
-resolve_helper "$work/seats-modelonly.yaml" core claude opus ""
+resolve_helper "$work/seats-modelonly.yaml" core claude opus "" ""
 check "model-only entry keeps the frontmatter harness" "claude" "$(resolved_field RES_OUT 1)"
 check "model-only entry wins the model key" "sonnet" "$(resolved_field RES_OUT 2)"
 
 printf '\n== thinking inherits from frontmatter, seats overrides it ==\n'
-resolve_helper "$work/seats-default.yaml" thinky pi-local "" high
+resolve_helper "$work/seats-default.yaml" thinky pi-local "" high ""
 check "thinking inherits from frontmatter when no seat sets it" "high" "$(resolved_field RES_OUT 3)"
-check "an inherited thinking announces nothing" "" "$(resolved_field RES_OUT 4)"
+check "an inherited thinking announces nothing" "" "$(resolved_field RES_OUT 5)"
 cat > "$work/seats-thinking.yaml" <<'YAML'
 default:
   harness: pi-local
   thinking: low
 YAML
-resolve_helper "$work/seats-thinking.yaml" thinky pi-local "" high
+resolve_helper "$work/seats-thinking.yaml" thinky pi-local "" high ""
 check "a seats thinking overrides the frontmatter thinking" "low" "$(resolved_field RES_OUT 3)"
 contains "an overridden thinking is announced" "$RES_OUT" "thinking low, was high"
-resolve_helper "$work/seats-thinking.yaml" core claude opus ""
+resolve_helper "$work/seats-thinking.yaml" core claude opus "" ""
 check "a seats thinking applies to personas whose frontmatter has none" "low" "$(resolved_field RES_OUT 3)"
 
 printf '\n== thinking on a non-pi seat: explicit refused, inherited dropped ==\n'
@@ -224,7 +259,7 @@ default:
   harness: claude
   thinking: low
 YAML
-resolve_helper "$work/seats-thinknopy.yaml" core claude opus ""
+resolve_helper "$work/seats-thinknopy.yaml" core claude opus "" ""
 check "explicit seats thinking on a non-pi seat is refused" "1" "$RES_RC"
 contains "the refusal names the key's default-scope path" "$RES_ERR" "default.thinking"
 contains "the refusal names the persona the seat affects" "$RES_ERR" "for persona 'core'"
@@ -237,23 +272,24 @@ personas:
     harness: claude
     thinking: low
 YAML
-resolve_helper "$work/seats-thinknop2.yaml" core claude opus ""
+resolve_helper "$work/seats-thinknop2.yaml" core claude opus "" ""
 check "persona-level explicit thinking is refused too" "1" "$RES_RC"
 contains "the persona-scope refusal names the key's path" "$RES_ERR" "personas.core.thinking"
-resolve_helper "$work/seats-thinknop2.yaml" thinky pi-local "" high
-check "the same file still re-seats a pi seat" "pi-local" "$(resolved_field RES_OUT 1)"
+resolve_helper "$work/seats-thinknop2.yaml" thinky pi-local "" high ""
+check "the same file still re-seats a pi seat" "pi" "$(resolved_field RES_OUT 1)"
+check "the same file still re-seats a pi seat sealed" "sealed" "$(resolved_field RES_OUT 4)"
 check "the pi seat keeps its own thinking" "high" "$(resolved_field RES_OUT 3)"
 cat > "$work/seats-harnoffpi.yaml" <<'YAML'
 default:
   harness: claude
 YAML
-resolve_helper "$work/seats-harnoffpi.yaml" thinky pi-local "" high
+resolve_helper "$work/seats-harnoffpi.yaml" thinky pi-local "" high ""
 check "moving a seat off pi is not itself an error" "0" "$RES_RC"
 check "the inherited frontmatter thinking is dropped" "" "$(resolved_field RES_OUT 3)"
 contains "the harness move is still announced" "$RES_OUT" \
-    "seat thinky: claude (seats-harnoffpi.yaml, was pi-local)"
-case "$(resolved_field RES_OUT 4)" in
-    *thinking*) no "the announce does not mention the dropped thinking" "$(resolved_field RES_OUT 4)" ;;
+    "seat thinky: claude (seats-harnoffpi.yaml, was pi, sealed)"
+case "$(resolved_field RES_OUT 5)" in
+    *thinking*) no "the announce does not mention the dropped thinking" "$(resolved_field RES_OUT 5)" ;;
     *) ok "the announce does not mention the dropped thinking" ;;
 esac
 
@@ -271,14 +307,15 @@ personas:
     harness: claude
     model: opus
 YAML
-resolve_helper "$work/seats-crossscope.yaml" core claude opus ""
+resolve_helper "$work/seats-crossscope.yaml" core claude opus "" ""
 check "the persona harness re-seats core to claude" "claude" "$(resolved_field RES_OUT 1)"
 check "the persona's model rides the persona's harness" "opus" "$(resolved_field RES_OUT 2)"
 check "a lower-scope thinking does not refuse the seat" "0" "$RES_RC"
 check "the lower-scope thinking reaches no seat" "" "$(resolved_field RES_OUT 3)"
 check "the lower-scope thinking prints nothing to stderr" "" "$RES_ERR"
-resolve_helper "$work/seats-crossscope.yaml" author claude opus ""
-check "the default's harness still re-seats a pi seat" "pi-local" "$(resolved_field RES_OUT 1)"
+resolve_helper "$work/seats-crossscope.yaml" author claude opus "" ""
+check "the default's harness still re-seats a pi seat" "pi" "$(resolved_field RES_OUT 1)"
+check "the default's harness still re-seats a pi seat sealed" "sealed" "$(resolved_field RES_OUT 4)"
 check "the default's thinking still applies on a pi seat" "low" "$(resolved_field RES_OUT 3)"
 cat > "$work/seats-crosspi.yaml" <<'YAML'
 default:
@@ -287,8 +324,36 @@ personas:
   thinky:
     harness: pi-local
 YAML
-resolve_helper "$work/seats-crosspi.yaml" thinky pi-local "" high
+resolve_helper "$work/seats-crosspi.yaml" thinky pi-local "" high ""
 check "a lower-scope thinking composes on a pi seat" "low" "$(resolved_field RES_OUT 3)"
+
+printf '\n== the network axis follows the same drop and refusal rules as model ==\n'
+# A seats-file harness re-seats sealy off pi; sealy's own frontmatter
+# sealed network belongs to sealy's own (frontmatter) harness and is
+# dropped with it, not composed onto claude -- the seat launches pinned.
+cat > "$work/seats-networkdrop.yaml" <<'YAML'
+personas:
+  sealy:
+    harness: claude
+YAML
+resolve_helper "$work/seats-networkdrop.yaml" sealy pi "" "" sealed
+check "a persona harness drops a lower-scope frontmatter sealed" "claude" "$(resolved_field RES_OUT 1)"
+check "the dropped sealed does not survive the re-seat" "" "$(resolved_field RES_OUT 4)"
+check "dropping a sealed network is not itself an error" "0" "$RES_RC"
+
+# An EXPLICIT personas.<p>.network: sealed over a default: harness:
+# claude is the seats file itself asking for an impossible seat -- D4.
+cat > "$work/seats-networkrefuse.yaml" <<'YAML'
+default:
+  harness: claude
+personas:
+  sealy:
+    network: sealed
+YAML
+resolve_helper "$work/seats-networkrefuse.yaml" sealy pi "" "" ""
+check "an explicit sealed on a non-pi seat is refused" "1" "$RES_RC"
+contains "the refusal names the persona-scope network key" "$RES_ERR" "personas.sealy.network"
+contains "the network refusal names the resolved harness" "$RES_ERR" "'claude'"
 
 printf '\n== refusals name the file and the offending key ==\n'
 bad() {  # bad <label> <yaml> <expected-needle>
@@ -355,8 +420,8 @@ mkdir -p -- "$home_dir/.config/fork-sandbox"
 printf 'default:\n  harness: pi-local\n' > "$home_dir/.config/fork-sandbox/lkml-seats.yaml"
 HOME="$home_dir" LKML_SEATS_FILE='' "$resolver" active "$personas_test_dir"
 check "active: the default path is honored" "0" "$?"
-res_out="$(HOME="$home_dir" LKML_SEATS_FILE='' "$resolver" resolve "$personas_test_dir" core claude opus "")"
-check "set-but-empty LKML_SEATS_FILE consults the default path" "pi-local" "$(printf '%s\n' "$res_out" | sed -n 1p)"
+res_out="$(HOME="$home_dir" LKML_SEATS_FILE='' "$resolver" resolve "$personas_test_dir" core claude opus "" "")"
+check "set-but-empty LKML_SEATS_FILE consults the default path" "pi" "$(printf '%s\n' "$res_out" | sed -n 1p)"
 rm -f -- "$home_dir/.config/fork-sandbox/lkml-seats.yaml"
 HOME="$home_dir" LKML_SEATS_FILE="$work/nope.yaml" "$resolver" active "$personas_test_dir" 2>"$work/err"
 check "active: an explicit missing path errors, not just inactivates" "1" "$?"
@@ -459,6 +524,25 @@ case "$OUT" in
     *) ok "absent seats file announces nothing" ;;
 esac
 
+printf '\n== a frontmatter network: sealed with no alias reaches the launch line ==\n'
+rm -f -- "$capture_dir"/*.argv
+launch_round ABSENT sealy
+check "explicit sealed frontmatter: round exits 0" "0" "$RC"
+contains "explicit sealed frontmatter reaches the launch as --network sealed" \
+    "$(argv_of sealy)" "--harness pi --network sealed"
+
+printf '\n== a persona pairing a non-pi harness with sealed refuses the round pre-pass ==\n'
+# No seats file at all -- lkml-seats-resolve is never called for this
+# persona, so this is the case only the round'"'"'s own pre-pass check
+# can catch (D4).
+rm -f -- "$capture_dir"/*.argv
+launch_round ABSENT badseal
+if (( RC != 0 )); then ok "the impossible frontmatter pairing refuses the round"; else no "the impossible frontmatter pairing refuses the round" "exit 0: $OUT"; fi
+contains "the refusal names the persona" "$OUT" "badseal"
+contains "the refusal names the resolved harness" "$OUT" "claude"
+n_launches=$(find "$capture_dir" -name '*.argv' | wc -l | tr -d '[:space:]')
+check "the pre-pass refusal launches no persona" "0" "$n_launches"
+
 printf '\n== seats default: re-seats every launched persona, loudly ==\n'
 cat > "$work/seats-round.yaml" <<'YAML'
 default:
@@ -474,9 +558,9 @@ contains "seats default: author is launched on pi, sealed" \
 contains "seats default: ci is launched on pi, sealed" \
     "$(argv_of ci)" "--harness pi --network sealed"
 contains "core's moved seat is announced" "$OUT" \
-    "lkml-round: seat core: pi-local (seats-round.yaml, was claude/opus)"
+    "lkml-round: seat core: pi, sealed (seats-round.yaml, was claude/opus)"
 contains "author's moved seat is announced" "$OUT" \
-    "lkml-round: seat author: pi-local (seats-round.yaml, was claude/opus)"
+    "lkml-round: seat author: pi, sealed (seats-round.yaml, was claude/opus)"
 case "$OUT" in
     *"seat ci: "*) no "ci's unchanged seat is not announced" "$OUT" ;;
     *) ok "ci's unchanged seat is not announced" ;;
@@ -515,7 +599,38 @@ contains "core's persona harness is the bare harness, sealed" \
 check "author takes the default's model" "claude/sonnet" "$(harness_of author)"
 check "ci takes the default's model" "claude/sonnet" "$(harness_of ci)"
 contains "core's re-seat to the bare harness is announced" "$OUT" \
-    "lkml-round: seat core: pi-local (seats-round-pdrop.yaml, was claude/opus)"
+    "lkml-round: seat core: pi, sealed (seats-round-pdrop.yaml, was claude/opus)"
+
+printf '\n== a seats-file harness drops a frontmatter sealed, in the round ==\n'
+cat > "$work/seats-round-networkdrop.yaml" <<'YAML'
+personas:
+  sealy:
+    harness: claude
+YAML
+rm -f -- "$capture_dir"/*.argv
+launch_round "$work/seats-round-networkdrop.yaml" sealy
+check "network-drop round exits 0" "0" "$RC"
+case "$(argv_of sealy)" in
+    *"--network sealed"*) no "sealy launches pinned, not sealed" "$(argv_of sealy)" ;;
+    *) ok "sealy launches pinned, not sealed" ;;
+esac
+contains "sealy's re-seat off pi is announced" "$OUT" \
+    "lkml-round: seat sealy: claude (seats-round-networkdrop.yaml, was pi, sealed)"
+
+printf '\n== a seats-file personas.<p>.network sealed on a non-pi seat refuses the round ==\n'
+cat > "$work/seats-round-networkrefuse.yaml" <<'YAML'
+default:
+  harness: claude
+personas:
+  sealy:
+    network: sealed
+YAML
+rm -f -- "$capture_dir"/*.argv
+launch_round "$work/seats-round-networkrefuse.yaml" sealy
+if (( RC != 0 )); then ok "the seats-file network refusal refuses the round"; else no "the seats-file network refusal refuses the round" "exit 0: $OUT"; fi
+contains "the seats-file network refusal names the key's path" "$OUT" "personas.sealy.network"
+n_launches=$(find "$capture_dir" -name '*.argv' | wc -l | tr -d '[:space:]')
+check "the seats-file network refusal launches no persona" "0" "$n_launches"
 
 printf '\n== a seats thinking reaches the seat via --pi-args ==\n'
 cat > "$work/seats-round-thinking.yaml" <<'YAML'
@@ -645,7 +760,7 @@ OUT="$(env HOME="$home_dir" PATH="$stub_bin:$PATH" \
 RC=$?
 check "default-path round exits 0" "0" "$RC"
 contains "default-path round re-seats the panel and announces it" "$OUT" \
-    "lkml-round: seat core: pi-local (lkml-seats.yaml, was claude/opus)"
+    "lkml-round: seat core: pi, sealed (lkml-seats.yaml, was claude/opus)"
 rm -f -- "$home_dir/.config/fork-sandbox/lkml-seats.yaml"
 
 printf '\n== the author scripts consume the same seats resolution ==\n'
@@ -681,7 +796,7 @@ launch_author "$repo_dir/scripts/lkml-revise.sh" "$work/seats-author.yaml" \
 contains "revise: the seats file re-seats the author" "$OUT" \
     "launching author (pi, sealed, thinking low) for v2"
 contains "revise: the moved seat is announced" "$OUT" \
-    "lkml-revise: seat author: pi-local (seats-author.yaml, was claude/opus)"
+    "lkml-revise: seat author: pi, sealed (seats-author.yaml, was claude/opus)"
 launch_author "$repo_dir/scripts/lkml-revise.sh" "$work/seats-harnoffpi.yaml" \
     widget-seats --project "$project_dir" --checkout somebranch --version 1 \
     --base somebranch --personas-dir "$personas_test_dir" --author thinky
@@ -714,7 +829,7 @@ launch_author "$repo_dir/scripts/lkml-cover.sh" "$work/seats-author.yaml" \
 contains "cover: the seats file re-seats the author" "$OUT" \
     "launching author (pi, sealed, thinking low)"
 contains "cover: the moved seat is announced" "$OUT" \
-    "lkml-cover: seat author: pi-local (seats-author.yaml, was claude/opus)"
+    "lkml-cover: seat author: pi, sealed (seats-author.yaml, was claude/opus)"
 launch_author "$repo_dir/scripts/lkml-cover.sh" "$work/seats-harnoffpi.yaml" \
     widget-seats --project "$project_dir" --checkout somebranch --base somebranch \
     --patches "$work/patches" --personas-dir "$personas_test_dir" --author thinky
@@ -742,7 +857,7 @@ launch_author "$repo_dir/scripts/lkml-series.sh" "$work/seats-author.yaml" \
 contains "series: the seats file re-seats the author" "$OUT" \
     "launching author (pi, sealed, thinking low) for v1"
 contains "series: the moved seat is announced" "$OUT" \
-    "lkml-series: seat author: pi-local (seats-author.yaml, was claude/opus)"
+    "lkml-series: seat author: pi, sealed (seats-author.yaml, was claude/opus)"
 launch_author "$repo_dir/scripts/lkml-series.sh" "$work/seats-harnoffpi.yaml" \
     widget-seats --project "$project_dir" --range "HEAD..somebranch" \
     --personas-dir "$personas_test_dir" --author thinky
