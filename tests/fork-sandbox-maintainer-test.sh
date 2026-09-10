@@ -5,6 +5,25 @@
 # the parsing and validation rules, the pi-local seal warning, and the loop's
 # own execution and records once past --dry-run.
 #
+# It covers:
+#   - --maintainer-loop's parsing and validation: the dry-run refusals
+#     (missing model, flag pairing, positive-int caps, harness names) and
+#     that a plain run and a --review-loop run stay maintainer-free.
+#   - the built run.sh commands: the default harness/model fallback,
+#     --maintainer-harness, the pi-local seal warning, and the
+#     --review-only refusals.
+#   - the loop end to end under a counting stub: findings, fix, approval;
+#     no-progress stopping at one iteration; a failed session skipping the
+#     loop and taking the run's exit code.
+#   - the summary lines: per-iteration findings counts first, the exit
+#     labelled as how the loop ended -- approved with 0 findings and with
+#     several findings print different lines, cap renders its counts, an
+#     unknown findings count renders as '?' and never as 0, and the
+#     skipped form is unchanged. The maintainer line carries the same
+#     treatment as the review line.
+#   - surfacing: summary.txt, run.env, summary.json, status (plain,
+#     --result, --monitor, --json), and the durable run log.
+#
 # Usage: tests/fork-sandbox-maintainer-test.sh
 
 set -uo pipefail
@@ -744,6 +763,9 @@ if (( rcnp == 0 )) && [[ -n "$rdnp" ]]; then
     check "no-progress is recorded as the end" "no-progress" \
         "$(jq -r '.ended' "$rdnp/maintainer-loop.json")"
     check "three legs ran: implement, maintainer, fix" "3" "$(cat "$countnp")"
+    contains "the no-progress summary line keeps its findings" \
+        "maintainer:1 iteration(s), findings 1; loop exit: no-progress" \
+        "$(cat "$rdnp/summary.txt")"
 else
     no "the no-progress run exits 0" "rc=$rcnp rd=$rdnp: $outnp"
 fi
@@ -789,13 +811,13 @@ if [[ -n "$rd2" && -d "$rd2" ]]; then
     contains "run.env records the maintainer cap" \
         "maintainer_loop=2" "$(cat "$rd2/run.env")"
     contains "the summary has the maintainer line" \
-        "maintainer:2 iteration(s), ended approved" \
+        "maintainer:2 iteration(s), findings 1,0; loop exit: approved" \
         "$(cat "$rd2/summary.txt")"
     check "summary.json takes the report from the maintainer" "maintainer" \
         "$(jq -r '.report_from' "$rd2/summary.json" 2>/dev/null)"
     st_out="$("$repo_dir/scripts/fork-sandbox-status.sh" "$rd2" 2>&1)"
     contains "status prints the maintainer line" \
-        "maintainer:2 iteration(s), ended approved" "$st_out"
+        "maintainer:2 iteration(s), findings 1,0; loop exit: approved" "$st_out"
     contains "status prints the maintainer report" \
         "== report: maintainer leg 2 (APPROVED) ==" "$st_out"
     contains "status prints the maintainer report body" \
@@ -825,6 +847,148 @@ if [[ -n "$rd_nm" && -d "$rd_nm" ]]; then
         no "a no-maintainer summary and run.env name no maintainer" \
             "$(grep -h '^maintainer' "$rd_nm/summary.txt" "$rd_nm/run.env" 2>/dev/null)"
     fi
+fi
+
+printf '\n== summary lines: findings first, the exit is the loop ==\n'
+
+# The summary line is what an orchestrator skims first, so it must not read
+# as a verdict on the branch: "approved after one iteration" is a
+# different outcome when the reviewer found nothing than when it found a
+# lot. The counting stub plays the review leg's verdicts; each probe is a
+# whole stubbed run, the same shape as the maintainer section's.
+sumstub="$(mktemp -d /var/tmp/claude-scratch/fs-maintainer-sumstub.XXXXXX)"
+tmpdirs+=("$sumstub")
+cat > "$sumstub/claude-sandboxed" <<'STUB'
+#!/usr/bin/env bash
+set -uo pipefail
+
+outbox="" clone_dir="" prev=""
+for a in "$@"; do
+    [[ "$prev" == "--bind-rw" ]] && outbox="$a"
+    [[ "$a" == "--dangerously-skip-permissions" ]] && clone_dir="$prev"
+    prev="$a"
+done
+
+cat >/dev/null
+n=0
+[[ -f "$FAKE_COUNT_FILE" ]] && n="$(cat "$FAKE_COUNT_FILE")"
+n=$(( n + 1 ))
+printf '%s' "$n" > "$FAKE_COUNT_FILE"
+
+case "$n" in
+1)
+    git -c user.email=t@fork-sandbox.invalid -c user.name=Tester \
+        -C "$clone_dir" commit --allow-empty -q -m "sump implement"
+    ;;
+2)
+    # The first review verdict, whatever the probe handed over.
+    cat "$REVIEW_VERDICT1" > "$clone_dir/.git/review-verdict.md"
+    ;;
+3)
+    git -c user.email=t@fork-sandbox.invalid -c user.name=Tester \
+        -C "$clone_dir" commit --allow-empty -q -m "sump fix"
+    ;;
+4)
+    printf 'APPROVED\n\n## Report\nfixed\n' \
+        > "$clone_dir/.git/review-verdict.md"
+    ;;
+esac
+
+printf '{"type":"result","subtype":"success","total_cost_usd":0.01,"usage":{"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}\n'
+exit 0
+STUB
+chmod +x "$sumstub/claude-sandboxed"
+
+sumprobes="$(mktemp -d /var/tmp/claude-scratch/fs-maintainer-sumprobes.XXXXXX)"
+tmpdirs+=("$sumprobes")
+printf 'APPROVED\n\n## Report\nnothing to see.\n' > "$sumprobes/approved.md"
+cat > "$sumprobes/two.md" <<'EOF'
+FINDINGS
+
+file.txt:1 first cited problem
+
+file.txt:2 second cited problem
+EOF
+cat > "$sumprobes/three.md" <<'EOF'
+FINDINGS
+
+file.txt:1 a problem
+
+file.txt:2 another
+
+file.txt:3 a third
+EOF
+# A first line that is neither APPROVED nor FINDINGS: the loop dies for a
+# harness reason, and the iteration's findings are null in the record.
+printf 'MAYBE\n\nthe leg cannot decide.\n' > "$sumprobes/badline.md"
+
+# tag cap first-verdict -- echoes the run dir on success, fails the suite
+# line otherwise.
+summary_probe() {
+    local tag="$1" cap="$2" verdict="$3"
+    local count out rc rd
+    count="$(mktemp)"; tmpdirs+=("$count")
+    out="$(PATH="$sumstub:$real_stub:$PATH" FAKE_COUNT_FILE="$count" \
+        FORK_SANDBOX_CONFIG_DIR="$real_cfg" FORK_SANDBOX_BACKEND=fake-image \
+        REVIEW_VERDICT1="$verdict" \
+        timeout 60 "$launcher" --foreground --harness claude \
+        --review-loop "$cap" \
+        --branch "sandbox-test-sump-$tag-$$" \
+        "$proj" "$handoff" 2>&1)"
+    rc=$?
+    rd="$(printf '%s\n' "$out" | sed -n 's/^  run dir:  *//p' | head -1)"
+    if (( rc != 0 )) || [[ -z "$rd" ]]; then
+        no "summary probe $tag reaches a run dir" "rc=$rc: $out"
+        printf ''
+        return 1
+    fi
+    tmpdirs+=("$rd")
+    printf '%s' "$rd"
+}
+
+rd_p0="$(summary_probe s0 2 "$sumprobes/approved.md")" || rd_p0=""
+rd_p2="$(summary_probe s2 2 "$sumprobes/two.md")" || rd_p2=""
+rd_pc="$(summary_probe sc 1 "$sumprobes/three.md")" || rd_pc=""
+rd_pn="$(summary_probe sn 1 "$sumprobes/badline.md")" || rd_pn=""
+
+review_line() { grep '^review:' "$1/summary.txt" 2>/dev/null; }
+
+if [[ -n "$rd_p0" && -d "$rd_p0" ]]; then
+    check "approved with 0 findings says so" \
+        "review:    1 iteration(s), findings 0; loop exit: approved" \
+        "$(review_line "$rd_p0")"
+fi
+if [[ -n "$rd_p2" && -d "$rd_p2" ]]; then
+    check "approved after findings says which findings" \
+        "review:    2 iteration(s), findings 2,0; loop exit: approved" \
+        "$(review_line "$rd_p2")"
+fi
+if [[ -n "$rd_p0" && -n "$rd_p2" \
+    && "$(review_line "$rd_p0")" != "$(review_line "$rd_p2")" ]]; then
+    ok "approved with 0 findings and approved after findings print differently"
+else
+    no "approved with 0 findings and approved after findings print differently" \
+        "line0=$(review_line "$rd_p0") line2=$(review_line "$rd_p2")"
+fi
+if [[ -n "$rd_pc" && -d "$rd_pc" ]]; then
+    check "cap renders its findings counts" \
+        "review:    1 iteration(s), findings 3; loop exit: cap" \
+        "$(review_line "$rd_pc")"
+fi
+if [[ -n "$rd_pn" && -d "$rd_pn" ]]; then
+    check "an unknown findings count renders as '?', not 0" \
+        "review:    1 iteration(s), findings ?; loop exit: harness-error" \
+        "$(review_line "$rd_pn")"
+fi
+
+# The skipped form is untouched: a session that committed nothing skips the
+# review loop, and the line still reads 'skipped -- <why>'.
+rd_ps="$(run_real --harness claude --review-loop 2)" \
+    && tmpdirs+=("$rd_ps")
+if [[ -n "$rd_ps" && -d "$rd_ps" ]]; then
+    contains "a skipped review loop keeps its summary form" \
+        "review:    skipped -- the session committed nothing, so there is nothing to review" \
+        "$(cat "$rd_ps/summary.txt")"
 fi
 
 # The durable run log: the maintainer tier is on the record when the run had

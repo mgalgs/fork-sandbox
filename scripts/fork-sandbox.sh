@@ -7003,6 +7003,17 @@ else
     rm -f "$run_dir/run.env.part"
 fi
 
+# The loop record's per-iteration findings counts, comma-joined. An
+# iteration whose count is unknown (null in the record) renders as '?',
+# the suite's established "cannot read it" mark -- it must never render
+# as 0, which would read as a clean review. Empty, and so the findings
+# clause is dropped, when the record cannot be read at all.
+loop_findings() {
+    jq -r '[.iterations[].findings
+           | if . == null then "?" else tostring end] | join(",")' \
+        "$1" 2>/dev/null || true
+}
+
 {
     # The value column is 12, not 10: 'maintainer:' is 11 characters, the
     # longest label in the block, and the block reads as two aligned
@@ -7023,9 +7034,18 @@ fi
         if [[ "$review_loop_ended" == "skipped" ]]; then
             printf 'review:    skipped -- %s\n' "$review_loop_detail"
         else
-            printf 'review:    %s iteration(s), ended %s\n' \
-                "$(jq '.iterations | length' "$run_dir/review-loop.json" 2>/dev/null || printf '?')" \
-                "$review_loop_ended"
+            # Findings first, exit labelled as the loop's: "approved" after
+            # one clean iteration and after a loop that stopped early must
+            # not read the same, and neither is a judgement on the branch.
+            _n="$(jq '.iterations | length' "$run_dir/review-loop.json" 2>/dev/null || printf '?')"
+            _f="$(loop_findings "$run_dir/review-loop.json")"
+            if [[ -n "$_f" ]]; then
+                printf 'review:    %s iteration(s), findings %s; loop exit: %s\n' \
+                    "$_n" "$_f" "$review_loop_ended"
+            else
+                printf 'review:    %s iteration(s); loop exit: %s\n' \
+                    "$_n" "$review_loop_ended"
+            fi
         fi
     fi
     # The maintainer loop's line, the review line's sibling and the run's
@@ -7035,9 +7055,17 @@ fi
         if [[ "${maintainer_loop_ended}" == "skipped" ]]; then
             printf 'maintainer:skipped -- %s\n' "${maintainer_loop_detail:-}"
         else
-            printf 'maintainer:%s iteration(s), ended %s\n' \
-                "$(jq '.iterations | length' "$run_dir/maintainer-loop.json" 2>/dev/null || printf '?')" \
-                "$maintainer_loop_ended"
+            # Same shape as the review line: findings first, exit labelled
+            # as the loop's, never the branch's.
+            _n="$(jq '.iterations | length' "$run_dir/maintainer-loop.json" 2>/dev/null || printf '?')"
+            _f="$(loop_findings "$run_dir/maintainer-loop.json")"
+            if [[ -n "$_f" ]]; then
+                printf 'maintainer:%s iteration(s), findings %s; loop exit: %s\n' \
+                    "$_n" "$_f" "${maintainer_loop_ended}"
+            else
+                printf 'maintainer:%s iteration(s); loop exit: %s\n' \
+                    "$_n" "${maintainer_loop_ended}"
+            fi
         fi
     fi
     # Its sibling for --refresh-at, printed only when something happened --
