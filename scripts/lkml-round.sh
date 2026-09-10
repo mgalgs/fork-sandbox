@@ -466,7 +466,7 @@ launch_failed=0
 # guarantee `check` has for parse errors. (A missing persona FILE stays
 # a per-persona skip in the launch loop: a roster typo the operator can
 # re-run without touching the seats file.)
-declare -A seat_harness=() seat_model=() seat_thinking=() seat_display=()
+declare -A seat_harness=() seat_model=() seat_thinking=() seat_display=() seat_network=()
 for persona in "${personas[@]}"; do
     persona="${persona#"${persona%%[![:space:]]*}"}"
     persona="${persona%"${persona##*[![:space:]]}"}"
@@ -478,6 +478,7 @@ for persona in "${personas[@]}"; do
     model="$(lkml_persona_field "$persona_file" model)"
     display="$(lkml_persona_field "$persona_file" display)"
     thinking="$(lkml_persona_field "$persona_file" thinking)"
+    network="$(lkml_persona_field "$persona_file" network)"
     [[ -n "$harness" ]] || harness="claude"
     [[ -n "$display" ]] || display="$persona"
     if [[ -n "$model_override" ]]; then
@@ -493,6 +494,11 @@ for persona in "${personas[@]}"; do
             harness="$model_override"
             model=""
         fi
+        # A network belongs to its harness the same way a model does;
+        # --model-override has no channel of its own for network (see its
+        # own doc comment -- that vocabulary is deliberately not extended),
+        # so any frontmatter network is dropped along with the model.
+        network=""
     elif (( seats_active )); then
         # The seats file re-seats this persona, key by key; the frontmatter
         # values are the lowest-priority inputs (lkml-seats-resolve owns
@@ -504,10 +510,11 @@ for persona in "${personas[@]}"; do
             read -r harness
             read -r model
             read -r thinking
+            read -r network
             read -r seat_note
         } < <(
             "$script_dir/lkml-seats-resolve" resolve "$personas_dir" "$persona" \
-                "$harness" "$model" "$thinking")
+                "$harness" "$model" "$thinking" "$network")
         [[ -n "$harness" ]] || {
             # The resolver already printed the refusal with the persona,
             # key and file named; this refuses the WHOLE round, not just
@@ -519,26 +526,57 @@ for persona in "${personas[@]}"; do
         }
         [[ -n "$seat_note" ]] && echo "fork-sandbox lkml-round: $seat_note" >&2
     fi
+    # pi-local is a permanent alias for harness pi + network sealed.
+    # lkml-seats-resolve already expanded it for the seats-file and
+    # frontmatter-argument surfaces above (harness is never literally
+    # "pi-local" coming out of that branch); this catches the two surfaces
+    # it cannot reach -- a --model-override of pi-local, and the plain
+    # frontmatter fallthrough when neither an override nor an active
+    # seats file touched this persona.
+    if [[ "$harness" == "pi-local" ]]; then
+        if [[ "$network" == "pinned" ]]; then
+            echo "Error: persona '$persona' asks for harness 'pi-local' with network 'pinned'; pi-local is already sealed. Fix the persona frontmatter or the --model-override before relaunching." >&2
+            exit 1
+        fi
+        harness="pi"
+        network="sealed"
+    fi
+    if [[ "$harness" != "pi" && "$network" == "sealed" ]]; then
+        # The seats-file-caused version of this refusal already happened
+        # inside lkml-seats-resolve, naming the seats-file key. This is
+        # the case it cannot see -- the persona's own frontmatter pairs a
+        # non-pi harness with a sealed network, whether or not a seats
+        # file is even present (a seats file that never mentions this
+        # persona resolves it verbatim from frontmatter, the same as no
+        # file at all). Refuse the whole round here, in the same pre-pass
+        # that holds the --k8s harness checks below, rather than inside
+        # the launch loop, where earlier seats would already have spent
+        # real cost.
+        echo "Error: persona '$persona' resolves to harness '$harness' with network 'sealed'; a sealed seat must run on pi. Fix the persona frontmatter (or the seats file, if it re-seats this persona) before relaunching." >&2
+        exit 1
+    fi
     if (( k8s )); then
-        # The cluster refuses pi-local (a pod has no sealed local
-        # endpoint) -- the zero-cost equivalent is pi against the
-        # endpoint, the same self-hosted model through the in-cluster
-        # proxy. Translate rather than fail the seat. Anything that is
-        # not pi, pi-local or claude refuses the WHOLE round here, in
-        # the same pre-pass that validates the seats file: the launch
+        # Anything that is not pi or claude refuses the WHOLE round here,
+        # in the same pre-pass that validates the seats file: the launch
         # loop below submits as it goes, so a refusal there would mean
         # the rest of the panel spends real cluster cost first.
         case "$harness" in
-            pi-local)
-                echo "fork-sandbox lkml-round: seat $persona: pi-local runs as pi via endpoint '$endpoint' on the cluster" >&2
-                harness="pi"
-                ;;
             pi|claude) ;;
             *)
-                echo "Error: seat $persona asks for harness '$harness', which the cluster cannot run (pi, pi-local and claude only); no persona was launched." >&2
+                echo "Error: seat $persona asks for harness '$harness', which the cluster cannot run (pi and claude only); no persona was launched." >&2
                 exit 1
                 ;;
         esac
+        # A pod has no sealed local endpoint -- the zero-cost equivalent
+        # for a sealed seat is pi against the endpoint, the same
+        # self-hosted model through the in-cluster proxy. Translate
+        # rather than fail the seat. By this point network == sealed
+        # implies harness == pi (the refusal above already caught any
+        # other pairing), so no harness check is needed here.
+        if [[ "$network" == "sealed" ]]; then
+            echo "fork-sandbox lkml-round: seat $persona: a sealed seat runs as pi via endpoint '$endpoint' on the cluster" >&2
+            network="pinned"
+        fi
         # A model-less claude seat passes every other check here and
         # would be refused only by `submit` itself (pod model discovery
         # lists pi endpoint model ids, not Claude Code model names) --
@@ -556,6 +594,7 @@ for persona in "${personas[@]}"; do
     seat_model["$persona"]="$model"
     seat_thinking["$persona"]="$thinking"
     seat_display["$persona"]="$display"
+    seat_network["$persona"]="$network"
 done
 
 for persona in "${personas[@]}"; do
@@ -584,6 +623,7 @@ for persona in "${personas[@]}"; do
     model="${seat_model[$persona]}"
     display="${seat_display[$persona]}"
     thinking="${seat_thinking[$persona]}"
+    network="${seat_network[$persona]}"
 
     mkdir -p -- /var/tmp/claude-scratch
     handoff_file="$(mktemp /var/tmp/claude-scratch/lkml-round-XXXXXX.md)" || {
@@ -609,21 +649,17 @@ for persona in "${personas[@]}"; do
 
     harness_spec="$harness"
     [[ -n "$model" ]] && harness_spec="$harness/$model"
-    # A resolved pi-local seat is spelled out as harness pi with an
-    # explicit --network sealed rather than passed through as the
-    # pi-local alias -- fork-sandbox.sh still honors the alias, but this
-    # is the first-party call site and should read like the modern spelling.
+    # network_args is driven by the resolved network mode directly -- a
+    # pi-local seat, if this persona had one, was already expanded to
+    # harness pi + network sealed in the pre-pass above, so no
+    # harness-value special case is needed here.
     network_args=()
-    if [[ "$harness" == "pi-local" ]]; then
-        harness_spec="pi${model:+/$model}"
-        network_args=(--network sealed)
-    fi
-    # The argv split above moves "sealed" out of harness_spec and into
-    # network_args -- correct for --harness, but it would silently drop the
-    # one fact an operator reading the launch line most needs: whether this
+    [[ "$network" == "sealed" ]] && network_args=(--network sealed)
+    # harness_announce is display-only and is never passed to
+    # fork-sandbox.sh: it exists because harness_spec alone drops the one
+    # fact an operator reading the launch line most needs -- whether this
     # seat ships the clone's contents to a networked provider or runs
-    # sealed against a local endpoint. harness_announce is display-only and
-    # is never passed to fork-sandbox.sh.
+    # sealed against a local endpoint.
     harness_announce="$harness_spec"
     (( ${#network_args[@]} )) && harness_announce="$harness_spec, sealed"
 
@@ -637,7 +673,7 @@ for persona in "${personas[@]}"; do
     # nothing. `thinking: low` is the fix for that seat, not a smaller panel.
     pi_args=()
     thinking_note=""
-    if [[ -n "$thinking" && ( "$harness" == "pi" || "$harness" == "pi-local" ) ]]; then
+    if [[ -n "$thinking" && "$harness" == "pi" ]]; then
         pi_args=(--pi-args "--thinking $thinking")
         thinking_note=", thinking $thinking"
     fi
