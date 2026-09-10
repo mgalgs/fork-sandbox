@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # lkml-mailbox.sh — A Maildir-like message store for one lkml-mode series
 #
-# Usage: lkml-mailbox.sh init <series> --cover <file> --patches <dir> --from <persona> [--display <name>] [--version <n>] [--harness <h>] [--model <m>] [--attach <file>]... [--diffstat <range>] [--smoke <file>]
-#        lkml-mailbox.sh post <series> --from <persona> --reply-to <id> --file <file|-> [--display <name>] [--subject <s>] [--tags <t1,t2>] [--harness <h>] [--model <m>] [--attach <file>]...
+# Usage: lkml-mailbox.sh init <series> --cover <file> --patches <dir> --from <persona> [--display <name>] [--version <n>] [--harness <h>] [--model <m>] [--network <pinned|sealed>] [--attach <file>]... [--diffstat <range>] [--smoke <file>]
+#        lkml-mailbox.sh post <series> --from <persona> --reply-to <id> --file <file|-> [--display <name>] [--subject <s>] [--tags <t1,t2>] [--harness <h>] [--model <m>] [--network <pinned|sealed>] [--attach <file>]...
 #        lkml-mailbox.sh tree <series> [--version <n>]
 #        lkml-mailbox.sh cover <series> [--version <n>]
 #        lkml-mailbox.sh show <series> <id>
@@ -56,6 +56,10 @@
 #   X-AI-Persona: <persona>
 #   X-AI-Harness: <harness>
 #   X-AI-Model: <model>
+#   X-AI-Network: <pinned|sealed>   -- the seat's network mode at launch,
+#            e.g. distinguishing a zero-cost local seat (pi, sealed) from
+#            a networked one (pi, pinned) permanently: harness alone
+#            cannot, since both resolve to the same "pi".
 #   X-Series: <series>
 #   X-Version: <n>
 #   X-Depth: <n>
@@ -228,11 +232,14 @@ lkml_validate_tags() {
 # contain a comma but never a '/'), already copied into
 # <series>/attachments/ by the caller -- this function only writes the
 # X-Attachment header per name, it does not touch the filesystem beyond the
-# message file itself.
+# message file itself. $16 is the seat's network mode ("pinned" or
+# "sealed"); harness alone cannot tell a sealed pi seat from a networked
+# one, so this is the only permanent record of that fact.
 lkml_post_raw() {
     local series="$1" id="$2" parent_id="$3" references="$4" version="$5" depth="$6"
     local persona="$7" display_override="$8" harness="$9" model="${10}"
     local subject="${11}" tags="${12}" body="${13}" attachments="${14:-}" misthreaded="${15:-}"
+    local network="${16:-unknown}"
     local dir; dir="$(lkml_series_dir "$series")/cur"
     local display="${display_override:-$(lkml_default_display "$persona")}"
     local email="${persona}.ai@lkml.local"
@@ -251,6 +258,7 @@ lkml_post_raw() {
         printf 'X-AI-Persona: %s\n' "$persona"
         printf 'X-AI-Harness: %s\n' "$harness"
         printf 'X-AI-Model: %s\n' "$model"
+        printf 'X-AI-Network: %s\n' "$network"
         printf 'X-Series: %s\n' "$series"
         printf 'X-Version: %s\n' "$version"
         printf 'X-Depth: %s\n' "$depth"
@@ -557,6 +565,7 @@ cmd_init() {
     local series="${1:?Usage: lkml-mailbox.sh init <series> --cover <file> --patches <dir> --from <persona>}"
     shift
     local cover="" patches="" from="" display="" version="" harness="unknown" model="unknown"
+    local network="unknown"
     local diffstat_range="" smoke_file=""
     local -a attach_files=()
     while [[ $# -gt 0 ]]; do
@@ -568,6 +577,7 @@ cmd_init() {
             --version) version="${2:?--version requires a number}"; shift 2 ;;
             --harness) harness="${2:?--harness requires a value}"; shift 2 ;;
             --model) model="${2:?--model requires a value}"; shift 2 ;;
+            --network) network="${2:?--network requires a value}"; shift 2 ;;
             --attach) attach_files+=("${2:?--attach requires a file}"); shift 2 ;;
             --diffstat) diffstat_range="${2:?--diffstat requires a range}"; shift 2 ;;
             --smoke) smoke_file="${2:?--smoke requires a file}"; shift 2 ;;
@@ -635,7 +645,7 @@ cmd_init() {
         cover_body="$(printf '%s\n\n## Test results\n\n%s\n' "$cover_body" "$(cat -- "$smoke_file")")"
     fi
     lkml_post_raw "$series" "$cover_id" "" "" "$version" 0 \
-        "$from" "$display" "$harness" "$model" "$cover_subject" "" "$cover_body" "$attach_csv"
+        "$from" "$display" "$harness" "$model" "$cover_subject" "" "$cover_body" "$attach_csv" "" "$network"
     echo "fork-sandbox lkml: posted cover ${cover_id:0:7} as v$version 0/$m" >&2
 
     local n=0 pf subj body id pos
@@ -651,7 +661,8 @@ cmd_init() {
         body="$(cat -- "$pf")"
         id="$(lkml_new_uuid)"
         lkml_post_raw "$series" "$id" "$cover_id" "<$cover_id@lkml.local>" "$version" 1 \
-            "$from" "$display" "$harness" "$model" "[PATCH v$version $pos/$m] $subj" "" "$body"
+            "$from" "$display" "$harness" "$model" "[PATCH v$version $pos/$m] $subj" "" "$body" \
+            "" "" "$network"
         echo "fork-sandbox lkml: posted patch ${id:0:7} as v$version $n/$m" >&2
     done
     printf '%s\n' "$cover_id"
@@ -661,6 +672,7 @@ cmd_post() {
     local series="${1:?Usage: lkml-mailbox.sh post <series> --from <persona> --reply-to <id> --file <file>}"
     shift
     local from="" display="" reply_to="" file="" subject_override="" tags="" harness="unknown" model="unknown"
+    local network="unknown"
     local -a attach_files=()
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -672,6 +684,7 @@ cmd_post() {
             --tags) tags="${2:?--tags requires a comma-separated list}"; shift 2 ;;
             --harness) harness="${2:?--harness requires a value}"; shift 2 ;;
             --model) model="${2:?--model requires a value}"; shift 2 ;;
+            --network) network="${2:?--network requires a value}"; shift 2 ;;
             --attach) attach_files+=("${2:?--attach requires a file}"); shift 2 ;;
             -h|--help) usage; exit 0 ;;
             *) echo "Error: post: unknown option '$1'." >&2; return 1 ;;
@@ -776,7 +789,8 @@ cmd_post() {
     local misthreaded=""
     (( LKML_FALLBACK )) && misthreaded="$reply_to"
     lkml_post_raw "$series" "$id" "$parent" "$newrefs" "$pversion" "$newdepth" \
-        "$from" "$display" "$harness" "$model" "$subject" "$tags" "$body" "$attach_csv" "$misthreaded"
+        "$from" "$display" "$harness" "$model" "$subject" "$tags" "$body" "$attach_csv" "$misthreaded" \
+        "$network"
     echo "fork-sandbox lkml: posted ${id:0:7} as reply to ${parent:0:7} (depth $newdepth)" >&2
     printf '%s\n' "$id"
 }

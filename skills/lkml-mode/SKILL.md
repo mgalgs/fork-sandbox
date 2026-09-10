@@ -105,11 +105,14 @@ scheduling, not reading, and the reviewers' job is reading.
   touches nothing in the mailbox. The tier harnesses/models are
   overridable with `--high`/`--low` or a
   `~/.config/fork-sandbox/lkml-summarize.env` file; a bare harness
-  (e.g. `--high pi`) passes through bare, exactly like a reviewer
-  persona's. `--series` instead summarizes the whole series with one
-  synthesis-only run: the handoff carries every recorded version's
-  `results-v<N>.json` verbatim in version order plus each version's tally
-  section and the latest version's cover letter, and the model writes the
+  (e.g. `--high pi-local`) passes through bare, exactly like a reviewer
+  persona's -- `lkml-summarize.sh` has no `network:` channel of its own,
+  so a bare `pi` (as opposed to `pi-local`) has no model and
+  `fork-sandbox.sh` refuses it. `--series` instead summarizes the whole
+  series with one synthesis-only run: the handoff carries every
+  recorded version's `results-v<N>.json` verbatim in version order plus
+  each version's tally section and the latest version's cover letter,
+  and the model writes the
   story — the arc in a few lines, one short paragraph per version, and the
   open items and recommended next actions. Every recorded version must
   already have its `results-v<N>.json` (the refusal names each missing one
@@ -218,8 +221,10 @@ Entries carry only `harness`, `network`, `model` and `thinking`.
 Precedence, per persona, key by key: the script's `--model-override`
 flag > a `personas.<name>` entry > `default:` > the persona's
 frontmatter. Setting `harness` at any scope DROPS `model` AND `network`
-from every lower-precedence scope (a bare `pi` resolves its model from
-the endpoint, a bare `claude` takes the harness default; composing a
+from every lower-precedence scope (a bare `pi` that is also sealed
+resolves its model from the endpoint; a bare `pi` that is pinned has no
+such resolution and `fork-sandbox.sh` refuses it for lacking `--model`;
+a bare `claude` takes the harness default; composing a
 lower scope's `network: sealed` onto a new harness would manufacture a
 launch failure, since `fork-sandbox.sh` refuses a sealed non-pi
 harness outright); a model or network survives only from the same
@@ -372,15 +377,16 @@ operator's real repository, and it does not push or run tests for you.
 ## Attribution is non-negotiable, and it is not your job to enforce it
 
 Every message's `From` header carries `(AI persona)`, every message
-carries `X-AI-Persona`/`X-AI-Harness`/`X-AI-Model`, and `tree` renders the
-harness/model column — all of this is baked into `lkml-mailbox.sh` itself
-(the one function that ever writes a message file), not left to a
-persona's good behavior. You do not need to check for it, and a persona
-prompt that tried to write around it would still get stamped, not
-believed. What IS your job: the cover letter you write or ask `author` to
-write states plainly, in its first paragraph, that every participant is an
-AI persona run in a sandbox — say that in your own words when you draft
-one, the mailbox cannot write your cover letter's prose for you.
+carries `X-AI-Persona`/`X-AI-Harness`/`X-AI-Model`/`X-AI-Network`, and
+`tree` renders the harness/model column — all of this is baked into
+`lkml-mailbox.sh` itself (the one function that ever writes a message
+file), not left to a persona's good behavior. You do not need to check
+for it, and a persona prompt that tried to write around it would still
+get stamped, not believed. What IS your job: the cover letter you write
+or ask `author` to write states plainly, in its first paragraph, that
+every participant is an AI persona run in a sandbox — say that in your
+own words when you draft one, the mailbox cannot write your cover
+letter's prose for you.
 
 ## What this is not
 

@@ -420,10 +420,13 @@ fi
 # as lkml-round.sh's harvest).
 [[ -n "$model" ]] || model="$(jq -r '.model // empty' "$run_dir/summary.json" 2>/dev/null || true)"
 [[ -n "$model" ]] || model="unknown"
+# An empty network means the ordinary networked default, not "unknown" --
+# unlike model, which really can be unresolvable.
+[[ -n "$network" ]] || network="pinned"
 
 init_args=(init "$series" --cover "$completed_cover" --patches "$patches_dir" \
     --from "$author_persona" --display "$display" --harness "$harness" --model "$model" \
-    --diffstat "$base_ref..$checkout_ref")
+    --network "$network" --diffstat "$base_ref..$checkout_ref")
 [[ -n "$version" ]] && init_args+=(--version "$version")
 [[ -n "$smoke_file" ]] && init_args+=(--smoke "$smoke_file")
 for f in "${attach_files[@]}"; do

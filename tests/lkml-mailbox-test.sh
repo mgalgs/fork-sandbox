@@ -78,7 +78,7 @@ fixture_cover cover.txt
 fixture_patches patches
 
 out="$("$mailbox" init widget-frob --cover cover.txt --patches patches --from author \
-    --harness claude --model opus 2>diag.txt)"
+    --harness claude --model opus --network sealed 2>diag.txt)"
 rc=$?
 check "init exits 0" "0" "$rc"
 cover_id="$out"
@@ -99,6 +99,7 @@ raw="$("$mailbox" show widget-frob "${cover_id:0:7}")"
 contains "show: From always carries (AI persona)" "$raw" "(AI persona)"
 contains "show: X-AI-Harness is stamped" "$raw" "X-AI-Harness: claude"
 contains "show: X-AI-Model is stamped" "$raw" "X-AI-Model: opus"
+contains "show: X-AI-Network is stamped" "$raw" "X-AI-Network: sealed"
 contains "show: X-Depth 0 for the cover" "$raw" "X-Depth: 0"
 case "$raw" in
     *"In-Reply-To:"*) no "cover has no In-Reply-To" ;;
@@ -112,7 +113,7 @@ printf '\n== post ==\n'
 echo "why not use a linked list here?" > q.txt
 r1="$("$mailbox" post widget-frob --from core --display "The Core Reviewer" \
     --reply-to "$patch_id" --file q.txt --tags Question \
-    --harness claude --model opus 2>diag.txt)"
+    --harness claude --model opus --network pinned 2>diag.txt)"
 rc=$?
 check "post exits 0" "0" "$rc"
 
@@ -124,6 +125,7 @@ contains "reply: In-Reply-To names the parent" "$raw1" "In-Reply-To: <$patch_id"
 contains "reply: References carries the whole chain" "$raw1" "$cover_id@lkml.local"
 contains "reply: References carries the parent too" "$raw1" "$patch_id"
 contains "reply: X-Depth is parent-depth + 1" "$raw1" "X-Depth: 2"
+contains "reply: X-AI-Network is stamped" "$raw1" "X-AI-Network: pinned"
 contains "reply: default subject prefixes Re:" "$raw1" "Subject: Re: [PATCH v1 1/2] frob: add core"
 contains "reply: carries the requested tag" "$raw1" "X-Tags: Question"
 

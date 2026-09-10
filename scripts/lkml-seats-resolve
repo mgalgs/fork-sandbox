@@ -73,13 +73,14 @@
 # `personas.<p>.model` or `.network` riding a `default:` harness is the
 # operator composing both in one file, and stays allowed). Composing a
 # lower scope's model onto a new harness is what asks the endpoint for a
-# model it does not serve: a bare pi resolves its model from the
-# endpoint, and a bare claude takes the harness default. Composing a
-# lower scope's network onto a new harness is what manufactures a launch
-# failure out of two individually-valid files: a frontmatter `sealed`
-# composed onto a seats-file `harness: claude` is an impossible seat,
-# since fork-sandbox.sh refuses `--harness claude --network sealed`
-# outright.
+# model it does not serve: a bare SEALED pi resolves its model from the
+# endpoint (a bare pinned pi has no such resolution and fork-sandbox.sh
+# refuses it for lacking --model), and a bare claude takes the harness
+# default. Composing a lower scope's network onto a new harness is what
+# manufactures a launch failure out of two individually-valid files: a
+# frontmatter `sealed` composed onto a seats-file `harness: claude` is an
+# impossible seat, since fork-sandbox.sh refuses `--harness claude
+# --network sealed` outright.
 # `thinking` is harness-portable between pi flavors, so it inherits
 # from frontmatter unless a seats entry sets it -- but it only reaches
 # a seat on pi (the launchers pass it via --pi-args, and nothing else),
@@ -138,7 +139,19 @@ if [[ "$mode" == "resolve" ]]; then
     # D2: pi-local is a frontmatter input surface too, and nothing else
     # validates a frontmatter harness+network pair (lkml-seats-parse.py
     # only validates the seats FILE), so resolve does it here, at the
-    # earliest point the frontmatter argument is read.
+    # earliest point the frontmatter argument is read. A frontmatter
+    # `network` outside the whitelist (a typo like 'seald') must refuse
+    # here too -- every consumer downstream compares it with
+    # `== "sealed"`, so an unrecognized value fails OPEN (networked)
+    # rather than refusing, the opposite of what a seal typo should do.
+    case "$fm_network" in
+        ""|pinned|sealed) ;;
+        *)
+            echo "Error: persona '$persona' frontmatter: 'network' takes 'pinned'" >&2
+            echo "or 'sealed', not '$fm_network'." >&2
+            exit 1
+            ;;
+    esac
     if [[ "$fm_harness" == "pi-local" ]]; then
         if [[ "$fm_network" == "pinned" ]]; then
             echo "Error: persona '$persona' frontmatter: harness 'pi-local' is" >&2
@@ -292,7 +305,13 @@ announce=""
 changed=0
 [[ "$harness" != "$fm_harness" ]] && changed=1
 [[ "$model" != "$fm_model" ]] && changed=1
-[[ "$network" != "$fm_network" ]] && changed=1
+# "" and "pinned" are the same seat spelled two ways (an omitted
+# frontmatter network defaults to pinned, same as an explicit one) --
+# compare normalized copies so an explicit `network: pinned` that only
+# restates the default is not announced as a change.
+network_norm="${network:-pinned}"
+fm_network_norm="${fm_network:-pinned}"
+[[ "$network_norm" != "$fm_network_norm" ]] && changed=1
 # A dropped frontmatter thinking (non-pi seat) is a silent drop, not a
 # change to announce; on a pi seat it is compared as before.
 (( pi_flavor )) && [[ "$thinking" != "$fm_thinking" ]] && changed=1

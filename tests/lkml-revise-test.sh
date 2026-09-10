@@ -247,7 +247,7 @@ case "$out" in
 esac
 n_pi=0; n_pi_unknown=0; bare_reply=0
 while IFS= read -r f; do
-    grep -q -- 'X-AI-Harness: pi' "$f" || continue
+    grep -q -- 'X-AI-Harness: pi$' "$f" || continue
     n_pi=$(( n_pi + 1 ))
     grep -q -- 'X-AI-Model: unknown' "$f" && n_pi_unknown=$(( n_pi_unknown + 1 ))
     grep -q -- 'Fixed, see v2' "$f" && bare_reply=1

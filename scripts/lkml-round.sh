@@ -450,7 +450,7 @@ tree_text="$("$mailbox" tree "$series" --version "$version" 2>/dev/null)" || tre
 
 IFS=',' read -ra personas <<< "$personas_csv"
 
-declare -A run_dir_of=() harness_of=() model_of=() display_of=()
+declare -A run_dir_of=() harness_of=() model_of=() display_of=() network_of=()
 declare -A branch_of=() outbox_of=()
 launch_failed=0
 
@@ -526,6 +526,20 @@ for persona in "${personas[@]}"; do
         }
         [[ -n "$seat_note" ]] && echo "fork-sandbox lkml-round: $seat_note" >&2
     fi
+    # A network outside the whitelist (a typo like 'seald') must refuse
+    # here rather than fall through: every check below and every launch
+    # decision compares network with `== "sealed"`, so an unrecognized
+    # value fails OPEN (networked) instead of refusing. lkml-seats-resolve
+    # already validates this for the seats-active and --model-override
+    # paths (network is forced to "" there); this is the plain frontmatter
+    # fallthrough, the one path it cannot reach.
+    case "$network" in
+        ""|pinned|sealed) ;;
+        *)
+            echo "Error: persona '$persona' frontmatter: 'network' takes 'pinned' or 'sealed', not '$network'." >&2
+            exit 1
+            ;;
+    esac
     # pi-local is a permanent alias for harness pi + network sealed.
     # lkml-seats-resolve already expanded it for the seats-file and
     # frontmatter-argument surfaces above (harness is never literally
@@ -720,6 +734,7 @@ for persona in "${personas[@]}"; do
         harness_of["$persona"]="$harness"
         model_of["$persona"]="$model"
         display_of["$persona"]="$display"
+        network_of["$persona"]="$network"
         # Cost ledger: a cluster run has no run dir, so its line records
         # the seat's branch instead, marked cluster so a reader knows
         # why there is no cost. The cost of a cluster run is currently
@@ -753,6 +768,7 @@ for persona in "${personas[@]}"; do
     harness_of["$persona"]="$harness"
     model_of["$persona"]="$model"
     display_of["$persona"]="$display"
+    network_of["$persona"]="$network"
 
     # A cost ledger for lkml-status.sh, kept beside the mailbox rather than
     # as an 8th mailbox verb: one JSON line per launched run, so cost can be
@@ -913,6 +929,10 @@ lkml_round_strip_id() {
 
 harvest_one() {
     local persona="$1" display="$2" harness="$3" model="$4" msgfile="$5"
+    # An empty network (no seat ever set one, e.g. a claude persona with no
+    # `network:` frontmatter key) means the ordinary networked default, not
+    # "unknown" -- unlike model, which really can be unresolvable.
+    local network="${6:-pinned}"
     local reply_to="" subject="" tags="" body_file in_headers=1 line
     body_file="$(mktemp)"
     : > "$body_file"
@@ -947,7 +967,7 @@ harvest_one() {
     local id rc=0
     id="$("$mailbox" post "$series" --from "$persona" --display "$display" \
         --reply-to "$reply_to" --file "$body_file" --harness "$harness" --model "$model" \
-        "${extra[@]}")" || rc=$?
+        --network "$network" "${extra[@]}")" || rc=$?
     rm -f "$body_file"
     if (( rc != 0 )); then
         echo "Warning: lkml-round: failed to post $msgfile (persona $persona)." >&2
@@ -985,7 +1005,7 @@ if (( k8s )); then
         while IFS= read -r msgfile; do
             [[ -e "$msgfile" ]] || continue
             harvest_one "$persona" "${display_of[$persona]}" "${harness_of[$persona]}" \
-                "$model" "$msgfile" && harvested=$(( harvested + 1 ))
+                "$model" "$msgfile" "${network_of[$persona]}" && harvested=$(( harvested + 1 ))
         done < <(find "$out_dir" -maxdepth 1 -name '*.msg' | sort -V)
     done
 else
@@ -1036,7 +1056,7 @@ else
         while IFS= read -r msgfile; do
             [[ -e "$msgfile" ]] || continue
             harvest_one "$persona" "${display_of[$persona]}" "${harness_of[$persona]}" \
-                "$model" "$msgfile" && harvested=$(( harvested + 1 ))
+                "$model" "$msgfile" "${network_of[$persona]}" && harvested=$(( harvested + 1 ))
         done < <(find "$out_dir" -maxdepth 1 -name '*.msg' | sort -V)
     done
 fi

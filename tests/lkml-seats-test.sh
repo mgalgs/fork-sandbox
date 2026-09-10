@@ -90,6 +90,15 @@ network: sealed
 An impossible seat: a non-pi harness paired with sealed, straight in
 its own frontmatter, with no seats file to blame.
 PERSONA
+cat > "$personas_test_dir/badnetwork.md" <<'PERSONA'
+---
+persona: badnetwork
+harness: pi
+network: seald
+---
+A typo'd network value, straight in its own frontmatter, with no seats
+file to blame -- D1: this must refuse, not launch pinned.
+PERSONA
 
 # resolve_helper <seats-file | ABSENT> <persona> <fm-harness> <fm-model>
 # <fm-thinking> <fm-network> — call the helper with a controlled HOME and
@@ -128,6 +137,10 @@ resolve_helper ABSENT thinky pi-local "" high pinned
 check "frontmatter pi-local with an explicit pinned is refused" "1" "$RES_RC"
 contains "the refusal names the contradiction" "$RES_ERR" "already sealed"
 contains "the refusal names pi-local" "$RES_ERR" "pi-local"
+
+resolve_helper ABSENT core pi "" "" seald
+check "an invalid frontmatter network value is refused" "1" "$RES_RC"
+contains "the refusal names the bad value" "$RES_ERR" "not 'seald'"
 
 printf '\n== a frontmatter network: sealed with no alias reaches the seat ==\n'
 resolve_helper ABSENT sealy pi "" "" sealed
@@ -355,6 +368,18 @@ check "an explicit sealed on a non-pi seat is refused" "1" "$RES_RC"
 contains "the refusal names the persona-scope network key" "$RES_ERR" "personas.sealy.network"
 contains "the network refusal names the resolved harness" "$RES_ERR" "'claude'"
 
+# An explicit `network: pinned` only restates the default an omitted
+# frontmatter network already means -- the same seat spelled two ways,
+# not a change, so it must not be announced (D3: announcing a no-op is
+# the exact noise this script's header refuses for `thinking`).
+cat > "$work/seats-networkpin.yaml" <<'YAML'
+default:
+  network: pinned
+YAML
+resolve_helper "$work/seats-networkpin.yaml" core claude opus "" ""
+check "an explicit pinned restating an omitted frontmatter network is not an error" "0" "$RES_RC"
+check "an explicit pinned restating the default announces nothing" "" "$(resolved_field RES_OUT 5)"
+
 printf '\n== refusals name the file and the offending key ==\n'
 bad() {  # bad <label> <yaml> <expected-needle>
     local file="$work/bad.yaml"
@@ -384,6 +409,15 @@ bad "an invalid harness value is refused" \
     'default:
   harness: pilocal' \
     "not 'pilocal'"
+bad "an invalid network value is refused" \
+    'default:
+  network: seald' \
+    "not 'seald'"
+bad "a same-entry pi-local with network pinned is refused" \
+    'default:
+  harness: pi-local
+  network: pinned' \
+    "already sealed"
 bad "an empty file is refused" '' \
     "empty"
 bad "an empty entry is refused" \
@@ -542,6 +576,17 @@ contains "the refusal names the persona" "$OUT" "badseal"
 contains "the refusal names the resolved harness" "$OUT" "claude"
 n_launches=$(find "$capture_dir" -name '*.argv' | wc -l | tr -d '[:space:]')
 check "the pre-pass refusal launches no persona" "0" "$n_launches"
+
+printf '\n== a typo'"'"'d frontmatter network value refuses rather than launching pinned ==\n'
+# No seats file at all -- lkml-seats-resolve is never called for this
+# persona either, so this is also a case only the round's own pre-pass
+# check can catch (D1): an unrecognized value must not fail open.
+rm -f -- "$capture_dir"/*.argv
+launch_round ABSENT badnetwork
+if (( RC != 0 )); then ok "the typo'd network value refuses the round"; else no "the typo'd network value refuses the round" "exit 0: $OUT"; fi
+contains "the refusal names the bad value" "$OUT" "not 'seald'"
+n_launches=$(find "$capture_dir" -name '*.argv' | wc -l | tr -d '[:space:]')
+check "the typo refusal launches no persona" "0" "$n_launches"
 
 printf '\n== seats default: re-seats every launched persona, loudly ==\n'
 cat > "$work/seats-round.yaml" <<'YAML'

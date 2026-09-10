@@ -382,6 +382,9 @@ if [[ -z "$model" ]]; then
     model="$(jq -r '.model // empty' "$run_dir/summary.json" 2>/dev/null || true)"
 fi
 [[ -n "$model" ]] || model="unknown"
+# An empty network means the ordinary networked default, not "unknown" --
+# unlike model, which really can be unresolvable.
+[[ -n "$network" ]] || network="pinned"
 
 # Harvest one .git/lkml-out/*.msg file as a reply from the author persona.
 # Kept as a function, not inline, specifically so its per-message state
@@ -430,7 +433,7 @@ harvest_reply() {
     local id rc=0
     id="$("$mailbox" post "$series" --from "$author_persona" --display "$display" \
         --reply-to "$reply_to" --file "$body_file" --harness "$harness" --model "$model" \
-        "${extra[@]}")" || rc=$?
+        --network "$network" "${extra[@]}")" || rc=$?
     rm -f "$body_file"
     if (( rc != 0 )); then
         echo "Warning: lkml-revise: failed to post $msgfile." >&2
@@ -485,7 +488,8 @@ fi
 
 new_cover_id="$(cd "$real_repo" && "$mailbox" init "$series" --cover "$cover_file" --patches "$patch_dir" \
     --from "$author_persona" --display "$display" --version "$next_version" \
-    --harness "$harness" --model "$model" --diffstat "$series_base_sha..$real_branch")" || {
+    --harness "$harness" --model "$model" --network "$network" \
+    --diffstat "$series_base_sha..$real_branch")" || {
     echo "Error: lkml-mailbox.sh init failed -- v$next_version was not posted." >&2
     echo "Patches are sitting at $patch_dir; branch $real_branch was not" >&2
     echo "recorded in $ledger_root/$series/versions.jsonl." >&2
