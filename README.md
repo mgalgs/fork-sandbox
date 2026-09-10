@@ -427,10 +427,11 @@ what lands on your PATH. `install.sh` decides that, in its `PORCELAIN` and
 `PLUMBING` arrays, and it draws the line by a stricter test: porcelain means
 something has to find this **without** a `script_dir` to search from — a
 hook that invokes it by bare name, or another script with its installed path
-hardcoded. That catches names nobody ever types, which is why `fork-sandbox
-run` refuses to launch a run when `claude-sandboxed` is missing from PATH
-(its hardcoded install path is the only fallback). Classify a
-new script in `install.sh`, not here.
+hardcoded. That catches names nobody ever types, which is why
+`claude-sandboxed` is porcelain: `fs_require_sandbox_wrapper` takes it from PATH
+when it is there, falls back to its hardcoded install path when it is not,
+and refuses to start a run only when neither exists. Classify a new script
+in `install.sh`, not here.
 
 ```bash
 # Launch a run, get a branch back — the engine under /fork-sandbox and
