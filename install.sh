@@ -300,15 +300,6 @@ PORCELAIN=(
     fork-sandbox-say.sh
     fork-sandbox-status.sh
     fork-sandbox.sh
-    lkml-cover.sh
-    lkml-forklift.sh
-    lkml-mailbox.sh
-    lkml-render.py
-    lkml-revise.sh
-    lkml-round.sh
-    lkml-series.sh
-    lkml-status.sh
-    lkml-summarize.sh
     pi-sandboxed
     sandbox-run-log.py        # fork-sandbox.sh looks it up on PATH before falling back to this hardcoded path
 )
@@ -330,8 +321,6 @@ PLUMBING=(
     fork-sandbox-k8s-services-parse.py
     fork-sandbox-lib.sh
     fork-sandbox-preset-parse.py
-    lkml-seats-parse.py
-    lkml-seats-resolve
     sandbox-backend-bwrap
     sandbox-backend-container
 )
