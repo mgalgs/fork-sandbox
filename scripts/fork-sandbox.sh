@@ -4481,7 +4481,7 @@ else
         if [[ "$harness" == "claude" ]]; then
             # Last occurrence wins, including over one supplied in --claude-args.
             review_sandbox_cmd+=(--model "$review_model")
-        elif [[ "$harness" == "pi-local" ]]; then
+        elif [[ "$harness" == "pi" && "$network" == "sealed" ]]; then
             model_flag_i=-1
             workdir_i=-1
             for i in "${!review_sandbox_cmd[@]}"; do
@@ -4563,7 +4563,7 @@ if (( maintainer_loop_cap > 0 )); then
         if [[ "$harness" == "claude" ]]; then
             # Last occurrence wins, including over one supplied in --claude-args.
             maintainer_sandbox_cmd+=(--model "$maintainer_model")
-        elif [[ "$harness" == "pi-local" ]]; then
+        elif [[ "$harness" == "pi" && "$network" == "sealed" ]]; then
             model_flag_i=-1
             workdir_i=-1
             for i in "${!maintainer_sandbox_cmd[@]}"; do

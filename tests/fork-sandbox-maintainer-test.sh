@@ -403,6 +403,24 @@ else
     no "an all-non-claude run produced a run directory" "run_real failed"
 fi
 
+# Regression: --harness pi-local (no --maintainer-harness given, so the
+# maintainer leg falls back to reusing the implement command) with
+# --maintainer-model must still patch the model into the maintainer leg's
+# agent-sandboxed command. This fallback branch used to key off the literal
+# harness value "pi-local", which $harness can never hold once the
+# --network split expands the alias to harness "pi" + network "sealed" --
+# see the dead-arm regression this guards against.
+rd_reg="$(run_real --harness pi-local --model some-local-model \
+    --maintainer-loop 1 --maintainer-model other-local-model)" \
+    && tmpdirs+=("$rd_reg")
+if [[ -n "$rd_reg" ]]; then
+    mnt_line="$(grep '^maintainer_sandbox_cmd=' "$rd_reg/run.sh")"
+    contains "a pi-local maintainer leg (no --maintainer-harness) gets --maintainer-model patched in" \
+        "--model other-local-model" "$mnt_line"
+else
+    no "run_real produced a run directory for the pi-local maintainer-model regression" "run_real failed"
+fi
+
 printf '\n== --maintainer-loop: the loop, end to end ==\n'
 
 # A four-leg scenario under --maintainer-loop 2: the implement leg commits,

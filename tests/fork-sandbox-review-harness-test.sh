@@ -702,6 +702,24 @@ else
     no "run_real produced a run directory for the pi-local/pi pair" "rc=$rc9pl: $out9pl"
 fi
 
+# 10. Regression: --harness pi-local (no --review-harness given, so the
+# review leg falls back to reusing the implement command) with
+# --review-model must still patch the model into the review leg's
+# agent-sandboxed command. This fallback branch used to key off the literal
+# harness value "pi-local", which $harness can never hold once the
+# --network split expands the alias to harness "pi" + network "sealed" --
+# see the dead-arm regression this guards against.
+rd10="$(run_real --harness pi-local --model some-local-model \
+    --review-loop 1 --review-model other-local-model)"
+if [[ -n "$rd10" ]]; then
+    tmpdirs+=("$rd10")
+    review_line10="$(grep '^review_sandbox_cmd=' "$rd10/run.sh")"
+    contains "a pi-local review leg (no --review-harness) gets --review-model patched in" \
+        "--model other-local-model" "$review_line10"
+else
+    no "run_real produced a run directory for the pi-local review-model regression" "run_real failed"
+fi
+
 printf '\n== --review-loop: review and fix legs start with an empty inbox ==\n'
 
 # fs_archive_inbox (fork-sandbox.sh) moves every addendum out of the inbox
