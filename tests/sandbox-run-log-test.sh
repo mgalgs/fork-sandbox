@@ -44,6 +44,14 @@ contains() {
     esac
 }
 
+not_contains() {
+    local label="$1" needle="$2" hay="$3"
+    case "$hay" in
+        *"$needle"*) no "$label" "did not expect to find '$needle' in: $hay" ;;
+        *) ok "$label" ;;
+    esac
+}
+
 tmp="$(mktemp -d)"
 tmpdirs+=("$tmp")
 
@@ -105,8 +113,10 @@ contains "show normalizes a historical pi-local row's network to sealed" \
     '"network": "sealed"' "$out"
 
 out="$(query list 2>/dev/null)"
-contains "list shows the normalized harness for the historical row" \
-    "pi" "$out"
+not_contains "list does not show the unnormalized pi-local harness" \
+    "pi-local" "$out"
+contains "list shows the normalized harness cell as exactly pi" \
+    "pi       -" "$out"
 
 out="$(query stats --by network 2>/dev/null)"
 contains "stats --by network groups the historical row under sealed" \
