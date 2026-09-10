@@ -313,24 +313,26 @@
 #                         ids, never a Claude Code model name. Precedence:
 #                         --model, then this key, then the pod's own
 #                         single-candidate discovery rule, then that
-#                         discovery's error listing what it found. A value
-#                         the endpoint's listing does not contain is an
-#                         error at pod start that names the requested id,
-#                         lists the ids the endpoint does offer, and points
-#                         back to this key -- unless K8S_ALLOW_UNLISTED_MODEL
-#                         is set, in which case it is the old warning.
+#                         discovery's error listing what it found. If the
+#                         pod cannot READ this id's context length -- the
+#                         listing does not contain it, the listing carries
+#                         no usable max_model_len for it, or the catalog
+#                         fetch failed -- that is an error at pod start
+#                         unless K8S_ALLOW_UNLISTED_MODEL is set.
 #   K8S_ALLOW_UNLISTED_MODEL=
-#                         set to 1 to turn the pod-side refusal of an
-#                         unlisted model id back into a warning. The
-#                         listing may be stale -- the model behind an
-#                         endpoint is free to change -- and this is the
-#                         explicit door for a known-good id the listing
-#                         does not yet show. Unset (the default) means
-#                         refuse: a warning that proceeds is
+#                         set to 1 to permit a launch whose context
+#                         length had to be guessed: the model id is
+#                         absent from the endpoint's /v1/models listing,
+#                         the catalog fetch itself failed, timed out or
+#                         came back unparseable, or the entry carries no
+#                         usable max_model_len. Without it the pod
+#                         refuses: a warning that proceeds is
 #                         indistinguishable from success once the pod is
 #                         reaped, and the guess-low context window that
-#                         follows from the missing id would then stand
-#                         silently for a real one. May only be 1 or unset.
+#                         follows a missing id would then stand silently
+#                         for a real one. The warning it restores names
+#                         the guessed value as a guess. May only be 1 or
+#                         unset.
 #   K8S_CLUSTER_DOMAIN=   the cluster's own DNS domain, defaults to
 #                         cluster.local. A K8S_PROXY_UPSTREAM or
 #                         K8S_PROXY_ENDPOINTS URL on http:// to a host
@@ -483,9 +485,9 @@ K8S_DEFAULT_ENDPOINT="$(read_env_value "$k8s_env" K8S_DEFAULT_ENDPOINT || true)"
 # install; see the model-requirement block in cmd_submit, which resolves
 # it with the same precedence shape as K8S_DEFAULT_ENDPOINT above.
 K8S_DEFAULT_MODEL="$(read_env_value "$k8s_env" K8S_DEFAULT_MODEL || true)"
-# Refuse-or-warn switch for a model id the endpoint's /v1/models listing
-# does not contain; see the key's header entry above. Empty means unset,
-# meaning the pod refuses -- the same read_env_value empty-means-unset
+# Permits a launch whose context length had to be guessed (see the key's
+# header entry above); the pod refuses such a launch without it. Empty
+# means unset, meaning refuse -- the same read_env_value empty-means-unset
 # convention as every other K8S_* key.
 K8S_ALLOW_UNLISTED_MODEL="$(read_env_value "$k8s_env" K8S_ALLOW_UNLISTED_MODEL || true)"
 K8S_PROXY_ALLOW="$(read_env_value "$k8s_env" K8S_PROXY_ALLOW || true)"
@@ -3197,8 +3199,9 @@ CENV
 
     # ALLOW_UNLISTED_MODEL, rendered only when k8s.env sets
     # K8S_ALLOW_UNLISTED_MODEL=1 (validated at parse time above): the pod's
-    # half of the refusal's escape hatch. Unset renders nothing, so the
-    # pod-side default stays refuse without this script spelling "0".
+    # half of the escape hatch -- it permits a launch whose context length
+    # had to be guessed. Unset renders nothing, so the pod-side default
+    # stays refuse without this script spelling "0".
     local allow_unlisted_model_env=""
     if [[ "$K8S_ALLOW_UNLISTED_MODEL" == 1 ]]; then
         allow_unlisted_model_env=$'\n'"$(cat <<CENV

@@ -799,26 +799,39 @@ resolves before this discovery ever runs: `submit`/`run` fill in a
 missing `--model` from it (announced on stderr) the same way
 `--endpoint` falls back to `K8S_DEFAULT_ENDPOINT` above, so the
 site-configured model reaches the pod as if `--model` had been given.
-When `--model` (or `K8S_DEFAULT_MODEL`) was
-omitted, exactly one model in the listing is used (and said so); zero
-or several is an error listing what was found. When `--model` was
-given (directly or via `K8S_DEFAULT_MODEL`) but the listing does not
-contain it, the pod **refuses**: it names the requested id, lists the
-ids the endpoint does offer, and points at `K8S_DEFAULT_MODEL` in
-`k8s.env` as the likely place to fix it — a renamed or removed
-catalog entry is the usual cause, and a wrong id that proceeds costs
-a whole round of runs that then quietly use a guess-low context
-window. Failing at pod start costs one launch. `--harness claude`
+When the pod cannot *read* the context length of the id the run will
+use, it **refuses** — at the single point where a guessed value would
+be returned, so every path to a guess fails closed. When `--model`
+(or `K8S_DEFAULT_MODEL`) was omitted, exactly one model in the listing
+is used (and said so); zero or several is an error listing what was
+found. The paths that refuse are: the id was given (directly or via
+`K8S_DEFAULT_MODEL`) but the listing does not contain it — the error
+names the requested id, lists the ids the endpoint does offer, and
+points at `K8S_DEFAULT_MODEL` in `k8s.env` as the likely place to fix
+it, a renamed or removed catalog entry being the usual cause; the
+catalog fetch itself failed or came back unparseable — an
+ops-flavoured "the endpoint is not running right now; start it and
+resubmit"; and the entry is listed but carries no usable
+`max_model_len`. In every case a warning that proceeds is
+indistinguishable from success once the pod is reaped — a wrong id
+would quietly run a whole round on a guess-low context window — and
+failing at pod start costs one launch. Id comparison is
+case-insensitive (the gateway's lookup is): a case-variant id that
+matches proceeds under the *listing's* canonical spelling, which is
+what the run record carries. `--harness claude`
 keeps requiring `--model` regardless
 of `K8S_DEFAULT_MODEL` — the claude check runs first specifically so a
 claude run never silently picks up a pi endpoint's model id, and a
 Claude Code model name is never in this listing, so the claude
-harness is exempt from the refusal too. The legitimate stale-listing
-case keeps an explicit door: `K8S_ALLOW_UNLISTED_MODEL=1` in
-`k8s.env` (may only be `1` or unset) turns the refusal back into a
-warning, for a known-good id the listing does not yet show. The same response's `max_model_len` for the chosen
-model becomes `models.json`'s `contextWindow` (a missing value falls
-back to a deliberately low 32768 guess, with a warning), and `maxTokens`
+harness is exempt from the refusal too. The explicit door for all
+three paths: `K8S_ALLOW_UNLISTED_MODEL=1` in
+`k8s.env` (may only be `1` or unset) permits a launch whose context
+had to be guessed, turning the refusal into a warning that names the
+guessed value as a guess — for a stale listing, a catalog that
+could not be read, or a catalog that reports no window. The same response's `max_model_len` for the chosen
+model becomes `models.json`'s `contextWindow` (a missing value
+reaches the guess described above, refused by default), and
+`maxTokens`
 is derived the same way `agent-sandboxed` derives it: a 32768 floor
 capped at a quarter of the window. `REVIEW_MODEL`, when set, gets the
 window discovered for *its own id* rather than sharing the coding

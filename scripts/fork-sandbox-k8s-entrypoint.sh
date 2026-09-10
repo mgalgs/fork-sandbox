@@ -33,12 +33,17 @@
 #                   resolves it from the proxy's /v1/models: exactly one
 #                   model in the listing is used (and said so), zero or
 #                   several is an error. When submit DID give one and the
-#                   listing does not contain it, that is an ERROR that
-#                   refuses the run (naming the requested id, listing the
-#                   ids the endpoint does offer, and pointing at
-#                   K8S_DEFAULT_MODEL in k8s.env) -- unless the host set
-#                   ALLOW_UNLISTED_MODEL, in which case it is the old
-#                   warn-and-proceed.
+#                   run's context length had to be GUESSED -- the id is
+#                   absent from the listing, the catalog fetch itself
+#                   failed or came back unparseable, or the entry carries
+#                   no usable max_model_len -- that is an ERROR that
+#                   refuses the run, at the single point the guess would
+#                   be returned -- unless the host set ALLOW_UNLISTED_MODEL,
+#                   in which case it is a warning that names the guessed
+#                   value as a guess. The id comparison is
+#                   case-insensitive (the gateway's lookup is); a
+#                   case-variant configured id proceeds with the
+#                   listing's canonical spelling.
 #                   The same discovery reads the context window
 #                   (max_model_len for the chosen model; a missing value
 #                   falls back to 32768, a deliberately low guess, with a
@@ -81,11 +86,14 @@
 #                   variable instead of the pod guessing from the URL.
 #   ALLOW_UNLISTED_MODEL
 #                   set to 1 by fork-sandbox-k8s.sh when k8s.env carries
-#                   K8S_ALLOW_UNLISTED_MODEL=1: it turns the unlisted-
-#                   model refusal in discover_model_facts below back into
-#                   a warning, for the case where the listing is stale
-#                   and the configured id is known good. Unset (the
-#                   default) means refuse.
+#                   K8S_ALLOW_UNLISTED_MODEL=1: it permits a launch whose
+#                   context length had to be guessed -- the model id is
+#                   absent from the listing, the catalog fetch failed or
+#                   came back unparseable, or the entry carries no usable
+#                   max_model_len -- turning the refusal in
+#                   discover_model_facts below into a warning that names
+#                   the guessed value as a guess. Unset (the default)
+#                   means refuse.
 #   PI_ARGS         extra arguments for the pi coding-leg invocation,
 #                   verbatim from fork-sandbox-k8s.sh's --pi-args, e.g.
 #                   "--thinking low". Rendered only when non-empty, so
@@ -233,23 +241,34 @@ fi
 # keeps the constants synthesize_pi_config used before discovery
 # existed.
 discover_model_facts() {
-    local url="$PROXY_BASE_URL/models" body probe_ids count
-    if ! body="$(curl -sS --max-time 20 "$url" 2>&1)"; then
-        echo "Error: model discovery failed -- $url did not answer:" >&2
-        echo "  $body" >&2
-        echo "A connection refusal here is an expected, ordinary state, not" >&2
-        echo "a bug to chase: the endpoint is often a workstation-class" >&2
-        echo "host, and this simply means it is not running right now." >&2
-        echo "Start the endpoint and resubmit the run." >&2
-        exit 1
-    fi
-    if ! probe_ids="$(jq -r '.data[].id' <<<"$body" 2>/dev/null)" || [[ -z "$probe_ids" ]]; then
-        echo "Error: model discovery failed -- $url did not answer with a" >&2
-        echo "model list. It answered:" >&2
-        printf '%s\n' "${body:0:400}" >&2
-        exit 1
+    local url="$PROXY_BASE_URL/models" body probe_ids count curl_rc=0 fetch_note=""
+    # A catalog that cannot be fetched or parsed does NOT die here: it
+    # dies -- or warns -- at the single point where the context that
+    # would have come from it gets guessed, in _model_context_facts
+    # below. That is what makes every path to the guess one refusal.
+    body="$(curl -sS --max-time 20 "$url" 2>&1)" || curl_rc=$?
+    if (( curl_rc != 0 )); then
+        fetch_note="$body"
+        body=""
+        probe_ids=""
+    else
+        probe_ids="$(jq -r '.data[].id' <<<"$body" 2>/dev/null || true)"
+        if [[ -z "$probe_ids" ]]; then
+            fetch_note="it answered with no model list: ${body:0:400}"
+        fi
     fi
     if [[ -z "$MODEL" ]]; then
+        if [[ -z "$probe_ids" ]]; then
+            # No model can be resolved at all -- nothing to guess a
+            # window for, so this one is a hard error either way.
+            echo "Error: model discovery failed -- $url:" >&2
+            printf '%s\n' "$fetch_note" >&2
+            echo "A connection refusal here is an expected, ordinary state, not" >&2
+            echo "a bug to chase: the endpoint is often a workstation-class" >&2
+            echo "host, and this simply means it is not running right now." >&2
+            echo "Start the endpoint and resubmit the run." >&2
+            exit 1
+        fi
         count="$(printf '%s\n' "$probe_ids" | wc -l)"
         if (( count > 1 )); then
             echo "Error: the endpoint serves more than one model, so one" >&2
@@ -260,39 +279,38 @@ discover_model_facts() {
         MODEL="$probe_ids"
         echo "fork-sandbox-k8s-entrypoint: no --model given; the endpoint" >&2
         echo "serves exactly one model, so using $MODEL." >&2
-    elif [[ "$HARNESS" != claude ]] && ! printf '%s\n' "$probe_ids" | grep -qxF "$MODEL"; then
-        # (HARNESS=claude: MODEL is a Claude Code name this listing never
-        # contains and no pi leg uses, so it is never checked here.)
-        # The requested id is not in the endpoint's own listing. Warn
-        # and proceed, and once the pod is reaped with the round
-        # reported green, the two warnings are indistinguishable from
-        # success -- the renamed-catalog-entry incident this refusal
-        # exists for: the guess-low context window below then stands in
-        # silently for a real one, a quarter of the size. So the default
-        # is to REFUSE: failing at pod start costs one launch; proceeding
-        # on the wrong context costs a whole round of empty seats.
-        # The listing CAN be stale and a legitimate run can name a model
-        # the listing does not yet show -- that case keeps an explicit
-        # door, ALLOW_UNLISTED_MODEL=1 (the host's K8S_ALLOW_UNLISTED_MODEL
-        # in k8s.env), which restores the old warn-and-proceed. Silence
-        # is no longer the default.
-        if [[ "$ALLOW_UNLISTED_MODEL" == 1 ]]; then
-            echo "Warning: $url does not list a model called '$MODEL'." >&2
-            echo "Continuing anyway because ALLOW_UNLISTED_MODEL=1; the" >&2
-            echo "endpoint may serve more than it advertises." >&2
-        else
-            echo "Error: $url does not list a model called '$MODEL'." >&2
-            echo "The endpoint offers:" >&2
-            printf '%s\n' "$probe_ids" | sed 's/^/  /' >&2
-            echo "A renamed or removed catalog entry is the usual cause: the" >&2
-            echo "configured id was right when written and the endpoint's" >&2
-            echo "catalog changed since. Fix the id -- most often" >&2
-            echo "K8S_DEFAULT_MODEL in k8s.env, the value submit fell back" >&2
-            echo "to when --model was omitted -- and resubmit. If the id" >&2
-            echo "is known good and the listing is stale, setting" >&2
-            echo "K8S_ALLOW_UNLISTED_MODEL=1 in k8s.env restores the old" >&2
-            echo "warn-and-proceed." >&2
-            exit 1
+    fi
+
+    # The listing's canonical spelling for a case-variant id, or empty:
+    # the gateway's own lookup is case-insensitive, but /v1/models reports
+    # the canonical spelling, so a correctly-working, case-variant
+    # configured id must not compare unequal -- and once it matches, the
+    # LISTING's spelling is what the run and its record carry. The exact
+    # jq lookup in _model_context_facts below needs this match to find
+    # the entry at all.
+    _listing_spelling() {
+        local id
+        while IFS= read -r id; do
+            if [[ -n "$id" && "${id,,}" == "${1,,}" ]]; then
+                printf '%s\n' "$id"
+                return 0
+            fi
+        done <<< "$probe_ids"
+        return 0
+    }
+
+    # (HARNESS=claude: MODEL is a Claude Code name this listing never
+    # contains and no pi leg uses, so it is never checked or normalized
+    # here.)
+    if [[ "$HARNESS" != claude && -n "$MODEL" ]]; then
+        local listed_id
+        listed_id="$(_listing_spelling "$MODEL")"
+        if [[ -n "$listed_id" && "$listed_id" != "$MODEL" ]]; then
+            echo "fork-sandbox-k8s-entrypoint: the listing spells the model" >&2
+            echo "'$listed_id', not the configured '$MODEL'; the gateway's" >&2
+            echo "lookup is case-insensitive, so the run uses the listing's" >&2
+            echo "spelling." >&2
+            MODEL="$listed_id"
         fi
     fi
 
@@ -312,8 +330,23 @@ discover_model_facts() {
     # extracts exactly this function's source and runs it alone. Sets the
     # globals FACTS_CTX / FACTS_MAX / FACTS_SRC (reported or guessed, the
     # source of FACTS_CTX) for the id in $1.
+    #
+    # The refusal this design pivots on lives HERE, the single point a
+    # guessed value would be returned: every path to the guess -- the id
+    # is absent from a successfully fetched listing, the catalog fetch
+    # itself failed, timed out or came back unparseable, or the entry was
+    # found but carries no usable max_model_len -- funnels into this one
+    # check, so a future fourth path to the guess fails closed by
+    # construction. Refusing at pod start costs one launch; proceeding on
+    # the guess lets a window that is four times off stand silently for
+    # the real one, and that is what the renamed-catalog-entry incident
+    # did to a whole round. The guess is still the right guess when the
+    # endpoint simply reports no max_model_len -- but it must be named a
+    # guess, and it proceeds only when ALLOW_UNLISTED_MODEL=1 (the host's
+    # K8S_ALLOW_UNLISTED_MODEL in k8s.env) permits a launch whose context
+    # had to be guessed.
     _model_context_facts() {
-        local model="$1" len
+        local model="$1" len why kind
         FACTS_SRC=reported
         len="$(jq -r --arg m "$model" \
             'first(.data[] | select(.id == $m) | .max_model_len // empty) // empty' \
@@ -323,9 +356,58 @@ discover_model_facts() {
             # rejection that arrives mid-run with the work half done.
             len=32768
             FACTS_SRC=guessed
-            echo "Warning: $url does not report a context length for" >&2
-            echo "'$model', so the run using it assumes $len tokens, a" >&2
-            echo "deliberately low guess." >&2
+            if [[ -z "$probe_ids" ]]; then
+                kind=catalog
+                why="the endpoint's model catalog could not be read ($url: $fetch_note)"
+            elif ! printf '%s\n' "$probe_ids" | grep -qxF "$model"; then
+                kind=unlisted
+                why="the endpoint's listing does not contain that id"
+            else
+                kind=nolen
+                why="its entry in the listing carries no usable max_model_len"
+            fi
+            if [[ "$ALLOW_UNLISTED_MODEL" == 1 ]]; then
+                echo "Warning: the context length for '$model' is a GUESS of" >&2
+                echo "$len tokens -- $why. Continuing because" >&2
+                echo "ALLOW_UNLISTED_MODEL=1 permits a launch whose context" >&2
+                echo "had to be guessed." >&2
+                if [[ "$kind" == unlisted ]]; then
+                    echo "The endpoint does not list that id; it offers:" >&2
+                    printf '%s\n' "$probe_ids" | sed 's/^/  /' >&2
+                fi
+            else
+                echo "Error: the context length for '$model' had to be" >&2
+                echo "guessed: $why." >&2
+                case "$kind" in
+                    catalog)
+                        echo "An unreachable or unhelpful endpoint is the" >&2
+                        echo "expected, ordinary state here, not a bug to" >&2
+                        echo "chase: the endpoint is often a workstation-class" >&2
+                        echo "host, and this simply means it is not running" >&2
+                        echo "right now. Start the endpoint and resubmit the" >&2
+                        echo "run." >&2
+                        ;;
+                    unlisted)
+                        echo "The endpoint offers:" >&2
+                        printf '%s\n' "$probe_ids" | sed 's/^/  /' >&2
+                        echo "A renamed or removed catalog entry is the usual" >&2
+                        echo "cause: the configured id was right when written and" >&2
+                        echo "the endpoint's catalog changed since (a case-only" >&2
+                        echo "difference is not a miss -- the comparison above" >&2
+                        echo "is case-insensitive). Fix the id -- most often" >&2
+                        echo "K8S_DEFAULT_MODEL in k8s.env, the value submit fell" >&2
+                        echo "back to when --model was omitted -- and resubmit. If" >&2
+                        echo "the id is known good and the listing is stale," >&2
+                        echo "K8S_ALLOW_UNLISTED_MODEL=1 in k8s.env permits a" >&2
+                        echo "launch whose context had to be guessed." >&2
+                        ;;
+                    *)
+                        echo "K8S_ALLOW_UNLISTED_MODEL=1 in k8s.env permits a" >&2
+                        echo "launch whose context had to be guessed." >&2
+                        ;;
+                esac
+                exit 1
+            fi
         fi
         FACTS_CTX="$len"
         # MAX_TOKENS from CTX, the same rule agent-sandboxed applies: a
@@ -355,6 +437,17 @@ discover_model_facts() {
         MODEL_CTX_SOURCE="$FACTS_SRC"
     fi
     if [[ -n "$REVIEW_MODEL" && "$REVIEW_MODEL" != "$MODEL" ]]; then
+        # The same case-insensitive listing match as MODEL above, so a
+        # case-variant --review-model is not a silent miss into the
+        # guess either.
+        local review_canonical
+        review_canonical="$(_listing_spelling "$REVIEW_MODEL")"
+        if [[ -n "$review_canonical" && "$review_canonical" != "$REVIEW_MODEL" ]]; then
+            echo "fork-sandbox-k8s-entrypoint: the listing spells the review" >&2
+            echo "model '$review_canonical', not the configured '$REVIEW_MODEL';" >&2
+            echo "using the listing's spelling." >&2
+            REVIEW_MODEL="$review_canonical"
+        fi
         _model_context_facts "$REVIEW_MODEL"
         REVIEW_CTX="$FACTS_CTX"
         REVIEW_MAX_TOKENS="$FACTS_MAX"

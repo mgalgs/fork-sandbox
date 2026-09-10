@@ -230,12 +230,16 @@
 #     single-model /v1/models response resolves MODEL and sets CTX /
 #     MAX_TOKENS from max_model_len (agent-sandboxed's rules: a 32768
 #     MAX_TOKENS floor capped at a quarter of the window); a multi-model
-#     response with no MODEL is an error listing the ids; a curl failure
-#     (the ordinary connection-refused state) errors naming the URL; a
-#     missing max_model_len warns and falls back to 32768; a MODEL absent
-#     from the listing warns and continues; REVIEW_MODEL gets the window
-#     discovered for its OWN id, not MODEL's -- the --harness claude case
-#     where MODEL is a Claude Code model name the listing never contains;
+#     response with no MODEL is an error listing the ids; a context
+#     length that would have to be GUESSED -- a MODEL absent from the
+#     listing, a failed or unparseable catalog fetch, or a listed entry
+#     with no usable max_model_len -- refuses at the single point the
+#     guess would be returned, unless ALLOW_UNLISTED_MODEL permits a
+#     launch whose context had to be guessed; id comparison is
+#     case-insensitive, with the run recording the listing's canonical
+#     spelling; REVIEW_MODEL gets the window discovered for its OWN id,
+#     not MODEL's -- the --harness claude case where MODEL is a Claude
+#     Code model name the listing never contains;
 #     and discovery runs in the script BEFORE the repository-receive
 #     wait, with no hardcoded contextWindow/maxTokens left in
 #     synthesize_pi_config's render. The call itself is gated on the
@@ -6305,15 +6309,31 @@ else
         "rc=$discover_rc: $discover_out"
 fi
 
-# A missing max_model_len warns, falls back to the low 32768 guess, and
-# marks the context source guessed -- the recorded facts must be able to
-# tell this apart from a 32768 that is a healthy large window's reply room.
+# A listed id with no usable max_model_len reaches the guess through
+# the third path to it: the default is to refuse, and
+# ALLOW_UNLISTED_MODEL=1 permits the launch with a warning that names
+# the guessed value as a guess. The recorded facts must be able to tell
+# this 32768 apart from a 32768 that is a healthy large window's reply
+# room.
 discover_run '{"data":[{"id":"solo"}]}' ""
-if (( discover_rc == 0 )) && [[ "$discover_out" == *"assumes 32768"* \
-        && "$discover_out" == *"MODEL=solo CTX=32768 MAX_TOKENS=8192 MODEL_CTX_SOURCE=guessed"* ]]; then
-    ok "discovery: missing max_model_len warns, falls back to 32768, and records context_source=guessed"
+if (( discover_rc != 0 )) \
+    && [[ "$discover_out" == *"for 'solo' had to be"* ]] \
+    && [[ "$discover_out" == *"guessed"* ]] \
+    && [[ "$discover_out" == *"no usable max_model_len"* ]] \
+    && [[ "$discover_out" == *"K8S_ALLOW_UNLISTED_MODEL=1"* ]]; then
+    ok "discovery: a listed id with no max_model_len refuses by default"
 else
-    no "discovery: missing max_model_len warns, falls back to 32768, and records context_source=guessed" \
+    no "discovery: a listed id with no max_model_len refuses by default" \
+        "rc=$discover_rc: $discover_out"
+fi
+discover_run '{"data":[{"id":"solo"}]}' "" "" pi 1
+if (( discover_rc == 0 )) \
+    && [[ "$discover_out" == *"is a GUESS of"* ]] \
+    && [[ "$discover_out" == *"32768 tokens"* ]] \
+    && [[ "$discover_out" == *"MODEL=solo CTX=32768 MAX_TOKENS=8192 MODEL_CTX_SOURCE=guessed"* ]]; then
+    ok "discovery: ALLOW_UNLISTED_MODEL=1 permits the guess, names it a guess, and records context_source=guessed"
+else
+    no "discovery: ALLOW_UNLISTED_MODEL=1 permits the guess, names it a guess, and records context_source=guessed" \
         "rc=$discover_rc: $discover_out"
 fi
 
@@ -6337,22 +6357,29 @@ else
         "rc=$discover_rc: $discover_out"
 fi
 
-# A MODEL absent from the listing is REFUSED by default: the renamed-
-# catalog-entry incident it exists for. The error names the requested id,
-# lists the ids the endpoint DOES offer, points at K8S_DEFAULT_MODEL in
-# k8s.env, and names the escape hatch.
+# A MODEL that was GIVEN and is absent from the listing is refused by
+# default: a warning that proceeds is indistinguishable from success
+# once the pod is reaped, and the guess-low window that follows a
+# missing id would then stand silently for a real one. The refusal is
+# about the context having to be GUESSED, not about the id per se --
+# the same refusal fires for a failed catalog fetch and for a listed
+# entry with no max_model_len, all through the one check where the
+# guess is returned. The error names the requested id, lists the ids
+# the endpoint DOES offer, points at K8S_DEFAULT_MODEL in k8s.env, and
+# names the escape hatch.
 discover_run '{"data":[{"id":"a-model","max_model_len":8192}]}' "other-model"
 if (( discover_rc != 0 )) \
     && [[ "$discover_out" == *"Error: "* ]] \
     && [[ "$discover_out" != *"Warning: "* ]] \
-    && [[ "$discover_out" == *"does not list a model called 'other-model'"* ]] \
+    && [[ "$discover_out" == *"for 'other-model' had to be"* ]] \
+    && [[ "$discover_out" == *"guessed: the endpoint's listing does not contain that id"* ]] \
     && [[ "$discover_out" == *"  a-model"* ]] \
     && [[ "$discover_out" == *"K8S_DEFAULT_MODEL in k8s.env"* ]] \
     && [[ "$discover_out" == *"K8S_ALLOW_UNLISTED_MODEL=1"* ]] \
     && [[ "$discover_out" != *"MODEL=other-model"* ]]; then
-    ok "discovery: a MODEL absent from the listing refuses, naming the offered ids and K8S_DEFAULT_MODEL"
+    ok "discovery: an unlisted MODEL refuses the run by default, naming the offered ids and K8S_DEFAULT_MODEL"
 else
-    no "discovery: a MODEL absent from the listing refuses, naming the offered ids and K8S_DEFAULT_MODEL" \
+    no "discovery: an unlisted MODEL refuses the run by default, naming the offered ids and K8S_DEFAULT_MODEL" \
         "rc=$discover_rc: $discover_out"
 fi
 # ...with more than one offered id, the error lists them all, not just the
@@ -6366,15 +6393,18 @@ else
         "rc=$discover_rc: $discover_out"
 fi
 # ALLOW_UNLISTED_MODEL=1 restores the old warn-and-proceed for the same
-# situation -- the explicit door for a stale listing.
+# situation -- the explicit door for a stale listing -- naming the
+# guessed value as a guess.
 discover_run '{"data":[{"id":"a-model","max_model_len":8192}]}' "other-model" "" pi 1
 if (( discover_rc == 0 )) \
-    && [[ "$discover_out" == *"does not list a model called 'other-model'"* ]] \
+    && [[ "$discover_out" == *"is a GUESS of"* ]] \
+    && [[ "$discover_out" == *"32768 tokens"* ]] \
+    && [[ "$discover_out" == *"does not contain that id"* ]] \
     && [[ "$discover_out" == *"ALLOW_UNLISTED_MODEL=1"* ]] \
-    && [[ "$discover_out" == *"MODEL=other-model CTX=32768"* ]]; then
-    ok "discovery: ALLOW_UNLISTED_MODEL=1 restores warn-and-proceed for an unlisted MODEL"
+    && [[ "$discover_out" == *"MODEL=other-model CTX=32768 MAX_TOKENS=8192 MODEL_CTX_SOURCE=guessed"* ]]; then
+    ok "discovery: ALLOW_UNLISTED_MODEL=1 restores warn-and-proceed for an unlisted MODEL, naming the guess"
 else
-    no "discovery: ALLOW_UNLISTED_MODEL=1 restores warn-and-proceed for an unlisted MODEL" \
+    no "discovery: ALLOW_UNLISTED_MODEL=1 restores warn-and-proceed for an unlisted MODEL, naming the guess" \
         "rc=$discover_rc: $discover_out"
 fi
 
@@ -6395,15 +6425,40 @@ else
     no "discovery: on a claude run the Claude Code name is not probed and the review model's window stands" \
         "rc=$discover_rc: $discover_out"
 fi
-# ...and a REVIEW_MODEL absent from the listing gets the low-guess
-# fallback for itself, with the warning naming IT.
+# ...and a REVIEW_MODEL absent from the listing is a refusal of its own:
+# the review loop is a pi leg, and its guessed context is the same
+# class of damage.
 discover_run '{"data":[{"id":"a-model","max_model_len":8192}]}' "a-model" "other-model"
-if (( discover_rc == 0 )) && [[ "$discover_out" == *"MODEL=a-model CTX=8192 MAX_TOKENS=2048"* \
-        && "$discover_out" == *"'other-model', so the run using it assumes 32768"* \
-        && "$discover_out" == *"REVIEW_CTX=32768 REVIEW_MAX_TOKENS=8192"* ]]; then
-    ok "discovery: a REVIEW_MODEL absent from the listing warns and falls back to 32768"
+if (( discover_rc != 0 )) \
+    && [[ "$discover_out" == *"for 'other-model' had to be"* ]] \
+    && [[ "$discover_out" != *"MODEL=a-model"* ]]; then
+    ok "discovery: a REVIEW_MODEL absent from the listing refuses the run"
 else
-    no "discovery: a REVIEW_MODEL absent from the listing warns and falls back to 32768" \
+    no "discovery: a REVIEW_MODEL absent from the listing refuses the run" \
+        "rc=$discover_rc: $discover_out"
+fi
+# ...and with ALLOW_UNLISTED_MODEL=1 the review model's guessed
+# context is permitted, with the real MODEL's window untouched.
+discover_run '{"data":[{"id":"a-model","max_model_len":8192}]}' "a-model" "other-model" pi 1
+if (( discover_rc == 0 )) \
+    && [[ "$discover_out" == *"MODEL=a-model CTX=8192 MAX_TOKENS=2048"* ]] \
+    && [[ "$discover_out" == *"is a GUESS of"* ]] \
+    && [[ "$discover_out" == *"32768 tokens"* ]] \
+    && [[ "$discover_out" == *"REVIEW_CTX=32768 REVIEW_MAX_TOKENS=8192"* ]]; then
+    ok "discovery: ALLOW_UNLISTED_MODEL=1 permits the review model's guessed context"
+else
+    no "discovery: ALLOW_UNLISTED_MODEL=1 permits the review model's guessed context" \
+        "rc=$discover_rc: $discover_out"
+fi
+# ...and a case-variant REVIEW_MODEL that IS listed matches case-
+# insensitively and gets the real window, not the guess.
+discover_run '{"data":[{"id":"a-model","max_model_len":8192}]}' "a-model" "A-model"
+if (( discover_rc == 0 )) \
+    && [[ "$discover_out" == *"REVIEW_CTX=8192 REVIEW_MAX_TOKENS=2048"* ]] \
+    && [[ "$discover_out" != *"GUESS"* ]]; then
+    ok "discovery: a case-variant REVIEW_MODEL that is listed matches and gets the real window"
+else
+    no "discovery: a case-variant REVIEW_MODEL that is listed matches and gets the real window" \
         "rc=$discover_rc: $discover_out"
 fi
 # ...and with no separate review model, the review loop falls back to
@@ -6416,17 +6471,74 @@ else
         "rc=$discover_rc: $discover_out"
 fi
 
-# A curl failure -- the ordinary connection-refused state of a
-# workstation-class endpoint -- errors naming the URL, and reads like
-# operations rather than a stack trace.
+# A curl failure with no model to fall back on -- the ordinary
+# connection-refused state of a workstation-class endpoint -- errors
+# naming the URL, and reads like operations rather than a stack trace.
 discover_run FAIL ""
 if (( discover_rc != 0 )) \
     && [[ "$discover_out" == *"/e/primary/v1/models"* \
         && "$discover_out" == *"Connection refused"* \
         && "$discover_out" == *"expected, ordinary state"* ]]; then
-    ok "discovery: a curl failure errors naming the URL, ops-flavoured"
+    ok "discovery: a curl failure without a configured MODEL errors naming the URL, ops-flavoured"
 else
-    no "discovery: a curl failure errors naming the URL, ops-flavoured" \
+    no "discovery: a curl failure without a configured MODEL errors naming the URL, ops-flavoured" \
+        "rc=$discover_rc: $discover_out"
+fi
+# A catalog fetch that FAILS with a model already configured reaches
+# the guess through the second path to it: the default is to refuse,
+# ops-flavoured, and ALLOW_UNLISTED_MODEL=1 permits the launch.
+discover_run FAIL "a-model"
+if (( discover_rc != 0 )) \
+    && [[ "$discover_out" == *"/e/primary/v1/models"* \
+        && "$discover_out" == *"Connection refused"* \
+        && "$discover_out" == *"for 'a-model' had to be"* \
+        && "$discover_out" == *"expected, ordinary state"* \
+        && "$discover_out" == *"Start the endpoint and resubmit"* ]]; then
+    ok "discovery: a failed catalog fetch with a configured MODEL refuses, ops-flavoured"
+else
+    no "discovery: a failed catalog fetch with a configured MODEL refuses, ops-flavoured" \
+        "rc=$discover_rc: $discover_out"
+fi
+discover_run FAIL "a-model" "" pi 1
+if (( discover_rc == 0 )) \
+    && [[ "$discover_out" == *"is a GUESS of"* ]] \
+    && [[ "$discover_out" == *"32768 tokens"* ]] \
+    && [[ "$discover_out" == *"MODEL=a-model CTX=32768 MAX_TOKENS=8192 MODEL_CTX_SOURCE=guessed"* ]]; then
+    ok "discovery: ALLOW_UNLISTED_MODEL=1 permits a launch whose catalog could not be read"
+else
+    no "discovery: ALLOW_UNLISTED_MODEL=1 permits a launch whose catalog could not be read" \
+        "rc=$discover_rc: $discover_out"
+fi
+# ...and an UNPARSEABLE catalog answer is the same refusal class.
+discover_run '{"not":"a model list"}' "a-model"
+if (( discover_rc != 0 )) \
+    && [[ "$discover_out" == *"no model list"* ]] \
+    && [[ "$discover_out" == *"for 'a-model' had to be"* ]]; then
+    ok "discovery: an unparseable catalog answer refuses when a MODEL is configured"
+else
+    no "discovery: an unparseable catalog answer refuses when a MODEL is configured" \
+        "rc=$discover_rc: $discover_out"
+fi
+# The gateway's lookup is case-insensitive but /v1/models reports the
+# canonical spelling: a case-variant id that IS listed must not be a
+# miss, and the run records the LISTING's spelling -- while a
+# case-variant id that is not listed under any spelling is still a
+# miss.
+discover_run '{"data":[{"id":"Qwen3-8B","max_model_len":24576}]}' "qwen3-8b"
+if (( discover_rc == 0 )) \
+    && [[ "$discover_out" == *"MODEL=Qwen3-8B CTX=24576 MAX_TOKENS=6144 MODEL_CTX_SOURCE=reported"* ]] \
+    && [[ "$discover_out" == *"uses the listing's"* ]]; then
+    ok "discovery: a case-variant listed id matches and the run records the canonical spelling"
+else
+    no "discovery: a case-variant listed id matches and the run records the canonical spelling" \
+        "rc=$discover_rc: $discover_out"
+fi
+discover_run '{"data":[{"id":"a-model","max_model_len":8192}]}' "B-MODEL"
+if (( discover_rc != 0 )) \
+    && [[ "$discover_out" == *"for 'B-MODEL' had to be"* ]]; then
+    ok "discovery: a case-variant id not listed under any spelling still refuses"
+else
+    no "discovery: a case-variant id not listed under any spelling still refuses" \
         "rc=$discover_rc: $discover_out"
 fi
 
