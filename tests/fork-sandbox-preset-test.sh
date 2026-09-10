@@ -371,6 +371,124 @@ refuses "an invalid network: value is refused" \
     "takes 'pinned' or 'sealed'" \
     --preset net-bad
 
+# §2: a seat's network: sealed lying about a networked harness (claude or
+# codex) used to be accepted silently -- see the review that found this.
+# One preset per seat, refused at parse time by fork-sandbox-preset-parse.py
+# (the earlier of the two layers this round adds; scripts/fork-sandbox.sh
+# itself refuses the same combination again, right after its existing
+# implement-leg checks, for a seat that ever reached it some other way).
+cat > "$presets_dir/seal-review.yaml" <<'EOF'
+agents:
+  coder:
+    harness: claude
+    model: opus
+  reviewer:
+    harness: claude
+    model: opus
+    network: sealed
+pipeline:
+  - action: code
+    agent: coder
+  - action: review
+    repeat: 1
+    agent: reviewer
+EOF
+refuses "a sealed review seat on a networked harness is refused" \
+    "agents.reviewer: network 'sealed' requires harness 'pi'" \
+    --preset seal-review
+
+cat > "$presets_dir/seal-fix.yaml" <<'EOF'
+agents:
+  coder:
+    harness: claude
+    model: opus
+  reviewer:
+    harness: pi
+    model: moonshotai/kimi-k3
+  fixer:
+    harness: claude
+    model: opus
+    network: sealed
+pipeline:
+  - action: code
+    agent: coder
+  - action: review
+    repeat: 2
+    agent: reviewer
+    fix_agent: fixer
+EOF
+refuses "a sealed review fix seat on a networked harness is refused" \
+    "agents.fixer: network 'sealed' requires harness 'pi'" \
+    --preset seal-fix
+
+cat > "$presets_dir/seal-mntfix.yaml" <<'EOF'
+agents:
+  coder:
+    harness: claude
+    model: opus
+  elder:
+    harness: pi
+    model: moonshotai/kimi-k3
+  mfixer:
+    harness: claude
+    model: opus
+    network: sealed
+pipeline:
+  - action: code
+    agent: coder
+  - action: maintain
+    repeat: 2
+    agent: elder
+    fix_agent: mfixer
+EOF
+refuses "a sealed maintain fix seat on a networked harness is refused" \
+    "agents.mfixer: network 'sealed' requires harness 'pi'" \
+    --preset seal-mntfix
+
+cat > "$presets_dir/seal-maintainer.yaml" <<'EOF'
+agents:
+  coder:
+    harness: claude
+    model: opus
+  elder:
+    harness: claude
+    model: opus
+    network: sealed
+pipeline:
+  - action: code
+    agent: coder
+  - action: maintain
+    repeat: 1
+    agent: elder
+EOF
+refuses "a sealed maintainer seat on a networked harness is refused" \
+    "agents.elder: network 'sealed' requires harness 'pi'" \
+    --preset seal-maintainer
+
+# The legitimate case must still work: a sealed implement leg reviewed by
+# an ordinarily networked (not sealed) seat is accepted, and still warns --
+# §2 must not touch that path, only the lying "network: sealed" case above.
+cat > "$presets_dir/seal-ok-warns.yaml" <<'EOF'
+agents:
+  coder:
+    harness: pi-local
+  reviewer:
+    harness: claude
+    model: opus
+pipeline:
+  - action: code
+    agent: coder
+  - action: review
+    repeat: 1
+    agent: reviewer
+EOF
+out="$(run --preset seal-ok-warns 2>"$err")"
+check "a legitimately networked review seat over a sealed implement leg still compiles" \
+    $'preset=seal-ok-warns\nharness=pi\nmodel=\nreview_model=opus\nreview_harness=claude' \
+    "$out"
+contains "the seal-crossing warning still fires for it" "$(cat "$err")" \
+    "the implement leg is sealed -- no network at all -- but"
+
 cat > "$presets_dir/fast3.yaml" <<'EOF'
 agents:
   coder:

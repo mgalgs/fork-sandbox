@@ -2206,6 +2206,46 @@ if [[ "$harness" == "codex" && "$network" == "sealed" ]]; then
     exit 1
 fi
 
+# The same rule, one seat at a time, for the three other legs a preset's
+# per-seat network: key (or the pi-local aliases above, which already
+# normalize their seat's harness to "pi" before this runs) can seal on its
+# own -- there is no --review-network or --maintainer-network flag, so a
+# preset is the only route to a "claude"/"codex" seat claiming sealed, and
+# without this check it was accepted silently (see §2 in the review that
+# found it).
+if [[ "$review_harness_given" == true && "${review_network:-}" == "sealed" \
+    && "$review_harness" != "pi" ]]; then
+    echo "Error: network 'sealed' is not supported on the review seat with" >&2
+    echo "--review-harness $review_harness. Sealed means a self-hosted" >&2
+    echo "endpoint, and no such path exists for $review_harness yet --" >&2
+    echo "only pi has one." >&2
+    exit 1
+fi
+if [[ -n "$fix_harness" && "${fix_network:-}" == "sealed" \
+    && "$fix_harness" != "pi" ]]; then
+    echo "Error: network 'sealed' is not supported on the review fix seat" >&2
+    echo "with harness $fix_harness. Sealed means a self-hosted endpoint," >&2
+    echo "and no such path exists for $fix_harness yet -- only pi has one." >&2
+    exit 1
+fi
+if [[ -n "$mntfix_harness" && "${mntfix_network:-}" == "sealed" \
+    && "$mntfix_harness" != "pi" ]]; then
+    echo "Error: network 'sealed' is not supported on the maintain fix seat" >&2
+    echo "with harness $mntfix_harness. Sealed means a self-hosted endpoint," >&2
+    echo "and no such path exists for $mntfix_harness yet -- only pi has" >&2
+    echo "one." >&2
+    exit 1
+fi
+if [[ "$maintainer_harness_given" == true \
+    && "${maintainer_network:-}" == "sealed" \
+    && "$maintainer_harness" != "pi" ]]; then
+    echo "Error: network 'sealed' is not supported on the maintainer seat" >&2
+    echo "with --maintainer-harness $maintainer_harness. Sealed means a" >&2
+    echo "self-hosted endpoint, and no such path exists for" >&2
+    echo "$maintainer_harness yet -- only pi has one." >&2
+    exit 1
+fi
+
 # --k8s dispatches the whole run to fork-sandbox-k8s.sh run, which submits it
 # as a Kubernetes Job -- see the header comment above and
 # docs/kubernetes-runs.md. This block is placed here, before the review-loop,

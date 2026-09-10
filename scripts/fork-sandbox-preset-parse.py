@@ -319,6 +319,11 @@ def main():
             fail(f"agents.{name}: harness 'pi-local' is already sealed; "
                  f"its 'network' key can only be 'sealed' or omitted, not "
                  f"'{agent['network']}'")
+        if agent["network"] == "sealed" and agent["harness"] not in (
+                "pi", "pi-local"):
+            fail(f"agents.{name}: network 'sealed' requires harness 'pi' "
+                 f"(or 'pi-local'); '{agent['harness']}' has no "
+                 f"self-hosted-endpoint path")
         if name not in seated:
             warns.append(f"agent '{name}' is defined but sits no seat")
 
