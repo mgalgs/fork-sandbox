@@ -175,6 +175,12 @@ case "$persona" in
         printf '# self-refresh handoff\n\nThis file must never be harvested.\n' \
             > "$run_dir/outbox/handoff.md"
         ;;
+    seal)
+        # A sealed seat that writes a reply, so the harvest can post it
+        # with its network mode (the outbox path, like core's).
+        printf 'In-Reply-To: %s\n\nSealed review.\n' "$STUB_REPLY_TO" \
+            > "$run_dir/outbox/1.msg"
+        ;;
 esac
 
 printf '0\n' > "$run_dir/exit-code"
@@ -217,6 +223,16 @@ harness: codex
 thinking: low
 ---
 Codex reviewer.
+PERSONA
+# A sealed pi seat with no model of its own: the network axis is what
+# marks it, and its reply is what the X-AI-Network stamp test posts.
+cat > "$work/seal.md" <<'PERSONA'
+---
+persona: seal
+harness: pi
+network: sealed
+---
+Sealed local reviewer.
 PERSONA
 cp -- "$repo_dir/skills/lkml-mode/personas/core.md" "$work/core.md"
 cp -- "$repo_dir/skills/lkml-mode/personas/security.md" "$work/security.md"
@@ -311,6 +327,39 @@ for p in core security pi-local codex; do
         no "persona $p archived into the series mailbox" "missing or differs"
     fi
 done
+
+printf '\n== harvest stamps the seat network into the post ==\n'
+# harvest_one threads each seat's network mode into lkml-mailbox.sh post,
+# whose lkml_post_raw takes it as the sixteenth positional, behind two
+# optional ones -- an off-by-one stamps an empty network or lands the
+# value in X-Misthreaded with the whole suite still green. Assert on the
+# posted headers, through the launcher, for a sealed and a non-sealed
+# seat.
+cap_net="$(mktemp -d)"; tmpdirs+=("$cap_net")
+out_net="$(PATH="$stub_bin:$PATH" STUB_CAPTURE_DIR="$cap_net" STUB_RUN_PREFIX="$run_prefix_dir" \
+    STUB_REPLY_TO="$patch_id" STUB_REPLY_TO_BRACKETED="$patch_id_bracketed" \
+    "$round" widget-frob --project "$project_dir" --checkout somebranch \
+    --personas core,seal --personas-dir "$work" \
+    --reply-to "$patch_id" --no-summarize 2>&1)"
+rc_net=$?
+if (( rc_net == 0 )); then ok "sealed-seat round exits 0 against the stub"; else no "sealed-seat round exits 0 against the stub" "exit $rc_net: $out_net"; fi
+seal_msgs="$(grep -l '^X-AI-Persona: seal$' "$LKML_MAILBOX_ROOT/widget-frob/cur"/*.msg)"
+check "the sealed seat's reply was posted" "1" "$(printf '%s\n' "$seal_msgs" | grep -c .)"
+contains "a sealed seat's reply is stamped X-AI-Network: sealed" "$(cat "$seal_msgs")" 'X-AI-Network: sealed'
+contains "a sealed seat's reply is stamped harness pi, not the alias" "$(cat "$seal_msgs")" 'X-AI-Harness: pi'
+case "$(cat "$seal_msgs")" in
+    *'X-Misthreaded: sealed'*|*'X-Misthreaded: pinned'*) no "the network value did not land in X-Misthreaded" ;;
+    *) ok "the network value did not land in X-Misthreaded" ;;
+esac
+# Every core reply posted through the launcher up to this point came
+# from a non-sealed seat: stamped pinned, never sealed, never empty.
+core_msgs="$(grep -l '^X-AI-Persona: core$' "$LKML_MAILBOX_ROOT/widget-frob/cur"/*.msg)"
+n_core="$(printf '%s\n' "$core_msgs" | grep -c .)"
+if (( n_core >= 1 )); then ok "core posted at least one reply through the launcher"; else no "core posted at least one reply through the launcher" "count $n_core"; fi
+n_pinned="$(printf '%s\n' "$core_msgs" | xargs grep -l '^X-AI-Network: pinned$' | wc -l | tr -d '[:space:]')"
+check "every non-sealed seat's reply is stamped X-AI-Network: pinned" "$n_core" "$n_pinned"
+n_empty="$(printf '%s\n' "$core_msgs" | xargs grep -h '^X-AI-Network: *$' | wc -l | tr -d '[:space:]')"
+check "no core reply carries an empty X-AI-Network" "0" "$n_empty"
 
 printf '\n== bad --reply-to id is caught before any persona launches ==\n'
 
