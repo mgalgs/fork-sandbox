@@ -32,6 +32,11 @@ contains() {
     esac
 }
 
+check() {
+    local label="$1" expected="$2" actual="$3"
+    if [[ "$expected" == "$actual" ]]; then ok "$label"; else no "$label" "expected '$expected', got '$actual'"; fi
+}
+
 work="$(mktemp -d)"
 tmpdirs+=("$work")
 export LKML_MAILBOX_ROOT="$work/mailbox"
@@ -915,6 +920,70 @@ if python3 "$renderer" --text render-fixture-dir-does-not-exist >/dev/null 2>/de
 else
     ok "missing mailbox fails in text mode"
 fi
+
+printf '\n== text mode: a sealed seat stays visible (X-AI-Network) ==\n'
+# Before the network axis a sealed seat stamped X-AI-Harness: pi-local
+# and the render showed that verbatim; now every sealed seat stamps
+# harness 'pi' and the fact rides on X-AI-Network, which the render must
+# carry through in the same 'pi, sealed' spelling the launch line and
+# the seats announce use. A message with no header at all (a pre-axis
+# archive) must render EXACTLY as it did before: absence is not a value.
+"$mailbox" init render-net --cover "$work/cover.txt" --patches "$work/patches" \
+    --from author --harness test --model fixture >/dev/null 2>/dev/null
+rn_tree="$("$mailbox" tree render-net)"
+rn_p1="$(printf '%s\n' "$rn_tree" | awk '/\[PATCH v1 1\/2\]/{print $1}')"
+printf '%s\n' 'sealed review' > "$work/rn1.txt"
+"$mailbox" post render-net --from local --reply-to "$rn_p1" --file "$work/rn1.txt" \
+    --harness pi --model fixture --network sealed >/dev/null 2>/dev/null
+"$mailbox" post render-net --from ci --reply-to "$rn_p1" --file "$work/rn1.txt" \
+    --harness pi --model fixture --network pinned >/dev/null 2>/dev/null
+# A pre-axis message, written by hand in the store's own format with no
+# X-AI-Network line: the mailbox writes one on every post it makes, so
+# the header-less case can only be constructed this way.
+rn_p1_msgs=("$LKML_MAILBOX_ROOT/render-net/cur/${rn_p1}"*.msg)
+rn_p1_full="$(basename "${rn_p1_msgs[0]}" .msg)"
+rn_uuid="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+rn_seq="$(( $(date +%s) * 1000000000 + 999999999 ))"
+printf '%s\n' \
+    "Message-ID: <${rn_uuid}@lkml.local>" \
+    "In-Reply-To: <${rn_p1_full}@lkml.local>" \
+    "References: <${rn_p1_full}@lkml.local>" \
+    'Date: Mon, 17 Sep 2001 00:00:00 +0000' \
+    'From: Old (AI persona) <old.ai@lkml.local>' \
+    'Subject: Re: [PATCH v1 1/2] demo: add one' \
+    'X-AI-Persona: old' \
+    'X-AI-Harness: test' \
+    'X-AI-Model: fixture' \
+    'X-Series: render-net' \
+    'X-Version: 1' \
+    'X-Depth: 2' \
+    'X-Tags: ' \
+    "X-Seq: ${rn_seq}" \
+    '' \
+    'pre-axis body' \
+    > "$LKML_MAILBOX_ROOT/render-net/cur/${rn_uuid}.msg"
+nnet_out="$work/rn-net.txt"
+python3 "$renderer" --text "$LKML_MAILBOX_ROOT/render-net" > "$nnet_out"
+ntext="$(<"$nnet_out")"
+contains "text: a sealed seat's meta line reads 'harness: pi, sealed'" "$ntext" 'harness: pi, sealed'
+check "only the sealed message carries the 'sealed' suffix" "1" \
+    "$(grep -c 'harness: pi, sealed' "$nnet_out")"
+# The pinned seat stamps the header too, but renders bare 'pi' -- the
+# launch line spells pinned seats without a suffix as well, so one
+# vocabulary covers all the surfaces.
+contains "text: a pinned seat's meta line stays bare 'harness: pi'" "$ntext" '[persona: ci · harness: pi · model: fixture]'
+# The header-less message renders EXACTLY as pre-axis: the whole meta
+# bracket byte-for-byte, no 'unknown', no trailing comma.
+contains "text: a message with no X-AI-Network renders the pre-axis meta verbatim" \
+    "$ntext" '[persona: old · harness: test · model: fixture]'
+case "$ntext" in *'harness: test,'*|*'harness: old'*) no "header-less meta has no trailing comma or empty value" ;; *) ok "header-less meta has no trailing comma or empty value" ;; esac
+case "$ntext" in *unknown*) no "absence of the header does not render 'unknown'" ;; *) ok "absence of the header does not render 'unknown'" ;; esac
+# The reviewers block carries the same fact, 'pi, sealed' before the
+# model, and only for the sealed reviewer.
+contains "text: the reviewers block carries 'pi, sealed · model'" "$ntext" 'pi, sealed · fixture'
+check "only the sealed reviewer carries the 'sealed' suffix in the block" "1" \
+    "$(grep -c 'pi, sealed · fixture' "$nnet_out")"
+contains "text: the non-sealed reviewer block stays bare" "$ntext" 'Ci (ci)'
 
 printf '\n== text mode: tally and reviewers ==\n'
 # Same scoping as the long-subj checks above: these labels also appear in

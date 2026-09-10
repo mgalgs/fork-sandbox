@@ -151,6 +151,7 @@ def read_msg(path, attachment_root):
         "id": mid, "parent": parent, "seq": seq, "date": date,
         "from": hdr.get("From", ""), "subject": hdr.get("Subject", ""),
         "persona": hdr.get("X-AI-Persona", ""), "harness": hdr.get("X-AI-Harness", ""),
+        "network": hdr.get("X-AI-Network", ""),
         "model": hdr.get("X-AI-Model", ""), "version": int(hdr.get("X-Version", "1") or 1),
         "depth": int(hdr.get("X-Depth", "0") or 0), "tags": tags, "body": body,
         "attachments": rendered_attachments,
@@ -448,8 +449,8 @@ def reviewer_rollup(version_msgs, author, tally_rows):
             continue
         r = next((x for x in out if x["persona"] == p), None)
         if r is None:
-            r = {"persona": p, "name": "", "harness": m["harness"], "model": m["model"],
-                 "count": 0, "rev": 0, "nak": 0}
+            r = {"persona": p, "name": "", "harness": m["harness"], "network": m["network"],
+                 "model": m["model"], "count": 0, "rev": 0, "nak": 0}
             out.append(r)
         if not r["name"]:
             r["name"] = m["from"].split(" (AI persona)")[0].split(" <")[0]
@@ -1449,7 +1450,17 @@ def render_text_message(out, m, nums, depth):
     if m["persona"]:
         meta.append(f"persona: {m['persona']}")
     if m["harness"]:
-        meta.append(f"harness: {m['harness']}")
+        # The seat's network fact rides on the harness value in the same
+        # 'pi, sealed' spelling the launch line and the seats announce
+        # use: a sealed pi seat and a networked one both stamp harness
+        # 'pi', so harness alone no longer shows the zero-cost local
+        # seat. A message with no X-AI-Network header at all (a
+        # pre-axis archive) renders exactly as before -- absence is not
+        # a value.
+        if m["network"] == "sealed":
+            meta.append(f"harness: {m['harness']}, sealed")
+        else:
+            meta.append(f"harness: {m['harness']}")
     if m["model"]:
         meta.append(f"model: {m['model']}")
     if meta:
@@ -1531,7 +1542,11 @@ def render_text_reviewers(out, name, series_dir, reviewer_entries):
     out.append("reviewers")
     for r in reviewer_entries:
         out.append(f"  {r['name']} ({r['persona']})")
-        meta = " · ".join(x for x in (r["harness"], r["model"]) if x)
+        # The sealed fact in the same 'pi, sealed' spelling as the
+        # per-message meta line: a message with no X-AI-Network header
+        # (a pre-axis archive) renders exactly as before.
+        harness = f"{r['harness']}, sealed" if r["network"] == "sealed" else r["harness"]
+        meta = " · ".join(x for x in (harness, r["model"]) if x)
         if meta:
             out.append(f"    {meta}")
         counts = [f"{r['count']} message" + ("s" if r["count"] != 1 else "")]
