@@ -7452,6 +7452,21 @@ else
         "$(find "$svc_validate_dir" -mindepth 1)"
 fi
 
+# The dispatcher passes a post-verb -h/--help straight to this script
+# (like every other verb, it must answer with its usage, exit 0), not
+# treat the flag as a spec path.
+for svc_flag in -h --help; do
+    svc_help_out="$(env FORK_SANDBOX_CONFIG_DIR="$config_dir" python3 \
+        "$svc_parse_py" "$svc_flag" 2>&1)"; svc_help_rc=$?
+    if (( svc_help_rc == 0 )) && [[ "$svc_help_out" == *'Usage:'* \
+        && "$svc_help_out" == *'validate only'* ]]; then
+        ok "validate-only: $svc_flag prints usage and exits 0"
+    else
+        no "validate-only: $svc_flag prints usage and exits 0" \
+            "rc=$svc_help_rc: $svc_help_out"
+    fi
+done
+
 printf 'version: 1\nservices:\n  - name: db\n    image: registry.example/x:1\n    port: 80\n' \
     > "$svc_validate_dir/invalid.yaml"
 svc_val_bad_out=""; svc_val_bad_rc=0

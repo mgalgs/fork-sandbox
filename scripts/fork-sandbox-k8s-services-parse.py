@@ -523,7 +523,18 @@ def validate_only():
 
 
 if __name__ == "__main__":
+    usage = (
+        "Usage: fork-sandbox-k8s-services-parse.py <file> <out-dir> "
+        "<max-services> <max-cpu> <max-memory>\n"
+        "       or: fork-sandbox-k8s-services-parse.py <file>  "
+        "(validate only: checks the spec, writes nothing)\n")
     if len(sys.argv) == 2:
+        if sys.argv[1] in ("-h", "--help"):  # the dispatcher forwards it
+            # The dispatcher passes a post-verb -h/--help straight to the
+            # target, like every other verb answers it: usage and exit 0,
+            # not a file-not-found on the flag itself.
+            sys.stdout.write(usage)
+            sys.exit(0)
         # Validate-only mode: no out-dir, no rendering.
         FILE = sys.argv[1]
         validate_only()
@@ -533,9 +544,5 @@ if __name__ == "__main__":
         MAX_CPU, MAX_MEMORY = sys.argv[4], sys.argv[5]
         main()
     else:
-        sys.stderr.write(
-            "Usage: fork-sandbox-k8s-services-parse.py <file> <out-dir> "
-            "<max-services> <max-cpu> <max-memory>\n"
-            "       or: fork-sandbox-k8s-services-parse.py <file>  "
-            "(validate only: checks the spec, writes nothing)\n")
+        sys.stderr.write(usage)
         sys.exit(1)
