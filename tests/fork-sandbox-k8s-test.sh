@@ -7512,6 +7512,55 @@ else
         "$(cat "$svc_val_cfg_out")"
 fi
 
+# A malformed K8S_SERVICES_MAX is a k8s.env error, not a spec error: the
+# cluster path validates the key against ^[0-9]+$ at config load, so
+# validate-only must reject the same shapes with a message that names the
+# config file -- and an empty value must fall back to the default the way
+# ${K8S_SERVICES_MAX:-8} does, so a local pass is a guarantee under the
+# same configuration.
+svc_val_cfg_bad="$(newdir)"; tmpdirs+=("$svc_val_cfg_bad")
+printf 'K8S_SERVICES_MAX=+5\n' > "$svc_val_cfg_bad/k8s.env"
+svc_val_badmax_out=""; svc_val_badmax_rc=0
+svc_val_badmax_out="$(env FORK_SANDBOX_CONFIG_DIR="$svc_val_cfg_bad" python3 "$svc_parse_py" \
+    "$svc_validate_dir/services.yaml" 2>&1)" || svc_val_badmax_rc=$?
+if (( svc_val_badmax_rc != 0 )) \
+    && [[ "$svc_val_badmax_out" == *"K8S_SERVICES_MAX must be a positive integer, got '+5'"* \
+    && "$svc_val_badmax_out" == *"$svc_val_cfg_bad/k8s.env"* \
+    && "$svc_val_badmax_out" != *"services.yaml"* ]]; then
+    ok "validate-only: K8S_SERVICES_MAX=+5 is a config error naming k8s.env"
+else
+    no "validate-only: K8S_SERVICES_MAX=+5 is a config error naming k8s.env" \
+        "rc=$svc_val_badmax_rc: $svc_val_badmax_out"
+fi
+printf 'K8S_SERVICES_MAX=-1\n' > "$svc_val_cfg_bad/k8s.env"
+svc_val_neg_out=""; svc_val_neg_rc=0
+svc_val_neg_out="$(env FORK_SANDBOX_CONFIG_DIR="$svc_val_cfg_bad" python3 "$svc_parse_py" \
+    "$svc_validate_dir/services.yaml" 2>&1)" || svc_val_neg_rc=$?
+if (( svc_val_neg_rc != 0 )) \
+    && [[ "$svc_val_neg_out" == *"K8S_SERVICES_MAX must be a positive integer, got '-1'"* \
+    && "$svc_val_neg_out" != *"more than the"* ]]; then
+    ok "validate-only: K8S_SERVICES_MAX=-1 is a config error, not a spec error"
+else
+    no "validate-only: K8S_SERVICES_MAX=-1 is a config error, not a spec error" \
+        "rc=$svc_val_neg_rc: $svc_val_neg_out"
+fi
+printf 'K8S_SERVICES_MAX=\n' > "$svc_val_cfg_bad/k8s.env"
+svc_val_empty_out="$(newdir)/svc-validate-empty.out"; tmpdirs+=("$(dirname "$svc_val_empty_out")")
+if env FORK_SANDBOX_CONFIG_DIR="$svc_val_cfg_bad" python3 "$svc_parse_py" \
+    "$svc_validate_dir/services.yaml" > "$svc_val_empty_out" \
+    2>/tmp/fs-k8s-test-svc-val-empty.err; then
+    ok "validate-only: an empty K8S_SERVICES_MAX falls back to the default 8"
+else
+    no "validate-only: an empty K8S_SERVICES_MAX falls back to the default 8" \
+        "$(cat /tmp/fs-k8s-test-svc-val-empty.err)"
+fi
+if grep -qF 'K8S_SERVICES_MAX=8 (built-in default)' "$svc_val_empty_out"; then
+    ok "validate-only: the empty-value fallback is reported as the default"
+else
+    no "validate-only: the empty-value fallback is reported as the default" \
+        "$(cat "$svc_val_empty_out")"
+fi
+
 # The 6-positional-argument form the cluster path uses must render exactly
 # as before, and a wrong argument count still fails with usage.
 svc_val_render_dir="$(newdir)/out"; tmpdirs+=("$(dirname "$svc_val_render_dir")")

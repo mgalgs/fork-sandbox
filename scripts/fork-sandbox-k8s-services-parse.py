@@ -444,6 +444,15 @@ def read_env_key(file, key):
     return None
 
 
+def k8s_env_path():
+    """The site's k8s.env, resolved the same way fork-sandbox-k8s.sh finds
+    it: $FORK_SANDBOX_CONFIG_DIR or ~/.config/fork-sandbox."""
+    config_dir = (os.environ.get("FORK_SANDBOX_CONFIG_DIR") or
+                  os.path.join(os.path.expanduser("~"),
+                               ".config", "fork-sandbox"))
+    return os.path.join(config_dir, "k8s.env")
+
+
 def resolve_limits():
     """The per-run caps, resolved the same way the cluster path resolves
     them (fork-sandbox-k8s.sh): K8S_SERVICES_MAX / K8S_SERVICE_MAX_CPU /
@@ -451,16 +460,13 @@ def resolve_limits():
     otherwise the same built-in defaults. Returns the three values plus a
     line naming which limits came from where, so a passing result is never
     mistaken for a guarantee under a different site's configuration."""
-    config_dir = (os.environ.get("FORK_SANDBOX_CONFIG_DIR") or
-                  os.path.join(os.path.expanduser("~"),
-                               ".config", "fork-sandbox"))
-    k8s_env = os.path.join(config_dir, "k8s.env")
+    k8s_env = k8s_env_path()
     values, where = [], []
     for key, default in (("K8S_SERVICES_MAX", "8"),
                          ("K8S_SERVICE_MAX_CPU", "1000m"),
                          ("K8S_SERVICE_MAX_MEMORY", "1Gi")):
         cfg = read_env_key(k8s_env, key)
-        if cfg is not None:
+        if cfg:  # empty value == unset, the way ${VAR:-default} treats it
             values.append(cfg)
             where.append(f"{key}={cfg} (from {k8s_env})")
         else:
@@ -479,11 +485,15 @@ def validate_only():
     SPEC_PATH = FILE
     global MAX_SERVICES, MAX_CPU, MAX_MEMORY
     MAX_SERVICES, MAX_CPU, MAX_MEMORY, limits_line = resolve_limits()
-    try:
-        MAX_SERVICES = int(MAX_SERVICES)
-    except ValueError:
+    # The cluster path (fork-sandbox-k8s.sh) validates this key against
+    # ^[0-9]+$ at config load, so a shape it rejects there is a k8s.env
+    # error, not a spec error: check the string with the same pattern
+    # (not int(), which also accepts '+5' and ' 8 ') and name the config
+    # file in the message, since the spec is not what is wrong.
+    if not re.fullmatch(r"[0-9]+", MAX_SERVICES):
         fail(f"K8S_SERVICES_MAX must be a positive integer, got "
-             f"'{MAX_SERVICES}'")
+             f"'{MAX_SERVICES}'", spec_path=k8s_env_path())
+    MAX_SERVICES = int(MAX_SERVICES)
     doc = load_doc(FILE)
     parse_doc(doc)
     sys.stdout.write(f"{FILE}: valid services spec\n")
