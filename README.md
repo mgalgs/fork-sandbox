@@ -49,14 +49,14 @@ support for:
 
 **Agent harnesses**
 
-Claude, Codex, and Pi are currently supported. Pi also has a `pi-local`
-variant which is configured to run against your own LLM endpoint (zero
-network access).
+Claude, Codex, and Pi are currently supported. Which harness runs is a
+separate choice from what the sandbox may reach — see
+[the three network modes](#the-three-network-modes).
 
-- **Most secure:** `/fork-sandbox --harness pi-local` under Linux. Runs
-  without any network whatsoever. External services (docker compose stack,
-  other endpoints) can be individually mounted into the sandbox as unix
-  sockets.
+- **Most secure:** `/fork-sandbox --harness pi --network sealed` under
+  Linux. Runs without any network whatsoever, against your own LLM
+  endpoint. External services (docker compose stack, other endpoints) can be
+  individually mounted into the sandbox as unix sockets.
 - **Frontier models:** `/fork-sandbox --harness claude`
 - **Most scalable:** `/fork-sandbox --k8s` — each run is a Kubernetes Job.
 
@@ -117,7 +117,7 @@ is paired with a pinned, credentialed review leg on purpose.
 | Mode | Reaches | Use for |
 |---|---|---|
 | **Pinned** (default) | The internet, via your default interface only. Not the VPN, not the tailnet, not host loopback. | A Claude or OpenRouter run that needs to fetch packages and read docs. |
-| **Sealed** (`--harness pi-local`) | Nothing. One OpenAI-compatible endpoint over a unix socket. | A model you host. Costs nothing, holds no credential, cannot exfiltrate — true of the implement leg; a networked `--review-harness` reopens all three for its own leg. |
+| **Sealed** (`--network sealed`) | Nothing. One OpenAI-compatible endpoint over a unix socket. | A model you host. Costs nothing, holds no credential, cannot exfiltrate — true of the implement leg; a networked `--review-harness` reopens all three for its own leg. |
 | **Serviced** (repo opt-in; `--no-services` skips) | Whichever of the above, plus a per-run compose stack on unix sockets. | A suite that needs postgres or redis to run. |
 
 Sealed mode is why a local model is worth the trouble. A local endpoint needs
@@ -132,16 +132,21 @@ price, same as any other run under it.
 | `--harness` | Runs | Credential in the sandbox |
 |---|---|---|
 | `claude` (default) | Claude Code | A short-lived access token |
-| `pi` | [pi](https://github.com/earendil-works/pi) against OpenRouter | Your OpenRouter key |
-| `pi-local` | pi against your own endpoint | **None** |
+| `pi` | [pi](https://github.com/earendil-works/pi) against OpenRouter, or against your own endpoint under `--network sealed` | Your OpenRouter key; **none** when sealed |
 | `codex` | Codex CLI | Your ChatGPT auth |
+
+**The harness is which agent binary runs; it is not what the sandbox may
+reach.** That is `--network`, and the two are chosen independently — see
+[the three network modes](#the-three-network-modes). `--network sealed`
+requires a self-hosted endpoint, so it pairs with `pi`; `claude` and `codex`
+talk to their vendors and are refused with it.
 
 Every harness gets the same clone, the same provisioning, the same fetch-back,
 and a review kit — two skills that let the run review its own work before it
 reports back.
 
-`pi` and `pi-local` read their per-machine config (an OpenRouter key, a
-model endpoint) from `~/.config/fork-sandbox/`. `fork-sandbox configure`
+`pi` reads its per-machine config (an OpenRouter key, a model endpoint) from
+`~/.config/fork-sandbox/`. `fork-sandbox configure`
 discovers and installs it for you — see [docs/configure.md](docs/configure.md).
 
 ## Pro Recipes
@@ -151,7 +156,7 @@ Recipe: Interactive orchestrator session using a frontier model
 self-hosted endpoint, but with 2 rounds of claude+opus (paid) review:
 
 ```
-/sandbox-coder-mode --harness pi-local --review-harness claude --review-model opus --review-loop 2
+/sandbox-coder-mode --harness pi --network sealed --review-harness claude --review-model opus --review-loop 2
 ```
 
 (you can ask your agent to save these as your machine-local defaults for
@@ -274,10 +279,10 @@ verdict, and if it found problems a third session fixes them and commits. That
 repeats until the review approves, until a fix session stops making progress,
 or until the count runs out. Each leg is a whole session at its selected
 model's price, so reach for it when a defect would be expensive to find later — and
-freely on a `pi-local` run with no `--review-harness` (or `--review-harness
-pi-local`), where the price is zero either way. Naming a networked
-`--review-harness` turns that back into paid sessions on whichever model it
-names, even though `--harness` itself stays `pi-local`.
+freely on a sealed run with no `--review-harness`, where the price is zero
+either way. Naming a networked `--review-harness` turns that back into paid
+sessions on whichever model it names, and reopens the network for that leg
+even though the implement leg stays sealed.
 The review verdict also carries the report shown first by `--result`; the
 session's own account follows it.
 
@@ -295,8 +300,8 @@ nothing, or a failed leg. Unlike the review loop it has no default model —
 `--maintainer-model` is required (or the combined
 `--maintainer-harness pi/<id>` form) — because the maintainer's verdict is
 the run's last word on the branch, reported ahead of the review's. Its
-`--maintainer-harness` takes the same `claude`/`pi`/`pi-local`/`codex`
-choices as `--review-harness`, and a sealed `--harness pi-local` with a
+`--maintainer-harness` takes the same `claude`/`pi`/`codex`
+choices as `--review-harness`, and a sealed implement leg with a
 networked maintainer harness warns by name, as `--review-harness` does.
 
 Use `--review-only --checkout <ref>` to review an existing branch after the
@@ -356,7 +361,7 @@ legs, the same way it already does for `--review-loop`.
 
 **`claude` only, for now.** The threshold is measured by a hook installed into
 the local sandbox's claude session, which reads the transcript on every tool
-call; `pi`, `pi-local` and `codex` have no hook system to measure with, so
+call; `pi` and `codex` have no hook system to measure with, so
 `--refresh-at` is refused outright on those harnesses, and on `--k8s`, whose
 pod runs a different entrypoint.
 
@@ -430,10 +435,17 @@ new script in `install.sh`, not here.
 ```bash
 # Launch a run, get a branch back — the engine under /fork-sandbox and
 # /sandbox-coder-mode
+<<<<<<< HEAD
 fork-sandbox run ~/src/proj /var/tmp/claude-scratch/handoff.md
 fork-sandbox run --review-loop 2 --review-model opus ~/src/proj handoff.md
 fork-sandbox run --harness pi-local ~/src/proj handoff.md   # sealed: your model, no network
 fork-sandbox run --preset deep ~/src/proj handoff.md        # a named pipeline (docs/presets.md)
+=======
+fork-sandbox.sh ~/src/proj /var/tmp/claude-scratch/handoff.md
+fork-sandbox.sh --review-loop 2 --review-model opus ~/src/proj handoff.md
+fork-sandbox.sh --harness pi --network sealed ~/src/proj handoff.md   # your model, no network
+fork-sandbox.sh --preset deep ~/src/proj handoff.md        # a named pipeline (docs/presets.md)
+>>>>>>> 0378e1fa03 (Move the docs to the --network spelling)
 
 # Watch it
 fork-sandbox status <run-dir>              # status at a glance
@@ -565,9 +577,9 @@ less than it claims:
   Replacing those stubs with real `netstat -rn -f inet` and `ifconfig` output
   from a Mac is the one step that settles it, and the cheapest useful thing a
   Mac owner can contribute.
-- **Unix-socket bridges**, and so `--harness pi-local`, which is sealed plus a
-  bridge. Docker Desktop and Colima share files over virtiofs or a FUSE
-  gateway, and unix sockets generally do not survive that.
+- **Unix-socket bridges**, and so `--network sealed`, which is a sealed
+  sandbox plus a bridge. Docker Desktop and Colima share files over virtiofs
+  or a FUSE gateway, and unix sockets generally do not survive that.
 - **Per-run services.** These are opt-*out*, so a repo carrying a
   `sandbox-services.sh` hook gets them on a Mac whether or not anyone planned
   for it. Whether the sockets they publish survive Docker Desktop's filesystem

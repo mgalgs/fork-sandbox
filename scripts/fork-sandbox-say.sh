@@ -21,7 +21,7 @@
 #   claude   next tool call. A PostToolUse hook puts it beside the tool
 #            result, and a Stop hook refuses to let the session finish while
 #            an addendum is unread — so it cannot be missed.
-#   others   within ~25 tool calls. pi, pi-local and codex have no hook
+#   others   within ~25 tool calls. pi and codex have no hook
 #            system, so the generated prompt tells the session to read the
 #            inbox on a tool-call floor, around long commands, before each
 #            commit, and before its final report. Same inbox, slower delivery.

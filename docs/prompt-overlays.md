@@ -25,7 +25,7 @@ observe by running it, not something this repo can know in advance.
 ## What this is for
 
 A concrete example, observed rather than invented: a local model, driven
-through `--harness pi-local`, was asked to commit its work. It wrote
+through `--harness pi --network sealed`, was asked to commit its work. It wrote
 
 ```
 git commit -m "ran the tests: `pytest -q` all green, pushing now: `git push`"
@@ -87,7 +87,7 @@ said:
 <prompts-dir>/<leg>/model/<model>.md
 ```
 
-`<harness>` is one of `claude`, `pi`, `pi-local`, `codex`. `<leg>` is exactly
+`<harness>` is one of `claude`, `pi`, `codex`. `<leg>` is exactly
 one of `implement`, `review`, `fix`, `maintainer` — the prompt currently
 being rendered.
 Any file that does not exist is skipped silently — a directory holding only
@@ -136,7 +136,7 @@ path.
 ## Applying one fragment set to one run: `--prompts-dir`
 
 ```
-fork-sandbox.sh --prompts-dir ~/experiments/prompts-v2 --harness pi-local \
+fork-sandbox.sh --prompts-dir ~/experiments/prompts-v2 --harness pi --network sealed \
     --model qwen3.5-9b ~/src/myrepo /var/tmp/claude-scratch/handoff.md
 ```
 

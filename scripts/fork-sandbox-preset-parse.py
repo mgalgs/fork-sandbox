@@ -154,8 +154,8 @@ def main():
                 # (an OpenRouter model id carries its own slash).
                 harness, _, combined = value.partition("/")
                 if harness not in HARNESSES:
-                    fail(f"{path}: takes 'claude', 'pi', 'pi-local' or "
-                         f"'codex', not '{harness}'")
+                    fail(f"{path}: takes 'claude', 'pi' or 'codex', not "
+                         f"'{harness}'")
                 agent["harness"] = harness
                 if combined:
                     if agent["model"]:

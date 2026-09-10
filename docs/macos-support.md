@@ -277,8 +277,8 @@ a sandbox quietly holding less than it claims.
    a Mac into that fixture settles it in one step**, and is the cheapest useful
    thing a Mac owner can contribute.
 2. **The Keychain service name**, as above.
-3. **Unix-socket bridges**, and so `--harness pi-local`, which is sealed plus a
-   bridge. Docker Desktop and Colima share files over virtiofs or a FUSE
+3. **Unix-socket bridges**, and so `--network sealed`, which is a sealed
+   sandbox plus a bridge. Docker Desktop and Colima share files over virtiofs or a FUSE
    gateway, and unix sockets generally do not survive that.
 4. **Per-run services**, which drive Docker Compose on the host from inside a
    run. These are opt-out rather than opt-in, so a repo that ships a

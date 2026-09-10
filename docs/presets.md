@@ -96,7 +96,7 @@ An agent is a named seat: who types, on what, and how. Names match
 
 | property | meaning |
 |---|---|
-| `harness` | required — `claude`, `pi`, `pi-local` or `codex`. The combined `harness/model` form the flags accept works here too, split at the first slash for the same reason (an OpenRouter model id carries its own slash). |
+| `harness` | required — `claude`, `pi` or `codex`. The combined `harness/model` form the flags accept works here too, split at the first slash for the same reason (an OpenRouter model id carries its own slash). |
 | `network` | `pinned` (the default) or `sealed`, the same axis as `--network`: whether this seat's harness reaches the network at all. Independent of `harness` — `{harness: pi, network: sealed}` is `--harness pi --network sealed`. |
 | `model` | the seat's model or model alias. Optional where the flag is optional, required where it is required (`pi` needs one, on any seat, unless `network: sealed`); conflicts with a combined `harness` form, exactly as `--model` conflicts with `--harness pi/x`. |
 | `claude-args` | extra arguments for the claude CLI — e.g. `--effort high`. |
@@ -298,7 +298,8 @@ reviews, the coder-mode economics as one word:
 ```yaml
 agents:
   typist:
-    harness: pi-local
+    harness: pi
+    network: sealed
   reviewer:
     harness: claude
     model: fable

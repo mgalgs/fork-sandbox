@@ -609,7 +609,7 @@ precisely.** The agent pod's egress allowlist is exactly two entries:
 - the model proxy Service, on 8080/TCP.
 
 No port 443. No LAN. No public internet from the agent pod at all. This is the
-cluster analogue of `--harness pi-local`'s sealed sandbox, and it is why the
+cluster analogue of a `--network sealed` sandbox, and it is why the
 pod can hold no credential of its own: there is nowhere for a leaked one to be
 spent from inside the pod.
 
@@ -956,7 +956,7 @@ A self-hosted OpenAI-compatible endpoint — vLLM, Ollama, and similar all speak
 this shape — needs **no key and therefore no proxy at all**. The pod would
 talk straight to the endpoint, and there would be no credential anywhere in
 the system: not in a Secret, not as a placeholder, nothing to leak. This is
-the cluster analogue of `--harness pi-local`, and because it removes an entire
+the cluster analogue of `--network sealed`, and because it removes an entire
 moving part (the proxy Deployment, its Secret, its `NetworkPolicy`) it is the
 **cheapest and strongest** option here, not a footnote to the built mode.
 

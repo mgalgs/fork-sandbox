@@ -299,13 +299,13 @@ services are up and where the sockets are. Add one line to the project's
 `env $(cat .env.sandbox) python -m pytest`), so the session does not have to
 guess the convention.
 
-## Local-model runs: `--harness pi-local`
+## Local-model runs: `--network sealed`
 
 The levels above assume a session that costs money and has ordinary internet.
 There is one more mode, and it is the opposite on both counts:
 
 ```bash
-fork-sandbox.sh --harness pi-local --branch sbx-my-task ~/src/myrepo \
+fork-sandbox.sh --harness pi --network sealed --branch sbx-my-task ~/src/myrepo \
     /var/tmp/claude-scratch/claude-handoff-my-task.md
 ```
 
@@ -317,7 +317,7 @@ same way. Nothing beyond those sockets is reachable. So the implement leg costs
 nothing, holds no credential, and cannot send anything anywhere. That is
 specific to the implement leg: `--review-harness` can point a review leg at
 a networked, credentialed harness instead, in a separate sandbox that does
-not share this seal — see `fork-sandbox.sh --help` and the `pi-local`
+not share this seal — see `fork-sandbox.sh --help` and the `--network`
 reference in `skills/fork-sandbox/SKILL.md` for that flag.
 
 Setup is one file, on each machine that has such an endpoint:
