@@ -96,8 +96,8 @@ An agent is a named seat: who types, on what, and how. Names match
 
 | property | meaning |
 |---|---|
-| `harness` | required — `claude`, `pi` or `codex`. The combined `harness/model` form the flags accept works here too, split at the first slash for the same reason (an OpenRouter model id carries its own slash). |
-| `network` | `pinned` (the default) or `sealed`, the same axis as `--network`: whether this seat's harness reaches the network at all. Independent of `harness` — `{harness: pi, network: sealed}` is `--harness pi --network sealed`. |
+| `harness` | required — `claude`, `pi`, `pi-local` or `codex`. The combined `harness/model` form the flags accept works here too, split at the first slash for the same reason (an OpenRouter model id carries its own slash). `pi-local` is the permanent alias for `{harness: pi, network: sealed}`. |
+| `network` | `pinned` (the default) or `sealed`, the same axis as `--network`: whether this seat's harness reaches the network at all. `sealed` requires `harness: pi` (or `pi-local`, which is already sealed) — `claude` and `codex` have no self-hosted-endpoint path, and `{harness: claude, network: sealed}` is refused at load time. Otherwise independent of `harness` — `{harness: pi, network: sealed}` is `--harness pi --network sealed`. |
 | `model` | the seat's model or model alias. Optional where the flag is optional, required where it is required (`pi` needs one, on any seat, unless `network: sealed`); conflicts with a combined `harness` form, exactly as `--model` conflicts with `--harness pi/x`. |
 | `claude-args` | extra arguments for the claude CLI — e.g. `--effort high`. |
 | `pi-args` | extra arguments for pi — e.g. `--thinking low`. |

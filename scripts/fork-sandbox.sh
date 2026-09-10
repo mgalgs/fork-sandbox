@@ -2774,16 +2774,23 @@ if [[ -d "$prompt_overlay_dir" ]]; then
     [[ -n "$model" ]] && prompt_overlay_model_frag="${model//\//_}"
 
     for prompt_overlay_leg in "${prompt_overlay_legs[@]}"; do
-        # network/<network>.md (and the legacy harness/pi-local.md name it
-        # replaces) describe the network THIS leg actually runs under, which
-        # can differ from the implement leg's -- --review-harness or
-        # --maintainer-harness (or a preset's per-seat network: key) may seat
-        # a networked review or maintainer leg on top of a sealed implement
-        # leg. Falling back to the implement leg's own harness/network is
-        # also the right answer for "implement" itself, and for "fix" (which
-        # shares one overlay bucket across the review-fix and maintain-fix
-        # seats regardless of which harness runs it -- the harness/ axis has
-        # this same blindness already and is not this round's fix).
+        # harness/<harness>.md and network/<network>.md (and the legacy
+        # harness/pi-local.md name the latter replaces) describe the harness
+        # and network THIS leg actually runs under, which can differ from
+        # the implement leg's -- --review-harness or --maintainer-harness
+        # (or a preset's per-seat harness/network: keys) may seat a
+        # differently-harnessed or networked review or maintainer leg on
+        # top of the implement leg, and a preset's fix_agent seats a fix
+        # leg the same way. Falling back to the implement leg's own
+        # harness/network is also the right answer for "implement" itself.
+        #
+        # "fix" shares one overlay bucket across the review-fix and
+        # maintain-fix seats regardless of which harness runs it -- when a
+        # preset seats both with different harnesses, this picks the
+        # review-fix seat's; that residual bucket-sharing ambiguity is not
+        # this round's fix. Preferring fix_harness over mntfix_harness here
+        # still beats always falling back to the implement leg's own values,
+        # which was simply wrong whenever exactly one fix seat was preset.
         prompt_overlay_leg_harness="$harness"
         prompt_overlay_leg_network="$network"
         case "$prompt_overlay_leg" in
@@ -2803,6 +2810,19 @@ if [[ -d "$prompt_overlay_dir" ]]; then
                         && prompt_overlay_leg_network="sealed"
                 fi
                 ;;
+            fix)
+                if [[ -n "$fix_harness" ]]; then
+                    prompt_overlay_leg_harness="$fix_harness"
+                    prompt_overlay_leg_network="pinned"
+                    [[ "${fix_network:-}" == "sealed" ]] \
+                        && prompt_overlay_leg_network="sealed"
+                elif [[ -n "$mntfix_harness" ]]; then
+                    prompt_overlay_leg_harness="$mntfix_harness"
+                    prompt_overlay_leg_network="pinned"
+                    [[ "${mntfix_network:-}" == "sealed" ]] \
+                        && prompt_overlay_leg_network="sealed"
+                fi
+                ;;
         esac
 
         # General first, specific last: a later fragment can override an
@@ -2811,7 +2831,13 @@ if [[ -d "$prompt_overlay_dir" ]]; then
         # in the fix leg as in the implement leg -- and the leg-scoped pair
         # narrows it for this leg alone. No glob or family matching --
         # deliberately deferred, see docs/prompt-overlays.md.
-        prompt_overlay_candidates=("all.md" "harness/$harness.md")
+        #
+        # harness/<harness>.md keys on this leg's own harness, not always
+        # the implement leg's -- it has to move with the leg-aware pi-local
+        # and network checks right below it, or a leg re-seated onto a
+        # different harness collects both its own harness fragment and the
+        # implement leg's, two harness-specific fragments at once.
+        prompt_overlay_candidates=("all.md" "harness/$prompt_overlay_leg_harness.md")
         # harness/pi-local.md is a legacy candidate name: before the network
         # mode split, a sealed pi run was "--harness pi-local", and an
         # operator's overlay filed under that name must not go silently dead

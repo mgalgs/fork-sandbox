@@ -178,6 +178,7 @@ netdir="$(mktemp -d)"; tmpdirs+=("$netdir")
 mkdir -p "$netdir/harness" "$netdir/network" "$netdir/model"
 printf 'pi\n' > "$netdir/harness/pi.md"
 printf 'legacy\n' > "$netdir/harness/pi-local.md"
+printf 'claude\n' > "$netdir/harness/claude.md"
 printf 'sealed\n' > "$netdir/network/sealed.md"
 printf 'pinned\n' > "$netdir/network/pinned.md"
 printf 'model\n' > "$netdir/model/demo-model.md"
@@ -198,39 +199,67 @@ check "a pinned pi run picks up network/pinned.md but neither the sealed nor the
     "harness/pi.md,network/pinned.md,model/demo-model.md" \
     "$(printf '%s\n' "$out" | sed -n 's/^prompt_overlay_fragments\[implement\]=//p')"
 
-printf '\n== --dry-run: network/<network>.md is per-leg, not the implement leg%s ==\n' "'"
+printf '\n== --dry-run: harness/<harness>.md and network/<network>.md are per-leg, not the implement leg%s ==\n' "'"
 
 # A sealed implement leg (--harness pi-local) with a networked review or
 # maintainer leg (--review-harness / --maintainer-harness) must not inject
 # network/sealed.md -- "no internet available" -- into a leg that has
-# internet. Each leg's own effective harness/network decides its candidates.
+# internet, and must not read the implement leg's own harness/<harness>.md
+# instead of (or, worse, alongside) its own. Each leg's own effective
+# harness/network decides its candidates.
 out="$(dry "$config" --harness pi-local --review-loop 1 \
     --review-harness claude/opus --prompts-dir "$netdir" 2>/dev/null)"
 check "a sealed implement leg still gets network/sealed.md" \
     "harness/pi.md,harness/pi-local.md,network/sealed.md" \
     "$(printf '%s\n' "$out" | sed -n 's/^prompt_overlay_fragments\[implement\]=//p')"
-# harness/pi.md still shows up here: harness/<harness>.md is keyed on the
-# implement leg's own harness for every leg, a pre-existing limitation this
-# round does not fix (see the comment above the candidate loop). Only the
-# network axis -- the one this round's docs actively point at sealed-only
-# content -- is asserted leg-aware below.
-check "a networked review leg over a sealed implement leg gets network/pinned.md, not sealed" \
-    "harness/pi.md,network/pinned.md" \
+check "a networked review leg over a sealed implement leg gets its own harness/claude.md and network/pinned.md, not the implement leg's harness/pi.md or network/sealed.md" \
+    "harness/claude.md,network/pinned.md" \
     "$(printf '%s\n' "$out" | sed -n 's/^prompt_overlay_fragments\[review\]=//p')"
 
 out="$(dry "$config" --harness pi-local --maintainer-loop 1 \
     --maintainer-harness claude/opus --prompts-dir "$netdir" 2>/dev/null)"
-check "a networked maintainer leg over a sealed implement leg gets network/pinned.md, not sealed" \
-    "harness/pi.md,network/pinned.md" \
+check "a networked maintainer leg over a sealed implement leg gets its own harness/claude.md and network/pinned.md" \
+    "harness/claude.md,network/pinned.md" \
     "$(printf '%s\n' "$out" | sed -n 's/^prompt_overlay_fragments\[maintainer\]=//p')"
 
 # The reverse -- a networked implement leg with a sealed review leg --
-# must still pick up network/sealed.md for that review leg alone.
+# must still pick up harness/pi.md, harness/pi-local.md and network/sealed.md
+# for that review leg alone, and must NOT also collect the implement leg's
+# own harness/claude.md: two mutually exclusive harness fragments landing in
+# the same leg at once would be as wrong as picking neither.
 out="$(dry "$config" --harness claude --review-loop 1 \
     --review-harness pi-local --prompts-dir "$netdir" 2>/dev/null)"
-check "a sealed review leg over a networked implement leg gets network/sealed.md" \
-    "harness/pi-local.md,network/sealed.md" \
+check "a sealed review leg over a networked implement leg gets network/sealed.md and its own harness fragments, not the implement leg's harness/claude.md" \
+    "harness/pi.md,harness/pi-local.md,network/sealed.md" \
     "$(printf '%s\n' "$out" | sed -n 's/^prompt_overlay_fragments\[review\]=//p')"
+
+# A preset's fix seat is the same case: a sealed implement leg whose review
+# loop hands findings to a networked fix_agent must get the fix leg's own
+# harness/network, not the implement leg's sealed ones -- getting the
+# implement leg's would mean shipping the clone's contents to the fix
+# agent's networked provider while its own prompt still claims "no internet
+# available" (network/sealed.md).
+presetcfg="$(new_empty_config)"; tmpdirs+=("$presetcfg")
+mkdir -p "$presetcfg/presets"
+cat > "$presetcfg/presets/fixseat.yaml" <<'EOF'
+agents:
+  coder:
+    harness: pi-local
+  fixer:
+    harness: claude
+    model: opus
+pipeline:
+  - action: code
+    agent: coder
+  - action: review
+    repeat: 1
+    agent: coder
+    fix_agent: fixer
+EOF
+out="$(dry "$presetcfg" --preset fixseat --prompts-dir "$netdir" 2>/dev/null)"
+check "a preset fix seat gets its own harness/claude.md and network/pinned.md, not the sealed implement leg's" \
+    "harness/claude.md,network/pinned.md" \
+    "$(printf '%s\n' "$out" | sed -n 's/^prompt_overlay_fragments\[fix\]=//p')"
 
 printf '\n== --dry-run: model id sanitisation ==\n'
 

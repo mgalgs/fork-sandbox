@@ -189,8 +189,10 @@ def main():
                          f"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$")
                 agent["endpoint"] = value
             elif prop == "network":
-                # An axis independent of harness (see docs/presets.md):
-                # 'sealed' can pair with any harness, not just pi-local.
+                # An axis independent of harness in the pinned case (see
+                # docs/presets.md), but 'sealed' still requires harness 'pi'
+                # (or 'pi-local') -- checked once every agent's harness is
+                # known, below.
                 value = scalar(value, path)
                 if value not in ("pinned", "sealed"):
                     fail(f"{path}: takes 'pinned' or 'sealed', not "

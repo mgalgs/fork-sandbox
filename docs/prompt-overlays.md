@@ -96,22 +96,38 @@ Any file that does not exist is skipped silently — a directory holding only
 `all.md` is a perfectly normal setup. The ones that do exist are
 concatenated, in that order, under one heading, into the rendered prompt.
 
-The first four are the same shape this mechanism always had, and they still
-mean what they meant: every leg reads them. A fragment saying how a model
-should write a commit is as true in the fix leg as in the implement leg, so
-`all.md`, `harness/<harness>.md`, `network/<network>.md` and
-`model/<model>.md` apply everywhere, unchanged, and an existing prompts
-directory keeps working exactly as it did before this layer existed — it now
-simply applies to every leg instead of one. `network/<network>.md` narrows by
-the network axis directly, the distinction splitting `--network` away from
-`--harness` was meant to buy back: a fragment that only makes sense with no
-internet available (mentioning there is no LAN or DNS, say) belongs in
-`network/sealed.md`, not duplicated into every sealed harness's own file. The
-last two narrow the whole baseline to one leg: `<leg>/all.md` for every model
-in this leg, `<leg>/model/<model>.md` for this model in this leg alone,
-general first within the leg-scoped pair too. A `maintainer/` directory is
-how you correct the maintainer leg's prompt specifically — the leg that runs
-only under `--maintainer-loop`.
+The first four are the same shape this mechanism always had, and every leg
+still reads them — but `harness/<harness>.md` and `network/<network>.md` are
+resolved per leg, not from the implement leg's own harness and network.
+`--review-harness`, `--maintainer-harness`, and a preset's per-seat
+`harness:`/`network:` keys can seat a review, fix, or maintainer leg on a
+different harness, a different network, or both, and each of those two
+fragments names the harness and network the leg is actually about to run
+under
+— the implement leg's own values are only ever the *default* a leg falls
+back to when nothing re-seats it. This is the one surprising thing about the
+layer: an operator who has not re-seated any leg sees `<harness>` and
+`<network>` as constants for the whole run, same as before this axis
+existed, and only needs to think about the per-leg resolution once a preset
+or a `--review-harness`/`--maintainer-harness` flag re-seats something. (The
+`fix` leg is a partial exception: a review loop's fix seat and a maintainer
+loop's fix seat share this one `fix` bucket, so when a preset seats both
+with different harnesses, the bucket resolves to the review loop's fix
+seat's harness and network, not the maintainer loop's.) `all.md` and
+`model/<model>.md`, by contrast, really are constants for the whole run —
+there is one model and one `all.md` fragment set regardless of which leg is
+rendering. `network/<network>.md` narrows by the network axis directly, the
+distinction splitting `--network` away from `--harness` was meant to buy
+back: a fragment that only makes sense with no internet available
+(mentioning there is no LAN or DNS, say) belongs in `network/sealed.md`, not
+duplicated into every sealed harness's own file — and, because it is
+per-leg, it can be trusted to land only on a leg that actually has no
+internet, not on every leg an operator happens to be running sealed
+somewhere in the pipeline. The last two narrow the whole baseline to one
+leg: `<leg>/all.md` for every model in this leg, `<leg>/model/<model>.md`
+for this model in this leg alone, general first within the leg-scoped pair
+too. A `maintainer/` directory is how you correct the maintainer leg's
+prompt specifically — the leg that runs only under `--maintainer-loop`.
 
 `implement`, `review`, `fix` and `maintainer` are reserved directory names at
 the root of a prompts directory — a model can never be called `review`.
