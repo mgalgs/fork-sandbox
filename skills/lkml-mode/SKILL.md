@@ -105,7 +105,7 @@ scheduling, not reading, and the reviewers' job is reading.
   touches nothing in the mailbox. The tier harnesses/models are
   overridable with `--high`/`--low` or a
   `~/.config/fork-sandbox/lkml-summarize.env` file; a bare harness
-  (e.g. `--high pi-local`) passes through bare, exactly like a reviewer
+  (e.g. `--high pi`) passes through bare, exactly like a reviewer
   persona's. `--series` instead summarizes the whole series with one
   synthesis-only run: the handoff carries every recorded version's
   `results-v<N>.json` verbatim in version order plus each version's tally
@@ -185,49 +185,62 @@ launching all five archetypes by default. A kernel-style locking change
 wants a locking-literate reviewer; a kids' game wants a child-safety
 reviewer; a data-pipeline change wants someone who has actually operated
 one. When none of the shipped archetypes fit, write a new one or two —
-copy an existing persona file's shape (a `harness`/`model`/`display`
-frontmatter block, then a short voice-and-focus body) into
+copy an existing persona file's shape (a `harness`/`network`/`model`/
+`display` frontmatter block, then a short voice-and-focus body) into
 `skills/lkml-mode/personas/`. A persona is pinned to one harness and model
 for the whole series, so its voice stays consistent version over version —
 do not vary it round to round.
 
 **Persona pins are defaults, not policy — a machine seats file re-seats the panel.**
-Each persona file's `harness`/`model`/`thinking` frontmatter is the seat the
-persona runs on by default. On a machine where the panel should run
-elsewhere (every reviewer on a self-hosted `pi-local` endpoint, `author`
-staying on `claude/opus`), write the machine seats file at
-`~/.config/fork-sandbox/lkml-seats.yaml` (overridable via `LKML_SEATS_FILE`):
+Each persona file's `harness`/`network`/`model`/`thinking` frontmatter is the
+seat the persona runs on by default. `harness` and `network` are two
+independent axes: `harness` is `claude`, `pi` or `codex`; `network` is
+`pinned` (the default) or `sealed`, i.e. whether that seat is walled off
+from the network — sealed only makes sense on `pi`. On a machine where
+the panel should run elsewhere (every reviewer sealed against a
+self-hosted `pi` endpoint, `author` staying on `claude/opus`), write the
+machine seats file at `~/.config/fork-sandbox/lkml-seats.yaml`
+(overridable via `LKML_SEATS_FILE`):
 
 ```yaml
 # which harness/model each lkml persona seat runs on this machine
 ---
 default:
-  harness: pi-local
+  harness: pi
+  network: sealed
 personas:
   author:
     harness: claude
     model: opus
 ```
 
-Entries carry only `harness`, `model` and `thinking`. Precedence, per
-persona, key by key: the script's `--model-override` flag > a
-`personas.<name>` entry > `default:` > the persona's frontmatter.
-Setting `harness` at any scope DROPS `model` from every
-lower-precedence scope (a bare `pi-local` resolves from the endpoint, a
-bare `claude` takes the harness default); a model survives only from
-the same scope as the effective harness or a higher one. `thinking`
-inherits from frontmatter unless an entry sets it, but it only
-reaches a seat on `pi`/`pi-local`: an explicit `thinking` set at the
-effective seat's scope or a higher one (a `personas.<name>` thinking,
-or a `default:` thinking with no persona entry re-seating the harness)
-refuses the run on a resolved non-pi harness, naming the key's path;
-a lower-scope one (a `default:` thinking under a `personas.<name>`
-harness) is dropped with the re-seat, and the frontmatter's is dropped
-silently when the seat moves off pi.
+Entries carry only `harness`, `network`, `model` and `thinking`.
+Precedence, per persona, key by key: the script's `--model-override`
+flag > a `personas.<name>` entry > `default:` > the persona's
+frontmatter. Setting `harness` at any scope DROPS `model` AND `network`
+from every lower-precedence scope (a bare `pi` resolves its model from
+the endpoint, a bare `claude` takes the harness default; composing a
+lower scope's `network: sealed` onto a new harness would manufacture a
+launch failure, since `fork-sandbox.sh` refuses a sealed non-pi
+harness outright); a model or network survives only from the same
+scope as the effective harness or a higher one. An EXPLICIT
+`network: sealed` at the effective harness's scope or higher, on a
+persona whose resolved harness is not `pi`, is refused the same way,
+naming the key's path (`default.network` or
+`personas.<name>.network`) — a sealed seat only makes sense on `pi`.
+`thinking` inherits from frontmatter unless an entry sets it, but it
+only reaches a seat on `pi`, regardless of that seat's network mode: an
+explicit `thinking` set at the effective seat's scope or a higher one
+(a `personas.<name>` thinking, or a `default:` thinking with no persona
+entry re-seating the harness) refuses the run on a resolved non-pi
+harness, naming the key's path; a lower-scope one (a `default:`
+thinking under a `personas.<name>` harness) is dropped with the
+re-seat, and the frontmatter's is dropped silently when the seat moves
+off pi.
 A missing file means the frontmatter pins stand exactly as shipped; an
 unreadable or unparseable one refuses the run loudly — a typo never
 silently re-seats the panel onto the expensive endpoint. Every seat the
-file changes is announced on stderr (`lkml-round: seat core: pi-local
+file changes is announced on stderr (`lkml-round: seat core: pi, sealed
 (lkml-seats.yaml, was claude/opus)`), and `--model-override` wins over the
 seats file quietly, as it flattens the whole roster. `lkml-round.sh`,
 `lkml-revise.sh`, `lkml-cover.sh` and `lkml-series.sh` all consume the same
@@ -311,15 +324,15 @@ Each seat's replies are pulled back to its own outbox directory
 `/var/tmp/claude-scratch/forks/lkml-round-k8s/`) and harvested from
 there, so five seats can never stamp one another's replies.
 
-Seats map onto the cluster as follows: a `pi-local` seat is
-translated to `pi` against the endpoint, not refused (a pod has no
-sealed local endpoint; the endpoint reaches the same self-hosted model
-through the in-cluster proxy), so those seats stay zero-cost; a
-`claude` seat runs unchanged against its own per-run proxy. Any other
-harness (e.g. `codex`) -- and a model-less `claude` seat, which
-`submit` would refuse on its own (the pod's model discovery lists pi
-endpoint model ids, never a Claude Code model name) -- refuses the
-whole round in the seats pre-pass, before any seat is submitted. A persona's `thinking:` cannot be
+Seats map onto the cluster as follows: a sealed seat is translated to
+`pi` against the endpoint, not refused (a pod has no sealed local
+endpoint; the endpoint reaches the same self-hosted model through the
+in-cluster proxy), so those seats stay zero-cost; a `claude` seat runs
+unchanged against its own per-run proxy. Any other harness (e.g.
+`codex`) -- and a model-less `claude` seat, which `submit` would refuse
+on its own (the pod's model discovery lists pi endpoint model ids,
+never a Claude Code model name) -- refuses the whole round in the
+seats pre-pass, before any seat is submitted. A persona's `thinking:` cannot be
 expressed in a cluster `submit` (there is no pi-args channel), so it
 is dropped for cluster seats and the drop is announced per seat.
 

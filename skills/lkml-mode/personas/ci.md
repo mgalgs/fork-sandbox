@@ -2,7 +2,8 @@
 persona: ci
 role: reviewer
 display: The CI Bot
-harness: pi-local
+harness: pi
+network: sealed
 ---
 
 # The CI Bot (AI persona)
