@@ -803,11 +803,20 @@ When `--model` (or `K8S_DEFAULT_MODEL`) was
 omitted, exactly one model in the listing is used (and said so); zero
 or several is an error listing what was found. When `--model` was
 given (directly or via `K8S_DEFAULT_MODEL`) but the listing does not
-contain it, that is a warning, not an
-error — the listing may be stale, and refusing would strand a
-legitimate run. `--harness claude` keeps requiring `--model` regardless
+contain it, the pod **refuses**: it names the requested id, lists the
+ids the endpoint does offer, and points at `K8S_DEFAULT_MODEL` in
+`k8s.env` as the likely place to fix it — a renamed or removed
+catalog entry is the usual cause, and a wrong id that proceeds costs
+a whole round of runs that then quietly use a guess-low context
+window. Failing at pod start costs one launch. `--harness claude`
+keeps requiring `--model` regardless
 of `K8S_DEFAULT_MODEL` — the claude check runs first specifically so a
-claude run never silently picks up a pi endpoint's model id. The same response's `max_model_len` for the chosen
+claude run never silently picks up a pi endpoint's model id, and a
+Claude Code model name is never in this listing, so the claude
+harness is exempt from the refusal too. The legitimate stale-listing
+case keeps an explicit door: `K8S_ALLOW_UNLISTED_MODEL=1` in
+`k8s.env` (may only be `1` or unset) turns the refusal back into a
+warning, for a known-good id the listing does not yet show. The same response's `max_model_len` for the chosen
 model becomes `models.json`'s `contextWindow` (a missing value falls
 back to a deliberately low 32768 guess, with a warning), and `maxTokens`
 is derived the same way `agent-sandboxed` derives it: a 32768 floor
@@ -818,7 +827,21 @@ name the listing never contains and no pi leg uses (so it is never
 checked or looked up against the listing, and the pod's summary names
 the review model instead), and the review loop runs pi with
 `REVIEW_MODEL`, so the coding model's absent value must not stand in
-for the review model's window. On a legacy install `--model` stays
+for the review model's window.
+
+**The context facts travel home with the outbox.** An entrypoint that
+ran model discovery writes them to `.fork-sandbox-model` in the outbox
+(line 1 stays the bare model id — the pre-existing shape; the facts
+append as `context=`, `max_tokens=`,
+`context_source=reported|guessed`), and `collect` surfaces them, so a
+completed run's record says whether its context was reported by the
+endpoint or guessed. That record exists because of the derivation's
+own fingerprint: `max_tokens = min(32768, context/4)`, so **32768 is
+both the correct reply room on a healthy 131072 window and the broken
+fallback context** — a reader grepping for 32768 cannot tell the two
+apart. `context=32768` with `max_tokens=8192` is the unambiguous
+signature of the fallback; `context=131072` with `max_tokens=32768`
+is healthy. On a legacy install `--model` stays
 required (the same error text as before), the pod skips discovery
 entirely and keeps the 131072/32768 constants the pre-discovery
 `models.json` carried, and `--harness claude` keeps the requirement
