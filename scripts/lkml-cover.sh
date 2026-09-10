@@ -58,8 +58,8 @@
 #              frontmatter's model). A missing file means the pins stand;
 #              an unreadable or unparseable one refuses the run before the
 #              launch. A seat the seats file changes is announced on stderr,
-#              e.g. `lkml-cover: seat author: pi-local (lkml-seats.yaml, was
-#              claude/opus)`; --model-override wins over the seats file
+#              e.g. `lkml-cover: seat author: pi, sealed (lkml-seats.yaml,
+#              was claude/opus)`; --model-override wins over the seats file
 #              silently.
 # --timeout    seconds to wait for the run to finish. Default 3600.
 #

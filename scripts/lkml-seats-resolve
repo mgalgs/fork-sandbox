@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# lkml-seats-resolve — Resolve which harness/model/thinking one lkml-mode
+# lkml-seats-resolve — Resolve which harness/network/model/thinking one lkml-mode
 # persona seat runs on this machine, applying the machine seats file.
 #
 # Usage: lkml-seats-resolve check <personas-dir>
@@ -274,7 +274,7 @@ else
         echo "Error: seats file '$seats_file': $bad_key sets 'thinking'" >&2
         echo "for persona '$persona', but its resolved harness is '$harness'," >&2
         echo "which is not a pi flavor. Thinking reaches a seat only via" >&2
-        echo "--pi-args on pi and pi-local; remove the key or move the seat." >&2
+        echo "--pi-args on pi; remove the key or move the seat." >&2
         exit 1
     fi
 fi

@@ -108,7 +108,7 @@ def entry(entry_doc, path):
     """Validate one `default:` or `personas.<name>:` entry and return its
     set keys in canonical order, for the emit below."""
     if not isinstance(entry_doc, dict):
-        fail(f"{path}: expected a mapping of 'harness', 'model' and 'thinking'")
+        fail(f"{path}: expected a mapping of 'harness', 'network', 'model' and 'thinking'")
     if not entry_doc:
         fail(f"{path}: sets no key; an entry carries at least one of "
              f"'harness', 'network', 'model' or 'thinking'")

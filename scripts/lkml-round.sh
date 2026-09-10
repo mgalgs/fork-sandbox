@@ -61,10 +61,11 @@
 #            directory, named after its branch under
 #            /var/tmp/claude-scratch/forks/lkml-round-k8s/ and harvested
 #            from there, so one seat can never stamp another's replies.
-#            A pi-local seat is translated to pi against --endpoint (a
-#            pod has no sealed local endpoint; the endpoint reaches the
-#            same self-hosted model through the in-cluster proxy), not
-#            refused. Any other harness that is not pi or claude
+#            A sealed seat -- network: sealed in the frontmatter, or the
+#            pi-local alias that expands to it -- is translated to pi
+#            against --endpoint (a pod has no sealed local endpoint; the
+#            endpoint reaches the same self-hosted model through the
+#            in-cluster proxy), not refused. Any other harness that is not pi or claude
 #            (e.g. codex) -- and a model-less claude seat, which submit
 #            would refuse once the seats ahead of it had already been
 #            submitted -- refuses the whole round in the seats
@@ -77,7 +78,8 @@
 #            line records the branch, marked cluster, with no cost --
 #            a cluster run's cost is unknown, not free.
 # --endpoint <name> the registered K8S_PROXY_ENDPOINTS entry the pi
-#            seats (including translated pi-local ones) are wired to,
+#            seats (including sealed seats translated to pi for the
+#            cluster) are wired to,
 #            via fork-sandbox-k8s.sh submit --endpoint. Required with
 #            --k8s: endpoint names are site-specific configuration, so
 #            this repo ships none and refuses to guess.
@@ -102,8 +104,8 @@
 #            missing file means the pins stand; an unreadable or
 #            unparseable one refuses the whole round before any launch.
 #            Every seat the seats file changes is announced on stderr,
-#            e.g. `lkml-round: seat core: pi-local (lkml-seats.yaml, was
-#            claude/opus)`; --model-override wins over the seats file
+#            e.g. `lkml-round: seat core: pi, sealed (lkml-seats.yaml,
+#            was claude/opus)`; --model-override wins over the seats file
 #            silently -- it flattens the whole roster, so per-persona
 #            seat announcements would be noise.
 # --services-trust-ref <ref> is passed through to every seat's
