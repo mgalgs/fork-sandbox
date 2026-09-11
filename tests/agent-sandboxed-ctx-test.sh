@@ -29,7 +29,7 @@ chmod +x "$bin/pi"
 cat > "$bin/sandbox-backend-test" <<'BACKEND'
 #!/usr/bin/env bash
 if [[ "${1-}" == --capabilities ]]; then
-    printf 'toolchain=host\n'
+    printf '%s\n' "${BACKEND_CAPS:-toolchain=host}"
     exit 0
 fi
 for ((i=1; i<=$#; i++)); do
@@ -40,6 +40,7 @@ for ((i=1; i<=$#; i++)); do
         esac
     fi
 done
+[[ -z "${BACKEND_CAPTURE:-}" ]] || printf '%s\0' "$@" > "$BACKEND_CAPTURE"
 exit 0
 BACKEND
 chmod +x "$bin/sandbox-backend-test"
@@ -95,6 +96,43 @@ run_case "props supplies context" props "" 3000
 run_case "both absent uses fallback" absent "" 8192
 run_case "malformed props uses fallback" malformed "" 8192
 run_case "props timeout uses fallback" timeout "" 8192
+
+# A hostname must survive into the provider URL and be handed to a capable
+# backend. Conversely, an IPv4 endpoint must not gain a hosts-alias flag.
+cat > "$bin/curl" <<'CURL'
+#!/usr/bin/env bash
+printf '%s\n' '{"data":[{"id":"test-model"}]}'
+CURL
+chmod +x "$bin/curl"
+run_endpoint_case() {
+    local name="$1" endpoint="$2" caps="$3" out rc
+    local capture="$work/$name.args"
+    out="$(PATH="$bin:$PATH" FORK_SANDBOX_BACKEND=test FORK_SANDBOX_CONFIG_DIR="$work" \
+        BACKEND_CAPS="$caps" BACKEND_CAPTURE="$capture" CTX_CAPTURE="$work/$name.models.json" timeout 8 "$agent" \
+        --endpoint "$endpoint" --model test-model "$work/project" 2>&1)"
+    rc=$?
+    if (( rc == 0 )); then ok "$name exits successfully"; else no "$name exits successfully" "$out"; return; fi
+    tr '\0' '\n' < "$capture" > "$capture.text"
+}
+run_endpoint_case "hostname endpoint" 'http://gateway.example/v1' $'toolchain=host\nhosts_alias=1'
+if grep -qx -- '--hosts-alias' "$work/hostname endpoint.args.text" && \
+    grep -qx -- 'gateway.example' "$work/hostname endpoint.args.text" && \
+    [[ "$(jq -r '.providers.local.baseUrl' "$work/hostname endpoint.models.json" 2>/dev/null)" == 'http://gateway.example:8318/v1' ]]; then
+    ok "hostname endpoint keeps name in URL and backend command"
+else
+    no "hostname endpoint keeps name in URL and backend command"
+fi
+run_endpoint_case "IP endpoint" 'http://192.0.2.10:8080/v1' $'toolchain=host\nhosts_alias=1'
+if ! grep -qx -- '--hosts-alias' "$work/IP endpoint.args.text" && \
+    [[ "$(jq -r '.providers.local.baseUrl' "$work/IP endpoint.models.json" 2>/dev/null)" == 'http://127.0.0.1:8080/v1' ]]; then
+    ok "IP endpoint keeps existing command and URL"
+else
+    no "IP endpoint keeps existing command and URL"
+fi
+out="$(PATH="$bin:$PATH" FORK_SANDBOX_BACKEND=test FORK_SANDBOX_CONFIG_DIR="$work" \
+    BACKEND_CAPS='toolchain=host' timeout 8 "$agent" --endpoint 'http://gateway.example/v1' \
+    --model test-model "$work/project" 2>&1)"
+if [[ "$out" == *'hosts_alias=1'* ]]; then ok "hostname refuses backend without hosts alias"; else no "hostname refuses backend without hosts alias" "$out"; fi
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 (( fail == 0 )) || exit 1

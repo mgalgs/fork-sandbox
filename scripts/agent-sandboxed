@@ -112,6 +112,11 @@
 #   host:    socat UNIX-LISTEN:<state>/sockets/model.sock TCP:<endpoint host>
 #   sandbox: socat TCP-LISTEN:127.0.0.1:<port>            UNIX-CONNECT:<same>
 #
+# A hostname endpoint keeps that hostname in the sandbox URL. The backend maps
+# it to 127.0.0.1 in the sandbox hosts file, so the relay is still the only
+# route but HTTP carries the Host header an ingress expects. IP endpoints keep
+# the loopback URL because there is no hostname to preserve.
+#
 # The sockets directory is bound READ-ONLY. That is enough, because connect()
 # needs write permission on the socket inode rather than a writable mount — the
 # same property the mount allowlist in sandbox-backend-bwrap is built on. The
@@ -439,6 +444,15 @@ if [[ ! "$EP_PORT" =~ ^[0-9]+$ ]] || [[ -z "$EP_HOST" ]]; then
     exit 1
 fi
 
+# An IPv4 endpoint has no Host-routed name to retain. IPv6 was refused above;
+# every other accepted endpoint host must be mapped by the backend.
+EP_NEEDS_HOSTS_ALIAS=0
+if [[ ! "$EP_HOST" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+    EP_NEEDS_HOSTS_ALIAS=1
+fi
+BASE_HOST=127.0.0.1
+(( EP_NEEDS_HOSTS_ALIAS )) && BASE_HOST="$EP_HOST"
+
 # The port the bridge listens on inside the sandbox. Keeping the endpoint's own
 # port makes the two halves easy to match up when reading a log; a privileged
 # port cannot be bound by the sandbox's unprivileged uid, so those move.
@@ -586,6 +600,12 @@ done
 # nothing on this host to find or bind.
 fs_resolve_backend "$script_dir" || exit 1
 fs_backend_capabilities "$FS_BACKEND_BIN"
+if (( EP_NEEDS_HOSTS_ALIAS )) && [[ "$FS_BACKEND_HOSTS_ALIAS" != 1 ]]; then
+    echo "Error: endpoint '$ENDPOINT' needs hostname '$EP_HOST' inside the" >&2
+    echo "sandbox, but backend '$FS_BACKEND_BIN' does not declare hosts_alias=1." >&2
+    echo "Refusing to fall back to 127.0.0.1, which loses the endpoint Host header." >&2
+    exit 1
+fi
 
 fs_resolve_pi || exit 1
 
@@ -682,9 +702,10 @@ else
     echo "bare pi configuration. Only the generated model registration." >&2
 fi
 
-# Register the bridged endpoint as a provider pi can select. The base URL names
-# loopback inside the sandbox, which is where the inner half of the bridge
-# listens. The key is required by the API shape and ignored by the server.
+# Register the bridged endpoint as a provider pi can select. A hostname base
+# URL resolves to the inner loopback relay through --hosts-alias while retaining
+# the Host header required by ingress routing. The key is required by the API
+# shape and ignored by the server.
 #
 # compat, both halves earned: max_tokens because a local server implements the
 # older field rather than max_completion_tokens, and the qwen thinking format
@@ -692,7 +713,7 @@ fi
 # the thinking dial is available; no default level is set here, so --thinking
 # and Shift+Tab decide, and pi-agent/settings.json can settle it later.
 jq -n \
-    --arg base "http://127.0.0.1:$IN_PORT$EP_PREFIX" \
+    --arg base "http://$BASE_HOST:$IN_PORT$EP_PREFIX" \
     --arg model "$MODEL" \
     --argjson ctx "$CTX" \
     --argjson maxtok "$MAX_TOKENS" \
@@ -941,6 +962,11 @@ for i in "${!BRIDGE_HOSTS[@]}"; do
 done
 
 echo "agent-sandboxed: $HARNESS against $MODEL at $ENDPOINT (${CTX} token context)" >&2
+if (( EP_NEEDS_HOSTS_ALIAS )); then
+    echo "agent-sandboxed: model bridge: $EP_HOST:$IN_PORT inside (hosts alias -> 127.0.0.1)" >&2
+else
+    echo "agent-sandboxed: model bridge: 127.0.0.1:$IN_PORT inside" >&2
+fi
 if (( ${#BRIDGE_HOSTS[@]} )); then
     # A bridge consumer dials the in-sandbox address, so the mapping is
     # printed at start, where the model line is, not only in a log.
@@ -978,6 +1004,9 @@ sandbox_cmd=(
     --workdir "$WORK_DIR"
     --hostname agent-sandbox
 )
+if (( EP_NEEDS_HOSTS_ALIAS )); then
+    sandbox_cmd+=(--hosts-alias "$EP_HOST")
+fi
 # pi's own node goes on PATH FIRST, which puts it LAST in lookup order among
 # the prepended directories: the backend prepends each one in turn, so the
 # last flag ends up leftmost. That ordering is the point. A caller's own

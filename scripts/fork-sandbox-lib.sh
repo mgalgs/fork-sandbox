@@ -840,13 +840,17 @@ fs_resolve_backend() {
 # That reads as `host`, the status quo, so such a backend keeps behaving
 # exactly as it does today rather than silently changing.
 #
-# Takes FS_BACKEND_BIN, or any backend path. Fills FS_BACKEND_TOOLCHAIN.
+# Takes FS_BACKEND_BIN, or any backend path. Fills FS_BACKEND_TOOLCHAIN and
+# FS_BACKEND_HOSTS_ALIAS.
 # shellcheck disable=SC2034  # written here, read by the sourcing scripts
 FS_BACKEND_TOOLCHAIN=host
+# shellcheck disable=SC2034  # written here, read by the sourcing scripts
+FS_BACKEND_HOSTS_ALIAS=0
 
 fs_backend_capabilities() {
     local bin="$1" out line key value
     FS_BACKEND_TOOLCHAIN=host
+    FS_BACKEND_HOSTS_ALIAS=0
     # Parse only a clean exit. A backend that refuses the option may still
     # print its usage, and a usage line can hold an '=' -- reading that as a
     # capability would be inventing an answer out of an error message.
@@ -868,6 +872,10 @@ fs_backend_capabilities() {
                 echo "backend did before the property existed." >&2
                 ;;
             esac
+            ;;
+        hosts_alias)
+            # shellcheck disable=SC2034  # read by scripts sourcing this library
+            [[ "$value" == 1 ]] && FS_BACKEND_HOSTS_ALIAS=1
             ;;
         esac
         # An unknown key is ignored on purpose: a newer backend may declare
