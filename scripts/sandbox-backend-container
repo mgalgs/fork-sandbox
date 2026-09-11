@@ -4,7 +4,7 @@
 # Usage: sandbox-backend-container --workdir DIR --net pinned|sealed|unpinned
 #          --image NAME [--bind-ro PATH]... [--bind-rw PATH]...
 #          [--bind-ro-at SRC DEST]... [--bind-rw-at SRC DEST]...
-#          [--bridge SOCKET=PORT]... [--setenv K=V]... [--prepend-path DIR]...
+#          [--bridge SOCKET=PORT]... [--hosts-alias NAME]... [--setenv K=V]... [--prepend-path DIR]...
 #          [--hostname NAME] -- COMMAND [ARG...]
 #
 # --image selects the Linux image; FORK_SANDBOX_CONTAINER_IMAGE is its
@@ -25,6 +25,9 @@
 # only on the first real connection attempt, not at startup. -- ends options;
 # the remaining argv and its authoritative `docker wait` exit status are the
 # command and backend status.
+# --hosts-alias NAME maps a validated DNS hostname to container loopback. It
+# preserves the name in a Host-routed endpoint URL while the sealed bridge
+# receives the connection at 127.0.0.1.
 #
 # The image supplies the sandbox toolchain, unlike bwrap, which mounts host
 # /usr. It must contain bash; pinned mode also needs iproute2's ip, and bridges
@@ -89,6 +92,7 @@ fi
 # install from the host at all.
 if [[ "${1-}" == --capabilities ]]; then
     echo "toolchain=image"
+    echo "hosts_alias=1"
     exit 0
 fi
 
@@ -103,6 +107,7 @@ IMAGE="${FORK_SANDBOX_CONTAINER_IMAGE:-}"
 WORK_DIR_ARG=""; NET_MODE=""; HOSTNAME_ARG=""
 BIND_RO=(); BIND_RW=(); BIND_RO_AT_SRC=(); BIND_RO_AT_DEST=()
 BIND_RW_AT_SRC=(); BIND_RW_AT_DEST=(); BRIDGE_SOCKETS=(); BRIDGE_PORTS=()
+HOSTS_ALIASES=()
 SETENV=(); PREPEND_PATH=()
 while (( $# )); do
     case "$1" in
@@ -118,6 +123,7 @@ while (( $# )); do
             v="${2:?--bridge requires SOCKET=PORT}"
             if [[ "$v" != *=* ]]; then echo "Error: --bridge '$v' has no port. The form is" >&2; echo "SOCKET=PORT." >&2; exit 1; fi
             BRIDGE_SOCKETS+=("${v%=*}"); BRIDGE_PORTS+=("${v##*=}"); shift 2 ;;
+        --hosts-alias) HOSTS_ALIASES+=("${2:?--hosts-alias requires a hostname}"); shift 2 ;;
         --setenv) SETENV+=("${2:?--setenv requires NAME=VALUE}"); shift 2 ;;
         --prepend-path) PREPEND_PATH+=("${2:?--prepend-path requires a directory}"); shift 2 ;;
         --) shift; break ;;
@@ -143,6 +149,15 @@ check_remap_dest() {
 check_mount_path() {
     local flag="$1" path="$2"
     [[ "$path" != *,* ]] || { echo "Error: $flag path '$path' contains a comma, which the container runtime's --mount syntax cannot represent." >&2; return 1; }
+}
+is_valid_hostname() {
+    local name="$1" label
+    [[ ${#name} -le 253 && "$name" =~ ^[A-Za-z0-9.-]+$ ]] || return 1
+    [[ "$name" != .* && "$name" != *. ]] || return 1
+    IFS=. read -ra hostname_labels <<<"$name"
+    for label in "${hostname_labels[@]}"; do
+        [[ -n "$label" && "$label" != -* && "$label" != *- ]] || return 1
+    done
 }
 is_tunnel_iface() { case "$1" in tailscale*|ts*|wg*|tun*|tap*|zt*|ppp*|nebula*|gpd*) return 0 ;; *) return 1 ;; esac; }
 
@@ -192,6 +207,13 @@ for i in "${!BIND_RW_AT_SRC[@]}"; do s="${BIND_RW_AT_SRC[$i]}"; d="${BIND_RW_AT_
 
 SETENV_NAMES=()
 for kv in "${SETENV[@]}"; do [[ "$kv" == *=* ]] || { echo "Error: --setenv '$kv' is not NAME=VALUE." >&2; exit 1; }; [[ "${kv%%=*}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || { echo "Error: --setenv names a variable that is not [A-Za-z_][A-Za-z0-9_]*: '${kv%%=*}'" >&2; exit 1; }; SETENV_NAMES+=("${kv%%=*}"); done
+HOSTS_ALIASES_UNIQUE=()
+for hostname in "${HOSTS_ALIASES[@]}"; do
+    is_valid_hostname "$hostname" || { echo "Error: --hosts-alias '$hostname' is not a DNS hostname." >&2; exit 1; }
+    hostname_seen=0
+    for seen_hostname in "${HOSTS_ALIASES_UNIQUE[@]}"; do [[ "$seen_hostname" == "$hostname" ]] && { hostname_seen=1; break; }; done
+    (( hostname_seen )) || HOSTS_ALIASES_UNIQUE+=("$hostname")
+done
 if (( ${#BRIDGE_SOCKETS[@]} )) && [[ "$NET_MODE" != sealed ]]; then echo "Error: --bridge works only with --net sealed." >&2; exit 1; fi
 for i in "${!BRIDGE_SOCKETS[@]}"; do
     s="${BRIDGE_SOCKETS[$i]}"; p="${BRIDGE_PORTS[$i]}"
@@ -309,6 +331,7 @@ TTY=(); [[ -t 0 && -t 1 ]] && TTY=(-t)
 # that points nowhere near the mount. Pass the rest of Docker's default set
 # explicitly, restoring only exec, for parity with bwrap.
 CREATE_ARGS=(create --label "fork-sandbox-run=$RUN_ID" --init --user "$uid_n:$gid_n" --cap-drop=ALL --security-opt no-new-privileges --tmpfs "/tmp:rw,nosuid,nodev,exec" --tmpfs "$HOME:rw,nosuid,nodev,exec" -i "${TTY[@]}" "${NET_ARGS[@]}" "${MOUNTS[@]}" "${ENV_ARGS[@]}" --workdir "$WORK_DIR" --entrypoint /bin/bash)
+for hostname in "${HOSTS_ALIASES_UNIQUE[@]}"; do CREATE_ARGS+=(--add-host "$hostname:127.0.0.1"); done
 [[ -z "$HOSTNAME_ARG" ]] || CREATE_ARGS+=(--hostname "$HOSTNAME_ARG")
 CONTAINER="$("$CLI" "${CREATE_ARGS[@]}" "$IMAGE" /fork-sandbox-bootstrap "$@")" || { echo "Error: container create failed; command did not start." >&2; exit 1; }
 

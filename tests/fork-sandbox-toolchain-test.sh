@@ -111,7 +111,10 @@ for backend in bwrap container; do
             contains "bwrap declares toolchain=host" "toolchain=host" "$out"
             contains "bwrap declares hosts_alias=1" "hosts_alias=1" "$out"
             ;;
-        container) contains "container declares toolchain=image" "toolchain=image" "$out" ;;
+        container)
+            contains "container declares toolchain=image" "toolchain=image" "$out"
+            contains "container declares hosts_alias=1" "hosts_alias=1" "$out"
+            ;;
     esac
 done
 

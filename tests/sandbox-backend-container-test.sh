@@ -31,6 +31,11 @@ refuses "refuses writable system bind" refusing "$backend" --workdir "$w" --net 
 refuses "requires absolute remap" absolute "$backend" --workdir "$w" --net sealed --image "$image" --bind-ro-at "$w" relative -- true
 refuses "rejects remap dot-dot" component "$backend" --workdir "$w" --net sealed --image "$image" --bind-ro-at "$w" /tmp/../etc -- true
 refuses "rejects malformed setenv" NAME=VALUE "$backend" --workdir "$w" --net sealed --image "$image" --setenv BROKEN -- true
+refuses "hosts alias rejects newline" "DNS hostname" "$backend" --workdir "$w" --net sealed --image "$image" --hosts-alias $'gateway.example\ninjected.invalid' -- true
+refuses "hosts alias rejects leading hyphen" "DNS hostname" "$backend" --workdir "$w" --net sealed --image "$image" --hosts-alias -gateway.example -- true
+refuses "hosts alias rejects space" "DNS hostname" "$backend" --workdir "$w" --net sealed --image "$image" --hosts-alias 'gateway example' -- true
+long_alias="$(printf 'a%.0s' {1..254})"
+refuses "hosts alias rejects overlong name" "DNS hostname" "$backend" --workdir "$w" --net sealed --image "$image" --hosts-alias "$long_alias" -- true
 refuses "bridge requires port" "no port" "$backend" --workdir "$w" --net sealed --image "$image" --bridge /tmp/x -- true
 refuses "bridge rejects missing socket" "not a unix socket" "$backend" --workdir "$w" --net sealed --image "$image" --bridge /definitely/missing=3000 -- true
 refuses "bridge only sealed" "only with" "$backend" --workdir "$w" --net pinned --image "$image" --bridge /definitely/missing=3000 -- true
