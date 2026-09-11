@@ -44,6 +44,7 @@ sandbox-backend-<name> [options] -- COMMAND [ARG...]
 | `--bind-rw-at SRC DEST` | Mount SRC read-write at a *different* path inside. Repeatable. Carries `--bind-rw`'s risk, so SRC is refused on the same list as `--workdir`. A client that synthesizes state on the host cannot work without it: `claude-sandboxed` builds a throwaway `~/.claude` in its own state dir and has to mount it at `$HOME/.claude`. |
 | `--net pinned\|sealed` | The network mode. Required — there is no default, because the default would be the one nobody chose. |
 | `--bridge SOCKET=PORT` | Sealed mode only: make host unix socket SOCKET reachable at `127.0.0.1:PORT` inside. Repeatable. PORT must be ≥1024. |
+| `--hosts-alias NAME` | Map a validated DNS hostname to `127.0.0.1` inside. Repeatable. This lets a bridged Host-routed endpoint retain the hostname its ingress expects while connecting only to the loopback relay. |
 | `--setenv K=V` | Set one variable inside. Repeatable. The environment is otherwise empty. |
 | `--prepend-path DIR` | Prepend DIR to the sandbox `PATH`. Repeatable. |
 | `--hostname NAME` | Set the sandbox hostname, so a prompt can show where it is. |
@@ -92,6 +93,7 @@ defined:
 | Key | Values | Meaning |
 |---|---|---|
 | `toolchain` | `host` \| `image` | Whether the sandbox inherits the host's userland. |
+| `hosts_alias` | `1` | Whether the backend supports `--hosts-alias`. Callers needing an endpoint hostname must refuse when it is absent. |
 
 `host` means the backend mounts the host's `/usr`, so a binary bound in from
 the host runs — bwrap. `image` means the userland comes from somewhere else and

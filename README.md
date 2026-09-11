@@ -490,7 +490,10 @@ What you get:
 - **Free runs against your own model.** Point it at a model you host and the
   sandbox gets *no network at all* — the endpoint arrives over a unix socket.
   The tokens are yours, no credential is inside, and there is nowhere to
-  exfiltrate to. That is the implement leg; a networked `--review-harness`
+  exfiltrate to. An endpoint behind an ingress works too: use the hostname
+  its router expects, which the sealed sandbox maps only to its loopback
+  bridge so the HTTP Host header remains correct. That is the implement leg;
+  a networked `--review-harness`
   gives its own leg a credential, egress, and a price, on purpose.
 - **Steering without attaching.** `fork-sandbox say` sends a running
   session an addendum, delivered at its next tool call.
