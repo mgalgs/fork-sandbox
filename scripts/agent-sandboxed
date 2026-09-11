@@ -453,6 +453,16 @@ fi
 BASE_HOST=127.0.0.1
 (( EP_NEEDS_HOSTS_ALIAS )) && BASE_HOST="$EP_HOST"
 
+# A URL client derives Host from its URL authority. When the endpoint's
+# privileged port moves to the relay port below, retain the endpoint authority
+# as an explicit provider header so a Host-routed ingress sees gateway.example
+# rather than gateway.example:8318.
+EP_HOST_HEADER=""
+if (( EP_NEEDS_HOSTS_ALIAS )) && (( EP_PORT < 1024 )); then
+    EP_HOST_HEADER="$EP_HOST"
+    (( EP_PORT == 80 )) || EP_HOST_HEADER+=":$EP_PORT"
+fi
+
 # The port the bridge listens on inside the sandbox. Keeping the endpoint's own
 # port makes the two halves easy to match up when reading a log; a privileged
 # port cannot be bound by the sandbox's unprivileged uid, so those move.
@@ -714,6 +724,7 @@ fi
 # and Shift+Tab decide, and pi-agent/settings.json can settle it later.
 jq -n \
     --arg base "http://$BASE_HOST:$IN_PORT$EP_PREFIX" \
+    --arg host "$EP_HOST_HEADER" \
     --arg model "$MODEL" \
     --argjson ctx "$CTX" \
     --argjson maxtok "$MAX_TOKENS" \
@@ -723,6 +734,7 @@ jq -n \
                 baseUrl: $base,
                 api: "openai-completions",
                 apiKey: "sandbox",
+                headers: (if $host == "" then {} else {Host: $host} end),
                 models: [{
                     id: $model,
                     name: ($model + " (local)"),

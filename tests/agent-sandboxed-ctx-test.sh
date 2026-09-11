@@ -117,10 +117,11 @@ run_endpoint_case() {
 run_endpoint_case "hostname endpoint" 'http://gateway.example/v1' $'toolchain=host\nhosts_alias=1'
 if grep -qx -- '--hosts-alias' "$work/hostname endpoint.args.text" && \
     grep -qx -- 'gateway.example' "$work/hostname endpoint.args.text" && \
-    [[ "$(jq -r '.providers.local.baseUrl' "$work/hostname endpoint.models.json" 2>/dev/null)" == 'http://gateway.example:8318/v1' ]]; then
-    ok "hostname endpoint keeps name in URL and backend command"
+    [[ "$(jq -r '.providers.local.baseUrl' "$work/hostname endpoint.models.json" 2>/dev/null)" == 'http://gateway.example:8318/v1' ]] && \
+    [[ "$(jq -r '.providers.local.headers.Host' "$work/hostname endpoint.models.json" 2>/dev/null)" == 'gateway.example' ]]; then
+    ok "hostname endpoint keeps Host authority at remapped port"
 else
-    no "hostname endpoint keeps name in URL and backend command"
+    no "hostname endpoint keeps Host authority at remapped port"
 fi
 run_endpoint_case "IP endpoint" 'http://192.0.2.10:8080/v1' $'toolchain=host\nhosts_alias=1'
 if ! grep -qx -- '--hosts-alias' "$work/IP endpoint.args.text" && \

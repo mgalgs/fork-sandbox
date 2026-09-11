@@ -727,16 +727,41 @@ fi
 
 # Retain ordinary host aliases, but replace any whole hostname field requested
 # above. Stopping at '#' means a name in a comment is never treated as an
-# alias. Removing old entries avoids resolver races with the loopback relay.
+# alias. Removing old entries avoids resolver races with the loopback relay,
+# without discarding sibling aliases from a shared address line.
 HOSTS_MOUNT_AT=""
 if (( ${#HOSTS_ALIASES_UNIQUE[@]} )); then
     hosts_aliases="$(IFS=$'\034'; echo "${HOSTS_ALIASES_UNIQUE[*]}")"
     awk -v aliases="$hosts_aliases" '
         BEGIN { n = split(aliases, a, "\034"); for (i = 1; i <= n; i++) wanted[a[i]] = 1 }
         {
-            drop = 0
-            for (i = 2; i <= NF && $i != "#"; i++) if ($i in wanted) { drop = 1; break }
-            if (!drop) print
+            removed = 0
+            for (i = 2; i <= NF && $i != "#"; i++) {
+                if ($i in wanted) {
+                    removed = 1
+                    break
+                }
+            }
+            if (!removed) {
+                print
+                next
+            }
+            kept_names = 0
+            line = $1
+            for (i = 2; i <= NF; i++) {
+                if ($i == "#") {
+                    for (; i <= NF; i++) line = line " " $i
+                    break
+                }
+                if ($i in wanted) {
+                    removed = 1
+                    continue
+                }
+                line = line " " $i
+                kept_names++
+            }
+            # A rewritten line needs at least one remaining hostname.
+            if (kept_names) print line
         }
     ' /etc/hosts > "$STATE_DIR/hosts"
     for hostname in "${HOSTS_ALIASES_UNIQUE[@]}"; do
