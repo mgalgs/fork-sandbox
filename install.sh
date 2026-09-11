@@ -321,7 +321,6 @@ PLUMBING=(
     fork-sandbox-k8s-services-parse.py
     fork-sandbox-lib.sh
     fork-sandbox-preset-parse.py
-    http-host-relay.mjs
     sandbox-backend-bwrap
     sandbox-backend-container
 )

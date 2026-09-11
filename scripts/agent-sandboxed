@@ -453,14 +453,17 @@ fi
 BASE_HOST=127.0.0.1
 (( EP_NEEDS_HOSTS_ALIAS )) && BASE_HOST="$EP_HOST"
 
-# A URL client derives Host from its URL authority. When the endpoint's
-# privileged port moves to the relay port below, its host-side relay rewrites
-# the request authority before forwarding it to the endpoint.
-EP_HOST_HEADER=""
-if (( EP_NEEDS_HOSTS_ALIAS )) && (( EP_PORT < 1024 )); then
-    EP_HOST_HEADER="$EP_HOST"
-    (( EP_PORT == 80 )) || EP_HOST_HEADER+=":$EP_PORT"
-fi
+# A URL client derives Host from its URL authority, so a privileged endpoint
+# port -- which must move to an unprivileged in-sandbox port below -- yields
+# `Host: <name>:<in-port>` rather than the endpoint's own authority. That is
+# deliberately left alone: Host-based routers match the header's HOSTNAME and
+# ignore the port, verified against a live Traefik-fronted endpoint, so the
+# request routes correctly as-is. Do NOT "fix" this by rewriting the header on
+# the wire -- that replaces a byte-level tunnel with an HTTP parser on the host
+# in the path from sandbox-controlled bytes, which is a strictly larger attack
+# surface than the problem it solves. If a router is ever found that matches
+# the port too, the answer is to document the limitation or let the caller name
+# the authority, not to parse HTTP here.
 
 # The port the bridge listens on inside the sandbox. Keeping the endpoint's own
 # port makes the two halves easy to match up when reading a log; a privileged
@@ -618,24 +621,6 @@ fi
 
 fs_resolve_pi || exit 1
 
-# This relay runs on the host, not in the sandbox. Under a host toolchain,
-# fs_resolve_pi has already selected pi's matching Node -- including an
-# otherwise inactive NVM install -- so reuse it. An image toolchain leaves
-# FS_PI_NODE empty on purpose because its pi and node come from the image;
-# that case needs a separate host-side lookup for the relay.
-HOST_NODE=""
-if [[ -n "$EP_HOST_HEADER" ]]; then
-    HOST_NODE="$FS_PI_NODE"
-    if [[ -z "$HOST_NODE" || ! -x "$HOST_NODE" ]]; then
-        HOST_NODE="$(command -v node 2>/dev/null || true)"
-    fi
-    if [[ -z "$HOST_NODE" || ! -x "$HOST_NODE" ]]; then
-        echo "Error: endpoint '$ENDPOINT' needs a host-side Node interpreter" >&2
-        echo "to run its Host-header relay, but none could be resolved." >&2
-        exit 1
-    fi
-fi
-
 # The work dir is the only path that persists. Default to a fresh one under the
 # scratch root, as claude-sandboxed does, so a run with no arguments still has
 # somewhere to leave its results.
@@ -650,7 +635,7 @@ fi
 # Every path below ends up inside a generated shell script, and printf %q is
 # what keeps it safe there. A newline would still break the file's shape, so
 # refuse the characters that do not survive the trip.
-fs_reject_unsafe_chars "$WORK_DIR" "$FS_PI_NODE" "$FS_PI_REAL" "$FS_PI_ROOT" "$HOST_NODE" \
+fs_reject_unsafe_chars "$WORK_DIR" "$FS_PI_NODE" "$FS_PI_REAL" "$FS_PI_ROOT" \
     "$FS_PI_BIN_DIR" "$MODEL" "$EP_HOST" "$EP_PREFIX" || exit 1
 
 # A writable .git is host code execution: a hook, or a config key such as
@@ -730,10 +715,9 @@ else
 fi
 
 # Register the bridged endpoint as a provider pi can select. A hostname base
-# URL resolves to the inner loopback relay through --hosts-alias. For a
-# privileged hostname endpoint, the host-side relay restores the authority
-# required by ingress routing. The key is required by the API shape and ignored
-# by the server.
+# URL resolves to the inner loopback relay through --hosts-alias, so the
+# request carries the Host header an ingress routes on. The key is required by
+# the API shape and ignored by the server.
 #
 # compat, both halves earned: max_tokens because a local server implements the
 # older field rather than max_completion_tokens, and the qwen thinking format
@@ -957,13 +941,7 @@ fi
 # uid.
 # setsid puts each in a process group of its own, so the trap can take its
 # per-connection children with it. $! is then the group leader.
-if [[ -n "$EP_HOST_HEADER" ]]; then
-    printf -v relay_exec '%q ' "$HOST_NODE" "$REPO_ROOT/scripts/http-host-relay.mjs" \
-        "$EP_HOST" "$EP_PORT" "$EP_HOST_HEADER"
-    setsid socat "UNIX-LISTEN:$SOCK,fork,mode=600" "EXEC:$relay_exec" &
-else
-    setsid socat "UNIX-LISTEN:$SOCK,fork,mode=600" "TCP:$EP_HOST:$EP_PORT" &
-fi
+setsid socat "UNIX-LISTEN:$SOCK,fork,mode=600" "TCP:$EP_HOST:$EP_PORT" &
 SOCAT_PID=$!
 
 for _ in $(seq 1 25); do
