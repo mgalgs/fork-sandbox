@@ -46,8 +46,8 @@
 #                   listing's canonical spelling.
 #                   The same discovery reads the context window
 #                   (max_model_len for the chosen model; a missing value
-#                   falls back to 32768, a deliberately low guess, with a
-#                   warning) and MAX_TOKENS (agent-sandboxed's rule: a
+#                   reaches the guess described above, refused by
+#                   default) and MAX_TOKENS (agent-sandboxed's rule: a
 #                   32768 floor, capped at a quarter of the window). The
 #                   review model gets the window discovered for ITS OWN
 #                   id, not this model's -- on a --harness claude run this
