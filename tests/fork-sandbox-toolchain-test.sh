@@ -107,8 +107,11 @@ for backend in bwrap container; do
     rc=$?
     check "sandbox-backend-$backend --capabilities exits 0" "0" "$rc"
     case "$backend" in
-        bwrap)     check "bwrap declares toolchain=host" "toolchain=host" "$out" ;;
-        container) check "container declares toolchain=image" "toolchain=image" "$out" ;;
+        bwrap)
+            contains "bwrap declares toolchain=host" "toolchain=host" "$out"
+            contains "bwrap declares hosts_alias=1" "hosts_alias=1" "$out"
+            ;;
+        container) contains "container declares toolchain=image" "toolchain=image" "$out" ;;
     esac
 done
 

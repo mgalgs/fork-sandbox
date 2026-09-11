@@ -66,6 +66,26 @@ run_bwrap() {
     "$repo_dir/scripts/sandbox-backend-bwrap" --net sealed "$@" 2>/dev/null
 }
 
+# Host aliases decide what the resolver reaches, so reject values before they
+# can become a line in the synthesized hosts file. These fail before bwrap is
+# invoked and therefore run even on machines without the runtime.
+for bad_alias in $'gateway.example\ninjected.invalid' '-gateway.example' \
+    'gateway example'; do
+    if "$repo_dir/scripts/sandbox-backend-bwrap" --net sealed --workdir "$(newdir)" \
+        --hosts-alias "$bad_alias" -- true >/dev/null 2>&1; then
+        no "rejects unsafe hosts alias '$bad_alias'"
+    else
+        ok "rejects unsafe hosts alias '$bad_alias'"
+    fi
+done
+too_long_alias="$(printf 'a%.0s' {1..254})"
+if "$repo_dir/scripts/sandbox-backend-bwrap" --net sealed --workdir "$(newdir)" \
+    --hosts-alias "$too_long_alias" -- true >/dev/null 2>&1; then
+    no "rejects hosts alias longer than 253 characters"
+else
+    ok "rejects hosts alias longer than 253 characters"
+fi
+
 printf '== bwrap backend ==\n'
 if ! command -v bwrap >/dev/null 2>&1; then
     printf '  SKIP  bwrap not installed\n'
@@ -108,6 +128,19 @@ else
         -- /bin/bash -c 'touch "$1/tie" 2>/dev/null && printf writable || printf readonly' _ "$state")"
     check "equal depth keeps category order" "writable" "$out"
     rm -f "$state/tie"
+
+    # Passing an alias twice must not leave the resolver two addresses to try.
+    # shellcheck disable=SC2016  # quoted program runs inside the sandbox
+    out="$(run_bwrap --workdir "$w" --hosts-alias gateway.example \
+        --hosts-alias gateway.example -- /bin/bash -c \
+        'grep -c "[[:space:]]gateway.example$" /etc/hosts')"
+    check "hosts alias is unique" "1" "$out"
+    if run_bwrap --workdir "$w" --hosts-alias gateway.example -- \
+        /bin/bash -c 'grep -q "[[:space:]]localhost$" /etc/hosts'; then
+        ok "hosts alias preserves localhost"
+    else
+        no "hosts alias preserves localhost"
+    fi
 fi
 
 printf '\n== container backend ==\n'

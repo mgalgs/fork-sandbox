@@ -4,7 +4,7 @@
 # Usage: sandbox-backend-bwrap --workdir DIR --net pinned|sealed|unpinned
 #          [--bind-ro PATH]... [--bind-rw PATH]...
 #          [--bind-ro-at SRC DEST]... [--bind-rw-at SRC DEST]...
-#          [--bridge SOCKET=PORT]... [--setenv K=V]... [--prepend-path DIR]...
+#          [--bridge SOCKET=PORT]... [--hosts-alias NAME]... [--setenv K=V]... [--prepend-path DIR]...
 #          [--hostname NAME] -- COMMAND [ARG...]
 #
 # This is the isolation substrate and nothing else. It knows about mounts,
@@ -207,6 +207,7 @@ fi
 # exits nonzero, and the caller reads that as the status quo, `host`.
 if [[ "${1-}" == --capabilities ]]; then
     echo "toolchain=host"
+    echo "hosts_alias=1"
     exit 0
 fi
 
@@ -225,6 +226,7 @@ BIND_RW=()
 BIND_RO_AT_SRC=(); BIND_RO_AT_DEST=()
 BIND_RW_AT_SRC=(); BIND_RW_AT_DEST=()
 BRIDGE_SOCKETS=(); BRIDGE_PORTS=()
+HOSTS_ALIASES=()
 SETENV=()
 PREPEND_PATH=()
 while [[ $# -gt 0 ]]; do
@@ -272,6 +274,10 @@ while [[ $# -gt 0 ]]; do
             BRIDGE_PORTS+=("${bridge_val##*=}")
             shift 2
             ;;
+        --hosts-alias)
+            HOSTS_ALIASES+=("${2:?--hosts-alias requires a hostname}")
+            shift 2
+            ;;
         --setenv)
             SETENV+=("${2:?--setenv requires NAME=VALUE}")
             shift 2
@@ -290,6 +296,29 @@ while [[ $# -gt 0 ]]; do
             exit 1
             ;;
     esac
+done
+
+is_valid_hostname() {
+    local name="$1" label
+    [[ ${#name} -le 253 && "$name" =~ ^[A-Za-z0-9.-]+$ ]] || return 1
+    [[ "$name" != .* && "$name" != *. ]] || return 1
+    IFS=. read -ra hostname_labels <<<"$name"
+    for label in "${hostname_labels[@]}"; do
+        [[ -n "$label" && "$label" != -* && "$label" != *- ]] || return 1
+    done
+}
+
+HOSTS_ALIASES_UNIQUE=()
+for hostname in "${HOSTS_ALIASES[@]}"; do
+    if ! is_valid_hostname "$hostname"; then
+        echo "Error: --hosts-alias '$hostname' is not a DNS hostname." >&2
+        exit 1
+    fi
+    hostname_seen=0
+    for seen_hostname in "${HOSTS_ALIASES_UNIQUE[@]}"; do
+        [[ "$seen_hostname" == "$hostname" ]] && { hostname_seen=1; break; }
+    done
+    (( hostname_seen )) || HOSTS_ALIASES_UNIQUE+=("$hostname")
 done
 
 if (( $# == 0 )); then
@@ -696,6 +725,27 @@ else
         > "$STATE_DIR/resolv.conf"
 fi
 
+# Retain ordinary host aliases, but replace any whole hostname field requested
+# above. Stopping at '#' means a name in a comment is never treated as an
+# alias. Removing old entries avoids resolver races with the loopback relay.
+HOSTS_MOUNT_AT=""
+if (( ${#HOSTS_ALIASES_UNIQUE[@]} )); then
+    hosts_aliases="$(IFS=$'\034'; echo "${HOSTS_ALIASES_UNIQUE[*]}")"
+    awk -v aliases="$hosts_aliases" '
+        BEGIN { n = split(aliases, a, "\034"); for (i = 1; i <= n; i++) wanted[a[i]] = 1 }
+        {
+            drop = 0
+            for (i = 2; i <= NF && $i != "#"; i++) if ($i in wanted) { drop = 1; break }
+            if (!drop) print
+        }
+    ' /etc/hosts > "$STATE_DIR/hosts"
+    for hostname in "${HOSTS_ALIASES_UNIQUE[@]}"; do
+        printf '127.0.0.1 %s\n' "$hostname" >> "$STATE_DIR/hosts"
+    done
+    HOSTS_MOUNT_AT="$(readlink -f /etc/hosts 2>/dev/null || true)"
+    [[ -n "$HOSTS_MOUNT_AT" ]] || HOSTS_MOUNT_AT=/etc/hosts
+fi
+
 # Mount the replacement where the host's /etc/resolv.conf actually
 # resolves to. On systemd-resolved hosts that is a symlink into /run,
 # which the allowlist does not mount, so binding onto /etc/resolv.conf
@@ -829,6 +879,11 @@ BWRAP_ARGS=(
     # noisily. Turning bytecode writing off avoids it and costs a run nothing.
     --setenv PYTHONDONTWRITEBYTECODE 1
 )
+
+# bwrap applies mounts in sequence, so this must follow --ro-bind /etc /etc.
+if [[ -n "$HOSTS_MOUNT_AT" ]]; then
+    BWRAP_ARGS+=(--ro-bind "$STATE_DIR/hosts" "$HOSTS_MOUNT_AT")
+fi
 
 if [[ -n "$HOSTNAME_ARG" ]]; then
     BWRAP_ARGS+=(--hostname "$HOSTNAME_ARG")
