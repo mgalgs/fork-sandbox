@@ -76,8 +76,12 @@
 #
 # collect is run's third and last phase on its own: it reads the review
 # loop's outcome (only when --review-loop N is given and non-zero), pulls
-# the pod's /work/outbox back, fetches the branch into the named project,
-# and removes the Job and pod unless --keep.
+# the pod's /work/outbox back, pulls the run's evidence back (the agent's
+# own transcript from /work/events*.jsonl plus the pod's logs, into a
+# sibling `evidence` directory of the outbox -- never inside it, so
+# operator-captured evidence stays distinguishable from the agent's own
+# artifacts), fetches the branch into the named project, and removes the
+# Job and pod unless --keep.
 #
 # wait and collect exist so a caller fanning out several runs can submit
 # them all up front and then wait on and collect them independently, rather
@@ -3850,6 +3854,13 @@ cmd_wait() {
     printf '%s\n' "$agent_rc"
 }
 
+# The byte cap on the run-evidence pull-back: the agent transcript and the
+# agent's own stderr logs that cmd_collect pulls from the pod. Same order
+# of magnitude as the outbox's FS_OUTBOX_MAX_BYTES -- a JSONL transcript of
+# an ordinary session is small, and the cap exists so a session that loops
+# writing to its own output cannot fill the host's disk.
+FS_RUN_EVIDENCE_MAX_BYTES=$((64 * 1024 * 1024))
+
 # cmd_run's collect phase, standalone: read the review loop's outcome (when
 # --review-loop N is given and non-zero), pull the pod's /work/outbox back,
 # fetch the branch into the named project, and remove the Job and pod unless
@@ -4023,6 +4034,91 @@ cmd_collect() {
         fi
     fi
     rm -f -- "$outbox_tar"
+
+    # The run's evidence, pulled back BEFORE the fetch for exactly the
+    # reason the outbox read above runs before it: cmd_fetch touches
+    # /work/.fetched -- the pod's own signal to stop idling and exit --
+    # and a kubectl exec into a completed pod fails. The primary evidence
+    # is the agent's transcript: /work/events.jsonl, the cluster-side
+    # analogue of the local path's <run-dir>/events.jsonl (the entrypoint
+    # redirects the agent's output there), plus the review loop's legs at
+    # /work/events-<kind>-<n>.jsonl and the agent's own stderr log. The
+    # pod's stdout is NOT this: it is the entrypoint narrating its own
+    # steps -- a handful of lines on a silent seat -- and a perfect capture of
+    # it answers nothing about what the agent did. The pod's logs come
+    # back too, named per container, as a supplement for connection-level
+    # diagnosis.
+    #
+    # Written to a SIBLING of the outbox directory, never inside it: the
+    # outbox is the agent's artifact space, and operator-captured evidence
+    # must stay distinguishable from what the agent chose to write.
+    #
+    # Like the outbox read, a failure here warns and falls through rather
+    # than exiting: retrieving evidence must never cost the branch fetch
+    # that follows.
+    local evidence_dir
+    evidence_dir="$(dirname -- "$outbox_dest")/evidence"
+    local evidence_ok=true
+    local events_tar events_err events_rc=0
+    events_tar="$(mktemp)"
+    events_err="$(mktemp)"
+    kubectl exec --request-timeout=60s "$pod_name" -- \
+            sh -c 'cd /work && find . -maxdepth 1 -name "events*.jsonl" -o -name "pi-stderr.log" -o -name "claude-stderr.log" | tar cf - --files-from=-' \
+            2> "$events_err" \
+            | head -c "$((FS_RUN_EVIDENCE_MAX_BYTES + 1))" > "$events_tar" \
+            || events_rc=$?
+    # Same size-check-before-exit-status ordering as the outbox read above:
+    # an over-cap stream makes head -c exit early and the pipeline non-zero
+    # under pipefail, and that IS the over-cap case, not a read failure.
+    if (( $("$FS_STAT" -c '%s' -- "$events_tar") > FS_RUN_EVIDENCE_MAX_BYTES )); then
+        echo "fork-sandbox-k8s: warning: pod $pod_name's transcript is over the $FS_RUN_EVIDENCE_MAX_BYTES byte cap; refusing to pull it back." >&2
+        evidence_ok=false
+    elif (( events_rc != 0 )); then
+        echo "fork-sandbox-k8s: warning: could not read the transcript from pod $pod_name; no transcript pulled back." >&2
+        fs_report_captured_stderr "kubectl exec into pod $pod_name (transcript read)" "$events_err"
+        evidence_ok=false
+    fi
+    rm -f -- "$events_err"
+    # The shared extraction guard, same as the outbox: untarring a stream
+    # from an untrusted pod is a path-traversal sink. A 0-byte spool is a
+    # stream that produced NO bytes at all -- the pod held none of the
+    # named files -- not a truncated archive, so there is nothing to
+    # extract and nothing that failed.
+    if [[ "$evidence_ok" == true ]] \
+        && (( $("$FS_STAT" -c '%s' -- "$events_tar") > 0 )) \
+        && ! "$script_dir/fork-sandbox-k8s-outbox-extract.sh" "$events_tar" "$evidence_dir" "$FS_RUN_EVIDENCE_MAX_BYTES"; then
+        echo "fork-sandbox-k8s: warning: could not extract the transcript tarball; no transcript pulled back to $evidence_dir" >&2
+        evidence_ok=false
+    fi
+    rm -f -- "$events_tar"
+
+    # The pod's own logs, one file per container, alongside the
+    # transcript: the entrypoint narration and (on a claude run) the
+    # proxy's connectivity errors. A supplement to the transcript above,
+    # which is the actual record of what the agent did.
+    if ! mkdir -p -- "$evidence_dir"; then
+        echo "fork-sandbox-k8s: warning: could not create $evidence_dir; pod logs not captured." >&2
+        evidence_ok=false
+    else
+        local pod_json pod_json_err containers c
+        pod_json_err="$(mktemp)"
+        if ! pod_json="$(kubectl get pod "$pod_name" -o json 2> "$pod_json_err")"; then
+            echo "fork-sandbox-k8s: warning: could not read pod $pod_name's spec; pod logs not captured." >&2
+            fs_report_captured_stderr "kubectl get pod $pod_name (spec read)" "$pod_json_err"
+            evidence_ok=false
+        else
+            containers="$(jq -r '(.spec.containers // []) + (.spec.initContainers // []) | .[].name' <<< "$pod_json")" || containers=""
+            while IFS= read -r c; do
+                [[ -n "$c" ]] || continue
+                if ! kubectl logs "$pod_name" -c "$c" --request-timeout=60s > "$evidence_dir/pod-log-$c.log" 2> "$pod_json_err"; then
+                    echo "fork-sandbox-k8s: warning: could not capture the pod logs for container '$c' of $pod_name." >&2
+                    fs_report_captured_stderr "kubectl logs $pod_name -c $c" "$pod_json_err"
+                    evidence_ok=false
+                fi
+            done <<< "$containers"
+        fi
+        rm -f -- "$pod_json_err"
+    fi
 
     echo "fork-sandbox-k8s: fetching branch $branch" >&2
     cmd_fetch --branch "$branch" "$project_path"

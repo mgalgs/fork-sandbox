@@ -46,7 +46,10 @@
 #     reports an approved and a cap review-loop outcome under
 #     --review-loop 1, never reads review-loop.json when --review-loop is
 #     omitted, removes the job unless --keep, and reads the outbox before
-#     the fetch touches /work/.fetched.
+#     the fetch touches /work/.fetched. It also pulls the agent's
+#     transcript and the per-container pod logs back into an `evidence`
+#     directory SIBLING of the outbox, before the fetch touches
+#     /work/.fetched, with the same request-timeout bound.
 #   - `submit --dry-run`'s rendered handoff.md carries the operator-inbox
 #     section, names /work/inbox, and never claims that directory is
 #     read-only -- it is not, in a pod (see docs/kubernetes-runs.md).
@@ -4211,9 +4214,34 @@ case " $* " in
     *" get pod -l job-name="*)
         [[ -n "${K8S_STUB_POD_NAME:-}" ]] && printf '%s\n' "$K8S_STUB_POD_NAME"
         exit 0 ;;
+    *" get pod "*)
+        # The pod's spec, for the per-container log capture. Containers and
+        # an initContainer, like a real claude-harness run's pod shape.
+        printf '{"spec":{"containers":[{"name":"agent"}],"initContainers":[{"name":"egress-gate"}]}}\n' ;;
     *" cat /work/review-loop.json "*)
         [[ -n "${K8S_STUB_REVIEW_LOOP_JSON:-}" ]] && printf '%s' "$K8S_STUB_REVIEW_LOOP_JSON"
         exit "${K8S_STUB_REVIEW_LOOP_RC:-0}" ;;
+    *" cat /work/.run-complete "*)
+        # The sentinel, when the stub pod "finished": value and rc
+        # independent, like the outbox read above.
+        if [[ -n "${K8S_STUB_RUN_COMPLETE:-}" ]]; then
+            printf '%s\n' "$K8S_STUB_RUN_COMPLETE"
+            exit "${K8S_STUB_RUN_COMPLETE_RC:-0}"
+        fi
+        exit 1 ;;
+    *" logs "*)
+        printf 'stub pod log: entrypoint narration for %s\n' "${K8S_STUB_LOGS_CONTAINER:-agent}"
+        exit "${K8S_STUB_LOGS_RC:-0}" ;;
+    *" tar cf - --files-from="*)
+        # The transcript read: serve the pod's /work fixture whenever
+        # K8S_STUB_WORK_DIR is set, same trick as the outbox read above.
+        if [[ -n "${K8S_STUB_WORK_DIR:-}" ]]; then
+            ( cd "$K8S_STUB_WORK_DIR" && find . -maxdepth 1 \
+                \( -name "events*.jsonl" -o -name "pi-stderr.log" -o -name "claude-stderr.log" \) \
+                | tar cf - --files-from=- ) || true
+        fi
+        [[ -n "${K8S_STUB_WORK_STDERR:-}" ]] && printf '%s' "$K8S_STUB_WORK_STDERR" >&2
+        exit "${K8S_STUB_WORK_RC:-0}" ;;
     *" tar cf - -C /work/outbox "*)
         # Serve the fixture stream whenever K8S_STUB_OUTBOX_DIR is set,
         # independently of the exit status -- same trick the runstub uses
@@ -4450,6 +4478,41 @@ if K8S_STUB_OUTBOX_RC=0 \
     fi
 else
     no "collect pulls the outbox back before the fetch touches /work/.fetched" "collect exited nonzero: $(cat "$collect_out9")"
+fi
+
+# 10. The agent's transcript and the per-container pod logs land in an
+# `evidence` directory SIBLING of the outbox (never inside it), each
+# review leg distinguishable from the coding leg, and the transcript pull
+# sits BEFORE the fetch's touch /work/.fetched, carrying the same
+# request-timeout bound as the outbox read.
+collect_work10="$(newdir)/pod-work-10"; tmpdirs+=("$collect_work10")
+mkdir -p -- "$collect_work10"
+printf '{"type":"assistant","text":"the coding leg did the work"}\n' > "$collect_work10/events.jsonl"
+printf '{"type":"assistant","text":"the review leg verdict"}\n' > "$collect_work10/events-review-1.jsonl"
+printf 'connection to the proxy refused once\n' > "$collect_work10/pi-stderr.log"
+printf 'not evidence: agent workspace file\n' > "$collect_work10/notes.md"
+collect_log10="$(newdir)/kubectl.log"; collect_out10="$(newdir)/out10.txt"; collect_dest10="$(newdir)/outbox-10"
+tmpdirs+=("$(dirname "$collect_log10")" "$(dirname "$collect_dest10")")
+if K8S_STUB_WORK_DIR="$collect_work10" K8S_STUB_OUTBOX_RC=0 \
+    collectstub_collect "$collect_log10" "$collect_out10" \
+    --branch fs-k8s-test-collect-evidence --outbox-dir "$collect_dest10" "$proj_dir"; then
+    evidence10="$(dirname -- "$collect_dest10")/evidence"
+    trans_ln="$(grep -n 'tar cf - --files-from=' "$collect_log10" | head -n 1 | cut -d: -f1 || true)"
+    fetched_ln="$(grep -n 'touch /work/.fetched' "$collect_log10" | head -n 1 | cut -d: -f1 || true)"
+    if [[ -n "$trans_ln" && -n "$fetched_ln" ]] && (( trans_ln < fetched_ln )) \
+        && grep -q -- '--request-timeout=60s' <(sed -n "${trans_ln}p" "$collect_log10") \
+        && [[ -f "$evidence10/events.jsonl" && -f "$evidence10/events-review-1.jsonl" && -f "$evidence10/pi-stderr.log" ]] \
+        && [[ ! -e "$evidence10/notes.md" ]] \
+        && [[ -f "$evidence10/pod-log-agent.log" && -f "$evidence10/pod-log-egress-gate.log" ]] \
+        && [[ ! -e "$collect_dest10/events.jsonl" ]] \
+        && [[ "$(find "$collect_dest10" -type f | wc -l)" == 1 ]]; then
+        ok "the transcript and per-container pod logs land in the evidence sibling, before the fetch"
+    else
+        no "the transcript and per-container pod logs land in the evidence sibling, before the fetch" \
+            "trans_ln=$trans_ln fetched_ln=$fetched_ln evidence=$(find "$evidence10" 2>/dev/null) outbox=$(find "$collect_dest10" 2>/dev/null) out=$(cat "$collect_out10")"
+    fi
+else
+    no "the transcript and per-container pod logs land in the evidence sibling, before the fetch" "collect exited nonzero: $(cat "$collect_out10")"
 fi
 
 printf '\n== fork-sandbox-k8s.sh say: argument validation (no cluster) ==\n'
