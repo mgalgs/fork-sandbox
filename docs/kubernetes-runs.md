@@ -75,7 +75,11 @@ run still going at the deadline is left exactly as it is: `run` does not
 fetch a half-finished branch and does not remove a still-running pod, and
 its error message prints the exact `fetch` command to run by hand once the
 agent does finish. `--keep` skips the final `rm`, for a caller who wants
-the Job and pod left in place after a successful fetch.
+the Job and pod left in place after a successful fetch. `run` and `collect`
+also pull the run's **evidence** — the agent's transcript and the pod
+logs — back before the fetch; a failed capture, or a run that harvested
+nothing at all, also skips the final `rm`, and the second case changes
+the exit code — see "Reading a run back" below.
 
 `wait` and `collect` are those second and third phases as first-class
 verbs, and they exist for the fan-out that `run`'s single blocking call
@@ -114,9 +118,13 @@ run executes.
 [--review-loop N] [--keep] <project-path>` does everything `run` does
 after the wait: the review-loop outcome read (only when `--review-loop N`
 is given and non-zero — an omitted or zero flag reads nothing at all),
-the outbox pull-back, the `fetch`, and the final `rm` (skipped under
-`--keep`). It prints no agent exit code — it does not know it — and the
-`run complete` line stays with `run` for exactly that reason.
+the evidence pull-back, the outbox pull-back, the `fetch`, and the final
+`rm` (skipped under `--keep`, and also skipped — for a different reason —
+when the evidence capture failed or the run harvested nothing). It prints
+no agent exit code — it does not know it — and the `run complete` line
+stays with `run` for exactly that reason. A zero-harvest run ends in
+exit 3 rather than the collect's usual 0; see "Reading a run back"
+below.
 
 `fork-sandbox.sh --k8s` dispatches to exactly this `run` verb: it resolves
 and validates the harness and model the same way a local run does — the
@@ -320,6 +328,86 @@ the base image deliberately does not carry one; see
 a custom image built `FROM` that base, with `K8S_IMAGE` — see "Bringing your
 own image and registry" below — rather than adding one to the base image
 everyone else's runs also pull.
+
+## Reading a run back: the evidence, the reap, and the zero harvest
+
+Reaping a run is destructive: when `rm` fires, the pod's transcript and
+logs go with it. So `run` and `collect` do three things in a fixed order
+around that moment.
+
+**The evidence pull-back.** Before the branch fetch — the same reason as
+the outbox: the fetch is what ends the pod, and `kubectl exec` into an
+exited container fails — `run` and `collect` read back the agent's own
+transcript: `/work/events*.jsonl` (one per review-loop leg — `events.jsonl`
+the coding leg, `events-review-N.jsonl` and `events-fix-N.jsonl` the legs
+after it) plus the agent's
+stderr log (`pi-stderr.log` or `claude-stderr.log`) — and land it in an
+`evidence` directory **sibling to the outbox**, e.g. `/var/tmp/claude-
+scratch/forks/k8s-<safe-branch>/evidence`. Alongside the transcript files,
+the same directory holds `pod-log-<container>.log`: the `kubectl logs`
+capture of every container in the pod, main and initContainers. That
+second half exists because what the entrypoint did *before the agent ever
+ran* — the model discovery, the context extract — is narrated only into
+the pod log, where nothing else carries it.
+
+The pull-back gets the same treatment as the outbox: bounded by a kubectl
+request timeout so it can delay the fetch but not hang it, capped at a
+fixed 64 MiB (`FS_RUN_EVIDENCE_MAX_BYTES`) — a transcript that is that
+large is information in itself — and extracted through the same guard
+that refuses the outbox. It is best-effort like the outbox — a
+failed pull-back never costs the fetch — but it is not *ignored* like the
+outbox's failure: see the next rule.
+
+**The reap rule on failure.** If the evidence pull-back fails — the
+transcript read, or its guard rejecting what came back — the run is **not
+reaped**, even without `--keep`. Reaping would destroy the only record of
+what the run did, and whatever still remains in the pod is exactly what is
+worth inspecting. The output is a loud block pointing at `kubectl logs`
+and, for when inspection is done, the manual cleanup:
+`fork-sandbox-k8s.sh rm --branch NAME`. `--keep` keeps working unchanged
+over this: it still keeps, under its own message, so a run you were keeping
+anyway is not made scarier than it is. The outbox's failure rule is
+untouched — an artifact failure never costs the branch — because a failed
+outbox pull is not evidence the run is broken, while a failed transcript
+pull usually is.
+
+**The zero-harvest suspicion.** A run that ends with all three of these
+is flagged **SUSPICIOUS** and treated differently:
+
+1. the agent's own exit code was 0 (read from the sentinel — a non-zero
+   exit already reported itself loudly, and re-flagging it would only
+   confuse the signal);
+2. the fetch brought back zero commits (the branch ref compared before
+   and after the fetch);
+3. the outbox holds no file the agent wrote.
+
+Condition 3 is *not* "the outbox is empty": the entrypoint itself writes
+`/work/outbox/.fork-sandbox-model` to record its model discovery, so a
+dead seat's outbox always holds exactly that one file, and a bare
+emptiness check would never fire. The count instead excludes a small list
+of files the operator's own tooling writes — `FS_OPERATOR_OUTBOX_FILES`
+in the script, currently `.fork-sandbox-model` only, and the place a new
+entry gets added if the entrypoint ever writes more. That list exists
+solely for the suspicion check; it is never used to filter the pull-back
+itself, which still lands every file the pod's outbox held.
+
+A zero-harvest run is the signature of a seat that started and did no
+work — typically a launch whose context was empty or wrong, an agent that
+reads it, finds nothing to do, and exits without complaining. What that
+run gets: its job is **kept**, not reaped; the same manual `rm` advice;
+and a non-zero exit (3) from `run`/`collect`, so an orchestrator or a
+fan-out harness sees the failure in its exit code instead of having to
+read the transcript. The transcript itself, when captured, is where the
+explanation lives, and the block points at it. `--keep` does not soften
+this: a kept run is kept either way, but a dead run is reported and exits
+3 under `--keep` just as without it — the flag controls the reap, and a
+zero-harvest verdict does not depend on one.
+
+No single condition is suspicious on its own: a review-panel seat commits
+nothing (condition 2) yet writes its verdict to the outbox, so condition
+3 is not met; a harness-erroring agent (condition 1) exits non-zero; an
+artifact-only task may produce a file and no commits. It is the
+*conjunction* that marks a dead seat.
 
 ## Getting the repository in: by push, not by clone
 
