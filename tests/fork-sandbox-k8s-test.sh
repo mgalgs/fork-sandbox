@@ -31,8 +31,11 @@
 #     a failed read with empty stderr says so explicitly, the outbox
 #     read happens BEFORE the fetch touches /work/.fetched, a
 #     substantially-over-cap outbox is diagnosed as over the cap (not as
-#     a read failure) even when kubectl dies of EPIPE, and the
-#     review-loop.json read carries the same request-timeout bound.
+#     a read failure) even when kubectl dies of EPIPE, the
+#     review-loop.json read carries the same request-timeout bound, and a
+#     zero-harvest run (agent exit 0, zero commits, an outbox holding
+#     nothing but operator metadata) makes run itself exit 3 with no
+#     'run complete' line.
 #   - the `wait` and `collect` verbs, driven directly against the same
 #     stubbed kubectl pair: a completed wait prints the agent's exit code
 #     to stdout and nothing else (a non-zero AGENT exit is a successful
@@ -51,7 +54,12 @@
 #     directory SIBLING of the outbox, before the fetch touches
 #     /work/.fetched, with the same request-timeout bound; a run whose
 #     evidence capture failed is NOT reaped (a loud block and the manual
-#     rm command, and --keep still keeps working unchanged).
+#     rm command, and --keep still keeps working unchanged); and a
+#     zero-harvest run -- the agent exited 0, the fetch brought back zero
+#     commits, and the outbox holds no file the agent wrote (.fork-
+#     sandbox-model discounted as operator metadata) -- keeps its job and
+#     exits 3, under --keep as well, while zero commits with a non-empty
+#     outbox stays a success and a non-zero agent exit is never flagged.
 #   - `submit --dry-run`'s rendered handoff.md carries the operator-inbox
 #     section, names /work/inbox, and never claims that directory is
 #     read-only -- it is not, in a pod (see docs/kubernetes-runs.md).
@@ -3978,7 +3986,7 @@ if K8S_STUB_OUTBOX_RC=0 runstub_run "$runstub_log3" "$runstub_out3" \
     if [[ -n "$tar_ln" && -n "$fetched_ln" ]] && (( tar_ln < fetched_ln )) \
         && grep -q -- '--request-timeout=60s' <(sed -n "${tar_ln}p" "$runstub_log3") \
         && [[ -f "$runstub_dest3/hello.txt" ]] \
-        && grep -q 'outbox: 1 file(s) at' "$runstub_out3"; then
+        && grep -q 'outbox: 1 agent file(s) at' "$runstub_out3"; then
         ok "outbox is pulled back before the fetch touches /work/.fetched"
         ok "the outbox kubectl exec carries a request-timeout bound"
     else
@@ -4042,6 +4050,34 @@ if runstub_run "$runstub_log5" "$runstub_out5" \
     fi
 else
     no "the review-loop.json kubectl exec carries a request-timeout bound" "run exited nonzero: $(cat "$runstub_out5")"
+fi
+
+# 6. A dead run through run: the agent's sentinel holds 0, the stubbed
+# fetch lands no commits, and the outbox holds nothing but the entrypoint's
+# own .fork-sandbox-model dotfile -- the full three-way zero-harvest
+# conjunction. run must exit non-zero (3, collect's suspicious code), must
+# not print the success line, and must not reap the job.
+runstub_dead_outbox="$(newdir)"; tmpdirs+=("$runstub_dead_outbox")
+mkdir -p -- "$runstub_dead_outbox"
+printf 'discovered-model\n' > "$runstub_dead_outbox/.fork-sandbox-model"
+runstub_log6="$(newdir)/kubectl.log"; runstub_out6="$(newdir)/out6.txt"; runstub_dest6="$(newdir)/outbox-6"
+tmpdirs+=("$(dirname "$runstub_log6")" "$(dirname "$runstub_out6")" "$(dirname "$runstub_dest6")")
+rc=0
+K8S_STUB_OUTBOX_DIR="$runstub_dead_outbox" K8S_STUB_OUTBOX_RC=0 \
+    runstub_run "$runstub_log6" "$runstub_out6" \
+    --branch fs-k8s-test-run-dead --model moonshotai/kimi-k3 \
+    --outbox-dir "$runstub_dest6" \
+    "$proj_dir" "$handoff_file" || rc=$?
+if (( rc == 3 )) \
+    && grep -q 'SUSPICIOUS: this run produced nothing' "$runstub_out6" \
+    && ! grep -q 'run complete' "$runstub_out6" \
+    && ! grep -q 'delete job' "$runstub_log6" \
+    && grep -qF -- "fork-sandbox-k8s.sh rm --branch fs-k8s-test-run-dead" "$runstub_out6" \
+    && grep -q 'outbox: empty of agent files (only 1 operator metadata file(s))' "$runstub_out6"; then
+    ok "a dead run through run exits 3, keeps the job, and names the manual rm"
+else
+    no "a dead run through run exits 3, keeps the job, and names the manual rm" \
+        "rc=$rc log=$(grep delete "$runstub_log6") out=$(cat "$runstub_out6")"
 fi
 
 printf '\n== fork-sandbox-k8s.sh wait: direct drive vs stubbed kubectl ==\n'
@@ -4205,7 +4241,25 @@ cat > "$collectstub_dir/git" <<'STUB'
 #!/usr/bin/env bash
 case " $* " in
     *" push "*) exit 0 ;;
-    *" fetch "*) exit 0 ;;
+    *" fetch "*)
+        # When K8S_STUB_FETCH_REF is set, simulate the agent's commits
+        # landing: advance that ref to a fresh commit in the repository
+        # this fetch runs in, so a before/after ref compare sees new work.
+        if [[ -n "${K8S_STUB_FETCH_REF:-}" ]]; then
+            empty_tree="$(git -C . hash-object -t tree /dev/null)"
+            parent="$(git -C . rev-parse -q --verify "refs/heads/$K8S_STUB_FETCH_REF" 2>/dev/null || true)"
+            if [[ -n "$parent" ]]; then
+                new="$(GIT_AUTHOR_NAME=stub-fetch GIT_AUTHOR_EMAIL=stub-fetch@fork-sandbox.invalid \
+                    GIT_COMMITTER_NAME=stub-fetch GIT_COMMITTER_EMAIL=stub-fetch@fork-sandbox.invalid \
+                    git -C . commit-tree "$empty_tree" -p "$parent" -m "stub: fetched commit")"
+            else
+                new="$(GIT_AUTHOR_NAME=stub-fetch GIT_AUTHOR_EMAIL=stub-fetch@fork-sandbox.invalid \
+                    GIT_COMMITTER_NAME=stub-fetch GIT_COMMITTER_EMAIL=stub-fetch@fork-sandbox.invalid \
+                    git -C . commit-tree "$empty_tree" -m "stub: fetched commit")"
+            fi
+            git -C . update-ref "refs/heads/$K8S_STUB_FETCH_REF" "$new"
+        fi
+        exit 0 ;;
 esac
 exec /usr/bin/git "$@"
 STUB
@@ -4276,7 +4330,7 @@ if K8S_STUB_OUTBOX_RC=0 \
     collectstub_collect "$collect_log1" "$collect_out1" \
     --branch fs-k8s-test-collect-outbox --outbox-dir "$collect_dest1" "$proj_dir"; then
     if [[ -f "$collect_dest1/hello.txt" ]] \
-        && grep -q "outbox: 1 file(s) at $collect_dest1" "$collect_out1" \
+        && grep -q "outbox: 1 agent file(s) at $collect_dest1" "$collect_out1" \
         && grep -q 'fetched into' "$collect_out1"; then
         ok "collect lands the outbox at --outbox-dir and fetches"
     else
@@ -4517,6 +4571,96 @@ else
     no "the transcript and per-container pod logs land in the evidence sibling, before the fetch" "collect exited nonzero: $(cat "$collect_out10")"
 fi
 
+# 11. THE dead-run case: the agent's sentinel holds 0, the fetch lands no
+# commits, and the outbox holds nothing but .fork-sandbox-model -- exactly
+# the run today's every-file count read as a success ("outbox: 1 file(s)").
+# collect must call it suspicious, exit 3, keep the job, and the agent's
+# own transcript must be in the fetched artifacts.
+collect_work11="$(newdir)/pod-work-11"; tmpdirs+=("$collect_work11")
+mkdir -p -- "$collect_work11"
+printf '{"type":"assistant","text":"...nothing"}\n' > "$collect_work11/events.jsonl"
+collect_outbox11="$(newdir)/pod-outbox-11"; tmpdirs+=("$collect_outbox11")
+mkdir -p -- "$collect_outbox11"
+printf 'discovered-model\n' > "$collect_outbox11/.fork-sandbox-model"
+collect_log11="$(newdir)/kubectl.log"; collect_out11="$(newdir)/out11.txt"; collect_dest11="$(newdir)/outbox-11"
+tmpdirs+=("$(dirname "$collect_log11")" "$(dirname "$collect_dest11")")
+rc=0
+K8S_STUB_RUN_COMPLETE=0 K8S_STUB_WORK_DIR="$collect_work11" \
+K8S_STUB_OUTBOX_DIR="$collect_outbox11" K8S_STUB_OUTBOX_RC=0 \
+    collectstub_collect "$collect_log11" "$collect_out11" \
+    --branch fs-k8s-test-collect-dead --outbox-dir "$collect_dest11" "$proj_dir" || rc=$?
+if (( rc == 3 )) \
+    && grep -q 'SUSPICIOUS: this run produced nothing' "$collect_out11" \
+    && ! grep -q 'delete job' "$collect_log11" \
+    && grep -qF -- "fork-sandbox-k8s.sh rm --branch fs-k8s-test-collect-dead" "$collect_out11" \
+    && [[ -f "$(dirname -- "$collect_dest11")/evidence/events.jsonl" ]]; then
+    ok "a dead run (exit 0, zero commits, dotfile-only outbox) is suspicious: exit 3, job kept, transcript fetched"
+else
+    no "a dead run (exit 0, zero commits, dotfile-only outbox) is suspicious: exit 3, job kept, transcript fetched" \
+        "rc=$rc log=$(grep delete "$collect_log11") out=$(cat "$collect_out11")"
+fi
+
+# 12. Zero commits with a NON-EMPTY outbox is a success -- a review panel
+# seat commits nothing and writes its verdict to the outbox. Never flagged.
+collect_outbox12="$(newdir)/pod-outbox-12"; tmpdirs+=("$collect_outbox12")
+mkdir -p -- "$collect_outbox12"
+printf '# verdict\napproved\n' > "$collect_outbox12/verdict.md"
+collect_log12="$(newdir)/kubectl.log"; collect_out12="$(newdir)/out12.txt"; collect_dest12="$(newdir)/outbox-12"
+tmpdirs+=("$(dirname "$collect_log12")" "$(dirname "$collect_dest12")")
+if K8S_STUB_RUN_COMPLETE=0 K8S_STUB_OUTBOX_DIR="$collect_outbox12" K8S_STUB_OUTBOX_RC=0 \
+    collectstub_collect "$collect_log12" "$collect_out12" \
+    --branch fs-k8s-test-collect-verdict --outbox-dir "$collect_dest12" "$proj_dir"; then
+    if grep -q "outbox: 1 agent file(s) at $collect_dest12" "$collect_out12" \
+        && ! grep -q 'SUSPICIOUS' "$collect_out12" \
+        && grep -q 'delete job' "$collect_log12"; then
+        ok "zero commits with a non-empty outbox is a success, not suspicious"
+    else
+        no "zero commits with a non-empty outbox is a success, not suspicious" \
+            "out=$(cat "$collect_out12")"
+    fi
+else
+    no "zero commits with a non-empty outbox is a success, not suspicious" "collect exited nonzero: $(cat "$collect_out12")"
+fi
+
+# 13. The agent wrote nothing to the outbox but its commits came back --
+# the stub fetch advances the branch ref, so the before/after compare sees
+# new work. Not flagged, despite the dotfile-only outbox.
+collect_log13="$(newdir)/kubectl.log"; collect_out13="$(newdir)/out13.txt"; collect_dest13="$(newdir)/outbox-13"
+tmpdirs+=("$(dirname "$collect_log13")" "$(dirname "$collect_dest13")")
+if K8S_STUB_RUN_COMPLETE=0 K8S_STUB_FETCH_REF=fs-k8s-test-collect-commits \
+    K8S_STUB_OUTBOX_DIR="$collect_outbox11" K8S_STUB_OUTBOX_RC=0 \
+    collectstub_collect "$collect_log13" "$collect_out13" \
+    --branch fs-k8s-test-collect-commits --outbox-dir "$collect_dest13" "$proj_dir"; then
+    if ! grep -q 'SUSPICIOUS' "$collect_out13" \
+        && grep -q 'delete job' "$collect_log13" \
+        && git -C "$proj_dir" rev-parse -q --verify refs/heads/fs-k8s-test-collect-commits >/dev/null 2>&1; then
+        ok "a dotfile-only outbox with commits brought back is not suspicious"
+    else
+        no "a dotfile-only outbox with commits brought back is not suspicious" \
+            "out=$(cat "$collect_out13")"
+    fi
+else
+    no "a dotfile-only outbox with commits brought back is not suspicious" "collect exited nonzero: $(cat "$collect_out13")"
+fi
+
+# 14. A non-zero agent exit with zero commits and an empty outbox is not
+# the suspicious conjunction either -- the agent's own failure already
+# reports loudly, and this check must not re-flag it.
+collect_log14="$(newdir)/kubectl.log"; collect_out14="$(newdir)/out14.txt"; collect_dest14="$(newdir)/outbox-14"
+tmpdirs+=("$(dirname "$collect_log14")" "$(dirname "$collect_dest14")")
+if K8S_STUB_RUN_COMPLETE=3 K8S_STUB_OUTBOX_DIR="$collect_outbox11" K8S_STUB_OUTBOX_RC=0 \
+    collectstub_collect "$collect_log14" "$collect_out14" \
+    --branch fs-k8s-test-collect-agentfail --outbox-dir "$collect_dest14" "$proj_dir"; then
+    if ! grep -q 'SUSPICIOUS' "$collect_out14" \
+        && grep -q 'delete job' "$collect_log14"; then
+        ok "a non-zero agent exit is never flagged suspicious"
+    else
+        no "a non-zero agent exit is never flagged suspicious" "out=$(cat "$collect_out14")"
+    fi
+else
+    no "a non-zero agent exit is never flagged suspicious" "collect exited nonzero: $(cat "$collect_out14")"
+fi
+
 # 15. A failed transcript read does not cost the fetch, but the run is NOT
 # reaped: a loud block, the manual rm command, and no delete in the log.
 collect_log15="$(newdir)/kubectl.log"; collect_out15="$(newdir)/out15.txt"; collect_dest15="$(newdir)/outbox-15"
@@ -4555,6 +4699,23 @@ if K8S_STUB_WORK_RC=1 K8S_STUB_OUTBOX_RC=0 \
     fi
 else
     no "--keep is unchanged when the evidence capture failed" "collect exited nonzero: $(cat "$collect_out16")"
+fi
+
+# 17. --keep does not soften the zero-harvest verdict: the flag controls
+# the reap, and a dead run is still reported and still exits 3 under it.
+collect_log17="$(newdir)/kubectl.log"; collect_out17="$(newdir)/out17.txt"; collect_dest17="$(newdir)/outbox-17"
+tmpdirs+=("$(dirname "$collect_log17")" "$(dirname "$collect_dest17")")
+rc=0
+K8S_STUB_RUN_COMPLETE=0 K8S_STUB_OUTBOX_DIR="$collect_outbox11" K8S_STUB_OUTBOX_RC=0 \
+    collectstub_collect "$collect_log17" "$collect_out17" \
+    --branch fs-k8s-test-collect-keep-dead --outbox-dir "$collect_dest17" --keep "$proj_dir" || rc=$?
+if (( rc == 3 )) \
+    && grep -q 'SUSPICIOUS: this run produced nothing' "$collect_out17" \
+    && ! grep -q 'delete job' "$collect_log17"; then
+    ok "a dead run under --keep is still flagged and still exits 3"
+else
+    no "a dead run under --keep is still flagged and still exits 3" \
+        "rc=$rc log=$(grep delete "$collect_log17") out=$(cat "$collect_out17")"
 fi
 
 printf '\n== fork-sandbox-k8s.sh say: argument validation (no cluster) ==\n'

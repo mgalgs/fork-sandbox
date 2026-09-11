@@ -81,9 +81,12 @@
 # sibling `evidence` directory of the outbox -- never inside it, so
 # operator-captured evidence stays distinguishable from the agent's own
 # artifacts), fetches the branch into the named project, and removes the
-# Job and pod unless --keep. One automatic rule guards the removal: a run
+# Job and pod unless --keep. Two automatic rules guard the removal: a run
 # whose evidence could not be captured in full is NOT reaped (its
-# resources are left in place with the manual `rm` command printed).
+# resources are left in place with the manual `rm` command printed), and
+# a run that produced nothing -- the agent exited 0, the fetch brought
+# back zero commits, and the outbox holds no file the agent wrote -- keeps
+# its job and exits 3 rather than reporting success.
 #
 # wait and collect exist so a caller fanning out several runs can submit
 # them all up front and then wait on and collect them independently, rather
@@ -3863,6 +3866,43 @@ cmd_wait() {
 # writing to its own output cannot fill the host's disk.
 FS_RUN_EVIDENCE_MAX_BYTES=$((64 * 1024 * 1024))
 
+# Files the pod's ENTRYPOINT writes into /work/outbox, not the agent: its
+# own harness metadata, for the host's bookkeeping. The zero-harvest check
+# in cmd_collect below decides whether "the outbox is empty of anything the
+# agent wrote" by discounting these as a class. When
+# fork-sandbox-k8s-entrypoint.sh starts writing another metadata file into
+# the outbox, register it in THIS list -- here, and only here -- or the
+# next one will silently re-break the check the same way
+# .fork-sandbox-model already broke the naive every-file count.
+FS_OPERATOR_OUTBOX_FILES=(.fork-sandbox-model)
+
+# Count the files an outbox directory holds that the AGENT wrote: every
+# file, minus the operator metadata named in FS_OPERATOR_OUTBOX_FILES.
+fs_count_agent_outbox_files() {
+    local dir="$1" total operator
+    total="$(find "$dir" -type f | wc -l)"
+    operator="$(fs_count_operator_outbox_files "$dir")"
+    printf '%s\n' "$(( total - operator ))"
+}
+
+# Count an outbox directory's operator metadata files (top level only: the
+# entrypoint writes them flat). Files are matched against
+# FS_OPERATOR_OUTBOX_FILES by basename, so a subdirectory the agent happens
+# to name like one of them is not discounted.
+fs_count_operator_outbox_files() {
+    local dir="$1" f known count=0
+    while IFS= read -r -d '' f; do
+        f="${f##*/}"
+        for known in "${FS_OPERATOR_OUTBOX_FILES[@]}"; do
+            if [[ "$f" == "$known" ]]; then
+                count=$(( count + 1 ))
+                break
+            fi
+        done
+    done < <(find "$dir" -maxdepth 1 -type f -print0)
+    printf '%s\n' "$count"
+}
+
 # cmd_run's collect phase, standalone: read the review loop's outcome (when
 # --review-loop N is given and non-zero), pull the pod's /work/outbox back,
 # fetch the branch into the named project, and remove the Job and pod unless
@@ -3975,6 +4015,7 @@ cmd_collect() {
     [[ -n "$outbox_dest" ]] \
         || outbox_dest="/var/tmp/claude-scratch/forks/k8s-$(k8s_safe_name_component "$branch")/outbox"
     local outbox_tar outbox_err outbox_ok=true outbox_rc=0
+    local outbox_agent_count=0 outbox_operator_count=0
     outbox_tar="$(mktemp)"
     outbox_err="$(mktemp)"
     kubectl exec --request-timeout=60s "$pod_name" -- tar cf - -C /work/outbox . 2> "$outbox_err" \
@@ -4001,10 +4042,22 @@ cmd_collect() {
     fi
     if [[ "$outbox_ok" == true ]]; then
         if "$script_dir/fork-sandbox-k8s-outbox-extract.sh" "$outbox_tar" "$outbox_dest" "$outbox_max_bytes"; then
-            local outbox_count
-            outbox_count="$(find "$outbox_dest" -type f | wc -l)"
-            if (( outbox_count > 0 )); then
-                echo "fork-sandbox-k8s: outbox: $outbox_count file(s) at $outbox_dest" >&2
+            # Count only what the AGENT wrote: the entrypoint puts its own
+            # metadata dotfile(s) into the outbox (named in
+            # FS_OPERATOR_OUTBOX_FILES), and a completely dead run's outbox
+            # holds exactly one of them. Counting every file would let that
+            # one stand in for a harvest -- the failure the zero-harvest
+            # check below exists to catch.
+            outbox_agent_count="$(fs_count_agent_outbox_files "$outbox_dest")"
+            outbox_operator_count="$(fs_count_operator_outbox_files "$outbox_dest")"
+            if (( outbox_agent_count > 0 )); then
+                local outbox_count_note=""
+                if (( outbox_operator_count > 0 )); then
+                    outbox_count_note=" ($outbox_operator_count operator metadata file(s) not counted)"
+                fi
+                echo "fork-sandbox-k8s: outbox: $outbox_agent_count agent file(s) at $outbox_dest$outbox_count_note" >&2
+            elif (( outbox_operator_count > 0 )); then
+                echo "fork-sandbox-k8s: outbox: empty of agent files (only $outbox_operator_count operator metadata file(s))" >&2
             else
                 echo "fork-sandbox-k8s: outbox: empty (nothing written)" >&2
             fi
@@ -4053,7 +4106,8 @@ cmd_collect() {
     #
     # Written to a SIBLING of the outbox directory, never inside it: the
     # outbox is the agent's artifact space, and operator-captured evidence
-    # must stay distinguishable from what the agent chose to write.
+    # must stay distinguishable from what the agent chose to write -- the
+    # zero-harvest check below depends on that distinction.
     #
     # Like the outbox read, a failure here warns and falls through rather
     # than exiting: retrieving evidence must never cost the branch fetch
@@ -4125,8 +4179,60 @@ cmd_collect() {
         rm -f -- "$pod_json_err"
     fi
 
+    # The agent's own exit code, from the sentinel the entrypoint writes
+    # after the agent exits. Read here rather than taken from a caller so
+    # the zero-harvest check below works for a standalone collect the same
+    # as for run. Absent or non-numeric -- a run still going, a pod that
+    # died early -- simply does not satisfy the check's "agent exited 0"
+    # term, rather than being guessed.
+    local agent_exit_code
+    agent_exit_code="$(kubectl exec --request-timeout=60s "$pod_name" -- cat /work/.run-complete 2>/dev/null || true)"
+    [[ "$agent_exit_code" =~ ^[0-9]+$ ]] || agent_exit_code=""
+
+    # How many commits the fetch brings back: the branch's revision in the
+    # origin repo before the fetch versus after it. cmd_fetch itself does
+    # not say, and only the caller's repo can say -- a fetch that lands no
+    # new work moves the ref nowhere.
+    local origin_repo before_sha after_sha zero_commits=false
+    origin_repo="$(fs_repo_toplevel "$project_path")" || exit 1
+    before_sha="$(git -C "$origin_repo" rev-parse -q --verify "refs/heads/$branch" 2>/dev/null || true)"
+
     echo "fork-sandbox-k8s: fetching branch $branch" >&2
     cmd_fetch --branch "$branch" "$project_path"
+    after_sha="$(git -C "$origin_repo" rev-parse -q --verify "refs/heads/$branch" 2>/dev/null || true)"
+    if [[ "$before_sha" == "$after_sha" ]]; then
+        zero_commits=true
+    fi
+
+    # A zero-harvest run is not a success: the agent exited 0, the fetch
+    # brought back zero commits, and the outbox holds no file the agent
+    # wrote. Each term alone is legitimate -- a review panel seat commits
+    # nothing and writes its verdict to the outbox, and zero commits with
+    # a non-empty outbox is a success -- so only the full three-way
+    # conjunction is reported. It is also only DECIDABLE when the outbox
+    # read succeeded: a refused or failed outbox read cannot establish
+    # "empty of anything the agent wrote", and an undecidable check must
+    # not report a suspicion.
+    if [[ "$agent_exit_code" == "0" && "$zero_commits" == true && "$outbox_ok" == true ]] \
+        && (( outbox_agent_count == 0 )); then
+        echo "fork-sandbox-k8s: ################################################" >&2
+        echo "fork-sandbox-k8s: *** SUSPICIOUS: this run produced nothing." >&2
+        echo "fork-sandbox-k8s: *** The agent exited 0, the fetch brought back zero" >&2
+        echo "fork-sandbox-k8s: *** commits, and the outbox holds no file the agent" >&2
+        echo "fork-sandbox-k8s: *** wrote. That combination is the signature of a seat" >&2
+        echo "fork-sandbox-k8s: *** that started and did no work -- typically a launch" >&2
+        echo "fork-sandbox-k8s: *** whose context was empty or wrong. The job is being" >&2
+        echo "fork-sandbox-k8s: *** KEPT for inspection rather than reaped, and this" >&2
+        echo "fork-sandbox-k8s: *** run exits non-zero. The agent's own transcript, when" >&2
+        echo "fork-sandbox-k8s: *** captured, explains the exit:" >&2
+        echo "fork-sandbox-k8s: ***   $evidence_dir/events.jsonl" >&2
+        echo "fork-sandbox-k8s: *** Clean up with:" >&2
+        echo "fork-sandbox-k8s: ***   fork-sandbox-k8s.sh rm --branch $branch" >&2
+        echo "fork-sandbox-k8s: ################################################" >&2
+        # 3, distinct from the agent's exit code (0) and from the wait's
+        # 1/2 codes: the agent's work exited 0; the RUN produced nothing.
+        exit 3
+    fi
 
     if [[ "$keep" == true ]]; then
         echo "fork-sandbox-k8s: --keep set; leaving job and pod for branch $branch in place" >&2
