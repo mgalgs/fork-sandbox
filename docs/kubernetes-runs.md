@@ -377,8 +377,13 @@ is flagged **SUSPICIOUS** and treated differently:
 1. the agent's own exit code was 0 (read from the sentinel — a non-zero
    exit already reported itself loudly, and re-flagging it would only
    confuse the signal);
-2. the fetch brought back zero commits (the branch ref compared before
-   and after the fetch);
+2. the fetch brought back zero commits. A re-fetch, where the branch
+   already exists locally, compares the branch ref before and after the
+   fetch. The first collect of a run, where it does not -- the fetch
+   itself creates the local ref, at the pod's tip even for a run that
+   committed nothing -- instead compares the fetched sha against the sha
+   the submit push created on the pod (read from the pod's bare
+   repository, which the agent never writes to).
 3. the outbox holds no file the agent wrote.
 
 Condition 3 is *not* "the outbox is empty": the entrypoint itself writes

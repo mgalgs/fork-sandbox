@@ -4161,12 +4161,21 @@ cmd_collect() {
     else
         local pod_json pod_json_err containers c
         pod_json_err="$(mktemp)"
-        if ! pod_json="$(kubectl get pod "$pod_name" -o json 2> "$pod_json_err")"; then
+        if ! pod_json="$(kubectl get pod "$pod_name" -o json --request-timeout=60s 2> "$pod_json_err")"; then
             echo "fork-sandbox-k8s: warning: could not read pod $pod_name's spec; pod logs not captured." >&2
             fs_report_captured_stderr "kubectl get pod $pod_name (spec read)" "$pod_json_err"
             evidence_ok=false
+        elif ! containers="$(jq -r '(.spec.containers // []) + (.spec.initContainers // []) | .[].name' <<< "$pod_json")" \
+            || [[ -z "$containers" ]]; then
+            # The spec came back but carries no readable container list --
+            # not JSON at all, or JSON with no containers (a live pod always
+            # has some). Like every other failure in this block, that is a
+            # FAILED capture: it warns and records itself in evidence_ok, so
+            # the reap rule below keeps the run rather than reaping a run
+            # whose pod logs were never captured.
+            echo "fork-sandbox-k8s: warning: could not read the container names from pod $pod_name's spec; pod logs not captured." >&2
+            evidence_ok=false
         else
-            containers="$(jq -r '(.spec.containers // []) + (.spec.initContainers // []) | .[].name' <<< "$pod_json")" || containers=""
             while IFS= read -r c; do
                 [[ -n "$c" ]] || continue
                 if ! kubectl logs "$pod_name" -c "$c" --request-timeout=60s > "$evidence_dir/pod-log-$c.log" 2> "$pod_json_err"; then
@@ -4189,19 +4198,52 @@ cmd_collect() {
     agent_exit_code="$(kubectl exec --request-timeout=60s "$pod_name" -- cat /work/.run-complete 2>/dev/null || true)"
     [[ "$agent_exit_code" =~ ^[0-9]+$ ]] || agent_exit_code=""
 
-    # How many commits the fetch brings back: the branch's revision in the
-    # origin repo before the fetch versus after it. cmd_fetch itself does
-    # not say, and only the caller's repo can say -- a fetch that lands no
-    # new work moves the ref nowhere.
-    local origin_repo before_sha after_sha zero_commits=false
+    # How many commits the fetch brings back. A branch that already exists
+    # locally -- a RE-fetch after a --keep collect -- is measured the way
+    # only the caller's repo can say it: the ref's revision before the
+    # fetch versus after it, where a fetch that lands no new work moves the
+    # ref nowhere.
+    #
+    # A branch that does NOT exist locally cannot be measured that way,
+    # and the FIRST collect of a run -- always the case when cmd_run drives
+    # this, since cmd_submit refuses a branch that already exists locally
+    # and the submit push creates it only in the pod's repo -- is exactly
+    # such a branch. cmd_fetch's refspec
+    # refs/heads/$branch:refs/heads/$branch creates the local ref at the
+    # pod's tip, so before/after there compares "" to the pushed base sha
+    # and reads new work where there is none: a genuinely dead run would
+    # pass the check below and be reaped. The measure that works is the sha
+    # pushed at submit. The pod's bare repository (/work/repo.git) received
+    # exactly that push and nothing else ever writes to it -- the agent
+    # commits in the clone, and the fetch uploads from the clone -- so its
+    # branch tip is still the pushed base, and a first fetch brought back no
+    # work exactly when it lands at that sha. Read like the sentinel above,
+    # through a bounded exec BEFORE the fetch, which is what ends the pod.
+    local origin_repo before_sha after_sha base_sha="" zero_commits=false
     origin_repo="$(fs_repo_toplevel "$project_path")" || exit 1
     before_sha="$(git -C "$origin_repo" rev-parse -q --verify "refs/heads/$branch" 2>/dev/null || true)"
+    if [[ -z "$before_sha" ]]; then
+        local base_err
+        base_err="$(mktemp)"
+        base_sha="$(kubectl exec --request-timeout=60s "$pod_name" -- \
+            git -C /work/repo.git rev-parse -q --verify "refs/heads/$branch" 2> "$base_err" || true)"
+        rm -f -- "$base_err"
+    fi
 
     echo "fork-sandbox-k8s: fetching branch $branch" >&2
     cmd_fetch --branch "$branch" "$project_path"
     after_sha="$(git -C "$origin_repo" rev-parse -q --verify "refs/heads/$branch" 2>/dev/null || true)"
-    if [[ "$before_sha" == "$after_sha" ]]; then
-        zero_commits=true
+    if [[ -n "$before_sha" ]]; then
+        [[ "$before_sha" == "$after_sha" ]] && zero_commits=true
+    elif [[ -n "$base_sha" ]]; then
+        [[ "$base_sha" == "$after_sha" ]] && zero_commits=true
+    else
+        # Undecidable, in the same sense the outbox_ok term below is: the
+        # base could not be read and the fetch creates the ref a
+        # before/after compare would need, so neither measure can say the
+        # fetch brought back no work. An undecidable check does not report
+        # a suspicion.
+        echo "fork-sandbox-k8s: warning: could not read the pushed base sha from pod $pod_name's repository; the zero-harvest check is undecidable for this collect." >&2
     fi
 
     # A zero-harvest run is not a success: the agent exited 0, the fetch

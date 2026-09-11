@@ -54,7 +54,9 @@
 #     directory SIBLING of the outbox, before the fetch touches
 #     /work/.fetched, with the same request-timeout bound; a run whose
 #     evidence capture failed is NOT reaped (a loud block and the manual
-#     rm command, and --keep still keeps working unchanged); and a
+#     rm command, and --keep still keeps working unchanged); a pod spec
+#     that is not readable JSON is such a failed capture, not a silent
+#     abandon; and a
 #     zero-harvest run -- the agent exited 0, the fetch brought back zero
 #     commits, and the outbox holds no file the agent wrote (.fork-
 #     sandbox-model discounted as operator metadata) -- keeps its job and
@@ -3884,7 +3886,31 @@ cat > "$runstub_dir/git" <<'STUB'
 #!/usr/bin/env bash
 case " $* " in
     *" push "*) exit 0 ;;
-    *" fetch "*) exit 0 ;;
+    *" fetch "*)
+        # Emulate the real fetch's refspec refs/heads/X:refs/heads/X,
+        # which creates the local branch at the pod's tip even when the
+        # agent committed nothing. The pod's tip is the pushed base
+        # (K8S_STUB_BASE_SHA, default: this repo's HEAD), and one commit
+        # past it when K8S_STUB_FETCH_REF is set -- the agent
+        # "committed".
+        base="${K8S_STUB_BASE_SHA:-$(git -C . rev-parse -q --verify HEAD 2>/dev/null || true)}"
+        for arg in "$@"; do
+            case "$arg" in
+                refs/heads/*:refs/heads/*)
+                    tip="$base"
+                    if [[ -n "${K8S_STUB_FETCH_REF:-}" ]]; then
+                        parent="$(git -C . rev-parse -q --verify "$base" 2>/dev/null || true)"
+                        if [[ -n "$parent" ]]; then
+                            tip="$(GIT_AUTHOR_NAME=stub-fetch GIT_AUTHOR_EMAIL=stub-fetch@fork-sandbox.invalid \
+                                GIT_COMMITTER_NAME=stub-fetch GIT_COMMITTER_EMAIL=stub-fetch@fork-sandbox.invalid \
+                                git -C . commit-tree "$(git -C . hash-object -t tree /dev/null)" -p "$parent" -m "stub: fetched commit")"
+                        fi
+                    fi
+                    [[ -n "$tip" ]] && git -C . update-ref "refs/heads/${arg#*:}" "$tip"
+                    ;;
+            esac
+        done
+        exit 0 ;;
 esac
 exec /usr/bin/git "$@"
 STUB
@@ -3894,8 +3920,20 @@ printf '%s\n' "$*" >> "$K8S_STUB_LOG"
 case " $* " in
     *" apply -f -"*) cat >/dev/null; exit 0 ;;
     *" wait "*) exit 0 ;;
+    *" get pod -l job-name="*) printf 'stub-pod\n' ;;
+    *" get pod "*)
+        # The pod's spec, for the per-container log capture.
+        spec="${K8S_STUB_POD_SPEC:-}"
+        [[ -n "$spec" ]] || spec='{"spec":{"containers":[{"name":"agent"}]}}'
+        printf '%s\n' "$spec" ;;
     *" get "*) printf 'stub-pod\n' ;;
+    *" /work/repo.git rev-parse "*)
+        # The pushed base sha, for the zero-harvest check's first-collect
+        # measure.
+        printf '%s\n' "${K8S_STUB_BASE_SHA:-}"
+        exit 0 ;;
     *" delete "*) exit 0 ;;
+    *" logs "*) printf 'stub pod log: entrypoint narration\n'; exit 0 ;;
     *" tar cf - -C /work/outbox "*)
         # Serve the fixture stream whenever K8S_STUB_OUTBOX_DIR is set,
         # independently of the exit status -- a kubectl exec that dies of
@@ -3917,9 +3955,14 @@ printf 'an artifact\n' > "$runstub_pod_outbox/hello.txt"
 runstub_run() {
     # $1 = kubectl log, $2 = output file, rest = fork-sandbox-k8s.sh run args.
     # K8S_STUB_OUTBOX_DIR may be set by the caller to serve a different
-    # pod-side outbox fixture than the default one.
+    # pod-side outbox fixture than the default one. K8S_STUB_BASE_SHA
+    # defaults to this repo's HEAD: the pod's bare repository always holds
+    # a pushed base, so the stub's emulated fetch and the stub's base-sha
+    # read must agree on one, and the caller's repo's own HEAD is the only
+    # sha both can reach.
     local log="$1" out="$2"; shift 2
     PATH="$runstub_dir:$PATH" K8S_STUB_LOG="$log" \
+        K8S_STUB_BASE_SHA="${K8S_STUB_BASE_SHA:-$(git -C "$proj_dir" rev-parse HEAD)}" \
         K8S_STUB_OUTBOX_DIR="${K8S_STUB_OUTBOX_DIR:-$runstub_pod_outbox}" \
         FORK_SANDBOX_CONFIG_DIR="$config_dir" \
         "$k8s_sh" run "$@" > "$out" 2>&1
@@ -3983,9 +4026,14 @@ if K8S_STUB_OUTBOX_RC=0 runstub_run "$runstub_log3" "$runstub_out3" \
     # assertion below.
     tar_ln="$(grep -n 'tar cf - -C /work/outbox' "$runstub_log3" | head -n 1 | cut -d: -f1 || true)"
     fetched_ln="$(grep -n 'touch /work/.fetched' "$runstub_log3" | head -n 1 | cut -d: -f1 || true)"
+    # The run path's own pod-log capture is asserted here too: the
+    # per-container log file must exist in the evidence sibling, so a
+    # capture silently abandoned on this path (non-JSON pod spec, failed
+    # jq) cannot pass without a missing file.
     if [[ -n "$tar_ln" && -n "$fetched_ln" ]] && (( tar_ln < fetched_ln )) \
         && grep -q -- '--request-timeout=60s' <(sed -n "${tar_ln}p" "$runstub_log3") \
         && [[ -f "$runstub_dest3/hello.txt" ]] \
+        && [[ -f "$(dirname -- "$runstub_dest3")/evidence/pod-log-agent.log" ]] \
         && grep -q 'outbox: 1 agent file(s) at' "$runstub_out3"; then
         ok "outbox is pulled back before the fetch touches /work/.fetched"
         ok "the outbox kubectl exec carries a request-timeout bound"
@@ -4242,23 +4290,31 @@ cat > "$collectstub_dir/git" <<'STUB'
 case " $* " in
     *" push "*) exit 0 ;;
     *" fetch "*)
-        # When K8S_STUB_FETCH_REF is set, simulate the agent's commits
-        # landing: advance that ref to a fresh commit in the repository
-        # this fetch runs in, so a before/after ref compare sees new work.
-        if [[ -n "${K8S_STUB_FETCH_REF:-}" ]]; then
-            empty_tree="$(git -C . hash-object -t tree /dev/null)"
-            parent="$(git -C . rev-parse -q --verify "refs/heads/$K8S_STUB_FETCH_REF" 2>/dev/null || true)"
-            if [[ -n "$parent" ]]; then
-                new="$(GIT_AUTHOR_NAME=stub-fetch GIT_AUTHOR_EMAIL=stub-fetch@fork-sandbox.invalid \
-                    GIT_COMMITTER_NAME=stub-fetch GIT_COMMITTER_EMAIL=stub-fetch@fork-sandbox.invalid \
-                    git -C . commit-tree "$empty_tree" -p "$parent" -m "stub: fetched commit")"
-            else
-                new="$(GIT_AUTHOR_NAME=stub-fetch GIT_AUTHOR_EMAIL=stub-fetch@fork-sandbox.invalid \
-                    GIT_COMMITTER_NAME=stub-fetch GIT_COMMITTER_EMAIL=stub-fetch@fork-sandbox.invalid \
-                    git -C . commit-tree "$empty_tree" -m "stub: fetched commit")"
-            fi
-            git -C . update-ref "refs/heads/$K8S_STUB_FETCH_REF" "$new"
-        fi
+        # Emulate the real fetch's refspec refs/heads/X:refs/heads/X,
+        # which creates the local branch at the pod's tip even when the
+        # agent committed nothing -- the first-collect case the
+        # zero-harvest check must measure against the pushed base, not a
+        # ref the fetch itself creates. The pod's tip is the pushed base
+        # (K8S_STUB_BASE_SHA, default: this repo's HEAD), and one commit
+        # past it when K8S_STUB_FETCH_REF is set -- the agent
+        # "committed".
+        base="${K8S_STUB_BASE_SHA:-$(git -C . rev-parse -q --verify HEAD 2>/dev/null || true)}"
+        for arg in "$@"; do
+            case "$arg" in
+                refs/heads/*:refs/heads/*)
+                    tip="$base"
+                    if [[ -n "${K8S_STUB_FETCH_REF:-}" ]]; then
+                        parent="$(git -C . rev-parse -q --verify "$base" 2>/dev/null || true)"
+                        if [[ -n "$parent" ]]; then
+                            tip="$(GIT_AUTHOR_NAME=stub-fetch GIT_AUTHOR_EMAIL=stub-fetch@fork-sandbox.invalid \
+                                GIT_COMMITTER_NAME=stub-fetch GIT_COMMITTER_EMAIL=stub-fetch@fork-sandbox.invalid \
+                                git -C . commit-tree "$(git -C . hash-object -t tree /dev/null)" -p "$parent" -m "stub: fetched commit")"
+                        fi
+                    fi
+                    [[ -n "$tip" ]] && git -C . update-ref "refs/heads/${arg#*:}" "$tip"
+                    ;;
+            esac
+        done
         exit 0 ;;
 esac
 exec /usr/bin/git "$@"
@@ -4273,7 +4329,14 @@ case " $* " in
     *" get pod "*)
         # The pod's spec, for the per-container log capture. Containers and
         # an initContainer, like a real claude-harness run's pod shape.
-        printf '{"spec":{"containers":[{"name":"agent"}],"initContainers":[{"name":"egress-gate"}]}}\n' ;;
+        spec="${K8S_STUB_POD_SPEC:-}"
+        [[ -n "$spec" ]] || spec='{"spec":{"containers":[{"name":"agent"}],"initContainers":[{"name":"egress-gate"}]}}'
+        printf '%s\n' "$spec" ;;
+    *" /work/repo.git rev-parse "*)
+        # The pushed base sha, for the zero-harvest check's first-collect
+        # measure.
+        printf '%s\n' "${K8S_STUB_BASE_SHA:-}"
+        exit 0 ;;
     *" cat /work/review-loop.json "*)
         [[ -n "${K8S_STUB_REVIEW_LOOP_JSON:-}" ]] && printf '%s' "$K8S_STUB_REVIEW_LOOP_JSON"
         exit "${K8S_STUB_REVIEW_LOOP_RC:-0}" ;;
@@ -4314,9 +4377,14 @@ STUB
 chmod +x "$collectstub_dir/git" "$collectstub_dir/kubectl"
 collectstub_collect() {
     # $1 = kubectl log, $2 = output file, rest = collect args.
+    # K8S_STUB_BASE_SHA defaults to this repo's HEAD: the pod's bare
+    # repository always holds a pushed base, so the stub's emulated fetch
+    # and the stub's base-sha read must agree on one, and the caller's
+    # repo's own HEAD is the only sha both can reach.
     local log="$1" out="$2"; shift 2
     K8S_STUB_POD_NAME="${K8S_STUB_POD_NAME:-stub-pod}" \
     PATH="$collectstub_dir:$PATH" K8S_STUB_LOG="$log" \
+    K8S_STUB_BASE_SHA="${K8S_STUB_BASE_SHA:-$(git -C "$proj_dir" rev-parse HEAD)}" \
     K8S_STUB_OUTBOX_DIR="${K8S_STUB_OUTBOX_DIR:-$runstub_pod_outbox}" \
     FORK_SANDBOX_CONFIG_DIR="$config_dir" \
     "$k8s_sh" collect "$@" > "$out" 2>&1
@@ -4555,8 +4623,15 @@ if K8S_STUB_WORK_DIR="$collect_work10" K8S_STUB_OUTBOX_RC=0 \
     evidence10="$(dirname -- "$collect_dest10")/evidence"
     trans_ln="$(grep -n 'tar cf - --files-from=' "$collect_log10" | head -n 1 | cut -d: -f1 || true)"
     fetched_ln="$(grep -n 'touch /work/.fetched' "$collect_log10" | head -n 1 | cut -d: -f1 || true)"
+    # The pod-spec read is the one kubectl GET in the evidence block: it
+    # must carry the same request-timeout bound as the execs, or a hung
+    # get can hang the collect the way the rest of the block exists to
+    # prevent.
+    spec_ln="$(grep -n 'get pod stub-pod -o json' "$collect_log10" | head -n 1 | cut -d: -f1 || true)"
     if [[ -n "$trans_ln" && -n "$fetched_ln" ]] && (( trans_ln < fetched_ln )) \
         && grep -q -- '--request-timeout=60s' <(sed -n "${trans_ln}p" "$collect_log10") \
+        && [[ -n "$spec_ln" ]] \
+        && grep -q -- '--request-timeout=60s' <(sed -n "${spec_ln}p" "$collect_log10") \
         && [[ -f "$evidence10/events.jsonl" && -f "$evidence10/events-review-1.jsonl" && -f "$evidence10/pi-stderr.log" ]] \
         && [[ ! -e "$evidence10/notes.md" ]] \
         && [[ -f "$evidence10/pod-log-agent.log" && -f "$evidence10/pod-log-egress-gate.log" ]] \
@@ -4716,6 +4791,30 @@ if (( rc == 3 )) \
 else
     no "a dead run under --keep is still flagged and still exits 3" \
         "rc=$rc log=$(grep delete "$collect_log17") out=$(cat "$collect_out17")"
+fi
+
+# 18. A pod spec that is not readable JSON: the per-container log capture
+# fails exactly like every other failure in its block -- it warns, and the
+# run is not reaped. A silent abandon here (the pre-fix behavior) would
+# leave a run reaped with no record of what it did at all.
+collect_log18="$(newdir)/kubectl.log"; collect_out18="$(newdir)/out18.txt"; collect_dest18="$(newdir)/outbox-18"
+tmpdirs+=("$(dirname "$collect_log18")" "$(dirname "$collect_dest18")")
+if K8S_STUB_POD_SPEC='stub-pod (not the JSON the capture assumes)' K8S_STUB_OUTBOX_RC=0 \
+    collectstub_collect "$collect_log18" "$collect_out18" \
+    --branch fs-k8s-test-collect-badspec --outbox-dir "$collect_dest18" "$proj_dir"; then
+    if grep -q 'could not read the container names' "$collect_out18" \
+        && grep -q 'LEFT IN PLACE rather than' "$collect_out18" \
+        && grep -qF -- "fork-sandbox-k8s.sh rm --branch fs-k8s-test-collect-badspec" "$collect_out18" \
+        && grep -q 'fetched into' "$collect_out18" \
+        && ! grep -q 'delete job' "$collect_log18" \
+        && [[ ! -e "$(dirname -- "$collect_dest18")/evidence/pod-log-agent.log" ]]; then
+        ok "an unreadable pod spec warns and leaves the run in place"
+    else
+        no "an unreadable pod spec warns and leaves the run in place" \
+            "log=$(grep delete "$collect_log18") out=$(cat "$collect_out18")"
+    fi
+else
+    no "an unreadable pod spec warns and leaves the run in place" "collect exited nonzero: $(cat "$collect_out18")"
 fi
 
 printf '\n== fork-sandbox-k8s.sh say: argument validation (no cluster) ==\n'
