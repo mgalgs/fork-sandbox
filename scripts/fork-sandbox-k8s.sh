@@ -81,7 +81,9 @@
 # sibling `evidence` directory of the outbox -- never inside it, so
 # operator-captured evidence stays distinguishable from the agent's own
 # artifacts), fetches the branch into the named project, and removes the
-# Job and pod unless --keep.
+# Job and pod unless --keep. One automatic rule guards the removal: a run
+# whose evidence could not be captured in full is NOT reaped (its
+# resources are left in place with the manual `rm` command printed).
 #
 # wait and collect exist so a caller fanning out several runs can submit
 # them all up front and then wait on and collect them independently, rather
@@ -4055,7 +4057,10 @@ cmd_collect() {
     #
     # Like the outbox read, a failure here warns and falls through rather
     # than exiting: retrieving evidence must never cost the branch fetch
-    # that follows.
+    # that follows. But a failed capture is recorded in evidence_ok and
+    # governs the reap decision at the bottom of this function: a run
+    # whose evidence was not captured is not reaped, because reaping is
+    # what destroys the record.
     local evidence_dir
     evidence_dir="$(dirname -- "$outbox_dest")/evidence"
     local evidence_ok=true
@@ -4125,6 +4130,21 @@ cmd_collect() {
 
     if [[ "$keep" == true ]]; then
         echo "fork-sandbox-k8s: --keep set; leaving job and pod for branch $branch in place" >&2
+    elif [[ "$evidence_ok" == false ]]; then
+        # Not reaped: reaping now destroys the only record of what this
+        # run did, and a rule that leaves resources behind must say so
+        # and say how to remove them -- a namespaced pods limit turns an
+        # unexplained leftover into a quota-exhaustion bug otherwise.
+        echo "fork-sandbox-k8s: ################################################" >&2
+        echo "fork-sandbox-k8s: *** This run's evidence could not be captured in full," >&2
+        echo "fork-sandbox-k8s: *** so its resources are being LEFT IN PLACE rather than" >&2
+        echo "fork-sandbox-k8s: *** reaped. Reaping now would destroy the only record of" >&2
+        echo "fork-sandbox-k8s: *** what the run did; whatever still remains in the pod" >&2
+        echo "fork-sandbox-k8s: *** is worth inspecting first:" >&2
+        echo "fork-sandbox-k8s: ***   kubectl --context=$K8S_CONTEXT -n $K8S_NAMESPACE logs $pod_name" >&2
+        echo "fork-sandbox-k8s: *** Remove them by hand when you are done:" >&2
+        echo "fork-sandbox-k8s: ***   fork-sandbox-k8s.sh rm --branch $branch" >&2
+        echo "fork-sandbox-k8s: ################################################" >&2
     else
         cmd_rm --branch "$branch"
     fi

@@ -49,7 +49,9 @@
 #     the fetch touches /work/.fetched. It also pulls the agent's
 #     transcript and the per-container pod logs back into an `evidence`
 #     directory SIBLING of the outbox, before the fetch touches
-#     /work/.fetched, with the same request-timeout bound.
+#     /work/.fetched, with the same request-timeout bound; a run whose
+#     evidence capture failed is NOT reaped (a loud block and the manual
+#     rm command, and --keep still keeps working unchanged).
 #   - `submit --dry-run`'s rendered handoff.md carries the operator-inbox
 #     section, names /work/inbox, and never claims that directory is
 #     read-only -- it is not, in a pod (see docs/kubernetes-runs.md).
@@ -4513,6 +4515,46 @@ if K8S_STUB_WORK_DIR="$collect_work10" K8S_STUB_OUTBOX_RC=0 \
     fi
 else
     no "the transcript and per-container pod logs land in the evidence sibling, before the fetch" "collect exited nonzero: $(cat "$collect_out10")"
+fi
+
+# 15. A failed transcript read does not cost the fetch, but the run is NOT
+# reaped: a loud block, the manual rm command, and no delete in the log.
+collect_log15="$(newdir)/kubectl.log"; collect_out15="$(newdir)/out15.txt"; collect_dest15="$(newdir)/outbox-15"
+tmpdirs+=("$(dirname "$collect_log15")" "$(dirname "$collect_dest15")")
+if K8S_STUB_WORK_RC=1 K8S_STUB_WORK_STDERR='stub-kubectl says: transcript read exploded' K8S_STUB_OUTBOX_RC=0 \
+    collectstub_collect "$collect_log15" "$collect_out15" \
+    --branch fs-k8s-test-collect-nocapture --outbox-dir "$collect_dest15" "$proj_dir"; then
+    if grep -q 'could not read the transcript from pod' "$collect_out15" \
+        && grep -q 'stub-kubectl says: transcript read exploded' "$collect_out15" \
+        && grep -q 'LEFT IN PLACE rather than' "$collect_out15" \
+        && grep -qF -- "fork-sandbox-k8s.sh rm --branch fs-k8s-test-collect-nocapture" "$collect_out15" \
+        && grep -q 'fetched into' "$collect_out15" \
+        && ! grep -q 'delete job' "$collect_log15"; then
+        ok "a failed evidence capture leaves the run in place with the manual rm command"
+    else
+        no "a failed evidence capture leaves the run in place with the manual rm command" \
+            "log=$(grep delete "$collect_log15") out=$(cat "$collect_out15")"
+    fi
+else
+    no "a failed evidence capture leaves the run in place with the manual rm command" "collect exited nonzero: $(cat "$collect_out15")"
+fi
+
+# 16. --keep keeps working unchanged even when the capture failed: the old
+# message, no scary block.
+collect_log16="$(newdir)/kubectl.log"; collect_out16="$(newdir)/out16.txt"; collect_dest16="$(newdir)/outbox-16"
+tmpdirs+=("$(dirname "$collect_log16")" "$(dirname "$collect_dest16")")
+if K8S_STUB_WORK_RC=1 K8S_STUB_OUTBOX_RC=0 \
+    collectstub_collect "$collect_log16" "$collect_out16" \
+    --branch fs-k8s-test-collect-keep-nocapture --outbox-dir "$collect_dest16" --keep "$proj_dir"; then
+    if grep -q -- '--keep set; leaving job and pod' "$collect_out16" \
+        && ! grep -q 'LEFT IN PLACE' "$collect_out16" \
+        && ! grep -q 'delete job' "$collect_log16"; then
+        ok "--keep is unchanged when the evidence capture failed"
+    else
+        no "--keep is unchanged when the evidence capture failed" "out=$(cat "$collect_out16")"
+    fi
+else
+    no "--keep is unchanged when the evidence capture failed" "collect exited nonzero: $(cat "$collect_out16")"
 fi
 
 printf '\n== fork-sandbox-k8s.sh say: argument validation (no cluster) ==\n'
