@@ -618,6 +618,19 @@ fi
 
 fs_resolve_pi || exit 1
 
+# This relay runs on the host, not in the sandbox. An image toolchain leaves
+# FS_PI_NODE empty on purpose because its pi and node come from the image, so
+# do not use that sandbox-only answer to start host-side JavaScript.
+HOST_NODE=""
+if [[ -n "$EP_HOST_HEADER" ]]; then
+    HOST_NODE="$(command -v node 2>/dev/null || true)"
+    if [[ -z "$HOST_NODE" || ! -x "$HOST_NODE" ]]; then
+        echo "Error: endpoint '$ENDPOINT' needs a host-side Node interpreter" >&2
+        echo "to run its Host-header relay, but node was not found on PATH." >&2
+        exit 1
+    fi
+fi
+
 # The work dir is the only path that persists. Default to a fresh one under the
 # scratch root, as claude-sandboxed does, so a run with no arguments still has
 # somewhere to leave its results.
@@ -632,7 +645,7 @@ fi
 # Every path below ends up inside a generated shell script, and printf %q is
 # what keeps it safe there. A newline would still break the file's shape, so
 # refuse the characters that do not survive the trip.
-fs_reject_unsafe_chars "$WORK_DIR" "$FS_PI_NODE" "$FS_PI_REAL" "$FS_PI_ROOT" \
+fs_reject_unsafe_chars "$WORK_DIR" "$FS_PI_NODE" "$FS_PI_REAL" "$FS_PI_ROOT" "$HOST_NODE" \
     "$FS_PI_BIN_DIR" "$MODEL" "$EP_HOST" "$EP_PREFIX" || exit 1
 
 # A writable .git is host code execution: a hook, or a config key such as
@@ -940,7 +953,7 @@ fi
 # setsid puts each in a process group of its own, so the trap can take its
 # per-connection children with it. $! is then the group leader.
 if [[ -n "$EP_HOST_HEADER" ]]; then
-    printf -v relay_exec '%q ' "$FS_PI_NODE" "$REPO_ROOT/scripts/http-host-relay.mjs" \
+    printf -v relay_exec '%q ' "$HOST_NODE" "$REPO_ROOT/scripts/http-host-relay.mjs" \
         "$EP_HOST" "$EP_PORT" "$EP_HOST_HEADER"
     setsid socat "UNIX-LISTEN:$SOCK,fork,mode=600" "EXEC:$relay_exec" &
 else

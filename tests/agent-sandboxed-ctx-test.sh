@@ -20,7 +20,14 @@ check() {
 
 work="$(mktemp -d)"; tmpdirs+=("$work")
 bin="$work/bin"; mkdir "$bin"
-ln -s "$(command -v node)" "$bin/node"
+real_node="$(command -v node)"
+cat > "$bin/node" <<'NODE'
+#!/usr/bin/env bash
+[[ -z "${HOST_NODE_CAPTURE:-}" ]] || printf '%s\n' "$@" > "$HOST_NODE_CAPTURE"
+exec "$REAL_NODE" "$@"
+NODE
+chmod +x "$bin/node"
+export REAL_NODE
 cat > "$bin/pi" <<'PI'
 #!/usr/bin/env bash
 exit 0
@@ -41,6 +48,22 @@ for ((i=1; i<=$#; i++)); do
     fi
 done
 [[ -z "${BACKEND_CAPTURE:-}" ]] || printf '%s\0' "$@" > "$BACKEND_CAPTURE"
+if [[ -n "${IMAGE_RELAY_PROBE:-}" ]]; then
+    for ((i=1; i<=$#; i++)); do
+        if [[ "${!i}" == --bridge ]]; then
+            j=$((i + 1)); socket="${!j%%=*}"
+            python3 - "$socket" <<'PY'
+import socket, sys
+s = socket.socket(socket.AF_UNIX)
+s.connect(sys.argv[1])
+s.sendall(b'GET / HTTP/1.1\r\nHost: localhost:8318\r\n\r\n')
+s.close()
+PY
+            sleep 0.1
+            break
+        fi
+    done
+fi
 exit 0
 BACKEND
 chmod +x "$bin/sandbox-backend-test"
@@ -127,6 +150,17 @@ if grep -qx -- '--hosts-alias' "$work/hostname endpoint.args.text" && \
     ok "hostname endpoint leaves Host rewriting to its relay"
 else
     no "hostname endpoint leaves Host rewriting to its relay"
+fi
+
+# Image toolchains intentionally leave FS_PI_NODE empty because pi runs in the
+# image. The host-side Host relay still needs the host's Node interpreter.
+export HOST_NODE_CAPTURE="$work/image-relay-node.args" IMAGE_RELAY_PROBE=1
+run_endpoint_case "image hostname endpoint" 'http://localhost/v1' $'toolchain=image\nhosts_alias=1'
+unset HOST_NODE_CAPTURE IMAGE_RELAY_PROBE
+if [[ "$(sed -n '1p' "$work/image-relay-node.args" 2>/dev/null)" == "$repo_dir/scripts/http-host-relay.mjs" ]]; then
+    ok "image hostname relay uses a host Node interpreter"
+else
+    no "image hostname relay uses a host Node interpreter"
 fi
 
 # Node's OpenAI transport derives Host from the remapped URL authority. The
