@@ -20,7 +20,7 @@ check() {
 
 work="$(mktemp -d)"; tmpdirs+=("$work")
 bin="$work/bin"; mkdir "$bin"
-real_node="$(command -v node)"
+REAL_NODE="$(command -v node)"
 cat > "$bin/node" <<'NODE'
 #!/usr/bin/env bash
 [[ -z "${HOST_NODE_CAPTURE:-}" ]] || printf '%s\n' "$@" > "$HOST_NODE_CAPTURE"
@@ -170,7 +170,7 @@ host_port_file="$work/host-relay.port"
 python3 "$work/server.py" host "$host_port_file" & host_server_pid=$!
 for _ in $(seq 1 50); do [[ -s "$host_port_file" ]] && break; sleep 0.02; done
 printf 'GET /host HTTP/1.1\r\nHost: gateway.example:8318\r\nConnection: close\r\n\r\n' \
-    | node "$repo_dir/scripts/http-host-relay.mjs" 127.0.0.1 "$(cat "$host_port_file")" gateway.example \
+    | "$bin/node" "$repo_dir/scripts/http-host-relay.mjs" 127.0.0.1 "$(cat "$host_port_file")" gateway.example \
     > "$work/host-relay.response"
 host_relay_rc=$?
 kill "$host_server_pid" 2>/dev/null; wait "$host_server_pid" 2>/dev/null

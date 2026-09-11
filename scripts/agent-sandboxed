@@ -618,15 +618,20 @@ fi
 
 fs_resolve_pi || exit 1
 
-# This relay runs on the host, not in the sandbox. An image toolchain leaves
-# FS_PI_NODE empty on purpose because its pi and node come from the image, so
-# do not use that sandbox-only answer to start host-side JavaScript.
+# This relay runs on the host, not in the sandbox. Under a host toolchain,
+# fs_resolve_pi has already selected pi's matching Node -- including an
+# otherwise inactive NVM install -- so reuse it. An image toolchain leaves
+# FS_PI_NODE empty on purpose because its pi and node come from the image;
+# that case needs a separate host-side lookup for the relay.
 HOST_NODE=""
 if [[ -n "$EP_HOST_HEADER" ]]; then
-    HOST_NODE="$(command -v node 2>/dev/null || true)"
+    HOST_NODE="$FS_PI_NODE"
+    if [[ -z "$HOST_NODE" || ! -x "$HOST_NODE" ]]; then
+        HOST_NODE="$(command -v node 2>/dev/null || true)"
+    fi
     if [[ -z "$HOST_NODE" || ! -x "$HOST_NODE" ]]; then
         echo "Error: endpoint '$ENDPOINT' needs a host-side Node interpreter" >&2
-        echo "to run its Host-header relay, but node was not found on PATH." >&2
+        echo "to run its Host-header relay, but none could be resolved." >&2
         exit 1
     fi
 fi
