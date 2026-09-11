@@ -377,13 +377,18 @@ is flagged **SUSPICIOUS** and treated differently:
 1. the agent's own exit code was 0 (read from the sentinel — a non-zero
    exit already reported itself loudly, and re-flagging it would only
    confuse the signal);
-2. the fetch brought back zero commits. A re-fetch, where the branch
-   already exists locally, compares the branch ref before and after the
-   fetch. The first collect of a run, where it does not -- the fetch
-   itself creates the local ref, at the pod's tip even for a run that
-   committed nothing -- instead compares the fetched sha against the sha
-   the submit push created on the pod (read from the pod's bare
-   repository, which the agent never writes to).
+2. the fetch brought back zero commits. The measure is the sha the submit
+   push created on the pod, read from the pod's bare repository, which
+   the agent never writes to, so its branch tip is still that base: the
+   run produced no commits exactly when the fetched branch lands at that
+   sha. The base is read on every collect, first and re-collect alike,
+   because neither of the other candidates answers the run's question:
+   the first collect has no local ref to compare (the fetch itself
+   creates it, at the pod's tip even for a run that committed nothing),
+   and a re-collect's local ref, compared before and after the fetch,
+   answers "did THIS fetch land new commits" -- which for a re-collect
+   of a branch whose commits an earlier collect already delivered reads
+   "no" while the run plainly produced them.
 3. the outbox holds no file the agent wrote.
 
 Condition 3 is *not* "the outbox is empty": the entrypoint itself writes
@@ -394,7 +399,11 @@ of files the operator's own tooling writes — `FS_OPERATOR_OUTBOX_FILES`
 in the script, currently `.fork-sandbox-model` only, and the place a new
 entry gets added if the entrypoint ever writes more. That list exists
 solely for the suspicion check; it is never used to filter the pull-back
-itself, which still lands every file the pod's outbox held.
+itself, which still lands every file the pod's outbox held. The check is
+likewise silent when the outbox read itself fails, or the extraction
+guard refuses the archive (a link entry, an absolute path, a `..`
+component): none of those can establish "the outbox holds no file the
+agent wrote", and an undecidable check does not report a suspicion.
 
 A zero-harvest run is the signature of a seat that started and did no
 work — typically a launch whose context was empty or wrong, an agent that

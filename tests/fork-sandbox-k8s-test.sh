@@ -3928,8 +3928,8 @@ case " $* " in
         printf '%s\n' "$spec" ;;
     *" get "*) printf 'stub-pod\n' ;;
     *" /work/repo.git rev-parse "*)
-        # The pushed base sha, for the zero-harvest check's first-collect
-        # measure.
+        # The pushed base sha, read by the zero-harvest check on every
+        # collect (first and re-collect alike).
         printf '%s\n' "${K8S_STUB_BASE_SHA:-}"
         exit 0 ;;
     *" delete "*) exit 0 ;;
@@ -4295,15 +4295,18 @@ case " $* " in
         # agent committed nothing -- the first-collect case the
         # zero-harvest check must measure against the pushed base, not a
         # ref the fetch itself creates. The pod's tip is the pushed base
-        # (K8S_STUB_BASE_SHA, default: this repo's HEAD), and one commit
-        # past it when K8S_STUB_FETCH_REF is set -- the agent
-        # "committed".
+        # (K8S_STUB_BASE_SHA, default: this repo's HEAD), one commit past
+        # it when K8S_STUB_FETCH_REF is set -- the agent "committed" --
+        # or exactly K8S_STUB_CLONE_TIP when that is set -- a commit an
+        # earlier collect already delivered, for the re-collect tests.
         base="${K8S_STUB_BASE_SHA:-$(git -C . rev-parse -q --verify HEAD 2>/dev/null || true)}"
         for arg in "$@"; do
             case "$arg" in
                 refs/heads/*:refs/heads/*)
                     tip="$base"
-                    if [[ -n "${K8S_STUB_FETCH_REF:-}" ]]; then
+                    if [[ -n "${K8S_STUB_CLONE_TIP:-}" ]]; then
+                        tip="$K8S_STUB_CLONE_TIP"
+                    elif [[ -n "${K8S_STUB_FETCH_REF:-}" ]]; then
                         parent="$(git -C . rev-parse -q --verify "$base" 2>/dev/null || true)"
                         if [[ -n "$parent" ]]; then
                             tip="$(GIT_AUTHOR_NAME=stub-fetch GIT_AUTHOR_EMAIL=stub-fetch@fork-sandbox.invalid \
@@ -4333,8 +4336,8 @@ case " $* " in
         [[ -n "$spec" ]] || spec='{"spec":{"containers":[{"name":"agent"}],"initContainers":[{"name":"egress-gate"}]}}'
         printf '%s\n' "$spec" ;;
     *" /work/repo.git rev-parse "*)
-        # The pushed base sha, for the zero-harvest check's first-collect
-        # measure.
+        # The pushed base sha, read by the zero-harvest check on every
+        # collect (first and re-collect alike).
         printf '%s\n' "${K8S_STUB_BASE_SHA:-}"
         exit 0 ;;
     *" cat /work/review-loop.json "*)
@@ -4815,6 +4818,87 @@ if K8S_STUB_POD_SPEC='stub-pod (not the JSON the capture assumes)' K8S_STUB_OUTB
     fi
 else
     no "an unreadable pod spec warns and leaves the run in place" "collect exited nonzero: $(cat "$collect_out18")"
+fi
+
+# 19. An outbox the extraction guard REFUSES is undecidable, not a
+# zero-harvest: a symlink entry (a natural habit for an agent that
+# symlinks a report into the outbox) makes the guard refuse the whole
+# archive, so the agent-file count never sees the file the agent did
+# write. With the sentinel at 0 and the fetch landing no commits, the
+# refusal must not read as "the outbox holds no file the agent wrote".
+collect_outbox19="$(newdir)/pod-outbox-19"; tmpdirs+=("$collect_outbox19")
+mkdir -p -- "$collect_outbox19"
+printf '# report\nthe work is here\n' > "$collect_outbox19/report.md"
+ln -s report.md "$collect_outbox19/link.md"
+collect_log19="$(newdir)/kubectl.log"; collect_out19="$(newdir)/out19.txt"; collect_dest19="$(newdir)/outbox-19"
+tmpdirs+=("$(dirname "$collect_log19")" "$(dirname "$collect_dest19")")
+rc=0
+K8S_STUB_RUN_COMPLETE=0 K8S_STUB_OUTBOX_DIR="$collect_outbox19" K8S_STUB_OUTBOX_RC=0 \
+    collectstub_collect "$collect_log19" "$collect_out19" \
+    --branch fs-k8s-test-collect-outbox-refused --outbox-dir "$collect_dest19" "$proj_dir" || rc=$?
+if (( rc == 0 )) \
+    && grep -q 'warning: could not extract the outbox tarball' "$collect_out19" \
+    && grep -q 'refusing the whole archive' "$collect_out19" \
+    && ! grep -q 'SUSPICIOUS' "$collect_out19" \
+    && grep -q 'delete job' "$collect_log19"; then
+    ok "a guard-refused outbox is undecidable, not a zero-harvest"
+else
+    no "a guard-refused outbox is undecidable, not a zero-harvest" \
+        "rc=$rc log=$(grep delete "$collect_log19") out=$(cat "$collect_out19")"
+fi
+
+# 20. A re-collect of a branch whose commits an EARLIER collect already
+# delivered: the local ref pre-exists at the advanced sha, the fetch
+# lands no new commits (before == after), the sentinel is 0 and the
+# outbox holds only the operator dotfile. The ref's before/after compare
+# reads "no new work" -- but the run plainly produced its commits, and
+# the caller's repo already holds them. Not flagged; the pushed-base
+# measure (branch tip advanced off it) is what keeps this honest.
+collect_refetch_tip="$(GIT_AUTHOR_NAME=stub-delivered GIT_AUTHOR_EMAIL=stub-delivered@fork-sandbox.invalid \
+    GIT_COMMITTER_NAME=stub-delivered GIT_COMMITTER_EMAIL=stub-delivered@fork-sandbox.invalid \
+    git -C "$proj_dir" commit-tree "$(git -C "$proj_dir" hash-object -t tree /dev/null)" \
+        -p "$(git -C "$proj_dir" rev-parse HEAD)" -m 'stub: previously delivered')"
+git -C "$proj_dir" update-ref refs/heads/fs-k8s-test-collect-refetch-delivered "$collect_refetch_tip"
+collect_log20="$(newdir)/kubectl.log"; collect_out20="$(newdir)/out20.txt"; collect_dest20="$(newdir)/outbox-20"
+tmpdirs+=("$(dirname "$collect_log20")" "$(dirname "$collect_dest20")")
+if K8S_STUB_RUN_COMPLETE=0 K8S_STUB_CLONE_TIP="$collect_refetch_tip" \
+    K8S_STUB_OUTBOX_DIR="$collect_outbox11" K8S_STUB_OUTBOX_RC=0 \
+    collectstub_collect "$collect_log20" "$collect_out20" \
+    --branch fs-k8s-test-collect-refetch-delivered --outbox-dir "$collect_dest20" "$proj_dir"; then
+    if ! grep -q 'SUSPICIOUS' "$collect_out20" \
+        && grep -q 'delete job' "$collect_log20" \
+        && [[ "$(git -C "$proj_dir" rev-parse -q --verify refs/heads/fs-k8s-test-collect-refetch-delivered)" == "$collect_refetch_tip" ]] \
+        && grep -q 'outbox: empty of agent files' "$collect_out20"; then
+        ok "a re-collect of an already-delivered branch is not a zero-harvest"
+    else
+        no "a re-collect of an already-delivered branch is not a zero-harvest" \
+            "ref=$(git -C "$proj_dir" rev-parse -q --verify refs/heads/fs-k8s-test-collect-refetch-delivered) out=$(cat "$collect_out20")"
+    fi
+else
+    no "a re-collect of an already-delivered branch is not a zero-harvest" "collect exited nonzero: $(cat "$collect_out20")"
+fi
+
+# 21. The same re-collect shape, but for a run that produced NOTHING: the
+# local ref pre-exists at the pushed base (the crash window between the
+# fetch's ref update and its touch of /work/.fetched), the fetch lands
+# nothing, the sentinel is 0 and the outbox holds only the dotfile. The
+# pushed base still says the branch never moved -- flagged, exit 3.
+collect_refetch_dead_branch=fs-k8s-test-collect-refetch-dead
+git -C "$proj_dir" update-ref "refs/heads/$collect_refetch_dead_branch" "$(git -C "$proj_dir" rev-parse HEAD)"
+collect_log21="$(newdir)/kubectl.log"; collect_out21="$(newdir)/out21.txt"; collect_dest21="$(newdir)/outbox-21"
+tmpdirs+=("$(dirname "$collect_log21")" "$(dirname "$collect_dest21")")
+rc=0
+K8S_STUB_RUN_COMPLETE=0 K8S_STUB_OUTBOX_DIR="$collect_outbox11" K8S_STUB_OUTBOX_RC=0 \
+    collectstub_collect "$collect_log21" "$collect_out21" \
+    --branch "$collect_refetch_dead_branch" --outbox-dir "$collect_dest21" "$proj_dir" || rc=$?
+if (( rc == 3 )) \
+    && grep -q 'SUSPICIOUS: this run produced nothing' "$collect_out21" \
+    && ! grep -q 'delete job' "$collect_log21" \
+    && grep -qF -- "fork-sandbox-k8s.sh rm --branch $collect_refetch_dead_branch" "$collect_out21"; then
+    ok "a re-collect of a dead run (local ref at the base) is still a zero-harvest"
+else
+    no "a re-collect of a dead run (local ref at the base) is still a zero-harvest" \
+        "rc=$rc log=$(grep delete "$collect_log21") out=$(cat "$collect_out21")"
 fi
 
 printf '\n== fork-sandbox-k8s.sh say: argument validation (no cluster) ==\n'

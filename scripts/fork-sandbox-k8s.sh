@@ -4063,6 +4063,15 @@ cmd_collect() {
             fi
         else
             echo "fork-sandbox-k8s: warning: could not extract the outbox tarball; nothing pulled back to $outbox_dest" >&2
+            # A REFUSED archive is a failed read for the zero-harvest check
+            # below, not an empty one: the guard refuses whole archives that
+            # hold a link entry, an absolute path, or a `..` component, and a
+            # symlinked report is a natural agent habit -- the archive
+            # refused is evidence the agent DID write, that the count above
+            # simply never got to see. Leaving outbox_ok true here would let
+            # the conjunction read "nothing was extracted" as "the agent
+            # wrote nothing".
+            outbox_ok=false
         fi
     fi
     # The pod's harness metadata dotfile, when the outbox came back:
@@ -4198,52 +4207,59 @@ cmd_collect() {
     agent_exit_code="$(kubectl exec --request-timeout=60s "$pod_name" -- cat /work/.run-complete 2>/dev/null || true)"
     [[ "$agent_exit_code" =~ ^[0-9]+$ ]] || agent_exit_code=""
 
-    # How many commits the fetch brings back. A branch that already exists
-    # locally -- a RE-fetch after a --keep collect -- is measured the way
-    # only the caller's repo can say it: the ref's revision before the
-    # fetch versus after it, where a fetch that lands no new work moves the
-    # ref nowhere.
+    # How many commits the run produced. The measure that answers that
+    # question is the sha pushed at submit. The pod's bare repository
+    # (/work/repo.git) received exactly that push and nothing else ever
+    # writes to it -- the agent commits in the clone, and the fetch
+    # uploads from the clone -- so its branch tip is still the pushed
+    # base, and the run produced no commits exactly when the fetched
+    # branch lands at that sha.
     #
-    # A branch that does NOT exist locally cannot be measured that way,
-    # and the FIRST collect of a run -- always the case when cmd_run drives
+    # The FIRST collect of a run -- always the case when cmd_run drives
     # this, since cmd_submit refuses a branch that already exists locally
-    # and the submit push creates it only in the pod's repo -- is exactly
-    # such a branch. cmd_fetch's refspec
+    # and the submit push creates it only in the pod's repo -- cannot be
+    # measured against the local ref at all: cmd_fetch's refspec
     # refs/heads/$branch:refs/heads/$branch creates the local ref at the
-    # pod's tip, so before/after there compares "" to the pushed base sha
-    # and reads new work where there is none: a genuinely dead run would
-    # pass the check below and be reaped. The measure that works is the sha
-    # pushed at submit. The pod's bare repository (/work/repo.git) received
-    # exactly that push and nothing else ever writes to it -- the agent
-    # commits in the clone, and the fetch uploads from the clone -- so its
-    # branch tip is still the pushed base, and a first fetch brought back no
-    # work exactly when it lands at that sha. Read like the sentinel above,
-    # through a bounded exec BEFORE the fetch, which is what ends the pod.
+    # pod's tip, so before/after there compares "" to the fetched tip and
+    # reads new work where there is none: a genuinely dead run would pass
+    # the check below and be reaped.
+    #
+    # A branch that ALREADY exists locally -- a re-collect -- is not
+    # measured by the local ref either: before/after there answers "did
+    # THIS fetch land new commits", which for a re-collect of a branch
+    # whose commits an earlier collect already delivered (a live idle pod
+    # plus an existing local ref, or the crash window between the fetch's
+    # ref update and its touch of /work/.fetched) reads "no" while the
+    # run plainly produced them -- a false zero-harvest. The pushed base
+    # answers the run's own question in both cases, so it is read in
+    # both, like the sentinel above, through a bounded exec BEFORE the
+    # fetch, which is what ends the pod.
     local origin_repo before_sha after_sha base_sha="" zero_commits=false
     origin_repo="$(fs_repo_toplevel "$project_path")" || exit 1
     before_sha="$(git -C "$origin_repo" rev-parse -q --verify "refs/heads/$branch" 2>/dev/null || true)"
-    if [[ -z "$before_sha" ]]; then
-        local base_err
-        base_err="$(mktemp)"
-        base_sha="$(kubectl exec --request-timeout=60s "$pod_name" -- \
-            git -C /work/repo.git rev-parse -q --verify "refs/heads/$branch" 2> "$base_err" || true)"
-        rm -f -- "$base_err"
-    fi
+    local base_err
+    base_err="$(mktemp)"
+    base_sha="$(kubectl exec --request-timeout=60s "$pod_name" -- \
+        git -C /work/repo.git rev-parse -q --verify "refs/heads/$branch" 2> "$base_err" || true)"
+    rm -f -- "$base_err"
 
     echo "fork-sandbox-k8s: fetching branch $branch" >&2
     cmd_fetch --branch "$branch" "$project_path"
     after_sha="$(git -C "$origin_repo" rev-parse -q --verify "refs/heads/$branch" 2>/dev/null || true)"
-    if [[ -n "$before_sha" ]]; then
-        [[ "$before_sha" == "$after_sha" ]] && zero_commits=true
-    elif [[ -n "$base_sha" ]]; then
+    if [[ -n "$base_sha" ]]; then
         [[ "$base_sha" == "$after_sha" ]] && zero_commits=true
+    elif [[ -n "$before_sha" && "$before_sha" != "$after_sha" ]]; then
+        # The base could not be read, but the fetch landed new commits:
+        # the run produced work, whatever the base would have said.
+        :
     else
-        # Undecidable, in the same sense the outbox_ok term below is: the
-        # base could not be read and the fetch creates the ref a
-        # before/after compare would need, so neither measure can say the
-        # fetch brought back no work. An undecidable check does not report
-        # a suspicion.
-        echo "fork-sandbox-k8s: warning: could not read the pushed base sha from pod $pod_name's repository; the zero-harvest check is undecidable for this collect." >&2
+        # Undecidable, in the same sense the outbox_ok term below is:
+        # neither the base nor a before/after compare can say the run
+        # produced no commits -- the fetch landed nothing new, and that
+        # says nothing about a ref an earlier collect may already have
+        # advanced off an unreadable base. An undecidable check does not
+        # report a suspicion.
+        echo "fork-sandbox-k8s: warning: could not decide whether the run produced commits (the pushed base sha was unreadable from pod $pod_name's repository, and this fetch landed no new commits); the zero-harvest check is undecidable for this collect." >&2
     fi
 
     # A zero-harvest run is not a success: the agent exited 0, the fetch
