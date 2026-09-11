@@ -61,6 +61,9 @@ class Handler(BaseHTTPRequestHandler):
             elif mode == 'malformed': raw = b'{not json'
             elif mode == 'timeout': time.sleep(3); raw = b'{}'
             else: raw = b'{}'
+        elif mode == 'host':
+            open(port_file + '.host', 'w').write(self.headers['Host'])
+            raw = b'{}'
         else: self.send_error(404); return
         self.send_response(200); self.send_header('Content-Length', str(len(raw)))
         self.end_headers(); self.wfile.write(raw)
@@ -98,7 +101,9 @@ run_case "malformed props uses fallback" malformed "" 8192
 run_case "props timeout uses fallback" timeout "" 8192
 
 # A hostname must survive into the provider URL and be handed to a capable
-# backend. Conversely, an IPv4 endpoint must not gain a hosts-alias flag.
+# backend. Its Host is restored by the host-side relay, not by pi's ineffective
+# defaultHeaders setting. Conversely, an IPv4 endpoint must not gain a
+# hosts-alias flag.
 cat > "$bin/curl" <<'CURL'
 #!/usr/bin/env bash
 printf '%s\n' '{"data":[{"id":"test-model"}]}'
@@ -118,10 +123,27 @@ run_endpoint_case "hostname endpoint" 'http://gateway.example/v1' $'toolchain=ho
 if grep -qx -- '--hosts-alias' "$work/hostname endpoint.args.text" && \
     grep -qx -- 'gateway.example' "$work/hostname endpoint.args.text" && \
     [[ "$(jq -r '.providers.local.baseUrl' "$work/hostname endpoint.models.json" 2>/dev/null)" == 'http://gateway.example:8318/v1' ]] && \
-    [[ "$(jq -r '.providers.local.headers.Host' "$work/hostname endpoint.models.json" 2>/dev/null)" == 'gateway.example' ]]; then
-    ok "hostname endpoint keeps Host authority at remapped port"
+    [[ "$(jq -r '.providers.local | has("headers")' "$work/hostname endpoint.models.json" 2>/dev/null)" == 'false' ]]; then
+    ok "hostname endpoint leaves Host rewriting to its relay"
 else
-    no "hostname endpoint keeps Host authority at remapped port"
+    no "hostname endpoint leaves Host rewriting to its relay"
+fi
+
+# Node's OpenAI transport derives Host from the remapped URL authority. The
+# host-side relay must rewrite the wire header instead of relying on pi's
+# defaultHeaders setting, which fetch replaces.
+host_port_file="$work/host-relay.port"
+python3 "$work/server.py" host "$host_port_file" & host_server_pid=$!
+for _ in $(seq 1 50); do [[ -s "$host_port_file" ]] && break; sleep 0.02; done
+printf 'GET /host HTTP/1.1\r\nHost: gateway.example:8318\r\nConnection: close\r\n\r\n' \
+    | node "$repo_dir/scripts/http-host-relay.mjs" 127.0.0.1 "$(cat "$host_port_file")" gateway.example \
+    > "$work/host-relay.response"
+host_relay_rc=$?
+kill "$host_server_pid" 2>/dev/null; wait "$host_server_pid" 2>/dev/null
+if (( host_relay_rc == 0 )) && [[ "$(cat "$host_port_file.host" 2>/dev/null)" == gateway.example ]]; then
+    ok "host relay rewrites remapped URL authority"
+else
+    no "host relay rewrites remapped URL authority"
 fi
 run_endpoint_case "IP endpoint" 'http://192.0.2.10:8080/v1' $'toolchain=host\nhosts_alias=1'
 if ! grep -qx -- '--hosts-alias' "$work/IP endpoint.args.text" && \

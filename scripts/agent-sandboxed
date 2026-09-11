@@ -454,9 +454,8 @@ BASE_HOST=127.0.0.1
 (( EP_NEEDS_HOSTS_ALIAS )) && BASE_HOST="$EP_HOST"
 
 # A URL client derives Host from its URL authority. When the endpoint's
-# privileged port moves to the relay port below, retain the endpoint authority
-# as an explicit provider header so a Host-routed ingress sees gateway.example
-# rather than gateway.example:8318.
+# privileged port moves to the relay port below, its host-side relay rewrites
+# the request authority before forwarding it to the endpoint.
 EP_HOST_HEADER=""
 if (( EP_NEEDS_HOSTS_ALIAS )) && (( EP_PORT < 1024 )); then
     EP_HOST_HEADER="$EP_HOST"
@@ -713,9 +712,10 @@ else
 fi
 
 # Register the bridged endpoint as a provider pi can select. A hostname base
-# URL resolves to the inner loopback relay through --hosts-alias while retaining
-# the Host header required by ingress routing. The key is required by the API
-# shape and ignored by the server.
+# URL resolves to the inner loopback relay through --hosts-alias. For a
+# privileged hostname endpoint, the host-side relay restores the authority
+# required by ingress routing. The key is required by the API shape and ignored
+# by the server.
 #
 # compat, both halves earned: max_tokens because a local server implements the
 # older field rather than max_completion_tokens, and the qwen thinking format
@@ -724,7 +724,6 @@ fi
 # and Shift+Tab decide, and pi-agent/settings.json can settle it later.
 jq -n \
     --arg base "http://$BASE_HOST:$IN_PORT$EP_PREFIX" \
-    --arg host "$EP_HOST_HEADER" \
     --arg model "$MODEL" \
     --argjson ctx "$CTX" \
     --argjson maxtok "$MAX_TOKENS" \
@@ -734,7 +733,6 @@ jq -n \
                 baseUrl: $base,
                 api: "openai-completions",
                 apiKey: "sandbox",
-                headers: (if $host == "" then {} else {Host: $host} end),
                 models: [{
                     id: $model,
                     name: ($model + " (local)"),
@@ -941,7 +939,13 @@ fi
 # uid.
 # setsid puts each in a process group of its own, so the trap can take its
 # per-connection children with it. $! is then the group leader.
-setsid socat "UNIX-LISTEN:$SOCK,fork,mode=600" "TCP:$EP_HOST:$EP_PORT" &
+if [[ -n "$EP_HOST_HEADER" ]]; then
+    printf -v relay_exec '%q ' "$FS_PI_NODE" "$REPO_ROOT/scripts/http-host-relay.mjs" \
+        "$EP_HOST" "$EP_PORT" "$EP_HOST_HEADER"
+    setsid socat "UNIX-LISTEN:$SOCK,fork,mode=600" "EXEC:$relay_exec" &
+else
+    setsid socat "UNIX-LISTEN:$SOCK,fork,mode=600" "TCP:$EP_HOST:$EP_PORT" &
+fi
 SOCAT_PID=$!
 
 for _ in $(seq 1 25); do
