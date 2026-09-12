@@ -143,11 +143,13 @@ fleet_read_frontmatter() {
     done <<< "$out"
 }
 
-cmd_resolve() {
-    local name="${1:?Usage: fork-sandbox-fleet.sh resolve <name>}"
+# Core of `resolve`, given an already-computed dump (a caller doing many
+# resolutions, like `roster`, computes the dump once and passes it here
+# instead of paying a full YAML parse per agent).
+resolve_with_dump() {
+    local dump="$1" name="$2"
     fleet_validate_name "$name" || return 1
 
-    local dump; dump="$(fleet_dump)"
     fleet_read_agent "$dump" "$name"
 
     local persona_path="$PERSONAS_DIR/${fleet_persona:-$name.md}"
@@ -166,6 +168,12 @@ cmd_resolve() {
     printf '%s\n' "${fleet_network:-$fm_network}"
     printf '%s\n' "$persona_path"
     printf '%s\n' "${fleet_description:-$fm_description}"
+}
+
+cmd_resolve() {
+    local name="${1:?Usage: fork-sandbox-fleet.sh resolve <name>}"
+    local dump; dump="$(fleet_dump)"
+    resolve_with_dump "$dump" "$name"
 }
 
 fleet_is_list() {
@@ -192,6 +200,11 @@ cmd_expand() {
     IFS=',' read -ra addrs <<< "$input"
     local addr name already existing m
     for addr in "${addrs[@]}"; do
+        # mail_validate_addr_list (fork-sandbox-mail.sh) normalizes stored
+        # To:/Cc: headers as ", "-joined; strip that surrounding
+        # whitespace here so expand can consume its own canonical input.
+        addr="${addr#"${addr%%[![:space:]]*}"}"
+        addr="${addr%"${addr##*[![:space:]]}"}"
         if [[ ! "$addr" =~ $FLEET_ADDR_RE ]]; then
             echo "Error: expand: '$addr' is not a valid address; addresses" >&2
             echo "look like '@name', lowercase alphanumeric and '-' only." >&2
@@ -241,7 +254,7 @@ cmd_roster() {
     local name harness model thinking network persona description
     for name in "${agent_names[@]}"; do
         { read -r harness; read -r model; read -r thinking; read -r network; \
-          read -r persona; read -r description; } < <(cmd_resolve "$name")
+          read -r persona; read -r description; } < <(resolve_with_dump "$dump" "$name")
         printf '  %-20s harness=%-8s model=%-12s thinking=%-8s network=%-8s persona=%s%s\n' \
             "$name" "${harness:--}" "${model:--}" "${thinking:--}" \
             "${network:--}" "$persona" "${description:+  # $description}"

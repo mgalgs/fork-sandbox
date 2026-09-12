@@ -145,6 +145,19 @@ def check_network(value, path, errors):
     return value
 
 
+def check_persona(value, path, errors):
+    """A persona: override names a file directly under personas-dir
+    (<personas-dir>/<name>.md, per the header contract), never a path --
+    an absolute value or one with a '/' would resolve differently on the
+    bash side (plain string concatenation) than here (os.path.join,
+    which silently discards personas_dir for an absolute value)."""
+    if value != os.path.basename(value) or value in (".", ".."):
+        errors.append(f"{path}: must be a bare filename within the "
+                       f"personas directory, not a path, got '{value}'")
+        return ""
+    return value
+
+
 def load_and_validate(fleet_file, label, errors):
     """Returns (agents, lists) dicts, best-effort -- callers only trust
     them when `errors` is still empty afterward."""
@@ -194,7 +207,11 @@ def load_and_validate(fleet_file, label, errors):
         agent = dict.fromkeys(FIELDS, "")
         for prop, value in (props or {}).items():
             path = f"agents.{name}.{prop}"
-            if prop in ("persona", "model", "thinking", "description"):
+            if prop == "persona":
+                v = scalar(value, path, errors)
+                if v is not None:
+                    agent["persona"] = check_persona(v, path, errors)
+            elif prop in ("model", "thinking", "description"):
                 v = scalar(value, path, errors)
                 if v is not None:
                     agent[prop] = v
@@ -317,7 +334,7 @@ def parse_frontmatter(path, label, errors):
 
 def cmd_check(fleet_file, label, personas_dir):
     errors = []
-    agents, _ = load_and_validate(fleet_file, label, errors)
+    agents, lists = load_and_validate(fleet_file, label, errors)
     if not errors:
         for name, agent in agents.items():
             persona_name = agent["persona"] or f"{name}.md"
@@ -327,6 +344,17 @@ def cmd_check(fleet_file, label, personas_dir):
                                f"'{persona_path}' does not exist")
                 continue
             parse_frontmatter(persona_path, persona_path, errors)
+        # The bash side (fleet_is_agent) treats a bare <name>.md under
+        # personas-dir as making `name` an agent even with no fleet.yaml
+        # entry at all -- so a list sharing that name is the same
+        # agent/list collision the check above catches within fleet.yaml,
+        # just with one half of it living on disk instead.
+        for name in lists:
+            persona_path = os.path.join(personas_dir, f"{name}.md")
+            if os.path.isfile(persona_path):
+                errors.append(f"lists.{name}: '{name}' is defined as a "
+                               f"list, but persona file '{persona_path}' "
+                               f"also makes it a valid agent name")
     if errors:
         for e in errors:
             sys.stderr.write(f"Error: {e}\n")

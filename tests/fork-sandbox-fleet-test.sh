@@ -179,6 +179,32 @@ agents:
   ghost: {}
 EOF
 
+bad "absolute persona: value is rejected" "must be a bare filename" <<'EOF'
+agents:
+  riffler:
+    persona: /tmp/elsewhere/x.md
+EOF
+
+bad "persona: value with a subdirectory is rejected" "must be a bare filename" <<'EOF'
+agents:
+  riffler:
+    persona: subdir/x.md
+EOF
+
+cat > "$FORK_SANDBOX_PERSONAS_DIR/collide.md" <<'EOF'
+---
+harness: claude
+---
+EOF
+bad "list name colliding with a persona file is rejected" "also makes it a valid agent name" <<'EOF'
+agents:
+  riffler: {}
+lists:
+  collide:
+    members: [riffler]
+EOF
+rm -f "$FORK_SANDBOX_PERSONAS_DIR/collide.md"
+
 badfile="$FORK_SANDBOX_FLEET_FILE_DIR/bad.yaml"
 cat > "$badfile" <<'EOF'
 agents:
@@ -242,6 +268,10 @@ check "expand: dedup keeps first-seen position" "$(printf '@riffler\n@tuner\n@sc
 
 exp_comma="$("$fleet" expand @tuner,@scout)"
 check "expand: comma-separated input" "$(printf '@tuner\n@scout')" "$exp_comma"
+
+exp_spaced="$("$fleet" expand "@tuner, @scout")"
+check "expand: comma-space-joined input, mail's canonical To:/Cc: form" \
+    "$(printf '@tuner\n@scout')" "$exp_spaced"
 
 refuses "expand: unknown address errors" "$fleet" expand @nobody
 refuses "expand: address without @ is rejected" "$fleet" expand riffler
