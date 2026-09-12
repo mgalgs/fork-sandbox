@@ -222,6 +222,22 @@ mail_stage_attachments() {
     local dir="$thread_dir/attachments"
     local -a names=()
     local f base size
+
+    # Validate every attachment's basename before staging any of them. The
+    # basenames come back '/'-joined (see above) and the callers split them
+    # with `read -ra`, which stops at the first newline -- a newline in a
+    # basename would silently truncate the list, dropping a later
+    # attachment's X-Attachment header. Checking all of them up front means
+    # a refusal here stages zero files and writes no message.
+    for f in "$@"; do
+        base="$(basename -- "$f")"
+        if [[ "$base" == *$'\n'* ]]; then
+            echo "Error: --attach file '$f' has a newline in its basename;" >&2
+            echo "refusing." >&2
+            return 1
+        fi
+    done
+
     for f in "$@"; do
         [[ -f "$f" ]] || { echo "Error: --attach file '$f' not found." >&2; return 1; }
         size="$(wc -c < "$f" | tr -d '[:space:]')"

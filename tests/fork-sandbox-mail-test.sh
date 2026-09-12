@@ -254,6 +254,56 @@ else
 fi
 contains "the collision refusal names the colliding path" "$out" "attachments/shot.png"
 
+printf '\n== attachments: multiple clean attachments ==\n'
+
+echo "file a" > attach-a.txt
+echo "file b" > attach-b.txt
+multi_id="$("$mail" send --from @alice --to @bob --subject "Two attachments" --body - \
+    --attach attach-a.txt --attach attach-b.txt <<< "see both" 2>diag.txt)"
+rc=$?
+check "send with two --attach exits 0" "0" "$rc"
+raw_multi="$("$mail" show "$multi_id")"
+check "one X-Attachment header per file" "2" \
+    "$(grep -c '^X-Attachment:' <<< "$raw_multi")"
+contains "X-Attachment header names the first file" "$raw_multi" "X-Attachment: attachments/attach-a.txt"
+contains "X-Attachment header names the second file" "$raw_multi" "X-Attachment: attachments/attach-b.txt"
+
+printf '\n== attachments: a newline in the basename is refused ==\n'
+
+# `read -ra` (used to split the '/'-joined staged-basename list back apart)
+# stops at the first newline, so a newline inside a basename would
+# silently truncate that list and drop a later attachment's header.
+nl_file="$work/$(printf 'evil\nname.txt')"
+printf 'content\n' > "$nl_file"
+
+msgs_before="$(find "$FORK_SANDBOX_MAIL_ROOT" -name '*.msg' | wc -l)"
+attach_files_before="$(find "$FORK_SANDBOX_MAIL_ROOT" -path '*/attachments/*' -type f | wc -l)"
+
+out="$("$mail" send --from @alice --to @bob --subject "NL attach" --body - --attach "$nl_file" <<< "x" 2>&1)"
+rc=$?
+if (( rc != 0 )); then
+    ok "send refuses an attachment with a newline in its basename"
+else
+    no "send refuses an attachment with a newline in its basename" "it succeeded"
+fi
+check "the refused send wrote no new message" "$msgs_before" \
+    "$(find "$FORK_SANDBOX_MAIL_ROOT" -name '*.msg' | wc -l)"
+check "the refused send staged no attachment" "$attach_files_before" \
+    "$(find "$FORK_SANDBOX_MAIL_ROOT" -path '*/attachments/*' -type f | wc -l)"
+
+reply_msgs_before="$(find "$FORK_SANDBOX_MAIL_ROOT/threads/$att_id" -maxdepth 1 -name '*.msg' | wc -l)"
+out="$("$mail" reply --from @bob --reply-to "$att_id" --body - --attach "$nl_file" <<< "x" 2>&1)"
+rc=$?
+if (( rc != 0 )); then
+    ok "reply refuses an attachment with a newline in its basename"
+else
+    no "reply refuses an attachment with a newline in its basename" "it succeeded"
+fi
+check "the refused reply wrote no new message in the thread" "$reply_msgs_before" \
+    "$(find "$FORK_SANDBOX_MAIL_ROOT/threads/$att_id" -maxdepth 1 -name '*.msg' | wc -l)"
+check "the refused reply staged no attachment" "$attach_files_before" \
+    "$(find "$FORK_SANDBOX_MAIL_ROOT" -path '*/attachments/*' -type f | wc -l)"
+
 printf '\n== show on a missing id ==\n'
 
 refuses "show fails on an id that matches nothing" "$mail" show "not-a-real-id"
