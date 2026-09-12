@@ -220,15 +220,17 @@ mail_find_by_id() {
 mail_stage_attachments() {
     local thread_dir="$1"; shift
     local dir="$thread_dir/attachments"
-    local -a names=()
-    local f base size
+    local -a names=() seen_bases=() seen_files=()
+    local f base size i
 
-    # Validate every attachment's basename before staging any of them. The
-    # basenames come back '/'-joined (see above) and the callers split them
-    # with `read -ra`, which stops at the first newline -- a newline in a
-    # basename would silently truncate the list, dropping a later
-    # attachment's X-Attachment header. Checking all of them up front means
-    # a refusal here stages zero files and writes no message.
+    # Validate every attachment before staging any of them: basename
+    # (newline), existence, size cap, collision against a file already
+    # staged by an earlier message in this thread, and collision against
+    # another --attach in *this* invocation sharing the same basename.
+    # None of these checks depends on a prior `cp`, so running them all
+    # up front means a refusal here stages zero files and writes no
+    # message -- no half-copied attachments left behind to poison a later,
+    # unrelated message with the same basename.
     for f in "$@"; do
         base="$(basename -- "$f")"
         if [[ "$base" == *$'\n'* ]]; then
@@ -236,9 +238,6 @@ mail_stage_attachments() {
             echo "refusing." >&2
             return 1
         fi
-    done
-
-    for f in "$@"; do
         [[ -f "$f" ]] || { echo "Error: --attach file '$f' not found." >&2; return 1; }
         size="$(wc -c < "$f" | tr -d '[:space:]')"
         if (( size > MAIL_ATTACH_MAX_BYTES )); then
@@ -246,14 +245,27 @@ mail_stage_attachments() {
             echo "$MAIL_ATTACH_MAX_BYTES byte (4 MiB) cap." >&2
             return 1
         fi
-        mkdir -p -- "$dir"
-        base="$(basename -- "$f")"
         if [[ -e "$dir/$base" ]] && ! cmp -s -- "$f" "$dir/$base"; then
             echo "Error: --attach '$f' would overwrite attachments/$base," >&2
             echo "which already holds different content staged by an earlier" >&2
             echo "message in this thread. Rename the file and retry." >&2
             return 1
         fi
+        for ((i = 0; i < ${#seen_bases[@]}; i++)); do
+            if [[ "${seen_bases[i]}" == "$base" ]] && ! cmp -s -- "$f" "${seen_files[i]}"; then
+                echo "Error: --attach '$f' and '${seen_files[i]}' both map to" >&2
+                echo "attachments/$base but have different content; they were" >&2
+                echo "given together in this command. Rename one and retry." >&2
+                return 1
+            fi
+        done
+        seen_bases+=("$base")
+        seen_files+=("$f")
+    done
+
+    for f in "$@"; do
+        base="$(basename -- "$f")"
+        mkdir -p -- "$dir"
         cp -f -- "$f" "$dir/$base"
         names+=("$base")
     done

@@ -256,17 +256,17 @@ contains "the collision refusal names the colliding path" "$out" "attachments/sh
 
 printf '\n== attachments: multiple clean attachments ==\n'
 
-echo "file a" > attach-a.txt
-echo "file b" > attach-b.txt
+echo "file a" > "attach,a.txt"
+echo "file b" > "attach b.txt"
 multi_id="$("$mail" send --from @alice --to @bob --subject "Two attachments" --body - \
-    --attach attach-a.txt --attach attach-b.txt <<< "see both" 2>diag.txt)"
+    --attach "attach,a.txt" --attach "attach b.txt" <<< "see both" 2>diag.txt)"
 rc=$?
 check "send with two --attach exits 0" "0" "$rc"
 raw_multi="$("$mail" show "$multi_id")"
 check "one X-Attachment header per file" "2" \
     "$(grep -c '^X-Attachment:' <<< "$raw_multi")"
-contains "X-Attachment header names the first file" "$raw_multi" "X-Attachment: attachments/attach-a.txt"
-contains "X-Attachment header names the second file" "$raw_multi" "X-Attachment: attachments/attach-b.txt"
+contains "X-Attachment header names the first file (basename has a comma)" "$raw_multi" "X-Attachment: attachments/attach,a.txt"
+contains "X-Attachment header names the second file (basename has a space)" "$raw_multi" "X-Attachment: attachments/attach b.txt"
 
 printf '\n== attachments: a newline in the basename is refused ==\n'
 

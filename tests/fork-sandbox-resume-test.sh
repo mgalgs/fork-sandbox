@@ -923,7 +923,7 @@ unrelated_fail_out="$(printf 'the prompt\n' \
       CLAUDE_FAIL_MESSAGE="Error: unrelated tool failure (session id: not the resume marker)" \
       timeout 60 "$wrapper" --session-state "$cs_state" \
       --resume-session "$cs_sid" \
-      "$(mktemp -d "$scratch/forks/fs-resume-work.XXXXXX")" --print 2>&1)"
+      "$(mktmp_dir "$scratch/forks/fs-resume-work.XXXXXX")" --print 2>&1)"
 unrelated_fail_rc=$?
 if (( $(grep -cx -- '--- attempt end ---' "$unrelated_fail_argv") == 1 )); then
     ok "an unrelated 'session id:' mention does NOT retry"
