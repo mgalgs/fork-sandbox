@@ -1,22 +1,29 @@
 #!/usr/bin/env bash
-# fork-sandbox-inbox-hook.sh — Deliver fork-sandbox operator-inbox addenda, and a context-refresh nudge, to a running claude session
+# fork-sandbox-inbox-hook.sh — Deliver fork-sandbox operator-inbox addenda, mid-session mail banners, and a context-refresh nudge, to a running claude session
 #
 # Usage: not run by hand. fork-sandbox.sh copies this into a run's inbox and
 #        registers it as a Claude Code hook for PostToolUse and Stop.
 #
 # The operator inbox is a host-written, sandbox-read-only directory. An
-# operator drops a file into it with fork-sandbox-say.sh; this script is what
-# puts that file in front of the running session.
+# operator drops a file into it with fork-sandbox-say.sh; the postmaster
+# drops a mail-banner-*.md file into it (fork-sandbox-postmaster.sh's rule 4,
+# pm_deliver_live) when mail arrives addressed to this run's agent on the
+# same thread it was woken for. This script is what puts either kind of file
+# in front of the running session.
 #
-#   PostToolUse  every unread addendum is emitted as
+#   PostToolUse  every unread addendum or mail banner is emitted as
 #                hookSpecificOutput.additionalContext, which Claude Code
-#                places next to the tool result. So an addendum reaches the
-#                session on its very next tool call, with no cooperation from
-#                the session itself.
-#   Stop         unread addenda block the stop with decision/reason, so an
-#                agent that has gone quiet and is about to finish gets them
-#                too. This is the delivery guarantee: a session cannot end
-#                with an addendum unread.
+#                places next to the tool result. So it reaches the session
+#                on its very next tool call, with no cooperation from the
+#                session itself. A mail banner's context is banner-only: a
+#                one-line summary (short-id, From, Subject, a body preview)
+#                plus the in-sandbox path of the full rendered thread — the
+#                thread file's content is never injected, reading it is the
+#                agent's own choice.
+#   Stop         unread addenda AND unread mail banners both block the stop
+#                with decision/reason, so an agent that has gone quiet and is
+#                about to finish gets them too. This is the delivery
+#                guarantee: a session cannot end with either kind unread.
 #
 # Both contracts are the documented ones (code.claude.com/docs/en/hooks):
 # PostToolUse takes hookSpecificOutput.hookEventName + additionalContext, and

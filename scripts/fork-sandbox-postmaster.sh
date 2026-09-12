@@ -69,9 +69,19 @@
 #      and via a list) wakes once. An agent already running a wake for
 #      thread T (a live, not-yet-harvested run) does not get a second
 #      spawn -- the new message-id is recorded on that run as a pending
-#      message; after harvesting that run's reply, rules 2-3 are
-#      re-checked and a follow-up wake is spawned for the newest pending
-#      message if they still pass.
+#      message (as always, for the fallback below), AND delivered LIVE
+#      into that run's own inbox dir (pm_deliver_live): a banner
+#      (short-id, From, Subject, a sanitized body preview) plus the full
+#      re-rendered thread, written for the run's existing inbox hook to
+#      surface -- no budget spent, no second spawn. Live delivery is
+#      scoped strictly to the (agent, thread) the run is already live
+#      for; mail for the same agent on a different thread is unaffected
+#      by this rule and spawns its own wake as usual. At harvest, if the
+#      events log shows the banner was actually delivered (the hook's own
+#      stderr tag), the pending record is just a note (pm_ledger_delivered_live);
+#      otherwise -- the hook never fired again, or the wake died first --
+#      rules 2-3 are re-checked and a follow-up wake is spawned for the
+#      newest pending message exactly as before live delivery existed.
 #
 # THE WAKE
 #
@@ -130,12 +140,17 @@
 # file (fork-sandbox.sh's last artifact, written after run_cleanup and the
 # branch fetch-back), or its pid has gone dead without one ever landing
 # (see pm_wake_is_dead) -- the harvester posts each mail-*.md via
-# fork-sandbox-mail.sh as
-# --from @<agent>, passing --hops explicitly as (trigger's X-Hops - 1) on
+# fork-sandbox-mail.sh as --from @<agent>, passing --hops explicitly on
 # BOTH the ordinary reply path and the new-thread path -- `mail.sh reply`
 # takes a --hops override for exactly this (round 3 is this script, per
-# fork-sandbox-mail.sh's own header comment). A non-zero exit code, and a
-# wake that died without ever writing summary.json, are both harvested
+# fork-sandbox-mail.sh's own header comment). The hops value is one less
+# than the ACTUAL PARENT's X-Hops, not always the wake's trigger: when
+# Reply-To-Id names a message other than the trigger and that message
+# resolves in the store, its X-Hops is what gets decremented (live
+# delivery makes replying to a newer message than the trigger the common
+# case); a Reply-To-Id of "new" or the trigger itself, or one that does
+# not resolve, falls back to the trigger's own X-Hops. A non-zero exit
+# code, and a wake that died without ever writing summary.json, are both harvested
 # the same as a zero exit code (their outbox, if any, is still posted)
 # but also flag the thread, since an empty outbox from a crashed wake is
 # not the documented "no reply is a valid outcome" and needs an
@@ -180,8 +195,15 @@
 #                                   launched to resume, empty for a fresh
 #                                   one -- what `status` prints in its
 #                                   session column), PENDING_MSGS (comma
-#                                   list, may be empty)
+#                                   list, may be empty), MAIL_SEQ (the next
+#                                   live-delivery sequence number for this
+#                                   run, see pm_next_mail_seq)
 #   harvested/<run-id>             marker: this run's outbox is collected
+#   delivered-live/<thread-id>     one line per message rule 4 confirmed
+#                                   was delivered live at harvest (agent,
+#                                   message-id, run-id) -- an audit trail
+#                                   for the routing decision, not read back
+#                                   by anything (pm_ledger_delivered_live)
 #   needs-operator/<thread-id>     flag file; content is the reason
 #   spawns/<thread-id>             one line appended per spawn, reset to
 #                                   empty by rule 1 -- line count is the
