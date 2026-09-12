@@ -171,8 +171,10 @@ list_unread() {
     for f in "$inbox"/*.md; do
         [[ -f "$f" ]] || continue
         name="${f##*/}"
-        # A generated name holds only digits, hyphens, and '.md', so it can
-        # carry no glob metacharacter and this match is exact.
+        # $name is quoted, so this match is exact regardless of what
+        # characters it holds: quoting a variable on the right-hand side of
+        # [[ ... == ... ]] disables glob-pattern matching for it, unlike an
+        # unquoted or literal right-hand side.
         [[ "$blob" == *$'\n'"$name"$'\n'* ]] && continue
         case "$name" in
             mail-banner-*) unread_mail+=("$name") ;;

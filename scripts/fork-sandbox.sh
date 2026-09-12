@@ -5665,27 +5665,41 @@ rm -f "$run_dir/exit-code"
 # nothing should ever put one there, but archiving is a move, and following
 # a link out of the inbox is not a mistake worth making possible.
 #
-# 'mail-banner-*.md' (fork-sandbox-postmaster.sh's pm_deliver_live) is also
-# skipped, deliberately: everything else this function moves is re-emitted to
-# a continuation leg as an "operator addendum ... carries the same authority
-# as the brief and outranks it" (see refresh_build_prompt), which is true of
-# an addendum and false of a mail banner -- it is new thread information from
-# the postmaster, not an operator instruction. Leaving it in place means the
-# next leg's own inbox hook re-surfaces it, unread, through the hook's
-# separate mail_provenance/mail_authority framing instead -- the same
-# delivery guarantee, with the correct authority attached.
+# 'mail-banner-*.md' (fork-sandbox-postmaster.sh's pm_deliver_live) is moved
+# too, but into a SEPARATE destination, mail-delivered/leg-<N>/ rather than
+# inbox-delivered/leg-<N>/: it must leave the live inbox exactly like an
+# addendum does -- this run's inbox_dir is the same read-only bind every leg's
+# sandbox gets, so a banner left behind would sit there for the next leg's
+# fresh /tmp (a fresh seen-list) to re-read and re-deliver, unread, through
+# the hook all over again. But it must NOT come back through
+# fs_addenda_dirs/refresh_build_prompt (or the review/maintainer loops' own
+# copies of that logic), which reads every '*.md' under inbox-delivered/ back
+# as an "operator addendum ... carries the same authority as the brief and
+# outranks it" -- true of an addendum, false of a mail banner, which is new
+# thread information from the postmaster, not an operator instruction, and
+# which this same leg's Stop hook already confirmed was delivered before this
+# function ever runs. A separate directory nothing reads back satisfies both:
+# gone from the live inbox, and never re-surfaced under the wrong authority.
 fs_archive_inbox() {
-    local leg_no="$1" leg_harness="$2" leg_rc="$3" inbox_dir="$run_dir/inbox" dest="" f moved=0
+    local leg_no="$1" leg_harness="$2" leg_rc="$3" inbox_dir="$run_dir/inbox" \
+        dest="" mail_dest="" f moved=0
     [[ "$leg_harness" == "claude" && "$leg_rc" == "0" ]] || return 0
     for f in "$inbox_dir"/*.md; do
         [[ -e "$f" || -L "$f" ]] || continue
-        [[ "${f##*/}" == mail-banner-* ]] && continue
         if [[ -L "$f" ]]; then
             printf 'fork-sandbox: %s is a symlink; refusing to archive it.\n' "$f" \
                 >> "$sandbox_log"
             continue
         fi
         [[ -f "$f" ]] || continue
+        if [[ "${f##*/}" == mail-banner-* ]]; then
+            if [[ -z "$mail_dest" ]]; then
+                mail_dest="$run_dir/mail-delivered/leg-$leg_no"
+                mkdir -p "$mail_dest"
+            fi
+            mv -f -- "$f" "$mail_dest/"
+            continue
+        fi
         if (( ! moved )); then
             dest="$run_dir/inbox-delivered/leg-$leg_no"
             mkdir -p "$dest"

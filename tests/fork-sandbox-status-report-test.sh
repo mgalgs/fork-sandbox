@@ -468,4 +468,18 @@ if (( rc == 0 )); then echo "events-code-x.jsonl was accepted (rc=0)"; exit 1; f
     || { echo "no refusal for a malformed code leg name: $out"; exit 1; }
 [[ "$out" != *"should not appear"* ]] || { echo "malformed code leg file was read: $out"; exit 1; }
 
-echo "27 passed, 0 failed"
+# 10. inbox_count skips mail-banner-* files -- a postmaster mail notice, not
+# an operator addendum -- both while still live in inbox/ and after
+# fs_archive_inbox has moved it out (the addendum still gets one; the
+# banner sitting beside it in the same directories does not).
+new_run_dir
+mkdir -p "$rd_new/inbox" "$rd_new/inbox-delivered/leg-1"
+printf 'an operator addendum\n' > "$rd_new/inbox/1700000000-01.md"
+printf 'mail banner text\n' > "$rd_new/inbox/mail-banner-001-deadbeef.md"
+printf 'an archived addendum\n' > "$rd_new/inbox-delivered/leg-1/1699999999-01.md"
+printf 'archived mail banner text\n' > "$rd_new/inbox-delivered/leg-1/mail-banner-002-deadbeef.md"
+out="$(timeout 12 "$status" "$rd_new" 2>&1)"
+[[ "$out" == *"inbox:    2 addenda"* ]] \
+    || { echo "inbox_count counted a mail banner as an addendum: $out"; exit 1; }
+
+echo "28 passed, 0 failed"

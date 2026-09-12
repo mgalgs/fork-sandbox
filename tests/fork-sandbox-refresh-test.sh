@@ -277,8 +277,8 @@ cat > "$stub_bin/claude-sandboxed" <<'STUB'
 # loop reacts to. Which invocation this is (1 = implement leg, 2 = first
 # continuation, ...) comes from a counter file so a scenario can control each
 # leg independently; FAKE_NUDGE_LEGS, FAKE_HANDOFF_LEGS, FAKE_SYMLINK_LEGS,
-# FAKE_FAIL_LEGS, FAKE_STALE_LEGS and FAKE_ADDENDUM_LEGS are comma lists of
-# leg numbers (or the literal "all"), read fresh per call.
+# FAKE_FAIL_LEGS, FAKE_STALE_LEGS, FAKE_ADDENDUM_LEGS and FAKE_MAIL_BANNER_LEGS
+# are comma lists of leg numbers (or the literal "all"), read fresh per call.
 set -uo pipefail
 
 outbox=""
@@ -311,6 +311,20 @@ if [[ -n "$outbox" ]] \
     if [[ -d "$run_dir_for_addendum/inbox" ]]; then
         printf 'operator addendum for leg %s\n' "$n" \
             > "$run_dir_for_addendum/inbox/9999999900-0$n.md"
+    fi
+fi
+
+# Same trick for a mail banner: fork-sandbox-postmaster.sh's pm_deliver_live
+# writes 'mail-banner-<nnn>-<shortid>.md' into a live run's own inbox, so the
+# stub drops one in the same shape to exercise fs_archive_inbox's separate
+# handling of it.
+mail_banner_legs=",${FAKE_MAIL_BANNER_LEGS:-},"
+if [[ -n "$outbox" ]] \
+    && { [[ "${FAKE_MAIL_BANNER_LEGS:-}" == "all" ]] || [[ "$mail_banner_legs" == *",$n,"* ]]; }; then
+    run_dir_for_banner="$(dirname "$outbox")"
+    if [[ -d "$run_dir_for_banner/inbox" ]]; then
+        printf 'mail banner for leg %s\n' "$n" \
+            > "$run_dir_for_banner/inbox/mail-banner-00$n-deadbeef.md"
     fi
 fi
 
@@ -386,6 +400,7 @@ run_real() {
         FAKE_FAIL_LEGS="${FAKE_FAIL_LEGS:-}" \
         FAKE_STALE_LEGS="${FAKE_STALE_LEGS:-}" \
         FAKE_ADDENDUM_LEGS="${FAKE_ADDENDUM_LEGS:-}" \
+        FAKE_MAIL_BANNER_LEGS="${FAKE_MAIL_BANNER_LEGS:-}" \
         timeout 60 "$launcher" --foreground --harness claude "$@" \
         "$proj" "$handoff" 2>&1)"
     rc=$?
@@ -519,6 +534,84 @@ if [[ -n "$rd" ]]; then
         no "the continuation prompt carries the addendum's own file name" "no continuation prompt"
         no "the continuation prompt carries the addendum's text" "no continuation prompt"
         no "the addenda heading sits between the brief and the hand-off" "no continuation prompt"
+    fi
+fi
+
+# -- a mail banner delivered to leg 1 alongside an addendum: both must leave
+# inbox/ once leg 1 ends (a fresh leg-2 sandbox binds the same inbox_dir with
+# a fresh, empty seen-list, so anything left behind is re-delivered from
+# scratch), but only the addendum may come back as an "operator addendum"
+# in leg 2's continuation prompt -- the banner is new thread information
+# from the postmaster, not an operator instruction, and by the time
+# fs_archive_inbox runs the Stop hook has already confirmed it was shown to
+# leg 1 once, so it needs no re-surfacing at all.
+count_file="$(mktemp)"; tmpdirs+=("$count_file")
+FAKE_ADDENDUM_LEGS=1
+FAKE_MAIL_BANNER_LEGS=1
+rd="$(run_real "$proj" "$count_file" 1 1 --refresh-at 0.5)"
+FAKE_ADDENDUM_LEGS=""
+FAKE_MAIL_BANNER_LEGS=""
+[[ -n "$rd" ]] && tmpdirs+=("$rd")
+if [[ -n "$rd" ]]; then
+    leftover="$(find "$rd/inbox" -maxdepth 1 -name '*.md' 2>/dev/null | wc -l | tr -d ' ')"
+    check "the mail banner and the addendum both leave inbox/ once leg 1 ends" \
+        "0" "$leftover"
+    banner_archived="$(find "$rd/mail-delivered/leg-1" -maxdepth 1 \
+        -name 'mail-banner-*' 2>/dev/null | head -1)"
+    if [[ -n "$banner_archived" ]]; then
+        ok "mail-delivered/leg-1 holds the banner"
+        contains "the archived banner keeps its text" \
+            "mail banner for leg 1" "$(cat "$banner_archived")"
+    else
+        no "mail-delivered/leg-1 holds the banner"
+        no "the archived banner keeps its text"
+    fi
+    banner_in_inbox_delivered="$(find "$rd/inbox-delivered/leg-1" -maxdepth 1 \
+        -name 'mail-banner-*' 2>/dev/null | head -1)"
+    check "the banner is not archived under inbox-delivered/leg-1 too" \
+        "" "$banner_in_inbox_delivered"
+    status_out="$("$repo_dir/scripts/fork-sandbox-status.sh" "$rd" 2>/dev/null)"
+    contains "fork-sandbox-status.sh counts the addendum but not the banner" \
+        "inbox:    1 addenda" "$status_out"
+    cont_prompt="$rd/continuation-prompt-1.md"
+    if [[ -f "$cont_prompt" ]]; then
+        contains "the continuation prompt still carries the addendum" \
+            "operator addendum for leg 1" "$(cat "$cont_prompt")"
+        # The static header's generic "a file named mail-banner-* ..."
+        # sentence is expected in every continuation prompt -- this checks
+        # for THIS banner's own file name and body text, not that mention.
+        if grep -q 'mail-banner-001-deadbeef\.md\|mail banner for leg 1' "$cont_prompt"; then
+            no "the continuation prompt carries no trace of the mail banner"
+        else
+            ok "the continuation prompt carries no trace of the mail banner"
+        fi
+    else
+        no "the continuation prompt still carries the addendum" "no continuation prompt"
+        no "the continuation prompt carries no trace of the mail banner" "no continuation prompt"
+    fi
+fi
+
+# -- a mail banner delivered to leg 1 with no addendum at all: still leaves
+# inbox/ (so it cannot be re-delivered to leg 2), and the continuation
+# prompt gets no addenda heading at all, since there is nothing to embed.
+count_file="$(mktemp)"; tmpdirs+=("$count_file")
+FAKE_MAIL_BANNER_LEGS=1
+rd="$(run_real "$proj" "$count_file" 1 1 --refresh-at 0.5)"
+FAKE_MAIL_BANNER_LEGS=""
+[[ -n "$rd" ]] && tmpdirs+=("$rd")
+if [[ -n "$rd" ]]; then
+    leftover="$(find "$rd/inbox" -maxdepth 1 -name '*.md' 2>/dev/null | wc -l | tr -d ' ')"
+    check "a lone mail banner still leaves inbox/ once leg 1 ends" "0" "$leftover"
+    cont_prompt="$rd/continuation-prompt-1.md"
+    if [[ -f "$cont_prompt" ]]; then
+        if grep -q '## Operator addenda delivered to earlier legs' "$cont_prompt"; then
+            no "a lone mail banner adds no addenda heading to the continuation prompt"
+        else
+            ok "a lone mail banner adds no addenda heading to the continuation prompt"
+        fi
+    else
+        no "a lone mail banner adds no addenda heading to the continuation prompt" \
+            "no continuation prompt"
     fi
 fi
 

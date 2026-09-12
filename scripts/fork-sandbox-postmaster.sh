@@ -155,7 +155,11 @@
 # resolves in the store, its X-Hops is what gets decremented (live
 # delivery makes replying to a newer message than the trigger the common
 # case); a Reply-To-Id of "new" or the trigger itself, or one that does
-# not resolve, falls back to the trigger's own X-Hops. A non-zero exit
+# not resolve, falls back to the trigger's own X-Hops -- and so does a
+# parent that DOES resolve but whose X-Hops exceeds the trigger's: hops
+# only ever go down a thread, so naming an ancestor further up than the
+# trigger can only raise the budget, and the fallback clamps that back
+# down to the trigger's own hops rather than letting it through. A non-zero exit
 # code, and a wake that died without ever writing summary.json, are both harvested
 # the same as a zero exit code (their outbox, if any, is still posted)
 # but also flag the thread, since an empty outbox from a crashed wake is
