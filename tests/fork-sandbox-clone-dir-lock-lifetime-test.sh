@@ -47,6 +47,7 @@ fail=0
 tmpdirs=()
 tmux_socket=""
 tmux_socket2=""
+tmux_socket3=""
 
 cleanup() {
     local d
@@ -55,6 +56,9 @@ cleanup() {
     fi
     if [[ -n "$tmux_socket2" ]]; then
         "$real_tmux" -L "$tmux_socket2" kill-server >/dev/null 2>&1 || true
+    fi
+    if [[ -n "$tmux_socket3" ]]; then
+        "$real_tmux" -L "$tmux_socket3" kill-server >/dev/null 2>&1 || true
     fi
     for d in "${tmpdirs[@]-}"; do
         [[ -n "$d" && -e "$d" ]] && rm -rf -- "$d"
@@ -314,6 +318,78 @@ else
         no "the lock is still held between run_cleanup and the fetch-back" \
             "no run dir to probe"
     fi
+fi
+
+# ---------------------------------------------------------------------------
+printf '\n== fork-sandbox.sh: the lock fd does not leak into sandbox invocations ==\n'
+# ---------------------------------------------------------------------------
+# Regression test for the bug where `exec {clone_lock_fd}<>...` had no
+# close-on-exec, so every claude-sandboxed/bwrap invocation inherited the
+# open, locked fd -- an orphaned descendant (a wedged sandbox, a `setsid`
+# child that outlives its parent) then kept the flock held forever, which is
+# exactly what fs_run_lock_closed (see its comment above the function in
+# fork-sandbox.sh) exists to prevent. The stub claude-sandboxed below, standing
+# in for every sandbox invocation the run makes, inspects its own
+# /proc/self/fd for anything pointing at a file named "fork-sandbox-lock" and
+# logs what it found; a leaked fd would show up there since a close-then-exec
+# subshell is the only thing standing between the runner's open fd and this
+# child's inherited copy of it.
+
+leak_dir="$(mktmp_dir "$scratch/fs-locklife-leak.XXXXXX")"
+leak_log="$leak_dir/leak.log"
+: > "$leak_log"
+cat > "$stub_bin/claude-sandboxed" <<STUB
+#!/usr/bin/env bash
+cat >/dev/null
+if readlink /proc/self/fd/* 2>/dev/null | grep -q fork-sandbox-lock; then
+    echo LEAKED >> "$leak_log"
+else
+    echo CLEAN >> "$leak_log"
+fi
+exit 0
+STUB
+chmod +x "$stub_bin/claude-sandboxed"
+
+tmux_socket3="fs-locklife3-$$"
+export FS_TEST_TMUX_SOCKET="$tmux_socket3"
+"$real_tmux" -L "$tmux_socket3" new-session -d -s keepalive -- sleep 120
+
+home3="$(mktmp_dir "$scratch/fs-locklife-home3.XXXXXX")"
+proj3="$(new_project "$home3")"
+clone3="$(mktmp_dir "$scratch/fs-locklife-clone3.XXXXXX")"
+rmdir "$clone3"
+cfg3="$(mktmp_dir "$scratch/fs-locklife-cfg3.XXXXXX")"
+handoff_dir3="$(mktmp_dir "$scratch/fs-locklife-ho3.XXXXXX")"
+handoff3="$handoff_dir3/handoff.md"
+printf 'do the task\n' > "$handoff3"
+
+launch_out3="$(HOME="$home3" PATH="$stub_bin:$PATH" FORK_SANDBOX_CONFIG_DIR="$cfg3" \
+    timeout 60 "$launcher" --harness claude --branch fs-locklife-b3 \
+    --clone-dir "$clone3" "$proj3" "$handoff3" 2>&1)"
+run_dir3="$(printf '%s\n' "$launch_out3" | sed -n 's/^  run dir:  *//p' | head -1)"
+
+if [[ -n "$run_dir3" ]]; then
+    for _ in $(seq 1 100); do
+        [[ -s "$run_dir3/exit-code" ]] && break
+        sleep 0.1
+    done
+
+    if [[ -s "$run_dir3/exit-code" ]] && [[ -s "$leak_log" ]]; then
+        ok "at least one sandbox invocation ran and reported its fd state"
+    else
+        no "at least one sandbox invocation ran and reported its fd state" \
+            "no exit-code, or the stub never logged anything"
+    fi
+
+    if grep -q LEAKED "$leak_log"; then
+        no "no sandbox invocation inherits the workspace lock fd" \
+            "at least one invocation found an open fd pointing at fork-sandbox-lock"
+    else
+        ok "no sandbox invocation inherits the workspace lock fd"
+    fi
+else
+    no "at least one sandbox invocation ran and reported its fd state" "no run dir to probe"
+    no "no sandbox invocation inherits the workspace lock fd" "no run dir to probe"
 fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
