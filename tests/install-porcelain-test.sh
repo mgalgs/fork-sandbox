@@ -104,15 +104,19 @@ for name in "${porcelain[@]}" "${plumbing[@]}"; do
     fi
 done
 
-# --- Case 10: the four load-bearing porcelain names, before anything else
+# --- Case 10: the five load-bearing porcelain names, before anything else
 # risks masking their absence behind a green run of the cases above.
+# fork-sandbox-lib.sh is here because it reads as plumbing and was once
+# classified that way: every script IN this repo reaches it through its own
+# script_dir, but an out-of-repo consumer sources it by bare PATH name and
+# hard-fails when the link is pruned.
 
 echo "== load-bearing porcelain names are protected =="
-for name in ensure-scratch-dirs.sh sandbox-run-log.py claude-sandboxed agent-sandboxed; do
+for name in ensure-scratch-dirs.sh sandbox-run-log.py claude-sandboxed agent-sandboxed fork-sandbox-lib.sh; do
     if in_list "$name" "${porcelain[@]}"; then
         ok "$name stays in PORCELAIN (regression guard: it is reached by bare name or hardcoded path, not script_dir)"
     else
-        no "$name stays in PORCELAIN" "$name must be in PORCELAIN — it is reached by a bare-name hook invocation or a hardcoded \$HOME/.claude/scripts path, not script_dir, so unlinking it silently breaks a running machine"
+        no "$name stays in PORCELAIN" "$name must be in PORCELAIN — it is reached by a bare-name invocation or source, or a hardcoded \$HOME/.claude/scripts path, not script_dir, so unlinking it silently breaks a running machine"
     fi
 done
 

@@ -298,6 +298,7 @@ PORCELAIN=(
     fork-sandbox
     fork-sandbox-fleet.sh
     fork-sandbox-k8s.sh
+    fork-sandbox-lib.sh       # sourced by bare PATH name from outside this repo (fork-task.sh), which has no script_dir to search from
     fork-sandbox-mail-render.py
     fork-sandbox-mail.sh
     fork-sandbox-postmaster.sh
@@ -324,7 +325,6 @@ PLUMBING=(
     fork-sandbox-k8s-platform-generic
     fork-sandbox-k8s-review-loop.sh
     fork-sandbox-k8s-services-parse.py
-    fork-sandbox-lib.sh
     fork-sandbox-preset-parse.py
     sandbox-backend-bwrap
     sandbox-backend-container
@@ -334,6 +334,14 @@ PLUMBING=(
 # fork-sandbox-lib.sh and fork-sandbox.sh. agent-sandboxed is hardcoded the
 # same way in fork-sandbox.sh (pi-sandboxed is a repo symlink to it). Both
 # require the link to exist at that exact path, not just somewhere on PATH.
+#
+# fork-sandbox-lib.sh looks like plumbing -- every script in this repo reaches
+# it through its own script_dir -- and was classified that way once. It is
+# not: fork-task.sh lives outside this repo, has no script_dir into this
+# checkout to search from, and sources the lib by bare PATH name, so it
+# hard-fails the moment the link is pruned. That is exactly the porcelain
+# test ("something has to find this WITHOUT a script_dir"), which is why the
+# name is in PORCELAIN above and guarded by tests/install-porcelain-test.sh.
 
 # Fail closed: every regular file (or symlink to one) in scripts/ must be in
 # exactly one list, and every name in a list must exist in scripts/. This

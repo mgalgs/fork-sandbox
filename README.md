@@ -469,7 +469,7 @@ gets out of the way, so `fork-sandbox status --result <run-dir>` and
 `fork-sandbox-status.sh --result <run-dir>` are the same command. Both
 spellings work — the verbs keep one name on your PATH instead of seven. Each
 prints its full doc with `--help`, and a `--help` after a verb reaches the
-underlying script. Everything not listed here — `fork-sandbox-lib.sh`, the
+underlying script. Everything not listed here — the `*-parse.py` helpers, the
 pod-side k8s scripts, `sandbox-backend-*` — is plumbing, reached through the
 calling script's own directory rather than by typing its name.
 
