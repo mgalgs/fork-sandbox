@@ -691,7 +691,7 @@ fi
 # with session ID: <uuid>"); the rest cover a transcript that is present but
 # unreadable. Deliberately narrow: a false positive here reruns a session
 # that already did its work, at full price.
-RESUME_FAIL_RE='no conversation found|session id:|corrupt.*(session|transcript|conversation)|failed to (load|parse|read).*(session|transcript|conversation)'
+RESUME_FAIL_RE='no conversation found with session id:|corrupt.*(session|transcript|conversation)|failed to (load|parse|read).*(session|transcript|conversation)'
 
 # The prompt arrives on stdin — it is too large for an argv — and the first
 # attempt consumes it, so a retry would hand claude an empty prompt. Buffer

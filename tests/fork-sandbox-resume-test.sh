@@ -908,6 +908,34 @@ else
     no "a non-resume failure keeps its exit code" "$plain_fail_out"
 fi
 
+# A failure that merely mentions "session id:" -- but not the CLI's actual
+# "No conversation found with session ID:" phrasing -- must not be treated
+# as resume-shaped either. RESUME_FAIL_RE used to carry a bare "session
+# id:" alternative broad enough to match this and trigger a full-price
+# fresh rerun on top of a failed run's own commits.
+unrelated_fail_argv="$scratch/fs-resume-unrelatedargv.$$"
+tmpdirs+=("$unrelated_fail_argv")
+unrelated_fail_out="$(printf 'the prompt\n' \
+    | HOME="$cs_home" PATH="$cs_bin:$PATH" FORK_SANDBOX_BACKEND=test \
+      BACKEND_CAPTURE=/dev/null \
+      CLAUDE_ARGV_FILE="$unrelated_fail_argv" \
+      CLAUDE_STDIN_FILE=/dev/null \
+      CLAUDE_FAIL_MESSAGE="Error: unrelated tool failure (session id: not the resume marker)" \
+      timeout 60 "$wrapper" --session-state "$cs_state" \
+      --resume-session "$cs_sid" \
+      "$(mktemp -d "$scratch/forks/fs-resume-work.XXXXXX")" --print 2>&1)"
+unrelated_fail_rc=$?
+if (( $(grep -cx -- '--- attempt end ---' "$unrelated_fail_argv") == 1 )); then
+    ok "an unrelated 'session id:' mention does NOT retry"
+else
+    no "an unrelated 'session id:' mention does NOT retry" "$(cat "$unrelated_fail_argv")"
+fi
+if (( unrelated_fail_rc != 0 )); then
+    ok "an unrelated 'session id:' mention keeps its exit code"
+else
+    no "an unrelated 'session id:' mention keeps its exit code" "$unrelated_fail_out"
+fi
+
 # --- claude-sandboxed's own refusals ---------------------------------------
 cs_refuses() {
     local label="$1" needle="$2"; shift 2
