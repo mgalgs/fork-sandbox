@@ -337,11 +337,17 @@ done
 # both: inbox/ alone would drop to zero after the first leg ends even though
 # nothing was ever un-sent.
 inbox_count() {
-    local have=0 n=0 f d
+    local have=0 n=0 f d base
     if resolve_run_subdir inbox 2>/dev/null; then
         have=1
         for f in "$RUN_SUBDIR_PATH"/*.md; do
-            [[ -f "$f" ]] && n=$(( n + 1 ))
+            [[ -f "$f" ]] || continue
+            base="${f##*/}"
+            # mail-banner-* is a postmaster mail notice (pm_deliver_live), not
+            # an operator addendum -- counting it here would report live mail
+            # deliveries as if the operator had sent them.
+            [[ "$base" == mail-banner-* ]] && continue
+            n=$(( n + 1 ))
         done
     fi
     if resolve_run_subdir inbox-delivered 2>/dev/null; then
@@ -349,7 +355,10 @@ inbox_count() {
         for d in "$RUN_SUBDIR_PATH"/leg-*; do
             [[ -L "$d" || ! -d "$d" ]] && continue
             for f in "$d"/*.md; do
-                [[ -f "$f" ]] && n=$(( n + 1 ))
+                [[ -f "$f" ]] || continue
+                base="${f##*/}"
+                [[ "$base" == mail-banner-* ]] && continue
+                n=$(( n + 1 ))
             done
         done
     fi

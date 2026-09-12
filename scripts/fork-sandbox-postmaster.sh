@@ -69,19 +69,25 @@
 #      and via a list) wakes once. An agent already running a wake for
 #      thread T (a live, not-yet-harvested run) does not get a second
 #      spawn -- the new message-id is recorded on that run as a pending
-#      message (as always, for the fallback below), AND delivered LIVE
-#      into that run's own inbox dir (pm_deliver_live): a banner
-#      (short-id, From, Subject, a sanitized body preview) plus the full
-#      re-rendered thread, written for the run's existing inbox hook to
-#      surface -- no budget spent, no second spawn. Live delivery is
-#      scoped strictly to the (agent, thread) the run is already live
-#      for; mail for the same agent on a different thread is unaffected
-#      by this rule and spawns its own wake as usual. At harvest, if the
-#      events log shows the banner was actually delivered (the hook's own
-#      stderr tag), the pending record is just a note (pm_ledger_delivered_live);
-#      otherwise -- the hook never fired again, or the wake died first --
-#      rules 2-3 are re-checked and a follow-up wake is spawned for the
-#      newest pending message exactly as before live delivery existed.
+#      message (as always, for the fallback below), AND, if the run's seat
+#      is the claude harness, delivered LIVE into that run's own inbox dir
+#      (pm_deliver_live): a banner (short-id, From, Subject, a sanitized
+#      body preview) plus the full re-rendered thread, written for the
+#      run's existing inbox hook to surface -- no budget spent, no second
+#      spawn. Any other harness gets no live delivery: fork-sandbox.sh only
+#      installs the inbox hook for claude, so nothing would ever surface a
+#      banner written for a pi/codex run, and leaving one sitting in the
+#      inbox for that harness's prompt to `cat` directly would misread it
+#      as an operator addendum. Live delivery is scoped strictly to the
+#      (agent, thread) the run is already live for; mail for the same
+#      agent on a different thread is unaffected by this rule and spawns
+#      its own wake as usual. At harvest, if the events log shows the
+#      banner was actually delivered (the hook's own stderr tag), the
+#      pending record is just a note (pm_ledger_delivered_live); otherwise
+#      -- the hook never fired again, live delivery was skipped for the
+#      harness, or the wake died first -- rules 2-3 are re-checked and a
+#      follow-up wake is spawned for the newest pending message exactly as
+#      before live delivery existed.
 #
 # THE WAKE
 #
@@ -592,14 +598,33 @@ pm_mail_body_preview() {
     printf '%s' "${out:0:20}"
 }
 
+# Prepares a From/Subject value for interpolation into the banner's one flat
+# line, whose only field delimiter is the literal substring " -- ". Newline-
+# freedom (which fork-sandbox-mail.sh already guarantees for Subject) is not
+# the property a delimiter-separated line needs: a Subject containing " -- "
+# forges a fake field boundary, and one containing "Mail <id> from @x --
+# Subject: ..." forges a whole fake second banner. Collapsing every run of
+# 2+ hyphens to one hyphen makes the delimiter unreconstructable from field
+# content, and the length cap keeps one hostile field from crowding out the
+# real ones or the thread path that follows.
+pm_banner_field() {
+    local s
+    s="$(tr -d '\n\r' <<< "$1")"
+    s="$(sed -E 's/-{2,}/-/g' <<< "$s")"
+    printf '%s' "${s:0:80}"
+}
+
 # Writes a banner + the full rendered thread into a live same-thread run's
 # own inbox dir (R8b decisions 2/7): mid-flight mail delivered into a wake
 # that is already running, instead of paying for a whole follow-up spawn
 # just to read one message. Every failure mode here returns 0 silently --
 # pm_append_pending has already recorded the message as pending, so a
-# wedged/missing inbox, a message id that no longer resolves, or a renderer
-# hiccup must fall back to that path rather than block routing or crash the
-# route pass over the other messages in the same batch.
+# wedged/missing inbox, a message id that no longer resolves, a renderer
+# hiccup, or a write failing partway through (an unwritable inbox, the run
+# dir reaped mid-write) must fall back to that path rather than block
+# routing or crash the route pass over the other messages in the same
+# batch -- so every mv and every redirect below is guarded explicitly
+# rather than left bare under the script's set -e.
 pm_deliver_live() {
     local rid="$1" tid="$2" mid="$3"
     local f="$RUNS/$rid.env" inbox
@@ -622,18 +647,27 @@ pm_deliver_live() {
         return 0
     fi
     chmod 644 -- "$thread_file.part" 2>/dev/null
-    mv -- "$thread_file.part" "$thread_file"
+    if ! mv -- "$thread_file.part" "$thread_file" 2>/dev/null; then
+        rm -f -- "$thread_file.part"
+        return 0
+    fi
 
     local from subject preview
-    from="$(tr -d '\n\r' <<< "$(pm_header "$mf" From)")"
-    subject="$(tr -d '\n\r' <<< "$(pm_header "$mf" Subject)")"
+    from="$(pm_banner_field "$(pm_header "$mf" From)")"
+    subject="$(pm_banner_field "$(pm_header "$mf" Subject)")"
     preview="$(pm_mail_body_preview "$mf")"
 
-    printf 'Mail %s from %s -- Subject: %s -- > %s -- full thread: %s\n' \
+    if ! printf 'Mail %s from %s -- Subject: %s -- > %s -- full thread: %s\n' \
         "$shortid" "$from" "$subject" "$preview" "$thread_file" \
-        > "$banner_file.part"
+        > "$banner_file.part" 2>/dev/null; then
+        rm -f -- "$banner_file.part"
+        return 0
+    fi
     chmod 644 -- "$banner_file.part" 2>/dev/null
-    mv -- "$banner_file.part" "$banner_file"
+    if ! mv -- "$banner_file.part" "$banner_file" 2>/dev/null; then
+        rm -f -- "$banner_file.part"
+        return 0
+    fi
 }
 
 pm_spawn_wake() {
@@ -724,6 +758,7 @@ pm_spawn_wake() {
         printf 'TRIGGER=%s\n' "$mid"
         printf 'RUN_DIR=%s\n' "$run_dir"
         printf 'INBOX=%s\n' "$run_dir/inbox"
+        printf 'HARNESS=%s\n' "$harness"
         printf 'BRANCH=%s\n' "$branch"
         printf 'RESUMED=%s\n' "$resumed"
         printf 'PENDING_MSGS=\n'
@@ -738,7 +773,23 @@ pm_wake_or_pend() {
     local run_id
     if run_id="$(fs_pm_find_live_run "$agent" "$tid")"; then
         pm_append_pending "$run_id" "$mid"
-        pm_deliver_live "$run_id" "$tid" "$mid"
+        # Live delivery only reaches a running agent on the claude harness --
+        # that is the only harness fork-sandbox.sh installs the inbox hook
+        # for (see fs_build_sandbox_cmd's --settings wiring). Rendering and
+        # writing the banner/thread files for any other harness would cost a
+        # full fork-sandbox-mail-render.py invocation and two writes that
+        # nothing surfaces, AND leave them sitting in the run's inbox for a
+        # pi/codex wake to find on its own (that harness's prompt tells it to
+        # ls/cat the inbox directly) and misread as an operator addendum,
+        # since only the hook -- not the directory itself -- knows a mail
+        # banner isn't one. Skipping the render costs nothing: the message
+        # stays pending and rules 2-3 re-check for a follow-up wake exactly
+        # as they did before live delivery existed.
+        local harness
+        harness="$(fs_pm_env_get "$RUNS/$run_id.env" HARNESS)"
+        if [[ -z "$harness" || "$harness" == claude ]]; then
+            pm_deliver_live "$run_id" "$tid" "$mid"
+        fi
     else
         pm_spawn_wake "$project" "$agent" "$tid" "$mid"
     fi
@@ -877,6 +928,15 @@ pm_harvest_one_file() {
     # replying to a newer message than the trigger the common case. A
     # Reply-To-Id that doesn't resolve in the store (or names "new" or the
     # trigger itself) falls back to the trigger's hops.
+    #
+    # Clamped to the trigger's own hops, never raised above them: an agent
+    # is free to name ANY ancestor as Reply-To-Id, including one further up
+    # the thread than its trigger (e.g. the thread's opening message), and
+    # that ancestor's X-Hops is necessarily >= the trigger's (hops only ever
+    # go down a thread). Using it unclamped would let a reply to an earlier
+    # ancestor re-raise the budget every time, defeating the X-Hops stop
+    # rule -- the ratchet must never move backwards regardless of which
+    # ancestor a reply answers.
     local parent_hops="$trigger_hops"
     if [[ "$reply_to_id" != "new" && "$reply_to_id" != "$trigger" ]]; then
         local parent_file
@@ -885,6 +945,9 @@ pm_harvest_one_file() {
             parent_hops="$(pm_header "$parent_file" X-Hops)"
             [[ "$parent_hops" =~ ^[0-9]+$ ]] || parent_hops="$trigger_hops"
         fi
+    fi
+    if (( parent_hops > trigger_hops )); then
+        parent_hops="$trigger_hops"
     fi
     local decremented=$(( parent_hops > 0 ? parent_hops - 1 : 0 ))
 

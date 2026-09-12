@@ -4372,8 +4372,12 @@ fs_reject_unsafe_chars "$inbox_dir"
 # go in the inbox, as dotfiles: the hook and fork-sandbox-say.sh both work in
 # '*.md', so a leading dot is invisible to them, and it keeps the sandbox's
 # bind list at one entry instead of three. Nothing inside can rewrite them —
-# the bind is read-only — and nothing outside writes the inbox except
-# fork-sandbox-say.sh, which only ever generates a '<epoch>-<nn>.md' name.
+# the bind is read-only. Outside writers are now two, not one:
+# fork-sandbox-say.sh, which only ever generates a '<epoch>-<nn>.md' addendum
+# name, and fork-sandbox-postmaster.sh's pm_deliver_live, which writes
+# 'mail-banner-<nnn>-<shortid>.md' and 'mail-thread-<nnn>-<shortid>.txt' into
+# a live run's own inbox for its hook to surface as mail, not as an addendum
+# — see fs_archive_inbox's own comment on why the two are kept apart.
 inbox_hook=""
 inbox_settings=""
 # One hook and one settings file cover every claude leg this run has, not
@@ -5660,11 +5664,22 @@ rm -f "$run_dir/exit-code"
 # A symlink is refused rather than followed -- the inbox is host-written and
 # nothing should ever put one there, but archiving is a move, and following
 # a link out of the inbox is not a mistake worth making possible.
+#
+# 'mail-banner-*.md' (fork-sandbox-postmaster.sh's pm_deliver_live) is also
+# skipped, deliberately: everything else this function moves is re-emitted to
+# a continuation leg as an "operator addendum ... carries the same authority
+# as the brief and outranks it" (see refresh_build_prompt), which is true of
+# an addendum and false of a mail banner -- it is new thread information from
+# the postmaster, not an operator instruction. Leaving it in place means the
+# next leg's own inbox hook re-surfaces it, unread, through the hook's
+# separate mail_provenance/mail_authority framing instead -- the same
+# delivery guarantee, with the correct authority attached.
 fs_archive_inbox() {
     local leg_no="$1" leg_harness="$2" leg_rc="$3" inbox_dir="$run_dir/inbox" dest="" f moved=0
     [[ "$leg_harness" == "claude" && "$leg_rc" == "0" ]] || return 0
     for f in "$inbox_dir"/*.md; do
         [[ -e "$f" || -L "$f" ]] || continue
+        [[ "${f##*/}" == mail-banner-* ]] && continue
         if [[ -L "$f" ]]; then
             printf 'fork-sandbox: %s is a symlink; refusing to archive it.\n' "$f" \
                 >> "$sandbox_log"
