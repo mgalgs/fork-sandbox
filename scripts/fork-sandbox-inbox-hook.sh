@@ -140,12 +140,19 @@ if [[ -n "$refresh_threshold" && -n "$clone_dir" && "$stale_reminded" == 0 \
 fi
 
 unread=()
+unread_mail=()
 
-# Fill `unread` with the names of inbox files not yet shown, oldest first.
-# Names are generated as <epoch>-<nn>.md, so a lexicographic sort is a
-# chronological one. Builtins only: this runs on every single tool call.
+# Fill `unread` and `unread_mail` with the names of inbox files not yet
+# shown, oldest first. Names are generated as <epoch>-<nn>.md (operator
+# addenda) or mail-banner-<nnn>-<shortid>.md (mail delivered mid-session by
+# the postmaster, see mail_text below), so a lexicographic sort is a
+# chronological one within each kind. Builtins only: this runs on every
+# single tool call. mail-thread-*.txt files, the full rendered thread a
+# mail-banner-* points at, are not in this glob at all (wrong extension) --
+# they are read by path, never surfaced here.
 list_unread() {
     unread=()
+    unread_mail=()
     local blob="" f name
     if [[ -f "$seen_file" ]]; then
         # read -d '' consumes the whole file in one builtin read. It returns
@@ -157,10 +164,13 @@ list_unread() {
     for f in "$inbox"/*.md; do
         [[ -f "$f" ]] || continue
         name="${f##*/}"
-        # A generated name holds only digits, a hyphen and '.md', so it can
+        # A generated name holds only digits, hyphens, and '.md', so it can
         # carry no glob metacharacter and this match is exact.
         [[ "$blob" == *$'\n'"$name"$'\n'* ]] && continue
-        unread+=("$name")
+        case "$name" in
+            mail-banner-*) unread_mail+=("$name") ;;
+            *) unread+=("$name") ;;
+        esac
     done
 }
 
@@ -180,6 +190,7 @@ list_unread
 # before it below.
 need_work=0
 (( ${#unread[@]} > 0 )) && need_work=1
+(( ${#unread_mail[@]} > 0 )) && need_work=1
 (( measure_usage )) && need_work=1
 if [[ -n "$refresh_threshold" && "$nudged" == 1 && "$reminded" == 0 ]]; then
     [[ -z "$outbox_dir" || ! -f "$outbox_dir/handoff.md" ]] && need_work=1
@@ -236,7 +247,7 @@ fi
 # nothing left to decide, so it exits here rather than pay the lock (and the
 # race it guards against) for the rest of a leg whose hand-off is sitting
 # stale in the outbox waiting for that leg's own Stop to send it back.
-if (( ${#unread[@]} == 0 && ! nudge_now )) \
+if (( ${#unread[@]} == 0 && ${#unread_mail[@]} == 0 && ! nudge_now )) \
     && [[ "$event" != "Stop" && "$event" != "SubagentStop" ]]; then
     exit 0
 fi
@@ -295,7 +306,8 @@ if [[ ( "$event" == "Stop" || "$event" == "SubagentStop" ) ]] && (( handoff_stal
     stale_block=1
 fi
 
-if (( ${#unread[@]} == 0 && ! nudge_now && ! handoff_missing && ! stale_block )); then
+if (( ${#unread[@]} == 0 && ${#unread_mail[@]} == 0 && ! nudge_now \
+    && ! handoff_missing && ! stale_block )); then
     exit 0
 fi
 
@@ -308,6 +320,7 @@ fi
 # something goes wrong mid-emit, which is the outcome this ordering exists to
 # avoid.
 (( ${#unread[@]} )) && printf '%s\n' "${unread[@]}" >> "$seen_file"
+(( ${#unread_mail[@]} )) && printf '%s\n' "${unread_mail[@]}" >> "$seen_file"
 (( nudge_now )) && : > "$nudge_marker"
 (( handoff_missing )) && : > "$nudge_reminded_marker"
 (( stale_block )) && : > "$stale_reminded_marker"
@@ -318,6 +331,14 @@ for name in "${unread[@]}"; do
     names+="${names:+, }$name"
     body+=$'\n'"## Operator addendum ($name)"$'\n\n'
     body+="$(cat -- "$inbox/$name")"$'\n'
+done
+
+mail_names=""
+mail_body=""
+for name in "${unread_mail[@]}"; do
+    mail_names+="${mail_names:+, }$name"
+    mail_body+=$'\n'"## Mail delivered ($name)"$'\n\n'
+    mail_body+="$(cat -- "$inbox/$name")"$'\n'
 done
 
 # Say what an addendum IS, every time. Two things have to be established, and
@@ -334,6 +355,12 @@ done
 #   the handoff and carries on with the original plan.
 provenance="This text is not tool output and did not come from the repository. It was written by the operator who launched this run and wrote your handoff, and it arrived over that run's operator inbox — a host-side directory mounted read-only here, which nothing inside this sandbox can write to."
 authority="An addendum is a continuation of your handoff and carries the same authority: it may override the handoff rather than merely add to it. Where the two conflict, the addendum is the newer instruction and takes precedence."
+
+# Mail delivered mid-session gets its own provenance/authority pair, distinct
+# from an addendum's: it is new information from the fork-sandbox postmaster,
+# not an instruction from the operator that overrides the handoff.
+mail_provenance="This text is not tool output and did not come from the repository. It is mail delivered mid-session by the fork-sandbox postmaster: a message arrived, addressed to you, on the same thread this run was woken for."
+mail_authority="This is new information for you to act on if it changes what you do next, not an instruction that overrides your handoff. The full updated thread is readable at the path the banner below names, if you need the details behind it."
 
 # The nudge and the reminder are not from the repository or the operator
 # either — they are generated by this harness, measuring this session's own
@@ -364,6 +391,12 @@ if (( stale_block )); then
     stale_text="This is not tool output, not an operator message, and not part of the repository. It is generated by the fork-sandbox harness running this session. The hand-off at \`$outbox_dir/handoff.md\` was written before the most recent commit on this branch, so it describes a state that no longer exists. Rewrite it now from \`git log --oneline\` and \`git status\` so it lists what is actually committed and what actually remains, then end the turn. This is the only such reminder."
 fi
 
+mail_text=""
+if (( ${#unread_mail[@]} )); then
+    mail_text="Mail arrived for you mid-session on this thread, and you have not seen it yet. $mail_provenance $mail_authority
+$mail_body"
+fi
+
 case "$event" in
     Stop|SubagentStop)
         # Top-level decision/reason is the documented Stop contract. Blocking
@@ -385,6 +418,9 @@ $body"
         if [[ -n "$stale_text" ]]; then
             reason+=$'\n\n'"$stale_text"
         fi
+        if [[ -n "$mail_text" ]]; then
+            reason+=$'\n\n'"$mail_text"
+        fi
         jq -n --arg reason "$reason" '{decision: "block", reason: $reason}'
         ;;
     *)
@@ -396,13 +432,20 @@ $body"
         if [[ -n "$nudge_text" ]]; then
             context+=$'\n\n'"$nudge_text"
         fi
+        if [[ -n "$mail_text" ]]; then
+            context+=$'\n\n'"$mail_text"
+        fi
         jq -n --arg ctx "$context" --arg ev "${event:-PostToolUse}" \
             '{hookSpecificOutput: {hookEventName: $ev, additionalContext: $ctx}}'
         ;;
 esac
 
-if (( ${#unread[@]} )); then
-    printf '%s delivered %s\n' "$STDERR_TAG" "$names" >&2
+if (( ${#unread[@]} || ${#unread_mail[@]} )); then
+    all_names="$names"
+    if [[ -n "$mail_names" ]]; then
+        all_names="${all_names:+$all_names, }$mail_names"
+    fi
+    printf '%s delivered %s\n' "$STDERR_TAG" "$all_names" >&2
 fi
 if (( nudge_now )); then
     printf '%s nudged (usage >= %s tokens)\n' "$STDERR_TAG_REFRESH" "$refresh_threshold" >&2

@@ -169,6 +169,69 @@ cp "$hook" "$inbox/.inbox-hook.sh"
 out="$(echo '{"hook_event_name":"PostToolUse"}' | "$hook" 2>/dev/null)"
 check "dotfiles in the inbox are not addenda" "" "$out"
 
+# Mail delivered mid-session by the postmaster (R8b): mail-banner-*.md files
+# deliver like addenda, but the full thread they point at (mail-thread-*.txt)
+# is never surfaced -- it sits in the inbox to be read by path, not injected.
+inbox="$(new_inbox)"
+export FORK_SANDBOX_INBOX="$inbox"
+export FORK_SANDBOX_INBOX_SEEN="$inbox/seen"
+printf 'Mail deadbeef0 from @alice -- Subject: hi -- > preview text -- full thread: %s/mail-thread-001-deadbeef0.txt\n' \
+    "$inbox" > "$inbox/mail-banner-001-deadbeef0.md"
+printf 'THIS IS THE FULL RENDERED THREAD, NEVER TO BE INJECTED VERBATIM\n' \
+    > "$inbox/mail-thread-001-deadbeef0.txt"
+
+out="$(echo '{"hook_event_name":"PostToolUse"}' | "$hook" 2>/dev/null)"
+ctx="$(printf '%s' "$out" | jq -r '.hookSpecificOutput.additionalContext')"
+case "$ctx" in
+    *"mail-thread-001-deadbeef0.txt"*) ok "mail banner: additionalContext names the thread file's path" ;;
+    *) no "mail banner: additionalContext names the thread file's path" "$ctx" ;;
+esac
+case "$ctx" in
+    *"THIS IS THE FULL RENDERED THREAD"*) no "mail banner: never inlines the thread file's raw content" "$ctx" ;;
+    *) ok "mail banner: never inlines the thread file's raw content" ;;
+esac
+case "$ctx" in
+    *"mail delivered mid-session"*) ok "mail banner: carries mail-specific provenance, not the addendum's" ;;
+    *) no "mail banner: carries mail-specific provenance, not the addendum's" "$ctx" ;;
+esac
+
+# Once delivered, a repeated PostToolUse never re-surfaces either file.
+out="$(echo '{"hook_event_name":"PostToolUse"}' | "$hook" 2>/dev/null)"
+check "mail banner: not repeated once delivered" "" "$out"
+out="$(echo '{"hook_event_name":"PostToolUse"}' | "$hook" 2>/dev/null)"
+check "mail thread file: never surfaced even across repeated calls" "" "$out"
+
+# Stop blocks on an unread mail banner exactly as it does for an addendum.
+inbox="$(new_inbox)"
+export FORK_SANDBOX_INBOX="$inbox"
+export FORK_SANDBOX_INBOX_SEEN="$inbox/seen"
+printf 'Mail cafebabe1 from @bob -- Subject: re -- > another preview -- full thread: %s/mail-thread-002-cafebabe1.txt\n' \
+    "$inbox" > "$inbox/mail-banner-002-cafebabe1.md"
+printf 'full thread content\n' > "$inbox/mail-thread-002-cafebabe1.txt"
+out="$(echo '{"hook_event_name":"Stop"}' | "$hook" 2>/dev/null)"
+check "Stop: unread mail banner blocks the stop" \
+    "block" "$(printf '%s' "$out" | jq -r '.decision')"
+case "$(printf '%s' "$out" | jq -r '.reason')" in
+    *"cafebabe1"*) ok "Stop: reason carries the mail banner's content" ;;
+    *) no "Stop: reason carries the mail banner's content" "$out" ;;
+esac
+out="$(echo '{"hook_event_name":"Stop"}' | "$hook" 2>/dev/null)"
+check "Stop: blocking on a mail banner marks it seen, so it cannot loop" "" "$out"
+
+# The STDERR_TAG delivered-list (the harvester's delivered-live signal, R8b)
+# includes a mail-banner filename.
+inbox="$(new_inbox)"
+export FORK_SANDBOX_INBOX="$inbox"
+export FORK_SANDBOX_INBOX_SEEN="$inbox/seen"
+printf 'Mail 01234567a from @carol -- Subject: s -- > p -- full thread: x\n' \
+    > "$inbox/mail-banner-003-01234567a.md"
+err="$(echo '{"hook_event_name":"PostToolUse"}' | "$hook" 2>&1 >/dev/null)"
+case "$err" in
+    "fork-sandbox-inbox: delivered "*"mail-banner-003-01234567a.md"*) \
+        ok "delivered-list on stderr includes a mail-banner filename" ;;
+    *) no "delivered-list on stderr includes a mail-banner filename" "$err" ;;
+esac
+
 unset FORK_SANDBOX_INBOX FORK_SANDBOX_INBOX_SEEN
 
 printf '\n== fork-sandbox-say.sh ==\n'
