@@ -173,13 +173,30 @@
 #                                   never repeat within a thread even
 #                                   across a rule-1 budget reset
 #   handoffs/<run-id>.md           the generated handoff passed to a wake
+#   state/<thread-id>/<agent>/     the claude CLI's transcript store for
+#                                   that one (thread, agent) pair, bound
+#                                   into every wake of it with
+#                                   --session-state so the conversation
+#                                   outlives the run. claude seats only
+#                                   (pi and codex keep their sessions
+#                                   elsewhere and stay fresh-wake)
+#   sessions/<thread-id>/<agent>   the session id the LAST wake of that
+#                                   pair ended on, read out of the run's
+#                                   summary.json at harvest. Present ->
+#                                   the next wake resumes it; absent ->
+#                                   the next wake is fresh. Cleared when a
+#                                   wake fails outright, so a broken
+#                                   session can never wedge a seat
 #
 # All state transitions are marker-file creation, never deletion of
 # anything fork-sandbox-mail.sh owns.
 #
 # LIMITATIONS (v1 does not do these; a later round might):
-#   - No session resume -- every wake is a fresh session, the thread in
-#     the prompt is the only continuity.
+#   - Session resume is claude-only: a pi or codex seat gets a fresh
+#     session on every wake, with the thread in the prompt as its only
+#     continuity. That prompt stays the correctness guarantee even for
+#     claude -- resume is a continuity and cost optimization, and a wake
+#     whose session is missing or unreadable still does the work.
 #   - No delivery of mail tooling into the sandbox, and no store access
 #     from inside a run.
 #   - No list-Cc delivery index.
@@ -225,6 +242,14 @@ NEEDS_OPERATOR="$STATE/needs-operator"
 SPAWNS="$STATE/spawns"
 SEQ="$STATE/seq"
 HANDOFFS="$STATE/handoffs"
+PM_SESSION_STATE="$STATE/state"
+PM_SESSIONS="$STATE/sessions"
+
+# The shape fork-sandbox.sh accepts for --resume-session. Applied to what
+# summary.json reported before it is recorded: a malformed id would make
+# the launcher refuse EVERY later wake of that seat, which is a wedge, and
+# the value comes from a filename this script never chose.
+PM_SESSION_ID_RE='^[0-9a-f-]{8,64}$'
 
 PM_ADDR_RE='^@[a-z0-9][a-z0-9-]*$'
 
@@ -267,6 +292,22 @@ pm_persona_body() {
 pm_env_get() {
     [[ -f "$1" ]] || return 0
     sed -n "s/^$2=//p" "$1" | tail -n1
+}
+
+# Records / clears the session a (thread, agent) pair's next wake should
+# resume. Clearing is the failure path's job: the next wake then starts
+# fresh, which always works, rather than retrying a session that may be
+# what broke the last one. Never a retry loop -- claude-sandboxed already
+# retried once inside the run.
+pm_session_record() {
+    local tid="$1" agent="$2" sid="$3"
+    mkdir -p -- "$PM_SESSIONS/$tid"
+    printf '%s\n' "$sid" > "$PM_SESSIONS/$tid/$agent"
+}
+
+pm_session_clear() {
+    local tid="$1" agent="$2"
+    rm -f -- "$PM_SESSIONS/$tid/$agent"
 }
 
 pm_new_uuid() {
@@ -488,6 +529,25 @@ pm_spawn_wake() {
         spawn_args+=(--pi-args "--thinking $thinking")
     fi
 
+    # An agent woken again and again on one thread should be ONE
+    # conversation, not a series of amnesiacs. The transcript store for
+    # this (thread, agent) pair is bound into every claude wake of it; the
+    # id the last wake ended on, if harvest recorded one, resumes it.
+    # Other harnesses get neither flag -- fork-sandbox.sh refuses both
+    # there.
+    local resumed=""
+    if [[ "$harness" == claude ]]; then
+        spawn_args+=(--session-state "$PM_SESSION_STATE/$tid/$agent")
+        local sid_file="$PM_SESSIONS/$tid/$agent" sid
+        if [[ -f "$sid_file" ]]; then
+            sid="$(pm_trim "$(cat -- "$sid_file" 2>/dev/null)")"
+            if [[ "$sid" =~ $PM_SESSION_ID_RE ]]; then
+                spawn_args+=(--resume-session "$sid")
+                resumed="$sid"
+            fi
+        fi
+    fi
+
     local launch_out rc run_dir
     set +e
     launch_out="$("$FORK_SANDBOX" "${spawn_args[@]}" "$project" "$handoff_file" 2>&1)"
@@ -508,6 +568,7 @@ pm_spawn_wake() {
         printf 'TRIGGER=%s\n' "$mid"
         printf 'RUN_DIR=%s\n' "$run_dir"
         printf 'BRANCH=%s\n' "$branch"
+        printf 'RESUMED=%s\n' "$resumed"
         printf 'PENDING_MSGS=\n'
     } > "$RUNS/$run_id.env"
     mkdir -p -- "$SPAWNS" "$SEQ"
@@ -720,6 +781,11 @@ pm_harvest_run() {
         # as a terminal failure: flag the thread and unblock the agent
         # instead of leaving pm_find_live_run wedged on it forever.
         pm_flag "$tid" "run dir for $agent vanished before exit-code appeared (run $rid)"
+        # No summary.json to read, and the store this seat resumes from
+        # sits under the same scratch root that just lost the run dir.
+        # Start the next wake fresh rather than point it at an id nothing
+        # can be said about.
+        pm_session_clear "$tid" "$agent"
         mkdir -p -- "$HARVESTED"
         : > "$HARVESTED/$rid"
         return 0
@@ -734,6 +800,23 @@ pm_harvest_run() {
         # a non-zero exit is a failure, not the documented "no reply is a
         # valid outcome".
         pm_flag "$tid" "wake for $agent exited $exit_code (run $rid); outbox may be incomplete"
+        # ...and forget the session, so the next wake of this seat is a
+        # fresh one. A failed resumed wake is exactly the case where the
+        # recorded id is the suspect.
+        pm_session_clear "$tid" "$agent"
+    else
+        # Which session the next wake should resume. Absent (no
+        # --session-state on this seat, or no jq on the host), null or
+        # malformed leaves whatever was recorded before standing: a wake
+        # that ended without writing a transcript has not invalidated the
+        # one the store already holds, and the worst case is a fresh
+        # wake, which always works.
+        local sid
+        sid="$(pm_trim "$(jq -r '.session_id // empty' \
+            "$run_dir/summary.json" 2>/dev/null || true)")"
+        if [[ "$sid" =~ $PM_SESSION_ID_RE ]]; then
+            pm_session_record "$tid" "$agent" "$sid"
+        fi
     fi
 
     local trigger_file trigger_hops decremented
@@ -833,7 +916,7 @@ cmd_status() {
     printf 'unrouted: %s\n' "$(( total - routed_count ))"
 
     printf '\nlive runs:\n'
-    local any_live=0 rid agent tid run_dir
+    local any_live=0 rid agent tid run_dir resumed session
     for f in "$RUNS"/*.env; do
         [[ -e "$f" ]] || continue
         rid="$(basename -- "$f" .env)"
@@ -841,7 +924,18 @@ cmd_status() {
         agent="$(pm_env_get "$f" AGENT)"
         tid="$(pm_env_get "$f" THREAD)"
         run_dir="$(pm_env_get "$f" RUN_DIR)"
-        printf '  %s  agent=%s thread=%s run_dir=%s\n' "$rid" "$agent" "$tid" "$run_dir"
+        # Read off the .env the spawn wrote, not the sessions file: that
+        # one moves under a live run, and what this column reports is how
+        # THIS wake was launched. A run spawned before the field existed
+        # has no RESUMED line and reads as fresh, which it was.
+        resumed="$(pm_env_get "$f" RESUMED)"
+        if [[ -n "$resumed" ]]; then
+            session="resumed=$resumed"
+        else
+            session="session=fresh"
+        fi
+        printf '  %s  agent=%s thread=%s %s run_dir=%s\n' \
+            "$rid" "$agent" "$tid" "$session" "$run_dir"
         any_live=1
     done
     (( any_live )) || printf '  (none)\n'

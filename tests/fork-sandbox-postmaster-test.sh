@@ -734,6 +734,117 @@ check "launcher: the stub, not any fork-sandbox.sh found via PATH, received the 
     "$(grep -c -- '^----CALL----$' "$STUB_ARGV_LOG")"
 
 # ============================================================
+printf '\n== session resume: state dir on every claude wake, id across wakes ==\n'
+# ============================================================
+
+# An agent woken repeatedly on one thread is one continuing claude
+# conversation: --session-state binds a per-(thread, agent) transcript
+# store into every wake, and the id harvest read out of the last wake's
+# summary.json resumes it on the next.
+
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+
+# env_file_for_agent above returns the FIRST match, which after a harvest
+# is a dead run. These wakes each follow the last one's harvest, so the
+# live one is what every assertion below wants.
+live_env_for_agent() {
+    local agent="$1" f rid
+    for f in "$PM_STATE_DIR/runs"/*.env; do
+        [[ -e "$f" ]] || continue
+        rid="$(basename -- "$f" .env)"
+        [[ -e "$PM_STATE_DIR/harvested/$rid" ]] && continue
+        grep -q "^AGENT=$agent\$" "$f" && { printf '%s' "$f"; return 0; }
+    done
+    return 1
+}
+
+# Ends the live run for $1: exit code $2, and a summary.json naming
+# session $3 when one is given (the shape fork-sandbox.sh writes on a
+# --session-state run).
+finish_run() {
+    local agent="$1" code="$2" sid="${3:-}" env_f run_dir
+    env_f="$(live_env_for_agent "$agent")"
+    run_dir="$(sed -n 's/^RUN_DIR=//p' "$env_f")"
+    mkdir -p -- "$run_dir/outbox"
+    [[ -n "$sid" ]] \
+        && printf '{"session_id":"%s","session_state":"x"}\n' "$sid" \
+            > "$run_dir/summary.json"
+    printf '%s\n' "$code" > "$run_dir/exit-code"
+}
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+
+res_sid=11112222-3333-4444-5555-666677778888
+res_mid1="$(send_msg '@carol' '@alice' 'resume topic' 'first message' 8)"
+res_tid="$(thread_of "$res_mid1")"
+res_state="$PM_STATE_DIR/state/$res_tid/alice"
+res_sessions="$PM_STATE_DIR/sessions/$res_tid/alice"
+
+: > "$STUB_ARGV_LOG"
+once
+check "resume: first wake binds the per-(thread, agent) state dir" \
+    "$res_state" "$(argv_after --session-state "$STUB_ARGV_LOG")"
+check "resume: first wake passes no --resume-session" 0 \
+    "$(grep -c -- '^--resume-session$' "$STUB_ARGV_LOG")"
+check "resume: first wake's .env records it as fresh" "RESUMED=" \
+    "$(grep '^RESUMED=' "$(live_env_for_agent alice)")"
+contains "resume: status marks a fresh wake" \
+    "$("$postmaster" status 2>&1)" "session=fresh"
+
+finish_run alice 0 "$res_sid"
+once
+check "resume: harvest records the session id from summary.json" \
+    "$res_sid" "$(cat "$res_sessions" 2>/dev/null)"
+
+res_mid2="$(reply_msg '@carol' "$res_mid1" 'second message' --to '@alice')"
+: > "$STUB_ARGV_LOG"
+once
+check "resume: second wake resumes the recorded session" \
+    "$res_sid" "$(argv_after --resume-session "$STUB_ARGV_LOG")"
+check "resume: second wake binds the same state dir" \
+    "$res_state" "$(argv_after --session-state "$STUB_ARGV_LOG")"
+contains "resume: status marks a resumed wake" \
+    "$("$postmaster" status 2>&1)" "resumed=$res_sid"
+
+# A resumed wake that fails outright forgets the session: the recorded id
+# is the suspect, and a fresh wake always works. Never a retry loop --
+# claude-sandboxed already retried once inside the run.
+finish_run alice 1
+once
+check "resume: a failed wake clears the recorded session id" 0 \
+    "$( [[ -e "$res_sessions" ]] && echo 1 || echo 0 )"
+
+reply_msg '@carol' "$res_mid2" 'third message' --to '@alice' >/dev/null
+: > "$STUB_ARGV_LOG"
+once
+check "resume: the wake after a failure is fresh again" 0 \
+    "$(grep -c -- '^--resume-session$' "$STUB_ARGV_LOG")"
+check "resume: ...and still binds the state dir" \
+    "$res_state" "$(argv_after --session-state "$STUB_ARGV_LOG")"
+
+# A summary.json that names nothing usable leaves the store's own history
+# alone rather than recording a value the launcher would refuse -- a bad
+# id there would wedge every later wake of this seat.
+finish_run alice 0 'not a session id'
+once
+check "resume: a malformed session id is not recorded" 0 \
+    "$( [[ -e "$res_sessions" ]] && echo 1 || echo 0 )"
+
+# pi and codex have no resume support and fork-sandbox.sh refuses both
+# flags there, so a non-claude seat must get neither. bob is the pi seat.
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+send_msg '@carol' '@bob' 'pi seat resume' 'body' 8 >/dev/null
+: > "$STUB_ARGV_LOG"
+once
+check "resume: a pi seat gets no --session-state" 0 \
+    "$(grep -c -- '^--session-state$' "$STUB_ARGV_LOG")"
+check "resume: a pi seat gets no --resume-session" 0 \
+    "$(grep -c -- '^--resume-session$' "$STUB_ARGV_LOG")"
+
+# ============================================================
 printf '\n== --help and dispatcher wiring ==\n'
 # ============================================================
 
