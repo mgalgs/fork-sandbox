@@ -383,10 +383,17 @@ teardown_lock_acquire() {
 teardown_lock_release() {
     [[ -n "${teardown_lock_fd:-}" ]] || return 0
     flock -u "$teardown_lock_fd" 2>/dev/null || true
-    exec {teardown_lock_fd}>&- 2>/dev/null || true
+    # Braces scope the redirect to just this close, the same reason
+    # teardown_workspace_locked below uses them: a bare `exec {fd}>&-
+    # 2>/dev/null` has no command for exec to run, so its `2>/dev/null`
+    # would land on the whole rest of the process instead of just this one
+    # open. Latent today -- this only runs from the EXIT trap, with nothing
+    # after it to lose its stderr -- but the same defect the comment below
+    # calls out, left uncorrected here.
+    { exec {teardown_lock_fd}>&-; } 2>/dev/null || true
 }
 
-# A workspace's own flock (see fs_lock_clone_dir, fork-sandbox.sh) is the
+# A workspace's own flock (see fs_lock_clone_dir, fork-sandbox-lib.sh) is the
 # authoritative liveness signal for it: a live run holds it for its whole
 # lifetime, starting BEFORE it touches the workspace's git state at all.
 # runs/*.env (teardown_live_run) is written only after a spawn returns,

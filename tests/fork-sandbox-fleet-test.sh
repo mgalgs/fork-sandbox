@@ -474,7 +474,7 @@ refuses "teardown: --thread of '.' is refused" \
 # for a wake the postmaster has not finished recording yet (no runs/*.env
 # exists), and teardown must still refuse it rather than pull the clone out
 # from under that in-flight run. Simulated by holding the same lock
-# fork-sandbox.sh's fs_lock_clone_dir takes, with no runs/*.env at all.
+# fork-sandbox-lib.sh's fs_lock_clone_dir takes, with no runs/*.env at all.
 mkdir -p -- "$PM_STATE/workspaces/th6/eve/.git"
 (
     exec {eve_lock_fd}<>"$PM_STATE/workspaces/th6/eve/.git/fork-sandbox-lock"

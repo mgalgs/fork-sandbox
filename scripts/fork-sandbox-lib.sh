@@ -331,6 +331,27 @@ fs_reuse_clone() {
     return 0
 }
 
+# Acquire the persistent-workspace lock at $1/.git/fork-sandbox-lock and set
+# the global clone_lock_fd, or print the standard refusal and exit. Under
+# .git, not the working tree: the pi session dir, the review verdict and
+# .env.sandbox all live under .git for the same reason -- git tracks nothing
+# there, so a leg running `git add -A` cannot commit the lock file onto the
+# branch that gets fetched home, and a `git clean -fdx` cannot unlink it out
+# from under a still-live holder. Shared by the launcher (fork-sandbox.sh),
+# which holds it only while it sets up the workspace, and the generated
+# runner, which reacquires it fresh as its own first action so the lock's
+# lifetime matches the run rather than the launcher or tmux -- see both
+# call sites for why a single acquisition cannot simply be handed down.
+fs_lock_clone_dir() {
+    local dir="$1"
+    exec {clone_lock_fd}<>"$dir/.git/fork-sandbox-lock"
+    if ! flock -n "$clone_lock_fd"; then
+        echo "Error: workspace '$dir' is locked by another run --" >&2
+        echo "refusing to start." >&2
+        exit 1
+    fi
+}
+
 fs_require_src_project() {
     local project_path="$1" real
     real="$("$FS_REALPATH" -m "$project_path")"

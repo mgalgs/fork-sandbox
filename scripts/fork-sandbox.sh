@@ -3992,22 +3992,8 @@ if [[ "$prompt_overlay_matched" == true ]]; then
         '{dir: $dir, rev: (if $rev == "" then null else $rev end), legs: $legs}' \
         > "$run_dir/prompt-overlay.json"
 fi
-# Acquire the persistent-workspace lock at $1/.git/fork-sandbox-lock and set
-# the global clone_lock_fd, or print the standard refusal and exit. Under
-# .git, not the working tree: the pi session dir (below), the review verdict
-# and .env.sandbox all live under .git for the same reason -- git tracks
-# nothing there, so a leg running `git add -A` cannot commit the lock file
-# onto the branch that gets fetched home, and a `git clean -fdx` cannot
-# unlink it out from under a still-live holder.
-fs_lock_clone_dir() {
-    local dir="$1"
-    exec {clone_lock_fd}<>"$dir/.git/fork-sandbox-lock"
-    if ! flock -n "$clone_lock_fd"; then
-        echo "Error: workspace '$dir' is locked by another run --" >&2
-        echo "refusing to start." >&2
-        exit 1
-    fi
-}
+# fs_lock_clone_dir lives in fork-sandbox-lib.sh, shared with the generated
+# runner below, which reacquires the same lock as its own first action.
 
 # clone_reused feeds the resumed-session continuation prompt below: a reused
 # clone keeps the same absolute path and the same branch history across
@@ -4100,8 +4086,19 @@ fi
 # --clone-dir was given. The reuse branch above already took it, before
 # doing any git work in that workspace; this covers the first-wake-for-this-
 # --clone-dir branch, where the workspace did not exist until fs_make_clone
-# just created it and so could not have raced anything. Held via a plain fd
-# for the run's lifetime, released by run_cleanup; see pm_lock_acquire in
+# just created it and so could not have raced anything. Held by THIS
+# launcher process only for as long as the launcher itself is touching the
+# workspace -- the fetch/checkout above, and the provisioning below -- and
+# released just before the runner starts (see the release beside the
+# generated run.sh, below). Without --foreground this process exits the
+# moment `tmux new-session -d` returns, and a plain fd held here does not
+# survive that: with a tmux server already running, the new session is a
+# child of that unrelated, older server and never had the fd; with no
+# server running, tmux forks one that inherits the fd and then holds it for
+# the server's lifetime, wedging the seat long after this run ends. Either
+# way the lock's holder has to be the runner process, not this one -- see
+# clone_lock_path/clone_lock_fd in the runner below, which reacquires it as
+# the runner's first action. See pm_lock_acquire in
 # fork-sandbox-postmaster.sh for why this is flock rather than a pid file.
 if [[ -n "$clone_dir_flag" && -z "$clone_lock_fd" ]]; then
     fs_lock_clone_dir "$clone_dir"
@@ -4611,11 +4608,25 @@ Otherwise:
 - The clone is the SAME directory as the earlier run's: \`$clone_dir\`. It did
   not move. Only the operator inbox and the artifact outbox are at new
   absolute paths this wake, named above.
+EOF
+        if [[ -z "$checkout_ref" ]]; then
+            cat <<EOF
 - The branch is \`$branch\`, a new name, but it was started at the earlier
   run's own branch tip -- so anything you committed on an earlier wake is
   already on this branch's history. \`git log\` shows it directly; there is no
   remote-tracking ref to go hunting through.
 EOF
+        else
+            cat <<EOF
+- The branch is \`$branch\`, a new name, but this run was given
+  \`--checkout $checkout_ref\`, which pins its start point at that ref
+  instead of the earlier wake's branch tip. Commits from that earlier wake
+  may not be reachable from this branch's history at all. \`git branch\`
+  lists the earlier wake's branch name in this same local repository --
+  check there, and with \`git log <that-branch>\`, before assuming a commit
+  from an earlier wake exists on HEAD.
+EOF
+        fi
     elif [[ "$clone_reused" == true ]]; then
         # --clone-dir is not claude-only, but --resume-session is: a pi or
         # codex seat's second wake reuses this same workspace with no
@@ -4631,9 +4642,22 @@ This session has no earlier conversation to resume, but the clone is not new
 either: \`$clone_dir\` is the SAME directory an earlier wake used, and its git
 history is still there.
 
+EOF
+        if [[ -z "$checkout_ref" ]]; then
+            cat <<EOF
 - The branch is \`$branch\`, a new name, but it was started at an earlier
   wake's own branch tip, so anything committed on an earlier wake is already
   on this branch's history. \`git log\` shows it directly.
+EOF
+        else
+            cat <<EOF
+- The branch is \`$branch\`, a new name, but this run was given
+  \`--checkout $checkout_ref\`, which pins its start point at that ref
+  instead of an earlier wake's branch tip. Commits from earlier wakes may
+  not be reachable from this branch's history at all.
+EOF
+        fi
+        cat <<EOF
 - \`git branch\` may list other branches from earlier wakes in this same
   workspace; they are this repository's own history, not a different
   sandbox's.
@@ -5350,6 +5374,14 @@ started_at="$(date +%s)"
     printf 'run_dir=%q\n' "$run_dir"
     printf 'script_dir=%q\n' "$script_dir"
     printf 'clone_dir=%q\n' "$clone_dir"
+    # Empty for a fresh clone under run_dir, which nothing else can ever
+    # reach and so needs no lock. Non-empty for a --clone-dir workspace: the
+    # launcher held this same path locked while it set up the workspace, but
+    # released it before starting this runner (see fs_lock_clone_dir's
+    # caller above), so the runner reacquires it itself, right below, as the
+    # first thing it does -- see the comment there for why the lock cannot
+    # simply be handed down from the launcher.
+    printf 'clone_lock_path=%q\n' "${clone_dir_flag:+$clone_dir/.git/fork-sandbox-lock}"
     printf 'origin_repo=%q\n' "$origin_repo"
     printf 'branch=%q\n' "$branch"
     printf 'base_sha=%q\n' "$base_sha"
@@ -5515,6 +5547,19 @@ started_at="$(date +%s)"
 # report display and summary provenance cannot drift between processes.
 source "$script_dir/fork-sandbox-lib.sh"
 
+# The launcher held this same workspace's lock while it set up the clone and
+# provisioned it, but released it just before starting this runner (see the
+# release beside where this file was generated). From here the lock's
+# lifetime has to match THIS run's, not the launcher's (already gone by the
+# time this line runs) and not tmux's (whose server outlives every run and
+# must never be the one holding it) -- so this process reacquires it fresh,
+# as close to its own first line as sourcing fork-sandbox-lib.sh above
+# allows. clone_lock_path is empty for a fresh clone under run_dir (no
+# --clone-dir), which nothing else can ever reach and so needs no lock.
+if [[ -n "${clone_lock_path:-}" ]]; then
+    fs_lock_clone_dir "$clone_dir"
+fi
+
 # The two coding-leg argvs. The launcher emits them only on a
 # --session-state run, where the coding legs differ from every other leg by
 # the transcript-store bind; with no such flag there is nothing to differ by
@@ -5637,7 +5682,11 @@ run_cleanup() {
     _cleanup_done=1
     if [[ -n "${clone_lock_fd:-}" ]]; then
         flock -u "$clone_lock_fd" 2>/dev/null || true
-        exec {clone_lock_fd}>&- 2>/dev/null || true
+        # Braces scope the redirect to just this close: a bare
+        # `exec {fd}>&- 2>/dev/null` has no command for exec to run, so its
+        # `2>/dev/null` would apply to the whole rest of this script instead
+        # of just this one open, silently swallowing every later stderr.
+        { exec {clone_lock_fd}>&-; } 2>/dev/null || true
     fi
     if [[ "${#codex_auth_dirs[@]}" -gt 0 ]]; then
         for codex_auth_dir in "${codex_auth_dirs[@]}"; do
@@ -7785,6 +7834,21 @@ exit "$rc"
 RUNNER
 } > "$run_dir/run.sh"
 chmod +x "$run_dir/run.sh"
+
+# The launcher's own hold on the workspace lock ends here: everything that
+# touches this workspace's git state or provisions it happens above, and
+# the runner about to start is what needs to hold the lock for the rest of
+# the run's life, not this process. Releasing it here rather than letting
+# it ride into `tmux new-session -d` (or an --foreground exec) is what
+# keeps it out of tmux's server and the harness -- neither is meant to hold
+# it, and both have wedged or dropped it when they did (see the comment
+# above fs_lock_clone_dir's launcher-side call). The runner reacquires it
+# itself, fresh, as its first action -- see clone_lock_path in the RUNNER
+# heredoc below.
+if [[ -n "$clone_lock_fd" ]]; then
+    flock -u "$clone_lock_fd" 2>/dev/null || true
+    { exec {clone_lock_fd}>&-; } 2>/dev/null || true
+fi
 
 where="here, in the foreground"
 if ! $foreground; then
