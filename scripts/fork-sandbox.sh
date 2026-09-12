@@ -181,13 +181,17 @@
 #                        has no host directory to bind. It exists so a caller
 #                        that wakes the same agent repeatedly — the
 #                        postmaster, on one mail thread — can hand the next
-#                        wake the previous one's transcript. The IMPLEMENT
-#                        leg alone is bound: a review, fix or maintainer leg
+#                        wake the previous one's transcript. The CODING legs
+#                        alone are bound: a review, fix or maintainer leg
 #                        is a different conversation, and its transcript in
 #                        the store would be the newest one there, which is
 #                        the one summary.json reports as this run's
 #                        session_id. --refresh-at continuations are the same
-#                        conversation continued, and do write there.
+#                        conversation continued, so they do write there --
+#                        but they are never RESUMED, whatever
+#                        --resume-session says: a continuation exists to
+#                        drop the context it inherited, and resuming it
+#                        would hand that context straight back.
 #                        summary.json gains two keys on such a run, and only
 #                        on such a run: `session_state`, the directory, and
 #                        `session_id`, the stem of the newest transcript in
@@ -201,7 +205,10 @@
 #                        <dir> is the durable copy instead.
 # --resume-session <id>: resume the claude session <id> instead of starting a
 #                        fresh one, with this run's handoff delivered as the
-#                        new prompt. Requires --session-state, which is where
+#                        new prompt. The FIRST coding leg only: a --refresh-at
+#                        continuation of it starts fresh by design, and no
+#                        review, fix or maintainer leg is resumed at all.
+#                        Requires --session-state, which is where
 #                        the transcript is read from; claude only. <id> must
 #                        match ^[0-9a-f-]{8,64}$ — it is a transcript
 #                        filename stem, so anything with a slash or a dot is
@@ -4547,9 +4554,13 @@ run_log_bin="$(command -v sandbox-run-log.py 2>/dev/null || true)"
 # above already computed once, in the same order, on every call -- so a
 # call for "impl" and a call for "rev" can never disagree about them,
 # without a second array to keep in sync by hand. $1 is the prefix; $2 is
-# the name of the array to write the built command into.
+# the name of the array to write the built command into. $3 is this argv's
+# claude transcript-store mode -- "none" (the default), "state" or "resume",
+# see the --session-state block below -- and is the one input that is NOT a
+# property of the harness: two legs of the same harness need different
+# answers, so the caller states which.
 fs_build_sandbox_cmd() {
-    local prefix="$1" out_name="$2"
+    local prefix="$1" out_name="$2" session_mode="${3:-none}"
 
     local -n b_harness="${prefix}_harness"
     local -n b_model="${prefix}_model"
@@ -4638,16 +4649,21 @@ fs_build_sandbox_cmd() {
     # the sandbox HOME's ~/.claude/projects by claude-sandboxed itself --
     # only that script knows where the synthetic ~/.claude comes from.
     #
-    # The implement leg alone, for the same reason --claude-args is: a review
-    # or fix leg is a DIFFERENT conversation with a different prompt, and
-    # resuming the implement session into one would be wrong. Letting those
-    # legs merely WRITE into the store would be wrong too, because
-    # summary.json reports the newest transcript in it as this run's
-    # session_id -- a review leg's transcript would be the newest, and the
-    # next wake would resume the reviewer instead of the agent.
-    if [[ "$b_harness" == claude && "$prefix" == impl && -n "$session_state" ]]; then
+    # $3 decides, because the prefix cannot: "resume" for the first coding
+    # leg, "state" for a --refresh-at continuation of it, "none" -- the
+    # default, so an unconverted caller gets the safe answer -- for every
+    # other leg. A review, maintainer or fix leg is a DIFFERENT conversation
+    # with a different prompt, so resuming the implement session into one
+    # would be wrong; and letting such a leg merely WRITE into the store
+    # would be wrong too, because summary.json reports the newest transcript
+    # in it as this run's session_id -- a review leg's transcript would be
+    # the newest, and the next wake would resume the reviewer instead of the
+    # agent. A continuation leg is the same conversation continued, so it
+    # does write there, but it must NOT resume: see where the two derived
+    # arrays are built below.
+    if [[ "$b_harness" == claude && "$session_mode" != none && -n "$session_state" ]]; then
         out+=(--session-state "$session_state")
-        if [[ -n "$resume_session" ]]; then
+        if [[ "$session_mode" == resume && -n "$resume_session" ]]; then
             out+=(--resume-session "$resume_session")
         fi
     fi
@@ -4756,6 +4772,36 @@ fs_build_sandbox_cmd() {
     fs_build_sandbox_cmd impl sandbox_cmd
     pi_session_dir="$impl_pi_session_dir"
 }
+
+# The transcript store belongs to the CODING conversation and to nothing
+# else, so it is deliberately absent from sandbox_cmd itself: the review and
+# maintainer commands are copies of that array (below), a preset-less fix,
+# mntfix or repeat-code leg falls through to it in run_leg, and every one of
+# those is a different conversation. Two derived forms carry the flags
+# instead, and only on a --session-state run:
+#
+#   impl_sandbox_cmd -- the first coding leg. Binds the store, and resumes
+#     the caller's session into it when --resume-session asked for one.
+#   cont_sandbox_cmd -- a --refresh-at continuation leg. Binds the store and
+#     never resumes. The continuation prompt tells that leg it is "that
+#     fresh session, with none of its memory"; --resume would load the very
+#     conversation the refresh exists to drop, so the leg would start at or
+#     above the threshold it just crossed and hand off again at once,
+#     spending every remaining --refresh-max leg at full price and making no
+#     progress. It still WRITES there -- its transcript is then the newest
+#     in the store, which is what summary.json reports and a later wake
+#     resumes.
+#
+# "sandbox_cmd" was populated by fs_build_sandbox_cmd's out-nameref just
+# above, not by a literal assignment shellcheck can see -- the same false
+# positive as the review fallback's below.
+# shellcheck disable=SC2154
+impl_sandbox_cmd=("${sandbox_cmd[@]}")
+cont_sandbox_cmd=("${sandbox_cmd[@]}")
+if [[ -n "$session_state" ]]; then
+    fs_build_sandbox_cmd impl impl_sandbox_cmd resume
+    fs_build_sandbox_cmd impl cont_sandbox_cmd state
+fi
 
 # Review legs may use a stronger or independent model, or -- with
 # --review-harness -- a different harness entirely. A different harness
@@ -5179,6 +5225,19 @@ started_at="$(date +%s)"
     printf 'sandbox_cmd=('
     printf '%q ' "${sandbox_cmd[@]}"
     printf ')\n'
+    # The coding legs' own argvs, emitted only when they differ from
+    # sandbox_cmd at all -- i.e. on a --session-state run -- the same
+    # discipline the maintainer arrays below follow, so a run without the
+    # flag carries no state for it. The runner defaults both to sandbox_cmd
+    # when they are absent.
+    if [[ -n "$session_state" ]]; then
+        printf 'impl_sandbox_cmd=('
+        printf '%q ' "${impl_sandbox_cmd[@]}"
+        printf ')\n'
+        printf 'cont_sandbox_cmd=('
+        printf '%q ' "${cont_sandbox_cmd[@]}"
+        printf ')\n'
+    fi
     printf 'review_sandbox_cmd=('
     printf '%q ' "${review_sandbox_cmd[@]}"
     printf ')\n'
@@ -5206,6 +5265,14 @@ started_at="$(date +%s)"
 # Load shared predicates used by the status script as well as this runner, so
 # report display and summary provenance cannot drift between processes.
 source "$script_dir/fork-sandbox-lib.sh"
+
+# The two coding-leg argvs. The launcher emits them only on a
+# --session-state run, where the coding legs differ from every other leg by
+# the transcript-store bind; with no such flag there is nothing to differ by
+# and both are sandbox_cmd itself. Defaulted here rather than always emitted,
+# so a run without the flag carries no state for a feature it never used.
+impl_sandbox_cmd=("${impl_sandbox_cmd[@]-${sandbox_cmd[@]}}")
+cont_sandbox_cmd=("${cont_sandbox_cmd[@]-${sandbox_cmd[@]}}")
 
 events="$run_dir/events.jsonl"
 sandbox_log="$run_dir/sandbox.log"
@@ -5470,12 +5537,12 @@ fi
 rc=0
 if [[ "$mode" != "review-only" ]]; then
 if [[ -n "$formatter" ]]; then
-    "${sandbox_cmd[@]}" < "$handoff" \
+    "${impl_sandbox_cmd[@]}" < "$handoff" \
         2> >(tee -a "$sandbox_log" >&2) \
         | tee -a "$events" \
         | "$formatter"
 else
-    "${sandbox_cmd[@]}" < "$handoff" \
+    "${impl_sandbox_cmd[@]}" < "$handoff" \
         2> >(tee -a "$sandbox_log" >&2) \
         | tee -a "$events"
 fi
@@ -5863,13 +5930,17 @@ if [[ "$refresh_enabled" == "1" ]]; then
             # "last result wins" is exactly "the LAST coding leg's result"),
             # and this leg's own file so its cost and usage can be read in
             # isolation below, the same way a review-loop leg's can.
+            # cont_sandbox_cmd, not sandbox_cmd: identical but for the
+            # transcript-store flags, where a continuation leg writes into
+            # the store and never resumes out of it -- see where the array
+            # is built, in the launcher above.
             if [[ -n "$formatter" ]]; then
-                "${sandbox_cmd[@]}" < "$cont_prompt" \
+                "${cont_sandbox_cmd[@]}" < "$cont_prompt" \
                     2> >(tee -a "$sandbox_log" >&2) \
                     | tee -a "$events" -a "$cont_events" \
                     | "$formatter"
             else
-                "${sandbox_cmd[@]}" < "$cont_prompt" \
+                "${cont_sandbox_cmd[@]}" < "$cont_prompt" \
                     2> >(tee -a "$sandbox_log" >&2) \
                     | tee -a "$events" -a "$cont_events"
             fi
@@ -6161,7 +6232,12 @@ run_leg() {
     fi
     # "fix" and "mntfix" without a preset fix seat, and "code" (a repeat
     # pass of the coding leg), all fall through to the implement defaults
-    # above: those legs run the implement harness and model.
+    # above: those legs run the implement harness and model. Note what they
+    # do NOT inherit: sandbox_cmd carries no --session-state, so none of
+    # them writes into the transcript store. That is deliberate -- each is
+    # its own conversation with its own prompt, and the store's newest
+    # transcript is what summary.json offers the next wake to resume (see
+    # impl_sandbox_cmd/cont_sandbox_cmd in the launcher).
     leg_rc=1
     leg_cost=""
     leg_usage=""

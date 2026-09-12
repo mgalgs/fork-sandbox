@@ -51,6 +51,9 @@ cleanup() {
     local d
     for d in "${tmpdirs[@]-}"; do
         [[ -n "$d" && -e "$d" ]] && rm -rf -- "$d"
+        # The per-call argv files and the call counter the stub writes
+        # beside a registered argv file ("<file>.1", "<file>.count").
+        rm -f -- "$d".[0-9]* "$d".count 2>/dev/null
     done
 }
 trap cleanup EXIT
@@ -219,6 +222,35 @@ cat > "$stub_bin/claude-sandboxed" <<'STUB'
 cat >/dev/null
 printf '%s\n' "$@" >> "$FAKE_ARGV_FILE"
 printf -- '--- end of argv ---\n' >> "$FAKE_ARGV_FILE"
+# ...and once more per invocation, in its own file, so a multi-leg run can be
+# asserted on leg by leg: "$FAKE_ARGV_FILE.1" is the implement leg, ".2" the
+# leg after it, and so on.
+call_n=$(( $(cat "$FAKE_ARGV_FILE.count" 2>/dev/null || printf 0) + 1 ))
+printf '%s\n' "$call_n" > "$FAKE_ARGV_FILE.count"
+printf '%s\n' "$@" > "$FAKE_ARGV_FILE.$call_n"
+# The work dir is the argument before claude's own first flag, and the outbox
+# is the --bind-rw whose basename says so. Both are read off the argv rather
+# than passed in, so this stub cannot disagree with the launcher about them.
+stub_clone=""
+stub_outbox=""
+stub_prev=""
+for a in "$@"; do
+    [[ "$a" == --dangerously-skip-permissions ]] && stub_clone="$stub_prev"
+    [[ "$stub_prev" == --bind-rw && "${a##*/}" == outbox ]] && stub_outbox="$a"
+    stub_prev="$a"
+done
+# FAKE_HANDOFF_ON_CALL=N: write an outbox hand-off on the Nth invocation, so
+# the launcher's --refresh-at loop runs exactly one continuation leg.
+if [[ "${FAKE_HANDOFF_ON_CALL:-}" == "$call_n" && -n "$stub_outbox" ]]; then
+    printf 'done some of it; the rest is left\n' > "$stub_outbox/handoff.md"
+fi
+# FAKE_COMMIT_ON_CALL=N: commit in the clone on the Nth invocation. The
+# review loop refuses to start on a branch whose head still equals the base,
+# so a review leg only ever runs if a coding leg committed something.
+if [[ "${FAKE_COMMIT_ON_CALL:-}" == "$call_n" && -n "$stub_clone" ]]; then
+    git -C "$stub_clone" -c user.email=t@fork-sandbox.invalid -c user.name=Tester \
+        commit -q --allow-empty -m 'stub work' >/dev/null 2>&1
+fi
 # Stand in for the claude CLI's transcript store when the caller asks for
 # one: FAKE_TRANSCRIPTS is "<stem>@<mtime> ..." and each becomes a .jsonl
 # under a per-project directory of the bound state dir, exactly where the
@@ -338,6 +370,88 @@ else
         no "a run with no --session-state passes neither flag" "$(cat "$plain_argv")"
     else
         ok "a run with no --session-state passes neither flag"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+printf '\n== the store belongs to the coding legs alone ==\n'
+# ---------------------------------------------------------------------------
+
+# A --refresh-at continuation is the same conversation continued, so it
+# WRITES into the store -- but it must never be handed --resume-session. The
+# continuation prompt tells that leg it is "that fresh session, with none of
+# its memory"; resuming would load the very conversation the refresh exists
+# to drop, so the leg would start at or above the threshold it just crossed
+# and hand off again at once, spending every --refresh-max leg for nothing.
+# --refresh-at needs no flag here: it defaults to 0.5 on the claude harness,
+# which is how the postmaster launches every wake.
+cont_home="$(mktmp_dir "$scratch/fs-resume-home.XXXXXX")"
+cont_state="$(mktmp_dir "$scratch/fs-resume-state.XXXXXX")"
+cont_sid=0123abcd-4567-89ab-cdef-0123456789ab
+export FAKE_HANDOFF_ON_CALL=1
+cont_result="$(run_and_capture_argv "$cont_home" \
+    --session-state "$cont_state" --resume-session "$cont_sid")"
+cont_rc=$?
+unset FAKE_HANDOFF_ON_CALL
+register_run_paths "$cont_result"
+cont_argv="$REGISTERED_ARGV_FILE"
+
+if (( cont_rc != 0 )); then
+    no "a continuation leg ran" "run failed"
+elif [[ ! -f "$cont_argv.2" ]]; then
+    no "a continuation leg ran" "only $(cat "$cont_argv.count" 2>/dev/null) leg(s) launched"
+else
+    ok "a continuation leg ran"
+    if argv_has_flag_value "$cont_argv.1" --resume-session "$cont_sid"; then
+        ok "the implement leg still resumes the caller's session"
+    else
+        no "the implement leg still resumes the caller's session" \
+            "$(cat "$cont_argv.1")"
+    fi
+    if argv_has_flag_value "$cont_argv.2" --session-state "$cont_state"; then
+        ok "the continuation leg still binds the store"
+    else
+        no "the continuation leg still binds the store" "$(cat "$cont_argv.2")"
+    fi
+    if argv_has_word "$cont_argv.2" --resume-session; then
+        no "the continuation leg is NOT resumed" "$(cat "$cont_argv.2")"
+    else
+        ok "the continuation leg is NOT resumed"
+    fi
+fi
+
+# A review leg is a different conversation with a different prompt, so it
+# gets neither flag: resuming the agent's session into it would append the
+# reviewer's turns to the agent's own transcript, and merely writing there
+# would make the review the newest transcript in the store -- which is the
+# one summary.json reports as this run's session_id, and the one the next
+# wake would resume.
+rev_home="$(mktmp_dir "$scratch/fs-resume-home.XXXXXX")"
+rev_state="$(mktmp_dir "$scratch/fs-resume-state.XXXXXX")"
+# --review-loop refuses to launch without the review leg's method on the
+# host, and this fixture HOME has nothing in it. Stage the repo's own copy,
+# the same place install.sh puts it.
+mkdir -p "$rev_home/.claude/skills"
+cp -R "$repo_dir/skills/code-review-portable" "$rev_home/.claude/skills/"
+export FAKE_COMMIT_ON_CALL=1
+rev_result="$(run_and_capture_argv "$rev_home" --review-loop 1 \
+    --session-state "$rev_state" --resume-session "$cont_sid")"
+rev_rc=$?
+unset FAKE_COMMIT_ON_CALL
+register_run_paths "$rev_result"
+rev_argv="$REGISTERED_ARGV_FILE"
+
+if (( rev_rc != 0 )); then
+    no "a review leg ran" "run failed"
+elif [[ ! -f "$rev_argv.2" ]]; then
+    no "a review leg ran" "only $(cat "$rev_argv.count" 2>/dev/null) leg(s) launched"
+else
+    ok "a review leg ran"
+    if argv_has_word "$rev_argv.2" --session-state \
+        || argv_has_word "$rev_argv.2" --resume-session; then
+        no "the review leg gets neither flag" "$(cat "$rev_argv.2")"
+    else
+        ok "the review leg gets neither flag"
     fi
 fi
 
