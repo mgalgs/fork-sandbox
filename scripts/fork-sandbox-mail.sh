@@ -140,6 +140,14 @@ mail_validate_no_newline() {
     return 0
 }
 
+# Strips leading/trailing whitespace and prints the result.
+mail_trim() {
+    local s="$1"
+    s="${s#"${s%%[![:space:]]*}"}"
+    s="${s%"${s##*[![:space:]]}"}"
+    printf '%s' "$s"
+}
+
 # Validates a comma-separated list of addresses and prints it back
 # normalized as ", "-joined, or nothing for an empty list.
 mail_validate_addr_list() {
@@ -149,8 +157,7 @@ mail_validate_addr_list() {
     IFS=',' read -ra parts <<< "$list"
     local p out=""
     for p in "${parts[@]}"; do
-        p="${p#"${p%%[![:space:]]*}"}"
-        p="${p%"${p##*[![:space:]]}"}"
+        p="$(mail_trim "$p")"
         mail_validate_addr "$p" || return 1
         out="${out:+$out, }$p"
     done
@@ -432,8 +439,7 @@ cmd_reply() {
             IFS=',' read -ra parts <<< "$rest"
             local a
             for a in "${parts[@]}"; do
-                a="${a#"${a%%[![:space:]]*}"}"
-                a="${a%"${a##*[![:space:]]}"}"
+                a="$(mail_trim "$a")"
                 [[ -n "$a" ]] && candidates+=("$a")
             done
         fi

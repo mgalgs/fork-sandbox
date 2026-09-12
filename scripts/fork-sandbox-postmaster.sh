@@ -119,16 +119,18 @@
 #   <blank line>
 #   body...
 #
-# Once a run reaches terminal state (its run dir has an exit-code file),
-# the harvester posts each mail-*.md via fork-sandbox-mail.sh as
+# Once a run reaches terminal state -- its run dir has an exit-code file,
+# or its pid has gone dead without one ever landing (see pm_wake_is_dead)
+# -- the harvester posts each mail-*.md via fork-sandbox-mail.sh as
 # --from @<agent>, passing --hops explicitly as (trigger's X-Hops - 1) on
 # BOTH the ordinary reply path and the new-thread path -- `mail.sh reply`
 # takes a --hops override for exactly this (round 3 is this script, per
-# fork-sandbox-mail.sh's own header comment). A non-zero exit code is
-# harvested the same as a zero one (its outbox, if any, is still posted)
-# but also flags the thread, since an empty outbox from a crashed wake is
-# not the documented "no reply is a valid outcome" and needs an operator's
-# eyes. A malformed reply file (bad address, unparseable stanza, or a
+# fork-sandbox-mail.sh's own header comment). A non-zero exit code, and a
+# wake that died without ever writing one, are both harvested the same as
+# a zero exit code (their outbox, if any, is still posted) but also flag
+# the thread, since an empty outbox from a crashed wake is not the
+# documented "no reply is a valid outcome" and needs an operator's eyes.
+# A malformed reply file (bad address, unparseable stanza, or a
 # `mail.sh` call that itself fails) is skipped and flags the thread with
 # the filename and the reason -- it never costs the run's other,
 # well-formed replies. The run is then marked harvested exactly once.
@@ -221,11 +223,13 @@
 #   - A spawned wake whose process died without ever writing exit-code --
 #     tmux session killed, host rebooted mid-run -- is detected at harvest
 #     via its run dir's pid file (see pm_wake_is_dead): once that pid is
-#     dead and PM_WAKE_DEAD_GRACE seconds have passed, the thread is
-#     flagged, the agent unblocks and the recorded session id is cleared.
-#     Residual gap: a pid recycled by the OS onto a live, unrelated
-#     process reads as "alive" here, so detection waits for THAT process
-#     to exit too -- vanishingly rare, and the same gap fork-sandbox-status.sh's
+#     dead (or its pid file predates the current boot, per /proc/stat's
+#     btime) and FORK_SANDBOX_POSTMASTER_WAKE_DEAD_GRACE seconds have
+#     passed, the thread is flagged, the agent unblocks and the recorded
+#     session id is cleared. Residual gap: a pid recycled by the OS onto a
+#     live, unrelated process *within the same boot* reads as "alive"
+#     here, so detection waits for THAT process to exit too --
+#     vanishingly rare, and the same gap fork-sandbox-status.sh's
 #     "abandoned" state already accepts for the identical check.
 
 set -euo pipefail
@@ -270,7 +274,7 @@ PM_SESSIONS="$STATE/sessions"
 # summary.json reported before it is recorded: a malformed id would make
 # the launcher refuse EVERY later wake of that seat, which is a wedge, and
 # the value comes from a filename this script never chose.
-PM_SESSION_ID_RE='^[0-9a-f-]{8,64}$'
+PM_SESSION_ID_RE='^[0-9a-f][0-9a-f-]{7,63}$'
 
 PM_ADDR_RE='^@[a-z0-9][a-z0-9-]*$'
 
@@ -797,20 +801,36 @@ pm_followup_wake() {
 # reads as "recent" here even though kill -0 has nothing to check yet.
 #
 # Residual gap: a pid recycled by the OS onto a live, unrelated process
-# reads as "alive" here, so detection waits for THAT process to exit too.
-# Vanishingly rare in practice (pid reuse needs the full pid space to
-# wrap), and the same gap `fork-sandbox-status.sh`'s "abandoned" state and
-# `fork-sandbox-say.sh` already accept for the identical check.
-PM_WAKE_DEAD_GRACE="${PM_WAKE_DEAD_GRACE:-60}"
+# *within the same boot* reads as "alive" here, so detection waits for
+# THAT process to exit too. Vanishingly rare in practice (pid reuse needs
+# the full pid space to wrap), and the same gap `fork-sandbox-status.sh`'s
+# "abandoned" state and `fork-sandbox-say.sh` already accept for the
+# identical check. A reboot does NOT fall into this residual gap even
+# though the pid counter restarts from the bottom: run dirs live under
+# /var/tmp/claude-scratch and survive a reboot, so the check below also
+# rejects a pid file older than the current boot outright, since whatever
+# it names now cannot be the process that wrote it.
+FORK_SANDBOX_POSTMASTER_WAKE_DEAD_GRACE="${FORK_SANDBOX_POSTMASTER_WAKE_DEAD_GRACE:-60}"
+
+# /proc/stat's own boot time, read from the real file by default;
+# overridable so the test suite can fake a reboot with a fixture file
+# instead of actually rebooting the host it runs on.
+FORK_SANDBOX_POSTMASTER_PROC_STAT="${FORK_SANDBOX_POSTMASTER_PROC_STAT:-/proc/stat}"
 
 pm_wake_is_dead() {
     local run_dir="$1" env_file="$2"
-    local pid_file="$run_dir/pid" now ref_mtime pid
+    local pid_file="$run_dir/pid" now ref_mtime pid btime
     now="$(date +%s)"
+    btime="$(awk '/^btime /{print $2}' "$FORK_SANDBOX_POSTMASTER_PROC_STAT" 2>/dev/null)"
+    [[ "$btime" =~ ^[0-9]+$ ]] || btime=""
     if pid="$(cat -- "$pid_file" 2>/dev/null)"; then
         pid="$(pm_trim "$pid")"
         ref_mtime="$("$FS_STAT" -c %Y -- "$pid_file" 2>/dev/null)" || ref_mtime="$now"
-        if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+        if [[ -n "$btime" && "$ref_mtime" -lt "$btime" ]]; then
+            : # pid file predates this boot; the pid it names, even if
+              # live, belongs to a different boot's process table and
+              # cannot be this run's own process.
+        elif [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
             return 1
         fi
     else
@@ -819,7 +839,7 @@ pm_wake_is_dead() {
         # itself would have written the pid file.
         ref_mtime="$("$FS_STAT" -c %Y -- "$env_file" 2>/dev/null)" || ref_mtime="$now"
     fi
-    (( now - ref_mtime >= PM_WAKE_DEAD_GRACE ))
+    (( now - ref_mtime >= FORK_SANDBOX_POSTMASTER_WAKE_DEAD_GRACE ))
 }
 
 pm_harvest_run() {
@@ -848,39 +868,45 @@ pm_harvest_run() {
         return 0
     fi
     if [[ ! -f "$run_dir/exit-code" ]]; then
-        if pm_wake_is_dead "$run_dir" "$f"; then
-            pm_flag "$tid" "wake died without exit-code: $rid"
-            pm_session_clear "$tid" "$agent"
-            mkdir -p -- "$HARVESTED"
-            : > "$HARVESTED/$rid"
+        if ! pm_wake_is_dead "$run_dir" "$f"; then
+            return 0
         fi
-        return 0
-    fi
-
-    local exit_code
-    exit_code="$(pm_trim "$(cat -- "$run_dir/exit-code" 2>/dev/null)")"
-    if [[ "$exit_code" != "0" ]]; then
-        # Harvest whatever outbox there is (a crash mid-reply may still
-        # have written a file), but flag regardless: an empty outbox from
-        # a non-zero exit is a failure, not the documented "no reply is a
-        # valid outcome".
-        pm_flag "$tid" "wake for $agent exited $exit_code (run $rid); outbox may be incomplete"
-        # ...and forget the session, so the next wake of this seat is a
-        # fresh one. A failed resumed wake is exactly the case where the
-        # recorded id is the suspect.
+        # Same crash shape as a non-zero exit code below -- no exit-code
+        # ever landed, but the outbox is a host directory bind-mounted rw
+        # into the sandbox, so a reply the agent finished composing before
+        # the runner died is already on disk. Flag the thread, forget the
+        # session (a wake that never finished is exactly the case where
+        # the recorded id is the suspect), and fall through to the shared
+        # outbox-harvest and pending-message handling below rather than
+        # discarding both.
+        pm_flag "$tid" "wake died without exit-code: $rid"
         pm_session_clear "$tid" "$agent"
     else
-        # Which session the next wake should resume. Absent (no
-        # --session-state on this seat, or no jq on the host), null or
-        # malformed leaves whatever was recorded before standing: a wake
-        # that ended without writing a transcript has not invalidated the
-        # one the store already holds, and the worst case is a fresh
-        # wake, which always works.
-        local sid
-        sid="$(pm_trim "$(jq -r '.session_id // empty' \
-            "$run_dir/summary.json" 2>/dev/null || true)")"
-        if [[ "$sid" =~ $PM_SESSION_ID_RE ]]; then
-            pm_session_record "$tid" "$agent" "$sid"
+        local exit_code
+        exit_code="$(pm_trim "$(cat -- "$run_dir/exit-code" 2>/dev/null)")"
+        if [[ "$exit_code" != "0" ]]; then
+            # Harvest whatever outbox there is (a crash mid-reply may still
+            # have written a file), but flag regardless: an empty outbox from
+            # a non-zero exit is a failure, not the documented "no reply is a
+            # valid outcome".
+            pm_flag "$tid" "wake for $agent exited $exit_code (run $rid); outbox may be incomplete"
+            # ...and forget the session, so the next wake of this seat is a
+            # fresh one. A failed resumed wake is exactly the case where the
+            # recorded id is the suspect.
+            pm_session_clear "$tid" "$agent"
+        else
+            # Which session the next wake should resume. Absent (no
+            # --session-state on this seat, or no jq on the host), null or
+            # malformed leaves whatever was recorded before standing: a wake
+            # that ended without writing a transcript has not invalidated the
+            # one the store already holds, and the worst case is a fresh
+            # wake, which always works.
+            local sid
+            sid="$(pm_trim "$(jq -r '.session_id // empty' \
+                "$run_dir/summary.json" 2>/dev/null || true)")"
+            if [[ "$sid" =~ $PM_SESSION_ID_RE ]]; then
+                pm_session_record "$tid" "$agent" "$sid"
+            fi
         fi
     fi
 

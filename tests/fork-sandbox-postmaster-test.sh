@@ -732,7 +732,7 @@ dead_pid_of() {
 # spawn's run dir has no pid file yet -- the stub does not write one -- and
 # with 60s of grace that reads as "not dead yet", exactly as a real run's
 # runner has not written its pid file in the first instant either).
-# PM_WAKE_DEAD_GRACE is only lowered right before the harvest pass under
+# FORK_SANDBOX_POSTMASTER_WAKE_DEAD_GRACE is only lowered right before the harvest pass under
 # test, never before the spawn, so the spawn itself never trips the check
 # this section exists to exercise.
 
@@ -748,9 +748,9 @@ mkdir -p -- "$FORK_SANDBOX_MAIL_ROOT/.postmaster/sessions/$tid"
 printf '%s\n' 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' \
     > "$FORK_SANDBOX_MAIL_ROOT/.postmaster/sessions/$tid/alice"
 printf '%s\n' "$(dead_pid_of)" > "$run_dir/pid"
-export PM_WAKE_DEAD_GRACE=0
+export FORK_SANDBOX_POSTMASTER_WAKE_DEAD_GRACE=0
 once
-unset PM_WAKE_DEAD_GRACE
+unset FORK_SANDBOX_POSTMASTER_WAKE_DEAD_GRACE
 contains "dead pid, no grace: thread is flagged with the wake-died reason" \
     "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid" 2>/dev/null || true)" \
     "wake died without exit-code"
@@ -761,6 +761,53 @@ check "dead pid, no grace: the recorded session id is cleared" 0 \
 
 new_scratch_root FORK_SANDBOX_MAIL_ROOT
 export FORK_SANDBOX_MAIL_ROOT
+mid="$(send_msg '@carol' '@alice' 'dead pid, reply already on disk' 'body' 8)"
+tid="$(thread_of "$mid")"
+: > "$STUB_ARGV_LOG"
+once
+run_env="$(env_file_for_agent alice)"
+run_dir="$(sed -n 's/^RUN_DIR=//p' "$run_env")"
+mkdir -p -- "$run_dir/outbox"
+printf '\nGot it, working on it.\n' > "$run_dir/outbox/mail-1.md"
+printf '%s\n' "$(dead_pid_of)" > "$run_dir/pid"
+export FORK_SANDBOX_POSTMASTER_WAKE_DEAD_GRACE=0
+once
+unset FORK_SANDBOX_POSTMASTER_WAKE_DEAD_GRACE
+reply_posted=0
+for f in "$FORK_SANDBOX_MAIL_ROOT/threads/$tid"/*.msg; do
+    [[ -e "$f" ]] || continue
+    grep -qF 'Got it, working on it.' "$f" && reply_posted=1
+done
+check "dead pid, reply on disk: the reply that finished composing before the runner died is posted" 1 "$reply_posted"
+contains "dead pid, reply on disk: thread is still flagged (a died wake is not a healthy outcome)" \
+    "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid" 2>/dev/null || true)" \
+    "wake died without exit-code"
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+mid1="$(send_msg '@carol' '@alice' 'dead pid, pending message queued' 'body' 8)"
+tid="$(thread_of "$mid1")"
+: > "$STUB_ARGV_LOG"
+once
+run_env="$(env_file_for_agent alice)"
+run_dir="$(sed -n 's/^RUN_DIR=//p' "$run_env")"
+mid2="$(reply_msg '@carol' "$mid1" 'a second message while alice is still working' --to '@alice')"
+: > "$STUB_ARGV_LOG"
+once
+contains "dead pid, pending: message id recorded as pending on the live run" \
+    "$(cat "$run_env")" "PENDING_MSGS=$mid2"
+printf '%s\n' "$(dead_pid_of)" > "$run_dir/pid"
+export FORK_SANDBOX_POSTMASTER_WAKE_DEAD_GRACE=0
+: > "$STUB_ARGV_LOG"
+once
+unset FORK_SANDBOX_POSTMASTER_WAKE_DEAD_GRACE
+check "dead pid, pending: harvest still fires a follow-up wake for the pending message" 1 \
+    "$(grep -c -- "^sbx-mail-${tid:0:8}-alice-" "$STUB_ARGV_LOG")"
+contains "dead pid, pending: follow-up wake's TRIGGER is the pending message" \
+    "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/runs"/*.env)" "TRIGGER=$mid2"
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
 mid="$(send_msg '@carol' '@alice' 'dead pid, within grace' 'body' 8)"
 tid="$(thread_of "$mid")"
 : > "$STUB_ARGV_LOG"
@@ -768,9 +815,9 @@ once
 run_env="$(env_file_for_agent alice)"
 run_dir="$(sed -n 's/^RUN_DIR=//p' "$run_env")"
 printf '%s\n' "$(dead_pid_of)" > "$run_dir/pid"
-export PM_WAKE_DEAD_GRACE=3600
+export FORK_SANDBOX_POSTMASTER_WAKE_DEAD_GRACE=3600
 once
-unset PM_WAKE_DEAD_GRACE
+unset FORK_SANDBOX_POSTMASTER_WAKE_DEAD_GRACE
 check "dead pid, within grace: not yet flagged" 0 \
     "$( [[ -e "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid" ]] && echo 1 || echo 0 )"
 check "dead pid, within grace: not yet harvested (still counts as live)" "0" \
@@ -784,9 +831,9 @@ tid="$(thread_of "$mid")"
 once
 # No pid file at all is written -- the stub fabricates a run dir with only
 # outbox/ under it.
-export PM_WAKE_DEAD_GRACE=0
+export FORK_SANDBOX_POSTMASTER_WAKE_DEAD_GRACE=0
 once
-unset PM_WAKE_DEAD_GRACE
+unset FORK_SANDBOX_POSTMASTER_WAKE_DEAD_GRACE
 contains "missing pid file: flagged with the wake-died reason" \
     "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid" 2>/dev/null || true)" \
     "wake died without exit-code"
@@ -802,12 +849,60 @@ once
 run_env="$(env_file_for_agent alice)"
 run_dir="$(sed -n 's/^RUN_DIR=//p' "$run_env")"
 printf '%s\n' "$$" > "$run_dir/pid"
-export PM_WAKE_DEAD_GRACE=0
+export FORK_SANDBOX_POSTMASTER_WAKE_DEAD_GRACE=0
 once
-unset PM_WAKE_DEAD_GRACE
+unset FORK_SANDBOX_POSTMASTER_WAKE_DEAD_GRACE
 check "live pid: not flagged" 0 \
     "$( [[ -e "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid" ]] && echo 1 || echo 0 )"
 check "live pid: not harvested (a genuinely running wake is left alone)" "0" \
+    "$(find "$FORK_SANDBOX_MAIL_ROOT/.postmaster/harvested" -type f | wc -l)"
+
+# A pid file that predates the current boot names a pid from a process
+# table that no longer exists -- even a live, unrelated pid recycled onto
+# it by the new boot must not be read as this run's own process. Faked
+# here with a fixture instead of an actual reboot: a real one would take
+# the test host down too.
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+mid="$(send_msg '@carol' '@alice' 'pid file predates a reboot' 'body' 8)"
+tid="$(thread_of "$mid")"
+: > "$STUB_ARGV_LOG"
+once
+run_env="$(env_file_for_agent alice)"
+run_dir="$(sed -n 's/^RUN_DIR=//p' "$run_env")"
+printf '%s\n' "$$" > "$run_dir/pid"
+touch -d '@1000000000' "$run_dir/pid"
+fake_proc_stat="$FORK_SANDBOX_MAIL_ROOT/fake-proc-stat"
+printf 'btime 1700000000\n' > "$fake_proc_stat"
+export FORK_SANDBOX_POSTMASTER_PROC_STAT="$fake_proc_stat"
+export FORK_SANDBOX_POSTMASTER_WAKE_DEAD_GRACE=0
+once
+unset FORK_SANDBOX_POSTMASTER_PROC_STAT FORK_SANDBOX_POSTMASTER_WAKE_DEAD_GRACE
+contains "reboot: a live pid whose pid file predates the current boot is flagged" \
+    "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid" 2>/dev/null || true)" \
+    "wake died without exit-code"
+check "reboot: a live pid whose pid file predates the current boot is harvested" "1" \
+    "$(find "$FORK_SANDBOX_MAIL_ROOT/.postmaster/harvested" -type f | wc -l)"
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+mid="$(send_msg '@carol' '@alice' 'pid file postdates the boot' 'body' 8)"
+tid="$(thread_of "$mid")"
+: > "$STUB_ARGV_LOG"
+once
+run_env="$(env_file_for_agent alice)"
+run_dir="$(sed -n 's/^RUN_DIR=//p' "$run_env")"
+printf '%s\n' "$$" > "$run_dir/pid"
+touch -d '@1700000000' "$run_dir/pid"
+fake_proc_stat="$FORK_SANDBOX_MAIL_ROOT/fake-proc-stat"
+printf 'btime 1000000000\n' > "$fake_proc_stat"
+export FORK_SANDBOX_POSTMASTER_PROC_STAT="$fake_proc_stat"
+export FORK_SANDBOX_POSTMASTER_WAKE_DEAD_GRACE=0
+once
+unset FORK_SANDBOX_POSTMASTER_PROC_STAT FORK_SANDBOX_POSTMASTER_WAKE_DEAD_GRACE
+check "same boot: a live pid whose pid file postdates the boot is left alone" 0 \
+    "$( [[ -e "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid" ]] && echo 1 || echo 0 )"
+check "same boot: not harvested (a genuinely running wake is left alone)" "0" \
     "$(find "$FORK_SANDBOX_MAIL_ROOT/.postmaster/harvested" -type f | wc -l)"
 
 # ============================================================
@@ -925,6 +1020,19 @@ check "resume: ...and still binds the state dir" \
 finish_run alice 0 'not a session id'
 once
 check "resume: a malformed session id is not recorded" 0 \
+    "$( [[ -e "$res_sessions" ]] && echo 1 || echo 0 )"
+
+# A session-state directory bound rw into the sandbox can end up with a
+# transcript named with a leading hyphen; fork-sandbox.sh's own
+# --resume-session gate refuses that shape (a resumed value with a
+# leading hyphen would be misread as another flag), so PM_SESSION_ID_RE
+# must reject it too, or this seat records an id the launcher then
+# refuses on every later wake.
+reply_msg '@carol' "$res_mid1" 'fourth message' --to '@alice' >/dev/null
+once
+finish_run alice 0 '-abcdef12'
+once
+check "resume: a session id with a leading hyphen is not recorded" 0 \
     "$( [[ -e "$res_sessions" ]] && echo 1 || echo 0 )"
 
 # pi and codex have no resume support and fork-sandbox.sh refuses both
