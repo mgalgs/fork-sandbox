@@ -801,7 +801,7 @@ once
 unset FORK_SANDBOX_POSTMASTER_WAKE_DEAD_GRACE
 contains "dead pid, no grace: thread is flagged with the wake-died reason" \
     "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid" 2>/dev/null || true)" \
-    "wake died without exit-code"
+    "wake never produced summary.json"
 check "dead pid, no grace: the run is marked harvested (agent unblocks)" "1" \
     "$(find "$FORK_SANDBOX_MAIL_ROOT/.postmaster/harvested" -type f | wc -l)"
 check "dead pid, no grace: the recorded session id is cleared" 0 \
@@ -829,7 +829,7 @@ done
 check "dead pid, reply on disk: the reply that finished composing before the runner died is posted" 1 "$reply_posted"
 contains "dead pid, reply on disk: thread is still flagged (a died wake is not a healthy outcome)" \
     "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid" 2>/dev/null || true)" \
-    "wake died without exit-code"
+    "wake never produced summary.json"
 
 new_scratch_root FORK_SANDBOX_MAIL_ROOT
 export FORK_SANDBOX_MAIL_ROOT
@@ -884,7 +884,7 @@ once
 unset FORK_SANDBOX_POSTMASTER_WAKE_DEAD_GRACE
 contains "missing pid file: flagged with the wake-died reason" \
     "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid" 2>/dev/null || true)" \
-    "wake died without exit-code"
+    "wake never produced summary.json"
 check "missing pid file: marked harvested" "1" \
     "$(find "$FORK_SANDBOX_MAIL_ROOT/.postmaster/harvested" -type f | wc -l)"
 
@@ -928,7 +928,7 @@ once
 unset FORK_SANDBOX_POSTMASTER_PROC_STAT FORK_SANDBOX_POSTMASTER_WAKE_DEAD_GRACE
 contains "reboot: a live pid whose pid file predates the current boot is flagged" \
     "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid" 2>/dev/null || true)" \
-    "wake died without exit-code"
+    "wake never produced summary.json"
 check "reboot: a live pid whose pid file predates the current boot is harvested" "1" \
     "$(find "$FORK_SANDBOX_MAIL_ROOT/.postmaster/harvested" -type f | wc -l)"
 

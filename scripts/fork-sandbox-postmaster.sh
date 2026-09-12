@@ -902,7 +902,7 @@ pm_harvest_run() {
         # the recorded id is the suspect), and fall through to the shared
         # outbox-harvest and pending-message handling below rather than
         # discarding both.
-        pm_flag "$tid" "wake died without exit-code: $rid"
+        pm_flag "$tid" "wake never produced summary.json: $rid"
         pm_session_clear "$tid" "$agent"
     else
         local exit_code
