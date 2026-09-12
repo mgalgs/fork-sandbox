@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# fork-sandbox-clone-test.sh — Exercise fs_make_clone's git-identity seeding
+# fork-sandbox-clone-test.sh — Exercise fs_make_clone's git-identity seeding,
+# and fs_reuse_clone's branch-start behavior
 #
 # Usage: tests/fork-sandbox-clone-test.sh
 #
@@ -11,6 +12,13 @@
 # commit the sandbox made came back authored by whatever ~/.gitconfig said.
 # Nothing downstream caught it: cherry-pick and rebase deliberately keep the
 # author, so integration carried the wrong address into real history.
+#
+# Also covers fs_reuse_clone, fs_make_clone's counterpart for a --clone-dir
+# target that already exists: it fetches the existing clone's origin remote
+# and starts a new branch at the clone's own current HEAD -- the previous
+# wake's branch tip -- instead of making a fresh clone. Identity seeding does
+# not apply to it: a reused clone already has repo-local identity config from
+# when fs_make_clone first created it.
 #
 # Every case runs against a throwaway global config (GIT_CONFIG_GLOBAL) with
 # the system one switched off, so the identities are the test's own: the host's
@@ -203,6 +211,52 @@ if fs_make_clone "$scratch/not-a-repo" "sandbox/five" "$clone" >/dev/null 2>&1; 
     no "an unclonable source still returns non-zero"
 else
     ok "an unclonable source still returns non-zero"
+fi
+
+printf '\n== fs_reuse_clone: branch start point on an existing clone ==\n'
+
+# A "prior wake's" clone: build it with fs_make_clone exactly as the launcher
+# does, then commit something in it, the way a coding leg would.
+origin="$(new_origin)"
+prior_clone="$(new_clone_path)"
+fs_make_clone "$origin" "prior-branch" "$prior_clone" >/dev/null 2>&1
+config_commit "$prior_clone" "prior wake work" >/dev/null 2>&1
+prior_commit="$(git -C "$prior_clone" rev-parse HEAD)"
+
+reuse_out="$(fs_reuse_clone "$prior_clone" "next-branch" 2>&1)"
+check "fs_reuse_clone succeeds" "0" "$?"
+check "reuse is silent on success" "" "$reuse_out"
+check "the new branch is checked out" \
+    "next-branch" "$(git -C "$prior_clone" rev-parse --abbrev-ref HEAD)"
+check "the new branch starts at the prior wake's own commit" \
+    "$prior_commit" "$(git -C "$prior_clone" rev-parse HEAD)"
+check "identity config is untouched by reuse (still the origin's)" \
+    "$GLOBAL_EMAIL" "$(cd "$prior_clone" && git config --local --get user.email)"
+
+# The fallback path: a --clone-dir target that is a valid git repo but has no
+# commits at all (its own HEAD cannot be resolved), the one legitimate way a
+# real reused clone could lack a branch tip to start from.
+fallback_origin="$(new_origin)"
+fallback_sha="$(git -C "$fallback_origin" rev-parse HEAD)"
+empty_target="$(mktemp -d)"
+tmpdirs+=("$empty_target")
+(cd "$empty_target" && git init -q .) >/dev/null 2>&1
+git -C "$empty_target" remote add origin "$fallback_origin" >/dev/null 2>&1
+
+fs_reuse_clone "$empty_target" "fallback-branch" "$fallback_sha" >/dev/null 2>&1
+check "fs_reuse_clone with an unresolvable HEAD still succeeds" "0" "$?"
+check "the fallback sha places the branch" \
+    "$fallback_sha" "$(git -C "$empty_target" rev-parse --verify --quiet HEAD)"
+
+# Callers exit on a non-zero return, so a fetch failure (no such origin
+# remote) must stay non-zero.
+noorigin_target="$(mktemp -d)"
+tmpdirs+=("$noorigin_target")
+(cd "$noorigin_target" && git init -q .) >/dev/null 2>&1
+if fs_reuse_clone "$noorigin_target" "doomed-branch" >/dev/null 2>&1; then
+    no "a clone with no origin remote still returns non-zero"
+else
+    ok "a clone with no origin remote still returns non-zero"
 fi
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"

@@ -259,6 +259,64 @@ fs_require_scratch_handoff() {
     return 0
 }
 
+# Validate a directory that will be bound or persisted read-write into an
+# unattended sandbox: refuse a symlink (a symlink checked here and resolved
+# later is a different directory from the one that gets used), require it to
+# resolve under /var/tmp/claude-scratch/ or the /tmp/claude-scratch compat
+# path (both spellings, for the same reason fs_require_scratch_handoff and
+# the mail root's own startup check accept both), and refuse a path that
+# exists as something other than a directory. Prints the resolved realpath on
+# success. Shared by --session-state and --clone-dir, which both hand an
+# unattended session a directory to write into, so where either may point is
+# the same security boundary.
+fs_validate_scratch_dir() {
+    local path="$1" flag="$2" real
+    if [[ -L "$path" ]]; then
+        echo "Error: $flag '$path' is a symlink. Name the directory itself:" >&2
+        echo "a symlink checked here and resolved later is a different" >&2
+        echo "directory from the one that gets used." >&2
+        return 1
+    fi
+    real="$("$FS_REALPATH" -m "$path")"
+    if [[ "$real" != /var/tmp/claude-scratch/* && "$real" != /tmp/claude-scratch/* ]]; then
+        echo "Error: $flag must name a directory under" >&2
+        echo "/var/tmp/claude-scratch/ (or the /tmp/claude-scratch compat" >&2
+        echo "path) — got '$real'. The directory is written to from inside an" >&2
+        echo "unattended session, so which paths may be handed over is a" >&2
+        echo "security boundary, not a tidiness rule." >&2
+        return 1
+    fi
+    if [[ -e "$real" && ! -d "$real" ]]; then
+        echo "Error: $flag '$real' exists and is not a directory." >&2
+        return 1
+    fi
+    printf '%s\n' "$real"
+    return 0
+}
+
+# Reuse an existing --clone-dir clone for a new wake instead of making a
+# fresh one: fetch from its origin remote (named 'origin' -- fs_make_clone
+# never passes git clone a -o, so this is git's own default), then start a
+# new branch there. The new branch starts at the clone's own current HEAD --
+# the previous wake's branch tip -- so commits made on earlier wakes are
+# reachable from the new branch's history directly, not just as a
+# remote-tracking ref. A clone with no commits at all (HEAD unresolvable --
+# in practice only a --clone-dir target the caller `git init`'d empty, since
+# every real prior wake leaves at least the origin's own history) falls back
+# to the given fallback sha instead, exactly as a fresh fs_make_clone would.
+#
+# No identity-seeding here, unlike fs_make_clone: a reused clone already has
+# repo-local user.name/user.email from when it was first created.
+fs_reuse_clone() {
+    local dest="$1" branch="$2" fallback_sha="${3:-}" start_sha
+    git -C "$dest" fetch origin --quiet || return 1
+    if ! start_sha="$(git -C "$dest" rev-parse --verify --quiet HEAD)"; then
+        start_sha="$fallback_sha"
+    fi
+    git -C "$dest" checkout --quiet -b "$branch" ${start_sha:+"$start_sha"} || return 1
+    return 0
+}
+
 fs_require_src_project() {
     local project_path="$1" real
     real="$("$FS_REALPATH" -m "$project_path")"

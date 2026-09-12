@@ -226,7 +226,38 @@
 #                        the branch is new and starts at the clone's HEAD,
 #                        and commits the resumed conversation remembers
 #                        making are reachable only through a
-#                        remote-tracking ref, not from HEAD.
+#                        remote-tracking ref, not from HEAD. --clone-dir
+#                        below changes this: a reused clone keeps its
+#                        earlier commits on the new branch's own history.
+# --clone-dir <dir>:     persist the clone in <dir> instead of a throwaway
+#                        one under the run dir, so a caller that runs this
+#                        script again with the same <dir> continues from the
+#                        earlier run's own work instead of starting over.
+#                        Validated exactly as --session-state (refused as a
+#                        symlink, or if it resolves outside
+#                        /var/tmp/claude-scratch/ or the /tmp/claude-scratch
+#                        compat path, or if it exists as something other than
+#                        a directory) — unlike --session-state, NOT
+#                        claude-only: every harness gets a clone, so
+#                        persisting it is useful on every harness. Refused
+#                        with --k8s, whose pod filesystem dies with the Job
+#                        and leaves nothing for a later wake to reuse.
+#                        On first use (<dir> absent, or empty of a git
+#                        repository) this behaves exactly like the no-flag
+#                        path: a fresh clone, at <dir> itself rather than
+#                        nested under the project's basename. On reuse (<dir>
+#                        already a git repository) the clone step is skipped
+#                        entirely: the existing clone fetches from its origin
+#                        remote, and the new branch starts at the clone's own
+#                        current HEAD -- the previous run's branch tip --
+#                        falling back to the freshly-resolved origin ref only
+#                        when that HEAD cannot be read (an empty repository
+#                        with no commits at all). <dir> naming a directory
+#                        that exists but is not a git repository is a hard
+#                        error. The per-run fetch-back to the origin repo,
+#                        below, is unchanged either way -- every run still
+#                        pushes its branch home regardless of where its
+#                        clone lives.
 # --keep-session:        leave the tmux session open on a shell when the run
 #                        ends, instead of letting it close. Ignored with
 #                        --foreground, which has no tmux session.
@@ -1294,6 +1325,7 @@ task_meta=""
 context_ro=""
 session_state=""
 resume_session=""
+clone_dir_flag=""
 review_loop_arg=""
 review_loop_cap=0
 maintainer_loop_arg=""
@@ -1414,6 +1446,10 @@ while [[ "${1:-}" == -* ]]; do
             ;;
         --resume-session)
             resume_session="${2:?--resume-session requires a session id}"
+            shift 2
+            ;;
+        --clone-dir)
+            clone_dir_flag="${2:?--clone-dir requires a directory}"
             shift 2
             ;;
         --review-loop)
@@ -2403,6 +2439,13 @@ if [[ "$k8s_mode" == true ]]; then
         echo "--session-state, which a cluster run cannot have." >&2
         exit 1
     fi
+    if [[ -n "$clone_dir_flag" ]]; then
+        echo "Error: --clone-dir is not supported with --k8s. It persists a clone" >&2
+        echo "on a host directory between wakes, and a cluster Job's pod" >&2
+        echo "filesystem dies with the Job -- there is nothing for a later" >&2
+        echo "wake to reuse." >&2
+        exit 1
+    fi
     if [[ "$no_services" == true ]]; then
         echo "Error: --no-services is not supported with --k8s. There is no" >&2
         echo "per-run services mechanism on the cluster path to skip in the" >&2
@@ -3079,41 +3122,17 @@ if [[ -n "$session_state" ]]; then
     # and a wider one, because this one grants write. The prefix is the
     # scratch root rather than forks/: callers that keep durable per-agent
     # state (the postmaster, under the mail root) live beside forks/, not in
-    # it. A symlink is refused outright rather than followed, so the path
-    # that was checked is the path that gets bound.
-    if [[ -L "$session_state" ]]; then
-        echo "Error: --session-state '$session_state' is a symlink. Name the" >&2
-        echo "directory itself: a symlink checked here and resolved later is a" >&2
-        echo "different directory from the one that gets a writable bind." >&2
-        exit 1
-    fi
-    session_state_real="$("$FS_REALPATH" -m "$session_state")"
-    # Both spellings of the scratch root, exactly as the handoff check below
-    # and fs_require_scratch_handoff (fork-sandbox-lib.sh) accept them: on a
-    # host where /tmp/claude-scratch is a REAL directory rather than the
-    # compat symlink — which ensure-scratch-dirs.sh leaves untouched on
-    # purpose — realpath cannot fold it away, and a narrower root here would
-    # refuse a path the rest of the repo calls scratch. That is not a
-    # theoretical mismatch: an operator who points FORK_SANDBOX_MAIL_ROOT
-    # there passes the postmaster's own startup validation and would then
-    # have every claude wake refused for a flag they never typed.
-    if [[ "$session_state_real" != /var/tmp/claude-scratch/* \
-        && "$session_state_real" != /tmp/claude-scratch/* ]]; then
-        echo "Error: --session-state must name a directory under" >&2
-        echo "/var/tmp/claude-scratch/ (or the /tmp/claude-scratch compat" >&2
-        echo "path) — got '$session_state_real'. The" >&2
-        echo "directory is bound read-WRITE into an unattended session, so an" >&2
-        echo "arbitrary host path here would let that session write anywhere;" >&2
-        echo "which paths may be handed over is a security boundary, not a" >&2
-        echo "tidiness rule." >&2
-        exit 1
-    fi
-    if [[ -e "$session_state_real" && ! -d "$session_state_real" ]]; then
-        echo "Error: --session-state '$session_state_real' exists and is not a" >&2
-        echo "directory." >&2
-        exit 1
-    fi
-    session_state="$session_state_real"
+    # it. Shared with --clone-dir below, which grants the same kind of write
+    # access for a different directory.
+    session_state="$(fs_validate_scratch_dir "$session_state" --session-state)" || exit 1
+fi
+
+# --clone-dir, validated the same way as --session-state just above and for
+# the same reason (a directory an unattended session writes into is a
+# security boundary), but with no claude-only gate: every harness gets a
+# clone, so persisting it is useful on every harness, not just claude's.
+if [[ -n "$clone_dir_flag" ]]; then
+    clone_dir_flag="$(fs_validate_scratch_dir "$clone_dir_flag" --clone-dir)" || exit 1
 fi
 
 if [[ "$dry_run" == true ]]; then
@@ -3148,6 +3167,7 @@ if [[ "$dry_run" == true ]]; then
     printf 'outbox_max_bytes=%s\n' "$outbox_max_bytes"
     [[ -z "$session_state" ]] || printf 'session_state=%s\n' "$session_state"
     [[ -z "$resume_session" ]] || printf 'resume_session=%s\n' "$resume_session"
+    [[ -z "$clone_dir_flag" ]] || printf 'clone_dir=%s\n' "$clone_dir_flag"
     if [[ "$review_only" == true ]]; then
         printf 'mode=review-only\ncheckout=%s\nbase_sha=%s\nrange=%s...%s\n' \
             "$checkout_ref" "$base_sha" "$base_sha" "$checkout_ref"
@@ -3954,21 +3974,67 @@ if [[ "$prompt_overlay_matched" == true ]]; then
         '{dir: $dir, rev: (if $rev == "" then null else $rev end), legs: $legs}' \
         > "$run_dir/prompt-overlay.json"
 fi
-# Name the parent 'clone', not 'repo'. A directory called 'repo' sitting one
-# level above the checkout reads like the repository root, and a session that
-# builds an absolute path by hand drops the last segment and reads nothing.
-# The error it gets back says "No such file or directory", which looks like a
-# missing file rather than a wrong path.
-clone_dir="$run_dir/clone/$(basename "$origin_repo")"
-mkdir -p "$run_dir/clone"
+# clone_reused feeds the resumed-session continuation prompt below: a reused
+# clone keeps the same absolute path and the same branch history across
+# wakes, which makes several claims in that prompt's "stale paths" section
+# false, so it is rewritten when this is true.
+clone_reused=false
+if [[ -z "$clone_dir_flag" ]]; then
+    # Name the parent 'clone', not 'repo'. A directory called 'repo' sitting
+    # one level above the checkout reads like the repository root, and a
+    # session that builds an absolute path by hand drops the last segment and
+    # reads nothing. The error it gets back says "No such file or directory",
+    # which looks like a missing file rather than a wrong path.
+    clone_dir="$run_dir/clone/$(basename "$origin_repo")"
+    mkdir -p "$run_dir/clone"
 
-echo "Cloning '$origin_repo' for the sandbox..." >&2
-# Take the run dir back out if the clone fails, so a bad branch name does
-# not leave an empty directory behind under the scratch root.
-if ! fs_make_clone "$origin_repo" "$branch" "$clone_dir" \
-    "${checkout_ref:+${checkout_sha:-$base_sha}}"; then
-    rm -rf "$run_dir"
-    exit 1
+    echo "Cloning '$origin_repo' for the sandbox..." >&2
+    # Take the run dir back out if the clone fails, so a bad branch name does
+    # not leave an empty directory behind under the scratch root.
+    if ! fs_make_clone "$origin_repo" "$branch" "$clone_dir" \
+        "${checkout_ref:+${checkout_sha:-$base_sha}}"; then
+        rm -rf "$run_dir"
+        exit 1
+    fi
+elif ! git -C "$clone_dir_flag" rev-parse --git-dir >/dev/null 2>&1; then
+    if [[ -e "$clone_dir_flag" ]]; then
+        echo "Error: --clone-dir '$clone_dir_flag' exists and is not a git" >&2
+        echo "repository." >&2
+        exit 1
+    fi
+    # First wake for this --clone-dir: used AS GIVEN, not nested under the
+    # project's basename -- the caller named the exact directory it expects
+    # the workspace at, and nesting here would silently change that path out
+    # from under it.
+    clone_dir="$clone_dir_flag"
+    mkdir -p "$(dirname "$clone_dir")"
+
+    echo "Cloning '$origin_repo' for the sandbox..." >&2
+    if ! fs_make_clone "$origin_repo" "$branch" "$clone_dir" \
+        "${checkout_ref:+${checkout_sha:-$base_sha}}"; then
+        rm -rf "$clone_dir"
+        exit 1
+    fi
+else
+    # Reuse: fetch from the origin first, so upstream work done since the
+    # last wake is visible, then start the new branch at the clone's own
+    # current HEAD -- the previous wake's branch tip -- so this wake's
+    # commits build on the last one's instead of an agent silently losing
+    # its own work across wakes.
+    clone_dir="$clone_dir_flag"
+    clone_reused=true
+
+    echo "Reusing '$clone_dir' for the sandbox..." >&2
+    # Unlike fs_make_clone's fresh path, there is no "already checked out at
+    # the right commit" default to fall back to silently: a fresh clone sits
+    # at origin's HEAD the moment git clone finishes, but a reused clone's
+    # own HEAD may be unresolvable (the empty-repo edge case), so the
+    # fallback must be given explicitly rather than only when --checkout was
+    # passed. checkout_sha is always resolved by this point -- to the
+    # checked-out ref's sha when --checkout was given, to base_sha otherwise.
+    if ! fs_reuse_clone "$clone_dir" "$branch" "$checkout_sha"; then
+        exit 1
+    fi
 fi
 fs_collect_alternates "$clone_dir"
 
@@ -4430,7 +4496,7 @@ fs_emit_prompt_overlay() {
     # Only the coding leg gets this. A review, maintainer or fix leg is a
     # fresh session by construction and has nothing stale to correct, and a
     # --refresh-at continuation runs in THIS sandbox, with these paths.
-    if [[ -n "$resume_session" ]]; then
+    if [[ -n "$resume_session" ]] && [[ "$clone_reused" != true ]]; then
         cat <<EOF
 
 ## This session is a continuation
@@ -4456,6 +4522,29 @@ conversation as stale:
   repository, so it is in this clone as a remote-tracking ref. \`git branch -r\`
   lists them, \`git log\`/\`git show\` read one, and \`git cherry-pick\`/\`git merge\`
   bring it forward. Check the tree before you trust a memory of writing a file.
+EOF
+    elif [[ -n "$resume_session" ]] && [[ "$clone_reused" == true ]]; then
+        cat <<EOF
+
+## This session is a continuation
+
+This conversation began in an earlier run, in a different sandbox, and is
+being resumed here. Its transcript carried over. So did more than usual this
+time:
+
+If you see no earlier conversation above this hand-off, the resume fell back
+to a fresh session and the rest of this section does not apply to you: you
+are starting clean.
+
+Otherwise:
+
+- The clone is the SAME directory as the earlier run's: \`$clone_dir\`. It did
+  not move. Only the operator inbox and the artifact outbox are at new
+  absolute paths this wake, named above.
+- The branch is \`$branch\`, a new name, but it was started at the earlier
+  run's own branch tip -- so anything you committed on an earlier wake is
+  already on this branch's history. \`git log\` shows it directly; there is no
+  remote-tracking ref to go hunting through.
 EOF
     fi
     if (( services_enabled )); then
