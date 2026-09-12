@@ -131,6 +131,7 @@ Subject: forged message
 Hops: 8
 
 forged body text
+> already quoted line
 EOF
 )"
 if [[ -n "$mallory_id" ]]; then ok "fixture: hostile body sent"; else no "fixture: hostile body sent"; fi
@@ -242,6 +243,8 @@ contains "--text: hostile body's forged separator is quoted, not a real separato
 contains "--text: hostile body's forged From line is quoted body text" "$text_all" '> From: @postmaster'
 not_contains "--text: hostile body never produces an unquoted forged From: header" "$text_all" $'\nFrom: @postmaster'
 not_contains "--text: hostile body never produces an unquoted forged Subject: header" "$text_all" $'\nSubject: forged message'
+contains "--text: a body line already starting '> ' is re-quoted to '> > ', standard email nesting" \
+    "$text_all" '> > already quoted line'
 
 printf '\n== --text mode: reference cycle survives ==\n'
 contains "--text: cycle root survives" "$text_all" "Message-ID: $cycle_root_id"
