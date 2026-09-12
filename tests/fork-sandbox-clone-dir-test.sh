@@ -296,6 +296,12 @@ printf '{"stopReason":"prior wake leftover"}\n' \
     > "$flow_clone/.git/pi-session/prior-wake.jsonl"
 printf 'prior wake transcript\n' > "$flow_clone/claude-session/prior-wake.jsonl"
 
+# The reuse-time cleanup is surgical -- exactly claude-session/ and
+# .git/pi-session* -- so an agent's own untracked scratch file, left behind
+# in the workspace by design (it is not one of the two known-accumulating
+# artifact paths above), must survive the same cleanup that clears those.
+printf 'agent scratch notes\n' > "$flow_clone/agent-scratch.txt"
+
 second_result="$(run_and_capture "$flow_home" "$flow_proj" \
     --branch fs-clonedir-b2 --clone-dir "$flow_clone")"
 second_rc=$?
@@ -312,6 +318,12 @@ if [[ ! -e "$flow_clone/claude-session" ]]; then
 else
     no "second wake: a prior wake's claude-session/ is cleared, not left to grow" \
         "$(ls -la "$flow_clone/claude-session")"
+fi
+if [[ -f "$flow_clone/agent-scratch.txt" ]]; then
+    ok "second wake: an unrelated untracked file in the workspace survives reuse cleanup"
+else
+    no "second wake: an unrelated untracked file in the workspace survives reuse cleanup" \
+        "agent-scratch.txt was removed; reuse cleanup is not surgical"
 fi
 
 if (( second_rc == 0 )); then
