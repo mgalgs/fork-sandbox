@@ -1088,6 +1088,39 @@ once
 check "resume: a session id with a leading hyphen is not recorded" 0 \
     "$( [[ -e "$res_sessions" ]] && echo 1 || echo 0 )"
 
+# ============================================================
+printf '\n== harvest: a malformed session_id leaves an earlier VALID id standing ==\n'
+# ============================================================
+
+# The tests above only ever check "not recorded" after $res_sessions was
+# already cleared by an earlier step in this same run -- that proves
+# nothing about the "leave standing" branch, since an absent file reads
+# the same whether it was correctly left alone or never written. This
+# block puts a real id on file FIRST, then feeds a malformed session_id
+# and checks that id is untouched -- the only way to actually exercise
+# "leave standing" rather than "was already absent".
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+ls_sid=99998888-7777-6666-5555-444433332211
+ls_mid1="$(send_msg '@carol' '@alice' 'leave-standing topic' 'first message' 8)"
+ls_tid="$(thread_of "$ls_mid1")"
+ls_sessions="$PM_STATE_DIR/sessions/$ls_tid/alice"
+
+: > "$STUB_ARGV_LOG"
+once
+finish_run alice 0 "$ls_sid"
+once
+check "leave-standing: a valid session id is recorded first" \
+    "$ls_sid" "$(cat "$ls_sessions" 2>/dev/null)"
+
+reply_msg '@carol' "$ls_mid1" 'second message' --to '@alice' >/dev/null
+once
+finish_run alice 0 'not a session id'
+once
+check "leave-standing: a malformed session id leaves the earlier VALID id standing" \
+    "$ls_sid" "$(cat "$ls_sessions" 2>/dev/null)"
+
 # pi and codex have no resume support and fork-sandbox.sh refuses both
 # flags there, so a non-claude seat must get neither. bob is the pi seat.
 new_scratch_root FORK_SANDBOX_MAIL_ROOT

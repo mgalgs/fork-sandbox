@@ -918,13 +918,18 @@ pm_harvest_run() {
             # recorded id is the suspect.
             pm_session_clear "$tid" "$agent"
         else
-            # Which session the next wake should resume. Absent (no
-            # --session-state on this seat, or no jq on the host) or null
-            # clears the recorded id outright -- a resume pointer with no
-            # transcript behind it is worse than a fresh wake. A malformed
-            # (present but not id-shaped) value leaves whatever was
-            # recorded before standing, since that shape should never come
-            # from the launcher itself.
+            # Which session the next wake should resume. sid comes up empty
+            # two different ways -- summary.json has no session_id (or it is
+            # null), OR summary.json fails to parse as JSON at all (jq then
+            # emits nothing, same as "absent" from this script's point of
+            # view) -- and both CLEAR the recorded id outright: neither is
+            # readable evidence of a transcript, and a resume pointer with
+            # nothing behind it is worse than a fresh wake. A summary.json
+            # that DOES parse but whose session_id value is present and not
+            # id-shaped is a different case entirely: that shape should
+            # never come from the launcher itself, so it leaves whatever was
+            # recorded before standing rather than clearing or recording
+            # garbage.
             local sid
             sid="$(pm_trim "$(jq -r '.session_id // empty' \
                 "$run_dir/summary.json" 2>/dev/null || true)")"
