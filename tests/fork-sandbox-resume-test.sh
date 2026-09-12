@@ -338,6 +338,7 @@ flow_result="$(run_and_capture_argv "$flow_home" \
 flow_rc=$?
 register_run_paths "$flow_result"
 flow_argv="$REGISTERED_ARGV_FILE"
+flow_run_dir="$REGISTERED_RUN_DIR"
 
 if (( flow_rc != 0 )); then
     no "the launcher completed with --session-state" "run failed"
@@ -417,6 +418,65 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+printf '\n== a resumed wake is told what did not carry over ==\n'
+# ---------------------------------------------------------------------------
+
+# The transcript is the only thing that crosses between wakes. The clone, the
+# inbox, the outbox and the branch are all new, and commits the resumed
+# conversation remembers making are not reachable from this HEAD -- so the
+# coding leg's prompt has to say so, or the session reasons from a sandbox
+# that no longer exists.
+cont_marker='## This session is a continuation'
+
+if [[ -z "$flow_run_dir" || ! -f "$flow_run_dir/handoff.md" ]]; then
+    no "the resumed leg's prompt carries the continuation section" \
+        "no handoff.md for the resumed run"
+else
+    if grep -qF -- "$cont_marker" "$flow_run_dir/handoff.md"; then
+        ok "the resumed leg's prompt carries the continuation section"
+    else
+        no "the resumed leg's prompt carries the continuation section" \
+            "$cont_marker not in $flow_run_dir/handoff.md"
+    fi
+    # The three things it must name concretely: this run's branch, the fact
+    # that earlier commits are not reachable, and where they are instead.
+    flow_branch="$(jq -r '.branch // ""' "$flow_run_dir/summary.json" 2>/dev/null)"
+    if [[ -n "$flow_branch" ]] \
+        && grep -qF -- "The branch is \`$flow_branch\`" "$flow_run_dir/handoff.md"; then
+        ok "the continuation section names this run's own branch"
+    else
+        no "the continuation section names this run's own branch" \
+            "branch '$flow_branch' not named"
+    fi
+    if grep -qF -- 'not reachable from HEAD here' "$flow_run_dir/handoff.md" \
+        && grep -qF -- 'git branch -r' "$flow_run_dir/handoff.md"; then
+        ok "it says earlier commits are unreachable, and where to find them"
+    else
+        no "it says earlier commits are unreachable, and where to find them" \
+            "$(cat "$flow_run_dir/handoff.md")"
+    fi
+    # The hand-off the caller passed in is still there, verbatim and last.
+    if grep -qF -- 'do the task' "$flow_run_dir/handoff.md"; then
+        ok "the caller's hand-off survives beside the continuation section"
+    else
+        no "the caller's hand-off survives beside the continuation section" \
+            "$(cat "$flow_run_dir/handoff.md")"
+    fi
+fi
+
+# A run that resumes nothing has nothing stale to correct, and must not be
+# told it is a continuation of a conversation it never had.
+if [[ -z "$plain_run_dir" || ! -f "$plain_run_dir/handoff.md" ]]; then
+    no "a fresh run's prompt has no continuation section" \
+        "no handoff.md for the plain run"
+elif grep -qF -- "$cont_marker" "$plain_run_dir/handoff.md"; then
+    no "a fresh run's prompt has no continuation section" \
+        "$(cat "$plain_run_dir/handoff.md")"
+else
+    ok "a fresh run's prompt has no continuation section"
+fi
+
+# ---------------------------------------------------------------------------
 printf '\n== the store belongs to the coding legs alone ==\n'
 # ---------------------------------------------------------------------------
 
@@ -438,6 +498,7 @@ cont_rc=$?
 unset FAKE_HANDOFF_ON_CALL
 register_run_paths "$cont_result"
 cont_argv="$REGISTERED_ARGV_FILE"
+cont_run_dir="$REGISTERED_RUN_DIR"
 
 if (( cont_rc != 0 )); then
     no "a continuation leg ran" "run failed"
@@ -460,6 +521,19 @@ else
         no "the continuation leg is NOT resumed" "$(cat "$cont_argv.2")"
     else
         ok "the continuation leg is NOT resumed"
+    fi
+    # ...and it is not told it is a continuation of an earlier SANDBOX
+    # either, which it is not: a continuation leg runs in this very run's
+    # clone, with this run's paths and this run's branch. The section
+    # belongs to the resumed implement leg alone.
+    if [[ -n "$cont_run_dir" ]] \
+        && grep -rqF -- "$cont_marker" \
+            "$cont_run_dir/continuation-prompt-header.md" \
+            "$cont_run_dir"/continuation-prompt-[0-9]*.md 2>/dev/null; then
+        no "a continuation leg's prompt has no continuation-of-a-wake section" \
+            "found in $cont_run_dir"
+    else
+        ok "a continuation leg's prompt has no continuation-of-a-wake section"
     fi
 fi
 

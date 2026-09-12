@@ -160,7 +160,10 @@
 #                                   one wake -- `status` shows the gap;
 #                                   v1 has no repair machinery for it)
 #   runs/<run-id>.env               one spawned wake: AGENT, THREAD,
-#                                   TRIGGER, RUN_DIR, BRANCH,
+#                                   TRIGGER, RUN_DIR, BRANCH, RESUMED (the
+#                                   session id this wake was launched to
+#                                   resume, empty for a fresh one -- what
+#                                   `status` prints in its session column),
 #                                   PENDING_MSGS (comma list, may be empty)
 #   harvested/<run-id>             marker: this run's outbox is collected
 #   needs-operator/<thread-id>     flag file; content is the reason
@@ -197,6 +200,19 @@
 #     continuity. That prompt stays the correctness guarantee even for
 #     claude -- resume is a continuity and cost optimization, and a wake
 #     whose session is missing or unreadable still does the work.
+#   - A resumed session is the only thing that crosses between wakes. The
+#     sandbox does not: every wake gets a new work dir, so a new clone, a
+#     new operator inbox and a new artifact outbox at fresh absolute paths,
+#     and a new branch (the seq above guarantees the name is new) started at
+#     the clone's own HEAD rather than at the previous wake's branch. A
+#     resumed conversation therefore remembers paths that no longer exist
+#     and commits that are not reachable from the HEAD it is now looking at
+#     -- the earlier wake's branch came back to the origin, so the new clone
+#     has it as a remote-tracking ref, but nothing merges it forward.
+#     fork-sandbox.sh tells a resumed wake this, in a "This session is a
+#     continuation" section it adds to the prompt whenever
+#     --resume-session is given; carrying work forward across wakes is
+#     still the agent's own git work, and nothing here automates it.
 #   - No delivery of mail tooling into the sandbox, and no store access
 #     from inside a run.
 #   - No list-Cc delivery index.

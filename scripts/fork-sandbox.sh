@@ -219,6 +219,14 @@
 #                        session is unknown or its transcript is unreadable,
 #                        claude-sandboxed retries once as a fresh session and
 #                        the run continues.
+#                        Nothing but the transcript crosses over, so the
+#                        coding leg's prompt gains a "This session is a
+#                        continuation" section naming what did not: the
+#                        clone, inbox and outbox are at new absolute paths,
+#                        the branch is new and starts at the clone's HEAD,
+#                        and commits the resumed conversation remembers
+#                        making are reachable only through a
+#                        remote-tracking ref, not from HEAD.
 # --keep-session:        leave the tmux session open on a shell when the run
 #                        ends, instead of letting it close. Ignored with
 #                        --foreground, which has no tmux session.
@@ -4409,6 +4417,46 @@ fs_emit_prompt_overlay() {
 {
     fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" "$harness" "$preamble_network" \
         "$outbox_dir" "" "$outbox_max_bytes"
+    # A resumed session is the one case where the preamble above contradicts
+    # something already in the model's context: the earlier part of this
+    # conversation ran in a DIFFERENT sandbox and names that sandbox's clone,
+    # inbox and outbox, its branch, and commits it made there -- none of which
+    # exist here. Only the transcript crosses over. Say so once, right after
+    # the paths it supersedes, because the failure is otherwise silent in the
+    # wrong direction: a reply written to the remembered outbox path is an
+    # ENOENT the agent can see, but reasoning from files it committed on an
+    # earlier wake and cannot find now looks like the work was lost.
+    # Only the coding leg gets this. A review, maintainer or fix leg is a
+    # fresh session by construction and has nothing stale to correct, and a
+    # --refresh-at continuation runs in THIS sandbox, with these paths.
+    if [[ -n "$resume_session" ]]; then
+        cat <<EOF
+
+## This session is a continuation
+
+This conversation began in an earlier run, in a different sandbox, and is
+being resumed here. Its transcript carried over. Nothing else did.
+
+If you see no earlier conversation above this hand-off, the resume fell back
+to a fresh session and the rest of this section does not apply to you: you
+are starting clean.
+
+Otherwise, treat every path, branch and commit from the earlier part of this
+conversation as stale:
+
+- The clone, the operator inbox and the artifact outbox are at the absolute
+  paths named above and nowhere else. The earlier run's directories are gone;
+  writing a reply or an artifact to a remembered path fails with
+  "No such file or directory".
+- The branch is \`$branch\`. It was created for this run: it is not the
+  earlier run's branch and does not build on it.
+- So work you committed on an earlier wake is **not reachable from HEAD here**.
+  It is not lost: each earlier run's branch was fetched back into the origin
+  repository, so it is in this clone as a remote-tracking ref. \`git branch -r\`
+  lists them, \`git log\`/\`git show\` read one, and \`git cherry-pick\`/\`git merge\`
+  bring it forward. Check the tree before you trust a memory of writing a file.
+EOF
+    fi
     if (( services_enabled )); then
         cat <<EOF
 
