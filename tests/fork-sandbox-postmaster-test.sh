@@ -565,6 +565,11 @@ once
 run_env="$(env_file_for_agent bob)"
 run_dir="$(sed -n 's/^RUN_DIR=//p' "$run_env")"
 
+# A second, same-thread message with hops deliberately different from (and
+# lower than) the trigger's, so a reply naming it as Reply-To-Id can only
+# pass by actually reading ITS hops, not the trigger's.
+mid_earlier="$(reply_msg '@carol' "$trig_mid" 'an earlier reply' --hops 3)"
+
 mkdir -p -- "$run_dir/outbox"
 # 1. No stanza at all (default reply-all, default subject, no hops override).
 printf '\nSounds good to me.\n' > "$run_dir/outbox/mail-1.md"
@@ -574,6 +579,10 @@ printf 'To: @carol\nSubject: Custom subject line\n\nRouted explicitly.\n' > "$ru
 printf 'To: @carol\nSubject: Fresh topic\nReply-To-Id: new\n\nStarting something new.\n' > "$run_dir/outbox/mail-3.md"
 # 4. Malformed: an unrecognized header line.
 printf 'Foo: bar\n\nThis should never post.\n' > "$run_dir/outbox/mail-4.md"
+# 5. Reply-To-Id names a message OTHER than the trigger: hops must come
+# from THAT message, not the trigger's.
+printf 'To: @carol\nSubject: answering the earlier one\nReply-To-Id: %s\n\nBody here.\n' \
+    "$mid_earlier" > "$run_dir/outbox/mail-5.md"
 printf '0\n' > "$run_dir/exit-code"
 printf '{}\n' > "$run_dir/summary.json"
 once
@@ -602,6 +611,18 @@ if [[ -n "$explicit_reply" ]]; then
     check "harvest: explicit reply To honored" "@carol" "$(header_of_file "$explicit_reply" To)"
 else
     no "harvest: explicit To/Subject reply posted"
+fi
+
+parent_reply=""
+for f in "$FORK_SANDBOX_MAIL_ROOT/threads/$tid"/*.msg; do
+    [[ "$(header_of_file "$f" Subject)" == "answering the earlier one" ]] && parent_reply="$f"
+done
+if [[ -n "$parent_reply" ]]; then
+    ok "harvest: reply naming a non-trigger Reply-To-Id was posted"
+    check "harvest: hops come from the named parent, not the trigger" \
+        "$(( $(hops_of_mid "$mid_earlier") - 1 ))" "$(header_of_file "$parent_reply" X-Hops)"
+else
+    no "harvest: reply naming a non-trigger Reply-To-Id was posted"
 fi
 
 new_tid=""

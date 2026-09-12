@@ -835,7 +835,7 @@ pm_parse_reply_file() {
 }
 
 pm_harvest_one_file() {
-    local mf="$1" agent="$2" tid="$3" trigger="$4" decremented="$5"
+    local mf="$1" agent="$2" tid="$3" trigger="$4" trigger_hops="$5"
     local body_file parsed
     body_file="$(mktemp "$MAIL_ROOT/.postmaster.body.XXXXXX")"
     if ! parsed="$(pm_parse_reply_file "$mf" "$body_file")"; then
@@ -849,6 +849,22 @@ pm_harvest_one_file() {
     # merge with its neighboring delimiter and shift every field after it.
     IFS=$'\x1f' read -r to cc subject reply_to_id <<< "$parsed"
     [[ -n "$reply_to_id" ]] || reply_to_id="$trigger"
+
+    # Hops come from the message this reply actually answers, not always
+    # the wake's trigger -- live delivery (see pm_deliver_live) makes
+    # replying to a newer message than the trigger the common case. A
+    # Reply-To-Id that doesn't resolve in the store (or names "new" or the
+    # trigger itself) falls back to the trigger's hops.
+    local parent_hops="$trigger_hops"
+    if [[ "$reply_to_id" != "new" && "$reply_to_id" != "$trigger" ]]; then
+        local parent_file
+        parent_file="$(pm_find_by_id "$reply_to_id" || true)"
+        if [[ -n "$parent_file" ]]; then
+            parent_hops="$(pm_header "$parent_file" X-Hops)"
+            [[ "$parent_hops" =~ ^[0-9]+$ ]] || parent_hops="$trigger_hops"
+        fi
+    fi
+    local decremented=$(( parent_hops > 0 ? parent_hops - 1 : 0 ))
 
     local -a cmd=()
     local rc=0
@@ -1063,17 +1079,16 @@ pm_harvest_run() {
         fi
     fi
 
-    local trigger_file trigger_hops decremented
+    local trigger_file trigger_hops
     trigger_file="$(pm_find_by_id "$trigger" || true)"
     trigger_hops="0"
     [[ -n "$trigger_file" ]] && trigger_hops="$(pm_header "$trigger_file" X-Hops)"
     [[ "$trigger_hops" =~ ^[0-9]+$ ]] || trigger_hops=0
-    decremented=$(( trigger_hops > 0 ? trigger_hops - 1 : 0 ))
 
     local mf
     for mf in "$run_dir/outbox"/mail-*.md; do
         [[ -e "$mf" ]] || continue
-        pm_harvest_one_file "$mf" "$agent" "$tid" "$trigger" "$decremented"
+        pm_harvest_one_file "$mf" "$agent" "$tid" "$trigger" "$trigger_hops"
     done
 
     mkdir -p -- "$HARVESTED"
