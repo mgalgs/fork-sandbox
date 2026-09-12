@@ -168,6 +168,42 @@
 #                        /var/tmp/claude-scratch/forks/ — a staging path a
 #                        host-side script created on purpose — never an
 #                        arbitrary host path.
+# --session-state <dir>: bind <dir> read-WRITE into the sandbox at the
+#                        sandbox HOME's ~/.claude/projects, so the claude
+#                        CLI's per-project transcript store survives the run
+#                        instead of dying with the per-run state dir. Created
+#                        if missing. Refused if it exists as a symlink, or if
+#                        it resolves outside /var/tmp/claude-scratch/ — the
+#                        directory is writable from inside an unattended
+#                        session, so where it may point is a security
+#                        boundary. claude only (pi and codex keep their
+#                        sessions elsewhere), and refused with --k8s, which
+#                        has no host directory to bind. It exists so a caller
+#                        that wakes the same agent repeatedly — the
+#                        postmaster, on one mail thread — can hand the next
+#                        wake the previous one's transcript. The IMPLEMENT
+#                        leg alone is bound: a review, fix or maintainer leg
+#                        is a different conversation, and its transcript in
+#                        the store would be the newest one there, which is
+#                        the one summary.json reports as this run's
+#                        session_id. --refresh-at continuations are the same
+#                        conversation continued, and do write there.
+#                        Note that with this flag the sandbox's transcripts
+#                        no longer land in the work dir's claude-session/:
+#                        the bind is namespace-local, so the per-run state
+#                        dir the rescue copies from is an empty mountpoint.
+#                        <dir> is the durable copy instead.
+# --resume-session <id>: resume the claude session <id> instead of starting a
+#                        fresh one, with this run's handoff delivered as the
+#                        new prompt. Requires --session-state, which is where
+#                        the transcript is read from; claude only. <id> must
+#                        match ^[0-9a-f-]{8,64}$ — it is a transcript
+#                        filename stem, so anything with a slash or a dot is
+#                        refused. Resume is a continuity and cost
+#                        optimization, never a correctness guarantee: if the
+#                        session is unknown or its transcript is unreadable,
+#                        claude-sandboxed retries once as a fresh session and
+#                        the run continues.
 # --keep-session:        leave the tmux session open on a shell when the run
 #                        ends, instead of letting it close. Ignored with
 #                        --foreground, which has no tmux session.
@@ -551,7 +587,9 @@
 #
 # That also means most of this script's flags have nothing to attach to on a
 # cluster run: they describe local-sandbox machinery -- bubblewrap, per-run
-# docker-compose services, the detached tmux session -- that a Kubernetes pod
+# docker-compose services, the detached tmux session, a host directory bound
+# in to outlive the run (--session-state, and --resume-session with it) --
+# that a Kubernetes pod
 # has no equivalent of, they describe a real capability (--prompts-dir,
 # --task-meta) the cluster path has
 # not been built to carry yet, or -- --claude-args alone, since --harness
@@ -1231,6 +1269,8 @@ pi_extra_args=""
 sandbox_args=""
 task_meta=""
 context_ro=""
+session_state=""
+resume_session=""
 review_loop_arg=""
 review_loop_cap=0
 maintainer_loop_arg=""
@@ -1343,6 +1383,14 @@ while [[ "${1:-}" == -* ]]; do
             ;;
         --context-ro)
             context_ro="${2:?--context-ro requires a directory}"
+            shift 2
+            ;;
+        --session-state)
+            session_state="${2:?--session-state requires a directory}"
+            shift 2
+            ;;
+        --resume-session)
+            resume_session="${2:?--resume-session requires a session id}"
             shift 2
             ;;
         --review-loop)
@@ -2321,6 +2369,17 @@ if [[ "$k8s_mode" == true ]]; then
         echo "--harness claude) is fixed -- there is no flag yet to extend it." >&2
         exit 1
     fi
+    if [[ -n "$session_state" ]]; then
+        echo "Error: --session-state is not supported with --k8s. It binds a host" >&2
+        echo "directory into the sandbox, and a cluster run has no host directory" >&2
+        echo "to bind -- the pod's filesystem dies with the Job." >&2
+        exit 1
+    fi
+    if [[ -n "$resume_session" ]]; then
+        echo "Error: --resume-session is not supported with --k8s. It needs" >&2
+        echo "--session-state, which a cluster run cannot have." >&2
+        exit 1
+    fi
     if [[ "$no_services" == true ]]; then
         echo "Error: --no-services is not supported with --k8s. There is no" >&2
         echo "per-run services mechanism on the cluster path to skip in the" >&2
@@ -2959,6 +3018,69 @@ if [[ "$review_only" == true ]]; then
     fi
 fi
 
+# --session-state and --resume-session, validated here rather than beside the
+# other path checks below because --dry-run exits before those run: a caller
+# asking what a run would do must be told the flag is refused, and must be
+# shown the resolved directory. Nothing is CREATED here for the same reason —
+# the mkdir waits until after the dry-run exit.
+#
+# Both are claude-only. pi and codex keep their session state somewhere else
+# entirely (--session-dir, ~/.codex/sessions), and neither CLI has a headless
+# resume this script could drive, so a flag named for claude's transcript
+# store would be a silent no-op there.
+if [[ -n "$session_state" || -n "$resume_session" ]]; then
+    if [[ "$harness" != claude ]]; then
+        echo "Error: --session-state and --resume-session are claude-only; this" >&2
+        echo "run's harness is '$harness'. They name the claude CLI's own" >&2
+        echo "transcript store and its --resume flag, neither of which the other" >&2
+        echo "harnesses have." >&2
+        exit 1
+    fi
+fi
+if [[ -n "$resume_session" && -z "$session_state" ]]; then
+    echo "Error: --resume-session requires --session-state. The session to be" >&2
+    echo "resumed is read out of that directory; with no bind there is no" >&2
+    echo "transcript inside the sandbox to resume from." >&2
+    exit 1
+fi
+if [[ -n "$resume_session" && ! "$resume_session" =~ ^[0-9a-f-]{8,64}$ ]]; then
+    echo "Error: --resume-session '$resume_session' is not a session id. It is" >&2
+    echo "used as a transcript filename stem, so it must match" >&2
+    echo "^[0-9a-f-]{8,64}\$ — no slashes, no dots, no other characters." >&2
+    exit 1
+fi
+if [[ -n "$session_state" ]]; then
+    # The bind is read-WRITE and the sandbox is unattended, so where it may
+    # point is a security boundary of the same kind --context-ro enforces —
+    # and a wider one, because this one grants write. The prefix is the
+    # scratch root rather than forks/: callers that keep durable per-agent
+    # state (the postmaster, under the mail root) live beside forks/, not in
+    # it. A symlink is refused outright rather than followed, so the path
+    # that was checked is the path that gets bound.
+    if [[ -L "$session_state" ]]; then
+        echo "Error: --session-state '$session_state' is a symlink. Name the" >&2
+        echo "directory itself: a symlink checked here and resolved later is a" >&2
+        echo "different directory from the one that gets a writable bind." >&2
+        exit 1
+    fi
+    session_state_real="$("$FS_REALPATH" -m "$session_state")"
+    if [[ "$session_state_real" != /var/tmp/claude-scratch/* ]]; then
+        echo "Error: --session-state must name a directory under" >&2
+        echo "/var/tmp/claude-scratch/ — got '$session_state_real'. The" >&2
+        echo "directory is bound read-WRITE into an unattended session, so an" >&2
+        echo "arbitrary host path here would let that session write anywhere;" >&2
+        echo "which paths may be handed over is a security boundary, not a" >&2
+        echo "tidiness rule." >&2
+        exit 1
+    fi
+    if [[ -e "$session_state_real" && ! -d "$session_state_real" ]]; then
+        echo "Error: --session-state '$session_state_real' exists and is not a" >&2
+        echo "directory." >&2
+        exit 1
+    fi
+    session_state="$session_state_real"
+fi
+
 if [[ "$dry_run" == true ]]; then
     [[ -z "$preset_name" ]] || printf 'preset=%s\n' "$preset_name"
     printf 'harness=%s\nmodel=%s\n' "$harness" "$model"
@@ -2989,6 +3111,8 @@ if [[ "$dry_run" == true ]]; then
     printf 'prompt_overlay_rev=%s\n' "$prompt_overlay_rev"
     printf 'refresh_at=%s\nrefresh_max=%s\n' "$refresh_at" "$refresh_max"
     printf 'outbox_max_bytes=%s\n' "$outbox_max_bytes"
+    [[ -z "$session_state" ]] || printf 'session_state=%s\n' "$session_state"
+    [[ -z "$resume_session" ]] || printf 'resume_session=%s\n' "$resume_session"
     if [[ "$review_only" == true ]]; then
         printf 'mode=review-only\ncheckout=%s\nbase_sha=%s\nrange=%s...%s\n' \
             "$checkout_ref" "$base_sha" "$base_sha" "$checkout_ref"
@@ -3079,6 +3203,12 @@ if [[ -n "$context_ro" ]]; then
         exit 1
     fi
     context_ro="$context_ro_real"
+fi
+
+# The session-state directory is validated above, before the --dry-run exit;
+# creating it is what waits until here, so a dry run still creates nothing.
+if [[ -n "$session_state" ]]; then
+    mkdir -p "$session_state"
 fi
 
 # A sealed run has no network at all, and --unpin-egress — the one value
@@ -4497,6 +4627,23 @@ fs_build_sandbox_cmd() {
     out+=(--bind-rw "$outbox_dir")
     if [[ "$b_harness" == codex ]]; then
         out+=(--bind-rw-at "$codex_sessions_dir" "$HOME/.codex/sessions")
+    fi
+    # claude's counterpart: the caller-supplied transcript store, bound at
+    # the sandbox HOME's ~/.claude/projects by claude-sandboxed itself --
+    # only that script knows where the synthetic ~/.claude comes from.
+    #
+    # The implement leg alone, for the same reason --claude-args is: a review
+    # or fix leg is a DIFFERENT conversation with a different prompt, and
+    # resuming the implement session into one would be wrong. Letting those
+    # legs merely WRITE into the store would be wrong too, because
+    # summary.json reports the newest transcript in it as this run's
+    # session_id -- a review leg's transcript would be the newest, and the
+    # next wake would resume the reviewer instead of the agent.
+    if [[ "$b_harness" == claude && "$prefix" == impl && -n "$session_state" ]]; then
+        out+=(--session-state "$session_state")
+        if [[ -n "$resume_session" ]]; then
+            out+=(--resume-session "$resume_session")
+        fi
     fi
     if [[ -n "$sandbox_args" ]]; then
         # Deliberate word splitting: the caller passes a flag string.
