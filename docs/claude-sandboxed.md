@@ -335,7 +335,11 @@ instead, which costs nothing to maintain and is easier to vary per task.
   sealed pi run too.
 - **The session transcript is copied into the work dir** on exit, under
   `claude-session/`. Without it, a killed run keeps its files but loses the
-  agent's reasoning.
+  agent's reasoning. The one exception is `--session-state <dir>`: that
+  binds the host's own directory over the transcript store, so the per-run
+  state dir the rescue copies from is an empty mountpoint and
+  `claude-session/` does not appear. `<dir>` is the durable copy in that
+  case, and it holds every leg of the run.
 - **The session dies when the access token expires**, with no way to refresh.
   The script prints the remaining lifetime. Start long runs early in a
   token's life.
