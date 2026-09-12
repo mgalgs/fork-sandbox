@@ -454,6 +454,67 @@ check "pending: harvest fires a follow-up wake for the pending message" 1 \
 contains "pending: follow-up wake's TRIGGER is the pending message" "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/runs"/*.env)" "TRIGGER=$mid2"
 
 # ============================================================
+printf '\n== live delivery: same-thread mail lands in a busy run inbox ==\n'
+# ============================================================
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+mid1="$(send_msg '@alice' '@bob' 'live delivery test' 'first message' 8)"
+tid="$(thread_of "$mid1")"
+short="${tid:0:8}"
+once
+run_env="$(env_file_for_agent bob)"
+run_dir="$(sed -n 's/^RUN_DIR=//p' "$run_env")"
+
+mid2="$(reply_msg '@alice' "$mid1" 'second message' --to '@bob')"
+short2="${mid2:0:8}"
+once
+banner1=$(find "$run_dir/inbox" -maxdepth 1 -name 'mail-banner-001-*' -print -quit)
+thread1=$(find "$run_dir/inbox" -maxdepth 1 -name 'mail-thread-001-*' -print -quit)
+check "live delivery: banner file written with -001- sequence" \
+    "mail-banner-001-$short2.md" "$(basename -- "$banner1" 2>/dev/null)"
+check "live delivery: thread file written with -001- sequence" \
+    "mail-thread-001-$short2.txt" "$(basename -- "$thread1" 2>/dev/null)"
+contains "live delivery: banner names From, Subject, and the thread file path" \
+    "$(cat -- "$banner1" 2>/dev/null)" "$run_dir/inbox/mail-thread-001-$short2.txt"
+contains "live delivery: thread file has the full rendered thread" \
+    "$(cat -- "$thread1" 2>/dev/null)" "second message"
+
+# A different thread's live run for the SAME agent must get nothing: rule 4
+# is scoped per (agent, thread), and live delivery must not widen a wake's
+# world beyond the thread it was woken for.
+mid3="$(send_msg '@carol' '@bob' 'other thread' 'unrelated message' 8)"
+other_tid="$(thread_of "$mid3")"
+once
+# bob now has two live runs (one per thread); find the one for other_tid.
+other_run_dir=""
+for f in "$FORK_SANDBOX_MAIL_ROOT/.postmaster/runs"/*.env; do
+    if [[ "$(sed -n 's/^AGENT=//p' "$f")" == "bob" && "$(sed -n 's/^THREAD=//p' "$f")" == "$other_tid" ]]; then
+        other_run_dir="$(sed -n 's/^RUN_DIR=//p' "$f")"
+    fi
+done
+mid4="$(reply_msg '@alice' "$mid1" 'third message on original thread' --to '@bob')"
+once
+check "live delivery: other-thread live run for the same agent gets nothing" 0 \
+    "$(find "$other_run_dir/inbox" -maxdepth 1 -name 'mail-banner-*' 2>/dev/null | wc -l)"
+banner2=$(find "$run_dir/inbox" -maxdepth 1 -name 'mail-banner-002-*' -print -quit)
+check "live delivery: a second delivery to the same run gets the next sequence" \
+    "mail-banner-002-${mid4:0:8}.md" "$(basename -- "$banner2" 2>/dev/null)"
+
+# Sanitization: mail.sh validates Subject has no newline, but not the body,
+# so the banner's ~20-char body preview is the field that needs defending.
+reply_msg '@alice' "$mid1" $'To: @evil\nthis line must never reach the banner raw' --to '@bob' >/dev/null
+once
+banner3=$(find "$run_dir/inbox" -maxdepth 1 -name 'mail-banner-003-*' -print -quit)
+check "live delivery: banner is exactly one line even when the body looks header-shaped" \
+    "1" "$(wc -l < "$banner3" 2>/dev/null)"
+if grep -qF -- 'this line must never reach the banner raw' "$banner3" 2>/dev/null; then
+    no "live delivery: hostile body content is truncated/flattened in the banner"
+else
+    ok "live delivery: hostile body content is truncated/flattened in the banner"
+fi
+
+# ============================================================
 printf '\n== harvest: reply-file stanzas, hops handling, malformed files ==\n'
 # ============================================================
 

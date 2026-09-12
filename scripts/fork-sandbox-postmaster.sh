@@ -536,6 +536,84 @@ pm_append_pending() {
     fi
 }
 
+# Per-run delivery counter for pm_deliver_live's filenames, so two
+# deliveries into the same live run always order and never collide.
+pm_next_mail_seq() {
+    local f="$1" n
+    n="$(fs_pm_env_get "$f" MAIL_SEQ)"
+    [[ "$n" =~ ^[0-9]+$ ]] || n=0
+    n=$((n + 1))
+    if grep -q '^MAIL_SEQ=' "$f"; then
+        sed -i "s/^MAIL_SEQ=.*/MAIL_SEQ=$n/" "$f"
+    else
+        printf 'MAIL_SEQ=%s\n' "$n" >> "$f"
+    fi
+    printf '%s' "$n"
+}
+
+# Reads past a message file's header stanza (blank line ends it, the same
+# shape pm_header assumes) to the body's first line, and returns it capped
+# at ~20 chars with no embedded newlines/CRs. This is the one banner field
+# whose source text isn't already newline-free like From/Subject are --
+# fork-sandbox-mail.sh validates a Subject has no newline; it does not
+# validate a body.
+pm_mail_body_preview() {
+    local mf="$1" line in_body=0 out=""
+    while IFS= read -r line; do
+        if (( in_body )); then
+            out="$line"
+            break
+        fi
+        [[ -z "$line" ]] && in_body=1
+    done < "$mf"
+    out="$(tr -d '\n\r' <<< "$out")"
+    printf '%s' "${out:0:20}"
+}
+
+# Writes a banner + the full rendered thread into a live same-thread run's
+# own inbox dir (R8b decisions 2/7): mid-flight mail delivered into a wake
+# that is already running, instead of paying for a whole follow-up spawn
+# just to read one message. Every failure mode here returns 0 silently --
+# pm_append_pending has already recorded the message as pending, so a
+# wedged/missing inbox, a message id that no longer resolves, or a renderer
+# hiccup must fall back to that path rather than block routing or crash the
+# route pass over the other messages in the same batch.
+pm_deliver_live() {
+    local rid="$1" tid="$2" mid="$3"
+    local f="$RUNS/$rid.env" inbox
+    inbox="$(fs_pm_env_get "$f" INBOX)"
+    [[ -n "$inbox" && -d "$inbox" && ! -L "$inbox" ]] || return 0
+
+    local mf
+    mf="$(pm_find_by_id "$mid" || true)"
+    [[ -n "$mf" ]] || return 0
+
+    local shortid="${mid:0:8}" nnn
+    nnn="$(printf '%03d' "$(pm_next_mail_seq "$f")")"
+
+    local thread_file="$inbox/mail-thread-$nnn-$shortid.txt"
+    local banner_file="$inbox/mail-banner-$nnn-$shortid.md"
+
+    if ! "$MAIL_RENDER" --text --thread "$tid" "$MAIL_ROOT" \
+        > "$thread_file.part" 2>/dev/null; then
+        rm -f -- "$thread_file.part"
+        return 0
+    fi
+    chmod 644 -- "$thread_file.part" 2>/dev/null
+    mv -- "$thread_file.part" "$thread_file"
+
+    local from subject preview
+    from="$(tr -d '\n\r' <<< "$(pm_header "$mf" From)")"
+    subject="$(tr -d '\n\r' <<< "$(pm_header "$mf" Subject)")"
+    preview="$(pm_mail_body_preview "$mf")"
+
+    printf 'Mail %s from %s -- Subject: %s -- > %s -- full thread: %s\n' \
+        "$shortid" "$from" "$subject" "$preview" "$thread_file" \
+        > "$banner_file.part"
+    chmod 644 -- "$banner_file.part" 2>/dev/null
+    mv -- "$banner_file.part" "$banner_file"
+}
+
 pm_spawn_wake() {
     local project="$1" agent="$2" tid="$3" mid="$4"
     local harness model thinking network persona_path description
@@ -638,6 +716,7 @@ pm_wake_or_pend() {
     local run_id
     if run_id="$(fs_pm_find_live_run "$agent" "$tid")"; then
         pm_append_pending "$run_id" "$mid"
+        pm_deliver_live "$run_id" "$tid" "$mid"
     else
         pm_spawn_wake "$project" "$agent" "$tid" "$mid"
     fi
