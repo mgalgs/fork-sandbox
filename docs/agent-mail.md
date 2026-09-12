@@ -316,9 +316,14 @@ for it.
 4. **One wake per (agent, message).** An agent named twice — directly and
    via a list — wakes once. An agent already running a wake for T does
    not get a second spawn; the new message id is recorded on that run as
-   a pending message, and after harvesting that run's reply, rules 2–3
-   are re-checked and a follow-up wake is spawned for the newest pending
-   message if they still pass.
+   a pending message. On a claude seat, it is also delivered live: a
+   banner plus the rendered thread is written straight into the run's own
+   inbox, and its inbox hook surfaces it alongside operator addenda (a pi
+   or codex seat gets neither — those harnesses have no hook to deliver
+   through). At harvest, if that live delivery is confirmed to have
+   reached the wake, no follow-up wake is spawned for it; otherwise rules
+   2–3 are re-checked and a follow-up wake is spawned for the newest
+   pending message if they still pass.
 
 Together with "an agent may originate a reply only when it is in `To`",
 those rules are the stop rules. Hops bound the depth of a conversation,
@@ -375,9 +380,13 @@ Once a run reaches a terminal state — `summary.json` in its run dir
 (`fork-sandbox.sh`'s last artifact, written after cleanup and the branch
 fetch-back), or a dead pid with no `summary.json` ever landing — the
 harvester posts each file through `fork-sandbox mail`, as
-`--from @<agent>`, passing `--hops` explicitly as the trigger's
-`X-Hops` minus one. That is the only place the decrement happens, on both
-the ordinary-reply and the new-thread path.
+`--from @<agent>`, passing `--hops` explicitly as one less than the hops
+of the message the reply actually answers (`Reply-To-Id`, which need not
+be the wake's trigger — a live-delivered reply commonly answers a newer
+message than the one that spawned the run), clamped to never exceed the
+trigger's own `X-Hops`. That clamp is what keeps `Reply-To-Id` from
+re-raising the budget by naming an earlier ancestor; the decrement itself
+happens only here, on both the ordinary-reply and the new-thread path.
 
 A non-zero exit, and a wake that died without writing `summary.json`, are
 harvested exactly like success — their outbox, if any, is still posted —
@@ -402,8 +411,9 @@ own thread scans never see it:
 |---|---|
 | `lock` | a `flock`'d file; the pid inside is for messages only — the mutual exclusion is the kernel's advisory lock, so a killed postmaster cannot leave a stale hold |
 | `routed/<message-id>` | routing already decided for this message |
-| `runs/<run-id>.env` | one spawned wake: agent, thread, trigger, run dir, branch, resumed session id, pending messages |
+| `runs/<run-id>.env` | one spawned wake: agent, thread, trigger, run dir, inbox dir, harness, branch, resumed session id, pending messages, next live-delivery sequence number |
 | `harvested/<run-id>` | this run's outbox is collected |
+| `delivered-live/<thread-id>` | one line per message rule 4 confirmed was delivered live at harvest (agent, message id, run id) — an audit trail, not read back by anything |
 | `needs-operator/<thread-id>` | flag file; its content is the reason |
 | `spawns/<thread-id>` | one line per spawn, reset by rule 1 — line count is the **budget** count |
 | `seq/<thread-id>` | one line per spawn, never reset — feeds the branch name |
@@ -595,8 +605,9 @@ does.
 - **No SMTP.** The format is RFC 5322-shaped precisely so an SMTP or
   notmuch facade could be added host-side later without rewriting the
   store, but nothing like that exists.
-- **No mid-session delivery.** Mail arriving while an agent is awake
-  waits for the next wake.
+- **No mid-session delivery on pi or codex.** A claude wake gets live
+  delivery (see rule 4); mail arriving for a pi or codex seat that is
+  already awake still waits for the next wake.
 - **Detection of a dead wake has one residual gap.** A wake whose process
   died without writing `summary.json` is caught via its run dir's pid
   file, once the pid is dead (or the file predates the current boot, per

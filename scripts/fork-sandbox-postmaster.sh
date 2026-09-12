@@ -200,14 +200,20 @@
 #                                   TRIGGER, RUN_DIR, INBOX (RUN_DIR's
 #                                   inbox dir, recorded at spawn time so
 #                                   later rule-4 deliveries don't have to
-#                                   derive it from run-dir layout), BRANCH,
-#                                   RESUMED (the session id this wake was
-#                                   launched to resume, empty for a fresh
-#                                   one -- what `status` prints in its
-#                                   session column), PENDING_MSGS (comma
-#                                   list, may be empty), MAIL_SEQ (the next
-#                                   live-delivery sequence number for this
-#                                   run, see pm_next_mail_seq)
+#                                   derive it from run-dir layout), HARNESS
+#                                   (recorded at spawn time; the gate
+#                                   pm_wake_or_pend reads before a rule-4
+#                                   delivery -- live delivery only reaches
+#                                   a claude wake, every other harness
+#                                   falls back to a follow-up spawn),
+#                                   BRANCH, RESUMED (the session id this
+#                                   wake was launched to resume, empty for
+#                                   a fresh one -- what `status` prints in
+#                                   its session column), PENDING_MSGS
+#                                   (comma list, may be empty), MAIL_SEQ
+#                                   (the next live-delivery sequence
+#                                   number for this run, see
+#                                   pm_next_mail_seq)
 #   harvested/<run-id>             marker: this run's outbox is collected
 #   delivered-live/<thread-id>     one line per message rule 4 confirmed
 #                                   was delivered live at harvest (agent,

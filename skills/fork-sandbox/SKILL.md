@@ -575,6 +575,7 @@ described below are mounted. The log is written by the host shell.
 | `--outbox-dir` path (`--k8s` only) | the pod's own `/work/outbox`, pulled back to the host here once the run finishes; see "Kubernetes runs" above |
 | `<run-dir>/inbox/` | operator addenda, written with `fork-sandbox say`; bound read-only into the sandbox |
 | `<run-dir>/inbox-delivered/leg-<N>/` (non-`--k8s` only) | addenda delivered to leg `N` (the implement leg is 1; continuation, review and fix legs continue the count), archived here the moment that leg ends. Not created on a `--k8s` run: its review and fix legs run pod-side and never archive |
+| `<run-dir>/mail-delivered/leg-<N>/` (non-`--k8s` only) | `fork-sandbox-postmaster.sh`'s live-delivered mail banners for leg `N`, moved out of the inbox the same way and at the same moment as an addendum, but kept in a separate directory: a banner is new thread mail from the postmaster, not an operator instruction, and unlike `inbox-delivered/` this directory is never read back as an addendum by `fs_addenda_dirs`/`refresh_build_prompt` or the review/maintainer loops' own copies of that logic |
 | `<run-dir>/exit-code` | written when the session exits |
 | `<run-dir>/pi-session` | `--harness pi` only: pi's session, with per-message cost |
 | `<run-dir>/codex-sessions` | local Codex legs only: Codex rollout logs, persisted so host-side quota readers can see rate-limit snapshots; contains session transcripts and shares the run directory's lifecycle |
