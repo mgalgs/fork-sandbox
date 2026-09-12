@@ -111,9 +111,10 @@
 #
 # --resume-session ID resumes the claude session ID instead of starting a
 # fresh one. It requires --session-state, which is where the transcript is
-# read from, and ID must match ^[0-9a-f-]{8,64}$ -- it is a transcript
-# filename stem. The prompt on stdin is still delivered, as the next turn of
-# that conversation rather than the first of a new one.
+# read from, and ID must match ^[0-9a-f][0-9a-f-]{7,63}$ -- it is a
+# transcript filename stem, and a leading hyphen would let it be mistaken for
+# a flag on a command line. The prompt on stdin is still delivered, as the
+# next turn of that conversation rather than the first of a new one.
 #
 # Resume is a continuity and cost optimization, never a correctness
 # guarantee. A session id can name a transcript that was pruned, or one the
@@ -296,10 +297,10 @@ if [[ -n "$RESUME_SESSION" ]]; then
     # file in the store, so it is checked against the shape of a session id
     # rather than trusted. A caller that builds it from a filename cannot
     # turn a stray path into a different transcript, or into a flag.
-    if [[ ! "$RESUME_SESSION" =~ ^[0-9a-f-]{8,64}$ ]]; then
+    if [[ ! "$RESUME_SESSION" =~ ^[0-9a-f][0-9a-f-]{7,63}$ ]]; then
         echo "Error: --resume-session '$RESUME_SESSION' is not a session id. It" >&2
-        echo "must match ^[0-9a-f-]{8,64}\$ -- no slashes, no dots, no other" >&2
-        echo "characters." >&2
+        echo "must match ^[0-9a-f][0-9a-f-]{7,63}\$ -- no slashes, no dots, no" >&2
+        echo "leading hyphen, no other characters." >&2
         exit 1
     fi
 fi

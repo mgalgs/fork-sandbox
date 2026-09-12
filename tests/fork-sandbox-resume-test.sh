@@ -150,8 +150,12 @@ refuses "--resume-session refused without --session-state" \
     --resume-session 0123abcd-4567-89ab-cdef-0123456789ab
 
 # The id is used as a transcript filename stem, so path characters and
-# anything outside [0-9a-f-] must not survive to the claude command line.
+# anything outside [0-9a-f-] must not survive to the claude command line. A
+# leading hyphen is refused too: it would make the id flag-shaped, so a
+# caller building one by hand could hand the claude CLI an option instead of
+# a session id.
 for bad in "../etc/passwd" "a/b" "abcdef12.jsonl" "ABCDEF1234" "short" \
+           "-abcdef12" "-" \
            "$(printf 'a%.0s' {1..65})"; do
     refuses "bad session id refused: '$bad'" "is not a session id" \
         --harness claude --session-state "$scratch/fs-resume-unused" \
@@ -928,6 +932,9 @@ cs_refuses "claude-sandboxed refuses --resume-session without --session-state" \
 cs_refuses "claude-sandboxed refuses a bad session id" \
     "is not a session id" --session-state "$cs_state" \
     --resume-session "../etc/passwd" "$cs_work"
+cs_refuses "claude-sandboxed refuses a leading-hyphen session id" \
+    "is not a session id" --session-state "$cs_state" \
+    --resume-session "-abcdef12" "$cs_work"
 cs_refuses "claude-sandboxed refuses a symlinked state dir" \
     "is a symlink" --session-state "$symlink_state" "$cs_work"
 

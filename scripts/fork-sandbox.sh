@@ -212,13 +212,13 @@
 #                        review, fix or maintainer leg is resumed at all.
 #                        Requires --session-state, which is where
 #                        the transcript is read from; claude only. <id> must
-#                        match ^[0-9a-f-]{8,64}$ — it is a transcript
-#                        filename stem, so anything with a slash or a dot is
-#                        refused. Resume is a continuity and cost
-#                        optimization, never a correctness guarantee: if the
-#                        session is unknown or its transcript is unreadable,
-#                        claude-sandboxed retries once as a fresh session and
-#                        the run continues.
+#                        match ^[0-9a-f][0-9a-f-]{7,63}$ — it is a transcript
+#                        filename stem, so anything with a slash, a dot or a
+#                        leading hyphen is refused. Resume is a continuity and
+#                        cost optimization, never a correctness guarantee: if
+#                        the session is unknown or its transcript is
+#                        unreadable, claude-sandboxed retries once as a fresh
+#                        session and the run continues.
 #                        Nothing but the transcript crosses over, so the
 #                        coding leg's prompt gains a "This session is a
 #                        continuation" section naming what did not: the
@@ -3066,10 +3066,11 @@ if [[ -n "$resume_session" && -z "$session_state" ]]; then
     echo "transcript inside the sandbox to resume from." >&2
     exit 1
 fi
-if [[ -n "$resume_session" && ! "$resume_session" =~ ^[0-9a-f-]{8,64}$ ]]; then
+if [[ -n "$resume_session" && ! "$resume_session" =~ ^[0-9a-f][0-9a-f-]{7,63}$ ]]; then
     echo "Error: --resume-session '$resume_session' is not a session id. It is" >&2
     echo "used as a transcript filename stem, so it must match" >&2
-    echo "^[0-9a-f-]{8,64}\$ — no slashes, no dots, no other characters." >&2
+    echo "^[0-9a-f][0-9a-f-]{7,63}\$ — no slashes, no dots, no leading hyphen," >&2
+    echo "no other characters." >&2
     exit 1
 fi
 if [[ -n "$session_state" ]]; then
