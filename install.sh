@@ -296,6 +296,7 @@ PORCELAIN=(
     claude-sandboxed
     ensure-scratch-dirs.sh    # UserPromptSubmit hook command: settings.json invokes it by bare name
     fork-sandbox
+    fork-sandbox-fleet.sh
     fork-sandbox-k8s.sh
     fork-sandbox-mail.sh
     fork-sandbox-say.sh
@@ -310,6 +311,7 @@ PLUMBING=(
     fork-sandbox-discover-k8s
     fork-sandbox-discover-model
     fork-sandbox-discover-openrouter
+    fork-sandbox-fleet-parse.py
     fork-sandbox-format.sh
     fork-sandbox-inbox-hook.sh
     fork-sandbox-k8s-context-extract.sh
