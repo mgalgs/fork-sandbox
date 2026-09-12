@@ -16,9 +16,11 @@
 # Also covers fs_reuse_clone, fs_make_clone's counterpart for a --clone-dir
 # target that already exists: it fetches the existing clone's origin remote
 # and starts a new branch at the clone's own current HEAD -- the previous
-# wake's branch tip -- instead of making a fresh clone. Identity seeding does
-# not apply to it: a reused clone already has repo-local identity config from
-# when fs_make_clone first created it.
+# wake's branch tip -- instead of making a fresh clone, unless a checkout ref
+# is given, which pins the start point there instead. It prints the sha the
+# branch actually started from. Identity seeding does not apply to it: a
+# reused clone already has repo-local identity config from when fs_make_clone
+# first created it.
 #
 # Every case runs against a throwaway global config (GIT_CONFIG_GLOBAL) with
 # the system one switched off, so the identities are the test's own: the host's
@@ -223,9 +225,10 @@ fs_make_clone "$origin" "prior-branch" "$prior_clone" >/dev/null 2>&1
 config_commit "$prior_clone" "prior wake work" >/dev/null 2>&1
 prior_commit="$(git -C "$prior_clone" rev-parse HEAD)"
 
-reuse_out="$(fs_reuse_clone "$prior_clone" "next-branch" 2>&1)"
+reuse_out="$(fs_reuse_clone "$prior_clone" "next-branch" "" 2>&1)"
 check "fs_reuse_clone succeeds" "0" "$?"
-check "reuse is silent on success" "" "$reuse_out"
+check "reuse prints the sha it actually started the branch from" \
+    "$prior_commit" "$reuse_out"
 check "the new branch is checked out" \
     "next-branch" "$(git -C "$prior_clone" rev-parse --abbrev-ref HEAD)"
 check "the new branch starts at the prior wake's own commit" \
@@ -243,17 +246,41 @@ tmpdirs+=("$empty_target")
 (cd "$empty_target" && git init -q .) >/dev/null 2>&1
 git -C "$empty_target" remote add origin "$fallback_origin" >/dev/null 2>&1
 
-fs_reuse_clone "$empty_target" "fallback-branch" "$fallback_sha" >/dev/null 2>&1
+fs_reuse_clone "$empty_target" "fallback-branch" "" "$fallback_sha" >/dev/null 2>&1
 check "fs_reuse_clone with an unresolvable HEAD still succeeds" "0" "$?"
 check "the fallback sha places the branch" \
     "$fallback_sha" "$(git -C "$empty_target" rev-parse --verify --quiet HEAD)"
+
+# --checkout pins the start point even on a reused clone: the new branch
+# starts at the named ref's sha, not at the clone's own current HEAD, even
+# though the clone already has history of its own ahead of that sha.
+pin_origin="$(new_origin)"
+pin_clone="$(new_clone_path)"
+fs_make_clone "$pin_origin" "pin-prior-branch" "$pin_clone" >/dev/null 2>&1
+config_commit "$pin_clone" "prior wake work" >/dev/null 2>&1
+pin_prior_commit="$(git -C "$pin_clone" rev-parse HEAD)"
+env_commit "$pin_origin" "unrelated origin commit" >/dev/null 2>&1
+pin_target_sha="$(git -C "$pin_origin" rev-parse HEAD)"
+
+pin_out="$(fs_reuse_clone "$pin_clone" "pin-branch" "some-ref" "$pin_target_sha" 2>&1)"
+check "fs_reuse_clone with --checkout succeeds" "0" "$?"
+check "fs_reuse_clone with --checkout reports the pinned sha" \
+    "$pin_target_sha" "$pin_out"
+check "the new branch starts at the checkout sha, not the clone's own tip" \
+    "$pin_target_sha" "$(git -C "$pin_clone" rev-parse HEAD)"
+if git -C "$pin_clone" merge-base --is-ancestor "$pin_prior_commit" pin-branch 2>/dev/null; then
+    no "the prior wake's commit is not an ancestor of the pinned branch" \
+        "$pin_prior_commit is an ancestor of pin-branch"
+else
+    ok "the prior wake's commit is not an ancestor of the pinned branch"
+fi
 
 # Callers exit on a non-zero return, so a fetch failure (no such origin
 # remote) must stay non-zero.
 noorigin_target="$(mktemp -d)"
 tmpdirs+=("$noorigin_target")
 (cd "$noorigin_target" && git init -q .) >/dev/null 2>&1
-if fs_reuse_clone "$noorigin_target" "doomed-branch" >/dev/null 2>&1; then
+if fs_reuse_clone "$noorigin_target" "doomed-branch" "" >/dev/null 2>&1; then
     no "a clone with no origin remote still returns non-zero"
 else
     ok "a clone with no origin remote still returns non-zero"

@@ -236,11 +236,15 @@
 #     conversation's paths and commits are therefore both still there on
 #     the next wake; only run-dir-scoped paths (the previous wake's log,
 #     handoff, inbox, outbox) are gone, as they always were.
-#     fork-sandbox.sh tells a wake which case it is in, in a "This session
-#     is a continuation" section it adds to the prompt whenever
-#     --resume-session is given. Carrying work forward across wakes is
-#     still the agent's own git work (commit it, or it is not there next
-#     wake either); this just gives that work a stable place to land.
+#     fork-sandbox.sh tells a wake which case it is in, adding a "This
+#     session is a continuation" section when --resume-session is given
+#     (claude only) and a "This workspace is not new" section whenever the
+#     clone was reused with no session to resume (pi and codex, on every
+#     wake past the first) -- so a non-claude seat learns its workspace
+#     persisted even though it never gets the session-resume flag at all.
+#     Carrying work forward across wakes is still the agent's own git work
+#     (commit it, or it is not there next wake either); this just gives
+#     that work a stable place to land.
 #   - No delivery of mail tooling into the sandbox, and no store access
 #     from inside a run.
 #   - No list-Cc delivery index.

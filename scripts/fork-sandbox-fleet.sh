@@ -65,14 +65,24 @@
 #                  state dir under the postmaster's mail root (see
 #                  fork-sandbox-postmaster.sh's STATE table). <agent> alone
 #                  tears down every thread that agent has a seat on;
-#                  --thread narrows to one seat; --all tears down every
-#                  seat found. Refuses (naming the run) any seat with a
-#                  live, not-yet-harvested run rather than pull a
+#                  --thread narrows to one seat (validated the same way
+#                  <agent> is -- a single path component, so it cannot walk
+#                  the removal outside the state tree); --all tears down
+#                  every seat found. Refuses (naming the run) any seat with
+#                  a live, not-yet-harvested run rather than pull a
 #                  workspace out from under a running sandbox; a --all or
 #                  bare-<agent> sweep still tears down every OTHER named
-#                  seat and reports the refusal alongside them. Removing
-#                  nothing is success, not an error. This is the one verb
-#                  in this script that reads postmaster state
+#                  seat and reports the refusal alongside them. That check
+#                  is bookkeeping (runs/*.env), which the postmaster writes
+#                  only after a spawn returns, so it is backstopped by a
+#                  non-blocking probe of the workspace's OWN flock (the same
+#                  one fork-sandbox.sh takes for the run's lifetime) --
+#                  authoritative for a workspace already mid-clone, when no
+#                  runs/*.env exists yet to read. The whole verb also holds
+#                  the postmaster's own lock for its duration, so it cannot
+#                  run against a mid-flight routing pass. Removing nothing
+#                  is success, not an error. This is the one verb in this
+#                  script that reads postmaster state
 #                  ($FORK_SANDBOX_MAIL_ROOT/.postmaster) -- a deliberate,
 #                  narrow exception (it is a fleet-lifecycle operation a
 #                  user looks for on the fleet verb); no other verb here
@@ -105,6 +115,20 @@ fleet_validate_name() {
     if [[ ! "$1" =~ $FLEET_NAME_RE ]]; then
         echo "Error: '$1' is not a valid name; names are lowercase" >&2
         echo "alphanumeric and '-' only, no leading '-'." >&2
+        return 1
+    fi
+    return 0
+}
+
+# --thread is used as a single path component under three state trees
+# (PM_WORKSPACES/$tid/$agent and friends), the same way <agent> is. Unlike
+# an agent name, a thread id is not this script's to shape -- it comes from
+# whatever mail source the postmaster reads -- so this only rejects what
+# would escape that one path component, not what it may contain otherwise.
+fleet_validate_thread() {
+    if [[ -z "$1" || "$1" == */* || "$1" == "." || "$1" == ".." ]]; then
+        echo "Error: '$1' is not a valid thread id; it must be a single" >&2
+        echo "path component -- no '/', and not '.' or '..'." >&2
         return 1
     fi
     return 0
@@ -326,11 +350,67 @@ cmd_roster() {
 teardown_state_paths() {
     MAIL_ROOT="${FORK_SANDBOX_MAIL_ROOT:-/var/tmp/claude-scratch/agent-mail}"
     STATE="$MAIL_ROOT/.postmaster"
+    LOCK_FILE="$STATE/lock"
     RUNS="$STATE/runs"
     HARVESTED="$STATE/harvested"
     PM_SESSION_STATE="$STATE/state"
     PM_SESSIONS="$STATE/sessions"
     PM_WORKSPACES="$STATE/workspaces"
+}
+
+# Mirrors pm_lock_acquire/pm_lock_release (fork-sandbox-postmaster.sh)
+# exactly: the same flock(2) on the same file, so teardown and a routing
+# pass cannot run at the same time. Non-blocking -- an operator running
+# this interactively should see the conflict, not hang behind a router
+# that could be mid-spawn for a while.
+teardown_lock_acquire() {
+    mkdir -p -- "$STATE"
+    exec {teardown_lock_fd}<>"$LOCK_FILE" || return 1
+    if ! flock -n "$teardown_lock_fd"; then
+        local pid
+        pid="$(cat -- "$LOCK_FILE" 2>/dev/null || true)"
+        exec {teardown_lock_fd}>&-
+        echo "Error: teardown: postmaster${pid:+" (pid $pid)"} holds the lock; try again shortly." >&2
+        return 1
+    fi
+    # Same courtesy pm_lock_acquire extends: leave our own pid behind so a
+    # postmaster that loses the race to us reports an accurate holder
+    # rather than whatever pid was last written here.
+    printf '%s\n' "$$" > "$LOCK_FILE"
+    return 0
+}
+
+teardown_lock_release() {
+    [[ -n "${teardown_lock_fd:-}" ]] || return 0
+    flock -u "$teardown_lock_fd" 2>/dev/null || true
+    exec {teardown_lock_fd}>&- 2>/dev/null || true
+}
+
+# A workspace's own flock (see fs_lock_clone_dir, fork-sandbox.sh) is the
+# authoritative liveness signal for it: a live run holds it for its whole
+# lifetime, starting BEFORE it touches the workspace's git state at all.
+# runs/*.env (teardown_live_run) is written only after a spawn returns,
+# i.e. after a wake may already be cloning or fetching into the workspace,
+# so it alone would let a teardown race a run that has started but not yet
+# been recorded. No .git yet (the workspace does not exist, or a first
+# wake has not created it) means nothing to hold the lock, so there is
+# nothing to probe -- not a live run.
+teardown_workspace_locked() {
+    local ws="$1" fd
+    [[ -e "$ws/.git" ]] || return 1
+    # A bare `exec {fd}<>file 2>/dev/null` redirects the WHOLE shell's
+    # stderr from here on, not just this open -- exec with only
+    # redirections and no command applies them to the current shell
+    # permanently. Braces scope the redirect to just this open, the same
+    # way a subshell would, but without losing the fd for the caller.
+    { exec {fd}<>"$ws/.git/fork-sandbox-lock"; } 2>/dev/null || return 1
+    if flock -n "$fd"; then
+        flock -u "$fd"
+        exec {fd}>&-
+        return 1
+    fi
+    exec {fd}>&-
+    return 0
 }
 
 teardown_env_get() {
@@ -384,11 +464,16 @@ teardown_find_seats() {
 teardown_seat() {
     local tid="$1" agent="$2" run_id
     local -a removed=()
+    local ws="$PM_WORKSPACES/$tid/$agent"
     if run_id="$(teardown_live_run "$agent" "$tid")"; then
         echo "Error: $agent/$tid: refusing, run '$run_id' is still live." >&2
         return 1
     fi
-    local ws="$PM_WORKSPACES/$tid/$agent"
+    if teardown_workspace_locked "$ws"; then
+        echo "Error: $agent/$tid: refusing, workspace '$ws' is locked by a" >&2
+        echo "live run (no runs/*.env for it yet)." >&2
+        return 1
+    fi
     local sess="$PM_SESSIONS/$tid/$agent"
     local st="$PM_SESSION_STATE/$tid/$agent"
     [[ -e "$ws" ]] && { rm -rf -- "$ws"; removed+=("workspace"); }
@@ -420,6 +505,7 @@ cmd_teardown() {
             case "$1" in
                 --thread)
                     thread="${2:?Usage: fork-sandbox-fleet.sh teardown <agent> --thread <id>}"
+                    fleet_validate_thread "$thread" || return 1
                     shift 2
                     ;;
                 *)
@@ -444,6 +530,12 @@ cmd_teardown() {
         printf 'nothing to tear down.\n'
         return 0
     fi
+
+    # Held for the whole sweep, not just its lookups: a routing pass that
+    # starts partway through would otherwise see whatever half-torn-down
+    # state this leaves behind.
+    teardown_lock_acquire || return 1
+    trap teardown_lock_release EXIT
 
     local rc=0 seat tid a
     for seat in "${seats[@]}"; do

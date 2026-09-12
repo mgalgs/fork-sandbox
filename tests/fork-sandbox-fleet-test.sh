@@ -460,6 +460,81 @@ td_out7="$("$fleet" teardown --all)"; td_rc7=$?
 check "teardown --all: nothing left exits 0" "0" "$td_rc7"
 contains "teardown --all: nothing-to-tear-down message" "$td_out7" "nothing to tear down"
 
+# --thread is a path component, exactly like <agent>: a traversal value must
+# not be able to steer the removal outside the state tree.
+refuses "teardown: --thread with a '/' is refused" \
+    "$fleet" teardown alice --thread "../escape"
+refuses "teardown: --thread of '..' is refused" \
+    "$fleet" teardown alice --thread ".."
+refuses "teardown: --thread of '.' is refused" \
+    "$fleet" teardown alice --thread "."
+
+# eve/th6: the workspace's own git-dir lock is the authoritative liveness
+# signal, checked in ADDITION to runs/*.env -- a workspace can be mid-clone
+# for a wake the postmaster has not finished recording yet (no runs/*.env
+# exists), and teardown must still refuse it rather than pull the clone out
+# from under that in-flight run. Simulated by holding the same lock
+# fork-sandbox.sh's fs_lock_clone_dir takes, with no runs/*.env at all.
+mkdir -p -- "$PM_STATE/workspaces/th6/eve/.git"
+(
+    exec {eve_lock_fd}<>"$PM_STATE/workspaces/th6/eve/.git/fork-sandbox-lock"
+    flock "$eve_lock_fd"
+    touch "$work/eve-lock-held"
+    sleep 30
+) &
+eve_holder_pid=$!
+for _ in $(seq 1 50); do
+    [[ -e "$work/eve-lock-held" ]] && break
+    sleep 0.1
+done
+
+td_out8="$("$fleet" teardown eve --thread th6 2>&1)"; td_rc8=$?
+pkill -TERM -P "$eve_holder_pid" 2>/dev/null
+kill "$eve_holder_pid" 2>/dev/null
+wait "$eve_holder_pid" 2>/dev/null
+rm -f -- "$work/eve-lock-held"
+
+check "teardown: a workspace locked with no runs/*.env yet is refused" "1" "$td_rc8"
+contains "teardown: names the workspace lock as the reason" "$td_out8" "locked"
+path_state "teardown: locked-workspace seat untouched" present "$PM_STATE/workspaces/th6/eve"
+
+# Once the lock is released, the same seat tears down normally.
+td_out9="$("$fleet" teardown eve --thread th6)"; td_rc9=$?
+check "teardown: the same seat tears down once the lock clears" "0" "$td_rc9"
+path_state "teardown: eve workspace gone once unlocked" gone "$PM_STATE/workspaces/th6/eve"
+
+# A mid-flight routing pass holds the postmaster's own lock; teardown must
+# not run against it (a sweep started under it could tear down a seat the
+# router is about to spawn a wake for).
+mkdir -p -- "$PM_STATE/workspaces/th7/frank"
+(
+    exec {pm_lock_fd}<>"$PM_STATE/lock"
+    flock "$pm_lock_fd"
+    touch "$work/pm-lock-held"
+    sleep 30
+) &
+pm_holder_pid=$!
+for _ in $(seq 1 50); do
+    [[ -e "$work/pm-lock-held" ]] && break
+    sleep 0.1
+done
+
+td_out10="$("$fleet" teardown frank --thread th7 2>&1)"; td_rc10=$?
+pkill -TERM -P "$pm_holder_pid" 2>/dev/null
+kill "$pm_holder_pid" 2>/dev/null
+wait "$pm_holder_pid" 2>/dev/null
+rm -f -- "$work/pm-lock-held"
+
+check "teardown: refuses while the postmaster's own lock is held" "1" "$td_rc10"
+contains "teardown: names the postmaster lock as the reason" "$td_out10" "lock"
+path_state "teardown: seat untouched while the postmaster lock is held" \
+    present "$PM_STATE/workspaces/th7/frank"
+
+td_out11="$("$fleet" teardown frank --thread th7)"; td_rc11=$?
+check "teardown: the same seat tears down once the postmaster lock clears" "0" "$td_rc11"
+path_state "teardown: frank workspace gone once the postmaster lock clears" \
+    gone "$PM_STATE/workspaces/th7/frank"
+
 unset FORK_SANDBOX_MAIL_ROOT
 
 printf '\n== dispatcher wiring ==\n'

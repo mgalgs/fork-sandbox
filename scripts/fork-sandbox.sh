@@ -229,6 +229,10 @@
 #                        remote-tracking ref, not from HEAD. --clone-dir
 #                        below changes this: a reused clone keeps its
 #                        earlier commits on the new branch's own history.
+#                        (--resume-session is claude-only; --clone-dir is
+#                        not, so a pi or codex seat's later wakes get a
+#                        "This workspace is not new" section saying so
+#                        instead, with no session to resume at all.)
 # --clone-dir <dir>:     persist the clone in <dir> instead of a throwaway
 #                        one under the run dir, so a caller that runs this
 #                        script again with the same <dir> continues from the
@@ -252,15 +256,26 @@
 #                        current HEAD -- the previous run's branch tip --
 #                        falling back to the freshly-resolved origin ref only
 #                        when that HEAD cannot be read (an empty repository
-#                        with no commits at all). <dir> naming a directory
-#                        that exists but is not a git repository is a hard
-#                        error. The per-run fetch-back to the origin repo,
-#                        below, is unchanged either way -- every run still
-#                        pushes its branch home regardless of where its
-#                        clone lives. <dir> is locked (flock) for the life of
-#                        the run: a second run given the same <dir> while the
-#                        first is still going refuses to start rather than
-#                        risk two writers corrupting one git repository.
+#                        with no commits at all), or when --checkout names a
+#                        ref: --checkout always pins the start point, on a
+#                        reused clone exactly as on a fresh one, rather than
+#                        letting the clone's own history override the ref
+#                        that was asked for. <dir> naming a directory that
+#                        exists but is not a git repository is a hard error.
+#                        The per-run fetch-back to the origin repo, below, is
+#                        unchanged either way -- every run still pushes its
+#                        branch home regardless of where its clone lives.
+#                        Commit accounting and the review/maintainer loops'
+#                        no-progress guards measure against wherever THIS
+#                        run's branch actually started, not against the
+#                        origin ref resolved before reuse was known. <dir> is
+#                        locked (flock, at <dir>/.git/fork-sandbox-lock, so a
+#                        leg's own git operations cannot disturb it) for the
+#                        life of the run, taken before any git operation
+#                        touches a reused <dir>: a second run given the same
+#                        <dir> while the first is still going refuses to
+#                        start rather than risk two writers corrupting one
+#                        git repository.
 # --keep-session:        leave the tmux session open on a shell when the run
 #                        ends, instead of letting it close. Ignored with
 #                        --foreground, which has no tmux session.
@@ -3977,11 +3992,29 @@ if [[ "$prompt_overlay_matched" == true ]]; then
         '{dir: $dir, rev: (if $rev == "" then null else $rev end), legs: $legs}' \
         > "$run_dir/prompt-overlay.json"
 fi
+# Acquire the persistent-workspace lock at $1/.git/fork-sandbox-lock and set
+# the global clone_lock_fd, or print the standard refusal and exit. Under
+# .git, not the working tree: the pi session dir (below), the review verdict
+# and .env.sandbox all live under .git for the same reason -- git tracks
+# nothing there, so a leg running `git add -A` cannot commit the lock file
+# onto the branch that gets fetched home, and a `git clean -fdx` cannot
+# unlink it out from under a still-live holder.
+fs_lock_clone_dir() {
+    local dir="$1"
+    exec {clone_lock_fd}<>"$dir/.git/fork-sandbox-lock"
+    if ! flock -n "$clone_lock_fd"; then
+        echo "Error: workspace '$dir' is locked by another run --" >&2
+        echo "refusing to start." >&2
+        exit 1
+    fi
+}
+
 # clone_reused feeds the resumed-session continuation prompt below: a reused
 # clone keeps the same absolute path and the same branch history across
 # wakes, which makes several claims in that prompt's "stale paths" section
 # false, so it is rewritten when this is true.
 clone_reused=false
+clone_lock_fd=""
 if [[ -z "$clone_dir_flag" ]]; then
     # Name the parent 'clone', not 'repo'. A directory called 'repo' sitting
     # one level above the checkout reads like the repository root, and a
@@ -4019,25 +4052,44 @@ elif ! git -C "$clone_dir_flag" rev-parse --git-dir >/dev/null 2>&1; then
         exit 1
     fi
 else
-    # Reuse: fetch from the origin first, so upstream work done since the
-    # last wake is visible, then start the new branch at the clone's own
-    # current HEAD -- the previous wake's branch tip -- so this wake's
-    # commits build on the last one's instead of an agent silently losing
-    # its own work across wakes.
+    # Reuse: lock the workspace BEFORE touching its git state at all. A
+    # second run given a live seat's --clone-dir must find out it is locked
+    # before it fetches or checks out a branch there -- taking the lock only
+    # afterward (as a "belt and braces" afterthought, below) is too late: by
+    # the time flock refuses, this run has already switched the live
+    # holder's checked-out branch out from under it, and exiting now does
+    # not undo that.
     clone_dir="$clone_dir_flag"
     clone_reused=true
 
     echo "Reusing '$clone_dir' for the sandbox..." >&2
-    # Unlike fs_make_clone's fresh path, there is no "already checked out at
-    # the right commit" default to fall back to silently: a fresh clone sits
-    # at origin's HEAD the moment git clone finishes, but a reused clone's
-    # own HEAD may be unresolvable (the empty-repo edge case), so the
-    # fallback must be given explicitly rather than only when --checkout was
-    # passed. checkout_sha is always resolved by this point -- to the
-    # checked-out ref's sha when --checkout was given, to base_sha otherwise.
-    if ! fs_reuse_clone "$clone_dir" "$branch" "$checkout_sha"; then
+    fs_lock_clone_dir "$clone_dir"
+
+    # Fetch from the origin first, so upstream work done since the last
+    # wake is visible, then start the new branch at the clone's own current
+    # HEAD -- the previous wake's branch tip -- so this wake's commits build
+    # on the last one's instead of an agent silently losing its own work
+    # across wakes. Unlike fs_make_clone's fresh path, there is no "already
+    # checked out at the right commit" default to fall back to silently: a
+    # fresh clone sits at origin's HEAD the moment git clone finishes, but a
+    # reused clone's own HEAD may be unresolvable (the empty-repo edge
+    # case), so the fallback must be given explicitly rather than only when
+    # --checkout was passed. checkout_sha is always resolved by this point
+    # -- to the checked-out ref's sha when --checkout was given, to base_sha
+    # otherwise. --checkout, when given, pins the start point instead of
+    # the clone's own tip, exactly as a fresh clone would; fs_reuse_clone
+    # prints back whichever sha it actually started the branch from, so the
+    # run's commit accounting and loop guards can measure against what this
+    # wake's branch really started at rather than against base_sha/
+    # return_base_sha as resolved before reuse was known.
+    if ! reuse_start_sha="$(fs_reuse_clone "$clone_dir" "$branch" "$checkout_ref" "$checkout_sha")"; then
         exit 1
     fi
+    return_base_sha="$reuse_start_sha"
+    # base_sha stays as computed above in review-only mode: --review-base
+    # can name a review range base older than the checkout, deliberately
+    # different from the commit the clone actually started from.
+    [[ "$review_only" == true ]] || base_sha="$reuse_start_sha"
 fi
 # Belt and braces on top of the postmaster's routing rule 4 (which already
 # serializes wakes for one seat by refusing a second spawn while a run is
@@ -4045,17 +4097,14 @@ fi
 # second concurrent run in the same directory would corrupt its git state. A
 # fresh clone under $run_dir carries no such risk -- it dies with this run
 # and nothing else can ever reach it -- so the lock is only taken when a
-# --clone-dir was given. Held via a plain fd for the run's lifetime, released
-# by run_cleanup; see pm_lock_acquire in fork-sandbox-postmaster.sh for why
-# this is flock rather than a pid file.
-clone_lock_fd=""
-if [[ -n "$clone_dir_flag" ]]; then
-    exec {clone_lock_fd}<>"$clone_dir/.fork-sandbox-lock"
-    if ! flock -n "$clone_lock_fd"; then
-        echo "Error: workspace '$clone_dir' is locked by another run --" >&2
-        echo "refusing to start." >&2
-        exit 1
-    fi
+# --clone-dir was given. The reuse branch above already took it, before
+# doing any git work in that workspace; this covers the first-wake-for-this-
+# --clone-dir branch, where the workspace did not exist until fs_make_clone
+# just created it and so could not have raced anything. Held via a plain fd
+# for the run's lifetime, released by run_cleanup; see pm_lock_acquire in
+# fork-sandbox-postmaster.sh for why this is flock rather than a pid file.
+if [[ -n "$clone_dir_flag" && -z "$clone_lock_fd" ]]; then
+    fs_lock_clone_dir "$clone_dir"
 fi
 fs_collect_alternates "$clone_dir"
 
@@ -4566,6 +4615,28 @@ Otherwise:
   run's own branch tip -- so anything you committed on an earlier wake is
   already on this branch's history. \`git log\` shows it directly; there is no
   remote-tracking ref to go hunting through.
+EOF
+    elif [[ "$clone_reused" == true ]]; then
+        # --clone-dir is not claude-only, but --resume-session is: a pi or
+        # codex seat's second wake reuses this same workspace with no
+        # transcript to resume, and without this branch it gets nothing but
+        # the generic "throwaway, ephemeral" preamble above -- wrong for a
+        # workspace that persists and already carries an earlier wake's
+        # commits.
+        cat <<EOF
+
+## This workspace is not new
+
+This session has no earlier conversation to resume, but the clone is not new
+either: \`$clone_dir\` is the SAME directory an earlier wake used, and its git
+history is still there.
+
+- The branch is \`$branch\`, a new name, but it was started at an earlier
+  wake's own branch tip, so anything committed on an earlier wake is already
+  on this branch's history. \`git log\` shows it directly.
+- \`git branch\` may list other branches from earlier wakes in this same
+  workspace; they are this repository's own history, not a different
+  sandbox's.
 EOF
     fi
     if (( services_enabled )); then

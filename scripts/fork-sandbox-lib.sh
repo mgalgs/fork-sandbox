@@ -297,23 +297,37 @@ fs_validate_scratch_dir() {
 # Reuse an existing --clone-dir clone for a new wake instead of making a
 # fresh one: fetch from its origin remote (named 'origin' -- fs_make_clone
 # never passes git clone a -o, so this is git's own default), then start a
-# new branch there. The new branch starts at the clone's own current HEAD --
-# the previous wake's branch tip -- so commits made on earlier wakes are
-# reachable from the new branch's history directly, not just as a
-# remote-tracking ref. A clone with no commits at all (HEAD unresolvable --
-# in practice only a --clone-dir target the caller `git init`'d empty, since
-# every real prior wake leaves at least the origin's own history) falls back
-# to the given fallback sha instead, exactly as a fresh fs_make_clone would.
+# new branch there.
+#
+# checkout_ref, when non-empty, PINS the start point at checkout_sha,
+# exactly as a fresh fs_make_clone would -- the caller asked for that
+# specific ref, and a reused clone's own history does not get to override
+# that just because it happens to have one. Without --checkout, the new
+# branch starts at the clone's own current HEAD -- the previous wake's
+# branch tip -- so commits made on earlier wakes are reachable from the new
+# branch's history directly, not just as a remote-tracking ref. A clone with
+# no commits at all (HEAD unresolvable -- in practice only a --clone-dir
+# target the caller `git init`'d empty, since every real prior wake leaves
+# at least the origin's own history) falls back to checkout_sha too, exactly
+# as a fresh fs_make_clone would.
+#
+# Prints the sha the branch actually started from on success, so the caller
+# can rebase its own commit accounting and loop guards on the commit this
+# wake's branch really started at, rather than on whatever base_sha meant
+# before it was known this clone would be reused.
 #
 # No identity-seeding here, unlike fs_make_clone: a reused clone already has
 # repo-local user.name/user.email from when it was first created.
 fs_reuse_clone() {
-    local dest="$1" branch="$2" fallback_sha="${3:-}" start_sha
+    local dest="$1" branch="$2" checkout_ref="$3" checkout_sha="${4:-}" start_sha
     git -C "$dest" fetch origin --quiet || return 1
-    if ! start_sha="$(git -C "$dest" rev-parse --verify --quiet HEAD)"; then
-        start_sha="$fallback_sha"
+    if [[ -n "$checkout_ref" ]]; then
+        start_sha="$checkout_sha"
+    elif ! start_sha="$(git -C "$dest" rev-parse --verify --quiet HEAD)"; then
+        start_sha="$checkout_sha"
     fi
     git -C "$dest" checkout --quiet -b "$branch" ${start_sha:+"$start_sha"} || return 1
+    printf '%s\n' "$start_sha"
     return 0
 }
 

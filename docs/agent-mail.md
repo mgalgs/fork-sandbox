@@ -230,12 +230,24 @@ fork-sandbox fleet resolve <name>     # six lines: harness, model, thinking,
                                       # network, persona-path, description
 fork-sandbox fleet expand @crew,@ci   # a list becomes its members, deduped
 fork-sandbox fleet roster             # human-readable summary
+fork-sandbox fleet teardown <agent> [--thread <id>]
+fork-sandbox fleet teardown --all     # destroy persistent (thread, agent)
+                                      # seat state: the workspace clone, the
+                                      # session record, the session state dir
 ```
 
 `check` accumulates every error across the fleet file and every persona
 it declares — addressed by path, like `agents.reviewer.modle` — rather
 than stopping at the first. `resolve` always prints exactly six lines;
 an unconfigured field is an empty line, never a missing one.
+
+`teardown` is how an operator reclaims a seat's persistent state (the
+`workspaces/`, `sessions/` and `state/` rows in the table above) once a
+thread is done with it — nothing else ever removes them. `<agent>` alone
+tears down every thread that agent has a seat on; `--thread` narrows to
+one seat; `--all` tears down every seat found. It refuses, by name, any
+seat with a live, not-yet-harvested run rather than pull a workspace out
+from under a running sandbox.
 
 A missing fleet file is not an error by itself: `resolve` and `expand` of
 a bare agent still work from persona files alone, which makes a personas
@@ -398,6 +410,7 @@ own thread scans never see it:
 | `handoffs/<run-id>.md` | the generated handoff a wake was given |
 | `state/<thread-id>/<agent>/` | the claude transcript store for that pair |
 | `sessions/<thread-id>/<agent>` | the session id that pair's last wake ended on |
+| `workspaces/<thread-id>/<agent>/` | the persistent clone for that (thread, agent) seat, bound into every wake of it (every harness, not just claude) with `--clone-dir`; removed only by `fleet teardown` |
 
 All state transitions are marker-file creation, never deletion of
 anything the store owns. A `routed/` marker is written *before* any spawn
@@ -440,17 +453,24 @@ That file present means the next wake resumes; absent means fresh. It is
 cleared when a wake fails outright, or ends with a null session id, so a
 broken session can never wedge a seat.
 
-**A resumed session is the only thing that crosses between wakes.** The
-sandbox does not. Every wake gets a new work dir, so a new clone, new
-inbox and outbox at fresh absolute paths, and a new branch started at the
-clone's own HEAD rather than at the previous wake's branch. A resumed
-conversation therefore remembers paths that no longer exist and commits
-that are not reachable from the HEAD it is now looking at — the earlier
-branch did come back to the origin, so the new clone has it as a
-remote-tracking ref, but nothing merges it forward.
-`fork-sandbox.sh` tells a resumed wake exactly this, in a "This session
-is a continuation" section it adds to the prompt. Carrying work forward
-across wakes is the agent's own git work; nothing here automates it.
+**A resumed session and the seat's clone both cross wakes; the run dir does
+not.** Every wake still gets a fresh run dir — a new log, handoff,
+summary.json, operator inbox and artifact outbox, all at fresh absolute
+paths — but the clone at `workspaces/<thread-id>/<agent>/` (see the state
+table above) is the SAME directory every wake of that seat sees, bound in
+with `--clone-dir` for every harness, not just claude. `fork-sandbox.sh`
+fetches the origin and starts each new wake's branch at the seat's own
+previous branch tip, so work commits forward across wakes instead of
+restarting at origin HEAD each time. A resumed conversation's paths and
+commits are therefore both still there on the next wake; only run-dir-scoped
+paths (the previous wake's log, handoff, inbox, outbox) are gone, as they
+always were.
+`fork-sandbox.sh` tells a wake which case it is in: a "This session is a
+continuation" section when `--resume-session` is given (claude only), or a
+"This workspace is not new" section whenever the clone was reused with no
+session to resume — which is every wake past a pi or codex seat's first,
+since those harnesses never get `--resume-session` at all. Carrying work
+forward across wakes is the agent's own git work; nothing here automates it.
 
 A `--refresh-at` continuation is the same conversation continued, so it
 does write to the session store — but it is never *resumed*, whatever

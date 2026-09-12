@@ -253,6 +253,18 @@ if git -C "$flow_clone" rev-parse --verify --quiet fs-clonedir-b1 >/dev/null; th
 else
     no "first wake: clone is on the run's branch" "no branch fs-clonedir-b1 in $flow_clone"
 fi
+if [[ -e "$flow_clone/.git/fork-sandbox-lock" ]]; then
+    ok "first wake: the lock file lives under .git, not the working tree"
+else
+    no "first wake: the lock file lives under .git, not the working tree" \
+        "expected $flow_clone/.git/fork-sandbox-lock"
+fi
+if [[ -z "$(git -C "$flow_clone" status --porcelain)" ]]; then
+    ok "first wake: the lock file leaves the working tree clean"
+else
+    no "first wake: the lock file leaves the working tree clean" \
+        "$(git -C "$flow_clone" status --porcelain)"
+fi
 first_head="$(git -C "$flow_clone" rev-parse HEAD 2>/dev/null)"
 proj_head="$(git -C "$flow_proj" rev-parse HEAD 2>/dev/null)"
 if [[ -n "$first_head" && "$first_head" == "$proj_head" ]]; then
@@ -282,6 +294,55 @@ if git -C "$flow_clone" merge-base --is-ancestor "$seat_commit" fs-clonedir-b2 2
 else
     no "second wake: new branch is built on the first wake's own commit" \
         "seat_commit=$seat_commit not an ancestor of fs-clonedir-b2"
+fi
+
+# Commit accounting has to measure THIS wake against the commit the reused
+# clone actually started from -- the previous wake's tip -- not against the
+# origin's HEAD from before any wake existed. The stub commits nothing on
+# this call, so a wake that made no commits of its own must report 0, not
+# claim the first wake's already-accounted-for commit as its own.
+second_fields=()
+mapfile -t second_fields <<<"$second_result"
+second_rundir="${second_fields[3]:-}"
+if [[ -n "$second_rundir" && -f "$second_rundir/summary.json" ]]; then
+    second_commits="$(jq -r '.commits' "$second_rundir/summary.json" 2>/dev/null)"
+    if [[ "$second_commits" == "0" ]]; then
+        ok "second wake: a wake that commits nothing reports 0 commits, not its predecessor's"
+    else
+        no "second wake: a wake that commits nothing reports 0 commits, not its predecessor's" \
+            "summary.json reports commits=$second_commits"
+    fi
+else
+    no "second wake: a wake that commits nothing reports 0 commits, not its predecessor's" \
+        "no summary.json at '${second_rundir:-<empty>}'"
+fi
+if git -C "$flow_proj" rev-parse --verify --quiet fs-clonedir-b2 >/dev/null 2>&1; then
+    no "second wake: a no-new-commits wake does not leave its branch behind in the origin" \
+        "found branch fs-clonedir-b2 in $flow_proj"
+else
+    ok "second wake: a no-new-commits wake does not leave its branch behind in the origin"
+fi
+
+# This run passed no --resume-session (that flag is claude-only; --clone-dir
+# is not), so the reused-workspace notice must key off clone_reused alone --
+# a seat reusing a persistent workspace has to be told so even when there is
+# no transcript to resume.
+if [[ -n "$second_rundir" && -f "$second_rundir/handoff.md" ]]; then
+    if grep -qF -- '## This workspace is not new' "$second_rundir/handoff.md"; then
+        ok "second wake: a reused workspace is flagged even with no --resume-session"
+    else
+        no "second wake: a reused workspace is flagged even with no --resume-session" \
+            "$(cat "$second_rundir/handoff.md")"
+    fi
+    if grep -qF -- '## This session is a continuation' "$second_rundir/handoff.md"; then
+        no "second wake: no false claim of a resumed transcript" \
+            "found the resumed-session marker with no --resume-session given"
+    else
+        ok "second wake: no false claim of a resumed transcript"
+    fi
+else
+    no "second wake: a reused workspace is flagged even with no --resume-session" \
+        "no handoff.md at '${second_rundir:-<empty>}'"
 fi
 
 # ---------------------------------------------------------------------------
@@ -359,7 +420,7 @@ tmpdirs+=("$lock_marker")
 rm -f -- "$lock_marker"
 
 (
-    exec {lock_fd}<>"$lock_clone/.fork-sandbox-lock"
+    exec {lock_fd}<>"$lock_clone/.git/fork-sandbox-lock"
     if flock -n "$lock_fd"; then
         touch "$lock_marker"
         sleep 30
@@ -392,6 +453,17 @@ if (( locked_rc != 0 )) && printf '%s' "$locked_out" | grep -qF "is locked by an
     ok "--clone-dir refuses to start against a locked workspace"
 else
     no "--clone-dir refuses to start against a locked workspace" "$locked_out"
+fi
+
+# The lock must be taken BEFORE the reuse path fetches/checks out a branch,
+# not after: a run that loses the race has to refuse before it touches the
+# live holder's git state, not after it has already switched the checked-out
+# branch out from under it.
+if git -C "$lock_clone" rev-parse --verify --quiet fs-clonedir-locked-b >/dev/null; then
+    no "--clone-dir refuses before checking out a branch in the locked workspace" \
+        "found branch fs-clonedir-locked-b in $lock_clone"
+else
+    ok "--clone-dir refuses before checking out a branch in the locked workspace"
 fi
 
 unlocked_out="$(HOME="$lock_home" PATH="$stub_bin:$PATH" \
