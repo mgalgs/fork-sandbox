@@ -320,5 +320,275 @@ else
     fi
 fi
 
+# ---------------------------------------------------------------------------
+printf '\n== claude-sandboxed: the bind, the resume and the retry ==\n'
+# ---------------------------------------------------------------------------
+
+wrapper="$repo_dir/scripts/claude-sandboxed"
+
+# A fixture $HOME with a synthetic, unexpired credential. claude-sandboxed
+# reads it with jq before anything else in claude mode, so without one every
+# assertion below would fail on the operator's real credential instead of on
+# what is under test. Nothing here is a real token.
+cs_home="$(mktmp_dir "$scratch/fs-resume-cshome.XXXXXX")"
+mkdir -p "$cs_home/.claude"
+jq -n --argjson exp "$(( ($(date +%s) + 86400) * 1000 ))" \
+    '{claudeAiOauth: {accessToken: "fixture-not-a-token", expiresAt: $exp,
+                      refreshToken: "fixture-refresh"}}' \
+    > "$cs_home/.claude/.credentials.json"
+chmod 600 "$cs_home/.claude/.credentials.json"
+
+# The backend stub: answers --capabilities, dumps its own argv, then execs
+# the words after '--' so the stub claude below sees the real invocation.
+cs_bin="$(mktmp_dir "$scratch/fs-resume-csbin.XXXXXX")"
+cat > "$cs_bin/sandbox-backend-test" <<'BACKEND'
+#!/usr/bin/env bash
+if [[ "${1-}" == --capabilities ]]; then
+    printf 'toolchain=host\n'
+    exit 0
+fi
+[[ -z "${BACKEND_CAPTURE:-}" ]] || printf '%s\n' "$@" >> "$BACKEND_CAPTURE"
+while [[ $# -gt 0 && "$1" != -- ]]; do shift; done
+shift
+exec "$@"
+BACKEND
+chmod +x "$cs_bin/sandbox-backend-test"
+
+# The stub claude: records the argv it was handed and the prompt it was fed,
+# and fails on demand with a chosen message on stderr.
+cat > "$cs_bin/claude" <<'CLAUDE'
+#!/usr/bin/env bash
+printf '%s\n' "$@" >> "$CLAUDE_ARGV_FILE"
+printf -- '--- attempt end ---\n' >> "$CLAUDE_ARGV_FILE"
+cat >> "$CLAUDE_STDIN_FILE"
+# CLAUDE_FAIL_ONCE names a marker file: fail while it exists, and remove it
+# on the way out, so the FIRST attempt fails and a retry succeeds. Without
+# it, CLAUDE_FAIL_MESSAGE fails every attempt.
+if [[ -n "${CLAUDE_FAIL_ONCE:-}" ]]; then
+    if [[ -e "$CLAUDE_FAIL_ONCE" ]]; then
+        rm -f "$CLAUDE_FAIL_ONCE"
+        printf '%s\n' "${CLAUDE_FAIL_MESSAGE:-failed}" >&2
+        exit 1
+    fi
+    exit 0
+fi
+if [[ -n "${CLAUDE_FAIL_MESSAGE:-}" ]]; then
+    printf '%s\n' "$CLAUDE_FAIL_MESSAGE" >&2
+    exit 1
+fi
+exit 0
+CLAUDE
+chmod +x "$cs_bin/claude"
+
+# Runs claude-sandboxed for real against those stubs. Prints
+# "backend-argv<nl>claude-argv<nl>claude-stdin<nl>wrapper-output"; exit status
+# is the wrapper's.
+run_wrapper() {
+    local work backend_argv claude_argv claude_stdin out rc
+    work="$(mktemp -d "$scratch/forks/fs-resume-work.XXXXXX")"
+    backend_argv="$(mktemp "$scratch/fs-resume-backend.XXXXXX")"
+    claude_argv="$(mktemp "$scratch/fs-resume-claudeargv.XXXXXX")"
+    claude_stdin="$(mktemp "$scratch/fs-resume-claudestdin.XXXXXX")"
+    out="$(printf 'the prompt\n' \
+        | HOME="$cs_home" PATH="$cs_bin:$PATH" \
+          FORK_SANDBOX_BACKEND=test \
+          BACKEND_CAPTURE="$backend_argv" \
+          CLAUDE_ARGV_FILE="$claude_argv" \
+          CLAUDE_STDIN_FILE="$claude_stdin" \
+          timeout 60 "$wrapper" "$@" "$work" --print 2>&1)"
+    rc=$?
+    rm -rf "$work"
+    printf '%s\n%s\n%s\n%s\n' "$backend_argv" "$claude_argv" "$claude_stdin" "$out"
+    (( rc == 0 ))
+}
+
+# Splits a run_wrapper result, registering the three files with tmpdirs in
+# the shell that owns the array -- run_wrapper's own body runs inside the
+# caller's command substitution, where a tmpdirs+= would not survive.
+take_wrapper_result() {
+    local -a fields
+    mapfile -t fields <<<"$1"
+    W_BACKEND="${fields[0]:-}"
+    W_CLAUDE_ARGV="${fields[1]:-}"
+    W_CLAUDE_STDIN="${fields[2]:-}"
+    tmpdirs+=("$W_BACKEND" "$W_CLAUDE_ARGV" "$W_CLAUDE_STDIN")
+}
+
+cs_state="$(mktmp_dir "$scratch/fs-resume-csstate.XXXXXX")"
+cs_sid=0123abcd-4567-89ab-cdef-0123456789ab
+
+# --- the bind ---------------------------------------------------------------
+take_wrapper_result "$(run_wrapper --session-state "$cs_state")"
+if argv_has_flag_value "$W_BACKEND" --bind-rw-at "$cs_state" \
+    && awk -v s="$cs_state" -v d="$cs_home/.claude/projects" '
+        $0 == s && prev == "--bind-rw-at" { want = 1 }
+        want && $0 == d { found = 1; want = 0 }
+        { prev = $0 }
+        END { exit !found }' "$W_BACKEND"; then
+    ok "the state dir is bound rw at the sandbox HOME's ~/.claude/projects"
+else
+    no "the state dir is bound rw at the sandbox HOME's ~/.claude/projects" \
+        "$(cat "$W_BACKEND")"
+fi
+
+# It must be the ONLY new writable bind: never the whole ~/.claude, whose
+# other contents (the credential copy, the settings, the onboarding file)
+# stay ephemeral. Compare the DESTINATIONS of every writable bind against the
+# same run without the flag -- the sources are per-run mktemp paths, which
+# differ between two runs for reasons that have nothing to do with this flag.
+rw_destinations() {
+    awk '
+        prev2 == "--bind-rw-at" { print }
+        prev == "--bind-rw" { print }
+        { prev2 = prev; prev = $0 }
+    ' "$1" | sort
+}
+take_wrapper_result "$(run_wrapper)"
+plain_backend="$W_BACKEND"
+take_wrapper_result "$(run_wrapper --session-state "$cs_state")"
+added="$(comm -13 <(rw_destinations "$plain_backend") <(rw_destinations "$W_BACKEND"))"
+if [[ "$added" == "$cs_home/.claude/projects" ]]; then
+    ok "--session-state adds that bind and nothing else writable"
+else
+    no "--session-state adds that bind and nothing else writable" \
+        "writable destinations added: $added"
+fi
+# ~/.claude as a whole must still be the ephemeral state dir's copy, not a
+# second host bind: the credential lives in there.
+if (( $(grep -cx -- "$cs_home/.claude" "$W_BACKEND") == 1 )); then
+    ok "the sandbox HOME .claude is still bound exactly once, from the temp state dir"
+else
+    no "the sandbox HOME .claude is still bound exactly once, from the temp state dir" \
+        "$(cat "$W_BACKEND")"
+fi
+
+# --- the resume -------------------------------------------------------------
+take_wrapper_result "$(run_wrapper --session-state "$cs_state" \
+    --resume-session "$cs_sid")"
+if argv_has_flag_value "$W_CLAUDE_ARGV" --resume "$cs_sid"; then
+    ok "claude is invoked with --resume <id>"
+else
+    no "claude is invoked with --resume <id>" "$(cat "$W_CLAUDE_ARGV")"
+fi
+if grep -qx -- --print "$W_CLAUDE_ARGV"; then
+    ok "--resume rides alongside the caller's --print (headless resume)"
+else
+    no "--resume rides alongside the caller's --print (headless resume)" \
+        "$(cat "$W_CLAUDE_ARGV")"
+fi
+if grep -qx 'the prompt' "$W_CLAUDE_STDIN"; then
+    ok "the prompt still reaches a resumed session on stdin"
+else
+    no "the prompt still reaches a resumed session on stdin" \
+        "$(cat "$W_CLAUDE_STDIN")"
+fi
+
+take_wrapper_result "$(run_wrapper --session-state "$cs_state")"
+if grep -qx -- --resume "$W_CLAUDE_ARGV"; then
+    no "no --resume-session means a fresh session" "$(cat "$W_CLAUDE_ARGV")"
+else
+    ok "no --resume-session means a fresh session"
+fi
+
+# --- the retry --------------------------------------------------------------
+fail_once="$scratch/fs-resume-failonce.$$"
+tmpdirs+=("$fail_once")
+: > "$fail_once"
+retry_out="$(printf 'the prompt\n' \
+    | HOME="$cs_home" PATH="$cs_bin:$PATH" FORK_SANDBOX_BACKEND=test \
+      BACKEND_CAPTURE=/dev/null \
+      CLAUDE_ARGV_FILE="$scratch/fs-resume-retryargv.$$" \
+      CLAUDE_STDIN_FILE="$scratch/fs-resume-retrystdin.$$" \
+      CLAUDE_FAIL_MESSAGE="No conversation found with session ID: $cs_sid" \
+      CLAUDE_FAIL_ONCE="$fail_once" \
+      timeout 60 "$wrapper" --session-state "$cs_state" \
+      --resume-session "$cs_sid" \
+      "$(mktemp -d "$scratch/forks/fs-resume-work.XXXXXX")" --print 2>&1)"
+retry_rc=$?
+tmpdirs+=("$scratch/fs-resume-retryargv.$$" "$scratch/fs-resume-retrystdin.$$")
+retry_argv="$scratch/fs-resume-retryargv.$$"
+
+if printf '%s\n' "$retry_out" | grep -q 'resume failed, retrying fresh'; then
+    ok "a resume-shaped failure logs the marker line"
+else
+    no "a resume-shaped failure logs the marker line" "$retry_out"
+fi
+if (( $(grep -cx -- '--- attempt end ---' "$retry_argv") == 2 )); then
+    ok "a resume-shaped failure runs claude exactly twice"
+else
+    no "a resume-shaped failure runs claude exactly twice" "$(cat "$retry_argv")"
+fi
+# The second attempt must carry no --resume at all.
+if [[ "$(sed -n '/--- attempt end ---/,$p' "$retry_argv" | grep -cx -- --resume)" == 0 ]]; then
+    ok "the second attempt drops --resume"
+else
+    no "the second attempt drops --resume" "$(cat "$retry_argv")"
+fi
+# And it must get the prompt: the first attempt consumed stdin, so an
+# unbuffered retry would hand claude nothing.
+if (( $(grep -cx 'the prompt' "$scratch/fs-resume-retrystdin.$$") == 2 )); then
+    ok "both attempts are fed the buffered prompt"
+else
+    no "both attempts are fed the buffered prompt" \
+        "$(cat "$scratch/fs-resume-retrystdin.$$")"
+fi
+if (( retry_rc == 0 )); then
+    ok "the run succeeds when the fresh retry does"
+else
+    no "the run succeeds when the fresh retry does" "rc=$retry_rc: $retry_out"
+fi
+
+# A failure that is NOT resume-shaped is the run's own: no retry, and the
+# exit code passes straight back.
+plain_fail_argv="$scratch/fs-resume-plainargv.$$"
+tmpdirs+=("$plain_fail_argv")
+plain_fail_out="$(printf 'the prompt\n' \
+    | HOME="$cs_home" PATH="$cs_bin:$PATH" FORK_SANDBOX_BACKEND=test \
+      BACKEND_CAPTURE=/dev/null \
+      CLAUDE_ARGV_FILE="$plain_fail_argv" \
+      CLAUDE_STDIN_FILE=/dev/null \
+      CLAUDE_FAIL_MESSAGE="Error: the model refused to do the work" \
+      timeout 60 "$wrapper" --session-state "$cs_state" \
+      --resume-session "$cs_sid" \
+      "$(mktemp -d "$scratch/forks/fs-resume-work.XXXXXX")" --print 2>&1)"
+plain_fail_rc=$?
+if (( $(grep -cx -- '--- attempt end ---' "$plain_fail_argv") == 1 )); then
+    ok "a non-resume failure does NOT retry"
+else
+    no "a non-resume failure does NOT retry" "$(cat "$plain_fail_argv")"
+fi
+if (( plain_fail_rc != 0 )); then
+    ok "a non-resume failure keeps its exit code"
+else
+    no "a non-resume failure keeps its exit code" "$plain_fail_out"
+fi
+
+# --- claude-sandboxed's own refusals ---------------------------------------
+cs_refuses() {
+    local label="$1" needle="$2"; shift 2
+    local out rc
+    out="$(HOME="$cs_home" PATH="$cs_bin:$PATH" FORK_SANDBOX_BACKEND=test \
+        timeout 60 "$wrapper" "$@" 2>&1)"
+    rc=$?
+    if (( rc == 0 )); then
+        no "$label" "accepted; expected a refusal"
+    elif ! printf '%s' "$out" | grep -qF -- "$needle"; then
+        no "$label" "refused with the wrong message: $out"
+    else
+        ok "$label"
+    fi
+}
+
+cs_work="$(mktmp_dir "$scratch/forks/fs-resume-work.XXXXXX")"
+cs_refuses "claude-sandboxed refuses --session-state with --exec" \
+    "only without --exec" --exec --session-state "$cs_state" "$cs_work" true
+cs_refuses "claude-sandboxed refuses --resume-session without --session-state" \
+    "requires --session-state" --resume-session "$cs_sid" "$cs_work"
+cs_refuses "claude-sandboxed refuses a bad session id" \
+    "is not a session id" --session-state "$cs_state" \
+    --resume-session "../etc/passwd" "$cs_work"
+cs_refuses "claude-sandboxed refuses a symlinked state dir" \
+    "is a symlink" --session-state "$symlink_state" "$cs_work"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))

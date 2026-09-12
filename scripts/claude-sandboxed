@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run claude in a sandbox, provisioned with a throwaway copy of its credential.
 #
-# Usage: claude-sandboxed [--unpin-egress | --seal-egress] [--bind-ro PATH]... [--bind-rw PATH]... [--bind-ro-at SRC DEST]... [--bind-rw-at SRC DEST]... [--prepend-path DIR]... [--env-file FILE] [--exec] [work-dir] [claude-args... | CMD ARG...]
+# Usage: claude-sandboxed [--unpin-egress | --seal-egress] [--bind-ro PATH]... [--bind-rw PATH]... [--bind-ro-at SRC DEST]... [--bind-rw-at SRC DEST]... [--prepend-path DIR]... [--session-state DIR] [--resume-session ID] [--env-file FILE] [--exec] [work-dir] [claude-args... | CMD ARG...]
 #
 # This is the Claude client of the sandbox backend. The isolation itself —
 # the mount allowlist, the network namespace, the egress pin, the seal — is
@@ -97,6 +97,34 @@
 # named here are readable by everything inside the sandbox — that is the point
 # of passing them — so name only the ones that run has to have.
 #
+# --session-state DIR binds DIR read-WRITE at $HOME/.claude/projects inside
+# the sandbox, which is where the claude CLI keeps its per-project
+# transcripts. Without it those transcripts live in the per-run state dir and
+# die with it; with it they land on the host and the next run can resume one.
+# It is the ONLY writable bind this flag adds -- never the whole ~/.claude,
+# which holds the credential copy, the settings and the onboarding file and
+# stays exactly as it is. What lands in DIR is conversation text, which the
+# caller already keeps: fork-sandbox.sh writes the same session to
+# events.jsonl in its run dir. No new credential reaches disk. DIR is created
+# if missing, refused if it is a symlink, and claude-only: with --exec there
+# is no claude and no ~/.claude at all.
+#
+# --resume-session ID resumes the claude session ID instead of starting a
+# fresh one. It requires --session-state, which is where the transcript is
+# read from, and ID must match ^[0-9a-f-]{8,64}$ -- it is a transcript
+# filename stem. The prompt on stdin is still delivered, as the next turn of
+# that conversation rather than the first of a new one.
+#
+# Resume is a continuity and cost optimization, never a correctness
+# guarantee. A session id can name a transcript that was pruned, or one the
+# CLI will not parse, and the caller's work still has to happen. So when
+# claude exits non-zero with a resume-shaped error on stderr -- "No
+# conversation found with session ID: ...", and the other spellings the
+# pattern beside the retry covers -- this script logs
+# "resume failed, retrying fresh" and runs the whole invocation once more
+# with no --resume. Once: a second failure is the run's own failure and is
+# reported as such.
+#
 # With no work-dir, the script creates a unique one under
 # /var/tmp/claude-scratch/forks and prints the path. Many sandboxes can run at
 # the same time; every run gets
@@ -121,6 +149,13 @@
 #     that expires within hours.
 #     With --exec none of this happens and no Claude credential is
 #     present at all; whatever --env-file names is the only secret inside.
+#     With --session-state, one directory inside that remap --
+#     ~/.claude/projects, the transcript store -- is a bind of its own from
+#     the host, so it survives the run. Everything else in there is still
+#     the temp copy and still dies with the script. Note the side effect:
+#     that host mountpoint is namespace-local, so the transcript rescue
+#     below finds an empty directory and copies nothing. The
+#     --session-state directory IS the durable copy in that case.
 #   - Credentials: the copy holds the short-lived access token only. The
 #     refresh token and the mcpOAuth tokens stay on the host. A leaked
 #     sandbox credential dies at token expiry, and the session cannot
@@ -172,6 +207,8 @@ BIND_RW_AT_DEST=()
 PREPEND_PATH=()
 EXEC_MODE=0
 ENV_FILE=""
+SESSION_STATE=""
+RESUME_SESSION=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --unpin-egress|--allow-tunnels) UNPIN_EGRESS=1; shift ;;
@@ -203,6 +240,14 @@ while [[ $# -gt 0 ]]; do
             PREPEND_PATH+=("${2:?--prepend-path requires a directory}")
             shift 2
             ;;
+        --session-state)
+            SESSION_STATE="${2:?--session-state requires a directory}"
+            shift 2
+            ;;
+        --resume-session)
+            RESUME_SESSION="${2:?--resume-session requires a session id}"
+            shift 2
+            ;;
         -*) break ;;
         *)
             [[ -n "$WORK_DIR_ARG" ]] && break
@@ -229,6 +274,48 @@ elif [[ -n "$ENV_FILE" ]]; then
     echo "Error: --env-file works only with --exec. A claude session gets no" >&2
     echo "API keys on purpose, so this script carries none into one." >&2
     exit 1
+fi
+
+# --session-state and --resume-session name the claude CLI's transcript store
+# and its --resume flag. With --exec there is no claude in the sandbox and no
+# ~/.claude at all, so there is nothing for either to attach to.
+if (( EXEC_MODE )) && [[ -n "$SESSION_STATE" || -n "$RESUME_SESSION" ]]; then
+    echo "Error: --session-state and --resume-session work only without --exec." >&2
+    echo "They name the claude CLI's transcript store, and --exec runs another" >&2
+    echo "program with no ~/.claude inside at all." >&2
+    exit 1
+fi
+if [[ -n "$RESUME_SESSION" ]]; then
+    if [[ -z "$SESSION_STATE" ]]; then
+        echo "Error: --resume-session requires --session-state. The transcript to" >&2
+        echo "be resumed is read from that directory; with no bind there is none" >&2
+        echo "inside the sandbox." >&2
+        exit 1
+    fi
+    # The id reaches a command line as claude's --resume argument and names a
+    # file in the store, so it is checked against the shape of a session id
+    # rather than trusted. A caller that builds it from a filename cannot
+    # turn a stray path into a different transcript, or into a flag.
+    if [[ ! "$RESUME_SESSION" =~ ^[0-9a-f-]{8,64}$ ]]; then
+        echo "Error: --resume-session '$RESUME_SESSION' is not a session id. It" >&2
+        echo "must match ^[0-9a-f-]{8,64}\$ -- no slashes, no dots, no other" >&2
+        echo "characters." >&2
+        exit 1
+    fi
+fi
+if [[ -n "$SESSION_STATE" ]]; then
+    # Refused rather than followed, for the reason --env-file refuses one: a
+    # symlink checked here and resolved by the backend is not necessarily the
+    # same directory, and this one gets a writable bind.
+    if [[ -L "$SESSION_STATE" ]]; then
+        echo "Error: --session-state '$SESSION_STATE' is a symlink. Name the" >&2
+        echo "directory itself." >&2
+        exit 1
+    fi
+    if [[ -e "$SESSION_STATE" && ! -d "$SESSION_STATE" ]]; then
+        echo "Error: --session-state '$SESSION_STATE' is not a directory." >&2
+        exit 1
+    fi
 fi
 
 # A sealed sandbox has no route anywhere, so claude cannot reach the
@@ -425,6 +512,14 @@ if (( ! EXEC_MODE )); then
     for i in "${!BIND_RO_AT_DEST[@]}"; do
         claude_mountpoint "${BIND_RO_AT_SRC[$i]}" "${BIND_RO_AT_DEST[$i]}"
     done
+    # The transcript store's own stand-in, same reason: it nests inside the
+    # ~/.claude remap. Created on the host too -- the backend's --bind-rw-at
+    # errors on a source that does not exist, and a caller handing over a
+    # per-agent directory for the first wake has nothing there yet.
+    if [[ -n "$SESSION_STATE" ]]; then
+        mkdir -p "$SESSION_STATE"
+        claude_mountpoint "$SESSION_STATE" "$HOME/.claude/projects"
+    fi
 
     # Keep the access token. Drop the refresh token, which is long-lived and
     # single-use — a sandbox refresh would invalidate the host's copy. Drop
@@ -495,6 +590,15 @@ if (( ! EXEC_MODE )); then
         --bind-ro-at "$STATE_DIR/.claude.json" "$HOME/.claude.json"
         --bind-rw-at "$STATE_DIR/claude" "$HOME/.claude"
     )
+    # The caller's transcript store, nested inside that remap so it outlives
+    # the state dir. One directory, not the whole ~/.claude: the credential
+    # copy, the settings and the onboarding file stay ephemeral. Backends
+    # sort caller binds by destination depth (see
+    # tests/sandbox-backend-bind-order-test.sh), so this nested destination
+    # survives the ~/.claude bind above whatever order they are listed in.
+    if [[ -n "$SESSION_STATE" ]]; then
+        CLAUDE_FLAGS+=(--bind-rw-at "$SESSION_STATE" "$HOME/.claude/projects")
+    fi
 fi
 
 # The network mode, in the backend's spelling. --unpin-egress maps onto the
@@ -553,6 +657,15 @@ else
     else
         TARGET_CMD=(claude "$@")
     fi
+    # The fresh form is kept whether or not a resume was asked for: it is
+    # what the retry below falls back to, and building it here rather than
+    # unpicking --resume out of an argv keeps the two forms provably the
+    # same but for that flag. The CLI's headless resume is `--resume <id>`
+    # alongside --print, which the caller already passes.
+    TARGET_CMD_FRESH=("${TARGET_CMD[@]}")
+    if [[ -n "$RESUME_SESSION" ]]; then
+        TARGET_CMD=("${TARGET_CMD[0]}" --resume "$RESUME_SESSION" "${TARGET_CMD[@]:1}")
+    fi
 fi
 
 if (( ! EXEC_MODE )) && (( MINS_LEFT >= 60 )); then
@@ -567,12 +680,73 @@ if (( ${#EXEC_ENV_LINES[@]} )); then
     echo "claude-sandboxed: environment from $ENV_FILE: ${EXEC_ENV_LINES[*]%%=*}" >&2
 fi
 
+# What stderr has to say for a failure to count as "the resume did not work"
+# rather than "the work did not work". The first alternative is what the
+# installed CLI actually prints for an unknown id ("No conversation found
+# with session ID: <uuid>"); the rest cover a transcript that is present but
+# unreadable. Deliberately narrow: a false positive here reruns a session
+# that already did its work, at full price.
+RESUME_FAIL_RE='no conversation found|session id:|corrupt.*(session|transcript|conversation)|failed to (load|parse|read).*(session|transcript|conversation)'
+
+# The prompt arrives on stdin — it is too large for an argv — and the first
+# attempt consumes it, so a retry would hand claude an empty prompt. Buffer
+# it, mode 600 in the state dir the EXIT trap removes, and feed both attempts
+# from the file. Only when a retry is possible at all: with no
+# --resume-session, stdin stays untouched all the way down, exactly as
+# before. A tty stdin is an interactive session, which has no piped prompt
+# and must not block here waiting for EOF.
+STDIN_FILE=""
+if [[ -n "$RESUME_SESSION" && ! -t 0 ]]; then
+    install -m 600 /dev/null "$STATE_DIR/stdin-prompt"
+    cat > "$STATE_DIR/stdin-prompt"
+    STDIN_FILE="$STATE_DIR/stdin-prompt"
+fi
+
+# One attempt. With a capture file, stderr is duplicated into it on the way
+# to the caller's stderr through a real PIPELINE rather than a `2> >(tee)`
+# process substitution: bash does not wait on the latter, so the file can
+# still be unwritten when the exit status lands. fd 3 carries the command's
+# own stdout past the pipe untouched — the stream-json event stream must not
+# be disturbed.
+# shellcheck disable=SC2317  # called below; shellcheck loses it past `set +e`
+run_attempt() {
+    local rc
+    if [[ -n "$ERR_CAPTURE" ]]; then
+        if [[ -n "$STDIN_FILE" ]]; then
+            { "$FS_BACKEND_BIN" "${BACKEND_ARGS[@]}" -- "${TARGET_CMD[@]}" \
+                < "$STDIN_FILE" 2>&1 1>&3 | tee -a "$ERR_CAPTURE" >&2; } 3>&1
+        else
+            { "$FS_BACKEND_BIN" "${BACKEND_ARGS[@]}" -- "${TARGET_CMD[@]}" \
+                2>&1 1>&3 | tee -a "$ERR_CAPTURE" >&2; } 3>&1
+        fi
+        rc="${PIPESTATUS[0]}"
+    else
+        "$FS_BACKEND_BIN" "${BACKEND_ARGS[@]}" -- "${TARGET_CMD[@]}"
+        rc=$?
+    fi
+    return "$rc"
+}
+
 # The backend's exit code is the command's own, so pass it straight back: the
-# layers above use it to decide whether a run failed. stdin is untouched all
-# the way down — a prompt too large for one argv arrives that way.
+# layers above use it to decide whether a run failed.
+ERR_CAPTURE=""
 set +e
-"$FS_BACKEND_BIN" "${BACKEND_ARGS[@]}" -- "${TARGET_CMD[@]}"
+if [[ -n "$RESUME_SESSION" ]]; then
+    ERR_CAPTURE="$STATE_DIR/claude-stderr"
+    : > "$ERR_CAPTURE"
+fi
+run_attempt
 RC=$?
+# Resume is a continuity optimization, so a resume that fails must not cost
+# the caller the wake. Retry ONCE, fresh; a second failure is the run's own.
+if (( RC != 0 )) && [[ -n "$ERR_CAPTURE" ]] \
+    && grep -qiE "$RESUME_FAIL_RE" "$ERR_CAPTURE"; then
+    echo "claude-sandboxed: resume failed, retrying fresh (session $RESUME_SESSION)" >&2
+    TARGET_CMD=("${TARGET_CMD_FRESH[@]}")
+    : > "$ERR_CAPTURE"
+    run_attempt
+    RC=$?
+fi
 set -e
 
 echo "claude-sandboxed: results in $WORK_DIR" >&2
