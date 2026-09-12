@@ -37,7 +37,9 @@
 #   Thread-ID: <root uuid>        equals Message-ID on a thread root
 #   Date: <RFC 2822 date, UTC>
 #   From: @<name>
-#   To: @<name>[, @<name>...]
+#   To: @<name>[, @<name>...]     reply, if --to is omitted, defaults to
+#                                 reply-all: the parent's From + To + Cc,
+#                                 deduped, minus the replying sender
 #   Cc: @<name>[, @<name>...]     omitted entirely when there is no Cc
 #   Subject: <text>               replies default to "Re: <parent subject>"
 #   In-Reply-To: <parent uuid>    replies only
@@ -68,17 +70,21 @@
 # filesystem access to the store sees everything.
 #
 # NNN allocation and concurrency. Two posts landing in the same thread at
-# once race for the same NNN. This is resolved with a hardlink-based retry
-# loop, not a plain rename: the message is first written in full to a temp
-# file, then `ln` (not `mv`) is used to place it at
-# "<NNN>-<uuid>.msg" -- `ln` fails atomically with EEXIST if that name is
-# already taken, with no window where a check-then-write race could let two
-# posters both believe they own the same NNN. On EEXIST the NNN is
-# incremented and the link retried; the temp file is only removed once a
-# link attempt succeeds. Since the filename also embeds a fresh uuid, two
-# posters can never collide on the final path even if they briefly guess the
-# same NNN -- the loop exists to keep NNNs themselves gap-free and
-# ordered, not to prevent data loss.
+# once race for the same NNN. This is resolved with an `mkdir`-based lock,
+# not a check-then-write: for a candidate NNN, `mkdir` a reservation
+# directory named "<NNN>.seq" that carries no uuid, so two posters
+# guessing the same NNN are contending for the exact same path and `mkdir`
+# fails atomically with EEXIST for the loser -- there is no window where
+# both could believe they own the NNN. The loser bumps NNN and retries,
+# up to a bounded number of attempts; a failure that is not "the slot is
+# taken" (permission denied, ENOSPC, a read-only thread dir) aborts with a
+# diagnostic instead of retrying forever, since nothing about those is
+# fixed by trying again. Once a reservation directory is won, the message
+# (already written in full to a temp file) is renamed into place at
+# "<NNN>-<uuid>.msg" -- a plain `mv`, safe because the NNN is now
+# exclusively ours. Reservation directories are never removed: doing so
+# would free the NNN for reuse while a message still occupies it,
+# recreating the duplicate-NNN bug this scheme exists to prevent.
 #
 # Attachments are copied into <thread-id>/attachments/, capped at 4 MiB
 # each. A basename already staged with different content is refused --
@@ -93,6 +99,7 @@ set -euo pipefail
 MAIL_ROOT="${FORK_SANDBOX_MAIL_ROOT:-/var/tmp/claude-scratch/agent-mail}"
 MAIL_ATTACH_MAX_BYTES=$(( 4 * 1024 * 1024 ))
 MAIL_ADDR_RE='^@[a-z0-9][a-z0-9-]*$'
+MAIL_SEQ_MAX_TRIES=10000
 
 usage() {
     # The header block is the documentation: print it from line 2 down to
@@ -112,6 +119,19 @@ mail_validate_addr() {
     if [[ ! "$1" =~ $MAIL_ADDR_RE ]]; then
         echo "Error: '$1' is not a valid address; addresses look like" >&2
         echo "'@name', lowercase alphanumeric and '-' only, no leading '-'." >&2
+        return 1
+    fi
+    return 0
+}
+
+# Rejects a value containing a raw newline. Header values are joined into
+# the header block with newlines and everything up to the first blank
+# line is parsed as a header, so a newline inside a value (e.g. a
+# caller-supplied --subject) would forge or truncate header lines.
+mail_validate_no_newline() {
+    local val="$1" field="$2"
+    if [[ "$val" == *$'\n'* ]]; then
+        echo "Error: $field must not contain a newline." >&2
         return 1
     fi
     return 0
@@ -154,11 +174,6 @@ mail_header() {
     return 0
 }
 
-# Everything after the first blank line.
-mail_body() {
-    awk 'f{print} /^$/{f=1}' "$1"
-}
-
 # Counts how many header lines named $2 a message file $1 carries -- for
 # X-Attachment, which may legitimately repeat once per attached file.
 mail_count_header() {
@@ -168,15 +183,6 @@ mail_count_header() {
         [[ "$line" == "$name:"* ]] && count=$(( count + 1 ))
     done < "$file"
     printf '%s' "$count"
-}
-
-# Prints every value of a repeating header, one per line.
-mail_header_all() {
-    local file="$1" name="$2" line
-    while IFS= read -r line; do
-        [[ -z "$line" ]] && break
-        [[ "$line" == "$name:"* ]] && printf '%s\n' "${line#"$name": }"
-    done < "$file"
 }
 
 # Finds the message file whose Message-ID equals $1, across every thread.
@@ -226,50 +232,65 @@ mail_stage_attachments() {
     (IFS='/'; printf '%s' "${names[*]:-}")
 }
 
-# Writes the message body ($1 = headers already newline-joined and ending in
-# a trailing blank line, $2 = body text) to a fresh temp file, then links it
-# into place under $3 (thread dir) with the NNN-retry loop documented in the
-# header comment above. Prints the final NNN-uuid basename on success.
+# Writes headers + a blank line + the body (from $2, a file, copied
+# verbatim) to a fresh temp file, then claims a NNN via the mkdir-lock
+# scheme documented above and renames the temp file into place under $3
+# (thread dir). Prints the final NNN-uuid basename on success.
 mail_place_message() {
-    local headers="$1" body="$2" thread_dir="$3" uuid="$4"
+    local headers="$1" body_file="$2" thread_dir="$3" uuid="$4"
     local tmp
     tmp="$(mktemp "$MAIL_ROOT/.mail.XXXXXX")"
     {
         printf '%s\n' "$headers"
         printf '\n'
-        printf '%s\n' "$body"
+        cat -- "$body_file"
     } > "$tmp"
-    local n
-    n=$(find "$thread_dir" -maxdepth 1 -name '*.msg' | wc -l)
-    n=$(( n + 1 ))
-    local dest
+    local n lock tries=0
+    n=$(( $(find "$thread_dir" -maxdepth 1 -name '*.msg' | wc -l) + 1 ))
     while :; do
-        dest="$thread_dir/$(printf '%03d' "$n")-$uuid.msg"
-        if ln -- "$tmp" "$dest" 2>/dev/null; then
+        lock="$thread_dir/$(printf '%03d' "$n").seq"
+        if mkdir -- "$lock" 2>/dev/null; then
+            break
+        fi
+        if [[ ! -e "$lock" ]]; then
             rm -f -- "$tmp"
-            printf '%s' "$(basename -- "$dest")"
-            return 0
+            echo "Error: could not reserve a sequence number in '$thread_dir'" >&2
+            echo "(mkdir failed for a reason other than the slot being taken)." >&2
+            return 1
         fi
         n=$(( n + 1 ))
+        tries=$(( tries + 1 ))
+        if (( tries > MAIL_SEQ_MAX_TRIES )); then
+            rm -f -- "$tmp"
+            echo "Error: could not allocate a sequence number in '$thread_dir'" >&2
+            echo "after $tries attempts." >&2
+            return 1
+        fi
     done
+    local dest; dest="$thread_dir/$(printf '%03d' "$n")-$uuid.msg"
+    mv -- "$tmp" "$dest"
+    printf '%s' "$(basename -- "$dest")"
 }
 
+# Copies the body into $2 verbatim. Deliberately not a command
+# substitution: capturing output that way strips all trailing newlines,
+# which would violate the "body stored verbatim" contract once that
+# output is written back out.
 mail_read_body_arg() {
-    local body_arg="$1"
+    local body_arg="$1" dest="$2"
     if [[ "$body_arg" == "-" ]]; then
-        cat
+        cat > "$dest"
     else
         [[ -f "$body_arg" ]] || { echo "Error: body file '$body_arg' not found." >&2; return 1; }
-        cat -- "$body_arg"
+        cat -- "$body_arg" > "$dest"
     fi
 }
 
-# A regex find-one-non-space, not a whole-string glob substitution: the
-# latter walks the body per multibyte character under a UTF-8 locale, which
-# makes posting a long quoted reply quadratically slow (measured elsewhere
-# in this repo's history: 7.5s@64KB, 33s@128KB, 139s@256KB).
+# Checks the body file directly for any non-space byte, rather than
+# loading it into a shell variable first (see mail_read_body_arg above for
+# why that would be lossy).
 mail_body_is_empty() {
-    [[ ! "$1" =~ [^[:space:]] ]]
+    ! grep -q '[^[:space:]]' -- "$1"
 }
 
 cmd_send() {
@@ -293,6 +314,7 @@ cmd_send() {
     [[ -n "$subject" ]] || { echo "Error: send: --subject is required." >&2; return 1; }
     [[ -n "$body_arg" ]] || { echo "Error: send: --body is required." >&2; return 1; }
     [[ "$hops" =~ ^[0-9]+$ ]] || { echo "Error: send: --hops must be a non-negative integer." >&2; return 1; }
+    mail_validate_no_newline "$subject" "--subject" || return 1
 
     mail_validate_addr "$from" || return 1
     local to_norm cc_norm
@@ -300,9 +322,13 @@ cmd_send() {
     cc_norm=""
     [[ -n "$cc" ]] && { cc_norm="$(mail_validate_addr_list "$cc")" || return 1; }
 
-    local body
-    body="$(mail_read_body_arg "$body_arg")" || return 1
-    mail_body_is_empty "$body" && { echo "Error: send: message body is empty." >&2; return 1; }
+    local body_file; body_file="$(mktemp "$MAIL_ROOT/.mail.body.XXXXXX")"
+    mail_read_body_arg "$body_arg" "$body_file" || { rm -f -- "$body_file"; return 1; }
+    if mail_body_is_empty "$body_file"; then
+        rm -f -- "$body_file"
+        echo "Error: send: message body is empty." >&2
+        return 1
+    fi
 
     local uuid; uuid="$(mail_new_uuid)"
     local thread_dir; thread_dir="$(mail_thread_dir "$uuid")"
@@ -310,7 +336,7 @@ cmd_send() {
 
     local attach_csv=""
     if (( ${#attach_files[@]} > 0 )); then
-        attach_csv="$(mail_stage_attachments "$thread_dir" "${attach_files[@]}")" || return 1
+        attach_csv="$(mail_stage_attachments "$thread_dir" "${attach_files[@]}")" || { rm -f -- "$body_file"; return 1; }
     fi
 
     local date_hdr; date_hdr="$(date -u +'%a, %d %b %Y %H:%M:%S +0000')"
@@ -333,7 +359,8 @@ cmd_send() {
     fi
     local headers; headers="$(printf '%s\n' "${hlines[@]}")"
 
-    mail_place_message "$headers" "$body" "$thread_dir" "$uuid" >/dev/null
+    mail_place_message "$headers" "$body_file" "$thread_dir" "$uuid" >/dev/null || { rm -f -- "$body_file"; return 1; }
+    rm -f -- "$body_file"
     echo "fork-sandbox mail: sent ${uuid} as a new thread" >&2
     printf '%s\n' "$uuid"
 }
@@ -357,6 +384,7 @@ cmd_reply() {
     [[ -n "$from" ]] || { echo "Error: reply: --from is required." >&2; return 1; }
     [[ -n "$reply_to" ]] || { echo "Error: reply: --reply-to is required." >&2; return 1; }
     [[ -n "$body_arg" ]] || { echo "Error: reply: --body is required." >&2; return 1; }
+    [[ -z "$subject_override" ]] || mail_validate_no_newline "$subject_override" "--subject" || return 1
 
     mail_validate_addr "$from" || return 1
     local to_norm="" cc_norm=""
@@ -369,9 +397,13 @@ cmd_reply() {
         return 1
     }
 
-    local body
-    body="$(mail_read_body_arg "$body_arg")" || return 1
-    mail_body_is_empty "$body" && { echo "Error: reply: message body is empty." >&2; return 1; }
+    local body_file; body_file="$(mktemp "$MAIL_ROOT/.mail.body.XXXXXX")"
+    mail_read_body_arg "$body_arg" "$body_file" || { rm -f -- "$body_file"; return 1; }
+    if mail_body_is_empty "$body_file"; then
+        rm -f -- "$body_file"
+        echo "Error: reply: message body is empty." >&2
+        return 1
+    fi
 
     local p_thread_id p_from p_to p_cc p_subject p_hops p_references p_id
     p_id="$(mail_header "$parent_file" Message-ID)"
@@ -411,8 +443,8 @@ cmd_reply() {
         done
         local joined
         joined="$(IFS=','; printf '%s' "${result[*]:-}")"
-        to_norm="$(mail_validate_addr_list "$joined")" || return 1
-        [[ -n "$to_norm" ]] || { echo "Error: reply: reply-all resolved to no recipients; pass --to explicitly." >&2; return 1; }
+        to_norm="$(mail_validate_addr_list "$joined")" || { rm -f -- "$body_file"; return 1; }
+        [[ -n "$to_norm" ]] || { rm -f -- "$body_file"; echo "Error: reply: reply-all resolved to no recipients; pass --to explicitly." >&2; return 1; }
     fi
 
     local subject="$subject_override"
@@ -433,7 +465,7 @@ cmd_reply() {
     local thread_dir; thread_dir="$(mail_thread_dir "$p_thread_id")"
     local attach_csv=""
     if (( ${#attach_files[@]} > 0 )); then
-        attach_csv="$(mail_stage_attachments "$thread_dir" "${attach_files[@]}")" || return 1
+        attach_csv="$(mail_stage_attachments "$thread_dir" "${attach_files[@]}")" || { rm -f -- "$body_file"; return 1; }
     fi
 
     local uuid; uuid="$(mail_new_uuid)"
@@ -459,7 +491,8 @@ cmd_reply() {
     fi
     local headers; headers="$(printf '%s\n' "${hlines[@]}")"
 
-    mail_place_message "$headers" "$body" "$thread_dir" "$uuid" >/dev/null
+    mail_place_message "$headers" "$body_file" "$thread_dir" "$uuid" >/dev/null || { rm -f -- "$body_file"; return 1; }
+    rm -f -- "$body_file"
     echo "fork-sandbox mail: replied ${uuid} to ${p_id}" >&2
     printf '%s\n' "$uuid"
 }
@@ -475,22 +508,22 @@ cmd_show() {
 }
 
 mail_tree_print() {
-    local -n ids_ref="$1" parents_ref="$2" froms_ref="$3" subjects_ref="$4" attach_ref="$5"
-    local id="$6" depth="$7" i indent attach_mark
+    local -n ids_ref="$1" parents_ref="$2" froms_ref="$3" subjects_ref="$4" attach_ref="$5" seqs_ref="$6"
+    local id="$7" depth="$8" i indent attach_mark
     for i in "${!ids_ref[@]}"; do
         [[ "${ids_ref[$i]}" == "$id" ]] && break
     done
     indent="$(printf '%*s' $(( depth * 2 )) '')"
     attach_mark=""
     [[ "${attach_ref[$i]:-0}" -gt 0 ]] && attach_mark=" 📎"
-    printf '%s%03d  %-16s %s%s\n' "$indent" $(( i + 1 )) "${froms_ref[$i]}" "${subjects_ref[$i]}" "$attach_mark"
+    printf '%s%s  %-16s %s%s\n' "$indent" "${seqs_ref[$i]}" "${froms_ref[$i]}" "${subjects_ref[$i]}" "$attach_mark"
     local -a child_idx=()
     local j
     for j in "${!parents_ref[@]}"; do
         [[ "${parents_ref[$j]}" == "$id" ]] && child_idx+=("$j")
     done
     for j in "${child_idx[@]}"; do
-        mail_tree_print "$1" "$2" "$3" "$4" "$5" "${ids_ref[$j]}" $(( depth + 1 ))
+        mail_tree_print "$1" "$2" "$3" "$4" "$5" "$6" "${ids_ref[$j]}" $(( depth + 1 ))
     done
 }
 
@@ -509,13 +542,14 @@ cmd_tree() {
         return 0
     fi
 
-    local -a ids=() parents=() froms=() subjects=() attach=()
+    local -a ids=() parents=() froms=() subjects=() attach=() seqs=()
     for f in "${files[@]}"; do
         ids+=("$(mail_header "$f" Message-ID)")
         parents+=("$(mail_header "$f" In-Reply-To)")
         froms+=("$(mail_header "$f" From)")
         subjects+=("$(mail_header "$f" Subject)")
         attach+=("$(mail_count_header "$f" X-Attachment)")
+        seqs+=("$(basename -- "$f" | cut -c1-3)")
     done
 
     local root=""
@@ -527,7 +561,7 @@ cmd_tree() {
         fi
     done
     [[ -n "$root" ]] || root="${ids[0]}"
-    mail_tree_print ids parents froms subjects attach "$root" 0
+    mail_tree_print ids parents froms subjects attach seqs "$root" 0
 }
 
 cmd_list() {

@@ -55,11 +55,14 @@ refuses() {
     fi
 }
 
+# Sets $1 to a fresh temp dir and registers it for cleanup. A nameref
+# out-param, not a printf-and-capture return: "$(new_root)" would run the
+# body in a command-substitution subshell, where "tmpdirs+=" only updates
+# the subshell's copy and the dir would never actually get tracked.
 new_root() {
-    local d
-    d="$(mktemp -d)"
-    tmpdirs+=("$d")
-    printf '%s' "$d"
+    local -n out_ref="$1"
+    out_ref="$(mktemp -d)"
+    tmpdirs+=("$out_ref")
 }
 
 work="$(mktemp -d)"
@@ -68,7 +71,7 @@ cd "$work" || exit 1
 
 printf '== send ==\n'
 
-export FORK_SANDBOX_MAIL_ROOT; FORK_SANDBOX_MAIL_ROOT="$(new_root)"
+new_root FORK_SANDBOX_MAIL_ROOT; export FORK_SANDBOX_MAIL_ROOT
 
 id1="$("$mail" send --from @alice --to @bob --subject "Hello" --body - <<< "hi there" 2>diag.txt)"
 rc=$?
@@ -161,7 +164,7 @@ refuses "rejects a missing --from" "$mail" send --to @bob --subject x --body -
 
 printf '\n== inbox and seen ==\n'
 
-export FORK_SANDBOX_MAIL_ROOT; FORK_SANDBOX_MAIL_ROOT="$(new_root)"
+new_root FORK_SANDBOX_MAIL_ROOT; export FORK_SANDBOX_MAIL_ROOT
 i1="$("$mail" send --from @alice --to @bob --subject "To bob" --body - <<< "m1" 2>diag.txt)"
 i2="$("$mail" send --from @alice --to @carol --cc @bob --subject "Cc bob" --body - <<< "m2" 2>diag.txt)"
 i3="$("$mail" send --from @alice --to @dave --subject "Not for bob" --body - <<< "m3" 2>diag.txt)"
@@ -192,7 +195,7 @@ check "seen: records multiple ids" "2" "$(wc -l < "$seen_file")"
 
 printf '\n== attachments ==\n'
 
-export FORK_SANDBOX_MAIL_ROOT; FORK_SANDBOX_MAIL_ROOT="$(new_root)"
+new_root FORK_SANDBOX_MAIL_ROOT; export FORK_SANDBOX_MAIL_ROOT
 echo "a screenshot, pretend" > shot.png
 att_id="$("$mail" send --from @alice --to @bob --subject "With attachment" --body - --attach shot.png <<< "see attached" 2>diag.txt)"
 rc=$?
@@ -205,7 +208,7 @@ contains "X-Attachment header names the file" "$raw_att" "X-Attachment: attachme
 tree_att="$("$mail" tree "$att_id")"
 contains "tree marks the attachment with 📎" "$tree_att" "📎"
 
-big="$(mktemp)"; tmpdirs+=("$big")
+big="$work/big-attachment.bin"
 dd if=/dev/zero of="$big" bs=1M count=5 >/dev/null 2>&1
 out="$("$mail" send --from @alice --to @bob --subject "Too big" --body - --attach "$big" <<< "x" 2>&1)"
 rc=$?
@@ -242,7 +245,7 @@ check "stdin and file bodies produce identical content" "$body_file" "$body_stdi
 
 printf '\n== sequential replies get distinct, increasing seq numbers ==\n'
 
-export FORK_SANDBOX_MAIL_ROOT; FORK_SANDBOX_MAIL_ROOT="$(new_root)"
+new_root FORK_SANDBOX_MAIL_ROOT; export FORK_SANDBOX_MAIL_ROOT
 root_id="$("$mail" send --from @alice --to @bob --subject "Seq" --body - <<< "root" 2>diag.txt)"
 for _ in 1 2 3 4; do
     "$mail" reply --from @bob --reply-to "$root_id" --body - <<< "reply" >/dev/null 2>diag.txt
@@ -255,6 +258,29 @@ if [[ "${seqs[*]}" == "${expected[*]}" ]]; then
 else
     no "seq numbers are strictly increasing and gap-free" "got: ${seqs[*]}"
 fi
+
+printf '\n== concurrent replies still get distinct, gap-free seq numbers ==\n'
+
+seq_root="$FORK_SANDBOX_MAIL_ROOT"
+new_root FORK_SANDBOX_MAIL_ROOT; export FORK_SANDBOX_MAIL_ROOT
+conc_root="$("$mail" send --from @alice --to @bob --subject "Concurrent" --body - <<< "root" 2>diag.txt)"
+conc_n=12
+for _ in $(seq 1 "$conc_n"); do
+    "$mail" reply --from @bob --reply-to "$conc_root" --body - <<< "reply" >/dev/null 2>diag.txt &
+done
+wait
+mapfile -t conc_seqs < <(find "$FORK_SANDBOX_MAIL_ROOT/threads/$conc_root" -maxdepth 1 -name '*.msg' -printf '%f\n' | sort | sed -n 's/^\([0-9]\{3\}\)-.*/\1/p')
+conc_expected=()
+for i in $(seq 1 "$(( conc_n + 1 ))"); do
+    conc_expected+=("$(printf '%03d' "$i")")
+done
+check "concurrent replies produce as many distinct seq prefixes as messages" "$(( conc_n + 1 ))" "${#conc_seqs[@]}"
+if [[ "${conc_seqs[*]}" == "${conc_expected[*]}" ]]; then
+    ok "concurrent seq numbers are exactly 001..00N, no dupes or gaps"
+else
+    no "concurrent seq numbers are exactly 001..00N, no dupes or gaps" "got: ${conc_seqs[*]}"
+fi
+export FORK_SANDBOX_MAIL_ROOT="$seq_root"
 
 printf '\n== list ==\n'
 
