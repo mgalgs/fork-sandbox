@@ -7,7 +7,7 @@
 #                              [--attach <file>]... [--hops <n>]
 #        fork-sandbox-mail.sh reply --from @a --reply-to <message-id>
 #                              (--body <file>|-) [--to @b[,@c]] [--cc @d[,@e]]
-#                              [--subject <s>] [--attach <file>]...
+#                              [--subject <s>] [--attach <file>]... [--hops <n>]
 #        fork-sandbox-mail.sh show <message-id>
 #        fork-sandbox-mail.sh tree <thread-id>
 #        fork-sandbox-mail.sh list
@@ -46,9 +46,12 @@
 #   References: <uuid> <uuid>...  replies only: parent's References, then
 #                                 the parent's own id, root-to-parent order
 #   X-Hops: <int>                 default 8 on a new thread; a reply COPIES
-#                                 the parent's value verbatim -- decrementing
-#                                 it is the ROUTER's job (round 3), not the
-#                                 store's
+#                                 the parent's value verbatim unless --hops
+#                                 overrides it -- decrementing on an
+#                                 ordinary reply is the ROUTER's job (round
+#                                 3), not this store's; --hops just gives
+#                                 it (or an operator) the override to do it
+#                                 with
 #   X-Attachment: attachments/<basename>   one line per attachment
 #
 # Unlike the RFC-2822-style angle-bracket/domain ids this repo's old
@@ -366,7 +369,7 @@ cmd_send() {
 }
 
 cmd_reply() {
-    local from="" reply_to="" body_arg="" to="" cc="" subject_override=""
+    local from="" reply_to="" body_arg="" to="" cc="" subject_override="" hops_override=""
     local -a attach_files=()
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -377,6 +380,7 @@ cmd_reply() {
             --cc) cc="${2:?--cc requires an address list}"; shift 2 ;;
             --subject) subject_override="${2:?--subject requires text}"; shift 2 ;;
             --attach) attach_files+=("${2:?--attach requires a file}"); shift 2 ;;
+            --hops) hops_override="${2:?--hops requires a number}"; shift 2 ;;
             -h|--help) usage; exit 0 ;;
             *) echo "Error: reply: unknown option '$1'." >&2; return 1 ;;
         esac
@@ -385,6 +389,7 @@ cmd_reply() {
     [[ -n "$reply_to" ]] || { echo "Error: reply: --reply-to is required." >&2; return 1; }
     [[ -n "$body_arg" ]] || { echo "Error: reply: --body is required." >&2; return 1; }
     [[ -z "$subject_override" ]] || mail_validate_no_newline "$subject_override" "--subject" || return 1
+    [[ -z "$hops_override" ]] || [[ "$hops_override" =~ ^[0-9]+$ ]] || { echo "Error: reply: --hops must be a non-negative integer." >&2; return 1; }
 
     mail_validate_addr "$from" || return 1
     local to_norm="" cc_norm=""
@@ -480,7 +485,7 @@ cmd_reply() {
     hlines+=("Subject: $subject")
     hlines+=("In-Reply-To: $p_id")
     hlines+=("References: $references")
-    hlines+=("X-Hops: $p_hops")
+    hlines+=("X-Hops: ${hops_override:-$p_hops}")
     if [[ -n "$attach_csv" ]]; then
         local -a names=()
         IFS='/' read -ra names <<< "$attach_csv"

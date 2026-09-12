@@ -118,11 +118,11 @@ if ! "$FLEET" check >/dev/null 2>&1; then
     exit 1
 fi
 
-# ---- stub fork-sandbox.sh, resolved from PATH by bare name (as pm_spawn_wake
-# invokes it) ----
+# ---- stub fork-sandbox.sh, resolved via FORK_SANDBOX_POSTMASTER_LAUNCHER
+# (pm_spawn_wake resolves the real thing through script_dir, not PATH, so
+# a plain PATH stub would be shadowed by the checkout's own scripts/) ----
 
 new_root STUB_BIN
-export PATH="$STUB_BIN:$PATH"
 new_root STUB_RUN_PREFIX
 export STUB_RUN_PREFIX
 STUB_ARGV_LOG="$work/argv.log"
@@ -137,12 +137,13 @@ for a in "$@"; do printf '%s\n' "$a" >> "$STUB_ARGV_LOG"; done
 run_dir="$(mktemp -d "$STUB_RUN_PREFIX/run.XXXXXX")"
 mkdir -p -- "$run_dir/outbox"
 if [[ -n "${STUB_IMMEDIATE_EXIT:-}" ]]; then
-    printf '0\n' > "$run_dir/exit-code"
+    printf '%s\n' "${STUB_IMMEDIATE_EXIT}" > "$run_dir/exit-code"
 fi
 echo "fork-sandbox: launched in a stub"
 printf '  run dir:  %s\n' "$run_dir"
 STUB
 chmod +x "$STUB_BIN/fork-sandbox.sh"
+export FORK_SANDBOX_POSTMASTER_LAUNCHER="$STUB_BIN/fork-sandbox.sh"
 
 new_root PROJECT_DIR
 
@@ -257,7 +258,12 @@ fi
 send_msg '@alice' '@bob' 'seat bob' 'body' 8 >/dev/null
 once
 check "seat bob: harness from fleet.yaml" "pi" "$(argv_after '--harness' "$STUB_ARGV_LOG")"
-check "seat bob: model defaults to sonnet (unset anywhere)" "sonnet" "$(argv_after '--model' "$STUB_ARGV_LOG")"
+if grep -qF -- '--model' "$STUB_ARGV_LOG"; then
+    no "seat bob: no --model on a pi harness with no configured model (sonnet is a claude alias)" \
+        "$(argv_after '--model' "$STUB_ARGV_LOG")"
+else
+    ok "seat bob: no --model on a pi harness with no configured model (sonnet is a claude alias)"
+fi
 check "seat bob: network from fleet.yaml" "sealed" "$(argv_after '--network' "$STUB_ARGV_LOG")"
 check "seat bob: thinking passed as --pi-args on a pi harness" "--thinking medium" "$(argv_after '--pi-args' "$STUB_ARGV_LOG")"
 
@@ -404,8 +410,8 @@ printf 'Foo: bar\n\nThis should never post.\n' > "$run_dir/outbox/mail-4.md"
 printf '0\n' > "$run_dir/exit-code"
 once
 
-# mail-1: ordinary reply-all, hops copied verbatim (mail.sh reply has no
-# --hops override -- see the script's own LIMITATIONS section).
+# mail-1: ordinary reply-all, hops decremented by the harvester's --hops
+# override on `mail reply` (both reply paths decrement now).
 default_reply=""
 for f in "$FORK_SANDBOX_MAIL_ROOT/threads/$tid"/*.msg; do
     [[ -e "$f" ]] || continue
@@ -413,8 +419,8 @@ for f in "$FORK_SANDBOX_MAIL_ROOT/threads/$tid"/*.msg; do
 done
 if [[ -n "$default_reply" ]]; then
     ok "harvest: no-stanza reply posted with reply-all default subject"
-    check "harvest: no-stanza reply hops equal the trigger's (mail.sh reply cannot decrement)" \
-        "$trig_hops" "$(header_of_file "$default_reply" X-Hops)"
+    check "harvest: no-stanza reply hops are the trigger's decremented by 1" \
+        "$(( trig_hops - 1 ))" "$(header_of_file "$default_reply" X-Hops)"
 else
     no "harvest: no-stanza reply posted with reply-all default subject"
 fi
@@ -480,28 +486,35 @@ check "routed idempotence: exactly one spawn across two --once passes" 1 \
     "$(grep -c -- "^sbx-mail-$short-bob-" "$STUB_ARGV_LOG")"
 
 # ============================================================
-printf '\n== lock: live pid refuses, stale pid is broken ==\n'
+printf '\n== lock: flock held refuses, released allows, stale content is ignored ==\n'
 # ============================================================
 
 new_root FORK_SANDBOX_MAIL_ROOT
 export FORK_SANDBOX_MAIL_ROOT
-mkdir -p -- "$FORK_SANDBOX_MAIL_ROOT/.postmaster/lock"
-printf '%s\n' "$$" > "$FORK_SANDBOX_MAIL_ROOT/.postmaster/lock/pid"
+mkdir -p -- "$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+lock_file="$FORK_SANDBOX_MAIL_ROOT/.postmaster/lock"
+ready_file="$work/lock-holder-ready"
+rm -f -- "$ready_file"
+flock "$lock_file" -c "touch '$ready_file'; sleep 5" &
+holder_pid=$!
+for _ in $(seq 1 50); do [[ -e "$ready_file" ]] && break; sleep 0.1; done
 err="$("$postmaster" deliver --project "$PROJECT_DIR" --once 2>&1)"; rc=$?
-check "lock: second deliver refuses while pid is alive" "1" "$rc"
-contains "lock: refusal names the holder" "$err" "holds the lock"
-rm -rf -- "$FORK_SANDBOX_MAIL_ROOT/.postmaster/lock"
+check "lock: second deliver refuses while the flock is held" "1" "$rc"
+contains "lock: refusal names the lock" "$err" "holds the lock"
+wait "$holder_pid" 2>/dev/null
 
-sleep 60 &
-dead_pid=$!
-kill -9 "$dead_pid" 2>/dev/null
-wait "$dead_pid" 2>/dev/null
-mkdir -p -- "$FORK_SANDBOX_MAIL_ROOT/.postmaster/lock"
-printf '%s\n' "$dead_pid" > "$FORK_SANDBOX_MAIL_ROOT/.postmaster/lock/pid"
+# A dead process can never leave a stale flock behind (the kernel releases
+# it on exit, however the process died), so a leftover pid in the lock
+# file's content -- with nothing actually holding the flock -- must not
+# block a new deliver. This is the case the old mkdir+pid+kill-0 scheme
+# needed a whole "detect and break a stale lock" path for; flock has no
+# such case to detect.
+printf '99999999\n' > "$lock_file"
 rc="$(once_rc)"
-check "lock: stale (dead-pid) lock is broken, deliver proceeds" "0" "$rc"
-check "lock: lock dir is released after a successful deliver" "0" \
-    "$( [[ -d "$FORK_SANDBOX_MAIL_ROOT/.postmaster/lock" ]] && echo 1 || echo 0 )"
+check "lock: a stale pid left in the lock file's content does not block deliver" "0" "$rc"
+
+rc="$(once_rc)"
+check "lock: a second deliver after release succeeds (the flock was released)" "0" "$rc"
 
 # ============================================================
 printf '\n== generated handoff contains persona, thread, trigger id, no-reply line ==\n'
@@ -559,6 +572,112 @@ check "flag: reason recorded" "operator wants eyes on this" \
 "$postmaster" unflag "$manual_tid" >/dev/null 2>&1
 check "unflag: flag file removed" "0" \
     "$( [[ -e "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$manual_tid" ]] && echo 1 || echo 0 )"
+
+# ============================================================
+printf '\n== branch names never repeat, even across an operator spawn-count reset ==\n'
+# ============================================================
+
+new_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+root_mid="$(send_msg '@operator' '@alice' 'reset one' 'first' 8)"
+tid="$(thread_of "$root_mid")"
+short="${tid:0:8}"
+: > "$STUB_ARGV_LOG"
+once
+first_branch="$(argv_after '--branch' "$STUB_ARGV_LOG")"
+
+# Harvest the first run (no new spawn -- just clears the live-run block so
+# alice is eligible to be woken again).
+alice_env="$(env_file_for_agent alice)"
+alice_run_dir="$(sed -n 's/^RUN_DIR=//p' "$alice_env")"
+mkdir -p -- "$alice_run_dir/outbox"
+printf '0\n' > "$alice_run_dir/exit-code"
+once
+
+# A second operator message on the same thread resets the (rule 1) budget
+# counter again before this spawn is counted -- without a separate,
+# never-reset sequence for branch naming, this would recompute the same
+# "count + 1" as the first spawn and hand fork-sandbox.sh the same branch
+# name twice.
+second_mid="$(reply_msg '@operator' "$root_mid" 'second')"
+[[ "$(thread_of "$second_mid")" == "$tid" ]] || no "fixture: second operator message landed on the same thread"
+: > "$STUB_ARGV_LOG"
+once
+second_branch="$(argv_after '--branch' "$STUB_ARGV_LOG")"
+
+if [[ -n "$first_branch" && -n "$second_branch" ]]; then
+    if [[ "$first_branch" != "$second_branch" ]]; then
+        ok "branch name does not repeat across a rule-1 reset"
+    else
+        no "branch name does not repeat across a rule-1 reset" "both spawns got '$first_branch'"
+    fi
+else
+    no "branch name does not repeat across a rule-1 reset" "missing a --branch value (first='$first_branch' second='$second_branch')"
+fi
+[[ -n "$short" ]] # silence unused-var warnings under -u in some shells
+
+# ============================================================
+printf '\n== harvest: non-zero exit code flags the thread even with a reply ==\n'
+# ============================================================
+
+new_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+mid="$(send_msg '@alice' '@bob' 'crash test' 'body' 8)"
+tid="$(thread_of "$mid")"
+: > "$STUB_ARGV_LOG"
+once
+run_env="$(env_file_for_agent bob)"
+run_dir="$(sed -n 's/^RUN_DIR=//p' "$run_env")"
+mkdir -p -- "$run_dir/outbox"
+printf '1\n' > "$run_dir/exit-code"
+once
+contains "harvest: non-zero exit code flags the thread" \
+    "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid" 2>/dev/null || true)" "exited 1"
+check "harvest: a failed run is still marked harvested (agent unblocks)" "1" \
+    "$(find "$FORK_SANDBOX_MAIL_ROOT/.postmaster/harvested" -type f | wc -l)"
+
+# ============================================================
+printf '\n== harvest: a run dir that vanishes is treated as a terminal failure ==\n'
+# ============================================================
+
+new_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+mid="$(send_msg '@alice' '@bob' 'vanished run dir' 'body' 8)"
+tid="$(thread_of "$mid")"
+: > "$STUB_ARGV_LOG"
+once
+run_env="$(env_file_for_agent bob)"
+run_dir="$(sed -n 's/^RUN_DIR=//p' "$run_env")"
+rm -rf -- "$run_dir"
+once
+contains "harvest: vanished run dir flags the thread" \
+    "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid" 2>/dev/null || true)" "vanished"
+check "harvest: vanished run dir is marked harvested (agent unblocks)" "1" \
+    "$(find "$FORK_SANDBOX_MAIL_ROOT/.postmaster/harvested" -type f | wc -l)"
+: > "$STUB_ARGV_LOG"
+mid2="$(reply_msg '@alice' "$mid" 'a new message on the same thread' --to '@bob')"
+[[ "$(thread_of "$mid2")" == "$tid" ]] || no "fixture: follow-up message landed on the same thread"
+once
+check "harvest: agent is spawnable again after the vanished run was harvested" 1 \
+    "$(grep -c -- "^sbx-mail-${tid:0:8}-bob-" "$STUB_ARGV_LOG")"
+
+# ============================================================
+printf '\n== spawn launcher is resolved independent of PATH ==\n'
+# ============================================================
+
+# FORK_SANDBOX_POSTMASTER_LAUNCHER (exported in the fixture setup above)
+# points straight at the stub via script_dir-style resolution, never via
+# PATH -- true whether or not some OTHER fork-sandbox.sh happens to be on
+# PATH too (e.g. this machine's own install). Proof: the stub is the one
+# that's called.
+new_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+send_msg '@alice' '@bob' 'path independence' 'body' 8 >/dev/null
+: > "$STUB_ARGV_LOG"
+rc="$(once_rc)"
+check "launcher: deliver spawns" "0" "$rc"
+check "launcher: the stub, not any fork-sandbox.sh found via PATH, received the call" 1 \
+    "$(grep -c -- '^----CALL----$' "$STUB_ARGV_LOG")"
 
 # ============================================================
 printf '\n== --help and dispatcher wiring ==\n'

@@ -49,10 +49,11 @@
 #   1. Operator reset: if M's From does NOT resolve as a fleet agent, M is
 #      operator/external mail -- clear T's needs-operator flag and reset
 #      T's spawn count to 0 BEFORE applying rules 2-3 to M. The operator
-#      re-arms a stalled thread just by mailing into it, and raises hops
-#      with `mail reply` (whose X-Hops always copies the parent's, so a
-#      real hop increase currently needs `mail send --hops` on a fresh
-#      thread -- see LIMITATIONS).
+#      re-arms a stalled thread just by mailing into it. Raising hops
+#      (rather than the harvester's automatic per-wake decrement) needs
+#      `mail send --hops` on a fresh thread: an operator's own `mail
+#      reply` still copies the parent's X-Hops verbatim, since only the
+#      harvester's reply-posting call (below) passes --hops.
 #   2. X-Hops gate: M's X-Hops == 0 means no wakes from M -- flag T
 #      needs-operator, reason "hops exhausted at <message-id>".
 #   3. Thread budget: spawns-so-far(T) >= budget (default 12,
@@ -71,16 +72,25 @@
 #
 # THE WAKE
 #
-# Spawned via `fork-sandbox.sh --branch <b> --harness <h> --model <m>
+# Spawned via `fork-sandbox.sh --branch <b> --harness <h> [--model <m>]
 # [--network <n>] [--pi-args "--thinking <level>"] <project> <handoff>`,
 # with NO --review-loop and NO --maintainer-loop: the fleet IS the review
 # here, scrutiny comes from other agents reading the reply on the thread.
 # Seat (harness/model/thinking/network) comes from `fleet resolve <agent>`;
-# unset harness/model/network default to claude/sonnet/pinned, thinking
-# is passed as --pi-args only when the harness is pi. Branch name is
-# sbx-mail-<first8-of-thread-id>-<agent>-<seq>, seq being that thread's
-# spawn count + 1. A wake that commits nothing is normal (an analysis
-# reply has no code) -- fork-sandbox.sh itself deletes empty branches.
+# unset harness/network default to claude/pinned. An unset model defaults
+# to sonnet ONLY on the claude harness -- "sonnet" is a claude alias, so
+# defaulting it for pi/codex would hand a bogus model to a harness that
+# does not know the name (codex) or defeat fork-sandbox.sh's own
+# model-less-pi guard and a sealed seat's model discovery (pi); those
+# harnesses get no --model flag at all when unset, so fork-sandbox.sh's
+# own resolution/refusal applies exactly as it would for any other caller.
+# thinking is passed as --pi-args only when the harness is pi. Branch name
+# is sbx-mail-<first8-of-thread-id>-<agent>-<seq>, seq counting from a
+# thread-lifetime spawn sequence that is NEVER reset (unlike the budget
+# counter rule 1 resets on an operator message -- see STATE below), so a
+# branch name can never repeat within a thread. A wake that commits
+# nothing is normal (an analysis reply has no code) -- fork-sandbox.sh
+# itself deletes empty branches.
 #
 # The generated handoff embeds everything the sandbox needs and nothing
 # it can reach on its own: "You are @<agent>." plus the persona's markdown
@@ -108,22 +118,31 @@
 #
 # Once a run reaches terminal state (its run dir has an exit-code file),
 # the harvester posts each mail-*.md via fork-sandbox-mail.sh as
-# --from @<agent>. On the new-thread path it passes --hops explicitly as
-# (trigger's X-Hops - 1); see LIMITATIONS for why the ordinary reply path
-# cannot do the same. A malformed reply file (bad address, unparseable
-# stanza, or a `mail.sh` call that itself fails) is skipped and flags the
-# thread with the filename and the reason -- it never costs the run's
-# other, well-formed replies. The run is then marked harvested exactly
-# once. Posted replies are new unrouted messages; the next scan routes
-# them -- that loop is the whole conversation.
+# --from @<agent>, passing --hops explicitly as (trigger's X-Hops - 1) on
+# BOTH the ordinary reply path and the new-thread path -- `mail.sh reply`
+# takes a --hops override for exactly this (round 3 is this script, per
+# fork-sandbox-mail.sh's own header comment). A non-zero exit code is
+# harvested the same as a zero one (its outbox, if any, is still posted)
+# but also flags the thread, since an empty outbox from a crashed wake is
+# not the documented "no reply is a valid outcome" and needs an operator's
+# eyes. A malformed reply file (bad address, unparseable stanza, or a
+# `mail.sh` call that itself fails) is skipped and flags the thread with
+# the filename and the reason -- it never costs the run's other,
+# well-formed replies. The run is then marked harvested exactly once.
+# Posted replies are new unrouted messages; the next scan routes them --
+# that loop is the whole conversation.
 #
 # STATE, under $FORK_SANDBOX_MAIL_ROOT/.postmaster/ (dot-prefixed so the
 # store's own thread scans never see it):
 #
-#   lock/                          mkdir lock + pid file; one postmaster
-#                                   per mail root -- a second `deliver`
-#                                   refuses while the lock holds a live
-#                                   pid, and breaks a stale one itself
+#   lock                           a flock(1)'d file; the holder's pid is
+#                                   written into it for status/error
+#                                   messages only -- the actual mutual
+#                                   exclusion is the kernel's advisory
+#                                   lock on the open file description, not
+#                                   the file's content, so a killed
+#                                   postmaster can never leave a stale
+#                                   hold for a successor to race against
 #   routed/<message-id>            marker: routing already decided for
 #                                   this message (created before any
 #                                   spawn it triggers, so a crash between
@@ -135,8 +154,14 @@
 #                                   PENDING_MSGS (comma list, may be empty)
 #   harvested/<run-id>             marker: this run's outbox is collected
 #   needs-operator/<thread-id>     flag file; content is the reason
-#   spawns/<thread-id>             one line appended per spawn; line
-#                                   count is the thread's spawn count
+#   spawns/<thread-id>             one line appended per spawn, reset to
+#                                   empty by rule 1 -- line count is the
+#                                   thread's BUDGET count (rule 3)
+#   seq/<thread-id>                one line appended per spawn, NEVER
+#                                   reset -- line count feeds the branch
+#                                   name's sequence number, so a name can
+#                                   never repeat within a thread even
+#                                   across a rule-1 budget reset
 #   handoffs/<run-id>.md           the generated handoff passed to a wake
 #
 # All state transitions are marker-file creation, never deletion of
@@ -150,14 +175,16 @@
 #   - No list-Cc delivery index.
 #   - No repair of a routed-but-never-spawned wake after a crash.
 #   - No renderer, no SMTP.
-#   - fork-sandbox-mail.sh's `reply` verb has no --hops override (its
-#     header comment calls decrementing "the ROUTER's job (round 3)", but
-#     ships no flag for it) -- so an ordinary in-thread reply's X-Hops
-#     copies the parent's verbatim instead of decrementing. Only the
-#     Reply-To-Id: new path (which uses `mail.sh send --hops`) actually
-#     decrements. Hops therefore only reliably fall on the new-thread
-#     path today; fixing the common in-thread-reply path needs a
-#     `mail.sh reply --hops <n>` override, out of this script's scope.
+#   - No timeout/liveness check on a spawned wake: a run dir that vanishes
+#     from the scratch root is detected and harvested as a failure (the
+#     thread is flagged, the agent unblocks), but a run whose process
+#     died without ever writing exit-code -- tmux session killed, host
+#     rebooted mid-run -- leaves its run dir in place with no exit-code,
+#     which is indistinguishable here from "still running": the agent
+#     stays wedged on that thread until an operator notices (`status`
+#     shows the run as live indefinitely) and clears it by hand. Neither
+#     the .env file nor this script tracks the wake's pid, so an
+#     automatic repair would need that added first.
 
 set -euo pipefail
 
@@ -168,15 +195,21 @@ usage() {
 script_dir="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 MAIL="$script_dir/fork-sandbox-mail.sh"
 FLEET="$script_dir/fork-sandbox-fleet.sh"
+# Resolved through script_dir like MAIL/FLEET above, not left to PATH: an
+# uninstalled checkout (not yet on PATH) still has all three scripts
+# sitting next to each other, but PATH lookup alone would fail. Overridable
+# so the test suite can point this at a stub instead of the real launcher.
+FORK_SANDBOX="${FORK_SANDBOX_POSTMASTER_LAUNCHER:-$script_dir/fork-sandbox.sh}"
 
 MAIL_ROOT="${FORK_SANDBOX_MAIL_ROOT:-/var/tmp/claude-scratch/agent-mail}"
 STATE="$MAIL_ROOT/.postmaster"
-LOCK_DIR="$STATE/lock"
+LOCK_FILE="$STATE/lock"
 ROUTED="$STATE/routed"
 RUNS="$STATE/runs"
 HARVESTED="$STATE/harvested"
 NEEDS_OPERATOR="$STATE/needs-operator"
 SPAWNS="$STATE/spawns"
+SEQ="$STATE/seq"
 HANDOFFS="$STATE/handoffs"
 
 PM_ADDR_RE='^@[a-z0-9][a-z0-9-]*$'
@@ -271,6 +304,17 @@ pm_spawn_count() {
     [[ -f "$SPAWNS/$tid" ]] && wc -l < "$SPAWNS/$tid" || printf '0'
 }
 
+# Branch-naming sequence: unlike $SPAWNS/$tid (the budget counter, reset to
+# empty by rule 1 on every operator/external message), $SEQ/$tid is never
+# truncated, so seq is monotonic for the thread's whole lifetime and a
+# branch name can never repeat -- even across a rule-1 reset landing two
+# spawns back-to-back at the same (would-be) count+1.
+pm_next_seq() {
+    local tid="$1" n
+    n="$([[ -f "$SEQ/$tid" ]] && wc -l < "$SEQ/$tid" || printf '0')"
+    printf '%s' "$(( n + 1 ))"
+}
+
 pm_flag() {
     local tid="$1" reason="$2"
     mkdir -p -- "$NEEDS_OPERATOR"
@@ -282,27 +326,34 @@ pm_unflag() {
 }
 
 # ---- lock ----
+#
+# flock(2) on a plain file, held for the life of this process (pm_lock_fd
+# stays open until pm_lock_release or process exit closes it). This is
+# deliberately NOT a "check a pid, then mkdir/rm-rf" scheme: kill -0 plus a
+# separate rm -rf + mkdir is a TOCTOU race between any two postmasters that
+# both see the same stale pid at the same time -- both proceed, both
+# "win", and both then route and double-spawn every wake. A kernel advisory
+# lock has no such window: it is acquired atomically, and a killed holder
+# (however it died) can never leave a stale hold for a successor to race
+# against, so there is no "stale lock" case left to detect or break.
 
 pm_lock_acquire() {
     mkdir -p -- "$STATE"
-    if mkdir -- "$LOCK_DIR" 2>/dev/null; then
-        printf '%s\n' "$$" > "$LOCK_DIR/pid"
-        return 0
-    fi
-    local pid
-    pid="$(cat -- "$LOCK_DIR/pid" 2>/dev/null || true)"
-    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-        echo "Error: postmaster: another deliver (pid $pid) holds the lock." >&2
+    exec {pm_lock_fd}<>"$LOCK_FILE" || return 1
+    if ! flock -n "$pm_lock_fd"; then
+        local pid
+        pid="$(cat -- "$LOCK_FILE" 2>/dev/null || true)"
+        exec {pm_lock_fd}>&-
+        echo "Error: postmaster: another deliver${pid:+" (pid $pid)"} holds the lock." >&2
         return 1
     fi
-    rm -rf -- "$LOCK_DIR"
-    mkdir -- "$LOCK_DIR"
-    printf '%s\n' "$$" > "$LOCK_DIR/pid"
+    printf '%s\n' "$$" > "$LOCK_FILE"
     return 0
 }
 
 pm_lock_release() {
-    rm -rf -- "$LOCK_DIR"
+    flock -u "$pm_lock_fd" 2>/dev/null || true
+    exec {pm_lock_fd}>&- 2>/dev/null || true
 }
 
 # ---- handoff generation ----
@@ -395,27 +446,37 @@ pm_spawn_wake() {
         return 0
     fi
     harness="${harness:-claude}"
-    model="${model:-sonnet}"
+    # "sonnet" is a claude alias; defaulting it for any other harness sends
+    # a bogus model id (codex does not know the name) or, worse, defeats
+    # fork-sandbox.sh's own model-less-pi guard and a sealed pi seat's
+    # model discovery. Only claude gets a default -- everyone else gets no
+    # --model flag at all when unset, so fork-sandbox.sh's own resolution
+    # (or refusal) applies exactly as it would for any other caller.
+    if [[ "$harness" == claude ]]; then
+        model="${model:-sonnet}"
+    fi
     network="${network:-pinned}"
 
     local run_id
     run_id="$(pm_new_uuid)"
-    local count
-    count="$(pm_spawn_count "$tid")"
-    local branch="sbx-mail-${tid:0:8}-${agent}-$(( count + 1 ))"
+    mkdir -p -- "$SEQ"
+    local seq
+    seq="$(pm_next_seq "$tid")"
+    local branch="sbx-mail-${tid:0:8}-${agent}-${seq}"
 
     mkdir -p -- "$HANDOFFS"
     local handoff_file="$HANDOFFS/$run_id.md"
     pm_write_handoff "$handoff_file" "$agent" "$persona_path" "$tid" "$mid"
 
-    local -a spawn_args=(--branch "$branch" --harness "$harness" --model "$model" --network "$network")
+    local -a spawn_args=(--branch "$branch" --harness "$harness" --network "$network")
+    [[ -n "$model" ]] && spawn_args+=(--model "$model")
     if [[ "$harness" == pi && -n "$thinking" ]]; then
         spawn_args+=(--pi-args "--thinking $thinking")
     fi
 
     local launch_out rc run_dir
     set +e
-    launch_out="$(fork-sandbox.sh "${spawn_args[@]}" "$project" "$handoff_file" 2>&1)"
+    launch_out="$("$FORK_SANDBOX" "${spawn_args[@]}" "$project" "$handoff_file" 2>&1)"
     rc=$?
     set -e
     run_dir="$(printf '%s\n' "$launch_out" | sed -n 's/^  run dir:  *//p' | head -n1)"
@@ -435,8 +496,9 @@ pm_spawn_wake() {
         printf 'BRANCH=%s\n' "$branch"
         printf 'PENDING_MSGS=\n'
     } > "$RUNS/$run_id.env"
-    mkdir -p -- "$SPAWNS"
+    mkdir -p -- "$SPAWNS" "$SEQ"
     printf '%s\n' "$run_id" >> "$SPAWNS/$tid"
+    printf '%s\n' "$run_id" >> "$SEQ/$tid"
 }
 
 pm_wake_or_pend() {
@@ -581,7 +643,7 @@ pm_harvest_one_file() {
         cmd=("$MAIL" send --from "@$agent" --to "$to" --subject "$subject" --body "$body_file" --hops "$decremented")
         [[ -n "$cc" ]] && cmd+=(--cc "$cc")
     else
-        cmd=("$MAIL" reply --from "@$agent" --reply-to "$reply_to_id" --body "$body_file")
+        cmd=("$MAIL" reply --from "@$agent" --reply-to "$reply_to_id" --body "$body_file" --hops "$decremented")
         [[ -n "$to" ]] && cmd+=(--to "$to")
         [[ -n "$cc" ]] && cmd+=(--cc "$cc")
         [[ -n "$subject" ]] && cmd+=(--subject "$subject")
@@ -629,7 +691,29 @@ pm_harvest_run() {
     tid="$(pm_env_get "$f" THREAD)"
     trigger="$(pm_env_get "$f" TRIGGER)"
     run_dir="$(pm_env_get "$f" RUN_DIR)"
+    if [[ ! -d "$run_dir" ]]; then
+        # Vanished (scratch root cleaned up, or never existed) rather than
+        # merely still running -- this is the one crash shape distinct
+        # from "not done yet" that this script can actually detect without
+        # a timeout or a tracked pid (see LIMITATIONS), so it is treated
+        # as a terminal failure: flag the thread and unblock the agent
+        # instead of leaving pm_find_live_run wedged on it forever.
+        pm_flag "$tid" "run dir for $agent vanished before exit-code appeared (run $rid)"
+        mkdir -p -- "$HARVESTED"
+        : > "$HARVESTED/$rid"
+        return 0
+    fi
     [[ -f "$run_dir/exit-code" ]] || return 0
+
+    local exit_code
+    exit_code="$(pm_trim "$(cat -- "$run_dir/exit-code" 2>/dev/null)")"
+    if [[ "$exit_code" != "0" ]]; then
+        # Harvest whatever outbox there is (a crash mid-reply may still
+        # have written a file), but flag regardless: an empty outbox from
+        # a non-zero exit is a failure, not the documented "no reply is a
+        # valid outcome".
+        pm_flag "$tid" "wake for $agent exited $exit_code (run $rid); outbox may be incomplete"
+    fi
 
     local trigger_file trigger_hops decremented
     trigger_file="$(pm_find_by_id "$trigger" || true)"
