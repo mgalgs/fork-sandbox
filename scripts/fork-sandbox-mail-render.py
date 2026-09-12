@@ -40,10 +40,12 @@ tokens). The Message-ID is included even though nothing else needs it,
 because it is the handle every id-taking verb (reply --reply-to, show,
 seen) requires, and a view an agent cannot act on is not a view. Body
 lines are verbatim but each is prefixed with the thread indent plus a
-literal '| ', so a body cannot forge the separator or header lines of a
-message that never existed: the renderer's own grammar never emits a
-'| '-prefixed line, so anything carrying that prefix reads as quoted
-body text no matter what it says.
+literal '> ' (real-email quoting: a body line that already starts with
+'> ' becomes '> > ', standard reply-nesting), so a body cannot forge the
+separator or header lines of a message that never existed: the
+renderer's own grammar never emits an unquoted line from a body, so
+anything carrying a leading '> ' reads as quoted body text no matter
+what it says.
 """
 import argparse
 import html
@@ -429,7 +431,7 @@ def render_text_message(e, depth, orphaned, is_error, out):
         out.append(f"{indent}Attachments: " + ", ".join(e["attachments"]))
     out.append("")
     for ln in e["body"].split("\n"):
-        out.append(f"{indent}| {ln}" if ln else f"{indent}|")
+        out.append(f"{indent}> {ln}" if ln else f"{indent}>")
 
 
 def render_text(mail_root, thread_ids):
