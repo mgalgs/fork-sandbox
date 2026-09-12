@@ -95,7 +95,12 @@
 # silently overwriting it would leave an earlier message's X-Attachment
 # header pointing at the wrong file. Identical content under the same
 # basename is accepted silently (two messages may legitimately share one
-# attachment).
+# attachment). Two --attach arguments in one command that share a
+# basename but differ in content are refused for the same reason -- the
+# second `cp` would clobber the first. A basename containing a newline is
+# refused too: the staged basename list is '/'-joined and split back
+# apart with `read -ra`, which stops at the first newline and would
+# silently truncate the list.
 
 set -euo pipefail
 
@@ -233,11 +238,7 @@ mail_stage_attachments() {
     # unrelated message with the same basename.
     for f in "$@"; do
         base="$(basename -- "$f")"
-        if [[ "$base" == *$'\n'* ]]; then
-            echo "Error: --attach file '$f' has a newline in its basename;" >&2
-            echo "refusing." >&2
-            return 1
-        fi
+        mail_validate_no_newline "$base" "--attach basename '$base'" || return 1
         [[ -f "$f" ]] || { echo "Error: --attach file '$f' not found." >&2; return 1; }
         size="$(wc -c < "$f" | tr -d '[:space:]')"
         if (( size > MAIL_ATTACH_MAX_BYTES )); then

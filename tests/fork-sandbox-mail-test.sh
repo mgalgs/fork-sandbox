@@ -254,6 +254,75 @@ else
 fi
 contains "the collision refusal names the colliding path" "$out" "attachments/shot.png"
 
+printf '\n== attachments: a later refusal stages nothing, not even an earlier clean attachment ==\n'
+
+# All of send/reply's attachment refusals are checked before any `cp` runs
+# (fork-sandbox-mail.sh's mail_stage_attachments), so a reply with a clean
+# attachment followed by one that gets refused must stage *neither* -- if
+# the hoist ever regresses to a per-attachment check-then-cp loop, the
+# first, clean attachment would already be copied by the time the second
+# one's check fails. A single-attachment refusal can't witness that
+# regression (its own check already ran before its own cp, hoisted or
+# not), so each case here pairs a fresh clean attachment with the failing
+# one. Reusing $att_id (an existing thread) makes the leak permanent and
+# visible, unlike testing against a brand-new thread with nothing staged.
+attach_files_before="$(find "$FORK_SANDBOX_MAIL_ROOT" -path '*/attachments/*' -type f | wc -l)"
+
+echo "clean, not-found case" > "$work/clean-notfound.txt"
+out="$("$mail" reply --from @bob --reply-to "$att_id" --body - \
+    --attach "$work/clean-notfound.txt" --attach "$work/does-not-exist.bin" <<< "x" 2>&1)"
+rc=$?
+if (( rc != 0 )); then
+    ok "reply refuses an attachment that does not exist"
+else
+    no "reply refuses an attachment that does not exist" "it succeeded"
+fi
+check "the not-found refusal staged no attachment, including the earlier clean one" "$attach_files_before" \
+    "$(find "$FORK_SANDBOX_MAIL_ROOT" -path '*/attachments/*' -type f | wc -l)"
+
+echo "clean, over-cap case" > "$work/clean-overcap.txt"
+out="$("$mail" reply --from @bob --reply-to "$att_id" --body - \
+    --attach "$work/clean-overcap.txt" --attach "$big" <<< "x" 2>&1)"
+rc=$?
+if (( rc != 0 )); then
+    ok "reply refuses an attachment over the 4 MiB cap"
+else
+    no "reply refuses an attachment over the 4 MiB cap" "it succeeded"
+fi
+check "the over-cap refusal staged no attachment, including the earlier clean one" "$attach_files_before" \
+    "$(find "$FORK_SANDBOX_MAIL_ROOT" -path '*/attachments/*' -type f | wc -l)"
+
+# shot.png (in $work) holds "different content" from earlier in this file --
+# still a cross-message collision against attachments/shot.png.
+echo "clean, collision case" > "$work/clean-collision.txt"
+out="$("$mail" reply --from @bob --reply-to "$att_id" --body - \
+    --attach "$work/clean-collision.txt" --attach shot.png <<< "x" 2>&1)"
+rc=$?
+if (( rc != 0 )); then
+    ok "reply refuses a cross-message basename collision"
+else
+    no "reply refuses a cross-message basename collision" "it succeeded"
+fi
+check "the cross-message collision refusal staged no attachment, including the earlier clean one" "$attach_files_before" \
+    "$(find "$FORK_SANDBOX_MAIL_ROOT" -path '*/attachments/*' -type f | wc -l)"
+
+printf '\n== attachments: two --attach args in one command sharing a basename are refused ==\n'
+
+mkdir -p "$work/dup-a" "$work/dup-b"
+echo "dup content a" > "$work/dup-a/dup.txt"
+echo "dup content b" > "$work/dup-b/dup.txt"
+out="$("$mail" reply --from @bob --reply-to "$att_id" --body - \
+    --attach "$work/dup-a/dup.txt" --attach "$work/dup-b/dup.txt" <<< "x" 2>&1)"
+rc=$?
+if (( rc != 0 )); then
+    ok "refuses two --attach args in one command sharing a basename with different content"
+else
+    no "refuses two --attach args in one command sharing a basename with different content" "it succeeded"
+fi
+contains "the same-invocation collision refusal names the shared basename" "$out" "attachments/dup.txt"
+check "the same-invocation collision refusal staged no attachment" "$attach_files_before" \
+    "$(find "$FORK_SANDBOX_MAIL_ROOT" -path '*/attachments/*' -type f | wc -l)"
+
 printf '\n== attachments: multiple clean attachments ==\n'
 
 echo "file a" > "attach,a.txt"
