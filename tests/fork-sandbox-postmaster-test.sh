@@ -716,6 +716,101 @@ check "harvest: agent is spawnable again after the vanished run was harvested" 1
     "$(grep -c -- "^sbx-mail-${tid:0:8}-bob-" "$STUB_ARGV_LOG")"
 
 # ============================================================
+printf '\n== harvest: a wake that dies without exit-code is detected via its pid ==\n'
+# ============================================================
+
+# A dead, already-reaped pid: kill -0 on it fails unconditionally, unlike a
+# live process the test could accidentally collide with.
+dead_pid_of() {
+    ( exit 0 ) &
+    local p=$!
+    wait "$p" 2>/dev/null || true
+    printf '%s' "$p"
+}
+
+# Every scenario below spawns with the DEFAULT grace in force (a fresh
+# spawn's run dir has no pid file yet -- the stub does not write one -- and
+# with 60s of grace that reads as "not dead yet", exactly as a real run's
+# runner has not written its pid file in the first instant either).
+# PM_WAKE_DEAD_GRACE is only lowered right before the harvest pass under
+# test, never before the spawn, so the spawn itself never trips the check
+# this section exists to exercise.
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+mid="$(send_msg '@carol' '@alice' 'dead pid, no grace' 'body' 8)"
+tid="$(thread_of "$mid")"
+: > "$STUB_ARGV_LOG"
+once
+run_env="$(env_file_for_agent alice)"
+run_dir="$(sed -n 's/^RUN_DIR=//p' "$run_env")"
+mkdir -p -- "$FORK_SANDBOX_MAIL_ROOT/.postmaster/sessions/$tid"
+printf '%s\n' 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' \
+    > "$FORK_SANDBOX_MAIL_ROOT/.postmaster/sessions/$tid/alice"
+printf '%s\n' "$(dead_pid_of)" > "$run_dir/pid"
+export PM_WAKE_DEAD_GRACE=0
+once
+unset PM_WAKE_DEAD_GRACE
+contains "dead pid, no grace: thread is flagged with the wake-died reason" \
+    "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid" 2>/dev/null || true)" \
+    "wake died without exit-code"
+check "dead pid, no grace: the run is marked harvested (agent unblocks)" "1" \
+    "$(find "$FORK_SANDBOX_MAIL_ROOT/.postmaster/harvested" -type f | wc -l)"
+check "dead pid, no grace: the recorded session id is cleared" 0 \
+    "$( [[ -e "$FORK_SANDBOX_MAIL_ROOT/.postmaster/sessions/$tid/alice" ]] && echo 1 || echo 0 )"
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+mid="$(send_msg '@carol' '@alice' 'dead pid, within grace' 'body' 8)"
+tid="$(thread_of "$mid")"
+: > "$STUB_ARGV_LOG"
+once
+run_env="$(env_file_for_agent alice)"
+run_dir="$(sed -n 's/^RUN_DIR=//p' "$run_env")"
+printf '%s\n' "$(dead_pid_of)" > "$run_dir/pid"
+export PM_WAKE_DEAD_GRACE=3600
+once
+unset PM_WAKE_DEAD_GRACE
+check "dead pid, within grace: not yet flagged" 0 \
+    "$( [[ -e "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid" ]] && echo 1 || echo 0 )"
+check "dead pid, within grace: not yet harvested (still counts as live)" "0" \
+    "$(find "$FORK_SANDBOX_MAIL_ROOT/.postmaster/harvested" -type f | wc -l)"
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+mid="$(send_msg '@carol' '@alice' 'missing pid file' 'body' 8)"
+tid="$(thread_of "$mid")"
+: > "$STUB_ARGV_LOG"
+once
+# No pid file at all is written -- the stub fabricates a run dir with only
+# outbox/ under it.
+export PM_WAKE_DEAD_GRACE=0
+once
+unset PM_WAKE_DEAD_GRACE
+contains "missing pid file: flagged with the wake-died reason" \
+    "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid" 2>/dev/null || true)" \
+    "wake died without exit-code"
+check "missing pid file: marked harvested" "1" \
+    "$(find "$FORK_SANDBOX_MAIL_ROOT/.postmaster/harvested" -type f | wc -l)"
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+mid="$(send_msg '@carol' '@alice' 'live pid untouched' 'body' 8)"
+tid="$(thread_of "$mid")"
+: > "$STUB_ARGV_LOG"
+once
+run_env="$(env_file_for_agent alice)"
+run_dir="$(sed -n 's/^RUN_DIR=//p' "$run_env")"
+printf '%s\n' "$$" > "$run_dir/pid"
+export PM_WAKE_DEAD_GRACE=0
+once
+unset PM_WAKE_DEAD_GRACE
+check "live pid: not flagged" 0 \
+    "$( [[ -e "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid" ]] && echo 1 || echo 0 )"
+check "live pid: not harvested (a genuinely running wake is left alone)" "0" \
+    "$(find "$FORK_SANDBOX_MAIL_ROOT/.postmaster/harvested" -type f | wc -l)"
+
+# ============================================================
 printf '\n== spawn launcher is resolved independent of PATH ==\n'
 # ============================================================
 

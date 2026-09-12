@@ -218,16 +218,15 @@
 #   - No list-Cc delivery index.
 #   - No repair of a routed-but-never-spawned wake after a crash.
 #   - No renderer, no SMTP.
-#   - No timeout/liveness check on a spawned wake: a run dir that vanishes
-#     from the scratch root is detected and harvested as a failure (the
-#     thread is flagged, the agent unblocks), but a run whose process
-#     died without ever writing exit-code -- tmux session killed, host
-#     rebooted mid-run -- leaves its run dir in place with no exit-code,
-#     which is indistinguishable here from "still running": the agent
-#     stays wedged on that thread until an operator notices (`status`
-#     shows the run as live indefinitely) and clears it by hand. Neither
-#     the .env file nor this script tracks the wake's pid, so an
-#     automatic repair would need that added first.
+#   - A spawned wake whose process died without ever writing exit-code --
+#     tmux session killed, host rebooted mid-run -- is detected at harvest
+#     via its run dir's pid file (see pm_wake_is_dead): once that pid is
+#     dead and PM_WAKE_DEAD_GRACE seconds have passed, the thread is
+#     flagged, the agent unblocks and the recorded session id is cleared.
+#     Residual gap: a pid recycled by the OS onto a live, unrelated
+#     process reads as "alive" here, so detection waits for THAT process
+#     to exit too -- vanishingly rare, and the same gap fork-sandbox-status.sh's
+#     "abandoned" state already accepts for the identical check.
 
 set -euo pipefail
 
@@ -247,6 +246,12 @@ FORK_SANDBOX="${FORK_SANDBOX_POSTMASTER_LAUNCHER:-$script_dir/fork-sandbox.sh}"
 # shellcheck source=fork-sandbox-lib.sh
 # shellcheck disable=SC1091  # plain shellcheck cannot follow it; use -x
 source "$script_dir/fork-sandbox-lib.sh"
+
+# The harvest pass below reads a run dir's pid file with $FS_STAT -c %Y (the
+# GNU form fork-sandbox-lib.sh resolves); the BSD stat of the same name takes
+# different flags entirely, so say so here, before anything is created,
+# rather than fail confusingly deep in a harvest pass.
+fs_require_gnu_tools || exit 1
 
 MAIL_ROOT="${FORK_SANDBOX_MAIL_ROOT:-/var/tmp/claude-scratch/agent-mail}"
 STATE="$MAIL_ROOT/.postmaster"
@@ -781,6 +786,42 @@ pm_followup_wake() {
     pm_spawn_wake "$project" "$agent" "$tid" "$mid"
 }
 
+# A tracked run's pid file, once dead and past a grace period, is the one
+# other crash shape this script can tell apart from "still running": a wake
+# whose tmux session was killed, or whose host rebooted, never writes
+# exit-code, so a naive "does exit-code exist yet" check would leave
+# pm_find_live_run treating it as live forever. The grace (default 60s,
+# overridable for tests) covers an exit-code write still in flight when this
+# runs -- fork-sandbox.sh writes the pid file once, at the very start of the
+# run, and exit-code strictly before its process exits, so a fresh run
+# reads as "recent" here even though kill -0 has nothing to check yet.
+#
+# Residual gap: a pid recycled by the OS onto a live, unrelated process
+# reads as "alive" here, so detection waits for THAT process to exit too.
+# Vanishingly rare in practice (pid reuse needs the full pid space to
+# wrap), and the same gap `fork-sandbox-status.sh`'s "abandoned" state and
+# `fork-sandbox-say.sh` already accept for the identical check.
+PM_WAKE_DEAD_GRACE="${PM_WAKE_DEAD_GRACE:-60}"
+
+pm_wake_is_dead() {
+    local run_dir="$1" env_file="$2"
+    local pid_file="$run_dir/pid" now ref_mtime pid
+    now="$(date +%s)"
+    if pid="$(cat -- "$pid_file" 2>/dev/null)"; then
+        pid="$(pm_trim "$pid")"
+        ref_mtime="$("$FS_STAT" -c %Y -- "$pid_file" 2>/dev/null)" || ref_mtime="$now"
+        if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+            return 1
+        fi
+    else
+        # Missing or unreadable: no pid was ever recorded. Age it off the
+        # .env file instead, written at spawn time, moments before the run
+        # itself would have written the pid file.
+        ref_mtime="$("$FS_STAT" -c %Y -- "$env_file" 2>/dev/null)" || ref_mtime="$now"
+    fi
+    (( now - ref_mtime >= PM_WAKE_DEAD_GRACE ))
+}
+
 pm_harvest_run() {
     local project="$1" rid="$2"
     local f="$RUNS/$rid.env"
@@ -806,7 +847,15 @@ pm_harvest_run() {
         : > "$HARVESTED/$rid"
         return 0
     fi
-    [[ -f "$run_dir/exit-code" ]] || return 0
+    if [[ ! -f "$run_dir/exit-code" ]]; then
+        if pm_wake_is_dead "$run_dir" "$f"; then
+            pm_flag "$tid" "wake died without exit-code: $rid"
+            pm_session_clear "$tid" "$agent"
+            mkdir -p -- "$HARVESTED"
+            : > "$HARVESTED/$rid"
+        fi
+        return 0
+    fi
 
     local exit_code
     exit_code="$(pm_trim "$(cat -- "$run_dir/exit-code" 2>/dev/null)")"
