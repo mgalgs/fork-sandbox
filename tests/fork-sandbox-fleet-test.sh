@@ -205,6 +205,53 @@ lists:
 EOF
 rm -f "$FORK_SANDBOX_PERSONAS_DIR/collide.md"
 
+cat > "$FORK_SANDBOX_PERSONAS_DIR/loner-bad.md" <<'EOF'
+---
+harness: gpt-9
+---
+EOF
+bad "bare persona file with no fleet.yaml entry is still checked" \
+    "takes 'claude', 'pi' or 'codex', not 'gpt-9'" <<'EOF'
+agents:
+  riffler: {}
+EOF
+rm -f "$FORK_SANDBOX_PERSONAS_DIR/loner-bad.md"
+
+bad "network sealed with harness claude in the same fleet.yaml entry is rejected" \
+    "network 'sealed' requires harness 'pi'" <<'EOF'
+agents:
+  riffler:
+    harness: claude
+    network: sealed
+EOF
+
+cat > "$FORK_SANDBOX_PERSONAS_DIR/sealed-claude.md" <<'EOF'
+---
+harness: claude
+network: sealed
+---
+EOF
+bad "network sealed with harness claude in frontmatter alone is rejected" \
+    "network 'sealed' requires harness 'pi'" <<'EOF'
+agents:
+  sealed-claude: {}
+EOF
+rm -f "$FORK_SANDBOX_PERSONAS_DIR/sealed-claude.md"
+
+cat > "$FORK_SANDBOX_PERSONAS_DIR/merged-sealed.md" <<'EOF'
+---
+harness: pi
+network: sealed
+---
+EOF
+bad "network sealed from frontmatter merged with a harness override from fleet.yaml is rejected" \
+    "network 'sealed' requires harness 'pi'" <<'EOF'
+agents:
+  merged-sealed:
+    harness: claude
+EOF
+rm -f "$FORK_SANDBOX_PERSONAS_DIR/merged-sealed.md"
+
 badfile="$FORK_SANDBOX_FLEET_FILE_DIR/bad.yaml"
 cat > "$badfile" <<'EOF'
 agents:
@@ -284,6 +331,18 @@ contains "roster: lists riffler" "$roster_out" "riffler"
 contains "roster: lists tuner" "$roster_out" "tuner"
 contains "roster: lists scout" "$roster_out" "scout"
 contains "roster: lists the jam-band list" "$roster_out" "jam-band"
+
+printf '\n== roster includes persona-only agents (no fleet.yaml entry) ==\n'
+
+cat > "$FORK_SANDBOX_PERSONAS_DIR/drifter.md" <<'EOF'
+---
+harness: codex
+---
+EOF
+roster_loner="$("$fleet" roster 2>&1)"
+contains "roster: lists a persona-only agent with no fleet.yaml entry" "$roster_loner" "drifter"
+contains "roster: resolves the persona-only agent's harness" "$roster_loner" "harness=codex"
+rm -f "$FORK_SANDBOX_PERSONAS_DIR/drifter.md"
 
 printf '\n== missing fleet file / personas dir ==\n'
 

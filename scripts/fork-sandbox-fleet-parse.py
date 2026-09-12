@@ -16,9 +16,13 @@ This script owns every validation rule for both documents -- YAML
 validity, the schema, name shape, the harness/network enums (including
 refusing `pi-local`, which fork-sandbox-preset-parse.py accepts but this
 registry does not: the two-axis spelling `harness: pi` + `network: sealed`
-is the only one here), the agent/list namespace, list membership, and
-persona-file existence -- and reports every error it finds, not just the
-first, addressed by path (`agents.reviewer.modle`).
+is the only one here), the requirement that `network: sealed` only ever
+resolves against harness `pi` (checked both within one document and, in
+`check`, against the fleet.yaml/frontmatter-merged result, since either
+document can be individually valid and still combine into an illegal
+pair), the agent/list namespace, list membership, and persona-file
+existence -- and reports every error it finds, not just the first,
+addressed by path (`agents.reviewer.modle`).
 
 `check` accumulates every error across the whole fleet file and every
 persona it declares, prints them all to stderr, and exits 1; exits 0 with
@@ -145,6 +149,19 @@ def check_network(value, path, errors):
     return value
 
 
+def check_network_harness_pair(harness, network, path, errors):
+    """'sealed' is a property of the harness (only 'pi' has a self-hosted
+    endpoint to seal), not of either file format, so this runs both on a
+    single document's own fields and, from cmd_check, on the two fields
+    after fleet.yaml/frontmatter precedence is applied -- an agent can be
+    individually valid in both documents and still resolve to an illegal
+    pair. An empty harness is left alone: unspecified defers to whatever
+    consumes the registry, per the header's no-defaulting rule."""
+    if network == "sealed" and harness not in ("", "pi"):
+        errors.append(f"{path}: network 'sealed' requires harness 'pi'; "
+                       f"'{harness}' has no self-hosted-endpoint path")
+
+
 def check_persona(value, path, errors):
     """A persona: override names a file directly under personas-dir
     (<personas-dir>/<name>.md, per the header contract), never a path --
@@ -225,6 +242,8 @@ def load_and_validate(fleet_file, label, errors):
                     agent["network"] = check_network(v, path, errors)
             else:
                 errors.append(f"{label}: {path}: unknown key")
+        check_network_harness_pair(agent["harness"], agent["network"],
+                                    f"{label}: agents.{name}", errors)
         agents[name] = agent
 
     lists = {}
@@ -329,6 +348,8 @@ def parse_frontmatter(path, label, errors):
                 fm["network"] = check_network(v, path_, errors)
         else:
             errors.append(f"{path_}: unknown key")
+    check_network_harness_pair(fm["harness"], fm["network"],
+                                f"persona '{label}' frontmatter", errors)
     return fm
 
 
@@ -343,7 +364,11 @@ def cmd_check(fleet_file, label, personas_dir):
                 errors.append(f"agents.{name}: persona file "
                                f"'{persona_path}' does not exist")
                 continue
-            parse_frontmatter(persona_path, persona_path, errors)
+            fm = parse_frontmatter(persona_path, persona_path, errors)
+            check_network_harness_pair(
+                agent["harness"] or fm["harness"],
+                agent["network"] or fm["network"],
+                f"agents.{name}", errors)
         # The bash side (fleet_is_agent) treats a bare <name>.md under
         # personas-dir as making `name` an agent even with no fleet.yaml
         # entry at all -- so a list sharing that name is the same
@@ -355,6 +380,24 @@ def cmd_check(fleet_file, label, personas_dir):
                 errors.append(f"lists.{name}: '{name}' is defined as a "
                                f"list, but persona file '{persona_path}' "
                                f"also makes it a valid agent name")
+        # Symmetrically, that same bare-<name>.md rule makes a persona
+        # file with no fleet.yaml entry at all a real agent too -- one
+        # `check` must validate, or it stays silent on exactly the
+        # frontmatter errors `resolve`/`expand` then hit later.
+        try:
+            persona_files = sorted(os.listdir(personas_dir))
+        except OSError as e:
+            errors.append(f"{label}: personas dir '{personas_dir}': "
+                           f"unreadable: {e}")
+            persona_files = []
+        for fname in persona_files:
+            if not fname.endswith(".md"):
+                continue
+            name = fname[:-len(".md")]
+            if name in agents or name in lists or not NAME_RE.fullmatch(name):
+                continue
+            persona_path = os.path.join(personas_dir, fname)
+            parse_frontmatter(persona_path, persona_path, errors)
     if errors:
         for e in errors:
             sys.stderr.write(f"Error: {e}\n")

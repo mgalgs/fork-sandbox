@@ -39,9 +39,12 @@
 #
 # Verbs:
 #
-#   check          Validate the fleet file and every persona file it
-#                  declares. Exits 0 silently if clean; otherwise prints
-#                  every error found (not just the first) and exits 1.
+#   check          Validate the fleet file, every persona file it
+#                  declares, and every bare <name>.md in the personas
+#                  directory that makes `name` an agent on its own (see
+#                  fleet_is_agent below). Exits 0 silently if clean;
+#                  otherwise prints every error found (not just the
+#                  first) and exits 1.
 #   resolve <name> Print exactly six lines for one agent: harness, model,
 #                  thinking, network, persona-path, description. A field
 #                  with nothing configured anywhere prints as an empty
@@ -249,6 +252,23 @@ cmd_roster() {
     while IFS= read -r n; do
         [[ -n "$n" ]] && agent_names+=("$n")
     done < <(awk -F'\t' '$1=="agent"{print $2}' <<< "$dump" | awk '!seen[$0]++')
+
+    # fleet_is_agent treats a bare <name>.md under personas-dir as making
+    # `name` an agent with no fleet.yaml entry at all; roster's "every
+    # agent" promise needs those names too, or they stay invisible here
+    # exactly like they do in `check`.
+    local f loner already existing
+    for f in "$PERSONAS_DIR"/*.md; do
+        [[ -e "$f" ]] || continue
+        loner="$(basename "$f" .md)"
+        [[ "$loner" =~ $FLEET_NAME_RE ]] || continue
+        fleet_is_list "$dump" "$loner" && continue
+        already=0
+        for existing in "${agent_names[@]:-}"; do
+            [[ "$existing" == "$loner" ]] && { already=1; break; }
+        done
+        (( already )) || agent_names+=("$loner")
+    done
 
     echo "Agents:"
     local name harness model thinking network persona description
