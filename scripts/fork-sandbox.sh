@@ -188,6 +188,12 @@
 #                        the one summary.json reports as this run's
 #                        session_id. --refresh-at continuations are the same
 #                        conversation continued, and do write there.
+#                        summary.json gains two keys on such a run, and only
+#                        on such a run: `session_state`, the directory, and
+#                        `session_id`, the stem of the newest transcript in
+#                        it at run end (null if the store stayed empty). The
+#                        newest-by-mtime rule is a heuristic — the CLI does
+#                        not record which transcript was this run's.
 #                        Note that with this flag the sandbox's transcripts
 #                        no longer land in the work dir's claude-session/:
 #                        the bind is namespace-local, so the per-run state
@@ -5087,6 +5093,9 @@ started_at="$(date +%s)"
     printf 'rev_harness_env_file=%q\n' "$rev_harness_env_file"
     printf 'started_at=%q\n' "$started_at"
     printf 'pi_session_dir=%q\n' "$pi_session_dir"
+    # Empty unless --session-state was given; the runner reads it at the end
+    # to name this run's session_id in summary.json.
+    printf 'session_state=%q\n' "$session_state"
     printf 'rev_pi_session_dir=%q\n' "$rev_pi_session_dir"
     printf 'review_loop_cap=%q\n' "$review_loop_cap"
     # Every maintainer-tier variable the runner reads is emitted only when
@@ -7317,6 +7326,22 @@ removed_json=false
 (( removed )) && removed_json=true
 session_dir_json=""
 [[ -d "$run_dir/pi-session" ]] && session_dir_json="$run_dir/pi-session"
+# With --session-state, name the claude session a later run could resume.
+# The CLI files each transcript as <session-id>.jsonl under a per-project
+# directory of the store, and records nowhere which one is this run's, so
+# this is a documented heuristic: the newest by mtime. A --refresh-at chain
+# writes one transcript per leg and the newest is the leg a resume should
+# continue; only the implement leg is bound at all, so no review or
+# maintainer conversation competes for newest (see --session-state in the
+# header). Empty when the flag was not given, or when the store has no
+# transcript -- a session that died before writing one.
+session_id_json=""
+if [[ -n "$session_state" && -d "$session_state" ]]; then
+    newest_transcript="$(find "$session_state" -maxdepth 2 -name '*.jsonl' \
+        -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1)"
+    [[ -z "$newest_transcript" ]] \
+        || session_id_json="$(basename "${newest_transcript#* }" .jsonl)"
+fi
 ended_at="$(date +%s)"
 
 jq -n \
@@ -7351,6 +7376,8 @@ jq -n \
     --argjson continuations "$continuations_json" \
     --argjson outbox_bytes "$outbox_bytes" \
     --argjson outbox_max_bytes "$outbox_max_bytes" \
+    --arg session_state "$session_state" \
+    --arg session_id "$session_id_json" \
     '{
         version: $version,
         mode: $mode,
@@ -7384,7 +7411,14 @@ jq -n \
         started_at: $started_at,
         ended_at: $ended_at,
         duration_seconds: ($ended_at - $started_at),
-    }' > "$run_dir/summary.json" 2>/dev/null \
+    }
+    # Both keys are absent, not null, on a run without --session-state:
+    # their presence is how a caller tells a resumable run from one whose
+    # transcript died with the sandbox.
+    + (if $session_state == "" then {} else {
+        session_state: $session_state,
+        session_id: (if $session_id == "" then null else $session_id end),
+    } end)' > "$run_dir/summary.json" 2>/dev/null \
     || rm -f "$run_dir/summary.json"
 
 # Append this run to the durable run log (~/.claude/sandbox-runs.jsonl),

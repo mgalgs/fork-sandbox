@@ -219,6 +219,25 @@ cat > "$stub_bin/claude-sandboxed" <<'STUB'
 cat >/dev/null
 printf '%s\n' "$@" >> "$FAKE_ARGV_FILE"
 printf -- '--- end of argv ---\n' >> "$FAKE_ARGV_FILE"
+# Stand in for the claude CLI's transcript store when the caller asks for
+# one: FAKE_TRANSCRIPTS is "<stem>@<mtime> ..." and each becomes a .jsonl
+# under a per-project directory of the bound state dir, exactly where the
+# real CLI files them. Fixed mtimes, so "newest" is not a race.
+if [[ -n "${FAKE_TRANSCRIPTS:-}" ]]; then
+    state=""
+    prev=""
+    for a in "$@"; do
+        [[ "$prev" == --session-state ]] && state="$a"
+        prev="$a"
+    done
+    if [[ -n "$state" ]]; then
+        mkdir -p "$state/-home-agent-project"
+        for spec in $FAKE_TRANSCRIPTS; do
+            printf '{}\n' > "$state/-home-agent-project/${spec%%@*}.jsonl"
+            touch -d "@${spec##*@}" "$state/-home-agent-project/${spec%%@*}.jsonl"
+        done
+    fi
+fi
 exit 0
 STUB
 chmod +x "$stub_bin/claude-sandboxed"
@@ -256,6 +275,7 @@ register_run_paths() {
     local -a fields
     mapfile -t fields <<<"$result"
     REGISTERED_ARGV_FILE="${fields[0]:-}"
+    REGISTERED_RUN_DIR="${fields[3]:-}"
     local f
     for f in "${fields[@]}"; do
         [[ -n "$f" ]] && tmpdirs+=("$f")
@@ -309,6 +329,7 @@ plain_result="$(run_and_capture_argv "$plain_home")"
 plain_rc=$?
 register_run_paths "$plain_result"
 plain_argv="$REGISTERED_ARGV_FILE"
+plain_run_dir="$REGISTERED_RUN_DIR"
 if (( plain_rc != 0 )); then
     no "a run with no --session-state passes neither flag" "run failed"
 else
@@ -318,6 +339,79 @@ else
     else
         ok "a run with no --session-state passes neither flag"
     fi
+fi
+
+# ---------------------------------------------------------------------------
+printf '\n== summary.json: session_state and session_id ==\n'
+# ---------------------------------------------------------------------------
+
+# What a caller reads to learn what the next wake should resume. The id is
+# the newest transcript in the store by mtime -- a heuristic, because the
+# CLI records nowhere which transcript was this run's.
+
+summary_field() {
+    jq -r "$2" "$1/summary.json" 2>/dev/null
+}
+
+# Two transcripts, a day apart, written in the order that would trip a
+# naive "last one wins": the OLDER stem is written second.
+sum_home="$(mktmp_dir "$scratch/fs-resume-home.XXXXXX")"
+sum_state="$(mktmp_dir "$scratch/fs-resume-state.XXXXXX")"
+sum_new=aaaabbbb-1111-2222-3333-444455556666
+sum_old=ccccdddd-7777-8888-9999-aaaabbbbcccc
+export FAKE_TRANSCRIPTS="$sum_new@1700000200 $sum_old@1700000100"
+sum_result="$(run_and_capture_argv "$sum_home" --session-state "$sum_state")"
+sum_rc=$?
+unset FAKE_TRANSCRIPTS
+register_run_paths "$sum_result"
+sum_run_dir="$REGISTERED_RUN_DIR"
+
+if (( sum_rc != 0 )) || [[ -z "$sum_run_dir" ]]; then
+    no "summary.json reports session_state and session_id" "run failed"
+else
+    if [[ "$(summary_field "$sum_run_dir" .session_state)" == "$sum_state" ]]; then
+        ok "summary.json carries session_state"
+    else
+        no "summary.json carries session_state" \
+            "$(summary_field "$sum_run_dir" .session_state)"
+    fi
+    if [[ "$(summary_field "$sum_run_dir" .session_id)" == "$sum_new" ]]; then
+        ok "summary.json session_id is the newest transcript stem"
+    else
+        no "summary.json session_id is the newest transcript stem" \
+            "$(summary_field "$sum_run_dir" .session_id)"
+    fi
+fi
+
+# The store stayed empty -- a session that died before writing a transcript.
+# session_state is still reported; session_id is null, not missing, so a
+# caller can tell "nothing to resume" from "resume was never asked for".
+empty_home="$(mktmp_dir "$scratch/fs-resume-home.XXXXXX")"
+empty_state="$(mktmp_dir "$scratch/fs-resume-state.XXXXXX")"
+empty_result="$(run_and_capture_argv "$empty_home" --session-state "$empty_state")"
+empty_rc=$?
+register_run_paths "$empty_result"
+empty_run_dir="$REGISTERED_RUN_DIR"
+if (( empty_rc != 0 )) || [[ -z "$empty_run_dir" ]]; then
+    no "summary.json session_id is null on an empty store" "run failed"
+else
+    if [[ "$(summary_field "$empty_run_dir" .session_id)" == null \
+        && "$(summary_field "$empty_run_dir" .session_state)" == "$empty_state" ]]; then
+        ok "summary.json session_id is null on an empty store"
+    else
+        no "summary.json session_id is null on an empty store" \
+            "$(summary_field "$empty_run_dir" .)"
+    fi
+fi
+
+# No --session-state: both keys absent entirely, not null.
+if [[ -z "$plain_run_dir" ]]; then
+    no "summary.json omits both keys without --session-state" "no run dir"
+elif [[ "$(summary_field "$plain_run_dir" 'has("session_id") or has("session_state")')" == false ]]; then
+    ok "summary.json omits both keys without --session-state"
+else
+    no "summary.json omits both keys without --session-state" \
+        "$(summary_field "$plain_run_dir" .)"
 fi
 
 # ---------------------------------------------------------------------------
