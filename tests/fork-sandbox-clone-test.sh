@@ -236,6 +236,23 @@ check "the new branch starts at the prior wake's own commit" \
 check "identity config is untouched by reuse (still the origin's)" \
     "$GLOBAL_EMAIL" "$(cd "$prior_clone" && git config --local --get user.email)"
 
+# prior_clone was built with no fifth (dissociate) argument, so it is still
+# --shared with an alternates file at reuse time -- exactly the pre-existing,
+# not-yet-dissociated workspace fs_reuse_clone's own dissociation exists to
+# close. Mirrors the create-side pair fs_make_clone's "true" branch gets.
+if [[ ! -e "$prior_clone/.git/objects/info/alternates" ]]; then
+    ok "reuse dissociates a --shared clone from its origin's object store"
+else
+    no "reuse dissociates a --shared clone from its origin's object store" \
+        "$(cat "$prior_clone/.git/objects/info/alternates")"
+fi
+if git -C "$prior_clone" fsck --full >/dev/null 2>&1; then
+    ok "reuse leaves the repacked clone fsck-clean"
+else
+    no "reuse leaves the repacked clone fsck-clean" \
+        "$(git -C "$prior_clone" fsck --full 2>&1)"
+fi
+
 # The fallback path: a --clone-dir target that is a valid git repo but has no
 # commits at all (its own HEAD cannot be resolved), the one legitimate way a
 # real reused clone could lack a branch tip to start from.
