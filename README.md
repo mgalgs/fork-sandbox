@@ -30,6 +30,12 @@ installed and callable under its own name — `fork-sandbox status` and
   discover
 - `fork-sandbox validate-services <file>` — check the repo's services spec
   without a cluster
+- `fork-sandbox mail send|reply|show|tree|list|inbox|seen ...` — the
+  fleet's shared maildir-style message store
+- `fork-sandbox fleet check|resolve|expand|roster` — the fleet's agent
+  registry: personas, harness/model/network overrides, address lists
+- `fork-sandbox postmaster deliver|status|flag|unflag` — the host-side
+  router: wakes addressed agents, harvests replies, enforces stop rules
 - the lkml-mode review toolchain now lives in its own repo:
   https://github.com/mgalgs/lkml-review
 
