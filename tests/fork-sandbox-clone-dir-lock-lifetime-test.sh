@@ -46,11 +46,15 @@ pass=0
 fail=0
 tmpdirs=()
 tmux_socket=""
+tmux_socket2=""
 
 cleanup() {
     local d
     if [[ -n "$tmux_socket" ]]; then
         "$real_tmux" -L "$tmux_socket" kill-server >/dev/null 2>&1 || true
+    fi
+    if [[ -n "$tmux_socket2" ]]; then
+        "$real_tmux" -L "$tmux_socket2" kill-server >/dev/null 2>&1 || true
     fi
     for d in "${tmpdirs[@]-}"; do
         [[ -n "$d" && -e "$d" ]] && rm -rf -- "$d"
@@ -227,6 +231,89 @@ else
     no "the tmux server outlives this run (unrelated session still up)" "no run dir to probe"
     no "the lock is free again once the run ends, even though the tmux server is still up" \
         "no run dir to probe"
+fi
+
+# ---------------------------------------------------------------------------
+printf '\n== fork-sandbox.sh: lock held across the run_cleanup -> fetch-back gap ==\n'
+# ---------------------------------------------------------------------------
+# Regression test for the bug where run_cleanup released the lock as its
+# first act, before the branch fetch-back, 0-commit branch removal and
+# summary ran. Those all still need the workspace, so a third process taking
+# the lock in that gap would race a live fetch. An instrumented copy of the
+# launcher inserts a marker file + a short sleep right after the runner's
+# `run_cleanup` call and before the fetch-back (the only bare, unindented
+# call to it in the whole script, so the insertion point is unambiguous),
+# giving this test a window to probe the lock file from outside during
+# exactly that gap.
+
+instr_dir="$(mktmp_dir "$scratch/fs-locklife-instr.XXXXXX")"
+# fork-sandbox.sh sources its siblings (fork-sandbox-lib.sh among them) from
+# its own script_dir, so the instrumented copy needs them alongside it too;
+# symlinking the rest of scripts/ in unmodified is cheaper than copying it.
+for f in "$repo_dir/scripts"/*; do
+    bn="$(basename "$f")"
+    [[ "$bn" == "fork-sandbox.sh" ]] && continue
+    ln -s "$f" "$instr_dir/$bn"
+done
+instrumented="$instr_dir/fork-sandbox.sh"
+sed "/^run_cleanup\$/a touch \"\$run_dir/.probe-before-fetch\"; sleep 2" \
+    "$launcher" > "$instrumented"
+chmod +x "$instrumented"
+if ! grep -q '.probe-before-fetch' "$instrumented"; then
+    no "the lock is still held between run_cleanup and the fetch-back" \
+        "sed insertion point not found; the anchor line may have moved"
+else
+    tmux_socket2="fs-locklife2-$$"
+    export FS_TEST_TMUX_SOCKET="$tmux_socket2"
+    "$real_tmux" -L "$tmux_socket2" new-session -d -s keepalive -- sleep 120
+
+    home2="$(mktmp_dir "$scratch/fs-locklife-home2.XXXXXX")"
+    proj2="$(new_project "$home2")"
+    clone2="$(mktmp_dir "$scratch/fs-locklife-clone2.XXXXXX")"
+    rmdir "$clone2"
+    cfg2="$(mktmp_dir "$scratch/fs-locklife-cfg2.XXXXXX")"
+    handoff_dir2="$(mktmp_dir "$scratch/fs-locklife-ho2.XXXXXX")"
+    handoff2="$handoff_dir2/handoff.md"
+    printf 'do the task\n' > "$handoff2"
+
+    launch_out2="$(HOME="$home2" PATH="$stub_bin:$PATH" FORK_SANDBOX_CONFIG_DIR="$cfg2" \
+        timeout 60 "$instrumented" --harness claude --branch fs-locklife-b2 \
+        --clone-dir "$clone2" "$proj2" "$handoff2" 2>&1)"
+    run_dir2="$(printf '%s\n' "$launch_out2" | sed -n 's/^  run dir:  *//p' | head -1)"
+    lock_file2="$clone2/.git/fork-sandbox-lock"
+
+    if [[ -n "$run_dir2" ]]; then
+        for _ in $(seq 1 100); do
+            [[ -e "$run_dir2/.probe-before-fetch" ]] && break
+            sleep 0.1
+        done
+        if [[ -e "$run_dir2/.probe-before-fetch" ]]; then
+            if (
+                exec {probe_fd2}<>"$lock_file2"
+                if flock -n "$probe_fd2"; then
+                    flock -u "$probe_fd2"
+                    exit 1
+                fi
+                exit 0
+            ); then
+                ok "the lock is still held between run_cleanup and the fetch-back"
+            else
+                no "the lock is still held between run_cleanup and the fetch-back" \
+                    "flock -n succeeded; the lock was released before the fetch-back ran"
+            fi
+        else
+            no "the lock is still held between run_cleanup and the fetch-back" \
+                "instrumented marker never appeared; the run may have failed to start"
+        fi
+
+        for _ in $(seq 1 100); do
+            [[ -s "$run_dir2/exit-code" ]] && break
+            sleep 0.1
+        done
+    else
+        no "the lock is still held between run_cleanup and the fetch-back" \
+            "no run dir to probe"
+    fi
 fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
