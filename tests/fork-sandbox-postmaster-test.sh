@@ -1134,6 +1134,50 @@ check "resume: a pi seat gets no --resume-session" 0 \
     "$(grep -c -- '^--resume-session$' "$STUB_ARGV_LOG")"
 
 # ============================================================
+printf '\n== persistent workspace: --clone-dir path is stable across wakes ==\n'
+# ============================================================
+
+# Every harness (not just claude) gets a --clone-dir binding a persistent
+# per-(thread, agent) workspace into the wake, at
+# workspaces/<thread-id>/<agent>/ under postmaster state. It must be the
+# SAME path on every wake of that seat -- that stability is the whole
+# feature (fork-sandbox.sh reuses the clone and starts the new branch at
+# the seat's own previous tip instead of origin HEAD).
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+
+ws_mid1="$(send_msg '@carol' '@alice' 'workspace topic' 'first message' 8)"
+ws_tid="$(thread_of "$ws_mid1")"
+ws_expected="$PM_STATE_DIR/workspaces/$ws_tid/alice"
+
+: > "$STUB_ARGV_LOG"
+once
+check "workspace: first wake passes --clone-dir at workspaces/<thread>/<agent>" \
+    "$ws_expected" "$(argv_after --clone-dir "$STUB_ARGV_LOG")"
+
+finish_run alice 0
+reply_msg '@carol' "$ws_mid1" 'second message' --to '@alice' >/dev/null
+: > "$STUB_ARGV_LOG"
+once
+check "workspace: second wake passes the IDENTICAL --clone-dir path" \
+    "$ws_expected" "$(argv_after --clone-dir "$STUB_ARGV_LOG")"
+
+# Unlike --session-state, this is not claude-only: bob (the pi seat) must
+# still get --clone-dir even though he gets no --session-state/
+# --resume-session (checked above).
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+ws_pi_mid="$(send_msg '@carol' '@bob' 'workspace pi seat' 'body' 8)"
+ws_pi_tid="$(thread_of "$ws_pi_mid")"
+: > "$STUB_ARGV_LOG"
+once
+check "workspace: a pi seat still gets --clone-dir" \
+    "$PM_STATE_DIR/workspaces/$ws_pi_tid/bob" "$(argv_after --clone-dir "$STUB_ARGV_LOG")"
+
+# ============================================================
 printf '\n== harvest: exit-code alone is not terminal (summary.json still pending) ==\n'
 # ============================================================
 

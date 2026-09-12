@@ -204,6 +204,18 @@
 #                                   with a null/absent session_id, so a
 #                                   broken or missing session can never
 #                                   wedge a seat
+#   workspaces/<thread-id>/<agent>/ the persistent clone for that (thread,
+#                                   agent) seat, bound into every wake of
+#                                   it (every harness, not just claude)
+#                                   with --clone-dir. Created on the
+#                                   seat's first wake and reused by every
+#                                   later one; fork-sandbox.sh fetches the
+#                                   origin and starts each wake's new
+#                                   branch at the seat's own previous
+#                                   branch tip, so work commits forward
+#                                   across wakes instead of restarting at
+#                                   origin HEAD each time. Only `fleet
+#                                   teardown` removes it
 #
 # All state transitions are marker-file creation, never deletion of
 # anything fork-sandbox-mail.sh owns.
@@ -214,19 +226,21 @@
 #     continuity. That prompt stays the correctness guarantee even for
 #     claude -- resume is a continuity and cost optimization, and a wake
 #     whose session is missing or unreadable still does the work.
-#   - A resumed session is the only thing that crosses between wakes. The
-#     sandbox does not: every wake gets a new work dir, so a new clone, a
-#     new operator inbox and a new artifact outbox at fresh absolute paths,
-#     and a new branch (the seq above guarantees the name is new) started at
-#     the clone's own HEAD rather than at the previous wake's branch. A
-#     resumed conversation therefore remembers paths that no longer exist
-#     and commits that are not reachable from the HEAD it is now looking at
-#     -- the earlier wake's branch came back to the origin, so the new clone
-#     has it as a remote-tracking ref, but nothing merges it forward.
-#     fork-sandbox.sh tells a resumed wake this, in a "This session is a
-#     continuation" section it adds to the prompt whenever
-#     --resume-session is given; carrying work forward across wakes is
-#     still the agent's own git work, and nothing here automates it.
+#   - A resumed session and the seat's clone both cross wakes now; the run
+#     dir does not. Every wake still gets a fresh run dir -- fresh log,
+#     handoff, summary.json, operator inbox, artifact outbox, all at new
+#     absolute paths -- but the clone at workspaces/<thread-id>/<agent>/
+#     is the SAME directory every wake of that seat sees, and each new
+#     wake's branch is started at the seat's own previous branch tip
+#     (after fetching the origin), not at origin HEAD. A resumed
+#     conversation's paths and commits are therefore both still there on
+#     the next wake; only run-dir-scoped paths (the previous wake's log,
+#     handoff, inbox, outbox) are gone, as they always were.
+#     fork-sandbox.sh tells a wake which case it is in, in a "This session
+#     is a continuation" section it adds to the prompt whenever
+#     --resume-session is given. Carrying work forward across wakes is
+#     still the agent's own git work (commit it, or it is not there next
+#     wake either); this just gives that work a stable place to land.
 #   - No delivery of mail tooling into the sandbox, and no store access
 #     from inside a run.
 #   - No list-Cc delivery index.
@@ -282,6 +296,7 @@ SEQ="$STATE/seq"
 HANDOFFS="$STATE/handoffs"
 PM_SESSION_STATE="$STATE/state"
 PM_SESSIONS="$STATE/sessions"
+PM_WORKSPACES="$STATE/workspaces"
 
 # The shape fork-sandbox.sh accepts for --resume-session. Applied to what
 # summary.json reported before it is recorded: a malformed id would make
@@ -580,6 +595,12 @@ pm_spawn_wake() {
     if [[ "$harness" == pi && -n "$thinking" ]]; then
         spawn_args+=(--pi-args "--thinking $thinking")
     fi
+
+    # Every harness gets a persistent per-(thread, agent) clone -- unlike
+    # --session-state below, this is not claude-only: the clone and its
+    # branch history are useful continuity on every harness, not just the
+    # ones with a resumable transcript.
+    spawn_args+=(--clone-dir "$PM_WORKSPACES/$tid/$agent")
 
     # An agent woken again and again on one thread should be ONE
     # conversation, not a series of amnesiacs. The transcript store for
