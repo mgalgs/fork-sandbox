@@ -36,6 +36,7 @@ installed and callable under its own name — `fork-sandbox status` and
   registry: personas, harness/model/network overrides, address lists
 - `fork-sandbox postmaster deliver|status|flag|unflag` — the host-side
   router: wakes addressed agents, harvests replies, enforces stop rules
+  (those three together are [agent mail](#a-fleet-that-emails-itself))
 - the lkml-mode review toolchain now lives in its own repo:
   https://github.com/mgalgs/lkml-review
 
@@ -416,6 +417,50 @@ What to expect while it is on:
   context windows, and distrust of a run's own self-report are the default
   discipline, not a flag. (`--long` is still accepted; it changes nothing.)
 
+## A fleet that emails itself
+
+Everything above runs one agent: a handoff goes in, a branch comes back.
+Agent mail is the layer above that — a fleet of agents with standing
+instructions and mailboxes, working asynchronously and talking to each
+other by email.
+
+You mail an agent. It wakes up in a sandbox, reads the thread, does
+something, and replies. Its reply is mail too, so it can wake somebody
+else. The conversation is the program.
+
+```bash
+fork-sandbox fleet check                    # who the agents are
+fork-sandbox postmaster deliver --project ~/src/proj &
+fork-sandbox mail send --from @operator --to @reviewer --cc @crew \
+    --subject "look at the parser rewrite" --body ./ask.md
+```
+
+The shape of it:
+
+- **An agent is a (persona, mailbox) pair** — a markdown file of standing
+  instructions and an `@name`. Nothing runs between wakes.
+- **`To:` wakes an agent; `Cc:` does not.** A Cc'd agent gets the message
+  in its inbox and the full thread whenever it is next addressed, which
+  makes a mostly-watching maintainer seat free.
+- **The thread is the memory.** Every wake carries the whole thread, so
+  session resume (claude seats) is a cost optimization, never a
+  correctness requirement.
+- **Privacy is addressing, not access control.** A private conversation
+  is a thread whose recipients are its participants; a wake's world is
+  the thread it was woken for.
+- **Stop rules from day one** — an `X-Hops` counter, a per-thread spawn
+  budget, and reply-only-when-in-`To` — so a conversation cannot run
+  away. The operator re-arms a stalled thread just by mailing into it.
+- **Real email is the model**, down to `> ` quoting that nests to `> > `.
+  That is also the security boundary: header and separator lines are the
+  only unquoted lines the renderer emits, so no message body can forge a
+  message from someone else.
+
+Seats are per agent, so one fleet can mix a claude reviewer, a sealed pi
+worker and a codex second opinion on the same thread.
+[docs/agent-mail.md](docs/agent-mail.md) has the store format, the
+routing rules, the registry schema and the limits.
+
 ## Scripts
 
 The porcelain, for when there is no agent in the loop. `fork-sandbox` is a
@@ -604,6 +649,9 @@ what is mounted, what is not, and a numbered list of the gaps.
 - [docs/claude-sandboxed.md](docs/claude-sandboxed.md) — the sandbox itself.
 - [docs/presets.md](docs/presets.md) — agents and a pipeline in a named
   file (`--preset deep`) instead of a fistful of flags.
+- [docs/agent-mail.md](docs/agent-mail.md) — a fleet of agents that work
+  asynchronously and talk to each other by email: the store, the
+  registry, the router, and the stop rules.
 - [docs/sandbox-services.md](docs/sandbox-services.md) — the committed
   contract a repo uses to declare its service stack.
 - [docs/permissions.md](docs/permissions.md) — running these without a prompt.
