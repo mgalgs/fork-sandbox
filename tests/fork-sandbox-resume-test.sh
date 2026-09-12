@@ -481,6 +481,121 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+printf '\n== a resumed wake in a reused --clone-dir workspace is told differently ==\n'
+# ---------------------------------------------------------------------------
+
+# The "told what did not carry over" section above only proves the text for
+# clone_reused=false (no --clone-dir was ever passed in this file until now).
+# fork-sandbox.sh's continuation-prompt generator has two more branches,
+# gated on clone_reused as well as resume_session: when --clone-dir is reused,
+# the clone/branch are NOT all new, so the "not reachable from HEAD here,
+# check git branch -r" text above would be actively wrong -- the generator
+# says something different instead. Exercise those branches for real, the
+# same way tests/fork-sandbox-clone-dir-test.sh drives a real two-wake
+# --clone-dir reuse (that file already covers the clone_reused-but-no-
+# resume-session branch; this covers the two where resume_session is set
+# too, which only this suite's flags can reach).
+
+# Mirrors run_and_capture_argv above, except the caller passes its own
+# project (so --clone-dir reuse is against a fixed origin_repo across wakes)
+# and its own extra flags.
+run_and_capture_argv_at() {
+    local home="$1" proj="$2"; shift 2
+    local handoff_dir handoff argv_file cfg out rc rd
+    handoff_dir="$(mktemp -d "$scratch/fs-resume-ho.XXXXXX")"
+    handoff="$handoff_dir/handoff.md"
+    printf 'do the task\n' > "$handoff"
+    argv_file="$(mktemp "$scratch/fs-resume-argv.XXXXXX")"
+    cfg="$(mktemp -d)"
+    out="$(HOME="$home" PATH="$stub_bin:$PATH" FORK_SANDBOX_CONFIG_DIR="$cfg" \
+        FAKE_ARGV_FILE="$argv_file" \
+        timeout 120 "$launcher" --foreground --harness claude "$@" \
+        "$proj" "$handoff" 2>&1)"
+    rc=$?
+    rd=""
+    if (( rc != 0 )); then
+        printf 'run failed (rc=%s):\n%s\n' "$rc" "$out" >&2
+    else
+        rd="$(printf '%s\n' "$out" | sed -n 's/^  run dir:  *//p' | head -1)"
+    fi
+    printf '%s\n%s\n%s\n%s\n' "$argv_file" "$handoff_dir" "$cfg" "$rd"
+    (( rc == 0 ))
+}
+
+reuse_home="$(mktmp_dir "$scratch/fs-resume-home.XXXXXX")"
+reuse_proj="$(new_project "$reuse_home")"
+reuse_clone="$scratch/fs-resume-ws.$$"
+tmpdirs+=("$reuse_clone")
+reuse_state="$(mktmp_dir "$scratch/fs-resume-state.XXXXXX")"
+reuse_sid=89abcdef-0123-4567-89ab-cdef01234567
+
+# Wake 1: just establishes the workspace (clone_reused=false on this call).
+reuse_w1_result="$(run_and_capture_argv_at "$reuse_home" "$reuse_proj" \
+    --branch fs-resume-reuse-b1 --clone-dir "$reuse_clone")"
+reuse_w1_rc=$?
+register_run_paths "$reuse_w1_result"
+if (( reuse_w1_rc != 0 )); then
+    no "clone-dir reuse fixture: wake 1 creates the workspace" "$reuse_w1_result"
+fi
+
+# Wake 2: same --clone-dir plus --resume-session, no --checkout -- resume_session
+# set AND clone_reused true.
+reuse_w2_result="$(run_and_capture_argv_at "$reuse_home" "$reuse_proj" \
+    --branch fs-resume-reuse-b2 --clone-dir "$reuse_clone" \
+    --session-state "$reuse_state" --resume-session "$reuse_sid")"
+reuse_w2_rc=$?
+register_run_paths "$reuse_w2_result"
+reuse_w2_run_dir="$REGISTERED_RUN_DIR"
+
+if (( reuse_w2_rc != 0 )) || [[ -z "$reuse_w2_run_dir" || ! -f "$reuse_w2_run_dir/handoff.md" ]]; then
+    no "resumed + reused workspace: prompt says the clone did not move" \
+        "run failed or missing handoff.md: $reuse_w2_result"
+else
+    if grep -qF -- "The clone is the SAME directory as the earlier run's: \`$reuse_clone\`" \
+        "$reuse_w2_run_dir/handoff.md"; then
+        ok "resumed + reused workspace: prompt says the clone did not move"
+    else
+        no "resumed + reused workspace: prompt says the clone did not move" \
+            "$(cat "$reuse_w2_run_dir/handoff.md")"
+    fi
+    if grep -qF -- "already on this branch's history" "$reuse_w2_run_dir/handoff.md" \
+        && ! grep -qF -- 'not reachable from HEAD here' "$reuse_w2_run_dir/handoff.md" \
+        && ! grep -qF -- 'git branch -r' "$reuse_w2_run_dir/handoff.md"; then
+        ok "resumed + reused workspace: says commits are already on this branch, not the fresh-clone unreachable-ref text"
+    else
+        no "resumed + reused workspace: says commits are already on this branch, not the fresh-clone unreachable-ref text" \
+            "$(cat "$reuse_w2_run_dir/handoff.md")"
+    fi
+fi
+
+# Wake 3: same --clone-dir, --resume-session AND --checkout -- resume_session
+# set, clone_reused true, checkout_ref pins the start point instead of the
+# earlier wake's branch tip, so the "already on this branch's history" claim
+# from wake 2 no longer holds and the generator says so instead.
+reuse_w3_result="$(run_and_capture_argv_at "$reuse_home" "$reuse_proj" \
+    --branch fs-resume-reuse-b3 --clone-dir "$reuse_clone" --checkout HEAD \
+    --session-state "$reuse_state" --resume-session "$reuse_sid")"
+reuse_w3_rc=$?
+register_run_paths "$reuse_w3_result"
+reuse_w3_run_dir="$REGISTERED_RUN_DIR"
+
+if (( reuse_w3_rc != 0 )) || [[ -z "$reuse_w3_run_dir" || ! -f "$reuse_w3_run_dir/handoff.md" ]]; then
+    no "resumed + reused workspace with --checkout: prompt warns commits may not be reachable" \
+        "run failed or missing handoff.md: $reuse_w3_result"
+else
+    if grep -qF -- "\`--checkout HEAD\`, which pins its start point at that ref" \
+        "$reuse_w3_run_dir/handoff.md" \
+        && grep -qF -- 'may not be reachable from this branch'"'"'s history at all' \
+            "$reuse_w3_run_dir/handoff.md" \
+        && ! grep -qF -- "already on this branch's history" "$reuse_w3_run_dir/handoff.md"; then
+        ok "resumed + reused workspace with --checkout: prompt warns commits may not be reachable"
+    else
+        no "resumed + reused workspace with --checkout: prompt warns commits may not be reachable" \
+            "$(cat "$reuse_w3_run_dir/handoff.md")"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 printf '\n== the store belongs to the coding legs alone ==\n'
 # ---------------------------------------------------------------------------
 
