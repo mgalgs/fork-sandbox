@@ -273,16 +273,46 @@ else
     no "first wake: branch starts at the origin project's HEAD" \
         "clone HEAD=$first_head project HEAD=$proj_head"
 fi
+if grep -qxF 'claude-session/' "$flow_clone/.git/info/exclude" 2>/dev/null; then
+    ok "first wake: claude-session/ is excluded via .git/info/exclude"
+else
+    no "first wake: claude-session/ is excluded via .git/info/exclude" \
+        "$(cat "$flow_clone/.git/info/exclude" 2>/dev/null)"
+fi
 
 # --- second wake: reuse, new branch built on the first wake's commit ------
 git -C "$flow_clone" -c user.email=t@fork-sandbox.invalid -c user.name=Tester \
     commit -q --allow-empty -m 'first wake work' >/dev/null 2>&1
 seat_commit="$(git -C "$flow_clone" rev-parse HEAD)"
 
+# Stand-ins for what a wake actually leaves behind: pi's fixed-path session
+# dirs under .git, and claude-sandboxed's transcript rescue in the working
+# tree. Nothing in the stub harness writes these, so seed them here and
+# assert the next wake clears them rather than folding them into its own
+# accounting or carrying them forward forever.
+mkdir -p "$flow_clone/.git/pi-session" "$flow_clone/.git/pi-session-review-1" \
+    "$flow_clone/claude-session"
+printf '{"stopReason":"prior wake leftover"}\n' \
+    > "$flow_clone/.git/pi-session/prior-wake.jsonl"
+printf 'prior wake transcript\n' > "$flow_clone/claude-session/prior-wake.jsonl"
+
 second_result="$(run_and_capture "$flow_home" "$flow_proj" \
     --branch fs-clonedir-b2 --clone-dir "$flow_clone")"
 second_rc=$?
 register_paths "$second_result"
+
+if [[ ! -e "$flow_clone/.git/pi-session" && ! -e "$flow_clone/.git/pi-session-review-1" ]]; then
+    ok "second wake: a prior wake's pi-session dirs are cleared, not folded in"
+else
+    no "second wake: a prior wake's pi-session dirs are cleared, not folded in" \
+        "$(find "$flow_clone/.git" -maxdepth 1 -name 'pi-session*')"
+fi
+if [[ ! -e "$flow_clone/claude-session" ]]; then
+    ok "second wake: a prior wake's claude-session/ is cleared, not left to grow"
+else
+    no "second wake: a prior wake's claude-session/ is cleared, not left to grow" \
+        "$(ls -la "$flow_clone/claude-session")"
+fi
 
 if (( second_rc == 0 )); then
     ok "second wake: launch succeeds reusing --clone-dir"

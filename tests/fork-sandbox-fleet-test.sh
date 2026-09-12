@@ -499,7 +499,7 @@ contains "teardown: names the workspace lock as the reason" "$td_out8" "locked"
 path_state "teardown: locked-workspace seat untouched" present "$PM_STATE/workspaces/th6/eve"
 
 # Once the lock is released, the same seat tears down normally.
-td_out9="$("$fleet" teardown eve --thread th6)"; td_rc9=$?
+"$fleet" teardown eve --thread th6 >/dev/null; td_rc9=$?
 check "teardown: the same seat tears down once the lock clears" "0" "$td_rc9"
 path_state "teardown: eve workspace gone once unlocked" gone "$PM_STATE/workspaces/th6/eve"
 
@@ -530,7 +530,7 @@ contains "teardown: names the postmaster lock as the reason" "$td_out10" "lock"
 path_state "teardown: seat untouched while the postmaster lock is held" \
     present "$PM_STATE/workspaces/th7/frank"
 
-td_out11="$("$fleet" teardown frank --thread th7)"; td_rc11=$?
+"$fleet" teardown frank --thread th7 >/dev/null; td_rc11=$?
 check "teardown: the same seat tears down once the postmaster lock clears" "0" "$td_rc11"
 path_state "teardown: frank workspace gone once the postmaster lock clears" \
     gone "$PM_STATE/workspaces/th7/frank"

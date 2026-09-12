@@ -245,6 +245,45 @@ err="$(fs_node_provision "$origin" "$clone" 2>&1)"
 lacks "host mode does not scan for native modules" "compiled native module" "$err"
 contains "host mode still resolves the .nvmrc" "not installed" "$err"
 
+# A reused --clone-dir workspace already holds a previous wake's
+# node_modules. `cp -a` into an existing directory copies inside it rather
+# than replacing it, so without the reused flag the second wake would leave
+# a nested clone-image/node_modules/node_modules/left-pad.js behind and
+# never pick up origin's current tree.
+FS_BACKEND_TOOLCHAIN=image
+clone="$scratch/clone-reused"
+mkdir -p "$clone/node_modules"
+printf 'module.exports = 0\n' > "$clone/node_modules/stale-only.js"
+fs_node_provision "$origin" "$clone" true >/dev/null 2>&1
+if [[ -f "$clone/node_modules/left-pad.js" ]]; then
+    ok "reused clone gets origin's current node_modules"
+else
+    no "reused clone gets origin's current node_modules"
+fi
+if [[ -d "$clone/node_modules/node_modules" ]]; then
+    no "reused clone does not nest the previous wake's tree"
+else
+    ok "reused clone does not nest the previous wake's tree"
+fi
+if [[ -e "$clone/node_modules/stale-only.js" ]]; then
+    no "reused clone drops the previous wake's stale-only file"
+else
+    ok "reused clone drops the previous wake's stale-only file"
+fi
+
+# origin no longer has node_modules at all -- a reused clone must not keep
+# serving one from a wake before that, which a fresh clone would never see.
+rm -rf "$origin/node_modules"
+clone="$scratch/clone-reused-gone"
+mkdir -p "$clone/node_modules"
+printf 'module.exports = 0\n' > "$clone/node_modules/stale-only.js"
+fs_node_provision "$origin" "$clone" true >/dev/null 2>&1
+if [[ -e "$clone/node_modules" ]]; then
+    no "reused clone drops node_modules origin no longer has"
+else
+    ok "reused clone drops node_modules origin no longer has"
+fi
+
 echo ""
 echo "== fs_cache_binds =="
 

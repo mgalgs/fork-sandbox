@@ -151,15 +151,14 @@ if [[ -n "$run_dir" ]]; then
         sleep 0.1
     done
 
-    (
+    if (
         exec {probe_fd}<>"$lock_file"
         if flock -n "$probe_fd"; then
             flock -u "$probe_fd"
             exit 1
         fi
         exit 0
-    )
-    if (( $? == 0 )); then
+    ); then
         ok "the workspace is locked while the run is in flight, after the launcher has already exited"
     else
         no "the workspace is locked while the run is in flight, after the launcher has already exited" \
@@ -187,11 +186,35 @@ if [[ -n "$run_dir" ]]; then
             "expected the keepalive session to still be there"
     fi
 
-    (
-        exec {probe_fd}<>"$lock_file"
-        flock -n "$probe_fd"
-    )
-    if (( $? == 0 )); then
+    # exit-code is published as soon as the exit code itself is known --
+    # deliberately BEFORE the branch fetch-back and the summary, which still
+    # need the lock (see run_cleanup's own comment on why it no longer
+    # releases it). So this is not yet the run's true end; wait for
+    # summary.json, written right before the lock actually is released, so
+    # this probe does not race that tail of the run and read it as wedged.
+    for _ in $(seq 1 100); do
+        [[ -s "$run_dir/summary.json" ]] && break
+        sleep 0.1
+    done
+
+    # summary.json existing means the lock's release is imminent, not that it
+    # has already happened -- the runner still has the run-log append and its
+    # own explicit release call left to execute. Retry briefly rather than
+    # one-shot: a wedged lock stays held no matter how long this waits, so
+    # retrying cannot hide a real bug, only a real, much longer, hang would
+    # exhaust it.
+    lock_free=0
+    for _ in $(seq 1 50); do
+        if (
+            exec {probe_fd}<>"$lock_file"
+            flock -n "$probe_fd"
+        ); then
+            lock_free=1
+            break
+        fi
+        sleep 0.1
+    done
+    if (( lock_free )); then
         ok "the lock is free again once the run ends, even though the tmux server is still up"
     else
         no "the lock is free again once the run ends, even though the tmux server is still up" \

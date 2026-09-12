@@ -4076,6 +4076,28 @@ else
     # can name a review range base older than the checkout, deliberately
     # different from the commit the clone actually started from.
     [[ "$review_only" == true ]] || base_sha="$reuse_start_sha"
+
+    # pi's session dir is a fixed path under this workspace's .git (see
+    # out_pi_session_dir in fs_build_sandbox_cmd, below) so that it survives
+    # the sandbox's tmpfs $HOME -- but a fixed path is also the SAME path
+    # every wake of this seat writes to. Left alone, wake 2 would write
+    # beside wake 1's session files rather than replace them, and the cost
+    # walk and last-stopReason check near the end of the runner sum and read
+    # every file under a leg's directory: a fresh clone starts with none, so
+    # a reused one is put at that same parity here, before anything below
+    # can build a pi command that points at it.
+    rm -rf "$clone_dir"/.git/pi-session*
+
+    # claude-sandboxed rescues its transcript to claude-session/ in the work
+    # dir -- the clone itself, not under .git -- on every leg that runs
+    # without --session-state (every review, fix and maintainer leg; see
+    # fs_build_sandbox_cmd). fs_make_clone already keeps it out of what a
+    # leg's `git add -A` can commit, via .git/info/exclude, but nothing
+    # removes the files themselves: left alone, a persistent seat's
+    # workspace would keep every leg's transcript from every past wake
+    # forever. A fresh clone starts with none, so a reused one is put at
+    # that same parity here too.
+    rm -rf "$clone_dir/claude-session"
 fi
 # Belt and braces on top of the postmaster's routing rule 4 (which already
 # serializes wakes for one seat by refusing a second spawn while a run is
@@ -4107,7 +4129,7 @@ fs_collect_alternates "$clone_dir"
 
 # Node toolchain and dependencies, for a repo that has them (fs_node_provision
 # in the lib explains both halves).
-fs_node_provision "$origin_repo" "$clone_dir"
+fs_node_provision "$origin_repo" "$clone_dir" "$clone_reused"
 
 # Per-run services and provision-ro binds, for a repo that opts in with
 # .agents/sandbox-services/ (or the legacy .claude/sandbox-services/). Both are
@@ -5560,6 +5582,23 @@ if [[ -n "${clone_lock_path:-}" ]]; then
     fs_lock_clone_dir "$clone_dir"
 fi
 
+# `exec {clone_lock_fd}<>...` above has no close-on-exec, so every harness
+# invocation below would otherwise hand its whole process tree an open,
+# locked fd on this workspace's lock file -- a claude-sandboxed/bwrap
+# descendant that outlives this runner (a wedged sandbox, an orphaned
+# `setsid` child) then keeps the flock held forever, which is exactly the
+# permanently wedged seat `fleet teardown` cannot reclaim (see
+# fs_lock_clone_dir's comment). Every sandbox invocation below runs through
+# this wrapper instead of calling its argv directly. A subshell, not a
+# close-then-reopen around the call: closing happens only in the forked copy
+# that is about to exec the harness, so this runner's own fd is untouched
+# afterwards. Harmless when clone_lock_fd is empty (no --clone-dir): the
+# close then targets an unset fd, errors internally and is swallowed, and
+# "$@" still runs.
+fs_run_lock_closed() {
+    ( { exec {clone_lock_fd}>&-; } 2>/dev/null; "$@" )
+}
+
 # The two coding-leg argvs. The launcher emits them only on a
 # --session-state run, where the coding legs differ from every other leg by
 # the transcript-store bind; with no such flag there is nothing to differ by
@@ -5672,6 +5711,14 @@ printf '\nHeadless. Nothing here needs a keypress; the session exits on its own.
 # script does. Up to three legs (implement, review, maintainer) each
 # resolved their own codex harness, so codex_auth_dirs holds every such
 # directory the launcher made.
+# The lock is released separately, by release_clone_lock below, not here:
+# this function runs as soon as the harness session ends, but the workspace
+# is still in use well past that point -- the branch fetch-back, the 0-commit
+# branch removal, and the summary all still read it, and every one of those
+# needs the lock held. Releasing it here would open the workspace to a
+# concurrent run (or `fleet teardown`) while this run's most consequential
+# work was still ahead of it.
+#
 # Cleanup that must run however this session ends — a normal exit, an error, or
 # a kill. It removes every codex credential directory and tears the per-run
 # services down.
@@ -5680,14 +5727,6 @@ printf '\nHeadless. Nothing here needs a keypress; the session exits on its own.
 run_cleanup() {
     [[ -n "${_cleanup_done:-}" ]] && return 0
     _cleanup_done=1
-    if [[ -n "${clone_lock_fd:-}" ]]; then
-        flock -u "$clone_lock_fd" 2>/dev/null || true
-        # Braces scope the redirect to just this close: a bare
-        # `exec {fd}>&- 2>/dev/null` has no command for exec to run, so its
-        # `2>/dev/null` would apply to the whole rest of this script instead
-        # of just this one open, silently swallowing every later stderr.
-        { exec {clone_lock_fd}>&-; } 2>/dev/null || true
-    fi
     if [[ "${#codex_auth_dirs[@]}" -gt 0 ]]; then
         for codex_auth_dir in "${codex_auth_dirs[@]}"; do
             rm -rf "$codex_auth_dir"
@@ -5749,7 +5788,25 @@ run_cleanup() {
         fi
     fi
 }
-trap run_cleanup EXIT
+# The lock's own release, kept separate from run_cleanup so that function's
+# early, inline call (once the harness session ends) cannot let it go before
+# the fetch-back, branch removal and summary near the end of this script are
+# done with the workspace. Guarded the same way, so calling it again from the
+# EXIT trap after this script's own explicit call, near the very end, is a
+# no-op rather than a second close of an already-closed fd.
+release_clone_lock() {
+    [[ -n "${_lock_released:-}" ]] && return 0
+    _lock_released=1
+    if [[ -n "${clone_lock_fd:-}" ]]; then
+        flock -u "$clone_lock_fd" 2>/dev/null || true
+        # Braces scope the redirect to just this close: a bare
+        # `exec {fd}>&- 2>/dev/null` has no command for exec to run, so its
+        # `2>/dev/null` would apply to the whole rest of this script instead
+        # of just this one open, silently swallowing every later stderr.
+        { exec {clone_lock_fd}>&-; } 2>/dev/null || true
+    fi
+}
+trap 'run_cleanup; release_clone_lock' EXIT
 if [[ "$harness" == "codex" && -n "$harness_env_file" ]]; then
     install -m 600 /dev/null "$harness_env_file"
     {
@@ -5839,12 +5896,12 @@ fi
 rc=0
 if [[ "$mode" != "review-only" ]]; then
 if [[ -n "$formatter" ]]; then
-    "${impl_sandbox_cmd[@]}" < "$handoff" \
+    fs_run_lock_closed "${impl_sandbox_cmd[@]}" < "$handoff" \
         2> >(tee -a "$sandbox_log" >&2) \
         | tee -a "$events" \
         | "$formatter"
 else
-    "${impl_sandbox_cmd[@]}" < "$handoff" \
+    fs_run_lock_closed "${impl_sandbox_cmd[@]}" < "$handoff" \
         2> >(tee -a "$sandbox_log" >&2) \
         | tee -a "$events"
 fi
@@ -6237,12 +6294,12 @@ if [[ "$refresh_enabled" == "1" ]]; then
             # the store and never resumes out of it -- see where the array
             # is built, in the launcher above.
             if [[ -n "$formatter" ]]; then
-                "${cont_sandbox_cmd[@]}" < "$cont_prompt" \
+                fs_run_lock_closed "${cont_sandbox_cmd[@]}" < "$cont_prompt" \
                     2> >(tee -a "$sandbox_log" >&2) \
                     | tee -a "$events" -a "$cont_events" \
                     | "$formatter"
             else
-                "${cont_sandbox_cmd[@]}" < "$cont_prompt" \
+                fs_run_lock_closed "${cont_sandbox_cmd[@]}" < "$cont_prompt" \
                     2> >(tee -a "$sandbox_log" >&2) \
                     | tee -a "$events" -a "$cont_events"
             fi
@@ -6570,12 +6627,12 @@ run_leg() {
     # leg's redirect for why (MAX_ARG_STRLEN), and note that the fix prompt
     # carries verdict text of no fixed size.
     if [[ -n "$leg_formatter" ]]; then
-        "${cmd[@]}" < "$prompt" \
+        fs_run_lock_closed "${cmd[@]}" < "$prompt" \
             2> >(tee -a "$sandbox_log" >&2) \
             | tee -a "$leg_events" \
             | "$leg_formatter"
     else
-        "${cmd[@]}" < "$prompt" \
+        fs_run_lock_closed "${cmd[@]}" < "$prompt" \
             2> >(tee -a "$sandbox_log" >&2) \
             | tee -a "$leg_events"
     fi
@@ -7823,6 +7880,13 @@ if [[ -n "$run_log_bin" && -x "$run_log_bin" ]]; then
         || printf 'fork-sandbox: run-log append failed; see %s\n' \
             "$sandbox_log" >&2
 fi
+
+# Everything above that touches this workspace's git state is done, so the
+# lock's job is done too. Released explicitly here rather than left to the
+# EXIT trap: the --keep-session path below ends in exec, which replaces this
+# process without running the trap, so a run started with that flag would
+# hold the lock for as long as the interactive shell stays open otherwise.
+release_clone_lock
 
 cat "$run_dir/summary.txt"
 

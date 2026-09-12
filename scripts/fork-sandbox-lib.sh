@@ -421,6 +421,18 @@ fs_make_clone() {
         [[ -n "$value" ]] || continue
         (cd "$dest" && git config "$key" "$value") || true
     done
+    # claude-sandboxed rescues its transcript to claude-session/ in the work
+    # dir on exit (see its own cleanup trap) -- in the working tree, not
+    # under .git, because it is written from outside this repo's knowledge
+    # entirely. A leg that runs `git add -A` would otherwise commit another
+    # leg's full transcript onto the branch that gets fetched into the
+    # user's own repo. .git/info/exclude is local to this clone and never
+    # committed itself, unlike a tracked .gitignore would be, and it is
+    # written once here rather than by claude-sandboxed itself so it is in
+    # place before the first sandbox ever runs.
+    if ! grep -qxF 'claude-session/' "$dest/.git/info/exclude" 2>/dev/null; then
+        printf 'claude-session/\n' >> "$dest/.git/info/exclude"
+    fi
     return 0
 }
 
@@ -439,11 +451,19 @@ fs_make_clone() {
 #     access to the host's own files.
 # Both halves are no-ops in a repo without them. Fills FS_NODE_FLAGS; the
 # caller formats it for its own use, like FS_ALTERNATES.
+#
+# A fourth argument, "true" on a reused --clone-dir workspace, says the
+# destination may already hold a PREVIOUS wake's node_modules. `cp -a` into
+# an existing directory copies the source inside it rather than replacing
+# it, so without this a reused clone keeps wake 1's tree forever, nested
+# one level deeper on every later wake, however much origin's own
+# node_modules moved on in between. A fresh clone never has one at this
+# point, so the reused tree is removed first to put both paths at parity.
 # shellcheck disable=SC2034  # written here, read by the sourcing scripts
 FS_NODE_FLAGS=()
 
 fs_node_provision() {
-    local origin_repo="$1" clone_dir="$2" ver dir native count nm
+    local origin_repo="$1" clone_dir="$2" reused="${3:-false}" ver dir native count nm
     local -a shown
     FS_NODE_FLAGS=()
     if [[ -f "$origin_repo/.nvmrc" ]]; then
@@ -465,6 +485,9 @@ fs_node_provision() {
             echo "Warning: .nvmrc wants node v$ver, which is not installed" >&2
             echo "under ~/.nvm. The sandbox falls back to system node." >&2
         fi
+    fi
+    if [[ "$reused" == true && -e "$clone_dir/node_modules" ]]; then
+        rm -rf "$clone_dir/node_modules"
     fi
     if [[ -d "$origin_repo/node_modules" ]]; then
         echo "Copying node_modules into the clone..." >&2
