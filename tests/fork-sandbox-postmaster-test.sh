@@ -260,6 +260,7 @@ for a in alice bob carol; do
     run_dir="$(sed -n 's/^RUN_DIR=//p' "$run_env")"
     mkdir -p -- "$run_dir/outbox"
     printf '0\n' > "$run_dir/exit-code"
+    printf '{}\n' > "$run_dir/summary.json"
 done
 once
 
@@ -430,6 +431,7 @@ contains "pending: message id recorded as pending on the live run" \
 
 mkdir -p -- "$run_dir/outbox"
 printf '0\n' > "$run_dir/exit-code"
+printf '{}\n' > "$run_dir/summary.json"
 printf '\nAcknowledged, thanks.\n' > "$run_dir/outbox/mail-1.md"
 : > "$STUB_ARGV_LOG"
 once
@@ -462,6 +464,7 @@ printf 'To: @carol\nSubject: Fresh topic\nReply-To-Id: new\n\nStarting something
 # 4. Malformed: an unrecognized header line.
 printf 'Foo: bar\n\nThis should never post.\n' > "$run_dir/outbox/mail-4.md"
 printf '0\n' > "$run_dir/exit-code"
+printf '{}\n' > "$run_dir/summary.json"
 once
 
 # mail-1: ordinary reply-all, hops decremented by the harvester's --hops
@@ -646,6 +649,7 @@ alice_env="$(env_file_for_agent alice)"
 alice_run_dir="$(sed -n 's/^RUN_DIR=//p' "$alice_env")"
 mkdir -p -- "$alice_run_dir/outbox"
 printf '0\n' > "$alice_run_dir/exit-code"
+printf '{}\n' > "$alice_run_dir/summary.json"
 once
 
 # A second operator message on the same thread resets the (rule 1) budget
@@ -684,6 +688,7 @@ run_env="$(env_file_for_agent bob)"
 run_dir="$(sed -n 's/^RUN_DIR=//p' "$run_env")"
 mkdir -p -- "$run_dir/outbox"
 printf '1\n' > "$run_dir/exit-code"
+printf '{}\n' > "$run_dir/summary.json"
 once
 contains "harvest: non-zero exit code flags the thread" \
     "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid" 2>/dev/null || true)" "exited 1"
@@ -948,18 +953,23 @@ live_env_for_agent() {
     return 1
 }
 
-# Ends the live run for $1: exit code $2, and a summary.json naming
-# session $3 when one is given (the shape fork-sandbox.sh writes on a
-# --session-state run).
+# Ends the live run for $1: exit code $2, then a summary.json naming
+# session $3 (or carrying a null session_id when $3 is omitted) -- exit-code
+# before summary.json, matching fork-sandbox.sh's own write order (exit-code
+# right after the coding leg, summary.json only after run_cleanup and the
+# branch fetch-back).
 finish_run() {
     local agent="$1" code="$2" sid="${3:-}" env_f run_dir
     env_f="$(live_env_for_agent "$agent")"
     run_dir="$(sed -n 's/^RUN_DIR=//p' "$env_f")"
     mkdir -p -- "$run_dir/outbox"
-    [[ -n "$sid" ]] \
-        && printf '{"session_id":"%s","session_state":"x"}\n' "$sid" \
-            > "$run_dir/summary.json"
     printf '%s\n' "$code" > "$run_dir/exit-code"
+    if [[ -n "$sid" ]]; then
+        printf '{"session_id":"%s","session_state":"x"}\n' "$sid" \
+            > "$run_dir/summary.json"
+    else
+        printf '{"session_id":null,"session_state":"x"}\n' > "$run_dir/summary.json"
+    fi
 }
 
 new_scratch_root FORK_SANDBOX_MAIL_ROOT
@@ -1046,6 +1056,60 @@ check "resume: a pi seat gets no --session-state" 0 \
     "$(grep -c -- '^--session-state$' "$STUB_ARGV_LOG")"
 check "resume: a pi seat gets no --resume-session" 0 \
     "$(grep -c -- '^--resume-session$' "$STUB_ARGV_LOG")"
+
+# ============================================================
+printf '\n== harvest: exit-code alone is not terminal (summary.json still pending) ==\n'
+# ============================================================
+
+# fork-sandbox.sh writes exit-code right after the coding leg but
+# summary.json only after run_cleanup and the branch fetch-back -- a run
+# sitting in that window must read as "not done yet", the same as no
+# exit-code at all, not as a crash and not as a reason to harvest early.
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+mid1="$(send_msg '@carol' '@alice' 'exit-code without summary' 'body' 8)"
+tid="$(thread_of "$mid1")"
+: > "$STUB_ARGV_LOG"
+once
+run_env="$(env_file_for_agent alice)"
+run_dir="$(sed -n 's/^RUN_DIR=//p' "$run_env")"
+printf '%s\n' "$$" > "$run_dir/pid"
+printf '0\n' > "$run_dir/exit-code"
+mid2="$(reply_msg '@carol' "$mid1" 'second message while still finishing' --to '@alice')"
+: > "$STUB_ARGV_LOG"
+once
+check "exit-code alone: not flagged" 0 \
+    "$( [[ -e "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid" ]] && echo 1 || echo 0 )"
+check "exit-code alone: not harvested (still counted live)" "0" \
+    "$(find "$FORK_SANDBOX_MAIL_ROOT/.postmaster/harvested" -type f | wc -l)"
+check "exit-code alone: no follow-up wake spawned (still live)" "0" \
+    "$(grep -c -- '^----CALL----$' "$STUB_ARGV_LOG")"
+contains "exit-code alone: second message queued as pending, not answered" \
+    "$(cat "$run_env")" "PENDING_MSGS=$mid2"
+
+# ============================================================
+printf '\n== harvest: a clean finish with a null session_id clears a prior record ==\n'
+# ============================================================
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+mid1="$(send_msg '@carol' '@alice' 'null session clears' 'first' 8)"
+tid="$(thread_of "$mid1")"
+sessions_file="$FORK_SANDBOX_MAIL_ROOT/.postmaster/sessions/$tid/alice"
+: > "$STUB_ARGV_LOG"
+once
+finish_run alice 0 'cafefeed-0000-1111-2222-333344445555'
+once
+check "null session clears: a valid session id is recorded first" 1 \
+    "$( [[ -e "$sessions_file" ]] && echo 1 || echo 0 )"
+
+reply_msg '@carol' "$mid1" 'second message' --to '@alice' >/dev/null
+once
+finish_run alice 0
+once
+check "null session clears: a clean finish with a null session_id clears the prior record" 0 \
+    "$( [[ -e "$sessions_file" ]] && echo 1 || echo 0 )"
 
 # ============================================================
 printf '\n== --help and dispatcher wiring ==\n'

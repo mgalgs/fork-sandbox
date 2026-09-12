@@ -119,9 +119,11 @@
 #   <blank line>
 #   body...
 #
-# Once a run reaches terminal state -- its run dir has an exit-code file,
-# or its pid has gone dead without one ever landing (see pm_wake_is_dead)
-# -- the harvester posts each mail-*.md via fork-sandbox-mail.sh as
+# Once a run reaches terminal state -- its run dir has a summary.json
+# file (fork-sandbox.sh's last artifact, written after run_cleanup and the
+# branch fetch-back), or its pid has gone dead without one ever landing
+# (see pm_wake_is_dead) -- the harvester posts each mail-*.md via
+# fork-sandbox-mail.sh as
 # --from @<agent>, passing --hops explicitly as (trigger's X-Hops - 1) on
 # BOTH the ordinary reply path and the new-thread path -- `mail.sh reply`
 # takes a --hops override for exactly this (round 3 is this script, per
@@ -190,8 +192,10 @@
 #                                   summary.json at harvest. Present ->
 #                                   the next wake resumes it; absent ->
 #                                   the next wake is fresh. Cleared when a
-#                                   wake fails outright, so a broken
-#                                   session can never wedge a seat
+#                                   wake fails outright, or ends cleanly
+#                                   with a null/absent session_id, so a
+#                                   broken or missing session can never
+#                                   wedge a seat
 #
 # All state transitions are marker-file creation, never deletion of
 # anything fork-sandbox-mail.sh owns.
@@ -220,7 +224,7 @@
 #   - No list-Cc delivery index.
 #   - No repair of a routed-but-never-spawned wake after a crash.
 #   - No renderer, no SMTP.
-#   - A spawned wake whose process died without ever writing exit-code --
+#   - A spawned wake whose process died without ever writing summary.json --
 #     tmux session killed, host rebooted mid-run -- is detected at harvest
 #     via its run dir's pid file (see pm_wake_is_dead): once that pid is
 #     dead (or its pid file predates the current boot, per /proc/stat's
@@ -867,11 +871,17 @@ pm_harvest_run() {
         : > "$HARVESTED/$rid"
         return 0
     fi
-    if [[ ! -f "$run_dir/exit-code" ]]; then
+    if [[ ! -f "$run_dir/summary.json" ]]; then
+        # summary.json is fork-sandbox.sh's last artifact -- written after
+        # run_cleanup and the branch fetch-back, well after exit-code (and,
+        # for a --review-loop run, after exit-code is even published). A
+        # run can sit with exit-code present and summary.json still absent
+        # while it finishes archiving and fetching back; that window is
+        # "not done yet", exactly like no exit-code at all, not a crash.
         if ! pm_wake_is_dead "$run_dir" "$f"; then
             return 0
         fi
-        # Same crash shape as a non-zero exit code below -- no exit-code
+        # Same crash shape as a non-zero exit code below -- no summary.json
         # ever landed, but the outbox is a host directory bind-mounted rw
         # into the sandbox, so a reply the agent finished composing before
         # the runner died is already on disk. Flag the thread, forget the
@@ -896,16 +906,19 @@ pm_harvest_run() {
             pm_session_clear "$tid" "$agent"
         else
             # Which session the next wake should resume. Absent (no
-            # --session-state on this seat, or no jq on the host), null or
-            # malformed leaves whatever was recorded before standing: a wake
-            # that ended without writing a transcript has not invalidated the
-            # one the store already holds, and the worst case is a fresh
-            # wake, which always works.
+            # --session-state on this seat, or no jq on the host) or null
+            # clears the recorded id outright -- a resume pointer with no
+            # transcript behind it is worse than a fresh wake. A malformed
+            # (present but not id-shaped) value leaves whatever was
+            # recorded before standing, since that shape should never come
+            # from the launcher itself.
             local sid
             sid="$(pm_trim "$(jq -r '.session_id // empty' \
                 "$run_dir/summary.json" 2>/dev/null || true)")"
             if [[ "$sid" =~ $PM_SESSION_ID_RE ]]; then
                 pm_session_record "$tid" "$agent" "$sid"
+            elif [[ -z "$sid" ]]; then
+                pm_session_clear "$tid" "$agent"
             fi
         fi
     fi
