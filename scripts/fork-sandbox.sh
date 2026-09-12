@@ -173,7 +173,9 @@
 #                        CLI's per-project transcript store survives the run
 #                        instead of dying with the per-run state dir. Created
 #                        if missing. Refused if it exists as a symlink, or if
-#                        it resolves outside /var/tmp/claude-scratch/ — the
+#                        it resolves outside /var/tmp/claude-scratch/ (or
+#                        the /tmp/claude-scratch compat path, the same two
+#                        roots a handoff may live under) — the
 #                        directory is writable from inside an unattended
 #                        session, so where it may point is a security
 #                        boundary. claude only (pi and codex keep their
@@ -3077,9 +3079,20 @@ if [[ -n "$session_state" ]]; then
         exit 1
     fi
     session_state_real="$("$FS_REALPATH" -m "$session_state")"
-    if [[ "$session_state_real" != /var/tmp/claude-scratch/* ]]; then
+    # Both spellings of the scratch root, exactly as the handoff check below
+    # and fs_require_scratch_handoff (fork-sandbox-lib.sh) accept them: on a
+    # host where /tmp/claude-scratch is a REAL directory rather than the
+    # compat symlink — which ensure-scratch-dirs.sh leaves untouched on
+    # purpose — realpath cannot fold it away, and a narrower root here would
+    # refuse a path the rest of the repo calls scratch. That is not a
+    # theoretical mismatch: an operator who points FORK_SANDBOX_MAIL_ROOT
+    # there passes the postmaster's own startup validation and would then
+    # have every claude wake refused for a flag they never typed.
+    if [[ "$session_state_real" != /var/tmp/claude-scratch/* \
+        && "$session_state_real" != /tmp/claude-scratch/* ]]; then
         echo "Error: --session-state must name a directory under" >&2
-        echo "/var/tmp/claude-scratch/ — got '$session_state_real'. The" >&2
+        echo "/var/tmp/claude-scratch/ (or the /tmp/claude-scratch compat" >&2
+        echo "path) — got '$session_state_real'. The" >&2
         echo "directory is bound read-WRITE into an unattended session, so an" >&2
         echo "arbitrary host path here would let that session write anywhere;" >&2
         echo "which paths may be handed over is a security boundary, not a" >&2
@@ -3220,8 +3233,14 @@ fi
 
 # The session-state directory is validated above, before the --dry-run exit;
 # creating it is what waits until here, so a dry run still creates nothing.
+# 0700 for the same reason the codex sessions directory below is: what lands
+# in here is the session's whole conversation, and the ambient umask on a
+# common host is 022, which would publish every transcript the fleet writes
+# to every local account. chmod, not umask, so a directory the caller
+# already created is tightened too.
 if [[ -n "$session_state" ]]; then
     mkdir -p "$session_state"
+    chmod 700 "$session_state"
 fi
 
 # A sealed run has no network at all, and --unpin-egress — the one value
@@ -7407,16 +7426,31 @@ session_dir_json=""
 # directory of the store, and records nowhere which one is this run's, so
 # this is a documented heuristic: the newest by mtime. A --refresh-at chain
 # writes one transcript per leg and the newest is the leg a resume should
-# continue; only the implement leg is bound at all, so no review or
+# continue; only the coding legs are bound at all, so no review or
 # maintainer conversation competes for newest (see --session-state in the
 # header). Empty when the flag was not given, or when the store has no
 # transcript -- a session that died before writing one.
+#
+# The mtimes come from GNU stat, which fs_require_gnu_tools has already
+# proven is on PATH, and not from `find -printf`: that flag is GNU findutils
+# only, and `brew install coreutils` does not supply find. On macOS -- a
+# platform the container backend supports -- BSD find would reject it, and
+# with its error swallowed this would report session_id as null on every
+# single run, which is a silent no-op rather than a failure anyone can see.
+# find itself is given only -maxdepth/-name/-print0, which BSD find has.
 session_id_json=""
 if [[ -n "$session_state" && -d "$session_state" ]]; then
-    newest_transcript="$(find "$session_state" -maxdepth 2 -name '*.jsonl' \
-        -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1)"
-    [[ -z "$newest_transcript" ]] \
-        || session_id_json="$(basename "${newest_transcript#* }" .jsonl)"
+    transcripts=()
+    while IFS= read -r -d '' transcript_file; do
+        transcripts+=("$transcript_file")
+    done < <(find "$session_state" -maxdepth 2 -name '*.jsonl' -type f \
+        -print0 2>/dev/null)
+    if (( ${#transcripts[@]} )); then
+        newest_transcript="$("$FS_STAT" -c '%Y %n' -- "${transcripts[@]}" \
+            | sort -rn | head -1)"
+        [[ -z "$newest_transcript" ]] \
+            || session_id_json="$(basename "${newest_transcript#* }" .jsonl)"
+    fi
 fi
 ended_at="$(date +%s)"
 

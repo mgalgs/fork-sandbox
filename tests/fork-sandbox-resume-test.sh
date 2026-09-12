@@ -178,6 +178,22 @@ refuses "--session-state refused when a parent symlink leads out" \
     "/var/tmp/claude-scratch/" \
     --harness claude --session-state "$scratch/../../etc/fs-resume"
 
+# Both spellings of the scratch root are accepted, exactly as a handoff path
+# is (fs_require_scratch_handoff): on a host where /tmp/claude-scratch is a
+# real directory rather than the compat symlink -- which ensure-scratch-dirs.sh
+# leaves alone on purpose -- realpath cannot fold it into /var/tmp, and a
+# narrower rule here would refuse a mail root the postmaster's own startup
+# validation had already accepted, wedging every claude wake in the fleet.
+tmp_root_out="$(dry_run --harness claude \
+    --session-state /tmp/claude-scratch/fs-resume-tmp-root/state)"
+tmp_root_rc=$?
+if (( tmp_root_rc == 0 )) && printf '%s\n' "$tmp_root_out" \
+    | grep -q '^session_state='; then
+    ok "--session-state accepts a /tmp/claude-scratch path"
+else
+    no "--session-state accepts a /tmp/claude-scratch path" "$tmp_root_out"
+fi
+
 printf '\n== fork-sandbox.sh: --dry-run prints both flags resolved ==\n'
 
 dry_state="$scratch/fs-resume-dry.$$/state"
@@ -353,6 +369,33 @@ else
     fi
 fi
 
+# Whole conversations land in the store, so the ambient umask does not get to
+# decide who can read them -- the same 0700 the codex sessions directory gets.
+# The directory must be one the LAUNCHER creates (mktemp -d makes 0700 by
+# itself, which would pass without the chmod), under a umask that would
+# otherwise publish it.
+mode_home="$(mktmp_dir "$scratch/fs-resume-home.XXXXXX")"
+mode_parent="$scratch/fs-resume-mode.$$"
+tmpdirs+=("$mode_parent")
+mode_umask="$(umask)"
+umask 022
+mode_result="$(run_and_capture_argv "$mode_home" \
+    --session-state "$mode_parent/state")"
+mode_rc=$?
+umask "$mode_umask"
+register_run_paths "$mode_result"
+if (( mode_rc != 0 )); then
+    no "the state directory is created mode 700 under umask 022" "run failed"
+else
+    mode_bits="$(stat -c '%a' "$mode_parent/state" 2>/dev/null)"
+    if [[ "$mode_bits" == 700 ]]; then
+        ok "the state directory is created mode 700 under umask 022"
+    else
+        no "the state directory is created mode 700 under umask 022" \
+            "mode is '$mode_bits'"
+    fi
+fi
+
 # Without --resume-session, neither flag appears at all: a run that was
 # never asked to persist anything must be byte-identical to one built
 # before the flags existed.
@@ -516,6 +559,22 @@ else
         no "summary.json session_id is null on an empty store" \
             "$(summary_field "$empty_run_dir" .)"
     fi
+fi
+
+# The mtime walk behind session_id runs on every host this script supports,
+# so it must not reach for a GNU-only find. `find -printf` is findutils, and
+# `brew install coreutils` does not supply find: on macOS, which the
+# container backend supports, BSD find would reject it, the error would go
+# to /dev/null with the rest of the walk's stderr, and session_id would come
+# back null on every single run -- a silent no-op instead of a failure.
+# Comment lines are skipped: the comment where the walk explains this rule
+# names the flag it is refusing to use.
+printf_hits="$(awk '/-printf/ && $0 !~ /^[[:space:]]*#/ { printf "%d: %s\n", NR, $0 }' \
+    "$launcher")"
+if [[ -n "$printf_hits" ]]; then
+    no "the launcher uses no GNU-only find -printf" "$printf_hits"
+else
+    ok "the launcher uses no GNU-only find -printf"
 fi
 
 # No --session-state: both keys absent entirely, not null.

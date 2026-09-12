@@ -518,6 +518,10 @@ if (( ! EXEC_MODE )); then
     # per-agent directory for the first wake has nothing there yet.
     if [[ -n "$SESSION_STATE" ]]; then
         mkdir -p "$SESSION_STATE"
+        # Conversation transcripts, so not world-readable: the ambient umask
+        # on a common host is 022. chmod rather than umask, so a directory
+        # the caller created first is tightened too.
+        chmod 700 "$SESSION_STATE"
         claude_mountpoint "$SESSION_STATE" "$HOME/.claude/projects"
     fi
 
