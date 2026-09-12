@@ -50,7 +50,7 @@ chmod +x "$tmp/fork-sandbox"
 
 for target in fork-sandbox.sh fork-sandbox-status.sh fork-sandbox-say.sh \
     fork-sandbox-k8s.sh sandbox-run-log.py fork-sandbox-k8s-services-parse.py \
-    fork-sandbox-mail.sh fork-sandbox-fleet.sh; do
+    fork-sandbox-mail.sh fork-sandbox-fleet.sh fork-sandbox-postmaster.sh; do
     cat > "$tmp/$target" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "${0##*/}"
@@ -100,12 +100,14 @@ run_case 'configure prepends configure' $'fork-sandbox.sh\nconfigure\n--dry-run'
     configure --dry-run
 run_case 'mail passes arguments' $'fork-sandbox-mail.sh\nlist' mail list
 run_case 'fleet passes arguments' $'fork-sandbox-fleet.sh\ncheck' fleet check
+run_case 'postmaster passes arguments' $'fork-sandbox-postmaster.sh\nstatus' postmaster status
 run_case 'help after verb reaches target' $'fork-sandbox.sh\n--help' run --help
 
 help="$("$tmp"/fork-sandbox --help)"
 if [[ "$help" == *'run'* && "$help" == *'status'* && "$help" == *'say'* &&
     "$help" == *'configure'* && "$help" == *'k8s'* && "$help" == *'log'* &&
-    "$help" == *'validate-services'* && "$help" == *'mail'* && "$help" == *'fleet'* ]]; then
+    "$help" == *'validate-services'* && "$help" == *'mail'* && "$help" == *'fleet'* &&
+    "$help" == *'postmaster'* ]]; then
     ok '--help names all verbs'
 else
     no '--help names all verbs' "$help"
@@ -134,7 +136,7 @@ if grep -Fq "unknown verb 'frobnicate'" "$tmp/unknown-err"; then
 else
     no 'unknown verb names offender' "$(cat "$tmp/unknown-err")"
 fi
-if grep -qF 'Verbs: run status say configure k8s log validate-services mail fleet' \
+if grep -qF 'Verbs: run status say configure k8s log validate-services mail fleet postmaster' \
         "$tmp/unknown-err"; then
     ok 'unknown verb lists every verb'
 else

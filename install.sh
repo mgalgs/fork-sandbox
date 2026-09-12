@@ -299,6 +299,7 @@ PORCELAIN=(
     fork-sandbox-fleet.sh
     fork-sandbox-k8s.sh
     fork-sandbox-mail.sh
+    fork-sandbox-postmaster.sh
     fork-sandbox-say.sh
     fork-sandbox-status.sh
     fork-sandbox.sh
