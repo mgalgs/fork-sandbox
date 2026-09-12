@@ -352,6 +352,64 @@ fs_lock_clone_dir() {
     fi
 }
 
+# ---- postmaster state shared with fork-sandbox-fleet.sh's teardown verb ----
+#
+# fork-sandbox-postmaster.sh and fleet.sh's `teardown` both need the
+# postmaster's on-disk layout and its "is a (thread, agent) seat live"
+# predicate. teardown deliberately does not source the postmaster script
+# itself (that would also pull in its usage()/dispatch), so the pieces both
+# sides need live here instead, as the one shared surface, rather than as
+# two copies that would drift apart the way item 8 of the R8-fix review
+# found them starting to.
+
+# Sets the postmaster's on-disk state paths as globals: MAIL_ROOT, STATE,
+# LOCK_FILE, RUNS, HARVESTED, PM_SESSION_STATE, PM_SESSIONS, PM_WORKSPACES.
+# A caller with its own additional paths under STATE (fork-sandbox-postmaster.sh
+# has several) sets those itself, after calling this.
+fs_pm_state_paths() {
+    MAIL_ROOT="${FORK_SANDBOX_MAIL_ROOT:-/var/tmp/claude-scratch/agent-mail}"
+    STATE="$MAIL_ROOT/.postmaster"
+    # shellcheck disable=SC2034  # written here, read by the sourcing scripts
+    LOCK_FILE="$STATE/lock"
+    RUNS="$STATE/runs"
+    HARVESTED="$STATE/harvested"
+    # shellcheck disable=SC2034  # written here, read by the sourcing scripts
+    PM_SESSION_STATE="$STATE/state"
+    # shellcheck disable=SC2034  # written here, read by the sourcing scripts
+    PM_SESSIONS="$STATE/sessions"
+    # shellcheck disable=SC2034  # written here, read by the sourcing scripts
+    PM_WORKSPACES="$STATE/workspaces"
+}
+
+# Reads one NAME=VALUE line from a run's *.env file, last match wins (a
+# record is appended to, never rewritten in place, so the last line is the
+# current value). Deliberately not fs_read_env_value above: that helper is
+# first-match-wins and is its own copy for a different, unrelated surface
+# (fork-sandbox-configure's target table and the Kubernetes run path) — this
+# one is the postmaster's run-record format specifically.
+fs_pm_env_get() {
+    [[ -f "$1" ]] || return 0
+    sed -n "s/^$2=//p" "$1" | tail -n1
+}
+
+# Prints a live run's id for (agent, tid) against $RUNS/$HARVESTED (set by
+# fs_pm_state_paths) and returns 0, or returns 1.
+fs_pm_find_live_run() {
+    local agent="$1" tid="$2" f rid a t
+    for f in "$RUNS"/*.env; do
+        [[ -e "$f" ]] || continue
+        rid="$(basename -- "$f" .env)"
+        [[ -e "$HARVESTED/$rid" ]] && continue
+        a="$(fs_pm_env_get "$f" AGENT)"
+        t="$(fs_pm_env_get "$f" THREAD)"
+        if [[ "$a" == "$agent" && "$t" == "$tid" ]]; then
+            printf '%s' "$rid"
+            return 0
+        fi
+    done
+    return 1
+}
+
 fs_require_src_project() {
     local project_path="$1" real
     real="$("$FS_REALPATH" -m "$project_path")"

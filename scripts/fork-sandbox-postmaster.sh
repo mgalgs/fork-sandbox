@@ -288,19 +288,15 @@ source "$script_dir/fork-sandbox-lib.sh"
 # rather than fail confusingly deep in a harvest pass.
 fs_require_gnu_tools || exit 1
 
-MAIL_ROOT="${FORK_SANDBOX_MAIL_ROOT:-/var/tmp/claude-scratch/agent-mail}"
-STATE="$MAIL_ROOT/.postmaster"
-LOCK_FILE="$STATE/lock"
+# Sets MAIL_ROOT, STATE, LOCK_FILE, RUNS, HARVESTED, PM_SESSION_STATE,
+# PM_SESSIONS, PM_WORKSPACES (fork-sandbox-lib.sh, shared with fleet.sh's
+# teardown verb); this script's own extra paths under STATE follow.
+fs_pm_state_paths
 ROUTED="$STATE/routed"
-RUNS="$STATE/runs"
-HARVESTED="$STATE/harvested"
 NEEDS_OPERATOR="$STATE/needs-operator"
 SPAWNS="$STATE/spawns"
 SEQ="$STATE/seq"
 HANDOFFS="$STATE/handoffs"
-PM_SESSION_STATE="$STATE/state"
-PM_SESSIONS="$STATE/sessions"
-PM_WORKSPACES="$STATE/workspaces"
 
 # The shape fork-sandbox.sh accepts for --resume-session. Applied to what
 # summary.json reported before it is recorded: a malformed id would make
@@ -344,11 +340,6 @@ pm_persona_body() {
         infm { next }
         { print }
     ' "$1"
-}
-
-pm_env_get() {
-    [[ -f "$1" ]] || return 0
-    sed -n "s/^$2=//p" "$1" | tail -n1
 }
 
 # Records / clears the session a (thread, agent) pair's next wake should
@@ -526,26 +517,10 @@ INSTR
 
 # ---- spawn ----
 
-pm_find_live_run() {
-    local agent="$1" tid="$2" f rid a t
-    for f in "$RUNS"/*.env; do
-        [[ -e "$f" ]] || continue
-        rid="$(basename -- "$f" .env)"
-        [[ -e "$HARVESTED/$rid" ]] && continue
-        a="$(pm_env_get "$f" AGENT)"
-        t="$(pm_env_get "$f" THREAD)"
-        if [[ "$a" == "$agent" && "$t" == "$tid" ]]; then
-            printf '%s' "$rid"
-            return 0
-        fi
-    done
-    return 1
-}
-
 pm_append_pending() {
     local rid="$1" mid="$2"
     local f="$RUNS/$rid.env" existing
-    existing="$(pm_env_get "$f" PENDING_MSGS)"
+    existing="$(fs_pm_env_get "$f" PENDING_MSGS)"
     case ",$existing," in
         *",$mid,"*) return 0 ;;
     esac
@@ -656,7 +631,7 @@ pm_spawn_wake() {
 pm_wake_or_pend() {
     local project="$1" agent="$2" tid="$3" mid="$4"
     local run_id
-    if run_id="$(pm_find_live_run "$agent" "$tid")"; then
+    if run_id="$(fs_pm_find_live_run "$agent" "$tid")"; then
         pm_append_pending "$run_id" "$mid"
     else
         pm_spawn_wake "$project" "$agent" "$tid" "$mid"
@@ -846,7 +821,7 @@ pm_followup_wake() {
 # other crash shape this script can tell apart from "still running": a wake
 # whose tmux session was killed, or whose host rebooted, never writes
 # exit-code, so a naive "does exit-code exist yet" check would leave
-# pm_find_live_run treating it as live forever. The grace (default 60s,
+# fs_pm_find_live_run treating it as live forever. The grace (default 60s,
 # overridable for tests) covers an exit-code write still in flight when this
 # runs -- fork-sandbox.sh writes the pid file once, at the very start of the
 # run, and exit-code strictly before its process exits, so a fresh run
@@ -898,17 +873,17 @@ pm_harvest_run() {
     local project="$1" rid="$2"
     local f="$RUNS/$rid.env"
     local agent tid trigger run_dir
-    agent="$(pm_env_get "$f" AGENT)"
-    tid="$(pm_env_get "$f" THREAD)"
-    trigger="$(pm_env_get "$f" TRIGGER)"
-    run_dir="$(pm_env_get "$f" RUN_DIR)"
+    agent="$(fs_pm_env_get "$f" AGENT)"
+    tid="$(fs_pm_env_get "$f" THREAD)"
+    trigger="$(fs_pm_env_get "$f" TRIGGER)"
+    run_dir="$(fs_pm_env_get "$f" RUN_DIR)"
     if [[ ! -d "$run_dir" ]]; then
         # Vanished (scratch root cleaned up, or never existed) rather than
         # merely still running -- this is the one crash shape distinct
         # from "not done yet" that this script can actually detect without
         # a timeout or a tracked pid (see LIMITATIONS), so it is treated
         # as a terminal failure: flag the thread and unblock the agent
-        # instead of leaving pm_find_live_run wedged on it forever.
+        # instead of leaving fs_pm_find_live_run wedged on it forever.
         pm_flag "$tid" "run dir for $agent vanished (run $rid)"
         # No summary.json to read, and the store this seat resumes from
         # sits under the same scratch root that just lost the run dir.
@@ -997,7 +972,7 @@ pm_harvest_run() {
     : > "$HARVESTED/$rid"
 
     local pending
-    pending="$(pm_env_get "$f" PENDING_MSGS)"
+    pending="$(fs_pm_env_get "$f" PENDING_MSGS)"
     if [[ -n "$pending" ]]; then
         local newest="${pending##*,}"
         pm_followup_wake "$project" "$agent" "$tid" "$newest"
@@ -1082,14 +1057,14 @@ cmd_status() {
         [[ -e "$f" ]] || continue
         rid="$(basename -- "$f" .env)"
         [[ -e "$HARVESTED/$rid" ]] && continue
-        agent="$(pm_env_get "$f" AGENT)"
-        tid="$(pm_env_get "$f" THREAD)"
-        run_dir="$(pm_env_get "$f" RUN_DIR)"
+        agent="$(fs_pm_env_get "$f" AGENT)"
+        tid="$(fs_pm_env_get "$f" THREAD)"
+        run_dir="$(fs_pm_env_get "$f" RUN_DIR)"
         # Read off the .env the spawn wrote, not the sessions file: that
         # one moves under a live run, and what this column reports is how
         # THIS wake was launched. A run spawned before the field existed
         # has no RESUMED line and reads as fresh, which it was.
-        resumed="$(pm_env_get "$f" RESUMED)"
+        resumed="$(fs_pm_env_get "$f" RESUMED)"
         if [[ -n "$resumed" ]]; then
             session="resumed=$resumed"
         else

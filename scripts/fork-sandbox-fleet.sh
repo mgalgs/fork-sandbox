@@ -105,6 +105,14 @@ FLEET_ADDR_RE='^@[a-z0-9][a-z0-9-]*$'
 script_dir="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 PARSE="$script_dir/fork-sandbox-fleet-parse.py"
 
+# Only the teardown verb needs this (fs_pm_state_paths, fs_pm_find_live_run
+# below) -- sourced unconditionally anyway, since every other verb's cost
+# from doing so is a no-op: no vars this script already uses are shadowed.
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=fork-sandbox-lib.sh
+# shellcheck disable=SC1091  # plain shellcheck cannot follow it; use -x
+source "$script_dir/fork-sandbox-lib.sh"
+
 usage() {
     # The header block is the documentation: print it from line 2 down to
     # the first non-comment line.
@@ -342,21 +350,12 @@ cmd_roster() {
 # reads postmaster state -- see the header comment above cmd_teardown's
 # entry in the Verbs: list) ----
 
-# Sets MAIL_ROOT/STATE and the postmaster state paths teardown needs.
-# Mirrors the same-named assignments in fork-sandbox-postmaster.sh
-# exactly; duplicated rather than sourced, since sourcing that script
-# would also pull in its own usage()/dispatch (decision 6: keep the
+# The postmaster state paths teardown needs (MAIL_ROOT, STATE, LOCK_FILE,
+# RUNS, HARVESTED, PM_SESSION_STATE, PM_SESSIONS, PM_WORKSPACES) come from
+# fs_pm_state_paths (fork-sandbox-lib.sh), shared with the same assignments
+# in fork-sandbox-postmaster.sh -- not sourcing that script itself, since
+# that would also pull in its own usage()/dispatch (decision 6: keep the
 # coupling to exactly this verb).
-teardown_state_paths() {
-    MAIL_ROOT="${FORK_SANDBOX_MAIL_ROOT:-/var/tmp/claude-scratch/agent-mail}"
-    STATE="$MAIL_ROOT/.postmaster"
-    LOCK_FILE="$STATE/lock"
-    RUNS="$STATE/runs"
-    HARVESTED="$STATE/harvested"
-    PM_SESSION_STATE="$STATE/state"
-    PM_SESSIONS="$STATE/sessions"
-    PM_WORKSPACES="$STATE/workspaces"
-}
 
 # Mirrors pm_lock_acquire/pm_lock_release (fork-sandbox-postmaster.sh)
 # exactly: the same flock(2) on the same file, so teardown and a routing
@@ -396,7 +395,7 @@ teardown_lock_release() {
 # A workspace's own flock (see fs_lock_clone_dir, fork-sandbox-lib.sh) is the
 # authoritative liveness signal for it: a live run holds it for its whole
 # lifetime, starting BEFORE it touches the workspace's git state at all.
-# runs/*.env (teardown_live_run) is written only after a spawn returns,
+# runs/*.env (fs_pm_find_live_run) is written only after a spawn returns,
 # i.e. after a wake may already be cloning or fetching into the workspace,
 # so it alone would let a teardown race a run that has started but not yet
 # been recorded. No .git yet (the workspace does not exist, or a first
@@ -418,29 +417,6 @@ teardown_workspace_locked() {
     fi
     exec {fd}>&-
     return 0
-}
-
-teardown_env_get() {
-    [[ -f "$1" ]] || return 0
-    sed -n "s/^$2=//p" "$1" | tail -n1
-}
-
-# Prints a live run's id for (agent, tid) and returns 0, or returns 1.
-# Mirrors pm_find_live_run (fork-sandbox-postmaster.sh) exactly.
-teardown_live_run() {
-    local agent="$1" tid="$2" f rid a t
-    for f in "$RUNS"/*.env; do
-        [[ -e "$f" ]] || continue
-        rid="$(basename -- "$f" .env)"
-        [[ -e "$HARVESTED/$rid" ]] && continue
-        a="$(teardown_env_get "$f" AGENT)"
-        t="$(teardown_env_get "$f" THREAD)"
-        if [[ "$a" == "$agent" && "$t" == "$tid" ]]; then
-            printf '%s' "$rid"
-            return 0
-        fi
-    done
-    return 1
 }
 
 # Prints "<tid>\t<agent>" for every seat found under the workspace,
@@ -472,7 +448,7 @@ teardown_seat() {
     local tid="$1" agent="$2" run_id
     local -a removed=()
     local ws="$PM_WORKSPACES/$tid/$agent"
-    if run_id="$(teardown_live_run "$agent" "$tid")"; then
+    if run_id="$(fs_pm_find_live_run "$agent" "$tid")"; then
         echo "Error: $agent/$tid: refusing, run '$run_id' is still live." >&2
         return 1
     fi
@@ -495,7 +471,7 @@ teardown_seat() {
 }
 
 cmd_teardown() {
-    teardown_state_paths
+    fs_pm_state_paths
     local agent="" thread=""
 
     if [[ "${1-}" == "--all" ]]; then
