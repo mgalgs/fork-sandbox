@@ -209,12 +209,12 @@ pm_find_by_id() {
 }
 
 pm_persona_body() {
-    awk '
+    awk -- '
         NR==1 && $0=="---" { infm=1; next }
         infm && $0=="---" { infm=0; next }
         infm { next }
         { print }
-    ' -- "$1"
+    ' "$1"
 }
 
 pm_env_get() {
@@ -550,7 +550,7 @@ pm_parse_reply_file() {
             [[ "$(pm_trim "$ac")" =~ $PM_ADDR_RE ]] || return 1
         done
     fi
-    printf '%s\t%s\t%s\t%s\n' "$to" "$cc" "$subject" "$reply_to_id"
+    printf '%s\x1f%s\x1f%s\x1f%s\n' "$to" "$cc" "$subject" "$reply_to_id"
     return 0
 }
 
@@ -564,7 +564,10 @@ pm_harvest_one_file() {
         return 0
     fi
     local to cc subject reply_to_id
-    IFS=$'\t' read -r to cc subject reply_to_id <<< "$parsed"
+    # \x1f, not \t: bash's `read` collapses runs of IFS-whitespace
+    # delimiters (tab counts, even set alone), so an empty Cc field would
+    # merge with its neighboring delimiter and shift every field after it.
+    IFS=$'\x1f' read -r to cc subject reply_to_id <<< "$parsed"
     [[ -n "$reply_to_id" ]] || reply_to_id="$trigger"
 
     local -a cmd=()
