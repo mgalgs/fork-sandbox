@@ -45,7 +45,10 @@
 #      whole batch) -- every expanded name that resolves as a fleet agent
 #      is a wake candidate. A name that does not resolve (unknown or
 #      external, e.g. the operator's own address) is skipped silently:
-#      external senders receive mail only in the archive.
+#      external senders receive mail only in the archive. M's own From is
+#      never a wake candidate, even when it only reaches the list via a
+#      list address M's To: expands through -- a sender never wakes on a
+#      message it sent itself.
 #   1. Operator reset: if M's From does NOT resolve as a fleet agent, M is
 #      operator/external mail -- clear T's needs-operator flag and reset
 #      T's spawn count to 0 BEFORE applying rules 2-3 to M. The operator
@@ -133,7 +136,14 @@
 # that loop is the whole conversation.
 #
 # STATE, under $FORK_SANDBOX_MAIL_ROOT/.postmaster/ (dot-prefixed so the
-# store's own thread scans never see it):
+# store's own thread scans never see it). $FORK_SANDBOX_MAIL_ROOT must
+# itself resolve under /var/tmp/claude-scratch (or the /tmp/claude-scratch
+# compat symlink) and not under its forks/ subtree -- handoffs/ below is
+# where every wake stages the document fork-sandbox.sh reads into a
+# session's prompt, and that script refuses any handoff outside those
+# bounds (fs_require_scratch_handoff, fork-sandbox-lib.sh). `deliver`
+# checks this once at startup rather than let every spawn fail one at a
+# time with the real reason:
 #
 #   lock                           a flock(1)'d file; the holder's pid is
 #                                   written into it for status/error
@@ -200,6 +210,10 @@ FLEET="$script_dir/fork-sandbox-fleet.sh"
 # sitting next to each other, but PATH lookup alone would fail. Overridable
 # so the test suite can point this at a stub instead of the real launcher.
 FORK_SANDBOX="${FORK_SANDBOX_POSTMASTER_LAUNCHER:-$script_dir/fork-sandbox.sh}"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=fork-sandbox-lib.sh
+# shellcheck disable=SC1091  # plain shellcheck cannot follow it; use -x
+source "$script_dir/fork-sandbox-lib.sh"
 
 MAIL_ROOT="${FORK_SANDBOX_MAIL_ROOT:-/var/tmp/claude-scratch/agent-mail}"
 STATE="$MAIL_ROOT/.postmaster"
@@ -545,7 +559,14 @@ pm_process_message() {
 
     local -a candidates=()
     if [[ -z "$gate_reason" ]]; then
-        mapfile -t candidates < <(pm_expand_to "$to")
+        local -a expanded=()
+        mapfile -t expanded < <(pm_expand_to "$to")
+        local cand
+        for cand in "${expanded[@]}"; do
+            [[ -n "$cand" ]] || continue
+            [[ "$cand" == "$from_name" ]] && continue
+            candidates+=("$cand")
+        done
     fi
 
     : > "$ROUTED/$mid"
@@ -763,6 +784,16 @@ cmd_deliver() {
         esac
     done
     [[ -n "$project" ]] || { echo "Error: deliver: --project is required." >&2; return 1; }
+
+    # HANDOFFS sits under $FORK_SANDBOX_MAIL_ROOT, a first-class env key an
+    # operator can point anywhere -- but every wake stages its handoff there
+    # and hands it to fork-sandbox.sh, which refuses any handoff outside
+    # /var/tmp/claude-scratch (or the /tmp/claude-scratch compat symlink) and
+    # excludes forks/ within it (fs_require_scratch_handoff, fork-sandbox-lib.sh).
+    # Checked once here, at startup, so a bad root fails with this explanation
+    # instead of every single spawn dying with "spawn failed for <agent>: <mid>"
+    # and the real reason buried in the deliver loop's stderr.
+    fs_require_scratch_handoff "$HANDOFFS/probe.md" || return 1
 
     mkdir -p -- "$MAIL_ROOT" "$STATE"
     pm_lock_acquire || return 1

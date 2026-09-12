@@ -73,6 +73,16 @@ new_root() {
     tmpdirs+=("$out_ref")
 }
 
+# Same as new_root, but under /var/tmp/claude-scratch: FORK_SANDBOX_MAIL_ROOT
+# feeds fs_require_scratch_handoff via HANDOFFS at `deliver` startup (see
+# fork-sandbox-postmaster.sh), so a bare mktemp -d root (usually under /tmp)
+# would fail that check before ever reaching the routing logic under test.
+new_scratch_root() {
+    local -n out_ref="$1"
+    out_ref="$(mktemp -d /var/tmp/claude-scratch/fs-postmaster-test.XXXXXX)"
+    tmpdirs+=("$out_ref")
+}
+
 work="$(mktemp -d)"
 tmpdirs+=("$work")
 cd "$work" || exit 1
@@ -201,7 +211,7 @@ spawn_count_of() {
 printf '\n== To wakes, Cc does not; list wakes every member once; direct+list dedup ==\n'
 # ============================================================
 
-new_root FORK_SANDBOX_MAIL_ROOT
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
 export FORK_SANDBOX_MAIL_ROOT
 
 mid="$(send_msg '@alice' '@bob' 'cc test' 'body for cc test' 8 '@carol')"
@@ -211,7 +221,7 @@ once
 check "To recipient (bob) spawns" 1 "$(grep -c -- "^sbx-mail-$short-bob-" "$STUB_ARGV_LOG")"
 check "Cc recipient (carol) does not spawn" 0 "$(grep -c -- "^sbx-mail-$short-carol-" "$STUB_ARGV_LOG")"
 
-new_root FORK_SANDBOX_MAIL_ROOT
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
 export FORK_SANDBOX_MAIL_ROOT
 mid="$(send_msg '@carol' '@bob,@team' 'list dedup test' 'body for list dedup' 8)"
 tid="$(thread_of "$mid")"
@@ -219,13 +229,57 @@ short="${tid:0:8}"
 once
 check "list member alice wakes" 1 "$(grep -c -- "^sbx-mail-$short-alice-" "$STUB_ARGV_LOG")"
 check "direct+list bob wakes exactly once" 1 "$(grep -c -- "^sbx-mail-$short-bob-" "$STUB_ARGV_LOG")"
-check "list member carol wakes" 1 "$(grep -c -- "^sbx-mail-$short-carol-" "$STUB_ARGV_LOG")"
+check "sender carol does not wake on her own message" 0 "$(grep -c -- "^sbx-mail-$short-carol-" "$STUB_ARGV_LOG")"
+
+# ============================================================
+printf '\n== a list member never wakes on a message they sent themselves ==\n'
+# ============================================================
+
+# Operator-seeded shape: @operator mails @team (alice/bob/carol), one of
+# whom (bob) reply-alls. mail.sh's reply-all keeps @team in the parent's
+# To: verbatim (it only strips the literal sender address, not list
+# membership), so bob's reply is still addressed to a list he belongs to.
+# Without the sender exclusion in pm_process_message, that would wake bob
+# on his own reply -- and self-sustainingly so, since his next reply-all
+# would be byte-for-byte the same shape. All three first runs are
+# harvested before bob replies so the busy-run dedup (rule 4) can't be
+# what's suppressing his second wake -- only the sender exclusion can,
+# and alice/carol waking as usual on the same message shows it's not
+# some other rule blocking everyone.
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+mid1="$(send_msg '@operator' '@team' 'self-wake regression' 'body from operator' 8)"
+tid="$(thread_of "$mid1")"
+short="${tid:0:8}"
+once
+check "operator mail wakes all three team members" 3 \
+    "$(grep -c -- "^sbx-mail-$short-\(alice\|bob\|carol\)-" "$STUB_ARGV_LOG")"
+
+for a in alice bob carol; do
+    run_env="$(env_file_for_agent "$a")"
+    run_dir="$(sed -n 's/^RUN_DIR=//p' "$run_env")"
+    mkdir -p -- "$run_dir/outbox"
+    printf '0\n' > "$run_dir/exit-code"
+done
+once
+
+mid2="$(reply_msg '@bob' "$mid1" 'reply from bob')"
+contains "bob's reply-all still addresses the team list" \
+    "$("$MAIL" show "$mid2" 2>/dev/null | sed -n 's/^To: //p')" '@team'
+: > "$STUB_ARGV_LOG"
+once
+check "bob does not wake on the message he just sent" 0 \
+    "$(grep -c -- "^sbx-mail-$short-bob-" "$STUB_ARGV_LOG")"
+check "alice still wakes on bob's reply" 1 \
+    "$(grep -c -- "^sbx-mail-$short-alice-" "$STUB_ARGV_LOG")"
+check "carol still wakes on bob's reply" 1 \
+    "$(grep -c -- "^sbx-mail-$short-carol-" "$STUB_ARGV_LOG")"
 
 # ============================================================
 printf '\n== unknown/external To name is skipped, no crash, no flag ==\n'
 # ============================================================
 
-new_root FORK_SANDBOX_MAIL_ROOT
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
 export FORK_SANDBOX_MAIL_ROOT
 mid="$(send_msg '@alice' '@bob,@nobody' 'unknown to test' 'body' 8)"
 tid="$(thread_of "$mid")"
@@ -239,7 +293,7 @@ check "unknown To name: no flag raised" "" "$(cat "$FORK_SANDBOX_MAIL_ROOT/.post
 printf '\n== seat resolution reaches launcher argv ==\n'
 # ============================================================
 
-new_root FORK_SANDBOX_MAIL_ROOT
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
 export FORK_SANDBOX_MAIL_ROOT
 
 : > "$STUB_ARGV_LOG"
@@ -283,7 +337,7 @@ fi
 printf '\n== X-Hops 0 gate: no spawn, thread flagged ==\n'
 # ============================================================
 
-new_root FORK_SANDBOX_MAIL_ROOT
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
 export FORK_SANDBOX_MAIL_ROOT
 mid="$(send_msg '@alice' '@bob' 'hops zero' 'body' 0)"
 tid="$(thread_of "$mid")"
@@ -299,7 +353,7 @@ contains "X-Hops 0: flag reason says hops exhausted" \
 printf '\n== thread budget: default 12, env override, flag on exhaust ==\n'
 # ============================================================
 
-new_root FORK_SANDBOX_MAIL_ROOT
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
 export FORK_SANDBOX_MAIL_ROOT
 mid="$(send_msg '@alice' '@bob' 'budget default' 'body' 8)"
 tid="$(thread_of "$mid")"
@@ -312,7 +366,7 @@ check "budget default 12: no spawn once exhausted" 0 "$(grep -c -- "^sbx-mail-$s
 contains "budget default 12: flag names the limit" \
     "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid")" "thread budget 12 exhausted"
 
-new_root FORK_SANDBOX_MAIL_ROOT
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
 export FORK_SANDBOX_MAIL_ROOT
 export FORK_SANDBOX_THREAD_BUDGET=1
 mid1="$(send_msg '@alice' '@bob' 'budget override' 'body one' 8)"
@@ -335,7 +389,7 @@ unset FORK_SANDBOX_THREAD_BUDGET
 printf '\n== operator mail (From not a fleet agent) resets flag and spawn count ==\n'
 # ============================================================
 
-new_root FORK_SANDBOX_MAIL_ROOT
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
 export FORK_SANDBOX_MAIL_ROOT
 root_mid="$(send_msg '@operator' '@alice' 'operator reset' 'first message' 5)"
 tid="$(thread_of "$root_mid")"
@@ -354,7 +408,7 @@ check "operator mail: routes normally after reset (alice spawns)" 1 "$(grep -c -
 printf '\n== pending: busy agent does not get a second spawn; follow-up wake after harvest ==\n'
 # ============================================================
 
-new_root FORK_SANDBOX_MAIL_ROOT
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
 export FORK_SANDBOX_MAIL_ROOT
 mid1="$(send_msg '@alice' '@bob' 'pending test' 'first message' 8)"
 tid="$(thread_of "$mid1")"
@@ -387,7 +441,7 @@ contains "pending: follow-up wake's TRIGGER is the pending message" "$(cat "$FOR
 printf '\n== harvest: reply-file stanzas, hops handling, malformed files ==\n'
 # ============================================================
 
-new_root FORK_SANDBOX_MAIL_ROOT
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
 export FORK_SANDBOX_MAIL_ROOT
 trig_mid="$(send_msg '@alice' '@bob' 'harvest topic' 'the original body' 8)"
 tid="$(thread_of "$trig_mid")"
@@ -474,7 +528,7 @@ check "harvest: second scan over an already-harvested run posts nothing new" \
 printf '\n== routed marker idempotence: two --once passes route each message once ==\n'
 # ============================================================
 
-new_root FORK_SANDBOX_MAIL_ROOT
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
 export FORK_SANDBOX_MAIL_ROOT
 mid="$(send_msg '@alice' '@bob' 'idempotence' 'body' 8)"
 tid="$(thread_of "$mid")"
@@ -489,7 +543,7 @@ check "routed idempotence: exactly one spawn across two --once passes" 1 \
 printf '\n== lock: flock held refuses, released allows, stale content is ignored ==\n'
 # ============================================================
 
-new_root FORK_SANDBOX_MAIL_ROOT
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
 export FORK_SANDBOX_MAIL_ROOT
 mkdir -p -- "$FORK_SANDBOX_MAIL_ROOT/.postmaster"
 lock_file="$FORK_SANDBOX_MAIL_ROOT/.postmaster/lock"
@@ -520,7 +574,7 @@ check "lock: a second deliver after release succeeds (the flock was released)" "
 printf '\n== generated handoff contains persona, thread, trigger id, no-reply line ==\n'
 # ============================================================
 
-new_root FORK_SANDBOX_MAIL_ROOT
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
 export FORK_SANDBOX_MAIL_ROOT
 mid="$(send_msg '@bob' '@alice' 'handoff check' 'Please take a look at this specific body text.' 8)"
 : > "$STUB_ARGV_LOG"
@@ -540,7 +594,7 @@ fi
 printf '\n== status lists unrouted/live/flagged truthfully ==\n'
 # ============================================================
 
-new_root FORK_SANDBOX_MAIL_ROOT
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
 export FORK_SANDBOX_MAIL_ROOT
 live_mid="$(send_msg '@alice' '@bob' 'status live' 'body' 8)"
 live_tid="$(thread_of "$live_mid")"
@@ -563,7 +617,7 @@ contains "status: spawn count per thread" "$status_out" "$live_tid: 1 spawns"
 printf '\n== flag / unflag verbs ==\n'
 # ============================================================
 
-new_root FORK_SANDBOX_MAIL_ROOT
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
 export FORK_SANDBOX_MAIL_ROOT
 manual_tid="manually-flagged-thread"
 "$postmaster" flag "$manual_tid" "operator wants eyes on this" >/dev/null 2>&1
@@ -577,7 +631,7 @@ check "unflag: flag file removed" "0" \
 printf '\n== branch names never repeat, even across an operator spawn-count reset ==\n'
 # ============================================================
 
-new_root FORK_SANDBOX_MAIL_ROOT
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
 export FORK_SANDBOX_MAIL_ROOT
 root_mid="$(send_msg '@operator' '@alice' 'reset one' 'first' 8)"
 tid="$(thread_of "$root_mid")"
@@ -620,7 +674,7 @@ fi
 printf '\n== harvest: non-zero exit code flags the thread even with a reply ==\n'
 # ============================================================
 
-new_root FORK_SANDBOX_MAIL_ROOT
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
 export FORK_SANDBOX_MAIL_ROOT
 mid="$(send_msg '@alice' '@bob' 'crash test' 'body' 8)"
 tid="$(thread_of "$mid")"
@@ -640,7 +694,7 @@ check "harvest: a failed run is still marked harvested (agent unblocks)" "1" \
 printf '\n== harvest: a run dir that vanishes is treated as a terminal failure ==\n'
 # ============================================================
 
-new_root FORK_SANDBOX_MAIL_ROOT
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
 export FORK_SANDBOX_MAIL_ROOT
 mid="$(send_msg '@alice' '@bob' 'vanished run dir' 'body' 8)"
 tid="$(thread_of "$mid")"
@@ -670,7 +724,7 @@ printf '\n== spawn launcher is resolved independent of PATH ==\n'
 # PATH -- true whether or not some OTHER fork-sandbox.sh happens to be on
 # PATH too (e.g. this machine's own install). Proof: the stub is the one
 # that's called.
-new_root FORK_SANDBOX_MAIL_ROOT
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
 export FORK_SANDBOX_MAIL_ROOT
 send_msg '@alice' '@bob' 'path independence' 'body' 8 >/dev/null
 : > "$STUB_ARGV_LOG"
