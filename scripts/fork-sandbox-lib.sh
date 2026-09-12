@@ -370,9 +370,9 @@ fs_lock_clone_dir() {
 # postmaster's on-disk layout and its "is a (thread, agent) seat live"
 # predicate. teardown deliberately does not source the postmaster script
 # itself (that would also pull in its usage()/dispatch), so the pieces both
-# sides need live here instead, as the one shared surface, rather than as
-# two copies that would drift apart the way item 8 of the R8-fix review
-# found them starting to.
+# sides need live here instead, as the one shared surface. They started out
+# as verbatim copies in both scripts, and copies of a liveness rule that
+# guards an rm -rf are exactly the kind that must not drift apart.
 
 # Sets the postmaster's on-disk state paths as globals: MAIL_ROOT, STATE,
 # LOCK_FILE, RUNS, HARVESTED, PM_SESSION_STATE, PM_SESSIONS, PM_WORKSPACES.

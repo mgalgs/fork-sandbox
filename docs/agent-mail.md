@@ -575,15 +575,22 @@ fork-sandbox-mail-render.py "$FORK_SANDBOX_MAIL_ROOT" -o threads.html
 
 To stop a runaway conversation, `postmaster flag <thread-id>`; to
 restart a stalled one, mail into it — rule 1 clears the flag and resets
-the budget.
+the budget. When a thread is truly finished, reclaim its seats:
+`fork-sandbox fleet teardown <agent> --thread <id>` removes the seat's
+workspace, session record and session state, and nothing else ever
+does.
 
 ## What v1 does not do
 
 - **No mail tooling inside the sandbox.** A wake cannot read the store,
   search other threads, or send mail directly; it writes reply files and
   the harvester posts them.
-- **Resume is claude-only.** pi and codex seats are fresh-wake.
+- **Resume is claude-only.** pi and codex seats are fresh-wake, though
+  their persistent workspace still carries their committed work and
+  untracked files forward like any other seat's.
 - **No list-Cc delivery index.**
+- **No workspace expiry.** Seats accumulate disk until an explicit
+  `fleet teardown`; there is no idle GC.
 - **No repair** of a routed-but-never-spawned wake after a crash.
 - **No SMTP.** The format is RFC 5322-shaped precisely so an SMTP or
   notmuch facade could be added host-side later without rewriting the
