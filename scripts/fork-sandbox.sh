@@ -257,7 +257,10 @@
 #                        error. The per-run fetch-back to the origin repo,
 #                        below, is unchanged either way -- every run still
 #                        pushes its branch home regardless of where its
-#                        clone lives.
+#                        clone lives. <dir> is locked (flock) for the life of
+#                        the run: a second run given the same <dir> while the
+#                        first is still going refuses to start rather than
+#                        risk two writers corrupting one git repository.
 # --keep-session:        leave the tmux session open on a shell when the run
 #                        ends, instead of letting it close. Ignored with
 #                        --foreground, which has no tmux session.
@@ -4036,6 +4039,24 @@ else
         exit 1
     fi
 fi
+# Belt and braces on top of the postmaster's routing rule 4 (which already
+# serializes wakes for one seat by refusing a second spawn while a run is
+# live): a persistent --clone-dir workspace is now reused across wakes, so a
+# second concurrent run in the same directory would corrupt its git state. A
+# fresh clone under $run_dir carries no such risk -- it dies with this run
+# and nothing else can ever reach it -- so the lock is only taken when a
+# --clone-dir was given. Held via a plain fd for the run's lifetime, released
+# by run_cleanup; see pm_lock_acquire in fork-sandbox-postmaster.sh for why
+# this is flock rather than a pid file.
+clone_lock_fd=""
+if [[ -n "$clone_dir_flag" ]]; then
+    exec {clone_lock_fd}<>"$clone_dir/.fork-sandbox-lock"
+    if ! flock -n "$clone_lock_fd"; then
+        echo "Error: workspace '$clone_dir' is locked by another run --" >&2
+        echo "refusing to start." >&2
+        exit 1
+    fi
+fi
 fs_collect_alternates "$clone_dir"
 
 # Node toolchain and dependencies, for a repo that has them (fs_node_provision
@@ -5543,6 +5564,10 @@ printf '\nHeadless. Nothing here needs a keypress; the session exits on its own.
 run_cleanup() {
     [[ -n "${_cleanup_done:-}" ]] && return 0
     _cleanup_done=1
+    if [[ -n "${clone_lock_fd:-}" ]]; then
+        flock -u "$clone_lock_fd" 2>/dev/null || true
+        exec {clone_lock_fd}>&- 2>/dev/null || true
+    fi
     if [[ "${#codex_auth_dirs[@]}" -gt 0 ]]; then
         for codex_auth_dir in "${codex_auth_dirs[@]}"; do
             rm -rf "$codex_auth_dir"

@@ -339,5 +339,73 @@ else
     no "--clone-dir naming a non-git directory is a hard error" "$notrepo_out"
 fi
 
+# ---------------------------------------------------------------------------
+printf '\n== fork-sandbox.sh: --clone-dir workspace lock ==\n'
+# ---------------------------------------------------------------------------
+
+# Belt and braces on top of the postmaster's own single-writer routing: two
+# runs given the same --clone-dir at once must not both touch that git
+# working tree. Hold the lock file externally, the same way a concurrent
+# fork-sandbox.sh run would, and confirm this run refuses rather than races
+# it -- then confirm the workspace is usable again once that hold is gone.
+lock_home="$(mktmp_dir "$scratch/fs-clonedir-home4.XXXXXX")"
+lock_proj="$(new_project "$lock_home")"
+lock_clone="$(mktmp_dir "$scratch/fs-clonedir-lock.XXXXXX")"
+git init -q "$lock_clone" >/dev/null 2>&1
+git -C "$lock_clone" remote add origin "$lock_proj" >/dev/null 2>&1
+
+lock_marker="$(mktemp "$scratch/fs-clonedir-lockmarker.XXXXXX")"
+tmpdirs+=("$lock_marker")
+rm -f -- "$lock_marker"
+
+(
+    exec {lock_fd}<>"$lock_clone/.fork-sandbox-lock"
+    if flock -n "$lock_fd"; then
+        touch "$lock_marker"
+        sleep 30
+    fi
+) &
+lock_holder_pid=$!
+
+# Wait for the external holder to actually acquire the lock (up to 5s) before
+# racing the launcher against it.
+for _ in $(seq 1 50); do
+    [[ -e "$lock_marker" ]] && break
+    sleep 0.1
+done
+
+locked_out="$(HOME="$lock_home" PATH="$stub_bin:$PATH" \
+    FORK_SANDBOX_CONFIG_DIR="$(mktmp_dir "$scratch/fs-clonedir-cfg3.XXXXXX")" \
+    FAKE_ARGV_FILE="$(mktemp "$scratch/fs-clonedir-argv3.XXXXXX")" \
+    timeout 60 "$launcher" --foreground --harness claude \
+    --branch fs-clonedir-locked-b --clone-dir "$lock_clone" \
+    "$lock_proj" "$refusal_handoff" 2>&1)"
+locked_rc=$?
+
+# Kill the sleep this subshell forked first -- it inherits the locked fd, so
+# killing only the subshell leaves it as an orphan still holding the lock.
+pkill -TERM -P "$lock_holder_pid" 2>/dev/null
+kill "$lock_holder_pid" 2>/dev/null
+wait "$lock_holder_pid" 2>/dev/null
+
+if (( locked_rc != 0 )) && printf '%s' "$locked_out" | grep -qF "is locked by another run"; then
+    ok "--clone-dir refuses to start against a locked workspace"
+else
+    no "--clone-dir refuses to start against a locked workspace" "$locked_out"
+fi
+
+unlocked_out="$(HOME="$lock_home" PATH="$stub_bin:$PATH" \
+    FORK_SANDBOX_CONFIG_DIR="$(mktmp_dir "$scratch/fs-clonedir-cfg4.XXXXXX")" \
+    FAKE_ARGV_FILE="$(mktemp "$scratch/fs-clonedir-argv4.XXXXXX")" \
+    timeout 60 "$launcher" --foreground --harness claude \
+    --branch fs-clonedir-unlocked-b --clone-dir "$lock_clone" \
+    "$lock_proj" "$refusal_handoff" 2>&1)"
+unlocked_rc=$?
+if (( unlocked_rc == 0 )); then
+    ok "--clone-dir succeeds once the external lock is released"
+else
+    no "--clone-dir succeeds once the external lock is released" "$unlocked_out"
+fi
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))
