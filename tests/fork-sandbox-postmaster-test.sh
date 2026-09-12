@@ -454,6 +454,42 @@ check "pending: harvest fires a follow-up wake for the pending message" 1 \
 contains "pending: follow-up wake's TRIGGER is the pending message" "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/runs"/*.env)" "TRIGGER=$mid2"
 
 # ============================================================
+printf '\n== harvest: delivered-live mail suppresses the follow-up wake ==\n'
+# ============================================================
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+mid1="$(send_msg '@alice' '@bob' 'delivered-live test' 'first message' 8)"
+tid="$(thread_of "$mid1")"
+short="${tid:0:8}"
+: > "$STUB_ARGV_LOG"
+once
+run_env="$(env_file_for_agent bob)"
+run_dir="$(sed -n 's/^RUN_DIR=//p' "$run_env")"
+
+mid2="$(reply_msg '@alice' "$mid1" 'second message' --to '@bob')"
+short2="${mid2:0:8}"
+: > "$STUB_ARGV_LOG"
+once
+contains "delivered-live: message id recorded as pending on the live run" \
+    "$(cat "$run_env")" "PENDING_MSGS=$mid2"
+
+# Fabricate the events.jsonl line the inbox hook's stderr tag would have
+# produced had it actually delivered the banner -- this is the only signal
+# pm_mail_delivered_live trusts (see its header comment).
+mkdir -p -- "$run_dir/outbox"
+printf 'fork-sandbox-inbox: delivered mail-banner-001-%s.md\n' "$short2" > "$run_dir/events.jsonl"
+printf '0\n' > "$run_dir/exit-code"
+printf '{}\n' > "$run_dir/summary.json"
+printf '\nAcknowledged, thanks.\n' > "$run_dir/outbox/mail-1.md"
+: > "$STUB_ARGV_LOG"
+once
+check "delivered-live: no follow-up wake when delivery is confirmed in events.jsonl" 0 \
+    "$(grep -c -- "^sbx-mail-$short-bob-" "$STUB_ARGV_LOG")"
+check "delivered-live: ledger records the message as delivered-live" 1 \
+    "$( [[ -f "$FORK_SANDBOX_MAIL_ROOT/.postmaster/delivered-live/$tid" ]] && grep -c -- "$mid2" "$FORK_SANDBOX_MAIL_ROOT/.postmaster/delivered-live/$tid" || echo 0 )"
+
+# ============================================================
 printf '\n== live delivery: same-thread mail lands in a busy run inbox ==\n'
 # ============================================================
 

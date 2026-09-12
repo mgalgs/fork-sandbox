@@ -901,6 +901,30 @@ pm_followup_wake() {
     pm_spawn_wake "$project" "$agent" "$tid" "$mid"
 }
 
+# events.jsonl is fork-sandbox.sh's own event stream for this run
+# (--include-hook-events wires hook stderr into it); a hook firing shows
+# up as a raw JSON line whose "stderr" field is the hook's stderr text,
+# JSON-string-escaped. Our banner filenames are alnum/hyphen/period only
+# -- no JSON metacharacters -- so the STDERR_TAG line's text (see
+# fork-sandbox-inbox-hook.sh's final delivered-list print) appears
+# byte-for-byte in the raw file, and a plain grep finds it with no JSON
+# parsing needed.
+pm_mail_delivered_live() {
+    local run_dir="$1" mid="$2" shortid
+    local events="$run_dir/events.jsonl"
+    [[ -f "$events" ]] || return 1
+    shortid="${mid:0:8}"
+    grep -q "fork-sandbox-inbox:.*delivered.*mail-banner-[0-9]*-$shortid\.md" \
+        -- "$events" 2>/dev/null
+}
+
+pm_ledger_delivered_live() {
+    local tid="$1" agent="$2" mid="$3" rid="$4"
+    local dir="$STATE/delivered-live"
+    mkdir -p -- "$dir"
+    printf '%s %s %s\n' "$agent" "$mid" "$rid" >> "$dir/$tid"
+}
+
 # A tracked run's pid file, once dead and past a grace period, is the one
 # other crash shape this script can tell apart from "still running": a wake
 # whose tmux session was killed, or whose host rebooted, never writes
@@ -1059,7 +1083,11 @@ pm_harvest_run() {
     pending="$(fs_pm_env_get "$f" PENDING_MSGS)"
     if [[ -n "$pending" ]]; then
         local newest="${pending##*,}"
-        pm_followup_wake "$project" "$agent" "$tid" "$newest"
+        if pm_mail_delivered_live "$run_dir" "$newest"; then
+            pm_ledger_delivered_live "$tid" "$agent" "$newest" "$rid"
+        else
+            pm_followup_wake "$project" "$agent" "$tid" "$newest"
+        fi
     fi
 }
 
