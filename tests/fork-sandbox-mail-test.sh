@@ -162,6 +162,30 @@ refuses "rejects an address with embedded spaces" "$mail" send --from "@al ice" 
 refuses "rejects a malformed --to" "$mail" send --from @alice --to bob --subject x --body -
 refuses "rejects a missing --from" "$mail" send --to @bob --subject x --body -
 
+printf '\n== address list trimming ==\n'
+
+id_trim_comma="$("$mail" send --from @alice --to "@bob, @carol" --subject x --body - <<< "y" 2>diag.txt)"
+rc=$?
+check "', '-separated --to is accepted" "0" "$rc"
+raw_trim_comma="$("$mail" show "$id_trim_comma")"
+check "', '-separated --to is stored normalized" "To: @bob, @carol" "$(grep '^To:' <<< "$raw_trim_comma")"
+
+id_trim_tab="$("$mail" send --from @alice --to $'@bob,\t@carol' --cc $'@dave, \t@erin' --subject x --body - <<< "y" 2>diag.txt)"
+rc=$?
+check "tab-padded --to/--cc are accepted" "0" "$rc"
+raw_trim_tab="$("$mail" show "$id_trim_tab")"
+check "tab-padded --to is stored normalized" "To: @bob, @carol" "$(grep '^To:' <<< "$raw_trim_tab")"
+check "tab-padded --cc is stored normalized" "Cc: @dave, @erin" "$(grep '^Cc:' <<< "$raw_trim_tab")"
+
+refuses "an empty element between commas is still rejected" "$mail" send --from @alice --to "@bob,,@carol" --subject x --body -
+refuses "a whitespace-only element between commas is still rejected" "$mail" send --from @alice --to "@bob, ,@carol" --subject x --body -
+
+id_trim_reply="$("$mail" reply --from @bob --reply-to "$id1" --to "@alice, @carol" --body - <<< "z" 2>diag.txt)"
+rc=$?
+check "', '-separated reply --to is accepted" "0" "$rc"
+raw_trim_reply="$("$mail" show "$id_trim_reply")"
+check "', '-separated reply --to is stored normalized" "To: @alice, @carol" "$(grep '^To:' <<< "$raw_trim_reply")"
+
 printf '\n== inbox and seen ==\n'
 
 new_root FORK_SANDBOX_MAIL_ROOT; export FORK_SANDBOX_MAIL_ROOT

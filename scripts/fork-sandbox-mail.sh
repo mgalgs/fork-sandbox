@@ -149,6 +149,8 @@ mail_validate_addr_list() {
     IFS=',' read -ra parts <<< "$list"
     local p out=""
     for p in "${parts[@]}"; do
+        p="${p#"${p%%[![:space:]]*}"}"
+        p="${p%"${p##*[![:space:]]}"}"
         mail_validate_addr "$p" || return 1
         out="${out:+$out, }$p"
     done
