@@ -390,6 +390,78 @@ agents:
     harness: pi-local
 EOF
 
+printf '\n== teardown ==\n'
+
+# Asserts path $2 does/does not exist, per $1 ("gone" or "present").
+path_state() {
+    local label="$1" want="$2" path="$3"
+    if [[ "$want" == gone ]]; then
+        if [[ -e "$path" ]]; then no "$label" "still present: $path"; else ok "$label"; fi
+    else
+        if [[ -e "$path" ]]; then ok "$label"; else no "$label" "missing: $path"; fi
+    fi
+}
+
+new_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+
+# alice/th1: a full seat -- workspace, session record, session state.
+mkdir -p -- "$PM_STATE/workspaces/th1/alice" "$PM_STATE/state/th1/alice" "$PM_STATE/sessions/th1"
+echo sid-alice > "$PM_STATE/sessions/th1/alice"
+
+td_out="$("$fleet" teardown alice --thread th1)"; td_rc=$?
+check "teardown: no-live-run seat exits 0" "0" "$td_rc"
+contains "teardown: reports workspace removed" "$td_out" "workspace"
+contains "teardown: reports session record removed" "$td_out" "session record"
+contains "teardown: reports session state removed" "$td_out" "session state"
+path_state "teardown: workspace actually removed" gone "$PM_STATE/workspaces/th1/alice"
+path_state "teardown: session record actually removed" gone "$PM_STATE/sessions/th1/alice"
+path_state "teardown: session state actually removed" gone "$PM_STATE/state/th1/alice"
+
+td_out2="$("$fleet" teardown alice --thread th1)"; td_rc2=$?
+check "teardown: nothing-to-remove exits 0" "0" "$td_rc2"
+contains "teardown: nothing-to-remove message" "$td_out2" "nothing to remove"
+
+# bob/th2: a live, not-yet-harvested run -- teardown must refuse it.
+mkdir -p -- "$PM_STATE/workspaces/th2/bob" "$PM_STATE/runs" "$PM_STATE/harvested"
+printf 'AGENT=bob\nTHREAD=th2\n' > "$PM_STATE/runs/run-bob.env"
+td_out3="$("$fleet" teardown bob --thread th2 2>&1)"; td_rc3=$?
+check "teardown: live-run refusal exits 1" "1" "$td_rc3"
+contains "teardown: live-run refusal names the run" "$td_out3" "run-bob"
+path_state "teardown: live-run seat's workspace untouched" present "$PM_STATE/workspaces/th2/bob"
+
+# carol has seats on two threads; teardown with no --thread sweeps both.
+mkdir -p -- "$PM_STATE/workspaces/th3/carol" "$PM_STATE/workspaces/th4/carol"
+td_out4="$("$fleet" teardown carol)"; td_rc4=$?
+check "teardown: bare agent (no --thread) sweeps every thread, exits 0" "0" "$td_rc4"
+contains "teardown: bare agent tears down th3" "$td_out4" "carol/th3"
+contains "teardown: bare agent tears down th4" "$td_out4" "carol/th4"
+path_state "teardown: th3 workspace actually gone" gone "$PM_STATE/workspaces/th3/carol"
+path_state "teardown: th4 workspace actually gone" gone "$PM_STATE/workspaces/th4/carol"
+
+# --all: a mix of a clean seat and bob's still-live one -- best-effort,
+# both outcomes reported, non-zero exit because one seat was refused.
+mkdir -p -- "$PM_STATE/workspaces/th5/dave"
+td_out5="$("$fleet" teardown --all 2>&1)"; td_rc5=$?
+check "teardown --all: exits 1 when any seat is refused" "1" "$td_rc5"
+contains "teardown --all: reports the refused seat" "$td_out5" "run-bob"
+contains "teardown --all: reports the cleanly torn down seat" "$td_out5" "dave/th5"
+path_state "teardown --all: dave workspace actually gone" gone "$PM_STATE/workspaces/th5/dave"
+path_state "teardown --all: bob (live) workspace untouched" present "$PM_STATE/workspaces/th2/bob"
+
+# Once bob's run is no longer live, --all clears the rest and settles at
+# "nothing to tear down" -- still exit 0, not an error.
+rm -f -- "$PM_STATE/runs/run-bob.env"
+"$fleet" teardown --all >/dev/null; td_rc6=$?
+check "teardown --all: clean sweep once the run clears exits 0" "0" "$td_rc6"
+
+td_out7="$("$fleet" teardown --all)"; td_rc7=$?
+check "teardown --all: nothing left exits 0" "0" "$td_rc7"
+contains "teardown --all: nothing-to-tear-down message" "$td_out7" "nothing to tear down"
+
+unset FORK_SANDBOX_MAIL_ROOT
+
 printf '\n== dispatcher wiring ==\n'
 
 dispatcher="$repo_dir/scripts/fork-sandbox"
@@ -400,6 +472,11 @@ if [[ -x "$dispatcher" ]]; then
     check "fork-sandbox fleet roster output matches direct invocation" "$roster_out" "$disp_roster"
     disp_help="$("$dispatcher" fleet --help 2>&1)"
     contains "fork-sandbox fleet --help reaches the fleet script's header" "$disp_help" "fork-sandbox-fleet.sh"
+    disp_mail_root="$(mktemp -d)"
+    tmpdirs+=("$disp_mail_root")
+    disp_teardown="$(FORK_SANDBOX_MAIL_ROOT="$disp_mail_root" "$dispatcher" fleet teardown --all 2>&1)"; disp_teardown_rc=$?
+    check "fork-sandbox fleet teardown --all (empty root) routes through and exits 0" "0" "$disp_teardown_rc"
+    contains "fork-sandbox fleet teardown --all (empty root) reports nothing to tear down" "$disp_teardown" "nothing to tear down"
 else
     no "dispatcher wiring" "scripts/fork-sandbox is not executable"
 fi

@@ -7,6 +7,8 @@
 #        fork-sandbox-fleet.sh resolve <name>
 #        fork-sandbox-fleet.sh expand <addr>[,<addr>...]
 #        fork-sandbox-fleet.sh roster
+#        fork-sandbox-fleet.sh teardown <agent> [--thread <id>]
+#        fork-sandbox-fleet.sh teardown --all
 #
 # Two sources of truth, machine config over content:
 #
@@ -56,6 +58,25 @@
 #                  by first-seen position, one address per line.
 #   roster         Human-readable summary: every agent with its resolved
 #                  seat, every list with its members.
+#   teardown <agent> [--thread <id>]
+#   teardown --all
+#                  Destroy persistent (thread, agent) seat state: the
+#                  workspace clone, the session record, and the session
+#                  state dir under the postmaster's mail root (see
+#                  fork-sandbox-postmaster.sh's STATE table). <agent> alone
+#                  tears down every thread that agent has a seat on;
+#                  --thread narrows to one seat; --all tears down every
+#                  seat found. Refuses (naming the run) any seat with a
+#                  live, not-yet-harvested run rather than pull a
+#                  workspace out from under a running sandbox; a --all or
+#                  bare-<agent> sweep still tears down every OTHER named
+#                  seat and reports the refusal alongside them. Removing
+#                  nothing is success, not an error. This is the one verb
+#                  in this script that reads postmaster state
+#                  ($FORK_SANDBOX_MAIL_ROOT/.postmaster) -- a deliberate,
+#                  narrow exception (it is a fleet-lifecycle operation a
+#                  user looks for on the fleet verb); no other verb here
+#                  knows the store or the router exist.
 #
 # A missing fleet file is not an error by itself: `expand`/`resolve` of a
 # bare agent still work from persona files alone (a personas directory
@@ -293,12 +314,152 @@ cmd_roster() {
     done
 }
 
+# ---- teardown (decision: the one narrow exception where this registry
+# reads postmaster state -- see the header comment above cmd_teardown's
+# entry in the Verbs: list) ----
+
+# Sets MAIL_ROOT/STATE and the postmaster state paths teardown needs.
+# Mirrors the same-named assignments in fork-sandbox-postmaster.sh
+# exactly; duplicated rather than sourced, since sourcing that script
+# would also pull in its own usage()/dispatch (decision 6: keep the
+# coupling to exactly this verb).
+teardown_state_paths() {
+    MAIL_ROOT="${FORK_SANDBOX_MAIL_ROOT:-/var/tmp/claude-scratch/agent-mail}"
+    STATE="$MAIL_ROOT/.postmaster"
+    RUNS="$STATE/runs"
+    HARVESTED="$STATE/harvested"
+    PM_SESSION_STATE="$STATE/state"
+    PM_SESSIONS="$STATE/sessions"
+    PM_WORKSPACES="$STATE/workspaces"
+}
+
+teardown_env_get() {
+    [[ -f "$1" ]] || return 0
+    sed -n "s/^$2=//p" "$1" | tail -n1
+}
+
+# Prints a live run's id for (agent, tid) and returns 0, or returns 1.
+# Mirrors pm_find_live_run (fork-sandbox-postmaster.sh) exactly.
+teardown_live_run() {
+    local agent="$1" tid="$2" f rid a t
+    for f in "$RUNS"/*.env; do
+        [[ -e "$f" ]] || continue
+        rid="$(basename -- "$f" .env)"
+        [[ -e "$HARVESTED/$rid" ]] && continue
+        a="$(teardown_env_get "$f" AGENT)"
+        t="$(teardown_env_get "$f" THREAD)"
+        if [[ "$a" == "$agent" && "$t" == "$tid" ]]; then
+            printf '%s' "$rid"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Prints "<tid>\t<agent>" for every seat found under the workspace,
+# session, or session-state trees, deduped. want_agent="" means any agent
+# (the --all sweep); otherwise only that agent's seats.
+teardown_find_seats() {
+    local want_agent="$1" base d tid agent
+    local -A seen=()
+    for base in "$PM_WORKSPACES" "$PM_SESSIONS" "$PM_SESSION_STATE"; do
+        for d in "$base"/*/*; do
+            [[ -e "$d" ]] || continue
+            tid="$(basename -- "$(dirname -- "$d")")"
+            agent="$(basename -- "$d")"
+            [[ -n "$want_agent" && "$agent" != "$want_agent" ]] && continue
+            [[ -n "${seen["$tid"$'\t'"$agent"]:-}" ]] && continue
+            seen["$tid"$'\t'"$agent"]=1
+            printf '%s\t%s\n' "$tid" "$agent"
+        done
+    done
+}
+
+# Tears down one (thread, agent) seat: the workspace clone, the session
+# record, and the session state dir. Refuses a seat with a live,
+# not-yet-harvested run, naming it, rather than pull a clone out from
+# under a running sandbox. Always prints one line for the seat --
+# "nothing to remove" is success, not silence, so an operator running
+# this interactively sees confirmation either way.
+teardown_seat() {
+    local tid="$1" agent="$2" run_id
+    local -a removed=()
+    if run_id="$(teardown_live_run "$agent" "$tid")"; then
+        echo "Error: $agent/$tid: refusing, run '$run_id' is still live." >&2
+        return 1
+    fi
+    local ws="$PM_WORKSPACES/$tid/$agent"
+    local sess="$PM_SESSIONS/$tid/$agent"
+    local st="$PM_SESSION_STATE/$tid/$agent"
+    [[ -e "$ws" ]] && { rm -rf -- "$ws"; removed+=("workspace"); }
+    [[ -e "$sess" ]] && { rm -f -- "$sess"; removed+=("session record"); }
+    [[ -e "$st" ]] && { rm -rf -- "$st"; removed+=("session state"); }
+    if (( ${#removed[@]} )); then
+        local joined; joined="$(IFS=', '; echo "${removed[*]}")"
+        printf '%s/%s: removed %s\n' "$agent" "$tid" "$joined"
+    else
+        printf '%s/%s: nothing to remove\n' "$agent" "$tid"
+    fi
+}
+
+cmd_teardown() {
+    teardown_state_paths
+    local agent="" thread=""
+
+    if [[ "${1-}" == "--all" ]]; then
+        shift
+        if (( $# > 0 )); then
+            echo "Error: teardown --all takes no other arguments." >&2
+            return 1
+        fi
+    else
+        agent="${1:?Usage: fork-sandbox-fleet.sh teardown <agent> [--thread <id>] | teardown --all}"
+        shift
+        fleet_validate_name "$agent" || return 1
+        while (( $# > 0 )); do
+            case "$1" in
+                --thread)
+                    thread="${2:?Usage: fork-sandbox-fleet.sh teardown <agent> --thread <id>}"
+                    shift 2
+                    ;;
+                *)
+                    echo "Error: teardown: unexpected argument '$1'." >&2
+                    return 1
+                    ;;
+            esac
+        done
+    fi
+
+    local -a seats=()
+    if [[ -n "$thread" ]]; then
+        seats=("$thread"$'\t'"$agent")
+    else
+        local line
+        while IFS= read -r line; do
+            [[ -n "$line" ]] && seats+=("$line")
+        done < <(teardown_find_seats "$agent")
+    fi
+
+    if (( ${#seats[@]} == 0 )); then
+        printf 'nothing to tear down.\n'
+        return 0
+    fi
+
+    local rc=0 seat tid a
+    for seat in "${seats[@]}"; do
+        IFS=$'\t' read -r tid a <<< "$seat"
+        teardown_seat "$tid" "$a" || rc=1
+    done
+    return "$rc"
+}
+
 case "${1-}" in
     -h|--help) usage; exit 0 ;;
     check) shift; cmd_check "$@" ;;
     resolve) shift; cmd_resolve "$@" ;;
     expand) shift; cmd_expand "$@" ;;
     roster) shift; cmd_roster "$@" ;;
+    teardown) shift; cmd_teardown "$@" ;;
     "")
         usage >&2
         exit 1
