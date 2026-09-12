@@ -145,7 +145,7 @@ set -euo pipefail
 printf -- '----CALL----\n' >> "$STUB_ARGV_LOG"
 for a in "$@"; do printf '%s\n' "$a" >> "$STUB_ARGV_LOG"; done
 run_dir="$(mktemp -d "$STUB_RUN_PREFIX/run.XXXXXX")"
-mkdir -p -- "$run_dir/outbox"
+mkdir -p -- "$run_dir/outbox" "$run_dir/inbox"
 if [[ -n "${STUB_IMMEDIATE_EXIT:-}" ]]; then
     printf '%s\n' "${STUB_IMMEDIATE_EXIT}" > "$run_dir/exit-code"
 fi
@@ -333,6 +333,20 @@ if grep -qF -- '--pi-args' "$STUB_ARGV_LOG"; then
 else
     ok "seat carol: no --pi-args on a claude harness"
 fi
+
+# ============================================================
+printf '\n== spawn: INBOX recorded in the run env file ==\n'
+# ============================================================
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+
+send_msg '@bob' '@alice' 'inbox key' 'body' 8 >/dev/null
+once
+run_env="$(env_file_for_agent alice)"
+run_dir="$(sed -n 's/^RUN_DIR=//p' "$run_env")"
+check "spawn: INBOX recorded in the run's env file" "INBOX=$run_dir/inbox" \
+    "$(grep '^INBOX=' "$run_env")"
 
 # ============================================================
 printf '\n== X-Hops 0 gate: no spawn, thread flagged ==\n'

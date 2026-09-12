@@ -172,11 +172,15 @@
 #                                   one wake -- `status` shows the gap;
 #                                   v1 has no repair machinery for it)
 #   runs/<run-id>.env               one spawned wake: AGENT, THREAD,
-#                                   TRIGGER, RUN_DIR, BRANCH, RESUMED (the
-#                                   session id this wake was launched to
-#                                   resume, empty for a fresh one -- what
-#                                   `status` prints in its session column),
-#                                   PENDING_MSGS (comma list, may be empty)
+#                                   TRIGGER, RUN_DIR, INBOX (RUN_DIR's
+#                                   inbox dir, recorded at spawn time so
+#                                   later rule-4 deliveries don't have to
+#                                   derive it from run-dir layout), BRANCH,
+#                                   RESUMED (the session id this wake was
+#                                   launched to resume, empty for a fresh
+#                                   one -- what `status` prints in its
+#                                   session column), PENDING_MSGS (comma
+#                                   list, may be empty)
 #   harvested/<run-id>             marker: this run's outbox is collected
 #   needs-operator/<thread-id>     flag file; content is the reason
 #   spawns/<thread-id>             one line appended per spawn, reset to
@@ -619,6 +623,7 @@ pm_spawn_wake() {
         printf 'THREAD=%s\n' "$tid"
         printf 'TRIGGER=%s\n' "$mid"
         printf 'RUN_DIR=%s\n' "$run_dir"
+        printf 'INBOX=%s\n' "$run_dir/inbox"
         printf 'BRANCH=%s\n' "$branch"
         printf 'RESUMED=%s\n' "$resumed"
         printf 'PENDING_MSGS=\n'
