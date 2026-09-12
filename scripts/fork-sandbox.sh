@@ -4032,8 +4032,11 @@ elif ! git -C "$clone_dir_flag" rev-parse --git-dir >/dev/null 2>&1; then
     mkdir -p "$(dirname "$clone_dir")"
 
     echo "Cloning '$origin_repo' for the sandbox..." >&2
+    # true: this is a NEW persistent workspace, so fs_make_clone dissociates
+    # it from the origin's object store once created (see its own comment for
+    # why a --shared clone that outlives this run is a corruption hazard).
     if ! fs_make_clone "$origin_repo" "$branch" "$clone_dir" \
-        "${checkout_ref:+${checkout_sha:-$base_sha}}"; then
+        "${checkout_ref:+${checkout_sha:-$base_sha}}" true; then
         rm -rf "$clone_dir"
         exit 1
     fi

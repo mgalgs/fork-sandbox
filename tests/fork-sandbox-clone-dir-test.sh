@@ -273,6 +273,18 @@ else
     no "first wake: branch starts at the origin project's HEAD" \
         "clone HEAD=$first_head project HEAD=$proj_head"
 fi
+if [[ ! -e "$flow_clone/.git/objects/info/alternates" ]]; then
+    ok "first wake: dissociated from the origin's object store (no alternates file)"
+else
+    no "first wake: dissociated from the origin's object store (no alternates file)" \
+        "$(cat "$flow_clone/.git/objects/info/alternates")"
+fi
+if git -C "$flow_clone" fsck --full >/dev/null 2>&1; then
+    ok "first wake: git fsck passes with the origin's objects repacked locally"
+else
+    no "first wake: git fsck passes with the origin's objects repacked locally" \
+        "$(git -C "$flow_clone" fsck --full 2>&1)"
+fi
 if grep -qxF 'claude-session/' "$flow_clone/.git/info/exclude" 2>/dev/null; then
     ok "first wake: claude-session/ is excluded via .git/info/exclude"
 else

@@ -386,10 +386,27 @@ fs_warn_if_dirty() {
 # refs/tags only, so a commit the source repo keeps under its own ref
 # namespace — a fetched pull request head, say — has no name here. The object
 # is still readable through the alternates, so a sha resolves.
+#
+# A fifth argument, "true", dissociates the clone from the origin's object
+# store right after creation: `git repack -a -d` pulls every reachable object
+# (including everything read through alternates so far) into a pack local to
+# this clone, then the alternates file is removed so nothing here can read
+# the origin's store again. --shared is free speed for a clone that dies with
+# the run, but a persistent --clone-dir workspace lives for as long as its
+# seat does — long enough for the operator to delete a landed wake branch in
+# the origin and `git gc` to prune the objects behind it, which would leave
+# this workspace's history dangling with no way back. The caller passes true
+# only when creating a NEW persistent workspace (never on the throwaway path,
+# never on a --clone-dir reuse, which fetches into an already-dissociated
+# clone and needs nothing special); disk cost per seat is accepted.
 fs_make_clone() {
-    local repo="$1" branch="$2" dest="$3" start_sha="${4:-}" key value
+    local repo="$1" branch="$2" dest="$3" start_sha="${4:-}" dissociate="${5:-false}" key value
     git clone --shared --quiet "$repo" "$dest" || return 1
     (cd "$dest" && git checkout --quiet -b "$branch" ${start_sha:+"$start_sha"}) || return 1
+    if [[ "$dissociate" == true ]]; then
+        git -C "$dest" repack -a -d --quiet || return 1
+        rm -f "$dest/.git/objects/info/alternates"
+    fi
     # Carry the origin's identity across. git clone copies no repo-local
     # config, so a repo whose user.email is a local override — a work address
     # on a machine whose ~/.gitconfig holds a personal one — leaves the clone
