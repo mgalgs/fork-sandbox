@@ -268,7 +268,11 @@ mail_stage_attachments() {
         base="$(basename -- "$f")"
         mkdir -p -- "$dir"
         cp -f -- "$f" "$dir/$base"
-        names+=("$base")
+        local dup=0 n
+        for n in "${names[@]:-}"; do
+            [[ "$n" == "$base" ]] && { dup=1; break; }
+        done
+        (( dup )) || names+=("$base")
     done
     (IFS='/'; printf '%s' "${names[*]:-}")
 }

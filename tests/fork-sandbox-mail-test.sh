@@ -323,6 +323,22 @@ contains "the same-invocation collision refusal names the shared basename" "$out
 check "the same-invocation collision refusal staged no attachment" "$attach_files_before" \
     "$(find "$FORK_SANDBOX_MAIL_ROOT" -path '*/attachments/*' -type f | wc -l)"
 
+printf '\n== attachments: two --attach args in one command sharing a basename with IDENTICAL content is allowed and de-duplicated ==\n'
+
+mkdir -p "$work/samedup-a" "$work/samedup-b"
+echo "same bytes" > "$work/samedup-a/samedup.txt"
+echo "same bytes" > "$work/samedup-b/samedup.txt"
+samedup_id="$("$mail" reply --from @bob --reply-to "$att_id" --body - \
+    --attach "$work/samedup-a/samedup.txt" --attach "$work/samedup-b/samedup.txt" <<< "x" 2>diag.txt)"
+rc=$?
+check "identical-content duplicate --attach exits 0" "0" "$rc"
+raw_samedup="$("$mail" show "$samedup_id")"
+check "identical-content duplicate --attach yields exactly one X-Attachment header" "1" \
+    "$(grep -c '^X-Attachment:' <<< "$raw_samedup")"
+contains "the X-Attachment header names the shared basename" "$raw_samedup" "X-Attachment: attachments/samedup.txt"
+check "exactly one file is staged for the shared basename" "1" \
+    "$(find "$FORK_SANDBOX_MAIL_ROOT" -path '*/attachments/samedup.txt' -type f | wc -l)"
+
 printf '\n== attachments: multiple clean attachments ==\n'
 
 echo "file a" > "attach,a.txt"
