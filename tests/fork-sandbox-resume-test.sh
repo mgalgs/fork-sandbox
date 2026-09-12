@@ -295,13 +295,15 @@ STUB
 chmod +x "$stub_bin/claude-sandboxed"
 
 # Runs the launcher for real, in the foreground, against a fixture $HOME and
-# the stub above, and prints "argv-file<newline>run-dir" for the CALLER to
+# a given project, and prints "argv-file<newline>run-dir" for the CALLER to
 # register -- this body runs inside the caller's command substitution, so a
-# tmpdirs+= here would never reach the trap.
-run_and_capture_argv() {
-    local home="$1"; shift
-    local proj handoff_dir handoff argv_file cfg out rc rd
-    proj="$(new_project "$home")"
+# tmpdirs+= here would never reach the trap. Takes the project explicitly (as
+# opposed to run_and_capture_argv, below, which makes a fresh one per call)
+# so a caller can drive --clone-dir reuse against a fixed origin_repo across
+# more than one wake.
+run_and_capture_argv_at() {
+    local home="$1" proj="$2"; shift 2
+    local handoff_dir handoff argv_file cfg out rc rd
     handoff_dir="$(mktemp -d "$scratch/fs-resume-ho.XXXXXX")"
     handoff="$handoff_dir/handoff.md"
     printf 'do the task\n' > "$handoff"
@@ -320,6 +322,14 @@ run_and_capture_argv() {
     fi
     printf '%s\n%s\n%s\n%s\n' "$argv_file" "$handoff_dir" "$cfg" "$rd"
     (( rc == 0 ))
+}
+
+# Same, but makes its own fresh project rather than taking one from the
+# caller -- the common case, everywhere a test does not need the project
+# held fixed across repeated calls (see run_and_capture_argv_at above).
+run_and_capture_argv() {
+    local home="$1"; shift
+    run_and_capture_argv_at "$home" "$(new_project "$home")" "$@"
 }
 
 register_run_paths() {
@@ -496,31 +506,9 @@ printf '\n== a resumed wake in a reused --clone-dir workspace is told differentl
 # resume-session branch; this covers the two where resume_session is set
 # too, which only this suite's flags can reach).
 
-# Mirrors run_and_capture_argv above, except the caller passes its own
-# project (so --clone-dir reuse is against a fixed origin_repo across wakes)
-# and its own extra flags.
-run_and_capture_argv_at() {
-    local home="$1" proj="$2"; shift 2
-    local handoff_dir handoff argv_file cfg out rc rd
-    handoff_dir="$(mktemp -d "$scratch/fs-resume-ho.XXXXXX")"
-    handoff="$handoff_dir/handoff.md"
-    printf 'do the task\n' > "$handoff"
-    argv_file="$(mktemp "$scratch/fs-resume-argv.XXXXXX")"
-    cfg="$(mktemp -d)"
-    out="$(HOME="$home" PATH="$stub_bin:$PATH" FORK_SANDBOX_CONFIG_DIR="$cfg" \
-        FAKE_ARGV_FILE="$argv_file" \
-        timeout 120 "$launcher" --foreground --harness claude "$@" \
-        "$proj" "$handoff" 2>&1)"
-    rc=$?
-    rd=""
-    if (( rc != 0 )); then
-        printf 'run failed (rc=%s):\n%s\n' "$rc" "$out" >&2
-    else
-        rd="$(printf '%s\n' "$out" | sed -n 's/^  run dir:  *//p' | head -1)"
-    fi
-    printf '%s\n%s\n%s\n%s\n' "$argv_file" "$handoff_dir" "$cfg" "$rd"
-    (( rc == 0 ))
-}
+# run_and_capture_argv_at (defined above, near run_and_capture_argv) takes
+# the project explicitly for exactly this: driving --clone-dir reuse against
+# a fixed origin_repo across more than one wake.
 
 reuse_home="$(mktmp_dir "$scratch/fs-resume-home.XXXXXX")"
 reuse_proj="$(new_project "$reuse_home")"

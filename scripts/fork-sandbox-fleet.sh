@@ -357,11 +357,12 @@ cmd_roster() {
 # that would also pull in its own usage()/dispatch (decision 6: keep the
 # coupling to exactly this verb).
 
-# Mirrors pm_lock_acquire/pm_lock_release (fork-sandbox-postmaster.sh)
-# exactly: the same flock(2) on the same file, so teardown and a routing
-# pass cannot run at the same time. Non-blocking -- an operator running
-# this interactively should see the conflict, not hang behind a router
-# that could be mid-spawn for a while.
+# Mirrors pm_lock_acquire/pm_lock_release (fork-sandbox-postmaster.sh): the
+# same flock(2) on the same file, so teardown and a routing pass cannot run
+# at the same time. Non-blocking -- an operator running this interactively
+# should see the conflict, not hang behind a router that could be mid-spawn
+# for a while. Not identical, though -- see teardown_lock_release's own
+# comment for the one place these two diverge.
 teardown_lock_acquire() {
     mkdir -p -- "$STATE"
     exec {teardown_lock_fd}<>"$LOCK_FILE" || return 1

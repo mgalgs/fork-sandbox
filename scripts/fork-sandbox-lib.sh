@@ -327,6 +327,18 @@ fs_reuse_clone() {
         start_sha="$checkout_sha"
     fi
     git -C "$dest" checkout --quiet -b "$branch" ${start_sha:+"$start_sha"} || return 1
+    # A workspace created before dissociate-on-create existed (or otherwise
+    # still --shared) reads its history through objects/info/alternates for
+    # as long as it persists, which is exactly the corruption hazard
+    # fs_make_clone's own "true" branch exists to close off: the operator can
+    # delete a landed wake branch and its origin ref, `git gc --prune=now`
+    # the origin, and strand this workspace's history with no way back. Close
+    # it here too, the first time a pre-existing workspace is reused, rather
+    # than only on workspaces fs_make_clone dissociated at creation.
+    if [[ -e "$dest/.git/objects/info/alternates" ]]; then
+        git -C "$dest" repack -a -d --quiet || return 1
+        rm -f "$dest/.git/objects/info/alternates"
+    fi
     printf '%s\n' "$start_sha"
     return 0
 }
@@ -454,9 +466,11 @@ fs_warn_if_dirty() {
 # seat does — long enough for the operator to delete a landed wake branch in
 # the origin and `git gc` to prune the objects behind it, which would leave
 # this workspace's history dangling with no way back. The caller passes true
-# only when creating a NEW persistent workspace (never on the throwaway path,
-# never on a --clone-dir reuse, which fetches into an already-dissociated
-# clone and needs nothing special); disk cost per seat is accepted.
+# only when creating a NEW persistent workspace (never on the throwaway path;
+# a --clone-dir reuse does not go through fs_make_clone at all, so this flag
+# does not apply there -- see fs_reuse_clone, which does its own equivalent
+# dissociation for a workspace that predates this check); disk cost per seat
+# is accepted.
 fs_make_clone() {
     local repo="$1" branch="$2" dest="$3" start_sha="${4:-}" dissociate="${5:-false}" key value
     git clone --shared --quiet "$repo" "$dest" || return 1
