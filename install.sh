@@ -297,6 +297,7 @@ PORCELAIN=(
     ensure-scratch-dirs.sh    # UserPromptSubmit hook command: settings.json invokes it by bare name
     fork-sandbox
     fork-sandbox-k8s.sh
+    fork-sandbox-mail.sh
     fork-sandbox-say.sh
     fork-sandbox-status.sh
     fork-sandbox.sh
