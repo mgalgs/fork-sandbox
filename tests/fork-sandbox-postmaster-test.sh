@@ -1231,6 +1231,54 @@ else
 fi
 
 # ============================================================
+printf '\n== handoff render failure flags the thread instead of killing the pass ==\n'
+# ============================================================
+
+# pm_write_handoff runs fork-sandbox-mail-render.py under this script's
+# set -euo pipefail with nothing guarding the call; a non-zero exit from
+# the renderer must not take the whole `deliver --once` process down with
+# it, and must not leave the triggering message stranded with no flag
+# (it is already marked routed by the time pm_spawn_wake runs). Corrupt
+# one message's Thread-ID header in place so the renderer is handed a
+# thread id with no directory on disk -- "no thread '<id>' under
+# <root>" is a real, confirmed renderer failure, not a stub. A second,
+# unrelated message in the same pass must still spawn normally.
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+
+msg_file_of() {
+    local mid="$1" f
+    for f in "$FORK_SANDBOX_MAIL_ROOT"/threads/*/*.msg; do
+        [[ -e "$f" ]] || continue
+        grep -q "^Message-ID: $mid\$" "$f" && { printf '%s' "$f"; return 0; }
+    done
+    return 1
+}
+
+mid_bad="$(send_msg '@carol' '@bob' 'render will fail' 'body for the doomed thread' 8)"
+tid_bad="$(thread_of "$mid_bad")"
+bogus_tid="${tid_bad}-missing"
+msg_file="$(msg_file_of "$mid_bad")"
+sed -i "s/^Thread-ID: .*/Thread-ID: $bogus_tid/" "$msg_file"
+
+mid_ok="$(send_msg '@carol' '@alice' 'render will succeed' 'body for the healthy thread' 8)"
+tid_ok="$(thread_of "$mid_ok")"
+
+: > "$STUB_ARGV_LOG"
+rc="$(once_rc)"
+check "deliver --once still exits 0 (one bad thread doesn't kill the pass)" "0" "$rc"
+check "the corrupted thread's agent (bob) never spawns" 0 \
+    "$(grep -c -- "^sbx-mail-${bogus_tid:0:8}-bob-" "$STUB_ARGV_LOG")"
+check "the unrelated thread's agent (alice) still spawns" 1 \
+    "$(grep -c -- "^sbx-mail-${tid_ok:0:8}-alice-" "$STUB_ARGV_LOG")"
+check "the corrupted thread is flagged for the operator" \
+    "handoff render failed for bob: $mid_bad" \
+    "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$bogus_tid" 2>/dev/null || true)"
+check "the doomed message is still marked routed (not retried forever)" 0 \
+    "$([[ -e "$FORK_SANDBOX_MAIL_ROOT/.postmaster/routed/$mid_bad" ]]; echo $?)"
+
+# ============================================================
 printf '\n== --help and dispatcher wiring ==\n'
 # ============================================================
 

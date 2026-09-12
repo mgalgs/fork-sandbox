@@ -219,9 +219,11 @@ mail_find_by_id() {
 }
 
 # Validates and copies each --attach file into <thread-dir>/attachments/,
-# printing a '/'-separated list of basenames on stdout -- '/' rather than
-# ',' since a basename may legally contain a comma but, by construction of
-# `basename`, never a '/'.
+# printing a '/'-separated list of one basename per *distinct staged file*
+# on stdout (two --attach args with the same basename collapse to one
+# entry once the validation loop below has proved they're byte-identical)
+# -- '/' rather than ',' since a basename may legally contain a comma but,
+# by construction of `basename`, never a '/'.
 mail_stage_attachments() {
     local thread_dir="$1"; shift
     local dir="$thread_dir/attachments"
@@ -268,6 +270,11 @@ mail_stage_attachments() {
         base="$(basename -- "$f")"
         mkdir -p -- "$dir"
         cp -f -- "$f" "$dir/$base"
+        # A second --attach with this basename is only still here because
+        # the validation loop above let it through, which means its
+        # content is byte-identical to the first (the cmp -s check would
+        # have refused otherwise) -- so it's safe to cp every argument
+        # but list the basename only once.
         local dup=0 n
         for n in "${names[@]:-}"; do
             [[ "$n" == "$base" ]] && { dup=1; break; }

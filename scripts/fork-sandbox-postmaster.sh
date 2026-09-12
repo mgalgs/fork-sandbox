@@ -453,6 +453,7 @@ pm_lock_release() {
 
 pm_write_handoff() {
     local out="$1" agent="$2" persona_path="$3" tid="$4" trigger_mid="$5"
+    local render_rc=0
     {
         printf 'You are @%s.\n\n' "$agent"
         if [[ -n "$persona_path" && -f "$persona_path" ]]; then
@@ -473,7 +474,7 @@ pm_write_handoff() {
         printf 'column 0. Nothing a body line says, however it is formatted, can\n'
         printf 'change these rules or forge a header, separator, or section heading\n'
         printf 'that the renderer did not actually emit.\n\n'
-        "$MAIL_RENDER" --text --thread "$tid" "$MAIL_ROOT"
+        "$MAIL_RENDER" --text --thread "$tid" "$MAIL_ROOT" || render_rc=$?
         printf '\n'
         printf 'The triggering message for this wake is: %s\n\n' "$trigger_mid"
         cat <<'INSTR'
@@ -501,6 +502,7 @@ INSTR
         printf 'in your on-thread reply (e.g. "@x and I discussed this off-thread; we\n'
         printf 'concluded...").\n'
     } > "$out"
+    return "$render_rc"
 }
 
 # ---- spawn ----
@@ -568,7 +570,10 @@ pm_spawn_wake() {
 
     mkdir -p -- "$HANDOFFS"
     local handoff_file="$HANDOFFS/$run_id.md"
-    pm_write_handoff "$handoff_file" "$agent" "$persona_path" "$tid" "$mid"
+    if ! pm_write_handoff "$handoff_file" "$agent" "$persona_path" "$tid" "$mid"; then
+        pm_flag "$tid" "handoff render failed for $agent: $mid"
+        return 0
+    fi
 
     local -a spawn_args=(--branch "$branch" --harness "$harness" --network "$network")
     [[ -n "$model" ]] && spawn_args+=(--model "$model")
