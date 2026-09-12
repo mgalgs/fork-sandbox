@@ -18,8 +18,12 @@ entirely.
 Threading is by In-Reply-To within a thread directory, falling back to
 the last id in References when In-Reply-To is absent; a reply whose
 parent cannot be found in the same thread attaches to the thread root
-instead, marked as orphaned. Ties (and top-level orphans) sort by the
-NNN arrival sequence baked into each message's own filename.
+instead, marked as orphaned. A reference cycle among non-root messages
+(In-Reply-To chains that loop without ever reaching the thread root) is
+treated the same way -- attached to the root and marked orphaned --
+rather than being silently dropped from the render. Ties (and top-level
+orphans) sort by the NNN arrival sequence baked into each message's own
+filename.
 
 HTML output is a single self-contained file: inline CSS, both a light
 and a dark theme via prefers-color-scheme, and no external asset beyond
@@ -31,8 +35,15 @@ read.
 
 --text is the agent view: oldest-first, a '---' separator line between
 messages, reply nesting shown by indentation, headers abbreviated to
-From/To/Cc/Subject/hops (deliberately no Date, to save prompt tokens),
-bodies verbatim.
+Message-ID/From/To/Cc/Subject/hops (deliberately no Date, to save prompt
+tokens). The Message-ID is included even though nothing else needs it,
+because it is the handle every id-taking verb (reply --reply-to, show,
+seen) requires, and a view an agent cannot act on is not a view. Body
+lines are verbatim but each is prefixed with the thread indent plus a
+literal '| ', so a body cannot forge the separator or header lines of a
+message that never existed: the renderer's own grammar never emits a
+'| '-prefixed line, so anything carrying that prefix reads as quoted
+body text no matter what it says.
 """
 import argparse
 import html
@@ -112,6 +123,31 @@ def load_thread(thread_dir):
     return entries
 
 
+def resolve_parent(e, by_id, root):
+    """e's immediate parent, or (root, True) when e's In-Reply-To/
+    References is missing, unknown, self-referential, or part of a
+    reference cycle among non-root messages. Without the cycle check, two
+    messages whose In-Reply-To headers name each other both resolve to a
+    real parent and neither is ever reachable by walking from root -- the
+    walk would simply never find them. Following the chain up to root (or
+    until an id repeats) catches that before it happens."""
+    parent_id = e["in_reply_to"] or (e["references"][-1] if e["references"] else "")
+    parent = by_id.get(parent_id) if parent_id else None
+    if parent is None or parent is e:
+        return root, True
+    seen = {id(e)}
+    node = parent
+    while node is not root:
+        if id(node) in seen:
+            return root, True
+        seen.add(id(node))
+        next_id = node["in_reply_to"] or (node["references"][-1] if node["references"] else "")
+        node = by_id.get(next_id) if next_id else None
+        if node is None:
+            break
+    return parent, False
+
+
 def build_thread(thread_id, entries):
     """Threads the entries of one directory into (root, trace): root is
     the entry whose id equals the directory's own thread id (or the
@@ -132,16 +168,8 @@ def build_thread(thread_id, entries):
     for e in valid:
         if e is root:
             continue
-        parent_id = e["in_reply_to"] or (e["references"][-1] if e["references"] else "")
-        parent = by_id.get(parent_id) if parent_id else None
-        orphaned = False
-        if parent is None or parent is e:
-            orphaned = True
-            parent = root
-        if parent is None:
-            top.append((e, orphaned, False))
-        else:
-            children.setdefault(id(parent), []).append((e, orphaned, False))
+        parent, orphaned = resolve_parent(e, by_id, root)
+        children.setdefault(id(parent), []).append((e, orphaned, False))
     for e in invalid:
         top.append((e, False, True))
     for lst in children.values():
@@ -251,8 +279,7 @@ def render_message_card(e, depth, orphaned, is_error):
     )
 
 
-def render_thread_section(data):
-    summ = thread_summary(data)
+def render_thread_section(data, summ):
     msgs = "\n".join(
         render_message_card(e, depth, orphaned, is_error)
         for e, depth, orphaned, is_error in data["trace"]
@@ -358,7 +385,9 @@ def build_html(mail_root, thread_ids, title):
     datas = [render_thread_data(mail_root, tid) for tid in thread_ids]
     summaries = [thread_summary(d) for d in datas]
     index_html = render_index(summaries)
-    threads_html = "\n".join(render_thread_section(d) for d in datas)
+    threads_html = "\n".join(
+        render_thread_section(d, s) for d, s in zip(datas, summaries)
+    )
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -389,6 +418,7 @@ def render_text_message(e, depth, orphaned, is_error, out):
         out.append(f"{indent}[error: {e['error']}]")
         return
     orphan_suffix = " [orphaned]" if orphaned else ""
+    out.append(f"{indent}Message-ID: {e['id']}")
     out.append(f"{indent}From: {e['from']}{orphan_suffix}")
     out.append(f"{indent}To: {e['to']}")
     if e["cc"]:
@@ -399,7 +429,7 @@ def render_text_message(e, depth, orphaned, is_error, out):
         out.append(f"{indent}Attachments: " + ", ".join(e["attachments"]))
     out.append("")
     for ln in e["body"].split("\n"):
-        out.append(f"{indent}{ln}" if ln else "")
+        out.append(f"{indent}| {ln}" if ln else f"{indent}|")
 
 
 def render_text(mail_root, thread_ids):
@@ -443,8 +473,12 @@ def main(argv=None):
 
     document = build_html(args.mail_root, thread_ids, args.title)
     if args.output:
-        with open(args.output, "w", encoding="utf-8") as f:
-            f.write(document)
+        try:
+            with open(args.output, "w", encoding="utf-8") as f:
+                f.write(document)
+        except OSError as e:
+            print(f"Error: could not write {args.output}: {e}", file=sys.stderr)
+            return 1
     else:
         sys.stdout.write(document)
     return 0
