@@ -66,7 +66,13 @@
 #      header: external senders receive mail only in the archive. M's own
 #      From is never a wake candidate on either header, even when it only
 #      reaches the list via a list address M's To: or Cc: expands through
-#      -- a sender never wakes on a message it sent itself.
+#      -- a sender never wakes on a message it sent itself. A handler seat
+#      (`handler: exec`) skips the triage check entirely regardless of the
+#      fleet's triage: configuration -- triage exists to gate a paid model
+#      call before it is spent, and a handler wake is a deterministic
+#      script, not a model call; wake-on-cc still gates a handler on Cc
+#      exactly as it would an LLM seat (a handler that should only answer
+#      To-direct mail sets wake-on-cc: false in its seat).
 #   1. Operator reset: if M's From does NOT resolve as a fleet agent, M is
 #      operator/external mail -- clear T's needs-operator flag and reset
 #      T's spawn count to 0 BEFORE applying rules 2-3 to M. The operator
@@ -111,6 +117,13 @@
 #      follow-up wake is spawned for the newest pending message exactly as
 #      before live delivery existed.
 #
+#   A candidate that clears rules 0-4 is spawned per THE WAKE below -- unless
+#   its seat declares `handler: exec` (fleet resolve's handler/command
+#   fields), in which case it runs synchronously per THE WAKE's handler
+#   variant instead of a sandbox spawn: no live delivery either (rule 4's
+#   live-delivery path never applies to a handler run, since it is never
+#   still "live" by the time routing could find it -- see STATE below).
+#
 # THE WAKE
 #
 # Spawned via `fork-sandbox.sh --branch <b> --harness <h> [--model <m>]
@@ -150,6 +163,39 @@
 # deliver now needs python3 on the host, but fork-sandbox-fleet-parse.py
 # already requires python3 for fleet parsing, so this is not a new
 # practical requirement, just a newly-honest one.
+#
+# A handler seat (`handler: exec`) is woken differently: no clone, branch,
+# run dir, session, live delivery, or triage -- "the wake" means running the
+# operator-authored script named by the seat's command field
+# ($FORK_SANDBOX_HANDLERS_DIR/<command>, resolved and executable-checked
+# again at wake time even though `fleet check` already verified it, since
+# the file on disk could change between check and wake) SYNCHRONOUSLY,
+# inline in the deliver pass, with:
+#   stdin   the same fork-sandbox-mail-render.py --text rendering of the
+#           thread an LLM wake's handoff embeds -- the anti-forgery grammar
+#           (quoted vs. unquoted lines) holds identically for a handler.
+#   env     FS_HANDLER_AGENT (the seat's own name, no @), FS_HANDLER_THREAD
+#           (thread id), FS_HANDLER_TRIGGER (the triggering message id),
+#           FS_HANDLER_OUTBOX (a fresh, empty, writable directory), and
+#           FS_HANDLER_ATTACH_DIR (the thread's attachments dir -- read-only
+#           by convention, not enforcement; the handler is trusted host-side
+#           config, the same trust class as a hook or a
+#           fork-sandbox-discover-* plugin, never LLM output).
+# It replies exactly like an LLM wake: mail-*.md files written to
+# FS_HANDLER_OUTBOX in the REPLY HARVEST format below, harvested by the
+# same pm_harvest_one_file code an LLM wake's run dir outbox uses -- no
+# separate parse path. Writing no files is a valid outcome (no reply).
+# It runs under a timeout ($FORK_SANDBOX_HANDLER_TIMEOUT seconds, default
+# 300, enforced via the $FS_TIMEOUT binary); a timeout or a non-zero exit
+# still harvests whatever well-formed files were written before the script
+# was killed or exited, then flags the thread naming the handler and the
+# exit cause -- a crashed or hung handler is exactly as visible to the
+# operator as a crashed sandbox wake. Because the script runs to
+# completion (or is killed by the timeout) before pm_exec_wake returns, a
+# handler is never "already running" the way rule 4 tracks a live sandbox
+# run: v1 accepts that a slow handler stalls the whole deliver pass behind
+# it -- the timeout is what bounds that, not any concurrency -- see
+# LIMITATIONS.
 #
 # REPLY HARVEST
 #
@@ -251,7 +297,36 @@
 #                                   To: or only reached via Cc: (list
 #                                   expansion included); recomputed from
 #                                   the trigger message's own To: at spawn
-#                                   time, see pm_wake_via)
+#                                   time, see pm_wake_via). A handler seat's
+#                                   run (see THE WAKE's handler variant)
+#                                   writes a deliberately minimal record
+#                                   instead: AGENT, THREAD, TRIGGER,
+#                                   KIND=exec, VIA -- no RUN_DIR, HARNESS,
+#                                   RESUMED, BRANCH, INBOX, or PENDING_MSGS,
+#                                   since none of those apply to a script
+#                                   that never had a sandbox, a session, or
+#                                   a live-delivery-eligible inbox.
+#                                   pm_exec_wake writes this record and this
+#                                   run's harvested/<run-id> marker (below)
+#                                   in the same call, before either SPAWNS
+#                                   or SEQ (further below) get the run id
+#                                   appended -- a handler wake is therefore
+#                                   never observable as "live" by anything
+#                                   that scans runs/ for an unharvested one
+#                                   (fs_pm_find_live_run, `status`'s live-run
+#                                   listing): it runs to completion
+#                                   synchronously within one deliver pass,
+#                                   so there is no window where it could be
+#                                   mid-flight across two scans.
+#   handler-outbox/<run-id>         a handler wake's FS_HANDLER_OUTBOX
+#                                   (see THE WAKE's handler variant) --
+#                                   unlike an LLM wake's outbox, which
+#                                   lives under its ephemeral scratch run
+#                                   dir and is someone else's to clean up,
+#                                   this sits under $STATE, so pm_exec_wake
+#                                   removes it itself once its contents are
+#                                   harvested (or found malformed) --
+#                                   nothing here outlives its own wake
 #   harvested/<run-id>             marker: this run's outbox is collected
 #   delivered-live/<thread-id>     one line per message rule 4 confirmed
 #                                   was delivered live at harvest (agent,
@@ -320,6 +395,14 @@
 # anything fork-sandbox-mail.sh owns.
 #
 # LIMITATIONS (v1 does not do these; a later round might):
+#   - A handler seat (`handler: exec`) runs synchronously, inline in the
+#     deliver pass (see THE WAKE's handler variant) -- there is no
+#     concurrency or backgrounding for it. A slow handler stalls the whole
+#     pass behind it, delaying routing for every other message and thread
+#     until it returns or its timeout ($FORK_SANDBOX_HANDLER_TIMEOUT,
+#     default 300) kills it. The timeout bounds
+#     how long a stall can last; it does not make the wake concurrent with
+#     anything else deliver is doing.
 #   - Session resume depends on the harness's own capability
 #     (fs_harness_session_caps, fork-sandbox-lib.sh): claude and codex
 #     resume by id (discovered from the prior wake's summary.json, see
@@ -1134,12 +1217,10 @@ pm_exec_wake() {
     [[ -n "$trigger_file" ]] && trigger_hops="$(pm_header "$trigger_file" X-Hops)"
     [[ "$trigger_hops" =~ ^[0-9]+$ ]] || trigger_hops=0
 
-    local mf
-    for mf in "$outbox"/mail-*.md; do
-        [[ -e "$mf" ]] || continue
-        pm_harvest_one_file "$mf" "$agent" "$tid" "$mid" "$trigger_hops"
-    done
-
+    # Flag the exit code before harvesting, not after: pm_flag overwrites
+    # rather than appends, and a per-file parse failure below is a more
+    # actionable reason than "exited N" -- it should win the collision, the
+    # same order the LLM wake path uses (pm_harvest_run, further down).
     if (( rc != 0 )); then
         local cause="exited $rc"
         (( rc == 124 )) && cause="timed out after ${timeout_s}s"
@@ -1148,6 +1229,21 @@ pm_exec_wake() {
         pm_flag "$tid" "handler '$command' for $agent $cause: $mid$err_out"
     fi
     rm -f -- "$stderr_capture"
+
+    local mf
+    for mf in "$outbox"/mail-*.md; do
+        [[ -e "$mf" ]] || continue
+        pm_harvest_one_file "$mf" "$agent" "$tid" "$mid" "$trigger_hops"
+    done
+
+    # Unlike an LLM wake's outbox (part of its ephemeral scratch run dir,
+    # cleaned up by whatever tore down the sandbox), $outbox lives under
+    # $STATE, which nothing else ever removes -- fleet teardown only
+    # touches the paths fs_pm_state_paths names, and none of those is
+    # this. Every byte a handler ever wrote here is already either
+    # harvested into the mail store above or was malformed and named in a
+    # pm_flag reason, so there is nothing left worth keeping it for.
+    rm -rf -- "$outbox"
 
     mkdir -p -- "$RUNS"
     {

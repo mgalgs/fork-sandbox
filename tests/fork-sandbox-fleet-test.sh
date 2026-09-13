@@ -266,6 +266,114 @@ agents:
     refresh-at: soon
 EOF
 
+printf '\n== check: handler:exec schema ==\n'
+
+bad "a handler value other than 'exec' is refused" \
+    "agents.riffler.handler: takes 'exec', not 'foo'" <<'EOF'
+agents:
+  riffler:
+    handler: foo
+    command: some-handler
+EOF
+
+bad "handler seat naming a persona is refused" \
+    "agents.riffler.persona: not allowed alongside 'handler: exec'" <<'EOF'
+agents:
+  riffler:
+    handler: exec
+    command: some-handler
+    persona: does-not-exist.md
+EOF
+
+bad "handler seat naming refresh-at is refused" \
+    "agents.riffler.refresh-at: not allowed alongside 'handler: exec'" <<'EOF'
+agents:
+  riffler:
+    handler: exec
+    command: some-handler
+    refresh-at: 0.5
+EOF
+
+bad "handler seat naming harness is refused" \
+    "agents.riffler.harness: not allowed alongside 'handler: exec'" <<'EOF'
+agents:
+  riffler:
+    handler: exec
+    command: some-handler
+    harness: pi
+EOF
+
+bad "command without handler is refused" \
+    "agents.riffler.handler: 'command' requires 'handler: exec'" <<'EOF'
+agents:
+  riffler:
+    command: some-handler
+EOF
+
+bad "handler without command is refused" \
+    "agents.riffler.command: required when 'handler' is set" <<'EOF'
+agents:
+  riffler:
+    handler: exec
+EOF
+
+bad "a command containing a path separator is refused" \
+    "must be a bare command name" <<'EOF'
+agents:
+  riffler:
+    handler: exec
+    command: sub/dir/handler
+EOF
+
+new_root HANDLERS_TEST_DIR
+export FORK_SANDBOX_HANDLERS_DIR="$HANDLERS_TEST_DIR"
+
+bad "a handler command that does not exist on disk is refused" \
+    "does not exist" <<'EOF'
+agents:
+  riffler:
+    handler: exec
+    command: nonexistent-handler
+EOF
+
+printf '#!/bin/sh\n' > "$HANDLERS_TEST_DIR/unexecutable-handler"
+chmod -x "$HANDLERS_TEST_DIR/unexecutable-handler"
+bad "a handler command that exists but is not executable is refused" \
+    "is not executable" <<'EOF'
+agents:
+  riffler:
+    handler: exec
+    command: unexecutable-handler
+EOF
+
+printf '#!/bin/sh\n' > "$HANDLERS_TEST_DIR/real-handler"
+chmod +x "$HANDLERS_TEST_DIR/real-handler"
+saved_fleet_for_handlers_dir="$(cat "$FORK_SANDBOX_FLEET_FILE")"
+cat > "$FORK_SANDBOX_FLEET_FILE" <<'EOF'
+agents:
+  riffler:
+    handler: exec
+    command: real-handler
+EOF
+check "a handler command that exists and is executable passes check" "0" \
+    "$("$fleet" check >/dev/null 2>&1; echo $?)"
+printf '%s\n' "$saved_fleet_for_handlers_dir" > "$FORK_SANDBOX_FLEET_FILE"
+
+unset FORK_SANDBOX_HANDLERS_DIR
+
+saved_riffler_md="$(cat "$FORK_SANDBOX_PERSONAS_DIR/riffler.md")"
+cat > "$FORK_SANDBOX_PERSONAS_DIR/riffler.md" <<'EOF'
+---
+handler: exec
+---
+EOF
+bad "handler in persona frontmatter is refused as an unknown key" \
+    "frontmatter.handler: unknown key" <<'EOF'
+agents:
+  riffler: {}
+EOF
+printf '%s\n' "$saved_riffler_md" > "$FORK_SANDBOX_PERSONAS_DIR/riffler.md"
+
 bad "an agent named 'all' is refused, naming the reservation" \
     "is reserved" "agents.all" <<'EOF'
 agents:
@@ -595,6 +703,29 @@ roster_loner="$("$fleet" roster 2>&1)"
 contains "roster: lists a persona-only agent with no fleet.yaml entry" "$roster_loner" "drifter"
 contains "roster: resolves the persona-only agent's harness" "$roster_loner" "harness=codex"
 rm -f "$FORK_SANDBOX_PERSONAS_DIR/drifter.md"
+
+printf '\n== roster shows wake-on-cc on a handler seat ==\n'
+
+# wake-on-cc is NOT in LLM_ONLY_FIELDS -- a handler seat can set it, and it
+# genuinely governs whether that handler wakes on a Cc (see
+# fork-sandbox-postmaster.sh's pm_wake_via / wake-on-cc handling). roster's
+# handler-seat line must surface it rather than silently drop it the way it
+# drops the fields that really are always empty for a handler.
+saved_fleet_for_handler="$(cat "$FORK_SANDBOX_FLEET_FILE")"
+cat > "$FORK_SANDBOX_FLEET_FILE" <<'EOF'
+agents:
+  riffler:
+    model: sonnet
+  quietbot:
+    handler: exec
+    command: some-handler
+    wake-on-cc: false
+EOF
+roster_handler="$("$fleet" roster 2>&1)"
+contains "roster: lists the handler seat" "$roster_handler" "quietbot"
+contains "roster: handler seat line names the command" "$roster_handler" "command=some-handler"
+contains "roster: handler seat line surfaces wake-on-cc=false" "$roster_handler" "wake-on-cc=false"
+printf '%s\n' "$saved_fleet_for_handler" > "$FORK_SANDBOX_FLEET_FILE"
 
 printf '\n== missing fleet file / personas dir ==\n'
 

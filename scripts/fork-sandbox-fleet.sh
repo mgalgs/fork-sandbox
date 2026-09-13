@@ -103,9 +103,14 @@
 #                  position, one address per line.
 #   roster         Human-readable summary: every agent with its resolved
 #                  seat, every list with its members. A handler seat
-#                  prints in a distinct `handler=exec command=<name>`
-#                  form rather than the harness/model/... seat line, since
-#                  those fields are always empty for it.
+#                  prints in a distinct `handler=exec command=<name>
+#                  wake-on-cc=<v>` form rather than the harness/model/...
+#                  seat line, since harness/model/thinking/network/triage
+#                  are always empty for it (refused at check time by
+#                  LLM_ONLY_FIELDS) -- but wake-on-cc is shown explicitly
+#                  because it is NOT one of those: a handler seat can set
+#                  it, and it genuinely governs whether that handler wakes
+#                  on a Cc.
 #   teardown <agent> [--thread <id>]
 #   teardown --all
 #                  Destroy persistent (thread, agent) seat state: the
@@ -510,8 +515,8 @@ cmd_roster() {
           read -r triage; read -r handler; read -r command; } \
             < <(resolve_with_dump "$dump" "$name")
         if [[ -n "$handler" ]]; then
-            printf '  %-20s handler=%-4s command=%s%s\n' \
-                "$name" "$handler" "$command" "${description:+  # $description}"
+            printf '  %-20s handler=%-4s command=%-20s wake-on-cc=%-5s%s\n' \
+                "$name" "$handler" "$command" "${wake_on_cc:--}" "${description:+  # $description}"
         else
             printf '  %-20s harness=%-8s model=%-12s thinking=%-8s network=%-8s wake-on-cc=%-5s refresh-at=%-6s triage=%-5s persona=%s%s\n' \
                 "$name" "${harness:--}" "${model:--}" "${thinking:--}" \

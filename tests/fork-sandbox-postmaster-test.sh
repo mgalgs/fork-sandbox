@@ -2246,6 +2246,13 @@ printf '\nPosted before dying.\n' > "$FS_HANDLER_OUTBOX/mail-1.md"
 exit 1
 STUB
 
+cat > "$HANDLER_STUB_DIR/nonzero-malformed-handler" <<'STUB'
+#!/usr/bin/env bash
+set -uo pipefail
+printf 'Foo: bar\n\nThis should never post.\n' > "$FS_HANDLER_OUTBOX/mail-1.md"
+exit 1
+STUB
+
 cat > "$HANDLER_STUB_DIR/timeout-handler" <<'STUB'
 #!/usr/bin/env bash
 set -uo pipefail
@@ -2288,6 +2295,9 @@ agents:
   nonzero:
     handler: exec
     command: nonzero-handler
+  nonzeromalformed:
+    handler: exec
+    command: nonzero-malformed-handler
   slowpoke:
     handler: exec
     command: timeout-handler
@@ -2347,6 +2357,9 @@ check "happy: FS_HANDLER_TRIGGER is the triggering message id" "TRIGGER:$mid" \
     "$(grep -- '^TRIGGER:' "$HANDLER_LOG")"
 contains "happy: FS_HANDLER_OUTBOX is a fresh dir under the postmaster state" \
     "$(grep -- '^OUTBOX:' "$HANDLER_LOG")" "handler-outbox"
+happy_outbox="$(grep -- '^OUTBOX:' "$HANDLER_LOG" | sed 's/^OUTBOX://')"
+check "happy: the outbox dir is removed once its reply is harvested, not left to accumulate" \
+    0 "$([[ -e "$happy_outbox" ]] && echo 1 || echo 0)"
 check "happy: FS_HANDLER_ATTACH_DIR points at the thread's attachments dir" \
     "ATTACH_DIR:$FORK_SANDBOX_MAIL_ROOT/threads/$tid/attachments" \
     "$(grep -- '^ATTACH_DIR:' "$HANDLER_LOG")"
@@ -2393,6 +2406,22 @@ done
 check "nonzero: reply still posted despite the non-zero exit" 1 "$posted"
 contains "nonzero: thread flagged with an exit-code-shaped reason" \
     "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid" 2>/dev/null)" "exited 1"
+
+# --- scenario: a handler that BOTH writes a malformed reply AND exits
+#     non-zero flags the thread with the malformed-file reason, not the
+#     exit code -- pm_flag overwrites rather than appends, so whichever
+#     flag call runs last wins, and the per-file parse failure is the more
+#     actionable of the two ---
+mid="$(send_msg '@carol' '@nonzeromalformed' 'Dies and posts garbage' 'trigger')"
+tid="$(thread_of "$mid")"
+once
+flag_body="$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid" 2>/dev/null)"
+contains "nonzero+malformed: the malformed-file reason wins the collision" \
+    "$flag_body" "mail-1.md"
+case "$flag_body" in
+    *"exited 1"*) no "nonzero+malformed: the exit-code reason clobbered the malformed-file reason" "$flag_body" ;;
+    *) ok "nonzero+malformed: the exit-code reason did not clobber the malformed-file reason" ;;
+esac
 
 # --- scenario: a handler that outruns the timeout is flagged and the
 #     pass does not hang ---
@@ -2479,6 +2508,12 @@ status_rc=$?
 check "status: exits 0 with only exec-kind runs recorded" 0 "$status_rc"
 contains "status: no exec run is reported live (none harvested-and-live)" "$status_out" "live runs:"
 
+# --- every handler run above (happy, malformed, nonzero, timeout,
+#     hostile, cc, quietbot) removes its own outbox once harvested --
+#     nothing should be left accumulating under the mail root ---
+check "handler-outbox: no run-id directory survives across every scenario above" 0 \
+    "$(find "$FORK_SANDBOX_MAIL_ROOT/.postmaster/handler-outbox" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l)"
+
 unset FORK_SANDBOX_POSTMASTER_TRIAGE_LAUNCHER
 unset FORK_SANDBOX_HANDLERS_DIR
 export FORK_SANDBOX_FLEET_FILE="$SAVED_FLEET_FILE"
@@ -2491,6 +2526,9 @@ printf '\n== --help and dispatcher wiring ==\n'
 help_out="$("$postmaster" --help 2>&1)"
 contains "--help prints usage naming deliver" "$help_out" "deliver"
 contains "--help documents the routing rules" "$help_out" "ROUTING RULES"
+contains "--help documents handler:exec seats" "$help_out" "handler: exec"
+contains "--help documents FORK_SANDBOX_HANDLERS_DIR" "$help_out" "FORK_SANDBOX_HANDLERS_DIR"
+contains "--help documents FORK_SANDBOX_HANDLER_TIMEOUT" "$help_out" "FORK_SANDBOX_HANDLER_TIMEOUT"
 
 dispatcher="$repo_dir/scripts/fork-sandbox"
 if [[ -x "$dispatcher" ]]; then

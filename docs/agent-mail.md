@@ -210,10 +210,27 @@ agents:
     wake-on-cc: false          # never wakes on a Cc, only on To:
   skeptic:
     triage: false              # Cc wake always spawns, skips the classifier
+  notifier:
+    handler: exec              # a deterministic script seat, not an LLM
+    command: notify-slack       # bare name, resolved under $FORK_SANDBOX_HANDLERS_DIR
 lists:
   crew:
     members: [reviewer, scribe, watcher]
 ```
+
+**Handler seats** (`handler: exec`): a script seat instead of an LLM seat.
+`command` (a bare name, never a path — resolved against
+`$FORK_SANDBOX_HANDLERS_DIR`, default `~/.config/fork-sandbox/handlers`,
+and required to exist and be executable both at `fleet check` time and
+again at wake time) is then required, and none of
+`harness`/`model`/`network`/`thinking`/`triage`/`persona`/`refresh-at`
+may be set on the same agent — those tune an LLM seat, which a handler is
+not. `wake-on-cc` still applies: it governs whether the seat wakes on a
+Cc at all, independent of whether the wake is an LLM spawn or a handler
+run. A handler seat is invoked synchronously, inline in the postmaster's
+deliver pass — see `fork-sandbox-postmaster.sh --help` for the wake
+contract (`FS_HANDLER_*` environment, stdin, timeout, and reply harvest,
+which is identical to an LLM wake's).
 
 Precedence per field is **fleet.yaml entry, then persona frontmatter,
 then empty** — `wake-on-cc` included, so a fleet.yaml override wins over
@@ -269,9 +286,10 @@ absence of the key entirely means no Cc wake is ever gated.
 
 ```bash
 fork-sandbox fleet check              # validate everything, report every error
-fork-sandbox fleet resolve <name>     # nine lines: harness, model, thinking,
+fork-sandbox fleet resolve <name>     # eleven lines: harness, model, thinking,
                                       # network, persona-path, description,
-                                      # wake-on-cc, refresh-at, triage
+                                      # wake-on-cc, refresh-at, triage,
+                                      # handler, command
 fork-sandbox fleet resolve-triage     # two lines: harness, model, for the
                                       # top-level triage: block (see above);
                                       # every line empty when there is none
@@ -285,7 +303,7 @@ fork-sandbox fleet teardown --all     # destroy persistent (thread, agent)
 
 `check` accumulates every error across the fleet file and every persona
 it declares — addressed by path, like `agents.reviewer.modle` — rather
-than stopping at the first. `resolve` always prints exactly nine lines;
+than stopping at the first. `resolve` always prints exactly eleven lines;
 an unconfigured field is an empty line, never a missing one.
 
 `teardown` is how an operator reclaims a seat's persistent state (the
@@ -508,6 +526,7 @@ own thread scans never see it:
 | `lock` | a `flock`'d file; the pid inside is for messages only — the mutual exclusion is the kernel's advisory lock, so a killed postmaster cannot leave a stale hold |
 | `routed/<message-id>` | routing already decided for this message |
 | `runs/<run-id>.env` | one spawned wake: agent, thread, trigger, run dir, inbox dir, harness, branch, resumed session id, pending messages, next live-delivery sequence number, `VIA` (`to` or `cc`, whichever header actually produced the wake) |
+| `handler-outbox/<run-id>` | a handler wake's outbox; unlike an LLM wake's (part of its ephemeral scratch run dir), this sits under this same persistent state tree, so the postmaster removes it itself once harvested — nothing here outlives its own wake |
 | `harvested/<run-id>` | this run's outbox is collected |
 | `delivered-live/<thread-id>` | one line per message rule 4 confirmed was delivered live at harvest (agent, message id, run id) — an audit trail, not read back by anything |
 | `needs-operator/<thread-id>` | flag file; its content is the reason |
@@ -680,6 +699,8 @@ marker**, so strip leading whitespace first, then test for `> `.
 | `FORK_SANDBOX_POSTMASTER_INTERVAL` | `15` (seconds) | router loop |
 | `FORK_SANDBOX_POSTMASTER_WAKE_DEAD_GRACE` | see `--help` | dead-wake detection |
 | `FORK_SANDBOX_POSTMASTER_TRIAGE_TIMEOUT` | `120` (seconds) | Cc triage classifier call |
+| `FORK_SANDBOX_HANDLERS_DIR` | `~/.config/fork-sandbox/handlers` | registry, router (`handler: exec` seats) |
+| `FORK_SANDBOX_HANDLER_TIMEOUT` | `300` (seconds) | router (`handler: exec` wake) |
 
 The registry needs PyYAML, as the preset parser does. A machine without
 it gets a plain error naming the package, not a traceback.

@@ -29,10 +29,10 @@ script.
 `handler: exec` marks an agent as a deterministic script seat rather
 than an LLM seat: `command` (a bare name, resolved host-side against the
 operator's handlers directory -- see fork-sandbox-postmaster.sh) is then
-required, and none of `harness`/`model`/`network`/`thinking`/`triage` may
-be set on the same agent -- those tune an LLM seat, which a handler is
-not. `handler`, when present, is always the literal string `exec`;
-nothing else validates.
+required, and none of `harness`/`model`/`network`/`thinking`/`triage`/
+`persona`/`refresh-at` may be set on the same agent -- those tune an LLM
+seat, which a handler is not. `handler`, when present, is always the
+literal string `exec`; nothing else validates.
 
 This script owns every validation rule for both documents -- YAML
 validity, the schema, name shape, the harness/network enums (including
@@ -119,8 +119,11 @@ FIELDS = ("persona", "harness", "model", "network", "thinking",
 FRONTMATTER_FIELDS = ("harness", "model", "network", "thinking",
                        "description", "wake-on-cc", "refresh-at", "triage")
 # LLM-seat-only fields: refused alongside `handler: exec` (decision: a
-# handler is a script seat, not an LLM seat to tune).
-LLM_ONLY_FIELDS = ("harness", "model", "network", "thinking", "triage")
+# handler is a script seat, not an LLM seat to tune). wake-on-cc is
+# deliberately absent: it governs routing (does this seat wake on a Cc at
+# all), which applies to a handler exactly as it does an LLM seat.
+LLM_ONLY_FIELDS = ("harness", "model", "network", "thinking", "triage",
+                    "persona", "refresh-at")
 # Only these two are wired up on the postmaster side (pm_triage_wake's
 # pi and claude arms); a triage seat naming any other harness would
 # validate here and then silently run as claude at launch, so the
