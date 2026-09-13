@@ -216,6 +216,9 @@ contains "reference-cycle thread renders its root message" "$html" "id=\"m-$cycl
 contains "reference-cycle thread renders message A despite mutual In-Reply-To" "$html" "id=\"m-$cycle_a_id\""
 contains "reference-cycle thread renders message B despite mutual In-Reply-To" "$html" "id=\"m-$cycle_b_id\""
 contains "reference-cycle thread's count label matches (3 messages, all reachable)" "$html" '3 messages'
+not_contains "non-live output carries no meta-refresh tag" "$html" 'http-equiv="refresh"'
+not_contains "non-live output carries no LIVE banner" "$html" 'LIVE'
+not_contains "non-live output carries no live-banner div" "$html" 'class="live-banner"'
 
 printf '\n== html: --thread selects one ==\n'
 html_one="$work/one.html"
@@ -256,6 +259,100 @@ if python3 "$renderer" --text "$FORK_SANDBOX_MAIL_ROOT" -o "$work/should-fail.ht
 else
     ok "--text refuses -o/--output"
 fi
+
+printf '\n== --live mode ==\n'
+
+if python3 "$renderer" "$FORK_SANDBOX_MAIL_ROOT" --text --live -o "$work/live-bad.html" >/dev/null 2>"$work/live-text.err"; then
+    no "--live refused when combined with --text"
+else
+    ok "--live refused when combined with --text"
+fi
+contains "--live+--text error is clean" "$(<"$work/live-text.err")" "Error:"
+
+if python3 "$renderer" "$FORK_SANDBOX_MAIL_ROOT" --live >/dev/null 2>"$work/live-noout.err"; then
+    no "--live refused without -o/--output"
+else
+    ok "--live refused without -o/--output"
+fi
+contains "--live without -o error is clean" "$(<"$work/live-noout.err")" "Error:"
+
+if python3 "$renderer" "$FORK_SANDBOX_MAIL_ROOT" --live 1 -o "$work/live-floor.html" >/dev/null 2>"$work/live-floor.err"; then
+    no "--live refuses an interval below the 2s floor"
+else
+    ok "--live refuses an interval below the 2s floor"
+fi
+contains "--live floor error names the minimum" "$(<"$work/live-floor.err")" "at least 2"
+
+if grep -q 'os\.replace(' "$renderer"; then ok "renderer writes via os.replace (atomic)"; else no "renderer writes via os.replace (atomic)"; fi
+if grep -q 'tempfile\.mkstemp(' "$renderer"; then ok "renderer stages a temp file before replace"; else no "renderer stages a temp file before replace"; fi
+
+# A hand-crafted .postmaster/ state: one live run (not yet harvested) and
+# one harvested run, matching the shape fork-sandbox-postmaster.sh itself
+# writes under runs/ and harvested/ (see fs_pm_env_get's NAME=VALUE format).
+pm_dir="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+mkdir -p "$pm_dir/runs" "$pm_dir/harvested"
+cat > "$pm_dir/runs/live-run-1.env" <<EOF
+AGENT=@bob
+THREAD=$root_id
+EOF
+cat > "$pm_dir/runs/done-run-1.env" <<EOF
+AGENT=@carol
+THREAD=$other_id
+EOF
+: > "$pm_dir/harvested/done-run-1"
+
+live_html="$work/live.html"
+python3 "$renderer" "$FORK_SANDBOX_MAIL_ROOT" -o "$live_html" --live 2 --live-cycles 1 2>"$work/live1.err"
+live_rc=$?
+if [[ $live_rc -eq 0 ]]; then ok "--live single cycle exits cleanly"; else no "--live single cycle exits cleanly" "$(cat "$work/live1.err")"; fi
+live_content="$(<"$live_html")"
+contains "--live output carries the meta-refresh tag" "$live_content" '<meta http-equiv="refresh" content="2">'
+contains "--live output carries the LIVE banner" "$live_content" 'class="live-banner"'
+contains "--live banner reports a message count" "$live_content" ' messages'
+contains "--live banner lists the live (unharvested) run only" "$live_content" 'live wakes: @bob@'"${root_id:0:8}"
+not_contains "--live banner omits the harvested run" "$live_content" '@carol@'
+rm -rf "$pm_dir"
+
+# Without any .postmaster/ dir at all, the live-wakes clause is omitted
+# entirely rather than showing "no live wakes" -- the two are meant to
+# read differently: unreadable state vs. confirmed-empty state.
+python3 "$renderer" "$FORK_SANDBOX_MAIL_ROOT" -o "$live_html" --live 2 --live-cycles 1 2>/dev/null
+live_content="$(<"$live_html")"
+contains "--live banner present with no .postmaster/ dir" "$live_content" 'class="live-banner"'
+not_contains "--live banner omits the live-wakes clause when state is unreadable" "$live_content" 'live wakes'
+not_contains "--live banner does not say 'no live wakes' when state is missing (distinct from confirmed-empty)" "$live_content" 'no live wakes'
+
+# An empty (but readable) .postmaster/runs/ reads as confirmed-empty:
+# "no live wakes", not an omitted clause.
+mkdir -p "$pm_dir/runs" "$pm_dir/harvested"
+python3 "$renderer" "$FORK_SANDBOX_MAIL_ROOT" -o "$live_html" --live 2 --live-cycles 1 2>/dev/null
+live_content="$(<"$live_html")"
+contains "--live banner says 'no live wakes' for a readable-but-empty runs/" "$live_content" 'no live wakes'
+rm -rf "$pm_dir"
+
+# Loop survives one bad cycle: make the output's directory briefly
+# unwritable so the middle of three cycles fails to write, then restore
+# it before the final cycle. The loop must not die, and must recover.
+live_dir="$work/live-survives"
+mkdir -p "$live_dir"
+live_survive_html="$live_dir/out.html"
+(
+    python3 "$renderer" "$FORK_SANDBOX_MAIL_ROOT" -o "$live_survive_html" --live 2 --live-cycles 3 \
+        >/dev/null 2>"$work/live-survive.err"
+    echo $? > "$work/live-survive.rc"
+) &
+survive_pid=$!
+# Let the first (immediate) cycle land, then block writes for the second.
+for _ in $(seq 1 50); do [[ -s "$live_survive_html" ]] && break; sleep 0.1; done
+chmod 555 "$live_dir"
+sleep 3
+chmod 755 "$live_dir"
+wait "$survive_pid"
+survive_rc="$(<"$work/live-survive.rc")"
+if [[ "$survive_rc" -eq 0 ]]; then ok "loop survives a mid-loop write failure, exits 0"; else no "loop survives a mid-loop write failure, exits 0" "rc=$survive_rc"; fi
+contains "a failed cycle is reported on stderr, not silently dropped" "$(<"$work/live-survive.err")" "Error:"
+final_live_content="$(<"$live_survive_html")"
+contains "the file is left in a valid, fully-rendered state after recovery" "$final_live_content" '</html>'
 
 printf '\n== exit codes ==\n'
 if python3 "$renderer" "$work/no-such-root" >/dev/null 2>"$work/missing.err"; then

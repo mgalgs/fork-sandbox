@@ -5,6 +5,7 @@ single-file HTML thread archive, or as plain text for agents.
 Usage: fork-sandbox-mail-render.py <mail-root> -o threads.html
        fork-sandbox-mail-render.py <mail-root> --thread <id> -o t.html
        fork-sandbox-mail-render.py --text <mail-root> [--thread <id>]
+       fork-sandbox-mail-render.py <mail-root> -o threads.html --live [SECONDS]
 
 Reads the store fork-sandbox-mail.sh writes under <mail-root>/threads/
 (<thread-id>/NNN-<uuid>.msg -- an RFC 5322-shaped header block, a blank
@@ -46,11 +47,35 @@ separator or header lines of a message that never existed: the
 renderer's own grammar never emits an unquoted line from a body, so
 anything carrying a leading '> ' reads as quoted body text no matter
 what it says.
+
+--live [SECONDS] turns this into a standing process for watching an
+in-progress thread in a browser: render, write the output file
+atomically (temp file in the same directory, then os.replace -- the
+browser's meta-refresh fetches on its own schedule and must never see
+a half-written file), sleep SECONDS (default 15, minimum 2), and
+repeat until SIGINT/SIGTERM. Each cycle re-scans the store, so new
+messages and new threads appear as they land. Requires -o/--output (a
+live loop needs a stable path to poll) and is refused with --text
+(that path feeds postmaster wake prompts -- see the anti-forgery note
+above -- and a looping text dump to stdout serves nobody). Under
+--live only, the HTML gains a <meta http-equiv="refresh"> tag and a
+banner reporting the render time, message count, and any currently
+live postmaster wakes, read from <mail-root>/.postmaster/ (the same
+state `postmaster status` reads). That state is read-only and
+best-effort: a missing or unreadable .postmaster/ just omits the
+live-wakes clause from the banner, never a crash. A bad render
+mid-loop (e.g. a message file mid-write by a concurrent harvest) skips
+that cycle rather than exiting; a bad mail-root at startup still fails
+fast, as without --live. --live-cycles N is a hidden, test-only escape
+hatch that stops the loop after N cycles instead of running forever.
 """
 import argparse
 import html
 import os
+import signal
 import sys
+import tempfile
+import time
 
 
 def esc(s):
@@ -380,22 +405,85 @@ table.index th, table.index td {
 .msg.error { border-color: var(--crit); }
 .attachments { margin-top: 6px; font-size: 12.5px; color: var(--ink-2); }
 .attachments ul { margin: .25rem 0 0; padding-left: 1.2rem; }
+.live-banner {
+  background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px;
+  padding: 6px 12px; margin-bottom: 1rem; font-size: 12.5px; color: var(--ink-2);
+  font-family: var(--mono);
+}
 """
 
 
-def build_html(mail_root, thread_ids, title):
+def render_live_banner(rendered_at, count, live_wakes):
+    """live_wakes is None when postmaster state could not be read at all
+    (the clause is omitted), an empty list when it was read and nothing
+    is live, or a list of 'agent@thread-short-id' strings."""
+    text = f"LIVE · rendered {rendered_at} · {count} messages"
+    if live_wakes is not None:
+        if live_wakes:
+            text += " · live wakes: " + ", ".join(live_wakes)
+        else:
+            text += " · no live wakes"
+    return f'<div class="live-banner">{esc(text)}</div>'
+
+
+def get_live_wakes(mail_root):
+    """Currently-live postmaster wakes, read from the same
+    <mail-root>/.postmaster/{runs,harvested}/ state `postmaster status`
+    reads. Returns None if that state cannot be read at all (missing
+    dir, permission error); an unreadable or unparseable individual run
+    record is skipped rather than aborting the whole read. Read-only:
+    never writes, creates, or locks anything under .postmaster/."""
+    runs_dir = os.path.join(mail_root, ".postmaster", "runs")
+    harvested_dir = os.path.join(mail_root, ".postmaster", "harvested")
+    try:
+        names = os.listdir(runs_dir)
+    except OSError:
+        return None
+    wakes = []
+    for fn in sorted(names):
+        if not fn.endswith(".env"):
+            continue
+        rid = fn[:-len(".env")]
+        if os.path.exists(os.path.join(harvested_dir, rid)):
+            continue
+        agent = tid = None
+        try:
+            with open(os.path.join(runs_dir, fn), encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if line.startswith("AGENT="):
+                        agent = line[len("AGENT="):].rstrip("\n")
+                    elif line.startswith("THREAD="):
+                        tid = line[len("THREAD="):].rstrip("\n")
+        except OSError:
+            continue
+        if agent and tid:
+            wakes.append(f"{agent}@{tid[:8]}")
+    return wakes
+
+
+def build_html(mail_root, thread_ids, title, live=None):
+    """live, when given, is a dict with 'interval', 'rendered_at' and
+    'live_wakes' (see get_live_wakes) and adds a meta-refresh tag plus a
+    status banner. live=None (the default) renders byte-identical output
+    to a plain, non-live run."""
     datas = [render_thread_data(mail_root, tid) for tid in thread_ids]
     summaries = [thread_summary(d) for d in datas]
     index_html = render_index(summaries)
     threads_html = "\n".join(
         render_thread_section(d, s) for d, s in zip(datas, summaries)
     )
+    meta_refresh = ""
+    banner_html = ""
+    if live is not None:
+        meta_refresh = f'<meta http-equiv="refresh" content="{live["interval"]}">\n'
+        count = sum(len(d["entries"]) for d in datas)
+        banner_html = render_live_banner(live["rendered_at"], count, live["live_wakes"]) + "\n"
     return f"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{esc(title)}</title>
+{meta_refresh}<title>{esc(title)}</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap">
@@ -403,7 +491,7 @@ def build_html(mail_root, thread_ids, title):
 </head>
 <body>
 <div class="wrap">
-<h1>{esc(title)}</h1>
+{banner_html}<h1>{esc(title)}</h1>
 {index_html}
 {threads_html}
 </div>
@@ -443,6 +531,77 @@ def render_text(mail_root, thread_ids):
     return "\n".join(out) + ("\n" if out else "")
 
 
+def write_atomic(path, content):
+    """Writes content to path via a temp file in the same directory plus
+    os.replace, so a concurrent reader (the browser, on its meta-refresh
+    timer) never observes a partially-written file."""
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    fd, tmp_path = tempfile.mkstemp(prefix=".mail-render-", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+class _StopLive(Exception):
+    """Raised from the SIGINT/SIGTERM handler to unwind run_live cleanly."""
+
+
+def run_live(mail_root, output, title, thread_filter, interval, cycles):
+    """Renders in a loop: render, write atomically, sleep, repeat, until
+    SIGINT/SIGTERM (cycles=None) or `cycles` renders have happened
+    (cycles is the test-only escape hatch, see --live-cycles). The first
+    cycle's write failure is fatal (a bad output path fails fast, same
+    as a one-shot run); every cycle after that is caught and skipped so
+    one bad render never kills the loop."""
+
+    def raise_stop(signum, frame):
+        raise _StopLive()
+
+    signal.signal(signal.SIGINT, raise_stop)
+    signal.signal(signal.SIGTERM, raise_stop)
+
+    def render_once():
+        all_ids = list_thread_ids(mail_root)
+        if thread_filter:
+            thread_ids = [thread_filter] if thread_filter in all_ids else []
+        else:
+            thread_ids = all_ids
+        live = {
+            "interval": interval,
+            "rendered_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "live_wakes": get_live_wakes(mail_root),
+        }
+        write_atomic(output, build_html(mail_root, thread_ids, title, live=live))
+
+    try:
+        render_once()
+    except OSError as e:
+        print(f"Error: could not write {output}: {e}", file=sys.stderr)
+        return 1
+    except _StopLive:
+        return 0
+
+    n = 1
+    try:
+        while cycles is None or n < cycles:
+            time.sleep(interval)
+            try:
+                render_once()
+            except Exception as e:
+                print(f"Error: live render cycle failed, skipping: {e}", file=sys.stderr)
+            n += 1
+    except _StopLive:
+        pass
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("mail_root", help="fork-sandbox-mail.sh store root")
@@ -450,7 +609,23 @@ def main(argv=None):
     parser.add_argument("-o", "--output", metavar="FILE", help="write HTML to FILE instead of stdout")
     parser.add_argument("--text", action="store_true", help="render as plain text to stdout instead of HTML")
     parser.add_argument("--title", default="Mail threads", help="HTML page title (default: %(default)s)")
+    parser.add_argument(
+        "--live", metavar="SECONDS", nargs="?", type=int, const=15, default=None,
+        help="re-render to -o/--output on an interval (default 15s, minimum 2s) until interrupted",
+    )
+    parser.add_argument("--live-cycles", type=int, default=None, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+
+    if args.live is not None:
+        if args.live < 2:
+            print("Error: --live SECONDS must be at least 2", file=sys.stderr)
+            return 1
+        if args.text:
+            print("Error: --live cannot be combined with --text", file=sys.stderr)
+            return 1
+        if not args.output:
+            print("Error: --live requires -o/--output", file=sys.stderr)
+            return 1
 
     threads_dir = os.path.join(args.mail_root, "threads")
     if not os.path.isdir(threads_dir):
@@ -472,6 +647,9 @@ def main(argv=None):
             return 1
         sys.stdout.write(render_text(args.mail_root, thread_ids))
         return 0
+
+    if args.live is not None:
+        return run_live(args.mail_root, args.output, args.title, args.thread, args.live, args.live_cycles)
 
     document = build_html(args.mail_root, thread_ids, args.title)
     if args.output:
