@@ -604,8 +604,29 @@ def cmd_check(fleet_file, label, personas_dir):
             # contract never injects a persona body into it (stdin is
             # just the rendered thread), so it needs no persona file at
             # all; requiring one here would fail `check` for the wrong
-            # reason.
+            # reason. But `agent["persona"]` is itself one of the
+            # LLM_ONLY_FIELDS refused in fleet.yaml for a handler seat,
+            # so a leftover file only ever sits at the bare <name>.md
+            # path -- and if it's there (e.g. an LLM seat converted to
+            # a handler in place), resolve_with_dump still reads it and
+            # falls back to its fields, so it still needs the same
+            # frontmatter validation, including the LLM_ONLY_FIELDS
+            # refusal, that a non-handler seat's persona gets.
             if agent["handler"] == "exec":
+                persona_path = os.path.join(personas_dir, f"{name}.md")
+                if os.path.isfile(persona_path):
+                    fm = parse_frontmatter(persona_path, persona_path,
+                                            errors)
+                    for field in LLM_ONLY_FIELDS:
+                        if field == "persona":
+                            continue
+                        if fm.get(field):
+                            errors.append(
+                                f"agents.{name}: persona file "
+                                f"'{persona_path}' sets '{field}', not "
+                                f"allowed alongside 'handler: exec' -- a "
+                                f"handler seat is a script, not an LLM "
+                                f"seat to tune")
                 continue
             persona_name = agent["persona"] or f"{name}.md"
             persona_path = os.path.join(personas_dir, persona_name)

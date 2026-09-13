@@ -1184,9 +1184,6 @@ pm_exec_wake() {
     run_id="$(pm_new_uuid)"
     via="$(pm_wake_via "$mid" "$agent")"
 
-    local outbox="$HANDLER_OUTBOX/$run_id"
-    mkdir -p -- "$outbox"
-
     local rendered
     rendered="$(mktemp "$MAIL_ROOT/.postmaster.handler.XXXXXX")"
     if ! "$MAIL_RENDER" --text --thread "$tid" "$MAIL_ROOT" > "$rendered"; then
@@ -1194,6 +1191,9 @@ pm_exec_wake() {
         pm_flag "$tid" "thread render failed for handler $agent: $mid"
         return 0
     fi
+
+    local outbox="$HANDLER_OUTBOX/$run_id"
+    mkdir -p -- "$outbox"
 
     local timeout_s stderr_capture rc
     timeout_s="${FORK_SANDBOX_HANDLER_TIMEOUT:-300}"

@@ -2508,9 +2508,30 @@ status_rc=$?
 check "status: exits 0 with only exec-kind runs recorded" 0 "$status_rc"
 contains "status: no exec run is reported live (none harvested-and-live)" "$status_out" "live runs:"
 
+# --- scenario: a thread render failure (forced here by corrupting the
+#     triggering message's own Thread-ID, the same trick the LLM wake
+#     render-failure scenario above uses) flags the thread and never
+#     creates an outbox dir to leak -- pm_exec_wake only mkdir's $outbox
+#     after the render succeeds ---
+mid="$(send_msg '@carol' '@happy' 'Render will fail' 'trigger')"
+tid="$(thread_of "$mid")"
+bogus_tid="${tid}-missing"
+msg_file="$(msg_file_of "$mid")"
+sed -i "s/^Thread-ID: .*/Thread-ID: $bogus_tid/" "$msg_file"
+: > "$HANDLER_LOG"
+once
+check "render failure: the handler never runs for the doomed message" 0 \
+    "$(grep -c -- "^TRIGGER:$mid\$" "$HANDLER_LOG")"
+contains "render failure: thread is flagged, naming the handler" \
+    "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$bogus_tid" 2>/dev/null)" \
+    "thread render failed for handler happy"
+check "render failure: no outbox directory is left behind" 0 \
+    "$(find "$FORK_SANDBOX_MAIL_ROOT/.postmaster/handler-outbox" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l)"
+
 # --- every handler run above (happy, malformed, nonzero, timeout,
-#     hostile, cc, quietbot) removes its own outbox once harvested --
-#     nothing should be left accumulating under the mail root ---
+#     hostile, cc, quietbot, the render failure above) removes its own
+#     outbox once harvested (or never creates one) -- nothing should be
+#     left accumulating under the mail root ---
 check "handler-outbox: no run-id directory survives across every scenario above" 0 \
     "$(find "$FORK_SANDBOX_MAIL_ROOT/.postmaster/handler-outbox" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l)"
 

@@ -328,6 +328,13 @@ EOF
 new_root HANDLERS_TEST_DIR
 export FORK_SANDBOX_HANDLERS_DIR="$HANDLERS_TEST_DIR"
 
+# riffler.md's fixture frontmatter (harness/model, set at the top of this
+# file) is exactly the stale-LLM-persona-on-a-handler-seat shape `check`
+# now refuses -- swap it out for the duration of these handler-command
+# tests so they exercise command resolution, not that refusal.
+saved_riffler_md_for_handlers="$(cat "$FORK_SANDBOX_PERSONAS_DIR/riffler.md")"
+rm -f -- "$FORK_SANDBOX_PERSONAS_DIR/riffler.md"
+
 bad "a handler command that does not exist on disk is refused" \
     "does not exist" <<'EOF'
 agents:
@@ -358,10 +365,28 @@ EOF
 check "a handler command that exists and is executable passes check" "0" \
     "$("$fleet" check >/dev/null 2>&1; echo $?)"
 printf '%s\n' "$saved_fleet_for_handlers_dir" > "$FORK_SANDBOX_FLEET_FILE"
+printf '%s\n' "$saved_riffler_md_for_handlers" > "$FORK_SANDBOX_PERSONAS_DIR/riffler.md"
 
 unset FORK_SANDBOX_HANDLERS_DIR
 
 saved_riffler_md="$(cat "$FORK_SANDBOX_PERSONAS_DIR/riffler.md")"
+cat > "$FORK_SANDBOX_PERSONAS_DIR/riffler.md" <<'EOF'
+---
+harness: pi
+model: some-model
+thinking: high
+refresh-at: 0.5
+---
+EOF
+bad "a handler seat with a stale LLM persona file is refused, not silently ignored" \
+    "not allowed alongside 'handler: exec'" <<'EOF'
+agents:
+  riffler:
+    handler: exec
+    command: real-handler
+EOF
+printf '%s\n' "$saved_riffler_md" > "$FORK_SANDBOX_PERSONAS_DIR/riffler.md"
+
 cat > "$FORK_SANDBOX_PERSONAS_DIR/riffler.md" <<'EOF'
 ---
 handler: exec
