@@ -1272,9 +1272,10 @@ pm_spawn_wake() {
     # by a wake -- wake_on_cc is a routing decision made before a wake is
     # ever spawned (see pm_process_message's Cc expansion). triage (9th
     # line) is likewise unused here -- pm_triage_wake reads its own copy
-    # before this function is ever called. preset (10th line) is read here
-    # to keep the line contract in sync with `resolve`, but not yet acted
-    # on -- see the `--preset` passthrough this function grows separately.
+    # before this function is ever called. preset (10th line) is acted on
+    # below, once the handler branch (next) has been ruled out -- a
+    # handler seat can never carry a preset (mutually exclusive, refused
+    # at `fleet check`).
     # handler/command (11th/12th lines) ARE used: a non-empty handler
     # branches straight to pm_exec_wake, below, before any of the
     # LLM-only spawn_args/session logic that follows.
@@ -1333,6 +1334,11 @@ pm_spawn_wake() {
     fi
 
     local -a spawn_args=(--branch "$branch" --harness "$harness" --network "$network")
+    # --preset goes first -- documentation only, `fork-sandbox.sh` applies
+    # flags over the preset key-by-key regardless of argv order (see
+    # docs/presets.md) -- so a preset-seat's own harness/model/network/
+    # thinking flags below still win over anything the preset sets.
+    [[ -n "$preset" ]] && spawn_args=(--preset "$preset" "${spawn_args[@]}")
     [[ -n "$model" ]] && spawn_args+=(--model "$model")
     if [[ "$harness" == pi && -n "$thinking" ]]; then
         spawn_args+=(--pi-args "--thinking $thinking")

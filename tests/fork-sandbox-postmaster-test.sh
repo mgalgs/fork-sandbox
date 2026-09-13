@@ -93,6 +93,16 @@ new_root FORK_SANDBOX_FLEET_FILE_DIR
 export FORK_SANDBOX_FLEET_FILE="$FORK_SANDBOX_FLEET_FILE_DIR/fleet.yaml"
 new_root FORK_SANDBOX_PERSONAS_DIR
 export FORK_SANDBOX_PERSONAS_DIR
+new_root FORK_SANDBOX_PRESETS_DIR
+export FORK_SANDBOX_PRESETS_DIR
+
+# A real preset FILE (content is irrelevant -- `fleet check`'s preset
+# check is existence-only, and this fixture's stub fork-sandbox.sh never
+# actually compiles it) so the preset-seat fixture below passes `fleet
+# check` at fixture-setup time.
+cat > "$FORK_SANDBOX_PRESETS_DIR/solo.yaml" <<'EOF'
+# stub preset for postmaster --preset passthrough tests
+EOF
 
 cat > "$FORK_SANDBOX_PERSONAS_DIR/alice.md" <<'EOF'
 ---
@@ -120,6 +130,9 @@ Frank is the non-sealed pi seat used by the session-resume tests -- bob is
 the sealed sibling, wired the same way (see the "sealed pi seat" resume
 group): agent-sandboxed's own --session-dir/--session-id carry it through.
 EOF
+cat > "$FORK_SANDBOX_PERSONAS_DIR/gina.md" <<'EOF'
+Gina is the preset seat used by the --preset passthrough tests.
+EOF
 
 cat > "$FORK_SANDBOX_FLEET_FILE" <<'EOF'
 agents:
@@ -135,6 +148,10 @@ agents:
     model: vendor/model
   dana:
     wake-on-cc: false
+  gina:
+    harness: pi
+    model: vendor/ginamodel
+    preset: solo
 lists:
   team:
     members: [alice, bob, carol]
@@ -208,6 +225,13 @@ once_rc() {
 argv_after() {
     local flag="$1" file="$2"
     awk -v f="$flag" 'found{print; exit} $0==f{found=1}' "$file"
+}
+
+# Line number of the LAST occurrence of a flag in the argv log -- used to
+# check --preset lands before --harness, not just that both are present.
+argv_line_of() {
+    local flag="$1" file="$2"
+    awk -v f="$flag" '$0==f{n=NR} END{print n+0}' "$file"
 }
 
 env_file_for_agent() {
@@ -439,6 +463,26 @@ if grep -qF -- '--pi-args' "$STUB_ARGV_LOG"; then
     no "seat carol: no --pi-args on a claude harness"
 else
     ok "seat carol: no --pi-args on a claude harness"
+fi
+if grep -qF -- '--preset' "$STUB_ARGV_LOG"; then
+    no "seat carol: no --preset flag on a presetless seat (regression guard)"
+else
+    ok "seat carol: no --preset flag on a presetless seat (regression guard)"
+fi
+
+: > "$STUB_ARGV_LOG"
+send_msg '@alice' '@gina' 'seat gina' 'body' 8 >/dev/null
+once
+check "seat gina: --preset carries the fleet.yaml preset name" "solo" \
+    "$(argv_after '--preset' "$STUB_ARGV_LOG")"
+check "seat gina: --harness still passed, unchanged by the preset" "pi" \
+    "$(argv_after '--harness' "$STUB_ARGV_LOG")"
+check "seat gina: --model still passed, unchanged by the preset" "vendor/ginamodel" \
+    "$(argv_after '--model' "$STUB_ARGV_LOG")"
+if (( $(argv_line_of '--preset' "$STUB_ARGV_LOG") < $(argv_line_of '--harness' "$STUB_ARGV_LOG") )); then
+    ok "seat gina: --preset positioned before --harness in argv"
+else
+    no "seat gina: --preset positioned before --harness in argv"
 fi
 
 # ============================================================
