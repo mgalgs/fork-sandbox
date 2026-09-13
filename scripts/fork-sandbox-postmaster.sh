@@ -220,9 +220,18 @@
 #                                   a claude wake, every other harness
 #                                   falls back to a follow-up spawn),
 #                                   BRANCH, RESUMED (the session id this
-#                                   wake was launched to resume, empty for
-#                                   a fresh one -- what `status` prints in
-#                                   its session column), PENDING_MSGS
+#                                   wake was launched with, empty when none
+#                                   was -- what `status` prints in its
+#                                   session column. For a "discover" harness
+#                                   (claude, codex) this id was read back
+#                                   from a prior wake's summary.json, so
+#                                   non-empty means an existing session was
+#                                   actually resumed. For a "given" harness
+#                                   (pi) the id is derived rather than
+#                                   discovered and is passed from the seat's
+#                                   very first wake onward, so non-empty
+#                                   there does not by itself mean a session
+#                                   already existed to resume), PENDING_MSGS
 #                                   (comma list, may be empty), MAIL_SEQ
 #                                   (the next live-delivery sequence
 #                                   number for this run, see

@@ -183,8 +183,12 @@
 #                        under) — the directory is writable from inside an
 #                        unattended session, so where it may point is a
 #                        security boundary. Refused on a harness with no
-#                        session-resume capability, and refused with --k8s,
-#                        which has no host directory to bind. It exists so a
+#                        session-resume capability, refused with --k8s, and
+#                        refused with --harness pi --network sealed (and its
+#                        pi-local alias): that run dispatches through
+#                        agent-sandboxed, which has no session-dir/session-id
+#                        wiring at all, so pi's own session-resume capability
+#                        does not reach it. It exists so a
 #                        caller that wakes the same agent repeatedly — the
 #                        postmaster, on one mail thread — can hand the next
 #                        wake the previous one's session. The CODING legs
@@ -256,6 +260,10 @@
 #                        harness whose id is "discovered" instead (claude,
 #                        codex; use --resume-session there) or with no
 #                        session-resume capability, and refused with --k8s.
+#                        Also refused with --harness pi --network sealed
+#                        (and its pi-local alias), same as --session-state
+#                        above: agent-sandboxed has no session-dir/session-id
+#                        wiring at all.
 #                        <id> must match ^[0-9a-f][0-9a-f-]{7,63}$, the same
 #                        shape --resume-session requires, since it is used as
 #                        a directory/filename component inside the bound
