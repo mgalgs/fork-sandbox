@@ -235,8 +235,12 @@
 #                        leading hyphen is refused. Resume is a continuity and
 #                        cost optimization, never a correctness guarantee: if
 #                        the session is unknown or its transcript is
-#                        unreadable, the harness's sandboxed wrapper retries
-#                        once as a fresh session and the run continues.
+#                        unreadable, the coding leg retries once as a fresh
+#                        session and the run continues -- inside
+#                        claude-sandboxed itself for claude, or here in the
+#                        runner for codex, which runs through claude-sandboxed's
+#                        --exec mode and so cannot use that wrapper's own
+#                        --session-state-gated retry.
 #                        Nothing but the transcript crosses over, so the
 #                        coding leg's prompt gains a "This session is a
 #                        continuation" section naming what did not: the
@@ -5642,6 +5646,12 @@ started_at="$(date +%s)"
     # Empty unless --session-state was given; the runner reads it at the end
     # to name this run's session_id in summary.json.
     printf 'session_state=%q\n' "$session_state"
+    # Empty unless --resume-session was given. The runner's codex
+    # retry-as-fresh check (beside impl_sandbox_cmd's invocation) reads this
+    # to know a resume was actually attempted -- without it, referencing
+    # $resume_session there would be an unbound-variable error under this
+    # script's own set -u.
+    printf 'resume_session=%q\n' "$resume_session"
     # Empty unless --session-id was given (harnesses with FS_HARNESS_ID_MODE
     # "given", i.e. pi): the runner echoes it back as-is into
     # summary.json's session_id, since there is nothing to discover.
@@ -6144,6 +6154,40 @@ else
         | tee -a "$events"
 fi
 rc="${PIPESTATUS[0]:-1}"
+# Resume is a continuity optimization for codex too (see claude-sandboxed's
+# own RESUME_FAIL_RE for the analogous claude case, unreachable here because
+# codex runs through claude-sandboxed's --exec mode, which claude-sandboxed
+# itself refuses to combine with --session-state/--resume-session). A codex
+# resume that fails on a missing rollout must not cost the caller the wake:
+# retry ONCE, fresh -- cont_sandbox_cmd, never spliced with `resume`, already
+# binds the same durable session store (see fs_build_sandbox_cmd's codex
+# arm) -- a second failure is the run's own. Host-verified: `codex exec
+# --json resume <bad-id> -` prints exactly this text to STDERR and exits 1;
+# the match is deliberately narrower than codex's full wording
+# ("thread/resume: thread/resume failed: ...") since only the
+# rollout-not-found fragment is the actual failure signature -- a false
+# positive here reruns a session that already did its work, at full price.
+# Neither $sandbox_log nor $events is truncated before the retry: both are
+# real, user-facing artifacts (accounting below reads $events in full, and a
+# human debugging a double-failure needs both attempts' stderr), and there
+# is no second grep of either after this one retry.
+CODEX_RESUME_FAIL_RE='no rollout found for thread id .* \(code -32600\)'
+if [[ "$rc" != "0" && "$harness" == codex && -n "$session_state" \
+    && -n "$resume_session" ]] \
+    && grep -qiE "$CODEX_RESUME_FAIL_RE" "$sandbox_log"; then
+    echo "fork-sandbox: codex resume failed, retrying fresh (session $resume_session)" >&2
+    if [[ -n "$formatter" ]]; then
+        fs_run_lock_closed "${cont_sandbox_cmd[@]}" < "$handoff" \
+            2> >(tee -a "$sandbox_log" >&2) \
+            | tee -a "$events" \
+            | "$formatter"
+    else
+        fs_run_lock_closed "${cont_sandbox_cmd[@]}" < "$handoff" \
+            2> >(tee -a "$sandbox_log" >&2) \
+            | tee -a "$events"
+    fi
+    rc="${PIPESTATUS[0]:-1}"
+fi
 # The implement leg is leg 1. Archive right after its exit code is known,
 # same as every later leg below.
 fs_archive_inbox 1 "$harness" "$rc"

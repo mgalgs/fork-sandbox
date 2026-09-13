@@ -1462,5 +1462,145 @@ else
     fi
 fi
 
+# ---------------------------------------------------------------------------
+printf '\n== codex: resume-as-fresh retry inside the runner ==\n'
+# ---------------------------------------------------------------------------
+
+# codex's resume splice runs inside claude-sandboxed's --exec mode (see
+# fs_build_sandbox_cmd's codex arm), and --exec is exactly what
+# claude-sandboxed refuses to combine with --session-state/--resume-session
+# -- so the retry a resume failure needs cannot live inside claude-sandboxed's
+# own RESUME_FAIL_RE/run_attempt. It lives in the runner (this suite's own
+# generated run.sh) instead. Stub claude-sandboxed itself, the one thing
+# between the runner and codex: it records every attempt's argv, and
+# simulates codex's own "no rollout found" failure -- host-verified against
+# the real codex CLI, see fork-sandbox.sh's own retry comment -- on the first
+# attempt whose argv carries the resume splice, succeeding on any attempt
+# without one.
+cat > "$stub_bin/claude-sandboxed" <<'STUB'
+#!/usr/bin/env bash
+cat >/dev/null
+if [[ -n "${CODEX_ARGV_FILE:-}" ]]; then
+    printf '%s\n' "$@" >> "$CODEX_ARGV_FILE"
+    printf -- '--- attempt end ---\n' >> "$CODEX_ARGV_FILE"
+fi
+is_resume=0
+for a in "$@"; do
+    [[ "$a" == resume ]] && is_resume=1
+done
+if (( is_resume )) && [[ -n "${CODEX_FAIL_ONCE:-}" && -e "${CODEX_FAIL_ONCE}" ]]; then
+    rm -f "$CODEX_FAIL_ONCE"
+    echo "Error: thread/resume: thread/resume failed: no rollout found for thread id 00000000-0000-0000-0000-000000000000 (code -32600)" >&2
+    exit 1
+fi
+if [[ -n "${CODEX_FAIL_MESSAGE:-}" ]]; then
+    printf '%s\n' "$CODEX_FAIL_MESSAGE" >&2
+    exit 1
+fi
+exit 0
+STUB
+chmod +x "$stub_bin/claude-sandboxed"
+
+# A codex resolution needs a real, unexpired-looking JWT on the launcher
+# side (fs_resolve_harness's codex arm reads it before anything is cloned) --
+# same fixture fork-sandbox-review-harness-test.sh's real_codex_home uses.
+codex_home="$(mktmp_dir "$scratch/fs-resume-codexhome.XXXXXX")"
+printf '{"tokens":{"access_token":"e30.eyJleHAiOjQxMDI0NDQ4MDB9.sig","refresh_token":"fixture"}}\n' \
+    > "$codex_home/auth.json"
+codex_cfg="$(mktmp_dir "$scratch/fs-resume-codexcfg.XXXXXX")"
+codex_sid=0123abcd-4567-89ab-cdef-0123456789ab
+
+# --- a resume-shaped failure retries fresh, once, and the run succeeds ------
+codex_fail_once="$scratch/fs-resume-codex-failonce.$$"
+tmpdirs+=("$codex_fail_once")
+: > "$codex_fail_once"
+codex_argv="$scratch/fs-resume-codexargv.$$"
+tmpdirs+=("$codex_argv")
+codex_state="$(mktmp_dir "$scratch/fs-resume-codexstate.XXXXXX")"
+codex_run_home="$(mktmp_dir "$scratch/fs-resume-home.XXXXXX")"
+codex_out="$(HOME="$codex_run_home" \
+    PATH="$stub_bin:$PATH" FORK_SANDBOX_CONFIG_DIR="$codex_cfg" \
+    CODEX_HOME="$codex_home" FORK_SANDBOX_BACKEND=fake-image \
+    CODEX_ARGV_FILE="$codex_argv" CODEX_FAIL_ONCE="$codex_fail_once" \
+    timeout 120 "$launcher" --foreground --harness codex \
+    --session-state "$codex_state" --resume-session "$codex_sid" \
+    "$(new_project "$codex_run_home")" "$refusal_handoff" 2>&1)"
+codex_rc=$?
+codex_run_dir="$(printf '%s\n' "$codex_out" | sed -n 's/^  run dir:  *//p' | head -1)"
+[[ -n "$codex_run_dir" ]] && tmpdirs+=("$codex_run_dir")
+
+if printf '%s\n' "$codex_out" | grep -q 'codex resume failed, retrying fresh'; then
+    ok "a resume-shaped codex failure logs the marker line"
+else
+    no "a resume-shaped codex failure logs the marker line" "$codex_out"
+fi
+if (( $(grep -cx -- '--- attempt end ---' "$codex_argv") == 2 )); then
+    ok "a resume-shaped codex failure runs codex exactly twice"
+else
+    no "a resume-shaped codex failure runs codex exactly twice" "$(cat "$codex_argv")"
+fi
+if [[ "$(sed -n '/--- attempt end ---/,$p' "$codex_argv" | grep -cx resume)" == 0 ]]; then
+    ok "the retry's own argv carries no resume splice"
+else
+    no "the retry's own argv carries no resume splice" "$(cat "$codex_argv")"
+fi
+if (( codex_rc == 0 )); then
+    ok "the run succeeds when the fresh retry does"
+else
+    no "the run succeeds when the fresh retry does" "rc=$codex_rc: $codex_out"
+fi
+
+# --- a failure that is NOT resume-shaped is the run's own: no retry --------
+codex_unrelated_argv="$scratch/fs-resume-codex-unrelatedargv.$$"
+tmpdirs+=("$codex_unrelated_argv")
+codex_unrelated_home="$(mktmp_dir "$scratch/fs-resume-home.XXXXXX")"
+codex_unrelated_out="$(HOME="$codex_unrelated_home" \
+    PATH="$stub_bin:$PATH" FORK_SANDBOX_CONFIG_DIR="$codex_cfg" \
+    CODEX_HOME="$codex_home" FORK_SANDBOX_BACKEND=fake-image \
+    CODEX_ARGV_FILE="$codex_unrelated_argv" \
+    CODEX_FAIL_MESSAGE="Error: the model refused to do the work" \
+    timeout 120 "$launcher" --foreground --harness codex \
+    --session-state "$codex_state" --resume-session "$codex_sid" \
+    "$(new_project "$codex_unrelated_home")" "$refusal_handoff" 2>&1)"
+codex_unrelated_rc=$?
+if (( $(grep -cx -- '--- attempt end ---' "$codex_unrelated_argv") == 1 )); then
+    ok "a non-resume codex failure does NOT retry"
+else
+    no "a non-resume codex failure does NOT retry" "$(cat "$codex_unrelated_argv")"
+fi
+if (( codex_unrelated_rc != 0 )); then
+    ok "a non-resume codex failure keeps its exit code"
+else
+    no "a non-resume codex failure keeps its exit code" "$codex_unrelated_out"
+fi
+
+# --- no --session-state/--resume-session means no retry gate at all --------
+# even if the resume-shaped string happens to appear in stderr for an
+# unrelated reason, a run that never asked to resume must not retry: the
+# gate gets both flags before it will even look at $sandbox_log.
+codex_nostate_argv="$scratch/fs-resume-codex-nostateargv.$$"
+tmpdirs+=("$codex_nostate_argv")
+codex_nostate_home="$(mktmp_dir "$scratch/fs-resume-home.XXXXXX")"
+codex_nostate_out="$(HOME="$codex_nostate_home" \
+    PATH="$stub_bin:$PATH" FORK_SANDBOX_CONFIG_DIR="$codex_cfg" \
+    CODEX_HOME="$codex_home" FORK_SANDBOX_BACKEND=fake-image \
+    CODEX_ARGV_FILE="$codex_nostate_argv" \
+    CODEX_FAIL_MESSAGE="Error: thread/resume: thread/resume failed: no rollout found for thread id 00000000-0000-0000-0000-000000000000 (code -32600)" \
+    timeout 120 "$launcher" --foreground --harness codex \
+    "$(new_project "$codex_nostate_home")" "$refusal_handoff" 2>&1)"
+codex_nostate_rc=$?
+if (( $(grep -cx -- '--- attempt end ---' "$codex_nostate_argv") == 1 )); then
+    ok "no --session-state means no retry even on a resume-shaped message"
+else
+    no "no --session-state means no retry even on a resume-shaped message" \
+        "$(cat "$codex_nostate_argv")"
+fi
+if (( codex_nostate_rc != 0 )); then
+    ok "no --session-state keeps the exit code on a resume-shaped message"
+else
+    no "no --session-state keeps the exit code on a resume-shaped message" \
+        "$codex_nostate_out"
+fi
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))
