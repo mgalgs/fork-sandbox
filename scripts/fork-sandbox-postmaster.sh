@@ -144,20 +144,19 @@
 # a later leg amends or overrides what it committed -- read the coding
 # leg's reply as "what I did," not as "what this pipeline landed."
 #
-# Which legs a preset's pipeline actually runs is mechanical, not
-# decided here or by the R9c
-# triage classifier: fork-sandbox.sh's review and maintainer loops skip
-# on an empty commit range (a wake that only replied with prose has
-# nothing to review), so a mail-only wake on a preset seat still costs
-# only the one coding leg. Seat (harness/model/thinking/network) comes
-# from `fleet resolve <agent>`; unset harness/network default to
-# claude/pinned. An unset model defaults to sonnet ONLY on the claude
-# harness -- "sonnet" is a claude alias, so
+# Which legs a preset's pipeline actually runs is mechanical, not decided
+# here or by the R9c triage classifier: fork-sandbox.sh's review and
+# maintainer loops skip on an empty commit range (a wake that only
+# replied with prose has nothing to review), so a mail-only wake on a
+# preset seat still costs only the one coding leg. Seat
+# (harness/model/thinking/network) comes from `fleet resolve <agent>`;
+# unset harness/network default to claude/pinned. An unset model defaults
+# to sonnet ONLY on the claude harness -- "sonnet" is a claude alias, so
 # defaulting it for pi/codex would hand a bogus model to a harness that
-# does not know the name (codex) or defeat fork-sandbox.sh's own
-# model-less-pi guard and a sealed seat's model discovery (pi); those
-# harnesses get no --model flag at all when unset, so fork-sandbox.sh's
-# own resolution/refusal applies exactly as it would for any other caller.
+# does not know the name (codex) or defeat fork-sandbox.sh's own model-
+# less-pi guard and a sealed seat's model discovery (pi); those harnesses
+# get no --model flag at all when unset, so fork-sandbox.sh's own
+# resolution/refusal applies exactly as it would for any other caller.
 # thinking is passed as --pi-args only when the harness is pi. --preset,
 # when the seat has one, is placed first in spawn_args -- documentation
 # only, since fork-sandbox.sh applies the seat's own harness/model/

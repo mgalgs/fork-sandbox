@@ -244,7 +244,8 @@ cmd_check() {
         echo "Error: check: no personas dir at '$PERSONAS_DIR'." >&2
         return 1
     fi
-    python3 "$PARSE" check "$FLEET_FILE" "$FLEET_FILE" "$PERSONAS_DIR" || return 1
+    local check_out
+    check_out="$(python3 "$PARSE" check "$FLEET_FILE" "$FLEET_FILE" "$PERSONAS_DIR")" || return 1
 
     # The parser has no concept of the handlers/presets directories
     # (bash-side, operator-configured paths) -- so a handler seat's
@@ -255,11 +256,19 @@ cmd_check() {
     # resolve_with_dump, for every agent: handler/command are
     # fleet.yaml-only (no persona fallback, see the header's "Handler
     # seats" paragraph) so the dump always has the final answer for
-    # them, and a fleet.yaml-level preset is likewise final without
-    # consulting the persona at all. Only when fleet.yaml leaves preset
-    # unset do we need the frontmatter to learn whether the persona sets
-    # one -- so the frontmatter parser only runs for that narrower set
-    # of agents, not once per agent in the fleet.
+    # them. A non-handler agent's resolved `preset` -- fleet.yaml's own
+    # value if it set one, else the persona frontmatter's -- comes back
+    # on $check_out's stdout: the `check` subprocess above already parses
+    # every such persona's frontmatter once, to validate it, so it emits
+    # the preset it found along the way instead of us re-invoking the
+    # frontmatter parser per agent here.
+    local -A check_preset=()
+    local check_kind check_name check_field check_value
+    while IFS=$'\t' read -r check_kind check_name check_field check_value; do
+        [[ "$check_kind" == agent && "$check_field" == preset ]] || continue
+        check_preset["$check_name"]="$check_value"
+    done <<< "$check_out"
+
     local rc=0
     local dump; dump="$(fleet_dump)"
     local -a agent_names=()
@@ -268,7 +277,7 @@ cmd_check() {
         [[ -n "$n" ]] && agent_names+=("$n")
     done < <(fleet_all_agent_names "$dump")
 
-    local name preset persona_path handler_path preset_path
+    local name preset handler_path preset_path
     for name in "${agent_names[@]}"; do
         fleet_read_agent "$dump" "$name"
         if [[ "$fleet_handler" == exec ]]; then
@@ -282,14 +291,7 @@ cmd_check() {
             fi
             continue
         fi
-        preset="$fleet_preset"
-        if [[ -z "$preset" ]]; then
-            persona_path="$PERSONAS_DIR/${fleet_persona:-$name.md}"
-            if [[ -f "$persona_path" ]]; then
-                fleet_read_frontmatter "$persona_path"
-                preset="$fm_preset"
-            fi
-        fi
+        preset="${check_preset[$name]:-}"
         if [[ -n "$preset" ]]; then
             preset_path="$PRESETS_DIR/$preset.yaml"
             if [[ ! -f "$preset_path" ]]; then

@@ -635,6 +635,13 @@ def cmd_check(fleet_file, label, personas_dir):
     errors = []
     reserved = reserved_names()
     agents, lists, _triage = load_and_validate(fleet_file, label, errors)
+    # Every non-handler agent's persona frontmatter is parsed below anyway
+    # (to validate it) -- record each one's resolved `preset` (fleet.yaml's
+    # own value if it set one, else the frontmatter's) along the way so the
+    # caller (fleet.sh's cmd_check) can read it back off this same
+    # single-process pass instead of re-invoking this parser once per
+    # agent just to learn `preset`.
+    resolved_presets = {}
     if not errors:
         for name, agent in agents.items():
             # A handler seat is a script, not an LLM seat -- the wake
@@ -676,6 +683,7 @@ def cmd_check(fleet_file, label, personas_dir):
                 agent["harness"] or fm["harness"],
                 agent["network"] or fm["network"],
                 f"agents.{name}", errors)
+            resolved_presets[name] = agent["preset"] or fm.get("preset", "")
         # The bash side (fleet_is_agent) treats a bare <name>.md under
         # personas-dir as making `name` an agent even with no fleet.yaml
         # entry at all -- so a list sharing that name is the same
@@ -707,11 +715,14 @@ def cmd_check(fleet_file, label, personas_dir):
             if name in reserved:
                 check_reserved(name, persona_path, reserved, errors)
                 continue
-            parse_frontmatter(persona_path, persona_path, errors)
+            fm = parse_frontmatter(persona_path, persona_path, errors)
+            resolved_presets[name] = fm.get("preset", "")
     if errors:
         for e in errors:
             sys.stderr.write(f"Error: {e}\n")
         sys.exit(1)
+    sys.stdout.write("".join(f"agent\t{name}\tpreset\t{value}\n"
+                              for name, value in resolved_presets.items()))
     sys.exit(0)
 
 

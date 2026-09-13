@@ -450,10 +450,22 @@ cheaply on every Cc.
 
 ### The wake
 
-A wake is one `fork-sandbox run` with **no review loop and no maintainer
-loop**. That is deliberate: on a fleet, the fleet is the review — scrutiny
-comes from other agents reading the reply on the thread, not from a
-second model reading the diff.
+A wake is one `fork-sandbox run`, with `--preset <name>` added to the
+spawn when the seat has one (see "The registry" above and
+docs/presets.md). A seat with **no** `preset:` gets no review loop and no
+maintainer loop — deliberate: on a fleet, the fleet is the review,
+scrutiny comes from other agents reading the reply on the thread, not
+from a second model reading the diff. A seat **with** a `preset:` still
+gets that, but its preset's own review/fix/maintainer legs, if any, also
+run inside that same `fork-sandbox run`, before the postmaster harvests
+the run's outbox — a division of labor, not a replacement: the in-run
+pipeline reviews the *diff*, the fleet still reviews the *position* on
+the thread, on every seat, preset or not. Only the coding leg writes the
+wake's `mail-*.md` reply, before any later leg in the preset's pipeline
+runs, so the thread always gets the coding leg's own account, unrevised
+— read it as "what I did," not as "what this pipeline landed," since a
+later leg can still amend or override what was committed without that
+ever reaching the reply.
 
 The seat comes from `fleet resolve`. Unset harness and network default to
 `claude` and `pinned`. An unset model defaults to `sonnet` **only on the
