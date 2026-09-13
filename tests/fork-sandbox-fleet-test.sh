@@ -485,11 +485,11 @@ export FORK_SANDBOX_FLEET_FILE="$saved"
 printf '\n== resolve ==\n'
 
 resolve_lines() {
-    # Reads the eleven-line contract into named globals for assertions.
+    # Reads the twelve-line contract into named globals for assertions.
     { read -r r_harness; read -r r_model; read -r r_thinking; read -r r_network; \
       read -r r_persona; read -r r_description; read -r r_wake_on_cc; \
-      read -r r_refresh_at; read -r r_triage; read -r r_handler; \
-      read -r r_command; } < <("$fleet" resolve "$1")
+      read -r r_refresh_at; read -r r_triage; read -r r_preset; \
+      read -r r_handler; read -r r_command; } < <("$fleet" resolve "$1")
 }
 
 resolve_lines riffler
@@ -511,6 +511,7 @@ check "resolve: all-empty agent, description empty" "" "$r_description"
 check "resolve: all-empty agent, wake-on-cc empty" "" "$r_wake_on_cc"
 check "resolve: all-empty agent, refresh-at empty" "" "$r_refresh_at"
 check "resolve: all-empty agent, triage empty" "" "$r_triage"
+check "resolve: all-empty agent, preset empty" "" "$r_preset"
 check "resolve: all-empty agent, handler empty" "" "$r_handler"
 check "resolve: all-empty agent, command empty" "" "$r_command"
 check "resolve: all-empty agent still resolves a persona path" "$FORK_SANDBOX_PERSONAS_DIR/tuner.md" "$r_persona"
@@ -518,7 +519,7 @@ check "resolve: all-empty agent still resolves a persona path" "$FORK_SANDBOX_PE
 # Piped, not captured via $(...): command substitution strips trailing
 # newlines, which would silently swallow the count when the last field
 # (command) is empty, as it is for tuner.
-check "resolve: output is exactly eleven lines" "11" "$("$fleet" resolve tuner | wc -l)"
+check "resolve: output is exactly twelve lines" "12" "$("$fleet" resolve tuner | wc -l)"
 
 printf '\n== resolve: wake-on-cc / refresh-at ==\n'
 
@@ -679,6 +680,108 @@ check "resolve-triage: explicit block overrides defaults" \
     "$(printf 'pi\nqwen2.5-coder')" "$triage_out3"
 
 printf '%s\n' "$saved_fleet_yaml" > "$FORK_SANDBOX_FLEET_FILE"
+
+printf '\n== preset ==\n'
+
+new_root PRESETS_TEST_DIR
+export FORK_SANDBOX_PRESETS_DIR="$PRESETS_TEST_DIR"
+cat > "$PRESETS_TEST_DIR/deep.yaml" <<'EOF'
+agents:
+  coder: {harness: claude}
+pipeline:
+  - action: code
+    agent: coder
+EOF
+
+bad "preset name shape is refused (path-shaped)" \
+    "preset names match" <<'EOF'
+agents:
+  riffler:
+    preset: foo/bar
+EOF
+
+bad "preset name shape is refused (uppercase)" \
+    "preset names match" <<'EOF'
+agents:
+  riffler:
+    preset: Deep
+EOF
+
+bad "preset alongside handler:exec is refused" \
+    "not allowed alongside 'handler: exec'" <<'EOF'
+agents:
+  riffler:
+    handler: exec
+    command: real-handler
+    preset: deep
+EOF
+
+saved_fleet_for_preset="$(cat "$FORK_SANDBOX_FLEET_FILE")"
+cat > "$FORK_SANDBOX_FLEET_FILE" <<'EOF'
+agents:
+  riffler:
+    preset: deep
+  tuner: {}
+  scout:
+    harness: pi
+lists:
+  jam-band:
+    members: [riffler, tuner, scout]
+EOF
+check "preset: an existing preset file passes check" "0" \
+    "$("$fleet" check >/dev/null 2>&1; echo $?)"
+
+resolve_lines riffler
+check "preset: fleet.yaml preset resolves" "deep" "$r_preset"
+
+saved_riffler_md_for_preset="$(cat "$FORK_SANDBOX_PERSONAS_DIR/riffler.md")"
+cat > "$FORK_SANDBOX_PERSONAS_DIR/riffler.md" <<'EOF'
+---
+harness: claude
+model: opus
+description: reviews riffs
+preset: shallow
+---
+Body text, opaque to the registry.
+EOF
+resolve_lines riffler
+check "preset: fleet.yaml preset overrides frontmatter preset" "deep" "$r_preset"
+
+cat > "$FORK_SANDBOX_FLEET_FILE" <<'EOF'
+agents:
+  riffler: {}
+  tuner: {}
+  scout:
+    harness: pi
+lists:
+  jam-band:
+    members: [riffler, tuner, scout]
+EOF
+resolve_lines riffler
+check "preset: frontmatter-only preset resolves when fleet.yaml sets none" \
+    "shallow" "$r_preset"
+check "preset: frontmatter-only preset fails check when the file does not exist" \
+    "1" "$("$fleet" check >/dev/null 2>&1; echo $?)"
+printf '%s\n' "$saved_riffler_md_for_preset" > "$FORK_SANDBOX_PERSONAS_DIR/riffler.md"
+
+cat > "$FORK_SANDBOX_FLEET_FILE" <<'EOF'
+agents:
+  riffler:
+    preset: nonexistent
+  tuner: {}
+  scout:
+    harness: pi
+lists:
+  jam-band:
+    members: [riffler, tuner, scout]
+EOF
+preset_err="$("$fleet" check 2>&1)"; preset_rc=$?
+check "preset: nonexistent preset fails check" "1" "$preset_rc"
+contains "preset: nonexistent preset error names the agent path" "$preset_err" "agents.riffler.preset"
+contains "preset: nonexistent preset error names the missing file" "$preset_err" "$PRESETS_TEST_DIR/nonexistent.yaml"
+
+printf '%s\n' "$saved_fleet_for_preset" > "$FORK_SANDBOX_FLEET_FILE"
+unset FORK_SANDBOX_PRESETS_DIR
 
 printf '\n== expand ==\n'
 

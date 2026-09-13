@@ -648,11 +648,12 @@ pm_expand_to() {
 # same agent again.
 pm_cc_candidate_resolve() {
     local agent="$1" harness model thinking network persona_path \
-          description wake_on_cc refresh_at triage handler command
+          description wake_on_cc refresh_at triage preset handler command
     # shellcheck disable=SC2034
     if ! { read -r harness; read -r model; read -r thinking; read -r network; \
            read -r persona_path; read -r description; read -r wake_on_cc; \
-           read -r refresh_at; read -r triage; read -r handler; read -r command; \
+           read -r refresh_at; read -r triage; read -r preset; read -r handler; \
+           read -r command; \
          } < <("$FLEET" resolve "$agent" 2>/dev/null); then
         return 1
     fi
@@ -1265,20 +1266,23 @@ pm_exec_wake() {
 pm_spawn_wake() {
     local project="$1" agent="$2" tid="$3" mid="$4"
     local harness model thinking network persona_path description wake_on_cc \
-          refresh_at triage handler command
+          refresh_at triage preset handler command
     # description and wake_on_cc (resolve's 6th and 7th lines) are read to
     # keep resolve's line contract explicit even though neither is needed
     # by a wake -- wake_on_cc is a routing decision made before a wake is
     # ever spawned (see pm_process_message's Cc expansion). triage (9th
     # line) is likewise unused here -- pm_triage_wake reads its own copy
-    # before this function is ever called. handler/command (10th/11th
-    # lines) ARE used: a non-empty handler branches straight to
-    # pm_exec_wake, below, before any of the LLM-only spawn_args/session
-    # logic that follows.
+    # before this function is ever called. preset (10th line) is read here
+    # to keep the line contract in sync with `resolve`, but not yet acted
+    # on -- see the `--preset` passthrough this function grows separately.
+    # handler/command (11th/12th lines) ARE used: a non-empty handler
+    # branches straight to pm_exec_wake, below, before any of the
+    # LLM-only spawn_args/session logic that follows.
     # shellcheck disable=SC2034
     if ! { read -r harness; read -r model; read -r thinking; read -r network; \
            read -r persona_path; read -r description; read -r wake_on_cc; \
-           read -r refresh_at; read -r triage; read -r handler; read -r command; \
+           read -r refresh_at; read -r triage; read -r preset; read -r handler; \
+           read -r command; \
          } < <("$FLEET" resolve "$agent" 2>/dev/null); then
         pm_flag "$tid" "seat resolution failed for $agent: $mid"
         return 0

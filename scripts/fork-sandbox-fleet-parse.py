@@ -13,12 +13,12 @@ divide, so neither can resolve as a fleet seat.
 
 A fleet file is a YAML mapping of `agents` (name -> optional persona/
 harness/model/network/thinking/description/wake-on-cc/refresh-at/triage/
-handler/command overrides), `lists` (name -> `members`, a list of agent
-names), and an optional top-level `triage` block (harness/model for the
-wake classifier's own sandbox seat -- absent means triage is off fleet-wide.
-No `network` field: the classifier's own launch path fixes its network
-by harness -- sealed for pi, pinned for claude -- with nothing in the
-fleet file left to override it).
+preset/handler/command overrides), `lists` (name -> `members`, a list of
+agent names), and an optional top-level `triage` block (harness/model for
+the wake classifier's own sandbox seat -- absent means triage is off
+fleet-wide. No `network` field: the classifier's own launch path fixes
+its network by harness -- sealed for pi, pinned for claude -- with
+nothing in the fleet file left to override it).
 A persona file is markdown with an optional YAML frontmatter block
 (delimited by `---` lines) carrying the same per-agent seat keys plus
 `description`, EXCEPT `handler`/`command` -- a handler seat is host
@@ -30,9 +30,18 @@ script.
 than an LLM seat: `command` (a bare name, resolved host-side against the
 operator's handlers directory -- see fork-sandbox-postmaster.sh) is then
 required, and none of `harness`/`model`/`network`/`thinking`/`triage`/
-`persona`/`refresh-at` may be set on the same agent -- those tune an LLM
-seat, which a handler is not. `handler`, when present, is always the
-literal string `exec`; nothing else validates.
+`persona`/`refresh-at`/`preset` may be set on the same agent -- those
+tune an LLM seat, which a handler is not. `handler`, when present, is
+always the literal string `exec`; nothing else validates.
+
+`preset` names a `~/.config/fork-sandbox/presets/<name>.yaml` (see
+docs/presets.md and fork-sandbox.sh's own `--preset` flag) that the
+postmaster passes to the seat's spawn -- a bare name only, same shape
+as a discoverer id (`^[a-z0-9][a-z0-9_-]*$`, underscores allowed, unlike
+an agent/list name), never a path or a `.yaml` suffix. Existence of the
+named preset file is checked bash-side (fork-sandbox-fleet.sh's `check`),
+against the same presets directory `--preset` itself resolves against --
+this script only validates the name's shape.
 
 This script owns every validation rule for both documents -- YAML
 validity, the schema, name shape, the harness/network enums (including
@@ -56,7 +65,7 @@ routine instead of two.
 
 `dump` emits tab-separated facts about the fleet file:
 
-    agent\t<name>\tpersona\t<value>        (eleven lines per agent, always,
+    agent\t<name>\tpersona\t<value>        (twelve lines per agent, always,
     agent\t<name>\tharness\t<value>         empty value when unset -- the
     agent\t<name>\tmodel\t<value>           bash side treats unset and
     agent\t<name>\tnetwork\t<value>         empty identically via ${x:-y})
@@ -65,6 +74,7 @@ routine instead of two.
     agent\t<name>\twake-on-cc\t<value>
     agent\t<name>\trefresh-at\t<value>
     agent\t<name>\ttriage\t<value>
+    agent\t<name>\tpreset\t<value>
     agent\t<name>\thandler\t<value>
     agent\t<name>\tcommand\t<value>
     list\t<name>                           (once per list, so an empty
@@ -86,8 +96,9 @@ routine instead of two.
     field\twake-on-cc\t<value>
     field\trefresh-at\t<value>
     field\ttriage\t<value>
+    field\tpreset\t<value>
 
-always eight lines, empty value when unset. A persona file with no leading
+always nine lines, empty value when unset. A persona file with no leading
 `---` frontmatter block is valid and reported as all-empty, not an error.
 
 Requires PyYAML, like fork-sandbox-preset-parse.py; a machine without it
@@ -110,20 +121,25 @@ except ImportError:
 
 HARNESSES = ("claude", "pi", "codex")
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+# Preset names follow the discoverer-id shape (underscores allowed),
+# distinct from NAME_RE (agent/list names, no underscore) -- mirrors
+# fork-sandbox.sh's own --preset name-shape check.
+PRESET_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 FIELDS = ("persona", "harness", "model", "network", "thinking",
-          "description", "wake-on-cc", "refresh-at", "triage",
+          "description", "wake-on-cc", "refresh-at", "triage", "preset",
           "handler", "command")
 # handler/command are deliberately absent here -- see the module
 # docstring's "handler: exec" paragraph: a handler seat is host config,
 # fleet.yaml-only, and refused as an unknown key in persona frontmatter.
 FRONTMATTER_FIELDS = ("harness", "model", "network", "thinking",
-                       "description", "wake-on-cc", "refresh-at", "triage")
+                       "description", "wake-on-cc", "refresh-at", "triage",
+                       "preset")
 # LLM-seat-only fields: refused alongside `handler: exec` (decision: a
 # handler is a script seat, not an LLM seat to tune). wake-on-cc is
 # deliberately absent: it governs routing (does this seat wake on a Cc at
 # all), which applies to a handler exactly as it does an LLM seat.
 LLM_ONLY_FIELDS = ("harness", "model", "network", "thinking", "triage",
-                    "persona", "refresh-at")
+                    "persona", "refresh-at", "preset")
 # Only these two are wired up on the postmaster side (pm_triage_wake's
 # pi and claude arms); a triage seat naming any other harness would
 # validate here and then silently run as claude at launch, so the
@@ -341,6 +357,19 @@ def check_persona(value, path, errors):
     return value
 
 
+def check_preset(value, path, errors):
+    """A preset: names a bare preset name, resolved bash-side against the
+    presets directory -- never a path or a '.yaml' suffix. Existence of
+    the named file is checked bash-side (fork-sandbox-fleet.sh's `check`);
+    this only validates the name's shape, mirroring fork-sandbox.sh's own
+    --preset name-shape check."""
+    if not PRESET_NAME_RE.fullmatch(value):
+        errors.append(f"{path}: preset names match ^[a-z0-9][a-z0-9_-]*$, "
+                       f"not '{value}'")
+        return ""
+    return value
+
+
 def check_handler(value, path, errors):
     """The only accepted value is the literal string 'exec' -- a handler
     seat is a deterministic script, not an LLM seat with a choice of
@@ -449,6 +478,10 @@ def load_and_validate(fleet_file, label, errors):
                 v = scalar(value, path, errors)
                 if v is not None:
                     agent["refresh-at"] = check_refresh_at(v, path, errors)
+            elif prop == "preset":
+                v = scalar(value, path, errors)
+                if v is not None:
+                    agent["preset"] = check_preset(v, path, errors)
             elif prop == "handler":
                 v = scalar(value, path, errors)
                 if v is not None:
@@ -587,6 +620,10 @@ def parse_frontmatter(path, label, errors):
             v = scalar(value, path_, errors)
             if v is not None:
                 fm["refresh-at"] = check_refresh_at(v, path_, errors)
+        elif key == "preset":
+            v = scalar(value, path_, errors)
+            if v is not None:
+                fm["preset"] = check_preset(v, path_, errors)
         else:
             errors.append(f"{path_}: unknown key")
     check_network_harness_pair(fm["harness"], fm["network"],

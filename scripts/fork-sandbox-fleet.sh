@@ -20,9 +20,9 @@
 #     `refresh-at` and `triage`.
 #     $FORK_SANDBOX_PERSONAS_DIR, default ~/.config/fork-sandbox/personas.
 #   - The fleet file, a YAML mapping of `agents` (name -> optional
-#     persona/harness/model/network/thinking/wake-on-cc/refresh-at/triage
-#     overrides, OR handler/command for a script seat -- see "Handler
-#     seats" below), `lists` (name -> members, a list of agent names),
+#     persona/harness/model/network/thinking/wake-on-cc/refresh-at/triage/
+#     preset overrides, OR handler/command for a script seat -- see
+#     "Handler seats" below), `lists` (name -> members, a list of agent names),
 #     and an optional top-level `triage` block (harness/model for the
 #     wake classifier's own sandbox seat -- see `resolve-triage` below).
 #     $FORK_SANDBOX_FLEET_FILE, default ~/.config/fork-sandbox/fleet.yaml.
@@ -41,13 +41,24 @@
 # `handler`/`command` are fleet.yaml-only (never read from persona
 # frontmatter, and a handler seat needs no persona file at all), carry
 # no defaulting fallback, and are mutually exclusive with every
-# harness/model/network/thinking/triage override -- `check` refuses the
-# combination. `command` is a bare name resolved ONLY against
+# harness/model/network/thinking/triage/preset override -- `check`
+# refuses the combination. `command` is a bare name resolved ONLY against
 # $FORK_SANDBOX_HANDLERS_DIR (default ~/.config/fork-sandbox/handlers)
 # -- never PATH, a repo, or a clone -- and `check` requires
 # `$FORK_SANDBOX_HANDLERS_DIR/<command>` to exist and be executable;
 # fork-sandbox-postmaster.sh re-checks the same thing at wake time. See
 # that script's header for the wake contract a handler runs under.
+#
+# A `preset:` override (fleet.yaml or persona frontmatter, same
+# precedence as every other LLM-seat field) names a
+# $PRESETS_DIR/<name>.yaml (default ~/.config/fork-sandbox/presets,
+# overridable via $FORK_SANDBOX_PRESETS_DIR or $FORK_SANDBOX_CONFIG_DIR --
+# the same chain fork-sandbox.sh's own --preset flag resolves against) that
+# the postmaster passes as `--preset <name>` at spawn -- see
+# fork-sandbox-postmaster.sh's THE WAKE section for what that changes about
+# a seat's wake. `check` requires the named file to exist; it does not
+# validate the preset's own contents (fork-sandbox.sh does that at spawn
+# time). Refused, alongside every other LLM-seat field, on a handler seat.
 #
 # This is a registry, not a router or a store: it has no idea what
 # fork-sandbox-mail.sh's message store holds, and never touches it.
@@ -74,16 +85,16 @@
 #                  operator's mail address, see docs/agent-mail.md) --
 #                  either would let the reserved address resolve as a
 #                  real seat.
-#   resolve <name> Print exactly eleven lines for one agent: harness,
+#   resolve <name> Print exactly twelve lines for one agent: harness,
 #                  model, thinking, network, persona-path, description,
-#                  wake-on-cc, refresh-at, triage, handler, command. A
-#                  field with nothing configured anywhere prints as an
-#                  empty line -- output is always eleven lines, never
-#                  fewer. A handler seat's harness/model/thinking/network/
-#                  triage lines are always empty (refused together at
-#                  `check` time); its handler/command lines are the only
-#                  ones populated besides persona-path/description/
-#                  wake-on-cc/refresh-at.
+#                  wake-on-cc, refresh-at, triage, preset, handler,
+#                  command. A field with nothing configured anywhere
+#                  prints as an empty line -- output is always twelve
+#                  lines, never fewer. A handler seat's harness/model/
+#                  thinking/network/triage/preset lines are always empty
+#                  (refused together at `check` time); its handler/command
+#                  lines are the only ones populated besides persona-path/
+#                  description/wake-on-cc/refresh-at.
 #   resolve-triage Print exactly two lines for the wake classifier's own
 #                  sandbox seat: harness, model. Reads only the fleet
 #                  file's top-level `triage` block (no persona fallback --
@@ -105,8 +116,8 @@
 #                  seat, every list with its members. A handler seat
 #                  prints in a distinct `handler=exec command=<name>
 #                  wake-on-cc=<v>` form rather than the harness/model/...
-#                  seat line, since harness/model/thinking/network/triage
-#                  are always empty for it (refused at check time by
+#                  seat line, since harness/model/thinking/network/triage/
+#                  preset are always empty for it (refused at check time by
 #                  LLM_ONLY_FIELDS) -- but wake-on-cc is shown explicitly
 #                  because it is NOT one of those: a handler seat can set
 #                  it, and it genuinely governs whether that handler wakes
@@ -157,6 +168,14 @@ PERSONAS_DIR="${FORK_SANDBOX_PERSONAS_DIR:-$HOME/.config/fork-sandbox/personas}"
 # a repo, or a clone. Read again, independently, by the postmaster at wake
 # time (this script's `check` is a config-time backstop, not the only gate).
 HANDLERS_DIR="${FORK_SANDBOX_HANDLERS_DIR:-$HOME/.config/fork-sandbox/handlers}"
+# Where a seat's `preset:` bare name resolves -- the SAME env-var chain
+# fork-sandbox.sh's own --preset flag resolves against
+# (FORK_SANDBOX_PRESETS_DIR, else FORK_SANDBOX_CONFIG_DIR/presets, else
+# $HOME/.config/fork-sandbox/presets), reproduced here rather than
+# invented afresh, so a fleet-configured preset and a manually-launched
+# --preset <name> always agree on where to look. Existence-only check;
+# preset content is fork-sandbox.sh's to load and validate at spawn time.
+PRESETS_DIR="${FORK_SANDBOX_PRESETS_DIR:-${FORK_SANDBOX_CONFIG_DIR:-$HOME/.config/fork-sandbox}/presets}"
 FLEET_NAME_RE='^[a-z0-9][a-z0-9-]*$'
 FLEET_ADDR_RE='^@[a-z0-9][a-z0-9-]*$'
 
@@ -227,10 +246,14 @@ cmd_check() {
     fi
     python3 "$PARSE" check "$FLEET_FILE" "$FLEET_FILE" "$PERSONAS_DIR" || return 1
 
-    # The parser has no concept of the handlers directory (a bash-side,
-    # operator-configured path) -- so a handler seat's command existing
-    # and being executable is checked here, once the schema itself (incl.
-    # the bare-name shape and the harness/model/... refusal) is known good.
+    # The parser has no concept of the handlers/presets directories
+    # (bash-side, operator-configured paths) -- so a handler seat's
+    # command existing and being executable, and a preset seat's preset
+    # file existing, are checked here, once the schema itself (incl. the
+    # bare-name shapes and the handler/preset mutual-exclusion refusal)
+    # is known good. resolve_with_dump, not fleet_read_agent, because
+    # `preset` (unlike handler/command) can come from persona frontmatter
+    # -- the fully resolved value is what a spawn will actually use.
     local rc=0
     local dump; dump="$(fleet_dump)"
     local -a agent_names=()
@@ -239,17 +262,29 @@ cmd_check() {
         [[ -n "$n" ]] && agent_names+=("$n")
     done < <(fleet_all_agent_names "$dump")
 
-    local name handler_path
+    local name harness model thinking network persona description
+    local wake_on_cc refresh_at triage preset handler command
+    local handler_path preset_path
     for name in "${agent_names[@]}"; do
-        fleet_read_agent "$dump" "$name"
-        [[ "$fleet_handler" == exec ]] || continue
-        handler_path="$HANDLERS_DIR/$fleet_command"
-        if [[ ! -e "$handler_path" ]]; then
-            echo "Error: agents.$name.command: handler '$handler_path' does not exist." >&2
-            rc=1
-        elif [[ ! -x "$handler_path" ]]; then
-            echo "Error: agents.$name.command: handler '$handler_path' is not executable." >&2
-            rc=1
+        { read -r harness; read -r model; read -r thinking; read -r network; \
+          read -r persona; read -r description; read -r wake_on_cc; read -r refresh_at; \
+          read -r triage; read -r preset; read -r handler; read -r command; } \
+            < <(resolve_with_dump "$dump" "$name")
+        if [[ "$handler" == exec ]]; then
+            handler_path="$HANDLERS_DIR/$command"
+            if [[ ! -e "$handler_path" ]]; then
+                echo "Error: agents.$name.command: handler '$handler_path' does not exist." >&2
+                rc=1
+            elif [[ ! -x "$handler_path" ]]; then
+                echo "Error: agents.$name.command: handler '$handler_path' is not executable." >&2
+                rc=1
+            fi
+        elif [[ -n "$preset" ]]; then
+            preset_path="$PRESETS_DIR/$preset.yaml"
+            if [[ ! -e "$preset_path" ]]; then
+                echo "Error: agents.$name.preset: preset '$preset' does not exist at '$preset_path'." >&2
+                rc=1
+            fi
         fi
     done
     return "$rc"
@@ -269,7 +304,7 @@ fleet_read_agent() {
     fleet_persona="" fleet_harness="" fleet_model=""
     fleet_network="" fleet_thinking="" fleet_description=""
     fleet_wake_on_cc="" fleet_refresh_at="" fleet_triage=""
-    fleet_handler="" fleet_command=""
+    fleet_preset="" fleet_handler="" fleet_command=""
     agent_declared=0
     [[ -n "$dump" ]] || return 0
     while IFS=$'\t' read -r kind aname field value; do
@@ -285,6 +320,7 @@ fleet_read_agent() {
             wake-on-cc) fleet_wake_on_cc="$value" ;;
             refresh-at) fleet_refresh_at="$value" ;;
             triage) fleet_triage="$value" ;;
+            preset) fleet_preset="$value" ;;
             handler) fleet_handler="$value" ;;
             command) fleet_command="$value" ;;
         esac
@@ -295,7 +331,7 @@ fleet_read_agent() {
 fleet_read_frontmatter() {
     local persona_path="$1" out field value
     fm_harness="" fm_model="" fm_network="" fm_thinking="" fm_description=""
-    fm_wake_on_cc="" fm_refresh_at="" fm_triage=""
+    fm_wake_on_cc="" fm_refresh_at="" fm_triage="" fm_preset=""
     out="$(python3 "$PARSE" frontmatter "$persona_path" "$persona_path")"
     while IFS=$'\t' read -r _ field value; do
         case "$field" in
@@ -307,6 +343,7 @@ fleet_read_frontmatter() {
             wake-on-cc) fm_wake_on_cc="$value" ;;
             refresh-at) fm_refresh_at="$value" ;;
             triage) fm_triage="$value" ;;
+            preset) fm_preset="$value" ;;
         esac
     done <<< "$out"
 }
@@ -334,7 +371,7 @@ resolve_with_dump() {
 
     local persona_path="$PERSONAS_DIR/${fleet_persona:-$name.md}"
     local fm_harness="" fm_model="" fm_network="" fm_thinking="" fm_description=""
-    local fm_wake_on_cc="" fm_refresh_at="" fm_triage=""
+    local fm_wake_on_cc="" fm_refresh_at="" fm_triage="" fm_preset=""
     if [[ -f "$persona_path" ]]; then
         fleet_read_frontmatter "$persona_path"
     elif (( ! agent_declared )); then
@@ -352,6 +389,7 @@ resolve_with_dump() {
     printf '%s\n' "${fleet_wake_on_cc:-$fm_wake_on_cc}"
     printf '%s\n' "${fleet_refresh_at:-$fm_refresh_at}"
     printf '%s\n' "${fleet_triage:-$fm_triage}"
+    printf '%s\n' "${fleet_preset:-$fm_preset}"
     # handler/command are fleet.yaml-only -- no frontmatter fallback, see
     # the header's "Handler seats" paragraph.
     printf '%s\n' "$fleet_handler"
@@ -508,19 +546,19 @@ cmd_roster() {
     done < <(fleet_all_agent_names "$dump")
 
     echo "Agents:"
-    local name harness model thinking network persona description wake_on_cc refresh_at triage handler command
+    local name harness model thinking network persona description wake_on_cc refresh_at triage preset handler command
     for name in "${agent_names[@]}"; do
         { read -r harness; read -r model; read -r thinking; read -r network; \
           read -r persona; read -r description; read -r wake_on_cc; read -r refresh_at; \
-          read -r triage; read -r handler; read -r command; } \
+          read -r triage; read -r preset; read -r handler; read -r command; } \
             < <(resolve_with_dump "$dump" "$name")
         if [[ -n "$handler" ]]; then
             printf '  %-20s handler=%-4s command=%-20s wake-on-cc=%-5s%s\n' \
                 "$name" "$handler" "$command" "${wake_on_cc:--}" "${description:+  # $description}"
         else
-            printf '  %-20s harness=%-8s model=%-12s thinking=%-8s network=%-8s wake-on-cc=%-5s refresh-at=%-6s triage=%-5s persona=%s%s\n' \
+            printf '  %-20s harness=%-8s model=%-12s thinking=%-8s network=%-8s wake-on-cc=%-5s refresh-at=%-6s triage=%-5s preset=%-8s persona=%s%s\n' \
                 "$name" "${harness:--}" "${model:--}" "${thinking:--}" \
-                "${network:--}" "${wake_on_cc:--}" "${refresh_at:--}" "${triage:--}" "$persona" "${description:+  # $description}"
+                "${network:--}" "${wake_on_cc:--}" "${refresh_at:--}" "${triage:--}" "${preset:--}" "$persona" "${description:+  # $description}"
         fi
     done
 
