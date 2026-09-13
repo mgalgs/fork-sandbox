@@ -2314,6 +2314,7 @@ set -uo pipefail
     printf 'TRIGGER:%s\n' "${FS_HANDLER_TRIGGER:-}"
     printf 'OUTBOX:%s\n' "${FS_HANDLER_OUTBOX:-}"
     printf 'ATTACH_DIR:%s\n' "${FS_HANDLER_ATTACH_DIR:-}"
+    printf 'VIA:%s\n' "${FS_HANDLER_VIA:-}"
     printf -- '----STDIN----\n'
     cat
     printf -- '----END----\n'
@@ -2458,6 +2459,8 @@ check "happy: the outbox dir is removed once its reply is harvested, not left to
 check "happy: FS_HANDLER_ATTACH_DIR points at the thread's attachments dir" \
     "ATTACH_DIR:$FORK_SANDBOX_MAIL_ROOT/threads/$tid/attachments" \
     "$(grep -- '^ATTACH_DIR:' "$HANDLER_LOG")"
+check "happy: FS_HANDLER_VIA is 'to' for a direct To: wake" "VIA:to" \
+    "$(grep -- '^VIA:' "$HANDLER_LOG")"
 contains "happy: the rendered thread reaches stdin (subject present)" \
     "$(sed -n '/----STDIN----/,/----END----/p' "$HANDLER_LOG")" "Happy path"
 happy_reply=""
@@ -2580,6 +2583,8 @@ tid="$(thread_of "$mid")"
 once
 check "cc handler: the Cc'd handler wakes" 1 \
     "$(grep -c -- 'AGENT:ccbot' "$HANDLER_LOG")"
+check "cc handler: FS_HANDLER_VIA is 'cc' for a Cc-only wake" "VIA:cc" \
+    "$(awk '/^AGENT:ccbot$/{f=1} f && /^VIA:/{print; exit}' "$HANDLER_LOG")"
 check "cc handler: zero triage classifier calls" 0 \
     "$(grep -c -- '^----CALL----$' "$HANDLER_TRIAGE_LOG")"
 

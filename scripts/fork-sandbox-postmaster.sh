@@ -204,11 +204,13 @@
 #           (quoted vs. unquoted lines) holds identically for a handler.
 #   env     FS_HANDLER_AGENT (the seat's own name, no @), FS_HANDLER_THREAD
 #           (thread id), FS_HANDLER_TRIGGER (the triggering message id),
-#           FS_HANDLER_OUTBOX (a fresh, empty, writable directory), and
+#           FS_HANDLER_OUTBOX (a fresh, empty, writable directory),
 #           FS_HANDLER_ATTACH_DIR (the thread's attachments dir -- read-only
 #           by convention, not enforcement; the handler is trusted host-side
 #           config, the same trust class as a hook or a
-#           fork-sandbox-discover-* plugin, never LLM output).
+#           fork-sandbox-discover-* plugin, never LLM output), and
+#           FS_HANDLER_VIA ("to" or "cc", whichever header produced this
+#           wake -- see ROUTING RULES rule 4).
 # It replies exactly like an LLM wake: mail-*.md files written to
 # FS_HANDLER_OUTBOX in the REPLY HARVEST format below, harvested by the
 # same pm_harvest_one_file code an LLM wake's run dir outbox uses -- no
@@ -1275,6 +1277,7 @@ pm_exec_wake() {
         "FS_HANDLER_TRIGGER=$mid" \
         "FS_HANDLER_OUTBOX=$outbox" \
         "FS_HANDLER_ATTACH_DIR=$MAIL_ROOT/threads/$tid/attachments" \
+        "FS_HANDLER_VIA=$via" \
         "$FS_TIMEOUT" --kill-after 10 "$timeout_s" "$handler_path" \
         < "$rendered" > /dev/null 2>"$stderr_capture"
     rc=$?
