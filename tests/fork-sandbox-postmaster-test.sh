@@ -1830,6 +1830,222 @@ check "the doomed message is still marked routed (not retried forever)" 0 \
     "$([[ -e "$FORK_SANDBOX_MAIL_ROOT/.postmaster/routed/$mid_bad" ]]; echo $?)"
 
 # ============================================================
+printf '\n== triage classifier gates a Cc-only wake ==\n'
+# ============================================================
+
+# The shared fixture's fleet.yaml/personas (set up at the top of this file)
+# has no top-level triage: block, and every OTHER group in this file relies
+# on that -- turning triage on for it here would make every other group's
+# Cc wakes route through a classifier none of them stub, so this group gets
+# its own fleet file and persona dir instead of touching the shared ones.
+
+SAVED_FLEET_FILE="$FORK_SANDBOX_FLEET_FILE"
+SAVED_PERSONAS_DIR="$FORK_SANDBOX_PERSONAS_DIR"
+
+new_root TRIAGE_STUB_BIN
+TRIAGE_LOG="$work/triage.log"
+export TRIAGE_LOG
+: > "$TRIAGE_LOG"
+
+cat > "$TRIAGE_STUB_BIN/triage-launcher" <<'STUB'
+#!/usr/bin/env bash
+set -uo pipefail
+{
+    printf -- '----CALL----\n'
+    for a in "$@"; do printf 'ARG:%s\n' "$a"; done
+    printf -- '----STDIN----\n'
+    cat
+    printf -- '----END----\n'
+} >> "$TRIAGE_LOG"
+case "${TRIAGE_STUB_MODE:-verdict}" in
+    fail) exit 1 ;;
+    timeout) sleep 5 ;;
+    garbage) printf 'this is not a valid verdict\n' ;;
+    verdict) printf '%s\n' "${TRIAGE_STUB_VERDICT:-wake}" ;;
+esac
+STUB
+chmod +x "$TRIAGE_STUB_BIN/triage-launcher"
+export FORK_SANDBOX_POSTMASTER_TRIAGE_LAUNCHER="$TRIAGE_STUB_BIN/triage-launcher"
+
+new_root TRIAGE_FLEET_DIR
+export FORK_SANDBOX_FLEET_FILE="$TRIAGE_FLEET_DIR/fleet.yaml"
+new_root TRIAGE_PERSONAS_DIR
+export FORK_SANDBOX_PERSONAS_DIR="$TRIAGE_PERSONAS_DIR"
+
+cat > "$FORK_SANDBOX_PERSONAS_DIR/alice.md" <<'EOF'
+Alice is a Cc-only reviewer whose wake is gated by triage.
+EOF
+cat > "$FORK_SANDBOX_PERSONAS_DIR/bob.md" <<'EOF'
+Bob is the direct recipient; his wake is never gated.
+EOF
+cat > "$FORK_SANDBOX_PERSONAS_DIR/carol.md" <<'EOF'
+Carol is the sender used throughout this group.
+EOF
+cat > "$FORK_SANDBOX_PERSONAS_DIR/dave.md" <<'EOF'
+Dave opts out of triage entirely; his Cc wake always spawns.
+EOF
+
+cat > "$FORK_SANDBOX_FLEET_FILE" <<'EOF'
+agents:
+  alice: {}
+  bob: {}
+  carol: {}
+  dave:
+    triage: false
+triage:
+  harness: claude
+  model: haiku
+  network: pinned
+EOF
+
+if ! "$FLEET" check >/dev/null 2>&1; then
+    echo "FATAL: triage fixture fleet.yaml does not pass 'fleet check':" >&2
+    "$FLEET" check >&2
+    exit 1
+fi
+
+cat > "$TRIAGE_FLEET_DIR/no-triage-fleet.yaml" <<'EOF'
+agents:
+  alice: {}
+  bob: {}
+  carol: {}
+  dave:
+    triage: false
+EOF
+
+# --- scenario 1: a wake verdict spawns the Cc-only candidate, To is
+#     never routed through the classifier at all ---
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+: > "$STUB_ARGV_LOG"
+: > "$TRIAGE_LOG"
+export TRIAGE_STUB_MODE=verdict
+export TRIAGE_STUB_VERDICT=wake
+mid="$(send_msg '@carol' '@bob' 'A' 'body' 8 '@alice')"
+tid="$(thread_of "$mid")"
+once
+check "wake verdict: bob (To) spawns" 1 \
+    "$(grep -c -- "^sbx-mail-${tid:0:8}-bob-" "$STUB_ARGV_LOG")"
+check "wake verdict: alice (Cc) spawns" 1 \
+    "$(grep -c -- "^sbx-mail-${tid:0:8}-alice-" "$STUB_ARGV_LOG")"
+check "wake verdict: exactly one classifier call (bob's To wake was never classified)" 1 \
+    "$(grep -c -- '^----CALL----$' "$TRIAGE_LOG")"
+
+# --- scenario 2: a skip verdict suppresses only the Cc wake, and is
+#     recorded in triaged/<thread-id> ---
+: > "$STUB_ARGV_LOG"
+: > "$TRIAGE_LOG"
+export TRIAGE_STUB_VERDICT=skip
+mid="$(send_msg '@carol' '@bob' 'A2' 'body' 8 '@alice')"
+tid="$(thread_of "$mid")"
+once
+check "skip verdict: bob (To) still spawns" 1 \
+    "$(grep -c -- "^sbx-mail-${tid:0:8}-bob-" "$STUB_ARGV_LOG")"
+check "skip verdict: alice (Cc) does not spawn" 0 \
+    "$(grep -c -- "^sbx-mail-${tid:0:8}-alice-" "$STUB_ARGV_LOG")"
+check "skip verdict: triaged/<thread-id> has exactly one line" 1 \
+    "$(wc -l < "$FORK_SANDBOX_MAIL_ROOT/.postmaster/triaged/$tid" 2>/dev/null || echo 0)"
+contains "skip verdict: triaged line names the message and agent" \
+    "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/triaged/$tid" 2>/dev/null)" \
+    "$mid"$'\t'"alice"
+contains "status prints the triaged count" "$("$postmaster" status 2>&1)" "triaged: 1"
+
+# --- scenario 3: a To candidate is never classified, even when the
+#     stub would have said skip ---
+: > "$STUB_ARGV_LOG"
+: > "$TRIAGE_LOG"
+export TRIAGE_STUB_VERDICT=skip
+mid="$(send_msg '@carol' '@alice' 'B' 'body' 8)"
+tid="$(thread_of "$mid")"
+once
+check "To candidate spawns regardless of the stub's skip verdict" 1 \
+    "$(grep -c -- "^sbx-mail-${tid:0:8}-alice-" "$STUB_ARGV_LOG")"
+check "To candidate: zero classifier calls" 0 \
+    "$(grep -c -- '^----CALL----$' "$TRIAGE_LOG")"
+
+# --- scenario 4: operator/external mail is never classified, for any
+#     candidate on the message ---
+: > "$STUB_ARGV_LOG"
+: > "$TRIAGE_LOG"
+export TRIAGE_STUB_VERDICT=skip
+mid="$(send_msg '@operator' '@carol' 'C' 'body' 8 '@alice')"
+tid="$(thread_of "$mid")"
+once
+check "operator mail: alice (Cc) spawns regardless of the stub's skip verdict" 1 \
+    "$(grep -c -- "^sbx-mail-${tid:0:8}-alice-" "$STUB_ARGV_LOG")"
+check "operator mail: zero classifier calls" 0 \
+    "$(grep -c -- '^----CALL----$' "$TRIAGE_LOG")"
+
+# --- scenario 5: an unparseable verdict fails toward wake ---
+: > "$STUB_ARGV_LOG"
+: > "$TRIAGE_LOG"
+export TRIAGE_STUB_MODE=garbage
+mid="$(send_msg '@carol' '@bob' 'D' 'body' 8 '@alice')"
+tid="$(thread_of "$mid")"
+once
+check "garbage classifier output: alice (Cc) still spawns" 1 \
+    "$(grep -c -- "^sbx-mail-${tid:0:8}-alice-" "$STUB_ARGV_LOG")"
+
+# --- scenario 6: a non-zero classifier exit fails toward wake ---
+: > "$STUB_ARGV_LOG"
+: > "$TRIAGE_LOG"
+export TRIAGE_STUB_MODE=fail
+mid="$(send_msg '@carol' '@bob' 'E' 'body' 8 '@alice')"
+tid="$(thread_of "$mid")"
+once
+check "failed classifier: alice (Cc) still spawns" 1 \
+    "$(grep -c -- "^sbx-mail-${tid:0:8}-alice-" "$STUB_ARGV_LOG")"
+
+# --- scenario 7: a classifier timeout fails toward wake ---
+: > "$STUB_ARGV_LOG"
+: > "$TRIAGE_LOG"
+export TRIAGE_STUB_MODE=timeout
+(
+    export FORK_SANDBOX_POSTMASTER_TRIAGE_TIMEOUT=1
+    mid="$(send_msg '@carol' '@bob' 'F' 'body' 8 '@alice')"
+    tid="$(thread_of "$mid")"
+    once
+    check "timed-out classifier: alice (Cc) still spawns" 1 \
+        "$(grep -c -- "^sbx-mail-${tid:0:8}-alice-" "$STUB_ARGV_LOG")"
+)
+export TRIAGE_STUB_MODE=verdict
+
+# --- scenario 8: a per-agent triage: false opt-out is never classified ---
+: > "$STUB_ARGV_LOG"
+: > "$TRIAGE_LOG"
+export TRIAGE_STUB_VERDICT=skip
+mid="$(send_msg '@carol' '@bob' 'G' 'body' 8 '@dave')"
+tid="$(thread_of "$mid")"
+once
+check "opted-out agent: dave (Cc) spawns regardless of the stub's skip verdict" 1 \
+    "$(grep -c -- "^sbx-mail-${tid:0:8}-dave-" "$STUB_ARGV_LOG")"
+check "opted-out agent: zero classifier calls" 0 \
+    "$(grep -c -- '^----CALL----$' "$TRIAGE_LOG")"
+
+# --- scenario 9: no top-level triage: block means no triage at all
+#     (regression baseline) ---
+export FORK_SANDBOX_FLEET_FILE="$TRIAGE_FLEET_DIR/no-triage-fleet.yaml"
+if ! "$FLEET" check >/dev/null 2>&1; then
+    echo "FATAL: no-triage fixture fleet.yaml does not pass 'fleet check':" >&2
+    "$FLEET" check >&2
+    exit 1
+fi
+: > "$STUB_ARGV_LOG"
+: > "$TRIAGE_LOG"
+export TRIAGE_STUB_VERDICT=skip
+mid="$(send_msg '@carol' '@bob' 'H' 'body' 8 '@alice')"
+tid="$(thread_of "$mid")"
+once
+check "no triage: block: alice (Cc) spawns regardless of the stub's skip verdict" 1 \
+    "$(grep -c -- "^sbx-mail-${tid:0:8}-alice-" "$STUB_ARGV_LOG")"
+check "no triage: block: zero classifier calls" 0 \
+    "$(grep -c -- '^----CALL----$' "$TRIAGE_LOG")"
+
+unset FORK_SANDBOX_POSTMASTER_TRIAGE_LAUNCHER
+export FORK_SANDBOX_FLEET_FILE="$SAVED_FLEET_FILE"
+export FORK_SANDBOX_PERSONAS_DIR="$SAVED_PERSONAS_DIR"
+
+# ============================================================
 printf '\n== --help and dispatcher wiring ==\n'
 # ============================================================
 
