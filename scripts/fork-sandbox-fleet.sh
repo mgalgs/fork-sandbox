@@ -5,6 +5,7 @@
 #
 # Usage: fork-sandbox-fleet.sh check
 #        fork-sandbox-fleet.sh resolve <name>
+#        fork-sandbox-fleet.sh resolve-triage
 #        fork-sandbox-fleet.sh expand <addr>[,<addr>...]
 #        fork-sandbox-fleet.sh roster
 #        fork-sandbox-fleet.sh teardown <agent> [--thread <id>]
@@ -15,12 +16,14 @@
 #   - Persona files, <personas-dir>/<name>.md: a markdown body (the
 #     agent's standing instructions, opaque to this script) with an
 #     optional YAML frontmatter block carrying `description`, `harness`,
-#     `model`, `network` (pinned|sealed), `thinking`, `wake-on-cc` and
-#     `refresh-at`.
+#     `model`, `network` (pinned|sealed), `thinking`, `wake-on-cc`,
+#     `refresh-at` and `triage`.
 #     $FORK_SANDBOX_PERSONAS_DIR, default ~/.config/fork-sandbox/personas.
 #   - The fleet file, a YAML mapping of `agents` (name -> optional
-#     persona/harness/model/network/thinking/wake-on-cc/refresh-at
-#     overrides) and `lists` (name -> members, a list of agent names).
+#     persona/harness/model/network/thinking/wake-on-cc/refresh-at/triage
+#     overrides), `lists` (name -> members, a list of agent names), and
+#     an optional top-level `triage` block (harness/model/network for the
+#     wake classifier's own sandbox seat -- see `resolve-triage` below).
 #     $FORK_SANDBOX_FLEET_FILE, default ~/.config/fork-sandbox/fleet.yaml.
 #
 # Precedence per seat field is fleet.yaml agent entry, then persona
@@ -52,11 +55,17 @@
 #                  "operator" (reserved for the human operator's mail
 #                  address, see docs/agent-mail.md) -- either would let
 #                  the reserved address resolve as a real seat.
-#   resolve <name> Print exactly eight lines for one agent: harness,
+#   resolve <name> Print exactly nine lines for one agent: harness,
 #                  model, thinking, network, persona-path, description,
-#                  wake-on-cc, refresh-at. A field with nothing configured
-#                  anywhere prints as an empty line -- output is always
-#                  eight lines, never fewer.
+#                  wake-on-cc, refresh-at, triage. A field with nothing
+#                  configured anywhere prints as an empty line -- output
+#                  is always nine lines, never fewer.
+#   resolve-triage Print exactly three lines for the wake classifier's own
+#                  sandbox seat: harness, model, network. Reads only the
+#                  fleet file's top-level `triage` block (no persona
+#                  fallback -- this is not a per-agent seat); every line
+#                  is empty when the fleet file has no `triage:` key at
+#                  all (triage off fleet-wide, see fork-sandbox-postmaster.sh).
 #   expand <addr>[,<addr>...]
 #                  Expand a comma-separated list of @-addresses: a
 #                  `@list` becomes its members' `@agent` addresses, a
@@ -192,7 +201,7 @@ fleet_read_agent() {
     local dump="$1" name="$2" kind aname field value
     fleet_persona="" fleet_harness="" fleet_model=""
     fleet_network="" fleet_thinking="" fleet_description=""
-    fleet_wake_on_cc="" fleet_refresh_at=""
+    fleet_wake_on_cc="" fleet_refresh_at="" fleet_triage=""
     agent_declared=0
     [[ -n "$dump" ]] || return 0
     while IFS=$'\t' read -r kind aname field value; do
@@ -207,6 +216,7 @@ fleet_read_agent() {
             description) fleet_description="$value" ;;
             wake-on-cc) fleet_wake_on_cc="$value" ;;
             refresh-at) fleet_refresh_at="$value" ;;
+            triage) fleet_triage="$value" ;;
         esac
     done <<< "$dump"
 }
@@ -215,7 +225,7 @@ fleet_read_agent() {
 fleet_read_frontmatter() {
     local persona_path="$1" out field value
     fm_harness="" fm_model="" fm_network="" fm_thinking="" fm_description=""
-    fm_wake_on_cc="" fm_refresh_at=""
+    fm_wake_on_cc="" fm_refresh_at="" fm_triage=""
     out="$(python3 "$PARSE" frontmatter "$persona_path" "$persona_path")"
     while IFS=$'\t' read -r _ field value; do
         case "$field" in
@@ -226,6 +236,7 @@ fleet_read_frontmatter() {
             description) fm_description="$value" ;;
             wake-on-cc) fm_wake_on_cc="$value" ;;
             refresh-at) fm_refresh_at="$value" ;;
+            triage) fm_triage="$value" ;;
         esac
     done <<< "$out"
 }
@@ -253,7 +264,7 @@ resolve_with_dump() {
 
     local persona_path="$PERSONAS_DIR/${fleet_persona:-$name.md}"
     local fm_harness="" fm_model="" fm_network="" fm_thinking="" fm_description=""
-    local fm_wake_on_cc="" fm_refresh_at=""
+    local fm_wake_on_cc="" fm_refresh_at="" fm_triage=""
     if [[ -f "$persona_path" ]]; then
         fleet_read_frontmatter "$persona_path"
     elif (( ! agent_declared )); then
@@ -270,12 +281,39 @@ resolve_with_dump() {
     printf '%s\n' "${fleet_description:-$fm_description}"
     printf '%s\n' "${fleet_wake_on_cc:-$fm_wake_on_cc}"
     printf '%s\n' "${fleet_refresh_at:-$fm_refresh_at}"
+    printf '%s\n' "${fleet_triage:-$fm_triage}"
 }
 
 cmd_resolve() {
     local name="${1:?Usage: fork-sandbox-fleet.sh resolve <name>}"
     local dump; dump="$(fleet_dump)"
     resolve_with_dump "$dump" "$name"
+}
+
+# Populates triage_<field> globals (harness/model/network) for the wake
+# classifier's own sandbox seat from a dump's `triage\t<field>\t<value>`
+# lines (three tab-separated fields, unlike an agent line's four) --
+# empty when the fleet file has no top-level `triage:` block at all.
+fleet_read_triage() {
+    local dump="$1" kind field value
+    triage_harness="" triage_model="" triage_network=""
+    [[ -n "$dump" ]] || return 0
+    while IFS=$'\t' read -r kind field value; do
+        [[ "$kind" == triage ]] || continue
+        case "$field" in
+            harness) triage_harness="$value" ;;
+            model) triage_model="$value" ;;
+            network) triage_network="$value" ;;
+        esac
+    done <<< "$dump"
+}
+
+cmd_resolve_triage() {
+    local dump; dump="$(fleet_dump)"
+    fleet_read_triage "$dump"
+    printf '%s\n' "$triage_harness"
+    printf '%s\n' "$triage_model"
+    printf '%s\n' "$triage_network"
 }
 
 fleet_is_list() {
@@ -398,14 +436,15 @@ cmd_roster() {
     done < <(fleet_all_agent_names "$dump")
 
     echo "Agents:"
-    local name harness model thinking network persona description wake_on_cc refresh_at
+    local name harness model thinking network persona description wake_on_cc refresh_at triage
     for name in "${agent_names[@]}"; do
         { read -r harness; read -r model; read -r thinking; read -r network; \
-          read -r persona; read -r description; read -r wake_on_cc; read -r refresh_at; } \
+          read -r persona; read -r description; read -r wake_on_cc; read -r refresh_at; \
+          read -r triage; } \
             < <(resolve_with_dump "$dump" "$name")
-        printf '  %-20s harness=%-8s model=%-12s thinking=%-8s network=%-8s wake-on-cc=%-5s refresh-at=%-6s persona=%s%s\n' \
+        printf '  %-20s harness=%-8s model=%-12s thinking=%-8s network=%-8s wake-on-cc=%-5s refresh-at=%-6s triage=%-5s persona=%s%s\n' \
             "$name" "${harness:--}" "${model:--}" "${thinking:--}" \
-            "${network:--}" "${wake_on_cc:--}" "${refresh_at:--}" "$persona" "${description:+  # $description}"
+            "${network:--}" "${wake_on_cc:--}" "${refresh_at:--}" "${triage:--}" "$persona" "${description:+  # $description}"
     done
 
     local -a list_names=()
@@ -608,6 +647,7 @@ case "${1-}" in
     -h|--help) usage; exit 0 ;;
     check) shift; cmd_check "$@" ;;
     resolve) shift; cmd_resolve "$@" ;;
+    resolve-triage) shift; cmd_resolve_triage "$@" ;;
     expand) shift; cmd_expand "$@" ;;
     roster) shift; cmd_roster "$@" ;;
     teardown) shift; cmd_teardown "$@" ;;

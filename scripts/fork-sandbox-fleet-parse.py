@@ -12,11 +12,13 @@ list may be defined with either, on either side of the agents/lists
 divide, so neither can resolve as a fleet seat.
 
 A fleet file is a YAML mapping of `agents` (name -> optional persona/
-harness/model/network/thinking/description/wake-on-cc/refresh-at
-overrides) and `lists` (name -> `members`, a list of agent names). A
-persona file is markdown with an optional YAML frontmatter block
-(delimited by `---` lines) carrying the same seat keys plus `description`;
-the body is opaque to this script.
+harness/model/network/thinking/description/wake-on-cc/refresh-at/triage
+overrides), `lists` (name -> `members`, a list of agent names), and an
+optional top-level `triage` block (harness/model/network for the wake
+classifier's own sandbox seat -- absent means triage is off fleet-wide).
+A persona file is markdown with an optional YAML frontmatter block
+(delimited by `---` lines) carrying the same per-agent seat keys plus
+`description`; the body is opaque to this script.
 
 This script owns every validation rule for both documents -- YAML
 validity, the schema, name shape, the harness/network enums (including
@@ -40,7 +42,7 @@ routine instead of two.
 
 `dump` emits tab-separated facts about the fleet file:
 
-    agent\t<name>\tpersona\t<value>        (eight lines per agent, always,
+    agent\t<name>\tpersona\t<value>        (nine lines per agent, always,
     agent\t<name>\tharness\t<value>         empty value when unset -- the
     agent\t<name>\tmodel\t<value>           bash side treats unset and
     agent\t<name>\tnetwork\t<value>         empty identically via ${x:-y})
@@ -48,9 +50,15 @@ routine instead of two.
     agent\t<name>\tdescription\t<value>
     agent\t<name>\twake-on-cc\t<value>
     agent\t<name>\trefresh-at\t<value>
+    agent\t<name>\ttriage\t<value>
     list\t<name>                           (once per list, so an empty
     list_member\t<name>\t<member>           list still appears; members
                                              in file order)
+    triage\t<field>\t<value>               (harness/model/network, three
+                                             lines, only when a top-level
+                                             `triage:` block is present;
+                                             zero lines when the fleet
+                                             file has no such block)
 
 `frontmatter` emits, for one persona file:
 
@@ -61,8 +69,9 @@ routine instead of two.
     field\tdescription\t<value>
     field\twake-on-cc\t<value>
     field\trefresh-at\t<value>
+    field\ttriage\t<value>
 
-always seven lines, empty value when unset. A persona file with no leading
+always eight lines, empty value when unset. A persona file with no leading
 `---` frontmatter block is valid and reported as all-empty, not an error.
 
 Requires PyYAML, like fork-sandbox-preset-parse.py; a machine without it
@@ -86,9 +95,12 @@ except ImportError:
 HARNESSES = ("claude", "pi", "codex")
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 FIELDS = ("persona", "harness", "model", "network", "thinking",
-          "description", "wake-on-cc", "refresh-at")
+          "description", "wake-on-cc", "refresh-at", "triage")
 FRONTMATTER_FIELDS = ("harness", "model", "network", "thinking",
-                       "description", "wake-on-cc", "refresh-at")
+                       "description", "wake-on-cc", "refresh-at", "triage")
+TRIAGE_SEAT_FIELDS = ("harness", "model", "network")
+TRIAGE_SEAT_DEFAULTS = {"harness": "claude", "model": "haiku",
+                         "network": "pinned"}
 
 # Names no agent or list may take, mapped to why. Both are reserved
 # everywhere (`check` and `dump` share this, so a broken fleet file
@@ -204,11 +216,56 @@ def check_network_harness_pair(harness, network, path, errors):
                        f"'{harness}' has no self-hosted-endpoint path")
 
 
+def check_triage_seat(value, label, errors):
+    """Validates the top-level `triage:` block -- the wake classifier's own
+    sandbox seat, distinct from the per-agent `triage: false` opt-out
+    checked by check_triage_field. Presence of the key (even `triage: {}`
+    or `triage:` with no value) turns triage on fleet-wide, defaulted from
+    TRIAGE_SEAT_DEFAULTS; absence of the key entirely means triage stays
+    off, which the caller checks before ever calling this."""
+    path = f"{label}: triage"
+    if value is None:
+        value = {}
+    if not isinstance(value, dict):
+        errors.append(f"{path}: must be a mapping of harness/model/network")
+        value = {}
+    seat = dict(TRIAGE_SEAT_DEFAULTS)
+    for key, v in value.items():
+        field_path = f"{path}.{key}"
+        if key == "harness":
+            sv = scalar(v, field_path, errors)
+            if sv is not None:
+                seat["harness"] = check_harness(sv, field_path, errors)
+        elif key == "model":
+            sv = scalar(v, field_path, errors)
+            if sv is not None:
+                seat["model"] = sv
+        elif key == "network":
+            sv = scalar(v, field_path, errors)
+            if sv is not None:
+                seat["network"] = check_network(sv, field_path, errors)
+        else:
+            errors.append(f"{field_path}: unknown key")
+    check_network_harness_pair(seat["harness"], seat["network"], path, errors)
+    return seat
+
+
 def check_wake_on_cc(value, path, errors):
     """Unlike every other seat field, this one must be a YAML boolean, not
     a string -- so it is checked directly against the raw YAML value
     rather than going through scalar() first, which explicitly rejects
     bool."""
+    if not isinstance(value, bool):
+        errors.append(f"{path}: must be a YAML boolean")
+        return ""
+    return "true" if value else "false"
+
+
+def check_triage_field(value, path, errors):
+    """The per-agent triage opt-out, `triage: false`: a YAML boolean, not a
+    string, same shape as check_wake_on_cc and kept separate rather than
+    shared, matching this file's small-single-purpose-checkers
+    convention."""
     if not isinstance(value, bool):
         errors.append(f"{path}: must be a YAML boolean")
         return ""
@@ -237,29 +294,36 @@ def check_persona(value, path, errors):
 
 
 def load_and_validate(fleet_file, label, errors):
-    """Returns (agents, lists) dicts, best-effort -- callers only trust
-    them when `errors` is still empty afterward."""
+    """Returns (agents, lists, triage), best-effort -- callers only trust
+    them when `errors` is still empty afterward. `triage` is None when the
+    fleet file has no top-level `triage:` key at all (triage off
+    fleet-wide); otherwise a fully-defaulted {"harness", "model",
+    "network"} dict, even for `triage: {}` -- presence of the key, not its
+    contents, is what turns triage on."""
     reserved = reserved_names()
     try:
         with open(fleet_file, encoding="utf-8") as f:
             doc = yaml.load(f, Loader=DupKeyLoader)
     except OSError as e:
         errors.append(f"{label}: unreadable: {e}")
-        return {}, {}
+        return {}, {}, None
     except (yaml.YAMLError, DupKeyError) as e:
         errors.append(f"{label}: not valid YAML: {e}")
-        return {}, {}
+        return {}, {}, None
 
     if doc is None:
         doc = {}
     if not isinstance(doc, dict):
         errors.append(f"{label}: the document must be a mapping with "
                        f"'agents' and/or 'lists'")
-        return {}, {}
+        return {}, {}, None
     for key in doc:
-        if key not in ("agents", "lists"):
+        if key not in ("agents", "lists", "triage"):
             errors.append(f"{label}: unknown top-level key '{key}'; a "
-                           f"fleet file has 'agents' and 'lists'")
+                           f"fleet file has 'agents', 'lists' and 'triage'")
+
+    triage = check_triage_seat(doc.get("triage"), label, errors) \
+        if "triage" in doc else None
 
     agents_doc = doc.get("agents") or {}
     lists_doc = doc.get("lists") or {}
@@ -307,6 +371,8 @@ def load_and_validate(fleet_file, label, errors):
                     agent["network"] = check_network(v, path, errors)
             elif prop == "wake-on-cc":
                 agent["wake-on-cc"] = check_wake_on_cc(value, path, errors)
+            elif prop == "triage":
+                agent["triage"] = check_triage_field(value, path, errors)
             elif prop == "refresh-at":
                 v = scalar(value, path, errors)
                 if v is not None:
@@ -364,7 +430,7 @@ def load_and_validate(fleet_file, label, errors):
                 errors.append(f"{label}: lists.{name}.members: '{m}' is "
                                f"not a defined agent")
 
-    return agents, lists
+    return agents, lists, triage
 
 
 def parse_frontmatter(path, label, errors):
@@ -422,6 +488,8 @@ def parse_frontmatter(path, label, errors):
                 fm["network"] = check_network(v, path_, errors)
         elif key == "wake-on-cc":
             fm["wake-on-cc"] = check_wake_on_cc(value, path_, errors)
+        elif key == "triage":
+            fm["triage"] = check_triage_field(value, path_, errors)
         elif key == "refresh-at":
             v = scalar(value, path_, errors)
             if v is not None:
@@ -436,7 +504,7 @@ def parse_frontmatter(path, label, errors):
 def cmd_check(fleet_file, label, personas_dir):
     errors = []
     reserved = reserved_names()
-    agents, lists = load_and_validate(fleet_file, label, errors)
+    agents, lists, _triage = load_and_validate(fleet_file, label, errors)
     if not errors:
         for name, agent in agents.items():
             persona_name = agent["persona"] or f"{name}.md"
@@ -491,7 +559,7 @@ def cmd_check(fleet_file, label, personas_dir):
 
 def cmd_dump(fleet_file, label):
     errors = []
-    agents, lists = load_and_validate(fleet_file, label, errors)
+    agents, lists, triage = load_and_validate(fleet_file, label, errors)
     if errors:
         for e in errors:
             sys.stderr.write(f"Error: {e}\n")
@@ -504,6 +572,9 @@ def cmd_dump(fleet_file, label):
         out.append(f"list\t{name}")
         for m in members:
             out.append(f"list_member\t{name}\t{m}")
+    if triage is not None:
+        for field in TRIAGE_SEAT_FIELDS:
+            out.append(f"triage\t{field}\t{triage[field]}")
     sys.stdout.write("".join(line + "\n" for line in out))
     sys.exit(0)
 

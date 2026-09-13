@@ -352,10 +352,10 @@ export FORK_SANDBOX_FLEET_FILE="$saved"
 printf '\n== resolve ==\n'
 
 resolve_lines() {
-    # Reads the eight-line contract into named globals for assertions.
+    # Reads the nine-line contract into named globals for assertions.
     { read -r r_harness; read -r r_model; read -r r_thinking; read -r r_network; \
       read -r r_persona; read -r r_description; read -r r_wake_on_cc; \
-      read -r r_refresh_at; } < <("$fleet" resolve "$1")
+      read -r r_refresh_at; read -r r_triage; } < <("$fleet" resolve "$1")
 }
 
 resolve_lines riffler
@@ -376,12 +376,13 @@ check "resolve: all-empty agent, network empty" "" "$r_network"
 check "resolve: all-empty agent, description empty" "" "$r_description"
 check "resolve: all-empty agent, wake-on-cc empty" "" "$r_wake_on_cc"
 check "resolve: all-empty agent, refresh-at empty" "" "$r_refresh_at"
+check "resolve: all-empty agent, triage empty" "" "$r_triage"
 check "resolve: all-empty agent still resolves a persona path" "$FORK_SANDBOX_PERSONAS_DIR/tuner.md" "$r_persona"
 
 # Piped, not captured via $(...): command substitution strips trailing
 # newlines, which would silently swallow the count when the last field
-# (refresh-at) is empty, as it is for tuner.
-check "resolve: output is exactly eight lines" "8" "$("$fleet" resolve tuner | wc -l)"
+# (triage) is empty, as it is for tuner.
+check "resolve: output is exactly nine lines" "9" "$("$fleet" resolve tuner | wc -l)"
 
 printf '\n== resolve: wake-on-cc / refresh-at ==\n'
 
@@ -422,6 +423,118 @@ check "resolve: wake-on-cc from fleet.yaml overrides frontmatter" "true" "$r_wak
 check "resolve: refresh-at from fleet.yaml overrides frontmatter" "4000" "$r_refresh_at"
 
 refuses "resolve: unknown agent exits nonzero" "$fleet" resolve nosuchagent
+
+printf '\n== resolve: triage (per-agent opt-out) ==\n'
+
+# Snapshot the fleet file / observer persona as the wake-on-cc section
+# above left them, so this section can freely rewrite both and restore
+# them exactly afterward -- the "== expand ==" section right after this
+# one depends on the observer/loud fixtures still being in place.
+saved_fleet_yaml="$(cat "$FORK_SANDBOX_FLEET_FILE")"
+saved_observer_md="$(cat "$FORK_SANDBOX_PERSONAS_DIR/observer.md")"
+
+cat > "$FORK_SANDBOX_PERSONAS_DIR/observer.md" <<'EOF'
+---
+wake-on-cc: false
+refresh-at: 0.75
+triage: false
+---
+EOF
+resolve_lines observer
+check "resolve: triage from frontmatter alone" "false" "$r_triage"
+
+cat > "$FORK_SANDBOX_FLEET_FILE" <<'EOF'
+agents:
+  quiet:
+    triage: true
+EOF
+cat > "$FORK_SANDBOX_PERSONAS_DIR/quiet.md" <<'EOF'
+---
+triage: false
+---
+EOF
+resolve_lines quiet
+check "resolve: triage from fleet.yaml overrides frontmatter" "true" "$r_triage"
+rm -f "$FORK_SANDBOX_PERSONAS_DIR/quiet.md"
+
+printf '%s\n' "$saved_fleet_yaml" > "$FORK_SANDBOX_FLEET_FILE"
+printf '%s\n' "$saved_observer_md" > "$FORK_SANDBOX_PERSONAS_DIR/observer.md"
+
+printf '\n== check: triage validation ==\n'
+
+bad "per-agent triage must be a YAML boolean, not a string" \
+    "agents.riffler.triage: must be a YAML boolean" <<'EOF'
+agents:
+  riffler:
+    triage: "no"
+EOF
+
+bad "unknown top-level key still refused, now naming triage as valid" \
+    "unknown top-level key 'bogus'" <<'EOF'
+bogus: 1
+agents:
+  riffler: {}
+EOF
+
+bad "top-level triage block must be a mapping" \
+    "triage: must be a mapping of harness/model/network" <<'EOF'
+triage: nope
+agents:
+  riffler: {}
+EOF
+
+bad "top-level triage block rejects an unknown sub-key" \
+    "triage.bogus: unknown key" <<'EOF'
+triage:
+  bogus: 1
+agents:
+  riffler: {}
+EOF
+
+bad "top-level triage block enforces the same network/harness pairing" \
+    "triage: network 'sealed' requires harness 'pi'" <<'EOF'
+triage:
+  harness: claude
+  network: sealed
+agents:
+  riffler: {}
+EOF
+
+printf '\n== resolve-triage: the classifier seat, separate from any agent ==\n'
+
+cat > "$FORK_SANDBOX_FLEET_FILE" <<'EOF'
+agents:
+  riffler: {}
+EOF
+# Piped, not captured via $(...): command substitution strips trailing
+# newlines, which would silently swallow the count when every line is
+# empty, as they all are here (no top-level `triage:` block at all).
+check "resolve-triage: no top-level block, output is exactly three lines" \
+    "3" "$("$fleet" resolve-triage | wc -l)"
+check "resolve-triage: no top-level block, harness is empty" "" \
+    "$("$fleet" resolve-triage | sed -n 1p)"
+
+cat > "$FORK_SANDBOX_FLEET_FILE" <<'EOF'
+triage: {}
+agents:
+  riffler: {}
+EOF
+triage_out2="$("$fleet" resolve-triage)"
+check "resolve-triage: empty block defaults to claude/haiku/pinned" \
+    "$(printf 'claude\nhaiku\npinned')" "$triage_out2"
+
+cat > "$FORK_SANDBOX_FLEET_FILE" <<'EOF'
+triage:
+  harness: pi
+  network: sealed
+agents:
+  riffler: {}
+EOF
+triage_out3="$("$fleet" resolve-triage)"
+check "resolve-triage: explicit block overrides defaults" \
+    "$(printf 'pi\nhaiku\nsealed')" "$triage_out3"
+
+printf '%s\n' "$saved_fleet_yaml" > "$FORK_SANDBOX_FLEET_FILE"
 
 printf '\n== expand ==\n'
 
