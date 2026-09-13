@@ -248,13 +248,16 @@
 #                                   never repeat within a thread even
 #                                   across a rule-1 budget reset
 #   handoffs/<run-id>.md           the generated handoff passed to a wake
-#   state/<thread-id>/<agent>/     the claude CLI's transcript store for
-#                                   that one (thread, agent) pair, bound
+#   state/<thread-id>/<agent>/     the harness's transcript/session store
+#                                   for that one (thread, agent) pair, bound
 #                                   into every wake of it with
 #                                   --session-state so the conversation
-#                                   outlives the run. claude seats only
-#                                   (pi and codex keep their sessions
-#                                   elsewhere and stay fresh-wake)
+#                                   outlives the run. Every resumable
+#                                   harness (fs_harness_session_caps,
+#                                   fork-sandbox-lib.sh -- today claude,
+#                                   codex, pi); a harness with no entry
+#                                   there gets neither this nor sessions/
+#                                   below and stays fresh-wake
 #   sessions/<thread-id>/<agent>   the session id the LAST wake of that
 #                                   pair ended on, read out of the run's
 #                                   summary.json at harvest. Present ->
@@ -263,7 +266,12 @@
 #                                   wake fails outright, or ends cleanly
 #                                   with a null/absent session_id, so a
 #                                   broken or missing session can never
-#                                   wedge a seat
+#                                   wedge a seat. Only for a "discover"
+#                                   id-mode harness (claude, codex) --  a
+#                                   "given" id-mode harness (pi) derives its
+#                                   own id fresh every spawn
+#                                   (pm_pi_session_id) and never has an
+#                                   entry here at all
 #   workspaces/<thread-id>/<agent>/ the persistent clone for that (thread,
 #                                   agent) seat, bound into every wake of
 #                                   it (every harness, not just claude)
@@ -281,11 +289,18 @@
 # anything fork-sandbox-mail.sh owns.
 #
 # LIMITATIONS (v1 does not do these; a later round might):
-#   - Session resume is claude-only: a pi or codex seat gets a fresh
-#     session on every wake, with the thread in the prompt as its only
-#     continuity. That prompt stays the correctness guarantee even for
-#     claude -- resume is a continuity and cost optimization, and a wake
-#     whose session is missing or unreadable still does the work.
+#   - Session resume depends on the harness's own capability
+#     (fs_harness_session_caps, fork-sandbox-lib.sh): claude and codex
+#     resume by id (discovered from the prior wake's summary.json, see
+#     sessions/ above); pi resumes by a deterministically-derived id
+#     (pm_pi_session_id) that its own CLI creates on first use -- both
+#     read as "resumed" from this script's point of view. A harness with
+#     no entry in that table gets a fresh session every wake, with the
+#     thread in the prompt as its only continuity. That prompt stays the
+#     correctness guarantee for every harness, resumable or not -- resume
+#     is a continuity and cost optimization, and a wake whose session is
+#     missing, unreadable, or (claude/codex) rejected by the harness still
+#     does the work.
 #   - A resumed session and the seat's clone both cross wakes now; the run
 #     dir does not. Every wake still gets a fresh run dir -- fresh log,
 #     handoff, summary.json, operator inbox, artifact outbox, all at new
@@ -297,14 +312,14 @@
 #     the next wake; only run-dir-scoped paths (the previous wake's log,
 #     handoff, inbox, outbox) are gone, as they always were.
 #     fork-sandbox.sh tells a wake which case it is in, adding a "This
-#     session is a continuation" section when --resume-session is given
-#     (claude only) and a "This workspace is not new" section whenever the
-#     clone was reused with no session to resume (pi and codex, on every
-#     wake past the first) -- so a non-claude seat learns its workspace
-#     persisted even though it never gets the session-resume flag at all.
-#     Carrying work forward across wakes is still the agent's own git work
-#     (commit it, or it is not there next wake either); this just gives
-#     that work a stable place to land.
+#     session is a continuation" section when a resume is named
+#     (--resume-session for claude/codex, --session-id for pi) and a "This
+#     workspace is not new" section whenever the clone was reused with no
+#     resume named (a non-resumable harness, on every wake past the first)
+#     -- so a seat with no resumable session still learns its workspace
+#     persisted. Carrying work forward across wakes is still the agent's
+#     own git work (commit it, or it is not there next wake either); this
+#     just gives that work a stable place to land.
 #   - No delivery of mail tooling into the sandbox, and no store access
 #     from inside a run.
 #   - No list-Cc delivery index.
@@ -428,6 +443,26 @@ pm_new_uuid() {
     else
         python3 -c 'import uuid; print(uuid.uuid4())'
     fi
+}
+
+# A pi seat's id mode is "given" (fs_harness_session_caps): pi creates the
+# session named by --session-id if it does not already exist, so there is
+# nothing to discover and nothing to persist under sessions/ -- the SAME id
+# just has to arrive on every wake of that (thread, agent) pair, including
+# the first. uuid5 over a fixed, arbitrary namespace and the pair's own
+# "<tid>/<agent>" string gives a deterministic, collision-free id with no
+# state to read or write. The namespace constant must never change once a
+# fleet is running pi seats -- changing it silently starts every pi seat
+# over on a new, empty session.
+PM_PI_SESSION_NAMESPACE='c9f5c6b0-6b1a-4b3e-9c2a-2e9f6b1c9a1e'
+
+pm_pi_session_id() {
+    local tid="$1" agent="$2"
+    python3 -c '
+import sys, uuid
+ns = uuid.UUID(sys.argv[1])
+print(uuid.uuid5(ns, sys.argv[2]))
+' "$PM_PI_SESSION_NAMESPACE" "$tid/$agent"
 }
 
 pm_trim() {
@@ -875,19 +910,30 @@ pm_spawn_wake() {
 
     # An agent woken again and again on one thread should be ONE
     # conversation, not a series of amnesiacs. The transcript store for
-    # this (thread, agent) pair is bound into every claude wake of it; the
-    # id the last wake ended on, if harvest recorded one, resumes it.
-    # Other harnesses get neither flag -- fork-sandbox.sh refuses both
-    # there.
+    # this (thread, agent) pair is bound into every wake of a resumable
+    # harness (fs_harness_session_caps); a non-resumable harness gets
+    # neither flag -- fork-sandbox.sh refuses both there.
     local resumed=""
-    if [[ "$harness" == claude ]]; then
+    fs_harness_session_caps "$harness"
+    if [[ "$FS_HARNESS_RESUMABLE" == true ]]; then
         spawn_args+=(--session-state "$PM_SESSION_STATE/$tid/$agent")
-        local sid_file="$PM_SESSIONS/$tid/$agent" sid
-        if [[ -f "$sid_file" ]]; then
-            sid="$(pm_trim "$(cat -- "$sid_file" 2>/dev/null)")"
-            if [[ "$sid" =~ $PM_SESSION_ID_RE ]]; then
-                spawn_args+=(--resume-session "$sid")
-                resumed="$sid"
+        if [[ "$FS_HARNESS_ID_MODE" == given ]]; then
+            # No discovery: the id is derived, not read back from a prior
+            # wake, so it is available -- and passed -- from the first wake
+            # of this seat onward. sessions/ is never touched for this
+            # harness.
+            local sid
+            sid="$(pm_pi_session_id "$tid" "$agent")"
+            spawn_args+=(--session-id "$sid")
+            resumed="$sid"
+        else
+            local sid_file="$PM_SESSIONS/$tid/$agent" sid
+            if [[ -f "$sid_file" ]]; then
+                sid="$(pm_trim "$(cat -- "$sid_file" 2>/dev/null)")"
+                if [[ "$sid" =~ $PM_SESSION_ID_RE ]]; then
+                    spawn_args+=(--resume-session "$sid")
+                    resumed="$sid"
+                fi
             fi
         fi
     fi
@@ -1251,11 +1297,19 @@ pm_wake_is_dead() {
 pm_harvest_run() {
     local project="$1" rid="$2"
     local f="$RUNS/$rid.env"
-    local agent tid trigger run_dir
+    local agent tid trigger run_dir harness
     agent="$(fs_pm_env_get "$f" AGENT)"
     tid="$(fs_pm_env_get "$f" THREAD)"
     trigger="$(fs_pm_env_get "$f" TRIGGER)"
     run_dir="$(fs_pm_env_get "$f" RUN_DIR)"
+    harness="$(fs_pm_env_get "$f" HARNESS)"
+    # A given-mode harness (pi) derives its id fresh on every spawn (see
+    # pm_pi_session_id) and never reads sessions/ back -- so harvest must
+    # not write one there either, or a stale file sits unread forever. Only
+    # a discover-mode harness's id lives in sessions/.
+    fs_harness_session_caps "$harness"
+    local sessions_tracked=true
+    [[ "$FS_HARNESS_ID_MODE" == given ]] && sessions_tracked=false
     if [[ ! -d "$run_dir" ]]; then
         # Vanished (scratch root cleaned up, or never existed) rather than
         # merely still running -- this is the one crash shape distinct
@@ -1268,7 +1322,7 @@ pm_harvest_run() {
         # sits under the same scratch root that just lost the run dir.
         # Start the next wake fresh rather than point it at an id nothing
         # can be said about.
-        pm_session_clear "$tid" "$agent"
+        [[ "$sessions_tracked" == true ]] && pm_session_clear "$tid" "$agent"
         mkdir -p -- "$HARVESTED"
         : > "$HARVESTED/$rid"
         return 0
@@ -1292,7 +1346,7 @@ pm_harvest_run() {
         # outbox-harvest and pending-message handling below rather than
         # discarding both.
         pm_flag "$tid" "wake never produced summary.json: $rid"
-        pm_session_clear "$tid" "$agent"
+        [[ "$sessions_tracked" == true ]] && pm_session_clear "$tid" "$agent"
     else
         local exit_code
         exit_code="$(pm_trim "$(cat -- "$run_dir/exit-code" 2>/dev/null)")"
@@ -1305,11 +1359,11 @@ pm_harvest_run() {
             # ...and forget the session, so the next wake of this seat is a
             # fresh one. A failed resumed wake is exactly the case where the
             # recorded id is the suspect.
-            pm_session_clear "$tid" "$agent"
+            [[ "$sessions_tracked" == true ]] && pm_session_clear "$tid" "$agent"
         else
             # Which session the next wake should resume. sid comes up empty
             # several different ways -- summary.json has no session_id (or
-            # it is null; a pi/codex seat with no --session-state lands
+            # it is null; a non-resumable seat with no --session-state lands
             # here), OR summary.json fails to parse as JSON at all, OR
             # there is no jq on the host at all (fs_require_gnu_tools does
             # not check for it, so this is a real host, not a hypothetical
@@ -1323,13 +1377,19 @@ pm_harvest_run() {
             # different case entirely: that shape should never come from
             # the launcher itself, so it leaves whatever was recorded
             # before standing rather than clearing or recording garbage.
-            local sid
-            sid="$(pm_trim "$(jq -r '.session_id // empty' \
-                "$run_dir/summary.json" 2>/dev/null || true)")"
-            if [[ "$sid" =~ $PM_SESSION_ID_RE ]]; then
-                pm_session_record "$tid" "$agent" "$sid"
-            elif [[ -z "$sid" ]]; then
-                pm_session_clear "$tid" "$agent"
+            # A given-mode harness's summary.json just echoes back the id
+            # this seat's own next spawn will re-derive anyway, so none of
+            # this three-way branch is reached for it (sessions_tracked is
+            # false there).
+            if [[ "$sessions_tracked" == true ]]; then
+                local sid
+                sid="$(pm_trim "$(jq -r '.session_id // empty' \
+                    "$run_dir/summary.json" 2>/dev/null || true)")"
+                if [[ "$sid" =~ $PM_SESSION_ID_RE ]]; then
+                    pm_session_record "$tid" "$agent" "$sid"
+                elif [[ -z "$sid" ]]; then
+                    pm_session_clear "$tid" "$agent"
+                fi
             fi
         fi
     fi

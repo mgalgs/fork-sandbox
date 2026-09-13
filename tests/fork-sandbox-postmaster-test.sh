@@ -112,6 +112,9 @@ EOF
 cat > "$FORK_SANDBOX_PERSONAS_DIR/dana.md" <<'EOF'
 Dana opts out of Cc wakes; only a direct To wakes her.
 EOF
+cat > "$FORK_SANDBOX_PERSONAS_DIR/eve.md" <<'EOF'
+Eve is the codex seat used by the session-resume tests.
+EOF
 
 cat > "$FORK_SANDBOX_FLEET_FILE" <<'EOF'
 agents:
@@ -120,6 +123,8 @@ agents:
     harness: pi
     network: sealed
   carol: {}
+  eve:
+    harness: codex
   dana:
     wake-on-cc: false
 lists:
@@ -1522,17 +1527,74 @@ once
 check "leave-standing: a malformed session id leaves the earlier VALID id standing" \
     "$ls_sid" "$(cat "$ls_sessions" 2>/dev/null)"
 
-# pi and codex have no resume support and fork-sandbox.sh refuses both
-# flags there, so a non-claude seat must get neither. bob is the pi seat.
+# pi is a "given" id-mode harness (fs_harness_session_caps): the postmaster
+# derives its session id itself (pm_pi_session_id) and passes it as
+# --session-id on EVERY wake, first included -- no sessions/ record is ever
+# read or written for it. bob is the pi seat.
 new_scratch_root FORK_SANDBOX_MAIL_ROOT
 export FORK_SANDBOX_MAIL_ROOT
-send_msg '@carol' '@bob' 'pi seat resume' 'body' 8 >/dev/null
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+pi_mid1="$(send_msg '@carol' '@bob' 'pi seat resume' 'first message' 8)"
+pi_tid="$(thread_of "$pi_mid1")"
+pi_sessions="$PM_STATE_DIR/sessions/$pi_tid/bob"
 : > "$STUB_ARGV_LOG"
 once
-check "resume: a pi seat gets no --session-state" 0 \
-    "$(grep -c -- '^--session-state$' "$STUB_ARGV_LOG")"
-check "resume: a pi seat gets no --resume-session" 0 \
+check "resume: a pi seat gets --session-state" \
+    "$PM_STATE_DIR/state/$pi_tid/bob" "$(argv_after --session-state "$STUB_ARGV_LOG")"
+pi_sid1="$(argv_after --session-id "$STUB_ARGV_LOG")"
+check "resume: a pi seat's first wake already gets a --session-id" 0 \
+    "$( [[ -n "$pi_sid1" ]] && echo 0 || echo 1 )"
+check "resume: a pi seat gets no --resume-session (create-if-missing, not discovered)" 0 \
     "$(grep -c -- '^--resume-session$' "$STUB_ARGV_LOG")"
+check "resume: a pi seat's session is never recorded under sessions/" 0 \
+    "$( [[ -e "$pi_sessions" ]] && echo 1 || echo 0 )"
+
+finish_run bob 0 "$pi_sid1"
+once
+check "resume: a pi seat's clean finish still writes nothing under sessions/" 0 \
+    "$( [[ -e "$pi_sessions" ]] && echo 1 || echo 0 )"
+
+reply_msg '@carol' "$pi_mid1" 'second message' --to '@bob' >/dev/null
+: > "$STUB_ARGV_LOG"
+once
+check "resume: a pi seat's second wake gets the SAME --session-id" \
+    "$pi_sid1" "$(argv_after --session-id "$STUB_ARGV_LOG")"
+
+# codex is a "discover" id-mode harness, same as claude: the recorded id (if
+# any) resumes via --resume-session, and a failed wake clears it. eve is the
+# codex seat.
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+codex_sid=aaaa1111-bbbb-2222-cccc-333344445555
+codex_mid1="$(send_msg '@carol' '@eve' 'codex seat resume' 'first message' 8)"
+codex_tid="$(thread_of "$codex_mid1")"
+codex_sessions="$PM_STATE_DIR/sessions/$codex_tid/eve"
+
+: > "$STUB_ARGV_LOG"
+once
+check "resume: a codex seat's first wake binds --session-state" \
+    "$PM_STATE_DIR/state/$codex_tid/eve" "$(argv_after --session-state "$STUB_ARGV_LOG")"
+check "resume: a codex seat's first wake passes no --resume-session" 0 \
+    "$(grep -c -- '^--resume-session$' "$STUB_ARGV_LOG")"
+
+finish_run eve 0 "$codex_sid"
+once
+check "resume: harvest records a codex seat's session id" \
+    "$codex_sid" "$(cat "$codex_sessions" 2>/dev/null)"
+
+reply_msg '@carol' "$codex_mid1" 'second message' --to '@eve' >/dev/null
+: > "$STUB_ARGV_LOG"
+once
+check "resume: a codex seat's second wake resumes the recorded session" \
+    "$codex_sid" "$(argv_after --resume-session "$STUB_ARGV_LOG")"
+
+# A broken (failed) resumed wake degrades the NEXT wake to fresh, for every
+# resumable harness -- codex here, claude already covered above.
+finish_run eve 1
+once
+check "resume: a codex seat's failed wake clears the recorded session id" 0 \
+    "$( [[ -e "$codex_sessions" ]] && echo 1 || echo 0 )"
 
 # ============================================================
 printf '\n== persistent workspace: --clone-dir path is stable across wakes ==\n'
