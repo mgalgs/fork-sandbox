@@ -5363,7 +5363,14 @@ else
     # everywhere a leg's own accounting reads one of these, means the
     # runner (below) and run_leg can always read "rev_*" for a review leg
     # and get the right answer whether or not --review-harness was given.
-    rev_pi_session_dir="$impl_pi_session_dir"
+    # The session dir is the one exception: on a --session-state run,
+    # impl_pi_session_dir has since been overwritten by the resume/state
+    # rebuilds above to point at the durable store, but this leg still
+    # runs the clone-local marker (it falls back to sandbox_cmd, not
+    # impl_sandbox_cmd/cont_sandbox_cmd) -- so it must read pi_session_dir,
+    # which was captured right after sandbox_cmd's own "none"-mode build
+    # and never touched again.
+    rev_pi_session_dir="$pi_session_dir"
     rev_usage_source="$impl_usage_source"
     rev_run_formatter="$impl_run_formatter"
     rev_harness_env_file="$impl_harness_env_file"
@@ -5440,8 +5447,11 @@ if (( maintainer_loop_cap > 0 )); then
         # No --maintainer-harness, so the maintainer leg stays on the
         # implement harness in every respect -- the same "mnt_*" fallback set
         # as the review leg's, so run_leg can always read it for a maintainer
-        # leg.
-        mnt_pi_session_dir="$impl_pi_session_dir"
+        # leg. Session dir: same exception as "rev_pi_session_dir" above --
+        # read pi_session_dir, not impl_pi_session_dir, since the latter may
+        # have since been overwritten to the durable store by a
+        # --session-state run's resume/state rebuilds.
+        mnt_pi_session_dir="$pi_session_dir"
         mnt_usage_source="$impl_usage_source"
         mnt_run_formatter="$impl_run_formatter"
         mnt_harness_env_file="$impl_harness_env_file"

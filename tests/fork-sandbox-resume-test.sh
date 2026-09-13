@@ -1197,6 +1197,7 @@ pi_out="$(HOME="$pi_home" PATH="$stub_bin:$PATH" \
     FORK_SANDBOX_CONFIG_DIR="$pi_cfg" FORK_SANDBOX_BACKEND=fake-image \
     timeout 120 "$launcher" --foreground --harness pi --model vendor/model \
     --session-state "$pi_state" --session-id "$pi_sid" \
+    --maintainer-loop 1 --maintainer-model vendor/model2 \
     "$pi_proj" "$refusal_handoff" 2>&1)"
 pi_rc=$?
 pi_run_dir="$(printf '%s\n' "$pi_out" | sed -n 's/^  run dir:  *//p' | head -1)"
@@ -1247,6 +1248,30 @@ else
             "$pi_base_line" ;;
         *) ok "a leg with no seat of its own gets no --session-id (pi)" ;;
     esac
+
+    # Without --review-harness/--maintainer-harness, a review or maintainer
+    # leg still runs the implement harness but on the clone-local session
+    # dir sandbox_cmd carries (see the "no seat of its own" checks just
+    # above) -- never the durable store $pi_state names, which is the
+    # CODING leg's alone. rev_/mnt_pi_session_dir must therefore track
+    # pi_session_dir (recorded from sandbox_cmd's own build, before a
+    # --session-state run repoints impl_pi_session_dir at the store), not
+    # impl_pi_session_dir itself.
+    pi_run_pi_session_dir="$(sed -n 's/^pi_session_dir=//p' "$pi_run_dir/run.sh")"
+    pi_run_rev_session_dir="$(sed -n 's/^rev_pi_session_dir=//p' "$pi_run_dir/run.sh")"
+    pi_run_mnt_session_dir="$(sed -n 's/^mnt_pi_session_dir=//p' "$pi_run_dir/run.sh")"
+    if [[ "$pi_run_rev_session_dir" == "$pi_run_pi_session_dir" ]]; then
+        ok "a review leg with no seat of its own keeps the clone-local session dir (pi)"
+    else
+        no "a review leg with no seat of its own keeps the clone-local session dir (pi)" \
+            "pi_session_dir=$pi_run_pi_session_dir rev_pi_session_dir=$pi_run_rev_session_dir"
+    fi
+    if [[ "$pi_run_mnt_session_dir" == "$pi_run_pi_session_dir" ]]; then
+        ok "a maintainer leg with no seat of its own keeps the clone-local session dir (pi)"
+    else
+        no "a maintainer leg with no seat of its own keeps the clone-local session dir (pi)" \
+            "pi_session_dir=$pi_run_pi_session_dir mnt_pi_session_dir=$pi_run_mnt_session_dir"
+    fi
 fi
 
 # Without --session-id (--session-state alone), pi must still be told
