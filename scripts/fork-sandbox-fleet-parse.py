@@ -7,10 +7,11 @@ Usage: fork-sandbox-fleet-parse.py check <fleet-file> <label> <personas-dir>
        fork-sandbox-fleet-parse.py frontmatter <persona-file> <label>
 
 A fleet file is a YAML mapping of `agents` (name -> optional persona/
-harness/model/network/thinking/description overrides) and `lists` (name ->
-`members`, a list of agent names). A persona file is markdown with an
-optional YAML frontmatter block (delimited by `---` lines) carrying the
-same seat keys plus `description`; the body is opaque to this script.
+harness/model/network/thinking/description/wake-on-cc/refresh-at
+overrides) and `lists` (name -> `members`, a list of agent names). A
+persona file is markdown with an optional YAML frontmatter block
+(delimited by `---` lines) carrying the same seat keys plus `description`;
+the body is opaque to this script.
 
 This script owns every validation rule for both documents -- YAML
 validity, the schema, name shape, the harness/network enums (including
@@ -34,12 +35,14 @@ routine instead of two.
 
 `dump` emits tab-separated facts about the fleet file:
 
-    agent\t<name>\tpersona\t<value>        (six lines per agent, always,
+    agent\t<name>\tpersona\t<value>        (eight lines per agent, always,
     agent\t<name>\tharness\t<value>         empty value when unset -- the
     agent\t<name>\tmodel\t<value>           bash side treats unset and
     agent\t<name>\tnetwork\t<value>         empty identically via ${x:-y})
     agent\t<name>\tthinking\t<value>
     agent\t<name>\tdescription\t<value>
+    agent\t<name>\twake-on-cc\t<value>
+    agent\t<name>\trefresh-at\t<value>
     list\t<name>                           (once per list, so an empty
     list_member\t<name>\t<member>           list still appears; members
                                              in file order)
@@ -51,8 +54,10 @@ routine instead of two.
     field\tnetwork\t<value>
     field\tthinking\t<value>
     field\tdescription\t<value>
+    field\twake-on-cc\t<value>
+    field\trefresh-at\t<value>
 
-always five lines, empty value when unset. A persona file with no leading
+always seven lines, empty value when unset. A persona file with no leading
 `---` frontmatter block is valid and reported as all-empty, not an error.
 
 Requires PyYAML, like fork-sandbox-preset-parse.py; a machine without it
@@ -75,8 +80,15 @@ except ImportError:
 
 HARNESSES = ("claude", "pi", "codex")
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
-FIELDS = ("persona", "harness", "model", "network", "thinking", "description")
-FRONTMATTER_FIELDS = ("harness", "model", "network", "thinking", "description")
+FIELDS = ("persona", "harness", "model", "network", "thinking",
+          "description", "wake-on-cc", "refresh-at")
+FRONTMATTER_FIELDS = ("harness", "model", "network", "thinking",
+                       "description", "wake-on-cc", "refresh-at")
+
+# Mirrors fork-sandbox.sh line 2795's --refresh-at grammar exactly -- one
+# grammar in two places is a bug, so if that regex ever changes, this one
+# must change with it.
+REFRESH_AT_RE = re.compile(r"^[0-9]+(\.[0-9]+)?$")
 
 
 class DupKeyError(ValueError):
@@ -162,6 +174,25 @@ def check_network_harness_pair(harness, network, path, errors):
                        f"'{harness}' has no self-hosted-endpoint path")
 
 
+def check_wake_on_cc(value, path, errors):
+    """Unlike every other seat field, this one must be a YAML boolean, not
+    a string -- so it is checked directly against the raw YAML value
+    rather than going through scalar() first, which explicitly rejects
+    bool."""
+    if not isinstance(value, bool):
+        errors.append(f"{path}: must be a YAML boolean")
+        return ""
+    return "true" if value else "false"
+
+
+def check_refresh_at(value, path, errors):
+    if not REFRESH_AT_RE.fullmatch(value):
+        errors.append(f"{path}: must be a fraction like 0.5 or an "
+                       f"absolute token count, not '{value}'")
+        return ""
+    return value
+
+
 def check_persona(value, path, errors):
     """A persona: override names a file directly under personas-dir
     (<personas-dir>/<name>.md, per the header contract), never a path --
@@ -240,6 +271,12 @@ def load_and_validate(fleet_file, label, errors):
                 v = scalar(value, path, errors)
                 if v is not None:
                     agent["network"] = check_network(v, path, errors)
+            elif prop == "wake-on-cc":
+                agent["wake-on-cc"] = check_wake_on_cc(value, path, errors)
+            elif prop == "refresh-at":
+                v = scalar(value, path, errors)
+                if v is not None:
+                    agent["refresh-at"] = check_refresh_at(v, path, errors)
             else:
                 errors.append(f"{label}: {path}: unknown key")
         check_network_harness_pair(agent["harness"], agent["network"],
@@ -346,6 +383,12 @@ def parse_frontmatter(path, label, errors):
             v = scalar(value, path_, errors)
             if v is not None:
                 fm["network"] = check_network(v, path_, errors)
+        elif key == "wake-on-cc":
+            fm["wake-on-cc"] = check_wake_on_cc(value, path_, errors)
+        elif key == "refresh-at":
+            v = scalar(value, path_, errors)
+            if v is not None:
+                fm["refresh-at"] = check_refresh_at(v, path_, errors)
         else:
             errors.append(f"{path_}: unknown key")
     check_network_harness_pair(fm["harness"], fm["network"],

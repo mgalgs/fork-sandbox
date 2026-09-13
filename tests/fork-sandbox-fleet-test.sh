@@ -252,6 +252,20 @@ agents:
 EOF
 rm -f "$FORK_SANDBOX_PERSONAS_DIR/merged-sealed.md"
 
+bad "wake-on-cc must be a YAML boolean, not a string" \
+    "agents.riffler.wake-on-cc: must be a YAML boolean" <<'EOF'
+agents:
+  riffler:
+    wake-on-cc: "yes"
+EOF
+
+bad "refresh-at must match fork-sandbox.sh's --refresh-at grammar" \
+    "agents.riffler.refresh-at: must be a fraction" <<'EOF'
+agents:
+  riffler:
+    refresh-at: soon
+EOF
+
 badfile="$FORK_SANDBOX_FLEET_FILE_DIR/bad.yaml"
 cat > "$badfile" <<'EOF'
 agents:
@@ -273,9 +287,10 @@ export FORK_SANDBOX_FLEET_FILE="$saved"
 printf '\n== resolve ==\n'
 
 resolve_lines() {
-    # Reads the six-line contract into named globals for assertions.
+    # Reads the eight-line contract into named globals for assertions.
     { read -r r_harness; read -r r_model; read -r r_thinking; read -r r_network; \
-      read -r r_persona; read -r r_description; } < <("$fleet" resolve "$1")
+      read -r r_persona; read -r r_description; read -r r_wake_on_cc; \
+      read -r r_refresh_at; } < <("$fleet" resolve "$1")
 }
 
 resolve_lines riffler
@@ -294,12 +309,52 @@ check "resolve: all-empty agent, harness empty" "" "$r_harness"
 check "resolve: all-empty agent, model empty" "" "$r_model"
 check "resolve: all-empty agent, network empty" "" "$r_network"
 check "resolve: all-empty agent, description empty" "" "$r_description"
+check "resolve: all-empty agent, wake-on-cc empty" "" "$r_wake_on_cc"
+check "resolve: all-empty agent, refresh-at empty" "" "$r_refresh_at"
 check "resolve: all-empty agent still resolves a persona path" "$FORK_SANDBOX_PERSONAS_DIR/tuner.md" "$r_persona"
 
 # Piped, not captured via $(...): command substitution strips trailing
 # newlines, which would silently swallow the count when the last field
-# (description) is empty, as it is for tuner.
-check "resolve: output is exactly six lines" "6" "$("$fleet" resolve tuner | wc -l)"
+# (refresh-at) is empty, as it is for tuner.
+check "resolve: output is exactly eight lines" "8" "$("$fleet" resolve tuner | wc -l)"
+
+printf '\n== resolve: wake-on-cc / refresh-at ==\n'
+
+cat > "$FORK_SANDBOX_PERSONAS_DIR/observer.md" <<'EOF'
+---
+wake-on-cc: false
+refresh-at: 0.75
+---
+EOF
+cat > "$FORK_SANDBOX_FLEET_FILE" <<'EOF'
+agents:
+  riffler:
+    model: sonnet
+  tuner: {}
+  scout:
+    harness: pi
+  observer: {}
+  loud:
+    wake-on-cc: true
+    refresh-at: 4000
+lists:
+  jam-band:
+    members: [riffler, tuner, scout]
+EOF
+
+resolve_lines observer
+check "resolve: wake-on-cc from frontmatter alone" "false" "$r_wake_on_cc"
+check "resolve: refresh-at from frontmatter alone" "0.75" "$r_refresh_at"
+
+cat > "$FORK_SANDBOX_PERSONAS_DIR/loud.md" <<'EOF'
+---
+wake-on-cc: false
+refresh-at: 0.1
+---
+EOF
+resolve_lines loud
+check "resolve: wake-on-cc from fleet.yaml overrides frontmatter" "true" "$r_wake_on_cc"
+check "resolve: refresh-at from fleet.yaml overrides frontmatter" "4000" "$r_refresh_at"
 
 refuses "resolve: unknown agent exits nonzero" "$fleet" resolve nosuchagent
 

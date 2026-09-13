@@ -15,12 +15,13 @@
 #   - Persona files, <personas-dir>/<name>.md: a markdown body (the
 #     agent's standing instructions, opaque to this script) with an
 #     optional YAML frontmatter block carrying `description`, `harness`,
-#     `model`, `network` (pinned|sealed) and `thinking`.
+#     `model`, `network` (pinned|sealed), `thinking`, `wake-on-cc` and
+#     `refresh-at`.
 #     $FORK_SANDBOX_PERSONAS_DIR, default ~/.config/fork-sandbox/personas.
 #   - The fleet file, a YAML mapping of `agents` (name -> optional
-#     persona/harness/model/network/thinking overrides) and `lists`
-#     (name -> members, a list of agent names). $FORK_SANDBOX_FLEET_FILE,
-#     default ~/.config/fork-sandbox/fleet.yaml.
+#     persona/harness/model/network/thinking/wake-on-cc/refresh-at
+#     overrides) and `lists` (name -> members, a list of agent names).
+#     $FORK_SANDBOX_FLEET_FILE, default ~/.config/fork-sandbox/fleet.yaml.
 #
 # Precedence per seat field is fleet.yaml agent entry, then persona
 # frontmatter, then empty -- applied here in bash, not by the parser.
@@ -47,10 +48,11 @@
 #                  fleet_is_agent below). Exits 0 silently if clean;
 #                  otherwise prints every error found (not just the
 #                  first) and exits 1.
-#   resolve <name> Print exactly six lines for one agent: harness, model,
-#                  thinking, network, persona-path, description. A field
-#                  with nothing configured anywhere prints as an empty
-#                  line -- output is always six lines, never fewer.
+#   resolve <name> Print exactly eight lines for one agent: harness,
+#                  model, thinking, network, persona-path, description,
+#                  wake-on-cc, refresh-at. A field with nothing configured
+#                  anywhere prints as an empty line -- output is always
+#                  eight lines, never fewer.
 #   expand <addr>[,<addr>...]
 #                  Expand a comma-separated list of @-addresses: a
 #                  `@list` becomes its members' `@agent` addresses, a
@@ -167,6 +169,7 @@ fleet_read_agent() {
     local dump="$1" name="$2" kind aname field value
     fleet_persona="" fleet_harness="" fleet_model=""
     fleet_network="" fleet_thinking="" fleet_description=""
+    fleet_wake_on_cc="" fleet_refresh_at=""
     agent_declared=0
     [[ -n "$dump" ]] || return 0
     while IFS=$'\t' read -r kind aname field value; do
@@ -179,6 +182,8 @@ fleet_read_agent() {
             network) fleet_network="$value" ;;
             thinking) fleet_thinking="$value" ;;
             description) fleet_description="$value" ;;
+            wake-on-cc) fleet_wake_on_cc="$value" ;;
+            refresh-at) fleet_refresh_at="$value" ;;
         esac
     done <<< "$dump"
 }
@@ -187,6 +192,7 @@ fleet_read_agent() {
 fleet_read_frontmatter() {
     local persona_path="$1" out field value
     fm_harness="" fm_model="" fm_network="" fm_thinking="" fm_description=""
+    fm_wake_on_cc="" fm_refresh_at=""
     out="$(python3 "$PARSE" frontmatter "$persona_path" "$persona_path")"
     while IFS=$'\t' read -r _ field value; do
         case "$field" in
@@ -195,6 +201,8 @@ fleet_read_frontmatter() {
             network) fm_network="$value" ;;
             thinking) fm_thinking="$value" ;;
             description) fm_description="$value" ;;
+            wake-on-cc) fm_wake_on_cc="$value" ;;
+            refresh-at) fm_refresh_at="$value" ;;
         esac
     done <<< "$out"
 }
@@ -210,6 +218,7 @@ resolve_with_dump() {
 
     local persona_path="$PERSONAS_DIR/${fleet_persona:-$name.md}"
     local fm_harness="" fm_model="" fm_network="" fm_thinking="" fm_description=""
+    local fm_wake_on_cc="" fm_refresh_at=""
     if [[ -f "$persona_path" ]]; then
         fleet_read_frontmatter "$persona_path"
     elif (( ! agent_declared )); then
@@ -224,6 +233,8 @@ resolve_with_dump() {
     printf '%s\n' "${fleet_network:-$fm_network}"
     printf '%s\n' "$persona_path"
     printf '%s\n' "${fleet_description:-$fm_description}"
+    printf '%s\n' "${fleet_wake_on_cc:-$fm_wake_on_cc}"
+    printf '%s\n' "${fleet_refresh_at:-$fm_refresh_at}"
 }
 
 cmd_resolve() {
@@ -324,13 +335,14 @@ cmd_roster() {
     done
 
     echo "Agents:"
-    local name harness model thinking network persona description
+    local name harness model thinking network persona description wake_on_cc refresh_at
     for name in "${agent_names[@]}"; do
         { read -r harness; read -r model; read -r thinking; read -r network; \
-          read -r persona; read -r description; } < <(resolve_with_dump "$dump" "$name")
-        printf '  %-20s harness=%-8s model=%-12s thinking=%-8s network=%-8s persona=%s%s\n' \
+          read -r persona; read -r description; read -r wake_on_cc; read -r refresh_at; } \
+            < <(resolve_with_dump "$dump" "$name")
+        printf '  %-20s harness=%-8s model=%-12s thinking=%-8s network=%-8s wake-on-cc=%-5s refresh-at=%-6s persona=%s%s\n' \
             "$name" "${harness:--}" "${model:--}" "${thinking:--}" \
-            "${network:--}" "$persona" "${description:+  # $description}"
+            "${network:--}" "${wake_on_cc:--}" "${refresh_at:--}" "$persona" "${description:+  # $description}"
     done
 
     local -a list_names=()

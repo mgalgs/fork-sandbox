@@ -682,12 +682,15 @@ pm_deliver_live() {
 
 pm_spawn_wake() {
     local project="$1" agent="$2" tid="$3" mid="$4"
-    local harness model thinking network persona_path description
-    # description (resolve's 6th line) is read to keep the fixed 6-line
-    # contract explicit but is not needed by a wake.
+    local harness model thinking network persona_path description wake_on_cc refresh_at
+    # description and wake_on_cc (resolve's 6th and 7th lines) are read to
+    # keep the fixed 8-line contract explicit but are not needed by a
+    # wake -- wake_on_cc is a routing decision made before a wake is ever
+    # spawned (see pm_process_message's Cc expansion).
     # shellcheck disable=SC2034
     if ! { read -r harness; read -r model; read -r thinking; read -r network; \
-           read -r persona_path; read -r description; } < <("$FLEET" resolve "$agent" 2>/dev/null); then
+           read -r persona_path; read -r description; read -r wake_on_cc; \
+           read -r refresh_at; } < <("$FLEET" resolve "$agent" 2>/dev/null); then
         pm_flag "$tid" "seat resolution failed for $agent: $mid"
         return 0
     fi
@@ -721,6 +724,11 @@ pm_spawn_wake() {
     [[ -n "$model" ]] && spawn_args+=(--model "$model")
     if [[ "$harness" == pi && -n "$thinking" ]]; then
         spawn_args+=(--pi-args "--thinking $thinking")
+    fi
+    # --refresh-at only works with --harness claude (fork-sandbox.sh
+    # refuses it outright, by name, on every other harness).
+    if [[ "$harness" == claude && -n "$refresh_at" ]]; then
+        spawn_args+=(--refresh-at "$refresh_at")
     fi
 
     # Every harness gets a persistent per-(thread, agent) clone -- unlike
