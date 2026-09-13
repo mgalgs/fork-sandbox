@@ -59,7 +59,7 @@
 #      harvester's reply-posting call (below) passes --hops.
 #   2. X-Hops gate: M's X-Hops == 0 means no wakes from M -- flag T
 #      needs-operator, reason "hops exhausted at <message-id>".
-#   3. Thread budget: spawns-so-far(T) >= budget (default 12,
+#   3. Thread budget: spawns-so-far(T) >= budget (default 32,
 #      $FORK_SANDBOX_THREAD_BUDGET overrides) means no wake -- flag T,
 #      reason "thread budget <n> exhausted". Checked once per message,
 #      not once per candidate: a message addressing several agents with
@@ -838,7 +838,7 @@ pm_process_message() {
     if [[ "$x_hops" == "0" ]]; then
         gate_reason="hops exhausted at $mid"
     else
-        local budget="${FORK_SANDBOX_THREAD_BUDGET:-12}" count
+        local budget="${FORK_SANDBOX_THREAD_BUDGET:-32}" count
         count="$(pm_spawn_count "$tid")"
         if (( count >= budget )); then
             gate_reason="thread budget $budget exhausted"
@@ -1011,7 +1011,7 @@ pm_followup_wake() {
         pm_flag "$tid" "hops exhausted at $mid"
         return 0
     fi
-    local budget="${FORK_SANDBOX_THREAD_BUDGET:-12}" count
+    local budget="${FORK_SANDBOX_THREAD_BUDGET:-32}" count
     count="$(pm_spawn_count "$tid")"
     if (( count >= budget )); then
         pm_flag "$tid" "thread budget $budget exhausted"

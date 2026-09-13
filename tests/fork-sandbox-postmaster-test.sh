@@ -365,7 +365,7 @@ contains "X-Hops 0: flag reason says hops exhausted" \
     "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid")" "hops exhausted"
 
 # ============================================================
-printf '\n== thread budget: default 12, env override, flag on exhaust ==\n'
+printf '\n== thread budget: default 32, env override, flag on exhaust ==\n'
 # ============================================================
 
 new_scratch_root FORK_SANDBOX_MAIL_ROOT
@@ -374,12 +374,12 @@ mid="$(send_msg '@alice' '@bob' 'budget default' 'body' 8)"
 tid="$(thread_of "$mid")"
 short="${tid:0:8}"
 mkdir -p -- "$FORK_SANDBOX_MAIL_ROOT/.postmaster/spawns"
-seq 1 12 > "$FORK_SANDBOX_MAIL_ROOT/.postmaster/spawns/$tid"
+seq 1 32 > "$FORK_SANDBOX_MAIL_ROOT/.postmaster/spawns/$tid"
 : > "$STUB_ARGV_LOG"
 once
-check "budget default 12: no spawn once exhausted" 0 "$(grep -c -- "^sbx-mail-$short-bob-" "$STUB_ARGV_LOG")"
-contains "budget default 12: flag names the limit" \
-    "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid")" "thread budget 12 exhausted"
+check "budget default 32: no spawn once exhausted" 0 "$(grep -c -- "^sbx-mail-$short-bob-" "$STUB_ARGV_LOG")"
+contains "budget default 32: flag names the limit" \
+    "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid")" "thread budget 32 exhausted"
 
 new_scratch_root FORK_SANDBOX_MAIL_ROOT
 export FORK_SANDBOX_MAIL_ROOT
