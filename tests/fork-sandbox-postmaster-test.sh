@@ -117,8 +117,8 @@ Eve is the codex seat used by the session-resume tests.
 EOF
 cat > "$FORK_SANDBOX_PERSONAS_DIR/frank.md" <<'EOF'
 Frank is the non-sealed pi seat used by the session-resume tests -- bob is
-sealed, and a sealed pi seat gets neither --session-state nor --session-id
-(fork-sandbox.sh refuses both there; see the "sealed pi seat" resume group).
+the sealed sibling, wired the same way (see the "sealed pi seat" resume
+group): agent-sandboxed's own --session-dir/--session-id carry it through.
 EOF
 
 cat > "$FORK_SANDBOX_FLEET_FILE" <<'EOF'
@@ -1568,11 +1568,13 @@ once
 check "resume: a pi seat's second wake gets the SAME --session-id" \
     "$pi_sid1" "$(argv_after --session-id "$STUB_ARGV_LOG")"
 
-# A SEALED pi seat (bob) is the one exception in the capability table: it
-# dispatches through agent-sandboxed instead of execing pi directly, and
-# that has no --session-dir/--session-id wiring at all -- fork-sandbox.sh
-# refuses all three flags there, so the postmaster must never send them,
-# even though plain pi (frank, above) is fully resumable.
+# A SEALED pi seat (bob) is wired the same as any other resumable harness
+# now: it dispatches through agent-sandboxed instead of execing pi directly,
+# but agent-sandboxed has its own --session-dir/--session-id, which bind the
+# durable store into the sandbox and point pi at it there -- so the
+# postmaster sends bob the same --session-state/--session-id pair it sends
+# plain pi (frank, above), and bob's session is likewise never recorded
+# under sessions/ (pi is a "given" id-mode harness regardless of network).
 new_scratch_root FORK_SANDBOX_MAIL_ROOT
 export FORK_SANDBOX_MAIL_ROOT
 PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
@@ -1581,14 +1583,26 @@ sealed_tid="$(thread_of "$sealed_mid1")"
 sealed_sessions="$PM_STATE_DIR/sessions/$sealed_tid/bob"
 : > "$STUB_ARGV_LOG"
 once
-check "resume: a sealed pi seat gets no --session-state" 0 \
-    "$(grep -c -- '^--session-state$' "$STUB_ARGV_LOG")"
-check "resume: a sealed pi seat gets no --session-id" 0 \
-    "$(grep -c -- '^--session-id$' "$STUB_ARGV_LOG")"
-check "resume: a sealed pi seat gets no --resume-session" 0 \
+check "resume: a sealed pi seat gets --session-state" \
+    "$PM_STATE_DIR/state/$sealed_tid/bob" "$(argv_after --session-state "$STUB_ARGV_LOG")"
+sealed_sid1="$(argv_after --session-id "$STUB_ARGV_LOG")"
+check "resume: a sealed pi seat's first wake already gets a --session-id" 0 \
+    "$( [[ -n "$sealed_sid1" ]] && echo 0 || echo 1 )"
+check "resume: a sealed pi seat gets no --resume-session (create-if-missing, not discovered)" 0 \
     "$(grep -c -- '^--resume-session$' "$STUB_ARGV_LOG")"
 check "resume: a sealed pi seat's session is never recorded under sessions/" 0 \
     "$( [[ -e "$sealed_sessions" ]] && echo 1 || echo 0 )"
+
+finish_run bob 0 "$sealed_sid1"
+once
+check "resume: a sealed pi seat's clean finish still writes nothing under sessions/" 0 \
+    "$( [[ -e "$sealed_sessions" ]] && echo 1 || echo 0 )"
+
+reply_msg '@carol' "$sealed_mid1" 'second message' --to '@bob' >/dev/null
+: > "$STUB_ARGV_LOG"
+once
+check "resume: a sealed pi seat's second wake gets the SAME --session-id" \
+    "$sealed_sid1" "$(argv_after --session-id "$STUB_ARGV_LOG")"
 
 # codex is a "discover" id-mode harness, same as claude: the recorded id (if
 # any) resumes via --resume-session, and a failed wake clears it. eve is the

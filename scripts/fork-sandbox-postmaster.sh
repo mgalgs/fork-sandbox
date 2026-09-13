@@ -264,16 +264,15 @@
 #                                   outlives the run. Every resumable
 #                                   harness (fs_harness_session_caps,
 #                                   fork-sandbox-lib.sh -- today claude,
-#                                   codex, pi) EXCEPT a sealed pi seat
+#                                   codex, pi), including a sealed pi seat
 #                                   (network "sealed"): that one dispatches
-#                                   through agent-sandboxed, which has no
-#                                   --session-dir/--session-id wiring at
-#                                   all, so fork-sandbox.sh refuses both
-#                                   flags there and this script never sends
-#                                   them. A harness with no capability-table
-#                                   entry, or a sealed pi seat, gets neither
-#                                   this nor sessions/ below and stays
-#                                   fresh-wake
+#                                   through agent-sandboxed, whose own
+#                                   --session-dir/--session-id bind the
+#                                   store into the sandbox and point pi at
+#                                   it there, the same as any other
+#                                   resumable harness. A harness with no
+#                                   capability-table entry gets neither this
+#                                   nor sessions/ below and stays fresh-wake
 #   sessions/<thread-id>/<agent>   the session id the LAST wake of that
 #                                   pair ended on, read out of the run's
 #                                   summary.json at harvest. Present ->
@@ -311,12 +310,12 @@
 #     sessions/ above); pi resumes by a deterministically-derived id
 #     (pm_pi_session_id) that its own CLI creates on first use -- both
 #     read as "resumed" from this script's point of view. A sealed pi seat
-#     (network "sealed") is the one exception: it dispatches through
-#     agent-sandboxed, which has no --session-dir/--session-id wiring at
-#     all, so fork-sandbox.sh refuses both flags there and this script
-#     never sends them to one. A harness with no entry in that table, or a
-#     sealed pi seat, gets a fresh session every wake, with the thread in
-#     the prompt as its only continuity. That prompt stays the
+#     (network "sealed") is wired the same as any other resumable harness:
+#     it dispatches through agent-sandboxed, whose own
+#     --session-dir/--session-id bind the durable store into the sandbox
+#     and point pi at it there. A harness with no entry in that table gets
+#     a fresh session every wake, with the thread in the prompt as its only
+#     continuity. That prompt stays the
 #     correctness guarantee for every harness, resumable or not -- resume
 #     is a continuity and cost optimization, and a wake whose session is
 #     missing, unreadable, or (claude/codex) rejected by the harness still
@@ -933,15 +932,13 @@ pm_spawn_wake() {
     # this (thread, agent) pair is bound into every wake of a resumable
     # harness (fs_harness_session_caps); a non-resumable harness gets
     # neither flag -- fork-sandbox.sh refuses both there. A sealed pi seat
-    # (network "sealed") is separately refused both flags even though pi
-    # itself is resumable: that seat dispatches through agent-sandboxed,
-    # which has no --session-dir/--session-id wiring at all, so
-    # fork-sandbox.sh refuses the flags outright rather than silently
-    # dropping them -- this is the postmaster's own default local-model
-    # seat, so it must never hand them to one.
+    # (network "sealed") -- the postmaster's own default local-model seat --
+    # is wired the same as any other resumable harness now: agent-sandboxed
+    # has its own --session-dir/--session-id, which bind the durable store
+    # into the sandbox and point pi at it there.
     local resumed=""
     fs_harness_session_caps "$harness"
-    if [[ "$FS_HARNESS_RESUMABLE" == true && "$network" != sealed ]]; then
+    if [[ "$FS_HARNESS_RESUMABLE" == true ]]; then
         spawn_args+=(--session-state "$PM_SESSION_STATE/$tid/$agent")
         if [[ "$FS_HARNESS_ID_MODE" == given ]]; then
             # No discovery: the id is derived, not read back from a prior

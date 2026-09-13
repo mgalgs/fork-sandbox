@@ -193,23 +193,40 @@ refuses "--resume-session refused on a given-mode harness (pi)" \
     --session-state "$scratch/fs-resume-unused" \
     --resume-session 0123abcd-4567-89ab-cdef-0123456789ab
 
-# A sealed pi run dispatches through agent-sandboxed, not a direct pi exec,
-# and agent-sandboxed has no --session-dir/--session-id wiring at all -- so
-# these three flags are refused there even though plain --harness pi (no
-# --network sealed) has the capability. Both spellings of a sealed pi seat
-# (the explicit pair and the pi-local alias) are refused the same way.
-refuses "--session-state refused with --harness pi --network sealed" \
-    "supported with --harness pi --network sealed" \
-    --harness pi --network sealed \
-    --session-state "$scratch/fs-resume-unused"
-refuses "--session-state refused with --harness pi-local" \
-    "supported with --harness pi-local" \
-    --harness pi-local --session-state "$scratch/fs-resume-unused"
-refuses "--session-id refused with --harness pi --network sealed" \
-    "supported with --harness pi --network sealed" \
-    --harness pi --network sealed \
+# A sealed pi run dispatches through agent-sandboxed, not a direct pi exec --
+# but agent-sandboxed now has its own --session-dir/--session-id wiring, so
+# these flags are accepted there exactly as on plain --harness pi. Both
+# spellings of a sealed pi seat (the explicit pair and the pi-local alias)
+# accept it the same way. A sealed pi run is model-less by construction, so
+# neither dry_run call below passes --model.
+sealed_state_out="$(dry_run --harness pi --network sealed \
+    --session-state "$scratch/fs-resume-unused")"
+sealed_state_rc=$?
+if (( sealed_state_rc == 0 )) && printf '%s\n' "$sealed_state_out" \
+    | grep -q '^session_state='; then
+    ok "--session-state accepted with --harness pi --network sealed"
+else
+    no "--session-state accepted with --harness pi --network sealed" "$sealed_state_out"
+fi
+pilocal_state_out="$(dry_run --harness pi-local \
+    --session-state "$scratch/fs-resume-unused")"
+pilocal_state_rc=$?
+if (( pilocal_state_rc == 0 )) && printf '%s\n' "$pilocal_state_out" \
+    | grep -q '^session_state='; then
+    ok "--session-state accepted with --harness pi-local"
+else
+    no "--session-state accepted with --harness pi-local" "$pilocal_state_out"
+fi
+sealed_id_out="$(dry_run --harness pi --network sealed \
     --session-state "$scratch/fs-resume-unused" \
-    --session-id 0123abcd-4567-89ab-cdef-0123456789ab
+    --session-id 0123abcd-4567-89ab-cdef-0123456789ab)"
+sealed_id_rc=$?
+if (( sealed_id_rc == 0 )) && printf '%s\n' "$sealed_id_out" \
+    | grep -qx 'session_id=0123abcd-4567-89ab-cdef-0123456789ab'; then
+    ok "--session-id accepted with --harness pi --network sealed"
+else
+    no "--session-id accepted with --harness pi --network sealed" "$sealed_id_out"
+fi
 
 # The id is used as a transcript filename stem, so path characters and
 # anything outside [0-9a-f-] must not survive to the claude command line. A
@@ -1352,6 +1369,97 @@ else
         "2.000000" "$(jq -r '.cost_usd // empty' "$pi_cross_run_dir/summary.json" 2>/dev/null)"
     check "summary.json's usage is this run's own turn, not the running total" \
         "40" "$(jq -r '.usage.total_tokens // empty' "$pi_cross_run_dir/summary.json" 2>/dev/null)"
+fi
+
+# ---------------------------------------------------------------------------
+printf '\n== pi-local (sealed): --session-dir/--session-id flow to agent-sandboxed ==\n'
+# ---------------------------------------------------------------------------
+
+# The sealed dispatch resolves "agent-sandboxed" off PATH (fs_resolve_harness's
+# pi-local arm) rather than execing pi directly or going through
+# claude-sandboxed, so a stub agent-sandboxed on PATH -- recording its argv
+# and exiting 0, exactly like the claude-sandboxed stub above -- replaces it
+# entirely; no real sandbox, backend or pi is ever started. The image-mode
+# fake backend already declared above (sandbox-backend-fake-image) is reused
+# so fs_resolve_pi's host-toolchain probe is skipped on the launcher side too.
+cat > "$stub_bin/agent-sandboxed" <<'STUB'
+#!/usr/bin/env bash
+cat >/dev/null
+if [[ -n "${FAKE_ARGV_FILE:-}" ]]; then
+    printf '%s\n' "$@" >> "$FAKE_ARGV_FILE"
+    printf -- '--- end of argv ---\n' >> "$FAKE_ARGV_FILE"
+fi
+exit 0
+STUB
+chmod +x "$stub_bin/agent-sandboxed"
+
+pilocal_cfg="$(mktmp_dir "$scratch/fs-resume-cfg.XXXXXX")"
+printf 'MODEL_ENDPOINT=http://198.51.100.1:8001/v1\n' > "$pilocal_cfg/model.env"
+pilocal_home="$(mktmp_dir "$scratch/fs-resume-home.XXXXXX")"
+pilocal_state="$(mktmp_dir "$scratch/fs-resume-pi-state.XXXXXX")"
+pilocal_sid=0123abcd-4567-89ab-cdef-0123456789ab
+
+pilocal_out="$(HOME="$pilocal_home" PATH="$stub_bin:$PATH" \
+    FORK_SANDBOX_CONFIG_DIR="$pilocal_cfg" FORK_SANDBOX_BACKEND=fake-image \
+    timeout 120 "$launcher" --foreground --harness pi --network sealed \
+    --session-state "$pilocal_state" --session-id "$pilocal_sid" \
+    --maintainer-loop 1 --maintainer-model vendor/model2 \
+    "$(new_project "$pilocal_home")" "$refusal_handoff" 2>&1)"
+pilocal_rc=$?
+pilocal_run_dir="$(printf '%s\n' "$pilocal_out" | sed -n 's/^  run dir:  *//p' | head -1)"
+if (( pilocal_rc != 0 )) || [[ -z "$pilocal_run_dir" ]]; then
+    no "a sealed pi run with --session-state and --session-id completed" \
+        "rc=$pilocal_rc: $pilocal_out"
+else
+    tmpdirs+=("$pilocal_run_dir")
+    pilocal_impl_line="$(grep '^impl_sandbox_cmd=' "$pilocal_run_dir/run.sh")"
+    pilocal_base_line="$(grep '^sandbox_cmd=' "$pilocal_run_dir/run.sh")"
+
+    # agent-sandboxed's own --session-dir/--session-id, ahead of the clone
+    # dir positional -- the bind and the pi-facing translation both happen
+    # inside agent-sandboxed itself now, so fork-sandbox.sh only has to name
+    # the host directory it already validated.
+    case "$pilocal_impl_line" in
+        *"--session-dir $pilocal_state"*) \
+            ok "the coding leg passes agent-sandboxed its own --session-dir at the host store" ;;
+        *) no "the coding leg passes agent-sandboxed its own --session-dir at the host store" \
+            "$pilocal_impl_line" ;;
+    esac
+    case "$pilocal_impl_line" in
+        *"--session-id $pilocal_sid"*) ok "the coding leg passes agent-sandboxed its own --session-id" ;;
+        *) no "the coding leg passes agent-sandboxed its own --session-id" "$pilocal_impl_line" ;;
+    esac
+
+    # sandbox_cmd is what a review or maintainer leg with no seat of its own
+    # falls back to -- it must carry neither flag, on pi-local exactly as on
+    # plain pi, or such a leg would write into (and, since pi's id is
+    # create-if-missing, effectively resume) the coding leg's own session.
+    case "$pilocal_base_line" in
+        *"--session-dir $pilocal_state"*) no "a leg with no seat of its own gets no durable --session-dir (pi-local)" \
+            "$pilocal_base_line" ;;
+        *) ok "a leg with no seat of its own gets no durable --session-dir (pi-local)" ;;
+    esac
+    case "$pilocal_base_line" in
+        *"--session-id"*) no "a leg with no seat of its own gets no --session-id (pi-local)" \
+            "$pilocal_base_line" ;;
+        *) ok "a leg with no seat of its own gets no --session-id (pi-local)" ;;
+    esac
+
+    pilocal_pi_session_dir="$(sed -n 's/^pi_session_dir=//p' "$pilocal_run_dir/run.sh")"
+    pilocal_rev_session_dir="$(sed -n 's/^rev_pi_session_dir=//p' "$pilocal_run_dir/run.sh")"
+    pilocal_mnt_session_dir="$(sed -n 's/^mnt_pi_session_dir=//p' "$pilocal_run_dir/run.sh")"
+    if [[ "$pilocal_rev_session_dir" == "$pilocal_pi_session_dir" ]]; then
+        ok "a review leg with no seat of its own keeps the clone-local session dir (pi-local)"
+    else
+        no "a review leg with no seat of its own keeps the clone-local session dir (pi-local)" \
+            "pi_session_dir=$pilocal_pi_session_dir rev_pi_session_dir=$pilocal_rev_session_dir"
+    fi
+    if [[ "$pilocal_mnt_session_dir" == "$pilocal_pi_session_dir" ]]; then
+        ok "a maintainer leg with no seat of its own keeps the clone-local session dir (pi-local)"
+    else
+        no "a maintainer leg with no seat of its own keeps the clone-local session dir (pi-local)" \
+            "pi_session_dir=$pilocal_pi_session_dir mnt_pi_session_dir=$pilocal_mnt_session_dir"
+    fi
 fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"

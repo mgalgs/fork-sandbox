@@ -183,12 +183,14 @@
 #                        under) — the directory is writable from inside an
 #                        unattended session, so where it may point is a
 #                        security boundary. Refused on a harness with no
-#                        session-resume capability, refused with --k8s, and
-#                        refused with --harness pi --network sealed (and its
-#                        pi-local alias): that run dispatches through
-#                        agent-sandboxed, which has no session-dir/session-id
-#                        wiring at all, so pi's own session-resume capability
-#                        does not reach it. It exists so a
+#                        session-resume capability, and refused with --k8s.
+#                        A sealed pi run (--harness pi --network sealed, and
+#                        its pi-local alias) dispatches through
+#                        agent-sandboxed rather than execing pi directly, but
+#                        is not refused: agent-sandboxed's own
+#                        --session-dir/--session-id bind the store into the
+#                        sandbox and point pi at it there, the same as every
+#                        other resumable harness. It exists so a
 #                        caller that wakes the same agent repeatedly — the
 #                        postmaster, on one mail thread — can hand the next
 #                        wake the previous one's session. The CODING legs
@@ -260,10 +262,10 @@
 #                        harness whose id is "discovered" instead (claude,
 #                        codex; use --resume-session there) or with no
 #                        session-resume capability, and refused with --k8s.
-#                        Also refused with --harness pi --network sealed
-#                        (and its pi-local alias), same as --session-state
-#                        above: agent-sandboxed has no session-dir/session-id
-#                        wiring at all.
+#                        Accepted with --harness pi --network sealed (and its
+#                        pi-local alias), same as --session-state above:
+#                        agent-sandboxed's own --session-dir/--session-id
+#                        wiring carries it through.
 #                        <id> must match ^[0-9a-f][0-9a-f-]{7,63}$, the same
 #                        shape --resume-session requires, since it is used as
 #                        a directory/filename component inside the bound
@@ -3167,30 +3169,6 @@ if [[ -n "$session_state" || -n "$resume_session" || -n "$session_id_arg" ]]; th
         echo "'$harness', which has none." >&2
         exit 1
     fi
-    # A sealed pi run dispatches through agent-sandboxed (fs_resolve_harness's
-    # pi-local arm) instead of execing pi directly, and agent-sandboxed has no
-    # --session-dir/--session-id wiring of its own (fs_build_sandbox_cmd's
-    # pi-local arm just uses a fixed per-run directory) -- these flags would
-    # be accepted here, since $harness is plain "pi", and then silently
-    # dropped when the command is actually built. That is exactly the failure
-    # the capability check just above exists to prevent for a harness with no
-    # resume capability at all; a sealed pi run has the capability in general
-    # but not through this dispatch path, so it needs the same refusal.
-    if [[ "$harness" == pi && "$network" == sealed ]]; then
-        if [[ "$harness_alias_pi_local" == true ]]; then
-            echo "Error: --session-state, --resume-session and --session-id are not" >&2
-            echo "supported with --harness pi-local. It dispatches through" >&2
-            echo "agent-sandboxed, which has no session-dir/session-id wiring at" >&2
-            echo "all -- the flag would be accepted and then silently dropped." >&2
-        else
-            echo "Error: --session-state, --resume-session and --session-id are not" >&2
-            echo "supported with --harness pi --network sealed. That run dispatches" >&2
-            echo "through agent-sandboxed, which has no session-dir/session-id" >&2
-            echo "wiring at all -- the flag would be accepted and then silently" >&2
-            echo "dropped." >&2
-        fi
-        exit 1
-    fi
 fi
 if [[ -n "$resume_session" && "$FS_HARNESS_ID_MODE" != discover ]]; then
     echo "Error: --resume-session names a session id to discover-then-resume," >&2
@@ -5186,19 +5164,44 @@ fs_build_sandbox_cmd() {
         # dies with the sandbox, and .git is writable but tracked by
         # nothing, so a session running `git add -A` cannot commit the
         # transcript by accident. The runner copies it out at the end.
-        out_pi_session_dir="$clone_dir/.git/pi-session"
+        #
+        # Same session_mode/session_state gate as the pi arm above, now
+        # that agent-sandboxed has its own --session-dir/--session-id
+        # wiring (see its header): a coding or continuation leg passes
+        # them as agent-sandboxed's OWN flags, which bind the durable
+        # store into the sandbox and point pi at it there; every other leg
+        # falls through to the clone-local marker below, exactly as
+        # before this wiring existed.
+        if [[ "$session_mode" != none && -n "$session_state" ]]; then
+            out+=(--session-dir "$session_state")
+            out_pi_session_dir="$session_state"
+            if [[ -n "$session_id_arg" ]]; then
+                out+=(--session-id "$session_id_arg")
+            fi
+        else
+            out_pi_session_dir="$clone_dir/.git/pi-session"
+        fi
         # The work dir here is a throwaway clone, and nothing runs git in
         # it once the sandbox has touched it, so agent-sandboxed's warning
         # about a writable .git would only tell the caller to use this
-        # script.
+        # script. agent-sandboxed's own flags -- --session-dir/--session-id
+        # just above, when present -- must precede this positional, exactly
+        # like every other agent-sandboxed flag.
         out+=(--no-git-warning "$clone_dir")
         if (( ${#harness_cmd[@]} )); then
             out+=("${harness_cmd[@]}")
         fi
         # --mode json for the same reason as the pi arm above: a real
         # event stream in events.jsonl, and no change to how the session
-        # runs.
-        out+=(--session-dir "$out_pi_session_dir" --mode json -p)
+        # runs. On the durable-store path, --session-dir was already named
+        # above as agent-sandboxed's own flag; naming it again here would
+        # forward a SECOND, conflicting --session-dir to pi as a plain
+        # agent argument.
+        if [[ "$session_mode" != none && -n "$session_state" ]]; then
+            out+=(--mode json -p)
+        else
+            out+=(--session-dir "$out_pi_session_dir" --mode json -p)
+        fi
     else
         out+=("$clone_dir" --dangerously-skip-permissions)
         # --print exits when the work is done and never shows a dialog.
