@@ -61,6 +61,15 @@ trap cleanup EXIT
 ok() { printf '  ok    %s\n' "$1"; pass=$(( pass + 1 )); }
 no() { printf '  FAIL  %s\n' "$1"; [[ -n "${2:-}" ]] && printf '        %s\n' "$2"; fail=$(( fail + 1 )); }
 
+check() {
+    local label="$1" expected="$2" actual="$3"
+    if [[ "$expected" == "$actual" ]]; then
+        ok "$label"
+    else
+        no "$label" "expected '$expected', got '$actual'"
+    fi
+}
+
 # Checks that argv (one token per line in FILE) contains FLAG immediately
 # followed by VALUE -- exactly how every flag pair in these argvs is built.
 argv_has_flag_value() {
@@ -184,6 +193,24 @@ refuses "--resume-session refused on a given-mode harness (pi)" \
     --session-state "$scratch/fs-resume-unused" \
     --resume-session 0123abcd-4567-89ab-cdef-0123456789ab
 
+# A sealed pi run dispatches through agent-sandboxed, not a direct pi exec,
+# and agent-sandboxed has no --session-dir/--session-id wiring at all -- so
+# these three flags are refused there even though plain --harness pi (no
+# --network sealed) has the capability. Both spellings of a sealed pi seat
+# (the explicit pair and the pi-local alias) are refused the same way.
+refuses "--session-state refused with --harness pi --network sealed" \
+    "supported with --harness pi --network sealed" \
+    --harness pi --network sealed \
+    --session-state "$scratch/fs-resume-unused"
+refuses "--session-state refused with --harness pi-local" \
+    "supported with --harness pi-local" \
+    --harness pi-local --session-state "$scratch/fs-resume-unused"
+refuses "--session-id refused with --harness pi --network sealed" \
+    "supported with --harness pi --network sealed" \
+    --harness pi --network sealed \
+    --session-state "$scratch/fs-resume-unused" \
+    --session-id 0123abcd-4567-89ab-cdef-0123456789ab
+
 # The id is used as a transcript filename stem, so path characters and
 # anything outside [0-9a-f-] must not survive to the claude command line. A
 # leading hyphen is refused too: it would make the id flag-shaped, so a
@@ -289,14 +316,22 @@ cat > "$stub_bin/claude-sandboxed" <<'STUB'
 # Fake claude-sandboxed: bypasses the backend entirely. It drains the prompt
 # from stdin (never read) and records the argv it was handed, then exits 0.
 cat >/dev/null
-printf '%s\n' "$@" >> "$FAKE_ARGV_FILE"
-printf -- '--- end of argv ---\n' >> "$FAKE_ARGV_FILE"
-# ...and once more per invocation, in its own file, so a multi-leg run can be
-# asserted on leg by leg: "$FAKE_ARGV_FILE.1" is the implement leg, ".2" the
-# leg after it, and so on.
-call_n=$(( $(cat "$FAKE_ARGV_FILE.count" 2>/dev/null || printf 0) + 1 ))
-printf '%s\n' "$call_n" > "$FAKE_ARGV_FILE.count"
-printf '%s\n' "$@" > "$FAKE_ARGV_FILE.$call_n"
+# A caller that only cares about run.sh (grepped straight out of the run
+# dir, e.g. the pi --session-state cases below) never sets FAKE_ARGV_FILE at
+# all; without this guard, every write below still resolves to a path
+# (bash does not error on ">> empty-string", and ".count"/".$call_n" resolve
+# to plain relative names) and litters the CURRENT DIRECTORY with stray
+# dot-files instead of doing nothing.
+if [[ -n "${FAKE_ARGV_FILE:-}" ]]; then
+    printf '%s\n' "$@" >> "$FAKE_ARGV_FILE"
+    printf -- '--- end of argv ---\n' >> "$FAKE_ARGV_FILE"
+    # ...and once more per invocation, in its own file, so a multi-leg run can
+    # be asserted on leg by leg: "$FAKE_ARGV_FILE.1" is the implement leg,
+    # ".2" the leg after it, and so on.
+    call_n=$(( $(cat "$FAKE_ARGV_FILE.count" 2>/dev/null || printf 0) + 1 ))
+    printf '%s\n' "$call_n" > "$FAKE_ARGV_FILE.count"
+    printf '%s\n' "$@" > "$FAKE_ARGV_FILE.$call_n"
+fi
 # The work dir is the argument before claude's own first flag, and the outbox
 # is the --bind-rw whose basename says so. Both are read off the argv rather
 # than passed in, so this stub cannot disagree with the launcher about them.
@@ -338,6 +373,14 @@ if [[ -n "${FAKE_TRANSCRIPTS:-}" ]]; then
             touch -d "@${spec##*@}" "$state/-home-agent-project/${spec%%@*}.jsonl"
         done
     fi
+fi
+# Stand in for pi's own append-only session file across resumed wakes:
+# FAKE_PI_APPEND_FILE names a file (a host path -- the --session-state
+# directory itself, since this stub never runs inside a real bind) to
+# append FAKE_PI_APPEND_LINE to, simulating a resumed pi CLI adding this
+# wake's own turn on top of whatever an earlier wake already left there.
+if [[ -n "${FAKE_PI_APPEND_FILE:-}" && -n "${FAKE_PI_APPEND_LINE:-}" ]]; then
+    printf '%s\n' "$FAKE_PI_APPEND_LINE" >> "$FAKE_PI_APPEND_FILE"
 fi
 exit 0
 STUB
@@ -1117,6 +1160,174 @@ cs_refuses "claude-sandboxed refuses a leading-hyphen session id" \
     --resume-session "-abcdef12" "$cs_work"
 cs_refuses "claude-sandboxed refuses a symlinked state dir" \
     "is a symlink" --session-state "$symlink_state" "$cs_work"
+
+# ---------------------------------------------------------------------------
+printf '\n== pi'"'"'s own --session-state: bind destination, gating, --session-id ==\n'
+# ---------------------------------------------------------------------------
+
+# A non-sealed pi run still goes through claude-sandboxed (with --exec), so
+# the same claude-sandboxed stub above -- which replaces the wrapper
+# entirely and just records its argv -- works here too. fork-sandbox.sh
+# itself still resolves a real pi+node to bind in, unless the backend
+# reports an image toolchain (fs_resolve_pi) -- so fake the backend into
+# image mode, the same way fork-sandbox-review-harness-test.sh's --harness
+# pi/some-model cases do. A plain (non-sealed) pi run does need pi.env too:
+# fork-sandbox.sh refuses it outright otherwise, well before
+# fs_build_sandbox_cmd.
+cat > "$stub_bin/sandbox-backend-fake-image" <<'STUB'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "--capabilities" ]]; then
+    printf 'toolchain=image\n'
+    exit 0
+fi
+exit 0
+STUB
+chmod +x "$stub_bin/sandbox-backend-fake-image"
+
+pi_cfg="$(mktemp -d)"; tmpdirs+=("$pi_cfg")
+install -m 600 /dev/null "$pi_cfg/pi.env"
+printf 'OPENROUTER_API_KEY=fake\n' > "$pi_cfg/pi.env"
+
+pi_home="$(mktmp_dir "$scratch/fs-resume-home.XXXXXX")"
+pi_state="$(mktmp_dir "$scratch/fs-resume-pi-state.XXXXXX")"
+pi_sid=0123abcd-4567-89ab-cdef-0123456789ab
+pi_proj="$(new_project "$pi_home")"
+
+pi_out="$(HOME="$pi_home" PATH="$stub_bin:$PATH" \
+    FORK_SANDBOX_CONFIG_DIR="$pi_cfg" FORK_SANDBOX_BACKEND=fake-image \
+    timeout 120 "$launcher" --foreground --harness pi --model vendor/model \
+    --session-state "$pi_state" --session-id "$pi_sid" \
+    "$pi_proj" "$refusal_handoff" 2>&1)"
+pi_rc=$?
+pi_run_dir="$(printf '%s\n' "$pi_out" | sed -n 's/^  run dir:  *//p' | head -1)"
+if (( pi_rc != 0 )) || [[ -z "$pi_run_dir" ]]; then
+    no "a pi run with --session-state and --session-id completed" \
+        "rc=$pi_rc: $pi_out"
+else
+    tmpdirs+=("$pi_run_dir")
+    pi_impl_line="$(grep '^impl_sandbox_cmd=' "$pi_run_dir/run.sh")"
+    pi_base_line="$(grep '^sandbox_cmd=' "$pi_run_dir/run.sh")"
+
+    # The bind's SOURCE is the host directory; its DESTINATION -- what pi is
+    # actually TOLD as --session-dir, since pi runs inside the sandbox and
+    # never sees the host path -- is the fixed in-sandbox path, not
+    # $pi_state again. sandbox-backend-bwrap sets the sandboxed process's
+    # HOME to this script's own $HOME (here, $pi_home), so that is the value
+    # pi is actually told -- fork-sandbox.sh expands "$HOME/.pi/sessions" at
+    # generation time, same as it already does for codex's own destination.
+    case "$pi_impl_line" in
+        *"--bind-rw-at $pi_state $pi_home/.pi/sessions"*) \
+            ok "the coding leg binds the host dir read-write at the in-sandbox destination" ;;
+        *) no "the coding leg binds the host dir read-write at the in-sandbox destination" \
+            "$pi_impl_line" ;;
+    esac
+    case "$pi_impl_line" in
+        *"--session-dir $pi_home/.pi/sessions"*) \
+            ok "pi is told --session-dir at the in-sandbox destination, not the host path" ;;
+        *) no "pi is told --session-dir at the in-sandbox destination, not the host path" \
+            "$pi_impl_line" ;;
+    esac
+    case "$pi_impl_line" in
+        *"--session-id $pi_sid"*) ok "pi is told --session-id" ;;
+        *) no "pi is told --session-id" "$pi_impl_line" ;;
+    esac
+
+    # sandbox_cmd is what a review, fix or maintainer leg without its own
+    # seat falls back to (run_leg's "cmd=(\"\${sandbox_cmd[@]}\")" default):
+    # it must carry NEITHER the bind nor --session-id, on pi exactly as on
+    # claude/codex, or such a leg would write into -- and, since pi's id is
+    # create-if-missing, effectively resume -- the coding leg's own session.
+    case "$pi_base_line" in
+        *"--bind-rw-at"*) no "a leg with no seat of its own gets no --session-state bind (pi)" \
+            "$pi_base_line" ;;
+        *) ok "a leg with no seat of its own gets no --session-state bind (pi)" ;;
+    esac
+    case "$pi_base_line" in
+        *"--session-id"*) no "a leg with no seat of its own gets no --session-id (pi)" \
+            "$pi_base_line" ;;
+        *) ok "a leg with no seat of its own gets no --session-id (pi)" ;;
+    esac
+fi
+
+# Without --session-id (--session-state alone), pi must still be told
+# --session-dir at the durable destination -- but never a literal empty
+# --session-id argument: fork-sandbox.sh omits the flag entirely rather than
+# pass one an empty value, which pi would see as a bare '' argument.
+pi_noid_home="$(mktmp_dir "$scratch/fs-resume-home.XXXXXX")"
+pi_noid_state="$(mktmp_dir "$scratch/fs-resume-pi-state.XXXXXX")"
+pi_noid_out="$(HOME="$pi_noid_home" PATH="$stub_bin:$PATH" \
+    FORK_SANDBOX_CONFIG_DIR="$pi_cfg" FORK_SANDBOX_BACKEND=fake-image \
+    timeout 120 "$launcher" --foreground --harness pi --model vendor/model \
+    --session-state "$pi_noid_state" \
+    "$(new_project "$pi_noid_home")" "$refusal_handoff" 2>&1)"
+pi_noid_rc=$?
+pi_noid_run_dir="$(printf '%s\n' "$pi_noid_out" | sed -n 's/^  run dir:  *//p' | head -1)"
+if (( pi_noid_rc != 0 )) || [[ -z "$pi_noid_run_dir" ]]; then
+    no "a pi run with --session-state and no --session-id completed" \
+        "rc=$pi_noid_rc: $pi_noid_out"
+else
+    tmpdirs+=("$pi_noid_run_dir")
+    pi_noid_impl_line="$(grep '^impl_sandbox_cmd=' "$pi_noid_run_dir/run.sh")"
+    case "$pi_noid_impl_line" in
+        *'--session-id'*) \
+            no "no --session-id means no --session-id flag at all, not an empty one" \
+                "$pi_noid_impl_line" ;;
+        *) ok "no --session-id means no --session-id flag at all, not an empty one" ;;
+    esac
+fi
+
+# The durable store crosses wakes, so it already holds an earlier wake's
+# turns before this run's own pi process appends its own. Pre-seed one
+# "prior wake" turn directly in the (host) --session-state directory, have
+# the stub append one "this wake" turn to the SAME file (as a real resumed
+# pi CLI would, appending to the id's own file), and confirm the run's own
+# accounting -- and its rescued copy under the run dir -- carry only the
+# new turn, not the running total across both.
+pi_cross_home="$(mktmp_dir "$scratch/fs-resume-home.XXXXXX")"
+pi_cross_state="$(mktmp_dir "$scratch/fs-resume-pi-state.XXXXXX")"
+pi_cross_sid=89abcdef-0123-4567-89ab-cdef01234567
+pi_cross_file="$pi_cross_state/$pi_cross_sid.jsonl"
+printf '{"usage":{"cost":{"total":1},"input":10,"output":10,"cacheRead":0,"cacheWrite":0,"totalTokens":20}}\n' \
+    > "$pi_cross_file"
+
+pi_cross_out="$(HOME="$pi_cross_home" PATH="$stub_bin:$PATH" \
+    FORK_SANDBOX_CONFIG_DIR="$pi_cfg" FORK_SANDBOX_BACKEND=fake-image \
+    FAKE_PI_APPEND_FILE="$pi_cross_file" \
+    FAKE_PI_APPEND_LINE='{"usage":{"cost":{"total":2},"input":20,"output":20,"cacheRead":0,"cacheWrite":0,"totalTokens":40}}' \
+    timeout 120 "$launcher" --foreground --harness pi --model vendor/model \
+    --session-state "$pi_cross_state" --session-id "$pi_cross_sid" \
+    "$(new_project "$pi_cross_home")" "$refusal_handoff" 2>&1)"
+pi_cross_rc=$?
+pi_cross_run_dir="$(printf '%s\n' "$pi_cross_out" | sed -n 's/^  run dir:  *//p' | head -1)"
+if (( pi_cross_rc != 0 )) || [[ -z "$pi_cross_run_dir" ]]; then
+    no "a pi run against a pre-seeded durable store completed" \
+        "rc=$pi_cross_rc: $pi_cross_out"
+else
+    tmpdirs+=("$pi_cross_run_dir")
+    # The durable file itself now carries both turns -- that part is
+    # supposed to grow; it is the seat's whole transcript.
+    check "the durable session file carries both wakes' turns" "2" \
+        "$(wc -l < "$pi_cross_file")"
+    # The run dir's rescued copy, and this run's own reported cost, must
+    # carry only the new one.
+    pi_cross_copy="$pi_cross_run_dir/pi-session/$pi_cross_sid.jsonl"
+    if [[ -f "$pi_cross_copy" ]]; then
+        check "the rescued copy carries only this run's own new turn" "1" \
+            "$(wc -l < "$pi_cross_copy")"
+        check "the rescued copy's turn is this run's own, not the prior wake's" \
+            '{"usage":{"cost":{"total":2},"input":20,"output":20,"cacheRead":0,"cacheWrite":0,"totalTokens":40}}' \
+            "$(cat "$pi_cross_copy")"
+    else
+        no "the rescued copy carries only this run's own new turn" \
+            "no file at $pi_cross_copy"
+        no "the rescued copy's turn is this run's own, not the prior wake's" \
+            "no file at $pi_cross_copy"
+    fi
+    check "summary.json's cost is this run's own turn, not the running total" \
+        "2.000000" "$(jq -r '.cost_usd // empty' "$pi_cross_run_dir/summary.json" 2>/dev/null)"
+    check "summary.json's usage is this run's own turn, not the running total" \
+        "40" "$(jq -r '.usage.total_tokens // empty' "$pi_cross_run_dir/summary.json" 2>/dev/null)"
+fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))

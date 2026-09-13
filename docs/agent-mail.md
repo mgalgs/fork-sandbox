@@ -447,7 +447,7 @@ own thread scans never see it:
 | `spawns/<thread-id>` | one line per spawn, reset by rule 1 — line count is the **budget** count |
 | `seq/<thread-id>` | one line per spawn, never reset — feeds the branch name |
 | `handoffs/<run-id>.md` | the generated handoff a wake was given |
-| `state/<thread-id>/<agent>/` | the claude transcript store for that pair |
+| `state/<thread-id>/<agent>/` | the harness's transcript/session store for that pair (claude, codex or pi — a sealed pi seat excepted, see below) |
 | `sessions/<thread-id>/<agent>` | the session id that pair's last wake ended on |
 | `workspaces/<thread-id>/<agent>/` | the persistent clone for that (thread, agent) seat, bound into every wake of it (every harness, not just claude) with `--clone-dir`; removed only by `fleet teardown` |
 
@@ -466,31 +466,52 @@ letting every spawn fail one at a time with the real reason buried.
 ## Session resume
 
 An (agent, thread) pair maps to one harness session, resumed at each
-wake. This is a continuity and cost optimization and **never** a
-correctness requirement — the full thread is in every prompt regardless.
+wake, on every harness with a session-resume capability — today claude,
+codex and pi, per `fs_harness_session_caps` (`fork-sandbox-lib.sh`), with
+one exception: a **sealed** pi seat (`network: sealed`) dispatches through
+`agent-sandboxed` instead of execing pi directly, and that path has no
+`--session-dir`/`--session-id` wiring at all, so it is refused the flags
+below and stays fresh-wake. This is a continuity and cost optimization and
+**never** a correctness requirement — the full thread is in every prompt
+regardless.
 
-It works through two `fork-sandbox.sh` flags:
+It works through three `fork-sandbox.sh` flags:
 
 - `--session-state <dir>` binds a host directory read-write into the
-  sandbox at the sandbox HOME's `~/.claude/projects`, so the claude CLI's
-  transcript store outlives the run. The directory must not be a symlink
-  and must resolve under `/var/tmp/claude-scratch` — it is writable from
-  inside an unattended session, so where it may point is a security
-  boundary. Only the **coding** legs are bound: a review, fix or
-  maintainer leg is a different conversation, and its transcript would be
-  the newest in the store, which is the one `summary.json` reports.
+  sandbox at the harness's own session store — the sandbox HOME's
+  `~/.claude/projects` for claude, `~/.codex/sessions` for codex, an
+  operator-chosen `~/.pi/sessions`-shaped path for pi — so that store
+  outlives the run. The directory must not be a symlink and must resolve
+  under `/var/tmp/claude-scratch` — it is writable from inside an
+  unattended session, so where it may point is a security boundary. Only
+  the **coding** legs are bound: a review, fix or maintainer leg is a
+  different conversation, and on a "discover" harness (claude, codex) its
+  transcript would be the newest in the store, which is the one
+  `summary.json` reports.
 - `--resume-session <id>` resumes that session with this wake's handoff
-  as the new prompt. First coding leg only. The id must match
+  as the new prompt. First coding leg only, and only on a "discover"
+  harness (claude, codex) — a harness whose id is "given" instead (pi)
+  uses `--session-id` below. The id must match
   `^[0-9a-f][0-9a-f-]{7,63}$` — it is a filename stem, so anything with a
   slash, a dot, or a leading hyphen is refused.
+- `--session-id <id>` supplies the session id for a "given" harness (pi)
+  instead of discovering one at run end: pi's `--session-id` creates the
+  session if it does not already exist, so passing the same id on every
+  wake makes resume implicit — there is nothing to discover. The
+  postmaster derives it deterministically from the (thread, agent) pair
+  (`pm_pi_session_id`) rather than reading one back from `sessions/`.
 
-`summary.json` gains `session_state` and `session_id` on such a run; the
-session id is the newest transcript stem at run end, which is a heuristic
-because the CLI does not record which transcript was this run's. The
-postmaster reads it at harvest and writes `sessions/<thread>/<agent>`.
-That file present means the next wake resumes; absent means fresh. It is
-cleared when a wake fails outright, or ends with a null session id, so a
-broken session can never wedge a seat.
+`summary.json` gains `session_state` and `session_id` on such a run. For a
+"discover" harness the session id is the newest transcript's stem
+(claude) or the newest rollout filename's uuid suffix (codex) at run end
+— a heuristic, since neither CLI records which transcript was this run's.
+For a "given" harness (pi) it is simply `--session-id` echoed back. The
+postmaster reads it at harvest and, for a discover-mode harness, writes
+`sessions/<thread>/<agent>`; that file present means the next wake
+resumes, absent means fresh, and it is cleared when a wake fails
+outright or ends with a null session id, so a broken session can never
+wedge a seat. A given-mode harness (pi) never touches `sessions/` at all
+— its id is derived fresh every spawn, not read back.
 
 **A resumed session and the seat's clone both cross wakes; the run dir does
 not.** Every wake still gets a fresh run dir — a new log, handoff,
@@ -505,19 +526,24 @@ commits are therefore both still there on the next wake; only run-dir-scoped
 paths (the previous wake's log, handoff, inbox, outbox) are gone, as they
 always were.
 `fork-sandbox.sh` tells a wake which case it is in: a "This session is a
-continuation" section when `--resume-session` is given (claude only), or a
-"This workspace is not new" section whenever the clone was reused with no
-session to resume — which is every wake past a pi or codex seat's first,
-since those harnesses never get `--resume-session` at all. Carrying work
-forward across wakes is the agent's own git work; nothing here automates it.
+continuation" section when a resume is named (`--resume-session` for
+claude/codex, `--session-id` for pi), or a "This workspace is not new"
+section whenever the clone was reused with no resume named — every wake
+past the first for a non-resumable harness or a sealed pi seat, and any
+wake whose recorded session turned out missing or unreadable for a
+discover-mode harness. Carrying work forward across wakes is the agent's
+own git work; nothing here automates it.
 
 A `--refresh-at` continuation is the same conversation continued, so it
 does write to the session store — but it is never *resumed*, whatever
 `--resume-session` says. A continuation exists to drop the context it
 inherited, and resuming it would hand that context straight back.
+(`--refresh-at` itself works only with `--harness claude`.)
 
-Resume is claude-only. A pi or codex seat gets a fresh session every
-wake, with the thread in the prompt as its only continuity.
+Resume works on claude, codex and pi seats alike, with one exception: a
+sealed pi seat gets a fresh session every wake, with the thread in the
+prompt as its only continuity — same as any harness with no
+session-resume capability at all.
 
 ## Rendering a thread
 
@@ -624,9 +650,12 @@ does.
 - **No mail tooling inside the sandbox.** A wake cannot read the store,
   search other threads, or send mail directly; it writes reply files and
   the harvester posts them.
-- **Resume is claude-only.** pi and codex seats are fresh-wake, though
-  their persistent workspace still carries their committed work and
-  untracked files forward like any other seat's.
+- **A sealed pi seat cannot resume.** It dispatches through
+  `agent-sandboxed` instead of execing pi directly, and that path has no
+  `--session-dir`/`--session-id` wiring at all, so it stays fresh-wake —
+  claude, codex and a non-sealed pi seat all resume (see "Session resume"
+  above). A sealed seat's persistent workspace still carries its
+  committed work and untracked files forward like any other seat's.
 - **No list-Cc delivery index.**
 - **No workspace expiry.** Seats accumulate disk until an explicit
   `fleet teardown`; there is no idle GC.

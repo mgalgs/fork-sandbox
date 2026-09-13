@@ -115,6 +115,11 @@ EOF
 cat > "$FORK_SANDBOX_PERSONAS_DIR/eve.md" <<'EOF'
 Eve is the codex seat used by the session-resume tests.
 EOF
+cat > "$FORK_SANDBOX_PERSONAS_DIR/frank.md" <<'EOF'
+Frank is the non-sealed pi seat used by the session-resume tests -- bob is
+sealed, and a sealed pi seat gets neither --session-state nor --session-id
+(fork-sandbox.sh refuses both there; see the "sealed pi seat" resume group).
+EOF
 
 cat > "$FORK_SANDBOX_FLEET_FILE" <<'EOF'
 agents:
@@ -125,6 +130,9 @@ agents:
   carol: {}
   eve:
     harness: codex
+  frank:
+    harness: pi
+    model: vendor/model
   dana:
     wake-on-cc: false
 lists:
@@ -1530,17 +1538,17 @@ check "leave-standing: a malformed session id leaves the earlier VALID id standi
 # pi is a "given" id-mode harness (fs_harness_session_caps): the postmaster
 # derives its session id itself (pm_pi_session_id) and passes it as
 # --session-id on EVERY wake, first included -- no sessions/ record is ever
-# read or written for it. bob is the pi seat.
+# read or written for it. frank is the non-sealed pi seat.
 new_scratch_root FORK_SANDBOX_MAIL_ROOT
 export FORK_SANDBOX_MAIL_ROOT
 PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
-pi_mid1="$(send_msg '@carol' '@bob' 'pi seat resume' 'first message' 8)"
+pi_mid1="$(send_msg '@carol' '@frank' 'pi seat resume' 'first message' 8)"
 pi_tid="$(thread_of "$pi_mid1")"
-pi_sessions="$PM_STATE_DIR/sessions/$pi_tid/bob"
+pi_sessions="$PM_STATE_DIR/sessions/$pi_tid/frank"
 : > "$STUB_ARGV_LOG"
 once
 check "resume: a pi seat gets --session-state" \
-    "$PM_STATE_DIR/state/$pi_tid/bob" "$(argv_after --session-state "$STUB_ARGV_LOG")"
+    "$PM_STATE_DIR/state/$pi_tid/frank" "$(argv_after --session-state "$STUB_ARGV_LOG")"
 pi_sid1="$(argv_after --session-id "$STUB_ARGV_LOG")"
 check "resume: a pi seat's first wake already gets a --session-id" 0 \
     "$( [[ -n "$pi_sid1" ]] && echo 0 || echo 1 )"
@@ -1549,16 +1557,38 @@ check "resume: a pi seat gets no --resume-session (create-if-missing, not discov
 check "resume: a pi seat's session is never recorded under sessions/" 0 \
     "$( [[ -e "$pi_sessions" ]] && echo 1 || echo 0 )"
 
-finish_run bob 0 "$pi_sid1"
+finish_run frank 0 "$pi_sid1"
 once
 check "resume: a pi seat's clean finish still writes nothing under sessions/" 0 \
     "$( [[ -e "$pi_sessions" ]] && echo 1 || echo 0 )"
 
-reply_msg '@carol' "$pi_mid1" 'second message' --to '@bob' >/dev/null
+reply_msg '@carol' "$pi_mid1" 'second message' --to '@frank' >/dev/null
 : > "$STUB_ARGV_LOG"
 once
 check "resume: a pi seat's second wake gets the SAME --session-id" \
     "$pi_sid1" "$(argv_after --session-id "$STUB_ARGV_LOG")"
+
+# A SEALED pi seat (bob) is the one exception in the capability table: it
+# dispatches through agent-sandboxed instead of execing pi directly, and
+# that has no --session-dir/--session-id wiring at all -- fork-sandbox.sh
+# refuses all three flags there, so the postmaster must never send them,
+# even though plain pi (frank, above) is fully resumable.
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+sealed_mid1="$(send_msg '@carol' '@bob' 'sealed pi seat resume' 'first message' 8)"
+sealed_tid="$(thread_of "$sealed_mid1")"
+sealed_sessions="$PM_STATE_DIR/sessions/$sealed_tid/bob"
+: > "$STUB_ARGV_LOG"
+once
+check "resume: a sealed pi seat gets no --session-state" 0 \
+    "$(grep -c -- '^--session-state$' "$STUB_ARGV_LOG")"
+check "resume: a sealed pi seat gets no --session-id" 0 \
+    "$(grep -c -- '^--session-id$' "$STUB_ARGV_LOG")"
+check "resume: a sealed pi seat gets no --resume-session" 0 \
+    "$(grep -c -- '^--resume-session$' "$STUB_ARGV_LOG")"
+check "resume: a sealed pi seat's session is never recorded under sessions/" 0 \
+    "$( [[ -e "$sealed_sessions" ]] && echo 1 || echo 0 )"
 
 # codex is a "discover" id-mode harness, same as claude: the recorded id (if
 # any) resumes via --resume-session, and a failed wake clears it. eve is the

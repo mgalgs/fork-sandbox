@@ -3159,6 +3159,30 @@ if [[ -n "$session_state" || -n "$resume_session" || -n "$session_id_arg" ]]; th
         echo "'$harness', which has none." >&2
         exit 1
     fi
+    # A sealed pi run dispatches through agent-sandboxed (fs_resolve_harness's
+    # pi-local arm) instead of execing pi directly, and agent-sandboxed has no
+    # --session-dir/--session-id wiring of its own (fs_build_sandbox_cmd's
+    # pi-local arm just uses a fixed per-run directory) -- these flags would
+    # be accepted here, since $harness is plain "pi", and then silently
+    # dropped when the command is actually built. That is exactly the failure
+    # the capability check just above exists to prevent for a harness with no
+    # resume capability at all; a sealed pi run has the capability in general
+    # but not through this dispatch path, so it needs the same refusal.
+    if [[ "$harness" == pi && "$network" == sealed ]]; then
+        if [[ "$harness_alias_pi_local" == true ]]; then
+            echo "Error: --session-state, --resume-session and --session-id are not" >&2
+            echo "supported with --harness pi-local. It dispatches through" >&2
+            echo "agent-sandboxed, which has no session-dir/session-id wiring at" >&2
+            echo "all -- the flag would be accepted and then silently dropped." >&2
+        else
+            echo "Error: --session-state, --resume-session and --session-id are not" >&2
+            echo "supported with --harness pi --network sealed. That run dispatches" >&2
+            echo "through agent-sandboxed, which has no session-dir/session-id" >&2
+            echo "wiring at all -- the flag would be accepted and then silently" >&2
+            echo "dropped." >&2
+        fi
+        exit 1
+    fi
 fi
 if [[ -n "$resume_session" && "$FS_HARNESS_ID_MODE" != discover ]]; then
     echo "Error: --resume-session names a session id to discover-then-resume," >&2
@@ -3442,6 +3466,12 @@ harness_sandbox_bin=""
 run_formatter="$formatter"
 usage_source="$harness"
 pi_session_dir=""
+# Where the CODING leg's own accounting (near "run_cost=" below) reads
+# from. Usually the same as pi_session_dir; differs only once
+# --session-state makes the coding leg actually run impl_sandbox_cmd or
+# cont_sandbox_cmd instead of the sandbox_cmd review/fix/maintainer legs
+# fall back to -- see where each is set, below.
+pi_run_session_dir=""
 
 # --review-harness (below) needs the whole block below resolved a second
 # time, for a second harness, without the two runs seeing or clobbering
@@ -5080,17 +5110,33 @@ fs_build_sandbox_cmd() {
             # run reports, never what it does: the same print mode, the
             # same session, the same agent loop.
             #
-            # With --session-state, pi gets no session_mode gate the way
-            # claude/codex do above: pi's --session-id is create-if-missing,
-            # so every wake -- coding, review, fix or maintainer -- that
-            # was handed a session-state bind is correctly resumable on its
-            # own id, with no "newest transcript" heuristic to protect from
-            # a wrong leg's rollout competing for it.
-            if [[ -n "$session_state" ]]; then
+            # pi needs the SAME session_mode gate as claude/codex above,
+            # even though its --session-id is create-if-missing rather than
+            # discovered: the id is one fixed value for this whole run (the
+            # caller's --session-id), so an ungated bind would have a
+            # review, fix or maintainer leg write into -- and, since the
+            # same id is create-if-missing, effectively resume -- the exact
+            # session the coding leg uses, rather than each being its own
+            # conversation. Gated, every leg but the coding one falls to the
+            # transient clone-local directory below, exactly like
+            # claude/codex leave sandbox_cmd itself with no store flags.
+            #
+            # The bind's SOURCE is the host directory the caller passed
+            # (--session-state); its DESTINATION, "$HOME/.pi/sessions", is
+            # also what --session-dir must name, because pi runs inside the
+            # sandbox and never sees the host path -- only the destination
+            # the bind lands it at. out_pi_session_dir stays the host path:
+            # it is read back on the host, after the sandbox has exited, for
+            # the per-leg accounting and the review/fix/maintainer
+            # substitution below, both of which run outside any sandbox.
+            if [[ "$session_mode" != none && -n "$session_state" ]]; then
                 out+=(--bind-rw-at "$session_state" "$HOME/.pi/sessions")
                 out_pi_session_dir="$session_state"
-                harness_cmd+=(--session-dir "$out_pi_session_dir" \
-                    --session-id "$session_id_arg" --mode json -p)
+                harness_cmd+=(--session-dir "$HOME/.pi/sessions")
+                if [[ -n "$session_id_arg" ]]; then
+                    harness_cmd+=(--session-id "$session_id_arg")
+                fi
+                harness_cmd+=(--mode json -p)
             else
                 out_pi_session_dir="$clone_dir/.git/pi-session"
                 harness_cmd+=(--session-dir "$out_pi_session_dir" --mode json -p)
@@ -5182,6 +5228,7 @@ fs_build_sandbox_cmd() {
 {
     fs_build_sandbox_cmd impl sandbox_cmd
     pi_session_dir="$impl_pi_session_dir"
+    pi_run_session_dir="$pi_session_dir"
 }
 
 # The transcript store belongs to the CODING conversation and to nothing
@@ -5212,6 +5259,15 @@ cont_sandbox_cmd=("${sandbox_cmd[@]}")
 if [[ -n "$session_state" ]]; then
     fs_build_sandbox_cmd impl impl_sandbox_cmd resume
     fs_build_sandbox_cmd impl cont_sandbox_cmd state
+    # The CODING leg actually runs impl_sandbox_cmd or cont_sandbox_cmd, not
+    # sandbox_cmd -- both builds just above land on the same durable
+    # directory (fs_build_sandbox_cmd's pi arm does not vary it by
+    # session_mode), so either's out_pi_session_dir names it. pi_session_dir
+    # itself is left alone: review and maintainer legs without their own
+    # --review-harness/--maintainer-harness fall back to sandbox_cmd (see
+    # "rev_pi_session_dir"/"mnt_pi_session_dir" below), so it must keep
+    # naming what THAT build used, not this one.
+    pi_run_session_dir="$impl_pi_session_dir"
 fi
 
 # Review legs may use a stronger or independent model, or -- with
@@ -5558,6 +5614,10 @@ started_at="$(date +%s)"
     printf 'rev_harness_env_file=%q\n' "$rev_harness_env_file"
     printf 'started_at=%q\n' "$started_at"
     printf 'pi_session_dir=%q\n' "$pi_session_dir"
+    # Where the CODING leg's own accounting reads from -- see where it is
+    # set, beside impl_sandbox_cmd/cont_sandbox_cmd, for why this can differ
+    # from pi_session_dir itself.
+    printf 'pi_run_session_dir=%q\n' "$pi_run_session_dir"
     # Empty unless --session-state was given; the runner reads it at the end
     # to name this run's session_id in summary.json.
     printf 'session_state=%q\n' "$session_state"
@@ -6034,6 +6094,18 @@ fi
 # the file at exec time, after the services block above, so a failure
 # correction appended there still lands in the prompt.
 
+# With --session-state, pi_run_session_dir is the durable cross-wake store
+# (see where it is set, above), not a fresh per-run directory -- it already
+# holds every earlier wake's turns before this one starts. Snapshot each
+# transcript's current line count now, so the accounting below can take
+# only what THIS run appends, not the whole store's history.
+declare -A pi_run_session_baseline_lines=()
+if [[ -n "$pi_run_session_dir" && -d "$pi_run_session_dir" ]]; then
+    while IFS= read -r -d '' pi_baseline_file; do
+        pi_run_session_baseline_lines["$pi_baseline_file"]="$(wc -l < "$pi_baseline_file" 2>/dev/null || echo 0)"
+    done < <(find "$pi_run_session_dir" -name '*.jsonl' -type f -print0 2>/dev/null)
+fi
+
 # stdout is the session's output: tee keeps the raw copy in the event log,
 # and the formatter renders it live when there is one to render. The
 # sandbox's own messages go to stderr, which is copied to the log and shown
@@ -6094,15 +6166,30 @@ fi
 # the formatter reads it out. pi does not say it anywhere in its output,
 # but records the token cost of every message in its session file — so
 # rescue that file first, before anything else touches the clone. It is
-# worth keeping for its own sake, being the whole transcript. cp -a copies
-# symlinks as symlinks, so nothing the sandbox left behind can redirect
-# this write. Summing every usage.cost counts tool-reported usage too,
-# which is what pi's own totals do.
+# worth keeping for its own sake, being the whole transcript.
+#
+# Not a plain cp -a: with --session-state, pi_run_session_dir is the durable
+# cross-wake store, so it already holds every earlier wake's turns, and a
+# straight copy would fold their cost, usage and last stopReason into this
+# run's. pi_run_session_baseline_lines, snapshotted just before the run
+# above, is empty for every file here without --session-state (a fresh
+# per-run directory starts with nothing, so this is the same full copy cp -a
+# was) and the pre-run line count of each transcript otherwise; take only
+# what comes after it. Symlinks are skipped rather than followed, the same
+# protection cp -a's own symlink-preserving behavior gave against anything
+# the sandbox left behind redirecting this write.
 run_cost=""
 run_usage=""
 run_error=""
-if [[ -n "$pi_session_dir" && -d "$pi_session_dir" ]]; then
-    cp -a "$pi_session_dir" "$run_dir/pi-session" 2>/dev/null
+if [[ -n "$pi_run_session_dir" && -d "$pi_run_session_dir" ]]; then
+    mkdir -p "$run_dir/pi-session"
+    while IFS= read -r -d '' pi_copy_file; do
+        pi_copy_rel="${pi_copy_file#"$pi_run_session_dir"/}"
+        pi_copy_dest="$run_dir/pi-session/$pi_copy_rel"
+        mkdir -p "$(dirname "$pi_copy_dest")"
+        pi_copy_base="${pi_run_session_baseline_lines[$pi_copy_file]:-0}"
+        tail -n "+$(( pi_copy_base + 1 ))" "$pi_copy_file" > "$pi_copy_dest" 2>/dev/null
+    done < <(find "$pi_run_session_dir" -name '*.jsonl' -type f -print0 2>/dev/null)
 
     # pi exits 0 even when its final turn ended in a provider error -- a
     # context-length 400, a refused request, a dropped endpoint -- because the

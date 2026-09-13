@@ -993,10 +993,14 @@ fs_resolve_pi() {
 # instead of ever testing a harness name themselves for session-resume logic.
 # $1 is the harness name -- "claude", "codex" or "pi". "pi-local" (the
 # sealed-network dispatch key fs_resolve_harness derives from harness "pi") is
-# accepted too and treated identically to "pi": it is the same CLI, the same
-# --session-dir/--session-id contract, reached through agent-sandboxed instead
-# of a direct exec, and callers that already have "pi-local" in hand (inside
-# fs_build_sandbox_cmd) should not have to re-derive "pi" from it first.
+# accepted too and treated identically to "pi", since it is the same CLI and
+# the same --session-dir/--session-id contract, reached through
+# agent-sandboxed instead of a direct exec -- a sealed pi run is refused
+# --session-state/--resume-session/--session-id outright, at the same
+# fork-sandbox.sh callsite this capability table feeds (agent-sandboxed has
+# no --session-dir/--session-id wiring of its own to bind them into), but the
+# alias means a caller checking a harness it already has as "pi-local" gets
+# the same answer "pi" would without re-deriving it first.
 #
 # Fills three globals rather than printing to stdout, exactly like
 # FS_PI_ROOT/FS_PI_ARGV0 above -- a caller wants several of them at once, and
@@ -1007,17 +1011,21 @@ fs_resolve_pi() {
 #                         the in-sandbox bind destination, as a literal
 #                         string with an UNEXPANDED "$HOME" token -- e.g.
 #                         '$HOME/.claude/projects', not the expansion of any
-#                         particular $HOME. sandbox-backend-bwrap sets the
-#                         sandboxed process's HOME to the exact value of the
-#                         invoking script's own $HOME (--setenv HOME "$HOME",
-#                         see sandbox-backend-bwrap), so every consumer of
-#                         this string -- fork-sandbox.sh itself for codex,
-#                         claude-sandboxed for claude, agent-sandboxed for pi
-#                         -- expands the literal "$HOME" against ITS OWN
-#                         $HOME and reaches the same path the sandboxed
-#                         process sees. None of them may expand it here: this
-#                         function may be called from a context whose $HOME
-#                         is irrelevant to the sandbox (there is none today,
+#                         particular $HOME. No caller expands it today --
+#                         fork-sandbox.sh's own fs_build_sandbox_cmd hardcodes
+#                         the same paths directly for codex and pi, the way
+#                         claude-sandboxed hardcodes claude's -- so this is
+#                         documentation of what those hardcoded paths must
+#                         agree with, not a value read back at run time yet.
+#                         Should a caller ever expand it: sandbox-backend-bwrap
+#                         sets the sandboxed process's HOME to the exact value
+#                         of the invoking script's own $HOME (--setenv HOME
+#                         "$HOME", see sandbox-backend-bwrap), so expanding
+#                         the literal "$HOME" against THAT script's own $HOME
+#                         reaches the same path the sandboxed process sees.
+#                         It may not be expanded here: this function may be
+#                         called from a context whose $HOME is irrelevant to
+#                         the sandbox (there is none today,
 #                         but nothing pins that). Empty when not resumable.
 #   FS_HARNESS_ID_MODE    "discover" -- the id is read back out of the bound
 #                         directory at run end (claude: newest transcript's
