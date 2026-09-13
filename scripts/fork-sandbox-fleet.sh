@@ -91,10 +91,10 @@
 #                  command. A field with nothing configured anywhere
 #                  prints as an empty line -- output is always twelve
 #                  lines, never fewer. A handler seat's harness/model/
-#                  thinking/network/triage/preset lines are always empty
-#                  (refused together at `check` time); its handler/command
-#                  lines are the only ones populated besides persona-path/
-#                  description/wake-on-cc/refresh-at.
+#                  thinking/network/triage/preset/refresh-at lines are
+#                  always empty (refused together at `check` time); its
+#                  handler/command lines are the only ones populated
+#                  besides persona-path/description/wake-on-cc.
 #   resolve-triage Print exactly two lines for the wake classifier's own
 #                  sandbox seat: harness, model. Reads only the fleet
 #                  file's top-level `triage` block (no persona fallback --

@@ -227,8 +227,9 @@ lists:
 and required to exist and be executable both at `fleet check` time and
 again at wake time) is then required, and none of
 `harness`/`model`/`network`/`thinking`/`triage`/`persona`/`refresh-at`/`preset`
-may be set on the same agent — those tune an LLM seat, which a handler is
-not. `wake-on-cc` still applies: it governs whether the seat wakes on a
+may be set on the same agent — in fleet.yaml or in the seat's own
+`<name>.md` frontmatter alike — since those tune an LLM seat, which a
+handler is not. `wake-on-cc` still applies: it governs whether the seat wakes on a
 Cc at all, independent of whether the wake is an LLM spawn or a handler
 run. A handler seat is invoked synchronously, inline in the postmaster's
 deliver pass — see `fork-sandbox-postmaster.sh --help` for the wake
@@ -623,7 +624,12 @@ postmaster reads it at harvest and, for a discover-mode harness, writes
 resumes, absent means fresh, and it is cleared when a wake fails
 outright or ends with a null session id, so a broken session can never
 wedge a seat. A given-mode harness (pi) never touches `sessions/` at all
-— its id is derived fresh every spawn, not read back.
+— its id is derived fresh every spawn, not read back. That also makes
+the self-clearing above a discover-mode behavior only: pi has no
+recorded id to clear, so if pi's own session store ever becomes
+unloadable, every later wake presents it the same derived id. Recovery
+there is `fleet teardown` (or removing the seat's `state/` directory),
+not automatic.
 
 **A resumed session and the seat's clone both cross wakes; the run dir does
 not.** Every wake still gets a fresh run dir — a new log, handoff,

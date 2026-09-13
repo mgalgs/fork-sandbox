@@ -30,8 +30,9 @@ script.
 than an LLM seat: `command` (a bare name, resolved host-side against the
 operator's handlers directory -- see fork-sandbox-postmaster.sh) is then
 required, and none of `harness`/`model`/`network`/`thinking`/`triage`/
-`persona`/`refresh-at`/`preset` may be set on the same agent -- those
-tune an LLM seat, which a handler is not. `handler`, when present, is
+`persona`/`refresh-at`/`preset` may be set on the same agent -- in
+fleet.yaml or in that agent's own `<name>.md` frontmatter alike --
+since those tune an LLM seat, which a handler is not. `handler`, when present, is
 always the literal string `exec`; nothing else validates.
 
 `preset` names a `~/.config/fork-sandbox/presets/<name>.yaml` (see

@@ -1166,7 +1166,8 @@ pm_deliver_live() {
 # Determines whether $agent's wake for $mid was addressed via To: or only
 # via Cc: (list expansion included) -- feeds both the handoff's {via} and
 # the run ledger's VIA field (see STATE above), so the dogfood can count
-# observer wakes. Computed once per spawn, in pm_spawn_wake, from $mid's
+# observer wakes. Computed once per wake — by pm_spawn_wake for an LLM
+# seat, by pm_exec_wake for a handler seat — from $mid's
 # own To: header, independent of whatever pm_process_message decided when
 # routing it: a follow-up wake for a message that was only ever Cc'd
 # correctly still ledgers as cc since the source of truth is the message
