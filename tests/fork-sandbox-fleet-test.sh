@@ -294,42 +294,41 @@ agents:
 EOF
 rm -f "$FORK_SANDBOX_PERSONAS_DIR/all.md"
 
-printf '\n== $USER guard ==\n'
+printf '\n== "operator" is always reserved (not $USER-conditional) ==\n'
 
-(
-    export USER=collider
-    bad "an agent named for \$USER is refused when \$USER matches the fleet name shape" \
-        "is reserved" "agents.collider" <<'EOF'
+bad "an agent named 'operator' is refused, naming the reservation" \
+    "is reserved" "agents.operator" <<'EOF'
 agents:
   riffler: {}
-  collider: {}
+  operator: {}
 EOF
-)
 
-(
-    export USER=collider
-    bad "a list named for \$USER is refused when \$USER matches the fleet name shape" \
-        "is reserved" "lists.collider" <<'EOF'
+bad "a list named 'operator' is refused, naming the reservation" \
+    "is reserved" "lists.operator" <<'EOF'
 agents:
   riffler: {}
 lists:
-  collider:
+  operator:
     members: [riffler]
 EOF
-)
 
-(
-    cat > "$FORK_SANDBOX_FLEET_FILE_DIR/bad.yaml" <<'EOF'
+cat > "$FORK_SANDBOX_PERSONAS_DIR/operator.md" <<'EOF'
+---
+harness: claude
+---
+EOF
+bad "a bare operator.md persona file is refused, naming the reservation" \
+    "is reserved" "operator.md" <<'EOF'
 agents:
   riffler: {}
 EOF
-    export USER='Not-A-Fleet-Name'
-    saved="$FORK_SANDBOX_FLEET_FILE"
-    export FORK_SANDBOX_FLEET_FILE="$FORK_SANDBOX_FLEET_FILE_DIR/bad.yaml"
+rm -f "$FORK_SANDBOX_PERSONAS_DIR/operator.md"
+
+(
+    export USER=collider
     out="$("$fleet" check 2>&1)"; rc=$?
-    export FORK_SANDBOX_FLEET_FILE="$saved"
-    check "a \$USER that doesn't match the fleet name shape reserves nothing (no error)" "0" "$rc"
-    check "a \$USER that doesn't match the fleet name shape prints nothing" "" "$out"
+    check "check: \$USER no longer affects reservation at all (clean config still exits 0)" "0" "$rc"
+    check "check: \$USER no longer affects reservation at all (no output)" "" "$out"
 )
 
 badfile="$FORK_SANDBOX_FLEET_FILE_DIR/bad.yaml"

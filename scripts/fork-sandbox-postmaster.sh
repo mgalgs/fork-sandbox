@@ -30,13 +30,15 @@
 # fork-sandbox.sh run carrying the persona, the full thread, and reply
 # instructions in a generated handoff. A message's To: recipients always
 # wake; Cc: recipients wake too unless their seat's wake-on-cc resolves
-# false (empty/unset means true -- a silent wake is cheap and cannot
-# extend a conversation on its own, and a Cc'd colleague should read the
-# mail today, not at their next meeting; see `fleet resolve`'s wake-on-cc
-# field). Privacy is addressing: a woken agent receives ONLY the thread it
-# is being woken for -- the sandbox has no mail tooling and no store
-# access, so the thread embedded in its handoff is that agent's entire
-# world for the run.
+# false (empty/unset means true -- the kit tells a Cc-woken agent a reply
+# is allowed when something genuinely matters, so this does spend a hop
+# and can extend the thread, same as a To wake; the default favors a
+# Cc'd colleague reading the mail today over saving that spawn, and a
+# seat that should stay silent sets wake-on-cc: false; see `fleet
+# resolve`'s wake-on-cc field). Privacy is addressing: a woken agent
+# receives ONLY the thread it is being woken for -- the sandbox has no
+# mail tooling and no store access, so the thread embedded in its
+# handoff is that agent's entire world for the run.
 #
 # ROUTING RULES (applied in this order to each unrouted message M in
 # thread T; a message is routed exactly once, decided before any wake is
@@ -571,7 +573,8 @@ pm_kit_path() {
 # broken install refuses up front instead of every wake's handoff failing
 # quietly (same posture as fs_require_scratch_handoff above it in cmd_deliver).
 pm_require_kit() {
-    if ! pm_kit_path >/dev/null; then
+    local kit_path
+    if ! kit_path="$(pm_kit_path)"; then
         local config_dir prompts_dir
         config_dir="${FORK_SANDBOX_CONFIG_DIR:-$HOME/.config/fork-sandbox}"
         prompts_dir="${FORK_SANDBOX_PROMPTS_DIR:-$config_dir/prompts}"
@@ -583,21 +586,41 @@ pm_require_kit() {
         echo "install (the repo copy should always exist) or the overlay path." >&2
         return 1
     fi
+    # An overlay that drops {name} silently un-guarantees the one thing
+    # every handoff used to state unconditionally: the agent's own
+    # address. Catch it here, loudly and once, instead of every wake
+    # quietly going out with no self-identification.
+    if ! grep -qF '{name}' -- "$kit_path"; then
+        echo "Error: postmaster: fleet kit at '$kit_path' has no {name}" >&2
+        echo "placeholder, so no handoff built from it would ever tell the" >&2
+        echo "agent its own address. Add '{name}' to the overlay, or remove" >&2
+        echo "the overlay so the repo's own copy (which has one) is used." >&2
+        return 1
+    fi
     return 0
 }
 
 pm_write_handoff() {
     local out="$1" agent="$2" persona_path="$3" tid="$4" trigger_mid="$5"
-    local render_rc=0 kit_path kit_text operator
+    local render_rc=0 kit_path kit_text via via_label
     kit_path="$(pm_kit_path)" || {
         echo "Error: postmaster: fleet kit missing (checked loudly at deliver" >&2
         echo "startup; this should not be reachable mid-run)." >&2
         return 1
     }
     kit_text="$(<"$kit_path")"
-    operator="${USER:-operator}"
+    # Every documented `mail send`/`mail reply` invocation sends operator
+    # mail as the literal address `@operator` (never the postmaster host's
+    # own $USER, which mail.sh's --from never defaults to and which is
+    # frequently not even a legal address) -- so the kit's rule-1-outranks
+    # framing must name that same literal address, not whatever account
+    # happens to run the postmaster.
     kit_text="${kit_text//\{name\}/$agent}"
-    kit_text="${kit_text//\{operator\}/$operator}"
+    kit_text="${kit_text//\{operator\}/operator}"
+    via="$(pm_wake_via "$trigger_mid" "$agent")"
+    via_label="Cc"
+    [[ "$via" == to ]] && via_label="To"
+    kit_text="${kit_text//\{via\}/$via_label}"
     {
         printf '%s\n\n' "$kit_text"
         if [[ -n "$persona_path" && -f "$persona_path" ]]; then

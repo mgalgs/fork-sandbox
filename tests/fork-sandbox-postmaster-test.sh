@@ -212,6 +212,13 @@ spawn_count_of() {
     [[ -f "$f" ]] && wc -l < "$f" || printf '0'
 }
 
+handoff_file_for_agent() {
+    local agent="$1" f run_id
+    f="$(env_file_for_agent "$agent")" || return 1
+    run_id="$(basename "$f" .env)"
+    printf '%s' "$FORK_SANDBOX_MAIL_ROOT/.postmaster/handoffs/$run_id.md"
+}
+
 # ============================================================
 printf '\n== To wakes, Cc wakes by default; list wakes every member once; direct+list dedup ==\n'
 # ============================================================
@@ -229,6 +236,16 @@ run_env="$(env_file_for_agent carol)"
 check "Cc wake: ledger records VIA=cc" "VIA=cc" "$(grep '^VIA=' "$run_env")"
 run_env_bob="$(env_file_for_agent bob)"
 check "To wake: ledger records VIA=to" "VIA=to" "$(grep '^VIA=' "$run_env_bob")"
+
+# The ledger's VIA is computed for a reason -- it must also be legible
+# to the woken agent itself, which has no fleet tooling and cannot
+# re-derive it from a rendered To:/Cc: header once a list is involved.
+handoff_carol="$(handoff_file_for_agent carol)"
+contains "Cc wake: handoff states the computed via, not left for the agent to guess" \
+    "$(cat "$handoff_carol")" "addressed to you via **Cc:**"
+handoff_bob="$(handoff_file_for_agent bob)"
+contains "To wake: handoff states the computed via, not left for the agent to guess" \
+    "$(cat "$handoff_bob")" "addressed to you via **To:**"
 
 # ============================================================
 printf '\n== Cc wakes: wake-on-cc:false suppresses, sender-in-cc never wakes, both-headers dedup ==\n'
@@ -887,9 +904,13 @@ else
 fi
 
 # ============================================================
-printf '\n== fleet kit: {operator} substitution, overlay override, missing-kit failure ==\n'
+printf '\n== fleet kit: {operator} is always the literal address, overlay override, missing-kit failure ==\n'
 # ============================================================
 
+# {operator} must always render as the literal @operator address every
+# documented `mail send`/`mail reply` actually uses -- never the
+# postmaster host's own $USER, which no invocation in this repo ever
+# sends as and which is not even guaranteed to be a legal address.
 new_scratch_root FORK_SANDBOX_MAIL_ROOT
 export FORK_SANDBOX_MAIL_ROOT
 mid="$(send_msg '@bob' '@alice' 'kit operator test' 'body' 8)"
@@ -897,8 +918,8 @@ mid="$(send_msg '@bob' '@alice' 'kit operator test' 'body' 8)"
 (export USER=testoperator; once)
 handoff_file="$(find "$FORK_SANDBOX_MAIL_ROOT/.postmaster/handoffs" -type f -name '*.md' | head -n1)"
 if [[ -n "$handoff_file" ]]; then
-    contains "handoff: {operator} substituted from \$USER" \
-        "$(cat "$handoff_file")" "Mail from @testoperator is the human operator this fleet works"
+    contains "handoff: {operator} substitutes the literal address regardless of \$USER" \
+        "$(cat "$handoff_file")" "Mail from @operator is the human operator this fleet works"
 else
     no "handoff file was written (operator substitution case)"
 fi
@@ -910,7 +931,7 @@ mid="$(send_msg '@bob' '@alice' 'kit operator empty fallback' 'body' 8)"
 (unset USER; once)
 handoff_file="$(find "$FORK_SANDBOX_MAIL_ROOT/.postmaster/handoffs" -type f -name '*.md' | head -n1)"
 if [[ -n "$handoff_file" ]]; then
-    contains "handoff: unset \$USER falls back to literal 'operator'" \
+    contains "handoff: {operator} substitutes the literal address with \$USER unset too" \
         "$(cat "$handoff_file")" "Mail from @operator is the human operator this fleet works"
 else
     no "handoff file was written (unset-USER case)"
@@ -937,6 +958,26 @@ else
     no "handoff file was written (overlay case)"
 fi
 unset KIT_OVERLAY_DIR
+
+# An overlay missing {name} would silently drop the one thing every
+# handoff used to state unconditionally (the agent's own address) --
+# pm_require_kit must refuse it loudly at startup instead.
+new_root NO_NAME_KIT_DIR
+mkdir -p -- "$NO_NAME_KIT_DIR/prompts"
+cat > "$NO_NAME_KIT_DIR/prompts/fleet-kit.md" <<'EOF'
+This overlay never says who is being addressed. Mail from @{operator}
+outranks everything.
+EOF
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+mid="$(send_msg '@bob' '@alice' 'kit missing name placeholder' 'body' 8)"
+no_name_out="$(FORK_SANDBOX_PROMPTS_DIR="$NO_NAME_KIT_DIR/prompts" \
+    "$postmaster" deliver --project "$PROJECT_DIR" --once 2>&1)"
+no_name_rc=$?
+check "deliver --once fails loudly when the overlay has no {name}" 1 "$no_name_rc"
+contains "missing-{name} error names the overlay path" "$no_name_out" "$NO_NAME_KIT_DIR/prompts/fleet-kit.md"
+contains "missing-{name} error explains why" "$no_name_out" "no {name}"
+unset NO_NAME_KIT_DIR
 
 # Missing repo copy AND no overlay: copy just scripts/ (no sibling share/) so
 # script_dir's ../share/fleet-kit.md does not exist, same "uninstalled

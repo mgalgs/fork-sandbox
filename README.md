@@ -439,9 +439,11 @@ The shape of it:
 
 - **An agent is a (persona, mailbox) pair** — a markdown file of standing
   instructions and an `@name`. Nothing runs between wakes.
-- **`To:` wakes an agent; `Cc:` does not.** A Cc'd agent gets the message
-  in its inbox and the full thread whenever it is next addressed, which
-  makes a mostly-watching maintainer seat free.
+- **`To:` wakes an agent, and `Cc:` does too, by default.** A Cc'd agent
+  is told a reply is optional and expected only when something genuinely
+  matters; a seat that should never speak unprompted sets
+  `wake-on-cc: false`, which is what makes a mostly-watching maintainer
+  seat free.
 - **The thread is the memory.** Every wake carries the whole thread, so
   session resume (claude seats) is a cost optimization, never a
   correctness requirement.

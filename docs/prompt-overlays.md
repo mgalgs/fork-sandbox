@@ -137,6 +137,15 @@ named `review` still cannot shadow the leg directory. But a reader should not
 have to work that out to know a model id is safe to pick; treat the four leg
 names as off-limits at the root, full stop.
 
+`fleet-kit.md` is a fifth reserved name at the root, for a different
+mechanism: agent mail's postmaster (`fork-sandbox-postmaster.sh`), not
+`fork-sandbox.sh`, reads it, and only when it exists — there is no
+repo-shipped fallback lookup here the way there is for the four leg
+prompts, since the postmaster falls back to its own repo copy
+(`share/fleet-kit.md`) instead. An overlay here replaces that file
+wholesale, no merging; see [agent-mail.md](agent-mail.md#the-wake) for
+what it does.
+
 There is no glob or family matching (`qwen*.md` for a whole model family is
 tempting, but the override order gets fiddly fast, and this project prefers
 predictable over clever). That is a deliberate deferral, not an oversight —

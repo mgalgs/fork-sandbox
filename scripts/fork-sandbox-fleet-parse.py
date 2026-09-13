@@ -2,15 +2,14 @@
 """Parse and validate fork-sandbox's fleet file and persona frontmatter, for
 fork-sandbox-fleet.sh.
 
-Usage: fork-sandbox-fleet-parse.py check <fleet-file> <label> <personas-dir> [<user>]
+Usage: fork-sandbox-fleet-parse.py check <fleet-file> <label> <personas-dir>
        fork-sandbox-fleet-parse.py dump <fleet-file> <label>
        fork-sandbox-fleet-parse.py frontmatter <persona-file> <label>
 
-`check`'s optional fifth argument is the postmaster host's $USER value;
-when given, that name is reserved too (on top of the always-reserved
-"all", the built-in @all list), so an agent or list cannot collide with
-the operator's own address. Omit it (or pass a value that doesn't match
-the fleet name shape) and only "all" is reserved.
+"all" (the built-in @all list) and "operator" (the human operator's mail
+address -- see docs/agent-mail.md) are always-reserved names: no agent or
+list may be defined with either, on either side of the agents/lists
+divide, so neither can resolve as a fleet seat.
 
 A fleet file is a YAML mapping of `agents` (name -> optional persona/
 harness/model/network/thinking/description/wake-on-cc/refresh-at
@@ -91,20 +90,24 @@ FIELDS = ("persona", "harness", "model", "network", "thinking",
 FRONTMATTER_FIELDS = ("harness", "model", "network", "thinking",
                        "description", "wake-on-cc", "refresh-at")
 
-# Names no agent or list may take, mapped to why. "all" is reserved
-# everywhere (both `check` and `dump` share this, so a broken fleet file
-# defining it is caught the same way regardless of which verb reads it
-# first) since fork-sandbox-fleet.sh's `expand` treats @all as the
-# built-in every-agent address, not a lookup. A caller may pass one more
-# name (the operator's $USER, from `check`) to reserve on top of this.
-BUILTIN_RESERVED = {"all": "the built-in @all list"}
+# Names no agent or list may take, mapped to why. Both are reserved
+# everywhere (`check` and `dump` share this, so a broken fleet file
+# defining either is caught the same way regardless of which verb reads
+# it first): "all" because fork-sandbox-fleet.sh's `expand` treats @all
+# as the built-in every-agent address, not a lookup; "operator" because
+# every documented `mail send`/`mail reply` sends operator mail as the
+# literal address @operator, and an agent or list resolving that name
+# would let it stand in for the real operator -- breaking rule 1's
+# operator reset and the kit's "mail from @operator outranks everything"
+# framing.
+BUILTIN_RESERVED = {
+    "all": "the built-in @all list",
+    "operator": "the human operator's mail address",
+}
 
 
-def reserved_names(extra=None):
-    reserved = dict(BUILTIN_RESERVED)
-    if extra:
-        reserved.update(extra)
-    return reserved
+def reserved_names():
+    return dict(BUILTIN_RESERVED)
 
 
 def check_reserved(name, path, reserved, errors):
@@ -233,10 +236,10 @@ def check_persona(value, path, errors):
     return value
 
 
-def load_and_validate(fleet_file, label, errors, extra_reserved=None):
+def load_and_validate(fleet_file, label, errors):
     """Returns (agents, lists) dicts, best-effort -- callers only trust
     them when `errors` is still empty afterward."""
-    reserved = reserved_names(extra_reserved)
+    reserved = reserved_names()
     try:
         with open(fleet_file, encoding="utf-8") as f:
             doc = yaml.load(f, Loader=DupKeyLoader)
@@ -430,15 +433,10 @@ def parse_frontmatter(path, label, errors):
     return fm
 
 
-def cmd_check(fleet_file, label, personas_dir, user_value=""):
+def cmd_check(fleet_file, label, personas_dir):
     errors = []
-    # A $USER that cannot itself be a valid fleet name (e.g. contains an
-    # uppercase letter) cannot collide with one, so it reserves nothing.
-    extra_reserved = {}
-    if user_value and NAME_RE.fullmatch(user_value):
-        extra_reserved[user_value] = "the operator's own $USER address"
-    reserved = reserved_names(extra_reserved)
-    agents, lists = load_and_validate(fleet_file, label, errors, extra_reserved)
+    reserved = reserved_names()
+    agents, lists = load_and_validate(fleet_file, label, errors)
     if not errors:
         for name, agent in agents.items():
             persona_name = agent["persona"] or f"{name}.md"
@@ -525,7 +523,7 @@ def cmd_frontmatter(persona_file, label):
 def usage_exit():
     sys.stderr.write(
         "Usage: fork-sandbox-fleet-parse.py check <fleet-file> <label> "
-        "<personas-dir> [<user>]\n"
+        "<personas-dir>\n"
         "       fork-sandbox-fleet-parse.py dump <fleet-file> <label>\n"
         "       fork-sandbox-fleet-parse.py frontmatter <persona-file> "
         "<label>\n"
@@ -535,9 +533,8 @@ def usage_exit():
 
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else ""
-    if mode == "check" and len(sys.argv) in (5, 6):
-        user_value = sys.argv[5] if len(sys.argv) == 6 else ""
-        cmd_check(sys.argv[2], sys.argv[3], sys.argv[4], user_value)
+    if mode == "check" and len(sys.argv) == 5:
+        cmd_check(sys.argv[2], sys.argv[3], sys.argv[4])
     elif mode == "dump" and len(sys.argv) == 4:
         cmd_dump(sys.argv[2], sys.argv[3])
     elif mode == "frontmatter" and len(sys.argv) == 4:

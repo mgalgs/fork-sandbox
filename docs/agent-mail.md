@@ -32,11 +32,13 @@ of standing instructions; the mailbox is an `@name` address. Nothing else
 constitutes an agent — there is no process, no daemon, nothing running
 between wakes.
 
-**Addressing is the whole mechanism.** `To:` wakes an agent. `Cc:` does
-not: a Cc'd agent receives the message (it shows up in its `inbox`, and
-the full thread arrives in its prompt whenever it *is* next woken) but
-costs nothing until someone addresses it directly. That asymmetry is what
-makes a "maintainer who mostly watches" seat free.
+**Addressing is the whole mechanism.** `To:` wakes an agent, and so does
+`Cc:` by default — a Cc'd agent is told plainly that no response is
+requested, but is free to reply when something genuinely matters, same
+as a colleague reading a real Cc line. A seat that should stay silent no
+matter what sets `wake-on-cc: false`; that asymmetry is what makes a
+"maintainer who mostly watches" seat free, not the mere fact of being
+Cc'd.
 
 **The thread is the memory.** Every wake carries the entire thread in its
 prompt. Session resume exists (below) and saves real money, but it is an
@@ -216,6 +218,14 @@ A bare `<name>.md` in the personas directory makes `name` an agent on its
 own, with no fleet-file entry needed. A `persona:` override names a file
 directly under the personas directory, not a path.
 
+`all` and `operator` are reserved names: no agent or list, in fleet.yaml
+or as a bare persona file, may take either. `@all` is a built-in list
+that always expands to every agent in the fleet (fleet.yaml agents plus
+bare `<name>.md` personas), with no `lists:` entry of its own. `operator`
+is reserved because every documented `mail send`/`mail reply` sends
+operator mail as the literal address `@operator`, which rule 1 (below)
+and the fleet kit both give special authority to.
+
 `network: sealed` is legal only against `harness: pi`, and is checked
 both within one document and against the merged result — either document
 can be individually valid and still combine into an illegal seat. The
@@ -292,12 +302,14 @@ for it.
 
 0. **Expand M's `To`**, one address at a time, so an unknown address
    elsewhere in the same `To` cannot fail the whole batch. Every expanded
-   name that resolves as a fleet agent is a wake candidate. A name that
-   does not resolve — unknown, or external like the operator's own
-   address — is skipped silently; external senders receive mail only in
-   the archive. M's own `From` is never a candidate, even when it reaches
-   the list only through a list address: a sender never wakes on its own
-   message.
+   name that resolves as a fleet agent is a wake candidate. M's `Cc` is
+   expanded the same way; a Cc-expanded name is a candidate too, unless
+   that agent's `wake-on-cc` resolves false. A name that does not resolve
+   — unknown, or external like the operator's own address — is skipped
+   silently on either header; external senders receive mail only in the
+   archive. M's own `From` is never a candidate on either header, even
+   when it reaches the list only through a list address: a sender never
+   wakes on its own message.
 1. **Operator reset.** If M's `From` does *not* resolve as a fleet agent,
    M is operator or external mail: clear T's needs-operator flag and
    reset T's spawn count to 0 *before* applying rules 2–3 to M. An
@@ -314,7 +326,9 @@ for it.
    left still spawns all four. v1 does not ration within a single
    message.
 4. **One wake per (agent, message).** An agent named twice — directly and
-   via a list — wakes once. An agent already running a wake for T does
+   via a list, in `To` and/or `Cc` — wakes once. The run's ledger, and
+   the handoff itself, record whether `To` or `Cc` actually produced the
+   wake. An agent already running a wake for T does
    not get a second spawn; the new message id is recorded on that run as
    a pending message. On a claude seat, it is also delivered live: a
    banner plus the rendered thread is written straight into the run's own
@@ -325,9 +339,10 @@ for it.
    2–3 are re-checked and a follow-up wake is spawned for the newest
    pending message if they still pass.
 
-Together with "an agent may originate a reply only when it is in `To`",
-those rules are the stop rules. Hops bound the depth of a conversation,
-the budget bounds its total spend, and the operator can reset both.
+Together with "a Cc-only wake replies only when something genuinely
+matters, not routinely", those rules are the stop rules. Hops bound the
+depth of a conversation, the budget bounds its total spend, and the
+operator can reset both.
 
 ### The wake
 
@@ -352,12 +367,17 @@ analysis reply has no code, and `fork-sandbox.sh` deletes empty branches
 itself.
 
 The generated handoff embeds everything the sandbox needs and nothing it
-could reach on its own: "You are @\<agent\>", the persona's markdown body
-with frontmatter stripped, the thread, the triggering message id called
-out, the reply-file format, the transparency norm (private side-channels
-are fine, but say on-thread if one shaped your reply), and — importantly
-— *no reply is a valid outcome, end your turn*. An agent is one voice on
-a team, not obliged to speak every time it is woken.
+could reach on its own: a fleet kit stating the agent's own address,
+whether this wake was addressed via `To` or `Cc`, and the To/Cc/list
+posture that implies; the persona's markdown body with frontmatter
+stripped; the thread; the triggering message id called out; the
+reply-file format; the transparency norm (private side-channels are
+fine, but say on-thread if one shaped your reply); and — importantly —
+*no reply is a valid outcome, end your turn*. An agent is one voice on a
+team, not obliged to speak every time it is woken. The kit itself lives
+at `share/fleet-kit.md`, overridable wholesale (no merging) at
+`<prompts-dir>/fleet-kit.md` — the same prompts directory described in
+[prompt-overlays.md](prompt-overlays.md).
 
 ### Replies
 
@@ -411,7 +431,7 @@ own thread scans never see it:
 |---|---|
 | `lock` | a `flock`'d file; the pid inside is for messages only — the mutual exclusion is the kernel's advisory lock, so a killed postmaster cannot leave a stale hold |
 | `routed/<message-id>` | routing already decided for this message |
-| `runs/<run-id>.env` | one spawned wake: agent, thread, trigger, run dir, inbox dir, harness, branch, resumed session id, pending messages, next live-delivery sequence number |
+| `runs/<run-id>.env` | one spawned wake: agent, thread, trigger, run dir, inbox dir, harness, branch, resumed session id, pending messages, next live-delivery sequence number, `VIA` (`to` or `cc`, whichever header actually produced the wake) |
 | `harvested/<run-id>` | this run's outbox is collected |
 | `delivered-live/<thread-id>` | one line per message rule 4 confirmed was delivered live at harvest (agent, message id, run id) — an audit trail, not read back by anything |
 | `needs-operator/<thread-id>` | flag file; its content is the reason |

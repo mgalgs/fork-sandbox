@@ -49,8 +49,8 @@
 #                  otherwise prints every error found (not just the
 #                  first) and exits 1. Refuses an agent or list named
 #                  "all" (reserved for @all, see `expand` below) or
-#                  named for the postmaster host's $USER, if $USER
-#                  itself looks like a fleet name -- either would let
+#                  "operator" (reserved for the human operator's mail
+#                  address, see docs/agent-mail.md) -- either would let
 #                  the reserved address resolve as a real seat.
 #   resolve <name> Print exactly eight lines for one agent: harness,
 #                  model, thinking, network, persona-path, description,
@@ -111,6 +111,22 @@ PERSONAS_DIR="${FORK_SANDBOX_PERSONAS_DIR:-$HOME/.config/fork-sandbox/personas}"
 FLEET_NAME_RE='^[a-z0-9][a-z0-9-]*$'
 FLEET_ADDR_RE='^@[a-z0-9][a-z0-9-]*$'
 
+# Mirrors fork-sandbox-fleet-parse.py's BUILTIN_RESERVED -- one reserved
+# set in two languages, same as FLEET_NAME_RE/NAME_RE above. `check`
+# catches either name declared in fleet.yaml via the parser. These two
+# are what the bash side must itself refuse to treat as a real agent via
+# the bare-<name>.md-persona route, which never reaches the parser at
+# all (see fleet_is_agent, fleet_all_agent_names, resolve_with_dump).
+FLEET_RESERVED_NAMES=(all operator)
+
+fleet_is_reserved() {
+    local name="$1" r
+    for r in "${FLEET_RESERVED_NAMES[@]}"; do
+        [[ "$name" == "$r" ]] && return 0
+    done
+    return 1
+}
+
 script_dir="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 PARSE="$script_dir/fork-sandbox-fleet-parse.py"
 
@@ -160,11 +176,7 @@ cmd_check() {
         echo "Error: check: no personas dir at '$PERSONAS_DIR'." >&2
         return 1
     fi
-    # $USER is passed through so the parser can reserve it alongside the
-    # built-in "all": an agent or list named for the operator's own
-    # address would let it resolve as a fleet seat, breaking rule 1's
-    # operator reset and the kit's authority framing.
-    python3 "$PARSE" check "$FLEET_FILE" "$FLEET_FILE" "$PERSONAS_DIR" "${USER:-}"
+    python3 "$PARSE" check "$FLEET_FILE" "$FLEET_FILE" "$PERSONAS_DIR"
 }
 
 # Runs `dump` against $FLEET_FILE if it exists, else prints nothing. Both
@@ -227,6 +239,18 @@ resolve_with_dump() {
 
     fleet_read_agent "$dump" "$name"
 
+    # A reserved name can never be a real agent even via a bare
+    # <name>.md persona file with no fleet.yaml entry: `check`/`dump`
+    # already refuse a fleet.yaml declaration (agent_declared can only
+    # be true here if the parser accepted it, which it never does for a
+    # reserved name), but a bare persona file never reaches the parser
+    # at all, so this is the one place left to refuse it.
+    if (( ! agent_declared )) && fleet_is_reserved "$name"; then
+        echo "Error: resolve: unknown agent '$name' (no fleet.yaml entry" >&2
+        echo "and '$name' is a reserved name, not a persona file)." >&2
+        return 1
+    fi
+
     local persona_path="$PERSONAS_DIR/${fleet_persona:-$name.md}"
     local fm_harness="" fm_model="" fm_network="" fm_thinking="" fm_description=""
     local fm_wake_on_cc="" fm_refresh_at=""
@@ -262,7 +286,7 @@ fleet_is_list() {
 fleet_is_agent() {
     local dump="$1" name="$2"
     { [[ -n "$dump" ]] && grep -q "^agent"$'\t'"$name"$'\t' <<< "$dump"; } \
-        || [[ -f "$PERSONAS_DIR/$name.md" ]]
+        || { ! fleet_is_reserved "$name" && [[ -f "$PERSONAS_DIR/$name.md" ]]; }
 }
 
 fleet_list_members() {
@@ -291,6 +315,7 @@ fleet_all_agent_names() {
         [[ -e "$f" ]] || continue
         loner="$(basename "$f" .md)"
         [[ "$loner" =~ $FLEET_NAME_RE ]] || continue
+        fleet_is_reserved "$loner" && continue
         fleet_is_list "$dump" "$loner" && continue
         already=0
         for existing in "${agent_names[@]:-}"; do
