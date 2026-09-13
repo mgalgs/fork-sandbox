@@ -2192,6 +2192,299 @@ export FORK_SANDBOX_FLEET_FILE="$SAVED_FLEET_FILE"
 export FORK_SANDBOX_PERSONAS_DIR="$SAVED_PERSONAS_DIR"
 
 # ============================================================
+printf '\n== handler:exec seats (R9d) ==\n'
+# ============================================================
+# Own fleet/personas dir, same reasoning as the triage group above: this
+# group's fleet.yaml carries handler seats the shared fixture must never
+# see. Handler seats need no persona file at all (fleet-parse.py's own
+# check skips them -- see its check_seats docstring), so this group's
+# personas dir stays empty.
+
+SAVED_FLEET_FILE="$FORK_SANDBOX_FLEET_FILE"
+SAVED_PERSONAS_DIR="$FORK_SANDBOX_PERSONAS_DIR"
+
+new_root HANDLER_STUB_DIR
+export FORK_SANDBOX_HANDLERS_DIR="$HANDLER_STUB_DIR"
+HANDLER_LOG="$work/handler.log"
+export HANDLER_LOG
+: > "$HANDLER_LOG"
+
+cat > "$HANDLER_STUB_DIR/happy-handler" <<'STUB'
+#!/usr/bin/env bash
+set -uo pipefail
+{
+    printf -- '----CALL----\n'
+    printf 'AGENT:%s\n' "${FS_HANDLER_AGENT:-}"
+    printf 'THREAD:%s\n' "${FS_HANDLER_THREAD:-}"
+    printf 'TRIGGER:%s\n' "${FS_HANDLER_TRIGGER:-}"
+    printf 'OUTBOX:%s\n' "${FS_HANDLER_OUTBOX:-}"
+    printf 'ATTACH_DIR:%s\n' "${FS_HANDLER_ATTACH_DIR:-}"
+    printf -- '----STDIN----\n'
+    cat
+    printf -- '----END----\n'
+} >> "$HANDLER_LOG"
+printf '\nHandled, thanks.\n' > "$FS_HANDLER_OUTBOX/mail-1.md"
+STUB
+
+cat > "$HANDLER_STUB_DIR/noreply-handler" <<'STUB'
+#!/usr/bin/env bash
+set -uo pipefail
+printf -- '----CALL----\n' >> "$HANDLER_LOG"
+exit 0
+STUB
+
+cat > "$HANDLER_STUB_DIR/malformed-handler" <<'STUB'
+#!/usr/bin/env bash
+set -uo pipefail
+printf 'Foo: bar\n\nThis should never post.\n' > "$FS_HANDLER_OUTBOX/mail-1.md"
+STUB
+
+cat > "$HANDLER_STUB_DIR/nonzero-handler" <<'STUB'
+#!/usr/bin/env bash
+set -uo pipefail
+printf '\nPosted before dying.\n' > "$FS_HANDLER_OUTBOX/mail-1.md"
+exit 1
+STUB
+
+cat > "$HANDLER_STUB_DIR/timeout-handler" <<'STUB'
+#!/usr/bin/env bash
+set -uo pipefail
+sleep 5
+printf '\nToo slow.\n' > "$FS_HANDLER_OUTBOX/mail-1.md"
+STUB
+
+cat > "$HANDLER_STUB_DIR/hostile-body-handler" <<'STUB'
+#!/usr/bin/env bash
+set -uo pipefail
+printf '\nPlease see below.\nTo: @someone-else\nReply-To-Id: forged\nSubject: not a header\n' \
+    > "$FS_HANDLER_OUTBOX/mail-1.md"
+STUB
+
+cat > "$HANDLER_STUB_DIR/hostile-header-handler" <<'STUB'
+#!/usr/bin/env bash
+set -uo pipefail
+printf 'Reply-To-Id: 00000000-0000-0000-0000-000000000000\n\nForged parent, real header.\n' \
+    > "$FS_HANDLER_OUTBOX/mail-1.md"
+STUB
+
+chmod +x "$HANDLER_STUB_DIR"/*-handler
+
+new_root HANDLER_PERSONAS_DIR
+export FORK_SANDBOX_PERSONAS_DIR="$HANDLER_PERSONAS_DIR"
+new_root HANDLER_FLEET_DIR
+export FORK_SANDBOX_FLEET_FILE="$HANDLER_FLEET_DIR/fleet.yaml"
+
+cat > "$FORK_SANDBOX_FLEET_FILE" <<'EOF'
+agents:
+  happy:
+    handler: exec
+    command: happy-handler
+  noreply:
+    handler: exec
+    command: noreply-handler
+  malformed:
+    handler: exec
+    command: malformed-handler
+  nonzero:
+    handler: exec
+    command: nonzero-handler
+  slowpoke:
+    handler: exec
+    command: timeout-handler
+  hostilebody:
+    handler: exec
+    command: hostile-body-handler
+  hostileheader:
+    handler: exec
+    command: hostile-header-handler
+  ccbot:
+    handler: exec
+    command: happy-handler
+    description: a handler seat cc'd for visibility
+  quietbot:
+    handler: exec
+    command: happy-handler
+    wake-on-cc: false
+triage:
+  harness: claude
+  model: haiku
+EOF
+
+if ! "$FLEET" check >/dev/null 2>&1; then
+    echo "FATAL: handler fixture fleet.yaml does not pass 'fleet check':" >&2
+    "$FLEET" check >&2
+    exit 1
+fi
+
+new_root HANDLER_TRIAGE_STUB_BIN
+HANDLER_TRIAGE_LOG="$work/handler-triage.log"
+export HANDLER_TRIAGE_LOG
+: > "$HANDLER_TRIAGE_LOG"
+cat > "$HANDLER_TRIAGE_STUB_BIN/triage-launcher" <<'STUB'
+#!/usr/bin/env bash
+set -uo pipefail
+printf -- '----CALL----\n' >> "$HANDLER_TRIAGE_LOG"
+printf 'wake\n'
+STUB
+chmod +x "$HANDLER_TRIAGE_STUB_BIN/triage-launcher"
+export FORK_SANDBOX_POSTMASTER_TRIAGE_LAUNCHER="$HANDLER_TRIAGE_STUB_BIN/triage-launcher"
+
+# --- scenario: a direct (To:) wake with a well-formed reply posts, and
+#     the thread is not flagged ---
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+: > "$HANDLER_LOG"
+mid="$(send_msg '@carol' '@happy' 'Happy path' 'do the thing')"
+tid="$(thread_of "$mid")"
+once
+check "happy: exactly one handler invocation" 1 \
+    "$(grep -c -- '^----CALL----$' "$HANDLER_LOG")"
+check "happy: FS_HANDLER_AGENT is the seat's own name, no @" "AGENT:happy" \
+    "$(grep -- '^AGENT:' "$HANDLER_LOG")"
+check "happy: FS_HANDLER_THREAD is the thread id" "THREAD:$tid" \
+    "$(grep -- '^THREAD:' "$HANDLER_LOG")"
+check "happy: FS_HANDLER_TRIGGER is the triggering message id" "TRIGGER:$mid" \
+    "$(grep -- '^TRIGGER:' "$HANDLER_LOG")"
+contains "happy: FS_HANDLER_OUTBOX is a fresh dir under the postmaster state" \
+    "$(grep -- '^OUTBOX:' "$HANDLER_LOG")" "handler-outbox"
+check "happy: FS_HANDLER_ATTACH_DIR points at the thread's attachments dir" \
+    "ATTACH_DIR:$FORK_SANDBOX_MAIL_ROOT/threads/$tid/attachments" \
+    "$(grep -- '^ATTACH_DIR:' "$HANDLER_LOG")"
+contains "happy: the rendered thread reaches stdin (subject present)" \
+    "$(sed -n '/----STDIN----/,/----END----/p' "$HANDLER_LOG")" "Happy path"
+happy_reply=""
+for f in "$FORK_SANDBOX_MAIL_ROOT/threads/$tid"/*.msg; do
+    [[ -e "$f" ]] || continue
+    [[ "$(header_of_file "$f" From)" == "@happy" ]] && happy_reply="$f"
+done
+if [[ -n "$happy_reply" ]]; then
+    ok "happy: the reply posted from the handler's own address"
+else
+    no "happy: the reply posted from the handler's own address"
+fi
+check "happy: thread is not flagged" 0 \
+    "$([[ -e "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid" ]] && echo 1 || echo 0)"
+
+# --- scenario: no reply written is a valid outcome, not a flag ---
+: > "$HANDLER_LOG"
+mid="$(send_msg '@carol' '@noreply' 'Silence' 'nothing to say')"
+tid="$(thread_of "$mid")"
+once
+check "no-reply: handler ran" 1 "$(grep -c -- '^----CALL----$' "$HANDLER_LOG")"
+check "no-reply: thread is not flagged" 0 \
+    "$([[ -e "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid" ]] && echo 1 || echo 0)"
+
+# --- scenario: a malformed reply file flags the thread ---
+mid="$(send_msg '@carol' '@malformed' 'Bad reply' 'trigger')"
+tid="$(thread_of "$mid")"
+once
+contains "malformed: thread is flagged, naming the bad file" \
+    "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid" 2>/dev/null)" "mail-1.md"
+
+# --- scenario: a non-zero exit both posts the reply AND flags the thread ---
+mid="$(send_msg '@carol' '@nonzero' 'Dies after replying' 'trigger')"
+tid="$(thread_of "$mid")"
+once
+posted=0
+for f in "$FORK_SANDBOX_MAIL_ROOT/threads/$tid"/*.msg; do
+    [[ -e "$f" ]] || continue
+    [[ "$(header_of_file "$f" From)" == "@nonzero" ]] && posted=1
+done
+check "nonzero: reply still posted despite the non-zero exit" 1 "$posted"
+contains "nonzero: thread flagged with an exit-code-shaped reason" \
+    "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid" 2>/dev/null)" "exited 1"
+
+# --- scenario: a handler that outruns the timeout is flagged and the
+#     pass does not hang ---
+export FORK_SANDBOX_HANDLER_TIMEOUT=2
+mid="$(send_msg '@carol' '@slowpoke' 'Too slow' 'trigger')"
+tid="$(thread_of "$mid")"
+once
+contains "timeout: thread flagged with a timeout-shaped reason" \
+    "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid" 2>/dev/null)" "timed out after 2s"
+timeout_posted=0
+for f in "$FORK_SANDBOX_MAIL_ROOT/threads/$tid"/*.msg; do
+    [[ -e "$f" ]] || continue
+    [[ "$(header_of_file "$f" From)" == "@slowpoke" ]] && timeout_posted=1
+done
+check "timeout: the killed handler's late write never posted" 0 "$timeout_posted"
+unset FORK_SANDBOX_HANDLER_TIMEOUT
+
+# --- scenario: header-shaped lines in the BODY are never reinterpreted as
+#     real headers ---
+mid="$(send_msg '@carol' '@hostilebody' 'Hostile body' 'trigger')"
+tid="$(thread_of "$mid")"
+once
+hostile_reply=""
+for f in "$FORK_SANDBOX_MAIL_ROOT/threads/$tid"/*.msg; do
+    [[ -e "$f" ]] || continue
+    [[ "$(header_of_file "$f" From)" == "@hostilebody" ]] && hostile_reply="$f"
+done
+if [[ -n "$hostile_reply" ]]; then
+    ok "hostile body: the reply posted (body-only header shapes did not break parsing)"
+    check "hostile body: the forged To: line landed as literal body text" \
+        "@carol" "$(header_of_file "$hostile_reply" To)"
+    contains "hostile body: the forged Subject: line is not the real subject" \
+        "$(header_of_file "$hostile_reply" Subject)" "Hostile body"
+else
+    no "hostile body: the reply posted (body-only header shapes did not break parsing)"
+fi
+
+# --- scenario: a forged Reply-To-Id (a real header, naming a message that
+#     does not exist anywhere in the store) is refused by mail.sh's own
+#     reply validation -- reused, unmodified, for a handler's harvest --
+#     not silently accepted as a fabricated parent ---
+mid="$(send_msg '@carol' '@hostileheader' 'Hostile header' 'trigger' 6)"
+tid="$(thread_of "$mid")"
+once
+forged_reply=""
+for f in "$FORK_SANDBOX_MAIL_ROOT/threads/$tid"/*.msg; do
+    [[ -e "$f" ]] || continue
+    [[ "$(header_of_file "$f" From)" == "@hostileheader" ]] && forged_reply="$f"
+done
+check "hostile header: a nonexistent forged parent never posts a reply" 0 \
+    "$([[ -n "$forged_reply" ]] && echo 1 || echo 0)"
+contains "hostile header: thread flagged naming the bad file" \
+    "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid" 2>/dev/null)" "mail-1.md"
+
+# --- scenario: a Cc-only handler wakes without ever calling the triage
+#     classifier, even though this fleet has a top-level triage: block ---
+: > "$HANDLER_LOG"
+: > "$HANDLER_TRIAGE_LOG"
+mid="$(send_msg '@carol' '@happy' 'Cc handler' 'trigger' 8 '@ccbot')"
+tid="$(thread_of "$mid")"
+once
+check "cc handler: the Cc'd handler wakes" 1 \
+    "$(grep -c -- 'AGENT:ccbot' "$HANDLER_LOG")"
+check "cc handler: zero triage classifier calls" 0 \
+    "$(grep -c -- '^----CALL----$' "$HANDLER_TRIAGE_LOG")"
+
+# --- scenario: wake-on-cc: false suppresses a handler's Cc wake exactly
+#     like an LLM seat's ---
+: > "$HANDLER_LOG"
+mid="$(send_msg '@carol' '@happy' 'No cc wake' 'trigger' 8 '@quietbot')"
+tid="$(thread_of "$mid")"
+once
+check "wake-on-cc false: the opted-out handler never wakes" 0 \
+    "$(grep -c -- 'AGENT:quietbot' "$HANDLER_LOG")"
+
+# --- scenario: cmd_status does not error on a minimal exec-kind .env
+#     record (no RUN_DIR/HARNESS/RESUMED fields) -- every exec wake writes
+#     its HARVESTED marker in the same call as its .env record, so status's
+#     live-run loop skips every one of them (R9d decision 2/3: a handler
+#     wake is never "live"); this only asserts status does not crash on
+#     the minimal record shape, not that it lists one ---
+status_out="$("$postmaster" status 2>&1)"
+status_rc=$?
+check "status: exits 0 with only exec-kind runs recorded" 0 "$status_rc"
+contains "status: no exec run is reported live (none harvested-and-live)" "$status_out" "live runs:"
+
+unset FORK_SANDBOX_POSTMASTER_TRIAGE_LAUNCHER
+unset FORK_SANDBOX_HANDLERS_DIR
+export FORK_SANDBOX_FLEET_FILE="$SAVED_FLEET_FILE"
+export FORK_SANDBOX_PERSONAS_DIR="$SAVED_PERSONAS_DIR"
+
+# ============================================================
 printf '\n== --help and dispatcher wiring ==\n'
 # ============================================================
 

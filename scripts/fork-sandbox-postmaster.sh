@@ -413,6 +413,16 @@ SEQ="$STATE/seq"
 HANDOFFS="$STATE/handoffs"
 TRIAGED="$STATE/triaged"
 
+# Where a handler seat's `command:` bare name resolves -- same env var,
+# same default, as fleet.sh's own HANDLERS_DIR (fleet.sh:154). postmaster.sh
+# cannot reuse fleet.sh's shell variable (fleet.sh only ever runs as a
+# subprocess via $FLEET, never sourced), so this is its own copy of the
+# identical line.
+HANDLERS_DIR="${FORK_SANDBOX_HANDLERS_DIR:-$HOME/.config/fork-sandbox/handlers}"
+# One fresh, empty, writable outbox dir per handler wake, parallel to
+# $HANDOFFS -- see pm_exec_wake.
+HANDLER_OUTBOX="$STATE/handler-outbox"
+
 # The shape fork-sandbox.sh accepts for --resume-session. Applied to what
 # summary.json reported before it is recorded: a malformed id would make
 # the launcher refuse EVERY later wake of that seat, which is a wedge, and
@@ -549,8 +559,9 @@ pm_expand_to() {
 # reaches here. Fails closed (no wake) if the agent does not resolve at
 # all, though pm_process_message only ever calls this with a name
 # pm_expand_to already proved resolvable. On success, prints the
-# candidate's description and per-agent triage opt-out (two lines) for
-# the caller to pass straight into pm_triage_wake without resolving the
+# candidate's description, per-agent triage opt-out, and handler command
+# (three lines) for the caller to pass straight into pm_triage_wake (or to
+# skip triage for a handler seat, R9d decision 4) without resolving the
 # same agent again.
 pm_cc_candidate_resolve() {
     local agent="$1" harness model thinking network persona_path \
@@ -563,7 +574,7 @@ pm_cc_candidate_resolve() {
         return 1
     fi
     [[ "$wake_on_cc" != "false" ]] || return 1
-    printf '%s\n%s\n' "$description" "$triage"
+    printf '%s\n%s\n%s\n' "$description" "$triage" "$handler"
 }
 
 # Builds the classifier's ENTIRE input: never the whole thread, never the
@@ -1051,23 +1062,145 @@ pm_wake_via() {
     printf 'cc'
 }
 
+# Runs a handler seat's wake: a deterministic, operator-authored script,
+# not an LLM sandbox (R9d decisions 1-4). No clone, no branch, no session,
+# no live delivery, no triage -- it runs synchronously within the route
+# pass, gets the rendered thread on stdin, and replies (if at all) by
+# writing mail-*.md files to its own fresh outbox dir, harvested the same
+# way an LLM wake's outbox is. Writes its .env record AND its HARVESTED
+# marker before returning, in that same call -- this is what makes
+# fs_pm_find_live_run (fork-sandbox-lib.sh) never report a handler wake as
+# "live": there is no window, even across scans, where one could be found,
+# since route and harvest passes are both fully synchronous within one
+# `deliver --once` pass (see cmd_deliver). A slow handler therefore stalls
+# the whole route pass for its duration; $FORK_SANDBOX_HANDLER_TIMEOUT
+# bounds that.
+pm_exec_wake() {
+    local agent="$1" tid="$2" mid="$3" command="$4"
+
+    # fleet-parse.py already refuses a `/` in `command:` at `fleet check`
+    # time; this is the same refusal again at wake time, in case the
+    # fleet file changed since the last check ran, or $FLEET itself was
+    # swapped from underneath this process (R9d decision 1: both
+    # checkpoints, on purpose).
+    if [[ "$command" == */* ]]; then
+        pm_flag "$tid" "handler command '$command' for $agent contains a path separator: $mid"
+        return 0
+    fi
+    local handler_path="$HANDLERS_DIR/$command"
+    if [[ ! -e "$handler_path" ]]; then
+        pm_flag "$tid" "handler '$handler_path' for $agent does not exist: $mid"
+        return 0
+    fi
+    if [[ ! -x "$handler_path" ]]; then
+        pm_flag "$tid" "handler '$handler_path' for $agent is not executable: $mid"
+        return 0
+    fi
+
+    local run_id via
+    run_id="$(pm_new_uuid)"
+    via="$(pm_wake_via "$mid" "$agent")"
+
+    local outbox="$HANDLER_OUTBOX/$run_id"
+    mkdir -p -- "$outbox"
+
+    local rendered
+    rendered="$(mktemp "$MAIL_ROOT/.postmaster.handler.XXXXXX")"
+    if ! "$MAIL_RENDER" --text --thread "$tid" "$MAIL_ROOT" > "$rendered"; then
+        rm -f -- "$rendered"
+        pm_flag "$tid" "thread render failed for handler $agent: $mid"
+        return 0
+    fi
+
+    local timeout_s stderr_capture rc
+    timeout_s="${FORK_SANDBOX_HANDLER_TIMEOUT:-300}"
+    stderr_capture="$(mktemp "$MAIL_ROOT/.postmaster.handler-err.XXXXXX")"
+    set +e
+    env \
+        "FS_HANDLER_AGENT=$agent" \
+        "FS_HANDLER_THREAD=$tid" \
+        "FS_HANDLER_TRIGGER=$mid" \
+        "FS_HANDLER_OUTBOX=$outbox" \
+        "FS_HANDLER_ATTACH_DIR=$MAIL_ROOT/threads/$tid/attachments" \
+        "$FS_TIMEOUT" "$timeout_s" "$handler_path" \
+        < "$rendered" > /dev/null 2>"$stderr_capture"
+    rc=$?
+    set -e
+    rm -f -- "$rendered"
+
+    local trigger_file trigger_hops
+    trigger_file="$(pm_find_by_id "$mid" || true)"
+    trigger_hops="0"
+    [[ -n "$trigger_file" ]] && trigger_hops="$(pm_header "$trigger_file" X-Hops)"
+    [[ "$trigger_hops" =~ ^[0-9]+$ ]] || trigger_hops=0
+
+    local mf
+    for mf in "$outbox"/mail-*.md; do
+        [[ -e "$mf" ]] || continue
+        pm_harvest_one_file "$mf" "$agent" "$tid" "$mid" "$trigger_hops"
+    done
+
+    if (( rc != 0 )); then
+        local cause="exited $rc"
+        (( rc == 124 )) && cause="timed out after ${timeout_s}s"
+        local err_out=""
+        [[ -s "$stderr_capture" ]] && err_out=" ($(pm_trim "$(tail -n1 -- "$stderr_capture")"))"
+        pm_flag "$tid" "handler '$command' for $agent $cause: $mid$err_out"
+    fi
+    rm -f -- "$stderr_capture"
+
+    mkdir -p -- "$RUNS"
+    {
+        printf 'AGENT=%s\n' "$agent"
+        printf 'THREAD=%s\n' "$tid"
+        printf 'TRIGGER=%s\n' "$mid"
+        printf 'KIND=exec\n'
+        printf 'VIA=%s\n' "$via"
+    } > "$RUNS/$run_id.env"
+
+    mkdir -p -- "$HARVESTED"
+    : > "$HARVESTED/$run_id"
+
+    mkdir -p -- "$SPAWNS" "$SEQ"
+    printf '%s\n' "$run_id" >> "$SPAWNS/$tid"
+    printf '%s\n' "$run_id" >> "$SEQ/$tid"
+}
+
 pm_spawn_wake() {
     local project="$1" agent="$2" tid="$3" mid="$4"
-    local harness model thinking network persona_path description wake_on_cc refresh_at
+    local harness model thinking network persona_path description wake_on_cc \
+          refresh_at triage handler command
     # description and wake_on_cc (resolve's 6th and 7th lines) are read to
     # keep resolve's line contract explicit even though neither is needed
     # by a wake -- wake_on_cc is a routing decision made before a wake is
-    # ever spawned (see pm_process_message's Cc expansion). resolve emits
-    # eleven lines as of the handler/command fields; this reads only the
-    # first eight on purpose, since an LLM wake itself never needs the
-    # triage opt-out (pm_triage_wake reads the ninth line for that) or the
-    # handler/command lines (a handler seat is dispatched on a separate,
-    # non-sandbox path before this function is ever called for it).
+    # ever spawned (see pm_process_message's Cc expansion). triage (9th
+    # line) is likewise unused here -- pm_triage_wake reads its own copy
+    # before this function is ever called. handler/command (10th/11th
+    # lines) ARE used: a non-empty handler branches straight to
+    # pm_exec_wake, below, before any of the LLM-only spawn_args/session
+    # logic that follows.
     # shellcheck disable=SC2034
     if ! { read -r harness; read -r model; read -r thinking; read -r network; \
            read -r persona_path; read -r description; read -r wake_on_cc; \
-           read -r refresh_at; } < <("$FLEET" resolve "$agent" 2>/dev/null); then
+           read -r refresh_at; read -r triage; read -r handler; read -r command; \
+         } < <("$FLEET" resolve "$agent" 2>/dev/null); then
         pm_flag "$tid" "seat resolution failed for $agent: $mid"
+        return 0
+    fi
+    if [[ -n "$handler" ]]; then
+        # A handler seat is a deterministic script, not an LLM sandbox --
+        # dispatch to the synchronous exec-wake path instead of everything
+        # below (branch/session/clone-dir/spawn_args are all LLM-only
+        # concepts). Both of this function's own callers (pm_wake_or_pend,
+        # pm_followup_wake) reach this transparently: fs_pm_find_live_run
+        # never reports a handler wake as live (pm_exec_wake writes its
+        # HARVESTED marker in the same call that writes its .env record),
+        # so pm_wake_or_pend's live-run branch -- and hence
+        # pm_followup_wake, which only fires off a pending message that
+        # branch recorded -- is categorically unreachable for a handler
+        # seat, and neither of those two callers needs its own copy of
+        # this check.
+        pm_exec_wake "$agent" "$tid" "$mid" "$command"
         return 0
     fi
     harness="${harness:-claude}"
@@ -1265,13 +1398,18 @@ pm_process_message() {
             done
             (( dup )) && continue
 
-            local c_description c_triage
-            if ! { read -r c_description; read -r c_triage; } \
+            local c_description c_triage c_handler
+            if ! { read -r c_description; read -r c_triage; read -r c_handler; } \
                     < <(pm_cc_candidate_resolve "$cand"); then
                 continue
             fi
 
-            if (( ! operator_mail )); then
+            # A handler seat is never triaged (R9d decision 4): triage is a
+            # gate on a paid model call before another paid model call, and
+            # a handler wake is neither -- wake-on-cc still applies (already
+            # enforced inside pm_cc_candidate_resolve before it prints
+            # anything), only the classifier step is skipped.
+            if (( ! operator_mail )) && [[ -z "$c_handler" ]]; then
                 if (( ! t_resolved )); then
                     { read -r t_harness; read -r t_model; } \
                         < <("$FLEET" resolve-triage 2>/dev/null)
