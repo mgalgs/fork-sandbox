@@ -2111,6 +2111,82 @@ check "thread privacy: the prompt carries the triggering message's body" 1 \
 check "thread privacy: the prompt does not carry an earlier message's body" 0 \
     "$(grep -c -- 'FIRSTUNIQUETOKEN' "$TRIAGE_LOG")"
 
+# --- scenario 12: a pi-harness triage seat's argv shape is distinct from
+#     claude's -- agent-sandboxed reads a `--model` flag (when the seat
+#     sets one) BEFORE the work dir, never gets a defaulted model (haiku
+#     is a claude alias, see pm_triage_wake), and always ends in `-p` ---
+cat > "$TRIAGE_FLEET_DIR/pi-fleet.yaml" <<'EOF'
+agents:
+  alice:
+    description: Cc-only reviewer, wakes only when something needs her
+  bob:
+    description: direct recipient, always wakes
+  carol:
+    description: sender used throughout this group
+triage:
+  harness: pi
+EOF
+export FORK_SANDBOX_FLEET_FILE="$TRIAGE_FLEET_DIR/pi-fleet.yaml"
+if ! "$FLEET" check >/dev/null 2>&1; then
+    echo "FATAL: pi-harness triage fixture fleet.yaml does not pass 'fleet check':" >&2
+    "$FLEET" check >&2
+    exit 1
+fi
+
+: > "$STUB_ARGV_LOG"
+: > "$TRIAGE_LOG"
+export TRIAGE_STUB_VERDICT=wake
+mid="$(send_msg '@carol' '@bob' 'PiNoModel' 'body' 8 '@alice')"
+tid="$(thread_of "$mid")"
+once
+check "pi harness, no model configured: exactly one classifier call" 1 \
+    "$(grep -c -- '^----CALL----$' "$TRIAGE_LOG")"
+check "pi harness, no model configured: no --model flag reaches the launcher" 0 \
+    "$(grep -c -- '^ARG:--model$' "$TRIAGE_LOG")"
+check "pi harness, no model configured: exactly two args (work dir, -p)" 2 \
+    "$(grep -c -- '^ARG:' "$TRIAGE_LOG")"
+contains "pi harness, no model configured: the first arg is the work dir" \
+    "$(grep -- '^ARG:' "$TRIAGE_LOG" | sed -n '1p')" ".postmaster.triage-work."
+check "pi harness, no model configured: the second arg is -p" "ARG:-p" \
+    "$(grep -- '^ARG:' "$TRIAGE_LOG" | sed -n '2p')"
+
+cat > "$TRIAGE_FLEET_DIR/pi-model-fleet.yaml" <<'EOF'
+agents:
+  alice:
+    description: Cc-only reviewer, wakes only when something needs her
+  bob:
+    description: direct recipient, always wakes
+  carol:
+    description: sender used throughout this group
+triage:
+  harness: pi
+  model: some-local-model
+EOF
+export FORK_SANDBOX_FLEET_FILE="$TRIAGE_FLEET_DIR/pi-model-fleet.yaml"
+if ! "$FLEET" check >/dev/null 2>&1; then
+    echo "FATAL: pi-harness+model triage fixture fleet.yaml does not pass 'fleet check':" >&2
+    "$FLEET" check >&2
+    exit 1
+fi
+
+: > "$STUB_ARGV_LOG"
+: > "$TRIAGE_LOG"
+mid="$(send_msg '@carol' '@bob' 'PiWithModel' 'body' 8 '@alice')"
+tid="$(thread_of "$mid")"
+once
+check "pi harness with model: exactly one classifier call" 1 \
+    "$(grep -c -- '^----CALL----$' "$TRIAGE_LOG")"
+check "pi harness with model: --model is the first arg" "ARG:--model" \
+    "$(grep -- '^ARG:' "$TRIAGE_LOG" | sed -n '1p')"
+check "pi harness with model: the model value follows, second" "ARG:some-local-model" \
+    "$(grep -- '^ARG:' "$TRIAGE_LOG" | sed -n '2p')"
+contains "pi harness with model: the work dir follows the model flag, third" \
+    "$(grep -- '^ARG:' "$TRIAGE_LOG" | sed -n '3p')" ".postmaster.triage-work."
+check "pi harness with model: the fourth (last) arg is -p" "ARG:-p" \
+    "$(grep -- '^ARG:' "$TRIAGE_LOG" | sed -n '4p')"
+check "pi harness with model: exactly four args" 4 \
+    "$(grep -c -- '^ARG:' "$TRIAGE_LOG")"
+
 unset FORK_SANDBOX_POSTMASTER_TRIAGE_LAUNCHER
 export FORK_SANDBOX_FLEET_FILE="$SAVED_FLEET_FILE"
 export FORK_SANDBOX_PERSONAS_DIR="$SAVED_PERSONAS_DIR"

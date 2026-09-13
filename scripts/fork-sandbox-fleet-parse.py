@@ -322,9 +322,10 @@ def load_and_validate(fleet_file, label, errors):
     """Returns (agents, lists, triage), best-effort -- callers only trust
     them when `errors` is still empty afterward. `triage` is None when the
     fleet file has no top-level `triage:` key at all (triage off
-    fleet-wide); otherwise a fully-defaulted {"harness", "model",
-    "network"} dict, even for `triage: {}` -- presence of the key, not its
-    contents, is what turns triage on."""
+    fleet-wide); otherwise a fully-defaulted {"harness", "model"} dict
+    (see check_triage_seat for why there is no `network` key), even for
+    `triage: {}` -- presence of the key, not its contents, is what turns
+    triage on."""
     reserved = reserved_names()
     try:
         with open(fleet_file, encoding="utf-8") as f:

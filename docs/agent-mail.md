@@ -399,8 +399,9 @@ The gate fails toward waking, not skipping, at every decision point: no
 top-level `triage:` block, operator/external mail, a per-agent
 `triage: false` opt-out, a candidate with no `description` configured
 anywhere (nothing for the classifier to judge relevance against), an
-unresolvable agent, a non-zero classifier exit, a timeout, or any reply
-other than the exact word `skip` all wake the candidate. A missed skip
+unresolvable agent, a non-zero classifier exit, a timeout (see
+`FORK_SANDBOX_POSTMASTER_TRIAGE_TIMEOUT` below), or any reply other than
+the exact word `skip` all wake the candidate. A missed skip
 only spends a wake the thread budget already allows for; a missed wake
 would silence an agent with no way to notice or recover, which is why
 the asymmetry runs this direction.
@@ -678,6 +679,7 @@ marker**, so strip leading whitespace first, then test for `> `.
 | `FORK_SANDBOX_THREAD_BUDGET` | `32` | router (rule 3) |
 | `FORK_SANDBOX_POSTMASTER_INTERVAL` | `15` (seconds) | router loop |
 | `FORK_SANDBOX_POSTMASTER_WAKE_DEAD_GRACE` | see `--help` | dead-wake detection |
+| `FORK_SANDBOX_POSTMASTER_TRIAGE_TIMEOUT` | `120` (seconds) | Cc triage classifier call |
 
 The registry needs PyYAML, as the preset parser does. A machine without
 it gets a plain error naming the package, not a traceback.

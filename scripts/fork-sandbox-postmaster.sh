@@ -40,7 +40,10 @@
 # spawns (see `triage:` in fleet.yaml and pm_triage_wake) -- a second,
 # content-based gate, off by default (no top-level triage: block means
 # today's behavior, unchanged), and never applied to a To-addressed
-# candidate or to operator/external mail. Privacy is addressing: a woken
+# candidate or to operator/external mail. The classifier call is bounded
+# by $FORK_SANDBOX_POSTMASTER_TRIAGE_TIMEOUT seconds (default 120) and
+# fails toward waking the candidate if it is exceeded. Privacy is
+# addressing: a woken
 # agent receives ONLY the thread it is being woken for -- the sandbox has
 # no mail tooling and no store access, so the thread embedded in its
 # handoff is that agent's entire world for the run.
