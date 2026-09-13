@@ -1052,6 +1052,57 @@ check "deliver --once fails loudly when neither kit exists" 1 "$missing_rc"
 contains "missing-kit error names the problem" "$missing_out" "no fleet kit found"
 
 # ============================================================
+printf '\n== deliver startup: fleet check gate ==\n'
+# ============================================================
+
+# A fleet file that reserves an existing agent name ('operator' or 'all')
+# is refused at deliver startup, loudly, with `fleet check`'s own output --
+# instead of pm_expand_to silently swallowing the per-address expand
+# failure while rule 1 falls back to treating every sender as the operator.
+SAVED_FLEET_FILE_STARTUP="$FORK_SANDBOX_FLEET_FILE"
+new_root RESERVED_FLEET_DIR
+export FORK_SANDBOX_FLEET_FILE="$RESERVED_FLEET_DIR/fleet.yaml"
+cat > "$FORK_SANDBOX_FLEET_FILE" <<'EOF'
+agents:
+  operator:
+    harness: claude
+EOF
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+mid="$(send_msg '@bob' '@alice' 'fleet gate reserved name' 'body' 8)"
+reserved_out="$("$postmaster" deliver --project "$PROJECT_DIR" --once 2>&1)"
+reserved_rc=$?
+check "deliver --once refuses a fleet file reserving 'operator'" 1 "$reserved_rc"
+contains "refusal names the reserved agent" "$reserved_out" "'operator' is reserved"
+unset RESERVED_FLEET_DIR
+export FORK_SANDBOX_FLEET_FILE="$SAVED_FLEET_FILE_STARTUP"
+
+# No fleet file at all is a valid, personas-only fleet -- deliver must run
+# the pass normally rather than treat its absence as an error.
+new_root NO_FLEET_FILE_DIR
+export FORK_SANDBOX_FLEET_FILE="$NO_FLEET_FILE_DIR/does-not-exist.yaml"
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+mid="$(send_msg '@bob' '@alice' 'fleet gate no file' 'body' 8)"
+"$postmaster" deliver --project "$PROJECT_DIR" --once > /dev/null 2>&1
+no_fleet_rc=$?
+check "deliver --once skips the fleet gate when no fleet file exists" 0 "$no_fleet_rc"
+unset NO_FLEET_FILE_DIR
+export FORK_SANDBOX_FLEET_FILE="$SAVED_FLEET_FILE_STARTUP"
+
+# A clean fleet file (the shared fixture) passes the gate and routes
+# normally -- covered by every other `once`/`deliver` call in this suite,
+# all of which exercise the gate on the way in; this is just the direct
+# assertion for the gate itself.
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+mid="$(send_msg '@bob' '@alice' 'fleet gate clean file' 'body' 8)"
+"$postmaster" deliver --project "$PROJECT_DIR" --once > /dev/null 2>&1
+clean_rc=$?
+check "deliver --once passes the fleet gate on a clean fleet file" 0 "$clean_rc"
+unset SAVED_FLEET_FILE_STARTUP
+
+# ============================================================
 printf '\n== handoff: body content is quoted, never lets a message forge structure ==\n'
 # ============================================================
 

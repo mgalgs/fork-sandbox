@@ -538,6 +538,12 @@ TRIAGED="$STATE/triaged"
 # subprocess via $FLEET, never sourced), so this is its own copy of the
 # identical line.
 HANDLERS_DIR="${FORK_SANDBOX_HANDLERS_DIR:-$HOME/.config/fork-sandbox/handlers}"
+# Same reasoning, same duplication, for fleet.sh's own FLEET_FILE
+# (fleet.sh:164) -- used only by pm_require_fleet_check below to decide
+# whether the startup `fleet check` gate applies at all: a personas-only
+# fleet with no fleet.yaml is valid, and `fleet check` requires the file
+# to exist, so its absence must skip the gate rather than fail it.
+FLEET_FILE="${FORK_SANDBOX_FLEET_FILE:-$HOME/.config/fork-sandbox/fleet.yaml}"
 # One fresh, empty, writable outbox dir per handler wake, parallel to
 # $HANDOFFS -- see pm_exec_wake.
 HANDLER_OUTBOX="$STATE/handler-outbox"
@@ -967,6 +973,26 @@ pm_require_kit() {
         return 1
     fi
     return 0
+}
+
+# Gate run once at deliver startup, same posture as pm_require_kit above:
+# refuse loudly, before the lock, with `fleet check`'s own output. Rationale:
+# reserving `operator`/`all` (fleet.sh's FLEET_RESERVED_NAMES) can make an
+# existing fleet file that already used either name as an agent invalid, and
+# the runtime failure is silent -- pm_expand_to swallows a per-address expand
+# failure while rule 1 falls back to treating every sender as the operator.
+# A startup refusal turns that into a config error the operator sees at the
+# moment it happens, instead of a silent behavior change discovered later.
+# A personas-only fleet (no fleet.yaml) is a valid setup -- `fleet check`
+# itself requires the file to exist, so its absence is not an error here,
+# it just means there is nothing for this gate to check. Startup only, not
+# per route pass: the dangerous wake-time properties (handler command bare
+# name, executable, regular file) are already re-checked at wake time (see
+# pm_exec_wake); re-running full fleet validation on every pass would tax
+# every route pass for a mid-run edit the next restart would catch anyway.
+pm_require_fleet_check() {
+    [[ -f "$FLEET_FILE" ]] || return 0
+    "$FLEET" check
 }
 
 pm_write_handoff() {
@@ -1969,6 +1995,7 @@ cmd_deliver() {
     # and the real reason buried in the deliver loop's stderr.
     fs_require_scratch_handoff "$HANDOFFS/probe.md" || return 1
     pm_require_kit || return 1
+    pm_require_fleet_check || return 1
 
     mkdir -p -- "$MAIL_ROOT" "$STATE"
     pm_lock_acquire || return 1
