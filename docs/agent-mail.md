@@ -178,7 +178,7 @@ content.
 `~/.config/fork-sandbox/personas`): a markdown body — the agent's
 standing instructions, opaque to the registry — with optional YAML
 frontmatter carrying `description`, `harness`, `model`, `network`
-(`pinned` or `sealed`) and `thinking`.
+(`pinned` or `sealed`), `thinking` and `wake-on-cc`.
 
 ```markdown
 ---
@@ -202,17 +202,22 @@ agents:
   scribe:
     harness: pi
     network: sealed
-  watcher: {}                 # persona watcher.md, no overrides
+  watcher:
+    wake-on-cc: false          # never wakes on a Cc, only on To:
 lists:
   crew:
     members: [reviewer, scribe, watcher]
 ```
 
 Precedence per field is **fleet.yaml entry, then persona frontmatter,
-then empty**. The registry reports what is configured and applies no
-defaults of its own — an agent may resolve with every field empty, and
-that is valid output, not an error. Whoever consults the registry owns
-the defaulting policy.
+then empty** — `wake-on-cc` included, so a fleet.yaml override wins over
+whatever the persona file says. The registry reports what is configured
+and applies no defaults of its own — an agent may resolve with every
+field empty, and that is valid output, not an error. Whoever consults
+the registry owns the defaulting policy: for `wake-on-cc`, that consumer
+is the postmaster, and it treats empty the same as any value other than
+the literal string `false` — only `wake-on-cc: false` suppresses a Cc
+wake.
 
 A bare `<name>.md` in the personas directory makes `name` an agent on its
 own, with no fleet-file entry needed. A `persona:` override names a file
@@ -236,8 +241,9 @@ here; the registry takes the two-axis form only.
 
 ```bash
 fork-sandbox fleet check              # validate everything, report every error
-fork-sandbox fleet resolve <name>     # six lines: harness, model, thinking,
-                                      # network, persona-path, description
+fork-sandbox fleet resolve <name>     # eight lines: harness, model, thinking,
+                                      # network, persona-path, description,
+                                      # wake-on-cc, refresh-at
 fork-sandbox fleet expand @crew,@ci   # a list becomes its members, deduped
 fork-sandbox fleet roster             # human-readable summary
 fork-sandbox fleet teardown <agent> [--thread <id>]
@@ -248,7 +254,7 @@ fork-sandbox fleet teardown --all     # destroy persistent (thread, agent)
 
 `check` accumulates every error across the fleet file and every persona
 it declares — addressed by path, like `agents.reviewer.modle` — rather
-than stopping at the first. `resolve` always prints exactly six lines;
+than stopping at the first. `resolve` always prints exactly eight lines;
 an unconfigured field is an empty line, never a missing one.
 
 `teardown` is how an operator reclaims a seat's persistent state (the
