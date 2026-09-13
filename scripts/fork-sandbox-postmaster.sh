@@ -166,8 +166,8 @@
 # override the coding leg's own seat identity. Only the coding leg binds
 # session state (fork-sandbox.sh's own resume rule, see STATE's RESUMED
 # field below) -- a preset's review/fix/maintainer legs never touch the
-# seat's session id, resumed or not. Branch name
-# is sbx-mail-<first8-of-thread-id>-<agent>-<seq>, seq counting from a
+# seat's session id, resumed or not. Branch name is
+# sbx-mail-<first8-of-thread-id>-<agent>-<seq>, seq counting from a
 # thread-lifetime spawn sequence that is NEVER reset (unlike the budget
 # counter rule 1 resets on an operator message -- see STATE below), so a
 # branch name can never repeat within a thread. A wake that commits

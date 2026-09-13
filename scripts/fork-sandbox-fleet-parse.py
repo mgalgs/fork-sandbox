@@ -56,8 +56,19 @@ existence -- and reports every error it finds, not just the first,
 addressed by path (`agents.reviewer.modle`).
 
 `check` accumulates every error across the whole fleet file and every
-persona it declares, prints them all to stderr, and exits 1; exits 0 with
-no output when everything is clean. `dump` and `frontmatter` are for the
+persona it declares, prints them all to stderr, and exits 1. On success
+it exits 0 and emits one line to stdout per non-handler agent:
+
+    agent\t<name>\tpreset\t<value>         (empty value when the agent has
+                                             no preset, fleet.yaml or
+                                             persona frontmatter)
+
+This spares fork-sandbox-fleet.sh a second pass over every persona file
+just to learn each agent's resolved preset for the preset-file-exists
+check below: `check` already parses every persona's frontmatter once, to
+validate it, so it hands back the preset it found along the way. Handler
+agents are omitted (a handler is host config, not a preset-bearing LLM
+seat -- see `handler: exec` above). `dump` and `frontmatter` are for the
 bash side's `resolve`/`expand`/`roster` verbs: same validation, but since
 each is asked about one document at a time, printing every accumulated
 error before exiting 1 is just as correct and keeps one validation
