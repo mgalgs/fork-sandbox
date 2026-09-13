@@ -352,10 +352,11 @@ export FORK_SANDBOX_FLEET_FILE="$saved"
 printf '\n== resolve ==\n'
 
 resolve_lines() {
-    # Reads the nine-line contract into named globals for assertions.
+    # Reads the eleven-line contract into named globals for assertions.
     { read -r r_harness; read -r r_model; read -r r_thinking; read -r r_network; \
       read -r r_persona; read -r r_description; read -r r_wake_on_cc; \
-      read -r r_refresh_at; read -r r_triage; } < <("$fleet" resolve "$1")
+      read -r r_refresh_at; read -r r_triage; read -r r_handler; \
+      read -r r_command; } < <("$fleet" resolve "$1")
 }
 
 resolve_lines riffler
@@ -377,12 +378,14 @@ check "resolve: all-empty agent, description empty" "" "$r_description"
 check "resolve: all-empty agent, wake-on-cc empty" "" "$r_wake_on_cc"
 check "resolve: all-empty agent, refresh-at empty" "" "$r_refresh_at"
 check "resolve: all-empty agent, triage empty" "" "$r_triage"
+check "resolve: all-empty agent, handler empty" "" "$r_handler"
+check "resolve: all-empty agent, command empty" "" "$r_command"
 check "resolve: all-empty agent still resolves a persona path" "$FORK_SANDBOX_PERSONAS_DIR/tuner.md" "$r_persona"
 
 # Piped, not captured via $(...): command substitution strips trailing
 # newlines, which would silently swallow the count when the last field
-# (triage) is empty, as it is for tuner.
-check "resolve: output is exactly nine lines" "9" "$("$fleet" resolve tuner | wc -l)"
+# (command) is empty, as it is for tuner.
+check "resolve: output is exactly eleven lines" "11" "$("$fleet" resolve tuner | wc -l)"
 
 printf '\n== resolve: wake-on-cc / refresh-at ==\n'
 

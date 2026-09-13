@@ -21,8 +21,9 @@
 #     $FORK_SANDBOX_PERSONAS_DIR, default ~/.config/fork-sandbox/personas.
 #   - The fleet file, a YAML mapping of `agents` (name -> optional
 #     persona/harness/model/network/thinking/wake-on-cc/refresh-at/triage
-#     overrides), `lists` (name -> members, a list of agent names), and
-#     an optional top-level `triage` block (harness/model for the
+#     overrides, OR handler/command for a script seat -- see "Handler
+#     seats" below), `lists` (name -> members, a list of agent names),
+#     and an optional top-level `triage` block (harness/model for the
 #     wake classifier's own sandbox seat -- see `resolve-triage` below).
 #     $FORK_SANDBOX_FLEET_FILE, default ~/.config/fork-sandbox/fleet.yaml.
 #
@@ -32,6 +33,21 @@
 # defaulting policy belongs to whatever consults this registry, not to
 # it. An agent may resolve with every field empty; that is valid output,
 # not an error.
+#
+# Handler seats (`handler: exec` + `command: <name>` in a fleet.yaml
+# agent entry -- see fork-sandbox-fleet-parse.py's module docstring for
+# the full schema) are a second, disjoint kind of agent: a deterministic
+# script the postmaster runs instead of spawning an LLM sandbox.
+# `handler`/`command` are fleet.yaml-only (never read from persona
+# frontmatter, and a handler seat needs no persona file at all), carry
+# no defaulting fallback, and are mutually exclusive with every
+# harness/model/network/thinking/triage override -- `check` refuses the
+# combination. `command` is a bare name resolved ONLY against
+# $FORK_SANDBOX_HANDLERS_DIR (default ~/.config/fork-sandbox/handlers)
+# -- never PATH, a repo, or a clone -- and `check` requires
+# `$FORK_SANDBOX_HANDLERS_DIR/<command>` to exist and be executable;
+# fork-sandbox-postmaster.sh re-checks the same thing at wake time. See
+# that script's header for the wake contract a handler runs under.
 #
 # This is a registry, not a router or a store: it has no idea what
 # fork-sandbox-mail.sh's message store holds, and never touches it.
@@ -46,20 +62,28 @@
 # Verbs:
 #
 #   check          Validate the fleet file, every persona file it
-#                  declares, and every bare <name>.md in the personas
-#                  directory that makes `name` an agent on its own (see
-#                  fleet_is_agent below). Exits 0 silently if clean;
-#                  otherwise prints every error found (not just the
-#                  first) and exits 1. Refuses an agent or list named
-#                  "all" (reserved for @all, see `expand` below) or
-#                  "operator" (reserved for the human operator's mail
-#                  address, see docs/agent-mail.md) -- either would let
-#                  the reserved address resolve as a real seat.
-#   resolve <name> Print exactly nine lines for one agent: harness,
+#                  declares (handler seats excepted -- they need none),
+#                  every bare <name>.md in the personas directory that
+#                  makes `name` an agent on its own (see fleet_is_agent
+#                  below), and, for every handler seat, that its command
+#                  exists and is executable under $FORK_SANDBOX_HANDLERS_DIR.
+#                  Exits 0 silently if clean; otherwise prints every
+#                  error found (not just the first) and exits 1. Refuses
+#                  an agent or list named "all" (reserved for @all, see
+#                  `expand` below) or "operator" (reserved for the human
+#                  operator's mail address, see docs/agent-mail.md) --
+#                  either would let the reserved address resolve as a
+#                  real seat.
+#   resolve <name> Print exactly eleven lines for one agent: harness,
 #                  model, thinking, network, persona-path, description,
-#                  wake-on-cc, refresh-at, triage. A field with nothing
-#                  configured anywhere prints as an empty line -- output
-#                  is always nine lines, never fewer.
+#                  wake-on-cc, refresh-at, triage, handler, command. A
+#                  field with nothing configured anywhere prints as an
+#                  empty line -- output is always eleven lines, never
+#                  fewer. A handler seat's harness/model/thinking/network/
+#                  triage lines are always empty (refused together at
+#                  `check` time); its handler/command lines are the only
+#                  ones populated besides persona-path/description/
+#                  wake-on-cc/refresh-at.
 #   resolve-triage Print exactly two lines for the wake classifier's own
 #                  sandbox seat: harness, model. Reads only the fleet
 #                  file's top-level `triage` block (no persona fallback --
@@ -78,7 +102,10 @@
 #                  `roster` walks). Output is deduped by first-seen
 #                  position, one address per line.
 #   roster         Human-readable summary: every agent with its resolved
-#                  seat, every list with its members.
+#                  seat, every list with its members. A handler seat
+#                  prints in a distinct `handler=exec command=<name>`
+#                  form rather than the harness/model/... seat line, since
+#                  those fields are always empty for it.
 #   teardown <agent> [--thread <id>]
 #   teardown --all
 #                  Destroy persistent (thread, agent) seat state: the
@@ -120,6 +147,11 @@ set -euo pipefail
 
 FLEET_FILE="${FORK_SANDBOX_FLEET_FILE:-$HOME/.config/fork-sandbox/fleet.yaml}"
 PERSONAS_DIR="${FORK_SANDBOX_PERSONAS_DIR:-$HOME/.config/fork-sandbox/personas}"
+# Where a handler seat's `command:` bare name resolves -- operator config
+# only, per fork-sandbox-postmaster.sh's wake-contract posture: never PATH,
+# a repo, or a clone. Read again, independently, by the postmaster at wake
+# time (this script's `check` is a config-time backstop, not the only gate).
+HANDLERS_DIR="${FORK_SANDBOX_HANDLERS_DIR:-$HOME/.config/fork-sandbox/handlers}"
 FLEET_NAME_RE='^[a-z0-9][a-z0-9-]*$'
 FLEET_ADDR_RE='^@[a-z0-9][a-z0-9-]*$'
 
@@ -188,7 +220,34 @@ cmd_check() {
         echo "Error: check: no personas dir at '$PERSONAS_DIR'." >&2
         return 1
     fi
-    python3 "$PARSE" check "$FLEET_FILE" "$FLEET_FILE" "$PERSONAS_DIR"
+    python3 "$PARSE" check "$FLEET_FILE" "$FLEET_FILE" "$PERSONAS_DIR" || return 1
+
+    # The parser has no concept of the handlers directory (a bash-side,
+    # operator-configured path) -- so a handler seat's command existing
+    # and being executable is checked here, once the schema itself (incl.
+    # the bare-name shape and the harness/model/... refusal) is known good.
+    local rc=0
+    local dump; dump="$(fleet_dump)"
+    local -a agent_names=()
+    local n
+    while IFS= read -r n; do
+        [[ -n "$n" ]] && agent_names+=("$n")
+    done < <(fleet_all_agent_names "$dump")
+
+    local name handler_path
+    for name in "${agent_names[@]}"; do
+        fleet_read_agent "$dump" "$name"
+        [[ "$fleet_handler" == exec ]] || continue
+        handler_path="$HANDLERS_DIR/$fleet_command"
+        if [[ ! -e "$handler_path" ]]; then
+            echo "Error: agents.$name.command: handler '$handler_path' does not exist." >&2
+            rc=1
+        elif [[ ! -x "$handler_path" ]]; then
+            echo "Error: agents.$name.command: handler '$handler_path' is not executable." >&2
+            rc=1
+        fi
+    done
+    return "$rc"
 }
 
 # Runs `dump` against $FLEET_FILE if it exists, else prints nothing. Both
@@ -205,6 +264,7 @@ fleet_read_agent() {
     fleet_persona="" fleet_harness="" fleet_model=""
     fleet_network="" fleet_thinking="" fleet_description=""
     fleet_wake_on_cc="" fleet_refresh_at="" fleet_triage=""
+    fleet_handler="" fleet_command=""
     agent_declared=0
     [[ -n "$dump" ]] || return 0
     while IFS=$'\t' read -r kind aname field value; do
@@ -220,6 +280,8 @@ fleet_read_agent() {
             wake-on-cc) fleet_wake_on_cc="$value" ;;
             refresh-at) fleet_refresh_at="$value" ;;
             triage) fleet_triage="$value" ;;
+            handler) fleet_handler="$value" ;;
+            command) fleet_command="$value" ;;
         esac
     done <<< "$dump"
 }
@@ -285,6 +347,10 @@ resolve_with_dump() {
     printf '%s\n' "${fleet_wake_on_cc:-$fm_wake_on_cc}"
     printf '%s\n' "${fleet_refresh_at:-$fm_refresh_at}"
     printf '%s\n' "${fleet_triage:-$fm_triage}"
+    # handler/command are fleet.yaml-only -- no frontmatter fallback, see
+    # the header's "Handler seats" paragraph.
+    printf '%s\n' "$fleet_handler"
+    printf '%s\n' "$fleet_command"
 }
 
 cmd_resolve() {
@@ -437,15 +503,20 @@ cmd_roster() {
     done < <(fleet_all_agent_names "$dump")
 
     echo "Agents:"
-    local name harness model thinking network persona description wake_on_cc refresh_at triage
+    local name harness model thinking network persona description wake_on_cc refresh_at triage handler command
     for name in "${agent_names[@]}"; do
         { read -r harness; read -r model; read -r thinking; read -r network; \
           read -r persona; read -r description; read -r wake_on_cc; read -r refresh_at; \
-          read -r triage; } \
+          read -r triage; read -r handler; read -r command; } \
             < <(resolve_with_dump "$dump" "$name")
-        printf '  %-20s harness=%-8s model=%-12s thinking=%-8s network=%-8s wake-on-cc=%-5s refresh-at=%-6s triage=%-5s persona=%s%s\n' \
-            "$name" "${harness:--}" "${model:--}" "${thinking:--}" \
-            "${network:--}" "${wake_on_cc:--}" "${refresh_at:--}" "${triage:--}" "$persona" "${description:+  # $description}"
+        if [[ -n "$handler" ]]; then
+            printf '  %-20s handler=%-4s command=%s%s\n' \
+                "$name" "$handler" "$command" "${description:+  # $description}"
+        else
+            printf '  %-20s harness=%-8s model=%-12s thinking=%-8s network=%-8s wake-on-cc=%-5s refresh-at=%-6s triage=%-5s persona=%s%s\n' \
+                "$name" "${harness:--}" "${model:--}" "${thinking:--}" \
+                "${network:--}" "${wake_on_cc:--}" "${refresh_at:--}" "${triage:--}" "$persona" "${description:+  # $description}"
+        fi
     done
 
     local -a list_names=()

@@ -554,11 +554,11 @@ pm_expand_to() {
 # same agent again.
 pm_cc_candidate_resolve() {
     local agent="$1" harness model thinking network persona_path \
-          description wake_on_cc refresh_at triage
+          description wake_on_cc refresh_at triage handler command
     # shellcheck disable=SC2034
     if ! { read -r harness; read -r model; read -r thinking; read -r network; \
            read -r persona_path; read -r description; read -r wake_on_cc; \
-           read -r refresh_at; read -r triage; \
+           read -r refresh_at; read -r triage; read -r handler; read -r command; \
          } < <("$FLEET" resolve "$agent" 2>/dev/null); then
         return 1
     fi
@@ -1058,9 +1058,11 @@ pm_spawn_wake() {
     # keep resolve's line contract explicit even though neither is needed
     # by a wake -- wake_on_cc is a routing decision made before a wake is
     # ever spawned (see pm_process_message's Cc expansion). resolve emits
-    # nine lines as of the per-agent triage field; this reads only the
-    # first eight on purpose, since a wake itself never needs that
-    # opt-out (pm_triage_wake reads the ninth line for that).
+    # eleven lines as of the handler/command fields; this reads only the
+    # first eight on purpose, since an LLM wake itself never needs the
+    # triage opt-out (pm_triage_wake reads the ninth line for that) or the
+    # handler/command lines (a handler seat is dispatched on a separate,
+    # non-sandbox path before this function is ever called for it).
     # shellcheck disable=SC2034
     if ! { read -r harness; read -r model; read -r thinking; read -r network; \
            read -r persona_path; read -r description; read -r wake_on_cc; \

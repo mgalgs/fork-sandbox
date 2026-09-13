@@ -12,16 +12,27 @@ list may be defined with either, on either side of the agents/lists
 divide, so neither can resolve as a fleet seat.
 
 A fleet file is a YAML mapping of `agents` (name -> optional persona/
-harness/model/network/thinking/description/wake-on-cc/refresh-at/triage
-overrides), `lists` (name -> `members`, a list of agent names), and an
-optional top-level `triage` block (harness/model for the wake
-classifier's own sandbox seat -- absent means triage is off fleet-wide.
+harness/model/network/thinking/description/wake-on-cc/refresh-at/triage/
+handler/command overrides), `lists` (name -> `members`, a list of agent
+names), and an optional top-level `triage` block (harness/model for the
+wake classifier's own sandbox seat -- absent means triage is off fleet-wide.
 No `network` field: the classifier's own launch path fixes its network
 by harness -- sealed for pi, pinned for claude -- with nothing in the
 fleet file left to override it).
 A persona file is markdown with an optional YAML frontmatter block
 (delimited by `---` lines) carrying the same per-agent seat keys plus
-`description`; the body is opaque to this script.
+`description`, EXCEPT `handler`/`command` -- a handler seat is host
+config (see below), not content, so those two are fleet.yaml-only and
+refused (as unknown keys) in frontmatter; the body is opaque to this
+script.
+
+`handler: exec` marks an agent as a deterministic script seat rather
+than an LLM seat: `command` (a bare name, resolved host-side against the
+operator's handlers directory -- see fork-sandbox-postmaster.sh) is then
+required, and none of `harness`/`model`/`network`/`thinking`/`triage` may
+be set on the same agent -- those tune an LLM seat, which a handler is
+not. `handler`, when present, is always the literal string `exec`;
+nothing else validates.
 
 This script owns every validation rule for both documents -- YAML
 validity, the schema, name shape, the harness/network enums (including
@@ -45,7 +56,7 @@ routine instead of two.
 
 `dump` emits tab-separated facts about the fleet file:
 
-    agent\t<name>\tpersona\t<value>        (nine lines per agent, always,
+    agent\t<name>\tpersona\t<value>        (eleven lines per agent, always,
     agent\t<name>\tharness\t<value>         empty value when unset -- the
     agent\t<name>\tmodel\t<value>           bash side treats unset and
     agent\t<name>\tnetwork\t<value>         empty identically via ${x:-y})
@@ -54,6 +65,8 @@ routine instead of two.
     agent\t<name>\twake-on-cc\t<value>
     agent\t<name>\trefresh-at\t<value>
     agent\t<name>\ttriage\t<value>
+    agent\t<name>\thandler\t<value>
+    agent\t<name>\tcommand\t<value>
     list\t<name>                           (once per list, so an empty
     list_member\t<name>\t<member>           list still appears; members
                                              in file order)
@@ -98,9 +111,16 @@ except ImportError:
 HARNESSES = ("claude", "pi", "codex")
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 FIELDS = ("persona", "harness", "model", "network", "thinking",
-          "description", "wake-on-cc", "refresh-at", "triage")
+          "description", "wake-on-cc", "refresh-at", "triage",
+          "handler", "command")
+# handler/command are deliberately absent here -- see the module
+# docstring's "handler: exec" paragraph: a handler seat is host config,
+# fleet.yaml-only, and refused as an unknown key in persona frontmatter.
 FRONTMATTER_FIELDS = ("harness", "model", "network", "thinking",
                        "description", "wake-on-cc", "refresh-at", "triage")
+# LLM-seat-only fields: refused alongside `handler: exec` (decision: a
+# handler is a script seat, not an LLM seat to tune).
+LLM_ONLY_FIELDS = ("harness", "model", "network", "thinking", "triage")
 # Only these two are wired up on the postmaster side (pm_triage_wake's
 # pi and claude arms); a triage seat naming any other harness would
 # validate here and then silently run as claude at launch, so the
@@ -318,6 +338,29 @@ def check_persona(value, path, errors):
     return value
 
 
+def check_handler(value, path, errors):
+    """The only accepted value is the literal string 'exec' -- a handler
+    seat is a deterministic script, not an LLM seat with a choice of
+    harnesses, so there is nothing else for this field to mean."""
+    if value != "exec":
+        errors.append(f"{path}: takes 'exec', not '{value}'")
+        return ""
+    return value
+
+
+def check_command(value, path, errors):
+    """Mirrors check_persona: a bare name only, never a path -- resolution
+    happens entirely host-side (fork-sandbox-postmaster.sh), against the
+    operator's own handlers directory, never PATH or a repo/clone, so
+    anything that could escape a single path component is refused here
+    at the earliest possible point."""
+    if value != os.path.basename(value) or value in (".", ".."):
+        errors.append(f"{path}: must be a bare command name, not a "
+                       f"path, got '{value}'")
+        return ""
+    return value
+
+
 def load_and_validate(fleet_file, label, errors):
     """Returns (agents, lists, triage), best-effort -- callers only trust
     them when `errors` is still empty afterward. `triage` is None when the
@@ -403,10 +446,31 @@ def load_and_validate(fleet_file, label, errors):
                 v = scalar(value, path, errors)
                 if v is not None:
                     agent["refresh-at"] = check_refresh_at(v, path, errors)
+            elif prop == "handler":
+                v = scalar(value, path, errors)
+                if v is not None:
+                    agent["handler"] = check_handler(v, path, errors)
+            elif prop == "command":
+                v = scalar(value, path, errors)
+                if v is not None:
+                    agent["command"] = check_command(v, path, errors)
             else:
                 errors.append(f"{label}: {path}: unknown key")
         check_network_harness_pair(agent["harness"], agent["network"],
                                     f"{label}: agents.{name}", errors)
+        if agent["handler"]:
+            if not agent["command"]:
+                errors.append(f"{label}: agents.{name}.command: required "
+                               f"when 'handler' is set")
+            for field in LLM_ONLY_FIELDS:
+                if agent[field]:
+                    errors.append(
+                        f"{label}: agents.{name}.{field}: not allowed "
+                        f"alongside 'handler: exec' -- a handler seat is "
+                        f"a script, not an LLM seat to tune")
+        elif agent["command"]:
+            errors.append(f"{label}: agents.{name}.handler: 'command' "
+                           f"requires 'handler: exec'")
         agents[name] = agent
 
     lists = {}
@@ -533,6 +597,13 @@ def cmd_check(fleet_file, label, personas_dir):
     agents, lists, _triage = load_and_validate(fleet_file, label, errors)
     if not errors:
         for name, agent in agents.items():
+            # A handler seat is a script, not an LLM seat -- the wake
+            # contract never injects a persona body into it (stdin is
+            # just the rendered thread), so it needs no persona file at
+            # all; requiring one here would fail `check` for the wrong
+            # reason.
+            if agent["handler"] == "exec":
+                continue
             persona_name = agent["persona"] or f"{name}.md"
             persona_path = os.path.join(personas_dir, persona_name)
             if not os.path.isfile(persona_path):
