@@ -133,12 +133,29 @@ refuses() {
     fi
 }
 
-refuses "--session-state refused on --harness pi" \
-    "claude-only" --harness pi --model vendor/model \
-    --session-state "$scratch/fs-resume-unused"
-refuses "--session-state refused on --harness codex" \
-    "claude-only" --harness codex \
-    --session-state "$scratch/fs-resume-unused"
+# pi and codex are resumable too now (fs_harness_session_caps), so
+# --session-state is accepted on both -- only a harness with no
+# session-resume capability at all would be refused here, and every harness
+# --harness itself accepts (claude/pi/codex) has one, so that refusal path
+# is exercised at the fs_harness_session_caps unit level
+# (fork-sandbox-harness-session-caps-test.sh), not reachable through this
+# CLI's own --harness flag.
+pi_state_out="$(dry_run --harness pi --model vendor/model --session-state "$scratch/fs-resume-unused")"
+pi_state_rc=$?
+if (( pi_state_rc == 0 )) && printf '%s\n' "$pi_state_out" \
+    | grep -q '^session_state='; then
+    ok "--session-state accepted on --harness pi"
+else
+    no "--session-state accepted on --harness pi" "$pi_state_out"
+fi
+codex_state_out="$(dry_run --harness codex --session-state "$scratch/fs-resume-unused")"
+codex_state_rc=$?
+if (( codex_state_rc == 0 )) && printf '%s\n' "$codex_state_out" \
+    | grep -q '^session_state='; then
+    ok "--session-state accepted on --harness codex"
+else
+    no "--session-state accepted on --harness codex" "$codex_state_out"
+fi
 refuses "--session-state refused with --k8s" \
     "not supported with --k8s" --k8s --model vendor/model \
     --session-state "$scratch/fs-resume-unused"
@@ -147,6 +164,24 @@ refuses "--resume-session refused with --k8s" \
     --resume-session 0123abcd-4567-89ab-cdef-0123456789ab
 refuses "--resume-session refused without --session-state" \
     "requires --session-state" --harness claude \
+    --resume-session 0123abcd-4567-89ab-cdef-0123456789ab
+refuses "--session-id refused with --k8s" \
+    "not supported with --k8s" --k8s --model vendor/model \
+    --session-id 0123abcd-4567-89ab-cdef-0123456789ab
+refuses "--session-id refused without --session-state" \
+    "requires --session-state" --harness pi --model vendor/model \
+    --session-id 0123abcd-4567-89ab-cdef-0123456789ab
+refuses "--session-id refused on a discover-mode harness (claude)" \
+    "with nothing to" --harness claude \
+    --session-state "$scratch/fs-resume-unused" \
+    --session-id 0123abcd-4567-89ab-cdef-0123456789ab
+refuses "--session-id refused on a discover-mode harness (codex)" \
+    "with nothing to" --harness codex \
+    --session-state "$scratch/fs-resume-unused" \
+    --session-id 0123abcd-4567-89ab-cdef-0123456789ab
+refuses "--resume-session refused on a given-mode harness (pi)" \
+    "does not do" --harness pi --model vendor/model \
+    --session-state "$scratch/fs-resume-unused" \
     --resume-session 0123abcd-4567-89ab-cdef-0123456789ab
 
 # The id is used as a transcript filename stem, so path characters and
@@ -160,6 +195,9 @@ for bad in "../etc/passwd" "a/b" "abcdef12.jsonl" "ABCDEF1234" "short" \
     refuses "bad session id refused: '$bad'" "is not a session id" \
         --harness claude --session-state "$scratch/fs-resume-unused" \
         --resume-session "$bad"
+    refuses "bad --session-id refused: '$bad'" "is not a session id" \
+        --harness pi --model vendor/model --session-state "$scratch/fs-resume-unused" \
+        --session-id "$bad"
 done
 
 # A symlink checked here and resolved later is a different directory from
@@ -220,6 +258,17 @@ if [[ -e "$scratch/fs-resume-dry.$$" ]]; then
 else
     ok "--dry-run creates no state directory"
 fi
+
+dry_pi_state="$scratch/fs-resume-dry-pi.$$/state"
+dry_pi_out="$(dry_run --harness pi --model vendor/model --session-state "$dry_pi_state" \
+    --session-id 0123abcd-4567-89ab-cdef-0123456789ab)"
+if printf '%s\n' "$dry_pi_out" \
+    | grep -qx 'session_id=0123abcd-4567-89ab-cdef-0123456789ab'; then
+    ok "--dry-run prints session_id"
+else
+    no "--dry-run prints session_id" "$dry_pi_out"
+fi
+[[ -e "$scratch/fs-resume-dry-pi.$$" ]] && rm -rf "$scratch/fs-resume-dry-pi.$$"
 
 # A run with neither flag must print neither key, so a caller parsing the
 # dry run can tell "not requested" from "requested and empty".

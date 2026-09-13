@@ -169,56 +169,68 @@
 #                        host-side script created on purpose — never an
 #                        arbitrary host path.
 # --session-state <dir>: bind <dir> read-WRITE into the sandbox at the
-#                        sandbox HOME's ~/.claude/projects, so the claude
-#                        CLI's per-project transcript store survives the run
-#                        instead of dying with the per-run state dir. Created
-#                        if missing. Refused if it exists as a symlink, or if
-#                        it resolves outside /var/tmp/claude-scratch/ (or
-#                        the /tmp/claude-scratch compat path, the same two
-#                        roots a handoff may live under) — the
-#                        directory is writable from inside an unattended
-#                        session, so where it may point is a security
-#                        boundary. claude only (pi and codex keep their
-#                        sessions elsewhere), and refused with --k8s, which
-#                        has no host directory to bind. It exists so a caller
-#                        that wakes the same agent repeatedly — the
+#                        harness's own session store — sandbox HOME's
+#                        ~/.claude/projects for claude, ~/.codex/sessions for
+#                        codex, an operator-chosen ~/.pi/sessions-shaped path
+#                        for pi — so that store survives the run instead of
+#                        dying with the per-run state dir. Which harnesses
+#                        accept this, and where it binds, comes from
+#                        fs_harness_session_caps's capability table, not a
+#                        harness-name check here. Created if missing. Refused
+#                        if it exists as a symlink, or if it resolves outside
+#                        /var/tmp/claude-scratch/ (or the /tmp/claude-scratch
+#                        compat path, the same two roots a handoff may live
+#                        under) — the directory is writable from inside an
+#                        unattended session, so where it may point is a
+#                        security boundary. Refused on a harness with no
+#                        session-resume capability, and refused with --k8s,
+#                        which has no host directory to bind. It exists so a
+#                        caller that wakes the same agent repeatedly — the
 #                        postmaster, on one mail thread — can hand the next
-#                        wake the previous one's transcript. The CODING legs
-#                        alone are bound: a review, fix or maintainer leg
-#                        is a different conversation, and its transcript in
-#                        the store would be the newest one there, which is
-#                        the one summary.json reports as this run's
-#                        session_id. --refresh-at continuations are the same
-#                        conversation continued, so they do write there --
-#                        but they are never RESUMED, whatever
-#                        --resume-session says: a continuation exists to
-#                        drop the context it inherited, and resuming it
-#                        would hand that context straight back.
+#                        wake the previous one's session. The CODING legs
+#                        alone are bound: a review, fix or maintainer leg is
+#                        a different conversation, and on a "discover"
+#                        harness (claude, codex) its transcript in the store
+#                        would be the newest one there, which is the one
+#                        summary.json reports as this run's session_id.
+#                        --refresh-at continuations are the same conversation
+#                        continued, so they do write there -- but they are
+#                        never RESUMED, whatever --resume-session says: a
+#                        continuation exists to drop the context it
+#                        inherited, and resuming it would hand that context
+#                        straight back.
 #                        summary.json gains two keys on such a run, and only
 #                        on such a run: `session_state`, the directory, and
-#                        `session_id`, the stem of the newest transcript in
-#                        it at run end (null if the store stayed empty). The
-#                        newest-by-mtime rule is a heuristic — the CLI does
-#                        not record which transcript was this run's.
-#                        Note that with this flag the sandbox's transcripts
-#                        no longer land in the work dir's claude-session/:
-#                        the bind is namespace-local, so the per-run state
-#                        dir the rescue copies from is an empty mountpoint.
-#                        <dir> is the durable copy instead.
-# --resume-session <id>: resume the claude session <id> instead of starting a
-#                        fresh one, with this run's handoff delivered as the
-#                        new prompt. The FIRST coding leg only: a --refresh-at
+#                        `session_id`. For a "discover" harness, session_id
+#                        is the stem of the newest transcript (claude) or the
+#                        uuid suffix of the newest rollout filename (codex)
+#                        in the store at run end (null if it stayed empty) —
+#                        a documented newest-by-mtime heuristic, since
+#                        neither CLI records which transcript was this run's.
+#                        For a "given" harness (pi), session_id is simply
+#                        --session-id echoed back.
+#                        Note that with this flag the sandbox's claude
+#                        transcripts no longer land in the work dir's
+#                        claude-session/: the bind is namespace-local, so the
+#                        per-run state dir the rescue copies from is an empty
+#                        mountpoint. <dir> is the durable copy instead.
+# --resume-session <id>: resume the session <id> instead of starting a fresh
+#                        one, with this run's handoff delivered as the new
+#                        prompt. The FIRST coding leg only: a --refresh-at
 #                        continuation of it starts fresh by design, and no
 #                        review, fix or maintainer leg is resumed at all.
-#                        Requires --session-state, which is where
-#                        the transcript is read from; claude only. <id> must
+#                        Requires --session-state, which is where the
+#                        transcript is read from; only harnesses whose
+#                        capability table entry says the id is "discovered"
+#                        (claude, codex) — a harness whose id is "given"
+#                        instead (pi) uses --session-id below. <id> must
 #                        match ^[0-9a-f][0-9a-f-]{7,63}$ — it is a transcript
 #                        filename stem, so anything with a slash, a dot or a
 #                        leading hyphen is refused. Resume is a continuity and
 #                        cost optimization, never a correctness guarantee: if
 #                        the session is unknown or its transcript is
-#                        unreadable, claude-sandboxed retries once as a fresh
-#                        session and the run continues.
+#                        unreadable, the harness's sandboxed wrapper retries
+#                        once as a fresh session and the run continues.
 #                        Nothing but the transcript crosses over, so the
 #                        coding leg's prompt gains a "This session is a
 #                        continuation" section naming what did not: the
@@ -229,10 +241,25 @@
 #                        remote-tracking ref, not from HEAD. --clone-dir
 #                        below changes this: a reused clone keeps its
 #                        earlier commits on the new branch's own history.
-#                        (--resume-session is claude-only; --clone-dir is
-#                        not, so a pi or codex seat's later wakes get a
-#                        "This workspace is not new" section saying so
-#                        instead, with no session to resume at all.)
+#                        (--resume-session applies only to "discover"
+#                        harnesses; --clone-dir is not harness-restricted at
+#                        all, so a codex seat's later wakes without it, or a
+#                        pi seat's always, get a "This workspace is not new"
+#                        section saying so instead, with no session to
+#                        resume at all.)
+# --session-id <id>:     supply the session id for a "given" harness (pi)
+#                        instead of discovering one at run end: pi's
+#                        --session-id creates the session if it does not
+#                        already exist, so passing the same id on every wake
+#                        makes resume implicit — there is nothing to
+#                        discover. Requires --session-state. Refused on a
+#                        harness whose id is "discovered" instead (claude,
+#                        codex; use --resume-session there) or with no
+#                        session-resume capability, and refused with --k8s.
+#                        <id> must match ^[0-9a-f][0-9a-f-]{7,63}$, the same
+#                        shape --resume-session requires, since it is used as
+#                        a directory/filename component inside the bound
+#                        store.
 # --clone-dir <dir>:     persist the clone in <dir> instead of a throwaway
 #                        one under the run dir, so a caller that runs this
 #                        script again with the same <dir> continues from the
@@ -241,8 +268,9 @@
 #                        symlink, or if it resolves outside
 #                        /var/tmp/claude-scratch/ or the /tmp/claude-scratch
 #                        compat path, or if it exists as something other than
-#                        a directory) — unlike --session-state, NOT
-#                        claude-only: every harness gets a clone, so
+#                        a directory) — unlike --session-state, not
+#                        restricted to harnesses with a session-resume
+#                        capability: every harness gets a clone, so
 #                        persisting it is useful on every harness. Refused
 #                        with --k8s, whose pod filesystem dies with the Job
 #                        and leaves nothing for a later wake to reuse.
@@ -1343,6 +1371,7 @@ task_meta=""
 context_ro=""
 session_state=""
 resume_session=""
+session_id_arg=""
 clone_dir_flag=""
 review_loop_arg=""
 review_loop_cap=0
@@ -1464,6 +1493,10 @@ while [[ "${1:-}" == -* ]]; do
             ;;
         --resume-session)
             resume_session="${2:?--resume-session requires a session id}"
+            shift 2
+            ;;
+        --session-id)
+            session_id_arg="${2:?--session-id requires a session id}"
             shift 2
             ;;
         --clone-dir)
@@ -2457,6 +2490,11 @@ if [[ "$k8s_mode" == true ]]; then
         echo "--session-state, which a cluster run cannot have." >&2
         exit 1
     fi
+    if [[ -n "$session_id_arg" ]]; then
+        echo "Error: --session-id is not supported with --k8s. It needs" >&2
+        echo "--session-state, which a cluster run cannot have." >&2
+        exit 1
+    fi
     if [[ -n "$clone_dir_flag" ]]; then
         echo "Error: --clone-dir is not supported with --k8s. It persists a clone" >&2
         echo "on a host directory between wakes, and a cluster Job's pod" >&2
@@ -3102,24 +3140,37 @@ if [[ "$review_only" == true ]]; then
     fi
 fi
 
-# --session-state and --resume-session, validated here rather than beside the
-# other path checks below because --dry-run exits before those run: a caller
-# asking what a run would do must be told the flag is refused, and must be
-# shown the resolved directory. Nothing is CREATED here for the same reason —
-# the mkdir waits until after the dry-run exit.
+# --session-state, --resume-session and --session-id, validated here rather
+# than beside the other path checks below because --dry-run exits before
+# those run: a caller asking what a run would do must be told the flag is
+# refused, and must be shown the resolved directory. Nothing is CREATED here
+# for the same reason — the mkdir waits until after the dry-run exit.
 #
-# Both are claude-only. pi and codex keep their session state somewhere else
-# entirely (--session-dir, ~/.codex/sessions), and neither CLI has a headless
-# resume this script could drive, so a flag named for claude's transcript
-# store would be a silent no-op there.
-if [[ -n "$session_state" || -n "$resume_session" ]]; then
-    if [[ "$harness" != claude ]]; then
-        echo "Error: --session-state and --resume-session are claude-only; this" >&2
-        echo "run's harness is '$harness'. They name the claude CLI's own" >&2
-        echo "transcript store and its --resume flag, neither of which the other" >&2
-        echo "harnesses have." >&2
+# Which harnesses accept these at all, and which of --resume-session /
+# --session-id apply, comes from the capability table rather than a
+# harness-name check here: fs_harness_session_caps is the one place that
+# knows claude and codex discover their id at run end while pi's is given up
+# front.
+fs_harness_session_caps "$harness"
+if [[ -n "$session_state" || -n "$resume_session" || -n "$session_id_arg" ]]; then
+    if [[ "$FS_HARNESS_RESUMABLE" != true ]]; then
+        echo "Error: --session-state, --resume-session and --session-id all need" >&2
+        echo "a harness with a session-resume capability; this run's harness is" >&2
+        echo "'$harness', which has none." >&2
         exit 1
     fi
+fi
+if [[ -n "$resume_session" && "$FS_HARNESS_ID_MODE" != discover ]]; then
+    echo "Error: --resume-session names a session id to discover-then-resume," >&2
+    echo "which harness '$harness' does not do. Use --session-id instead if" >&2
+    echo "the harness takes one." >&2
+    exit 1
+fi
+if [[ -n "$session_id_arg" && "$FS_HARNESS_ID_MODE" != given ]]; then
+    echo "Error: --session-id supplies an id for a harness with nothing to" >&2
+    echo "discover; harness '$harness' discovers its id instead. Use" >&2
+    echo "--resume-session instead if the harness takes one." >&2
+    exit 1
 fi
 if [[ -n "$resume_session" && -z "$session_state" ]]; then
     echo "Error: --resume-session requires --session-state. The session to be" >&2
@@ -3127,9 +3178,21 @@ if [[ -n "$resume_session" && -z "$session_state" ]]; then
     echo "transcript inside the sandbox to resume from." >&2
     exit 1
 fi
+if [[ -n "$session_id_arg" && -z "$session_state" ]]; then
+    echo "Error: --session-id requires --session-state. The id names a session" >&2
+    echo "inside that directory; with no bind there is nowhere for it to live." >&2
+    exit 1
+fi
 if [[ -n "$resume_session" && ! "$resume_session" =~ ^[0-9a-f][0-9a-f-]{7,63}$ ]]; then
     echo "Error: --resume-session '$resume_session' is not a session id. It is" >&2
     echo "used as a transcript filename stem, so it must match" >&2
+    echo "^[0-9a-f][0-9a-f-]{7,63}\$ — no slashes, no dots, no leading hyphen," >&2
+    echo "no other characters." >&2
+    exit 1
+fi
+if [[ -n "$session_id_arg" && ! "$session_id_arg" =~ ^[0-9a-f][0-9a-f-]{7,63}$ ]]; then
+    echo "Error: --session-id '$session_id_arg' is not a session id. It is" >&2
+    echo "used as a directory/filename component, so it must match" >&2
     echo "^[0-9a-f][0-9a-f-]{7,63}\$ — no slashes, no dots, no leading hyphen," >&2
     echo "no other characters." >&2
     exit 1
@@ -3185,6 +3248,7 @@ if [[ "$dry_run" == true ]]; then
     printf 'outbox_max_bytes=%s\n' "$outbox_max_bytes"
     [[ -z "$session_state" ]] || printf 'session_state=%s\n' "$session_state"
     [[ -z "$resume_session" ]] || printf 'resume_session=%s\n' "$resume_session"
+    [[ -z "$session_id_arg" ]] || printf 'session_id=%s\n' "$session_id_arg"
     [[ -z "$clone_dir_flag" ]] || printf 'clone_dir=%s\n' "$clone_dir_flag"
     if [[ "$review_only" == true ]]; then
         printf 'mode=review-only\ncheckout=%s\nbase_sha=%s\nrange=%s...%s\n' \
@@ -4577,6 +4641,16 @@ fs_emit_prompt_overlay() {
     done <<<"$frags"
 }
 
+# Whether THIS run was asked to resume a prior conversation, across both id
+# modes: --resume-session names one to discover-then-resume (claude, codex),
+# --session-id supplies one for a create-if-missing harness (pi) where the
+# id being non-empty is itself the request, first wake included -- the "if
+# you see no earlier conversation above this hand-off" disclaimer in the
+# text below already covers a pi first-wake create with no continuation
+# story to tell.
+resume_named=false
+[[ -n "$resume_session" || -n "$session_id_arg" ]] && resume_named=true
+
 {
     fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" "$harness" "$preamble_network" \
         "$outbox_dir" "" "$outbox_max_bytes"
@@ -4592,7 +4666,7 @@ fs_emit_prompt_overlay() {
     # Only the coding leg gets this. A review, maintainer or fix leg is a
     # fresh session by construction and has nothing stale to correct, and a
     # --refresh-at continuation runs in THIS sandbox, with these paths.
-    if [[ -n "$resume_session" ]] && [[ "$clone_reused" != true ]]; then
+    if [[ "$resume_named" == true ]] && [[ "$clone_reused" != true ]]; then
         cat <<EOF
 
 ## This session is a continuation
@@ -4619,7 +4693,7 @@ conversation as stale:
   lists them, \`git log\`/\`git show\` read one, and \`git cherry-pick\`/\`git merge\`
   bring it forward. Check the tree before you trust a memory of writing a file.
 EOF
-    elif [[ -n "$resume_session" ]] && [[ "$clone_reused" == true ]]; then
+    elif [[ "$resume_named" == true ]] && [[ "$clone_reused" == true ]]; then
         cat <<EOF
 
 ## This session is a continuation
@@ -4657,12 +4731,12 @@ EOF
 EOF
         fi
     elif [[ "$clone_reused" == true ]]; then
-        # --clone-dir is not claude-only, but --resume-session is: a pi or
-        # codex seat's second wake reuses this same workspace with no
-        # transcript to resume, and without this branch it gets nothing but
-        # the generic "throwaway, ephemeral" preamble above -- wrong for a
-        # workspace that persists and already carries an earlier wake's
-        # commits.
+        # --clone-dir has no session-resume-capability restriction, but
+        # $resume_named does: a seat with --clone-dir and no session request
+        # at all reuses this same workspace with no transcript to resume,
+        # and without this branch it gets nothing but the generic
+        # "throwaway, ephemeral" preamble above -- wrong for a workspace
+        # that persists and already carries an earlier wake's commits.
         cat <<EOF
 
 ## This workspace is not new
@@ -4945,7 +5019,17 @@ fs_build_sandbox_cmd() {
     # where it is created, above.
     out+=(--bind-rw "$outbox_dir")
     if [[ "$b_harness" == codex ]]; then
-        out+=(--bind-rw-at "$codex_sessions_dir" "$HOME/.codex/sessions")
+        # Bound to the caller-supplied durable store only on a leg that may
+        # resume or be resumed later (same session_mode/session_state gate
+        # as claude's own bind just below, and for the identical reason: a
+        # review, maintainer or fix leg's rollout would otherwise become the
+        # newest one in the store, and the next wake would resume it instead
+        # of the agent).
+        if [[ "$session_mode" != none && -n "$session_state" ]]; then
+            out+=(--bind-rw-at "$session_state" "$HOME/.codex/sessions")
+        else
+            out+=(--bind-rw-at "$codex_sessions_dir" "$HOME/.codex/sessions")
+        fi
     fi
     # claude's counterpart: the caller-supplied transcript store, bound at
     # the sandbox HOME's ~/.claude/projects by claude-sandboxed itself --
@@ -4995,8 +5079,22 @@ fs_build_sandbox_cmd() {
             # events.jsonl holds a real event stream. It changes what the
             # run reports, never what it does: the same print mode, the
             # same session, the same agent loop.
-            out_pi_session_dir="$clone_dir/.git/pi-session"
-            harness_cmd+=(--session-dir "$out_pi_session_dir" --mode json -p)
+            #
+            # With --session-state, pi gets no session_mode gate the way
+            # claude/codex do above: pi's --session-id is create-if-missing,
+            # so every wake -- coding, review, fix or maintainer -- that
+            # was handed a session-state bind is correctly resumable on its
+            # own id, with no "newest transcript" heuristic to protect from
+            # a wrong leg's rollout competing for it.
+            if [[ -n "$session_state" ]]; then
+                out+=(--bind-rw-at "$session_state" "$HOME/.pi/sessions")
+                out_pi_session_dir="$session_state"
+                harness_cmd+=(--session-dir "$out_pi_session_dir" \
+                    --session-id "$session_id_arg" --mode json -p)
+            else
+                out_pi_session_dir="$clone_dir/.git/pi-session"
+                harness_cmd+=(--session-dir "$out_pi_session_dir" --mode json -p)
+            fi
             ;;
         codex)
             # codex wants its credential as a FILE, and the sandbox's $HOME
@@ -5006,6 +5104,17 @@ fs_build_sandbox_cmd() {
             # looks. Writing it inside rather than binding it also leaves
             # codex free to rewrite it, which a read-only bind would
             # refuse.
+            #
+            # The resume splice runs first, replacing the trailing "-" (see
+            # fs_resolve_harness's codex arm) with "resume <id> -": same
+            # session_mode/resume_session gate as claude's --resume-session
+            # above, and the same first-coding-leg-only rule (session_mode
+            # is "resume" only there; a --refresh-at continuation gets
+            # "state", never "resume").
+            if [[ "$session_mode" == resume && -n "$resume_session" ]]; then
+                harness_cmd=("${harness_cmd[@]:0:${#harness_cmd[@]}-1}" \
+                    resume "$resume_session" -)
+            fi
             # shellcheck disable=SC2016  # a program for the sandbox's bash
             harness_cmd=(/bin/bash -c \
                 'umask 077; mkdir -p "$HOME/.codex"; printf %s "$CODEX_AUTH_JSON" > "$HOME/.codex/auth.json"; unset CODEX_AUTH_JSON; exec "$@"' \
@@ -5452,6 +5561,10 @@ started_at="$(date +%s)"
     # Empty unless --session-state was given; the runner reads it at the end
     # to name this run's session_id in summary.json.
     printf 'session_state=%q\n' "$session_state"
+    # Empty unless --session-id was given (harnesses with FS_HARNESS_ID_MODE
+    # "given", i.e. pi): the runner echoes it back as-is into
+    # summary.json's session_id, since there is nothing to discover.
+    printf 'session_id_given=%q\n' "$session_id_arg"
     printf 'rev_pi_session_dir=%q\n' "$rev_pi_session_dir"
     printf 'review_loop_cap=%q\n' "$review_loop_cap"
     # Every maintainer-tier variable the runner reads is emitted only when
@@ -7793,15 +7906,24 @@ removed_json=false
 (( removed )) && removed_json=true
 session_dir_json=""
 [[ -d "$run_dir/pi-session" ]] && session_dir_json="$run_dir/pi-session"
-# With --session-state, name the claude session a later run could resume.
-# The CLI files each transcript as <session-id>.jsonl under a per-project
-# directory of the store, and records nowhere which one is this run's, so
-# this is a documented heuristic: the newest by mtime. A --refresh-at chain
-# writes one transcript per leg and the newest is the leg a resume should
-# continue; only the coding legs are bound at all, so no review or
-# maintainer conversation competes for newest (see --session-state in the
-# header). Empty when the flag was not given, or when the store has no
-# transcript -- a session that died before writing one.
+# With --session-state, name the session a later run could resume. Which
+# harnesses get here at all, and whether the id is discovered or was given
+# up front, comes from fs_harness_session_caps (FS_HARNESS_ID_MODE), not a
+# harness-name check.
+#
+# For "discover" harnesses (claude, codex): the CLI files each transcript
+# under a per-project directory of the store, keyed by its own session id,
+# and records nowhere which one is this run's, so this is a documented
+# heuristic: the newest by mtime. A --refresh-at chain writes one transcript
+# per leg and the newest is the leg a resume should continue; only the
+# coding legs are bound at all, so no review or maintainer conversation
+# competes for newest (see --session-state in the header). Empty when the
+# flag was not given, or when the store has no transcript -- a session that
+# died before writing one.
+#
+# For "given" harnesses (pi): the id was supplied by the caller via
+# --session-id and pi's own create-if-missing behavior makes resume
+# implicit, so it is simply echoed back -- there is nothing to discover.
 #
 # The mtimes come from GNU stat, which fs_require_gnu_tools has already
 # proven is on PATH, and not from `find -printf`: that flag is GNU findutils
@@ -7811,18 +7933,46 @@ session_dir_json=""
 # single run, which is a silent no-op rather than a failure anyone can see.
 # find itself is given only -maxdepth/-name/-print0, which BSD find has.
 session_id_json=""
-if [[ -n "$session_state" && -d "$session_state" ]]; then
-    transcripts=()
-    while IFS= read -r -d '' transcript_file; do
-        transcripts+=("$transcript_file")
-    done < <(find "$session_state" -maxdepth 2 -name '*.jsonl' -type f \
-        -print0 2>/dev/null)
-    if (( ${#transcripts[@]} )); then
-        newest_transcript="$("$FS_STAT" -c '%Y %n' -- "${transcripts[@]}" \
-            | sort -rn | head -1)"
-        [[ -z "$newest_transcript" ]] \
-            || session_id_json="$(basename "${newest_transcript#* }" .jsonl)"
-    fi
+if [[ -n "$session_state" ]]; then
+    fs_harness_session_caps "$harness"
+    case "$FS_HARNESS_ID_MODE" in
+    given)
+        # pi: create-if-missing means the id is meaningful the moment
+        # --session-id was passed, whether or not the sandbox ever actually
+        # started -- there is nothing to discover.
+        session_id_json="$session_id_given"
+        ;;
+    discover)
+        if [[ -d "$session_state" ]]; then
+            transcripts=()
+            case "$harness" in
+            codex) find_maxdepth=5 ;;
+            *) find_maxdepth=2 ;;
+            esac
+            while IFS= read -r -d '' transcript_file; do
+                transcripts+=("$transcript_file")
+            done < <(find "$session_state" -maxdepth "$find_maxdepth" \
+                -name '*.jsonl' -type f -print0 2>/dev/null)
+            if (( ${#transcripts[@]} )); then
+                newest_transcript="$("$FS_STAT" -c '%Y %n' -- "${transcripts[@]}" \
+                    | sort -rn | head -1)"
+                if [[ -n "$newest_transcript" ]]; then
+                    stem="$(basename "${newest_transcript#* }" .jsonl)"
+                    if [[ "$harness" == codex ]]; then
+                        # codex rollout filenames are
+                        # rollout-<timestamp>-<uuid>.jsonl; a UUID is always
+                        # exactly 36 characters, so take the last 36 rather
+                        # than stripping a timestamp prefix whose format is
+                        # not this script's contract to track.
+                        session_id_json="${stem: -36}"
+                    else
+                        session_id_json="$stem"
+                    fi
+                fi
+            fi
+        fi
+        ;;
+    esac
 fi
 ended_at="$(date +%s)"
 
