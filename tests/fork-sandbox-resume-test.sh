@@ -788,6 +788,70 @@ else
     fi
 fi
 
+# R9e decision 5: a preset's review leg is the exact same review-loop
+# mechanism --review-loop drives above, just compiled from a fleet.yaml
+# preset: key instead of a bare CLI flag. Session binding must not care
+# which one produced review_loop_cap/review_prompt -- only the CODING leg
+# resumes/binds, never the leg a preset's pipeline adds after it. The
+# helper above (run_and_capture_argv) makes its own FORK_SANDBOX_CONFIG_DIR
+# per call with no presets/ subdirectory, so this test drives the launcher
+# directly instead, to seed one before the run.
+preset_home="$(mktmp_dir "$scratch/fs-resume-home.XXXXXX")"
+mkdir -p "$preset_home/.claude/skills"
+cp -R "$repo_dir/skills/code-review-portable" "$preset_home/.claude/skills/"
+preset_state="$(mktmp_dir "$scratch/fs-resume-state.XXXXXX")"
+preset_cfg="$(mktmp_dir "$scratch/fs-resume-cfg.XXXXXX")"
+mkdir -p "$preset_cfg/presets"
+cat > "$preset_cfg/presets/revcheck.yaml" <<'EOF'
+agents:
+  coder:
+    harness: claude
+  reviewer:
+    harness: claude
+pipeline:
+  - action: code
+    agent: coder
+  - action: review
+    repeat: 1
+    agent: reviewer
+EOF
+preset_sid=0123abcd-4567-89ab-cdef-0123456789ab
+preset_handoff_dir="$(mktmp_dir "$scratch/fs-resume-ho.XXXXXX")"
+preset_handoff="$preset_handoff_dir/handoff.md"
+printf 'do the task\n' > "$preset_handoff"
+preset_argv="$(mktemp "$scratch/fs-resume-argv.XXXXXX")"
+tmpdirs+=("$preset_argv")
+export FAKE_COMMIT_ON_CALL=1
+preset_out="$(HOME="$preset_home" PATH="$stub_bin:$PATH" \
+    FORK_SANDBOX_CONFIG_DIR="$preset_cfg" FAKE_ARGV_FILE="$preset_argv" \
+    timeout 120 "$launcher" --foreground --harness claude --preset revcheck \
+    --session-state "$preset_state" --resume-session "$preset_sid" \
+    "$(new_project "$preset_home")" "$preset_handoff" 2>&1)"
+preset_rc=$?
+unset FAKE_COMMIT_ON_CALL
+
+if (( preset_rc != 0 )); then
+    no "a preset's review leg ran" "run failed: $preset_out"
+elif [[ ! -f "$preset_argv.2" ]]; then
+    no "a preset's review leg ran" \
+        "only $(cat "$preset_argv.count" 2>/dev/null) leg(s) launched"
+else
+    ok "a preset's review leg ran"
+    if argv_has_flag_value "$preset_argv.1" --resume-session "$preset_sid"; then
+        ok "a preset's coding leg still resumes the caller's session"
+    else
+        no "a preset's coding leg still resumes the caller's session" \
+            "$(cat "$preset_argv.1")"
+    fi
+    if argv_has_word "$preset_argv.2" --session-state \
+        || argv_has_word "$preset_argv.2" --resume-session; then
+        no "a preset's review leg gets neither session flag" \
+            "$(cat "$preset_argv.2")"
+    else
+        ok "a preset's review leg gets neither session flag"
+    fi
+fi
+
 # ---------------------------------------------------------------------------
 printf '\n== summary.json: session_state and session_id ==\n'
 # ---------------------------------------------------------------------------

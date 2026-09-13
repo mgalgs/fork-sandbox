@@ -1333,6 +1333,66 @@ if [[ -n "${rd_c:-}" ]]; then
     fi
 fi
 
+# H. R9e decision (b): pipeline selection is mechanical, not a classifier --
+# fork-sandbox.sh's review loop already skips when the code leg's commit
+# range is empty, so a preset's review leg costs nothing on a wake that
+# committed nothing, and runs in full on one that did. This is the
+# fork-sandbox.sh-level test the brief's Section 3 calls for when the
+# postmaster-level stub cannot express whether a leg actually ran (see the
+# final report: postmaster backgrounds every spawn into tmux with no
+# --foreground seam, so a literal through-postmaster run cannot observe
+# this).
+cat > "$real_presets/skiptest.yaml" <<'EOF'
+agents:
+  coder:
+    harness: claude
+    model: haiku
+  reviewer:
+    harness: claude
+    model: opus
+pipeline:
+  - action: code
+    agent: coder
+  - action: review
+    repeat: 1
+    agent: reviewer
+EOF
+
+# H1: the code leg commits nothing -> the review leg never runs at all.
+prep_stub 'noop'
+rd_h1="$(run_stubbed --preset skiptest \
+    --branch "sandbox-test-skiptest-noop-$$")" && tmpdirs+=("$rd_h1")
+if [[ -n "${rd_h1:-}" ]]; then
+    check "no-commit preset wake: only the code leg ran" "1" "$(cat "$count")"
+    if [[ -e "$rd_h1/events-review-1.jsonl" ]]; then
+        no "no-commit preset wake: no review-leg events file" \
+            "$(find "$rd_h1" -maxdepth 1 -name 'events-*' 2>/dev/null | tr '\n' ' ')"
+    else
+        ok "no-commit preset wake: no review-leg events file"
+    fi
+    contains "no-commit preset wake: summary records the skip and why" \
+        "$(cat "$rd_h1/summary.txt")" \
+        "review:    skipped -- the session committed nothing, so there is nothing to review"
+fi
+
+# H2: the code leg commits -> the review leg runs (approved, one iteration).
+prep_stub $'commit\napproved'
+rd_h2="$(run_stubbed --preset skiptest \
+    --branch "sandbox-test-skiptest-commit-$$")" && tmpdirs+=("$rd_h2")
+if [[ -n "${rd_h2:-}" ]]; then
+    check "committing preset wake: code and review legs both ran" "2" \
+        "$(cat "$count")"
+    if [[ -s "$rd_h2/events-review-1.jsonl" ]]; then
+        ok "committing preset wake: review-leg events file exists"
+    else
+        no "committing preset wake: review-leg events file exists" \
+            "$(find "$rd_h2" -maxdepth 1 -name 'events-*' 2>/dev/null | tr '\n' ' ')"
+    fi
+    contains "committing preset wake: summary records the approved loop" \
+        "$(cat "$rd_h2/summary.txt")" \
+        "review:    1 iteration(s), findings 0; loop exit: approved"
+fi
+
 printf '\n== sandbox-run-log.py: the preset definition in the archive ==\n'
 
 if [[ -n "${rd_a:-}" && -x "$run_log" ]]; then
