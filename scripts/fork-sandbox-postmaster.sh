@@ -134,11 +134,18 @@
 # comes from other agents reading the reply on the thread. A seat WITH a
 # preset gets `--preset <name>` added to spawn_args (see below); its
 # review/fix/maintainer legs, if any, run inside that one
-# fork-sandbox.sh invocation, before the reply is posted -- this is a
-# division of labor, not a replacement: the in-run pipeline reviews the
-# DIFF before the reply goes out, the fleet still reviews the POSITION on
-# the thread, on every seat, preset or not. Which legs a preset's
-# pipeline actually runs is mechanical, not decided here or by the R9c
+# fork-sandbox.sh invocation, before the postmaster harvests the run's
+# outbox -- this is a division of labor, not a replacement: the in-run
+# pipeline reviews the DIFF, the fleet still reviews the POSITION on the
+# thread, on every seat, preset or not. It is a division in TIME, not
+# content: the coding leg writes its `mail-*.md` reply first, and no
+# later leg is given that file or told to touch it, so the reply the
+# thread receives is the coding leg's own account, unrevised, even when
+# a later leg amends or overrides what it committed -- read the coding
+# leg's reply as "what I did," not as "what this pipeline landed."
+#
+# Which legs a preset's pipeline actually runs is mechanical, not
+# decided here or by the R9c
 # triage classifier: fork-sandbox.sh's review and maintainer loops skip
 # on an empty commit range (a wake that only replied with prose has
 # nothing to review), so a mail-only wake on a preset seat still costs

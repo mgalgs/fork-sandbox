@@ -182,7 +182,7 @@ content.
 `~/.config/fork-sandbox/personas`): a markdown body — the agent's
 standing instructions, opaque to the registry — with optional YAML
 frontmatter carrying `description`, `harness`, `model`, `network`
-(`pinned` or `sealed`), `thinking`, `wake-on-cc` and `triage`.
+(`pinned` or `sealed`), `thinking`, `wake-on-cc`, `triage` and `preset`.
 
 ```markdown
 ---
@@ -213,6 +213,9 @@ agents:
   notifier:
     handler: exec              # a deterministic script seat, not an LLM
     command: notify-slack       # bare name, resolved under $FORK_SANDBOX_HANDLERS_DIR
+  archivist:
+    preset: nightly             # names $PRESETS_DIR/nightly.yaml, same
+                                 # resolution chain as fork-sandbox.sh's --preset
 lists:
   crew:
     members: [reviewer, scribe, watcher]
@@ -223,7 +226,7 @@ lists:
 `$FORK_SANDBOX_HANDLERS_DIR`, default `~/.config/fork-sandbox/handlers`,
 and required to exist and be executable both at `fleet check` time and
 again at wake time) is then required, and none of
-`harness`/`model`/`network`/`thinking`/`triage`/`persona`/`refresh-at`
+`harness`/`model`/`network`/`thinking`/`triage`/`persona`/`refresh-at`/`preset`
 may be set on the same agent — those tune an LLM seat, which a handler is
 not. `wake-on-cc` still applies: it governs whether the seat wakes on a
 Cc at all, independent of whether the wake is an LLM spawn or a handler
@@ -231,6 +234,16 @@ run. A handler seat is invoked synchronously, inline in the postmaster's
 deliver pass — see `fork-sandbox-postmaster.sh --help` for the wake
 contract (`FS_HANDLER_*` environment, stdin, timeout, and reply harvest,
 which is identical to an LLM wake's).
+
+A `preset:` override (fleet.yaml or persona frontmatter, same precedence
+as every other LLM-seat field) names a
+`$PRESETS_DIR/<name>.yaml` (default `~/.config/fork-sandbox/presets`,
+overridable via `$FORK_SANDBOX_PRESETS_DIR` or `$FORK_SANDBOX_CONFIG_DIR`
+— the same chain `fork-sandbox.sh`'s own `--preset` flag resolves
+against) that the postmaster passes as `--preset <name>` at spawn time.
+`check` requires the named file to exist; it does not validate the
+preset's own contents (`fork-sandbox.sh` does that at spawn time). See
+docs/presets.md for the preset file format.
 
 Precedence per field is **fleet.yaml entry, then persona frontmatter,
 then empty** — `wake-on-cc` included, so a fleet.yaml override wins over
@@ -286,10 +299,10 @@ absence of the key entirely means no Cc wake is ever gated.
 
 ```bash
 fork-sandbox fleet check              # validate everything, report every error
-fork-sandbox fleet resolve <name>     # eleven lines: harness, model, thinking,
+fork-sandbox fleet resolve <name>     # twelve lines: harness, model, thinking,
                                       # network, persona-path, description,
                                       # wake-on-cc, refresh-at, triage,
-                                      # handler, command
+                                      # preset, handler, command
 fork-sandbox fleet resolve-triage     # two lines: harness, model, for the
                                       # top-level triage: block (see above);
                                       # every line empty when there is none
@@ -303,7 +316,7 @@ fork-sandbox fleet teardown --all     # destroy persistent (thread, agent)
 
 `check` accumulates every error across the fleet file and every persona
 it declares — addressed by path, like `agents.reviewer.modle` — rather
-than stopping at the first. `resolve` always prints exactly eleven lines;
+than stopping at the first. `resolve` always prints exactly twelve lines;
 an unconfigured field is an empty line, never a missing one.
 
 `teardown` is how an operator reclaims a seat's persistent state (the

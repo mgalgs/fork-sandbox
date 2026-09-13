@@ -251,9 +251,15 @@ cmd_check() {
     # command existing and being executable, and a preset seat's preset
     # file existing, are checked here, once the schema itself (incl. the
     # bare-name shapes and the handler/preset mutual-exclusion refusal)
-    # is known good. resolve_with_dump, not fleet_read_agent, because
-    # `preset` (unlike handler/command) can come from persona frontmatter
-    # -- the fully resolved value is what a spawn will actually use.
+    # is known good. fleet_read_agent (dump-only, no subprocess), not
+    # resolve_with_dump, for every agent: handler/command are
+    # fleet.yaml-only (no persona fallback, see the header's "Handler
+    # seats" paragraph) so the dump always has the final answer for
+    # them, and a fleet.yaml-level preset is likewise final without
+    # consulting the persona at all. Only when fleet.yaml leaves preset
+    # unset do we need the frontmatter to learn whether the persona sets
+    # one -- so the frontmatter parser only runs for that narrower set
+    # of agents, not once per agent in the fleet.
     local rc=0
     local dump; dump="$(fleet_dump)"
     local -a agent_names=()
@@ -262,16 +268,11 @@ cmd_check() {
         [[ -n "$n" ]] && agent_names+=("$n")
     done < <(fleet_all_agent_names "$dump")
 
-    local name harness model thinking network persona description
-    local wake_on_cc refresh_at triage preset handler command
-    local handler_path preset_path
+    local name preset persona_path handler_path preset_path
     for name in "${agent_names[@]}"; do
-        { read -r harness; read -r model; read -r thinking; read -r network; \
-          read -r persona; read -r description; read -r wake_on_cc; read -r refresh_at; \
-          read -r triage; read -r preset; read -r handler; read -r command; } \
-            < <(resolve_with_dump "$dump" "$name")
-        if [[ "$handler" == exec ]]; then
-            handler_path="$HANDLERS_DIR/$command"
+        fleet_read_agent "$dump" "$name"
+        if [[ "$fleet_handler" == exec ]]; then
+            handler_path="$HANDLERS_DIR/$fleet_command"
             if [[ ! -e "$handler_path" ]]; then
                 echo "Error: agents.$name.command: handler '$handler_path' does not exist." >&2
                 rc=1
@@ -279,9 +280,19 @@ cmd_check() {
                 echo "Error: agents.$name.command: handler '$handler_path' is not executable." >&2
                 rc=1
             fi
-        elif [[ -n "$preset" ]]; then
+            continue
+        fi
+        preset="$fleet_preset"
+        if [[ -z "$preset" ]]; then
+            persona_path="$PERSONAS_DIR/${fleet_persona:-$name.md}"
+            if [[ -f "$persona_path" ]]; then
+                fleet_read_frontmatter "$persona_path"
+                preset="$fm_preset"
+            fi
+        fi
+        if [[ -n "$preset" ]]; then
             preset_path="$PRESETS_DIR/$preset.yaml"
-            if [[ ! -e "$preset_path" ]]; then
+            if [[ ! -f "$preset_path" ]]; then
                 echo "Error: agents.$name.preset: preset '$preset' does not exist at '$preset_path'." >&2
                 rc=1
             fi

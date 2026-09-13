@@ -780,6 +780,27 @@ check "preset: nonexistent preset fails check" "1" "$preset_rc"
 contains "preset: nonexistent preset error names the agent path" "$preset_err" "agents.riffler.preset"
 contains "preset: nonexistent preset error names the missing file" "$preset_err" "$PRESETS_TEST_DIR/nonexistent.yaml"
 
+# A directory sitting at <name>.yaml must fail `check` exactly like a missing
+# file: fork-sandbox.sh's own --preset resolution tests `-f`, and `check` has
+# to refuse the same shape or a seat can pass `fleet check` here and then
+# fail its first wake at launch.
+mkdir -p "$PRESETS_TEST_DIR/dirpreset.yaml"
+cat > "$FORK_SANDBOX_FLEET_FILE" <<'EOF'
+agents:
+  riffler:
+    preset: dirpreset
+  tuner: {}
+  scout:
+    harness: pi
+lists:
+  jam-band:
+    members: [riffler, tuner, scout]
+EOF
+preset_dir_err="$("$fleet" check 2>&1)"; preset_dir_rc=$?
+check "preset: a directory at <name>.yaml fails check" "1" "$preset_dir_rc"
+contains "preset: directory-preset error names the agent path" "$preset_dir_err" "agents.riffler.preset"
+rm -rf "$PRESETS_TEST_DIR/dirpreset.yaml"
+
 printf '%s\n' "$saved_fleet_for_preset" > "$FORK_SANDBOX_FLEET_FILE"
 unset FORK_SANDBOX_PRESETS_DIR
 
