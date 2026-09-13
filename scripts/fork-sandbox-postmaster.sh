@@ -127,18 +127,40 @@
 # THE WAKE
 #
 # Spawned via `fork-sandbox.sh --branch <b> --harness <h> [--model <m>]
-# [--network <n>] [--pi-args "--thinking <level>"] <project> <handoff>`,
-# with NO --review-loop and NO --maintainer-loop: the fleet IS the review
-# here, scrutiny comes from other agents reading the reply on the thread.
-# Seat (harness/model/thinking/network) comes from `fleet resolve <agent>`;
-# unset harness/network default to claude/pinned. An unset model defaults
-# to sonnet ONLY on the claude harness -- "sonnet" is a claude alias, so
+# [--network <n>] [--pi-args "--thinking <level>"] [--preset <p>]
+# <project> <handoff>`. A seat with no `preset:` (fleet resolve's 10th
+# line) spawns with NO --review-loop and NO --maintainer-loop, exactly as
+# before presets existed: the fleet IS the review for that seat, scrutiny
+# comes from other agents reading the reply on the thread. A seat WITH a
+# preset gets `--preset <name>` added to spawn_args (see below); its
+# review/fix/maintainer legs, if any, run inside that one
+# fork-sandbox.sh invocation, before the reply is posted -- this is a
+# division of labor, not a replacement: the in-run pipeline reviews the
+# DIFF before the reply goes out, the fleet still reviews the POSITION on
+# the thread, on every seat, preset or not. Which legs a preset's
+# pipeline actually runs is mechanical, not decided here or by the R9c
+# triage classifier: fork-sandbox.sh's review and maintainer loops skip
+# on an empty commit range (a wake that only replied with prose has
+# nothing to review), so a mail-only wake on a preset seat still costs
+# only the one coding leg. Seat (harness/model/thinking/network) comes
+# from `fleet resolve <agent>`; unset harness/network default to
+# claude/pinned. An unset model defaults to sonnet ONLY on the claude
+# harness -- "sonnet" is a claude alias, so
 # defaulting it for pi/codex would hand a bogus model to a harness that
 # does not know the name (codex) or defeat fork-sandbox.sh's own
 # model-less-pi guard and a sealed seat's model discovery (pi); those
 # harnesses get no --model flag at all when unset, so fork-sandbox.sh's
 # own resolution/refusal applies exactly as it would for any other caller.
-# thinking is passed as --pi-args only when the harness is pi. Branch name
+# thinking is passed as --pi-args only when the harness is pi. --preset,
+# when the seat has one, is placed first in spawn_args -- documentation
+# only, since fork-sandbox.sh applies the seat's own harness/model/
+# network/thinking flags over whatever the preset sets, key by key,
+# regardless of argv order (see docs/presets.md's "Flags override, key by
+# key"); a preset can shape a pipeline's review/maintainer legs but never
+# override the coding leg's own seat identity. Only the coding leg binds
+# session state (fork-sandbox.sh's own resume rule, see STATE's RESUMED
+# field below) -- a preset's review/fix/maintainer legs never touch the
+# seat's session id, resumed or not. Branch name
 # is sbx-mail-<first8-of-thread-id>-<agent>-<seq>, seq counting from a
 # thread-lifetime spawn sequence that is NEVER reset (unlike the budget
 # counter rule 1 resets on an operator message -- see STATE below), so a
@@ -336,7 +358,15 @@
 #   needs-operator/<thread-id>     flag file; content is the reason
 #   spawns/<thread-id>             one line appended per spawn, reset to
 #                                   empty by rule 1 -- line count is the
-#                                   thread's BUDGET count (rule 3)
+#                                   thread's BUDGET count (rule 3). A
+#                                   preset seat's review/fix/maintainer
+#                                   legs never add lines here: they run
+#                                   inside the one fork-sandbox.sh
+#                                   invocation the coding leg's own single
+#                                   spawn already accounted for, not as
+#                                   separate postmaster-spawned wakes --
+#                                   one wake is one budget line however
+#                                   many legs its pipeline runs
 #   triaged/<thread-id>             one line per Cc candidate the triage
 #                                   classifier skipped: message id, agent,
 #                                   UTC timestamp (date -u) -- a skip is a
