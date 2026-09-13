@@ -400,6 +400,35 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+printf '\n== fork-sandbox.sh: --clone-dir reuse fetches forward ==\n'
+# ---------------------------------------------------------------------------
+
+# A ref that lands in the origin AFTER a seat workspace was cloned (here:
+# after both wakes above) must become visible as origin/<name> in the SAME
+# workspace on its very next wake -- a reused clone's remote-tracking refs
+# are exactly as stale as its last fetch, and the reuse path must re-fetch
+# every time, not just on first clone.
+git -C "$flow_proj" branch fs-clonedir-new-origin-branch >/dev/null 2>&1
+
+third_result="$(run_and_capture "$flow_home" "$flow_proj" \
+    --branch fs-clonedir-b3 --clone-dir "$flow_clone")"
+third_rc=$?
+register_paths "$third_result"
+
+if (( third_rc == 0 )); then
+    ok "third wake: launch succeeds reusing --clone-dir again"
+else
+    no "third wake: launch succeeds reusing --clone-dir again" "$third_result"
+fi
+if git -C "$flow_clone" rev-parse --verify --quiet \
+        origin/fs-clonedir-new-origin-branch >/dev/null; then
+    ok "third wake: a branch added to the origin after cloning is fetched on reuse"
+else
+    no "third wake: a branch added to the origin after cloning is fetched on reuse" \
+        "origin/fs-clonedir-new-origin-branch did not resolve in $flow_clone"
+fi
+
+# ---------------------------------------------------------------------------
 printf '\n== fork-sandbox.sh: --clone-dir edge cases ==\n'
 # ---------------------------------------------------------------------------
 
