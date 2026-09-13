@@ -319,7 +319,7 @@ for it.
    other reply.
 2. **Hops gate.** `X-Hops == 0` means no wakes from M. Flag T
    needs-operator, reason `hops exhausted at <message-id>`.
-3. **Thread budget.** Spawns so far ≥ budget (default 12,
+3. **Thread budget.** Spawns so far ≥ budget (default 32,
    `$FORK_SANDBOX_THREAD_BUDGET`) means no wake. Flag T, reason
    `thread budget <n> exhausted`. This is checked once per message, not
    once per candidate: a message addressing four agents with one slot
@@ -377,7 +377,10 @@ fine, but say on-thread if one shaped your reply); and — importantly —
 team, not obliged to speak every time it is woken. The kit itself lives
 at `share/fleet-kit.md`, overridable wholesale (no merging) at
 `<prompts-dir>/fleet-kit.md` — the same prompts directory described in
-[prompt-overlays.md](prompt-overlays.md).
+[prompt-overlays.md](prompt-overlays.md). `{name}`, `{operator}` and
+`{via}` in the kit text are substituted before embedding; an overlay
+that drops `{name}` fails `postmaster deliver` at startup, since that
+placeholder is the only way a handoff tells the agent its own address.
 
 ### Replies
 
@@ -573,7 +576,7 @@ marker**, so strip leading whitespace first, then test for `> `.
 | `FORK_SANDBOX_MAIL_ROOT` | `/var/tmp/claude-scratch/agent-mail` | store, router, renderer |
 | `FORK_SANDBOX_FLEET_FILE` | `~/.config/fork-sandbox/fleet.yaml` | registry |
 | `FORK_SANDBOX_PERSONAS_DIR` | `~/.config/fork-sandbox/personas` | registry |
-| `FORK_SANDBOX_THREAD_BUDGET` | `12` | router (rule 3) |
+| `FORK_SANDBOX_THREAD_BUDGET` | `32` | router (rule 3) |
 | `FORK_SANDBOX_POSTMASTER_INTERVAL` | `15` (seconds) | router loop |
 | `FORK_SANDBOX_POSTMASTER_WAKE_DEAD_GRACE` | see `--help` | dead-wake detection |
 

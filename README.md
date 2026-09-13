@@ -451,8 +451,9 @@ The shape of it:
   is a thread whose recipients are its participants; a wake's world is
   the thread it was woken for.
 - **Stop rules from day one** — an `X-Hops` counter, a per-thread spawn
-  budget, and reply-only-when-in-`To` — so a conversation cannot run
-  away. The operator re-arms a stalled thread just by mailing into it.
+  budget, and a Cc-only wake replying only when something genuinely
+  matters — so a conversation cannot run away. The operator re-arms a
+  stalled thread just by mailing into it.
 - **Real email is the model**, down to `> ` quoting that nests to `> > `.
   That is also the security boundary: header and separator lines are the
   only unquoted lines the renderer emits, so no message body can forge a

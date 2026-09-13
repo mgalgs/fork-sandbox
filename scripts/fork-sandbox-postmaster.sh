@@ -125,7 +125,7 @@
 # The generated handoff embeds everything the sandbox needs and nothing
 # it can reach on its own: the fleet kit (share/fleet-kit.md, overlay-
 # overridable at <prompts-dir>/fleet-kit.md -- see pm_kit_path) with
-# {name}/{operator} substituted, plus the persona's markdown
+# {name}/{operator}/{via} substituted, plus the persona's markdown
 # body (frontmatter stripped), the thread section, the triggering
 # message-id called out, the reply-file format, the transparency norm
 # (private side-channels are fine but say so on-thread if they shaped your
@@ -601,8 +601,8 @@ pm_require_kit() {
 }
 
 pm_write_handoff() {
-    local out="$1" agent="$2" persona_path="$3" tid="$4" trigger_mid="$5"
-    local render_rc=0 kit_path kit_text via via_label
+    local out="$1" agent="$2" persona_path="$3" tid="$4" trigger_mid="$5" via="$6"
+    local render_rc=0 kit_path kit_text via_label
     kit_path="$(pm_kit_path)" || {
         echo "Error: postmaster: fleet kit missing (checked loudly at deliver" >&2
         echo "startup; this should not be reachable mid-run)." >&2
@@ -617,7 +617,6 @@ pm_write_handoff() {
     # happens to run the postmaster.
     kit_text="${kit_text//\{name\}/$agent}"
     kit_text="${kit_text//\{operator\}/operator}"
-    via="$(pm_wake_via "$trigger_mid" "$agent")"
     via_label="Cc"
     [[ "$via" == to ]] && via_label="To"
     kit_text="${kit_text//\{via\}/$via_label}"
@@ -796,14 +795,13 @@ pm_deliver_live() {
 }
 
 # Determines whether $agent's wake for $mid was addressed via To: or only
-# via Cc: (list expansion included) -- ledger provenance for the run's
-# VIA field (see STATE above), so the dogfood can count observer wakes.
-# Recomputed here from $mid's own To: header, independent of whatever
-# pm_process_message decided when routing it, rather than threaded through
-# every caller (pm_wake_or_pend, pm_followup_wake): this is the one place
-# that needs it, and a follow-up wake for a message that was only ever
-# Cc'd correctly still ledgers as cc since the source of truth is the
-# message itself, not the caller's path to it.
+# via Cc: (list expansion included) -- feeds both the handoff's {via} and
+# the run ledger's VIA field (see STATE above), so the dogfood can count
+# observer wakes. Computed once per spawn, in pm_spawn_wake, from $mid's
+# own To: header, independent of whatever pm_process_message decided when
+# routing it: a follow-up wake for a message that was only ever Cc'd
+# correctly still ledgers as cc since the source of truth is the message
+# itself, not the caller's path to it.
 pm_wake_via() {
     local mid="$1" agent="$2" f to name
     f="$(pm_find_by_id "$mid" || true)"
@@ -848,9 +846,12 @@ pm_spawn_wake() {
     seq="$(pm_next_seq "$tid")"
     local branch="sbx-mail-${tid:0:8}-${agent}-${seq}"
 
+    local via
+    via="$(pm_wake_via "$mid" "$agent")"
+
     mkdir -p -- "$HANDOFFS"
     local handoff_file="$HANDOFFS/$run_id.md"
-    if ! pm_write_handoff "$handoff_file" "$agent" "$persona_path" "$tid" "$mid"; then
+    if ! pm_write_handoff "$handoff_file" "$agent" "$persona_path" "$tid" "$mid" "$via"; then
         pm_flag "$tid" "handoff render failed for $agent: $mid"
         return 0
     fi
@@ -903,9 +904,6 @@ pm_spawn_wake() {
         pm_flag "$tid" "spawn failed for $agent: $mid"
         return 0
     fi
-
-    local via
-    via="$(pm_wake_via "$mid" "$agent")"
 
     mkdir -p -- "$RUNS"
     {

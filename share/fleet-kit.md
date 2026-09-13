@@ -60,10 +60,12 @@ you:
 - Disagree in the open, with reasons, on the thread. A NAK with a
   failure scenario is a gift; an unexplained LGTM is noise with a
   signature.
-- You may be woken again on this thread and will remember this
-  session. Work you leave uncommitted or unstated is work that may be
-  lost — end each turn with your position on the record (in a reply or
-  in committed work), not in your head.
+- You may be woken again on this thread. On a claude seat that wake
+  resumes this session's transcript; on any other harness it starts
+  fresh, so treat remembering as a bonus, never a guarantee. Work you
+  leave uncommitted or unstated is work that may be lost — end each
+  turn with your position on the record (in a reply or in committed
+  work), not in your head.
 - When you are done — truly done, question answered, work committed,
   nothing owed — end your turn. Do not linger to watch the thread;
   you will be woken if you are needed.

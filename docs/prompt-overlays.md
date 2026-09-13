@@ -144,7 +144,11 @@ repo-shipped fallback lookup here the way there is for the four leg
 prompts, since the postmaster falls back to its own repo copy
 (`share/fleet-kit.md`) instead. An overlay here replaces that file
 wholesale, no merging; see [agent-mail.md](agent-mail.md#the-wake) for
-what it does.
+what it does. The postmaster substitutes `{name}`, `{operator}` and
+`{via}` into the text before embedding it, and refuses to start
+(`postmaster deliver` exits 1) if an overlay drops `{name}` — that
+placeholder is how a handoff tells the agent its own address, so write
+any custom `fleet-kit.md` with at least `{name}` still in it.
 
 There is no glob or family matching (`qwen*.md` for a whole model family is
 tempting, but the override order gets fiddly fast, and this project prefers
