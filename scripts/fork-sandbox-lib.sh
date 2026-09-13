@@ -988,6 +988,86 @@ fs_resolve_pi() {
     return 0
 }
 
+# Per-harness session-resume capabilities, as a table rather than a scatter of
+# harness-name checks: fork-sandbox.sh and the postmaster both consult this
+# instead of ever testing a harness name themselves for session-resume logic.
+# $1 is the harness name -- "claude", "codex" or "pi". "pi-local" (the
+# sealed-network dispatch key fs_resolve_harness derives from harness "pi") is
+# accepted too and treated identically to "pi": it is the same CLI, the same
+# --session-dir/--session-id contract, reached through agent-sandboxed instead
+# of a direct exec, and callers that already have "pi-local" in hand (inside
+# fs_build_sandbox_cmd) should not have to re-derive "pi" from it first.
+#
+# Fills three globals rather than printing to stdout, exactly like
+# FS_PI_ROOT/FS_PI_ARGV0 above -- a caller wants several of them at once, and
+# command substitution cannot hand back an array.
+#
+#   FS_HARNESS_RESUMABLE  true or false.
+#   FS_HARNESS_SESSION_ROOT
+#                         the in-sandbox bind destination, as a literal
+#                         string with an UNEXPANDED "$HOME" token -- e.g.
+#                         '$HOME/.claude/projects', not the expansion of any
+#                         particular $HOME. sandbox-backend-bwrap sets the
+#                         sandboxed process's HOME to the exact value of the
+#                         invoking script's own $HOME (--setenv HOME "$HOME",
+#                         see sandbox-backend-bwrap), so every consumer of
+#                         this string -- fork-sandbox.sh itself for codex,
+#                         claude-sandboxed for claude, agent-sandboxed for pi
+#                         -- expands the literal "$HOME" against ITS OWN
+#                         $HOME and reaches the same path the sandboxed
+#                         process sees. None of them may expand it here: this
+#                         function may be called from a context whose $HOME
+#                         is irrelevant to the sandbox (there is none today,
+#                         but nothing pins that). Empty when not resumable.
+#   FS_HARNESS_ID_MODE    "discover" -- the id is read back out of the bound
+#                         directory at run end (claude: newest transcript's
+#                         stem; codex: the uuid suffix of the newest rollout
+#                         file's name) -- or "given" -- the caller supplies
+#                         the id up front and the CLI's own create-if-missing
+#                         behavior makes resume implicit, so there is nothing
+#                         to discover (pi only). Empty when not resumable.
+fs_harness_session_caps() {
+    local harness="$1"
+    [[ "$harness" == pi-local ]] && harness=pi
+
+    # shellcheck disable=SC2034  # read by the sourcing scripts
+    FS_HARNESS_RESUMABLE=false
+    # shellcheck disable=SC2034  # read by the sourcing scripts
+    FS_HARNESS_SESSION_ROOT=""
+    # shellcheck disable=SC2034  # read by the sourcing scripts
+    FS_HARNESS_ID_MODE=""
+    case "$harness" in
+    claude)
+        # shellcheck disable=SC2034  # read by the sourcing scripts
+        FS_HARNESS_RESUMABLE=true
+        # shellcheck disable=SC2034,SC2016  # literal $HOME token, see header above
+        FS_HARNESS_SESSION_ROOT='$HOME/.claude/projects'
+        # shellcheck disable=SC2034  # read by the sourcing scripts
+        FS_HARNESS_ID_MODE="discover"
+        ;;
+    codex)
+        # shellcheck disable=SC2034  # read by the sourcing scripts
+        FS_HARNESS_RESUMABLE=true
+        # shellcheck disable=SC2034,SC2016  # literal $HOME token, see header above
+        FS_HARNESS_SESSION_ROOT='$HOME/.codex/sessions'
+        # shellcheck disable=SC2034  # read by the sourcing scripts
+        FS_HARNESS_ID_MODE="discover"
+        ;;
+    pi)
+        # shellcheck disable=SC2034  # read by the sourcing scripts
+        FS_HARNESS_RESUMABLE=true
+        # shellcheck disable=SC2034,SC2016  # literal $HOME token, see header above
+        FS_HARNESS_SESSION_ROOT='$HOME/.pi/sessions'
+        # shellcheck disable=SC2034  # read by the sourcing scripts
+        FS_HARNESS_ID_MODE="given"
+        ;;
+    *)
+        # Not resumable -- e.g. a future harness this table has no entry for
+        # yet. Leave the false/empty defaults set above.
+        ;;
+    esac
+}
+
 # The sandbox backend: the executable that actually isolates a run.
 # FORK_SANDBOX_BACKEND names it and defaults to bwrap, so the resolved name is
 # sandbox-backend-$FORK_SANDBOX_BACKEND. PATH comes first, which is how a
