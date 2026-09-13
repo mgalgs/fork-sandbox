@@ -285,6 +285,9 @@ cmd_check() {
             if [[ ! -e "$handler_path" ]]; then
                 echo "Error: agents.$name.command: handler '$handler_path' does not exist." >&2
                 rc=1
+            elif [[ ! -f "$handler_path" ]]; then
+                echo "Error: agents.$name.command: handler '$handler_path' is not a regular file." >&2
+                rc=1
             elif [[ ! -x "$handler_path" ]]; then
                 echo "Error: agents.$name.command: handler '$handler_path' is not executable." >&2
                 rc=1

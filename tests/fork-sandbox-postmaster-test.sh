@@ -2636,6 +2636,72 @@ export FORK_SANDBOX_FLEET_FILE="$SAVED_FLEET_FILE"
 export FORK_SANDBOX_PERSONAS_DIR="$SAVED_PERSONAS_DIR"
 
 # ============================================================
+printf '\n== handler command must be a regular file (wake-time gate) ==\n'
+# ============================================================
+# `fleet check` (tested in fork-sandbox-fleet-test.sh) and deliver's own
+# startup fleet check (pm_require_fleet_check) both already refuse a
+# directory as `command:` before any message would ever route -- so the
+# only way to exercise pm_exec_wake's OWN re-check is the same race its
+# path-separator re-check already documents: the handler file changing
+# on disk after the once-at-startup check has already passed. This runs
+# deliver in loop mode (not --once, which re-runs the startup check every
+# call) and swaps the handler command from a real file to a directory
+# during the interval between two passes, so the startup check -- which
+# already ran once and passed -- never sees the swap, but the next
+# wake-time check does.
+
+SAVED_FLEET_FILE="$FORK_SANDBOX_FLEET_FILE"
+SAVED_PERSONAS_DIR="$FORK_SANDBOX_PERSONAS_DIR"
+
+new_root SWAP_HANDLERS_DIR
+export FORK_SANDBOX_HANDLERS_DIR="$SWAP_HANDLERS_DIR"
+printf '#!/bin/sh\n' > "$SWAP_HANDLERS_DIR/swap-handler"
+chmod +x "$SWAP_HANDLERS_DIR/swap-handler"
+
+new_root SWAP_PERSONAS_DIR
+export FORK_SANDBOX_PERSONAS_DIR="$SWAP_PERSONAS_DIR"
+new_root SWAP_FLEET_DIR
+export FORK_SANDBOX_FLEET_FILE="$SWAP_FLEET_DIR/fleet.yaml"
+cat > "$FORK_SANDBOX_FLEET_FILE" <<'EOF'
+agents:
+  swapseat:
+    handler: exec
+    command: swap-handler
+EOF
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+
+SWAP_LOG="$work/swap-deliver.log"
+FORK_SANDBOX_POSTMASTER_INTERVAL=3 "$postmaster" deliver --project "$PROJECT_DIR" \
+    >"$SWAP_LOG" 2>&1 &
+swap_pid=$!
+
+# Generous enough that the startup fleet check (a subprocess launch of
+# fleet.sh) and the empty first pass have certainly both finished before
+# the swap below lands -- if either is still mid-flight when the swap
+# happens, the startup check would see the directory too and this test
+# would be exercising the wrong checkpoint.
+sleep 1
+rm -f -- "$SWAP_HANDLERS_DIR/swap-handler"
+mkdir -p -- "$SWAP_HANDLERS_DIR/swap-handler"
+
+mid="$(send_msg '@carol' '@swapseat' 'Swap' 'trigger')"
+tid="$(thread_of "$mid")"
+
+swap_flag_file="$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid"
+for _ in $(seq 1 100); do [[ -e "$swap_flag_file" ]] && break; sleep 0.1; done
+contains "wake-time gate: a command swapped to a directory mid-run is refused, naming the handler" \
+    "$(cat "$swap_flag_file" 2>/dev/null)" "is not a regular file"
+
+kill "$swap_pid" 2>/dev/null || true
+wait "$swap_pid" 2>/dev/null || true
+
+unset FORK_SANDBOX_HANDLERS_DIR
+export FORK_SANDBOX_FLEET_FILE="$SAVED_FLEET_FILE"
+export FORK_SANDBOX_PERSONAS_DIR="$SAVED_PERSONAS_DIR"
+
+# ============================================================
 printf '\n== --kill-after 10 on every FS_TIMEOUT invocation ==\n'
 # ============================================================
 # A child that ignores SIGTERM must still die -- `timeout` alone reports

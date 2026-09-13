@@ -1241,6 +1241,10 @@ pm_exec_wake() {
         pm_flag "$tid" "handler '$handler_path' for $agent does not exist: $mid"
         return 0
     fi
+    if [[ ! -f "$handler_path" ]]; then
+        pm_flag "$tid" "handler '$handler_path' for $agent is not a regular file: $mid"
+        return 0
+    fi
     if [[ ! -x "$handler_path" ]]; then
         pm_flag "$tid" "handler '$handler_path' for $agent is not executable: $mid"
         return 0

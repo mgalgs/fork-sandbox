@@ -353,6 +353,15 @@ agents:
     command: unexecutable-handler
 EOF
 
+mkdir -p "$HANDLERS_TEST_DIR/dir-handler"
+bad "a handler command that is a directory is refused" \
+    "is not a regular file" <<'EOF'
+agents:
+  riffler:
+    handler: exec
+    command: dir-handler
+EOF
+
 printf '#!/bin/sh\n' > "$HANDLERS_TEST_DIR/real-handler"
 chmod +x "$HANDLERS_TEST_DIR/real-handler"
 saved_fleet_for_handlers_dir="$(cat "$FORK_SANDBOX_FLEET_FILE")"
