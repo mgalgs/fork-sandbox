@@ -22,7 +22,7 @@
 #   - The fleet file, a YAML mapping of `agents` (name -> optional
 #     persona/harness/model/network/thinking/wake-on-cc/refresh-at/triage
 #     overrides), `lists` (name -> members, a list of agent names), and
-#     an optional top-level `triage` block (harness/model/network for the
+#     an optional top-level `triage` block (harness/model for the
 #     wake classifier's own sandbox seat -- see `resolve-triage` below).
 #     $FORK_SANDBOX_FLEET_FILE, default ~/.config/fork-sandbox/fleet.yaml.
 #
@@ -60,12 +60,15 @@
 #                  wake-on-cc, refresh-at, triage. A field with nothing
 #                  configured anywhere prints as an empty line -- output
 #                  is always nine lines, never fewer.
-#   resolve-triage Print exactly three lines for the wake classifier's own
-#                  sandbox seat: harness, model, network. Reads only the
-#                  fleet file's top-level `triage` block (no persona
-#                  fallback -- this is not a per-agent seat); every line
-#                  is empty when the fleet file has no `triage:` key at
-#                  all (triage off fleet-wide, see fork-sandbox-postmaster.sh).
+#   resolve-triage Print exactly two lines for the wake classifier's own
+#                  sandbox seat: harness, model. Reads only the fleet
+#                  file's top-level `triage` block (no persona fallback --
+#                  this is not a per-agent seat); every line is empty when
+#                  the fleet file has no `triage:` key at all (triage off
+#                  fleet-wide, see fork-sandbox-postmaster.sh). No
+#                  network field: the classifier's egress is fixed by
+#                  harness (sealed for pi, pinned for claude), not
+#                  configurable, so there is nothing to report.
 #   expand <addr>[,<addr>...]
 #                  Expand a comma-separated list of @-addresses: a
 #                  `@list` becomes its members' `@agent` addresses, a
@@ -290,20 +293,19 @@ cmd_resolve() {
     resolve_with_dump "$dump" "$name"
 }
 
-# Populates triage_<field> globals (harness/model/network) for the wake
+# Populates triage_<field> globals (harness/model) for the wake
 # classifier's own sandbox seat from a dump's `triage\t<field>\t<value>`
-# lines (three tab-separated fields, unlike an agent line's four) --
+# lines (two tab-separated fields, unlike an agent line's four) --
 # empty when the fleet file has no top-level `triage:` block at all.
 fleet_read_triage() {
     local dump="$1" kind field value
-    triage_harness="" triage_model="" triage_network=""
+    triage_harness="" triage_model=""
     [[ -n "$dump" ]] || return 0
     while IFS=$'\t' read -r kind field value; do
         [[ "$kind" == triage ]] || continue
         case "$field" in
             harness) triage_harness="$value" ;;
             model) triage_model="$value" ;;
-            network) triage_network="$value" ;;
         esac
     done <<< "$dump"
 }
@@ -313,7 +315,6 @@ cmd_resolve_triage() {
     fleet_read_triage "$dump"
     printf '%s\n' "$triage_harness"
     printf '%s\n' "$triage_model"
-    printf '%s\n' "$triage_network"
 }
 
 fleet_is_list() {

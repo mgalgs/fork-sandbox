@@ -38,7 +38,11 @@ requested, but is free to reply when something genuinely matters, same
 as a colleague reading a real Cc line. A seat that should stay silent no
 matter what sets `wake-on-cc: false`; that asymmetry is what makes a
 "maintainer who mostly watches" seat free, not the mere fact of being
-Cc'd.
+Cc'd. A fleet with a top-level `triage:` block goes one step further: a
+small classifier reads just the triggering message and decides whether
+each Cc'd observer's wake is worth the spend at all (see "The Cc triage
+gate" below). `To:` is never gated this way — only an observer-tier Cc
+wake is a candidate for staying silent by default.
 
 **The thread is the memory.** Every wake carries the entire thread in its
 prompt. Session resume exists (below) and saves real money, but it is an
@@ -178,7 +182,7 @@ content.
 `~/.config/fork-sandbox/personas`): a markdown body — the agent's
 standing instructions, opaque to the registry — with optional YAML
 frontmatter carrying `description`, `harness`, `model`, `network`
-(`pinned` or `sealed`), `thinking` and `wake-on-cc`.
+(`pinned` or `sealed`), `thinking`, `wake-on-cc` and `triage`.
 
 ```markdown
 ---
@@ -204,6 +208,8 @@ agents:
     network: sealed
   watcher:
     wake-on-cc: false          # never wakes on a Cc, only on To:
+  skeptic:
+    triage: false              # Cc wake always spawns, skips the classifier
 lists:
   crew:
     members: [reviewer, scribe, watcher]
@@ -237,13 +243,38 @@ can be individually valid and still combine into an illegal seat. The
 one-word spelling `pi-local` that presets accept is deliberately refused
 here; the registry takes the two-axis form only.
 
+An optional top-level `triage:` block configures the wake classifier's
+own sandbox seat (see "The Cc triage gate" below) — `harness` and
+`model` only, defaulted from an empty block to `harness: claude`. There
+is no `network` key: the classifier's own launch path fixes its egress
+by harness (sealed for pi, pinned for claude) with nothing left to
+configure, so the field does not exist rather than existing and lying
+about what runs. `harness` here takes only `claude` or `pi` — narrower
+than a per-agent seat's `claude`/`pi`/`codex`, since only two are wired
+up as classifier launchers; naming `codex` is refused by `check`, not
+silently run as claude.
+
+```yaml
+triage:
+  harness: pi
+  model: qwen2.5-coder
+agents:
+  reviewer: {}
+```
+
+Presence of the key (even `triage: {}`) turns triage on fleet-wide;
+absence of the key entirely means no Cc wake is ever gated.
+
 ### Verbs
 
 ```bash
 fork-sandbox fleet check              # validate everything, report every error
-fork-sandbox fleet resolve <name>     # eight lines: harness, model, thinking,
+fork-sandbox fleet resolve <name>     # nine lines: harness, model, thinking,
                                       # network, persona-path, description,
-                                      # wake-on-cc, refresh-at
+                                      # wake-on-cc, refresh-at, triage
+fork-sandbox fleet resolve-triage     # two lines: harness, model, for the
+                                      # top-level triage: block (see above);
+                                      # every line empty when there is none
 fork-sandbox fleet expand @crew,@ci   # a list becomes its members, deduped
 fork-sandbox fleet roster             # human-readable summary
 fork-sandbox fleet teardown <agent> [--thread <id>]
@@ -254,7 +285,7 @@ fork-sandbox fleet teardown --all     # destroy persistent (thread, agent)
 
 `check` accumulates every error across the fleet file and every persona
 it declares — addressed by path, like `agents.reviewer.modle` — rather
-than stopping at the first. `resolve` always prints exactly eight lines;
+than stopping at the first. `resolve` always prints exactly nine lines;
 an unconfigured field is an empty line, never a missing one.
 
 `teardown` is how an operator reclaims a seat's persistent state (the
@@ -310,12 +341,14 @@ for it.
    elsewhere in the same `To` cannot fail the whole batch. Every expanded
    name that resolves as a fleet agent is a wake candidate. M's `Cc` is
    expanded the same way; a Cc-expanded name is a candidate too, unless
-   that agent's `wake-on-cc` resolves false. A name that does not resolve
-   — unknown, or external like the operator's own address — is skipped
-   silently on either header; external senders receive mail only in the
-   archive. M's own `From` is never a candidate on either header, even
-   when it reaches the list only through a list address: a sender never
-   wakes on its own message.
+   that agent's `wake-on-cc` resolves false or, when a top-level
+   `triage:` block is configured and M is not operator/external mail,
+   the classifier gate described in "The Cc triage gate" below decides
+   skip. A name that does not resolve — unknown, or external like the
+   operator's own address — is skipped silently on either header;
+   external senders receive mail only in the archive. M's own `From` is
+   never a candidate on either header, even when it reaches the list
+   only through a list address: a sender never wakes on its own message.
 1. **Operator reset.** If M's `From` does *not* resolve as a fleet agent,
    M is operator or external mail: clear T's needs-operator flag and
    reset T's spawn count to 0 *before* applying rules 2–3 to M. An
@@ -349,6 +382,39 @@ Together with "a Cc-only wake replies only when something genuinely
 matters, not routinely", those rules are the stop rules. Hops bound the
 depth of a conversation, the budget bounds its total spend, and the
 operator can reset both.
+
+### The Cc triage gate
+
+A top-level `triage:` block in the fleet file (see above) turns on a
+cheap pre-filter for observer-tier wakes: before an otherwise-eligible Cc
+candidate spawns, a small classifier reads just the triggering message —
+never the rest of the thread, never the candidate's own persona body —
+and answers one question, "wake or skip". A skip is recorded in that
+thread's `triaged` log (visible in `postmaster status`'s `triaged` count)
+and costs no spawn; a wake proceeds exactly as it would with no gate at
+all. `To:` wakes are never routed through this — the gate exists only
+for the "free to reply, not expected to" tier `wake-on-cc` describes.
+
+The gate fails toward waking, not skipping, at every decision point: no
+top-level `triage:` block, operator/external mail, a per-agent
+`triage: false` opt-out, a candidate with no `description` configured
+anywhere (nothing for the classifier to judge relevance against), an
+unresolvable agent, a non-zero classifier exit, a timeout, or any reply
+other than the exact word `skip` all wake the candidate. A missed skip
+only spends a wake the thread budget already allows for; a missed wake
+would silence an agent with no way to notice or recover, which is why
+the asymmetry runs this direction.
+
+The classifier's own launch is a second, narrower sandboxed seat — not
+the candidate's — resolved from the top-level `triage:` block
+(`fleet resolve-triage`), defaulting to the claude harness with tools
+denied outright (the run's only job is one word, so it is granted none
+of the access a real wake needs to do its work). Its prompt embeds the
+triggering message's Subject/From/body all `> `-quoted as sender-
+authored and explicitly untrusted, alongside the candidate's name and
+`description` as the only trusted framing — the same anti-forgery shape
+a real wake's handoff uses, applied to a prompt small enough to run
+cheaply on every Cc.
 
 ### The wake
 

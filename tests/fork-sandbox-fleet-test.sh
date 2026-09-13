@@ -477,7 +477,7 @@ agents:
 EOF
 
 bad "top-level triage block must be a mapping" \
-    "triage: must be a mapping of harness/model/network" <<'EOF'
+    "triage: must be a mapping of harness/model" <<'EOF'
 triage: nope
 agents:
   riffler: {}
@@ -491,11 +491,19 @@ agents:
   riffler: {}
 EOF
 
-bad "top-level triage block enforces the same network/harness pairing" \
-    "triage: network 'sealed' requires harness 'pi'" <<'EOF'
+bad "top-level triage block has no network key -- it is derived from harness" \
+    "triage.network: unknown key" <<'EOF'
 triage:
-  harness: claude
+  harness: pi
   network: sealed
+agents:
+  riffler: {}
+EOF
+
+bad "top-level triage block rejects codex -- only claude and pi are wired up" \
+    "triage.harness: takes 'claude' or 'pi'" <<'EOF'
+triage:
+  harness: codex
 agents:
   riffler: {}
 EOF
@@ -509,8 +517,8 @@ EOF
 # Piped, not captured via $(...): command substitution strips trailing
 # newlines, which would silently swallow the count when every line is
 # empty, as they all are here (no top-level `triage:` block at all).
-check "resolve-triage: no top-level block, output is exactly three lines" \
-    "3" "$("$fleet" resolve-triage | wc -l)"
+check "resolve-triage: no top-level block, output is exactly two lines" \
+    "2" "$("$fleet" resolve-triage | wc -l)"
 check "resolve-triage: no top-level block, harness is empty" "" \
     "$("$fleet" resolve-triage | sed -n 1p)"
 
@@ -520,19 +528,19 @@ agents:
   riffler: {}
 EOF
 triage_out2="$("$fleet" resolve-triage)"
-check "resolve-triage: empty block defaults to claude/haiku/pinned" \
-    "$(printf 'claude\nhaiku\npinned')" "$triage_out2"
+check "resolve-triage: empty block defaults to claude harness, no model default" \
+    "$(printf 'claude\n')" "$triage_out2"
 
 cat > "$FORK_SANDBOX_FLEET_FILE" <<'EOF'
 triage:
   harness: pi
-  network: sealed
+  model: qwen2.5-coder
 agents:
   riffler: {}
 EOF
 triage_out3="$("$fleet" resolve-triage)"
 check "resolve-triage: explicit block overrides defaults" \
-    "$(printf 'pi\nhaiku\nsealed')" "$triage_out3"
+    "$(printf 'pi\nqwen2.5-coder')" "$triage_out3"
 
 printf '%s\n' "$saved_fleet_yaml" > "$FORK_SANDBOX_FLEET_FILE"
 

@@ -1884,18 +1884,25 @@ EOF
 cat > "$FORK_SANDBOX_PERSONAS_DIR/dave.md" <<'EOF'
 Dave opts out of triage entirely; his Cc wake always spawns.
 EOF
+cat > "$FORK_SANDBOX_PERSONAS_DIR/eve.md" <<'EOF'
+Eve has no description anywhere (no fleet.yaml entry, no frontmatter);
+her Cc wake always spawns because there is nothing to triage against.
+EOF
 
 cat > "$FORK_SANDBOX_FLEET_FILE" <<'EOF'
 agents:
-  alice: {}
-  bob: {}
-  carol: {}
+  alice:
+    description: Cc-only reviewer, wakes only when something needs her
+  bob:
+    description: direct recipient, always wakes
+  carol:
+    description: sender used throughout this group
   dave:
+    description: opts out of triage entirely
     triage: false
 triage:
   harness: claude
   model: haiku
-  network: pinned
 EOF
 
 if ! "$FLEET" check >/dev/null 2>&1; then
@@ -1930,6 +1937,35 @@ check "wake verdict: alice (Cc) spawns" 1 \
     "$(grep -c -- "^sbx-mail-${tid:0:8}-alice-" "$STUB_ARGV_LOG")"
 check "wake verdict: exactly one classifier call (bob's To wake was never classified)" 1 \
     "$(grep -c -- '^----CALL----$' "$TRIAGE_LOG")"
+
+# The prompt/argv the classifier actually received: the stub logs every
+# ARG and the whole stdin, but until now nothing asserted on either, so
+# a regression in the prompt's anti-forgery quoting, the candidate's
+# name, or the launch flags would pass a green suite silently.
+check "wake verdict: Subject never appears bare (unquoted) in the prompt" 0 \
+    "$(grep -c -- '^Subject: A$' "$TRIAGE_LOG")"
+check "wake verdict: Subject appears quoted, inside the sender-authored region" 1 \
+    "$(grep -c -- '^> Subject: A$' "$TRIAGE_LOG")"
+check "wake verdict: From never appears bare (unquoted) in the prompt" 0 \
+    "$(grep -c -- '^From: @carol$' "$TRIAGE_LOG")"
+check "wake verdict: From appears quoted, inside the sender-authored region" 1 \
+    "$(grep -c -- '^> From: @carol$' "$TRIAGE_LOG")"
+check "wake verdict: the body is quoted" 1 \
+    "$(grep -c -- '^> body$' "$TRIAGE_LOG")"
+check "wake verdict: the prompt names the candidate agent" 1 \
+    "$(grep -c -- '^Agent: alice$' "$TRIAGE_LOG")"
+check "wake verdict: the prompt carries the candidate's description" 1 \
+    "$(grep -c -- '^Candidate: Cc-only reviewer, wakes only when something needs her$' "$TRIAGE_LOG")"
+check "wake verdict: --tools reaches the launcher (deny all tools)" 1 \
+    "$(grep -c -- '^ARG:--tools$' "$TRIAGE_LOG")"
+check "wake verdict: --tools value is the empty string (all tools denied)" "ARG:" \
+    "$(grep -A1 -- '^ARG:--tools$' "$TRIAGE_LOG" | tail -n1)"
+check "wake verdict: --model reaches the launcher" 1 \
+    "$(grep -c -- '^ARG:--model$' "$TRIAGE_LOG")"
+check "wake verdict: --model value is haiku" "ARG:haiku" \
+    "$(grep -A1 -- '^ARG:--model$' "$TRIAGE_LOG" | tail -n1)"
+contains "wake verdict: the work dir reaches the launcher" \
+    "$(grep -m1 -- '^ARG:' "$TRIAGE_LOG")" ".postmaster.triage-work."
 
 # --- scenario 2: a skip verdict suppresses only the Cc wake, and is
 #     recorded in triaged/<thread-id> ---
@@ -2040,6 +2076,40 @@ check "no triage: block: alice (Cc) spawns regardless of the stub's skip verdict
     "$(grep -c -- "^sbx-mail-${tid:0:8}-alice-" "$STUB_ARGV_LOG")"
 check "no triage: block: zero classifier calls" 0 \
     "$(grep -c -- '^----CALL----$' "$TRIAGE_LOG")"
+
+export FORK_SANDBOX_FLEET_FILE="$TRIAGE_FLEET_DIR/fleet.yaml"
+
+# --- scenario 10: a candidate with no description anywhere is never
+#     classified -- there is nothing for the classifier to judge "should
+#     this agent wake" against, so it is treated as a reason to skip the
+#     classifier (and wake), not to guess ---
+: > "$STUB_ARGV_LOG"
+: > "$TRIAGE_LOG"
+export TRIAGE_STUB_VERDICT=skip
+mid="$(send_msg '@carol' '@bob' 'I' 'body' 8 '@eve')"
+tid="$(thread_of "$mid")"
+once
+check "no description: eve (Cc) spawns regardless of the stub's skip verdict" 1 \
+    "$(grep -c -- "^sbx-mail-${tid:0:8}-eve-" "$STUB_ARGV_LOG")"
+check "no description: zero classifier calls" 0 \
+    "$(grep -c -- '^----CALL----$' "$TRIAGE_LOG")"
+
+# --- scenario 11: the classifier's prompt carries only the triggering
+#     message, never the rest of the thread (the stated privacy property)
+#     ---
+: > "$STUB_ARGV_LOG"
+: > "$TRIAGE_LOG"
+export TRIAGE_STUB_VERDICT=wake
+mid_first="$(send_msg '@carol' '@bob' 'Thread start' 'FIRSTUNIQUETOKEN' 8)"
+reply_msg '@bob' "$mid_first" 'SECONDUNIQUETOKEN' --cc '@alice' >/dev/null
+tid="$(thread_of "$mid_first")"
+once
+check "thread privacy: exactly one classifier call (message 1 never cc'd alice)" 1 \
+    "$(grep -c -- '^----CALL----$' "$TRIAGE_LOG")"
+check "thread privacy: the prompt carries the triggering message's body" 1 \
+    "$(grep -c -- '^> SECONDUNIQUETOKEN$' "$TRIAGE_LOG")"
+check "thread privacy: the prompt does not carry an earlier message's body" 0 \
+    "$(grep -c -- 'FIRSTUNIQUETOKEN' "$TRIAGE_LOG")"
 
 unset FORK_SANDBOX_POSTMASTER_TRIAGE_LAUNCHER
 export FORK_SANDBOX_FLEET_FILE="$SAVED_FLEET_FILE"

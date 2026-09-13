@@ -14,8 +14,11 @@ divide, so neither can resolve as a fleet seat.
 A fleet file is a YAML mapping of `agents` (name -> optional persona/
 harness/model/network/thinking/description/wake-on-cc/refresh-at/triage
 overrides), `lists` (name -> `members`, a list of agent names), and an
-optional top-level `triage` block (harness/model/network for the wake
-classifier's own sandbox seat -- absent means triage is off fleet-wide).
+optional top-level `triage` block (harness/model for the wake
+classifier's own sandbox seat -- absent means triage is off fleet-wide.
+No `network` field: the classifier's own launch path fixes its network
+by harness -- sealed for pi, pinned for claude -- with nothing in the
+fleet file left to override it).
 A persona file is markdown with an optional YAML frontmatter block
 (delimited by `---` lines) carrying the same per-agent seat keys plus
 `description`; the body is opaque to this script.
@@ -54,8 +57,8 @@ routine instead of two.
     list\t<name>                           (once per list, so an empty
     list_member\t<name>\t<member>           list still appears; members
                                              in file order)
-    triage\t<field>\t<value>               (harness/model/network, three
-                                             lines, only when a top-level
+    triage\t<field>\t<value>               (harness/model, two lines,
+                                             only when a top-level
                                              `triage:` block is present;
                                              zero lines when the fleet
                                              file has no such block)
@@ -98,9 +101,22 @@ FIELDS = ("persona", "harness", "model", "network", "thinking",
           "description", "wake-on-cc", "refresh-at", "triage")
 FRONTMATTER_FIELDS = ("harness", "model", "network", "thinking",
                        "description", "wake-on-cc", "refresh-at", "triage")
-TRIAGE_SEAT_FIELDS = ("harness", "model", "network")
-TRIAGE_SEAT_DEFAULTS = {"harness": "claude", "model": "haiku",
-                         "network": "pinned"}
+# Only these two are wired up on the postmaster side (pm_triage_wake's
+# pi and claude arms); a triage seat naming any other harness would
+# validate here and then silently run as claude at launch, so the
+# enum for this one field is narrower than the general HARNESSES tuple.
+TRIAGE_HARNESSES = ("claude", "pi")
+TRIAGE_SEAT_FIELDS = ("harness", "model")
+# No default for `model`: unlike a real agent seat, the classifier's
+# model default is harness-gated on the bash side (pm_triage_wake),
+# because a flat default here would hand a claude-only alias to a pi
+# seat's local endpoint. See fork-sandbox-postmaster.sh's pm_spawn_wake
+# for the identical reasoning on a per-agent seat's own model default.
+# "model": "" is not a real default (nothing runs with an empty --model
+# flag) -- it just gives dump()'s `triage[field]` lookup a key to find
+# for every TRIAGE_SEAT_FIELDS entry, the same way an unset per-agent
+# field resolves to an empty line rather than a missing one.
+TRIAGE_SEAT_DEFAULTS = {"harness": "claude", "model": ""}
 
 # Names no agent or list may take, mapped to why. Both are reserved
 # everywhere (`check` and `dump` share this, so a broken fleet file
@@ -222,12 +238,19 @@ def check_triage_seat(value, label, errors):
     checked by check_triage_field. Presence of the key (even `triage: {}`
     or `triage:` with no value) turns triage on fleet-wide, defaulted from
     TRIAGE_SEAT_DEFAULTS; absence of the key entirely means triage stays
-    off, which the caller checks before ever calling this."""
+    off, which the caller checks before ever calling this.
+
+    No `network` key: pm_triage_wake's pi arm always launches through
+    agent-sandboxed, which is unconditionally sealed and refuses any
+    egress flag, and its claude arm can never be sealed (a sealed claude
+    session cannot reach the Anthropic API). Either harness's network is
+    therefore a fixed fact about that harness, not something a fleet
+    file can configure -- so there is nothing here for `network` to mean."""
     path = f"{label}: triage"
     if value is None:
         value = {}
     if not isinstance(value, dict):
-        errors.append(f"{path}: must be a mapping of harness/model/network")
+        errors.append(f"{path}: must be a mapping of harness/model")
         value = {}
     seat = dict(TRIAGE_SEAT_DEFAULTS)
     for key, v in value.items():
@@ -235,18 +258,20 @@ def check_triage_seat(value, label, errors):
         if key == "harness":
             sv = scalar(v, field_path, errors)
             if sv is not None:
-                seat["harness"] = check_harness(sv, field_path, errors)
+                if sv in TRIAGE_HARNESSES:
+                    seat["harness"] = sv
+                else:
+                    errors.append(
+                        f"{field_path}: takes 'claude' or 'pi' -- the only "
+                        f"harnesses the triage classifier launches, not "
+                        f"'{sv}'"
+                    )
         elif key == "model":
             sv = scalar(v, field_path, errors)
             if sv is not None:
                 seat["model"] = sv
-        elif key == "network":
-            sv = scalar(v, field_path, errors)
-            if sv is not None:
-                seat["network"] = check_network(sv, field_path, errors)
         else:
             errors.append(f"{field_path}: unknown key")
-    check_network_harness_pair(seat["harness"], seat["network"], path, errors)
     return seat
 
 
