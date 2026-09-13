@@ -995,12 +995,10 @@ fs_resolve_pi() {
 # sealed-network dispatch key fs_resolve_harness derives from harness "pi") is
 # accepted too and treated identically to "pi", since it is the same CLI and
 # the same --session-dir/--session-id contract, reached through
-# agent-sandboxed instead of a direct exec -- a sealed pi run is refused
-# --session-state/--resume-session/--session-id outright, at the same
-# fork-sandbox.sh callsite this capability table feeds (agent-sandboxed has
-# no --session-dir/--session-id wiring of its own to bind them into), but the
-# alias means a caller checking a harness it already has as "pi-local" gets
-# the same answer "pi" would without re-deriving it first.
+# agent-sandboxed's own --session-dir/--session-id wiring (see its header)
+# instead of a direct exec -- the alias means a caller checking a harness it
+# already has as "pi-local" gets the same answer "pi" would without
+# re-deriving it first.
 #
 # Fills three globals rather than printing to stdout, exactly like
 # FS_PI_ROOT/FS_PI_ARGV0 above -- a caller wants several of them at once, and

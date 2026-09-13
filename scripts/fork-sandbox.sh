@@ -6143,14 +6143,27 @@ fi
 # here too.
 rc=0
 if [[ "$mode" != "review-only" ]]; then
+# stderr goes through a real pipeline into $sandbox_log, not a `2> >(tee)`
+# process substitution: bash does not wait on the latter (claude-sandboxed's
+# own RESUME_FAIL_RE names this exact hazard beside its ERR_CAPTURE), so
+# $sandbox_log could still be unwritten when the codex retry check below
+# greps it. fd 3 carries this attempt's own stdout past the inner pipe
+# untouched, into the same $events/$formatter tee the process substitution
+# form used to feed directly; the trailing `exit` makes the group's own
+# exit code the command's, not tee's, since PIPESTATUS[0] below reads the
+# group as a single pipeline stage.
 if [[ -n "$formatter" ]]; then
-    fs_run_lock_closed "${impl_sandbox_cmd[@]}" < "$handoff" \
-        2> >(tee -a "$sandbox_log" >&2) \
+    { fs_run_lock_closed "${impl_sandbox_cmd[@]}" < "$handoff" \
+        2>&1 1>&3 | tee -a "$sandbox_log" >&2
+      exit "${PIPESTATUS[0]}"
+    } 3>&1 \
         | tee -a "$events" \
         | "$formatter"
 else
-    fs_run_lock_closed "${impl_sandbox_cmd[@]}" < "$handoff" \
-        2> >(tee -a "$sandbox_log" >&2) \
+    { fs_run_lock_closed "${impl_sandbox_cmd[@]}" < "$handoff" \
+        2>&1 1>&3 | tee -a "$sandbox_log" >&2
+      exit "${PIPESTATUS[0]}"
+    } 3>&1 \
         | tee -a "$events"
 fi
 rc="${PIPESTATUS[0]:-1}"

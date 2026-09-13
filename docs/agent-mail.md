@@ -447,7 +447,7 @@ own thread scans never see it:
 | `spawns/<thread-id>` | one line per spawn, reset by rule 1 — line count is the **budget** count |
 | `seq/<thread-id>` | one line per spawn, never reset — feeds the branch name |
 | `handoffs/<run-id>.md` | the generated handoff a wake was given |
-| `state/<thread-id>/<agent>/` | the harness's transcript/session store for that pair (claude, codex or pi — a sealed pi seat excepted, see below) |
+| `state/<thread-id>/<agent>/` | the harness's transcript/session store for that pair (claude, codex or pi, sealed or not) |
 | `sessions/<thread-id>/<agent>` | the session id that pair's last wake ended on |
 | `workspaces/<thread-id>/<agent>/` | the persistent clone for that (thread, agent) seat, bound into every wake of it (every harness, not just claude) with `--clone-dir`; removed only by `fleet teardown` |
 
@@ -467,11 +467,12 @@ letting every spawn fail one at a time with the real reason buried.
 
 An (agent, thread) pair maps to one harness session, resumed at each
 wake, on every harness with a session-resume capability — today claude,
-codex and pi, per `fs_harness_session_caps` (`fork-sandbox-lib.sh`), with
-one exception: a **sealed** pi seat (`network: sealed`) dispatches through
-`agent-sandboxed` instead of execing pi directly, and that path has no
-`--session-dir`/`--session-id` wiring at all, so it is refused the flags
-below and stays fresh-wake. This is a continuity and cost optimization and
+codex and pi, per `fs_harness_session_caps` (`fork-sandbox-lib.sh`). A
+**sealed** pi seat (`network: sealed`) dispatches through
+`agent-sandboxed` instead of execing pi directly, but that script has its
+own `--session-dir`/`--session-id` wiring (see its header) that binds the
+same durable store the flags below name, so a sealed seat resumes exactly
+like a non-sealed one. This is a continuity and cost optimization and
 **never** a correctness requirement — the full thread is in every prompt
 regardless.
 
@@ -529,10 +530,10 @@ always were.
 continuation" section when a resume is named (`--resume-session` for
 claude/codex, `--session-id` for pi), or a "This workspace is not new"
 section whenever the clone was reused with no resume named — every wake
-past the first for a non-resumable harness or a sealed pi seat, and any
-wake whose recorded session turned out missing or unreadable for a
-discover-mode harness. Carrying work forward across wakes is the agent's
-own git work; nothing here automates it.
+past the first for a non-resumable harness, and any wake whose recorded
+session turned out missing or unreadable for a discover-mode harness.
+Carrying work forward across wakes is the agent's own git work; nothing
+here automates it.
 
 A `--refresh-at` continuation is the same conversation continued, so it
 does write to the session store — but it is never *resumed*, whatever
@@ -540,10 +541,10 @@ does write to the session store — but it is never *resumed*, whatever
 inherited, and resuming it would hand that context straight back.
 (`--refresh-at` itself works only with `--harness claude`.)
 
-Resume works on claude, codex and pi seats alike, with one exception: a
-sealed pi seat gets a fresh session every wake, with the thread in the
-prompt as its only continuity — same as any harness with no
-session-resume capability at all.
+Resume works on claude, codex and pi seats alike, sealed or not — a
+sealed pi seat resumes through agent-sandboxed's own
+`--session-dir`/`--session-id` wiring the same way a non-sealed one does
+through pi directly.
 
 ## Rendering a thread
 
@@ -650,12 +651,6 @@ does.
 - **No mail tooling inside the sandbox.** A wake cannot read the store,
   search other threads, or send mail directly; it writes reply files and
   the harvester posts them.
-- **A sealed pi seat cannot resume.** It dispatches through
-  `agent-sandboxed` instead of execing pi directly, and that path has no
-  `--session-dir`/`--session-id` wiring at all, so it stays fresh-wake —
-  claude, codex and a non-sealed pi seat all resume (see "Session resume"
-  above). A sealed seat's persistent workspace still carries its
-  committed work and untracked files forward like any other seat's.
 - **No list-Cc delivery index.**
 - **No workspace expiry.** Seats accumulate disk until an explicit
   `fleet teardown`; there is no idle GC.

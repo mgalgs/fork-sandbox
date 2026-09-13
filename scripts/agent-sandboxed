@@ -349,10 +349,16 @@ while [[ $# -gt 0 ]]; do
             shift 3
             ;;
         --session-dir)
+            # Own flag only before the work dir, like the header promises; one
+            # given after it is pi's own --session-dir instead, so this must
+            # fall through to the same break the unrecognized-flag arm below
+            # takes once the work dir is already captured.
+            [[ -n "$WORK_DIR_ARG" ]] && break
             SESSION_DIR_ARG="${2:?--session-dir requires a directory}"
             shift 2
             ;;
         --session-id)
+            [[ -n "$WORK_DIR_ARG" ]] && break
             SESSION_ID_ARG="${2:?--session-id requires a session id}"
             shift 2
             ;;

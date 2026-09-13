@@ -122,5 +122,38 @@ else
     no "--session-id without --session-dir is refused" "$out"
 fi
 
+# --session-dir/--session-id given AFTER the work dir are pi's own flags,
+# forwarded verbatim, per the header at scripts/agent-sandboxed:107-109 --
+# not this script's own durable-store flags, which only that position gets.
+afterpos_dir="$work/afterpos-store"
+out="$(PATH="$bin:$PATH" FORK_SANDBOX_BACKEND=test FORK_SANDBOX_CONFIG_DIR="$work" \
+    BACKEND_CAPTURE="$work/afterpos.args" SHIM_CAPTURE="$work/afterpos.shim.sh" \
+    timeout 8 "$agent" --endpoint 'http://127.0.0.1:1/v1' --model test-model \
+    "$work/project-afterpos" --session-dir "$afterpos_dir" --session-id xyz98765 2>&1)"
+rc=$?
+tr '\0' '\n' < "$work/afterpos.args" > "$work/afterpos.args.text" 2>/dev/null || : > "$work/afterpos.args.text"
+if (( rc == 0 )); then
+    ok "--session-dir/--session-id after the work dir still exits successfully"
+else
+    no "--session-dir/--session-id after the work dir still exits successfully" "$out"
+fi
+if [[ ! -d "$afterpos_dir" ]] && ! grep -qxF -- '--bind-rw-at' "$work/afterpos.args.text"; then
+    ok "--session-dir after the work dir is not bound as a durable store"
+else
+    no "--session-dir after the work dir is not bound as a durable store" "$(cat "$work/afterpos.args.text")"
+fi
+# The raw trailing args land in the backend's own argv (sandbox_cmd's final
+# "-- shim.sh $@"), not baked into shim.sh's text -- shim.sh only bakes in
+# THIS script's own session_flags; a forwarded "$@" stays a literal "$@" in
+# the generated file, expanded only when the backend runs it.
+if grep -qxF -- '--session-dir' "$work/afterpos.args.text" && \
+    grep -qxF -- "$afterpos_dir" "$work/afterpos.args.text" && \
+    grep -qxF -- '--session-id' "$work/afterpos.args.text" && \
+    grep -qxF -- 'xyz98765' "$work/afterpos.args.text"; then
+    ok "--session-dir/--session-id after the work dir reach pi verbatim"
+else
+    no "--session-dir/--session-id after the work dir reach pi verbatim" "$(cat "$work/afterpos.args.text")"
+fi
+
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 (( fail == 0 )) || exit 1
