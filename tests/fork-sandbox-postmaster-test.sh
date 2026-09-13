@@ -109,6 +109,9 @@ EOF
 cat > "$FORK_SANDBOX_PERSONAS_DIR/carol.md" <<'EOF'
 Carol keeps her replies short.
 EOF
+cat > "$FORK_SANDBOX_PERSONAS_DIR/dana.md" <<'EOF'
+Dana opts out of Cc wakes; only a direct To wakes her.
+EOF
 
 cat > "$FORK_SANDBOX_FLEET_FILE" <<'EOF'
 agents:
@@ -117,6 +120,8 @@ agents:
     harness: pi
     network: sealed
   carol: {}
+  dana:
+    wake-on-cc: false
 lists:
   team:
     members: [alice, bob, carol]
@@ -208,7 +213,7 @@ spawn_count_of() {
 }
 
 # ============================================================
-printf '\n== To wakes, Cc does not; list wakes every member once; direct+list dedup ==\n'
+printf '\n== To wakes, Cc wakes by default; list wakes every member once; direct+list dedup ==\n'
 # ============================================================
 
 new_scratch_root FORK_SANDBOX_MAIL_ROOT
@@ -219,7 +224,79 @@ tid="$(thread_of "$mid")"
 short="${tid:0:8}"
 once
 check "To recipient (bob) spawns" 1 "$(grep -c -- "^sbx-mail-$short-bob-" "$STUB_ARGV_LOG")"
-check "Cc recipient (carol) does not spawn" 0 "$(grep -c -- "^sbx-mail-$short-carol-" "$STUB_ARGV_LOG")"
+check "Cc recipient (carol) spawns too (wake-on-cc default true)" 1 "$(grep -c -- "^sbx-mail-$short-carol-" "$STUB_ARGV_LOG")"
+run_env="$(env_file_for_agent carol)"
+check "Cc wake: ledger records VIA=cc" "VIA=cc" "$(grep '^VIA=' "$run_env")"
+run_env_bob="$(env_file_for_agent bob)"
+check "To wake: ledger records VIA=to" "VIA=to" "$(grep '^VIA=' "$run_env_bob")"
+
+# ============================================================
+printf '\n== Cc wakes: wake-on-cc:false suppresses, sender-in-cc never wakes, both-headers dedup ==\n'
+# ============================================================
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+mid="$(send_msg '@alice' '@bob' 'cc opt-out test' 'body' 8 '@dana')"
+tid="$(thread_of "$mid")"
+short="${tid:0:8}"
+once
+check "wake-on-cc:false suppresses the Cc wake (dana)" 0 "$(grep -c -- "^sbx-mail-$short-dana-" "$STUB_ARGV_LOG")"
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+mid="$(send_msg '@alice' '@bob' 'sender in cc via list' 'body' 8 '@team')"
+tid="$(thread_of "$mid")"
+short="${tid:0:8}"
+once
+check "sender named in Cc (via a list) never wakes (alice)" 0 "$(grep -c -- "^sbx-mail-$short-alice-" "$STUB_ARGV_LOG")"
+check "other Cc'd list member (carol) still wakes" 1 "$(grep -c -- "^sbx-mail-$short-carol-" "$STUB_ARGV_LOG")"
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+mid="$(send_msg '@alice' '@bob' 'both headers dedup' 'body' 8 '@bob')"
+tid="$(thread_of "$mid")"
+short="${tid:0:8}"
+once
+check "agent named in both To and Cc wakes exactly once (bob)" 1 "$(grep -c -- "^sbx-mail-$short-bob-" "$STUB_ARGV_LOG")"
+run_env="$(env_file_for_agent bob)"
+check "both-headers dedup: To wins for VIA (bob)" "VIA=to" "$(grep '^VIA=' "$run_env")"
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+mid="$(send_msg '@alice' '@bob' 'cc hops gate' 'body' 0 '@carol')"
+tid="$(thread_of "$mid")"
+short="${tid:0:8}"
+once
+check "X-Hops 0 gates a Cc wake too (carol)" 0 "$(grep -c -- "^sbx-mail-$short-carol-" "$STUB_ARGV_LOG")"
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+mid="$(send_msg '@alice' '@bob' 'cc budget gate' 'body' 8 '@carol')"
+tid="$(thread_of "$mid")"
+short="${tid:0:8}"
+mkdir -p -- "$FORK_SANDBOX_MAIL_ROOT/.postmaster/spawns"
+seq 1 32 > "$FORK_SANDBOX_MAIL_ROOT/.postmaster/spawns/$tid"
+: > "$STUB_ARGV_LOG"
+once
+check "thread budget exhausted gates a Cc wake too (carol)" 0 "$(grep -c -- "^sbx-mail-$short-carol-" "$STUB_ARGV_LOG")"
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+mid1="$(send_msg '@alice' '@bob' 'cc live delivery' 'first message' 8 '@carol')"
+tid="$(thread_of "$mid1")"
+short="${tid:0:8}"
+once
+check "cc live delivery setup: carol's first cc wake spawns" 1 "$(grep -c -- "^sbx-mail-$short-carol-" "$STUB_ARGV_LOG")"
+run_env="$(env_file_for_agent carol)"
+run_dir="$(sed -n 's/^RUN_DIR=//p' "$run_env")"
+mid2="$(reply_msg '@alice' "$mid1" 'second message' --cc '@carol' --to '@bob')"
+short2="${mid2:0:8}"
+: > "$STUB_ARGV_LOG"
+once
+check "live run + new Cc message: no second spawn (carol)" 0 "$(grep -c -- "^sbx-mail-$short-carol-" "$STUB_ARGV_LOG")"
+banner2=$(find "$run_dir/inbox" -maxdepth 1 -name 'mail-banner-*' -print -quit)
+check "live run + new Cc message: live delivery banner written instead" \
+    "mail-banner-001-$short2.md" "$(basename -- "$banner2" 2>/dev/null)"
 
 new_scratch_root FORK_SANDBOX_MAIL_ROOT
 export FORK_SANDBOX_MAIL_ROOT

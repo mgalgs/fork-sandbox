@@ -28,13 +28,15 @@
 #
 # Spawn-on-delivery. An agent is a (persona, mailbox) pair; a wake is one
 # fork-sandbox.sh run carrying the persona, the full thread, and reply
-# instructions in a generated handoff. Only a message's To: recipients
-# wake -- Cc: recipients never spawn; their visibility is `mail inbox` and
-# the full thread arriving in the prompt whenever they are later woken.
-# Privacy is addressing: a woken agent receives ONLY the thread it is
-# being woken for -- the sandbox has no mail tooling and no store access,
-# so the thread embedded in its handoff is that agent's entire world for
-# the run.
+# instructions in a generated handoff. A message's To: recipients always
+# wake; Cc: recipients wake too unless their seat's wake-on-cc resolves
+# false (empty/unset means true -- a silent wake is cheap and cannot
+# extend a conversation on its own, and a Cc'd colleague should read the
+# mail today, not at their next meeting; see `fleet resolve`'s wake-on-cc
+# field). Privacy is addressing: a woken agent receives ONLY the thread it
+# is being woken for -- the sandbox has no mail tooling and no store
+# access, so the thread embedded in its handoff is that agent's entire
+# world for the run.
 #
 # ROUTING RULES (applied in this order to each unrouted message M in
 # thread T; a message is routed exactly once, decided before any wake is
@@ -43,12 +45,15 @@
 #   0. Expand M's To via fleet expand, one address at a time (an unknown
 #      address anywhere else in the same To: would otherwise fail the
 #      whole batch) -- every expanded name that resolves as a fleet agent
-#      is a wake candidate. A name that does not resolve (unknown or
-#      external, e.g. the operator's own address) is skipped silently:
-#      external senders receive mail only in the archive. M's own From is
-#      never a wake candidate, even when it only reaches the list via a
-#      list address M's To: expands through -- a sender never wakes on a
-#      message it sent itself.
+#      is a wake candidate. M's Cc is expanded the same way, one address
+#      at a time; a Cc-expanded name is a wake candidate too, IFF that
+#      agent's wake-on-cc resolves true (empty/unset means true -- see THE
+#      MODEL above). A name that does not resolve (unknown or external,
+#      e.g. the operator's own address) is skipped silently on either
+#      header: external senders receive mail only in the archive. M's own
+#      From is never a wake candidate on either header, even when it only
+#      reaches the list via a list address M's To: or Cc: expands through
+#      -- a sender never wakes on a message it sent itself.
 #   1. Operator reset: if M's From does NOT resolve as a fleet agent, M is
 #      operator/external mail -- clear T's needs-operator flag and reset
 #      T's spawn count to 0 BEFORE applying rules 2-3 to M. The operator
@@ -65,9 +70,13 @@
 #      not once per candidate: a message addressing several agents with
 #      one budget slot left still spawns all of them (v1 does not ration
 #      within a single message).
-#   4. One wake per (agent, message): an agent named in To twice (directly
-#      and via a list) wakes once. An agent already running a wake for
-#      thread T (a live, not-yet-harvested run) does not get a second
+#   4. One wake per (agent, message), regardless of which header named it:
+#      an agent named in To and/or Cc (directly or via a list, including
+#      both headers at once, or the same header twice via two lists)
+#      wakes once. The run's ledger records VIA=to or VIA=cc noting which
+#      header actually produced the wake, so the dogfood can count
+#      observer wakes (see STATE below). An agent already running a wake
+#      for thread T (a live, not-yet-harvested run) does not get a second
 #      spawn -- the new message-id is recorded on that run as a pending
 #      message (as always, for the fallback below), AND, if the run's seat
 #      is the claude harness, delivered LIVE into that run's own inbox dir
@@ -213,7 +222,12 @@
 #                                   (comma list, may be empty), MAIL_SEQ
 #                                   (the next live-delivery sequence
 #                                   number for this run, see
-#                                   pm_next_mail_seq)
+#                                   pm_next_mail_seq), VIA (to or cc --
+#                                   whether the wake's agent was named via
+#                                   To: or only reached via Cc: (list
+#                                   expansion included); recomputed from
+#                                   the trigger message's own To: at spawn
+#                                   time, see pm_wake_via)
 #   harvested/<run-id>             marker: this run's outbox is collected
 #   delivered-live/<thread-id>     one line per message rule 4 confirmed
 #                                   was delivered live at harvest (agent,
@@ -442,6 +456,26 @@ pm_expand_to() {
         done <<< "$expanded"
     done
     printf '%s\n' "${result[@]:-}"
+}
+
+# Resolves whether $agent should wake when named only via Cc: (an agent
+# named via To: always wakes, unconditionally -- this is never called for
+# that path). Empty wake-on-cc (unset in fleet.yaml and frontmatter) means
+# true, per THE MODEL above: only the literal string "false" suppresses a
+# Cc wake; fleet-parse.py's own validation already refuses any other
+# spelling before it ever reaches here. Fails closed (no wake) if the
+# agent does not resolve at all, though pm_process_message only ever calls
+# this with a name pm_expand_to already proved resolvable.
+pm_wake_on_cc() {
+    local agent="$1" harness model thinking network persona_path \
+          description wake_on_cc refresh_at
+    # shellcheck disable=SC2034
+    if ! { read -r harness; read -r model; read -r thinking; read -r network; \
+           read -r persona_path; read -r description; read -r wake_on_cc; \
+           read -r refresh_at; } < <("$FLEET" resolve "$agent" 2>/dev/null); then
+        return 1
+    fi
+    [[ "$wake_on_cc" != "false" ]]
 }
 
 pm_spawn_count() {
@@ -680,6 +714,26 @@ pm_deliver_live() {
     fi
 }
 
+# Determines whether $agent's wake for $mid was addressed via To: or only
+# via Cc: (list expansion included) -- ledger provenance for the run's
+# VIA field (see STATE above), so the dogfood can count observer wakes.
+# Recomputed here from $mid's own To: header, independent of whatever
+# pm_process_message decided when routing it, rather than threaded through
+# every caller (pm_wake_or_pend, pm_followup_wake): this is the one place
+# that needs it, and a follow-up wake for a message that was only ever
+# Cc'd correctly still ledgers as cc since the source of truth is the
+# message itself, not the caller's path to it.
+pm_wake_via() {
+    local mid="$1" agent="$2" f to name
+    f="$(pm_find_by_id "$mid" || true)"
+    [[ -n "$f" ]] || { printf 'to'; return 0; }
+    to="$(pm_header "$f" To)"
+    while IFS= read -r name; do
+        [[ "$name" == "$agent" ]] && { printf 'to'; return 0; }
+    done < <(pm_expand_to "$to")
+    printf 'cc'
+}
+
 pm_spawn_wake() {
     local project="$1" agent="$2" tid="$3" mid="$4"
     local harness model thinking network persona_path description wake_on_cc refresh_at
@@ -769,6 +823,9 @@ pm_spawn_wake() {
         return 0
     fi
 
+    local via
+    via="$(pm_wake_via "$mid" "$agent")"
+
     mkdir -p -- "$RUNS"
     {
         printf 'AGENT=%s\n' "$agent"
@@ -780,6 +837,7 @@ pm_spawn_wake() {
         printf 'BRANCH=%s\n' "$branch"
         printf 'RESUMED=%s\n' "$resumed"
         printf 'PENDING_MSGS=\n'
+        printf 'VIA=%s\n' "$via"
     } > "$RUNS/$run_id.env"
     mkdir -p -- "$SPAWNS" "$SEQ"
     printf '%s\n' "$run_id" >> "$SPAWNS/$tid"
@@ -817,13 +875,14 @@ pm_wake_or_pend() {
 
 pm_process_message() {
     local project="$1" f="$2"
-    local mid tid from to x_hops
+    local mid tid from to cc x_hops
     mkdir -p -- "$ROUTED"
     mid="$(pm_header "$f" Message-ID)"
     [[ -e "$ROUTED/$mid" ]] && return 0
     tid="$(pm_header "$f" Thread-ID)"
     from="$(pm_header "$f" From)"
     to="$(pm_header "$f" To)"
+    cc="$(pm_header "$f" Cc)"
     x_hops="$(pm_header "$f" X-Hops)"
     local from_name="${from#@}"
 
@@ -853,6 +912,20 @@ pm_process_message() {
         for cand in "${expanded[@]}"; do
             [[ -n "$cand" ]] || continue
             [[ "$cand" == "$from_name" ]] && continue
+            candidates+=("$cand")
+        done
+
+        local -a expanded_cc=()
+        mapfile -t expanded_cc < <(pm_expand_to "$cc")
+        for cand in "${expanded_cc[@]}"; do
+            [[ -n "$cand" ]] || continue
+            [[ "$cand" == "$from_name" ]] && continue
+            local dup=0 e
+            for e in "${candidates[@]:-}"; do
+                [[ "$e" == "$cand" ]] && { dup=1; break; }
+            done
+            (( dup )) && continue
+            pm_wake_on_cc "$cand" || continue
             candidates+=("$cand")
         done
     fi
