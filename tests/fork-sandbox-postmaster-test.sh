@@ -1090,6 +1090,86 @@ check "deliver --once skips the fleet gate when no fleet file exists" 0 "$no_fle
 unset NO_FLEET_FILE_DIR
 export FORK_SANDBOX_FLEET_FILE="$SAVED_FLEET_FILE_STARTUP"
 
+# A fleet made only of handler seats needs no persona file at all, so a
+# fleet.yaml that never mentions a personas dir must not be blocked by one
+# that was simply never created.
+SAVED_PERSONAS_DIR_STARTUP="$FORK_SANDBOX_PERSONAS_DIR"
+new_root NO_PERSONAS_HANDLERS_DIR
+cat > "$NO_PERSONAS_HANDLERS_DIR/noop-handler" <<'STUB'
+#!/usr/bin/env bash
+exit 0
+STUB
+chmod +x "$NO_PERSONAS_HANDLERS_DIR/noop-handler"
+new_root NO_PERSONAS_FLEET_DIR
+export FORK_SANDBOX_FLEET_FILE="$NO_PERSONAS_FLEET_DIR/fleet.yaml"
+cat > "$FORK_SANDBOX_FLEET_FILE" <<EOF
+agents:
+  handlerseat:
+    handler: exec
+    command: noop-handler
+EOF
+export FORK_SANDBOX_PERSONAS_DIR="$work/no-personas-dir-does-not-exist"
+export FORK_SANDBOX_HANDLERS_DIR="$NO_PERSONAS_HANDLERS_DIR"
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+mid="$(send_msg '@bob' '@handlerseat' 'fleet gate no personas dir' 'body' 8)"
+"$postmaster" deliver --project "$PROJECT_DIR" --once > /dev/null 2>&1
+no_personas_rc=$?
+check "deliver --once skips the fleet gate when no personas dir exists" 0 "$no_personas_rc"
+handlerseat_posted=0
+tid="$(thread_of "$mid")"
+for f in "$FORK_SANDBOX_MAIL_ROOT/threads/$tid"/*.msg; do
+    [[ -e "$f" ]] || continue
+    [[ "$(header_of_file "$f" From)" == "@handlerseat" ]] && handlerseat_posted=1
+done
+check "fleet gate no personas dir: handler-only fleet still routes" 0 "$handlerseat_posted"
+unset NO_PERSONAS_FLEET_DIR NO_PERSONAS_HANDLERS_DIR FORK_SANDBOX_HANDLERS_DIR
+export FORK_SANDBOX_FLEET_FILE="$SAVED_FLEET_FILE_STARTUP"
+export FORK_SANDBOX_PERSONAS_DIR="$SAVED_PERSONAS_DIR_STARTUP"
+
+# The startup gate runs `fleet check` over the WHOLE fleet file, so one
+# unrelated agent's bad config (here, a persona file that does not exist)
+# blocks mail for every agent, including a healthy handler seat that
+# shares the file -- documented behavior (docs/agent-mail.md's "The
+# postmaster" section), not scoped to the reserved-name case above.
+new_root BLAST_RADIUS_HANDLERS_DIR
+cat > "$BLAST_RADIUS_HANDLERS_DIR/noop-handler" <<'STUB'
+#!/usr/bin/env bash
+exit 0
+STUB
+chmod +x "$BLAST_RADIUS_HANDLERS_DIR/noop-handler"
+new_root BLAST_RADIUS_PERSONAS_DIR
+new_root BLAST_RADIUS_FLEET_DIR
+export FORK_SANDBOX_FLEET_FILE="$BLAST_RADIUS_FLEET_DIR/fleet.yaml"
+cat > "$FORK_SANDBOX_FLEET_FILE" <<'EOF'
+agents:
+  handlerseat:
+    handler: exec
+    command: noop-handler
+  ghost:
+    persona: ghost.md
+EOF
+export FORK_SANDBOX_PERSONAS_DIR="$BLAST_RADIUS_PERSONAS_DIR"
+export FORK_SANDBOX_HANDLERS_DIR="$BLAST_RADIUS_HANDLERS_DIR"
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+mid="$(send_msg '@bob' '@handlerseat' 'fleet gate blast radius' 'body' 8)"
+blast_out="$("$postmaster" deliver --project "$PROJECT_DIR" --once 2>&1)"
+blast_rc=$?
+check "fleet gate blast radius: one bad unrelated agent refuses the whole pass" 1 "$blast_rc"
+contains "fleet gate blast radius: refusal names the broken agent" "$blast_out" "agents.ghost"
+blast_posted=0
+tid="$(thread_of "$mid")"
+for f in "$FORK_SANDBOX_MAIL_ROOT/threads/$tid"/*.msg; do
+    [[ -e "$f" ]] || continue
+    [[ "$(header_of_file "$f" From)" == "@handlerseat" ]] && blast_posted=1
+done
+check "fleet gate blast radius: the healthy handler seat did not route either" 0 "$blast_posted"
+unset BLAST_RADIUS_FLEET_DIR BLAST_RADIUS_PERSONAS_DIR BLAST_RADIUS_HANDLERS_DIR FORK_SANDBOX_HANDLERS_DIR
+export FORK_SANDBOX_FLEET_FILE="$SAVED_FLEET_FILE_STARTUP"
+export FORK_SANDBOX_PERSONAS_DIR="$SAVED_PERSONAS_DIR_STARTUP"
+unset SAVED_PERSONAS_DIR_STARTUP
+
 # A clean fleet file (the shared fixture) passes the gate and routes
 # normally -- covered by every other `once`/`deliver` call in this suite,
 # all of which exercise the gate on the way in; this is just the direct
@@ -2356,6 +2436,18 @@ sleep 5
 printf '\nToo slow.\n' > "$FS_HANDLER_OUTBOX/mail-1.md"
 STUB
 
+# Ignores SIGTERM outright, so `timeout` cannot end it with the signal
+# alone -- it can only die once the --kill-after grace period elapses and
+# `timeout` escalates to SIGKILL. That is the rc-137 path (as opposed to
+# plain `timeout-handler` above, which dies on the first SIGTERM and only
+# ever exercises rc 124).
+cat > "$HANDLER_STUB_DIR/trap-term-handler" <<'STUB'
+#!/usr/bin/env bash
+trap '' TERM
+sleep 15
+printf '\nOutlived TERM.\n' > "$FS_HANDLER_OUTBOX/mail-1.md"
+STUB
+
 cat > "$HANDLER_STUB_DIR/hostile-body-handler" <<'STUB'
 #!/usr/bin/env bash
 set -uo pipefail
@@ -2397,6 +2489,9 @@ agents:
   slowpoke:
     handler: exec
     command: timeout-handler
+  ignorepoke:
+    handler: exec
+    command: trap-term-handler
   hostilebody:
     handler: exec
     command: hostile-body-handler
@@ -2535,6 +2630,24 @@ for f in "$FORK_SANDBOX_MAIL_ROOT/threads/$tid"/*.msg; do
     [[ "$(header_of_file "$f" From)" == "@slowpoke" ]] && timeout_posted=1
 done
 check "timeout: the killed handler's late write never posted" 0 "$timeout_posted"
+unset FORK_SANDBOX_HANDLER_TIMEOUT
+
+# --- scenario: a handler that ignores SIGTERM outlives the plain timeout
+#     and is only ended once --kill-after's grace period elapses and
+#     `timeout` escalates to SIGKILL (rc 137, not 124) -- the flag reason
+#     must still name it a timeout, not "exited 137" ---
+export FORK_SANDBOX_HANDLER_TIMEOUT=2
+mid="$(send_msg '@carol' '@ignorepoke' 'Immune to TERM' 'trigger')"
+tid="$(thread_of "$mid")"
+once
+contains "kill-after: SIGKILL-ended handler flagged as a timeout, not exited 137" \
+    "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid" 2>/dev/null)" "timed out after 2s"
+ignorepoke_posted=0
+for f in "$FORK_SANDBOX_MAIL_ROOT/threads/$tid"/*.msg; do
+    [[ -e "$f" ]] || continue
+    [[ "$(header_of_file "$f" From)" == "@ignorepoke" ]] && ignorepoke_posted=1
+done
+check "kill-after: the SIGKILL-ended handler's late write never posted" 0 "$ignorepoke_posted"
 unset FORK_SANDBOX_HANDLER_TIMEOUT
 
 # --- scenario: header-shaped lines in the BODY are never reinterpreted as

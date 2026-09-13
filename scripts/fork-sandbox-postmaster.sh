@@ -548,6 +548,13 @@ HANDLERS_DIR="${FORK_SANDBOX_HANDLERS_DIR:-$HOME/.config/fork-sandbox/handlers}"
 # fleet with no fleet.yaml is valid, and `fleet check` requires the file
 # to exist, so its absence must skip the gate rather than fail it.
 FLEET_FILE="${FORK_SANDBOX_FLEET_FILE:-$HOME/.config/fork-sandbox/fleet.yaml}"
+# Same reasoning again for fleet.sh's own PERSONAS_DIR (fleet.sh:165):
+# `fleet check` also hard-requires this directory to exist, but a fleet
+# made only of `handler: exec` seats needs no persona file at all (see
+# fleet.sh's own header), so an operator running such a fleet may never
+# have created ~/.config/fork-sandbox/personas. Its absence must skip the
+# gate the same way a missing fleet file does, not fail it.
+PERSONAS_DIR="${FORK_SANDBOX_PERSONAS_DIR:-$HOME/.config/fork-sandbox/personas}"
 # One fresh, empty, writable outbox dir per handler wake, parallel to
 # $HANDOFFS -- see pm_exec_wake.
 HANDLER_OUTBOX="$STATE/handler-outbox"
@@ -989,13 +996,18 @@ pm_require_kit() {
 # moment it happens, instead of a silent behavior change discovered later.
 # A personas-only fleet (no fleet.yaml) is a valid setup -- `fleet check`
 # itself requires the file to exist, so its absence is not an error here,
-# it just means there is nothing for this gate to check. Startup only, not
+# it just means there is nothing for this gate to check. Symmetrically, a
+# fleet made only of `handler: exec` seats needs no persona file at all,
+# so a missing personas dir is skipped the same way: `fleet check` also
+# hard-requires that directory, but its absence only means there is
+# nothing in it for this gate to check either. Startup only, not
 # per route pass: the dangerous wake-time properties (handler command bare
 # name, executable, regular file) are already re-checked at wake time (see
 # pm_exec_wake); re-running full fleet validation on every pass would tax
 # every route pass for a mid-run edit the next restart would catch anyway.
 pm_require_fleet_check() {
     [[ -f "$FLEET_FILE" ]] || return 0
+    [[ -d "$PERSONAS_DIR" ]] || return 0
     "$FLEET" check
 }
 
@@ -1296,7 +1308,12 @@ pm_exec_wake() {
     # same order the LLM wake path uses (pm_harvest_run, further down).
     if (( rc != 0 )); then
         local cause="exited $rc"
-        (( rc == 124 )) && cause="timed out after ${timeout_s}s"
+        # GNU timeout returns 124 when SIGTERM alone ends the child, and 137
+        # when the --kill-after grace period elapses and it has to SIGKILL
+        # it -- a handler that traps or ignores SIGTERM (exactly the child
+        # --kill-after exists to bound) exits via the second path, not the
+        # first.
+        (( rc == 124 || rc == 137 )) && cause="timed out after ${timeout_s}s"
         local err_out=""
         [[ -s "$stderr_capture" ]] && err_out=" ($(pm_trim "$(tail -n1 -- "$stderr_capture")"))"
         pm_flag "$tid" "handler '$command' for $agent $cause: $mid$err_out"

@@ -224,8 +224,8 @@ lists:
 **Handler seats** (`handler: exec`): a script seat instead of an LLM seat.
 `command` (a bare name, never a path — resolved against
 `$FORK_SANDBOX_HANDLERS_DIR`, default `~/.config/fork-sandbox/handlers`,
-and required to exist and be executable both at `fleet check` time and
-again at wake time) is then required, and none of
+and required to exist, be a regular file, and be executable both at
+`fleet check` time and again at wake time) is then required, and none of
 `harness`/`model`/`network`/`thinking`/`triage`/`persona`/`refresh-at`/`preset`
 may be set on the same agent — in fleet.yaml or in the seat's own
 `<name>.md` frontmatter alike — since those tune an LLM seat, which a
@@ -355,6 +355,13 @@ fork-sandbox postmaster flag   <thread-id> [reason]
 fork-sandbox postmaster unflag <thread-id>
 ```
 
+Before anything else, `deliver` runs `fleet check` once and refuses to
+start at all if it fails (skipped only when there is no fleet file, or no
+personas directory, to check) — a fleet.yaml typo in one agent's
+`persona`, `harness`/`network` pairing, `preset`, or handler `command`
+blocks mail for every agent, not just the broken one, until it is fixed.
+The error goes to `deliver`'s own stderr, so a backgrounded postmaster
+that hits this reports it there and nowhere else. Once past that gate,
 `deliver` loops — scan, route, harvest, sleep
 `$FORK_SANDBOX_POSTMASTER_INTERVAL` seconds (default 15) — until
 SIGTERM/SIGINT. `--once` does a single pass and exits. `status` prints
