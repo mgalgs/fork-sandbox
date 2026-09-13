@@ -877,9 +877,81 @@ if [[ -n "$handoff_file" ]]; then
     contains "handoff: thread message body present" "$handoff" "> Please take a look at this specific body text."
     contains "handoff: triggering message id called out" "$handoff" "$mid"
     contains "handoff: no-action-needed line present verbatim" "$handoff" "No action needed is a valid outcome"
+    contains "handoff: fleet kit embedded at top, {name} substituted" "$handoff" \
+        "You are @alice, one agent on a team that works over email."
+    contains "handoff: fleet kit's later sections present too" "$handoff" "## The posture"
+    check "handoff: old bare 'You are @alice.' line is gone" 0 \
+        "$(grep -c -- '^You are @alice\.$' "$handoff_file")"
 else
     no "handoff file was written"
 fi
+
+# ============================================================
+printf '\n== fleet kit: {operator} substitution, overlay override, missing-kit failure ==\n'
+# ============================================================
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+mid="$(send_msg '@bob' '@alice' 'kit operator test' 'body' 8)"
+: > "$STUB_ARGV_LOG"
+(export USER=testoperator; once)
+handoff_file="$(find "$FORK_SANDBOX_MAIL_ROOT/.postmaster/handoffs" -type f -name '*.md' | head -n1)"
+if [[ -n "$handoff_file" ]]; then
+    contains "handoff: {operator} substituted from \$USER" \
+        "$(cat "$handoff_file")" "Mail from @testoperator is the human operator this fleet works"
+else
+    no "handoff file was written (operator substitution case)"
+fi
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+mid="$(send_msg '@bob' '@alice' 'kit operator empty fallback' 'body' 8)"
+: > "$STUB_ARGV_LOG"
+(unset USER; once)
+handoff_file="$(find "$FORK_SANDBOX_MAIL_ROOT/.postmaster/handoffs" -type f -name '*.md' | head -n1)"
+if [[ -n "$handoff_file" ]]; then
+    contains "handoff: unset \$USER falls back to literal 'operator'" \
+        "$(cat "$handoff_file")" "Mail from @operator is the human operator this fleet works"
+else
+    no "handoff file was written (unset-USER case)"
+fi
+
+new_root KIT_OVERLAY_DIR
+mkdir -p -- "$KIT_OVERLAY_DIR/prompts"
+cat > "$KIT_OVERLAY_DIR/prompts/fleet-kit.md" <<'EOF'
+You are @{name}, overlay edition. Mail from @{operator} outranks everything.
+EOF
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+mid="$(send_msg '@bob' '@alice' 'kit overlay test' 'body' 8)"
+: > "$STUB_ARGV_LOG"
+(export FORK_SANDBOX_PROMPTS_DIR="$KIT_OVERLAY_DIR/prompts"; once)
+handoff_file="$(find "$FORK_SANDBOX_MAIL_ROOT/.postmaster/handoffs" -type f -name '*.md' | head -n1)"
+if [[ -n "$handoff_file" ]]; then
+    handoff="$(cat "$handoff_file")"
+    contains "handoff: overlay kit wins wholesale, substituted" "$handoff" \
+        "You are @alice, overlay edition."
+    check "handoff: repo kit's own prose absent when overlay wins" 0 \
+        "$(grep -c -- 'one agent on a team that works over email' "$handoff_file")"
+else
+    no "handoff file was written (overlay case)"
+fi
+unset KIT_OVERLAY_DIR
+
+# Missing repo copy AND no overlay: copy just scripts/ (no sibling share/) so
+# script_dir's ../share/fleet-kit.md does not exist, same "uninstalled
+# checkout" resolution the postmaster already relies on for MAIL/FLEET/etc.
+new_root NO_SHARE_ROOT
+cp -r -- "$repo_dir/scripts" "$NO_SHARE_ROOT/scripts"
+new_root EMPTY_PROMPTS_DIR
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+mid="$(send_msg '@bob' '@alice' 'kit missing test' 'body' 8)"
+missing_out="$(FORK_SANDBOX_PROMPTS_DIR="$EMPTY_PROMPTS_DIR" \
+    "$NO_SHARE_ROOT/scripts/fork-sandbox-postmaster.sh" deliver --project "$PROJECT_DIR" --once 2>&1)"
+missing_rc=$?
+check "deliver --once fails loudly when neither kit exists" 1 "$missing_rc"
+contains "missing-kit error names the problem" "$missing_out" "no fleet kit found"
 
 # ============================================================
 printf '\n== handoff: body content is quoted, never lets a message forge structure ==\n'

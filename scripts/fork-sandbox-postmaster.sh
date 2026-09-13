@@ -121,7 +121,9 @@
 # itself deletes empty branches.
 #
 # The generated handoff embeds everything the sandbox needs and nothing
-# it can reach on its own: "You are @<agent>." plus the persona's markdown
+# it can reach on its own: the fleet kit (share/fleet-kit.md, overlay-
+# overridable at <prompts-dir>/fleet-kit.md -- see pm_kit_path) with
+# {name}/{operator} substituted, plus the persona's markdown
 # body (frontmatter stripped), the thread section, the triggering
 # message-id called out, the reply-file format, the transparency norm
 # (private side-channels are fine but say so on-thread if they shaped your
@@ -333,6 +335,10 @@ MAIL_RENDER="$script_dir/fork-sandbox-mail-render.py"
 # sitting next to each other, but PATH lookup alone would fail. Overridable
 # so the test suite can point this at a stub instead of the real launcher.
 FORK_SANDBOX="${FORK_SANDBOX_POSTMASTER_LAUNCHER:-$script_dir/fork-sandbox.sh}"
+# The repo's own copy of the fleet kit (see pm_kit_path below); resolved
+# through script_dir like the scripts above so an installed symlink still
+# finds it.
+REPO_FLEET_KIT="$script_dir/../share/fleet-kit.md"
 # shellcheck source-path=SCRIPTDIR
 # shellcheck source=fork-sandbox-lib.sh
 # shellcheck disable=SC1091  # plain shellcheck cannot follow it; use -x
@@ -537,11 +543,63 @@ pm_lock_release() {
 
 # ---- handoff generation ----
 
+# Resolves the fleet kit's path: an overlay at
+# <prompts-dir>/fleet-kit.md wins wholesale over the repo's own copy, no
+# merging -- same directory resolution fork-sandbox.sh uses for its prompt
+# overlays (scripts/fork-sandbox.sh lines 756 and 2872: FORK_SANDBOX_PROMPTS_DIR,
+# falling back to FORK_SANDBOX_CONFIG_DIR/prompts, falling back to
+# ~/.config/fork-sandbox/prompts; see docs/prompt-overlays.md). Prints the
+# resolved path and returns 0, or returns 1 with nothing printed when neither
+# exists.
+pm_kit_path() {
+    local config_dir prompts_dir overlay
+    config_dir="${FORK_SANDBOX_CONFIG_DIR:-$HOME/.config/fork-sandbox}"
+    prompts_dir="${FORK_SANDBOX_PROMPTS_DIR:-$config_dir/prompts}"
+    overlay="$prompts_dir/fleet-kit.md"
+    if [[ -f "$overlay" ]]; then
+        printf '%s' "$overlay"
+        return 0
+    fi
+    if [[ -f "$REPO_FLEET_KIT" ]]; then
+        printf '%s' "$REPO_FLEET_KIT"
+        return 0
+    fi
+    return 1
+}
+
+# Fails loudly if no kit is reachable -- called once at deliver startup so a
+# broken install refuses up front instead of every wake's handoff failing
+# quietly (same posture as fs_require_scratch_handoff above it in cmd_deliver).
+pm_require_kit() {
+    if ! pm_kit_path >/dev/null; then
+        local config_dir prompts_dir
+        config_dir="${FORK_SANDBOX_CONFIG_DIR:-$HOME/.config/fork-sandbox}"
+        prompts_dir="${FORK_SANDBOX_PROMPTS_DIR:-$config_dir/prompts}"
+        echo "Error: postmaster: no fleet kit found. Looked for an overlay at" >&2
+        echo "  $prompts_dir/fleet-kit.md" >&2
+        echo "and the repo's own copy at" >&2
+        echo "  $REPO_FLEET_KIT" >&2
+        echo "Every wake embeds this file at the top of its handoff -- fix the" >&2
+        echo "install (the repo copy should always exist) or the overlay path." >&2
+        return 1
+    fi
+    return 0
+}
+
 pm_write_handoff() {
     local out="$1" agent="$2" persona_path="$3" tid="$4" trigger_mid="$5"
-    local render_rc=0
+    local render_rc=0 kit_path kit_text operator
+    kit_path="$(pm_kit_path)" || {
+        echo "Error: postmaster: fleet kit missing (checked loudly at deliver" >&2
+        echo "startup; this should not be reachable mid-run)." >&2
+        return 1
+    }
+    kit_text="$(<"$kit_path")"
+    operator="${USER:-operator}"
+    kit_text="${kit_text//\{name\}/$agent}"
+    kit_text="${kit_text//\{operator\}/$operator}"
     {
-        printf 'You are @%s.\n\n' "$agent"
+        printf '%s\n\n' "$kit_text"
         if [[ -n "$persona_path" && -f "$persona_path" ]]; then
             pm_persona_body "$persona_path"
             printf '\n'
@@ -1316,6 +1374,7 @@ cmd_deliver() {
     # instead of every single spawn dying with "spawn failed for <agent>: <mid>"
     # and the real reason buried in the deliver loop's stderr.
     fs_require_scratch_handoff "$HANDOFFS/probe.md" || return 1
+    pm_require_kit || return 1
 
     mkdir -p -- "$MAIL_ROOT" "$STATE"
     pm_lock_acquire || return 1
