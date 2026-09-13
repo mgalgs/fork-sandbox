@@ -676,6 +676,7 @@ through pi directly.
 fork-sandbox-mail-render.py <mail-root> -o threads.html
 fork-sandbox-mail-render.py <mail-root> --thread <id> -o t.html
 fork-sandbox-mail-render.py --text <mail-root> [--thread <id>]
+fork-sandbox-mail-render.py <mail-root> -o threads.html --live [SECONDS]
 ```
 
 The renderer reads the store and never writes to it, and never invokes
@@ -703,6 +704,17 @@ to Message-ID / From / To / Cc / Subject / hops. There is deliberately no
 `Date`, to save prompt tokens. The Message-ID stays, because it is the
 handle every id-taking verb needs, and a view an agent cannot act on is
 not a view.
+
+**`--live [SECONDS]`** turns the HTML render into a standing process for
+watching an in-progress thread in a browser: render, write `-o`'s file
+atomically, sleep `SECONDS` (default 15, minimum 2), and repeat until
+SIGINT/SIGTERM. Each cycle re-scans the store, so new messages and
+threads appear as they land. It requires `-o`/`--output` and is refused
+with `--text`. The page gains a `<meta http-equiv="refresh">` tag and a
+banner reporting the render time, message count, and any currently live
+postmaster wakes read from `<mail-root>/.postmaster/`. A bad render
+mid-loop skips that cycle rather than exiting; a bad `mail-root` at
+startup still fails fast, same as without `--live`.
 
 ## The anti-forgery grammar
 
@@ -763,7 +775,7 @@ fork-sandbox mail send --from @operator --to @reviewer --cc @crew \
 
 # 5. Watch.
 fork-sandbox postmaster status
-fork-sandbox-mail-render.py "$FORK_SANDBOX_MAIL_ROOT" -o threads.html
+fork-sandbox-mail-render.py "$FORK_SANDBOX_MAIL_ROOT" -o threads.html --live
 ```
 
 To stop a runaway conversation, `postmaster flag <thread-id>`; to

@@ -283,8 +283,44 @@ else
 fi
 contains "--live floor error names the minimum" "$(<"$work/live-floor.err")" "at least 2"
 
-if grep -q 'os\.replace(' "$renderer"; then ok "renderer writes via os.replace (atomic)"; else no "renderer writes via os.replace (atomic)"; fi
-if grep -q 'tempfile\.mkstemp(' "$renderer"; then ok "renderer stages a temp file before replace"; else no "renderer stages a temp file before replace"; fi
+tmp_ok_dir="$work/tmp-ok"
+mkdir -p "$tmp_ok_dir"
+python3 "$renderer" "$FORK_SANDBOX_MAIL_ROOT" -o "$tmp_ok_dir/out.html" --live 2 --live-cycles 2 \
+    >/dev/null 2>"$work/tmpok.err"
+if find "$tmp_ok_dir" -maxdepth 1 -name '.mail-render-*.tmp' -print -quit | grep -q .; then
+    no "no stray .mail-render-*.tmp file left after successful cycles"
+else
+    ok "no stray .mail-render-*.tmp file left after successful cycles"
+fi
+
+# Force a failure between the temp-file write and os.replace by pointing
+# -o at a path that is itself a directory: write_atomic's temp file gets
+# staged in the parent dir, then os.replace raises (dst is a directory),
+# and the except-BaseException cleanup in write_atomic must still unlink
+# the temp file rather than leaving it behind.
+tmp_fail_dir="$work/tmp-fail"
+mkdir -p "$tmp_fail_dir/out.html"
+python3 "$renderer" "$FORK_SANDBOX_MAIL_ROOT" -o "$tmp_fail_dir/out.html" --live 2 --live-cycles 1 \
+    >/dev/null 2>"$work/tmpfail.err"
+if find "$tmp_fail_dir" -maxdepth 1 -name '.mail-render-*.tmp' -print -quit | grep -q .; then
+    no "no stray .mail-render-*.tmp file left after a failed write"
+else
+    ok "no stray .mail-render-*.tmp file left after a failed write"
+fi
+
+# --live must preserve the output file's existing permissions (or the
+# umask-derived default for a fresh file), not silently downgrade to the
+# 0600 tempfile.mkstemp creates its staging file with.
+perm_html="$work/perm.html"
+: > "$perm_html"
+chmod 644 "$perm_html"
+python3 "$renderer" "$FORK_SANDBOX_MAIL_ROOT" -o "$perm_html" --live 2 --live-cycles 1 >/dev/null 2>"$work/perm.err"
+perm_mode="$(stat -c '%a' "$perm_html" 2>/dev/null || stat -f '%Lp' "$perm_html")"
+if [[ "$perm_mode" == "644" ]]; then
+    ok "--live preserves an existing output file's permissions"
+else
+    no "--live preserves an existing output file's permissions" "got mode $perm_mode, expected 644"
+fi
 
 # A hand-crafted .postmaster/ state: one live run (not yet harvested) and
 # one harvested run, matching the shape fork-sandbox-postmaster.sh itself
@@ -353,6 +389,58 @@ if [[ "$survive_rc" -eq 0 ]]; then ok "loop survives a mid-loop write failure, e
 contains "a failed cycle is reported on stderr, not silently dropped" "$(<"$work/live-survive.err")" "Error:"
 final_live_content="$(<"$live_survive_html")"
 contains "the file is left in a valid, fully-rendered state after recovery" "$final_live_content" '</html>'
+
+printf '\n== --live stop signal handling ==\n'
+
+# Waits for $1 to exit, force-killing it after $2 seconds so a regression
+# that hangs the loop fails the test instead of hanging the whole suite.
+# Sets WAIT_RC to the process's exit code, or 124 if it had to be killed.
+wait_with_timeout() {
+    local pid="$1" timeout_s="$2" waited=0
+    while kill -0 "$pid" 2>/dev/null; do
+        sleep 0.1
+        waited=$(( waited + 1 ))
+        if (( waited >= timeout_s * 10 )); then
+            kill -KILL "$pid" 2>/dev/null
+            wait "$pid" 2>/dev/null
+            WAIT_RC=124
+            return
+        fi
+    done
+    wait "$pid"
+    WAIT_RC=$?
+}
+
+# A signal landing during the interval sleep (not inside a render) already
+# worked before the _StopLive fix -- this just guards against regressing it.
+sleep_sig_html="$work/live-sleep-sig.html"
+python3 "$renderer" "$FORK_SANDBOX_MAIL_ROOT" -o "$sleep_sig_html" --live 5 \
+    >/dev/null 2>"$work/live-sleep-sig.err" &
+sleep_sig_pid=$!
+for _ in $(seq 1 50); do [[ -s "$sleep_sig_html" ]] && break; sleep 0.1; done
+sleep 0.3
+kill -TERM "$sleep_sig_pid"
+wait_with_timeout "$sleep_sig_pid" 3
+if [[ "$WAIT_RC" -eq 0 ]]; then ok "SIGTERM during the sleep window: exits 0 promptly"; else no "SIGTERM during the sleep window: exits 0 promptly" "rc=$WAIT_RC"; fi
+not_contains "SIGTERM during the sleep window: not reported as a render failure" "$(<"$work/live-sleep-sig.err")" "render cycle failed"
+
+# A signal landing while a render is actually running is the bug this
+# regression test exists for: _StopLive used to subclass Exception, so the
+# per-cycle `except Exception` guard swallowed it, printed it as a skipped
+# render, and kept looping instead of stopping. --live-render-delay is a
+# hidden, test-only hook (see the script's docstring) that pads every
+# render with a sleep, so the signal can be aimed at the render window
+# deterministically instead of racing real render latency.
+render_sig_html="$work/live-render-sig.html"
+python3 "$renderer" "$FORK_SANDBOX_MAIL_ROOT" -o "$render_sig_html" --live 2 --live-render-delay 3 \
+    >/dev/null 2>"$work/live-render-sig.err" &
+render_sig_pid=$!
+for _ in $(seq 1 80); do [[ -s "$render_sig_html" ]] && break; sleep 0.1; done
+sleep 2.3   # first cycle's 2s interval sleep elapses; now ~0.3s into cycle 2's 3s render
+kill -TERM "$render_sig_pid"
+wait_with_timeout "$render_sig_pid" 4
+if [[ "$WAIT_RC" -eq 0 ]]; then ok "SIGTERM during a render: exits 0 promptly, not swallowed"; else no "SIGTERM during a render: exits 0 promptly, not swallowed" "rc=$WAIT_RC (124 means it had to be force-killed)"; fi
+not_contains "SIGTERM during a render: not reported as a render failure" "$(<"$work/live-render-sig.err")" "render cycle failed"
 
 printf '\n== exit codes ==\n'
 if python3 "$renderer" "$work/no-such-root" >/dev/null 2>"$work/missing.err"; then

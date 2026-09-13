@@ -66,13 +66,16 @@ best-effort: a missing or unreadable .postmaster/ just omits the
 live-wakes clause from the banner, never a crash. A bad render
 mid-loop (e.g. a message file mid-write by a concurrent harvest) skips
 that cycle rather than exiting; a bad mail-root at startup still fails
-fast, as without --live. --live-cycles N is a hidden, test-only escape
-hatch that stops the loop after N cycles instead of running forever.
+fast, as without --live. --live-cycles N and --live-render-delay
+SECONDS are hidden, test-only hooks: the former stops the loop after N
+cycles instead of running forever, the latter pads every render with a
+sleep so a test can land a signal inside the render window on purpose.
 """
 import argparse
 import html
 import os
 import signal
+import stat
 import sys
 import tempfile
 import time
@@ -540,6 +543,13 @@ def write_atomic(path, content):
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(content)
+        try:
+            mode = stat.S_IMODE(os.stat(path).st_mode)
+        except OSError:
+            umask = os.umask(0)
+            os.umask(umask)
+            mode = 0o666 & ~umask
+        os.chmod(tmp_path, mode)
         os.replace(tmp_path, path)
     except BaseException:
         try:
@@ -549,17 +559,25 @@ def write_atomic(path, content):
         raise
 
 
-class _StopLive(Exception):
-    """Raised from the SIGINT/SIGTERM handler to unwind run_live cleanly."""
+class _StopLive(BaseException):
+    """Raised from the SIGINT/SIGTERM handler to unwind run_live cleanly.
+
+    Derives from BaseException, not Exception: the per-cycle `except
+    Exception` guard in run_live's loop must never swallow this, or a
+    signal landing mid-render gets reported as a render failure and the
+    loop keeps going instead of stopping."""
 
 
-def run_live(mail_root, output, title, thread_filter, interval, cycles):
+def run_live(mail_root, output, title, thread_filter, interval, cycles, render_delay=0):
     """Renders in a loop: render, write atomically, sleep, repeat, until
     SIGINT/SIGTERM (cycles=None) or `cycles` renders have happened
     (cycles is the test-only escape hatch, see --live-cycles). The first
     cycle's write failure is fatal (a bad output path fails fast, same
     as a one-shot run); every cycle after that is caught and skipped so
-    one bad render never kills the loop."""
+    one bad render never kills the loop. render_delay is a second
+    test-only hook (see --live-render-delay) that pads every render with
+    a sleep, so a test can land a signal inside the render window on
+    purpose instead of racing real render latency."""
 
     def raise_stop(signum, frame):
         raise _StopLive()
@@ -568,6 +586,8 @@ def run_live(mail_root, output, title, thread_filter, interval, cycles):
     signal.signal(signal.SIGTERM, raise_stop)
 
     def render_once():
+        if render_delay:
+            time.sleep(render_delay)
         all_ids = list_thread_ids(mail_root)
         if thread_filter:
             thread_ids = [thread_filter] if thread_filter in all_ids else []
@@ -614,6 +634,7 @@ def main(argv=None):
         help="re-render to -o/--output on an interval (default 15s, minimum 2s) until interrupted",
     )
     parser.add_argument("--live-cycles", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--live-render-delay", type=float, default=0, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
 
     if args.live is not None:
@@ -649,7 +670,10 @@ def main(argv=None):
         return 0
 
     if args.live is not None:
-        return run_live(args.mail_root, args.output, args.title, args.thread, args.live, args.live_cycles)
+        return run_live(
+            args.mail_root, args.output, args.title, args.thread, args.live,
+            args.live_cycles, args.live_render_delay,
+        )
 
     document = build_html(args.mail_root, thread_ids, args.title)
     if args.output:
