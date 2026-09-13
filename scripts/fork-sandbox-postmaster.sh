@@ -436,8 +436,10 @@
 #     concurrency or backgrounding for it. A slow handler stalls the whole
 #     pass behind it, delaying routing for every other message and thread
 #     until it returns or its timeout ($FORK_SANDBOX_HANDLER_TIMEOUT,
-#     default 300) kills it. The timeout bounds
-#     how long a stall can last; it does not make the wake concurrent with
+#     default 300) kills it -- SIGTERM, then SIGKILL 10s later if the
+#     child ignores it (--kill-after 10), so the timeout unconditionally
+#     bounds how long a stall can last, even against a child that traps
+#     or ignores SIGTERM; it does not make the wake concurrent with
 #     anything else deliver is doing.
 #   - Session resume depends on the harness's own capability
 #     (fs_harness_session_caps, fork-sandbox-lib.sh): claude and codex
@@ -816,7 +818,7 @@ pm_triage_wake() {
         local -a args=()
         [[ -n "$t_model" ]] && args+=(--model "$t_model")
         args+=("$work_dir" -p)
-        out="$("$FS_TIMEOUT" "$timeout_s" "$bin" "${args[@]}" < "$prompt_file" 2>/dev/null)"
+        out="$("$FS_TIMEOUT" --kill-after 10 "$timeout_s" "$bin" "${args[@]}" < "$prompt_file" 2>/dev/null)"
         rc=$?
     else
         # Every other harness value ("claude" or empty; codex is refused
@@ -834,7 +836,7 @@ pm_triage_wake() {
         local -a args=("$work_dir" --dangerously-skip-permissions --print \
                         --tools "")
         [[ -n "$t_model" ]] && args+=(--model "$t_model")
-        out="$("$FS_TIMEOUT" "$timeout_s" "$bin" "${args[@]}" < "$prompt_file" 2>/dev/null)"
+        out="$("$FS_TIMEOUT" --kill-after 10 "$timeout_s" "$bin" "${args[@]}" < "$prompt_file" 2>/dev/null)"
         rc=$?
     fi
     set -e
@@ -1269,7 +1271,7 @@ pm_exec_wake() {
         "FS_HANDLER_TRIGGER=$mid" \
         "FS_HANDLER_OUTBOX=$outbox" \
         "FS_HANDLER_ATTACH_DIR=$MAIL_ROOT/threads/$tid/attachments" \
-        "$FS_TIMEOUT" "$timeout_s" "$handler_path" \
+        "$FS_TIMEOUT" --kill-after 10 "$timeout_s" "$handler_path" \
         < "$rendered" > /dev/null 2>"$stderr_capture"
     rc=$?
     set -e

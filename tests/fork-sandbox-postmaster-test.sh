@@ -2636,6 +2636,114 @@ export FORK_SANDBOX_FLEET_FILE="$SAVED_FLEET_FILE"
 export FORK_SANDBOX_PERSONAS_DIR="$SAVED_PERSONAS_DIR"
 
 # ============================================================
+printf '\n== --kill-after 10 on every FS_TIMEOUT invocation ==\n'
+# ============================================================
+# A child that ignores SIGTERM must still die -- `timeout` alone reports
+# rc 124 but lets an ignoring child run to completion. This stubs `timeout`
+# itself (not the classifier/handler binary underneath it), so the
+# assertion is on what postmaster.sh hands the coreutils binary, not on
+# what the wrapped command sees.
+
+SAVED_FLEET_FILE="$FORK_SANDBOX_FLEET_FILE"
+SAVED_PERSONAS_DIR="$FORK_SANDBOX_PERSONAS_DIR"
+SAVED_PATH="$PATH"
+
+new_root KILL_AFTER_TIMEOUT_STUB_DIR
+KILL_AFTER_ARGV_LOG="$work/kill-after-argv.log"
+export KILL_AFTER_ARGV_LOG
+: > "$KILL_AFTER_ARGV_LOG"
+# Answers --version as GNU coreutils so _fs_resolve_gnu_tool
+# (fork-sandbox-lib.sh) accepts it as $FS_TIMEOUT; otherwise logs its full
+# argv, then strips the leading `--kill-after N DURATION` it expects and
+# execs the rest, so the wrapped classifier/handler still actually runs.
+cat > "$KILL_AFTER_TIMEOUT_STUB_DIR/timeout" <<'STUB'
+#!/usr/bin/env bash
+set -uo pipefail
+if [[ "${1:-}" == --version ]]; then
+    echo "timeout (GNU coreutils) 9.9"
+    exit 0
+fi
+{
+    printf -- '----CALL----\n'
+    for a in "$@"; do printf '%s\n' "$a"; done
+} >> "$KILL_AFTER_ARGV_LOG"
+if [[ "${1:-}" == --kill-after ]]; then
+    shift 2
+fi
+shift
+exec "$@"
+STUB
+chmod +x "$KILL_AFTER_TIMEOUT_STUB_DIR/timeout"
+PATH="$KILL_AFTER_TIMEOUT_STUB_DIR:$PATH"
+
+new_root KILL_AFTER_HANDLERS_DIR
+export FORK_SANDBOX_HANDLERS_DIR="$KILL_AFTER_HANDLERS_DIR"
+cat > "$KILL_AFTER_HANDLERS_DIR/quiet-handler" <<'STUB'
+#!/usr/bin/env bash
+exit 0
+STUB
+chmod +x "$KILL_AFTER_HANDLERS_DIR/quiet-handler"
+
+new_root KILL_AFTER_TRIAGE_STUB_BIN
+cat > "$KILL_AFTER_TRIAGE_STUB_BIN/triage-launcher" <<'STUB'
+#!/usr/bin/env bash
+cat >/dev/null
+printf 'wake\n'
+STUB
+chmod +x "$KILL_AFTER_TRIAGE_STUB_BIN/triage-launcher"
+export FORK_SANDBOX_POSTMASTER_TRIAGE_LAUNCHER="$KILL_AFTER_TRIAGE_STUB_BIN/triage-launcher"
+
+new_root KILL_AFTER_PERSONAS_DIR
+export FORK_SANDBOX_PERSONAS_DIR="$KILL_AFTER_PERSONAS_DIR"
+new_root KILL_AFTER_FLEET_DIR
+export FORK_SANDBOX_FLEET_FILE="$KILL_AFTER_FLEET_DIR/fleet.yaml"
+
+cat > "$FORK_SANDBOX_PERSONAS_DIR/fromagent.md" <<'EOF'
+Fromagent is the sender used throughout this group -- an agent, not the
+operator, so its mail is subject to triage (never bypassed as
+operator/external mail).
+EOF
+cat > "$FORK_SANDBOX_PERSONAS_DIR/sender.md" <<'EOF'
+Sender is the direct recipient; never gated by triage.
+EOF
+cat > "$FORK_SANDBOX_PERSONAS_DIR/triagee.md" <<'EOF'
+Triagee is a Cc-only agent gated by the triage classifier.
+EOF
+
+cat > "$FORK_SANDBOX_FLEET_FILE" <<'EOF'
+agents:
+  fromagent:
+    description: sender used throughout this group
+  sender:
+    description: direct recipient, never gated
+  triagee:
+    description: Cc-only agent gated by triage
+  handlerseat:
+    handler: exec
+    command: quiet-handler
+triage:
+  harness: claude
+EOF
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+send_msg '@fromagent' '@sender' 'kill-after fanout' 'body' 8 '@triagee,@handlerseat' > /dev/null
+"$postmaster" deliver --project "$PROJECT_DIR" --once > /dev/null 2>&1
+
+check "kill-after: two \$FS_TIMEOUT invocations (triage wake + handler wake)" 2 \
+    "$(grep -c -- '----CALL----' "$KILL_AFTER_ARGV_LOG")"
+check "kill-after: every invocation carries '--kill-after'" 2 \
+    "$(grep -c -- '^--kill-after$' "$KILL_AFTER_ARGV_LOG")"
+check "kill-after: every invocation's grace period is 10" 2 \
+    "$(grep -c -- '^10$' "$KILL_AFTER_ARGV_LOG")"
+
+PATH="$SAVED_PATH"
+unset FORK_SANDBOX_POSTMASTER_TRIAGE_LAUNCHER
+unset FORK_SANDBOX_HANDLERS_DIR
+export FORK_SANDBOX_FLEET_FILE="$SAVED_FLEET_FILE"
+export FORK_SANDBOX_PERSONAS_DIR="$SAVED_PERSONAS_DIR"
+
+# ============================================================
 printf '\n== --help and dispatcher wiring ==\n'
 # ============================================================
 
