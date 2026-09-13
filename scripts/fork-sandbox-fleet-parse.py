@@ -2,9 +2,15 @@
 """Parse and validate fork-sandbox's fleet file and persona frontmatter, for
 fork-sandbox-fleet.sh.
 
-Usage: fork-sandbox-fleet-parse.py check <fleet-file> <label> <personas-dir>
+Usage: fork-sandbox-fleet-parse.py check <fleet-file> <label> <personas-dir> [<user>]
        fork-sandbox-fleet-parse.py dump <fleet-file> <label>
        fork-sandbox-fleet-parse.py frontmatter <persona-file> <label>
+
+`check`'s optional fifth argument is the postmaster host's $USER value;
+when given, that name is reserved too (on top of the always-reserved
+"all", the built-in @all list), so an agent or list cannot collide with
+the operator's own address. Omit it (or pass a value that doesn't match
+the fleet name shape) and only "all" is reserved.
 
 A fleet file is a YAML mapping of `agents` (name -> optional persona/
 harness/model/network/thinking/description/wake-on-cc/refresh-at
@@ -84,6 +90,27 @@ FIELDS = ("persona", "harness", "model", "network", "thinking",
           "description", "wake-on-cc", "refresh-at")
 FRONTMATTER_FIELDS = ("harness", "model", "network", "thinking",
                        "description", "wake-on-cc", "refresh-at")
+
+# Names no agent or list may take, mapped to why. "all" is reserved
+# everywhere (both `check` and `dump` share this, so a broken fleet file
+# defining it is caught the same way regardless of which verb reads it
+# first) since fork-sandbox-fleet.sh's `expand` treats @all as the
+# built-in every-agent address, not a lookup. A caller may pass one more
+# name (the operator's $USER, from `check`) to reserve on top of this.
+BUILTIN_RESERVED = {"all": "the built-in @all list"}
+
+
+def reserved_names(extra=None):
+    reserved = dict(BUILTIN_RESERVED)
+    if extra:
+        reserved.update(extra)
+    return reserved
+
+
+def check_reserved(name, path, reserved, errors):
+    if name in reserved:
+        errors.append(f"{path}: '{name}' is reserved ({reserved[name]}); "
+                       f"choose a different name")
 
 # Mirrors fork-sandbox.sh line 2795's --refresh-at grammar exactly -- one
 # grammar in two places is a bug, so if that regex ever changes, this one
@@ -206,9 +233,10 @@ def check_persona(value, path, errors):
     return value
 
 
-def load_and_validate(fleet_file, label, errors):
+def load_and_validate(fleet_file, label, errors, extra_reserved=None):
     """Returns (agents, lists) dicts, best-effort -- callers only trust
     them when `errors` is still empty afterward."""
+    reserved = reserved_names(extra_reserved)
     try:
         with open(fleet_file, encoding="utf-8") as f:
             doc = yaml.load(f, Loader=DupKeyLoader)
@@ -247,6 +275,9 @@ def load_and_validate(fleet_file, label, errors):
         if not NAME_RE.fullmatch(name):
             errors.append(f"{label}: agents.{name}: agent names match "
                            f"^[a-z0-9][a-z0-9-]*$")
+            continue
+        if name in reserved:
+            check_reserved(name, f"{label}: agents.{name}", reserved, errors)
             continue
         if not isinstance(props, dict):
             errors.append(f"{label}: agents.{name}: expected a mapping of "
@@ -289,6 +320,9 @@ def load_and_validate(fleet_file, label, errors):
         if not NAME_RE.fullmatch(name):
             errors.append(f"{label}: lists.{name}: list names match "
                            f"^[a-z0-9][a-z0-9-]*$")
+            continue
+        if name in reserved:
+            check_reserved(name, f"{label}: lists.{name}", reserved, errors)
             continue
         if not isinstance(props, dict):
             errors.append(f"{label}: lists.{name}: expected a mapping "
@@ -396,9 +430,15 @@ def parse_frontmatter(path, label, errors):
     return fm
 
 
-def cmd_check(fleet_file, label, personas_dir):
+def cmd_check(fleet_file, label, personas_dir, user_value=""):
     errors = []
-    agents, lists = load_and_validate(fleet_file, label, errors)
+    # A $USER that cannot itself be a valid fleet name (e.g. contains an
+    # uppercase letter) cannot collide with one, so it reserves nothing.
+    extra_reserved = {}
+    if user_value and NAME_RE.fullmatch(user_value):
+        extra_reserved[user_value] = "the operator's own $USER address"
+    reserved = reserved_names(extra_reserved)
+    agents, lists = load_and_validate(fleet_file, label, errors, extra_reserved)
     if not errors:
         for name, agent in agents.items():
             persona_name = agent["persona"] or f"{name}.md"
@@ -440,6 +480,9 @@ def cmd_check(fleet_file, label, personas_dir):
             if name in agents or name in lists or not NAME_RE.fullmatch(name):
                 continue
             persona_path = os.path.join(personas_dir, fname)
+            if name in reserved:
+                check_reserved(name, persona_path, reserved, errors)
+                continue
             parse_frontmatter(persona_path, persona_path, errors)
     if errors:
         for e in errors:
@@ -482,7 +525,7 @@ def cmd_frontmatter(persona_file, label):
 def usage_exit():
     sys.stderr.write(
         "Usage: fork-sandbox-fleet-parse.py check <fleet-file> <label> "
-        "<personas-dir>\n"
+        "<personas-dir> [<user>]\n"
         "       fork-sandbox-fleet-parse.py dump <fleet-file> <label>\n"
         "       fork-sandbox-fleet-parse.py frontmatter <persona-file> "
         "<label>\n"
@@ -492,8 +535,9 @@ def usage_exit():
 
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else ""
-    if mode == "check" and len(sys.argv) == 5:
-        cmd_check(sys.argv[2], sys.argv[3], sys.argv[4])
+    if mode == "check" and len(sys.argv) in (5, 6):
+        user_value = sys.argv[5] if len(sys.argv) == 6 else ""
+        cmd_check(sys.argv[2], sys.argv[3], sys.argv[4], user_value)
     elif mode == "dump" and len(sys.argv) == 4:
         cmd_dump(sys.argv[2], sys.argv[3])
     elif mode == "frontmatter" and len(sys.argv) == 4:

@@ -47,7 +47,11 @@
 #                  directory that makes `name` an agent on its own (see
 #                  fleet_is_agent below). Exits 0 silently if clean;
 #                  otherwise prints every error found (not just the
-#                  first) and exits 1.
+#                  first) and exits 1. Refuses an agent or list named
+#                  "all" (reserved for @all, see `expand` below) or
+#                  named for the postmaster host's $USER, if $USER
+#                  itself looks like a fleet name -- either would let
+#                  the reserved address resolve as a real seat.
 #   resolve <name> Print exactly eight lines for one agent: harness,
 #                  model, thinking, network, persona-path, description,
 #                  wake-on-cc, refresh-at. A field with nothing configured
@@ -56,8 +60,11 @@
 #   expand <addr>[,<addr>...]
 #                  Expand a comma-separated list of @-addresses: a
 #                  `@list` becomes its members' `@agent` addresses, a
-#                  `@agent` passes through unchanged. Output is deduped
-#                  by first-seen position, one address per line.
+#                  `@agent` passes through unchanged, and the reserved
+#                  `@all` becomes every agent in the fleet (fleet.yaml
+#                  agents plus bare <name>.md personas, the same set
+#                  `roster` walks). Output is deduped by first-seen
+#                  position, one address per line.
 #   roster         Human-readable summary: every agent with its resolved
 #                  seat, every list with its members.
 #   teardown <agent> [--thread <id>]
@@ -153,7 +160,11 @@ cmd_check() {
         echo "Error: check: no personas dir at '$PERSONAS_DIR'." >&2
         return 1
     fi
-    python3 "$PARSE" check "$FLEET_FILE" "$FLEET_FILE" "$PERSONAS_DIR"
+    # $USER is passed through so the parser can reserve it alongside the
+    # built-in "all": an agent or list named for the operator's own
+    # address would let it resolve as a fleet seat, breaking rule 1's
+    # operator reset and the kit's authority framing.
+    python3 "$PARSE" check "$FLEET_FILE" "$FLEET_FILE" "$PERSONAS_DIR" "${USER:-}"
 }
 
 # Runs `dump` against $FLEET_FILE if it exists, else prints nothing. Both
@@ -259,6 +270,37 @@ fleet_list_members() {
     grep "^list_member"$'\t'"$name"$'\t' <<< "$dump" | cut -f3
 }
 
+# Every known agent name: fleet.yaml agents plus bare <name>.md personas,
+# deduped, first-seen order (fleet.yaml agents first). Shared by
+# `roster`, which prints this set, and `expand`'s @all reserved address,
+# which expands to it -- one collection loop, not two copies of it.
+fleet_all_agent_names() {
+    local dump="$1"
+
+    local -a agent_names=()
+    local n
+    while IFS= read -r n; do
+        [[ -n "$n" ]] && agent_names+=("$n")
+    done < <(awk -F'\t' '$1=="agent"{print $2}' <<< "$dump" | awk '!seen[$0]++')
+
+    # fleet_is_agent treats a bare <name>.md under personas-dir as making
+    # `name` an agent with no fleet.yaml entry at all; both callers'
+    # "every agent" promise needs those names too.
+    local f loner already existing
+    for f in "$PERSONAS_DIR"/*.md; do
+        [[ -e "$f" ]] || continue
+        loner="$(basename "$f" .md)"
+        [[ "$loner" =~ $FLEET_NAME_RE ]] || continue
+        fleet_is_list "$dump" "$loner" && continue
+        already=0
+        for existing in "${agent_names[@]:-}"; do
+            [[ "$existing" == "$loner" ]] && { already=1; break; }
+        done
+        (( already )) || agent_names+=("$loner")
+    done
+    printf '%s\n' "${agent_names[@]:-}"
+}
+
 cmd_expand() {
     local input="${1:?Usage: fork-sandbox-fleet.sh expand <addr>[,<addr>...]}"
     local dump; dump="$(fleet_dump)"
@@ -278,7 +320,20 @@ cmd_expand() {
             return 1
         fi
         name="${addr#@}"
-        if fleet_is_list "$dump" "$name"; then
+        if [[ "$name" == "all" ]]; then
+            # @all is a reserved auto-list, not a dump lookup: every
+            # agent in the fleet, expanded the same way a real list's
+            # members are (in-place, into the same dedup-as-it-appends
+            # loop, so `@all,@x` composes for free).
+            while IFS= read -r m; do
+                [[ -n "$m" ]] || continue
+                already=0
+                for existing in "${result[@]:-}"; do
+                    [[ "$existing" == "@$m" ]] && { already=1; break; }
+                done
+                (( already )) || result+=("@$m")
+            done < <(fleet_all_agent_names "$dump")
+        elif fleet_is_list "$dump" "$name"; then
             while IFS= read -r m; do
                 [[ -n "$m" ]] || continue
                 already=0
@@ -315,24 +370,7 @@ cmd_roster() {
     local -a agent_names=()
     while IFS= read -r n; do
         [[ -n "$n" ]] && agent_names+=("$n")
-    done < <(awk -F'\t' '$1=="agent"{print $2}' <<< "$dump" | awk '!seen[$0]++')
-
-    # fleet_is_agent treats a bare <name>.md under personas-dir as making
-    # `name` an agent with no fleet.yaml entry at all; roster's "every
-    # agent" promise needs those names too, or they stay invisible here
-    # exactly like they do in `check`.
-    local f loner already existing
-    for f in "$PERSONAS_DIR"/*.md; do
-        [[ -e "$f" ]] || continue
-        loner="$(basename "$f" .md)"
-        [[ "$loner" =~ $FLEET_NAME_RE ]] || continue
-        fleet_is_list "$dump" "$loner" && continue
-        already=0
-        for existing in "${agent_names[@]:-}"; do
-            [[ "$existing" == "$loner" ]] && { already=1; break; }
-        done
-        (( already )) || agent_names+=("$loner")
-    done
+    done < <(fleet_all_agent_names "$dump")
 
     echo "Agents:"
     local name harness model thinking network persona description wake_on_cc refresh_at

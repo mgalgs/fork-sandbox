@@ -266,6 +266,72 @@ agents:
     refresh-at: soon
 EOF
 
+bad "an agent named 'all' is refused, naming the reservation" \
+    "is reserved" "agents.all" <<'EOF'
+agents:
+  riffler: {}
+  all: {}
+EOF
+
+bad "a list named 'all' is refused, naming the reservation" \
+    "is reserved" "lists.all" <<'EOF'
+agents:
+  riffler: {}
+lists:
+  all:
+    members: [riffler]
+EOF
+
+cat > "$FORK_SANDBOX_PERSONAS_DIR/all.md" <<'EOF'
+---
+harness: claude
+---
+EOF
+bad "a bare all.md persona file is refused, naming the reservation" \
+    "is reserved" "all.md" <<'EOF'
+agents:
+  riffler: {}
+EOF
+rm -f "$FORK_SANDBOX_PERSONAS_DIR/all.md"
+
+printf '\n== $USER guard ==\n'
+
+(
+    export USER=collider
+    bad "an agent named for \$USER is refused when \$USER matches the fleet name shape" \
+        "is reserved" "agents.collider" <<'EOF'
+agents:
+  riffler: {}
+  collider: {}
+EOF
+)
+
+(
+    export USER=collider
+    bad "a list named for \$USER is refused when \$USER matches the fleet name shape" \
+        "is reserved" "lists.collider" <<'EOF'
+agents:
+  riffler: {}
+lists:
+  collider:
+    members: [riffler]
+EOF
+)
+
+(
+    cat > "$FORK_SANDBOX_FLEET_FILE_DIR/bad.yaml" <<'EOF'
+agents:
+  riffler: {}
+EOF
+    export USER='Not-A-Fleet-Name'
+    saved="$FORK_SANDBOX_FLEET_FILE"
+    export FORK_SANDBOX_FLEET_FILE="$FORK_SANDBOX_FLEET_FILE_DIR/bad.yaml"
+    out="$("$fleet" check 2>&1)"; rc=$?
+    export FORK_SANDBOX_FLEET_FILE="$saved"
+    check "a \$USER that doesn't match the fleet name shape reserves nothing (no error)" "0" "$rc"
+    check "a \$USER that doesn't match the fleet name shape prints nothing" "" "$out"
+)
+
 badfile="$FORK_SANDBOX_FLEET_FILE_DIR/bad.yaml"
 cat > "$badfile" <<'EOF'
 agents:
@@ -378,6 +444,14 @@ check "expand: comma-space-joined input, mail's canonical To:/Cc: form" \
 refuses "expand: unknown address errors" "$fleet" expand @nobody
 refuses "expand: address without @ is rejected" "$fleet" expand riffler
 
+exp_all="$("$fleet" expand @all)"
+check "expand: @all yields every fleet.yaml agent, first-seen order" \
+    "$(printf '@riffler\n@tuner\n@scout\n@observer\n@loud')" "$exp_all"
+
+exp_all_compose="$("$fleet" expand @riffler,@all)"
+check "expand: @all composes inside a longer address list and dedupes" \
+    "$(printf '@riffler\n@tuner\n@scout\n@observer\n@loud')" "$exp_all_compose"
+
 printf '\n== roster ==\n'
 
 roster_out="$("$fleet" roster 2>&1)"; roster_rc=$?
@@ -434,6 +508,8 @@ export FORK_SANDBOX_FLEET_FILE="$MISSING_DIR/still-no-fleet.yaml"
 resolve_lines loner
 check "expand/resolve: bare agent works from persona alone, no fleet file" "codex" "$r_harness"
 check "expand: bare agent from persona alone" "@loner" "$("$fleet" expand @loner)"
+check "expand: @all with no fleet file expands to bare personas alone" \
+    "@loner" "$("$fleet" expand @all)"
 export FORK_SANDBOX_FLEET_FILE="$saved_fleet"
 export FORK_SANDBOX_PERSONAS_DIR="$saved_personas"
 
