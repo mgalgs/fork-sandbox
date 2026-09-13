@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # agent-sandboxed — Run a coding agent in a sealed sandbox against a local model
 #
-# Usage: agent-sandboxed [--harness pi] [--endpoint URL] [--model ID] [--bridge HOST:PORT[=INPORT]]... [--services] [--bind-ro PATH]... [--bind-rw PATH]... [--bind-ro-at SRC DEST]... [--prepend-path DIR]... [work-dir] [agent-args...]
+# Usage: agent-sandboxed [--harness pi] [--endpoint URL] [--model ID] [--bridge HOST:PORT[=INPORT]]... [--services] [--bind-ro PATH]... [--bind-rw PATH]... [--bind-ro-at SRC DEST]... [--prepend-path DIR]... [--session-dir DIR] [--session-id ID] [work-dir] [agent-args...]
 #
 # This runs the sandbox backend sealed, with a model bridged in. The sandbox
 # has NO network: no internet, no LAN, no DNS. The single exception is one
@@ -102,8 +102,21 @@
 # work dir's root would show up untracked in the owner's `git status` and need
 # an ignore rule in every repo this is pointed at. git tracks nothing under
 # .git, so a repository gets them there. The path is printed when the run ends,
-# because nothing else would lead anyone to it. A --session-dir of the caller's
-# own takes precedence over all of this.
+# because nothing else would lead anyone to it.
+#
+# --session-dir DIR and --session-id ID, given as THIS script's own flags
+# (before the work dir — a --session-dir after it is pi's own flag instead,
+# forwarded verbatim, unrelated to either of these), point a run at a
+# caller-chosen HOST directory instead: DIR is bound read-write into the
+# sandbox at a fixed path under its own $HOME, and pi is told to use it
+# there via --session-dir, plus --session-id ID when one is given. This is
+# how a caller that wakes the same agent repeatedly — such as
+# fork-sandbox.sh's pi-local dispatch, or the postmaster — hands a sealed pi
+# seat a session that survives across runs, the same as the WORK_DIR-relative
+# default above survives one run. --session-id has no effect without
+# --session-dir: the id names a session inside that directory, and with no
+# bind there is nowhere for it to live. Both are optional; with neither, the
+# WORK_DIR-relative default above is unchanged.
 #
 # How the model gets in. A sealed sandbox has loopback and nothing else, and
 # nothing inside can add an interface or a route. So the endpoint arrives as a
@@ -221,6 +234,13 @@ WORK_DIR_ARG=""
 GIT_WARNING=1
 SERVICES=0
 FORWARD_FLAGS=()
+# --session-dir/--session-id, this script's OWN flags (as opposed to a
+# --session-dir forwarded to the agent verbatim after the work dir — see the
+# SESSION_DIR block below). Both optional; populated during flag parsing,
+# read after the work dir is resolved.
+SESSION_DIR_ARG=""
+SESSION_ID_ARG=""
+SESSION_BIND_FLAGS=()
 # One entry per --bridge flag: the host to dial, the port to dial, and the
 # port the relay listens on inside the sandbox. The socket path and the host
 # side's process-group PID join here later, once the state dir exists and the
@@ -327,6 +347,14 @@ while [[ $# -gt 0 ]]; do
             FORWARD_FLAGS+=("$1" "${2:?--bind-ro-at requires a source path}" \
                             "${3:?--bind-ro-at requires a destination path}")
             shift 3
+            ;;
+        --session-dir)
+            SESSION_DIR_ARG="${2:?--session-dir requires a directory}"
+            shift 2
+            ;;
+        --session-id)
+            SESSION_ID_ARG="${2:?--session-id requires a session id}"
+            shift 2
             ;;
         # claude-sandboxed's own flags, named here only to refuse them. Every
         # unrecognized flag otherwise becomes an argument for the agent, and
@@ -632,11 +660,23 @@ else
     WORK_DIR="$(mktemp -d /var/tmp/claude-scratch/forks/agent-sandbox.XXXXXX)"
 fi
 
+# --session-id names a session inside the directory --session-dir binds; with
+# no bind there is nowhere for it to live.
+if [[ -n "$SESSION_ID_ARG" && -z "$SESSION_DIR_ARG" ]]; then
+    echo "Error: --session-id requires --session-dir. The id names a session" >&2
+    echo "inside that directory; with no bind there is nowhere for it to live." >&2
+    exit 1
+fi
+if [[ -n "$SESSION_DIR_ARG" ]]; then
+    mkdir -p "$SESSION_DIR_ARG"
+fi
+
 # Every path below ends up inside a generated shell script, and printf %q is
 # what keeps it safe there. A newline would still break the file's shape, so
 # refuse the characters that do not survive the trip.
 fs_reject_unsafe_chars "$WORK_DIR" "$FS_PI_NODE" "$FS_PI_REAL" "$FS_PI_ROOT" \
-    "$FS_PI_BIN_DIR" "$MODEL" "$EP_HOST" "$EP_PREFIX" || exit 1
+    "$FS_PI_BIN_DIR" "$MODEL" "$EP_HOST" "$EP_PREFIX" \
+    "$SESSION_DIR_ARG" "$SESSION_ID_ARG" || exit 1
 
 # A writable .git is host code execution: a hook, or a config key such as
 # core.fsmonitor, runs on the HOST the next time anyone uses git in there. The
@@ -781,13 +821,38 @@ mv "$STATE_DIR/pi-agent/settings.json.new" "$STATE_DIR/pi-agent/settings.json"
 # outside the work dir that the sandbox cannot write. Those fall back to the
 # work-dir root, where the transcript is untracked and visible — the only
 # writable place there is.
-# Both spellings count as the caller having chosen: --session-dir PATH and
-# --session-dir=PATH. Matching only the first would emit the generated flag
-# too, and pi taking the last occurrence is the only reason that would be
-# harmless rather than wrong.
+#
+# --session-dir is dual-purpose. Given as THIS script's own flag (before the
+# work dir, parsed above into SESSION_DIR_ARG), it names a durable HOST
+# directory: bind it read-write at a fixed path under the sandbox's own
+# (tmpfs) $HOME, and tell pi to use it there — $HOME dies with the sandbox,
+# so pi's own default would lose the transcript, exactly like the
+# WORK_DIR-relative default below exists to avoid the same loss. Forwarded to
+# the AGENT instead (after the work dir, so it lands in "$@") it is pi's own
+# flag, used directly, exactly as before this option existed — both
+# spellings, --session-dir PATH and --session-dir=PATH, still count as the
+# caller having chosen for that path, so the default below still checks for
+# either.
 SESSION_DIR=""
 session_flags=()
-if ! printf '%s\0' "$@" | grep -qzE -- '^--session-dir(=|$)'; then
+if [[ -n "$SESSION_DIR_ARG" ]]; then
+    # A REAL, expanded path -- unlike the shim's own $HOME references (see
+    # "mkdir -p \"\$HOME/.pi\"" below), which are deliberately left literal
+    # for the sandbox's bash to expand. --bind-rw-at's destination is
+    # different: it is consumed directly by the sandbox backend, which
+    # requires an absolute path (sandbox-backend-bwrap's check_remap_dest)
+    # and never runs it through a shell, so a literal "$HOME" string would
+    # be rejected outright rather than expanded. This works because the
+    # backend gives the sandbox the SAME $HOME it has out here
+    # (--setenv HOME "$HOME"), so the concrete path resolved now is exactly
+    # where $HOME points inside the sandbox too.
+    SESSION_DIR="$HOME/.pi/sessions"
+    SESSION_BIND_FLAGS+=(--bind-rw-at "$SESSION_DIR_ARG" "$SESSION_DIR")
+    session_flags=(--session-dir "$SESSION_DIR")
+    if [[ -n "$SESSION_ID_ARG" ]]; then
+        session_flags+=(--session-id "$SESSION_ID_ARG")
+    fi
+elif ! printf '%s\0' "$@" | grep -qzE -- '^--session-dir(=|$)'; then
     if [[ -d "$WORK_DIR/.git" ]]; then
         SESSION_DIR="$WORK_DIR/.git/pi-sessions"
     else
@@ -1049,6 +1114,11 @@ fi
 if (( ${#EXTRA_BIND_FLAGS[@]} )); then
     sandbox_cmd+=("${EXTRA_BIND_FLAGS[@]}")
 fi
+# The durable session store, when --session-dir named one: bound read-write
+# at the fixed sandbox-internal path pi was told to use above.
+if (( ${#SESSION_BIND_FLAGS[@]} )); then
+    sandbox_cmd+=("${SESSION_BIND_FLAGS[@]}")
+fi
 # The services sockets dir, read-only for the same reason as the model bridge
 # below: connect() needs write on the socket inode, not a writable mount. Set
 # only when the stack came up.
@@ -1081,8 +1151,14 @@ set -e
 
 # Say where the transcript went. Inside .git it is deliberately somewhere no
 # `git status` will ever mention, which also means nowhere anyone would think
-# to look for it.
-if [[ -n "$SESSION_DIR" && -d "$SESSION_DIR" ]]; then
+# to look for it. With --session-dir, $SESSION_DIR is a sandbox-internal
+# path string ($HOME/...) that names nothing on the host — the host-visible
+# copy is $SESSION_DIR_ARG, the bind's source.
+if [[ -n "$SESSION_DIR_ARG" ]]; then
+    if [[ -d "$SESSION_DIR_ARG" ]]; then
+        echo "agent-sandboxed: session transcript in $SESSION_DIR_ARG" >&2
+    fi
+elif [[ -n "$SESSION_DIR" && -d "$SESSION_DIR" ]]; then
     echo "agent-sandboxed: session transcript in $SESSION_DIR" >&2
 fi
 exit "$RC"
