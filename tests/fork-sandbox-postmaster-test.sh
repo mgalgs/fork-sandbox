@@ -1275,12 +1275,16 @@ printf '\n== flag / unflag verbs ==\n'
 new_scratch_root FORK_SANDBOX_MAIL_ROOT
 export FORK_SANDBOX_MAIL_ROOT
 manual_tid="manually-flagged-thread"
-"$postmaster" flag "$manual_tid" "operator wants eyes on this" >/dev/null 2>&1
+"$postmaster" flag "$manual_tid" "operator wants eyes on this" >"$work/flag_verb.out" 2>&1
 check "flag: reason recorded" "operator wants eyes on this" \
     "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$manual_tid")"
-"$postmaster" unflag "$manual_tid" >/dev/null 2>&1
+check "flag: the standalone verb prints no event line (deliver-only contract)" "" \
+    "$(cat "$work/flag_verb.out")"
+"$postmaster" unflag "$manual_tid" >"$work/unflag_verb.out" 2>&1
 check "unflag: flag file removed" "0" \
     "$( [[ -e "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$manual_tid" ]] && echo 1 || echo 0 )"
+check "unflag: the standalone verb prints no event line either" "" \
+    "$(cat "$work/unflag_verb.out")"
 
 # ============================================================
 printf '\n== branch names never repeat, even across an operator spawn-count reset ==\n'
@@ -2451,6 +2455,17 @@ printf 'Foo: bar\n\nThis should never post.\n' > "$FS_HANDLER_OUTBOX/mail-1.md"
 exit 1
 STUB
 
+# Its stderr tail is crafted to contain the exact prose pm_flag_keyword
+# looks for in the OTHER handler-setup flag reasons ("does not exist"),
+# so a naive keyword-from-reason-substring derivation would mislabel this
+# plain exit-1 as handler-missing.
+cat > "$HANDLER_STUB_DIR/lying-stderr-handler" <<'STUB'
+#!/usr/bin/env bash
+set -uo pipefail
+echo "ERROR: config file does not exist" >&2
+exit 1
+STUB
+
 cat > "$HANDLER_STUB_DIR/timeout-handler" <<'STUB'
 #!/usr/bin/env bash
 set -uo pipefail
@@ -2508,6 +2523,9 @@ agents:
   nonzeromalformed:
     handler: exec
     command: nonzero-malformed-handler
+  lyingstderr:
+    handler: exec
+    command: lying-stderr-handler
   slowpoke:
     handler: exec
     command: timeout-handler
@@ -2562,6 +2580,8 @@ tid="$(thread_of "$mid")"
 once
 contains "happy: handler event logged with exit=0" \
     "$(cat "$work/once.out")" "pm handler thread=${tid:0:8} agent=happy exit=0"
+contains "happy: harvest event logged for the handler seat, not just LLM seats" \
+    "$(cat "$work/once.out")" "pm harvest thread=${tid:0:8} agent=happy replies=1"
 check "happy: exactly one handler invocation" 1 \
     "$(grep -c -- '^----CALL----$' "$HANDLER_LOG")"
 check "happy: FS_HANDLER_AGENT is the seat's own name, no @" "AGENT:happy" \
@@ -2595,6 +2615,27 @@ fi
 check "happy: thread is not flagged" 0 \
     "$([[ -e "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid" ]] && echo 1 || echo 0)"
 
+# --- scenario: a reader that hangs up right after the first event line
+#     must not kill deliver on its next pm_event write -- pm_event traps
+#     and ignores SIGPIPE around its own printf, scoped per-call (see
+#     pm_event's own comment). A single handler wake here already emits
+#     two event lines (handler, then harvest), with a real handler exec
+#     and a real `mail post` spawn happening in between -- by the time
+#     the second line is due, the `:` reader below (a builtin, no exec)
+#     has long since exited and closed its end of the pipe. ---
+: > "$HANDLER_LOG"
+mid="$(send_msg '@carol' '@happy' 'sigpipe check' 'do the thing')"
+tid="$(thread_of "$mid")"
+"$postmaster" deliver --project "$PROJECT_DIR" --once 2>"$work/sigpipe.err" | :
+sigpipe_rc=$?
+check "sigpipe: deliver is not killed when its stdout reader hangs up early" 0 "$sigpipe_rc"
+sigpipe_posted=0
+for f in "$FORK_SANDBOX_MAIL_ROOT/threads/$tid"/*.msg; do
+    [[ -e "$f" ]] || continue
+    [[ "$(header_of_file "$f" From)" == "@happy" ]] && sigpipe_posted=1
+done
+check "sigpipe: the pass still ran to completion and posted the reply" 1 "$sigpipe_posted"
+
 # --- scenario: no reply written is a valid outcome, not a flag ---
 : > "$HANDLER_LOG"
 mid="$(send_msg '@carol' '@noreply' 'Silence' 'nothing to say')"
@@ -2617,8 +2658,8 @@ tid="$(thread_of "$mid")"
 once
 contains "nonzero: handler event logged with exit=1" \
     "$(cat "$work/once.out")" "pm handler thread=${tid:0:8} agent=nonzero exit=1"
-contains "nonzero: flag event uses the fixed handler-error keyword" \
-    "$(cat "$work/once.out")" "pm flag thread=${tid:0:8} reason=handler-error"
+contains "nonzero: flag event uses the fixed handler-exit keyword" \
+    "$(cat "$work/once.out")" "pm flag thread=${tid:0:8} reason=handler-exit"
 posted=0
 for f in "$FORK_SANDBOX_MAIL_ROOT/threads/$tid"/*.msg; do
     [[ -e "$f" ]] || continue
@@ -2627,6 +2668,19 @@ done
 check "nonzero: reply still posted despite the non-zero exit" 1 "$posted"
 contains "nonzero: thread flagged with an exit-code-shaped reason" \
     "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid" 2>/dev/null)" "exited 1"
+
+# --- scenario: a handler's own stderr echoes prose pm_flag_keyword would
+#     otherwise mistake for one of the wake-time setup failures (handler
+#     missing/not-regular/not-executable) it shares the "handler " prefix
+#     with -- the keyword must still describe what actually happened
+#     (a plain non-zero exit), not what the handler's stderr claims ---
+mid="$(send_msg '@carol' '@lyingstderr' 'Lies in stderr' 'trigger')"
+tid="$(thread_of "$mid")"
+once
+contains "lying stderr: flag event uses handler-exit, not the stderr's own words" \
+    "$(cat "$work/once.out")" "pm flag thread=${tid:0:8} reason=handler-exit"
+check "lying stderr: no misleading handler-missing keyword reached stdout" 0 \
+    "$(grep -c -- 'reason=handler-missing' "$work/once.out")"
 
 # --- scenario: a handler that BOTH writes a malformed reply AND exits
 #     non-zero flags the thread with the malformed-file reason, not the
@@ -2652,6 +2706,8 @@ tid="$(thread_of "$mid")"
 once
 contains "timeout: thread flagged with a timeout-shaped reason" \
     "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid" 2>/dev/null)" "timed out after 2s"
+contains "timeout: flag event uses the fixed handler-timeout keyword" \
+    "$(cat "$work/once.out")" "pm flag thread=${tid:0:8} reason=handler-timeout"
 timeout_posted=0
 for f in "$FORK_SANDBOX_MAIL_ROOT/threads/$tid"/*.msg; do
     [[ -e "$f" ]] || continue
@@ -2670,6 +2726,8 @@ tid="$(thread_of "$mid")"
 once
 contains "kill-after: SIGKILL-ended handler flagged as a timeout, not exited 137" \
     "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid" 2>/dev/null)" "timed out after 2s"
+contains "kill-after: flag event uses handler-timeout, not handler-exit" \
+    "$(cat "$work/once.out")" "pm flag thread=${tid:0:8} reason=handler-timeout"
 ignorepoke_posted=0
 for f in "$FORK_SANDBOX_MAIL_ROOT/threads/$tid"/*.msg; do
     [[ -e "$f" ]] || continue

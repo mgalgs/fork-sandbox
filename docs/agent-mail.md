@@ -378,9 +378,21 @@ live: `pm <event> thread=<short-id> agent=<name> key=val...`, where
 `thread` is the thread id's first 8 characters and `agent` is always the
 resolved fleet registry name, never raw header text. The six events are
 `spawn` (agent, thread, run, via=to|cc), `harvest` (agent, thread,
-replies=<count>), `flag` (thread, reason=<fixed keyword>), `refuse`
-(agent, thread, reason=hops|budget), `triage-skip` (agent, thread), and
-`handler` (agent, thread, exit=<status>). This is a stable contract, not
+replies=<count>, emitted for both LLM and handler seats), `flag` (thread,
+reason=<fixed keyword>), `refuse` (agent, thread, reason=hops|budget — at
+route-pass time this names only the message's `To:` candidates, since a
+refused message skips Cc resolution outright, but the same gate is
+re-checked at follow-up-wake time against whichever agent owns the live
+run a pending message is waiting on, and that agent can be one originally
+woken via Cc — so a Cc-woken seat's follow-up can still produce a refuse
+line), `triage-skip` (agent, thread), and `handler` (agent,
+thread, exit=<status>). `flag` goes through this same event-emitting
+code, gated the same way — it only prints one when reached via
+`deliver`'s own route/harvest pass, so running `flag` directly prints
+nothing. `unflag` prints nothing ever, in or out of `deliver`: it has no
+event of its own in the six above, so a thread being flagged and later
+auto-cleared (rule 1, operator mail) is invisible on this stream — only
+the flag is observable, not its clearing. This is a stable contract, not
 a log file — stderr is unchanged (errors only), and nothing
 sender-controlled (Subject, body, raw From, attachment names) ever
 becomes a field value on one of these lines.

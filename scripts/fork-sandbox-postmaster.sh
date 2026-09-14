@@ -41,9 +41,18 @@
 #   harvest      agent, thread, replies=<count posted this pass>
 #   flag         thread, reason=<fixed keyword> (no agent -- a thread-level
 #                condition, not a per-agent one; see pm_flag_keyword)
-#   refuse       agent, thread, reason=hops|budget -- a specific agent's
-#                wake was refused (X-Hops or thread-budget gate); the
-#                thread itself is also separately flag'd
+#   refuse       agent, thread, reason=hops|budget -- an agent's wake was
+#                refused (X-Hops or thread-budget gate); the thread itself
+#                is also separately flag'd. At route-pass time (a message
+#                the gate refuses wholesale) this only names To: candidates
+#                -- Cc resolution (wake-on-cc, triage) is skipped outright
+#                for that message, so there is no per-agent decision left
+#                to report one for. But the same gate is re-checked at
+#                follow-up-wake time for a message pending on a live run
+#                (pm_followup_wake), against whichever agent owns that run
+#                -- and that agent can be one who was originally woken via
+#                Cc, so a Cc-woken seat's follow-up can still produce a
+#                refuse line.
 #   triage-skip  agent, thread -- the Cc triage classifier skipped this
 #                candidate for this message
 #   handler      agent, thread, exit=<status> -- a handler seat's wake ran
@@ -917,6 +926,11 @@ pm_next_seq() {
     printf '%s' "$(( n + 1 ))"
 }
 
+# Set by cmd_deliver only: the event stream is a `deliver`-only contract
+# (see the EVENT STREAM header comment), so pm_event no-ops when pm_flag
+# is reached via the standalone `flag`/`unflag` verbs instead.
+PM_EVENTS_ENABLED=0
+
 # Prints one porcelain line to stdout for a route/harvest-pass action
 # worth operator eyes (see the EVENT STREAM header comment for the format
 # and the fixed event vocabulary). The one rule every call site must
@@ -925,8 +939,16 @@ pm_next_seq() {
 # attachment names) -- only agent names already resolved against the
 # fleet registry, thread short-ids, and values this script itself
 # computed (run-dir basenames, exit codes, fixed keywords).
+#
+# The printf runs in a subshell with SIGPIPE ignored, and its own write
+# failure is swallowed: `deliver` is meant to be piped to `tail -F` or a
+# live consumer, and without this a consumer that exits early kills
+# deliver itself with SIGPIPE the next time an event fires (the subshell
+# scopes the ignored disposition to this one printf, not to any child
+# process the rest of the script forks).
 pm_event() {
-    printf 'pm %s\n' "$*"
+    (( PM_EVENTS_ENABLED )) || return 0
+    ( trap '' PIPE; printf 'pm %s\n' "$*" 2>/dev/null ) || true
 }
 
 # Maps a pm_flag reason string to a fixed, safe keyword for the "flag"
@@ -935,6 +957,16 @@ pm_event() {
 # substring/passthrough of $reason -- specifically so that an operand
 # embedded in a reason (a message-id, a run-id, a handler's own stderr
 # tail) can never reach stdout even indirectly.
+#
+# That guarantee only holds for reasons built entirely from fixed prose
+# plus registry-resolved names/ids: these patterns are start-anchored (a
+# leading literal, not a leading `*`), so a reason with a captured
+# command's stderr tail appended (handler exec failure, a mail-send
+# failure) is only at risk when that reason shares a fixed prefix with
+# one of the more specific patterns below AND the free-text tail happens
+# to supply the pattern's second literal -- see the callers that pass an
+# explicit keyword to pm_flag instead of relying on this function to
+# derive one.
 pm_flag_keyword() {
     local reason="$1"
     case "$reason" in
@@ -959,10 +991,11 @@ pm_flag_keyword() {
 }
 
 pm_flag() {
-    local tid="$1" reason="$2"
+    local tid="$1" reason="$2" keyword="${3:-}"
     mkdir -p -- "$NEEDS_OPERATOR"
     printf '%s\n' "$reason" > "$NEEDS_OPERATOR/$tid"
-    pm_event "flag thread=${tid:0:8} reason=$(pm_flag_keyword "$reason")"
+    [[ -n "$keyword" ]] || keyword="$(pm_flag_keyword "$reason")"
+    pm_event "flag thread=${tid:0:8} reason=$keyword"
 }
 
 pm_unflag() {
@@ -1380,24 +1413,37 @@ pm_exec_wake() {
     # actionable reason than "exited N" -- it should win the collision, the
     # same order the LLM wake path uses (pm_harvest_run, further down).
     if (( rc != 0 )); then
-        local cause="exited $rc"
+        local cause="exited $rc" keyword="handler-exit"
         # GNU timeout returns 124 when SIGTERM alone ends the child, and 137
         # when the --kill-after grace period elapses and it has to SIGKILL
         # it -- a handler that traps or ignores SIGTERM (exactly the child
         # --kill-after exists to bound) exits via the second path, not the
         # first.
-        (( rc == 124 || rc == 137 )) && cause="timed out after ${timeout_s}s"
+        if (( rc == 124 || rc == 137 )); then
+            cause="timed out after ${timeout_s}s"
+            keyword="handler-timeout"
+        fi
         local err_out=""
         [[ -s "$stderr_capture" ]] && err_out=" ($(pm_trim "$(tail -n1 -- "$stderr_capture")"))"
-        pm_flag "$tid" "handler '$command' for $agent $cause: $mid$err_out"
+        # $keyword is passed explicitly, not derived by pm_flag_keyword: this
+        # reason shares the "handler " prefix with the wake-time setup
+        # failures below it does derive from a pattern (handler-missing,
+        # -not-regular, -not-executable), and it ends with the handler's own
+        # stderr tail ($err_out) -- so a handler that writes e.g. "does not
+        # exist" to its own stderr on a plain exit-1 would otherwise supply
+        # those patterns' second literal and be mis-flagged as handler-missing.
+        pm_flag "$tid" "handler '$command' for $agent $cause: $mid$err_out" "$keyword"
     fi
     rm -f -- "$stderr_capture"
 
-    local mf
+    local mf replies=0
     for mf in "$outbox"/mail-*.md; do
         [[ -e "$mf" ]] || continue
-        pm_harvest_one_file "$mf" "$agent" "$tid" "$mid" "$trigger_hops" || true
+        if pm_harvest_one_file "$mf" "$agent" "$tid" "$mid" "$trigger_hops"; then
+            replies=$(( replies + 1 ))
+        fi
     done
+    pm_event "harvest thread=${tid:0:8} agent=$agent replies=$replies"
 
     # Unlike an LLM wake's outbox (part of its ephemeral scratch run dir,
     # cleaned up by whatever tore down the sandbox), $outbox lives under
@@ -1636,9 +1682,10 @@ pm_process_message() {
     # Expanded regardless of the gate below: a refused message still needs
     # its To-candidates' resolved names for the "refuse" event (agent field
     # must be a registry name, never raw header text) -- pm_expand_to only
-    # resolves names via `fleet expand`, it spawns nothing and triages
-    # nothing, so computing it unconditionally costs one cheap read, not a
-    # wasted wake or a wasted triage classifier call.
+    # resolves names via `fleet expand` (one bash process plus one `python3
+    # ... dump` per address, not a read, but cheap next to a spawn), it
+    # spawns nothing and triages nothing, so computing it unconditionally
+    # costs that, not a wasted wake or a wasted triage classifier call.
     local -a to_expanded=()
     mapfile -t to_expanded < <(pm_expand_to "$to")
     local -a to_candidates=()
@@ -1846,7 +1893,13 @@ pm_harvest_one_file() {
     rm -f -- "$body_file" "$body_file.err"
 
     if (( rc != 0 )); then
-        pm_flag "$tid" "malformed reply file $(basename -- "$mf"): $err_out"
+        # Explicit keyword for clarity at the call site, not because
+        # pm_flag_keyword would get this one wrong: this reason's fixed
+        # prefix ("malformed reply file") never matches one of the
+        # "handler "-prefixed patterns, so $err_out (the mail command's own
+        # stderr) can't supply a false second literal the way it can at the
+        # pm_exec_wake call site above (see pm_flag_keyword's own comment).
+        pm_flag "$tid" "malformed reply file $(basename -- "$mf"): $err_out" "malformed-reply"
         return 1
     fi
     return 0
@@ -2122,6 +2175,8 @@ cmd_deliver() {
     mkdir -p -- "$MAIL_ROOT" "$STATE"
     pm_lock_acquire || return 1
     trap pm_lock_release EXIT
+
+    PM_EVENTS_ENABLED=1
 
     if (( once )); then
         pm_route_pass "$project"
