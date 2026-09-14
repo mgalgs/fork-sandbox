@@ -733,10 +733,13 @@ that placement — the short version is that the egress gate probes
 would pass the gate and quietly falsify this section.
 
 **Setting it makes `K8S_DENIED_PROBE` load-bearing in a new way.** The probe
-must name a destination *outside* every namespace listed, or it is testing an
-address the policy now permits, and a gate whose denied probe is actually
-allowed passes every time and proves nothing. `install` prints this caveat
-whenever the key is set.
+must name a destination *outside* every namespace listed. Inside one, it is
+testing an address the policy now permits: either it answers and the gate
+refuses the run outright, or — worse, because it is silent — nothing is
+listening, it reads as unreachable for a reason that has nothing to do with
+policy, and the gate passes having proved nothing. See "Enforcement varies by
+CNI" above for the full shape of that wrong-reason pass. `install` prints the
+caveat whenever the key is set.
 
 The rule is a `namespaceSelector` on `kubernetes.io/metadata.name`, never an
 `ipBlock` — same DNAT reasoning as `K8S_PROXY_ALLOW_NS` below, applied to a
@@ -772,6 +775,34 @@ The gate asserts **both directions, simultaneously**:
 The second is not decoration. Without it, a completely broken network — every
 route dropped, not just the denied one — passes as a working policy. Fail
 closed on either.
+
+**What the denied half actually proves is stronger than "the allowlist is
+tight": it proves the allowlist is enforced by anything at all.** The API
+server accepts a `NetworkPolicy` object whether or not a single component in
+the cluster implements one. A CNI with no policy engine behind it takes every
+policy this project applies, reports success, and enforces none of it — the
+objects exist, `kubectl get netpol` lists them, and the agent pod has full
+egress. Nothing in the apply path can tell that case from a correctly sealed
+one, because from the API's side they are identical.
+
+The probe is the only thing that can. That is why `K8S_DENIED_PROBE` is
+required for `submit` rather than a nicety, and why it is worth re-checking
+after any change to how a cluster does networking: policy enforcement can be
+added, removed, or swapped underneath a namespace whose manifests never
+changed, and every run in between looks exactly as correct as one on a cluster
+that enforces nothing.
+
+`K8S_AGENT_ALLOW_NS` sharpens the same edge, though not in the direction that
+first suggests itself. A probe that key has made genuinely reachable fails the
+gate loudly (`… is reachable and must not be`) and refuses the run — noisy,
+and safe. The silent case is the one to guard: the gate requires the probe to
+be *unreachable*, and cannot tell "unreachable because policy denied it" from
+"unreachable because nothing was listening there anyway". So a probe must be
+both outside every opened namespace **and** an address that would actually
+answer if the policy let it through. Pointing it at a dead address inside an
+opened namespace satisfies the gate while testing nothing at all — the same
+wrong-reason pass the gate's own header warns about for a totally broken
+network, reached from the other side.
 
 ## Model access: three modes, one built
 
