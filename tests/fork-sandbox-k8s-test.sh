@@ -364,6 +364,100 @@ else
     ok "agent policy has no rule permitting port 443"
 fi
 
+# --allow-namespace -- the one option that widens the agent's seal. The
+# baseline policy carries exactly one namespaceSelector (kube-system, for
+# DNS) and two `ports:` keys (DNS and the proxy), so both are counted rather
+# than checked for bare presence.
+check "render-policy: baseline has one namespaceSelector" \
+    "1" "$(grep -c 'namespaceSelector' <<< "$policy")"
+check "render-policy: baseline has two ports: keys" \
+    "2" "$(grep -c 'ports:' <<< "$policy")"
+
+policy_ns_port="$("$platform_generic" render-policy --namespace fork-sandbox \
+    --agent-label app=fork-sandbox-agent --proxy-label app=fork-sandbox-proxy \
+    --proxy-port 8080 --allow-namespace preview-one:8000)"
+if command -v yamllint >/dev/null 2>&1; then
+    out="$(yamllint - <<< "$policy_ns_port" 2>&1)"
+    if [[ -z "$out" ]]; then
+        ok "yamllint: render-policy --allow-namespace output"
+    else
+        no "yamllint: render-policy --allow-namespace output" "$out"
+    fi
+fi
+if grep -qF 'kubernetes.io/metadata.name: preview-one' <<< "$policy_ns_port" \
+    && [[ "$(grep -c 'namespaceSelector' <<< "$policy_ns_port")" == 2 ]] \
+    && [[ "$(grep -c 'ports:' <<< "$policy_ns_port")" == 3 ]]; then
+    ok "--allow-namespace <ns>:<port> adds one namespaceSelector rule with a port"
+else
+    no "--allow-namespace <ns>:<port> adds one namespaceSelector rule with a port" \
+        "$policy_ns_port"
+fi
+
+# No port means every port, which NetworkPolicy spells as the ABSENCE of a
+# ports: key -- `ports: []` would match nothing at all.
+policy_ns_bare="$("$platform_generic" render-policy --namespace fork-sandbox \
+    --agent-label app=fork-sandbox-agent --proxy-label app=fork-sandbox-proxy \
+    --proxy-port 8080 --allow-namespace preview-two)"
+if grep -qF 'kubernetes.io/metadata.name: preview-two' <<< "$policy_ns_bare" \
+    && [[ "$(grep -c 'namespaceSelector' <<< "$policy_ns_bare")" == 2 ]] \
+    && [[ "$(grep -c 'ports:' <<< "$policy_ns_bare")" == 2 ]]; then
+    ok "--allow-namespace <ns> (no port) renders the rule and omits ports: entirely"
+else
+    no "--allow-namespace <ns> (no port) renders the rule and omits ports: entirely" \
+        "$policy_ns_bare"
+fi
+
+policy_ns_two="$("$platform_generic" render-policy --namespace fork-sandbox \
+    --agent-label app=fork-sandbox-agent --proxy-label app=fork-sandbox-proxy \
+    --proxy-port 8080 --allow-namespace preview-one:8000 --allow-namespace preview-two)"
+if [[ "$(grep -c 'namespaceSelector' <<< "$policy_ns_two")" == 3 ]]; then
+    ok "--allow-namespace is repeatable: two entries render two extra rules"
+else
+    no "--allow-namespace is repeatable: two entries render two extra rules" \
+        "$policy_ns_two"
+fi
+
+# Omitting the option must leave the output byte-identical to what every
+# existing caller already gets -- this is what makes the widening opt-in
+# rather than a change in the sealed default.
+policy_again="$("$platform_generic" render-policy --namespace fork-sandbox \
+    --agent-label app=fork-sandbox-agent --proxy-label app=fork-sandbox-proxy --proxy-port 8080)"
+check "render-policy without --allow-namespace is unchanged" "$policy" "$policy_again"
+
+# A leading-zero port must normalize to canonical decimal, not render as-is
+# and not abort in bash arithmetic reading "08" as octal -- the trap
+# parse_proxy_allow_ns documents for the identical input.
+policy_ns_octal="$("$platform_generic" render-policy --namespace fork-sandbox \
+    --agent-label app=fork-sandbox-agent --proxy-label app=fork-sandbox-proxy \
+    --proxy-port 8080 --allow-namespace preview-three:08)"
+if grep -qE '^ +port: 8$' <<< "$policy_ns_octal" \
+    && ! grep -qE '^ +port: 08$' <<< "$policy_ns_octal"; then
+    ok "--allow-namespace normalizes a leading-zero port to decimal"
+else
+    no "--allow-namespace normalizes a leading-zero port to decimal" "$policy_ns_octal"
+fi
+
+refuses "--allow-namespace refuses an invalid namespace" \
+    "does not name a valid" \
+    "$platform_generic" render-policy --namespace fork-sandbox \
+    --agent-label app=fork-sandbox-agent --proxy-label app=fork-sandbox-proxy \
+    --proxy-port 8080 --allow-namespace Bad_NS
+refuses "--allow-namespace refuses a trailing colon with no port" \
+    "has a trailing ':'" \
+    "$platform_generic" render-policy --namespace fork-sandbox \
+    --agent-label app=fork-sandbox-agent --proxy-label app=fork-sandbox-proxy \
+    --proxy-port 8080 --allow-namespace preview-one:
+refuses "--allow-namespace refuses port 0" \
+    "invalid port" \
+    "$platform_generic" render-policy --namespace fork-sandbox \
+    --agent-label app=fork-sandbox-agent --proxy-label app=fork-sandbox-proxy \
+    --proxy-port 8080 --allow-namespace preview-one:0
+refuses "--allow-namespace refuses a port above 65535" \
+    "invalid port" \
+    "$platform_generic" render-policy --namespace fork-sandbox \
+    --agent-label app=fork-sandbox-agent --proxy-label app=fork-sandbox-proxy \
+    --proxy-port 8080 --allow-namespace preview-one:99999
+
 printf '\n== fork-sandbox-k8s.sh --dry-run (fixture config, no cluster) ==\n'
 config_dir="$(newdir)"; tmpdirs+=("$config_dir")
 cat > "$config_dir/k8s.env" <<'CONF'
@@ -424,6 +518,18 @@ extract_doc_by_kind() {
         $0 == k { flag=1 }
         flag && /^---$/ { exit }
         flag { print }
+    ' "$file"
+}
+# extract_doc_by_kind stops at the FIRST document of a kind, which is the
+# proxy's for NetworkPolicy -- the agent-egress policy the platform plugin
+# renders is a second one in the same stream. This selects a document by
+# content instead, so either can be addressed.
+extract_doc_matching() {
+    local pattern="$1" file="$2"
+    awk -v pat="$pattern" '
+        /^---$/ { if (doc ~ pat) { printf "%s", doc; exit } doc = ""; next }
+        { doc = doc $0 "\n" }
+        END { if (doc ~ pat) printf "%s", doc }
     ' "$file"
 }
 proxy_deployment_doc="$(extract_doc_by_kind Deployment "$install_out")"
@@ -2053,6 +2159,91 @@ if grep -q 'Warning:' /tmp/fs-k8s-test-combined-allow-install.err; then
 else
     ok "K8S_PROXY_ALLOW and K8S_PROXY_ALLOW_NS composing covers both endpoints with no warning"
 fi
+
+# K8S_AGENT_ALLOW_NS -- the AGENT pod's own egress widening. Distinct from
+# K8S_PROXY_ALLOW_NS above in every way that matters: a different pod, a
+# different policy document, and a different question ("what may the agent
+# reach", not "what may the proxy dial"). The two must not bleed into each
+# other, so this checks BOTH documents from the same install.
+agent_ns_config_dir="$(newdir)"; tmpdirs+=("$agent_ns_config_dir")
+cat > "$agent_ns_config_dir/k8s.env" <<'CONF'
+K8S_CONTEXT=test-context
+K8S_NAMESPACE=fork-sandbox-test
+K8S_IMAGE=registry.example/you/fork-sandbox:latest
+K8S_PROXY_UPSTREAM=https://openrouter.ai
+K8S_AGENT_ALLOW_NS=preview-alpha:8000,preview-beta
+K8S_DENIED_PROBE=10.0.0.1:443
+CONF
+install -m 600 /dev/null "$agent_ns_config_dir/pi.env"
+printf 'OPENROUTER_API_KEY=sk-test-dummy\n' >> "$agent_ns_config_dir/pi.env"
+agent_ns_out="$(newdir)/agent-allow-ns-install.yaml"; tmpdirs+=("$(dirname "$agent_ns_out")")
+FORK_SANDBOX_CONFIG_DIR="$agent_ns_config_dir" "$k8s_sh" install --dry-run \
+    > "$agent_ns_out" 2>/tmp/fs-k8s-test-agent-allow-ns-install.err
+agent_netpol_doc="$(extract_doc_matching 'fork-sandbox-agent-egress' "$agent_ns_out")"
+proxy_netpol_untouched_doc="$(extract_doc_by_kind NetworkPolicy "$agent_ns_out")"
+
+if grep -qF 'kubernetes.io/metadata.name: preview-alpha' <<< "$agent_netpol_doc" \
+    && grep -qF 'kubernetes.io/metadata.name: preview-beta' <<< "$agent_netpol_doc" \
+    && grep -qE '^ +port: 8000$' <<< "$agent_netpol_doc"; then
+    ok "K8S_AGENT_ALLOW_NS reaches the agent policy as --allow-namespace rules"
+else
+    no "K8S_AGENT_ALLOW_NS reaches the agent policy as --allow-namespace rules" \
+        "$agent_netpol_doc"
+fi
+
+# The agent key must not leak into the proxy's policy. The proxy document is
+# the first NetworkPolicy in the stream and carries exactly one
+# namespaceSelector of its own (kube-system, for DNS) when K8S_PROXY_ALLOW_NS
+# is unset -- as it is here.
+if [[ "$(grep -c 'namespaceSelector' <<< "$proxy_netpol_untouched_doc")" == 1 ]] \
+    && ! grep -qF 'preview-alpha' <<< "$proxy_netpol_untouched_doc"; then
+    ok "K8S_AGENT_ALLOW_NS does not widen the proxy's own policy"
+else
+    no "K8S_AGENT_ALLOW_NS does not widen the proxy's own policy" \
+        "$proxy_netpol_untouched_doc"
+fi
+
+# Widening the seal is announced, not silent -- that announcement is the
+# whole reason this is a caller key rather than something a plugin reads on
+# its own, so it is a tested property, not a nicety.
+if grep -qF "opens agent egress to namespace 'preview-alpha' on port 8000" \
+        /tmp/fs-k8s-test-agent-allow-ns-install.err \
+    && grep -qF "opens agent egress to namespace 'preview-beta' on every port" \
+        /tmp/fs-k8s-test-agent-allow-ns-install.err \
+    && grep -qF 'K8S_DENIED_PROBE must name a destination outside those namespaces' \
+        /tmp/fs-k8s-test-agent-allow-ns-install.err; then
+    ok "K8S_AGENT_ALLOW_NS announces every entry it opens, and the probe caveat"
+else
+    no "K8S_AGENT_ALLOW_NS announces every entry it opens, and the probe caveat" \
+        "$(cat /tmp/fs-k8s-test-agent-allow-ns-install.err)"
+fi
+
+# Unset (every existing install) must leave the agent policy exactly sealed.
+agent_netpol_default_doc="$(extract_doc_matching 'fork-sandbox-agent-egress' "$install_out")"
+if [[ "$(grep -c 'namespaceSelector' <<< "$agent_netpol_default_doc")" == 1 ]]; then
+    ok "unset K8S_AGENT_ALLOW_NS leaves the agent policy sealed to DNS and the proxy"
+else
+    no "unset K8S_AGENT_ALLOW_NS leaves the agent policy sealed to DNS and the proxy" \
+        "$agent_netpol_default_doc"
+fi
+
+# A bad entry must name K8S_AGENT_ALLOW_NS, not the proxy key it shares a
+# parser with -- an operator who set one key should never be sent to the
+# other.
+agent_ns_bad_dir="$(newdir)"; tmpdirs+=("$agent_ns_bad_dir")
+cat > "$agent_ns_bad_dir/k8s.env" <<'CONF'
+K8S_CONTEXT=test-context
+K8S_NAMESPACE=fork-sandbox-test
+K8S_IMAGE=registry.example/you/fork-sandbox:latest
+K8S_PROXY_UPSTREAM=https://openrouter.ai
+K8S_AGENT_ALLOW_NS=Bad_NS
+K8S_DENIED_PROBE=10.0.0.1:443
+CONF
+install -m 600 /dev/null "$agent_ns_bad_dir/pi.env"
+printf 'OPENROUTER_API_KEY=sk-test-dummy\n' >> "$agent_ns_bad_dir/pi.env"
+refuses "a bad K8S_AGENT_ALLOW_NS entry names that key, not K8S_PROXY_ALLOW_NS" \
+    "Error: K8S_AGENT_ALLOW_NS entry" \
+    env FORK_SANDBOX_CONFIG_DIR="$agent_ns_bad_dir" "$k8s_sh" install --dry-run
 
 # A bad namespace shape in K8S_PROXY_ALLOW_NS is a parse-time error, nothing
 # created.

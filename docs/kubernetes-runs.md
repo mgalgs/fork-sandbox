@@ -705,7 +705,8 @@ pod-side, on the first review leg, after the coding leg has already run.
 ## Egress is sealed, except the proxy
 
 **Stronger than the original design's `pinned` mode, and worth stating
-precisely.** The agent pod's egress allowlist is exactly two entries:
+precisely.** By default, the agent pod's egress allowlist is exactly two
+entries:
 
 - DNS to `kube-dns` in `kube-system`, on 53/UDP and 53/TCP.
 - the model proxy Service, on 8080/TCP.
@@ -714,6 +715,34 @@ No port 443. No LAN. No public internet from the agent pod at all. This is the
 cluster analogue of a `--network sealed` sandbox, and it is why the
 pod can hold no credential of its own: there is nowhere for a leaked one to be
 spent from inside the pod.
+
+### `K8S_AGENT_ALLOW_NS`, the one way to widen that
+
+One key opens more: `K8S_AGENT_ALLOW_NS=<namespace>[:<port>][,...]` adds an
+egress rule per entry to the agent pod's own policy, letting a run reach a
+Service inside the cluster — a shared per-PR preview environment, say — that
+the sealed default would deny. Unset (the default, and every install that has
+not asked for it) leaves the two entries above exactly as stated.
+
+It is the caller's key on purpose, not something a platform plugin decides.
+`fork-sandbox-k8s.sh` reads it, validates it, announces every entry it opens
+on stderr, and passes it to the plugin as `--allow-namespace`; `--dry-run`
+shows the resulting rules. `docs/k8s-platform.md` has the full reasoning for
+that placement — the short version is that the egress gate probes
+`K8S_DENIED_PROBE` and nothing else, so a widening only a plugin knew about
+would pass the gate and quietly falsify this section.
+
+**Setting it makes `K8S_DENIED_PROBE` load-bearing in a new way.** The probe
+must name a destination *outside* every namespace listed, or it is testing an
+address the policy now permits, and a gate whose denied probe is actually
+allowed passes every time and proves nothing. `install` prints this caveat
+whenever the key is set.
+
+The rule is a `namespaceSelector` on `kubernetes.io/metadata.name`, never an
+`ipBlock` — same DNAT reasoning as `K8S_PROXY_ALLOW_NS` below, applied to a
+different pod. Note which is which: `K8S_PROXY_ALLOW_NS` governs what the
+*proxy* may dial (model endpoints); this governs what the *agent* may reach.
+They compose, they validate identically, and they are not substitutes.
 
 **The cost, stated rather than worked around: a run cannot install anything.**
 No `npm install`, no `pip install`, no fetching a package from anywhere.

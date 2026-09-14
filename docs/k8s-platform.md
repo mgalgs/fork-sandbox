@@ -24,7 +24,8 @@ for why that is deliberate rather than a shortcut.
 ```
 fork-sandbox-k8s-platform-<name> --capabilities
 fork-sandbox-k8s-platform-<name> render-policy --namespace NS \
-        --agent-label KEY=VAL --proxy-label KEY=VAL --proxy-port PORT
+        --agent-label KEY=VAL --proxy-label KEY=VAL --proxy-port PORT \
+        [--allow-namespace NS[:PORT]]...
 ```
 
 Two verbs. A platform that needs a third is a sign the contract is missing
@@ -44,13 +45,49 @@ this list ad hoc.
 | `--agent-label KEY=VAL` | The label the rendered policy's `podSelector` must match — the agent pod carries it. |
 | `--proxy-label KEY=VAL` | The label of the proxy pod the agent is allowed to reach. |
 | `--proxy-port PORT` | The port on the proxy the agent is allowed to reach. |
+| `--allow-namespace NS[:PORT]` | Repeatable, and the only optional one. An extra namespace the agent may reach, on one port or (omitted) every port. Renders a `namespaceSelector` on `kubernetes.io/metadata.name`. |
 
-All four are required. `render-policy` prints one thing: a policy that seals
-the agent pod to exactly two egress destinations — DNS in `kube-system`, and
-the proxy on the given label and port — plus whatever this platform's dialect
-can add to that (an ICMP denial, if the dialect supports one). It has no
-opinion about the proxy's own policy, which is ordinary and portable and lives
-as a static file in `manifests/k8s/` instead.
+The first four are required; `--allow-namespace` is optional and repeatable.
+With none of it, `render-policy` prints one thing: a policy that seals the
+agent pod to exactly two egress destinations — DNS in `kube-system`, and the
+proxy on the given label and port — plus whatever this platform's dialect can
+add to that (an ICMP denial, if the dialect supports one). It has no opinion
+about the proxy's own policy, which is ordinary and portable and lives as a
+static file in `manifests/k8s/` instead.
+
+### `--allow-namespace`, the one thing that widens the seal
+
+Every other extension in this contract *narrows*: the dialect hook exists so a
+richer policy language can deny ICMP. This one is the exception, and it is
+deliberately shaped so the widening cannot happen quietly.
+
+It is a **caller** decision, never a platform one. `fork-sandbox-k8s.sh`
+passes it from `K8S_AGENT_ALLOW_NS` in the machine's `k8s.env`, announces
+every entry it forwards on stderr, and shows the rendered rules under
+`--dry-run`. A plugin must not read its own config to decide this. The reason
+is not tidiness:
+
+- **The egress gate would not notice.** It probes `K8S_DENIED_PROBE` and
+  nothing else, so it passes whether the seal is two destinations or twelve.
+  A gate that passes while the seal silently grew is the failure class
+  `sandbox-backend.md` calls out — a pin asserted but never verified.
+- **This document would become false.** It exists so it is possible to say
+  which guarantees a given cluster actually holds. A plugin that widened
+  privately would make its own `--capabilities` answer a half-truth, with
+  nothing anywhere to contradict it.
+
+Setting it has one consequence the operator owns: `K8S_DENIED_PROBE` must name
+a destination **outside** every namespace listed, or the gate proves nothing.
+`fork-sandbox-k8s.sh` says so on every install that uses the key.
+
+Each entry renders a `namespaceSelector` on the standard
+`kubernetes.io/metadata.name` label, never an `ipBlock`. kube-proxy DNATs a
+`ClusterIP` to a pod IP *before* egress policy is evaluated on most CNIs, so an
+`ipBlock` naming a Service's `ClusterIP` validates fine and then never matches;
+a `namespaceSelector` matches the destination pod's own namespace label, which
+survives the DNAT. This is the same construct, and the same reasoning, that
+`K8S_PROXY_ALLOW_NS` applies to the proxy's policy — a different pod answering
+a different question.
 
 ## Asking a platform about itself
 

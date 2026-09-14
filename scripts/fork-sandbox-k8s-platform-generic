@@ -3,7 +3,8 @@
 #
 # Usage: fork-sandbox-k8s-platform-generic --capabilities
 #        fork-sandbox-k8s-platform-generic render-policy --namespace NS \
-#                --agent-label KEY=VAL --proxy-label KEY=VAL --proxy-port PORT
+#                --agent-label KEY=VAL --proxy-label KEY=VAL --proxy-port PORT \
+#                [--allow-namespace NS[:PORT]]...
 #
 # Implements the contract in docs/k8s-platform.md: two verbs, nothing else.
 # --capabilities prints what this platform can do, to stdout, and touches
@@ -29,10 +30,33 @@
 #   dns=recursive          DNS egress is not content-filtered here.
 #   runtimeclass=none      no stronger isolation class is offered.
 #
-# render-policy's output seals the agent pod to exactly two destinations:
+# render-policy's output seals the agent pod to two destinations by default:
 # DNS in kube-system, and the proxy on the given label and port. It has no
 # opinion about the proxy's own policy -- that one is ordinary and portable
 # and lives as a static file in manifests/k8s/ instead.
+#
+# --allow-namespace is the one thing that widens that seal, and it is a
+# CALLER decision, never a platform one: fork-sandbox-k8s.sh passes it from
+# K8S_AGENT_ALLOW_NS in this machine's k8s.env, so the set of extra
+# destinations is site configuration that the caller can announce, log and
+# dry-run, rather than something a plugin decides privately. That placement
+# is the whole point. A plugin that widened by reading its own config would
+# be invisible to the egress gate (which probes K8S_DENIED_PROBE and nothing
+# else, so it passes either way) and would make this platform's
+# --capabilities answer -- the thing docs/k8s-platform.md exists to make
+# sayable -- quietly false.
+#
+# Each entry renders a namespaceSelector on the standard
+# kubernetes.io/metadata.name label, NOT an ipBlock. kube-proxy DNATs a
+# ClusterIP to a pod IP BEFORE egress policy is evaluated on most CNIs, so an
+# ipBlock naming a Service's ClusterIP validates fine and then never matches;
+# a namespaceSelector matches the destination pod's own namespace label,
+# which survives the DNAT. This is the same construct, and the same reasoning,
+# as K8S_PROXY_ALLOW_NS applies to the proxy's own policy.
+#
+# The port is optional: a site pointing at an in-cluster Service may not know
+# (or want to pin) which port it listens on, and NetworkPolicy treats a rule
+# with no `ports:` key as every port and protocol.
 
 set -euo pipefail
 
@@ -75,6 +99,8 @@ namespace=""
 agent_label=""
 proxy_label=""
 proxy_port=""
+allow_ns=()
+allow_port=()
 
 while (( $# )); do
     case "$1" in
@@ -82,6 +108,47 @@ while (( $# )); do
         --agent-label) agent_label="${2:?--agent-label requires KEY=VAL}"; shift 2 ;;
         --proxy-label) proxy_label="${2:?--proxy-label requires KEY=VAL}"; shift 2 ;;
         --proxy-port) proxy_port="${2:?--proxy-port requires a port number}"; shift 2 ;;
+        --allow-namespace)
+            entry="${2:?--allow-namespace requires NS[:PORT]}"
+            if [[ "$entry" == *:* ]]; then
+                ns="${entry%:*}"
+                port="${entry##*:}"
+                if [[ -z "$port" ]]; then
+                    echo "Error: --allow-namespace '$entry' has a trailing ':' with no" >&2
+                    echo "port after it -- omit the ':' entirely for every port, or name" >&2
+                    echo "one, such as '$ns:8000'." >&2
+                    exit 1
+                fi
+            else
+                ns="$entry"
+                port=""
+            fi
+            if [[ ! "$ns" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]]; then
+                echo "Error: --allow-namespace '$entry' does not name a valid" >&2
+                echo "namespace ('$ns') -- it must match" >&2
+                echo '[a-z0-9]([a-z0-9-]*[a-z0-9])?, the standard' >&2
+                echo "kubernetes.io/metadata.name label shape." >&2
+                exit 1
+            fi
+            # Forced base 10 (10#$port), as parse_proxy_allow_ns does for the
+            # identical input: plain (( port < 1 )) hands bash arithmetic a
+            # string it reads as a C-style integer literal, so a leading zero
+            # is octal -- "08"/"09" are not valid octal digits at all and
+            # abort with a bash arithmetic error instead of this message,
+            # leaving the port unvalidated and rendered as-is.
+            if [[ -n "$port" ]] && { [[ ! "$port" =~ ^[0-9]{1,5}$ ]] || (( 10#$port < 1 || 10#$port > 65535 )); }; then
+                echo "Error: --allow-namespace '$entry' has an invalid port '$port'" >&2
+                echo "-- must be 1-65535." >&2
+                exit 1
+            fi
+            # Normalized to canonical decimal so a leading-zero input like
+            # "08" never renders as a string the Kubernetes API reads as a
+            # named port.
+            [[ -n "$port" ]] && port="$(( 10#$port ))"
+            allow_ns+=("$ns")
+            allow_port+=("$port")
+            shift 2
+            ;;
         *) echo "Error: unknown option '$1' for render-policy." >&2; exit 1 ;;
     esac
 done
@@ -152,3 +219,24 @@ spec:
         - protocol: TCP
           port: $proxy_port
 EOF
+
+# Appended after the two sealed rules above, so output stays byte-identical
+# to a no --allow-namespace run whenever none is passed. An empty port omits
+# the `ports:` key entirely rather than rendering an empty list --
+# NetworkPolicy reads a rule with no `ports:` key as every port and protocol,
+# whereas `ports: []` would match nothing.
+for (( i = 0; i < ${#allow_ns[@]}; i++ )); do
+    cat <<EOF
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ${allow_ns[$i]}
+EOF
+    if [[ -n "${allow_port[$i]}" ]]; then
+        cat <<EOF
+      ports:
+        - protocol: TCP
+          port: ${allow_port[$i]}
+EOF
+    fi
+done
