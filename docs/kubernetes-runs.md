@@ -194,7 +194,7 @@ idles out or is removed.
 | Files arrive via | `--bind-ro` of a host path | `--context-ro`: `git push`-style push over `kubectl exec`, into `/work/context` — see "Getting files in" below |
 | Work leaves via | `git fetch` from the clone | `git fetch` over `kubectl exec`, from the pod's clone |
 | Services reach it via | unix-socket bridges | Services, narrowed by NetworkPolicy |
-| Egress pin | pasta, or blackhole routes | NetworkPolicy, sealed to DNS and the proxy, plus an initContainer self-test |
+| Egress pin | pasta, or blackhole routes | NetworkPolicy, sealed by default to DNS and the proxy (widened per `K8S_AGENT_ALLOW_NS`), plus an initContainer self-test |
 | Exit status | the process's | the terminated container's `exitCode` |
 
 The client is whatever submits: a workstation, or a CI job holding a kubeconfig.
@@ -728,8 +728,8 @@ It is the caller's key on purpose, not something a platform plugin decides.
 `fork-sandbox-k8s.sh` reads it, validates it, announces every entry it opens
 on stderr, and passes it to the plugin as `--allow-namespace`; `--dry-run`
 shows the resulting rules. `docs/k8s-platform.md` has the full reasoning for
-that placement — the short version is that the egress gate probes
-`K8S_DENIED_PROBE` and nothing else, so a widening only a plugin knew about
+that placement — the short version is that nothing the egress gate checks
+ever touches a widened namespace, so a widening only a plugin knew about
 would pass the gate and quietly falsify this section.
 
 **Setting it makes `K8S_DENIED_PROBE` load-bearing in a new way.** The probe
@@ -1481,9 +1481,13 @@ specific cluster.
 Stated rather than solved, in the same spirit `docs/sandbox-backend.md` states
 what each backend does not hold:
 
-- **No package installation inside a run.** Egress is sealed to DNS and the
-  proxy; there is no reachable package registry, no `npm install`, no
-  `pip install`, no fetching anything not already in `K8S_IMAGE`.
+- **No package installation inside a run — unless `K8S_AGENT_ALLOW_NS` says
+  otherwise.** By default egress is sealed to DNS and the proxy, so there is no
+  reachable package registry, no `npm install`, no `pip install`, no fetching
+  anything not already in `K8S_IMAGE`. Note what that key can therefore buy:
+  naming an in-cluster registry mirror restores every one of those, which may
+  be exactly the intent, and is a consequence to choose deliberately rather
+  than discover.
 - **Under `icmp=unfiltered`** — which is what `generic` declares, because
   plain Kubernetes `NetworkPolicy` has no field that denies ICMP — a pod can
   ping-sweep whatever its egress rules leave reachable, and can tunnel data

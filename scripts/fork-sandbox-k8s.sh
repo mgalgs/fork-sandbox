@@ -386,9 +386,10 @@
 #                         and --dry-run shows the rendered rules. A platform
 #                         plugin cannot open this on its own, because a
 #                         widening only a plugin knew about would be
-#                         invisible to the egress gate (which probes
-#                         K8S_DENIED_PROBE and nothing else, so it passes
-#                         either way) and would quietly falsify what
+#                         invisible to the egress gate, whose fixed checks
+#                         (denied probe unreachable, proxy reachable, ICMP
+#                         where declared) touch no widened namespace, so it
+#                         passes either way -- and would quietly falsify what
 #                         docs/k8s-platform.md says this cluster guarantees.
 #                         Setting it means K8S_DENIED_PROBE must name a
 #                         destination OUTSIDE every namespace listed here,
@@ -1613,6 +1614,35 @@ parse_proxy_allow() {
     return 0
 }
 
+# Prints, to stderr, every extra egress destination K8S_AGENT_ALLOW_NS opens
+# for the AGENT pod, plus the caveat that makes K8S_DENIED_PROBE meaningful
+# alongside it. Prints nothing when the key is unset, which is every install
+# that has not asked to widen the seal.
+#
+# Called from BOTH install and submit, deliberately. install is what applies
+# the policy, but it is a separate command run once; every run for weeks
+# afterwards is governed by a seal nobody is looking at, and a run log that
+# says only "policy verified, proceeding" points its reader at a tighter seal
+# than actually exists. Repeating it per submit costs three lines and keeps
+# the run's own output honest about what that run could reach.
+#
+# Requires PROXY_ALLOW_NS_* to already hold THIS key's parse; callers restore
+# the proxy's afterwards (see cmd_install).
+announce_agent_allow_ns() {
+    local i ns port
+    (( ${#PROXY_ALLOW_NS_NAMESPACES[@]} )) || return 0
+    for (( i = 0; i < ${#PROXY_ALLOW_NS_NAMESPACES[@]}; i++ )); do
+        ns="${PROXY_ALLOW_NS_NAMESPACES[$i]}"
+        port="${PROXY_ALLOW_NS_PORTS[$i]}"
+        if [[ -n "$port" ]]; then
+            echo "fork-sandbox-k8s: K8S_AGENT_ALLOW_NS opens agent egress to namespace '$ns' on TCP port $port." >&2
+        else
+            echo "fork-sandbox-k8s: K8S_AGENT_ALLOW_NS opens agent egress to namespace '$ns' on every port and protocol." >&2
+        fi
+    done
+    echo "fork-sandbox-k8s: K8S_DENIED_PROBE must name a destination outside those namespaces, or the gate's denied half proves nothing." >&2
+}
+
 # Parses K8S_PROXY_ALLOW_NS ("<namespace>[:<port>],<namespace>[:<port>],...")
 # into the PROXY_ALLOW_NS_NAMESPACES / PROXY_ALLOW_NS_PORTS arrays
 # (module-global; an empty string in PROXY_ALLOW_NS_PORTS means "every
@@ -1650,11 +1680,16 @@ parse_proxy_allow_ns() {
             ns="$entry"
             port=""
         fi
-        if [[ ! "$ns" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]]; then
+        # 63 is the label-VALUE cap the API enforces on
+        # kubernetes.io/metadata.name -- the same limit k8s_valid_label_value
+        # applies to every other label this script emits. Checking it here
+        # fails fast instead of at kubectl apply.
+        if [[ ! "$ns" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ || ${#ns} -gt 63 ]]; then
             echo "Error: $label entry '$entry' does not name a valid" >&2
             echo "namespace ('$ns') -- it must match" >&2
             echo '[a-z0-9]([a-z0-9-]*[a-z0-9])?, the standard' >&2
-            echo "kubernetes.io/metadata.name label shape." >&2
+            echo "kubernetes.io/metadata.name label shape, and be at most" >&2
+            echo "63 characters." >&2
             return 1
         fi
         # Forced base 10 (10#$port): plain (( port < 1 || port > 65535 ))
@@ -2492,19 +2527,22 @@ cmd_install() {
         fi
         rendered+="$file_rendered"$'\n'
     done
-
     # K8S_AGENT_ALLOW_NS becomes one --allow-namespace per entry. It reuses
     # the proxy key's parser -- identical syntax, identical validation, and
     # the same DNAT reasoning -- but the RULE is rendered by the plugin, not
     # here, because the agent policy is the platform's to emit and this
     # script has no business knowing its dialect.
     #
-    # Reusing that parser overwrites PROXY_ALLOW_NS_*, which is safe only
-    # because the proxy's own policy is already rendered into $rendered by
-    # this point (the manifest loop above substitutes
-    # render_proxy_egress_rules into 30-proxy.yaml). The results are copied
-    # into agent_allow_args immediately rather than read back later, so this
-    # stays true even if that ordering changes.
+    # That parser fills the module-global PROXY_ALLOW_NS_* arrays, and those
+    # are what render_proxy_egress_rules_ns reads for the PROXY's policy.
+    # Parsing the agent's key through it therefore clobbers the proxy's
+    # entries. The proxy policy happens to be rendered already by this point,
+    # but leaning on that would leave a live trap: move this block earlier --
+    # "validate all config before rendering anything" is a plausible tidy-up
+    # -- and K8S_PROXY_ALLOW_NS's namespaces silently vanish from the proxy
+    # policy while the agent's appear there instead, with every test still
+    # green. So the proxy's parse is restored below rather than assumed
+    # spent. The invariant is enforced here, not documented at a distance.
     local -a agent_allow_args=()
     if [[ -n "$K8S_AGENT_ALLOW_NS" ]]; then
         parse_proxy_allow_ns "$K8S_AGENT_ALLOW_NS" K8S_AGENT_ALLOW_NS || exit 1
@@ -2514,13 +2552,15 @@ cmd_install() {
             aport="${PROXY_ALLOW_NS_PORTS[$ai]}"
             if [[ -n "$aport" ]]; then
                 agent_allow_args+=(--allow-namespace "$ans:$aport")
-                echo "fork-sandbox-k8s: K8S_AGENT_ALLOW_NS opens agent egress to namespace '$ans' on port $aport." >&2
             else
                 agent_allow_args+=(--allow-namespace "$ans")
-                echo "fork-sandbox-k8s: K8S_AGENT_ALLOW_NS opens agent egress to namespace '$ans' on every port." >&2
             fi
         done
-        echo "fork-sandbox-k8s: K8S_DENIED_PROBE must name a destination outside those namespaces, or the egress gate proves nothing." >&2
+        announce_agent_allow_ns
+        # Restore the proxy's own parse. An empty K8S_PROXY_ALLOW_NS resets
+        # the arrays to empty and succeeds, which is the correct restore for
+        # the common case of the key being unset.
+        parse_proxy_allow_ns "$K8S_PROXY_ALLOW_NS" || exit 1
     fi
     rendered+="$("$K8S_PLATFORM_BIN" render-policy --namespace "$K8S_NAMESPACE" \
         --agent-label app=fork-sandbox-agent \
@@ -3060,6 +3100,14 @@ cmd_submit() {
         echo "before anything untrusted runs. Add a line:" >&2
         echo "  K8S_DENIED_PROBE=10.0.0.1:443" >&2
         exit 1
+    fi
+    # What THIS run can reach beyond the sealed default, restated here because
+    # install said it once and may have been weeks ago. Parsed and discarded:
+    # submit renders no policy of its own, so nothing downstream reads these
+    # arrays and there is nothing to restore.
+    if [[ -n "$K8S_AGENT_ALLOW_NS" ]]; then
+        parse_proxy_allow_ns "$K8S_AGENT_ALLOW_NS" K8S_AGENT_ALLOW_NS || exit 1
+        announce_agent_allow_ns
     fi
 
     resolve_platform || exit 1

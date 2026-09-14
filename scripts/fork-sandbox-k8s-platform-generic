@@ -41,8 +41,9 @@
 # destinations is site configuration that the caller can announce, log and
 # dry-run, rather than something a plugin decides privately. That placement
 # is the whole point. A plugin that widened by reading its own config would
-# be invisible to the egress gate (which probes K8S_DENIED_PROBE and nothing
-# else, so it passes either way) and would make this platform's
+# be invisible to the egress gate, whose fixed checks (denied probe
+# unreachable, proxy reachable, ICMP where declared) touch no widened
+# namespace, so it passes either way -- and would make this platform's
 # --capabilities answer -- the thing docs/k8s-platform.md exists to make
 # sayable -- quietly false.
 #
@@ -57,6 +58,12 @@
 # The port is optional: a site pointing at an in-cluster Service may not know
 # (or want to pin) which port it listens on, and NetworkPolicy treats a rule
 # with no `ports:` key as every port and protocol.
+#
+# Mind the protocol asymmetry that creates. A NAMED port renders
+# `protocol: TCP` and permits nothing else, so the narrower-looking form is
+# the one that silently drops UDP -- a StatsD or syslog service named with its
+# port is announced as opened and then never receives a datagram. Omit the
+# port for anything not purely TCP.
 
 set -euo pipefail
 
@@ -123,11 +130,16 @@ while (( $# )); do
                 ns="$entry"
                 port=""
             fi
-            if [[ ! "$ns" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]]; then
+            # The 63-character cap is the label-VALUE limit the Kubernetes
+            # API enforces on kubernetes.io/metadata.name. Without it an
+            # over-long namespace renders clean here and under --dry-run, and
+            # is refused only at kubectl apply -- the least useful place.
+            if [[ ! "$ns" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ || ${#ns} -gt 63 ]]; then
                 echo "Error: --allow-namespace '$entry' does not name a valid" >&2
                 echo "namespace ('$ns') -- it must match" >&2
                 echo '[a-z0-9]([a-z0-9-]*[a-z0-9])?, the standard' >&2
-                echo "kubernetes.io/metadata.name label shape." >&2
+                echo "kubernetes.io/metadata.name label shape, and be at most" >&2
+                echo "63 characters." >&2
                 exit 1
             fi
             # Forced base 10 (10#$port), as parse_proxy_allow_ns does for the

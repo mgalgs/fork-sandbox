@@ -32,6 +32,14 @@ Two verbs. A platform that needs a third is a sign the contract is missing
 something, not a place to bolt one on quietly — raise it instead of growing
 this list ad hoc.
 
+`--allow-namespace` was added to `render-policy` after the first
+implementation shipped. A plugin predating it hits its own unknown-option arm
+and refuses the moment an operator sets `K8S_AGENT_ALLOW_NS` — fail-closed and
+correct, but the error names a flag nobody typed, so a plugin you did not write
+is worth checking before setting that key. Plugins must accept the option; the
+caller guarantees every value it passes already matches the namespace label
+shape and a valid port.
+
 | Verb | Meaning |
 |---|---|
 | `--capabilities` | Print `key=value` lines describing this platform. Exits 0. Renders nothing. |
@@ -45,7 +53,7 @@ this list ad hoc.
 | `--agent-label KEY=VAL` | The label the rendered policy's `podSelector` must match — the agent pod carries it. |
 | `--proxy-label KEY=VAL` | The label of the proxy pod the agent is allowed to reach. |
 | `--proxy-port PORT` | The port on the proxy the agent is allowed to reach. |
-| `--allow-namespace NS[:PORT]` | Repeatable, and the only optional one. An extra namespace the agent may reach, on one port or (omitted) every port. Renders a `namespaceSelector` on `kubernetes.io/metadata.name`. |
+| `--allow-namespace NS[:PORT]` | Repeatable, and the only optional one. An extra namespace the agent may reach. With a port: that **TCP** port only. Without one: every port *and every protocol*. Renders a `namespaceSelector` on `kubernetes.io/metadata.name`. |
 
 The first four are required; `--allow-namespace` is optional and repeatable.
 With none of it, `render-policy` prints one thing: a policy that seals the
@@ -67,9 +75,11 @@ every entry it forwards on stderr, and shows the rendered rules under
 `--dry-run`. A plugin must not read its own config to decide this. The reason
 is not tidiness:
 
-- **The egress gate would not notice.** It probes `K8S_DENIED_PROBE` and
-  nothing else, so it passes whether the seal is two destinations or twelve.
-  A gate that passes while the seal silently grew is the failure class
+- **The egress gate would not notice.** It checks a fixed set of conditions
+  — `K8S_DENIED_PROBE` unreachable, the proxy reachable, and ICMP blocked on a
+  platform declaring `icmp=filtered` — and not one of them touches a widened
+  namespace. It therefore passes whether the seal is two destinations or
+  twelve. A gate that passes while the seal silently grew is the failure class
   `sandbox-backend.md` calls out — a pin asserted but never verified.
 - **This document would become false.** It exists so it is possible to say
   which guarantees a given cluster actually holds. A plugin that widened
@@ -105,6 +115,14 @@ a `namespaceSelector` matches the destination pod's own namespace label, which
 survives the DNAT. This is the same construct, and the same reasoning, that
 `K8S_PROXY_ALLOW_NS` applies to the proxy's policy — a different pod answering
 a different question.
+
+**The two halves of the option differ by protocol, which is easy to miss.** A
+named port renders `protocol: TCP` and permits nothing else; an omitted port
+renders no `ports:` key at all, which NetworkPolicy reads as every port *and
+every protocol*. So the narrower-looking form is also the one that silently
+drops UDP — `K8S_AGENT_ALLOW_NS=telemetry:8125` for a StatsD sidecar, or `:514`
+for syslog, announces an opening at install and then discards every datagram.
+Omit the port for a UDP or mixed-protocol service.
 
 ## Asking a platform about itself
 

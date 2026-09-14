@@ -420,9 +420,49 @@ fi
 # Omitting the option must leave the output byte-identical to what every
 # existing caller already gets -- this is what makes the widening opt-in
 # rather than a change in the sealed default.
-policy_again="$("$platform_generic" render-policy --namespace fork-sandbox \
-    --agent-label app=fork-sandbox-agent --proxy-label app=fork-sandbox-proxy --proxy-port 8080)"
-check "render-policy without --allow-namespace is unchanged" "$policy" "$policy_again"
+#
+# Pinned against the literal expected document, NOT against a second
+# invocation of the same binary with the same arguments: that would be
+# f(x) == f(x), true for any edit to the script and therefore evidence of
+# nothing. The baseline has to be written down to be a baseline.
+read -r -d '' sealed_baseline <<'SEALED' || true
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: fork-sandbox-agent-egress
+  namespace: fork-sandbox
+spec:
+  podSelector:
+    matchLabels:
+      app: fork-sandbox-agent
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress: []
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - podSelector:
+            matchLabels:
+              app: fork-sandbox-proxy
+      ports:
+        - protocol: TCP
+          port: 8080
+SEALED
+check "render-policy without --allow-namespace matches the sealed baseline" \
+    "$sealed_baseline" "$policy"
 
 # A leading-zero port must normalize to canonical decimal, not render as-is
 # and not abort in bash arithmetic reading "08" as octal -- the trap
@@ -2206,9 +2246,9 @@ fi
 # Widening the seal is announced, not silent -- that announcement is the
 # whole reason this is a caller key rather than something a plugin reads on
 # its own, so it is a tested property, not a nicety.
-if grep -qF "opens agent egress to namespace 'preview-alpha' on port 8000" \
+if grep -qF "opens agent egress to namespace 'preview-alpha' on TCP port 8000" \
         /tmp/fs-k8s-test-agent-allow-ns-install.err \
-    && grep -qF "opens agent egress to namespace 'preview-beta' on every port" \
+    && grep -qF "opens agent egress to namespace 'preview-beta' on every port and protocol" \
         /tmp/fs-k8s-test-agent-allow-ns-install.err \
     && grep -qF 'K8S_DENIED_PROBE must name a destination outside those namespaces' \
         /tmp/fs-k8s-test-agent-allow-ns-install.err; then
@@ -2244,6 +2284,50 @@ printf 'OPENROUTER_API_KEY=sk-test-dummy\n' >> "$agent_ns_bad_dir/pi.env"
 refuses "a bad K8S_AGENT_ALLOW_NS entry names that key, not K8S_PROXY_ALLOW_NS" \
     "Error: K8S_AGENT_ALLOW_NS entry" \
     env FORK_SANDBOX_CONFIG_DIR="$agent_ns_bad_dir" "$k8s_sh" install --dry-run
+
+# BOTH keys set at once -- the fixture that was missing while the two shared
+# a parser. Each key must land in its own policy document and nowhere else.
+#
+# Read what this does and does not defend. It pins the END STATE, which is
+# what a user actually gets. It does NOT catch the reordering hazard the
+# call site's own comment describes: under today's ordering the proxy policy
+# is already rendered before the agent's parse clobbers PROXY_ALLOW_NS_*, so
+# this passes with or without the restore (verified by removing it). The
+# restore is the protection; no fixture here can substitute for it, because
+# the hazard only exists in a rearrangement of the code this test cannot
+# reach. Do not read a green run here as license to drop that line.
+both_ns_config_dir="$(newdir)"; tmpdirs+=("$both_ns_config_dir")
+cat > "$both_ns_config_dir/k8s.env" <<'CONF'
+K8S_CONTEXT=test-context
+K8S_NAMESPACE=fork-sandbox-test
+K8S_IMAGE=registry.example/you/fork-sandbox:latest
+K8S_PROXY_ENDPOINTS=primary=http://svc-a.proxy-side-ns.svc.cluster.local:8001/v1
+K8S_PROXY_ALLOW_NS=proxy-side-ns:8001
+K8S_AGENT_ALLOW_NS=agent-side-ns:8000
+K8S_DENIED_PROBE=10.0.0.1:443
+CONF
+install -m 600 /dev/null "$both_ns_config_dir/pi.env"
+printf 'OPENROUTER_API_KEY=sk-test-dummy\n' >> "$both_ns_config_dir/pi.env"
+both_ns_out="$(newdir)/both-allow-ns-install.yaml"; tmpdirs+=("$(dirname "$both_ns_out")")
+FORK_SANDBOX_CONFIG_DIR="$both_ns_config_dir" "$k8s_sh" install --dry-run \
+    > "$both_ns_out" 2>/tmp/fs-k8s-test-both-allow-ns-install.err
+both_proxy_doc="$(extract_doc_by_kind NetworkPolicy "$both_ns_out")"
+both_agent_doc="$(extract_doc_matching 'fork-sandbox-agent-egress' "$both_ns_out")"
+
+if grep -qF 'kubernetes.io/metadata.name: proxy-side-ns' <<< "$both_proxy_doc" \
+    && ! grep -qF 'agent-side-ns' <<< "$both_proxy_doc"; then
+    ok "with both keys set, the proxy policy carries only K8S_PROXY_ALLOW_NS"
+else
+    no "with both keys set, the proxy policy carries only K8S_PROXY_ALLOW_NS" \
+        "$both_proxy_doc"
+fi
+if grep -qF 'kubernetes.io/metadata.name: agent-side-ns' <<< "$both_agent_doc" \
+    && ! grep -qF 'proxy-side-ns' <<< "$both_agent_doc"; then
+    ok "with both keys set, the agent policy carries only K8S_AGENT_ALLOW_NS"
+else
+    no "with both keys set, the agent policy carries only K8S_AGENT_ALLOW_NS" \
+        "$both_agent_doc"
+fi
 
 # A bad namespace shape in K8S_PROXY_ALLOW_NS is a parse-time error, nothing
 # created.
