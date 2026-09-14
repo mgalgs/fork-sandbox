@@ -370,6 +370,21 @@ needs-operator with its reason, each thread's spawn count. `flag` and
 `unflag` set that flag by hand — to silence a thread you intend to leave
 alone, or to re-arm one after fixing whatever tripped it.
 
+### The event stream
+
+Every route/harvest pass, `deliver` prints one porcelain line per action
+worth operator eyes to stdout, unbuffered enough to `tail -F` or pipe
+live: `pm <event> thread=<short-id> agent=<name> key=val...`, where
+`thread` is the thread id's first 8 characters and `agent` is always the
+resolved fleet registry name, never raw header text. The six events are
+`spawn` (agent, thread, run, via=to|cc), `harvest` (agent, thread,
+replies=<count>), `flag` (thread, reason=<fixed keyword>), `refuse`
+(agent, thread, reason=hops|budget), `triage-skip` (agent, thread), and
+`handler` (agent, thread, exit=<status>). This is a stable contract, not
+a log file — stderr is unchanged (errors only), and nothing
+sender-controlled (Subject, body, raw From, attachment names) ever
+becomes a field value on one of these lines.
+
 ### Routing rules
 
 Applied in order to each unrouted message M in thread T. A message is

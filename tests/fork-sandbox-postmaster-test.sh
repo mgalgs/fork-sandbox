@@ -284,6 +284,15 @@ handoff_bob="$(handoff_file_for_agent bob)"
 contains "To wake: handoff states the computed via, not left for the agent to guess" \
     "$(cat "$handoff_bob")" "addressed to you via **To:**"
 
+run_dir_carol="$(sed -n 's/^RUN_DIR=//p' "$run_env")"
+run_dir_bob="$(sed -n 's/^RUN_DIR=//p' "$run_env_bob")"
+contains "spawn event: To wake (bob) logged on stdout with via=to" \
+    "$(cat "$work/once.out")" \
+    "pm spawn thread=$short agent=bob run=$(basename -- "$run_dir_bob") via=to"
+contains "spawn event: Cc wake (carol) logged on stdout with via=cc" \
+    "$(cat "$work/once.out")" \
+    "pm spawn thread=$short agent=carol run=$(basename -- "$run_dir_carol") via=cc"
+
 # ============================================================
 printf '\n== Cc wakes: wake-on-cc:false suppresses, sender-in-cc never wakes, both-headers dedup ==\n'
 # ============================================================
@@ -514,6 +523,10 @@ contains "X-Hops 0: flag names the message id" \
     "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid")" "$mid"
 contains "X-Hops 0: flag reason says hops exhausted" \
     "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid")" "hops exhausted"
+contains "X-Hops 0: refuse event names bob" "$(cat "$work/once.out")" \
+    "pm refuse thread=$short agent=bob reason=hops"
+contains "X-Hops 0: flag event uses the fixed hops-exhausted keyword" \
+    "$(cat "$work/once.out")" "pm flag thread=$short reason=hops-exhausted"
 
 # ============================================================
 printf '\n== thread budget: default 32, env override, flag on exhaust ==\n'
@@ -531,6 +544,10 @@ once
 check "budget default 32: no spawn once exhausted" 0 "$(grep -c -- "^sbx-mail-$short-bob-" "$STUB_ARGV_LOG")"
 contains "budget default 32: flag names the limit" \
     "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid")" "thread budget 32 exhausted"
+contains "budget default 32: refuse event names bob" \
+    "$(cat "$work/once.out")" "pm refuse thread=$short agent=bob reason=budget"
+contains "budget default 32: flag event uses the fixed budget-exhausted keyword" \
+    "$(cat "$work/once.out")" "pm flag thread=$short reason=budget-exhausted"
 
 new_scratch_root FORK_SANDBOX_MAIL_ROOT
 export FORK_SANDBOX_MAIL_ROOT
@@ -800,6 +817,9 @@ printf 'To: @carol\nSubject: answering an ancestor with more hops\nReply-To-Id: 
 printf '0\n' > "$run_dir/exit-code"
 printf '{}\n' > "$run_dir/summary.json"
 once
+
+contains "harvest event: bob's pass logged with the correct reply count" \
+    "$(cat "$work/once.out")" "pm harvest thread=$short agent=bob replies=5"
 
 # mail-1: ordinary reply-all, hops decremented by the harvester's --hops
 # override on `mail reply` (both reply paths decrement now).
@@ -2159,6 +2179,8 @@ check "skip verdict: triaged/<thread-id> has exactly one line" 1 \
 contains "skip verdict: triaged line names the message and agent" \
     "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/triaged/$tid" 2>/dev/null)" \
     "$mid"$'\t'"alice"
+contains "skip verdict: triage-skip event names alice on stdout" \
+    "$(cat "$work/once.out")" "pm triage-skip thread=${tid:0:8} agent=alice"
 contains "status prints the triaged count" "$("$postmaster" status 2>&1)" "triaged: 1"
 
 # --- scenario 3: a To candidate is never classified, even when the
@@ -2538,6 +2560,8 @@ export FORK_SANDBOX_MAIL_ROOT
 mid="$(send_msg '@carol' '@happy' 'Happy path' 'do the thing')"
 tid="$(thread_of "$mid")"
 once
+contains "happy: handler event logged with exit=0" \
+    "$(cat "$work/once.out")" "pm handler thread=${tid:0:8} agent=happy exit=0"
 check "happy: exactly one handler invocation" 1 \
     "$(grep -c -- '^----CALL----$' "$HANDLER_LOG")"
 check "happy: FS_HANDLER_AGENT is the seat's own name, no @" "AGENT:happy" \
@@ -2591,6 +2615,10 @@ contains "malformed: thread is flagged, naming the bad file" \
 mid="$(send_msg '@carol' '@nonzero' 'Dies after replying' 'trigger')"
 tid="$(thread_of "$mid")"
 once
+contains "nonzero: handler event logged with exit=1" \
+    "$(cat "$work/once.out")" "pm handler thread=${tid:0:8} agent=nonzero exit=1"
+contains "nonzero: flag event uses the fixed handler-error keyword" \
+    "$(cat "$work/once.out")" "pm flag thread=${tid:0:8} reason=handler-error"
 posted=0
 for f in "$FORK_SANDBOX_MAIL_ROOT/threads/$tid"/*.msg; do
     [[ -e "$f" ]] || continue
@@ -2926,6 +2954,36 @@ unset FORK_SANDBOX_POSTMASTER_TRIAGE_LAUNCHER
 unset FORK_SANDBOX_HANDLERS_DIR
 export FORK_SANDBOX_FLEET_FILE="$SAVED_FLEET_FILE"
 export FORK_SANDBOX_PERSONAS_DIR="$SAVED_PERSONAS_DIR"
+
+# ============================================================
+printf '\n== event stream: a hostile Subject/body never reaches stdout ==\n'
+# ============================================================
+# The event stream's hard safety requirement: no sender-controlled text
+# (Subject, body, raw From, attachment names) may ever become a field
+# value on a "pm <event> ..." stdout line. mail.sh's own --subject
+# validation (mail_validate_no_newline) already refuses a literal
+# newline in a Subject at send time -- so the newline half of this
+# attack is exercised via the BODY instead, which carries no such
+# restriction.
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+evil_subject=$'\e[31mFAKE\e[0m pm spawn thread=deadbeef agent=evilsubject run=x via=to'
+evil_body=$'first line\npm flag thread=deadbeef reason=evilbody\nlast line'
+mid="$(send_msg '@alice' '@bob' "$evil_subject" "$evil_body" 8)"
+tid="$(thread_of "$mid")"
+once
+stdout_content="$(cat "$work/once.out")"
+check "hostile subject: raw ANSI escape never reaches stdout" 0 \
+    "$(printf '%s' "$stdout_content" | grep -acF $'\e[31m')"
+check "hostile subject: forged agent name never reaches stdout" 0 \
+    "$(printf '%s' "$stdout_content" | grep -ac -- 'evilsubject')"
+check "hostile body: forged reason never reaches stdout" 0 \
+    "$(printf '%s' "$stdout_content" | grep -ac -- 'evilbody')"
+check "hostile subject/body: every stdout line matches the fixed pm event shape" 0 \
+    "$(printf '%s' "$stdout_content" | grep -avc -- '^pm \(spawn\|harvest\|flag\|refuse\|triage-skip\|handler\) thread=[0-9a-f]\{8\} ')"
+check "hostile subject/body: exactly the one legitimate spawn event, nothing extra" 1 \
+    "$(printf '%s' "$stdout_content" | grep -ac '^pm ')"
 
 # ============================================================
 printf '\n== --help and dispatcher wiring ==\n'

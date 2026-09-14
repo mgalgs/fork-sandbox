@@ -24,6 +24,35 @@
 # silence a thread the operator intends to leave alone, or to re-arm one
 # after fixing whatever tripped a flag automatically.
 #
+# EVENT STREAM (stdout, `deliver` only)
+#
+# Every route/harvest pass prints one line per action worth operator eyes,
+# unbuffered so the process can be `tail -F`'d or piped live -- this is
+# porcelain, not a log file, so the line shape below is the stable
+# contract, not an implementation detail:
+#
+#   pm <event> thread=<short-id> agent=<name> key=val...
+#
+# thread=<short-id> is the thread id's first 8 characters (same shortening
+# `pm_spawn_wake` uses for a wake's branch name). agent=<name> is always
+# the RESOLVED fleet registry name, never raw header text. Events:
+#
+#   spawn        agent, thread, run=<run-dir basename>, via=to|cc
+#   harvest      agent, thread, replies=<count posted this pass>
+#   flag         thread, reason=<fixed keyword> (no agent -- a thread-level
+#                condition, not a per-agent one; see pm_flag_keyword)
+#   refuse       agent, thread, reason=hops|budget -- a specific agent's
+#                wake was refused (X-Hops or thread-budget gate); the
+#                thread itself is also separately flag'd
+#   triage-skip  agent, thread -- the Cc triage classifier skipped this
+#                candidate for this message
+#   handler      agent, thread, exit=<status> -- a handler seat's wake ran
+#                to completion (every run, not just failures)
+#
+# stderr is unchanged (errors only). Nothing sender-controlled (Subject,
+# body, raw From, attachment names) is ever a field value here -- see
+# pm_event's own comment.
+#
 # THE MODEL
 #
 # Spawn-on-delivery. An agent is a (persona, mailbox) pair; a wake is one
@@ -888,10 +917,52 @@ pm_next_seq() {
     printf '%s' "$(( n + 1 ))"
 }
 
+# Prints one porcelain line to stdout for a route/harvest-pass action
+# worth operator eyes (see the EVENT STREAM header comment for the format
+# and the fixed event vocabulary). The one rule every call site must
+# honor: every value passed in "$@" here ends up on stdout verbatim, so
+# NEVER pass sender-controlled text (Subject, body, raw From header,
+# attachment names) -- only agent names already resolved against the
+# fleet registry, thread short-ids, and values this script itself
+# computed (run-dir basenames, exit codes, fixed keywords).
+pm_event() {
+    printf 'pm %s\n' "$*"
+}
+
+# Maps a pm_flag reason string to a fixed, safe keyword for the "flag"
+# event's stdout line. This is a closed case match over the exact reason
+# strings this script itself constructs (see the call sites) -- never a
+# substring/passthrough of $reason -- specifically so that an operand
+# embedded in a reason (a message-id, a run-id, a handler's own stderr
+# tail) can never reach stdout even indirectly.
+pm_flag_keyword() {
+    local reason="$1"
+    case "$reason" in
+        "seat resolution failed for"*) printf 'seat-resolution-failed' ;;
+        "handler command"*"path separator"*) printf 'handler-bad-command' ;;
+        "handler "*"does not exist"*) printf 'handler-missing' ;;
+        "handler "*"is not a regular file"*) printf 'handler-not-regular' ;;
+        "handler "*"is not executable"*) printf 'handler-not-executable' ;;
+        "thread render failed for handler"*) printf 'render-failed' ;;
+        "handler "*) printf 'handler-error' ;;
+        "handoff render failed for"*) printf 'handoff-render-failed' ;;
+        "spawn failed for"*) printf 'spawn-failed' ;;
+        "hops exhausted at"*) printf 'hops-exhausted' ;;
+        "thread budget"*"exhausted") printf 'budget-exhausted' ;;
+        "malformed reply file"*) printf 'malformed-reply' ;;
+        "pending message"*"vanished"*) printf 'pending-vanished' ;;
+        "run dir for"*"vanished"*) printf 'run-vanished' ;;
+        "wake never produced summary.json"*) printf 'no-summary' ;;
+        "wake for"*"exited"*) printf 'wake-exit' ;;
+        *) printf 'other' ;;
+    esac
+}
+
 pm_flag() {
     local tid="$1" reason="$2"
     mkdir -p -- "$NEEDS_OPERATOR"
     printf '%s\n' "$reason" > "$NEEDS_OPERATOR/$tid"
+    pm_event "flag thread=${tid:0:8} reason=$(pm_flag_keyword "$reason")"
 }
 
 pm_unflag() {
@@ -1296,6 +1367,8 @@ pm_exec_wake() {
     set -e
     rm -f -- "$rendered"
 
+    pm_event "handler thread=${tid:0:8} agent=$agent exit=$rc"
+
     local trigger_file trigger_hops
     trigger_file="$(pm_find_by_id "$mid" || true)"
     trigger_hops="0"
@@ -1323,7 +1396,7 @@ pm_exec_wake() {
     local mf
     for mf in "$outbox"/mail-*.md; do
         [[ -e "$mf" ]] || continue
-        pm_harvest_one_file "$mf" "$agent" "$tid" "$mid" "$trigger_hops"
+        pm_harvest_one_file "$mf" "$agent" "$tid" "$mid" "$trigger_hops" || true
     done
 
     # Unlike an LLM wake's outbox (part of its ephemeral scratch run dir,
@@ -1507,6 +1580,7 @@ pm_spawn_wake() {
     mkdir -p -- "$SPAWNS" "$SEQ"
     printf '%s\n' "$run_id" >> "$SPAWNS/$tid"
     printf '%s\n' "$run_id" >> "$SEQ/$tid"
+    pm_event "spawn thread=${tid:0:8} agent=$agent run=$(basename -- "$run_dir") via=$via"
 }
 
 pm_wake_or_pend() {
@@ -1559,6 +1633,22 @@ pm_process_message() {
         : > "$SPAWNS/$tid"
     fi
 
+    # Expanded regardless of the gate below: a refused message still needs
+    # its To-candidates' resolved names for the "refuse" event (agent field
+    # must be a registry name, never raw header text) -- pm_expand_to only
+    # resolves names via `fleet expand`, it spawns nothing and triages
+    # nothing, so computing it unconditionally costs one cheap read, not a
+    # wasted wake or a wasted triage classifier call.
+    local -a to_expanded=()
+    mapfile -t to_expanded < <(pm_expand_to "$to")
+    local -a to_candidates=()
+    local cand
+    for cand in "${to_expanded[@]}"; do
+        [[ -n "$cand" ]] || continue
+        [[ "$cand" == "$from_name" ]] && continue
+        to_candidates+=("$cand")
+    done
+
     local gate_reason=""
     if [[ "$x_hops" == "0" ]]; then
         gate_reason="hops exhausted at $mid"
@@ -1572,14 +1662,7 @@ pm_process_message() {
 
     local -a candidates=()
     if [[ -z "$gate_reason" ]]; then
-        local -a expanded=()
-        mapfile -t expanded < <(pm_expand_to "$to")
-        local cand
-        for cand in "${expanded[@]}"; do
-            [[ -n "$cand" ]] || continue
-            [[ "$cand" == "$from_name" ]] && continue
-            candidates+=("$cand")
-        done
+        candidates+=("${to_candidates[@]}")
 
         local -a expanded_cc=()
         mapfile -t expanded_cc < <(pm_expand_to "$cc")
@@ -1613,6 +1696,7 @@ pm_process_message() {
                 if ! pm_triage_wake "$cand" "$mid" "$tid" "$f" \
                         "$c_description" "$c_triage" "$t_harness" "$t_model"; then
                     pm_triage_record "$tid" "$mid" "$cand"
+                    pm_event "triage-skip thread=${tid:0:8} agent=$cand"
                     continue
                 fi
             fi
@@ -1623,6 +1707,11 @@ pm_process_message() {
     : > "$ROUTED/$mid"
 
     if [[ -n "$gate_reason" ]]; then
+        local refuse_reason="budget"
+        [[ "$gate_reason" == hops* ]] && refuse_reason="hops"
+        for cand in "${to_candidates[@]}"; do
+            pm_event "refuse thread=${tid:0:8} agent=$cand reason=$refuse_reason"
+        done
         pm_flag "$tid" "$gate_reason"
         return 0
     fi
@@ -1695,7 +1784,7 @@ pm_harvest_one_file() {
     if ! parsed="$(pm_parse_reply_file "$mf" "$body_file")"; then
         rm -f -- "$body_file"
         pm_flag "$tid" "malformed reply file $(basename -- "$mf"): unparseable header stanza"
-        return 0
+        return 1
     fi
     local to cc subject reply_to_id
     # \x1f, not \t: bash's `read` collapses runs of IFS-whitespace
@@ -1738,7 +1827,7 @@ pm_harvest_one_file() {
         if [[ -z "$to" || -z "$subject" ]]; then
             rm -f -- "$body_file"
             pm_flag "$tid" "malformed reply file $(basename -- "$mf"): Reply-To-Id: new requires To and Subject"
-            return 0
+            return 1
         fi
         cmd=("$MAIL" send --from "@$agent" --to "$to" --subject "$subject" --body "$body_file" --hops "$decremented")
         [[ -n "$cc" ]] && cmd+=(--cc "$cc")
@@ -1758,7 +1847,9 @@ pm_harvest_one_file() {
 
     if (( rc != 0 )); then
         pm_flag "$tid" "malformed reply file $(basename -- "$mf"): $err_out"
+        return 1
     fi
+    return 0
 }
 
 pm_followup_wake() {
@@ -1771,12 +1862,14 @@ pm_followup_wake() {
     local x_hops
     x_hops="$(pm_header "$f" X-Hops)"
     if [[ "$x_hops" == "0" ]]; then
+        pm_event "refuse thread=${tid:0:8} agent=$agent reason=hops"
         pm_flag "$tid" "hops exhausted at $mid"
         return 0
     fi
     local budget="${FORK_SANDBOX_THREAD_BUDGET:-32}" count
     count="$(pm_spawn_count "$tid")"
     if (( count >= budget )); then
+        pm_event "refuse thread=${tid:0:8} agent=$agent reason=budget"
         pm_flag "$tid" "thread budget $budget exhausted"
         return 0
     fi
@@ -1965,11 +2058,14 @@ pm_harvest_run() {
     [[ -n "$trigger_file" ]] && trigger_hops="$(pm_header "$trigger_file" X-Hops)"
     [[ "$trigger_hops" =~ ^[0-9]+$ ]] || trigger_hops=0
 
-    local mf
+    local mf replies=0
     for mf in "$run_dir/outbox"/mail-*.md; do
         [[ -e "$mf" ]] || continue
-        pm_harvest_one_file "$mf" "$agent" "$tid" "$trigger" "$trigger_hops"
+        if pm_harvest_one_file "$mf" "$agent" "$tid" "$trigger" "$trigger_hops"; then
+            replies=$(( replies + 1 ))
+        fi
     done
+    pm_event "harvest thread=${tid:0:8} agent=$agent replies=$replies"
 
     mkdir -p -- "$HARVESTED"
     : > "$HARVESTED/$rid"
