@@ -142,9 +142,45 @@ run_endpoint_case() {
     if (( rc == 0 )); then ok "$name exits successfully"; else no "$name exits successfully" "$out"; return; fi
     tr '\0' '\n' < "$capture" > "$capture.text"
 }
+# An argv assertion has to prove three things AT ONCE, because each one alone
+# passes against a build that forwards nothing: the flag is present, THIS value
+# follows it immediately, and both sit before the backend's `--` separator.
+# That last one is the trap: everything after the separator goes to the agent
+# verbatim, so an unrecognized flag still appears in a captured argv and a
+# grep for it anywhere in the capture goes green while the feature does
+# nothing. Raised by a peer whose own first two --setenv tests passed against
+# unmodified code for exactly this reason.
+argv_has_flag_value() {
+    awk -v flag="$2" -v value="$3" '
+        $0 == "--" { after = 1 }
+        !after && prev == flag && $0 == value { found = 1 }
+        { prev = $0 }
+        END { exit(found ? 0 : 1) }
+    ' "$1"
+}
+# The assertion helper gets its own falsification tests. An assertion nobody
+# has watched fail is not known to be an assertion -- which is the whole defect
+# this helper exists to fix, so it would be absurd to take the helper itself on
+# trust.
+printf '%s\n' --hosts-alias gateway.example -- other > "$work/argv-good"
+printf '%s\n' -- --hosts-alias gateway.example > "$work/argv-after-sep"
+printf '%s\n' --hosts-alias other gateway.example -- > "$work/argv-not-adjacent"
+printf '%s\n' --hosts-alias other.example -- > "$work/argv-wrong-value"
+if argv_has_flag_value "$work/argv-good" --hosts-alias gateway.example; then
+    ok "argv assertion accepts flag+value before the separator"
+else
+    no "argv assertion accepts flag+value before the separator"
+fi
+for bad in after-sep not-adjacent wrong-value; do
+    if argv_has_flag_value "$work/argv-$bad" --hosts-alias gateway.example; then
+        no "argv assertion rejects $bad"
+    else
+        ok "argv assertion rejects $bad"
+    fi
+done
+
 run_endpoint_case "hostname endpoint" 'http://gateway.example/v1' $'toolchain=host\nhosts_alias=1'
-if grep -qx -- '--hosts-alias' "$work/hostname endpoint.args.text" && \
-    grep -qx -- 'gateway.example' "$work/hostname endpoint.args.text" && \
+if argv_has_flag_value "$work/hostname endpoint.args.text" --hosts-alias gateway.example && \
     [[ "$(jq -r '.providers.local.baseUrl' "$work/hostname endpoint.models.json" 2>/dev/null)" == 'http://gateway.example:8318/v1' ]] && \
     [[ "$(jq -r '.providers.local | has("headers")' "$work/hostname endpoint.models.json" 2>/dev/null)" == 'false' ]]; then
     ok "hostname endpoint keeps its hostname authority"
@@ -156,7 +192,7 @@ fi
 # hostname endpoint must still work there: the alias is the backend's job, so
 # nothing on the host side is needed for it.
 run_endpoint_case "image hostname endpoint" 'http://localhost/v1' $'toolchain=image\nhosts_alias=1'
-if grep -qx -- 'localhost' "$work/image hostname endpoint.args.text"; then
+if argv_has_flag_value "$work/image hostname endpoint.args.text" --hosts-alias localhost; then
     ok "image hostname endpoint still gets its alias"
 else
     no "image hostname endpoint still gets its alias"
