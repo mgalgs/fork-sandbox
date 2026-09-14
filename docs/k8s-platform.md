@@ -76,6 +76,23 @@ is not tidiness:
   privately would make its own `--capabilities` answer a half-truth, with
   nothing anywhere to contradict it.
 
+**`--capabilities` does not report this, and that is a real limit rather than
+an oversight.** The keys describe the platform's *dialect* — what policy
+language it emits, whether that language can deny ICMP — and widening is not a
+dialect property: it is a caller's choice, expressed per invocation, so two
+runs against the same plugin can seal differently. A key would therefore have
+to answer "could be widened", which is true of every platform and tells a
+reader nothing about the run in front of them.
+
+The consequence is worth stating plainly: **nothing can ask the plugin, after
+the fact, how wide a given policy was rendered.** `--capabilities` answers as
+though the seal were the two default destinations regardless. A consumer that
+needs the real answer has to read the applied `NetworkPolicy`, or the
+`K8S_AGENT_ALLOW_NS` the launcher was given — both of which are available, and
+neither of which is this interface. That is an accepted trade, made because
+the alternative (a key that is either always-true or silently per-run) would
+be worse than the gap it filled.
+
 Setting it has one consequence the operator owns: `K8S_DENIED_PROBE` must name
 a destination **outside** every namespace listed, or the gate proves nothing.
 `fork-sandbox-k8s.sh` says so on every install that uses the key.
