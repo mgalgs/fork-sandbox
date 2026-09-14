@@ -87,9 +87,11 @@
 # stack down. A SIGKILL skips the teardown and leaks the compose project, the
 # same way it leaks the state dir below.
 #
-# --bind-ro, --bind-rw, --bind-ro-at and --prepend-path pass straight through to
-# the sandbox backend. See sandbox-backend-bwrap's header for what each one
-# costs.
+# --bind-ro, --bind-rw, --bind-ro-at, --prepend-path and --setenv pass straight
+# through to the sandbox backend. See sandbox-backend-bwrap's header for what
+# each one costs. --setenv KEY=VALUE is how a caller points a client inside at
+# a bridged service: the in-sandbox address is assigned here, so a checkout
+# cannot carry it and something outside has to supply it.
 #
 # --no-git-warning drops the warning below about a work dir that is a git
 # checkout. It exists for fork-sandbox.sh, whose work dir is always a throwaway
@@ -350,6 +352,20 @@ while [[ $# -gt 0 ]]; do
             ;;
         --bind-ro|--bind-rw|--prepend-path)
             FORWARD_FLAGS+=("$1" "${2:?$1 requires a path}")
+            shift 2
+            ;;
+        --setenv)
+            # KEY=VALUE, not a path, so it gets its own arm and its own
+            # message. A bridged service is reached at an in-sandbox address
+            # the caller cannot know until this script assigns it, so the
+            # setting that points a client at one has to arrive from outside
+            # rather than from the checkout.
+            setenv_val="${2:?--setenv requires KEY=VALUE}"
+            if [[ "$setenv_val" != *=* || "$setenv_val" == =* ]]; then
+                echo "Error: --setenv '$setenv_val' is not KEY=VALUE." >&2
+                exit 1
+            fi
+            FORWARD_FLAGS+=("$1" "$setenv_val")
             shift 2
             ;;
         --bind-ro-at)

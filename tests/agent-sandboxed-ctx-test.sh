@@ -255,5 +255,55 @@ out="$(PATH="$bin:$PATH" FORK_SANDBOX_BACKEND=test FORK_SANDBOX_CONFIG_DIR="$wor
     --bridge 'gateway.example:80=8090' --model test-model "$work/project" 2>&1)"
 if [[ "$out" == *'hosts_alias=1'* ]]; then ok "bridged hostname refuses backend without hosts alias"; else no "bridged hostname refuses backend without hosts alias" "$out"; fi
 
+# --setenv is how a caller points a client at a bridged service, whose
+# in-sandbox address the checkout cannot know, so it has to reach the backend
+# verbatim. A value that is not KEY=VALUE is refused here rather than passed on
+# for the backend to reject in less specific terms.
+setenv_capture="$work/setenv.args"
+setenv_out="$(PATH="$bin:$PATH" FORK_SANDBOX_BACKEND=test FORK_SANDBOX_CONFIG_DIR="$work" \
+    BACKEND_CAPS=$'toolchain=host\nhosts_alias=1' BACKEND_CAPTURE="$setenv_capture" \
+    CTX_CAPTURE="$work/setenv.models.json" timeout 8 "$agent" \
+    --endpoint 'http://192.0.2.10:8080/v1' \
+    --setenv 'GPU_EMBEDDER_GEMMA_BULK_HOSTS=http://gateway.example:8090' \
+    --model test-model "$work/project" 2>&1)"
+setenv_rc=$?
+if (( setenv_rc == 0 )); then
+    tr '\0' '\n' < "$setenv_capture" > "$setenv_capture.text"
+    # Two traps here, and the obvious assertion falls into both. Presence of
+    # '--setenv' proves nothing: this script emits its OWN --setenv
+    # HF_HUB_OFFLINE=1, so the flag name matches even on a build that never
+    # forwarded anything, and matching the FIRST one finds that. Nor does
+    # presence of the pair prove it reached the BACKEND: everything after the
+    # work dir goes to the agent verbatim, past the backend's '--' separator,
+    # so an unrecognized --setenv still lands in this capture.
+    # So anchor on the VALUE, which is unique to this case, require the line
+    # before it to be the flag, and require the pair to sit BEFORE the
+    # separator.
+    setenv_sep="$(grep -nx -- '--' "$setenv_capture.text" | head -1 | cut -d: -f1)"
+    setenv_val_at="$(grep -nx -- 'GPU_EMBEDDER_GEMMA_BULK_HOSTS=http://gateway.example:8090' "$setenv_capture.text" | head -1 | cut -d: -f1)"
+    setenv_flag_before=""
+    if [[ -n "$setenv_val_at" ]] && (( setenv_val_at > 1 )); then
+        setenv_flag_before="$(sed -n "$((setenv_val_at - 1))p" "$setenv_capture.text")"
+    fi
+    if [[ -n "$setenv_val_at" && "$setenv_flag_before" == '--setenv' ]] && \
+        { [[ -z "$setenv_sep" ]] || (( setenv_val_at < setenv_sep )); }; then
+        ok "--setenv reaches the backend as a backend flag"
+    else
+        no "--setenv reaches the backend as a backend flag" "$(cat "$setenv_capture.text")"
+    fi
+else
+    no "--setenv reaches the backend as a backend flag" "$setenv_out"
+fi
+
+setenv_out="$(PATH="$bin:$PATH" FORK_SANDBOX_BACKEND=test FORK_SANDBOX_CONFIG_DIR="$work" \
+    BACKEND_CAPS=$'toolchain=host\nhosts_alias=1' timeout 8 "$agent" \
+    --endpoint 'http://192.0.2.10:8080/v1' --setenv 'notkeyvalue' \
+    --model test-model "$work/project" 2>&1)"
+if [[ "$setenv_out" == *'not KEY=VALUE'* ]]; then
+    ok "--setenv refuses a value that is not KEY=VALUE"
+else
+    no "--setenv refuses a value that is not KEY=VALUE" "$setenv_out"
+fi
+
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 (( fail == 0 )) || exit 1
