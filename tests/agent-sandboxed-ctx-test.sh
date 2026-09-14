@@ -210,5 +210,50 @@ out="$(PATH="$bin:$PATH" FORK_SANDBOX_BACKEND=test FORK_SANDBOX_CONFIG_DIR="$wor
     --model test-model "$work/project" 2>&1)"
 if [[ "$out" == *'hosts_alias=1'* ]]; then ok "hostname refuses backend without hosts alias"; else no "hostname refuses backend without hosts alias" "$out"; fi
 
+# A BRIDGED hostname needs the same alias for the same reason: the in-sandbox
+# client dials loopback, so without a name mapped there its Host header reads
+# `127.0.0.1:<in-port>` and a Host-routed service answers for its default
+# vhost instead of the bridged name. Measured against a live Host-routed
+# gateway: no alias -> 404; alias -> the service's own answer. Each case below
+# uses an IPv4 ENDPOINT, which contributes no alias of its own, so any alias
+# in the captured args can only have come from the bridge.
+run_bridge_case() {
+    local name="$1" bridge="$2" caps="$3" out rc
+    local capture="$work/$name.args"
+    out="$(PATH="$bin:$PATH" FORK_SANDBOX_BACKEND=test FORK_SANDBOX_CONFIG_DIR="$work" \
+        BACKEND_CAPS="$caps" BACKEND_CAPTURE="$capture" CTX_CAPTURE="$work/$name.models.json" timeout 8 "$agent" \
+        --endpoint 'http://192.0.2.10:8080/v1' --bridge "$bridge" \
+        --model test-model "$work/project" 2>&1)"
+    rc=$?
+    if (( rc == 0 )); then ok "$name exits successfully"; else no "$name exits successfully" "$out"; return 1; fi
+    tr '\0' '\n' < "$capture" > "$capture.text"
+}
+if run_bridge_case "bridge hostname" 'gateway.example:80=8090' $'toolchain=host\nhosts_alias=1'; then
+    if grep -qx -- '--hosts-alias' "$work/bridge hostname.args.text" && \
+        grep -qx -- 'gateway.example' "$work/bridge hostname.args.text"; then
+        ok "bridged hostname is mapped inside the sandbox"
+    else
+        no "bridged hostname is mapped inside the sandbox" "$(cat "$work/bridge hostname.args.text")"
+    fi
+fi
+
+# An IPv4 bridge has no name to carry, so it must not gain an alias -- the
+# endpoint is IPv4 here too, so a correct run emits no --hosts-alias at all.
+if run_bridge_case "bridge IP" '192.0.2.20:80=8091' $'toolchain=host\nhosts_alias=1'; then
+    if ! grep -qx -- '--hosts-alias' "$work/bridge IP.args.text"; then
+        ok "bridged IPv4 gains no alias"
+    else
+        no "bridged IPv4 gains no alias" "$(cat "$work/bridge IP.args.text")"
+    fi
+fi
+
+# And a backend that cannot map hostnames must be refused rather than silently
+# falling back to loopback, which would look like a working bridge returning
+# another vhost's answers.
+out="$(PATH="$bin:$PATH" FORK_SANDBOX_BACKEND=test FORK_SANDBOX_CONFIG_DIR="$work" \
+    BACKEND_CAPS='toolchain=host' timeout 8 "$agent" --endpoint 'http://192.0.2.10:8080/v1' \
+    --bridge 'gateway.example:80=8090' --model test-model "$work/project" 2>&1)"
+if [[ "$out" == *'hosts_alias=1'* ]]; then ok "bridged hostname refuses backend without hosts alias"; else no "bridged hostname refuses backend without hosts alias" "$out"; fi
+
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 (( fail == 0 )) || exit 1

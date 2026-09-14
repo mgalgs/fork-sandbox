@@ -52,6 +52,15 @@
 # the port it gets. The mapping is printed on stderr when the run starts, so a
 # test suite or client can point at the in-sandbox address.
 #
+# A bridged HOSTNAME is also mapped to loopback inside, the same way the model
+# endpoint's is, so a client reaches the bridge by the name it was given and
+# sends a Host header the far end routes on. Without that mapping the request
+# carries `Host: 127.0.0.1:<in-port>`, and a Host-routed service answers for
+# its default vhost rather than the name meant -- a bridge that looks up but
+# returns the wrong service's answers. Reach it at NAME:INPORT, not NAME:PORT:
+# the alias points the name at loopback, where only the in-sandbox port is
+# listening. An IPv4 bridge host is left alone, having no name to carry.
+#
 # --services stands up this repository's throwaway service stack — postgres,
 # redis, object storage — and binds what its checkout needs to run sealed. It
 # honors the same committed contract fork-sandbox.sh uses: a repo opts in by
@@ -487,6 +496,22 @@ fi
 BASE_HOST=127.0.0.1
 (( EP_NEEDS_HOSTS_ALIAS )) && BASE_HOST="$EP_HOST"
 
+# A bridged endpoint has exactly the same Host-routing need as the model
+# endpoint above, and for the same reason: the in-sandbox client dials
+# loopback, so without a name mapped there its request carries
+# `Host: 127.0.0.1:<in-port>` and a Host-routed service answers for whatever
+# its default vhost is -- not for the name the caller meant. Measured against
+# a live Host-routed inference gateway: bridged with no alias, POST /embed
+# returned 404; with the alias, the identical request returned vectors. An
+# IPv4 bridge host has no name to retain, exactly as for the endpoint.
+BRIDGE_NEEDS_HOSTS_ALIAS=0
+for i in "${!BRIDGE_HOSTS[@]}"; do
+    if [[ ! "${BRIDGE_HOSTS[$i]}" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+        BRIDGE_NEEDS_HOSTS_ALIAS=1
+        break
+    fi
+done
+
 # A URL client derives Host from its URL authority, so a privileged endpoint
 # port -- which must move to an unprivileged in-sandbox port below -- yields
 # `Host: <name>:<in-port>` rather than the endpoint's own authority. That is
@@ -650,6 +675,15 @@ if (( EP_NEEDS_HOSTS_ALIAS )) && [[ "$FS_BACKEND_HOSTS_ALIAS" != 1 ]]; then
     echo "Error: endpoint '$ENDPOINT' needs hostname '$EP_HOST' inside the" >&2
     echo "sandbox, but backend '$FS_BACKEND_BIN' does not declare hosts_alias=1." >&2
     echo "Refusing to fall back to 127.0.0.1, which loses the endpoint Host header." >&2
+    exit 1
+fi
+if (( BRIDGE_NEEDS_HOSTS_ALIAS )) && [[ "$FS_BACKEND_HOSTS_ALIAS" != 1 ]]; then
+    echo "Error: a --bridge names a hostname that must be mapped inside the" >&2
+    echo "sandbox, but backend '$FS_BACKEND_BIN' does not declare hosts_alias=1." >&2
+    echo "Refusing to fall back to 127.0.0.1: a Host-routed service would then" >&2
+    echo "answer for its default vhost instead of the bridged name, which looks" >&2
+    echo "like a working bridge returning wrong answers. Bridge an IPv4 literal" >&2
+    echo "instead, or use a backend that maps hostnames." >&2
     exit 1
 fi
 
@@ -1090,6 +1124,15 @@ sandbox_cmd=(
 if (( EP_NEEDS_HOSTS_ALIAS )); then
     sandbox_cmd+=(--hosts-alias "$EP_HOST")
 fi
+# Each bridged hostname too, so a client can reach a bridge by the name it
+# was given rather than by loopback, and carry a Host header the far end
+# routes on. The backend dedups, so a bridge that repeats a host -- or that
+# names the endpoint's own host -- costs nothing here.
+for i in "${!BRIDGE_HOSTS[@]}"; do
+    if [[ ! "${BRIDGE_HOSTS[$i]}" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+        sandbox_cmd+=(--hosts-alias "${BRIDGE_HOSTS[$i]}")
+    fi
+done
 # pi's own node goes on PATH FIRST, which puts it LAST in lookup order among
 # the prepended directories: the backend prepends each one in turn, so the
 # last flag ends up leftmost. That ordering is the point. A caller's own
