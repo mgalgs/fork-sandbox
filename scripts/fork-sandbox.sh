@@ -1383,6 +1383,7 @@ pi_extra_args=""
 sandbox_args=""
 task_meta=""
 context_ro=""
+fixtures_dir=""
 session_state=""
 resume_session=""
 session_id_arg=""
@@ -1499,6 +1500,10 @@ while [[ "${1:-}" == -* ]]; do
             ;;
         --context-ro)
             context_ro="${2:?--context-ro requires a directory}"
+            shift 2
+            ;;
+        --fixtures)
+            fixtures_dir="${2:?--fixtures requires a directory}"
             shift 2
             ;;
         --session-state)
@@ -2487,6 +2492,12 @@ if [[ "$k8s_mode" == true ]]; then
         echo "no bubblewrap to pass them to." >&2
         exit 1
     fi
+    if [[ -n "$fixtures_dir" ]]; then
+        echo "Error: --fixtures is not supported with --k8s. It binds a host" >&2
+        echo "directory into a local sandbox; a cluster run has no host directory" >&2
+        echo "to bind." >&2
+        exit 1
+    fi
     if [[ -n "$claude_extra_args" ]]; then
         echo "Error: --claude-args is not supported with --k8s. It passes flags" >&2
         echo "to the claude CLI, and the pod's own claude invocation (when" >&2
@@ -3354,6 +3365,22 @@ if [[ -n "$context_ro" ]]; then
         exit 1
     fi
     context_ro="$context_ro_real"
+fi
+
+# Fixtures are deliberately less general than --context-ro: the caller names
+# only an existing directory, while this launcher fixes both the mountpoint
+# and environment variable.  That keeps this useful sealed-run input from
+# becoming a caller-controlled bind or environment passthrough.
+if [[ -n "$fixtures_dir" ]]; then
+    fixtures_dir="$("$FS_REALPATH" -m "$fixtures_dir")"
+    if [[ ! -e "$fixtures_dir" ]]; then
+        echo "Error: --fixtures directory '$fixtures_dir' does not exist." >&2
+        exit 1
+    fi
+    if [[ ! -d "$fixtures_dir" ]]; then
+        echo "Error: --fixtures path '$fixtures_dir' is not a directory." >&2
+        exit 1
+    fi
 fi
 
 # The session-state directory is validated above, before the --dry-run exit;
