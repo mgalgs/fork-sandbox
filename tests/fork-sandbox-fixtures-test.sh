@@ -97,6 +97,21 @@ else
     no "fixture directory outside the staging root is refused" "$out"
 fi
 
+# The launcher REFUSES a root outside fixtures/ rather than creating it, so
+# something else has to. Tie the two together here: this is the bug class where
+# a run refuses to start against a directory nothing creates, which this repo
+# has already shipped once for forks/. Asserted against the creating script
+# rather than by checking the directory exists -- the root is an absolute
+# system path that is already present on any machine that has run a fixture
+# staging test, so "it exists" cannot fail and would prove nothing.
+# shellcheck disable=SC2016  # the literal '$root/fixtures' is the needle
+if grep -qF '$root/fixtures' "$repo_dir/scripts/ensure-scratch-dirs.sh"; then
+    ok "the fixture staging root is one ensure-scratch-dirs.sh creates"
+else
+    no "the fixture staging root is one ensure-scratch-dirs.sh creates" \
+        "fork-sandbox.sh requires $fixture_stage_root/ but nothing creates it"
+fi
+
 # forks/ is machinery, not fixture storage: a live Codex credential staging
 # directory there must never become readable at /fixtures.
 machinery_dir="$work/claude-fork-codex.fake"; mkdir "$machinery_dir"
