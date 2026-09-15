@@ -168,6 +168,11 @@
 #                        /var/tmp/claude-scratch/forks/ — a staging path a
 #                        host-side script created on purpose — never an
 #                        arbitrary host path.
+# --fixtures <dir>:      bind an existing host fixture directory read-only at
+#                        /fixtures inside a local run, and set
+#                        FORK_SANDBOX_FIXTURE_DIR=/fixtures there. This is a
+#                        purpose-scoped staging path, not a general bind or
+#                        environment passthrough. Refused with --k8s.
 # --session-state <dir>: bind <dir> read-WRITE into the sandbox at the
 #                        harness's own session store — sandbox HOME's
 #                        ~/.claude/projects for claude, ~/.codex/sessions for
@@ -5057,6 +5062,10 @@ fs_build_sandbox_cmd() {
     fi
     if [[ -n "$context_ro" ]]; then
         out+=(--bind-ro "$context_ro")
+    fi
+    if [[ -n "$fixtures_dir" ]]; then
+        out+=(--bind-ro-at "$fixtures_dir" /fixtures)
+        out+=(--setenv FORK_SANDBOX_FIXTURE_DIR=/fixtures)
     fi
     # The operator inbox, for every harness. Read-only, so this widens
     # nothing the sandbox can write; it is the one path a host can put
