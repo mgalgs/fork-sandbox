@@ -229,8 +229,7 @@ run_bridge_case() {
     tr '\0' '\n' < "$capture" > "$capture.text"
 }
 if run_bridge_case "bridge hostname" 'gateway.example:80=8090' $'toolchain=host\nhosts_alias=1'; then
-    if grep -qx -- '--hosts-alias' "$work/bridge hostname.args.text" && \
-        grep -qx -- 'gateway.example' "$work/bridge hostname.args.text"; then
+    if argv_has_flag_value "$work/bridge hostname.args.text" --hosts-alias gateway.example; then
         ok "bridged hostname is mapped inside the sandbox"
     else
         no "bridged hostname is mapped inside the sandbox" "$(cat "$work/bridge hostname.args.text")"
@@ -276,17 +275,10 @@ if (( setenv_rc == 0 )); then
     # presence of the pair prove it reached the BACKEND: everything after the
     # work dir goes to the agent verbatim, past the backend's '--' separator,
     # so an unrecognized --setenv still lands in this capture.
-    # So anchor on the VALUE, which is unique to this case, require the line
-    # before it to be the flag, and require the pair to sit BEFORE the
-    # separator.
-    setenv_sep="$(grep -nx -- '--' "$setenv_capture.text" | head -1 | cut -d: -f1)"
-    setenv_val_at="$(grep -nx -- 'GPU_EMBEDDER_GEMMA_BULK_HOSTS=http://gateway.example:8090' "$setenv_capture.text" | head -1 | cut -d: -f1)"
-    setenv_flag_before=""
-    if [[ -n "$setenv_val_at" ]] && (( setenv_val_at > 1 )); then
-        setenv_flag_before="$(sed -n "$((setenv_val_at - 1))p" "$setenv_capture.text")"
-    fi
-    if [[ -n "$setenv_val_at" && "$setenv_flag_before" == '--setenv' ]] && \
-        { [[ -z "$setenv_sep" ]] || (( setenv_val_at < setenv_sep )); }; then
+    # All three properties are what argv_has_flag_value proves, so anchoring on
+    # the unique VALUE through it covers both traps at once.
+    if argv_has_flag_value "$setenv_capture.text" --setenv \
+        'GPU_EMBEDDER_GEMMA_BULK_HOSTS=http://gateway.example:8090'; then
         ok "--setenv reaches the backend as a backend flag"
     else
         no "--setenv reaches the backend as a backend flag" "$(cat "$setenv_capture.text")"
