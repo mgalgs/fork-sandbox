@@ -29,9 +29,11 @@ git -C "$project" init -q
 git -C "$project" -c user.name=Test -c user.email=test@fork-sandbox.invalid commit --allow-empty -qm init
 handoff="/var/tmp/claude-scratch/fs-fixtures-handoff-$$.md"; tmpdirs+=("$handoff")
 printf 'test fixtures\n' > "$handoff"
-fixtures="$work/fixtures"; mkdir "$fixtures"
+fixture_stage_root="/var/tmp/claude-scratch/fixtures"
+mkdir -p "$fixture_stage_root"
+fixtures="$(mktemp -d "$fixture_stage_root/fs-fixtures-test.XXXXXX")"; tmpdirs+=("$fixtures")
 outside_fixtures="$(mktemp -d /var/tmp/claude-scratch/fs-fixtures-outside.XXXXXX)"; tmpdirs+=("$outside_fixtures")
-escaped_fixtures="$work/escaped-fixtures"; ln -s "$outside_fixtures" "$escaped_fixtures"
+escaped_fixtures="$fixtures/escaped-fixtures"; ln -s "$outside_fixtures" "$escaped_fixtures"
 
 ln -s "$repo_dir/scripts/agent-sandboxed" "$work/bin/agent-sandboxed"
 cat > "$work/bin/pi" <<'STUB'
@@ -80,19 +82,30 @@ else
     no "--fixtures exports its fixed fixture directory variable" "${out:-$(cat "$capture" 2>/dev/null)}"
 fi
 
-missing="$work/no-such-fixtures"
+missing="$fixtures/no-such-fixtures"
 out="$(run_launcher "$missing" "$work/missing-argv")"; rc=$?
 if (( rc != 0 )) && [[ "$out" == *"$missing"* && "$out" == *"does not exist"* ]]; then ok "missing fixture directory is refused by name"; else no "missing fixture directory is refused by name" "$out"; fi
 
-file="$work/fixture-file"; : > "$file"
+file="$fixtures/fixture-file"; : > "$file"
 out="$(run_launcher "$file" "$work/file-argv")"; rc=$?
 if (( rc != 0 )) && [[ "$out" == *"$file"* && "$out" == *"not a directory"* ]]; then ok "fixture file is refused"; else no "fixture file is refused" "$out"; fi
 
 out="$(run_launcher "$outside_fixtures" "$work/outside-argv")"; rc=$?
-if (( rc != 0 )) && [[ "$out" == *"must name a directory under"* && "$out" == *"/var/tmp/claude-scratch/forks/"* ]]; then
+if (( rc != 0 )) && [[ "$out" == *"must name a directory under"* && "$out" == *"$fixture_stage_root/"* ]]; then
     ok "fixture directory outside the staging root is refused"
 else
     no "fixture directory outside the staging root is refused" "$out"
+fi
+
+# forks/ is machinery, not fixture storage: a live Codex credential staging
+# directory there must never become readable at /fixtures.
+machinery_dir="$work/claude-fork-codex.fake"; mkdir "$machinery_dir"
+printf 'MODEL_API_KEY=fixture-test-secret\n' > "$machinery_dir/env"
+out="$(run_launcher "$machinery_dir" "$work/machinery-argv")"; rc=$?
+if (( rc != 0 )) && [[ "$out" == *"must name a directory under"* && "$out" == *"$fixture_stage_root/"* ]]; then
+    ok "fixture directory under forks machinery is refused"
+else
+    no "fixture directory under forks machinery is refused" "$out"
 fi
 
 out="$(run_launcher "$escaped_fixtures" "$work/escaped-argv")"; rc=$?

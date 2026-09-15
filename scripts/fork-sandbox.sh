@@ -169,7 +169,7 @@
 #                        host-side script created on purpose — never an
 #                        arbitrary host path.
 # --fixtures <dir>:      bind an existing fixture staging directory under
-#                        /var/tmp/claude-scratch/forks/ read-only at /fixtures
+#                        /var/tmp/claude-scratch/fixtures/ read-only at /fixtures
 #                        inside a local run, and set
 #                        FORK_SANDBOX_FIXTURE_DIR=/fixtures there. This is a
 #                        purpose-scoped staging path, not a general bind or
@@ -3373,17 +3373,21 @@ if [[ -n "$context_ro" ]]; then
     context_ro="$context_ro_real"
 fi
 
-# Fixtures have the same staging-root boundary as --context-ro. Fixing their
-# mountpoint and environment variable alone is not enough: an arbitrary
-# source directory would still make this a general read-only host bind.
+# Fixtures have their own staging-root boundary. Unlike --context-ro, they
+# must not share forks/: that machinery root also holds live Codex credential
+# directories. Fixing their mountpoint and environment variable alone is not
+# enough: an arbitrary source directory would still make this a general
+# read-only host bind.
 if [[ -n "$fixtures_dir" ]]; then
     fixtures_dir="$("$FS_REALPATH" -m "$fixtures_dir")"
-    if [[ "$fixtures_dir" != /var/tmp/claude-scratch/forks/* ]]; then
+    if [[ "$fixtures_dir" != /var/tmp/claude-scratch/fixtures/* ]]; then
         echo "Error: --fixtures must name a directory under" >&2
-        echo "/var/tmp/claude-scratch/forks/ — got '$fixtures_dir'. An" >&2
+        echo "/var/tmp/claude-scratch/fixtures/ — got '$fixtures_dir'. An" >&2
         echo "unattended agent can read the bind, and for most harnesses it has" >&2
         echo "internet too, so which paths may be handed over is a security" >&2
-        echo "boundary. Stage fixtures in a mktemp directory there and rerun." >&2
+        echo "boundary. This fixture-only root is separate from forks/, which" >&2
+        echo "holds run machinery and credentials. Stage fixtures in a mktemp" >&2
+        echo "directory there and rerun." >&2
         exit 1
     fi
     if [[ ! -e "$fixtures_dir" ]]; then
