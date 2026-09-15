@@ -460,6 +460,29 @@ for skill_dir in "$REPO_DIR"/skills/*/; do
     done
 done
 
+# Create the scratch root now, because a run refuses a handoff outside it.
+# `fs_require_scratch_handoff` is a security boundary -- a handoff becomes the
+# prompt of a session with internet access -- so it cannot soften to make a
+# missing directory work. That leaves a fresh install with a documented
+# quickstart whose first `--k8s` run fails against a directory nothing had
+# created, and an error that says to stage the document there without saying
+# the directory is absent.
+#
+# Calling the hook script rather than inlining a `mkdir -p`: it already owns
+# both levels and the /tmp compat symlink, and it declines to replace a real
+# directory at the symlink's path. A second copy of that logic here would be
+# the duplication that stops matching the original.
+# Not silenced with `|| true`: a swallowed failure here reproduces exactly the
+# invisibility this fixes, leaving the first run to fail on a missing directory
+# with nothing having mentioned it. Install still completes -- the rest of the
+# links are useful either way -- but it says so.
+if ! "$REPO_DIR/scripts/ensure-scratch-dirs.sh"; then
+    echo ""
+    echo "Warning: could not create the scratch root /var/tmp/claude-scratch."
+    echo "A run refuses a handoff outside it, so create it by hand before"
+    echo "starting one:  mkdir -p /var/tmp/claude-scratch"
+fi
+
 echo ""
 echo "Done. (Only new or changed symlinks are shown above.)"
 

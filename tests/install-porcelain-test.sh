@@ -67,6 +67,29 @@ in_list() {
     return 1
 }
 
+echo "== the scratch root is created at install time =="
+# Asserted STATICALLY, and the reason is worth stating so nobody "improves" it
+# into a runtime check. A run refuses a handoff outside /var/tmp/claude-scratch
+# because that path is a security boundary, so it is deliberately not
+# configurable -- there is no env var to point it at a fixture. This suite runs
+# install.sh with a fake HOME, but the scratch root is an absolute system path
+# shared with whatever else is running on the machine. So "the directory exists
+# afterwards" would pass on any developer box whether or not install.sh does
+# anything, which is an assertion that cannot fail and therefore proves
+# nothing. Asserting the invocation can fail: delete the line and this goes
+# red.
+install_src="$(cat "$repo_dir/install.sh")"
+contains "install.sh invokes ensure-scratch-dirs.sh" \
+    'scripts/ensure-scratch-dirs.sh' "$install_src"
+# And it must not swallow the failure, or a box where the directory cannot be
+# created installs silently and fails on its first run instead.
+if printf '%s' "$install_src" | grep -q 'ensure-scratch-dirs\.sh" || true'; then
+    no "install.sh reports a failed scratch-root creation" \
+        "the invocation is silenced with '|| true'"
+else
+    ok "install.sh reports a failed scratch-root creation"
+fi
+
 echo "== list extraction sanity =="
 if (( ${#porcelain[@]} > 0 )); then ok "PORCELAIN parsed from install.sh (${#porcelain[@]} names)"; else no "PORCELAIN parsed from install.sh" "got zero names"; fi
 if (( ${#plumbing[@]} > 0 )); then ok "PLUMBING parsed from install.sh (${#plumbing[@]} names)"; else no "PLUMBING parsed from install.sh" "got zero names"; fi
