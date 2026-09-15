@@ -30,6 +30,8 @@ git -C "$project" -c user.name=Test -c user.email=test@fork-sandbox.invalid comm
 handoff="/var/tmp/claude-scratch/fs-fixtures-handoff-$$.md"; tmpdirs+=("$handoff")
 printf 'test fixtures\n' > "$handoff"
 fixtures="$work/fixtures"; mkdir "$fixtures"
+outside_fixtures="$(mktemp -d /var/tmp/claude-scratch/fs-fixtures-outside.XXXXXX)"; tmpdirs+=("$outside_fixtures")
+escaped_fixtures="$work/escaped-fixtures"; ln -s "$outside_fixtures" "$escaped_fixtures"
 
 ln -s "$repo_dir/scripts/agent-sandboxed" "$work/bin/agent-sandboxed"
 cat > "$work/bin/pi" <<'STUB'
@@ -85,6 +87,20 @@ if (( rc != 0 )) && [[ "$out" == *"$missing"* && "$out" == *"does not exist"* ]]
 file="$work/fixture-file"; : > "$file"
 out="$(run_launcher "$file" "$work/file-argv")"; rc=$?
 if (( rc != 0 )) && [[ "$out" == *"$file"* && "$out" == *"not a directory"* ]]; then ok "fixture file is refused"; else no "fixture file is refused" "$out"; fi
+
+out="$(run_launcher "$outside_fixtures" "$work/outside-argv")"; rc=$?
+if (( rc != 0 )) && [[ "$out" == *"must name a directory under"* && "$out" == *"/var/tmp/claude-scratch/forks/"* ]]; then
+    ok "fixture directory outside the staging root is refused"
+else
+    no "fixture directory outside the staging root is refused" "$out"
+fi
+
+out="$(run_launcher "$escaped_fixtures" "$work/escaped-argv")"; rc=$?
+if (( rc != 0 )) && [[ "$out" == *"$outside_fixtures"* && "$out" == *"must name a directory under"* ]]; then
+    ok "fixture symlink escaping the staging root is refused after canonicalization"
+else
+    no "fixture symlink escaping the staging root is refused after canonicalization" "$out"
+fi
 
 plain="$work/plain-argv"
 out="$(run_launcher "" "$plain")"; rc=$?

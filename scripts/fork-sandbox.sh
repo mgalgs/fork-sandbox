@@ -168,8 +168,9 @@
 #                        /var/tmp/claude-scratch/forks/ — a staging path a
 #                        host-side script created on purpose — never an
 #                        arbitrary host path.
-# --fixtures <dir>:      bind an existing host fixture directory read-only at
-#                        /fixtures inside a local run, and set
+# --fixtures <dir>:      bind an existing fixture staging directory under
+#                        /var/tmp/claude-scratch/forks/ read-only at /fixtures
+#                        inside a local run, and set
 #                        FORK_SANDBOX_FIXTURE_DIR=/fixtures there. This is a
 #                        purpose-scoped staging path, not a general bind or
 #                        environment passthrough. Refused with --k8s.
@@ -3372,12 +3373,19 @@ if [[ -n "$context_ro" ]]; then
     context_ro="$context_ro_real"
 fi
 
-# Fixtures are deliberately less general than --context-ro: the caller names
-# only an existing directory, while this launcher fixes both the mountpoint
-# and environment variable.  That keeps this useful sealed-run input from
-# becoming a caller-controlled bind or environment passthrough.
+# Fixtures have the same staging-root boundary as --context-ro. Fixing their
+# mountpoint and environment variable alone is not enough: an arbitrary
+# source directory would still make this a general read-only host bind.
 if [[ -n "$fixtures_dir" ]]; then
     fixtures_dir="$("$FS_REALPATH" -m "$fixtures_dir")"
+    if [[ "$fixtures_dir" != /var/tmp/claude-scratch/forks/* ]]; then
+        echo "Error: --fixtures must name a directory under" >&2
+        echo "/var/tmp/claude-scratch/forks/ — got '$fixtures_dir'. An" >&2
+        echo "unattended agent can read the bind, and for most harnesses it has" >&2
+        echo "internet too, so which paths may be handed over is a security" >&2
+        echo "boundary. Stage fixtures in a mktemp directory there and rerun." >&2
+        exit 1
+    fi
     if [[ ! -e "$fixtures_dir" ]]; then
         echo "Error: --fixtures directory '$fixtures_dir' does not exist." >&2
         exit 1
