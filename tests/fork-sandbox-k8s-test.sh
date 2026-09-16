@@ -4306,7 +4306,11 @@ cat > "$runstub_dir/kubectl" <<'STUB'
 printf '%s\n' "$*" >> "$K8S_STUB_LOG"
 case " $* " in
     *" apply -f -"*)
-        cat >/dev/null
+        if [[ -n "${K8S_STUB_APPLY_MANIFEST:-}" ]]; then
+            cat > "$K8S_STUB_APPLY_MANIFEST"
+        else
+            cat >/dev/null
+        fi
         # Overridable so a test can simulate a submit that dies at the
         # manifest apply -- well after the run directory (and everything
         # submit had spooled before this call) already exists.
@@ -8930,12 +8934,14 @@ fi
 rm -f "$rundir_dryrun_marker"
 
 rundir_handoff="$(newdir)/handoff.md"; tmpdirs+=("$(dirname "$rundir_handoff")")
-printf 'do the submit-time task\n' > "$rundir_handoff"
+printf 'do the submit-time task\n\n\n' > "$rundir_handoff"
 rundir_kubectl_log="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$rundir_kubectl_log")")
 rundir_submit_out="$(newdir)/submit-out.txt"; tmpdirs+=("$(dirname "$rundir_submit_out")")
+rundir_manifest="$(newdir)/submit.yaml"; tmpdirs+=("$(dirname "$rundir_manifest")")
 rundir_head_sha="$(git -C "$proj_dir" rev-parse HEAD)"
 PATH="$runstub_dir:$PATH" K8S_STUB_LOG="$rundir_kubectl_log" \
     K8S_STUB_BASE_SHA="$rundir_head_sha" \
+    K8S_STUB_APPLY_MANIFEST="$rundir_manifest" \
     FORK_SANDBOX_CONFIG_DIR="$config_dir" \
     "$k8s_sh" submit --branch fs-k8s-test-rundir-submit --model moonshotai/kimi-k3 \
     --task-meta '{"kind":"implement","difficulty":2}' \
@@ -8985,6 +8991,33 @@ if [[ -n "$rundir_rd" && -d "$rundir_rd" ]]; then
         ok "handoff.md is not itself the raw file (it carries the preamble too)"
     else
         no "handoff.md is not itself the raw file (it carries the preamble too)"
+    fi
+
+    # The archive is exact, including blank terminal lines. The ConfigMap
+    # intentionally differs: its `|` block scalar uses YAML clip chomping,
+    # so the pod receives exactly one terminal newline. This comparison also
+    # pins the sentinel above: without it command substitution would strip
+    # the archive's blank terminal lines before this write.
+    expected_rundir_handoff="$({ fs_emit_prompt_preamble /work/clone /work/inbox \
+        pi gated /work/outbox pod 67108864
+        printf '\n---\n\n'
+        cat -- "$rundir_handoff"
+        printf X
+    })"
+    expected_rundir_handoff="${expected_rundir_handoff%X}"
+    if cmp -s <(printf '%s' "$expected_rundir_handoff") "$rundir_rd/handoff.md"; then
+        ok "handoff.md faithfully archives rendered prompts with trailing blank lines"
+    else
+        no "handoff.md faithfully archives rendered prompts with trailing blank lines"
+    fi
+    configmap_handoff="$(extract_configmap_key handoff.md "$rundir_manifest")"
+    expected_rundir_handoff_without_trailing_newlines="$(printf '%s' "$expected_rundir_handoff" | sed -z 's/\n*$//')"
+    check "ConfigMap and archive have identical non-trailing prompt text" \
+        "$expected_rundir_handoff_without_trailing_newlines" "$configmap_handoff"
+    if grep -qF '  handoff.md: |' "$rundir_manifest"; then
+        ok "ConfigMap's literal block uses clip chomping for one terminal newline"
+    else
+        no "ConfigMap's literal block uses clip chomping for one terminal newline"
     fi
 
     # Both copies must be taken AT SUBMIT TIME, not re-read later: the

@@ -3402,12 +3402,12 @@ CENV
     # The exact prompt text the pod's ConfigMap embeds under handoff.md --
     # preamble, then the optional context/services sections, then the
     # operator's own handoff -- captured here once so run_dir's own
-    # handoff.md (below) can be a byte-for-byte copy of what the pod was
-    # actually given, rather than a second, independent render. A trailing
-    # sentinel byte survives the command substitution's own trailing-
-    # newline stripping and is peeled back off, so a handoff file that ends
-    # in blank lines renders into the ConfigMap exactly as it did before
-    # this capture existed.
+    # handoff.md (below) is a faithful archive rather than a second,
+    # independent render. A trailing sentinel byte survives command
+    # substitution's trailing-newline stripping and is peeled back off, so
+    # the archive retains blank lines at the end of the operator's handoff.
+    # The ConfigMap's enclosing pipeline strips those newlines before YAML's
+    # clip chomping gives the pod one trailing newline.
     local rendered_handoff
     rendered_handoff="$({ fs_emit_prompt_preamble "$pod_clone_dir" "$POD_INBOX_DIR" "$harness" gated "$POD_OUTBOX_DIR" pod \
        "$outbox_max_bytes"
@@ -3647,9 +3647,10 @@ EOF
 
     # Two archived copies, matching the local run's own handoff.md /
     # handoff-original.md split (scripts/fork-sandbox.sh): handoff.md is
-    # what the agent was actually given -- the rendered prompt captured
-    # above as $rendered_handoff, byte-for-byte what the ConfigMap embeds
-    # -- and handoff-original.md is the operator's raw file, unrendered.
+    # the rendered prompt captured above as $rendered_handoff, while
+    # handoff-original.md is the operator's raw file, unrendered. The
+    # archive preserves trailing newlines; YAML clip chomping means the pod
+    # receives the ConfigMap form with exactly one trailing newline.
     # Written now rather than left for cmd_collect to read later: the
     # caller may edit or remove the original while the run is in flight.
     printf '%s' "$rendered_handoff" > "$run_dir/handoff.md"
