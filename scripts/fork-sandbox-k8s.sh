@@ -2687,6 +2687,27 @@ cmd_submit() {
         fi
     fi
 
+    # FORK_SANDBOX_RUN_SOURCE is a token that ends up in the durable run
+    # log, not free text: it must be groupable in stats, so it is refused,
+    # with a clear message, before the run is created -- the same check
+    # fork-sandbox.sh applies to its own local run, repeated here because
+    # `fork-sandbox.sh --k8s` execs straight into this script's `run`
+    # (scripts/fork-sandbox.sh) ABOVE fork-sandbox.sh's own copy of this
+    # check, so neither that script nor a direct `submit`/`run` here would
+    # otherwise validate it at all. Checked under LC_ALL=C for the same
+    # reason fork-sandbox.sh's copy is: in a UTF-8 locale a [a-z] range
+    # matches accented characters, which the recorder's ASCII-only check
+    # would then silently reject -- the two gates must refuse exactly the
+    # same set.
+    if [[ -n "${FORK_SANDBOX_RUN_SOURCE:-}" ]] \
+        && (LC_ALL=C; [[ ! "$FORK_SANDBOX_RUN_SOURCE" =~ ^[a-z][a-z0-9-]{0,31}$ ]]); then
+        echo "Error: FORK_SANDBOX_RUN_SOURCE is a provenance token that ends up" >&2
+        echo "in the run log, so it must start with a lowercase letter and be" >&2
+        echo "only lowercase letters, digits and hyphens, at most 32 chars" >&2
+        echo "(^[a-z][a-z0-9-]{0,31}$) -- not '$FORK_SANDBOX_RUN_SOURCE'." >&2
+        exit 1
+    fi
+
     # --pi-args names pi, which only the pi harness starts -- the same
     # refusal fork-sandbox.sh's own --pi-args applies to its non-pi
     # harnesses, checked here before anything is created.
@@ -3546,6 +3567,21 @@ EOF
     run_dir="$(mktemp -d /var/tmp/claude-scratch/forks/claude-fork-sandbox.XXXXXX)"
     fs_reject_unsafe_chars "$run_dir"
 
+    # Printed as soon as the directory exists, not only once submit
+    # finishes: a submit that dies below (context spool, repository push,
+    # any kubectl create) still leaves this directory on disk, populated
+    # with whatever submit had established by then, and with nothing
+    # printed there would be no way for an orchestrator -- or an operator
+    # cleaning up by hand -- to learn it exists at all. Same line shape
+    # fork-sandbox.sh's own local launcher prints (two leading spaces,
+    # "run dir:", two spaces), so a caller fanning out -- this project's
+    # own test suites, or an external panel launcher calling
+    # submit/wait/collect directly rather than blocking through run --
+    # scrapes it with the identical `sed -n 's/^  run dir:  *//p'` either
+    # path uses, and gets the same value whether this submit goes on to
+    # succeed or not.
+    printf '  run dir:  %s\n' "$run_dir" >&2
+
     # The run's provenance, when the launching shell declared one -- same
     # absence convention and same file name as fork-sandbox.sh's own local
     # run (scripts/fork-sandbox.sh, beside its own run_dir creation):
@@ -3752,11 +3788,6 @@ EOF
 
     echo "fork-sandbox-k8s: submitted. branch=$branch pod=$pod_name" >&2
     echo "fork-sandbox-k8s: fetch with: fork-sandbox-k8s.sh fetch --branch $branch $project_path" >&2
-    # Same line shape fork-sandbox.sh's own local launcher prints (two
-    # leading spaces, "run dir:", two spaces), so a caller fanning out --
-    # fork-sandbox-postmaster.sh, this project's own test suites -- scrapes
-    # it with the identical `sed -n 's/^  run dir:  *//p'` either path uses.
-    printf '  run dir:  %s\n' "$run_dir" >&2
 }
 
 cmd_fetch() {
@@ -4762,8 +4793,33 @@ cmd_run() {
     # propagate it explicitly. cmd_collect below is NOT captured -- it is
     # called normally, so its own exit paths behave exactly as they did
     # inline before this extraction.
-    local agent_rc
-    agent_rc="$(cmd_wait --branch "$branch" --timeout "$timeout")" || exit $?
+    local agent_rc wait_rc=0
+    agent_rc="$(cmd_wait --branch "$branch" --timeout "$timeout")" || wait_rc=$?
+    if (( wait_rc != 0 )); then
+        # cmd_wait failed before the agent's sentinel appeared (a dead pod,
+        # a malformed sentinel, or a timeout) -- cmd_collect, the only
+        # other caller of sandbox-run-log.py record, is never reached in
+        # that case, and the run directory cmd_submit created would
+        # otherwise carry no summary.json and no row in the durable run
+        # log: exactly the "a seat is silently failing" case this log
+        # exists to surface. cmd_wait's own error already told the
+        # operator the job and pod are left in place for inspection, so
+        # this does not attempt any of collect's pod reads (outbox,
+        # evidence, fetch) against a pod that is dead or still mid-timeout
+        # -- it records only what submit already knew, via record's own
+        # run.env fallback for a run directory with no summary.json.
+        # exit_code stays absent (record's null): none is known.
+        if [[ -n "$run_dir" ]]; then
+            local run_log_bin
+            run_log_bin="$(command -v sandbox-run-log.py 2>/dev/null || true)"
+            [[ -n "$run_log_bin" ]] || run_log_bin="$HOME/.claude/scripts/sandbox-run-log.py"
+            if [[ -n "$run_log_bin" && -x "$run_log_bin" ]]; then
+                "$run_log_bin" record --run-dir "$run_dir" >&2 \
+                    || echo "fork-sandbox-k8s: run-log append failed" >&2
+            fi
+        fi
+        exit "$wait_rc"
+    fi
 
     local -a collect_argv=(--branch "$branch")
     [[ -n "$outbox_dir" ]] && collect_argv+=(--outbox-dir "$outbox_dir")

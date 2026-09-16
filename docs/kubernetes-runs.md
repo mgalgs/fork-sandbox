@@ -469,11 +469,16 @@ takes: `mktemp -d` under the same
   local-path runs.
 
 `submit` prints the directory's path on a line shaped exactly like the
-local launcher's own (`  run dir:  <path>`), so a caller that fans out --
-this project's own postmaster, or an external panel launcher calling
-`submit`/`wait`/`collect` directly rather than blocking through `run` --
-scrapes it with the identical `sed -n 's/^  run dir:  *//p'` either path
-already uses.
+local launcher's own (`  run dir:  <path>`), as soon as the directory
+exists -- not only once submit finishes -- so a submit that dies later
+(context spool, repository push, any `kubectl create`) still leaves a
+printed, attributable path rather than an orphaned directory nobody
+learned about. A caller that fans out -- an external panel launcher
+calling `submit`/`wait`/`collect` directly rather than blocking through
+`run` -- scrapes it with the identical `sed -n 's/^  run dir:  *//p'`
+the local path uses. This project's own postmaster does not do this: it
+launches only the local `fork-sandbox.sh` and has no cluster fan-out of
+its own yet.
 
 **`collect` finalizes it.** A new, optional `--run-dir DIR`: absent, it
 behaves exactly as it always has, writing and recording nothing; given
@@ -486,6 +491,19 @@ output would otherwise need capturing) and handing it to its own
 `collect` phase. This runs **before** the zero-harvest check, not after:
 a run that produced nothing is exactly the case a query like "has a seat
 been silently failing" needs to see, and code after `exit 3` never runs.
+
+A run whose pod dies or times out never reaches `collect` at all -- `wait`
+itself exits non-zero, before there is anything to fetch or an outbox to
+pull. `run` still records that run: rather than call `collect`, it invokes
+`sandbox-run-log.py record --run-dir DIR` directly against the directory
+`submit` created, with no `summary.json` written. `record` falls back to
+`run.env` in that case (the same fallback the local path's own run offers
+it), so the row still carries `harness`, `network`, `model`, `branch`,
+`origin_repo` and `base_sha` -- everything `submit` already knew, with
+the same `summary_missing: true` marker any other summary-less run
+carries -- with `exit_code` simply absent, since none is known. This is
+the same "a seat silently failing" case the log exists to surface, so a
+dead or timed-out run gets a row instead of vanishing.
 
 `summary.json`'s fields, decided:
 

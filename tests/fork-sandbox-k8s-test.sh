@@ -337,6 +337,15 @@ cleanup() {
     while IFS= read -r d; do
         [[ -z "$d" ]] && continue
         grep -qxF "$d" <<< "$k8s_test_preexisting_rundirs" && continue
+        # Ownership, not just novelty: a directory that showed up after the
+        # snapshot above is not necessarily this suite's own -- a real
+        # `fork-sandbox.sh` run started concurrently, from the identical
+        # mktemp template under the identical forks root, looks identical
+        # at this point. Only remove it when its own run-source marker
+        # carries this suite's FORK_SANDBOX_RUN_SOURCE=test tag (every
+        # fixture run this suite drives writes one); a live run's
+        # marker, if it has one at all, will not read "test".
+        [[ "$(cat "$d/run-source" 2>/dev/null)" == test ]] || continue
         rm -rf -- "$d"
     done <<< "$after"
 }
@@ -353,6 +362,32 @@ refuses() {
     if (( rc != 0 )) && [[ "$out" == *"$needle"* ]]; then ok "$label"; else no "$label" "status $rc: $out"; fi
 }
 newdir() { mktemp -d; }
+
+printf '== exit sweep ownership (this suite'"'"'s own cleanup trap) ==\n'
+# cleanup()'s exit-time sweep, above, removes a claude-fork-sandbox.*
+# directory that showed up after the pre-existing-directories snapshot
+# ONLY when that directory's own run-source marker reads exactly "test" --
+# not merely because it is new, which a real fork-sandbox.sh run started
+# concurrently under the same forks root would also be. Exercised here
+# against throwaway directories of our own, never the real forks root, so
+# this check cannot itself delete anything live.
+sweep_owned_dir="$(newdir)"; tmpdirs+=("$sweep_owned_dir")
+printf 'test\n' > "$sweep_owned_dir/run-source"
+sweep_foreign_dir="$(newdir)"; tmpdirs+=("$sweep_foreign_dir")
+printf 'some-other-source\n' > "$sweep_foreign_dir/run-source"
+sweep_bare_dir="$(newdir)"; tmpdirs+=("$sweep_bare_dir")
+check "sweep ownership: this suite's own run-source marker reads 'test'" \
+    "test" "$(cat "$sweep_owned_dir/run-source" 2>/dev/null)"
+if [[ "$(cat "$sweep_foreign_dir/run-source" 2>/dev/null)" != test ]]; then
+    ok "sweep ownership: a foreign run-source marker is not this suite's own"
+else
+    no "sweep ownership: a foreign run-source marker is not this suite's own"
+fi
+if [[ "$(cat "$sweep_bare_dir/run-source" 2>/dev/null)" != test ]]; then
+    ok "sweep ownership: a directory with no run-source marker at all is not this suite's own"
+else
+    no "sweep ownership: a directory with no run-source marker at all is not this suite's own"
+fi
 
 k8s_sh="$repo_dir/scripts/fork-sandbox-k8s.sh"
 fs_sh="$repo_dir/scripts/fork-sandbox.sh"
@@ -4244,9 +4279,19 @@ cat > "$runstub_dir/kubectl" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$K8S_STUB_LOG"
 case " $* " in
-    *" apply -f -"*) cat >/dev/null; exit 0 ;;
+    *" apply -f -"*)
+        cat >/dev/null
+        # Overridable so a test can simulate a submit that dies at the
+        # manifest apply -- well after the run directory (and everything
+        # submit had spooled before this call) already exists.
+        exit "${K8S_STUB_APPLY_RC:-0}" ;;
     *" wait "*) exit 0 ;;
     *" get pod -l job-name="*) printf 'stub-pod\n' ;;
+    *" -o jsonpath={.status.phase} "*)
+        # cmd_wait's per-poll liveness check. Defaults to Running (never
+        # Failed/Succeeded, so the poll loop falls through to the sentinel
+        # read below) unless a test overrides it to exercise a dead pod.
+        printf '%s\n' "${K8S_STUB_POD_PHASE:-Running}"; exit 0 ;;
     *" get pod "*)
         # The pod's spec, for the per-container log capture.
         spec="${K8S_STUB_POD_SPEC:-}"
@@ -4271,7 +4316,14 @@ case " $* " in
         [[ -n "${K8S_STUB_OUTBOX_STDERR:-}" ]] && printf '%s' "$K8S_STUB_OUTBOX_STDERR" >&2
         exit "${K8S_STUB_OUTBOX_RC:-1}"
         ;;
-    *" cat /work/.run-complete "*) printf '0\n' ;;
+    *" cat /work/.run-complete "*)
+        # Overridable so a test can simulate a pod that died before ever
+        # writing the sentinel -- exec into it just fails, the same as a
+        # real dead container.
+        if [[ -n "${K8S_STUB_RUN_COMPLETE_RC:-}" ]]; then
+            exit "$K8S_STUB_RUN_COMPLETE_RC"
+        fi
+        printf '0\n' ;;
 esac
 exit 0
 STUB
@@ -4313,6 +4365,33 @@ if K8S_STUB_OUTBOX_STDERR='stub-kubectl says: pod stub-pod is already Completed'
     fi
 else
     no "failed outbox read surfaces kubectl's own stderr" "run exited nonzero: $(cat "$runstub_out1")"
+fi
+
+# 1b. `run` actually threads --run-dir from its own submit phase to its own
+# collect phase: the only path a real `fork-sandbox.sh --k8s` run takes,
+# and the one behavior in this file's own header that nothing directly
+# asserted before this test -- dropping K8S_LAST_SUBMIT_RUN_DIR or the
+# `[[ -n "$run_dir" ]] && collect_argv+=(--run-dir ...)` line in cmd_run
+# would leave every test above green while this silently stopped working.
+# Reuses test 1's own successful run, whose stubbed outbox read failed but
+# whose run still completed and collected.
+runstub_rd1="$(sed -n 's/^  run dir:  *//p' "$runstub_out1" | head -1)"
+if [[ -n "$runstub_rd1" && -f "$runstub_rd1/summary.json" ]] \
+    && jq -e . "$runstub_rd1/summary.json" >/dev/null 2>&1; then
+    ok "run threads --run-dir: submit's run dir carries a summary.json after run"
+    check "run threads --run-dir: summary.json branch" \
+        "fs-k8s-test-run-outbox-err" "$(jq -r '.branch' "$runstub_rd1/summary.json")"
+    check "run threads --run-dir: summary.json mode" \
+        "run" "$(jq -r '.mode' "$runstub_rd1/summary.json")"
+    runstub_rd1_log_home="$(newdir)"; tmpdirs+=("$runstub_rd1_log_home")
+    HOME="$runstub_rd1_log_home" python3 "$repo_dir/scripts/sandbox-run-log.py" \
+        record --run-dir "$runstub_rd1" >/dev/null 2>&1
+    runstub_rd1_log_line="$(tail -1 "$runstub_rd1_log_home/.claude/sandbox-runs.jsonl" 2>/dev/null)"
+    check "run threads --run-dir: record() folds in the same branch" \
+        "fs-k8s-test-run-outbox-err" "$(jq -r '.branch' <<< "$runstub_rd1_log_line")"
+else
+    no "run threads --run-dir: submit's run dir carries a summary.json after run" \
+        "run_dir=$runstub_rd1 $([[ -n "$runstub_rd1" ]] && cat "$runstub_rd1/summary.json" 2>/dev/null; echo NOFILE)"
 fi
 
 # 2. A failed read with NOTHING on stderr is reported as silent, not as an
@@ -4452,6 +4531,46 @@ if (( rc == 3 )) \
 else
     no "a dead run through run exits 3, keeps the job, and names the manual rm" \
         "rc=$rc log=$(grep delete "$runstub_log6") out=$(cat "$runstub_out6")"
+fi
+
+# 7. A pod that dies before writing the sentinel: cmd_wait itself fails
+# (Failed phase, code 2, before collect ever runs -- see the "wait: direct
+# drive" section below for that exit code's own coverage), and run must
+# still leave a row in the durable run log rather than the run directory
+# submit created sitting with no summary.json and no record at all -- the
+# exact "seat silently failing" case this log exists to surface. run's own
+# exit code must stay wait's terminal code (2), not the agent's.
+runstub_log7="$(newdir)/kubectl.log"; runstub_out7="$(newdir)/out7.txt"
+tmpdirs+=("$(dirname "$runstub_log7")" "$(dirname "$runstub_out7")")
+rc=0
+K8S_STUB_RUN_COMPLETE_RC=1 K8S_STUB_POD_PHASE=Failed \
+    runstub_run "$runstub_log7" "$runstub_out7" \
+    --branch fs-k8s-test-run-wait-fail --model moonshotai/kimi-k3 \
+    "$proj_dir" "$handoff_file" || rc=$?
+runstub_rd7="$(sed -n 's/^  run dir:  *//p' "$runstub_out7" | head -1)"
+if (( rc == 2 )) && [[ -n "$runstub_rd7" && -d "$runstub_rd7" ]] \
+    && grep -q 'is Failed' "$runstub_out7" \
+    && ! grep -q 'run complete' "$runstub_out7"; then
+    ok "a run whose pod dies before the sentinel exits wait's own code (2)"
+else
+    no "a run whose pod dies before the sentinel exits wait's own code (2)" \
+        "rc=$rc run_dir=$runstub_rd7 out=$(cat "$runstub_out7")"
+fi
+check "a dead-pod run's directory carries no summary.json (collect never ran)" \
+    "false" "$([[ -n "$runstub_rd7" ]] && [[ -f "$runstub_rd7/summary.json" ]] && echo true || echo false)"
+if [[ -n "$runstub_rd7" ]]; then
+    runstub_rd7_log_home="$(newdir)"; tmpdirs+=("$runstub_rd7_log_home")
+    HOME="$runstub_rd7_log_home" python3 "$repo_dir/scripts/sandbox-run-log.py" \
+        record --run-dir "$runstub_rd7" >/dev/null 2>&1
+    runstub_rd7_log_line="$(tail -1 "$runstub_rd7_log_home/.claude/sandbox-runs.jsonl" 2>/dev/null)"
+    check "a dead-pod run's row went through record's summary-missing fallback" \
+        "true" "$(jq -r '.summary_missing' <<< "$runstub_rd7_log_line")"
+    check "a dead-pod run's row falls back to run.env: branch" \
+        "fs-k8s-test-run-wait-fail" "$(jq -r '.branch' <<< "$runstub_rd7_log_line")"
+    check "a dead-pod run's row falls back to run.env: model" \
+        "moonshotai/kimi-k3" "$(jq -r '.model' <<< "$runstub_rd7_log_line")"
+    check "a dead-pod run's row carries no exit_code (none is known)" \
+        "false" "$(jq 'has("exit_code")' <<< "$runstub_rd7_log_line")"
 fi
 
 printf '\n== fork-sandbox-k8s.sh wait: direct drive vs stubbed kubectl ==\n'
@@ -8749,6 +8868,46 @@ if [[ ! -s "$rundir_badmeta_log" ]]; then
     ok "an invalid --task-meta creates nothing (empty kubectl log)"
 else
     no "an invalid --task-meta creates nothing (empty kubectl log)" "$(cat "$rundir_badmeta_log")"
+fi
+
+# FORK_SANDBOX_RUN_SOURCE is validated before anything is created too, the
+# same as the local path's own copy of this check in fork-sandbox.sh: an
+# off-pattern token (an underscore here) must be refused with an empty
+# kubectl log. This script's own copy is the ONLY gate that ever sees a
+# `fork-sandbox.sh --k8s` launch's token, since that path execs into this
+# script's own submit above fork-sandbox.sh's own check.
+rundir_badsource_log="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$rundir_badsource_log")")
+refuses "FORK_SANDBOX_RUN_SOURCE with an underscore is refused" \
+    "FORK_SANDBOX_RUN_SOURCE is a provenance token" \
+    env PATH="$runstub_dir:$PATH" K8S_STUB_LOG="$rundir_badsource_log" \
+    FORK_SANDBOX_CONFIG_DIR="$config_dir" FORK_SANDBOX_RUN_SOURCE=k8s_fixture \
+    "$k8s_sh" submit --branch fs-k8s-test-rundir-badsource --model moonshotai/kimi-k3 \
+    "$proj_dir" "$handoff_file"
+if [[ ! -s "$rundir_badsource_log" ]]; then
+    ok "an invalid FORK_SANDBOX_RUN_SOURCE creates nothing (empty kubectl log)"
+else
+    no "an invalid FORK_SANDBOX_RUN_SOURCE creates nothing (empty kubectl log)" "$(cat "$rundir_badsource_log")"
+fi
+
+# A submit that dies after the run directory exists (here: the manifest
+# apply, well after the context spool and the repository push) must still
+# print the directory's path -- so it is at least attributable -- rather
+# than leaving it silently on disk. See cmd_submit's own comment on why
+# the "  run dir:  " line moved to right after the directory is created.
+rundir_applyfail_log="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$rundir_applyfail_log")")
+rundir_applyfail_out="$(newdir)/applyfail-out.txt"; tmpdirs+=("$(dirname "$rundir_applyfail_out")")
+K8S_STUB_APPLY_RC=1 PATH="$runstub_dir:$PATH" K8S_STUB_LOG="$rundir_applyfail_log" \
+    K8S_STUB_BASE_SHA="$rundir_head_sha" \
+    FORK_SANDBOX_CONFIG_DIR="$config_dir" \
+    "$k8s_sh" submit --branch fs-k8s-test-rundir-applyfail --model moonshotai/kimi-k3 \
+    "$proj_dir" "$rundir_handoff" > "$rundir_applyfail_out" 2>&1
+rundir_applyfail_rc=$?
+rundir_applyfail_rd="$(sed -n 's/^  run dir:  *//p' "$rundir_applyfail_out" | head -1)"
+if (( rundir_applyfail_rc != 0 )) && [[ -n "$rundir_applyfail_rd" && -d "$rundir_applyfail_rd" ]]; then
+    ok "a submit that dies after creating the run dir still prints its path"
+else
+    no "a submit that dies after creating the run dir still prints its path" \
+        "rc=$rundir_applyfail_rc run_dir=$rundir_applyfail_rd out=$(cat "$rundir_applyfail_out")"
 fi
 
 printf '\n== the durable run log: cmd_collect finalizes the run directory and calls record ==\n'
