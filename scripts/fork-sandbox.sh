@@ -7451,6 +7451,11 @@ fi
 if [[ "${maintainer_loop_cap:-0}" != "0" && -n "${maintainer_prompt:-}" ]]; then
     maintainer_loop_ended=""
     maintainer_loop_detail=""
+    # The coding leg's own exit code ($rc at the moment the gate below runs),
+    # recorded here so it survives into every save_maintainer_loop call
+    # regardless of how the loop ends -- see the review loop's own comment
+    # on review_loop_coding_rc, above.
+    maintainer_loop_coding_rc=""
     maintainer_iters_done='[]'
 
     # The branch head the loop measures progress against, read from the
@@ -7535,6 +7540,7 @@ if [[ "${maintainer_loop_cap:-0}" != "0" && -n "${maintainer_prompt:-}" ]]; then
             --argjson fix_repeat "${mntfix_repeat:-1}" \
             --arg ended "$maintainer_loop_ended" \
             --arg detail "$maintainer_loop_detail" \
+            --argjson coding_exit_code "${maintainer_loop_coding_rc:-null}" \
             --argjson prev "$maintainer_iters_done" \
             --argjson cur "$cur" \
             '{
@@ -7546,6 +7552,7 @@ if [[ "${maintainer_loop_cap:-0}" != "0" && -n "${maintainer_prompt:-}" ]]; then
                 fix_repeat: (if $fix_repeat == 1 then null else $fix_repeat end),
                 ended: (if $ended == "" then null else $ended end),
                 detail: (if $detail == "" then null else $detail end),
+                coding_exit_code: $coding_exit_code,
                 iterations: ($prev + $cur),
             }' > "$run_dir/maintainer-loop.json.part" 2>/dev/null; then
             mv -f "$run_dir/maintainer-loop.json.part" "$run_dir/maintainer-loop.json"
@@ -7567,19 +7574,19 @@ if [[ "${maintainer_loop_cap:-0}" != "0" && -n "${maintainer_prompt:-}" ]]; then
         save_maintainer_loop
     }
 
-    # The same three skip conditions the review loop records, applied to the
-    # branch as it stands once the review loop is over.
-    if [[ "$rc" != "0" ]]; then
+    # Whether the branch holds work decides whether the loop runs -- the exit
+    # code is recorded (coding_exit_code, above) but is never itself a skip
+    # reason. See the review loop's own gate, above, and the header comment
+    # it points at.
+    maintainer_loop_coding_rc="$rc"
+    if [[ -z "$mnt_head" ]]; then
         maintainer_loop_ended="skipped"
-        maintainer_loop_detail="the session exited $rc, so there is nothing worth reviewing"
-    else
-        if [[ -z "$mnt_head" ]]; then
-            maintainer_loop_ended="skipped"
-            maintainer_loop_detail="branch $branch could not be read from the clone"
-        elif [[ "$mnt_head" == "$base_sha" ]]; then
-            maintainer_loop_ended="skipped"
-            maintainer_loop_detail="the branch holds no commits, so there is nothing to review"
-        fi
+        maintainer_loop_detail="branch $branch could not be read from the clone"
+    elif [[ "$mnt_head" == "$base_sha" ]]; then
+        maintainer_loop_ended="skipped"
+        maintainer_loop_detail="the branch holds no commits, so there is nothing to review"
+    elif [[ "$rc" != "0" ]]; then
+        maintainer_loop_detail="the session exited $rc; reviewing the commits it did land"
     fi
 
     loop_i=1
@@ -7600,6 +7607,17 @@ if [[ "${maintainer_loop_cap:-0}" != "0" && -n "${maintainer_prompt:-}" ]]; then
         maintainer_prompt_iter="$run_dir/maintainer-prompt-$loop_i.md"
         {
             cat -- "$maintainer_prompt"
+            # The coding leg failed on something -- possibly after it
+            # committed the very work under review. Told once, up front, the
+            # same as the review loop's own copy of this note.
+            if [[ -n "$maintainer_loop_coding_rc" && "$maintainer_loop_coding_rc" != "0" ]]; then
+                printf '\n---\n\n## The coding session exited non-zero\n\n'
+                printf 'The session that produced the commits under review exited with\n'
+                printf 'status %s. Its work may be incomplete or partially applied -- read\n' \
+                    "$maintainer_loop_coding_rc"
+                printf 'the branch and flag anything that looks unfinished as a finding,\n'
+                printf 'the same as any other defect.\n'
+            fi
             mp_addenda_list="$(fs_addenda_dirs)"
             if [[ -n "$mp_addenda_list" ]]; then
                 printf '\n---\n\n## Operator addenda delivered to earlier legs of this run\n\n'

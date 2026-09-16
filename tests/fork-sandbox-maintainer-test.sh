@@ -799,8 +799,9 @@ else
     no "the no-progress run exits 0" "rc=$rcnp rd=$rdnp: $outnp"
 fi
 
-# A failed session is not reviewed: the loop is skipped, and the session's
-# exit code is the run's.
+# A failed session that committed nothing still skips the maintainer loop
+# (there is nothing to review), and the session's exit code is the run's --
+# but the exit code is recorded in the loop record even on a skip.
 mntfail_stub="$(mktemp -d /var/tmp/claude-scratch/fs-maintainer-fail.XXXXXX)"
 tmpdirs+=("$mntfail_stub")
 cat > "$mntfail_stub/claude-sandboxed" <<'STUB'
@@ -824,10 +825,109 @@ if [[ -n "$rdf" ]]; then
         "$(cat "$rdf/exit-code")"
     check "a failed session skips the maintainer loop" "skipped" \
         "$(jq -r '.ended' "$rdf/maintainer-loop.json")"
-    contains "the skip says the session failed" "exited 3" \
-        "$(jq -r '.detail' "$rdf/maintainer-loop.json")"
+    contains "the skip says there is nothing to review, not that the exit code was the reason" \
+        "holds no commits" "$(jq -r '.detail' "$rdf/maintainer-loop.json")"
+    check "the coding leg's exit code is still recorded even on a skip" "3" \
+        "$(jq -r '.coding_exit_code' "$rdf/maintainer-loop.json")"
 else
     no "a failed session leaves a run dir" "rc=$rcf: $outf"
+fi
+
+# A failed session that DID commit real work is not skipped: the maintainer
+# loop now runs despite the coding leg's exit code, the same as the review
+# loop's own fix for this (see fork-sandbox-review-harness-test.sh).
+mntnz_stub="$(mktemp -d /var/tmp/claude-scratch/fs-maintainer-nonzero.XXXXXX)"
+tmpdirs+=("$mntnz_stub")
+cat > "$mntnz_stub/claude-sandboxed" <<'STUB'
+#!/usr/bin/env bash
+set -uo pipefail
+clone_dir="" prev=""
+for a in "$@"; do
+    [[ "$a" == "--dangerously-skip-permissions" ]] && clone_dir="$prev"
+    prev="$a"
+done
+cat >/dev/null
+n=0
+[[ -f "$FAKE_COUNT_FILE" ]] && n="$(cat "$FAKE_COUNT_FILE")"
+n=$(( n + 1 ))
+printf '%s' "$n" > "$FAKE_COUNT_FILE"
+
+case "$n" in
+1)
+    if [[ "${NZ_COMMIT:-1}" == "1" ]]; then
+        git -c user.email=t@fork-sandbox.invalid -c user.name=Tester \
+            -C "$clone_dir" commit --allow-empty -q -m "mnt-nonzero-exit implement"
+    fi
+    printf '{"type":"result","subtype":"success","total_cost_usd":0.01,"usage":{"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}\n'
+    exit "${NZ_EXIT:-3}"
+    ;;
+2)
+    printf 'APPROVED\n\nChecked: the diff, despite the failed coding leg.\n\n## Report\nThe branch is sound.\n' \
+        > "$clone_dir/.git/maintainer-verdict.md"
+    printf '{"type":"result","subtype":"success","total_cost_usd":0.01,"usage":{"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}\n'
+    exit 0
+    ;;
+esac
+STUB
+chmod +x "$mntnz_stub/claude-sandboxed"
+
+# A: non-zero exit, WITH commits off base -- the maintainer loop now runs
+# (and approves) despite the coding leg's failure, and the run's own exit
+# code still reports the coding leg's failure.
+count_mntnzA="$(mktemp)"; tmpdirs+=("$count_mntnzA")
+outA_mntnz="$(PATH="$mntnz_stub:$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$real_cfg" \
+    FORK_SANDBOX_BACKEND=fake-image FAKE_COUNT_FILE="$count_mntnzA" \
+    NZ_COMMIT=1 NZ_EXIT=3 \
+    timeout 60 "$launcher" --foreground --harness claude \
+    --maintainer-loop 1 --maintainer-model sonnet \
+    --branch "sandbox-test-mnt-nonzero-commit-$$" \
+    "$proj" "$handoff" 2>&1)"
+rcA_mntnz=$?
+rdA_mntnz="$(printf '%s\n' "$outA_mntnz" | sed -n 's/^  run dir:  *//p' | head -1)"
+if [[ -n "$rdA_mntnz" ]]; then
+    tmpdirs+=("$rdA_mntnz")
+    check "a failed coding leg that committed work still runs both legs" "2" \
+        "$(cat "$count_mntnzA")"
+    check "the maintainer leg approves the branch despite the failed coding leg" \
+        "approved" "$(jq -r '.ended' "$rdA_mntnz/maintainer-loop.json")"
+    check "the coding leg's exit code is recorded in the loop record" "3" \
+        "$(jq -r '.coding_exit_code' "$rdA_mntnz/maintainer-loop.json")"
+    contains "the maintainer leg's own prompt is told the coding leg failed" \
+        "exited with" "$(cat "$rdA_mntnz/maintainer-prompt-1.md" 2>/dev/null)"
+    check "the run's own exit code stays the coding leg's, not laundered by the review" \
+        "3" "$rcA_mntnz"
+    check "exit-code on disk agrees" "3" "$(cat "$rdA_mntnz/exit-code" 2>/dev/null)"
+else
+    no "a failed coding leg that committed work produced a run directory" \
+        "rc=$rcA_mntnz: $outA_mntnz"
+fi
+
+# B: non-zero exit, with NO commits -- still skips, because there is nothing
+# to review, not because of the exit code.
+count_mntnzB="$(mktemp)"; tmpdirs+=("$count_mntnzB")
+outB_mntnz="$(PATH="$mntnz_stub:$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$real_cfg" \
+    FORK_SANDBOX_BACKEND=fake-image FAKE_COUNT_FILE="$count_mntnzB" \
+    NZ_COMMIT=0 NZ_EXIT=3 \
+    timeout 60 "$launcher" --foreground --harness claude \
+    --maintainer-loop 1 --maintainer-model sonnet \
+    --branch "sandbox-test-mnt-nonzero-nocommit-$$" \
+    "$proj" "$handoff" 2>&1)"
+rcB_mntnz=$?
+rdB_mntnz="$(printf '%s\n' "$outB_mntnz" | sed -n 's/^  run dir:  *//p' | head -1)"
+if [[ -n "$rdB_mntnz" ]]; then
+    tmpdirs+=("$rdB_mntnz")
+    check "a failed coding leg with no commits runs only the coding leg" "1" \
+        "$(cat "$count_mntnzB")"
+    check "a failed, commitless coding leg still skips the maintainer loop" \
+        "skipped" "$(jq -r '.ended' "$rdB_mntnz/maintainer-loop.json")"
+    contains "the skip says there is nothing to review, not that the exit code was the reason" \
+        "holds no commits" "$(jq -r '.detail' "$rdB_mntnz/maintainer-loop.json")"
+    check "the coding leg's exit code is still recorded even on a skip" "3" \
+        "$(jq -r '.coding_exit_code' "$rdB_mntnz/maintainer-loop.json")"
+    check "the run's own exit code is unaffected by the skip" "3" "$rcB_mntnz"
+else
+    no "a failed, commitless coding leg produced a run directory" \
+        "rc=$rcB_mntnz: $outB_mntnz"
 fi
 
 printf '\n== maintainer surfacing: summary, run.env, status, run log ==\n'
