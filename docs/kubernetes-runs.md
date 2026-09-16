@@ -423,6 +423,111 @@ nothing (condition 2) yet writes its verdict to the outbox, so condition
 artifact-only task may produce a file and no commits. It is the
 *conjunction* that marks a dead seat.
 
+## The durable run log
+
+Every local `fork-sandbox.sh` run ends by appending one line to
+`~/.claude/sandbox-runs.jsonl` (see `sandbox-run-log.py`'s own header): a
+row a caller queries later with `list`, `show` and `stats`, and judges by
+hand with `verdict`. A `--k8s` run used to append nothing at all -- not a
+degraded row, an *absent* one, so a query like "has a seat been silently
+failing for weeks" came back clean while being structurally incapable of
+seeing a cluster run in the first place. `submit` and `collect` fix that
+by giving a cluster run the same kind of row a local run gets, read by the
+same unmodified tool.
+
+**The run directory is the join.** `sandbox-run-log.py record` does not
+take fields on its command line -- it takes `--run-dir` and reads what
+that directory contains (`run.env`, `task-meta.json`, `handoff.md`,
+`summary.json`). A `--k8s` run had no such directory to hand it. `submit`
+now creates one, in exactly the shape a local run's own run directory
+takes: `mktemp -d` under the same
+`/var/tmp/claude-scratch/forks/claude-fork-sandbox.XXXXXX` template
+`record`'s own path gate requires. Into it, at submit time, go:
+
+- `run.env` -- the fallback shape `record` reads when `summary.json` is
+  missing, carrying `mode`, `harness`, `network`, `model`, `branch`,
+  `origin_repo` and `base_sha` (the revision the branch is about to start
+  from -- `--checkout`'s resolved sha, or this repo's HEAD).
+- `task-meta.json` -- present only with `--task-meta`, the same flag and
+  the same meaning as the local path's own (see "Recommended --task-meta
+  fields" in `sandbox-run-log.py`'s header). `--task-meta` used to be
+  refused outright with `--k8s`, for the very reason this section exists:
+  it is folded into a row that did not exist. It no longer is --
+  `fork-sandbox.sh --k8s` forwards it unchanged to `fork-sandbox-k8s.sh
+  run`, which threads it to `submit`.
+- `handoff.md` -- a copy of the handoff file, taken **at submit time**,
+  not read again later: the caller may edit or remove the original while
+  the run is in flight, and the archive must reflect what the pod actually
+  received.
+- `run-source` -- written only when `FORK_SANDBOX_RUN_SOURCE` is set in
+  the launching shell, exactly like the local path's own marker. This is
+  how this project's own `--k8s` test suite keeps its stubbed-kubectl
+  fixture runs out of the operator's performance stats without needing a
+  scratch `HOME`: it tags every fixture run `source=test` and lets
+  `record` append for real, the same convention
+  `fork-sandbox-maintainer-test.sh` already uses for its own real,
+  local-path runs.
+
+`submit` prints the directory's path on a line shaped exactly like the
+local launcher's own (`  run dir:  <path>`), so a caller that fans out --
+this project's own postmaster, or an external panel launcher calling
+`submit`/`wait`/`collect` directly rather than blocking through `run` --
+scrapes it with the identical `sed -n 's/^  run dir:  *//p'` either path
+already uses.
+
+**`collect` finalizes it.** A new, optional `--run-dir DIR`: absent, it
+behaves exactly as it always has, writing and recording nothing; given
+the path `submit` printed, it writes `summary.json` -- with everything
+now known -- and calls `sandbox-run-log.py record --run-dir DIR`. `run`
+threads the two automatically, reading the directory its own `submit`
+phase created (a module-global `cmd_submit` sets as its last action,
+since it is a plain bash function call rather than a subprocess whose
+output would otherwise need capturing) and handing it to its own
+`collect` phase. This runs **before** the zero-harvest check, not after:
+a run that produced nothing is exactly the case a query like "has a seat
+been silently failing" needs to see, and code after `exit 3` never runs.
+
+`summary.json`'s fields, decided:
+
+- `mode: "run"` -- a cluster run *is* a run.
+- `network: "cluster"`. The local vocabulary is `pinned` / `sealed`,
+  which describe host sandbox mechanisms; a pod's reachability is
+  enforced by a NetworkPolicy instead, so it is honestly a third thing.
+  Putting the cluster-ness on `network` rather than on `mode` keeps one
+  axis per fact: `stats --by network` answers "how much ran in-cluster"
+  directly, and `stats --by harness` stops splitting one binary across
+  two names (the same reasoning `sandbox-run-log.py`'s own
+  `normalize_network` already applies to a historical `harness="pi-local"`
+  row). `record`'s read-time normalizer only rewrites that one historical
+  shape, never a row that already carries a `network` key, so a
+  `network: "cluster"` row passes through untouched.
+- `harness`, `model`, `branch`, `origin_repo`, `base_sha` -- harness and
+  model are read back from `run.env` (only `submit` knows them; `collect`
+  does not take them as arguments), the rest as `collect` already knows
+  them for the zero-harvest check.
+- `exit_code`, `commits` -- the agent's own exit code (from the
+  `.run-complete` sentinel) and a `git rev-list --count` between the
+  pushed base and the fetched tip, the same measure the zero-harvest check
+  itself uses.
+- **cost and tokens: omitted entirely, never written as zero.** They live
+  in the pod, and extracting them is its own piece of work this round does
+  not do. An absent key says "not measured"; a zero would claim the run
+  was measured and free -- a permanent false economy on every cluster row
+  otherwise.
+
+**The append is best-effort**, on both paths: a machine without
+`sandbox-run-log.py` on `PATH` or under `$HOME/.claude/scripts/` skips it,
+and a `record` invocation that itself fails only warns. A run that
+finished must never be reported as failed because a log append broke --
+the same posture the local launcher already takes.
+
+**The run directory is not removed by this script.** Unlike every other
+per-run resource `collect` (or its own cleanup) reaps, this directory
+outlives the Job and the pod: its basename is the run id an orchestrator
+later attaches a verdict to (`sandbox-run-log.py verdict <run-id>`), and
+it is what `collect`'s own `record` call reads. It is removed by the
+orchestrator after review, exactly like a local run's own run directory.
+
 ## Getting the repository in: by push, not by clone
 
 **This is the biggest change from the original design, and it replaces two
