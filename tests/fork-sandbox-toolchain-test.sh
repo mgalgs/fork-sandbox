@@ -646,6 +646,7 @@ echo "== GNU tool resolution =="
 # keg-only, so the bare name is still BSD's — which is the whole reason the
 # scripts ask for it by resolved name rather than hardcoding one.
 check "a GNU realpath was found" "0" "$( _fs_resolve_gnu_tool realpath >/dev/null; echo $? )"
+check "a GNU sort was found" "0" "$( _fs_resolve_gnu_tool sort >/dev/null; echo $? )"
 check "a GNU stat was found" "0" "$( _fs_resolve_gnu_tool stat >/dev/null; echo $? )"
 check "a GNU timeout was found" "0" "$( _fs_resolve_gnu_tool timeout >/dev/null; echo $? )"
 check "fs_require_gnu_tools passes here" "0" "$( fs_require_gnu_tools >/dev/null 2>&1; echo $? )"
@@ -654,17 +655,19 @@ check "fs_require_gnu_tools passes here" "0" "$( fs_require_gnu_tools >/dev/null
 gdir="$scratch/gnu-bin"
 mkdir -p "$gdir"
 printf '#!/usr/bin/env bash\necho "grealpath (GNU coreutils) 9.9"\n' > "$gdir/grealpath"
-chmod 755 "$gdir/grealpath"
+printf '#!/usr/bin/env bash\necho "gsort (GNU coreutils) 9.9"\n' > "$gdir/gsort"
+chmod 755 "$gdir/grealpath" "$gdir/gsort"
 old_path="$PATH"
 PATH="$gdir:$PATH"
 check "the g-prefixed build is preferred" "grealpath" "$(_fs_resolve_gnu_tool realpath)"
+check "g-prefixed sort is preferred" "gsort" "$(_fs_resolve_gnu_tool sort)"
 PATH="$old_path"
 
 # A BSD-only machine has neither, and must be told rather than left to hit an
 # illegal-option error deep in a run.
 bsddir="$scratch/bsd-bin"
 mkdir -p "$bsddir"
-for t in realpath stat timeout; do
+for t in realpath sort stat timeout; do
     printf '#!/bin/bash\necho "usage: %s [-q] path" >&2\nexit 1\n' "$t" > "$bsddir/$t"
     chmod 755 "$bsddir/$t"
 done
