@@ -328,6 +328,20 @@ pass=0; fail=0; tmpdirs=()
 k8s_test_forks_root=/var/tmp/claude-scratch/forks
 k8s_test_preexisting_rundirs="$(find "$k8s_test_forks_root" -maxdepth 1 \
     -name 'claude-fork-sandbox.*' 2>/dev/null | sort)"
+
+# Same idea, for the durable run log itself: most of this suite's own
+# record() calls run against a scratch HOME and never touch the operator's
+# real ~/.claude/sandbox-runs.jsonl at all, but a couple of fixtures below
+# drive a REAL collect (no HOME override) whose FORK_SANDBOX_RUN_SOURCE=test
+# tag is only honored if the run dir they hand it also carries the
+# run-source marker that tag turns into. Snapshot the real log's line
+# count now, before any of that runs, so the guard near the end of this
+# file reads only lines appended since -- an operator row already in the
+# file is never touched or asserted against.
+k8s_test_runlog="$HOME/.claude/sandbox-runs.jsonl"
+k8s_test_runlog_before_lines=0
+[[ -f "$k8s_test_runlog" ]] && k8s_test_runlog_before_lines="$(wc -l < "$k8s_test_runlog")"
+
 cleanup() {
     local d
     for d in "${tmpdirs[@]-}"; do [[ -n "$d" && -d "$d" ]] && rm -rf -- "$d"; done
@@ -5432,6 +5446,13 @@ collect_undecidable_rd="$(mktemp -d /var/tmp/claude-scratch/forks/claude-fork-sa
     printf 'harness=pi\n'
     printf 'model=moonshotai/kimi-k3\n'
 } > "$collect_undecidable_rd/run.env"
+# This run dir is built by hand, not via cmd_submit, so it never picked up
+# the FORK_SANDBOX_RUN_SOURCE=test tag submit writes to run-source (see the
+# sweep-ownership section above). The collect below drives a REAL record
+# call against this process's own $HOME -- collectstub_collect sets no
+# scratch HOME -- so without this marker the row lands with source:
+# "fork-sandbox", indistinguishable from real operator work.
+printf 'test\n' > "$collect_undecidable_rd/run-source"
 collect_log22="$(newdir)/kubectl.log"; collect_out22="$(newdir)/out22.txt"; collect_dest22="$(newdir)/outbox-22"
 tmpdirs+=("$(dirname "$collect_log22")" "$(dirname "$collect_dest22")")
 if K8S_STUB_RUN_COMPLETE=0 K8S_STUB_BASE_SHA_RC=1 K8S_STUB_FETCH_REF="$collect_undecidable_branch" \
@@ -9238,6 +9259,32 @@ refuses "--k8s --task-meta with invalid JSON is still refused (by cmd_submit, fo
     --harness pi --branch fs-k8s-flag-test-taskmeta-bad --model moonshotai/kimi-k3 \
     --task-meta 'not json' \
     "$k8s_flag_proj" "$k8s_flag_handoff"
+
+printf '\n== the durable run log: every row this suite appends carries source=test ==\n'
+# This suite's header (above) states appending source: "test" rows is
+# deliberate, and that list/stats exclude them by default -- an invariant
+# nothing enforced until now (see the fs-k8s-test-collect-commits-
+# undecidable fixture's own run-source comment, earlier in this file, for
+# the one fixture that once violated it). Reads only the lines appended
+# since the snapshot taken near the top of this file, so a real operator
+# row already in the log is never touched or asserted against. A real
+# fork-sandbox.sh run started concurrently under this same $HOME would
+# also append a non-test row in this window and be flagged here as a false
+# positive -- same caveat the exit-sweep ownership check above already
+# lives with -- not something a single-host test run needs to guard
+# against further.
+k8s_test_runlog_bad_sources=""
+if [[ -f "$k8s_test_runlog" ]]; then
+    while IFS= read -r k8s_test_runlog_line; do
+        [[ -z "$k8s_test_runlog_line" ]] && continue
+        k8s_test_runlog_source="$(jq -r '.source // "(absent)"' <<< "$k8s_test_runlog_line" 2>/dev/null)"
+        if [[ "$k8s_test_runlog_source" != test ]]; then
+            k8s_test_runlog_bad_sources+="${k8s_test_runlog_source} "
+        fi
+    done < <(tail -n +"$(( k8s_test_runlog_before_lines + 1 ))" "$k8s_test_runlog")
+fi
+check "every row this suite appended to the real run log carries source=test" \
+    "" "$k8s_test_runlog_bad_sources"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))
