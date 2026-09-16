@@ -1189,5 +1189,100 @@ else
         "rc=$rcB: $outB"
 fi
 
+printf '\n== a non-zero coding-leg exit does not skip a branch that holds work ==\n'
+
+# Whether the branch holds commits off base_sha decides whether the review
+# loop runs -- not the coding leg's exit code. A leg that fails on something
+# AFTER committing real work (the reported case: a harness guard refusing an
+# rm -rf during its own scratch-dir cleanup) must not have that work skipped
+# over unreviewed.
+nz_stub="$(mktemp -d /var/tmp/claude-scratch/fs-review-nonzero.XXXXXX)"
+tmpdirs+=("$nz_stub")
+cat > "$nz_stub/claude-sandboxed" <<'STUB'
+#!/usr/bin/env bash
+set -uo pipefail
+clone_dir="" prev=""
+for a in "$@"; do
+    [[ "$a" == "--dangerously-skip-permissions" ]] && clone_dir="$prev"
+    prev="$a"
+done
+cat >/dev/null
+n=0
+[[ -f "$FAKE_COUNT_FILE" ]] && n="$(cat "$FAKE_COUNT_FILE")"
+n=$(( n + 1 ))
+printf '%s' "$n" > "$FAKE_COUNT_FILE"
+
+case "$n" in
+1)
+    if [[ "${NZ_COMMIT:-1}" == "1" ]]; then
+        git -c user.email=t@fork-sandbox.invalid -c user.name=Tester \
+            -C "$clone_dir" commit --allow-empty -q -m "nonzero-exit implement"
+    fi
+    printf '{"type":"result","subtype":"success","total_cost_usd":0.01,"usage":{"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}\n'
+    exit "${NZ_EXIT:-3}"
+    ;;
+2)
+    printf 'APPROVED\n\nChecked: the diff, despite the failed coding leg.\n\n## Report\nThe branch is sound.\n' \
+        > "$clone_dir/.git/review-verdict.md"
+    printf '{"type":"result","subtype":"success","total_cost_usd":0.01,"usage":{"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}\n'
+    exit 0
+    ;;
+esac
+STUB
+chmod +x "$nz_stub/claude-sandboxed"
+
+# A: non-zero exit, WITH commits off base -- the loop now runs (and approves)
+# despite the coding leg's failure, and the run's own exit code still
+# reports the coding leg's failure: a review must never launder it green.
+count_nzA="$(mktemp)"; tmpdirs+=("$count_nzA")
+outA_nz="$(PATH="$nz_stub:$PATH" NZ_COMMIT=1 NZ_EXIT=3 FAKE_COUNT_FILE="$count_nzA" \
+    timeout 60 "$launcher" --foreground --harness claude --review-loop 1 \
+    --branch "sandbox-test-nonzero-commit-$$" \
+    "$proj" "$handoff" 2>&1)"
+rcA_nz=$?
+rdA_nz="$(printf '%s\n' "$outA_nz" | sed -n 's/^  run dir:  *//p' | head -1)"
+if [[ -n "$rdA_nz" ]]; then
+    tmpdirs+=("$rdA_nz")
+    check "a failed coding leg that committed work still runs both legs" "2" \
+        "$(cat "$count_nzA")"
+    check "the review leg approves the branch despite the failed coding leg" \
+        "approved" "$(jq -r '.ended' "$rdA_nz/review-loop.json")"
+    check "the coding leg's exit code is recorded in the loop record" "3" \
+        "$(jq -r '.coding_exit_code' "$rdA_nz/review-loop.json")"
+    contains "the review leg's own prompt is told the coding leg failed" \
+        "exited with" "$(cat "$rdA_nz/review-prompt-1.md" 2>/dev/null)"
+    check "the run's own exit code stays the coding leg's, not laundered by the review" \
+        "3" "$rcA_nz"
+    check "exit-code on disk agrees" "3" "$(cat "$rdA_nz/exit-code" 2>/dev/null)"
+else
+    no "a failed coding leg that committed work produced a run directory" \
+        "rc=$rcA_nz: $outA_nz"
+fi
+
+# B: non-zero exit, with NO commits -- still skips, because there is nothing
+# to review, not because of the exit code.
+count_nzB="$(mktemp)"; tmpdirs+=("$count_nzB")
+outB_nz="$(PATH="$nz_stub:$PATH" NZ_COMMIT=0 NZ_EXIT=3 FAKE_COUNT_FILE="$count_nzB" \
+    timeout 60 "$launcher" --foreground --harness claude --review-loop 1 \
+    --branch "sandbox-test-nonzero-nocommit-$$" \
+    "$proj" "$handoff" 2>&1)"
+rcB_nz=$?
+rdB_nz="$(printf '%s\n' "$outB_nz" | sed -n 's/^  run dir:  *//p' | head -1)"
+if [[ -n "$rdB_nz" ]]; then
+    tmpdirs+=("$rdB_nz")
+    check "a failed coding leg with no commits runs only the coding leg" "1" \
+        "$(cat "$count_nzB")"
+    check "a failed, commitless coding leg still skips the review loop" \
+        "skipped" "$(jq -r '.ended' "$rdB_nz/review-loop.json")"
+    contains "the skip says there is nothing to review, not that the exit code was the reason" \
+        "committed nothing" "$(jq -r '.detail' "$rdB_nz/review-loop.json")"
+    check "the coding leg's exit code is still recorded even on a skip" "3" \
+        "$(jq -r '.coding_exit_code' "$rdB_nz/review-loop.json")"
+    check "the run's own exit code is unaffected by the skip" "3" "$rcB_nz"
+else
+    no "a failed, commitless coding leg produced a run directory" \
+        "rc=$rcB_nz: $outB_nz"
+fi
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))

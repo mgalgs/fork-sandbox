@@ -489,15 +489,28 @@
 #                  readable verdict. Nothing is inferred from a leg that
 #                  failed — neither approval nor a lack of progress.
 #
-# The loop is skipped, and says so, when the main leg exited non-zero or
-# committed nothing: there is nothing to review. What happened is recorded in
-# <run-dir>/review-loop.json, per iteration, with each leg's exit code, head
-# sha, cost and token usage, and it lands in the run log as `review_loop` —
-# the point being to answer later, from real data, how many iterations are
-# worth paying for on a given model. Each leg is a session at that model's
-# price, so N=2 can cost three times a plain run: summary.json's
-# total_cost_usd is the sum of all of them, while cost_usd goes on meaning the
-# coding session alone.
+# The loop is skipped, and says so, only when there is nothing to review: the
+# branch could not be read, or its head sits at base_sha with no commits past
+# it. The main leg exiting non-zero is NOT, by itself, one of those reasons —
+# it used to be joined to "committed nothing" by an "or", as though the two
+# were one condition, but they are not: a coding leg can fail on something
+# that happens AFTER it already committed real work (its own cleanup, say),
+# and that work still deserves a reviewer. The exit code is recorded in
+# coding_exit_code in the loop record below, and handed to the review leg in
+# its prompt, so a reviewer that runs despite it knows the branch may be an
+# incomplete implementation — the same "nothing is inferred from a leg that
+# failed" principle behind harness-error above, applied here to the leg that
+# decides whether the loop runs at all rather than to one running inside it.
+# None of this touches the RUN's own exit code, which stays whatever the main
+# leg made it: reviewing a failed run does not launder it into a green one.
+#
+# What happened is recorded in <run-dir>/review-loop.json, per iteration,
+# with each leg's exit code, head sha, cost and token usage, and it lands in
+# the run log as `review_loop` — the point being to answer later, from real
+# data, how many iterations are worth paying for on a given model. Each leg
+# is a session at that model's price, so N=2 can cost three times a plain
+# run: summary.json's total_cost_usd is the sum of all of them, while
+# cost_usd goes on meaning the coding session alone.
 #
 # The legs write their own event files (events-review-N.jsonl,
 # events-fix-N.jsonl); events.jsonl stays the coding session's, so --result
@@ -6827,6 +6840,10 @@ fi
 next_leg_no=$(( ${leg_no:-1} + 1 ))
 review_loop_ended=""
 review_loop_detail=""
+# The coding leg's own exit code ($rc at the moment the gate below runs),
+# recorded here so it survives into every save_review_loop call regardless
+# of how the loop ends -- see the header comment above.
+review_loop_coding_rc=""
 review_iters_done='[]'
 leg_cost=""
 leg_usage=null
@@ -6918,6 +6935,7 @@ save_review_loop() {
         --argjson fix_repeat "${fix_repeat:-1}" \
         --arg ended "$review_loop_ended" \
         --arg detail "$review_loop_detail" \
+        --argjson coding_exit_code "${review_loop_coding_rc:-null}" \
         --argjson prev "$review_iters_done" \
         --argjson cur "$cur" \
         '{
@@ -6928,6 +6946,7 @@ save_review_loop() {
             fix_model: (if $fix_model == "" then null else $fix_model end),
             fix_repeat: (if $fix_repeat == 1 then null else $fix_repeat end),
             ended: (if $ended == "" then null else $ended end),
+            coding_exit_code: $coding_exit_code,
             detail: (if $detail == "" then null else $detail end),
             iterations: ($prev + $cur),
         }' > "$run_dir/review-loop.json.part" 2>/dev/null; then
@@ -7167,19 +7186,19 @@ if [[ "${code_repeat:-1}" != "1" && "$mode" != "review-only" ]]; then
 fi
 
 if [[ "$review_loop_cap" != "0" && -n "$review_prompt" ]]; then
-    # Three reasons not to start at all, each recorded rather than silent.
-    if [[ "$rc" != "0" ]]; then
+    # Whether the branch holds work decides whether the loop runs -- the exit
+    # code is recorded (coding_exit_code, below) but is never itself a skip
+    # reason. See the header comment above.
+    review_loop_coding_rc="$rc"
+    loop_head="$(clone_branch_head)"
+    if [[ -z "$loop_head" ]]; then
         review_loop_ended="skipped"
-        review_loop_detail="the session exited $rc, so there is nothing worth reviewing"
-    else
-        loop_head="$(clone_branch_head)"
-        if [[ -z "$loop_head" ]]; then
-            review_loop_ended="skipped"
-            review_loop_detail="branch $branch could not be read from the clone"
-        elif [[ "$loop_head" == "$base_sha" ]]; then
-            review_loop_ended="skipped"
-            review_loop_detail="the session committed nothing, so there is nothing to review"
-        fi
+        review_loop_detail="branch $branch could not be read from the clone"
+    elif [[ "$loop_head" == "$base_sha" ]]; then
+        review_loop_ended="skipped"
+        review_loop_detail="the session committed nothing, so there is nothing to review"
+    elif [[ "$rc" != "0" ]]; then
+        review_loop_detail="the session exited $rc; reviewing the commits it did land"
     fi
 
     loop_i=1
@@ -7206,6 +7225,18 @@ if [[ "$review_loop_cap" != "0" && -n "$review_prompt" ]]; then
         review_prompt_iter="$run_dir/review-prompt-$loop_i.md"
         {
             cat -- "$review_prompt"
+            # The coding leg failed on something -- possibly after it
+            # committed the very work under review. Told once, up front,
+            # rather than left for the reviewer to infer from a clean-looking
+            # diff and approve as if nothing had gone wrong.
+            if [[ -n "$review_loop_coding_rc" && "$review_loop_coding_rc" != "0" ]]; then
+                printf '\n---\n\n## The coding session exited non-zero\n\n'
+                printf 'The session that produced the commits under review exited with\n'
+                printf 'status %s. Its work may be incomplete or partially applied -- read\n' \
+                    "$review_loop_coding_rc"
+                printf 'the branch and flag anything that looks unfinished as a finding,\n'
+                printf 'the same as any other defect.\n'
+            fi
             rp_addenda_list="$(fs_addenda_dirs)"
             if [[ -n "$rp_addenda_list" ]]; then
                 printf '\n---\n\n## Operator addenda delivered to earlier legs of this run\n\n'
