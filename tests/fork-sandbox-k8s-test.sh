@@ -314,6 +314,14 @@ repo_dir="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 export FORK_SANDBOX_RUN_SOURCE=test
 
 pass=0; fail=0; tmpdirs=()
+# Fixture commands that invoke record must never write prompt archives into
+# the operator's durable home. They use this isolated HOME.
+k8s_test_operator_home="$HOME"
+k8s_test_handoff_archive="$k8s_test_operator_home/.claude/sandbox-handoffs"
+k8s_test_handoff_archives_before="$(find "$k8s_test_handoff_archive" -maxdepth 1 \
+    -type f 2>/dev/null | sort)"
+k8s_test_home="$(mktemp -d)"; tmpdirs+=("$k8s_test_home")
+
 # Every real (non --dry-run) submit this suite drives now also creates a
 # genuine run directory under the forks root -- unlike every other
 # artifact this suite creates, that directory is deliberately NOT removed
@@ -329,16 +337,10 @@ k8s_test_forks_root=/var/tmp/claude-scratch/forks
 k8s_test_preexisting_rundirs="$(find "$k8s_test_forks_root" -maxdepth 1 \
     -name 'claude-fork-sandbox.*' 2>/dev/null | sort)"
 
-# Same idea, for the durable run log itself: most of this suite's own
-# record() calls run against a scratch HOME and never touch the operator's
-# real ~/.claude/sandbox-runs.jsonl at all, but a couple of fixtures below
-# drive a REAL collect (no HOME override) whose FORK_SANDBOX_RUN_SOURCE=test
-# tag is only honored if the run dir they hand it also carries the
-# run-source marker that tag turns into. Snapshot the real log's line
-# count now, before any of that runs, so the guard near the end of this
-# file reads only lines appended since -- an operator row already in the
-# file is never touched or asserted against.
-k8s_test_runlog="$HOME/.claude/sandbox-runs.jsonl"
+# Same idea, for the durable run log itself: fixture commands that can call
+# record use $k8s_test_home, so snapshot that fixture log and read only its
+# rows near the end.
+k8s_test_runlog="$k8s_test_home/.claude/sandbox-runs.jsonl"
 k8s_test_runlog_before_lines=0
 [[ -f "$k8s_test_runlog" ]] && k8s_test_runlog_before_lines="$(wc -l < "$k8s_test_runlog")"
 
@@ -4368,8 +4370,9 @@ runstub_run() {
     # a pushed base, so the stub's emulated fetch and the stub's base-sha
     # read must agree on one, and the caller's repo's own HEAD is the only
     # sha both can reach.
-    local log="$1" out="$2"; shift 2
-    PATH="$runstub_dir:$PATH" K8S_STUB_LOG="$log" \
+    local log="$1" out="$2" run_home="$HOME"; shift 2
+    [[ "$run_home" == "$k8s_test_operator_home" ]] && run_home="$k8s_test_home"
+    HOME="$run_home" PATH="$runstub_dir:$PATH" K8S_STUB_LOG="$log" \
         K8S_STUB_BASE_SHA="${K8S_STUB_BASE_SHA:-$(git -C "$proj_dir" rev-parse HEAD)}" \
         K8S_STUB_OUTBOX_DIR="${K8S_STUB_OUTBOX_DIR:-$runstub_pod_outbox}" \
         FORK_SANDBOX_CONFIG_DIR="$config_dir" \
@@ -4919,7 +4922,7 @@ collectstub_collect() {
     # repo's own HEAD is the only sha both can reach.
     local log="$1" out="$2"; shift 2
     K8S_STUB_POD_NAME="${K8S_STUB_POD_NAME:-stub-pod}" \
-    PATH="$collectstub_dir:$PATH" K8S_STUB_LOG="$log" \
+    HOME="$k8s_test_home" PATH="$collectstub_dir:$PATH" K8S_STUB_LOG="$log" \
     K8S_STUB_BASE_SHA="${K8S_STUB_BASE_SHA:-$(git -C "$proj_dir" rev-parse HEAD)}" \
     K8S_STUB_OUTBOX_DIR="${K8S_STUB_OUTBOX_DIR:-$runstub_pod_outbox}" \
     FORK_SANDBOX_CONFIG_DIR="$config_dir" \
@@ -9095,7 +9098,7 @@ if [[ -n "$rundir_rd" && -d "$rundir_rd" ]]; then
     collect_rundir_log="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$collect_rundir_log")")
     collect_rundir_out="$(newdir)/collect-out.txt"; tmpdirs+=("$(dirname "$collect_rundir_out")")
     collect_rundir_outbox="$(newdir)/outbox"; tmpdirs+=("$(dirname "$collect_rundir_outbox")")
-    PATH="$runstub_dir:$PATH" K8S_STUB_LOG="$collect_rundir_log" \
+    HOME="$k8s_test_home" PATH="$runstub_dir:$PATH" K8S_STUB_LOG="$collect_rundir_log" \
         K8S_STUB_BASE_SHA="$rundir_head_sha" \
         K8S_STUB_OUTBOX_DIR="$runstub_pod_outbox" \
         FORK_SANDBOX_CONFIG_DIR="$config_dir" \
@@ -9337,6 +9340,20 @@ if [[ -f "$k8s_test_runlog" ]]; then
 fi
 check "every row this suite appended to the real run log carries source=test" \
     "" "$k8s_test_runlog_bad_sources"
+
+printf '\n== fixture runs leave no handoff archives in the operator home ==\n'
+# Archives carry no source marker, so unlike the JSONL rows above a fixture
+# archive is indistinguishable from an operator's real work. Compare only
+# against the pre-suite snapshot: never remove or otherwise disturb an
+# existing durable archive.
+k8s_test_new_handoff_archives=""
+while IFS= read -r k8s_test_handoff_archive_path; do
+    [[ -z "$k8s_test_handoff_archive_path" ]] && continue
+    grep -qxF "$k8s_test_handoff_archive_path" <<< "$k8s_test_handoff_archives_before" && continue
+    k8s_test_new_handoff_archives+="$k8s_test_handoff_archive_path "
+done < <(find "$k8s_test_handoff_archive" -maxdepth 1 -type f 2>/dev/null | sort)
+check "fixture runs append no handoff archives to the operator's durable state" \
+    "" "$k8s_test_new_handoff_archives"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))
