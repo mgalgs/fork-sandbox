@@ -553,10 +553,40 @@ FS_NODE_FLAGS=()
 
 fs_node_provision() {
     local origin_repo="$1" clone_dir="$2" reused="${3:-false}" ver dir native count nm
-    local -a shown
+    local path base rel selected_nvmrc="" selected_rel="" candidate_ver idx
+    local -a shown project_paths project_rels
     FS_NODE_FLAGS=()
+    project_paths=("$origin_repo")
+    project_rels=("")
+    # A node project is commonly one layer below a non-node backend. Keep the
+    # search deliberately bounded: root plus non-hidden immediate children.
+    for path in "$origin_repo"/*; do
+        [[ -d "$path" && -f "$path/package.json" ]] || continue
+        base="${path##*/}"
+        [[ "$base" == node_modules || "$base" == .git || "$base" == .* ]] && continue
+        project_paths+=("$path")
+        project_rels+=("$base")
+    done
+
     if [[ -f "$origin_repo/.nvmrc" ]]; then
-        ver="$(tr -d 'v[:space:]' < "$origin_repo/.nvmrc")"
+        selected_nvmrc="$origin_repo/.nvmrc"
+    else
+        for (( idx = 1; idx < ${#project_paths[@]}; idx++ )); do
+            path="${project_paths[$idx]}"
+            [[ -f "$path/.nvmrc" ]] || continue
+            candidate_ver="$(tr -d 'v[:space:]' < "$path/.nvmrc")"
+            if [[ -z "$selected_nvmrc" ]]; then
+                selected_nvmrc="$path/.nvmrc"
+                selected_rel="${project_rels[$idx]}"
+                ver="$candidate_ver"
+            elif [[ "$candidate_ver" != "$ver" ]]; then
+                echo "Warning: node subprojects '$selected_rel' (v$ver) and" >&2
+                echo "'${project_rels[$idx]}' (v$candidate_ver) request different node versions; using '$selected_rel' (v$ver)." >&2
+            fi
+        done
+    fi
+    if [[ -n "$selected_nvmrc" ]]; then
+        ver="$(tr -d 'v[:space:]' < "$selected_nvmrc")"
         dir="$HOME/.nvm/versions/node/v$ver"
         if [[ "$FS_BACKEND_TOOLCHAIN" != host ]]; then
             # The bind names a host node install, and the sandbox's userland
@@ -575,12 +605,20 @@ fs_node_provision() {
             echo "under ~/.nvm. The sandbox falls back to system node." >&2
         fi
     fi
-    if [[ "$reused" == true && -e "$clone_dir/node_modules" ]]; then
-        rm -rf "$clone_dir/node_modules"
-    fi
-    if [[ -d "$origin_repo/node_modules" ]]; then
+    for (( idx = 0; idx < ${#project_paths[@]}; idx++ )); do
+        path="${project_paths[$idx]}"
+        rel="${project_rels[$idx]}"
+        if [[ -n "$rel" ]]; then
+            dir="$clone_dir/$rel/node_modules"
+        else
+            dir="$clone_dir/node_modules"
+        fi
+        if [[ "$reused" == true && -e "$dir" ]]; then
+            rm -rf "$dir"
+        fi
+        [[ -d "$path/node_modules" ]] || continue
         echo "Copying node_modules into the clone..." >&2
-        cp -a "$origin_repo/node_modules" "$clone_dir/node_modules"
+        cp -a "$path/node_modules" "$dir"
         # Nearly all of that tree is JavaScript and runs anywhere. A few
         # packages also carry a compiled .node, built for one OS and one CPU.
         # Under a host toolchain those are the right binaries. Under an image
@@ -590,7 +628,7 @@ fs_node_provision() {
         # Collect the whole list before counting: `find | head` would take
         # SIGPIPE, and pipefail would turn that into a failed provision.
         if [[ "$FS_BACKEND_TOOLCHAIN" != host ]]; then
-            native="$(find "$clone_dir/node_modules" -type f -name '*.node' 2>/dev/null || true)"
+            native="$(find "$dir" -type f -name '*.node' 2>/dev/null || true)"
             if [[ -n "$native" ]]; then
                 count=0
                 shown=()
@@ -606,7 +644,7 @@ fs_node_provision() {
                 echo "Run 'npm rebuild' (or 'npm ci') inside the sandbox to fix it." >&2
             fi
         fi
-    fi
+    done
     return 0
 }
 

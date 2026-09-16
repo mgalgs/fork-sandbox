@@ -284,6 +284,79 @@ else
     ok "reused clone drops node_modules origin no longer has"
 fi
 
+# A backend repo can keep its only node project one level down. Its .nvmrc
+# must still select node, and its dependencies land at the matching path.
+node_home="$scratch/node-home"
+node_real_home="$HOME"
+mkdir -p "$node_home/.nvm/versions/node/v20.12.2"
+origin_sub="$scratch/origin-subproject"
+clone_sub="$scratch/clone-subproject"
+mkdir -p "$origin_sub/web/node_modules/pkg" "$clone_sub/web"
+printf '{}\n' > "$origin_sub/web/package.json"
+printf 'v20.12.2\n' > "$origin_sub/web/.nvmrc"
+printf 'module.exports = 1\n' > "$origin_sub/web/node_modules/pkg/index.js"
+FS_BACKEND_TOOLCHAIN=host
+HOME="$node_home"
+fs_node_provision "$origin_sub" "$clone_sub" 2>"$scratch/subproject-err"
+check "a subproject .nvmrc selects its node install" \
+    "$node_home/.nvm/versions/node/v20.12.2" "${FS_NODE_FLAGS[1]-}"
+if [[ -f "$clone_sub/web/node_modules/pkg/index.js" ]]; then
+    ok "a subproject node_modules lands at the matching clone path"
+else
+    no "a subproject node_modules lands at the matching clone path"
+fi
+
+# A root .nvmrc keeps precedence over a subproject's version.
+mkdir -p "$node_home/.nvm/versions/node/v22.11.0"
+printf 'v22.11.0\n' > "$origin_sub/.nvmrc"
+fs_node_provision "$origin_sub" "$clone_sub" 2>"$scratch/root-precedence-err"
+check "the root .nvmrc wins over a subproject .nvmrc" \
+    "$node_home/.nvm/versions/node/v22.11.0" "${FS_NODE_FLAGS[1]-}"
+
+# With no root .nvmrc, sorted subproject order decides. A conflict is useful
+# context rather than a hard failure, so both paths and versions are named.
+origin_conflict="$scratch/origin-conflict"
+clone_conflict="$scratch/clone-conflict"
+mkdir -p "$origin_conflict/alpha" "$origin_conflict/zeta" \
+    "$clone_conflict/alpha" "$clone_conflict/zeta"
+printf '{}\n' > "$origin_conflict/alpha/package.json"
+printf '{}\n' > "$origin_conflict/zeta/package.json"
+printf 'v20.12.2\n' > "$origin_conflict/alpha/.nvmrc"
+printf 'v22.11.0\n' > "$origin_conflict/zeta/.nvmrc"
+fs_node_provision "$origin_conflict" "$clone_conflict" 2>"$scratch/conflict-err"
+err="$(cat "$scratch/conflict-err")"
+check "the first sorted subproject .nvmrc wins a conflict" \
+    "$node_home/.nvm/versions/node/v20.12.2" "${FS_NODE_FLAGS[1]-}"
+contains "a conflicting subproject warning names the first project and version" \
+    "'alpha' (v20.12.2)" "$err"
+contains "a conflicting subproject warning names the other project and version" \
+    "'zeta' (v22.11.0)" "$err"
+
+# No package.json means no newly discovered node project and remains a clean
+# no-op, even if an unrelated immediate directory exists.
+origin_none="$scratch/origin-no-node"
+clone_none="$scratch/clone-no-node"
+mkdir -p "$origin_none/docs" "$clone_none/docs"
+fs_node_provision "$origin_none" "$clone_none" 2>"$scratch/no-node-err"
+check "a repo with no node project sets no node flags" "0" "${#FS_NODE_FLAGS[@]}"
+check "a repo with no node project emits no warning" "" "$(cat "$scratch/no-node-err")"
+
+# Reused subproject dependencies are replaced at their own path, rather than
+# retained or copied into a nested node_modules directory.
+rm -f "$origin_sub/.nvmrc"
+printf 'module.exports = 2\n' > "$origin_sub/web/node_modules/pkg/current.js"
+mkdir -p "$clone_sub/web/node_modules"
+printf 'module.exports = 0\n' > "$clone_sub/web/node_modules/stale-only.js"
+fs_node_provision "$origin_sub" "$clone_sub" true >/dev/null 2>&1
+if [[ -f "$clone_sub/web/node_modules/pkg/current.js" && \
+      ! -e "$clone_sub/web/node_modules/stale-only.js" && \
+      ! -d "$clone_sub/web/node_modules/node_modules" ]]; then
+    ok "a reused clone replaces a subproject node_modules tree"
+else
+    no "a reused clone replaces a subproject node_modules tree"
+fi
+HOME="$node_real_home"
+
 echo ""
 echo "== fs_cache_binds =="
 
