@@ -74,9 +74,16 @@ The review loop (fork-sandbox.sh --review-loop N):
   review_loop  present only when the run used the flag. The whole loop, as
                the runner recorded it: `cap`, `ended` (approved | cap |
                no-progress | harness-error | skipped), `detail` for the last
-               two, and `iterations` -- one object per review/fix pair with
-               its findings count, each leg's exit code and cost, the branch
-               head before and after, and the commits the fix leg added.
+               two, `coding_exit_code`, and `iterations` -- one object per
+               review/fix pair with its findings count, each leg's exit
+               code and cost, the branch head before and after, and the
+               commits the fix leg added. `coding_exit_code` is the coding
+               leg's own exit status (null in --review-only mode, where
+               there is no coding leg), recorded but never dispositive --
+               whether the branch holds commits past the base decides
+               whether the loop runs at all, not whether that leg exited
+               zero; a non-zero exit still gets the branch reviewed, with
+               the review prompt told the session may be incomplete.
                `total_cost_usd` beside it is the run's implement leg plus
                every loop leg; `cost_usd` stays the implement leg alone.
                Group on it directly: `stats --by model,review_loop.ended`
@@ -90,9 +97,10 @@ branch after the review loop ended.
   maintainer_loop  present only when the run used the flag. Same shape as
                review_loop -- `cap`, `maintainer_model`,
                `maintainer_harness`, `ended` (approved | cap | no-progress |
-               harness-error | skipped), `detail`, and `iterations` with
-               each maintainer/fix leg's exit code, cost, heads and the
-               commits the fix leg added. A fix leg's commits go to the
+               harness-error | skipped), `detail`, `coding_exit_code` (same
+               meaning as review_loop's), and `iterations` with each
+               maintainer/fix leg's exit code, cost, heads and the commits
+               the fix leg added. A fix leg's commits go to the
                maintainer's next iteration, never to the review loop.
                Group on it directly: `stats --by model,maintainer_loop.ended`
 

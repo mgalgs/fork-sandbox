@@ -159,10 +159,13 @@
 #                           fully rendered on the HOST by
 #                           fork-sandbox-k8s.sh (fs_emit_review_prompt_body /
 #                           fs_emit_fix_prompt_body in fork-sandbox-lib.sh) --
-#                           this script never composes prompt text of its
-#                           own. review-loop.sh is the loop's own control
-#                           flow; see its header for why it is a separate
-#                           script.
+#                           this script only composes prompt text of its own
+#                           for one exception, the "coding session exited
+#                           non-zero" note appended pod-side ahead of the
+#                           review loop, since only this script knows the
+#                           coding leg's exit code. review-loop.sh is the
+#                           loop's own control flow; see its header for why
+#                           it is a separate script.
 #
 # Creates /work/inbox: the operator inbox, written to from outside the pod
 # by `fork-sandbox-k8s.sh say` over kubectl exec, and read by the agent per

@@ -892,6 +892,8 @@ if [[ -n "$rdA_mntnz" ]]; then
         "approved" "$(jq -r '.ended' "$rdA_mntnz/maintainer-loop.json")"
     check "the coding leg's exit code is recorded in the loop record" "3" \
         "$(jq -r '.coding_exit_code' "$rdA_mntnz/maintainer-loop.json")"
+    check "an approved loop's detail is not left carrying how the loop started" \
+        "null" "$(jq -r '.detail' "$rdA_mntnz/maintainer-loop.json")"
     contains "the maintainer leg's own prompt is told the coding leg failed" \
         "exited with" "$(cat "$rdA_mntnz/maintainer-prompt-1.md" 2>/dev/null)"
     check "the run's own exit code stays the coding leg's, not laundered by the review" \

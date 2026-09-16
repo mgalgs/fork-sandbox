@@ -35,12 +35,16 @@
 # against a plain git repo, with a stub standing in for pi, and no cluster
 # involved at all.
 #
-# It renders no prompt text of its own. Every word of the review and fix
-# prompts is composed on the HOST by fork-sandbox-lib.sh's
-# fs_emit_review_prompt_body/fs_emit_fix_prompt_body, the same functions
-# fork-sandbox.sh's local loop uses, and shipped in as --review-prompt and
-# --fix-header. This script's only prompt-related job is concatenating the
-# fix header to a verdict -- see the fix-prompt assembly below.
+# It renders no prompt text of its own. The review and fix prompt bodies are
+# composed by fork-sandbox-lib.sh's fs_emit_review_prompt_body/
+# fs_emit_fix_prompt_body, the same functions fork-sandbox.sh's local loop
+# uses, and shipped in as --review-prompt and --fix-header -- almost always
+# rendered on the HOST by fork-sandbox-k8s.sh, except that when the coding
+# leg exited non-zero, entrypoint.sh appends one pod-side note of its own
+# to --review-prompt before calling here, since only it knows that exit
+# code (see entrypoint.sh's header). This script's only prompt-related job
+# is concatenating the fix header to a verdict -- see the fix-prompt
+# assembly below.
 
 set -euo pipefail
 
@@ -217,10 +221,11 @@ if [[ -z "$loop_head" ]]; then
 fi
 
 # One skip condition, recorded rather than silent: the coding session
-# committed nothing, so there is nothing to review. (The other local skip
-# condition -- the coding leg itself exiting non-zero -- is
-# fork-sandbox-k8s-entrypoint.sh's call, not this script's: only the
-# entrypoint knows the coding leg's exit code.)
+# committed nothing, so there is nothing to review. The coding leg exiting
+# non-zero is deliberately NOT a skip condition here or in the entrypoint --
+# see fork-sandbox-k8s-entrypoint.sh's comment on its review-loop block:
+# a non-zero exit is folded into the review prompt instead, so a branch
+# with real commits still gets reviewed.
 if [[ "$loop_head" == "$base_sha" ]]; then
     ended="skipped"
     detail="the session committed nothing, so there is nothing to review"

@@ -439,6 +439,8 @@ if [[ "$approved_rc" == 0 && -n "$approved_rd" ]]; then
     fi
     check "APPROVED review-only run ends approved" "approved" \
         "$(jq -r '.ended' "$approved_rd/review-loop.json")"
+    check "review-only has no coding leg, so coding_exit_code is null, not a forged 0" \
+        "null" "$(jq -r '.coding_exit_code' "$approved_rd/review-loop.json")"
     check "APPROVED review-only summary has mode" "review-only" \
         "$(jq -r '.mode' "$approved_rd/summary.json")"
     check "APPROVED review-only summary has no commits" "0" \
@@ -1249,6 +1251,8 @@ if [[ -n "$rdA_nz" ]]; then
         "approved" "$(jq -r '.ended' "$rdA_nz/review-loop.json")"
     check "the coding leg's exit code is recorded in the loop record" "3" \
         "$(jq -r '.coding_exit_code' "$rdA_nz/review-loop.json")"
+    check "an approved loop's detail is not left carrying how the loop started" \
+        "null" "$(jq -r '.detail' "$rdA_nz/review-loop.json")"
     contains "the review leg's own prompt is told the coding leg failed" \
         "exited with" "$(cat "$rdA_nz/review-prompt-1.md" 2>/dev/null)"
     check "the run's own exit code stays the coding leg's, not laundered by the review" \

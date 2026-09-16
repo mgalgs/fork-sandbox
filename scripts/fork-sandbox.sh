@@ -7198,8 +7198,13 @@ fi
 if [[ "$review_loop_cap" != "0" && -n "$review_prompt" ]]; then
     # Whether the branch holds work decides whether the loop runs -- the exit
     # code is recorded (coding_exit_code, below) but is never itself a skip
-    # reason. See the header comment above.
-    review_loop_coding_rc="$rc"
+    # reason. See the header comment above. In --review-only mode $rc is
+    # just its unused initial 0 (no coding leg runs), so recording it would
+    # forge a clean coding leg that never existed -- leave it unset, which
+    # save_review_loop turns into the record's null.
+    if [[ "$mode" != "review-only" ]]; then
+        review_loop_coding_rc="$rc"
+    fi
     loop_head="$(clone_branch_head)"
     if [[ -z "$loop_head" ]]; then
         review_loop_ended="skipped"
@@ -7207,9 +7212,11 @@ if [[ "$review_loop_cap" != "0" && -n "$review_prompt" ]]; then
     elif [[ "$loop_head" == "$base_sha" ]]; then
         review_loop_ended="skipped"
         review_loop_detail="the session committed nothing, so there is nothing to review"
-    elif [[ "$rc" != "0" ]]; then
-        review_loop_detail="the session exited $rc; reviewing the commits it did land"
     fi
+    # A non-zero $rc here is not a skip reason, and detail is documented as
+    # "why the loop ended" (harness-error | skipped) -- coding_exit_code,
+    # set just above, already carries the coding leg's own exit status, and
+    # the review prompt below tells the reviewer about it directly.
 
     loop_i=1
     while [[ -z "$review_loop_ended" ]] && (( loop_i <= review_loop_cap )); do
@@ -7595,9 +7602,11 @@ if [[ "${maintainer_loop_cap:-0}" != "0" && -n "${maintainer_prompt:-}" ]]; then
     elif [[ "$mnt_head" == "$base_sha" ]]; then
         maintainer_loop_ended="skipped"
         maintainer_loop_detail="the branch holds no commits, so there is nothing to review"
-    elif [[ "$rc" != "0" ]]; then
-        maintainer_loop_detail="the session exited $rc; reviewing the commits it did land"
     fi
+    # A non-zero $rc here is not a skip reason, and detail is documented as
+    # "why the loop ended" (harness-error | skipped) -- coding_exit_code,
+    # set just above, already carries the coding leg's own exit status, and
+    # the maintainer prompt below tells the reviewer about it directly.
 
     loop_i=1
     while [[ -z "$maintainer_loop_ended" ]] && (( loop_i <= maintainer_loop_cap )); do
