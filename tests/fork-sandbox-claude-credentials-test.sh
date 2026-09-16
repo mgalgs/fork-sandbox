@@ -225,5 +225,42 @@ else
     no "review leg: run_real produced a run directory" "run_real failed"
 fi
 
+printf '\n== --claude-credentials/CLAUDE_CREDENTIALS resolved to an absolute\n   path, checked to exist, before anything is created ==\n'
+
+# A nonexistent path fails at launch with a clear error -- not deep inside
+# fs_read_claude_credential after the clone, the branch and (in a detached
+# run) the tmux session already exist.
+missing_cfg="$(mktemp -d)"; tmpdirs+=("$missing_cfg")
+missing_path="$tmp/does-not-exist-credentials.json"
+missing_out="$(PATH="$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$missing_cfg" \
+    FORK_SANDBOX_BACKEND=fake-image \
+    timeout 60 "$launcher" --foreground --harness claude \
+    --claude-credentials "$missing_path" "$proj" "$handoff" 2>&1)"
+missing_rc=$?
+if (( missing_rc == 0 )); then
+    no "missing path: fork-sandbox.sh exited 0" "$missing_out"
+else
+    ok "missing path: fork-sandbox.sh refuses to launch"
+fi
+contains "missing path: the error names the path" "$missing_path" "$missing_out"
+lacks "missing path: no run directory was created" "run dir:" "$missing_out"
+
+# A path relative to the launcher's own cwd resolves to the same absolute
+# file a detached run's tmux -c "$origin_repo" and a --foreground exec from
+# the operator's own shell would otherwise disagree about.
+rel_cfg="$(mktemp -d)"; tmpdirs+=("$rel_cfg")
+rel_out="$(cd "$tmp" && PATH="$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$rel_cfg" \
+    FORK_SANDBOX_BACKEND=fake-image \
+    timeout 60 "$launcher" --foreground --harness claude \
+    --claude-credentials flag-credentials.json "$proj" "$handoff" 2>&1)"
+rel_rd="$(printf '%s\n' "$rel_out" | sed -n 's/^  run dir:  *//p' | head -1)"
+if [[ -n "$rel_rd" ]]; then
+    tmpdirs+=("$rel_rd")
+    contains "relative path: sandbox_cmd carries the resolved absolute path" \
+        "--claude-credentials $flag_cred" "$(grep '^sandbox_cmd=' "$rel_rd/run.sh")"
+else
+    no "relative path: run_real produced a run directory" "$rel_out"
+fi
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))

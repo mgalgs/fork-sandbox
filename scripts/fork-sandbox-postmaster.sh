@@ -883,6 +883,19 @@ pm_triage_wake() {
         local -a args=("$work_dir" --dangerously-skip-permissions --print \
                         --tools "")
         [[ -n "$t_model" ]] && args+=(--model "$t_model")
+        # This is a claude leg like any other, so it reads the same
+        # CLAUDE_CREDENTIALS override fork-sandbox.sh threads to every
+        # other claude-sandboxed invocation (docs/configure.md) -- without
+        # this, triage would silently keep billing the default account
+        # while every fan-out run obeyed the override. claude-sandboxed
+        # validates the path itself (fs_reject_unsafe_chars,
+        # fs_read_claude_credential), so a bad value fails the classifier
+        # call and this function's caller falls back to its safe default
+        # (wake) exactly as it does for any other triage failure.
+        local triage_config_dir triage_claude_credentials
+        triage_config_dir="${FORK_SANDBOX_CONFIG_DIR:-$HOME/.config/fork-sandbox}"
+        triage_claude_credentials="$(fs_read_env_value "$triage_config_dir/claude.env" CLAUDE_CREDENTIALS || true)"
+        [[ -n "$triage_claude_credentials" ]] && args+=(--claude-credentials "$triage_claude_credentials")
         out="$("$FS_TIMEOUT" --kill-after 10 "$timeout_s" "$bin" "${args[@]}" < "$prompt_file" 2>/dev/null)"
         rc=$?
     fi

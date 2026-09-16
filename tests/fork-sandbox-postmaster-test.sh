@@ -2166,6 +2166,25 @@ check "wake verdict: --model value is haiku" "ARG:haiku" \
 contains "wake verdict: the work dir reaches the launcher" \
     "$(grep -m1 -- '^ARG:' "$TRIAGE_LOG")" ".postmaster.triage-work."
 
+# --- scenario 1b: the claude triage seat is a claude leg like any
+#     other, so it obeys CLAUDE_CREDENTIALS in claude.env the same way
+#     every other claude-sandboxed invocation does (docs/configure.md) ---
+new_root TRIAGE_CONFIG_DIR
+cat > "$TRIAGE_CONFIG_DIR/claude.env" <<EOF
+CLAUDE_CREDENTIALS=$TRIAGE_CONFIG_DIR/team-credentials.json
+EOF
+: > "$STUB_ARGV_LOG"
+: > "$TRIAGE_LOG"
+export TRIAGE_STUB_VERDICT=wake
+mid="$(FORK_SANDBOX_CONFIG_DIR="$TRIAGE_CONFIG_DIR" send_msg '@carol' '@bob' 'Creds' 'body' 8 '@alice')"
+tid="$(thread_of "$mid")"
+FORK_SANDBOX_CONFIG_DIR="$TRIAGE_CONFIG_DIR" once
+check "CLAUDE_CREDENTIALS: --claude-credentials reaches the launcher" 1 \
+    "$(grep -c -- '^ARG:--claude-credentials$' "$TRIAGE_LOG")"
+check "CLAUDE_CREDENTIALS: its value is the path claude.env named" \
+    "ARG:$TRIAGE_CONFIG_DIR/team-credentials.json" \
+    "$(grep -A1 -- '^ARG:--claude-credentials$' "$TRIAGE_LOG" | tail -n1)"
+
 # --- scenario 2: a skip verdict suppresses only the Cc wake, and is
 #     recorded in triaged/<thread-id> ---
 : > "$STUB_ARGV_LOG"

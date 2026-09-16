@@ -3959,6 +3959,19 @@ claude_credentials_config="$(fs_read_env_value "$config_dir/claude.env" CLAUDE_C
 claude_credentials_resolved="${claude_credentials:-$claude_credentials_config}"
 if [[ -n "$claude_credentials_resolved" ]]; then
     fs_reject_unsafe_chars "$claude_credentials_resolved"
+    # Resolved to an absolute path now, at the launcher's own cwd, the same
+    # way --context-ro and --fixtures are above: a detached run's run.sh
+    # execs later under tmux's -c "$origin_repo", not the launcher's cwd, so
+    # a relative path stored verbatim would read a different file depending
+    # on --foreground. Checked for existence here too, so a typo fails
+    # before the clone, the branch and the tmux session are created, not
+    # deep inside fs_read_claude_credential after all of that already exists.
+    claude_credentials_resolved="$("$FS_REALPATH" -m "$claude_credentials_resolved")"
+    if [[ ! -f "$claude_credentials_resolved" ]]; then
+        echo "Error: --claude-credentials (or CLAUDE_CREDENTIALS in claude.env)" >&2
+        echo "names '$claude_credentials_resolved', which does not exist." >&2
+        exit 1
+    fi
 fi
 
 # Every codex credential directory this run's resolutions create, in order.
