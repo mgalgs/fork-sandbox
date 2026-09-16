@@ -554,7 +554,7 @@ FS_NODE_FLAGS=()
 fs_node_provision() {
     local origin_repo="$1" clone_dir="$2" reused="${3:-false}" ver dir native count nm
     local path base rel selected_nvmrc="" selected_rel="" candidate_ver idx
-    local -a shown project_paths project_rels
+    local -a shown project_paths project_rels matching_installs
     FS_NODE_FLAGS=()
     # A reused clone can retain an untracked dependency tree after the new
     # checkout removes that project's package.json (or all its tracked files).
@@ -608,12 +608,25 @@ fs_node_provision() {
         elif [[ ! "$ver" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
             echo "Warning: .nvmrc says '$ver', which is not a plain version" >&2
             echo "number. The sandbox falls back to system node." >&2
-        elif [[ -d "$dir" ]]; then
-            # shellcheck disable=SC2034  # read by the sourcing scripts
-            FS_NODE_FLAGS=(--bind-ro "$dir" --prepend-path "$dir/bin")
         else
-            echo "Warning: .nvmrc wants node v$ver, which is not installed" >&2
-            echo "under ~/.nvm. The sandbox falls back to system node." >&2
+            if [[ ! -d "$dir" ]]; then
+                matching_installs=()
+                for path in "$HOME/.nvm/versions/node/v$ver".*; do
+                    base="${path##*/}"
+                    [[ -d "$path" && "$base" =~ ^v[0-9]+(\.[0-9]+)*$ ]] || continue
+                    matching_installs+=("$path")
+                done
+                if (( ${#matching_installs[@]} > 0 )); then
+                    dir="$(printf '%s\n' "${matching_installs[@]}" | sort -V | tail -n 1)"
+                fi
+            fi
+            if [[ -d "$dir" ]]; then
+                # shellcheck disable=SC2034  # read by the sourcing scripts
+                FS_NODE_FLAGS=(--bind-ro "$dir" --prepend-path "$dir/bin")
+            else
+                echo "Warning: .nvmrc wants node v$ver, which is not installed" >&2
+                echo "under ~/.nvm. The sandbox falls back to system node." >&2
+            fi
         fi
     fi
     for (( idx = 0; idx < ${#project_paths[@]}; idx++ )); do

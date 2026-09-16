@@ -245,6 +245,54 @@ err="$(fs_node_provision "$origin" "$clone" 2>&1)"
 lacks "host mode does not scan for native modules" "compiled native module" "$err"
 contains "host mode still resolves the .nvmrc" "not installed" "$err"
 
+# Partial versions resolve to the newest installed version on component
+# boundaries. In particular, version ordering must be numeric rather than
+# lexical: 24.18.1 is newer than 24.9.0.
+node_version_home="$scratch/node-version-home"
+node_version_real_home="$HOME"
+mkdir -p "$node_version_home/.nvm/versions/node/v23.6.1" \
+    "$node_version_home/.nvm/versions/node/v24.18.1"
+HOME="$node_version_home"
+printf '24\n' > "$origin/.nvmrc"
+fs_node_provision "$origin" "$clone" >/dev/null 2>&1
+check "a major-only .nvmrc resolves to an installed version" \
+    "$node_version_home/.nvm/versions/node/v24.18.1" "${FS_NODE_FLAGS[1]-}"
+
+mkdir -p "$node_version_home/.nvm/versions/node/v24.9.0"
+fs_node_provision "$origin" "$clone" >/dev/null 2>&1
+check "partial version matches are sorted numerically" \
+    "$node_version_home/.nvm/versions/node/v24.18.1" "${FS_NODE_FLAGS[1]-}"
+
+rm -rf "$node_version_home/.nvm/versions/node/v24.18.1" \
+    "$node_version_home/.nvm/versions/node/v24.9.0"
+mkdir -p "$node_version_home/.nvm/versions/node/v240.1.0"
+fs_node_provision "$origin" "$clone" 2>"$scratch/major-boundary-err"
+err="$(cat "$scratch/major-boundary-err")"
+check "a major does not match a longer major label" "0" "${#FS_NODE_FLAGS[@]}"
+contains "a major with no boundary match keeps the existing warning" \
+    "Warning: .nvmrc wants node v24, which is not installed" "$err"
+
+mkdir -p "$node_version_home/.nvm/versions/node/v24.18.1"
+printf '24.1\n' > "$origin/.nvmrc"
+fs_node_provision "$origin" "$clone" 2>"$scratch/minor-boundary-err"
+err="$(cat "$scratch/minor-boundary-err")"
+check "a minor does not match a longer minor label" "0" "${#FS_NODE_FLAGS[@]}"
+contains "a minor with no boundary match keeps the existing warning" \
+    "Warning: .nvmrc wants node v24.1, which is not installed" "$err"
+
+printf 'v24.18.1\n' > "$origin/.nvmrc"
+fs_node_provision "$origin" "$clone" >/dev/null 2>&1
+check "an exact full version keeps its exact install path" \
+    "$node_version_home/.nvm/versions/node/v24.18.1" "${FS_NODE_FLAGS[1]-}"
+
+printf 'lts/iron\n' > "$origin/.nvmrc"
+fs_node_provision "$origin" "$clone" 2>"$scratch/non-numeric-version-err"
+err="$(cat "$scratch/non-numeric-version-err")"
+check "a non-numeric .nvmrc still sets no node flags" "0" "${#FS_NODE_FLAGS[@]}"
+contains "a non-numeric .nvmrc keeps the plain-version warning" \
+    "Warning: .nvmrc says 'lts/iron', which is not a plain version" "$err"
+HOME="$node_version_real_home"
+
 # A reused --clone-dir workspace already holds a previous wake's
 # node_modules. `cp -a` into an existing directory copies inside it rather
 # than replacing it, so without the reused flag the second wake would leave
