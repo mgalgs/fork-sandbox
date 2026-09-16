@@ -1288,5 +1288,95 @@ else
         "rc=$rcB_nz: $outB_nz"
 fi
 
+printf '\n== a pi coding leg that ends in a model error (rc 0 -> 1) defers\n   exit-code the same as any other pending review loop ==\n'
+
+# pi exits 0 even when its last turn ended in a provider error; fork-sandbox.sh
+# recovers that from the session file and turns rc 0 into rc 1 itself (see the
+# "pi exits 0 even when its final turn ended in a provider error" comment
+# above pi_error in fork-sandbox.sh). That correction has its own exit-code
+# write, separate from the deferred write every other coding-leg path uses,
+# and it must defer the same way: with a review loop still to come, exit-code
+# must not exist yet when the review leg starts, only after the loop ends.
+#
+# The review leg's own stub below checks for exit-code's existence itself,
+# the moment it starts -- no polling or timing needed, since fork-sandbox.sh
+# runs every leg of a --foreground run strictly in sequence: if the pi
+# accounting step wrote exit-code early, it is already on disk by the time
+# this stub is invoked; if it deferred correctly, it is not.
+# A --harness pi (networked, not pi-local) implement leg and a
+# --review-harness claude review leg are BOTH wrapped by claude-sandboxed --
+# only the sealed pi-local harness gets its own agent-sandboxed wrapper (see
+# fs_build_sandbox_cmd's "A harness may bring its own wrapper" comment) --
+# so one stub plays both roles here, told apart by --exec: only the pi
+# implement leg's command carries it (pi itself runs inside via --exec,
+# claude never does).
+pi_err_stub="$(mktemp -d /var/tmp/claude-scratch/fs-review-pi-error.XXXXXX)"
+tmpdirs+=("$pi_err_stub")
+pi_err_marker="$(mktemp)"; tmpdirs+=("$pi_err_marker")
+cat > "$pi_err_stub/claude-sandboxed" <<STUB
+#!/usr/bin/env bash
+set -uo pipefail
+is_pi_leg=0
+for a in "\$@"; do
+    [[ "\$a" == "--exec" ]] && is_pi_leg=1
+done
+clone_dir=""
+for a in "\$@"; do
+    [[ -d "\$a/.git" ]] && clone_dir="\$a"
+done
+cat >/dev/null
+if (( is_pi_leg )); then
+    git -c user.email=t@fork-sandbox.invalid -c user.name=Tester \
+        -C "\$clone_dir" commit --allow-empty -q -m "pi model-error implement"
+    mkdir -p "\$clone_dir/.git/pi-session"
+    {
+        printf '{"role":"assistant","stopReason":"stop"}\n'
+        printf '{"role":"assistant","stopReason":"error",'
+        printf '"errorMessage":"context length exceeded",'
+        printf '"usage":{"input":100,"output":10,"cacheRead":0,"cacheWrite":0,'
+        printf '"totalTokens":110,"cost":{"total":0.001}}}\n'
+    } > "\$clone_dir/.git/pi-session/session.jsonl"
+    exit 0
+fi
+run_dir_seen="\$(cd "\$clone_dir/../.." && pwd)"
+if [[ -f "\$run_dir_seen/exit-code" ]]; then
+    printf 'exists\n' > "$pi_err_marker"
+else
+    printf 'absent\n' > "$pi_err_marker"
+fi
+printf 'APPROVED\n\nChecked: the diff, despite the failed coding leg.\n\n## Report\nThe branch is sound.\n' \
+    > "\$clone_dir/.git/review-verdict.md"
+printf '{"type":"result","subtype":"success","total_cost_usd":0.01,"usage":{"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}\n'
+exit 0
+STUB
+chmod +x "$pi_err_stub/claude-sandboxed"
+
+pi_err_cfg="$(mktemp -d)"; tmpdirs+=("$pi_err_cfg")
+install -m 600 /dev/null "$pi_err_cfg/pi.env"
+printf 'OPENROUTER_API_KEY=fake\n' > "$pi_err_cfg/pi.env"
+
+pi_err_out="$(PATH="$pi_err_stub:$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$pi_err_cfg" \
+    FORK_SANDBOX_BACKEND=fake-image \
+    timeout 60 "$launcher" --foreground --harness pi/some-model --review-loop 1 \
+    --review-harness claude --branch "sandbox-test-pi-model-error-$$" \
+    "$proj" "$handoff" 2>&1)"
+pi_err_rc=$?
+pi_err_rd="$(printf '%s\n' "$pi_err_out" | sed -n 's/^  run dir:  *//p' | head -1)"
+if [[ -n "$pi_err_rd" ]]; then
+    tmpdirs+=("$pi_err_rd")
+    check "the review leg saw no exit-code file yet when it started" \
+        "absent" "$(cat "$pi_err_marker")"
+    check "the review leg still ran and approved the branch" \
+        "approved" "$(jq -r '.ended' "$pi_err_rd/review-loop.json")"
+    check "the coding leg's model-error correction is recorded in the loop record" \
+        "1" "$(jq -r '.coding_exit_code' "$pi_err_rd/review-loop.json")"
+    check "the run's own exit code reflects the corrected rc" "1" "$pi_err_rc"
+    check "exit-code on disk agrees, published only after the loop ended" \
+        "1" "$(cat "$pi_err_rd/exit-code" 2>/dev/null)"
+else
+    no "the pi model-error scenario produced a run directory" \
+        "rc=$pi_err_rc: $pi_err_out"
+fi
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))

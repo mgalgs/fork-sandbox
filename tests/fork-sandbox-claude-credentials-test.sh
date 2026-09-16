@@ -262,23 +262,45 @@ else
     no "relative path: run_real produced a run directory" "$rel_out"
 fi
 
-printf '\n== the existence check is gated on this run actually using claude ==\n'
+printf '\n== the existence check on CLAUDE_CREDENTIALS is gated on this run\n   actually using claude; an explicit --claude-credentials is not ==\n'
 
-# A --harness pi run never reads a Claude credential, so a claude.env whose
-# CLAUDE_CREDENTIALS names a path that has since moved must not abort it --
-# only a claude leg (implement, review, maintainer, or either fix seat)
-# makes the path relevant enough to check for existence.
+# A --harness pi run never reads a Claude credential, so CLAUDE_CREDENTIALS
+# in claude.env -- a machine-wide default this run never asked for by name
+# -- naming a path that has since moved must not abort it. Only a claude
+# leg (implement, review, maintainer, or either fix seat) makes the path
+# relevant enough to check for existence.
 pi_cfg="$(mktemp -d)"; tmpdirs+=("$pi_cfg")
 install -m 600 /dev/null "$pi_cfg/pi.env"
 printf 'OPENROUTER_API_KEY=fake\n' > "$pi_cfg/pi.env"
-pi_rd="$(run_real "$pi_cfg" --harness pi --model moonshotai/kimi-k3 \
-    --claude-credentials "$missing_path")"
+printf 'CLAUDE_CREDENTIALS=%s\n' "$missing_path" > "$pi_cfg/claude.env"
+pi_rd="$(run_real "$pi_cfg" --harness pi --model moonshotai/kimi-k3)"
 if [[ -n "$pi_rd" ]]; then
     tmpdirs+=("$pi_rd")
-    ok "a --harness pi run is not refused by a nonexistent --claude-credentials path"
+    ok "a --harness pi run is not refused by claude.env naming a missing path"
 else
-    no "a --harness pi run is not refused by a nonexistent --claude-credentials path" \
+    no "a --harness pi run is not refused by claude.env naming a missing path" \
         "run_real failed"
+fi
+
+# An explicit --claude-credentials is different: the operator named that
+# file by hand, on this invocation, so it is checked unconditionally, the
+# same as --claude-args or --pi-args naming a CLI a run never starts fails
+# loud rather than being silently dropped. A --harness pi run that passes
+# the flag anyway is still refused.
+pi_flag_cfg="$(mktemp -d)"; tmpdirs+=("$pi_flag_cfg")
+install -m 600 /dev/null "$pi_flag_cfg/pi.env"
+printf 'OPENROUTER_API_KEY=fake\n' > "$pi_flag_cfg/pi.env"
+pi_flag_out="$(PATH="$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$pi_flag_cfg" \
+    FORK_SANDBOX_BACKEND=fake-image \
+    timeout 60 "$launcher" --foreground --harness pi --model moonshotai/kimi-k3 \
+    --claude-credentials "$missing_path" "$proj" "$handoff" 2>&1)"
+pi_flag_rc=$?
+if (( pi_flag_rc == 0 )); then
+    no "a --harness pi run is still refused by an explicit --claude-credentials naming a missing path" \
+        "$pi_flag_out"
+else
+    contains "a --harness pi run is still refused by an explicit --claude-credentials naming a missing path" \
+        "$missing_path" "$pi_flag_out"
 fi
 
 # The same nonexistent path still fails a --harness claude run (the

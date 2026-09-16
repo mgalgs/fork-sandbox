@@ -3980,19 +3980,32 @@ if [[ -n "$claude_credentials_resolved" ]]; then
     # before the clone, the branch and the tmux session are created, not
     # deep inside fs_read_claude_credential after all of that already exists.
     claude_credentials_resolved="$("$FS_REALPATH" -m "$claude_credentials_resolved")"
-    # Gated on whether any leg of THIS run reads a Claude credential at
-    # all -- the same "$harness/$review_harness/$maintainer_harness/
-    # $fix_harness/$mntfix_harness == claude" test used below for the
-    # inbox hook. Ungated, a claude.env naming a path that later moves
-    # aborts even a --harness pi run, which never reads a Claude
-    # credential in the first place -- the blast radius is every run on
-    # the machine, for a file only claude legs read.
-    if [[ "$harness" == "claude" || "$review_harness" == "claude" \
+    if [[ -n "$claude_credentials" ]]; then
+        # An explicit --claude-credentials is the operator naming a
+        # specific file by hand, the same as --claude-args or
+        # --claude-credentials --k8s above naming something this run
+        # cannot use -- fail loud rather than silently drop it, even on a
+        # --harness pi run that will never read it.
+        if [[ ! -f "$claude_credentials_resolved" ]]; then
+            echo "Error: --claude-credentials names '$claude_credentials_resolved'," >&2
+            echo "which does not exist." >&2
+            exit 1
+        fi
+    elif [[ "$harness" == "claude" || "$review_harness" == "claude" \
         || "$maintainer_harness" == "claude" || "$fix_harness" == "claude" \
         || "$mntfix_harness" == "claude" ]] \
         && [[ ! -f "$claude_credentials_resolved" ]]; then
-        echo "Error: --claude-credentials (or CLAUDE_CREDENTIALS in claude.env)" >&2
-        echo "names '$claude_credentials_resolved', which does not exist." >&2
+        # CLAUDE_CREDENTIALS in claude.env is a machine-wide default this
+        # run did not ask for by name, so gate it on whether any leg of
+        # THIS run reads a Claude credential at all -- the same
+        # "$harness/$review_harness/$maintainer_harness/$fix_harness/
+        # $mntfix_harness == claude" test used below for the inbox hook.
+        # Ungated, a claude.env naming a path that later moves aborts even
+        # a --harness pi run, which never reads a Claude credential in the
+        # first place -- the blast radius is every run on the machine, for
+        # a file only claude legs read.
+        echo "Error: CLAUDE_CREDENTIALS in claude.env names" >&2
+        echo "'$claude_credentials_resolved', which does not exist." >&2
         exit 1
     fi
 fi
@@ -6423,7 +6436,17 @@ if [[ -n "$pi_run_session_dir" && -d "$pi_run_session_dir" ]]; then
         # process's own code is the better diagnosis when it has one.
         if [[ "$rc" == "0" ]]; then
             rc=1
-            printf '%s\n' "$rc" > "$run_dir/exit-code"
+            # Same deferral as the write above: with a review loop, a
+            # maintainer loop, a pending refresh or repeat passes still to
+            # come, the run is not over, and exit-code must stay unwritten
+            # (or, if the gate above already wrote the stale rc=0, stay
+            # unwritten by this branch) until whichever of those legs is
+            # actually last updates it with the final $rc.
+            if [[ "$review_loop_cap" == "0" && "$refresh_enabled" == "0" \
+                && "${maintainer_loop_cap:-0}" == "0" \
+                && "${code_repeat:-1}" == "1" ]]; then
+                printf '%s\n' "$rc" > "$run_dir/exit-code"
+            fi
         fi
     fi
 
@@ -7177,7 +7200,8 @@ run_leg() {
 # that "looks finished". Passes stop early only on a harness error: a dead
 # run is not polished, it is dead. Each pass is an ordinary leg (its own
 # events-code-N.jsonl, its own accounting through run_leg), and rc ends as
-# the LAST pass's exit, which is what the review loop below gates on. A
+# the LAST pass's exit -- recorded below as coding_exit_code, but never
+# itself a reason the review loop skips (see the header comment above). A
 # pass does not context-refresh: the refresh loop above belongs to the
 # first pass alone.
 if [[ "${code_repeat:-1}" != "1" && "$mode" != "review-only" ]]; then
@@ -7244,15 +7268,11 @@ if [[ "$review_loop_cap" != "0" && -n "$review_prompt" ]]; then
             cat -- "$review_prompt"
             # The coding leg failed on something -- possibly after it
             # committed the very work under review. Told once, up front,
-            # rather than left for the reviewer to infer from a clean-looking
-            # diff and approve as if nothing had gone wrong.
+            # via fs_emit_coding_exit_note (fork-sandbox-lib.sh), rather than
+            # left for the reviewer to infer from a clean-looking diff and
+            # approve as if nothing had gone wrong.
             if [[ -n "$review_loop_coding_rc" && "$review_loop_coding_rc" != "0" ]]; then
-                printf '\n---\n\n## The coding session exited non-zero\n\n'
-                printf 'The session that produced the commits under review exited with\n'
-                printf 'status %s. Its work may be incomplete or partially applied -- read\n' \
-                    "$review_loop_coding_rc"
-                printf 'the branch and flag anything that looks unfinished as a finding,\n'
-                printf 'the same as any other defect.\n'
+                fs_emit_coding_exit_note "$review_loop_coding_rc"
             fi
             rp_addenda_list="$(fs_addenda_dirs)"
             if [[ -n "$rp_addenda_list" ]]; then
@@ -7627,15 +7647,11 @@ if [[ "${maintainer_loop_cap:-0}" != "0" && -n "${maintainer_prompt:-}" ]]; then
         {
             cat -- "$maintainer_prompt"
             # The coding leg failed on something -- possibly after it
-            # committed the very work under review. Told once, up front, the
-            # same as the review loop's own copy of this note.
+            # committed the very work under review. Told once, up front, via
+            # fs_emit_coding_exit_note (fork-sandbox-lib.sh), the same as the
+            # review loop's own copy of this note.
             if [[ -n "$maintainer_loop_coding_rc" && "$maintainer_loop_coding_rc" != "0" ]]; then
-                printf '\n---\n\n## The coding session exited non-zero\n\n'
-                printf 'The session that produced the commits under review exited with\n'
-                printf 'status %s. Its work may be incomplete or partially applied -- read\n' \
-                    "$maintainer_loop_coding_rc"
-                printf 'the branch and flag anything that looks unfinished as a finding,\n'
-                printf 'the same as any other defect.\n'
+                fs_emit_coding_exit_note "$maintainer_loop_coding_rc"
             fi
             mp_addenda_list="$(fs_addenda_dirs)"
             if [[ -n "$mp_addenda_list" ]]; then
