@@ -578,7 +578,8 @@ described below are mounted. The log is written by the host shell.
 | `<run-dir>/mail-delivered/leg-<N>/` (non-`--k8s` only) | `fork-sandbox-postmaster.sh`'s live-delivered mail banners for leg `N`, moved out of the inbox the same way and at the same moment as an addendum, but kept in a separate directory: a banner is new thread mail from the postmaster, not an operator instruction, and unlike `inbox-delivered/` this directory is never read back as an addendum by `fs_addenda_dirs`/`refresh_build_prompt` or the review/maintainer loops' own copies of that logic |
 | `<run-dir>/exit-code` | written when the session exits |
 | `<run-dir>/pi-session` | `--harness pi` only: pi's session, with per-message cost |
-| `<run-dir>/codex-sessions` | local Codex legs only: Codex rollout logs, persisted so host-side quota readers can see rate-limit snapshots; contains session transcripts and shares the run directory's lifecycle |
+| `<run-dir>/codex-sessions` | local Codex legs only: Codex rollout logs; contains session transcripts and shares the run directory's lifecycle, while its rate-limit snapshots are extracted at run end |
+| `~/.claude/codex-quota/<run-id>.jsonl` | durable host-side archive of the first and last rate-limit snapshot from each Codex rollout leg |
 | `<run-dir>/clone/<name>` | the writable throwaway clone where the task runs |
 
 ## What it gives up

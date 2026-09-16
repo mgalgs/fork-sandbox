@@ -4565,9 +4565,10 @@ fs_reject_unsafe_chars "$outbox_dir"
 
 # Codex writes account quota snapshots only to its private rollout logs; its
 # --json stdout carries token counts but omits rate limits. Preserve the
-# narrow sessions subtree in this run's own record so a host-side reader can
-# observe those snapshots while the run is live. Never bind the user's real
-# ~/.codex: it also holds the credential and unrelated interactive history.
+# narrow sessions subtree for the host-side run-end archival reader, which
+# retains rate-limit snapshots in ~/.claude/codex-quota after this run
+# directory is deleted. Never bind the user's real ~/.codex: it also holds
+# the credential and unrelated interactive history.
 codex_sessions_dir=""
 for leg_harness in "$harness" "$review_harness" "$maintainer_harness" \
                    "$fix_harness" "$mntfix_harness"; do
