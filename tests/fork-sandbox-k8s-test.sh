@@ -281,9 +281,10 @@
 #     branch, origin_repo, base_sha and exit_code/commits as known at
 #     collect, and never a cost_usd/total_cost_usd/usage key (omitted, not
 #     zero) -- and calls sandbox-run-log.py record, verified by re-running
-#     record against a scratch HOME (this file's own
-#     FORK_SANDBOX_RUN_SOURCE=test tag keeps every fixture run's real
-#     append out of the operator's own stats). collect without --run-dir
+#     record against a scratch HOME. Fixture calls themselves use this
+#     suite's isolated HOME, which cleanup removes, while their
+#     FORK_SANDBOX_RUN_SOURCE=test tag exercises provenance filtering.
+#     collect without --run-dir
 #     still writes and records nothing, even when a run directory for the
 #     branch exists on disk, and a missing sandbox-run-log.py does not
 #     fail collect. `run` threads --run-dir from its own submit phase to
@@ -303,14 +304,11 @@ export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
 
 repo_dir="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 
-# Every run this suite launches is a fixture, not real work. Mark it so
-# sandbox-run-log.py's list/stats exclude it by default: every real (non
-# --dry-run) submit this suite drives now appends a row to the operator's
-# own ~/.claude/sandbox-runs.jsonl (see cmd_submit/cmd_collect's own "the
-# durable run log" work) the same way tests/fork-sandbox-maintainer-test.sh
-# already lets its own real local-path runs append for real -- this tag is
-# what keeps either kind of fixture run out of the operator's performance
-# stats without needing a scratch HOME.
+# Every run this suite launches is a fixture, not real work. Mark its row so
+# sandbox-run-log.py's list/stats exclude it by default. Fixture commands
+# that record use the isolated k8s_test_home below, which cleanup removes;
+# the tag remains a provenance/filtering assertion rather than protection for
+# the operator's durable log.
 export FORK_SANDBOX_RUN_SOURCE=test
 
 pass=0; fail=0; tmpdirs=()
@@ -5455,10 +5453,9 @@ collect_undecidable_rd="$(mktemp -d /var/tmp/claude-scratch/forks/claude-fork-sa
 } > "$collect_undecidable_rd/run.env"
 # This run dir is built by hand, not via cmd_submit, so it never picked up
 # the FORK_SANDBOX_RUN_SOURCE=test tag submit writes to run-source (see the
-# sweep-ownership section above). The collect below drives a REAL record
-# call against this process's own $HOME -- collectstub_collect sets no
-# scratch HOME -- so without this marker the row lands with source:
-# "fork-sandbox", indistinguishable from real operator work.
+# sweep-ownership section above). The collect below records through the
+# fixture's isolated HOME; add the marker so the row still proves the suite's
+# source=test provenance invariant.
 printf 'test\n' > "$collect_undecidable_rd/run-source"
 collect_log22="$(newdir)/kubectl.log"; collect_out22="$(newdir)/out22.txt"; collect_dest22="$(newdir)/outbox-22"
 tmpdirs+=("$(dirname "$collect_log22")" "$(dirname "$collect_dest22")")
@@ -9315,19 +9312,11 @@ refuses "--k8s --task-meta with invalid JSON is still refused (by cmd_submit, fo
     --task-meta 'not json' \
     "$k8s_flag_proj" "$k8s_flag_handoff"
 
-printf '\n== the durable run log: every row this suite appends carries source=test ==\n'
-# This suite's header (above) states appending source: "test" rows is
-# deliberate, and that list/stats exclude them by default -- an invariant
-# nothing enforced until now (see the fs-k8s-test-collect-commits-
-# undecidable fixture's own run-source comment, earlier in this file, for
-# the one fixture that once violated it). Reads only the lines appended
-# since the snapshot taken near the top of this file, so a real operator
-# row already in the log is never touched or asserted against. A real
-# fork-sandbox.sh run started concurrently under this same $HOME would
-# also append a non-test row in this window and be flagged here as a false
-# positive -- same caveat the exit-sweep ownership check above already
-# lives with -- not something a single-host test run needs to guard
-# against further.
+printf '\n== the fixture run log: every row this suite appends carries source=test ==\n'
+# This suite's header (above) states that source: "test" is deliberate and
+# excluded from list/stats by default. Assert that provenance behavior in the
+# isolated fixture log; its disposable HOME prevents any operator row from
+# sharing this window.
 k8s_test_runlog_bad_sources=""
 if [[ -f "$k8s_test_runlog" ]]; then
     while IFS= read -r k8s_test_runlog_line; do
@@ -9338,7 +9327,7 @@ if [[ -f "$k8s_test_runlog" ]]; then
         fi
     done < <(tail -n +"$(( k8s_test_runlog_before_lines + 1 ))" "$k8s_test_runlog")
 fi
-check "every row this suite appended to the real run log carries source=test" \
+check "every row this suite appended to the fixture run log carries source=test" \
     "" "$k8s_test_runlog_bad_sources"
 
 printf '\n== fixture runs leave no handoff archives in the operator home ==\n'

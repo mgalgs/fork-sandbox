@@ -455,21 +455,20 @@ takes: `mktemp -d` under the same
   it is folded into a row that did not exist. It no longer is --
   `fork-sandbox.sh --k8s` forwards it unchanged to `fork-sandbox-k8s.sh
   run`, which threads it to `submit`.
-- `handoff.md` -- the rendered prompt, captured **at submit time**: the
-  prompt `record` hashes and archives, matching the local run-log contract.
-  It is not read again later, so the caller may edit or remove the original
-  while the run is in flight.
+- `handoff.md` -- the pre-YAML rendered prompt, captured **at submit time**:
+  the prompt `record` hashes and archives, matching the local run-log
+  contract. The ConfigMap's YAML clip chomping can normalize multiple
+  terminal newlines before the pod receives the prompt. It is not read again
+  later, so the caller may edit or remove the original while the run is in
+  flight.
 - `handoff-original.md` -- the operator's raw handoff file, also captured at
   submit time. It preserves the original brief separately from the rendered
   prompt in `handoff.md`.
 - `run-source` -- written only when `FORK_SANDBOX_RUN_SOURCE` is set in
-  the launching shell, exactly like the local path's own marker. This is
-  how this project's own `--k8s` test suite keeps its stubbed-kubectl
-  fixture runs out of the operator's performance stats without needing a
-  scratch `HOME`: it tags every fixture run `source=test` and lets
-  `record` append for real, the same convention
-  `fork-sandbox-maintainer-test.sh` already uses for its own real,
-  local-path runs.
+  the launching shell, exactly like the local path's own marker. The
+  project's `--k8s` suite directs fixture `record` calls to an isolated
+  `HOME`, which cleanup deletes; it still tags those rows `source=test` to
+  exercise the same provenance filtering as the local-path test suite.
 
 `submit` prints the directory's path on a line shaped exactly like the
 local launcher's own (`  run dir:  <path>`), as soon as the directory
