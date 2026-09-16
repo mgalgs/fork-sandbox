@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run claude in a sandbox, provisioned with a throwaway copy of its credential.
 #
-# Usage: claude-sandboxed [--unpin-egress | --seal-egress] [--bind-ro PATH]... [--bind-rw PATH]... [--bind-ro-at SRC DEST]... [--bind-rw-at SRC DEST]... [--prepend-path DIR]... [--session-state DIR] [--resume-session ID] [--env-file FILE] [--exec] [work-dir] [claude-args... | CMD ARG...]
+# Usage: claude-sandboxed [--unpin-egress | --seal-egress] [--bind-ro PATH]... [--bind-rw PATH]... [--bind-ro-at SRC DEST]... [--bind-rw-at SRC DEST]... [--prepend-path DIR]... [--session-state DIR] [--resume-session ID] [--claude-credentials PATH] [--env-file FILE] [--exec] [work-dir] [claude-args... | CMD ARG...]
 #
 # This is the Claude client of the sandbox backend. The isolation itself —
 # the mount allowlist, the network namespace, the egress pin, the seal — is
@@ -84,6 +84,14 @@
 # /usr needs its own --bind-ro, /usr being mounted already; under
 # toolchain=image the /usr inside is the image's, so a host command needs to
 # be in the image rather than bound.
+#
+# --claude-credentials PATH reads that file instead of
+# $HOME/.claude/.credentials.json (or, on macOS, the login Keychain) for the
+# access token this sandbox gets. Only without --exec -- an --exec sandbox
+# reads no Claude credential of any kind, per the CLAUDE_CRED_JSON comment
+# further down. fork-sandbox.sh passes this through from its own same-named flag
+# or from CLAUDE_CREDENTIALS in claude.env; a caller of this script
+# directly can pass it too.
 #
 # --env-file adds environment variables to that command, one NAME=VALUE
 # per line, and only with --exec. It exists for a harness that needs an
@@ -210,6 +218,7 @@ EXEC_MODE=0
 ENV_FILE=""
 SESSION_STATE=""
 RESUME_SESSION=""
+CLAUDE_CREDENTIALS=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --unpin-egress|--allow-tunnels) UNPIN_EGRESS=1; shift ;;
@@ -217,6 +226,10 @@ while [[ $# -gt 0 ]]; do
         --exec) EXEC_MODE=1; shift ;;
         --env-file)
             ENV_FILE="${2:?--env-file requires a path}"
+            shift 2
+            ;;
+        --claude-credentials)
+            CLAUDE_CREDENTIALS="${2:?--claude-credentials requires a path}"
             shift 2
             ;;
         --bind-ro)
@@ -275,6 +288,15 @@ elif [[ -n "$ENV_FILE" ]]; then
     echo "Error: --env-file works only with --exec. A claude session gets no" >&2
     echo "API keys on purpose, so this script carries none into one." >&2
     exit 1
+fi
+if (( EXEC_MODE )) && [[ -n "$CLAUDE_CREDENTIALS" ]]; then
+    echo "Error: --claude-credentials works only without --exec. --exec runs" >&2
+    echo "another program in the sandbox, and no Claude credential of any" >&2
+    echo "kind enters one -- see the comment above CLAUDE_CRED_JSON below." >&2
+    exit 1
+fi
+if [[ -n "$CLAUDE_CREDENTIALS" ]]; then
+    fs_reject_unsafe_chars "$CLAUDE_CREDENTIALS"
 fi
 
 # --session-state and --resume-session name the claude CLI's transcript store
@@ -406,7 +428,7 @@ if (( ! EXEC_MODE )); then
     # launch rather than somewhere inside an unattended run. The value lives in
     # a variable from here on and is piped with printf, a builtin, so it never
     # appears in an argv that /proc or `ps` would publish.
-    CLAUDE_CRED_JSON="$(fs_read_claude_credential)" || exit 1
+    CLAUDE_CRED_JSON="$(fs_read_claude_credential "$CLAUDE_CREDENTIALS")" || exit 1
 
     # Resolve the claude binary on the host and run it by absolute path.
     # ~/.local/bin is often absent from a non-interactive PATH, so relying on
@@ -433,7 +455,7 @@ if (( ! EXEC_MODE )); then
     EXPIRES_AT_MS=$(printf '%s' "$CLAUDE_CRED_JSON" | jq -r '.claudeAiOauth.expiresAt // 0')
     MINS_LEFT=$(( EXPIRES_AT_MS / 60000 - $(date +%s) / 60 ))
     if (( MINS_LEFT <= 0 )); then
-        echo "Error: the access token in $(fs_claude_credential_source) has expired." >&2
+        echo "Error: the access token in $(fs_claude_credential_source "$CLAUDE_CREDENTIALS") has expired." >&2
         echo "Log in with claude on the host, then retry." >&2
         exit 1
     elif (( MINS_LEFT < 60 )); then

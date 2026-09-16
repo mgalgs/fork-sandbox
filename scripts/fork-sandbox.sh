@@ -163,6 +163,14 @@
 #                        Only --unpin-egress is accepted. Refused outright
 #                        with --network sealed, which has no egress to
 #                        unpin.
+# --claude-credentials <path>:
+#                        read this file instead of
+#                        $HOME/.claude/.credentials.json (or, on macOS, the
+#                        login Keychain) for a --harness claude leg. Beats
+#                        CLAUDE_CREDENTIALS in claude.env when both are
+#                        set. Refused with --k8s -- set CLAUDE_CREDENTIALS
+#                        in claude.env instead, which fork-sandbox-k8s.sh
+#                        also reads directly.
 # --context-ro <dir>:    bind <dir> read-only into the sandbox as gathered
 #                        context. The directory must live under
 #                        /var/tmp/claude-scratch/forks/ — a staging path a
@@ -1400,6 +1408,7 @@ fixtures_dir=""
 session_state=""
 resume_session=""
 session_id_arg=""
+claude_credentials=""
 clone_dir_flag=""
 review_loop_arg=""
 review_loop_cap=0
@@ -1533,6 +1542,10 @@ while [[ "${1:-}" == -* ]]; do
             ;;
         --clone-dir)
             clone_dir_flag="${2:?--clone-dir requires a directory}"
+            shift 2
+            ;;
+        --claude-credentials)
+            claude_credentials="${2:?--claude-credentials requires a path}"
             shift 2
             ;;
         --review-loop)
@@ -2531,6 +2544,12 @@ if [[ "$k8s_mode" == true ]]; then
     if [[ -n "$session_id_arg" ]]; then
         echo "Error: --session-id is not supported with --k8s. It needs" >&2
         echo "--session-state, which a cluster run cannot have." >&2
+        exit 1
+    fi
+    if [[ -n "$claude_credentials" ]]; then
+        echo "Error: --claude-credentials is not supported with --k8s. Set" >&2
+        echo "CLAUDE_CREDENTIALS in $config_dir/claude.env instead --" >&2
+        echo "fork-sandbox-k8s.sh reads that config key directly." >&2
         exit 1
     fi
     if [[ -n "$clone_dir_flag" ]]; then
@@ -3929,13 +3948,15 @@ codex)
     fs_reject_unsafe_chars "$harness_bin" "$harness_version"
 }
 
-# Which Claude credential a claude leg reads: CLAUDE_CREDENTIALS in
-# claude.env, when set, else today's default ($HOME/.claude/.credentials.json,
-# falling back to the Keychain on macOS). One process-wide fact, not scoped
-# per leg -- there is no case where review or maintainer should authenticate
-# as a different account than implement, so this resolves once rather than
-# through fs_resolve_harness's per-prefix namerefs.
-claude_credentials_resolved="$(fs_read_env_value "$config_dir/claude.env" CLAUDE_CREDENTIALS || true)"
+# Which Claude credential a claude leg reads: --claude-credentials, else
+# CLAUDE_CREDENTIALS in claude.env, else today's default
+# ($HOME/.claude/.credentials.json, falling back to the Keychain on macOS).
+# One process-wide fact, not scoped per leg -- there is no case where review
+# or maintainer should authenticate as a different account than implement,
+# so this resolves once rather than through fs_resolve_harness's per-prefix
+# namerefs.
+claude_credentials_config="$(fs_read_env_value "$config_dir/claude.env" CLAUDE_CREDENTIALS || true)"
+claude_credentials_resolved="${claude_credentials:-$claude_credentials_config}"
 if [[ -n "$claude_credentials_resolved" ]]; then
     fs_reject_unsafe_chars "$claude_credentials_resolved"
 fi
