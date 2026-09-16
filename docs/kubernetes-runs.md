@@ -115,7 +115,7 @@ and then the `rm`. `run` never reaches this case, since it waits while the
 run executes.
 
 `collect --branch NAME [--outbox-dir DIR] [--outbox-max SIZE]
-[--review-loop N] [--keep] <project-path>` does everything `run` does
+[--review-loop N] [--keep] [--run-dir DIR] <project-path>` does everything `run` does
 after the wait: the review-loop outcome read (only when `--review-loop N`
 is given and non-zero — an omitted or zero flag reads nothing at all),
 the evidence pull-back, the outbox pull-back, the `fetch`, and the final

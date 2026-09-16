@@ -4186,6 +4186,18 @@ else
         no "oversized context is refused before kubectl apply" "log=$(cat "$cr_order_log") out=$(cat /tmp/fs-k8s-test-cr-big.out)"
     fi
 fi
+# This failure is strictly host-side -- no kubectl apply ever ran, so no
+# cluster object exists for an orchestrator or an operator's `rm --branch`
+# to find -- so the run directory submit had already created and printed
+# above must not survive it either, or it leaks forever with nothing able
+# to join to it.
+cr_order_rd="$(sed -n 's/^  run dir:  *//p' /tmp/fs-k8s-test-cr-big.out | head -1)"
+if [[ -n "$cr_order_rd" ]] && [[ ! -e "$cr_order_rd" ]]; then
+    ok "an over-cap context also removes the run dir it never got to use"
+else
+    no "an over-cap context also removes the run dir it never got to use" \
+        "run_dir=$cr_order_rd $([[ -e "$cr_order_rd" ]] && echo STILL_PRESENT)"
+fi
 rm -f /tmp/fs-k8s-test-cr-big.out
 
 # A context exec failure must remove the already-sized host archive. The git
@@ -4392,6 +4404,57 @@ if [[ -n "$runstub_rd1" && -f "$runstub_rd1/summary.json" ]] \
 else
     no "run threads --run-dir: submit's run dir carries a summary.json after run" \
         "run_dir=$runstub_rd1 $([[ -n "$runstub_rd1" ]] && cat "$runstub_rd1/summary.json" 2>/dev/null; echo NOFILE)"
+fi
+
+# 1c. cmd_run's OTHER call to sandbox-run-log.py record -- the wait-failure
+# branch, reached when cmd_wait fails before the agent's sentinel ever
+# appears -- is never exercised by the wait-verb tests above (every one of
+# those drives cmd_wait directly, never through cmd_run, so none of them
+# ever reach this second call site). This drives `run` for real, with the
+# pod's sentinel read failing and its phase Failed (a genuinely dead pod --
+# the terminal case this branch means to cover), $HOME pointed at a
+# scratch directory, and the repo's own scripts/ on PATH so the real
+# sandbox-run-log.py is what runs, then reads the row back from that real,
+# unmodified $HOME/.claude/sandbox-runs.jsonl -- not a second, separate
+# invocation of record() the way the checks above do.
+reallog2_home="$(newdir)"; tmpdirs+=("$reallog2_home")
+reallog2_log="$(newdir)/kubectl.log"; reallog2_out="$(newdir)/out.txt"
+tmpdirs+=("$(dirname "$reallog2_log")" "$(dirname "$reallog2_out")")
+rc=0
+HOME="$reallog2_home" PATH="$repo_dir/scripts:$PATH" \
+    K8S_STUB_RUN_COMPLETE_RC=1 K8S_STUB_POD_PHASE=Failed \
+    runstub_run "$reallog2_log" "$reallog2_out" \
+    --branch fs-k8s-test-run-waitfail-deadpod --model moonshotai/kimi-k3 \
+    "$proj_dir" "$handoff_file" || rc=$?
+reallog2_line="$(tail -1 "$reallog2_home/.claude/sandbox-runs.jsonl" 2>/dev/null)"
+if (( rc == 2 )) && [[ -n "$reallog2_line" ]] \
+    && [[ "$(jq -r '.branch' <<< "$reallog2_line")" == "fs-k8s-test-run-waitfail-deadpod" ]] \
+    && [[ "$(jq -r '.summary_missing' <<< "$reallog2_line")" == "true" ]]; then
+    ok "cmd_run's wait-failure path really records a row for a dead pod (terminal, exit 2)"
+else
+    no "cmd_run's wait-failure path really records a row for a dead pod (terminal, exit 2)" \
+        "rc=$rc line=$reallog2_line out=$(cat "$reallog2_out")"
+fi
+
+# The flip side of that same fix: a TIMEOUT (exit 1) is not terminal --
+# cmd_wait's own message says the pod is still running, holding its work
+# -- so this call site must NOT record a row for it. A premature run_end
+# while the run is still going would be a false record that nothing later
+# ever supersedes (the by-hand fetch/rm advice passes no --run-dir).
+reallog3_home="$(newdir)"; tmpdirs+=("$reallog3_home")
+reallog3_log="$(newdir)/kubectl.log"; reallog3_out="$(newdir)/out.txt"
+tmpdirs+=("$(dirname "$reallog3_log")" "$(dirname "$reallog3_out")")
+rc=0
+HOME="$reallog3_home" PATH="$repo_dir/scripts:$PATH" \
+    K8S_STUB_RUN_COMPLETE_RC=1 \
+    runstub_run "$reallog3_log" "$reallog3_out" \
+    --branch fs-k8s-test-run-waitfail-timeout --model moonshotai/kimi-k3 --timeout 0 \
+    "$proj_dir" "$handoff_file" || rc=$?
+if (( rc == 1 )) && [[ ! -f "$reallog3_home/.claude/sandbox-runs.jsonl" ]]; then
+    ok "cmd_run's wait-failure path records nothing for a timeout (not terminal, exit 1)"
+else
+    no "cmd_run's wait-failure path records nothing for a timeout (not terminal, exit 1)" \
+        "rc=$rc log=$(cat "$reallog3_home/.claude/sandbox-runs.jsonl" 2>/dev/null) out=$(cat "$reallog3_out")"
 fi
 
 # 2. A failed read with NOTHING on stderr is reported as silent, not as an
@@ -4782,7 +4845,14 @@ case " $* " in
         printf '%s\n' "$spec" ;;
     *" /work/repo.git rev-parse "*)
         # The pushed base sha, read by the zero-harvest check on every
-        # collect (first and re-collect alike).
+        # collect (first and re-collect alike). K8S_STUB_BASE_SHA_RC
+        # simulates the bounded kubectl exec itself failing -- the base is
+        # unreadable -- independently of whatever K8S_STUB_BASE_SHA holds,
+        # which the fetch emulation above still uses to build its own
+        # tip.
+        if [[ -n "${K8S_STUB_BASE_SHA_RC:-}" ]]; then
+            exit "$K8S_STUB_BASE_SHA_RC"
+        fi
         printf '%s\n' "${K8S_STUB_BASE_SHA:-}"
         exit 0 ;;
     *" cat /work/review-loop.json "*)
@@ -5344,6 +5414,43 @@ if (( rc == 3 )) \
 else
     no "a re-collect of a dead run (local ref at the base) is still a zero-harvest" \
         "rc=$rc log=$(grep delete "$collect_log21") out=$(cat "$collect_out21")"
+fi
+
+# 22. A re-collect whose pushed base is unreadable (a bounded kubectl exec
+# failure), but whose fetch still lands a new commit past the local ref's
+# pre-existing tip: the zero-harvest check is decided by the before/after
+# compare alone (not a zero-harvest -- the run produced work), but the
+# exact commit COUNT written to summary.json cannot be: there is no base
+# to rev-list against. commits must be null (not measured), never 0 --
+# 0 would tell a reader this run produced no commits, when it produced
+# some unknown positive number of them.
+collect_undecidable_branch=fs-k8s-test-collect-commits-undecidable
+git -C "$proj_dir" update-ref "refs/heads/$collect_undecidable_branch" "$(git -C "$proj_dir" rev-parse HEAD)"
+collect_undecidable_rd="$(mktemp -d /var/tmp/claude-scratch/forks/claude-fork-sandbox.XXXXXX)"; tmpdirs+=("$collect_undecidable_rd")
+{
+    printf 'mode=run\n'
+    printf 'harness=pi\n'
+    printf 'model=moonshotai/kimi-k3\n'
+} > "$collect_undecidable_rd/run.env"
+collect_log22="$(newdir)/kubectl.log"; collect_out22="$(newdir)/out22.txt"; collect_dest22="$(newdir)/outbox-22"
+tmpdirs+=("$(dirname "$collect_log22")" "$(dirname "$collect_dest22")")
+if K8S_STUB_RUN_COMPLETE=0 K8S_STUB_BASE_SHA_RC=1 K8S_STUB_FETCH_REF="$collect_undecidable_branch" \
+    K8S_STUB_OUTBOX_DIR="$collect_outbox11" K8S_STUB_OUTBOX_RC=0 \
+    collectstub_collect "$collect_log22" "$collect_out22" \
+    --branch "$collect_undecidable_branch" --outbox-dir "$collect_dest22" \
+    --run-dir "$collect_undecidable_rd" "$proj_dir"; then
+    if ! grep -q 'SUSPICIOUS' "$collect_out22" \
+        && [[ -f "$collect_undecidable_rd/summary.json" ]] \
+        && [[ "$(jq -r '.base_sha' "$collect_undecidable_rd/summary.json")" == null ]] \
+        && [[ "$(jq -r '.commits' "$collect_undecidable_rd/summary.json")" == null ]]; then
+        ok "an unreadable base with new commits fetched writes commits: null, not 0"
+    else
+        no "an unreadable base with new commits fetched writes commits: null, not 0" \
+            "summary=$(cat "$collect_undecidable_rd/summary.json" 2>/dev/null; echo NOFILE) out=$(cat "$collect_out22")"
+    fi
+else
+    no "an unreadable base with new commits fetched writes commits: null, not 0" \
+        "collect exited nonzero: $(cat "$collect_out22")"
 fi
 
 printf '\n== fork-sandbox-k8s.sh say: argument validation (no cluster) ==\n'
@@ -8979,6 +9086,51 @@ if [[ -n "$rundir_rd" && -d "$rundir_rd" ]]; then
         "false" "$(jq 'has("cost_usd")' <<< "$rundir_log_line")"
     check "the recorded row never carries a usage key" \
         "false" "$(jq 'has("usage")' <<< "$rundir_log_line")"
+fi
+
+# The assertions above re-invoke sandbox-run-log.py record BY HAND, against
+# a scratch HOME, to check record()'s own behavior without touching this
+# machine's real ~/.claude/sandbox-runs.jsonl -- but that never proves
+# cmd_collect's OWN call to the real binary (scripts/fork-sandbox-k8s.sh's
+# "$run_log_bin" record --run-dir "$run_dir" line) actually runs: a test
+# suite that only ever calls record() itself would stay green even if that
+# line in cmd_collect were deleted. This drives a real submit+collect with
+# $HOME pointed at a scratch directory and the repo's own scripts/ directory
+# on PATH (so `command -v sandbox-run-log.py` finds the real script, not
+# nothing, unlike the missing-binary test below), and reads the row back
+# from THAT run's real, unmodified $HOME/.claude/sandbox-runs.jsonl.
+printf '\n== cmd_collect really invokes sandbox-run-log.py record, not just record() itself ==\n'
+reallog_home="$(newdir)"; tmpdirs+=("$reallog_home")
+reallog_submit_out="$(newdir)/submit-out.txt"; tmpdirs+=("$(dirname "$reallog_submit_out")")
+HOME="$reallog_home" PATH="$runstub_dir:$PATH" \
+    K8S_STUB_BASE_SHA="$rundir_head_sha" \
+    FORK_SANDBOX_CONFIG_DIR="$config_dir" \
+    "$k8s_sh" submit --branch fs-k8s-test-rundir-reallog --model moonshotai/kimi-k3 \
+    "$proj_dir" "$handoff_file" > "$reallog_submit_out" 2>&1
+reallog_rd="$(sed -n 's/^  run dir:  *//p' "$reallog_submit_out" | head -1)"
+if [[ -n "$reallog_rd" && -d "$reallog_rd" ]]; then
+    tmpdirs+=("$reallog_rd")
+    reallog_collect_out="$(newdir)/collect-out.txt"; tmpdirs+=("$(dirname "$reallog_collect_out")")
+    reallog_outbox="$(newdir)/outbox"; tmpdirs+=("$(dirname "$reallog_outbox")")
+    HOME="$reallog_home" PATH="$repo_dir/scripts:$runstub_dir:$PATH" \
+        K8S_STUB_BASE_SHA="$rundir_head_sha" \
+        K8S_STUB_OUTBOX_DIR="$runstub_pod_outbox" \
+        FORK_SANDBOX_CONFIG_DIR="$config_dir" \
+        "$k8s_sh" collect --branch fs-k8s-test-rundir-reallog --run-dir "$reallog_rd" \
+        --outbox-dir "$reallog_outbox" \
+        "$proj_dir" > "$reallog_collect_out" 2>&1
+    reallog_collect_rc=$?
+    reallog_log_line="$(tail -1 "$reallog_home/.claude/sandbox-runs.jsonl" 2>/dev/null)"
+    if (( reallog_collect_rc == 0 )) && [[ -n "$reallog_log_line" ]] \
+        && [[ "$(jq -r '.branch' <<< "$reallog_log_line")" == "fs-k8s-test-rundir-reallog" ]]; then
+        ok "cmd_collect's own record call really appends a row under \$HOME/.claude"
+    else
+        no "cmd_collect's own record call really appends a row under \$HOME/.claude" \
+            "rc=$reallog_collect_rc line=$reallog_log_line out=$(cat "$reallog_collect_out")"
+    fi
+else
+    no "cmd_collect's own record call really appends a row under \$HOME/.claude" \
+        "submit did not produce a run dir: $(cat "$reallog_submit_out")"
 fi
 
 # collect without --run-dir must behave exactly as before this feature --

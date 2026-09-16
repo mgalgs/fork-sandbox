@@ -3556,23 +3556,54 @@ EOF
     # cluster object exists, so it is populated with what submit already
     # knows regardless of whether the cluster calls below succeed.
     #
-    # Never removed by this script: unlike every other per-run resource
-    # cmd_collect or its EXIT trap cleans up, this directory is the join
-    # key an orchestrator later attaches a verdict to (`sandbox-run-log.py
-    # verdict <run-id>`, the directory's basename), and it is what
-    # cmd_collect's own record call reads -- removing it here would defeat
-    # the whole point. It is removed by the orchestrator after review,
-    # exactly like a local run's own run directory.
+    # Not removed by this script once a cluster object for this run may
+    # exist: this directory is the join key an orchestrator later attaches
+    # a verdict to (`sandbox-run-log.py verdict <run-id>`, the directory's
+    # basename), and it is what cmd_collect's own record call reads --
+    # removing it then would defeat the whole point. It is removed by the
+    # orchestrator after review, exactly like a local run's own run
+    # directory. Before that point -- while a failure can still only be
+    # host-side, with nothing yet in the cluster to join this directory to
+    # -- it IS removed on failure, by the trap set right after it is
+    # created below; see that trap's own comment.
+    # A script cannot assume the hook ran: fork-sandbox.sh's own root
+    # mkdir (its own comment says as much) sits AFTER the --k8s dispatch's
+    # exec, which replaces this process before that line ever runs, and a
+    # cron/CI driver or a fresh box calling this script directly never
+    # reaches fork-sandbox.sh's mkdir at all. Without this, the mktemp
+    # below dies on a missing parent, under set -euo pipefail, after every
+    # validation above has already passed.
+    mkdir -p /var/tmp/claude-scratch/forks
     local run_dir
     run_dir="$(mktemp -d /var/tmp/claude-scratch/forks/claude-fork-sandbox.XXXXXX)"
     fs_reject_unsafe_chars "$run_dir"
 
+    # Removed on any failure between here and the first cluster object,
+    # mirroring fork-sandbox.sh's own local launcher, which removes ITS
+    # run dir when fs_make_clone fails so a bad branch name does not leave
+    # an empty directory behind. A submit that dies validating something
+    # host-side (the context archive's size cap below, a spool failure)
+    # never reaches the cluster at all -- no Job, no Secret, nothing for
+    # "the orchestrator after review" or an operator's `rm --branch` to
+    # find -- so the join key this directory exists to be has nothing to
+    # join to, and would otherwise leak forever. Disarmed just before the
+    # first kubectl create/apply below: from that point on, a cluster
+    # object may already exist, and this directory is what cmd_collect's
+    # own record call needs to read back, exactly like every run that
+    # does reach the cluster.
+    trap 'rm -rf -- "$run_dir"' EXIT
+
     # Printed as soon as the directory exists, not only once submit
-    # finishes: a submit that dies below (context spool, repository push,
-    # any kubectl create) still leaves this directory on disk, populated
-    # with whatever submit had established by then, and with nothing
-    # printed there would be no way for an orchestrator -- or an operator
-    # cleaning up by hand -- to learn it exists at all. Same line shape
+    # finishes: a submit that dies below at the repository push or any
+    # kubectl create still leaves this directory on disk, populated with
+    # whatever submit had established by then, and with nothing printed
+    # there would be no way for an orchestrator -- or an operator cleaning
+    # up by hand -- to learn it exists at all. (A death during the context
+    # spool just above the cluster work, by contrast, takes this directory
+    # with it -- see the trap set right after this directory was created
+    # -- but this line still ran first, so that failure is attributable
+    # too, even though there is no longer anything on disk to point at.)
+    # Same line shape
     # fork-sandbox.sh's own local launcher prints (two leading spaces,
     # "run dir:", two spaces), so a caller fanning out -- this project's
     # own test suites, or an external panel launcher calling
@@ -3639,7 +3670,12 @@ EOF
     if [[ -n "$context_ro" ]]; then
         context_tar="$(mktemp)"
         K8S_SUBMIT_CONTEXT_TAR="$context_tar"
-        trap 'rm -f -- "${K8S_SUBMIT_CONTEXT_TAR:-}"' EXIT
+        # Replaces (does not stack with) the run-dir-only trap set right
+        # after run_dir was created -- bash keeps only the latest EXIT
+        # trap -- so this one covers both: a tar/stat failure or an
+        # over-cap archive here is still before any cluster object, and
+        # must still take run_dir with it.
+        trap 'rm -f -- "${K8S_SUBMIT_CONTEXT_TAR:-}"; rm -rf -- "$run_dir"' EXIT
         tar cf "$context_tar" -C "$context_ro" .
         context_size="$("$FS_STAT" -c '%s' -- "$context_tar")"
         if (( context_size > CONTEXT_MAX_BYTES )); then
@@ -3649,6 +3685,18 @@ EOF
             exit 1
         fi
     fi
+
+    # From here on, a cluster object may exist for this run (a Secret
+    # right below for the claude harness, the Job itself either way), so
+    # run_dir must survive a failure past this point instead of being
+    # taken with it -- resets the trap back to guarding only context_tar,
+    # which is what it protected before the window above needed it to
+    # cover run_dir too. The claude branch below installs its own trap
+    # over this one, folding the same context_tar cleanup in with the
+    # cluster objects it is about to create; for the pi harness, this is
+    # the trap that stays live for the rest of this function, exactly as
+    # it did before run_dir had one of its own.
+    trap 'rm -f -- "${K8S_SUBMIT_CONTEXT_TAR:-}"' EXIT
 
     if [[ "$harness" == claude ]]; then
         # The per-run Secret carrying the REAL operator access token, read
@@ -4551,13 +4599,19 @@ cmd_collect() {
     # counts are omitted entirely, never written as zero: they live in the
     # pod, and extracting them is separate work this round does not do --
     # an absent key says "not measured"; a zero would falsely claim the
-    # run was measured and free.
+    # run was measured and free. commits gets the same treatment: it is
+    # only computable when both base_sha and after_sha are known, which is
+    # exactly when the zero-harvest check above is decidable -- an
+    # unreadable base (kubectl exec failure) leaves it empty, and empty
+    # becomes null below rather than the 0 the initializer used to leave
+    # in place, which would have told a reader "this run produced no
+    # commits" about a run this same collect just called undecidable.
     if [[ -n "$run_dir" ]]; then
-        local run_log_harness run_log_model run_log_commits=0
+        local run_log_harness run_log_model run_log_commits=""
         run_log_harness="$(read_env_value "$run_dir/run.env" harness || true)"
         run_log_model="$(read_env_value "$run_dir/run.env" model || true)"
         if [[ -n "$base_sha" && -n "$after_sha" ]]; then
-            run_log_commits="$(cd "$origin_repo" && git rev-list --count "$base_sha..$after_sha" 2>/dev/null || printf 0)"
+            run_log_commits="$(cd "$origin_repo" && git rev-list --count "$base_sha..$after_sha" 2>/dev/null || true)"
         fi
         jq -n \
             --arg mode "run" \
@@ -4568,7 +4622,7 @@ cmd_collect() {
             --arg origin_repo "$origin_repo" \
             --arg base_sha "$base_sha" \
             --argjson exit_code "${agent_exit_code:-null}" \
-            --argjson commits "$run_log_commits" \
+            --arg commits "$run_log_commits" \
             '{
                 mode: $mode,
                 harness: $harness,
@@ -4578,7 +4632,7 @@ cmd_collect() {
                 origin_repo: $origin_repo,
                 base_sha: (if $base_sha == "" then null else $base_sha end),
                 exit_code: $exit_code,
-                commits: $commits,
+                commits: (if $commits == "" then null else ($commits | tonumber) end),
             }' > "$run_dir/summary.json" 2>/dev/null \
             || rm -f "$run_dir/summary.json"
 
@@ -4796,20 +4850,31 @@ cmd_run() {
     local agent_rc wait_rc=0
     agent_rc="$(cmd_wait --branch "$branch" --timeout "$timeout")" || wait_rc=$?
     if (( wait_rc != 0 )); then
-        # cmd_wait failed before the agent's sentinel appeared (a dead pod,
-        # a malformed sentinel, or a timeout) -- cmd_collect, the only
-        # other caller of sandbox-run-log.py record, is never reached in
-        # that case, and the run directory cmd_submit created would
-        # otherwise carry no summary.json and no row in the durable run
-        # log: exactly the "a seat is silently failing" case this log
-        # exists to surface. cmd_wait's own error already told the
-        # operator the job and pod are left in place for inspection, so
-        # this does not attempt any of collect's pod reads (outbox,
-        # evidence, fetch) against a pod that is dead or still mid-timeout
-        # -- it records only what submit already knew, via record's own
-        # run.env fallback for a run directory with no summary.json.
-        # exit_code stays absent (record's null): none is known.
-        if [[ -n "$run_dir" ]]; then
+        # cmd_wait failed before the agent's sentinel appeared (a dead pod
+        # or a malformed sentinel, both terminal codes -- exit 2 -- or a
+        # timeout, exit 1) -- cmd_collect, the only other caller of
+        # sandbox-run-log.py record, is never reached in that case, and the
+        # run directory cmd_submit created would otherwise carry no
+        # summary.json and no row in the durable run log: exactly the "a
+        # seat is silently failing" case this log exists to surface.
+        # cmd_wait's own error already told the operator the job and pod
+        # are left in place for inspection, so this does not attempt any of
+        # collect's pod reads (outbox, evidence, fetch) against a pod that
+        # is dead -- it records only what submit already knew, via
+        # record's own run.env fallback for a run directory with no
+        # summary.json. exit_code stays absent (record's null): none is
+        # known.
+        #
+        # A timeout (wait_rc 1) is excluded: cmd_wait's own message for it
+        # says the opposite of "this run ended" -- "the pod is still
+        # running, holding its work" -- and a run_end row written while the
+        # run is still going would be a false record no later collect ever
+        # supersedes (a by-hand fetch/rm, the advice cmd_wait gives, passes
+        # no --run-dir). Every other wait_rc (2: dead pod, malformed
+        # sentinel, an already-Succeeded pod, pod not found) is terminal
+        # from wait's own perspective -- no further wait will ever turn
+        # into a normal completion -- so those still get the row.
+        if [[ -n "$run_dir" && "$wait_rc" != 1 ]]; then
             local run_log_bin
             run_log_bin="$(command -v sandbox-run-log.py 2>/dev/null || true)"
             [[ -n "$run_log_bin" ]] || run_log_bin="$HOME/.claude/scripts/sandbox-run-log.py"
