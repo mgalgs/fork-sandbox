@@ -8,15 +8,17 @@ anything:
 | `pi.env` | `OPENROUTER_API_KEY` — a real secret, mode 0600 |
 | `model.env` | `MODEL_ENDPOINT`, `MODEL_ID`, `MODEL_CTX` — a local model endpoint |
 | `k8s.env` | `K8S_CONTEXT`, `K8S_NAMESPACE`, `K8S_IMAGE`, `K8S_PROXY_UPSTREAM`, `K8S_DENIED_PROBE` |
-| `claude.env` | `CLAUDE_CREDENTIALS` — a path to read instead of `$HOME/.claude/.credentials.json` for every `--harness claude` leg on this machine, e.g. to point sandbox agents at a separate team-plan account. Missing file or key means today's default (that file, falling back to the login Keychain on macOS). Beaten by `fork-sandbox.sh`'s own `--claude-credentials <path>` for one launch; not read at all by `fork-sandbox-k8s.sh`'s direct entry point beyond this config key, which it reads the same way |
+| `claude.env` | `CLAUDE_CREDENTIALS` — a path to read instead of `$HOME/.claude/.credentials.json` for every `--harness claude` leg on this machine, e.g. to point sandbox agents at a separate team-plan account. Missing file or key means today's default (that file, falling back to the login Keychain on macOS). Beaten by `fork-sandbox.sh`'s own `--claude-credentials <path>` for one launch; not read at all by `fork-sandbox-k8s.sh`'s direct entry point beyond this config key, which it reads the same way. `fork-sandbox-discover-claude` only reports whether a credential is ready (see below) — `CLAUDE_CREDENTIALS` is not on the allowlist a discoverer can target, so `configure` does not write this file |
 | `coder-mode.env` | `CODER_MODE_*` — the `sandbox-coder-mode` skill's launch defaults: a composition spelled key-per-flag (`CODER_MODE_HARNESS`, `CODER_MODE_MODEL`, `CODER_MODE_NETWORK`, the `REVIEW` and `MAINTAINER` sets), or `CODER_MODE_PRESET` naming one preset in place of all of them. The skill owns the key list; these are read by the orchestrating session, not by any script, and `configure` does not write the file |
 
 Assembling that by hand means copying key names out of docs and typing a
 `chmod 600`. `configure` does it instead: it discovers what is already on
 this machine — an `OPENROUTER_API_KEY` in your environment, a local model
 endpoint, a kubectl context — shows you what it found, and writes the
-pieces you pick into the files above, **except `coder-mode.env`**, which
-has no discoverer and is never a `configure` target — see the row above.
+pieces you pick into the files above, **except `coder-mode.env` and
+`claude.env`** — neither has a target on the allowlist a discoverer can
+write to, so `configure` never installs anything into either; see the rows
+above.
 
 ```
 fork-sandbox.sh configure [--remove] [--all] [--dry-run]

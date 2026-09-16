@@ -8,10 +8,13 @@
 #
 # Informational only: its one candidate's target is "-", never selectable
 # and never written anywhere. fork-sandbox.sh already finds the Claude
-# credential at run time with no config of its own (fs_read_claude_credential
-# in fork-sandbox-lib.sh), so there is nothing for configure to install --
-# the value of listing it at all is telling a new user their `claude`
-# harness is ready before they try a run and find out the hard way.
+# credential at run time (fs_read_claude_credential in fork-sandbox-lib.sh):
+# $HOME/.claude/.credentials.json, the macOS Keychain, or -- when this
+# machine's claude.env sets CLAUDE_CREDENTIALS -- the path it names instead.
+# There is nothing for configure to install; the value of listing it at all
+# is telling a new user their `claude` harness is ready before they try a
+# run and find out the hard way. It reads that same override so the report
+# matches what a real run would actually use, not always the default.
 #
 # Never prints the credential itself, or any part of it: presence is
 # checked by redirecting fs_read_claude_credential's stdout (the credential
@@ -30,9 +33,17 @@ script_dir="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 # shellcheck disable=SC1091  # plain shellcheck cannot follow it; use -x
 source "$script_dir/fork-sandbox-lib.sh"
 
+# Per-machine facts a shared checkout must not carry -- the same directory
+# fork-sandbox.sh and fork-sandbox-k8s.sh read, so this reports on the same
+# credential a real run resolves.
+config_dir="${FORK_SANDBOX_CONFIG_DIR:-$HOME/.config/fork-sandbox}"
+
 cmd_discover() {
-    if fs_read_claude_credential >/dev/null 2>&1; then
-        printf 'present\t-\tClaude credential\t%s\tfound\n' "$(fs_claude_credential_source)"
+    local override
+    override="$(fs_read_env_value "$config_dir/claude.env" CLAUDE_CREDENTIALS || true)"
+    if fs_read_claude_credential "$override" >/dev/null 2>&1; then
+        printf 'present\t-\tClaude credential\t%s\tfound\n' \
+            "$(fs_claude_credential_source "$override")"
     fi
 }
 

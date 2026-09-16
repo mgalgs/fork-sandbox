@@ -1246,62 +1246,51 @@ fs_claude_credential_source() {
 
 fs_read_claude_credential() {
     local override="${1:-}"
-    if [[ -n "$override" ]]; then
-        if [[ ! -f "$override" ]]; then
+    local file="${override:-$HOME/.claude/.credentials.json}" svc out
+
+    if [[ ! -f "$file" ]]; then
+        if [[ -n "$override" ]]; then
             echo "Error: $override not found. --claude-credentials (or" >&2
             echo "CLAUDE_CREDENTIALS in claude.env) named this path explicitly," >&2
             echo "so it is not falling back to the default credential file or" >&2
             echo "Keychain." >&2
             return 1
         fi
-        if ! cat -- "$override"; then
-            echo "Error: $override exists but could not be read. Check its owner" >&2
-            echo "and mode -- a credential written under sudo is the usual" >&2
-            echo "cause. This is not an expired token; logging in again would" >&2
-            echo "rewrite a file you still cannot read." >&2
+        if [[ "$(uname -s)" == Darwin ]] && command -v security >/dev/null 2>&1; then
+            for svc in "${FS_CLAUDE_KEYCHAIN_SERVICES[@]}"; do
+                out="$(security find-generic-password -s "$svc" -w 2>/dev/null)" || continue
+                # A wrong item would otherwise become a silently broken credential
+                # inside the sandbox, which fails as a 401 an hour later. Check the
+                # shape here, where the error can still say what is wrong.
+                printf '%s' "$out" | jq -e '.claudeAiOauth.accessToken' >/dev/null 2>&1 || continue
+                printf '%s' "$out"
+                return 0
+            done
+            echo "Error: no Claude credential found. $file does not exist, which is" >&2
+            echo "expected on macOS -- the CLI keeps it in the login Keychain -- but" >&2
+            echo "no usable item was there either. Tried: ${FS_CLAUDE_KEYCHAIN_SERVICES[*]}" >&2
+            echo "Log in with claude first. If you are already logged in, the service" >&2
+            echo "name may have changed; find it with:" >&2
+            echo "  security dump-keychain | grep -i claude" >&2
             return 1
         fi
-        return 0
-    fi
-
-    local file="$HOME/.claude/.credentials.json" svc out
-    if [[ -f "$file" ]]; then
-        # `-f` proves it is a regular file, not that it can be read. Check the
-        # read itself: an unreadable credential used to abort loudly, when jq
-        # opened the file directly, and returning 0 with no output here would
-        # instead be diagnosed downstream as an EXPIRED token -- sending the
-        # user to re-log-in, which rewrites a file they still cannot read.
-        if ! cat -- "$file"; then
-            echo "Error: $file exists but could not be read. Check its owner" >&2
-            echo "and mode -- a credential written under sudo is the usual" >&2
-            echo "cause. This is not an expired token; logging in again would" >&2
-            echo "rewrite a file you still cannot read." >&2
-            return 1
-        fi
-        return 0
-    fi
-
-    if [[ "$(uname -s)" == Darwin ]] && command -v security >/dev/null 2>&1; then
-        for svc in "${FS_CLAUDE_KEYCHAIN_SERVICES[@]}"; do
-            out="$(security find-generic-password -s "$svc" -w 2>/dev/null)" || continue
-            # A wrong item would otherwise become a silently broken credential
-            # inside the sandbox, which fails as a 401 an hour later. Check the
-            # shape here, where the error can still say what is wrong.
-            printf '%s' "$out" | jq -e '.claudeAiOauth.accessToken' >/dev/null 2>&1 || continue
-            printf '%s' "$out"
-            return 0
-        done
-        echo "Error: no Claude credential found. $file does not exist, which is" >&2
-        echo "expected on macOS -- the CLI keeps it in the login Keychain -- but" >&2
-        echo "no usable item was there either. Tried: ${FS_CLAUDE_KEYCHAIN_SERVICES[*]}" >&2
-        echo "Log in with claude first. If you are already logged in, the service" >&2
-        echo "name may have changed; find it with:" >&2
-        echo "  security dump-keychain | grep -i claude" >&2
+        echo "Error: $file not found. Log in with claude first." >&2
         return 1
     fi
 
-    echo "Error: $file not found. Log in with claude first." >&2
-    return 1
+    # `-f` proves it is a regular file, not that it can be read. Check the
+    # read itself: an unreadable credential used to abort loudly, when jq
+    # opened the file directly, and returning 0 with no output here would
+    # instead be diagnosed downstream as an EXPIRED token -- sending the
+    # user to re-log-in, which rewrites a file they still cannot read.
+    if ! cat -- "$file"; then
+        echo "Error: $file exists but could not be read. Check its owner" >&2
+        echo "and mode -- a credential written under sudo is the usual" >&2
+        echo "cause. This is not an expired token; logging in again would" >&2
+        echo "rewrite a file you still cannot read." >&2
+        return 1
+    fi
+    return 0
 }
 
 # The host's model and browser caches, read-only, when the host has them.
