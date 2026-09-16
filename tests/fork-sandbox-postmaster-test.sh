@@ -2184,6 +2184,17 @@ check "CLAUDE_CREDENTIALS: --claude-credentials reaches the launcher" 1 \
 check "CLAUDE_CREDENTIALS: its value is the path claude.env named" \
     "ARG:$TRIAGE_CONFIG_DIR/team-credentials.json" \
     "$(grep -A1 -- '^ARG:--claude-credentials$' "$TRIAGE_LOG" | tail -n1)"
+# claude-sandboxed stops parsing its own flags at the first one it does
+# not recognize (--dangerously-skip-permissions among them), so
+# --claude-credentials only reaches its own parse branch if it precedes
+# the work dir. The stub above logs every ARG in argv order but has no
+# idea what a flag means positionally -- it would pass this scenario
+# identically whether the flag were forwarded straight through to
+# `claude` instead of consumed here. Pin the order directly: the first
+# logged ARG must be --claude-credentials, not the work dir.
+check "CLAUDE_CREDENTIALS: --claude-credentials precedes the work dir in the launcher argv" \
+    "ARG:--claude-credentials" \
+    "$(grep -m1 -- '^ARG:' "$TRIAGE_LOG")"
 
 # --- scenario 2: a skip verdict suppresses only the Cc wake, and is
 #     recorded in triaged/<thread-id> ---
