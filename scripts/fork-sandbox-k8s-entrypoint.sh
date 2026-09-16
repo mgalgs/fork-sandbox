@@ -784,24 +784,46 @@ commit_uncommitted_work "coding leg"
 # The --review-loop pass, when this run carries one. Runs pod-side -- the
 # pod owns the clone, so a fresh review/fix session per iteration costs no
 # kubectl round trip. See review-loop.sh's own header for the control flow;
-# this block only decides whether to run it and folds its result in.
+# this block decides whether the branch holds anything to hand it at all,
+# not whether pi succeeded -- review-loop.sh already skips on its own when
+# the branch head equals BASE_SHA, so a non-zero pi exit is folded into the
+# review prompt and recorded in review-loop.json, not used to preempt the
+# loop. Only an unreadable branch head is this block's own call, since
+# review-loop.sh treats that as a hard failure rather than a graceful skip.
 if [[ "$REVIEW_LOOP_CAP" =~ ^[1-9][0-9]*$ ]]; then
-    if [[ "$pi_rc" != "0" ]]; then
-        # A session that died of a model error must not be reviewed as if
-        # it had worked -- the same rule fork-sandbox.sh's own local loop
-        # follows. There is no review-loop.sh invocation to make that call
-        # itself here, since only this script knows pi's exit code, so the
-        # skip and its review-loop.json are written right here rather than
-        # threaded into the loop script's interface.
-        echo "fork-sandbox-k8s-entrypoint: pi exited $pi_rc; skipping the review loop" >&2
-        jq -n --argjson cap "$REVIEW_LOOP_CAP" --arg rc "$pi_rc" '{
+    coding_head="$(git -C "$clone_dir" rev-parse HEAD 2>/dev/null || true)"
+    if [[ -z "$coding_head" ]]; then
+        echo "fork-sandbox-k8s-entrypoint: branch $BRANCH could not be read;" >&2
+        echo "fork-sandbox-k8s-entrypoint: skipping the review loop" >&2
+        jq -n --argjson cap "$REVIEW_LOOP_CAP" --argjson rc "$pi_rc" --arg branch "$BRANCH" '{
             cap: $cap,
             ended: "skipped",
-            detail: ("the session exited " + $rc + ", so there is nothing worth reviewing"),
+            detail: ("branch " + $branch + " could not be read from the clone"),
+            coding_exit_code: $rc,
             iterations: [],
         }' > "$work_dir/review-loop.json"
     else
-        echo "fork-sandbox-k8s-entrypoint: running the review loop" >&2
+        review_prompt_path="$mounts_dir/review-prompt.md"
+        if [[ "$pi_rc" != "0" ]]; then
+            # The session may have failed partway through -- reviewed
+            # anyway (review-loop.sh decides for itself whether the branch
+            # holds any commits worth it), but told so it can judge the
+            # branch as a possibly-incomplete implementation rather than a
+            # finished one. $mounts_dir is a read-only mount, so the
+            # annotated copy is written to $work_dir instead.
+            echo "fork-sandbox-k8s-entrypoint: pi exited $pi_rc; reviewing what it landed" >&2
+            review_prompt_path="$work_dir/review-prompt-annotated.md"
+            {
+                cat -- "$mounts_dir/review-prompt.md"
+                printf '\n---\n\n## The coding session exited non-zero\n\n'
+                printf 'The session that produced the commits under review exited with\n'
+                printf 'status %s. Its work may be incomplete or partially\n' "$pi_rc"
+                printf 'applied -- read the branch and flag anything that looks\n'
+                printf 'unfinished as a finding, the same as any other defect.\n'
+            } > "$review_prompt_path"
+        else
+            echo "fork-sandbox-k8s-entrypoint: running the review loop" >&2
+        fi
         # The review loop always runs pi, regardless of the coding leg's
         # harness, and always prefers REVIEW_MODEL over MODEL when set --
         # required at startup when HARNESS=claude, see the validation
@@ -825,7 +847,7 @@ if [[ "$REVIEW_LOOP_CAP" =~ ^[1-9][0-9]*$ ]]; then
             --clone "$clone_dir" \
             --cap "$REVIEW_LOOP_CAP" \
             --base-sha "$BASE_SHA" \
-            --review-prompt "$mounts_dir/review-prompt.md" \
+            --review-prompt "$review_prompt_path" \
             --fix-header "$mounts_dir/fix-prompt-header.md" \
             --verdict "$clone_dir/.git/review-verdict.md" \
             --work-dir "$work_dir" \
@@ -836,6 +858,16 @@ if [[ "$REVIEW_LOOP_CAP" =~ ^[1-9][0-9]*$ ]]; then
             # comment on run_complete below. review-loop.json is where the
             # loop's outcome actually lives.
             echo "fork-sandbox-k8s-entrypoint: review-loop.sh exited $loop_rc" >&2
+        fi
+
+        # review-loop.sh regenerates review-loop.json from scratch and has
+        # no way to know pi's exit code (only this script does), so the
+        # field is folded in here after the fact rather than threaded
+        # through the loop script's interface.
+        if [[ -f "$work_dir/review-loop.json" ]]; then
+            jq --argjson rc "$pi_rc" '. + {coding_exit_code: $rc}' \
+                "$work_dir/review-loop.json" > "$work_dir/review-loop.json.tmp" \
+                && mv -f "$work_dir/review-loop.json.tmp" "$work_dir/review-loop.json"
         fi
 
         # Deliberately NOT run between iterations -- review-loop.sh's own

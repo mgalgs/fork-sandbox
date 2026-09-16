@@ -7339,6 +7339,95 @@ else
         "missing review_loop_model wiring in $entrypoint_sh"
 fi
 
+# A non-zero pi exit no longer preempts the whole review-loop block -- the
+# commits-based check runs first, and review-loop.sh itself decides the
+# no-commits skip. The old "nothing worth reviewing" conclusion is gone
+# entirely, from this file and the whole repo (regression -- kept even
+# though it duplicates a grep run manually while diagnosing this bug).
+if grep -qF 'nothing worth reviewing' "$entrypoint_sh"; then
+    no "entrypoint's review-loop skip no longer asserts \"nothing worth reviewing\"" \
+        "the literal string is still present in $entrypoint_sh"
+else
+    ok "entrypoint's review-loop skip no longer asserts \"nothing worth reviewing\""
+fi
+if ! grep -rlF 'nothing worth reviewing' -- "$repo_dir/scripts" "$repo_dir/docs" \
+    >/dev/null 2>&1; then
+    ok "\"nothing worth reviewing\" does not appear anywhere in scripts/ or docs/"
+else
+    no "\"nothing worth reviewing\" does not appear anywhere in scripts/ or docs/" \
+        "$(grep -rlF 'nothing worth reviewing' -- "$repo_dir/scripts" "$repo_dir/docs" 2>/dev/null)"
+fi
+
+# The branch-readability check runs first, ahead of any pi_rc check, and
+# gates only the review-loop.sh invocation -- not a bare pi_rc check
+# gating the whole block, which was the bug.
+# shellcheck disable=SC2016
+if grep -qF 'coding_head="$(git -C "$clone_dir" rev-parse HEAD 2>/dev/null || true)"' \
+    "$entrypoint_sh" \
+    && grep -qF 'if [[ -z "$coding_head" ]]; then' "$entrypoint_sh"; then
+    ok "entrypoint's review-loop block checks the branch head, not pi_rc, to decide skip-vs-run"
+else
+    no "entrypoint's review-loop block checks the branch head, not pi_rc, to decide skip-vs-run" \
+        "missing the coding_head branch-readability check in $entrypoint_sh"
+fi
+review_block="$(awk '
+    /^# The --review-loop pass, when this run carries one\./ { p=1 }
+    p { print }
+    p && /^fi$/ { exit }
+' "$entrypoint_sh")"
+if [[ -n "$review_block" ]] \
+    && [[ "$(grep -c 'if \[\[ -z "\$coding_head" \]\]; then' <<<"$review_block")" == 1 ]] \
+    && [[ "$(grep -c 'bash "\$mounts_dir/review-loop.sh"' <<<"$review_block")" == 1 ]]; then
+    coding_head_line="$(grep -n 'if \[\[ -z "\$coding_head" \]\]; then' <<<"$review_block" \
+        | cut -d: -f1)"
+    review_loop_call_line="$(grep -n 'bash "\$mounts_dir/review-loop.sh"' <<<"$review_block" \
+        | cut -d: -f1)"
+    if (( coding_head_line < review_loop_call_line )); then
+        ok "the branch-readability check precedes the review-loop.sh invocation, not the other way round"
+    else
+        no "the branch-readability check precedes the review-loop.sh invocation, not the other way round" \
+            "coding_head check at line $coding_head_line, review-loop.sh call at line $review_loop_call_line"
+    fi
+else
+    no "the branch-readability check precedes the review-loop.sh invocation, not the other way round" \
+        "could not isolate the REVIEW_LOOP_CAP block in $entrypoint_sh"
+fi
+
+# The unreadable-branch skip states what happened, not a conclusion about
+# whether the work is worth reviewing.
+# shellcheck disable=SC2016
+if grep -qF 'detail: ("branch " + $branch + " could not be read from the clone")' \
+    "$entrypoint_sh"; then
+    ok "entrypoint's unreadable-branch skip detail states what happened, not \"nothing worth reviewing\""
+else
+    no "entrypoint's unreadable-branch skip detail states what happened, not \"nothing worth reviewing\"" \
+        "missing the branch-could-not-be-read detail string in $entrypoint_sh"
+fi
+
+# The coding leg's exit code is recorded in review-loop.json either way --
+# the direct skip-write for an unreadable branch, and the post-process
+# merge once review-loop.sh (which does not itself know pi's exit code)
+# has written its own file.
+# shellcheck disable=SC2016
+if grep -qF -- '--argjson rc "$pi_rc" --arg branch "$BRANCH"' "$entrypoint_sh" \
+    && grep -qF 'coding_exit_code: $rc,' "$entrypoint_sh" \
+    && grep -qF "jq --argjson rc \"\$pi_rc\" '. + {coding_exit_code: \$rc}'" "$entrypoint_sh"; then
+    ok "entrypoint records coding_exit_code in review-loop.json for both the skip and the run-anyway case"
+else
+    no "entrypoint records coding_exit_code in review-loop.json for both the skip and the run-anyway case" \
+        "missing coding_exit_code wiring in $entrypoint_sh"
+fi
+
+# A non-zero pi exit gets an annotated review prompt (written under
+# $work_dir since $mounts_dir is read-only), not a skip.
+if grep -qF '## The coding session exited non-zero' "$entrypoint_sh" \
+    && grep -qF 'review_prompt_path="$work_dir/review-prompt-annotated.md"' "$entrypoint_sh"; then
+    ok "entrypoint annotates the review prompt with a non-zero-exit note instead of skipping"
+else
+    no "entrypoint annotates the review prompt with a non-zero-exit note instead of skipping" \
+        "missing the annotated review-prompt logic in $entrypoint_sh"
+fi
+
 # A pi coding leg folds REVIEW_MODEL into models.json alongside MODEL up
 # front, via a second synthesize_pi_config argument, and the function's
 # own jq dedupes the two ids with `unique` so an unset REVIEW_MODEL (or
