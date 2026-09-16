@@ -3980,7 +3980,17 @@ if [[ -n "$claude_credentials_resolved" ]]; then
     # before the clone, the branch and the tmux session are created, not
     # deep inside fs_read_claude_credential after all of that already exists.
     claude_credentials_resolved="$("$FS_REALPATH" -m "$claude_credentials_resolved")"
-    if [[ ! -f "$claude_credentials_resolved" ]]; then
+    # Gated on whether any leg of THIS run reads a Claude credential at
+    # all -- the same "$harness/$review_harness/$maintainer_harness/
+    # $fix_harness/$mntfix_harness == claude" test used below for the
+    # inbox hook. Ungated, a claude.env naming a path that later moves
+    # aborts even a --harness pi run, which never reads a Claude
+    # credential in the first place -- the blast radius is every run on
+    # the machine, for a file only claude legs read.
+    if [[ "$harness" == "claude" || "$review_harness" == "claude" \
+        || "$maintainer_harness" == "claude" || "$fix_harness" == "claude" \
+        || "$mntfix_harness" == "claude" ]] \
+        && [[ ! -f "$claude_credentials_resolved" ]]; then
         echo "Error: --claude-credentials (or CLAUDE_CREDENTIALS in claude.env)" >&2
         echo "names '$claude_credentials_resolved', which does not exist." >&2
         exit 1

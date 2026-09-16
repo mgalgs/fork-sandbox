@@ -262,5 +262,43 @@ else
     no "relative path: run_real produced a run directory" "$rel_out"
 fi
 
+printf '\n== the existence check is gated on this run actually using claude ==\n'
+
+# A --harness pi run never reads a Claude credential, so a claude.env whose
+# CLAUDE_CREDENTIALS names a path that has since moved must not abort it --
+# only a claude leg (implement, review, maintainer, or either fix seat)
+# makes the path relevant enough to check for existence.
+pi_cfg="$(mktemp -d)"; tmpdirs+=("$pi_cfg")
+install -m 600 /dev/null "$pi_cfg/pi.env"
+printf 'OPENROUTER_API_KEY=fake\n' > "$pi_cfg/pi.env"
+pi_rd="$(run_real "$pi_cfg" --harness pi --model moonshotai/kimi-k3 \
+    --claude-credentials "$missing_path")"
+if [[ -n "$pi_rd" ]]; then
+    tmpdirs+=("$pi_rd")
+    ok "a --harness pi run is not refused by a nonexistent --claude-credentials path"
+else
+    no "a --harness pi run is not refused by a nonexistent --claude-credentials path" \
+        "run_real failed"
+fi
+
+# The same nonexistent path still fails a --harness claude run (the
+# existing "missing path" case above already covers --claude-credentials
+# directly; this repeats it via CLAUDE_CREDENTIALS in claude.env to prove
+# the gate condition, not just the flag, is exercised).
+claude_env_cfg="$(mktemp -d)"; tmpdirs+=("$claude_env_cfg")
+mkdir -p "$claude_env_cfg"
+printf 'CLAUDE_CREDENTIALS=%s\n' "$missing_path" > "$claude_env_cfg/claude.env"
+claude_env_out="$(PATH="$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$claude_env_cfg" \
+    FORK_SANDBOX_BACKEND=fake-image \
+    timeout 60 "$launcher" --foreground --harness claude "$proj" "$handoff" 2>&1)"
+claude_env_rc=$?
+if (( claude_env_rc == 0 )); then
+    no "a --harness claude run is still refused by CLAUDE_CREDENTIALS naming a missing path" \
+        "$claude_env_out"
+else
+    contains "a --harness claude run is still refused by CLAUDE_CREDENTIALS naming a missing path" \
+        "$missing_path" "$claude_env_out"
+fi
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))
