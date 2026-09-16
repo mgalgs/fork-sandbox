@@ -17,12 +17,12 @@
 #                            [--outbox-dir DIR] [--outbox-max SIZE]
 #                            [--context-ro DIR]
 #                            [--checkout REF] [--services-trust-ref REF]
-#                            [--label key=value]...
+#                            [--label key=value]... [--task-meta JSON]
 #                            <project-path> <handoff-file>
 #        fork-sandbox-k8s.sh wait --branch NAME [--timeout SECONDS] [--probe]
 #        fork-sandbox-k8s.sh collect --branch NAME [--outbox-dir DIR]
 #                            [--outbox-max SIZE] [--review-loop N]
-#                            [--keep] <project-path>
+#                            [--keep] [--run-dir DIR] <project-path>
 #        fork-sandbox-k8s.sh fetch --branch NAME <project-path>
 #        fork-sandbox-k8s.sh say --branch NAME <text>
 #        fork-sandbox-k8s.sh say --branch NAME -        # text from stdin
@@ -86,7 +86,10 @@
 # resources are left in place with the manual `rm` command printed), and
 # a run that produced nothing -- the agent exited 0, the fetch brought
 # back zero commits, and the outbox holds no file the agent wrote -- keeps
-# its job and exits 3 rather than reporting success.
+# its job and exits 3 rather than reporting success. With --run-dir, it
+# also finalizes the run directory submit created -- writing summary.json
+# and calling sandbox-run-log.py record -- so the run gets a row in the
+# durable run log; see "The durable run log" in docs/kubernetes-runs.md.
 #
 # wait and collect exist so a caller fanning out several runs can submit
 # them all up front and then wait on and collect them independently, rather
@@ -256,6 +259,14 @@
 # the same meaning as fork-sandbox.sh's own local --task-meta. See "The
 # durable run log" in docs/kubernetes-runs.md and sandbox-run-log.py's own
 # header for the recommended fields.
+#
+# --run-dir DIR (collect): finalize the run directory submit created --
+# writing summary.json and calling sandbox-run-log.py record -- rather than
+# collect's ordinary behavior of writing and recording nothing. `run`
+# threads this automatically, using the directory its own submit phase
+# created; a caller driving submit and collect separately passes back what
+# submit printed on its "run dir:" line. See "The durable run log" in
+# docs/kubernetes-runs.md.
 #
 # --harness pi|claude (submit): which coding harness the pod runs. Defaults
 # to pi, which talks to the shared fork-sandbox-proxy over PROXY_BASE_URL,
@@ -575,6 +586,16 @@ K8S_RUN_LABELS="$(read_env_value "$k8s_env" K8S_RUN_LABELS || true)"
 # resolve_run_labels.
 RUN_LABEL_KEYS=()
 RUN_LABEL_VALUES=()
+
+# The run directory cmd_submit just created, for cmd_run to read straight
+# back after calling cmd_submit as a plain bash function (never a
+# subprocess) -- the same "module-global out param" idiom
+# k8s_parse_label_entry's PARSED_LABEL_KEY/PARSED_LABEL_VALUE already use in
+# this file, chosen over capturing cmd_submit's output so its progress
+# messages keep streaming to the terminal live rather than being buffered
+# until submit finishes. Declared empty here so it is safe to read under
+# `set -u` even on a verb that never calls cmd_submit.
+K8S_LAST_SUBMIT_RUN_DIR=""
 
 if [[ ! "$K8S_NAMESPACE" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]]; then
     echo "Error: K8S_NAMESPACE='$K8S_NAMESPACE' is not a valid namespace name." >&2
@@ -3572,6 +3593,8 @@ EOF
         printf 'base_sha=%s\n' "$run_log_base_sha"
     } > "$run_dir/run.env"
 
+    K8S_LAST_SUBMIT_RUN_DIR="$run_dir"
+
     # Spool and size the context before creating anything in the cluster or
     # pushing the repository. The EXIT trap covers tar/stat failures and
     # later submit failures, so a large temporary archive cannot leak.
@@ -4122,6 +4145,7 @@ fs_count_operator_outbox_files() {
 # composes this verb.
 cmd_collect() {
     local keep=false branch="" outbox_dir="" outbox_max_arg="" review_loop_cap=""
+    local run_dir=""
     while (( $# )); do
         case "$1" in
             --branch) branch="${2:?--branch requires a name}"; shift 2 ;;
@@ -4129,6 +4153,7 @@ cmd_collect() {
             --outbox-max) outbox_max_arg="${2:?--outbox-max requires a size}"; shift 2 ;;
             --review-loop) review_loop_cap="${2:?--review-loop requires a positive integer}"; shift 2 ;;
             --keep) keep=true; shift ;;
+            --run-dir) run_dir="${2:?--run-dir requires a path}"; shift 2 ;;
             -*) echo "Error: unknown option '$1' for collect." >&2; exit 1 ;;
             *) break ;;
         esac
@@ -4473,6 +4498,72 @@ cmd_collect() {
         echo "fork-sandbox-k8s: warning: could not decide whether the run produced commits (the pushed base sha was unreadable from pod $pod_name's repository, and this fetch landed no new commits); the zero-harvest check is undecidable for this collect." >&2
     fi
 
+    # Finalize the run directory submit created (--run-dir, threaded
+    # automatically by cmd_run) and append this run to the durable run log
+    # (~/.claude/sandbox-runs.jsonl), however it ended -- including a
+    # zero-harvest run, which is exactly the case a query like "has a seat
+    # been silently failing" needs to see, so this runs BEFORE the
+    # zero-harvest check below rather than after it (that check can exit 3
+    # a few lines down, and code after an exit never runs). Absent
+    # --run-dir, this does and writes nothing at all, unchanged from
+    # collect's behavior before --run-dir existed.
+    #
+    # harness and model are not collect's own arguments -- only submit
+    # knows them -- so they are read back from run.env, written by submit
+    # into this same directory at launch. Every other field is known here:
+    # network is always "cluster" (a pod's reachability is enforced by
+    # NetworkPolicy, not by this project's local pinned/sealed vocabulary),
+    # base_sha is the pushed revision already read above (the same value
+    # the zero-harvest check measures against), and commits is a rev-list
+    # count over that same base and the post-fetch tip -- mirroring how
+    # fork-sandbox.sh's own local run counts its commits. cost and token
+    # counts are omitted entirely, never written as zero: they live in the
+    # pod, and extracting them is separate work this round does not do --
+    # an absent key says "not measured"; a zero would falsely claim the
+    # run was measured and free.
+    if [[ -n "$run_dir" ]]; then
+        local run_log_harness run_log_model run_log_commits=0
+        run_log_harness="$(read_env_value "$run_dir/run.env" harness || true)"
+        run_log_model="$(read_env_value "$run_dir/run.env" model || true)"
+        if [[ -n "$base_sha" && -n "$after_sha" ]]; then
+            run_log_commits="$(cd "$origin_repo" && git rev-list --count "$base_sha..$after_sha" 2>/dev/null || printf 0)"
+        fi
+        jq -n \
+            --arg mode "run" \
+            --arg harness "$run_log_harness" \
+            --arg network "cluster" \
+            --arg model "$run_log_model" \
+            --arg branch "$branch" \
+            --arg origin_repo "$origin_repo" \
+            --arg base_sha "$base_sha" \
+            --argjson exit_code "${agent_exit_code:-null}" \
+            --argjson commits "$run_log_commits" \
+            '{
+                mode: $mode,
+                harness: $harness,
+                network: $network,
+                model: (if $model == "" then null else $model end),
+                branch: $branch,
+                origin_repo: $origin_repo,
+                base_sha: (if $base_sha == "" then null else $base_sha end),
+                exit_code: $exit_code,
+                commits: $commits,
+            }' > "$run_dir/summary.json" 2>/dev/null \
+            || rm -f "$run_dir/summary.json"
+
+        # Best-effort, like fork-sandbox.sh's own local append: a run that
+        # finished must never be reported as failed because a log append
+        # broke, and a machine without sandbox-run-log.py installed simply
+        # skips it.
+        local run_log_bin
+        run_log_bin="$(command -v sandbox-run-log.py 2>/dev/null || true)"
+        [[ -n "$run_log_bin" ]] || run_log_bin="$HOME/.claude/scripts/sandbox-run-log.py"
+        if [[ -n "$run_log_bin" && -x "$run_log_bin" ]]; then
+            "$run_log_bin" record --run-dir "$run_dir" >&2 \
+                || echo "fork-sandbox-k8s: run-log append failed" >&2
+        fi
+    fi
+
     # A zero-harvest run is not a success: the agent exited 0, the fetch
     # brought back zero commits, and the outbox holds no file the agent
     # wrote. Each term alone is legitimate -- a review panel seat commits
@@ -4534,7 +4625,7 @@ cmd_collect() {
 cmd_run() {
     local dry_run=false keep=false timeout=3600 branch="" model="" review_loop_cap=""
     local outbox_dir="" outbox_max_arg="" context_ro="" harness="" review_model="" endpoint=""
-    local checkout_ref="" pi_args="" services_trust_ref=""
+    local checkout_ref="" pi_args="" services_trust_ref="" task_meta=""
     local -a labels_raw=()
     while (( $# )); do
         case "$1" in
@@ -4554,6 +4645,7 @@ cmd_run() {
             --outbox-max) outbox_max_arg="${2:?--outbox-max requires a size}"; shift 2 ;;
             --context-ro) context_ro="${2:?--context-ro requires a directory}"; shift 2 ;;
             --label) labels_raw+=("${2:?--label requires key=value}"); shift 2 ;;
+            --task-meta) task_meta="${2:?--task-meta requires a JSON object}"; shift 2 ;;
             -*) echo "Error: unknown option '$1' for run." >&2; exit 1 ;;
             *) break ;;
         esac
@@ -4632,6 +4724,7 @@ cmd_run() {
     # rev-parse check itself, before anything is created.
     [[ -n "$checkout_ref" ]] && submit_argv+=(--checkout "$checkout_ref")
     [[ -n "$services_trust_ref" ]] && submit_argv+=(--services-trust-ref "$services_trust_ref")
+    [[ -n "$task_meta" ]] && submit_argv+=(--task-meta "$task_meta")
     # Unconditional, unlike the scalar flags above: an empty labels_raw
     # array is itself the "no --label given" signal, so the loop simply
     # forwards nothing rather than needing a separate -n guard.
@@ -4643,11 +4736,24 @@ cmd_run() {
     # branch freedom, handoff contents...) and, under --dry-run, exits the
     # whole process itself with the rendered YAML -- run never reaches the
     # wait/fetch/rm steps below in that case, and touches no kubectl either.
+    # (A dry-run also never reaches cmd_submit's run-dir creation, so there
+    # is nothing for K8S_LAST_SUBMIT_RUN_DIR to hold in this branch.)
     if [[ "$dry_run" == true ]]; then
         cmd_submit --dry-run "${submit_argv[@]}"
         exit 0
     fi
     cmd_submit "${submit_argv[@]}"
+
+    # cmd_submit is a plain bash function call, never a subprocess, so its
+    # progress messages above already streamed straight to this run's own
+    # stderr -- capturing its output here (the way cmd_wait's subshell
+    # below captures agent_rc) would buffer all of that until submit
+    # finished instead. K8S_LAST_SUBMIT_RUN_DIR is the module-global out
+    # param cmd_submit set as its last action instead, read back here so
+    # this run's own collect phase can finalize the same run directory --
+    # see cmd_run's own row in "The durable run log" in
+    # docs/kubernetes-runs.md.
+    local run_dir="$K8S_LAST_SUBMIT_RUN_DIR"
 
     # The wait runs in a $(...) subshell to capture the agent's exit code
     # from its stdout. An `exit` inside a subshell stops only the
@@ -4670,6 +4776,7 @@ cmd_run() {
     # collect's own copy only decides whether the loop read happens.
     [[ -n "$review_loop_cap" ]] && collect_argv+=(--review-loop "$review_loop_cap")
     [[ "$keep" == true ]] && collect_argv+=(--keep)
+    [[ -n "$run_dir" ]] && collect_argv+=(--run-dir "$run_dir")
     cmd_collect "${collect_argv[@]}" "$project_path"
 
     # The one line this verb prints that none of its three phases can: it

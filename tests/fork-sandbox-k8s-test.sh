@@ -268,6 +268,29 @@
 #     repository push in submit surfaces the pod's container log, since
 #     a pod that died in early discovery would otherwise only show
 #     git's bare "connection refused".
+#   - the durable run log (~/.claude/sandbox-runs.jsonl): submit creates a
+#     run directory in exactly the shape fork-sandbox.sh's own local run
+#     creates, prints its path on a "  run dir:  " line a fan-out caller
+#     scrapes the same way, and populates it with run.env, task-meta.json
+#     (only with --task-meta) and a copy of the handoff taken AT SUBMIT
+#     TIME (editing the original afterward does not change the archive);
+#     --dry-run creates no such directory; an invalid --task-meta is
+#     refused before anything is created. collect's new --run-dir
+#     finalizes that directory -- summary.json carries mode=run,
+#     network=cluster, harness/model read back from submit's own run.env,
+#     branch, origin_repo, base_sha and exit_code/commits as known at
+#     collect, and never a cost_usd/total_cost_usd/usage key (omitted, not
+#     zero) -- and calls sandbox-run-log.py record, verified by re-running
+#     record against a scratch HOME (this file's own
+#     FORK_SANDBOX_RUN_SOURCE=test tag keeps every fixture run's real
+#     append out of the operator's own stats). collect without --run-dir
+#     still writes and records nothing, even when a run directory for the
+#     branch exists on disk, and a missing sandbox-run-log.py does not
+#     fail collect. `run` threads --run-dir from its own submit phase to
+#     its own collect phase automatically. fork-sandbox.sh --k8s no longer
+#     refuses --task-meta: it forwards the raw value, byte-for-byte
+#     identical to a direct `run --dry-run` render, and an invalid value
+#     is still refused (now by cmd_submit, forwarded through).
 #
 # This lives in tests/ rather than scripts/tests/ on purpose: install.sh
 # iterates scripts/* and runs `sed -n 2p` on each entry to build the
@@ -8728,6 +8751,147 @@ if [[ ! -s "$rundir_badmeta_log" ]]; then
     ok "an invalid --task-meta creates nothing (empty kubectl log)"
 else
     no "an invalid --task-meta creates nothing (empty kubectl log)" "$(cat "$rundir_badmeta_log")"
+fi
+
+printf '\n== the durable run log: cmd_collect finalizes the run directory and calls record ==\n'
+if [[ -n "$rundir_rd" && -d "$rundir_rd" ]]; then
+    collect_rundir_log="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$collect_rundir_log")")
+    collect_rundir_out="$(newdir)/collect-out.txt"; tmpdirs+=("$(dirname "$collect_rundir_out")")
+    collect_rundir_outbox="$(newdir)/outbox"; tmpdirs+=("$(dirname "$collect_rundir_outbox")")
+    PATH="$runstub_dir:$PATH" K8S_STUB_LOG="$collect_rundir_log" \
+        K8S_STUB_BASE_SHA="$rundir_head_sha" \
+        K8S_STUB_OUTBOX_DIR="$runstub_pod_outbox" \
+        FORK_SANDBOX_CONFIG_DIR="$config_dir" \
+        "$k8s_sh" collect --branch fs-k8s-test-rundir-submit --run-dir "$rundir_rd" \
+        --outbox-dir "$collect_rundir_outbox" \
+        "$proj_dir" > "$collect_rundir_out" 2>&1
+    collect_rundir_rc=$?
+    if (( collect_rundir_rc == 0 )); then
+        ok "collect --run-dir (--run-dir is accepted, not an unknown option) exits 0"
+    else
+        no "collect --run-dir (--run-dir is accepted, not an unknown option) exits 0" \
+            "rc=$collect_rundir_rc: $(cat "$collect_rundir_out")"
+    fi
+
+    if [[ -f "$rundir_rd/summary.json" ]] && jq -e . "$rundir_rd/summary.json" >/dev/null 2>&1; then
+        ok "collect --run-dir writes a valid summary.json"
+        check "summary.json: mode" "run" "$(jq -r '.mode' "$rundir_rd/summary.json")"
+        check "summary.json: network" "cluster" "$(jq -r '.network' "$rundir_rd/summary.json")"
+        check "summary.json: harness (read back from submit's own run.env)" \
+            "pi" "$(jq -r '.harness' "$rundir_rd/summary.json")"
+        check "summary.json: model (read back from submit's own run.env)" \
+            "moonshotai/kimi-k3" "$(jq -r '.model' "$rundir_rd/summary.json")"
+        check "summary.json: branch" \
+            "fs-k8s-test-rundir-submit" "$(jq -r '.branch' "$rundir_rd/summary.json")"
+        check "summary.json: origin_repo" \
+            "$(fs_repo_toplevel "$proj_dir")" "$(jq -r '.origin_repo' "$rundir_rd/summary.json")"
+        check "summary.json: base_sha (the pushed base, read from the pod)" \
+            "$rundir_head_sha" "$(jq -r '.base_sha' "$rundir_rd/summary.json")"
+        check "summary.json: exit_code (the agent's own exit code)" \
+            "0" "$(jq -r '.exit_code' "$rundir_rd/summary.json")"
+        check "summary.json: commits (zero here -- the stub fetch landed no new commits)" \
+            "0" "$(jq -r '.commits' "$rundir_rd/summary.json")"
+        check "summary.json never carries a cost_usd key (absent, not zero)" \
+            "false" "$(jq 'has("cost_usd")' "$rundir_rd/summary.json")"
+        check "summary.json never carries a total_cost_usd key" \
+            "false" "$(jq 'has("total_cost_usd")' "$rundir_rd/summary.json")"
+        check "summary.json never carries a usage key (token counts)" \
+            "false" "$(jq 'has("usage")' "$rundir_rd/summary.json")"
+    else
+        no "collect --run-dir writes a valid summary.json" \
+            "$(cat "$rundir_rd/summary.json" 2>/dev/null; echo NOFILE)"
+    fi
+
+    # Verify record() actually ran and folded the row in correctly, without
+    # ever reading the real ~/.claude/sandbox-runs.jsonl for the check: a
+    # scratch HOME re-invocation of record against the SAME run directory
+    # (the same pattern tests/fork-sandbox-maintainer-test.sh already uses
+    # for its own run-log assertions) appends an identical-shape row to a
+    # throwaway log, which is what the assertions below read.
+    rundir_log_home="$(newdir)"; tmpdirs+=("$rundir_log_home")
+    HOME="$rundir_log_home" python3 "$repo_dir/scripts/sandbox-run-log.py" \
+        record --run-dir "$rundir_rd" >/dev/null 2>&1
+    rundir_log_line="$(tail -1 "$rundir_log_home/.claude/sandbox-runs.jsonl" 2>/dev/null)"
+    check "the recorded row carries mode=run" "run" "$(jq -r '.mode' <<< "$rundir_log_line")"
+    check "the recorded row carries network=cluster" \
+        "cluster" "$(jq -r '.network' <<< "$rundir_log_line")"
+    check "the recorded row folds in --task-meta verbatim" \
+        '{"kind":"implement","difficulty":2}' \
+        "$(jq -c '.task' <<< "$rundir_log_line")"
+    check "the recorded row never carries a cost_usd key" \
+        "false" "$(jq 'has("cost_usd")' <<< "$rundir_log_line")"
+    check "the recorded row never carries a usage key" \
+        "false" "$(jq 'has("usage")' <<< "$rundir_log_line")"
+fi
+
+# collect without --run-dir must behave exactly as before this feature --
+# writing and recording nothing -- even when a run directory for the same
+# branch exists on disk: collect must not go looking for one on its own.
+nodir_handoff="$handoff_file"
+nodir_kubectl_log="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$nodir_kubectl_log")")
+nodir_submit_out="$(newdir)/submit-out.txt"; tmpdirs+=("$(dirname "$nodir_submit_out")")
+PATH="$runstub_dir:$PATH" K8S_STUB_LOG="$nodir_kubectl_log" \
+    K8S_STUB_BASE_SHA="$rundir_head_sha" \
+    FORK_SANDBOX_CONFIG_DIR="$config_dir" \
+    "$k8s_sh" submit --branch fs-k8s-test-rundir-nodir --model moonshotai/kimi-k3 \
+    "$proj_dir" "$nodir_handoff" > "$nodir_submit_out" 2>&1
+nodir_rd="$(sed -n 's/^  run dir:  *//p' "$nodir_submit_out" | head -1)"
+if [[ -n "$nodir_rd" && -d "$nodir_rd" ]]; then
+    tmpdirs+=("$nodir_rd")
+    nodir_collect_log="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$nodir_collect_log")")
+    nodir_collect_out="$(newdir)/collect-out.txt"; tmpdirs+=("$(dirname "$nodir_collect_out")")
+    nodir_outbox="$(newdir)/outbox"; tmpdirs+=("$(dirname "$nodir_outbox")")
+    PATH="$runstub_dir:$PATH" K8S_STUB_LOG="$nodir_collect_log" \
+        K8S_STUB_BASE_SHA="$rundir_head_sha" \
+        K8S_STUB_OUTBOX_DIR="$runstub_pod_outbox" \
+        FORK_SANDBOX_CONFIG_DIR="$config_dir" \
+        "$k8s_sh" collect --branch fs-k8s-test-rundir-nodir \
+        --outbox-dir "$nodir_outbox" \
+        "$proj_dir" > "$nodir_collect_out" 2>&1
+    nodir_collect_rc=$?
+    if (( nodir_collect_rc == 0 )) && [[ ! -f "$nodir_rd/summary.json" ]]; then
+        ok "collect without --run-dir writes nothing, even with a run dir on disk for the branch"
+    else
+        no "collect without --run-dir writes nothing, even with a run dir on disk for the branch" \
+            "rc=$nodir_collect_rc summary=$([[ -f "$nodir_rd/summary.json" ]] && echo present || echo absent)"
+    fi
+else
+    no "collect without --run-dir writes nothing, even with a run dir on disk for the branch" \
+        "submit did not produce a run dir: $(cat "$nodir_submit_out")"
+fi
+
+# A machine without sandbox-run-log.py installed must not fail the run: the
+# append is best-effort. PATH is fully replaced (not merely prepended) so
+# neither `command -v` nor the $HOME fallback can resolve the real script
+# from this machine's own install.
+printf '\n== a missing sandbox-run-log.py does not fail collect ==\n'
+missingbin_home="$(newdir)"; tmpdirs+=("$missingbin_home")
+missingbin_kubectl_log="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$missingbin_kubectl_log")")
+missingbin_submit_out="$(newdir)/submit-out.txt"; tmpdirs+=("$(dirname "$missingbin_submit_out")")
+HOME="$missingbin_home" PATH="$runstub_dir:/usr/bin:/bin" \
+    K8S_STUB_LOG="$missingbin_kubectl_log" K8S_STUB_BASE_SHA="$rundir_head_sha" \
+    FORK_SANDBOX_CONFIG_DIR="$config_dir" \
+    "$k8s_sh" submit --branch fs-k8s-test-rundir-missingbin --model moonshotai/kimi-k3 \
+    "$proj_dir" "$handoff_file" > "$missingbin_submit_out" 2>&1
+missingbin_rd="$(sed -n 's/^  run dir:  *//p' "$missingbin_submit_out" | head -1)"
+if [[ -n "$missingbin_rd" && -d "$missingbin_rd" ]]; then
+    tmpdirs+=("$missingbin_rd")
+    missingbin_collect_log="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$missingbin_collect_log")")
+    missingbin_collect_out="$(newdir)/collect-out.txt"; tmpdirs+=("$(dirname "$missingbin_collect_out")")
+    missingbin_outbox="$(newdir)/outbox"; tmpdirs+=("$(dirname "$missingbin_outbox")")
+    HOME="$missingbin_home" PATH="$runstub_dir:/usr/bin:/bin" \
+        K8S_STUB_LOG="$missingbin_collect_log" K8S_STUB_BASE_SHA="$rundir_head_sha" \
+        K8S_STUB_OUTBOX_DIR="$runstub_pod_outbox" \
+        FORK_SANDBOX_CONFIG_DIR="$config_dir" \
+        "$k8s_sh" collect --branch fs-k8s-test-rundir-missingbin --run-dir "$missingbin_rd" \
+        --outbox-dir "$missingbin_outbox" \
+        "$proj_dir" > "$missingbin_collect_out" 2>&1
+    missingbin_collect_rc=$?
+    check "collect exits 0 even though sandbox-run-log.py cannot be found" \
+        "0" "$missingbin_collect_rc"
+else
+    no "collect exits 0 even though sandbox-run-log.py cannot be found" \
+        "submit did not produce a run dir: $(cat "$missingbin_submit_out")"
 fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
