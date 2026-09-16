@@ -342,7 +342,19 @@ def load_run_env(path):
 
 
 def archive_codex_quota(run_dir, run_id):
-    """Extract the first and last rate-limit row from each Codex rollout."""
+    """Extract the first and last rate-limit row from each Codex rollout.
+
+    A run launched with --session-state writes its rollouts to the
+    caller-supplied session-state directory instead of
+    <run-dir>/codex-sessions, so this finds nothing and such a run is not
+    archived. That directory is deliberately not read here: `cmd_record`'s
+    whole boundary is that its one path argument is a run directory the
+    fork machinery itself created, and a session-state directory is an
+    arbitrary caller-supplied path outside it -- reading it would turn a
+    blanket-approved tool into an arbitrary-file-read primitive. It is also
+    durable and shared across runs by design, so any rollout found there
+    cannot be attributed to this run id without guessing.
+    """
     sessions_dir = os.path.join(run_dir, "codex-sessions")
     if not os.path.isdir(sessions_dir):
         return None

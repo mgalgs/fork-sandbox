@@ -579,7 +579,7 @@ described below are mounted. The log is written by the host shell.
 | `<run-dir>/exit-code` | written when the session exits |
 | `<run-dir>/pi-session` | `--harness pi` only: pi's session, with per-message cost |
 | `<run-dir>/codex-sessions` | local Codex legs only: Codex rollout logs; contains session transcripts and shares the run directory's lifecycle, while its rate-limit snapshots are extracted at run end |
-| `~/.claude/codex-quota/<run-id>.jsonl` | durable host-side archive of the first and last rate-limit snapshot from each Codex rollout leg |
+| `~/.claude/codex-quota/<run-id>.jsonl` | durable host-side archive of the first and last rate-limit snapshot from each Codex rollout leg; not written for a run launched with `--session-state`, whose rollouts land in that caller-supplied directory instead of `<run-dir>/codex-sessions` |
 | `<run-dir>/clone/<name>` | the writable throwaway clone where the task runs |
 
 ## What it gives up
