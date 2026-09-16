@@ -446,6 +446,54 @@ else
 fi
 contains_quiet "an unreadable credential is not called expired" "could not be read" "$err"
 chmod 600 "$cred_home/.claude/.credentials.json"
+
+# An override is an explicit instruction: it must win even when the no-override
+# path would otherwise succeed (a real, valid credential in $HOME) or trigger
+# the Darwin Keychain branch (an empty $HOME with no credential file at all).
+override_cred="$scratch/override-creds.json"
+printf '{"claudeAiOauth":{"accessToken":"override-tok","expiresAt":1}}\n' > "$override_cred"
+
+HOME="$cred_home"
+out="$(fs_read_claude_credential "$override_cred")"
+rc=$?
+check "an override path is read even when HOME has its own credential" "0" "$rc"
+contains_quiet "the override file's contents come back, not HOME's" '"accessToken":"override-tok"' "$out"
+check "the source reports the override path" "$override_cred" "$(fs_claude_credential_source "$override_cred")"
+
+HOME="$scratch/empty-home"
+out="$(fs_read_claude_credential "$override_cred")"
+rc=$?
+check "an override path is read even when HOME would hit the Keychain branch" "0" "$rc"
+contains_quiet "the override file's contents come back there too" '"accessToken":"override-tok"' "$out"
+check "the source reports the override path, not the Keychain" \
+    "$override_cred" "$(fs_claude_credential_source "$override_cred")"
+
+# A missing override must fail naming that path -- not fall back to a valid
+# credential sitting right there in HOME, and not mention the Keychain.
+HOME="$cred_home"
+missing_override="$scratch/does-not-exist-override.json"
+if err="$(fs_read_claude_credential "$missing_override" 2>&1)"; then
+    no "a missing override returns non-zero"
+else
+    ok "a missing override returns non-zero"
+fi
+contains_quiet "a missing override names that path" "$missing_override" "$err"
+lacks "a missing override does not fall back to HOME's credential" '"accessToken":"tok"' "$err"
+lacks "a missing override does not try the Keychain" "security dump-keychain" "$err"
+
+# An override that exists but cannot be read gets the same message shape as
+# the default-path case -- not silently treated as an expired token.
+unreadable_override="$scratch/unreadable-override.json"
+printf '{"claudeAiOauth":{"accessToken":"tok","expiresAt":1}}\n' > "$unreadable_override"
+chmod 000 "$unreadable_override"
+if err="$(fs_read_claude_credential "$unreadable_override" 2>&1)"; then
+    no "an unreadable override returns non-zero"
+else
+    ok "an unreadable override returns non-zero"
+fi
+contains_quiet "an unreadable override is not called expired" "could not be read" "$err"
+chmod 600 "$unreadable_override"
+
 HOME="$real_home"
 
 echo ""

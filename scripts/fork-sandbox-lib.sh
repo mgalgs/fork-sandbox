@@ -1231,6 +1231,11 @@ FS_CLAUDE_KEYCHAIN_SERVICES=("Claude Code-credentials")
 # nothing and holds no secret, so it is safe to call from anywhere, as often as
 # a message needs it.
 fs_claude_credential_source() {
+    local override="${1:-}"
+    if [[ -n "$override" ]]; then
+        printf '%s\n' "$override"
+        return 0
+    fi
     local file="$HOME/.claude/.credentials.json"
     if [[ ! -f "$file" && "$(uname -s)" == Darwin ]]; then
         printf '%s\n' "the login Keychain"
@@ -1240,6 +1245,25 @@ fs_claude_credential_source() {
 }
 
 fs_read_claude_credential() {
+    local override="${1:-}"
+    if [[ -n "$override" ]]; then
+        if [[ ! -f "$override" ]]; then
+            echo "Error: $override not found. --claude-credentials (or" >&2
+            echo "CLAUDE_CREDENTIALS in claude.env) named this path explicitly," >&2
+            echo "so it is not falling back to the default credential file or" >&2
+            echo "Keychain." >&2
+            return 1
+        fi
+        if ! cat -- "$override"; then
+            echo "Error: $override exists but could not be read. Check its owner" >&2
+            echo "and mode -- a credential written under sudo is the usual" >&2
+            echo "cause. This is not an expired token; logging in again would" >&2
+            echo "rewrite a file you still cannot read." >&2
+            return 1
+        fi
+        return 0
+    fi
+
     local file="$HOME/.claude/.credentials.json" svc out
     if [[ -f "$file" ]]; then
         # `-f` proves it is a regular file, not that it can be read. Check the
