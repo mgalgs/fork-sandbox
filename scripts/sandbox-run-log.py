@@ -312,7 +312,7 @@ def get_path(rec, path):
 
 def parse_ts(rec):
     try:
-        return dt.datetime.fromisoformat(rec.get("ts", ""))
+        return dt.datetime.fromisoformat(rec.get("ts") or "")
     except ValueError:
         return None
 
@@ -600,11 +600,15 @@ def cmd_record(args):
               file=sys.stderr)
 
     append(rec)
+    harness = rec.get("harness") or "?"
+    model = rec.get("model") or "?"
+    exit_code = rec.get("exit_code")
+    commits = rec.get("commits")
     print(
         f"sandbox-run-log: recorded {run_id} "
-        f"({rec.get('harness', '?')}/{rec.get('model', '?')}, "
-        f"exit {rec.get('exit_code', '?')}, "
-        f"{rec.get('commits', '?')} commit(s))"
+        f"({harness}/{model}, "
+        f"exit {exit_code if exit_code is not None else '?'}, "
+        f"{commits if commits is not None else '?'} commit(s))"
     )
 
 
@@ -717,7 +721,7 @@ def cmd_list(args):
         exit_code = r.get("exit_code")
         commits = r.get("commits")
         table.append((
-            r.get("run_id", "?")[:30],
+            (r.get("run_id") or "?")[:30],
             ts,
             r.get("harness") or "-",
             model[:24],

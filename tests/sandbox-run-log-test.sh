@@ -297,5 +297,16 @@ nullrender_line="$(grep 'claude-fork-sandbox.nullrender' <<< "$out")"
 not_contains "list never renders a present-and-null exit_code/commits as the literal string None" \
     "None" "$nullrender_line"
 
+printf '\n== record: present-and-null fields use confirmation placeholders ==\n'
+rd_null_confirmation="$(mk_run_dir null-confirmation)"
+tmpdirs+=("$rd_null_confirmation")
+printf '%s\n' '{"harness":null,"model":null,"exit_code":null,"commits":null}' \
+    > "$rd_null_confirmation/summary.json"
+out="$(record "$rd_null_confirmation")"
+not_contains "record confirmation never renders present-and-null fields as None" \
+    "None" "$out"
+contains "record confirmation renders unknown exit and commit values as question marks" \
+    "exit ?, ? commit(s)" "$out"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))
