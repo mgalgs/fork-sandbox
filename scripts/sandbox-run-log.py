@@ -344,15 +344,19 @@ def load_run_env(path):
 def archive_codex_quota(run_dir, run_id):
     """Extract the first and last rate-limit row from each Codex rollout.
 
-    A run launched with --session-state redirects only the CODING leg's
-    rollout to the caller-supplied session-state directory instead of
-    <run-dir>/codex-sessions -- every other codex leg (a --review-harness
-    codex build, a preset fix/maintainer seat, or a review/fix/repeat-code
-    leg that falls back to the coding command) still writes here. So such a
-    run is not necessarily unarchived: if any of those other legs ran, this
-    still finds rows and writes an archive, but it is PARTIAL -- missing the
-    coding leg's own rate-limit history, the one a reader most wants, with
-    nothing in the output to say so. The caller-supplied session-state
+    When the CODING leg is itself codex, a run launched with --session-state
+    redirects only that leg's rollout to the caller-supplied session-state
+    directory instead of <run-dir>/codex-sessions -- every other codex leg
+    (a --review-harness codex build, a preset fix/maintainer seat, or a
+    review/fix/repeat-code leg that falls back to the coding command) still
+    writes here. So such a run is not necessarily unarchived: if any of
+    those other legs ran, this still finds rows and writes an archive, but
+    it is PARTIAL -- missing the coding leg's own rate-limit history, the
+    one a reader most wants, with nothing in the output to say so. (When
+    the coding leg is claude, --session-state redirects claude's own
+    transcript store instead and never touches codex-sessions, so this
+    caveat does not apply -- the archive is complete whenever any codex leg
+    ran.) The caller-supplied session-state
     directory is deliberately not read here: `cmd_record`'s whole boundary
     is that its one path argument is a run directory the fork machinery
     itself created, and a session-state directory is an arbitrary

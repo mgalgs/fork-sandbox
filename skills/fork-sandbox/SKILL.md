@@ -579,7 +579,7 @@ described below are mounted. The log is written by the host shell.
 | `<run-dir>/exit-code` | written when the session exits |
 | `<run-dir>/pi-session` | `--harness pi` only: pi's session, with per-message cost |
 | `<run-dir>/codex-sessions` | local Codex legs only: Codex rollout logs; contains session transcripts and shares the run directory's lifecycle, while its rate-limit snapshots are extracted at run end |
-| `~/.claude/codex-quota/<run-id>.jsonl` | durable host-side archive of the first and last rate-limit snapshot from each Codex rollout leg found in `<run-dir>/codex-sessions`; a run launched with `--session-state` redirects only the CODING leg's rollout to that caller-supplied directory instead, so if any other codex leg ran (a `--review-harness codex` build, a preset fix/maintainer seat, or a fallback review/fix/repeat-code leg) the archive still appears but is missing the coding leg's own rows |
+| `~/.claude/codex-quota/<run-id>.jsonl` | durable host-side archive of the first and last rate-limit snapshot from each Codex rollout leg found in `<run-dir>/codex-sessions`; when the CODING leg is itself codex, a run launched with `--session-state` redirects only that leg's rollout to the caller-supplied directory instead, so if any other codex leg ran (a `--review-harness codex` build, a preset fix/maintainer seat, or a fallback review/fix/repeat-code leg) the archive still appears but is missing the coding leg's own rows. When the coding leg is claude, `--session-state` redirects claude's own transcript store instead and never touches `codex-sessions`, so the archive is complete whenever any codex leg ran |
 | `<run-dir>/clone/<name>` | the writable throwaway clone where the task runs |
 
 ## What it gives up

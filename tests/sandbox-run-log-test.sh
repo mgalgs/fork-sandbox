@@ -200,6 +200,8 @@ check "an unterminated row gets its own line instead of fusing with the next" \
     "$(cmp -s "$tmp/quota-no-trailing-nl-expected" "$(quota_path "$rd_no_trailing_nl")" && echo same || echo different)"
 check "every physical line in the archived file parses as JSON" "yes" \
     "$(lines_all_parse "$(quota_path "$rd_no_trailing_nl")")"
+check "the record's row count is the expected 3, not vacuously empty" "3" \
+    "$(record_field "$(basename "$rd_no_trailing_nl")" codex_quota_rows)"
 check "the archived file's line count matches the record's row count" \
     "$(record_field "$(basename "$rd_no_trailing_nl")" codex_quota_rows)" \
     "$(wc -l < "$(quota_path "$rd_no_trailing_nl")" | tr -d ' ')"
