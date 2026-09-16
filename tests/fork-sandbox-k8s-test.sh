@@ -6338,11 +6338,9 @@ refuses "--k8s --harness claude --endpoint without --model is still refused" \
     env FORK_SANDBOX_CONFIG_DIR="$endpoints_config_dir" "$fs_sh" --k8s --dry-run \
     --harness claude --endpoint secondary \
     "$k8s_flag_proj" "$k8s_flag_handoff"
-refuses "--k8s --task-meta is refused as not yet supported" \
-    "--task-meta is not yet supported with --k8s" \
-    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
-    --harness pi --model moonshotai/kimi-k3 --task-meta '{"kind":"implement"}' \
-    unused-project unused-handoff
+# --task-meta is no longer refused with --k8s -- it is forwarded to
+# fork-sandbox-k8s.sh run, which threads it to cmd_submit; see "the durable
+# run log" section's own tests below for the positive coverage.
 refuses "--k8s --prompts-dir is refused as not yet supported" \
     "--prompts-dir is not yet supported with --k8s" \
     env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
@@ -8893,6 +8891,42 @@ else
     no "collect exits 0 even though sandbox-run-log.py cannot be found" \
         "submit did not produce a run dir: $(cat "$missingbin_submit_out")"
 fi
+
+printf '\n== fork-sandbox.sh --k8s: --task-meta is forwarded, not refused ==\n'
+# k8s_flag_proj/k8s_flag_handoff (set up above, under $HOME/src and
+# /var/tmp/claude-scratch respectively) are required here: unlike a direct
+# fork-sandbox-k8s.sh call, fs_require_scratch_handoff and
+# fs_require_src_project run for every --k8s call, dry-run included.
+taskmeta_out="$(newdir)/dispatch.yaml"; tmpdirs+=("$(dirname "$taskmeta_out")")
+if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
+    --harness pi --branch fs-k8s-flag-test-taskmeta --model moonshotai/kimi-k3 \
+    --task-meta '{"kind":"implement"}' \
+    "$k8s_flag_proj" "$k8s_flag_handoff" > "$taskmeta_out" 2>/tmp/fs-k8s-test-taskmeta.err; then
+    ok "fork-sandbox.sh --k8s --task-meta is no longer refused"
+else
+    no "fork-sandbox.sh --k8s --task-meta is no longer refused" "$(cat /tmp/fs-k8s-test-taskmeta.err)"
+fi
+if grep -q "is not yet supported with --k8s" /tmp/fs-k8s-test-taskmeta.err 2>/dev/null; then
+    no "the old --task-meta refusal message is gone" "$(cat /tmp/fs-k8s-test-taskmeta.err)"
+else
+    ok "the old --task-meta refusal message is gone"
+fi
+rm -f /tmp/fs-k8s-test-taskmeta.err
+
+taskmeta_direct_out="$(newdir)/direct.yaml"; tmpdirs+=("$(dirname "$taskmeta_direct_out")")
+FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" run --dry-run \
+    --branch fs-k8s-flag-test-taskmeta --model moonshotai/kimi-k3 \
+    --harness pi --task-meta '{"kind":"implement"}' \
+    "$k8s_flag_proj" "$k8s_flag_handoff" > "$taskmeta_direct_out" 2>/dev/null
+check "--k8s --task-meta renders byte-for-byte the same as a direct run --dry-run" \
+    "$(cat "$taskmeta_direct_out")" "$(cat "$taskmeta_out")"
+
+refuses "--k8s --task-meta with invalid JSON is still refused (by cmd_submit, forwarded through)" \
+    "must be one valid JSON object" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
+    --harness pi --branch fs-k8s-flag-test-taskmeta-bad --model moonshotai/kimi-k3 \
+    --task-meta 'not json' \
+    "$k8s_flag_proj" "$k8s_flag_handoff"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))

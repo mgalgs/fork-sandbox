@@ -710,8 +710,8 @@
 # docker-compose services, the detached tmux session, a host directory bound
 # in to outlive the run (--session-state, and --resume-session with it) --
 # that a Kubernetes pod
-# has no equivalent of, they describe a real capability (--prompts-dir,
-# --task-meta) the cluster path has
+# has no equivalent of, they describe a real capability (--prompts-dir)
+# the cluster path has
 # not been built to carry yet, or -- --claude-args alone, since --harness
 # claude landed here -- the pod's own invocation of the flag's target IS
 # built, but fixed: a --harness claude pod really does run the claude CLI,
@@ -763,14 +763,21 @@
 # directly, and a silent drop here would look identical to a run that
 # honored it.
 #
-# One gap is not a refused flag, because no flag controls it: a --k8s run
-# never appends to the durable run log described below
-# (~/.claude/sandbox-runs.jsonl), unlike every local run. The numbers that
-# log would need -- cost, tokens, exit code -- live in the pod, and getting
-# them out is its own piece of work, not done here. --task-meta IS refused
-# with --k8s, for the same underlying reason: it exists to be folded into
-# that log by sandbox-run-log.py, and there is no log entry for a --k8s run
-# to fold it into yet.
+# --k8s runs also append to the durable run log described below
+# (~/.claude/sandbox-runs.jsonl): --k8s forwards --task-meta to
+# fork-sandbox-k8s.sh run, which threads it to cmd_submit and cmd_collect,
+# the same way it threads --context-ro and --checkout. cmd_submit creates a
+# run directory in exactly the shape a local run's own run directory takes
+# and writes --task-meta into it; cmd_collect finalizes that directory once
+# the run is known to have finished and calls sandbox-run-log.py record,
+# the same tool a local run's own runner invokes. See "The durable run log"
+# in docs/kubernetes-runs.md.
+#
+# The row is thin, though: cost and token counts live in the pod, and
+# getting them out is its own piece of work, not done here -- they are
+# omitted from the record entirely, never written as zero (which would
+# claim the run was measured and free), rather than blocking the rest of
+# the row on it.
 #
 # Every run's end is also appended to the durable run log,
 # ~/.claude/sandbox-runs.jsonl, by sandbox-run-log.py -- whatever the
@@ -2560,12 +2567,6 @@ if [[ "$k8s_mode" == true ]]; then
         echo "fork-sandbox-k8s.sh directly for it." >&2
         exit 1
     fi
-    if [[ -n "$task_meta" ]]; then
-        echo "Error: --task-meta is not yet supported with --k8s. It is folded" >&2
-        echo "into the local run log, and a --k8s run does not append to that" >&2
-        echo "log at all yet." >&2
-        exit 1
-    fi
     if [[ -n "$prompts_dir_arg" ]]; then
         echo "Error: --prompts-dir is not yet supported with --k8s. The overlay" >&2
         echo "is layered onto a generated per-leg prompt, and the cluster path" >&2
@@ -2688,6 +2689,13 @@ if [[ "$k8s_mode" == true ]]; then
     # sync.
     [[ -n "$outbox_max_arg" ]] && k8s_argv+=(--outbox-max "$outbox_max_arg")
     [[ -n "$context_ro" ]] && k8s_argv+=(--context-ro "$context_ro")
+    # Forwarded as the raw string, not the compacted-and-validated form the
+    # local path produces further down (this dispatch runs ahead of that
+    # code, which this exec never reaches): fork-sandbox-k8s.sh's own
+    # cmd_submit validates the JSON shape itself, before anything is
+    # created, the same way it validates --review-loop's shape rather than
+    # this script duplicating that check.
+    [[ -n "$task_meta" ]] && k8s_argv+=(--task-meta "$task_meta")
     # --model is forwarded only when set: a model-less pi run is the one
     # legitimate combination (an endpoints install where the pod
     # discovers its model), and run omits an empty --model from its own
