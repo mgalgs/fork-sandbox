@@ -438,7 +438,7 @@ same unmodified tool.
 **The run directory is the join.** `sandbox-run-log.py record` does not
 take fields on its command line -- it takes `--run-dir` and reads what
 that directory contains (`run.env`, `task-meta.json`, `handoff.md`,
-`summary.json`). A `--k8s` run had no such directory to hand it. `submit`
+`handoff-original.md`, `summary.json`). A `--k8s` run had no such directory to hand it. `submit`
 now creates one, in exactly the shape a local run's own run directory
 takes: `mktemp -d` under the same
 `/var/tmp/claude-scratch/forks/claude-fork-sandbox.XXXXXX` template
@@ -455,10 +455,13 @@ takes: `mktemp -d` under the same
   it is folded into a row that did not exist. It no longer is --
   `fork-sandbox.sh --k8s` forwards it unchanged to `fork-sandbox-k8s.sh
   run`, which threads it to `submit`.
-- `handoff.md` -- a copy of the handoff file, taken **at submit time**,
-  not read again later: the caller may edit or remove the original while
-  the run is in flight, and the archive must reflect what the pod actually
-  received.
+- `handoff.md` -- the rendered prompt, captured **at submit time**: the
+  prompt `record` hashes and archives, matching the local run-log contract.
+  It is not read again later, so the caller may edit or remove the original
+  while the run is in flight.
+- `handoff-original.md` -- the operator's raw handoff file, also captured at
+  submit time. It preserves the original brief separately from the rendered
+  prompt in `handoff.md`.
 - `run-source` -- written only when `FORK_SANDBOX_RUN_SOURCE` is set in
   the launching shell, exactly like the local path's own marker. This is
   how this project's own `--k8s` test suite keeps its stubbed-kubectl

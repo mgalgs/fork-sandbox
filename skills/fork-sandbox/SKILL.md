@@ -562,12 +562,12 @@ described below are mounted. The log is written by the host shell.
 | `<run-dir>/sandbox.log` | the sandbox wrapper's messages, startup errors included |
 | `<run-dir>/summary.txt` | branch, exit code, commit list and diffstat after the fetch |
 | `<run-dir>/summary.json` | the same facts structured — harness and its version, model, exit code, commits with subjects, `cost_usd`, `total_cost_usd` (the run plus any `--review-loop` or `--refresh-at` legs), `refresh` and `continuations` (`--refresh-at`'s own record, each entry also carrying `handoff_stale`), `usage` token counts, `author_email_unexpected` (empty unless a returned commit carries an address other than the repo's own), and — on a run launched with `--session-state <dir>`, the claude-only flag that binds a host directory over the CLI's transcript store so the conversation outlives the run — `session_state` (that directory) and `session_id` (the newest transcript in it at run end, null if it stayed empty, and what a later run passes back as `--resume-session` to continue the same conversation). Those last two are absent, not null, on a run without the flag: their presence is how a caller tells a resumable run from one whose transcript died with the sandbox. For reading, not grepping |
-| `<run-dir>/handoff.md` | the prompt as it was sent |
+| `<run-dir>/handoff.md` | the rendered prompt as it was sent |
 | `<run-dir>/task-meta.json` | the `--task-meta` object, when one was given |
 | `<run-dir>/review-loop.json` | `--review-loop` only: how the loop ended, and one record per iteration |
 | `<run-dir>/review-verdict-<i>.md` | `--review-loop` only: what the reviewer wrote, verbatim |
 | `<run-dir>/events-review-<i>.jsonl`, `<run-dir>/events-fix-<i>.jsonl` | `--review-loop` only: each loop leg's own event stream |
-| `<run-dir>/handoff-original.md` | `--refresh-at` only: a verbatim snapshot of the hand-off this run itself was launched with, taken once at launch; embedded in every continuation's prompt |
+| `<run-dir>/handoff-original.md` | a verbatim snapshot of the raw hand-off this run itself was launched with, taken once at launch; every `--k8s` submit writes it beside the rendered `handoff.md`, and `--refresh-at` embeds it in every continuation's prompt |
 | `<run-dir>/handoff-<N>.md` | `--refresh-at` only: continuation N's prompt, exactly as the previous leg wrote it to the outbox |
 | `<run-dir>/continuation-prompt-<N>.md` | `--refresh-at` only: continuation N's whole rendered prompt (preamble, the original brief, any addenda archived from earlier legs, an optional stale-hand-off warning, then the hand-off above) |
 | `<run-dir>/events-continuation-<N>.jsonl` | `--refresh-at` only: continuation N's own event stream, for its isolated cost and usage; its events also land in `events.jsonl`, unlike a review-loop leg's |
