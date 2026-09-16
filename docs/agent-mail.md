@@ -817,6 +817,21 @@ does.
 - **No mail tooling inside the sandbox.** A wake cannot read the store,
   search other threads, or send mail directly; it writes reply files and
   the harvester posts them.
+- **No outbound attachments — the attachment store is inbound-only.**
+  `mail send` and `mail reply` both accept `--attach`, but the harvester
+  that posts a wake's mail passes it on neither path: not when replying,
+  and not on the `Reply-To-Id: new` branch that opens a thread. The reply
+  stanza has no attachment header either. So an operator posting from the
+  host can put files in the store and an agent never can. This is not the
+  bullet above restated: a wake already writes replies without mail
+  tooling, it simply cannot attach to them. The failure is silent — a seat
+  told to attach files writes a reply that posts cleanly, with the body
+  intact and the files absent — so a persona written against the store's
+  documented behaviour will look correct and do nothing. Mail is also the
+  only transport that reaches a sealed wake, which has no network and
+  cannot fetch a branch, so any workflow whose output is a *file* rather
+  than prose is currently limited to naming an artifact the reader cannot
+  resolve.
 - **No list-Cc delivery index.**
 - **No workspace expiry.** Seats accumulate disk until an explicit
   `fleet teardown`; there is no idle GC.
