@@ -3929,6 +3929,17 @@ codex)
     fs_reject_unsafe_chars "$harness_bin" "$harness_version"
 }
 
+# Which Claude credential a claude leg reads: CLAUDE_CREDENTIALS in
+# claude.env, when set, else today's default ($HOME/.claude/.credentials.json,
+# falling back to the Keychain on macOS). One process-wide fact, not scoped
+# per leg -- there is no case where review or maintainer should authenticate
+# as a different account than implement, so this resolves once rather than
+# through fs_resolve_harness's per-prefix namerefs.
+claude_credentials_resolved="$(fs_read_env_value "$config_dir/claude.env" CLAUDE_CREDENTIALS || true)"
+if [[ -n "$claude_credentials_resolved" ]]; then
+    fs_reject_unsafe_chars "$claude_credentials_resolved"
+fi
+
 # Every codex credential directory this run's resolutions create, in order.
 # The generated runner deletes all of them when it ends (run_cleanup) --
 # see the codex arm of fs_resolve_harness for why the list and not one.
@@ -5129,6 +5140,11 @@ fs_build_sandbox_cmd() {
         if [[ "$session_mode" == resume && -n "$resume_session" ]]; then
             out+=(--resume-session "$resume_session")
         fi
+    fi
+    # The credential override applies to every claude leg, independent of
+    # session state -- it is a machine/launch-wide fact, not a per-session one.
+    if [[ "$b_harness" == claude && -n "$claude_credentials_resolved" ]]; then
+        out+=(--claude-credentials "$claude_credentials_resolved")
     fi
     if [[ -n "$sandbox_args" ]]; then
         # Deliberate word splitting: the caller passes a flag string.

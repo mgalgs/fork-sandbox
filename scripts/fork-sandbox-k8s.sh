@@ -464,6 +464,7 @@ fs_require_gnu_tools || exit 1
 config_dir="${FORK_SANDBOX_CONFIG_DIR:-$HOME/.config/fork-sandbox}"
 k8s_env="$config_dir/k8s.env"
 pi_env="$config_dir/pi.env"
+claude_env="$config_dir/claude.env"
 
 # Reads one NAME=VALUE line from an env file, first match wins. Never
 # `source`d: these files are read by a script that goes on to build
@@ -2903,7 +2904,14 @@ cmd_submit() {
     # validation in this function that --dry-run is meant to exercise.
     local claude_cred_json="" claude_access_token="" claude_configmap_cred=""
     if [[ "$harness" == claude ]]; then
-        claude_cred_json="$(fs_read_claude_credential)" || exit 1
+        # Machine-wide config only -- there is no per-run flag for this on
+        # the direct k8s entry point, see docs/kubernetes-runs.md.
+        local claude_credentials_override
+        claude_credentials_override="$(read_env_value "$claude_env" CLAUDE_CREDENTIALS || true)"
+        if [[ -n "$claude_credentials_override" ]]; then
+            fs_reject_unsafe_chars "$claude_credentials_override" || exit 1
+        fi
+        claude_cred_json="$(fs_read_claude_credential "$claude_credentials_override")" || exit 1
 
         # The pod cannot refresh the token, so a run that outlives it dies
         # -- the same lifetime caveat a local claude-sandboxed session has.
@@ -2916,7 +2924,7 @@ cmd_submit() {
         claude_expires_at_ms="$(printf '%s' "$claude_cred_json" | jq -r '.claudeAiOauth.expiresAt // 0')"
         claude_mins_left=$(( claude_expires_at_ms / 60000 - $(date +%s) / 60 ))
         if (( claude_mins_left <= 0 )); then
-            echo "Error: the access token in $(fs_claude_credential_source) has expired." >&2
+            echo "Error: the access token in $(fs_claude_credential_source "$claude_credentials_override") has expired." >&2
             echo "Log in with claude on the host, then retry." >&2
             exit 1
         elif (( claude_mins_left < 60 )); then
@@ -2925,12 +2933,12 @@ cmd_submit() {
 
         claude_access_token="$(printf '%s' "$claude_cred_json" | jq -r '.claudeAiOauth.accessToken // empty')"
         if [[ -z "$claude_access_token" ]]; then
-            echo "Error: $(fs_claude_credential_source) has no claudeAiOauth.accessToken." >&2
+            echo "Error: $(fs_claude_credential_source "$claude_credentials_override") has no claudeAiOauth.accessToken." >&2
             exit 1
         fi
         fs_reject_unsafe_chars "$claude_access_token" || exit 1
         reject_nginx_unsafe_chars "$claude_access_token" \
-            "the access token in $(fs_claude_credential_source)" || exit 1
+            "the access token in $(fs_claude_credential_source "$claude_credentials_override")" || exit 1
 
         # The placeholder credential shipped into the pod's ConfigMap: the
         # same sanitizing jq claude-sandboxed applies to a local sandbox's
