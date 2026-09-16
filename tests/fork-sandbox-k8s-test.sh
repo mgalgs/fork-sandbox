@@ -281,14 +281,42 @@ export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
 repo_dir="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 
 # Every run this suite launches is a fixture, not real work. Mark it so
-# sandbox-run-log.py's list/stats exclude it by default. A cluster run does
-# not append to the run log at all today, so this changes nothing yet -- it
-# is here so that whenever the k8s path does gain a run-log entry, this
-# suite's fixtures do not silently start polluting the operator's stats.
+# sandbox-run-log.py's list/stats exclude it by default: every real (non
+# --dry-run) submit this suite drives now appends a row to the operator's
+# own ~/.claude/sandbox-runs.jsonl (see cmd_submit/cmd_collect's own "the
+# durable run log" work) the same way tests/fork-sandbox-maintainer-test.sh
+# already lets its own real local-path runs append for real -- this tag is
+# what keeps either kind of fixture run out of the operator's performance
+# stats without needing a scratch HOME.
 export FORK_SANDBOX_RUN_SOURCE=test
 
 pass=0; fail=0; tmpdirs=()
-cleanup() { local d; for d in "${tmpdirs[@]-}"; do [[ -n "$d" && -d "$d" ]] && rm -rf -- "$d"; done; }
+# Every real (non --dry-run) submit this suite drives now also creates a
+# genuine run directory under the forks root -- unlike every other
+# artifact this suite creates, that directory is deliberately NOT removed
+# by the tool itself (an orchestrator removes it after review, exactly
+# like a local run's own run directory), so most call sites below have
+# nothing to add to tmpdirs for it. Swept at exit instead: snapshot what is
+# already there before any test runs, then remove whatever new
+# claude-fork-sandbox.* directory shows up by the time this suite exits --
+# a stubbed-kubectl fixture run's own directory is not evidence worth
+# keeping on a real machine, and this suite alone drives dozens of real
+# submits.
+k8s_test_forks_root=/var/tmp/claude-scratch/forks
+k8s_test_preexisting_rundirs="$(find "$k8s_test_forks_root" -maxdepth 1 \
+    -name 'claude-fork-sandbox.*' 2>/dev/null | sort)"
+cleanup() {
+    local d
+    for d in "${tmpdirs[@]-}"; do [[ -n "$d" && -d "$d" ]] && rm -rf -- "$d"; done
+    local after
+    after="$(find "$k8s_test_forks_root" -maxdepth 1 \
+        -name 'claude-fork-sandbox.*' 2>/dev/null | sort)"
+    while IFS= read -r d; do
+        [[ -z "$d" ]] && continue
+        grep -qxF "$d" <<< "$k8s_test_preexisting_rundirs" && continue
+        rm -rf -- "$d"
+    done <<< "$after"
+}
 trap cleanup EXIT
 ok() { printf '  ok    %s\n' "$1"; pass=$(( pass + 1 )); }
 no() { printf '  FAIL  %s\n' "$1"; [[ -n "${2:-}" ]] && printf '        %s\n' "$2"; fail=$(( fail + 1 )); }
@@ -8616,6 +8644,91 @@ fi
 svc_val_usage_rc=0
 python3 "$svc_parse_py" a b c d > /dev/null 2>&1 || svc_val_usage_rc=$?
 check "render form: a wrong argument count is refused" 1 "$svc_val_usage_rc"
+
+printf '\n== the durable run log: cmd_submit creates and populates the run directory ==\n'
+# --dry-run contacts nothing, and that includes the host filesystem outside
+# rendering: no run directory may appear under the forks root.
+rundir_dryrun_marker="$(mktemp /var/tmp/claude-scratch/forks/fs-k8s-test-rundir-marker.XXXXXX)"
+FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-rundir-dryrun --model moonshotai/kimi-k3 \
+    "$proj_dir" "$handoff_file" > /dev/null 2>/tmp/fs-k8s-test-rundir-dryrun.err
+rundir_dryrun_leak="$(find /var/tmp/claude-scratch/forks -maxdepth 1 \
+    -name 'claude-fork-sandbox.*' -newer "$rundir_dryrun_marker" 2>/dev/null)"
+if [[ -z "$rundir_dryrun_leak" ]]; then
+    ok "submit --dry-run creates no run directory"
+else
+    no "submit --dry-run creates no run directory" "$rundir_dryrun_leak"
+fi
+rm -f "$rundir_dryrun_marker"
+
+rundir_handoff="$(newdir)/handoff.md"; tmpdirs+=("$(dirname "$rundir_handoff")")
+printf 'do the submit-time task\n' > "$rundir_handoff"
+rundir_kubectl_log="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$rundir_kubectl_log")")
+rundir_submit_out="$(newdir)/submit-out.txt"; tmpdirs+=("$(dirname "$rundir_submit_out")")
+rundir_head_sha="$(git -C "$proj_dir" rev-parse HEAD)"
+PATH="$runstub_dir:$PATH" K8S_STUB_LOG="$rundir_kubectl_log" \
+    K8S_STUB_BASE_SHA="$rundir_head_sha" \
+    FORK_SANDBOX_CONFIG_DIR="$config_dir" \
+    "$k8s_sh" submit --branch fs-k8s-test-rundir-submit --model moonshotai/kimi-k3 \
+    --task-meta '{"kind":"implement","difficulty":2}' \
+    "$proj_dir" "$rundir_handoff" > "$rundir_submit_out" 2>&1
+rundir_submit_rc=$?
+rundir_rd="$(sed -n 's/^  run dir:  *//p' "$rundir_submit_out" | head -1)"
+if (( rundir_submit_rc == 0 )) && [[ -n "$rundir_rd" && -d "$rundir_rd" ]]; then
+    ok "submit prints a run dir path and it exists"
+    tmpdirs+=("$rundir_rd")
+else
+    no "submit prints a run dir path and it exists" \
+        "rc=$rundir_submit_rc out=$(cat "$rundir_submit_out")"
+fi
+
+if [[ -n "$rundir_rd" && -d "$rundir_rd" ]]; then
+    check "the run dir's basename is prefixed claude-fork-sandbox." \
+        "claude-fork-sandbox" "$(basename "$rundir_rd" | grep -o '^claude-fork-sandbox')"
+    check "the run dir sits directly under the forks root" \
+        "/var/tmp/claude-scratch/forks" "$(dirname "$rundir_rd")"
+    check "run.env carries mode=run" "mode=run" "$(grep '^mode=' "$rundir_rd/run.env")"
+    check "run.env carries the harness" "harness=pi" "$(grep '^harness=' "$rundir_rd/run.env")"
+    check "run.env carries network=cluster" \
+        "network=cluster" "$(grep '^network=' "$rundir_rd/run.env")"
+    check "run.env carries the model" \
+        "model=moonshotai/kimi-k3" "$(grep '^model=' "$rundir_rd/run.env")"
+    check "run.env carries the branch" \
+        "branch=fs-k8s-test-rundir-submit" "$(grep '^branch=' "$rundir_rd/run.env")"
+    check "run.env carries the origin repo" \
+        "origin_repo=$(fs_repo_toplevel "$proj_dir")" "$(grep '^origin_repo=' "$rundir_rd/run.env")"
+    check "run.env carries base_sha (this repo's HEAD, no --checkout given)" \
+        "base_sha=$rundir_head_sha" "$(grep '^base_sha=' "$rundir_rd/run.env")"
+    check "task-meta.json carries what --task-meta passed" \
+        '{"kind":"implement","difficulty":2}' \
+        "$(jq -c . "$rundir_rd/task-meta.json" 2>/dev/null)"
+    check "the run-source marker carries this suite's own FORK_SANDBOX_RUN_SOURCE=test tag" \
+        "test" "$(cat "$rundir_rd/run-source" 2>/dev/null)"
+    check "the archived handoff matches what was submitted" \
+        "do the submit-time task" "$(cat "$rundir_rd/handoff.md" 2>/dev/null)"
+
+    # The copy must be taken AT SUBMIT TIME, not re-read later: the caller
+    # may edit or remove the original while the run is in flight.
+    printf 'edited after submit\n' > "$rundir_handoff"
+    check "the archived handoff is a copy taken at submit time, not re-read later" \
+        "do the submit-time task" "$(cat "$rundir_rd/handoff.md" 2>/dev/null)"
+fi
+
+# --task-meta is validated before anything is created: an invalid JSON
+# value is refused with an empty kubectl log (nothing created).
+rundir_badmeta_log="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$rundir_badmeta_log")")
+refuses "--task-meta must be one valid JSON object" \
+    "must be one valid JSON object" \
+    env PATH="$runstub_dir:$PATH" K8S_STUB_LOG="$rundir_badmeta_log" \
+    FORK_SANDBOX_CONFIG_DIR="$config_dir" \
+    "$k8s_sh" submit --branch fs-k8s-test-rundir-badmeta --model moonshotai/kimi-k3 \
+    --task-meta 'not json' \
+    "$proj_dir" "$handoff_file"
+if [[ ! -s "$rundir_badmeta_log" ]]; then
+    ok "an invalid --task-meta creates nothing (empty kubectl log)"
+else
+    no "an invalid --task-meta creates nothing (empty kubectl log)" "$(cat "$rundir_badmeta_log")"
+fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))

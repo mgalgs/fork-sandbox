@@ -8,7 +8,7 @@
 #                            [--outbox-max SIZE]
 #                            [--context-ro DIR]
 #                            [--checkout REF] [--services-trust-ref REF]
-#                            [--label key=value]...
+#                            [--label key=value]... [--task-meta JSON]
 #                            <project-path> <handoff-file>
 #        fork-sandbox-k8s.sh run [--dry-run] [--timeout SECONDS] [--keep]
 #                            --branch NAME [--model MODEL] [--endpoint NAME]
@@ -249,6 +249,13 @@
 # see docs/kubernetes-runs.md. K8S_RUN_LABELS in k8s.env supplies file-level
 # defaults; a --label for the same key overrides the file's value (announced
 # on stderr), a file-only key survives unchanged.
+#
+# --task-meta JSON (submit, run): one JSON object of orchestrator-supplied
+# task metadata, folded verbatim into the run's row in the durable run log
+# (~/.claude/sandbox-runs.jsonl) as its `task` field -- the same flag and
+# the same meaning as fork-sandbox.sh's own local --task-meta. See "The
+# durable run log" in docs/kubernetes-runs.md and sandbox-run-log.py's own
+# header for the recommended fields.
 #
 # --harness pi|claude (submit): which coding harness the pod runs. Defaults
 # to pi, which talks to the shared fork-sandbox-proxy over PROXY_BASE_URL,
@@ -2608,7 +2615,7 @@ cmd_install() {
 cmd_submit() {
     local dry_run=false branch="" model="" review_loop_cap="" outbox_max_arg=""
     local context_ro="" harness="pi" review_model="" endpoint="" checkout_ref=""
-    local pi_args="" services_trust_ref=""
+    local pi_args="" services_trust_ref="" task_meta=""
     local -a labels_raw=()
     while (( $# )); do
         case "$1" in
@@ -2625,6 +2632,7 @@ cmd_submit() {
             --outbox-max) outbox_max_arg="${2:?--outbox-max requires a size}"; shift 2 ;;
             --context-ro) context_ro="${2:?--context-ro requires a directory}"; shift 2 ;;
             --label) labels_raw+=("${2:?--label requires key=value}"); shift 2 ;;
+            --task-meta) task_meta="${2:?--task-meta requires a JSON object}"; shift 2 ;;
             -*) echo "Error: unknown option '$1' for submit." >&2; exit 1 ;;
             *) break ;;
         esac
@@ -2639,6 +2647,24 @@ cmd_submit() {
             exit 1
             ;;
     esac
+
+    # --task-meta never enters the pod -- it is written straight to a file
+    # in the run directory, where sandbox-run-log.py's `record` (invoked by
+    # cmd_collect) picks it up as the record's `task` object -- so the check
+    # it needs is JSON validity, not shell safety, the same rule
+    # fork-sandbox.sh's own local --task-meta applies. Compacting to one
+    # line here also normalizes whatever whitespace the caller's JSON
+    # carried. Validated before anything is created, so a typo fails at
+    # once, same as every other pre-creation check in this function.
+    if [[ -n "$task_meta" ]]; then
+        if ! task_meta="$(printf '%s' "$task_meta" \
+            | jq -ce 'if type == "object" then . else halt_error end' 2>/dev/null)"; then
+            echo "Error: --task-meta must be one valid JSON object, e.g." >&2
+            echo "  --task-meta '{\"kind\":\"implement\",\"difficulty\":3}'" >&2
+            echo "See sandbox-run-log.py's header for the recommended fields." >&2
+            exit 1
+        fi
+    fi
 
     # --pi-args names pi, which only the pi harness starts -- the same
     # refusal fork-sandbox.sh's own --pi-args applies to its non-pi
@@ -3477,6 +3503,75 @@ EOF
         exit 0
     fi
 
+    # This run's row in the durable run log (~/.claude/sandbox-runs.jsonl):
+    # a run directory in exactly the shape fork-sandbox.sh's own local run
+    # creates (same mktemp template, same FORKS_ROOT, same prefix), so
+    # sandbox-run-log.py's `record` -- invoked by cmd_collect once the run
+    # is known to have finished -- can read it back as an ordinary run
+    # directory rather than needing a second code path of its own. Created
+    # here, after --dry-run's exit above (a dry-run contacts nothing, and
+    # that includes the host filesystem outside rendering), but before any
+    # cluster object exists, so it is populated with what submit already
+    # knows regardless of whether the cluster calls below succeed.
+    #
+    # Never removed by this script: unlike every other per-run resource
+    # cmd_collect or its EXIT trap cleans up, this directory is the join
+    # key an orchestrator later attaches a verdict to (`sandbox-run-log.py
+    # verdict <run-id>`, the directory's basename), and it is what
+    # cmd_collect's own record call reads -- removing it here would defeat
+    # the whole point. It is removed by the orchestrator after review,
+    # exactly like a local run's own run directory.
+    local run_dir
+    run_dir="$(mktemp -d /var/tmp/claude-scratch/forks/claude-fork-sandbox.XXXXXX)"
+    fs_reject_unsafe_chars "$run_dir"
+
+    # The run's provenance, when the launching shell declared one -- same
+    # absence convention and same file name as fork-sandbox.sh's own local
+    # run (scripts/fork-sandbox.sh, beside its own run_dir creation):
+    # sandbox-run-log.py reads this back as the record's `source`, so a
+    # test suite driving this script for real (a stubbed kubectl, no
+    # cluster) can tag its fixture runs and stay out of the operator's own
+    # stats without this script needing to know why.
+    if [[ -n "${FORK_SANDBOX_RUN_SOURCE:-}" ]]; then
+        printf '%s\n' "$FORK_SANDBOX_RUN_SOURCE" > "$run_dir/run-source"
+    fi
+
+    # The task metadata rides beside the run, where sandbox-run-log.py
+    # picks it up at collect time -- same absence convention as a local
+    # run's own task-meta.json: no file when --task-meta was not given.
+    if [[ -n "$task_meta" ]]; then
+        printf '%s\n' "$task_meta" > "$run_dir/task-meta.json"
+    fi
+
+    # The handoff, copied now rather than left for cmd_collect to read
+    # later: the caller may edit or remove the original file while the run
+    # is in flight (it already handed the content to the pod, via the
+    # rendered ConfigMap above), and the archived copy must be what THIS
+    # run actually used.
+    cp -- "$handoff_file" "$run_dir/handoff.md"
+
+    # run.env: the same fallback shape a local run's own run.env offers
+    # sandbox-run-log.py when summary.json (written by cmd_collect, once
+    # the run is known to have finished) is missing or unreadable.
+    # base_sha here is the revision the branch is about to start from --
+    # checkout_sha when --checkout was given, else this repo's HEAD --
+    # computed independently of the review-loop's own base_sha above
+    # (which stays empty without --review-loop) because the log wants this
+    # value regardless of whether a review loop ran.
+    local run_log_base_sha="$checkout_sha"
+    if [[ -z "$run_log_base_sha" ]]; then
+        run_log_base_sha="$(cd "$origin_repo" && git rev-parse HEAD 2>/dev/null || true)"
+    fi
+    {
+        printf 'mode=run\n'
+        printf 'harness=%s\n' "$harness"
+        printf 'network=cluster\n'
+        printf 'model=%s\n' "$model"
+        printf 'branch=%s\n' "$branch"
+        printf 'origin_repo=%s\n' "$origin_repo"
+        printf 'base_sha=%s\n' "$run_log_base_sha"
+    } > "$run_dir/run.env"
+
     # Spool and size the context before creating anything in the cluster or
     # pushing the repository. The EXIT trap covers tar/stat failures and
     # later submit failures, so a large temporary archive cannot leak.
@@ -3634,6 +3729,11 @@ EOF
 
     echo "fork-sandbox-k8s: submitted. branch=$branch pod=$pod_name" >&2
     echo "fork-sandbox-k8s: fetch with: fork-sandbox-k8s.sh fetch --branch $branch $project_path" >&2
+    # Same line shape fork-sandbox.sh's own local launcher prints (two
+    # leading spaces, "run dir:", two spaces), so a caller fanning out --
+    # fork-sandbox-postmaster.sh, this project's own test suites -- scrapes
+    # it with the identical `sed -n 's/^  run dir:  *//p'` either path uses.
+    printf '  run dir:  %s\n' "$run_dir" >&2
 }
 
 cmd_fetch() {
