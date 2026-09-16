@@ -268,6 +268,13 @@
 #     repository push in submit surfaces the pod's container log, since
 #     a pod that died in early discovery would otherwise only show
 #     git's bare "connection refused".
+#   - CLAUDE_CREDENTIALS in claude.env: a --harness claude submit --dry-run
+#     reads the named file instead of $HOME/.claude/.credentials.json for
+#     both the ConfigMap placeholder and the per-run Secret's access
+#     token; a missing named file fails naming that path, not the default;
+#     an expired override's error also names the override path, proving
+#     fs_claude_credential_source and fs_read_claude_credential are
+#     threaded the same override, not just one of the two.
 #   - the durable run log (~/.claude/sandbox-runs.jsonl): submit creates a
 #     run directory in exactly the shape fork-sandbox.sh's own local run
 #     creates, prints its path on a "  run dir:  " line a fan-out caller
@@ -3141,6 +3148,94 @@ else
         "not found in $claude_submit_out"
 fi
 rm -f /tmp/fs-k8s-test-claude-submit.err
+
+printf '\n== fork-sandbox-k8s.sh submit --dry-run --harness claude, CLAUDE_CREDENTIALS override ==\n'
+# An empty HOME -- no ~/.claude at all -- so the default credential lookup
+# has nothing to fall back to. Any of the three checks below succeeding
+# proves the override in claude.env was actually read, not the default path
+# silently working some other way.
+claude_override_home="$(newdir)"; tmpdirs+=("$claude_override_home")
+
+claude_override_config_dir="$(newdir)"; tmpdirs+=("$claude_override_config_dir")
+cp "$config_dir/k8s.env" "$claude_override_config_dir/k8s.env"
+install -m 600 /dev/null "$claude_override_config_dir/pi.env"
+printf 'OPENROUTER_API_KEY=sk-test-dummy\n' >> "$claude_override_config_dir/pi.env"
+
+claude_override_cred="$(newdir)/override-credentials.json"; tmpdirs+=("$(dirname "$claude_override_cred")")
+claude_override_token="fixture-override-secret-token-do-not-leak"
+cat > "$claude_override_cred" <<JSON
+{"claudeAiOauth": {"accessToken": "$claude_override_token", "refreshToken": "fixture-override-refresh-token", "refreshTokenExpiresAt": 123, "expiresAt": $claude_future_ms, "scopes": ["user:inference"]}}
+JSON
+printf 'CLAUDE_CREDENTIALS=%s\n' "$claude_override_cred" > "$claude_override_config_dir/claude.env"
+
+claude_override_out="$(newdir)/claude-override-submit.yaml"; tmpdirs+=("$(dirname "$claude_override_out")")
+if HOME="$claude_override_home" FORK_SANDBOX_CONFIG_DIR="$claude_override_config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model claude-sonnet-5 --harness claude \
+    "$proj_dir" "$handoff_file" > "$claude_override_out" 2>/tmp/fs-k8s-test-claude-override.err; then
+    ok "submit --dry-run --harness claude with CLAUDE_CREDENTIALS exits 0 despite an empty HOME"
+else
+    no "submit --dry-run --harness claude with CLAUDE_CREDENTIALS exits 0 despite an empty HOME" \
+        "$(cat /tmp/fs-k8s-test-claude-override.err)"
+fi
+if grep -q '"accessToken": "sandbox"' "$claude_override_out"; then
+    ok "CLAUDE_CREDENTIALS override still renders the sandbox placeholder access token"
+else
+    no "CLAUDE_CREDENTIALS override still renders the sandbox placeholder access token" \
+        "not found in $claude_override_out"
+fi
+if grep -qF "$claude_override_token" "$claude_override_out"; then
+    no "CLAUDE_CREDENTIALS override's real access token never leaks into the output" \
+        "found the override fixture token in $claude_override_out"
+else
+    ok "CLAUDE_CREDENTIALS override's real access token never leaks into the output"
+fi
+rm -f /tmp/fs-k8s-test-claude-override.err
+
+# A CLAUDE_CREDENTIALS naming a file that does not exist must fail naming
+# that path, not silently fall back to $HOME/.claude/.credentials.json
+# (which this HOME does not even have) or the macOS Keychain.
+claude_missing_config_dir="$(newdir)"; tmpdirs+=("$claude_missing_config_dir")
+cp "$config_dir/k8s.env" "$claude_missing_config_dir/k8s.env"
+install -m 600 /dev/null "$claude_missing_config_dir/pi.env"
+printf 'OPENROUTER_API_KEY=sk-test-dummy\n' >> "$claude_missing_config_dir/pi.env"
+claude_missing_cred="$claude_override_home/does-not-exist-credentials.json"
+printf 'CLAUDE_CREDENTIALS=%s\n' "$claude_missing_cred" > "$claude_missing_config_dir/claude.env"
+refuses "a missing CLAUDE_CREDENTIALS path fails naming that path" \
+    "$claude_missing_cred" \
+    env HOME="$claude_override_home" FORK_SANDBOX_CONFIG_DIR="$claude_missing_config_dir" \
+    "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model claude-sonnet-5 --harness claude \
+    "$proj_dir" "$handoff_file"
+
+# An expired override credential must report the OVERRIDE path in its error
+# -- proving fs_claude_credential_source (not just fs_read_claude_credential)
+# is threaded the same override on this path too.
+claude_expired_config_dir="$(newdir)"; tmpdirs+=("$claude_expired_config_dir")
+cp "$config_dir/k8s.env" "$claude_expired_config_dir/k8s.env"
+install -m 600 /dev/null "$claude_expired_config_dir/pi.env"
+printf 'OPENROUTER_API_KEY=sk-test-dummy\n' >> "$claude_expired_config_dir/pi.env"
+claude_expired_cred="$(newdir)/expired-credentials.json"; tmpdirs+=("$(dirname "$claude_expired_cred")")
+claude_past_ms=$(( ($(date +%s) - 3600) * 1000 ))
+cat > "$claude_expired_cred" <<JSON
+{"claudeAiOauth": {"accessToken": "fixture-expired-token", "refreshToken": "fixture-refresh-token", "refreshTokenExpiresAt": 123, "expiresAt": $claude_past_ms, "scopes": ["user:inference"]}}
+JSON
+printf 'CLAUDE_CREDENTIALS=%s\n' "$claude_expired_cred" > "$claude_expired_config_dir/claude.env"
+claude_expired_out="$(HOME="$claude_override_home" FORK_SANDBOX_CONFIG_DIR="$claude_expired_config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model claude-sonnet-5 --harness claude \
+    "$proj_dir" "$handoff_file" 2>&1)"
+claude_expired_rc=$?
+if (( claude_expired_rc != 0 )) && [[ "$claude_expired_out" == *"the access token in $claude_expired_cred has expired"* ]]; then
+    ok "an expired CLAUDE_CREDENTIALS override's error names the override path"
+else
+    no "an expired CLAUDE_CREDENTIALS override's error names the override path" \
+        "status $claude_expired_rc: $claude_expired_out"
+fi
+if [[ "$claude_expired_out" == *"login Keychain"* ]]; then
+    no "an expired CLAUDE_CREDENTIALS override's error does not mention the Keychain" \
+        "found 'login Keychain' in: $claude_expired_out"
+else
+    ok "an expired CLAUDE_CREDENTIALS override's error does not mention the Keychain"
+fi
 
 # A claude_access_token containing '"', '$' or '\' renders into the exact
 # same nginx `set $var "...";` sink as OPENROUTER_API_KEY and a keyed
