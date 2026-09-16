@@ -4233,6 +4233,22 @@ fs_count_operator_outbox_files() {
     printf '%s\n' "$count"
 }
 
+# Appends a row to the durable run log for $1 (a run directory) -- the
+# sandbox-run-log.py record invocation cmd_collect and cmd_run's own
+# wait-failure branch both need. Best-effort, like fork-sandbox.sh's own
+# local append: a run that finished must never be reported as failed
+# because a log append broke, and a machine without sandbox-run-log.py
+# installed simply skips it.
+fs_record_run_log() {
+    local run_dir="$1" run_log_bin
+    run_log_bin="$(command -v sandbox-run-log.py 2>/dev/null || true)"
+    [[ -n "$run_log_bin" ]] || run_log_bin="$HOME/.claude/scripts/sandbox-run-log.py"
+    if [[ -x "$run_log_bin" ]]; then
+        "$run_log_bin" record --run-dir "$run_dir" >&2 \
+            || echo "fork-sandbox-k8s: run-log append failed" >&2
+    fi
+}
+
 # cmd_run's collect phase, standalone: read the review loop's outcome (when
 # --review-loop N is given and non-zero), pull the pod's /work/outbox back,
 # fetch the branch into the named project, and remove the Job and pod unless
@@ -4653,17 +4669,7 @@ cmd_collect() {
             }' > "$run_dir/summary.json" 2>/dev/null \
             || rm -f "$run_dir/summary.json"
 
-        # Best-effort, like fork-sandbox.sh's own local append: a run that
-        # finished must never be reported as failed because a log append
-        # broke, and a machine without sandbox-run-log.py installed simply
-        # skips it.
-        local run_log_bin
-        run_log_bin="$(command -v sandbox-run-log.py 2>/dev/null || true)"
-        [[ -n "$run_log_bin" ]] || run_log_bin="$HOME/.claude/scripts/sandbox-run-log.py"
-        if [[ -n "$run_log_bin" && -x "$run_log_bin" ]]; then
-            "$run_log_bin" record --run-dir "$run_dir" >&2 \
-                || echo "fork-sandbox-k8s: run-log append failed" >&2
-        fi
+        fs_record_run_log "$run_dir"
     fi
 
     # A zero-harvest run is not a success: the agent exited 0, the fetch
@@ -4892,13 +4898,7 @@ cmd_run() {
         # from wait's own perspective -- no further wait will ever turn
         # into a normal completion -- so those still get the row.
         if [[ -n "$run_dir" && "$wait_rc" != 1 ]]; then
-            local run_log_bin
-            run_log_bin="$(command -v sandbox-run-log.py 2>/dev/null || true)"
-            [[ -n "$run_log_bin" ]] || run_log_bin="$HOME/.claude/scripts/sandbox-run-log.py"
-            if [[ -n "$run_log_bin" && -x "$run_log_bin" ]]; then
-                "$run_log_bin" record --run-dir "$run_dir" >&2 \
-                    || echo "fork-sandbox-k8s: run-log append failed" >&2
-            fi
+            fs_record_run_log "$run_dir"
         fi
         exit "$wait_rc"
     fi
