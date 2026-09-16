@@ -795,6 +795,14 @@ numbers nobody is computing would imply there is. `commits_added` **is**
 filled in during the loop here, unlike locally — the pod owns the clone
 directly, so `git rev-list --count` needs no fetch to run against.
 
+`coding_exit_code` carries the coding leg's own exit status, recorded but
+never dispositive: whether the branch holds commits decides whether the
+loop runs at all, not whether that leg exited zero. A non-zero exit still
+gets the branch reviewed — the review prompt is told the session may be
+incomplete — with `coding_exit_code` there for a reader to see that it
+happened; only a branch with no commits past `BASE_SHA`, or one this pod
+cannot read at all, skips.
+
 `fork-sandbox-k8s.sh run` reads `/work/review-loop.json` back and prints a
 summary before fetching the branch, because of a constraint the local run
 does not have: **the container's own exit code always stays the CODING
