@@ -293,6 +293,7 @@ origin_sub="$scratch/origin-subproject"
 clone_sub="$scratch/clone-subproject"
 mkdir -p "$origin_sub/web/node_modules/pkg" "$clone_sub/web"
 printf '{}\n' > "$origin_sub/web/package.json"
+printf '{}\n' > "$clone_sub/web/package.json"
 printf 'v20.12.2\n' > "$origin_sub/web/.nvmrc"
 printf 'module.exports = 1\n' > "$origin_sub/web/node_modules/pkg/index.js"
 FS_BACKEND_TOOLCHAIN=host
@@ -304,6 +305,17 @@ if [[ -f "$clone_sub/web/node_modules/pkg/index.js" ]]; then
     ok "a subproject node_modules lands at the matching clone path"
 else
     no "a subproject node_modules lands at the matching clone path"
+fi
+
+# The origin working tree may have a Node subproject that is absent from the
+# ref selected for the clone. Provisioning must not recreate that directory.
+clone_without_sub="$scratch/clone-without-subproject"
+mkdir -p "$clone_without_sub"
+fs_node_provision "$origin_sub" "$clone_without_sub" 2>"$scratch/absent-subproject-err"
+if [[ -e "$clone_without_sub/web" ]]; then
+    no "an origin-only subproject is not recreated in the clone"
+else
+    ok "an origin-only subproject is not recreated in the clone"
 fi
 
 # A root .nvmrc keeps precedence over a subproject's version.
@@ -354,6 +366,16 @@ if [[ -f "$clone_sub/web/node_modules/pkg/current.js" && \
     ok "a reused clone replaces a subproject node_modules tree"
 else
     no "a reused clone replaces a subproject node_modules tree"
+fi
+
+# Cleanup cannot rely on current origin discovery: the project may have been
+# removed since the previous wake while its untracked dependency tree remains.
+rm -f "$origin_sub/web/package.json"
+fs_node_provision "$origin_sub" "$clone_sub" true >/dev/null 2>&1
+if [[ -e "$clone_sub/web/node_modules" ]]; then
+    no "a reused clone drops dependencies for a removed subproject"
+else
+    ok "a reused clone drops dependencies for a removed subproject"
 fi
 HOME="$node_real_home"
 

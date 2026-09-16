@@ -556,6 +556,17 @@ fs_node_provision() {
     local path base rel selected_nvmrc="" selected_rel="" candidate_ver idx
     local -a shown project_paths project_rels
     FS_NODE_FLAGS=()
+    # A reused clone can retain an untracked dependency tree after the new
+    # checkout removes that project's package.json (or all its tracked files).
+    # Clean the bounded set of locations we provision before discovering the
+    # projects that exist in the origin now.
+    if [[ "$reused" == true ]]; then
+        [[ ! -e "$clone_dir/node_modules" ]] || rm -rf "$clone_dir/node_modules"
+        for dir in "$clone_dir"/*/node_modules; do
+            [[ -e "$dir" ]] || continue
+            rm -rf "$dir"
+        done
+    fi
     project_paths=("$origin_repo")
     project_rels=("")
     # A node project is commonly one layer below a non-node backend. Keep the
@@ -613,10 +624,10 @@ fs_node_provision() {
         else
             dir="$clone_dir/node_modules"
         fi
-        if [[ "$reused" == true && -e "$dir" ]]; then
-            rm -rf "$dir"
-        fi
         [[ -d "$path/node_modules" ]] || continue
+        # The origin working tree can differ from the ref checked out in the
+        # clone. Do not recreate a subproject that the requested ref removed.
+        [[ -z "$rel" || -f "$clone_dir/$rel/package.json" ]] || continue
         echo "Copying node_modules into the clone..." >&2
         cp -a "$path/node_modules" "$dir"
         # Nearly all of that tree is JavaScript and runs anywhere. A few
