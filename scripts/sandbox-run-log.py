@@ -708,6 +708,14 @@ def cmd_list(args):
         ts = (r.get("ts") or "")[:10]
         usage = r.get("usage") or {}
         cost = r.get("cost_usd")
+        # r.get(k, "-") only falls back when the key is ABSENT -- a key
+        # present with a JSON null (exit_code and commits both go through
+        # this once undecidable, see cmd_collect) comes back as None, and
+        # str(None) is the four-character string "None". r.get(k) with no
+        # default returns None either way, so a single "is not None" check
+        # covers both "absent" and "present-and-null" as "-".
+        exit_code = r.get("exit_code")
+        commits = r.get("commits")
         table.append((
             r.get("run_id", "?")[:30],
             ts,
@@ -715,8 +723,8 @@ def cmd_list(args):
             model[:24],
             str(get_path(r, "task.kind") or "-"),
             str(get_path(r, "task.difficulty") or "-"),
-            str(r.get("exit_code", "-")),
-            str(r.get("commits", "-")),
+            str(exit_code) if exit_code is not None else "-",
+            str(commits) if commits is not None else "-",
             fmt_tok(usage.get("input_tokens")),
             fmt_tok(usage.get("output_tokens")),
             f"${cost:.4f}" if isinstance(cost, (int, float)) else "-",

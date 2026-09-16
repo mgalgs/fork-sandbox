@@ -282,5 +282,20 @@ out="$(query show claude-fork-sandbox.histpinned)"
 contains "a row that already carries network is left alone" \
     '"network": "pinned"' "$out"
 
+printf '\n== list: a present-and-null exit_code/commits renders as "-", never "None" ==\n'
+# dict.get(k, default) only falls back when the key is ABSENT. commits:
+# null is the deliberate "not measured" value cmd_collect writes when a
+# commit count is undecidable (see fork-sandbox-k8s.sh), and exit_code:
+# null is reachable the same way (cmd_collect's --argjson exit_code
+# "${agent_exit_code:-null}"). A key present with JSON null comes back as
+# Python None, and str(None) is the four-character string "None" -- this
+# row would print it in both the EXIT and CMTS columns if list regressed
+# to r.get(k, "-").
+printf '%s\n' '{"v":1,"event":"run_end","run_id":"claude-fork-sandbox.nullrender","ts":"2025-01-01T00:00:00+00:00","source":"fork-sandbox","harness":"pi","network":"cluster","model":null,"exit_code":null,"commits":null}' >> "$log_file"
+out="$(query list 2>/dev/null)"
+nullrender_line="$(grep 'claude-fork-sandbox.nullrender' <<< "$out")"
+not_contains "list never renders a present-and-null exit_code/commits as the literal string None" \
+    "None" "$nullrender_line"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))
