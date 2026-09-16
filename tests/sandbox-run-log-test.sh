@@ -70,6 +70,100 @@ mk_run_dir() {  # $1 = distinctive suffix
     mktemp -d "/var/tmp/claude-scratch/forks/claude-fork-sandbox.rlog-$1.XXXXXX"
 }
 
+quota_path() {  # $1 = run directory
+    printf '%s/.claude/codex-quota/%s.jsonl' "$log_home" "$(basename "$1")"
+}
+
+record_field() {  # $1 = run id, $2 = field name
+    python3 -c '
+import json, sys
+for line in open(sys.argv[1], encoding="utf-8"):
+    rec = json.loads(line)
+    if rec.get("event") == "run_end" and rec.get("run_id") == sys.argv[2]:
+        print(rec.get(sys.argv[3], ""))
+        break
+' "$log_file" "$1" "$2"
+}
+
+printf '== record: no Codex sessions is silent ==\n'
+rd_no_sessions="$(mk_run_dir no-sessions)"
+tmpdirs+=("$rd_no_sessions")
+printf '0\n' > "$rd_no_sessions/exit-code"
+record "$rd_no_sessions" >/dev/null 2>"$tmp/err"
+check "a non-Codex run creates no quota directory" "no" \
+    "$(test -d "$log_home/.claude/codex-quota" && echo yes || echo no)"
+check "a non-Codex run creates no quota file" "no" \
+    "$(test -e "$(quota_path "$rd_no_sessions")" && echo yes || echo no)"
+
+printf '\n== record: Codex quota snapshots ==\n'
+rd_one="$(mk_run_dir quota-one)"
+tmpdirs+=("$rd_one")
+mkdir -p "$rd_one/codex-sessions/2026/09/15"
+one_first='{"timestamp":"2026-09-15T01:00:00.000Z","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":2.5}}}}'
+one_middle='{"timestamp":"2026-09-15T01:01:00.000Z","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":3.75}}}}'
+one_last='{"timestamp":"2026-09-15T01:02:00.000Z","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":5.0}}}}'
+printf '%s\n%s\n%s\n' "$one_first" "$one_middle" "$one_last" \
+    > "$rd_one/codex-sessions/2026/09/15/rollout-one.jsonl"
+record "$rd_one" >/dev/null 2>"$tmp/err"
+printf '%s\n%s\n' "$one_first" "$one_last" > "$tmp/quota-one-expected"
+check "one rollout contributes its first and last quota rows" "2" \
+    "$(wc -l < "$(quota_path "$rd_one")" | tr -d ' ')"
+check "archived quota rows retain their original bytes" "same" \
+    "$(cmp -s "$tmp/quota-one-expected" "$(quota_path "$rd_one")" && echo same || echo different)"
+check "the record reports the archived quota row count" "2" \
+    "$(record_field "$(basename "$rd_one")" codex_quota_rows)"
+
+rd_two="$(mk_run_dir quota-two)"
+tmpdirs+=("$rd_two")
+mkdir -p "$rd_two/codex-sessions/2026/09/15"
+two_a_first='{"timestamp":"2026-09-15T02:00:00.000Z","payload":{"rate_limits":{"primary":{"used_percent":20.0}}}}'
+two_a_last='{"timestamp":"2026-09-15T04:00:00.000Z","payload":{"rate_limits":{"primary":{"used_percent":40.0}}}}'
+two_b_first='{"timestamp":"2026-09-15T01:00:00.000Z","payload":{"rate_limits":{"primary":{"used_percent":10.0}}}}'
+two_b_last='{"timestamp":"2026-09-15T05:00:00.000Z","payload":{"rate_limits":{"primary":{"used_percent":50.0}}}}'
+printf '%s\n%s\n' "$two_a_first" "$two_a_last" \
+    > "$rd_two/codex-sessions/2026/09/15/rollout-a.jsonl"
+printf '%s\n%s\n' "$two_b_first" "$two_b_last" \
+    > "$rd_two/codex-sessions/2026/09/15/rollout-b.jsonl"
+record "$rd_two" >/dev/null 2>"$tmp/err"
+printf '%s\n%s\n%s\n%s\n' "$two_b_first" "$two_a_first" "$two_a_last" "$two_b_last" \
+    > "$tmp/quota-two-expected"
+check "two rollout legs contribute four ordered quota rows" "same" \
+    "$(cmp -s "$tmp/quota-two-expected" "$(quota_path "$rd_two")" && echo same || echo different)"
+
+rd_single="$(mk_run_dir quota-single)"
+tmpdirs+=("$rd_single")
+mkdir -p "$rd_single/codex-sessions"
+single_row='{"timestamp":"2026-09-15T06:00:00.000Z","payload":{"rate_limits":{"primary":{"used_percent":60.0}}}}'
+printf '%s\n' "$single_row" > "$rd_single/codex-sessions/rollout-single.jsonl"
+record "$rd_single" >/dev/null 2>"$tmp/err"
+check "a single quota row is archived once" "1" \
+    "$(wc -l < "$(quota_path "$rd_single")" | tr -d ' ')"
+
+rd_none="$(mk_run_dir quota-none)"
+tmpdirs+=("$rd_none")
+mkdir -p "$rd_none/codex-sessions"
+printf '%s\n' '{"timestamp":"2026-09-15T07:00:00.000Z","payload":{"type":"token_count"}}' \
+    > "$rd_none/codex-sessions/rollout-none.jsonl"
+record "$rd_none" >/dev/null 2>"$tmp/err"
+check "rows without rate limits do not create an archive" "no" \
+    "$(test -e "$(quota_path "$rd_none")" && echo yes || echo no)"
+check "rows without rate limits omit quota fields from the record" "" \
+    "$(record_field "$(basename "$rd_none")" codex_quota_rows)"
+
+rd_bad="$(mk_run_dir quota-malformed)"
+tmpdirs+=("$rd_bad")
+mkdir -p "$rd_bad/codex-sessions"
+bad_first='{"timestamp":"2026-09-15T08:00:00.000Z","payload":{"rate_limits":{"primary":{"used_percent":70.0}}}}'
+bad_last='{"timestamp":"2026-09-15T09:00:00.000Z","payload":{"rate_limits":{"primary":{"used_percent":80.0}}}}'
+printf '%s\n%s\n%s\n' "$bad_first" '{not json' "$bad_last" \
+    > "$rd_bad/codex-sessions/rollout-bad.jsonl"
+record "$rd_bad" >/dev/null 2>"$tmp/err"
+printf '%s\n%s\n' "$bad_first" "$bad_last" > "$tmp/quota-bad-expected"
+check "a malformed rollout line does not discard good quota rows" "same" \
+    "$(cmp -s "$tmp/quota-bad-expected" "$(quota_path "$rd_bad")" && echo same || echo different)"
+check "a malformed rollout line still appends the run record" "2" \
+    "$(record_field "$(basename "$rd_bad")" codex_quota_rows)"
+
 printf '== record: network is lifted from summary.json ==\n'
 rd_sealed="$(mk_run_dir sealed)"
 tmpdirs+=("$rd_sealed")

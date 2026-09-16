@@ -162,10 +162,11 @@ import re
 import statistics
 import sys
 
-# One fixed file and one fixed archive dir. Not arguments, on purpose: with
-# no output path there is nothing to aim somewhere else.
+# One fixed file and fixed archive dirs. Not arguments, on purpose: with no
+# output path there is nothing to aim somewhere else.
 LOG = os.path.expanduser("~/.claude/sandbox-runs.jsonl")
 ARCHIVE_DIR = os.path.expanduser("~/.claude/sandbox-handoffs")
+QUOTA_DIR = os.path.expanduser("~/.claude/codex-quota")
 
 # `record` reads files a run left behind, so its one path argument must be a
 # run directory the fork machinery itself created -- the same boundary
@@ -340,6 +341,54 @@ def load_run_env(path):
     return env
 
 
+def archive_codex_quota(run_dir, run_id):
+    """Extract the first and last rate-limit row from each Codex rollout."""
+    sessions_dir = os.path.join(run_dir, "codex-sessions")
+    if not os.path.isdir(sessions_dir):
+        return None
+
+    rows = []
+    for root, dirs, names in os.walk(sessions_dir):
+        dirs.sort()
+        for name in sorted(names):
+            if not name.endswith(".jsonl"):
+                continue
+            path = os.path.join(root, name)
+            first = last = None
+            with open(path, "rb") as f:
+                for raw_line in f:
+                    try:
+                        row = json.loads(raw_line)
+                        payload = row.get("payload")
+                        timestamp = row.get("timestamp")
+                    except (AttributeError, UnicodeDecodeError, ValueError):
+                        # A rollout log is not important enough to lose its
+                        # enclosing run record over one corrupt line.
+                        continue
+                    if (not isinstance(payload, dict)
+                            or "rate_limits" not in payload
+                            or not isinstance(timestamp, str)):
+                        continue
+                    item = (timestamp, raw_line)
+                    if first is None:
+                        first = item
+                    last = item
+            if first is not None:
+                rows.append(first)
+                if last is not first:
+                    rows.append(last)
+
+    if not rows:
+        return None
+    rows.sort(key=lambda row: row[0])
+    os.makedirs(QUOTA_DIR, exist_ok=True)
+    dest = os.path.join(QUOTA_DIR, run_id + ".jsonl")
+    with open(dest, "wb") as f:
+        for _, raw_line in rows:
+            f.write(raw_line)
+    return dest, len(rows)
+
+
 def cmd_record(args):
     rd = os.path.realpath(args.run_dir)
     root = os.path.realpath(FORKS_ROOT)
@@ -506,6 +555,18 @@ def cmd_record(args):
         except OSError as e:
             print(f"sandbox-run-log: handoff not archived: {e}",
                   file=sys.stderr)
+
+    # Codex's private rollout logs are deleted with the run directory, but
+    # their rate-limit rows are the only quota record. Keep just the first
+    # and last row from each rollout: enough to show each leg's spend without
+    # preserving the transcripts or making storage grow with turn count.
+    try:
+        quota_archive = archive_codex_quota(rd, run_id)
+        if quota_archive is not None:
+            rec["codex_quota_archive"], rec["codex_quota_rows"] = quota_archive
+    except (OSError, UnicodeDecodeError, ValueError) as e:
+        print(f"sandbox-run-log: Codex quota not archived: {e}",
+              file=sys.stderr)
 
     append(rec)
     print(
