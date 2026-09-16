@@ -164,6 +164,55 @@ check "a malformed rollout line does not discard good quota rows" "same" \
 check "a malformed rollout line still appends the run record" "2" \
     "$(record_field "$(basename "$rd_bad")" codex_quota_rows)"
 
+lines_all_parse() {  # $1 = file path
+    python3 -c '
+import json, sys
+try:
+    with open(sys.argv[1], "rb") as f:
+        for line in f:
+            json.loads(line)
+except Exception:
+    print("no")
+    sys.exit(0)
+print("yes")
+' "$1"
+}
+
+printf '\n== record: a row without a trailing newline does not corrupt the archive ==\n'
+rd_no_trailing_nl="$(mk_run_dir quota-no-trailing-nl)"
+tmpdirs+=("$rd_no_trailing_nl")
+mkdir -p "$rd_no_trailing_nl/codex-sessions"
+nonl_a='{"timestamp":"2026-09-15T10:00:00.000Z","payload":{"rate_limits":{"primary":{"used_percent":90.0}}}}'
+nonl_b_first='{"timestamp":"2026-09-15T11:00:00.000Z","payload":{"rate_limits":{"primary":{"used_percent":91.0}}}}'
+nonl_b_last='{"timestamp":"2026-09-15T12:00:00.000Z","payload":{"rate_limits":{"primary":{"used_percent":92.0}}}}'
+# Leg A's only qualifying row has no trailing newline -- what a rollout log
+# cut short by a crash or a mid-run quota kill looks like. It sorts first
+# (earliest timestamp), directly ahead of leg B's two properly terminated
+# rows, so an unfixed writer fuses it onto the row that follows.
+printf '%s' "$nonl_a" > "$rd_no_trailing_nl/codex-sessions/rollout-a.jsonl"
+printf '%s\n%s\n' "$nonl_b_first" "$nonl_b_last" \
+    > "$rd_no_trailing_nl/codex-sessions/rollout-b.jsonl"
+record "$rd_no_trailing_nl" >/dev/null 2>"$tmp/err"
+printf '%s\n%s\n%s\n' "$nonl_a" "$nonl_b_first" "$nonl_b_last" \
+    > "$tmp/quota-no-trailing-nl-expected"
+check "an unterminated row gets its own line instead of fusing with the next" \
+    "same" \
+    "$(cmp -s "$tmp/quota-no-trailing-nl-expected" "$(quota_path "$rd_no_trailing_nl")" && echo same || echo different)"
+check "every physical line in the archived file parses as JSON" "yes" \
+    "$(lines_all_parse "$(quota_path "$rd_no_trailing_nl")")"
+check "the archived file's line count matches the record's row count" \
+    "$(record_field "$(basename "$rd_no_trailing_nl")" codex_quota_rows)" \
+    "$(wc -l < "$(quota_path "$rd_no_trailing_nl")" | tr -d ' ')"
+
+rd_single_no_nl="$(mk_run_dir quota-single-no-nl)"
+tmpdirs+=("$rd_single_no_nl")
+mkdir -p "$rd_single_no_nl/codex-sessions"
+single_nonl='{"timestamp":"2026-09-15T13:00:00.000Z","payload":{"rate_limits":{"primary":{"used_percent":93.0}}}}'
+printf '%s' "$single_nonl" > "$rd_single_no_nl/codex-sessions/rollout-single.jsonl"
+record "$rd_single_no_nl" >/dev/null 2>"$tmp/err"
+check "the only row lacking a trailing newline still gets one" "1" \
+    "$(tail -c1 "$(quota_path "$rd_single_no_nl")" | wc -l | tr -d ' ')"
+
 printf '== record: network is lifted from summary.json ==\n'
 rd_sealed="$(mk_run_dir sealed)"
 tmpdirs+=("$rd_sealed")

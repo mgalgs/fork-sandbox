@@ -385,6 +385,15 @@ def archive_codex_quota(run_dir, run_id):
     dest = os.path.join(QUOTA_DIR, run_id + ".jsonl")
     with open(dest, "wb") as f:
         for _, raw_line in rows:
+            # Iterating a file in binary mode yields its final line without a
+            # trailing newline when the source does not end in one -- a
+            # rollout log cut short by a crash or a quota-exhaustion kill is
+            # exactly that. Writing it as-is would fuse it onto the row that
+            # follows into one unparsable physical line. The newline is
+            # JSONL framing, not row content, so adding a missing one does
+            # not touch the verbatim-bytes promise the row's content keeps.
+            if not raw_line.endswith(b"\n"):
+                raw_line += b"\n"
             f.write(raw_line)
     return dest, len(rows)
 
