@@ -8972,14 +8972,33 @@ if [[ -n "$rundir_rd" && -d "$rundir_rd" ]]; then
         "$(jq -c . "$rundir_rd/task-meta.json" 2>/dev/null)"
     check "the run-source marker carries this suite's own FORK_SANDBOX_RUN_SOURCE=test tag" \
         "test" "$(cat "$rundir_rd/run-source" 2>/dev/null)"
-    check "the archived handoff matches what was submitted" \
-        "do the submit-time task" "$(cat "$rundir_rd/handoff.md" 2>/dev/null)"
+    check "handoff-original.md is a verbatim, unrendered copy of what was submitted" \
+        "do the submit-time task" "$(cat "$rundir_rd/handoff-original.md" 2>/dev/null)"
+    rundir_handoffmd_content="$(cat "$rundir_rd/handoff.md" 2>/dev/null)"
+    if [[ "$rundir_handoffmd_content" == *"do the submit-time task"* ]]; then
+        ok "handoff.md is the rendered prompt, embedding the operator's own text"
+    else
+        no "handoff.md is the rendered prompt, embedding the operator's own text" \
+            "$rundir_handoffmd_content"
+    fi
+    if [[ "$rundir_handoffmd_content" != "do the submit-time task" ]]; then
+        ok "handoff.md is not itself the raw file (it carries the preamble too)"
+    else
+        no "handoff.md is not itself the raw file (it carries the preamble too)"
+    fi
 
-    # The copy must be taken AT SUBMIT TIME, not re-read later: the caller
-    # may edit or remove the original while the run is in flight.
+    # Both copies must be taken AT SUBMIT TIME, not re-read later: the
+    # caller may edit or remove the original while the run is in flight.
     printf 'edited after submit\n' > "$rundir_handoff"
-    check "the archived handoff is a copy taken at submit time, not re-read later" \
-        "do the submit-time task" "$(cat "$rundir_rd/handoff.md" 2>/dev/null)"
+    check "handoff-original.md is a copy taken at submit time, not re-read later" \
+        "do the submit-time task" "$(cat "$rundir_rd/handoff-original.md" 2>/dev/null)"
+    rundir_handoffmd_content2="$(cat "$rundir_rd/handoff.md" 2>/dev/null)"
+    if [[ "$rundir_handoffmd_content2" == *"do the submit-time task"* ]]; then
+        ok "handoff.md is likewise taken at submit time, not re-read later"
+    else
+        no "handoff.md is likewise taken at submit time, not re-read later" \
+            "$rundir_handoffmd_content2"
+    fi
 fi
 
 # --task-meta is validated before anything is created: an invalid JSON

@@ -3399,6 +3399,25 @@ CENV
 )"
     fi
 
+    # The exact prompt text the pod's ConfigMap embeds under handoff.md --
+    # preamble, then the optional context/services sections, then the
+    # operator's own handoff -- captured here once so run_dir's own
+    # handoff.md (below) can be a byte-for-byte copy of what the pod was
+    # actually given, rather than a second, independent render. A trailing
+    # sentinel byte survives the command substitution's own trailing-
+    # newline stripping and is peeled back off, so a handoff file that ends
+    # in blank lines renders into the ConfigMap exactly as it did before
+    # this capture existed.
+    local rendered_handoff
+    rendered_handoff="$({ fs_emit_prompt_preamble "$pod_clone_dir" "$POD_INBOX_DIR" "$harness" gated "$POD_OUTBOX_DIR" pod \
+       "$outbox_max_bytes"
+   [[ -n "$context_ro" ]] && render_context_section "$POD_CONTEXT_DIR"
+   [[ -n "$services_prompt_text" ]] && render_services_section "$services_prompt_text" "$sandbox_env_present"
+   printf '\n---\n\n'
+   cat -- "$handoff_file"
+   printf 'X'; })"
+    rendered_handoff="${rendered_handoff%X}"
+
     local job_rendered rendered
     job_rendered="$(cat <<EOF
 ---
@@ -3420,12 +3439,7 @@ $(indent_block < "$inbox_write_sh")
   context-extract.sh: |
 $(indent_block < "$context_extract_sh")
   handoff.md: |
-$({ fs_emit_prompt_preamble "$pod_clone_dir" "$POD_INBOX_DIR" "$harness" gated "$POD_OUTBOX_DIR" pod \
-       "$outbox_max_bytes"
-   [[ -n "$context_ro" ]] && render_context_section "$POD_CONTEXT_DIR"
-   [[ -n "$services_prompt_text" ]] && render_services_section "$services_prompt_text" "$sandbox_env_present"
-   printf '\n---\n\n'
-   cat -- "$handoff_file"; } | indent_block)${review_loop_configmap_keys}${claude_configmap_keys}${services_env_configmap_key}
+$(printf '%s' "$rendered_handoff" | indent_block)${review_loop_configmap_keys}${claude_configmap_keys}${services_env_configmap_key}
 ---
 apiVersion: batch/v1
 kind: Job
@@ -3631,12 +3645,15 @@ EOF
         printf '%s\n' "$task_meta" > "$run_dir/task-meta.json"
     fi
 
-    # The handoff, copied now rather than left for cmd_collect to read
-    # later: the caller may edit or remove the original file while the run
-    # is in flight (it already handed the content to the pod, via the
-    # rendered ConfigMap above), and the archived copy must be what THIS
-    # run actually used.
-    cp -- "$handoff_file" "$run_dir/handoff.md"
+    # Two archived copies, matching the local run's own handoff.md /
+    # handoff-original.md split (scripts/fork-sandbox.sh): handoff.md is
+    # what the agent was actually given -- the rendered prompt captured
+    # above as $rendered_handoff, byte-for-byte what the ConfigMap embeds
+    # -- and handoff-original.md is the operator's raw file, unrendered.
+    # Written now rather than left for cmd_collect to read later: the
+    # caller may edit or remove the original while the run is in flight.
+    printf '%s' "$rendered_handoff" > "$run_dir/handoff.md"
+    cp -- "$handoff_file" "$run_dir/handoff-original.md"
 
     # run.env: the same fallback shape a local run's own run.env offers
     # sandbox-run-log.py when summary.json (written by cmd_collect, once
