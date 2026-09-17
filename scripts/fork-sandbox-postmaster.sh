@@ -1608,6 +1608,15 @@ pm_spawn_wake() {
     # ones with a resumable transcript.
     spawn_args+=(--clone-dir "$PM_WORKSPACES/$tid/$agent")
 
+    # The LLM-seat counterpart of the handler path's FS_HANDLER_ATTACH_DIR:
+    # most threads carry no attachments at all, so the bind is added only
+    # when the directory exists and actually holds something -- an empty or
+    # absent mount is noise no wake needs.
+    local attach_dir="$MAIL_ROOT/threads/$tid/attachments"
+    if [[ -d "$attach_dir" && -n "$(find "$attach_dir" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
+        spawn_args+=(--attach-dir "$attach_dir")
+    fi
+
     # An agent woken again and again on one thread should be ONE
     # conversation, not a series of amnesiacs. The transcript store for
     # this (thread, agent) pair is bound into every wake of a resumable

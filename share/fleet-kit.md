@@ -48,6 +48,9 @@ you:
   between your actions — or only at your next wake; the transport
   decides which, and either way nothing is lost. When a notice does
   appear mid-run, read what it changes before pressing on.
+- When the thread lists `attachments/<name>`, the file itself is
+  readable, read-only, at `/attachments/<name>` — if that mount is
+  absent, the listing is names-only, as it always was.
 
 ## The posture
 

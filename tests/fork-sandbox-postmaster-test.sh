@@ -3137,6 +3137,49 @@ check "hostile subject/body: exactly the one legitimate spawn event, nothing ext
     "$(printf '%s' "$stdout_content" | grep -ac '^pm ')"
 
 # ============================================================
+printf '\n== --attach-dir: LLM seat wakes bind a thread'"'"'s attachments ==\n'
+# ============================================================
+
+# Extracts the argv block (the lines between two "----CALL----" markers) that
+# spawned the given branch prefix, so an assertion can check what one
+# specific spawn's argv carried instead of the whole log.
+call_block_for_branch() {
+    local prefix="$1" file="$2"
+    awk -v p="$prefix" '
+        /^----CALL----$/ { if (blk ~ ("\n" p)) { print blk }; blk = ""; next }
+        { blk = blk "\n" $0 }
+        END { if (blk ~ ("\n" p)) print blk }
+    ' "$file"
+}
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+: > "$STUB_ARGV_LOG"
+
+printf 'has attachment\n' > "$work/attach-fixture.txt"
+mid_att="$("$MAIL" send --from '@alice' --to '@bob' --subject 'has attachment' \
+    --body - --attach "$work/attach-fixture.txt" --hops 8 <<< 'see attached' 2>/dev/null)"
+tid_att="$(thread_of "$mid_att")"
+short_att="${tid_att:0:8}"
+once
+block_att="$(call_block_for_branch "sbx-mail-$short_att-bob-" "$STUB_ARGV_LOG")"
+if [[ -n "$block_att" ]] && printf '%s' "$block_att" | grep -qx -- "$FORK_SANDBOX_MAIL_ROOT/threads/$tid_att/attachments"; then
+    check "thread with an attachment: wake's argv carries --attach-dir" 1 \
+        "$(printf '%s' "$block_att" | grep -c -- '--attach-dir')"
+else
+    check "thread with an attachment: wake's argv carries --attach-dir" 1 0
+fi
+
+: > "$STUB_ARGV_LOG"
+mid_noatt="$(send_msg '@alice' '@bob' 'no attachment' 'plain body' 8)"
+tid_noatt="$(thread_of "$mid_noatt")"
+short_noatt="${tid_noatt:0:8}"
+once
+block_noatt="$(call_block_for_branch "sbx-mail-$short_noatt-bob-" "$STUB_ARGV_LOG")"
+check "thread without an attachment: wake's argv carries no --attach-dir" 0 \
+    "$(printf '%s' "$block_noatt" | grep -c -- '--attach-dir')"
+
+# ============================================================
 printf '\n== --help and dispatcher wiring ==\n'
 # ============================================================
 

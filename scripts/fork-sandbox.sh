@@ -1418,6 +1418,7 @@ sandbox_args=""
 task_meta=""
 context_ro=""
 fixtures_dir=""
+attach_dir=""
 session_state=""
 resume_session=""
 session_id_arg=""
@@ -1539,6 +1540,10 @@ while [[ "${1:-}" == -* ]]; do
             ;;
         --fixtures)
             fixtures_dir="${2:?--fixtures requires a directory}"
+            shift 2
+            ;;
+        --attach-dir)
+            attach_dir="${2:?--attach-dir requires a directory}"
             shift 2
             ;;
         --session-state)
@@ -2537,6 +2542,12 @@ if [[ "$k8s_mode" == true ]]; then
         echo "to bind." >&2
         exit 1
     fi
+    if [[ -n "$attach_dir" ]]; then
+        echo "Error: --attach-dir is not supported with --k8s. It binds a host" >&2
+        echo "directory into a local sandbox; a cluster run has no host directory" >&2
+        echo "to bind." >&2
+        exit 1
+    fi
     if [[ -n "$claude_extra_args" ]]; then
         echo "Error: --claude-args is not supported with --k8s. It passes flags" >&2
         echo "to the claude CLI, and the pod's own claude invocation (when" >&2
@@ -3436,6 +3447,22 @@ if [[ -n "$fixtures_dir" ]]; then
     fi
     if [[ ! -d "$fixtures_dir" ]]; then
         echo "Error: --fixtures path '$fixtures_dir' is not a directory." >&2
+        exit 1
+    fi
+fi
+
+# --attach-dir has no staging-root boundary of its own, unlike --fixtures:
+# its caller (the postmaster) always names a thread's own attachments
+# directory under the mail store, not an arbitrary host path a preset or
+# operator flag could redirect.
+if [[ -n "$attach_dir" ]]; then
+    attach_dir="$("$FS_REALPATH" -m "$attach_dir")"
+    if [[ ! -e "$attach_dir" ]]; then
+        echo "Error: --attach-dir directory '$attach_dir' does not exist." >&2
+        exit 1
+    fi
+    if [[ ! -d "$attach_dir" ]]; then
+        echo "Error: --attach-dir path '$attach_dir' is not a directory." >&2
         exit 1
     fi
 fi
@@ -5169,6 +5196,9 @@ fs_build_sandbox_cmd() {
     if [[ -n "$fixtures_dir" ]]; then
         out+=(--bind-ro-at "$fixtures_dir" /fixtures)
         out+=(--setenv FORK_SANDBOX_FIXTURE_DIR=/fixtures)
+    fi
+    if [[ -n "$attach_dir" ]]; then
+        out+=(--bind-ro-at "$attach_dir" /attachments)
     fi
     # The operator inbox, for every harness. Read-only, so this widens
     # nothing the sandbox can write; it is the one path a host can put
