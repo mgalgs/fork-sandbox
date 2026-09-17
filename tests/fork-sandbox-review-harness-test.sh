@@ -1648,7 +1648,7 @@ exit 0
 STUB
 chmod +x "$fixex_stub/claude-sandboxed"
 
-fixex_run() {  # $1 branch; sets fixex_rc / fixex_rd / fixex_out
+fixex_run() {  # $1 count file, $2 branch; sets fixex_rc / fixex_rd / fixex_out
     fixex_out="$(FIX_COMMIT="${FIX_COMMIT:-0}" \
         PATH="$fixex_stub:$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$retry_cfg" \
         FORK_SANDBOX_BACKEND=fake-image FAKE_COUNT_FILE="$1" \
