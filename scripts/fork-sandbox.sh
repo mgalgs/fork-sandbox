@@ -6439,12 +6439,22 @@ if [[ -n "$pi_run_session_dir" && -d "$pi_run_session_dir" ]]; then
                   | .errorMessage // "the model reported an error"' \
              2>/dev/null || true)"
     if [[ -z "$pi_error" ]]; then
-        # The same defect through a second door: pi also exits 0 when its
-        # automatic retries run out. The stream then ends in
-        # auto_retry_end success=false, the session settles, and no turn in
-        # the session file is left with stopReason "error" -- so the check
-        # above, the other failure detection a pi run has, never fires, and
-        # the run reports a clean exit having produced nothing.
+        # The retry-exhaustion backstop. pi also exits 0 when its
+        # automatic retries run out, the stream then ending in
+        # auto_retry_end success=false. The installed pi (0.84.3) does
+        # not leave that uncaught: it appends the failed turn to the
+        # session file before its retry bookkeeping, so the LAST turn
+        # there has stopReason "error" and the check above fires for a
+        # real exhaustion first -- the run fails as a model error and
+        # this block never runs. It covers the exhaustion shape with no
+        # error turn last in the session: a pi whose retry path leaves
+        # the session clean, or the durable --session-state store, where
+        # the check above reads the last turn across every wake's
+        # transcript in find|cat order, which need not be the current
+        # wake's final turn. It cannot report a success as failed: a
+        # run that finished cleanly ends without a failing
+        # auto_retry_end, and a run that committed work is excluded by
+        # condition 2 below.
         #
         # Two conditions, in that order, short-circuiting:
         #   1. the LAST auto_retry_end in the run's own event stream is a
@@ -7056,8 +7066,8 @@ close_iter() {
 
 # Run one leg: kind (review or fix), iteration number, prompt file. Sets
 # leg_rc, leg_cost (a number, or empty when the harness does not report one),
-# leg_usage (a JSON object, or null) and leg_error (a model-error message, or
-# empty).
+# leg_usage (a JSON object, or null) and leg_error (a model-error or
+# retry-exhaustion message, or empty).
 run_leg() {
     local kind="$1" n="$2" prompt="$3"
     local leg_events="$run_dir/events-$kind-$n.jsonl"
@@ -7193,13 +7203,17 @@ run_leg() {
                       | select(.stopReason == "error")
                       | .errorMessage // "the model reported an error"' \
                  2>/dev/null || true)"
-        # The exhaustion shape the implement leg's accounting checks (see
-        # pi_retry_error there): the LAST auto_retry_end in this leg's own
-        # stream is a failure; a later success=true is a recovered retry
-        # and stands instead, the same LAST-is-truth rule. The
-        # committed-nothing half of the test needs the head read after the
-        # leg ran, so it comes at the end of the accounting, beside the
-        # stopReason result.
+        # The same exhaustion backstop the implement leg's accounting
+        # checks (see pi_retry_error there): the LAST auto_retry_end in
+        # this leg's own stream is a failure; a later success=true is a
+        # recovered retry and stands instead, the same LAST-is-truth
+        # rule. As there, it is gated on leg_error being empty: the
+        # installed pi leaves the failed turn as the session's last, so
+        # a real exhausted leg is already caught by the stopReason
+        # check above, and this engages only for an exhausted stream
+        # whose session ends clean. The committed-nothing half of the
+        # test needs the head read after the leg ran, so it comes at the
+        # end of the accounting, beside the stopReason result.
         leg_retry_error="$(jq -rs \
             '[.[] | select(.type == "auto_retry_end")]
              | last // empty
@@ -7256,15 +7270,21 @@ run_leg() {
         printf 'fork-sandbox: the %s leg of iteration %s ended in a model error: %s\n' \
             "$kind" "$n" "$leg_error" >> "$sandbox_log"
     fi
-    # The second half of the exhaustion check, for the leg kinds that can
-    # leave work behind: a leg that ran out of retries and still committed
-    # is a success, exactly as the implement leg's own check says of a run.
-    # A code pass measures against base (the branch holds nothing off base);
-    # a fix or mntfix leg against its own start (the head did not move); an
-    # unreadable head is treated as holding nothing, the same rule. A review
-    # or maintainer leg is not checked this way: it commits nothing by
+    # The second half of the exhaustion backstop, for the leg kinds that
+    # can leave work behind: within the backstop's shape, a leg that ran
+    # out of retries and still committed is a success, exactly as the
+    # implement leg's own check says of a run. A code pass measures
+    # against base (the branch holds nothing off base); a fix or mntfix
+    # leg against its own start (the head did not move); an unreadable
+    # head is treated as holding nothing, the same rule. A review or
+    # maintainer leg is not checked this way: it commits nothing by
     # design, and one that ran out of retries left no verdict, which the
-    # loop already ends over as a harness error.
+    # loop already ends over as a harness error. Note what the leg_error
+    # gate does NOT protect against: on the installed pi an exhausted
+    # leg -- committed or not -- ends its session in an error turn, so
+    # it is already failed above, and a committing-but-exhausted fix leg
+    # ends the loop as a harness error the same way any leg that ends in
+    # a model error does.
     if [[ -z "$leg_error" && -n "$leg_retry_error" ]]; then
         case "$kind" in
         code)

@@ -1388,18 +1388,26 @@ fi
 
 printf '\n== pi retry exhaustion: rc 0 -> 1 only when nothing was committed ==\n'
 
-# pi exits 0 when its automatic retries run out -- the stream ends in
-# auto_retry_end success=false, the session settles, and no turn in the
-# session file is left with stopReason "error", so the stopReason check
-# above (the other failure detection a pi run has) never fires. The
-# accounting turns rc 0 into rc 1 when BOTH the last auto_retry_end is a
-# failure AND the branch holds no commits off base (see the pi_retry_error
-# block in fork-sandbox.sh). One stub plays the pi implement leg (the
-# --exec argument is pi's tell), parameterized per scenario: RE_STREAM is
-# the stream shape (exhausted | recovered | none), RE_COMMIT whether the
-# leg commits, RE_EXIT the process exit, RE_STOP the session file's last
-# turn's stopReason. The stub's stdout IS the run's events.jsonl, so the
-# retry events it prints are what the check reads.
+# Backstop for pi's retry exhaustion: pi exits 0 when its automatic
+# retries run out, and the accounting turns rc 0 into rc 1 when BOTH the
+# last auto_retry_end in the run's stream is a failure AND the branch
+# holds no commits off base (see the pi_retry_error block in
+# fork-sandbox.sh). The shape that block guards -- an exhausted stream
+# whose session file's last turn is NOT stopReason "error" -- is not
+# what the installed pi (0.84.3) emits: it appends the failed turn to
+# the session before its retry bookkeeping, so a real exhaustion ends in
+# an error turn that the stopReason check catches first, and the
+# retry-exhaustion line the run would show is the model-error one
+# (scenario 4 below pins that shape). The stub plays the backstop's
+# shape -- the one a pi that leaves no error turn, or a
+# multi-transcript session store whose find|cat order masks the final
+# error turn, would produce -- to exercise the block's own logic.
+# One stub plays the pi implement leg (the --exec argument is pi's tell),
+# parameterized per scenario: RE_STREAM is the stream shape (exhausted |
+# recovered | none), RE_COMMIT whether the leg commits, RE_EXIT the
+# process exit, RE_STOP the session file's last turn's stopReason. The
+# stub's stdout IS the run's events.jsonl, so the retry events it prints
+# are what the check reads.
 retry_stub="$(mktemp -d /var/tmp/claude-scratch/fs-review-pi-retry.XXXXXX)"
 tmpdirs+=("$retry_stub")
 cat > "$retry_stub/claude-sandboxed" <<'STUB'
@@ -1504,7 +1512,25 @@ else
         "rc=$retry_rc: $retry_out"
 fi
 
-# 4. The process's own non-zero exit is never overwritten: exhausted
+# 4. The shape the installed pi actually emits on exhaustion: an
+#    exhausted stream AND a final stopReason "error" turn. The
+#    stopReason check catches it first -- the model-error line, not the
+#    retry line -- and the run still fails.
+RE_STREAM=exhausted RE_STOP=error \
+    retry_run "sandbox-test-pi-retry-realshape-$$"
+if [[ -n "$retry_rd" ]]; then
+    check "a real-shape exhausted run exits 1" "1" "$retry_rc"
+    check "exit-code on disk agrees" "1" "$(cat "$retry_rd/exit-code" 2>/dev/null)"
+    contains "the model-error line, not the retry line, names this failure" \
+        "the session ended in a model error" "$(cat "$retry_rd/sandbox.log" 2>/dev/null)"
+    lacks "the backstop stays silent for the shape it defers to" \
+        "exhausted its automatic retries" "$(cat "$retry_rd/sandbox.log" 2>/dev/null)"
+else
+    no "a real-shape exhausted pi run produced a run directory" \
+        "rc=$retry_rc: $retry_out"
+fi
+
+# 5. The process's own non-zero exit is never overwritten: exhausted
 #    retries and no commits on top of exit 5 still exit 5.
 RE_STREAM=exhausted RE_COMMIT=0 RE_EXIT=5 \
     retry_run "sandbox-test-pi-retry-nonzero-$$"
@@ -1516,7 +1542,7 @@ else
         "rc=$retry_rc: $retry_out"
 fi
 
-# 5. Exhausted retries with work committed: condition 2 is what keeps a
+# 6. Exhausted retries with work committed: condition 2 is what keeps a
 #    recovered run green, so the run stays 0.
 RE_STREAM=exhausted RE_COMMIT=1 \
     retry_run "sandbox-test-pi-retry-committed-$$"
@@ -1530,7 +1556,7 @@ else
         "rc=$retry_rc: $retry_out"
 fi
 
-# 6. The review legs gate on commits off base, not the exit code: a
+# 7. The review legs gate on commits off base, not the exit code: a
 #    retry-exhausted run has zero commits, so the loop still skips with
 #    its work-based detail and records the corrected coding exit -- no
 #    special-casing of the new failure shape.
@@ -1550,16 +1576,21 @@ fi
 
 printf '\n== a pi fix leg that exhausts its retries and commits nothing ==\n'
 
-# The census sibling of the implement-leg check: run_leg\'s accounting reads
-# the same session stream with the same last-stopReason check, and the same
-# exhaustion shape was invisible to it. A fix leg that ran out of retries
-# and committed nothing used to read as a clean exit-0 leg that made no
-# progress; it now reads as a failed leg (leg_rc 1), which the loop records
-# as a harness error with the reason. A fix leg that exhausted retries but
-# still committed is a success, the same condition-2 rule as the implement
-# leg\'s check. The loop\'s failure does not rewrite the RUN\'s exit code,
-# which stays the coding leg\'s -- the existing harness-error semantics --
-# so the observable is the loop record, not the run\'s rc.
+# The leg census sibling of the implement-leg backstop: run_leg's
+# accounting reads the same session stream with the same last-stopReason
+# check, and the same exhausted-with-clean-session shape was invisible to
+# it. In the shape the stub plays (an exhausted stream whose session ends
+# in a "stop" turn, which the installed pi does not emit -- see the block
+# above), a fix leg that ran out of retries and committed nothing reads
+# as a failed leg (leg_rc 1), which the loop records as a harness error
+# with the reason; a fix leg that exhausted retries but still committed
+# is a success, the same condition-2 rule as the implement leg's check.
+# On the installed pi an exhausted leg -- committed or not -- ends its
+# session in an error turn and fails by the stopReason check instead;
+# these scenarios pin the backstop's own logic, not that path. The
+# loop's failure does not rewrite the RUN's exit code, which stays the
+# coding leg's -- the existing harness-error semantics -- so the
+# observable is the loop record, not the run's rc.
 fixex_stub="$(mktemp -d /var/tmp/claude-scratch/fs-review-fix-exhausted.XXXXXX)"
 tmpdirs+=("$fixex_stub")
 cat > "$fixex_stub/claude-sandboxed" <<'STUB'
