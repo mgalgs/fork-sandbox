@@ -1386,5 +1386,147 @@ else
         "rc=$pi_err_rc: $pi_err_out"
 fi
 
+printf '\n== pi retry exhaustion: rc 0 -> 1 only when nothing was committed ==\n'
+
+# pi exits 0 when its automatic retries run out -- the stream ends in
+# auto_retry_end success=false, the session settles, and no turn in the
+# session file is left with stopReason "error", so the stopReason check
+# above (the other failure detection a pi run has) never fires. The
+# accounting turns rc 0 into rc 1 when BOTH the last auto_retry_end is a
+# failure AND the branch holds no commits off base (see the pi_retry_error
+# block in fork-sandbox.sh). One stub plays the pi implement leg (the
+# --exec argument is pi's tell), parameterized per scenario: RE_STREAM is
+# the stream shape (exhausted | recovered | none), RE_COMMIT whether the
+# leg commits, RE_EXIT the process exit, RE_STOP the session file's last
+# turn's stopReason. The stub's stdout IS the run's events.jsonl, so the
+# retry events it prints are what the check reads.
+retry_stub="$(mktemp -d /var/tmp/claude-scratch/fs-review-pi-retry.XXXXXX)"
+tmpdirs+=("$retry_stub")
+cat > "$retry_stub/claude-sandboxed" <<'STUB'
+#!/usr/bin/env bash
+set -uo pipefail
+is_pi_leg=0
+for a in "$@"; do
+    [[ "$a" == "--exec" ]] && is_pi_leg=1
+done
+clone_dir=""
+for a in "$@"; do
+    [[ -d "$a/.git" ]] && clone_dir="$a"
+done
+cat >/dev/null
+if (( is_pi_leg )); then
+    if [[ "${RE_COMMIT:-0}" == "1" ]]; then
+        git -c user.email=t@fork-sandbox.invalid -c user.name=Tester \
+            -C "$clone_dir" commit --allow-empty -q -m "pi retry implement"
+    fi
+    mkdir -p "$clone_dir/.git/pi-session"
+    printf '{"role":"assistant","stopReason":"stop","usage":{"input":100,"output":10,"cacheRead":0,"cacheWrite":0,"totalTokens":110,"cost":{"total":0.001}}}\n' \
+        > "$clone_dir/.git/pi-session/session.jsonl"
+    case "${RE_STREAM:-exhausted}" in
+    exhausted)
+        printf '{"type":"auto_retry_start","attempt":1,"maxAttempts":3,"delayMs":2000,"errorMessage":"529 overloaded"}\n'
+        printf '{"type":"auto_retry_end","success":false,"attempt":3,"finalError":"529 overloaded_error: Overloaded"}\n'
+        ;;
+    recovered)
+        printf '{"type":"auto_retry_end","success":false,"attempt":1}\n'
+        printf '{"type":"auto_retry_end","success":true,"attempt":2}\n'
+        ;;
+    esac
+    if [[ "${RE_STOP:-stop}" == "error" ]]; then
+        printf '{"role":"assistant","stopReason":"error","errorMessage":"context length exceeded"}\n' \
+            >> "$clone_dir/.git/pi-session/session.jsonl"
+    fi
+    exit "${RE_EXIT:-0}"
+fi
+exit 0
+STUB
+chmod +x "$retry_stub/claude-sandboxed"
+
+retry_cfg="$(mktemp -d)"; tmpdirs+=("$retry_cfg")
+install -m 600 /dev/null "$retry_cfg/pi.env"
+printf 'OPENROUTER_API_KEY=fake\n' > "$retry_cfg/pi.env"
+
+retry_run() {  # $1 branch; sets retry_rc / retry_rd / retry_out
+    retry_out="$(RE_STREAM="${RE_STREAM:-}" RE_COMMIT="${RE_COMMIT:-0}" \
+        RE_EXIT="${RE_EXIT:-0}" RE_STOP="${RE_STOP:-stop}" \
+        PATH="$retry_stub:$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$retry_cfg" \
+        FORK_SANDBOX_BACKEND=fake-image \
+        timeout 60 "$launcher" --foreground --harness pi/some-model \
+        --branch "$1" "$proj" "$handoff" 2>&1)"
+    retry_rc=$?
+    retry_rd="$(printf '%s\n' "$retry_out" | sed -n 's/^  run dir:  *//p' | head -1)"
+    [[ -n "$retry_rd" ]] && tmpdirs+=("$retry_rd")
+}
+
+# 1. Exhausted retries, no commits: the run must fail and say why.
+RE_STREAM=exhausted RE_COMMIT=0 \
+    retry_run "sandbox-test-pi-retry-exhausted-$$"
+if [[ -n "$retry_rd" ]]; then
+    check "an exhausted-retries, commitless pi run exits 1" "1" "$retry_rc"
+    check "exit-code on disk agrees" "1" "$(cat "$retry_rd/exit-code" 2>/dev/null)"
+    contains "the failure is named in the sandbox log" \
+        "exhausted its automatic retries" "$(cat "$retry_rd/sandbox.log" 2>/dev/null)"
+    contains "the reason reaches the summary as harness_error" \
+        "exhausted its automatic retries" \
+        "$(jq -r '.harness_error // empty' "$retry_rd/summary.json" 2>/dev/null)"
+else
+    no "an exhausted-retries, commitless pi run produced a run directory" \
+        "rc=$retry_rc: $retry_out"
+fi
+
+# 2. An auto_retry_end failure that a LATER success=true supersedes is a
+#    recovered retry: with work committed, the run stays green.
+RE_STREAM=recovered RE_COMMIT=1 \
+    retry_run "sandbox-test-pi-retry-recovered-$$"
+if [[ -n "$retry_rd" ]]; then
+    check "a recovered retry with committed work exits 0" "0" "$retry_rc"
+    check "exit-code on disk agrees" "0" "$(cat "$retry_rd/exit-code" 2>/dev/null)"
+    lacks "a recovered retry is not reported as exhaustion" \
+        "exhausted" "$(cat "$retry_rd/sandbox.log" 2>/dev/null)"
+else
+    no "a recovered-retry pi run produced a run directory" \
+        "rc=$retry_rc: $retry_out"
+fi
+
+# 3. Regression guard on the pre-existing path, without a review loop:
+#    the last stopReason "error" still turns rc 0 into rc 1.
+RE_STREAM=none RE_STOP=error \
+    retry_run "sandbox-test-pi-retry-stoperror-$$"
+if [[ -n "$retry_rd" ]]; then
+    check "a final-turn stopReason error still exits 1" "1" "$retry_rc"
+    check "exit-code on disk agrees" "1" "$(cat "$retry_rd/exit-code" 2>/dev/null)"
+    contains "the model-error line, not the retry line, names this failure" \
+        "the session ended in a model error" "$(cat "$retry_rd/sandbox.log" 2>/dev/null)"
+else
+    no "a stopReason-error pi run produced a run directory" \
+        "rc=$retry_rc: $retry_out"
+fi
+
+# 4. The process's own non-zero exit is never overwritten: exhausted
+#    retries and no commits on top of exit 5 still exit 5.
+RE_STREAM=exhausted RE_COMMIT=0 RE_EXIT=5 \
+    retry_run "sandbox-test-pi-retry-nonzero-$$"
+if [[ -n "$retry_rd" ]]; then
+    check "the process's own exit 5 is kept, not turned into 1" "5" "$retry_rc"
+    check "exit-code on disk agrees" "5" "$(cat "$retry_rd/exit-code" 2>/dev/null)"
+else
+    no "an exhausted-retry, exit-5 pi run produced a run directory" \
+        "rc=$retry_rc: $retry_out"
+fi
+
+# 5. Exhausted retries with work committed: condition 2 is what keeps a
+#    recovered run green, so the run stays 0.
+RE_STREAM=exhausted RE_COMMIT=1 \
+    retry_run "sandbox-test-pi-retry-committed-$$"
+if [[ -n "$retry_rd" ]]; then
+    check "exhausted retries with committed work exits 0" "0" "$retry_rc"
+    check "exit-code on disk agrees" "0" "$(cat "$retry_rd/exit-code" 2>/dev/null)"
+    lacks "a run that committed work is not reported as exhaustion" \
+        "exhausted" "$(cat "$retry_rd/sandbox.log" 2>/dev/null)"
+else
+    no "an exhausted-retry, committed pi run produced a run directory" \
+        "rc=$retry_rc: $retry_out"
+fi
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))

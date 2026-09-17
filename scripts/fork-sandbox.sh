@@ -6381,6 +6381,15 @@ if [[ -z "$model" && -s "$sandbox_log" ]]; then
         "$sandbox_log" | head -n1)"
 fi
 
+# The branch head, read from the clone the one way anything here may read it:
+# over upload-pack from outside, exactly like the fetch below. Nothing runs git
+# INSIDE the clone -- the sandbox can write its config, and a key such as
+# core.fsmonitor runs on the HOST.
+clone_branch_head() {
+    (cd "$origin_repo" && git ls-remote "$clone_dir" "refs/heads/$branch" \
+        2>/dev/null) | awk 'NR == 1 { print $1 }'
+}
+
 # What the run cost, in one place for both harnesses. Either way a missing
 # or unreadable source leaves it unreported rather than wrong.
 #
@@ -6429,6 +6438,58 @@ if [[ -n "$pi_run_session_dir" && -d "$pi_run_session_dir" ]]; then
                   | select(.stopReason == "error")
                   | .errorMessage // "the model reported an error"' \
              2>/dev/null || true)"
+    if [[ -z "$pi_error" ]]; then
+        # The same defect through a second door: pi also exits 0 when its
+        # automatic retries run out. The stream then ends in
+        # auto_retry_end success=false, the session settles, and no turn in
+        # the session file is left with stopReason "error" -- so the check
+        # above, the other failure detection a pi run has, never fires, and
+        # the run reports a clean exit having produced nothing.
+        #
+        # Two conditions, in that order, short-circuiting:
+        #   1. the LAST auto_retry_end in the run's own event stream is a
+        #      failure. A success=true after a false is a recovered retry, and
+        #      the last one is the one that stands -- the same LAST-is-truth
+        #      rule the stopReason check applies to its own shape, so a
+        #      session that exhausted retries on an earlier turn and then
+        #      recovered reads as success.
+        #   2. the branch holds no commits off base -- the review-loop
+        #      gate's own read (clone_branch_head), reused rather than
+        #      duplicated. This is what protects a run that exhausted
+        #      retries mid-way and still committed work: it is a success.
+        #      A head that cannot be read at all is treated as holding
+        #      nothing: the branch is the run's one observable output, and a
+        #      run whose retries ran out and whose work no one can see must
+        #      not read as success.
+        pi_retry_error="$(jq -rs \
+            '[.[] | select(.type == "auto_retry_end")]
+             | last // empty
+             | select(.success == false)
+             | .finalError // "the model reported an error"' \
+            "$events" 2>/dev/null || true)"
+        if [[ -n "$pi_retry_error" ]]; then
+            retry_head="$(clone_branch_head)"
+            if [[ -z "$retry_head" || "$retry_head" == "$base_sha" ]]; then
+                run_error="pi exhausted its automatic retries and committed nothing: $pi_retry_error"
+                printf 'fork-sandbox: pi exhausted its automatic retries and committed nothing: %s\n' \
+                    "$pi_retry_error" >> "$sandbox_log"
+                # rc=1 like the model-error branch below, with its same two
+                # guards: never turn a non-zero exit into a different
+                # non-zero one, and the same exit-code deferral -- with a
+                # review loop, a maintainer loop, a pending refresh or repeat
+                # passes still to come, the run is not over, and the leg that
+                # is actually last writes the final exit code.
+                if [[ "$rc" == "0" ]]; then
+                    rc=1
+                    if [[ "$review_loop_cap" == "0" && "$refresh_enabled" == "0" \
+                        && "${maintainer_loop_cap:-0}" == "0" \
+                        && "${code_repeat:-1}" == "1" ]]; then
+                        printf '%s\n' "$rc" > "$run_dir/exit-code"
+                    fi
+                fi
+            fi
+        fi
+    fi
     if [[ -n "$pi_error" ]]; then
         run_error="$pi_error"
         printf 'fork-sandbox: the session ended in a model error: %s\n' \
@@ -6882,15 +6943,6 @@ review_iters_done='[]'
 leg_cost=""
 leg_usage=null
 leg_error=""
-
-# The branch head, read from the clone the one way anything here may read it:
-# over upload-pack from outside, exactly like the fetch below. Nothing runs git
-# INSIDE the clone -- the sandbox can write its config, and a key such as
-# core.fsmonitor runs on the HOST.
-clone_branch_head() {
-    (cd "$origin_repo" && git ls-remote "$clone_dir" "refs/heads/$branch" \
-        2>/dev/null) | awk 'NR == 1 { print $1 }'
-}
 
 # One iteration's record, built leg by leg. Anything not established is null
 # rather than 0: "not reported" must never read as "none", which is the rule
