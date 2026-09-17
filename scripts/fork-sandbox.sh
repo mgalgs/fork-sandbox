@@ -7219,13 +7219,17 @@ run_leg() {
     fi
 
     # The branch head as of just before the leg, for the retry-exhaustion
-    # check in this leg's accounting: for a fix or mntfix leg, "the leg
-    # committed nothing" is the head not moving (a code pass measures
-    # against base instead, the way the implement leg's check does, and a
-    # review or maintainer leg is never checked -- see that check). It is
-    # read before the leg runs, and the one way anything here may read the
-    # head (clone_branch_head).
-    if [[ "$kind" == "fix" || "$kind" == "mntfix" ]]; then
+    # check in this leg's accounting: for a code, fix or mntfix leg, "the leg
+    # committed nothing" is the head not moving from where it stood just
+    # before this leg ran (a review or maintainer leg is never checked -- see
+    # that check). A repeat code pass sits on top of an earlier pass's
+    # commits exactly as a fix leg sits on top of the coding leg's, so it is
+    # measured the same way, against its own pre-leg head rather than the
+    # run's base -- pass 1's pre-leg head is the checkout point, so that
+    # pass's check is unchanged; only a pass 2+ that starts already ahead of
+    # base is affected. It is read before the leg runs, and the one way
+    # anything here may read the head (clone_branch_head).
+    if [[ "$kind" == "code" || "$kind" == "fix" || "$kind" == "mntfix" ]]; then
         leg_head_before="$(clone_branch_head)"
     fi
 
@@ -7336,27 +7340,24 @@ run_leg() {
     # The second half of the exhaustion backstop, for the leg kinds that
     # can leave work behind: within the backstop's shape, a leg that ran
     # out of retries and still committed is a success, exactly as the
-    # implement leg's own check says of a run. A code pass measures
-    # against base (the branch holds nothing off base); a fix or mntfix
-    # leg against its own start (the head did not move); an unreadable
-    # head is treated as holding nothing, the same rule. A review or
-    # maintainer leg is not checked this way: it commits nothing by
-    # design, and one that ran out of retries left no verdict, which the
-    # loop already ends over as a harness error. Note what the leg_error
-    # gate does NOT protect against: on the installed pi an exhausted
-    # leg -- committed or not -- ends its session in an error turn, so
-    # it is already failed above, and a committing-but-exhausted fix leg
-    # ends the loop as a harness error the same way any leg that ends in
-    # a model error does.
+    # implement leg's own check says of a run. Every one of those legs --
+    # code, fix and mntfix alike -- measures against its OWN pre-leg head
+    # (the head did not move); an unreadable head, before or after, is
+    # treated as holding nothing, the same rule. A code pass's pre-leg head
+    # is base_sha on pass 1 (the checkout point), so that pass's check is
+    # unchanged from measuring against base directly; a pass 2+ that starts
+    # already ahead of base is now measured correctly instead of always
+    # reading as having committed. A review or maintainer leg is not checked
+    # this way: it commits nothing by design, and one that ran out of
+    # retries left no verdict, which the loop already ends over as a
+    # harness error. Note what the leg_error gate does NOT protect against:
+    # on the installed pi an exhausted leg -- committed or not -- ends its
+    # session in an error turn, so it is already failed above, and a
+    # committing-but-exhausted fix leg ends the loop as a harness error the
+    # same way any leg that ends in a model error does.
     if [[ -z "$leg_error" && -n "$leg_retry_error" ]]; then
         case "$kind" in
-        code)
-            leg_head_after="$(clone_branch_head)"
-            if [[ -z "$leg_head_after" || "$leg_head_after" == "$base_sha" ]]; then
-                leg_failed_retry=1
-            fi
-            ;;
-        fix|mntfix)
+        code|fix|mntfix)
             leg_head_after="$(clone_branch_head)"
             if [[ -z "$leg_head_before" || -z "$leg_head_after" \
                 || "$leg_head_after" == "$leg_head_before" ]]; then

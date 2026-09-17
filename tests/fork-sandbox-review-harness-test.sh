@@ -1710,5 +1710,116 @@ else
         "rc=$fixex_rc: $fixex_out"
 fi
 
+printf '\n== a repeat code pass that exhausts its retries after an earlier pass committed ==\n'
+
+# The code-arm sibling of the fix-leg backstop above: a preset's coder seat
+# with repeat: 2 runs pass 1 as the ordinary top-level implement leg (its own,
+# separate backstop, not under test here) and pass 2 as run_leg code 2. Pass 1
+# commits, so by the time pass 2's own exhaustion is measured, the branch
+# already holds work off base -- the fix this scenario pins is that pass 2's
+# accounting now reads its OWN pre-leg head (set by run_leg before pass 2
+# runs), not base_sha, so a pass 2 that exhausts and commits nothing is still
+# caught instead of reading as clean because base moved.
+coderep_stub="$(mktemp -d /var/tmp/claude-scratch/fs-review-code-repeat.XXXXXX)"
+tmpdirs+=("$coderep_stub")
+cat > "$coderep_stub/claude-sandboxed" <<'STUB'
+#!/usr/bin/env bash
+set -uo pipefail
+is_pi_leg=0
+session_dir=""
+prev=""
+for a in "$@"; do
+    [[ "$a" == "--exec" ]] && is_pi_leg=1
+    [[ "$prev" == "--session-dir" ]] && session_dir="$a"
+    prev="$a"
+done
+clone_dir=""
+for a in "$@"; do
+    [[ -d "$a/.git" ]] && clone_dir="$a"
+done
+cat >/dev/null
+n=0
+[[ -f "$FAKE_COUNT_FILE" ]] && n="$(cat "$FAKE_COUNT_FILE")"
+n=$(( n + 1 ))
+printf '%s' "$n" > "$FAKE_COUNT_FILE"
+case "$n" in
+1)
+    # pass 1: the top-level implement leg (pi) -- commits the initial work,
+    # so pass 2 starts already ahead of base.
+    git -c user.email=t@fork-sandbox.invalid -c user.name=Tester \
+        -C "$clone_dir" commit --allow-empty -q -m "code-repeat pass 1"
+    ;;
+2)
+    # pass 2: run_leg code 2 -- exhausted retries, no commit unless
+    # CODE2_COMMIT=1.
+    if [[ "${CODE2_COMMIT:-0}" == "1" ]]; then
+        git -c user.email=t@fork-sandbox.invalid -c user.name=Tester \
+            -C "$clone_dir" commit --allow-empty -q -m "code-repeat pass 2"
+    fi
+    printf '{"type":"auto_retry_end","success":false,"attempt":3,"finalError":"529 overloaded_error: Overloaded"}\n'
+    ;;
+esac
+if (( is_pi_leg )); then
+    mkdir -p "$session_dir"
+    printf '{"role":"assistant","stopReason":"stop","usage":{"input":100,"output":10,"cacheRead":0,"cacheWrite":0,"totalTokens":110,"cost":{"total":0.001}}}\n' \
+        > "$session_dir/session.jsonl"
+fi
+exit 0
+STUB
+chmod +x "$coderep_stub/claude-sandboxed"
+
+coderep_cfg="$(mktemp -d)"; tmpdirs+=("$coderep_cfg")
+install -m 600 /dev/null "$coderep_cfg/pi.env"
+printf 'OPENROUTER_API_KEY=fake\n' > "$coderep_cfg/pi.env"
+coderep_presets="$coderep_cfg/presets"
+mkdir -p "$coderep_presets"
+cat > "$coderep_presets/coderep.yaml" <<'EOF'
+agents:
+  coder:
+    harness: pi/some-model
+    repeat: 2
+pipeline:
+  - action: code
+    agent: coder
+EOF
+
+coderep_run() {  # $1 count file, $2 branch; sets coderep_rc / coderep_rd / coderep_out
+    coderep_out="$(CODE2_COMMIT="${CODE2_COMMIT:-0}" \
+        PATH="$coderep_stub:$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$coderep_cfg" \
+        FORK_SANDBOX_BACKEND=fake-image FAKE_COUNT_FILE="$1" \
+        timeout 60 "$launcher" --foreground --preset coderep \
+        --branch "$2" "$proj" "$handoff" 2>&1)"
+    coderep_rc=$?
+    coderep_rd="$(printf '%s\n' "$coderep_out" | sed -n 's/^  run dir:  *//p' | head -1)"
+    [[ -n "$coderep_rd" ]] && tmpdirs+=("$coderep_rd")
+}
+
+coderep_countA="$(mktemp)"; tmpdirs+=("$coderep_countA")
+coderep_run "$coderep_countA" "sandbox-test-code-repeat-exhausted-$$"
+if [[ -n "$coderep_rd" ]]; then
+    check "a repeat code pass that exhausts its retries and commits nothing exits 1" \
+        "1" "$coderep_rc"
+    check "exit-code on disk agrees" "1" "$(cat "$coderep_rd/exit-code" 2>/dev/null)"
+    contains "the sandbox log names the second pass's retry exhaustion" \
+        "the code leg of iteration 2 exhausted its automatic retries" \
+        "$(cat "$coderep_rd/sandbox.log" 2>/dev/null)"
+else
+    no "an exhausted repeat code pass produced a run directory" \
+        "rc=$coderep_rc: $coderep_out"
+fi
+
+coderep_countB="$(mktemp)"; tmpdirs+=("$coderep_countB")
+CODE2_COMMIT=1 coderep_run "$coderep_countB" "sandbox-test-code-repeat-recovered-$$"
+if [[ -n "$coderep_rd" ]]; then
+    check "a repeat code pass that exhausts its retries but still commits exits 0" \
+        "0" "$coderep_rc"
+    check "exit-code on disk agrees" "0" "$(cat "$coderep_rd/exit-code" 2>/dev/null)"
+    lacks "a committing repeat code pass is not reported as exhaustion" \
+        "exhausted" "$(cat "$coderep_rd/sandbox.log" 2>/dev/null)"
+else
+    no "a committing, exhausted repeat code pass produced a run directory" \
+        "rc=$coderep_rc: $coderep_out"
+fi
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))
