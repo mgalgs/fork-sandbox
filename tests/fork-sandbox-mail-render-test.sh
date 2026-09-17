@@ -499,10 +499,25 @@ contains "--text: full attribution rendered on the From line" "$attrib_text" \
 contains "--text: partial attribution omits the missing (network) part" "$attrib_text" \
     'From: @bob [claude]'
 
-not_contains "html: fixtures without X-AI-* headers render byte-identical, no attribution bracket" \
-    "$html" 'class="attribution"'
-not_contains "--text: fixtures without X-AI-* headers render byte-identical, no attribution bracket" \
-    "$text_all" 'attribution'
+# $html/$text_all are snapshots from before the attribution fixtures above
+# existed (lines 194/231), so a plain not_contains against 'attribution'/
+# 'class="attribution"' here would pass no matter what the renderer does
+# with X-AI-* headers -- neither string can ever appear in content the
+# renderer produced before those headers existed. Anchor on @alice's own
+# From line instead: her messages never carried X-AI-* headers, so if the
+# renderer started emitting attribution for headerless messages, her From
+# line is where it would show up.
+not_contains "html: a fixture without X-AI-* headers shows no attribution span on its From line" \
+    "$html" '<span class="from">@alice</span> <span class="attribution">'
+# Anchored on the nested reply specifically (4-space indent, reply2_id),
+# not just any "From: @alice [" -- two of the reference-cycle fixture's
+# three messages are also from @alice and DO carry a trailing bracket
+# (" [orphaned]"), which is unrelated to attribution but would false-
+# positive a broader needle. The nested reply is never orphaned, so an
+# unbroken "From: @alice" all the way to the newline is exactly what an
+# attribution-free From line looks like.
+contains "--text: a fixture without X-AI-* headers shows no attribution bracket on its From line" \
+    "$text_all" $'\n    From: @alice\n'
 
 printf '\n== misc ==\n'
 if python3 -m py_compile "$renderer"; then ok "renderer compiles"; else no "renderer compiles"; fi

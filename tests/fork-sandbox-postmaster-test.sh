@@ -54,6 +54,14 @@ contains() {
     esac
 }
 
+not_contains() {
+    local label="$1" haystack="$2" needle="$3"
+    case "$haystack" in
+        *"$needle"*) no "$label" "'$needle' unexpectedly found in: $haystack" ;;
+        *) ok "$label" ;;
+    esac
+}
+
 refuses() {
     local label="$1"; shift
     local out rc
@@ -446,12 +454,62 @@ contains "unresolvable To: events log carries route-dead with the unresolved cou
 contains "unresolvable To: flag event uses the fixed unresolvable-to keyword" \
     "$(cat "$work/once.out")" "pm flag thread=$short reason=unresolvable-to"
 
-# A genuinely external To: (not @-shaped at all) is not something
-# fork-sandbox-mail.sh's own send validation can ever produce -- every
-# address it accepts matches @[a-z0-9-]+ -- so this pins rule 0's
-# silent-skip for that hypothetical raw-message case by patching the
-# stored .msg file directly, the same technique the corrupted-Thread-ID
-# fixture above uses.
+# `mail reply`'s default reply-all copies the parent's From+To+Cc into the
+# new message's own To:, so @nobody (still unresolved) rides along into
+# every later reply on this thread -- exactly like a real reply-all would.
+# Before pm_flag stopped re-firing for an already-flagged name, this
+# second pass re-flagged the thread with THIS message's id and clobbered
+# whatever the flag said before (pm_flag overwrites, not appends).
+reply_msg '@bob' "$mid" 'a reply-all reply' >/dev/null
+: > "$STUB_ARGV_LOG"
+once
+flag_content2="$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid" 2>/dev/null)"
+check "unresolvable To: a reply-all reply carrying the SAME unresolved name does not re-flag" \
+    "$flag_content" "$flag_content2"
+not_contains "unresolvable To: a reply-all reply carrying the SAME unresolved name emits no route-dead event" \
+    "$(cat "$work/once.out")" "route-dead"
+
+# Rule 1: operator mail resets the flag, and the operator's own mail
+# reply is a reply-all too -- it must not immediately re-flag the thread
+# it just re-armed just because @nobody is still riding along in the
+# propagated To:.
+reply_msg '@operator' "$mid" 'operator re-arms the thread' >/dev/null
+: > "$STUB_ARGV_LOG"
+once
+check "unresolvable To: an operator reply-all carrying the SAME unresolved name clears the flag and it stays cleared" \
+    "" "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid" 2>/dev/null || true)"
+
+# A single message that trips BOTH the unresolvable-To check and the
+# hops gate must leave the more specific hops reason standing, not get
+# silently overwritten by the unresolvable-To reason written moments
+# earlier in the same pm_process_message call.
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+mid_gate="$(send_msg '@alice' '@bob,@nobody' 'unresolvable plus exhausted hops' 'body' 0)"
+tid_gate="$(thread_of "$mid_gate")"
+short_gate="${tid_gate:0:8}"
+: > "$STUB_ARGV_LOG"
+once
+check "unresolvable+hops: the hops reason wins, not clobbered by unresolvable-To" \
+    "hops exhausted at $mid_gate" \
+    "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid_gate" 2>/dev/null)"
+check "unresolvable+hops: exactly one flag event for the message, not two" 1 \
+    "$(grep -c -- "^pm flag thread=$short_gate " "$work/once.out")"
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+
+# A non-@-shaped To: (not something fork-sandbox-mail.sh's own send
+# validation can ever produce -- every address it accepts matches
+# @[a-z0-9-]+ -- so this patches the stored .msg file directly, the same
+# technique the corrupted-Thread-ID fixture above uses) is still silently
+# skipped, unflagged: this pins that one hypothetical raw-message shape,
+# nothing more. It is NOT evidence that rule 0's original "external
+# senders are silently skipped" promise holds for a real external
+# correspondent, because every address this store actually accepts is
+# @-shaped, making a real external address indistinguishable from a
+# typo'd seat name -- and the @-shaped case flags (see "unresolvable To:
+# @name is flagged" above), the opposite of "silently skipped".
 new_scratch_root FORK_SANDBOX_MAIL_ROOT
 export FORK_SANDBOX_MAIL_ROOT
 mid_ext="$(send_msg '@alice' '@bob' 'external to test' 'body' 8)"
@@ -466,7 +524,7 @@ sed -i "s/^To: .*/To: @bob, someone@example.com/" "$ext_msg_file"
 : > "$STUB_ARGV_LOG"
 once
 check "external To: known recipient still wakes" 1 "$(grep -c -- "^sbx-mail-$short_ext-bob-" "$STUB_ARGV_LOG")"
-check "external To: no flag raised (rule 0 regression pin)" "" \
+check "external To: no flag raised (non-@-shaped address, an unreachable shape via the CLI)" "" \
     "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid_ext" 2>/dev/null || true)"
 if grep -qF -- "route-dead thread=$short_ext" "$work/once.out"; then
     no "external To: no route-dead event (rule 0 regression pin)"
@@ -1024,6 +1082,50 @@ once
 msg_count_after="$(find "$FORK_SANDBOX_MAIL_ROOT/threads" -name '*.msg' | wc -l)"
 check "harvest: second scan over an already-harvested run posts nothing new" \
     "$msg_count_before" "$msg_count_after"
+
+# ============================================================
+printf '\n== harvest: sealed pi with no configured model recovers X-AI-Model from summary.json ==\n'
+# ============================================================
+
+# bob (fleet.yaml: harness pi, network sealed, no model:) is exactly the
+# seat fork-sandbox.sh's own model-less-pi guard lets through model-less:
+# agent-sandboxed discovers the real model from the endpoint at run time,
+# and fork-sandbox.sh recovers that discovered id into summary.json's
+# "model" key (see the comment above this fallback in pm_harvest_run).
+# MODEL in the run's own .env stays empty the whole time -- the postmaster
+# never asked fork-sandbox.sh for a model here -- so this is the one case
+# attribution has to read summary.json instead of its own spawn record.
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+
+model_mid="$(send_msg '@carol' '@bob' 'sealed pi topic' 'first message' 8)"
+model_tid="$(thread_of "$model_mid")"
+: > "$STUB_ARGV_LOG"
+once
+model_run_env="$(env_file_for_agent bob)"
+model_run_dir="$(sed -n 's/^RUN_DIR=//p' "$model_run_env")"
+check "harvest: sealed-pi-no-model wake's own .env records no MODEL" "" \
+    "$(sed -n 's/^MODEL=//p' "$model_run_env")"
+
+mkdir -p -- "$model_run_dir/outbox"
+printf '\nDiscovered-model reply.\n' > "$model_run_dir/outbox/mail-1.md"
+printf '0\n' > "$model_run_dir/exit-code"
+printf '{"model":"moonshotai/kimi-k3"}\n' > "$model_run_dir/summary.json"
+once
+
+model_reply=""
+for f in "$FORK_SANDBOX_MAIL_ROOT/threads/$model_tid"/*.msg; do
+    [[ -e "$f" ]] || continue
+    [[ "$(header_of_file "$f" From)" == "@bob" ]] && model_reply="$f"
+done
+if [[ -n "$model_reply" ]]; then
+    ok "harvest: sealed-pi-no-model reply posted"
+    check "harvest: X-AI-Model recovered from summary.json's discovered model" \
+        "moonshotai/kimi-k3" "$(header_of_file "$model_reply" X-AI-Model)"
+else
+    no "harvest: sealed-pi-no-model reply posted"
+fi
 
 # ============================================================
 printf '\n== routed marker idempotence: two --once passes route each message once ==\n'

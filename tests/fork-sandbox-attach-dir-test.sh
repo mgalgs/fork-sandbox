@@ -96,12 +96,18 @@ else
     no "attach directory outside the scratch root is refused" "$out"
 fi
 
+# --attach-dir shares fs_validate_scratch_dir with --session-state and
+# --clone-dir, which refuse ANY symlink outright, before ever resolving
+# where it points (see fs_validate_scratch_dir's own comment: a symlink
+# checked here and resolved later is a different directory from the one
+# that gets used) -- so this is refused for being a symlink at all, not
+# specifically for escaping the scratch root.
 escaped="$attach/escaped-attach"; ln -s "$outside" "$escaped"; tmpdirs+=("$escaped")
 out="$(run_launcher "$escaped" "$work/escaped-argv")"; rc=$?
-if (( rc != 0 )) && [[ "$out" == *"must name a directory under"* && "$out" == *"$outside"* ]]; then
-    ok "attach-dir symlink escaping the scratch root is refused after canonicalization"
+if (( rc != 0 )) && [[ "$out" == *"is a symlink"* && "$out" == *"$escaped"* ]]; then
+    ok "attach-dir symlink is refused outright, not resolved and boundary-checked"
 else
-    no "attach-dir symlink escaping the scratch root is refused after canonicalization" "$out"
+    no "attach-dir symlink is refused outright, not resolved and boundary-checked" "$out"
 fi
 
 missing="$attach/no-such-dir"

@@ -399,10 +399,21 @@ woken via Cc — so a Cc-woken seat's follow-up can still produce a refuse
 line), `triage-skip` (agent, thread), `handler` (agent,
 thread, exit=<status>), and `route-dead` (thread, unresolved=<count> — one
 or more `To:` names in rule 0's expansion were @-shaped but did not
-resolve as a fleet agent, so the thread is also separately flag'd; the
+resolve as a fleet agent, so the thread is also separately flag'd with
+reason `unresolvable To: <names> at <message-id>` (keyword
+`unresolvable-to`), unless a hops/budget gate flags the same message
+first, in which case that reason wins instead — pm_flag overwrites, not
+appends, so only one reason survives a message that trips both; the
 names themselves never appear on this line, only the count — `@operator`
 does not count here, since rule 0 already treats it as legitimately
-non-resolving). `flag` goes through this same event-emitting
+non-resolving. Because `mail reply` defaults to reply-all and copies a
+message's own From/To/Cc into every reply, the same unresolved name tends
+to reappear on every later message in the thread; `unresolved` counts
+only names not already flagged once for this thread, so a name is flagged
+(and this event fires) at most once per thread until a *different*
+unresolved name appears — this also means rule 1's operator reset is not
+immediately undone by an operator's own reply-all reintroducing a name
+already flagged before). `flag` goes through this same event-emitting
 code, gated the same way — it only prints one when reached via
 `deliver`'s own route/harvest pass, so running `flag` directly prints
 nothing. `unflag` prints nothing ever, in or out of `deliver`: it has no
@@ -426,9 +437,12 @@ for it.
    that agent's `wake-on-cc` resolves false or, when a top-level
    `triage:` block is configured and M is not operator/external mail,
    the classifier gate described in "The Cc triage gate" below decides
-   skip. A name that does not resolve — unknown, or external like the
-   operator's own address — is skipped silently on either header;
-   external senders receive mail only in the archive. M's own `From` is
+   skip. A name that does not resolve as a wake candidate on either
+   header: an unknown fleet name (a typo'd seat or a missing fleet file)
+   also flags T needs-operator the first time this thread sees it (see
+   `route-dead` above), while an address that is not `@`-shaped at all,
+   or is `@operator`, is treated as genuinely external and never flags.
+   External senders receive mail only in the archive. M's own `From` is
    never a candidate on either header, even when it reaches the list
    only through a list address: a sender never wakes on its own message.
 1. **Operator reset.** If M's `From` does *not* resolve as a fleet agent,

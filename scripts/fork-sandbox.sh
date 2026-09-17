@@ -185,9 +185,13 @@
 # --attach-dir <dir>:    bind an existing directory read-only at
 #                        /attachments inside a local run. The directory
 #                        must live under /var/tmp/claude-scratch/ (or the
-#                        /tmp/claude-scratch compat path) — same boundary
-#                        as --context-ro and --fixtures, never an
-#                        arbitrary host path. The postmaster uses this to
+#                        /tmp/claude-scratch compat path) — the same
+#                        whole-scratch-root boundary as --session-state
+#                        and --clone-dir below, not the narrower forks/
+#                        or fixtures/ prefix --context-ro and --fixtures
+#                        enforce — never an arbitrary host path, but wide
+#                        enough to reach another run's clone or the rest
+#                        of the mail store. The postmaster uses this to
 #                        hand a wake its thread's own attachments
 #                        directory under the mail store. Refused with
 #                        --k8s.
@@ -3463,20 +3467,17 @@ fi
 # --attach-dir's caller (the postmaster) always names a thread's own
 # attachments directory under the mail store, which lives under
 # /var/tmp/claude-scratch/ (or the /tmp/claude-scratch compat path) by
-# convention -- but the flag itself is a general read-only bind, exactly
-# the shape --context-ro and --fixtures each refuse outside their own
-# staging root, so it gets the same boundary rather than trusting every
-# caller to only ever pass a mail-store path.
+# convention -- but the flag itself is a general read-only bind, so it
+# gets the same boundary fs_validate_scratch_dir already enforces for
+# --session-state and --clone-dir (the whole scratch root, not the
+# narrower forks/ and fixtures/ prefixes --context-ro and --fixtures are
+# scoped to below -- --attach-dir can reach another run's clone or the
+# rest of the mail store, same as those two writable binds can) rather
+# than trusting every caller to only ever pass a mail-store path. Unlike
+# those two, this bind must already exist and be a directory: it names a
+# thread's attachments at read time, not a location a session creates.
 if [[ -n "$attach_dir" ]]; then
-    attach_dir="$("$FS_REALPATH" -m "$attach_dir")"
-    if [[ "$attach_dir" != /var/tmp/claude-scratch/* && "$attach_dir" != /tmp/claude-scratch/* ]]; then
-        echo "Error: --attach-dir must name a directory under" >&2
-        echo "/var/tmp/claude-scratch/ (or the /tmp/claude-scratch compat" >&2
-        echo "path) — got '$attach_dir'. An unattended agent can read the" >&2
-        echo "bind, and for most harnesses it has internet too, so which" >&2
-        echo "paths may be handed over is a security boundary." >&2
-        exit 1
-    fi
+    attach_dir="$(fs_validate_scratch_dir "$attach_dir" --attach-dir)" || exit 1
     if [[ ! -e "$attach_dir" ]]; then
         echo "Error: --attach-dir directory '$attach_dir' does not exist." >&2
         exit 1

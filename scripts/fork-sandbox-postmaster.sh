@@ -60,10 +60,20 @@
 #   route-dead   thread, unresolved=<count> -- rule 0's To: expansion hit
 #                one or more @-shaped names (typo'd seat, missing fleet
 #                file -- never `@operator`, which is excepted, see
-#                pm_expand_to) that `fleet expand` could not resolve; the
-#                thread is also separately flag'd. Names never appear on
-#                this line, only the count -- they are raw header text,
-#                and the flag reason is where they belong.
+#                pm_expand_to) that `fleet expand` could not resolve, and
+#                that this thread had not already been flagged for once
+#                before (reply-all reintroduces the same unresolved name
+#                on every later message, and pm_flag overwrites rather
+#                than appends, so a name already flagged for this thread
+#                does not flag or count again -- see UNRESOLVED_TO). The
+#                thread is also separately flag'd with reason
+#                "unresolvable To: <names> at <message-id>" (keyword
+#                unresolvable-to), UNLESS a hops/budget gate flags the
+#                same message too, in which case that reason wins instead
+#                (pm_flag overwrites; only one reason survives). Names
+#                never appear on this line, only the count -- they are
+#                raw header text, and the flag reason is where they
+#                belong.
 #
 # stderr is unchanged (errors only). Nothing sender-controlled (Subject,
 # body, raw From, attachment names) is ever a field value here -- see
@@ -106,9 +116,13 @@
 #      MODEL above), and, unless M is operator/external mail (rule 1), IFF
 #      the triage classifier (when a top-level triage: seat is configured
 #      and the candidate has not set triage: false) returns wake rather
-#      than skip for it. A name that does not resolve (unknown or external,
-#      e.g. the operator's own address) is skipped silently on either
-#      header: external senders receive mail only in the archive. M's own
+#      than skip for it. A name that does not resolve is never a wake
+#      candidate on either header: an unknown fleet name (typo'd seat,
+#      missing fleet file) also flags T needs-operator the first time
+#      this thread sees it (see the route-dead event above), while
+#      `@operator` -- or anything not @-shaped -- is treated as
+#      genuinely external and never flags. External senders receive mail
+#      only in the archive. M's own
 #      From is never a wake candidate on either header, even when it only
 #      reaches the list via a list address M's To: or Cc: expands through
 #      -- a sender never wakes on a message it sent itself. A handler seat
@@ -596,6 +610,10 @@ SPAWNS="$STATE/spawns"
 SEQ="$STATE/seq"
 HANDOFFS="$STATE/handoffs"
 TRIAGED="$STATE/triaged"
+# One file per thread, one already-flagged name per line -- see the
+# unresolvable-To block in pm_process_message for why this exists and why
+# rule 1's operator reset must NOT clear it.
+UNRESOLVED_TO="$STATE/unresolved-to"
 
 # Where a handler seat's `command:` bare name resolves -- same env var,
 # same default, as fleet.sh's own HANDLERS_DIR (fleet.sh:154). postmaster.sh
@@ -1861,14 +1879,49 @@ pm_process_message() {
     # itself is still wrong. The raw names are safe in the flag file
     # (precedent: the malformed-reply flag embeds mail CLI stderr) but
     # never on the events line, which only ever carries the count.
+    #
+    # reply-all copies a message's own From/To/Cc into every reply
+    # (fork-sandbox-mail.sh's reply-all default), so an unresolved To:
+    # name is, past the message that first introduced it, almost always
+    # the SAME name every later reply in the thread inherited, not a new
+    # problem. pm_flag overwrites rather than appends (see its own
+    # comment), so re-flagging an already-known name on every later
+    # message would permanently pin the thread on this one reason,
+    # clobbering "hops exhausted", "spawn failed" and every other flag
+    # reason a later message would otherwise report, and would defeat
+    # rule 1's operator-reset promise the instant the operator's own
+    # `mail reply` (itself a reply-all) reintroduces the same name.
+    # UNRESOLVED_TO/$tid records, one per line, every name this thread
+    # has already been flagged for once; only a name not already in that
+    # record is "fresh" and re-flags/re-events, and every name seen this
+    # pass is appended so it is never flagged again. The record is
+    # thread-scoped and deliberately NOT cleared by rule 1's pm_unflag
+    # above: an operator's reply carrying the same propagated name must
+    # not immediately re-flag the thread it just re-armed.
+    local -a fresh_unresolved=()
     if (( ${#unresolved_to[@]} )); then
-        local unresolved_joined="" u
+        mkdir -p -- "$UNRESOLVED_TO"
+        local seen_file="$UNRESOLVED_TO/$tid" u
         for u in "${unresolved_to[@]}"; do
+            if [[ -e "$seen_file" ]] && grep -qxF -- "$u" "$seen_file"; then
+                continue
+            fi
+            fresh_unresolved+=("$u")
+            printf '%s\n' "$u" >> "$seen_file"
+        done
+    fi
+    if (( ${#fresh_unresolved[@]} )); then
+        local unresolved_joined="" u
+        for u in "${fresh_unresolved[@]}"; do
             [[ -n "$unresolved_joined" ]] && unresolved_joined+=", "
             unresolved_joined+="$u"
         done
-        pm_event "route-dead thread=${tid:0:8} unresolved=${#unresolved_to[@]}"
-        pm_flag "$tid" "unresolvable To: $unresolved_joined at $mid"
+        pm_event "route-dead thread=${tid:0:8} unresolved=${#fresh_unresolved[@]}"
+        # A hops/budget gate on this same message is about to flag the
+        # thread too (below), and pm_flag overwrites -- so when both fire
+        # on one message, let the gate reason win rather than silently
+        # discard it the instant this block runs first.
+        [[ -z "$gate_reason" ]] && pm_flag "$tid" "unresolvable To: $unresolved_joined at $mid"
     fi
 
     if [[ -n "$gate_reason" ]]; then
@@ -2233,6 +2286,21 @@ pm_harvest_run() {
                 fi
             fi
         fi
+    fi
+
+    # $model above is the model the postmaster ASKED fork-sandbox.sh for
+    # (from fleet resolve), which is empty exactly for a sealed pi seat
+    # with no model: in fleet.yaml -- the one case where the model is
+    # discovered, not requested (agent-sandboxed asks the endpoint; see
+    # the comment above the harness=claude default a few lines up in
+    # pm_spawn_wake). fork-sandbox.sh recovers that discovered id from
+    # the sandbox log and stamps it into summary.json's "model" key
+    # before this run's last artifact is written, so read it from there
+    # rather than leave X-AI-Model empty for attribution's least-guessable
+    # seat.
+    if [[ -z "$model" && -f "$run_dir/summary.json" ]]; then
+        model="$(pm_trim "$(jq -r '.model // empty' \
+            "$run_dir/summary.json" 2>/dev/null || true)")"
     fi
 
     local trigger_file trigger_hops
