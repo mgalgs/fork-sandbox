@@ -417,8 +417,11 @@ check "carol still wakes on bob's reply" 1 \
     "$(grep -c -- "^sbx-mail-$short-carol-" "$STUB_ARGV_LOG")"
 
 # ============================================================
-printf '\n== unknown/external To name is skipped, no crash, no flag ==\n'
+printf '\n== unresolvable To: @name is flagged, known recipients still wake ==\n'
 # ============================================================
+# @nobody is @-shaped (agents are always addressed "@name") but not a
+# registered fleet agent -- exactly the typo/missing-fleet-file case this
+# feature exists to surface, so it is no longer silent.
 
 new_scratch_root FORK_SANDBOX_MAIL_ROOT
 export FORK_SANDBOX_MAIL_ROOT
@@ -426,9 +429,69 @@ mid="$(send_msg '@alice' '@bob,@nobody' 'unknown to test' 'body' 8)"
 tid="$(thread_of "$mid")"
 short="${tid:0:8}"
 rc="$(once_rc)"
-check "unknown To name: deliver still exits 0" "0" "$rc"
-check "unknown To name: known recipient still wakes" 1 "$(grep -c -- "^sbx-mail-$short-bob-" "$STUB_ARGV_LOG")"
-check "unknown To name: no flag raised" "" "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid" 2>/dev/null || true)"
+check "unresolvable To: deliver still exits 0" "0" "$rc"
+check "unresolvable To: known recipient still wakes" 1 "$(grep -c -- "^sbx-mail-$short-bob-" "$STUB_ARGV_LOG")"
+check "unresolvable To: message is still marked routed" 0 \
+    "$([[ -e "$FORK_SANDBOX_MAIL_ROOT/.postmaster/routed/$mid" ]]; echo $?)"
+flag_content="$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid" 2>/dev/null)"
+contains "unresolvable To: flag reason names the typo'd address" \
+    "$flag_content" "unresolvable To: @nobody at $mid"
+if [[ "$flag_content" == *"@bob"* ]]; then
+    no "unresolvable To: flag does not name the resolved address" "$flag_content"
+else
+    ok "unresolvable To: flag does not name the resolved address"
+fi
+contains "unresolvable To: events log carries route-dead with the unresolved count" \
+    "$(cat "$work/once.out")" "pm route-dead thread=$short unresolved=1"
+contains "unresolvable To: flag event uses the fixed unresolvable-to keyword" \
+    "$(cat "$work/once.out")" "pm flag thread=$short reason=unresolvable-to"
+
+# A genuinely external To: (not @-shaped at all) is not something
+# fork-sandbox-mail.sh's own send validation can ever produce -- every
+# address it accepts matches @[a-z0-9-]+ -- so this pins rule 0's
+# silent-skip for that hypothetical raw-message case by patching the
+# stored .msg file directly, the same technique the corrupted-Thread-ID
+# fixture above uses.
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+mid_ext="$(send_msg '@alice' '@bob' 'external to test' 'body' 8)"
+tid_ext="$(thread_of "$mid_ext")"
+short_ext="${tid_ext:0:8}"
+ext_msg_file=""
+for f in "$FORK_SANDBOX_MAIL_ROOT/threads/$tid_ext"/*.msg; do
+    [[ -e "$f" ]] || continue
+    grep -q "^Message-ID: $mid_ext\$" "$f" && ext_msg_file="$f"
+done
+sed -i "s/^To: .*/To: @bob, someone@example.com/" "$ext_msg_file"
+: > "$STUB_ARGV_LOG"
+once
+check "external To: known recipient still wakes" 1 "$(grep -c -- "^sbx-mail-$short_ext-bob-" "$STUB_ARGV_LOG")"
+check "external To: no flag raised (rule 0 regression pin)" "" \
+    "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid_ext" 2>/dev/null || true)"
+if grep -qF -- "route-dead thread=$short_ext" "$work/once.out"; then
+    no "external To: no route-dead event (rule 0 regression pin)"
+else
+    ok "external To: no route-dead event (rule 0 regression pin)"
+fi
+
+# A mix of one good seat and one typo'd seat in the same To: -- the good
+# seat still wakes, and the flag names only the typo, not the seat that
+# resolved fine.
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+mid_mix="$(send_msg '@alice' '@bob,@typo' 'mixed to test' 'body' 8)"
+tid_mix="$(thread_of "$mid_mix")"
+short_mix="${tid_mix:0:8}"
+: > "$STUB_ARGV_LOG"
+once
+check "mixed To: good seat still wakes" 1 "$(grep -c -- "^sbx-mail-$short_mix-bob-" "$STUB_ARGV_LOG")"
+flag_mix="$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid_mix" 2>/dev/null)"
+contains "mixed To: flag names the typo'd address" "$flag_mix" "@typo"
+if [[ "$flag_mix" == *"@bob"* ]]; then
+    no "mixed To: flag does not name the good address" "$flag_mix"
+else
+    ok "mixed To: flag does not name the good address"
+fi
 
 # ============================================================
 printf '\n== seat resolution reaches launcher argv ==\n'

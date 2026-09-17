@@ -699,15 +699,37 @@ pm_trim() {
 # one alongside it). Unknown/external addresses are skipped, not errors
 # (rule 0). Output: one BARE agent name per line (fleet expand emits
 # "@name"; resolve and branch-naming both want the bare name).
+#
+# A caller that wants to know which of those skipped inputs were
+# fleet-internal typos rather than genuine external addresses sets
+# PM_EXPAND_UNRESOLVED_FILE to a path before calling; this function
+# truncates that file at the top of the call (so a stale list from a
+# previous call, e.g. this same caller's earlier To: expansion, never
+# leaks into a Cc: expansion) and appends the raw (trimmed) input for
+# every address that is @-shaped (`^@` -- agents are always addressed
+# "@name", so an @-shaped input that fails to expand is a typo'd seat
+# name or a missing fleet file, never a legitimate external address) and
+# whose `fleet expand` failed. A caller that leaves the variable unset
+# gets none of this -- reset and record both no-op -- so existing call
+# sites are unaffected. This can't be a plain global/nameref because the
+# caller invokes this function inside a `<( ... )` process substitution,
+# which forks a subshell; a file survives that fork, an in-memory
+# variable would not.
 pm_expand_to() {
     local to_field="$1" a name
     local -a addrs=() result=()
+    [[ -n "${PM_EXPAND_UNRESOLVED_FILE:-}" ]] && : > "$PM_EXPAND_UNRESOLVED_FILE"
     IFS=',' read -ra addrs <<< "$to_field"
     for a in "${addrs[@]}"; do
         a="$(pm_trim "$a")"
         [[ -n "$a" ]] || continue
         local expanded
-        expanded="$("$FLEET" expand "$a" 2>/dev/null)" || continue
+        if ! expanded="$("$FLEET" expand "$a" 2>/dev/null)"; then
+            if [[ -n "${PM_EXPAND_UNRESOLVED_FILE:-}" && "$a" == @* ]]; then
+                printf '%s\n' "$a" >> "$PM_EXPAND_UNRESOLVED_FILE"
+            fi
+            continue
+        fi
         while IFS= read -r name; do
             [[ -n "$name" ]] || continue
             name="${name#@}"
@@ -993,6 +1015,7 @@ pm_flag_keyword() {
     local reason="$1"
     case "$reason" in
         "seat resolution failed for"*) printf 'seat-resolution-failed' ;;
+        "unresolvable To:"*) printf 'unresolvable-to' ;;
         "handler command"*"path separator"*) printf 'handler-bad-command' ;;
         "handler "*"does not exist"*) printf 'handler-missing' ;;
         "handler "*"is not a regular file"*) printf 'handler-not-regular' ;;
@@ -1708,8 +1731,22 @@ pm_process_message() {
     # ... dump` per address, not a read, but cheap next to a spawn), it
     # spawns nothing and triages nothing, so computing it unconditionally
     # costs that, not a wasted wake or a wasted triage classifier call.
+    # PM_EXPAND_UNRESOLVED_FILE is set as a local (not a `VAR=val cmd`
+    # prefix) so the assignment is a plain shell variable pm_expand_to
+    # picks up by dynamic scope, not something whose lifetime depends on
+    # exactly when bash wires up the process-substitution redirection
+    # below. It's unset again immediately after so the Cc: expansion a
+    # few lines down (out of scope for this feature -- see the file's
+    # header comment) never gets unresolved-name tracking.
     local -a to_expanded=()
+    local to_unresolved_file
+    to_unresolved_file="$(mktemp "$MAIL_ROOT/.postmaster.to-unresolved.XXXXXX")"
+    local PM_EXPAND_UNRESOLVED_FILE="$to_unresolved_file"
     mapfile -t to_expanded < <(pm_expand_to "$to")
+    unset PM_EXPAND_UNRESOLVED_FILE
+    local -a unresolved_to=()
+    mapfile -t unresolved_to < "$to_unresolved_file"
+    rm -f -- "$to_unresolved_file"
     local -a to_candidates=()
     local cand
     for cand in "${to_expanded[@]}"; do
@@ -1774,6 +1811,23 @@ pm_process_message() {
     fi
 
     : > "$ROUTED/$mid"
+
+    # An @-shaped To: name that never expanded is a typo'd seat or a
+    # missing fleet file, not an external address (rule 0 already let
+    # those through silently, above) -- flag it even when Cc: rescued a
+    # wake for someone else on the same message, since the To: line
+    # itself is still wrong. The raw names are safe in the flag file
+    # (precedent: the malformed-reply flag embeds mail CLI stderr) but
+    # never on the events line, which only ever carries the count.
+    if (( ${#unresolved_to[@]} )); then
+        local unresolved_joined="" u
+        for u in "${unresolved_to[@]}"; do
+            [[ -n "$unresolved_joined" ]] && unresolved_joined+=", "
+            unresolved_joined+="$u"
+        done
+        pm_event "route-dead thread=${tid:0:8} unresolved=${#unresolved_to[@]}"
+        pm_flag "$tid" "unresolvable To: $unresolved_joined at $mid"
+    fi
 
     if [[ -n "$gate_reason" ]]; then
         local refuse_reason="budget"
