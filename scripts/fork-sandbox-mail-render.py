@@ -37,9 +37,12 @@ read.
 --text is the agent view: oldest-first, a '---' separator line between
 messages, reply nesting shown by indentation, headers abbreviated to
 Message-ID/From/To/Cc/Subject/hops (deliberately no Date, to save prompt
-tokens). The Message-ID is included even though nothing else needs it,
-because it is the handle every id-taking verb (reply --reply-to, show,
-seen) requires, and a view an agent cannot act on is not a view. Body
+tokens); From carries a bracketed [X-AI-* attribution] suffix when the
+message has one (see attribution_str), byte-identical to before that
+existed when it doesn't. The Message-ID is included even though nothing
+else needs it, because it is the handle every id-taking verb (reply
+--reply-to, show, seen) requires, and a view an agent cannot act on is
+not a view. Body
 lines are verbatim but each is prefixed with the thread indent plus a
 literal '> ' (real-email quoting: a body line that already starts with
 '> ' becomes '> > ', standard reply-nesting), so a body cannot forge the

@@ -88,6 +88,22 @@ fi
 
 printf '\n== --attach-dir refusals ==\n'
 
+outside="$(mktemp -d)"; tmpdirs+=("$outside")
+out="$(run_launcher "$outside" "$work/outside-argv")"; rc=$?
+if (( rc != 0 )) && [[ "$out" == *"must name a directory under"* && "$out" == *"$outside"* ]]; then
+    ok "attach directory outside the scratch root is refused"
+else
+    no "attach directory outside the scratch root is refused" "$out"
+fi
+
+escaped="$attach/escaped-attach"; ln -s "$outside" "$escaped"; tmpdirs+=("$escaped")
+out="$(run_launcher "$escaped" "$work/escaped-argv")"; rc=$?
+if (( rc != 0 )) && [[ "$out" == *"must name a directory under"* && "$out" == *"$outside"* ]]; then
+    ok "attach-dir symlink escaping the scratch root is refused after canonicalization"
+else
+    no "attach-dir symlink escaping the scratch root is refused after canonicalization" "$out"
+fi
+
 missing="$attach/no-such-dir"
 out="$(run_launcher "$missing" "$work/missing-argv")"; rc=$?
 if (( rc != 0 )) && [[ "$out" == *"$missing"* && "$out" == *"does not exist"* ]]; then

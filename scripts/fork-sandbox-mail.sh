@@ -54,7 +54,6 @@
 #                                 3), not this store's; --hops just gives
 #                                 it (or an operator) the override to do it
 #                                 with
-#   X-Attachment: attachments/<basename>   one line per attachment
 #   X-<Name>: <value>             any number of caller-supplied custom
 #                                 headers, via a repeatable --header
 #                                 'X-Name: value' flag on send/reply. Name
@@ -64,6 +63,7 @@
 #                                 alone) and may not be X-Hops or
 #                                 X-Attachment, which this store writes
 #                                 itself.
+#   X-Attachment: attachments/<basename>   one line per attachment
 #
 # Unlike the RFC-2822-style angle-bracket/domain ids this repo's old
 # lkml-mailbox.sh used, ids here are bare uuids with no "<...>" wrapping and

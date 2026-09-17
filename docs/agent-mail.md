@@ -109,6 +109,9 @@ Subject: <text>
 In-Reply-To: <parent uuid>      replies only
 References: <uuid> <uuid>...    replies only, root-to-parent order
 X-Hops: <int>                   default 8 on a new thread
+X-<Name>: <value>               any number of caller-supplied custom
+                                 headers, one per repeatable --header
+                                 'X-Name: value' flag on send/reply
 X-Attachment: attachments/<basename>    one line per attachment
 ```
 
@@ -120,6 +123,14 @@ deduped, minus the sender. Its subject defaults to `Re: ` + the parent's.
 Its `X-Hops` is **copied verbatim** from the parent — decrementing is the
 router's job, not the store's, and `--hops` is the override the router
 (or an operator) uses to do it.
+
+`--header 'X-Name: value'` on `send`/`reply` may be repeated and sets an
+arbitrary custom header; the name must match `^X-[A-Za-z0-9-]+$` and may
+not be `X-Hops` or `X-Attachment`, which the store writes itself. The
+postmaster uses this to stamp `X-AI-Persona`/`X-AI-Harness`/`X-AI-Model`/
+`X-AI-Network` attribution on every harvested reply (see "The event
+stream" in the postmaster section); the `--text` render view shows it as
+a bracketed suffix on `From`.
 
 ### Addresses
 
@@ -376,7 +387,7 @@ Every route/harvest pass, `deliver` prints one porcelain line per action
 worth operator eyes to stdout, unbuffered enough to `tail -F` or pipe
 live: `pm <event> thread=<short-id> agent=<name> key=val...`, where
 `thread` is the thread id's first 8 characters and `agent` is always the
-resolved fleet registry name, never raw header text. The six events are
+resolved fleet registry name, never raw header text. The seven events are
 `spawn` (agent, thread, run, via=to|cc), `harvest` (agent, thread,
 replies=<count>, emitted for both LLM and handler seats), `flag` (thread,
 reason=<fixed keyword>), `refuse` (agent, thread, reason=hops|budget — at
@@ -385,12 +396,17 @@ refused message skips Cc resolution outright, but the same gate is
 re-checked at follow-up-wake time against whichever agent owns the live
 run a pending message is waiting on, and that agent can be one originally
 woken via Cc — so a Cc-woken seat's follow-up can still produce a refuse
-line), `triage-skip` (agent, thread), and `handler` (agent,
-thread, exit=<status>). `flag` goes through this same event-emitting
+line), `triage-skip` (agent, thread), `handler` (agent,
+thread, exit=<status>), and `route-dead` (thread, unresolved=<count> — one
+or more `To:` names in rule 0's expansion were @-shaped but did not
+resolve as a fleet agent, so the thread is also separately flag'd; the
+names themselves never appear on this line, only the count — `@operator`
+does not count here, since rule 0 already treats it as legitimately
+non-resolving). `flag` goes through this same event-emitting
 code, gated the same way — it only prints one when reached via
 `deliver`'s own route/harvest pass, so running `flag` directly prints
 nothing. `unflag` prints nothing ever, in or out of `deliver`: it has no
-event of its own in the six above, so a thread being flagged and later
+event of its own in the seven above, so a thread being flagged and later
 auto-cleared (rule 1, operator mail) is invisible on this stream — only
 the flag is observable, not its clearing. This is a stable contract, not
 a log file — stderr is unchanged (errors only), and nothing

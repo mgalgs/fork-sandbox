@@ -57,6 +57,13 @@
 #                candidate for this message
 #   handler      agent, thread, exit=<status> -- a handler seat's wake ran
 #                to completion (every run, not just failures)
+#   route-dead   thread, unresolved=<count> -- rule 0's To: expansion hit
+#                one or more @-shaped names (typo'd seat, missing fleet
+#                file -- never `@operator`, which is excepted, see
+#                pm_expand_to) that `fleet expand` could not resolve; the
+#                thread is also separately flag'd. Names never appear on
+#                this line, only the count -- they are raw header text,
+#                and the flag reason is where they belong.
 #
 # stderr is unchanged (errors only). Nothing sender-controlled (Subject,
 # body, raw From, attachment names) is ever a field value here -- see
@@ -166,9 +173,14 @@
 #
 # Spawned via `fork-sandbox.sh --branch <b> --harness <h> [--model <m>]
 # [--network <n>] [--pi-args "--thinking <level>"] [--preset <p>]
-# <project> <handoff>`. A seat with no `preset:` (fleet resolve's 10th
-# line) spawns with NO --review-loop and NO --maintainer-loop, exactly as
-# before presets existed: the fleet IS the review for that seat, scrutiny
+# [--attach-dir <dir>] <project> <handoff>`. --attach-dir is added only
+# when the thread's attachments directory under the mail store exists and
+# is non-empty (see pm_spawn_wake); it binds that directory read-only at
+# /attachments inside the sandbox, the one filesystem mount every LLM
+# seat gets beyond the clone itself. A seat with no `preset:` (fleet
+# resolve's 10th line) spawns with NO --review-loop and NO
+# --maintainer-loop, exactly as before presets existed: the fleet IS the
+# review for that seat, scrutiny
 # comes from other agents reading the reply on the thread. A seat WITH a
 # preset gets `--preset <name>` added to spawn_args (see below); its
 # review/fix/maintainer legs, if any, run inside that one
@@ -297,7 +309,12 @@
 # parent that DOES resolve but whose X-Hops exceeds the trigger's: hops
 # only ever go down a thread, so naming an ancestor further up than the
 # trigger can only raise the budget, and the fallback clamps that back
-# down to the trigger's own hops rather than letting it through. A non-zero exit
+# down to the trigger's own hops rather than letting it through. Every
+# post also carries --header X-AI-Persona: <agent>, and, when non-empty,
+# X-AI-Harness/X-AI-Model/X-AI-Network -- stamped here because the
+# postmaster is the one party that actually knows which agent/harness/
+# model/network produced the reply; a persona prompt cannot be trusted to
+# reproduce this reliably itself. A non-zero exit
 # code, and a wake that died without ever writing summary.json, are both harvested
 # the same as a zero exit code (their outbox, if any, is still posted)
 # but also flag the thread, since an empty outbox from a crashed wake is
@@ -344,6 +361,11 @@
 #                                   delivery -- live delivery only reaches
 #                                   a claude wake, every other harness
 #                                   falls back to a follow-up spawn),
+#                                   MODEL, NETWORK (the seat's resolved
+#                                   model and network mode, recorded at
+#                                   spawn time purely for `status` and
+#                                   operator inspection -- nothing here
+#                                   reads either back),
 #                                   BRANCH, RESUMED (the session id this
 #                                   wake was launched with, empty when none
 #                                   was -- what `status` prints in its
@@ -370,10 +392,11 @@
 #                                   writes a deliberately minimal record
 #                                   instead: AGENT, THREAD, TRIGGER,
 #                                   KIND=exec, VIA -- no RUN_DIR, HARNESS,
-#                                   RESUMED, BRANCH, INBOX, or PENDING_MSGS,
-#                                   since none of those apply to a script
-#                                   that never had a sandbox, a session, or
-#                                   a live-delivery-eligible inbox.
+#                                   MODEL, NETWORK, RESUMED, BRANCH, INBOX,
+#                                   or PENDING_MSGS, since none of those
+#                                   apply to a script that never had a
+#                                   sandbox, a session, or a
+#                                   live-delivery-eligible inbox.
 #                                   pm_exec_wake writes this record and this
 #                                   run's harvested/<run-id> marker (below)
 #                                   in the same call, before either SPAWNS
@@ -709,12 +732,20 @@ pm_trim() {
 # every address that is @-shaped (`^@` -- agents are always addressed
 # "@name", so an @-shaped input that fails to expand is a typo'd seat
 # name or a missing fleet file, never a legitimate external address) and
-# whose `fleet expand` failed. A caller that leaves the variable unset
-# gets none of this -- reset and record both no-op -- so existing call
-# sites are unaffected. This can't be a plain global/nameref because the
-# caller invokes this function inside a `<( ... )` process substitution,
-# which forks a subshell; a file survives that fork, an in-memory
-# variable would not.
+# whose `fleet expand` failed -- EXCEPT `@operator`, which `fleet expand`
+# also fails on (fleet.sh's FLEET_RESERVED_NAMES refuses it as an agent
+# name on purpose) but which rule 0 above documents as the one @-shaped
+# address that legitimately never resolves: every documented `mail
+# send`/`mail reply` sends operator mail as the literal address
+# `@operator`, so reply-all on an operator-initiated thread puts it in
+# the To: of every reply. Treating it as a typo would flag that thread on
+# every single reply, clobbering any real flag reason already there
+# (pm_flag overwrites, not appends). A caller that leaves the variable
+# unset gets none of this -- reset and record both no-op -- so existing
+# call sites are unaffected. This can't be a plain global/nameref because
+# the caller invokes this function inside a `<( ... )` process
+# substitution, which forks a subshell; a file survives that fork, an
+# in-memory variable would not.
 pm_expand_to() {
     local to_field="$1" a name
     local -a addrs=() result=()
@@ -725,7 +756,7 @@ pm_expand_to() {
         [[ -n "$a" ]] || continue
         local expanded
         if ! expanded="$("$FLEET" expand "$a" 2>/dev/null)"; then
-            if [[ -n "${PM_EXPAND_UNRESOLVED_FILE:-}" && "$a" == @* ]]; then
+            if [[ -n "${PM_EXPAND_UNRESOLVED_FILE:-}" && "$a" == @* && "$a" != "@operator" ]]; then
                 printf '%s\n' "$a" >> "$PM_EXPAND_UNRESOLVED_FILE"
             fi
             continue

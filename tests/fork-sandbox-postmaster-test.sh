@@ -432,7 +432,7 @@ rc="$(once_rc)"
 check "unresolvable To: deliver still exits 0" "0" "$rc"
 check "unresolvable To: known recipient still wakes" 1 "$(grep -c -- "^sbx-mail-$short-bob-" "$STUB_ARGV_LOG")"
 check "unresolvable To: message is still marked routed" 0 \
-    "$([[ -e "$FORK_SANDBOX_MAIL_ROOT/.postmaster/routed/$mid" ]]; echo $?)"
+    "$([[ -e "$FORK_SANDBOX_MAIL_ROOT/.postmaster/routed/$mid" ]] && echo 0 || echo 1)"
 flag_content="$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid" 2>/dev/null)"
 contains "unresolvable To: flag reason names the typo'd address" \
     "$flag_content" "unresolvable To: @nobody at $mid"
@@ -492,6 +492,51 @@ if [[ "$flag_mix" == *"@bob"* ]]; then
 else
     ok "mixed To: flag does not name the good address"
 fi
+
+# ============================================================
+printf '\n== @operator in To: is never treated as unresolvable (rule 0) ==\n'
+# ============================================================
+# Every documented `mail send`/`mail reply` sends operator mail as the
+# literal address @operator, and reply-all puts the parent's From in the
+# reply's own To: -- so a reply-all on an operator-started thread always
+# carries "@operator" in its To:. Rule 0 already says an address that
+# does not resolve, e.g. the operator's own, is skipped silently; @operator
+# must get that same silent skip, not the unresolvable-To: flag, since
+# pm_flag OVERWRITES (not appends) a thread's flag reason -- treating it
+# as a typo would clobber a real flag reason on every single reply.
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+mid_op="$(send_msg '@operator' '@team' 'operator thread' 'body from operator' 8)"
+tid_op="$(thread_of "$mid_op")"
+short_op="${tid_op:0:8}"
+once
+for a in alice bob carol; do
+    run_env="$(env_file_for_agent "$a")"
+    run_dir="$(sed -n 's/^RUN_DIR=//p' "$run_env")"
+    mkdir -p -- "$run_dir/outbox"
+    printf '0\n' > "$run_dir/exit-code"
+    printf '{}\n' > "$run_dir/summary.json"
+done
+once
+
+# Pre-flag the thread with a real reason, the way a genuine spawn failure
+# would -- to prove @operator's silent-skip does not clobber it.
+"$postmaster" flag "$tid_op" "spawn failed for alice: $mid_op" >/dev/null 2>&1
+
+mid_reply="$(reply_msg '@bob' "$mid_op" 'reply from bob')"
+contains "bob's reply-all addresses the operator" \
+    "$("$MAIL" show "$mid_reply" 2>/dev/null | sed -n 's/^To: //p')" "@operator"
+: > "$STUB_ARGV_LOG"
+once
+if grep -qF -- "route-dead thread=$short_op" "$work/once.out"; then
+    no "@operator in To: does not produce a route-dead event"
+else
+    ok "@operator in To: does not produce a route-dead event"
+fi
+check "@operator in To: does not clobber a real flag reason" \
+    "spawn failed for alice: $mid_op" \
+    "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid_op" 2>/dev/null)"
 
 # ============================================================
 printf '\n== seat resolution reaches launcher argv ==\n'

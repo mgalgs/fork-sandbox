@@ -182,6 +182,15 @@
 #                        FORK_SANDBOX_FIXTURE_DIR=/fixtures there. This is a
 #                        purpose-scoped staging path, not a general bind or
 #                        environment passthrough. Refused with --k8s.
+# --attach-dir <dir>:    bind an existing directory read-only at
+#                        /attachments inside a local run. The directory
+#                        must live under /var/tmp/claude-scratch/ (or the
+#                        /tmp/claude-scratch compat path) — same boundary
+#                        as --context-ro and --fixtures, never an
+#                        arbitrary host path. The postmaster uses this to
+#                        hand a wake its thread's own attachments
+#                        directory under the mail store. Refused with
+#                        --k8s.
 # --session-state <dir>: bind <dir> read-WRITE into the sandbox at the
 #                        harness's own session store — sandbox HOME's
 #                        ~/.claude/projects for claude, ~/.codex/sessions for
@@ -3451,12 +3460,23 @@ if [[ -n "$fixtures_dir" ]]; then
     fi
 fi
 
-# --attach-dir has no staging-root boundary of its own, unlike --fixtures:
-# its caller (the postmaster) always names a thread's own attachments
-# directory under the mail store, not an arbitrary host path a preset or
-# operator flag could redirect.
+# --attach-dir's caller (the postmaster) always names a thread's own
+# attachments directory under the mail store, which lives under
+# /var/tmp/claude-scratch/ (or the /tmp/claude-scratch compat path) by
+# convention -- but the flag itself is a general read-only bind, exactly
+# the shape --context-ro and --fixtures each refuse outside their own
+# staging root, so it gets the same boundary rather than trusting every
+# caller to only ever pass a mail-store path.
 if [[ -n "$attach_dir" ]]; then
     attach_dir="$("$FS_REALPATH" -m "$attach_dir")"
+    if [[ "$attach_dir" != /var/tmp/claude-scratch/* && "$attach_dir" != /tmp/claude-scratch/* ]]; then
+        echo "Error: --attach-dir must name a directory under" >&2
+        echo "/var/tmp/claude-scratch/ (or the /tmp/claude-scratch compat" >&2
+        echo "path) — got '$attach_dir'. An unattended agent can read the" >&2
+        echo "bind, and for most harnesses it has internet too, so which" >&2
+        echo "paths may be handed over is a security boundary." >&2
+        exit 1
+    fi
     if [[ ! -e "$attach_dir" ]]; then
         echo "Error: --attach-dir directory '$attach_dir' does not exist." >&2
         exit 1
