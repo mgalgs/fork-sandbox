@@ -1148,13 +1148,13 @@ k8s_find_pod() {
 render_review_loop_configmap_keys() {
     local pod_clone_dir="$1" pod_inbox_dir="$2" pod_skill_dir="$3" pod_verdict_file="$4"
     local branch="$5" base_sha="$6" review_skill_src="$7" review_loop_sh="$8"
-    local pod_outbox_dir="$9" outbox_max_bytes="${10}"
+    local pod_outbox_dir="$9" outbox_max_bytes="${10}" handoff_file="${11}"
     cat <<KEYS
   review-prompt.md: |
 $({ fs_emit_prompt_preamble "$pod_clone_dir" "$pod_inbox_dir" pi gated "$pod_outbox_dir" pod \
        "$outbox_max_bytes"
    fs_emit_review_prompt_body "$branch" "$base_sha" "$pod_skill_dir" \
-       "$pod_verdict_file" "$pod_inbox_dir"; } | indent_block)
+       "$pod_verdict_file" "$pod_inbox_dir" "$handoff_file"; } | indent_block)
   fix-prompt-header.md: |
 $({ fs_emit_prompt_preamble "$pod_clone_dir" "$pod_inbox_dir" pi gated "$pod_outbox_dir" pod \
        "$outbox_max_bytes"
@@ -3309,7 +3309,7 @@ cmd_submit() {
         review_loop_configmap_keys=$'\n'"$(render_review_loop_configmap_keys \
             "$pod_clone_dir" "$POD_INBOX_DIR" "$POD_SKILL_DIR" "$POD_VERDICT_FILE" \
             "$branch" "$base_sha" "$review_skill_src" "$review_loop_sh" "$POD_OUTBOX_DIR" \
-            "$outbox_max_bytes")"
+            "$outbox_max_bytes" "$handoff_file")"
         review_loop_env=$'\n'"$(render_review_loop_env "$review_loop_cap" "$base_sha")"
     fi
 

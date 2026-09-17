@@ -308,7 +308,7 @@ proj="$(new_project)"; tmpdirs+=("$proj")
 handoff_dir="$(mktemp -d /var/tmp/claude-scratch/fs-review-harness-handoff.XXXXXX)"
 tmpdirs+=("$handoff_dir")
 handoff="$handoff_dir/handoff.md"
-printf 'do the task\n' > "$handoff"
+printf 'do the task RH-BRIEF-SENTINEL-6b5e\n' > "$handoff"
 
 before="$(find /var/tmp/claude-scratch/forks -maxdepth 1 -name 'claude-fork-sandbox.*' 2>/dev/null | wc -l)"
 out="$(PATH="$cred_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$cred_cfg" \
@@ -502,6 +502,14 @@ if [[ "$findings_rc" == 0 && -n "$findings_rd" ]]; then
         "$(jq -r '.ended' "$findings_rd/review-loop.json")"
     check "FINDINGS review-only counts two cited paragraphs" "2" \
         "$(jq -r '.iterations[0].findings' "$findings_rd/review-loop.json")"
+    # The review-only leg runs through the review loop, so its prompt is the
+    # review prompt: the handoff it judges against must be embedded in it
+    # (and exactly once -- the implement prompt is never a second copy).
+    contains "the review-only prompt embeds the run's handoff" \
+        "RH-BRIEF-SENTINEL-6b5e" \
+        "$(cat "$findings_rd/review-prompt-1.md" 2>/dev/null)"
+    check "the review-only prompt embeds the handoff exactly once" \
+        "1" "$(grep -cF -- 'RH-BRIEF-SENTINEL-6b5e' "$findings_rd/review-prompt-1.md" 2>/dev/null)"
     if [[ ! -e "$findings_rd/fix-prompt-1.md" ]]; then
         ok "FINDINGS review-only writes no fix prompt"
     else

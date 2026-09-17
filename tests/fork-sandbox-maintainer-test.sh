@@ -338,7 +338,7 @@ proj="$(new_project)"; tmpdirs+=("$proj")
 handoff_dir="$(mktemp -d /var/tmp/claude-scratch/fs-maintainer-handoff.XXXXXX)"
 tmpdirs+=("$handoff_dir")
 handoff="$handoff_dir/handoff.md"
-printf 'do the task\n' > "$handoff"
+printf 'do the task MNT-BRIEF-SENTINEL-9d2c\n' > "$handoff"
 
 run_real() {
     local out rc rd
@@ -568,6 +568,8 @@ if (( rc2 == 0 )) && [[ -n "$rd2" ]]; then
     done
     contains "the maintainer prompt takes the maintainer framing" \
         "the way a maintainer would" "$(cat "$rd2/maintainer-prompt.md")"
+    contains "the maintainer prompt embeds the run's handoff" \
+        "MNT-BRIEF-SENTINEL-9d2c" "$(cat "$rd2/maintainer-prompt.md")"
     contains "the maintainer prompt names the verdict path" \
         ".git/maintainer-verdict.md" "$(cat "$rd2/maintainer-prompt.md")"
     # This run has no --review-loop, so the prompt must NOT claim an inner

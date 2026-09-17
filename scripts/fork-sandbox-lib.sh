@@ -1549,6 +1549,94 @@ EOF
     esac
 }
 
+# Appended to a review, maintainer or fix prompt: the caller's original
+# handoff, verbatim, under a fixed heading. The whole file is carried, not
+# an extracted "out of scope" slice: in a real handoff the fence on work is
+# distributed through the document -- scope sections, trap notes, "decided,
+# do not revisit" lines, and commit conventions no extractor would classify
+# as scope at all -- so a slice structurally under-delivers, and a missed
+# parse fails silently. The hazards are handled in the framing the callers
+# emit before this, not in a filter.
+#
+# $1  handoff_file  the caller's ORIGINAL handoff path, not a rendered copy
+#                   of it: the copy has the implement leg's preamble
+#                   prepended, which is not part of the spec. Required and
+#                   non-empty; the callers have already validated the path
+#                   at launch, so any failure here is a bug that must be
+#                   visible at prompt-build time (before any model runs),
+#                   not a silently missing section.
+fs_append_handoff_brief() {
+    local handoff_file="$1"
+    if [[ -z "$handoff_file" ]]; then
+        printf 'Error: fs_append_handoff_brief: the handoff path is empty. ' >&2
+        printf 'A review, maintainer or fix prompt must embed the handoff the' >&2
+        printf ' branch was built against, and there is none to name.\n' >&2
+        return 1
+    fi
+    if [[ ! -f "$handoff_file" || ! -r "$handoff_file" ]]; then
+        printf 'Error: handoff file %q is missing or unreadable at' "$handoff_file" >&2
+        printf ' prompt-build time. The branch spec cannot be embedded into' >&2
+        printf ' the prompt, so the prompt is not built rather than built' >&2
+        printf ' without it.\n' >&2
+        return 1
+    fi
+    if [[ ! -s "$handoff_file" ]]; then
+        printf 'Error: handoff file %q is empty at prompt-build time. An empty' "$handoff_file" >&2
+        printf ' spec is not a spec; the prompt is not built rather than built' >&2
+        printf ' without its section.\n' >&2
+        return 1
+    fi
+    printf '\n## The handoff this branch was built against\n\n'
+    cat -- "$handoff_file"
+}
+
+# The review and maintainer legs' shared section: the handoff is the spec
+# the branch was built against, and the three rules the leg holds it to.
+# The rules sit immediately before the handoff they govern, which
+# fs_append_handoff_brief appends after them. Shared for the same reason as
+# the bodies that call it -- one emitter, two callers, so the two wordings
+# can never drift. Rule 3 is load-bearing: without it the section swaps one
+# failure for a worse one, a reviewer deferring to the handoff and stopping
+# flagging decided designs that are themselves wrong.
+#
+# $1  handoff_file  see fs_append_handoff_brief.
+fs_emit_handoff_spec_section() {
+    local handoff_file="$1"
+    cat <<'EOF'
+
+---
+
+## The handoff is the spec — read it, and judge it
+
+The brief the implementing session was given is appended below, in full. It
+is the spec this branch was built against, and nothing else in this sandbox
+tells you what was asked for.
+
+Read it before you read the diff, and hold it to three rules.
+
+1. **Work the handoff deliberately excludes is not a finding.** Where the
+   handoff fences something out of scope, a branch that leaves it undone is
+   correct, not deficient. Do not report it. The code-review skill compares
+   the diff against the conventions of this repository, where a deliberate
+   omission and an oversight look identical — the handoff is the only thing
+   here that tells them apart.
+
+2. **Work the handoff asked for that the branch does not contain IS a
+   finding.** Report it the way you would report a bug, quoting the line of
+   the handoff that asked for it. This is the rule from "An unfollowed
+   addendum is a finding" above, applied to the original brief.
+
+3. **A decision being written down does not make it right.** The handoff
+   can be wrong: a plan that cannot work, a constraint that defeats its own
+   goal, an approach that breaks something it did not consider. If you
+   believe it is, say so and say why — that IS a finding, and it is the
+   most valuable one you can report. Rules 1 and 2 ask whether the branch
+   matches the spec; this one asks whether the spec is sound. Never
+   withhold it because the handoff sounds decided.
+EOF
+    fs_append_handoff_brief "$handoff_file"
+}
+
 # The review leg's task text, for fork-sandbox.sh's --review-loop: read the
 # branch under the given commit range, run the code-review-portable skill
 # against it, and write a verdict to a fixed path in the fixed
@@ -1558,6 +1646,11 @@ EOF
 # for the same reason: fork-sandbox-k8s.sh's own review loop needs this exact
 # text next, and the one thing it must not do is grow a second copy.
 #
+# The body ends with the handoff section (fs_emit_handoff_spec_section):
+# without it the reviewer can never tell a deliberate omission from an
+# oversight, because the only document that says what was asked for is the
+# brief the implementing session got.
+#
 # $1  branch              the branch under review.
 # $2  base_sha            the commit the branch is compared against; the
 #                         range reviewed is $base_sha...HEAD.
@@ -1566,9 +1659,12 @@ EOF
 # $4  review_verdict_file absolute path the verdict must be written to.
 # $5  inbox_dir           absolute path to the operator inbox, so an
 #                         addendum-sourced finding can cite it.
+# $6  handoff_file        the caller's original handoff, embedded at the end
+#                         of the body; see fs_append_handoff_brief.
 fs_emit_review_prompt_body() {
     local branch="$1" base_sha="$2" review_skill_dir="$3"
     local review_verdict_file="$4" inbox_dir="$5"
+    local handoff_file="$6"
     cat <<EOF
 
 ---
@@ -1659,6 +1755,7 @@ author's message. The orchestrator reads this report instead of the author's
 own account. Keep the \`Checked:\` paragraph where it is, in the verdict body,
 before this heading.
 EOF
+    fs_emit_handoff_spec_section "$handoff_file"
 }
 
 # inner_review is "yes" when a --review-loop ran before this one and "no"
@@ -1672,10 +1769,19 @@ EOF
 # embeds the earlier legs' addenda — the run dir is never bound into the
 # sandbox, so the static prompt alone could not promise the leg a file it
 # can read.
+#
+# As with the review body, this one ends with the same handoff section
+# (fs_emit_handoff_spec_section): the maintainer decides whether the branch
+# is ready to land, and a branch that was not built for what the handoff
+# asked for is not ready.
+#
+# $6  handoff_file  the caller's original handoff, embedded at the end of
+#                   the body; see fs_append_handoff_brief.
 fs_emit_maintainer_prompt_body() {
     local branch="$1" base_sha="$2"
     local maintainer_verdict_file="$3" inbox_dir="$4"
     local inner_review="$5"
+    local handoff_file="$6"
     local mnt_role_para
     if [[ "$inner_review" == "yes" ]]; then
         mnt_role_para="Another session worked in this same clone and committed to the branch
@@ -1786,6 +1892,7 @@ author's message. The orchestrator reads this report instead of the
 author's own account. Keep the \`Checked:\` paragraph where it is, in the
 verdict body, before this heading.
 EOF
+    fs_emit_handoff_spec_section "$handoff_file"
 }
 
 # The fix leg's task text, for fork-sandbox.sh's --review-loop and the

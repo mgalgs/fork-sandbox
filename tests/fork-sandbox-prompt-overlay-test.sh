@@ -804,6 +804,40 @@ heading and write this account from the branch and the diff, never from the
 author's message. The orchestrator reads this report instead of the author's
 own account. Keep the \`Checked:\` paragraph where it is, in the verdict body,
 before this heading.
+
+---
+
+## The handoff is the spec — read it, and judge it
+
+The brief the implementing session was given is appended below, in full. It
+is the spec this branch was built against, and nothing else in this sandbox
+tells you what was asked for.
+
+Read it before you read the diff, and hold it to three rules.
+
+1. **Work the handoff deliberately excludes is not a finding.** Where the
+   handoff fences something out of scope, a branch that leaves it undone is
+   correct, not deficient. Do not report it. The code-review skill compares
+   the diff against the conventions of this repository, where a deliberate
+   omission and an oversight look identical — the handoff is the only thing
+   here that tells them apart.
+
+2. **Work the handoff asked for that the branch does not contain IS a
+   finding.** Report it the way you would report a bug, quoting the line of
+   the handoff that asked for it. This is the rule from "An unfollowed
+   addendum is a finding" above, applied to the original brief.
+
+3. **A decision being written down does not make it right.** The handoff
+   can be wrong: a plan that cannot work, a constraint that defeats its own
+   goal, an approach that breaks something it did not consider. If you
+   believe it is, say so and say why — that IS a finding, and it is the
+   most valuable one you can report. Rules 1 and 2 ask whether the branch
+   matches the spec; this one asks whether the spec is sound. Never
+   withhold it because the handoff sounds decided.
+
+## The handoff this branch was built against
+
+do the task
 EXPECTED
 )"
     rendered_review_prompt="$(cat "$rd4/review-prompt.md" 2>/dev/null)"
@@ -918,6 +952,102 @@ EXPECTED
 else
     no "review prompt renders byte-for-byte" "run_real failed"
     no "fix prompt header renders byte-for-byte" "run_real failed"
+fi
+
+printf '\n== handoff as spec: the review and maintainer prompts embed the brief ==\n'
+
+# The review and maintainer prompts end with the handoff the branch was
+# built against. The exact-text check above uses the plain fixture handoff,
+# so a wrong wiring could pass it silently; this case uses a handoff with
+# sentinel lines and checks presence, position (the handoff is the LAST
+# thing in the static prompt, not just somewhere in it), and that the
+# section stays out of the implement prompt. The "one # Your working
+# directory" check is the guard against passing $handoff_copy (the rendered
+# copy, implement preamble prepended) instead of $handoff_file.
+handoff_spec="$handoff_dir/handoff-spec.md"
+cat > "$handoff_spec" <<'EOF'
+SENTINEL-BRIEF-REVIEW-3f8a: implement the sentinel task.
+SENTINEL-BRIEF-FIX-7b2c: commit convention line for the fix leg.
+EOF
+config5="$(new_empty_config)"; tmpdirs+=("$config5")
+rd5="$(run_real "$proj" "$config5" "$handoff_spec" \
+    --review-loop 1 --maintainer-loop 1 --maintainer-model sonnet)"
+[[ -n "$rd5" ]] && tmpdirs+=("$rd5")
+if [[ -n "$rd5" ]]; then
+    spec_review="$(cat "$rd5/review-prompt.md" 2>/dev/null)"
+    spec_mnt="$(cat "$rd5/maintainer-prompt.md" 2>/dev/null)"
+    spec_impl="$(cat "$rd5/handoff.md" 2>/dev/null)"
+    spec_brief_last="SENTINEL-BRIEF-FIX-7b2c: commit convention line for the fix leg."
+    contains "the review prompt contains the handoff's text" \
+        "SENTINEL-BRIEF-REVIEW-3f8a" "$spec_review"
+    contains "the maintainer prompt contains the handoff's text" \
+        "SENTINEL-BRIEF-REVIEW-3f8a" "$spec_mnt"
+    contains "the review prompt carries rule 3 (the handoff can be wrong)" \
+        "withhold it because the handoff sounds decided." "$spec_review"
+    check "the handoff ends the review prompt, it is not merely in it" \
+        "$spec_brief_last" "$(printf '%s\n' "$spec_review" | tail -n 1)"
+    check "the handoff ends the maintainer prompt, it is not merely in it" \
+        "$spec_brief_last" "$(printf '%s\n' "$spec_mnt" | tail -n 1)"
+    check "the review prompt embeds the original handoff, not the rendered copy" \
+        "1" "$(printf '%s\n' "$spec_review" | grep -cF -- '# Your working directory')"
+    case "$spec_impl" in
+        *"## The handoff is the spec"*)
+            no "the implement prompt does not carry the review-leg rules" ;;
+        *)
+            ok "the implement prompt does not carry the review-leg rules" ;;
+    esac
+else
+    no "run_real produced a run directory for the handoff-as-spec case" \
+        "run_real failed"
+fi
+
+# -- a handoff that cannot be read at render time must fail the prompt
+# build loudly, at launch, rather than render the prompt without its
+# section. These call the lib's emitters directly: fork-sandbox.sh has
+# already validated the handoff path before it reaches them, so what is
+# under test is the emitter's own guard, not the launcher's.
+# shellcheck source-path=SCRIPTDIR/../scripts
+# shellcheck disable=SC1091  # plain shellcheck cannot follow it; use -x
+source "$repo_dir/scripts/fork-sandbox-lib.sh"
+spec_err="$(mktemp)"; tmpdirs+=("$spec_err")
+spec_missing=/var/tmp/claude-scratch/fs-prompt-overlay-missing-$$.md
+if fs_emit_review_prompt_body br base /skill /verdict /inbox \
+    "$spec_missing" > /dev/null 2> "$spec_err"; then
+    no "a missing handoff file fails the prompt build" "exited 0"
+else
+    ok "a missing handoff file fails the prompt build"
+    contains "the failure names the handoff file" \
+        "$spec_missing" "$(cat "$spec_err")"
+fi
+if fs_emit_maintainer_prompt_body br base /verdict /inbox no "" \
+    > /dev/null 2> "$spec_err"; then
+    no "an empty handoff path fails the prompt build" "exited 0"
+else
+    ok "an empty handoff path fails the prompt build"
+fi
+spec_empty="$(mktemp /var/tmp/claude-scratch/fs-prompt-overlay-empty.XXXXXX)"
+tmpdirs+=("$spec_empty")
+if fs_emit_review_prompt_body br base /skill /verdict /inbox "$spec_empty" \
+    > /dev/null 2> "$spec_err"; then
+    no "an empty handoff file fails the prompt build" "exited 0"
+else
+    ok "an empty handoff file fails the prompt build"
+fi
+if [[ "$(id -u)" != "0" ]]; then
+    spec_noperm="$(mktemp /var/tmp/claude-scratch/fs-prompt-overlay-noperm.XXXXXX)"
+    tmpdirs+=("$spec_noperm")
+    printf 'x\n' > "$spec_noperm"
+    chmod 000 "$spec_noperm"
+    if fs_emit_review_prompt_body br base /skill /verdict /inbox "$spec_noperm" \
+        > /dev/null 2> "$spec_err"; then
+        no "an unreadable handoff file fails the prompt build" "exited 0"
+    else
+        ok "an unreadable handoff file fails the prompt build"
+        contains "the unreadable-file failure names the file" \
+            "$spec_noperm" "$(cat "$spec_err")"
+    fi
+else
+    printf '  SKIP  unreadable-handoff case (running as root; chmod 000 stays readable)\n'
 fi
 
 printf '\n== sandbox-run-log.py: prompt_overlay in the record ==\n'

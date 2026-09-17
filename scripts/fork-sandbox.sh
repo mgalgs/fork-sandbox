@@ -4982,7 +4982,7 @@ if (( review_loop_cap > 0 )); then
             "" "$outbox_max_bytes"
         fs_emit_prompt_overlay review
         fs_emit_review_prompt_body "$branch" "$base_sha" "$review_skill_dir" \
-            "$review_verdict_file" "$inbox_dir"
+            "$review_verdict_file" "$inbox_dir" "$handoff_file"
     } > "$review_prompt.part"
     mv -- "$review_prompt.part" "$review_prompt"
 fi
@@ -5046,7 +5046,8 @@ if (( maintainer_loop_cap > 0 )); then
             "$outbox_dir" "" "$outbox_max_bytes"
         fs_emit_prompt_overlay maintainer
         fs_emit_maintainer_prompt_body "$branch" "$base_sha" \
-            "$maintainer_verdict_file" "$inbox_dir" "$mnt_inner_review"
+            "$maintainer_verdict_file" "$inbox_dir" "$mnt_inner_review" \
+            "$handoff_file"
     } > "$maintainer_prompt.part"
     mv -- "$maintainer_prompt.part" "$maintainer_prompt"
 fi

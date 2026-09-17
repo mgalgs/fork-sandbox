@@ -3840,11 +3840,22 @@ pod_outbox_dir_expected=/work/outbox
 expected_rl_review_prompt="$({ fs_emit_prompt_preamble "$pod_clone_dir_expected" \
         "$pod_inbox_dir_expected" pi gated "$pod_outbox_dir_expected" pod
     fs_emit_review_prompt_body fs-k8s-test-rl-branch "$proj_base_sha" \
-        "$pod_skill_dir_expected" "$pod_verdict_file_expected" "$pod_inbox_dir_expected"
+        "$pod_skill_dir_expected" "$pod_verdict_file_expected" \
+        "$pod_inbox_dir_expected" "$handoff_file"
 })"
 actual_rl_review_prompt="$(extract_configmap_key review-prompt.md "$rl_submit_out")"
 check "review-prompt.md renders byte-for-byte (preamble + body, no overlay)" \
     "$expected_rl_review_prompt" "$actual_rl_review_prompt"
+# The review prompt must carry the operator's handoff -- the spec the
+# branch was built against -- the same as the local path. The byte-for-byte
+# check above proves it for the fixture text, but this names it: a wiring
+# that drops the handoff argument silently renders a spec-less review.
+case "$actual_rl_review_prompt" in
+    *"$(cat "$handoff_file")"*)
+        ok "review-prompt.md embeds the operator's handoff" ;;
+    *)
+        no "review-prompt.md embeds the operator's handoff" "not found" ;;
+esac
 
 expected_rl_fix_header="$({ fs_emit_prompt_preamble "$pod_clone_dir_expected" \
         "$pod_inbox_dir_expected" pi gated "$pod_outbox_dir_expected" pod
