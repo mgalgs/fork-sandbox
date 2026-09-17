@@ -616,6 +616,13 @@
 # nothing to enumerate. For the same reason nothing here ever runs git inside
 # the clone once the sandbox has touched it.
 #
+# The fetch can also rewrite what it brings back: if a returned commit's
+# author doesn't match your repo's own identity, this rewrites that commit
+# in YOUR repo, in place, to carry your identity instead of leaving the
+# mismatch for you to fix by hand. There is no flag to opt out. See
+# `author_email_unexpected` and `authorship_normalized` in summary.json, and
+# the NOTICE/WARNING summary.txt prints when either fires.
+#
 # What the session gives up:
 #   - No global ~/.claude. No global CLAUDE.md, skills, scripts, settings
 #     or hooks. A project .claude/ is committed, so it comes with the clone.
