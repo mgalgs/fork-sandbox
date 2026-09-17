@@ -198,6 +198,60 @@ check "the wrong commit is forced to the expected email" \
 check "the right commit keeps its own author name" \
     "Custom Name" "$(cd "$repo" && git log --reverse --format=%an "$base..main" | tail -1)"
 
+printf '\n== want_name is empty (origin has user.email but no user.name) ==\n'
+
+# fs_make_clone seeds user.name and user.email independently and tolerates
+# either being unset, so an email-only origin is a supported configuration
+# -- and exactly the one this feature exists to repair. commit-tree refuses
+# an empty ident name outright, so forcing want_name through unconditionally
+# would turn this into a guaranteed failure; the fix keeps the mismatched
+# commit's own author name and only forces its email.
+repo="$(new_repo)"
+base="$(cd "$repo" && git rev-parse HEAD)"
+commit_as "$repo" "$WRONG_NAME" "$WRONG_EMAIL" "half-configured origin" >/dev/null
+
+out="$(fs_normalize_authorship "$repo" main "$base" "" "$WANT_EMAIL")"
+rc=$?
+check "one commit rewritten" "1" "$out"
+check "the function returns 0 instead of failing on an empty ident name" "0" "$rc"
+check "the rewritten commit's email is the expected one" \
+    "$WANT_EMAIL" "$(cd "$repo" && git log -1 --format=%ae main)"
+check "the rewritten commit keeps its own original author name" \
+    "$WRONG_NAME" "$(cd "$repo" && git log -1 --format=%an main)"
+
+printf '\n== want_name empty AND the host config has no name at all ==\n'
+
+# Distinct from the case above: there GIT_CONFIG_GLOBAL (this file's own
+# stand-in for ~/.gitconfig) still names WANT_NAME, so leaving the
+# committer to resolve from config normally would have worked anyway, and
+# never exercised that path. Here the host config carries no name
+# anywhere, so commit-tree's own committer resolution would ALSO hit
+# "empty ident name" without the GIT_COMMITTER_NAME fallback -- this is
+# what proves the fallback covers the committer, not only the author.
+noname_global_dir="$(mktemp -d)"
+tmpdirs+=("$noname_global_dir")
+printf '[init]\n\tdefaultBranch = main\n[user]\n\temail = %s\n' "$WANT_EMAIL" \
+    > "$noname_global_dir/gitconfig"
+
+repo="$(new_repo)"
+base="$(cd "$repo" && git rev-parse HEAD)"
+commit_as "$repo" "$WRONG_NAME" "$WRONG_EMAIL" "no host identity at all" >/dev/null
+
+committer_err_file="$(mktemp)"
+tmpdirs+=("$committer_err_file")
+out="$(GIT_CONFIG_GLOBAL="$noname_global_dir/gitconfig" \
+    fs_normalize_authorship "$repo" main "$base" "" "$WANT_EMAIL" 2>"$committer_err_file")"
+rc=$?
+check "one commit rewritten" "1" "$out"
+check "the function returns 0 -- committer resolution no longer breaks it" "0" "$rc"
+check "no stderr is produced" "" "$(cat "$committer_err_file")"
+check "the rewritten commit's email is the expected one" \
+    "$WANT_EMAIL" "$(cd "$repo" && git log -1 --format=%ae main)"
+check "the rewritten commit keeps its own original author name" \
+    "$WRONG_NAME" "$(cd "$repo" && git log -1 --format=%an main)"
+check "the rewritten commit's committer name falls back to the author's" \
+    "$WRONG_NAME" "$(cd "$repo" && git log -1 --format=%cn main)"
+
 printf '\n== a range containing a merge commit ==\n'
 
 repo="$(new_repo)"
@@ -269,19 +323,28 @@ cat > "$shim_dir/git" <<SHIM
 #!/usr/bin/env bash
 if [[ "\$1" == "rev-list" ]]; then
     for a in "\$@"; do
-        [[ "\$a" == "--reverse" ]] && exit 1
+        [[ "\$a" == "--reverse" ]] && { echo "shim: rev-list --reverse killed" >&2; exit 1; }
     done
 fi
 exec "$real_git" "\$@"
 SHIM
 chmod +x "$shim_dir/git"
 
-out="$(PATH="$shim_dir:$PATH" fs_normalize_authorship "$repo" main "$base" "$WANT_NAME" "$WANT_EMAIL")"
+err_file="$(mktemp)"
+tmpdirs+=("$err_file")
+out="$(PATH="$shim_dir:$PATH" fs_normalize_authorship "$repo" main "$base" "$WANT_NAME" "$WANT_EMAIL" \
+    2>"$err_file")"
 rc=$?
 check "nothing is printed" "" "$out"
 check "the function returns 1 (rev-list failed)" "1" "$rc"
 check "the branch tip is unchanged -- no commits were dropped" \
     "$before" "$(cd "$repo" && git rev-parse main)"
+if grep -qF "shim: rev-list --reverse killed" "$err_file"; then
+    ok "the failing command's stderr reaches the caller, not /dev/null"
+else
+    no "the failing command's stderr reaches the caller, not /dev/null" \
+        "$(cat "$err_file")"
+fi
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 (( fail == 0 )) || exit 1

@@ -8298,6 +8298,7 @@ authorship_normalized=0
 authorship_normalized_from=""
 authorship_skip_nonlinear=0
 authorship_normalize_failed=0
+authorship_normalize_log="$run_dir/authorship-normalize.log"
 if (( fetched )) && [[ "$n_commits" != "0" ]]; then
     author_email_want="$( (cd "$origin_repo" && git config --get user.email) 2>/dev/null || true )"
     if [[ -n "$author_email_want" ]]; then
@@ -8307,8 +8308,15 @@ if (( fetched )) && [[ "$n_commits" != "0" ]]; then
             | grep -vxF -- "$author_email_want" | sort -u || true )"
         if [[ -n "$author_email_bad" ]]; then
             author_name_want="$( (cd "$origin_repo" && git config --get user.name) 2>/dev/null || true )"
+            # fs_normalize_authorship lets its plumbing calls write stderr
+            # normally (see its own comment for why), so capturing this
+            # call's stderr into a file under run_dir is what actually puts
+            # the git error somewhere the failure message below can point
+            # to -- sandbox.log never sees it, since this call is not part
+            # of the tee'd harness pipeline.
             if authorship_normalized_out="$(fs_normalize_authorship "$origin_repo" "$branch" \
-                "$return_base_sha" "$author_name_want" "$author_email_want")"; then
+                "$return_base_sha" "$author_name_want" "$author_email_want" \
+                2> "$authorship_normalize_log")"; then
                 authorship_normalize_rc=0
             else
                 authorship_normalize_rc=$?
@@ -8500,8 +8508,9 @@ loop_findings() {
             printf 'rewrite only knows how to walk a single line of history from it.\n'
         elif (( authorship_normalize_failed )); then
             printf 'Normalization was attempted and failed -- the branch is\n'
-            printf 'unchanged from what fetch brought in. Check the run log under\n'
-            printf '%s for the git error.\n' "$run_dir"
+            printf 'unchanged from what fetch brought in. See %s\n' \
+                "$authorship_normalize_log"
+            printf 'for the git error.\n'
         fi
     elif (( authorship_normalized > 0 )); then
         printf '\nNOTICE: authorship normalized -- %s commit(s) rewritten from\n' \
@@ -8514,11 +8523,18 @@ loop_findings() {
         printf 'This rewrite only touched %s in %s; every sha this\n' "$branch" "$origin_repo"
         printf 'run recorded before now (review-loop.json, maintainer-loop.json\n'
         printf 'head_before/head_after) still names the pre-rewrite commits, which\n'
-        printf 'are no longer reachable from the branch. The persistent clone at\n'
-        printf '%s still carries them too, under the regressed identity --\n' "$clone_dir"
-        printf 'if that workspace is reused for a later wake, its next branch will\n'
-        printf 'start from those commits and carry the bad authorship forward\n'
-        printf 'unflagged, since the check only ever looks at its own base..branch.\n'
+        printf 'are no longer reachable from the branch.\n'
+        # clone_lock_path is only ever set for a --clone-dir seat (see its
+        # own comment in the RUNNER above) -- a fresh clone under run_dir is
+        # a throwaway nothing else can reach and gets no later wake, so the
+        # reuse hazard below does not apply to it.
+        if [[ -n "${clone_lock_path:-}" ]]; then
+            printf 'The persistent clone at\n'
+            printf '%s still carries them too, under the regressed identity --\n' "$clone_dir"
+            printf 'if that workspace is reused for a later wake, its next branch will\n'
+            printf 'start from those commits and carry the bad authorship forward\n'
+            printf 'unflagged, since the check only ever looks at its own base..branch.\n'
+        fi
     fi
 } > "$run_dir/summary.txt" 2>&1
 

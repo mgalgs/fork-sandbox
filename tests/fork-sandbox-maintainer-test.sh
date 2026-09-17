@@ -1265,11 +1265,35 @@ if (( rc_ok == 0 )) && [[ -n "$rd_ok" ]]; then
         "[]" "$(jq -c '.author_email_unexpected' "$rd_ok/summary.json")"
     contains "the NOTICE warns that pre-rewrite loop-record shas are now stale" \
         "no longer reachable from the branch" "$(cat "$rd_ok/summary.txt")"
-    contains "the NOTICE warns the persistent clone still carries the bad identity" \
+    # No --clone-dir here, so the clone is a throwaway under run_dir that
+    # nothing can reuse for a later wake -- the persistent-clone reuse
+    # hazard does not apply and must not be printed.
+    lacks "a fresh-clone run's NOTICE carries no persistent-clone reuse hazard" \
         "still carries them too, under the regressed identity" \
         "$(cat "$rd_ok/summary.txt")"
 else
     no "a wrong-author run produced a run directory" "rc=$rc_ok: $out_ok"
+fi
+
+# The same wrong-author scenario, but with --clone-dir: this workspace IS a
+# seat that can be reused for a later wake, so here the NOTICE's warning
+# about the persistent clone still carrying the bad identity applies.
+authnorm_seat_dir="/var/tmp/claude-scratch/fs-authnorm-seat.$$"
+tmpdirs+=("$authnorm_seat_dir")
+out_seat="$(PATH="$authnorm_ok_stub:$real_stub:$PATH" \
+    FORK_SANDBOX_CONFIG_DIR="$real_cfg" FORK_SANDBOX_BACKEND=fake-image \
+    timeout 60 "$launcher" --foreground --harness claude \
+    --branch "sandbox-test-authnorm-seat-$$" --clone-dir "$authnorm_seat_dir" \
+    "$proj" "$handoff" 2>&1)"
+rc_seat=$?
+rd_seat="$(printf '%s\n' "$out_seat" | sed -n 's/^  run dir:  *//p' | head -1)"
+if (( rc_seat == 0 )) && [[ -n "$rd_seat" ]]; then
+    tmpdirs+=("$rd_seat")
+    contains "a --clone-dir run's NOTICE warns the persistent clone still carries the bad identity" \
+        "still carries them too, under the regressed identity" \
+        "$(cat "$rd_seat/summary.txt")"
+else
+    no "a --clone-dir wrong-author run produced a run directory" "rc=$rc_seat: $out_seat"
 fi
 
 # A wrong-author commit alongside a merge commit: fs_normalize_authorship
@@ -1322,11 +1346,13 @@ else
 fi
 
 # An origin whose identity is half-configured (user.email but no
-# user.name -- fs_make_clone's own seeding tolerates exactly this): the
-# rewrite's commit-tree calls die with "empty ident name" and
-# fs_normalize_authorship returns 1, not 2. This is the caller's rc==1 arm
-# (authorship_normalize_failed) added alongside the guard in
-# fs_normalize_authorship that refuses to move the ref on a failed walk.
+# user.name -- fs_make_clone's own seeding tolerates exactly this): forcing
+# an empty want_name onto a mismatched commit used to make every
+# commit-tree call die with "empty ident name", so fs_normalize_authorship
+# never succeeded against this configuration at all. It now keeps the
+# mismatched commit's own author name and forces only the email, so this
+# rewrite succeeds like any other (fs_normalize_authorship's own unit test
+# covers the fallback directly; this exercises it through the launcher).
 proj_no_name="$(mktemp -d "$HOME/src/fs-maintainer-test-noname.XXXXXX")"
 tmpdirs+=("$proj_no_name")
 (
@@ -1338,9 +1364,9 @@ tmpdirs+=("$proj_no_name")
         && git -c user.name=Tester commit -q -m init
 ) >/dev/null 2>&1
 
-authnorm_fail_stub="$(mktemp -d /var/tmp/claude-scratch/fs-authnorm-fail.XXXXXX)"
-tmpdirs+=("$authnorm_fail_stub")
-cat > "$authnorm_fail_stub/claude-sandboxed" <<'STUB'
+authnorm_noname_stub="$(mktemp -d /var/tmp/claude-scratch/fs-authnorm-noname.XXXXXX)"
+tmpdirs+=("$authnorm_noname_stub")
+cat > "$authnorm_noname_stub/claude-sandboxed" <<'STUB'
 #!/usr/bin/env bash
 set -uo pipefail
 prev="" clone_dir=""
@@ -1350,31 +1376,34 @@ for a in "$@"; do
 done
 cat >/dev/null
 git -c user.email=wrong@fork-sandbox.invalid -c user.name="Wrong Person" \
-    -C "$clone_dir" commit --allow-empty -q -m "authnorm fail test"
+    -C "$clone_dir" commit --allow-empty -q -m "authnorm noname test"
 printf '{"type":"result","subtype":"success","total_cost_usd":0.01,"usage":{"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}\n'
 exit 0
 STUB
-chmod +x "$authnorm_fail_stub/claude-sandboxed"
+chmod +x "$authnorm_noname_stub/claude-sandboxed"
 
-out_fail="$(PATH="$authnorm_fail_stub:$real_stub:$PATH" \
+out_noname="$(PATH="$authnorm_noname_stub:$real_stub:$PATH" \
     FORK_SANDBOX_CONFIG_DIR="$real_cfg" FORK_SANDBOX_BACKEND=fake-image \
     timeout 60 "$launcher" --foreground --harness claude \
-    --branch "sandbox-test-authnorm-fail-$$" \
+    --branch "sandbox-test-authnorm-noname-$$" \
     "$proj_no_name" "$handoff" 2>&1)"
-rc_fail=$?
-rd_fail="$(printf '%s\n' "$out_fail" | sed -n 's/^  run dir:  *//p' | head -1)"
-if (( rc_fail == 0 )) && [[ -n "$rd_fail" ]]; then
-    tmpdirs+=("$rd_fail")
-    contains "a failed rewrite keeps the plain WARNING" \
-        "WARNING: a returned commit" "$(cat "$rd_fail/summary.txt")"
-    contains "a failed rewrite's summary says normalization failed" \
-        "Normalization was attempted and failed" "$(cat "$rd_fail/summary.txt")"
-    check "the unrewritten commit still carries the wrong email" \
-        "wrong@fork-sandbox.invalid" \
-        "$(cd "$proj_no_name" && git log -1 --format=%ae "sandbox-test-authnorm-fail-$$")"
+rc_noname=$?
+rd_noname="$(printf '%s\n' "$out_noname" | sed -n 's/^  run dir:  *//p' | head -1)"
+if (( rc_noname == 0 )) && [[ -n "$rd_noname" ]]; then
+    tmpdirs+=("$rd_noname")
+    contains "a half-configured-identity run's summary carries the NOTICE, not the WARNING" \
+        "NOTICE: authorship normalized" "$(cat "$rd_noname/summary.txt")"
+    lacks "a half-configured-identity run's summary carries no WARNING" \
+        "WARNING: a returned commit" "$(cat "$rd_noname/summary.txt")"
+    check "the rewritten commit carries the origin's own email" \
+        "t@fork-sandbox.invalid" \
+        "$(cd "$proj_no_name" && git log -1 --format=%ae "sandbox-test-authnorm-noname-$$")"
+    check "the rewritten commit keeps its own original author name" \
+        "Wrong Person" \
+        "$(cd "$proj_no_name" && git log -1 --format=%an "sandbox-test-authnorm-noname-$$")"
 else
     no "a half-configured-identity run produced a run directory" \
-        "rc=$rc_fail: $out_fail"
+        "rc=$rc_noname: $out_noname"
 fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"

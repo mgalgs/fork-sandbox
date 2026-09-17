@@ -2155,6 +2155,14 @@ fs_emit_coding_exit_note() {
 # correct, just wasteful; it is written this way so a clean run costs one
 # git-log more, not a rewrite.
 #
+# Every plumbing call on the rewrite path (merges/commits/tree/name/email/
+# date lookups, cat-file, commit-tree, update-ref) is left to write its
+# stderr wherever the caller's stderr goes, deliberately: a `return 1` here
+# means one of those calls failed, and the caller's only way to learn why
+# is whatever that command printed. Only the two calls whose failure is an
+# expected, silent "no" -- the initial mismatch scan and the ancestor check
+# below -- are run with stderr discarded.
+#
 # The rewrite is linear-only: every commit in base..branch is walked oldest
 # first with rev-list --reverse and re-created with commit-tree, chained
 # onto the REWRITTEN parent -- so even a commit whose author was already
@@ -2179,14 +2187,26 @@ fs_emit_coding_exit_note() {
 # block, say) with a single space, so a genuinely empty line can never
 # appear inside a header.
 #
-# The committer is deliberately left unset here (no GIT_COMMITTER_*), so it
-# resolves from config exactly the way an interactive rebase would --
-# this runs against $repo, the operator's own host-side checkout, never the
-# clone, so that resolves to the operator's own identity, applied as if
-# they had rebased the branch by hand. commit-tree ignores commit.gpgsign
-# entirely (it only signs when -S is passed, which this never does), so a
-# host with commit signing configured on still gets a plain, unsigned,
-# successful rewrite.
+# The committer email is deliberately left unset here (no
+# GIT_COMMITTER_EMAIL), so it resolves from config exactly the way an
+# interactive rebase would -- this runs against $repo, the operator's own
+# host-side checkout, never the clone, so that resolves to the operator's
+# own identity, applied as if they had rebased the branch by hand. The
+# committer NAME is pinned explicitly, though: want_name comes from a
+# `git config --get user.name` in this same repo (fork-sandbox.sh reads it
+# right before calling in), which is exactly what git would resolve the
+# committer name to anyway when it is non-empty, so pinning it changes
+# nothing observable on a normally-configured host. It matters on a host
+# whose git config carries no name at all: committer resolution reads that
+# same empty value, and unlike the author (which this function can always
+# fall back to the commit's own existing name for) commit-tree has no
+# comparable fallback of its own, so a plain, unset GIT_COMMITTER_NAME
+# would turn every rewrite on such a host into the exact "empty ident
+# name" fatal this function exists to get past. Falling back to this
+# commit's own (already non-empty) author name keeps that host's rewrite
+# working instead. commit-tree ignores commit.gpgsign entirely (it only
+# signs when -S is passed, which this never does), so a host with commit
+# signing configured on still gets a plain, unsigned, successful rewrite.
 #
 # $1  repo        the host-side repo the branch lives in (origin_repo,
 #                  never the clone -- this must never run against a
@@ -2194,7 +2214,15 @@ fs_emit_coding_exit_note() {
 # $2  branch      the branch to rewrite in place, via update-ref.
 # $3  base        the commit before the fetched range; base itself is
 #                  never touched, only base..branch.
-# $4  want_name   author name forced onto a mismatched commit.
+# $4  want_name   author name forced onto a mismatched commit. May be
+#                  empty -- an origin can have user.email configured with
+#                  no user.name (fs_make_clone seeds the two independently
+#                  and tolerates either being unset) -- in which case a
+#                  mismatched commit keeps its own author name and only
+#                  its email is forced; commit-tree refuses an empty ident
+#                  name outright, so forcing it through unconditionally
+#                  would turn this into a guaranteed failure for exactly
+#                  the configuration this feature exists to repair.
 # $5  want_email  author email forced onto a mismatched commit, and the
 #                  value every commit's author email is compared against.
 fs_normalize_authorship() {
@@ -2205,7 +2233,7 @@ fs_normalize_authorship() {
         | grep -vxF -- "$want_email" )" || true
     [[ -n "$mismatched" ]] || { printf '0'; return 0; }
 
-    merges="$( (cd "$repo" && git rev-list --min-parents=2 --count "$base..$branch") 2>/dev/null )" \
+    merges="$( (cd "$repo" && git rev-list --min-parents=2 --count "$base..$branch") )" \
         || return 1
     [[ "$merges" == "0" ]] || return 2
     (cd "$repo" && git merge-base --is-ancestor "$base" "$branch") 2>/dev/null || return 2
@@ -2217,7 +2245,7 @@ fs_normalize_authorship() {
     # success. Requiring this to succeed and be non-empty (mismatched above
     # already proved the range holds at least one commit) means a rev-list
     # failure returns 1 here instead of reaching update-ref at all.
-    commits="$( (cd "$repo" && git rev-list --reverse "$base..$branch") 2>/dev/null )" || return 1
+    commits="$( (cd "$repo" && git rev-list --reverse "$base..$branch") )" || return 1
     [[ -n "$commits" ]] || return 1
 
     msgfile="$(mktemp)" || return 1
@@ -2225,24 +2253,25 @@ fs_normalize_authorship() {
     parent="$base"
     while IFS= read -r sha; do
         [[ -n "$sha" ]] || continue
-        tree="$( (cd "$repo" && git rev-parse "$sha^{tree}") 2>/dev/null )" \
+        tree="$( (cd "$repo" && git rev-parse "$sha^{tree}") )" \
             || { rm -f "$msgfile"; return 1; }
-        aname="$( (cd "$repo" && git log -1 --format='%an' "$sha") 2>/dev/null )" \
+        aname="$( (cd "$repo" && git log -1 --format='%an' "$sha") )" \
             || { rm -f "$msgfile"; return 1; }
-        aemail="$( (cd "$repo" && git log -1 --format='%ae' "$sha") 2>/dev/null )" \
+        aemail="$( (cd "$repo" && git log -1 --format='%ae' "$sha") )" \
             || { rm -f "$msgfile"; return 1; }
-        adate="$( (cd "$repo" && git log -1 --format='%ad' --date=raw "$sha") 2>/dev/null )" \
+        adate="$( (cd "$repo" && git log -1 --format='%ad' --date=raw "$sha") )" \
             || { rm -f "$msgfile"; return 1; }
         if [[ "$aemail" != "$want_email" ]]; then
-            aname="$want_name"
+            [[ -n "$want_name" ]] && aname="$want_name"
             aemail="$want_email"
             n=$(( n + 1 ))
         fi
-        (cd "$repo" && git cat-file commit "$sha") 2>/dev/null \
+        (cd "$repo" && git cat-file commit "$sha") \
             | awk 'body{print} !body && $0==""{body=1}' > "$msgfile" \
             || { rm -f "$msgfile"; return 1; }
         parent="$(cd "$repo" \
             && GIT_AUTHOR_NAME="$aname" GIT_AUTHOR_EMAIL="$aemail" GIT_AUTHOR_DATE="$adate" \
+               GIT_COMMITTER_NAME="${want_name:-$aname}" \
                git commit-tree "$tree" -p "$parent" -F "$msgfile")" \
             || { rm -f "$msgfile"; return 1; }
     done <<< "$commits"
