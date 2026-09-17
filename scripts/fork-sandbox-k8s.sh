@@ -1145,24 +1145,43 @@ k8s_find_pod() {
 # fork-sandbox.sh's own local --review-loop uses -- this function renders
 # no prompt prose of its own, only concatenates what those functions emit.
 # Indented 2 spaces to sit beside handoff.md as ConfigMap data keys.
+#
+# Each key's content is captured into a variable BEFORE the heredoc, and a
+# failed capture returns 1. A command substitution inside a heredoc body
+# hands its exit status to cat, not to the caller, so an inline $(...) would
+# swallow an emitter failure -- e.g. fs_append_handoff_brief refusing a
+# handoff that is missing, unreadable or empty at prompt-build time -- and
+# render the prompt prose ("the brief ... is appended below") with the brief
+# silently absent, a spec-less review and fix leg the commit that added the
+# handoff section exists to prevent. cmd_submit calls this inside its own
+# $(...), so returning 1 here makes its
+# review_loop_configmap_keys=... assignment fail under set -e, the same
+# guarantee the local path gets from its { ...; } > file block.
 render_review_loop_configmap_keys() {
     local pod_clone_dir="$1" pod_inbox_dir="$2" pod_skill_dir="$3" pod_verdict_file="$4"
     local branch="$5" base_sha="$6" review_skill_src="$7" review_loop_sh="$8"
     local pod_outbox_dir="$9" outbox_max_bytes="${10}" handoff_file="${11}"
+    local review_prompt fix_prompt_header review_skill review_loop
+    review_prompt="$({ fs_emit_prompt_preamble "$pod_clone_dir" "$pod_inbox_dir" pi gated "$pod_outbox_dir" pod \
+        "$outbox_max_bytes"
+      fs_emit_review_prompt_body "$branch" "$base_sha" "$pod_skill_dir" \
+          "$pod_verdict_file" "$pod_inbox_dir" "$handoff_file"; } | indent_block)" \
+        || return 1
+    fix_prompt_header="$({ fs_emit_prompt_preamble "$pod_clone_dir" "$pod_inbox_dir" pi gated "$pod_outbox_dir" pod \
+        "$outbox_max_bytes"
+      fs_emit_fix_prompt_body "$branch" "$base_sha" "$handoff_file"; } | indent_block)" \
+        || return 1
+    review_skill="$(indent_block < "$review_skill_src")" || return 1
+    review_loop="$(indent_block < "$review_loop_sh")" || return 1
     cat <<KEYS
   review-prompt.md: |
-$({ fs_emit_prompt_preamble "$pod_clone_dir" "$pod_inbox_dir" pi gated "$pod_outbox_dir" pod \
-       "$outbox_max_bytes"
-   fs_emit_review_prompt_body "$branch" "$base_sha" "$pod_skill_dir" \
-       "$pod_verdict_file" "$pod_inbox_dir" "$handoff_file"; } | indent_block)
+$review_prompt
   fix-prompt-header.md: |
-$({ fs_emit_prompt_preamble "$pod_clone_dir" "$pod_inbox_dir" pi gated "$pod_outbox_dir" pod \
-       "$outbox_max_bytes"
-   fs_emit_fix_prompt_body "$branch" "$base_sha" "$handoff_file"; } | indent_block)
+$fix_prompt_header
   code-review-portable-skill.md: |
-$(indent_block < "$review_skill_src")
+$review_skill
   review-loop.sh: |
-$(indent_block < "$review_loop_sh")
+$review_loop
 KEYS
 }
 

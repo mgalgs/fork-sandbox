@@ -3876,6 +3876,66 @@ esac
 check "fix-prompt-header.md ends with the findings paragraph, after the handoff" \
     "one out." "$(printf '%s\n' "$actual_rl_fix_header" | tail -n 1)"
 
+# Item: render_review_loop_configmap_keys fails rather than swallows an
+# emitter failure. A $(...) inside a heredoc body hands its exit status to
+# cat, not to the caller, so the function must capture each key's content
+# into a variable first and return 1 on failure -- without that, a handoff
+# deleted or made unreadable in the window between cmd_submit's pre-render
+# validation and the render itself would render the prompt prose ("the
+# brief ... is appended below") with the brief silently absent, a spec-less
+# review and fix leg, and the submit would go ahead. Extract both functions
+# from the k8s script's own source and drive the render directly, the same
+# function-extraction this suite uses for the entrypoint's run_pi_coding_leg.
+rlrender_fn="$(sed -n -e '/^indent_block() {/,/^}/p' \
+    -e '/^render_review_loop_configmap_keys() {/,/^}/p' "$k8s_sh")"
+rlrender_fn_file="$(newdir)/rl-render.sh"; tmpdirs+=("$(dirname "$rlrender_fn_file")")
+if [[ -n "$rlrender_fn" ]]; then
+    printf '%s\n' 'set -euo pipefail' \
+        "source \"$lib_sh\"" \
+        "$rlrender_fn" \
+        'render_review_loop_configmap_keys "$@"' > "$rlrender_fn_file"
+    ok "indent_block and render_review_loop_configmap_keys are standalone functions in the k8s script"
+else
+    no "indent_block and render_review_loop_configmap_keys are standalone functions in the k8s script" \
+        "function not found in $k8s_sh"
+fi
+rlrender_missing_handoff="$(newdir)/gone-handoff.md"
+if out="$(bash "$rlrender_fn_file" \
+        /work/clone /work/inbox /work/skills/code-review-portable \
+        /work/clone/.git/review-verdict.md fs-k8s-test-rl-branch "$proj_base_sha" \
+        "$repo_dir/skills/code-review-portable/SKILL.md" "$review_loop_sh" \
+        /work/outbox "" "$rlrender_missing_handoff" \
+        2>/tmp/fs-k8s-test-rlrender.err)"; then
+    no "render_review_loop_configmap_keys fails on a missing handoff" \
+        "exited 0; output starts: $(head -n 3 <<< "$out")"
+else
+    ok "render_review_loop_configmap_keys fails on a missing handoff"
+fi
+if grep -q "missing or unreadable at prompt-build time" /tmp/fs-k8s-test-rlrender.err; then
+    ok "the missing-handoff failure names the prompt-build-time guarantee"
+else
+    no "the missing-handoff failure names the prompt-build-time guarantee" \
+        "stderr: $(cat /tmp/fs-k8s-test-rlrender.err)"
+fi
+if out="$(bash "$rlrender_fn_file" \
+        /work/clone /work/inbox /work/skills/code-review-portable \
+        /work/clone/.git/review-verdict.md fs-k8s-test-rl-branch "$proj_base_sha" \
+        "$repo_dir/skills/code-review-portable/SKILL.md" "$review_loop_sh" \
+        /work/outbox "" "$handoff_file" 2>/dev/null)"; then
+    ok "render_review_loop_configmap_keys exits 0 with a readable handoff"
+else
+    no "render_review_loop_configmap_keys exits 0 with a readable handoff" \
+        "$(cat /tmp/fs-k8s-test-rlrender.err)"
+fi
+if [[ "$out" == *"  review-prompt.md: |"* && "$out" == *"  fix-prompt-header.md: |"* \
+    && "$out" == *"Do the thing."* ]]; then
+    ok "the successful render carries both prompt keys and the embedded handoff"
+else
+    no "the successful render carries both prompt keys and the embedded handoff" \
+        "output starts: $(head -n 3 <<< "$out")"
+fi
+rm -f /tmp/fs-k8s-test-rlrender.err
+
 # Item: the rendered review prompt names the POD's paths, never a host path
 # -- proof this run's clone-under-/var/tmp and the operator's real project
 # path never leak into a prompt a model on the internet is about to read.
