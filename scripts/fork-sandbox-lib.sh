@@ -2142,3 +2142,98 @@ fs_emit_coding_exit_note() {
     printf 'the branch and flag anything that looks unfinished as a finding,\n'
     printf 'the same as any other defect.\n'
 }
+
+# Rewrites base..branch host-side, in $repo, so every commit's author
+# identity matches want_name/want_email -- called by fork-sandbox.sh's own
+# fetch-time identity check (grep "unexpected address") only after THAT
+# check has already found a commit authored under some other address. This
+# function re-checks the same thing itself, cheaply, before touching
+# anything: it prints "0" and returns 0 with NO git writes at all -- no
+# update-ref, no reflog entry -- when it finds no mismatch, which is what
+# keeps a clean run's branch byte-identical to what fetch brought in. A
+# caller that ran this unconditionally on every fetch would still be
+# correct, just wasteful; it is written this way so a clean run costs one
+# git-log more, not a rewrite.
+#
+# The rewrite is linear-only: every commit in base..branch is walked oldest
+# first with rev-list --reverse and re-created with commit-tree, chained
+# onto the REWRITTEN parent -- so even a commit whose author was already
+# correct still gets a new SHA, because its parent's SHA changed underneath
+# it. Only a commit whose author email does not already equal want_email
+# has its author name and email overwritten; a correctly-authored commit
+# keeps its own author name and email verbatim (just not its own SHA). A
+# merge commit in range has no single "rewritten parent" to chain onto, so
+# rather than guess which side wins, this returns 2 and does nothing --
+# the caller keeps today's plain warning for that case instead.
+#
+# The message body is read with cat-file + awk rather than
+# `git log --format=%B`, which appends a trailing newline the raw commit
+# object does not have. Byte-fidelity matters here (a Co-Authored-By
+# trailer has to survive exactly), and the first WHOLLY empty line in a
+# commit object's raw bytes is always the true header/body separator: git
+# prefixes every continuation line of a multi-line header value (a gpgsig
+# block, say) with a single space, so a genuinely empty line can never
+# appear inside a header.
+#
+# The committer is deliberately left unset here (no GIT_COMMITTER_*), so it
+# resolves from config exactly the way an interactive rebase would --
+# this runs against $repo, the operator's own host-side checkout, never the
+# clone, so that resolves to the operator's own identity, applied as if
+# they had rebased the branch by hand. commit-tree ignores commit.gpgsign
+# entirely (it only signs when -S is passed, which this never does), so a
+# host with commit signing configured on still gets a plain, unsigned,
+# successful rewrite.
+#
+# $1  repo        the host-side repo the branch lives in (origin_repo,
+#                  never the clone -- this must never run against a
+#                  sandbox-writable checkout).
+# $2  branch      the branch to rewrite in place, via update-ref.
+# $3  base        the commit before the fetched range; base itself is
+#                  never touched, only base..branch.
+# $4  want_name   author name forced onto a mismatched commit.
+# $5  want_email  author email forced onto a mismatched commit, and the
+#                  value every commit's author email is compared against.
+fs_normalize_authorship() {
+    local repo="$1" branch="$2" base="$3" want_name="$4" want_email="$5"
+    local mismatched merges sha parent tree aname aemail adate msgfile n=0
+
+    mismatched="$( (cd "$repo" && git log --format='%ae' "$base..$branch") 2>/dev/null \
+        | grep -vxF -- "$want_email" )" || true
+    [[ -n "$mismatched" ]] || { printf '0'; return 0; }
+
+    merges="$( (cd "$repo" && git rev-list --min-parents=2 --count "$base..$branch") 2>/dev/null )" \
+        || return 1
+    [[ "$merges" == "0" ]] || return 2
+
+    msgfile="$(mktemp)" || return 1
+
+    parent="$base"
+    while IFS= read -r sha; do
+        [[ -n "$sha" ]] || continue
+        tree="$( (cd "$repo" && git rev-parse "$sha^{tree}") 2>/dev/null )" \
+            || { rm -f "$msgfile"; return 1; }
+        aname="$( (cd "$repo" && git log -1 --format='%an' "$sha") 2>/dev/null )" \
+            || { rm -f "$msgfile"; return 1; }
+        aemail="$( (cd "$repo" && git log -1 --format='%ae' "$sha") 2>/dev/null )" \
+            || { rm -f "$msgfile"; return 1; }
+        adate="$( (cd "$repo" && git log -1 --format='%ad' --date=raw "$sha") 2>/dev/null )" \
+            || { rm -f "$msgfile"; return 1; }
+        if [[ "$aemail" != "$want_email" ]]; then
+            aname="$want_name"
+            aemail="$want_email"
+            n=$(( n + 1 ))
+        fi
+        (cd "$repo" && git cat-file commit "$sha") 2>/dev/null \
+            | awk 'body{print} !body && $0==""{body=1}' > "$msgfile" \
+            || { rm -f "$msgfile"; return 1; }
+        parent="$(cd "$repo" \
+            && GIT_AUTHOR_NAME="$aname" GIT_AUTHOR_EMAIL="$aemail" GIT_AUTHOR_DATE="$adate" \
+               git commit-tree "$tree" -p "$parent" -F "$msgfile")" \
+            || { rm -f "$msgfile"; return 1; }
+    done < <( (cd "$repo" && git rev-list --reverse "$base..$branch") 2>/dev/null )
+
+    rm -f "$msgfile"
+    (cd "$repo" && git update-ref "refs/heads/$branch" "$parent") || return 1
+    printf '%s' "$n"
+    return 0
+}

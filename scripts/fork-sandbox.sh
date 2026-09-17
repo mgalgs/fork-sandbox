@@ -8284,14 +8284,19 @@ fi
 # nothing downstream noticed: integration re-creates the commits on the host,
 # and cherry-pick and rebase deliberately keep the author. Silent misattribution
 # is how that survived, so the run checks itself rather than wait for someone to
-# look. A report only -- rewriting authorship on fetch would be a surprise, and
-# integration is where that call belongs. When the seeding works this is empty
-# and the summary reads exactly as before, so silence is the pass signal.
+# look. When a mismatch turns up, fs_normalize_authorship rewrites the branch
+# host-side to the identity below rather than only reporting it -- the summary
+# turns the warning into a notice for that case (grep "NOTICE: authorship
+# normalized" below). When the seeding works nothing here fires and the
+# summary reads exactly as before, so silence is still the pass signal.
 #
 # The addresses come from the session's commits and are untrusted text, so
 # control characters go the same way they do for the subjects below.
 author_email_want=""
 author_email_bad=""
+authorship_normalized=0
+authorship_normalized_from=""
+authorship_skip_nonlinear=0
 if (( fetched )) && [[ "$n_commits" != "0" ]]; then
     author_email_want="$( (cd "$origin_repo" && git config --get user.email) 2>/dev/null || true )"
     if [[ -n "$author_email_want" ]]; then
@@ -8299,6 +8304,31 @@ if (( fetched )) && [[ "$n_commits" != "0" ]]; then
             && git log --format='%ae' "$return_base_sha..$branch") 2>/dev/null \
             | tr -d '\000-\010\013-\037\177' \
             | grep -vxF -- "$author_email_want" | sort -u || true )"
+        if [[ -n "$author_email_bad" ]]; then
+            author_name_want="$( (cd "$origin_repo" && git config --get user.name) 2>/dev/null || true )"
+            if authorship_normalized_out="$(fs_normalize_authorship "$origin_repo" "$branch" \
+                "$return_base_sha" "$author_name_want" "$author_email_want")"; then
+                authorship_normalize_rc=0
+            else
+                authorship_normalize_rc=$?
+            fi
+            # A successful rewrite clears author_email_bad back to empty --
+            # that variable is the pass/fail signal everything below this
+            # point (the summary's WARNING branch, summary.json's
+            # author_email_unexpected field) already keys off, and after a
+            # rewrite the branch genuinely does carry the expected identity
+            # now. The address(es) found are kept in
+            # authorship_normalized_from instead, since the notice below
+            # still needs to say what was wrong before the fix.
+            if [[ "$authorship_normalized_out" =~ ^[0-9]+$ ]] \
+                && (( authorship_normalize_rc == 0 && authorship_normalized_out > 0 )); then
+                authorship_normalized="$authorship_normalized_out"
+                authorship_normalized_from="$author_email_bad"
+                author_email_bad=""
+            elif (( authorship_normalize_rc == 2 )); then
+                authorship_skip_nonlinear=1
+            fi
+        fi
     fi
 fi
 
@@ -8455,6 +8485,18 @@ loop_findings() {
         printf 'The clone is seeded with the repo user.email, so a mismatch means\n'
         printf 'that seeding regressed. Fix authorship before you integrate: rebase\n'
         printf 'and cherry-pick both keep the author, so it lands as-is otherwise.\n'
+        if (( authorship_skip_nonlinear )); then
+            printf 'Normalization was skipped: the range contains a merge commit, and\n'
+            printf 'this rewrite only knows how to walk a single line of history.\n'
+        fi
+    elif (( authorship_normalized > 0 )); then
+        printf '\nNOTICE: authorship normalized -- %s commit(s) rewritten from\n' \
+            "$authorship_normalized"
+        printf '%s\n' "$authorship_normalized_from" | sed 's/^/  found:    /'
+        printf 'to %s   (the user.email %s resolves to).\n' \
+            "$author_email_want" "$origin_repo"
+        printf 'The clone is seeded with the repo user.email, so this means seeding\n'
+        printf 'regressed for this run. Keep %s around for diagnosis.\n' "$run_dir"
     fi
 } > "$run_dir/summary.txt" 2>&1
 
@@ -8576,6 +8618,7 @@ jq -n \
     --argjson commits_list "$commit_list" \
     --arg author_email "$author_email_want" \
     --argjson author_email_unexpected "$author_email_bad_json" \
+    --argjson authorship_normalized "$authorship_normalized" \
     --arg refresh "$refresh_ended" \
     --arg report_from "$report_from" \
     --argjson continuations "$continuations_json" \
@@ -8601,6 +8644,7 @@ jq -n \
         commits_list: $commits_list,
         author_email: (if $author_email == "" then null else $author_email end),
         author_email_unexpected: $author_email_unexpected,
+        authorship_normalized: $authorship_normalized,
         fetched: $fetched,
         branch_removed: $branch_removed,
         cost_usd: $cost_usd,
