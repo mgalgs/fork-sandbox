@@ -315,7 +315,8 @@ fact. It runs one review leg and returns no coding or fix changes; use
 `--review-base <ref>` to choose the start of the reviewed range. This also
 supports comparing two reviewers on the same branch. The handoff you pass is
 embedded in the review leg's prompt as the review brief for this run, not as
-the branch's spec — it previously reached no leg at all.
+the branch's spec, since this run never had the spec the branch was built
+against.
 
 The launcher accepts either `--model sol --harness codex` or the pasteable
 combined form `--harness codex/sol`. It resolves personal aliases from

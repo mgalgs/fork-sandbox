@@ -7225,10 +7225,13 @@ run_leg() {
     # that check). A repeat code pass sits on top of an earlier pass's
     # commits exactly as a fix leg sits on top of the coding leg's, so it is
     # measured the same way, against its own pre-leg head rather than the
-    # run's base -- pass 1's pre-leg head is the checkout point, so that
-    # pass's check is unchanged; only a pass 2+ that starts already ahead of
-    # base is affected. It is read before the leg runs, and the one way
-    # anything here may read the head (clone_branch_head).
+    # run's base -- run_leg's "code" kind is only ever called for pass 2+ of
+    # the repeat loop (pass 1 is the top-level implement leg, accounted for
+    # separately, outside run_leg), so this pre-leg head is always the
+    # previous pass's head, and a pass that starts already ahead of base is
+    # measured correctly instead of against base directly. It is read
+    # before the leg runs, and the one way anything here may read the head
+    # (clone_branch_head).
     if [[ "$kind" == "code" || "$kind" == "fix" || "$kind" == "mntfix" ]]; then
         leg_head_before="$(clone_branch_head)"
     fi
@@ -7343,11 +7346,12 @@ run_leg() {
     # implement leg's own check says of a run. Every one of those legs --
     # code, fix and mntfix alike -- measures against its OWN pre-leg head
     # (the head did not move); an unreadable head, before or after, is
-    # treated as holding nothing, the same rule. A code pass's pre-leg head
-    # is base_sha on pass 1 (the checkout point), so that pass's check is
-    # unchanged from measuring against base directly; a pass 2+ that starts
-    # already ahead of base is now measured correctly instead of always
-    # reading as having committed. A review or maintainer leg is not checked
+    # treated as holding nothing, the same rule. run_leg's "code" kind is
+    # only ever called for pass 2+ of the repeat loop -- the top-level
+    # implement leg (pass 1) is accounted for separately, outside run_leg --
+    # so a pass that starts already ahead of base is now measured against
+    # its own pre-leg head instead of always reading as having committed. A
+    # review or maintainer leg is not checked
     # this way: it commits nothing by design, and one that ran out of
     # retries left no verdict, which the loop already ends over as a
     # harness error. Note what the leg_error gate does NOT protect against:

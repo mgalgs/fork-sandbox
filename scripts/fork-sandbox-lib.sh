@@ -1719,16 +1719,25 @@ fs_emit_review_prompt_body() {
     local branch="$1" base_sha="$2" review_skill_dir="$3"
     local review_verdict_file="$4" inbox_dir="$5"
     local handoff_file="$6" flavor="${7:-spec}"
+    local review_role_para
+    if [[ "$flavor" == "review-only" ]]; then
+        review_role_para="This branch was not built in this sandbox -- it was built elsewhere,
+against a spec this sandbox never had. You are reviewing it cold, with none
+of the implementing session's reasoning and none of its attachment to the
+result. Read what it committed and say what is wrong with it."
+    else
+        review_role_para="Another session worked in this same clone and committed to the branch
+\`$branch\`. You are a different session, with none of its reasoning and none
+of its attachment to the result. Read what it committed and say what is wrong
+with it."
+    fi
     cat <<EOF
 
 ---
 
 # Your task: review this branch, and only review it
 
-Another session worked in this same clone and committed to the branch
-\`$branch\`. You are a different session, with none of its reasoning and none
-of its attachment to the result. Read what it committed and say what is wrong
-with it.
+$review_role_para
 
 The change is the commit range:
 
