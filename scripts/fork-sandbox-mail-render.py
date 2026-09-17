@@ -127,8 +127,21 @@ def parse_msg(path, seq, fn):
         "hops": hdr.get("X-Hops", ""),
         "attachments": attachments,
         "body": body,
+        "ai_harness": hdr.get("X-AI-Harness", ""),
+        "ai_model": hdr.get("X-AI-Model", ""),
+        "ai_network": hdr.get("X-AI-Network", ""),
     })
     return entry
+
+
+def attribution_str(e):
+    """A compact '<harness> · <model> · <network>' string from a message's
+    X-AI-* headers, omitting empty parts, or "" when none are set -- a
+    message from before this stamping existed (or a handler-seat reply,
+    which carries X-AI-Persona but no harness/model/network) renders with
+    no attribution at all, byte-identical to before this existed."""
+    parts = [p for p in (e.get("ai_harness"), e.get("ai_model"), e.get("ai_network")) if p]
+    return " · ".join(parts)
 
 
 def load_thread(thread_dir):
@@ -284,6 +297,8 @@ def render_message_card(e, depth, orphaned, is_error):
             f'</div>'
         )
     orphan_html = ' <span class="badge orphan">orphaned</span>' if orphaned else ""
+    attrib = attribution_str(e)
+    attrib_html = f' <span class="attribution">[{esc(attrib)}]</span>' if attrib else ""
     attach_html = ""
     if e["attachments"]:
         items = "".join(f"<li>{esc(a)}</li>" for a in e["attachments"])
@@ -295,7 +310,7 @@ def render_message_card(e, depth, orphaned, is_error):
     return (
         f'<div class="msg" id="m-{esc(e["id"])}"{style}>\n'
         f'  <div class="msg-head">\n'
-        f'    <span class="from">{esc(e["from"])}</span>{orphan_html}\n'
+        f'    <span class="from">{esc(e["from"])}</span>{attrib_html}{orphan_html}\n'
         f'    <span class="hops">hops {esc(e["hops"])}</span>\n'
         f'  </div>\n'
         f'  <div class="msg-meta">\n'
@@ -403,6 +418,7 @@ table.index th, table.index td {
   font-size: 11px; text-transform: uppercase; letter-spacing: .04em;
   border-radius: 999px; padding: 1px 8px; margin-left: 6px;
 }
+.attribution { font-weight: 400; color: var(--ink-3); font-size: 12.5px; }
 .badge.orphan { background: var(--surface-2); color: var(--ink-2); border: 1px solid var(--rule); }
 .badge.err { background: var(--crit); color: #fff; }
 .msg.error { border-color: var(--crit); }
@@ -511,8 +527,10 @@ def render_text_message(e, depth, orphaned, is_error, out):
         out.append(f"{indent}[error: {e['error']}]")
         return
     orphan_suffix = " [orphaned]" if orphaned else ""
+    attrib = attribution_str(e)
+    attrib_suffix = f" [{attrib}]" if attrib else ""
     out.append(f"{indent}Message-ID: {e['id']}")
-    out.append(f"{indent}From: {e['from']}{orphan_suffix}")
+    out.append(f"{indent}From: {e['from']}{attrib_suffix}{orphan_suffix}")
     out.append(f"{indent}To: {e['to']}")
     if e["cc"]:
         out.append(f"{indent}Cc: {e['cc']}")

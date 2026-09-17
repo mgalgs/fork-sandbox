@@ -895,6 +895,14 @@ if [[ -n "$default_reply" ]]; then
     ok "harvest: no-stanza reply posted with reply-all default subject"
     check "harvest: no-stanza reply hops are the trigger's decremented by 1" \
         "$(( trig_hops - 1 ))" "$(header_of_file "$default_reply" X-Hops)"
+    check "harvest: LLM-seat reply is stamped with X-AI-Persona" "bob" \
+        "$(header_of_file "$default_reply" X-AI-Persona)"
+    check "harvest: LLM-seat reply is stamped with the seat's harness (fleet.yaml: pi)" "pi" \
+        "$(header_of_file "$default_reply" X-AI-Harness)"
+    check "harvest: LLM-seat reply is stamped with the seat's network (fleet.yaml: sealed)" "sealed" \
+        "$(header_of_file "$default_reply" X-AI-Network)"
+    check "harvest: bob has no configured model, so no X-AI-Model is stamped" "" \
+        "$(header_of_file "$default_reply" X-AI-Model)"
 else
     no "harvest: no-stanza reply posted with reply-all default subject"
 fi
@@ -2702,6 +2710,14 @@ for f in "$FORK_SANDBOX_MAIL_ROOT/threads/$tid"/*.msg; do
 done
 if [[ -n "$happy_reply" ]]; then
     ok "happy: the reply posted from the handler's own address"
+    check "happy: harvested reply is stamped with X-AI-Persona" "happy" \
+        "$(header_of_file "$happy_reply" X-AI-Persona)"
+    check "happy: handler-path harvest carries no X-AI-Harness (handler has no .env record)" "" \
+        "$(header_of_file "$happy_reply" X-AI-Harness)"
+    check "happy: handler-path harvest carries no X-AI-Model" "" \
+        "$(header_of_file "$happy_reply" X-AI-Model)"
+    check "happy: handler-path harvest carries no X-AI-Network" "" \
+        "$(header_of_file "$happy_reply" X-AI-Network)"
 else
     no "happy: the reply posted from the handler's own address"
 fi

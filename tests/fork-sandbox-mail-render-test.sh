@@ -466,6 +466,44 @@ badout_err="$(<"$work/badout.err")"
 contains "-o with a missing parent directory prints a clean diagnostic" "$badout_err" "Error:"
 not_contains "-o with a missing parent directory does not dump a Python traceback" "$badout_err" "Traceback"
 
+printf '\n== X-AI-* attribution ==\n'
+
+attrib_id="$("$mail" send --from @reviewer --to @bob --subject 'Attributed reply' --body - \
+    --header 'X-AI-Persona: reviewer' --header 'X-AI-Harness: pi-local' \
+    --header 'X-AI-Model: Qwen/test-model' --header 'X-AI-Network: sealed' \
+    <<< 'attributed body' 2>/dev/null)"
+if [[ -n "$attrib_id" ]]; then ok "fixture: attributed message sent"; else no "fixture: attributed message sent"; fi
+
+partial_id="$("$mail" reply --from @bob --reply-to "$attrib_id" \
+    --header 'X-AI-Persona: bob' --header 'X-AI-Harness: claude' \
+    --body - <<< 'partial attribution body' 2>/dev/null)"
+if [[ -n "$partial_id" ]]; then ok "fixture: partially attributed reply sent"; else no "fixture: partially attributed reply sent"; fi
+
+persona_only_id="$("$mail" reply --from @carol --reply-to "$attrib_id" \
+    --header 'X-AI-Persona: carol' --body - <<< 'handler-style reply, persona only' 2>/dev/null)"
+if [[ -n "$persona_only_id" ]]; then ok "fixture: persona-only reply sent"; else no "fixture: persona-only reply sent"; fi
+
+attrib_html="$(python3 "$renderer" "$FORK_SANDBOX_MAIL_ROOT" --thread "$attrib_id" 2>/dev/null)"
+contains "html: a persona-only header (handler-path shape) still renders the message" \
+    "$attrib_html" 'handler-style reply, persona only'
+not_contains "html: a persona-only header (no harness/model/network) shows no attribution bracket" \
+    "$attrib_html" '<span class="from">@carol</span> <span class="attribution">'
+contains "html: full attribution rendered on the From line" "$attrib_html" \
+    '<span class="from">@reviewer</span> <span class="attribution">[pi-local · Qwen/test-model · sealed]</span>'
+contains "html: partial attribution omits the missing (network) part" "$attrib_html" \
+    '<span class="from">@bob</span> <span class="attribution">[claude]</span>'
+
+attrib_text="$(python3 "$renderer" --text "$FORK_SANDBOX_MAIL_ROOT" --thread "$attrib_id" 2>/dev/null)"
+contains "--text: full attribution rendered on the From line" "$attrib_text" \
+    'From: @reviewer [pi-local · Qwen/test-model · sealed]'
+contains "--text: partial attribution omits the missing (network) part" "$attrib_text" \
+    'From: @bob [claude]'
+
+not_contains "html: fixtures without X-AI-* headers render byte-identical, no attribution bracket" \
+    "$html" 'class="attribution"'
+not_contains "--text: fixtures without X-AI-* headers render byte-identical, no attribution bracket" \
+    "$text_all" 'attribution'
+
 printf '\n== misc ==\n'
 if python3 -m py_compile "$renderer"; then ok "renderer compiles"; else no "renderer compiles"; fi
 

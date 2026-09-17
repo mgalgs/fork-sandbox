@@ -1484,7 +1484,7 @@ pm_exec_wake() {
     local mf replies=0
     for mf in "$outbox"/mail-*.md; do
         [[ -e "$mf" ]] || continue
-        if pm_harvest_one_file "$mf" "$agent" "$tid" "$mid" "$trigger_hops"; then
+        if pm_harvest_one_file "$mf" "$agent" "$tid" "$mid" "$trigger_hops" "" "" ""; then
             replies=$(( replies + 1 ))
         fi
     done
@@ -1672,6 +1672,8 @@ pm_spawn_wake() {
         printf 'RUN_DIR=%s\n' "$run_dir"
         printf 'INBOX=%s\n' "$run_dir/inbox"
         printf 'HARNESS=%s\n' "$harness"
+        printf 'MODEL=%s\n' "$model"
+        printf 'NETWORK=%s\n' "$network"
         printf 'BRANCH=%s\n' "$branch"
         printf 'RESUMED=%s\n' "$resumed"
         printf 'PENDING_MSGS=\n'
@@ -1911,6 +1913,7 @@ pm_parse_reply_file() {
 
 pm_harvest_one_file() {
     local mf="$1" agent="$2" tid="$3" trigger="$4" trigger_hops="$5"
+    local harness="${6:-}" model="${7:-}" network="${8:-}"
     local body_file parsed
     body_file="$(mktemp "$MAIL_ROOT/.postmaster.body.XXXXXX")"
     if ! parsed="$(pm_parse_reply_file "$mf" "$body_file")"; then
@@ -1969,6 +1972,15 @@ pm_harvest_one_file() {
         [[ -n "$cc" ]] && cmd+=(--cc "$cc")
         [[ -n "$subject" ]] && cmd+=(--subject "$subject")
     fi
+    # Stamped at harvest, not by the persona prompt: the old lkml transport
+    # treated in-writer attribution as load-bearing, but a persona prompt
+    # cannot be trusted to reliably reproduce it. The postmaster is the one
+    # party that actually knows which agent/harness/model/network produced
+    # this reply, so it stamps here.
+    cmd+=(--header "X-AI-Persona: $agent")
+    [[ -n "$harness" ]] && cmd+=(--header "X-AI-Harness: $harness")
+    [[ -n "$model" ]] && cmd+=(--header "X-AI-Model: $model")
+    [[ -n "$network" ]] && cmd+=(--header "X-AI-Network: $network")
 
     if ! "${cmd[@]}" >/dev/null 2>"$body_file.err"; then
         rc=1
@@ -2093,12 +2105,14 @@ pm_wake_is_dead() {
 pm_harvest_run() {
     local project="$1" rid="$2"
     local f="$RUNS/$rid.env"
-    local agent tid trigger run_dir harness
+    local agent tid trigger run_dir harness model network
     agent="$(fs_pm_env_get "$f" AGENT)"
     tid="$(fs_pm_env_get "$f" THREAD)"
     trigger="$(fs_pm_env_get "$f" TRIGGER)"
     run_dir="$(fs_pm_env_get "$f" RUN_DIR)"
     harness="$(fs_pm_env_get "$f" HARNESS)"
+    model="$(fs_pm_env_get "$f" MODEL)"
+    network="$(fs_pm_env_get "$f" NETWORK)"
     # A given-mode harness (pi) derives its id fresh on every spawn (see
     # pm_pi_session_id) and never reads sessions/ back -- so harvest must
     # not write one there either, or a stale file sits unread forever. Only
@@ -2199,7 +2213,7 @@ pm_harvest_run() {
     local mf replies=0
     for mf in "$run_dir/outbox"/mail-*.md; do
         [[ -e "$mf" ]] || continue
-        if pm_harvest_one_file "$mf" "$agent" "$tid" "$trigger" "$trigger_hops"; then
+        if pm_harvest_one_file "$mf" "$agent" "$tid" "$trigger" "$trigger_hops" "$harness" "$model" "$network"; then
             replies=$(( replies + 1 ))
         fi
     done
