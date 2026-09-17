@@ -530,6 +530,20 @@ if [[ "$findings_rc" == 0 && -n "$findings_rd" ]]; then
     else
         no "FINDINGS review-only writes no fix prompt"
     fi
+    # And no fix prompt HEADER either. The header render site is gated on
+    # review_loop_cap > 0, which --review-only forces to 1, so it used to
+    # render one -- built against the review brief as if the brief were
+    # the branch's spec, the very framing the review prompt's review-only
+    # flavor exists to avoid. No fix leg can ever read it here. The
+    # matching non-regression pin, that a --review-loop run still gets
+    # one, is on rd7 below.
+    if [[ ! -e "$findings_rd/fix-prompt-header.md" ]]; then
+        ok "review-only writes no fix prompt header"
+    else
+        no "review-only writes no fix prompt header"
+    fi
+    check "review-only run.sh carries an empty fix_prompt_header" "fix_prompt_header=''" \
+        "$(grep '^fix_prompt_header=' "$findings_rd/run.sh")"
 else
     no "a FINDINGS review-only run exits 0" "rc=$findings_rc rd=$findings_rd $findings_out"
 fi
@@ -616,6 +630,13 @@ run_real() {
 rd7="$(run_real --harness claude --review-loop 1 --review-harness pi-local)"
 if [[ -n "$rd7" ]]; then
     tmpdirs+=("$rd7")
+    # The non-regression pin for the review-only case above: a run with a
+    # real fix leg still gets its fix prompt header.
+    if [[ -e "$rd7/fix-prompt-header.md" ]]; then
+        ok "a --review-loop run still writes a fix prompt header"
+    else
+        no "a --review-loop run still writes a fix prompt header"
+    fi
     sandbox_line="$(grep '^sandbox_cmd=' "$rd7/run.sh")"
     review_line="$(grep '^review_sandbox_cmd=' "$rd7/run.sh")"
 

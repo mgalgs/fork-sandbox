@@ -5030,9 +5030,14 @@ if (( review_loop_cap > 0 )); then
     # for this run. fs_emit_review_prompt_body's default "spec" flavor
     # would tell the reviewer to treat that brief as the spec and report
     # its own "what to look at" language as missing work -- see
-    # fs_emit_handoff_spec_section. No other render site here ever runs in
-    # review-only mode (the k8s path refuses --review-only, and maintainer
-    # and fix legs never run in it), so this is the only flavor switch.
+    # fs_emit_handoff_spec_section. This is the only site that needs a
+    # flavor, but not because it is the only one review-only reaches: the
+    # fix-header site just below is gated on review_loop_cap > 0, which
+    # --review-only forces to 1, so it would render too. A review-only run
+    # can never build a fix leg -- a FINDINGS verdict ends the run -- so
+    # that site is gated off there outright rather than flavored. The k8s
+    # path refuses --review-only, and the maintainer prompt is built only
+    # with --maintainer-loop, which --review-only refuses.
     review_prompt_flavor=spec
     [[ "$review_only" == true ]] && review_prompt_flavor=review-only
     {
@@ -5051,7 +5056,16 @@ fi
 # preset fix seat runs its legs on its own harness, whose addendum-delivery
 # and network facts may differ, so each seat that is set gets a header of
 # its own, built the same way with its own preamble arguments.
-if (( review_loop_cap > 0 || maintainer_loop_cap > 0 )); then
+#
+# Except in review-only mode, which forces review_loop_cap to 1 and so
+# would otherwise satisfy this condition. That run has no fix leg to serve
+# -- the loop breaks on FINDINGS and ends the run -- and the header it
+# would write is rendered against the review brief as if the brief were
+# the branch's spec, which is exactly what the review prompt's flavor
+# exists to avoid. Nothing would read it; it is skipped rather than
+# flavored.
+if [[ "$review_only" != true ]] \
+    && (( review_loop_cap > 0 || maintainer_loop_cap > 0 )); then
     fix_prompt_header="$run_dir/fix-prompt-header.md"
     fs_reject_unsafe_chars "$fix_prompt_header"
     {
