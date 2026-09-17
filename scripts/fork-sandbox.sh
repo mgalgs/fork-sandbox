@@ -4998,7 +4998,7 @@ if (( review_loop_cap > 0 || maintainer_loop_cap > 0 )); then
         fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" "$harness" "$preamble_network" \
             "$outbox_dir" "" "$outbox_max_bytes"
         fs_emit_prompt_overlay fix
-        fs_emit_fix_prompt_body "$branch" "$base_sha"
+        fs_emit_fix_prompt_body "$branch" "$base_sha" "$handoff_file"
     } > "$fix_prompt_header.part"
     mv -- "$fix_prompt_header.part" "$fix_prompt_header"
 fi
@@ -5010,7 +5010,7 @@ if [[ -n "$fix_harness" ]] && (( review_loop_cap > 0 )); then
         fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" "$fix_harness" \
             "$fxr_preamble_network" "$outbox_dir" "" "$outbox_max_bytes"
         fs_emit_prompt_overlay fix
-        fs_emit_fix_prompt_body "$branch" "$base_sha"
+        fs_emit_fix_prompt_body "$branch" "$base_sha" "$handoff_file"
     } > "$fxr_fix_prompt_header.part"
     mv -- "$fxr_fix_prompt_header.part" "$fxr_fix_prompt_header"
 fi
@@ -5022,7 +5022,7 @@ if [[ -n "$mntfix_harness" ]] && (( maintainer_loop_cap > 0 )); then
         fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" "$mntfix_harness" \
             "$fxm_preamble_network" "$outbox_dir" "" "$outbox_max_bytes"
         fs_emit_prompt_overlay fix
-        fs_emit_fix_prompt_body "$branch" "$base_sha"
+        fs_emit_fix_prompt_body "$branch" "$base_sha" "$handoff_file"
     } > "$fxm_fix_prompt_header.part"
     mv -- "$fxm_fix_prompt_header.part" "$fxm_fix_prompt_header"
 fi

@@ -605,6 +605,8 @@ if (( rc2 == 0 )) && [[ -n "$rd2" ]]; then
     contains "the fix prompt carries the verdict body" \
         "file.txt:1 the new line breaks the invariant it sits next to" \
         "$(cat "$rd2/maintainer-fix-prompt-1.md")"
+    contains "the maintainer's fix prompt embeds the run's handoff" \
+        "MNT-BRIEF-SENTINEL-9d2c" "$(cat "$rd2/maintainer-fix-prompt-1.md")"
     # The total now spends maintainer-tier money too, so the line that
     # explains it names that tier, and the summary's value column stays
     # aligned even though 'maintainer:' is the longest label.
@@ -716,6 +718,16 @@ if (( rc3 == 0 )) && [[ -n "$rd3" ]]; then
     contains "the embedded verdict carries the review leg's account" \
         "Checked: the whole diff line by line." \
         "$(cat "$rd3/maintainer-prompt-1.md")"
+    # Every prompt that actually went to a leg in this run -- two review
+    # iterations, the fix leg, the maintainer leg -- carries the handoff,
+    # and carries it exactly once. The review prompt is rendered once at
+    # launch and run per iteration; this is what "the leg saw the spec"
+    # amounts to, for each of the four.
+    for leg_prompt in review-prompt-1.md review-prompt-2.md fix-prompt-1.md \
+        maintainer-prompt-1.md; do
+        check "the $leg_prompt a leg ran carries the handoff exactly once" "1" \
+            "$(grep -cF -- 'MNT-BRIEF-SENTINEL-9d2c' "$rd3/$leg_prompt" 2>/dev/null)"
+    done
 else
     no "the five-leg combined run exits 0" "rc=$rc3 rd=$rd3: $out3"
 fi

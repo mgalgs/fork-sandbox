@@ -3859,11 +3859,22 @@ esac
 
 expected_rl_fix_header="$({ fs_emit_prompt_preamble "$pod_clone_dir_expected" \
         "$pod_inbox_dir_expected" pi gated "$pod_outbox_dir_expected" pod
-    fs_emit_fix_prompt_body fs-k8s-test-rl-branch "$proj_base_sha"
+    fs_emit_fix_prompt_body fs-k8s-test-rl-branch "$proj_base_sha" "$handoff_file"
 })"
 actual_rl_fix_header="$(extract_configmap_key fix-prompt-header.md "$rl_submit_out")"
 check "fix-prompt-header.md renders byte-for-byte (preamble + body, no overlay)" \
     "$expected_rl_fix_header" "$actual_rl_fix_header"
+# The fix header carries the handoff the same as the review prompt -- the
+# fix leg weighs the findings against the spec too -- and the findings
+# paragraph still lands last, after the embedded handoff.
+case "$actual_rl_fix_header" in
+    *"Do the thing."*)
+        ok "fix-prompt-header.md embeds the operator's handoff" ;;
+    *)
+        no "fix-prompt-header.md embeds the operator's handoff" "not found" ;;
+esac
+check "fix-prompt-header.md ends with the findings paragraph, after the handoff" \
+    "one out." "$(printf '%s\n' "$actual_rl_fix_header" | tail -n 1)"
 
 # Item: the rendered review prompt names the POD's paths, never a host path
 # -- proof this run's clone-under-/var/tmp and the operator's real project

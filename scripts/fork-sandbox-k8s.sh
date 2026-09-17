@@ -1158,7 +1158,7 @@ $({ fs_emit_prompt_preamble "$pod_clone_dir" "$pod_inbox_dir" pi gated "$pod_out
   fix-prompt-header.md: |
 $({ fs_emit_prompt_preamble "$pod_clone_dir" "$pod_inbox_dir" pi gated "$pod_outbox_dir" pod \
        "$outbox_max_bytes"
-   fs_emit_fix_prompt_body "$branch" "$base_sha"; } | indent_block)
+   fs_emit_fix_prompt_body "$branch" "$base_sha" "$handoff_file"; } | indent_block)
   code-review-portable-skill.md: |
 $(indent_block < "$review_skill_src")
   review-loop.sh: |
