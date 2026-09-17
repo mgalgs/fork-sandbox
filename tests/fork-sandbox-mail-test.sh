@@ -459,5 +459,56 @@ else
     no "dispatcher wiring" "scripts/fork-sandbox is not executable"
 fi
 
+printf '\n== --header: repeatable custom X- headers on send ==\n'
+
+hdr_id="$("$mail" send --from @alice --to @bob --subject "With headers" --body - \
+    --header 'X-AI-Persona: reviewer' --header 'X-AI-Model: test-model' <<< "see headers" 2>diag.txt)"
+rc=$?
+check "send with two --header exits 0" "0" "$rc"
+raw_hdr="$("$mail" show "$hdr_id")"
+contains "stored message carries the first --header" "$raw_hdr" "X-AI-Persona: reviewer"
+contains "stored message carries the second --header" "$raw_hdr" "X-AI-Model: test-model"
+
+printf '\n== --header: a newline in the value is refused ==\n'
+
+msgs_before="$(find "$FORK_SANDBOX_MAIL_ROOT" -name '*.msg' | wc -l)"
+out="$("$mail" send --from @alice --to @bob --subject "NL header" --body - \
+    --header "$(printf 'X-AI-Persona: bad\nvalue')" <<< "x" 2>&1)"
+rc=$?
+if (( rc != 0 )); then
+    ok "send refuses a --header value containing a newline"
+else
+    no "send refuses a --header value containing a newline" "it succeeded"
+fi
+check "the refused send wrote no new message" "$msgs_before" \
+    "$(find "$FORK_SANDBOX_MAIL_ROOT" -name '*.msg' | wc -l)"
+
+printf '\n== --header: a non-X header name is refused ==\n'
+
+refuses "send refuses --header naming a core header (Subject)" \
+    "$mail" send --from @alice --to @bob --subject "Bad header" --body - --header 'Subject: hijack' <<< "x"
+
+printf '\n== --header: reserved header names are refused ==\n'
+
+refuses "send refuses --header X-Hops (store-owned)" \
+    "$mail" send --from @alice --to @bob --subject "Reserved" --body - --header 'X-Hops: 99' <<< "x"
+refuses "send refuses --header X-Attachment (store-owned)" \
+    "$mail" send --from @alice --to @bob --subject "Reserved" --body - --header 'X-Attachment: attachments/x' <<< "x"
+
+printf '\n== --header: same validation applies on reply ==\n'
+
+reply_hdr_id="$("$mail" reply --from @bob --reply-to "$hdr_id" --body - \
+    --header 'X-AI-Persona: reviewer' <<< "reply with header" 2>diag.txt)"
+rc=$?
+check "reply with --header exits 0" "0" "$rc"
+contains "reply's stored message carries --header" "$("$mail" show "$reply_hdr_id")" "X-AI-Persona: reviewer"
+
+refuses "reply refuses --header naming a core header (Subject)" \
+    "$mail" reply --from @bob --reply-to "$hdr_id" --body - --header 'Subject: hijack' <<< "x"
+refuses "reply refuses --header X-Hops (store-owned)" \
+    "$mail" reply --from @bob --reply-to "$hdr_id" --body - --header 'X-Hops: 99' <<< "x"
+refuses "reply refuses a --header value containing a newline" \
+    "$mail" reply --from @bob --reply-to "$hdr_id" --body - --header "$(printf 'X-AI-Persona: bad\nvalue')" <<< "x"
+
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 (( fail == 0 )) || exit 1

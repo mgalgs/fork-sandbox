@@ -5,9 +5,11 @@
 # Usage: fork-sandbox-mail.sh send --from @a --to @b[,@c] [--cc @d[,@e]]
 #                              --subject <s> (--body <file>|-)
 #                              [--attach <file>]... [--hops <n>]
+#                              [--header 'X-Name: value']...
 #        fork-sandbox-mail.sh reply --from @a --reply-to <message-id>
 #                              (--body <file>|-) [--to @b[,@c]] [--cc @d[,@e]]
 #                              [--subject <s>] [--attach <file>]... [--hops <n>]
+#                              [--header 'X-Name: value']...
 #        fork-sandbox-mail.sh show <message-id>
 #        fork-sandbox-mail.sh tree <thread-id>
 #        fork-sandbox-mail.sh list
@@ -53,6 +55,15 @@
 #                                 it (or an operator) the override to do it
 #                                 with
 #   X-Attachment: attachments/<basename>   one line per attachment
+#   X-<Name>: <value>             any number of caller-supplied custom
+#                                 headers, via a repeatable --header
+#                                 'X-Name: value' flag on send/reply. Name
+#                                 must match ^X-[A-Za-z0-9-]+$ (only custom
+#                                 X- headers may be set this way; core
+#                                 headers are refused by the name pattern
+#                                 alone) and may not be X-Hops or
+#                                 X-Attachment, which this store writes
+#                                 itself.
 #
 # Unlike the RFC-2822-style angle-bracket/domain ids this repo's old
 # lkml-mailbox.sh used, ids here are bare uuids with no "<...>" wrapping and
@@ -143,6 +154,35 @@ mail_validate_no_newline() {
         return 1
     fi
     return 0
+}
+
+# Validates one --header 'X-Name: value' argument and prints it back as a
+# normalized "X-Name: value" header line. Refuses a raw newline (would
+# forge or truncate header lines, same reasoning as mail_validate_no_newline),
+# any name that isn't ^X-[A-Za-z0-9-]+$ (core, non-X headers are refused by
+# this pattern alone -- only custom X- headers may be set this way), and the
+# reserved names this store writes itself (X-Hops, X-Attachment).
+mail_validate_header() {
+    local raw="$1" name value
+    mail_validate_no_newline "$raw" "--header" || return 1
+    if [[ "$raw" != *:* ]]; then
+        echo "Error: --header '$raw' must look like 'X-Name: value'." >&2
+        return 1
+    fi
+    name="${raw%%:*}"
+    value="${raw#*:}"
+    value="${value# }"
+    if [[ ! "$name" =~ ^X-[A-Za-z0-9-]+$ ]]; then
+        echo "Error: --header name '$name' must match 'X-[A-Za-z0-9-]+' -- only custom X- headers may be set." >&2
+        return 1
+    fi
+    case "$name" in
+        X-Hops|X-Attachment)
+            echo "Error: --header may not set reserved header '$name'." >&2
+            return 1
+            ;;
+    esac
+    printf '%s: %s' "$name" "$value"
 }
 
 # Strips leading/trailing whitespace and prints the result.
@@ -347,7 +387,7 @@ mail_body_is_empty() {
 
 cmd_send() {
     local from="" to="" cc="" subject="" body_arg="" hops=8
-    local -a attach_files=()
+    local -a attach_files=() extra_headers=()
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --from) from="${2:?--from requires an address}"; shift 2 ;;
@@ -357,6 +397,7 @@ cmd_send() {
             --body) body_arg="${2:?--body requires a file, or -}"; shift 2 ;;
             --attach) attach_files+=("${2:?--attach requires a file}"); shift 2 ;;
             --hops) hops="${2:?--hops requires a number}"; shift 2 ;;
+            --header) extra_headers+=("${2:?--header requires 'X-Name: value'}"); shift 2 ;;
             -h|--help) usage; exit 0 ;;
             *) echo "Error: send: unknown option '$1'." >&2; return 1 ;;
         esac
@@ -367,6 +408,13 @@ cmd_send() {
     [[ -n "$body_arg" ]] || { echo "Error: send: --body is required." >&2; return 1; }
     [[ "$hops" =~ ^[0-9]+$ ]] || { echo "Error: send: --hops must be a non-negative integer." >&2; return 1; }
     mail_validate_no_newline "$subject" "--subject" || return 1
+    local -a validated_headers=()
+    local eh hline
+    for eh in "${extra_headers[@]:-}"; do
+        [[ -z "$eh" ]] && continue
+        hline="$(mail_validate_header "$eh")" || return 1
+        validated_headers+=("$hline")
+    done
 
     mail_validate_addr "$from" || return 1
     local to_norm cc_norm
@@ -401,6 +449,9 @@ cmd_send() {
     [[ -n "$cc_norm" ]] && hlines+=("Cc: $cc_norm")
     hlines+=("Subject: $subject")
     hlines+=("X-Hops: $hops")
+    for hline in "${validated_headers[@]:-}"; do
+        [[ -n "$hline" ]] && hlines+=("$hline")
+    done
     if [[ -n "$attach_csv" ]]; then
         local -a names=()
         IFS='/' read -ra names <<< "$attach_csv"
@@ -419,7 +470,7 @@ cmd_send() {
 
 cmd_reply() {
     local from="" reply_to="" body_arg="" to="" cc="" subject_override="" hops_override=""
-    local -a attach_files=()
+    local -a attach_files=() extra_headers=()
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --from) from="${2:?--from requires an address}"; shift 2 ;;
@@ -430,6 +481,7 @@ cmd_reply() {
             --subject) subject_override="${2:?--subject requires text}"; shift 2 ;;
             --attach) attach_files+=("${2:?--attach requires a file}"); shift 2 ;;
             --hops) hops_override="${2:?--hops requires a number}"; shift 2 ;;
+            --header) extra_headers+=("${2:?--header requires 'X-Name: value'}"); shift 2 ;;
             -h|--help) usage; exit 0 ;;
             *) echo "Error: reply: unknown option '$1'." >&2; return 1 ;;
         esac
@@ -439,6 +491,13 @@ cmd_reply() {
     [[ -n "$body_arg" ]] || { echo "Error: reply: --body is required." >&2; return 1; }
     [[ -z "$subject_override" ]] || mail_validate_no_newline "$subject_override" "--subject" || return 1
     [[ -z "$hops_override" ]] || [[ "$hops_override" =~ ^[0-9]+$ ]] || { echo "Error: reply: --hops must be a non-negative integer." >&2; return 1; }
+    local -a validated_headers=()
+    local eh hline
+    for eh in "${extra_headers[@]:-}"; do
+        [[ -z "$eh" ]] && continue
+        hline="$(mail_validate_header "$eh")" || return 1
+        validated_headers+=("$hline")
+    done
 
     mail_validate_addr "$from" || return 1
     local to_norm="" cc_norm=""
@@ -534,6 +593,9 @@ cmd_reply() {
     hlines+=("In-Reply-To: $p_id")
     hlines+=("References: $references")
     hlines+=("X-Hops: ${hops_override:-$p_hops}")
+    for hline in "${validated_headers[@]:-}"; do
+        [[ -n "$hline" ]] && hlines+=("$hline")
+    done
     if [[ -n "$attach_csv" ]]; then
         local -a names=()
         IFS='/' read -ra names <<< "$attach_csv"
