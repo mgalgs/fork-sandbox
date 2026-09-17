@@ -1446,13 +1446,15 @@ retry_cfg="$(mktemp -d)"; tmpdirs+=("$retry_cfg")
 install -m 600 /dev/null "$retry_cfg/pi.env"
 printf 'OPENROUTER_API_KEY=fake\n' > "$retry_cfg/pi.env"
 
-retry_run() {  # $1 branch; sets retry_rc / retry_rd / retry_out
+retry_run() {  # $1 branch, $2 optional --review-loop count; sets retry_rc / retry_rd / retry_out
+    local extra=()
+    [[ -n "${2:-}" ]] && extra=(--review-loop "$2")
     retry_out="$(RE_STREAM="${RE_STREAM:-}" RE_COMMIT="${RE_COMMIT:-0}" \
         RE_EXIT="${RE_EXIT:-0}" RE_STOP="${RE_STOP:-stop}" \
         PATH="$retry_stub:$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$retry_cfg" \
         FORK_SANDBOX_BACKEND=fake-image \
         timeout 60 "$launcher" --foreground --harness pi/some-model \
-        --branch "$1" "$proj" "$handoff" 2>&1)"
+        --branch "$1" ${extra[@]+"${extra[@]}"} "$proj" "$handoff" 2>&1)"
     retry_rc=$?
     retry_rd="$(printf '%s\n' "$retry_out" | sed -n 's/^  run dir:  *//p' | head -1)"
     [[ -n "$retry_rd" ]] && tmpdirs+=("$retry_rd")
@@ -1525,6 +1527,24 @@ if [[ -n "$retry_rd" ]]; then
         "exhausted" "$(cat "$retry_rd/sandbox.log" 2>/dev/null)"
 else
     no "an exhausted-retry, committed pi run produced a run directory" \
+        "rc=$retry_rc: $retry_out"
+fi
+
+# 6. The review legs gate on commits off base, not the exit code: a
+#    retry-exhausted run has zero commits, so the loop still skips with
+#    its work-based detail and records the corrected coding exit -- no
+#    special-casing of the new failure shape.
+RE_STREAM=exhausted RE_COMMIT=0 \
+    retry_run "sandbox-test-pi-retry-loop-skip-$$" 1
+if [[ -n "$retry_rd" && -f "$retry_rd/review-loop.json" ]]; then
+    check "an exhausted, commitless run's review loop skips on work, not exit code" \
+        "skipped" "$(jq -r '.ended' "$retry_rd/review-loop.json" 2>/dev/null)"
+    contains "the skip says there is nothing to review" \
+        "committed nothing" "$(jq -r '.detail' "$retry_rd/review-loop.json" 2>/dev/null)"
+    check "the corrected coding exit is recorded in the loop record" \
+        "1" "$(jq -r '.coding_exit_code' "$retry_rd/review-loop.json" 2>/dev/null)"
+else
+    no "an exhausted, commitless run with a review loop produced its record" \
         "rc=$retry_rc: $retry_out"
 fi
 
