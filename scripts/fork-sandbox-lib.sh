@@ -2164,7 +2164,11 @@ fs_emit_coding_exit_note() {
 # keeps its own author name and email verbatim (just not its own SHA). A
 # merge commit in range has no single "rewritten parent" to chain onto, so
 # rather than guess which side wins, this returns 2 and does nothing --
-# the caller keeps today's plain warning for that case instead.
+# the caller keeps today's plain warning for that case instead. The same
+# skip applies when $base is not even an ancestor of $branch (an amend or
+# reset/rebase that dropped the starting commit from the branch's own
+# history): chaining oldest..branch onto $base would otherwise splice in a
+# parent the branch never actually descended from.
 #
 # The message body is read with cat-file + awk rather than
 # `git log --format=%B`, which appends a trailing newline the raw commit
@@ -2195,7 +2199,7 @@ fs_emit_coding_exit_note() {
 #                  value every commit's author email is compared against.
 fs_normalize_authorship() {
     local repo="$1" branch="$2" base="$3" want_name="$4" want_email="$5"
-    local mismatched merges sha parent tree aname aemail adate msgfile n=0
+    local mismatched merges commits sha parent tree aname aemail adate msgfile n=0
 
     mismatched="$( (cd "$repo" && git log --format='%ae' "$base..$branch") 2>/dev/null \
         | grep -vxF -- "$want_email" )" || true
@@ -2204,6 +2208,17 @@ fs_normalize_authorship() {
     merges="$( (cd "$repo" && git rev-list --min-parents=2 --count "$base..$branch") 2>/dev/null )" \
         || return 1
     [[ "$merges" == "0" ]] || return 2
+    (cd "$repo" && git merge-base --is-ancestor "$base" "$branch") 2>/dev/null || return 2
+
+    # Captured up front, not read straight from the process substitution the
+    # loop used to run against: that discarded a rev-list failure silently,
+    # leaving $parent at $base and the update-ref below free to rewind the
+    # branch to $base -- deleting every commit in range -- while reporting
+    # success. Requiring this to succeed and be non-empty (mismatched above
+    # already proved the range holds at least one commit) means a rev-list
+    # failure returns 1 here instead of reaching update-ref at all.
+    commits="$( (cd "$repo" && git rev-list --reverse "$base..$branch") 2>/dev/null )" || return 1
+    [[ -n "$commits" ]] || return 1
 
     msgfile="$(mktemp)" || return 1
 
@@ -2230,9 +2245,12 @@ fs_normalize_authorship() {
             && GIT_AUTHOR_NAME="$aname" GIT_AUTHOR_EMAIL="$aemail" GIT_AUTHOR_DATE="$adate" \
                git commit-tree "$tree" -p "$parent" -F "$msgfile")" \
             || { rm -f "$msgfile"; return 1; }
-    done < <( (cd "$repo" && git rev-list --reverse "$base..$branch") 2>/dev/null )
+    done <<< "$commits"
 
     rm -f "$msgfile"
+    # Belt-and-suspenders: refuse to move the ref at all unless the loop
+    # above actually advanced $parent past $base, however that could happen.
+    [[ "$parent" != "$base" ]] || return 1
     (cd "$repo" && git update-ref "refs/heads/$branch" "$parent") || return 1
     printf '%s' "$n"
     return 0

@@ -1214,5 +1214,168 @@ else
     no "a review-only run prints no maintainer report" "$out"
 fi
 
+printf '\n== authorship normalization: caller-side glue ==\n'
+
+# fs_normalize_authorship itself is exercised directly, unit-style, by
+# tests/fork-sandbox-authorship-normalize-test.sh. Nothing until now ran the
+# caller side in scripts/fork-sandbox.sh that decides when to call it and
+# renders the result -- the WARNING-to-NOTICE switch, the
+# authorship_normalized/author_email_unexpected fields in summary.json, the
+# authorship_skip_nonlinear line, and the authorship_normalize_failed line --
+# through a real launcher run, so these three scenarios do.
+
+# A single wrong-author commit, successfully normalized.
+authnorm_ok_stub="$(mktemp -d /var/tmp/claude-scratch/fs-authnorm-ok.XXXXXX)"
+tmpdirs+=("$authnorm_ok_stub")
+cat > "$authnorm_ok_stub/claude-sandboxed" <<'STUB'
+#!/usr/bin/env bash
+set -uo pipefail
+prev="" clone_dir=""
+for a in "$@"; do
+    [[ "$a" == "--dangerously-skip-permissions" ]] && clone_dir="$prev"
+    prev="$a"
+done
+cat >/dev/null
+git -c user.email=wrong@fork-sandbox.invalid -c user.name="Wrong Person" \
+    -C "$clone_dir" commit --allow-empty -q -m "authnorm ok test"
+printf '{"type":"result","subtype":"success","total_cost_usd":0.01,"usage":{"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}\n'
+exit 0
+STUB
+chmod +x "$authnorm_ok_stub/claude-sandboxed"
+
+out_ok="$(PATH="$authnorm_ok_stub:$real_stub:$PATH" \
+    FORK_SANDBOX_CONFIG_DIR="$real_cfg" FORK_SANDBOX_BACKEND=fake-image \
+    timeout 60 "$launcher" --foreground --harness claude \
+    --branch "sandbox-test-authnorm-ok-$$" \
+    "$proj" "$handoff" 2>&1)"
+rc_ok=$?
+rd_ok="$(printf '%s\n' "$out_ok" | sed -n 's/^  run dir:  *//p' | head -1)"
+if (( rc_ok == 0 )) && [[ -n "$rd_ok" ]]; then
+    tmpdirs+=("$rd_ok")
+    contains "a normalized run's summary carries the NOTICE, not the WARNING" \
+        "NOTICE: authorship normalized" "$(cat "$rd_ok/summary.txt")"
+    lacks "a normalized run's summary carries no WARNING" \
+        "WARNING: a returned commit" "$(cat "$rd_ok/summary.txt")"
+    check "the rewritten commit carries the origin's own email" \
+        "t@fork-sandbox.invalid" \
+        "$(cd "$proj" && git log -1 --format=%ae "sandbox-test-authnorm-ok-$$")"
+    check "summary.json's authorship_normalized counts the one rewritten commit" \
+        "1" "$(jq -r '.authorship_normalized' "$rd_ok/summary.json")"
+    check "summary.json's author_email_unexpected is empty after a clean rewrite" \
+        "[]" "$(jq -c '.author_email_unexpected' "$rd_ok/summary.json")"
+    contains "the NOTICE warns that pre-rewrite loop-record shas are now stale" \
+        "no longer reachable from the branch" "$(cat "$rd_ok/summary.txt")"
+    contains "the NOTICE warns the persistent clone still carries the bad identity" \
+        "still carries them too, under the regressed identity" \
+        "$(cat "$rd_ok/summary.txt")"
+else
+    no "a wrong-author run produced a run directory" "rc=$rc_ok: $out_ok"
+fi
+
+# A wrong-author commit alongside a merge commit: fs_normalize_authorship
+# refuses to walk a non-linear range (rc 2), so the summary keeps its plain
+# WARNING and names why, rather than switching to a NOTICE it cannot back up.
+authnorm_skip_stub="$(mktemp -d /var/tmp/claude-scratch/fs-authnorm-skip.XXXXXX)"
+tmpdirs+=("$authnorm_skip_stub")
+cat > "$authnorm_skip_stub/claude-sandboxed" <<'STUB'
+#!/usr/bin/env bash
+set -uo pipefail
+prev="" clone_dir=""
+for a in "$@"; do
+    [[ "$a" == "--dangerously-skip-permissions" ]] && clone_dir="$prev"
+    prev="$a"
+done
+cat >/dev/null
+(
+    cd "$clone_dir" || exit 1
+    git checkout -q -b authnorm-side
+    git -c user.email=wrong@fork-sandbox.invalid -c user.name="Wrong Person" \
+        commit --allow-empty -q -m "side change"
+    git checkout -q -
+    git -c user.email=t@fork-sandbox.invalid -c user.name=Tester \
+        merge --no-ff -q -m "merge side" authnorm-side
+)
+printf '{"type":"result","subtype":"success","total_cost_usd":0.01,"usage":{"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}\n'
+exit 0
+STUB
+chmod +x "$authnorm_skip_stub/claude-sandboxed"
+
+out_skip="$(PATH="$authnorm_skip_stub:$real_stub:$PATH" \
+    FORK_SANDBOX_CONFIG_DIR="$real_cfg" FORK_SANDBOX_BACKEND=fake-image \
+    timeout 60 "$launcher" --foreground --harness claude \
+    --branch "sandbox-test-authnorm-skip-$$" \
+    "$proj" "$handoff" 2>&1)"
+rc_skip=$?
+rd_skip="$(printf '%s\n' "$out_skip" | sed -n 's/^  run dir:  *//p' | head -1)"
+if (( rc_skip == 0 )) && [[ -n "$rd_skip" ]]; then
+    tmpdirs+=("$rd_skip")
+    contains "a non-linear range keeps the plain WARNING" \
+        "WARNING: a returned commit" "$(cat "$rd_skip/summary.txt")"
+    contains "a non-linear range's summary says normalization was skipped" \
+        "Normalization was skipped" "$(cat "$rd_skip/summary.txt")"
+    lacks "a non-linear range's summary carries no NOTICE" \
+        "NOTICE: authorship normalized" "$(cat "$rd_skip/summary.txt")"
+    check "summary.json's authorship_normalized stays 0" \
+        "0" "$(jq -r '.authorship_normalized' "$rd_skip/summary.json")"
+else
+    no "a merge-commit run produced a run directory" "rc=$rc_skip: $out_skip"
+fi
+
+# An origin whose identity is half-configured (user.email but no
+# user.name -- fs_make_clone's own seeding tolerates exactly this): the
+# rewrite's commit-tree calls die with "empty ident name" and
+# fs_normalize_authorship returns 1, not 2. This is the caller's rc==1 arm
+# (authorship_normalize_failed) added alongside the guard in
+# fs_normalize_authorship that refuses to move the ref on a failed walk.
+proj_no_name="$(mktemp -d "$HOME/src/fs-maintainer-test-noname.XXXXXX")"
+tmpdirs+=("$proj_no_name")
+(
+    cd "$proj_no_name" \
+        && git init -q . \
+        && git config user.email t@fork-sandbox.invalid \
+        && printf 'hello\n' > file.txt \
+        && git add file.txt \
+        && git -c user.name=Tester commit -q -m init
+) >/dev/null 2>&1
+
+authnorm_fail_stub="$(mktemp -d /var/tmp/claude-scratch/fs-authnorm-fail.XXXXXX)"
+tmpdirs+=("$authnorm_fail_stub")
+cat > "$authnorm_fail_stub/claude-sandboxed" <<'STUB'
+#!/usr/bin/env bash
+set -uo pipefail
+prev="" clone_dir=""
+for a in "$@"; do
+    [[ "$a" == "--dangerously-skip-permissions" ]] && clone_dir="$prev"
+    prev="$a"
+done
+cat >/dev/null
+git -c user.email=wrong@fork-sandbox.invalid -c user.name="Wrong Person" \
+    -C "$clone_dir" commit --allow-empty -q -m "authnorm fail test"
+printf '{"type":"result","subtype":"success","total_cost_usd":0.01,"usage":{"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}\n'
+exit 0
+STUB
+chmod +x "$authnorm_fail_stub/claude-sandboxed"
+
+out_fail="$(PATH="$authnorm_fail_stub:$real_stub:$PATH" \
+    FORK_SANDBOX_CONFIG_DIR="$real_cfg" FORK_SANDBOX_BACKEND=fake-image \
+    timeout 60 "$launcher" --foreground --harness claude \
+    --branch "sandbox-test-authnorm-fail-$$" \
+    "$proj_no_name" "$handoff" 2>&1)"
+rc_fail=$?
+rd_fail="$(printf '%s\n' "$out_fail" | sed -n 's/^  run dir:  *//p' | head -1)"
+if (( rc_fail == 0 )) && [[ -n "$rd_fail" ]]; then
+    tmpdirs+=("$rd_fail")
+    contains "a failed rewrite keeps the plain WARNING" \
+        "WARNING: a returned commit" "$(cat "$rd_fail/summary.txt")"
+    contains "a failed rewrite's summary says normalization failed" \
+        "Normalization was attempted and failed" "$(cat "$rd_fail/summary.txt")"
+    check "the unrewritten commit still carries the wrong email" \
+        "wrong@fork-sandbox.invalid" \
+        "$(cd "$proj_no_name" && git log -1 --format=%ae "sandbox-test-authnorm-fail-$$")"
+else
+    no "a half-configured-identity run produced a run directory" \
+        "rc=$rc_fail: $out_fail"
+fi
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))

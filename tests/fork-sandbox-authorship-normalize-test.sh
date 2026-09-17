@@ -234,5 +234,54 @@ tip="$(cd "$repo" && git rev-parse main)"
 gpgsig_lines="$(cd "$repo" && git cat-file commit "$tip" | grep -c '^gpgsig ')"
 check "the resulting commit carries no gpgsig header" "0" "$gpgsig_lines"
 
+printf '\n== a base that is not an ancestor of the branch ==\n'
+
+repo="$(new_repo)"
+base="$(cd "$repo" && git rev-parse HEAD)"
+(cd "$repo" && git checkout -q --orphan other)
+commit_as "$repo" "$WRONG_NAME" "$WRONG_EMAIL" "orphan change" >/dev/null
+(cd "$repo" && git branch -f main other)
+before="$(cd "$repo" && git rev-parse main)"
+
+out="$(fs_normalize_authorship "$repo" main "$base" "$WANT_NAME" "$WANT_EMAIL")"
+rc=$?
+check "nothing is printed" "" "$out"
+check "the function returns 2 (skipped, base is not an ancestor)" "2" "$rc"
+check "the branch tip is unchanged" "$before" "$(cd "$repo" && git rev-parse main)"
+
+printf '\n== rev-list fails while walking commits ==\n'
+
+repo="$(new_repo)"
+base="$(cd "$repo" && git rev-parse HEAD)"
+commit_as "$repo" "$WRONG_NAME" "$WRONG_EMAIL" "about to be lost" >/dev/null
+before="$(cd "$repo" && git rev-parse main)"
+
+# A git shim that fails only the specific rev-list --reverse call the
+# rewrite loop reads its commit list from, standing in for that call being
+# killed or erroring for any other reason. Before the fix, the loop below
+# it silently saw zero lines, left $parent at $base, and update-ref then
+# pointed the branch at $base -- deleting every commit in range while
+# still printing "0" and returning 0, as if nothing needed rewriting.
+shim_dir="$(mktemp -d)"
+tmpdirs+=("$shim_dir")
+real_git="$(command -v git)"
+cat > "$shim_dir/git" <<SHIM
+#!/usr/bin/env bash
+if [[ "\$1" == "rev-list" ]]; then
+    for a in "\$@"; do
+        [[ "\$a" == "--reverse" ]] && exit 1
+    done
+fi
+exec "$real_git" "\$@"
+SHIM
+chmod +x "$shim_dir/git"
+
+out="$(PATH="$shim_dir:$PATH" fs_normalize_authorship "$repo" main "$base" "$WANT_NAME" "$WANT_EMAIL")"
+rc=$?
+check "nothing is printed" "" "$out"
+check "the function returns 1 (rev-list failed)" "1" "$rc"
+check "the branch tip is unchanged -- no commits were dropped" \
+    "$before" "$(cd "$repo" && git rev-parse main)"
+
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 (( fail == 0 )) || exit 1

@@ -8297,6 +8297,7 @@ author_email_bad=""
 authorship_normalized=0
 authorship_normalized_from=""
 authorship_skip_nonlinear=0
+authorship_normalize_failed=0
 if (( fetched )) && [[ "$n_commits" != "0" ]]; then
     author_email_want="$( (cd "$origin_repo" && git config --get user.email) 2>/dev/null || true )"
     if [[ -n "$author_email_want" ]]; then
@@ -8327,6 +8328,14 @@ if (( fetched )) && [[ "$n_commits" != "0" ]]; then
                 author_email_bad=""
             elif (( authorship_normalize_rc == 2 )); then
                 authorship_skip_nonlinear=1
+            elif (( authorship_normalize_rc != 0 )); then
+                # mktemp, or any of the rev-parse/git log/cat-file/commit-tree/
+                # update-ref calls inside the rewrite, failed. The branch is
+                # left exactly as fetched (fs_normalize_authorship makes no
+                # git writes on this path), but without this flag the summary
+                # below falls through to the plain WARNING with nothing to
+                # say a rewrite was even attempted.
+                authorship_normalize_failed=1
             fi
         fi
     fi
@@ -8486,8 +8495,13 @@ loop_findings() {
         printf 'that seeding regressed. Fix authorship before you integrate: rebase\n'
         printf 'and cherry-pick both keep the author, so it lands as-is otherwise.\n'
         if (( authorship_skip_nonlinear )); then
-            printf 'Normalization was skipped: the range contains a merge commit, and\n'
-            printf 'this rewrite only knows how to walk a single line of history.\n'
+            printf 'Normalization was skipped: the range contains a merge commit, or\n'
+            printf 'does not descend from the run'"'"'s own base commit, and this\n'
+            printf 'rewrite only knows how to walk a single line of history from it.\n'
+        elif (( authorship_normalize_failed )); then
+            printf 'Normalization was attempted and failed -- the branch is\n'
+            printf 'unchanged from what fetch brought in. Check the run log under\n'
+            printf '%s for the git error.\n' "$run_dir"
         fi
     elif (( authorship_normalized > 0 )); then
         printf '\nNOTICE: authorship normalized -- %s commit(s) rewritten from\n' \
@@ -8497,6 +8511,14 @@ loop_findings() {
             "$author_email_want" "$origin_repo"
         printf 'The clone is seeded with the repo user.email, so this means seeding\n'
         printf 'regressed for this run. Keep %s around for diagnosis.\n' "$run_dir"
+        printf 'This rewrite only touched %s in %s; every sha this\n' "$branch" "$origin_repo"
+        printf 'run recorded before now (review-loop.json, maintainer-loop.json\n'
+        printf 'head_before/head_after) still names the pre-rewrite commits, which\n'
+        printf 'are no longer reachable from the branch. The persistent clone at\n'
+        printf '%s still carries them too, under the regressed identity --\n' "$clone_dir"
+        printf 'if that workspace is reused for a later wake, its next branch will\n'
+        printf 'start from those commits and carry the bad authorship forward\n'
+        printf 'unflagged, since the check only ever looks at its own base..branch.\n'
     fi
 } > "$run_dir/summary.txt" 2>&1
 
