@@ -1148,6 +1148,46 @@ contains "review-only prompt still treats an unfollowed addendum as a finding" \
 contains "the spec-flavor review prompt keeps the fix-leg reason" \
     "so the fix leg can carry it out" "$spec_review"
 
+# The hands-off rule, the APPROVED definition and the invented-finding
+# warning all gave a downstream session as their reason in the one flavor
+# that has no downstream session. The rules themselves stay in both
+# flavors -- only the premise changes -- so each case pins both halves:
+# the false premise is gone from the review-only prompt, the rule is not,
+# and the spec flavor still says what it always said.
+case "$review_only_flavor_prompt" in
+    *"Another session applies the fixes"*)
+        no "review-only prompt does not claim another session applies the fixes" ;;
+    *)
+        ok "review-only prompt does not claim another session applies the fixes" ;;
+esac
+contains "review-only prompt keeps the hands-off rule" \
+    "Do not fix anything. Do not edit, stage, commit, amend, rebase or revert." \
+    "$review_only_flavor_prompt"
+contains "review-only prompt gives discarded edits as the hands-off reason" \
+    "thrown away with the sandbox" "$review_only_flavor_prompt"
+case "$review_only_flavor_prompt" in
+    *"another session's time"*)
+        no "review-only prompt does not define APPROVED by another session's time" ;;
+    *)
+        ok "review-only prompt does not define APPROVED by another session's time" ;;
+esac
+contains "review-only prompt defines APPROVED against the operator" \
+    "nothing worth reporting to the operator" "$review_only_flavor_prompt"
+case "$review_only_flavor_prompt" in
+    *"a whole extra session"*)
+        no "review-only prompt does not price an invented finding in sessions" ;;
+    *)
+        ok "review-only prompt does not price an invented finding in sessions" ;;
+esac
+contains "review-only prompt prices an invented finding in operator time" \
+    "costs the operator real" "$review_only_flavor_prompt"
+contains "the spec-flavor review prompt keeps the another-session hands-off reason" \
+    "Another session applies the fixes" "$spec_review"
+contains "the spec-flavor review prompt keeps the another-session APPROVED bar" \
+    "nothing worth another session's time" "$spec_review"
+contains "the spec-flavor review prompt keeps the extra-session finding cost" \
+    "costs a whole extra" "$spec_review"
+
 printf '\n== sandbox-run-log.py: prompt_overlay in the record ==\n'
 
 if [[ -n "$rd2" && -x "$run_log" ]]; then

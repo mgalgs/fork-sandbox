@@ -1721,6 +1721,20 @@ EOF
 # rule (an unfollowed addendum is still a finding) and drops only the claim
 # that something downstream will act on it.
 #
+# Three more clauses carry the same downstream-session premise and are
+# flavored the same way, for the same reason: the hands-off rule ("Do not
+# touch the code"), whose "spec" wording gives "another session applies the
+# fixes" as the reason not to edit; the `APPROVED` definition ("nothing
+# worth another session's time"); and the invented-finding warning ("costs
+# a whole extra session"). In review-only mode no session applies anything,
+# so each of those premises is false. The hands-off rule in particular has
+# to keep working with a true premise -- a reviewer who checks it, finds no
+# downstream session, and concludes it had better fix things itself would
+# edit a clone whose changes are discarded -- so its review-only wording
+# keeps the rule and replaces the reason: the verdict is the run's whole
+# output and edits here are thrown away. The other two are rescaled to what
+# a review-only finding actually costs, the operator's time.
+#
 # $1  branch              the branch under review.
 # $2  base_sha            the commit the branch is compared against; the
 #                         range reviewed is $base_sha...HEAD.
@@ -1737,7 +1751,8 @@ fs_emit_review_prompt_body() {
     local branch="$1" base_sha="$2" review_skill_dir="$3"
     local review_verdict_file="$4" inbox_dir="$5"
     local handoff_file="$6" flavor="${7:-spec}"
-    local review_role_para addendum_para
+    local review_role_para addendum_para hands_off_para approved_clause
+    local invented_para
     if [[ "$flavor" == "review-only" ]]; then
         review_role_para="This branch was not built in this sandbox -- it was built elsewhere,
 against a spec this sandbox never had. You are reviewing it cold, with none
@@ -1767,6 +1782,24 @@ with the addendum quoted, so the fix leg can carry it out. Do not approve a
 branch that leaves an operator instruction unfollowed. You are reporting the
 gap here, not closing it — the next section still applies."
     fi
+    if [[ "$flavor" == "review-only" ]]; then
+        hands_off_para="Do not fix anything. Do not edit, stage, commit, amend, rebase or revert.
+Your verdict is this run's whole output: nothing downstream applies fixes, and
+every change you make in this clone is thrown away with the sandbox. Touching
+the code is not someone else's job here, it is pure waste. Reading, building
+and running the tests is fine — changing tracked files is not."
+        approved_clause="  - \`APPROVED\` means you found nothing worth reporting to the operator. Only"
+        invented_para="Say \`APPROVED\` when you mean it. An invented finding costs the operator real
+time chasing it, and can talk a working branch into a change it did not need."
+    else
+        hands_off_para="Do not fix anything. Do not edit, stage, commit, amend, rebase or revert.
+Another session applies the fixes; a review that quietly repaired what it
+found leaves nobody able to tell the two apart. Reading, building and running
+the tests is fine — changing tracked files is not."
+        approved_clause="  - \`APPROVED\` means you found nothing worth another session's time. Only"
+        invented_para="Say \`APPROVED\` when you mean it. An invented finding costs a whole extra
+session and can talk a working branch into a change it did not need."
+    fi
     cat <<EOF
 
 ---
@@ -1794,10 +1827,7 @@ $addendum_para
 
 ## Do not touch the code
 
-Do not fix anything. Do not edit, stage, commit, amend, rebase or revert.
-Another session applies the fixes; a review that quietly repaired what it
-found leaves nobody able to tell the two apart. Reading, building and running
-the tests is fine — changing tracked files is not.
+$hands_off_para
 
 ## Your verdict is a file
 
@@ -1813,7 +1843,7 @@ Its format is fixed, because a program reads the first line:
   - **The first line is exactly \`APPROVED\` or \`FINDINGS\`**, one word, alone
     on the line, in capitals, with no punctuation, no bullet and no heading
     marker.
-  - \`APPROVED\` means you found nothing worth another session's time. Only
+$approved_clause
     the first line is parsed, so nothing after it changes what happens next
     -- but a person, or the session that launched this run, reads the file
     to decide how far to trust the approval. So after \`APPROVED\`, add a
@@ -1833,8 +1863,7 @@ Its format is fixed, because a program reads the first line:
 Order the findings worst first, and write each as a sentence or two of what is
 wrong and what it breaks, not as a patch.
 
-Say \`APPROVED\` when you mean it. An invented finding costs a whole extra
-session and can talk a working branch into a change it did not need.
+$invented_para
 
 ## Report
 
