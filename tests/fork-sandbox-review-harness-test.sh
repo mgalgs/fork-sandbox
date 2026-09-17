@@ -510,6 +510,21 @@ if [[ "$findings_rc" == 0 && -n "$findings_rd" ]]; then
         "$(cat "$findings_rd/review-prompt-1.md" 2>/dev/null)"
     check "the review-only prompt embeds the handoff exactly once" \
         "1" "$(grep -cF -- 'RH-BRIEF-SENTINEL-6b5e' "$findings_rd/review-prompt-1.md" 2>/dev/null)"
+    findings_review_prompt="$(cat "$findings_rd/review-prompt-1.md" 2>/dev/null)"
+    contains "the review-only prompt carries the review-brief heading" \
+        "## The review brief for this run" "$findings_review_prompt"
+    case "$findings_review_prompt" in
+        *"the spec this branch was built against"*)
+            no "the review-only prompt does not call the handoff the branch's spec" ;;
+        *)
+            ok "the review-only prompt does not call the handoff the branch's spec" ;;
+    esac
+    case "$findings_review_prompt" in
+        *"Work the handoff asked for"*)
+            no "the review-only prompt does not carry the missing-work rule" ;;
+        *)
+            ok "the review-only prompt does not carry the missing-work rule" ;;
+    esac
     if [[ ! -e "$findings_rd/fix-prompt-1.md" ]]; then
         ok "FINDINGS review-only writes no fix prompt"
     else

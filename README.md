@@ -313,7 +313,9 @@ networked maintainer harness warns by name, as `--review-harness` does.
 Use `--review-only --checkout <ref>` to review an existing branch after the
 fact. It runs one review leg and returns no coding or fix changes; use
 `--review-base <ref>` to choose the start of the reviewed range. This also
-supports comparing two reviewers on the same branch.
+supports comparing two reviewers on the same branch. The handoff you pass is
+embedded in the review leg's prompt as the review brief for this run, not as
+the branch's spec — it previously reached no leg at all.
 
 The launcher accepts either `--model sol --harness codex` or the pasteable
 combined form `--harness codex/sol`. It resolves personal aliases from

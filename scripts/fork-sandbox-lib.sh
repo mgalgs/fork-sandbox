@@ -1565,8 +1565,12 @@ EOF
 #                   at launch, so any failure here is a bug that must be
 #                   visible at prompt-build time (before any model runs),
 #                   not a silently missing section.
+# $2  flavor        "spec" (default) or "review-only" -- see
+#                   fs_emit_handoff_spec_section. Only the heading above the
+#                   embedded text changes; the fail-on-missing/empty/
+#                   unreadable checks below are the same in both flavors.
 fs_append_handoff_brief() {
-    local handoff_file="$1"
+    local handoff_file="$1" flavor="${2:-spec}"
     if [[ -z "$handoff_file" ]]; then
         printf 'Error: fs_append_handoff_brief: the handoff path is empty. ' >&2
         printf 'A review, maintainer or fix prompt must embed the handoff the' >&2
@@ -1586,23 +1590,66 @@ fs_append_handoff_brief() {
         printf ' without its section.\n' >&2
         return 1
     fi
-    printf '\n## The handoff this branch was built against\n\n'
+    if [[ "$flavor" == "review-only" ]]; then
+        printf '\n## The review brief\n\n'
+    else
+        printf '\n## The handoff this branch was built against\n\n'
+    fi
     cat -- "$handoff_file"
 }
 
-# The review and maintainer legs' shared section: the handoff is the spec
-# the branch was built against, and the three rules the leg holds it to.
-# The rules sit immediately before the handoff they govern, which
+# The review and maintainer legs' shared section: normally, the handoff is
+# the spec the branch was built against, and the three rules the leg holds
+# it to. The rules sit immediately before the handoff they govern, which
 # fs_append_handoff_brief appends after them. Shared for the same reason as
-# the bodies that call it -- one emitter, two callers, so the two wordings
+# the bodies that call it -- one emitter, multiple callers, so the wordings
 # can never drift. Rule 3 is load-bearing: without it the section swaps one
 # failure for a worse one, a reviewer deferring to the handoff and stopping
 # flagging decided designs that are themselves wrong.
 #
+# The "review-only" flavor is the exception: fork-sandbox.sh --review-only
+# reviews a branch this run did not build, so what the caller passes as
+# "the handoff" is a review brief the operator wrote FOR THIS REVIEW RUN,
+# not the spec the branch was built against -- this sandbox never had that
+# spec. Rules 1 and 2 above assume the handoff IS the branch's spec (a gap
+# against it is a finding); asserted against a review brief instead, they
+# would make the reviewer invent findings out of "the branch does not
+# contain what the brief asked for", which is true of every review-only
+# branch by construction. So that flavor drops rules 1 and 2 and keeps only
+# the rule that survives being pointed at a brief instead of a spec: the
+# text handed to the reviewer can itself be wrong, and saying so is a
+# finding.
+#
 # $1  handoff_file  see fs_append_handoff_brief.
+# $2  flavor        "spec" (default) or "review-only", see above. Only the
+#                   local --review-only render site passes "review-only";
+#                   every other caller must keep rendering byte-identical
+#                   to the "spec" flavor.
 fs_emit_handoff_spec_section() {
-    local handoff_file="$1"
-    cat <<'EOF'
+    local handoff_file="$1" flavor="${2:-spec}"
+    if [[ "$flavor" == "review-only" ]]; then
+        cat <<'EOF'
+
+---
+
+## The review brief for this run
+
+The text appended below is the brief the operator wrote for this review run
+specifically. This branch was not built in this sandbox -- it was built
+elsewhere, against a spec this sandbox never had. So the brief is not a spec
+to diff the branch against: it steers where to look and what to weigh, not
+what the branch is required to contain. Work the brief mentions that the
+branch's commits do not contain is not a finding -- the brief did not
+commission this branch, so its absence proves nothing.
+
+The brief can still be wrong: a request that will not work, a premise the
+branch's own code contradicts, an emphasis that misses the real risk. If you
+believe it is, say so and say why — that IS a finding, and it is the most
+valuable one you can report. Never withhold it because the brief sounds
+decided.
+EOF
+    else
+        cat <<'EOF'
 
 ---
 
@@ -1634,7 +1681,8 @@ Read it before you read the diff, and hold it to three rules.
    matches the spec; this one asks whether the spec is sound. Never
    withhold it because the handoff sounds decided.
 EOF
-    fs_append_handoff_brief "$handoff_file"
+    fi
+    fs_append_handoff_brief "$handoff_file" "$flavor"
 }
 
 # The review leg's task text, for fork-sandbox.sh's --review-loop: read the
@@ -1649,7 +1697,11 @@ EOF
 # The body ends with the handoff section (fs_emit_handoff_spec_section):
 # without it the reviewer can never tell a deliberate omission from an
 # oversight, because the only document that says what was asked for is the
-# brief the implementing session got.
+# brief the implementing session got. That is true of the default "spec"
+# flavor; the caller passes "review-only" instead when $handoff_file is not
+# the branch's spec but a review brief written for this run (see
+# fs_emit_handoff_spec_section) -- fork-sandbox.sh's --review-only render
+# site is the only caller that ever does.
 #
 # $1  branch              the branch under review.
 # $2  base_sha            the commit the branch is compared against; the
@@ -1661,10 +1713,12 @@ EOF
 #                         addendum-sourced finding can cite it.
 # $6  handoff_file        the caller's original handoff, embedded at the end
 #                         of the body; see fs_append_handoff_brief.
+# $7  flavor              "spec" (default) or "review-only", forwarded to
+#                         fs_emit_handoff_spec_section verbatim.
 fs_emit_review_prompt_body() {
     local branch="$1" base_sha="$2" review_skill_dir="$3"
     local review_verdict_file="$4" inbox_dir="$5"
-    local handoff_file="$6"
+    local handoff_file="$6" flavor="${7:-spec}"
     cat <<EOF
 
 ---
@@ -1755,7 +1809,7 @@ author's message. The orchestrator reads this report instead of the author's
 own account. Keep the \`Checked:\` paragraph where it is, in the verdict body,
 before this heading.
 EOF
-    fs_emit_handoff_spec_section "$handoff_file"
+    fs_emit_handoff_spec_section "$handoff_file" "$flavor"
 }
 
 # inner_review is "yes" when a --review-loop ran before this one and "no"

@@ -843,6 +843,10 @@ EXPECTED
     rendered_review_prompt="$(cat "$rd4/review-prompt.md" 2>/dev/null)"
     check "review prompt renders byte-for-byte" \
         "$expected_review" "$rendered_review_prompt"
+    contains "review prompt still carries the built-against rule" \
+        "the spec this branch was built against" "$rendered_review_prompt"
+    contains "review prompt still carries the missing-work-is-a-bug rule" \
+        "Work the handoff asked for" "$rendered_review_prompt"
     contains "rendered review contract makes the report optional" \
         "you may add a \`## Report\` heading" "$rendered_review_prompt"
     if [[ "$rendered_review_prompt" == *"add exactly one \`## Report\` heading"* ]]; then
@@ -1090,6 +1094,39 @@ if [[ "$(id -u)" != "0" ]]; then
     fi
 else
     printf '  SKIP  unreadable-handoff case (running as root; chmod 000 stays readable)\n'
+fi
+
+printf '\n== review-only prompt: review brief flavor ==\n'
+
+review_only_flavor_prompt="$(fs_emit_review_prompt_body br base /skill \
+    /verdict /inbox "$handoff_spec" review-only)"
+contains "review-only prompt carries the review-brief heading" \
+    "## The review brief for this run" "$review_only_flavor_prompt"
+check "review-only prompt embeds the brief exactly once" \
+    "1" "$(printf '%s\n' "$review_only_flavor_prompt" \
+        | grep -cF -- 'SENTINEL-BRIEF-REVIEW-3f8a')"
+case "$review_only_flavor_prompt" in
+    *"Work the handoff asked for"*)
+        no "review-only prompt does not carry the missing-work rule" ;;
+    *)
+        ok "review-only prompt does not carry the missing-work rule" ;;
+esac
+case "$review_only_flavor_prompt" in
+    *"the spec this branch was built against"*)
+        no "review-only prompt does not call the brief the branch's spec" ;;
+    *)
+        ok "review-only prompt does not call the brief the branch's spec" ;;
+esac
+contains "review-only prompt keeps the brief-can-be-wrong rule" \
+    "The brief can still be wrong" "$review_only_flavor_prompt"
+
+if fs_emit_review_prompt_body br base /skill /verdict /inbox \
+    "$spec_missing" review-only > /dev/null 2> "$spec_err"; then
+    no "a missing handoff file fails the review-only prompt build" "exited 0"
+else
+    ok "a missing handoff file fails the review-only prompt build"
+    contains "the review-only failure names the handoff file" \
+        "$spec_missing" "$(cat "$spec_err")"
 fi
 
 printf '\n== sandbox-run-log.py: prompt_overlay in the record ==\n'

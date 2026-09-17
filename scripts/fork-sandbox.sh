@@ -5024,13 +5024,25 @@ if (( review_loop_cap > 0 )); then
     review_verdict_file="$clone_dir/.git/review-verdict.md"
     fs_reject_unsafe_chars "$review_prompt" "$review_verdict_file" \
         "$review_skill_dir"
+    # --review-only is the one mode where $handoff_file is not the branch's
+    # spec: the branch was built elsewhere, against a spec this sandbox
+    # never had, and what was passed in instead is a review brief written
+    # for this run. fs_emit_review_prompt_body's default "spec" flavor
+    # would tell the reviewer to treat that brief as the spec and report
+    # its own "what to look at" language as missing work -- see
+    # fs_emit_handoff_spec_section. No other render site here ever runs in
+    # review-only mode (the k8s path refuses --review-only, and maintainer
+    # and fix legs never run in it), so this is the only flavor switch.
+    review_prompt_flavor=spec
+    [[ "$review_only" == true ]] && review_prompt_flavor=review-only
     {
         fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" \
             "$review_preamble_harness" "$review_preamble_network" "$outbox_dir" \
             "" "$outbox_max_bytes"
         fs_emit_prompt_overlay review
         fs_emit_review_prompt_body "$branch" "$base_sha" "$review_skill_dir" \
-            "$review_verdict_file" "$inbox_dir" "$handoff_file"
+            "$review_verdict_file" "$inbox_dir" "$handoff_file" \
+            "$review_prompt_flavor"
     } > "$review_prompt.part"
     mv -- "$review_prompt.part" "$review_prompt"
 fi
