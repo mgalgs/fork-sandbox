@@ -1566,28 +1566,38 @@ EOF
 #                   visible at prompt-build time (before any model runs),
 #                   not a silently missing section.
 # $2  flavor        "spec" (default) or "review-only" -- see
-#                   fs_emit_handoff_spec_section. Only the heading above the
-#                   embedded text changes; the fail-on-missing/empty/
-#                   unreadable checks below are the same in both flavors.
+#                   fs_emit_handoff_spec_section. The heading above the
+#                   embedded text and the wording of the fail-on-missing/
+#                   empty/unreadable checks below both change with it: the
+#                   review-only file is a review brief, not the branch's
+#                   spec, and the failure text should not call it one.
 fs_append_handoff_brief() {
     local handoff_file="$1" flavor="${2:-spec}"
+    local doc_desc build_desc
+    if [[ "$flavor" == "review-only" ]]; then
+        doc_desc="review brief"
+        build_desc="the review brief for this run"
+    else
+        doc_desc="handoff"
+        build_desc="the handoff the branch was built against"
+    fi
     if [[ -z "$handoff_file" ]]; then
         printf 'Error: fs_append_handoff_brief: the handoff path is empty. ' >&2
-        printf 'A review, maintainer or fix prompt must embed the handoff the' >&2
-        printf ' branch was built against, and there is none to name.\n' >&2
+        printf 'A review, maintainer or fix prompt must embed %s,' "$build_desc" >&2
+        printf ' and there is none to name.\n' >&2
         return 1
     fi
     if [[ ! -f "$handoff_file" || ! -r "$handoff_file" ]]; then
-        printf 'Error: handoff file %q is missing or unreadable at' "$handoff_file" >&2
-        printf ' prompt-build time. The branch spec cannot be embedded into' >&2
+        printf 'Error: %s file %q is missing or unreadable at' "$doc_desc" "$handoff_file" >&2
+        printf ' prompt-build time. The %s cannot be embedded into' "$build_desc" >&2
         printf ' the prompt, so the prompt is not built rather than built' >&2
         printf ' without it.\n' >&2
         return 1
     fi
     if [[ ! -s "$handoff_file" ]]; then
-        printf 'Error: handoff file %q is empty at prompt-build time. An empty' "$handoff_file" >&2
-        printf ' spec is not a spec; the prompt is not built rather than built' >&2
-        printf ' without its section.\n' >&2
+        printf 'Error: %s file %q is empty at prompt-build time. An empty' "$doc_desc" "$handoff_file" >&2
+        printf ' %s is not usable; the prompt is not built rather than' "$doc_desc" >&2
+        printf ' built without its section.\n' >&2
         return 1
     fi
     if [[ "$flavor" == "review-only" ]]; then
@@ -1703,6 +1713,14 @@ EOF
 # fs_emit_handoff_spec_section) -- fork-sandbox.sh's --review-only render
 # site is the only caller that ever does.
 #
+# The "An unfollowed addendum is a finding" section is flavor-aware for the
+# same reason: its "spec" wording tells the reviewer to report the gap "so
+# the fix leg can carry it out", which is false in review-only mode -- a
+# FINDINGS verdict there ends the run with no fix leg ever built (see
+# fork-sandbox.sh's review-only loop). The review-only wording keeps the
+# rule (an unfollowed addendum is still a finding) and drops only the claim
+# that something downstream will act on it.
+#
 # $1  branch              the branch under review.
 # $2  base_sha            the commit the branch is compared against; the
 #                         range reviewed is $base_sha...HEAD.
@@ -1719,7 +1737,7 @@ fs_emit_review_prompt_body() {
     local branch="$1" base_sha="$2" review_skill_dir="$3"
     local review_verdict_file="$4" inbox_dir="$5"
     local handoff_file="$6" flavor="${7:-spec}"
-    local review_role_para
+    local review_role_para addendum_para
     if [[ "$flavor" == "review-only" ]]; then
         review_role_para="This branch was not built in this sandbox -- it was built elsewhere,
 against a spec this sandbox never had. You are reviewing it cold, with none
@@ -1730,6 +1748,24 @@ result. Read what it committed and say what is wrong with it."
 \`$branch\`. You are a different session, with none of its reasoning and none
 of its attachment to the result. Read what it committed and say what is wrong
 with it."
+    fi
+    if [[ "$flavor" == "review-only" ]]; then
+        addendum_para="You read the operator inbox as part of every session; this leg is where that
+reading has to show up in the verdict. If an addendum asks for work that the
+commits under review do not contain, that is a finding. Report it as one,
+with the addendum quoted. A --review-only run has no fix leg -- a FINDINGS
+verdict ends the run outright -- so reporting the gap is all this leg can do
+about it; do not withhold it on the assumption something downstream will act
+on it instead. Do not approve a branch that leaves an operator instruction
+unfollowed. You are reporting the gap here, not closing it — the next
+section still applies."
+    else
+        addendum_para="You read the operator inbox as part of every session; this leg is where that
+reading has to show up in the verdict. If an addendum asks for work that the
+commits under review do not contain, that is a finding. Report it as one,
+with the addendum quoted, so the fix leg can carry it out. Do not approve a
+branch that leaves an operator instruction unfollowed. You are reporting the
+gap here, not closing it — the next section still applies."
     fi
     cat <<EOF
 
@@ -1754,12 +1790,7 @@ range above. Use the range exactly as written — three dots, base first.
 
 ## An unfollowed addendum is a finding
 
-You read the operator inbox as part of every session; this leg is where that
-reading has to show up in the verdict. If an addendum asks for work that the
-commits under review do not contain, that is a finding. Report it as one,
-with the addendum quoted, so the fix leg can carry it out. Do not approve a
-branch that leaves an operator instruction unfollowed. You are reporting the
-gap here, not closing it — the next section still applies.
+$addendum_para
 
 ## Do not touch the code
 

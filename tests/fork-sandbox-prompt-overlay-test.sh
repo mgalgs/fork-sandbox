@@ -1127,7 +1127,26 @@ else
     ok "a missing handoff file fails the review-only prompt build"
     contains "the review-only failure names the handoff file" \
         "$spec_missing" "$(cat "$spec_err")"
+    case "$(cat "$spec_err")" in
+        *"branch spec"*)
+            no "the review-only failure does not call the file a branch spec" ;;
+        *)
+            ok "the review-only failure does not call the file a branch spec" ;;
+    esac
+    contains "the review-only failure calls the file a review brief" \
+        "review brief" "$(cat "$spec_err")"
 fi
+
+case "$review_only_flavor_prompt" in
+    *"so the fix leg can carry it out"*)
+        no "review-only prompt does not claim a fix leg will act on an addendum" ;;
+    *)
+        ok "review-only prompt does not claim a fix leg will act on an addendum" ;;
+esac
+contains "review-only prompt still treats an unfollowed addendum as a finding" \
+    "that is a finding" "$review_only_flavor_prompt"
+contains "the spec-flavor review prompt keeps the fix-leg reason" \
+    "so the fix leg can carry it out" "$spec_review"
 
 printf '\n== sandbox-run-log.py: prompt_overlay in the record ==\n'
 
