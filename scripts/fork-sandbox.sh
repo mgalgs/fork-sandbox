@@ -6915,8 +6915,8 @@ fi
 #
 # It sits here on purpose: everything above is the implement leg's accounting
 # and, when --refresh-at ran any continuations, the refresh loop's -- including
-# the pi stopReason check, which is the only failure detection a pi run has. A
-# coding leg that died of a model error must never be reviewed as if it had
+# the pi stopReason and retry-exhaustion checks, the only failure detection a
+# pi run has. A coding leg that died of a model error must never be reviewed as if it had
 # worked, so the loop runs downstream of the checks that catch it, and $rc by
 # now names the LAST coding leg's exit, not necessarily the implement leg's.
 #
@@ -7063,6 +7063,7 @@ run_leg() {
     local leg_events="$run_dir/events-$kind-$n.jsonl"
     [[ "$mode" == "review-only" ]] && leg_events="$run_dir/events.jsonl"
     local leg_session="" leg_session_copy="" idx
+    local leg_retry_error="" leg_head_before="" leg_head_after="" leg_failed_retry=""
     local -a cmd=("${sandbox_cmd[@]}")
     # A review leg's own harness (--review-harness, when given -- the
     # "rev_*" values, which fall back to the implement ones otherwise, see
@@ -7144,6 +7145,17 @@ run_leg() {
         done
     fi
 
+    # The branch head as of just before the leg, for the retry-exhaustion
+    # check in this leg's accounting: for a fix or mntfix leg, "the leg
+    # committed nothing" is the head not moving (a code pass measures
+    # against base instead, the way the implement leg's check does, and a
+    # review or maintainer leg is never checked -- see that check). It is
+    # read before the leg runs, and the one way anything here may read the
+    # head (clone_branch_head).
+    if [[ "$kind" == "fix" || "$kind" == "mntfix" ]]; then
+        leg_head_before="$(clone_branch_head)"
+    fi
+
     printf '\n== fork-sandbox: %s leg, iteration %s ==\n' "$kind" "$n"
     # The prompt is a FILE on stdin, never an argument -- see the implement
     # leg's redirect for why (MAX_ARG_STRLEN), and note that the fix prompt
@@ -7163,9 +7175,9 @@ run_leg() {
     next_leg_no=$(( next_leg_no + 1 ))
 
     # The same three readers the implement leg's accounting uses, applied per
-    # leg. Deliberately a copy of those walks rather than a refactor of them:
-    # that block is the only failure detection a pi run has, and it is not
-    # worth disturbing to save thirty lines here.
+    # leg, plus the same two failure checks (stopReason and retry
+    # exhaustion). Deliberately a copy of those walks rather than a refactor
+    # of them: they are not worth disturbing to save thirty lines here.
     if [[ -n "$leg_session" && -d "$leg_session" ]]; then
         leg_session_copy="$run_dir/pi-session-$kind-$n"
         # Take any earlier copy out first: cp -a onto an existing directory
@@ -7181,6 +7193,19 @@ run_leg() {
                       | select(.stopReason == "error")
                       | .errorMessage // "the model reported an error"' \
                  2>/dev/null || true)"
+        # The exhaustion shape the implement leg's accounting checks (see
+        # pi_retry_error there): the LAST auto_retry_end in this leg's own
+        # stream is a failure; a later success=true is a recovered retry
+        # and stands instead, the same LAST-is-truth rule. The
+        # committed-nothing half of the test needs the head read after the
+        # leg ran, so it comes at the end of the accounting, beside the
+        # stopReason result.
+        leg_retry_error="$(jq -rs \
+            '[.[] | select(.type == "auto_retry_end")]
+             | last // empty
+             | select(.success == false)
+             | .finalError // "the model reported an error"' \
+            "$leg_events" 2>/dev/null || true)"
         leg_cost="$(find "$leg_session_copy" -name '*.jsonl' -exec cat {} + 2>/dev/null \
             | jq -s '[.. | objects | select(has("usage")) | .usage.cost.total? // empty]
                      | add
@@ -7230,6 +7255,43 @@ run_leg() {
         leg_rc=1
         printf 'fork-sandbox: the %s leg of iteration %s ended in a model error: %s\n' \
             "$kind" "$n" "$leg_error" >> "$sandbox_log"
+    fi
+    # The second half of the exhaustion check, for the leg kinds that can
+    # leave work behind: a leg that ran out of retries and still committed
+    # is a success, exactly as the implement leg's own check says of a run.
+    # A code pass measures against base (the branch holds nothing off base);
+    # a fix or mntfix leg against its own start (the head did not move); an
+    # unreadable head is treated as holding nothing, the same rule. A review
+    # or maintainer leg is not checked this way: it commits nothing by
+    # design, and one that ran out of retries left no verdict, which the
+    # loop already ends over as a harness error.
+    if [[ -z "$leg_error" && -n "$leg_retry_error" ]]; then
+        case "$kind" in
+        code)
+            leg_head_after="$(clone_branch_head)"
+            if [[ -z "$leg_head_after" || "$leg_head_after" == "$base_sha" ]]; then
+                leg_failed_retry=1
+            fi
+            ;;
+        fix|mntfix)
+            leg_head_after="$(clone_branch_head)"
+            if [[ -z "$leg_head_before" || -z "$leg_head_after" \
+                || "$leg_head_after" == "$leg_head_before" ]]; then
+                leg_failed_retry=1
+            fi
+            ;;
+        esac
+        if [[ -n "$leg_failed_retry" ]]; then
+            leg_error="pi exhausted its automatic retries and committed nothing: $leg_retry_error"
+            # The model-error line above, not a new code: the leg failed,
+            # and how it failed is the reason, not the number; and the same
+            # never-overwrite-a-nonzero-rc guard.
+            if [[ "$leg_rc" == "0" ]]; then
+                leg_rc=1
+            fi
+            printf 'fork-sandbox: the %s leg of iteration %s exhausted its automatic retries and committed nothing: %s\n' \
+                "$kind" "$n" "$leg_retry_error" >> "$sandbox_log"
+        fi
     fi
     # The run's total cost is the implement leg plus every loop leg, and a sum
     # is only honest when every part is known. One leg the harness priced

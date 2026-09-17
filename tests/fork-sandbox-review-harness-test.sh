@@ -1528,5 +1528,121 @@ else
         "rc=$retry_rc: $retry_out"
 fi
 
+printf '\n== a pi fix leg that exhausts its retries and commits nothing ==\n'
+
+# The census sibling of the implement-leg check: run_leg\'s accounting reads
+# the same session stream with the same last-stopReason check, and the same
+# exhaustion shape was invisible to it. A fix leg that ran out of retries
+# and committed nothing used to read as a clean exit-0 leg that made no
+# progress; it now reads as a failed leg (leg_rc 1), which the loop records
+# as a harness error with the reason. A fix leg that exhausted retries but
+# still committed is a success, the same condition-2 rule as the implement
+# leg\'s check. The loop\'s failure does not rewrite the RUN\'s exit code,
+# which stays the coding leg\'s -- the existing harness-error semantics --
+# so the observable is the loop record, not the run\'s rc.
+fixex_stub="$(mktemp -d /var/tmp/claude-scratch/fs-review-fix-exhausted.XXXXXX)"
+tmpdirs+=("$fixex_stub")
+cat > "$fixex_stub/claude-sandboxed" <<'STUB'
+#!/usr/bin/env bash
+set -uo pipefail
+is_pi_leg=0
+session_dir=""
+prev=""
+for a in "$@"; do
+    [[ "$a" == "--exec" ]] && is_pi_leg=1
+    [[ "$prev" == "--session-dir" ]] && session_dir="$a"
+    prev="$a"
+done
+clone_dir=""
+for a in "$@"; do
+    [[ -d "$a/.git" ]] && clone_dir="$a"
+done
+cat >/dev/null
+n=0
+[[ -f "$FAKE_COUNT_FILE" ]] && n="$(cat "$FAKE_COUNT_FILE")"
+n=$(( n + 1 ))
+printf '%s' "$n" > "$FAKE_COUNT_FILE"
+case "$n" in
+1)
+    # implement leg (pi): commit the work under review
+    git -c user.email=t@fork-sandbox.invalid -c user.name=Tester \
+        -C "$clone_dir" commit --allow-empty -q -m "fix-exhaust implement"
+    ;;
+2|4)
+    # review legs (claude): findings first, then approval of the fix
+    if (( n == 2 )); then
+        printf 'FINDINGS\n\nfile.txt:1 not quite right\n\n## Report\nThe review found one issue.\n' \
+            > "$clone_dir/.git/review-verdict.md"
+    else
+        printf 'APPROVED\n\nChecked: the fix.\n\n## Report\nThe branch is sound.\n' \
+            > "$clone_dir/.git/review-verdict.md"
+    fi
+    printf '{"type":"result","subtype":"success","total_cost_usd":0.01,"usage":{"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}\n'
+    ;;
+3)
+    # fix leg (pi): exhausted retries, no commit unless FIX_COMMIT=1
+    if [[ "${FIX_COMMIT:-0}" == "1" ]]; then
+        git -c user.email=t@fork-sandbox.invalid -c user.name=Tester \
+            -C "$clone_dir" commit --allow-empty -q -m "fix-exhaust fix"
+    fi
+    printf '{"type":"auto_retry_end","success":false,"attempt":3,"finalError":"529 overloaded_error: Overloaded"}\n'
+    ;;
+esac
+if (( is_pi_leg )); then
+    mkdir -p "$session_dir"
+    printf '{"role":"assistant","stopReason":"stop","usage":{"input":100,"output":10,"cacheRead":0,"cacheWrite":0,"totalTokens":110,"cost":{"total":0.001}}}\n' \
+        > "$session_dir/session.jsonl"
+fi
+exit 0
+STUB
+chmod +x "$fixex_stub/claude-sandboxed"
+
+fixex_run() {  # $1 branch; sets fixex_rc / fixex_rd / fixex_out
+    fixex_out="$(FIX_COMMIT="${FIX_COMMIT:-0}" \
+        PATH="$fixex_stub:$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$retry_cfg" \
+        FORK_SANDBOX_BACKEND=fake-image FAKE_COUNT_FILE="$1" \
+        timeout 60 "$launcher" --foreground --harness pi/some-model \
+        --review-loop 2 --review-harness claude \
+        --branch "$2" "$proj" "$handoff" 2>&1)"
+    fixex_rc=$?
+    fixex_rd="$(printf '%s\n' "$fixex_out" | sed -n 's/^  run dir:  *//p' | head -1)"
+    [[ -n "$fixex_rd" ]] && tmpdirs+=("$fixex_rd")
+}
+
+fixex_countA="$(mktemp)"; tmpdirs+=("$fixex_countA")
+fixex_run "$fixex_countA" "sandbox-test-fix-exhausted-$$"
+if [[ -n "$fixex_rd" ]]; then
+    check "an exhausted, commitless fix leg fails the loop as a harness error" \
+        "harness-error" "$(jq -r '.ended' "$fixex_rd/review-loop.json" 2>/dev/null)"
+    check "the fix leg's exit in the loop record is 1, not the process's 0" \
+        "1" "$(jq -r '.iterations[0].fix_exit' "$fixex_rd/review-loop.json" 2>/dev/null)"
+    contains "the loop's detail names the retry exhaustion" \
+        "exhausted its automatic retries" \
+        "$(jq -r '.detail' "$fixex_rd/review-loop.json" 2>/dev/null)"
+    contains "the sandbox log names it too" \
+        "the fix leg of iteration 1 exhausted its automatic retries" \
+        "$(cat "$fixex_rd/sandbox.log" 2>/dev/null)"
+    check "the run's own exit code stays the coding leg's (the existing harness-error rule)" \
+        "0" "$fixex_rc"
+else
+    no "an exhausted fix leg produced a run directory" \
+        "rc=$fixex_rc: $fixex_out"
+fi
+
+fixex_countB="$(mktemp)"; tmpdirs+=("$fixex_countB")
+FIX_COMMIT=1 fixex_run "$fixex_countB" "sandbox-test-fix-recovered-$$"
+if [[ -n "$fixex_rd" ]]; then
+    check "an exhausted fix leg that committed work still gets reviewed and approved" \
+        "approved" "$(jq -r '.ended' "$fixex_rd/review-loop.json" 2>/dev/null)"
+    check "the committing fix leg's exit in the loop record stays 0" \
+        "0" "$(jq -r '.iterations[0].fix_exit' "$fixex_rd/review-loop.json" 2>/dev/null)"
+    check "the run exits 0" "0" "$fixex_rc"
+    lacks "a committing fix leg is not reported as exhaustion" \
+        "exhausted" "$(cat "$fixex_rd/sandbox.log" 2>/dev/null)"
+else
+    no "a committing, exhausted fix leg produced a run directory" \
+        "rc=$fixex_rc: $fixex_out"
+fi
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))
