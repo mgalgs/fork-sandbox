@@ -4603,7 +4603,6 @@ else
         run_step_idx[run_step_k]=""
         # shellcheck disable=SC2034
         run_step_cap[run_step_k]="$maintainer_loop_cap"
-        # shellcheck disable=SC2034
         run_step_prompt[run_step_k]=""
         run_step_k=$(( run_step_k + 1 ))
     fi
@@ -5648,6 +5647,94 @@ if (( maintainer_loop_cap > 0 )); then
             "$handoff_file"
     } > "$maintainer_prompt.part"
     mv -- "$maintainer_prompt.part" "$maintainer_prompt"
+fi
+
+# run_step_prompt (declared empty at the run_step_* compile point above,
+# before any prompt file existed yet) is filled in now that every prompt
+# file this launcher builds actually exists. A code step's prompt is never
+# a file the launcher writes -- it is the handoff itself, rebuilt by the
+# runner for each pass (see run_leg's "code" caller, which reads
+# "$handoff" directly) -- so it stays "" for both shapes here, same as the
+# compile point left it.
+#
+# Legacy steps just point at the fixed-tier files already built above:
+# $review_prompt and $maintainer_prompt were sized and named for exactly
+# one review/maintainer leg each, the same leg run_step_kind's "review"/
+# "maintainer" entry describes for a legacy-shaped run, so this is a
+# pointer copy, not a rebuild.
+#
+# A composed step gets a prompt file of its own instead of reusing those:
+# $review_prompt/$maintainer_prompt are sized for the ONE fixed-tier leg a
+# legacy run has of each kind, built against that leg's own preamble
+# harness/network -- a composed pipeline can seat more than one review or
+# maintain step, each on its own harness, so every step needs its own
+# build-then-rename file, following the same discipline as the block
+# above. Nothing reads run_step_prompt yet -- see the compile point's own
+# comment -- so this stays additive.
+if [[ "$preset_is_legacy_shaped" == true ]]; then
+    for ((rsp_k = 1; rsp_k <= run_step_count; rsp_k++)); do
+        case "${run_step_kind[rsp_k]}" in
+            review) run_step_prompt[rsp_k]="$review_prompt" ;;
+            maintainer) run_step_prompt[rsp_k]="$maintainer_prompt" ;;
+        esac
+    done
+else
+    for ((preset_k = 1; preset_k <= preset_step_count; preset_k++)); do
+        preset_k_agent="${preset_step_agent[$preset_k]}"
+        preset_k_preamble_harness="${preset_agent_harness[$preset_k_agent]}"
+        preset_k_preamble_network=""
+        [[ "${preset_agent_network[$preset_k_agent]}" == "sealed" ]] \
+            && preset_k_preamble_network=sealed
+        case "${preset_step_action[$preset_k]}" in
+            review)
+                step_k_prompt="$run_dir/step-${preset_k}-prompt.md"
+                step_k_verdict_file="$clone_dir/.git/s${preset_k}-verdict.md"
+                fs_reject_unsafe_chars "$step_k_prompt" "$step_k_verdict_file"
+                {
+                    fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" \
+                        "$preset_k_preamble_harness" "$preset_k_preamble_network" \
+                        "$outbox_dir" "" "$outbox_max_bytes"
+                    fs_emit_prompt_overlay review
+                    fs_emit_review_prompt_body "$branch" "$base_sha" \
+                        "$review_skill_dir" "$step_k_verdict_file" "$inbox_dir" \
+                        "$handoff_file" spec
+                } > "$step_k_prompt.part"
+                mv -- "$step_k_prompt.part" "$step_k_prompt"
+                run_step_prompt[preset_k]="$step_k_prompt"
+                ;;
+            maintain)
+                step_k_prompt="$run_dir/step-${preset_k}-prompt.md"
+                step_k_verdict_file="$clone_dir/.git/s${preset_k}-verdict.md"
+                fs_reject_unsafe_chars "$step_k_prompt" "$step_k_verdict_file"
+                # "yes" when an earlier step in THIS pipeline is a review
+                # step -- the composed equivalent of the legacy site's
+                # "review_loop_cap > 0" check, since a composed pipeline's
+                # order is not fixed the way the legacy tiers are.
+                step_k_inner_review=no
+                for ((preset_j = 1; preset_j < preset_k; preset_j++)); do
+                    if [[ "${preset_step_action[$preset_j]}" == review ]]; then
+                        step_k_inner_review=yes
+                        break
+                    fi
+                done
+                {
+                    fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" \
+                        "$preset_k_preamble_harness" "$preset_k_preamble_network" \
+                        "$outbox_dir" "" "$outbox_max_bytes"
+                    fs_emit_prompt_overlay maintainer
+                    fs_emit_maintainer_prompt_body "$branch" "$base_sha" \
+                        "$step_k_verdict_file" "$inbox_dir" "$step_k_inner_review" \
+                        "$handoff_file"
+                } > "$step_k_prompt.part"
+                mv -- "$step_k_prompt.part" "$step_k_prompt"
+                # shellcheck disable=SC2034  # unused-for-now, see the
+                # run_step_* compile point's own comment above -- this is
+                # the array's last textual write in the file, so the
+                # disable comment lives here, not there.
+                run_step_prompt[preset_k]="$step_k_prompt"
+                ;;
+        esac
+    done
 fi
 
 # --refresh-at's continuation prompt: just the preamble, built once here for
