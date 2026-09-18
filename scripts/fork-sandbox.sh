@@ -4461,6 +4461,80 @@ if [[ "$preset_is_legacy_shaped" != true ]]; then
     done
 fi
 
+# The single spine the run engine will eventually walk instead of the two
+# fixed loop drivers below: one set of parallel arrays, 1-indexed by
+# pipeline step, populated from EITHER the composed preset's own step list
+# (preset_step_*, parsed above) OR the legacy-translated scalars
+# (code_repeat/review_loop_cap/maintainer_loop_cap, final as of the
+# review-only fold-in near the top of this file) -- never both for the same
+# run. run_step_kind speaks run_leg's own kind vocabulary directly
+# ("maintainer", not the parser's "maintain") so a future caller never
+# juggles two names for the same step. run_step_idx is the empty string for
+# a legacy-translated step (today's fixed-name resolution, byte-identical)
+# or "s<K>" for a composed step (the seat-resolution loop just above).
+# run_step_cap is the loop cap for review/maintainer or the repeat count for
+# code. run_step_prompt is left empty here -- it names a prompt file that
+# does not exist yet at this point in the launcher; whichever step builds
+# per-step prompt files fills it in once they do. Nothing reads any of this
+# yet -- the run engine that walks it is a later step of this same effort --
+# so shellcheck sees every element write below as dead and is right to, for
+# now -- shellcheck only reports each variable's LAST write in the script as
+# unused, so the disable comments below sit at those final assignments, not
+# at the declarations.
+run_step_count=0
+declare -a run_step_kind=()
+declare -a run_step_idx=()
+declare -a run_step_cap=()
+declare -a run_step_prompt=()
+if [[ "$preset_is_legacy_shaped" != true ]]; then
+    run_step_count="$preset_step_count"
+    for ((preset_k = 1; preset_k <= preset_step_count; preset_k++)); do
+        case "${preset_step_action[$preset_k]}" in
+            code)
+                run_step_kind[preset_k]="code"
+                run_step_cap[preset_k]="${preset_step_repeat[$preset_k]:-1}"
+                ;;
+            review)
+                run_step_kind[preset_k]="review"
+                run_step_cap[preset_k]="${preset_step_max[$preset_k]}"
+                ;;
+            maintain)
+                run_step_kind[preset_k]="maintainer"
+                run_step_cap[preset_k]="${preset_step_max[$preset_k]}"
+                ;;
+        esac
+        run_step_idx[preset_k]="s${preset_k}"
+        run_step_prompt[preset_k]=""
+    done
+else
+    run_step_k=1
+    run_step_kind[run_step_k]="code"
+    run_step_idx[run_step_k]=""
+    run_step_cap[run_step_k]="${code_repeat:-1}"
+    run_step_prompt[run_step_k]=""
+    run_step_k=$(( run_step_k + 1 ))
+    if [[ "$review_loop_cap" != "0" ]]; then
+        run_step_kind[run_step_k]="review"
+        run_step_idx[run_step_k]=""
+        run_step_cap[run_step_k]="$review_loop_cap"
+        run_step_prompt[run_step_k]=""
+        run_step_k=$(( run_step_k + 1 ))
+    fi
+    if [[ "${maintainer_loop_cap:-0}" != "0" ]]; then
+        # shellcheck disable=SC2034  # unused-for-now, see the block comment above
+        run_step_kind[run_step_k]="maintainer"
+        # shellcheck disable=SC2034
+        run_step_idx[run_step_k]=""
+        # shellcheck disable=SC2034
+        run_step_cap[run_step_k]="$maintainer_loop_cap"
+        # shellcheck disable=SC2034
+        run_step_prompt[run_step_k]=""
+        run_step_k=$(( run_step_k + 1 ))
+    fi
+    # shellcheck disable=SC2034
+    run_step_count=$(( run_step_k - 1 ))
+fi
+
 # Check every value that goes into the generated runner or the run record
 # before anything is created, so a bad name cannot leave a clone behind on
 # the way out.
