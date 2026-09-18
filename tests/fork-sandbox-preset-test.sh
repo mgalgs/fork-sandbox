@@ -1447,6 +1447,9 @@ if [[ -n "${rd_a:-}" ]]; then
         "$(jq -r '.steps[0].fix' "$rd_a/pipeline.json")"
     check "pipeline.json's step 0 harness is claude" "claude" \
         "$(jq -r '.steps[0].harness' "$rd_a/pipeline.json")"
+    check "legacy preset run keeps its historical filename set" \
+        $'continuation-prompt-header.md\nevents-code-2.jsonl\nevents-code-3.jsonl\nevents.jsonl\nexit-code\nhandoff-original.md\nhandoff.md\npid\npipeline.json\npreset.json\npreset.yaml\nrun-source\nrun.env\nrun.sh\nsandbox.log\nsummary.json\nsummary.txt' \
+        "$(find "$rd_a" -maxdepth 1 -type f -exec basename {} \; | LC_ALL=C sort)"
 fi
 
 # A composed walk uses the first code seat for the historical top-level pass,
@@ -1470,17 +1473,19 @@ pipeline:
     agent: reviewer
 EOF
 prep_stub $'commit\napproved'
-rd_composed="$(run_stubbed --preset composed-walk --branch "sandbox-test-composed-$$-$RANDOM")" && tmpdirs+=("$rd_composed")
-if [[ -n "${rd_composed:-}" ]]; then
+if rd_composed="$(run_stubbed --preset composed-walk --branch "sandbox-test-composed-$$-$RANDOM")"; then
+    tmpdirs+=("$rd_composed")
     check "composed walk runs each runnable step" "2" "$(cat "$count")"
     if [[ -s "$rd_composed/step-1-loop.json" && -s "$rd_composed/step-3-loop.json" \
         && -s "$rd_composed/s3-maintain-verdict-1.md" ]]; then
         ok "composed walk writes step-indexed artifacts"
     else
         no "composed walk writes step-indexed artifacts" \
-            "$(find "$rd_composed" -maxdepth 1 -type f -printf '%f ' | sort)"
+            "$(find "$rd_composed" -maxdepth 1 -type f -exec basename {} \; | LC_ALL=C sort | tr '\n' ' ')"
     fi
     check "composed walk writes pipeline.json" "3" "$(jq -r '.steps | length' "$rd_composed/pipeline.json")"
+else
+    no "composed walk launch succeeds"
 fi
 
 # A2. A bare --review-loop with no --review-model/--review-harness: the

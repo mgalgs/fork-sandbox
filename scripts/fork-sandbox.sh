@@ -5938,18 +5938,11 @@ else
                 step_k_prompt="$run_dir/step-${preset_k}-prompt.md"
                 step_k_verdict_file="$clone_dir/.git/s${preset_k}-verdict.md"
                 fs_reject_unsafe_chars "$step_k_prompt" "$step_k_verdict_file"
-                # "yes" when an earlier step in THIS pipeline is a review
-                # step -- the composed equivalent of the legacy site's
-                # "review_loop_cap > 0" check, since a composed pipeline's
-                # order is not fixed the way the legacy tiers are.
+                # A prior step can be skipped or fail before producing a
+                # verdict.  The runner therefore adds the positive inner-
+                # review note only when it finds a usable preceding verdict.
+                # This static base keeps the truthful first-review wording.
                 step_k_inner_review=no
-                for ((preset_j = 1; preset_j < preset_k; preset_j++)); do
-                    if [[ "${preset_step_action[$preset_j]}" == review \
-                        || "${preset_step_action[$preset_j]}" == maintain ]]; then
-                        step_k_inner_review=yes
-                        break
-                    fi
-                done
                 # Same inherited bucket-sharing as the review arm above:
                 # fs_emit_prompt_overlay's "maintainer" bucket is one bucket
                 # for every composed maintain step, not one per step.
@@ -6995,15 +6988,20 @@ started_at="$(date +%s)"
         unset -n preset_k_cmd_ref
         printf 'composed_pipeline=%q\n' 1
         printf 'run_step_count=%q\n' "$run_step_count"
-        printf 'run_step_kind=('
-        printf '%q ' "${run_step_kind[@]}"
-        printf ')\nrun_step_idx=('
-        printf '%q ' "${run_step_idx[@]}"
-        printf ')\nrun_step_cap=('
-        printf '%q ' "${run_step_cap[@]}"
-        printf ')\nrun_step_prompt=('
-        printf '%q ' "${run_step_prompt[@]}"
-        printf ')\n'
+        # These arrays are deliberately 1-indexed.  Expanding values alone
+        # would rebuild them from index zero in run.sh.
+        for preset_k in kind idx cap prompt; do
+            printf 'run_step_%s=(' "$preset_k"
+            for ((preset_j = 1; preset_j <= run_step_count; preset_j++)); do
+                case "$preset_k" in
+                kind) printf '[%d]=%q ' "$preset_j" "${run_step_kind[$preset_j]}" ;;
+                idx) printf '[%d]=%q ' "$preset_j" "${run_step_idx[$preset_j]}" ;;
+                cap) printf '[%d]=%q ' "$preset_j" "${run_step_cap[$preset_j]}" ;;
+                prompt) printf '[%d]=%q ' "$preset_j" "${run_step_prompt[$preset_j]}" ;;
+                esac
+            done
+            printf ')\n'
+        done
     else
         printf 'composed_pipeline=%q\n' 0
     fi
@@ -8538,10 +8536,11 @@ if [[ "${composed_pipeline:-0}" == 1 ]]; then
         cur_save() {
             jq -n --argjson cap "$cur_cap" --arg review_model "$cur_model" --arg review_harness "$cur_harness" \
                 --arg fix_harness "$cur_fix_harness" --arg fix_model "$cur_fix_model" --argjson fix_repeat "$cur_fix_repeat" \
-                --arg ended "$cur_ended" --arg detail "$cur_detail" --argjson coding_exit_code "$rc" --argjson iterations "$cur_iters" \
+                --arg ended "$cur_ended" --arg detail "$cur_detail" --argjson coding_exit_code "${rc:-null}" --argjson iterations "$cur_iters" \
                 '{cap:$cap,review_model:(if $review_model=="" then null else $review_model end),review_harness:(if $review_harness=="" then null else $review_harness end),fix_harness:(if $fix_harness=="" then null else $fix_harness end),fix_model:(if $fix_model=="" then null else $fix_model end),fix_repeat:(if $fix_repeat==1 then null else $fix_repeat end),ended:(if $ended=="" then null else $ended end),detail:(if $detail=="" then null else $detail end),coding_exit_code:$coding_exit_code,iterations:$iterations}' > "$cur_loop_json.part" 2>/dev/null && mv -f "$cur_loop_json.part" "$cur_loop_json"
         }
-        for ((cur_i = 1; cur_i <= cur_cap && -z "$cur_ended"; cur_i++)); do
+        for ((cur_i = 1; cur_i <= cur_cap; cur_i++)); do
+            [[ -z "$cur_ended" ]] || break
             cur_verdict_file="$clone_dir/.git/${cur_step_idx}-verdict.md"
             rm -f "$cur_verdict_file"
             cur_prompt_iter="$run_dir/step-${cur_step_no}-prompt-${cur_i}.md"
@@ -8566,12 +8565,15 @@ if [[ "${composed_pipeline:-0}" == 1 ]]; then
                 if (( cur_i > 1 )); then cur_prev="$run_dir/${cur_step_idx}-maintain-verdict-$((cur_i-1)).md"
                 else
                     for ((cur_j = cur_step_no - 1; cur_j >= 1; cur_j--)); do
-                        cur_prev="$(find "$run_dir" -maxdepth 1 -type f \( -name "s${cur_j}-review-verdict-*.md" -o -name "s${cur_j}-maintain-verdict-*.md" \) -printf '%f\n' 2>/dev/null | sed -nE 's/.*-([0-9]+)\.md$/\1 &/p' | sort -n | tail -n1 | cut -d' ' -f2-)"
+                        cur_prev="$(find "$run_dir" -maxdepth 1 -type f \( -name "s${cur_j}-review-verdict-*.md" -o -name "s${cur_j}-maintain-verdict-*.md" \) -print 2>/dev/null | sed -nE 's!.*/!!;s/.*-([0-9]+)\.md$/\1 &/p' | sort -n | tail -n1 | cut -d' ' -f2-)"
                         [[ -n "$cur_prev" ]] && cur_prev="$run_dir/$cur_prev"
                         [[ -n "$cur_prev" ]] && break
                     done
                 fi
-                [[ -n "$cur_prev" && -f "$cur_prev" ]] && { printf '\n---\n\n## The previous verdict\n\n'; cat -- "$cur_prev"; } >> "$cur_prompt_iter"
+                if [[ -n "$cur_prev" && -f "$cur_prev" ]]; then
+                    printf '\n---\n\n## A preceding review completed\n\nA preceding review left the verdict below. Build on it and inspect the surrounding code; do not repeat its line-by-line diff review.\n\n## The previous verdict\n\n' >> "$cur_prompt_iter"
+                    cat -- "$cur_prev" >> "$cur_prompt_iter"
+                fi
             fi
             run_leg "$cur_kind" "$cur_i" "$cur_prompt_iter" "$cur_step_idx"
             cur_review_exit="$leg_rc"; cur_review_cost="${leg_cost:-null}"; cur_review_usage="${leg_usage:-null}"; cur_fix_exit=null; cur_fix_cost=null; cur_fix_usage=null; cur_findings=null; cur_before="$cur_head"; cur_after=""
@@ -8602,7 +8604,7 @@ if [[ "${composed_pipeline:-0}" == 1 ]]; then
                     else cur_head="$cur_after"; fi
                 else cur_ended=harness-error; cur_detail="the $cur_kind leg of iteration $cur_i wrote an invalid verdict"; fi
             fi
-            cur_iters="$(jq -c --argjson old "$cur_iters" --argjson i "$cur_i" --argjson findings "$cur_findings" --argjson review_exit "$cur_review_exit" --argjson fix_exit "$cur_fix_exit" --argjson review_cost "$cur_review_cost" --argjson fix_cost "$cur_fix_cost" --argjson review_usage "$cur_review_usage" --argjson fix_usage "$cur_fix_usage" --arg before "$cur_before" --arg after "$cur_after" '$old + [{i:$i,findings:$findings,review_exit:$review_exit,fix_exit:$fix_exit,head_before:(if $before=="" then null else $before end),head_after:(if $after=="" then null else $after end),commits_added:null,review_cost_usd:$review_cost,fix_cost_usd:$fix_cost,review_usage:$review_usage,fix_usage:$fix_usage}]')"
+            cur_iters="$(jq -cn --argjson old "$cur_iters" --argjson i "$cur_i" --argjson findings "$cur_findings" --argjson review_exit "$cur_review_exit" --argjson fix_exit "$cur_fix_exit" --argjson review_cost "$cur_review_cost" --argjson fix_cost "$cur_fix_cost" --argjson review_usage "$cur_review_usage" --argjson fix_usage "$cur_fix_usage" --arg before "$cur_before" --arg after "$cur_after" '$old + [{i:$i,findings:$findings,review_exit:$review_exit,fix_exit:$fix_exit,head_before:(if $before=="" then null else $before end),head_after:(if $after=="" then null else $after end),commits_added:null,review_cost_usd:$review_cost,fix_cost_usd:$fix_cost,review_usage:$review_usage,fix_usage:$fix_usage}]')"
             cur_save
         done
         [[ -n "$cur_ended" ]] || cur_ended=cap
