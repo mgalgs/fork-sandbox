@@ -652,6 +652,64 @@ refuses "a composed pipeline step's fix seat on codex is refused by name" \
     "composed pipeline step on codex is not yet" \
     --preset composed-codex-fix
 
+# claude-args/pi-args reach only the code seat's build today (fs_build_
+# sandbox_cmd splices them in for prefix "impl" alone); a composed pipeline's
+# code seat is built under an "s<K>" prefix instead, so the same value the
+# parser accepts (only the first code seat may carry it) would silently be
+# dropped once the run engine walks this preset. Refused by name now, the
+# same way the codex checks above are, so the gap survives past this round.
+cat > "$presets_dir/composed-cargs.yaml" <<'EOF'
+agents:
+  coder:
+    harness: claude
+    model: sonnet
+    claude-args: --effort high
+  reviewer:
+    harness: claude
+    model: opus
+pipeline:
+  - action: code
+    agent: coder
+  - action: review
+    repeat: 1
+    agent: coder
+  - action: review
+    repeat: 1
+    agent: reviewer
+  - action: maintain
+    repeat: 2
+    agent: reviewer
+EOF
+refuses "a composed pipeline's code seat claude-args is refused by name" \
+    "sets claude_args on agent" \
+    --preset composed-cargs
+
+cat > "$presets_dir/composed-pargs.yaml" <<'EOF'
+agents:
+  coder:
+    harness: pi
+    model: sonnet
+    pi-args: --thinking low
+  reviewer:
+    harness: claude
+    model: opus
+pipeline:
+  - action: code
+    agent: coder
+  - action: review
+    repeat: 1
+    agent: coder
+  - action: review
+    repeat: 1
+    agent: reviewer
+  - action: maintain
+    repeat: 2
+    agent: reviewer
+EOF
+refuses "a composed pipeline's code seat pi-args is refused by name" \
+    "sets pi_args on agent" \
+    --preset composed-pargs
+
 cat > "$presets_dir/composed-reviewfirst.yaml" <<'EOF'
 agents:
   coder:

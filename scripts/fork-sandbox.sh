@@ -3072,6 +3072,35 @@ if [[ -n "$preset_file" && "$preset_is_legacy_shaped" != true ]]; then
             exit 1
         fi
     done
+    # A composed preset's claude_args/pi_args has the same silent-drop gap:
+    # the parser (fork-sandbox-preset-parse.py) already refuses claude_args
+    # or pi_args on any agent but the pipeline's first code seat, so if
+    # either survived parsing here it belongs to that step -- but
+    # fs_build_sandbox_cmd only splices --claude-args/--pi-args into a
+    # command built with prefix "impl", never a composed step's own "s<K>"
+    # prefix, so that step would launch with them silently dropped. Name
+    # the gap now, the same way the codex check above does, so the message
+    # survives once the unconditional refusal below lifts.
+    for preset_cargs_agent in "${!preset_agent_cargs[@]}"; do
+        if [[ -n "${preset_agent_cargs[$preset_cargs_agent]}" ]]; then
+            echo "Error: preset '$preset_name' sets claude_args on agent" >&2
+            echo "'$preset_cargs_agent' -- a composed pipeline step's own" >&2
+            echo "claude-args are not yet wired into its build and would be" >&2
+            echo "silently dropped. Drop claude_args from the preset, or seat" >&2
+            echo "that agent in a legacy-shaped preset instead." >&2
+            exit 1
+        fi
+    done
+    for preset_pargs_agent in "${!preset_agent_pargs[@]}"; do
+        if [[ -n "${preset_agent_pargs[$preset_pargs_agent]}" ]]; then
+            echo "Error: preset '$preset_name' sets pi_args on agent" >&2
+            echo "'$preset_pargs_agent' -- a composed pipeline step's own" >&2
+            echo "pi-args are not yet wired into its build and would be" >&2
+            echo "silently dropped. Drop pi_args from the preset, or seat" >&2
+            echo "that agent in a legacy-shaped preset instead." >&2
+            exit 1
+        fi
+    done
     # The checks above only refuse specific flag combinations; a composed
     # preset invoked with none of them (the ordinary way to use one) falls
     # through them untouched. The run engine that would actually walk its
@@ -4582,13 +4611,36 @@ else
     run_step_count=$(( run_step_k - 1 ))
 fi
 
+# A composed preset's own per-step model/harness values (resolved by the
+# seat-resolution loop above into "s<K>_*"/"s<K>fix_*") reach this same
+# generated run.sh via the %q-quoted serialization loop further down, just
+# like the fixed-seat scalars the sweep below already covers -- so they
+# need the same sweep, or a preset-supplied name that the legacy path would
+# have refused sails through a composed one instead.
+composed_step_sweep_values=()
+if [[ "$preset_is_legacy_shaped" != true ]]; then
+    for ((preset_k = 1; preset_k <= preset_step_count; preset_k++)); do
+        preset_k_model_var="s${preset_k}_model"
+        preset_k_harness_var="s${preset_k}_harness"
+        composed_step_sweep_values+=("${!preset_k_model_var}" "${!preset_k_harness_var}")
+        if [[ "${preset_step_action[$preset_k]}" != code ]]; then
+            preset_k_fix_model_var="s${preset_k}fix_model"
+            preset_k_fix_harness_var="s${preset_k}fix_harness"
+            composed_step_sweep_values+=(
+                "${!preset_k_fix_model_var}" "${!preset_k_fix_harness_var}"
+            )
+        fi
+    done
+fi
+
 # Check every value that goes into the generated runner or the run record
 # before anything is created, so a bad name cannot leave a clone behind on
 # the way out.
 fs_reject_unsafe_chars "$project_path" "$handoff_file" "$branch" "$checkout_ref" \
     "$model" "$review_model" "$review_harness" "$maintainer_model" \
     "$maintainer_harness" "$fix_model" "$fix_harness" "$mntfix_model" \
-    "$mntfix_harness" "$claude_extra_args" "$sandbox_args"
+    "$mntfix_harness" "$claude_extra_args" "$sandbox_args" \
+    "${composed_step_sweep_values[@]}"
 
 # --task-meta never enters the generated runner -- it is written straight to
 # a file in the run dir -- so the check it needs is JSON validity, not shell
