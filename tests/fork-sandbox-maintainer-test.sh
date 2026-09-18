@@ -728,6 +728,36 @@ if (( rc3 == 0 )) && [[ -n "$rd3" ]]; then
         check "the $leg_prompt a leg ran carries the handoff exactly once" "1" \
             "$(grep -cF -- 'MNT-BRIEF-SENTINEL-9d2c' "$rd3/$leg_prompt" 2>/dev/null)"
     done
+    # Pinned regression: a legacy run's file-name set (names only, never
+    # bytes -- timestamps and session ids legitimately differ) must not
+    # drift when the walker becomes this run's only driver. If this check
+    # ever needs to change, it is because a deliberate artifact-naming
+    # decision changed, not because a refactor happened to move things.
+    check "the combined review+maintainer legacy run keeps its historical filename set" \
+        $'continuation-prompt-header.md\nevents-fix-1.jsonl\nevents-maintainer-1.jsonl\nevents-review-1.jsonl\nevents-review-2.jsonl\nevents.jsonl\nexit-code\nfix-prompt-1.md\nfix-prompt-header.md\nhandoff-original.md\nhandoff.md\nmaintainer-loop.json\nmaintainer-prompt-1.md\nmaintainer-prompt.md\nmaintainer-verdict-1.md\npid\nreview-loop.json\nreview-prompt-1.md\nreview-prompt-2.md\nreview-prompt.md\nreview-verdict-1.md\nreview-verdict-2.md\nrun-source\nrun.env\nrun.sh\nsandbox.log\nsummary.json\nsummary.txt' \
+        "$(find "$rd3" -maxdepth 1 -type f -exec basename {} \; | LC_ALL=C sort)"
+    check "review-loop.json's cap is the review-flavored field" "2" \
+        "$(jq -r '.cap' "$rd3/review-loop.json")"
+    check "review-loop.json names the review model under review_model" "sonnet" \
+        "$(jq -r '.review_model' "$rd3/review-loop.json")"
+    check "review-loop.json's iteration 1 exit is review_exit" "0" \
+        "$(jq -r '.iterations[0].review_exit' "$rd3/review-loop.json")"
+    check "review-loop.json's iteration 1 found the one finding" "1" \
+        "$(jq -r '.iterations[0].findings' "$rd3/review-loop.json")"
+    check "review-loop.json ran two iterations before approving" "2" \
+        "$(jq -r '.iterations | length' "$rd3/review-loop.json")"
+    check "maintainer-loop.json's cap is 1" "1" \
+        "$(jq -r '.cap' "$rd3/maintainer-loop.json")"
+    check "maintainer-loop.json names the model under maintainer_model, not review_model" \
+        "opus" "$(jq -r '.maintainer_model' "$rd3/maintainer-loop.json")"
+    check "maintainer-loop.json names the harness under maintainer_harness" \
+        "claude" "$(jq -r '.maintainer_harness' "$rd3/maintainer-loop.json")"
+    check "maintainer-loop.json's iteration exit is maintainer_exit, not review_exit" \
+        "0" "$(jq -r '.iterations[0].maintainer_exit' "$rd3/maintainer-loop.json")"
+    check "maintainer-loop.json carries no review_exit key" "null" \
+        "$(jq -r '.iterations[0].review_exit // "null"' "$rd3/maintainer-loop.json")"
+    check "maintainer-loop.json approved with no findings" "approved" \
+        "$(jq -r '.ended' "$rd3/maintainer-loop.json")"
 else
     no "the five-leg combined run exits 0" "rc=$rc3 rd=$rd3: $out3"
 fi
