@@ -552,6 +552,80 @@ else
 fi
 
 # ============================================================
+printf '\n== unresolvable Cc: @name is flagged, distinct from an unresolvable To: ==\n'
+# ============================================================
+# Same machinery as the unresolvable-To: flag above, extended to Cc: an
+# @-shaped Cc name that never resolves means an intended OBSERVER, not an
+# addressee, silently never sees the thread -- field evidence (a Cc'd
+# typo) motivated this. The reason says "via Cc" so the operator can tell
+# an observer, not an addressee, went missing.
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+mid_cc="$(send_msg '@alice' '@bob' 'unresolvable cc test' 'body' 8 '@nonexistent')"
+tid_cc="$(thread_of "$mid_cc")"
+short_cc="${tid_cc:0:8}"
+: > "$STUB_ARGV_LOG"
+once
+check "unresolvable Cc: known To recipient still wakes" 1 "$(grep -c -- "^sbx-mail-$short_cc-bob-" "$STUB_ARGV_LOG")"
+cc_flag_content="$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid_cc" 2>/dev/null)"
+contains "unresolvable Cc: flag reason names the typo'd address and marks it as Cc" \
+    "$cc_flag_content" "unresolvable Cc: @nonexistent at $mid_cc"
+contains "unresolvable Cc: flag event uses the unresolvable-cc keyword" \
+    "$(cat "$work/once.out")" "pm flag thread=$short_cc reason=unresolvable-cc"
+
+# A reply carrying the same unresolved name AGAIN in its own Cc: must not
+# re-flag (per-thread dedup, exactly like To:'s UNRESOLVED_TO record). Uses
+# an explicit --cc rather than default reply-all: reply-all folds the
+# parent's To+Cc together into the REPLY'S To: (see the reply-all comment
+# below), which would move @nonexistent into To and test the wrong path.
+reply_msg '@bob' "$mid_cc" 'a reply, still cc-ing the unresolved name' --to '@alice' --cc '@nonexistent' >/dev/null
+: > "$STUB_ARGV_LOG"
+once
+check "unresolvable Cc: a reply-all reply carrying the SAME unresolved name does not re-flag" \
+    "$cc_flag_content" "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid_cc" 2>/dev/null)"
+
+# @operator in Cc: is exempt exactly like @operator in To:, never treated
+# as unresolvable (pm_expand_to's own @operator guard covers both paths).
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+mid_op_cc="$(send_msg '@alice' '@bob' 'operator cc test' 'body' 8 '@operator')"
+tid_op_cc="$(thread_of "$mid_op_cc")"
+once
+check "@operator in Cc: is never treated as unresolvable" "" \
+    "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid_op_cc" 2>/dev/null || true)"
+
+# A resolvable seat with wake-on-cc: false (dana, shared fixture) is
+# suppressed-by-config, not unresolvable -- it must never flag.
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+mid_dana="$(send_msg '@alice' '@bob' 'wake-on-cc false cc test' 'body' 8 '@dana')"
+tid_dana="$(thread_of "$mid_dana")"
+: > "$STUB_ARGV_LOG"
+once
+check "wake-on-cc:false Cc candidate does not wake" 0 "$(grep -c -- "^sbx-mail-${tid_dana:0:8}-dana-" "$STUB_ARGV_LOG")"
+check "wake-on-cc:false Cc candidate is not flagged as unresolvable" "" \
+    "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid_dana" 2>/dev/null || true)"
+
+# Gate reason wins: a message that both gates (hops exhausted) AND has an
+# unresolvable Cc name flags with the gate reason, never the Cc reason --
+# gate_reason short-circuits Cc resolution entirely before it is ever
+# computed, so there is no unresolvable-Cc flag call to even race against
+# the gate's.
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+mid_gate_cc="$(send_msg '@alice' '@bob' 'unresolvable cc plus exhausted hops' 'body' 0 '@nonexistent')"
+tid_gate_cc="$(thread_of "$mid_gate_cc")"
+short_gate_cc="${tid_gate_cc:0:8}"
+: > "$STUB_ARGV_LOG"
+once
+check "unresolvable-Cc+hops: the hops reason wins, not the Cc reason" \
+    "hops exhausted at $mid_gate_cc" \
+    "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid_gate_cc" 2>/dev/null)"
+check "unresolvable-Cc+hops: exactly one flag event for the message, not two" 1 \
+    "$(grep -c -- "^pm flag thread=$short_gate_cc " "$work/once.out")"
+
+# ============================================================
 printf '\n== @operator in To: is never treated as unresolvable (rule 0) ==\n'
 # ============================================================
 # Every documented `mail send`/`mail reply` sends operator mail as the
@@ -1068,6 +1142,8 @@ fi
 
 contains "harvest: malformed file flags the thread with its name" \
     "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid")" "mail-4.md"
+contains "harvest: malformed file flag quotes the offending header line" \
+    "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid")" "Foo: bar"
 malformed_posted=0
 for f in "$FORK_SANDBOX_MAIL_ROOT/threads/$tid"/*.msg "$FORK_SANDBOX_MAIL_ROOT"/threads/*/*.msg; do
     [[ -e "$f" ]] || continue
@@ -1082,6 +1158,79 @@ once
 msg_count_after="$(find "$FORK_SANDBOX_MAIL_ROOT/threads" -name '*.msg' | wc -l)"
 check "harvest: second scan over an already-harvested run posts nothing new" \
     "$msg_count_before" "$msg_count_after"
+
+# ============================================================
+printf '\n== harvest: Reply-To-Id: new missing To/Subject flags with the quoted first line ==\n'
+# ============================================================
+# Unlike the unparseable-stanza case above, this header stanza parses
+# fine -- it is a semantic gap (Reply-To-Id: new requires To and Subject,
+# neither given), so there's no single "bad" line to point at the way a
+# parse failure has one. The quoted text is instead the first line of
+# what the agent actually wrote, so the operator sees what was submitted.
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+mid_new_bad="$(send_msg '@alice' '@bob' 'reply-to-id new missing fields' 'body' 8)"
+tid_new_bad="$(thread_of "$mid_new_bad")"
+once
+run_env_new_bad="$(env_file_for_agent bob)"
+run_dir_new_bad="$(sed -n 's/^RUN_DIR=//p' "$run_env_new_bad")"
+mkdir -p -- "$run_dir_new_bad/outbox"
+printf 'Reply-To-Id: new\n\nbody\n' > "$run_dir_new_bad/outbox/mail-1.md"
+printf '0\n' > "$run_dir_new_bad/exit-code"
+printf '{}\n' > "$run_dir_new_bad/summary.json"
+once
+new_bad_flag="$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid_new_bad" 2>/dev/null)"
+contains "Reply-To-Id: new missing To/Subject: flag names the failure" \
+    "$new_bad_flag" "Reply-To-Id: new requires To and Subject"
+contains "Reply-To-Id: new missing To/Subject: flag quotes the offending first line" \
+    "$new_bad_flag" "Reply-To-Id: new"
+
+# ============================================================
+printf '\n== malformed reply file: quoted line is sanitized (control chars stripped, overlength truncated) ==\n'
+# ============================================================
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+mid_ctrl="$(send_msg '@alice' '@bob' 'control char bad line' 'body' 8)"
+tid_ctrl="$(thread_of "$mid_ctrl")"
+once
+run_env_ctrl="$(env_file_for_agent bob)"
+run_dir_ctrl="$(sed -n 's/^RUN_DIR=//p' "$run_env_ctrl")"
+mkdir -p -- "$run_dir_ctrl/outbox"
+printf 'Foo: bar\x01evil\n\nbody\n' > "$run_dir_ctrl/outbox/mail-1.md"
+printf '0\n' > "$run_dir_ctrl/exit-code"
+printf '{}\n' > "$run_dir_ctrl/summary.json"
+once
+ctrl_flag="$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid_ctrl" 2>/dev/null)"
+contains "malformed reply file: quoted line keeps the surrounding text" "$ctrl_flag" "Foo: barevil"
+if [[ "$ctrl_flag" == *$'\x01'* ]]; then
+    no "malformed reply file: quoted line's control byte is stripped" "$ctrl_flag"
+else
+    ok "malformed reply file: quoted line's control byte is stripped"
+fi
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+mid_trunc="$(send_msg '@alice' '@bob' 'overlength bad line' 'body' 8)"
+tid_trunc="$(thread_of "$mid_trunc")"
+once
+run_env_trunc="$(env_file_for_agent bob)"
+run_dir_trunc="$(sed -n 's/^RUN_DIR=//p' "$run_env_trunc")"
+mkdir -p -- "$run_dir_trunc/outbox"
+long_x="$(printf 'x%.0s' {1..200})"
+printf 'Foo: %s\n\nbody\n' "$long_x" > "$run_dir_trunc/outbox/mail-1.md"
+printf '0\n' > "$run_dir_trunc/exit-code"
+printf '{}\n' > "$run_dir_trunc/summary.json"
+once
+trunc_flag="$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid_trunc" 2>/dev/null)"
+if [[ "$trunc_flag" == *"$long_x"* ]]; then
+    no "malformed reply file: quoted line is truncated, not embedded whole" "$trunc_flag"
+else
+    ok "malformed reply file: quoted line is truncated, not embedded whole"
+fi
+prefix_120="Foo: ${long_x:0:115}"
+contains "malformed reply file: quoted line's first 120 chars are preserved" "$trunc_flag" "$prefix_120"
 
 # ============================================================
 printf '\n== harvest: sealed pi with no configured model recovers X-AI-Model from summary.json ==\n'
@@ -1519,6 +1668,12 @@ flag_tid="$(thread_of "$flag_mid")"
 once
 unrouted_mid="$(send_msg '@alice' '@carol' 'status unrouted' 'body' 8)"
 
+# A second flag event on the same thread (still the hops-exhausted reason,
+# raised manually here rather than by a second real message) must show up
+# in status's per-thread event count -- the journal is append-only even
+# though the current-reason display below it still only shows the latest.
+"$postmaster" flag "$flag_tid" "hops exhausted at $flag_mid" >/dev/null 2>&1
+
 status_out="$("$postmaster" status)"
 contains "status: reports one unrouted message" "$status_out" "unrouted: 1"
 contains "status: lists the live run's agent" "$status_out" "agent=bob"
@@ -1526,6 +1681,7 @@ contains "status: lists the live run's thread" "$status_out" "thread=$live_tid"
 contains "status: lists the flagged thread" "$status_out" "$flag_tid"
 contains "status: flagged thread's reason" "$status_out" "hops exhausted"
 contains "status: spawn count per thread" "$status_out" "$live_tid: 1 spawns"
+contains "status: flagged thread's event count reflects both flag calls" "$status_out" "(2 events)"
 [[ -n "$unrouted_mid" ]] # silence unused-var warnings under -u in some shells
 
 # ============================================================
@@ -1535,16 +1691,41 @@ printf '\n== flag / unflag verbs ==\n'
 new_scratch_root FORK_SANDBOX_MAIL_ROOT
 export FORK_SANDBOX_MAIL_ROOT
 manual_tid="manually-flagged-thread"
+journal_file="$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator-journal/$manual_tid"
 "$postmaster" flag "$manual_tid" "operator wants eyes on this" >"$work/flag_verb.out" 2>&1
 check "flag: reason recorded" "operator wants eyes on this" \
     "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$manual_tid")"
 check "flag: the standalone verb prints no event line (deliver-only contract)" "" \
     "$(cat "$work/flag_verb.out")"
+check "flag: journal gains one flag line" 1 \
+    "$(grep -c -- $'\t''flag'$'\t' "$journal_file")"
+
+# A second flag call overwrites the CURRENT reason (today's unchanged
+# precedence semantics -- load-bearing for the gate-wins behavior) but
+# still appends its own line to the journal rather than overwriting it.
+"$postmaster" flag "$manual_tid" "a second, different reason" >/dev/null 2>&1
+check "flag: a second call overwrites the current reason (unchanged precedence)" \
+    "a second, different reason" \
+    "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$manual_tid")"
+check "flag: journal accumulates rather than overwrites -- two flag lines now" 2 \
+    "$(grep -c -- $'\t''flag'$'\t' "$journal_file")"
+
 "$postmaster" unflag "$manual_tid" >"$work/unflag_verb.out" 2>&1
 check "unflag: flag file removed" "0" \
     "$( [[ -e "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$manual_tid" ]] && echo 1 || echo 0 )"
 check "unflag: the standalone verb prints no event line either" "" \
     "$(cat "$work/unflag_verb.out")"
+check "unflag: journal gains one unflag line" 1 \
+    "$(grep -c -- $'\t''unflag'$'\t' "$journal_file")"
+
+# Unflagging an already-clear thread is a documented no-op for the
+# journal (rule 1's operator reset calls unflag unconditionally on every
+# operator/external message, flagged or not -- journaling every one of
+# those would drown the real transitions in noise), so the line count
+# must not grow on a second, redundant unflag.
+"$postmaster" unflag "$manual_tid" >/dev/null 2>&1
+check "unflag: a second, redundant unflag appends nothing" 1 \
+    "$(grep -c -- $'\t''unflag'$'\t' "$journal_file")"
 
 # ============================================================
 printf '\n== branch names never repeat, even across an operator spawn-count reset ==\n'
