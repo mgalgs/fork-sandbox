@@ -849,21 +849,6 @@ script_dir="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 # shellcheck disable=SC1091  # plain shellcheck cannot follow it; use -x
 source "$script_dir/fork-sandbox-lib.sh"
 
-# The first code step retains the historical top-level implementation leg
-# (and therefore events.jsonl).  Its composed seat nevertheless owns the
-# command; later code steps run through run_leg below.
-if [[ "${composed_pipeline:-0}" == 1 ]]; then
-    for (( _fs_step = 1; _fs_step <= run_step_count; _fs_step++ )); do
-        if [[ "${run_step_kind[$_fs_step]}" == code ]]; then
-            declare -n _fs_first_cmd="${run_step_idx[$_fs_step]}_sandbox_cmd"
-            impl_sandbox_cmd=("${_fs_first_cmd[@]}")
-            sandbox_cmd=("${_fs_first_cmd[@]}")
-            unset -n _fs_first_cmd
-            break
-        fi
-    done
-fi
-
 # The GNU flags these scripts use (realpath -m, stat -c) do not exist on the
 # BSD tools of the same name, and macOS has no timeout at all. Say so here, in
 # a sentence, before anything is created -- otherwise the first use fails as
@@ -7058,6 +7043,24 @@ fi
 fs_run_lock_closed() {
     ( { exec {clone_lock_fd}>&-; } 2>/dev/null; "$@" )
 }
+
+# The first code step retains the historical top-level implementation leg
+# (and therefore events.jsonl). Its composed seat nevertheless owns the
+# command; later code steps run through run_leg below. This has to run here,
+# inside the runner, not in the launcher: composed_pipeline and run_step_*
+# are runner-only values, printed into this file as literal assignments
+# above -- the launcher process itself never has them.
+if [[ "${composed_pipeline:-0}" == 1 ]]; then
+    for (( _fs_step = 1; _fs_step <= run_step_count; _fs_step++ )); do
+        if [[ "${run_step_kind[$_fs_step]}" == code ]]; then
+            declare -n _fs_first_cmd="${run_step_idx[$_fs_step]}_sandbox_cmd"
+            impl_sandbox_cmd=("${_fs_first_cmd[@]}")
+            sandbox_cmd=("${_fs_first_cmd[@]}")
+            unset -n _fs_first_cmd
+            break
+        fi
+    done
+fi
 
 # The two coding-leg argvs. The launcher emits them only on a
 # --session-state run, where the coding legs differ from every other leg by

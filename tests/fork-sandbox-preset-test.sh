@@ -1481,6 +1481,8 @@ prep_stub $'commit\nfindings\ncommit\napproved\napproved'
 if rd_composed="$(run_stubbed --preset composed --branch "sandbox-test-composed-$$-$RANDOM")"; then
     tmpdirs+=("$rd_composed")
     check "composed walk runs every step and its finding fix" "5" "$(cat "$count")"
+    contains "the first code leg runs its own seat's model, not the default seat's" \
+        "$(sed -n 1p "$argv_log")" "--model sonnet"
     if [[ -s "$rd_composed/step-2-loop.json" && -s "$rd_composed/step-3-loop.json" \
         && -s "$rd_composed/step-4-loop.json" && -s "$rd_composed/s4-maintain-verdict-1.md" ]]; then
         ok "composed walk writes step-indexed artifacts"
