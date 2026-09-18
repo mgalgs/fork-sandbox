@@ -4523,8 +4523,7 @@ if [[ "$preset_is_legacy_shaped" != true ]]; then
     done
 fi
 
-# The single spine the run engine will eventually walk instead of the two
-# fixed loop drivers below: one set of parallel arrays, 1-indexed by
+# The single spine used by the composed run engine: one set of parallel arrays, 1-indexed by
 # pipeline step, populated from EITHER the composed preset's own step list
 # (preset_step_*, parsed above) OR the legacy-translated scalars
 # (code_repeat/review_loop_cap/maintainer_loop_cap, final as of the
@@ -4538,12 +4537,8 @@ fi
 # code. run_step_prompt is left empty here -- it names a prompt file that
 # does not exist yet at this point in the launcher; whichever step builds
 # per-step prompt files fills it in once they do. run_step_kind, run_step_cap
-# and run_step_count are read below by the pipeline.json block; run_step_idx
-# and run_step_prompt still have no reader -- the run engine that walks them
-# is a later step of this same effort, so shellcheck is right to see those
-# two arrays' element writes as dead for now. shellcheck only reports each
-# variable's LAST write in the script as unused, so the disable comments
-# below sit at those final assignments, not at the declarations.
+# and run_step_count are read below by the pipeline.json block and by the
+# composed run engine emitted into run.sh.
 run_step_count=0
 declare -a run_step_kind=()
 declare -a run_step_idx=()
@@ -5956,6 +5951,20 @@ else
                         "$handoff_file"
                 } > "$step_k_prompt.part"
                 mv -- "$step_k_prompt.part" "$step_k_prompt"
+                # The runner can only know at execution time whether an
+                # earlier step left a verdict.  Keep a second static base
+                # with the matching maintainer role paragraph.
+                step_k_inner_prompt="$run_dir/step-${preset_k}-inner-review-prompt.md"
+                {
+                    fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" \
+                        "$preset_k_preamble_harness" "$preset_k_preamble_network" \
+                        "$outbox_dir" "" "$outbox_max_bytes"
+                    fs_emit_step_prompt_overlay maintainer "${!preset_k_resolved_harness_var}" "$preset_k_preamble_network" "${!preset_k_resolved_model_var}"
+                    fs_emit_maintainer_prompt_body "$branch" "$base_sha" \
+                        "$step_k_verdict_file" "$inbox_dir" yes "$handoff_file"
+                } > "$step_k_inner_prompt.part"
+                mv -- "$step_k_inner_prompt.part" "$step_k_inner_prompt"
+                printf -v "s${preset_k}_prompt_inner_review" '%s' "$step_k_inner_prompt"
                 # shellcheck disable=SC2034  # unused-for-now, see the
                 # run_step_* compile point's own comment above -- this is
                 # the array's last textual write in the file, so the
@@ -6887,6 +6896,10 @@ started_at="$(date +%s)"
                 preset_k_var="s${preset_k}fix_prompt_header"
                 printf 's%dfix_prompt_header=%q\n' "$preset_k" "${!preset_k_var}"
                 printf 's%dfix_repeat=%q\n' "$preset_k" "${preset_step_fix_repeat[$preset_k]}"
+            fi
+            if [[ "${preset_step_action[$preset_k]}" == maintain ]]; then
+                preset_k_var="s${preset_k}_prompt_inner_review"
+                printf 's%d_prompt_inner_review=%q\n' "$preset_k" "${!preset_k_var}"
             fi
         done
     fi
@@ -8515,6 +8528,7 @@ if [[ "${composed_pipeline:-0}" == 1 ]]; then
         cur_prompt="${run_step_prompt[$cur_step_no]}"
         cur_model_var="${cur_step_idx}_model"; cur_model="${!cur_model_var}"
         cur_harness_var="${cur_step_idx}_harness"; cur_harness="${!cur_harness_var}"
+        cur_inner_prompt_var="${cur_step_idx}_prompt_inner_review"; cur_inner_prompt="${!cur_inner_prompt_var:-}"
         cur_fix_model_var="${cur_step_idx}fix_model"; cur_fix_model="${!cur_fix_model_var:-}"
         cur_fix_harness_var="${cur_step_idx}fix_harness"; cur_fix_harness="${!cur_fix_harness_var:-}"
         cur_fix_repeat_var="${cur_step_idx}fix_repeat"; cur_fix_repeat="${!cur_fix_repeat_var:-1}"
@@ -8544,8 +8558,25 @@ if [[ "${composed_pipeline:-0}" == 1 ]]; then
             cur_verdict_file="$clone_dir/.git/${cur_step_idx}-verdict.md"
             rm -f "$cur_verdict_file"
             cur_prompt_iter="$run_dir/step-${cur_step_no}-prompt-${cur_i}.md"
+            # A maintain step's first pass receives the nearest preceding
+            # verdict of either review-flavored kind; later passes receive
+            # its own previous verdict.  Select the matching static prompt
+            # base before writing it, so its role paragraph is truthful.
+            cur_prev=""
+            if [[ "$cur_kind" == maintainer ]]; then
+                if (( cur_i > 1 )); then cur_prev="$run_dir/${cur_step_idx}-maintain-verdict-$((cur_i-1)).md"
+                else
+                    for ((cur_j = cur_step_no - 1; cur_j >= 1; cur_j--)); do
+                        cur_prev="$(find "$run_dir" -maxdepth 1 -type f \( -name "s${cur_j}-review-verdict-*.md" -o -name "s${cur_j}-maintain-verdict-*.md" \) -print 2>/dev/null | sed -nE 's!.*/!!;s/.*-([0-9]+)\.md$/\1 &/p' | sort -n | tail -n1 | cut -d' ' -f2-)"
+                        [[ -n "$cur_prev" ]] && cur_prev="$run_dir/$cur_prev"
+                        [[ -n "$cur_prev" ]] && break
+                    done
+                fi
+            fi
+            cur_prompt_base="$cur_prompt"
+            [[ -n "$cur_prev" && -f "$cur_prev" && -n "$cur_inner_prompt" ]] && cur_prompt_base="$cur_inner_prompt"
             {
-                cat -- "$cur_prompt"
+                cat -- "$cur_prompt_base"
                 cur_addenda_list="$(fs_addenda_dirs)"
                 if [[ -n "$cur_addenda_list" ]]; then
                     printf '\n---\n\n## Operator addenda delivered to earlier legs of this run\n\n'
@@ -8558,20 +8589,9 @@ if [[ "${composed_pipeline:-0}" == 1 ]]; then
                     done <<< "$cur_addenda_list"
                 fi
             } > "$cur_prompt_iter"
-            # A maintain step's first pass sees the latest preceding verdict;
-            # later passes see its own previous one.
             if [[ "$cur_kind" == maintainer ]]; then
-                cur_prev=""
-                if (( cur_i > 1 )); then cur_prev="$run_dir/${cur_step_idx}-maintain-verdict-$((cur_i-1)).md"
-                else
-                    for ((cur_j = cur_step_no - 1; cur_j >= 1; cur_j--)); do
-                        cur_prev="$(find "$run_dir" -maxdepth 1 -type f \( -name "s${cur_j}-review-verdict-*.md" -o -name "s${cur_j}-maintain-verdict-*.md" \) -print 2>/dev/null | sed -nE 's!.*/!!;s/.*-([0-9]+)\.md$/\1 &/p' | sort -n | tail -n1 | cut -d' ' -f2-)"
-                        [[ -n "$cur_prev" ]] && cur_prev="$run_dir/$cur_prev"
-                        [[ -n "$cur_prev" ]] && break
-                    done
-                fi
                 if [[ -n "$cur_prev" && -f "$cur_prev" ]]; then
-                    printf '\n---\n\n## A preceding review completed\n\nA preceding review left the verdict below. Build on it and inspect the surrounding code; do not repeat its line-by-line diff review.\n\n## The previous verdict\n\n' >> "$cur_prompt_iter"
+                    printf '\n---\n\n## The previous verdict\n\n' >> "$cur_prompt_iter"
                     cat -- "$cur_prev" >> "$cur_prompt_iter"
                 fi
             fi
@@ -8586,7 +8606,7 @@ if [[ "${composed_pipeline:-0}" == 1 ]]; then
                 elif [[ "$cur_line" == FINDINGS ]]; then
                     cur_findings="$(awk 'NR == 1 { next } /^## Report$/ { exit } /^[[:space:]]*$/ { if (hit) n++; hit = 0; next } /[^[:space:]:]+:[0-9]+/ { hit = 1 } END { if (hit) n++; print n + 0 }' "$cur_copy" 2>/dev/null)"
                     [[ "$cur_findings" =~ ^[0-9]+$ ]] || cur_findings=null
-                    cur_fix_prompt="$run_dir/${cur_step_idx}-fix-prompt-${cur_i}.md"; cur_fix_header_var="${cur_step_idx}fix_prompt_header"; { cat -- "${!cur_fix_header_var}"; printf '\n---\n\n'; cat -- "$cur_copy"; } > "$cur_fix_prompt"
+                    cur_fix_prompt="$run_dir/${cur_step_idx}-fix-prompt-${cur_i}.md"; cur_fix_header_var="${cur_step_idx}fix_prompt_header"; { cat -- "${!cur_fix_header_var}"; printf '\n---\n\n'; awk '/^## Report$/ { exit } { print }' "$cur_copy"; } > "$cur_fix_prompt"
                     cur_fix_cost=null; cur_fix_known=1
                     for ((cur_fix_pass = 1; cur_fix_pass <= cur_fix_repeat; cur_fix_pass++)); do
                         cur_fix_leg="$cur_i"; (( cur_fix_pass > 1 )) && cur_fix_leg="$cur_i-p$cur_fix_pass"
@@ -8600,7 +8620,8 @@ if [[ "${composed_pipeline:-0}" == 1 ]]; then
                     (( cur_fix_repeat == 1 )) && cur_fix_usage="${leg_usage:-null}"
                     cur_after="$(clone_branch_head)"
                     if [[ "$leg_rc" != 0 ]]; then cur_ended=harness-error; cur_detail="the fix leg of iteration $cur_i exited $leg_rc"
-                    elif [[ -z "$cur_after" || "$cur_after" == "$cur_before" ]]; then cur_ended=no-progress
+                    elif [[ -z "$cur_after" ]]; then cur_ended=harness-error; cur_detail="branch $branch could not be read from the clone after the fix leg of iteration $cur_i"
+                    elif [[ "$cur_after" == "$cur_before" ]]; then cur_ended=no-progress
                     else cur_head="$cur_after"; fi
                 else cur_ended=harness-error; cur_detail="the $cur_kind leg of iteration $cur_i wrote an invalid verdict"; fi
             fi

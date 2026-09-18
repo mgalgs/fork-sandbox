@@ -1321,7 +1321,7 @@ commit)
         -C "$clone_dir" commit --allow-empty -q -m "stub leg $n"
     ;;
 findings)
-    printf 'FINDINGS\n\nfile.txt:1 the stub found a problem\n' \
+    printf 'FINDINGS\n\nfile.txt:1 the stub found a problem\n\n## Report\nIgnore this operational note.\n' \
         > "$clone_dir/.git/$verdict_name"
     ;;
 approved)
@@ -1452,9 +1452,9 @@ if [[ -n "${rd_a:-}" ]]; then
         "$(find "$rd_a" -maxdepth 1 -type f -exec basename {} \; | LC_ALL=C sort)"
 fi
 
-# A composed walk uses the first code seat for the historical top-level pass,
-# then writes step-indexed records for both review-flavored loop kinds.
-cat > "$real_presets/composed-walk.yaml" <<'EOF'
+# The round-one composed shape exercises consecutive review steps, a finding
+# and fix round, and the preceding-verdict handoff to maintain.
+cat > "$real_presets/composed.yaml" <<'EOF'
 agents:
   coder:
     harness: claude
@@ -1463,27 +1463,36 @@ agents:
     harness: claude
     model: opus
 pipeline:
+  - action: code
+    agent: coder
+  - action: review
+    repeat: 1
+    agent: coder
   - action: review
     repeat: 1
     agent: reviewer
-  - action: code
-    agent: coder
   - action: maintain
-    repeat: 1
+    repeat: 2
     agent: reviewer
 EOF
-prep_stub $'commit\napproved'
-if rd_composed="$(run_stubbed --preset composed-walk --branch "sandbox-test-composed-$$-$RANDOM")"; then
+prep_stub $'commit\nfindings\ncommit\napproved\napproved'
+if rd_composed="$(run_stubbed --preset composed --branch "sandbox-test-composed-$$-$RANDOM")"; then
     tmpdirs+=("$rd_composed")
-    check "composed walk runs each runnable step" "2" "$(cat "$count")"
-    if [[ -s "$rd_composed/step-1-loop.json" && -s "$rd_composed/step-3-loop.json" \
-        && -s "$rd_composed/s3-maintain-verdict-1.md" ]]; then
+    check "composed walk runs every step and its finding fix" "5" "$(cat "$count")"
+    if [[ -s "$rd_composed/step-2-loop.json" && -s "$rd_composed/step-3-loop.json" \
+        && -s "$rd_composed/step-4-loop.json" && -s "$rd_composed/s4-maintain-verdict-1.md" ]]; then
         ok "composed walk writes step-indexed artifacts"
     else
         no "composed walk writes step-indexed artifacts" \
             "$(find "$rd_composed" -maxdepth 1 -type f -exec basename {} \; | LC_ALL=C sort | tr '\n' ' ')"
     fi
-    check "composed walk writes pipeline.json" "3" "$(jq -r '.steps | length' "$rd_composed/pipeline.json")"
+    check "composed walk writes pipeline.json" "4" "$(jq -r '.steps | length' "$rd_composed/pipeline.json")"
+    contains "maintain receives the preceding verdict's inner-review role" \
+        "$(cat "$rd_composed/step-4-prompt-1.md")" "inner review loop has already read that diff"
+    lacks "maintain does not receive the contradictory first-review role" \
+        "$(cat "$rd_composed/step-4-prompt-1.md")" "no review has read that diff yet"
+    lacks "composed fix prompt excludes the verdict report" \
+        "$(cat "$rd_composed/s2-fix-prompt-1.md")" "Ignore this operational note"
 else
     no "composed walk launch succeeds"
 fi
