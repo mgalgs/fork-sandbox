@@ -389,11 +389,18 @@ identical to a deliberate one-absent setup. Once past those gates,
 SIGTERM/SIGINT. `--once` does a single pass and exits. `status` prints
 one screen: unrouted count, every live run, every thread flagged
 needs-operator with its reason and how many flag events its journal has
-recorded, each thread's spawn count. `flag` and `unflag` set that flag by
-hand — to silence a thread you intend to leave alone, or to re-arm one
-after fixing whatever tripped it — and every `flag`/`unflag` call, manual
-or automatic, appends one line to that thread's needs-operator journal
-(timestamp, kind, keyword, reason); the journal is append-only operator
+recorded (or `(no journal)` for a flag predating the journal, e.g. one set
+by an older version of this script before an upgrade — that is unknown
+history, never reported as zero), each thread's spawn count. `flag` and
+`unflag` set that flag by hand — to silence a thread you intend to leave
+alone, or to re-arm one after fixing whatever tripped it. Every `pm_flag`
+call appends one line to that thread's needs-operator journal (timestamp,
+`flag`, keyword, reason); `pm_unflag` appends an `unflag` line (timestamp,
+`unflag`, empty keyword, empty reason) only when the thread was actually
+flagged — rule 1's operator reset calls it unconditionally on every
+operator/external message, and journaling every one of those no-ops would
+drown the real transitions in noise, so a redundant unflag on an
+already-clear thread appends nothing. The journal is append-only operator
 history and never affects the current reason or routing.
 
 ### The event stream
@@ -432,6 +439,11 @@ it, since the gate reason wins instead), so a name triggers this event at
 most once per thread until a *different* unresolved name appears — this
 also means rule 1's operator reset is not immediately undone by an
 operator's own reply-all reintroducing a name already recorded before).
+This record is shared between `To:` and `Cc:`, not kept separately per
+header: reply-all folds a parent's `Cc` into the reply's own `To:`, so a
+name already recorded via `Cc` must still read as already-known when it
+reappears via `To` on the very next message, or that fold would undo
+rule 1's reset in the same pass that performed it.
 `flag` goes through this same event-emitting
 code, gated the same way — it only prints one when reached via
 `deliver`'s own route/harvest pass, so running `flag` directly prints
@@ -646,7 +658,7 @@ own thread scans never see it:
 | `harvested/<run-id>` | this run's outbox is collected |
 | `delivered-live/<thread-id>` | one line per message rule 4 confirmed was delivered live at harvest (agent, message id, run id) — an audit trail, not read back by anything |
 | `needs-operator/<thread-id>` | flag file; its content is the reason |
-| `needs-operator-journal/<thread-id>` | append-only history of every `flag`/`unflag` call on that thread (timestamp, kind, keyword, reason) — the count `status` shows next to the current reason; operator-readable, nothing routes on it |
+| `needs-operator-journal/<thread-id>` | append-only history: one line per `pm_flag` call (timestamp, `flag`, keyword, reason) and one per `pm_unflag` call that actually cleared a flag (timestamp, `unflag`, empty keyword, empty reason) — a redundant unflag on an already-clear thread appends nothing. The flag-line count is what `status` shows next to the current reason, or `(no journal)` if this file doesn't exist yet for a thread flagged before the journal did. Operator-readable, nothing routes on it |
 | `spawns/<thread-id>` | one line per spawn, reset by rule 1 — line count is the **budget** count |
 | `seq/<thread-id>` | one line per spawn, never reset — feeds the branch name |
 | `handoffs/<run-id>.md` | the generated handoff a wake was given |

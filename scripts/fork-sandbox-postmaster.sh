@@ -617,21 +617,21 @@ SEQ="$STATE/seq"
 HANDOFFS="$STATE/handoffs"
 TRIAGED="$STATE/triaged"
 # One file per thread, one already-recorded name per line -- see the
-# unresolvable-To block in pm_process_message for why this exists and why
-# rule 1's operator reset must NOT clear it. A name lands here whether or
-# not it actually flagged (a gate reason can win instead -- see that
+# unresolvable-To/-Cc blocks in pm_process_message for why this exists and
+# why rule 1's operator reset must NOT clear it. A name lands here whether
+# or not it actually flagged (a gate reason can win instead -- see that
 # block), so "recorded" is the right word for what this holds, not
-# "flagged".
+# "flagged". Shared between To: and Cc: -- NOT split per header -- because
+# `mail reply`'s default reply-all folds a parent's To+Cc together into
+# the reply's own To:, so the SAME name can arrive via Cc on one message
+# and via To on the very next (an operator's own re-arming reply is
+# exactly this case); a header-keyed record would see that as a fresh
+# name and immediately re-flag the thread the operator's reply just
+# reset, defeating rule 1's promise. One record keyed on the name alone
+# avoids that, at the cost of not re-flagging a name that switches headers
+# after already being recorded once -- the reason text still says which
+# header it arrived on the first time.
 UNRESOLVED_TO="$STATE/unresolved-to"
-# Same record, same reasoning, for a Cc-expanded @-shaped name that never
-# resolved -- kept in its own per-thread file rather than sharing
-# UNRESOLVED_TO's, so a name that shows up unresolved on both headers (or
-# on Cc only, on a later message, after already being recorded via To) is
-# tracked and flagged independently per header -- the flag reason differs
-# ("unresolvable To:" vs "unresolvable Cc:") and the operator should learn
-# about both, not have the second header's typo silently deduped away by
-# the first's record.
-UNRESOLVED_CC="$STATE/unresolved-cc"
 # Per-thread, append-only flag history: pm_flag/pm_unflag each append one
 # line here on every call, never truncating -- unlike $NEEDS_OPERATOR/<tid>
 # (the CURRENT reason, overwritten every call; see pm_flag_keyword's own
@@ -1950,14 +1950,16 @@ pm_process_message() {
     if [[ -z "$gate_reason" ]]; then
         candidates+=("${to_candidates[@]}")
 
-        # Same unresolved-name tracking as To: above, own file, own record
-        # (UNRESOLVED_CC) -- only reached when there's no gate_reason, same
-        # as the rest of Cc resolution (wake-on-cc, triage): rule 0's own
-        # doc already says a refused message skips Cc resolution outright,
-        # and that now includes this check too, which is why "gate reason
-        # still wins" needs no extra code here -- an unresolvable Cc name
-        # on a gated message is simply never looked at, so there is never a
-        # competing pm_flag call for it to win against.
+        # Same unresolved-name tracking as To: below, SAME record
+        # (UNRESOLVED_TO, shared -- see its own comment for why not a
+        # separate per-header file) -- only reached when there's no
+        # gate_reason, same as the rest of Cc resolution (wake-on-cc,
+        # triage): rule 0's own doc already says a refused message skips
+        # Cc resolution outright, and that now includes this check too,
+        # which is why "gate reason still wins" needs no extra code here
+        # -- an unresolvable Cc name on a gated message is simply never
+        # looked at, so there is never a competing pm_flag call for it to
+        # win against.
         local -a expanded_cc=()
         local cc_unresolved_file
         cc_unresolved_file="$(mktemp "$MAIL_ROOT/.postmaster.cc-unresolved.XXXXXX")"
@@ -1968,8 +1970,8 @@ pm_process_message() {
         mapfile -t unresolved_cc < "$cc_unresolved_file"
         rm -f -- "$cc_unresolved_file"
         if (( ${#unresolved_cc[@]} )); then
-            mkdir -p -- "$UNRESOLVED_CC"
-            local cc_seen_file="$UNRESOLVED_CC/$tid" u
+            mkdir -p -- "$UNRESOLVED_TO"
+            local cc_seen_file="$UNRESOLVED_TO/$tid" u
             for u in "${unresolved_cc[@]}"; do
                 if [[ -e "$cc_seen_file" ]] && grep -qxF -- "$u" "$cc_seen_file"; then
                     continue
@@ -2047,7 +2049,13 @@ pm_process_message() {
     # pass is appended so it is never flagged again. The record is
     # thread-scoped and deliberately NOT cleared by rule 1's pm_unflag
     # above: an operator's reply carrying the same propagated name must
-    # not immediately re-flag the thread it just re-armed.
+    # not immediately re-flag the thread it just re-armed. Shared with
+    # the Cc: check above (same file, same tid) rather than a separate
+    # per-header record: reply-all folds a parent's Cc into the reply's
+    # own To:, so a name recorded via Cc here must still read as
+    # already-known when it reappears via To on the very next message,
+    # or the fold would re-flag the thread the operator's own reply just
+    # reset.
     local -a fresh_unresolved=()
     if (( ${#unresolved_to[@]} )); then
         mkdir -p -- "$UNRESOLVED_TO"
@@ -2094,16 +2102,30 @@ pm_process_message() {
     # reason win rather than either of these. When BOTH a To: name and a
     # Cc: name are fresh-unresolved on the same message, merge them into
     # one flag call instead of two: calling pm_flag twice would let the
-    # second call silently erase the first reason, and since UNRESOLVED_TO/
-    # UNRESOLVED_CC dedup each name after this pass, the erased reason can
-    # never come back on a later message either.
+    # second call silently erase the first reason, and since UNRESOLVED_TO
+    # dedups each name after this pass (shared between To: and Cc:, see
+    # its own comment), the erased reason can never come back on a later
+    # message either.
+    #
+    # The keyword is built here from the two booleans, not derived from
+    # combined_reason by pm_flag_keyword: that function is a closed,
+    # start-anchored case match specifically so an @-shaped name's raw
+    # text (attacker-controlled: any To:/Cc: value starting with "@" and
+    # not "@operator" lands in the reason verbatim, see pm_expand_to)
+    # can never influence which keyword comes out. Building the keyword
+    # from $to_reason/$cc_reason's presence rather than by re-matching
+    # substrings inside the combined text keeps that guarantee -- a name
+    # crafted to contain the literal text "unresolvable Cc:" must not be
+    # able to inject that keyword into a To:-only flag.
     if [[ -z "$gate_reason" ]]; then
-        local combined_reason="$to_reason"
+        local combined_reason="$to_reason" combined_keyword=""
+        [[ -n "$to_reason" ]] && combined_keyword="unresolvable-to"
         if [[ -n "$cc_reason" ]]; then
             [[ -n "$combined_reason" ]] && combined_reason+="; "
             combined_reason+="$cc_reason"
+            combined_keyword="${combined_keyword:+$combined_keyword,}unresolvable-cc"
         fi
-        [[ -n "$combined_reason" ]] && pm_flag "$tid" "$combined_reason"
+        [[ -n "$combined_reason" ]] && pm_flag "$tid" "$combined_reason" "$combined_keyword"
     fi
 
     if [[ -n "$gate_reason" ]]; then
@@ -2676,20 +2698,28 @@ cmd_status() {
     (( any_live )) || printf '  (none)\n'
 
     printf '\nneeds-operator:\n'
-    local any_flag=0 tid_f reason journal_file events
+    local any_flag=0 tid_f reason journal_file events_suffix events
     for f in "$NEEDS_OPERATOR"/*; do
         [[ -e "$f" ]] || continue
         tid_f="$(basename -- "$f")"
         reason="$(cat -- "$f")"
         journal_file="$NEEDS_OPERATOR_JOURNAL/$tid_f"
-        events=0
         # Count only "flag" lines, not "unflag" -- the event count answers
         # "how many times was this thread flagged", the same question the
         # header comment's "12 incidents read as 1" complaint is about, not
-        # a raw line count of the whole journal.
-        [[ -f "$journal_file" ]] && \
+        # a raw line count of the whole journal. A flag file with no
+        # journal at all (a thread flagged by a version of this script
+        # before the journal existed, still carrying that flag across an
+        # upgrade) is NOT zero events -- it is unknown history, and saying
+        # "(0 events)" would assert the exact thing this journal was added
+        # to stop misreporting.
+        if [[ -f "$journal_file" ]]; then
             events="$(awk -F'\t' '$2=="flag"{c++} END{print c+0}' "$journal_file")"
-        printf '  %s: %s (%s events)\n' "$tid_f" "$reason" "$events"
+            events_suffix=" ($events events)"
+        else
+            events_suffix=" (no journal)"
+        fi
+        printf '  %s: %s%s\n' "$tid_f" "$reason" "$events_suffix"
         any_flag=1
     done
     (( any_flag )) || printf '  (none)\n'

@@ -585,6 +585,23 @@ once
 check "unresolvable Cc: a reply-all reply carrying the SAME unresolved name does not re-flag" \
     "$cc_flag_content" "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid_cc" 2>/dev/null)"
 
+# Field scenario, not the hypothetical above: the operator's own re-arming
+# reply is normally a PLAIN reply with no --to/--cc, i.e. reply-all, the
+# default -- and reply-all folds the parent's To+Cc together into the
+# reply's own To: (fork-sandbox-mail.sh's cmd_reply), so @nonexistent
+# (still unresolved, still only ever seen via Cc so far) rides into this
+# message's To: instead. UNRESOLVED_TO is one record shared between To:
+# and Cc: exactly so this does not look like a fresh To: name: if it did,
+# rule 1's own reset (fired by this same operator message, above) would be
+# undone in the very same pass by the To: block re-flagging the thread.
+reply_msg '@operator' "$mid_cc" 'operator re-arms the thread with a plain reply-all' >/dev/null
+: > "$STUB_ARGV_LOG"
+once
+check "unresolvable Cc: an operator reply-all that folds the Cc name into To clears the flag and it stays cleared" \
+    "" "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid_cc" 2>/dev/null || true)"
+not_contains "unresolvable Cc: the folded name does not emit a fresh route-dead event" \
+    "$(cat "$work/once.out")" "route-dead"
+
 # @operator in Cc: is exempt exactly like @operator in To:, never treated
 # as unresolvable (pm_expand_to's own @operator guard covers both paths).
 new_scratch_root FORK_SANDBOX_MAIL_ROOT
@@ -627,9 +644,13 @@ check "unresolvable-Cc+hops: exactly one flag event for the message, not two" 1 
 
 # A single message with BOTH an unresolvable To: name and an unresolvable
 # Cc: name must not let the Cc flag call silently erase the To: reason --
-# pm_flag overwrites, and UNRESOLVED_TO/UNRESOLVED_CC dedup means a
-# clobbered reason can never come back on a later message either. Both
-# reasons must survive in the one flag call this message produces.
+# pm_flag overwrites, and UNRESOLVED_TO dedup means a clobbered reason can
+# never come back on a later message either. Both reasons must survive in
+# the one flag call this message produces, AND the keyword must say both:
+# docs/agent-mail.md promises an operator can find a missing Cc observer
+# by grepping for keyword unresolvable-cc, and a compound reason must not
+# make that grep silently miss this thread just because the To: miss on
+# the same message would otherwise win the keyword outright.
 new_scratch_root FORK_SANDBOX_MAIL_ROOT
 export FORK_SANDBOX_MAIL_ROOT
 mid_both="$(send_msg '@alice' '@bob,@notoname' 'both to and cc unresolvable' 'body' 8 '@noccname')"
@@ -646,6 +667,10 @@ contains "both To+Cc unresolvable: flag reason keeps the Cc: reason" \
     "$both_flag" "unresolvable Cc: @noccname at $mid_both"
 check "both To+Cc unresolvable: exactly one flag event for the message, not two" 1 \
     "$(grep -c -- "^pm flag thread=$short_both " "$work/once.out")"
+contains "both To+Cc unresolvable: the flag event keyword is still greppable for unresolvable-to" \
+    "$(cat "$work/once.out")" "unresolvable-to"
+contains "both To+Cc unresolvable: the flag event keyword is still greppable for unresolvable-cc" \
+    "$(cat "$work/once.out")" "unresolvable-cc"
 
 # ============================================================
 printf '\n== @operator in To: is never treated as unresolvable (rule 0) ==\n'
@@ -1730,6 +1755,25 @@ contains "status: flagged thread's reason" "$status_out" "hops exhausted"
 contains "status: spawn count per thread" "$status_out" "$live_tid: 1 spawns"
 contains "status: flagged thread's event count reflects both flag calls" "$status_out" "(2 events)"
 [[ -n "$unrouted_mid" ]] # silence unused-var warnings under -u in some shells
+
+# A flag file with no journal at all -- exactly what every thread already
+# flagged in a live mail store looks like the moment this version is
+# deployed, since nothing wrote their journal before now -- must not be
+# reported as "(0 events)": that asserts a known-wrong count, the same
+# "12 incidents read as 1" misreporting the journal exists to fix. Written
+# directly rather than via `postmaster flag`, which would create the
+# journal and defeat the point of this fixture.
+preupgrade_tid="pre-journal-flagged-thread"
+mkdir -p -- "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator"
+printf 'flagged before the journal existed\n' \
+    > "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$preupgrade_tid"
+check "status: no journal file exists for the pre-upgrade flag" 0 \
+    "$( [[ -e "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator-journal/$preupgrade_tid" ]] && echo 1 || echo 0 )"
+status_out2="$("$postmaster" status)"
+contains "status: a flag with no journal reports '(no journal)', not a false zero count" \
+    "$status_out2" "$preupgrade_tid: flagged before the journal existed (no journal)"
+not_contains "status: a flag with no journal never claims (0 events)" \
+    "$status_out2" "$preupgrade_tid: flagged before the journal existed (0 events)"
 
 # ============================================================
 printf '\n== flag / unflag verbs ==\n'
