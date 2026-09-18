@@ -1413,9 +1413,9 @@ pipeline:
     agent: coder
 EOF
 prep_stub $'commit\nnoop\ncommit'
-rd_a="$(run_stubbed --preset rep3 \
-    --branch "sandbox-test-rep3-$$")" && tmpdirs+=("$rd_a")
-if [[ -n "${rd_a:-}" ]]; then
+if rd_a="$(run_stubbed --preset rep3 \
+    --branch "sandbox-test-rep3-$$")"; then
+    tmpdirs+=("$rd_a")
     check "repeat: 3 runs three coding legs" "3" "$(cat "$count")"
     check "the run's exit code is published after the last pass" "0" \
         "$(cat "$rd_a/exit-code" 2>/dev/null)"
@@ -1450,6 +1450,8 @@ if [[ -n "${rd_a:-}" ]]; then
     check "legacy preset run keeps its historical filename set" \
         $'continuation-prompt-header.md\nevents-code-2.jsonl\nevents-code-3.jsonl\nevents.jsonl\nexit-code\nhandoff-original.md\nhandoff.md\npid\npipeline.json\npreset.json\npreset.yaml\nrun-source\nrun.env\nrun.sh\nsandbox.log\nsummary.json\nsummary.txt' \
         "$(find "$rd_a" -maxdepth 1 -type f -exec basename {} \; | LC_ALL=C sort)"
+else
+    no "rep3 launch succeeds"
 fi
 
 # The round-one composed shape exercises consecutive review steps, a finding
@@ -1511,15 +1513,17 @@ pipeline:
     agent: coder
 EOF
 prep_stub $'commit\napproved'
-rd_a2="$(run_stubbed --preset reviewloop --review-loop 1 \
-    --branch "sandbox-test-reviewloop-$$")" && tmpdirs+=("$rd_a2")
-if [[ -n "${rd_a2:-}" ]]; then
+if rd_a2="$(run_stubbed --preset reviewloop --review-loop 1 \
+    --branch "sandbox-test-reviewloop-$$")"; then
+    tmpdirs+=("$rd_a2")
     check "a bare --review-loop's step harness is the implement seat's" \
         "claude" "$(jq -r '.steps[1].harness' "$rd_a2/pipeline.json")"
     check "a bare --review-loop's step model is the implement seat's, not null" \
         "haiku" "$(jq -r '.steps[1].model' "$rd_a2/pipeline.json")"
     check "a bare --review-loop's step network is null (unsealed)" \
         "null" "$(jq -r '.steps[1].network' "$rd_a2/pipeline.json")"
+else
+    no "reviewloop launch succeeds"
 fi
 
 # A3. A sealed (pi-local) coder with an unsealed, explicitly-named reviewer:
@@ -1549,9 +1553,9 @@ pipeline:
     agent: reviewer
 EOF
 prep_stub 'noop'
-rd_a3="$(run_stubbed --preset sealed-review \
-    --branch "sandbox-test-sealed-review-$$")" && tmpdirs+=("$rd_a3")
-if [[ -n "${rd_a3:-}" ]]; then
+if rd_a3="$(run_stubbed --preset sealed-review \
+    --branch "sandbox-test-sealed-review-$$")"; then
+    tmpdirs+=("$rd_a3")
     check "the sealed coder's step harness is pi (pi-local, expanded)" \
         "pi" "$(jq -r '.steps[0].harness' "$rd_a3/pipeline.json")"
     check "the sealed coder's step network is sealed" \
@@ -1570,6 +1574,8 @@ if [[ -n "${rd_a3:-}" ]]; then
         "vendor/discovered-model" "$(jq -r '.steps[1].fix.model' "$rd_a3/pipeline.json")"
     check "the review step's default fix seat's repeat is the coder's own" \
         "2" "$(jq -r '.steps[1].fix.repeat' "$rd_a3/pipeline.json")"
+else
+    no "sealed-review launch succeeds"
 fi
 
 # D. A definition edited between the staging and the run dir -- the race the
@@ -1590,9 +1596,9 @@ EOF
 race_orig="$tmp/race.orig"
 cp -- "$race_live" "$race_orig"
 prep_stub 'commit'
-rd_d="$(RACE_PRESET_FILE="$race_live" run_stubbed \
-    --preset race --branch "sandbox-test-race-$$")" && tmpdirs+=("$rd_d")
-if [[ -n "${rd_d:-}" ]]; then
+if rd_d="$(RACE_PRESET_FILE="$race_live" run_stubbed \
+    --preset race --branch "sandbox-test-race-$$")"; then
+    tmpdirs+=("$rd_d")
     contains "the test's race actually happened" \
         "$(cat "$race_live")" "edited mid-launch"
     check "the recorded sha256 is the staged bytes' hash, not the edit's" \
@@ -1610,6 +1616,8 @@ if [[ -n "${rd_d:-}" ]]; then
         "$(cat "$rd_d/run.env")" "harness=claude"
     contains "run.env carries the pre-edit model" \
         "$(cat "$rd_d/run.env")" "model=haiku"
+else
+    no "race launch succeeds"
 fi
 
 # E. A launch that fails after staging the bytes (this one at the handoff
@@ -1759,9 +1767,9 @@ EOF
 # Call order: implement, review (findings), fix pass 1, fix pass 2,
 # review (approved).
 prep_stub $'commit\nfindings\ncommit\ncommit\napproved'
-rd_b="$(run_stubbed \
-    --preset fixseat --branch "sandbox-test-fixseat-$$")" && tmpdirs+=("$rd_b")
-if [[ -n "${rd_b:-}" ]]; then
+if rd_b="$(run_stubbed \
+    --preset fixseat --branch "sandbox-test-fixseat-$$")"; then
+    tmpdirs+=("$rd_b")
     check "the five legs ran: code, review, fix x2, review" "5" "$(cat "$count")"
     contains "the implement leg ran the code seat's model" \
         "$(sed -n 1p "$argv_log")" "--model fable"
@@ -1797,14 +1805,16 @@ if [[ -n "${rd_b:-}" ]]; then
     check "pipeline.json's step 1 fix names the fix seat, distinct from both" \
         "claude/haiku/2" \
         "$(jq -r '.steps[1].fix | "\(.harness)/\(.model)/\(.repeat)"' "$rd_b/pipeline.json")"
+else
+    no "fixseat launch succeeds"
 fi
 
 # C. A run with no preset emits none of the new state: run.sh and run.env
 # stay byte-compatible with what they were before fix seats existed.
 prep_stub 'commit'
-rd_c="$(run_stubbed --harness claude --model haiku \
-    --branch "sandbox-test-plain-$$")" && tmpdirs+=("$rd_c")
-if [[ -n "${rd_c:-}" ]]; then
+if rd_c="$(run_stubbed --harness claude --model haiku \
+    --branch "sandbox-test-plain-$$")"; then
+    tmpdirs+=("$rd_c")
     if [[ "$(grep -cE '^(fix_harness|fix_model|fix_repeat|fix_sandbox_cmd|fxr_|fxm_|mntfix_|code_repeat)' "$rd_c/run.sh")" == "0" ]]; then
         ok "a plain run.sh emits no fix-seat or repeat state"
     else
@@ -1826,6 +1836,8 @@ if [[ -n "${rd_c:-}" ]]; then
         no "run.sh never references the launcher-only preset_stage_cleanup" \
             "$(grep -n 'preset_stage_cleanup' "$rd_c/run.sh")"
     fi
+else
+    no "plain launch succeeds"
 fi
 
 # H. R9e decision (b): pipeline selection is mechanical, not a classifier --
@@ -1855,9 +1867,9 @@ EOF
 
 # H1: the code leg commits nothing -> the review leg never runs at all.
 prep_stub 'noop'
-rd_h1="$(run_stubbed --preset skiptest \
-    --branch "sandbox-test-skiptest-noop-$$")" && tmpdirs+=("$rd_h1")
-if [[ -n "${rd_h1:-}" ]]; then
+if rd_h1="$(run_stubbed --preset skiptest \
+    --branch "sandbox-test-skiptest-noop-$$")"; then
+    tmpdirs+=("$rd_h1")
     check "no-commit preset wake: only the code leg ran" "1" "$(cat "$count")"
     if [[ -e "$rd_h1/events-review-1.jsonl" ]]; then
         no "no-commit preset wake: no review-leg events file" \
@@ -1868,13 +1880,15 @@ if [[ -n "${rd_h1:-}" ]]; then
     contains "no-commit preset wake: summary records the skip and why" \
         "$(cat "$rd_h1/summary.txt")" \
         "review:    skipped -- the session committed nothing, so there is nothing to review"
+else
+    no "skiptest (noop) launch succeeds"
 fi
 
 # H2: the code leg commits -> the review leg runs (approved, one iteration).
 prep_stub $'commit\napproved'
-rd_h2="$(run_stubbed --preset skiptest \
-    --branch "sandbox-test-skiptest-commit-$$")" && tmpdirs+=("$rd_h2")
-if [[ -n "${rd_h2:-}" ]]; then
+if rd_h2="$(run_stubbed --preset skiptest \
+    --branch "sandbox-test-skiptest-commit-$$")"; then
+    tmpdirs+=("$rd_h2")
     check "committing preset wake: code and review legs both ran" "2" \
         "$(cat "$count")"
     if [[ -s "$rd_h2/events-review-1.jsonl" ]]; then
@@ -1886,6 +1900,8 @@ if [[ -n "${rd_h2:-}" ]]; then
     contains "committing preset wake: summary records the approved loop" \
         "$(cat "$rd_h2/summary.txt")" \
         "review:    1 iteration(s), findings 0; loop exit: approved"
+else
+    no "skiptest (commit) launch succeeds"
 fi
 
 printf '\n== sandbox-run-log.py: the preset definition in the archive ==\n'
