@@ -6050,6 +6050,36 @@ if [[ -n "$mntfix_harness" ]]; then
     fs_build_sandbox_cmd fxm mntfix_sandbox_cmd
 fi
 
+# A composed (non-legacy-shaped) preset builds one full command per step,
+# the same way a named --review-harness/--maintainer-harness/preset fix seat
+# above builds fresh rather than patching sandbox_cmd: every composed step
+# has its own resolved harness and model from the parser (never the bare
+# --model/--harness override sandbox_cmd's fallback path exists to splice
+# in), so there is no patch-the-implement-command case to fall back to here.
+# This is the seat-resolution loop's counterpart -- see the "s<K>_*"/
+# "s<K>fix_*" resolution above, near fs_resolve_harness's fixed calls -- and
+# must run down here instead of alongside it: fs_build_sandbox_cmd is not
+# defined yet up there, and its body reads globals (sockets_dir,
+# review_kit_flags, inbox_dir, outbox_dir, ...) that this script only
+# finishes computing between here and there. session_mode is left at its
+# "none" default for every step, including a composed pipeline's own first
+# code step: resume/state are wiring for the top-level implement leg's own
+# --refresh-at continuation machinery alone (decision 8 scopes refresh to
+# "first-code-step-first-pass only" there, not to any per-step build here),
+# so no composed step ever needs anything but "none". The composed launch
+# path that would read "s<K>_sandbox_cmd"/"s<K>fix_sandbox_cmd" is still
+# refused further up for now, so this loop's output has no reader yet --
+# same "additive, nothing reads it yet" property the seat-resolution loop
+# above already has.
+if [[ "$preset_is_legacy_shaped" != true ]]; then
+    for ((preset_k = 1; preset_k <= preset_step_count; preset_k++)); do
+        fs_build_sandbox_cmd "s${preset_k}" "s${preset_k}_sandbox_cmd"
+        if [[ "${preset_step_action[$preset_k]}" != code ]]; then
+            fs_build_sandbox_cmd "s${preset_k}fix" "s${preset_k}fix_sandbox_cmd"
+        fi
+    done
+fi
+
 # tmux rewrites ':' and '.' in a session name without saying so, and a branch
 # name may hold either. Fold every character tmux would touch to '-' here, so
 # the name this script records is the name tmux actually uses.
