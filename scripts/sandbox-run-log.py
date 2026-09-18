@@ -228,6 +228,8 @@ SUMMARY_FIELDS = [
     "started_at",
     "ended_at",
     "duration_seconds",
+    "claude_credentials_source",
+    "claude_credentials_via",
 ]
 
 
@@ -493,7 +495,8 @@ def cmd_record(args):
         rec["summary_missing"] = True
         env = load_run_env(os.path.join(rd, "run.env"))
         for k in ("harness", "harness_version", "network", "model", "branch",
-                  "origin_repo", "base_sha"):
+                  "origin_repo", "base_sha", "claude_credentials_source",
+                  "claude_credentials_via"):
             if env.get(k):
                 rec[k] = env[k]
         try:

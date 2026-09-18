@@ -322,5 +322,164 @@ else
         "$missing_path" "$claude_env_out"
 fi
 
+printf '\n== credential balancing: precedence, run.env recording, pure-pi gate ==\n'
+
+# A fake hook executable named fork-sandbox-headroom-<name>, staged in its
+# own PATH dir -- same shape as fork-sandbox-balance-test.sh's fake_hook,
+# duplicated here since this suite drives the real launcher rather than
+# calling fs_balance_claude_credential directly.
+fake_hook() {
+    local name="$1" body="$2" bindir
+    bindir="$(mktemp -d)"
+    tmpdirs+=("$bindir")
+    cat > "$bindir/fork-sandbox-headroom-$name" <<HOOK
+#!/usr/bin/env bash
+$body
+HOOK
+    chmod +x "$bindir/fork-sandbox-headroom-$name"
+    printf '%s' "$bindir"
+}
+
+pool_a="$tmp/pool-a-credentials.json"
+printf '{"claudeAiOauth":{"accessToken":"pool-a-tok"}}\n' > "$pool_a"
+pool_b="$tmp/pool-b-credentials.json"
+printf '{"claudeAiOauth":{"accessToken":"pool-b-tok"}}\n' > "$pool_b"
+
+# The flag beats a configured pool: the hook must never be invoked.
+flag_marker="$tmp/hook-invoked-flag-wins"
+rm -f "$flag_marker"
+hook_dir_flagwins="$(fake_hook flagwins "touch $flag_marker; printf '%s\n' \"\$1\"")"
+flagwins_cfg="$(mktemp -d)"; tmpdirs+=("$flagwins_cfg")
+{
+    printf 'CLAUDE_CREDENTIAL_POOL=%s:%s\n' "$pool_a" "$pool_b"
+    printf 'CLAUDE_HEADROOM_HOOK=flagwins\n'
+} > "$flagwins_cfg/claude.env"
+old_path="$PATH"
+export PATH="$hook_dir_flagwins:$PATH"
+rd_flagwins="$(run_real "$flagwins_cfg" --harness claude --claude-credentials "$flag_cred")"
+export PATH="$old_path"
+if [[ -n "$rd_flagwins" ]]; then
+    tmpdirs+=("$rd_flagwins")
+    contains "flag beats a configured pool: sandbox_cmd carries the flag's path" \
+        "--claude-credentials $flag_cred" "$(grep '^sandbox_cmd=' "$rd_flagwins/run.sh")"
+    if [[ -f "$flag_marker" ]]; then
+        no "flag beats a configured pool: the hook is not invoked" "marker file exists"
+    else
+        ok "flag beats a configured pool: the hook is not invoked"
+    fi
+    contains "flag beats a configured pool: run.env records via=flag" \
+        "claude_credentials_via=flag" "$(cat "$rd_flagwins/run.env")"
+else
+    no "flag beats a configured pool: run_real produced a run directory" "run_real failed"
+fi
+
+# Happy path: the hook's choice is used, and run.env records it.
+hook_dir_happy="$(fake_hook happy2 'printf "%s\n" "$2"')"
+happy_cfg="$(mktemp -d)"; tmpdirs+=("$happy_cfg")
+{
+    printf 'CLAUDE_CREDENTIAL_POOL=%s:%s\n' "$pool_a" "$pool_b"
+    printf 'CLAUDE_HEADROOM_HOOK=happy2\n'
+} > "$happy_cfg/claude.env"
+old_path="$PATH"
+export PATH="$hook_dir_happy:$PATH"
+rd_happy="$(run_real "$happy_cfg" --harness claude)"
+export PATH="$old_path"
+if [[ -n "$rd_happy" ]]; then
+    tmpdirs+=("$rd_happy")
+    contains "balance happy path: sandbox_cmd carries the hook's choice" \
+        "--claude-credentials $pool_b" "$(grep '^sandbox_cmd=' "$rd_happy/run.sh")"
+    happy_env="$(cat "$rd_happy/run.env")"
+    contains "balance happy path: run.env records via=balance" \
+        "claude_credentials_via=balance" "$happy_env"
+    contains "balance happy path: run.env records the hook's choice as the source" \
+        "claude_credentials_source=$pool_b" "$happy_env"
+else
+    no "balance happy path: run_real produced a run directory" "run_real failed"
+fi
+
+# A pure --harness pi run must never invoke the hook, even with a valid pool
+# and hook configured -- hook invocation is observable and this run has no
+# claude leg to balance a credential for.
+pi_marker="$tmp/hook-invoked-pure-pi"
+rm -f "$pi_marker"
+hook_dir_pi="$(fake_hook pimarker "touch $pi_marker; printf '%s\n' \"\$1\"")"
+pi_balance_cfg="$(mktemp -d)"; tmpdirs+=("$pi_balance_cfg")
+install -m 600 /dev/null "$pi_balance_cfg/pi.env"
+printf 'OPENROUTER_API_KEY=fake\n' > "$pi_balance_cfg/pi.env"
+{
+    printf 'CLAUDE_CREDENTIAL_POOL=%s:%s\n' "$pool_a" "$pool_b"
+    printf 'CLAUDE_HEADROOM_HOOK=pimarker\n'
+} > "$pi_balance_cfg/claude.env"
+old_path="$PATH"
+export PATH="$hook_dir_pi:$PATH"
+rd_pi_balance="$(run_real "$pi_balance_cfg" --harness pi --model moonshotai/kimi-k3)"
+export PATH="$old_path"
+if [[ -n "$rd_pi_balance" ]]; then
+    tmpdirs+=("$rd_pi_balance")
+    if [[ -f "$pi_marker" ]]; then
+        no "a pure pi run never invokes the headroom hook" "marker file exists"
+    else
+        ok "a pure pi run never invokes the headroom hook"
+    fi
+    lacks "a pure pi run's run.env has no claude_credentials_via key" \
+        "claude_credentials_via" "$(cat "$rd_pi_balance/run.env")"
+else
+    no "a pure pi run never invokes the headroom hook" "run_real failed"
+fi
+
+# The default chain (no flag, no claude.env, no pool) still records itself
+# in run.env, so a reader can tell "nothing configured" from "configured and
+# resolved to this path" without inferring it from key absence.
+contains "no override: run.env records via=default" \
+    "claude_credentials_via=default" "$(cat "$rd_none/run.env")"
+contains "no override: run.env records source=default" \
+    "claude_credentials_source=default" "$(cat "$rd_none/run.env")"
+
+# CLAUDE_CREDENTIALS in claude.env alone: run.env records via=claude-env and
+# the resolved path as the source.
+contains "claude.env alone: run.env records via=claude-env" \
+    "claude_credentials_via=claude-env" "$(cat "$rd_env/run.env")"
+contains "claude.env alone: run.env records its path as the source" \
+    "claude_credentials_source=$env_cred" "$(cat "$rd_env/run.env")"
+
+printf '\n== credential balancing: config errors and hook exit codes surface through the real launcher ==\n'
+
+# A pool without a hook is refused loudly at launch, the same as any other
+# config error -- one representative case proves the wiring surfaces
+# fs_balance_claude_credential's own error rather than swallowing it;
+# fork-sandbox-balance-test.sh covers every config-error shape directly.
+pool_no_hook_cfg="$(mktemp -d)"; tmpdirs+=("$pool_no_hook_cfg")
+printf 'CLAUDE_CREDENTIAL_POOL=%s\n' "$pool_a" > "$pool_no_hook_cfg/claude.env"
+pool_no_hook_out="$(PATH="$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$pool_no_hook_cfg" \
+    FORK_SANDBOX_BACKEND=fake-image \
+    timeout 60 "$launcher" --foreground --harness claude "$proj" "$handoff" 2>&1)"
+pool_no_hook_rc=$?
+if (( pool_no_hook_rc == 0 )); then
+    no "pool without hook is refused at launch" "$pool_no_hook_out"
+else
+    contains "pool without hook is refused at launch" "without" "$pool_no_hook_out"
+fi
+
+# Exit 2 (the hook's own "no routable candidate" answer) is a hard error
+# naming the --claude-credentials pin as the escape hatch.
+hook_dir_noroute="$(fake_hook noroute2 'exit 2')"
+noroute_cfg="$(mktemp -d)"; tmpdirs+=("$noroute_cfg")
+{
+    printf 'CLAUDE_CREDENTIAL_POOL=%s\n' "$pool_a"
+    printf 'CLAUDE_HEADROOM_HOOK=noroute2\n'
+} > "$noroute_cfg/claude.env"
+noroute_out="$(PATH="$hook_dir_noroute:$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$noroute_cfg" \
+    FORK_SANDBOX_BACKEND=fake-image \
+    timeout 60 "$launcher" --foreground --harness claude "$proj" "$handoff" 2>&1)"
+noroute_rc=$?
+if (( noroute_rc == 0 )); then
+    no "exit 2 (no routable candidate) is a hard error at launch" "$noroute_out"
+else
+    contains "exit 2 (no routable candidate) is a hard error at launch" \
+        "no routable credential" "$noroute_out"
+    contains "exit 2's error at launch names the --claude-credentials override" \
+        "--claude-credentials" "$noroute_out"
+fi
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))

@@ -4017,14 +4017,55 @@ codex)
 }
 
 # Which Claude credential a claude leg reads: --claude-credentials, else
-# CLAUDE_CREDENTIALS in claude.env, else today's default
+# CLAUDE_CREDENTIALS in claude.env, else a launcher-balanced choice from an
+# operator-configured pool (CLAUDE_CREDENTIAL_POOL + CLAUDE_HEADROOM_HOOK,
+# see fs_balance_claude_credential), else today's default
 # ($HOME/.claude/.credentials.json, falling back to the Keychain on macOS).
 # One process-wide fact, not scoped per leg -- there is no case where review
 # or maintainer should authenticate as a different account than implement,
 # so this resolves once rather than through fs_resolve_harness's per-prefix
 # namerefs.
 claude_credentials_config="$(fs_read_env_value "$config_dir/claude.env" CLAUDE_CREDENTIALS || true)"
-claude_credentials_resolved="${claude_credentials:-$claude_credentials_config}"
+# Gates the existence check below (a claude.env-wide default must not abort
+# a run that never reads it) and the balancer (a pure-pi run must never
+# invoke the operator's headroom hook -- hook invocation is observable, and
+# this run has no claude leg to balance a credential for). Same test used
+# below for the inbox hook.
+has_claude_leg=false
+if [[ "$harness" == "claude" || "$review_harness" == "claude" \
+    || "$maintainer_harness" == "claude" || "$fix_harness" == "claude" \
+    || "$mntfix_harness" == "claude" ]]; then
+    has_claude_leg=true
+fi
+
+claude_credentials_via="default"
+claude_credentials_resolved="$claude_credentials"
+if [[ -n "$claude_credentials" ]]; then
+    claude_credentials_via="flag"
+elif $has_claude_leg; then
+    # Called unconditionally, not gated on claude_credentials_config being
+    # empty -- fs_balance_claude_credential also validates that
+    # CLAUDE_CREDENTIALS and the pool keys are not BOTH set, so a
+    # misconfigured claude.env is refused loudly rather than having the pin
+    # silently win.
+    claude_balance_out=""
+    if claude_balance_out="$(fs_balance_claude_credential "$config_dir" "$script_dir")"; then
+        if [[ -n "$claude_balance_out" ]]; then
+            claude_credentials_resolved="$claude_balance_out"
+            claude_credentials_via="balance"
+        elif [[ -n "$claude_credentials_config" ]]; then
+            claude_credentials_resolved="$claude_credentials_config"
+            claude_credentials_via="claude-env"
+        fi
+    else
+        # fs_balance_claude_credential already printed the specific error.
+        exit 1
+    fi
+elif [[ -n "$claude_credentials_config" ]]; then
+    claude_credentials_resolved="$claude_credentials_config"
+    claude_credentials_via="claude-env"
+fi
+
 if [[ -n "$claude_credentials_resolved" ]]; then
     fs_reject_unsafe_chars "$claude_credentials_resolved"
     # Resolved to an absolute path now, at the launcher's own cwd, the same
@@ -4035,7 +4076,7 @@ if [[ -n "$claude_credentials_resolved" ]]; then
     # before the clone, the branch and the tmux session are created, not
     # deep inside fs_read_claude_credential after all of that already exists.
     claude_credentials_resolved="$("$FS_REALPATH" -m "$claude_credentials_resolved")"
-    if [[ -n "$claude_credentials" ]]; then
+    if [[ "$claude_credentials_via" == "flag" ]]; then
         # An explicit --claude-credentials is the operator naming a
         # specific file by hand, the same as --claude-args or
         # --claude-credentials --k8s above naming something this run
@@ -4046,19 +4087,24 @@ if [[ -n "$claude_credentials_resolved" ]]; then
             echo "which does not exist." >&2
             exit 1
         fi
-    elif [[ "$harness" == "claude" || "$review_harness" == "claude" \
-        || "$maintainer_harness" == "claude" || "$fix_harness" == "claude" \
-        || "$mntfix_harness" == "claude" ]] \
+    elif [[ "$claude_credentials_via" == "balance" ]] \
+        && [[ ! -f "$claude_credentials_resolved" ]]; then
+        # The balancer's choice is an operator-authored pool entry, same
+        # rule as the explicit flag above: a balanced choice naming a
+        # missing file is this run's problem to raise, not to swallow.
+        echo "Error: the credential balancer chose '$claude_credentials_resolved'," >&2
+        echo "which does not exist. Fix the pool entry in claude.env, or pin" >&2
+        echo "--claude-credentials to override the balancer." >&2
+        exit 1
+    elif [[ "$claude_credentials_via" == "claude-env" ]] && $has_claude_leg \
         && [[ ! -f "$claude_credentials_resolved" ]]; then
         # CLAUDE_CREDENTIALS in claude.env is a machine-wide default this
         # run did not ask for by name, so gate it on whether any leg of
-        # THIS run reads a Claude credential at all -- the same
-        # "$harness/$review_harness/$maintainer_harness/$fix_harness/
-        # $mntfix_harness == claude" test used below for the inbox hook.
-        # Ungated, a claude.env naming a path that later moves aborts even
-        # a --harness pi run, which never reads a Claude credential in the
-        # first place -- the blast radius is every run on the machine, for
-        # a file only claude legs read.
+        # THIS run reads a Claude credential at all ($has_claude_leg,
+        # computed above). Ungated, a claude.env naming a path that later
+        # moves aborts even a --harness pi run, which never reads a Claude
+        # credential in the first place -- the blast radius is every run
+        # on the machine, for a file only claude legs read.
         echo "Error: CLAUDE_CREDENTIALS in claude.env names" >&2
         echo "'$claude_credentials_resolved', which does not exist." >&2
         exit 1
@@ -5785,6 +5831,13 @@ started_at="$(date +%s)"
     fi
     printf 'outbox_max_bytes=%s\n' "$outbox_max_bytes"
     printf 'started_at=%s\n' "$started_at"
+    # Per-account attribution, printed only when a leg of this run actually
+    # reads a Claude credential -- same conditional-key convention as the
+    # maintainer block above. Path only, never token material.
+    if $has_claude_leg; then
+        printf 'claude_credentials_source=%s\n' "${claude_credentials_resolved:-default}"
+        printf 'claude_credentials_via=%s\n' "$claude_credentials_via"
+    fi
 } > "$run_dir/run.env"
 
 # Generate the runner instead of building a shell command string. Every value
