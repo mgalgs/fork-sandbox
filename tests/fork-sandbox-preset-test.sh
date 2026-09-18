@@ -576,7 +576,7 @@ refuses "--model is refused against a composed pipeline with more than one code 
     --preset composed-2code --model haiku
 refuses "--harness is refused against a composed pipeline with more than one code step" \
     "has no single" \
-    --preset composed-2code --harness pi --model moonshotai/kimi-k3
+    --preset composed-2code --harness claude
 
 refuses "--k8s is refused against a composed pipeline preset" \
     "does not support a composed pipeline preset ('composed')" \
@@ -653,7 +653,7 @@ EOF
 # refusal would still pass the test if the endpoint rule were deleted
 # and some other refusal fired.
 refuses "endpoint on a review-only agent is refused and names the agent" \
-    "agents.reviewer: has 'endpoint' but does not sit the code seat" \
+    "agents.reviewer: has 'endpoint' but does not sit the first code seat" \
     --preset ep-bad-seat
 
 cat > "$presets_dir/ep-badname.yaml" <<'EOF'
@@ -943,7 +943,7 @@ pipeline:
     fix_agent: fixer
 EOF
 
-printf '\n== free-order pipeline composition (parser only; the engine walks it from R10) ==\n'
+printf '\n== free-order pipeline composition (parser only; the run engine cannot walk it yet) ==\n'
 
 # These exercise fork-sandbox-preset-parse.py directly rather than through
 # the launcher: fork-sandbox.sh's TSV consumer is already rewired onto the
@@ -980,9 +980,8 @@ parse_refuses() {
     fi
 }
 
-# The motivating composition from the round's brief: a self-review by the
-# coder, then an opus review, then maintain x2 -- inexpressible under the
-# old one-code/one-review/one-maintain skeleton.
+# A composition inexpressible under the old one-code/one-review/one-maintain
+# skeleton: a self-review by the coder, then an opus review, then maintain x2.
 parses "the motivating composition parses" \
     "step	4	action	maintain" "step	2	action	review" \
     "step	3	action	review" <<'EOF'

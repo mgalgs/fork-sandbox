@@ -338,9 +338,10 @@ def main():
                  f"re-runs coding legs, and this agent sits neither the "
                  f"code seat nor a fix seat")
         if agent["endpoint"] and name != first_code_agent:
-            fail(f"agents.{name}: has 'endpoint' but does not sit the code "
-                 f"seat -- the run has one proxy base URL for the whole "
-                 f"run, so only the code seat's endpoint can be honored")
+            fail(f"agents.{name}: has 'endpoint' but does not sit the "
+                 f"first code seat -- the run has one proxy base URL for "
+                 f"the whole run, so only the first code seat's endpoint "
+                 f"can be honored")
         if agent["harness"] == "pi" and agent["network"] != "sealed" \
                 and not agent["model"] and name in seated:
             fail(f"agents.{name}: harness pi needs a model -- pi has no "

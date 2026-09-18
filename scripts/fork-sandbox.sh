@@ -141,8 +141,14 @@
 #                        no single review/maintain seat, or code seat past
 #                        the first, for a flag to override: there,
 #                        --model/--harness/--review-*/--maintainer-*/--k8s
-#                        are refused outright instead. Needs PyYAML. See
-#                        docs/presets.md for the file format.
+#                        are refused outright instead. A composed pipeline
+#                        is refused outright at launch even with none of
+#                        those flags given -- the run engine that walks an
+#                        arbitrary step list is not built yet, so only a
+#                        legacy-shaped pipeline (one code step, then at
+#                        most one review step, then at most one maintain
+#                        step, in that order) can actually run. Needs
+#                        PyYAML. See docs/presets.md for the file format.
 # --task-meta '<json>':  one JSON object of orchestrator-supplied task
 #                        metadata -- kind, difficulty, size,
 #                        prompt_template_id, stage -- stored beside the run
@@ -1887,10 +1893,12 @@ if [[ -n "$preset_name" ]]; then
     # and the existing loop drivers unchanged, via the preset_impl_*/
     # preset_review_*/preset_maintain_* scalars translated here. Anything
     # else -- any other order, any repeated kind, any count -- is a
-    # composed pipeline: decision 8 forbids compiling flags into it, so it
-    # skips this translation. The run engine has no walk over an arbitrary
-    # step list yet, so a composed pipeline is refused at launch further
-    # down instead of being run at all.
+    # composed pipeline: it has no single review/maintain seat for a flag
+    # to override, so compiling flags into it would either be ambiguous or
+    # silently pick a step, and it skips this translation instead. The run
+    # engine has no walk over an arbitrary step list yet, so a composed
+    # pipeline is refused at launch further down instead of being run at
+    # all.
     preset_is_legacy_shaped=false
     if (( preset_step_count == 1 )) && [[ "${preset_step_action[1]}" == code ]]; then
         preset_is_legacy_shaped=true
@@ -1946,11 +1954,11 @@ if [[ -n "$preset_name" ]]; then
     }
 
     # A composed (non-legacy-shaped) pipeline has no single code/review/
-    # maintain scalar to describe or compile flags into (decision 8): the
-    # summary below and the whole flag-compile block only apply to a
-    # legacy-shaped preset. A composed pipeline gets a step-count
-    # announcement instead, and is refused at launch further down: there
-    # is no run-engine walk over an arbitrary step list yet to run it.
+    # maintain scalar to describe or compile flags into, so the summary
+    # below and the whole flag-compile block only apply to a legacy-shaped
+    # preset. A composed pipeline gets a step-count announcement instead,
+    # and is refused at launch further down: there is no run-engine walk
+    # over an arbitrary step list yet to run it.
     if [[ "$preset_is_legacy_shaped" == true ]]; then
     # Announced before the compile below, so the picture of what the preset
     # says comes first and any "--x overrides ..." notes read against it.
@@ -2604,8 +2612,8 @@ if [[ "$k8s_mode" == true ]]; then
     # implement/review/maintainer skeleton's own flags (see the
     # --review-loop/--review-model forwarding further down, and the total
     # absence of any --maintainer-* forwarding at all -- a pre-existing gap
-    # this round does not touch). Refuse outright rather than silently
-    # dropping every step past the first three that happen to line up.
+    # left untouched here). Refuse outright rather than silently dropping
+    # every step past the first three that happen to line up.
     if [[ -n "$preset_file" && "$preset_is_legacy_shaped" != true ]]; then
         echo "Error: --k8s does not support a composed pipeline preset ('$preset_name')" >&2
         echo "yet -- only a legacy-shaped preset (one code step, then at most one" >&2
@@ -2976,8 +2984,8 @@ if [[ -n "$k8s_timeout" || "$k8s_keep" == true || -n "$k8s_outbox_dir" \
     exit 1
 fi
 
-# Decision 8: --review-loop/--review-model/--review-harness/--maintainer-*
-# describe the fixed one-code/one-review/one-maintain skeleton and only make
+# --review-loop/--review-model/--review-harness/--maintainer-* describe
+# the fixed one-code/one-review/one-maintain skeleton and only make
 # sense against a preset shaped like it (or no preset at all, which is
 # trivially that shape -- preset_is_legacy_shaped defaults true then). A
 # composed pipeline has no single review or maintain seat for these to
@@ -3037,8 +3045,8 @@ if [[ -n "$preset_file" && "$preset_is_legacy_shaped" != true ]]; then
         fi
         if [[ "$harness_given" == true ]]; then
             echo "Error: --harness cannot be combined with preset '$preset_name': composed" >&2
-            echo "pipeline has $preset_step_code_count code steps, so --harness has no" >&2
-            echo "single step to target; edit the preset or pick another." >&2
+            echo "pipeline has $preset_step_code_count code steps, so --harness has no single" >&2
+            echo "step to target; edit the preset or pick another." >&2
             exit 1
         fi
     fi
