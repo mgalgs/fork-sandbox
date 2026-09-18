@@ -4435,6 +4435,32 @@ if [[ "$maintainer_harness_given" == true ]]; then
     fs_resolve_harness "$maintainer_harness" "$maintainer_model" mnt "$maintainer_network"
 fi
 
+# A composed (non-legacy-shaped) preset has no single code/review/maintain
+# seat for the five fixed calls above to resolve, so it gets its own
+# resolution loop instead: one fs_resolve_harness call per step, into
+# "s<K>_*" (fs_resolve_harness is nameref-generic on its prefix argument,
+# so this collides with nothing the fixed prefixes above use), plus a
+# second call into "s<K>fix_*" for whichever steps carry a fix seat
+# (review and maintain -- a code step has none). The composed launch path
+# that would read these is refused further up for now, so this loop's
+# output has no reader yet; it exists on its own so the resolution -- and
+# the "fail before the clone" property the fixed calls above already
+# have -- is in place before the run engine that walks the step list
+# needs it.
+if [[ "$preset_is_legacy_shaped" != true ]]; then
+    for ((preset_k = 1; preset_k <= preset_step_count; preset_k++)); do
+        preset_k_agent="${preset_step_agent[$preset_k]}"
+        fs_resolve_harness "${preset_agent_harness[$preset_k_agent]}" \
+            "${preset_agent_model[$preset_k_agent]}" "s${preset_k}" \
+            "${preset_agent_network[$preset_k_agent]}"
+        if [[ "${preset_step_action[$preset_k]}" != code ]]; then
+            fs_resolve_harness "${preset_step_fix_harness[$preset_k]}" \
+                "${preset_step_fix_model[$preset_k]}" "s${preset_k}fix" \
+                "${preset_step_fix_network[$preset_k]}"
+        fi
+    done
+fi
+
 # Check every value that goes into the generated runner or the run record
 # before anything is created, so a bad name cannot leave a clone behind on
 # the way out.
