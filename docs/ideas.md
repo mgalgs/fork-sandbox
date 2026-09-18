@@ -89,8 +89,9 @@ This entry's trigger — "the second concrete 'it'd be nice to configure
 the pipeline this other way'" — has fired, and the linear part it named
 is built: free-order, arbitrarily-counted `code`/`review`/`maintain`
 composition, no longer the fixed one-code-then-review-then-maintain
-skeleton. (The run engine's walk over an arbitrary step list is a
-separate, not-yet-landed piece — see presets.md's "pipeline" section.)
+skeleton. (The local run engine walks arbitrary linear step lists; Kubernetes
+support remains a separate, legacy-shaped limitation — see presets.md's
+"pipeline" section.)
 
 Still parked: the general DSL — per-edge decision logic, `feed=` wiring
 beyond return-within-a-tier/forward-between-tiers, summarize legs,

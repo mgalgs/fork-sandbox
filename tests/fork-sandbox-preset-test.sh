@@ -572,24 +572,17 @@ refuses "--maintainer-harness is refused against a composed pipeline preset" \
     --preset composed --maintainer-harness claude --maintainer-model opus
 
 refuses "--model is refused against a composed pipeline with more than one code step" \
-    "has no single" \
+    "composed pipeline; edit the preset or pick another" \
     --preset composed-2code --model haiku
 refuses "--harness is refused against a composed pipeline with more than one code step" \
-    "has no single" \
+    "composed pipeline; edit the preset or pick another" \
     --preset composed-2code --harness claude
 
 refuses "--k8s is refused against a composed pipeline preset" \
     "does not support a composed pipeline preset ('composed')" \
     --preset composed --k8s
 
-# The run engine has no walk over an arbitrary step list yet, so a composed
-# preset is refused at launch even when none of the flags above are named --
-# the ordinary way to invoke a preset. Without this, --dry-run exits 0 and
-# a real run would silently launch today's no-preset defaults instead of
-# the preset's pipeline.
-refuses "a composed pipeline preset is refused at launch even with no conflicting flags" \
-    "run engine that walks an arbitrary step list isn't built yet" \
-    --preset composed
+accepts "a composed pipeline preset launches with no conflicting flags" --preset composed
 
 # A composed step's own seat on codex, and a composed step's fix seat on
 # codex, hit the same missing-credential gap the legacy "codex fix seat is
@@ -726,8 +719,8 @@ pipeline:
   - action: code
     agent: coder
 EOF
-refuses "a composed pipeline with exactly one code step is still refused, not silently overridden" \
-    "run engine that walks an arbitrary step list isn't built yet" \
+refuses "a composed pipeline with exactly one code step refuses --model" \
+    "composed pipeline; edit the preset or pick another" \
     --preset composed-reviewfirst --model haiku
 
 # The code seat's endpoint: a k8s-only key, so a local launch refuses it
@@ -1062,16 +1055,13 @@ pipeline:
     fix_agent: fixer
 EOF
 
-printf '\n== free-order pipeline composition (parser only; the run engine cannot walk it yet) ==\n'
+printf '\n== free-order pipeline composition ==\n'
 
 # These exercise fork-sandbox-preset-parse.py directly rather than through
 # the launcher: fork-sandbox.sh's TSV consumer is already rewired onto the
 # step-indexed emit shape, and a composed (non-legacy-shaped) pipeline is
-# correctly detected and refused for the legacy-only flags and --k8s (see
-# the "composed pipeline" refusal tests above), but the run engine itself
-# (the compile-point run_step_* array and the twin loop drivers' walk over
-# it) does not exist yet, so a composed preset still cannot round-trip
-# through a real --dry-run/--k8s success path or an actual run.
+# correctly detected for legacy-only flags and --k8s (see the composed
+# pipeline refusal tests above).
 preset_parser="$repo_dir/scripts/fork-sandbox-preset-parse.py"
 
 parses() {

@@ -175,6 +175,8 @@ resolve_run_file() {
     RUN_FILE_PATH=""
     case "$name" in
         run.env|events.jsonl|sandbox.log|exit-code|summary.txt|summary.json|pid|handoff.md|review-loop.json|maintainer-loop.json|pipeline.json) ;;
+        step-[0-9]*-loop.json)
+            [[ "$name" =~ ^step-[0-9]+-loop\.json$ ]] || die "'$name' is not a fork-sandbox run file" ;;
         # One file per leg, named by the runner. The leg kinds are
         # enumerated literally and the name is re-checked against the exact
         # pattern: a loose events-*.jsonl would let any name that starts
@@ -185,10 +187,15 @@ resolve_run_file() {
         events-review-[0-9]*.jsonl|events-fix-[0-9]*.jsonl|events-maintainer-[0-9]*.jsonl|events-mntfix-[0-9]*.jsonl|events-code-[0-9]*.jsonl|events-continuation-[0-9]*.jsonl)
             [[ "$name" =~ ^events-(review|fix|maintainer|mntfix|code|continuation)-[0-9]+(-p[0-9]+)?\.jsonl$ ]] \
                 || die "'$name' is not a fork-sandbox run file" ;;
+        events-s[0-9]*-*.jsonl)
+            [[ "$name" =~ ^events-s[0-9]+-(code|review|maintain|fix)-[0-9]+(-p[0-9]+)?\.jsonl$ ]] \
+                || die "'$name' is not a fork-sandbox run file" ;;
         review-verdict-[0-9]*.md)
             [[ "$name" =~ ^review-verdict-[0-9]+\.md$ ]] || die "'$name' is not a fork-sandbox run file" ;;
         maintainer-verdict-[0-9]*.md)
             [[ "$name" =~ ^maintainer-verdict-[0-9]+\.md$ ]] || die "'$name' is not a fork-sandbox run file" ;;
+        s[0-9]*-*-verdict-[0-9]*.md)
+            [[ "$name" =~ ^s[0-9]+-(review|maintain)-verdict-[0-9]+\.md$ ]] || die "'$name' is not a fork-sandbox run file" ;;
         *) die "'$name' is not a fork-sandbox run file" ;;
     esac
     if [[ -L "$path" ]]; then

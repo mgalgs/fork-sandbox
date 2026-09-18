@@ -849,6 +849,21 @@ script_dir="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 # shellcheck disable=SC1091  # plain shellcheck cannot follow it; use -x
 source "$script_dir/fork-sandbox-lib.sh"
 
+# The first code step retains the historical top-level implementation leg
+# (and therefore events.jsonl).  Its composed seat nevertheless owns the
+# command; later code steps run through run_leg below.
+if [[ "${composed_pipeline:-0}" == 1 ]]; then
+    for (( _fs_step = 1; _fs_step <= run_step_count; _fs_step++ )); do
+        if [[ "${run_step_kind[$_fs_step]}" == code ]]; then
+            declare -n _fs_first_cmd="${run_step_idx[$_fs_step]}_sandbox_cmd"
+            impl_sandbox_cmd=("${_fs_first_cmd[@]}")
+            sandbox_cmd=("${_fs_first_cmd[@]}")
+            unset -n _fs_first_cmd
+            break
+        fi
+    done
+fi
+
 # The GNU flags these scripts use (realpath -m, stat -c) do not exist on the
 # BSD tools of the same name, and macOS has no timeout at all. Say so here, in
 # a sentence, before anything is created -- otherwise the first use fails as
@@ -2994,12 +3009,8 @@ fi
 # otherwise fire their own, less specific "requires --review-loop"-style
 # message first since review_loop_cap/maintainer_loop_cap never get set for
 # a composed pipeline. --model/--harness are narrower: they only become
-# ambiguous once a composed pipeline has more than one code step. No new
-# flag algebra is added for a composed pipeline beyond these refusals --
-# and a composed pipeline with exactly one code step, naming none of the
-# flags above, still falls through to the unconditional refusal at the end
-# of this block: the run engine has no step-list walk to launch it into,
-# regardless of which flags (if any) were named.
+# ambiguous for every composed pipeline: command-line overrides do not name
+# a step. The runner walks the preset's step list directly.
 if [[ -n "$preset_file" && "$preset_is_legacy_shaped" != true ]]; then
     if [[ -n "$review_loop_arg" ]]; then
         echo "Error: --review-loop cannot be combined with preset '$preset_name':" >&2
@@ -3031,24 +3042,20 @@ if [[ -n "$preset_file" && "$preset_is_legacy_shaped" != true ]]; then
         echo "composed pipeline; edit the preset or pick another." >&2
         exit 1
     fi
-    preset_step_code_count=0
-    for ((preset_k = 1; preset_k <= preset_step_count; preset_k++)); do
-        [[ "${preset_step_action[$preset_k]}" == code ]] \
-            && preset_step_code_count=$(( preset_step_code_count + 1 ))
-    done
-    if (( preset_step_code_count > 1 )); then
-        if [[ "$model_given" == true ]]; then
-            echo "Error: --model cannot be combined with preset '$preset_name': composed" >&2
-            echo "pipeline has $preset_step_code_count code steps, so --model has no single" >&2
-            echo "step to target; edit the preset or pick another." >&2
-            exit 1
-        fi
-        if [[ "$harness_given" == true ]]; then
-            echo "Error: --harness cannot be combined with preset '$preset_name': composed" >&2
-            echo "pipeline has $preset_step_code_count code steps, so --harness has no single" >&2
-            echo "step to target; edit the preset or pick another." >&2
-            exit 1
-        fi
+    if [[ "$review_only" == true ]]; then
+        echo "Error: --review-only cannot be combined with preset '$preset_name':" >&2
+        echo "composed pipeline; edit the preset or pick another." >&2
+        exit 1
+    fi
+    if [[ "$model_given" == true ]]; then
+        echo "Error: --model cannot be combined with preset '$preset_name':" >&2
+        echo "composed pipeline; edit the preset or pick another." >&2
+        exit 1
+    fi
+    if [[ "$harness_given" == true ]]; then
+        echo "Error: --harness cannot be combined with preset '$preset_name':" >&2
+        echo "composed pipeline; edit the preset or pick another." >&2
+        exit 1
     fi
     # A composed step or its fix seat on codex has the same credential gap
     # the "codex fix seat is not yet supported" refusal above names for the
@@ -3101,20 +3108,6 @@ if [[ -n "$preset_file" && "$preset_is_legacy_shaped" != true ]]; then
             exit 1
         fi
     done
-    # The checks above only refuse specific flag combinations; a composed
-    # preset invoked with none of them (the ordinary way to use one) falls
-    # through them untouched. The run engine that would actually walk its
-    # step list does not exist yet (only the legacy-shaped translation
-    # above does), so without this refusal such a launch silently runs
-    # today's flag/no-preset defaults instead of the preset's pipeline --
-    # a launch, not an error, doing something other than what was asked.
-    # Refuse it outright, the same way --k8s already does further up.
-    echo "Error: preset '$preset_name' is a composed pipeline ($preset_step_count steps);" >&2
-    echo "the run engine that walks an arbitrary step list isn't built yet, so this" >&2
-    echo "preset cannot be launched locally either -- only a legacy-shaped preset (one" >&2
-    echo "code step, then at most one review step, then at most one maintain step, in" >&2
-    echo "that order) can run today. Edit the preset into that shape, or pick another." >&2
-    exit 1
 fi
 
 # Validated here, above the dry-run exit, rather than beside the rest of the
@@ -6537,6 +6530,24 @@ fi
 # above already has.
 if [[ "$preset_is_legacy_shaped" != true ]]; then
     for ((preset_k = 1; preset_k <= preset_step_count; preset_k++)); do
+        # Review-kit binds are added by fs_build_sandbox_cmd, while pi needs
+        # its matching --skill argv too.  Fixed review seats get this above;
+        # composed review/maintain seats (and their fix seats) need it here.
+        if [[ "${preset_step_action[$preset_k]}" != code ]]; then
+            for skill_dir in "$HOME/.claude/skills/commit-then-review" "$HOME/.claude/skills/code-review-portable"; do
+                [[ -d "$skill_dir" ]] || continue
+                if [[ "${preset_agent_harness[${preset_step_agent[$preset_k]}]}" == pi || "${preset_agent_harness[${preset_step_agent[$preset_k]}]}" == pi-local ]]; then
+                    declare -n preset_k_cmd="s${preset_k}_harness_cmd"
+                    preset_k_cmd+=(--skill "$skill_dir")
+                    unset -n preset_k_cmd
+                fi
+                if [[ "${preset_step_fix_harness[$preset_k]}" == pi || "${preset_step_fix_harness[$preset_k]}" == pi-local ]]; then
+                    declare -n preset_k_fix_cmd="s${preset_k}fix_harness_cmd"
+                    preset_k_fix_cmd+=(--skill "$skill_dir")
+                    unset -n preset_k_fix_cmd
+                fi
+            done
+        fi
         fs_build_sandbox_cmd "s${preset_k}" "s${preset_k}_sandbox_cmd"
         if [[ "${preset_step_action[$preset_k]}" != code ]]; then
             fs_build_sandbox_cmd "s${preset_k}fix" "s${preset_k}fix_sandbox_cmd"
@@ -6924,6 +6935,19 @@ started_at="$(date +%s)"
             fi
         done
         unset -n preset_k_cmd_ref
+        printf 'composed_pipeline=%q\n' 1
+        printf 'run_step_count=%q\n' "$run_step_count"
+        printf 'run_step_kind=('
+        printf '%q ' "${run_step_kind[@]}"
+        printf ')\nrun_step_idx=('
+        printf '%q ' "${run_step_idx[@]}"
+        printf ')\nrun_step_cap=('
+        printf '%q ' "${run_step_cap[@]}"
+        printf ')\nrun_step_prompt=('
+        printf '%q ' "${run_step_prompt[@]}"
+        printf ')\n'
+    else
+        printf 'composed_pipeline=%q\n' 0
     fi
     printf '\n'
     cat <<'RUNNER'
@@ -7293,7 +7317,7 @@ fi
 # sandbox's own messages go to stderr, which is copied to the log and shown
 # here too.
 rc=0
-if [[ "$mode" != "review-only" ]]; then
+if [[ "$mode" != "review-only" ]] && { [[ "${composed_pipeline:-0}" != 1 ]] || [[ "${run_step_kind[1]}" == code ]]; }; then
 # stderr goes through a real pipeline into $sandbox_log, not a `2> >(tee)`
 # process substitution: bash does not wait on the latter (claude-sandboxed's
 # own RESUME_FAIL_RE names this exact hazard beside its ERR_CAPTURE), so
@@ -7366,7 +7390,8 @@ fs_archive_inbox 1 "$harness" "$rc"
 # always. --refresh-at defers the same way, and for the same reason: a
 # continuation leg can still change $rc below.
 if [[ "$review_loop_cap" == "0" && "$refresh_enabled" == "0" \
-    && "${maintainer_loop_cap:-0}" == "0" && "${code_repeat:-1}" == "1" ]]; then
+    && "${maintainer_loop_cap:-0}" == "0" && "${code_repeat:-1}" == "1" \
+    && "${composed_pipeline:-0}" != 1 ]]; then
     printf '%s\n' "$rc" > "$run_dir/exit-code"
 fi
 fi
@@ -8415,6 +8440,87 @@ run_leg() {
         loop_cost_unknown=1
     fi
 }
+
+# Walk a composed preset after its first code leg.  This deliberately uses
+# the same run_leg accounting primitive as the fixed tiers; only the loop
+# record name and the seat index differ.  Composed records keep review field
+# names for review and maintain steps, per the pipeline schema.
+if [[ "${composed_pipeline:-0}" == 1 ]]; then
+    cur_first_code=0
+    for ((cur_scan = 1; cur_scan <= run_step_count; cur_scan++)); do
+        [[ "${run_step_kind[$cur_scan]}" == code ]] && { cur_first_code="$cur_scan"; break; }
+    done
+    for ((cur_step_no = 1; cur_step_no <= run_step_count; cur_step_no++)); do
+        cur_kind="${run_step_kind[$cur_step_no]}"
+        cur_step_idx="${run_step_idx[$cur_step_no]}"
+        cur_cap="${run_step_cap[$cur_step_no]}"
+        cur_prompt="${run_step_prompt[$cur_step_no]}"
+        cur_model_var="${cur_step_idx}_model"; cur_model="${!cur_model_var}"
+        cur_harness_var="${cur_step_idx}_harness"; cur_harness="${!cur_harness_var}"
+        cur_fix_model_var="${cur_step_idx}fix_model"; cur_fix_model="${!cur_fix_model_var:-}"
+        cur_fix_harness_var="${cur_step_idx}fix_harness"; cur_fix_harness="${!cur_fix_harness_var:-}"
+        cur_fix_repeat=1
+        # The first code pass is the historical implementation invocation.
+        if [[ "$cur_kind" == code ]]; then
+            if (( cur_step_no == cur_first_code )); then continue; fi
+            for ((cur_pass = 1; cur_pass <= cur_cap && rc == 0; cur_pass++)); do
+                run_leg code "$cur_pass" "$handoff" "$cur_step_idx"
+                rc="$leg_rc"
+            done
+            continue
+        fi
+        cur_loop_json="$run_dir/step-${cur_step_no}-loop.json"
+        cur_ended=""; cur_detail=""; cur_iters='[]'
+        cur_head="$(clone_branch_head)"
+        if [[ -z "$cur_head" ]]; then cur_ended=skipped; cur_detail="branch $branch could not be read from the clone"
+        elif [[ "$cur_head" == "$base_sha" ]]; then cur_ended=skipped; cur_detail="the branch holds no commits, so there is nothing to review"; fi
+        cur_save() {
+            jq -n --argjson cap "$cur_cap" --arg review_model "$cur_model" --arg review_harness "$cur_harness" \
+                --arg fix_harness "$cur_fix_harness" --arg fix_model "$cur_fix_model" --argjson fix_repeat "$cur_fix_repeat" \
+                --arg ended "$cur_ended" --arg detail "$cur_detail" --argjson coding_exit_code "$rc" --argjson iterations "$cur_iters" \
+                '{cap:$cap,review_model:(if $review_model=="" then null else $review_model end),review_harness:(if $review_harness=="" then null else $review_harness end),fix_harness:(if $fix_harness=="" then null else $fix_harness end),fix_model:(if $fix_model=="" then null else $fix_model end),fix_repeat:(if $fix_repeat==1 then null else $fix_repeat end),ended:(if $ended=="" then null else $ended end),detail:(if $detail=="" then null else $detail end),coding_exit_code:$coding_exit_code,iterations:$iterations}' > "$cur_loop_json.part" 2>/dev/null && mv -f "$cur_loop_json.part" "$cur_loop_json"
+        }
+        for ((cur_i = 1; cur_i <= cur_cap && -z "$cur_ended"; cur_i++)); do
+            cur_verdict_file="$clone_dir/.git/${cur_step_idx}-verdict.md"
+            rm -f "$cur_verdict_file"
+            cur_prompt_iter="$run_dir/step-${cur_step_no}-prompt-${cur_i}.md"
+            cp -- "$cur_prompt" "$cur_prompt_iter"
+            # A maintain step's first pass sees the latest preceding verdict;
+            # later passes see its own previous one.
+            if [[ "$cur_kind" == maintainer ]]; then
+                cur_prev=""
+                if (( cur_i > 1 )); then cur_prev="$run_dir/${cur_step_idx}-maintain-verdict-$((cur_i-1)).md"
+                else
+                    for ((cur_j = cur_step_no - 1; cur_j >= 1; cur_j--)); do
+                        for cur_candidate in "$run_dir"/s${cur_j}-{review,maintain}-verdict-*.md; do [[ -f "$cur_candidate" ]] && cur_prev="$cur_candidate"; done
+                        [[ -n "$cur_prev" ]] && break
+                    done
+                fi
+                [[ -n "$cur_prev" && -f "$cur_prev" ]] && { printf '\n---\n\n## The previous verdict\n\n'; cat -- "$cur_prev"; } >> "$cur_prompt_iter"
+            fi
+            run_leg "$cur_kind" "$cur_i" "$cur_prompt_iter" "$cur_step_idx"
+            cur_review_exit="$leg_rc"; cur_fix_exit=null; cur_findings=null; cur_before="$cur_head"; cur_after=""
+            if [[ "$leg_rc" != 0 || ! -s "$cur_verdict_file" || -L "$cur_verdict_file" ]]; then cur_ended=harness-error; cur_detail="the $cur_kind leg of iteration $cur_i left no usable verdict"
+            else
+                cur_copy="$run_dir/${cur_step_idx}-$([[ "$cur_kind" == maintainer ]] && echo maintain || echo review)-verdict-${cur_i}.md"
+                cp -- "$cur_verdict_file" "$cur_copy"; rm -f "$cur_verdict_file"
+                cur_line="$(head -n1 "$cur_copy" | tr -d '\000-\037\177' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+                if [[ "$cur_line" == APPROVED ]]; then cur_findings=0; cur_ended=approved
+                elif [[ "$cur_line" == FINDINGS ]]; then
+                    cur_fix_prompt="$run_dir/${cur_step_idx}-fix-prompt-${cur_i}.md"; { cat -- "$fix_prompt_header"; printf '\n---\n\n'; cat -- "$cur_copy"; } > "$cur_fix_prompt"
+                    run_leg fix "$cur_i" "$cur_fix_prompt" "$cur_step_idx"; cur_fix_exit="$leg_rc"; cur_after="$(clone_branch_head)"
+                    if [[ "$leg_rc" != 0 ]]; then cur_ended=harness-error; cur_detail="the fix leg of iteration $cur_i exited $leg_rc"
+                    elif [[ -z "$cur_after" || "$cur_after" == "$cur_before" ]]; then cur_ended=no-progress
+                    else cur_head="$cur_after"; fi
+                else cur_ended=harness-error; cur_detail="the $cur_kind leg of iteration $cur_i wrote an invalid verdict"; fi
+            fi
+            cur_iters="$(jq -c --argjson old "$cur_iters" --argjson i "$cur_i" --argjson findings "$cur_findings" --argjson review_exit "$cur_review_exit" --argjson fix_exit "$cur_fix_exit" --arg before "$cur_before" --arg after "$cur_after" '$old + [{i:$i,findings:$findings,review_exit:$review_exit,fix_exit:$fix_exit,head_before:(if $before=="" then null else $before end),head_after:(if $after=="" then null else $after end),commits_added:null,review_cost_usd:null,fix_cost_usd:null,review_usage:null,fix_usage:null}]')"
+            cur_save
+        done
+        [[ -n "$cur_ended" ]] || cur_ended=cap
+        cur_save
+    done
+fi
 
 # Repeat passes of the coding leg -- a preset code agent with repeat: N.
 # The point is to distrust a cheap model's premature "done": every pass

@@ -138,13 +138,10 @@ omitted, it defaults to the agent's `repeat` property.
 | `repeat` | required — the loop cap: how many verdict-then-fix rounds may run. |
 | `fix_agent` | who acts on findings — any agent, running on its own harness and model, with its own `repeat`. Omitted, it defaults to the first code step's agent in pipeline order, riding the implement command exactly as fix legs always have. A pipeline with no code step has no such default, so a `review`/`maintain` step without an explicit `fix_agent` there is a parse error. |
 
-Today's run engine only executes a **legacy-shaped** pipeline — one code
-step, then at most one review step, then at most one maintain step, in
-that order. A preset shaped any other way (a review-first pipeline, two
-review steps, a review step repeated after a maintain step, and so on)
-parses and validates successfully, but is refused at launch: the walk
-over an arbitrary step list that would run it does not exist yet. Write
-free-order pipelines against this grammar; run legacy-shaped ones.
+Today's local run engine walks arbitrary linear pipelines. Kubernetes still
+accepts only a **legacy-shaped** pipeline — one code step, then at most one
+review step, then at most one maintain step, in that order. Free-order
+pipelines can otherwise use this grammar directly.
 
 Each round runs the verdict leg; **approval ends the loop** — every
 review and maintain leg ends by writing a verdict whose first line is
