@@ -7466,9 +7466,9 @@ fs_archive_inbox 1 "$harness" "$rc"
 # until then. A run without the flag is untouched and writes it here as
 # always. --refresh-at defers the same way, and for the same reason: a
 # continuation leg can still change $rc below.
-if [[ "$review_loop_cap" == "0" && "$refresh_enabled" == "0" \
-    && "${maintainer_loop_cap:-0}" == "0" && "${code_repeat:-1}" == "1" \
-    && "${composed_pipeline:-0}" != 1 ]]; then
+if [[ "$refresh_enabled" == "0" && "${composed_pipeline:-0}" != 1 \
+    && "$run_step_count" == "1" && "${run_step_kind[1]}" == code \
+    && "${run_step_cap[1]}" == "1" ]]; then
     printf '%s\n' "$rc" > "$run_dir/exit-code"
 fi
 fi
@@ -8082,126 +8082,16 @@ fi
 # off at, for fs_archive_inbox: leg_no is the implement leg's own number (1)
 # when no continuation ran, or the last continuation's number otherwise.
 next_leg_no=$(( ${leg_no:-1} + 1 ))
-review_loop_ended=""
-review_loop_detail=""
-# The coding leg's own exit code ($rc at the moment the gate below runs),
-# recorded here so it survives into every save_review_loop call regardless
-# of how the loop ends -- see the header comment above.
-review_loop_coding_rc=""
-review_iters_done='[]'
 leg_cost=""
 leg_usage=null
 leg_error=""
-
-# One iteration's record, built leg by leg. Anything not established is null
-# rather than 0: "not reported" must never read as "none", which is the rule
-# the implement leg's accounting follows too.
-it_i=""
-it_findings=null
-it_review_exit=null
-it_fix_exit=null
-it_head_before=""
-it_head_after=""
-it_review_cost=null
-it_fix_cost=null
-it_review_usage=null
-it_fix_usage=null
-
-reset_iter() {
-    it_i="$1"
-    it_findings=null
-    it_review_exit=null
-    it_fix_exit=null
-    it_head_before=""
-    it_head_after=""
-    it_review_cost=null
-    it_fix_cost=null
-    it_review_usage=null
-    it_fix_usage=null
-}
-
-# The current iteration as a one-element array, or nothing when there is no
-# current iteration. jq builds it, so every value is escaped whatever it came
-# from. commits_added is null here and filled in after the fetch below: the
-# count needs the objects in the origin repo, and nothing may run git in the
-# clone to take it there.
-iter_json() {
-    [[ -n "$it_i" ]] || return 1
-    jq -c -n \
-        --argjson i "$it_i" \
-        --argjson findings "$it_findings" \
-        --argjson review_exit "$it_review_exit" \
-        --argjson fix_exit "$it_fix_exit" \
-        --arg head_before "$it_head_before" \
-        --arg head_after "$it_head_after" \
-        --argjson review_cost "$it_review_cost" \
-        --argjson fix_cost "$it_fix_cost" \
-        --argjson review_usage "$it_review_usage" \
-        --argjson fix_usage "$it_fix_usage" \
-        '[{
-            i: $i,
-            findings: $findings,
-            review_exit: $review_exit,
-            fix_exit: $fix_exit,
-            head_before: (if $head_before == "" then null else $head_before end),
-            head_after: (if $head_after == "" then null else $head_after end),
-            commits_added: null,
-            review_cost_usd: $review_cost,
-            fix_cost_usd: $fix_cost,
-            review_usage: $review_usage,
-            fix_usage: $fix_usage,
-        }]' 2>/dev/null
-}
-
-# Write review-loop.json from what is known right now. Called after every leg,
-# so a runner killed mid-loop still leaves behind the iterations it finished.
-# Built beside the file and renamed, which is atomic, so a reader watching the
-# run sees one version or the other and never half of one.
-save_review_loop() {
-    local cur
-    cur="$(iter_json)" || cur='[]'
-    [[ -n "$cur" ]] || cur='[]'
-    if jq -n \
-        --argjson cap "$review_loop_cap" \
-        --arg review_model "$review_model" \
-        --arg review_harness "$review_harness" \
-        --arg fix_harness "${fix_harness:-}" \
-        --arg fix_model "${fix_model:-}" \
-        --argjson fix_repeat "${fix_repeat:-1}" \
-        --arg ended "$review_loop_ended" \
-        --arg detail "$review_loop_detail" \
-        --argjson coding_exit_code "${review_loop_coding_rc:-null}" \
-        --argjson prev "$review_iters_done" \
-        --argjson cur "$cur" \
-        '{
-            cap: $cap,
-            review_model: (if $review_model == "" then null else $review_model end),
-            review_harness: (if $review_harness == "" then null else $review_harness end),
-            fix_harness: (if $fix_harness == "" then null else $fix_harness end),
-            fix_model: (if $fix_model == "" then null else $fix_model end),
-            fix_repeat: (if $fix_repeat == 1 then null else $fix_repeat end),
-            ended: (if $ended == "" then null else $ended end),
-            coding_exit_code: $coding_exit_code,
-            detail: (if $detail == "" then null else $detail end),
-            iterations: ($prev + $cur),
-        }' > "$run_dir/review-loop.json.part" 2>/dev/null; then
-        mv -f "$run_dir/review-loop.json.part" "$run_dir/review-loop.json"
-    else
-        rm -f "$run_dir/review-loop.json.part"
-    fi
-}
-
-# Move the current iteration into the finished list and write the file again.
-close_iter() {
-    local cur merged
-    if cur="$(iter_json)" && [[ -n "$cur" ]]; then
-        merged="$(jq -c -n --argjson d "$review_iters_done" --argjson c "$cur" \
-            '$d + $c' 2>/dev/null)"
-        [[ -n "$merged" ]] && review_iters_done="$merged"
-    fi
-    it_i=""
-    save_review_loop
-}
+# The summary block's review line gates on this being non-empty, unguarded
+# (the maintainer line's sibling carries its own ${...:-} default instead,
+# since a no-maintainer run.sh never emits maintainer_loop_ended at all) --
+# so this default must exist for every run shape, composed and legacy alike,
+# not just the ones that end up assigning it a real value.
+review_loop_ended=""
+review_loop_detail=""
 
 # Run one leg: kind (review or fix), iteration number, prompt file. Sets
 # leg_rc, leg_cost (a number, or empty when the harness does not report one),
@@ -8522,56 +8412,106 @@ run_leg() {
 # the same run_leg accounting primitive as the fixed tiers; only the loop
 # record name and the seat index differ.  Composed records keep review field
 # names for review and maintain steps, per the pipeline schema.
-if [[ "${composed_pipeline:-0}" == 1 ]]; then
-    cur_first_code=0
-    cur_first_code_ran=0
-    for ((cur_scan = 1; cur_scan <= run_step_count; cur_scan++)); do
-        [[ "${run_step_kind[$cur_scan]}" == code ]] && { cur_first_code="$cur_scan"; break; }
-    done
-    [[ "$cur_first_code" == 1 && "${run_step_kind[1]}" == code ]] && cur_first_code_ran=1
-    for ((cur_step_no = 1; cur_step_no <= run_step_count; cur_step_no++)); do
-        cur_kind="${run_step_kind[$cur_step_no]}"
-        cur_step_idx="${run_step_idx[$cur_step_no]}"
-        cur_cap="${run_step_cap[$cur_step_no]}"
-        cur_prompt="${run_step_prompt[$cur_step_no]}"
+cur_first_code=0
+cur_first_code_ran=0
+for ((cur_scan = 1; cur_scan <= run_step_count; cur_scan++)); do
+    [[ "${run_step_kind[$cur_scan]}" == code ]] && { cur_first_code="$cur_scan"; break; }
+done
+[[ "$cur_first_code" == 1 && "${run_step_kind[1]}" == code ]] && cur_first_code_ran=1
+for ((cur_step_no = 1; cur_step_no <= run_step_count; cur_step_no++)); do
+    cur_kind="${run_step_kind[$cur_step_no]}"
+    cur_step_idx="${run_step_idx[$cur_step_no]}"
+    cur_cap="${run_step_cap[$cur_step_no]}"
+    cur_prompt="${run_step_prompt[$cur_step_no]}"
+    cur_legacy=0; [[ -z "$cur_step_idx" ]] && cur_legacy=1
+    if [[ "$cur_legacy" == 1 ]]; then
+        cur_inner_prompt=""
+        if [[ "$cur_kind" == maintainer ]]; then
+            cur_model="${maintainer_model:-}"; cur_harness="${maintainer_harness:-}"
+            cur_fix_model="${mntfix_model:-}"; cur_fix_harness="${mntfix_harness:-}"
+            cur_fix_repeat="${mntfix_repeat:-1}"
+            cur_verdict_file="${maintainer_verdict_file:-}"
+        else
+            cur_model="$review_model"; cur_harness="$review_harness"
+            cur_fix_model="${fix_model:-}"; cur_fix_harness="${fix_harness:-}"
+            cur_fix_repeat="${fix_repeat:-1}"
+            cur_verdict_file="$review_verdict_file"
+        fi
+    else
         cur_model_var="${cur_step_idx}_model"; cur_model="${!cur_model_var}"
         cur_harness_var="${cur_step_idx}_harness"; cur_harness="${!cur_harness_var}"
         cur_inner_prompt_var="${cur_step_idx}_prompt_inner_review"; cur_inner_prompt="${!cur_inner_prompt_var:-}"
         cur_fix_model_var="${cur_step_idx}fix_model"; cur_fix_model="${!cur_fix_model_var:-}"
         cur_fix_harness_var="${cur_step_idx}fix_harness"; cur_fix_harness="${!cur_fix_harness_var:-}"
         cur_fix_repeat_var="${cur_step_idx}fix_repeat"; cur_fix_repeat="${!cur_fix_repeat_var:-1}"
-        # The first code pass is the historical implementation invocation.
-        if [[ "$cur_kind" == code ]]; then
-            cur_pass=1
-            if (( cur_step_no == cur_first_code && cur_first_code_ran )); then cur_pass=2; fi
-            for ((; cur_pass <= cur_cap && rc == 0; cur_pass++)); do
-                run_leg code "$cur_pass" "$handoff" "$cur_step_idx"
-                rc="$leg_rc"
-            done
-            continue
+        cur_verdict_file="$clone_dir/.git/${cur_step_idx}-verdict.md"
+    fi
+    cur_fix_kind=fix
+    [[ "$cur_legacy" == 1 && "$cur_kind" == maintainer ]] && cur_fix_kind=mntfix
+    cur_coding_rc="$rc"
+    [[ "$cur_legacy" == 1 && "$cur_kind" == review && "$mode" == "review-only" ]] && cur_coding_rc=""
+    # The first code pass is the historical implementation invocation.
+    if [[ "$cur_kind" == code ]]; then
+        cur_pass=1
+        if (( cur_step_no == cur_first_code && cur_first_code_ran )); then cur_pass=2; fi
+        for ((; cur_pass <= cur_cap && rc == 0; cur_pass++)); do
+            run_leg code "$cur_pass" "$handoff" "$cur_step_idx"
+            rc="$leg_rc"
+        done
+        continue
+    fi
+    if [[ "$cur_legacy" == 1 ]]; then
+        if [[ "$cur_kind" == maintainer ]]; then
+            cur_loop_json="$run_dir/maintainer-loop.json"
+        else
+            cur_loop_json="$run_dir/review-loop.json"
         fi
+    else
         cur_loop_json="$run_dir/step-${cur_step_no}-loop.json"
-        cur_ended=""; cur_detail=""; cur_iters='[]'
-        cur_head="$(clone_branch_head)"
-        if [[ -z "$cur_head" ]]; then cur_ended=skipped; cur_detail="branch $branch could not be read from the clone"
-        elif [[ "$cur_head" == "$base_sha" ]]; then cur_ended=skipped; cur_detail="the branch holds no commits, so there is nothing to review"; fi
-        cur_save() {
+    fi
+    cur_ended=""; cur_detail=""; cur_iters='[]'
+    cur_head="$(clone_branch_head)"
+    if [[ -z "$cur_head" ]]; then
+        cur_ended=skipped; cur_detail="branch $branch could not be read from the clone"
+    elif [[ "$cur_head" == "$base_sha" ]]; then
+        cur_ended=skipped
+        if [[ "$cur_legacy" == 1 && "$cur_kind" == review ]]; then
+            cur_detail="the session committed nothing, so there is nothing to review"
+        else
+            cur_detail="the branch holds no commits, so there is nothing to review"
+        fi
+    fi
+    cur_save() {
+        if [[ "$cur_legacy" == 1 && "$cur_kind" == maintainer ]]; then
+            jq -n --argjson cap "$cur_cap" --arg maintainer_model "$cur_model" --arg maintainer_harness "$cur_harness" \
+                --arg fix_harness "$cur_fix_harness" --arg fix_model "$cur_fix_model" --argjson fix_repeat "$cur_fix_repeat" \
+                --arg ended "$cur_ended" --arg detail "$cur_detail" --argjson coding_exit_code "${cur_coding_rc:-null}" --argjson iterations "$cur_iters" \
+                '{cap:$cap,maintainer_model:(if $maintainer_model=="" then null else $maintainer_model end),maintainer_harness:(if $maintainer_harness=="" then null else $maintainer_harness end),fix_harness:(if $fix_harness=="" then null else $fix_harness end),fix_model:(if $fix_model=="" then null else $fix_model end),fix_repeat:(if $fix_repeat==1 then null else $fix_repeat end),ended:(if $ended=="" then null else $ended end),detail:(if $detail=="" then null else $detail end),coding_exit_code:$coding_exit_code,iterations:$iterations}' > "$cur_loop_json.part" 2>/dev/null && mv -f "$cur_loop_json.part" "$cur_loop_json"
+        else
             jq -n --argjson cap "$cur_cap" --arg review_model "$cur_model" --arg review_harness "$cur_harness" \
                 --arg fix_harness "$cur_fix_harness" --arg fix_model "$cur_fix_model" --argjson fix_repeat "$cur_fix_repeat" \
-                --arg ended "$cur_ended" --arg detail "$cur_detail" --argjson coding_exit_code "${rc:-null}" --argjson iterations "$cur_iters" \
+                --arg ended "$cur_ended" --arg detail "$cur_detail" --argjson coding_exit_code "${cur_coding_rc:-null}" --argjson iterations "$cur_iters" \
                 '{cap:$cap,review_model:(if $review_model=="" then null else $review_model end),review_harness:(if $review_harness=="" then null else $review_harness end),fix_harness:(if $fix_harness=="" then null else $fix_harness end),fix_model:(if $fix_model=="" then null else $fix_model end),fix_repeat:(if $fix_repeat==1 then null else $fix_repeat end),ended:(if $ended=="" then null else $ended end),detail:(if $detail=="" then null else $detail end),coding_exit_code:$coding_exit_code,iterations:$iterations}' > "$cur_loop_json.part" 2>/dev/null && mv -f "$cur_loop_json.part" "$cur_loop_json"
-        }
-        for ((cur_i = 1; cur_i <= cur_cap; cur_i++)); do
-            [[ -z "$cur_ended" ]] || break
-            cur_verdict_file="$clone_dir/.git/${cur_step_idx}-verdict.md"
-            rm -f "$cur_verdict_file"
+        fi
+    }
+    for ((cur_i = 1; cur_i <= cur_cap; cur_i++)); do
+        [[ -z "$cur_ended" ]] || break
+        rm -f "$cur_verdict_file"
+        if [[ "$cur_legacy" == 1 ]]; then
+            if [[ "$cur_kind" == maintainer ]]; then
+                cur_prompt_iter="$run_dir/maintainer-prompt-$cur_i.md"
+            else
+                cur_prompt_iter="$run_dir/review-prompt-$cur_i.md"
+            fi
+        else
             cur_prompt_iter="$run_dir/step-${cur_step_no}-prompt-${cur_i}.md"
+        fi
             # A maintain step's first pass receives the nearest preceding
             # verdict of either review-flavored kind; later passes receive
             # its own previous verdict.  Select the matching static prompt
             # base before writing it, so its role paragraph is truthful.
             cur_prev=""
-            if [[ "$cur_kind" == maintainer ]]; then
+            if [[ "$cur_legacy" != 1 && "$cur_kind" == maintainer ]]; then
                 if (( cur_i > 1 )); then cur_prev="$run_dir/${cur_step_idx}-maintain-verdict-$((cur_i-1)).md"
                 else
                     for ((cur_j = cur_step_no - 1; cur_j >= 1; cur_j--)); do
@@ -8585,6 +8525,9 @@ if [[ "${composed_pipeline:-0}" == 1 ]]; then
             [[ -n "$cur_prev" && -f "$cur_prev" && -n "$cur_inner_prompt" ]] && cur_prompt_base="$cur_inner_prompt"
             {
                 cat -- "$cur_prompt_base"
+                if [[ "$cur_legacy" == 1 && -n "$cur_coding_rc" && "$cur_coding_rc" != "0" ]]; then
+                    fs_emit_coding_exit_note "$cur_coding_rc"
+                fi
                 cur_addenda_list="$(fs_addenda_dirs)"
                 if [[ -n "$cur_addenda_list" ]]; then
                     printf '\n---\n\n## Operator addenda delivered to earlier legs of this run\n\n'
@@ -8596,8 +8539,59 @@ if [[ "${composed_pipeline:-0}" == 1 ]]; then
                         done
                     done <<< "$cur_addenda_list"
                 fi
+                if [[ "$cur_legacy" == 1 && "$cur_kind" == maintainer ]]; then
+                    if [[ "${review_loop_cap:-0}" != "0" ]]; then
+                        cur_mp_verdict=""
+                        cur_mp_n=0
+                        for cur_mp_v in "$run_dir"/review-verdict-*.md; do
+                            [[ -f "$cur_mp_v" ]] || continue
+                            cur_mp_v_n="${cur_mp_v##*/review-verdict-}"
+                            cur_mp_v_n="${cur_mp_v_n%.md}"
+                            [[ "$cur_mp_v_n" =~ ^[0-9]+$ ]] || continue
+                            if (( cur_mp_v_n > cur_mp_n )); then
+                                cur_mp_n="$cur_mp_v_n"
+                                cur_mp_verdict="$cur_mp_v"
+                            fi
+                        done
+                        if [[ -n "$cur_mp_verdict" ]]; then
+                            printf '\n---\n\n## The inner review'\''s final verdict\n\n'
+                            printf 'The review loop read the diff line by line before this loop\n'
+                            printf 'started. Its verdict from iteration %s is below, in full: this\n' "$cur_mp_n"
+                            printf 'is the "findings to build on" the prompt above names. Build on\n'
+                            printf 'it rather than re-review what the loop already reviewed -- but\n'
+                            printf 'it is the loop'\''s account of the branch as it stood when the\n'
+                            printf 'loop ended, and the fix legs have committed since, so check\n'
+                            printf 'each finding against what is there now.\n\n'
+                            cat -- "$cur_mp_verdict"
+                        else
+                            printf '\n---\n\n## The inner review left no verdict\n\n'
+                            printf 'The review loop was requested, but it ended (%s) without\n' \
+                                "${review_loop_ended:-unknown}"
+                            printf 'leaving a usable verdict, so there are no findings to build\n'
+                            printf 'on despite what the prompt above says: read the diff\n'
+                            printf 'yourself.\n'
+                        fi
+                    fi
+                    if (( cur_i > 1 )); then
+                        cur_mp_mnt_prev="$run_dir/maintainer-verdict-$(( cur_i - 1 )).md"
+                        if [[ -f "$cur_mp_mnt_prev" ]]; then
+                            printf '\n---\n\n## The previous maintainer iteration'\''s verdict\n\n'
+                            printf 'The prompt above was written for this loop'\''s first pass, and its\n'
+                            printf 'account of what has already been read is stale now: maintainer\n'
+                            printf 'iteration %s has already reviewed this branch, and its\n' "$(( cur_i - 1 ))"
+                            printf 'verdict, in full, is below. It is a FINDINGS verdict -- had it\n'
+                            printf 'approved, the loop would have ended -- and the fix leg that has\n'
+                            printf 'committed since was handed exactly those findings. It is the\n'
+                            printf 'most recent review this branch has had, ahead of the review\n'
+                            printf 'loop'\''s verdict above where one was appended. Read it to know\n'
+                            printf 'which of the problems you find were already seen, and what was\n'
+                            printf 'committed in answer, then review the branch as it stands now.\n\n'
+                            cat -- "$cur_mp_mnt_prev"
+                        fi
+                    fi
+                fi
             } > "$cur_prompt_iter"
-            if [[ "$cur_kind" == maintainer ]]; then
+            if [[ "$cur_legacy" != 1 && "$cur_kind" == maintainer ]]; then
                 if [[ -n "$cur_prev" && -f "$cur_prev" ]]; then
                     printf '\n---\n\n## The previous verdict\n\n' >> "$cur_prompt_iter"
                     cat -- "$cur_prev" >> "$cur_prompt_iter"
@@ -8605,753 +8599,138 @@ if [[ "${composed_pipeline:-0}" == 1 ]]; then
             fi
             run_leg "$cur_kind" "$cur_i" "$cur_prompt_iter" "$cur_step_idx"
             cur_review_exit="$leg_rc"; cur_review_cost="${leg_cost:-null}"; cur_review_usage="${leg_usage:-null}"; cur_fix_exit=null; cur_fix_cost=null; cur_fix_usage=null; cur_findings=null; cur_before="$cur_head"; cur_after=""
-            if [[ "$leg_rc" != 0 || ! -s "$cur_verdict_file" || -L "$cur_verdict_file" ]]; then cur_ended=harness-error; cur_detail="the $cur_kind leg of iteration $cur_i left no usable verdict"
+            if [[ "$cur_legacy" == 1 ]]; then
+                if [[ "$leg_rc" != 0 ]]; then
+                    cur_ended=harness-error; cur_detail="the $cur_kind leg of iteration $cur_i exited $leg_rc${leg_error:+ ($leg_error)}"
+                elif [[ -L "$cur_verdict_file" || ! -f "$cur_verdict_file" ]]; then
+                    cur_ended=harness-error; cur_detail="the $cur_kind leg of iteration $cur_i left no verdict at $cur_verdict_file"
+                else
+                    if [[ "$cur_kind" == maintainer ]]; then
+                        cur_copy="$run_dir/maintainer-verdict-$cur_i.md"
+                    else
+                        cur_copy="$run_dir/review-verdict-$cur_i.md"
+                    fi
+                    cp -- "$cur_verdict_file" "$cur_copy" 2>/dev/null
+                    rm -f "$cur_verdict_file"
+                    if [[ ! -s "$cur_copy" ]]; then
+                        cur_ended=harness-error; cur_detail="the $cur_kind leg of iteration $cur_i wrote an empty verdict"
+                    else
+                        cur_line="$(head -n1 "$cur_copy" | tr -d '\000-\037\177' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+                        if [[ "$cur_line" == APPROVED ]]; then
+                            cur_findings=0; cur_ended=approved
+                        elif [[ "$cur_line" == FINDINGS ]]; then
+                            cur_findings="$(awk 'NR == 1 { next } /^## Report$/ { exit } /^[[:space:]]*$/ { if (hit) n++; hit = 0; next } /[^[:space:]:]+:[0-9]+/ { hit = 1 } END { if (hit) n++; print n + 0 }' "$cur_copy" 2>/dev/null)"
+                            [[ "$cur_findings" =~ ^[0-9]+$ ]] || cur_findings=null
+                            if [[ "$cur_kind" == review && "$mode" == "review-only" ]]; then
+                                cur_ended=findings
+                            else
+                                if [[ "$cur_kind" == maintainer ]]; then
+                                    cur_fix_prompt="$run_dir/maintainer-fix-prompt-${cur_i}.md"
+                                    cur_fix_header="$fix_prompt_header"
+                                    [[ -n "${fxm_fix_prompt_header:-}" ]] && cur_fix_header="$fxm_fix_prompt_header"
+                                else
+                                    cur_fix_prompt="$run_dir/fix-prompt-${cur_i}.md"
+                                    cur_fix_header="$fix_prompt_header"
+                                    [[ -n "${fxr_fix_prompt_header:-}" ]] && cur_fix_header="$fxr_fix_prompt_header"
+                                fi
+                                { cat -- "$cur_fix_header"; printf '\n---\n\n'; awk '/^## Report$/ { exit } { print }' "$cur_copy"; } > "$cur_fix_prompt.part"
+                                mv -f "$cur_fix_prompt.part" "$cur_fix_prompt"
+                                cur_fix_cost=null; cur_fix_known=1
+                                for ((cur_fix_pass = 1; cur_fix_pass <= cur_fix_repeat; cur_fix_pass++)); do
+                                    cur_fix_leg="$cur_i"; (( cur_fix_pass > 1 )) && cur_fix_leg="$cur_i-p$cur_fix_pass"
+                                    run_leg "$cur_fix_kind" "$cur_fix_leg" "$cur_fix_prompt"
+                                    cur_fix_exit="$leg_rc"
+                                    if [[ -n "$leg_cost" ]]; then
+                                        [[ "$cur_fix_cost" != null ]] && cur_fix_cost="$(jq -n --argjson a "$cur_fix_cost" --argjson b "$leg_cost" '$a + $b')" || cur_fix_cost="$leg_cost"
+                                    else cur_fix_known=0; fi
+                                    [[ "$leg_rc" == 0 ]] || break
+                                done
+                                (( cur_fix_known )) || cur_fix_cost=null
+                                (( cur_fix_repeat == 1 )) && cur_fix_usage="${leg_usage:-null}"
+                                cur_after="$(clone_branch_head)"
+                                if [[ "$leg_rc" != 0 ]]; then
+                                    cur_ended=harness-error; cur_detail="the fix leg of iteration $cur_i exited $leg_rc${leg_error:+ ($leg_error)}"
+                                elif [[ -z "$cur_after" ]]; then
+                                    cur_ended=harness-error; cur_detail="branch $branch could not be read from the clone after the fix leg of iteration $cur_i"
+                                elif [[ "$cur_after" == "$cur_before" ]]; then
+                                    cur_ended=no-progress
+                                else
+                                    cur_head="$cur_after"
+                                fi
+                            fi
+                        else
+                            cur_ended=harness-error; cur_detail="the $cur_kind leg of iteration $cur_i wrote a first line that is neither APPROVED nor FINDINGS"
+                        fi
+                    fi
+                fi
             else
-                cur_copy="$run_dir/${cur_step_idx}-$([[ "$cur_kind" == maintainer ]] && echo maintain || echo review)-verdict-${cur_i}.md"
-                cp -- "$cur_verdict_file" "$cur_copy"; rm -f "$cur_verdict_file"
-                cur_line="$(head -n1 "$cur_copy" | tr -d '\000-\037\177' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-                if [[ "$cur_line" == APPROVED ]]; then cur_findings=0; cur_ended=approved
-                elif [[ "$cur_line" == FINDINGS ]]; then
-                    cur_findings="$(awk 'NR == 1 { next } /^## Report$/ { exit } /^[[:space:]]*$/ { if (hit) n++; hit = 0; next } /[^[:space:]:]+:[0-9]+/ { hit = 1 } END { if (hit) n++; print n + 0 }' "$cur_copy" 2>/dev/null)"
-                    [[ "$cur_findings" =~ ^[0-9]+$ ]] || cur_findings=null
-                    cur_fix_prompt="$run_dir/${cur_step_idx}-fix-prompt-${cur_i}.md"; cur_fix_header_var="${cur_step_idx}fix_prompt_header"; { cat -- "${!cur_fix_header_var}"; printf '\n---\n\n'; awk '/^## Report$/ { exit } { print }' "$cur_copy"; } > "$cur_fix_prompt"
-                    cur_fix_cost=null; cur_fix_known=1
-                    for ((cur_fix_pass = 1; cur_fix_pass <= cur_fix_repeat; cur_fix_pass++)); do
-                        cur_fix_leg="$cur_i"; (( cur_fix_pass > 1 )) && cur_fix_leg="$cur_i-p$cur_fix_pass"
-                        run_leg fix "$cur_fix_leg" "$cur_fix_prompt" "$cur_step_idx"; cur_fix_exit="$leg_rc"
-                        if [[ -n "$leg_cost" ]]; then
-                            [[ "$cur_fix_cost" != null ]] && cur_fix_cost="$(jq -n --argjson a "$cur_fix_cost" --argjson b "$leg_cost" '$a + $b')" || cur_fix_cost="$leg_cost"
-                        else cur_fix_known=0; fi
-                        [[ "$leg_rc" == 0 ]] || break
-                    done
-                    (( cur_fix_known )) || cur_fix_cost=null
-                    (( cur_fix_repeat == 1 )) && cur_fix_usage="${leg_usage:-null}"
-                    cur_after="$(clone_branch_head)"
-                    if [[ "$leg_rc" != 0 ]]; then cur_ended=harness-error; cur_detail="the fix leg of iteration $cur_i exited $leg_rc"
-                    elif [[ -z "$cur_after" ]]; then cur_ended=harness-error; cur_detail="branch $branch could not be read from the clone after the fix leg of iteration $cur_i"
-                    elif [[ "$cur_after" == "$cur_before" ]]; then cur_ended=no-progress
-                    else cur_head="$cur_after"; fi
-                else cur_ended=harness-error; cur_detail="the $cur_kind leg of iteration $cur_i wrote an invalid verdict"; fi
+                if [[ "$leg_rc" != 0 || ! -s "$cur_verdict_file" || -L "$cur_verdict_file" ]]; then cur_ended=harness-error; cur_detail="the $cur_kind leg of iteration $cur_i left no usable verdict"
+                else
+                    cur_copy="$run_dir/${cur_step_idx}-$([[ "$cur_kind" == maintainer ]] && echo maintain || echo review)-verdict-${cur_i}.md"
+                    cp -- "$cur_verdict_file" "$cur_copy"; rm -f "$cur_verdict_file"
+                    cur_line="$(head -n1 "$cur_copy" | tr -d '\000-\037\177' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+                    if [[ "$cur_line" == APPROVED ]]; then cur_findings=0; cur_ended=approved
+                    elif [[ "$cur_line" == FINDINGS ]]; then
+                        cur_findings="$(awk 'NR == 1 { next } /^## Report$/ { exit } /^[[:space:]]*$/ { if (hit) n++; hit = 0; next } /[^[:space:]:]+:[0-9]+/ { hit = 1 } END { if (hit) n++; print n + 0 }' "$cur_copy" 2>/dev/null)"
+                        [[ "$cur_findings" =~ ^[0-9]+$ ]] || cur_findings=null
+                        cur_fix_prompt="$run_dir/${cur_step_idx}-fix-prompt-${cur_i}.md"; cur_fix_header_var="${cur_step_idx}fix_prompt_header"; { cat -- "${!cur_fix_header_var}"; printf '\n---\n\n'; awk '/^## Report$/ { exit } { print }' "$cur_copy"; } > "$cur_fix_prompt"
+                        cur_fix_cost=null; cur_fix_known=1
+                        for ((cur_fix_pass = 1; cur_fix_pass <= cur_fix_repeat; cur_fix_pass++)); do
+                            cur_fix_leg="$cur_i"; (( cur_fix_pass > 1 )) && cur_fix_leg="$cur_i-p$cur_fix_pass"
+                            run_leg fix "$cur_fix_leg" "$cur_fix_prompt" "$cur_step_idx"; cur_fix_exit="$leg_rc"
+                            if [[ -n "$leg_cost" ]]; then
+                                [[ "$cur_fix_cost" != null ]] && cur_fix_cost="$(jq -n --argjson a "$cur_fix_cost" --argjson b "$leg_cost" '$a + $b')" || cur_fix_cost="$leg_cost"
+                            else cur_fix_known=0; fi
+                            [[ "$leg_rc" == 0 ]] || break
+                        done
+                        (( cur_fix_known )) || cur_fix_cost=null
+                        (( cur_fix_repeat == 1 )) && cur_fix_usage="${leg_usage:-null}"
+                        cur_after="$(clone_branch_head)"
+                        if [[ "$leg_rc" != 0 ]]; then cur_ended=harness-error; cur_detail="the fix leg of iteration $cur_i exited $leg_rc"
+                        elif [[ -z "$cur_after" ]]; then cur_ended=harness-error; cur_detail="branch $branch could not be read from the clone after the fix leg of iteration $cur_i"
+                        elif [[ "$cur_after" == "$cur_before" ]]; then cur_ended=no-progress
+                        else cur_head="$cur_after"; fi
+                    else cur_ended=harness-error; cur_detail="the $cur_kind leg of iteration $cur_i wrote an invalid verdict"; fi
+                fi
             fi
-            cur_iters="$(jq -cn --argjson old "$cur_iters" --argjson i "$cur_i" --argjson findings "$cur_findings" --argjson review_exit "$cur_review_exit" --argjson fix_exit "$cur_fix_exit" --argjson review_cost "$cur_review_cost" --argjson fix_cost "$cur_fix_cost" --argjson review_usage "$cur_review_usage" --argjson fix_usage "$cur_fix_usage" --arg before "$cur_before" --arg after "$cur_after" '$old + [{i:$i,findings:$findings,review_exit:$review_exit,fix_exit:$fix_exit,head_before:(if $before=="" then null else $before end),head_after:(if $after=="" then null else $after end),commits_added:null,review_cost_usd:$review_cost,fix_cost_usd:$fix_cost,review_usage:$review_usage,fix_usage:$fix_usage}]')"
+            if [[ "$cur_legacy" == 1 && "$cur_kind" == maintainer ]]; then
+                cur_iters="$(jq -cn --argjson old "$cur_iters" --argjson i "$cur_i" --argjson findings "$cur_findings" --argjson maintainer_exit "$cur_review_exit" --argjson fix_exit "$cur_fix_exit" --argjson maintainer_cost "$cur_review_cost" --argjson fix_cost "$cur_fix_cost" --argjson maintainer_usage "$cur_review_usage" --argjson fix_usage "$cur_fix_usage" --arg before "$cur_before" --arg after "$cur_after" '$old + [{i:$i,findings:$findings,maintainer_exit:$maintainer_exit,fix_exit:$fix_exit,head_before:(if $before=="" then null else $before end),head_after:(if $after=="" then null else $after end),commits_added:null,maintainer_cost_usd:$maintainer_cost,fix_cost_usd:$fix_cost,maintainer_usage:$maintainer_usage,fix_usage:$fix_usage}]')"
+            else
+                cur_iters="$(jq -cn --argjson old "$cur_iters" --argjson i "$cur_i" --argjson findings "$cur_findings" --argjson review_exit "$cur_review_exit" --argjson fix_exit "$cur_fix_exit" --argjson review_cost "$cur_review_cost" --argjson fix_cost "$cur_fix_cost" --argjson review_usage "$cur_review_usage" --argjson fix_usage "$cur_fix_usage" --arg before "$cur_before" --arg after "$cur_after" '$old + [{i:$i,findings:$findings,review_exit:$review_exit,fix_exit:$fix_exit,head_before:(if $before=="" then null else $before end),head_after:(if $after=="" then null else $after end),commits_added:null,review_cost_usd:$review_cost,fix_cost_usd:$fix_cost,review_usage:$review_usage,fix_usage:$fix_usage}]')"
+            fi
             cur_save
         done
         [[ -n "$cur_ended" ]] || cur_ended=cap
         cur_save
-    done
-fi
-
-# Repeat passes of the coding leg -- a preset code agent with repeat: N.
-# The point is to distrust a cheap model's premature "done": every pass
-# re-reads the same prompt, finds the work already in place, and checks,
-# polishes and fixes -- so there is deliberately no early exit on a pass
-# that "looks finished". Passes stop early only on a harness error: a dead
-# run is not polished, it is dead. Each pass is an ordinary leg (its own
-# events-code-N.jsonl, its own accounting through run_leg), and rc ends as
-# the LAST pass's exit -- recorded below as coding_exit_code, but never
-# itself a reason the review loop skips (see the header comment above). A
-# pass does not context-refresh: the refresh loop above belongs to the
-# first pass alone.
-if [[ "${code_repeat:-1}" != "1" && "$mode" != "review-only" ]]; then
-    code_pass=2
-    while (( code_pass <= ${code_repeat:-1} )) && [[ "$rc" == "0" ]]; do
-        run_leg code "$code_pass" "$handoff"
-        rc="$leg_rc"
-        code_pass=$(( code_pass + 1 ))
-    done
-    # The exit-code deferral above skipped publishing while repeat passes
-    # were pending; when nothing else follows, this is where the run ends.
-    if [[ "$review_loop_cap" == "0" && "$refresh_enabled" == "0" \
-        && "${maintainer_loop_cap:-0}" == "0" ]]; then
-        printf '%s\n' "$rc" > "$run_dir/exit-code"
-    fi
-fi
-
-if [[ "$review_loop_cap" != "0" && -n "$review_prompt" ]]; then
-    # Whether the branch holds work decides whether the loop runs -- the exit
-    # code is recorded (coding_exit_code, below) but is never itself a skip
-    # reason. See the header comment above. In --review-only mode $rc is
-    # just its unused initial 0 (no coding leg runs), so recording it would
-    # forge a clean coding leg that never existed -- leave it unset, which
-    # save_review_loop turns into the record's null.
-    if [[ "$mode" != "review-only" ]]; then
-        review_loop_coding_rc="$rc"
-    fi
-    loop_head="$(clone_branch_head)"
-    if [[ -z "$loop_head" ]]; then
-        review_loop_ended="skipped"
-        review_loop_detail="branch $branch could not be read from the clone"
-    elif [[ "$loop_head" == "$base_sha" ]]; then
-        review_loop_ended="skipped"
-        review_loop_detail="the session committed nothing, so there is nothing to review"
-    fi
-    # A non-zero $rc here is not a skip reason, and detail is documented as
-    # "why the loop ended" (harness-error | skipped) -- coding_exit_code,
-    # set just above, already carries the coding leg's own exit status, and
-    # the review prompt below tells the reviewer about it directly.
-
-    loop_i=1
-    while [[ -z "$review_loop_ended" ]] && (( loop_i <= review_loop_cap )); do
-        reset_iter "$loop_i"
-        it_head_before="$loop_head"
-        save_review_loop
-
-        # A verdict from a previous iteration must never be read as this
-        # one's, so the path starts empty whatever left something there.
-        rm -f "$review_verdict_file"
-
-        # review_prompt is static, built once at launch -- but the review
-        # prompt body (fs_emit_review_prompt_body) tells the review leg that
-        # an unfollowed addendum is a finding, and by the time any review
-        # leg runs, fs_archive_inbox has already moved every addendum an
-        # earlier claude leg saw out of the live inbox this sandbox binds
-        # and into inbox-delivered/, where nothing but this leg's own prompt
-        # (built fresh here, the same way refresh_build_prompt does it for a
-        # continuation) ever carries it back. Without this, the review leg's
-        # own contract is impossible to meet on exactly the harness where it
-        # is enforceable: it would approve a branch that left a claude leg's
-        # addendum unfollowed, for no reason it could see.
-        review_prompt_iter="$run_dir/review-prompt-$loop_i.md"
-        {
-            cat -- "$review_prompt"
-            # The coding leg failed on something -- possibly after it
-            # committed the very work under review. Told once, up front,
-            # via fs_emit_coding_exit_note (fork-sandbox-lib.sh), rather than
-            # left for the reviewer to infer from a clean-looking diff and
-            # approve as if nothing had gone wrong.
-            if [[ -n "$review_loop_coding_rc" && "$review_loop_coding_rc" != "0" ]]; then
-                fs_emit_coding_exit_note "$review_loop_coding_rc"
-            fi
-            rp_addenda_list="$(fs_addenda_dirs)"
-            if [[ -n "$rp_addenda_list" ]]; then
-                printf '\n---\n\n## Operator addenda delivered to earlier legs of this run\n\n'
-                printf 'The operator sent the messages below to an earlier leg of this run,\n'
-                printf 'oldest first. The live inbox bound into this sandbox no longer holds\n'
-                printf 'them -- a claude leg archives what it saw the moment it ends -- so\n'
-                printf 'this is the only copy this leg will see. Check the commit range\n'
-                printf 'under review against each one: if it asks for work the commits do\n'
-                printf 'not contain, that is a finding under "An unfollowed addendum is a\n'
-                printf 'finding" above, citing the message file itself.\n'
-                while IFS= read -r rp_dir; do
-                    [[ -n "$rp_dir" ]] || continue
-                    for rp_file in "$rp_dir"/*.md; do
-                        [[ -f "$rp_file" ]] || continue
-                        printf '\n### %s\n\n' "${rp_file##*/}"
-                        cat -- "$rp_file"
-                    done
-                done <<< "$rp_addenda_list"
-            fi
-        } > "$review_prompt_iter.part"
-        mv -- "$review_prompt_iter.part" "$review_prompt_iter"
-
-        run_leg review "$loop_i" "$review_prompt_iter"
-        it_review_exit="$leg_rc"
-        it_review_cost="${leg_cost:-null}"
-        it_review_usage="$leg_usage"
-        save_review_loop
-        if [[ "$leg_rc" != "0" ]]; then
-            review_loop_ended="harness-error"
-            review_loop_detail="the review leg of iteration $loop_i exited $leg_rc${leg_error:+ ($leg_error)}"
-            close_iter
-            break
-        fi
-
-        # The verdict is DATA. It is copied, counted and concatenated into a
-        # prompt file -- never sourced, never evaluated, never put on a
-        # command line. It is also written by a session, so a symlink at that
-        # path is not a verdict: refuse it rather than follow it out of the
-        # clone.
-        verdict_copy="$run_dir/review-verdict-$loop_i.md"
-        if [[ -L "$review_verdict_file" || ! -f "$review_verdict_file" ]]; then
-            review_loop_ended="harness-error"
-            review_loop_detail="the review leg of iteration $loop_i left no verdict at $review_verdict_file"
-            close_iter
-            break
-        fi
-        # The run dir outlives the clone, so the copy is the record. Take the
-        # original away in the same breath, so iteration i+1 cannot re-read it.
-        cp -- "$review_verdict_file" "$verdict_copy" 2>/dev/null
-        rm -f "$review_verdict_file"
-        if [[ ! -s "$verdict_copy" ]]; then
-            review_loop_ended="harness-error"
-            review_loop_detail="the review leg of iteration $loop_i wrote an empty verdict"
-            close_iter
-            break
-        fi
-
-        # Untrusted text on its way to a terminal: strip control characters so
-        # an ESC or a CR in the verdict cannot spoof the pane or the monitor.
-        verdict_line="$(head -n 1 "$verdict_copy" | tr -d '\000-\037\177' \
-            | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-        # Deliberately nothing here checks the "## Report" section. The first
-        # line is the contract; the report is a courtesy to the orchestrator,
-        # and an absent, empty or duplicated one must never turn a valid
-        # verdict into a failed loop -- fork-sandbox-status.sh falls back to
-        # printing the whole verdict when the section is not usable.
-        case "$verdict_line" in
-        APPROVED)
-            it_findings=0
-            review_loop_ended="approved"
-            printf 'fork-sandbox: review iteration %s: APPROVED\n' "$loop_i"
-            close_iter
-            break
-            ;;
-        FINDINGS)
-            ;;
-        *)
-            review_loop_ended="harness-error"
-            review_loop_detail="the review leg of iteration $loop_i wrote a first line that is neither APPROVED nor FINDINGS"
-            close_iter
-            break
-            ;;
-        esac
-
-        # One finding per paragraph, each citing file:line -- so count the
-        # paragraphs that carry a citation. That is what the prompt asks for
-        # and all that can be counted without reading the prose.
-        it_findings="$(awk '
-            NR == 1 { next }
-            /^## Report$/ { exit }
-            /^[[:space:]]*$/ { if (hit) n++; hit = 0; next }
-            /[^[:space:]:]+:[0-9]+/ { hit = 1 }
-            END { if (hit) n++; print n + 0 }' "$verdict_copy" 2>/dev/null)"
-        [[ "$it_findings" =~ ^[0-9]+$ ]] || it_findings=null
-        printf 'fork-sandbox: review iteration %s: FINDINGS (%s cited)\n' \
-            "$loop_i" "$it_findings"
-        save_review_loop
-
-        if [[ "$mode" == "review-only" ]]; then
-            review_loop_ended="findings"
-            close_iter
-            break
-        fi
-
-        # The fix leg's prompt: the generated header (the fix seat's own,
-        # when a preset seated one), then the verdict. Built as a file and
-        # redirected -- the verdict has no size limit, and one argv string
-        # is capped at 128KB.
-        fix_prompt="$run_dir/fix-prompt-$loop_i.md"
-        fix_header="$fix_prompt_header"
-        [[ -n "${fxr_fix_prompt_header:-}" ]] && fix_header="$fxr_fix_prompt_header"
-        {
-            cat -- "$fix_header"
-            printf '\n---\n\n'
-            awk '/^## Report$/ { exit } { print }' "$verdict_copy"
-        } > "$fix_prompt.part"
-        mv -f "$fix_prompt.part" "$fix_prompt"
-
-        # A fix agent with repeat: N runs the fix as N passes on the same
-        # prompt -- the same distrust of a cheap model's premature "done"
-        # the code seat's repeat carries (see the repeat block above), so
-        # there is no early exit on a pass that looks finished; only a
-        # harness error stops the passes. The iteration records the LAST
-        # pass's exit, the SUM of the passes' costs (null when any pass
-        # went unpriced), and -- for a single pass -- its usage; multi-pass
-        # usage stays null, each pass's own events file carrying the detail.
-        fix_passes="${fix_repeat:-1}"
-        fix_pass=1
-        it_fix_cost=null
-        fix_cost_known=1
-        while :; do
-            fix_leg_id="$loop_i"
-            (( fix_pass > 1 )) && fix_leg_id="$loop_i-p$fix_pass"
-            run_leg fix "$fix_leg_id" "$fix_prompt"
-            it_fix_exit="$leg_rc"
-            if [[ -n "$leg_cost" ]]; then
-                if [[ "$it_fix_cost" == null ]]; then
-                    it_fix_cost="$leg_cost"
-                else
-                    it_fix_cost="$(jq -n --argjson a "$it_fix_cost" \
-                        --argjson b "$leg_cost" '$a + $b' 2>/dev/null)" \
-                        || fix_cost_known=0
-                fi
+        if [[ "$cur_legacy" == 1 ]]; then
+            if [[ "$cur_kind" == maintainer ]]; then
+                maintainer_loop_ended="$cur_ended"
+                maintainer_loop_detail="$cur_detail"
+                printf 'fork-sandbox: maintainer loop ended: %s\n' "$cur_ended"
             else
-                fix_cost_known=0
+                review_loop_ended="$cur_ended"
+                review_loop_detail="$cur_detail"
+                printf 'fork-sandbox: review loop ended: %s\n' "$cur_ended"
             fi
-            [[ "$leg_rc" == "0" ]] || break
-            (( fix_pass < fix_passes )) || break
-            fix_pass=$(( fix_pass + 1 ))
-        done
-        (( fix_cost_known )) && [[ -n "$it_fix_cost" ]] || it_fix_cost=null
-        if (( fix_passes == 1 )); then
-            it_fix_usage="$leg_usage"
-        else
-            it_fix_usage=null
         fi
-        it_head_after="$(clone_branch_head)"
-        save_review_loop
-        if [[ "$leg_rc" != "0" ]]; then
-            review_loop_ended="harness-error"
-            review_loop_detail="the fix leg of iteration $loop_i exited $leg_rc${leg_error:+ ($leg_error)}"
-            close_iter
-            break
-        fi
-        if [[ -z "$it_head_after" ]]; then
-            review_loop_ended="harness-error"
-            review_loop_detail="branch $branch could not be read from the clone after the fix leg of iteration $loop_i"
-            close_iter
-            break
-        fi
-        if [[ "$it_head_after" == "$it_head_before" ]]; then
-            # The same model reviews its own work here, so it can argue with
-            # itself indefinitely. An iteration that committed nothing is the
-            # end of the argument, not a reason to run another one.
-            review_loop_ended="no-progress"
-            printf 'fork-sandbox: review iteration %s: the fix leg committed nothing\n' \
-                "$loop_i"
-            close_iter
-            break
-        fi
-        loop_head="$it_head_after"
-        close_iter
-        loop_i=$(( loop_i + 1 ))
-    done
-    [[ -n "$review_loop_ended" ]] || review_loop_ended="cap"
-    save_review_loop
-    printf 'fork-sandbox: review loop ended: %s\n' "$review_loop_ended"
-    if [[ "$mode" == "review-only" ]]; then
-        case "$review_loop_ended" in
-            approved) printf 'fork-sandbox: review-only: APPROVED\n' ;;
-            findings) printf 'fork-sandbox: review-only: FINDINGS (%s cited)\n' "$it_findings" ;;
-        esac
-        printf 'fork-sandbox: review verdict: %s\n' "$run_dir/review-verdict-1.md"
-    fi
-fi
-
-# --maintainer-loop: the outer tier, after the review loop (or after the
-# coding session when there is no review loop). A maintainer leg reviews the
-# branch as a maintainer would -- when a review loop ran, the inner review
-# already read the diff line by line, so it reads the surrounding code and
-# builds on the review's final verdict, appended to the per-iteration prompt
-# below; when none did, it reads the diff close too, since it is the
-# branch's only review -- and a fix leg on the implement
-# harness addresses its findings. The mechanism is the review loop's, one for
-# one; only the harness, the prompt and the record differ. Fix legs never
-# re-enter the review loop: the inner loop is over by the time this one
-# starts, and the maintainer's next iteration is what reads the fix.
-#
-# Everything this block reads was emitted by the launcher only when the loop
-# is on, so the guard tests ${maintainer_loop_cap:-0}: a no-maintainer
-# run.sh has none of these variables at all.
-if [[ "${maintainer_loop_cap:-0}" != "0" && -n "${maintainer_prompt:-}" ]]; then
-    maintainer_loop_ended=""
-    maintainer_loop_detail=""
-    # The coding leg's own exit code ($rc at the moment the gate below runs),
-    # recorded here so it survives into every save_maintainer_loop call
-    # regardless of how the loop ends -- see the review loop's own comment
-    # on review_loop_coding_rc, above.
-    maintainer_loop_coding_rc=""
-    maintainer_iters_done='[]'
-
-    # The branch head the loop measures progress against, read from the
-    # clone the one way anything here may read it (see clone_branch_head).
-    mnt_head="$(clone_branch_head)"
-
-    # One iteration's record, built leg by leg -- the same "not established is
-    # null, never 0" rule the review loop's iterations follow. The maintainer
-    # leg's fields are named after the leg that produces them, not after
-    # "review": this is the run's last word, and the record should say which
-    # leg said it.
-    mit_i=""
-    mit_findings=null
-    mit_mnt_exit=null
-    mit_fix_exit=null
-    mit_head_before=""
-    mit_head_after=""
-    mit_mnt_cost=null
-    mit_fix_cost=null
-    mit_mnt_usage=null
-    mit_fix_usage=null
-
-    mit_reset() {
-        mit_i="$1"
-        mit_findings=null
-        mit_mnt_exit=null
-        mit_fix_exit=null
-        mit_head_before=""
-        mit_head_after=""
-        mit_mnt_cost=null
-        mit_fix_cost=null
-        mit_mnt_usage=null
-        mit_fix_usage=null
-    }
-
-    # The current iteration as a one-element array, or nothing when there is
-    # no current iteration -- the review loop's iter_json with the leg names
-    # changed (see iter_json's own comment for why commits_added is filled
-    # in after the fetch below).
-    mit_iter_json() {
-        [[ -n "$mit_i" ]] || return 1
-        jq -c -n \
-            --argjson i "$mit_i" \
-            --argjson findings "$mit_findings" \
-            --argjson maintainer_exit "$mit_mnt_exit" \
-            --argjson fix_exit "$mit_fix_exit" \
-            --arg head_before "$mit_head_before" \
-            --arg head_after "$mit_head_after" \
-            --argjson maintainer_cost "$mit_mnt_cost" \
-            --argjson fix_cost "$mit_fix_cost" \
-            --argjson maintainer_usage "$mit_mnt_usage" \
-            --argjson fix_usage "$mit_fix_usage" \
-            '[{
-                i: $i,
-                findings: $findings,
-                maintainer_exit: $maintainer_exit,
-                fix_exit: $fix_exit,
-                head_before: (if $head_before == "" then null else $head_before end),
-                head_after: (if $head_after == "" then null else $head_after end),
-                commits_added: null,
-                maintainer_cost_usd: $maintainer_cost,
-                fix_cost_usd: $fix_cost,
-                maintainer_usage: $maintainer_usage,
-                fix_usage: $fix_usage,
-            }]' 2>/dev/null
-    }
-
-    # Write maintainer-loop.json from what is known right now, the same way
-    # review-loop.json is written: after every leg, built beside the file
-    # and renamed, so a runner killed mid-loop still leaves the iterations
-    # it finished.
-    save_maintainer_loop() {
-        local cur
-        cur="$(mit_iter_json)" || cur='[]'
-        [[ -n "$cur" ]] || cur='[]'
-        if jq -n \
-            --argjson cap "$maintainer_loop_cap" \
-            --arg maintainer_model "$maintainer_model" \
-            --arg maintainer_harness "$maintainer_harness" \
-            --arg fix_harness "${mntfix_harness:-}" \
-            --arg fix_model "${mntfix_model:-}" \
-            --argjson fix_repeat "${mntfix_repeat:-1}" \
-            --arg ended "$maintainer_loop_ended" \
-            --arg detail "$maintainer_loop_detail" \
-            --argjson coding_exit_code "${maintainer_loop_coding_rc:-null}" \
-            --argjson prev "$maintainer_iters_done" \
-            --argjson cur "$cur" \
-            '{
-                cap: $cap,
-                maintainer_model: (if $maintainer_model == "" then null else $maintainer_model end),
-                maintainer_harness: (if $maintainer_harness == "" then null else $maintainer_harness end),
-                fix_harness: (if $fix_harness == "" then null else $fix_harness end),
-                fix_model: (if $fix_model == "" then null else $fix_model end),
-                fix_repeat: (if $fix_repeat == 1 then null else $fix_repeat end),
-                ended: (if $ended == "" then null else $ended end),
-                detail: (if $detail == "" then null else $detail end),
-                coding_exit_code: $coding_exit_code,
-                iterations: ($prev + $cur),
-            }' > "$run_dir/maintainer-loop.json.part" 2>/dev/null; then
-            mv -f "$run_dir/maintainer-loop.json.part" "$run_dir/maintainer-loop.json"
-        else
-            rm -f "$run_dir/maintainer-loop.json.part"
-        fi
-    }
-
-    # Move the current iteration into the finished list and write again --
-    # the review loop's close_iter, pointed at this record.
-    close_mit() {
-        local cur merged
-        if cur="$(mit_iter_json)" && [[ -n "$cur" ]]; then
-            merged="$(jq -c -n --argjson d "$maintainer_iters_done" --argjson c "$cur" \
-                '$d + $c' 2>/dev/null)"
-            [[ -n "$merged" ]] && maintainer_iters_done="$merged"
-        fi
-        mit_i=""
-        save_maintainer_loop
-    }
-
-    # Whether the branch holds work decides whether the loop runs -- the exit
-    # code is recorded (coding_exit_code, above) but is never itself a skip
-    # reason. See the review loop's own gate, above, and the header comment
-    # it points at.
-    maintainer_loop_coding_rc="$rc"
-    if [[ -z "$mnt_head" ]]; then
-        maintainer_loop_ended="skipped"
-        maintainer_loop_detail="branch $branch could not be read from the clone"
-    elif [[ "$mnt_head" == "$base_sha" ]]; then
-        maintainer_loop_ended="skipped"
-        maintainer_loop_detail="the branch holds no commits, so there is nothing to review"
-    fi
-    # A non-zero $rc here is not a skip reason, and detail is documented as
-    # "why the loop ended" (harness-error | skipped) -- coding_exit_code,
-    # set just above, already carries the coding leg's own exit status, and
-    # the maintainer prompt below tells the reviewer about it directly.
-
-    loop_i=1
-    while [[ -z "$maintainer_loop_ended" ]] && (( loop_i <= maintainer_loop_cap )); do
-        mit_reset "$loop_i"
-        mit_head_before="$mnt_head"
-        save_maintainer_loop
-
-        # A verdict from a previous iteration must never be read as this
-        # one's -- the same rule as the review loop, for the same reason.
-        rm -f "$maintainer_verdict_file"
-
-        # maintainer_prompt is static, built once at launch -- but the same
-        # unfollowed-addendum rule the review prompt carries applies to a
-        # maintainer leg as to a review leg, and fs_archive_inbox has moved
-        # every earlier leg's addendum out of the live inbox by now, so the
-        # per-iteration copy embeds them the way the review loop's does.
-        maintainer_prompt_iter="$run_dir/maintainer-prompt-$loop_i.md"
-        {
-            cat -- "$maintainer_prompt"
-            # The coding leg failed on something -- possibly after it
-            # committed the very work under review. Told once, up front, via
-            # fs_emit_coding_exit_note (fork-sandbox-lib.sh), the same as the
-            # review loop's own copy of this note.
-            if [[ -n "$maintainer_loop_coding_rc" && "$maintainer_loop_coding_rc" != "0" ]]; then
-                fs_emit_coding_exit_note "$maintainer_loop_coding_rc"
-            fi
-            mp_addenda_list="$(fs_addenda_dirs)"
-            if [[ -n "$mp_addenda_list" ]]; then
-                printf '\n---\n\n## Operator addenda delivered to earlier legs of this run\n\n'
-                printf 'The operator sent the messages below to an earlier leg of this run,\n'
-                printf 'oldest first. The live inbox bound into this sandbox no longer holds\n'
-                printf 'them -- a claude leg archives what it saw the moment it ends -- so\n'
-                printf 'this is the only copy this leg will see. Check the commit range\n'
-                printf 'under review against each one: if it asks for work the commits do\n'
-                printf 'not contain, that is a finding under "An unfollowed addendum is a\n'
-                printf 'finding" above, citing the message file itself.\n'
-                while IFS= read -r mp_dir; do
-                    [[ -n "$mp_dir" ]] || continue
-                    for mp_file in "$mp_dir"/*.md; do
-                        [[ -f "$mp_file" ]] || continue
-                        printf '\n### %s\n\n' "${mp_file##*/}"
-                        cat -- "$mp_file"
-                    done
-                done <<< "$mp_addenda_list"
-            fi
-            # The static prompt's "the inner review's final verdict is
-            # appended to this prompt" promise, kept: the run dir is never
-            # bound into the sandbox, so without this the leg is told it
-            # holds findings it cannot read. The highest-numbered verdict is
-            # the one to show -- it read the branch after every earlier
-            # review and fix. A review loop that ended without a usable
-            # verdict (its leg died) gets a correction instead, so the leg
-            # knows to read the diff itself.
-            if [[ "${review_loop_cap:-0}" != "0" ]]; then
-                mp_review_verdict=""
-                mp_review_n=0
-                for mp_v in "$run_dir"/review-verdict-*.md; do
-                    [[ -f "$mp_v" ]] || continue
-                    mp_v_n="${mp_v##*/review-verdict-}"
-                    mp_v_n="${mp_v_n%.md}"
-                    [[ "$mp_v_n" =~ ^[0-9]+$ ]] || continue
-                    if (( mp_v_n > mp_review_n )); then
-                        mp_review_n="$mp_v_n"
-                        mp_review_verdict="$mp_v"
-                    fi
-                done
-                if [[ -n "$mp_review_verdict" ]]; then
-                    printf '\n---\n\n## The inner review'\''s final verdict\n\n'
-                    printf 'The review loop read the diff line by line before this loop\n'
-                    printf 'started. Its verdict from iteration %s is below, in full: this\n' "$mp_review_n"
-                    printf 'is the "findings to build on" the prompt above names. Build on\n'
-                    printf 'it rather than re-review what the loop already reviewed -- but\n'
-                    printf 'it is the loop'\''s account of the branch as it stood when the\n'
-                    printf 'loop ended, and the fix legs have committed since, so check\n'
-                    printf 'each finding against what is there now.\n\n'
-                    cat -- "$mp_review_verdict"
-                else
-                    printf '\n---\n\n## The inner review left no verdict\n\n'
-                    printf 'The review loop was requested, but it ended (%s) without\n' \
-                        "${review_loop_ended:-unknown}"
-                    printf 'leaving a usable verdict, so there are no findings to build\n'
-                    printf 'on despite what the prompt above says: read the diff\n'
-                    printf 'yourself.\n'
-                fi
-            fi
-            # The loop's own predecessor, for the same reason: the static
-            # prompt was written for the loop's first pass, where "no review
-            # has read that diff yet" (and, with a review loop, "build on
-            # the inner review's verdict, a line-by-line reread is not the
-            # job") is true, and the immediately previous maintainer leg's
-            # verdict is what its fix leg just acted on -- without it, a
-            # later iteration cannot tell which of the findings in front of
-            # it were already addressed. The previous iteration's is the one
-            # to show: it is the most recent review of the branch, having
-            # read it after every earlier fix leg. Only ever reached with
-            # one in hand -- the loop advances only on a FINDINGS verdict --
-            # but the guard costs nothing.
-            if (( loop_i > 1 )); then
-                mp_mnt_prev="$run_dir/maintainer-verdict-$(( loop_i - 1 )).md"
-                if [[ -f "$mp_mnt_prev" ]]; then
-                    printf '\n---\n\n## The previous maintainer iteration'\''s verdict\n\n'
-                    printf 'The prompt above was written for this loop'\''s first pass, and its\n'
-                    printf 'account of what has already been read is stale now: maintainer\n'
-                    printf 'iteration %s has already reviewed this branch, and its\n' "$(( loop_i - 1 ))"
-                    printf 'verdict, in full, is below. It is a FINDINGS verdict -- had it\n'
-                    printf 'approved, the loop would have ended -- and the fix leg that has\n'
-                    printf 'committed since was handed exactly those findings. It is the\n'
-                    printf 'most recent review this branch has had, ahead of the review\n'
-                    printf 'loop'\''s verdict above where one was appended. Read it to know\n'
-                    printf 'which of the problems you find were already seen, and what was\n'
-                    printf 'committed in answer, then review the branch as it stands now.\n\n'
-                    cat -- "$mp_mnt_prev"
-                fi
-            fi
-        } > "$maintainer_prompt_iter.part"
-        mv -- "$maintainer_prompt_iter.part" "$maintainer_prompt_iter"
-
-        run_leg maintainer "$loop_i" "$maintainer_prompt_iter"
-        mit_mnt_exit="$leg_rc"
-        mit_mnt_cost="${leg_cost:-null}"
-        mit_mnt_usage="$leg_usage"
-        save_maintainer_loop
-        if [[ "$leg_rc" != "0" ]]; then
-            maintainer_loop_ended="harness-error"
-            maintainer_loop_detail="the maintainer leg of iteration $loop_i exited $leg_rc${leg_error:+ ($leg_error)}"
-            close_mit
-            break
-        fi
-
-        # The verdict is DATA, exactly as the review loop treats its own: it
-        # is copied, counted and concatenated into a prompt file -- never
-        # sourced, never evaluated, never put on a command line. A symlink at
-        # the path is not a verdict.
-        verdict_copy="$run_dir/maintainer-verdict-$loop_i.md"
-        if [[ -L "$maintainer_verdict_file" || ! -f "$maintainer_verdict_file" ]]; then
-            maintainer_loop_ended="harness-error"
-            maintainer_loop_detail="the maintainer leg of iteration $loop_i left no verdict at $maintainer_verdict_file"
-            close_mit
-            break
-        fi
-        # The run dir outlives the clone, so the copy is the record. Take the
-        # original away in the same breath, so iteration i+1 cannot re-read it.
-        cp -- "$maintainer_verdict_file" "$verdict_copy" 2>/dev/null
-        rm -f "$maintainer_verdict_file"
-        if [[ ! -s "$verdict_copy" ]]; then
-            maintainer_loop_ended="harness-error"
-            maintainer_loop_detail="the maintainer leg of iteration $loop_i wrote an empty verdict"
-            close_mit
-            break
-        fi
-
-        # Untrusted text on its way to a terminal: strip control characters.
-        verdict_line="$(head -n 1 "$verdict_copy" | tr -d '\000-\037\177' \
-            | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-        case "$verdict_line" in
-        APPROVED)
-            mit_findings=0
-            maintainer_loop_ended="approved"
-            printf 'fork-sandbox: maintainer iteration %s: APPROVED\n' "$loop_i"
-            close_mit
-            break
-            ;;
-        FINDINGS)
-            ;;
-        *)
-            maintainer_loop_ended="harness-error"
-            maintainer_loop_detail="the maintainer leg of iteration $loop_i wrote a first line that is neither APPROVED nor FINDINGS"
-            close_mit
-            break
-            ;;
-        esac
-
-        # One finding per paragraph, each citing file:line -- the same count
-        # the review loop takes, without reading the prose.
-        mit_findings="$(awk '
-            NR == 1 { next }
-            /^## Report$/ { exit }
-            /^[[:space:]]*$/ { if (hit) n++; hit = 0; next }
-            /[^[:space:]:]+:[0-9]+/ { hit = 1 }
-            END { if (hit) n++; print n + 0 }' "$verdict_copy" 2>/dev/null)"
-        [[ "$mit_findings" =~ ^[0-9]+$ ]] || mit_findings=null
-        printf 'fork-sandbox: maintainer iteration %s: FINDINGS (%s cited)\n' \
-            "$loop_i" "$mit_findings"
-        save_maintainer_loop
-
-        # The fix leg's prompt: the generated header (this tier's own fix
-        # seat's, when a preset seated one), then the verdict. Built as a
-        # file and redirected -- the verdict has no size limit, and one
-        # argv string is capped at 128KB.
-        mnt_fix_prompt="$run_dir/maintainer-fix-prompt-$loop_i.md"
-        mnt_fix_header="$fix_prompt_header"
-        [[ -n "${fxm_fix_prompt_header:-}" ]] && mnt_fix_header="$fxm_fix_prompt_header"
-        {
-            cat -- "$mnt_fix_header"
-            printf '\n---\n\n'
-            awk '/^## Report$/ { exit } { print }' "$verdict_copy"
-        } > "$mnt_fix_prompt.part"
-        mv -f "$mnt_fix_prompt.part" "$mnt_fix_prompt"
-
-        # The same pass loop as the review tier's fix -- see the comment
-        # there for the repeat semantics and what the iteration records.
-        mnt_fix_passes="${mntfix_repeat:-1}"
-        mnt_fix_pass=1
-        mit_fix_cost=null
-        mnt_fix_cost_known=1
-        while :; do
-            mnt_fix_leg_id="$loop_i"
-            (( mnt_fix_pass > 1 )) && mnt_fix_leg_id="$loop_i-p$mnt_fix_pass"
-            run_leg mntfix "$mnt_fix_leg_id" "$mnt_fix_prompt"
-            mit_fix_exit="$leg_rc"
-            if [[ -n "$leg_cost" ]]; then
-                if [[ "$mit_fix_cost" == null ]]; then
-                    mit_fix_cost="$leg_cost"
-                else
-                    mit_fix_cost="$(jq -n --argjson a "$mit_fix_cost" \
-                        --argjson b "$leg_cost" '$a + $b' 2>/dev/null)" \
-                        || mnt_fix_cost_known=0
-                fi
+        if [[ "$cur_legacy" == 1 && "$cur_kind" == review && "$mode" == "review-only" ]]; then
+            case "$cur_ended" in
+                approved) printf 'fork-sandbox: review-only: APPROVED\n' ;;
+                findings) printf 'fork-sandbox: review-only: FINDINGS (%s cited)\n' "$cur_findings" ;;
+            esac
+            printf 'fork-sandbox: review verdict: %s\n' "$run_dir/review-verdict-1.md"
+            run_cost="$leg_cost"
+            run_usage="$leg_usage"
+            run_error="$leg_error"
+            if [[ "$run_cost" =~ ^-?[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?$ ]]; then
+                run_cost_fmt="$(printf '%.6f' "$run_cost")"
             else
-                mnt_fix_cost_known=0
+                run_cost_fmt=""
             fi
-            [[ "$leg_rc" == "0" ]] || break
-            (( mnt_fix_pass < mnt_fix_passes )) || break
-            mnt_fix_pass=$(( mnt_fix_pass + 1 ))
-        done
-        (( mnt_fix_cost_known )) && [[ -n "$mit_fix_cost" ]] || mit_fix_cost=null
-        if (( mnt_fix_passes == 1 )); then
-            mit_fix_usage="$leg_usage"
-        else
-            mit_fix_usage=null
+            [[ "$cur_ended" == "harness-error" ]] && rc=1
         fi
-        mit_head_after="$(clone_branch_head)"
-        save_maintainer_loop
-        if [[ "$leg_rc" != "0" ]]; then
-            maintainer_loop_ended="harness-error"
-            maintainer_loop_detail="the fix leg of iteration $loop_i exited $leg_rc${leg_error:+ ($leg_error)}"
-            close_mit
-            break
-        fi
-        if [[ -z "$mit_head_after" ]]; then
-            maintainer_loop_ended="harness-error"
-            maintainer_loop_detail="branch $branch could not be read from the clone after the fix leg of iteration $loop_i"
-            close_mit
-            break
-        fi
-        if [[ "$mit_head_after" == "$mit_head_before" ]]; then
-            # An iteration that committed nothing is the end of the argument,
-            # not a reason to run another one: the maintainer would read
-            # exactly the same branch it just read.
-            maintainer_loop_ended="no-progress"
-            printf 'fork-sandbox: maintainer iteration %s: the fix leg committed nothing\n' \
-                "$loop_i"
-            close_mit
-            break
-        fi
-        mnt_head="$mit_head_after"
-        close_mit
-        loop_i=$(( loop_i + 1 ))
     done
-    [[ -n "$maintainer_loop_ended" ]] || maintainer_loop_ended="cap"
-    save_maintainer_loop
-    printf 'fork-sandbox: maintainer loop ended: %s\n' "$maintainer_loop_ended"
-fi
 
-# In review-only mode the sole leg is the review leg, so its accounting is the
-# run accounting as well. This also makes cost_usd and total_cost_usd agree.
-if [[ "$mode" == "review-only" ]]; then
-    run_cost="$leg_cost"
-    run_usage="$leg_usage"
-    run_error="$leg_error"
-    if [[ "$run_cost" =~ ^-?[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?$ ]]; then
-        run_cost_fmt="$(printf '%.6f' "$run_cost")"
-    else
-        run_cost_fmt=""
-    fi
-    [[ "$review_loop_ended" == "harness-error" ]] && rc=1
-fi
 
 # The other half of the deferral above: for a --review-loop or --refresh-at
 # run the run is over here -- every loop ran, or was skipped and said why --
@@ -9360,10 +8739,7 @@ fi
 # either loop. The pi check above may have written the same value already;
 # writing it again costs nothing and keeps this the one place that ends a
 # loop run.
-if [[ "$review_loop_cap" != "0" || "$refresh_enabled" == "1" \
-    || "${maintainer_loop_cap:-0}" != "0" || "${composed_pipeline:-0}" == 1 ]]; then
-    printf '%s\n' "$rc" > "$run_dir/exit-code"
-fi
+printf '%s\n' "$rc" > "$run_dir/exit-code"
 
 # The session and every loop leg are done with the credential and the
 # services. Clean both up now rather than lean on the trap, which a
