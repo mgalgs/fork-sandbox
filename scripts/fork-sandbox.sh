@@ -1843,36 +1843,24 @@ if [[ -n "$preset_name" ]]; then
                     network) preset_agent_network[$preset_f2]="$preset_f4" ;;
                 esac
                 ;;
-            implement)
-                case "$preset_f2" in
-                    agent) preset_impl_agent="$preset_f3" ;;
-                    repeat) preset_impl_repeat="$preset_f3" ;;
-                    refresh_at) preset_impl_refresh_at="$preset_f3" ;;
-                    refresh_max) preset_impl_refresh_max="$preset_f3" ;;
-                esac
+            pipeline)
+                preset_step_count="$preset_f3"
                 ;;
-            review)
-                case "$preset_f2" in
-                    agent) preset_review_agent="$preset_f3" ;;
-                    max) preset_review_max="$preset_f3" ;;
-                    fix_default) preset_review_fix_default="$preset_f3" ;;
-                    fix_agent) preset_review_fix_name="$preset_f3" ;;
-                    fix_harness) preset_review_fix_harness="$preset_f3" ;;
-                    fix_model) preset_review_fix_model="$preset_f3" ;;
-                    fix_repeat) preset_review_fix_repeat="$preset_f3" ;;
-                    fix_network) preset_review_fix_network="$preset_f3" ;;
-                esac
-                ;;
-            maintain)
-                case "$preset_f2" in
-                    agent) preset_maintain_agent="$preset_f3" ;;
-                    max) preset_maintain_max="$preset_f3" ;;
-                    fix_default) preset_maintain_fix_default="$preset_f3" ;;
-                    fix_agent) preset_maintain_fix_name="$preset_f3" ;;
-                    fix_harness) preset_maintain_fix_harness="$preset_f3" ;;
-                    fix_model) preset_maintain_fix_model="$preset_f3" ;;
-                    fix_repeat) preset_maintain_fix_repeat="$preset_f3" ;;
-                    fix_network) preset_maintain_fix_network="$preset_f3" ;;
+            step)
+                preset_step_k="$preset_f2"
+                case "$preset_f3" in
+                    action) preset_step_action[preset_step_k]="$preset_f4" ;;
+                    agent) preset_step_agent[preset_step_k]="$preset_f4" ;;
+                    repeat) preset_step_repeat[preset_step_k]="$preset_f4" ;;
+                    refresh_at) preset_step_refresh_at[preset_step_k]="$preset_f4" ;;
+                    refresh_max) preset_step_refresh_max[preset_step_k]="$preset_f4" ;;
+                    max) preset_step_max[preset_step_k]="$preset_f4" ;;
+                    fix_default) preset_step_fix_default[preset_step_k]="$preset_f4" ;;
+                    fix_agent) preset_step_fix_agent[preset_step_k]="$preset_f4" ;;
+                    fix_harness) preset_step_fix_harness[preset_step_k]="$preset_f4" ;;
+                    fix_model) preset_step_fix_model[preset_step_k]="$preset_f4" ;;
+                    fix_repeat) preset_step_fix_repeat[preset_step_k]="$preset_f4" ;;
+                    fix_network) preset_step_fix_network[preset_step_k]="$preset_f4" ;;
                 esac
                 ;;
             warn)
@@ -1880,6 +1868,58 @@ if [[ -n "$preset_name" ]]; then
                 ;;
         esac
     done <<< "$preset_tsv"
+
+    # A pipeline shaped exactly like the fixed skeleton this replaces (one
+    # code step, then at most one review step, then at most one maintain
+    # step, in that order) still drives the existing flag-compile block
+    # and the existing loop drivers unchanged, via the preset_impl_*/
+    # preset_review_*/preset_maintain_* scalars translated here. Anything
+    # else -- any other order, any repeated kind, any count -- is a
+    # composed pipeline: decision 8 forbids compiling flags into it, so it
+    # skips this translation and is built straight into the step_* arrays
+    # at the run engine's compile point instead.
+    preset_is_legacy_shaped=false
+    if (( preset_step_count == 1 )) && [[ "${preset_step_action[1]}" == code ]]; then
+        preset_is_legacy_shaped=true
+    elif (( preset_step_count == 2 )) && [[ "${preset_step_action[1]}" == code ]] \
+        && [[ "${preset_step_action[2]}" == review || "${preset_step_action[2]}" == maintain ]]; then
+        preset_is_legacy_shaped=true
+    elif (( preset_step_count == 3 )) && [[ "${preset_step_action[1]}" == code ]] \
+        && [[ "${preset_step_action[2]}" == review ]] \
+        && [[ "${preset_step_action[3]}" == maintain ]]; then
+        preset_is_legacy_shaped=true
+    fi
+
+    if [[ "$preset_is_legacy_shaped" == true ]]; then
+        preset_impl_agent="${preset_step_agent[1]}"
+        preset_impl_repeat="${preset_step_repeat[1]:-1}"
+        preset_impl_refresh_at="${preset_step_refresh_at[1]:-}"
+        preset_impl_refresh_max="${preset_step_refresh_max[1]:-}"
+        for ((preset_k = 2; preset_k <= preset_step_count; preset_k++)); do
+            case "${preset_step_action[$preset_k]}" in
+                review)
+                    preset_review_agent="${preset_step_agent[$preset_k]}"
+                    preset_review_max="${preset_step_max[$preset_k]}"
+                    preset_review_fix_default="${preset_step_fix_default[$preset_k]:-}"
+                    preset_review_fix_name="${preset_step_fix_agent[$preset_k]:-}"
+                    preset_review_fix_harness="${preset_step_fix_harness[$preset_k]}"
+                    preset_review_fix_model="${preset_step_fix_model[$preset_k]}"
+                    preset_review_fix_repeat="${preset_step_fix_repeat[$preset_k]}"
+                    preset_review_fix_network="${preset_step_fix_network[$preset_k]}"
+                    ;;
+                maintain)
+                    preset_maintain_agent="${preset_step_agent[$preset_k]}"
+                    preset_maintain_max="${preset_step_max[$preset_k]}"
+                    preset_maintain_fix_default="${preset_step_fix_default[$preset_k]:-}"
+                    preset_maintain_fix_name="${preset_step_fix_agent[$preset_k]:-}"
+                    preset_maintain_fix_harness="${preset_step_fix_harness[$preset_k]}"
+                    preset_maintain_fix_model="${preset_step_fix_model[$preset_k]}"
+                    preset_maintain_fix_repeat="${preset_step_fix_repeat[$preset_k]}"
+                    preset_maintain_fix_network="${preset_step_fix_network[$preset_k]}"
+                    ;;
+            esac
+        done
+    fi
 
     preset_seat_desc() {
         local agent="$1" h m
@@ -1892,6 +1932,13 @@ if [[ -n "$preset_name" ]]; then
         fi
     }
 
+    # A composed (non-legacy-shaped) pipeline has no single code/review/
+    # maintain scalar to describe or compile flags into (decision 8): the
+    # summary below and the whole flag-compile block only apply to a
+    # legacy-shaped preset. A composed pipeline gets a step-count
+    # announcement instead, and is built straight into the step_* arrays
+    # at the run engine's compile point further down.
+    if [[ "$preset_is_legacy_shaped" == true ]]; then
     # Announced before the compile below, so the picture of what the preset
     # says comes first and any "--x overrides ..." notes read against it.
     preset_summary="code $(preset_seat_desc "$preset_impl_agent")"
@@ -2108,6 +2155,9 @@ if [[ -n "$preset_name" ]]; then
                 mntfix_network="sealed"
             fi
         fi
+    fi
+    else
+        echo "fork-sandbox: preset '$preset_name' ($(display_config_path "$preset_file")): composed pipeline, $preset_step_count steps" >&2
     fi
 fi
 
