@@ -1328,11 +1328,29 @@ esac
 printf '{"type":"result","subtype":"success","total_cost_usd":0.01,"usage":{"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}\n'
 exit 0
 STUB
+# A pi-local (sealed) leg's wrapper: fake-image toolchain skips fs_resolve_pi's
+# host probe, so this stub never has to look like a real pi -- it only has to
+# exist on PATH (fs_resolve_harness's pi-local arm refuses to launch at all
+# without it) and print the "pi against <model> at <url>" banner the run.sh
+# model backfill (pipeline.json's steps[0].model) greps for, the same as a
+# real agent-sandboxed discovering the model from the endpoint would.
+cat > "$real_stub/agent-sandboxed" <<'STUB'
+#!/usr/bin/env bash
+cat >/dev/null
+n=0
+[[ -f "$FAKE_COUNT_FILE" ]] && n="$(cat "$FAKE_COUNT_FILE")"
+n=$(( n + 1 ))
+printf '%s' "$n" > "$FAKE_COUNT_FILE"
+printf '%s\n' "$*" >> "$FAKE_ARGV_LOG"
+printf 'agent-sandboxed: pi against vendor/discovered-model at http://198.51.100.1:8001/v1\n' >&2
+exit 0
+STUB
 chmod +x "$real_stub"/*
 
 real_cfg="$(mktemp -d)"; tmpdirs+=("$real_cfg")
 install -m 600 /dev/null "$real_cfg/pi.env"
 printf 'OPENROUTER_API_KEY=fake\n' > "$real_cfg/pi.env"
+printf 'MODEL_ENDPOINT=http://198.51.100.1:8001/v1\n' > "$real_cfg/model.env"
 real_presets="$real_cfg/presets"
 mkdir -p "$real_presets"
 
@@ -1424,6 +1442,77 @@ if [[ -n "${rd_a:-}" ]]; then
         "$(jq -r '.steps[0].fix' "$rd_a/pipeline.json")"
     check "pipeline.json's step 0 harness is claude" "claude" \
         "$(jq -r '.steps[0].harness' "$rd_a/pipeline.json")"
+fi
+
+# A2. A bare --review-loop with no --review-model/--review-harness: the
+# review leg actually runs the implement harness AND model (review_sandbox_cmd
+# copies sandbox_cmd verbatim when review_harness_given is false), so
+# pipeline.json's review step must say so too, not "model": null.
+cat > "$real_presets/reviewloop.yaml" <<'EOF'
+agents:
+  coder:
+    harness: claude
+    model: haiku
+pipeline:
+  - action: code
+    agent: coder
+EOF
+prep_stub $'commit\napproved'
+rd_a2="$(run_stubbed --preset reviewloop --review-loop 1 \
+    --branch "sandbox-test-reviewloop-$$")" && tmpdirs+=("$rd_a2")
+if [[ -n "${rd_a2:-}" ]]; then
+    check "a bare --review-loop's step harness is the implement seat's" \
+        "claude" "$(jq -r '.steps[1].harness' "$rd_a2/pipeline.json")"
+    check "a bare --review-loop's step model is the implement seat's, not null" \
+        "haiku" "$(jq -r '.steps[1].model' "$rd_a2/pipeline.json")"
+    check "a bare --review-loop's step network is null (unsealed)" \
+        "null" "$(jq -r '.steps[1].network' "$rd_a2/pipeline.json")"
+fi
+
+# A3. A sealed (pi-local) coder with an unsealed, explicitly-named reviewer:
+# the review step's network must not inherit the coder's "sealed" just
+# because review_network itself is unset -- and the coder's own default fix
+# seat (repeat: 2 triggers a fix record with no fix_agent named) must not
+# serialize its undiscovered model as "" where the rest of the file uses
+# null. The coder's repeat: 2 leg also exercises run.sh's pipeline.json
+# model backfill, since agent-sandboxed never gets a --model flag here.
+cat > "$real_presets/sealed-review.yaml" <<'EOF'
+agents:
+  coder:
+    harness: pi-local
+    repeat: 2
+  reviewer:
+    harness: claude
+    model: opus
+pipeline:
+  - action: code
+    agent: coder
+  - action: review
+    repeat: 1
+    agent: reviewer
+EOF
+prep_stub 'noop'
+rd_a3="$(run_stubbed --preset sealed-review \
+    --branch "sandbox-test-sealed-review-$$")" && tmpdirs+=("$rd_a3")
+if [[ -n "${rd_a3:-}" ]]; then
+    check "the sealed coder's step harness is pi (pi-local, expanded)" \
+        "pi" "$(jq -r '.steps[0].harness' "$rd_a3/pipeline.json")"
+    check "the sealed coder's step network is sealed" \
+        "sealed" "$(jq -r '.steps[0].network' "$rd_a3/pipeline.json")"
+    check "the sealed coder's step model is backfilled from the sandbox log" \
+        "vendor/discovered-model" "$(jq -r '.steps[0].model' "$rd_a3/pipeline.json")"
+    check "the unsealed, named reviewer's step harness is its own" \
+        "claude" "$(jq -r '.steps[1].harness' "$rd_a3/pipeline.json")"
+    check "the unsealed, named reviewer's step network is null, not the sealed coder's" \
+        "null" "$(jq -r '.steps[1].network' "$rd_a3/pipeline.json")"
+    check "the unsealed, named reviewer's step model is its own" \
+        "opus" "$(jq -r '.steps[1].model' "$rd_a3/pipeline.json")"
+    check "the review step's default fix seat inherits the coder's harness" \
+        "pi" "$(jq -r '.steps[1].fix.harness' "$rd_a3/pipeline.json")"
+    check "the review step's default fix seat's undiscovered model is null, not \"\"" \
+        "null" "$(jq -r '.steps[1].fix.model' "$rd_a3/pipeline.json")"
+    check "the review step's default fix seat's repeat is the coder's own" \
+        "2" "$(jq -r '.steps[1].fix.repeat' "$rd_a3/pipeline.json")"
 fi
 
 # D. A definition edited between the staging and the run dir -- the race the

@@ -4825,7 +4825,9 @@ if [[ -n "$preset_name" ]]; then
                     --arg harness "$pipeline_fix_harness" \
                     --arg model "${!pipeline_fix_model_var}" \
                     --argjson repeat "${preset_step_fix_repeat[$preset_k]}" \
-                    '{harness: $harness, model: $model, repeat: $repeat}')"
+                    '{harness: $harness,
+                      model: (if $model == "" then null else $model end),
+                      repeat: $repeat}')"
             fi
         else
             case "${run_step_kind[$preset_k]}" in
@@ -4835,19 +4837,31 @@ if [[ -n "$preset_name" ]]; then
                     pipeline_network="$network"
                     ;;
                 review)
-                    # Without --review-harness/--maintainer-harness (and no
-                    # preset reviewer/maintainer agent, which would have set
-                    # review_harness_given/maintainer_harness_given true and
-                    # gone through the same fallback the CLI flag does at
-                    # the harness-split blocks above), review_harness and
+                    # Without --review-harness (and no preset reviewer
+                    # agent, which would have set review_harness_given true
+                    # and gone through the same fallback the CLI flag does
+                    # at the harness-split blocks above), review_harness and
                     # review_network stay "" until long after this block
                     # runs: the leg actually runs on the implement harness
                     # and network (see review_sandbox_cmd's own
                     # "review_harness_given == true" branch below), so that
                     # is what pipeline.json must say too, not a bare "".
-                    pipeline_harness="${review_harness:-$harness}"
-                    pipeline_model="$review_model"
-                    pipeline_network="${review_network:-$network}"
+                    # The two cases are not one bare ":-" fallback apiece:
+                    # once review_harness_given is true, review_network is a
+                    # true fact about the NAMED seat ("" meaning genuinely
+                    # not sealed), and must not inherit the implement seat's
+                    # network just because it happens to be unset -- the
+                    # same split fs_emit_prompt_preamble's setup already
+                    # makes below, near review_preamble_network.
+                    if [[ "$review_harness_given" == true ]]; then
+                        pipeline_harness="$review_harness"
+                        pipeline_model="$review_model"
+                        pipeline_network="${review_network:-}"
+                    else
+                        pipeline_harness="$harness"
+                        pipeline_model="${review_model:-$model}"
+                        pipeline_network="$network"
+                    fi
                     if [[ -n "$fix_harness" || "$fix_repeat" != "1" ]]; then
                         if [[ -n "$fix_harness" ]]; then
                             pipeline_fix_harness="$fix_harness"
@@ -4860,18 +4874,28 @@ if [[ -n "$preset_name" ]]; then
                             --arg harness "$pipeline_fix_harness" \
                             --arg model "$pipeline_fix_model" \
                             --argjson repeat "$fix_repeat" \
-                            '{harness: $harness, model: $model, repeat: $repeat}')"
+                            '{harness: $harness,
+                              model: (if $model == "" then null else $model end),
+                              repeat: $repeat}')"
                     fi
                     ;;
                 maintainer)
-                    # Same fallback as the review step above, for the same
-                    # reason: maintainer_harness/maintainer_network are only
-                    # defaulted to the implement seat's own values once the
-                    # maintainer loop actually compiles, hundreds of lines
-                    # below this block.
-                    pipeline_harness="${maintainer_harness:-$harness}"
+                    # Same fallback split as the review step above, for the
+                    # same reason: maintainer_harness/maintainer_network are
+                    # only defaulted to the implement seat's own values once
+                    # the maintainer loop actually compiles, hundreds of
+                    # lines below this block. maintainer_model has no such
+                    # split to make -- it is mandatory whenever
+                    # maintainer_loop_cap != 0, so it is never the
+                    # implement model in disguise.
+                    if [[ "$maintainer_harness_given" == true ]]; then
+                        pipeline_harness="$maintainer_harness"
+                        pipeline_network="${maintainer_network:-}"
+                    else
+                        pipeline_harness="$harness"
+                        pipeline_network="$network"
+                    fi
                     pipeline_model="$maintainer_model"
-                    pipeline_network="${maintainer_network:-$network}"
                     if [[ -n "$mntfix_harness" || "$mntfix_repeat" != "1" ]]; then
                         if [[ -n "$mntfix_harness" ]]; then
                             pipeline_fix_harness="$mntfix_harness"
@@ -4884,7 +4908,9 @@ if [[ -n "$preset_name" ]]; then
                             --arg harness "$pipeline_fix_harness" \
                             --arg model "$pipeline_fix_model" \
                             --argjson repeat "$mntfix_repeat" \
-                            '{harness: $harness, model: $model, repeat: $repeat}')"
+                            '{harness: $harness,
+                              model: (if $model == "" then null else $model end),
+                              repeat: $repeat}')"
                     fi
                     ;;
             esac
