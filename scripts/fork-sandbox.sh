@@ -4572,7 +4572,6 @@ else
     fi
     if [[ "${maintainer_loop_cap:-0}" != "0" ]]; then
         run_step_kind[run_step_k]="maintainer"
-        # shellcheck disable=SC2034  # unused-for-now, see the block comment above
         run_step_idx[run_step_k]=""
         run_step_cap[run_step_k]="$maintainer_loop_cap"
         run_step_prompt[run_step_k]=""
@@ -5950,10 +5949,6 @@ else
                 } > "$step_k_inner_prompt.part"
                 mv -- "$step_k_inner_prompt.part" "$step_k_inner_prompt"
                 printf -v "s${preset_k}_prompt_inner_review" '%s' "$step_k_inner_prompt"
-                # shellcheck disable=SC2034  # unused-for-now, see the
-                # run_step_* compile point's own comment above -- this is
-                # the array's last textual write in the file, so the
-                # disable comment lives here, not there.
                 run_step_prompt[preset_k]="$step_k_prompt"
                 step_k_fix_header="$run_dir/${preset_k}-fix-prompt-header.md"
                 {
@@ -7630,9 +7625,9 @@ if [[ -n "$pi_run_session_dir" && -d "$pi_run_session_dir" ]]; then
                 # is actually last writes the final exit code.
                 if [[ "$rc" == "0" ]]; then
                     rc=1
-                    if [[ "$review_loop_cap" == "0" && "$refresh_enabled" == "0" \
-                        && "${maintainer_loop_cap:-0}" == "0" \
-                        && "${code_repeat:-1}" == "1" ]]; then
+                    if [[ "$refresh_enabled" == "0" && "${composed_pipeline:-0}" != 1 \
+                        && "$run_step_count" == "1" && "${run_step_kind[1]}" == code \
+                        && "${run_step_cap[1]}" == "1" ]]; then
                         printf '%s\n' "$rc" > "$run_dir/exit-code"
                     fi
                 fi
@@ -7653,9 +7648,9 @@ if [[ -n "$pi_run_session_dir" && -d "$pi_run_session_dir" ]]; then
             # (or, if the gate above already wrote the stale rc=0, stay
             # unwritten by this branch) until whichever of those legs is
             # actually last updates it with the final $rc.
-            if [[ "$review_loop_cap" == "0" && "$refresh_enabled" == "0" \
-                && "${maintainer_loop_cap:-0}" == "0" \
-                && "${code_repeat:-1}" == "1" ]]; then
+            if [[ "$refresh_enabled" == "0" && "${composed_pipeline:-0}" != 1 \
+                && "$run_step_count" == "1" && "${run_step_kind[1]}" == code \
+                && "${run_step_cap[1]}" == "1" ]]; then
                 printf '%s\n' "$rc" > "$run_dir/exit-code"
             fi
         fi
@@ -8408,16 +8403,24 @@ run_leg() {
     fi
 }
 
-# Walk a composed preset after its first code leg.  This deliberately uses
-# the same run_leg accounting primitive as the fixed tiers; only the loop
-# record name and the seat index differ.  Composed records keep review field
-# names for review and maintain steps, per the pipeline schema.
+# Walk every run's steps -- composed and legacy-translated alike -- after
+# the first code leg. Both step flavors share this same run_leg
+# accounting primitive; cur_legacy (set per-step below) branches the
+# handful of places their record names, field-name flavor and artifact
+# paths still differ. Composed records always use review field names for
+# both review and maintain steps, per the pipeline schema; legacy
+# records use maintainer-flavored names only for a legacy maintainer
+# step (see the loop-json writer's own flavor branch, further down).
 cur_first_code=0
 cur_first_code_ran=0
 for ((cur_scan = 1; cur_scan <= run_step_count; cur_scan++)); do
     [[ "${run_step_kind[$cur_scan]}" == code ]] && { cur_first_code="$cur_scan"; break; }
 done
 [[ "$cur_first_code" == 1 && "${run_step_kind[1]}" == code ]] && cur_first_code_ran=1
+cur_has_review=0
+for ((cur_scan = 1; cur_scan <= run_step_count; cur_scan++)); do
+    [[ "${run_step_kind[$cur_scan]}" == review ]] && { cur_has_review=1; break; }
+done
 for ((cur_step_no = 1; cur_step_no <= run_step_count; cur_step_no++)); do
     cur_kind="${run_step_kind[$cur_step_no]}"
     cur_step_idx="${run_step_idx[$cur_step_no]}"
@@ -8540,7 +8543,7 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count; cur_step_no++)); do
                     done <<< "$cur_addenda_list"
                 fi
                 if [[ "$cur_legacy" == 1 && "$cur_kind" == maintainer ]]; then
-                    if [[ "${review_loop_cap:-0}" != "0" ]]; then
+                    if [[ "$cur_has_review" == 1 ]]; then
                         cur_mp_verdict=""
                         cur_mp_n=0
                         for cur_mp_v in "$run_dir"/review-verdict-*.md; do
@@ -9503,7 +9506,11 @@ $review_harness needs and can cost money. See review_sandbox_cmd in
 $run_dir/run.sh for exactly what it sends where.
 EOF
     fi
-    if [[ "${maintainer_loop_cap:-0}" != "0" \
+    run_has_maintainer_step=0
+    for ((_fs_launch_scan = 1; _fs_launch_scan <= run_step_count; _fs_launch_scan++)); do
+        [[ "${run_step_kind[$_fs_launch_scan]}" == maintainer ]] && { run_has_maintainer_step=1; break; }
+    done
+    if [[ "$run_has_maintainer_step" == 1 \
         && "${maintainer_network:-}" != "sealed" ]]; then
         cat <<EOF
 Its maintainer legs do not share that seal either: --maintainer-harness
