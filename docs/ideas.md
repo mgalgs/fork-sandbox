@@ -77,17 +77,26 @@ per node, decision logic per edge), there is a middle rung:
   neither should be built separately from the other.
 
 The middle rung is built: **presets** ([presets.md](presets.md)) — named
-YAML files defining agents and the pipeline that seats them: a code
-step, then review/maintain loops with a `repeat` cap and a `fix_agent`
-of their own, plus per-agent `repeat` passes for coding legs. Compiled
-onto the existing execution machinery, with flags as per-key overrides —
-and the fix seats and repeat passes are the first knobs with no flag at
-all, new capability landing preset-first as this entry predicted.
+YAML files defining agents and a `pipeline` of `code`/`review`/`maintain`
+steps in any order and any count, each loop with a `repeat` cap and a
+`fix_agent` of its own, plus per-agent `repeat` passes for coding legs.
+Compiled onto the existing execution machinery, with flags as per-key
+overrides — and the fix seats and repeat passes were the first knobs
+with no flag at all, new capability landing preset-first as this entry
+predicted.
 
-Still parked: the general DSL — per-edge decision logic, `feed=`
-wiring beyond return-within-a-tier/forward-between-tiers, summarize
-legs, tiers past two, arbitrary graphs. A DSL built from a single use
-case encodes that use case's assumptions. Trigger: the second concrete
-"it'd be nice to configure the pipeline this other way" — a shape the
-preset vocabulary cannot express with the legs that already exist, or a
-multi-implementer experiment (above) that earns permanence.
+This entry's trigger — "the second concrete 'it'd be nice to configure
+the pipeline this other way'" — has fired, and the linear part it named
+is built: free-order, arbitrarily-counted `code`/`review`/`maintain`
+composition, no longer the fixed one-code-then-review-then-maintain
+skeleton. (The run engine's walk over an arbitrary step list is a
+separate, not-yet-landed piece — see presets.md's "pipeline" section.)
+
+Still parked: the general DSL — per-edge decision logic, `feed=` wiring
+beyond return-within-a-tier/forward-between-tiers, summarize legs,
+arbitrary graphs (branches, not just chains). A DSL built from a single
+use case encodes that use case's assumptions. Trigger: a shape the
+free-order preset vocabulary still cannot express — a decision point
+that depends on more than a verdict, or non-linear routing between
+seats — or a multi-implementer experiment (above) that earns
+permanence.

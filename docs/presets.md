@@ -101,37 +101,50 @@ An agent is a named seat: who types, on what, and how. Names match
 | `model` | the seat's model or model alias. Optional where the flag is optional, required where it is required (`pi` needs one, on any seat, unless `network: sealed`); conflicts with a combined `harness` form, exactly as `--model` conflicts with `--harness pi/x`. |
 | `claude-args` | extra arguments for the claude CLI — e.g. `--effort high`. |
 | `pi-args` | extra arguments for pi — e.g. `--thinking low`. |
-| `repeat` | run every coding leg this agent sits — the code step, or a loop's fix legs — as N passes on the same prompt. See "Repeat passes" below. |
+| `repeat` | run every coding leg this agent sits — a code step, or a loop's fix legs — as N passes on the same prompt. See "Repeat passes" below. A code step may set its own `repeat` (below) to override this agent-level default for that step only. |
 | `refresh-at` / `refresh-max` | context refresh for this agent's coding, same values and claude-only rule as the flags of these names. |
-| `endpoint` | which named `K8S_PROXY_ENDPOINTS` entry the seat talks to on a `--k8s` run, passed on to `fork-sandbox-k8s.sh run`, which resolves it against the registered endpoints. Refused on an agent that does not sit the code seat — the run has one proxy base URL for the whole run — and refused without `--k8s`: it names a cluster proxy path and means nothing locally. |
+| `endpoint` | which named `K8S_PROXY_ENDPOINTS` entry the seat talks to on a `--k8s` run, passed on to `fork-sandbox-k8s.sh run`, which resolves it against the registered endpoints. Refused on an agent that does not sit the first code step in pipeline order — the run has one proxy base URL for the whole run — and refused without `--k8s`: it names a cluster proxy path and means nothing locally. |
 
 Four of these reach less far than an agent definition suggests, and the
 parser refuses the cases the engine cannot honor rather than trimming
-them silently: `claude-args`/`pi-args` reach only the first code seat's
+them silently: `claude-args`/`pi-args` reach only the first code step's
 legs (there is no per-seat argument plumbing for any other leg yet), the
-refresh keys reach only the first code seat's *first pass*, `repeat`
+refresh keys reach only the first code step's *first pass*, `repeat`
 is refused on an agent that never codes, and `endpoint` is refused on
-an agent that does not sit the code seat (the run has one proxy base
-URL for the whole run) and without `--k8s` (it names a cluster proxy
-path and means nothing there).
+an agent that does not sit the first code step in pipeline order (the
+run has one proxy base URL for the whole run) and without `--k8s` (it
+names a cluster proxy path and means nothing there).
 
 ### `pipeline`
 
-The first item is the **code step** — the coding leg, exactly once:
+A list of steps, each `action: code`, `review` or `maintain`, in any
+order and any count — the only structural requirement is at least one
+step:
 
 ```yaml
   - action: code
     agent: haiku-coder
 ```
 
-Then at most one **review step** and one **maintain step**, in that
-order. Each is a loop:
+A `code` step is a coding leg. It takes `agent` and an optional `repeat`
+that overrides the agent's own `repeat` (above) for this step only;
+omitted, it defaults to the agent's `repeat` property.
+
+`review` and `maintain` steps are loops:
 
 | key | meaning |
 |---|---|
 | `agent` | who reads and writes the verdict. |
 | `repeat` | required — the loop cap: how many verdict-then-fix rounds may run. |
-| `fix_agent` | who acts on findings — any agent, running on its own harness and model, with its own `repeat`. Omitted, it is the code seat's agent, riding the implement command exactly as fix legs always have. |
+| `fix_agent` | who acts on findings — any agent, running on its own harness and model, with its own `repeat`. Omitted, it defaults to the first code step's agent in pipeline order, riding the implement command exactly as fix legs always have. A pipeline with no code step has no such default, so a `review`/`maintain` step without an explicit `fix_agent` there is a parse error. |
+
+Today's run engine only executes a **legacy-shaped** pipeline — one code
+step, then at most one review step, then at most one maintain step, in
+that order. A preset shaped any other way (a review-first pipeline, two
+review steps, a review step repeated after a maintain step, and so on)
+parses and validates successfully, but is refused at launch: the walk
+over an arbitrary step list that would run it does not exist yet. Write
+free-order pipelines against this grammar; run legacy-shaped ones.
 
 Each round runs the verdict leg; **approval ends the loop** — every
 review and maintain leg ends by writing a verdict whose first line is
@@ -346,16 +359,20 @@ sandbox-run-log.py stats --by preset.name,model
 
 ## Where the syntax stops
 
-The pipeline vocabulary is exactly the legs the execution machinery has,
-and what the syntax does not have, the engine does not have either:
+The pipeline vocabulary is exactly the legs the execution machinery has
+(free-order and repeated-step composition is grammar the parser accepts
+ahead of the run engine's walk over it, per "pipeline" above — not the
+general DSL below). What the syntax does not have, no engine — present or
+planned — has either:
 
 - **No conditional vocabulary.** Approval ends a loop, the cap ends it,
   no-progress ends it — those are the verbs' meaning, not options to
   choose among.
 - **No `summarize` action**, or other steps that pass work along without
   fixing.
-- **No third tier**, and no arbitrary chains or branches.
-- **No per-seat args or refresh** beyond the first code seat, and no
+- **No action beyond `code`/`review`/`maintain`**, and no branches or
+  graphs — a pipeline is always a single linear chain, of any length.
+- **No per-seat args or refresh** beyond the first code step, and no
   codex fix seats — each a plumbing gap named by its refusal, not a
   design position.
 - **No `input:` key.** The engine fixes the data flow — the code step
