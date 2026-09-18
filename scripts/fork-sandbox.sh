@@ -6321,6 +6321,49 @@ started_at="$(date +%s)"
         printf 'fxm_formatter=%q\n' "$fxm_run_formatter"
         printf 'fxm_fix_prompt_header=%q\n' "$fxm_fix_prompt_header"
     fi
+    # A composed (non-legacy-shaped) preset's per-step accounting state, the
+    # same six fields the "rev_*"/"mnt_*"/"fxr_*"/"fxm_*" blocks above supply
+    # for their fixed tiers -- the only fields run_leg's kind-branch actually
+    # reads (pi_session_dir, usage_source, formatter, harness_version,
+    # harness_env_file, and harness itself in place of a "preamble" fallback,
+    # which no composed step needs: every composed step's harness comes
+    # straight from the parser, never a --review-harness-style fallback --
+    # see the seat-resolution loop's "s<K>_*"/"s<K>fix_*" writes for where
+    # these values were actually resolved). Unlike the fixed fxr_*/fxm_*
+    # blocks above, there is no "was a fix seat given" guard on the fix half:
+    # the parser always resolves an effective fix agent for every
+    # review/maintain step, so "s<K>fix_*" is never empty the way
+    # "fix_harness"/"mntfix_harness" can be.
+    if [[ "$preset_is_legacy_shaped" != true ]]; then
+        for ((preset_k = 1; preset_k <= preset_step_count; preset_k++)); do
+            preset_k_var="s${preset_k}_usage_source"
+            printf 's%d_usage_source=%q\n' "$preset_k" "${!preset_k_var}"
+            preset_k_var="s${preset_k}_run_formatter"
+            printf 's%d_formatter=%q\n' "$preset_k" "${!preset_k_var}"
+            preset_k_var="s${preset_k}_harness_version"
+            printf 's%d_harness_version=%q\n' "$preset_k" "${!preset_k_var}"
+            preset_k_var="s${preset_k}_harness_env_file"
+            printf 's%d_harness_env_file=%q\n' "$preset_k" "${!preset_k_var}"
+            preset_k_var="s${preset_k}_pi_session_dir"
+            printf 's%d_pi_session_dir=%q\n' "$preset_k" "${!preset_k_var}"
+            preset_k_var="s${preset_k}_harness"
+            printf 's%d_harness=%q\n' "$preset_k" "${!preset_k_var}"
+            if [[ "${preset_step_action[$preset_k]}" != code ]]; then
+                preset_k_var="s${preset_k}fix_usage_source"
+                printf 's%dfix_usage_source=%q\n' "$preset_k" "${!preset_k_var}"
+                preset_k_var="s${preset_k}fix_run_formatter"
+                printf 's%dfix_formatter=%q\n' "$preset_k" "${!preset_k_var}"
+                preset_k_var="s${preset_k}fix_harness_version"
+                printf 's%dfix_harness_version=%q\n' "$preset_k" "${!preset_k_var}"
+                preset_k_var="s${preset_k}fix_harness_env_file"
+                printf 's%dfix_harness_env_file=%q\n' "$preset_k" "${!preset_k_var}"
+                preset_k_var="s${preset_k}fix_pi_session_dir"
+                printf 's%dfix_pi_session_dir=%q\n' "$preset_k" "${!preset_k_var}"
+                preset_k_var="s${preset_k}fix_harness"
+                printf 's%dfix_harness=%q\n' "$preset_k" "${!preset_k_var}"
+            fi
+        done
+    fi
     # Per-account attribution, for summary.json's own claude_credentials_*
     # pair below -- always printed (unlike run.env's conditional-key
     # convention above) with an empty-string sentinel for "no claude leg",
@@ -6394,6 +6437,29 @@ started_at="$(date +%s)"
         printf 'mntfix_sandbox_cmd=('
         printf '%q ' "${mntfix_sandbox_cmd[@]}"
         printf ')\n'
+    fi
+    # The composed-step counterpart to sandbox_cmd/review_sandbox_cmd/... above
+    # -- one array literal per step (plus its fix seat, for review/maintain
+    # steps), populated in-memory by the "fs_build_sandbox_cmd s<K> ..." loop
+    # above (see its own comment for why it could not run any earlier than
+    # here) and serialized into run.sh's own text the same %q-per-element way
+    # sandbox_cmd's is, just above. declare -n is used rather than "${!name}"
+    # because that indirection only reads a scalar; a runtime-built array name
+    # needs a real nameref to expand its elements.
+    if [[ "$preset_is_legacy_shaped" != true ]]; then
+        for ((preset_k = 1; preset_k <= preset_step_count; preset_k++)); do
+            declare -n preset_k_cmd_ref="s${preset_k}_sandbox_cmd"
+            printf 's%d_sandbox_cmd=(' "$preset_k"
+            printf '%q ' "${preset_k_cmd_ref[@]}"
+            printf ')\n'
+            if [[ "${preset_step_action[$preset_k]}" != code ]]; then
+                declare -n preset_k_cmd_ref="s${preset_k}fix_sandbox_cmd"
+                printf 's%dfix_sandbox_cmd=(' "$preset_k"
+                printf '%q ' "${preset_k_cmd_ref[@]}"
+                printf ')\n'
+            fi
+        done
+        unset -n preset_k_cmd_ref
     fi
     printf '\n'
     cat <<'RUNNER'
