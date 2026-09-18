@@ -1765,6 +1765,28 @@ if [[ -n "$preset_name" ]]; then
     declare -A preset_agent_pargs=()
     declare -A preset_agent_endpoint=()
     declare -A preset_agent_network=()
+    # The parser's step-indexed emit format lands here first, 1-based by
+    # pipeline order (see fork-sandbox-preset-parse.py's header comment for
+    # the wire format). A legacy-shaped pipeline (one code step, then at
+    # most one review, then at most one maintain, in that order) is
+    # translated below into the preset_impl_*/preset_review_*/
+    # preset_maintain_* scalars the existing flag-compile block already
+    # consumes unchanged; a composed pipeline skips that block entirely and
+    # is compiled straight into the step_* arrays at the run engine's
+    # compile point, further down.
+    preset_step_count=0
+    declare -a preset_step_action=()
+    declare -a preset_step_agent=()
+    declare -a preset_step_repeat=()
+    declare -a preset_step_refresh_at=()
+    declare -a preset_step_refresh_max=()
+    declare -a preset_step_max=()
+    declare -a preset_step_fix_default=()
+    declare -a preset_step_fix_agent=()
+    declare -a preset_step_fix_harness=()
+    declare -a preset_step_fix_model=()
+    declare -a preset_step_fix_repeat=()
+    declare -a preset_step_fix_network=()
     preset_impl_agent=""
     preset_impl_refresh_at=""
     preset_impl_refresh_max=""
