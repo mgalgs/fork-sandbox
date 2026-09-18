@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # fork-sandbox-discover-claude-test.sh -- the `claude` configure discoverer's
-# CLAUDE_CREDENTIALS override handling
+# CLAUDE_CREDENTIALS override handling, and its pool/hook balancer handling
 #
 # Usage: tests/fork-sandbox-discover-claude-test.sh
 #
@@ -14,10 +14,18 @@
 # or not read at all. This file asserts on the actual reported source path,
 # which only the correct read produces.
 #
+# It also runs fs_balance_claude_credential (CLAUDE_CREDENTIAL_POOL +
+# CLAUDE_HEADROOM_HOOK) the same way a real run would, per the header
+# comment in scripts/fork-sandbox-discover-claude -- this file pins the
+# three behaviors that header promises: a healthy pool is reported as the
+# pool's choice, a pool choice beats CLAUDE_CREDENTIALS, and a misconfigured
+# pool reports nothing (exit 0) rather than falling back to the default.
+#
 # Runs entirely offline: no real credential, no network. HOME always points
 # at a temp dir with no real ~/.claude, so the default-credential and
 # Keychain paths this file doesn't exercise stay untouched.
 
+# shellcheck disable=SC2016  # literal shell snippets handed to fake_hook are intentional
 set -uo pipefail
 
 repo_dir="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
@@ -35,11 +43,35 @@ check() {
 newdir() { mktemp -d; }
 
 # Runs `discover` with a clean HOME (no real ~/.claude, no real Keychain
-# reachable -- this is Linux) and the given FORK_SANDBOX_CONFIG_DIR.
+# reachable -- this is Linux) and the given FORK_SANDBOX_CONFIG_DIR. An
+# optional extra PATH dir (for a fake hook) is prepended ahead of the
+# minimal PATH the other cases use.
 run_discover() {
-    local home="$1" config_dir="$2"
-    env -i PATH="/usr/bin:/bin" HOME="$home" FORK_SANDBOX_CONFIG_DIR="$config_dir" \
-        "$discover_claude" discover
+    local home="$1" config_dir="$2" extra_path="${3:-}"
+    env -i PATH="${extra_path:+$extra_path:}/usr/bin:/bin" HOME="$home" \
+        FORK_SANDBOX_CONFIG_DIR="$config_dir" "$discover_claude" discover
+}
+
+# A fake credential file -- content never matters to the balancer, only the
+# path does; the balancer and the hook both only ever handle paths.
+fake_cred() {
+    local dir="$1" name="$2" path
+    path="$dir/$name"
+    printf '{"claudeAiOauth":{"accessToken":"fixture-%s"}}\n' "$name" > "$path"
+    printf '%s' "$path"
+}
+
+# A fake hook executable named fork-sandbox-headroom-<name>, in its own PATH
+# dir. $1 = name, $2 = script body (referencing "$@" for the candidate argv).
+fake_hook() {
+    local name="$1" body="$2" bindir
+    bindir="$(mktemp -d)"; tmpdirs+=("$bindir")
+    cat > "$bindir/fork-sandbox-headroom-$name" <<HOOK
+#!/usr/bin/env bash
+$body
+HOOK
+    chmod +x "$bindir/fork-sandbox-headroom-$name"
+    printf '%s' "$bindir"
 }
 
 printf '== no override, no default credential: reports nothing ==\n'
@@ -85,6 +117,41 @@ printf 'secret-token-marker-c\n' > "$home_c/.claude/.credentials.json"
 out="$(run_discover "$home_c" "$cfg_c")"
 check "no override: reports the default path as the source" \
     "present	-	Claude credential	$home_c/.claude/.credentials.json	found" "$out"
+
+printf '\n== healthy pool: reports the hook'"'"'s choice ==\n'
+home_d="$(newdir)"; tmpdirs+=("$home_d")
+cfg_d="$(newdir)"; tmpdirs+=("$cfg_d")
+cred_d1="$(fake_cred "$cfg_d" pool-d1.json)"
+cred_d2="$(fake_cred "$cfg_d" pool-d2.json)"
+hook_dir_d="$(fake_hook happy 'printf "%s\n" "$2"')"
+printf 'CLAUDE_CREDENTIAL_POOL=%s:%s\nCLAUDE_HEADROOM_HOOK=happy\n' "$cred_d1" "$cred_d2" \
+    > "$cfg_d/claude.env"
+out="$(run_discover "$home_d" "$cfg_d" "$hook_dir_d")"
+check "healthy pool: reports the hook's chosen candidate as the source" \
+    "present	-	Claude credential	$cred_d2	found" "$out"
+
+printf '\n== pool set alongside CLAUDE_CREDENTIALS is refused, not resolved by falling back to CLAUDE_CREDENTIALS ==\n'
+home_e="$(newdir)"; tmpdirs+=("$home_e")
+cfg_e="$(newdir)"; tmpdirs+=("$cfg_e")
+cred_pin_e="$(fake_cred "$cfg_e" pinned.json)"
+cred_e1="$(fake_cred "$cfg_e" pool-e1.json)"
+cred_e2="$(fake_cred "$cfg_e" pool-e2.json)"
+hook_dir_e="$(fake_hook happy2 'printf "%s\n" "$1"')"
+printf 'CLAUDE_CREDENTIALS=%s\nCLAUDE_CREDENTIAL_POOL=%s:%s\nCLAUDE_HEADROOM_HOOK=happy2\n' \
+    "$cred_pin_e" "$cred_e1" "$cred_e2" > "$cfg_e/claude.env"
+out="$(run_discover "$home_e" "$cfg_e" "$hook_dir_e")"
+check "CLAUDE_CREDENTIALS + pool both set: discover reports nothing, not the pinned credential" \
+    "" "$out"
+
+printf '\n== misconfigured pool (no hook): reports nothing, not the real default credential ==\n'
+home_f="$(newdir)"; tmpdirs+=("$home_f")
+cfg_f="$(newdir)"; tmpdirs+=("$cfg_f")
+mkdir -p "$home_f/.claude"
+printf 'secret-token-marker-f\n' > "$home_f/.claude/.credentials.json"
+cred_f="$(fake_cred "$cfg_f" pool-f.json)"
+printf 'CLAUDE_CREDENTIAL_POOL=%s\n' "$cred_f" > "$cfg_f/claude.env"
+out="$(run_discover "$home_f" "$cfg_f")"
+check "pool without hook, real default present: discover still prints nothing" "" "$out"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))

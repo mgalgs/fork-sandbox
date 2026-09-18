@@ -35,6 +35,15 @@ Today's default is `$HOME/.claude/.credentials.json`, falling back to the
 login Keychain on macOS. The balancer never runs for a run with no claude
 leg — a pure-`pi` run never touches the hook.
 
+`fork-sandbox.sh configure` is a separate exception to that rule: its
+`claude` discoverer (`scripts/fork-sandbox-discover-claude`) runs this same
+balancer on every `configure` invocation, for any harness, so its report
+matches what a real run would resolve. `configure` runs every discoverer
+unconditionally, so a configured pool means the hook is invoked once per
+`configure` run too, not just once per claude leg — and, per "No timeout is
+imposed" below, a hung hook hangs `configure` the same way it would hang a
+launch.
+
 The credential the balancer chooses flows through the exact same resolution
 as an explicit `--claude-credentials` or `CLAUDE_CREDENTIALS`: resolved to an
 absolute path, checked for unsafe characters, and required to exist. A

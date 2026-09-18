@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # fork-sandbox-claude-credentials-test.sh -- --claude-credentials and
 # CLAUDE_CREDENTIALS on fork-sandbox.sh itself: the precedence rule
-# (--claude-credentials beats claude.env beats the default), the --k8s
-# refusal, and forwarding into every claude leg's sandbox_cmd.
+# (--claude-credentials beats claude.env beats the default), --k8s
+# forwarding the flag instead of refusing it, and forwarding into every
+# claude leg's sandbox_cmd.
 #
 # fork-sandbox-lib.sh's own override plumbing is covered by
 # fork-sandbox-toolchain-test.sh, the client end by
