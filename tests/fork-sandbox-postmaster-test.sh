@@ -673,6 +673,35 @@ contains "both To+Cc unresolvable: the flag event keyword is still greppable for
     "$(cat "$work/once.out")" "unresolvable-cc"
 
 # ============================================================
+printf '\n== the SAME unresolvable @name on both To: and Cc: still flags as To: ==\n'
+# UNRESOLVED_TO is one dedup record shared between To: and Cc: (see its own
+# comment). When the SAME @-shaped name is unresolvable on both headers of
+# one message, the To: block must claim it, not the Cc: block: To: is the
+# addressee line and route-dead is stable porcelain a monitor greps to
+# learn an addressee is unreachable -- it must not silently disappear just
+# because Cc: resolution happened to record the name first.
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+mid_same="$(send_msg '@alice' '@bob,@ghostname' 'same unresolvable name on to and cc' 'body' 8 '@ghostname')"
+tid_same="$(thread_of "$mid_same")"
+short_same="${tid_same:0:8}"
+: > "$STUB_ARGV_LOG"
+once
+check "same name To+Cc: the good To seat still wakes" 1 \
+    "$(grep -c -- "^sbx-mail-$short_same-bob-" "$STUB_ARGV_LOG")"
+contains "same name To+Cc: route-dead event still fires for the addressee miss" \
+    "$(cat "$work/once.out")" "pm route-dead thread=$short_same unresolved=1"
+same_flag="$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid_same" 2>/dev/null)"
+contains "same name To+Cc: flag reason names it as unresolvable To:" \
+    "$same_flag" "unresolvable To: @ghostname at $mid_same"
+not_contains "same name To+Cc: flag reason does not also claim it as unresolvable Cc:" \
+    "$same_flag" "unresolvable Cc:"
+check "same name To+Cc: exactly one flag event for the message, not two" 1 \
+    "$(grep -c -- "^pm flag thread=$short_same " "$work/once.out")"
+contains "same name To+Cc: flag event keyword is unresolvable-to" \
+    "$(cat "$work/once.out")" "pm flag thread=$short_same reason=unresolvable-to"
+
+# ============================================================
 printf '\n== @operator in To: is never treated as unresolvable (rule 0) ==\n'
 # ============================================================
 # Every documented `mail send`/`mail reply` sends operator mail as the

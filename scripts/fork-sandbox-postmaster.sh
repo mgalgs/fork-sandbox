@@ -439,10 +439,14 @@
 #                                   for the routing decision, not read back
 #                                   by anything (pm_ledger_delivered_live)
 #   needs-operator/<thread-id>     flag file; content is the reason
-#   needs-operator-journal/<thread-id>  append-only per-thread history of
-#                                   every pm_flag/pm_unflag call (timestamp,
-#                                   kind, keyword, reason) -- operator-
-#                                   readable event count for `status`
+#   needs-operator-journal/<thread-id>  append-only per-thread history:
+#                                   one line per pm_flag call, plus one
+#                                   per pm_unflag call that actually
+#                                   cleared a flag -- a redundant unflag on
+#                                   an already-clear thread appends
+#                                   nothing (timestamp, kind, keyword,
+#                                   reason) -- operator-readable event
+#                                   count for `status`
 #                                   (e.g. "needs-operator (7 events)");
 #                                   nothing routes on it
 #   spawns/<thread-id>             one line appended per spawn, reset to
@@ -632,8 +636,10 @@ TRIAGED="$STATE/triaged"
 # after already being recorded once -- the reason text still says which
 # header it arrived on the first time.
 UNRESOLVED_TO="$STATE/unresolved-to"
-# Per-thread, append-only flag history: pm_flag/pm_unflag each append one
-# line here on every call, never truncating -- unlike $NEEDS_OPERATOR/<tid>
+# Per-thread, append-only flag history: every pm_flag call appends one
+# line here, and so does every pm_unflag call that actually clears a flag
+# (a redundant unflag on an already-clear thread appends nothing -- see
+# pm_unflag's own comment) -- never truncating, unlike $NEEDS_OPERATOR/<tid>
 # (the CURRENT reason, overwritten every call; see pm_flag_keyword's own
 # comment on why that overwrite is load-bearing and must not change). This
 # is what lets `status` report an event count beside the current reason
@@ -1917,7 +1923,12 @@ pm_process_message() {
     # exactly when bash wires up the process-substitution redirection
     # below. It's unset again immediately after, then set again around the
     # Cc: expansion further down with its own file -- same mechanism, two
-    # separate records (see UNRESOLVED_CC's own comment for why separate).
+    # separate temp files, one per pm_expand_to call, because
+    # PM_EXPAND_UNRESOLVED_FILE only holds one path at a time. Both feed
+    # the SAME per-thread dedup record (UNRESOLVED_TO, shared -- see its
+    # own comment) once expansion returns; the temp files are just how
+    # each call's unresolved names cross the process-substitution
+    # boundary before that.
     local -a to_expanded=()
     local to_unresolved_file
     to_unresolved_file="$(mktemp "$MAIL_ROOT/.postmaster.to-unresolved.XXXXXX")"
@@ -1935,6 +1946,76 @@ pm_process_message() {
         to_candidates+=("$cand")
     done
 
+    # An @-shaped To: name that never expanded is a typo'd seat or a
+    # missing fleet file, not an external address (rule 0 already let
+    # those through silently, above) -- flag it even when Cc: rescues a
+    # wake for someone else on the same message, since the To: line
+    # itself is still wrong. The raw names are safe in the flag file
+    # (precedent: the malformed-reply flag embeds mail CLI stderr) but
+    # never on the events line, which only ever carries the count.
+    #
+    # This runs BEFORE the Cc unresolved-name check below, deliberately:
+    # both write into the same UNRESOLVED_TO/$tid dedup record (same file,
+    # same tid -- see that record's own comment for why not a separate
+    # per-header file), so when one message carries the SAME @-shaped
+    # unresolvable name on both headers, whichever block runs first claims
+    # it as "fresh" and the other sees it as already-recorded. To: must
+    # win that race: it is the addressee line (Cc: rule below insists an
+    # unresolved Cc: reason means an OBSERVER, not an addressee, is
+    # missing), and route-dead is stable porcelain a monitor greps to
+    # learn an addressee is unreachable -- it must not silently disappear
+    # because a Cc: block recorded the same name first.
+    #
+    # reply-all copies a message's own From/To/Cc into every reply
+    # (fork-sandbox-mail.sh's reply-all default), so an unresolved To:
+    # name is, past the message that first introduced it, almost always
+    # the SAME name every later reply in the thread inherited, not a new
+    # problem. pm_flag overwrites rather than appends (see its own
+    # comment), so re-flagging an already-known name on every later
+    # message would permanently pin the thread on this one reason,
+    # clobbering "hops exhausted", "spawn failed" and every other flag
+    # reason a later message would otherwise report, and would defeat
+    # rule 1's operator-reset promise the instant the operator's own
+    # `mail reply` (itself a reply-all) reintroduces the same name.
+    # UNRESOLVED_TO/$tid records, one per line, every name this thread
+    # has already recorded -- flagged or not (a name first seen on a
+    # message that also trips the hops/budget gate below is recorded
+    # here without ever being flagged itself, since that gate's reason
+    # wins instead); only a name not already in that record is "fresh"
+    # and re-flags/re-events, and every name seen this
+    # pass is appended so it is never flagged again. The record is
+    # thread-scoped and deliberately NOT cleared by rule 1's pm_unflag
+    # above: an operator's reply carrying the same propagated name must
+    # not immediately re-flag the thread it just re-armed. Shared with
+    # the Cc: check below (same file, same tid) rather than a separate
+    # per-header record: reply-all folds a parent's Cc into the reply's
+    # own To:, so a name recorded via Cc here must still read as
+    # already-known when it reappears via To on the very next message,
+    # or the fold would re-flag the thread the operator's own reply just
+    # reset.
+    local -a fresh_unresolved=()
+    if (( ${#unresolved_to[@]} )); then
+        mkdir -p -- "$UNRESOLVED_TO"
+        local seen_file="$UNRESOLVED_TO/$tid" u
+        for u in "${unresolved_to[@]}"; do
+            if [[ -e "$seen_file" ]] && grep -qxF -- "$u" "$seen_file"; then
+                continue
+            fi
+            fresh_unresolved+=("$u")
+            printf '%s\n' "$u" >> "$seen_file"
+        done
+    fi
+    local to_reason=""
+    if (( ${#fresh_unresolved[@]} )); then
+        local unresolved_joined="" u
+        for u in "${fresh_unresolved[@]}"; do
+            [[ -n "$unresolved_joined" ]] && unresolved_joined+=", "
+            unresolved_joined+="$u"
+        done
+        pm_event "route-dead thread=${tid:0:8} unresolved=${#fresh_unresolved[@]}"
+        to_reason="unresolvable To: $unresolved_joined at $mid"
+    fi
+
     local gate_reason=""
     if [[ "$x_hops" == "0" ]]; then
         gate_reason="hops exhausted at $mid"
@@ -1950,9 +2031,13 @@ pm_process_message() {
     if [[ -z "$gate_reason" ]]; then
         candidates+=("${to_candidates[@]}")
 
-        # Same unresolved-name tracking as To: below, SAME record
+        # Same unresolved-name tracking as To: above, SAME record
         # (UNRESOLVED_TO, shared -- see its own comment for why not a
-        # separate per-header file) -- only reached when there's no
+        # separate per-header file), and deliberately run AFTER the To:
+        # block above: both dedup against the same per-thread record, so
+        # whichever runs first claims a name shared by both headers on the
+        # same message as "fresh" -- To: must win that race (see the To:
+        # block's own comment). This block is only reached when there's no
         # gate_reason, same as the rest of Cc resolution (wake-on-cc,
         # triage): rule 0's own doc already says a refused message skips
         # Cc resolution outright, and that now includes this check too,
@@ -2020,64 +2105,6 @@ pm_process_message() {
     fi
 
     : > "$ROUTED/$mid"
-
-    # An @-shaped To: name that never expanded is a typo'd seat or a
-    # missing fleet file, not an external address (rule 0 already let
-    # those through silently, above) -- flag it even when Cc: rescued a
-    # wake for someone else on the same message, since the To: line
-    # itself is still wrong. The raw names are safe in the flag file
-    # (precedent: the malformed-reply flag embeds mail CLI stderr) but
-    # never on the events line, which only ever carries the count.
-    #
-    # reply-all copies a message's own From/To/Cc into every reply
-    # (fork-sandbox-mail.sh's reply-all default), so an unresolved To:
-    # name is, past the message that first introduced it, almost always
-    # the SAME name every later reply in the thread inherited, not a new
-    # problem. pm_flag overwrites rather than appends (see its own
-    # comment), so re-flagging an already-known name on every later
-    # message would permanently pin the thread on this one reason,
-    # clobbering "hops exhausted", "spawn failed" and every other flag
-    # reason a later message would otherwise report, and would defeat
-    # rule 1's operator-reset promise the instant the operator's own
-    # `mail reply` (itself a reply-all) reintroduces the same name.
-    # UNRESOLVED_TO/$tid records, one per line, every name this thread
-    # has already recorded -- flagged or not (a name first seen on a
-    # message that also trips the hops/budget gate below is recorded
-    # here without ever being flagged itself, since that gate's reason
-    # wins instead); only a name not already in that record is "fresh"
-    # and re-flags/re-events, and every name seen this
-    # pass is appended so it is never flagged again. The record is
-    # thread-scoped and deliberately NOT cleared by rule 1's pm_unflag
-    # above: an operator's reply carrying the same propagated name must
-    # not immediately re-flag the thread it just re-armed. Shared with
-    # the Cc: check above (same file, same tid) rather than a separate
-    # per-header record: reply-all folds a parent's Cc into the reply's
-    # own To:, so a name recorded via Cc here must still read as
-    # already-known when it reappears via To on the very next message,
-    # or the fold would re-flag the thread the operator's own reply just
-    # reset.
-    local -a fresh_unresolved=()
-    if (( ${#unresolved_to[@]} )); then
-        mkdir -p -- "$UNRESOLVED_TO"
-        local seen_file="$UNRESOLVED_TO/$tid" u
-        for u in "${unresolved_to[@]}"; do
-            if [[ -e "$seen_file" ]] && grep -qxF -- "$u" "$seen_file"; then
-                continue
-            fi
-            fresh_unresolved+=("$u")
-            printf '%s\n' "$u" >> "$seen_file"
-        done
-    fi
-    local to_reason=""
-    if (( ${#fresh_unresolved[@]} )); then
-        local unresolved_joined="" u
-        for u in "${fresh_unresolved[@]}"; do
-            [[ -n "$unresolved_joined" ]] && unresolved_joined+=", "
-            unresolved_joined+="$u"
-        done
-        pm_event "route-dead thread=${tid:0:8} unresolved=${#fresh_unresolved[@]}"
-        to_reason="unresolvable To: $unresolved_joined at $mid"
-    fi
 
     # Cc's equivalent of the To: block above -- an @-shaped Cc name that
     # never resolved means an intended OBSERVER, not an addressee, silently
