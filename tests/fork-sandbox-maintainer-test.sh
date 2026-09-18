@@ -626,7 +626,8 @@ if (( rc2 == 0 )) && [[ -n "$rd2" ]]; then
         (( scol == 12 )) || misaligned+="$sline;"
     done < <(sed -n '/^== fork-sandbox summary ==$/,/^$/p' "$rd2/summary.txt")
     check "the summary's value column aligns at 12 across all labels" \
-        "" "$misaligned"    contains "events.jsonl still shows the coding session" \
+        "" "$misaligned"
+    contains "events.jsonl still shows the coding session" \
         '"subtype":"success"' "$(cat "$rd2/events.jsonl")"
     if [[ -f "$rd2/exit-code" ]]; then
         ok "the exit code was published"
