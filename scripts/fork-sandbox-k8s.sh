@@ -8,6 +8,7 @@
 #                            [--outbox-max SIZE]
 #                            [--context-ro DIR]
 #                            [--checkout REF] [--services-trust-ref REF]
+#                            [--claude-credentials PATH]
 #                            [--label key=value]... [--task-meta JSON]
 #                            <project-path> <handoff-file>
 #        fork-sandbox-k8s.sh run [--dry-run] [--timeout SECONDS] [--keep]
@@ -17,6 +18,7 @@
 #                            [--outbox-dir DIR] [--outbox-max SIZE]
 #                            [--context-ro DIR]
 #                            [--checkout REF] [--services-trust-ref REF]
+#                            [--claude-credentials PATH]
 #                            [--label key=value]... [--task-meta JSON]
 #                            <project-path> <handoff-file>
 #        fork-sandbox-k8s.sh wait --branch NAME [--timeout SECONDS] [--probe]
@@ -238,6 +240,17 @@
 # var (exactly the path --model takes) and is split on whitespace into an
 # array the entrypoint expands as arguments: splitting, never eval, never
 # a shell-string interpolation. Unset or empty adds no arguments at all.
+#
+# --claude-credentials PATH (submit, run; --harness claude only): pins the
+# OAuth credential file this run reads, overriding both CLAUDE_CREDENTIALS in
+# claude.env and the launcher-balanced pool choice (CLAUDE_CREDENTIAL_POOL +
+# CLAUDE_HEADROOM_HOOK, see docs/credential-balancing.md) -- the same
+# precedence fork-sandbox.sh's local path resolves, and, when this run was
+# started via `fork-sandbox.sh --k8s`, the same flag that launcher forwards
+# here already resolved, so the hook is never invoked twice for one run. PATH
+# must exist; a typo is refused before the Job, the ConfigMap or the per-run
+# claude-proxy Secret are created. See fs_balance_claude_credential in
+# scripts/fork-sandbox-lib.sh for the pool/hook contract itself.
 #
 # --label key=value (submit, run): an opt-in free-form label for this run's
 # objects, repeatable. Renders as fork-sandbox.io/<key>: <value> on the Job,
@@ -2656,7 +2669,7 @@ cmd_install() {
 cmd_submit() {
     local dry_run=false branch="" model="" review_loop_cap="" outbox_max_arg=""
     local context_ro="" harness="pi" review_model="" endpoint="" checkout_ref=""
-    local pi_args="" services_trust_ref="" task_meta=""
+    local pi_args="" services_trust_ref="" task_meta="" claude_credentials_flag=""
     local -a labels_raw=()
     while (( $# )); do
         case "$1" in
@@ -2672,6 +2685,7 @@ cmd_submit() {
             --review-model) review_model="${2:?--review-model requires a model id}"; shift 2 ;;
             --outbox-max) outbox_max_arg="${2:?--outbox-max requires a size}"; shift 2 ;;
             --context-ro) context_ro="${2:?--context-ro requires a directory}"; shift 2 ;;
+            --claude-credentials) claude_credentials_flag="${2:?--claude-credentials requires a path}"; shift 2 ;;
             --label) labels_raw+=("${2:?--label requires key=value}"); shift 2 ;;
             --task-meta) task_meta="${2:?--task-meta requires a JSON object}"; shift 2 ;;
             -*) echo "Error: unknown option '$1' for submit." >&2; exit 1 ;;
@@ -2921,15 +2935,77 @@ cmd_submit() {
     # file read (or, on macOS, a Keychain read), so it runs even under
     # --dry-run -- no cluster is contacted, exactly like every other
     # validation in this function that --dry-run is meant to exercise.
+    #
+    # Precedence: --claude-credentials > CLAUDE_CREDENTIALS in claude.env >
+    # a launcher-balanced pool choice (fs_balance_claude_credential) >
+    # today's default -- the same chain fork-sandbox.sh's own local path
+    # resolves, sharing fs_balance_claude_credential itself so the pool/hook
+    # config and its error checks cannot drift between the two entry
+    # points, while the precedence glue around it is deliberately
+    # duplicated rather than factored into a second shared function (see
+    # fs_balance_claude_credential's own header comment).
     local claude_cred_json="" claude_access_token="" claude_configmap_cred=""
+    local claude_credentials_override="" claude_credentials_via="default"
     if [[ "$harness" == claude ]]; then
-        # Machine-wide config only -- there is no per-run flag for this on
-        # the direct k8s entry point, see docs/kubernetes-runs.md.
-        local claude_credentials_override
-        claude_credentials_override="$(read_env_value "$claude_env" CLAUDE_CREDENTIALS || true)"
+        local claude_credentials_config
+        claude_credentials_config="$(read_env_value "$claude_env" CLAUDE_CREDENTIALS || true)"
+        if [[ -n "$claude_credentials_flag" ]]; then
+            claude_credentials_override="$claude_credentials_flag"
+            claude_credentials_via="flag"
+        else
+            # Called unconditionally, not gated on claude_credentials_config
+            # being empty -- fs_balance_claude_credential also validates
+            # that CLAUDE_CREDENTIALS and the pool keys are not BOTH set,
+            # so a misconfigured claude.env is refused loudly rather than
+            # having the pin silently win.
+            local claude_balance_out=""
+            if claude_balance_out="$(fs_balance_claude_credential "$config_dir" "$script_dir")"; then
+                if [[ -n "$claude_balance_out" ]]; then
+                    claude_credentials_override="$claude_balance_out"
+                    claude_credentials_via="balance"
+                elif [[ -n "$claude_credentials_config" ]]; then
+                    claude_credentials_override="$claude_credentials_config"
+                    claude_credentials_via="claude-env"
+                fi
+            else
+                # fs_balance_claude_credential already printed the specific error.
+                exit 1
+            fi
+        fi
+
         if [[ -n "$claude_credentials_override" ]]; then
             fs_reject_unsafe_chars "$claude_credentials_override" || exit 1
+            # Resolved to an absolute path here, before the existence check
+            # below, the same reason fork-sandbox.sh's own local path
+            # resolves its equivalent ahead of its own existence check: a
+            # relative path stored verbatim would read differently
+            # depending on the caller's cwd once it is recorded into
+            # run.env/summary.json.
+            claude_credentials_override="$("$FS_REALPATH" -m "$claude_credentials_override")"
+            if [[ "$claude_credentials_via" == "flag" \
+                && ! -f "$claude_credentials_override" ]]; then
+                echo "Error: --claude-credentials names" >&2
+                echo "'$claude_credentials_override', which does not exist." >&2
+                exit 1
+            elif [[ "$claude_credentials_via" == "balance" \
+                && ! -f "$claude_credentials_override" ]]; then
+                # The balancer's choice is an operator-authored pool entry,
+                # same rule as the explicit flag above: a balanced choice
+                # naming a missing file is this run's problem to raise, not
+                # to swallow.
+                echo "Error: the credential balancer chose" >&2
+                echo "'$claude_credentials_override', which does not exist." >&2
+                echo "Fix the pool entry in $claude_env, or pin" >&2
+                echo "--claude-credentials to override the balancer." >&2
+                exit 1
+            elif [[ "$claude_credentials_via" == "claude-env" \
+                && ! -f "$claude_credentials_override" ]]; then
+                echo "Error: CLAUDE_CREDENTIALS in $claude_env names" >&2
+                echo "'$claude_credentials_override', which does not exist." >&2
+                exit 1
+            fi
         fi
+
         claude_cred_json="$(fs_read_claude_credential "$claude_credentials_override")" || exit 1
 
         # The pod cannot refresh the token, so a run that outlives it dies
@@ -4761,7 +4837,7 @@ cmd_collect() {
 cmd_run() {
     local dry_run=false keep=false timeout=3600 branch="" model="" review_loop_cap=""
     local outbox_dir="" outbox_max_arg="" context_ro="" harness="" review_model="" endpoint=""
-    local checkout_ref="" pi_args="" services_trust_ref="" task_meta=""
+    local checkout_ref="" pi_args="" services_trust_ref="" task_meta="" claude_credentials_flag=""
     local -a labels_raw=()
     while (( $# )); do
         case "$1" in
@@ -4780,6 +4856,7 @@ cmd_run() {
             --outbox-dir) outbox_dir="${2:?--outbox-dir requires a path}"; shift 2 ;;
             --outbox-max) outbox_max_arg="${2:?--outbox-max requires a size}"; shift 2 ;;
             --context-ro) context_ro="${2:?--context-ro requires a directory}"; shift 2 ;;
+            --claude-credentials) claude_credentials_flag="${2:?--claude-credentials requires a path}"; shift 2 ;;
             --label) labels_raw+=("${2:?--label requires key=value}"); shift 2 ;;
             --task-meta) task_meta="${2:?--task-meta requires a JSON object}"; shift 2 ;;
             -*) echo "Error: unknown option '$1' for run." >&2; exit 1 ;;
@@ -4854,6 +4931,7 @@ cmd_run() {
     [[ -n "$review_model" ]] && submit_argv+=(--review-model "$review_model")
     [[ -n "$outbox_max_arg" ]] && submit_argv+=(--outbox-max "$outbox_max_arg")
     [[ -n "$context_ro" ]] && submit_argv+=(--context-ro "$context_ro")
+    [[ -n "$claude_credentials_flag" ]] && submit_argv+=(--claude-credentials "$claude_credentials_flag")
     # Passed through only when given, like every other optional option
     # above: an empty --checkout at submit's parse would be an argument
     # error, not "no checkout". cmd_submit does the resolution and the
