@@ -372,14 +372,29 @@ personas directory, to check) — a fleet.yaml typo in one agent's
 `persona`, `harness`/`network` pairing, `preset`, or handler `command`
 blocks mail for every agent, not just the broken one, until it is fixed.
 The error goes to `deliver`'s own stderr, so a backgrounded postmaster
-that hits this reports it there and nowhere else. Once past that gate,
+that hits this reports it there and nowhere else. Right beside that
+check, `deliver` also refuses to start if BOTH candidate seat sources are
+missing — no fleet file at `$FORK_SANDBOX_FLEET_FILE` (default
+`~/.config/fork-sandbox/fleet.yaml`) AND no personas dir at
+`$FORK_SANDBOX_PERSONAS_DIR` (default `~/.config/fork-sandbox/personas`)
+— since with neither, every message's To:/Cc: expansion resolves no one
+and `deliver` would run forever routing every message to nobody, with no
+error anywhere to explain why. A fleet using only ONE of the two is a
+documented, valid mode (personas-only, or handler-exec-only) and keeps
+running, but prints a startup WARNING naming the missing path and which
+mode its absence implies — a typo'd env override otherwise looks
+identical to a deliberate one-absent setup. Once past those gates,
 `deliver` loops — scan, route, harvest, sleep
 `$FORK_SANDBOX_POSTMASTER_INTERVAL` seconds (default 15) — until
 SIGTERM/SIGINT. `--once` does a single pass and exits. `status` prints
 one screen: unrouted count, every live run, every thread flagged
-needs-operator with its reason, each thread's spawn count. `flag` and
-`unflag` set that flag by hand — to silence a thread you intend to leave
-alone, or to re-arm one after fixing whatever tripped it.
+needs-operator with its reason and how many flag events its journal has
+recorded, each thread's spawn count. `flag` and `unflag` set that flag by
+hand — to silence a thread you intend to leave alone, or to re-arm one
+after fixing whatever tripped it — and every `flag`/`unflag` call, manual
+or automatic, appends one line to that thread's needs-operator journal
+(timestamp, kind, keyword, reason); the journal is append-only operator
+history and never affects the current reason or routing.
 
 ### The event stream
 
@@ -409,11 +424,15 @@ does not count here, since rule 0 already treats it as legitimately
 non-resolving. Because `mail reply` defaults to reply-all and copies a
 message's own From/To/Cc into every reply, the same unresolved name tends
 to reappear on every later message in the thread; `unresolved` counts
-only names not already flagged once for this thread, so a name is flagged
-(and this event fires) at most once per thread until a *different*
-unresolved name appears — this also means rule 1's operator reset is not
-immediately undone by an operator's own reply-all reintroducing a name
-already flagged before). `flag` goes through this same event-emitting
+only names not already recorded for this thread (recorded as soon as
+`fleet expand` fails to resolve them, whether or not that same message's
+flag call actually won — a name first seen on a message that also trips
+the hops/budget gate is recorded without the flag event ever firing for
+it, since the gate reason wins instead), so a name triggers this event at
+most once per thread until a *different* unresolved name appears — this
+also means rule 1's operator reset is not immediately undone by an
+operator's own reply-all reintroducing a name already recorded before).
+`flag` goes through this same event-emitting
 code, gated the same way — it only prints one when reached via
 `deliver`'s own route/harvest pass, so running `flag` directly prints
 nothing. `unflag` prints nothing ever, in or out of `deliver`: it has no
@@ -442,6 +461,13 @@ for it.
    also flags T needs-operator the first time this thread sees it (see
    `route-dead` above), while an address that is not `@`-shaped at all,
    or is `@operator`, is treated as genuinely external and never flags.
+   An unknown fleet name reached via `Cc` flags too, the same way and the
+   same once-per-thread dedup, but with its own reason naming it as
+   arriving via `Cc` (keyword `unresolvable-cc`) rather than `To`, so the
+   operator can tell a missing *observer* from a missing *addressee*. A
+   Cc name that DOES resolve to a real seat but is suppressed —
+   `wake-on-cc: false`, or a `triage-skip` verdict — is never flagged;
+   only a name that resolves to no seat at all is.
    External senders receive mail only in the archive. M's own `From` is
    never a candidate on either header, even when it reaches the list
    only through a list address: a sender never wakes on its own message.

@@ -61,11 +61,11 @@
 #                one or more @-shaped names (typo'd seat, missing fleet
 #                file -- never `@operator`, which is excepted, see
 #                pm_expand_to) that `fleet expand` could not resolve, and
-#                that this thread had not already been flagged for once
-#                before (reply-all reintroduces the same unresolved name
-#                on every later message, and pm_flag overwrites rather
-#                than appends, so a name already flagged for this thread
-#                does not flag or count again -- see UNRESOLVED_TO). The
+#                that this thread had not already recorded before
+#                (reply-all reintroduces the same unresolved name on
+#                every later message, and a name once recorded -- flagged
+#                or not, see UNRESOLVED_TO -- does not flag or count
+#                again). The
 #                thread is also separately flag'd with reason
 #                "unresolvable To: <names> at <message-id>" (keyword
 #                unresolvable-to), UNLESS a hops/budget gate flags the
@@ -2033,8 +2033,11 @@ pm_process_message() {
     # rule 1's operator-reset promise the instant the operator's own
     # `mail reply` (itself a reply-all) reintroduces the same name.
     # UNRESOLVED_TO/$tid records, one per line, every name this thread
-    # has already been flagged for once; only a name not already in that
-    # record is "fresh" and re-flags/re-events, and every name seen this
+    # has already recorded -- flagged or not (a name first seen on a
+    # message that also trips the hops/budget gate below is recorded
+    # here without ever being flagged itself, since that gate's reason
+    # wins instead); only a name not already in that record is "fresh"
+    # and re-flags/re-events, and every name seen this
     # pass is appended so it is never flagged again. The record is
     # thread-scoped and deliberately NOT cleared by rule 1's pm_unflag
     # above: an operator's reply carrying the same propagated name must
