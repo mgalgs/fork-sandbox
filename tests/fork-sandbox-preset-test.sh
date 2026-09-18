@@ -1809,8 +1809,11 @@ else
     no "fixseat launch succeeds"
 fi
 
-# C. A run with no preset emits none of the new state: run.sh and run.env
-# stay byte-compatible with what they were before fix seats existed.
+# C. A run with no preset emits none of the fix-seat-era state: run.sh and
+# run.env stay byte-compatible with what they were before fix seats existed,
+# on every knob but the run_step_* walker state below, which is serialized
+# for every run regardless of preset (a later round's prerequisite -- see
+# the run_step_count pin below).
 prep_stub 'commit'
 if rd_c="$(run_stubbed --harness claude --model haiku \
     --branch "sandbox-test-plain-$$")"; then
@@ -1836,6 +1839,14 @@ if rd_c="$(run_stubbed --harness claude --model haiku \
         no "run.sh never references the launcher-only preset_stage_cleanup" \
             "$(grep -n 'preset_stage_cleanup' "$rd_c/run.sh")"
     fi
+    # A plain run has one step: the code leg. This is the shape a unified
+    # walker will drive for every no-loop run once it becomes the only
+    # driver; pin it now so that migration is checked against today's
+    # single-step serialization, not a guess at what it should be.
+    check "a plain run.sh serializes run_step_count as a single code step" "1" \
+        "$(grep -o '^run_step_count=.*' "$rd_c/run.sh" | sed 's/run_step_count=//')"
+    contains "a plain run.sh's run_step_kind names that one step code" \
+        "$(grep '^run_step_kind=' "$rd_c/run.sh")" '[1]=code'
 else
     no "plain launch succeeds"
 fi

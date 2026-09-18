@@ -678,6 +678,14 @@ case "$n" in
         > "$clone_dir/.git/review-verdict.md"
     ;;
 5)
+    printf 'FINDINGS\n\nfile.txt:1 the maintainer found a problem too\n' \
+        > "$clone_dir/.git/maintainer-verdict.md"
+    ;;
+6)
+    git -c user.email=t@fork-sandbox.invalid -c user.name=Tester \
+        -C "$clone_dir" commit --allow-empty -q -m "loop3 maintainer fix"
+    ;;
+7)
     printf 'APPROVED\n\nChecked: the surrounding callers.\n\n## Report\nAll five paragraphs.\n' \
         > "$clone_dir/.git/maintainer-verdict.md"
     ;;
@@ -693,15 +701,15 @@ out3="$(PATH="$loop3_stub:$real_stub:$PATH" FAKE_COUNT_FILE="$count3" \
     FORK_SANDBOX_CONFIG_DIR="$real_cfg" FORK_SANDBOX_BACKEND=fake-image \
     timeout 60 "$launcher" --foreground --harness claude \
     --review-loop 2 --review-model sonnet \
-    --maintainer-loop 1 --maintainer-model opus \
+    --maintainer-loop 2 --maintainer-model opus \
     --branch "sandbox-test-loop3-$$" \
     "$proj" "$handoff" 2>&1)"
 rc3=$?
 rd3="$(printf '%s\n' "$out3" | sed -n 's/^  run dir:  *//p' | head -1)"
 if (( rc3 == 0 )) && [[ -n "$rd3" ]]; then
     tmpdirs+=("$rd3")
-    ok "the five-leg combined run exits 0"
-    check "five legs ran: impl, review, fix, review, maintainer" "5" \
+    ok "the seven-leg combined run exits 0"
+    check "seven legs ran: impl, review, fix, review, maintainer, mntfix, maintainer" "7" \
         "$(cat "$count3")"
     contains "a review-looped prompt claims the inner review" \
         "an inner review loop has already read that diff line by line" \
@@ -733,8 +741,12 @@ if (( rc3 == 0 )) && [[ -n "$rd3" ]]; then
     # drift when the walker becomes this run's only driver. If this check
     # ever needs to change, it is because a deliberate artifact-naming
     # decision changed, not because a refactor happened to move things.
+    # The maintainer tier also gets a FINDINGS iteration with its own fix
+    # leg here (mntfix), not just the review tier's -- it is the artifact
+    # family a migration is most likely to rename or drop, and a pin that
+    # never exercises it would not catch that.
     check "the combined review+maintainer legacy run keeps its historical filename set" \
-        $'continuation-prompt-header.md\nevents-fix-1.jsonl\nevents-maintainer-1.jsonl\nevents-review-1.jsonl\nevents-review-2.jsonl\nevents.jsonl\nexit-code\nfix-prompt-1.md\nfix-prompt-header.md\nhandoff-original.md\nhandoff.md\nmaintainer-loop.json\nmaintainer-prompt-1.md\nmaintainer-prompt.md\nmaintainer-verdict-1.md\npid\nreview-loop.json\nreview-prompt-1.md\nreview-prompt-2.md\nreview-prompt.md\nreview-verdict-1.md\nreview-verdict-2.md\nrun-source\nrun.env\nrun.sh\nsandbox.log\nsummary.json\nsummary.txt' \
+        $'continuation-prompt-header.md\nevents-fix-1.jsonl\nevents-maintainer-1.jsonl\nevents-maintainer-2.jsonl\nevents-mntfix-1.jsonl\nevents-review-1.jsonl\nevents-review-2.jsonl\nevents.jsonl\nexit-code\nfix-prompt-1.md\nfix-prompt-header.md\nhandoff-original.md\nhandoff.md\nmaintainer-fix-prompt-1.md\nmaintainer-loop.json\nmaintainer-prompt-1.md\nmaintainer-prompt-2.md\nmaintainer-prompt.md\nmaintainer-verdict-1.md\nmaintainer-verdict-2.md\npid\nreview-loop.json\nreview-prompt-1.md\nreview-prompt-2.md\nreview-prompt.md\nreview-verdict-1.md\nreview-verdict-2.md\nrun-source\nrun.env\nrun.sh\nsandbox.log\nsummary.json\nsummary.txt' \
         "$(find "$rd3" -maxdepth 1 -type f -exec basename {} \; | LC_ALL=C sort)"
     # run.sh's run_step_* serialization used to fire only for composed
     # runs (preset_is_legacy_shaped != true); a legacy run's generated
@@ -760,7 +772,7 @@ if (( rc3 == 0 )) && [[ -n "$rd3" ]]; then
         "$(jq -r '.iterations[0].findings' "$rd3/review-loop.json")"
     check "review-loop.json ran two iterations before approving" "2" \
         "$(jq -r '.iterations | length' "$rd3/review-loop.json")"
-    check "maintainer-loop.json's cap is 1" "1" \
+    check "maintainer-loop.json's cap is 2" "2" \
         "$(jq -r '.cap' "$rd3/maintainer-loop.json")"
     check "maintainer-loop.json names the model under maintainer_model, not review_model" \
         "opus" "$(jq -r '.maintainer_model' "$rd3/maintainer-loop.json")"
@@ -770,10 +782,47 @@ if (( rc3 == 0 )) && [[ -n "$rd3" ]]; then
         "0" "$(jq -r '.iterations[0].maintainer_exit' "$rd3/maintainer-loop.json")"
     check "maintainer-loop.json carries no review_exit key" "null" \
         "$(jq -r '.iterations[0].review_exit // "null"' "$rd3/maintainer-loop.json")"
+    check "maintainer-loop.json ran two iterations before approving" "2" \
+        "$(jq -r '.iterations | length' "$rd3/maintainer-loop.json")"
     check "maintainer-loop.json approved with no findings" "approved" \
         "$(jq -r '.ended' "$rd3/maintainer-loop.json")"
+    # The per-iteration cost/usage keys a flavor-renaming bug is most likely
+    # to miss, since they are named identically in both loop-json shapes
+    # apart from the maintainer/review prefix.
+    check "maintainer-loop.json's iteration 1 records maintainer_cost_usd" "0.01" \
+        "$(jq -r '.iterations[0].maintainer_cost_usd' "$rd3/maintainer-loop.json")"
+    check "maintainer-loop.json's iteration 1 records a maintainer_usage object" "100" \
+        "$(jq -r '.iterations[0].maintainer_usage.input_tokens' "$rd3/maintainer-loop.json")"
+    # The fix-tier fields stay fix-named even though they are fed from the
+    # mntfix_* globals -- a writer that renamed them to mntfix_cost_usd etc.
+    # to match the seat name, or that left the review tier's names in place,
+    # both pass every other check here.
+    check "maintainer-loop.json's fix leg is recorded under fix_exit" "0" \
+        "$(jq -r '.iterations[0].fix_exit' "$rd3/maintainer-loop.json")"
+    check "maintainer-loop.json's fix leg cost is recorded under fix_cost_usd" "0.01" \
+        "$(jq -r '.iterations[0].fix_cost_usd' "$rd3/maintainer-loop.json")"
+    check "maintainer-loop.json's fix leg usage is recorded under fix_usage" "100" \
+        "$(jq -r '.iterations[0].fix_usage.input_tokens' "$rd3/maintainer-loop.json")"
+    # coding_exit_code and commits_added are both back-filled after the loop
+    # ends (the former from the implement leg's own exit, the latter by a
+    # separate post-fetch jq pass per file) rather than written by the
+    # per-iteration writer -- easy for a merge of the two writers to drop.
+    check "maintainer-loop.json records the coding leg's exit code" "0" \
+        "$(jq -r '.coding_exit_code' "$rd3/maintainer-loop.json")"
+    check "maintainer-loop.json's fix-leg iteration got its commit counted" "1" \
+        "$(jq -r '.iterations[0].commits_added' "$rd3/maintainer-loop.json")"
+    check "review-loop.json records the coding leg's exit code" "0" \
+        "$(jq -r '.coding_exit_code' "$rd3/review-loop.json")"
+    check "review-loop.json's fix-leg iteration got its commit counted" "1" \
+        "$(jq -r '.iterations[0].commits_added' "$rd3/review-loop.json")"
+    contains "the maintainer fix prompt carries the maintainer verdict's finding" \
+        "the maintainer found a problem too" \
+        "$(cat "$rd3/maintainer-fix-prompt-1.md")"
+    contains "the second maintainer iteration's prompt cites the first's verdict" \
+        "iteration 1 has already reviewed this branch" \
+        "$(cat "$rd3/maintainer-prompt-2.md")"
 else
-    no "the five-leg combined run exits 0" "rc=$rc3 rd=$rd3: $out3"
+    no "the seven-leg combined run exits 0" "rc=$rc3 rd=$rd3: $out3"
 fi
 
 # A branch with no commits skips the loop, and says why.
