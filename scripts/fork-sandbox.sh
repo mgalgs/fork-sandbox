@@ -8700,6 +8700,11 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count; cur_step_no++)); do
         if [[ "$cur_legacy" == 1 ]]; then
             if [[ "$leg_rc" != 0 ]]; then
                 cur_ended=harness-error; cur_detail="the $cur_kind leg of iteration $cur_i exited $leg_rc${leg_error:+ ($leg_error)}"
+            # The verdict is DATA. It is copied, counted and concatenated
+            # into a prompt file -- never sourced, never evaluated, never
+            # put on a command line. It is also written by a session, so
+            # a symlink at that path is not a verdict: refuse it rather
+            # than follow it out of the clone.
             elif [[ -L "$cur_verdict_file" || ! -f "$cur_verdict_file" ]]; then
                 cur_ended=harness-error; cur_detail="the $cur_kind leg of iteration $cur_i left no verdict at $cur_verdict_file"
             else
@@ -8708,16 +8713,33 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count; cur_step_no++)); do
                 else
                     cur_copy="$run_dir/review-verdict-$cur_i.md"
                 fi
+                # The run dir outlives the clone, so the copy is the
+                # record. Take the original away in the same breath, so
+                # iteration i+1 cannot re-read it.
                 cp -- "$cur_verdict_file" "$cur_copy" 2>/dev/null
                 rm -f "$cur_verdict_file"
                 if [[ ! -s "$cur_copy" ]]; then
                     cur_ended=harness-error; cur_detail="the $cur_kind leg of iteration $cur_i wrote an empty verdict"
                 else
+                    # Untrusted text on its way to a terminal: strip control
+                    # characters so an ESC or a CR in the verdict cannot
+                    # spoof the pane or the monitor.
                     cur_line="$(head -n1 "$cur_copy" | tr -d '\000-\037\177' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+                    # Deliberately nothing here checks the "## Report"
+                    # section. The first line is the contract; the report
+                    # is a courtesy to the orchestrator, and an absent,
+                    # empty or duplicated one must never turn a valid
+                    # verdict into a failed loop -- fork-sandbox-status.sh
+                    # falls back to printing the whole verdict when the
+                    # section is not usable.
                     if [[ "$cur_line" == APPROVED ]]; then
                         cur_findings=0; cur_ended=approved
                         printf 'fork-sandbox: %s iteration %s: APPROVED\n' "$cur_kind" "$cur_i"
                     elif [[ "$cur_line" == FINDINGS ]]; then
+                        # One finding per paragraph, each citing file:line --
+                        # so count the paragraphs that carry a citation.
+                        # That is what the prompt asks for and all that can
+                        # be counted without reading the prose.
                         cur_findings="$(awk 'NR == 1 { next } /^## Report$/ { exit } /^[[:space:]]*$/ { if (hit) n++; hit = 0; next } /[^[:space:]:]+:[0-9]+/ { hit = 1 } END { if (hit) n++; print n + 0 }' "$cur_copy" 2>/dev/null)"
                         [[ "$cur_findings" =~ ^[0-9]+$ ]] || cur_findings=null
                         printf 'fork-sandbox: %s iteration %s: FINDINGS (%s cited)\n' "$cur_kind" "$cur_i" "$cur_findings"
@@ -8725,6 +8747,11 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count; cur_step_no++)); do
                         if [[ "$cur_kind" == review && "$mode" == "review-only" ]]; then
                             cur_ended=findings
                         else
+                            # The fix leg's prompt: the generated header
+                            # (the fix seat's own, when a preset seated
+                            # one), then the verdict. Built as a file and
+                            # redirected -- the verdict has no size limit,
+                            # and one argv string is capped at 128KB.
                             if [[ "$cur_kind" == maintainer ]]; then
                                 cur_fix_prompt="$run_dir/maintainer-fix-prompt-${cur_i}.md"
                                 cur_fix_header="$fix_prompt_header"
@@ -8737,6 +8764,16 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count; cur_step_no++)); do
                             { cat -- "$cur_fix_header"; printf '\n---\n\n'; awk '/^## Report$/ { exit } { print }' "$cur_copy"; } > "$cur_fix_prompt.part"
                             mv -f "$cur_fix_prompt.part" "$cur_fix_prompt"
                             cur_fix_cost=null; cur_fix_known=1
+                            # A fix agent with repeat: N runs the fix as N
+                            # passes on the same prompt -- distrust of a
+                            # cheap model's premature "done": there is no
+                            # early exit on a pass that looks finished;
+                            # only a harness error stops the passes. The
+                            # iteration records the LAST pass's exit, the
+                            # SUM of the passes' costs (null when any pass
+                            # went unpriced), and -- for a single pass --
+                            # its usage; multi-pass usage stays null, each
+                            # pass's own events file carrying the detail.
                             for ((cur_fix_pass = 1; cur_fix_pass <= cur_fix_repeat; cur_fix_pass++)); do
                                 cur_fix_leg="$cur_i"; (( cur_fix_pass > 1 )) && cur_fix_leg="$cur_i-p$cur_fix_pass"
                                 run_leg "$cur_fix_kind" "$cur_fix_leg" "$cur_fix_prompt"
@@ -8827,7 +8864,7 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count; cur_step_no++)); do
         fi
         [[ "$cur_ended" == "harness-error" ]] && rc=1
     fi
-    done
+done
 
 # The other half of the deferral above: for a --review-loop or --refresh-at
 # run the run is over here -- every loop ran, or was skipped and said why --
@@ -9600,12 +9637,14 @@ $review_harness needs and can cost money. See review_sandbox_cmd in
 $run_dir/run.sh for exactly what it sends where.
 EOF
     fi
-    run_has_maintainer_step=0
-    for ((_fs_launch_scan = 1; _fs_launch_scan <= run_step_count; _fs_launch_scan++)); do
-        [[ "${run_step_kind[$_fs_launch_scan]}" == maintainer ]] && { run_has_maintainer_step=1; break; }
-    done
-    if [[ "$run_has_maintainer_step" == 1 \
-        && "${maintainer_network:-}" != "sealed" ]]; then
+    # Survives the cap-scalar retirement, same reason as the earlier reads:
+    # this paragraph names the fixed legacy maintainer seat
+    # ($maintainer_harness, maintainer_sandbox_cmd in run.sh), which only
+    # exists when a legacy maintainer tier is on. A bare run_step_kind scan
+    # would also fire for a composed maintainer step, printing a paragraph
+    # naming a harness and a run.sh variable that step never has.
+    if (( maintainer_loop_cap > 0 )) \
+        && [[ "${maintainer_network:-}" != "sealed" ]]; then
         cat <<EOF
 Its maintainer legs do not share that seal either: --maintainer-harness
 $maintainer_harness runs in a separate, networked sandbox that carries
