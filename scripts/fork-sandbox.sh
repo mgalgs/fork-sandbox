@@ -5540,6 +5540,30 @@ fs_emit_prompt_overlay() {
     done <<<"$frags"
 }
 
+# Composed pipelines may seat every review, maintainer and fix leg
+# differently.  Their prompts are rendered in the launcher, before the
+# runner exists, so resolve this small overlay bucket at the call site rather
+# than reusing the fixed-tier bucket keyed only by the legacy scalars.
+fs_emit_step_prompt_overlay() {
+    local leg="$1" step_harness="$2" step_network="$3" step_model="$4" model_frag=""
+    local rel candidates=() fragments=()
+    [[ -n "$step_model" ]] && model_frag="${step_model//\//_}"
+    candidates=("all.md" "harness/$step_harness.md")
+    [[ "$step_harness" == pi && "$step_network" == sealed ]] && candidates+=("harness/pi-local.md")
+    candidates+=("network/$step_network.md")
+    [[ -n "$model_frag" ]] && candidates+=("model/$model_frag.md")
+    candidates+=("$leg/all.md")
+    [[ -n "$model_frag" ]] && candidates+=("$leg/model/$model_frag.md")
+    for rel in "${candidates[@]}"; do
+        [[ -f "$prompt_overlay_dir/$rel" ]] && fragments+=("$rel")
+    done
+    (( ${#fragments[@]} )) || return 0
+    printf '\n## Model-specific notes\n\n'
+    printf 'A machine-local overlay applies here (see docs/prompt-overlays.md).\n'
+    printf 'Fragments, general first: %s\n' "$(IFS=,; printf '%s' "${fragments[*]}")"
+    for rel in "${fragments[@]}"; do printf '\n'; cat -- "$prompt_overlay_dir/$rel"; done
+}
+
 # Whether THIS run was asked to resume a prior conversation, across both id
 # modes: --resume-session names one to discover-then-resume (claude, codex),
 # --session-id supplies one for a create-if-missing harness (pi) where the
@@ -5856,6 +5880,8 @@ else
     for ((preset_k = 1; preset_k <= preset_step_count; preset_k++)); do
         preset_k_agent="${preset_step_agent[$preset_k]}"
         preset_k_preamble_harness="${preset_agent_harness[$preset_k_agent]}"
+        preset_k_resolved_harness_var="s${preset_k}_harness"
+        preset_k_resolved_model_var="s${preset_k}_model"
         preset_k_preamble_network=""
         [[ "${preset_agent_network[$preset_k_agent]}" == "sealed" ]] \
             && preset_k_preamble_network=sealed
@@ -5888,13 +5914,25 @@ else
                     fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" \
                         "$preset_k_preamble_harness" "$preset_k_preamble_network" \
                         "$outbox_dir" "" "$outbox_max_bytes"
-                    fs_emit_prompt_overlay review
+                    fs_emit_step_prompt_overlay review "${!preset_k_resolved_harness_var}" "$preset_k_preamble_network" "${!preset_k_resolved_model_var}"
                     fs_emit_review_prompt_body "$branch" "$base_sha" \
                         "$review_skill_dir" "$step_k_verdict_file" "$inbox_dir" \
                         "$handoff_file" spec
                 } > "$step_k_prompt.part"
                 mv -- "$step_k_prompt.part" "$step_k_prompt"
                 run_step_prompt[preset_k]="$step_k_prompt"
+                step_k_fix_header="$run_dir/${preset_k}-fix-prompt-header.md"
+                {
+                    fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" \
+                        "${preset_step_fix_harness[$preset_k]}" "${preset_step_fix_network[$preset_k]}" \
+                        "$outbox_dir" "" "$outbox_max_bytes"
+                    preset_k_fix_harness_var="s${preset_k}fix_harness"
+                    preset_k_fix_model_var="s${preset_k}fix_model"
+                    fs_emit_step_prompt_overlay fix "${!preset_k_fix_harness_var}" "${preset_step_fix_network[$preset_k]}" "${!preset_k_fix_model_var}"
+                    fs_emit_fix_prompt_body "$branch" "$base_sha" "$handoff_file"
+                } > "$step_k_fix_header.part"
+                mv -- "$step_k_fix_header.part" "$step_k_fix_header"
+                printf -v "s${preset_k}fix_prompt_header" '%s' "$step_k_fix_header"
                 ;;
             maintain)
                 step_k_prompt="$run_dir/step-${preset_k}-prompt.md"
@@ -5906,7 +5944,8 @@ else
                 # order is not fixed the way the legacy tiers are.
                 step_k_inner_review=no
                 for ((preset_j = 1; preset_j < preset_k; preset_j++)); do
-                    if [[ "${preset_step_action[$preset_j]}" == review ]]; then
+                    if [[ "${preset_step_action[$preset_j]}" == review \
+                        || "${preset_step_action[$preset_j]}" == maintain ]]; then
                         step_k_inner_review=yes
                         break
                     fi
@@ -5918,7 +5957,7 @@ else
                     fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" \
                         "$preset_k_preamble_harness" "$preset_k_preamble_network" \
                         "$outbox_dir" "" "$outbox_max_bytes"
-                    fs_emit_prompt_overlay maintainer
+                    fs_emit_step_prompt_overlay maintainer "${!preset_k_resolved_harness_var}" "$preset_k_preamble_network" "${!preset_k_resolved_model_var}"
                     fs_emit_maintainer_prompt_body "$branch" "$base_sha" \
                         "$step_k_verdict_file" "$inbox_dir" "$step_k_inner_review" \
                         "$handoff_file"
@@ -5929,6 +5968,18 @@ else
                 # the array's last textual write in the file, so the
                 # disable comment lives here, not there.
                 run_step_prompt[preset_k]="$step_k_prompt"
+                step_k_fix_header="$run_dir/${preset_k}-fix-prompt-header.md"
+                {
+                    fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" \
+                        "${preset_step_fix_harness[$preset_k]}" "${preset_step_fix_network[$preset_k]}" \
+                        "$outbox_dir" "" "$outbox_max_bytes"
+                    preset_k_fix_harness_var="s${preset_k}fix_harness"
+                    preset_k_fix_model_var="s${preset_k}fix_model"
+                    fs_emit_step_prompt_overlay fix "${!preset_k_fix_harness_var}" "${preset_step_fix_network[$preset_k]}" "${!preset_k_fix_model_var}"
+                    fs_emit_fix_prompt_body "$branch" "$base_sha" "$handoff_file"
+                } > "$step_k_fix_header.part"
+                mv -- "$step_k_fix_header.part" "$step_k_fix_header"
+                printf -v "s${preset_k}fix_prompt_header" '%s' "$step_k_fix_header"
                 ;;
         esac
     done
@@ -6823,6 +6874,8 @@ started_at="$(date +%s)"
             printf 's%d_pi_session_dir=%q\n' "$preset_k" "${!preset_k_var}"
             preset_k_var="s${preset_k}_harness"
             printf 's%d_harness=%q\n' "$preset_k" "${!preset_k_var}"
+            preset_k_var="s${preset_k}_model"
+            printf 's%d_model=%q\n' "$preset_k" "${!preset_k_var}"
             if [[ "${preset_step_action[$preset_k]}" != code ]]; then
                 preset_k_var="s${preset_k}fix_usage_source"
                 printf 's%dfix_usage_source=%q\n' "$preset_k" "${!preset_k_var}"
@@ -6836,6 +6889,11 @@ started_at="$(date +%s)"
                 printf 's%dfix_pi_session_dir=%q\n' "$preset_k" "${!preset_k_var}"
                 preset_k_var="s${preset_k}fix_harness"
                 printf 's%dfix_harness=%q\n' "$preset_k" "${!preset_k_var}"
+                preset_k_var="s${preset_k}fix_model"
+                printf 's%dfix_model=%q\n' "$preset_k" "${!preset_k_var}"
+                preset_k_var="s${preset_k}fix_prompt_header"
+                printf 's%dfix_prompt_header=%q\n' "$preset_k" "${!preset_k_var}"
+                printf 's%dfix_repeat=%q\n' "$preset_k" "${preset_step_fix_repeat[$preset_k]}"
             fi
         done
     fi
@@ -8447,9 +8505,11 @@ run_leg() {
 # names for review and maintain steps, per the pipeline schema.
 if [[ "${composed_pipeline:-0}" == 1 ]]; then
     cur_first_code=0
+    cur_first_code_ran=0
     for ((cur_scan = 1; cur_scan <= run_step_count; cur_scan++)); do
         [[ "${run_step_kind[$cur_scan]}" == code ]] && { cur_first_code="$cur_scan"; break; }
     done
+    [[ "$cur_first_code" == 1 && "${run_step_kind[1]}" == code ]] && cur_first_code_ran=1
     for ((cur_step_no = 1; cur_step_no <= run_step_count; cur_step_no++)); do
         cur_kind="${run_step_kind[$cur_step_no]}"
         cur_step_idx="${run_step_idx[$cur_step_no]}"
@@ -8459,11 +8519,12 @@ if [[ "${composed_pipeline:-0}" == 1 ]]; then
         cur_harness_var="${cur_step_idx}_harness"; cur_harness="${!cur_harness_var}"
         cur_fix_model_var="${cur_step_idx}fix_model"; cur_fix_model="${!cur_fix_model_var:-}"
         cur_fix_harness_var="${cur_step_idx}fix_harness"; cur_fix_harness="${!cur_fix_harness_var:-}"
-        cur_fix_repeat=1
+        cur_fix_repeat_var="${cur_step_idx}fix_repeat"; cur_fix_repeat="${!cur_fix_repeat_var:-1}"
         # The first code pass is the historical implementation invocation.
         if [[ "$cur_kind" == code ]]; then
-            if (( cur_step_no == cur_first_code )); then continue; fi
-            for ((cur_pass = 1; cur_pass <= cur_cap && rc == 0; cur_pass++)); do
+            cur_pass=1
+            if (( cur_step_no == cur_first_code && cur_first_code_ran )); then cur_pass=2; fi
+            for ((; cur_pass <= cur_cap && rc == 0; cur_pass++)); do
                 run_leg code "$cur_pass" "$handoff" "$cur_step_idx"
                 rc="$leg_rc"
             done
@@ -8484,7 +8545,20 @@ if [[ "${composed_pipeline:-0}" == 1 ]]; then
             cur_verdict_file="$clone_dir/.git/${cur_step_idx}-verdict.md"
             rm -f "$cur_verdict_file"
             cur_prompt_iter="$run_dir/step-${cur_step_no}-prompt-${cur_i}.md"
-            cp -- "$cur_prompt" "$cur_prompt_iter"
+            {
+                cat -- "$cur_prompt"
+                cur_addenda_list="$(fs_addenda_dirs)"
+                if [[ -n "$cur_addenda_list" ]]; then
+                    printf '\n---\n\n## Operator addenda delivered to earlier legs of this run\n\n'
+                    while IFS= read -r cur_addenda_dir; do
+                        for cur_addenda_file in "$cur_addenda_dir"/*.md; do
+                            [[ -f "$cur_addenda_file" ]] || continue
+                            printf '\n### %s\n\n' "${cur_addenda_file##*/}"
+                            cat -- "$cur_addenda_file"
+                        done
+                    done <<< "$cur_addenda_list"
+                fi
+            } > "$cur_prompt_iter"
             # A maintain step's first pass sees the latest preceding verdict;
             # later passes see its own previous one.
             if [[ "$cur_kind" == maintainer ]]; then
@@ -8492,14 +8566,15 @@ if [[ "${composed_pipeline:-0}" == 1 ]]; then
                 if (( cur_i > 1 )); then cur_prev="$run_dir/${cur_step_idx}-maintain-verdict-$((cur_i-1)).md"
                 else
                     for ((cur_j = cur_step_no - 1; cur_j >= 1; cur_j--)); do
-                        for cur_candidate in "$run_dir"/s${cur_j}-{review,maintain}-verdict-*.md; do [[ -f "$cur_candidate" ]] && cur_prev="$cur_candidate"; done
+                        cur_prev="$(find "$run_dir" -maxdepth 1 -type f \( -name "s${cur_j}-review-verdict-*.md" -o -name "s${cur_j}-maintain-verdict-*.md" \) -printf '%f\n' 2>/dev/null | sed -nE 's/.*-([0-9]+)\.md$/\1 &/p' | sort -n | tail -n1 | cut -d' ' -f2-)"
+                        [[ -n "$cur_prev" ]] && cur_prev="$run_dir/$cur_prev"
                         [[ -n "$cur_prev" ]] && break
                     done
                 fi
                 [[ -n "$cur_prev" && -f "$cur_prev" ]] && { printf '\n---\n\n## The previous verdict\n\n'; cat -- "$cur_prev"; } >> "$cur_prompt_iter"
             fi
             run_leg "$cur_kind" "$cur_i" "$cur_prompt_iter" "$cur_step_idx"
-            cur_review_exit="$leg_rc"; cur_fix_exit=null; cur_findings=null; cur_before="$cur_head"; cur_after=""
+            cur_review_exit="$leg_rc"; cur_review_cost="${leg_cost:-null}"; cur_review_usage="${leg_usage:-null}"; cur_fix_exit=null; cur_fix_cost=null; cur_fix_usage=null; cur_findings=null; cur_before="$cur_head"; cur_after=""
             if [[ "$leg_rc" != 0 || ! -s "$cur_verdict_file" || -L "$cur_verdict_file" ]]; then cur_ended=harness-error; cur_detail="the $cur_kind leg of iteration $cur_i left no usable verdict"
             else
                 cur_copy="$run_dir/${cur_step_idx}-$([[ "$cur_kind" == maintainer ]] && echo maintain || echo review)-verdict-${cur_i}.md"
@@ -8507,14 +8582,27 @@ if [[ "${composed_pipeline:-0}" == 1 ]]; then
                 cur_line="$(head -n1 "$cur_copy" | tr -d '\000-\037\177' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
                 if [[ "$cur_line" == APPROVED ]]; then cur_findings=0; cur_ended=approved
                 elif [[ "$cur_line" == FINDINGS ]]; then
-                    cur_fix_prompt="$run_dir/${cur_step_idx}-fix-prompt-${cur_i}.md"; { cat -- "$fix_prompt_header"; printf '\n---\n\n'; cat -- "$cur_copy"; } > "$cur_fix_prompt"
-                    run_leg fix "$cur_i" "$cur_fix_prompt" "$cur_step_idx"; cur_fix_exit="$leg_rc"; cur_after="$(clone_branch_head)"
+                    cur_findings="$(awk 'NR == 1 { next } /^## Report$/ { exit } /^[[:space:]]*$/ { if (hit) n++; hit = 0; next } /[^[:space:]:]+:[0-9]+/ { hit = 1 } END { if (hit) n++; print n + 0 }' "$cur_copy" 2>/dev/null)"
+                    [[ "$cur_findings" =~ ^[0-9]+$ ]] || cur_findings=null
+                    cur_fix_prompt="$run_dir/${cur_step_idx}-fix-prompt-${cur_i}.md"; cur_fix_header_var="${cur_step_idx}fix_prompt_header"; { cat -- "${!cur_fix_header_var}"; printf '\n---\n\n'; cat -- "$cur_copy"; } > "$cur_fix_prompt"
+                    cur_fix_cost=null; cur_fix_known=1
+                    for ((cur_fix_pass = 1; cur_fix_pass <= cur_fix_repeat; cur_fix_pass++)); do
+                        cur_fix_leg="$cur_i"; (( cur_fix_pass > 1 )) && cur_fix_leg="$cur_i-p$cur_fix_pass"
+                        run_leg fix "$cur_fix_leg" "$cur_fix_prompt" "$cur_step_idx"; cur_fix_exit="$leg_rc"
+                        if [[ -n "$leg_cost" ]]; then
+                            [[ "$cur_fix_cost" != null ]] && cur_fix_cost="$(jq -n --argjson a "$cur_fix_cost" --argjson b "$leg_cost" '$a + $b')" || cur_fix_cost="$leg_cost"
+                        else cur_fix_known=0; fi
+                        [[ "$leg_rc" == 0 ]] || break
+                    done
+                    (( cur_fix_known )) || cur_fix_cost=null
+                    (( cur_fix_repeat == 1 )) && cur_fix_usage="${leg_usage:-null}"
+                    cur_after="$(clone_branch_head)"
                     if [[ "$leg_rc" != 0 ]]; then cur_ended=harness-error; cur_detail="the fix leg of iteration $cur_i exited $leg_rc"
                     elif [[ -z "$cur_after" || "$cur_after" == "$cur_before" ]]; then cur_ended=no-progress
                     else cur_head="$cur_after"; fi
                 else cur_ended=harness-error; cur_detail="the $cur_kind leg of iteration $cur_i wrote an invalid verdict"; fi
             fi
-            cur_iters="$(jq -c --argjson old "$cur_iters" --argjson i "$cur_i" --argjson findings "$cur_findings" --argjson review_exit "$cur_review_exit" --argjson fix_exit "$cur_fix_exit" --arg before "$cur_before" --arg after "$cur_after" '$old + [{i:$i,findings:$findings,review_exit:$review_exit,fix_exit:$fix_exit,head_before:(if $before=="" then null else $before end),head_after:(if $after=="" then null else $after end),commits_added:null,review_cost_usd:null,fix_cost_usd:null,review_usage:null,fix_usage:null}]')"
+            cur_iters="$(jq -c --argjson old "$cur_iters" --argjson i "$cur_i" --argjson findings "$cur_findings" --argjson review_exit "$cur_review_exit" --argjson fix_exit "$cur_fix_exit" --argjson review_cost "$cur_review_cost" --argjson fix_cost "$cur_fix_cost" --argjson review_usage "$cur_review_usage" --argjson fix_usage "$cur_fix_usage" --arg before "$cur_before" --arg after "$cur_after" '$old + [{i:$i,findings:$findings,review_exit:$review_exit,fix_exit:$fix_exit,head_before:(if $before=="" then null else $before end),head_after:(if $after=="" then null else $after end),commits_added:null,review_cost_usd:$review_cost,fix_cost_usd:$fix_cost,review_usage:$review_usage,fix_usage:$fix_usage}]')"
             cur_save
         done
         [[ -n "$cur_ended" ]] || cur_ended=cap
@@ -9242,7 +9330,7 @@ fi
 # writing it again costs nothing and keeps this the one place that ends a
 # loop run.
 if [[ "$review_loop_cap" != "0" || "$refresh_enabled" == "1" \
-    || "${maintainer_loop_cap:-0}" != "0" ]]; then
+    || "${maintainer_loop_cap:-0}" != "0" || "${composed_pipeline:-0}" == 1 ]]; then
     printf '%s\n' "$rc" > "$run_dir/exit-code"
 fi
 
@@ -9334,6 +9422,31 @@ if (( fetched )) && [[ -s "$run_dir/maintainer-loop.json" ]]; then
     else
         rm -f "$run_dir/maintainer-loop.json.part"
     fi
+fi
+
+# Composed records use the review-loop shape too, so give them the same
+# post-fetch commit-count backfill as the fixed review and maintainer tiers.
+if (( fetched )) && [[ "${composed_pipeline:-0}" == 1 ]]; then
+    for composed_loop in "$run_dir"/step-[0-9]*-loop.json; do
+        [[ -s "$composed_loop" ]] || continue
+        composed_counts=""
+        while IFS="$(printf '\t')" read -r hb ha; do
+            c=null
+            if [[ -n "$hb" && -n "$ha" ]]; then
+                c="$( (cd "$origin_repo" && git rev-list --count "$hb..$ha") 2>/dev/null || printf null )"
+                [[ "$c" =~ ^[0-9]+$ ]] || c=null
+            fi
+            composed_counts+="$c"$'\n'
+        done < <(jq -r '.iterations[]? | [(.head_before // ""), (.head_after // "")] | @tsv' "$composed_loop" 2>/dev/null)
+        composed_counts_json="$(printf '%s' "$composed_counts" | jq -R -s -c 'split("\n") | map(select(length > 0) | fromjson)' 2>/dev/null)"
+        if [[ -n "$composed_counts_json" ]] && jq --argjson c "$composed_counts_json" \
+            '.iterations |= [range(0; length) as $i | .[$i] + {commits_added: $c[$i]}]' \
+            "$composed_loop" > "$composed_loop.part" 2>/dev/null; then
+            mv -f "$composed_loop.part" "$composed_loop"
+        else
+            rm -f "$composed_loop.part"
+        fi
+    done
 fi
 
 # What the whole run cost: the implement leg plus every loop leg. A sum is

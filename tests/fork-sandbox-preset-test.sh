@@ -324,6 +324,16 @@ contains "the fix seat is not the review seat and survives" "$out" \
 
 printf '\n== refusals ==\n'
 
+accepts() {
+    local label="$1"
+    shift
+    if run "$@" >/dev/null 2>"$err"; then
+        ok "$label"
+    else
+        no "$label" "unexpected refusal: $(cat "$err")"
+    fi
+}
+
 refuses() {
     local label="$1" needle="$2"; shift 2
     if run "$@" > /dev/null 2>"$err"; then
@@ -581,6 +591,9 @@ refuses "--harness is refused against a composed pipeline with more than one cod
 refuses "--k8s is refused against a composed pipeline preset" \
     "does not support a composed pipeline preset ('composed')" \
     --preset composed --k8s
+refuses "--review-only is refused against a composed pipeline preset" \
+    "composed pipeline; edit the preset or pick another" \
+    --preset composed --review-only --checkout HEAD
 
 accepts "a composed pipeline preset launches with no conflicting flags" --preset composed
 
@@ -1290,7 +1303,7 @@ for a in "$@"; do
     prev="$a"
 done
 
-cat >/dev/null
+prompt="$(cat)"
 n=0
 [[ -f "$FAKE_COUNT_FILE" ]] && n="$(cat "$FAKE_COUNT_FILE")"
 n=$(( n + 1 ))
@@ -1300,6 +1313,8 @@ printf '%s\n' "$*" >> "$FAKE_ARGV_LOG"
 # The scripted role: FAKE_SCRIPT holds one action per line, indexed by call
 # number -- "commit", "findings", "approved", or "noop".
 action="$(sed -n "${n}p" "$FAKE_SCRIPT" 2>/dev/null)"
+verdict_name="$(printf '%s\n' "$prompt" | sed -nE 's|.*\.git/(s[0-9]+-verdict\.md).*|\1|p' | head -1)"
+[[ -n "$verdict_name" ]] || verdict_name=review-verdict.md
 case "$action" in
 commit)
     git -c user.email=t@fork-sandbox.invalid -c user.name=Tester \
@@ -1307,11 +1322,11 @@ commit)
     ;;
 findings)
     printf 'FINDINGS\n\nfile.txt:1 the stub found a problem\n' \
-        > "$clone_dir/.git/review-verdict.md"
+        > "$clone_dir/.git/$verdict_name"
     ;;
 approved)
     printf 'APPROVED\n\nChecked: everything.\n\n## Report\nFine.\n' \
-        > "$clone_dir/.git/review-verdict.md"
+        > "$clone_dir/.git/$verdict_name"
     ;;
 esac
 
@@ -1432,6 +1447,40 @@ if [[ -n "${rd_a:-}" ]]; then
         "$(jq -r '.steps[0].fix' "$rd_a/pipeline.json")"
     check "pipeline.json's step 0 harness is claude" "claude" \
         "$(jq -r '.steps[0].harness' "$rd_a/pipeline.json")"
+fi
+
+# A composed walk uses the first code seat for the historical top-level pass,
+# then writes step-indexed records for both review-flavored loop kinds.
+cat > "$real_presets/composed-walk.yaml" <<'EOF'
+agents:
+  coder:
+    harness: claude
+    model: sonnet
+  reviewer:
+    harness: claude
+    model: opus
+pipeline:
+  - action: review
+    repeat: 1
+    agent: reviewer
+  - action: code
+    agent: coder
+  - action: maintain
+    repeat: 1
+    agent: reviewer
+EOF
+prep_stub $'commit\napproved'
+rd_composed="$(run_stubbed --preset composed-walk --branch "sandbox-test-composed-$$-$RANDOM")" && tmpdirs+=("$rd_composed")
+if [[ -n "${rd_composed:-}" ]]; then
+    check "composed walk runs each runnable step" "2" "$(cat "$count")"
+    if [[ -s "$rd_composed/step-1-loop.json" && -s "$rd_composed/step-3-loop.json" \
+        && -s "$rd_composed/s3-maintain-verdict-1.md" ]]; then
+        ok "composed walk writes step-indexed artifacts"
+    else
+        no "composed walk writes step-indexed artifacts" \
+            "$(find "$rd_composed" -maxdepth 1 -type f -printf '%f ' | sort)"
+    fi
+    check "composed walk writes pipeline.json" "3" "$(jq -r '.steps | length' "$rd_composed/pipeline.json")"
 fi
 
 # A2. A bare --review-loop with no --review-model/--review-harness: the
