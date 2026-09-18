@@ -142,6 +142,21 @@ CLAUDE_CREDENTIAL_POOL=/etc/example-fleet/team-a.json:/etc/example-fleet/team-b.
 CLAUDE_HEADROOM_HOOK=example
 ```
 
+## Does not cover: postmaster triage
+
+`fork-sandbox-postmaster.sh`'s own triage classifier leg reads
+`CLAUDE_CREDENTIALS` directly out of `claude.env` — it does not call
+`fs_balance_claude_credential`, so it does not ride a configured pool. An
+operator who replaces a `CLAUDE_CREDENTIALS` pin with
+`CLAUDE_CREDENTIAL_POOL` + `CLAUDE_HEADROOM_HOOK` gets every launcher leg
+balancing onto a pool account while triage keeps reading
+`$HOME/.claude/.credentials.json` — the possibly-exhausted account this
+mechanism exists to stop defaulting to. This is a known gap, not an
+oversight to route around by hand: the `UNRESOLVED_TO`/postmaster area is
+out of scope for this mechanism (see below), and whether triage should get
+the balancer or an explicit documented exclusion is an open question for
+whoever picks that up next.
+
 ## Out of scope
 
 - Shipping any real headroom hook in this repo — the operator's own hook
@@ -151,3 +166,5 @@ CLAUDE_HEADROOM_HOOK=example
   check runs — a known, separately tracked gap, unrelated to the balancer.
 - Any change to token stripping, retry logic, or the `pi`/`codex` credential
   paths, none of which this document's mechanism touches.
+- `fork-sandbox-postmaster.sh`'s triage classifier leg — see "Does not
+  cover: postmaster triage" above.

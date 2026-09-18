@@ -10,11 +10,17 @@
 # and never written anywhere. fork-sandbox.sh already finds the Claude
 # credential at run time (fs_read_claude_credential in fork-sandbox-lib.sh):
 # $HOME/.claude/.credentials.json, the macOS Keychain, or -- when this
-# machine's claude.env sets CLAUDE_CREDENTIALS -- the path it names instead.
-# There is nothing for configure to install; the value of listing it at all
-# is telling a new user their `claude` harness is ready before they try a
-# run and find out the hard way. It reads that same override so the report
-# matches what a real run would actually use, not always the default.
+# machine's claude.env sets CLAUDE_CREDENTIALS, or configures
+# CLAUDE_CREDENTIAL_POOL + CLAUDE_HEADROOM_HOOK -- the path a real run
+# would resolve instead (see fs_balance_claude_credential in
+# fork-sandbox-lib.sh, and docs/credential-balancing.md). There is nothing
+# for configure to install; the value of listing it at all is telling a
+# new user their `claude` harness is ready before they try a run and find
+# out the hard way. It runs that same resolution so the report matches
+# what a real run would actually use, not always the default -- including
+# reporting "not present" (never a hard failure) when a misconfigured pool
+# or hook would make a real run refuse to launch; the balancer's own error
+# still reaches stderr, unsuppressed.
 #
 # Never prints the credential itself, or any part of it: presence is
 # checked by redirecting fs_read_claude_credential's stdout (the credential
@@ -41,6 +47,20 @@ config_dir="${FORK_SANDBOX_CONFIG_DIR:-$HOME/.config/fork-sandbox}"
 cmd_discover() {
     local override
     override="$(fs_read_env_value "$config_dir/claude.env" CLAUDE_CREDENTIALS || true)"
+    # Mirrors fork-sandbox.sh's own local-path precedence (minus the
+    # --claude-credentials flag, which has no equivalent here): a pool
+    # choice beats CLAUDE_CREDENTIALS, which beats today's default. A
+    # balancer failure (bad config, a broken hook contract, "no routable
+    # candidate") is not reported as present -- a real run would refuse to
+    # launch too, so the accurate report is "not ready", not a fallback to
+    # a default this run would never reach. fs_balance_claude_credential
+    # already put its own explanation on stderr.
+    local balance_out=""
+    if balance_out="$(fs_balance_claude_credential "$config_dir" "$script_dir")"; then
+        [[ -n "$balance_out" ]] && override="$balance_out"
+    else
+        return 0
+    fi
     if fs_read_claude_credential "$override" >/dev/null 2>&1; then
         printf 'present\t-\tClaude credential\t%s\tfound\n' \
             "$(fs_claude_credential_source "$override")"

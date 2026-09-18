@@ -447,7 +447,10 @@ takes: `mktemp -d` under the same
 - `run.env` -- the fallback shape `record` reads when `summary.json` is
   missing, carrying `mode`, `harness`, `network`, `model`, `branch`,
   `origin_repo` and `base_sha` (the revision the branch is about to start
-  from -- `--checkout`'s resolved sha, or this repo's HEAD).
+  from -- `--checkout`'s resolved sha, or this repo's HEAD), plus
+  `claude_credentials_source` and `claude_credentials_via` for a
+  `--harness claude` run (see
+  [docs/credential-balancing.md](credential-balancing.md)).
 - `task-meta.json` -- present only with `--task-meta`, the same flag and
   the same meaning as the local path's own (see "Recommended --task-meta
   fields" in `sandbox-run-log.py`'s header). `--task-meta` used to be
@@ -501,9 +504,11 @@ pull. `run` still records that run: rather than call `collect`, it invokes
 `submit` created, with no `summary.json` written. `record` falls back to
 `run.env` in that case (the same fallback the local path's own run offers
 it), so the row still carries `harness`, `network`, `model`, `branch`,
-`origin_repo` and `base_sha` -- everything `submit` already knew, with
-the same `summary_missing: true` marker any other summary-less run
-carries -- with `exit_code` simply absent, since none is known. This is
+`origin_repo` and `base_sha` -- everything `submit` already knew, plus
+`claude_credentials_source` and `claude_credentials_via` for a
+`--harness claude` run -- with the same `summary_missing: true` marker any
+other summary-less run carries, and `exit_code` simply absent, since none
+is known. This is
 the same "a seat silently failing" case the log exists to surface, so a
 dead or timed-out run gets a row instead of vanishing.
 
@@ -525,6 +530,9 @@ dead or timed-out run gets a row instead of vanishing.
   model are read back from `run.env` (only `submit` knows them; `collect`
   does not take them as arguments), the rest as `collect` already knows
   them for the zero-harvest check.
+- `claude_credentials_source`, `claude_credentials_via` -- lifted from
+  `run.env` the same way, present only for a `--harness claude` run (see
+  [docs/credential-balancing.md](credential-balancing.md)).
 - `exit_code`, `commits` -- the agent's own exit code (from the
   `.run-complete` sentinel) and a `git rev-list --count` between the
   pushed base and the fetched tip, the same measure the zero-harvest check

@@ -3395,6 +3395,29 @@ refuses "submit: exit 2 (no routable candidate) is a hard error naming the flag 
     "$k8s_sh" submit --dry-run --branch fs-k8s-test-branch --model claude-sonnet-5 \
     --harness claude "$proj_dir" "$handoff_file"
 
+# The balancer's choice naming a missing file is a hard error, the same
+# rule the explicit flag and CLAUDE_CREDENTIALS get below -- the pool is
+# operator-authored, so a bad entry is this run's problem to raise, not to
+# swallow. The pool entry is syntactically valid (absolute, no whitespace
+# or colon) but does not exist on disk; exercised via --dry-run since this
+# check runs before the dry-run render+exit.
+balance_pool_missing="$(newdir)/pool-missing-credentials.json"; tmpdirs+=("$(dirname "$balance_pool_missing")")
+balance_hook_dir_missing="$(balance_fake_hook missing2 'printf "%s\n" "$2"')"
+{
+    printf 'CLAUDE_CREDENTIAL_POOL=%s:%s\n' "$balance_pool_a" "$balance_pool_missing"
+    printf 'CLAUDE_HEADROOM_HOOK=missing2\n'
+} > "$balance_config_dir/claude.env"
+refuses "submit: the balancer choosing a missing file is refused" \
+    "the credential balancer chose" \
+    env PATH="$balance_hook_dir_missing:$PATH" FORK_SANDBOX_CONFIG_DIR="$balance_config_dir" \
+    "$k8s_sh" submit --dry-run --branch fs-k8s-test-branch --model claude-sonnet-5 \
+    --harness claude "$proj_dir" "$handoff_file"
+refuses "submit: the balancer-chose-missing-file error names the pool entry" \
+    "$balance_pool_missing" \
+    env PATH="$balance_hook_dir_missing:$PATH" FORK_SANDBOX_CONFIG_DIR="$balance_config_dir" \
+    "$k8s_sh" submit --dry-run --branch fs-k8s-test-branch --model claude-sonnet-5 \
+    --harness claude "$proj_dir" "$handoff_file"
+
 # The new --claude-credentials flag itself: a missing path is refused naming
 # it, both on submit directly and via run's forwarding into submit_argv.
 rm -f "$balance_config_dir/claude.env"
@@ -3422,20 +3445,28 @@ else
 fi
 rm -f /tmp/fs-k8s-test-balance-flagok.out
 
-# A locked-in scope decision, not an accident: --claude-credentials on a
-# --harness pi submit parses fine and is silently ignored (this harness
-# never reads a claude credential), rather than being refused the way
-# --pi-args with --harness claude is refused above. Proven here by pointing
-# the flag at a file that does not exist -- if the flag were validated
-# regardless of harness, this would fail naming that path; instead it must
-# exit 0, exactly as it would with the flag omitted entirely.
+# --claude-credentials naming a missing file is refused even on a
+# --harness pi submit, which will never read the file -- the same
+# "fail loud rather than silently drop it" rule fork-sandbox.sh's own two
+# entry points apply to this identical flag. An earlier revision of this
+# suite asserted the opposite (silently ignored on a non-claude harness);
+# that was a real divergence from the other two call sites this round was
+# meant to keep from drifting, fixed alongside this test.
+refuses "--claude-credentials naming a missing file is refused even on a --harness pi submit" \
+    "$balance_missing_cred" \
+    env PATH="$PATH" FORK_SANDBOX_CONFIG_DIR="$balance_config_dir" \
+    "$k8s_sh" submit --dry-run --branch fs-k8s-test-branch --model moonshotai/kimi-k3 \
+    --claude-credentials "$balance_missing_cred" "$proj_dir" "$handoff_file"
+
+# But a VALID --claude-credentials on a --harness pi submit still parses
+# fine and is simply unused (this harness never reads a claude credential).
 if PATH="$PATH" FORK_SANDBOX_CONFIG_DIR="$balance_config_dir" \
     "$k8s_sh" submit --dry-run --branch fs-k8s-test-branch --model moonshotai/kimi-k3 \
-    --claude-credentials "$balance_missing_cred" \
+    --claude-credentials "$claude_override_cred" \
     "$proj_dir" "$handoff_file" >/tmp/fs-k8s-test-balance-pi-flag.out 2>&1; then
-    ok "--claude-credentials on a --harness pi submit is silently ignored, even naming a missing file"
+    ok "--claude-credentials naming an existing file on a --harness pi submit exits 0"
 else
-    no "--claude-credentials on a --harness pi submit is silently ignored, even naming a missing file" \
+    no "--claude-credentials naming an existing file on a --harness pi submit exits 0" \
         "$(cat /tmp/fs-k8s-test-balance-pi-flag.out)"
 fi
 rm -f /tmp/fs-k8s-test-balance-pi-flag.out

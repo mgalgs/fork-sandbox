@@ -18,6 +18,8 @@ constant:
   `fork-sandbox-discover-<name>` on PATH (see docs/configure.md)
 - **Kubernetes platform plugins** — `fork-sandbox-k8s-platform-<name>`
   (see docs/k8s-platform.md)
+- **Claude credential headroom hooks** — `fork-sandbox-headroom-<name>`
+  (see docs/credential-balancing.md)
 - **prompt overlays** — `~/.config/fork-sandbox/prompts/`
 - **per-machine launch defaults** — `~/.config/fork-sandbox/coder-mode.env`,
   read by the orchestrating session, never by scripts

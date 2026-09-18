@@ -2946,6 +2946,23 @@ cmd_submit() {
     # fs_balance_claude_credential's own header comment).
     local claude_cred_json="" claude_access_token="" claude_configmap_cred=""
     local claude_credentials_override="" claude_credentials_via="default"
+    if [[ -n "$claude_credentials_flag" && "$harness" != claude ]]; then
+        # A typo in --claude-credentials is refused here too, even though
+        # this harness will never read the file -- the same "fail loud
+        # rather than silently drop it" rule fork-sandbox.sh's own two
+        # entry points apply to this identical flag (see the comment on
+        # the "flag" branch below). Without this, the flag would carry two
+        # opposite meanings across the pair of call sites this round exists
+        # to keep from drifting.
+        fs_reject_unsafe_chars "$claude_credentials_flag" || exit 1
+        local claude_credentials_flag_resolved
+        claude_credentials_flag_resolved="$("$FS_REALPATH" -m "$claude_credentials_flag")"
+        if [[ ! -f "$claude_credentials_flag_resolved" ]]; then
+            echo "Error: --claude-credentials names" >&2
+            echo "'$claude_credentials_flag_resolved', which does not exist." >&2
+            exit 1
+        fi
+    fi
     if [[ "$harness" == claude ]]; then
         local claude_credentials_config
         claude_credentials_config="$(read_env_value "$claude_env" CLAUDE_CREDENTIALS || true)"

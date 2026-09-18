@@ -13,6 +13,7 @@
 #
 # Usage: tests/fork-sandbox-claude-credentials-test.sh
 
+# shellcheck disable=SC2016  # literal shell snippets handed to fake_hook are intentional
 set -uo pipefail
 
 # Keep git fixtures independent of the operator's global and system config.
@@ -426,6 +427,32 @@ if [[ -n "$rd_happy" ]]; then
         "$pool_b" "$(jq -r '.claude_credentials_source' "$rd_happy/summary.json")"
 else
     no "balance happy path: run_real produced a run directory" "run_real failed"
+fi
+
+# The balancer's choice naming a missing file is a hard error, the same
+# rule as an explicit --claude-credentials or CLAUDE_CREDENTIALS naming one
+# (asserted directly above/below via the flag and claude.env cases) -- the
+# pool is operator-authored, so a bad entry is this run's problem to raise,
+# not to swallow. The pool entry here is syntactically valid (absolute, no
+# whitespace or colon) but does not exist on disk.
+pool_missing="$tmp/pool-missing-credentials.json"
+hook_dir_missing="$(fake_hook missing2 'printf "%s\n" "$2"')"
+missing_cfg="$(mktemp -d)"; tmpdirs+=("$missing_cfg")
+{
+    printf 'CLAUDE_CREDENTIAL_POOL=%s:%s\n' "$pool_a" "$pool_missing"
+    printf 'CLAUDE_HEADROOM_HOOK=missing2\n'
+} > "$missing_cfg/claude.env"
+missing_out="$(PATH="$hook_dir_missing:$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$missing_cfg" \
+    FORK_SANDBOX_BACKEND=fake-image \
+    timeout 60 "$launcher" --foreground --harness claude "$proj" "$handoff" 2>&1)"
+missing_rc=$?
+if (( missing_rc == 0 )); then
+    no "the balancer choosing a missing file is refused" "$missing_out"
+else
+    contains "the balancer choosing a missing file is refused" \
+        "the credential balancer chose '$pool_missing'" "$missing_out"
+    contains "the balancer-chose-missing-file error names the --claude-credentials escape hatch" \
+        "--claude-credentials" "$missing_out"
 fi
 
 # A pure --harness pi run must never invoke the hook, even with a valid pool
