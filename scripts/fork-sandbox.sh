@@ -135,8 +135,13 @@
 #                        repeat: N to run every coding leg as N passes --
 #                        both are preset-only, with no flag equivalent. A
 #                        preset value passes through exactly the validation
-#                        the equivalent flag would, and every explicit flag
-#                        overrides its preset counterpart. Needs PyYAML. See
+#                        the equivalent flag would, and an explicit flag
+#                        overrides its preset counterpart -- except against
+#                        a composed (non-legacy-shaped) pipeline, which has
+#                        no single review/maintain seat, or code seat past
+#                        the first, for a flag to override: there,
+#                        --model/--harness/--review-*/--maintainer-*/--k8s
+#                        are refused outright instead. Needs PyYAML. See
 #                        docs/presets.md for the file format.
 # --task-meta '<json>':  one JSON object of orchestrator-supplied task
 #                        metadata -- kind, difficulty, size,
@@ -1777,9 +1782,10 @@ if [[ -n "$preset_name" ]]; then
     # most one review, then at most one maintain, in that order) is
     # translated below into the preset_impl_*/preset_review_*/
     # preset_maintain_* scalars the existing flag-compile block already
-    # consumes unchanged; a composed pipeline skips that block entirely and
-    # is compiled straight into the step_* arrays at the run engine's
-    # compile point, further down.
+    # consumes unchanged; a composed pipeline skips that block entirely.
+    # There is no run-engine walk over an arbitrary step list yet, so a
+    # composed pipeline is refused at launch further down rather than
+    # compiled into anything.
     preset_step_count=0
     declare -a preset_step_action=()
     declare -a preset_step_agent=()
@@ -1882,8 +1888,9 @@ if [[ -n "$preset_name" ]]; then
     # preset_review_*/preset_maintain_* scalars translated here. Anything
     # else -- any other order, any repeated kind, any count -- is a
     # composed pipeline: decision 8 forbids compiling flags into it, so it
-    # skips this translation and is built straight into the step_* arrays
-    # at the run engine's compile point instead.
+    # skips this translation. The run engine has no walk over an arbitrary
+    # step list yet, so a composed pipeline is refused at launch further
+    # down instead of being run at all.
     preset_is_legacy_shaped=false
     if (( preset_step_count == 1 )) && [[ "${preset_step_action[1]}" == code ]]; then
         preset_is_legacy_shaped=true
@@ -1942,8 +1949,8 @@ if [[ -n "$preset_name" ]]; then
     # maintain scalar to describe or compile flags into (decision 8): the
     # summary below and the whole flag-compile block only apply to a
     # legacy-shaped preset. A composed pipeline gets a step-count
-    # announcement instead, and is built straight into the step_* arrays
-    # at the run engine's compile point further down.
+    # announcement instead, and is refused at launch further down: there
+    # is no run-engine walk over an arbitrary step list yet to run it.
     if [[ "$preset_is_legacy_shaped" == true ]]; then
     # Announced before the compile below, so the picture of what the preset
     # says comes first and any "--x overrides ..." notes read against it.
@@ -2603,9 +2610,9 @@ if [[ "$k8s_mode" == true ]]; then
         echo "Error: --k8s does not support a composed pipeline preset ('$preset_name')" >&2
         echo "yet -- only a legacy-shaped preset (one code step, then at most one" >&2
         echo "review step, then at most one maintain step, in that order) can" >&2
-        echo "forward to the cluster today. Tracked as a follow-up in" >&2
-        echo "docs/ideas.md. Run this preset locally, or use a legacy-shaped" >&2
-        echo "one with --k8s." >&2
+        echo "forward to the cluster today. The run engine cannot walk this" >&2
+        echo "pipeline locally either yet; edit it into a legacy shape, or pick" >&2
+        echo "another." >&2
         exit 1
     fi
     if [[ "$harness" != "pi" && "$harness" != "claude" ]]; then
@@ -2980,10 +2987,11 @@ fi
 # message first since review_loop_cap/maintainer_loop_cap never get set for
 # a composed pipeline. --model/--harness are narrower: they only become
 # ambiguous once a composed pipeline has more than one code step. No new
-# flag algebra is added for a composed pipeline beyond these refusals -- a
-# composed pipeline with exactly one code step is not refused here, but
-# --model/--harness still have no override wired to a composed step, per
-# the preset's own resolution.
+# flag algebra is added for a composed pipeline beyond these refusals --
+# and a composed pipeline with exactly one code step, naming none of the
+# flags above, still falls through to the unconditional refusal at the end
+# of this block: the run engine has no step-list walk to launch it into,
+# regardless of which flags (if any) were named.
 if [[ -n "$preset_file" && "$preset_is_legacy_shaped" != true ]]; then
     if [[ -n "$review_loop_arg" ]]; then
         echo "Error: --review-loop cannot be combined with preset '$preset_name':" >&2
@@ -3034,6 +3042,20 @@ if [[ -n "$preset_file" && "$preset_is_legacy_shaped" != true ]]; then
             exit 1
         fi
     fi
+    # The checks above only refuse specific flag combinations; a composed
+    # preset invoked with none of them (the ordinary way to use one) falls
+    # through them untouched. The run engine that would actually walk its
+    # step list does not exist yet (only the legacy-shaped translation
+    # above does), so without this refusal such a launch silently runs
+    # today's flag/no-preset defaults instead of the preset's pipeline --
+    # a launch, not an error, doing something other than what was asked.
+    # Refuse it outright, the same way --k8s already does further up.
+    echo "Error: preset '$preset_name' is a composed pipeline ($preset_step_count steps);" >&2
+    echo "the run engine that walks an arbitrary step list isn't built yet, so this" >&2
+    echo "preset cannot be launched locally either -- only a legacy-shaped preset (one" >&2
+    echo "code step, then at most one review step, then at most one maintain step, in" >&2
+    echo "that order) can run today. Edit the preset into that shape, or pick another." >&2
+    exit 1
 fi
 
 # Validated here, above the dry-run exit, rather than beside the rest of the

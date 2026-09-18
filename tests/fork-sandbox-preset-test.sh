@@ -582,6 +582,35 @@ refuses "--k8s is refused against a composed pipeline preset" \
     "does not support a composed pipeline preset ('composed')" \
     --preset composed --k8s
 
+# The run engine has no walk over an arbitrary step list yet, so a composed
+# preset is refused at launch even when none of the flags above are named --
+# the ordinary way to invoke a preset. Without this, --dry-run exits 0 and
+# a real run would silently launch today's no-preset defaults instead of
+# the preset's pipeline.
+refuses "a composed pipeline preset is refused at launch even with no conflicting flags" \
+    "run engine that walks an arbitrary step list isn't built yet" \
+    --preset composed
+
+cat > "$presets_dir/composed-reviewfirst.yaml" <<'EOF'
+agents:
+  coder:
+    harness: claude
+    model: sonnet
+  reviewer:
+    harness: claude
+    model: opus
+pipeline:
+  - action: review
+    repeat: 1
+    agent: reviewer
+    fix_agent: coder
+  - action: code
+    agent: coder
+EOF
+refuses "a composed pipeline with exactly one code step is still refused, not silently overridden" \
+    "run engine that walks an arbitrary step list isn't built yet" \
+    --preset composed-reviewfirst --model haiku
+
 # The code seat's endpoint: a k8s-only key, so a local launch refuses it
 # before the dry-run exit -- the k8s-side behavior is the stubbed dispatch
 # test in section G.
@@ -1040,18 +1069,38 @@ pipeline:
     repeat: 5
 EOF
 
+# spare.yaml is created here, before the legacy-fixture loop below, so
+# that loop actually exercises it instead of silently skipping a fixture
+# that does not exist yet.
+cat > "$presets_dir/spare.yaml" <<'EOF'
+agents:
+  coder:
+    harness: claude
+  spare:
+    harness: codex
+pipeline:
+  - action: code
+    agent: coder
+EOF
+
 # Every existing legacy-shaped preset fixture (one code step, then at most
 # one review and one maintain step, in that order) still parses -- with
 # the same seat resolution and warnings, in the new step-indexed shape.
 # Named explicitly, not globbed: several fixtures already on disk at this
 # point in the suite (net-conflict, seal-review, ep-bad-seat, ...) are
 # deliberately-invalid refusal fixtures, not legacy presets to round-trip.
+# Every name here must exist by this point -- no "[[ -e ]] || continue"
+# skip, so a fixture that is not yet created (or gets renamed away) fails
+# loudly instead of quietly dropping out of coverage.
 legacy_fixtures=(fast deep self-review maintain-only aliased sealed-alias
     sealed-explicit rev-sealed-alias rev-sealed-explicit seal-ok-warns
     fast3 ep codex-fix spare)
 for legacy_name in "${legacy_fixtures[@]}"; do
     legacy_f="$presets_dir/$legacy_name.yaml"
-    [[ -e "$legacy_f" ]] || continue
+    if [[ ! -e "$legacy_f" ]]; then
+        no "legacy fixture still parses: $legacy_name" "fixture file missing: $legacy_f"
+        continue
+    fi
     if python3 "$preset_parser" "$legacy_f" legacy "$legacy_f" \
         > /dev/null 2>"$err"; then
         ok "legacy fixture still parses: $legacy_name"
@@ -1066,16 +1115,6 @@ else
     no "seated agents draw no unused warning" "$(cat "$err")"
 fi
 
-cat > "$presets_dir/spare.yaml" <<'EOF'
-agents:
-  coder:
-    harness: claude
-  spare:
-    harness: codex
-pipeline:
-  - action: code
-    agent: coder
-EOF
 out="$(run --preset spare 2>"$err")"
 contains "an agent that sits no seat draws a warning" "$(cat "$err")" \
     "agent 'spare' is defined but sits no seat"
