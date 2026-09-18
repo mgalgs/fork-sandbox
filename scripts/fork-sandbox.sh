@@ -1718,6 +1718,12 @@ preset_stage_cleanup() {
         preset_staged_bytes=""
     fi
 }
+# No preset at all is the trivially legacy-shaped case: flags alone can only
+# ever describe one code seat plus at most one review loop and one maintain
+# loop, so there is no composed shape to detect without a preset's pipeline:
+# list to inspect.
+preset_is_legacy_shaped=true
+preset_step_count=0
 if [[ -n "$preset_name" ]]; then
     preset_dir="${FORK_SANDBOX_PRESETS_DIR:-$config_dir/presets}"
     # The same single-path-component rule discoverer ids follow: with no
