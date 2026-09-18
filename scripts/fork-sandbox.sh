@@ -7000,24 +7000,29 @@ started_at="$(date +%s)"
         done
         unset -n preset_k_cmd_ref
         printf 'composed_pipeline=%q\n' 1
-        printf 'run_step_count=%q\n' "$run_step_count"
-        # These arrays are deliberately 1-indexed.  Expanding values alone
-        # would rebuild them from index zero in run.sh.
-        for preset_k in kind idx cap prompt; do
-            printf 'run_step_%s=(' "$preset_k"
-            for ((preset_j = 1; preset_j <= run_step_count; preset_j++)); do
-                case "$preset_k" in
-                kind) printf '[%d]=%q ' "$preset_j" "${run_step_kind[$preset_j]}" ;;
-                idx) printf '[%d]=%q ' "$preset_j" "${run_step_idx[$preset_j]}" ;;
-                cap) printf '[%d]=%q ' "$preset_j" "${run_step_cap[$preset_j]}" ;;
-                prompt) printf '[%d]=%q ' "$preset_j" "${run_step_prompt[$preset_j]}" ;;
-                esac
-            done
-            printf ')\n'
-        done
     else
         printf 'composed_pipeline=%q\n' 0
     fi
+    printf 'run_step_count=%q\n' "$run_step_count"
+    # These arrays are deliberately 1-indexed.  Expanding values alone
+    # would rebuild them from index zero in run.sh.  Serialized
+    # unconditionally -- both composed and legacy-translated runs walk
+    # run_step_* at runtime; only the s<K>_sandbox_cmd/s<K>fix_sandbox_cmd
+    # array literals above stay composed-only, since legacy steps use the
+    # fixed sandbox_cmd/review_sandbox_cmd/maintainer_sandbox_cmd/
+    # fix_sandbox_cmd/mntfix_sandbox_cmd names instead.
+    for preset_k in kind idx cap prompt; do
+        printf 'run_step_%s=(' "$preset_k"
+        for ((preset_j = 1; preset_j <= run_step_count; preset_j++)); do
+            case "$preset_k" in
+            kind) printf '[%d]=%q ' "$preset_j" "${run_step_kind[$preset_j]}" ;;
+            idx) printf '[%d]=%q ' "$preset_j" "${run_step_idx[$preset_j]}" ;;
+            cap) printf '[%d]=%q ' "$preset_j" "${run_step_cap[$preset_j]}" ;;
+            prompt) printf '[%d]=%q ' "$preset_j" "${run_step_prompt[$preset_j]}" ;;
+            esac
+        done
+        printf ')\n'
+    done
     printf '\n'
     cat <<'RUNNER'
 # Load shared predicates used by the status script as well as this runner, so

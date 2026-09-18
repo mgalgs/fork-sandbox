@@ -736,6 +736,20 @@ if (( rc3 == 0 )) && [[ -n "$rd3" ]]; then
     check "the combined review+maintainer legacy run keeps its historical filename set" \
         $'continuation-prompt-header.md\nevents-fix-1.jsonl\nevents-maintainer-1.jsonl\nevents-review-1.jsonl\nevents-review-2.jsonl\nevents.jsonl\nexit-code\nfix-prompt-1.md\nfix-prompt-header.md\nhandoff-original.md\nhandoff.md\nmaintainer-loop.json\nmaintainer-prompt-1.md\nmaintainer-prompt.md\nmaintainer-verdict-1.md\npid\nreview-loop.json\nreview-prompt-1.md\nreview-prompt-2.md\nreview-prompt.md\nreview-verdict-1.md\nreview-verdict-2.md\nrun-source\nrun.env\nrun.sh\nsandbox.log\nsummary.json\nsummary.txt' \
         "$(find "$rd3" -maxdepth 1 -type f -exec basename {} \; | LC_ALL=C sort)"
+    # run.sh's run_step_* serialization used to fire only for composed
+    # runs (preset_is_legacy_shaped != true); a legacy run's generated
+    # run.sh had no run_step_* arrays in its runtime text at all, which
+    # would make it impossible for a unified walker to drive a legacy run.
+    # It is now unconditional -- confirm the three-leg-kind combination
+    # this run exercises (code, review, maintainer) actually landed.
+    check "run.sh serializes run_step_count for this legacy run" "3" \
+        "$(grep -o '^run_step_count=.*' "$rd3/run.sh" | sed "s/run_step_count=//")"
+    contains "run.sh's run_step_kind array names the code step" \
+        '[1]=code' "$(grep '^run_step_kind=' "$rd3/run.sh")"
+    contains "run.sh's run_step_kind array names the review step" \
+        '[2]=review' "$(grep '^run_step_kind=' "$rd3/run.sh")"
+    contains "run.sh's run_step_kind array names the maintainer step" \
+        '[3]=maintainer' "$(grep '^run_step_kind=' "$rd3/run.sh")"
     check "review-loop.json's cap is the review-flavored field" "2" \
         "$(jq -r '.cap' "$rd3/review-loop.json")"
     check "review-loop.json names the review model under review_model" "sonnet" \
