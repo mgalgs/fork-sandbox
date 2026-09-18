@@ -167,10 +167,11 @@
 #                        read this file instead of
 #                        $HOME/.claude/.credentials.json (or, on macOS, the
 #                        login Keychain) for a --harness claude leg. Beats
-#                        CLAUDE_CREDENTIALS in claude.env when both are
-#                        set. Refused with --k8s -- set CLAUDE_CREDENTIALS
-#                        in claude.env instead, which fork-sandbox-k8s.sh
-#                        also reads directly.
+#                        CLAUDE_CREDENTIALS in claude.env and the
+#                        pool/hook balancer (see docs/credential-balancing.md)
+#                        when set. With --k8s, resolved here and forwarded
+#                        to fork-sandbox-k8s.sh run as its own
+#                        --claude-credentials, rather than refused.
 # --context-ro <dir>:    bind <dir> read-only into the sandbox as gathered
 #                        context. The directory must live under
 #                        /var/tmp/claude-scratch/forks/ — a staging path a
@@ -2590,12 +2591,6 @@ if [[ "$k8s_mode" == true ]]; then
         echo "--session-state, which a cluster run cannot have." >&2
         exit 1
     fi
-    if [[ -n "$claude_credentials" ]]; then
-        echo "Error: --claude-credentials is not supported with --k8s. Set" >&2
-        echo "CLAUDE_CREDENTIALS in $config_dir/claude.env instead --" >&2
-        echo "fork-sandbox-k8s.sh reads that config key directly." >&2
-        exit 1
-    fi
     if [[ -n "$clone_dir_flag" ]]; then
         echo "Error: --clone-dir is not supported with --k8s. It persists a clone" >&2
         echo "on a host directory between wakes, and a cluster Job's pod" >&2
@@ -2707,6 +2702,73 @@ if [[ "$k8s_mode" == true ]]; then
         exit 1
     fi
 
+    # Which Claude credential the pod's claude CLI authenticates as:
+    # --claude-credentials, else CLAUDE_CREDENTIALS in claude.env, else a
+    # launcher-balanced choice from an operator-configured pool
+    # (CLAUDE_CREDENTIAL_POOL + CLAUDE_HEADROOM_HOOK, see
+    # fs_balance_claude_credential in fork-sandbox-lib.sh) -- the identical
+    # chain the local path below resolves. Resolved HERE, on this side of
+    # the exec below, and forwarded into k8s_argv as --claude-credentials
+    # so fork-sandbox-k8s.sh's own cmd_submit -- which carries this same
+    # precedence chain, duplicated rather than shared for the reason given
+    # at fs_balance_claude_credential's own header -- sees an
+    # operator-supplied flag and skips its own balance branch entirely.
+    # That is not an optimization: a run that resolved here AND let
+    # cmd_submit resolve again would invoke the operator's headroom hook
+    # twice, possibly landing on two different accounts if health changes
+    # between the two calls.
+    claude_credentials_resolved="$claude_credentials"
+    claude_credentials_via="default"
+    if [[ -n "$claude_credentials" ]]; then
+        claude_credentials_via="flag"
+    elif [[ "$harness" == "claude" ]]; then
+        claude_credentials_config="$(fs_read_env_value "$config_dir/claude.env" CLAUDE_CREDENTIALS || true)"
+        claude_balance_out=""
+        if claude_balance_out="$(fs_balance_claude_credential "$config_dir" "$script_dir")"; then
+            if [[ -n "$claude_balance_out" ]]; then
+                claude_credentials_resolved="$claude_balance_out"
+                claude_credentials_via="balance"
+            elif [[ -n "$claude_credentials_config" ]]; then
+                claude_credentials_resolved="$claude_credentials_config"
+                claude_credentials_via="claude-env"
+            fi
+        else
+            # fs_balance_claude_credential already printed the specific error.
+            exit 1
+        fi
+    fi
+
+    if [[ -n "$claude_credentials_resolved" ]]; then
+        fs_reject_unsafe_chars "$claude_credentials_resolved"
+        # Resolved to an absolute path at this launcher's own cwd, the same
+        # reason fork-sandbox-k8s.sh's own cmd_submit resolves its
+        # equivalent before its existence check: a relative path stored
+        # verbatim, forwarded across the exec below, would read differently
+        # once fork-sandbox-k8s.sh applies its own (different) cwd.
+        claude_credentials_resolved="$("$FS_REALPATH" -m "$claude_credentials_resolved")"
+        if [[ "$claude_credentials_via" == "flag" \
+            && ! -f "$claude_credentials_resolved" ]]; then
+            echo "Error: --claude-credentials names '$claude_credentials_resolved'," >&2
+            echo "which does not exist." >&2
+            exit 1
+        elif [[ "$claude_credentials_via" == "balance" \
+            && ! -f "$claude_credentials_resolved" ]]; then
+            # The balancer's choice is an operator-authored pool entry,
+            # same rule as the explicit flag above: a balanced choice
+            # naming a missing file is this run's problem to raise, not
+            # to swallow.
+            echo "Error: the credential balancer chose '$claude_credentials_resolved'," >&2
+            echo "which does not exist. Fix the pool entry in claude.env, or pin" >&2
+            echo "--claude-credentials to override the balancer." >&2
+            exit 1
+        elif [[ "$claude_credentials_via" == "claude-env" \
+            && ! -f "$claude_credentials_resolved" ]]; then
+            echo "Error: CLAUDE_CREDENTIALS in claude.env names" >&2
+            echo "'$claude_credentials_resolved', which does not exist." >&2
+            exit 1
+        fi
+    fi
+
     # Same two security checks the local path applies below, applied here
     # before this run is handed to fork-sandbox-k8s.sh: this script is meant
     # to be blanket-approved, so it is the security boundary regardless of
@@ -2765,6 +2827,13 @@ if [[ "$k8s_mode" == true ]]; then
     # submit argv the same way -- an empty value at run's parse would be
     # an argument error, not "no model".
     [[ -n "$model" ]] && k8s_argv+=(--model "$model")
+    # Forwarded whenever resolved to something -- flag, claude-env, or a
+    # balancer choice -- so fork-sandbox-k8s.sh's own cmd_submit sees an
+    # operator-supplied --claude-credentials and skips its own resolution
+    # (and, critically, its own balancer call). See the resolution above
+    # for why forwarding unconditionally here is what keeps a configured
+    # headroom hook from firing twice in one run.
+    [[ -n "$claude_credentials_resolved" ]] && k8s_argv+=(--claude-credentials "$claude_credentials_resolved")
     k8s_argv+=(--harness "$harness" --branch "$branch" "$project_path" "$handoff_file")
 
     # This path ends in exec, which replaces the shell image and discards
@@ -4078,10 +4147,8 @@ if [[ -n "$claude_credentials_resolved" ]]; then
     claude_credentials_resolved="$("$FS_REALPATH" -m "$claude_credentials_resolved")"
     if [[ "$claude_credentials_via" == "flag" ]]; then
         # An explicit --claude-credentials is the operator naming a
-        # specific file by hand, the same as --claude-args or
-        # --claude-credentials --k8s above naming something this run
-        # cannot use -- fail loud rather than silently drop it, even on a
-        # --harness pi run that will never read it.
+        # specific file by hand -- fail loud rather than silently drop it,
+        # even on a --harness pi run that will never read it.
         if [[ ! -f "$claude_credentials_resolved" ]]; then
             echo "Error: --claude-credentials names '$claude_credentials_resolved'," >&2
             echo "which does not exist." >&2

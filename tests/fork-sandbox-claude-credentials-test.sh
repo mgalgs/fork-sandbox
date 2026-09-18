@@ -68,19 +68,43 @@ dry() {
     "$launcher" --dry-run "$@" unused-project unused-handoff
 }
 
-printf '== --k8s refuses --claude-credentials ==\n'
+printf '== --k8s forwards --claude-credentials instead of refusing it ==\n'
+# The refusal this section used to assert was lifted: fork-sandbox.sh --k8s
+# now resolves --claude-credentials itself (same precedence chain as the
+# local path) and forwards the result into fork-sandbox-k8s.sh run's own
+# --claude-credentials, rather than pointing the operator at CLAUDE_CREDENTIALS
+# as the only escape hatch. Full precedence and hook-contract coverage lives
+# in fork-sandbox-balance-test.sh (the lib) and fork-sandbox-k8s-test.sh (the
+# fork-sandbox-k8s.sh cmd_submit call site); this file only needs to confirm
+# fork-sandbox.sh's own --k8s dispatch resolves and forwards, one
+# representative case each for the happy path and the missing-file refusal.
+
+k8s_cred_valid="$(mktemp)"; tmpdirs+=("$k8s_cred_valid")
+printf '{"claudeAiOauth":{"accessToken":"k8s-flag-tok"}}\n' > "$k8s_cred_valid"
 
 err="$(mktemp)"; tmpdirs+=("$err")
 if dry --k8s --harness claude --model sonnet \
-    --claude-credentials /tmp/fs-claude-credentials-test-unused.json \
+    --claude-credentials "$k8s_cred_valid" \
     >/dev/null 2>"$err"; then
-    no "--k8s --claude-credentials is refused"
+    no "--k8s --claude-credentials naming an existing file is no longer refused" \
+        "$(cat "$err")"
 else
-    contains "--k8s --claude-credentials is refused" \
+    lacks "--k8s --claude-credentials naming an existing file is no longer refused" \
         "not supported with --k8s" "$(cat "$err")"
 fi
-contains "--k8s --claude-credentials names CLAUDE_CREDENTIALS as the alternative" \
-    "CLAUDE_CREDENTIALS in" "$(cat "$err")"
+
+k8s_cred_missing="/tmp/fs-claude-credentials-test-unused.json"
+err2="$(mktemp)"; tmpdirs+=("$err2")
+if dry --k8s --harness claude --model sonnet \
+    --claude-credentials "$k8s_cred_missing" \
+    >/dev/null 2>"$err2"; then
+    no "--k8s --claude-credentials naming a missing file is refused"
+else
+    contains "--k8s --claude-credentials naming a missing file is refused" \
+        "--claude-credentials names '$k8s_cred_missing'" "$(cat "$err2")"
+fi
+lacks "the missing-file refusal is fork-sandbox.sh's own message, not the old --k8s refusal" \
+    "not supported with --k8s" "$(cat "$err2")"
 
 printf '\n== --claude-credentials precedence, forwarded into sandbox_cmd ==\n'
 

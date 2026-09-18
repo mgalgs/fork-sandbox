@@ -1241,14 +1241,16 @@ is the same: **a run that outlives its token dies partway through**, on the
 cluster exactly as it would locally. There is no refresh path in either
 place.
 
-**Which credential file `cmd_submit` reads is overridable.** `CLAUDE_CREDENTIALS`
-in `claude.env` (see docs/configure.md) names a path to read instead of
-`$HOME/.claude/.credentials.json`, e.g. to run cluster agents on a separate
-team-plan account. Missing file or key means the default above. There is no
-per-run flag for this on the direct `fork-sandbox-k8s.sh` entry point — only
-the config key, which is machine-wide — matching `fork-sandbox.sh --k8s`,
-which refuses its own `--claude-credentials` flag and points at this same key
-instead.
+**Which credential file `cmd_submit` reads is overridable.** Precedence:
+`--claude-credentials <path>` (on `fork-sandbox-k8s.sh run`/`submit`, or
+resolved and forwarded automatically when launched via `fork-sandbox.sh
+--k8s`) beats `CLAUDE_CREDENTIALS` in `claude.env` (see docs/configure.md)
+beats a launcher-balanced choice from an operator-configured pool (see
+docs/credential-balancing.md) beats the default
+`$HOME/.claude/.credentials.json`. `fork-sandbox.sh --k8s` resolves this
+same chain itself before delegating and always forwards the result as
+`--claude-credentials`, so a configured headroom hook is contacted at most
+once per run, never twice.
 
 **The pod's own credential is a placeholder.** The operator's real
 `.credentials.json` is passed through the same `jq` filter
