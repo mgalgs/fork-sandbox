@@ -610,10 +610,30 @@ SPAWNS="$STATE/spawns"
 SEQ="$STATE/seq"
 HANDOFFS="$STATE/handoffs"
 TRIAGED="$STATE/triaged"
-# One file per thread, one already-flagged name per line -- see the
+# One file per thread, one already-recorded name per line -- see the
 # unresolvable-To block in pm_process_message for why this exists and why
-# rule 1's operator reset must NOT clear it.
+# rule 1's operator reset must NOT clear it. A name lands here whether or
+# not it actually flagged (a gate reason can win instead -- see that
+# block), so "recorded" is the right word for what this holds, not
+# "flagged".
 UNRESOLVED_TO="$STATE/unresolved-to"
+# Same record, same reasoning, for a Cc-expanded @-shaped name that never
+# resolved -- kept in its own per-thread file rather than sharing
+# UNRESOLVED_TO's, so a name that shows up unresolved on both headers (or
+# on Cc only, on a later message, after already being recorded via To) is
+# tracked and flagged independently per header -- the flag reason differs
+# ("unresolvable To:" vs "unresolvable Cc:") and the operator should learn
+# about both, not have the second header's typo silently deduped away by
+# the first's record.
+UNRESOLVED_CC="$STATE/unresolved-cc"
+# Per-thread, append-only flag history: pm_flag/pm_unflag each append one
+# line here on every call, never truncating -- unlike $NEEDS_OPERATOR/<tid>
+# (the CURRENT reason, overwritten every call; see pm_flag_keyword's own
+# comment on why that overwrite is load-bearing and must not change). This
+# is what lets `status` report an event count beside the current reason
+# instead of only ever showing whichever reason happened to write last.
+# Nothing routes on it.
+NEEDS_OPERATOR_JOURNAL="$STATE/needs-operator-journal"
 
 # Where a handler seat's `command:` bare name resolves -- same env var,
 # same default, as fleet.sh's own HANDLERS_DIR (fleet.sh:154). postmaster.sh
@@ -1065,6 +1085,7 @@ pm_flag_keyword() {
     case "$reason" in
         "seat resolution failed for"*) printf 'seat-resolution-failed' ;;
         "unresolvable To:"*) printf 'unresolvable-to' ;;
+        "unresolvable Cc:"*) printf 'unresolvable-cc' ;;
         "handler command"*"path separator"*) printf 'handler-bad-command' ;;
         "handler "*"does not exist"*) printf 'handler-missing' ;;
         "handler "*"is not a regular file"*) printf 'handler-not-regular' ;;
@@ -1084,16 +1105,44 @@ pm_flag_keyword() {
     esac
 }
 
+# Appends one line to $tid's journal: UTC timestamp, event (flag/unflag),
+# keyword, reason -- tab-separated so `cmd_status`'s event count
+# (awk -F'\t' '$2=="flag"') never has to parse the free-text reason field
+# to find the boundary. date -u's own output can't itself contain a tab or
+# newline, and "flag"/"unflag" are fixed literals this function alone
+# writes, so only the reason (field 4, last) can carry anything
+# sender-influenced -- and being last, an embedded tab in IT still can't
+# shift $2.
+pm_flag_journal_append() {
+    local tid="$1" kind="$2" keyword="${3:-}" reason="${4:-}"
+    mkdir -p -- "$NEEDS_OPERATOR_JOURNAL"
+    printf '%s\t%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$kind" "$keyword" "$reason" \
+        >> "$NEEDS_OPERATOR_JOURNAL/$tid"
+}
+
 pm_flag() {
     local tid="$1" reason="$2" keyword="${3:-}"
     mkdir -p -- "$NEEDS_OPERATOR"
     printf '%s\n' "$reason" > "$NEEDS_OPERATOR/$tid"
     [[ -n "$keyword" ]] || keyword="$(pm_flag_keyword "$reason")"
+    # The journal is append-only and records EVERY flag call, even one
+    # whose reason is about to be clobbered by another flag call later in
+    # the same pass (pm_flag itself still only ever shows the current
+    # reason, unchanged -- see NEEDS_OPERATOR_JOURNAL's own comment). This
+    # is what lets 12 needs-operator incidents on one thread read as 12
+    # events instead of 1.
+    pm_flag_journal_append "$tid" flag "$keyword" "$reason"
     pm_event "flag thread=${tid:0:8} reason=$keyword"
 }
 
 pm_unflag() {
-    rm -f -- "$NEEDS_OPERATOR/$1"
+    local tid="$1"
+    # Only journal an unflag that actually clears something -- rule 1's
+    # operator reset calls this unconditionally on every operator/external
+    # message, flagged thread or not, and journaling every one of those
+    # no-ops would drown the real transitions in noise.
+    [[ -e "$NEEDS_OPERATOR/$tid" ]] && pm_flag_journal_append "$tid" unflag "" ""
+    rm -f -- "$NEEDS_OPERATOR/$tid"
 }
 
 # ---- lock ----
@@ -1207,6 +1256,71 @@ pm_require_fleet_check() {
     [[ -f "$FLEET_FILE" ]] || return 0
     [[ -d "$PERSONAS_DIR" ]] || return 0
     "$FLEET" check
+}
+
+# Startup contract: refuse a postmaster that can never route anything, and
+# warn loudly about the one-absent case that could easily be a typo instead
+# of the deliberate mode it looks identical to.
+#
+# Two candidate seat SOURCES exist -- fleet.yaml (agents/lists/handler
+# declarations) and the personas dir (bare <name>.md files, which
+# `fleet resolve`/`expand` accept with no fleet.yaml entry at all, see
+# fleet.sh's own header and fleet_all_agent_names). $FORK_SANDBOX_HANDLERS_DIR
+# is NOT a third one: it only resolves a `command:` bare name for a seat
+# fleet.yaml already declared (fleet.sh's HANDLERS_DIR, read only by
+# cmd_check/pm_exec_wake) -- neither `fleet expand` nor `fleet resolve`
+# (resolve_with_dump, cmd_expand) ever reads it to discover a seat, so a
+# handlers dir with no fleet.yaml is not a routable fleet, and its presence
+# or absence has no bearing on the check below.
+#
+# A fleet using only ONE of the two sources is a documented, valid mode --
+# personas-only (no fleet.yaml: every seat is a bare persona, no lists, no
+# handler seats) or handler-exec-only (no personas dir: every seat is
+# `handler: exec`) -- pm_require_fleet_check above already skips its own
+# gate for either alone, and that single-absent semantics must not change
+# here. But a typo'd env override (a wrong path in
+# $FORK_SANDBOX_FLEET_FILE/$FORK_SANDBOX_PERSONAS_DIR) looks IDENTICAL to
+# a deliberate one-absent mode from here -- the only difference is whether
+# the operator meant it -- so that case gets a startup WARNING, not
+# silence, naming the missing path and which mode its absence implies.
+#
+# BOTH absent is never a valid mode: with no seat source at all, `fleet
+# expand`/`fleet resolve` resolve nothing for any address on any message,
+# so every wake candidate on every message would come back unresolved
+# forever -- an @-shaped To: name flags route-dead (loud, at least), but a
+# non-@-shaped or already-recorded one just silently never wakes, with no
+# error anywhere to explain why. Caught here, loudly, before the lock --
+# same posture as pm_require_kit and pm_require_fleet_check above it in
+# cmd_deliver.
+pm_require_routing_source() {
+    local fleet_present=0 personas_present=0
+    [[ -f "$FLEET_FILE" ]] && fleet_present=1
+    [[ -d "$PERSONAS_DIR" ]] && personas_present=1
+
+    if (( ! fleet_present && ! personas_present )); then
+        echo "Error: postmaster: no seat source found -- neither a fleet file at" >&2
+        echo "  $FLEET_FILE" >&2
+        echo "(override: \$FORK_SANDBOX_FLEET_FILE) nor a personas dir at" >&2
+        echo "  $PERSONAS_DIR" >&2
+        echo "(override: \$FORK_SANDBOX_PERSONAS_DIR) exists. With neither, every" >&2
+        echo "message's To:/Cc: expansion resolves no one -- deliver would run" >&2
+        echo "forever, routing every message to nobody. Create one of the two, or" >&2
+        echo "point the env override at wherever your fleet actually lives." >&2
+        return 1
+    fi
+
+    if (( ! fleet_present )); then
+        echo "Warning: postmaster: no fleet file at '$FLEET_FILE' (override:" >&2
+        echo "\$FORK_SANDBOX_FLEET_FILE) -- running personas-only fleet: every seat" >&2
+        echo "comes from a bare persona file, with no fleet.yaml lists or handler" >&2
+        echo "seats. If that wasn't intentional, check the path or the override." >&2
+    elif (( ! personas_present )); then
+        echo "Warning: postmaster: no personas dir at '$PERSONAS_DIR' (override:" >&2
+        echo "\$FORK_SANDBOX_PERSONAS_DIR) -- this means handler-exec seats only:" >&2
+        echo "every seat in this fleet must be \`handler: exec\`. If that wasn't" >&2
+        echo "intentional, check the path or the override." >&2
+    fi
+    return 0
 }
 
 pm_write_handoff() {
@@ -1795,9 +1909,9 @@ pm_process_message() {
     # prefix) so the assignment is a plain shell variable pm_expand_to
     # picks up by dynamic scope, not something whose lifetime depends on
     # exactly when bash wires up the process-substitution redirection
-    # below. It's unset again immediately after so the Cc: expansion a
-    # few lines down (out of scope for this feature -- see the file's
-    # header comment) never gets unresolved-name tracking.
+    # below. It's unset again immediately after, then set again around the
+    # Cc: expansion further down with its own file -- same mechanism, two
+    # separate records (see UNRESOLVED_CC's own comment for why separate).
     local -a to_expanded=()
     local to_unresolved_file
     to_unresolved_file="$(mktemp "$MAIL_ROOT/.postmaster.to-unresolved.XXXXXX")"
@@ -1826,12 +1940,39 @@ pm_process_message() {
         fi
     fi
 
-    local -a candidates=()
+    local -a candidates=() fresh_unresolved_cc=()
     if [[ -z "$gate_reason" ]]; then
         candidates+=("${to_candidates[@]}")
 
+        # Same unresolved-name tracking as To: above, own file, own record
+        # (UNRESOLVED_CC) -- only reached when there's no gate_reason, same
+        # as the rest of Cc resolution (wake-on-cc, triage): rule 0's own
+        # doc already says a refused message skips Cc resolution outright,
+        # and that now includes this check too, which is why "gate reason
+        # still wins" needs no extra code here -- an unresolvable Cc name
+        # on a gated message is simply never looked at, so there is never a
+        # competing pm_flag call for it to win against.
         local -a expanded_cc=()
+        local cc_unresolved_file
+        cc_unresolved_file="$(mktemp "$MAIL_ROOT/.postmaster.cc-unresolved.XXXXXX")"
+        local PM_EXPAND_UNRESOLVED_FILE="$cc_unresolved_file"
         mapfile -t expanded_cc < <(pm_expand_to "$cc")
+        unset PM_EXPAND_UNRESOLVED_FILE
+        local -a unresolved_cc=()
+        mapfile -t unresolved_cc < "$cc_unresolved_file"
+        rm -f -- "$cc_unresolved_file"
+        if (( ${#unresolved_cc[@]} )); then
+            mkdir -p -- "$UNRESOLVED_CC"
+            local cc_seen_file="$UNRESOLVED_CC/$tid" u
+            for u in "${unresolved_cc[@]}"; do
+                if [[ -e "$cc_seen_file" ]] && grep -qxF -- "$u" "$cc_seen_file"; then
+                    continue
+                fi
+                fresh_unresolved_cc+=("$u")
+                printf '%s\n' "$u" >> "$cc_seen_file"
+            done
+        fi
+
         local t_harness="" t_model="" t_resolved=0
         for cand in "${expanded_cc[@]}"; do
             [[ -n "$cand" ]] || continue
@@ -1924,6 +2065,26 @@ pm_process_message() {
         [[ -z "$gate_reason" ]] && pm_flag "$tid" "unresolvable To: $unresolved_joined at $mid"
     fi
 
+    # Cc's equivalent of the To: block above -- an @-shaped Cc name that
+    # never resolved means an intended OBSERVER, not an addressee, silently
+    # never sees the thread; the reason says "via Cc" so the operator knows
+    # which. fresh_unresolved_cc is only ever non-empty when gate_reason is
+    # empty (see the Cc-resolution block above), so there is no gate-vs-Cc
+    # race to arbitrate here the way there is for To: above -- whichever of
+    # this and a later flag call in this same pass runs last still wins,
+    # per pm_flag's own overwrite semantics, same as any other collision.
+    # This flag never wakes anything: reaching a live seat by Cc is
+    # rule 0's job (wake-on-cc, triage), decided independently of whether
+    # any OTHER Cc name on the same message resolved.
+    if (( ${#fresh_unresolved_cc[@]} )); then
+        local unresolved_cc_joined="" u
+        for u in "${fresh_unresolved_cc[@]}"; do
+            [[ -n "$unresolved_cc_joined" ]] && unresolved_cc_joined+=", "
+            unresolved_cc_joined+="$u"
+        done
+        pm_flag "$tid" "unresolvable Cc: $unresolved_cc_joined at $mid"
+    fi
+
     if [[ -n "$gate_reason" ]]; then
         local refuse_reason="budget"
         [[ "$gate_reason" == hops* ]] && refuse_reason="hops"
@@ -1955,9 +2116,20 @@ pm_route_pass() {
 # Reply-To-Id, each optional), a blank line, then the body verbatim.
 # Prints four tab-separated fields (to, cc, subject, reply_to_id) on
 # success and writes the body to $2; returns 1 on any parse problem.
+# On any failure, if $PM_PARSE_BAD_LINE_FILE is set (dynamic scope, same
+# mechanism as PM_EXPAND_UNRESOLVED_FILE above -- the caller invokes this
+# inside a `$( ... )` command substitution, which forks a subshell exactly
+# like the `<( ... )` process substitution that mechanism's own comment
+# explains, so a file is what survives the fork), the raw offending header
+# line is written there for pm_harvest_one_file to embed in its flag
+# reason -- naming the file alone leaves the operator to guess what was
+# actually wrong with it. Not populated when the header stanza never finds
+# its blank-line separator at all: that failure has no single bad line to
+# point at.
 pm_parse_reply_file() {
     local mf="$1" body_out="$2"
     local to="" cc="" subject="" reply_to_id="" line in_body=0
+    local to_line="" cc_line=""
     : > "$body_out"
     while IFS= read -r line || [[ -n "$line" ]]; do
         if (( in_body )); then
@@ -1969,11 +2141,14 @@ pm_parse_reply_file() {
             continue
         fi
         case "$line" in
-            To:*) to="$(pm_trim "${line#To:}")" ;;
-            Cc:*) cc="$(pm_trim "${line#Cc:}")" ;;
+            To:*) to="$(pm_trim "${line#To:}")"; to_line="$line" ;;
+            Cc:*) cc="$(pm_trim "${line#Cc:}")"; cc_line="$line" ;;
             Subject:*) subject="$(pm_trim "${line#Subject:}")" ;;
             Reply-To-Id:*) reply_to_id="$(pm_trim "${line#Reply-To-Id:}")" ;;
-            *) return 1 ;;
+            *)
+                [[ -n "${PM_PARSE_BAD_LINE_FILE:-}" ]] && printf '%s' "$line" > "$PM_PARSE_BAD_LINE_FILE"
+                return 1
+                ;;
         esac
     done < "$mf"
     (( in_body )) || return 1
@@ -1981,18 +2156,36 @@ pm_parse_reply_file() {
         local -a parts a
         IFS=',' read -ra parts <<< "$to"
         for a in "${parts[@]}"; do
-            [[ "$(pm_trim "$a")" =~ $PM_ADDR_RE ]] || return 1
+            if [[ ! "$(pm_trim "$a")" =~ $PM_ADDR_RE ]]; then
+                [[ -n "${PM_PARSE_BAD_LINE_FILE:-}" ]] && printf '%s' "$to_line" > "$PM_PARSE_BAD_LINE_FILE"
+                return 1
+            fi
         done
     fi
     if [[ -n "$cc" ]]; then
         local -a partsc ac
         IFS=',' read -ra partsc <<< "$cc"
         for ac in "${partsc[@]}"; do
-            [[ "$(pm_trim "$ac")" =~ $PM_ADDR_RE ]] || return 1
+            if [[ ! "$(pm_trim "$ac")" =~ $PM_ADDR_RE ]]; then
+                [[ -n "${PM_PARSE_BAD_LINE_FILE:-}" ]] && printf '%s' "$cc_line" > "$PM_PARSE_BAD_LINE_FILE"
+                return 1
+            fi
         done
     fi
     printf '%s\x1f%s\x1f%s\x1f%s\n' "$to" "$cc" "$subject" "$reply_to_id"
     return 0
+}
+
+# Sanitizes one line of message-body-controlled text for embedding in a
+# flag reason ($NEEDS_OPERATOR/<tid>'s whole content is one line, and
+# `status` prints it on one line too) -- strips control characters
+# (newlines included, so a captured line can never fake a second header or
+# corrupt `status`'s one-line-per-thread listing) and truncates so one long
+# line can't crowd out the fixed prose around it.
+pm_flag_quote_line() {
+    local s
+    s="$(tr -d '[:cntrl:]' <<< "$1")"
+    printf '%s' "${s:0:120}"
 }
 
 pm_harvest_one_file() {
@@ -2000,11 +2193,22 @@ pm_harvest_one_file() {
     local harness="${6:-}" model="${7:-}" network="${8:-}"
     local body_file parsed
     body_file="$(mktemp "$MAIL_ROOT/.postmaster.body.XXXXXX")"
+    local bad_line_file bad_line=""
+    bad_line_file="$(mktemp "$MAIL_ROOT/.postmaster.badline.XXXXXX")"
+    local PM_PARSE_BAD_LINE_FILE="$bad_line_file"
     if ! parsed="$(pm_parse_reply_file "$mf" "$body_file")"; then
+        unset PM_PARSE_BAD_LINE_FILE
         rm -f -- "$body_file"
-        pm_flag "$tid" "malformed reply file $(basename -- "$mf"): unparseable header stanza"
+        bad_line="$(cat -- "$bad_line_file" 2>/dev/null || true)"
+        rm -f -- "$bad_line_file"
+        local reason
+        reason="malformed reply file $(basename -- "$mf"): unparseable header stanza"
+        [[ -n "$bad_line" ]] && reason+=": $(pm_flag_quote_line "$bad_line")"
+        pm_flag "$tid" "$reason"
         return 1
     fi
+    unset PM_PARSE_BAD_LINE_FILE
+    rm -f -- "$bad_line_file"
     local to cc subject reply_to_id
     # \x1f, not \t: bash's `read` collapses runs of IFS-whitespace
     # delimiters (tab counts, even set alone), so an empty Cc field would
@@ -2045,7 +2249,18 @@ pm_harvest_one_file() {
     if [[ "$reply_to_id" == "new" ]]; then
         if [[ -z "$to" || -z "$subject" ]]; then
             rm -f -- "$body_file"
-            pm_flag "$tid" "malformed reply file $(basename -- "$mf"): Reply-To-Id: new requires To and Subject"
+            # The header stanza parsed fine (this is a semantic gap, not a
+            # syntax one) -- there's no single "wrong" line the way a
+            # parse failure has one, so the most useful line to quote is
+            # the first line of the stanza the agent actually wrote,
+            # showing what it submitted instead of leaving the operator to
+            # guess whether To, Subject, or both were missing.
+            local first_line
+            first_line="$(head -n1 -- "$mf" 2>/dev/null || true)"
+            local reason
+            reason="malformed reply file $(basename -- "$mf"): Reply-To-Id: new requires To and Subject"
+            [[ -n "$first_line" ]] && reason+=": $(pm_flag_quote_line "$first_line")"
+            pm_flag "$tid" "$reason"
             return 1
         fi
         cmd=("$MAIL" send --from "@$agent" --to "$to" --subject "$subject" --body "$body_file" --hops "$decremented")
@@ -2368,6 +2583,7 @@ cmd_deliver() {
     # and the real reason buried in the deliver loop's stderr.
     fs_require_scratch_handoff "$HANDOFFS/probe.md" || return 1
     pm_require_kit || return 1
+    pm_require_routing_source || return 1
     pm_require_fleet_check || return 1
 
     mkdir -p -- "$MAIL_ROOT" "$STATE"
@@ -2435,12 +2651,20 @@ cmd_status() {
     (( any_live )) || printf '  (none)\n'
 
     printf '\nneeds-operator:\n'
-    local any_flag=0 tid_f reason
+    local any_flag=0 tid_f reason journal_file events
     for f in "$NEEDS_OPERATOR"/*; do
         [[ -e "$f" ]] || continue
         tid_f="$(basename -- "$f")"
         reason="$(cat -- "$f")"
-        printf '  %s: %s\n' "$tid_f" "$reason"
+        journal_file="$NEEDS_OPERATOR_JOURNAL/$tid_f"
+        events=0
+        # Count only "flag" lines, not "unflag" -- the event count answers
+        # "how many times was this thread flagged", the same question the
+        # header comment's "12 incidents read as 1" complaint is about, not
+        # a raw line count of the whole journal.
+        [[ -f "$journal_file" ]] && \
+            events="$(awk -F'\t' '$2=="flag"{c++} END{print c+0}' "$journal_file")"
+        printf '  %s: %s (%s events)\n' "$tid_f" "$reason" "$events"
         any_flag=1
     done
     (( any_flag )) || printf '  (none)\n'

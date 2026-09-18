@@ -1316,21 +1316,27 @@ unset RESERVED_FLEET_DIR
 export FORK_SANDBOX_FLEET_FILE="$SAVED_FLEET_FILE_STARTUP"
 
 # No fleet file at all is a valid, personas-only fleet -- deliver must run
-# the pass normally rather than treat its absence as an error.
+# the pass normally rather than treat its absence as an error, but must
+# warn on stderr that this is what it's doing (R-startup-contract: a typo'd
+# override looks identical to this deliberate mode from the outside).
 new_root NO_FLEET_FILE_DIR
 export FORK_SANDBOX_FLEET_FILE="$NO_FLEET_FILE_DIR/does-not-exist.yaml"
 new_scratch_root FORK_SANDBOX_MAIL_ROOT
 export FORK_SANDBOX_MAIL_ROOT
 mid="$(send_msg '@bob' '@alice' 'fleet gate no file' 'body' 8)"
-"$postmaster" deliver --project "$PROJECT_DIR" --once > /dev/null 2>&1
+no_fleet_out="$("$postmaster" deliver --project "$PROJECT_DIR" --once 2>&1 > /dev/null)"
 no_fleet_rc=$?
 check "deliver --once skips the fleet gate when no fleet file exists" 0 "$no_fleet_rc"
+contains "one-absent (no fleet file): warns and names personas-only mode" \
+    "$no_fleet_out" "personas-only fleet"
+contains "one-absent (no fleet file): warning names the missing path" \
+    "$no_fleet_out" "$FORK_SANDBOX_FLEET_FILE"
 unset NO_FLEET_FILE_DIR
 export FORK_SANDBOX_FLEET_FILE="$SAVED_FLEET_FILE_STARTUP"
 
 # A fleet made only of handler seats needs no persona file at all, so a
 # fleet.yaml that never mentions a personas dir must not be blocked by one
-# that was simply never created.
+# that was simply never created -- but, same as above, must warn.
 SAVED_PERSONAS_DIR_STARTUP="$FORK_SANDBOX_PERSONAS_DIR"
 new_root NO_PERSONAS_HANDLERS_DIR
 cat > "$NO_PERSONAS_HANDLERS_DIR/noop-handler" <<'STUB'
@@ -1351,9 +1357,13 @@ export FORK_SANDBOX_HANDLERS_DIR="$NO_PERSONAS_HANDLERS_DIR"
 new_scratch_root FORK_SANDBOX_MAIL_ROOT
 export FORK_SANDBOX_MAIL_ROOT
 mid="$(send_msg '@bob' '@handlerseat' 'fleet gate no personas dir' 'body' 8)"
-"$postmaster" deliver --project "$PROJECT_DIR" --once > /dev/null 2>&1
+no_personas_out="$("$postmaster" deliver --project "$PROJECT_DIR" --once 2>&1 > /dev/null)"
 no_personas_rc=$?
 check "deliver --once skips the fleet gate when no personas dir exists" 0 "$no_personas_rc"
+contains "one-absent (no personas dir): warns and names handler-exec-only mode" \
+    "$no_personas_out" "handler-exec seats only"
+contains "one-absent (no personas dir): warning names the missing path" \
+    "$no_personas_out" "$FORK_SANDBOX_PERSONAS_DIR"
 handlerseat_posted=0
 tid="$(thread_of "$mid")"
 for f in "$FORK_SANDBOX_MAIL_ROOT/threads/$tid"/*.msg; do
@@ -1362,6 +1372,38 @@ for f in "$FORK_SANDBOX_MAIL_ROOT/threads/$tid"/*.msg; do
 done
 check "fleet gate no personas dir: handler-only fleet still routes" 0 "$handlerseat_posted"
 unset NO_PERSONAS_FLEET_DIR NO_PERSONAS_HANDLERS_DIR FORK_SANDBOX_HANDLERS_DIR
+export FORK_SANDBOX_FLEET_FILE="$SAVED_FLEET_FILE_STARTUP"
+export FORK_SANDBOX_PERSONAS_DIR="$SAVED_PERSONAS_DIR_STARTUP"
+
+# ============================================================
+printf '\n== deliver startup: both-absent routing-source refusal ==\n'
+# ============================================================
+# Neither a fleet file nor a personas dir means no seat source exists at
+# all -- every message's To:/Cc: expansion would resolve nobody, forever,
+# with no error. This must refuse loudly at startup, naming both resolved
+# paths and both env overrides -- not silently drain the queue.
+new_root BOTH_ABSENT_FLEET_DIR
+new_root BOTH_ABSENT_PERSONAS_DIR
+export FORK_SANDBOX_FLEET_FILE="$BOTH_ABSENT_FLEET_DIR/does-not-exist.yaml"
+export FORK_SANDBOX_PERSONAS_DIR="$BOTH_ABSENT_PERSONAS_DIR/does-not-exist"
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+mid="$(send_msg '@bob' '@alice' 'both absent' 'body' 8)"
+both_absent_out="$("$postmaster" deliver --project "$PROJECT_DIR" --once 2>&1)"
+both_absent_rc=$?
+check "both-absent: deliver --once refuses" 1 "$both_absent_rc"
+contains "both-absent: error names the fleet file path" \
+    "$both_absent_out" "$FORK_SANDBOX_FLEET_FILE"
+contains "both-absent: error names the personas dir path" \
+    "$both_absent_out" "$FORK_SANDBOX_PERSONAS_DIR"
+contains "both-absent: error names the fleet file env override" \
+    "$both_absent_out" "FORK_SANDBOX_FLEET_FILE"
+contains "both-absent: error names the personas dir env override" \
+    "$both_absent_out" "FORK_SANDBOX_PERSONAS_DIR"
+tid="$(thread_of "$mid")"
+check "both-absent: the message was never routed" 0 \
+    "$([[ -e "$FORK_SANDBOX_MAIL_ROOT/.postmaster/routed" ]] && ls "$FORK_SANDBOX_MAIL_ROOT/.postmaster/routed" | wc -l || echo 0)"
+unset BOTH_ABSENT_FLEET_DIR BOTH_ABSENT_PERSONAS_DIR
 export FORK_SANDBOX_FLEET_FILE="$SAVED_FLEET_FILE_STARTUP"
 export FORK_SANDBOX_PERSONAS_DIR="$SAVED_PERSONAS_DIR_STARTUP"
 
