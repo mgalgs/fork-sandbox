@@ -482,4 +482,21 @@ out="$(timeout 12 "$status" "$rd_new" 2>&1)"
 [[ "$out" == *"inbox:    2 addenda"* ]] \
     || { echo "inbox_count counted a mail banner as an addendum: $out"; exit 1; }
 
-echo "28 passed, 0 failed"
+# 11. A run dir carrying pipeline.json (written for every preset run, legacy
+# or composed) does not make status choke, in either plain or --json mode --
+# the allowlist that gates every run-dir read has to know the name.
+new_run_dir
+printf '{"steps":[{"action":"code","harness":"claude","model":"haiku","repeat":1,"network":null,"fix":null}]}\n' \
+    > "$rd_new/pipeline.json"
+printf '0\n' > "$rd_new/exit-code"
+printf '{"branch":"test"}\n' > "$rd_new/summary.json"
+out="$(timeout 12 "$status" "$rd_new" 2>&1)"
+rc=$?
+[[ $rc -eq 0 && "$out" != *"is not a fork-sandbox run file"* ]] \
+    || { echo "plain status choked on a run dir carrying pipeline.json (rc=$rc): $out"; exit 1; }
+json="$(timeout 12 "$status" --json "$rd_new" 2>&1)"
+rc=$?
+[[ $rc -eq 0 && "$json" == '{"branch":"test"}' ]] \
+    || { echo "--json choked on a run dir carrying pipeline.json (rc=$rc): $json"; exit 1; }
+
+echo "29 passed, 0 failed"

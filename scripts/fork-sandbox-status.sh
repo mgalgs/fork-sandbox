@@ -174,7 +174,7 @@ resolve_run_file() {
     local name="$1" path="$run_dir/$1"
     RUN_FILE_PATH=""
     case "$name" in
-        run.env|events.jsonl|sandbox.log|exit-code|summary.txt|summary.json|pid|handoff.md|review-loop.json|maintainer-loop.json) ;;
+        run.env|events.jsonl|sandbox.log|exit-code|summary.txt|summary.json|pid|handoff.md|review-loop.json|maintainer-loop.json|pipeline.json) ;;
         # One file per leg, named by the runner. The leg kinds are
         # enumerated literally and the name is re-checked against the exact
         # pattern: a loose events-*.jsonl would let any name that starts

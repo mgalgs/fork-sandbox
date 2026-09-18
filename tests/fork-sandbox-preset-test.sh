@@ -1414,6 +1414,16 @@ if [[ -n "${rd_a:-}" ]]; then
         "$(jq -r '.sha256' "$rd_a/preset.json")" \
         "$(sha256sum "$rd_a/preset.yaml" | cut -d' ' -f1)"
     check "a noop middle pass does not stop the passes" "3" "$(cat "$count")"
+    check "pipeline.json has one code step" "1" \
+        "$(jq -r '.steps | length' "$rd_a/pipeline.json")"
+    check "pipeline.json's step 0 is the code action" "code" \
+        "$(jq -r '.steps[0].action' "$rd_a/pipeline.json")"
+    check "pipeline.json's step 0 repeat is 3" "3" \
+        "$(jq -r '.steps[0].repeat' "$rd_a/pipeline.json")"
+    check "pipeline.json's step 0 fix is null" "null" \
+        "$(jq -r '.steps[0].fix' "$rd_a/pipeline.json")"
+    check "pipeline.json's step 0 harness is claude" "claude" \
+        "$(jq -r '.steps[0].harness' "$rd_a/pipeline.json")"
 fi
 
 # D. A definition edited between the staging and the run dir -- the race the
@@ -1630,6 +1640,17 @@ if [[ -n "${rd_b:-}" ]]; then
     fi
     contains "run.sh froze the fix seat's own command" \
         "$(grep '^fix_sandbox_cmd=' "$rd_b/run.sh")" "--model haiku"
+    check "pipeline.json's step 0 is the code action with the coder's model" \
+        "code/fable" \
+        "$(jq -r '.steps[0] | "\(.action)/\(.model)"' "$rd_b/pipeline.json")"
+    check "pipeline.json's step 1 is the review action with the reviewer's model" \
+        "review/opus" \
+        "$(jq -r '.steps[1] | "\(.action)/\(.model)"' "$rd_b/pipeline.json")"
+    check "pipeline.json's step 1 repeat is the loop cap" "2" \
+        "$(jq -r '.steps[1].repeat' "$rd_b/pipeline.json")"
+    check "pipeline.json's step 1 fix names the fix seat, distinct from both" \
+        "claude/haiku/2" \
+        "$(jq -r '.steps[1].fix | "\(.harness)/\(.model)/\(.repeat)"' "$rd_b/pipeline.json")"
 fi
 
 # C. A run with no preset emits none of the new state: run.sh and run.env

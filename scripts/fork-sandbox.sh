@@ -4780,6 +4780,106 @@ if [[ "$prompt_overlay_matched" == true ]]; then
         '{dir: $dir, rev: (if $rev == "" then null else $rev end), legs: $legs}' \
         > "$run_dir/prompt-overlay.json"
 fi
+# pipeline.json: the ordered, resolved step array for a preset run, legacy-
+# shaped or composed -- action, seat harness/model, repeat, network (only
+# when sealed), and the fix seat (harness/model/repeat) when it differs from
+# the default. Nothing reads this file yet; a later step's ledger keys off
+# it, so the content has to be right now even without a reader. Steps are
+# appended 0-indexed (JSON convention) from the 1-indexed run_step_* arrays
+# the compile point above built -- the pi-local model-discovery backfill
+# below has to agree with that indexing when it patches step 0's model in
+# place. Written only for a preset run, matching preset.json/
+# prompt-overlay.json's own "no file when there is nothing to say" rule.
+if [[ -n "$preset_name" ]]; then
+    pipeline_steps_json="[]"
+    for ((preset_k = 1; preset_k <= run_step_count; preset_k++)); do
+        case "${run_step_kind[$preset_k]}" in
+            code) pipeline_action="code" ;;
+            review) pipeline_action="review" ;;
+            maintainer) pipeline_action="maintain" ;;
+        esac
+        pipeline_fix_json=null
+        if [[ "$preset_is_legacy_shaped" != true ]]; then
+            pipeline_agent="${preset_step_agent[$preset_k]}"
+            pipeline_harness="${preset_agent_harness[$pipeline_agent]}"
+            pipeline_model_var="s${preset_k}_model"
+            pipeline_model="${!pipeline_model_var}"
+            pipeline_network="${preset_agent_network[$pipeline_agent]}"
+            if [[ "${run_step_kind[$preset_k]}" != code ]] \
+                && { [[ "${preset_step_fix_default[$preset_k]:-}" != "1" ]] \
+                    || [[ "${preset_step_fix_repeat[$preset_k]:-1}" != "1" ]]; }; then
+                pipeline_fix_model_var="s${preset_k}fix_model"
+                pipeline_fix_json="$(jq -n \
+                    --arg harness "${preset_step_fix_harness[$preset_k]}" \
+                    --arg model "${!pipeline_fix_model_var}" \
+                    --argjson repeat "${preset_step_fix_repeat[$preset_k]}" \
+                    '{harness: $harness, model: $model, repeat: $repeat}')"
+            fi
+        else
+            case "${run_step_kind[$preset_k]}" in
+                code)
+                    pipeline_harness="$harness"
+                    pipeline_model="$model"
+                    pipeline_network="$network"
+                    ;;
+                review)
+                    pipeline_harness="$review_harness"
+                    pipeline_model="$review_model"
+                    pipeline_network="$review_network"
+                    if [[ -n "$fix_harness" || "$fix_repeat" != "1" ]]; then
+                        if [[ -n "$fix_harness" ]]; then
+                            pipeline_fix_harness="$fix_harness"
+                            pipeline_fix_model="$fix_model"
+                        else
+                            pipeline_fix_harness="$harness"
+                            pipeline_fix_model="$model"
+                        fi
+                        pipeline_fix_json="$(jq -n \
+                            --arg harness "$pipeline_fix_harness" \
+                            --arg model "$pipeline_fix_model" \
+                            --argjson repeat "$fix_repeat" \
+                            '{harness: $harness, model: $model, repeat: $repeat}')"
+                    fi
+                    ;;
+                maintainer)
+                    pipeline_harness="$maintainer_harness"
+                    pipeline_model="$maintainer_model"
+                    pipeline_network="$maintainer_network"
+                    if [[ -n "$mntfix_harness" || "$mntfix_repeat" != "1" ]]; then
+                        if [[ -n "$mntfix_harness" ]]; then
+                            pipeline_fix_harness="$mntfix_harness"
+                            pipeline_fix_model="$mntfix_model"
+                        else
+                            pipeline_fix_harness="$harness"
+                            pipeline_fix_model="$model"
+                        fi
+                        pipeline_fix_json="$(jq -n \
+                            --arg harness "$pipeline_fix_harness" \
+                            --arg model "$pipeline_fix_model" \
+                            --argjson repeat "$mntfix_repeat" \
+                            '{harness: $harness, model: $model, repeat: $repeat}')"
+                    fi
+                    ;;
+            esac
+        fi
+        pipeline_step_json="$(jq -n \
+            --arg action "$pipeline_action" \
+            --arg harness "$pipeline_harness" \
+            --arg model "$pipeline_model" \
+            --argjson repeat "${run_step_cap[$preset_k]}" \
+            --arg network "$pipeline_network" \
+            --argjson fix "$pipeline_fix_json" \
+            '{action: $action, harness: $harness,
+              model: (if $model == "" then null else $model end),
+              repeat: $repeat,
+              network: (if $network == "sealed" then "sealed" else null end),
+              fix: $fix}')"
+        pipeline_steps_json="$(jq --argjson step "$pipeline_step_json" \
+            '. + [$step]' <<<"$pipeline_steps_json")"
+    done
+    jq -n --argjson steps "$pipeline_steps_json" '{steps: $steps}' \
+        > "$run_dir/pipeline.json"
+fi
 # fs_lock_clone_dir lives in fork-sandbox-lib.sh, shared with the generated
 # runner below, which reacquires the same lock as its own first action.
 
@@ -7182,6 +7282,21 @@ fi
 if [[ -z "$model" && -s "$sandbox_log" ]]; then
     model="$(sed -n 's/^agent-sandboxed: pi against \([^ ]*\) at .*/\1/p' \
         "$sandbox_log" | head -n1)"
+fi
+
+# pipeline.json's step 0 is always the code seat (JSON's 0-indexed twin of
+# run_step_kind[1], which the compile point guarantees is "code" whenever one
+# exists), and the same model this script only just discovered above is what
+# that step's model field owes the reader. -s guards a run that never wrote
+# pipeline.json at all (no preset, or --review-only, whose step 0 is review
+# and so never enters this block regardless).
+if [[ -n "$model" && "${run_step_kind[1]:-}" == code && -s "$run_dir/pipeline.json" ]]; then
+    if jq --arg model "$model" '.steps[0].model = $model' \
+        "$run_dir/pipeline.json" > "$run_dir/pipeline.json.part" 2>/dev/null; then
+        mv -f "$run_dir/pipeline.json.part" "$run_dir/pipeline.json"
+    else
+        rm -f "$run_dir/pipeline.json.part"
+    fi
 fi
 
 # The branch head, read from the clone the one way anything here may read it:
