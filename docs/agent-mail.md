@@ -646,6 +646,7 @@ own thread scans never see it:
 | `harvested/<run-id>` | this run's outbox is collected |
 | `delivered-live/<thread-id>` | one line per message rule 4 confirmed was delivered live at harvest (agent, message id, run id) — an audit trail, not read back by anything |
 | `needs-operator/<thread-id>` | flag file; its content is the reason |
+| `needs-operator-journal/<thread-id>` | append-only history of every `flag`/`unflag` call on that thread (timestamp, kind, keyword, reason) — the count `status` shows next to the current reason; operator-readable, nothing routes on it |
 | `spawns/<thread-id>` | one line per spawn, reset by rule 1 — line count is the **budget** count |
 | `seq/<thread-id>` | one line per spawn, never reset — feeds the branch name |
 | `handoffs/<run-id>.md` | the generated handoff a wake was given |

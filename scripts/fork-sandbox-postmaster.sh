@@ -439,6 +439,12 @@
 #                                   for the routing decision, not read back
 #                                   by anything (pm_ledger_delivered_live)
 #   needs-operator/<thread-id>     flag file; content is the reason
+#   needs-operator-journal/<thread-id>  append-only per-thread history of
+#                                   every pm_flag/pm_unflag call (timestamp,
+#                                   kind, keyword, reason) -- operator-
+#                                   readable event count for `status`
+#                                   (e.g. "needs-operator (7 events)");
+#                                   nothing routes on it
 #   spawns/<thread-id>             one line appended per spawn, reset to
 #                                   empty by rule 1 -- line count is the
 #                                   thread's BUDGET count (rule 3). A
@@ -2054,6 +2060,7 @@ pm_process_message() {
             printf '%s\n' "$u" >> "$seen_file"
         done
     fi
+    local to_reason=""
     if (( ${#fresh_unresolved[@]} )); then
         local unresolved_joined="" u
         for u in "${fresh_unresolved[@]}"; do
@@ -2061,31 +2068,42 @@ pm_process_message() {
             unresolved_joined+="$u"
         done
         pm_event "route-dead thread=${tid:0:8} unresolved=${#fresh_unresolved[@]}"
-        # A hops/budget gate on this same message is about to flag the
-        # thread too (below), and pm_flag overwrites -- so when both fire
-        # on one message, let the gate reason win rather than silently
-        # discard it the instant this block runs first.
-        [[ -z "$gate_reason" ]] && pm_flag "$tid" "unresolvable To: $unresolved_joined at $mid"
+        to_reason="unresolvable To: $unresolved_joined at $mid"
     fi
 
     # Cc's equivalent of the To: block above -- an @-shaped Cc name that
     # never resolved means an intended OBSERVER, not an addressee, silently
     # never sees the thread; the reason says "via Cc" so the operator knows
     # which. fresh_unresolved_cc is only ever non-empty when gate_reason is
-    # empty (see the Cc-resolution block above), so there is no gate-vs-Cc
-    # race to arbitrate here the way there is for To: above -- whichever of
-    # this and a later flag call in this same pass runs last still wins,
-    # per pm_flag's own overwrite semantics, same as any other collision.
-    # This flag never wakes anything: reaching a live seat by Cc is
-    # rule 0's job (wake-on-cc, triage), decided independently of whether
-    # any OTHER Cc name on the same message resolved.
+    # empty (see the Cc-resolution block above). This flag never wakes
+    # anything: reaching a live seat by Cc is rule 0's job (wake-on-cc,
+    # triage), decided independently of whether any OTHER Cc name on the
+    # same message resolved.
+    local cc_reason=""
     if (( ${#fresh_unresolved_cc[@]} )); then
         local unresolved_cc_joined="" u
         for u in "${fresh_unresolved_cc[@]}"; do
             [[ -n "$unresolved_cc_joined" ]] && unresolved_cc_joined+=", "
             unresolved_cc_joined+="$u"
         done
-        pm_flag "$tid" "unresolvable Cc: $unresolved_cc_joined at $mid"
+        cc_reason="unresolvable Cc: $unresolved_cc_joined at $mid"
+    fi
+
+    # A hops/budget gate on this same message is about to flag the thread
+    # too (below), and pm_flag overwrites -- so when a gate fires, let its
+    # reason win rather than either of these. When BOTH a To: name and a
+    # Cc: name are fresh-unresolved on the same message, merge them into
+    # one flag call instead of two: calling pm_flag twice would let the
+    # second call silently erase the first reason, and since UNRESOLVED_TO/
+    # UNRESOLVED_CC dedup each name after this pass, the erased reason can
+    # never come back on a later message either.
+    if [[ -z "$gate_reason" ]]; then
+        local combined_reason="$to_reason"
+        if [[ -n "$cc_reason" ]]; then
+            [[ -n "$combined_reason" ]] && combined_reason+="; "
+            combined_reason+="$cc_reason"
+        fi
+        [[ -n "$combined_reason" ]] && pm_flag "$tid" "$combined_reason"
     fi
 
     if [[ -n "$gate_reason" ]]; then
@@ -2253,16 +2271,20 @@ pm_harvest_one_file() {
         if [[ -z "$to" || -z "$subject" ]]; then
             rm -f -- "$body_file"
             # The header stanza parsed fine (this is a semantic gap, not a
-            # syntax one) -- there's no single "wrong" line the way a
-            # parse failure has one, so the most useful line to quote is
-            # the first line of the stanza the agent actually wrote,
-            # showing what it submitted instead of leaving the operator to
-            # guess whether To, Subject, or both were missing.
-            local first_line
-            first_line="$(head -n1 -- "$mf" 2>/dev/null || true)"
+            # syntax one), and To/Subject are already parsed above -- name
+            # whichever is actually missing directly rather than quoting
+            # the stanza's first line, which is very often just
+            # "Reply-To-Id: new" itself and tells the operator nothing.
+            local -a missing=()
+            [[ -z "$to" ]] && missing+=("To")
+            [[ -z "$subject" ]] && missing+=("Subject")
+            local missing_joined="" m
+            for m in "${missing[@]}"; do
+                [[ -n "$missing_joined" ]] && missing_joined+=", "
+                missing_joined+="$m"
+            done
             local reason
-            reason="malformed reply file $(basename -- "$mf"): Reply-To-Id: new requires To and Subject"
-            [[ -n "$first_line" ]] && reason+=": $(pm_flag_quote_line "$first_line")"
+            reason="malformed reply file $(basename -- "$mf"): Reply-To-Id: new requires To and Subject (missing: $missing_joined)"
             pm_flag "$tid" "$reason"
             return 1
         fi

@@ -625,6 +625,28 @@ check "unresolvable-Cc+hops: the hops reason wins, not the Cc reason" \
 check "unresolvable-Cc+hops: exactly one flag event for the message, not two" 1 \
     "$(grep -c -- "^pm flag thread=$short_gate_cc " "$work/once.out")"
 
+# A single message with BOTH an unresolvable To: name and an unresolvable
+# Cc: name must not let the Cc flag call silently erase the To: reason --
+# pm_flag overwrites, and UNRESOLVED_TO/UNRESOLVED_CC dedup means a
+# clobbered reason can never come back on a later message either. Both
+# reasons must survive in the one flag call this message produces.
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+mid_both="$(send_msg '@alice' '@bob,@notoname' 'both to and cc unresolvable' 'body' 8 '@noccname')"
+tid_both="$(thread_of "$mid_both")"
+short_both="${tid_both:0:8}"
+: > "$STUB_ARGV_LOG"
+once
+check "both To+Cc unresolvable: the good To seat still wakes" 1 \
+    "$(grep -c -- "^sbx-mail-$short_both-bob-" "$STUB_ARGV_LOG")"
+both_flag="$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid_both" 2>/dev/null)"
+contains "both To+Cc unresolvable: flag reason keeps the To: reason" \
+    "$both_flag" "unresolvable To: @notoname at $mid_both"
+contains "both To+Cc unresolvable: flag reason keeps the Cc: reason" \
+    "$both_flag" "unresolvable Cc: @noccname at $mid_both"
+check "both To+Cc unresolvable: exactly one flag event for the message, not two" 1 \
+    "$(grep -c -- "^pm flag thread=$short_both " "$work/once.out")"
+
 # ============================================================
 printf '\n== @operator in To: is never treated as unresolvable (rule 0) ==\n'
 # ============================================================
@@ -1160,13 +1182,14 @@ check "harvest: second scan over an already-harvested run posts nothing new" \
     "$msg_count_before" "$msg_count_after"
 
 # ============================================================
-printf '\n== harvest: Reply-To-Id: new missing To/Subject flags with the quoted first line ==\n'
+printf '\n== harvest: Reply-To-Id: new missing To/Subject names which field is missing ==\n'
 # ============================================================
 # Unlike the unparseable-stanza case above, this header stanza parses
-# fine -- it is a semantic gap (Reply-To-Id: new requires To and Subject,
-# neither given), so there's no single "bad" line to point at the way a
-# parse failure has one. The quoted text is instead the first line of
-# what the agent actually wrote, so the operator sees what was submitted.
+# fine -- it is a semantic gap (Reply-To-Id: new requires To and Subject).
+# To and Subject are already parsed by this point, so the reason names
+# whichever is actually missing directly rather than quoting the stanza's
+# first line -- which, for a bare "Reply-To-Id: new" stanza, would just
+# repeat the fixed prose back at the operator and say nothing new.
 
 new_scratch_root FORK_SANDBOX_MAIL_ROOT
 export FORK_SANDBOX_MAIL_ROOT
@@ -1183,8 +1206,32 @@ once
 new_bad_flag="$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid_new_bad" 2>/dev/null)"
 contains "Reply-To-Id: new missing To/Subject: flag names the failure" \
     "$new_bad_flag" "Reply-To-Id: new requires To and Subject"
-contains "Reply-To-Id: new missing To/Subject: flag quotes the offending first line" \
-    "$new_bad_flag" "Reply-To-Id: new"
+contains "Reply-To-Id: new missing both To and Subject: reason names both fields" \
+    "$new_bad_flag" "(missing: To, Subject)"
+
+# Subject given, To missing -- the reason must name only the field that is
+# actually absent, not both, proving this reads the parsed fields rather
+# than quoting the stanza's text back.
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+mid_new_bad2="$(send_msg '@alice' '@bob' 'reply-to-id new missing to only' 'body' 8)"
+tid_new_bad2="$(thread_of "$mid_new_bad2")"
+once
+run_env_new_bad2="$(env_file_for_agent bob)"
+run_dir_new_bad2="$(sed -n 's/^RUN_DIR=//p' "$run_env_new_bad2")"
+mkdir -p -- "$run_dir_new_bad2/outbox"
+printf 'Reply-To-Id: new\nSubject: only subject given\n\nbody\n' > "$run_dir_new_bad2/outbox/mail-1.md"
+printf '0\n' > "$run_dir_new_bad2/exit-code"
+printf '{}\n' > "$run_dir_new_bad2/summary.json"
+once
+new_bad_flag2="$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid_new_bad2" 2>/dev/null)"
+contains "Reply-To-Id: new missing only To: reason names just To" \
+    "$new_bad_flag2" "(missing: To)"
+if [[ "$new_bad_flag2" == *"missing: To, Subject"* ]]; then
+    no "Reply-To-Id: new missing only To: reason does not also claim Subject is missing" "$new_bad_flag2"
+else
+    ok "Reply-To-Id: new missing only To: reason does not also claim Subject is missing"
+fi
 
 # ============================================================
 printf '\n== malformed reply file: quoted line is sanitized (control chars stripped, overlength truncated) ==\n'
@@ -1551,7 +1598,7 @@ contains "both-absent: error names the personas dir env override" \
     "$both_absent_out" "FORK_SANDBOX_PERSONAS_DIR"
 tid="$(thread_of "$mid")"
 check "both-absent: the message was never routed" 0 \
-    "$([[ -e "$FORK_SANDBOX_MAIL_ROOT/.postmaster/routed" ]] && ls "$FORK_SANDBOX_MAIL_ROOT/.postmaster/routed" | wc -l || echo 0)"
+    "$([[ -e "$FORK_SANDBOX_MAIL_ROOT/.postmaster/routed" ]] && find "$FORK_SANDBOX_MAIL_ROOT/.postmaster/routed" -mindepth 1 | wc -l || echo 0)"
 unset BOTH_ABSENT_FLEET_DIR BOTH_ABSENT_PERSONAS_DIR
 export FORK_SANDBOX_FLEET_FILE="$SAVED_FLEET_FILE_STARTUP"
 export FORK_SANDBOX_PERSONAS_DIR="$SAVED_PERSONAS_DIR_STARTUP"
@@ -2657,6 +2704,13 @@ contains "skip verdict: triaged line names the message and agent" \
 contains "skip verdict: triage-skip event names alice on stdout" \
     "$(cat "$work/once.out")" "pm triage-skip thread=${tid:0:8} agent=alice"
 contains "status prints the triaged count" "$("$postmaster" status 2>&1)" "triaged: 1"
+# alice resolved to a real seat, was considered, and was declined by the
+# triage classifier -- that is not the same thing as an @-shaped name that
+# never resolved to any seat at all, and must never flag as unresolvable
+# (the handoff's own trap: "resolved, considered, declined -- never
+# flagged").
+check "skip verdict: a triage-skipped Cc candidate is not flagged as unresolvable" "" \
+    "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid" 2>/dev/null || true)"
 
 # --- scenario 3: a To candidate is never classified, even when the
 #     stub would have said skip ---
