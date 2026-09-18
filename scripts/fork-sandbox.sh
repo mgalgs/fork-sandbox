@@ -5485,6 +5485,23 @@ fi
 # the runner, run.env and the summary all read a concrete
 # maintainer_harness/maintainer_network rather than branching on
 # maintainer_harness_given at every use site.
+#
+# This read of maintainer_loop_cap (and every other one below it in this
+# launcher) survives the cap-scalar retirement on purpose: it is not a "does
+# this run have a maintainer step" gate that a run_step_kind scan could
+# replace, it decides whether to build the fixed-name legacy maintainer seat
+# (maintainer_harness/maintainer_sandbox_cmd/maintainer-prompt.md/...) that
+# only a legacy-shaped run's fixed maintainer step reads. A composed
+# maintainer step is seated by its own "s<K>_*" values instead and must
+# never touch these fixed names or their files -- composed output stays
+# byte-for-byte as today (handoff, "Out of scope"). Converting this to a
+# bare run_step_kind == maintainer scan would fire for a composed maintainer
+# step too and build maintainer-prompt.md for it, which is the regression
+# the byte-for-byte constraint forbids. review_loop_cap/maintainer_loop_cap
+# are refused outright for any composed preset (see the "cannot be combined
+# with preset" checks above, near preset_is_legacy_shaped), so a bare
+# "> 0" read of either is already exactly "legacy-shaped and this tier is
+# on" -- the guard a scan would have to spell out longer, not a stray global.
 maintainer_preamble_harness="$harness"
 maintainer_preamble_network="$preamble_network"
 if (( maintainer_loop_cap > 0 )); then
@@ -5720,6 +5737,9 @@ fix_prompt_header=""
 review_verdict_file=""
 maintainer_prompt=""
 maintainer_verdict_file=""
+# Survives the cap-scalar retirement -- see the justification on
+# maintainer_loop_cap's read above (fixed-name legacy artifact, not a
+# run_step_kind gate a composed step could also satisfy).
 if (( review_loop_cap > 0 )); then
     review_prompt="$run_dir/review-prompt.md"
     review_verdict_file="$clone_dir/.git/review-verdict.md"
@@ -6454,6 +6474,10 @@ fi
 # placement of --model is per-harness, and the maintainer model always
 # exists (it is required), so this is the review fallback's same walks
 # without its empty-model branch.
+# Survives the cap-scalar retirement, same reason as the earlier reads:
+# maintainer_sandbox_cmd is the fixed legacy maintainer seat's own command,
+# never read by a composed maintainer step (which builds "s<K>_sandbox_cmd"
+# instead), so this stays a legacy-only read rather than a run_step_kind scan.
 if (( maintainer_loop_cap > 0 )); then
     if [[ "$maintainer_harness_given" == true ]]; then
         fs_build_sandbox_cmd mnt maintainer_sandbox_cmd
@@ -6778,10 +6802,11 @@ started_at="$(date +%s)"
     printf 'review_loop_cap=%q\n' "$review_loop_cap"
     # Every maintainer-tier variable the runner reads is emitted only when
     # the loop is on, so a no-maintainer run.sh stays byte-identical to one
-    # built before the tier existed. run_leg and the maintainer loop below
-    # guard their references to match: kind "maintainer" is only ever run
-    # when this block emitted its state, and the loop itself tests
-    # ${maintainer_loop_cap:-0}.
+    # built before the tier existed. run_leg and the walker below guard
+    # their references to match: kind "maintainer" is only ever walked when
+    # this block emitted its state, since the run_step_* compile point
+    # (above) only adds a legacy maintainer step when ${maintainer_loop_cap:-0}
+    # is non-zero.
     if (( maintainer_loop_cap > 0 )); then
         printf 'maintainer_loop_cap=%q\n' "$maintainer_loop_cap"
         printf 'maintainer_harness=%q\n' "$maintainer_harness"
@@ -6803,7 +6828,7 @@ started_at="$(date +%s)"
     fi
     # The preset-only pipeline knobs, emitted only when set so a run without
     # them stays byte-identical to one built before they existed. run_leg and
-    # the loop bodies below guard every read with ${...:-} defaults to match.
+    # the walker below guard every read with ${...:-} defaults to match.
     [[ "$code_repeat" == "1" ]] || printf 'code_repeat=%q\n' "$code_repeat"
     [[ "$fix_repeat" == "1" ]] || printf 'fix_repeat=%q\n' "$fix_repeat"
     [[ "$mntfix_repeat" == "1" ]] || printf 'mntfix_repeat=%q\n' "$mntfix_repeat"
@@ -6939,6 +6964,11 @@ started_at="$(date +%s)"
     printf 'review_sandbox_cmd=('
     printf '%q ' "${review_sandbox_cmd[@]}"
     printf ')\n'
+    # Survives the cap-scalar retirement, same reason as the earlier reads:
+    # maintainer_sandbox_cmd only exists for the fixed legacy maintainer
+    # seat, so this stays a legacy-only emission rather than a
+    # run_step_kind scan a composed maintainer step (its own
+    # "s<K>_sandbox_cmd") would also match.
     if (( maintainer_loop_cap > 0 )); then
         printf 'maintainer_sandbox_cmd=('
         printf '%q ' "${maintainer_sandbox_cmd[@]}"
@@ -7751,11 +7781,11 @@ else
     rm -f "$run_dir/run.env.part"
 fi
 
-# Shared with the review loop below: the running total of every extra
-# session this run pays for beyond the implement leg, and whether that total
-# is still honest. A continuation leg's cost lands here first; a review-loop
-# leg's cost lands here too, once that section runs -- one accumulator, so
-# total_cost_usd at the very end is never short a leg.
+# Shared with the walker below: the running total of every extra session
+# this run pays for beyond the implement leg, and whether that total is
+# still honest. A continuation leg's cost lands here first; a review or
+# maintainer step's leg cost lands here too, once the walker runs -- one
+# accumulator, so total_cost_usd at the very end is never short a leg.
 loop_cost_sum=0
 loop_cost_unknown=0
 
@@ -7770,12 +7800,12 @@ loop_cost_unknown=0
 # ordinary way this ends.
 #
 # $rc is OVERWRITTEN by each continuation's own exit code, deliberately: the
-# review loop below (and the final exit code) must judge the run by its LAST
+# walker below (and the final exit code) must judge the run by its LAST
 # coding leg, not its first. It sits here, after the implement leg's own
 # run_cost/run_usage accounting above, so that accounting keeps meaning the
 # implement leg alone -- exactly as it did before this feature existed --
 # while every continuation's cost instead joins loop_cost_sum, the same
-# accumulator the review loop below adds its own legs to.
+# accumulator the walker below adds its own legs to.
 refresh_ended=""
 continuations_json='[]'
 refresh_leg_n=0
@@ -8051,12 +8081,18 @@ if [[ "$refresh_enabled" == "1" ]]; then
     fi
 fi
 
-# ------------------------------------------------------------- review loop --
-# --review-loop N: review the commits the session just made in a FRESH session
-# of the same harness and (when supplied) --review-model, and when that review
-# reports problems, hand
-# them to a fresh session that fixes them. Repeat until the review approves,
-# until a fix leg stops making progress, or until N iterations have run.
+# ----------------------------------------------------------------- walker --
+# run_leg (below) and the cur_* walker further down are the one driver for
+# every run's review/maintain/fix legs, legacy-translated or composed alike
+# (see the run_step_* compile point and the walker's own header comment).
+# For a legacy run -- --review-loop N and/or --maintainer-loop N -- this
+# plays out exactly as before: review (or maintain) the commits the coding
+# leg just made in a FRESH session of the same harness and (when supplied)
+# --review-model/--maintainer-model, and when that review reports problems,
+# hand them to a fresh session that fixes them. Repeat until the review
+# approves, until a fix leg stops making progress, or until N iterations have
+# run. A composed preset's own review/maintain/fix steps walk the same code
+# path with their own per-step seats (see the compile point above).
 #
 # It sits here on purpose: everything above is the implement leg's accounting
 # and, when --refresh-at ran any continuations, the refresh loop's -- including
@@ -8558,6 +8594,15 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count; cur_step_no++)); do
         fi
         cur_prompt_base="$cur_prompt"
         [[ -n "$cur_prev" && -f "$cur_prev" && -n "$cur_inner_prompt" ]] && cur_prompt_base="$cur_inner_prompt"
+        # A legacy iteration's prompt is rebuilt every pass -- a maintainer
+        # pass concatenates a whole review verdict into it -- so it keeps the
+        # deleted loops' build-then-rename discipline (see review_prompt's
+        # own .part+mv above): build beside the destination and rename, so a
+        # reader never sees a half-assembled file. A composed step's prompt
+        # was already written directly before this walker existed; that is
+        # unchanged here.
+        cur_prompt_iter_out="$cur_prompt_iter"
+        [[ "$cur_legacy" == 1 ]] && cur_prompt_iter_out="$cur_prompt_iter.part"
         {
             cat -- "$cur_prompt_base"
             if [[ "$cur_legacy" == 1 && -n "$cur_coding_rc" && "$cur_coding_rc" != "0" ]]; then
@@ -8635,7 +8680,10 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count; cur_step_no++)); do
                     fi
                 fi
             fi
-        } > "$cur_prompt_iter"
+        } > "$cur_prompt_iter_out"
+        if [[ "$cur_legacy" == 1 ]]; then
+            mv -- "$cur_prompt_iter_out" "$cur_prompt_iter"
+        fi
         if [[ "$cur_legacy" != 1 && "$cur_kind" == maintainer ]]; then
             if [[ -n "$cur_prev" && -f "$cur_prev" ]]; then
                 printf '\n---\n\n## The previous verdict\n\n' >> "$cur_prompt_iter"
@@ -8749,38 +8797,37 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count; cur_step_no++)); do
         fi
         cur_iters="$(jq -cn --argjson old "$cur_iters" --argjson cur "$(cur_iter_record)" '$old + $cur')"
         cur_save
-        done
-        [[ -n "$cur_ended" ]] || cur_ended=cap
-        cur_save
-        if [[ "$cur_legacy" == 1 ]]; then
-            if [[ "$cur_kind" == maintainer ]]; then
-                maintainer_loop_ended="$cur_ended"
-                maintainer_loop_detail="$cur_detail"
-                printf 'fork-sandbox: maintainer loop ended: %s\n' "$cur_ended"
-            else
-                review_loop_ended="$cur_ended"
-                review_loop_detail="$cur_detail"
-                printf 'fork-sandbox: review loop ended: %s\n' "$cur_ended"
-            fi
-        fi
-        if [[ "$cur_legacy" == 1 && "$cur_kind" == review && "$mode" == "review-only" ]]; then
-            case "$cur_ended" in
-                approved) printf 'fork-sandbox: review-only: APPROVED\n' ;;
-                findings) printf 'fork-sandbox: review-only: FINDINGS (%s cited)\n' "$cur_findings" ;;
-            esac
-            printf 'fork-sandbox: review verdict: %s\n' "$run_dir/review-verdict-1.md"
-            run_cost="$leg_cost"
-            run_usage="$leg_usage"
-            run_error="$leg_error"
-            if [[ "$run_cost" =~ ^-?[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?$ ]]; then
-                run_cost_fmt="$(printf '%.6f' "$run_cost")"
-            else
-                run_cost_fmt=""
-            fi
-            [[ "$cur_ended" == "harness-error" ]] && rc=1
-        fi
     done
-
+    [[ -n "$cur_ended" ]] || cur_ended=cap
+    cur_save
+    if [[ "$cur_legacy" == 1 ]]; then
+        if [[ "$cur_kind" == maintainer ]]; then
+            maintainer_loop_ended="$cur_ended"
+            maintainer_loop_detail="$cur_detail"
+            printf 'fork-sandbox: maintainer loop ended: %s\n' "$cur_ended"
+        else
+            review_loop_ended="$cur_ended"
+            review_loop_detail="$cur_detail"
+            printf 'fork-sandbox: review loop ended: %s\n' "$cur_ended"
+        fi
+    fi
+    if [[ "$cur_legacy" == 1 && "$cur_kind" == review && "$mode" == "review-only" ]]; then
+        case "$cur_ended" in
+            approved) printf 'fork-sandbox: review-only: APPROVED\n' ;;
+            findings) printf 'fork-sandbox: review-only: FINDINGS (%s cited)\n' "$cur_findings" ;;
+        esac
+        printf 'fork-sandbox: review verdict: %s\n' "$run_dir/review-verdict-1.md"
+        run_cost="$leg_cost"
+        run_usage="$leg_usage"
+        run_error="$leg_error"
+        if [[ "$run_cost" =~ ^-?[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?$ ]]; then
+            run_cost_fmt="$(printf '%.6f' "$run_cost")"
+        else
+            run_cost_fmt=""
+        fi
+        [[ "$cur_ended" == "harness-error" ]] && rc=1
+    fi
+    done
 
 # The other half of the deferral above: for a --review-loop or --refresh-at
 # run the run is over here -- every loop ran, or was skipped and said why --
