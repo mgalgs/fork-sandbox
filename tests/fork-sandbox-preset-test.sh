@@ -591,6 +591,67 @@ refuses "a composed pipeline preset is refused at launch even with no conflictin
     "run engine that walks an arbitrary step list isn't built yet" \
     --preset composed
 
+# A composed step's own seat on codex, and a composed step's fix seat on
+# codex, hit the same missing-credential gap the legacy "codex fix seat is
+# not yet supported" refusal exists to name (see codex-fix.yaml below) --
+# but that refusal only reads the legacy fix_harness/mntfix_harness
+# scalars, so a composed pipeline needs its own check. The unconditional
+# refusal above already blocks either launch today; this pins the more
+# specific message so it is not silently lost once that refusal lifts.
+cat > "$presets_dir/composed-codex-step.yaml" <<'EOF'
+agents:
+  coder:
+    harness: claude
+    model: sonnet
+  reviewer:
+    harness: codex
+    model: gpt-5.6-sol
+pipeline:
+  - action: code
+    agent: coder
+  - action: review
+    repeat: 1
+    agent: coder
+  - action: review
+    repeat: 1
+    agent: reviewer
+  - action: maintain
+    repeat: 2
+    agent: reviewer
+EOF
+refuses "a composed pipeline step seated on codex is refused by name" \
+    "composed pipeline step on codex is not yet" \
+    --preset composed-codex-step
+
+cat > "$presets_dir/composed-codex-fix.yaml" <<'EOF'
+agents:
+  coder:
+    harness: claude
+    model: sonnet
+  reviewer:
+    harness: claude
+    model: opus
+  fixer:
+    harness: codex
+    model: gpt-5.6-sol
+pipeline:
+  - action: code
+    agent: coder
+  - action: review
+    repeat: 1
+    agent: coder
+  - action: review
+    repeat: 1
+    agent: reviewer
+    fix_agent: fixer
+  - action: maintain
+    repeat: 2
+    agent: reviewer
+EOF
+refuses "a composed pipeline step's fix seat on codex is refused by name" \
+    "composed pipeline step on codex is not yet" \
+    --preset composed-codex-fix
+
 cat > "$presets_dir/composed-reviewfirst.yaml" <<'EOF'
 agents:
   coder:

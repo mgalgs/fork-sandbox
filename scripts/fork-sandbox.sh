@@ -3050,6 +3050,28 @@ if [[ -n "$preset_file" && "$preset_is_legacy_shaped" != true ]]; then
             exit 1
         fi
     fi
+    # A composed step or its fix seat on codex has the same credential gap
+    # the "codex fix seat is not yet supported" refusal above names for the
+    # legacy fix seats: the runner writes CODEX_AUTH_JSON only into
+    # harness_env_file/rev_harness_env_file/mnt_harness_env_file -- the
+    # three fixed seats -- never into an "s<K>_harness_env_file" or
+    # "s<K>fix_harness_env_file" fs_resolve_harness names for a composed
+    # step. The unconditional refusal just below already blocks every
+    # composed launch today, but name this case specifically so the
+    # message survives once that refusal lifts -- otherwise the gap would
+    # surface as a leg launching codex with no credential file instead of
+    # failing here, where the problem is nameable.
+    for ((preset_k = 1; preset_k <= preset_step_count; preset_k++)); do
+        preset_k_agent="${preset_step_agent[$preset_k]}"
+        if [[ "${preset_agent_harness[$preset_k_agent]}" == codex \
+            || "${preset_step_fix_harness[$preset_k]:-}" == codex ]]; then
+            echo "Error: preset '$preset_name' seats step $preset_k (or its fix" >&2
+            echo "agent) on codex -- a composed pipeline step on codex is not yet" >&2
+            echo "supported; the runner does not write a per-step codex credential." >&2
+            echo "Seat that step's agent on claude or pi, or edit the preset." >&2
+            exit 1
+        fi
+    done
     # The checks above only refuse specific flag combinations; a composed
     # preset invoked with none of them (the ordinary way to use one) falls
     # through them untouched. The run engine that would actually walk its
