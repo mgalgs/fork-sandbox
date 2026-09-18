@@ -4450,12 +4450,30 @@ fi
 if [[ "$preset_is_legacy_shaped" != true ]]; then
     for ((preset_k = 1; preset_k <= preset_step_count; preset_k++)); do
         preset_k_agent="${preset_step_agent[$preset_k]}"
+        # Every fixed seat above resolves its model through resolve_model
+        # (alias file + codex cache validation) before fs_resolve_harness
+        # ever sees it; a composed step's model must go through the same
+        # gate, or a preset agent's alias (e.g. "sonnet") reaches the
+        # sandbox command unresolved while the identical agent inside a
+        # legacy-shaped preset gets the real model id, and a bad codex
+        # model id on a composed step survives to the clone instead of
+        # failing here the way every other seat's does.
+        preset_k_model="${preset_agent_model[$preset_k_agent]}"
+        preset_k_model_given=false
+        [[ -n "$preset_k_model" ]] && preset_k_model_given=true
+        resolve_model preset_k_model "$preset_k_model_given" \
+            "${preset_agent_harness[$preset_k_agent]}" || exit 1
         fs_resolve_harness "${preset_agent_harness[$preset_k_agent]}" \
-            "${preset_agent_model[$preset_k_agent]}" "s${preset_k}" \
+            "$preset_k_model" "s${preset_k}" \
             "${preset_agent_network[$preset_k_agent]}"
         if [[ "${preset_step_action[$preset_k]}" != code ]]; then
+            preset_k_fix_model="${preset_step_fix_model[$preset_k]}"
+            preset_k_fix_model_given=false
+            [[ -n "$preset_k_fix_model" ]] && preset_k_fix_model_given=true
+            resolve_model preset_k_fix_model "$preset_k_fix_model_given" \
+                "${preset_step_fix_harness[$preset_k]}" || exit 1
             fs_resolve_harness "${preset_step_fix_harness[$preset_k]}" \
-                "${preset_step_fix_model[$preset_k]}" "s${preset_k}fix" \
+                "$preset_k_fix_model" "s${preset_k}fix" \
                 "${preset_step_fix_network[$preset_k]}"
         fi
     done
@@ -4508,11 +4526,18 @@ if [[ "$preset_is_legacy_shaped" != true ]]; then
     done
 else
     run_step_k=1
-    run_step_kind[run_step_k]="code"
-    run_step_idx[run_step_k]=""
-    run_step_cap[run_step_k]="${code_repeat:-1}"
-    run_step_prompt[run_step_k]=""
-    run_step_k=$(( run_step_k + 1 ))
+    # --review-only runs one review leg over an existing branch and has no
+    # coding leg (enforced further up, and skipped at run time by every
+    # reader of review_only) -- so the spine must not claim one either, or
+    # the walk that reads this array will launch a coding leg --review-only
+    # promised never to run.
+    if [[ "$review_only" != true ]]; then
+        run_step_kind[run_step_k]="code"
+        run_step_idx[run_step_k]=""
+        run_step_cap[run_step_k]="${code_repeat:-1}"
+        run_step_prompt[run_step_k]=""
+        run_step_k=$(( run_step_k + 1 ))
+    fi
     if [[ "$review_loop_cap" != "0" ]]; then
         run_step_kind[run_step_k]="review"
         run_step_idx[run_step_k]=""
@@ -7702,6 +7727,11 @@ run_leg() {
     if [[ -n "$step_idx" ]]; then
         case "$kind" in
         fix | mntfix) leg_tag="${step_idx}-fix-$n" ;;
+        # run_leg's own kind vocabulary says "maintainer" (the accounting
+        # semantics decision 3 keeps); decision 4's composed artifact names
+        # spell the parser's action word instead ("maintain"), matching the
+        # status-allowlist globs written against that spelling.
+        maintainer) leg_tag="${step_idx}-maintain-$n" ;;
         *) leg_tag="${step_idx}-$kind-$n" ;;
         esac
     else
