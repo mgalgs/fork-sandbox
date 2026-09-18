@@ -1293,6 +1293,179 @@ fs_read_claude_credential() {
     return 0
 }
 
+# Picks a Claude credential from an operator-configured pool when neither
+# --claude-credentials nor CLAUDE_CREDENTIALS pinned one, so a run does not
+# default to an account that may be nearly exhausted. The pool
+# (CLAUDE_CREDENTIAL_POOL, colon-separated absolute paths) and the health
+# policy (CLAUDE_HEADROOM_HOOK, a plugin name) both live in claude.env; this
+# repo carries only the mechanism -- which account is healthy is answered
+# entirely by the operator's own hook, kept outside this repo so no real
+# quota tool or account name is ever named here (see CLAUDE.md).
+#
+# A lib function rather than code inlined at a call site because a Claude
+# credential is read at TWO independent places -- fork-sandbox.sh's local
+# path and fork-sandbox-k8s.sh's direct entry point -- and this repo has
+# shipped a fix that covered only one of a pair of call sites before. One
+# function means the config-error checks and the hook contract cannot
+# drift between the two.
+#
+# Takes the config dir (claude.env lives under it) and the calling script's
+# own directory, and resolves the hook the identical way
+# fork-sandbox-k8s.sh's resolve_platform() resolves a k8s platform plugin:
+# PATH first (so a checkout works before install.sh has run), then beside
+# the calling script.
+#
+# Config errors -- CLAUDE_CREDENTIALS set alongside CLAUDE_CREDENTIAL_POOL,
+# only one of POOL/HOOK set, a malformed pool entry, a malformed hook name
+# -- are refused loudly here, never resolved silently: two sources for one
+# fact, or half a mechanism, is a setup mistake the operator needs to see,
+# not code guessing which half was meant. A pool entry is a path, but the
+# hook is a NAME rather than a path for the same reason a `configure`
+# discoverer cannot name a path (docs/configure.md, "The allowlist"): config
+# a blanket-approved script trusts unconditionally must not be able to
+# point it at an arbitrary executable outside the plugin convention.
+#
+# Prints the chosen path on stdout and returns 0 when the pool picked one.
+# Prints nothing and returns 0 when there is no pool configured, or when the
+# hook itself failed (a warning is printed to stderr in that case) -- either
+# way the caller falls through to today's default chain, because a crashed
+# plugin must not brick every launch on the machine. Returns 1, with the
+# error already on stderr, on any config error, on a hook exit-0 contract
+# violation, or when the hook reports "no routable candidate" (exit 2) --
+# all three are hard errors, because a balanced choice is as
+# operator-authored as the explicit flag, and a broken contract must be
+# loud rather than silently falling back.
+#
+# The chosen path is NOT validated here beyond the hook's own contract
+# (member of the pool, exactly one line) -- it flows back through the
+# caller's existing $FS_REALPATH -m / fs_reject_unsafe_chars / fail-loud
+# existence check, the same path an explicit --claude-credentials or
+# CLAUDE_CREDENTIALS takes, so there is exactly one place that decides what
+# makes a credential path acceptable.
+fs_balance_claude_credential() {
+    local config_dir="$1" script_dir="$2"
+    local claude_env="$config_dir/claude.env"
+    local pinned pool_raw hook_name
+    pinned="$(fs_read_env_value "$claude_env" CLAUDE_CREDENTIALS || true)"
+    pool_raw="$(fs_read_env_value "$claude_env" CLAUDE_CREDENTIAL_POOL || true)"
+    hook_name="$(fs_read_env_value "$claude_env" CLAUDE_HEADROOM_HOOK || true)"
+
+    if [[ -n "$pinned" && -n "$pool_raw" ]]; then
+        echo "Error: claude.env sets both CLAUDE_CREDENTIALS and" >&2
+        echo "CLAUDE_CREDENTIAL_POOL. Two sources for one credential --" >&2
+        echo "pin one account with CLAUDE_CREDENTIALS, or let the pool" >&2
+        echo "balance between several, not both." >&2
+        return 1
+    fi
+    if [[ -n "$pool_raw" && -z "$hook_name" ]]; then
+        echo "Error: claude.env sets CLAUDE_CREDENTIAL_POOL without" >&2
+        echo "CLAUDE_HEADROOM_HOOK. A pool with no hook to ask has no way" >&2
+        echo "to pick a candidate -- set both, or neither." >&2
+        return 1
+    fi
+    if [[ -z "$pool_raw" && -n "$hook_name" ]]; then
+        echo "Error: claude.env sets CLAUDE_HEADROOM_HOOK without" >&2
+        echo "CLAUDE_CREDENTIAL_POOL. A hook with no candidates to judge" >&2
+        echo "has nothing to pick from -- set both, or neither." >&2
+        return 1
+    fi
+    if [[ -z "$pool_raw" ]]; then
+        # Not configured at all -- not an error, just nothing for this
+        # function to do. The caller falls through to CLAUDE_CREDENTIALS
+        # (already confirmed unset above, or this is unreachable) or
+        # today's default.
+        return 0
+    fi
+
+    if [[ ! "$hook_name" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+        echo "Error: CLAUDE_HEADROOM_HOOK='$hook_name' is not a plugin" >&2
+        echo "name. It becomes fork-sandbox-headroom-$hook_name, so it" >&2
+        echo "must be lowercase alphanumerics and hyphens, starting with" >&2
+        echo "an alphanumeric." >&2
+        return 1
+    fi
+
+    if [[ "$pool_raw" == :* || "$pool_raw" == *: || "$pool_raw" == *::* ]]; then
+        echo "Error: CLAUDE_CREDENTIAL_POOL has an empty entry (check for" >&2
+        echo "a leading, trailing or doubled ':')." >&2
+        return 1
+    fi
+
+    local -a pool=()
+    local entry
+    IFS=':' read -r -a pool <<< "$pool_raw"
+    for entry in "${pool[@]}"; do
+        if [[ "$entry" != /* ]]; then
+            echo "Error: CLAUDE_CREDENTIAL_POOL entry '$entry' is not an" >&2
+            echo "absolute path. Every pool candidate must be, so it names" >&2
+            echo "the same file regardless of the launcher's cwd." >&2
+            return 1
+        fi
+        if [[ "$entry" =~ [[:space:]] ]]; then
+            echo "Error: CLAUDE_CREDENTIAL_POOL entry '$entry' contains" >&2
+            echo "whitespace, which is not supported in a colon-separated" >&2
+            echo "list entry." >&2
+            return 1
+        fi
+        fs_reject_unsafe_chars "$entry" || return 1
+    done
+
+    local hook_bin
+    hook_bin="$(command -v "fork-sandbox-headroom-$hook_name" 2>/dev/null || true)"
+    if [[ -z "$hook_bin" && -x "$script_dir/fork-sandbox-headroom-$hook_name" ]]; then
+        hook_bin="$script_dir/fork-sandbox-headroom-$hook_name"
+    fi
+    if [[ -z "$hook_bin" ]]; then
+        echo "Error: cannot find fork-sandbox-headroom-$hook_name, which" >&2
+        echo "CLAUDE_HEADROOM_HOOK names. Looked on PATH and beside" >&2
+        echo "$script_dir. Install the hook, or unset CLAUDE_HEADROOM_HOOK" >&2
+        echo "and CLAUDE_CREDENTIAL_POOL." >&2
+        return 1
+    fi
+
+    local hook_out hook_rc
+    hook_out="$("$hook_bin" "${pool[@]}")"
+    hook_rc=$?
+    if (( hook_rc == 0 )); then
+        if [[ -z "$hook_out" ]]; then
+            echo "Error: $hook_bin printed nothing on stdout. Its contract" >&2
+            echo "is exit 0 with exactly one of the candidate paths on" >&2
+            echo "stdout." >&2
+            return 1
+        fi
+        if [[ "$hook_out" == *$'\n'* ]]; then
+            echo "Error: $hook_bin printed more than one line:" >&2
+            echo "$hook_out" >&2
+            echo "Its contract is exit 0 with exactly one of the candidate" >&2
+            echo "paths on stdout." >&2
+            return 1
+        fi
+        local is_member=false
+        for entry in "${pool[@]}"; do
+            [[ "$hook_out" == "$entry" ]] && is_member=true && break
+        done
+        if [[ "$is_member" != true ]]; then
+            echo "Error: $hook_bin printed '$hook_out', which is not one" >&2
+            echo "of the candidates it was given. Its contract is to print" >&2
+            echo "exactly one of them." >&2
+            return 1
+        fi
+        printf '%s\n' "$hook_out"
+        return 0
+    elif (( hook_rc == 2 )); then
+        echo "Error: $hook_bin found no routable credential (its" >&2
+        echo "considered answer, exit 2) -- every candidate in the pool" >&2
+        echo "looked unhealthy. Pin one by hand with --claude-credentials" >&2
+        echo "to override, or fix the accounts and retry." >&2
+        return 1
+    else
+        echo "Warning: $hook_bin exited $hook_rc. Falling back to today's" >&2
+        echo "default credential chain for this launch -- fix the hook" >&2
+        echo "when you get a chance." >&2
+        return 0
+    fi
+}
+
 # The host's model and browser caches, read-only, when the host has them.
 # Both clients want them, and neither wants the surgery to be repeated.
 # Fills FS_CACHE_FLAGS with backend flags; empty when the host has no cache.
