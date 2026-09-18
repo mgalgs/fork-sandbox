@@ -393,6 +393,13 @@ if [[ -n "$rd_happy" ]]; then
         "claude_credentials_via=balance" "$happy_env"
     contains "balance happy path: run.env records the hook's choice as the source" \
         "claude_credentials_source=$pool_b" "$happy_env"
+    # summary.json is the JSONL record's real source (sandbox-run-log.py's
+    # SUMMARY_FIELDS lift), not just run.env's fallback path -- assert the
+    # field lands there directly, not only in run.env.
+    contains "balance happy path: summary.json records via=balance" \
+        "balance" "$(jq -r '.claude_credentials_via' "$rd_happy/summary.json")"
+    contains "balance happy path: summary.json records the hook's choice as the source" \
+        "$pool_b" "$(jq -r '.claude_credentials_source' "$rd_happy/summary.json")"
 else
     no "balance happy path: run_real produced a run directory" "run_real failed"
 fi
@@ -423,6 +430,8 @@ if [[ -n "$rd_pi_balance" ]]; then
     fi
     lacks "a pure pi run's run.env has no claude_credentials_via key" \
         "claude_credentials_via" "$(cat "$rd_pi_balance/run.env")"
+    lacks "a pure pi run's summary.json has no claude_credentials_via key" \
+        "claude_credentials_via" "$(cat "$rd_pi_balance/summary.json")"
 else
     no "a pure pi run never invokes the headroom hook" "run_real failed"
 fi

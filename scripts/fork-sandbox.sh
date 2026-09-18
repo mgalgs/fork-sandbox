@@ -5993,6 +5993,18 @@ started_at="$(date +%s)"
         printf 'fxm_formatter=%q\n' "$fxm_run_formatter"
         printf 'fxm_fix_prompt_header=%q\n' "$fxm_fix_prompt_header"
     fi
+    # Per-account attribution, for summary.json's own claude_credentials_*
+    # pair below -- always printed (unlike run.env's conditional-key
+    # convention above) with an empty-string sentinel for "no claude leg",
+    # the same optional-pair shape session_state/session_id already use, so
+    # a value read under this script's own `set -u` is never unbound.
+    if $has_claude_leg; then
+        printf 'claude_credentials_source=%q\n' "${claude_credentials_resolved:-default}"
+        printf 'claude_credentials_via=%q\n' "$claude_credentials_via"
+    else
+        printf 'claude_credentials_source=%q\n' ""
+        printf 'claude_credentials_via=%q\n' ""
+    fi
     printf 'mode=%q\n' "$mode"
     printf 'review_prompt=%q\n' "$review_prompt"
     printf 'fix_prompt_header=%q\n' "$fix_prompt_header"
@@ -8724,6 +8736,8 @@ jq -n \
     --argjson outbox_max_bytes "$outbox_max_bytes" \
     --arg session_state "$session_state" \
     --arg session_id "$session_id_json" \
+    --arg claude_credentials_source "$claude_credentials_source" \
+    --arg claude_credentials_via "$claude_credentials_via" \
     '{
         version: $version,
         mode: $mode,
@@ -8765,6 +8779,14 @@ jq -n \
     + (if $session_state == "" then {} else {
         session_state: $session_state,
         session_id: (if $session_id == "" then null else $session_id end),
+    } end)
+    # Same absent-not-null shape, gated on whether this run had a claude
+    # leg at all -- mirrors the claude_credentials_* convention already
+    # used for run.env, so sandbox-run-log.py SUMMARY_FIELDS lift and its
+    # run.env fallback agree on when the pair exists.
+    + (if $claude_credentials_via == "" then {} else {
+        claude_credentials_source: $claude_credentials_source,
+        claude_credentials_via: $claude_credentials_via,
     } end)' > "$run_dir/summary.json" 2>/dev/null \
     || rm -f "$run_dir/summary.json"
 
