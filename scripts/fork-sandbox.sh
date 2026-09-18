@@ -7612,8 +7612,28 @@ close_iter() {
 # leg_usage (a JSON object, or null) and leg_error (a model-error or
 # retry-exhaustion message, or empty).
 run_leg() {
-    local kind="$1" n="$2" prompt="$3"
-    local leg_events="$run_dir/events-$kind-$n.jsonl"
+    local kind="$1" n="$2" prompt="$3" step_idx="${4:-}"
+    # A legacy-shaped run never passes step_idx, so leg_tag is exactly
+    # today's "$kind-$n"; a composed run's own step-indexed tag (decision 4)
+    # unifies "fix" and "mntfix" onto one "-fix-" segment, since a composed
+    # pipeline never distinguishes which tier's fix seat this is the way the
+    # fixed fxr_*/fxm_* split does -- the step index already says which step.
+    # This same tag also disambiguates the pi-session directory names below:
+    # two composed steps of the same kind (e.g. two review steps) would
+    # otherwise both claim "pi-session-review-1" for their own iteration 1
+    # and share a session the cost walk would double-bill, exactly the
+    # collision the surrounding comment there already warns about for the
+    # fixed tiers.
+    local leg_tag
+    if [[ -n "$step_idx" ]]; then
+        case "$kind" in
+        fix | mntfix) leg_tag="${step_idx}-fix-$n" ;;
+        *) leg_tag="${step_idx}-$kind-$n" ;;
+        esac
+    else
+        leg_tag="$kind-$n"
+    fi
+    local leg_events="$run_dir/events-$leg_tag.jsonl"
     [[ "$mode" == "review-only" ]] && leg_events="$run_dir/events.jsonl"
     local leg_session="" leg_session_copy="" idx
     local leg_retry_error="" leg_head_before="" leg_head_after="" leg_failed_retry=""
@@ -7635,7 +7655,28 @@ run_leg() {
     # invariant only holds for whichever harness this is, not for the
     # implement harness unconditionally.
     local leg_harness="$harness"
-    if [[ "$kind" == "review" ]]; then
+    if [[ -n "$step_idx" ]]; then
+        # A composed step's own seat: resolved by the seat-resolution loop
+        # into "s<K>_*"/"s<K>fix_*" and serialized into this same run.sh's
+        # text by the loops beside the fixed rev_*/mnt_*/fxr_*/fxm_*
+        # emission above (see their own comments). No separate "preamble"
+        # fallback is needed the way review/maintainer's is: a composed
+        # step's harness always comes straight from the parser, never a
+        # --review-harness-style fallback.
+        local step_prefix="$step_idx"
+        [[ "$kind" == "fix" || "$kind" == "mntfix" ]] && step_prefix="${step_idx}fix"
+        local -n leg_cmd_ref="${step_prefix}_sandbox_cmd"
+        cmd=("${leg_cmd_ref[@]}")
+        local step_field
+        step_field="${step_prefix}_pi_session_dir"
+        leg_pi_session_dir="${!step_field}"
+        step_field="${step_prefix}_usage_source"
+        leg_usage_source="${!step_field}"
+        step_field="${step_prefix}_formatter"
+        leg_formatter="${!step_field}"
+        step_field="${step_prefix}_harness"
+        leg_harness="${!step_field}"
+    elif [[ "$kind" == "review" ]]; then
         cmd=("${review_sandbox_cmd[@]}")
         leg_pi_session_dir="$rev_pi_session_dir"
         leg_usage_source="$rev_usage_source"
@@ -7690,7 +7731,7 @@ run_leg() {
     # would silently leave it sharing the implement leg's session
     # directory and billing every leg for every leg before it.
     if [[ -n "$leg_pi_session_dir" ]]; then
-        leg_session="$clone_dir/.git/pi-session-$kind-$n"
+        leg_session="$clone_dir/.git/pi-session-$leg_tag"
         for idx in "${!cmd[@]}"; do
             if [[ "${cmd[$idx]}" == "$leg_pi_session_dir" ]]; then
                 cmd[$idx]="$leg_session"
@@ -7739,7 +7780,7 @@ run_leg() {
     # exhaustion). Deliberately a copy of those walks rather than a refactor
     # of them: they are not worth disturbing to save thirty lines here.
     if [[ -n "$leg_session" && -d "$leg_session" ]]; then
-        leg_session_copy="$run_dir/pi-session-$kind-$n"
+        leg_session_copy="$run_dir/pi-session-$leg_tag"
         # Take any earlier copy out first: cp -a onto an existing directory
         # nests one inside it, and the cost walk below would then sum both.
         # A runner re-run by hand in the same run dir is the case that does it.
