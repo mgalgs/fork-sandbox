@@ -3277,6 +3277,169 @@ JSON
     fi
 done
 
+printf '\n== fork-sandbox-k8s.sh submit: --claude-credentials flag and the credential balancer ==\n'
+# This entry point reads claude.env directly (unlike fork-sandbox.sh's own
+# --k8s delegation, which resolves and forwards --claude-credentials
+# instead) -- so it exercises fs_balance_claude_credential itself, the same
+# lib function fork-sandbox.sh's local path calls. Full config-error and
+# hook-exit-code coverage lives in fork-sandbox-balance-test.sh (the lib's
+# own unit suite) and fork-sandbox-claude-credentials-test.sh (the local
+# launcher's integration suite); this section only proves the same wiring
+# reaches this entry point too -- one or two representative cases each,
+# per those suites' own precedent, not a full re-sweep.
+
+balance_config_dir="$(newdir)"; tmpdirs+=("$balance_config_dir")
+cp "$config_dir/k8s.env" "$balance_config_dir/k8s.env"
+install -m 600 /dev/null "$balance_config_dir/pi.env"
+printf 'OPENROUTER_API_KEY=sk-test-dummy\n' >> "$balance_config_dir/pi.env"
+
+balance_pool_a="$(newdir)/pool-a-credentials.json"; tmpdirs+=("$(dirname "$balance_pool_a")")
+cat > "$balance_pool_a" <<JSON
+{"claudeAiOauth": {"accessToken": "pool-a-tok", "refreshToken": "fixture-refresh-token", "refreshTokenExpiresAt": 123, "expiresAt": $claude_future_ms, "scopes": ["user:inference"]}}
+JSON
+balance_pool_b="$(newdir)/pool-b-credentials.json"; tmpdirs+=("$(dirname "$balance_pool_b")")
+cat > "$balance_pool_b" <<JSON
+{"claudeAiOauth": {"accessToken": "pool-b-tok", "refreshToken": "fixture-refresh-token", "refreshTokenExpiresAt": 123, "expiresAt": $claude_future_ms, "scopes": ["user:inference"]}}
+JSON
+
+# A fake hook executable named fork-sandbox-headroom-<name>, staged in its
+# own PATH dir -- same shape as fork-sandbox-balance-test.sh's own fake_hook,
+# duplicated here (as fork-sandbox-claude-credentials-test.sh's copy already
+# is) since this suite drives the real k8s entry point rather than calling
+# fs_balance_claude_credential directly.
+balance_fake_hook() {
+    local name="$1" body="$2" bindir
+    bindir="$(newdir)"
+    cat > "$bindir/fork-sandbox-headroom-$name" <<HOOK
+#!/usr/bin/env bash
+$body
+HOOK
+    chmod +x "$bindir/fork-sandbox-headroom-$name"
+    printf '%s' "$bindir"
+}
+
+# The flag beats a configured pool: the hook must never be invoked. Exercised
+# via --dry-run since the flag/balancer precedence and its existence checks
+# all run before the dry-run render+exit.
+balance_flag_marker="$(newdir)/hook-invoked-flag-wins"; tmpdirs+=("$(dirname "$balance_flag_marker")")
+rm -f "$balance_flag_marker"
+balance_hook_dir_flagwins="$(balance_fake_hook flagwins "touch $balance_flag_marker; printf '%s\n' \"\$1\"")"
+{
+    printf 'CLAUDE_CREDENTIAL_POOL=%s:%s\n' "$balance_pool_a" "$balance_pool_b"
+    printf 'CLAUDE_HEADROOM_HOOK=flagwins\n'
+} > "$balance_config_dir/claude.env"
+if PATH="$balance_hook_dir_flagwins:$PATH" FORK_SANDBOX_CONFIG_DIR="$balance_config_dir" \
+    "$k8s_sh" submit --dry-run --branch fs-k8s-test-branch --model claude-sonnet-5 \
+    --harness claude --claude-credentials "$claude_override_cred" \
+    "$proj_dir" "$handoff_file" >/tmp/fs-k8s-test-balance-flagwins.out 2>&1; then
+    ok "--claude-credentials on submit beats a configured pool: exits 0"
+else
+    no "--claude-credentials on submit beats a configured pool: exits 0" \
+        "$(cat /tmp/fs-k8s-test-balance-flagwins.out)"
+fi
+if [[ -f "$balance_flag_marker" ]]; then
+    no "--claude-credentials on submit beats a configured pool: the hook is not invoked" \
+        "marker file exists"
+else
+    ok "--claude-credentials on submit beats a configured pool: the hook is not invoked"
+fi
+rm -f /tmp/fs-k8s-test-balance-flagwins.out
+
+# Happy path (hook's choice used, recorded into run.env/summary.json) needs
+# a full non-dry-run submit through to a running pod -- driven further down
+# in this file, in the "durable run log" section, once runstub_dir (the
+# git+kubectl pair that fakes a whole cluster round trip) exists.
+
+# A pure --harness pi submit must never invoke the hook, even with a valid
+# pool and hook configured -- this harness has no claude leg to balance a
+# credential for.
+balance_pi_marker="$(newdir)/hook-invoked-pure-pi"; tmpdirs+=("$(dirname "$balance_pi_marker")")
+rm -f "$balance_pi_marker"
+balance_hook_dir_pi="$(balance_fake_hook pimarker "touch $balance_pi_marker; printf '%s\n' \"\$1\"")"
+if PATH="$balance_hook_dir_pi:$PATH" FORK_SANDBOX_CONFIG_DIR="$balance_config_dir" \
+    "$k8s_sh" submit --dry-run --branch fs-k8s-test-branch --model moonshotai/kimi-k3 \
+    "$proj_dir" "$handoff_file" >/tmp/fs-k8s-test-balance-pi.out 2>&1; then
+    ok "a pure pi submit never invokes the headroom hook: exits 0"
+else
+    no "a pure pi submit never invokes the headroom hook: exits 0" \
+        "$(cat /tmp/fs-k8s-test-balance-pi.out)"
+fi
+if [[ -f "$balance_pi_marker" ]]; then
+    no "a pure pi submit never invokes the headroom hook" "marker file exists"
+else
+    ok "a pure pi submit never invokes the headroom hook"
+fi
+rm -f /tmp/fs-k8s-test-balance-pi.out
+
+# One representative config error: a pool without a hook is refused loudly,
+# proving this entry point surfaces fs_balance_claude_credential's own
+# error rather than swallowing it. Every config-error shape is already
+# covered directly against the lib function by fork-sandbox-balance-test.sh.
+printf 'CLAUDE_CREDENTIAL_POOL=%s\n' "$balance_pool_a" > "$balance_config_dir/claude.env"
+refuses "submit: a pool without a hook is refused loudly" \
+    "without" \
+    env FORK_SANDBOX_CONFIG_DIR="$balance_config_dir" \
+    "$k8s_sh" submit --dry-run --branch fs-k8s-test-branch --model claude-sonnet-5 \
+    --harness claude "$proj_dir" "$handoff_file"
+
+# Exit 2 (the hook's own "no routable candidate" answer) is a hard error
+# naming the --claude-credentials pin as the escape hatch.
+balance_hook_dir_noroute="$(balance_fake_hook noroute2 'exit 2')"
+{
+    printf 'CLAUDE_CREDENTIAL_POOL=%s\n' "$balance_pool_a"
+    printf 'CLAUDE_HEADROOM_HOOK=noroute2\n'
+} > "$balance_config_dir/claude.env"
+refuses "submit: exit 2 (no routable candidate) is a hard error naming the flag override" \
+    "no routable credential" \
+    env PATH="$balance_hook_dir_noroute:$PATH" FORK_SANDBOX_CONFIG_DIR="$balance_config_dir" \
+    "$k8s_sh" submit --dry-run --branch fs-k8s-test-branch --model claude-sonnet-5 \
+    --harness claude "$proj_dir" "$handoff_file"
+
+# The new --claude-credentials flag itself: a missing path is refused naming
+# it, both on submit directly and via run's forwarding into submit_argv.
+rm -f "$balance_config_dir/claude.env"
+balance_missing_cred="$(newdir)/does-not-exist-credentials.json"; tmpdirs+=("$(dirname "$balance_missing_cred")")
+refuses "submit --claude-credentials naming a missing file is refused" \
+    "$balance_missing_cred" \
+    env FORK_SANDBOX_CONFIG_DIR="$balance_config_dir" \
+    "$k8s_sh" submit --dry-run --branch fs-k8s-test-branch --model claude-sonnet-5 \
+    --harness claude --claude-credentials "$balance_missing_cred" "$proj_dir" "$handoff_file"
+refuses "run --claude-credentials naming a missing file is refused (forwarded to submit)" \
+    "$balance_missing_cred" \
+    env FORK_SANDBOX_CONFIG_DIR="$balance_config_dir" \
+    "$k8s_sh" run --dry-run --branch fs-k8s-test-branch --model claude-sonnet-5 \
+    --harness claude --claude-credentials "$balance_missing_cred" "$proj_dir" "$handoff_file"
+
+# The existing valid flag credential still works end to end via --dry-run.
+if PATH="$PATH" FORK_SANDBOX_CONFIG_DIR="$balance_config_dir" \
+    "$k8s_sh" submit --dry-run --branch fs-k8s-test-branch --model claude-sonnet-5 \
+    --harness claude --claude-credentials "$claude_override_cred" \
+    "$proj_dir" "$handoff_file" >/tmp/fs-k8s-test-balance-flagok.out 2>&1; then
+    ok "submit --claude-credentials naming an existing file exits 0"
+else
+    no "submit --claude-credentials naming an existing file exits 0" \
+        "$(cat /tmp/fs-k8s-test-balance-flagok.out)"
+fi
+rm -f /tmp/fs-k8s-test-balance-flagok.out
+
+# A locked-in scope decision, not an accident: --claude-credentials on a
+# --harness pi submit parses fine and is silently ignored (this harness
+# never reads a claude credential), rather than being refused the way
+# --pi-args with --harness claude is refused above. Proven here by pointing
+# the flag at a file that does not exist -- if the flag were validated
+# regardless of harness, this would fail naming that path; instead it must
+# exit 0, exactly as it would with the flag omitted entirely.
+if PATH="$PATH" FORK_SANDBOX_CONFIG_DIR="$balance_config_dir" \
+    "$k8s_sh" submit --dry-run --branch fs-k8s-test-branch --model moonshotai/kimi-k3 \
+    --claude-credentials "$balance_missing_cred" \
+    "$proj_dir" "$handoff_file" >/tmp/fs-k8s-test-balance-pi-flag.out 2>&1; then
+    ok "--claude-credentials on a --harness pi submit is silently ignored, even naming a missing file"
+else
+    no "--claude-credentials on a --harness pi submit is silently ignored, even naming a missing file" \
+        "$(cat /tmp/fs-k8s-test-balance-pi-flag.out)"
+fi
+rm -f /tmp/fs-k8s-test-balance-pi-flag.out
+
 # The cleanup trap must exist before Secret creation: a label failure leaves
 # an unlabeled Secret behind, so only the explicit by-name delete can catch
 # it. This stub makes that exact command fail and records the cleanup calls.
@@ -9354,6 +9517,43 @@ if (( rundir_applyfail_rc != 0 )) && [[ -n "$rundir_applyfail_rd" && -d "$rundir
 else
     no "a submit that dies after creating the run dir still prints its path" \
         "rc=$rundir_applyfail_rc run_dir=$rundir_applyfail_rd out=$(cat "$rundir_applyfail_out")"
+fi
+
+printf '\n== fork-sandbox-k8s.sh submit --harness claude: credential balancer happy path ==\n'
+# The hook's choice is used, and run.env/summary.json record it -- needs a
+# full (non-dry-run) submit through to a running claude-proxy Pod, which is
+# why this lives here (after runstub_dir, the git+kubectl pair that fakes a
+# whole cluster round trip, already exists) rather than beside this file's
+# other --claude-credentials/balance cases above, which stay on --dry-run.
+balance_happy_config_dir="$(newdir)"; tmpdirs+=("$balance_happy_config_dir")
+cp "$config_dir/k8s.env" "$balance_happy_config_dir/k8s.env"
+install -m 600 /dev/null "$balance_happy_config_dir/pi.env"
+printf 'OPENROUTER_API_KEY=sk-test-dummy\n' >> "$balance_happy_config_dir/pi.env"
+{
+    printf 'CLAUDE_CREDENTIAL_POOL=%s:%s\n' "$balance_pool_a" "$balance_pool_b"
+    printf 'CLAUDE_HEADROOM_HOOK=happy2\n'
+} > "$balance_happy_config_dir/claude.env"
+balance_happy_hook_dir="$(balance_fake_hook happy2 'printf "%s\n" "$2"')"
+balance_happy_kubectl_log="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$balance_happy_kubectl_log")")
+balance_happy_out="$(PATH="$balance_happy_hook_dir:$runstub_dir:$PATH" \
+    K8S_STUB_LOG="$balance_happy_kubectl_log" \
+    K8S_STUB_BASE_SHA="$rundir_head_sha" \
+    FORK_SANDBOX_CONFIG_DIR="$balance_happy_config_dir" \
+    "$k8s_sh" submit --branch fs-k8s-test-balance-happy --model claude-sonnet-5 \
+    --harness claude "$proj_dir" "$handoff_file" 2>&1)"
+balance_happy_rc=$?
+balance_happy_rd="$(sed -n 's/^  run dir:  *//p' <<<"$balance_happy_out" | head -1)"
+if (( balance_happy_rc == 0 )) && [[ -n "$balance_happy_rd" && -d "$balance_happy_rd" ]]; then
+    tmpdirs+=("$balance_happy_rd")
+    ok "balance happy path: submit exits 0 and produces a run dir"
+    check "balance happy path: run.env records via=balance" \
+        "claude_credentials_via=balance" "$(grep '^claude_credentials_via=' "$balance_happy_rd/run.env")"
+    check "balance happy path: run.env records the hook's choice as the source" \
+        "claude_credentials_source=$balance_pool_b" \
+        "$(grep '^claude_credentials_source=' "$balance_happy_rd/run.env")"
+else
+    no "balance happy path: submit exits 0 and produces a run dir" \
+        "rc=$balance_happy_rc out=$balance_happy_out"
 fi
 
 printf '\n== the durable run log: cmd_collect finalizes the run directory and calls record ==\n'

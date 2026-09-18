@@ -3779,6 +3779,10 @@ EOF
         printf 'branch=%s\n' "$branch"
         printf 'origin_repo=%s\n' "$origin_repo"
         printf 'base_sha=%s\n' "$run_log_base_sha"
+        if [[ "$harness" == claude ]]; then
+            printf 'claude_credentials_source=%s\n' "${claude_credentials_override:-default}"
+            printf 'claude_credentials_via=%s\n' "$claude_credentials_via"
+        fi
     } > "$run_dir/run.env"
 
     K8S_LAST_SUBMIT_RUN_DIR="$run_dir"
@@ -4745,8 +4749,11 @@ cmd_collect() {
     # commits" about a run this same collect just called undecidable.
     if [[ -n "$run_dir" ]]; then
         local run_log_harness run_log_model run_log_commits=""
+        local run_log_claude_source="" run_log_claude_via=""
         run_log_harness="$(read_env_value "$run_dir/run.env" harness || true)"
         run_log_model="$(read_env_value "$run_dir/run.env" model || true)"
+        run_log_claude_source="$(read_env_value "$run_dir/run.env" claude_credentials_source || true)"
+        run_log_claude_via="$(read_env_value "$run_dir/run.env" claude_credentials_via || true)"
         if [[ -n "$base_sha" && -n "$after_sha" ]]; then
             run_log_commits="$(cd "$origin_repo" && git rev-list --count "$base_sha..$after_sha" 2>/dev/null || true)"
         fi
@@ -4760,6 +4767,8 @@ cmd_collect() {
             --arg base_sha "$base_sha" \
             --argjson exit_code "${agent_exit_code:-null}" \
             --arg commits "$run_log_commits" \
+            --arg claude_credentials_source "$run_log_claude_source" \
+            --arg claude_credentials_via "$run_log_claude_via" \
             '{
                 mode: $mode,
                 harness: $harness,
@@ -4770,7 +4779,11 @@ cmd_collect() {
                 base_sha: (if $base_sha == "" then null else $base_sha end),
                 exit_code: $exit_code,
                 commits: (if $commits == "" then null else ($commits | tonumber) end),
-            }' > "$run_dir/summary.json" 2>/dev/null \
+            }
+            + (if $claude_credentials_via == "" then {} else {
+                claude_credentials_source: $claude_credentials_source,
+                claude_credentials_via: $claude_credentials_via,
+            } end)' > "$run_dir/summary.json" 2>/dev/null \
             || rm -f "$run_dir/summary.json"
 
         fs_record_run_log "$run_dir"
