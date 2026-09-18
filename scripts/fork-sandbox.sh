@@ -4544,12 +4544,13 @@ fi
 # run_step_cap is the loop cap for review/maintainer or the repeat count for
 # code. run_step_prompt is left empty here -- it names a prompt file that
 # does not exist yet at this point in the launcher; whichever step builds
-# per-step prompt files fills it in once they do. Nothing reads any of this
-# yet -- the run engine that walks it is a later step of this same effort --
-# so shellcheck sees every element write below as dead and is right to, for
-# now -- shellcheck only reports each variable's LAST write in the script as
-# unused, so the disable comments below sit at those final assignments, not
-# at the declarations.
+# per-step prompt files fills it in once they do. run_step_kind, run_step_cap
+# and run_step_count are read below by the pipeline.json block; run_step_idx
+# and run_step_prompt still have no reader -- the run engine that walks them
+# is a later step of this same effort, so shellcheck is right to see those
+# two arrays' element writes as dead for now. shellcheck only reports each
+# variable's LAST write in the script as unused, so the disable comments
+# below sit at those final assignments, not at the declarations.
 run_step_count=0
 declare -a run_step_kind=()
 declare -a run_step_idx=()
@@ -4597,16 +4598,13 @@ else
         run_step_k=$(( run_step_k + 1 ))
     fi
     if [[ "${maintainer_loop_cap:-0}" != "0" ]]; then
-        # shellcheck disable=SC2034  # unused-for-now, see the block comment above
         run_step_kind[run_step_k]="maintainer"
-        # shellcheck disable=SC2034
+        # shellcheck disable=SC2034  # unused-for-now, see the block comment above
         run_step_idx[run_step_k]=""
-        # shellcheck disable=SC2034
         run_step_cap[run_step_k]="$maintainer_loop_cap"
         run_step_prompt[run_step_k]=""
         run_step_k=$(( run_step_k + 1 ))
     fi
-    # shellcheck disable=SC2034
     run_step_count=$(( run_step_k - 1 ))
 fi
 
@@ -4805,12 +4803,26 @@ if [[ -n "$preset_name" ]]; then
             pipeline_model_var="s${preset_k}_model"
             pipeline_model="${!pipeline_model_var}"
             pipeline_network="${preset_agent_network[$pipeline_agent]}"
+            # pi-local is a permanent harness alias, not a harness of its
+            # own -- every legacy seat expands it to "pi" plus a sealed
+            # network before anything downstream compares harness names
+            # (see the --harness/--review-harness/--maintainer-harness
+            # blocks above). A composed step's preset_agent_harness/network
+            # values come straight from the parser and skip that expansion,
+            # so it has to happen here or this step's record disagrees with
+            # the legacy convention for the identical seat.
+            if [[ "$pipeline_harness" == "pi-local" ]]; then
+                pipeline_harness="pi"
+                pipeline_network="sealed"
+            fi
             if [[ "${run_step_kind[$preset_k]}" != code ]] \
                 && { [[ "${preset_step_fix_default[$preset_k]:-}" != "1" ]] \
                     || [[ "${preset_step_fix_repeat[$preset_k]:-1}" != "1" ]]; }; then
                 pipeline_fix_model_var="s${preset_k}fix_model"
+                pipeline_fix_harness="${preset_step_fix_harness[$preset_k]}"
+                [[ "$pipeline_fix_harness" == "pi-local" ]] && pipeline_fix_harness="pi"
                 pipeline_fix_json="$(jq -n \
-                    --arg harness "${preset_step_fix_harness[$preset_k]}" \
+                    --arg harness "$pipeline_fix_harness" \
                     --arg model "${!pipeline_fix_model_var}" \
                     --argjson repeat "${preset_step_fix_repeat[$preset_k]}" \
                     '{harness: $harness, model: $model, repeat: $repeat}')"
@@ -4823,9 +4835,19 @@ if [[ -n "$preset_name" ]]; then
                     pipeline_network="$network"
                     ;;
                 review)
-                    pipeline_harness="$review_harness"
+                    # Without --review-harness/--maintainer-harness (and no
+                    # preset reviewer/maintainer agent, which would have set
+                    # review_harness_given/maintainer_harness_given true and
+                    # gone through the same fallback the CLI flag does at
+                    # the harness-split blocks above), review_harness and
+                    # review_network stay "" until long after this block
+                    # runs: the leg actually runs on the implement harness
+                    # and network (see review_sandbox_cmd's own
+                    # "review_harness_given == true" branch below), so that
+                    # is what pipeline.json must say too, not a bare "".
+                    pipeline_harness="${review_harness:-$harness}"
                     pipeline_model="$review_model"
-                    pipeline_network="$review_network"
+                    pipeline_network="${review_network:-$network}"
                     if [[ -n "$fix_harness" || "$fix_repeat" != "1" ]]; then
                         if [[ -n "$fix_harness" ]]; then
                             pipeline_fix_harness="$fix_harness"
@@ -4842,9 +4864,14 @@ if [[ -n "$preset_name" ]]; then
                     fi
                     ;;
                 maintainer)
-                    pipeline_harness="$maintainer_harness"
+                    # Same fallback as the review step above, for the same
+                    # reason: maintainer_harness/maintainer_network are only
+                    # defaulted to the implement seat's own values once the
+                    # maintainer loop actually compiles, hundreds of lines
+                    # below this block.
+                    pipeline_harness="${maintainer_harness:-$harness}"
                     pipeline_model="$maintainer_model"
-                    pipeline_network="$maintainer_network"
+                    pipeline_network="${maintainer_network:-$network}"
                     if [[ -n "$mntfix_harness" || "$mntfix_repeat" != "1" ]]; then
                         if [[ -n "$mntfix_harness" ]]; then
                             pipeline_fix_harness="$mntfix_harness"
@@ -5785,11 +5812,31 @@ else
         preset_k_preamble_network=""
         [[ "${preset_agent_network[$preset_k_agent]}" == "sealed" ]] \
             && preset_k_preamble_network=sealed
+        # Same pi-local expansion as pipeline.json's composed branch above:
+        # a step seated on the alias is genuinely sealed even though the
+        # preset's own network key is empty, and the preamble's "no network"
+        # section (keyed on $preset_k_preamble_network alone) has to know
+        # that or a sealed agent never gets told it has no network.
+        if [[ "$preset_k_preamble_harness" == "pi-local" ]]; then
+            preset_k_preamble_harness="pi"
+            preset_k_preamble_network="sealed"
+        fi
         case "${preset_step_action[$preset_k]}" in
             review)
                 step_k_prompt="$run_dir/step-${preset_k}-prompt.md"
                 step_k_verdict_file="$clone_dir/.git/s${preset_k}-verdict.md"
                 fs_reject_unsafe_chars "$step_k_prompt" "$step_k_verdict_file"
+                # fs_emit_prompt_overlay's "review" bucket is computed once,
+                # near prompt_overlay_fragments above, from the single
+                # legacy review_harness_given/review_network scalars -- it
+                # has no idea this is composed step $preset_k specifically,
+                # so every composed review step gets the same fragments
+                # (the implement leg's, in practice, since a composed
+                # preset never sets review_harness_given). This is the same
+                # residual bucket-sharing the "fix" comment above already
+                # calls out, just inherited here rather than introduced by
+                # this loop; giving each composed step its own bucket is a
+                # bigger change than this round's, so it stays as-is.
                 {
                     fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" \
                         "$preset_k_preamble_harness" "$preset_k_preamble_network" \
@@ -5817,6 +5864,9 @@ else
                         break
                     fi
                 done
+                # Same inherited bucket-sharing as the review arm above:
+                # fs_emit_prompt_overlay's "maintainer" bucket is one bucket
+                # for every composed maintain step, not one per step.
                 {
                     fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" \
                         "$preset_k_preamble_harness" "$preset_k_preamble_network" \
@@ -7284,14 +7334,18 @@ if [[ -z "$model" && -s "$sandbox_log" ]]; then
         "$sandbox_log" | head -n1)"
 fi
 
-# pipeline.json's step 0 is always the code seat (JSON's 0-indexed twin of
-# run_step_kind[1], which the compile point guarantees is "code" whenever one
-# exists), and the same model this script only just discovered above is what
-# that step's model field owes the reader. -s guards a run that never wrote
-# pipeline.json at all (no preset, or --review-only, whose step 0 is review
-# and so never enters this block regardless).
-if [[ -n "$model" && "${run_step_kind[1]:-}" == code && -s "$run_dir/pipeline.json" ]]; then
-    if jq --arg model "$model" '.steps[0].model = $model' \
+# pipeline.json's step 0 is the code seat whenever one exists, and the same
+# model this script only just discovered above is what that step's model
+# field owes the reader. This script is the generated run.sh, a separate
+# program from the launcher that wrote pipeline.json -- run_step_kind is a
+# launcher-only array that never reaches here, so the "is step 0 the code
+# seat" check has to read the fact back out of pipeline.json itself rather
+# than out of that array. -s guards a run that never wrote pipeline.json at
+# all (no preset, or --review-only, whose step 0 is review and so the jq
+# filter's own action check leaves untouched regardless).
+if [[ -n "$model" && -s "$run_dir/pipeline.json" ]]; then
+    if jq --arg model "$model" \
+        'if .steps[0].action == "code" then .steps[0].model = $model else . end' \
         "$run_dir/pipeline.json" > "$run_dir/pipeline.json.part" 2>/dev/null; then
         mv -f "$run_dir/pipeline.json.part" "$run_dir/pipeline.json"
     else

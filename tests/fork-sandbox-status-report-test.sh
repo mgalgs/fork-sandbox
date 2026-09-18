@@ -482,9 +482,11 @@ out="$(timeout 12 "$status" "$rd_new" 2>&1)"
 [[ "$out" == *"inbox:    2 addenda"* ]] \
     || { echo "inbox_count counted a mail banner as an addendum: $out"; exit 1; }
 
-# 11. A run dir carrying pipeline.json (written for every preset run, legacy
-# or composed) does not make status choke, in either plain or --json mode --
-# the allowlist that gates every run-dir read has to know the name.
+# 11a. status.sh never asks resolve_run_file for pipeline.json by name --
+# reading it is 3d's job, not this round's -- so a run dir carrying it was
+# always going to leave plain/--json status alone regardless of the
+# allowlist; this is a smoke test that an unrelated file sitting in the run
+# dir does not somehow trip a read, not proof the allowlist matters yet.
 new_run_dir
 printf '{"steps":[{"action":"code","harness":"claude","model":"haiku","repeat":1,"network":null,"fix":null}]}\n' \
     > "$rd_new/pipeline.json"
@@ -499,4 +501,12 @@ rc=$?
 [[ $rc -eq 0 && "$json" == '{"branch":"test"}' ]] \
     || { echo "--json choked on a run dir carrying pipeline.json (rc=$rc): $json"; exit 1; }
 
-echo "29 passed, 0 failed"
+# 11b. The actual, checkable claim: resolve_run_file's literal-name allowlist
+# names pipeline.json, so a future reader (3d's ledger) is not refused the
+# moment it asks. Pinned against the source directly, since nothing calls
+# resolve_run_file with that name yet for 11a to exercise end to end.
+allowlist_line="$(grep -m1 '^ *run\.env|' "$repo_dir/scripts/fork-sandbox-status.sh")"
+[[ "$allowlist_line" == *"|pipeline.json)"* ]] \
+    || { echo "pipeline.json is missing from resolve_run_file's allowlist: $allowlist_line"; exit 1; }
+
+echo "30 passed, 0 failed"
