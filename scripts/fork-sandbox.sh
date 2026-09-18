@@ -2592,6 +2592,22 @@ fi
 # already resolved above, exactly as a local run resolves them, so this
 # reuses that work rather than re-implementing it.
 if [[ "$k8s_mode" == true ]]; then
+    # A composed (non-legacy-shaped) pipeline has no equivalent in the
+    # cluster path yet: k8s_argv below only ever forwards the fixed
+    # implement/review/maintainer skeleton's own flags (see the
+    # --review-loop/--review-model forwarding further down, and the total
+    # absence of any --maintainer-* forwarding at all -- a pre-existing gap
+    # this round does not touch). Refuse outright rather than silently
+    # dropping every step past the first three that happen to line up.
+    if [[ -n "$preset_file" && "$preset_is_legacy_shaped" != true ]]; then
+        echo "Error: --k8s does not support a composed pipeline preset ('$preset_name')" >&2
+        echo "yet -- only a legacy-shaped preset (one code step, then at most one" >&2
+        echo "review step, then at most one maintain step, in that order) can" >&2
+        echo "forward to the cluster today. Tracked as a follow-up in" >&2
+        echo "docs/ideas.md. Run this preset locally, or use a legacy-shaped" >&2
+        echo "one with --k8s." >&2
+        exit 1
+    fi
     if [[ "$harness" != "pi" && "$harness" != "claude" ]]; then
         echo "Error: --k8s only supports --harness pi or claude. A cluster run" >&2
         echo "is pi talking to a model proxy that holds the provider key, or" >&2
@@ -2951,6 +2967,73 @@ if [[ -n "$k8s_timeout" || "$k8s_keep" == true || -n "$k8s_outbox_dir" \
         echo "preset '$preset_name', not a flag.)" >&2
     fi
     exit 1
+fi
+
+# Decision 8: --review-loop/--review-model/--review-harness/--maintainer-*
+# describe the fixed one-code/one-review/one-maintain skeleton and only make
+# sense against a preset shaped like it (or no preset at all, which is
+# trivially that shape -- preset_is_legacy_shaped defaults true then). A
+# composed pipeline has no single review or maintain seat for these to
+# override, so refuse outright rather than silently ignoring the flag or
+# overriding the wrong step -- before the checks just below, which would
+# otherwise fire their own, less specific "requires --review-loop"-style
+# message first since review_loop_cap/maintainer_loop_cap never get set for
+# a composed pipeline. --model/--harness are narrower: they only become
+# ambiguous once a composed pipeline has more than one code step. No new
+# flag algebra is added for a composed pipeline beyond these refusals -- a
+# composed pipeline with exactly one code step is not refused here, but
+# --model/--harness still have no override wired to a composed step, per
+# the preset's own resolution.
+if [[ -n "$preset_file" && "$preset_is_legacy_shaped" != true ]]; then
+    if [[ -n "$review_loop_arg" ]]; then
+        echo "Error: --review-loop cannot be combined with preset '$preset_name':" >&2
+        echo "composed pipeline; edit the preset or pick another." >&2
+        exit 1
+    fi
+    if [[ -n "$review_model" ]]; then
+        echo "Error: --review-model cannot be combined with preset '$preset_name':" >&2
+        echo "composed pipeline; edit the preset or pick another." >&2
+        exit 1
+    fi
+    if [[ "$review_harness_given" == true ]]; then
+        echo "Error: --review-harness cannot be combined with preset '$preset_name':" >&2
+        echo "composed pipeline; edit the preset or pick another." >&2
+        exit 1
+    fi
+    if [[ -n "$maintainer_loop_arg" ]]; then
+        echo "Error: --maintainer-loop cannot be combined with preset '$preset_name':" >&2
+        echo "composed pipeline; edit the preset or pick another." >&2
+        exit 1
+    fi
+    if [[ -n "$maintainer_model" ]]; then
+        echo "Error: --maintainer-model cannot be combined with preset '$preset_name':" >&2
+        echo "composed pipeline; edit the preset or pick another." >&2
+        exit 1
+    fi
+    if [[ "$maintainer_harness_given" == true ]]; then
+        echo "Error: --maintainer-harness cannot be combined with preset '$preset_name':" >&2
+        echo "composed pipeline; edit the preset or pick another." >&2
+        exit 1
+    fi
+    preset_step_code_count=0
+    for ((preset_k = 1; preset_k <= preset_step_count; preset_k++)); do
+        [[ "${preset_step_action[$preset_k]}" == code ]] \
+            && preset_step_code_count=$(( preset_step_code_count + 1 ))
+    done
+    if (( preset_step_code_count > 1 )); then
+        if [[ "$model_given" == true ]]; then
+            echo "Error: --model cannot be combined with preset '$preset_name': composed" >&2
+            echo "pipeline has $preset_step_code_count code steps, so --model has no single" >&2
+            echo "step to target; edit the preset or pick another." >&2
+            exit 1
+        fi
+        if [[ "$harness_given" == true ]]; then
+            echo "Error: --harness cannot be combined with preset '$preset_name': composed" >&2
+            echo "pipeline has $preset_step_code_count code steps, so --harness has no" >&2
+            echo "single step to target; edit the preset or pick another." >&2
+            exit 1
+        fi
+    fi
 fi
 
 # Validated here, above the dry-run exit, rather than beside the rest of the

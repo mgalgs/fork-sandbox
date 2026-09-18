@@ -510,6 +510,78 @@ refuses "fix seats and repeat are refused with --k8s by name" \
     "preset fix seats and repeat are not yet supported" \
     --preset fast3 --k8s
 
+# A composed (non-legacy-shaped) pipeline: the motivating self-review-then-
+# opus-review-then-maintain-x2 example, one code step. Decisions 8/9's
+# refusals fire on this even though the engine cannot walk it yet.
+cat > "$presets_dir/composed.yaml" <<'EOF'
+agents:
+  coder:
+    harness: claude
+    model: sonnet
+  reviewer:
+    harness: claude
+    model: opus
+pipeline:
+  - action: code
+    agent: coder
+  - action: review
+    repeat: 1
+    agent: coder
+  - action: review
+    repeat: 1
+    agent: reviewer
+  - action: maintain
+    repeat: 2
+    agent: reviewer
+EOF
+cat > "$presets_dir/composed-2code.yaml" <<'EOF'
+agents:
+  coder:
+    harness: claude
+    model: sonnet
+  reviewer:
+    harness: claude
+    model: opus
+pipeline:
+  - action: code
+    agent: coder
+  - action: review
+    repeat: 1
+    agent: reviewer
+  - action: code
+    agent: coder
+EOF
+
+refuses "--review-loop is refused against a composed pipeline preset" \
+    "composed pipeline; edit the preset or pick another" \
+    --preset composed --review-loop 2
+refuses "--review-model is refused against a composed pipeline preset" \
+    "composed pipeline; edit the preset or pick another" \
+    --preset composed --review-model opus
+refuses "--review-harness is refused against a composed pipeline preset" \
+    "composed pipeline; edit the preset or pick another" \
+    --preset composed --review-harness claude
+refuses "--maintainer-loop is refused against a composed pipeline preset" \
+    "composed pipeline; edit the preset or pick another" \
+    --preset composed --maintainer-loop 2 --maintainer-model opus
+refuses "--maintainer-model is refused against a composed pipeline preset" \
+    "composed pipeline; edit the preset or pick another" \
+    --preset composed --maintainer-model opus
+refuses "--maintainer-harness is refused against a composed pipeline preset" \
+    "composed pipeline; edit the preset or pick another" \
+    --preset composed --maintainer-harness claude --maintainer-model opus
+
+refuses "--model is refused against a composed pipeline with more than one code step" \
+    "has no single" \
+    --preset composed-2code --model haiku
+refuses "--harness is refused against a composed pipeline with more than one code step" \
+    "has no single" \
+    --preset composed-2code --harness pi --model moonshotai/kimi-k3
+
+refuses "--k8s is refused against a composed pipeline preset" \
+    "does not support a composed pipeline preset ('composed')" \
+    --preset composed --k8s
+
 # The code seat's endpoint: a k8s-only key, so a local launch refuses it
 # before the dry-run exit -- the k8s-side behavior is the stubbed dispatch
 # test in section G.
@@ -845,11 +917,13 @@ EOF
 printf '\n== free-order pipeline composition (parser only; the engine walks it from R10) ==\n'
 
 # These exercise fork-sandbox-preset-parse.py directly rather than through
-# the launcher: fork-sandbox.sh's own compiler still expects the old
-# tier-named emit shape until it is rewired onto the step-indexed one
-# (a later step in this round), so a composed (non-legacy-shaped) pipeline
-# cannot round-trip through --dry-run yet even though the parser already
-# accepts it.
+# the launcher: fork-sandbox.sh's TSV consumer is already rewired onto the
+# step-indexed emit shape, and a composed (non-legacy-shaped) pipeline is
+# correctly detected and refused for the legacy-only flags and --k8s (see
+# the "composed pipeline" refusal tests above), but the run engine itself
+# (the compile-point run_step_* array and the twin loop drivers' walk over
+# it) does not exist yet, so a composed preset still cannot round-trip
+# through a real --dry-run/--k8s success path or an actual run.
 preset_parser="$repo_dir/scripts/fork-sandbox-preset-parse.py"
 
 parses() {
