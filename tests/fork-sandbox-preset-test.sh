@@ -1474,8 +1474,12 @@ fi
 # because review_network itself is unset -- and the coder's own default fix
 # seat (repeat: 2 triggers a fix record with no fix_agent named) must not
 # serialize its undiscovered model as "" where the rest of the file uses
-# null. The coder's repeat: 2 leg also exercises run.sh's pipeline.json
-# model backfill, since agent-sandboxed never gets a --model flag here.
+# null, and must keep the "pi-local" spelling (the fix schema has no
+# network field to say "sealed" any other way) rather than collapsing into
+# the ambiguous "pi" an OpenRouter fix seat would also show. The coder's
+# repeat: 2 leg also exercises run.sh's pipeline.json model backfill, since
+# agent-sandboxed never gets a --model flag here -- and that backfill must
+# reach the fix seat's model too, since it is the same sealed endpoint.
 cat > "$real_presets/sealed-review.yaml" <<'EOF'
 agents:
   coder:
@@ -1507,10 +1511,10 @@ if [[ -n "${rd_a3:-}" ]]; then
         "null" "$(jq -r '.steps[1].network' "$rd_a3/pipeline.json")"
     check "the unsealed, named reviewer's step model is its own" \
         "opus" "$(jq -r '.steps[1].model' "$rd_a3/pipeline.json")"
-    check "the review step's default fix seat inherits the coder's harness" \
-        "pi" "$(jq -r '.steps[1].fix.harness' "$rd_a3/pipeline.json")"
-    check "the review step's default fix seat's undiscovered model is null, not \"\"" \
-        "null" "$(jq -r '.steps[1].fix.model' "$rd_a3/pipeline.json")"
+    check "the review step's default fix seat inherits the coder's harness, sealed" \
+        "pi-local" "$(jq -r '.steps[1].fix.harness' "$rd_a3/pipeline.json")"
+    check "the review step's default fix seat's model is backfilled too, same sealed seat" \
+        "vendor/discovered-model" "$(jq -r '.steps[1].fix.model' "$rd_a3/pipeline.json")"
     check "the review step's default fix seat's repeat is the coder's own" \
         "2" "$(jq -r '.steps[1].fix.repeat' "$rd_a3/pipeline.json")"
 fi

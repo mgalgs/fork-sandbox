@@ -4820,7 +4820,18 @@ if [[ -n "$preset_name" ]]; then
                     || [[ "${preset_step_fix_repeat[$preset_k]:-1}" != "1" ]]; }; then
                 pipeline_fix_model_var="s${preset_k}fix_model"
                 pipeline_fix_harness="${preset_step_fix_harness[$preset_k]}"
-                [[ "$pipeline_fix_harness" == "pi-local" ]] && pipeline_fix_harness="pi"
+                # The fix schema is harness/model/repeat only (decision 5) --
+                # no network field to tell a sealed pi-local fix seat apart
+                # from an OpenRouter pi one, the way the step object's own
+                # "network" key does. Fold that distinction into the harness
+                # name instead: fold harness pi + network sealed into the
+                # same "pi-local" spelling a preset can write directly, and
+                # leave a literal "pi-local" alone rather than collapsing it
+                # into the ambiguous "pi".
+                if [[ "$pipeline_fix_harness" == "pi" \
+                    && "${preset_step_fix_network[$preset_k]}" == "sealed" ]]; then
+                    pipeline_fix_harness="pi-local"
+                fi
                 pipeline_fix_json="$(jq -n \
                     --arg harness "$pipeline_fix_harness" \
                     --arg model "${!pipeline_fix_model_var}" \
@@ -4866,9 +4877,19 @@ if [[ -n "$preset_name" ]]; then
                         if [[ -n "$fix_harness" ]]; then
                             pipeline_fix_harness="$fix_harness"
                             pipeline_fix_model="$fix_model"
+                            pipeline_fix_network="$fix_network"
                         else
                             pipeline_fix_harness="$harness"
                             pipeline_fix_model="$model"
+                            pipeline_fix_network="$network"
+                        fi
+                        # Same fold as the composed branch above: the fix
+                        # schema has no network field, so a sealed pi fix
+                        # seat has to keep the "pi-local" spelling or it is
+                        # byte-identical to an unsealed OpenRouter pi one.
+                        if [[ "$pipeline_fix_harness" == "pi" \
+                            && "$pipeline_fix_network" == "sealed" ]]; then
+                            pipeline_fix_harness="pi-local"
                         fi
                         pipeline_fix_json="$(jq -n \
                             --arg harness "$pipeline_fix_harness" \
@@ -4900,9 +4921,16 @@ if [[ -n "$preset_name" ]]; then
                         if [[ -n "$mntfix_harness" ]]; then
                             pipeline_fix_harness="$mntfix_harness"
                             pipeline_fix_model="$mntfix_model"
+                            pipeline_fix_network="$mntfix_network"
                         else
                             pipeline_fix_harness="$harness"
                             pipeline_fix_model="$model"
+                            pipeline_fix_network="$network"
+                        fi
+                        # Same fold as the review step above.
+                        if [[ "$pipeline_fix_harness" == "pi" \
+                            && "$pipeline_fix_network" == "sealed" ]]; then
+                            pipeline_fix_harness="pi-local"
                         fi
                         pipeline_fix_json="$(jq -n \
                             --arg harness "$pipeline_fix_harness" \
@@ -7369,9 +7397,20 @@ fi
 # than out of that array. -s guards a run that never wrote pipeline.json at
 # all (no preset, or --review-only, whose step 0 is review and so the jq
 # filter's own action check leaves untouched regardless).
+#
+# Any fix seat's harness that reads "pi-local" owes the reader the same
+# backfill: config_dir/model.env is one file per machine, not one per seat,
+# so every pi-local seat in this run -- the code seat and any fix seat
+# folded to that spelling when pipeline.json was written -- necessarily
+# discovers the same model. Leaving a fix seat's model null after this point
+# would give the identical physical seat two encodings in one file.
 if [[ -n "$model" && -s "$run_dir/pipeline.json" ]]; then
     if jq --arg model "$model" \
-        'if .steps[0].action == "code" then .steps[0].model = $model else . end' \
+        'if .steps[0].action == "code" then .steps[0].model = $model else . end
+         | .steps |= map(
+             if .fix != null and .fix.harness == "pi-local" and .fix.model == null
+             then .fix.model = $model
+             else . end)' \
         "$run_dir/pipeline.json" > "$run_dir/pipeline.json.part" 2>/dev/null; then
         mv -f "$run_dir/pipeline.json.part" "$run_dir/pipeline.json"
     else
