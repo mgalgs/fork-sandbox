@@ -702,17 +702,6 @@ pipeline:
     fix_agent: ghost
 EOF
 
-bad "the pipeline must start with the code step" \
-    "starts with the code step" "pipeline[0]" <<'EOF'
-agents:
-  coder:
-    harness: claude
-pipeline:
-  - action: review
-    repeat: 1
-    agent: coder
-EOF
-
 bad "refresh keys on the code step point at the agent" \
     "agent property now" "pipeline[0].refresh-at" <<'EOF'
 agents:
@@ -722,18 +711,6 @@ pipeline:
   - action: code
     agent: coder
     refresh-at: 0.6
-EOF
-
-bad "a second code step is refused" \
-    "the agent's 'repeat' property" "pipeline[1]" <<'EOF'
-agents:
-  coder:
-    harness: claude
-pipeline:
-  - action: code
-    agent: coder
-  - action: code
-    agent: coder
 EOF
 
 bad "a review step without repeat is refused" \
@@ -774,37 +751,13 @@ pipeline:
     on_approved: break
 EOF
 
-bad "a second review step is refused" "at most one review step" <<'EOF'
+bad "an unknown pipeline action is refused" \
+    "'action' must be 'code', 'review' or 'maintain'" <<'EOF'
 agents:
   coder:
     harness: claude
 pipeline:
-  - action: code
-    agent: coder
-  - action: review
-    repeat: 1
-    agent: coder
-  - action: review
-    repeat: 1
-    agent: coder
-EOF
-
-bad "a maintain step before the review step is refused" \
-    "the review step comes before the maintain step" <<'EOF'
-agents:
-  coder:
-    harness: claude
-  elder:
-    harness: claude
-    model: opus
-pipeline:
-  - action: code
-    agent: coder
-  - action: maintain
-    repeat: 1
-    agent: elder
-  - action: review
-    repeat: 1
+  - action: summarize
     agent: coder
 EOF
 
@@ -888,6 +841,150 @@ pipeline:
     agent: coder
     fix_agent: fixer
 EOF
+
+printf '\n== free-order pipeline composition (parser only; the engine walks it from R10) ==\n'
+
+# These exercise fork-sandbox-preset-parse.py directly rather than through
+# the launcher: fork-sandbox.sh's own compiler still expects the old
+# tier-named emit shape until it is rewired onto the step-indexed one
+# (a later step in this round), so a composed (non-legacy-shaped) pipeline
+# cannot round-trip through --dry-run yet even though the parser already
+# accepts it.
+preset_parser="$repo_dir/scripts/fork-sandbox-preset-parse.py"
+
+parses() {
+    # $1 label, $2.. optional needles that must all appear in stdout.
+    local label="$1" f="$tmp/parse.yaml" out; shift
+    cat > "$f"
+    if out="$(python3 "$preset_parser" "$f" parsetest "$f" 2>"$err")"; then
+        ok "$label"
+        local needle
+        for needle in "$@"; do
+            contains "$label: emits $needle" "$out" "$needle"
+        done
+    else
+        no "$label" "$(cat "$err")"
+    fi
+}
+
+parse_refuses() {
+    local label="$1" needle="$2" f="$tmp/parse.yaml"
+    cat > "$f"
+    if python3 "$preset_parser" "$f" parsetest "$f" > /dev/null 2>"$err"; then
+        no "$label" "expected a refusal, got exit 0"
+    else
+        contains "$label" "$(cat "$err")" "$needle"
+    fi
+}
+
+# The motivating composition from the round's brief: a self-review by the
+# coder, then an opus review, then maintain x2 -- inexpressible under the
+# old one-code/one-review/one-maintain skeleton.
+parses "the motivating composition parses" \
+    "step	4	action	maintain" "step	2	action	review" \
+    "step	3	action	review" <<'EOF'
+agents:
+  coder:
+    harness: claude
+    model: sonnet
+  reviewer:
+    harness: claude
+    model: opus
+pipeline:
+  - action: code
+    agent: coder
+  - action: review
+    repeat: 1
+    agent: coder
+  - action: review
+    repeat: 1
+    agent: reviewer
+  - action: maintain
+    repeat: 2
+    agent: reviewer
+EOF
+
+# A review-first pipeline is well-defined -- it reviews the branch as it
+# stands -- and its fix seat still defaults to the code step that follows.
+parses "a review-first pipeline parses" \
+    "step	1	action	review" "step	1	fix_default	1" \
+    "step	1	fix_model	sonnet" "step	2	action	code" <<'EOF'
+agents:
+  coder:
+    harness: claude
+    model: sonnet
+pipeline:
+  - action: review
+    repeat: 1
+    agent: coder
+  - action: code
+    agent: coder
+EOF
+
+parse_refuses "a codeless pipeline without fix_agent is refused" \
+    "the review step needs 'fix_agent' -- this pipeline has no code step" \
+    <<'EOF'
+agents:
+  reviewer:
+    harness: claude
+    model: opus
+pipeline:
+  - action: review
+    repeat: 1
+    agent: reviewer
+EOF
+
+# A codeless pipeline WITH an explicit fix_agent on every review/maintain
+# step is fine.
+parses "a codeless pipeline with explicit fix_agent parses" \
+    "step	1	fix_agent	fixer" <<'EOF'
+agents:
+  reviewer:
+    harness: claude
+    model: opus
+  fixer:
+    harness: claude
+    model: haiku
+pipeline:
+  - action: review
+    repeat: 1
+    agent: reviewer
+    fix_agent: fixer
+EOF
+
+# A code step's own 'repeat' overrides its agent's, for that step only.
+parses "a code step's own repeat overrides its agent's" \
+    "step	1	repeat	5"  <<'EOF'
+agents:
+  coder:
+    harness: claude
+    model: sonnet
+    repeat: 2
+pipeline:
+  - action: code
+    agent: coder
+    repeat: 5
+EOF
+
+# Every existing legacy-shaped preset fixture (one code step, then at most
+# one review and one maintain step, in that order) still parses -- with
+# the same seat resolution and warnings, in the new step-indexed shape.
+# Named explicitly, not globbed: several fixtures already on disk at this
+# point in the suite (net-conflict, seal-review, ep-bad-seat, ...) are
+# deliberately-invalid refusal fixtures, not legacy presets to round-trip.
+legacy_fixtures=(fast deep self-review maintain-only aliased sealed-alias
+    sealed-explicit rev-sealed-alias rev-sealed-explicit seal-ok-warns
+    fast3 ep codex-fix spare)
+for legacy_name in "${legacy_fixtures[@]}"; do
+    legacy_f="$presets_dir/$legacy_name.yaml"
+    [[ -e "$legacy_f" ]] || continue
+    if python3 "$preset_parser" "$legacy_f" legacy "$legacy_f" \
+        > /dev/null 2>"$err"; then
+        ok "legacy fixture still parses: $legacy_name"
+    else
+        no "legacy fixture still parses: $legacy_name" "$(cat "$err")"
+    fi
+done
 
 if run --preset deep > /dev/null 2>"$err"; then
     lacks "seated agents draw no unused warning" "$(cat "$err")" "sits no seat"
