@@ -154,6 +154,14 @@ reports back.
 `~/.config/fork-sandbox/`. `fork-sandbox configure`
 discovers and installs it for you — see [docs/configure.md](docs/configure.md).
 
+`claude`'s own credential can be pinned with `--claude-credentials <path>` or
+`CLAUDE_CREDENTIALS` in `claude.env`, for one launch or one machine. When
+neither is set and an operator has configured a pool of credentials plus a
+headroom hook to pick between them, the launcher balances across the pool
+instead of always defaulting to the same account — see
+[docs/credential-balancing.md](docs/credential-balancing.md) for the pool,
+the hook contract, and how the choice gets recorded.
+
 ## Pro Recipes
 
 Recipe: Interactive orchestrator session using a frontier model
@@ -669,6 +677,9 @@ what is mounted, what is not, and a numbered list of the gaps.
   about your platform, with a `fork-sandbox-k8s-platform-<name>` plugin.
 - [docs/prompt-overlays.md](docs/prompt-overlays.md) — overriding what a run
   is told, from `~/.config/fork-sandbox/prompts/`.
+- [docs/credential-balancing.md](docs/credential-balancing.md) — picking a
+  Claude credential from an operator-configured pool instead of always
+  defaulting to the same account.
 - [docs/sandbox-backend-container.md](docs/sandbox-backend-container.md) — the
   container backend: mechanism, threat model, and limits.
 

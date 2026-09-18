@@ -60,6 +60,18 @@ Network (isolation):
   network` answers the isolation question, and `stats --by harness` stops
   splitting one binary across two names.
 
+Claude credential attribution (claude_credentials_source, claude_credentials_via):
+  Present on a --harness claude run's record whenever the launcher resolved
+  a credential override (absent on a default-Keychain/default-file run's
+  older records, and never present for pi/codex). `claude_credentials_source`
+  is the resolved path, or the literal "default". `claude_credentials_via`
+  says how it was chosen: `flag` (--claude-credentials), `claude-env`
+  (CLAUDE_CREDENTIALS in claude.env), `balance` (an operator-configured pool
+  plus headroom hook -- see docs/credential-balancing.md), or `default`
+  (today's default chain, no override). Never the token itself -- paths
+  only. Group on it directly: `stats --by claude_credentials_via` answers
+  how often a run rode the balancer versus a pin versus the default.
+
 Recommended --task-meta fields (documented here, enforced nowhere):
   kind                implement | fix | refactor | test | docs |
                       investigate | review | pr-review

@@ -9556,6 +9556,142 @@ else
         "rc=$balance_happy_rc out=$balance_happy_out"
 fi
 
+# The pair fs_record_run_log actually prefers: cmd_collect writes
+# claude_credentials_source/via into summary.json too (not just run.env),
+# and reads summary.json first when both exist. Nothing before this asserted
+# that these two fields survive the run.env -> summary.json handoff, so a
+# regression in cmd_collect's jq filter could silently drop attribution from
+# the durable log while every run.env-only check above stayed green.
+if [[ -n "$balance_happy_rd" && -d "$balance_happy_rd" ]]; then
+    balance_happy_collect_log="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$balance_happy_collect_log")")
+    balance_happy_collect_out="$(newdir)/collect-out.txt"; tmpdirs+=("$(dirname "$balance_happy_collect_out")")
+    balance_happy_collect_outbox="$(newdir)/outbox"; tmpdirs+=("$(dirname "$balance_happy_collect_outbox")")
+    HOME="$k8s_test_home" PATH="$runstub_dir:$PATH" K8S_STUB_LOG="$balance_happy_collect_log" \
+        K8S_STUB_BASE_SHA="$rundir_head_sha" \
+        K8S_STUB_OUTBOX_DIR="$runstub_pod_outbox" \
+        FORK_SANDBOX_CONFIG_DIR="$balance_happy_config_dir" \
+        "$k8s_sh" collect --branch fs-k8s-test-balance-happy --run-dir "$balance_happy_rd" \
+        --outbox-dir "$balance_happy_collect_outbox" \
+        "$proj_dir" > "$balance_happy_collect_out" 2>&1
+    balance_happy_collect_rc=$?
+    if (( balance_happy_collect_rc == 0 )) && [[ -f "$balance_happy_rd/summary.json" ]] \
+        && jq -e . "$balance_happy_rd/summary.json" >/dev/null 2>&1; then
+        ok "balance happy path: collect exits 0 and writes a valid summary.json"
+        check "balance happy path: summary.json records via=balance" \
+            "balance" "$(jq -r '.claude_credentials_via' "$balance_happy_rd/summary.json")"
+        check "balance happy path: summary.json records the hook's choice as the source" \
+            "$balance_pool_b" "$(jq -r '.claude_credentials_source' "$balance_happy_rd/summary.json")"
+    else
+        no "balance happy path: collect exits 0 and writes a valid summary.json" \
+            "rc=$balance_happy_collect_rc out=$(cat "$balance_happy_collect_out") summary=$(cat "$balance_happy_rd/summary.json" 2>/dev/null; echo NOFILE)"
+    fi
+fi
+
+printf '\n== fork-sandbox.sh --k8s delegation: via/source attribution and single hook call ==\n'
+# fork-sandbox.sh --k8s resolves the whole precedence chain itself and
+# forwards the choice as this script's own --claude-credentials (see the
+# comment at its exec site) -- but a bare --claude-credentials flag on its
+# own is indistinguishable from an operator typing the flag directly, which
+# would flatten a delegated balance/claude-env choice to via=flag and make
+# the ledger unable to answer "which account, chosen how" for any --k8s run
+# launched the normal way. FORK_SANDBOX_CLAUDE_CREDENTIALS_VIA is the
+# launcher's own internal handoff of the true source; these two cases drive
+# this entry point directly with that env var set, the same way
+# fork-sandbox.sh's own --k8s dispatch would set it, without needing a real
+# fork-sandbox.sh --k8s delegation.
+balance_via_config_dir="$(newdir)"; tmpdirs+=("$balance_via_config_dir")
+cp "$config_dir/k8s.env" "$balance_via_config_dir/k8s.env"
+install -m 600 /dev/null "$balance_via_config_dir/pi.env"
+printf 'OPENROUTER_API_KEY=sk-test-dummy\n' >> "$balance_via_config_dir/pi.env"
+: > "$balance_via_config_dir/claude.env"
+
+balance_via_kubectl_log="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$balance_via_kubectl_log")")
+balance_via_out="$(FORK_SANDBOX_CONFIG_DIR="$balance_via_config_dir" \
+    FORK_SANDBOX_CLAUDE_CREDENTIALS_VIA=claude-env \
+    FORK_SANDBOX_CLAUDE_CREDENTIALS_RESOLVED=1 \
+    PATH="$runstub_dir:$PATH" K8S_STUB_LOG="$balance_via_kubectl_log" \
+    K8S_STUB_BASE_SHA="$rundir_head_sha" \
+    "$k8s_sh" submit --branch fs-k8s-test-balance-via --model claude-sonnet-5 \
+    --harness claude --claude-credentials "$balance_pool_a" \
+    "$proj_dir" "$handoff_file" 2>&1)"
+balance_via_rc=$?
+balance_via_rd="$(sed -n 's/^  run dir:  *//p' <<<"$balance_via_out" | head -1)"
+if (( balance_via_rc == 0 )) && [[ -n "$balance_via_rd" && -d "$balance_via_rd" ]]; then
+    tmpdirs+=("$balance_via_rd")
+    ok "delegated --claude-credentials + VIA=claude-env: submit exits 0 and produces a run dir"
+    check "delegated --claude-credentials + VIA=claude-env: run.env records via=claude-env, not flag" \
+        "claude_credentials_via=claude-env" "$(grep '^claude_credentials_via=' "$balance_via_rd/run.env")"
+    check "delegated --claude-credentials + VIA=claude-env: run.env still records the forwarded path as the source" \
+        "claude_credentials_source=$balance_pool_a" \
+        "$(grep '^claude_credentials_source=' "$balance_via_rd/run.env")"
+else
+    no "delegated --claude-credentials + VIA=claude-env: submit exits 0 and produces a run dir" \
+        "rc=$balance_via_rc out=$balance_via_out"
+fi
+
+# A genuine, non-delegated flag (no FORK_SANDBOX_CLAUDE_CREDENTIALS_VIA in
+# the environment) must still record via=flag -- the env var is this
+# launcher's own internal signal, not something an operator's shell is
+# expected to carry, so its absence must not change today's behavior.
+balance_via_kubectl_log2="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$balance_via_kubectl_log2")")
+balance_via_out2="$(env -u FORK_SANDBOX_CLAUDE_CREDENTIALS_VIA -u FORK_SANDBOX_CLAUDE_CREDENTIALS_RESOLVED \
+    FORK_SANDBOX_CONFIG_DIR="$balance_via_config_dir" \
+    PATH="$runstub_dir:$PATH" K8S_STUB_LOG="$balance_via_kubectl_log2" \
+    K8S_STUB_BASE_SHA="$rundir_head_sha" \
+    "$k8s_sh" submit --branch fs-k8s-test-balance-via2 --model claude-sonnet-5 \
+    --harness claude --claude-credentials "$balance_pool_a" \
+    "$proj_dir" "$handoff_file" 2>&1)"
+balance_via_rc2=$?
+balance_via_rd2="$(sed -n 's/^  run dir:  *//p' <<<"$balance_via_out2" | head -1)"
+if (( balance_via_rc2 == 0 )) && [[ -n "$balance_via_rd2" && -d "$balance_via_rd2" ]]; then
+    tmpdirs+=("$balance_via_rd2")
+    check "a genuine --claude-credentials flag (no internal env var) still records via=flag" \
+        "claude_credentials_via=flag" "$(grep '^claude_credentials_via=' "$balance_via_rd2/run.env")"
+else
+    no "a genuine --claude-credentials flag (no internal env var) still records via=flag" \
+        "rc=$balance_via_rc2 out=$balance_via_out2"
+fi
+
+# The double-invocation bug: fork-sandbox.sh --k8s's own balancer call can
+# fail its hook (warn + fall through to today's default) without resolving
+# anything to forward as --claude-credentials -- and without
+# FORK_SANDBOX_CLAUDE_CREDENTIALS_RESOLVED, this entry point cannot tell
+# that apart from "never asked", so it would call fs_balance_claude_credential
+# (and the operator's headroom hook) a second time for the same run. Proven
+# here with a hook configured to succeed -- if this entry point invoked it,
+# the marker file would exist.
+balance_resolved_marker="$(newdir)/hook-invoked-after-resolved"; tmpdirs+=("$(dirname "$balance_resolved_marker")")
+rm -f "$balance_resolved_marker"
+balance_resolved_hook_dir="$(balance_fake_hook resolvedmarker "touch $balance_resolved_marker; printf '%s\n' \"\$1\"")"
+{
+    printf 'CLAUDE_CREDENTIAL_POOL=%s:%s\n' "$balance_pool_a" "$balance_pool_b"
+    printf 'CLAUDE_HEADROOM_HOOK=resolvedmarker\n'
+} > "$balance_via_config_dir/claude.env"
+balance_resolved_kubectl_log="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$balance_resolved_kubectl_log")")
+balance_resolved_out="$(FORK_SANDBOX_CLAUDE_CREDENTIALS_RESOLVED=1 \
+    FORK_SANDBOX_CONFIG_DIR="$balance_via_config_dir" \
+    PATH="$balance_resolved_hook_dir:$runstub_dir:$PATH" K8S_STUB_LOG="$balance_resolved_kubectl_log" \
+    K8S_STUB_BASE_SHA="$rundir_head_sha" \
+    "$k8s_sh" submit --branch fs-k8s-test-balance-resolved --model claude-sonnet-5 \
+    --harness claude "$proj_dir" "$handoff_file" 2>&1)"
+balance_resolved_rc=$?
+balance_resolved_rd="$(sed -n 's/^  run dir:  *//p' <<<"$balance_resolved_out" | head -1)"
+if (( balance_resolved_rc == 0 )) && [[ -n "$balance_resolved_rd" && -d "$balance_resolved_rd" ]]; then
+    tmpdirs+=("$balance_resolved_rd")
+    ok "FORK_SANDBOX_CLAUDE_CREDENTIALS_RESOLVED with no flag: submit exits 0 and produces a run dir"
+    if [[ -f "$balance_resolved_marker" ]]; then
+        no "FORK_SANDBOX_CLAUDE_CREDENTIALS_RESOLVED with no flag: the hook is not invoked again" \
+            "marker file exists"
+    else
+        ok "FORK_SANDBOX_CLAUDE_CREDENTIALS_RESOLVED with no flag: the hook is not invoked again"
+    fi
+    check "FORK_SANDBOX_CLAUDE_CREDENTIALS_RESOLVED with no flag: run.env records via=default" \
+        "claude_credentials_via=default" "$(grep '^claude_credentials_via=' "$balance_resolved_rd/run.env")"
+else
+    no "FORK_SANDBOX_CLAUDE_CREDENTIALS_RESOLVED with no flag: submit exits 0 and produces a run dir" \
+        "rc=$balance_resolved_rc out=$balance_resolved_out"
+fi
+
 printf '\n== the durable run log: cmd_collect finalizes the run directory and calls record ==\n'
 if [[ -n "$rundir_rd" && -d "$rundir_rd" ]]; then
     collect_rundir_log="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$collect_rundir_log")")

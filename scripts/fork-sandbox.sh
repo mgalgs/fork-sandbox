@@ -2834,6 +2834,20 @@ if [[ "$k8s_mode" == true ]]; then
     # for why forwarding unconditionally here is what keeps a configured
     # headroom hook from firing twice in one run.
     [[ -n "$claude_credentials_resolved" ]] && k8s_argv+=(--claude-credentials "$claude_credentials_resolved")
+    # --claude-credentials only carries a path, so on its own it would flatten
+    # claude_credentials_via to "flag" on the other side of the exec below,
+    # even when the value forwarded above actually came from CLAUDE_CREDENTIALS
+    # or the balancer -- losing exactly the per-account attribution run.env is
+    # meant to carry. These two env vars are this launcher's own internal
+    # handoff to fork-sandbox-k8s.sh's cmd_submit, not a documented interface:
+    # VIA restores the true source for the record, and RESOLVED tells
+    # cmd_submit that the precedence chain -- including the balancer, whose
+    # empty result here (falling through to today's default) is
+    # indistinguishable from "not asked yet" -- already ran once, so it must
+    # not run fs_balance_claude_credential again and invoke the operator's
+    # headroom hook a second time for one run.
+    export FORK_SANDBOX_CLAUDE_CREDENTIALS_VIA="$claude_credentials_via"
+    export FORK_SANDBOX_CLAUDE_CREDENTIALS_RESOLVED=1
     k8s_argv+=(--harness "$harness" --branch "$branch" "$project_path" "$handoff_file")
 
     # This path ends in exec, which replaces the shell image and discards

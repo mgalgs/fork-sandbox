@@ -2951,7 +2951,28 @@ cmd_submit() {
         claude_credentials_config="$(read_env_value "$claude_env" CLAUDE_CREDENTIALS || true)"
         if [[ -n "$claude_credentials_flag" ]]; then
             claude_credentials_override="$claude_credentials_flag"
-            claude_credentials_via="flag"
+            # A bare flag means "flag" for a caller invoking this script
+            # directly. But fork-sandbox.sh --k8s forwards its OWN already-
+            # resolved choice as this same flag (see the comment above its
+            # exec), and that choice may really have come from
+            # CLAUDE_CREDENTIALS or the balancer -- FORK_SANDBOX_CLAUDE_
+            # CREDENTIALS_VIA is that launcher's internal handoff of the true
+            # source, so the ledger keeps per-account attribution instead of
+            # flattening every delegated run to "flag".
+            local via_env="${FORK_SANDBOX_CLAUDE_CREDENTIALS_VIA:-flag}"
+            case "$via_env" in
+                flag | claude-env | balance) claude_credentials_via="$via_env" ;;
+                *) claude_credentials_via="flag" ;;
+            esac
+        elif [[ -n "${FORK_SANDBOX_CLAUDE_CREDENTIALS_RESOLVED:-}" ]]; then
+            # fork-sandbox.sh --k8s already ran this exact precedence chain,
+            # balancer included, before delegating here (see the exec site);
+            # an empty claude_credentials_flag then means it fell through to
+            # today's default. Running fs_balance_claude_credential again
+            # here would invoke the operator's headroom hook a second time
+            # for one run, which is the one thing the launcher's own forward
+            # is meant to prevent.
+            claude_credentials_via="default"
         else
             # Called unconditionally, not gated on claude_credentials_config
             # being empty -- fs_balance_claude_credential also validates
