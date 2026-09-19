@@ -3935,6 +3935,7 @@ fi
 # backend is one line here rather than a failure after a repo has been copied.
 fs_resolve_backend "$script_dir" || exit 1
 fs_backend_capabilities "$FS_BACKEND_BIN"
+fs_detect_browser
 
 # For the run record only. In image mode there is no host binary to ask for a
 # version, so name where the toolchain came from instead of inventing one.
@@ -5709,6 +5710,45 @@ the background, once per such service, before starting the client:
 
 \`socat\` is already on PATH here. The socket names, the ports and the env-file
 convention are the project's; its CLAUDE.md or the services hook documents them.
+EOF
+    fi
+    if [[ -n "$FS_BROWSER_CHROMIUM" ]]; then
+        no_sandbox_line="Chromium's own sandbox works here; do not pass --no-sandbox."
+        if [[ "$FS_BACKEND_CHROMIUM_OWN_SANDBOX" != 1 ]]; then
+            no_sandbox_line="Chromium's own sandbox does not work here; pass --no-sandbox."
+        fi
+        cat <<EOF
+
+## Browser
+
+A browser is available inside this sandbox:
+
+- chromium: $FS_BROWSER_CHROMIUM
+EOF
+        if [[ -n "$FS_BROWSER_PLAYWRIGHT" ]]; then
+            cat <<EOF
+- playwright browser cache: ~/.cache/ms-playwright (bound read-only)
+EOF
+        fi
+        cat <<EOF
+
+One-shot screenshot recipe known to work in this sandbox:
+
+    $FS_BROWSER_CHROMIUM --headless=new --disable-gpu --disable-dev-shm-usage \\
+        --screenshot=<out.png> --window-size=1280,2000 <url>
+
+$no_sandbox_line
+Write screenshots into the clone or the outbox. If you can Read
+images, read the PNG to check the render; otherwise save it to the
+outbox for the orchestrator to judge.
+EOF
+    else
+        cat <<EOF
+
+## Browser
+
+No browser is available in this sandbox. Do not spend tool calls
+looking for one; if the task needs rendering, say so in your report.
 EOF
     fi
     fs_emit_prompt_overlay implement

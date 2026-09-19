@@ -614,6 +614,11 @@ Say this to the user when you launch one:
   dying on a `playwright install` it cannot run. The whole directory is
   bound — it holds browser builds and nothing else — and Chromium's own
   sandbox still works inside.
+- **The generated prompt announces the detected browser**: a `## Browser`
+  section names the chromium binary (or the Playwright cache) and the
+  screenshot recipe known to work on this backend, or says plainly that
+  none is available. Set `FORK_SANDBOX_BROWSER=0` (or `none`) to force the
+  "no browser" announcement regardless of what is actually installed.
 - **No global `~/.claude`** — with two carve-outs. The `commit-then-review`
   skill and the `~/.claude/scripts` toolbox are bound in read-only, so the
   handoff can (and should) tell the session to end with

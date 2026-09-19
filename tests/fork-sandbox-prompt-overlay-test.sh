@@ -346,7 +346,7 @@ new_project() {
 run_real() {
     local proj="$1" cfg="$2" handoff="$3"; shift 3
     local out rc rd
-    out="$(PATH="$stub_bin:$PATH" FORK_SANDBOX_CONFIG_DIR="$cfg" \
+    out="$(PATH="$stub_bin:$PATH" FORK_SANDBOX_CONFIG_DIR="$cfg" FORK_SANDBOX_BROWSER=0 \
         timeout 60 "$launcher" --foreground --harness claude "$@" \
         "$proj" "$handoff" 2>&1)"
     rc=$?
@@ -432,6 +432,11 @@ Go over it and the outbox is refused **as a whole, not truncated** -- one
 oversized artifact means everything in here is lost, not just the large
 file. If you are about to write something big, downscale a screenshot or
 write one image instead of forty rather than risk the rest.
+
+## Browser
+
+No browser is available in this sandbox. Do not spend tool calls
+looking for one; if the task needs rendering, say so in your report.
 
 ---
 

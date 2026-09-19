@@ -220,3 +220,9 @@ local.
 above resolve `sandbox-backend-$FORK_SANDBOX_BACKEND` on `PATH` first — which is
 how a backend that does not live in this repository gets used — and then beside
 the calling script, so a checkout works before `install.sh` has run.
+
+`FORK_SANDBOX_BROWSER` overrides the in-sandbox browser detection that feeds
+the generated prompt's `## Browser` section (see
+[visual-browser.md](visual-browser.md)): `0` or `none` forces the "no browser"
+announcement regardless of what is actually installed; unset or `auto` (the
+default) detects normally.
