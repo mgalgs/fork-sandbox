@@ -13,8 +13,9 @@
 #     the (test) host
 #   - Playwright cache detection via a fake $HOME, mirroring fs_cache_binds'
 #     own condition exactly
-#   - the /usr/-prefix rule for a system chromium, via the internal
-#     candidate-list and prefix variables rather than a real chromium
+#   - the trusted-prefix rule for a system chromium (/usr/, /opt/,
+#     /nix/store/), via the internal candidate-list and prefix variables
+#     rather than a real chromium
 #   - fs_backend_capabilities' chromium_own_sandbox parsing and its
 #     toolchain-based default when the key is absent
 #
@@ -80,23 +81,23 @@ mkdir -p "$fake_home"
 
 real_home="$HOME"
 real_path="$PATH"
-real_prefix="$FS_BROWSER_USR_PREFIX"
+real_prefixes=("${FS_BROWSER_TRUSTED_PREFIXES[@]}")
 real_candidates=("${FS_BROWSER_CHROMIUM_CANDIDATES[@]}")
 
 restore_env() {
     HOME="$real_home"
     PATH="$real_path"
-    FS_BROWSER_USR_PREFIX="$real_prefix"
+    FS_BROWSER_TRUSTED_PREFIXES=("${real_prefixes[@]}")
     FS_BROWSER_CHROMIUM_CANDIDATES=("${real_candidates[@]}")
     unset FORK_SANDBOX_BROWSER
 }
 
 echo "== fs_detect_browser =="
 
-# The candidate list and prefix are internal variables precisely so this
+# The candidate list and prefixes are internal variables precisely so this
 # suite never needs a real chromium under a real /usr.
 FS_BROWSER_CHROMIUM_CANDIDATES=(chromium)
-FS_BROWSER_USR_PREFIX="$fake_usr/"
+FS_BROWSER_TRUSTED_PREFIXES=("$fake_usr/")
 PATH="$fake_usr/bin:$PATH"
 HOME="$fake_home"
 
@@ -142,6 +143,24 @@ fs_detect_browser
 check "an untrusted match with no trusted candidate anywhere is not trusted" \
     "" "$FS_BROWSER_CHROMIUM"
 FS_BROWSER_CHROMIUM_CANDIDATES=(chromium)
+PATH="$fake_usr/bin:$real_path"
+
+# A second configured prefix (standing in for /opt or /nix/store, which
+# sandbox-backend-bwrap also binds read-only) must be trusted too, not just
+# the first entry in the list.
+fake_opt="$scratch/opt"
+mkdir -p "$fake_opt/bin"
+cat > "$fake_opt/bin/chromium" <<'BIN'
+#!/usr/bin/env bash
+exit 0
+BIN
+chmod 755 "$fake_opt/bin/chromium"
+FS_BROWSER_TRUSTED_PREFIXES=("$fake_usr/" "$fake_opt/")
+PATH="$fake_opt/bin:$real_path"
+fs_detect_browser
+check "a second trusted prefix is honored" \
+    "$fake_opt/bin/chromium" "$FS_BROWSER_CHROMIUM"
+FS_BROWSER_TRUSTED_PREFIXES=("$fake_usr/")
 PATH="$fake_usr/bin:$real_path"
 
 FORK_SANDBOX_BROWSER=0

@@ -1636,13 +1636,15 @@ fs_cache_binds() {
 # point it at fake names without installing a real browser.
 FS_BROWSER_CHROMIUM_CANDIDATES=(chromium chromium-browser google-chrome-stable google-chrome)
 
-# The path prefix a resolved chromium must live under to be trusted. /usr is
-# the read-only mount every host-toolchain sandbox backend carries in, so a
-# binary resolved anywhere else (a user's ~/bin shim, say) is not actually
-# there at run time even though `command -v` finds it on the host doing the
-# detecting. A variable, not a literal, so a test can point this at a temp
-# tree instead of requiring a real chromium under /usr.
-FS_BROWSER_USR_PREFIX="/usr/"
+# The path prefixes a resolved chromium must live under to be trusted. These
+# are the read-only binds a host-toolchain sandbox backend carries in --
+# bwrap's --ro-bind /usr and --ro-bind-try /opt /nix/store (see
+# scripts/sandbox-backend-bwrap) -- so a binary resolved anywhere else (a
+# user's ~/bin shim, say) is not actually there at run time even though
+# `command -v` finds it on the host doing the detecting. A variable, not a
+# literal, so a test can point this at a temp tree instead of requiring a
+# real chromium under one of these paths.
+FS_BROWSER_TRUSTED_PREFIXES=("/usr/" "/opt/" "/nix/store/")
 
 # G1 detect: whether a usable browser exists for THIS sandbox run, mirroring
 # fs_cache_binds' own Playwright condition exactly -- a mismatch here would
@@ -1668,16 +1670,20 @@ fs_detect_browser() {
     esac
     [[ "$FS_BACKEND_TOOLCHAIN" == host ]] || return 0
 
-    local name resolved
+    local name resolved prefix trusted
     for name in "${FS_BROWSER_CHROMIUM_CANDIDATES[@]}"; do
         resolved="$(command -v -- "$name" 2>/dev/null)" || continue
-        case "$resolved" in
-        "$FS_BROWSER_USR_PREFIX"*)
+        trusted=0
+        for prefix in "${FS_BROWSER_TRUSTED_PREFIXES[@]}"; do
+            case "$resolved" in
+            "$prefix"*) trusted=1; break ;;
+            esac
+        done
+        if (( trusted )); then
             # shellcheck disable=SC2034  # read by the sourcing scripts
             FS_BROWSER_CHROMIUM="$resolved"
             break
-            ;;
-        esac
+        fi
     done
 
     local pw_root="$HOME/.cache/ms-playwright"

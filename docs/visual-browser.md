@@ -23,9 +23,10 @@ More of this works today than it first appears. The design below is mostly
 *guaranteeing* and *documenting* existing behavior, not building new
 machinery.
 
-- **A system browser reaches the sandbox via `/usr`.** The sandbox mounts
-  `/usr` read-only, so a host chromium is on PATH inside. This is
-  host-dependent — nothing checks for it or tells the session about it.
+- **A system browser reaches the sandbox via `/usr`, `/opt` or
+  `/nix/store`.** The sandbox mounts these read-only, so a host chromium
+  resolved under any of them is on PATH inside. This is host-dependent —
+  nothing checks for it or tells the session about it.
 - **The Playwright browser cache is bound read-only** when the host has
   one (`~/.cache/ms-playwright`, hardcoded by Playwright), so
   Playwright-driven suites and tools find a browser without a doomed
@@ -77,8 +78,8 @@ fork-sandbox guarantees three things; a repo owns the rest.
 
 **G1 — detect and bind.** At launch, detect a usable browser: the
 Playwright cache (bind read-only, as today) or a system chromium under
-`/usr`. Nothing new is mounted that isn't already; detection just records
-what is true.
+`/usr`, `/opt` or `/nix/store`. Nothing new is mounted that isn't already;
+detection just records what is true.
 
 **G2 — announce.** When a browser is present, the generated prompt gains a
 `## Browser` section naming the binary (or cache path), the flags that are
