@@ -45,6 +45,8 @@ newdir() { mktemp -d; }
 printf '== bwrap backend ==\n'
 if ! command -v bwrap >/dev/null 2>&1; then
     printf '  SKIP  bwrap not installed\n'
+elif ! command -v python3 >/dev/null 2>&1; then
+    printf '  SKIP  no python3 on this host (the sandbox binds host /usr, so it would be missing there too)\n'
 else
     FS_BACKEND_TOOLCHAIN=host
     fs_detect_browser
@@ -66,10 +68,18 @@ w="$1"; chromium="$2"; port="$3"
 cd "$w" || exit 1
 python3 -m http.server "$port" --bind 127.0.0.1 >/dev/null 2>&1 &
 srv=$!
+ready=""
 for _ in $(seq 1 50); do
-    (: </dev/tcp/127.0.0.1/"$port") 2>/dev/null && break
+    (: </dev/tcp/127.0.0.1/"$port") 2>/dev/null && { ready=1; break; }
     sleep 0.1
 done
+if [[ -z "$ready" ]]; then
+    # loopback broken, --workdir bind missing, or no python3 in the
+    # sandboxed userland: never silently fall through to chromium, which
+    # would happily screenshot its own "site cannot be reached" page.
+    kill "$srv" 2>/dev/null
+    exit 99
+fi
 "$chromium" --headless=new --disable-gpu --disable-dev-shm-usage \
     --screenshot="$w/out.png" --window-size=1280,2000 \
     "http://127.0.0.1:$port/" >/dev/null 2>&1
@@ -77,11 +87,80 @@ rc=$?
 kill "$srv" 2>/dev/null
 exit "$rc"
 '
-        if timeout 30 "$repo_dir/scripts/sandbox-backend-bwrap" --net sealed \
-            --workdir "$w" -- /bin/bash -c "$probe" _ "$w" "$FS_BROWSER_CHROMIUM" "$port"; then
+        # A PNG that decodes and is non-trivial is not enough: chromium
+        # exits 0 and writes a large, valid PNG for its own "site can't be
+        # reached" page too, so a dead server would pass silently. The
+        # probe itself refuses to fall through to chromium when the
+        # readiness loop times out (exit 99); this decodes the screenshot
+        # and confirms the served page's #ff3366 fill actually made it to
+        # the pixels, which chromium's (white) error page never has.
+        # shellcheck disable=SC2016  # single-quoted on purpose: python, not this shell
+        png_has_fill='
+import struct, sys, zlib
+
+def paeth(a, b, c):
+    p = a + b - c
+    pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+    return a if pa <= pb and pa <= pc else (b if pb <= pc else c)
+
+def has_color(path, target):
+    data = open(path, "rb").read()
+    if data[:8] != b"\x89PNG\r\n\x1a\n":
+        return None
+    pos, idat = 8, b""
+    width = height = bitdepth = colortype = None
+    while pos < len(data):
+        length = struct.unpack(">I", data[pos:pos + 4])[0]
+        ctype = data[pos + 4:pos + 8]
+        chunk = data[pos + 8:pos + 8 + length]
+        if ctype == b"IHDR":
+            width, height, bitdepth, colortype = struct.unpack(">IIBB", chunk[:10])
+        elif ctype == b"IDAT":
+            idat += chunk
+        elif ctype == b"IEND":
+            break
+        pos += 8 + length + 4
+    channels = {2: 3, 6: 4}.get(colortype)
+    if not channels or bitdepth != 8 or not width or not height:
+        return None
+    raw = zlib.decompress(idat)
+    stride = width * channels
+    prev = bytearray(stride)
+    off = 0
+    for _ in range(height):
+        filt = raw[off]; off += 1
+        line = bytearray(raw[off:off + stride]); off += stride
+        for x in range(stride):
+            a = line[x - channels] if x >= channels else 0
+            b = prev[x]
+            c = prev[x - channels] if x >= channels else 0
+            if filt == 1:
+                line[x] = (line[x] + a) & 0xff
+            elif filt == 2:
+                line[x] = (line[x] + b) & 0xff
+            elif filt == 3:
+                line[x] = (line[x] + ((a + b) // 2)) & 0xff
+            elif filt == 4:
+                line[x] = (line[x] + paeth(a, b, c)) & 0xff
+        mid = (width // 2) * channels
+        if tuple(line[mid:mid + 3]) == target:
+            return True
+        prev = line
+    return False
+
+sys.exit(0 if has_color(sys.argv[1], (0xff, 0x33, 0x66)) else 1)
+'
+
+        timeout 30 "$repo_dir/scripts/sandbox-backend-bwrap" --net sealed \
+            --workdir "$w" -- /bin/bash -c "$probe" _ "$w" "$FS_BROWSER_CHROMIUM" "$port"
+        probe_rc=$?
+        if (( probe_rc == 0 )); then
             ok "screenshot recipe exits 0 inside a sealed bwrap sandbox"
+        elif (( probe_rc == 99 )); then
+            no "screenshot recipe exits 0 inside a sealed bwrap sandbox" \
+                "the in-sandbox server never became reachable (dead loopback, missing --workdir bind, or no python3 in the sandboxed userland)"
         else
-            no "screenshot recipe exits 0 inside a sealed bwrap sandbox"
+            no "screenshot recipe exits 0 inside a sealed bwrap sandbox" "probe exited $probe_rc"
         fi
 
         if [[ -s "$w/out.png" ]]; then
@@ -98,9 +177,17 @@ exit "$rc"
             else
                 no "screenshot is non-trivial" "only $size bytes"
             fi
+
+            if python3 -c "$png_has_fill" "$w/out.png"; then
+                ok "screenshot renders the served page, not a browser error page"
+            else
+                no "screenshot renders the served page, not a browser error page" \
+                    "#ff3366 fill was not found in the decoded pixels"
+            fi
         else
             no "screenshot is a PNG" "out.png was not written"
             no "screenshot is non-trivial" "out.png was not written"
+            no "screenshot renders the served page, not a browser error page" "out.png was not written"
         fi
     fi
 fi
