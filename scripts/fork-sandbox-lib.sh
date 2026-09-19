@@ -1694,6 +1694,84 @@ fs_detect_browser() {
     return 0
 }
 
+# Renders the handoff prompt's "## Browser" section from fs_detect_browser's
+# output and the backend's sandbox capability, so a test can exercise the
+# rendering directly by setting the three globals below and capturing this
+# function's stdout -- without shelling out to a whole fork-sandbox.sh run,
+# which cannot make FS_BROWSER_CHROMIUM/FS_BROWSER_PLAYWRIGHT deterministic
+# from outside (they depend on what is actually installed on the host
+# running the test).
+#
+# Reads (never args, so it stays a drop-in call at the prompt-assembly site
+# where these are already in scope):
+#   FS_BROWSER_CHROMIUM           set by fs_detect_browser
+#   FS_BROWSER_PLAYWRIGHT         set by fs_detect_browser
+#   FS_BACKEND_CHROMIUM_OWN_SANDBOX  set by fs_backend_capabilities
+fs_emit_browser_section() {
+    if [[ -n "$FS_BROWSER_CHROMIUM" || -n "$FS_BROWSER_PLAYWRIGHT" ]]; then
+        local no_sandbox_line="Chromium's own sandbox works here; do not pass --no-sandbox."
+        if [[ "$FS_BACKEND_CHROMIUM_OWN_SANDBOX" != 1 ]]; then
+            no_sandbox_line="Chromium's own sandbox does not work here; pass --no-sandbox."
+        fi
+        if [[ -n "$FS_BROWSER_CHROMIUM" ]]; then
+            cat <<EOF
+
+## Browser
+
+A browser is available inside this sandbox:
+
+- chromium: $FS_BROWSER_CHROMIUM
+EOF
+            if [[ -n "$FS_BROWSER_PLAYWRIGHT" ]]; then
+                cat <<EOF
+- playwright browser cache: ~/.cache/ms-playwright (bound read-only)
+EOF
+            fi
+            cat <<EOF
+
+One-shot screenshot recipe known to work in this sandbox:
+
+    $FS_BROWSER_CHROMIUM --headless=new --disable-gpu --disable-dev-shm-usage \\
+        --screenshot=<out.png> --window-size=1280,2000 <url>
+
+$no_sandbox_line
+Write screenshots into the clone or the outbox. If you can Read
+images, read the PNG to check the render; otherwise save it to the
+outbox for the orchestrator to judge.
+EOF
+        else
+            cat <<EOF
+
+## Browser
+
+A browser is available inside this sandbox, though not on PATH: the
+Playwright browser cache at ~/.cache/ms-playwright is bound read-only.
+Find the chromium build under it, e.g.:
+
+    find ~/.cache/ms-playwright -maxdepth 3 -type f \\
+        \( -name chrome -o -name headless_shell \)
+
+and drive that binary directly; it takes the same flags as chromium
+(--headless=new --disable-gpu --disable-dev-shm-usage --screenshot=<out.png>
+--window-size=1280,2000 <url>).
+
+$no_sandbox_line
+Write screenshots into the clone or the outbox. If you can Read
+images, read the PNG to check the render; otherwise save it to the
+outbox for the orchestrator to judge.
+EOF
+        fi
+    else
+        cat <<EOF
+
+## Browser
+
+No browser is available in this sandbox. Do not spend tool calls
+looking for one; if the task needs rendering, say so in your report.
+EOF
+    fi
+}
+
 # The preamble every generated prompt starts with: where the clone is,
 # where the operator inbox is (if this run has one), how addenda reach this
 # harness, and what the network situation is. fork-sandbox.sh's handoff

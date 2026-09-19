@@ -18,6 +18,14 @@
 #     rather than a real chromium
 #   - fs_backend_capabilities' chromium_own_sandbox parsing and its
 #     toolchain-based default when the key is absent
+#   - fs_emit_browser_section's rendering of those signals into the
+#     handoff's "## Browser" text, across all five branches (no browser,
+#     chromium alone, chromium+playwright, playwright-only, and both
+#     FS_BACKEND_CHROMIUM_OWN_SANDBOX values) -- exercised directly by
+#     setting the globals it reads rather than through a whole
+#     fork-sandbox.sh run, which cannot make FS_BROWSER_CHROMIUM
+#     deterministic from outside (it depends on what is actually installed
+#     on the host running the test)
 #
 # This lives in tests/ rather than scripts/tests/ on purpose: install.sh
 # iterates scripts/* and runs `sed -n 2p` on each entry to build the
@@ -237,6 +245,73 @@ case "$out" in
     *"chromium_own_sandbox=0"*) ok "container declares chromium_own_sandbox=0" ;;
     *) no "container declares chromium_own_sandbox=0" "$out" ;;
 esac
+
+echo ""
+echo "== fs_emit_browser_section =="
+
+contains() {
+    local label="$1" haystack="$2" needle="$3"
+    case "$haystack" in
+    *"$needle"*) ok "$label" ;;
+    *) no "$label" "expected to find '$needle'" ;;
+    esac
+}
+lacks() {
+    local label="$1" haystack="$2" needle="$3"
+    case "$haystack" in
+    *"$needle"*) no "$label" "did not expect to find '$needle'" ;;
+    *) ok "$label" ;;
+    esac
+}
+
+FS_BROWSER_CHROMIUM=""
+FS_BROWSER_PLAYWRIGHT=""
+FS_BACKEND_CHROMIUM_OWN_SANDBOX=1
+out="$(fs_emit_browser_section)"
+contains "no browser: announces absence" "$out" "No browser is available in this sandbox."
+lacks "no browser: no screenshot recipe" "$out" "screenshot recipe"
+
+FS_BROWSER_CHROMIUM="$fake_usr/bin/chromium"
+FS_BROWSER_PLAYWRIGHT=""
+FS_BACKEND_CHROMIUM_OWN_SANDBOX=1
+out="$(fs_emit_browser_section)"
+contains "chromium alone: names the binary" "$out" "chromium: $fake_usr/bin/chromium"
+contains "chromium alone: screenshot recipe uses the resolved path" "$out" \
+    "$fake_usr/bin/chromium --headless=new"
+contains "chromium alone, own sandbox works: do-not-pass-no-sandbox line" "$out" \
+    "Chromium's own sandbox works here; do not pass --no-sandbox."
+lacks "chromium alone: does not mention the playwright cache" "$out" "playwright browser cache"
+
+FS_BACKEND_CHROMIUM_OWN_SANDBOX=0
+out="$(fs_emit_browser_section)"
+contains "chromium alone, own sandbox broken: pass-no-sandbox line" "$out" \
+    "Chromium's own sandbox does not work here; pass --no-sandbox."
+
+FS_BROWSER_PLAYWRIGHT="$fake_home/.cache/ms-playwright"
+FS_BACKEND_CHROMIUM_OWN_SANDBOX=1
+out="$(fs_emit_browser_section)"
+contains "chromium+playwright: announces both" "$out" \
+    "playwright browser cache: ~/.cache/ms-playwright (bound read-only)"
+contains "chromium+playwright: still names the chromium binary" "$out" \
+    "chromium: $fake_usr/bin/chromium"
+
+FS_BROWSER_CHROMIUM=""
+FS_BACKEND_CHROMIUM_OWN_SANDBOX=1
+out="$(fs_emit_browser_section)"
+contains "playwright-only: browser present but not on PATH" "$out" \
+    "though not on PATH"
+contains "playwright-only: points at the cache to find the binary" "$out" \
+    "find ~/.cache/ms-playwright -maxdepth 3"
+contains "playwright-only, own sandbox works: do-not-pass-no-sandbox line" "$out" \
+    "Chromium's own sandbox works here; do not pass --no-sandbox."
+lacks "playwright-only: does not claim a named chromium binary" "$out" "- chromium: "
+
+FS_BACKEND_CHROMIUM_OWN_SANDBOX=0
+out="$(fs_emit_browser_section)"
+contains "playwright-only, own sandbox broken: pass-no-sandbox line" "$out" \
+    "Chromium's own sandbox does not work here; pass --no-sandbox."
+
+unset FS_BROWSER_CHROMIUM FS_BROWSER_PLAYWRIGHT FS_BACKEND_CHROMIUM_OWN_SANDBOX
 
 echo ""
 echo "$pass passed, $fail failed"
