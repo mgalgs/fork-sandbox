@@ -1202,11 +1202,17 @@ fs_resolve_backend() {
 FS_BACKEND_TOOLCHAIN=host
 # shellcheck disable=SC2034  # written here, read by the sourcing scripts
 FS_BACKEND_HOSTS_ALIAS=0
+# Whether chromium's own inner sandbox (nested user namespaces) works under
+# this backend, so a caller never has to pass --no-sandbox to find out. See
+# docs/sandbox-backend.md's capabilities table.
+# shellcheck disable=SC2034  # written here, read by the sourcing scripts
+FS_BACKEND_CHROMIUM_OWN_SANDBOX=1
 
 fs_backend_capabilities() {
-    local bin="$1" out line key value
+    local bin="$1" out line key value chromium_own_sandbox_seen=0
     FS_BACKEND_TOOLCHAIN=host
     FS_BACKEND_HOSTS_ALIAS=0
+    FS_BACKEND_CHROMIUM_OWN_SANDBOX=1
     # Parse only a clean exit. A backend that refuses the option may still
     # print its usage, and a usage line can hold an '=' -- reading that as a
     # capability would be inventing an answer out of an error message.
@@ -1233,10 +1239,37 @@ fs_backend_capabilities() {
             # shellcheck disable=SC2034  # read by scripts sourcing this library
             [[ "$value" == 1 ]] && FS_BACKEND_HOSTS_ALIAS=1
             ;;
+        chromium_own_sandbox)
+            case "$value" in
+            0|1)
+                # shellcheck disable=SC2034  # read by the sourcing scripts
+                FS_BACKEND_CHROMIUM_OWN_SANDBOX="$value"
+                chromium_own_sandbox_seen=1
+                ;;
+            *)
+                echo "Warning: the backend reports chromium_own_sandbox='$value'," >&2
+                echo "which is not '0' or '1'. Defaulting by toolchain instead." >&2
+                ;;
+            esac
+            ;;
         esac
         # An unknown key is ignored on purpose: a newer backend may declare
         # properties this caller has never heard of.
     done <<< "$out"
+    # A backend written before this key existed declares neither value, so
+    # default by toolchain rather than leave the older, safer assumption
+    # (host, i.e. 1) in place unconditionally -- an older container-style
+    # backend would otherwise be told its chromium sandbox works when its
+    # toolchain=image already says the userland is not the host's.
+    if (( ! chromium_own_sandbox_seen )); then
+        if [[ "$FS_BACKEND_TOOLCHAIN" == host ]]; then
+            # shellcheck disable=SC2034  # read by the sourcing scripts
+            FS_BACKEND_CHROMIUM_OWN_SANDBOX=1
+        else
+            # shellcheck disable=SC2034  # read by the sourcing scripts
+            FS_BACKEND_CHROMIUM_OWN_SANDBOX=0
+        fi
+    fi
     return 0
 }
 
@@ -1591,6 +1624,66 @@ fs_cache_binds() {
     # needs a browser has to carry its own.
     if [[ -d "$pw_root" && "$FS_BACKEND_TOOLCHAIN" == host ]]; then
         FS_CACHE_FLAGS+=(--bind-ro "$pw_root")
+    fi
+    return 0
+}
+
+# Candidate binary names for a system chromium, tried in order with
+# `command -v`. A list rather than one name because distros disagree:
+# Debian/Ubuntu ships chromium or chromium-browser, Arch ships chromium, and
+# Google's own package is google-chrome-stable (google-chrome on older
+# installs). A variable, not a literal in fs_detect_browser, so a test can
+# point it at fake names without installing a real browser.
+FS_BROWSER_CHROMIUM_CANDIDATES=(chromium chromium-browser google-chrome-stable google-chrome)
+
+# The path prefix a resolved chromium must live under to be trusted. /usr is
+# the read-only mount every host-toolchain sandbox backend carries in, so a
+# binary resolved anywhere else (a user's ~/bin shim, say) is not actually
+# there at run time even though `command -v` finds it on the host doing the
+# detecting. A variable, not a literal, so a test can point this at a temp
+# tree instead of requiring a real chromium under /usr.
+FS_BROWSER_USR_PREFIX="/usr/"
+
+# G1 detect: whether a usable browser exists for THIS sandbox run, mirroring
+# fs_cache_binds' own Playwright condition exactly -- a mismatch here would
+# have the prompt announce a cache that was never bound, or stay silent about
+# one that was. Fills, empty string meaning absent:
+#
+#   FS_BROWSER_CHROMIUM     resolved path to a system chromium
+#   FS_BROWSER_PLAYWRIGHT   $HOME/.cache/ms-playwright, when that dir exists
+#
+# Both are forced empty when the backend's toolchain is not `host`: an image
+# toolchain's userland is the image's, not the host's, and the default image
+# ships no browser (images/sandbox/Dockerfile). Both are also forced empty
+# when FORK_SANDBOX_BROWSER is `0` or `none` -- an operator's explicit "there
+# is no usable browser here" (or "don't bother," e.g. a flaky host chromium),
+# taken at its word rather than second-guessed by detection. Unset or `auto`
+# (the default) detects normally.
+fs_detect_browser() {
+    FS_BROWSER_CHROMIUM=""
+    FS_BROWSER_PLAYWRIGHT=""
+
+    case "${FORK_SANDBOX_BROWSER:-auto}" in
+    0 | none) return 0 ;;
+    esac
+    [[ "$FS_BACKEND_TOOLCHAIN" == host ]] || return 0
+
+    local name resolved
+    for name in "${FS_BROWSER_CHROMIUM_CANDIDATES[@]}"; do
+        resolved="$(command -v -- "$name" 2>/dev/null)" || continue
+        case "$resolved" in
+        "$FS_BROWSER_USR_PREFIX"*)
+            # shellcheck disable=SC2034  # read by the sourcing scripts
+            FS_BROWSER_CHROMIUM="$resolved"
+            break
+            ;;
+        esac
+    done
+
+    local pw_root="$HOME/.cache/ms-playwright"
+    if [[ -d "$pw_root" ]]; then
+        # shellcheck disable=SC2034  # read by the sourcing scripts
+        FS_BROWSER_PLAYWRIGHT="$pw_root"
     fi
     return 0
 }

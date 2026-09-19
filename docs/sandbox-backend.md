@@ -87,13 +87,14 @@ to remove it afterwards.
 sandbox-backend-<name> --capabilities
 ```
 
-Prints `key=value` lines to stdout and exits 0, running nothing. One key is
+Prints `key=value` lines to stdout and exits 0, running nothing. Keys
 defined:
 
 | Key | Values | Meaning |
 |---|---|---|
 | `toolchain` | `host` \| `image` | Whether the sandbox inherits the host's userland. |
 | `hosts_alias` | `1` | Whether the backend supports `--hosts-alias`. Callers needing an endpoint hostname must refuse when it is absent. |
+| `chromium_own_sandbox` | `0` \| `1` | Whether chromium's own inner sandbox (nested user namespaces) works under this backend, so a caller never has to discover it by trying `--no-sandbox`. Absent defaults by toolchain: `1` for `host`, `0` for `image`. See [visual-browser.md](visual-browser.md). |
 
 `host` means the backend mounts the host's `/usr`, so a binary bound in from
 the host runs — bwrap. `image` means the userland comes from somewhere else and

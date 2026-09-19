@@ -93,6 +93,12 @@ fi
 if [[ "${1-}" == --capabilities ]]; then
     echo "toolchain=image"
     echo "hosts_alias=1"
+    # Docker's default seccomp profile blocks the nested user namespaces
+    # chromium's own sandbox needs (see this file's header), so a chromium
+    # running here would need --no-sandbox. No image ships a browser today
+    # (see docs/visual-browser.md), so this is not yet measured against a
+    # real one -- it records the seccomp constraint that would apply.
+    echo "chromium_own_sandbox=0"
     exit 0
 fi
 

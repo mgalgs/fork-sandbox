@@ -208,6 +208,11 @@ fi
 if [[ "${1-}" == --capabilities ]]; then
     echo "toolchain=host"
     echo "hosts_alias=1"
+    # bwrap leaves nested user namespaces available, so a chromium bound in
+    # from the host (via /usr) keeps its own inner sandbox -- no
+    # --no-sandbox needed. Measured 2026-09-18 on Arch; see
+    # docs/visual-browser.md.
+    echo "chromium_own_sandbox=1"
     exit 0
 fi
 
