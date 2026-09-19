@@ -1,9 +1,10 @@
 # Visual browser driving in a sandboxed run
 
-**Status: design draft — nothing here is built yet.** This follows the
-pattern [sandbox-backend.md](sandbox-backend.md) set: the contract is
-written down and agreed before implementation, because the parts that have
-to be right are cheaper to get right on paper.
+**Status: built for the bwrap backend.** G1 (detect), G2 (announce) and G3
+(smoke) are all implemented and tested for `bwrap`. The container backend
+gets G1/G2 too, but today that is always the announced-absence path: the
+default image ships no browser, so there is nothing yet for a container G3
+smoke to screenshot — it waits on a browser-carrying image.
 
 The goal: a sandboxed agent can render the app it is working on and *see*
 it — one-shot screenshots at minimum, stateful driving (click, type,
@@ -56,7 +57,10 @@ machinery.
    renders" is exactly the kind of discovery an unattended session should
    never spend its run on. The answer must be established once, on each
    supported backend, and encoded — in the wrapper or the prompt, not in
-   folklore.
+   folklore. **Settled**: encoded as the `chromium_own_sandbox` capability
+   key (see [sandbox-backend.md](sandbox-backend.md)'s capabilities
+   section), which `fs_backend_capabilities` parses and G2's prompt
+   section reads to flip its `--no-sandbox` sentence.
 3. **Stateful driving is repo tooling, not harness tooling.** A
    ref-driven Playwright CLI (a repo may commit one under its own tree,
    e.g. `etc/browser-tools/`) wants project-specific setup — which page,
@@ -123,9 +127,10 @@ are worth capturing.
   harmless dbus noise. G2's wording for the bwrap backend can state
   exactly those flags. The container backend still needs its own run of
   the same experiment.
-- Q2: should G2's detection prefer the Playwright cache or the system
-  chromium when both exist? Leaning: Playwright cache, since repo tooling
-  that cares (agent-browser) resolves through Playwright's own lookup.
+- Q2 — **settled**: announce both when both exist, rather than picking one.
+  Chromium carries the screenshot recipe; the Playwright cache serves repo
+  tooling (agent-browser, say) that resolves through Playwright's own
+  lookup regardless of what G2 says about chromium.
 - Q3: is a headed (non-headless) mode ever worth supporting in-sandbox
   (via Xvfb) for tools that misbehave headless? Leaning no until a real
   task hits it.
