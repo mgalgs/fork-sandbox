@@ -141,14 +141,14 @@
 #                        no single review/maintain seat, or code seat past
 #                        the first, for a flag to override: there,
 #                        --model/--harness/--review-*/--maintainer-*/--k8s
-#                        are refused outright instead. A composed pipeline
-#                        is refused outright at launch even with none of
-#                        those flags given -- the run engine that walks an
-#                        arbitrary step list is not built yet, so only a
-#                        legacy-shaped pipeline (one code step, then at
-#                        most one review step, then at most one maintain
-#                        step, in that order) can actually run. Needs
-#                        PyYAML. See docs/presets.md for the file format.
+#                        are refused outright instead. The run engine walks
+#                        an arbitrary step list, so a composed pipeline runs
+#                        locally exactly as authored -- --k8s is the one
+#                        path that still only accepts a legacy-shaped
+#                        pipeline (one code step, then at most one review
+#                        step, then at most one maintain step, in that
+#                        order). Needs PyYAML. See docs/presets.md for the
+#                        file format.
 # --task-meta '<json>':  one JSON object of orchestrator-supplied task
 #                        metadata -- kind, difficulty, size,
 #                        prompt_template_id, stage -- stored beside the run

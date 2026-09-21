@@ -354,13 +354,98 @@ sandbox-run-log.py stats --by preset.name
 sandbox-run-log.py stats --by preset.name,model
 ```
 
+## Composed runs: artifacts on disk, and the ledger key
+
+A **legacy-shaped** run (one code step, then at most one review step, then
+at most one maintain step) writes the historical, unindexed names:
+`review-loop.json`, `maintainer-loop.json`, `review-verdict-<N>.md`,
+`maintainer-verdict-<N>.md`, `review-prompt-<N>.md`,
+`maintainer-prompt-<N>.md`, `events-review-<N>.jsonl`,
+`events-maintainer-<N>.jsonl`, `events-fix-<N>.jsonl`,
+`events-mntfix-<N>[-p<P>].jsonl`, `events-code-<N>.jsonl`,
+`events-continuation-<N>.jsonl`.
+
+A **composed** run (anything else this grammar can express — free step
+order, more than one review or maintain step, review after maintain, and
+so on) writes step-indexed names instead, where `<K>` is the 1-based step
+number in pipeline order: `step-<K>-loop.json`,
+`s<K>-review-verdict-<i>.md`, `s<K>-maintain-verdict-<i>.md`,
+`step-<K>-prompt-<i>.md`, and
+`events-s<K>-(code|review|maintain|fix)-<N>[-p<P>].jsonl`. A run launched
+with `--preset` also writes `pipeline.json` (see "Provenance" above for
+`preset.json`/`preset.yaml`, which are separate files) — its `steps` array
+is the source of truth this section's canonical key is built from. Note
+that a composed step's saved loop record always uses the `review_model`/
+`review_harness` field names, even for a `maintain` step — only a
+*legacy* maintainer step gets `maintainer_model`/`maintainer_harness`; a
+reader has to consult `pipeline.json`'s own `action` for the step to tell
+review and maintain apart.
+
+`fork-sandbox-status.sh` reads both artifact shapes, and its report comes
+from the verdict of the highest step index that produced one (ties break to
+the highest iteration) — in a legacy-shaped run that is the maintainer's
+verdict, same as it always was, just stated as one rule instead of two.
+
+### Keying the run log by composition, not by name
+
+`sandbox-run-log.py record` computes two fields from `pipeline.json`'s
+`steps` array, present only when that file exists (a flag-driven run,
+which writes no `pipeline.json`, gets neither field, and so cannot yet be
+compared against a preset run in `stats` — the alternative, synthesizing a
+composition from `run.env`, would give one concept two derivations, which
+is the exact problem this design removes):
+
+- **`composition`** — the canonical identity: each step reduced to exactly
+  `action`, `harness`, `model`, `repeat`, `network`, `fix` (and `fix`, when
+  set, reduced to exactly `harness`, `model`, `repeat`), then the whole
+  array serialized as compact, key-sorted JSON
+  (`json.dumps(steps, sort_keys=True, separators=(",", ":"))`). Step order
+  is part of the identity and is never reordered. JSON, not a
+  punctuation-joined token string, because a model id can legitimately
+  contain both `/` (an OpenRouter `vendor/model-name` id) and `:` (an
+  ollama-style `qwen2.5:7b` id) — any joined-string separator collides
+  with some real model id, where JSON escapes for free.
+- **`composition_short`** — a best-effort display label, never a grouping
+  key: per step, in order, `<stage-letter><model-letter-or-slug><repeat>`
+  joined with `-` (`code`/`review`/`maintain` → `c`/`r`/`m`; a model id
+  containing `sonnet`/`opus`/`haiku` maps to `s`/`o`/`h`; anything else
+  slugs to the first 4 lowercased `[a-z0-9]` characters after its last
+  `/`, or `x` for no model). If any step took the slug path, a final
+  `-<4 hex chars>` — the first 4 hex characters of the sha256 of the
+  canonical string — is appended, so the reader can tell the shortname
+  alone did not pin down the composition.
+
+**Renaming or copying a preset file never changes `composition`** — it is
+computed from step content alone, which is exactly what lets `stats` group
+runs of one preset that got renamed, or two differently-named presets that
+happen to compose identically, together. `stats --by composition` groups
+on this raw canonical value but prints `composition_short` in the cell —
+grouping on the shortname, or on the preset's own name, would risk
+silently merging two different compositions, which defeats the reason this
+key exists. **Never group by the preset name or by `composition_short`
+alone** when the question is "which compositions am I comparing" —
+`--by composition_short` stays available, but stays honest about being a
+display-only grouping that can merge distinct compositions.
+
+`sandbox-run-log.py record` also folds every `step-<K>-loop.json` it finds
+into the run record's `steps` array (ordered by `<K>`, each element the
+parsed loop record plus `step` and `action`, the latter read from
+`pipeline.json`, per the field-name trap above) — present only when at
+least one such file exists. A composed run therefore carries `steps` and
+neither `review_loop` nor `maintainer_loop`; a legacy run carries the
+reverse; a run never carries both.
+
+```
+sandbox-run-log.py stats --by composition
+sandbox-run-log.py stats --by composition_short
+```
+
 ## Where the syntax stops
 
 The pipeline vocabulary is exactly the legs the execution machinery has
-(free-order and repeated-step composition is grammar the parser accepts
-ahead of the run engine's walk over it, per "pipeline" above — not the
-general DSL below). What the syntax does not have, no engine — present or
-planned — has either:
+(free-order and repeated-step composition, per "pipeline" above, is
+grammar the run engine actually walks — not the general DSL below). What
+the syntax does not have, no engine — present or planned — has either:
 
 - **No conditional vocabulary.** Approval ends a loop, the cap ends it,
   no-progress ends it — those are the verbs' meaning, not options to
