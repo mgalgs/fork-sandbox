@@ -1448,6 +1448,22 @@ if [[ -n "${rd_codex_args:-}" ]]; then
     fi
 fi
 
+# --codex-args belongs to the implementation command. A separately resolved
+# Codex review harness must not inherit it.
+prep_stub $'commit\nnoop'
+rd_codex_review_args="$(run_stubbed --harness codex/gpt-5.6-sol \
+    --codex-args '-c model_reasoning_effort=high' \
+    --review-loop 1 --review-harness codex --review-model gpt-5.6-sol \
+    --branch "sandbox-test-codex-review-args-$$")" && tmpdirs+=("$rd_codex_review_args")
+if [[ -n "${rd_codex_review_args:-}" ]]; then
+    impl_codex_cmd_line="$(grep '^sandbox_cmd=' "$rd_codex_review_args/run.sh")"
+    review_codex_cmd_line="$(grep '^review_sandbox_cmd=' "$rd_codex_review_args/run.sh")"
+    contains "codex extra arguments stay on the implementation command" \
+        "$impl_codex_cmd_line" 'model_reasoning_effort=high'
+    lacks "a separate codex review command excludes implementation arguments" \
+        "$review_codex_cmd_line" 'model_reasoning_effort=high'
+fi
+
 # A. Repeat passes: repeat: 3 on the code agent runs three coding legs on
 # the same prompt, unconditionally, and the run ends after the last.
 cat > "$real_presets/rep3.yaml" <<'EOF'

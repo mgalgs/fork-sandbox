@@ -4340,7 +4340,9 @@ codex)
     if [[ -n "$rh_model" ]]; then
         harness_cmd+=(--model "$rh_model")
     fi
-    if (( ${#codex_extra_argv[@]} )); then
+    # --codex-args has no per-leg form, so it applies only to the
+    # implementation command, like --claude-args below.
+    if [[ "$prefix" == impl ]] && (( ${#codex_extra_argv[@]} )); then
         harness_cmd+=("${codex_extra_argv[@]}")
     fi
     harness_cmd+=(-)
