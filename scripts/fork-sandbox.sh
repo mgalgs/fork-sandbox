@@ -208,6 +208,9 @@
 #                        enough to reach another run's clone or the rest
 #                        of the mail store. The postmaster uses this to
 #                        hand a wake its thread's own attachments
+# --thread-dir <dir>:    bind an existing rendered mail-thread directory
+#                        read-only at /thread inside a local run. Refused
+#                        with --k8s for the same host-bind reason.
 #                        directory under the mail store. Refused with
 #                        --k8s.
 # --session-state <dir>: bind <dir> read-WRITE into the sandbox at the
@@ -1455,6 +1458,7 @@ task_meta=""
 context_ro=""
 fixtures_dir=""
 attach_dir=""
+thread_dir=""
 session_state=""
 resume_session=""
 session_id_arg=""
@@ -1584,6 +1588,10 @@ while [[ "${1:-}" == -* ]]; do
             ;;
         --attach-dir)
             attach_dir="${2:?--attach-dir requires a directory}"
+            shift 2
+            ;;
+        --thread-dir)
+            thread_dir="${2:?--thread-dir requires a directory}"
             shift 2
             ;;
         --session-state)
@@ -2696,6 +2704,12 @@ if [[ "$k8s_mode" == true ]]; then
     fi
     if [[ -n "$attach_dir" ]]; then
         echo "Error: --attach-dir is not supported with --k8s. It binds a host" >&2
+        echo "directory into a local sandbox; a cluster run has no host directory" >&2
+        echo "to bind." >&2
+        exit 1
+    fi
+    if [[ -n "$thread_dir" ]]; then
+        echo "Error: --thread-dir is not supported with --k8s. It binds a host" >&2
         echo "directory into a local sandbox; a cluster run has no host directory" >&2
         echo "to bind." >&2
         exit 1
@@ -3817,6 +3831,17 @@ if [[ -n "$attach_dir" ]]; then
     fi
     if [[ ! -d "$attach_dir" ]]; then
         echo "Error: --attach-dir path '$attach_dir' is not a directory." >&2
+        exit 1
+    fi
+fi
+if [[ -n "$thread_dir" ]]; then
+    thread_dir="$(fs_validate_scratch_dir "$thread_dir" --thread-dir)" || exit 1
+    if [[ ! -e "$thread_dir" ]]; then
+        echo "Error: --thread-dir directory '$thread_dir' does not exist." >&2
+        exit 1
+    fi
+    if [[ ! -d "$thread_dir" ]]; then
+        echo "Error: --thread-dir path '$thread_dir' is not a directory." >&2
         exit 1
     fi
 fi
@@ -6149,6 +6174,9 @@ fs_build_sandbox_cmd() {
     fi
     if [[ -n "$attach_dir" ]]; then
         out+=(--bind-ro-at "$attach_dir" /attachments)
+    fi
+    if [[ -n "$thread_dir" ]]; then
+        out+=(--bind-ro-at "$thread_dir" /thread)
     fi
     # The operator inbox, for every harness. Read-only, so this widens
     # nothing the sandbox can write; it is the one path a host can put
