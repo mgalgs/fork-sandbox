@@ -1321,6 +1321,14 @@ for a in "$@"; do
     [[ "$a" == "--dangerously-skip-permissions" ]] && clone_dir="$prev"
     prev="$a"
 done
+if [[ -z "$clone_dir" ]]; then
+    # Only claude's argv carries a flag to anchor on. codex and pi get
+    # "<clone dir> <harness cmd...>" with nothing recognisable after it, so
+    # find the one argument that is itself a git worktree.
+    for a in "$@"; do
+        [[ -d "$a/.git" ]] && clone_dir="$a"
+    done
+fi
 
 prompt="$(cat)"
 n=0
@@ -1336,6 +1344,13 @@ verdict_name="$(printf '%s\n' "$prompt" | sed -nE 's|.*\.git/(s[0-9]+-verdict\.m
 [[ -n "$verdict_name" ]] || verdict_name=review-verdict.md
 case "$action" in
 commit)
+    # An empty clone_dir would make this `git -C ""`, which commits into the
+    # CWD -- silently adding junk commits to whatever repo the suite is run
+    # from. Fail loudly instead.
+    if [[ -z "$clone_dir" ]]; then
+        printf 'stub: no clone dir in argv; refusing to commit\n' >&2
+        exit 70
+    fi
     git -c user.email=t@fork-sandbox.invalid -c user.name=Tester \
         -C "$clone_dir" commit --allow-empty -q -m "stub leg $n"
     ;;
