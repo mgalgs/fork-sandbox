@@ -308,5 +308,101 @@ not_contains "record confirmation never renders present-and-null fields as None"
 contains "record confirmation renders unknown exit and commit values as question marks" \
     "exit ?, ? commit(s)" "$out"
 
+printf '\n== record: composition/composition_short from pipeline.json ==\n'
+# Two runs with byte-identical `steps` content but launched from
+# differently-NAMED preset files -- the rename-stranding case item 62
+# exists to fix. Both models hit the registered letter table (sonnet),
+# so neither shortname gets the collision-warning hash suffix.
+pipeline_cs2_rs2='{"steps":[
+  {"action":"code","harness":"claude","model":"claude-sonnet-4-5-20250929","repeat":1,"network":null,"fix":null},
+  {"action":"review","harness":"claude","model":"claude-sonnet-4-5-20250929","repeat":2,"network":null,"fix":null}
+]}'
+
+rd_comp_a="$(mk_run_dir comp-rename-a)"
+tmpdirs+=("$rd_comp_a")
+printf '%s\n' "$pipeline_cs2_rs2" > "$rd_comp_a/pipeline.json"
+printf '0\n' > "$rd_comp_a/exit-code"
+record "$rd_comp_a" >/dev/null 2>"$tmp/err"
+
+rd_comp_b="$(mk_run_dir comp-rename-b)"
+tmpdirs+=("$rd_comp_b")
+printf '%s\n' "$pipeline_cs2_rs2" > "$rd_comp_b/pipeline.json"
+printf '0\n' > "$rd_comp_b/exit-code"
+record "$rd_comp_b" >/dev/null 2>"$tmp/err"
+
+comp_a="$(record_field "$(basename "$rd_comp_a")" composition)"
+comp_b="$(record_field "$(basename "$rd_comp_b")" composition)"
+check "identical steps content yields an identical composition regardless of preset filename" \
+    "$comp_a" "$comp_b"
+check "composition_short has no hash suffix when every model hits the letter table" \
+    "cs1-rs2" "$(record_field "$(basename "$rd_comp_a")" composition_short)"
+
+printf '\n== record: a model id containing both / and : does not collide ==\n'
+# The separator trap docs/presets.md 3b warns about: an OpenRouter-shaped
+# id with a colon in the tag. JSON serialization must not confuse this
+# with a joined string built from a different step split at the same
+# character.
+rd_slash_colon="$(mk_run_dir comp-slashcolon)"
+tmpdirs+=("$rd_slash_colon")
+cat > "$rd_slash_colon/pipeline.json" <<'EOF'
+{"steps":[
+  {"action":"code","harness":"pi","model":"vendor/model:tag","repeat":1,"network":"sealed","fix":null}
+]}
+EOF
+printf '0\n' > "$rd_slash_colon/exit-code"
+record "$rd_slash_colon" >/dev/null 2>"$tmp/err"
+contains "a model id with both / and : serializes without error" \
+    "vendor/model:tag" \
+    "$(record_field "$(basename "$rd_slash_colon")" composition)"
+short_slashcolon="$(record_field "$(basename "$rd_slash_colon")" composition_short)"
+case "$short_slashcolon" in
+    c*-????) ok "shortname with an unmapped model carries a 4-char hash suffix" ;;
+    *) no "shortname with an unmapped model carries a 4-char hash suffix" "got '$short_slashcolon'" ;;
+esac
+
+printf '\n== record: a flag-driven run (no pipeline.json) gets neither field ==\n'
+rd_flagdriven="$(mk_run_dir comp-flagdriven)"
+tmpdirs+=("$rd_flagdriven")
+cat > "$rd_flagdriven/review-loop.json" <<'EOF'
+{"cap":3,"review_model":null,"review_harness":null,"fix_harness":null,"fix_model":null,"fix_repeat":null,"ended":"approved","detail":null,"coding_exit_code":0,"iterations":[]}
+EOF
+printf '0\n' > "$rd_flagdriven/exit-code"
+record "$rd_flagdriven" >/dev/null 2>"$tmp/err"
+check "a flag-driven run has no composition field" \
+    "" "$(record_field "$(basename "$rd_flagdriven")" composition)"
+check "a flag-driven run has no composition_short field" \
+    "" "$(record_field "$(basename "$rd_flagdriven")" composition_short)"
+out="$(query show "$(basename "$rd_flagdriven")")"
+contains "a flag-driven run's review_loop is recorded as before" \
+    '"review_loop"' "$out"
+
+printf '\n== record: steps -- composed per-step loop records, keyed off pipeline.json ==\n'
+rd_steps="$(mk_run_dir comp-steps)"
+tmpdirs+=("$rd_steps")
+cat > "$rd_steps/pipeline.json" <<'EOF'
+{"steps":[
+  {"action":"code","harness":"claude","model":"claude-sonnet-4-5-20250929","repeat":1,"network":null,"fix":null},
+  {"action":"maintain","harness":"claude","model":"claude-opus-4-5-20250929","repeat":1,"network":null,"fix":null}
+]}
+EOF
+cat > "$rd_steps/step-2-loop.json" <<'EOF'
+{"cap":1,"review_model":"claude-opus-4-5-20250929","review_harness":"claude","fix_harness":null,"fix_model":null,"fix_repeat":null,"ended":"approved","detail":null,"coding_exit_code":0,"iterations":[]}
+EOF
+printf '0\n' > "$rd_steps/exit-code"
+record "$rd_steps" >/dev/null 2>"$tmp/err"
+out="$(query show "$(basename "$rd_steps")")"
+contains "a composed maintain step's record is labeled action=maintain, not review" \
+    '"action": "maintain"' "$out"
+contains "a composed step's loop record keeps its review_model field flavor" \
+    '"review_model": "claude-opus-4-5-20250929"' "$out"
+not_contains "a composed run has no legacy maintainer_loop key" \
+    '"maintainer_loop"' "$out"
+
+printf '\n== stats: --by composition groups on the canonical value, prints the shortname ==\n'
+out="$(query stats --by composition 2>/dev/null)"
+contains "stats --by composition prints the shortname cell" "cs1-rs2" "$out"
+not_contains "stats --by composition does not print the raw canonical JSON" \
+    '"action":"code"' "$out"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))
