@@ -7516,25 +7516,36 @@ if [[ -z "$model" && -s "$sandbox_log" ]]; then
         "$sandbox_log" | head -n1)"
 fi
 
-# pipeline.json's step 0 is the code seat whenever one exists, and the same
-# model this script only just discovered above is what that step's model
-# field owes the reader. This script is the generated run.sh, a separate
-# program from the launcher that wrote pipeline.json -- run_step_kind is a
-# launcher-only array that never reaches here, so the "is step 0 the code
-# seat" check has to read the fact back out of pipeline.json itself rather
-# than out of that array. -s guards a run that never wrote pipeline.json at
-# all (no preset, or --review-only, whose step 0 is review and so the jq
-# filter's own action check leaves untouched regardless).
+# Every pi-local seat in this run -- any step (code, review or maintain)
+# whose harness/network pair reads "pi"/"sealed" with no model yet, and any
+# fix seat whose harness reads the literal "pi-local" -- owes the reader the
+# same backfill: config_dir/model.env is one file per machine, not one per
+# seat, so every pi-local seat in a single run necessarily discovers the
+# same model. Leaving one null would give the identical physical seat two
+# encodings in one file. This is true whether or not that seat's own leg
+# ever actually runs (a later step can be skipped, or a fix seat never
+# triggered) -- it will discover the identical model the moment it does,
+# so there is nothing to lose by writing it in now.
 #
-# Any fix seat's harness that reads "pi-local" owes the reader the same
-# backfill: config_dir/model.env is one file per machine, not one per seat,
-# so every pi-local seat in this run -- the code seat and any fix seat
-# folded to that spelling when pipeline.json was written -- necessarily
-# discovers the same model. Leaving a fix seat's model null after this point
-# would give the identical physical seat two encodings in one file.
+# This script is the generated run.sh, a separate program from the launcher
+# that wrote pipeline.json -- run_step_kind is a launcher-only array that
+# never reaches here, so this has to read the fact back out of pipeline.json
+# itself rather than out of that array. -s guards a run that never wrote
+# pipeline.json at all (no preset, or --review-only, whose step 0 is review
+# and so the harness/network check leaves it untouched regardless).
+#
+# A step's own harness/network pair already reads "pi"/"sealed" only after
+# the compile-time pi-local expansion (see pipeline.json's own emission
+# block above); a fix seat's harness keeps the literal "pi-local" spelling
+# instead, because the fix schema carries no network field to say "sealed"
+# any other way -- so the two seat flavors need two different match
+# conditions in the filter below, not one.
 if [[ -n "$model" && -s "$run_dir/pipeline.json" ]]; then
     if jq --arg model "$model" \
-        'if .steps[0].action == "code" then .steps[0].model = $model else . end
+        '.steps |= map(
+             if .harness == "pi" and .network == "sealed" and .model == null
+             then .model = $model
+             else . end)
          | .steps |= map(
              if .fix != null and .fix.harness == "pi-local" and .fix.model == null
              then .fix.model = $model

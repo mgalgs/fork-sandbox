@@ -1580,6 +1580,41 @@ else
     no "sealed-review launch succeeds"
 fi
 
+# A4. A pi-local review STEP itself (not the code seat, not a fix seat) --
+# the case round 3 closes. The reviewer agent is pi-local at a review step,
+# whose own leg never runs at all (the coder's pi-local pass is a "noop",
+# so the branch never moves past base_sha and the review step is marked
+# skipped before run_leg is ever called for it) -- proving the backfill
+# does not depend on the seat's own leg having executed, only on some
+# pi-local leg in the run (here, the code seat) having discovered the
+# model first.
+cat > "$real_presets/sealed-review-step.yaml" <<'EOF'
+agents:
+  coder:
+    harness: pi-local
+  reviewer:
+    harness: pi-local
+pipeline:
+  - action: code
+    agent: coder
+  - action: review
+    repeat: 1
+    agent: reviewer
+EOF
+prep_stub 'noop'
+if rd_a4="$(run_stubbed --preset sealed-review-step \
+    --branch "sandbox-test-sealed-review-step-$$")"; then
+    tmpdirs+=("$rd_a4")
+    check "the sealed review step's harness is pi (pi-local, expanded)" \
+        "pi" "$(jq -r '.steps[1].harness' "$rd_a4/pipeline.json")"
+    check "the sealed review step's network is sealed" \
+        "sealed" "$(jq -r '.steps[1].network' "$rd_a4/pipeline.json")"
+    check "the sealed review step's own model is backfilled, not left null" \
+        "vendor/discovered-model" "$(jq -r '.steps[1].model' "$rd_a4/pipeline.json")"
+else
+    no "sealed-review-step launch succeeds"
+fi
+
 # D. A definition edited between the staging and the run dir -- the race the
 # provenance exists around: the recorded sha256 must identify the staged
 # bytes, not the edit, and the run-dir copy must be those bytes.
