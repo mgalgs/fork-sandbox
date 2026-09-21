@@ -1464,6 +1464,24 @@ if [[ -n "${rd_codex_review_args:-}" ]]; then
         "$review_codex_cmd_line" 'model_reasoning_effort=high'
 fi
 
+# The ordinary review and maintainer paths copy the implementation command,
+# rather than resolving a dedicated harness. They must remove the same
+# implementation-only Codex arguments before changing their models.
+prep_stub $'commit\nnoop\nnoop'
+rd_codex_default_leg_args="$(run_stubbed --harness codex/gpt-5.6-sol \
+    --codex-args '-c model_reasoning_effort=high' \
+    --review-loop 1 --review-model gpt-5.6-sol \
+    --maintainer-loop 1 --maintainer-model gpt-5.6-sol \
+    --branch "sandbox-test-codex-default-leg-args-$$")" && tmpdirs+=("$rd_codex_default_leg_args")
+if [[ -n "${rd_codex_default_leg_args:-}" ]]; then
+    default_review_codex_cmd_line="$(grep '^review_sandbox_cmd=' "$rd_codex_default_leg_args/run.sh")"
+    default_maintainer_codex_cmd_line="$(grep '^maintainer_sandbox_cmd=' "$rd_codex_default_leg_args/run.sh")"
+    lacks "a default codex review command excludes implementation arguments" \
+        "$default_review_codex_cmd_line" 'model_reasoning_effort=high'
+    lacks "a default codex maintainer command excludes implementation arguments" \
+        "$default_maintainer_codex_cmd_line" 'model_reasoning_effort=high'
+fi
+
 # A. Repeat passes: repeat: 3 on the code agent runs three coding legs on
 # the same prompt, unconditionally, and the run ends after the last.
 cat > "$real_presets/rep3.yaml" <<'EOF'

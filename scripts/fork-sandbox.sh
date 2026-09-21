@@ -6361,6 +6361,34 @@ fs_build_sandbox_cmd() {
     fi
 }
 
+# A review or maintainer leg without a separately named harness shares the
+# implementation sandbox command.  Codex's --codex-args are the one part of
+# that command which is explicitly implementation-only, so remove the exact
+# suffix fs_resolve_harness placed immediately before its stdin marker before
+# either fallback leg patches in its own model.
+fs_strip_impl_codex_args() {
+    local out_name="$1"
+    local -n out="$out_name"
+    local marker_i start_i i
+
+    (( ${#codex_extra_argv[@]} )) || return 0
+    marker_i=$(( ${#out[@]} - 1 ))
+    start_i=$(( marker_i - ${#codex_extra_argv[@]} ))
+    if (( start_i < 0 )) || [[ "${out[$marker_i]:-}" != "-" ]]; then
+        echo "Error: cannot remove implementation-only --codex-args from" >&2
+        echo "the fallback leg command: its stdin marker was not final." >&2
+        exit 1
+    fi
+    for i in "${!codex_extra_argv[@]}"; do
+        if [[ "${out[$((start_i + i))]}" != "${codex_extra_argv[$i]}" ]]; then
+            echo "Error: cannot remove implementation-only --codex-args from" >&2
+            echo "the fallback leg command: its argument suffix changed." >&2
+            exit 1
+        fi
+    done
+    out=("${out[@]:0:start_i}" "${out[@]:marker_i}")
+}
+
 # "sandbox_cmd" is itself the out-array-name passed in, and
 # "impl_pi_session_dir" only exists as the nameref inside fs_build_sandbox_cmd
 # wrote it into being -- shellcheck cannot trace either through the dynamic
@@ -6435,6 +6463,9 @@ else
     # positive as fs_resolve_harness's "impl_*"/"rev_*" outputs.
     # shellcheck disable=SC2154
     review_sandbox_cmd=("${sandbox_cmd[@]}")
+    if [[ "$harness" == "codex" ]]; then
+        fs_strip_impl_codex_args review_sandbox_cmd
+    fi
     if [[ -n "$review_model" ]]; then
         if [[ "$harness" == "claude" ]]; then
             # Last occurrence wins, including over one supplied in --claude-args.
@@ -6529,6 +6560,9 @@ if (( maintainer_loop_cap > 0 )); then
         # -- the same false positive as the review fallback's.
         # shellcheck disable=SC2154
         maintainer_sandbox_cmd=("${sandbox_cmd[@]}")
+        if [[ "$harness" == "codex" ]]; then
+            fs_strip_impl_codex_args maintainer_sandbox_cmd
+        fi
         if [[ "$harness" == "claude" ]]; then
             # Last occurrence wins, including over one supplied in --claude-args.
             maintainer_sandbox_cmd+=(--model "$maintainer_model")
