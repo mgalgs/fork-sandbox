@@ -435,7 +435,7 @@ def composition_slug(model):
     if not model:
         return "x"
     text = model.rsplit("/", 1)[-1].lower()
-    slug = "".join(ch for ch in text if ch.isalnum())
+    slug = "".join(ch for ch in text if ch in "abcdefghijklmnopqrstuvwxyz0123456789")
     return slug[:4] or "x"
 
 

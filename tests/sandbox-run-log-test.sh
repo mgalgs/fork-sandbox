@@ -360,6 +360,28 @@ case "$short_slashcolon" in
     *) no "shortname with an unmapped model carries a 4-char hash suffix" "got '$short_slashcolon'" ;;
 esac
 
+printf '\n== record: an unmapped model with non-ASCII letters slugs to [a-z0-9] only ==\n'
+# docs/presets.md 3c's slug rule is "[a-z0-9] after lowercasing", not
+# str.isalnum() -- Unicode letters and digits pass isalnum() but are not
+# in [a-z0-9], so a naive isalnum() filter would leak non-ASCII bytes into
+# a value the contract says is display-safe ASCII. Built via \xHH escapes,
+# not a literal non-ASCII byte in this source file.
+model_unicode=$'vendor/m\xc3\xb6d\xc3\xa9l-7'
+rd_unicode="$(mk_run_dir comp-unicode)"
+tmpdirs+=("$rd_unicode")
+cat > "$rd_unicode/pipeline.json" <<EOF
+{"steps":[
+  {"action":"code","harness":"pi","model":"$model_unicode","repeat":1,"network":"sealed","fix":null}
+]}
+EOF
+printf '0\n' > "$rd_unicode/exit-code"
+record "$rd_unicode" >/dev/null 2>"$tmp/err"
+short_unicode="$(record_field "$(basename "$rd_unicode")" composition_short)"
+case "$short_unicode" in
+    cmdl71-????) ok "unmapped-model slug keeps only [a-z0-9] and drops non-ASCII" ;;
+    *) no "unmapped-model slug keeps only [a-z0-9] and drops non-ASCII" "got '$short_unicode'" ;;
+esac
+
 printf '\n== record: a flag-driven run (no pipeline.json) gets neither field ==\n'
 rd_flagdriven="$(mk_run_dir comp-flagdriven)"
 tmpdirs+=("$rd_flagdriven")
