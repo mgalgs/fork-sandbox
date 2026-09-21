@@ -520,6 +520,13 @@ contains "--text: a fixture without X-AI-* headers shows no attribution bracket 
     "$text_all" $'\n    From: @alice\n'
 
 printf '\n== misc ==\n'
+single_text="$(python3 "$renderer" --text --thread "$root_id" --message "$reply2_id" "$FORK_SANDBOX_MAIL_ROOT" 2>/dev/null)"
+contains "--message renders requested body" "$single_text" 'nested reply body'
+contains "--message lists attachments" "$single_text" 'Attachments: attachments/attach.txt'
+not_contains "--message has no separator" "$single_text" $'---\n'
+if python3 "$renderer" --text --thread "$root_id" --message does-not-exist "$FORK_SANDBOX_MAIL_ROOT" >/dev/null 2>&1; then no "--message unknown id fails"; else ok "--message unknown id fails"; fi
+if python3 "$renderer" --thread "$root_id" --message "$reply2_id" "$FORK_SANDBOX_MAIL_ROOT" >/dev/null 2>&1; then no "--message requires text"; else ok "--message requires text"; fi
+if python3 "$renderer" --text --message "$reply2_id" "$FORK_SANDBOX_MAIL_ROOT" >/dev/null 2>&1; then no "--message requires thread"; else ok "--message requires thread"; fi
 if python3 -m py_compile "$renderer"; then ok "renderer compiles"; else no "renderer compiles"; fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"

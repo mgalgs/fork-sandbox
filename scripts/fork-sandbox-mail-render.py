@@ -4,7 +4,7 @@ single-file HTML thread archive, or as plain text for agents.
 
 Usage: fork-sandbox-mail-render.py <mail-root> -o threads.html
        fork-sandbox-mail-render.py <mail-root> --thread <id> -o t.html
-       fork-sandbox-mail-render.py --text <mail-root> [--thread <id>]
+       fork-sandbox-mail-render.py --text <mail-root> [--thread <id>] [--message <id>]
        fork-sandbox-mail-render.py <mail-root> -o threads.html --live [SECONDS]
 
 Reads the store fork-sandbox-mail.sh writes under <mail-root>/threads/
@@ -523,6 +523,9 @@ def build_html(mail_root, thread_ids, title, live=None):
 
 
 def render_text_message(e, depth, orphaned, is_error, out):
+    # This quoting grammar is a wake trust boundary, not cosmetic: changing
+    # body prefixes or emitting an unquoted body-derived line breaks the
+    # anti-forgery property fork-sandbox-postmaster.sh depends on.
     indent = "  " * depth
     if out:
         out.append("---")
@@ -647,6 +650,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("mail_root", help="fork-sandbox-mail.sh store root")
     parser.add_argument("--thread", metavar="ID", help="render only this thread id")
+    parser.add_argument("--message", metavar="ID", help="render only this message (requires --text and --thread)")
     parser.add_argument("-o", "--output", metavar="FILE", help="write HTML to FILE instead of stdout")
     parser.add_argument("--text", action="store_true", help="render as plain text to stdout instead of HTML")
     parser.add_argument("--title", default="Mail threads", help="HTML page title (default: %(default)s)")
@@ -657,6 +661,13 @@ def main(argv=None):
     parser.add_argument("--live-cycles", type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--live-render-delay", type=float, default=0, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+
+    if args.message and not args.text:
+        print("Error: --message requires --text", file=sys.stderr)
+        return 1
+    if args.message and not args.thread:
+        print("Error: --message requires --thread", file=sys.stderr)
+        return 1
 
     if args.live is not None:
         if args.live < 2:
@@ -687,7 +698,17 @@ def main(argv=None):
         if args.output:
             print("Error: --text renders to stdout and cannot be combined with -o/--output", file=sys.stderr)
             return 1
-        sys.stdout.write(render_text(args.mail_root, thread_ids))
+        if args.message:
+            data = render_thread_data(args.mail_root, args.thread)
+            match = next((item for item in data["trace"] if item[0].get("id") == args.message), None)
+            if match is None:
+                print(f"Error: no message '{args.message}' in thread '{args.thread}'", file=sys.stderr)
+                return 1
+            out = []
+            render_text_message(*match, out)
+            sys.stdout.write("\n".join(out) + "\n")
+        else:
+            sys.stdout.write(render_text(args.mail_root, thread_ids))
         return 0
 
     if args.live is not None:
