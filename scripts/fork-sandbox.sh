@@ -6368,6 +6368,8 @@ fs_build_sandbox_cmd() {
 # either fallback leg patches in its own model.
 fs_strip_impl_codex_args() {
     local out_name="$1"
+    # shellcheck disable=SC2178  # -n aliases an array here; shellcheck
+    # cannot see through the dynamic target name to know that.
     local -n out="$out_name"
     local marker_i start_i i
 
