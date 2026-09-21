@@ -2477,24 +2477,16 @@ printf '\n== snapshot render failure keeps the legacy full-thread handoff ==\n'
 
 # CONSTRAINT: patch messages sent To: @operator never trigger wakes. If the
 # snapshot cannot be made, the wake must retain the old embedded full thread
-# rather than leaving seats reviewing blind. The wrapper fails every snapshot
-# render and lets the immediately following handoff render succeed.
+# rather than leaving seats reviewing blind. The configured renderer fails
+# throughout this wake; the fallback must still launch with the full thread.
 new_scratch_root FORK_SANDBOX_MAIL_ROOT
 export FORK_SANDBOX_MAIL_ROOT
 new_root SNAPSHOT_STUB_DIR
-snapshot_count="$SNAPSHOT_STUB_DIR/count"
 snapshot_renderer="$SNAPSHOT_STUB_DIR/render"
 snapshot_postmaster="$SNAPSHOT_STUB_DIR/postmaster"
 cat > "$snapshot_renderer" <<EOF
 #!/usr/bin/env bash
-count=0
-[[ -f "$snapshot_count" ]] && count="\$(cat "$snapshot_count")"
-count=\$((count + 1))
-printf '%s\\n' "\$count" > "$snapshot_count"
-if (( count % 2 )); then
-    exit 1
-fi
-exec "$repo_dir/scripts/fork-sandbox-mail-render.py" "\$@"
+exit 1
 EOF
 chmod +x "$snapshot_renderer"
 cp "$postmaster" "$snapshot_postmaster"
@@ -2503,6 +2495,7 @@ sed -i "s|^REPO_FLEET_KIT=.*|REPO_FLEET_KIT=\"$repo_dir/share/fleet-kit.md\"|" "
 ln -s "$repo_dir/scripts/fork-sandbox-mail.sh" "$SNAPSHOT_STUB_DIR/fork-sandbox-mail.sh"
 ln -s "$repo_dir/scripts/fork-sandbox-fleet.sh" "$SNAPSHOT_STUB_DIR/fork-sandbox-fleet.sh"
 ln -s "$repo_dir/scripts/fork-sandbox-lib.sh" "$SNAPSHOT_STUB_DIR/fork-sandbox-lib.sh"
+ln -s "$repo_dir/scripts/fork-sandbox-mail-render.py" "$SNAPSHOT_STUB_DIR/fork-sandbox-mail-render.py"
 fallback_root="$(send_msg '@carol' '@operator' 'fallback thread' 'fallback earlier body' 8)"
 : > "$STUB_ARGV_LOG"
 postmaster="$snapshot_postmaster"
