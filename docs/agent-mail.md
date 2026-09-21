@@ -44,17 +44,18 @@ each Cc'd observer's wake is worth the spend at all (see "The Cc triage
 gate" below). `To:` is never gated this way — only an observer-tier Cc
 wake is a candidate for staying silent by default.
 
-**The thread is the memory.** Every wake carries the entire thread in its
-prompt. Session resume exists (below) and saves real money, but it is an
-optimization: an agent whose session is lost, or whose harness cannot
-resume at all, still has everything it needs.
+**The thread is the memory.** A wake carries its triggering message; the
+full thread is readable on demand from a read-only mount. The old
+whole-thread prompt compensated for wakes having no store access. Session
+resume still saves money, but is only an optimization: the mounted thread
+remains available when a session is lost or cannot resume.
 
 **Privacy is addressing, not access control.** There are no ACLs. A
 private conversation is just a thread whose recipients are its
 participants. An agent's world is the thread it was woken for — the
-sandbox has no mail tooling and no store access, so what is embedded in
-its handoff is all it can see. On the host, the store is a directory of
-plain files and you can read all of it.
+sandbox has no mail tooling and no write access, but can read the one
+thread it was woken for through the mount. On the host, the store is a
+directory of plain files and you can read all of it.
 
 **Real email is the model.** Whenever a design question has an email
 answer, this takes the email answer: RFC 5322-shaped headers, reply-all
@@ -553,6 +554,15 @@ cheaply on every Cc.
 
 ### The wake
 
+The prompt embeds only the message that triggered the wake. Its complete
+rendered thread is mounted read-only at `/thread/thread.txt` via
+`--thread-dir`; read it when the triggering message lacks needed context.
+Replies should quote what they answer so the next trigger-only wake usually
+has that context. If snapshot creation fails, the postmaster deliberately
+falls back to the old full-thread prompt and passes no mount: a blind wake is
+never acceptable. This mount is load-bearing for patch messages addressed
+`To: @operator`, which are a spawn-exempt sink and can never trigger a wake.
+
 A wake is one `fork-sandbox run`, with `--preset <name>` added to the
 spawn when the seat has one (see "The registry" above and
 docs/presets.md). A seat with **no** `preset:` gets no review loop and no
@@ -800,6 +810,10 @@ to Message-ID / From / To / Cc / Subject / hops. There is deliberately no
 `Date`, to save prompt tokens. The Message-ID stays, because it is the
 handle every id-taking verb needs, and a view an agent cannot act on is
 not a view.
+
+**`--message ID`** requires both `--text` and `--thread ID` and renders one
+message at depth zero, using the same anti-forgery grammar. It is used for a
+trigger-only wake while the mounted `thread.txt` supplies the complete view.
 
 **`--live [SECONDS]`** turns the HTML render into a standing process for
 watching an in-progress thread in a browser: render, write `-o`'s file
