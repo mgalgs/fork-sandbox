@@ -110,8 +110,11 @@ an orphaned reply
 EOF
 ok "fixture: hand-crafted orphan message written"
 
-# A malformed .msg: no blank line separating headers from body at all.
-printf 'not a valid mail message, no header block here\n' > "$thread_dir/005-badfile.msg"
+# A malformed .msg: it retains a Message-ID but has no blank line
+# separating headers from body. The postmaster can discover this id, so
+# --message must render this entry's error card rather than reject it.
+malformed_id="66666666-6666-6666-6666-666666666666"
+printf 'Message-ID: %s\nnot a valid mail message, no header block here\n' "$malformed_id" > "$thread_dir/005-badfile.msg"
 ok "fixture: malformed message written"
 
 # A dot-dir under threads/ must be ignored entirely, like .postmaster/.
@@ -522,8 +525,12 @@ contains "--text: a fixture without X-AI-* headers shows no attribution bracket 
 printf '\n== misc ==\n'
 single_text="$(python3 "$renderer" --text --thread "$root_id" --message "$reply2_id" "$FORK_SANDBOX_MAIL_ROOT" 2>/dev/null)"
 contains "--message renders requested body" "$single_text" 'nested reply body'
+contains "--message renders nested reply at depth zero" "$single_text" $'\n> nested reply body'
+not_contains "--message has no nested reply indentation" "$single_text" $'\n    > nested reply body'
 contains "--message lists attachments" "$single_text" 'Attachments: attachments/attach.txt'
 not_contains "--message has no separator" "$single_text" $'---\n'
+malformed_text="$(python3 "$renderer" --text --thread "$root_id" --message "$malformed_id" "$FORK_SANDBOX_MAIL_ROOT" 2>/dev/null)"
+contains "--message renders a discoverable malformed entry's error card" "$malformed_text" '[error: 005-badfile.msg: no blank line separating headers from body]'
 if python3 "$renderer" --text --thread "$root_id" --message does-not-exist "$FORK_SANDBOX_MAIL_ROOT" >/dev/null 2>&1; then no "--message unknown id fails"; else ok "--message unknown id fails"; fi
 if python3 "$renderer" --thread "$root_id" --message "$reply2_id" "$FORK_SANDBOX_MAIL_ROOT" >/dev/null 2>&1; then no "--message requires text"; else ok "--message requires text"; fi
 if python3 "$renderer" --text --message "$reply2_id" "$FORK_SANDBOX_MAIL_ROOT" >/dev/null 2>&1; then no "--message requires thread"; else ok "--message requires thread"; fi

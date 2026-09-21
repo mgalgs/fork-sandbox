@@ -101,6 +101,14 @@ def parse_msg(path, seq, fn):
         return entry
     head, sep, body = raw.partition("\n\n")
     if not sep:
+        # Retain a discoverable Message-ID for a malformed entry.  The
+        # postmaster obtains the trigger id from this same header, and the
+        # text renderer must be able to show its error card for that wake.
+        for line in head.splitlines():
+            name, part, value = line.partition(": ")
+            if part and name == "Message-ID":
+                entry["id"] = value.strip()
+                break
         entry["error"] = f"{fn}: no blank line separating headers from body"
         return entry
     hdr = {}
@@ -705,7 +713,8 @@ def main(argv=None):
                 print(f"Error: no message '{args.message}' in thread '{args.thread}'", file=sys.stderr)
                 return 1
             out = []
-            render_text_message(*match, out)
+            e, _depth, orphaned, is_error = match
+            render_text_message(e, 0, orphaned, is_error, out)
             sys.stdout.write("\n".join(out) + "\n")
         else:
             sys.stdout.write(render_text(args.mail_root, thread_ids))
