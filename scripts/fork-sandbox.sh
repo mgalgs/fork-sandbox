@@ -67,6 +67,9 @@
 # --pi-args "...":       extra arguments passed verbatim to pi, e.g.
 #                        "--thinking low". Only with --harness pi, the
 #                        harness that starts pi.
+# --codex-args "...":    extra arguments passed verbatim to `codex exec`,
+#                        e.g. '-c model_reasoning_effort="high"'. Only with
+#                        --harness codex, the harness that starts codex.
 # --review-loop <N>:     after the session ends, review its commits in a fresh
 #                        session and let a third one fix what the review
 #                        found, up to N times. N must be a positive integer.
@@ -1446,6 +1449,7 @@ review_network=""
 dry_run=false
 claude_extra_args=""
 pi_extra_args=""
+codex_extra_args=""
 sandbox_args=""
 task_meta=""
 context_ro=""
@@ -1556,6 +1560,10 @@ while [[ "${1:-}" == -* ]]; do
             ;;
         --pi-args)
             pi_extra_args="${2:?--pi-args requires a value}"
+            shift 2
+            ;;
+        --codex-args)
+            codex_extra_args="${2:?--codex-args requires a value}"
             shift 2
             ;;
         --sandbox-args)
@@ -1780,6 +1788,7 @@ if [[ -n "$preset_name" ]]; then
     declare -A preset_agent_model=()
     declare -A preset_agent_cargs=()
     declare -A preset_agent_pargs=()
+    declare -A preset_agent_xargs=()
     declare -A preset_agent_endpoint=()
     declare -A preset_agent_network=()
     # The parser's step-indexed emit format lands here first, 1-based by
@@ -1857,6 +1866,7 @@ if [[ -n "$preset_name" ]]; then
                     model) preset_agent_model[$preset_f2]="$preset_f4" ;;
                     claude_args) preset_agent_cargs[$preset_f2]="$preset_f4" ;;
                     pi_args) preset_agent_pargs[$preset_f2]="$preset_f4" ;;
+                    codex_args) preset_agent_xargs[$preset_f2]="$preset_f4" ;;
                     endpoint) preset_agent_endpoint[$preset_f2]="$preset_f4" ;;
                     network) preset_agent_network[$preset_f2]="$preset_f4" ;;
                 esac
@@ -2031,6 +2041,13 @@ if [[ -n "$preset_name" ]]; then
                 preset_note "--pi-args overrides the code seat's pi-args"
             else
                 pi_extra_args="${preset_agent_pargs[$preset_impl_agent]}"
+            fi
+        fi
+        if [[ -n "${preset_agent_xargs[$preset_impl_agent]}" ]]; then
+            if [[ -n "$codex_extra_args" ]]; then
+                preset_note "--codex-args overrides the code seat's codex-args"
+            else
+                codex_extra_args="${preset_agent_xargs[$preset_impl_agent]}"
             fi
         fi
     fi
@@ -2607,6 +2624,14 @@ fi
 # already resolved above, exactly as a local run resolves them, so this
 # reuses that work rather than re-implementing it.
 if [[ "$k8s_mode" == true ]]; then
+    # Check this before the general codex-on-k8s refusal: the flag has no
+    # k8s path regardless of harness, and must not disappear behind it.
+    if [[ -n "$codex_extra_args" ]]; then
+        echo "Error: --codex-args is not supported with --k8s. It passes flags" >&2
+        echo "to codex exec, and --k8s does not run codex locally or forward" >&2
+        echo "its invocation to the pod." >&2
+        exit 1
+    fi
     # A composed (non-legacy-shaped) pipeline has no equivalent in the
     # cluster path yet: k8s_argv below only ever forwards the fixed
     # implement/review/maintainer skeleton's own flags (see the
@@ -3929,6 +3954,17 @@ if [[ -n "$pi_extra_args" ]]; then
     read -r -a pi_extra_argv <<< "$pi_extra_args"
 fi
 
+# --codex-args names codex exec, which no other harness starts.
+if [[ -n "$codex_extra_args" && "$harness" != "codex" ]]; then
+    echo "Error: --codex-args passes flags to codex exec, which a $harness run" >&2
+    echo "never starts. Drop it, or use --harness codex." >&2
+    exit 1
+fi
+codex_extra_argv=()
+if [[ -n "$codex_extra_args" ]]; then
+    read -r -a codex_extra_argv <<< "$codex_extra_args"
+fi
+
 # Where the sandbox's userland comes from. It decides whether the agent CLI
 # and node are bound in from this host or supplied by the sandbox itself, and
 # every harness arm below needs the answer. Ask before the clone, so a missing
@@ -4303,6 +4339,9 @@ codex)
                  --dangerously-bypass-approvals-and-sandbox --ignore-rules)
     if [[ -n "$rh_model" ]]; then
         harness_cmd+=(--model "$rh_model")
+    fi
+    if (( ${#codex_extra_argv[@]} )); then
+        harness_cmd+=("${codex_extra_argv[@]}")
     fi
     harness_cmd+=(-)
     # shellcheck disable=SC2034  # read by fs_build_sandbox_cmd via its own

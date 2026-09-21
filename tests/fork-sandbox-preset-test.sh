@@ -310,6 +310,22 @@ pipeline:
     repeat: 1
     agent: reviewer
 EOF
+
+cat > "$presets_dir/codex-arguments.yaml" <<'EOF'
+agents:
+  coder:
+    harness: codex/gpt-5.6-sol
+    codex-args: -c model_reasoning_effort="high"
+pipeline:
+  - action: code
+    agent: coder
+EOF
+out="$(run --preset codex-arguments 2>"$err")"
+check "a codex-args code seat compiles" \
+    $'preset=codex-arguments\nharness=codex\nmodel=gpt-5.6-sol' "$out"
+out="$(run --preset codex-arguments --codex-args '-c model_reasoning_effort="xhigh"' 2>"$err")"
+contains "--codex-args overrides the code seat's codex-args" "$(cat "$err")" \
+    "--codex-args overrides the code seat's codex-args"
 out="$(run --preset default-fix-repeat --harness codex 2>"$err")"
 contains "a defaulted fix seat's repeat is dropped with the overridden code seat" \
     "$(cat "$err")" \
@@ -516,6 +532,9 @@ refuses "a repeating code seat is refused with --review-only" \
 refuses "a preset's compiled values meet the --k8s refusals like flags do" \
     "--claude-args is not supported with --k8s" \
     --preset deep --k8s
+refuses "--codex-args is refused with --k8s" \
+    "--codex-args is not supported with --k8s" \
+    --harness codex --codex-args '-c model_reasoning_effort=high' --k8s
 refuses "fix seats and repeat are refused with --k8s by name" \
     "preset fix seats and repeat are not yet supported" \
     --preset fast3 --k8s
@@ -1399,6 +1418,35 @@ run_stubbed() {
     fi
     printf '%s' "$rd"
 }
+
+if PATH="$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$real_cfg" \
+    FORK_SANDBOX_BACKEND=fake-image "$launcher" --harness claude \
+    --codex-args '-c model_reasoning_effort=high' "$proj" "$handoff" \
+    > /dev/null 2>"$err"; then
+    no "--codex-args is refused on a non-codex harness" "expected a refusal, got exit 0"
+else
+    contains "--codex-args is refused on a non-codex harness" "$(cat "$err")" \
+        "--codex-args passes flags to codex exec, which a claude run"
+fi
+
+# The generated command must leave '-' last: codex uses it to read the prompt
+# from stdin. Image toolchain mode avoids relying on a host codex binary.
+printf '{"tokens":{"access_token":"e30.eyJleHAiOjQxMDI0NDQ4MDB9.sig","refresh_token":"fixture"}}\n' \
+    > "$CODEX_HOME/auth.json"
+prep_stub 'noop'
+rd_codex_args="$(run_stubbed --harness codex/gpt-5.6-sol \
+    --codex-args '-c model_reasoning_effort=high' \
+    --branch "sandbox-test-codex-args-$$")" && tmpdirs+=("$rd_codex_args")
+if [[ -n "${rd_codex_args:-}" ]]; then
+    codex_cmd_line="$(grep '^sandbox_cmd=' "$rd_codex_args/run.sh")"
+    contains "codex extra arguments follow --model" "$codex_cmd_line" \
+        '--model gpt-5.6-sol -c model_reasoning_effort=high -'
+    if [[ "$codex_cmd_line" == *'model_reasoning_effort=high - '* ]]; then
+        ok "codex stdin '-' remains the final command argument"
+    else
+        no "codex stdin '-' remains the final command argument" "$codex_cmd_line"
+    fi
+fi
 
 # A. Repeat passes: repeat: 3 on the code agent runs three coding legs on
 # the same prompt, unconditionally, and the run ends after the last.

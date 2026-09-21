@@ -77,6 +77,9 @@ run_case 'run passes arguments' $'fork-sandbox.sh\nproj\nhandoff' run proj hando
 run_case 'run preserves option order' \
     $'fork-sandbox.sh\n--harness\ncodex\n--model\nluna\nproj\nhandoff' \
     run --harness codex --model luna proj handoff
+run_case 'run preserves codex extra arguments' \
+    $'fork-sandbox.sh\n--harness\ncodex\n--codex-args\n-c model_reasoning_effort="high"\nproj\nhandoff' \
+    run --harness codex --codex-args '-c model_reasoning_effort="high"' proj handoff
 run_case 'status passes arguments' $'fork-sandbox-status.sh\n--monitor\n/run/dir' \
     status --monitor /run/dir
 run_case 'say preserves spaces' $'fork-sandbox-say.sh\n/run/dir\ntwo words' \

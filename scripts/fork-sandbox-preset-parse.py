@@ -17,6 +17,7 @@ ordered step list:
     agent <name> model <value>          (empty value when unset)
     agent <name> claude_args <value>
     agent <name> pi_args <value>
+    agent <name> codex_args <value>
     agent <name> endpoint <value>       (empty value when unset)
     agent <name> network <value>        (empty value when unset)
     pipeline steps <n>                  (the number of pipeline steps)
@@ -149,6 +150,7 @@ def main():
         if not isinstance(props, dict):
             fail(f"agents.{name}: expected a mapping of properties")
         agent = {"harness": "", "model": "", "claude_args": "", "pi_args": "",
+                 "codex_args": "",
                  "repeat": 1, "refresh_at": "", "refresh_max": "",
                  "endpoint": "", "network": ""}
         for prop, value in props.items():
@@ -174,7 +176,7 @@ def main():
                     fail(f"{path}: this agent already has a model from its "
                          f"combined harness form")
                 agent["model"] = value
-            elif prop in ("claude-args", "pi-args"):
+            elif prop in ("claude-args", "pi-args", "codex-args"):
                 agent[prop.replace("-", "_")] = scalar(value, path)
             elif prop == "repeat":
                 # Every coding leg this agent runs becomes this many passes,
@@ -206,7 +208,7 @@ def main():
                 agent["network"] = value
             else:
                 fail(f"{path}: unknown agent property; agents take 'harness', "
-                     f"'model', 'claude-args', 'pi-args', 'repeat', "
+                     f"'model', 'claude-args', 'pi-args', 'codex-args', 'repeat', "
                      f"'refresh-at', 'refresh-max', 'endpoint' and 'network'")
         if not agent["harness"]:
             fail(f"agents.{name}: has no harness")
@@ -324,9 +326,10 @@ def main():
                  f"is claude-only")
     warns = []
     for name, agent in agents.items():
-        if name != first_code_agent and (agent["claude_args"] or agent["pi_args"]):
+        if name != first_code_agent and (agent["claude_args"] or agent["pi_args"]
+                                         or agent["codex_args"]):
             fail(f"agents.{name}: has extra arguments but does not sit the "
-                 f"first code seat; claude-args and pi-args reach only that "
+                 f"first code seat; claude-args, pi-args and codex-args reach only that "
                  f"seat's legs today -- there is no per-seat argument "
                  f"plumbing for any other leg yet")
         if name != first_code_agent and (agent["refresh_at"] or agent["refresh_max"]):
@@ -362,7 +365,7 @@ def main():
     # ---- emit ----
     out = []
     for name, agent in agents.items():
-        for prop in ("harness", "model", "claude_args", "pi_args",
+        for prop in ("harness", "model", "claude_args", "pi_args", "codex_args",
                     "endpoint", "network"):
             out.append(f"agent\t{name}\t{prop}\t{agent[prop]}")
     out.append(f"pipeline\tsteps\t{len(steps)}")
