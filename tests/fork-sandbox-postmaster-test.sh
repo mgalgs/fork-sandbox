@@ -2445,6 +2445,84 @@ check "workspace: a pi seat still gets --clone-dir" \
     "$PM_STATE_DIR/workspaces/$ws_pi_tid/bob" "$(argv_after --clone-dir "$STUB_ARGV_LOG")"
 
 # ============================================================
+printf '\n== trigger-only wakes mount the complete rendered thread ==\n'
+# ============================================================
+
+# Patch messages go to @operator and never wake a seat, so a trigger-only
+# wake needs this snapshot to make earlier patch context readable at all.
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+trigger_root="$(send_msg '@carol' '@operator' 'snapshot thread' 'earlier unique body' 8)"
+: > "$STUB_ARGV_LOG"
+once
+reply_msg '@bob' "$trigger_root" 'trigger unique body' --to '@alice' >/dev/null
+: > "$STUB_ARGV_LOG"
+once
+trigger_handoff="$(handoff_file_for_agent alice)"
+trigger_dir="$(argv_after --thread-dir "$STUB_ARGV_LOG")"
+contains "trigger-only: handoff contains the triggering body" \
+    "$(cat "$trigger_handoff")" '> trigger unique body'
+not_contains "trigger-only: handoff omits the earlier body" \
+    "$(cat "$trigger_handoff")" 'earlier unique body'
+check "trigger-only: spawn binds the snapshot directory" \
+    "$FORK_SANDBOX_MAIL_ROOT/.postmaster/wake-threads/$(basename "${trigger_handoff%.md}")" "$trigger_dir"
+contains "trigger-only: mounted snapshot holds the full render" \
+    "$(cat "$trigger_dir/thread.txt")" '> earlier unique body'
+contains "trigger-only: mounted snapshot includes the trigger" \
+    "$(cat "$trigger_dir/thread.txt")" '> trigger unique body'
+
+# ============================================================
+printf '\n== snapshot render failure keeps the legacy full-thread handoff ==\n'
+# ============================================================
+
+# CONSTRAINT: patch messages sent To: @operator never trigger wakes. If the
+# snapshot cannot be made, the wake must retain the old embedded full thread
+# rather than leaving seats reviewing blind. The wrapper fails every snapshot
+# render and lets the immediately following handoff render succeed.
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+new_root SNAPSHOT_STUB_DIR
+snapshot_count="$SNAPSHOT_STUB_DIR/count"
+snapshot_renderer="$SNAPSHOT_STUB_DIR/render"
+snapshot_postmaster="$SNAPSHOT_STUB_DIR/postmaster"
+cat > "$snapshot_renderer" <<EOF
+#!/usr/bin/env bash
+count=0
+[[ -f "$snapshot_count" ]] && count="\$(cat "$snapshot_count")"
+count=\$((count + 1))
+printf '%s\\n' "\$count" > "$snapshot_count"
+if (( count % 2 )); then
+    exit 1
+fi
+exec "$repo_dir/scripts/fork-sandbox-mail-render.py" "\$@"
+EOF
+chmod +x "$snapshot_renderer"
+cp "$postmaster" "$snapshot_postmaster"
+sed -i "s|^MAIL_RENDER=.*|MAIL_RENDER=\"$snapshot_renderer\"|" "$snapshot_postmaster"
+sed -i "s|^REPO_FLEET_KIT=.*|REPO_FLEET_KIT=\"$repo_dir/share/fleet-kit.md\"|" "$snapshot_postmaster"
+ln -s "$repo_dir/scripts/fork-sandbox-mail.sh" "$SNAPSHOT_STUB_DIR/fork-sandbox-mail.sh"
+ln -s "$repo_dir/scripts/fork-sandbox-fleet.sh" "$SNAPSHOT_STUB_DIR/fork-sandbox-fleet.sh"
+ln -s "$repo_dir/scripts/fork-sandbox-lib.sh" "$SNAPSHOT_STUB_DIR/fork-sandbox-lib.sh"
+fallback_root="$(send_msg '@carol' '@operator' 'fallback thread' 'fallback earlier body' 8)"
+: > "$STUB_ARGV_LOG"
+postmaster="$snapshot_postmaster"
+once
+fallback_mid="$(reply_msg '@bob' "$fallback_root" 'fallback trigger body' --to '@alice')"
+: > "$STUB_ARGV_LOG"
+once
+postmaster="$repo_dir/scripts/fork-sandbox-postmaster.sh"
+fallback_handoff="$(handoff_file_for_agent alice)"
+contains "snapshot failure constraint: fallback handoff keeps the earlier body" \
+    "$(cat "$fallback_handoff")" '> fallback earlier body'
+contains "snapshot failure constraint: fallback handoff keeps the trigger" \
+    "$(cat "$fallback_handoff")" '> fallback trigger body'
+check "snapshot failure constraint: fallback carries no --thread-dir" 0 \
+    "$(grep -c -- '^--thread-dir$' "$STUB_ARGV_LOG")"
+contains "snapshot failure constraint: thread is flagged" \
+    "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$(thread_of "$fallback_mid")")" \
+    'wake thread snapshot failed for alice'
+
+# ============================================================
 printf '\n== harvest: exit-code alone is not terminal (summary.json still pending) ==\n'
 # ============================================================
 
