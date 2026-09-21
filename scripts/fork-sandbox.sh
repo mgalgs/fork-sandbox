@@ -1788,10 +1788,10 @@ if [[ -n "$preset_name" ]]; then
     # most one review, then at most one maintain, in that order) is
     # translated below into the preset_impl_*/preset_review_*/
     # preset_maintain_* scalars the existing flag-compile block already
-    # consumes unchanged; a composed pipeline skips that block entirely.
-    # There is no run-engine walk over an arbitrary step list yet, so a
-    # composed pipeline is refused at launch further down rather than
-    # compiled into anything.
+    # consumes unchanged; a composed pipeline skips that block entirely and
+    # runs through the walker's own arbitrary-step-list walk instead (see
+    # the walker's header comment further down) -- refused only under
+    # --k8s, which still only accepts a legacy-shaped pipeline.
     preset_step_count=0
     declare -a preset_step_action=()
     declare -a preset_step_agent=()
@@ -1895,10 +1895,8 @@ if [[ -n "$preset_name" ]]; then
     # else -- any other order, any repeated kind, any count -- is a
     # composed pipeline: it has no single review/maintain seat for a flag
     # to override, so compiling flags into it would either be ambiguous or
-    # silently pick a step, and it skips this translation instead. The run
-    # engine has no walk over an arbitrary step list yet, so a composed
-    # pipeline is refused at launch further down instead of being run at
-    # all.
+    # silently pick a step, and it skips this translation instead. It runs
+    # through the walker's own arbitrary-step-list walk unchanged.
     preset_is_legacy_shaped=false
     if (( preset_step_count == 1 )) && [[ "${preset_step_action[1]}" == code ]]; then
         preset_is_legacy_shaped=true
@@ -1956,9 +1954,8 @@ if [[ -n "$preset_name" ]]; then
     # A composed (non-legacy-shaped) pipeline has no single code/review/
     # maintain scalar to describe or compile flags into, so the summary
     # below and the whole flag-compile block only apply to a legacy-shaped
-    # preset. A composed pipeline gets a step-count announcement instead,
-    # and is refused at launch further down: there is no run-engine walk
-    # over an arbitrary step list yet to run it.
+    # preset. A composed pipeline gets a step-count announcement instead
+    # and runs through the walker unchanged; only --k8s still refuses it.
     if [[ "$preset_is_legacy_shaped" == true ]]; then
     # Announced before the compile below, so the picture of what the preset
     # says comes first and any "--x overrides ..." notes read against it.
@@ -2618,9 +2615,9 @@ if [[ "$k8s_mode" == true ]]; then
         echo "Error: --k8s does not support a composed pipeline preset ('$preset_name')" >&2
         echo "yet -- only a legacy-shaped preset (one code step, then at most one" >&2
         echo "review step, then at most one maintain step, in that order) can" >&2
-        echo "forward to the cluster today. The run engine cannot walk this" >&2
-        echo "pipeline locally either yet; edit it into a legacy shape, or pick" >&2
-        echo "another." >&2
+        echo "forward to the cluster today. The run engine walks this pipeline" >&2
+        echo "fine locally, without --k8s; edit it into a legacy shape to run it" >&2
+        echo "on the cluster, or pick another." >&2
         exit 1
     fi
     if [[ "$harness" != "pi" && "$harness" != "claude" ]]; then
@@ -3048,11 +3045,10 @@ if [[ -n "$preset_file" && "$preset_is_legacy_shaped" != true ]]; then
     # harness_env_file/rev_harness_env_file/mnt_harness_env_file -- the
     # three fixed seats -- never into an "s<K>_harness_env_file" or
     # "s<K>fix_harness_env_file" fs_resolve_harness names for a composed
-    # step. The unconditional refusal just below already blocks every
-    # composed launch today, but name this case specifically so the
-    # message survives once that refusal lifts -- otherwise the gap would
-    # surface as a leg launching codex with no credential file instead of
-    # failing here, where the problem is nameable.
+    # step. The walker runs a composed pipeline today, so this check is
+    # live, not preparatory: without it, a codex-seated composed step or
+    # fix seat would launch with no credential file and fail deep inside
+    # the leg instead of being named here, up front.
     for ((preset_k = 1; preset_k <= preset_step_count; preset_k++)); do
         preset_k_agent="${preset_step_agent[$preset_k]}"
         if [[ "${preset_agent_harness[$preset_k_agent]}" == codex \
@@ -3070,9 +3066,11 @@ if [[ -n "$preset_file" && "$preset_is_legacy_shaped" != true ]]; then
     # either survived parsing here it belongs to that step -- but
     # fs_build_sandbox_cmd only splices --claude-args/--pi-args into a
     # command built with prefix "impl", never a composed step's own "s<K>"
-    # prefix, so that step would launch with them silently dropped. Name
-    # the gap now, the same way the codex check above does, so the message
-    # survives once the unconditional refusal below lifts.
+    # prefix, so that step would launch with them silently dropped. The
+    # walker runs a composed pipeline today, so -- same as the codex check
+    # above -- this is a live refusal, not a placeholder for a gap that
+    # only matters once some other block stops blocking composed launches
+    # first.
     for preset_cargs_agent in "${!preset_agent_cargs[@]}"; do
         if [[ -n "${preset_agent_cargs[$preset_cargs_agent]}" ]]; then
             echo "Error: preset '$preset_name' sets claude_args on agent" >&2
