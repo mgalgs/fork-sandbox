@@ -407,11 +407,18 @@ is the exact problem this design removes):
   ollama-style `qwen2.5:7b` id) — any joined-string separator collides
   with some real model id, where JSON escapes for free.
 - **`composition_short`** — a best-effort display label, never a grouping
-  key: per step, in order, `<stage-letter><model-letter-or-slug><repeat>`
-  joined with `-` (`code`/`review`/`maintain` → `c`/`r`/`m`; a model id
-  containing `sonnet`/`opus`/`haiku` maps to `s`/`o`/`h`; anything else
-  slugs to the first 4 lowercased `[a-z0-9]` characters after its last
-  `/`, or `x` for no model). If any step took the slug path, a final
+  key: per step, in order, `<stage-letter><model-token><repeat>` joined
+  with `-` (`code`/`review`/`maintain` → `c`/`r`/`m`; a model id one of
+  whose separator-delimited segments is a registered alias —
+  `sonnet`, `opus`, `haiku`, `terra`, `sol`, `luna` — contributes that
+  alias spelled out; anything else slugs to the first 4 lowercased
+  `[a-z0-9]` characters after its last `/`, or `x` for no model).
+  Actions are a closed set, so they keep single letters; models are an
+  open set that grows without warning, so they are spelled out. A single
+  letter per model was tried first and collided — sonnet claimed `s`, so
+  sol was handed `l`, and luna then wanted `l` as well — which is also
+  why `gpt-5.6-terra`, `gpt-5.6-sol` and `gpt-5.6-luna` must not share a
+  token: slugging by the id's *head* gives all three `gpt5`. If any step took the slug path, a final
   `-<4 hex chars>` — the first 4 hex characters of the sha256 of the
   canonical string — is appended, so the reader can tell the shortname
   alone did not pin down the composition.

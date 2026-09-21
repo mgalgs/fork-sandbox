@@ -407,7 +407,12 @@ PIPELINE_FIX_KEYS = ("harness", "model", "repeat")
 # matched case-insensitively as a substring of the model id, first hit
 # wins. A model that hits none of these falls back to a slug, which is
 # what flips on the shortname's collision-warning hash suffix.
-MODEL_LETTERS = (("sonnet", "s"), ("opus", "o"), ("haiku", "h"))
+# Registered model aliases, spelled out rather than lettered. Single
+# letters were tried and collided: sonnet took "s", so sol was given "l",
+# and luna then wanted "l" too -- names that differ by an arbitrary
+# leftover letter encode nothing. Actions are a closed set and keep their
+# letters; models are an open set and get their name.
+MODEL_ALIASES = ("sonnet", "opus", "haiku", "terra", "sol", "luna")
 STAGE_LETTERS = {"code": "c", "review": "r", "maintain": "m"}
 
 STEP_LOOP_RE = re.compile(r"step-([0-9]+)-loop\.json")
@@ -439,14 +444,19 @@ def composition_slug(model):
     return slug[:4] or "x"
 
 
-def composition_model_letter(model):
-    """Returns (letter, used_slug) for one step's model id -- used_slug is
-    what triggers the shortname's hash suffix below."""
+def composition_model_token(model):
+    """Returns (token, used_slug) for one step's model id -- used_slug is
+    what triggers the shortname's hash suffix below.
+
+    Matches a registered alias against the id's own separator-delimited
+    segments, not as a bare substring: `gpt-5.6-terra` is [gpt, 5, 6,
+    terra]. Substring matching would let a short alias hit inside an
+    unrelated longer word, and segment matching costs nothing here."""
     if isinstance(model, str):
-        low = model.lower()
-        for word, letter in MODEL_LETTERS:
-            if word in low:
-                return letter, False
+        segments = set(re.split(r"[^a-z0-9]+", model.lower()))
+        for alias in MODEL_ALIASES:
+            if alias in segments:
+                return alias, False
     return composition_slug(model), True
 
 
@@ -462,10 +472,10 @@ def compute_composition(steps):
     used_slug = False
     for step in norm:
         stage = STAGE_LETTERS.get(step["action"], "?")
-        letter, is_slug = composition_model_letter(step["model"])
+        token, is_slug = composition_model_token(step["model"])
         used_slug = used_slug or is_slug
         repeat = step["repeat"] if isinstance(step["repeat"], int) else 1
-        parts.append(f"{stage}{letter}{repeat}")
+        parts.append(f"{stage}{token}{repeat}")
     short = "-".join(parts)
     if used_slug:
         short += "-" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:4]

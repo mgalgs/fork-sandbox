@@ -334,8 +334,8 @@ comp_a="$(record_field "$(basename "$rd_comp_a")" composition)"
 comp_b="$(record_field "$(basename "$rd_comp_b")" composition)"
 check "identical steps content yields an identical composition regardless of preset filename" \
     "$comp_a" "$comp_b"
-check "composition_short has no hash suffix when every model hits the letter table" \
-    "cs1-rs2" "$(record_field "$(basename "$rd_comp_a")" composition_short)"
+check "composition_short has no hash suffix when every model hits the alias table" \
+    "csonnet1-rsonnet2" "$(record_field "$(basename "$rd_comp_a")" composition_short)"
 
 printf '\n== record: a model id containing both / and : does not collide ==\n'
 # The separator trap docs/presets.md 3b warns about: an OpenRouter-shaped
@@ -422,7 +422,7 @@ not_contains "a composed run has no legacy maintainer_loop key" \
 
 printf '\n== stats: --by composition groups on the canonical value, prints the shortname ==\n'
 out="$(query stats --by composition 2>/dev/null)"
-contains "stats --by composition prints the shortname cell" "cs1-rs2" "$out"
+contains "stats --by composition prints the shortname cell" "csonnet1-rsonnet2" "$out"
 not_contains "stats --by composition does not print the raw canonical JSON" \
     '"action":"code"' "$out"
 
