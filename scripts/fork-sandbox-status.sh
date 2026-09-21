@@ -236,42 +236,86 @@ resolve_run_subdir() {
     return 0
 }
 
-review_verdict_path() {
-    local n path found=""
-    for path in "$run_dir"/review-verdict-*.md; do
+# The best verdict this run has, filtered to one action when asked and
+# optionally required to have a finished loop record backing it: one scan
+# serves both the marker (any action, no loop-record gate -- it worked this
+# way before composed pipelines existed and nothing here changes that) and
+# the two report bodies (one action each, gated on the loop record so an
+# orphaned verdict with no accompanying loop record still prints nothing,
+# exactly as before).
+#
+# "Highest step wins, ties break to the highest iteration" is the one
+# comparison every caller shares. A legacy-shaped pipeline is always
+# compiled code-then-review-then-maintain, so pinning legacy review to step
+# 1 and legacy maintainer to step 2 reproduces the old "maintainer outranks
+# review" marker as one instance of this rule, not a second hardcoded order.
+# A composed pipeline's real step numbers come from its s<K>- prefixed
+# verdict names. A legacy and a composed run never share a run directory (a
+# whole-pipeline, compile-time choice), so the two numbering schemes never
+# collide here.
+#
+# Sets STEP_VERDICT_STEP, STEP_VERDICT_ACTION, STEP_VERDICT_ITER and
+# STEP_VERDICT_PATH. Returns 1 when nothing matches.
+STEP_VERDICT_STEP=""
+STEP_VERDICT_ACTION=""
+STEP_VERDICT_ITER=""
+STEP_VERDICT_PATH=""
+best_verdict() {
+    local want_action="$1" require_loop="$2"
+    STEP_VERDICT_STEP=""
+    STEP_VERDICT_ACTION=""
+    STEP_VERDICT_ITER=""
+    STEP_VERDICT_PATH=""
+    local path base step action iter loopfile
+    for path in "$run_dir"/review-verdict-*.md "$run_dir"/maintainer-verdict-*.md \
+            "$run_dir"/s[0-9]*-*-verdict-*.md; do
         [[ -L "$path" ]] && die "'$path' is a symlink; refusing to read it"
         [[ -e "$path" ]] || continue
-        n="${path##*/review-verdict-}"; n="${n%.md}"
-        [[ "$n" =~ ^[0-9]+$ ]] || die "'$path' is not a valid review verdict name"
+        base="${path##*/}"
+        if [[ "$base" =~ ^review-verdict-([0-9]+)\.md$ ]]; then
+            step=1; action=review; iter="${BASH_REMATCH[1]}"; loopfile=review-loop.json
+        elif [[ "$base" =~ ^maintainer-verdict-([0-9]+)\.md$ ]]; then
+            step=2; action=maintain; iter="${BASH_REMATCH[1]}"; loopfile=maintainer-loop.json
+        elif [[ "$base" =~ ^s([0-9]+)-(review|maintain)-verdict-([0-9]+)\.md$ ]]; then
+            step="${BASH_REMATCH[1]}"; action="${BASH_REMATCH[2]}"; iter="${BASH_REMATCH[3]}"
+            loopfile="step-${step}-loop.json"
+        else
+            die "'$path' is not a valid verdict name"
+        fi
         [[ -f "$path" ]] || die "'$path' is not a regular file"
-        if [[ -z "$found" || "$n" -gt "$found" ]]; then found="$n"; fi
+        [[ -z "$want_action" || "$action" == "$want_action" ]] || continue
+        if [[ "$require_loop" == 1 ]]; then
+            resolve_run_file "$loopfile" >/dev/null || continue
+        fi
+        if [[ -z "$STEP_VERDICT_STEP" ]] || (( step > STEP_VERDICT_STEP )) \
+                || { (( step == STEP_VERDICT_STEP )) && (( iter > STEP_VERDICT_ITER )); }; then
+            STEP_VERDICT_STEP="$step"
+            STEP_VERDICT_ACTION="$action"
+            STEP_VERDICT_ITER="$iter"
+            STEP_VERDICT_PATH="$path"
+        fi
     done
-    [[ -n "$found" ]] || return 1
-    printf '%s/review-verdict-%s.md' "$run_dir" "$found"
+    [[ -n "$STEP_VERDICT_PATH" ]]
 }
 
 print_report_marker() {
-    local verdict leg status
-    if verdict="$(maintainer_verdict_path 2>/dev/null)"; then
-        leg="${verdict##*/maintainer-verdict-}"; leg="${leg%.md}"
-        status="$(head -n 1 -- "$verdict" | tr -d '\000-\037\177' \
-            | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-        printf 'report: maintainer leg %s (%s)\n' "$leg" "$status"
-    elif verdict="$(review_verdict_path 2>/dev/null)"; then
-        leg="${verdict##*/review-verdict-}"; leg="${leg%.md}"
-        status="$(head -n 1 -- "$verdict" | tr -d '\000-\037\177' \
-            | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-        printf 'report: review leg %s (%s)\n' "$leg" "$status"
-    else
+    local status label
+    if ! best_verdict "" 0; then
         printf 'report: session\n'
+        return
     fi
+    status="$(head -n 1 -- "$STEP_VERDICT_PATH" | tr -d '\000-\037\177' \
+        | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    label="$STEP_VERDICT_ACTION"
+    [[ "$label" == maintain ]] && label=maintainer
+    printf 'report: %s leg %s (%s)\n' "$label" "$STEP_VERDICT_ITER" "$status"
 }
 
 print_review_report() {
     local verdict leg status
-    resolve_run_file review-loop.json >/dev/null || return 1
-    verdict="$(review_verdict_path 2>/dev/null)" || return 1
-    leg="${verdict##*/review-verdict-}"; leg="${leg%.md}"
+    best_verdict review 1 || return 1
+    verdict="$STEP_VERDICT_PATH"
+    leg="$STEP_VERDICT_ITER"
     status="$(head -n 1 -- "$verdict" | tr -d '\000-\037\177' \
         | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
     if fs_verdict_has_usable_report "$verdict"; then
@@ -286,29 +330,15 @@ print_review_report() {
     printf '\n'
 }
 
-maintainer_verdict_path() {
-    local n path found=""
-    for path in "$run_dir"/maintainer-verdict-*.md; do
-        [[ -L "$path" ]] && die "'$path' is a symlink; refusing to read it"
-        [[ -e "$path" ]] || continue
-        n="${path##*/maintainer-verdict-}"; n="${n%.md}"
-        [[ "$n" =~ ^[0-9]+$ ]] || die "'$path' is not a valid maintainer verdict name"
-        [[ -f "$path" ]] || die "'$path' is not a regular file"
-        if [[ -z "$found" || "$n" -gt "$found" ]]; then found="$n"; fi
-    done
-    [[ -n "$found" ]] || return 1
-    printf '%s/maintainer-verdict-%s.md' "$run_dir" "$found"
-}
-
-# The maintainer's report, the review report's outer sibling: the maintainer
-# loop's last verdict, printed when the loop ran. Same shape and refusal
-# discipline as the review one -- the file name comes only from the fixed
-# pattern, never from an argument.
+# The maintainer's report, the review report's outer sibling: the best
+# maintain-type step's last verdict, printed when that step's loop ran. Same
+# shape and refusal discipline as the review one -- the file name comes only
+# from a fixed pattern, never from an argument.
 print_maintainer_report() {
     local verdict leg status
-    resolve_run_file maintainer-loop.json >/dev/null || return 1
-    verdict="$(maintainer_verdict_path 2>/dev/null)" || return 1
-    leg="${verdict##*/maintainer-verdict-}"; leg="${leg%.md}"
+    best_verdict maintain 1 || return 1
+    verdict="$STEP_VERDICT_PATH"
+    leg="$STEP_VERDICT_ITER"
     status="$(head -n 1 -- "$verdict" | tr -d '\000-\037\177' \
         | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
     if fs_verdict_has_usable_report "$verdict"; then
@@ -324,12 +354,17 @@ print_maintainer_report() {
 }
 
 # Preflight verdicts outside command substitutions so a refusal exits this
-# process rather than only the subshell used to find the latest leg.
-for _verdict in "$run_dir"/review-verdict-*.md "$run_dir"/maintainer-verdict-*.md; do
+# process rather than only the subshell used to find the best one. Widened
+# to the composed s<K>-(review|maintain)-verdict-<i>.md shape alongside the
+# legacy names, so a composed run's verdicts get the same refusal before any
+# read that the legacy ones always had.
+for _verdict in "$run_dir"/review-verdict-*.md "$run_dir"/maintainer-verdict-*.md \
+        "$run_dir"/s[0-9]*-*-verdict-*.md; do
     [[ -L "$_verdict" ]] && die "'$_verdict' is a symlink; refusing to read it"
     [[ -e "$_verdict" ]] || continue
     [[ "${_verdict##*/}" =~ ^review-verdict-[0-9]+\.md$ \
-        || "${_verdict##*/}" =~ ^maintainer-verdict-[0-9]+\.md$ ]] \
+        || "${_verdict##*/}" =~ ^maintainer-verdict-[0-9]+\.md$ \
+        || "${_verdict##*/}" =~ ^s[0-9]+-(review|maintain)-verdict-[0-9]+\.md$ ]] \
         || die "'$_verdict' is not a valid verdict name"
     [[ -f "$_verdict" ]] || die "'$_verdict' is not a regular file"
 done
@@ -391,10 +426,12 @@ all_event_files() {
     EVENT_FILES=()
     local path name
     resolve_run_file events.jsonl 2>/dev/null && EVENT_FILES+=("$RUN_FILE_PATH")
-    for path in "$run_dir"/events-{review,fix,maintainer,mntfix,code,continuation}-*.jsonl; do
+    for path in "$run_dir"/events-{review,fix,maintainer,mntfix,code,continuation}-*.jsonl \
+            "$run_dir"/events-s[0-9]*-*.jsonl; do
         [[ -e "$path" ]] || continue
         name="${path##*/}"
-        [[ "$name" =~ ^events-(review|fix|maintainer|mntfix|code|continuation)-[0-9]+(-p[0-9]+)?\.jsonl$ ]] \
+        [[ "$name" =~ ^events-(review|fix|maintainer|mntfix|code|continuation)-[0-9]+(-p[0-9]+)?\.jsonl$ \
+            || "$name" =~ ^events-s[0-9]+-(code|review|maintain|fix)-[0-9]+(-p[0-9]+)?\.jsonl$ ]] \
             || die "'$name' is not a valid event file name"
         resolve_run_file "$name" || die "'$name' is not a readable event file"
         EVENT_FILES+=("$RUN_FILE_PATH")
@@ -469,10 +506,12 @@ for _name in events.jsonl sandbox.log exit-code summary.txt summary.json pid; do
     resolve_run_file "$_name" || true
 done
 # The same check for the leg event files, globbed instead of named: the
-# runner only writes events-<kind>-<N>(-p<P>).jsonl for the leg kinds above,
-# so a name in that shape that fails the pattern is not a run file, and any
+# runner only writes events-<kind>-<N>(-p<P>).jsonl for the legacy leg kinds
+# above, or events-s<K>-<kind>-<N>(-p<P>).jsonl for a composed step, so a
+# name in either shape that fails its pattern is not a run file, and any
 # symlink is refused before anything is printed.
-for _leg_events in "$run_dir"/events-{review,fix,maintainer,mntfix,code,continuation}-*.jsonl; do
+for _leg_events in "$run_dir"/events-{review,fix,maintainer,mntfix,code,continuation}-*.jsonl \
+        "$run_dir"/events-s[0-9]*-*.jsonl; do
     [[ -e "$_leg_events" ]] || continue
     resolve_run_file "${_leg_events##*/}" || die "'$_leg_events' is not a readable event file"
 done
