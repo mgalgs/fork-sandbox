@@ -144,14 +144,14 @@
 #                        no single review/maintain seat, or code seat past
 #                        the first, for a flag to override: there,
 #                        --model/--harness/--review-*/--maintainer-*/--k8s
-#                        are refused outright instead. A composed pipeline
-#                        is refused outright at launch even with none of
-#                        those flags given -- the run engine that walks an
-#                        arbitrary step list is not built yet, so only a
-#                        legacy-shaped pipeline (one code step, then at
-#                        most one review step, then at most one maintain
-#                        step, in that order) can actually run. Needs
-#                        PyYAML. See docs/presets.md for the file format.
+#                        are refused outright instead. The run engine walks
+#                        an arbitrary step list, so a composed pipeline runs
+#                        locally exactly as authored -- --k8s is the one
+#                        path that still only accepts a legacy-shaped
+#                        pipeline (one code step, then at most one review
+#                        step, then at most one maintain step, in that
+#                        order). Needs PyYAML. See docs/presets.md for the
+#                        file format.
 # --task-meta '<json>':  one JSON object of orchestrator-supplied task
 #                        metadata -- kind, difficulty, size,
 #                        prompt_template_id, stage -- stored beside the run
@@ -1797,10 +1797,10 @@ if [[ -n "$preset_name" ]]; then
     # most one review, then at most one maintain, in that order) is
     # translated below into the preset_impl_*/preset_review_*/
     # preset_maintain_* scalars the existing flag-compile block already
-    # consumes unchanged; a composed pipeline skips that block entirely.
-    # There is no run-engine walk over an arbitrary step list yet, so a
-    # composed pipeline is refused at launch further down rather than
-    # compiled into anything.
+    # consumes unchanged; a composed pipeline skips that block entirely and
+    # runs through the walker's own arbitrary-step-list walk instead (see
+    # the walker's header comment further down) -- refused only under
+    # --k8s, which still only accepts a legacy-shaped pipeline.
     preset_step_count=0
     declare -a preset_step_action=()
     declare -a preset_step_agent=()
@@ -1905,10 +1905,8 @@ if [[ -n "$preset_name" ]]; then
     # else -- any other order, any repeated kind, any count -- is a
     # composed pipeline: it has no single review/maintain seat for a flag
     # to override, so compiling flags into it would either be ambiguous or
-    # silently pick a step, and it skips this translation instead. The run
-    # engine has no walk over an arbitrary step list yet, so a composed
-    # pipeline is refused at launch further down instead of being run at
-    # all.
+    # silently pick a step, and it skips this translation instead. It runs
+    # through the walker's own arbitrary-step-list walk unchanged.
     preset_is_legacy_shaped=false
     if (( preset_step_count == 1 )) && [[ "${preset_step_action[1]}" == code ]]; then
         preset_is_legacy_shaped=true
@@ -1966,9 +1964,8 @@ if [[ -n "$preset_name" ]]; then
     # A composed (non-legacy-shaped) pipeline has no single code/review/
     # maintain scalar to describe or compile flags into, so the summary
     # below and the whole flag-compile block only apply to a legacy-shaped
-    # preset. A composed pipeline gets a step-count announcement instead,
-    # and is refused at launch further down: there is no run-engine walk
-    # over an arbitrary step list yet to run it.
+    # preset. A composed pipeline gets a step-count announcement instead
+    # and runs through the walker unchanged; only --k8s still refuses it.
     if [[ "$preset_is_legacy_shaped" == true ]]; then
     # Announced before the compile below, so the picture of what the preset
     # says comes first and any "--x overrides ..." notes read against it.
@@ -2643,9 +2640,9 @@ if [[ "$k8s_mode" == true ]]; then
         echo "Error: --k8s does not support a composed pipeline preset ('$preset_name')" >&2
         echo "yet -- only a legacy-shaped preset (one code step, then at most one" >&2
         echo "review step, then at most one maintain step, in that order) can" >&2
-        echo "forward to the cluster today. The run engine cannot walk this" >&2
-        echo "pipeline locally either yet; edit it into a legacy shape, or pick" >&2
-        echo "another." >&2
+        echo "forward to the cluster today. The run engine walks this pipeline" >&2
+        echo "fine locally, without --k8s; edit it into a legacy shape to run it" >&2
+        echo "on the cluster, or pick another." >&2
         exit 1
     fi
     if [[ "$harness" != "pi" && "$harness" != "claude" ]]; then
@@ -3073,11 +3070,10 @@ if [[ -n "$preset_file" && "$preset_is_legacy_shaped" != true ]]; then
     # harness_env_file/rev_harness_env_file/mnt_harness_env_file -- the
     # three fixed seats -- never into an "s<K>_harness_env_file" or
     # "s<K>fix_harness_env_file" fs_resolve_harness names for a composed
-    # step. The unconditional refusal just below already blocks every
-    # composed launch today, but name this case specifically so the
-    # message survives once that refusal lifts -- otherwise the gap would
-    # surface as a leg launching codex with no credential file instead of
-    # failing here, where the problem is nameable.
+    # step. The walker runs a composed pipeline today, so this check is
+    # live, not preparatory: without it, a codex-seated composed step or
+    # fix seat would launch with no credential file and fail deep inside
+    # the leg instead of being named here, up front.
     for ((preset_k = 1; preset_k <= preset_step_count; preset_k++)); do
         preset_k_agent="${preset_step_agent[$preset_k]}"
         if [[ "${preset_agent_harness[$preset_k_agent]}" == codex \
@@ -3095,9 +3091,11 @@ if [[ -n "$preset_file" && "$preset_is_legacy_shaped" != true ]]; then
     # either survived parsing here it belongs to that step -- but
     # fs_build_sandbox_cmd only splices --claude-args/--pi-args into a
     # command built with prefix "impl", never a composed step's own "s<K>"
-    # prefix, so that step would launch with them silently dropped. Name
-    # the gap now, the same way the codex check above does, so the message
-    # survives once the unconditional refusal below lifts.
+    # prefix, so that step would launch with them silently dropped. The
+    # walker runs a composed pipeline today, so -- same as the codex check
+    # above -- this is a live refusal, not a placeholder for a gap that
+    # only matters once some other block stops blocking composed launches
+    # first.
     for preset_cargs_agent in "${!preset_agent_cargs[@]}"; do
         if [[ -n "${preset_agent_cargs[$preset_cargs_agent]}" ]]; then
             echo "Error: preset '$preset_name' sets claude_args on agent" >&2
@@ -7595,25 +7593,36 @@ if [[ -z "$model" && -s "$sandbox_log" ]]; then
         "$sandbox_log" | head -n1)"
 fi
 
-# pipeline.json's step 0 is the code seat whenever one exists, and the same
-# model this script only just discovered above is what that step's model
-# field owes the reader. This script is the generated run.sh, a separate
-# program from the launcher that wrote pipeline.json -- run_step_kind is a
-# launcher-only array that never reaches here, so the "is step 0 the code
-# seat" check has to read the fact back out of pipeline.json itself rather
-# than out of that array. -s guards a run that never wrote pipeline.json at
-# all (no preset, or --review-only, whose step 0 is review and so the jq
-# filter's own action check leaves untouched regardless).
+# Every pi-local seat in this run -- any step (code, review or maintain)
+# whose harness/network pair reads "pi"/"sealed" with no model yet, and any
+# fix seat whose harness reads the literal "pi-local" -- owes the reader the
+# same backfill: config_dir/model.env is one file per machine, not one per
+# seat, so every pi-local seat in a single run necessarily discovers the
+# same model. Leaving one null would give the identical physical seat two
+# encodings in one file. This is true whether or not that seat's own leg
+# ever actually runs (a later step can be skipped, or a fix seat never
+# triggered) -- it will discover the identical model the moment it does,
+# so there is nothing to lose by writing it in now.
 #
-# Any fix seat's harness that reads "pi-local" owes the reader the same
-# backfill: config_dir/model.env is one file per machine, not one per seat,
-# so every pi-local seat in this run -- the code seat and any fix seat
-# folded to that spelling when pipeline.json was written -- necessarily
-# discovers the same model. Leaving a fix seat's model null after this point
-# would give the identical physical seat two encodings in one file.
+# This script is the generated run.sh, a separate program from the launcher
+# that wrote pipeline.json -- run_step_kind is a launcher-only array that
+# never reaches here, so this has to read the fact back out of pipeline.json
+# itself rather than out of that array. -s guards a run that never wrote
+# pipeline.json at all (no preset, or --review-only, whose step 0 is review
+# and so the harness/network check leaves it untouched regardless).
+#
+# A step's own harness/network pair already reads "pi"/"sealed" only after
+# the compile-time pi-local expansion (see pipeline.json's own emission
+# block above); a fix seat's harness keeps the literal "pi-local" spelling
+# instead, because the fix schema carries no network field to say "sealed"
+# any other way -- so the two seat flavors need two different match
+# conditions in the filter below, not one.
 if [[ -n "$model" && -s "$run_dir/pipeline.json" ]]; then
     if jq --arg model "$model" \
-        'if .steps[0].action == "code" then .steps[0].model = $model else . end
+        '.steps |= map(
+             if .harness == "pi" and .network == "sealed" and .model == null
+             then .model = $model
+             else . end)
          | .steps |= map(
              if .fix != null and .fix.harness == "pi-local" and .fix.model == null
              then .fix.model = $model
@@ -8605,12 +8614,12 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count; cur_step_no++)); do
             jq -n --argjson cap "$cur_cap" --arg maintainer_model "$cur_model" --arg maintainer_harness "$cur_harness" \
                 --arg fix_harness "$cur_fix_harness" --arg fix_model "$cur_fix_model" --argjson fix_repeat "$cur_fix_repeat" \
                 --arg ended "$cur_ended" --arg detail "$cur_detail" --argjson coding_exit_code "${cur_coding_rc:-null}" --argjson iterations "$cur_iters" \
-                '{cap:$cap,maintainer_model:(if $maintainer_model=="" then null else $maintainer_model end),maintainer_harness:(if $maintainer_harness=="" then null else $maintainer_harness end),fix_harness:(if $fix_harness=="" then null else $fix_harness end),fix_model:(if $fix_model=="" then null else $fix_model end),fix_repeat:(if $fix_repeat==1 then null else $fix_repeat end),ended:(if $ended=="" then null else $ended end),detail:(if $detail=="" then null else $detail end),coding_exit_code:$coding_exit_code,iterations:$iterations}' > "$cur_loop_json.part" 2>/dev/null && mv -f "$cur_loop_json.part" "$cur_loop_json"
+                '{cap:$cap,maintainer_model:(if $maintainer_model=="" then null else $maintainer_model end),maintainer_harness:(if $maintainer_harness=="" then null else $maintainer_harness end),fix_harness:(if $fix_harness=="" then null else $fix_harness end),fix_model:(if $fix_model=="" then null else $fix_model end),fix_repeat:(if $fix_repeat==1 then null else $fix_repeat end),ended:(if $ended=="" then null else $ended end),detail:(if $detail=="" then null else $detail end),coding_exit_code:$coding_exit_code,iterations:$iterations}' > "$cur_loop_json.part" 2>/dev/null && mv -f "$cur_loop_json.part" "$cur_loop_json" || rm -f "$cur_loop_json.part"
         else
             jq -n --argjson cap "$cur_cap" --arg review_model "$cur_model" --arg review_harness "$cur_harness" \
                 --arg fix_harness "$cur_fix_harness" --arg fix_model "$cur_fix_model" --argjson fix_repeat "$cur_fix_repeat" \
                 --arg ended "$cur_ended" --arg detail "$cur_detail" --argjson coding_exit_code "${cur_coding_rc:-null}" --argjson iterations "$cur_iters" \
-                '{cap:$cap,review_model:(if $review_model=="" then null else $review_model end),review_harness:(if $review_harness=="" then null else $review_harness end),fix_harness:(if $fix_harness=="" then null else $fix_harness end),fix_model:(if $fix_model=="" then null else $fix_model end),fix_repeat:(if $fix_repeat==1 then null else $fix_repeat end),ended:(if $ended=="" then null else $ended end),detail:(if $detail=="" then null else $detail end),coding_exit_code:$coding_exit_code,iterations:$iterations}' > "$cur_loop_json.part" 2>/dev/null && mv -f "$cur_loop_json.part" "$cur_loop_json"
+                '{cap:$cap,review_model:(if $review_model=="" then null else $review_model end),review_harness:(if $review_harness=="" then null else $review_harness end),fix_harness:(if $fix_harness=="" then null else $fix_harness end),fix_model:(if $fix_model=="" then null else $fix_model end),fix_repeat:(if $fix_repeat==1 then null else $fix_repeat end),ended:(if $ended=="" then null else $ended end),detail:(if $detail=="" then null else $detail end),coding_exit_code:$coding_exit_code,iterations:$iterations}' > "$cur_loop_json.part" 2>/dev/null && mv -f "$cur_loop_json.part" "$cur_loop_json" || rm -f "$cur_loop_json.part"
         fi
     }
     # The current iteration as a one-element JSON array, built from whatever

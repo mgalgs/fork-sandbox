@@ -1384,6 +1384,24 @@ printf '%s\n' "$*" >> "$FAKE_ARGV_LOG"
 printf 'agent-sandboxed: pi against vendor/discovered-model at http://198.51.100.1:8001/v1\n' >&2
 exit 0
 STUB
+# A jq wrapper that can fail exactly the cur_save loop-json write and no
+# other jq call: it recognizes cur_save's invocations by their unique
+# "--arg fix_harness" pair (scripts/fork-sandbox.sh has no other jq call
+# that names a $-arg "fix_harness") and only misbehaves when
+# FAKE_JQ_FAIL_LOOP_SAVE is set, so every other test in this file -- which
+# shares this same real_stub dir -- still gets the real jq.
+real_jq="$(command -v jq)"
+cat > "$real_stub/jq" <<STUB
+#!/usr/bin/env bash
+if [[ "\${FAKE_JQ_FAIL_LOOP_SAVE:-}" == 1 ]]; then
+    prev=""
+    for a in "\$@"; do
+        [[ "\$prev" == "--arg" && "\$a" == "fix_harness" ]] && exit 1
+        prev="\$a"
+    done
+fi
+exec "$real_jq" "\$@"
+STUB
 chmod +x "$real_stub"/*
 
 real_cfg="$(mktemp -d)"; tmpdirs+=("$real_cfg")
@@ -1598,6 +1616,41 @@ else
     no "composed walk launch succeeds"
 fi
 
+# A1b. cur_save's jq write is `... > "$f.part" && mv ... "$f.part" "$f"` --
+# on a jq failure the redirection still creates the .part file, and without
+# a cleanup on the failed branch it is stranded in the run dir forever,
+# tripping the pinned filename-set contract other tests here rely on. Force
+# every cur_save jq call in a one-step review composed run to fail (the jq
+# wrapper above only misbehaves for cur_save's own "--arg fix_harness"
+# signature) and confirm no .part file survives the run.
+cat > "$real_presets/jqfail.yaml" <<'EOF'
+agents:
+  coder:
+    harness: claude
+    model: haiku
+pipeline:
+  - action: code
+    agent: coder
+  - action: review
+    repeat: 1
+    agent: coder
+EOF
+prep_stub $'commit\napproved'
+if rd_jqfail="$(FAKE_JQ_FAIL_LOOP_SAVE=1 run_stubbed --preset jqfail \
+    --branch "sandbox-test-jqfail-$$")"; then
+    tmpdirs+=("$rd_jqfail")
+    check "the forced jq failure kept step-2-loop.json from ever being written" \
+        "" "$(cat "$rd_jqfail/step-2-loop.json" 2>/dev/null)"
+    if [[ -z "$(find "$rd_jqfail" -maxdepth 1 -name '*.part' 2>/dev/null)" ]]; then
+        ok "cur_save cleans up its .part file when jq fails"
+    else
+        no "cur_save cleans up its .part file when jq fails" \
+            "$(find "$rd_jqfail" -maxdepth 1 -name '*.part' -exec basename {} \; | tr '\n' ' ')"
+    fi
+else
+    no "jqfail launch succeeds"
+fi
+
 # A2. A bare --review-loop with no --review-model/--review-harness: the
 # review leg actually runs the implement harness AND model (review_sandbox_cmd
 # copies sandbox_cmd verbatim when review_harness_given is false), so
@@ -1675,6 +1728,41 @@ if rd_a3="$(run_stubbed --preset sealed-review \
         "2" "$(jq -r '.steps[1].fix.repeat' "$rd_a3/pipeline.json")"
 else
     no "sealed-review launch succeeds"
+fi
+
+# A4. A pi-local review STEP itself (not the code seat, not a fix seat) --
+# the case round 3 closes. The reviewer agent is pi-local at a review step,
+# whose own leg never runs at all (the coder's pi-local pass is a "noop",
+# so the branch never moves past base_sha and the review step is marked
+# skipped before run_leg is ever called for it) -- proving the backfill
+# does not depend on the seat's own leg having executed, only on some
+# pi-local leg in the run (here, the code seat) having discovered the
+# model first.
+cat > "$real_presets/sealed-review-step.yaml" <<'EOF'
+agents:
+  coder:
+    harness: pi-local
+  reviewer:
+    harness: pi-local
+pipeline:
+  - action: code
+    agent: coder
+  - action: review
+    repeat: 1
+    agent: reviewer
+EOF
+prep_stub 'noop'
+if rd_a4="$(run_stubbed --preset sealed-review-step \
+    --branch "sandbox-test-sealed-review-step-$$")"; then
+    tmpdirs+=("$rd_a4")
+    check "the sealed review step's harness is pi (pi-local, expanded)" \
+        "pi" "$(jq -r '.steps[1].harness' "$rd_a4/pipeline.json")"
+    check "the sealed review step's network is sealed" \
+        "sealed" "$(jq -r '.steps[1].network' "$rd_a4/pipeline.json")"
+    check "the sealed review step's own model is backfilled, not left null" \
+        "vendor/discovered-model" "$(jq -r '.steps[1].model' "$rd_a4/pipeline.json")"
+else
+    no "sealed-review-step launch succeeds"
 fi
 
 # D. A definition edited between the staging and the run dir -- the race the

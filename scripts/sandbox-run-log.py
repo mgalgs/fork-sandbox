@@ -164,6 +164,37 @@ The prompt overlay (fork-sandbox.sh --prompts-dir, or a machine's default
                   prompt_overlay.legs.fix.sha256` narrows to the fix leg
                   alone.
 
+The composed pipeline (fork-sandbox.sh --preset, when the preset composes
+more than one action): the full algorithm for the fields below --
+canonical serialization, the shortname's letter table and slug fallback,
+and why grouping must never use the shortname or the preset name -- lives
+in docs/presets.md; this is only the field reference.
+  composition        the canonical grouping key: pipeline.json's `steps`
+                      array, normalized and key-sorted, so a preset
+                      renamed or copied to a new file still groups with
+                      its old runs. Present only when the run wrote a
+                      pipeline.json, i.e. only for a --preset run -- a
+                      flag-driven run has neither this nor
+                      composition_short.
+  composition_short   a best-effort display name built from the same
+                      steps -- display only, never a grouping key. `stats
+                      --by composition` is special-cased to key on
+                      `composition` and print `composition_short` in the
+                      cell, so grouping stays collision-free while the
+                      table stays readable. Never group on
+                      composition_short or on the preset name instead --
+                      see docs/presets.md for why a collision there
+                      silently merges two different compositions.
+  steps               present only when the run wrote at least one
+                      step-<K>-loop.json -- a composed run's per-step loop
+                      records, ordered by step ascending, each the parsed
+                      loop record plus `step` (K) and `action` (`review`
+                      or `maintain`, read from pipeline.json since the
+                      loop record's own fields do not distinguish them).
+                      A composed run has `steps` and no
+                      review_loop/maintainer_loop; a legacy-shaped run has
+                      the reverse -- never both.
+
 Verdict outcomes:
   integrated             merged as-is, or with trivial touch-ups
   integrated-with-fixes  merged after this session fixed real defects
@@ -363,6 +394,119 @@ def load_run_env(path):
     return env
 
 
+# The canonical composition key (docs/presets.md 3b): the compact,
+# key-sorted JSON serialization of pipeline.json's `steps` array, after
+# normalizing every step to exactly these keys, present always even when
+# null. JSON, not a punctuation-joined string, because a model id can
+# legitimately contain both "/" (OpenRouter) and ":" (ollama-style tags),
+# so any separator collides with some model id already using it.
+PIPELINE_STEP_KEYS = ("action", "harness", "model", "repeat", "network", "fix")
+PIPELINE_FIX_KEYS = ("harness", "model", "repeat")
+
+# The shortname's registered model-id letter table (docs/presets.md 3c) --
+# matched case-insensitively as a substring of the model id, first hit
+# wins. A model that hits none of these falls back to a slug, which is
+# what flips on the shortname's collision-warning hash suffix.
+MODEL_LETTERS = (("sonnet", "s"), ("opus", "o"), ("haiku", "h"))
+STAGE_LETTERS = {"code": "c", "review": "r", "maintain": "m"}
+
+STEP_LOOP_RE = re.compile(r"step-([0-9]+)-loop\.json")
+
+
+def normalize_pipeline_step(step):
+    """One step of pipeline.json's `steps` array, reduced to exactly the
+    keys the canonical composition string (docs/presets.md 3b) is defined
+    over. Any other key is dropped; every key here is always present, even
+    when its value is null."""
+    out = {}
+    for k in PIPELINE_STEP_KEYS:
+        v = step.get(k) if isinstance(step, dict) else None
+        if k == "fix":
+            v = {fk: v.get(fk) for fk in PIPELINE_FIX_KEYS} if isinstance(v, dict) else None
+        out[k] = v
+    return out
+
+
+def composition_slug(model):
+    """The shortname's fallback for a model id the letter table below does
+    not recognize (docs/presets.md 3c): text after the last '/',
+    lowercased, [a-z0-9] only, first 4 characters. A null model slugs to
+    'x'."""
+    if not model:
+        return "x"
+    text = model.rsplit("/", 1)[-1].lower()
+    slug = "".join(ch for ch in text if ch in "abcdefghijklmnopqrstuvwxyz0123456789")
+    return slug[:4] or "x"
+
+
+def composition_model_letter(model):
+    """Returns (letter, used_slug) for one step's model id -- used_slug is
+    what triggers the shortname's hash suffix below."""
+    if isinstance(model, str):
+        low = model.lower()
+        for word, letter in MODEL_LETTERS:
+            if word in low:
+                return letter, False
+    return composition_slug(model), True
+
+
+def compute_composition(steps):
+    """steps is pipeline.json's raw `steps` array. Returns (canonical,
+    shortname) per docs/presets.md 3b/3c, or (None, None) when steps is
+    not a usable array."""
+    if not isinstance(steps, list):
+        return None, None
+    norm = [normalize_pipeline_step(s) for s in steps]
+    canonical = json.dumps(norm, sort_keys=True, separators=(",", ":"))
+    parts = []
+    used_slug = False
+    for step in norm:
+        stage = STAGE_LETTERS.get(step["action"], "?")
+        letter, is_slug = composition_model_letter(step["model"])
+        used_slug = used_slug or is_slug
+        repeat = step["repeat"] if isinstance(step["repeat"], int) else 1
+        parts.append(f"{stage}{letter}{repeat}")
+    short = "-".join(parts)
+    if used_slug:
+        short += "-" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:4]
+    return canonical, short
+
+
+def load_composed_steps(rd, pipeline_steps):
+    """Every step-<K>-loop.json in a composed run dir (docs/presets.md 3e),
+    ordered by K ascending, each with `step` (K) and `action` added.
+    `action` comes from pipeline_steps[K-1] -- a composed maintain step's
+    own loop record uses the review_model/review_harness field flavor, not
+    maintainer_*, so the action cannot be inferred from the record's own
+    field names. Empty for a legacy-shaped run, which writes
+    review-loop.json/maintainer-loop.json instead."""
+    found = []
+    try:
+        names = os.listdir(rd)
+    except OSError:
+        return []
+    for name in names:
+        m = STEP_LOOP_RE.fullmatch(name)
+        if m:
+            found.append((int(m.group(1)), name))
+    found.sort()
+    steps = []
+    for k, name in found:
+        rec = load_json_file(os.path.join(rd, name))
+        if rec is None:
+            continue
+        rec = dict(rec)
+        rec["step"] = k
+        action = None
+        if isinstance(pipeline_steps, list) and 0 <= k - 1 < len(pipeline_steps):
+            step_def = pipeline_steps[k - 1]
+            if isinstance(step_def, dict):
+                action = step_def.get("action")
+        rec["action"] = action
+        steps.append(rec)
+    return steps
+
+
 def archive_codex_quota(run_dir, run_id):
     """Extract the first and last rate-limit row from each Codex rollout.
 
@@ -533,6 +677,28 @@ def cmd_record(args):
     maintainer_loop = load_json_file(os.path.join(rd, "maintainer-loop.json"))
     if maintainer_loop is not None:
         rec["maintainer_loop"] = maintainer_loop
+
+    # The composed pipeline's identity (docs/presets.md 3b/3c), when the
+    # run was launched with --preset: `composition` is the canonical,
+    # collision-free grouping key; `composition_short` is a best-effort
+    # display name that must never be grouped on. Same absence convention
+    # as review_loop/maintainer_loop above -- no keys at all for a
+    # flag-driven run, which writes no pipeline.json.
+    pipeline = load_json_file(os.path.join(rd, "pipeline.json"))
+    pipeline_steps = pipeline.get("steps") if isinstance(pipeline, dict) else None
+    if pipeline_steps is not None:
+        composition, composition_short = compute_composition(pipeline_steps)
+        if composition is not None:
+            rec["composition"] = composition
+            rec["composition_short"] = composition_short
+
+    # Every step-<K>-loop.json a composed run wrote (docs/presets.md 3e),
+    # ordered by step ascending. Absent entirely for a legacy-shaped run,
+    # which loaded into review_loop/maintainer_loop above instead -- a
+    # record has `steps` xor review_loop/maintainer_loop, never both.
+    composed_steps = load_composed_steps(rd, pipeline_steps)
+    if composed_steps:
+        rec["steps"] = composed_steps
 
     # The prompt overlay's provenance, when the run applied one: which
     # machine-local fragments, from where, at what rev (marked -dirty if the
@@ -789,6 +955,20 @@ def cmd_stats(args):
     landed_set = {"integrated", "integrated-with-fixes", "rescued"}
     for key in sorted(groups):
         rs = groups[key]
+        # `composition` is grouped on its canonical value (the dict key
+        # above) but DISPLAYED as composition_short -- printing the
+        # canonical value would make the table unreadable, and grouping on
+        # the shortname instead would silently merge distinct compositions
+        # (docs/presets.md 3d). If a group's rows disagree on their
+        # shortname (they should not), print the first by sort order
+        # rather than inventing a merged label.
+        display_key = tuple(
+            (sorted({str(get_path(r, "composition_short"))
+                     if get_path(r, "composition_short") is not None
+                     else "-" for r in rs})[0]
+             if d == "composition" else k)
+            for d, k in zip(dims, key)
+        )
         exit0 = sum(1 for r in rs if r.get("exit_code") == 0)
         died = sum(
             1 for r in rs
@@ -804,7 +984,7 @@ def cmd_stats(args):
         outs = [o for o in outs if isinstance(o, (int, float))]
         costs = [r.get("cost_usd") for r in rs
                  if isinstance(r.get("cost_usd"), (int, float))]
-        table.append(key + (
+        table.append(display_key + (
             str(len(rs)),
             str(exit0),
             str(died),

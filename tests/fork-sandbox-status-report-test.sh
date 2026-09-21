@@ -509,4 +509,106 @@ allowlist_line="$(grep -m1 '^ *run\.env|' "$repo_dir/scripts/fork-sandbox-status
 [[ "$allowlist_line" == *"|pipeline.json)"* ]] \
     || { echo "pipeline.json is missing from resolve_run_file's allowlist: $allowlist_line"; exit 1; }
 
-echo "30 passed, 0 failed"
+# 12. A composed, review-only pipeline: one step, action review, named with
+# the s<K>- prefix instead of the legacy review-loop.json/review-verdict-N
+# shape. Every reader that used to glob only the legacy names must pick this
+# up too.
+new_run_dir
+cat > "$rd_new/step-1-loop.json" <<'EOF'
+{"ended":"approved"}
+EOF
+printf 'APPROVED\nChecked: the diff.\n\n## Report\ncomposed review body\n' \
+    > "$rd_new/s1-review-verdict-1.md"
+printf '0\n' > "$rd_new/exit-code"
+printf 'done\n' > "$rd_new/summary.txt"
+out="$(timeout 12 "$status" "$rd_new" 2>&1)"
+[[ "$out" == *"== report: review leg 1 (APPROVED) =="* ]] \
+    || { echo "composed review-only report missing: $out"; exit 1; }
+[[ "$out" == *"composed review body"* ]] \
+    || { echo "composed review-only report body missing: $out"; exit 1; }
+mon_out="$(timeout 12 "$status" --monitor "$rd_new" 2>&1)"
+[[ "$mon_out" == *"report: review leg 1 (APPROVED)"* ]] \
+    || { echo "composed review-only marker wrong: $mon_out"; exit 1; }
+
+# 13. A composed pipeline whose highest step is a review, not a maintain:
+# step 1 maintains, step 2 reviews. The marker must still name step 2's
+# review -- proving the selection rule is "highest step wins", not "prefer
+# maintain" -- while both step bodies still print, maintainer first, same
+# order the legacy dual-loop shape always used.
+new_run_dir
+cat > "$rd_new/step-1-loop.json" <<'EOF'
+{"ended":"approved"}
+EOF
+cat > "$rd_new/step-2-loop.json" <<'EOF'
+{"ended":"approved"}
+EOF
+printf 'APPROVED\nChecked: the branch.\n\n## Report\nstep 1 maintain body\n' \
+    > "$rd_new/s1-maintain-verdict-1.md"
+printf 'APPROVED\nChecked: the diff.\n\n## Report\nstep 2 review body\n' \
+    > "$rd_new/s2-review-verdict-1.md"
+printf '0\n' > "$rd_new/exit-code"
+printf 'done\n' > "$rd_new/summary.txt"
+out="$(timeout 12 "$status" "$rd_new" 2>&1)"
+[[ "$out" == *"== report: maintainer leg 1 (APPROVED) =="* ]] \
+    || { echo "step 1 maintain report missing: $out"; exit 1; }
+[[ "$out" == *"== report: review leg 1 (APPROVED) =="* ]] \
+    || { echo "step 2 review report missing: $out"; exit 1; }
+if [[ "${out%%'== report: maintainer'*}" != "$out" \
+    && "${out%%'== report: review leg'*}" == *"step 1 maintain body"* ]]; then
+    : # maintainer body precedes review body, as legacy dual-loop always did
+else
+    echo "composed dual report order wrong: $out"; exit 1
+fi
+mon_out="$(timeout 12 "$status" --monitor "$rd_new" 2>&1)"
+[[ "$mon_out" == *"report: review leg 1 (APPROVED)"* ]] \
+    || { echo "highest-step-wins marker did not pick the review step: $mon_out"; exit 1; }
+[[ "$mon_out" != *"report: maintainer leg"* ]] \
+    || { echo "marker preferred maintain over the higher-numbered review step: $mon_out"; exit 1; }
+
+# 14. A 4-step composition: code, review, maintain, review. The marker must
+# come from the last step (a review, step 4), and each report body must come
+# from the highest step of its own action -- the maintainer body from step 3
+# (the only maintain step), the review body from step 4 (not step 2, the
+# earlier review).
+new_run_dir
+cat > "$rd_new/step-2-loop.json" <<'EOF'
+{"ended":"approved"}
+EOF
+cat > "$rd_new/step-3-loop.json" <<'EOF'
+{"ended":"approved"}
+EOF
+cat > "$rd_new/step-4-loop.json" <<'EOF'
+{"ended":"approved"}
+EOF
+printf 'APPROVED\nChecked: first pass.\n\n## Report\nstep 2 review body\n' \
+    > "$rd_new/s2-review-verdict-1.md"
+printf 'APPROVED\nChecked: the branch.\n\n## Report\nstep 3 maintain body\n' \
+    > "$rd_new/s3-maintain-verdict-1.md"
+printf 'APPROVED\nChecked: second pass.\n\n## Report\nstep 4 review body\n' \
+    > "$rd_new/s4-review-verdict-1.md"
+printf '0\n' > "$rd_new/exit-code"
+printf 'done\n' > "$rd_new/summary.txt"
+out="$(timeout 12 "$status" "$rd_new" 2>&1)"
+[[ "$out" == *"== report: maintainer leg 1 (APPROVED) =="* && "$out" == *"step 3 maintain body"* ]] \
+    || { echo "4-step maintainer report did not come from step 3: $out"; exit 1; }
+[[ "$out" == *"step 4 review body"* ]] \
+    || { echo "4-step review report did not come from step 4: $out"; exit 1; }
+[[ "$out" != *"step 2 review body"* ]] \
+    || { echo "4-step review report wrongly used the earlier step 2 verdict: $out"; exit 1; }
+mon_out="$(timeout 12 "$status" --monitor "$rd_new" 2>&1)"
+[[ "$mon_out" == *"report: review leg 1 (APPROVED)"* ]] \
+    || { echo "4-step marker did not pick the last step's review: $mon_out"; exit 1; }
+
+# 15. A symlinked composed verdict is refused exactly like a symlinked
+# legacy one -- the preflight scan's widened glob must actually catch it,
+# not just resolve_run_file's per-file allowlist.
+new_run_dir
+cat > "$rd_new/step-2-loop.json" <<'EOF'
+{"ended":"approved"}
+EOF
+ln -s /etc/passwd "$rd_new/s2-review-verdict-1.md"
+if "$status" --result "$rd_new" >/dev/null 2>&1; then
+    echo "symlinked composed verdict was accepted"; exit 1
+fi
+
+echo "35 passed, 0 failed"
