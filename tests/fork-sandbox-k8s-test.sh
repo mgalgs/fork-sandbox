@@ -323,8 +323,6 @@ pass=0; fail=0; tmpdirs=()
 # the operator's durable home. They use this isolated HOME.
 k8s_test_operator_home="$HOME"
 k8s_test_handoff_archive="$k8s_test_operator_home/.claude/sandbox-handoffs"
-k8s_test_handoff_archives_before="$(find "$k8s_test_handoff_archive" -maxdepth 1 \
-    -type f 2>/dev/null | sort)"
 k8s_test_home="$(mktemp -d)"; tmpdirs+=("$k8s_test_home")
 
 # Every real (non --dry-run) submit this suite drives now also creates a
@@ -349,26 +347,35 @@ k8s_test_runlog="$k8s_test_home/.claude/sandbox-runs.jsonl"
 k8s_test_runlog_before_lines=0
 [[ -f "$k8s_test_runlog" ]] && k8s_test_runlog_before_lines="$(wc -l < "$k8s_test_runlog")"
 
+# Every claude-fork-sandbox.* directory under the forks root that this
+# suite's own fixtures created, one per line. Ownership, not just novelty:
+# a directory that showed up after the pre-suite snapshot is not
+# necessarily this suite's own -- a real `fork-sandbox.sh` run started
+# concurrently, from the identical mktemp template under the identical
+# forks root, looks identical at this point. Only counted when its own
+# run-source marker carries this suite's FORK_SANDBOX_RUN_SOURCE=test tag
+# (every fixture run this suite drives writes one); a live run's marker,
+# if it has one at all, will not read "test". Used both by cleanup()'s
+# sweep and by the handoff-archive guard near the end of this file, so
+# each recomputes the identical set rather than drifting apart.
+k8s_test_owned_rundirs() {
+    local d
+    find "$k8s_test_forks_root" -maxdepth 1 \
+        -name 'claude-fork-sandbox.*' 2>/dev/null | sort | while IFS= read -r d; do
+        [[ -z "$d" ]] && continue
+        grep -qxF "$d" <<< "$k8s_test_preexisting_rundirs" && continue
+        [[ "$(cat "$d/run-source" 2>/dev/null)" == test ]] || continue
+        printf '%s\n' "$d"
+    done
+}
+
 cleanup() {
     local d
     for d in "${tmpdirs[@]-}"; do [[ -n "$d" && -d "$d" ]] && rm -rf -- "$d"; done
-    local after
-    after="$(find "$k8s_test_forks_root" -maxdepth 1 \
-        -name 'claude-fork-sandbox.*' 2>/dev/null | sort)"
     while IFS= read -r d; do
         [[ -z "$d" ]] && continue
-        grep -qxF "$d" <<< "$k8s_test_preexisting_rundirs" && continue
-        # Ownership, not just novelty: a directory that showed up after the
-        # snapshot above is not necessarily this suite's own -- a real
-        # `fork-sandbox.sh` run started concurrently, from the identical
-        # mktemp template under the identical forks root, looks identical
-        # at this point. Only remove it when its own run-source marker
-        # carries this suite's FORK_SANDBOX_RUN_SOURCE=test tag (every
-        # fixture run this suite drives writes one); a live run's
-        # marker, if it has one at all, will not read "test".
-        [[ "$(cat "$d/run-source" 2>/dev/null)" == test ]] || continue
         rm -rf -- "$d"
-    done <<< "$after"
+    done < <(k8s_test_owned_rundirs)
 }
 trap cleanup EXIT
 ok() { printf '  ok    %s\n' "$1"; pass=$(( pass + 1 )); }
@@ -9965,15 +9972,21 @@ check "every row this suite appended to the fixture run log carries source=test"
 
 printf '\n== fixture runs leave no handoff archives in the operator home ==\n'
 # Archives carry no source marker, so unlike the JSONL rows above a fixture
-# archive is indistinguishable from an operator's real work. Compare only
-# against the pre-suite snapshot: never remove or otherwise disturb an
-# existing durable archive.
+# archive is indistinguishable from an operator's real work. Ownership,
+# not a global snapshot diff (row 72): a snapshot diff fails this suite
+# over an unrelated concurrent run's archive landing during this suite's
+# window even when this suite itself leaked nothing. record() only ever
+# archives a run dir's handoff.md (sandbox-run-log.py), always as
+# <run-dir-basename>.md, so checking for exactly those names -- among
+# this suite's own owned run dirs, the same set cleanup() sweeps -- has
+# full teeth for the defect class without the false positive.
 k8s_test_new_handoff_archives=""
-while IFS= read -r k8s_test_handoff_archive_path; do
-    [[ -z "$k8s_test_handoff_archive_path" ]] && continue
-    grep -qxF "$k8s_test_handoff_archive_path" <<< "$k8s_test_handoff_archives_before" && continue
-    k8s_test_new_handoff_archives+="$k8s_test_handoff_archive_path "
-done < <(find "$k8s_test_handoff_archive" -maxdepth 1 -type f 2>/dev/null | sort)
+while IFS= read -r k8s_test_owned_rundir; do
+    [[ -z "$k8s_test_owned_rundir" ]] && continue
+    k8s_test_handoff_archive_path="$k8s_test_handoff_archive/$(basename "$k8s_test_owned_rundir").md"
+    [[ -e "$k8s_test_handoff_archive_path" ]] \
+        && k8s_test_new_handoff_archives+="$k8s_test_handoff_archive_path "
+done < <(k8s_test_owned_rundirs)
 check "fixture runs append no handoff archives to the operator's durable state" \
     "" "$k8s_test_new_handoff_archives"
 

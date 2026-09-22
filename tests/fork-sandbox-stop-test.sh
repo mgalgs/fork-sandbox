@@ -64,8 +64,6 @@ launcher_home="$(mktemp -d)"; tmpdirs+=("$launcher_home")
 # ~/src as a side effect).
 mkdir -p "$launcher_home/src"
 operator_archive_dir="$HOME/.claude/sandbox-handoffs"
-operator_archives_before="$(find "$operator_archive_dir" -maxdepth 1 \
-    -type f 2>/dev/null | sort)"
 # Set only by the exact-match tmux test, to a dedicated -L server -- never
 # the caller's own default one, per
 # fork-sandbox-clone-dir-lock-lifetime-test.sh's header. Killed in the EXIT
@@ -1230,14 +1228,21 @@ contains "failed fetch: names the clone as the rescue path" "$fail_clone" "$out_
 printf '\n== fixture runs leave no handoff archives in the operator home ==\n'
 # Same guard as fork-sandbox-k8s-test.sh's: archives carry no source
 # marker, so a leaked fixture archive is indistinguishable from an
-# operator's real work. Compare only against the pre-suite snapshot;
-# never remove or otherwise disturb an existing durable archive.
+# operator's real work. Ownership, not a global snapshot diff -- a
+# snapshot diff would fail this suite over an unrelated concurrent run's
+# archive landing during this suite's window even when this suite leaked
+# nothing (row 72). record() only ever archives a run dir's handoff.md
+# (sandbox-run-log.py), and $rd/$rd2 -- this suite's two real-launcher run
+# dirs -- are the only run dirs this suite ever gives one; every other
+# fixture run dir here is hand-built by new_run_dir() with no handoff.md
+# inside it, so it can never produce an archive. A leaked archive is
+# always named <run-dir-basename>.md.
 new_operator_archives=""
-while IFS= read -r archive_path; do
-    [[ -z "$archive_path" ]] && continue
-    grep -qxF "$archive_path" <<< "$operator_archives_before" && continue
-    new_operator_archives+="$archive_path "
-done < <(find "$operator_archive_dir" -maxdepth 1 -type f 2>/dev/null | sort)
+for owned_rd in "$rd" "$rd2"; do
+    [[ -z "$owned_rd" ]] && continue
+    archive_path="$operator_archive_dir/$(basename "$owned_rd").md"
+    [[ -e "$archive_path" ]] && new_operator_archives+="$archive_path "
+done
 check "fixture runs append no handoff archives to the operator's durable state" \
     "" "$new_operator_archives"
 
