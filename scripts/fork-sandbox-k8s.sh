@@ -3398,12 +3398,17 @@ cmd_submit() {
     # run's granted namespaces, and if that namespace's grant names a port
     # the probe's port must equal it -- otherwise the probe can never pass
     # and the run would only fail 60s later at the gate, for a reason
-    # submit could have named right here. Shape is checked with case/glob,
-    # not [[ =~ ]]: K8S_CLUSTER_DOMAIN may contain literal dots, and a dot
-    # is an ERE metacharacter (see this file's other glob-not-regex host
-    # comparisons for the same reason).
+    # submit could have named right here. Shape is checked by splitting on
+    # "." and counting/comparing labels, not with [[ =~ ]] or a "*.*.svc"
+    # style glob: K8S_CLUSTER_DOMAIN may contain literal dots, an ERE dot
+    # is a metacharacter, and a glob's "*" absorbs embedded dots too --
+    # "*.*.svc" wrongly accepts "svc.ns.extra.svc" (see this file's other
+    # glob-not-regex host comparisons, which use a single suffix "*" and
+    # don't have this trap).
     local -a run_reach_probes=()
     local probe host port_probe ns_seg gi found gport shape_ok
+    local -a host_labels domain_labels
+    local di domain_match
     for probe in "${reach_probe_raw[@]}"; do
         host="${probe%:*}"
         port_probe="${probe##*:}"
@@ -3419,12 +3424,20 @@ cmd_submit() {
         port_probe=$(( 10#$port_probe ))
 
         shape_ok=false
-        case "$host" in
-            *.*.svc."$K8S_CLUSTER_DOMAIN"|*.*.svc)
-                shape_ok=true ;;
-            *.*)
-                [[ "$host" != *.*.* ]] && shape_ok=true ;;
-        esac
+        IFS='.' read -r -a host_labels <<< "$host"
+        IFS='.' read -r -a domain_labels <<< "$K8S_CLUSTER_DOMAIN"
+        if (( ${#host_labels[@]} == 2 )); then
+            shape_ok=true
+        elif (( ${#host_labels[@]} == 3 )) && [[ "${host_labels[2]}" == svc ]]; then
+            shape_ok=true
+        elif (( ${#host_labels[@]} == 3 + ${#domain_labels[@]} )) \
+                && [[ "${host_labels[2]}" == svc ]]; then
+            domain_match=true
+            for (( di = 0; di < ${#domain_labels[@]}; di++ )); do
+                [[ "${host_labels[3 + di]}" == "${domain_labels[$di]}" ]] || domain_match=false
+            done
+            [[ "$domain_match" == true ]] && shape_ok=true
+        fi
         if [[ "$shape_ok" != true ]]; then
             echo "Error: --reach-probe '$probe' has host '$host', which must be" >&2
             echo "<svc>.<ns>, <svc>.<ns>.svc, or <svc>.<ns>.svc.$K8S_CLUSTER_DOMAIN." >&2

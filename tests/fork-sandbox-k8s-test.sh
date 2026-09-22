@@ -1025,6 +1025,27 @@ refuses "--reach-probe host with three labels and no .svc marker is refused" \
     --reach-probe "svc.demo-slot-01.extra:8000" \
     "$proj_dir" "$handoff_file"
 
+# A host with an extra label wedged in before the ".svc" marker must not
+# slip past the shape check as if it were <svc>.<ns>.svc -- a glob check
+# written as "*.*.svc" lets "*" absorb the embedded dot and wrongly accepts
+# this, which is exactly the "fails 60s later at the gate instead" failure
+# mode --reach-probe exists to catch here. Same trap applies with the
+# cluster-domain suffix appended.
+refuses "--reach-probe host with an extra label before the .svc marker is refused" \
+    "<svc>.<ns>, <svc>.<ns>.svc" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-ns --model moonshotai/kimi-k3 \
+    --allow-namespace "demo-slot-01:8000" \
+    --reach-probe "svc.demo-slot-01.extra.svc:8000" \
+    "$proj_dir" "$handoff_file"
+refuses "--reach-probe host with an extra label before .svc.\$K8S_CLUSTER_DOMAIN is refused" \
+    "<svc>.<ns>, <svc>.<ns>.svc" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-ns --model moonshotai/kimi-k3 \
+    --allow-namespace "demo-slot-01:8000" \
+    --reach-probe "svc.demo-slot-01.extra.svc.cluster.local:8000" \
+    "$proj_dir" "$handoff_file"
+
 # --allow-namespace with no port (every port/protocol) never triggers the
 # port-agreement refusal, whatever port the probe names.
 if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
@@ -1070,6 +1091,23 @@ if grep -qF "K8S_AGENT_ALLOW_NS opens agent egress to namespace 'static-slot'" \
 else
     no "submit announces both the static key's and this run's own --allow-namespace grant" \
         "$(cat /tmp/fs-k8s-test-both-submit-ns.err)"
+fi
+# The announcements above are just wording -- the handoff also requires the
+# per-run grant object itself to carry exactly the flag's namespaces, not
+# the static key's, since PROXY_ALLOW_NS_* is a module-global the static-key
+# parse and the flag parse both populate and could clobber each other.
+both_submit_ns_out="$(FORK_SANDBOX_CONFIG_DIR="$both_submit_ns_config_dir" "$k8s_sh" \
+    submit --dry-run \
+    --branch fs-k8s-test-ns --model moonshotai/kimi-k3 \
+    --allow-namespace "demo-slot-01:8000" \
+    --reach-probe "svc.demo-slot-01:8000" \
+    "$proj_dir" "$handoff_file")"
+if grep -qF 'kubernetes.io/metadata.name: demo-slot-01' <<< "$both_submit_ns_out" \
+    && ! grep -qF 'kubernetes.io/metadata.name: static-slot' <<< "$both_submit_ns_out"; then
+    ok "the rendered grant NetworkPolicy carries exactly the flag's namespaces, not the static key's"
+else
+    no "the rendered grant NetworkPolicy carries exactly the flag's namespaces, not the static key's" \
+        "$both_submit_ns_out"
 fi
 
 printf '\n== submit: per-run grant apply (render-grant, stale-grant refusal, capability gate) ==\n'
