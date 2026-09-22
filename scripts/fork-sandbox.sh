@@ -1743,7 +1743,12 @@ while [[ "${1:-}" == -* ]]; do
             ;;
         --wait-timeout)
             wait_timeout_arg="${2:?--wait-timeout requires a number of seconds}"
-            if [[ ! "$wait_timeout_arg" =~ ^[0-9]+$ ]] || [[ "$wait_timeout_arg" == 0 ]]; then
+            # Numeric zero-check, not string ("00" is a digit string but a
+            # string != "0" comparison lets it through, and `timeout
+            # --foreground 00 ...` expires immediately -- 10#$x forces
+            # base-10 so a leading-zero numeral like "008" isn't misread
+            # as octal here either.
+            if [[ ! "$wait_timeout_arg" =~ ^[0-9]+$ ]] || (( 10#$wait_timeout_arg == 0 )); then
                 echo "Error: --wait-timeout takes a positive integer number of" >&2
                 echo "seconds, not '$wait_timeout_arg'." >&2
                 exit 1
@@ -1766,6 +1771,15 @@ done
 # positional args are required, because everything they depend on
 # (k8s_mode, foreground, wait_requested, wait_timeout_arg) is already known
 # and none of them need a real project path or handoff file to be wrong.
+#
+# Only two refusals live below, not the three the wait round's handoff
+# asked for. It also named "--wait with --exec: exec replaces the
+# process; there is nothing to wait for" -- but `run` has no --exec flag
+# in this codebase (--exec exists only as claude-sandboxed's own internal
+# wrapper flag; grep the case statement above, from --branch through
+# --wait-timeout: no --exec case). There is nothing here for that
+# refusal to guard, so it is left out rather than added against a flag
+# that does not exist.
 if $wait_requested; then
     if [[ "$k8s_mode" == true ]]; then
         echo "Error: --wait is not supported with --k8s. v1 only waits on a" >&2
@@ -9902,7 +9916,14 @@ if $wait_requested; then
 
     if [[ -f "$run_dir/exit-code" && ! -L "$run_dir/exit-code" ]]; then
         run_rc="$(tr -dc '0-9-' < "$run_dir/exit-code")"
-        if [[ "$run_rc" =~ ^[0-9]+$ ]] && (( run_rc <= 255 )); then
+        # 10#$run_rc forces base-10: without it, bash's (( )) reads a
+        # leading-zero numeral (e.g. "018", "0377") as octal, which either
+        # errors out a valid code (018 has no digit 8 in octal) or lets a
+        # too-large value slip through the <=255 guard (0377 octal ==
+        # 255) only for the exit builtin below to reinterpret it as
+        # decimal 377, truncated mod 256 -- exactly the laundering this
+        # check exists to prevent.
+        if [[ "$run_rc" =~ ^[0-9]+$ ]] && (( 10#$run_rc <= 255 )); then
             exit "$run_rc"
         fi
         echo "fork-sandbox run --wait: $run_dir/exit-code does not hold a valid" >&2

@@ -290,6 +290,16 @@ out_timeout_zero="$(HOME="$launcher_home" "$launcher" --wait --wait-timeout 0 "$
 check "--wait-timeout 0: exits 1" "1" "$rc_timeout_zero"
 contains "--wait-timeout 0: names positive integer" "positive integer" "$out_timeout_zero"
 
+# A zero-padded all-zero string ("00") is digit-only, so the regex half
+# of the check passes it; a naive string comparison against the literal
+# "0" then misses it too, since "00" != "0" as strings. That let
+# `timeout --foreground 00 ...` through, which expires immediately
+# (exit 124 from timeout itself, not a real wait) instead of being
+# refused at parse time.
+out_timeout_zeropad="$(HOME="$launcher_home" "$launcher" --wait --wait-timeout 00 "$proj" "$handoff" 2>&1)"; rc_timeout_zeropad=$?
+check "--wait-timeout 00: exits 1" "1" "$rc_timeout_zeropad"
+contains "--wait-timeout 00: names positive integer" "positive integer" "$out_timeout_zeropad"
+
 out_timeout_abc="$(HOME="$launcher_home" "$launcher" --wait --wait-timeout abc "$proj" "$handoff" 2>&1)"; rc_timeout_abc=$?
 check "--wait-timeout abc: exits 1" "1" "$rc_timeout_abc"
 contains "--wait-timeout abc: names positive integer" "positive integer" "$out_timeout_abc"
