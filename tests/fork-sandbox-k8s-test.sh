@@ -1072,6 +1072,162 @@ else
         "$(cat /tmp/fs-k8s-test-both-submit-ns.err)"
 fi
 
+printf '\n== submit: per-run grant apply (render-grant, stale-grant refusal, capability gate) ==\n'
+# --dry-run renders the grant NetworkPolicy, named <safe_name>-agent-grant,
+# ahead of the Job -- the apply order submit itself uses.
+grant_dry_out="$(FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-grant --model moonshotai/kimi-k3 \
+    --allow-namespace "demo-slot-01:8000" \
+    --reach-probe "svc.demo-slot-01:8000" \
+    "$proj_dir" "$handoff_file")"
+if grep -q '^  name: fork-sandbox-agent-fs-k8s-test-grant-agent-grant$' <<< "$grant_dry_out"; then
+    ok "--dry-run renders the grant NetworkPolicy, named <safe_name>-agent-grant"
+else
+    no "--dry-run renders the grant NetworkPolicy, named <safe_name>-agent-grant" "$grant_dry_out"
+fi
+grant_line="$(grep -n '^  name: fork-sandbox-agent-fs-k8s-test-grant-agent-grant$' <<< "$grant_dry_out" | cut -d: -f1)"
+job_line="$(grep -n '^kind: Job$' <<< "$grant_dry_out" | head -1 | cut -d: -f1)"
+if [[ -n "$grant_line" && -n "$job_line" ]] && (( grant_line < job_line )); then
+    ok "the grant is rendered before the Job, matching submit's own apply order"
+else
+    no "the grant is rendered before the Job, matching submit's own apply order" \
+        "grant_line=$grant_line job_line=$job_line"
+fi
+# No --allow-namespace at all: no grant object rendered.
+if [[ "$submit_out" != *"agent-grant"* ]]; then
+    ok "a run with no --allow-namespace renders no grant object"
+else
+    no "a run with no --allow-namespace renders no grant object" "$submit_out"
+fi
+
+# A platform whose --capabilities omits grant=render-grant is refused
+# before any cluster object exists (--dry-run touches nothing, so a refusal
+# here proves the check ran ahead of any kubectl call, not merely that it
+# ran ahead of the Job).
+nogrant_platform_dir="$(newdir)"; tmpdirs+=("$nogrant_platform_dir")
+cat > "$nogrant_platform_dir/fork-sandbox-k8s-platform-nogrant" <<'PLATFORM'
+#!/usr/bin/env bash
+if [[ "${1-}" == --capabilities ]]; then
+    cat <<'EOF'
+policy=networkpolicy
+icmp=unfiltered
+dns=recursive
+runtimeclass=none
+EOF
+    exit 0
+fi
+echo "Error: fork-sandbox-k8s-platform-nogrant stub implements only --capabilities" >&2
+exit 1
+PLATFORM
+chmod +x "$nogrant_platform_dir/fork-sandbox-k8s-platform-nogrant"
+nogrant_out="$(PATH="$nogrant_platform_dir:$PATH" FORK_SANDBOX_K8S_PLATFORM=nogrant \
+    FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-grant --model moonshotai/kimi-k3 \
+    --allow-namespace "demo-slot-01:8000" \
+    --reach-probe "svc.demo-slot-01:8000" \
+    "$proj_dir" "$handoff_file" 2>&1)"
+nogrant_rc=$?
+if (( nogrant_rc != 0 )) && [[ "$nogrant_out" == *"'nogrant'"* ]] \
+    && [[ "$nogrant_out" == *"grant=render-grant"* ]]; then
+    ok "--allow-namespace on a platform without grant=render-grant is refused, naming the platform and the missing capability"
+else
+    no "--allow-namespace on a platform without grant=render-grant is refused, naming the platform and the missing capability" \
+        "status $nogrant_rc: $nogrant_out"
+fi
+# The same platform, with no --allow-namespace at all, is never asked about
+# the grant capability -- confirms the check is gated on --allow-namespace,
+# not a blanket new requirement on every submit.
+if PATH="$nogrant_platform_dir:$PATH" FORK_SANDBOX_K8S_PLATFORM=nogrant \
+    FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-grant --model moonshotai/kimi-k3 \
+    "$proj_dir" "$handoff_file" >/dev/null 2>/tmp/fs-k8s-test-nogrant-plain.err; then
+    ok "the same platform, with no --allow-namespace, is never asked for the grant capability"
+else
+    no "the same platform, with no --allow-namespace, is never asked for the grant capability" \
+        "$(cat /tmp/fs-k8s-test-nogrant-plain.err)"
+fi
+
+# A pre-existing NetworkPolicy named <safe_name>-agent-grant is refused as
+# stale, before anything else is created, naming the exact rm command that
+# clears it -- a stale grant would otherwise silently widen a new run that
+# reuses the branch name.
+stale_stub_dir="$(newdir)"; tmpdirs+=("$stale_stub_dir")
+cat > "$stale_stub_dir/kubectl" <<'STUB'
+#!/usr/bin/env bash
+# fork-sandbox-k8s.sh's own kubectl() wrapper prepends --context=... -n ...
+# ahead of the verb, so the verb and resource are found by scanning, not by
+# fixed position -- the same technique this suite's other kubectl stubs use.
+verb=""; prev=""; name=""
+for arg in "$@"; do
+    case "$arg" in get) verb=get ;; esac
+    [[ "$prev" == networkpolicy ]] && name="$arg"
+    prev="$arg"
+done
+if [[ "$verb" == get && -n "$name" ]]; then
+    echo "networkpolicy.networking.k8s.io/$name"
+fi
+exit 0
+STUB
+chmod +x "$stale_stub_dir/kubectl"
+refuses "a pre-existing grant NetworkPolicy is refused as stale, naming the exact rm command" \
+    "fork-sandbox-k8s.sh rm --branch fs-k8s-test-stale-grant" \
+    env PATH="$stale_stub_dir:$PATH" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-stale-grant --model moonshotai/kimi-k3 \
+    --allow-namespace "demo-slot-01:8000" \
+    --reach-probe "svc.demo-slot-01:8000" \
+    "$proj_dir" "$handoff_file"
+
+# A pi-harness run whose Job apply fails must still remove the grant it
+# already applied -- until now, only --harness claude installed any trap
+# that deleted cluster objects on failure; a pi run leaked everything,
+# including the grant, on any failure past the base context-tar-only trap.
+printf '\n== submit: pi-harness Job-apply failure also deletes a previously-applied grant ==\n'
+pi_fail_home="$(newdir)"; tmpdirs+=("$pi_fail_home")
+pi_fail_name_out="$(newdir)/pi-fail-name.yaml"; tmpdirs+=("$(dirname "$pi_fail_name_out")")
+FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-pi-grant-fail --model moonshotai/kimi-k3 --harness pi \
+    --allow-namespace "demo-slot-01:8000" --reach-probe "svc.demo-slot-01:8000" \
+    "$proj_dir" "$handoff_file" > "$pi_fail_name_out"
+pi_fail_safe_name="$(awk '/^kind: Job$/{job=1} job && /^  name:/{print $2; exit}' "$pi_fail_name_out")"
+pi_fail_stub_dir="$(newdir)"; tmpdirs+=("$pi_fail_stub_dir")
+pi_fail_log="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$pi_fail_log")")
+cat > "$pi_fail_stub_dir/kubectl" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$K8S_STUB_LOG"
+verb=""; for arg in "$@"; do case "$arg" in apply|get|delete) verb="$arg" ;; esac; done
+case "$verb" in
+    apply)
+        content="$(cat)"
+        if [[ "$content" == *"kind: Job"* ]]; then
+            echo "kubectl: stub apply failure for Job" >&2
+            exit 1
+        fi
+        ;;
+    get) : ;;
+    delete) : ;;
+    *) : ;;
+esac
+STUB
+chmod +x "$pi_fail_stub_dir/kubectl"
+PATH="$pi_fail_stub_dir:$PATH" K8S_STUB_LOG="$pi_fail_log" HOME="$pi_fail_home" \
+    FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit \
+    --branch fs-k8s-test-pi-grant-fail --model moonshotai/kimi-k3 --harness pi \
+    --allow-namespace "demo-slot-01:8000" --reach-probe "svc.demo-slot-01:8000" \
+    "$proj_dir" "$handoff_file" >/tmp/fs-k8s-test-pi-grant-fail.out 2>&1
+pi_fail_rc=$?
+if (( pi_fail_rc != 0 )); then
+    ok "a pi-harness run whose Job apply fails makes submit fail"
+else
+    no "a pi-harness run whose Job apply fails makes submit fail" "submit unexpectedly succeeded"
+fi
+if grep -qF "delete pod,service,secret,configmap,networkpolicy -l fork-sandbox/branch=$pi_fail_safe_name --ignore-not-found" "$pi_fail_log"; then
+    ok "the failure trap deletes the grant (and every other cluster object) for a pi-harness run too"
+else
+    no "the failure trap deletes the grant (and every other cluster object) for a pi-harness run too" \
+        "not found in $pi_fail_log: $(cat "$pi_fail_log")"
+fi
+rm -f /tmp/fs-k8s-test-pi-grant-fail.out
+
 # fs_emit_prompt_preamble (fork-sandbox-lib.sh), shared with fork-sandbox.sh's
 # local path: the rendered handoff.md must carry the clone-path and
 # gated-egress blocks, must carry an "Operator inbox" section naming
@@ -10201,6 +10357,74 @@ while IFS= read -r k8s_test_owned_rundir; do
 done < <(k8s_test_owned_rundirs)
 check "fixture runs append no handoff archives to the operator's durable state" \
     "" "$k8s_test_new_handoff_archives"
+
+printf '\n== fork-sandbox-k8s-egress-gate.sh: REACH_PROBES ==\n'
+# Direct invocation, no kubectl involved -- this script never calls it, and
+# nothing in this suite exercised it directly before this section. Real
+# listening sockets stand in for "reachable": /dev/tcp is a bash builtin
+# path, not something a PATH-shadowing stub like the kubectl stubs above
+# can intercept.
+gate_reach_port=$(( (RANDOM % 5000) + 20000 ))
+gate_closed_port=$(( gate_reach_port + 1 ))
+python3 -m http.server "$gate_reach_port" --bind 127.0.0.1 >/dev/null 2>&1 &
+gate_listener_pid=$!
+gate_listener_up=false
+for _ in $(seq 1 30); do
+    if (exec 3<>"/dev/tcp/127.0.0.1/$gate_reach_port") 2>/dev/null; then
+        exec 3<&- 3>&-
+        gate_listener_up=true
+        break
+    fi
+    sleep 0.1
+done
+
+if [[ "$gate_listener_up" != true ]]; then
+    printf '  SKIP  could not start a local listener for REACH_PROBES tests\n'
+else
+    gate_out="$(GATE_TIMEOUT=2 DENIED_PROBE="127.0.0.1:$gate_closed_port" \
+        PROXY_HOST=127.0.0.1 PROXY_PORT="$gate_reach_port" \
+        REACH_PROBES="127.0.0.1:$gate_reach_port" \
+        bash "$gate_sh" 2>&1)"; gate_rc1=$?
+    if (( gate_rc1 == 0 )); then
+        ok "the gate passes when every REACH_PROBES entry is reachable"
+    else
+        no "the gate passes when every REACH_PROBES entry is reachable" "$gate_out"
+    fi
+
+    gate_out2="$(GATE_TIMEOUT=2 DENIED_PROBE="127.0.0.1:$gate_closed_port" \
+        PROXY_HOST=127.0.0.1 PROXY_PORT="$gate_reach_port" \
+        REACH_PROBES="127.0.0.1:$gate_closed_port" \
+        bash "$gate_sh" 2>&1)"
+    gate_rc2=$?
+    if (( gate_rc2 != 0 )) \
+        && [[ "$gate_out2" == *"127.0.0.1:$gate_closed_port (a --reach-probe grant) is not reachable"* ]]; then
+        ok "the gate fails, naming the unreachable probe, when a REACH_PROBES entry is unreachable"
+    else
+        no "the gate fails, naming the unreachable probe, when a REACH_PROBES entry is unreachable" \
+            "rc=$gate_rc2 $gate_out2"
+    fi
+
+    gate_out3="$(GATE_TIMEOUT=2 DENIED_PROBE="127.0.0.1:$gate_closed_port" \
+        PROXY_HOST=127.0.0.1 PROXY_PORT="$gate_reach_port" \
+        bash "$gate_sh" 2>&1)"; gate_rc3=$?
+    if (( gate_rc3 == 0 )); then
+        ok "unset REACH_PROBES behaves exactly like today: no extra condition"
+    else
+        no "unset REACH_PROBES behaves exactly like today: no extra condition" "$gate_out3"
+    fi
+
+    gate_out4="$(GATE_TIMEOUT=2 DENIED_PROBE="127.0.0.1:$gate_closed_port" \
+        PROXY_HOST=127.0.0.1 PROXY_PORT="$gate_reach_port" \
+        REACH_PROBES="127.0.0.1:$gate_reach_port 127.0.0.1:$gate_closed_port" \
+        bash "$gate_sh" 2>&1)"; gate_rc4=$?
+    if (( gate_rc4 != 0 )); then
+        ok "every REACH_PROBES entry must be reachable, not just one of several"
+    else
+        no "every REACH_PROBES entry must be reachable, not just one of several" "$gate_out4"
+    fi
+fi
+kill "$gate_listener_pid" 2>/dev/null
+wait "$gate_listener_pid" 2>/dev/null
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))

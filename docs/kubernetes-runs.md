@@ -945,6 +945,64 @@ opened namespace satisfies the gate while testing nothing at all — the same
 wrong-reason pass the gate's own header warns about for a totally broken
 network, reached from the other side.
 
+### Per-run namespace grants: `--allow-namespace` and `--reach-probe`
+
+`K8S_AGENT_ALLOW_NS` is a machine-wide, install-time default: every run on
+that install gets the same widening, forever, until an operator edits
+`k8s.env` and re-runs `install`. Two runs that need *different* namespaces
+cannot both be satisfied by one static key, and a widening set for one task
+lingers for every run after it, whether or not that run needs it.
+
+`fork-sandbox-k8s.sh submit` (and `run`, which forwards to it) and
+`fork-sandbox.sh --k8s` (which forwards to `submit` in turn) take
+`--allow-namespace NS[:PORT]`, repeatable, for exactly this: a widening
+scoped to **this run only**, on top of (never instead of) whatever
+`K8S_AGENT_ALLOW_NS` already grants machine-wide. Syntax, validation and port
+semantics are identical to the static key — a bare `NS` opens every port and
+protocol to that namespace, `NS:PORT` opens only that TCP port. Submit
+announces each per-run grant on stderr, worded as this run's own, distinct
+from the static key's "every run" wording, so an operator reading the log
+can tell which is which even when both fired for the same run.
+
+**`--reach-probe HOST:PORT` is required, repeatable, whenever any
+`--allow-namespace` is given** — and refused if given without one. HOST must
+be `<svc>.<ns>`, `<svc>.<ns>.svc`, or `<svc>.<ns>.svc.$K8S_CLUSTER_DOMAIN`,
+and `<ns>` must be one of the namespaces this run just granted; if that
+namespace's own grant names a port, the probe's port must match it exactly,
+because a probe that can never agree with its own grant would only fail the
+gate 60 seconds later for a reason submit could have named at parse time
+instead. The requirement itself is the same lesson `K8S_DENIED_PROBE`
+already teaches, applied to the opposite direction: a policy the gate never
+exercises is not verified, whether that policy is a missing seal or an
+unverified widening. Every refusal names the flag and the bad value.
+
+Mechanically, submit renders and applies one additional NetworkPolicy per
+run — `fork-sandbox-k8s-platform-*`'s `render-grant` verb, named
+`<safe_name>-agent-grant`, selecting only this run's own agent pod (see
+`docs/k8s-platform.md` for the verb and the `grant=render-grant` capability
+key a platform must declare to support it). It is purely additive: it never
+touches, and never replaces, the shared `fork-sandbox-agent-egress` seal
+`render-policy` renders once at install time. Applied before the Job (and
+before the per-run claude proxy, for `--harness claude`), so the egress
+gate's `REACH_PROBES` sees it on the pod's very first poll iteration.
+
+**A stale grant left behind by an earlier run on the same branch is refused,
+not silently reused.** If a NetworkPolicy named `<safe_name>-agent-grant`
+already exists when `submit` runs, it refuses before creating anything, and
+names the exact cleanup command
+(`fork-sandbox-k8s.sh rm --branch <branch>`) — reusing it would silently
+widen the new run to whatever the old one granted, which could be a
+different, wider set of namespaces than the new run's own `--allow-namespace`
+flags name. `rm` (and `collect`, which routes through it) already deletes a
+`NetworkPolicy` by the run's `fork-sandbox/branch` label alongside every
+other per-run object, so a normal `rm`/`collect` after a run leaves nothing
+stale to trip over on the next submit for that branch. A run whose Job apply
+fails, for either harness, is cleaned up the same way, automatically, by
+submit's own failure trap.
+
+On the local (non-`--k8s`) path, both flags are refused with a message that
+they are `--k8s`-only: a local sandbox has no cluster namespaces to grant.
+
 ## Model access: three modes, one built
 
 Model access is **orthogonal to the platform plugin** — every mode below works

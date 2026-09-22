@@ -3462,6 +3462,35 @@ cmd_submit() {
 
     local safe_name
     safe_name="$(k8s_safe_name fork-sandbox-agent "$branch")"
+
+    # This run's own grant object, when --allow-namespace was given --
+    # resolved here, before any cluster object exists, so a platform that
+    # cannot render one, or a stale grant left by an earlier run on this
+    # branch, refuses before anything is created. "-agent-grant" is 12
+    # chars, one shorter than the "-claude-proxy" suffix k8s_safe_name's own
+    # comment already budgets 50 chars for, so grant_name is never over the
+    # 63-char Kubernetes object-name cap either.
+    local grant_name=""
+    if (( ${#run_allow_ns_namespaces[@]} > 0 )); then
+        if [[ "$(platform_capability grant "")" != render-grant ]]; then
+            echo "Error: --allow-namespace needs a platform that supports" >&2
+            echo "per-run grants, but platform" >&2
+            echo "'${FORK_SANDBOX_K8S_PLATFORM:-generic}' does not declare" >&2
+            echo "grant=render-grant in its --capabilities. This platform" >&2
+            echo "cannot grant a per-run namespace." >&2
+            exit 1
+        fi
+        grant_name="$safe_name-agent-grant"
+        if [[ -n "$(kubectl get networkpolicy "$grant_name" --ignore-not-found -o name 2>/dev/null)" ]]; then
+            echo "Error: a NetworkPolicy named '$grant_name' already exists --" >&2
+            echo "most likely a stale grant a previous run on branch '$branch'" >&2
+            echo "left behind. Reusing it here would silently widen this run's" >&2
+            echo "egress to whatever that grant named. Remove it first:" >&2
+            echo "  fork-sandbox-k8s.sh rm --branch $branch" >&2
+            exit 1
+        fi
+    fi
+
     local proxy_base_url
     if [[ -n "$proxy_endpoint" ]]; then
         # The named endpoint's exact-match location. A K8S_PROXY_ENDPOINTS
@@ -3494,6 +3523,43 @@ cmd_submit() {
     local extra_labels_4 extra_labels_8
     extra_labels_4="$(render_extra_labels_indent 4)"
     extra_labels_8="$(render_extra_labels_indent 8)"
+
+    # Every per-run object's label set: branch, owner (if any), and the
+    # fork-sandbox.io/* pairs resolve_run_labels resolved above -- built
+    # once here so the grant below and, for --harness claude, this run's
+    # own token Secret (further down) read the identical set rather than
+    # two copies that could drift.
+    local -a run_label_pairs=("fork-sandbox/branch=$safe_name")
+    [[ -n "$run_owner" ]] && run_label_pairs+=("fork-sandbox/owner=$run_owner")
+    local run_label_i
+    for run_label_i in "${!RUN_LABEL_KEYS[@]}"; do
+        run_label_pairs+=("fork-sandbox.io/${RUN_LABEL_KEYS[$run_label_i]}=${RUN_LABEL_VALUES[$run_label_i]}")
+    done
+
+    # The per-run grant NetworkPolicy, rendered (never applied) here --
+    # grant_name is empty unless --allow-namespace was given, in which case
+    # the capability and stale-name checks above already ran. Applied
+    # before the claude proxy and the Job below, so the egress gate sees it
+    # on its very first poll iteration; see the apply sequence further down.
+    local -a grant_allow_args=()
+    local grant_i
+    for (( grant_i = 0; grant_i < ${#run_allow_ns_namespaces[@]}; grant_i++ )); do
+        if [[ -n "${run_allow_ns_ports[$grant_i]}" ]]; then
+            grant_allow_args+=(--allow-namespace "${run_allow_ns_namespaces[$grant_i]}:${run_allow_ns_ports[$grant_i]}")
+        else
+            grant_allow_args+=(--allow-namespace "${run_allow_ns_namespaces[$grant_i]}")
+        fi
+    done
+    local grant_rendered=""
+    if [[ -n "$grant_name" ]]; then
+        local -a grant_label_args=()
+        for grant_i in "${!run_label_pairs[@]}"; do
+            grant_label_args+=(--label "${run_label_pairs[$grant_i]}")
+        done
+        grant_rendered="$("$K8S_PLATFORM_BIN" render-grant --namespace "$K8S_NAMESPACE" \
+            --name "$grant_name" --agent-label "fork-sandbox/branch=$safe_name" \
+            "${grant_label_args[@]}" "${grant_allow_args[@]}")"$'\n'
+    fi
 
     # The per-run Claude Code proxy manifest (ConfigMap + Pod + Service),
     # rendered here -- ahead of the ConfigMap+Job below, in the SAME
@@ -3757,6 +3823,8 @@ spec:
               value: "8080"
             - name: ICMP_CHECK
               value: "$icmp_check"
+            - name: REACH_PROBES
+              value: "${run_reach_probes[*]:-}"
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -3826,7 +3894,7 @@ spec:
           emptyDir: {}${services_volumes}
 EOF
 )"
-    rendered="${claude_proxy_rendered}${job_rendered}"
+    rendered="${grant_rendered}${claude_proxy_rendered}${job_rendered}"
 
     if [[ "$dry_run" == true ]]; then
         printf '%s\n' "$rendered"
@@ -3986,17 +4054,36 @@ EOF
         fi
     fi
 
-    # From here on, a cluster object may exist for this run (a Secret
-    # right below for the claude harness, the Job itself either way), so
-    # run_dir must survive a failure past this point instead of being
-    # taken with it -- resets the trap back to guarding only context_tar,
-    # which is what it protected before the window above needed it to
-    # cover run_dir too. The claude branch below installs its own trap
-    # over this one, folding the same context_tar cleanup in with the
-    # cluster objects it is about to create; for the pi harness, this is
-    # the trap that stays live for the rest of this function, exactly as
-    # it did before run_dir had one of its own.
-    trap 'rm -f -- "${K8S_SUBMIT_CONTEXT_TAR:-}"' EXIT
+    # From here on, a cluster object may exist for this run (the grant
+    # below, a Secret further down for the claude harness, the Job either
+    # way), so run_dir must survive a failure past this point instead of
+    # being taken with it -- resets the trap back to guarding cluster
+    # objects instead. K8S_SUBMIT_SAFE_NAME/K8S_SUBMIT_BRANCH are set
+    # unconditionally here (not just for claude) because this trap now
+    # covers BOTH harnesses: a pi run's grant or Job can fail to apply too,
+    # and until now nothing rolled that back -- only claude's own trap,
+    # installed further down, deleted anything. The claude branch below
+    # installs a strictly richer trap over this one (same by-label delete,
+    # plus the claude-token Secret's own by-name delete, since that Secret
+    # can be left unlabeled by a failure between its create and its label
+    # call); for the pi harness, this is the trap that stays live for the
+    # rest of this function.
+    K8S_SUBMIT_SAFE_NAME="$safe_name"
+    K8S_SUBMIT_BRANCH="$branch"
+    trap '
+        rm -f -- "${K8S_SUBMIT_CONTEXT_TAR:-}"
+        kubectl delete pod,service,secret,configmap,networkpolicy \
+            -l fork-sandbox/branch="$K8S_SUBMIT_SAFE_NAME" --ignore-not-found >&2
+        echo "fork-sandbox-k8s: submit failed -- removed this run'"'"'s cluster" >&2
+        echo "objects, if any were created (branch $K8S_SUBMIT_BRANCH)." >&2
+    ' EXIT
+
+    # Applied before the claude proxy and the Job below, for either
+    # harness, so the egress gate's REACH_PROBES sees it on the pod's very
+    # first poll iteration -- see fork-sandbox-k8s-egress-gate.sh.
+    if [[ -n "$grant_name" ]]; then
+        printf '%s\n' "$grant_rendered" | kubectl apply -f -
+    fi
 
     if [[ "$harness" == claude ]]; then
         # The per-run Secret carrying the REAL operator access token, read
@@ -4018,8 +4105,7 @@ EOF
         # the trap's own by-label delete would miss it too -- which is why
         # the trap also deletes this Secret by name. It also removes the
         # pre-sized context archive, if this run has one.
-        K8S_SUBMIT_SAFE_NAME="$safe_name"
-        K8S_SUBMIT_BRANCH="$branch"
+        # K8S_SUBMIT_SAFE_NAME/K8S_SUBMIT_BRANCH are already set, above.
         trap '
             rm -f -- "${K8S_SUBMIT_CONTEXT_TAR:-}"
             kubectl delete secret "$K8S_SUBMIT_SAFE_NAME-claude-token" --ignore-not-found >&2
@@ -4036,18 +4122,9 @@ EOF
             --dry-run=client -o yaml | kubectl apply -f -
         # The attribution labels go on here too, not just fork-sandbox/branch:
         # this Secret is one of the run's objects, and the docs promise every
-        # one of them carries the owner. kubectl label takes key=value, where
-        # EXTRA_LABEL_LINES holds rendered YAML, so the pairs are rebuilt from
-        # the same two sources build_extra_label_lines reads.
-        # The branch label seeds the array so it is never empty, which keeps
-        # the expansion below safe under `set -u` on every bash this project
-        # supports.
-        local run_label_pairs label_i
-        run_label_pairs=("fork-sandbox/branch=$safe_name")
-        [[ -n "$run_owner" ]] && run_label_pairs+=("fork-sandbox/owner=$run_owner")
-        for label_i in "${!RUN_LABEL_KEYS[@]}"; do
-            run_label_pairs+=("fork-sandbox.io/${RUN_LABEL_KEYS[$label_i]}=${RUN_LABEL_VALUES[$label_i]}")
-        done
+        # one of them carries the owner. kubectl label takes key=value;
+        # run_label_pairs (built above, shared with the grant) already holds
+        # exactly this set.
         kubectl label secret "$safe_name-claude-token" \
             "${run_label_pairs[@]}" --overwrite
 
@@ -4131,8 +4208,8 @@ EOF
     kubectl exec "$pod_name" -- sh -c 'touch /work/.inputs-complete'
 
     # Everything this run needs now exists and is up -- nothing left for
-    # the cleanup trap above to protect.
-    [[ "$harness" == claude ]] && trap - EXIT
+    # the cleanup trap above to protect, for either harness.
+    trap - EXIT
 
     echo "fork-sandbox-k8s: submitted. branch=$branch pod=$pod_name" >&2
     echo "fork-sandbox-k8s: fetch with: fork-sandbox-k8s.sh fetch --branch $branch $project_path" >&2

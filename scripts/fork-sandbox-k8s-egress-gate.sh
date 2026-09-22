@@ -29,12 +29,21 @@
 # A platform declaring icmp=unfiltered leaves ICMP_CHECK=0, and the probe is
 # skipped -- a probe expected to fail proves nothing about the platform.
 #
+# If REACH_PROBES names any HOST:PORT pairs, every one of them must also be
+# REACHABLE, on the same iteration as the two conditions above -- these are
+# a run's own --allow-namespace grants, and a grant the gate never exercises
+# is not verified (see fork-sandbox-k8s.sh submit --allow-namespace /
+# --reach-probe). Unset or empty is today's behavior, exactly: no extra
+# condition, nothing to satisfy.
+#
 # Env:
 #   DENIED_PROBE   HOST:PORT that egress must NOT reach. Required.
 #   PROXY_HOST     the proxy Service name. Required.
 #   PROXY_PORT     the proxy Service port. Required.
 #   ICMP_CHECK     1 to also require ICMP to DENIED_PROBE's host to fail.
 #                  Defaults to 0.
+#   REACH_PROBES   space-separated HOST:PORT list that must ALL be
+#                  reachable. Defaults to empty (no probes required).
 #   GATE_TIMEOUT   seconds to poll before failing closed. Defaults to 60.
 #
 # Exit 0 only when every condition held on the same iteration. Exit 1,
@@ -48,7 +57,13 @@ set -euo pipefail
 : "${PROXY_HOST:?PROXY_HOST must be set to the proxy Service name}"
 : "${PROXY_PORT:?PROXY_PORT must be set to the proxy Service port}"
 : "${ICMP_CHECK:=0}"
+: "${REACH_PROBES:=}"
 : "${GATE_TIMEOUT:=60}"
+
+# Split on whitespace into an array once, up front -- read -ra on an empty
+# string yields an empty array, so an unset/empty REACH_PROBES needs no
+# separate guard below.
+read -ra reach_probes <<< "$REACH_PROBES"
 
 if [[ "$DENIED_PROBE" != *:* ]]; then
     echo "Error: DENIED_PROBE must be HOST:PORT, got '$DENIED_PROBE'." >&2
@@ -83,6 +98,8 @@ deadline=$(( $(date +%s) + GATE_TIMEOUT ))
 denied_unreachable=0
 proxy_reachable=0
 icmp_ok=1
+reach_ok=1
+unmet_reach_probes=()
 satisfied=0
 
 while (( $(date +%s) < deadline )); do
@@ -98,7 +115,19 @@ while (( $(date +%s) < deadline )); do
         icmp_is_blocked && icmp_ok=1
     fi
 
-    if (( denied_unreachable )) && (( proxy_reachable )) && (( icmp_ok )); then
+    reach_ok=1
+    unmet_reach_probes=()
+    for probe in ${reach_probes[@]+"${reach_probes[@]}"}; do
+        probe_host="${probe%:*}"
+        probe_port="${probe##*:}"
+        if ! tcp_connects "$probe_host" "$probe_port"; then
+            reach_ok=0
+            unmet_reach_probes+=("$probe")
+        fi
+    done
+
+    if (( denied_unreachable )) && (( proxy_reachable )) \
+        && (( icmp_ok )) && (( reach_ok )); then
         satisfied=1
         break
     fi
@@ -110,6 +139,9 @@ if (( ! satisfied )); then
     (( denied_unreachable )) || echo "  - $DENIED_PROBE is reachable and must not be" >&2
     (( proxy_reachable )) || echo "  - $PROXY_HOST:$PROXY_PORT (the proxy) is not reachable" >&2
     (( icmp_ok )) || echo "  - ICMP to $denied_host did not fail as icmp=filtered requires" >&2
+    for probe in ${unmet_reach_probes[@]+"${unmet_reach_probes[@]}"}; do
+        echo "  - $probe (a --reach-probe grant) is not reachable" >&2
+    done
     exit 1
 fi
 
