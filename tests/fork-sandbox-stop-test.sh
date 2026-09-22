@@ -21,6 +21,15 @@
 #   commit still to fetch), a graceful stop and a timeout fallback each
 #   against a fake runner script (no real harness needed), and the k8s
 #   refusal.
+#
+#   Real-mechanism regression coverage: the two halves above never drove a
+#   fake runner that leads its own process group AND holds a child that
+#   does not trap TERM itself, and never drove one whose pgid differs from
+#   its pid -- so the group-signal path and the leadership guard were both
+#   unproven by anything that would fail if either broke. This section
+#   adds fixtures for both, plus exact-match tmux kill-session, the
+#   return_base_sha commit count, a real-repo branch removal through the
+#   stop verb's own code path, and a failed fetch.
 
 set -uo pipefail
 
@@ -468,6 +477,307 @@ else
     no "timeout: branch NOT removed (it has a real commit)" "fake runner never wrote a pid file"
 fi
 wait "$timeout_job" 2>/dev/null || true
+
+# =====================================================================
+printf '\n== real mechanisms: group signal, leadership, exact-match, bases ==\n'
+# =====================================================================
+
+# -- group signal reaches a child a pid-only signal would miss: the fake
+# runner leads its own process group (same setsid --fork isolation as the
+# other fake runners) and traps TERM itself, but also backgrounds a
+# sleep(1) child that does NOT trap TERM. Only a group signal -- not
+# "kill -TERM $pid" alone -- reaches that child.
+#
+# This is coverage, not a regression test for 3.1: pre-fix
+# (822cc2d35b) already sent the group signal unconditionally, so a
+# runner that DOES lead its own group behaves the same before and after
+# the fix (confirmed by reading 66005050b7's diff -- 3.1's bug was the
+# OPPOSITE case, signaling a group the runner does not lead, covered
+# separately below). Kept anyway because nothing else in this suite
+# proves the group-signal mechanism reaches an untrapped child at all.
+fake_runner_with_child="$(mktemp /var/tmp/claude-scratch/fs-stop-fake-runner.XXXXXX)"
+tmpdirs+=("$fake_runner_with_child")
+cat > "$fake_runner_with_child" <<'EOF'
+#!/usr/bin/env bash
+set -uo pipefail
+printf '%s\n' "$$" > "$RUN_DIR/pid"
+sleep 300 &
+printf '%s\n' "$!" > "$RUN_DIR/child-pid"
+trap 'printf "0\n" > "$RUN_DIR/exit-code"; exit 0' TERM
+while :; do sleep 0.2; done
+EOF
+chmod +x "$fake_runner_with_child"
+
+rd_group="$(new_run_dir)"
+cat > "$rd_group/run.env" <<EOF
+version=1
+branch=fs-stop-group
+origin_repo=/tmp/nonexistent-origin
+clone_dir=/tmp/nonexistent-clone
+base_sha=0000000000000000000000000000000000000000
+session=cc-sbx-fs-stop-group-does-not-exist
+EOF
+RUN_DIR="$rd_group" setsid --fork "$fake_runner_with_child" \
+    < /dev/null > "$rd_group/fake-runner.log" 2>&1 &
+group_job=$!
+if wait_for_file "$rd_group/pid" && wait_for_file "$rd_group/child-pid"; then
+    child_pid="$(cat "$rd_group/child-pid")"
+    timeout 20 "$stop" --timeout 15 "$rd_group" >/dev/null 2>&1; rc_group=$?
+    check "group signal: stop exits 0" "0" "$rc_group"
+    if kill -0 "$child_pid" 2>/dev/null; then
+        no "group signal: the untrapped child is also dead" \
+            "child pid $child_pid is still alive; only the runner's own pid was signaled"
+        kill -9 "$child_pid" 2>/dev/null || true
+    else
+        ok "group signal: the untrapped child is also dead"
+    fi
+else
+    no "group signal: stop exits 0" "fake runner never wrote pid/child-pid"
+    no "group signal: the untrapped child is also dead" "fake runner never wrote pid/child-pid"
+fi
+wait "$group_job" 2>/dev/null || true
+
+# -- leadership guard: a fake "foreground" runner whose pgid != pid (it
+# and a sibling are backgrounded jobs of a setsid --fork wrapper, which
+# leads the shared group itself -- the same shape a --foreground run's
+# inline launch gives the real runner, inheriting its caller's group).
+# stop must signal the runner's pid alone and leave the sibling alive --
+# the group-signal branch would kill the sibling too.
+leader_wrapper="$(mktemp /var/tmp/claude-scratch/fs-stop-leader-wrapper.XXXXXX)"
+tmpdirs+=("$leader_wrapper")
+cat > "$leader_wrapper" <<'EOF'
+#!/usr/bin/env bash
+set -uo pipefail
+# setsid --fork makes THIS process (the wrapper) the group leader; the
+# sibling and the fake runner below are plain background jobs, so they
+# inherit this group without leading it -- exactly the shape a
+# --foreground run's inline launch gives the real runner.
+sleep 300 &
+printf '%s\n' "$!" > "$SIBLING_PID_FILE"
+"$FAKE_RUNNER_SCRIPT" &
+wait
+EOF
+chmod +x "$leader_wrapper"
+
+rd_leader="$(new_run_dir)"
+cat > "$rd_leader/run.env" <<EOF
+version=1
+branch=fs-stop-leader
+origin_repo=/tmp/nonexistent-origin
+clone_dir=/tmp/nonexistent-clone
+base_sha=0000000000000000000000000000000000000000
+session=cc-sbx-fs-stop-leader-does-not-exist
+EOF
+sibling_pid_file="$(mktemp)"; tmpdirs+=("$sibling_pid_file")
+RUN_DIR="$rd_leader" SIBLING_PID_FILE="$sibling_pid_file" \
+    FAKE_RUNNER_SCRIPT="$fake_runner_honors_term" \
+    setsid --fork "$leader_wrapper" \
+    < /dev/null > "$rd_leader/fake-runner.log" 2>&1 &
+leader_job=$!
+if wait_for_file "$rd_leader/pid" && wait_for_file "$sibling_pid_file"; then
+    sibling_pid="$(cat "$sibling_pid_file")"
+    runner_pid="$(cat "$rd_leader/pid")"
+    pgid_seen="$(ps -o pgid= -p "$runner_pid" 2>/dev/null | tr -d '[:space:]')"
+    if [[ -n "$pgid_seen" && "$pgid_seen" != "$runner_pid" ]]; then
+        out_leader="$(timeout 20 "$stop" --timeout 15 "$rd_leader" 2>&1)"; rc_leader=$?
+        check "leadership guard: stop exits 0" "0" "$rc_leader"
+        contains "leadership guard: reports stopped gracefully" "stopped gracefully" "$out_leader"
+        if kill -0 "$sibling_pid" 2>/dev/null; then
+            ok "leadership guard: the group's other member survives"
+        else
+            no "leadership guard: the group's other member survives" \
+                "sibling pid $sibling_pid is dead; the group was signaled, not just the runner"
+        fi
+    else
+        no "leadership guard: stop exits 0" "runner's pgid ($pgid_seen) equalled its pid ($runner_pid); fixture did not set up pgid != pid"
+        no "leadership guard: reports stopped gracefully" "fixture setup failed"
+        no "leadership guard: the group's other member survives" "fixture setup failed"
+    fi
+    kill -9 "$sibling_pid" 2>/dev/null || true
+else
+    no "leadership guard: stop exits 0" "fake runner/sibling never wrote their pid files"
+    no "leadership guard: reports stopped gracefully" "fake runner/sibling never wrote their pid files"
+    no "leadership guard: the group's other member survives" "fake runner/sibling never wrote their pid files"
+fi
+wait "$leader_job" 2>/dev/null || true
+
+# -- exact-match tmux kill-session: run.env names a session that is a
+# strict PREFIX of the only session actually alive, and does not itself
+# exist. With two sessions both alive under their real, distinct names
+# (the brief's literal wording), this tmux build (3.7c) already resolves
+# the exact one and never reaches the ambiguous prefix path at all --
+# confirmed by hand: "tmux kill-session -t cc-sbx-x" with both "cc-sbx-x"
+# and "cc-sbx-x-2" alive kills only "cc-sbx-x". The prefix match tmux
+# actually performs only kicks in when no session has the exact target
+# name: "tmux kill-session -t cc-sbx-mybranch" against a lone session
+# named "cc-sbx-mybranch-a1b2c3" DOES kill it, silently, no error -- the
+# exact scenario this finding described reproducing. Model that: the
+# recorded session= is stale/prefix-only, the real live session is the
+# suffixed one, and only the '=' exact-match form can tell "no such
+# session" apart from "kill this different one". Uses the ignores-TERM
+# fake runner with a short --timeout so the FORCED path (the one that
+# calls tmux kill-session) actually runs -- the graceful path never
+# touches tmux.
+if ! command -v tmux >/dev/null 2>&1; then
+    printf '  SKIP  exact-match tmux kill-session: tmux not installed\n'
+else
+    tmux_a="cc-sbx-fs-stop-exact"
+    tmux_b="cc-sbx-fs-stop-exact-2"
+    # Only the suffixed session is ever actually created; $tmux_a is a
+    # prefix of it and never exists under its own exact name.
+    tmux new-session -d -s "$tmux_b" 'sleep 300' 2>/dev/null
+
+    exact_origin="$(new_project)"; tmpdirs+=("$exact_origin")
+    exact_base_sha="$(cd "$exact_origin" && git rev-parse HEAD)"
+    exact_clone="$(mktemp -d /var/tmp/claude-scratch/fs-stop-exact-clone.XXXXXX)"
+    tmpdirs+=("$exact_clone")
+    (
+        cd "$exact_origin" && git clone -q . "$exact_clone" \
+            && cd "$exact_clone" && git checkout -q -b fs-stop-exact \
+            && git config user.email t@fork-sandbox.invalid \
+            && git config user.name Tester \
+            && printf 'work\n' > exact-work.txt \
+            && git add exact-work.txt \
+            && git commit -q -m 'exact-match fixture work'
+    ) >/dev/null 2>&1
+
+    rd_exact="$(new_run_dir)"
+    cat > "$rd_exact/run.env" <<EOF
+version=1
+branch=fs-stop-exact
+origin_repo=$exact_origin
+clone_dir=$exact_clone
+base_sha=$exact_base_sha
+session=$tmux_a
+EOF
+    RUN_DIR="$rd_exact" setsid --fork "$fake_runner_ignores_term" \
+        < /dev/null > "$rd_exact/fake-runner.log" 2>&1 &
+    exact_job=$!
+    if wait_for_file "$rd_exact/pid"; then
+        timeout 20 "$stop" --timeout 2 "$rd_exact" >/dev/null 2>&1; rc_exact=$?
+        check "exact-match tmux: stop exits 0" "0" "$rc_exact"
+        # $tmux_a never existed under its own exact name -- the only
+        # correct outcome is that kill-session finds nothing and the
+        # real, differently-named session is left untouched. A bare (no
+        # '=') kill-session would prefix-match it and kill it instead.
+        if tmux has-session -t "=$tmux_b" 2>/dev/null; then
+            ok "exact-match tmux: the real, differently-named session survives"
+        else
+            no "exact-match tmux: the real, differently-named session survives" \
+                "$tmux_b was killed by a prefix match on the nonexistent '$tmux_a'"
+        fi
+        fake_pid_exact="$(cat "$rd_exact/pid" 2>/dev/null)"
+        [[ -n "$fake_pid_exact" ]] && kill -9 "$fake_pid_exact" 2>/dev/null || true
+    else
+        no "exact-match tmux: stop exits 0" "fake runner never wrote a pid file"
+        no "exact-match tmux: the real, differently-named session survives" "fake runner never wrote a pid file"
+    fi
+    wait "$exact_job" 2>/dev/null || true
+    tmux kill-session -t "=$tmux_a" 2>/dev/null || true
+    tmux kill-session -t "=$tmux_b" 2>/dev/null || true
+fi
+
+# -- branch-removal path with a real origin+clone (zero commits removed).
+# Coverage-only, same caveat as above: "kept" is already proven by the
+# salvage/timeout tests, but "removed" was never proven through the stop
+# verb's own complete_run_host_side -- only through the RUNNER's own
+# teardown, a different code path, in the first section of this file.
+zero_origin="$(new_project)"; tmpdirs+=("$zero_origin")
+zero_base_sha="$(cd "$zero_origin" && git rev-parse HEAD)"
+zero_clone="$(mktemp -d /var/tmp/claude-scratch/fs-stop-zero-clone.XXXXXX)"
+tmpdirs+=("$zero_clone")
+(
+    cd "$zero_origin" && git clone -q . "$zero_clone" \
+        && cd "$zero_clone" && git checkout -q -b fs-stop-zero
+) >/dev/null 2>&1
+rd_zero="$(new_run_dir)"
+cat > "$rd_zero/run.env" <<EOF
+version=1
+branch=fs-stop-zero
+origin_repo=$zero_origin
+clone_dir=$zero_clone
+base_sha=$zero_base_sha
+session=cc-sbx-fs-stop-zero-does-not-exist
+EOF
+( : ) & dead_pid_zero=$!
+wait "$dead_pid_zero" 2>/dev/null || true
+printf '%s\n' "$dead_pid_zero" > "$rd_zero/pid"
+out_zero="$("$stop" "$rd_zero" 2>&1)"; rc_zero=$?
+check "zero commits: stop exits 0" "0" "$rc_zero"
+contains "zero commits: reports 0 new commits" "0 new commit" "$out_zero"
+check "zero commits: branch removed" \
+    "0" "$(cd "$zero_origin" && git show-ref --quiet refs/heads/fs-stop-zero && echo 1 || echo 0)"
+
+# -- --checkout base: return_base_sha != base_sha (proves 3.3). base_sha
+# is left behind at an older commit while return_base_sha (and the
+# fixture branch) sit at a newer one, with nothing added past it. Reading
+# base_sha (the bug) would count one commit and keep the branch; reading
+# return_base_sha (the fix) sees zero and removes it.
+checkout_origin="$(new_project)"; tmpdirs+=("$checkout_origin")
+checkout_base_sha="$(cd "$checkout_origin" && git rev-parse HEAD)"
+# Advance the origin by one more commit -- simulates history that landed
+# between the merge-base (base_sha) and the ref this run actually checked
+# out (return_base_sha). base_sha stays behind at the old commit; the
+# fixture's branch will sit at the NEW one with nothing further added.
+(
+    cd "$checkout_origin" && printf 'more\n' > more.txt \
+        && git add more.txt && git commit -q -m 'advance past base_sha'
+) >/dev/null 2>&1
+checkout_return_base_sha="$(cd "$checkout_origin" && git rev-parse HEAD)"
+
+checkout_clone="$(mktemp -d /var/tmp/claude-scratch/fs-stop-checkout-clone.XXXXXX)"
+tmpdirs+=("$checkout_clone")
+(
+    cd "$checkout_origin" && git clone -q . "$checkout_clone" \
+        && cd "$checkout_clone" && git checkout -q -b fs-stop-checkout-base
+) >/dev/null 2>&1
+
+rd_checkout="$(new_run_dir)"
+cat > "$rd_checkout/run.env" <<EOF
+version=1
+branch=fs-stop-checkout-base
+origin_repo=$checkout_origin
+clone_dir=$checkout_clone
+base_sha=$checkout_base_sha
+return_base_sha=$checkout_return_base_sha
+session=cc-sbx-fs-stop-checkout-does-not-exist
+EOF
+( : ) & dead_pid_checkout=$!
+wait "$dead_pid_checkout" 2>/dev/null || true
+printf '%s\n' "$dead_pid_checkout" > "$rd_checkout/pid"
+out_checkout="$("$stop" "$rd_checkout" 2>&1)"; rc_checkout=$?
+check "checkout-base: stop exits 0" "0" "$rc_checkout"
+contains "checkout-base: reports 0 new commits from return_base_sha" "0 new commit" "$out_checkout"
+check "checkout-base: branch removed (zero commits past return_base_sha)" \
+    "0" "$(cd "$checkout_origin" && git show-ref --quiet refs/heads/fs-stop-checkout-base && echo 1 || echo 0)"
+
+# -- failed fetch is reported as a failure, not a clean "0 new commits"
+# (proves 3.5). clone_dir is a plain empty directory, not a git repo at
+# all, so the fetch fails cleanly without needing to fabricate corruption.
+fail_origin="$(new_project)"; tmpdirs+=("$fail_origin")
+fail_base_sha="$(cd "$fail_origin" && git rev-parse HEAD)"
+fail_clone="$(mktemp -d /var/tmp/claude-scratch/fs-stop-failclone.XXXXXX)"
+tmpdirs+=("$fail_clone")
+rd_fail="$(new_run_dir)"
+cat > "$rd_fail/run.env" <<EOF
+version=1
+branch=fs-stop-failfetch
+origin_repo=$fail_origin
+clone_dir=$fail_clone
+base_sha=$fail_base_sha
+session=cc-sbx-fs-stop-failfetch-does-not-exist
+EOF
+( : ) & dead_pid_fail=$!
+wait "$dead_pid_fail" 2>/dev/null || true
+printf '%s\n' "$dead_pid_fail" > "$rd_fail/pid"
+out_fail="$("$stop" "$rd_fail" 2>&1)"; rc_fail=$?
+if (( rc_fail != 0 )); then
+    ok "failed fetch: stop reports non-zero exit"
+else
+    no "failed fetch: stop reports non-zero exit" "exited 0: $out_fail"
+fi
+not_contains "failed fetch: does not claim 0 new commits" "0 new commit" "$out_fail"
+contains "failed fetch: names the clone as the rescue path" "$fail_clone" "$out_fail"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))
