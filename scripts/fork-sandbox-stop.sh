@@ -142,7 +142,6 @@ session="$(fs_read_env_value "$run_env" session || true)"
 
 exit_code_file="$run_dir/exit-code"
 pid_file="$run_dir/pid"
-summary_file="$run_dir/summary.json"
 
 # Entry state 1: the run is already over. Idempotent no-op, per the brief --
 # nothing is rewritten, this is not an error.
@@ -174,7 +173,7 @@ fi
 # inside the clone. Every git command below runs in the origin repo.
 complete_run_host_side() {
     local reason="$1" kill_tmux="$2"
-    local fetched=0 n_commits=0 removed=0 head_now="" ended_at
+    local fetched=0 n_commits=0 removed=0 head_now=""
 
     if [[ "$kill_tmux" == 1 && -n "$session" ]]; then
         # Exact-match: without the '=' prefix tmux prefix/fnmatch-matches
@@ -202,16 +201,17 @@ complete_run_host_side() {
 
     printf '143\n' > "$exit_code_file"
 
-    if [[ ! -e "$summary_file" ]]; then
-        ended_at="$(date +%s)"
-        jq -n --arg end_reason "$reason" --arg branch "$branch" --argjson ended_at "$ended_at" \
-            '{end_reason: $end_reason, ended_at: $ended_at, branch: $branch}' \
-            > "$summary_file" 2>/dev/null || rm -f "$summary_file"
-    fi
-
+    # No stub summary.json is fabricated here: a fabricated one holding only
+    # end_reason/ended_at/branch would suppress sandbox-run-log.py record's
+    # own no-summary fallback (which fills in harness/model/exit_code from
+    # run.env + the exit-code file), producing a WORSE record than writing
+    # nothing. Pass --end-reason instead, which record uses only when the
+    # run truly left no summary.json to read one from.
+    #
     # Best-effort, same as the runner's own call: a failed append must not
     # fail the stop.
-    "$script_dir/sandbox-run-log.py" record --run-dir "$run_dir" >/dev/null 2>&1 \
+    "$script_dir/sandbox-run-log.py" record --run-dir "$run_dir" --end-reason "$reason" \
+        >/dev/null 2>&1 \
         || printf 'fork-sandbox-stop: run-log append failed\n' >&2
 
     printf 'end_reason: %s; branch %s, %s new commit(s)%s.\n' \

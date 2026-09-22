@@ -231,6 +231,13 @@ printf '\n== the stop verb (scripts/fork-sandbox-stop.sh) ==\n'
 
 stop="$repo_dir/scripts/fork-sandbox-stop.sh"
 
+# The merged run-log record for a run dir, by basename -- reuses
+# sandbox-run-log.py's own "last run_end wins" merge instead of hand-rolling
+# jq filtering over the raw jsonl.
+run_log_show() {
+    "$repo_dir/scripts/sandbox-run-log.py" show "$(basename "$1")" 2>/dev/null
+}
+
 new_run_dir() {
     local d
     d="$(mktemp -d /var/tmp/claude-scratch/forks/claude-fork-sandbox.stopXXXXXX)"
@@ -319,19 +326,16 @@ out_salvage="$("$stop" "$rd_salvage" 2>&1)"; rc_salvage=$?
 check "salvage: exits 0" "0" "$rc_salvage"
 contains "salvage: reports end_reason salvaged" "salvaged" "$out_salvage"
 check "salvage: exit-code 143 written" "143" "$(cat "$rd_salvage/exit-code" 2>/dev/null)"
-check "salvage: summary.json end_reason is salvaged" \
-    "salvaged" "$(jq -r '.end_reason // empty' "$rd_salvage/summary.json" 2>/dev/null)"
+check "salvage: no summary.json fabricated" \
+    "0" "$([[ -e "$rd_salvage/summary.json" ]] && echo 1 || echo 0)"
+check "salvage: run-log end_reason is salvaged via --end-reason" \
+    "salvaged" "$(run_log_show "$rd_salvage" | jq -r '.end_reason // empty')"
+check "salvage: run-log marks summary_missing (no stub was fabricated)" \
+    "true" "$(run_log_show "$rd_salvage" | jq -r '.summary_missing // false')"
 check "salvage: branch fetched back with its commit" \
     "1" "$(cd "$salvage_origin" && git rev-list --count "$salvage_base_sha..fs-stop-salvage" 2>/dev/null)"
 check "salvage: branch NOT removed (it has a real commit)" \
     "1" "$(cd "$salvage_origin" && git show-ref --quiet "refs/heads/fs-stop-salvage" && echo 1 || echo 0)"
-if grep -q "\"run_id\":\"$(basename "$rd_salvage")\"" "$HOME/.claude/sandbox-runs.jsonl" 2>/dev/null \
-    || grep -F "$(basename "$rd_salvage")" "$HOME/.claude/sandbox-runs.jsonl" 2>/dev/null | grep -q '"end_reason":"salvaged"'; then
-    ok "salvage: run-log record appended with end_reason salvaged"
-else
-    no "salvage: run-log record appended with end_reason salvaged" \
-        "no matching run_end line in ~/.claude/sandbox-runs.jsonl"
-fi
 
 # A fake runner: writes its own pid as its first act (mirroring the real
 # runner), then either honors or ignores TERM depending on which script is
@@ -438,8 +442,12 @@ if wait_for_file "$rd_timeout/pid"; then
     check "timeout: exits 0 (completed host-side)" "0" "$rc_timeout"
     contains "timeout: reports stop-timeout" "stop-timeout" "$out_timeout"
     check "timeout: exit-code 143 written" "143" "$(cat "$rd_timeout/exit-code" 2>/dev/null)"
-    check "timeout: summary.json end_reason is stop-timeout" \
-        "stop-timeout" "$(jq -r '.end_reason // empty' "$rd_timeout/summary.json" 2>/dev/null)"
+    check "timeout: no summary.json fabricated" \
+        "0" "$([[ -e "$rd_timeout/summary.json" ]] && echo 1 || echo 0)"
+    check "timeout: run-log end_reason is stop-timeout via --end-reason" \
+        "stop-timeout" "$(run_log_show "$rd_timeout" | jq -r '.end_reason // empty')"
+    check "timeout: run-log marks summary_missing" \
+        "true" "$(run_log_show "$rd_timeout" | jq -r '.summary_missing // false')"
     check "timeout: branch fetched back with its commit" \
         "1" "$(cd "$timeout_origin" && git rev-list --count "$timeout_base_sha..fs-stop-timeout" 2>/dev/null)"
     check "timeout: branch NOT removed (it has a real commit)" \
@@ -453,7 +461,9 @@ else
     no "timeout: exits 0 (completed host-side)" "fake runner never wrote a pid file"
     no "timeout: reports stop-timeout" "fake runner never wrote a pid file"
     no "timeout: exit-code 143 written" "fake runner never wrote a pid file"
-    no "timeout: summary.json end_reason is stop-timeout" "fake runner never wrote a pid file"
+    no "timeout: no summary.json fabricated" "fake runner never wrote a pid file"
+    no "timeout: run-log end_reason is stop-timeout via --end-reason" "fake runner never wrote a pid file"
+    no "timeout: run-log marks summary_missing" "fake runner never wrote a pid file"
     no "timeout: branch fetched back with its commit" "fake runner never wrote a pid file"
     no "timeout: branch NOT removed (it has a real commit)" "fake runner never wrote a pid file"
 fi

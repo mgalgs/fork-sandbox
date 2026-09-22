@@ -672,6 +672,12 @@ def cmd_record(args):
         except (OSError, ValueError):
             pass
 
+    # --end-reason is only a gap-filler: a real summary.json already
+    # supplies end_reason via SUMMARY_FIELDS above, so this is a no-op
+    # whenever that happened and only takes effect on the no-summary path.
+    if args.end_reason and "end_reason" not in rec:
+        rec["end_reason"] = args.end_reason
+
     rec["task"] = load_json_file(os.path.join(rd, "task-meta.json"))
 
     # --review-loop's record, when the run had one: what the loop cost, how
@@ -1036,6 +1042,9 @@ def main():
                        help="append a run_end record from a run directory")
     p.add_argument("--run-dir", required=True,
                    help=f"a {RUN_DIR_PREFIX}* directory under {FORKS_ROOT}")
+    p.add_argument("--end-reason", choices=["stopped", "stop-timeout", "salvaged"],
+                   help="end_reason to record when the run left no "
+                        "summary.json to read one from")
     p.set_defaults(func=cmd_record)
 
     p = sub.add_parser("verdict",
