@@ -674,6 +674,7 @@ own thread scans never see it:
 | `spawns/<thread-id>` | one line per spawn, reset by rule 1 — line count is the **budget** count |
 | `seq/<thread-id>` | one line per spawn, never reset — feeds the branch name |
 | `handoffs/<run-id>.md` | the generated handoff a wake was given |
+| `wake-threads/<run-id>/thread.txt` | the rendered full-thread snapshot bound read-only at `/thread` in that one wake (`--thread-dir`), written per wake just before its handoff; a trigger-only handoff points at this mount for the rest of the thread, and a snapshot that cannot be written falls the wake back to the legacy full-thread handoff with no mount and flags the thread. Never reaped, like `handoffs/` and `runs/` |
 | `state/<thread-id>/<agent>/` | the harness's transcript/session store for that pair (claude, codex or pi, sealed or not) |
 | `sessions/<thread-id>/<agent>` | the session id that pair's last wake ended on |
 | `workspaces/<thread-id>/<agent>/` | the persistent clone for that (thread, agent) seat, bound into every wake of it (every harness, not just claude) with `--clone-dir`; removed only by `fleet teardown` |

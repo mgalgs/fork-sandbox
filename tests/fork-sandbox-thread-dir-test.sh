@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # fork-sandbox-thread-dir-test.sh -- --thread-dir binds a directory read-only
-# at /thread, the LLM-seat counterpart of the handler path's
-# FS_HANDLER_THREAD_DIR. Sits beside fork-sandbox-clone-dir-test.sh and
-# fork-sandbox-fixtures-test.sh, the other directory-bind/host-flag suites.
+# at /thread, where a wake reads the rendered thread snapshot it was woken
+# on. It is the sibling of --attach-dir: same validation, same read-only
+# bind, a different mount point. Sits beside fork-sandbox-clone-dir-test.sh
+# and fork-sandbox-fixtures-test.sh, the other directory-bind/host-flag
+# suites.
 #
 # Usage: tests/fork-sandbox-thread-dir-test.sh
 #
@@ -91,9 +93,9 @@ printf '\n== --thread-dir refusals ==\n'
 outside="$(mktemp -d)"; tmpdirs+=("$outside")
 out="$(run_launcher "$outside" "$work/outside-argv")"; rc=$?
 if (( rc != 0 )) && [[ "$out" == *"must name a directory under"* && "$out" == *"$outside"* ]]; then
-    ok "attach directory outside the scratch root is refused"
+    ok "thread directory outside the scratch root is refused"
 else
-    no "attach directory outside the scratch root is refused" "$out"
+    no "thread directory outside the scratch root is refused" "$out"
 fi
 
 # --thread-dir shares fs_validate_scratch_dir with --session-state and
@@ -113,9 +115,9 @@ fi
 missing="$attach/no-such-dir"
 out="$(run_launcher "$missing" "$work/missing-argv")"; rc=$?
 if (( rc != 0 )) && [[ "$out" == *"$missing"* && "$out" == *"does not exist"* ]]; then
-    ok "missing attach directory is refused by name"
+    ok "missing thread directory is refused by name"
 else
-    no "missing attach directory is refused by name" "$out"
+    no "missing thread directory is refused by name" "$out"
 fi
 
 file="$attach/file.txt"

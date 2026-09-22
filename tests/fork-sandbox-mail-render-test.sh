@@ -117,6 +117,14 @@ malformed_id="66666666-6666-6666-6666-666666666666"
 printf 'Message-ID: %s\nnot a valid mail message, no header block here\n' "$malformed_id" > "$thread_dir/005-badfile.msg"
 ok "fixture: malformed message written"
 
+# A second malformed .msg, with NO discoverable id at all: header-shaped
+# lines, no Message-ID among them, and no blank separator. parse_msg
+# recovers an id from the entry above, so this is the only fixture left
+# that exercises the id-less error card -- which must still render at top
+# level rather than vanish from the thread.
+printf 'From: @newcomer\nSubject: Re: Hello & welcome\nnot a valid mail message and no id either\n' > "$thread_dir/006-badfile-noid.msg"
+ok "fixture: malformed message with no discoverable id written"
+
 # A dot-dir under threads/ must be ignored entirely, like .postmaster/.
 mkdir -p "$FORK_SANDBOX_MAIL_ROOT/threads/.postmaster"
 printf 'router state, not mail\n' > "$FORK_SANDBOX_MAIL_ROOT/threads/.postmaster/state.txt"
@@ -213,6 +221,8 @@ not_contains "attachment bytes are never embedded" "$html" 'attachment bytes, ne
 not_contains "no data: URI is ever embedded" "$html" 'data:'
 contains "malformed message renders an error card" "$html" 'class="msg error"'
 contains "malformed message error names the file" "$html" '005-badfile.msg'
+contains "malformed message with no discoverable id renders an error card too" "$html" '006-badfile-noid.msg'
+count_of "both malformed entries render as error cards" "$html" 'class="msg error"' 2
 not_contains "dot-dir under threads/ is not rendered as a thread" "$html" 'router state, not mail'
 not_contains "dot-dir under threads/ leaves no stray index row" "$html" '.postmaster'
 contains "reference-cycle thread renders its root message" "$html" "id=\"m-$cycle_root_id\""
@@ -242,6 +252,7 @@ contains "--text: orphan marker present" "$text_all" '[orphaned]'
 not_contains "--text: no Date header (token budget)" "$text_all" $'\nDate:'
 contains "--text: Hops header present" "$text_all" 'Hops: 8'
 contains "--text: malformed message reported, not silently dropped" "$text_all" '[error:'
+contains "--text: malformed message with no discoverable id reported too" "$text_all" '[error: 006-badfile-noid.msg:'
 contains "--text: Message-ID present (the handle reply/show/seen need)" "$text_all" "Message-ID: $root_id"
 
 printf '\n== --text mode: hostile body cannot forge a message ==\n'

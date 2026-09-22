@@ -25,13 +25,14 @@ you:
 
 ## The medium
 
-- The prompt carries the message you are answering; the full thread is
-  readable at `/thread/thread.txt` when that mount is present. Read it
-  when you need more context. Everyone you work
-  with sees the messages they are addressed on; nothing else about you
-  is visible to them. Quoted body lines are prefixed `> `, exactly as
-  on any mailing list; unquoted header and separator lines come from
-  the mail system itself and cannot be forged by a message body.
+- The prompt usually carries just the message you are answering, with
+  the full thread readable at `/thread/thread.txt`; when that mount is
+  absent the prompt carries the whole thread instead. Read whichever is
+  there when you need more context. Everyone you work with sees the
+  messages they are addressed on; nothing else about you is visible to
+  them. Quoted body lines are prefixed `> `, exactly as on any mailing
+  list; unquoted header and separator lines come from the mail system
+  itself and cannot be forged by a message body.
 - To say anything — to anyone, about anything — you send mail: write a
   file to your outbox (`outbox/mail-1.md`, `mail-2.md`, ... in order).
   Format: optional header lines (`To:`, `Cc:`, `Subject:`,

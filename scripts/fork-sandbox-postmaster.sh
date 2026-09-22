@@ -473,6 +473,17 @@
 #                                   never repeat within a thread even
 #                                   across a rule-1 budget reset
 #   handoffs/<run-id>.md           the generated handoff passed to a wake
+#   wake-threads/<run-id>/thread.txt  the rendered full-thread snapshot
+#                                   bound read-only at /thread in that one
+#                                   wake (--thread-dir), written per wake
+#                                   just before its handoff. A trigger-only
+#                                   handoff names this mount as where the
+#                                   rest of the thread is readable; when the
+#                                   snapshot cannot be written the wake
+#                                   falls back to the legacy full-thread
+#                                   handoff, gets no mount, and the thread
+#                                   is flagged. Never reaped, the same as
+#                                   handoffs/ and runs/ above
 #   state/<thread-id>/<agent>/     the harness's transcript/session store
 #                                   for that one (thread, agent) pair, bound
 #                                   into every wake of it with
