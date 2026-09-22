@@ -175,13 +175,38 @@ complete_run_host_side() {
     local reason="$1" kill_tmux="$2"
     local fetched=0 n_commits=0 removed=0 head_now="" fetch_failed=0
 
-    if [[ "$kill_tmux" == 1 && -n "$session" ]]; then
-        # Exact-match: without the '=' prefix tmux prefix/fnmatch-matches
-        # the target, and can kill a DIFFERENT session whose name happens
-        # to start with this one (e.g. "cc-sbx-x" matching "cc-sbx-x-2").
-        # fork-sandbox.sh's own has-session check uses the same "=$name"
-        # idiom (see fork-sandbox.sh's session-existence check).
-        tmux kill-session -t "=$session" 2>/dev/null || true
+    if [[ "$kill_tmux" == 1 ]]; then
+        if [[ -n "$session" ]]; then
+            # Exact-match: without the '=' prefix tmux prefix/fnmatch-matches
+            # the target, and can kill a DIFFERENT session whose name
+            # happens to start with this one (e.g. "cc-sbx-x" matching
+            # "cc-sbx-x-2"). fork-sandbox.sh's own has-session check uses
+            # the same "=$name" idiom (see fork-sandbox.sh's
+            # session-existence check).
+            tmux kill-session -t "=$session" 2>/dev/null || true
+        fi
+
+        # A --foreground run has no tmux session (the block above is a
+        # no-op for it), and even a real session's kill-session can race
+        # the runner's own teardown -- either way, do not trust the
+        # session kill alone to mean the runner is dead. Re-check and, if
+        # it is still alive, KILL it directly before touching the clone or
+        # the ledger, so the completion below is not racing a
+        # still-writing process.
+        if kill -0 "$pid" 2>/dev/null; then
+            local force_pgid
+            force_pgid="$( { ps -o pgid= -p "$pid" 2>/dev/null || true; } | tr -d '[:space:]')"
+            if [[ -n "$force_pgid" && "$force_pgid" == "$pid" ]]; then
+                kill -KILL -- "-$force_pgid" 2>/dev/null || true
+            else
+                kill -KILL "$pid" 2>/dev/null || true
+            fi
+            local kill_wait=0
+            while kill -0 "$pid" 2>/dev/null && (( kill_wait < 5 )); do
+                sleep 1
+                kill_wait=$(( kill_wait + 1 ))
+            done
+        fi
     fi
 
     if (cd "$origin_repo" && git fetch --quiet "$clone_dir" "$branch:$branch") 2>/dev/null; then
