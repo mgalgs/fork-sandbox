@@ -749,4 +749,18 @@ json="$("$status" --json "$rdY" "$rdRunning" "$rdHostile" 2>&1)"
     && "$(jq -r '.totals.runs_without_cost' <<<"$json")" == "3" ]] \
     || { echo "an all-unknown-cost set fabricated a total: $json"; exit 1; }
 
-echo "54 passed, 0 failed"
+# 26. A summary-bearing member whose exit_code is null (the k8s shape
+# when the completion marker could not be read) must not be fabricated
+# into "failed" -- it lands as "unknown", the same way TRAP 2 keeps an
+# unknown cost from being summed as a known 0.
+new_run_dir; rdNullExit="$rd_new"
+printf '{"branch":"test","exit_code":null,"total_cost_usd":null}\n' > "$rdNullExit/summary.json"
+json="$("$status" --json "$rdX" "$rdNullExit" 2>&1)"; rc=$?
+[[ $rc -eq 0 ]] || { echo "a null-exit_code member failed the whole aggregate: $json"; exit 1; }
+member="$(printf '%s' "$json" | jq -c '.runs[] | select(.run_id == "'"$(basename "$rdNullExit")"'")')"
+[[ "$(jq -r '.state' <<<"$member")" == "unknown" && "$(jq -r '.summary' <<<"$member")" == "true" ]] \
+    || { echo "null exit_code member was not derived as unknown: $member"; exit 1; }
+[[ "$(jq -r '.totals.states.unknown' <<<"$json")" == "1" ]] \
+    || { echo "totals.states did not count the unknown-state member: $json"; exit 1; }
+
+echo "55 passed, 0 failed"

@@ -30,7 +30,10 @@
 #               "unreadable", summary: false, error}. Either way "summary"
 #               is the marker: false means no summary.json fields are on
 #               this entry, true means the entry is that run's full
-#               summary.json plus run_id and a derived state. "totals"
+#               summary.json plus run_id and a derived state -- derived as
+#               "unknown", never guessed as "failed", when exit_code in
+#               that summary.json is null or otherwise not a number.
+#               "totals"
 #               never renders an unknown cost as a $0 masquerading as
 #               known: cost_usd_total sums total_cost_usd only over runs
 #               where it is a number (never coerces a missing/null one to
@@ -920,7 +923,9 @@ case "$mode" in
         if fleet_summary="$(run_file_read summary.json 2>/dev/null)"; then
             printf '%s' "$fleet_summary" | jq --arg rid "$fleet_rid" \
                 '. + {run_id: $rid, summary: true,
-                      state: (if .exit_code == 0 then "done" else "failed" end)}'
+                      state: (if (.exit_code | type) != "number" then "unknown"
+                              elif .exit_code == 0 then "done"
+                              else "failed" end)}'
         else
             fleet_model="$(run_env_get model)"
             jq -n --arg rid "$fleet_rid" --arg state "$(run_state)" --arg branch "$branch" \

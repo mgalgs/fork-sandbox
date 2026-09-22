@@ -565,7 +565,12 @@ seats it is watching), and it switches to a fleet view,
 order. A run still in flight, or dead before its summary was fetched,
 never fails the whole call -- it gets a smaller entry built from what is
 on disk instead, marked `"summary": false` so a consumer can tell it
-apart from a real summary at a glance. `totals` holds `runs` (the count
+apart from a real summary at a glance. A member that does have a
+summary but whose `exit_code` in it is `null` (some harnesses write
+that when they could not read the exit code at all) is derived as
+`"unknown"`, not guessed as `"done"` or `"failed"` -- the same rule
+`totals.cost_usd_total` follows below, applied to state instead of
+cost. `totals` holds `runs` (the count
 of entries in the fleet), `states` (a count per state, keys present
 only for states that actually occur in this set -- not a fixed list),
 and the same care applied to cost: `cost_usd_total` only sums runs
