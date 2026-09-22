@@ -482,8 +482,9 @@ reason `unresolvable To: <names> at <message-id>` (keyword
 first, in which case that reason wins instead — pm_flag overwrites, not
 appends, so only one reason survives a message that trips both; the
 names themselves never appear on this line, only the count — `@operator`
-does not count here, since rule 0 already treats it as legitimately
-non-resolving. Because `mail reply` defaults to reply-all and copies a
+does not count here, since `fleet expand` resolves it successfully via
+its zero-candidate sink rather than failing (see rule 0 below). Because
+`mail reply` defaults to reply-all and copies a
 message's own From/To/Cc into every reply, the same unresolved name tends
 to reappear on every later message in the thread; `unresolved` counts
 only names not already recorded for this thread (recorded as soon as
@@ -542,8 +543,11 @@ thread routes it.
    skip. A name that does not resolve as a wake candidate on either
    header: an unknown fleet name (a typo'd seat or a missing fleet file)
    also flags T needs-operator the first time this thread sees it (see
-   `route-dead` above), while an address that is not `@`-shaped at all,
-   or is `@operator`, is treated as genuinely external and never flags.
+   `route-dead` above), while an address that is not `@`-shaped at all is
+   treated as genuinely external and never flags. `@operator` never
+   flags either, but for a different reason: `fleet expand` resolves it
+   successfully with zero candidates, so it is simply never a wake
+   candidate and never reaches the unresolved path at all.
    An unknown fleet name reached via `Cc` flags too, the same way and the
    same once-per-thread dedup, but with its own reason naming it as
    arriving via `Cc` (keyword `unresolvable-cc`) rather than `To`, so the

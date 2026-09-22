@@ -3867,14 +3867,21 @@ check "debounce: an aged thread routes on the next pass" 1 \
 export FORK_SANDBOX_POSTMASTER_DEBOUNCE=0
 
 # The bug scenario end to end: a cover plus its patch replies post as a
-# non-atomic burst. Once the whole burst has aged past the debounce, a
-# single pass routes the cover-triggered wake with the full series
-# already on-thread, not a patchless cover.
+# non-atomic burst. A pass that lands before the patches do must not
+# spawn a patchless wake off the cover alone; only once the whole burst
+# has aged past the debounce does a pass route the cover-triggered wake,
+# and by then the full series is on-thread. The cover addresses a real
+# seat (not just @operator) so a mid-burst pass has an actual candidate
+# to prematurely wake if the gate were missing.
 new_scratch_root FORK_SANDBOX_MAIL_ROOT
 export FORK_SANDBOX_MAIL_ROOT
 export FORK_SANDBOX_POSTMASTER_DEBOUNCE=300
-burst_cover="$(send_msg '@carol' '@operator' 'burst cover' 'burst cover body' 8)"
+burst_cover="$(send_msg '@carol' '@alice' 'burst cover' 'burst cover body' 8)"
 tid_burst="$(thread_of "$burst_cover")"
+: > "$STUB_ARGV_LOG"
+once
+check "debounce: a mid-burst pass does not spawn off the cover alone" 0 \
+    "$(grep -c -- '^--branch$' "$STUB_ARGV_LOG")"
 reply_msg '@carol' "$burst_cover" 'burst patch one body' --subject 'burst patch one' >/dev/null
 reply_msg '@carol' "$burst_cover" 'burst patch two body' --subject 'burst patch two' --to '@alice' >/dev/null
 touch -d '10 minutes ago' "$FORK_SANDBOX_MAIL_ROOT/threads/$tid_burst"/*.msg
