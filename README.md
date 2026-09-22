@@ -565,11 +565,15 @@ seats it is watching), and it switches to a fleet view,
 order. A run still in flight, or dead before its summary was fetched,
 never fails the whole call -- it gets a smaller entry built from what is
 on disk instead, marked `"summary": false` so a consumer can tell it
-apart from a real summary at a glance. `totals` applies the same care to
-cost: `cost_usd_total` only sums runs whose cost is a real number, an
-unknown cost (missing or null) is counted in `runs_without_cost` and
-never folded in as a `$0`, and `cost_usd_total` itself is `null`, not
-`0`, when nothing in the set is known.
+apart from a real summary at a glance. `totals` holds `runs` (the count
+of entries in the fleet), `states` (a count per state, keys present
+only for states that actually occur in this set -- not a fixed list),
+and the same care applied to cost: `cost_usd_total` only sums runs
+whose cost is a real number, `runs_with_cost` and `runs_without_cost`
+split the set the same way, an unknown cost (missing or null) is
+counted in `runs_without_cost` and never folded in as a `$0`, and
+`cost_usd_total` itself is `null`, not `0`, when nothing in the set is
+known.
 
 `fork-sandbox run --wait` turns the ordinary detached launch into a
 synchronous one: after printing the same launch block an unwaited `run`
