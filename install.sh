@@ -303,6 +303,7 @@ PORCELAIN=(
     fork-sandbox-postmaster.sh
     fork-sandbox-say.sh
     fork-sandbox-status.sh
+    fork-sandbox-stop.sh
     fork-sandbox.sh
     pi-sandboxed
     sandbox-run-log.py        # fork-sandbox.sh looks it up on PATH before falling back to this hardcoded path
