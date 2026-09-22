@@ -660,4 +660,93 @@ out="$(timeout 12 "$status" "$rd_new" 2>&1)"
 [[ "$out" == *"state:    failed (exit 143, after "*", stop timeout kill)"* ]] \
     || { echo "stop-timeout end_reason not read from the run-log fallback: $out"; exit 1; }
 
-echo "40 passed, 0 failed"
+# 18. --json on one run dir, no --set, stays exactly the bare object it
+# always was -- byte-identical, fixture-diffed rather than substring
+# matched -- and the hard exit 1 on a missing summary.json is untouched.
+new_run_dir
+printf '{"branch":"test","exit_code":0,"total_cost_usd":1.25}\n' > "$rd_new/summary.json"
+out="$("$status" --json "$rd_new" 2>&1)"
+[[ "$out" == '{"branch":"test","exit_code":0,"total_cost_usd":1.25}' ]] \
+    || { echo "single-dir --json is no longer byte-identical to the pre-fleet shape: $out"; exit 1; }
+new_run_dir
+if "$status" --json "$rd_new" >/dev/null 2>&1; then
+    echo "--json on a run dir with no summary.json did not hard-exit"; exit 1
+fi
+
+# 19. 2+ dirs, no --set: the wrapper shape, runs in argument order.
+new_run_dir; rdX="$rd_new"
+printf 'harness=claude\nmodel=sonnet\n' >> "$rdX/run.env"
+printf '{"branch":"test","exit_code":0,"total_cost_usd":1.5}\n' > "$rdX/summary.json"
+new_run_dir; rdY="$rd_new"
+printf 'harness=codex\nmodel=\n' >> "$rdY/run.env"
+printf '{"branch":"test","exit_code":1,"total_cost_usd":null}\n' > "$rdY/summary.json"
+json="$("$status" --json "$rdY" "$rdX" 2>&1)"
+[[ "$(printf '%s' "$json" | jq -r '.runs | length')" == "2" ]] \
+    || { echo "wrapper did not carry both runs: $json"; exit 1; }
+[[ "$(printf '%s' "$json" | jq -r '.runs[0].run_id')" == "$(basename "$rdY")" \
+    && "$(printf '%s' "$json" | jq -r '.runs[1].run_id')" == "$(basename "$rdX")" ]] \
+    || { echo "wrapper runs were not in argument order: $json"; exit 1; }
+
+# 20. --set with one dir: the wrapper shape even at arity one.
+json="$("$status" --json --set "$rdX" 2>&1)"
+[[ "$(printf '%s' "$json" | jq -r '.runs | length')" == "1" \
+    && "$(printf '%s' "$json" | jq -r '.totals.runs')" == "1" ]] \
+    || { echo "--set at arity one did not force the wrapper shape: $json"; exit 1; }
+
+# 21. --set with zero dirs: a one-line refusal, not a crash.
+err="$("$status" --json --set 2>&1)"; rc=$?
+[[ $rc -ne 0 && "$(wc -l <<<"$err")" -eq 1 ]] \
+    || { echo "--set with no dirs did not refuse cleanly: rc=$rc out=$err"; exit 1; }
+
+# 22. An in-flight member (no summary.json yet, still running) never kills
+# the aggregate: it gets a state-only stand-in with summary:false and the
+# fields run_state/run.env can actually supply, and the call still exits 0.
+new_run_dir; rdRunning="$rd_new"
+printf 'harness=claude\nmodel=opus\n' >> "$rdRunning/run.env"
+printf '%s\n' "$$" > "$rdRunning/pid"
+json="$("$status" --json "$rdX" "$rdRunning" 2>&1)"; rc=$?
+[[ $rc -eq 0 ]] || { echo "an in-flight member failed the whole aggregate: $json"; exit 1; }
+member="$(printf '%s' "$json" | jq -c '.runs[] | select(.run_id == "'"$(basename "$rdRunning")"'")')"
+[[ "$(jq -r '.summary' <<<"$member")" == "false" ]] \
+    || { echo "in-flight member did not carry summary:false: $member"; exit 1; }
+[[ "$(jq -r '.state' <<<"$member")" == "running" \
+    && "$(jq -r '.harness' <<<"$member")" == "claude" \
+    && "$(jq -r '.model' <<<"$member")" == "opus" \
+    && "$(jq 'has("cost_usd") or has("total_cost_usd")' <<<"$member")" == "false" ]] \
+    || { echo "in-flight member is missing state/branch/harness/model or fabricated a summary field: $member"; exit 1; }
+
+# 23. A hostile member (symlinked run.env) never kills the aggregate
+# either, the refused file is never read, and it lands as "unreadable".
+new_run_dir; rdHostile="$rd_new"
+rm -f "$rdHostile/run.env"
+ln -s /etc/passwd "$rdHostile/run.env"
+json="$("$status" --json "$rdX" "$rdHostile" 2>&1)"; rc=$?
+[[ $rc -eq 0 ]] || { echo "a hostile member failed the whole aggregate: $json"; exit 1; }
+member="$(printf '%s' "$json" | jq -c '.runs[] | select(.run_id == "'"$(basename "$rdHostile")"'")')"
+[[ "$(jq -r '.state' <<<"$member")" == "unreadable" && "$(jq -r '.summary' <<<"$member")" == "false" \
+    && "$(jq -r '.error' <<<"$member")" == *"symlink"* ]] \
+    || { echo "hostile member did not land as unreadable: $member"; exit 1; }
+[[ "$(jq -r '.runs[0].run_id' <<<"$json")" == "$(basename "$rdX")" ]] \
+    || { echo "the hostile member displaced a good one instead of standing alone: $json"; exit 1; }
+
+# 24. totals: a numeric cost and a null (codex-shaped) cost in the same
+# set sum only the numeric one, and count both. rdX above carries 1.5,
+# rdY carries null.
+json="$("$status" --json "$rdX" "$rdY" 2>&1)"
+[[ "$(jq -r '.totals.runs_with_cost' <<<"$json")" == "1" \
+    && "$(jq -r '.totals.runs_without_cost' <<<"$json")" == "1" \
+    && "$(jq -r '.totals.cost_usd_total' <<<"$json")" == "1.5" ]] \
+    || { echo "mixed numeric/null cost totals wrong: $json"; exit 1; }
+[[ "$(jq -r '.totals.states.done' <<<"$json")" == "1" \
+    && "$(jq -r '.totals.states.failed' <<<"$json")" == "1" ]] \
+    || { echo "totals.states did not count both done and failed: $json"; exit 1; }
+
+# 25. An all-null-cost set renders cost_usd_total as null, never a 0 that
+# would masquerade as a known total.
+json="$("$status" --json "$rdY" "$rdRunning" "$rdHostile" 2>&1)"
+[[ "$(jq -r '.totals.cost_usd_total' <<<"$json")" == "null" \
+    && "$(jq -r '.totals.runs_with_cost' <<<"$json")" == "0" \
+    && "$(jq -r '.totals.runs_without_cost' <<<"$json")" == "3" ]] \
+    || { echo "an all-unknown-cost set fabricated a total: $json"; exit 1; }
+
+echo "54 passed, 0 failed"

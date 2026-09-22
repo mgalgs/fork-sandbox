@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # fork-sandbox-status.sh — :approved: Read the state and result of a fork-sandbox run
 #
-# Usage: fork-sandbox-status.sh [--result | --json | --events N | --log | --monitor | --monitor-terminal | --follow] <run-dir>
+# Usage: fork-sandbox-status.sh [--result | --json | --events N | --log | --monitor | --monitor-terminal | --follow] <run-dir>...
+#        fork-sandbox-status.sh --json --set <run-dir>...
 #
 # <run-dir> is the run directory fork-sandbox.sh printed when it launched.
 #
@@ -12,10 +13,30 @@
 #               the run with fork-sandbox-say.sh.
 # --result:     the maintainer report, then the review report, when present,
 #               followed by the session's own summary of what it did.
-# --json:       the run's structured summary — harness, model, branch, exit
-#               code, commits with their subjects, cost in dollars — and
-#               nothing else, so it pipes into jq. Written when the run
-#               ends, so it is absent until then.
+# --json:       one <run-dir>, no --set: the run's structured summary --
+#               harness, model, branch, exit code, commits with their
+#               subjects, cost in dollars -- and nothing else, so it pipes
+#               into jq. Written when the run ends, so it is absent until
+#               then, and this hard-exits 1 on a run dir with no
+#               summary.json yet.
+#               2+ <run-dir>s, or --set with any number including one: a
+#               fleet view, {"runs": [...], "totals": {...}}. "runs" holds
+#               one object per argument, in argument order. A run dir with
+#               no summary.json yet -- still going, or dead before the
+#               fetch -- gets {run_id, state, branch, harness, model,
+#               summary: false} instead of failing the whole call; a run
+#               dir this script cannot read at all (not a run dir, or a
+#               symlink where a run file should be) gets {run_id, state:
+#               "unreadable", summary: false, error}. Either way "summary"
+#               is the marker: false means no summary.json fields are on
+#               this entry, true means the entry is that run's full
+#               summary.json plus run_id and a derived state. "totals"
+#               never renders an unknown cost as a $0 masquerading as
+#               known: cost_usd_total sums total_cost_usd only over runs
+#               where it is a number (never coerces a missing/null one to
+#               0), runs_with_cost and runs_without_cost count the same
+#               split, and states counts every run's state, one key per
+#               state that actually occurs.
 # --events N:   the last N formatted events.
 # --log:        the sandbox wrapper's messages (startup errors live here).
 # --monitor:    watch the run and print one line per notable change, then the
@@ -72,6 +93,9 @@ source "$script_dir/fork-sandbox-lib.sh"
 # "illegal option -- m" from a tool the reader has no reason to suspect.
 fs_require_gnu_tools || exit 1
 formatter="$script_dir/fork-sandbox-format.sh"
+# The resolved path to this very script, so the fleet wrapper can
+# re-invoke it once per run dir (see run_fleet_json).
+self="$(readlink -f "${BASH_SOURCE[0]}")"
 
 RUN_DIR_PREFIX="/var/tmp/claude-scratch/forks/claude-fork-sandbox."
 # The pre-consolidation location, still accepted so a run dir from before the
@@ -110,9 +134,52 @@ usage() {
     sed -n '2,/^[^#]/{ /^#/s/^# \?//p }' "$0"
 }
 
+# --json's fleet view: one --json call per run dir, each a fresh child
+# process, so a run dir this script cannot read dies only in its own child
+# and never takes the aggregate down with it -- the FS_STATUS_FLEET_MEMBER
+# child gets this script's ordinary single-dir resolution, symlink refusal
+# included, for free. A child that exits 0 already printed the right shape
+# (the full summary, or the no-summary-yet stand-in -- see the
+# fleet-member case arm); a child that exits non-zero hit a die() before
+# either was possible, so its first stderr line becomes this run's
+# "unreadable" entry.
+run_fleet_json() {
+    local dirs=("$@") dir rid out errline
+    local -a entries=()
+    for dir in "${dirs[@]}"; do
+        rid="$(basename -- "${dir%/}")"
+        if out="$(FS_STATUS_FLEET_MEMBER=1 "$self" "$dir" 2>&1)"; then
+            entries+=("$out")
+        else
+            errline="$(printf '%s\n' "$out" | head -n1)"
+            errline="${errline#Error: }"
+            entries+=("$(jq -n --arg rid "$rid" --arg err "$errline" \
+                '{run_id: $rid, state: "unreadable", summary: false, error: $err}')")
+        fi
+    done
+    local runs_json
+    runs_json="$(printf '%s\n' "${entries[@]}" | jq -s '.')"
+    jq -n --argjson runs "$runs_json" '
+        def is_known: (.total_cost_usd != null and (.total_cost_usd | type) == "number");
+        ($runs | map(select(is_known))) as $known
+        | ($runs | map(select(is_known | not))) as $unknown
+        | {
+            runs: $runs,
+            totals: {
+                runs: ($runs | length),
+                cost_usd_total: (if ($known | length) == 0 then null
+                                  else ($known | map(.total_cost_usd) | add) end),
+                runs_with_cost: ($known | length),
+                runs_without_cost: ($unknown | length),
+                states: ($runs | group_by(.state) | map({key: .[0].state, value: length}) | from_entries)
+            }
+        }'
+}
+
 mode="status"
 events_n=""
-run_dir_arg=""
+run_dir_args=()
+fleet_set=0
 terminal_only=0
 # The name of a mode flag already parsed, so --monitor-terminal can refuse
 # to follow one — the reverse of the case set_mode refuses, the same broken
@@ -136,21 +203,56 @@ while [[ $# -gt 0 ]]; do
             events_n="${2:?--events requires a count}"
             shift 2
             ;;
+        --set) fleet_set=1; shift ;;
         -h|--help) usage; exit 0 ;;
         -*) die "unknown option: $1 (try --help)" ;;
         *)
-            [[ -z "$run_dir_arg" ]] || die "only one run directory may be given"
-            run_dir_arg="$1"
+            run_dir_args+=("$1")
             shift
             ;;
     esac
 done
 
-[[ -n "$run_dir_arg" ]] || die "usage: fork-sandbox-status.sh [--result | --events N | --log | --monitor | --monitor-terminal | --follow] <run-dir>"
+# FS_STATUS_FLEET_MEMBER is set only by run_fleet_json's own re-invocation
+# of this script above, one child per run dir, and never by a real caller.
+# It overrides mode here, after flags are parsed, so the child needs no
+# flag of its own -- the env var alone decides, and no dir count or mode
+# rule below applies to it (it always runs with exactly one dir and no
+# --set).
+if [[ -n "${FS_STATUS_FLEET_MEMBER:-}" ]]; then
+    mode="fleet-member"
+fi
+
+if (( fleet_set )); then
+    [[ "$mode" == "json" ]] || die "--set is only valid with --json"
+    (( ${#run_dir_args[@]} > 0 )) || die "--set requires at least one run directory"
+fi
+if (( ${#run_dir_args[@]} > 1 )) && [[ "$mode" != "json" ]]; then
+    die "only one run directory may be given"
+fi
 if [[ -n "$events_n" && ! "$events_n" =~ ^[0-9]+$ ]]; then
     die "--events takes a number"
 fi
 [[ -x "$formatter" ]] || die "$formatter is missing. Run install.sh."
+
+# --json with 2+ run dirs, or --set at any arity (including one -- a
+# one-seat fleet is legal, and lkml's fleet screens must be able to ask
+# for the wrapper shape unconditionally), is the fleet view. Every other
+# case -- one bare dir, no --set -- falls through to the single-dir path
+# below, untouched, so that shape stays byte-identical to before this
+# existed.
+wrapper_mode=0
+if [[ "$mode" == "json" ]] && { (( fleet_set )) || (( ${#run_dir_args[@]} > 1 )); }; then
+    wrapper_mode=1
+fi
+if (( wrapper_mode )); then
+    run_fleet_json "${run_dir_args[@]}"
+    exit $?
+fi
+
+[[ ${#run_dir_args[@]} -eq 1 ]] \
+    || die "usage: fork-sandbox-status.sh [--result | --events N | --log | --monitor | --monitor-terminal | --follow] <run-dir>"
+run_dir_arg="${run_dir_args[0]}"
 
 # Resolve first, then check the prefix, so a symlink cannot point the rest of
 # this script somewhere else.
@@ -803,6 +905,28 @@ case "$mode" in
             echo "run ends, so a run still going, or one that died before the" >&2
             echo "fetch, does not have one yet." >&2
             exit 1
+        fi
+        ;;
+
+    fleet-member)
+        # run_fleet_json's own per-dir child (see FS_STATUS_FLEET_MEMBER
+        # above). Reached only after every preflight check above this case
+        # statement already passed for this run dir -- run.env exists and
+        # is readable, the symlink refusals cleared -- so this always
+        # exits 0. Unlike bare --json, a missing summary.json is not fatal
+        # here: it prints a state-only stand-in instead, so a run still in
+        # flight is a normal member of the fleet, not a failure.
+        fleet_rid="$(basename -- "$run_dir")"
+        if fleet_summary="$(run_file_read summary.json 2>/dev/null)"; then
+            printf '%s' "$fleet_summary" | jq --arg rid "$fleet_rid" \
+                '. + {run_id: $rid, summary: true,
+                      state: (if .exit_code == 0 then "done" else "failed" end)}'
+        else
+            fleet_model="$(run_env_get model)"
+            jq -n --arg rid "$fleet_rid" --arg state "$(run_state)" --arg branch "$branch" \
+                --arg harness "$(run_env_get harness)" --arg model "$fleet_model" \
+                '{run_id: $rid, state: $state, branch: $branch, harness: $harness,
+                  model: (if $model == "" then null else $model end), summary: false}'
         fi
         ;;
 
