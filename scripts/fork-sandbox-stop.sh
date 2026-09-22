@@ -409,10 +409,9 @@ if (( teardown_done )); then
         rc="$(tr -dc '0-9-' < "$exit_code_file")"
         # exit-code existing means the runner's own teardown at least
         # reached that point, but not that its own fetch-back afterward
-        # succeeded -- repeat it here (the same idempotent idiom
-        # complete_run_host_side uses; a no-op if it already worked) so
-        # "stopped gracefully" actually means the branch is back, not just
-        # that exit-code was written.
+        # succeeded -- repeat it here so "stopped gracefully" actually
+        # means the branch is back, not just that exit-code was written.
+        # NOT idempotent on its own: see reconcile_branch_after_fetch below.
         if (cd "$origin_repo" && git fetch --quiet "$clone_dir" "$branch:$branch") 2>/dev/null; then
             # The clone still holds the branch ref even after the runner's
             # own teardown deletes a zero-commit branch from the ORIGIN repo
