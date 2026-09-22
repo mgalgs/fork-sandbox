@@ -689,6 +689,12 @@ PERSONAS_DIR="${FORK_SANDBOX_PERSONAS_DIR:-$HOME/.config/fork-sandbox/personas}"
 # One fresh, empty, writable outbox dir per handler wake, parallel to
 # $HANDOFFS -- see pm_exec_wake.
 HANDLER_OUTBOX="$STATE/handler-outbox"
+# One file per (thread, agent) pair, holding the wedge-bound FAILS counter
+# (see pm_session_record's comment) and, once the deferred-retry feature
+# lands, its own scheduling fields in the same file. Read by an external
+# consumer, so every write is a full-file mktemp+mv rewrite, never an
+# in-place edit -- see pm_retry_fails_set.
+RETRIES="$STATE/retries"
 
 # The shape fork-sandbox.sh accepts for --resume-session. Applied to what
 # summary.json reported before it is recorded: a malformed id would make
@@ -735,10 +741,15 @@ pm_persona_body() {
 }
 
 # Records / clears the session a (thread, agent) pair's next wake should
-# resume. Clearing is the failure path's job: the next wake then starts
-# fresh, which always works, rather than retrying a session that may be
-# what broke the last one. Never a retry loop -- claude-sandboxed already
-# retried once inside the run.
+# resume. Kept across a failed wake: a crash's own summary.json, when it
+# has a usable id, is recorded exactly like a success (it may be the id a
+# --refresh-at mid-run credential rollover left behind), and otherwise the
+# prior record is left standing -- so a mid-wake credential rollover or
+# crash no longer wipes the seat's persona. Cleared only on a clean exit-0
+# with a null/absent session id (a deliberate "no transcript" statement
+# from the launcher) or after 3 consecutive failed harvests of a RESUMED
+# wake for the same pair -- the wedge bound: a genuinely broken session
+# must not wedge a seat forever. See pm_harvest_run's FAILS bookkeeping.
 pm_session_record() {
     local tid="$1" agent="$2" sid="$3"
     mkdir -p -- "$PM_SESSIONS/$tid"
@@ -748,6 +759,30 @@ pm_session_record() {
 pm_session_clear() {
     local tid="$1" agent="$2"
     rm -f -- "$PM_SESSIONS/$tid/$agent"
+}
+
+# The wedge bound's consecutive-failure counter for a (thread, agent) pair,
+# stored under $RETRIES. Absent file means 0. Full-file atomic rewrite
+# (mktemp + mv), matching the mail store's own write idiom -- an external
+# reader must never see a partial write. fails=0 removes the file rather
+# than leaving an empty one behind.
+pm_retry_fails_get() {
+    local tid="$1" agent="$2" v
+    v="$(fs_pm_env_get "$RETRIES/$tid/$agent" FAILS)"
+    printf '%s' "${v:-0}"
+}
+
+pm_retry_fails_set() {
+    local tid="$1" agent="$2" fails="$3"
+    if [[ "$fails" == 0 ]]; then
+        rm -f -- "$RETRIES/$tid/$agent"
+        return 0
+    fi
+    mkdir -p -- "$RETRIES/$tid"
+    local tmp
+    tmp="$(mktemp "$RETRIES/$tid/.tmp.XXXXXX")"
+    printf 'FAILS=%s\n' "$fails" > "$tmp"
+    mv -- "$tmp" "$RETRIES/$tid/$agent"
 }
 
 pm_new_uuid() {
@@ -2566,7 +2601,7 @@ pm_wake_is_dead() {
 pm_harvest_run() {
     local project="$1" rid="$2"
     local f="$RUNS/$rid.env"
-    local agent tid trigger run_dir harness model network
+    local agent tid trigger run_dir harness model network resumed_field
     agent="$(fs_pm_env_get "$f" AGENT)"
     tid="$(fs_pm_env_get "$f" THREAD)"
     trigger="$(fs_pm_env_get "$f" TRIGGER)"
@@ -2574,6 +2609,7 @@ pm_harvest_run() {
     harness="$(fs_pm_env_get "$f" HARNESS)"
     model="$(fs_pm_env_get "$f" MODEL)"
     network="$(fs_pm_env_get "$f" NETWORK)"
+    resumed_field="$(fs_pm_env_get "$f" RESUMED)"
     # A given-mode harness (pi) derives its id fresh on every spawn (see
     # pm_pi_session_id) and never reads sessions/ back -- so harvest must
     # not write one there either, or a stale file sits unread forever. Only
@@ -2581,6 +2617,10 @@ pm_harvest_run() {
     fs_harness_session_caps "$harness"
     local sessions_tracked=true
     [[ "$FS_HARNESS_ID_MODE" == given ]] && sessions_tracked=false
+    # Set by either failure branch below (not by run-dir-vanished, which
+    # returns early); gates the FAILS/retry bookkeeping done once, after
+    # the pending-message read near the end of this function.
+    local was_failure=0
     if [[ ! -d "$run_dir" ]]; then
         # Vanished (scratch root cleaned up, or never existed) rather than
         # merely still running -- this is the one crash shape distinct
@@ -2589,11 +2629,9 @@ pm_harvest_run() {
         # as a terminal failure: flag the thread and unblock the agent
         # instead of leaving fs_pm_find_live_run wedged on it forever.
         pm_flag "$tid" "run dir for $agent vanished (run $rid)"
-        # No summary.json to read, and the store this seat resumes from
-        # sits under the same scratch root that just lost the run dir.
-        # Start the next wake fresh rather than point it at an id nothing
-        # can be said about.
-        [[ "$sessions_tracked" == true ]] && pm_session_clear "$tid" "$agent"
+        # Session state lives under this script's own state dir, not the
+        # run dir that just vanished -- it is unaffected, so it is left
+        # standing rather than cleared on evidence this branch never had.
         mkdir -p -- "$HARVESTED"
         : > "$HARVESTED/$rid"
         return 0
@@ -2611,13 +2649,13 @@ pm_harvest_run() {
         # Same crash shape as a non-zero exit code below -- no summary.json
         # ever landed, but the outbox is a host directory bind-mounted rw
         # into the sandbox, so a reply the agent finished composing before
-        # the runner died is already on disk. Flag the thread, forget the
-        # session (a wake that never finished is exactly the case where
-        # the recorded id is the suspect), and fall through to the shared
-        # outbox-harvest and pending-message handling below rather than
-        # discarding both.
+        # the runner died is already on disk. Flag the thread, and fall
+        # through to the shared outbox-harvest and pending-message handling
+        # below. No summary.json means no evidence either way about the
+        # session, so the prior recorded id (if any) is left standing
+        # rather than cleared on nothing.
         pm_flag "$tid" "wake never produced summary.json: $rid"
-        [[ "$sessions_tracked" == true ]] && pm_session_clear "$tid" "$agent"
+        was_failure=1
     else
         local exit_code
         exit_code="$(pm_trim "$(cat -- "$run_dir/exit-code" 2>/dev/null)")"
@@ -2627,10 +2665,21 @@ pm_harvest_run() {
             # a non-zero exit is a failure, not the documented "no reply is a
             # valid outcome".
             pm_flag "$tid" "wake for $agent exited $exit_code (run $rid); outbox may be incomplete"
-            # ...and forget the session, so the next wake of this seat is a
-            # fresh one. A failed resumed wake is exactly the case where the
-            # recorded id is the suspect.
-            [[ "$sessions_tracked" == true ]] && pm_session_clear "$tid" "$agent"
+            # A crash's own summary.json, when present and id-shaped, is
+            # exactly as trustworthy as the success path's (it may be the
+            # id a --refresh-at mid-run credential rollover resumed onto) --
+            # record it the same way. Absent, unparseable, or non-id-shaped
+            # is weak evidence either way, so the prior recorded id is left
+            # standing rather than cleared on it. This can still wedge a
+            # seat on a genuinely broken session; see the FAILS bookkeeping
+            # below (near the pending-message read) for the bound on that.
+            if [[ "$sessions_tracked" == true ]]; then
+                local sid
+                sid="$(pm_trim "$(jq -r '.session_id // empty' \
+                    "$run_dir/summary.json" 2>/dev/null || true)")"
+                [[ "$sid" =~ $PM_SESSION_ID_RE ]] && pm_session_record "$tid" "$agent" "$sid"
+            fi
+            was_failure=1
         else
             # Which session the next wake should resume. sid comes up empty
             # several different ways -- summary.json has no session_id (or
@@ -2662,6 +2711,10 @@ pm_harvest_run() {
                     pm_session_clear "$tid" "$agent"
                 fi
             fi
+            # Any exit-0 harvest resets the wedge-bound counter, regardless
+            # of sessions_tracked -- a given-mode harness's clean finish is
+            # just as much evidence of health as a discover-mode one's.
+            pm_retry_fails_set "$tid" "$agent" 0
         fi
     fi
 
@@ -2697,6 +2750,20 @@ pm_harvest_run() {
 
     mkdir -p -- "$HARVESTED"
     : > "$HARVESTED/$rid"
+
+    # The wedge bound: only a RESUMED wake's failure counts (a wake that
+    # never resumed anything has no session for clearing to help), and 3
+    # in a row for the same pair clears the recorded session so the next
+    # wake starts fresh rather than wedging on it forever.
+    if (( was_failure )) && [[ -n "$resumed_field" ]]; then
+        local fails
+        fails=$(( $(pm_retry_fails_get "$tid" "$agent") + 1 ))
+        if (( fails >= 3 )); then
+            pm_session_clear "$tid" "$agent"
+            fails=0
+        fi
+        pm_retry_fails_set "$tid" "$agent" "$fails"
+    fi
 
     local pending
     pending="$(fs_pm_env_get "$f" PENDING_MSGS)"

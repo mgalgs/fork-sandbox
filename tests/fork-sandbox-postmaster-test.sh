@@ -2025,8 +2025,9 @@ contains "dead pid, no grace: thread is flagged with the wake-died reason" \
     "wake never produced summary.json"
 check "dead pid, no grace: the run is marked harvested (agent unblocks)" "1" \
     "$(find "$FORK_SANDBOX_MAIL_ROOT/.postmaster/harvested" -type f | wc -l)"
-check "dead pid, no grace: the recorded session id is cleared" 0 \
-    "$( [[ -e "$FORK_SANDBOX_MAIL_ROOT/.postmaster/sessions/$tid/alice" ]] && echo 1 || echo 0 )"
+check "dead pid, no grace: the recorded session id is left standing (no summary.json is no evidence)" \
+    'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' \
+    "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/sessions/$tid/alice" 2>/dev/null || true)"
 
 new_scratch_root FORK_SANDBOX_MAIL_ROOT
 export FORK_SANDBOX_MAIL_ROOT
@@ -2272,29 +2273,52 @@ check "resume: second wake binds the same state dir" \
 contains "resume: status marks a resumed wake" \
     "$("$postmaster" status 2>&1)" "resumed=$res_sid"
 
-# A resumed wake that fails outright forgets the session: the recorded id
-# is the suspect, and a fresh wake always works. Never a retry loop --
-# claude-sandboxed already retried once inside the run.
+# A resumed wake that fails outright KEEPS the recorded session now: its
+# summary.json here names no usable id (finish_run's default is a null
+# session_id), which is weak evidence either way, so the prior id is left
+# standing rather than cleared -- a mid-wake credential rollover or crash
+# must not wipe the seat's persona. The wedge bound that eventually clears
+# a session stuck failing across three consecutive resumed wakes is its
+# own section below.
 finish_run alice 1
 once
-check "resume: a failed wake clears the recorded session id" 0 \
-    "$( [[ -e "$res_sessions" ]] && echo 1 || echo 0 )"
+check "resume: a failed wake with no usable session_id in summary.json leaves the recorded id standing" \
+    "$res_sid" "$(cat "$res_sessions" 2>/dev/null)"
 
 reply_msg '@carol' "$res_mid2" 'third message' --to '@alice' >/dev/null
 : > "$STUB_ARGV_LOG"
 once
-check "resume: the wake after a failure is fresh again" 0 \
-    "$(grep -c -- '^--resume-session$' "$STUB_ARGV_LOG")"
+check "resume: the wake after a failure still resumes (session was not cleared)" \
+    "$res_sid" "$(argv_after --resume-session "$STUB_ARGV_LOG")"
 check "resume: ...and still binds the state dir" \
     "$res_state" "$(argv_after --session-state "$STUB_ARGV_LOG")"
+
+# A crash whose summary.json DOES name a real (id-shaped) session_id is
+# recorded exactly like a success -- it may be the id a --refresh-at
+# mid-run credential rollover resumed onto.
+new_crash_sid=cafefeed-1111-2222-3333-444455556666
+finish_run alice 1 "$new_crash_sid"
+once
+check "resume: a failed wake with an id-shaped summary session_id records THAT id" \
+    "$new_crash_sid" "$(cat "$res_sessions" 2>/dev/null)"
+
+reply_msg '@carol' "$res_mid1" 'fourth message' --to '@alice' >/dev/null
+: > "$STUB_ARGV_LOG"
+once
+check "resume: the next wake resumes the id recorded from the crash" \
+    "$new_crash_sid" "$(argv_after --resume-session "$STUB_ARGV_LOG")"
+finish_run alice 0 "$new_crash_sid"
+once
 
 # A summary.json that names nothing usable leaves the store's own history
 # alone rather than recording a value the launcher would refuse -- a bad
 # id there would wedge every later wake of this seat.
+reply_msg '@carol' "$res_mid1" 'fifth message' --to '@alice' >/dev/null
+once
 finish_run alice 0 'not a session id'
 once
-check "resume: a malformed session id is not recorded" 0 \
-    "$( [[ -e "$res_sessions" ]] && echo 1 || echo 0 )"
+check "resume: a malformed session id leaves the earlier valid id standing" \
+    "$new_crash_sid" "$(cat "$res_sessions" 2>/dev/null)"
 
 # A session-state directory bound rw into the sandbox can end up with a
 # transcript named with a leading hyphen; fork-sandbox.sh's own
@@ -2302,12 +2326,12 @@ check "resume: a malformed session id is not recorded" 0 \
 # leading hyphen would be misread as another flag), so PM_SESSION_ID_RE
 # must reject it too, or this seat records an id the launcher then
 # refuses on every later wake.
-reply_msg '@carol' "$res_mid1" 'fourth message' --to '@alice' >/dev/null
+reply_msg '@carol' "$res_mid1" 'sixth message' --to '@alice' >/dev/null
 once
 finish_run alice 0 '-abcdef12'
 once
-check "resume: a session id with a leading hyphen is not recorded" 0 \
-    "$( [[ -e "$res_sessions" ]] && echo 1 || echo 0 )"
+check "resume: a session id with a leading hyphen leaves the earlier valid id standing" \
+    "$new_crash_sid" "$(cat "$res_sessions" 2>/dev/null)"
 
 # ============================================================
 printf '\n== harvest: a malformed session_id leaves an earlier VALID id standing ==\n'
@@ -2440,12 +2464,116 @@ once
 check "resume: a codex seat's second wake resumes the recorded session" \
     "$codex_sid" "$(argv_after --resume-session "$STUB_ARGV_LOG")"
 
-# A broken (failed) resumed wake degrades the NEXT wake to fresh, for every
+# A broken (failed) resumed wake leaves the session standing, for every
 # resumable harness -- codex here, claude already covered above.
 finish_run eve 1
 once
-check "resume: a codex seat's failed wake clears the recorded session id" 0 \
-    "$( [[ -e "$codex_sessions" ]] && echo 1 || echo 0 )"
+check "resume: a codex seat's failed wake leaves the recorded session id standing" \
+    "$codex_sid" "$(cat "$codex_sessions" 2>/dev/null)"
+
+# ============================================================
+printf '\n== session resume: wedge bound -- 3 consecutive failed resumed wakes clear it ==\n'
+# ============================================================
+
+# "Keep across a failure" (above) must not wedge a seat on a genuinely
+# broken session forever: 3 consecutive failed harvests of a RESUMED wake
+# for the same pair clear the recorded id, and a clean exit-0 anywhere in
+# that run resets the count back to 0.
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+
+wb_sid=deadbeef-0000-1111-2222-333344445566
+wb_mid1="$(send_msg '@carol' '@alice' 'wedge bound topic' 'first message' 8)"
+wb_tid="$(thread_of "$wb_mid1")"
+wb_sessions="$PM_STATE_DIR/sessions/$wb_tid/alice"
+
+once
+finish_run alice 0 "$wb_sid"
+once
+check "wedge bound: healthy session recorded to start" \
+    "$wb_sid" "$(cat "$wb_sessions" 2>/dev/null)"
+
+# Failure 1 of 3: still standing.
+reply_msg '@carol' "$wb_mid1" 'wb msg 2' --to '@alice' >/dev/null
+once
+finish_run alice 1
+once
+check "wedge bound: 1st consecutive failed resumed wake leaves it standing" \
+    "$wb_sid" "$(cat "$wb_sessions" 2>/dev/null)"
+
+# Failure 2 of 3: still standing, and the retry actually resumed the
+# ORIGINAL id -- proving "keep across failures" is what let 2 failures
+# accumulate against the one resumed session.
+reply_msg '@carol' "$wb_mid1" 'wb msg 3' --to '@alice' >/dev/null
+: > "$STUB_ARGV_LOG"
+once
+check "wedge bound: the 2nd resumed wake resumed the original id" \
+    "$wb_sid" "$(argv_after --resume-session "$STUB_ARGV_LOG")"
+finish_run alice 1
+once
+check "wedge bound: 2nd consecutive failed resumed wake still leaves it standing" \
+    "$wb_sid" "$(cat "$wb_sessions" 2>/dev/null)"
+
+# Failure 3 of 3: this is the one that clears it.
+reply_msg '@carol' "$wb_mid1" 'wb msg 4' --to '@alice' >/dev/null
+: > "$STUB_ARGV_LOG"
+once
+check "wedge bound: the 3rd resumed wake also resumed the original id" \
+    "$wb_sid" "$(argv_after --resume-session "$STUB_ARGV_LOG")"
+finish_run alice 1
+once
+check "wedge bound: 3rd consecutive failed resumed wake clears it" 0 \
+    "$( [[ -e "$wb_sessions" ]] && echo 1 || echo 0 )"
+
+# ============================================================
+printf '\n== session resume: an exit-0 harvest in between resets the wedge count ==\n'
+# ============================================================
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+
+rs_sid=facefeed-0000-1111-2222-333344445577
+rs_mid1="$(send_msg '@carol' '@alice' 'reset count topic' 'first message' 8)"
+rs_tid="$(thread_of "$rs_mid1")"
+rs_sessions="$PM_STATE_DIR/sessions/$rs_tid/alice"
+
+once
+finish_run alice 0 "$rs_sid"
+once
+
+# Fail once (count=1).
+reply_msg '@carol' "$rs_mid1" 'rs msg 2' --to '@alice' >/dev/null
+once
+finish_run alice 1
+once
+
+# Succeed once: resets the count to 0.
+reply_msg '@carol' "$rs_mid1" 'rs msg 3' --to '@alice' >/dev/null
+once
+finish_run alice 0 "$rs_sid"
+once
+
+# Fail twice more: only 2 since the reset, so NOT cleared yet.
+reply_msg '@carol' "$rs_mid1" 'rs msg 4' --to '@alice' >/dev/null
+once
+finish_run alice 1
+once
+reply_msg '@carol' "$rs_mid1" 'rs msg 5' --to '@alice' >/dev/null
+once
+finish_run alice 1
+once
+check "reset count: 2 failures since the exit-0 reset do not clear it" \
+    "$rs_sid" "$(cat "$rs_sessions" 2>/dev/null)"
+
+# One more failure is the 3rd since the reset: this one clears it.
+reply_msg '@carol' "$rs_mid1" 'rs msg 6' --to '@alice' >/dev/null
+once
+finish_run alice 1
+once
+check "reset count: the 3rd failure since the reset clears it" 0 \
+    "$( [[ -e "$rs_sessions" ]] && echo 1 || echo 0 )"
 
 # ============================================================
 printf '\n== persistent workspace: --clone-dir path is stable across wakes ==\n'
