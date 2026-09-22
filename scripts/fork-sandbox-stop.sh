@@ -28,9 +28,26 @@
 #                         run's own teardown finish normally: fetch,
 #                         zero-commit branch cleanup, summary.json, exit-code,
 #                         run-log record. Waits (polling for the runner
-#                         process to actually exit, not just for exit-code
-#                         to appear) up to --timeout for that teardown to
-#                         finish. end_reason: stopped.
+#                         process to actually exit -- or, since a
+#                         --keep-session run's teardown ends in `exec
+#                         "$user_shell"`, which keeps its pid alive under a
+#                         new image forever, for its summary.json to appear
+#                         instead, the same "teardown truly finished" signal
+#                         without needing the pid to ever exit) up to
+#                         --timeout for that teardown to finish. Once it
+#                         has, the branch's fetched-back state is confirmed
+#                         by repeating the runner's own fetch (idempotent,
+#                         so harmless if it already worked) rather than
+#                         trusting exit-code alone -- a runner whose own
+#                         internal fetch-back silently failed must not read
+#                         as a clean stop. end_reason: stopped.
+#   runner dies mid-wait   without ever writing exit-code (e.g. an
+#                         external kill this verb did not itself perform)
+#                         -- none of its own teardown can be trusted to
+#                         have run. Falls through to the same forced
+#                         completion as a timeout, promptly rather than
+#                         waiting out the rest of --timeout.
+#                         end_reason: stop-timeout.
 #   timeout expires       falls back to the same forced completion below.
 #                         end_reason: stop-timeout.
 #   runner already dead   (e.g. someone ran 'tmux kill-session' directly)
@@ -157,6 +174,14 @@ session="$(fs_read_env_value "$run_env" session || true)"
 exit_code_file="$run_dir/exit-code"
 pid_file="$run_dir/pid"
 
+# Shared by both places that must tell a fetch failure from a clean "0 new
+# commits": the work is still in the clone, not lost, just not yet in the
+# origin repo.
+warn_fetch_failed() {
+    printf 'fork-sandbox-stop: could not fetch branch %s back from %s into %s -- the work is still there, not lost, but NOT yet in your repo. Retry by hand once the problem is fixed:\n  (cd %q && git fetch %q %q:%q)\n' \
+        "$branch" "$clone_dir" "$origin_repo" "$origin_repo" "$clone_dir" "$branch" "$branch" >&2
+}
+
 # Entry state 1: the run is already over. Idempotent no-op, per the brief --
 # nothing is rewritten, this is not an error.
 if [[ -e "$exit_code_file" && ! -L "$exit_code_file" ]]; then
@@ -227,8 +252,7 @@ complete_run_host_side() {
         fetched=1
     else
         fetch_failed=1
-        printf 'fork-sandbox-stop: could not fetch branch %s back from %s into %s -- the work is still there, not lost, but NOT yet in your repo. Retry by hand once the problem is fixed:\n  (cd %q && git fetch %q %q:%q)\n' \
-            "$branch" "$clone_dir" "$origin_repo" "$origin_repo" "$clone_dir" "$branch" "$branch" >&2
+        warn_fetch_failed
     fi
 
     if (( fetched )); then
@@ -332,26 +356,67 @@ fi
 # report "stopped gracefully" before the branch is actually back in the
 # origin repo. The process only exits once its full teardown -- fetch-back
 # included -- has completed.
+#
+# A --keep-session run is the one case where the process never exits at
+# all: its teardown ends in `exec "$user_shell" -i` (fork-sandbox.sh's own
+# comment on that exec explains why), which replaces the process image
+# without ending the pid, so kill -0 would keep succeeding forever for a
+# run that finished perfectly cleanly. Its summary.json is written
+# strictly AFTER the fetch-back (fork-sandbox.sh's teardown), so treat its
+# appearance as the same "teardown truly finished" signal a normal run's
+# process exit gives -- the one case a still-alive pid cannot give it.
 waited=0
+teardown_done=0
 while (( waited < timeout_secs )); do
-    kill -0 "$pid" 2>/dev/null || break
+    if ! kill -0 "$pid" 2>/dev/null; then
+        teardown_done=1
+        break
+    fi
+    if [[ -e "$run_dir/summary.json" ]]; then
+        teardown_done=1
+        break
+    fi
     sleep 1
     waited=$(( waited + 1 ))
 done
 
-if ! kill -0 "$pid" 2>/dev/null; then
+if (( teardown_done )); then
     if [[ -e "$exit_code_file" && ! -L "$exit_code_file" ]]; then
         rc="$(tr -dc '0-9-' < "$exit_code_file")"
-        printf 'stopped gracefully (exit %s) after %ss.\n' "$rc" "$waited"
-    else
-        printf 'stopped gracefully after %ss (runner exited without an exit-code file).\n' "$waited"
+        # exit-code existing means the runner's own teardown at least
+        # reached that point, but not that its own fetch-back afterward
+        # succeeded -- repeat it here (the same idempotent idiom
+        # complete_run_host_side uses; a no-op if it already worked) so
+        # "stopped gracefully" actually means the branch is back, not just
+        # that exit-code was written.
+        if (cd "$origin_repo" && git fetch --quiet "$clone_dir" "$branch:$branch") 2>/dev/null; then
+            printf 'stopped gracefully (exit %s) after %ss.\n' "$rc" "$waited"
+            exit 0
+        else
+            printf 'fork-sandbox-stop: the runner exited (exit %s) but its own fetch-back could not be confirmed.\n' "$rc" >&2
+            warn_fetch_failed
+            exit 1
+        fi
     fi
-    exit 0
+    # The process is gone (this is unreachable via the summary.json branch
+    # above, since summary.json never exists without exit-code already
+    # existing) but exit-code never got written -- the runner died without
+    # completing its own teardown, e.g. an external kill this verb did not
+    # itself perform while it was waiting. Nothing of its own can be
+    # trusted; close the run the same way a timed-out one is closed,
+    # rather than claim a graceful stop that never actually happened.
+    printf 'fork-sandbox-stop: the runner exited without completing its own teardown (no exit-code was written); completing the stop host-side.\n' >&2
+    if complete_run_host_side stop-timeout 1; then
+        exit 0
+    else
+        exit 1
+    fi
 fi
 
-# Timeout expired: fall back to the violent path that exists today, but
-# still owe a run_end -- distinguishable from a clean stop -- instead of
-# leaving the gap this verb exists to close merely relocated.
+# Timeout expired while the runner was still alive and had not finished:
+# fall back to the violent path that exists today, but still owe a
+# run_end -- distinguishable from a clean stop -- instead of leaving the
+# gap this verb exists to close merely relocated.
 printf 'timed out after %ss waiting for a graceful stop; forcing it.\n' "$timeout_secs" >&2
 if complete_run_host_side stop-timeout 1; then
     exit 0

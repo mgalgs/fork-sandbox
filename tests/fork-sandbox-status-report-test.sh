@@ -645,4 +645,19 @@ out="$(timeout 12 "$status" "$rd_new" 2>&1)"
 [[ "$out" != *"stopped by operator"* && "$out" != *"salvaged"* && "$out" != *"timeout kill"* ]] \
     || { echo "absent end_reason wrongly annotated: $out"; exit 1; }
 
-echo "39 passed, 0 failed"
+# 17. fork-sandbox-stop.sh's own forced/salvage completion deliberately
+# never fabricates a summary.json (a stub there would suppress
+# sandbox-run-log.py record's own no-summary fallback -- see that script's
+# comment), so stop-timeout/salvaged now land only in the run log, keyed
+# by the run dir's basename. The state line must still surface them from
+# there when summary.json is absent -- exactly this run dir's shape.
+new_run_dir
+printf '143\n' > "$rd_new/exit-code"
+printf 'test\n' > "$rd_new/run-source"
+"$repo_dir/scripts/sandbox-run-log.py" record --run-dir "$rd_new" \
+    --end-reason stop-timeout >/dev/null 2>&1
+out="$(timeout 12 "$status" "$rd_new" 2>&1)"
+[[ "$out" == *"state:    failed (exit 143, after "*", stop timeout kill)"* ]] \
+    || { echo "stop-timeout end_reason not read from the run-log fallback: $out"; exit 1; }
+
+echo "40 passed, 0 failed"

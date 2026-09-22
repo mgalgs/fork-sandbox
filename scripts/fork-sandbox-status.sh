@@ -585,14 +585,25 @@ exit_code() {
     printf '%s' "${rc//[^0-9-]/}"
 }
 
-# summary.json's end_reason: absent on every ordinary run (it ended on its
-# own), and on any run whose summary.json does not exist yet or at all.
-# 'fork-sandbox stop' is the only thing that ever writes stopped,
-# stop-timeout, or salvaged there.
+# end_reason: absent on every ordinary run (it ended on its own).
+# 'fork-sandbox stop' is the only thing that ever produces stopped,
+# stop-timeout, or salvaged, and the runner itself is the only thing that
+# ever writes stopped into summary.json (a run it hands off gracefully).
+# The stop verb's own forced/salvage completion deliberately does NOT
+# fabricate a summary.json for stop-timeout/salvaged (a stub there would
+# suppress sandbox-run-log.py record's no-summary fallback -- see that
+# script's own comment) -- those two land only in the run log, keyed by
+# this run dir's basename, so fall back to reading them back from there.
 end_reason_value() {
-    local json
-    json="$(run_file_read summary.json 2>/dev/null)" || return 0
-    printf '%s' "$json" | jq -r '.end_reason // empty' 2>/dev/null
+    local json reason run_id
+    json="$(run_file_read summary.json 2>/dev/null)"
+    if [[ -n "$json" ]]; then
+        reason="$(printf '%s' "$json" | jq -r '.end_reason // empty' 2>/dev/null)"
+        [[ -n "$reason" ]] && { printf '%s' "$reason"; return; }
+    fi
+    run_id="$(basename "$run_dir")"
+    "$script_dir/sandbox-run-log.py" show "$run_id" 2>/dev/null \
+        | jq -r '.end_reason // empty' 2>/dev/null
 }
 
 # The refresh loop's continuation legs tee into events.jsonl AND their own

@@ -46,9 +46,18 @@ export FORK_SANDBOX_RUN_SOURCE=test
 pass=0
 fail=0
 tmpdirs=()
+# Set only by the exact-match tmux test, to a dedicated -L server -- never
+# the caller's own default one, per
+# fork-sandbox-clone-dir-lock-lifetime-test.sh's header. Killed in the EXIT
+# trap, not just inline, so an interrupted run cannot leave a real cc-sbx-*
+# session alive on it.
+tmux_socket=""
 
 cleanup() {
     local d
+    if [[ -n "$tmux_socket" ]]; then
+        tmux -L "$tmux_socket" kill-server >/dev/null 2>&1 || true
+    fi
     for d in "${tmpdirs[@]-}"; do
         [[ -n "$d" && -e "$d" ]] && rm -rf -- "$d"
     done
@@ -395,16 +404,27 @@ wait_for_file() {
 # -- graceful stop: the fake runner honors TERM and writes exit-code
 # itself, the same as fork-sandbox.sh's own teardown would after its
 # deferred trap runs. The stop verb must signal it, notice the exit-code
-# appear well inside a generous timeout, and report success without ever
-# falling back to the violent path (no fetch, no kill-session needed since
-# the run never named a real branch here).
+# appear well inside a generous timeout, and report success. A real
+# origin+clone (zero commits past base) is needed here even though this
+# fixture never adds work, because the graceful report now confirms the
+# branch's fetched-back state by repeating the fetch itself -- a
+# nonexistent origin/clone would make that confirmation fail and the test
+# would wrongly look like a regression.
+graceful_origin="$(new_project)"; tmpdirs+=("$graceful_origin")
+graceful_base_sha="$(cd "$graceful_origin" && git rev-parse HEAD)"
+graceful_clone="$(mktemp -d /var/tmp/claude-scratch/fs-stop-graceful-clone.XXXXXX)"
+tmpdirs+=("$graceful_clone")
+(
+    cd "$graceful_origin" && git clone -q . "$graceful_clone" \
+        && cd "$graceful_clone" && git checkout -q -b fs-stop-graceful
+) >/dev/null 2>&1
 rd_graceful="$(new_run_dir)"
 cat > "$rd_graceful/run.env" <<EOF
 version=1
 branch=fs-stop-graceful
-origin_repo=/tmp/nonexistent-origin
-clone_dir=/tmp/nonexistent-clone
-base_sha=0000000000000000000000000000000000000000
+origin_repo=$graceful_origin
+clone_dir=$graceful_clone
+base_sha=$graceful_base_sha
 session=cc-sbx-fs-stop-graceful-does-not-exist
 EOF
 RUN_DIR="$rd_graceful" setsid --fork "$fake_runner_honors_term" \
@@ -442,13 +462,24 @@ while :; do sleep 0.2; done
 EOF
 chmod +x "$fake_runner_delayed_exit"
 
+# A real origin+clone, same reason as the plain graceful fixture above: the
+# graceful report now confirms the fetched-back state itself.
+delayed_origin="$(new_project)"; tmpdirs+=("$delayed_origin")
+delayed_base_sha="$(cd "$delayed_origin" && git rev-parse HEAD)"
+delayed_clone="$(mktemp -d /var/tmp/claude-scratch/fs-stop-delayed-clone.XXXXXX)"
+tmpdirs+=("$delayed_clone")
+(
+    cd "$delayed_origin" && git clone -q . "$delayed_clone" \
+        && cd "$delayed_clone" && git checkout -q -b fs-stop-delayed
+) >/dev/null 2>&1
+
 rd_delayed="$(new_run_dir)"
 cat > "$rd_delayed/run.env" <<EOF
 version=1
 branch=fs-stop-delayed
-origin_repo=/tmp/nonexistent-origin
-clone_dir=/tmp/nonexistent-clone
-base_sha=0000000000000000000000000000000000000000
+origin_repo=$delayed_origin
+clone_dir=$delayed_clone
+base_sha=$delayed_base_sha
 session=cc-sbx-fs-stop-delayed-does-not-exist
 EOF
 RUN_DIR="$rd_delayed" setsid --fork "$fake_runner_delayed_exit" \
@@ -480,6 +511,194 @@ else
     no "graceful-with-delay: the runner process has actually exited" "fake runner never wrote a pid file"
 fi
 wait "$delayed_job" 2>/dev/null || true
+
+# -- graceful stop, --keep-session shape: the fake runner honors TERM,
+# writes exit-code and summary.json exactly like a real teardown, then
+# `exec`s into something that keeps its pid alive forever -- the same
+# shape fork-sandbox.sh's own --keep-session path ends in (`exec
+# "$user_shell" -i"`, after exit-code, fetch-back and summary.json are all
+# already written). kill -0 on this pid never fails, so a wait that only
+# ever polls for process death would spin for the full --timeout and then
+# WRONGLY force-complete a run that already finished perfectly cleanly --
+# overwriting its real exit-code 0 with 143 and appending a second,
+# contradictory run_end. The fix must instead notice summary.json and
+# treat that as "teardown finished" on its own.
+fake_runner_keep_session="$(mktemp /var/tmp/claude-scratch/fs-stop-fake-runner.XXXXXX)"
+tmpdirs+=("$fake_runner_keep_session")
+cat > "$fake_runner_keep_session" <<'EOF'
+#!/usr/bin/env bash
+set -uo pipefail
+printf '%s\n' "$$" > "$RUN_DIR/pid"
+trap '
+    printf "0\n" > "$RUN_DIR/exit-code"
+    printf "{}\n" > "$RUN_DIR/summary.json"
+    exec sleep 300
+' TERM
+while :; do sleep 0.2; done
+EOF
+chmod +x "$fake_runner_keep_session"
+
+keepsession_origin="$(new_project)"; tmpdirs+=("$keepsession_origin")
+keepsession_base_sha="$(cd "$keepsession_origin" && git rev-parse HEAD)"
+keepsession_clone="$(mktemp -d /var/tmp/claude-scratch/fs-stop-keepsession-clone.XXXXXX)"
+tmpdirs+=("$keepsession_clone")
+(
+    cd "$keepsession_origin" && git clone -q . "$keepsession_clone" \
+        && cd "$keepsession_clone" && git checkout -q -b fs-stop-keepsession
+) >/dev/null 2>&1
+
+rd_keepsession="$(new_run_dir)"
+cat > "$rd_keepsession/run.env" <<EOF
+version=1
+branch=fs-stop-keepsession
+origin_repo=$keepsession_origin
+clone_dir=$keepsession_clone
+base_sha=$keepsession_base_sha
+session=cc-sbx-fs-stop-keepsession-does-not-exist
+EOF
+RUN_DIR="$rd_keepsession" setsid --fork "$fake_runner_keep_session" \
+    < /dev/null > "$rd_keepsession/fake-runner.log" 2>&1 &
+keepsession_job=$!
+if wait_for_file "$rd_keepsession/pid"; then
+    keepsession_pid="$(cat "$rd_keepsession/pid")"
+    start_ts_keepsession="$(date +%s)"
+    out_keepsession="$(timeout 20 "$stop" --timeout 15 "$rd_keepsession" 2>&1)"; rc_keepsession=$?
+    elapsed_keepsession=$(( $(date +%s) - start_ts_keepsession ))
+    check "keep-session shape: exits 0" "0" "$rc_keepsession"
+    contains "keep-session shape: reports stopped gracefully" "stopped gracefully" "$out_keepsession"
+    not_contains "keep-session shape: does not force-complete a clean stop" "timed out" "$out_keepsession"
+    check "keep-session shape: exit-code stays 0, not overwritten to 143" \
+        "0" "$(cat "$rd_keepsession/exit-code" 2>/dev/null)"
+    if (( elapsed_keepsession < 10 )); then
+        ok "keep-session shape: noticed summary.json promptly, did not spin for the full timeout"
+    else
+        no "keep-session shape: noticed summary.json promptly, did not spin for the full timeout" \
+            "took ${elapsed_keepsession}s against a 15s timeout"
+    fi
+    if kill -0 "$keepsession_pid" 2>/dev/null; then
+        ok "keep-session shape: the kept-open pid is left alone"
+    else
+        no "keep-session shape: the kept-open pid is left alone" \
+            "pid $keepsession_pid was killed; --keep-session must survive a graceful stop"
+    fi
+    kill -9 "$keepsession_pid" 2>/dev/null || true
+else
+    no "keep-session shape: exits 0" "fake runner never wrote a pid file"
+    no "keep-session shape: reports stopped gracefully" "fake runner never wrote a pid file"
+    no "keep-session shape: does not force-complete a clean stop" "fake runner never wrote a pid file"
+    no "keep-session shape: exit-code stays 0, not overwritten to 143" "fake runner never wrote a pid file"
+    no "keep-session shape: noticed summary.json promptly, did not spin for the full timeout" \
+        "fake runner never wrote a pid file"
+    no "keep-session shape: the kept-open pid is left alone" "fake runner never wrote a pid file"
+fi
+wait "$keepsession_job" 2>/dev/null || true
+
+# -- graceful stop but the runner's own fetch-back silently failed: the
+# fake runner honors TERM and writes exit-code 0 exactly like a real
+# successful teardown, but clone_dir is not a git repository at all, so
+# fetching it can never succeed. The graceful report must confirm the
+# branch actually landed rather than trust exit-code alone -- a runner
+# whose own internal fetch-back failed must not read as a clean "stopped
+# gracefully" (the same reassuring-but-stranded outcome the failed-fetch
+# test below forbids on the forced/salvage path).
+fetchfail_origin="$(new_project)"; tmpdirs+=("$fetchfail_origin")
+fetchfail_base_sha="$(cd "$fetchfail_origin" && git rev-parse HEAD)"
+fetchfail_clone="$(mktemp -d /var/tmp/claude-scratch/fs-stop-fetchfail-clone.XXXXXX)"
+tmpdirs+=("$fetchfail_clone")
+rd_fetchfail="$(new_run_dir)"
+cat > "$rd_fetchfail/run.env" <<EOF
+version=1
+branch=fs-stop-fetchfail
+origin_repo=$fetchfail_origin
+clone_dir=$fetchfail_clone
+base_sha=$fetchfail_base_sha
+session=cc-sbx-fs-stop-fetchfail-does-not-exist
+EOF
+RUN_DIR="$rd_fetchfail" setsid --fork "$fake_runner_honors_term" \
+    < /dev/null > "$rd_fetchfail/fake-runner.log" 2>&1 &
+fetchfail_job=$!
+if wait_for_file "$rd_fetchfail/pid"; then
+    out_fetchfail="$(timeout 20 "$stop" --timeout 15 "$rd_fetchfail" 2>&1)"; rc_fetchfail=$?
+    if (( rc_fetchfail != 0 )); then
+        ok "graceful with failed internal fetch: stop reports non-zero exit"
+    else
+        no "graceful with failed internal fetch: stop reports non-zero exit" "exited 0: $out_fetchfail"
+    fi
+    not_contains "graceful with failed internal fetch: does not claim a clean graceful stop" \
+        "stopped gracefully" "$out_fetchfail"
+else
+    no "graceful with failed internal fetch: stop reports non-zero exit" "fake runner never wrote a pid file"
+    no "graceful with failed internal fetch: does not claim a clean graceful stop" "fake runner never wrote a pid file"
+fi
+wait "$fetchfail_job" 2>/dev/null || true
+
+# -- runner exited without completing its own teardown, e.g. killed
+# externally while this verb was waiting (not by anything this verb did):
+# nothing of its own teardown can be trusted, so this must not read as a
+# clean "stopped gracefully" with the run left open forever. A fake runner
+# that ignores TERM (so it never reaches its own exit-code write on its
+# own) is SIGKILLed by this test shortly after stop's own TERM lands, well
+# inside a generous --timeout. The forced completion must still run --
+# fetch, exit-code 143, ledger record -- and promptly, not only once the
+# full timeout window elapses.
+extkill_origin="$(new_project)"; tmpdirs+=("$extkill_origin")
+extkill_base_sha="$(cd "$extkill_origin" && git rev-parse HEAD)"
+extkill_clone="$(mktemp -d /var/tmp/claude-scratch/fs-stop-extkill-clone.XXXXXX)"
+tmpdirs+=("$extkill_clone")
+(
+    cd "$extkill_origin" && git clone -q . "$extkill_clone" \
+        && cd "$extkill_clone" \
+        && git checkout -q -b fs-stop-extkill \
+        && git config user.email t@fork-sandbox.invalid \
+        && git config user.name Tester \
+        && printf 'work\n' > extkill-work.txt \
+        && git add extkill-work.txt \
+        && git commit -q -m 'in-flight work'
+) >/dev/null 2>&1
+rd_extkill="$(new_run_dir)"
+cat > "$rd_extkill/run.env" <<EOF
+version=1
+branch=fs-stop-extkill
+origin_repo=$extkill_origin
+clone_dir=$extkill_clone
+base_sha=$extkill_base_sha
+session=cc-sbx-fs-stop-extkill-does-not-exist
+EOF
+RUN_DIR="$rd_extkill" setsid --fork "$fake_runner_ignores_term" \
+    < /dev/null > "$rd_extkill/fake-runner.log" 2>&1 &
+extkill_job=$!
+if wait_for_file "$rd_extkill/pid"; then
+    extkill_pid="$(cat "$rd_extkill/pid")"
+    start_ts_extkill="$(date +%s)"
+    ( sleep 1; kill -KILL "$extkill_pid" 2>/dev/null || true ) &
+    killer_job=$!
+    out_extkill="$(timeout 20 "$stop" --timeout 15 "$rd_extkill" 2>&1)"; rc_extkill=$?
+    elapsed_extkill=$(( $(date +%s) - start_ts_extkill ))
+    wait "$killer_job" 2>/dev/null || true
+    check "external kill mid-wait: stop exits 0 (completed host-side)" "0" "$rc_extkill"
+    check "external kill mid-wait: exit-code 143 written" "143" "$(cat "$rd_extkill/exit-code" 2>/dev/null)"
+    not_contains "external kill mid-wait: does not falsely claim a clean graceful stop" \
+        "stopped gracefully" "$out_extkill"
+    check "external kill mid-wait: branch fetched back with its commit" \
+        "1" "$(cd "$extkill_origin" && git rev-list --count "$extkill_base_sha..fs-stop-extkill" 2>/dev/null)"
+    check "external kill mid-wait: run-log end_reason recorded" \
+        "stop-timeout" "$(run_log_show "$rd_extkill" | jq -r '.end_reason // empty')"
+    if (( elapsed_extkill < 10 )); then
+        ok "external kill mid-wait: noticed the death promptly, not only at the full timeout"
+    else
+        no "external kill mid-wait: noticed the death promptly, not only at the full timeout" \
+            "took ${elapsed_extkill}s against a 15s timeout"
+    fi
+else
+    no "external kill mid-wait: stop exits 0 (completed host-side)" "fake runner never wrote a pid file"
+    no "external kill mid-wait: exit-code 143 written" "fake runner never wrote a pid file"
+    no "external kill mid-wait: does not falsely claim a clean graceful stop" "fake runner never wrote a pid file"
+    no "external kill mid-wait: branch fetched back with its commit" "fake runner never wrote a pid file"
+    no "external kill mid-wait: run-log end_reason recorded" "fake runner never wrote a pid file"
+    no "external kill mid-wait: noticed the death promptly, not only at the full timeout" \
+        "fake runner never wrote a pid file"
+fi
+wait "$extkill_job" 2>/dev/null || true
 
 # -- timeout fallback: the fake runner ignores TERM entirely, so the
 # graceful wait must expire and the stop verb must fall back to the
@@ -592,13 +811,24 @@ while :; do sleep 0.2; done
 EOF
 chmod +x "$fake_runner_with_child"
 
+# A real origin+clone: the graceful report now confirms the fetched-back
+# state itself, which a nonexistent origin/clone would fail.
+group_origin="$(new_project)"; tmpdirs+=("$group_origin")
+group_base_sha="$(cd "$group_origin" && git rev-parse HEAD)"
+group_clone="$(mktemp -d /var/tmp/claude-scratch/fs-stop-group-clone.XXXXXX)"
+tmpdirs+=("$group_clone")
+(
+    cd "$group_origin" && git clone -q . "$group_clone" \
+        && cd "$group_clone" && git checkout -q -b fs-stop-group
+) >/dev/null 2>&1
+
 rd_group="$(new_run_dir)"
 cat > "$rd_group/run.env" <<EOF
 version=1
 branch=fs-stop-group
-origin_repo=/tmp/nonexistent-origin
-clone_dir=/tmp/nonexistent-clone
-base_sha=0000000000000000000000000000000000000000
+origin_repo=$group_origin
+clone_dir=$group_clone
+base_sha=$group_base_sha
 session=cc-sbx-fs-stop-group-does-not-exist
 EOF
 RUN_DIR="$rd_group" setsid --fork "$fake_runner_with_child" \
@@ -643,13 +873,23 @@ wait
 EOF
 chmod +x "$leader_wrapper"
 
+# A real origin+clone, same reason as the group-signal fixture above.
+leader_origin="$(new_project)"; tmpdirs+=("$leader_origin")
+leader_base_sha="$(cd "$leader_origin" && git rev-parse HEAD)"
+leader_clone="$(mktemp -d /var/tmp/claude-scratch/fs-stop-leader-clone.XXXXXX)"
+tmpdirs+=("$leader_clone")
+(
+    cd "$leader_origin" && git clone -q . "$leader_clone" \
+        && cd "$leader_clone" && git checkout -q -b fs-stop-leader
+) >/dev/null 2>&1
+
 rd_leader="$(new_run_dir)"
 cat > "$rd_leader/run.env" <<EOF
 version=1
 branch=fs-stop-leader
-origin_repo=/tmp/nonexistent-origin
-clone_dir=/tmp/nonexistent-clone
-base_sha=0000000000000000000000000000000000000000
+origin_repo=$leader_origin
+clone_dir=$leader_clone
+base_sha=$leader_base_sha
 session=cc-sbx-fs-stop-leader-does-not-exist
 EOF
 sibling_pid_file="$(mktemp)"; tmpdirs+=("$sibling_pid_file")
@@ -702,31 +942,55 @@ wait "$leader_job" 2>/dev/null || true
 # fake runner with a short --timeout so the FORCED path (the one that
 # calls tmux kill-session) actually runs -- the graceful path never
 # touches tmux.
+#
+# This test creates and kills real tmux sessions, so -- unlike the rest of
+# this suite, which only ever names sessions that do not exist -- it must
+# run on a dedicated, throwaway server (-L), never the caller's own
+# default one, exactly the convention
+# fork-sandbox-clone-dir-lock-lifetime-test.sh's header states and this
+# suite did not previously follow here. A PATH-shimmed tmux (real tmux
+# with -L inserted first) makes both this script's own tmux calls and the
+# stop verb's land on that socket. Skips cleanly, not just on tmux being
+# absent but also if the dedicated server itself cannot be started, so an
+# environment that cannot run tmux at all is never misreported as the verb
+# failing (do not silently pass either way).
 if ! command -v tmux >/dev/null 2>&1; then
     printf '  SKIP  exact-match tmux kill-session: tmux not installed\n'
 else
+    real_tmux="$(command -v tmux)"
+    tmux_socket="fs-stop-exact-$$"
+    tmux_stub_bin="$(mktemp -d /var/tmp/claude-scratch/fs-stop-tmux-stub.XXXXXX)"
+    tmpdirs+=("$tmux_stub_bin")
+    cat > "$tmux_stub_bin/tmux" <<STUB
+#!/usr/bin/env bash
+exec "$real_tmux" -L "$tmux_socket" "\$@"
+STUB
+    chmod +x "$tmux_stub_bin/tmux"
+
     tmux_a="cc-sbx-fs-stop-exact"
     tmux_b="cc-sbx-fs-stop-exact-2"
     # Only the suffixed session is ever actually created; $tmux_a is a
     # prefix of it and never exists under its own exact name.
-    tmux new-session -d -s "$tmux_b" 'sleep 300' 2>/dev/null
+    if ! PATH="$tmux_stub_bin:$PATH" tmux new-session -d -s "$tmux_b" 'sleep 300' 2>/dev/null; then
+        printf '  SKIP  exact-match tmux kill-session: could not start a dedicated tmux server\n'
+        tmux_socket=""
+    else
+        exact_origin="$(new_project)"; tmpdirs+=("$exact_origin")
+        exact_base_sha="$(cd "$exact_origin" && git rev-parse HEAD)"
+        exact_clone="$(mktemp -d /var/tmp/claude-scratch/fs-stop-exact-clone.XXXXXX)"
+        tmpdirs+=("$exact_clone")
+        (
+            cd "$exact_origin" && git clone -q . "$exact_clone" \
+                && cd "$exact_clone" && git checkout -q -b fs-stop-exact \
+                && git config user.email t@fork-sandbox.invalid \
+                && git config user.name Tester \
+                && printf 'work\n' > exact-work.txt \
+                && git add exact-work.txt \
+                && git commit -q -m 'exact-match fixture work'
+        ) >/dev/null 2>&1
 
-    exact_origin="$(new_project)"; tmpdirs+=("$exact_origin")
-    exact_base_sha="$(cd "$exact_origin" && git rev-parse HEAD)"
-    exact_clone="$(mktemp -d /var/tmp/claude-scratch/fs-stop-exact-clone.XXXXXX)"
-    tmpdirs+=("$exact_clone")
-    (
-        cd "$exact_origin" && git clone -q . "$exact_clone" \
-            && cd "$exact_clone" && git checkout -q -b fs-stop-exact \
-            && git config user.email t@fork-sandbox.invalid \
-            && git config user.name Tester \
-            && printf 'work\n' > exact-work.txt \
-            && git add exact-work.txt \
-            && git commit -q -m 'exact-match fixture work'
-    ) >/dev/null 2>&1
-
-    rd_exact="$(new_run_dir)"
-    cat > "$rd_exact/run.env" <<EOF
+        rd_exact="$(new_run_dir)"
+        cat > "$rd_exact/run.env" <<EOF
 version=1
 branch=fs-stop-exact
 origin_repo=$exact_origin
@@ -734,31 +998,33 @@ clone_dir=$exact_clone
 base_sha=$exact_base_sha
 session=$tmux_a
 EOF
-    RUN_DIR="$rd_exact" setsid --fork "$fake_runner_ignores_term" \
-        < /dev/null > "$rd_exact/fake-runner.log" 2>&1 &
-    exact_job=$!
-    if wait_for_file "$rd_exact/pid"; then
-        timeout 20 "$stop" --timeout 2 "$rd_exact" >/dev/null 2>&1; rc_exact=$?
-        check "exact-match tmux: stop exits 0" "0" "$rc_exact"
-        # $tmux_a never existed under its own exact name -- the only
-        # correct outcome is that kill-session finds nothing and the
-        # real, differently-named session is left untouched. A bare (no
-        # '=') kill-session would prefix-match it and kill it instead.
-        if tmux has-session -t "=$tmux_b" 2>/dev/null; then
-            ok "exact-match tmux: the real, differently-named session survives"
+        RUN_DIR="$rd_exact" setsid --fork "$fake_runner_ignores_term" \
+            < /dev/null > "$rd_exact/fake-runner.log" 2>&1 &
+        exact_job=$!
+        if wait_for_file "$rd_exact/pid"; then
+            PATH="$tmux_stub_bin:$PATH" timeout 20 "$stop" --timeout 2 "$rd_exact" \
+                >/dev/null 2>&1; rc_exact=$?
+            check "exact-match tmux: stop exits 0" "0" "$rc_exact"
+            # $tmux_a never existed under its own exact name -- the only
+            # correct outcome is that kill-session finds nothing and the
+            # real, differently-named session is left untouched. A bare (no
+            # '=') kill-session would prefix-match it and kill it instead.
+            if PATH="$tmux_stub_bin:$PATH" tmux has-session -t "=$tmux_b" 2>/dev/null; then
+                ok "exact-match tmux: the real, differently-named session survives"
+            else
+                no "exact-match tmux: the real, differently-named session survives" \
+                    "$tmux_b was killed by a prefix match on the nonexistent '$tmux_a'"
+            fi
+            fake_pid_exact="$(cat "$rd_exact/pid" 2>/dev/null)"
+            [[ -n "$fake_pid_exact" ]] && kill -9 "$fake_pid_exact" 2>/dev/null || true
         else
-            no "exact-match tmux: the real, differently-named session survives" \
-                "$tmux_b was killed by a prefix match on the nonexistent '$tmux_a'"
+            no "exact-match tmux: stop exits 0" "fake runner never wrote a pid file"
+            no "exact-match tmux: the real, differently-named session survives" "fake runner never wrote a pid file"
         fi
-        fake_pid_exact="$(cat "$rd_exact/pid" 2>/dev/null)"
-        [[ -n "$fake_pid_exact" ]] && kill -9 "$fake_pid_exact" 2>/dev/null || true
-    else
-        no "exact-match tmux: stop exits 0" "fake runner never wrote a pid file"
-        no "exact-match tmux: the real, differently-named session survives" "fake runner never wrote a pid file"
+        wait "$exact_job" 2>/dev/null || true
+        "$real_tmux" -L "$tmux_socket" kill-server >/dev/null 2>&1 || true
+        tmux_socket=""
     fi
-    wait "$exact_job" 2>/dev/null || true
-    tmux kill-session -t "=$tmux_a" 2>/dev/null || true
-    tmux kill-session -t "=$tmux_b" 2>/dev/null || true
 fi
 
 # -- branch-removal path with a real origin+clone (zero commits removed).
