@@ -133,6 +133,60 @@ postmaster uses this to stamp `X-AI-Persona`/`X-AI-Harness`/`X-AI-Model`/
 stream" in the postmaster section); the `--text` render view shows it as
 a bracketed suffix on `From`.
 
+### The header contract
+
+A foreign reader of the store — code in another repo, walking the thread
+tree directly — has no sample to infer header semantics from. This
+section is what to map against. The rule comes first because it is what
+makes the rest of this section trustworthy over time: **additions are
+allowed; silent semantic changes to an existing header are not.** The
+store accepts arbitrary `X-*` headers on any message (except the ones it
+owns itself), so the mere *presence* of a header carries no authority by
+itself — authority is per-header, and this is where each header's
+authority is written down.
+
+- **RFC 5322 core** — `Message-ID`, `Thread-ID`, `Date`, `From`, `To`,
+  `Cc`, `Subject`, `In-Reply-To`, `References`: store-written, always
+  present (`Cc` is the one optional field, omitted entirely when empty).
+- **`X-Hops`**: store-written. Default 8 on a new thread; copied
+  **verbatim** from the parent on reply — decrementing is the
+  postmaster's job, not the store's (see above). Always present.
+- **`X-Attachment`**: store-owned; `--header` refuses to set it directly.
+- **`X-AI-Persona` / `X-AI-Harness` / `X-AI-Model` / `X-AI-Network`**:
+  postmaster-stamped on every harvested reply. ABSENT means the message
+  was not a harvested AI reply — an operator message or external mail.
+  Absence here is attribution information, not an error.
+- **`X-Depth`**: an ecosystem header, stamped by lkml-review tooling —
+  never by this store or its postmaster. ABSENT means UNKNOWN, not zero
+  and not any other number. A reader must never default an absent
+  numeric header to a value that can satisfy a threshold: the defect that
+  motivated writing this contract down mapped a missing `X-Depth` to
+  `-1`, which happened to satisfy a `depth <= 1` posting rule, and the
+  tooling emitted confident, wrong convergence numbers on the strength of
+  a header that was never there.
+- **`X-Seats`**: the value preserves first-seen expansion order, and that
+  order carries no meaning. The example line below is expansion order
+  (from `--seats @panel,@ci` where `panel` expands to `core,docs,tests`)
+  — deliberately not alphabetical, so a real header diffs clean against
+  this doc.
+
+  ```
+  X-Seats: @core, @docs, @tests, @ci
+  ```
+
+  - Cover/thread-root only. A reply carrying X-Seats is noise; ignore it.
+  - A v2/v3 cover is a reply posted by the author seat and carries no
+    X-Seats authority.
+  - Value is the store's canonical address-list format: @-prefixed,
+    ", "-joined, as mail_validate_addr_list normalizes To:/Cc:.
+  - Fully-expanded seats only. A list address in the value is a contract
+    violation; a reader must never expand.
+  - ABSENT: the seated panel is unverifiable. A reader must not emit a
+    positive/converged verdict. Blocking verdicts are unaffected — those
+    are claims someone actually made. No fallback to To:/Cc: derivation.
+  - Trust: a verdict is exactly as trustworthy as the thread root's
+    author. Anchored, not self-certifying.
+
 ### Addresses
 
 Every address matches `^@[a-z0-9][a-z0-9-]*$` — lowercase alphanumeric
@@ -717,8 +771,8 @@ codex and pi, per `fs_harness_session_caps` (`fork-sandbox-lib.sh`). A
 own `--session-dir`/`--session-id` wiring (see its header) that binds the
 same durable store the flags below name, so a sealed seat resumes exactly
 like a non-sealed one. This is a continuity and cost optimization and
-**never** a correctness requirement — the full thread is in every prompt
-regardless.
+**never** a correctness requirement — the full thread is readable from
+every wake regardless, trigger-only prompt plus the `/thread` mount.
 
 It works through three `fork-sandbox.sh` flags:
 
