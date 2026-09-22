@@ -312,16 +312,26 @@ else
         || die "could not signal the runner ($pid)"
 fi
 
+# Wait for the runner PROCESS to exit, not for exit-code to appear: the
+# runner writes exit-code strictly before its own fetch-back (see
+# fork-sandbox.sh's teardown), so breaking on the file's mere existence can
+# report "stopped gracefully" before the branch is actually back in the
+# origin repo. The process only exits once its full teardown -- fetch-back
+# included -- has completed.
 waited=0
 while (( waited < timeout_secs )); do
-    [[ -e "$exit_code_file" && ! -L "$exit_code_file" ]] && break
+    kill -0 "$pid" 2>/dev/null || break
     sleep 1
     waited=$(( waited + 1 ))
 done
 
-if [[ -e "$exit_code_file" && ! -L "$exit_code_file" ]]; then
-    rc="$(tr -dc '0-9-' < "$exit_code_file")"
-    printf 'stopped gracefully (exit %s) after %ss.\n' "$rc" "$waited"
+if ! kill -0 "$pid" 2>/dev/null; then
+    if [[ -e "$exit_code_file" && ! -L "$exit_code_file" ]]; then
+        rc="$(tr -dc '0-9-' < "$exit_code_file")"
+        printf 'stopped gracefully (exit %s) after %ss.\n' "$rc" "$waited"
+    else
+        printf 'stopped gracefully after %ss (runner exited without an exit-code file).\n' "$waited"
+    fi
     exit 0
 fi
 
