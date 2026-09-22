@@ -155,10 +155,16 @@ authority is written down.
   **verbatim** from the parent on reply — decrementing is the
   postmaster's job, not the store's (see above). Always present.
 - **`X-Attachment`**: store-owned; `--header` refuses to set it directly.
-- **`X-AI-Persona` / `X-AI-Harness` / `X-AI-Model` / `X-AI-Network`**:
-  postmaster-stamped on every harvested reply. ABSENT means the message
-  was not a harvested AI reply — an operator message or external mail.
-  Absence here is attribution information, not an error.
+- **`X-AI-Persona`**: postmaster-stamped on every harvested reply. ABSENT
+  means the message was not a harvested reply — an operator message or
+  external mail. Absence here is attribution information, not an error;
+  this is the one X-AI-* header whose absence means "not harvested".
+- **`X-AI-Harness` / `X-AI-Model` / `X-AI-Network`**: postmaster-stamped on
+  a harvested reply too, but only when the seat's value is known
+  (non-empty). ABSENT means UNKNOWN, not "not harvested": a handler seat
+  has no harness, model or network at all, and an LLM seat with no
+  configured model omits `X-AI-Model` while still carrying `X-AI-Persona`.
+  Never read the absence of these three as a message-type discriminator.
 - **`X-Depth`**: an ecosystem header, stamped by lkml-review tooling —
   never by this store or its postmaster. ABSENT means UNKNOWN, not zero
   and not any other number. A reader must never default an absent

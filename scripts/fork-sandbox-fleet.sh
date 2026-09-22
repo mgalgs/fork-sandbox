@@ -556,7 +556,15 @@ cmd_expand() {
             return 1
         fi
     done
-    printf '%s\n' "${result[@]:-}"
+    # Print nothing when result is empty -- the @operator sink's
+    # zero-candidate case -- rather than the single blank line
+    # "${result[@]:-}" emits for an empty array. "succeeds with zero
+    # output" is the contract item 47's kickoff tooling keys on, so a
+    # caller doing `mapfile -t seats < <(fleet expand ...)` must get an
+    # empty array, not a one-element array holding an empty name.
+    if (( ${#result[@]} )); then
+        printf '%s\n' "${result[@]}"
+    fi
 }
 
 cmd_roster() {

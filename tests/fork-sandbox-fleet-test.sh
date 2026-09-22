@@ -849,6 +849,13 @@ check "expand: @all composes inside a longer address list and dedupes" \
 exp_operator_out="$("$fleet" expand @operator)"; exp_operator_rc=$?
 check "expand: @operator exits 0" "0" "$exp_operator_rc"
 check "expand: @operator prints nothing" "" "$exp_operator_out"
+# Byte-exact, because the check above compares through a command
+# substitution that strips the trailing newline, so it cannot tell zero
+# bytes from a single blank line. "succeeds with zero output" is the
+# contract item 47's kickoff tooling keys on: a caller mapfile'ing the
+# output must get an empty array, not a one-element array of "".
+exp_operator_bytes="$("$fleet" expand @operator | wc -c | tr -d ' ')"
+check "expand: @operator emits zero bytes, not a blank line" "0" "$exp_operator_bytes"
 
 exp_all_operator="$("$fleet" expand @all,@operator)"
 check "expand: @all,@operator is identical to plain @all" \

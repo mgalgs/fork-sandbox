@@ -110,8 +110,9 @@
 #
 #   A debounce gate runs before rule 0 is ever evaluated: M is skipped
 #   entirely (return, no side effect, no rule below applied) while its
-#   thread is not yet quiescent -- see pm_process_message and
-#   $FORK_SANDBOX_POSTMASTER_DEBOUNCE below.
+#   thread is not yet quiescent -- see pm_process_message.
+#   $FORK_SANDBOX_POSTMASTER_DEBOUNCE sets the quiet window in seconds
+#   (default 30; 0 disables the gate).
 #
 #   0. Expand M's To via fleet expand, one address at a time (an unknown
 #      address anywhere else in the same To: would otherwise fail the
