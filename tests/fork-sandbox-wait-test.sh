@@ -294,6 +294,96 @@ else
 fi
 
 # =====================================================================
+printf '\n== timeout race: exit-code already written, --wait-timeout still reports 124 ==\n'
+# =====================================================================
+# fork-sandbox-lib.sh resolves $FS_TIMEOUT by PATH lookup (gtimeout first,
+# then timeout, accepting only a build whose --version says "GNU
+# coreutils"), so a shim placed ahead of the real timeout on PATH is
+# picked up exactly the way a real gtimeout would be. This one answers
+# --version like GNU coreutils, passes everything through to the real
+# /usr/bin/timeout EXCEPT the one invocation this suite cares about --
+# wrapping fork-sandbox-status.sh --monitor-terminal -- where it ignores
+# the requested duration and fires 124 itself the instant the run dir's
+# exit-code file appears. That reproduces, deterministically, the narrow
+# window between the runner writing exit-code and it fetching the branch
+# back (fork-sandbox-status.sh's own done|failed branch blocks up to
+# 120s on summary.txt precisely because of that gap) without needing a
+# test-only delay hook in the runner: real elapsed-time timing cannot
+# reliably land inside a gap that narrow, but racing against the file's
+# appearance can. Regression coverage for the fall-through commit
+# 93dfb3a61b removed: --wait must report the timeout unconditionally,
+# never fall through to exit-code's own (possibly stale) value.
+wait_shim_bin="$(mktemp -d /var/tmp/claude-scratch/fs-wait-shim.XXXXXX)"
+tmpdirs+=("$wait_shim_bin")
+cat > "$wait_shim_bin/timeout" <<'SHIM'
+#!/usr/bin/env bash
+set -uo pipefail
+if [[ "${1:-}" == "--version" ]]; then
+    printf 'timeout (GNU coreutils) 9.0\n'
+    exit 0
+fi
+orig=("$@")
+[[ "${1:-}" == "--foreground" ]] && shift
+secs="${1:-0}"
+shift || true
+case " $* " in
+    *' --monitor-terminal '*)
+        args=("$@")
+        run_dir="${args[-1]}"
+        "$@" &
+        child=$!
+        max_iters=$(( secs * 50 ))
+        i=0
+        while kill -0 "$child" 2>/dev/null; do
+            if [[ -e "$run_dir/exit-code" ]]; then
+                kill -9 "$child" 2>/dev/null
+                wait "$child" 2>/dev/null
+                exit 124
+            fi
+            i=$(( i + 1 ))
+            if (( i >= max_iters )); then
+                kill -9 "$child" 2>/dev/null
+                wait "$child" 2>/dev/null
+                exit 124
+            fi
+            sleep 0.02
+        done
+        wait "$child"
+        exit $?
+        ;;
+    *)
+        exec /usr/bin/timeout "${orig[@]}"
+        ;;
+esac
+SHIM
+chmod +x "$wait_shim_bin/timeout"
+
+out_race="$(mktemp)"; tmpdirs+=("$out_race")
+HOME="$launcher_home" PATH="$wait_shim_bin:$stub_bin:$PATH" \
+    FAKE_SLEEP_SECONDS=0 FAKE_EXIT_CODE=0 \
+    /usr/bin/timeout 60 "$launcher" --harness claude --wait --wait-timeout 30 \
+    "$proj" "$handoff" > "$out_race" 2>&1
+rc_race=$?
+rd_race="$(run_dir_from_output "$out_race")"
+if [[ -n "$rd_race" ]]; then
+    tmpdirs+=("$rd_race")
+    owned_run_dirs+=("$rd_race")
+    check "timeout race: --wait-timeout still exits 124, not the run's own code" \
+        "124" "$rc_race"
+    contains "timeout race: names the timeout in its output" "timed out" "$(cat "$out_race")"
+    check "timeout race: exit-code file really was already there" \
+        "1" "$([[ -e "$rd_race/exit-code" ]] && echo 1 || echo 0)"
+    HOME="$launcher_home" "$repo_dir/scripts/fork-sandbox-stop.sh" "$rd_race" >/dev/null 2>&1 || true
+    branch_race="$(sed -n 's/^branch=//p' "$rd_race/run.env" 2>/dev/null | head -1)"
+    [[ -n "$branch_race" ]] && (cd "$proj" && git branch -q -D "$branch_race" >/dev/null 2>&1) || true
+else
+    no "timeout race: --wait-timeout still exits 124, not the run's own code" \
+        "no run dir ever appeared: $(cat "$out_race")"
+    no "timeout race: names the timeout in its output" "no run dir"
+    no "timeout race: exit-code file really was already there" "no run dir"
+fi
+
+# =====================================================================
 printf '\n== refusals (no real launch needed) ==\n'
 # =====================================================================
 
