@@ -110,8 +110,13 @@
 #                  `@agent` passes through unchanged, and the reserved
 #                  `@all` becomes every agent in the fleet (fleet.yaml
 #                  agents plus bare <name>.md personas, the same set
-#                  `roster` walks). Output is deduped by first-seen
-#                  position, one address per line.
+#                  `roster` walks). The reserved `@operator` succeeds
+#                  with zero output -- it is a real address for routing
+#                  purposes with no wake candidates behind it, so a
+#                  caller can tell that sink apart from a typo'd name,
+#                  which still exits 1 (see docs/agent-mail.md, Routing
+#                  rules). Output is deduped by first-seen position, one
+#                  address per line.
 #   roster         Human-readable summary: every agent with its resolved
 #                  seat, every list with its members. A handler seat
 #                  prints in a distinct `handler=exec command=<name>
@@ -526,10 +531,10 @@ cmd_expand() {
             # @operator is a real address for routing purposes with ZERO
             # wake candidates behind it -- succeeding with no output,
             # never resolving to anything expandable, IS the safety
-            # property (see docs/agent-mail.md, "the header contract" /
-            # routing rules). Do not "fix" this into resolving to
-            # something: every patch message on every thread would
-            # convert to paid wakes with no error anywhere.
+            # property (see docs/agent-mail.md, "Routing rules"). Do not
+            # "fix" this into resolving to something: every patch message
+            # on every thread would convert to paid wakes with no error
+            # anywhere.
             :
         elif fleet_is_list "$dump" "$name"; then
             while IFS= read -r m; do

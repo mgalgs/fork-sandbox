@@ -146,8 +146,11 @@ itself — authority is per-header, and this is where each header's
 authority is written down.
 
 - **RFC 5322 core** — `Message-ID`, `Thread-ID`, `Date`, `From`, `To`,
-  `Cc`, `Subject`, `In-Reply-To`, `References`: store-written, always
-  present (`Cc` is the one optional field, omitted entirely when empty).
+  `Subject`: store-written, always present on every message. `Cc` is
+  store-written but present only when non-empty, omitted entirely
+  otherwise. `In-Reply-To` and `References` are store-written but
+  present only on replies — a thread root has no parent to reference, so
+  both are absent on it (see "Message format" above).
 - **`X-Hops`**: store-written. Default 8 on a new thread; copied
   **verbatim** from the parent on reply — decrementing is the
   postmaster's job, not the store's (see above). Always present.

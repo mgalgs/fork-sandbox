@@ -757,8 +757,8 @@ check "@operator in To: does not clobber a real flag reason" \
 # ============================================================
 printf '\n== @operator sink: zero wake candidates, never unresolvable ==\n'
 # ============================================================
-# fleet expand's @operator sink (see docs/agent-mail.md, "the header
-# contract") succeeds for @operator with zero candidates -- so it wakes
+# fleet expand's @operator sink (see docs/agent-mail.md, "Routing
+# rules") succeeds for @operator with zero candidates -- so it wakes
 # nobody by itself, composes with a real seat address without changing
 # that seat's wake, and never lands in a route-dead event or an
 # unresolvable flag, since it was never unresolved to begin with.
