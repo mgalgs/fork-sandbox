@@ -273,6 +273,7 @@ SUMMARY_FIELDS = [
     "duration_seconds",
     "claude_credentials_source",
     "claude_credentials_via",
+    "end_reason",
 ]
 
 

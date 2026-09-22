@@ -7148,6 +7148,16 @@ started_at="$(date +%s)"
 # report display and summary provenance cannot drift between processes.
 source "$script_dir/fork-sandbox-lib.sh"
 
+# fork-sandbox-stop.sh's graceful path signals this runner's whole process
+# GROUP with TERM (a bash trap does not fire while a foreground child is
+# running, so the leg's own child gets the signal directly and dies first).
+# The trap only records that a stop was requested -- no work runs inside a
+# trap -- and every loop below that could start another leg checks the flag
+# once its current leg returns, so control falls through to the ordinary
+# teardown near the end of this file instead of starting anything new.
+stop_requested=0
+trap 'stop_requested=1' TERM
+
 # The launcher held this same workspace's lock while it set up the clone and
 # provisioned it, but released it just before starting this runner (see the
 # release beside where this file was generated). From here the lock's
@@ -8020,6 +8030,10 @@ refresh_build_prompt() {
 
 if [[ "$refresh_enabled" == "1" ]]; then
     while :; do
+        if [[ "${stop_requested:-0}" == 1 ]]; then
+            refresh_ended="stop-requested"
+            break
+        fi
         if [[ -f "$outbox_dir/handoff.md" ]]; then
             if (( refresh_leg_n >= refresh_max )); then
                 refresh_ended="cap"
@@ -8577,7 +8591,7 @@ cur_has_review=0
 for ((cur_scan = 1; cur_scan <= run_step_count; cur_scan++)); do
     [[ "${run_step_kind[$cur_scan]}" == review ]] && { cur_has_review=1; break; }
 done
-for ((cur_step_no = 1; cur_step_no <= run_step_count; cur_step_no++)); do
+for ((cur_step_no = 1; cur_step_no <= run_step_count && stop_requested != 1; cur_step_no++)); do
     cur_kind="${run_step_kind[$cur_step_no]}"
     cur_step_idx="${run_step_idx[$cur_step_no]}"
     cur_cap="${run_step_cap[$cur_step_no]}"
@@ -8613,7 +8627,7 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count; cur_step_no++)); do
     if [[ "$cur_kind" == code ]]; then
         cur_pass=1
         if (( cur_step_no == cur_first_code && cur_first_code_ran )); then cur_pass=2; fi
-        for ((; cur_pass <= cur_cap && rc == 0; cur_pass++)); do
+        for ((; cur_pass <= cur_cap && rc == 0 && stop_requested != 1; cur_pass++)); do
             run_leg code "$cur_pass" "$handoff" "$cur_step_idx"
             rc="$leg_rc"
         done
@@ -8685,7 +8699,8 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count; cur_step_no++)); do
         cur_iters="$cur_iters_before_live"
     }
     for ((cur_i = 1; cur_i <= cur_cap; cur_i++)); do
-        [[ -z "$cur_ended" ]] || break
+        if [[ -n "$cur_ended" ]]; then break; fi
+        if [[ "${stop_requested:-0}" == 1 ]]; then cur_ended=stop-requested; break; fi
         rm -f "$cur_verdict_file"
         if [[ "$cur_legacy" == 1 ]]; then
             if [[ "$cur_kind" == maintainer ]]; then
@@ -8993,6 +9008,14 @@ done
 # writing it again costs nothing and keeps this the one place that ends a
 # loop run.
 printf '%s\n' "$rc" > "$run_dir/exit-code"
+
+# Absent (empty here becomes an absent key below) unless a stop request
+# actually reached one of the loop checks above -- "stopped" is the only
+# value this runner ever writes itself; fork-sandbox-stop.sh's own timeout
+# and salvage paths write "stop-timeout"/"salvaged" host-side, after this
+# process is gone or unreachable.
+end_reason=""
+[[ "${stop_requested:-0}" == 1 ]] && end_reason="stopped"
 
 # The session and every loop leg are done with the credential and the
 # services. Clean both up now rather than lean on the trap, which a
@@ -9551,6 +9574,7 @@ jq -n \
     --arg session_id "$session_id_json" \
     --arg claude_credentials_source "$claude_credentials_source" \
     --arg claude_credentials_via "$claude_credentials_via" \
+    --arg end_reason "${end_reason:-}" \
     '{
         version: $version,
         mode: $mode,
@@ -9600,7 +9624,12 @@ jq -n \
     + (if $claude_credentials_via == "" then {} else {
         claude_credentials_source: $claude_credentials_source,
         claude_credentials_via: $claude_credentials_via,
-    } end)' > "$run_dir/summary.json" 2>/dev/null \
+    } end)
+    # Absent, not null, on every normal run -- same convention as the pair
+    # above. fork-sandbox-status.sh treats presence as the signal that this
+    # run ended other than on its own.
+    + (if $end_reason == "" then {} else {end_reason: $end_reason} end)' \
+    > "$run_dir/summary.json" 2>/dev/null \
     || rm -f "$run_dir/summary.json"
 
 # Append this run to the durable run log (~/.claude/sandbox-runs.jsonl),

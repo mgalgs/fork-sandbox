@@ -426,5 +426,29 @@ contains "stats --by composition prints the shortname cell" "csonnet1-rsonnet2" 
 not_contains "stats --by composition does not print the raw canonical JSON" \
     '"action":"code"' "$out"
 
+printf '\n== record: end_reason is lifted from summary.json when present ==\n'
+rd_stopped="$(mk_run_dir end-reason-stopped)"
+tmpdirs+=("$rd_stopped")
+cat > "$rd_stopped/summary.json" <<'EOF'
+{"harness":"pi","network":"sealed","model":null,"branch":"fixture-branch","origin_repo":"/var/tmp/claude-scratch/forks/fixture-origin","base_sha":"0123456789abcdef0123456789abcdef01234567","exit_code":0,"commits":0,"cost_usd":0.0,"end_reason":"stopped","duration_seconds":0}
+EOF
+printf '0\n' > "$rd_stopped/exit-code"
+record "$rd_stopped" >/dev/null 2>"$tmp/err"
+out="$(query show "$(basename "$rd_stopped")")"
+contains "a stopped run's end_reason is recorded" '"end_reason": "stopped"' "$out"
+
+printf '\n== record: end_reason is absent from the run_end record on a normal run ==\n'
+rd_normal="$(mk_run_dir end-reason-absent)"
+tmpdirs+=("$rd_normal")
+cat > "$rd_normal/summary.json" <<'EOF'
+{"harness":"pi","network":"sealed","model":null,"branch":"fixture-branch","origin_repo":"/var/tmp/claude-scratch/forks/fixture-origin","base_sha":"0123456789abcdef0123456789abcdef01234567","exit_code":0,"commits":0,"cost_usd":0.0,"duration_seconds":0}
+EOF
+printf '0\n' > "$rd_normal/exit-code"
+record "$rd_normal" >/dev/null 2>"$tmp/err"
+not_contains "a normal run's raw run_end record carries no end_reason key at all" \
+    "end_reason" "$(grep -F "\"$(basename "$rd_normal")\"" "$log_file")"
+out="$(query show "$(basename "$rd_normal")")"
+not_contains "show prints no end_reason field for a normal run" "end_reason" "$out"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))
