@@ -26,11 +26,14 @@ fork-sandbox-k8s-platform-<name> --capabilities
 fork-sandbox-k8s-platform-<name> render-policy --namespace NS \
         --agent-label KEY=VAL --proxy-label KEY=VAL --proxy-port PORT \
         [--allow-namespace NS[:PORT]]...
+fork-sandbox-k8s-platform-<name> render-grant --namespace NS \
+        --name NAME --agent-label KEY=VAL [--label KEY=VAL]... \
+        --allow-namespace NS[:PORT] [--allow-namespace NS[:PORT]]...
 ```
 
-Two verbs. A platform that needs a third is a sign the contract is missing
-something, not a place to bolt one on quietly — raise it instead of growing
-this list ad hoc.
+Three verbs. A platform that needs a fourth is a sign the contract is
+missing something, not a place to bolt one on quietly — raise it instead of
+growing this list ad hoc.
 
 `--allow-namespace` was added to `render-policy` after the first
 implementation shipped. A plugin predating it hits its own unknown-option arm
@@ -44,6 +47,7 @@ shape and a valid port.
 |---|---|
 | `--capabilities` | Print `key=value` lines describing this platform. Exits 0. Renders nothing. |
 | `render-policy` | Print, to stdout, the NetworkPolicy-shaped YAML that seals the agent pod's egress on this platform's dialect. Exits 0. |
+| `render-grant` | Print, to stdout, ONE additional NetworkPolicy that widens a single run's egress to one or more namespaces, without touching the shared seal. Exits 0. Only offered by a platform that declares the `grant` capability key. |
 
 `render-policy`'s options:
 
@@ -62,6 +66,39 @@ proxy on the given label and port — plus whatever this platform's dialect can
 add to that (an ICMP denial, if the dialect supports one). It has no opinion
 about the proxy's own policy, which is ordinary and portable and lives as a
 static file in `manifests/k8s/` instead.
+
+### `render-grant`, the per-run widening verb
+
+Where `--allow-namespace` on `render-policy` widens the *shared* seal for
+every agent pod in the namespace, `render-grant` prints a *separate* object
+scoped to one run's pods only, so a launcher can widen a single run's egress
+without touching any other run sharing the namespace.
+
+| Option | Meaning |
+|---|---|
+| `--namespace NS` | The namespace the run's agent pod lives in. |
+| `--name NAME` | The rendered object's `metadata.name`. Caller-chosen, and NEVER `render-policy`'s fixed name — reusing that name would replace the shared seal instead of adding to it (see below). |
+| `--agent-label KEY=VAL` | The label the rendered policy's `podSelector` must match — scoped to this one run's pod(s), not every agent pod in the namespace. |
+| `--label KEY=VAL` | Repeatable, optional. Extra `metadata.labels` on the rendered object, so a caller's by-label delete (`kubectl delete networkpolicy -l ...`) reaches it too. |
+| `--allow-namespace NS[:PORT]` | Repeatable. At least one required. Identical syntax and rendering to `render-policy`'s option of the same name. |
+
+`render-grant`'s output has `policyTypes: [Egress]` only — no `Ingress`, and
+no `ingress:` key at all — because it is purely additive. NetworkPolicies
+are additive by construction: the shared seal (`render-policy`'s output,
+applied separately) already supplies the deny baseline and the DNS/proxy
+rules, so `render-grant` renders nothing but the requested
+`--allow-namespace` rules, using the exact same rule-rendering as
+`render-policy`'s own `--allow-namespace` tail (the two are implemented by
+one shared function so they cannot drift).
+
+**Never implement a per-run grant by calling `render-policy` with a per-run
+selector.** `render-policy` hardcodes `metadata.name:
+fork-sandbox-agent-egress`. Applying it with a narrower `podSelector` per run
+would *replace* the shared seal each time — the seal would then match only
+that one run's pod, leaving every other agent pod in the namespace with no
+egress policy at all, which Kubernetes reads as unrestricted egress. This is
+why `render-grant` is its own verb with its own object, not a `render-policy`
+variant.
 
 ### `--allow-namespace`, the one thing that widens the seal
 
@@ -130,7 +167,7 @@ Omit the port for a UDP or mixed-protocol service.
 fork-sandbox-k8s-platform-<name> --capabilities
 ```
 
-Prints `key=value` lines to stdout and exits 0, rendering nothing. Four keys
+Prints `key=value` lines to stdout and exits 0, rendering nothing. Five keys
 are defined for v1:
 
 | Key | Values | Meaning |
@@ -139,14 +176,16 @@ are defined for v1:
 | `icmp` | `filtered` \| `unfiltered` | Whether this dialect can restrict ICMP at all. |
 | `dns` | `filtered` \| `recursive` | Whether DNS egress is content-filtered. |
 | `runtimeclass` | a name, or `none` | A stronger isolation class this platform offers, if any. |
+| `grant` | `render-grant`, or absent | Whether this platform supports `render-grant`, the per-run widening verb. A missing key means unsupported — a caller wanting to grant a run extra namespaces must refuse before creating anything, naming the platform and the missing capability, rather than attempt a verb the platform never promised. |
 
 Unknown keys are ignored, so a newer platform may declare more than a given
 caller understands — the same forward-compatibility rule
 `sandbox-backend.md` uses for its own `--capabilities`. A missing key takes
 the conservative value: `unfiltered` for `icmp`, `recursive` for `dns`, `none`
-for `runtimeclass`. A platform that does not implement `--capabilities` at
-all — there should be none, since this contract requires it from the start —
-would be read the same way: entirely conservative.
+for `runtimeclass`, unsupported for `grant`. A platform that does not
+implement `--capabilities` at all — there should be none, since this
+contract requires it from the start — would be read the same way: entirely
+conservative.
 
 ## Why these keys are not decoration
 
@@ -178,6 +217,7 @@ policy=networkpolicy
 icmp=unfiltered
 dns=recursive
 runtimeclass=none
+grant=render-grant
 ```
 
 `icmp=unfiltered` is not a shortcut taken for v1's convenience; it is the

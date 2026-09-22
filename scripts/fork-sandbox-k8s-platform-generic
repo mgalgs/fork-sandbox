@@ -5,12 +5,18 @@
 #        fork-sandbox-k8s-platform-generic render-policy --namespace NS \
 #                --agent-label KEY=VAL --proxy-label KEY=VAL --proxy-port PORT \
 #                [--allow-namespace NS[:PORT]]...
+#        fork-sandbox-k8s-platform-generic render-grant --namespace NS \
+#                --name NAME --agent-label KEY=VAL [--label KEY=VAL]... \
+#                --allow-namespace NS[:PORT] [--allow-namespace NS[:PORT]]...
 #
-# Implements the contract in docs/k8s-platform.md: two verbs, nothing else.
+# Implements the contract in docs/k8s-platform.md: three verbs, nothing else.
 # --capabilities prints what this platform can do, to stdout, and touches
 # nothing. render-policy prints the NetworkPolicy YAML that seals the agent
-# pod's egress, to stdout, and touches nothing -- neither verb ever runs
-# kubectl or reaches a cluster. fork-sandbox-k8s.sh applies the result.
+# pod's egress, to stdout, and touches nothing. render-grant prints ONE
+# additional, additive NetworkPolicy that widens a single run's egress to
+# the given namespaces, named NAME rather than the seal's fixed name --
+# neither verb ever runs kubectl or reaches a cluster. fork-sandbox-k8s.sh
+# applies the result.
 #
 # This is the one platform v1 ships: plain Kubernetes NetworkPolicy, the
 # dialect Calico, Cilium, kube-router, Antrea and Weave all honour. It is
@@ -29,6 +35,10 @@
 #                          first becomes `filtered`.
 #   dns=recursive          DNS egress is not content-filtered here.
 #   runtimeclass=none      no stronger isolation class is offered.
+#   grant=render-grant     this platform supports render-grant, the verb
+#                          that widens one run's egress without touching
+#                          the shared seal. A platform that omits this key
+#                          does not support per-run grants at all.
 #
 # render-policy's output seals the agent pod to two destinations by default:
 # DNS in kube-system, and the proxy on the given label and port. It has no
@@ -82,39 +92,44 @@ policy=networkpolicy
 icmp=unfiltered
 dns=recursive
 runtimeclass=none
+grant=render-grant
 EOF
     exit 0
 fi
 
 verb="${1-}"
 if [[ -z "$verb" ]]; then
-    echo "Error: no verb given. Use --capabilities or render-policy." >&2
+    echo "Error: no verb given. Use --capabilities, render-policy or render-grant." >&2
     exit 1
 fi
 shift
 
 case "$verb" in
-render-policy)
+render-policy|render-grant)
     ;;
 *)
-    echo "Error: unknown verb '$verb'. Use --capabilities or render-policy." >&2
+    echo "Error: unknown verb '$verb'. Use --capabilities, render-policy or render-grant." >&2
     exit 1
     ;;
 esac
 
 namespace=""
+grant_name=""
 agent_label=""
 proxy_label=""
 proxy_port=""
+labels=()
 allow_ns=()
 allow_port=()
 
 while (( $# )); do
     case "$1" in
         --namespace) namespace="${2:?--namespace requires a name}"; shift 2 ;;
+        --name) grant_name="${2:?--name requires a name}"; shift 2 ;;
         --agent-label) agent_label="${2:?--agent-label requires KEY=VAL}"; shift 2 ;;
         --proxy-label) proxy_label="${2:?--proxy-label requires KEY=VAL}"; shift 2 ;;
         --proxy-port) proxy_port="${2:?--proxy-port requires a port number}"; shift 2 ;;
+        --label) labels+=("${2:?--label requires KEY=VAL}"); shift 2 ;;
         --allow-namespace)
             entry="${2:?--allow-namespace requires NS[:PORT]}"
             if [[ "$entry" == *:* ]]; then
@@ -161,19 +176,43 @@ while (( $# )); do
             allow_port+=("$port")
             shift 2
             ;;
-        *) echo "Error: unknown option '$1' for render-policy." >&2; exit 1 ;;
+        *) echo "Error: unknown option '$1' for $verb." >&2; exit 1 ;;
     esac
 done
 
-for required in namespace agent_label proxy_label proxy_port; do
+case "$verb" in
+render-policy)
+    required_opts=(namespace agent_label proxy_label proxy_port)
+    ;;
+render-grant)
+    required_opts=(namespace grant_name agent_label)
+    ;;
+esac
+
+for required in "${required_opts[@]}"; do
     if [[ -z "${!required}" ]]; then
-        echo "Error: render-policy requires --namespace, --agent-label," >&2
-        echo "--proxy-label and --proxy-port. Missing: --${required//_/-}." >&2
+        flag="--${required//_/-}"
+        [[ "$required" == grant_name ]] && flag="--name"
+        if [[ "$verb" == render-policy ]]; then
+            echo "Error: render-policy requires --namespace, --agent-label," >&2
+            echo "--proxy-label and --proxy-port. Missing: $flag." >&2
+        else
+            echo "Error: render-grant requires --namespace, --name," >&2
+            echo "--agent-label and at least one --allow-namespace." >&2
+            echo "Missing: $flag." >&2
+        fi
         exit 1
     fi
 done
 
-for pair_name in agent_label proxy_label; do
+if [[ "$verb" == render-grant && ${#allow_ns[@]} -eq 0 ]]; then
+    echo "Error: render-grant requires at least one --allow-namespace." >&2
+    exit 1
+fi
+
+pair_names=(agent_label)
+[[ "$verb" == render-policy ]] && pair_names+=(proxy_label)
+for pair_name in "${pair_names[@]}"; do
     pair="${!pair_name}"
     if [[ "$pair" != *=* || -z "${pair%%=*}" ]]; then
         echo "Error: --${pair_name//_/-} takes KEY=VAL, not '$pair'." >&2
@@ -181,7 +220,14 @@ for pair_name in agent_label proxy_label; do
     fi
 done
 
-if [[ ! "$proxy_port" =~ ^[0-9]+$ ]]; then
+for pair in "${labels[@]}"; do
+    if [[ "$pair" != *=* || -z "${pair%%=*}" ]]; then
+        echo "Error: --label takes KEY=VAL, not '$pair'." >&2
+        exit 1
+    fi
+done
+
+if [[ "$verb" == render-policy && ! "$proxy_port" =~ ^[0-9]+$ ]]; then
     echo "Error: --proxy-port takes a port number, not '$proxy_port'." >&2
     exit 1
 fi
@@ -191,11 +237,36 @@ agent_val="${agent_label#*=}"
 proxy_key="${proxy_label%%=*}"
 proxy_val="${proxy_label#*=}"
 
-# Default-deny is implicit: policyTypes names both Ingress and Egress, and
-# an empty ingress list denies all ingress. The agent pod needs none -- it
-# is never dialed into, only fetched from over kubectl exec, which does not
-# cross this policy at all.
-cat <<EOF
+# Shared by render-policy's --allow-namespace tail and render-grant's whole
+# egress list, so the two dialects of "widen egress to a namespace" cannot
+# drift apart. An empty port omits the `ports:` key entirely rather than
+# rendering an empty list -- NetworkPolicy reads a rule with no `ports:` key
+# as every port and protocol, whereas `ports: []` would match nothing.
+render_allow_ns_rules() {
+    local i
+    for (( i = 0; i < ${#allow_ns[@]}; i++ )); do
+        cat <<EOF
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ${allow_ns[$i]}
+EOF
+        if [[ -n "${allow_port[$i]}" ]]; then
+            cat <<EOF
+      ports:
+        - protocol: TCP
+          port: ${allow_port[$i]}
+EOF
+        fi
+    done
+}
+
+if [[ "$verb" == render-policy ]]; then
+    # Default-deny is implicit: policyTypes names both Ingress and Egress,
+    # and an empty ingress list denies all ingress. The agent pod needs
+    # none -- it is never dialed into, only fetched from over kubectl exec,
+    # which does not cross this policy at all.
+    cat <<EOF
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -231,24 +302,37 @@ spec:
         - protocol: TCP
           port: $proxy_port
 EOF
-
-# Appended after the two sealed rules above, so output stays byte-identical
-# to a no --allow-namespace run whenever none is passed. An empty port omits
-# the `ports:` key entirely rather than rendering an empty list --
-# NetworkPolicy reads a rule with no `ports:` key as every port and protocol,
-# whereas `ports: []` would match nothing.
-for (( i = 0; i < ${#allow_ns[@]}; i++ )); do
+    # Appended after the two sealed rules above, so output stays
+    # byte-identical to a no --allow-namespace run whenever none is passed.
+    render_allow_ns_rules
+else
+    # render-grant is purely additive: policyTypes names Egress only, with
+    # no ingress: key at all, so ingress stays ungoverned by this object and
+    # the shared seal (render-policy's output, applied separately) keeps
+    # doing that job. This object must never carry render-policy's fixed
+    # name -- it would replace the seal instead of adding to it.
     cat <<EOF
-    - to:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: ${allow_ns[$i]}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: $grant_name
+  namespace: $namespace
 EOF
-    if [[ -n "${allow_port[$i]}" ]]; then
-        cat <<EOF
-      ports:
-        - protocol: TCP
-          port: ${allow_port[$i]}
-EOF
+    if (( ${#labels[@]} > 0 )); then
+        echo "  labels:"
+        for pair in "${labels[@]}"; do
+            echo "    ${pair%%=*}: ${pair#*=}"
+        done
     fi
-done
+    cat <<EOF
+spec:
+  podSelector:
+    matchLabels:
+      $agent_key: $agent_val
+  policyTypes:
+    - Egress
+  egress:
+EOF
+    render_allow_ns_rules
+fi

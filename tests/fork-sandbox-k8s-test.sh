@@ -465,6 +465,7 @@ check "capabilities: policy" "policy=networkpolicy" "$(grep '^policy=' <<< "$cap
 check "capabilities: icmp" "icmp=unfiltered" "$(grep '^icmp=' <<< "$caps")"
 check "capabilities: dns" "dns=recursive" "$(grep '^dns=' <<< "$caps")"
 check "capabilities: runtimeclass" "runtimeclass=none" "$(grep '^runtimeclass=' <<< "$caps")"
+check "capabilities: grant" "grant=render-grant" "$(grep '^grant=' <<< "$caps")"
 
 policy="$("$platform_generic" render-policy --namespace fork-sandbox \
     --agent-label app=fork-sandbox-agent --proxy-label app=fork-sandbox-proxy --proxy-port 8080)"
@@ -611,6 +612,84 @@ refuses "--allow-namespace refuses a port above 65535" \
     "$platform_generic" render-policy --namespace fork-sandbox \
     --agent-label app=fork-sandbox-agent --proxy-label app=fork-sandbox-proxy \
     --proxy-port 8080 --allow-namespace preview-one:99999
+
+# render-grant: the per-run widening object. It must never carry
+# render-policy's fixed name -- that name is the shared seal, and a
+# per-run object reusing it would REPLACE the seal for every other agent
+# pod in the namespace (see docs/k8s-platform.md). It also must carry no
+# ingress: key and only Egress in policyTypes -- it is purely additive,
+# not a second seal.
+grant="$("$platform_generic" render-grant --namespace fork-sandbox \
+    --name demo-branch-agent-grant --agent-label fork-sandbox/branch=demo-branch \
+    --label fork-sandbox.io/run=demo-branch --allow-namespace demo-slot-01:9090)"
+if command -v yamllint >/dev/null 2>&1; then
+    out="$(yamllint - <<< "$grant" 2>&1)"
+    if [[ -z "$out" ]]; then ok "yamllint: render-grant output"; else no "yamllint: render-grant output" "$out"; fi
+fi
+check "render-grant: metadata.name is the given NAME, never the seal's name" \
+    "  name: demo-branch-agent-grant" "$(grep '^  name:' <<< "$grant")"
+if grep -qF 'fork-sandbox-agent-egress' <<< "$grant"; then
+    no "render-grant output never names the seal's fixed NetworkPolicy name" \
+        "found 'fork-sandbox-agent-egress' in: $grant"
+else
+    ok "render-grant output never names the seal's fixed NetworkPolicy name"
+fi
+check "render-grant: policyTypes is Egress only" \
+    "1" "$(grep -c -- '- Egress' <<< "$grant")"
+if grep -q 'Ingress' <<< "$grant"; then
+    no "render-grant has no Ingress in policyTypes" "$grant"
+else
+    ok "render-grant has no Ingress in policyTypes"
+fi
+if grep -q '^  ingress:' <<< "$grant"; then
+    no "render-grant carries no ingress: key at all" "$grant"
+else
+    ok "render-grant carries no ingress: key at all"
+fi
+check "render-grant: podSelector matches --agent-label" \
+    "      fork-sandbox/branch: demo-branch" "$(grep '^      fork-sandbox/branch:' <<< "$grant")"
+check "render-grant: --label lands on metadata.labels" \
+    "    fork-sandbox.io/run: demo-branch" "$(grep '^    fork-sandbox.io/run:' <<< "$grant")"
+check "render-grant: egress has exactly one namespaceSelector rule" \
+    "1" "$(grep -c 'namespaceSelector' <<< "$grant")"
+check "render-grant: the namespaced rule names the granted namespace and port" \
+    "              kubernetes.io/metadata.name: demo-slot-01" \
+    "$(grep '^              kubernetes.io/metadata.name:' <<< "$grant")"
+
+grant_two="$("$platform_generic" render-grant --namespace fork-sandbox \
+    --name demo-branch-agent-grant --agent-label fork-sandbox/branch=demo-branch \
+    --allow-namespace demo-slot-01:9090 --allow-namespace demo-slot-02)"
+check "render-grant: --allow-namespace is repeatable: two entries render two rules" \
+    "2" "$(grep -c 'namespaceSelector' <<< "$grant_two")"
+if grep -q '^  labels:' <<< "$grant_two"; then
+    no "render-grant with no --label omits metadata.labels entirely" "$grant_two"
+else
+    ok "render-grant with no --label omits metadata.labels entirely"
+fi
+
+refuses "render-grant refuses zero --allow-namespace" \
+    "at least one --allow-namespace" \
+    "$platform_generic" render-grant --namespace fork-sandbox \
+    --name demo-branch-agent-grant --agent-label fork-sandbox/branch=demo-branch
+refuses "render-grant refuses a missing --name" \
+    "Missing: --name" \
+    "$platform_generic" render-grant --namespace fork-sandbox \
+    --agent-label fork-sandbox/branch=demo-branch --allow-namespace demo-slot-01
+refuses "render-grant refuses an invalid namespace, same as render-policy" \
+    "does not name a valid" \
+    "$platform_generic" render-grant --namespace fork-sandbox \
+    --name demo-branch-agent-grant --agent-label fork-sandbox/branch=demo-branch \
+    --allow-namespace Bad_NS
+
+# render-policy's output must be byte-for-byte unchanged by the refactor
+# that factored the shared allow-namespace rendering out for render-grant
+# to reuse -- re-checked here against the same sealed_baseline defined
+# above, one more time, right next to the render-grant tests that motivated
+# the refactor.
+check "render-policy is unchanged by the render-grant refactor" \
+    "$sealed_baseline" \
+    "$("$platform_generic" render-policy --namespace fork-sandbox \
+        --agent-label app=fork-sandbox-agent --proxy-label app=fork-sandbox-proxy --proxy-port 8080)"
 
 printf '\n== fork-sandbox-k8s.sh --dry-run (fixture config, no cluster) ==\n'
 config_dir="$(newdir)"; tmpdirs+=("$config_dir")
