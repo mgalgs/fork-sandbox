@@ -516,6 +516,10 @@ fork-sandbox status --result <run-dir>     # the final report
 fork-sandbox status --monitor <run-dir>    # line feed for an orchestrating agent
 fork-sandbox status --monitor-terminal <run-dir>  # the arm the skills use: the terminal event only
 
+# Watch a fleet of them
+fork-sandbox status --json <run-dir> <run-dir>...   # {"runs": [...], "totals": {...}}
+fork-sandbox status --json --set <run-dir>          # same wrapper shape, forced for one seat
+
 # Steer it while it runs — delivered at the session's next tool call
 fork-sandbox say <run-dir> "stop refactoring the tests; ship the fix first"
 
@@ -551,6 +555,21 @@ record — the same way a crash recovery would), and `salvaged` (the runner
 was already dead when the verb ran, e.g. after a raw `tmux kill-session`,
 so it went straight to that same host-side completion). Run against an
 already-ended run, it is a no-op.
+
+`fork-sandbox status --json` with one run dir is unchanged: the run's
+summary object, hard-exiting 1 until `summary.json` exists. Point it at
+two or more run dirs, or add `--set` (which forces the wrapper shape even
+for a single dir — useful when a caller does not know in advance how many
+seats it is watching), and it switches to a fleet view,
+`{"runs": [...], "totals": {...}}`, one entry per argument in argument
+order. A run still in flight, or dead before its summary was fetched,
+never fails the whole call — it gets a smaller entry built from what is
+on disk instead, marked `"summary": false` so a consumer can tell it
+apart from a real summary at a glance. `totals` applies the same care to
+cost: `cost_usd_total` only sums runs whose cost is a real number, an
+unknown cost (missing or null) is counted in `runs_without_cost` and
+never folded in as a `$0`, and `cost_usd_total` itself is `null`, not
+`0`, when nothing in the set is known.
 
 `fork-sandbox run --wait` turns the ordinary detached launch into a
 synchronous one: after printing the same launch block an unwaited `run`
