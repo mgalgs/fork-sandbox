@@ -371,6 +371,23 @@
 #                        --foreground, which has no tmux session.
 # --foreground:          run here in the foreground instead of a detached
 #                        tmux session. Blocks until the session ends.
+# --wait:                after the ordinary launch output, stream
+#                        fork-sandbox-status.sh --monitor-terminal against
+#                        this run's own dir and block until it reaches a
+#                        terminal state, then exit with the run's own
+#                        outcome: its own exit code (0, or 1-255) when
+#                        exit-code was written, 125 when it never was (the
+#                        run dir is gone, the runner was abandoned, or it
+#                        never started -- the printed line says which), and
+#                        124 only with --wait-timeout below, once it
+#                        expires. Refused with --k8s (v1 is local runs
+#                        only) and with --foreground (which already
+#                        blocks).
+# --wait-timeout <secs>: with --wait, give up waiting after <secs> and exit
+#                        124. The run itself is left running, untouched --
+#                        stop it with fork-sandbox stop, or re-arm
+#                        fork-sandbox-status.sh --monitor-terminal by hand.
+#                        Requires --wait.
 # --no-services:         skip the per-run services a repo opts into with
 #                        .agents/sandbox-services/ (see below), even when it
 #                        has them.
@@ -1515,6 +1532,8 @@ outbox_max_arg=""
 network_arg="pinned"
 network_given=false
 harness_alias_pi_local=false
+wait_requested=false
+wait_timeout_arg=""
 
 while [[ "${1:-}" == -* ]]; do
     case "$1" in
@@ -1718,6 +1737,19 @@ while [[ "${1:-}" == -* ]]; do
             esac
             shift 2
             ;;
+        --wait)
+            wait_requested=true
+            shift
+            ;;
+        --wait-timeout)
+            wait_timeout_arg="${2:?--wait-timeout requires a number of seconds}"
+            if [[ ! "$wait_timeout_arg" =~ ^[0-9]+$ ]] || [[ "$wait_timeout_arg" == 0 ]]; then
+                echo "Error: --wait-timeout takes a positive integer number of" >&2
+                echo "seconds, not '$wait_timeout_arg'." >&2
+                exit 1
+            fi
+            shift 2
+            ;;
         -h|--help)
             usage
             exit 0
@@ -1729,6 +1761,29 @@ while [[ "${1:-}" == -* ]]; do
             ;;
     esac
 done
+
+# --wait's refusals are checked here, right after parsing and before the
+# positional args are required, because everything they depend on
+# (k8s_mode, foreground, wait_requested, wait_timeout_arg) is already known
+# and none of them need a real project path or handoff file to be wrong.
+if $wait_requested; then
+    if [[ "$k8s_mode" == true ]]; then
+        echo "Error: --wait is not supported with --k8s. v1 only waits on a" >&2
+        echo "local run; watch a cluster run with" >&2
+        echo "fork-sandbox-status.sh --monitor-terminal against its run dir" >&2
+        echo "instead." >&2
+        exit 1
+    fi
+    if $foreground; then
+        echo "Error: --wait is redundant with --foreground -- a foreground" >&2
+        echo "run already blocks until it ends." >&2
+        exit 1
+    fi
+fi
+if [[ -n "$wait_timeout_arg" ]] && ! $wait_requested; then
+    echo "Error: --wait-timeout requires --wait." >&2
+    exit 1
+fi
 
 project_path="${1:?Usage: fork-sandbox.sh [options] <project-path> <handoff-file>}"
 handoff_file="${2:?Usage: fork-sandbox.sh [options] <project-path> <handoff-file>}"
@@ -9819,4 +9874,60 @@ EOF
 
 if $foreground; then
     exec "$run_dir/run.sh"
+fi
+
+if $wait_requested; then
+    # Reuse fork-sandbox-status.sh's own terminal-state detection rather
+    # than re-implement it: it already exits 0 on every terminal state
+    # (done, failed, abandoned, gone, never-started), which is exactly why
+    # the exit-code remapping below is needed -- the watcher's own exit
+    # status never carries the run's outcome, only whether it got to look.
+    watch_rc=0
+    if [[ -n "$wait_timeout_arg" ]]; then
+        timeout --foreground "$wait_timeout_arg" \
+            "$script_dir/fork-sandbox-status.sh" --monitor-terminal "$run_dir" \
+            || watch_rc=$?
+    else
+        "$script_dir/fork-sandbox-status.sh" --monitor-terminal "$run_dir" \
+            || watch_rc=$?
+    fi
+
+    if [[ -n "$wait_timeout_arg" ]] && (( watch_rc == 124 )); then
+        echo "fork-sandbox run --wait: timed out after ${wait_timeout_arg}s; the run" >&2
+        echo "is STILL RUNNING, untouched. Stop it with 'fork-sandbox stop" >&2
+        echo "$run_dir', or keep waiting with 'fork-sandbox-status.sh" >&2
+        echo "--monitor-terminal $run_dir'." >&2
+        exit 124
+    fi
+
+    if [[ -f "$run_dir/exit-code" && ! -L "$run_dir/exit-code" ]]; then
+        run_rc="$(tr -dc '0-9-' < "$run_dir/exit-code")"
+        if [[ "$run_rc" =~ ^[0-9]+$ ]] && (( run_rc <= 255 )); then
+            exit "$run_rc"
+        fi
+        echo "fork-sandbox run --wait: $run_dir/exit-code does not hold a valid" >&2
+        echo "exit code ('$run_rc'); treating the run as failed." >&2
+        exit 1
+    fi
+
+    # No exit-code file after a terminal wait: the run dir is gone, the
+    # runner was abandoned (pid dead, nothing written), or it never
+    # started (no pid file at all). Name which, in one line, so a consumer
+    # capturing only the tail of --wait's own output still sees it.
+    if [[ ! -d "$run_dir" ]]; then
+        echo "fork-sandbox run --wait: gone -- the run directory $run_dir was removed." >&2
+    elif [[ -f "$run_dir/pid" && ! -L "$run_dir/pid" ]]; then
+        wait_pid="$(tr -dc '0-9' < "$run_dir/pid")"
+        if [[ -n "$wait_pid" ]] && kill -0 "$wait_pid" 2>/dev/null; then
+            echo "fork-sandbox run --wait: no exit code after a terminal wait; the" >&2
+            echo "runner ($wait_pid) is still alive. Treating this as abandoned." >&2
+        else
+            echo "fork-sandbox run --wait: abandoned -- the runner is gone and wrote" >&2
+            echo "no exit code." >&2
+        fi
+    else
+        echo "fork-sandbox run --wait: never started -- no pid file was ever" >&2
+        echo "written." >&2
+    fi
+    exit 125
 fi
