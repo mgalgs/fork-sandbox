@@ -9898,7 +9898,7 @@ if $wait_requested; then
     # status never carries the run's outcome, only whether it got to look.
     watch_rc=0
     if [[ -n "$wait_timeout_arg" ]]; then
-        timeout --foreground "$wait_timeout_arg" \
+        "$FS_TIMEOUT" --foreground "$wait_timeout_arg" \
             "$script_dir/fork-sandbox-status.sh" --monitor-terminal "$run_dir" \
             || watch_rc=$?
     else
@@ -9906,14 +9906,20 @@ if $wait_requested; then
             || watch_rc=$?
     fi
 
-    if [[ -n "$wait_timeout_arg" ]] && (( watch_rc == 124 )) \
-        && [[ ! -f "$run_dir/exit-code" || -L "$run_dir/exit-code" ]]; then
-        # No exit-code file yet, so the run genuinely has not finished.
-        # (If one is already there, the watcher's timeout fired while it
-        # was still in its own post-exit-code wait for summary.txt --
-        # fork-sandbox-status.sh's done|failed branch blocks up to 120s
-        # for that file -- and the run is actually over; fall through to
-        # the exit-code handling below instead of reporting a falsehood.)
+    if [[ -n "$wait_timeout_arg" ]] && (( watch_rc == 124 )); then
+        # watch_rc==124 means $FS_TIMEOUT killed the watcher before it
+        # returned on its own -- fork-sandbox-status.sh only ever exits via
+        # its own terminal-state branches, which is exactly what "returned
+        # on its own" means here. That holds even if $run_dir/exit-code is
+        # already on disk: the runner writes exit-code, then cleans up,
+        # then fetches the branch, and only then writes summary.txt
+        # (fork-sandbox-status.sh's done|failed branch blocks up to 120s
+        # for that file precisely because of that gap). A kill landing in
+        # that window means the branch may not have crossed back yet, so
+        # exit-code's presence is not proof the run is over -- only
+        # status.sh returning on its own is. Report the timeout
+        # unconditionally rather than risk exiting 0 for a branch that
+        # is not there yet.
         echo "fork-sandbox run --wait: timed out after ${wait_timeout_arg}s; the run" >&2
         echo "is STILL RUNNING, untouched. Stop it with 'fork-sandbox stop" >&2
         echo "$run_dir', or keep waiting with 'fork-sandbox-status.sh" >&2

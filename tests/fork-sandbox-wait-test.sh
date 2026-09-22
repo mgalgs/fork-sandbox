@@ -164,6 +164,29 @@ wait_for_file() {
 }
 
 # =====================================================================
+printf '\n== static: --wait-timeout resolves timeout through FS_TIMEOUT ==\n'
+# =====================================================================
+# fork-sandbox-lib.sh resolves `timeout` into $FS_TIMEOUT (trying
+# `gtimeout` first, then `timeout`, accepting only a binary whose
+# `--version` says "GNU coreutils") precisely because `--foreground` is a
+# GNU-only flag and a bare `timeout` can silently be the wrong binary (or
+# absent) on a machine where GNU coreutils is g-prefixed. Every other
+# timeout call site in this file goes through $FS_TIMEOUT; --wait's must
+# too, or it can launch on a machine fs_require_gnu_tools already passed
+# and then never actually run the watcher. Modeled on
+# fork-sandbox-k8s-test.sh's "no bare 'timeout' command outside the
+# $FS_TIMEOUT shim" check.
+# shellcheck disable=SC2016  # the shimmed form is meant literally, not expanded
+raw_timeout_hits="$(grep -nE '(^|[;&|(])[[:space:]]*timeout[[:space:]]' "$launcher" \
+    | grep -vF -- '"$FS_TIMEOUT"' || true)"
+if [[ -z "$raw_timeout_hits" ]]; then
+    ok "fork-sandbox.sh: no bare 'timeout' command outside the \$FS_TIMEOUT shim"
+else
+    no "fork-sandbox.sh: no bare 'timeout' command outside the \$FS_TIMEOUT shim" \
+        "$raw_timeout_hits"
+fi
+
+# =====================================================================
 printf '\n== clean stub run: run --wait exits 0, branch fetched ==\n'
 # =====================================================================
 

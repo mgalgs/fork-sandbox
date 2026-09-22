@@ -562,7 +562,7 @@ run's own outcome instead of `status.sh`'s own always-0 exit:
 | --- | --- |
 | `0` | the run's own exit code was `0` |
 | `1`-`255` | the run's own exit code, unchanged |
-| `124` | `--wait-timeout` expired before the run wrote an exit code; the run is still going, untouched |
+| `124` | `--wait-timeout` expired; the run is still going, untouched |
 | `125` | no exit-code file was ever written (run dir gone, runner abandoned, or it never started — the printed line says which) |
 
 `--wait-timeout <secs>` wraps the watch in `timeout --foreground <secs>`;
