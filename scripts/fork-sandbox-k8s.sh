@@ -3488,11 +3488,15 @@ cmd_submit() {
 
     # This run's own grant object, when --allow-namespace was given --
     # resolved here, before any cluster object exists, so a platform that
-    # cannot render one, or a stale grant left by an earlier run on this
-    # branch, refuses before anything is created. "-agent-grant" is 12
-    # chars, one shorter than the "-claude-proxy" suffix k8s_safe_name's own
-    # comment already budgets 50 chars for, so grant_name is never over the
-    # 63-char Kubernetes object-name cap either.
+    # cannot render one refuses before anything is created. "-agent-grant"
+    # is 12 chars, one shorter than the "-claude-proxy" suffix
+    # k8s_safe_name's own comment already budgets 50 chars for, so
+    # grant_name is never over the 63-char Kubernetes object-name cap
+    # either. The stale-grant check (does a NetworkPolicy of this name
+    # already exist) is NOT here: it needs kubectl, and this is a purely
+    # local capability check that must keep running under --dry-run, which
+    # contacts no cluster at all -- see that check further down, placed
+    # after --dry-run's exit.
     local grant_name=""
     if (( ${#run_allow_ns_namespaces[@]} > 0 )); then
         if [[ "$(platform_capability grant "")" != render-grant ]]; then
@@ -3504,14 +3508,6 @@ cmd_submit() {
             exit 1
         fi
         grant_name="$safe_name-agent-grant"
-        if [[ -n "$(kubectl get networkpolicy "$grant_name" --ignore-not-found -o name 2>/dev/null)" ]]; then
-            echo "Error: a NetworkPolicy named '$grant_name' already exists --" >&2
-            echo "most likely a stale grant a previous run on branch '$branch'" >&2
-            echo "left behind. Reusing it here would silently widen this run's" >&2
-            echo "egress to whatever that grant named. Remove it first:" >&2
-            echo "  fork-sandbox-k8s.sh rm --branch $branch" >&2
-            exit 1
-        fi
     fi
 
     local proxy_base_url
@@ -4073,6 +4069,25 @@ EOF
             echo "Error: --context-ro directory '$context_ro' tars to" >&2
             echo "$context_size bytes, over the $CONTEXT_MAX_BYTES byte" >&2
             echo "(256 MiB) cap." >&2
+            exit 1
+        fi
+    fi
+
+    # The stale-grant check: does a NetworkPolicy named $grant_name
+    # already exist, most likely left behind by an earlier run on this
+    # branch. This is the first kubectl call cmd_submit makes -- run only
+    # after --dry-run's exit above, so a dry-run still contacts nothing,
+    # per this script's own --dry-run contract. It still runs before any
+    # cluster object for THIS run is created, and before the cluster-object
+    # EXIT trap below is installed, so a refusal here cannot trigger that
+    # trap's by-label delete and touch the stale object it just found.
+    if [[ -n "$grant_name" ]]; then
+        if [[ -n "$(kubectl get networkpolicy "$grant_name" --ignore-not-found -o name 2>/dev/null)" ]]; then
+            echo "Error: a NetworkPolicy named '$grant_name' already exists --" >&2
+            echo "most likely a stale grant a previous run on branch '$branch'" >&2
+            echo "left behind. Reusing it here would silently widen this run's" >&2
+            echo "egress to whatever that grant named. Remove it first:" >&2
+            echo "  fork-sandbox-k8s.sh rm --branch $branch" >&2
             exit 1
         fi
     fi

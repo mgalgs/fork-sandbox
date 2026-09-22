@@ -1221,7 +1221,11 @@ fi
 # A pre-existing NetworkPolicy named <safe_name>-agent-grant is refused as
 # stale, before anything else is created, naming the exact rm command that
 # clears it -- a stale grant would otherwise silently widen a new run that
-# reuses the branch name.
+# reuses the branch name. This is NOT a --dry-run invocation: the stale
+# check is the one kubectl read submit does before that point, and a
+# --dry-run must contact no kubectl at all (see the "no kubectl, no cluster
+# reachability check" --dry-run contract this suite's header documents), so
+# --dry-run would exit before ever reaching this stub.
 stale_stub_dir="$(newdir)"; tmpdirs+=("$stale_stub_dir")
 cat > "$stale_stub_dir/kubectl" <<'STUB'
 #!/usr/bin/env bash
@@ -1240,9 +1244,11 @@ fi
 exit 0
 STUB
 chmod +x "$stale_stub_dir/kubectl"
+stale_home="$(newdir)"; tmpdirs+=("$stale_home")
 refuses "a pre-existing grant NetworkPolicy is refused as stale, naming the exact rm command" \
     "fork-sandbox-k8s.sh rm --branch fs-k8s-test-stale-grant" \
-    env PATH="$stale_stub_dir:$PATH" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    env PATH="$stale_stub_dir:$PATH" HOME="$stale_home" FORK_SANDBOX_RUN_SOURCE=test \
+    FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit \
     --branch fs-k8s-test-stale-grant --model moonshotai/kimi-k3 \
     --allow-namespace "demo-slot-01:8000" \
     --reach-probe "svc.demo-slot-01:8000" \
