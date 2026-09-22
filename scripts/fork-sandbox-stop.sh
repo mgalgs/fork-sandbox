@@ -17,12 +17,20 @@
 # <run-dir>/exit-code:
 #
 #   already ended       nothing to do -- says so and exits 0.
-#   runner running       sends TERM to the runner's whole process group (a
-#                         trap in fork-sandbox.sh sets a flag on TERM and lets
-#                         the run's own teardown finish normally: fetch,
+#   runner running       a detached-tmux run (pgid == pid, the normal case)
+#                         gets TERM'd as a group so the harness leg's
+#                         foreground child dies and the runner's own
+#                         deferred trap can run; a --foreground run (pgid
+#                         != pid, no group of its own to signal) gets its
+#                         pid TERM'd alone so the caller's shell and its
+#                         siblings are never touched. Either way, a trap in
+#                         fork-sandbox.sh sets a flag on TERM and lets the
+#                         run's own teardown finish normally: fetch,
 #                         zero-commit branch cleanup, summary.json, exit-code,
-#                         run-log record). Waits up to --timeout for that
-#                         teardown to finish. end_reason: stopped.
+#                         run-log record. Waits (polling for the runner
+#                         process to actually exit, not just for exit-code
+#                         to appear) up to --timeout for that teardown to
+#                         finish. end_reason: stopped.
 #   timeout expires       falls back to the same forced completion below.
 #                         end_reason: stop-timeout.
 #   runner already dead   (e.g. someone ran 'tmux kill-session' directly)
@@ -30,12 +38,16 @@
 #                         completion, closing the run this verb exists for.
 #                         end_reason: salvaged.
 #
-# The forced completion is host-side: kill the tmux session (timeout path
-# only -- a dead runner has none), fetch the branch back into the origin
-# repo, remove it if the fetch added no commits, write exit-code 143, write
-# a minimal summary.json if the runner never got to write one, and append
-# the run-log record -- the same shape fork-sandbox.sh's own teardown
-# produces, so the ledger cannot tell a deliberate stop from a crash.
+# The forced completion is host-side: exact-match kill the tmux session
+# (timeout path only -- a dead runner has none), then KILL the runner
+# outright (group or pid, whichever it leads) if it is still alive so the
+# rest of this does not race a still-writing process, fetch the branch back
+# into the origin repo, remove it if the fetch added no commits, write
+# exit-code 143, pass --end-reason to the run-log record so its own
+# no-summary fallback fills in harness/model/exit_code (no summary.json is
+# fabricated here), and append that record -- the same shape
+# fork-sandbox.sh's own teardown produces, so the ledger cannot tell a
+# deliberate stop from a crash.
 #
 # A --k8s run is refused: this verb is local-run machinery only. Stop one
 # with 'fork-sandbox k8s rm' instead.
@@ -44,10 +56,12 @@
 # tool already makes on every ordinary run: it fetches the clone's branch
 # into the origin repo (the one config-safe way in -- see the comment above
 # this script's own fetch, and fork-sandbox.sh's near its own), deletes that
-# branch only when the fetch added nothing, and signals a process this same
-# tool started. It never runs git inside the clone, never reads stdin, and
-# refuses a run directory that is not a real fork-sandbox run (resolved
-# first, checked against the run-dir prefix, must hold a run.env).
+# branch only when the fetch added nothing, and signals only a process this
+# same tool started -- a group only when the runner leads it, an exact-match
+# tmux session, never a bystander. It never runs git inside the clone, never
+# reads stdin, and refuses a run directory that is not a real fork-sandbox
+# run (resolved first, checked against the run-dir prefix, must hold a
+# run.env).
 
 set -euo pipefail
 
