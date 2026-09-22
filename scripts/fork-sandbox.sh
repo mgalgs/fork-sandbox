@@ -9906,7 +9906,14 @@ if $wait_requested; then
             || watch_rc=$?
     fi
 
-    if [[ -n "$wait_timeout_arg" ]] && (( watch_rc == 124 )); then
+    if [[ -n "$wait_timeout_arg" ]] && (( watch_rc == 124 )) \
+        && [[ ! -f "$run_dir/exit-code" || -L "$run_dir/exit-code" ]]; then
+        # No exit-code file yet, so the run genuinely has not finished.
+        # (If one is already there, the watcher's timeout fired while it
+        # was still in its own post-exit-code wait for summary.txt --
+        # fork-sandbox-status.sh's done|failed branch blocks up to 120s
+        # for that file -- and the run is actually over; fall through to
+        # the exit-code handling below instead of reporting a falsehood.)
         echo "fork-sandbox run --wait: timed out after ${wait_timeout_arg}s; the run" >&2
         echo "is STILL RUNNING, untouched. Stop it with 'fork-sandbox stop" >&2
         echo "$run_dir', or keep waiting with 'fork-sandbox-status.sh" >&2

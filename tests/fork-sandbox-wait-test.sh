@@ -321,5 +321,21 @@ done
 check "fixture runs append no handoff archives to the operator's durable state" \
     "" "$new_operator_archives"
 
+# Positive control: prove the scratch-HOME redirect actually redirects, not
+# that archiving silently stopped. rd_clean is an ordinary --wait run that
+# exits 0, and sandbox-run-log.py's record step runs unconditionally at the
+# end of every run, so its archive is guaranteed to exist somewhere.
+if [[ -n "${rd_clean:-}" ]]; then
+    scratch_archive="$launcher_home/.claude/sandbox-handoffs/$(basename -- "$rd_clean").md"
+    if [[ -f "$scratch_archive" ]]; then
+        ok "a fixture run's handoff archive lands in the scratch HOME"
+    else
+        no "a fixture run's handoff archive lands in the scratch HOME" \
+            "expected $scratch_archive"
+    fi
+else
+    no "a fixture run's handoff archive lands in the scratch HOME" "rd_clean not set"
+fi
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))
