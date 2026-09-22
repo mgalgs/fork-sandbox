@@ -632,6 +632,84 @@ else
 fi
 wait "$fetchfail_job" 2>/dev/null || true
 
+# -- graceful stop must not resurrect a branch the runner's own teardown
+# already removed: a fake runner shaped like the real one (fork-sandbox.sh's
+# teardown, not this suite's other fixtures, none of which ever remove a
+# branch) writes exit-code, then fetches the zero-commit branch back into
+# the ORIGIN repo and deletes it there -- never touching the clone, which
+# still holds the ref, exactly like the real teardown at
+# fork-sandbox.sh:9039-9055. Before this fixture, the graceful path's
+# confirmation re-ran 'git fetch clone branch:branch' unconditionally,
+# which recreates the ref from the clone's still-live copy and undoes the
+# runner's own removal -- a stray branch left in the user's real repo after
+# an ordinary, went-nowhere run. Proves the confirmation now applies the
+# same zero-commit removal the runner itself just applied, instead of
+# blindly repeating only the fetch half of it.
+resurrect_origin="$(new_project)"; tmpdirs+=("$resurrect_origin")
+resurrect_base_sha="$(cd "$resurrect_origin" && git rev-parse HEAD)"
+resurrect_clone="$(mktemp -d /var/tmp/claude-scratch/fs-stop-resurrect-clone.XXXXXX)"
+tmpdirs+=("$resurrect_clone")
+(
+    cd "$resurrect_origin" && git clone -q . "$resurrect_clone" \
+        && cd "$resurrect_clone" && git checkout -q -b fs-stop-resurrect
+    # The origin repo holds the branch too, same as a real --checkout run
+    # (fork-sandbox.sh checks the branch out in the origin repo before
+    # launching) -- this is the ref the fake teardown below removes.
+    cd "$resurrect_origin" && git branch -q fs-stop-resurrect "$resurrect_base_sha"
+) >/dev/null 2>&1
+
+fake_runner_removes_branch="$(mktemp /var/tmp/claude-scratch/fs-stop-fake-runner.XXXXXX)"
+tmpdirs+=("$fake_runner_removes_branch")
+cat > "$fake_runner_removes_branch" <<'EOF'
+#!/usr/bin/env bash
+set -uo pipefail
+printf '%s\n' "$$" > "$RUN_DIR/pid"
+trap '
+    printf "0\n" > "$RUN_DIR/exit-code"
+    (cd "$ORIGIN_REPO" && git fetch --quiet "$CLONE_DIR" "$BRANCH:$BRANCH") >/dev/null 2>&1
+    (cd "$ORIGIN_REPO" && git branch -q -D "$BRANCH") >/dev/null 2>&1
+    exit 0
+' TERM
+while :; do sleep 0.2; done
+EOF
+chmod +x "$fake_runner_removes_branch"
+
+rd_resurrect="$(new_run_dir)"
+cat > "$rd_resurrect/run.env" <<EOF
+version=1
+branch=fs-stop-resurrect
+origin_repo=$resurrect_origin
+clone_dir=$resurrect_clone
+base_sha=$resurrect_base_sha
+session=cc-sbx-fs-stop-resurrect-does-not-exist
+EOF
+RUN_DIR="$rd_resurrect" ORIGIN_REPO="$resurrect_origin" CLONE_DIR="$resurrect_clone" \
+    BRANCH=fs-stop-resurrect \
+    setsid --fork "$fake_runner_removes_branch" \
+    < /dev/null > "$rd_resurrect/fake-runner.log" 2>&1 &
+resurrect_job=$!
+if wait_for_file "$rd_resurrect/pid"; then
+    out_resurrect="$(timeout 20 "$stop" --timeout 15 "$rd_resurrect" 2>&1)"; rc_resurrect=$?
+    check "confirmation does not resurrect an already-removed branch: stop exits 0" \
+        "0" "$rc_resurrect"
+    contains "confirmation does not resurrect an already-removed branch: reports stopped gracefully" \
+        "stopped gracefully" "$out_resurrect"
+    branch_gone=0
+    (cd "$resurrect_origin" \
+        && ! git rev-parse --verify -q "refs/heads/fs-stop-resurrect" >/dev/null 2>&1) \
+        && branch_gone=1
+    check "confirmation does not resurrect an already-removed branch: branch stays gone from origin" \
+        "1" "$branch_gone"
+else
+    no "confirmation does not resurrect an already-removed branch: stop exits 0" \
+        "fake runner never wrote a pid file"
+    no "confirmation does not resurrect an already-removed branch: reports stopped gracefully" \
+        "fake runner never wrote a pid file"
+    no "confirmation does not resurrect an already-removed branch: branch stays gone from origin" \
+        "fake runner never wrote a pid file"
+fi
+wait "$resurrect_job" 2>/dev/null || true
+
 # -- runner exited without completing its own teardown, e.g. killed
 # externally while this verb was waiting (not by anything this verb did):
 # nothing of its own teardown can be trusted, so this must not read as a

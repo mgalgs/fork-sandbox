@@ -36,11 +36,17 @@
 #                         without needing the pid to ever exit) up to
 #                         --timeout for that teardown to finish. Once it
 #                         has, the branch's fetched-back state is confirmed
-#                         by repeating the runner's own fetch (idempotent,
-#                         so harmless if it already worked) rather than
+#                         by repeating the runner's own fetch rather than
 #                         trusting exit-code alone -- a runner whose own
 #                         internal fetch-back silently failed must not read
-#                         as a clean stop. end_reason: stopped.
+#                         as a clean stop. The repeat is NOT idempotent on
+#                         its own once the runner has already removed a
+#                         zero-commit branch from the origin repo (the
+#                         clone still holds the ref, so re-fetching it would
+#                         resurrect exactly what the runner just deleted),
+#                         so the same zero-commit removal the forced path
+#                         applies is applied again here too. end_reason:
+#                         stopped.
 #   runner dies mid-wait   without ever writing exit-code (e.g. an
 #                         external kill this verb did not itself perform)
 #                         -- none of its own teardown can be trusted to
@@ -182,6 +188,29 @@ warn_fetch_failed() {
         "$branch" "$clone_dir" "$origin_repo" "$origin_repo" "$clone_dir" "$branch" "$branch" >&2
 }
 
+# Shared by both places that fetch the branch back and then must decide
+# whether to remove it: the runner's own teardown already deletes a
+# zero-commit branch from the origin repo (never from the clone, which
+# still holds the ref), so re-fetching branch:branch after that deletion
+# recreates exactly the ref the runner just removed unless this same
+# zero-commit check is applied again here. Sets reconcile_n_commits and
+# reconcile_removed for the caller to report.
+reconcile_n_commits=0
+reconcile_removed=0
+reconcile_branch_after_fetch() {
+    reconcile_n_commits=0
+    reconcile_removed=0
+    local head_now=""
+    reconcile_n_commits="$( (cd "$origin_repo" && git rev-list --count "$return_base_sha..$branch") 2>/dev/null || printf 0 )"
+    if [[ "$reconcile_n_commits" == "0" ]]; then
+        head_now="$( (cd "$origin_repo" && git rev-parse "$branch") 2>/dev/null || true )"
+        if [[ "$head_now" == "$return_base_sha" ]] \
+            && (cd "$origin_repo" && git branch -q -D "$branch") >/dev/null 2>&1; then
+            reconcile_removed=1
+        fi
+    fi
+}
+
 # Entry state 1: the run is already over. Idempotent no-op, per the brief --
 # nothing is rewritten, this is not an error.
 if [[ -e "$exit_code_file" && ! -L "$exit_code_file" ]]; then
@@ -212,7 +241,7 @@ fi
 # inside the clone. Every git command below runs in the origin repo.
 complete_run_host_side() {
     local reason="$1" kill_tmux="$2"
-    local fetched=0 n_commits=0 removed=0 head_now="" fetch_failed=0
+    local fetched=0 n_commits=0 removed=0 fetch_failed=0
 
     if [[ "$kill_tmux" == 1 ]]; then
         if [[ -n "$session" ]]; then
@@ -256,14 +285,9 @@ complete_run_host_side() {
     fi
 
     if (( fetched )); then
-        n_commits="$( (cd "$origin_repo" && git rev-list --count "$return_base_sha..$branch") 2>/dev/null || printf 0 )"
-        if [[ "$n_commits" == "0" ]]; then
-            head_now="$( (cd "$origin_repo" && git rev-parse "$branch") 2>/dev/null || true )"
-            if [[ "$head_now" == "$return_base_sha" ]] \
-                && (cd "$origin_repo" && git branch -q -D "$branch") >/dev/null 2>&1; then
-                removed=1
-            fi
-        fi
+        reconcile_branch_after_fetch
+        n_commits="$reconcile_n_commits"
+        removed="$reconcile_removed"
     fi
 
     if [[ -L "$exit_code_file" ]]; then
@@ -390,7 +414,18 @@ if (( teardown_done )); then
         # "stopped gracefully" actually means the branch is back, not just
         # that exit-code was written.
         if (cd "$origin_repo" && git fetch --quiet "$clone_dir" "$branch:$branch") 2>/dev/null; then
-            printf 'stopped gracefully (exit %s) after %ss.\n' "$rc" "$waited"
+            # The clone still holds the branch ref even after the runner's
+            # own teardown deletes a zero-commit branch from the ORIGIN repo
+            # only (fork-sandbox.sh's teardown never touches the clone), so
+            # the fetch just above can resurrect exactly the ref the runner
+            # just removed. Apply the same zero-commit removal here so a
+            # confirmed-clean stop leaves the origin repo the way the
+            # runner's own teardown left it, not the way a bare re-fetch
+            # would.
+            reconcile_branch_after_fetch
+            printf 'stopped gracefully (exit %s) after %ss; branch %s, %s new commit(s)%s.\n' \
+                "$rc" "$waited" "$branch" "$reconcile_n_commits" \
+                "$( (( reconcile_removed )) && printf ', branch removed (no new commits)' || true )"
             exit 0
         else
             printf 'fork-sandbox-stop: the runner exited (exit %s) but its own fetch-back could not be confirmed.\n' "$rc" >&2
