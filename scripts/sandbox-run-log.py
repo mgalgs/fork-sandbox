@@ -294,6 +294,11 @@ def epoch_iso(epoch):
 
 def append(rec):
     line = json.dumps(rec, separators=(",", ":"))
+    # A fresh machine has no ~/.claude yet -- the other archive writes in
+    # cmd_record happen to create it as a side effect when they run, but
+    # each of those is conditional (no preset.json, no handoff.md, no
+    # codex-sessions dir) and this one is not, so it cannot rely on them.
+    os.makedirs(os.path.dirname(LOG), exist_ok=True)
     # Concurrent runs end concurrently; an exclusive lock keeps two appends
     # from interleaving mid-line.
     with open(LOG, "a", encoding="utf-8") as f:

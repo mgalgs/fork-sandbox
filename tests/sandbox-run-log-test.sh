@@ -450,5 +450,32 @@ not_contains "a normal run's raw run_end record carries no end_reason key at all
 out="$(query show "$(basename "$rd_normal")")"
 not_contains "show prints no end_reason field for a normal run" "end_reason" "$out"
 
+printf '\n== record: append creates a missing ~/.claude on a fresh HOME ==\n'
+fresh_home="$tmp/fresh-home"
+mkdir -p "$fresh_home"
+tmpdirs+=("$fresh_home")
+rd_fresh="$(mk_run_dir fresh-home)"
+tmpdirs+=("$rd_fresh")
+cat > "$rd_fresh/summary.json" <<'EOF'
+{"harness":"pi","network":"sealed","model":null,"branch":"fixture-branch","origin_repo":"/var/tmp/claude-scratch/forks/fixture-origin","base_sha":"0123456789abcdef0123456789abcdef01234567","exit_code":0,"commits":0,"cost_usd":0.0,"duration_seconds":0}
+EOF
+printf '0\n' > "$rd_fresh/exit-code"
+HOME="$fresh_home" python3 "$runlog" record --run-dir "$rd_fresh" \
+    >/dev/null 2>"$tmp/fresh-err"
+check "append succeeds under a HOME with no .claude" "0" "$?"
+if [[ -d "$fresh_home/.claude" ]]; then
+    ok "append creates the missing .claude directory"
+else
+    no "append creates the missing .claude directory" "not found: $fresh_home/.claude"
+fi
+if [[ -f "$fresh_home/.claude/sandbox-runs.jsonl" ]]; then
+    ok "append creates sandbox-runs.jsonl under the fresh .claude"
+else
+    no "append creates sandbox-runs.jsonl under the fresh .claude" \
+        "not found: $fresh_home/.claude/sandbox-runs.jsonl"
+fi
+contains "the fresh-HOME record is readable back" "\"$(basename "$rd_fresh")\"" \
+    "$(cat "$fresh_home/.claude/sandbox-runs.jsonl" 2>/dev/null)"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))
