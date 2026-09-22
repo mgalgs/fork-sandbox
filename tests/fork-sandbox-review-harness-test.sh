@@ -65,6 +65,29 @@ tmpdirs+=("$tmp")
 export FORK_SANDBOX_CONFIG_DIR="$tmp/config"
 mkdir -p "$FORK_SANDBOX_CONFIG_DIR"
 
+# Every real fork-sandbox.sh fixture below runs under this scratch HOME, not
+# the operator's: sandbox-run-log.py's archive dir and run log are
+# deliberately hardcoded under ~/.claude (no flag can aim them elsewhere),
+# so a fixture run under the real HOME appends handoff archives that are
+# indistinguishable from an operator's real work. A scratch HOME also
+# empties the launcher's ${FORK_SANDBOX_CONFIG_DIR:-$HOME/.config/
+# fork-sandbox}, so machine config -- credential balancing above all --
+# cannot route a fixture run, nor refuse it outright when the machine's
+# live quota is tight.
+launcher_home="$(mktemp -d)"; tmpdirs+=("$launcher_home")
+# The launcher's own security boundary requires the project to live under
+# ~/src -- which it resolves against the scratch HOME above, so fixture
+# projects must live there too (and the suite stops littering the real
+# ~/src as a side effect).
+mkdir -p "$launcher_home/src"
+# --review-loop refuses to start unless the review kit's skill directories
+# exist under $HOME/.claude/skills (fork-sandbox.sh's review_skill_src
+# check) -- real content is never read, fs_emit_review_prompt_body only
+# ever quotes the path, so an empty directory satisfies it.
+mkdir -p "$launcher_home/.claude/skills/commit-then-review" \
+    "$launcher_home/.claude/skills/code-review-portable"
+operator_archive_dir="$HOME/.claude/sandbox-handoffs"
+
 # --dry-run resolves and validates the harness/model, then exits before the
 # clone -- exactly what every check below except the "real runs" section
 # needs, and none of it needs a real project or handoff.
@@ -172,8 +195,7 @@ check "--review-model alone still resolves as before (no review_harness line)" \
 
 printf '\n== --review-only: validation and base resolution ==\n'
 
-mkdir -p "$HOME/src"
-review_proj="$(mktemp -d "$HOME/src/fs-review-only-test.XXXXXX")"; tmpdirs+=("$review_proj")
+review_proj="$(mktemp -d "$launcher_home/src/fs-review-only-test.XXXXXX")"; tmpdirs+=("$review_proj")
 (
     cd "$review_proj" && git init -q . \
         && git config user.email t@fork-sandbox.invalid \
@@ -290,7 +312,7 @@ chmod +x "$cred_stub/claude-sandboxed"
 
 new_project() {
     local d
-    d="$(mktemp -d "$HOME/src/fs-review-harness-test.XXXXXX")"
+    d="$(mktemp -d "$launcher_home/src/fs-review-harness-test.XXXXXX")"
     (
         cd "$d" \
             && git init -q . \
@@ -311,7 +333,7 @@ handoff="$handoff_dir/handoff.md"
 printf 'do the task RH-BRIEF-SENTINEL-6b5e\n' > "$handoff"
 
 before="$(find /var/tmp/claude-scratch/forks -maxdepth 1 -name 'claude-fork-sandbox.*' 2>/dev/null | wc -l)"
-out="$(PATH="$cred_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$cred_cfg" \
+out="$(HOME="$launcher_home" PATH="$cred_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$cred_cfg" \
     timeout 60 "$launcher" --foreground --harness claude --review-loop 1 \
     --review-harness pi/some-model "$proj" "$handoff" 2>&1)"
 rc=$?
@@ -408,7 +430,7 @@ chmod +x "$review_only_stub/claude-sandboxed"
 
 review_only_run() {
     local branch="$1" verdict="$2" out rc rd
-    out="$(PATH="$review_only_stub:$real_stub:$PATH" \
+    out="$(HOME="$launcher_home" PATH="$review_only_stub:$real_stub:$PATH" \
         FORK_SANDBOX_CONFIG_DIR="$real_cfg" FORK_SANDBOX_BACKEND=fake-image \
         REVIEW_VERDICT="$verdict" timeout 60 "$launcher" --foreground \
         --review-only --harness claude --model sonnet \
@@ -607,7 +629,7 @@ fi
 # subshell never reaches the trap).
 run_real() {
     local out rc rd
-    out="$(PATH="$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$real_cfg" \
+    out="$(HOME="$launcher_home" PATH="$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$real_cfg" \
         CODEX_HOME="$real_codex_home" \
         FORK_SANDBOX_BACKEND=fake-image \
         timeout 60 "$launcher" --foreground "$@" "$proj" "$handoff" 2>&1)"
@@ -658,7 +680,7 @@ if [[ -n "$rd7" ]]; then
     # construction by hand.
     clone_dir7="$rd7/clone/$(ls "$rd7/clone")"
     inbox_dir7="$rd7/inbox"
-    skill_dir7="$HOME/.claude/skills/commit-then-review"
+    skill_dir7="$launcher_home/.claude/skills/commit-then-review"
     shared_ok=true
     for frag in \
         "--bind-ro $skill_dir7" \
@@ -723,7 +745,7 @@ if [[ -n "$rd_codex_impl" ]]; then
     tmpdirs+=("$rd_codex_impl")
     sandbox_codex_impl="$(grep '^sandbox_cmd=' "$rd_codex_impl/run.sh")"
     contains "a Codex implement leg mounts its per-run sessions directory" \
-        "--bind-rw-at $rd_codex_impl/codex-sessions $HOME/.codex/sessions" \
+        "--bind-rw-at $rd_codex_impl/codex-sessions $launcher_home/.codex/sessions" \
         "$sandbox_codex_impl"
     if [[ -d "$rd_codex_impl/codex-sessions" ]]; then
         ok "a Codex implement run creates its sessions directory"
@@ -743,7 +765,7 @@ if [[ -n "$rd_codex_review" ]]; then
     lacks "a claude implement command does not inherit its Codex review mount" \
         "codex-sessions" "$sandbox_codex_review"
     contains "a named Codex review leg mounts its per-run sessions directory" \
-        "--bind-rw-at $rd_codex_review/codex-sessions $HOME/.codex/sessions" \
+        "--bind-rw-at $rd_codex_review/codex-sessions $launcher_home/.codex/sessions" \
         "$review_codex_review"
 else
     no "run_real produced a run directory for a Codex review leg" \
@@ -759,7 +781,7 @@ fi
 # --exec with --env-file pi.env, per the "pi" case in fs_build_sandbox_cmd
 # above), and the launch report printed at the end must say so rather than
 # claim the whole run "costs nothing".
-out9pl="$(PATH="$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$real_cfg" \
+out9pl="$(HOME="$launcher_home" PATH="$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$real_cfg" \
     FORK_SANDBOX_BACKEND=fake-image \
     timeout 60 "$launcher" --foreground --harness pi-local --review-loop 1 \
     --review-harness pi/some-model "$proj" "$handoff" 2>&1)"
@@ -898,7 +920,7 @@ STUB
 chmod +x "$inbox_stub/claude-sandboxed"
 
 count_file9="$(mktemp)"; tmpdirs+=("$count_file9")
-out9="$(PATH="$inbox_stub:$PATH" \
+out9="$(HOME="$launcher_home" PATH="$inbox_stub:$PATH" \
     FAKE_COUNT_FILE="$count_file9" FAKE_SEEN_DIR="$seen_dir" \
     timeout 60 "$launcher" --foreground --harness claude --review-loop 1 \
     "$proj" "$handoff" 2>&1)"
@@ -1021,7 +1043,7 @@ STUB
 chmod +x "$loop2_stub/claude-sandboxed"
 
 count10="$(mktemp)"; tmpdirs+=("$count10")
-out10="$(PATH="$loop2_stub:$PATH" FAKE_COUNT_FILE="$count10" \
+out10="$(HOME="$launcher_home" PATH="$loop2_stub:$PATH" FAKE_COUNT_FILE="$count10" \
     timeout 60 "$launcher" --foreground --harness claude --review-loop 2 \
     --branch "sandbox-test-loop2-$$" \
     "$proj" "$handoff" 2>&1)"
@@ -1128,7 +1150,7 @@ STUB
 chmod +x "$mixed_a_stub/claude-sandboxed" "$mixed_a_stub/agent-sandboxed"
 
 count_a="$(mktemp)"; tmpdirs+=("$count_a")
-outA="$(PATH="$mixed_a_stub:$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$real_cfg" \
+outA="$(HOME="$launcher_home" PATH="$mixed_a_stub:$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$real_cfg" \
     FORK_SANDBOX_BACKEND=fake-image FAKE_COUNT_FILE="$count_a" \
     timeout 60 "$launcher" --foreground --harness claude --review-loop 1 \
     --review-harness pi-local --branch "sandbox-test-mixed-a-$$" \
@@ -1214,7 +1236,7 @@ STUB
 chmod +x "$mixed_b_stub/claude-sandboxed"
 
 count_b="$(mktemp)"; tmpdirs+=("$count_b")
-outB="$(PATH="$mixed_b_stub:$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$real_cfg" \
+outB="$(HOME="$launcher_home" PATH="$mixed_b_stub:$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$real_cfg" \
     FORK_SANDBOX_BACKEND=fake-image FAKE_COUNT_FILE="$count_b" \
     timeout 60 "$launcher" --foreground --harness pi/some-model --review-loop 1 \
     --review-harness claude --branch "sandbox-test-mixed-b-$$" \
@@ -1281,7 +1303,7 @@ chmod +x "$nz_stub/claude-sandboxed"
 # despite the coding leg's failure, and the run's own exit code still
 # reports the coding leg's failure: a review must never launder it green.
 count_nzA="$(mktemp)"; tmpdirs+=("$count_nzA")
-outA_nz="$(PATH="$nz_stub:$PATH" NZ_COMMIT=1 NZ_EXIT=3 FAKE_COUNT_FILE="$count_nzA" \
+outA_nz="$(HOME="$launcher_home" PATH="$nz_stub:$PATH" NZ_COMMIT=1 NZ_EXIT=3 FAKE_COUNT_FILE="$count_nzA" \
     timeout 60 "$launcher" --foreground --harness claude --review-loop 1 \
     --branch "sandbox-test-nonzero-commit-$$" \
     "$proj" "$handoff" 2>&1)"
@@ -1310,7 +1332,7 @@ fi
 # B: non-zero exit, with NO commits -- still skips, because there is nothing
 # to review, not because of the exit code.
 count_nzB="$(mktemp)"; tmpdirs+=("$count_nzB")
-outB_nz="$(PATH="$nz_stub:$PATH" NZ_COMMIT=0 NZ_EXIT=3 FAKE_COUNT_FILE="$count_nzB" \
+outB_nz="$(HOME="$launcher_home" PATH="$nz_stub:$PATH" NZ_COMMIT=0 NZ_EXIT=3 FAKE_COUNT_FILE="$count_nzB" \
     timeout 60 "$launcher" --foreground --harness claude --review-loop 1 \
     --branch "sandbox-test-nonzero-nocommit-$$" \
     "$proj" "$handoff" 2>&1)"
@@ -1399,7 +1421,7 @@ pi_err_cfg="$(mktemp -d)"; tmpdirs+=("$pi_err_cfg")
 install -m 600 /dev/null "$pi_err_cfg/pi.env"
 printf 'OPENROUTER_API_KEY=fake\n' > "$pi_err_cfg/pi.env"
 
-pi_err_out="$(PATH="$pi_err_stub:$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$pi_err_cfg" \
+pi_err_out="$(HOME="$launcher_home" PATH="$pi_err_stub:$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$pi_err_cfg" \
     FORK_SANDBOX_BACKEND=fake-image \
     timeout 60 "$launcher" --foreground --harness pi/some-model --review-loop 1 \
     --review-harness claude --branch "sandbox-test-pi-model-error-$$" \
@@ -1495,7 +1517,7 @@ retry_run() {  # $1 branch, $2 optional --review-loop count; sets retry_rc / ret
     [[ -n "${2:-}" ]] && extra=(--review-loop "$2")
     retry_out="$(RE_STREAM="${RE_STREAM:-}" RE_COMMIT="${RE_COMMIT:-0}" \
         RE_EXIT="${RE_EXIT:-0}" RE_STOP="${RE_STOP:-stop}" \
-        PATH="$retry_stub:$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$retry_cfg" \
+        HOME="$launcher_home" PATH="$retry_stub:$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$retry_cfg" \
         FORK_SANDBOX_BACKEND=fake-image \
         timeout 60 "$launcher" --foreground --harness pi/some-model \
         --branch "$1" ${extra[@]+"${extra[@]}"} "$proj" "$handoff" 2>&1)"
@@ -1686,7 +1708,7 @@ chmod +x "$fixex_stub/claude-sandboxed"
 
 fixex_run() {  # $1 count file, $2 branch; sets fixex_rc / fixex_rd / fixex_out
     fixex_out="$(FIX_COMMIT="${FIX_COMMIT:-0}" \
-        PATH="$fixex_stub:$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$retry_cfg" \
+        HOME="$launcher_home" PATH="$fixex_stub:$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$retry_cfg" \
         FORK_SANDBOX_BACKEND=fake-image FAKE_COUNT_FILE="$1" \
         timeout 60 "$launcher" --foreground --harness pi/some-model \
         --review-loop 2 --review-harness claude \
@@ -1806,7 +1828,7 @@ EOF
 
 coderep_run() {  # $1 count file, $2 branch; sets coderep_rc / coderep_rd / coderep_out
     coderep_out="$(CODE2_COMMIT="${CODE2_COMMIT:-0}" \
-        PATH="$coderep_stub:$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$coderep_cfg" \
+        HOME="$launcher_home" PATH="$coderep_stub:$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$coderep_cfg" \
         FORK_SANDBOX_BACKEND=fake-image FAKE_COUNT_FILE="$1" \
         timeout 60 "$launcher" --foreground --preset coderep \
         --branch "$2" "$proj" "$handoff" 2>&1)"
@@ -1840,6 +1862,39 @@ if [[ -n "$coderep_rd" ]]; then
 else
     no "a committing, exhausted repeat code pass produced a run directory" \
         "rc=$coderep_rc: $coderep_out"
+fi
+
+printf '\n== fixture runs leave no handoff archives in the operator home ==\n'
+# Own-run-ids shape, not a before/after snapshot diff: a snapshot diff would
+# also catch a concurrent real run or another suite's fixtures archiving
+# during this suite's own window, which is not this suite's leak to report.
+# Every run dir this suite creates is already in tmpdirs (appended right
+# after each launcher call), so that is the complete own-run-ids list; a
+# leaked fixture archive is always named "<run-dir-basename>.md".
+leaked=""
+for d in "${tmpdirs[@]}"; do
+    [[ -n "$d" && -d "$d" ]] || continue
+    cand="$operator_archive_dir/$(basename -- "$d").md"
+    [[ -f "$cand" ]] && leaked+="$cand "
+done
+check "fixture runs append no handoff archives to the operator's durable state" \
+    "" "$leaked"
+
+# Positive control: prove the scratch-HOME redirect actually redirects, not
+# that record silently stopped archiving. rd7 is an ordinary --harness
+# claude run that exits 0, and sandbox-run-log.py's record step runs
+# unconditionally at the end of every run ("however it ended"), so its
+# archive is guaranteed to exist somewhere.
+if [[ -n "${rd7:-}" ]]; then
+    scratch_archive="$launcher_home/.claude/sandbox-handoffs/$(basename -- "$rd7").md"
+    if [[ -f "$scratch_archive" ]]; then
+        ok "a fixture run's handoff archive lands in the scratch HOME"
+    else
+        no "a fixture run's handoff archive lands in the scratch HOME" \
+            "expected $scratch_archive"
+    fi
+else
+    no "a fixture run's handoff archive lands in the scratch HOME" "rd7 not set"
 fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
