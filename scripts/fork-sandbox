@@ -4,6 +4,7 @@
 # Usage: fork-sandbox run [options] <project-path> <handoff-file>
 #        fork-sandbox status [options] <run-dir>
 #        fork-sandbox say <run-dir> <message>
+#        fork-sandbox stop [--timeout SECS] <run-dir>
 #        fork-sandbox k8s <sub-verb> [options]
 #        fork-sandbox log <sub-verb> [options]
 #        fork-sandbox configure [options]
@@ -18,6 +19,7 @@
 #   run        fork-sandbox.sh
 #   status     fork-sandbox-status.sh
 #   say        fork-sandbox-say.sh
+#   stop       fork-sandbox-stop.sh
 #   k8s        fork-sandbox-k8s.sh
 #   log        sandbox-run-log.py
 #   configure  fork-sandbox.sh configure
@@ -61,6 +63,9 @@ case "$verb" in
     say)
         target='fork-sandbox-say.sh'
         ;;
+    stop)
+        target='fork-sandbox-stop.sh'
+        ;;
     configure)
         target='fork-sandbox.sh'
         set -- configure "$@"
@@ -85,7 +90,7 @@ case "$verb" in
         ;;
     *)
         printf "fork-sandbox: unknown verb '%s'\n" "$verb" >&2
-        printf '%s\n' 'Verbs: run status say configure k8s log validate-services mail fleet postmaster' >&2
+        printf '%s\n' 'Verbs: run status say stop configure k8s log validate-services mail fleet postmaster' >&2
         printf '%s\n' "Try 'fork-sandbox --help'." >&2
         exit 2
         ;;
