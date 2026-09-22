@@ -268,6 +268,22 @@ contains "with no refresh config, addenda still deliver" \
 printf '\n== the outer loop: real fork-sandbox.sh runs, claude-sandboxed stubbed ==\n'
 # =====================================================================
 
+# Every real fork-sandbox.sh fixture below runs under this scratch HOME, not
+# the operator's: sandbox-run-log.py's archive dir and run log are
+# deliberately hardcoded under ~/.claude (no flag can aim them elsewhere),
+# so a fixture run under the real HOME appends handoff archives that are
+# indistinguishable from an operator's real work. A scratch HOME also
+# empties the launcher's ${FORK_SANDBOX_CONFIG_DIR:-$HOME/.config/
+# fork-sandbox}, so machine config -- credential balancing above all --
+# cannot route a fixture run, nor refuse it outright when the machine's
+# live quota is tight.
+launcher_home="$(mktemp -d)"; tmpdirs+=("$launcher_home")
+# The launcher's own security boundary requires the project to live under
+# ~/src -- which it resolves against the scratch HOME above, so fixture
+# projects must live there too.
+mkdir -p "$launcher_home/src"
+operator_archive_dir="$HOME/.claude/sandbox-handoffs"
+
 stub_bin="$(mktemp -d /var/tmp/claude-scratch/fs-refresh-stub.XXXXXX)"
 tmpdirs+=("$stub_bin")
 cat > "$stub_bin/claude-sandboxed" <<'STUB'
@@ -363,7 +379,7 @@ chmod +x "$stub_bin/claude-sandboxed"
 
 new_project() {
     local d
-    d="$(mktemp -d "$HOME/src/fs-refresh-test.XXXXXX")"
+    d="$(mktemp -d "$launcher_home/src/fs-refresh-test.XXXXXX")"
     (
         cd "$d" \
             && git init -q . \
@@ -391,7 +407,7 @@ run_real() {
     handoff="$handoff_dir/handoff.md"
     printf 'do the task\n' > "$handoff"
     : > "$count_file"
-    out="$(PATH="$stub_bin:$PATH" \
+    out="$(HOME="$launcher_home" PATH="$stub_bin:$PATH" \
         FAKE_CLAUDE_COUNT_FILE="$count_file" \
         FAKE_NUDGE_LEGS="$nudge_legs" \
         FAKE_HANDOFF_LEGS="$handoff_legs" \
@@ -806,13 +822,29 @@ fi
 
 # -- harness refusal, no stub needed: fails during flag validation, before
 # any clone or run directory exists.
-if PATH="$stub_bin:$PATH" "$launcher" --harness pi --model demo/model \
+if HOME="$launcher_home" PATH="$stub_bin:$PATH" "$launcher" --harness pi --model demo/model \
     --refresh-at 0.5 "$proj" "$repo_dir/README.md" >/dev/null 2>"$stub_bin/err"; then
     no "--harness pi --refresh-at 0.5 is refused"
 else
     contains "--harness pi --refresh-at 0.5 is refused" \
         "only works with --harness claude" "$(cat "$stub_bin/err")"
 fi
+
+printf '\n== fixture runs leave no handoff archives in the operator home ==\n'
+# Own-run-ids shape, not a before/after snapshot diff: a snapshot diff would
+# also catch a concurrent real run or another suite's fixtures archiving
+# during this suite's own window, which is not this suite's leak to report.
+# Every run dir this suite creates is already in tmpdirs (appended right
+# after each launcher call), so that is the complete own-run-ids list; a
+# leaked fixture archive is always named "<run-dir-basename>.md".
+leaked=""
+for d in "${tmpdirs[@]}"; do
+    [[ -n "$d" && -d "$d" ]] || continue
+    cand="$operator_archive_dir/$(basename -- "$d").md"
+    [[ -f "$cand" ]] && leaked+="$cand "
+done
+check "fixture runs append no handoff archives to the operator's durable state" \
+    "" "$leaked"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))
