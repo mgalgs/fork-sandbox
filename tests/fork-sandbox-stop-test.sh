@@ -67,6 +67,15 @@ check() {
     fi
 }
 
+check_ge() {
+    local label="$1" min="$2" actual="$3"
+    if [[ "$actual" =~ ^[0-9]+$ ]] && (( actual >= min )); then
+        ok "$label"
+    else
+        no "$label" "expected >= $min, got '$actual'"
+    fi
+}
+
 contains() {
     local label="$1" needle="$2" hay="$3"
     case "$hay" in
@@ -413,6 +422,65 @@ else
 fi
 wait "$graceful_job" 2>/dev/null || true
 
+# -- graceful stop, delayed exit: the fake runner writes exit-code
+# immediately on TERM but does not actually exit for a few seconds after --
+# mirroring fork-sandbox.sh's own teardown, which writes exit-code BEFORE
+# its fetch-back (README.md documents that ordering). Proves 3.6: the stop
+# verb must wait for the runner PROCESS to exit, not merely for exit-code
+# to appear, or "stopped gracefully" could print while the fetch-back is
+# still in flight. Pre-3.6 code broke its wait as soon as exit-code
+# existed, so it would return in well under a second here; the fix must
+# take at least as long as the delay.
+fake_runner_delayed_exit="$(mktemp /var/tmp/claude-scratch/fs-stop-fake-runner.XXXXXX)"
+tmpdirs+=("$fake_runner_delayed_exit")
+cat > "$fake_runner_delayed_exit" <<'EOF'
+#!/usr/bin/env bash
+set -uo pipefail
+printf '%s\n' "$$" > "$RUN_DIR/pid"
+trap 'printf "0\n" > "$RUN_DIR/exit-code"; sleep 3; exit 0' TERM
+while :; do sleep 0.2; done
+EOF
+chmod +x "$fake_runner_delayed_exit"
+
+rd_delayed="$(new_run_dir)"
+cat > "$rd_delayed/run.env" <<EOF
+version=1
+branch=fs-stop-delayed
+origin_repo=/tmp/nonexistent-origin
+clone_dir=/tmp/nonexistent-clone
+base_sha=0000000000000000000000000000000000000000
+session=cc-sbx-fs-stop-delayed-does-not-exist
+EOF
+RUN_DIR="$rd_delayed" setsid --fork "$fake_runner_delayed_exit" \
+    < /dev/null > "$rd_delayed/fake-runner.log" 2>&1 &
+delayed_job=$!
+if wait_for_file "$rd_delayed/pid"; then
+    delayed_pid="$(cat "$rd_delayed/pid")"
+    start_ts="$(date +%s)"
+    out_delayed="$(timeout 20 "$stop" --timeout 15 "$rd_delayed" 2>&1)"; rc_delayed=$?
+    elapsed_delayed=$(( $(date +%s) - start_ts ))
+    check "graceful-with-delay: exits 0" "0" "$rc_delayed"
+    contains "graceful-with-delay: reports stopped gracefully" "stopped gracefully" "$out_delayed"
+    check "graceful-with-delay: exit-code 0 as the fake runner wrote" "0" "$(cat "$rd_delayed/exit-code" 2>/dev/null)"
+    check_ge "graceful-with-delay: stop waited for the process to actually exit, not just exit-code to appear" \
+        "2" "$elapsed_delayed"
+    if kill -0 "$delayed_pid" 2>/dev/null; then
+        no "graceful-with-delay: the runner process has actually exited" \
+            "pid $delayed_pid is still alive after stop reported success"
+        kill -9 "$delayed_pid" 2>/dev/null || true
+    else
+        ok "graceful-with-delay: the runner process has actually exited"
+    fi
+else
+    no "graceful-with-delay: exits 0" "fake runner never wrote a pid file"
+    no "graceful-with-delay: reports stopped gracefully" "fake runner never wrote a pid file"
+    no "graceful-with-delay: exit-code 0 as the fake runner wrote" "fake runner never wrote a pid file"
+    no "graceful-with-delay: stop waited for the process to actually exit, not just exit-code to appear" \
+        "fake runner never wrote a pid file"
+    no "graceful-with-delay: the runner process has actually exited" "fake runner never wrote a pid file"
+fi
+wait "$delayed_job" 2>/dev/null || true
+
 # -- timeout fallback: the fake runner ignores TERM entirely, so the
 # graceful wait must expire and the stop verb must fall back to the
 # violent path: fetch the branch back (there is a real commit waiting in
@@ -462,9 +530,24 @@ if wait_for_file "$rd_timeout/pid"; then
     check "timeout: branch NOT removed (it has a real commit)" \
         "1" "$(cd "$timeout_origin" && git show-ref --quiet "refs/heads/fs-stop-timeout" && echo 1 || echo 0)"
     fake_pid="$(cat "$rd_timeout/pid" 2>/dev/null)"
-    # The fake runner ignores TERM by design, so it is still alive here --
-    # a real tmux pane's kill-session would take it down; kill it directly
-    # so the test does not leak a process that outlives it.
+    # The fake runner ignores TERM by design AND there is no real tmux
+    # session for this fixture's name, so tmux kill-session is a no-op --
+    # only 3.7's KILL fallback in complete_run_host_side can end it. This
+    # is the assertion that proves the forced path actually kills a
+    # sessionless runner rather than just completing the host-side work
+    # around a still-running process.
+    if [[ -n "$fake_pid" ]]; then
+        if kill -0 "$fake_pid" 2>/dev/null; then
+            no "timeout: the forced path actually kills the sessionless runner" \
+                "pid $fake_pid is still alive after stop returned; kill-session is a no-op here, so only the KILL fallback could end it"
+        else
+            ok "timeout: the forced path actually kills the sessionless runner"
+        fi
+    else
+        no "timeout: the forced path actually kills the sessionless runner" "no pid file"
+    fi
+    # Safety net only: the assertion above is what proves 3.7, and this
+    # must already be a no-op by the time it runs.
     [[ -n "$fake_pid" ]] && kill -9 "$fake_pid" 2>/dev/null || true
 else
     no "timeout: exits 0 (completed host-side)" "fake runner never wrote a pid file"
@@ -475,6 +558,7 @@ else
     no "timeout: run-log marks summary_missing" "fake runner never wrote a pid file"
     no "timeout: branch fetched back with its commit" "fake runner never wrote a pid file"
     no "timeout: branch NOT removed (it has a real commit)" "fake runner never wrote a pid file"
+    no "timeout: the forced path actually kills the sessionless runner" "fake runner never wrote a pid file"
 fi
 wait "$timeout_job" 2>/dev/null || true
 
