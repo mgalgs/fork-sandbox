@@ -559,11 +559,11 @@ already-ended run, it is a no-op.
 `fork-sandbox status --json` with one run dir is unchanged: the run's
 summary object, hard-exiting 1 until `summary.json` exists. Point it at
 two or more run dirs, or add `--set` (which forces the wrapper shape even
-for a single dir — useful when a caller does not know in advance how many
+for a single dir -- useful when a caller does not know in advance how many
 seats it is watching), and it switches to a fleet view,
 `{"runs": [...], "totals": {...}}`, one entry per argument in argument
 order. A run still in flight, or dead before its summary was fetched,
-never fails the whole call — it gets a smaller entry built from what is
+never fails the whole call -- it gets a smaller entry built from what is
 on disk instead, marked `"summary": false` so a consumer can tell it
 apart from a real summary at a glance. `totals` applies the same care to
 cost: `cost_usd_total` only sums runs whose cost is a real number, an
