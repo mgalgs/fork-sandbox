@@ -14,6 +14,29 @@ set -uo pipefail
 
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
 
+# The launcher starts detached runs with `tmux new-session -d`, and a tmux
+# session's environment comes from the tmux SERVER, not from the client
+# that ran new-session. On a host with a live operator server, a fixture
+# run would therefore inherit the OPERATOR's HOME and none of this suite's
+# FAKE_* knobs: the stub never sleeps, fake exit codes vanish, and
+# sandbox-run-log.py archives fixture handoffs into the operator's real
+# ~/.claude -- the exact leak the guard at the end of this file exists to
+# catch (it fired on this suite's first host run; in a sandbox there is no
+# pre-existing server, which is why the suite was green there). So every
+# real launch below gets its own PRIVATE tmux server: a per-case
+# TMUX_TMPDIR makes tmux spawn a fresh server as a child of the launcher,
+# inheriting the whole per-case environment. Per-case, not per-suite: a
+# shared private server would freeze the FIRST case's FAKE_* values into
+# the server and feed them to every later case. unset TMUX so a suite run
+# from inside a tmux pane cannot target the operator's server anyway.
+unset TMUX
+tmux_tmpdirs=()
+case_tmux=""
+new_tmux_tmpdir() {
+    case_tmux="$(mktemp -d /var/tmp/claude-scratch/fs-wait-tmux.XXXXXX)"
+    tmux_tmpdirs+=("$case_tmux")
+}
+
 repo_dir="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 launcher="$repo_dir/scripts/fork-sandbox.sh"
 
@@ -44,7 +67,14 @@ mkdir -p "$launcher_home/src" "$launcher_home/.claude"
 operator_archive_dir="$HOME/.claude/sandbox-handoffs"
 
 cleanup() {
-    local d
+    local d t
+    # Private per-case tmux servers first: a server whose run is still
+    # alive holds processes inside the run dirs the loop below removes.
+    for t in "${tmux_tmpdirs[@]-}"; do
+        [[ -n "$t" && -d "$t" ]] || continue
+        TMUX_TMPDIR="$t" tmux kill-server >/dev/null 2>&1 || true
+        rm -rf -- "$t"
+    done
     for d in "${tmpdirs[@]-}"; do
         [[ -n "$d" && -e "$d" ]] && rm -rf -- "$d"
     done
@@ -134,7 +164,9 @@ owned_run_dirs=()
 # -- $! read back here would never see it. Globals avoid that trap.
 launch_wait_bg() {
     wait_bg_out="$(mktemp)"; tmpdirs+=("$wait_bg_out")
+    new_tmux_tmpdir
     HOME="$launcher_home" PATH="$stub_bin:$PATH" FAKE_SLEEP_SECONDS=10 \
+        TMUX_TMPDIR="$case_tmux" \
         "$launcher" "$@" "$proj" "$handoff" > "$wait_bg_out" 2>&1 &
     wait_bg_pid=$!
 }
@@ -191,7 +223,9 @@ printf '\n== clean stub run: run --wait exits 0, branch fetched ==\n'
 # =====================================================================
 
 out_clean="$(mktemp)"; tmpdirs+=("$out_clean")
+new_tmux_tmpdir
 HOME="$launcher_home" PATH="$stub_bin:$PATH" FAKE_SLEEP_SECONDS=0 FAKE_EXIT_CODE=0 \
+    TMUX_TMPDIR="$case_tmux" \
     timeout 60 "$launcher" --harness claude --wait "$proj" "$handoff" \
     > "$out_clean" 2>&1
 rc_clean=$?
@@ -214,7 +248,9 @@ printf '\n== stub harness exiting 3: --wait exits 3 ==\n'
 # =====================================================================
 
 out_exit3="$(mktemp)"; tmpdirs+=("$out_exit3")
+new_tmux_tmpdir
 HOME="$launcher_home" PATH="$stub_bin:$PATH" FAKE_SLEEP_SECONDS=0 FAKE_EXIT_CODE=3 \
+    TMUX_TMPDIR="$case_tmux" \
     timeout 60 "$launcher" --harness claude --wait "$proj" "$handoff" \
     > "$out_exit3" 2>&1
 rc_exit3=$?
@@ -270,7 +306,9 @@ printf '\n== timeout: --wait-timeout 2 exits 124, run still live ==\n'
 # =====================================================================
 
 out_timeout="$(mktemp)"; tmpdirs+=("$out_timeout")
+new_tmux_tmpdir
 HOME="$launcher_home" PATH="$stub_bin:$PATH" FAKE_SLEEP_SECONDS=999 \
+    TMUX_TMPDIR="$case_tmux" \
     timeout 30 "$launcher" --harness claude --wait --wait-timeout 2 \
     "$proj" "$handoff" > "$out_timeout" 2>&1
 rc_timeout=$?
@@ -284,8 +322,10 @@ if [[ -n "$rd_timeout" ]]; then
     # The run is genuinely still alive (a real tmux session, a real
     # runner sleeping 999s) -- tear it down with the real stop verb
     # before this suite's own tmpdirs cleanup removes the run dir out
-    # from under a still-running process.
-    HOME="$launcher_home" "$repo_dir/scripts/fork-sandbox-stop.sh" "$rd_timeout" >/dev/null 2>&1 || true
+    # from under a still-running process. Same TMUX_TMPDIR, so the stop
+    # verb's kill-session reaches this case's private server.
+    HOME="$launcher_home" TMUX_TMPDIR="$case_tmux" \
+        "$repo_dir/scripts/fork-sandbox-stop.sh" "$rd_timeout" >/dev/null 2>&1 || true
     branch_timeout="$(sed -n 's/^branch=//p' "$rd_timeout/run.env" 2>/dev/null | head -1)"
     [[ -n "$branch_timeout" ]] && (cd "$proj" && git branch -q -D "$branch_timeout" >/dev/null 2>&1) || true
 else
@@ -359,8 +399,10 @@ SHIM
 chmod +x "$wait_shim_bin/timeout"
 
 out_race="$(mktemp)"; tmpdirs+=("$out_race")
+new_tmux_tmpdir
 HOME="$launcher_home" PATH="$wait_shim_bin:$stub_bin:$PATH" \
     FAKE_SLEEP_SECONDS=0 FAKE_EXIT_CODE=0 \
+    TMUX_TMPDIR="$case_tmux" \
     /usr/bin/timeout 60 "$launcher" --harness claude --wait --wait-timeout 30 \
     "$proj" "$handoff" > "$out_race" 2>&1
 rc_race=$?
@@ -373,7 +415,8 @@ if [[ -n "$rd_race" ]]; then
     contains "timeout race: names the timeout in its output" "timed out" "$(cat "$out_race")"
     check "timeout race: exit-code file really was already there" \
         "1" "$([[ -e "$rd_race/exit-code" ]] && echo 1 || echo 0)"
-    HOME="$launcher_home" "$repo_dir/scripts/fork-sandbox-stop.sh" "$rd_race" >/dev/null 2>&1 || true
+    HOME="$launcher_home" TMUX_TMPDIR="$case_tmux" \
+        "$repo_dir/scripts/fork-sandbox-stop.sh" "$rd_race" >/dev/null 2>&1 || true
     branch_race="$(sed -n 's/^branch=//p' "$rd_race/run.env" 2>/dev/null | head -1)"
     [[ -n "$branch_race" ]] && (cd "$proj" && git branch -q -D "$branch_race" >/dev/null 2>&1) || true
 else
