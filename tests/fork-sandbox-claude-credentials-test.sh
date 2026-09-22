@@ -137,11 +137,31 @@ if [[ "${1:-}" == "--capabilities" ]]; then
 fi
 exit 0
 STUB
+# Every real fork-sandbox.sh fixture below runs under this scratch HOME, not
+# the operator's: sandbox-run-log.py's archive dir and run log are
+# deliberately hardcoded under ~/.claude (no flag can aim them elsewhere),
+# so a fixture run under the real HOME appends handoff archives that are
+# indistinguishable from an operator's real work. This suite already builds
+# its own FORK_SANDBOX_CONFIG_DIR per call -- that half of hermeticity (never
+# touching the operator's live machine config) is already covered; the
+# scratch HOME below closes the archive-leak half without changing how any
+# credential or config fixture is built or injected.
+launcher_home="$(mktemp -d)"; tmpdirs+=("$launcher_home")
+# The launcher's own security boundary requires the project to live under
+# ~/src -- which it resolves against the scratch HOME above, so fixture
+# projects must live there too.
+mkdir -p "$launcher_home/src"
+# The review-leg case below drives --review-loop, which refuses to start
+# unless the review kit's skill directories exist under $HOME/.claude/skills.
+mkdir -p "$launcher_home/.claude/skills/commit-then-review" \
+    "$launcher_home/.claude/skills/code-review-portable"
+operator_archive_dir="$HOME/.claude/sandbox-handoffs"
+
 chmod +x "$real_stub"/*
 
 new_project() {
     local d
-    d="$(mktemp -d "$HOME/src/fs-claude-credentials-test.XXXXXX")"
+    d="$(mktemp -d "$launcher_home/src/fs-claude-credentials-test.XXXXXX")"
     (
         cd "$d" \
             && git init -q . \
@@ -154,7 +174,6 @@ new_project() {
     printf '%s' "$d"
 }
 
-mkdir -p "$HOME/src"
 proj="$(new_project)"; tmpdirs+=("$proj")
 handoff_dir="$(mktemp -d /var/tmp/claude-scratch/fs-claude-credentials-handoff.XXXXXX)"
 tmpdirs+=("$handoff_dir")
@@ -173,7 +192,7 @@ printf '{"claudeAiOauth":{"accessToken":"flag-tok"}}\n' > "$flag_cred"
 run_real() {
     local cfg="$1"; shift
     local out rc rd
-    out="$(PATH="$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$cfg" \
+    out="$(HOME="$launcher_home" PATH="$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$cfg" \
         FORK_SANDBOX_BACKEND=fake-image \
         timeout 60 "$launcher" --foreground "$@" "$proj" "$handoff" 2>&1)"
     rc=$?
@@ -258,7 +277,7 @@ printf '\n== --claude-credentials/CLAUDE_CREDENTIALS resolved to an absolute\n  
 # run) the tmux session already exist.
 missing_cfg="$(mktemp -d)"; tmpdirs+=("$missing_cfg")
 missing_path="$tmp/does-not-exist-credentials.json"
-missing_out="$(PATH="$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$missing_cfg" \
+missing_out="$(HOME="$launcher_home" PATH="$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$missing_cfg" \
     FORK_SANDBOX_BACKEND=fake-image \
     timeout 60 "$launcher" --foreground --harness claude \
     --claude-credentials "$missing_path" "$proj" "$handoff" 2>&1)"
@@ -275,7 +294,7 @@ lacks "missing path: no run directory was created" "run dir:" "$missing_out"
 # file a detached run's tmux -c "$origin_repo" and a --foreground exec from
 # the operator's own shell would otherwise disagree about.
 rel_cfg="$(mktemp -d)"; tmpdirs+=("$rel_cfg")
-rel_out="$(cd "$tmp" && PATH="$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$rel_cfg" \
+rel_out="$(cd "$tmp" && HOME="$launcher_home" PATH="$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$rel_cfg" \
     FORK_SANDBOX_BACKEND=fake-image \
     timeout 60 "$launcher" --foreground --harness claude \
     --claude-credentials flag-credentials.json "$proj" "$handoff" 2>&1)"
@@ -316,7 +335,7 @@ fi
 pi_flag_cfg="$(mktemp -d)"; tmpdirs+=("$pi_flag_cfg")
 install -m 600 /dev/null "$pi_flag_cfg/pi.env"
 printf 'OPENROUTER_API_KEY=fake\n' > "$pi_flag_cfg/pi.env"
-pi_flag_out="$(PATH="$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$pi_flag_cfg" \
+pi_flag_out="$(HOME="$launcher_home" PATH="$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$pi_flag_cfg" \
     FORK_SANDBOX_BACKEND=fake-image \
     timeout 60 "$launcher" --foreground --harness pi --model moonshotai/kimi-k3 \
     --claude-credentials "$missing_path" "$proj" "$handoff" 2>&1)"
@@ -336,7 +355,7 @@ fi
 claude_env_cfg="$(mktemp -d)"; tmpdirs+=("$claude_env_cfg")
 mkdir -p "$claude_env_cfg"
 printf 'CLAUDE_CREDENTIALS=%s\n' "$missing_path" > "$claude_env_cfg/claude.env"
-claude_env_out="$(PATH="$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$claude_env_cfg" \
+claude_env_out="$(HOME="$launcher_home" PATH="$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$claude_env_cfg" \
     FORK_SANDBOX_BACKEND=fake-image \
     timeout 60 "$launcher" --foreground --harness claude "$proj" "$handoff" 2>&1)"
 claude_env_rc=$?
@@ -443,7 +462,7 @@ missing_cfg="$(mktemp -d)"; tmpdirs+=("$missing_cfg")
     printf 'CLAUDE_CREDENTIAL_POOL=%s:%s\n' "$pool_a" "$pool_missing"
     printf 'CLAUDE_HEADROOM_HOOK=missing2\n'
 } > "$missing_cfg/claude.env"
-missing_out="$(PATH="$hook_dir_missing:$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$missing_cfg" \
+missing_out="$(HOME="$launcher_home" PATH="$hook_dir_missing:$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$missing_cfg" \
     FORK_SANDBOX_BACKEND=fake-image \
     timeout 60 "$launcher" --foreground --harness claude "$proj" "$handoff" 2>&1)"
 missing_rc=$?
@@ -511,7 +530,7 @@ printf '\n== credential balancing: config errors and hook exit codes surface thr
 # fork-sandbox-balance-test.sh covers every config-error shape directly.
 pool_no_hook_cfg="$(mktemp -d)"; tmpdirs+=("$pool_no_hook_cfg")
 printf 'CLAUDE_CREDENTIAL_POOL=%s\n' "$pool_a" > "$pool_no_hook_cfg/claude.env"
-pool_no_hook_out="$(PATH="$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$pool_no_hook_cfg" \
+pool_no_hook_out="$(HOME="$launcher_home" PATH="$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$pool_no_hook_cfg" \
     FORK_SANDBOX_BACKEND=fake-image \
     timeout 60 "$launcher" --foreground --harness claude "$proj" "$handoff" 2>&1)"
 pool_no_hook_rc=$?
@@ -529,7 +548,7 @@ noroute_cfg="$(mktemp -d)"; tmpdirs+=("$noroute_cfg")
     printf 'CLAUDE_CREDENTIAL_POOL=%s\n' "$pool_a"
     printf 'CLAUDE_HEADROOM_HOOK=noroute2\n'
 } > "$noroute_cfg/claude.env"
-noroute_out="$(PATH="$hook_dir_noroute:$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$noroute_cfg" \
+noroute_out="$(HOME="$launcher_home" PATH="$hook_dir_noroute:$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$noroute_cfg" \
     FORK_SANDBOX_BACKEND=fake-image \
     timeout 60 "$launcher" --foreground --harness claude "$proj" "$handoff" 2>&1)"
 noroute_rc=$?
@@ -540,6 +559,25 @@ else
         "no routable credential" "$noroute_out"
     contains "exit 2's error at launch names the --claude-credentials override" \
         "--claude-credentials" "$noroute_out"
+fi
+
+printf '\n== fixture runs leave no handoff archives in the operator home ==\n'
+# Own-run-ids shape, not a before/after snapshot diff: a snapshot diff would
+# also catch a concurrent real run or another suite's fixtures archiving
+# during this suite's own window, which is not this suite's leak to report.
+# Every run dir this suite creates is already in tmpdirs (appended right
+# after each launcher call), so that is the complete own-run-ids list; a
+# leaked fixture archive is always named "<run-dir-basename>.md".
+leaked=""
+for d in "${tmpdirs[@]}"; do
+    [[ -n "$d" && -d "$d" ]] || continue
+    cand="$operator_archive_dir/$(basename -- "$d").md"
+    [[ -f "$cand" ]] && leaked+="$cand "
+done
+if [[ -z "$leaked" ]]; then
+    ok "fixture runs append no handoff archives to the operator's durable state"
+else
+    no "fixture runs append no handoff archives to the operator's durable state" "$leaked"
 fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
