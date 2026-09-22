@@ -462,6 +462,22 @@ Applied in order to each unrouted message M in thread T. A message is
 routed exactly once, and the decision is made before any wake is spawned
 for it.
 
+Before rule 0 is ever evaluated, a debounce gate checks whether T is
+quiescent: M is routable only when the newest message on T is at least
+`$FORK_SANDBOX_POSTMASTER_DEBOUNCE` seconds old (default 30, `0`
+disables). A cover plus its patch replies, or a harvested multi-message
+reply burst, land as separate non-atomic store writes seconds apart;
+without this gate a scan can route the cover before the rest of its
+burst has landed, waking a seat to review a truncated thread. A message
+that fails the gate is skipped with no side effect — not marked routed,
+no flag changed — so the next pass retries it for free. This is a
+debounce, not a lock: it shrinks the window from "any scan during the
+posting gap" to the gap between the check and the spawn, it does not
+close it. One consequence for `--once`: a single `--once` pass over
+freshly posted mail defers it, and a later invocation run at least
+`$FORK_SANDBOX_POSTMASTER_DEBOUNCE` seconds after the last post on that
+thread routes it.
+
 0. **Expand M's `To`**, one address at a time, so an unknown address
    elsewhere in the same `To` cannot fail the whole batch. Every expanded
    name that resolves as a fleet agent is a wake candidate. M's `Cc` is
@@ -859,6 +875,7 @@ marker**, so strip leading whitespace first, then test for `> `.
 | `FORK_SANDBOX_FLEET_FILE` | `~/.config/fork-sandbox/fleet.yaml` | registry |
 | `FORK_SANDBOX_PERSONAS_DIR` | `~/.config/fork-sandbox/personas` | registry |
 | `FORK_SANDBOX_THREAD_BUDGET` | `32` | router (rule 3) |
+| `FORK_SANDBOX_POSTMASTER_DEBOUNCE` | `30` (seconds, `0` disables) | router (pre-rule-0 quiescence gate) |
 | `FORK_SANDBOX_POSTMASTER_INTERVAL` | `15` (seconds) | router loop |
 | `FORK_SANDBOX_POSTMASTER_WAKE_DEAD_GRACE` | see `--help` | dead-wake detection |
 | `FORK_SANDBOX_POSTMASTER_TRIAGE_TIMEOUT` | `120` (seconds) | Cc triage classifier call |

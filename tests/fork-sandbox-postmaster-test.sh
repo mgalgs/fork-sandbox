@@ -198,6 +198,13 @@ STUB
 chmod +x "$STUB_BIN/fork-sandbox.sh"
 export FORK_SANDBOX_POSTMASTER_LAUNCHER="$STUB_BIN/fork-sandbox.sh"
 
+# The router now defers routing a message until its thread is quiescent
+# (see FORK_SANDBOX_POSTMASTER_DEBOUNCE). Every existing test here posts
+# mail and immediately runs `deliver --once`, so the suite-wide default
+# is off; the debounce tests below set a nonzero value on their own
+# invocations and restore this afterward.
+export FORK_SANDBOX_POSTMASTER_DEBOUNCE=0
+
 new_root PROJECT_DIR
 
 # ---- test helpers ----
@@ -3795,6 +3802,81 @@ once
 block_noatt="$(call_block_for_branch "sbx-mail-$short_noatt-bob-" "$STUB_ARGV_LOG")"
 check "thread without an attachment: wake's argv carries no --attach-dir" 0 \
     "$(printf '%s' "$block_noatt" | grep -c -- '--attach-dir')"
+
+# ============================================================
+printf '\n== debounce: thread quiescence gates routing ==\n'
+# ============================================================
+
+# A fresh thread's newest message is younger than the debounce, so it is
+# skipped with no side effect; the same message routes once the store's
+# own mtimes say the thread has gone quiet.
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_POSTMASTER_DEBOUNCE=300
+mid_defer="$(send_msg '@carol' '@alice' 'debounce defer' 'defer body' 8)"
+tid_defer="$(thread_of "$mid_defer")"
+: > "$STUB_ARGV_LOG"
+once
+check "debounce: a fresh thread is not routed" 0 \
+    "$(grep -c -- '^--branch$' "$STUB_ARGV_LOG")"
+touch -d '10 minutes ago' "$FORK_SANDBOX_MAIL_ROOT/threads/$tid_defer"/*.msg
+: > "$STUB_ARGV_LOG"
+once
+check "debounce: an aged thread routes on the next pass" 1 \
+    "$(grep -c -- '^--branch$' "$STUB_ARGV_LOG")"
+export FORK_SANDBOX_POSTMASTER_DEBOUNCE=0
+
+# The bug scenario end to end: a cover plus its patch replies post as a
+# non-atomic burst. Once the whole burst has aged past the debounce, a
+# single pass routes the cover-triggered wake with the full series
+# already on-thread, not a patchless cover.
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_POSTMASTER_DEBOUNCE=300
+burst_cover="$(send_msg '@carol' '@operator' 'burst cover' 'burst cover body' 8)"
+tid_burst="$(thread_of "$burst_cover")"
+reply_msg '@carol' "$burst_cover" 'burst patch one body' --subject 'burst patch one' >/dev/null
+reply_msg '@carol' "$burst_cover" 'burst patch two body' --subject 'burst patch two' --to '@alice' >/dev/null
+touch -d '10 minutes ago' "$FORK_SANDBOX_MAIL_ROOT/threads/$tid_burst"/*.msg
+: > "$STUB_ARGV_LOG"
+once
+burst_dir="$(argv_after --thread-dir "$STUB_ARGV_LOG")"
+contains "debounce: released burst snapshot contains the first patch" \
+    "$(cat "$burst_dir/thread.txt")" 'burst patch one body'
+contains "debounce: released burst snapshot contains the triggering patch" \
+    "$(cat "$burst_dir/thread.txt")" 'burst patch two body'
+export FORK_SANDBOX_POSTMASTER_DEBOUNCE=0
+
+# Disabled: explicit zero routes fresh mail immediately (also what the
+# rest of this suite relies on via the shared env export above).
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_POSTMASTER_DEBOUNCE=0
+send_msg '@carol' '@alice' 'debounce disabled' 'off body' 8 >/dev/null
+: > "$STUB_ARGV_LOG"
+once
+check "debounce: FORK_SANDBOX_POSTMASTER_DEBOUNCE=0 routes immediately" 1 \
+    "$(grep -c -- '^--branch$' "$STUB_ARGV_LOG")"
+
+# Quiescence is judged per thread: an aged thread routes in the same pass
+# where an unrelated fresh thread is deferred.
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_POSTMASTER_DEBOUNCE=300
+mid_aged="$(send_msg '@carol' '@alice' 'debounce aged thread' 'aged body' 8)"
+tid_aged="$(thread_of "$mid_aged")"
+touch -d '10 minutes ago' "$FORK_SANDBOX_MAIL_ROOT/threads/$tid_aged"/*.msg
+mid_fresh="$(send_msg '@carol' '@bob' 'debounce fresh thread' 'fresh body' 8)"
+tid_fresh="$(thread_of "$mid_fresh")"
+short_aged="${tid_aged:0:8}"
+short_fresh="${tid_fresh:0:8}"
+: > "$STUB_ARGV_LOG"
+once
+check "debounce: per-thread -- the aged thread routes" 1 \
+    "$(grep -c -- "^sbx-mail-$short_aged-alice-" "$STUB_ARGV_LOG")"
+check "debounce: per-thread -- the fresh thread does not" 0 \
+    "$(grep -c -- "^sbx-mail-$short_fresh-bob-" "$STUB_ARGV_LOG")"
+export FORK_SANDBOX_POSTMASTER_DEBOUNCE=0
 
 # ============================================================
 printf '\n== --help and dispatcher wiring ==\n'

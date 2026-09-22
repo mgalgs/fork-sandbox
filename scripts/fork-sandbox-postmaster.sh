@@ -107,6 +107,11 @@
 # thread T; a message is routed exactly once, decided before any wake is
 # spawned for it):
 #
+#   A debounce gate runs before rule 0 is ever evaluated: M is skipped
+#   entirely (return, no side effect, no rule below applied) while its
+#   thread is not yet quiescent -- see pm_process_message and
+#   $FORK_SANDBOX_POSTMASTER_DEBOUNCE below.
+#
 #   0. Expand M's To via fleet expand, one address at a time (an unknown
 #      address anywhere else in the same To: would otherwise fail the
 #      whole batch) -- every expanded name that resolves as a fleet agent
@@ -1951,6 +1956,28 @@ pm_process_message() {
     mid="$(pm_header "$f" Message-ID)"
     [[ -e "$ROUTED/$mid" ]] && return 0
     tid="$(pm_header "$f" Thread-ID)"
+
+    # Debounce: a v2/v3 cover and its patch replies, or a harvested
+    # multi-message reply burst, land as separate non-atomic store writes
+    # seconds apart. Routing this message before the rest of its burst has
+    # landed produces a real wake reviewing a truncated thread -- paid,
+    # and wrong. This shrinks that window (check-to-spawn), it does not
+    # close it; it is a debounce, not a lock. Silent defer: no event, no
+    # state touched, so the next pass retries it for free.
+    local pm_debounce="${FORK_SANDBOX_POSTMASTER_DEBOUNCE:-30}"
+    if (( pm_debounce > 0 )); then
+        local pm_newest=0 pm_tf pm_mt pm_now
+        for pm_tf in "$MAIL_ROOT/threads/$tid"/*.msg; do
+            [[ -e "$pm_tf" ]] || continue
+            pm_mt="$("$FS_STAT" -c %Y -- "$pm_tf" 2>/dev/null)" || continue
+            (( pm_mt > pm_newest )) && pm_newest=$pm_mt
+        done
+        pm_now="$(date +%s)"
+        if (( pm_now - pm_newest < pm_debounce )); then
+            return 0
+        fi
+    fi
+
     from="$(pm_header "$f" From)"
     to="$(pm_header "$f" To)"
     cc="$(pm_header "$f" Cc)"
