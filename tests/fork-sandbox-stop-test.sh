@@ -46,6 +46,26 @@ export FORK_SANDBOX_RUN_SOURCE=test
 pass=0
 fail=0
 tmpdirs=()
+# The real fork-sandbox.sh fixtures below run under this scratch HOME, not
+# the operator's: sandbox-run-log.py's archive dir and run log are
+# deliberately hardcoded under ~/.claude (no flag can aim them elsewhere),
+# so a fixture run under the real HOME appends handoff archives that are
+# indistinguishable from an operator's real work -- the same leak
+# fork-sandbox-k8s-test.sh isolates its record fixtures against. A scratch
+# HOME also empties the launcher's ${FORK_SANDBOX_CONFIG_DIR:-$HOME/.config/
+# fork-sandbox}, so machine config -- credential balancing above all --
+# cannot route a fixture run, nor refuse it outright when the machine's
+# live quota is tight. The guard near the end of this file holds the
+# archive half of this.
+launcher_home="$(mktemp -d)"; tmpdirs+=("$launcher_home")
+# The launcher's own security boundary requires the project to live under
+# ~/src -- which it resolves against the scratch HOME above, so fixture
+# projects must live there too (and the suite stops littering the real
+# ~/src as a side effect).
+mkdir -p "$launcher_home/src"
+operator_archive_dir="$HOME/.claude/sandbox-handoffs"
+operator_archives_before="$(find "$operator_archive_dir" -maxdepth 1 \
+    -type f 2>/dev/null | sort)"
 # Set only by the exact-match tmux test, to a dedicated -L server -- never
 # the caller's own default one, per
 # fork-sandbox-clone-dir-lock-lifetime-test.sh's header. Killed in the EXIT
@@ -103,7 +123,7 @@ not_contains() {
 
 new_project() {
     local d
-    d="$(mktemp -d "$HOME/src/fs-stop-test.XXXXXX")"
+    d="$(mktemp -d "$launcher_home/src/fs-stop-test.XXXXXX")"
     (
         cd "$d" \
             && git init -q . \
@@ -172,7 +192,7 @@ handoff="$handoff_dir/handoff.md"
 printf 'do the task\n' > "$handoff"
 out_file="$(mktemp)"; tmpdirs+=("$out_file")
 
-PATH="$stub_bin:$PATH" \
+HOME="$launcher_home" PATH="$stub_bin:$PATH" \
     FAKE_CLAUDE_COUNT_FILE="$count_file" \
     FAKE_SLEEP_SECONDS=3 \
     FAKE_HANDOFF_LEGS=",1," \
@@ -231,7 +251,7 @@ fi
 
 # -- a normal, unsignaled run's summary.json has no end_reason key at all.
 count_file2="$(mktemp)"; tmpdirs+=("$count_file2")
-out2="$(PATH="$stub_bin:$PATH" \
+out2="$(HOME="$launcher_home" PATH="$stub_bin:$PATH" \
     FAKE_CLAUDE_COUNT_FILE="$count_file2" \
     FAKE_SLEEP_SECONDS=0 \
     FAKE_HANDOFF_LEGS="" \
@@ -1206,6 +1226,20 @@ else
 fi
 not_contains "failed fetch: does not claim 0 new commits" "0 new commit" "$out_fail"
 contains "failed fetch: names the clone as the rescue path" "$fail_clone" "$out_fail"
+
+printf '\n== fixture runs leave no handoff archives in the operator home ==\n'
+# Same guard as fork-sandbox-k8s-test.sh's: archives carry no source
+# marker, so a leaked fixture archive is indistinguishable from an
+# operator's real work. Compare only against the pre-suite snapshot;
+# never remove or otherwise disturb an existing durable archive.
+new_operator_archives=""
+while IFS= read -r archive_path; do
+    [[ -z "$archive_path" ]] && continue
+    grep -qxF "$archive_path" <<< "$operator_archives_before" && continue
+    new_operator_archives+="$archive_path "
+done < <(find "$operator_archive_dir" -maxdepth 1 -type f 2>/dev/null | sort)
+check "fixture runs append no handoff archives to the operator's durable state" \
+    "" "$new_operator_archives"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))
