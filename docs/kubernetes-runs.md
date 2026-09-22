@@ -978,7 +978,10 @@ unverified widening. Every refusal names the flag and the bad value.
 
 Mechanically, submit renders and applies one additional NetworkPolicy per
 run — `fork-sandbox-k8s-platform-*`'s `render-grant` verb, named
-`<safe_name>-agent-grant`, selecting only this run's own agent pod (see
+`<safe_name>-agent-grant`, selecting only this run's own agent pod by the
+Job controller's `job-name` label. It never selects on `fork-sandbox/branch`,
+because the per-run claude-proxy pod carries that label too, and it holds
+the operator's real access token (see
 `docs/k8s-platform.md` for the verb and the `grant=render-grant` capability
 key a platform must declare to support it). It is purely additive: it never
 touches, and never replaces, the shared `fork-sandbox-agent-egress` seal

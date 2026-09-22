@@ -1164,6 +1164,24 @@ else
     no "the grant is rendered before the Job, matching submit's own apply order" \
         "grant_line=$grant_line job_line=$job_line"
 fi
+# The grant must select the agent pod by job-name, never by the branch label:
+# the per-run claude-proxy Pod (the one holding the real access token) carries
+# fork-sandbox/branch too, and never job-name.
+grant_doc="$(sed -n '/^  name: fork-sandbox-agent-fs-k8s-test-grant-agent-grant$/,/^---$/p' <<< "$grant_dry_out")"
+grant_selector="$(sed -n '/^  podSelector:$/,/^  policyTypes:$/p' <<< "$grant_doc")"
+if grep -qx '      job-name: fork-sandbox-agent-fs-k8s-test-grant' <<< "$grant_selector" \
+    && ! grep -q 'fork-sandbox/branch' <<< "$grant_selector"; then
+    ok "the grant's podSelector is job-name=<safe_name> alone, not the branch label"
+else
+    no "the grant's podSelector is job-name=<safe_name> alone, not the branch label" "$grant_selector"
+fi
+proxy_pod_labels="$(sed -n '/^kind: Pod$/,/^spec:$/p' "$repo_dir/manifests/k8s/31-claude-proxy.yaml")"
+if [[ -n "$proxy_pod_labels" ]] && ! grep -q 'job-name' <<< "$proxy_pod_labels"; then
+    ok "the claude-proxy Pod carries no job-name label, so the grant cannot select it"
+else
+    no "the claude-proxy Pod carries no job-name label, so the grant cannot select it" "$proxy_pod_labels"
+fi
+
 # No --allow-namespace at all: no grant object rendered.
 if [[ "$submit_out" != *"agent-grant"* ]]; then
     ok "a run with no --allow-namespace renders no grant object"

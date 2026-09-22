@@ -3575,8 +3575,11 @@ cmd_submit() {
         for grant_i in "${!run_label_pairs[@]}"; do
             grant_label_args+=(--label "${run_label_pairs[$grant_i]}")
         done
+        # job-name, never fork-sandbox/branch: the per-run claude-proxy Pod
+        # carries the branch label too, and a grant selecting it would widen
+        # the egress of the pod holding the operator's real access token.
         grant_rendered="$("$K8S_PLATFORM_BIN" render-grant --namespace "$K8S_NAMESPACE" \
-            --name "$grant_name" --agent-label "fork-sandbox/branch=$safe_name" \
+            --name "$grant_name" --agent-label "job-name=$safe_name" \
             "${grant_label_args[@]}" "${grant_allow_args[@]}")"$'\n'
     fi
 
