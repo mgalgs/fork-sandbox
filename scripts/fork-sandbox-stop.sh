@@ -130,6 +130,12 @@ branch="$(fs_read_env_value "$run_env" branch || true)"
 origin_repo="$(fs_read_env_value "$run_env" origin_repo || true)"
 clone_dir="$(fs_read_env_value "$run_env" clone_dir || true)"
 base_sha="$(fs_read_env_value "$run_env" base_sha || true)"
+return_base_sha="$(fs_read_env_value "$run_env" return_base_sha || true)"
+# A run.env written before this field existed has none -- fall back to
+# base_sha so an old run dir can still be stopped, at the cost of the
+# miscount this field exists to fix (identical to base_sha on every run
+# except --review-only with a review-base older than the checkout).
+[[ -n "$return_base_sha" ]] || return_base_sha="$base_sha"
 session="$(fs_read_env_value "$run_env" session || true)"
 [[ -n "$branch" && -n "$origin_repo" && -n "$clone_dir" && -n "$base_sha" ]] \
     || die "'$run_dir' has an incomplete run.env (missing branch/origin_repo/clone_dir/base_sha)"
@@ -184,10 +190,10 @@ complete_run_host_side() {
     fi
 
     if (( fetched )); then
-        n_commits="$( (cd "$origin_repo" && git rev-list --count "$base_sha..$branch") 2>/dev/null || printf 0 )"
+        n_commits="$( (cd "$origin_repo" && git rev-list --count "$return_base_sha..$branch") 2>/dev/null || printf 0 )"
         if [[ "$n_commits" == "0" ]]; then
             head_now="$( (cd "$origin_repo" && git rev-parse "$branch") 2>/dev/null || true )"
-            if [[ "$head_now" == "$base_sha" ]] \
+            if [[ "$head_now" == "$return_base_sha" ]] \
                 && (cd "$origin_repo" && git branch -q -D "$branch") >/dev/null 2>&1; then
                 removed=1
             fi
