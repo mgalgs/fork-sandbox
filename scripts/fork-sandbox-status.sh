@@ -39,7 +39,10 @@
 #               where it is a number (never coerces a missing/null one to
 #               0), runs_with_cost and runs_without_cost count the same
 #               split, and states counts every run's state, one key per
-#               state that actually occurs.
+#               state that actually occurs. Two defaults, on purpose: an
+#               absent states key is a genuine zero, a null
+#               cost_usd_total is NOT KNOWN -- default the counts, never
+#               the cost.
 # --events N:   the last N formatted events.
 # --log:        the sandbox wrapper's messages (startup errors live here).
 # --monitor:    watch the run and print one line per notable change, then the

@@ -578,7 +578,12 @@ whose cost is a real number, `runs_with_cost` and `runs_without_cost`
 split the set the same way, an unknown cost (missing or null) is
 counted in `runs_without_cost` and never folded in as a `$0`, and
 `cost_usd_total` itself is `null`, not `0`, when nothing in the set is
-known.
+known. Note that `totals` deliberately mixes two defaulting rules: an
+absent `states` key is a genuine zero (no member is in that state),
+while a null `cost_usd_total` means NOT KNOWN — so a uniform
+`x or 0` / `.get(key, 0)` accessor written across the whole object
+gets every count right and the cost silently wrong, reporting a fleet
+of unknown-cost runs as $0 spent. Default the counts, never the cost.
 
 `fork-sandbox run --wait` turns the ordinary detached launch into a
 synchronous one: after printing the same launch block an unwaited `run`
