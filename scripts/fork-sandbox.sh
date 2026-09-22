@@ -453,6 +453,19 @@
 #                        the combination on a legacy install); --harness
 #                        claude keeps the --model requirement either way.
 #                        Refused without --k8s.
+# --allow-namespace <ns[:port]>:
+#                        with --k8s, widen this run's own agent egress to
+#                        an extra namespace, on top of (never instead of)
+#                        the machine-wide K8S_AGENT_ALLOW_NS default.
+#                        Repeatable. Requires at least one --reach-probe.
+#                        Refused without --k8s. See "Per-run namespace
+#                        grants" in docs/kubernetes-runs.md.
+# --reach-probe <host:port>:
+#                        with --k8s, a namespace this run's own
+#                        --allow-namespace granted that the egress gate
+#                        must confirm is reachable before the run starts.
+#                        Repeatable, required whenever --allow-namespace is
+#                        given, refused without it. Refused without --k8s.
 # --outbox-max <size>:   raise the outbox size cap above the default 64 MiB.
 #                        Takes a plain byte count or a size with a K/M/G
 #                        suffix (512K, 256M, 2G). Applies to both the local
