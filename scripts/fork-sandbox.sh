@@ -1529,6 +1529,8 @@ k8s_keep=false
 k8s_outbox_dir=""
 k8s_endpoint=""
 k8s_endpoint_given=false
+k8s_allow_ns_raw=()
+k8s_reach_probe_raw=()
 outbox_max_arg=""
 network_arg="pinned"
 network_given=false
@@ -1719,6 +1721,14 @@ while [[ "${1:-}" == -* ]]; do
                 echo "match that shape (it becomes a /e/<name>/v1 path segment)." >&2
                 exit 1
             fi
+            shift 2
+            ;;
+        --allow-namespace)
+            k8s_allow_ns_raw+=("${2:?--allow-namespace requires NS[:PORT]}")
+            shift 2
+            ;;
+        --reach-probe)
+            k8s_reach_probe_raw+=("${2:?--reach-probe requires HOST:PORT}")
             shift 2
             ;;
         --outbox-max)
@@ -3066,6 +3076,13 @@ if [[ "$k8s_mode" == true ]]; then
     # headroom hook a second time for one run.
     export FORK_SANDBOX_CLAUDE_CREDENTIALS_VIA="$claude_credentials_via"
     export FORK_SANDBOX_CLAUDE_CREDENTIALS_RESOLVED=1
+    # Unconditional, like --label elsewhere: an empty array is itself the
+    # "none given" signal, so the loop simply forwards nothing. Shape and
+    # cross-checks (required --reach-probe, granted-namespace match, port
+    # agreement) are entirely fork-sandbox-k8s.sh cmd_submit's job, exactly
+    # like every other k8s-only flag this dispatch defers to it.
+    for k8s_grant_fwd in "${k8s_allow_ns_raw[@]}"; do k8s_argv+=(--allow-namespace "$k8s_grant_fwd"); done
+    for k8s_grant_fwd in "${k8s_reach_probe_raw[@]}"; do k8s_argv+=(--reach-probe "$k8s_grant_fwd"); done
     k8s_argv+=(--harness "$harness" --branch "$branch" "$project_path" "$handoff_file")
 
     # This path ends in exec, which replaces the shell image and discards
@@ -3079,10 +3096,12 @@ if [[ "$k8s_mode" == true ]]; then
 fi
 
 if [[ -n "$k8s_timeout" || "$k8s_keep" == true || -n "$k8s_outbox_dir" \
-    || -n "$k8s_endpoint" ]]; then
-    echo "Error: --timeout, --keep, --outbox-dir and --endpoint only apply with --k8s," >&2
+    || -n "$k8s_endpoint" || ${#k8s_allow_ns_raw[@]} -gt 0 \
+    || ${#k8s_reach_probe_raw[@]} -gt 0 ]]; then
+    echo "Error: --timeout, --keep, --outbox-dir, --endpoint," >&2
+    echo "--allow-namespace and --reach-probe only apply with --k8s," >&2
     echo "which passes them on to fork-sandbox-k8s.sh run. Add --k8s, or drop" >&2
-    echo "the flag." >&2
+    echo "the flag. A local sandbox has no namespaces to grant." >&2
     # The preset's endpoint key lands in the same variable --endpoint sets
     # (an explicit flag wins when both are present), so when the preset
     # supplied it, "drop the flag" names a flag the user never passed.

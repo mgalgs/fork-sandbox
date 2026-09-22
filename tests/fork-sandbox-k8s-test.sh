@@ -953,6 +953,125 @@ else
     no "rendered Job sets automountServiceAccountToken: false" "not found in $submit_out"
 fi
 
+printf '\n== submit: --allow-namespace / --reach-probe flag parsing and validation ==\n'
+# --reach-probe requires --allow-namespace, and vice versa: a grant the gate
+# never exercises is not verified, and a probe with nothing to verify is
+# meaningless.
+refuses "--reach-probe without --allow-namespace is refused" \
+    "--reach-probe requires --allow-namespace" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-ns --model moonshotai/kimi-k3 \
+    --reach-probe "svc.demo-slot-01:8000" \
+    "$proj_dir" "$handoff_file"
+refuses "--allow-namespace without --reach-probe is refused" \
+    "--allow-namespace requires at least one --reach-probe" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-ns --model moonshotai/kimi-k3 \
+    --allow-namespace "demo-slot-01:8000" \
+    "$proj_dir" "$handoff_file"
+
+# A probe targeting a namespace this run did not grant is refused -- a grant
+# the gate never exercises is not verified, and a probe for an ungranted
+# namespace verifies nothing about THIS run's own grants.
+refuses "--reach-probe targeting an ungranted namespace is refused" \
+    "not one of this run's --allow-namespace grants" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-ns --model moonshotai/kimi-k3 \
+    --allow-namespace "demo-slot-01:8000" \
+    --reach-probe "svc.demo-slot-02:8000" \
+    "$proj_dir" "$handoff_file"
+
+# A probe whose port disagrees with its namespace's own grant port can never
+# pass the gate -- refused at submit instead of failing 60s later for a
+# reason submit could have named.
+refuses "--reach-probe with a port disagreeing with its namespace's grant is refused" \
+    "they must match, or the probe can never pass the gate" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-ns --model moonshotai/kimi-k3 \
+    --allow-namespace "demo-slot-01:8000" \
+    --reach-probe "svc.demo-slot-01:9000" \
+    "$proj_dir" "$handoff_file"
+
+# The three accepted HOST shapes: bare <svc>.<ns>, <svc>.<ns>.svc, and
+# <svc>.<ns>.svc.$K8S_CLUSTER_DOMAIN (default cluster.local, unset in
+# $config_dir/k8s.env).
+for shape_host in "svc.demo-slot-01" "svc.demo-slot-01.svc" "svc.demo-slot-01.svc.cluster.local"; do
+    if out="$(FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+        --branch fs-k8s-test-ns --model moonshotai/kimi-k3 \
+        --allow-namespace "demo-slot-01:8000" \
+        --reach-probe "$shape_host:8000" \
+        "$proj_dir" "$handoff_file" 2>&1)"; then
+        ok "--reach-probe host shape '$shape_host' is accepted"
+    else
+        no "--reach-probe host shape '$shape_host' is accepted" "$out"
+    fi
+done
+
+# A host with no shape marker at all (no dot, or three labels with no .svc
+# marker) must be refused -- this is the shape check's own CAUTION case,
+# tested directly rather than trusted on inspection.
+refuses "--reach-probe host with no dot at all is refused" \
+    "<svc>.<ns>, <svc>.<ns>.svc" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-ns --model moonshotai/kimi-k3 \
+    --allow-namespace "demo-slot-01:8000" \
+    --reach-probe "bareword:8000" \
+    "$proj_dir" "$handoff_file"
+refuses "--reach-probe host with three labels and no .svc marker is refused" \
+    "<svc>.<ns>, <svc>.<ns>.svc" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-ns --model moonshotai/kimi-k3 \
+    --allow-namespace "demo-slot-01:8000" \
+    --reach-probe "svc.demo-slot-01.extra:8000" \
+    "$proj_dir" "$handoff_file"
+
+# --allow-namespace with no port (every port/protocol) never triggers the
+# port-agreement refusal, whatever port the probe names.
+if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-ns --model moonshotai/kimi-k3 \
+    --allow-namespace "demo-slot-01" \
+    --reach-probe "svc.demo-slot-01:1234" \
+    "$proj_dir" "$handoff_file" >/dev/null 2>/tmp/fs-k8s-test-ns-noport.err; then
+    ok "--allow-namespace with no port accepts a --reach-probe on any port"
+else
+    no "--allow-namespace with no port accepts a --reach-probe on any port" \
+        "$(cat /tmp/fs-k8s-test-ns-noport.err)"
+fi
+
+# Both K8S_AGENT_ALLOW_NS (machine-wide) and --allow-namespace (this run
+# only) set at once must each announce, distinguishably -- the static key's
+# message has no "this run's" wording, the flag's does.
+both_submit_ns_config_dir="$(newdir)"; tmpdirs+=("$both_submit_ns_config_dir")
+cat > "$both_submit_ns_config_dir/k8s.env" <<'CONF'
+K8S_CONTEXT=test-context
+K8S_NAMESPACE=fork-sandbox-test
+K8S_IMAGE=registry.example/you/fork-sandbox:latest
+K8S_PROXY_UPSTREAM=https://openrouter.ai
+K8S_AGENT_ALLOW_NS=static-slot:9000
+K8S_DENIED_PROBE=10.0.0.1:443
+CONF
+install -m 600 /dev/null "$both_submit_ns_config_dir/pi.env"
+printf 'OPENROUTER_API_KEY=sk-test-dummy\n' >> "$both_submit_ns_config_dir/pi.env"
+if FORK_SANDBOX_CONFIG_DIR="$both_submit_ns_config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-ns --model moonshotai/kimi-k3 \
+    --allow-namespace "demo-slot-01:8000" \
+    --reach-probe "svc.demo-slot-01:8000" \
+    "$proj_dir" "$handoff_file" >/dev/null 2>/tmp/fs-k8s-test-both-submit-ns.err; then
+    ok "submit with both K8S_AGENT_ALLOW_NS and --allow-namespace exits 0"
+else
+    no "submit with both K8S_AGENT_ALLOW_NS and --allow-namespace exits 0" \
+        "$(cat /tmp/fs-k8s-test-both-submit-ns.err)"
+fi
+if grep -qF "K8S_AGENT_ALLOW_NS opens agent egress to namespace 'static-slot'" \
+        /tmp/fs-k8s-test-both-submit-ns.err \
+    && grep -qF "this run's --allow-namespace opens agent egress to namespace 'demo-slot-01'" \
+        /tmp/fs-k8s-test-both-submit-ns.err; then
+    ok "submit announces both the static key's and this run's own --allow-namespace grant"
+else
+    no "submit announces both the static key's and this run's own --allow-namespace grant" \
+        "$(cat /tmp/fs-k8s-test-both-submit-ns.err)"
+fi
+
 # fs_emit_prompt_preamble (fork-sandbox-lib.sh), shared with fork-sandbox.sh's
 # local path: the rendered handoff.md must carry the clone-path and
 # gated-egress blocks, must carry an "Operator inbox" section naming

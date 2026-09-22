@@ -10,6 +10,7 @@
 #                            [--checkout REF] [--services-trust-ref REF]
 #                            [--claude-credentials PATH]
 #                            [--label key=value]... [--task-meta JSON]
+#                            [--allow-namespace NS[:PORT]]... [--reach-probe HOST:PORT]...
 #                            <project-path> <handoff-file>
 #        fork-sandbox-k8s.sh run [--dry-run] [--timeout SECONDS] [--keep]
 #                            --branch NAME [--model MODEL] [--endpoint NAME]
@@ -20,6 +21,7 @@
 #                            [--checkout REF] [--services-trust-ref REF]
 #                            [--claude-credentials PATH]
 #                            [--label key=value]... [--task-meta JSON]
+#                            [--allow-namespace NS[:PORT]]... [--reach-probe HOST:PORT]...
 #                            <project-path> <handoff-file>
 #        fork-sandbox-k8s.sh wait --branch NAME [--timeout SECONDS] [--probe]
 #        fork-sandbox-k8s.sh collect --branch NAME [--outbox-dir DIR]
@@ -272,6 +274,22 @@
 # the same meaning as fork-sandbox.sh's own local --task-meta. See "The
 # durable run log" in docs/kubernetes-runs.md and sandbox-run-log.py's own
 # header for the recommended fields.
+#
+# --allow-namespace NS[:PORT] (submit, run), repeatable: opens this run's own
+# agent egress to an extra namespace, for THIS RUN ONLY -- unlike the static
+# K8S_AGENT_ALLOW_NS in k8s.env below, which is a machine-wide default every
+# run inherits. Same syntax and port semantics as K8S_AGENT_ALLOW_NS: with a
+# port, that TCP port only; without one, every port and protocol. Requires
+# the resolved platform plugin to support the `render-grant` capability (see
+# docs/k8s-platform.md), and requires at least one --reach-probe. See "Per-run
+# namespace grants" in docs/kubernetes-runs.md.
+#
+# --reach-probe HOST:PORT (submit, run), repeatable: a destination the egress
+# gate must reach before the agent starts, required whenever --allow-namespace
+# is given (and refused without it). HOST must be <svc>.<ns>, <svc>.<ns>.svc,
+# or <svc>.<ns>.svc.$K8S_CLUSTER_DOMAIN, and <ns> must be one of this run's
+# --allow-namespace values -- a grant the gate never exercises is not
+# verified. See "Per-run namespace grants" in docs/kubernetes-runs.md.
 #
 # --run-dir DIR (collect): finalize the run directory submit created --
 # writing summary.json and calling sandbox-run-log.py record -- rather than
@@ -1704,6 +1722,27 @@ announce_agent_allow_ns() {
     echo "fork-sandbox-k8s: K8S_DENIED_PROBE must name a destination outside those namespaces, or the gate's denied half proves nothing." >&2
 }
 
+# Same as announce_agent_allow_ns, worded for a single run's own
+# --allow-namespace grant rather than the machine-wide K8S_AGENT_ALLOW_NS
+# default. Reads PROXY_ALLOW_NS_NAMESPACES/PORTS directly like its sibling,
+# so the caller must call this immediately after its own
+# parse_proxy_allow_ns call, before anything else can overwrite those
+# globals.
+announce_run_allow_ns() {
+    local i ns port
+    (( ${#PROXY_ALLOW_NS_NAMESPACES[@]} )) || return 0
+    for (( i = 0; i < ${#PROXY_ALLOW_NS_NAMESPACES[@]}; i++ )); do
+        ns="${PROXY_ALLOW_NS_NAMESPACES[$i]}"
+        port="${PROXY_ALLOW_NS_PORTS[$i]}"
+        if [[ -n "$port" ]]; then
+            echo "fork-sandbox-k8s: this run's --allow-namespace opens agent egress to namespace '$ns' on TCP port $port, for this run only." >&2
+        else
+            echo "fork-sandbox-k8s: this run's --allow-namespace opens agent egress to namespace '$ns' on every port and protocol, for this run only." >&2
+        fi
+    done
+    echo "fork-sandbox-k8s: K8S_DENIED_PROBE must name a destination outside every namespace this run can reach, static or per-run, or the gate's denied half proves nothing." >&2
+}
+
 # Parses K8S_PROXY_ALLOW_NS ("<namespace>[:<port>],<namespace>[:<port>],...")
 # into the PROXY_ALLOW_NS_NAMESPACES / PROXY_ALLOW_NS_PORTS arrays
 # (module-global; an empty string in PROXY_ALLOW_NS_PORTS means "every
@@ -2670,7 +2709,7 @@ cmd_submit() {
     local dry_run=false branch="" model="" review_loop_cap="" outbox_max_arg=""
     local context_ro="" harness="pi" review_model="" endpoint="" checkout_ref=""
     local pi_args="" services_trust_ref="" task_meta="" claude_credentials_flag=""
-    local -a labels_raw=()
+    local -a labels_raw=() allow_ns_raw=() reach_probe_raw=()
     while (( $# )); do
         case "$1" in
             --dry-run) dry_run=true; shift ;;
@@ -2688,6 +2727,8 @@ cmd_submit() {
             --claude-credentials) claude_credentials_flag="${2:?--claude-credentials requires a path}"; shift 2 ;;
             --label) labels_raw+=("${2:?--label requires key=value}"); shift 2 ;;
             --task-meta) task_meta="${2:?--task-meta requires a JSON object}"; shift 2 ;;
+            --allow-namespace) allow_ns_raw+=("${2:?--allow-namespace requires NS[:PORT]}"); shift 2 ;;
+            --reach-probe) reach_probe_raw+=("${2:?--reach-probe requires HOST:PORT}"); shift 2 ;;
             -*) echo "Error: unknown option '$1' for submit." >&2; exit 1 ;;
             *) break ;;
         esac
@@ -3318,6 +3359,102 @@ cmd_submit() {
         parse_proxy_allow_ns "$K8S_AGENT_ALLOW_NS" K8S_AGENT_ALLOW_NS || exit 1
         announce_agent_allow_ns
     fi
+
+    # This run's own --allow-namespace grant, on top of (never instead of)
+    # K8S_AGENT_ALLOW_NS above. Comma-joined and run through the same
+    # parser as the static key, with a distinct label so a bad entry's
+    # error names the flag, not the env var. parse_proxy_allow_ns fills
+    # PROXY_ALLOW_NS_* -- already fully consumed by the static-key block's
+    # own announce_agent_allow_ns call just above -- so overwriting it here
+    # is safe. Copied into this function's own arrays immediately after,
+    # since nothing downstream may be assumed to leave PROXY_ALLOW_NS_*
+    # alone.
+    local -a run_allow_ns_namespaces=() run_allow_ns_ports=()
+    if (( ${#allow_ns_raw[@]} > 0 )); then
+        local allow_ns_joined
+        allow_ns_joined="$(IFS=,; printf '%s' "${allow_ns_raw[*]}")"
+        parse_proxy_allow_ns "$allow_ns_joined" --allow-namespace || exit 1
+        run_allow_ns_namespaces=("${PROXY_ALLOW_NS_NAMESPACES[@]}")
+        run_allow_ns_ports=("${PROXY_ALLOW_NS_PORTS[@]}")
+        announce_run_allow_ns
+    fi
+
+    if (( ${#reach_probe_raw[@]} > 0 && ${#allow_ns_raw[@]} == 0 )); then
+        echo "Error: --reach-probe requires --allow-namespace. A reach probe" >&2
+        echo "verifies a grant the gate actually exercises; there is nothing" >&2
+        echo "to verify without one." >&2
+        exit 1
+    fi
+    if (( ${#allow_ns_raw[@]} > 0 && ${#reach_probe_raw[@]} == 0 )); then
+        echo "Error: --allow-namespace requires at least one --reach-probe." >&2
+        echo "A missing policy once passed the gate silently -- every grant" >&2
+        echo "must be exercised by at least one probe, or refuse." >&2
+        exit 1
+    fi
+
+    # Per-probe validation: HOST must be <svc>.<ns>, <svc>.<ns>.svc, or
+    # <svc>.<ns>.svc.$K8S_CLUSTER_DOMAIN (the same three shapes this file
+    # accepts elsewhere for a Service DNS name), <ns> must be one of this
+    # run's granted namespaces, and if that namespace's grant names a port
+    # the probe's port must equal it -- otherwise the probe can never pass
+    # and the run would only fail 60s later at the gate, for a reason
+    # submit could have named right here. Shape is checked with case/glob,
+    # not [[ =~ ]]: K8S_CLUSTER_DOMAIN may contain literal dots, and a dot
+    # is an ERE metacharacter (see this file's other glob-not-regex host
+    # comparisons for the same reason).
+    local -a run_reach_probes=()
+    local probe host port_probe ns_seg gi found gport shape_ok
+    for probe in "${reach_probe_raw[@]}"; do
+        host="${probe%:*}"
+        port_probe="${probe##*:}"
+        if [[ "$port_probe" == "$probe" || -z "$host" || -z "$port_probe" ]]; then
+            echo "Error: --reach-probe '$probe' must be HOST:PORT." >&2
+            exit 1
+        fi
+        if [[ ! "$port_probe" =~ ^[0-9]{1,5}$ ]] || (( 10#$port_probe < 1 || 10#$port_probe > 65535 )); then
+            echo "Error: --reach-probe '$probe' has an invalid port" >&2
+            echo "'$port_probe' -- must be 1-65535." >&2
+            exit 1
+        fi
+        port_probe=$(( 10#$port_probe ))
+
+        shape_ok=false
+        case "$host" in
+            *.*.svc."$K8S_CLUSTER_DOMAIN"|*.*.svc)
+                shape_ok=true ;;
+            *.*)
+                [[ "$host" != *.*.* ]] && shape_ok=true ;;
+        esac
+        if [[ "$shape_ok" != true ]]; then
+            echo "Error: --reach-probe '$probe' has host '$host', which must be" >&2
+            echo "<svc>.<ns>, <svc>.<ns>.svc, or <svc>.<ns>.svc.$K8S_CLUSTER_DOMAIN." >&2
+            exit 1
+        fi
+        ns_seg="${host#*.}"
+        ns_seg="${ns_seg%%.*}"
+
+        found=false
+        gport=""
+        for (( gi = 0; gi < ${#run_allow_ns_namespaces[@]}; gi++ )); do
+            if [[ "${run_allow_ns_namespaces[$gi]}" == "$ns_seg" ]]; then
+                found=true
+                gport="${run_allow_ns_ports[$gi]}"
+                break
+            fi
+        done
+        if [[ "$found" != true ]]; then
+            echo "Error: --reach-probe '$probe' targets namespace '$ns_seg'," >&2
+            echo "which is not one of this run's --allow-namespace grants." >&2
+            exit 1
+        fi
+        if [[ -n "$gport" ]] && (( gport != port_probe )); then
+            echo "Error: --reach-probe '$probe' uses port $port_probe, but the" >&2
+            echo "--allow-namespace grant for '$ns_seg' names port $gport --" >&2
+            echo "they must match, or the probe can never pass the gate." >&2
+            exit 1
+        fi
+        run_reach_probes+=("$host:$port_probe")
+    done
 
     resolve_platform || exit 1
     local icmp_check=0
@@ -4889,7 +5026,7 @@ cmd_run() {
     local dry_run=false keep=false timeout=3600 branch="" model="" review_loop_cap=""
     local outbox_dir="" outbox_max_arg="" context_ro="" harness="" review_model="" endpoint=""
     local checkout_ref="" pi_args="" services_trust_ref="" task_meta="" claude_credentials_flag=""
-    local -a labels_raw=()
+    local -a labels_raw=() allow_ns_raw=() reach_probe_raw=()
     while (( $# )); do
         case "$1" in
             --dry-run) dry_run=true; shift ;;
@@ -4910,6 +5047,8 @@ cmd_run() {
             --claude-credentials) claude_credentials_flag="${2:?--claude-credentials requires a path}"; shift 2 ;;
             --label) labels_raw+=("${2:?--label requires key=value}"); shift 2 ;;
             --task-meta) task_meta="${2:?--task-meta requires a JSON object}"; shift 2 ;;
+            --allow-namespace) allow_ns_raw+=("${2:?--allow-namespace requires NS[:PORT]}"); shift 2 ;;
+            --reach-probe) reach_probe_raw+=("${2:?--reach-probe requires HOST:PORT}"); shift 2 ;;
             -*) echo "Error: unknown option '$1' for run." >&2; exit 1 ;;
             *) break ;;
         esac
@@ -4995,6 +5134,8 @@ cmd_run() {
     # forwards nothing rather than needing a separate -n guard.
     local l
     for l in "${labels_raw[@]}"; do submit_argv+=(--label "$l"); done
+    for l in "${allow_ns_raw[@]}"; do submit_argv+=(--allow-namespace "$l"); done
+    for l in "${reach_probe_raw[@]}"; do submit_argv+=(--reach-probe "$l"); done
     submit_argv+=("$project_path" "$handoff_file")
 
     # cmd_submit does its own full validation (K8S_IMAGE, K8S_DENIED_PROBE,
