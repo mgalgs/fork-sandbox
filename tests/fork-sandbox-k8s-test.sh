@@ -6729,6 +6729,11 @@ printf '\n== fork-sandbox.sh --k8s (fixture config, no cluster) ==\n'
 # flag before reaching these checks. new_src_project mirrors fork-sandbox-
 # prompt-overlay-test.sh's own fixture: a real git repo under the real
 # ~/src, since that is the one root fork-sandbox.sh accepts a project from.
+# On every real operator machine ~/src already exists (fork-sandbox's own
+# security boundary requires it for any real use), so this mkdir -p is a
+# no-op there; it only actually creates anything under a from-scratch HOME
+# with no prior fork-sandbox history, which this suite must also pass under.
+mkdir -p "$HOME/src"
 new_src_project() {
     local d
     d="$(mktemp -d "$HOME/src/fs-k8s-flag-test.XXXXXX")"
@@ -9706,7 +9711,16 @@ balance_resolved_hook_dir="$(balance_fake_hook resolvedmarker "touch $balance_re
     printf 'CLAUDE_HEADROOM_HOOK=resolvedmarker\n'
 } > "$balance_via_config_dir/claude.env"
 balance_resolved_kubectl_log="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$balance_resolved_kubectl_log")")
-balance_resolved_out="$(FORK_SANDBOX_CLAUDE_CREDENTIALS_RESOLVED=1 \
+# via=default falls all the way back to reading the ambient $HOME's own
+# ~/.claude/.credentials.json (submit needs its actual bytes to upload as
+# a k8s Secret), so this needs a real file there -- a fixture one, under
+# its own scratch HOME, never the operator's real default credentials.
+balance_resolved_home="$(newdir)"; tmpdirs+=("$balance_resolved_home")
+mkdir -p "$balance_resolved_home/.claude"
+balance_resolved_future_ms=$(( ($(date +%s) + 7200) * 1000 ))
+printf '{"claudeAiOauth": {"accessToken": "resolved-default-tok", "refreshToken": "fixture-refresh-token", "refreshTokenExpiresAt": 123, "expiresAt": %s, "scopes": ["user:inference"]}}\n' \
+    "$balance_resolved_future_ms" > "$balance_resolved_home/.claude/.credentials.json"
+balance_resolved_out="$(HOME="$balance_resolved_home" FORK_SANDBOX_CLAUDE_CREDENTIALS_RESOLVED=1 \
     FORK_SANDBOX_CONFIG_DIR="$balance_via_config_dir" \
     PATH="$balance_resolved_hook_dir:$runstub_dir:$PATH" K8S_STUB_LOG="$balance_resolved_kubectl_log" \
     K8S_STUB_BASE_SHA="$rundir_head_sha" \

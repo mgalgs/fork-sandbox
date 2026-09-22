@@ -61,8 +61,14 @@ launcher_home="$(mktemp -d)"; tmpdirs+=("$launcher_home")
 # The launcher's own security boundary requires the project to live under
 # ~/src -- which it resolves against the scratch HOME above, so fixture
 # projects must live there too (and the suite stops littering the real
-# ~/src as a side effect).
-mkdir -p "$launcher_home/src"
+# ~/src as a side effect). sandbox-run-log.py's record() opens its
+# ~/.claude/sandbox-runs.jsonl in append mode and does not create the
+# parent directory itself, so on a genuinely empty HOME (no prior real
+# usage to have created it) record() fails outright -- pre-create it here
+# rather than relying on an operator's real ~/.claude having always
+# already existed. The scripts/fork-sandbox-stop.sh fixtures below, which
+# run under this same scratch HOME, share this directory.
+mkdir -p "$launcher_home/src" "$launcher_home/.claude"
 operator_archive_dir="$HOME/.claude/sandbox-handoffs"
 # Set only by the exact-match tmux test, to a dedicated -L server -- never
 # the caller's own default one, per
@@ -280,7 +286,7 @@ stop="$repo_dir/scripts/fork-sandbox-stop.sh"
 # sandbox-run-log.py's own "last run_end wins" merge instead of hand-rolling
 # jq filtering over the raw jsonl.
 run_log_show() {
-    "$repo_dir/scripts/sandbox-run-log.py" show "$(basename "$1")" 2>/dev/null
+    HOME="$launcher_home" "$repo_dir/scripts/sandbox-run-log.py" show "$(basename "$1")" 2>/dev/null
 }
 
 new_run_dir() {
@@ -305,7 +311,7 @@ base_sha=0000000000000000000000000000000000000000
 session=cc-sbx-fs-stop-ended
 EOF
 printf '0\n' > "$rd_ended/exit-code"
-out_ended="$("$stop" "$rd_ended" 2>&1)"; rc_ended=$?
+out_ended="$(HOME="$launcher_home" "$stop" "$rd_ended" 2>&1)"; rc_ended=$?
 check "already-ended: exits 0" "0" "$rc_ended"
 contains "already-ended: says nothing to stop" "already ended" "$out_ended"
 check "already-ended: exit-code file untouched" "0" "$(cat "$rd_ended/exit-code")"
@@ -323,7 +329,7 @@ base_sha=0000000000000000000000000000000000000000
 network=cluster
 session=cc-sbx-fs-stop-k8s
 EOF
-out_k8s="$("$stop" "$rd_k8s" 2>&1)"; rc_k8s=$?
+out_k8s="$(HOME="$launcher_home" "$stop" "$rd_k8s" 2>&1)"; rc_k8s=$?
 if (( rc_k8s != 0 )); then
     ok "k8s run: refused (non-zero exit)"
 else
@@ -367,7 +373,7 @@ EOF
 ( : ) & dead_pid=$!
 wait "$dead_pid" 2>/dev/null || true
 printf '%s\n' "$dead_pid" > "$rd_salvage/pid"
-out_salvage="$("$stop" "$rd_salvage" 2>&1)"; rc_salvage=$?
+out_salvage="$(HOME="$launcher_home" "$stop" "$rd_salvage" 2>&1)"; rc_salvage=$?
 check "salvage: exits 0" "0" "$rc_salvage"
 contains "salvage: reports end_reason salvaged" "salvaged" "$out_salvage"
 check "salvage: exit-code 143 written" "143" "$(cat "$rd_salvage/exit-code" 2>/dev/null)"
@@ -449,7 +455,7 @@ RUN_DIR="$rd_graceful" setsid --fork "$fake_runner_honors_term" \
     < /dev/null > "$rd_graceful/fake-runner.log" 2>&1 &
 graceful_job=$!
 if wait_for_file "$rd_graceful/pid"; then
-    out_graceful="$(timeout 20 "$stop" --timeout 15 "$rd_graceful" 2>&1)"; rc_graceful=$?
+    out_graceful="$(HOME="$launcher_home" timeout 20 "$stop" --timeout 15 "$rd_graceful" 2>&1)"; rc_graceful=$?
     check "graceful: exits 0" "0" "$rc_graceful"
     contains "graceful: reports stopped gracefully" "stopped gracefully" "$out_graceful"
     check "graceful: exit-code 0 as the fake runner wrote" "0" "$(cat "$rd_graceful/exit-code" 2>/dev/null)"
@@ -506,7 +512,7 @@ delayed_job=$!
 if wait_for_file "$rd_delayed/pid"; then
     delayed_pid="$(cat "$rd_delayed/pid")"
     start_ts="$(date +%s)"
-    out_delayed="$(timeout 20 "$stop" --timeout 15 "$rd_delayed" 2>&1)"; rc_delayed=$?
+    out_delayed="$(HOME="$launcher_home" timeout 20 "$stop" --timeout 15 "$rd_delayed" 2>&1)"; rc_delayed=$?
     elapsed_delayed=$(( $(date +%s) - start_ts ))
     check "graceful-with-delay: exits 0" "0" "$rc_delayed"
     contains "graceful-with-delay: reports stopped gracefully" "stopped gracefully" "$out_delayed"
@@ -580,7 +586,7 @@ keepsession_job=$!
 if wait_for_file "$rd_keepsession/pid"; then
     keepsession_pid="$(cat "$rd_keepsession/pid")"
     start_ts_keepsession="$(date +%s)"
-    out_keepsession="$(timeout 20 "$stop" --timeout 15 "$rd_keepsession" 2>&1)"; rc_keepsession=$?
+    out_keepsession="$(HOME="$launcher_home" timeout 20 "$stop" --timeout 15 "$rd_keepsession" 2>&1)"; rc_keepsession=$?
     elapsed_keepsession=$(( $(date +%s) - start_ts_keepsession ))
     check "keep-session shape: exits 0" "0" "$rc_keepsession"
     contains "keep-session shape: reports stopped gracefully" "stopped gracefully" "$out_keepsession"
@@ -636,7 +642,7 @@ RUN_DIR="$rd_fetchfail" setsid --fork "$fake_runner_honors_term" \
     < /dev/null > "$rd_fetchfail/fake-runner.log" 2>&1 &
 fetchfail_job=$!
 if wait_for_file "$rd_fetchfail/pid"; then
-    out_fetchfail="$(timeout 20 "$stop" --timeout 15 "$rd_fetchfail" 2>&1)"; rc_fetchfail=$?
+    out_fetchfail="$(HOME="$launcher_home" timeout 20 "$stop" --timeout 15 "$rd_fetchfail" 2>&1)"; rc_fetchfail=$?
     if (( rc_fetchfail != 0 )); then
         ok "graceful with failed internal fetch: stop reports non-zero exit"
     else
@@ -707,7 +713,7 @@ RUN_DIR="$rd_resurrect" ORIGIN_REPO="$resurrect_origin" CLONE_DIR="$resurrect_cl
     < /dev/null > "$rd_resurrect/fake-runner.log" 2>&1 &
 resurrect_job=$!
 if wait_for_file "$rd_resurrect/pid"; then
-    out_resurrect="$(timeout 20 "$stop" --timeout 15 "$rd_resurrect" 2>&1)"; rc_resurrect=$?
+    out_resurrect="$(HOME="$launcher_home" timeout 20 "$stop" --timeout 15 "$rd_resurrect" 2>&1)"; rc_resurrect=$?
     check "confirmation does not resurrect an already-removed branch: stop exits 0" \
         "0" "$rc_resurrect"
     contains "confirmation does not resurrect an already-removed branch: reports stopped gracefully" \
@@ -768,7 +774,7 @@ if wait_for_file "$rd_extkill/pid"; then
     start_ts_extkill="$(date +%s)"
     ( sleep 1; kill -KILL "$extkill_pid" 2>/dev/null || true ) &
     killer_job=$!
-    out_extkill="$(timeout 20 "$stop" --timeout 15 "$rd_extkill" 2>&1)"; rc_extkill=$?
+    out_extkill="$(HOME="$launcher_home" timeout 20 "$stop" --timeout 15 "$rd_extkill" 2>&1)"; rc_extkill=$?
     elapsed_extkill=$(( $(date +%s) - start_ts_extkill ))
     wait "$killer_job" 2>/dev/null || true
     check "external kill mid-wait: stop exits 0 (completed host-side)" "0" "$rc_extkill"
@@ -830,7 +836,7 @@ RUN_DIR="$rd_timeout" setsid --fork "$fake_runner_ignores_term" \
     < /dev/null > "$rd_timeout/fake-runner.log" 2>&1 &
 timeout_job=$!
 if wait_for_file "$rd_timeout/pid"; then
-    out_timeout="$(timeout 20 "$stop" --timeout 2 "$rd_timeout" 2>&1)"; rc_timeout=$?
+    out_timeout="$(HOME="$launcher_home" timeout 20 "$stop" --timeout 2 "$rd_timeout" 2>&1)"; rc_timeout=$?
     check "timeout: exits 0 (completed host-side)" "0" "$rc_timeout"
     contains "timeout: reports stop-timeout" "stop-timeout" "$out_timeout"
     check "timeout: exit-code 143 written" "143" "$(cat "$rd_timeout/exit-code" 2>/dev/null)"
@@ -932,7 +938,7 @@ RUN_DIR="$rd_group" setsid --fork "$fake_runner_with_child" \
 group_job=$!
 if wait_for_file "$rd_group/pid" && wait_for_file "$rd_group/child-pid"; then
     child_pid="$(cat "$rd_group/child-pid")"
-    timeout 20 "$stop" --timeout 15 "$rd_group" >/dev/null 2>&1; rc_group=$?
+    HOME="$launcher_home" timeout 20 "$stop" --timeout 15 "$rd_group" >/dev/null 2>&1; rc_group=$?
     check "group signal: stop exits 0" "0" "$rc_group"
     if kill -0 "$child_pid" 2>/dev/null; then
         no "group signal: the untrapped child is also dead" \
@@ -999,7 +1005,7 @@ if wait_for_file "$rd_leader/pid" && wait_for_file "$sibling_pid_file"; then
     runner_pid="$(cat "$rd_leader/pid")"
     pgid_seen="$(ps -o pgid= -p "$runner_pid" 2>/dev/null | tr -d '[:space:]')"
     if [[ -n "$pgid_seen" && "$pgid_seen" != "$runner_pid" ]]; then
-        out_leader="$(timeout 20 "$stop" --timeout 15 "$rd_leader" 2>&1)"; rc_leader=$?
+        out_leader="$(HOME="$launcher_home" timeout 20 "$stop" --timeout 15 "$rd_leader" 2>&1)"; rc_leader=$?
         check "leadership guard: stop exits 0" "0" "$rc_leader"
         contains "leadership guard: reports stopped gracefully" "stopped gracefully" "$out_leader"
         if kill -0 "$sibling_pid" 2>/dev/null; then
@@ -1098,7 +1104,7 @@ EOF
             < /dev/null > "$rd_exact/fake-runner.log" 2>&1 &
         exact_job=$!
         if wait_for_file "$rd_exact/pid"; then
-            PATH="$tmux_stub_bin:$PATH" timeout 20 "$stop" --timeout 2 "$rd_exact" \
+            HOME="$launcher_home" PATH="$tmux_stub_bin:$PATH" timeout 20 "$stop" --timeout 2 "$rd_exact" \
                 >/dev/null 2>&1; rc_exact=$?
             check "exact-match tmux: stop exits 0" "0" "$rc_exact"
             # $tmux_a never existed under its own exact name -- the only
@@ -1148,7 +1154,7 @@ EOF
 ( : ) & dead_pid_zero=$!
 wait "$dead_pid_zero" 2>/dev/null || true
 printf '%s\n' "$dead_pid_zero" > "$rd_zero/pid"
-out_zero="$("$stop" "$rd_zero" 2>&1)"; rc_zero=$?
+out_zero="$(HOME="$launcher_home" "$stop" "$rd_zero" 2>&1)"; rc_zero=$?
 check "zero commits: stop exits 0" "0" "$rc_zero"
 contains "zero commits: reports 0 new commits" "0 new commit" "$out_zero"
 check "zero commits: branch removed" \
@@ -1191,7 +1197,7 @@ EOF
 ( : ) & dead_pid_checkout=$!
 wait "$dead_pid_checkout" 2>/dev/null || true
 printf '%s\n' "$dead_pid_checkout" > "$rd_checkout/pid"
-out_checkout="$("$stop" "$rd_checkout" 2>&1)"; rc_checkout=$?
+out_checkout="$(HOME="$launcher_home" "$stop" "$rd_checkout" 2>&1)"; rc_checkout=$?
 check "checkout-base: stop exits 0" "0" "$rc_checkout"
 contains "checkout-base: reports 0 new commits from return_base_sha" "0 new commit" "$out_checkout"
 check "checkout-base: branch removed (zero commits past return_base_sha)" \
@@ -1216,7 +1222,7 @@ EOF
 ( : ) & dead_pid_fail=$!
 wait "$dead_pid_fail" 2>/dev/null || true
 printf '%s\n' "$dead_pid_fail" > "$rd_fail/pid"
-out_fail="$("$stop" "$rd_fail" 2>&1)"; rc_fail=$?
+out_fail="$(HOME="$launcher_home" "$stop" "$rd_fail" 2>&1)"; rc_fail=$?
 if (( rc_fail != 0 )); then
     ok "failed fetch: stop reports non-zero exit"
 else
