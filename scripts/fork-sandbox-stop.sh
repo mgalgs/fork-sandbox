@@ -173,7 +173,7 @@ fi
 # inside the clone. Every git command below runs in the origin repo.
 complete_run_host_side() {
     local reason="$1" kill_tmux="$2"
-    local fetched=0 n_commits=0 removed=0 head_now=""
+    local fetched=0 n_commits=0 removed=0 head_now="" fetch_failed=0
 
     if [[ "$kill_tmux" == 1 && -n "$session" ]]; then
         # Exact-match: without the '=' prefix tmux prefix/fnmatch-matches
@@ -186,6 +186,10 @@ complete_run_host_side() {
 
     if (cd "$origin_repo" && git fetch --quiet "$clone_dir" "$branch:$branch") 2>/dev/null; then
         fetched=1
+    else
+        fetch_failed=1
+        printf 'fork-sandbox-stop: could not fetch branch %s back from %s into %s -- the work is still there, not lost, but NOT yet in your repo. Retry by hand once the problem is fixed:\n  (cd %q && git fetch %q %q:%q)\n' \
+            "$branch" "$clone_dir" "$origin_repo" "$origin_repo" "$clone_dir" "$branch" "$branch" >&2
     fi
 
     if (( fetched )); then
@@ -199,7 +203,11 @@ complete_run_host_side() {
         fi
     fi
 
-    printf '143\n' > "$exit_code_file"
+    if [[ -L "$exit_code_file" ]]; then
+        printf 'fork-sandbox-stop: refusing to write exit-code through a symlink at %s\n' "$exit_code_file" >&2
+    else
+        printf '143\n' > "$exit_code_file"
+    fi
 
     # No stub summary.json is fabricated here: a fabricated one holding only
     # end_reason/ended_at/branch would suppress sandbox-run-log.py record's
@@ -214,9 +222,16 @@ complete_run_host_side() {
         >/dev/null 2>&1 \
         || printf 'fork-sandbox-stop: run-log append failed\n' >&2
 
+    if (( fetch_failed )); then
+        printf 'end_reason: %s; branch %s NOT fetched back -- see the fetch failure above.\n' \
+            "$reason" "$branch"
+        return 1
+    fi
+
     printf 'end_reason: %s; branch %s, %s new commit(s)%s.\n' \
         "$reason" "$branch" "$n_commits" \
         "$( (( removed )) && printf ', branch removed (no new commits)' || true )"
+    return 0
 }
 
 if (( ! runner_alive )); then
@@ -225,8 +240,11 @@ if (( ! runner_alive )); then
     # Nothing to signal; go straight to the same completion the timeout path
     # uses, minus the kill-session (there is no session left to kill, or one
     # this run never touched).
-    complete_run_host_side salvaged 0
-    exit 0
+    if complete_run_host_side salvaged 0; then
+        exit 0
+    else
+        exit 1
+    fi
 fi
 
 # Entry state 2: the runner is alive. Whether to signal its process GROUP or
@@ -286,4 +304,8 @@ fi
 # still owe a run_end -- distinguishable from a clean stop -- instead of
 # leaving the gap this verb exists to close merely relocated.
 printf 'timed out after %ss waiting for a graceful stop; forcing it.\n' "$timeout_secs" >&2
-complete_run_host_side stop-timeout 1
+if complete_run_host_side stop-timeout 1; then
+    exit 0
+else
+    exit 1
+fi
