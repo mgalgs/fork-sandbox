@@ -287,6 +287,31 @@ refuse_review_only "--review-loop" "one review leg" --review-loop 1
 
 printf '\n== --maintainer-loop: the built commands (--foreground, stubs) ==\n'
 
+# Every real fork-sandbox.sh fixture below runs under this scratch HOME, not
+# the operator's: sandbox-run-log.py's archive dir and run log are
+# deliberately hardcoded under ~/.claude (no flag can aim them elsewhere),
+# so a fixture run under the real HOME appends handoff archives that are
+# indistinguishable from an operator's real work. A scratch HOME also
+# empties the launcher's ${FORK_SANDBOX_CONFIG_DIR:-$HOME/.config/
+# fork-sandbox}, so machine config -- credential balancing above all --
+# cannot route a fixture run, nor refuse it outright when the machine's
+# live quota is tight.
+launcher_home="$(mktemp -d)"; tmpdirs+=("$launcher_home")
+# The launcher's own security boundary requires the project to live under
+# ~/src -- which it resolves against the scratch HOME above, so fixture
+# projects must live there too (and the suite stops littering the real
+# ~/src as a side effect).
+mkdir -p "$launcher_home/src"
+# --review-loop refuses to start unless the review kit's skill directories
+# exist under $HOME/.claude/skills (fork-sandbox.sh's review_skill_src
+# check) -- real content is never read, fs_emit_review_prompt_body only
+# ever quotes the path, so an empty directory satisfies it. Only the
+# seven-leg combined scenario and the summary-probe helper below drive
+# --review-loop, but an unused empty directory costs nothing for the rest.
+mkdir -p "$launcher_home/.claude/skills/commit-then-review" \
+    "$launcher_home/.claude/skills/code-review-portable"
+operator_archive_dir="$HOME/.claude/sandbox-handoffs"
+
 # Real foreground runs with every wrapper stubbed and the backend faked into
 # image mode -- the same machinery fork-sandbox-review-harness-test.sh uses.
 real_stub="$(mktemp -d /var/tmp/claude-scratch/fs-maintainer-real-stub.XXXXXX)"
@@ -321,7 +346,7 @@ printf '{"tokens":{"access_token":"e30.eyJleHAiOjQxMDI0NDQ4MDB9.sig","refresh_to
 
 new_project() {
     local d
-    d="$(mktemp -d "$HOME/src/fs-maintainer-test.XXXXXX")"
+    d="$(mktemp -d "$launcher_home/src/fs-maintainer-test.XXXXXX")"
     (
         cd "$d" \
             && git init -q . \
@@ -342,7 +367,7 @@ printf 'do the task MNT-BRIEF-SENTINEL-9d2c\n' > "$handoff"
 
 run_real() {
     local out rc rd
-    out="$(PATH="$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$real_cfg" \
+    out="$(HOME="$launcher_home" PATH="$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$real_cfg" \
         CODEX_HOME="$real_codex_home" \
         FORK_SANDBOX_BACKEND=fake-image \
         timeout 60 "$launcher" --foreground "$@" "$proj" "$handoff" 2>&1)"
@@ -405,7 +430,7 @@ if [[ -n "$rd_c" ]]; then
     lacks "a claude implement command has no Codex maintainer mount" \
         "codex-sessions" "$impl_line"
     contains "a Codex maintainer mounts its per-run sessions directory" \
-        "--bind-rw-at $rd_c/codex-sessions $HOME/.codex/sessions" "$mnt_line"
+        "--bind-rw-at $rd_c/codex-sessions $launcher_home/.codex/sessions" "$mnt_line"
 else
     no "a run with a Codex maintainer produced a run directory" \
         "run_real failed"
@@ -520,7 +545,7 @@ STUB
 chmod +x "$mnt2_stub/claude-sandboxed"
 
 count2="$(mktemp)"; tmpdirs+=("$count2")
-out2="$(PATH="$mnt2_stub:$real_stub:$PATH" FAKE_COUNT_FILE="$count2" \
+out2="$(HOME="$launcher_home" PATH="$mnt2_stub:$real_stub:$PATH" FAKE_COUNT_FILE="$count2" \
     FORK_SANDBOX_CONFIG_DIR="$real_cfg" FORK_SANDBOX_BACKEND=fake-image \
     timeout 60 "$launcher" --foreground --harness claude \
     --maintainer-loop 2 --maintainer-model sonnet \
@@ -698,7 +723,7 @@ STUB
 chmod +x "$loop3_stub/claude-sandboxed"
 
 count3="$(mktemp)"; tmpdirs+=("$count3")
-out3="$(PATH="$loop3_stub:$real_stub:$PATH" FAKE_COUNT_FILE="$count3" \
+out3="$(HOME="$launcher_home" PATH="$loop3_stub:$real_stub:$PATH" FAKE_COUNT_FILE="$count3" \
     FORK_SANDBOX_CONFIG_DIR="$real_cfg" FORK_SANDBOX_BACKEND=fake-image \
     timeout 60 "$launcher" --foreground --harness claude \
     --review-loop 2 --review-model sonnet \
@@ -884,7 +909,7 @@ STUB
 chmod +x "$mntnp_stub/claude-sandboxed"
 
 countnp="$(mktemp)"; tmpdirs+=("$countnp")
-outnp="$(PATH="$mntnp_stub:$real_stub:$PATH" FAKE_COUNT_FILE="$countnp" \
+outnp="$(HOME="$launcher_home" PATH="$mntnp_stub:$real_stub:$PATH" FAKE_COUNT_FILE="$countnp" \
     FORK_SANDBOX_CONFIG_DIR="$real_cfg" FORK_SANDBOX_BACKEND=fake-image \
     timeout 60 "$launcher" --foreground --harness claude \
     --maintainer-loop 3 --maintainer-model sonnet \
@@ -919,7 +944,7 @@ exit 3
 STUB
 chmod +x "$mntfail_stub/claude-sandboxed"
 
-outf="$(PATH="$mntfail_stub:$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$real_cfg" \
+outf="$(HOME="$launcher_home" PATH="$mntfail_stub:$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$real_cfg" \
     FORK_SANDBOX_BACKEND=fake-image \
     timeout 60 "$launcher" --foreground --harness claude \
     --maintainer-loop 1 --maintainer-model sonnet \
@@ -983,7 +1008,7 @@ chmod +x "$mntnz_stub/claude-sandboxed"
 # (and approves) despite the coding leg's failure, and the run's own exit
 # code still reports the coding leg's failure.
 count_mntnzA="$(mktemp)"; tmpdirs+=("$count_mntnzA")
-outA_mntnz="$(PATH="$mntnz_stub:$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$real_cfg" \
+outA_mntnz="$(HOME="$launcher_home" PATH="$mntnz_stub:$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$real_cfg" \
     FORK_SANDBOX_BACKEND=fake-image FAKE_COUNT_FILE="$count_mntnzA" \
     NZ_COMMIT=1 NZ_EXIT=3 \
     timeout 60 "$launcher" --foreground --harness claude \
@@ -1015,7 +1040,7 @@ fi
 # B: non-zero exit, with NO commits -- still skips, because there is nothing
 # to review, not because of the exit code.
 count_mntnzB="$(mktemp)"; tmpdirs+=("$count_mntnzB")
-outB_mntnz="$(PATH="$mntnz_stub:$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$real_cfg" \
+outB_mntnz="$(HOME="$launcher_home" PATH="$mntnz_stub:$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$real_cfg" \
     FORK_SANDBOX_BACKEND=fake-image FAKE_COUNT_FILE="$count_mntnzB" \
     NZ_COMMIT=0 NZ_EXIT=3 \
     timeout 60 "$launcher" --foreground --harness claude \
@@ -1167,7 +1192,7 @@ summary_probe() {
     local tag="$1" cap="$2" verdict="$3"
     local count out rc rd
     count="$(mktemp)"; tmpdirs+=("$count")
-    out="$(PATH="$sumstub:$real_stub:$PATH" FAKE_COUNT_FILE="$count" \
+    out="$(HOME="$launcher_home" PATH="$sumstub:$real_stub:$PATH" FAKE_COUNT_FILE="$count" \
         FORK_SANDBOX_CONFIG_DIR="$real_cfg" FORK_SANDBOX_BACKEND=fake-image \
         REVIEW_VERDICT1="$verdict" \
         timeout 60 "$launcher" --foreground --harness claude \
@@ -1337,7 +1362,7 @@ exit 0
 STUB
 chmod +x "$authnorm_ok_stub/claude-sandboxed"
 
-out_ok="$(PATH="$authnorm_ok_stub:$real_stub:$PATH" \
+out_ok="$(HOME="$launcher_home" PATH="$authnorm_ok_stub:$real_stub:$PATH" \
     FORK_SANDBOX_CONFIG_DIR="$real_cfg" FORK_SANDBOX_BACKEND=fake-image \
     timeout 60 "$launcher" --foreground --harness claude \
     --branch "sandbox-test-authnorm-ok-$$" \
@@ -1374,7 +1399,7 @@ fi
 # about the persistent clone still carrying the bad identity applies.
 authnorm_seat_dir="/var/tmp/claude-scratch/fs-authnorm-seat.$$"
 tmpdirs+=("$authnorm_seat_dir")
-out_seat="$(PATH="$authnorm_ok_stub:$real_stub:$PATH" \
+out_seat="$(HOME="$launcher_home" PATH="$authnorm_ok_stub:$real_stub:$PATH" \
     FORK_SANDBOX_CONFIG_DIR="$real_cfg" FORK_SANDBOX_BACKEND=fake-image \
     timeout 60 "$launcher" --foreground --harness claude \
     --branch "sandbox-test-authnorm-seat-$$" --clone-dir "$authnorm_seat_dir" \
@@ -1418,7 +1443,7 @@ exit 0
 STUB
 chmod +x "$authnorm_skip_stub/claude-sandboxed"
 
-out_skip="$(PATH="$authnorm_skip_stub:$real_stub:$PATH" \
+out_skip="$(HOME="$launcher_home" PATH="$authnorm_skip_stub:$real_stub:$PATH" \
     FORK_SANDBOX_CONFIG_DIR="$real_cfg" FORK_SANDBOX_BACKEND=fake-image \
     timeout 60 "$launcher" --foreground --harness claude \
     --branch "sandbox-test-authnorm-skip-$$" \
@@ -1447,7 +1472,7 @@ fi
 # mismatched commit's own author name and forces only the email, so this
 # rewrite succeeds like any other (fs_normalize_authorship's own unit test
 # covers the fallback directly; this exercises it through the launcher).
-proj_no_name="$(mktemp -d "$HOME/src/fs-maintainer-test-noname.XXXXXX")"
+proj_no_name="$(mktemp -d "$launcher_home/src/fs-maintainer-test-noname.XXXXXX")"
 tmpdirs+=("$proj_no_name")
 (
     cd "$proj_no_name" \
@@ -1476,7 +1501,7 @@ exit 0
 STUB
 chmod +x "$authnorm_noname_stub/claude-sandboxed"
 
-out_noname="$(PATH="$authnorm_noname_stub:$real_stub:$PATH" \
+out_noname="$(HOME="$launcher_home" PATH="$authnorm_noname_stub:$real_stub:$PATH" \
     FORK_SANDBOX_CONFIG_DIR="$real_cfg" FORK_SANDBOX_BACKEND=fake-image \
     timeout 60 "$launcher" --foreground --harness claude \
     --branch "sandbox-test-authnorm-noname-$$" \
@@ -1499,6 +1524,22 @@ else
     no "a half-configured-identity run produced a run directory" \
         "rc=$rc_noname: $out_noname"
 fi
+
+printf '\n== fixture runs leave no handoff archives in the operator home ==\n'
+# Own-run-ids shape, not a before/after snapshot diff: a snapshot diff would
+# also catch a concurrent real run or another suite's fixtures archiving
+# during this suite's own window, which is not this suite's leak to report.
+# Every run dir this suite creates is already in tmpdirs (appended right
+# after each launcher call), so that is the complete own-run-ids list; a
+# leaked fixture archive is always named "<run-dir-basename>.md".
+leaked=""
+for d in "${tmpdirs[@]}"; do
+    [[ -n "$d" && -d "$d" ]] || continue
+    cand="$operator_archive_dir/$(basename -- "$d").md"
+    [[ -f "$cand" ]] && leaked+="$cand "
+done
+check "fixture runs append no handoff archives to the operator's durable state" \
+    "" "$leaked"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))
