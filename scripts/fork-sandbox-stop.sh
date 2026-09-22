@@ -171,7 +171,12 @@ complete_run_host_side() {
     local fetched=0 n_commits=0 removed=0 head_now="" ended_at
 
     if [[ "$kill_tmux" == 1 && -n "$session" ]]; then
-        tmux kill-session -t "$session" 2>/dev/null || true
+        # Exact-match: without the '=' prefix tmux prefix/fnmatch-matches
+        # the target, and can kill a DIFFERENT session whose name happens
+        # to start with this one (e.g. "cc-sbx-x" matching "cc-sbx-x-2").
+        # fork-sandbox.sh's own has-session check uses the same "=$name"
+        # idiom (see fork-sandbox.sh's session-existence check).
+        tmux kill-session -t "=$session" 2>/dev/null || true
     fi
 
     if (cd "$origin_repo" && git fetch --quiet "$clone_dir" "$branch:$branch") 2>/dev/null; then
@@ -218,13 +223,9 @@ if (( ! runner_alive )); then
     exit 0
 fi
 
-# Entry state 2: the runner is alive. A bash TERM trap does not fire while a
-# foreground child runs, so signaling only the runner's own pid would do
-# nothing until whichever harness leg is running happens to return -- which
-# can be an hour away. Signal the whole process GROUP instead: the harness
-# leg's child gets TERM directly and dies, the foreground command returns,
-# and the runner's own deferred trap (fork-sandbox.sh's `trap 'stop_requested=1' TERM`)
-# then runs and lets its existing teardown finish normally.
+# Entry state 2: the runner is alive. Whether to signal its process GROUP or
+# just the runner's own pid depends on whether the runner LEADS that group --
+# see the leadership branch below.
 pgid="$( { ps -o pgid= -p "$pid" 2>/dev/null || true; } | tr -d '[:space:]')"
 [[ -n "$pgid" ]] \
     || die "the runner process ($pid) vanished before it could be signaled. Nothing was sent; run 'fork-sandbox stop' again to check its new state."
@@ -237,8 +238,30 @@ pgid_now="$( { ps -o pgid= -p "$pid" 2>/dev/null || true; } | tr -d '[:space:]')
 [[ -n "$pgid_now" && "$pgid_now" == "$pgid" ]] \
     || die "the runner process ($pid)'s process group changed while stopping; refusing to guess which group to signal. Run 'fork-sandbox stop' again."
 
-kill -TERM -- "-$pgid" 2>/dev/null \
-    || die "could not signal process group $pgid"
+if [[ "$pgid_now" == "$pid" ]]; then
+    # The runner leads its own process group -- the normal case, a detached
+    # tmux session's foreground command. A bash TERM trap does not fire
+    # while a foreground child runs, so signaling only the runner's own pid
+    # would do nothing until whichever harness leg is running happens to
+    # return -- which can be an hour away. Signal the whole group instead:
+    # the harness leg's child gets TERM directly and dies, the foreground
+    # command returns, and the runner's own deferred trap
+    # (fork-sandbox.sh's `trap 'stop_requested=1' TERM`) then runs and lets
+    # its existing teardown finish normally.
+    kill -TERM -- "-$pgid_now" 2>/dev/null \
+        || die "could not signal process group $pgid_now"
+else
+    # A --foreground run inherits its CALLER's process group instead of
+    # leading its own -- there is no group here that belongs to the runner
+    # alone, so a group signal would TERM the launching shell and its
+    # siblings too. Signal the runner's own pid instead. Its TERM trap will
+    # not fire until the current foreground leg returns on its own (a bash
+    # trap cannot interrupt a running foreground child), so a foreground
+    # stop is best-effort-prompt rather than immediate -- correct behaviour
+    # here, not a bug, and far better than killing the caller.
+    kill -TERM "$pid" 2>/dev/null \
+        || die "could not signal the runner ($pid)"
+fi
 
 waited=0
 while (( waited < timeout_secs )); do
