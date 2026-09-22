@@ -120,5 +120,47 @@ else
 fi
 rm -f /tmp/claude-sandboxed-cred-test.out
 
+printf '\n== the 5-minute token floor ==\n'
+cred_json_with_mins() {
+    local mins="$1" path="$2" ms
+    ms=$(( ($(date +%s) + mins * 60) * 1000 ))
+    cat > "$path" <<JSON
+{"claudeAiOauth": {"accessToken": "fixture-floor-token", "expiresAt": $ms, "scopes": ["user:inference"]}}
+JSON
+}
+
+four_min_cred="$work/four-min-credentials.json"
+cred_json_with_mins 4 "$four_min_cred"
+work_dir4="$work/four-min-wd"; mkdir -p "$work_dir4"
+refuses "4 minutes left refuses, naming the floor" \
+    "expires in 4m" \
+    env PATH="$bin:$PATH" FORK_SANDBOX_BACKEND=test HOME="$test_home" \
+    "$client" --claude-credentials "$four_min_cred" "$work_dir4" --print hello
+
+six_min_cred="$work/six-min-credentials.json"
+cred_json_with_mins 6 "$six_min_cred"
+work_dir5="$work/six-min-wd"; mkdir -p "$work_dir5"
+six_min_out="$(PATH="$bin:$PATH" FORK_SANDBOX_BACKEND=test HOME="$test_home" \
+    "$client" --claude-credentials "$six_min_cred" "$work_dir5" --print hello 2>&1)"
+six_min_rc=$?
+if (( six_min_rc == 0 )); then
+    ok "6 minutes left proceeds past the check"
+else
+    no "6 minutes left proceeds past the check" "status $six_min_rc: $six_min_out"
+fi
+if [[ "$six_min_out" == *"Warning:"*"expires in"* ]]; then
+    ok "6 minutes left still warns"
+else
+    no "6 minutes left still warns" "$six_min_out"
+fi
+
+expired_cred="$work/expired-credentials.json"
+cred_json_with_mins -10 "$expired_cred"
+work_dir6="$work/expired-wd"; mkdir -p "$work_dir6"
+refuses "already expired keeps the expired message" \
+    "has expired" \
+    env PATH="$bin:$PATH" FORK_SANDBOX_BACKEND=test HOME="$test_home" \
+    "$client" --claude-credentials "$expired_cred" "$work_dir6" --print hello
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))

@@ -458,6 +458,10 @@ if (( ! EXEC_MODE )); then
         echo "Error: the access token in $(fs_claude_credential_source "$CLAUDE_CREDENTIALS") has expired." >&2
         echo "Log in with claude on the host, then retry." >&2
         exit 1
+    elif (( MINS_LEFT < 5 )); then
+        echo "Error: the access token in $(fs_claude_credential_source "$CLAUDE_CREDENTIALS") expires in ${MINS_LEFT}m." >&2
+        echo "The sandbox cannot refresh the token, so the session would die almost at once. Log in with claude on the host, then retry." >&2
+        exit 1
     elif (( MINS_LEFT < 60 )); then
         echo "Warning: the access token expires in ${MINS_LEFT}m; the sandbox session dies then." >&2
     fi
