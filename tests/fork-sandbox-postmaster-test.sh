@@ -2517,6 +2517,41 @@ contains "renderer failure constraint: handoff failure is flagged" \
     'handoff render failed for alice'
 
 # ============================================================
+printf '\n== snapshot failure still wakes the seat on the full thread ==\n'
+# ============================================================
+
+# Prevents the failure this fallback exists for: a seat woken with a
+# trigger-only prompt and no thread mount, left reviewing blind.
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+mkdir -p -- "$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+# wake-threads/ as a regular FILE, so pm_spawn_wake's `mkdir -p` of this
+# wake's snapshot directory under it cannot succeed. The renderer itself
+# stays the real one -- this is the snapshot-assembly failure, not the
+# renderer-unavailable case above.
+: > "$FORK_SANDBOX_MAIL_ROOT/.postmaster/wake-threads"
+snapfail_root="$(send_msg '@carol' '@operator' 'snapshot fallback thread' 'snapfail earlier body' 8)"
+: > "$STUB_ARGV_LOG"
+once
+snapfail_mid="$(reply_msg '@bob' "$snapfail_root" 'snapfail trigger body' --to '@alice')"
+: > "$STUB_ARGV_LOG"
+once
+snapfail_handoff="$(cat "$(handoff_file_for_agent alice)")"
+check "snapshot fallback: the wake is still launched" 1 \
+    "$(grep -c -- '^--branch$' "$STUB_ARGV_LOG")"
+check "snapshot fallback: no thread mount is passed" 0 \
+    "$(grep -c -- '^--thread-dir$' "$STUB_ARGV_LOG")"
+contains "snapshot fallback: handoff carries an earlier message's body" \
+    "$snapfail_handoff" '> snapfail earlier body'
+contains "snapshot fallback: handoff carries the triggering body too" \
+    "$snapfail_handoff" '> snapfail trigger body'
+contains "snapshot fallback: handoff uses the legacy full-thread section" \
+    "$snapfail_handoff" '## Thread'
+contains "snapshot fallback: the snapshot failure is flagged for the operator" \
+    "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$(thread_of "$snapfail_mid")")" \
+    'wake thread snapshot failed for alice'
+
+# ============================================================
 printf '\n== harvest: exit-code alone is not terminal (summary.json still pending) ==\n'
 # ============================================================
 
