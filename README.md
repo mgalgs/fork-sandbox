@@ -507,6 +507,8 @@ fork-sandbox run ~/src/proj /var/tmp/claude-scratch/handoff.md
 fork-sandbox run --review-loop 2 --review-model opus ~/src/proj handoff.md
 fork-sandbox run --harness pi --network sealed ~/src/proj handoff.md   # your model, no network
 fork-sandbox run --preset deep ~/src/proj handoff.md        # a named pipeline (docs/presets.md)
+fork-sandbox run --wait ~/src/proj handoff.md                # block here until it ends
+fork-sandbox run --wait --wait-timeout 1800 ~/src/proj handoff.md  # give up after 30m
 
 # Watch it
 fork-sandbox status <run-dir>              # status at a glance
@@ -549,6 +551,27 @@ record — the same way a crash recovery would), and `salvaged` (the runner
 was already dead when the verb ran, e.g. after a raw `tmux kill-session`,
 so it went straight to that same host-side completion). Run against an
 already-ended run, it is a no-op.
+
+`fork-sandbox run --wait` turns the ordinary detached launch into a
+synchronous one: after printing the same launch block an unwaited `run`
+prints, it streams `fork-sandbox-status.sh --monitor-terminal <run-dir>`
+and blocks until the run reaches a terminal state, then exits with the
+run's own outcome instead of `status.sh`'s own always-0 exit:
+
+| `--wait` exit | meaning |
+| --- | --- |
+| `0` | the run's own exit code was `0` |
+| `1`-`255` | the run's own exit code, unchanged |
+| `124` | `--wait-timeout` expired; the run is still going, untouched |
+| `125` | no exit-code file was ever written (run dir gone, runner abandoned, or it never started — the printed line says which) |
+
+`--wait-timeout <secs>` wraps the watch in `timeout --foreground <secs>`;
+on expiry it does not stop, signal, or clean up the run — that is a
+decision for the caller, via `fork-sandbox stop <run-dir>` or by re-arming
+`fork-sandbox-status.sh --monitor-terminal <run-dir>` to keep waiting.
+`--wait-timeout` without `--wait` is refused, as is `--wait` together with
+`--k8s` (v1 waits on local runs only) or `--foreground` (which already
+blocks).
 
 ## Why
 
