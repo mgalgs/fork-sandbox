@@ -207,9 +207,10 @@ def build_thread(thread_id, entries):
     the entry whose id equals the directory's own thread id (or the
     lowest-seq valid entry, when even the root failed to parse), and
     trace is a flat pre-order walk of (entry, depth, orphaned, is_error)
-    tuples suitable for indented rendering. A malformed entry carries no
-    id to thread by, so it is listed at the top level, in NNN order
-    alongside any true orphans, rather than nested anywhere."""
+    tuples suitable for indented rendering. A malformed entry may retain
+    its Message-ID so a single-message render can show its error card, but
+    only valid entries are indexed for threading; malformed entries are
+    listed at the top level, in NNN order alongside any true orphans."""
     valid = [e for e in entries if e["ok"]]
     invalid = [e for e in entries if not e["ok"]]
     by_id = {e["id"]: e for e in valid}

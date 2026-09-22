@@ -187,11 +187,13 @@
 #
 # Spawned via `fork-sandbox.sh --branch <b> --harness <h> [--model <m>]
 # [--network <n>] [--pi-args "--thinking <level>"] [--preset <p>]
-# [--attach-dir <dir>] <project> <handoff>`. --attach-dir is added only
-# when the thread's attachments directory under the mail store exists and
-# is non-empty (see pm_spawn_wake); it binds that directory read-only at
-# /attachments inside the sandbox, the one filesystem mount every LLM
-# seat gets beyond the clone itself. A seat with no `preset:` (fleet
+# [--attach-dir <dir>] [--thread-dir <dir>] <project> <handoff>`.
+# --attach-dir is added only when the thread's attachments directory under
+# the mail store exists and is non-empty (see pm_spawn_wake); it binds that
+# directory read-only at /attachments inside the sandbox. --thread-dir is
+# added with a rendered snapshot of the woken thread and binds it read-only
+# at /thread. These are the filesystem mounts an LLM seat can receive beyond
+# the clone itself. A seat with no `preset:` (fleet
 # resolve's 10th line) spawns with NO --review-loop and NO
 # --maintainer-loop, exactly as before presets existed: the fleet IS the
 # review for that seat, scrutiny
@@ -1336,7 +1338,7 @@ pm_require_routing_source() {
 }
 
 pm_write_handoff() {
-    local out="$1" agent="$2" persona_path="$3" tid="$4" trigger_mid="$5" via="$6" trigger_only="$7" renderer="$8"
+    local out="$1" agent="$2" persona_path="$3" tid="$4" trigger_mid="$5" via="$6" trigger_only="$7"
     local render_rc=0 kit_path kit_text via_label
     kit_path="$(pm_kit_path)" || {
         echo "Error: postmaster: fleet kit missing (checked loudly at deliver" >&2
@@ -1394,12 +1396,12 @@ pm_write_handoff() {
             printf 'that the renderer did not actually emit.\n\n'
         fi
         if [[ "$trigger_only" == 1 ]]; then
-            "$renderer" --text --thread "$tid" --message "$trigger_mid" "$MAIL_ROOT" || render_rc=$?
+            "$MAIL_RENDER" --text --thread "$tid" --message "$trigger_mid" "$MAIL_ROOT" || render_rc=$?
             printf '\nThe full thread is readable at /thread/thread.txt whenever you need more\n'
             printf 'context. Quote the lines you answer in replies so the next wake usually\n'
             printf 'carries the relevant context.\n'
         else
-            "$renderer" --text --thread "$tid" "$MAIL_ROOT" || render_rc=$?
+            "$MAIL_RENDER" --text --thread "$tid" "$MAIL_ROOT" || render_rc=$?
         fi
         printf '\n'
         printf 'The triggering message for this wake is: %s\n\n' "$trigger_mid"
@@ -1771,17 +1773,13 @@ pm_spawn_wake() {
 
     local run_id
     run_id="$(pm_new_uuid)"
-    local trigger_only="" handoff_renderer="$MAIL_RENDER"
+    local trigger_only=""
     local snap_dir="$MAIL_ROOT/.postmaster/wake-threads/$run_id"
     if ! mkdir -p -- "$snap_dir" 2>/dev/null; then
         pm_flag "$tid" "wake thread snapshot failed for $agent: $mid (mkdir)"
     elif ! "$MAIL_RENDER" --text --thread "$tid" "$MAIL_ROOT" > "$snap_dir/thread.txt.part" 2>/dev/null; then
         rm -f -- "$snap_dir/thread.txt.part"
         pm_flag "$tid" "wake thread snapshot failed for $agent: $mid (render)"
-        # The configured renderer can be unavailable for the whole wake.
-        # Use the adjacent canonical renderer for the required full-thread
-        # fallback, so a failed snapshot never leaves a seat reviewing blind.
-        handoff_renderer="$script_dir/fork-sandbox-mail-render.py"
     else
         chmod 644 -- "$snap_dir/thread.txt.part" 2>/dev/null
         if mv -- "$snap_dir/thread.txt.part" "$snap_dir/thread.txt" 2>/dev/null; then
@@ -1801,7 +1799,7 @@ pm_spawn_wake() {
 
     mkdir -p -- "$HANDOFFS"
     local handoff_file="$HANDOFFS/$run_id.md"
-    if ! pm_write_handoff "$handoff_file" "$agent" "$persona_path" "$tid" "$mid" "$via" "$trigger_only" "$handoff_renderer"; then
+    if ! pm_write_handoff "$handoff_file" "$agent" "$persona_path" "$tid" "$mid" "$via" "$trigger_only"; then
         pm_flag "$tid" "handoff render failed for $agent: $mid"
         return 0
     fi

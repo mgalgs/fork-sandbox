@@ -558,10 +558,12 @@ The prompt embeds only the message that triggered the wake. Its complete
 rendered thread is mounted read-only at `/thread/thread.txt` via
 `--thread-dir`; read it when the triggering message lacks needed context.
 Replies should quote what they answer so the next trigger-only wake usually
-has that context. If snapshot creation fails, the postmaster deliberately
-falls back to the old full-thread prompt and passes no mount: a blind wake is
-never acceptable. This mount is load-bearing for patch messages addressed
-`To: @operator`, which are a spawn-exempt sink and can never trigger a wake.
+has that context. If making the snapshot directory or publishing its rendered
+file fails, the postmaster falls back to the old full-thread prompt and passes
+no mount. If the renderer itself is unavailable, it cannot construct either
+prompt, so it flags the thread and does not launch a wake. This mount is
+load-bearing for patch messages addressed `To: @operator`, which are a
+spawn-exempt sink and can never trigger a wake.
 
 A wake is one `fork-sandbox run`, with `--preset <name>` added to the
 spawn when the seat has one (see "The registry" above and

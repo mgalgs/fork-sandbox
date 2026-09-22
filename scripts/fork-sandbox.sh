@@ -208,11 +208,14 @@
 #                        enough to reach another run's clone or the rest
 #                        of the mail store. The postmaster uses this to
 #                        hand a wake its thread's own attachments
-# --thread-dir <dir>:    bind an existing rendered mail-thread directory
-#                        read-only at /thread inside a local run. Refused
-#                        with --k8s for the same host-bind reason.
 #                        directory under the mail store. Refused with
 #                        --k8s.
+# --thread-dir <dir>:    bind an existing rendered mail-thread directory
+#                        read-only at /thread inside a local run. The
+#                        directory must live under /var/tmp/claude-scratch/
+#                        (or the /tmp/claude-scratch compat path), never an
+#                        arbitrary host path. Refused with --k8s for the
+#                        same host-bind reason.
 # --session-state <dir>: bind <dir> read-WRITE into the sandbox at the
 #                        harness's own session store — sandbox HOME's
 #                        ~/.claude/projects for claude, ~/.codex/sessions for

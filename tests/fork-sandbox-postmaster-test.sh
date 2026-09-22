@@ -2472,13 +2472,15 @@ contains "trigger-only: mounted snapshot includes the trigger" \
     "$(cat "$trigger_dir/thread.txt")" '> trigger unique body'
 
 # ============================================================
-printf '\n== snapshot render failure keeps the legacy full-thread handoff ==\n'
+printf '\n== renderer failure flags the thread without a wake ==\n'
 # ============================================================
 
-# CONSTRAINT: patch messages sent To: @operator never trigger wakes. If the
-# snapshot cannot be made, the wake must retain the old embedded full thread
-# rather than leaving seats reviewing blind. The configured renderer fails
-# throughout this wake; the fallback must still launch with the full thread.
+# CONSTRAINT: patch messages sent To: @operator never trigger wakes. A failed
+# snapshot directory or publish can use the legacy full-thread handoff, but a
+# failed renderer cannot construct either form of handoff. Model production:
+# the postmaster and its canonical renderer are adjacent, so failure means the
+# wake is flagged and not launched rather than pretending an alternate
+# renderer exists.
 new_scratch_root FORK_SANDBOX_MAIL_ROOT
 export FORK_SANDBOX_MAIL_ROOT
 new_root SNAPSHOT_STUB_DIR
@@ -2490,12 +2492,11 @@ exit 1
 EOF
 chmod +x "$snapshot_renderer"
 cp "$postmaster" "$snapshot_postmaster"
-sed -i "s|^MAIL_RENDER=.*|MAIL_RENDER=\"$snapshot_renderer\"|" "$snapshot_postmaster"
 sed -i "s|^REPO_FLEET_KIT=.*|REPO_FLEET_KIT=\"$repo_dir/share/fleet-kit.md\"|" "$snapshot_postmaster"
 ln -s "$repo_dir/scripts/fork-sandbox-mail.sh" "$SNAPSHOT_STUB_DIR/fork-sandbox-mail.sh"
 ln -s "$repo_dir/scripts/fork-sandbox-fleet.sh" "$SNAPSHOT_STUB_DIR/fork-sandbox-fleet.sh"
 ln -s "$repo_dir/scripts/fork-sandbox-lib.sh" "$SNAPSHOT_STUB_DIR/fork-sandbox-lib.sh"
-ln -s "$repo_dir/scripts/fork-sandbox-mail-render.py" "$SNAPSHOT_STUB_DIR/fork-sandbox-mail-render.py"
+cp "$snapshot_renderer" "$SNAPSHOT_STUB_DIR/fork-sandbox-mail-render.py"
 fallback_root="$(send_msg '@carol' '@operator' 'fallback thread' 'fallback earlier body' 8)"
 : > "$STUB_ARGV_LOG"
 postmaster="$snapshot_postmaster"
@@ -2504,18 +2505,16 @@ fallback_mid="$(reply_msg '@bob' "$fallback_root" 'fallback trigger body' --to '
 : > "$STUB_ARGV_LOG"
 once
 postmaster="$repo_dir/scripts/fork-sandbox-postmaster.sh"
-fallback_handoff="$(handoff_file_for_agent alice)"
-contains "snapshot failure constraint: fallback handoff keeps the earlier body" \
-    "$(cat "$fallback_handoff")" '> fallback earlier body'
-contains "snapshot failure constraint: fallback handoff keeps the trigger" \
-    "$(cat "$fallback_handoff")" '> fallback trigger body'
-contains "snapshot failure constraint: fallback preserves the legacy thread preamble" \
-    "$(cat "$fallback_handoff")" $'The section below is exactly what fork-sandbox-mail-render.py --text\nrenders for this thread. Its grammar guarantees that ONLY\nmessage-body content ever gets a "> " marker -- every unquoted'
-check "snapshot failure constraint: fallback carries no --thread-dir" 0 \
+check "renderer failure constraint: no wake is launched" 0 \
+    "$(grep -c -- '^--branch$' "$STUB_ARGV_LOG")"
+check "renderer failure constraint: no thread mount is passed" 0 \
     "$(grep -c -- '^--thread-dir$' "$STUB_ARGV_LOG")"
-contains "snapshot failure constraint: thread is flagged" \
-    "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$(thread_of "$fallback_mid")")" \
+contains "renderer failure constraint: snapshot failure is flagged" \
+    "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator-journal/$(thread_of "$fallback_mid")")" \
     'wake thread snapshot failed for alice'
+contains "renderer failure constraint: handoff failure is flagged" \
+    "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$(thread_of "$fallback_mid")")" \
+    'handoff render failed for alice'
 
 # ============================================================
 printf '\n== harvest: exit-code alone is not terminal (summary.json still pending) ==\n'
