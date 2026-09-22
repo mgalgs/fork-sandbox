@@ -992,6 +992,39 @@ refuses "--reach-probe with a port disagreeing with its namespace's grant is ref
     --reach-probe "svc.demo-slot-01:9000" \
     "$proj_dir" "$handoff_file"
 
+# A namespace granted twice with different ports (both legal: the flag is
+# repeatable) must accept a --reach-probe on EITHER granted port, not just
+# the first one declared -- checking only the first array entry for that
+# namespace would wrongly refuse a probe on the second-declared port even
+# though the gate would actually let it through.
+if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-ns --model moonshotai/kimi-k3 \
+    --allow-namespace "demo-slot-01:443" --allow-namespace "demo-slot-01:80" \
+    --reach-probe "svc.demo-slot-01:80" \
+    "$proj_dir" "$handoff_file" >/dev/null 2>/tmp/fs-k8s-test-ns-dup2nd.err; then
+    ok "--reach-probe on the second-declared port of a twice-granted namespace is accepted"
+else
+    no "--reach-probe on the second-declared port of a twice-granted namespace is accepted" \
+        "$(cat /tmp/fs-k8s-test-ns-dup2nd.err)"
+fi
+if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-ns --model moonshotai/kimi-k3 \
+    --allow-namespace "demo-slot-01:443" --allow-namespace "demo-slot-01:80" \
+    --reach-probe "svc.demo-slot-01:443" \
+    "$proj_dir" "$handoff_file" >/dev/null 2>/tmp/fs-k8s-test-ns-dup1st.err; then
+    ok "--reach-probe on the first-declared port of a twice-granted namespace is accepted"
+else
+    no "--reach-probe on the first-declared port of a twice-granted namespace is accepted" \
+        "$(cat /tmp/fs-k8s-test-ns-dup1st.err)"
+fi
+refuses "--reach-probe on neither port of a twice-granted namespace is still refused" \
+    "they must match, or the probe can never pass the gate" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-ns --model moonshotai/kimi-k3 \
+    --allow-namespace "demo-slot-01:443" --allow-namespace "demo-slot-01:80" \
+    --reach-probe "svc.demo-slot-01:22" \
+    "$proj_dir" "$handoff_file"
+
 # The three accepted HOST shapes: bare <svc>.<ns>, <svc>.<ns>.svc, and
 # <svc>.<ns>.svc.$K8S_CLUSTER_DOMAIN (default cluster.local, unset in
 # $config_dir/k8s.env).

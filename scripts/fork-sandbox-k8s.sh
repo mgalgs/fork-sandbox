@@ -3406,7 +3406,7 @@ cmd_submit() {
     # glob-not-regex host comparisons, which use a single suffix "*" and
     # don't have this trap).
     local -a run_reach_probes=()
-    local probe host port_probe ns_seg gi found gport shape_ok
+    local probe host port_probe ns_seg gi found gport port_ok shape_ok
     local -a host_labels domain_labels
     local di domain_match
     for probe in "${reach_probe_raw[@]}"; do
@@ -3446,13 +3446,23 @@ cmd_submit() {
         ns_seg="${host#*.}"
         ns_seg="${ns_seg%%.*}"
 
+        # A namespace can be granted more than once with different ports
+        # (--allow-namespace ns:443 --allow-namespace ns:80 is legal, both
+        # are repeatable per the flag's own contract, and render-grant
+        # emits both as separate egress rules) -- so the probe's port must
+        # be checked against EVERY grant entry for this namespace, not just
+        # the first one found, or a probe on the second-declared port is
+        # wrongly refused even though the gate would actually let it through.
         found=false
-        gport=""
+        port_ok=false
         for (( gi = 0; gi < ${#run_allow_ns_namespaces[@]}; gi++ )); do
             if [[ "${run_allow_ns_namespaces[$gi]}" == "$ns_seg" ]]; then
                 found=true
                 gport="${run_allow_ns_ports[$gi]}"
-                break
+                if [[ -z "$gport" ]] || (( gport == port_probe )); then
+                    port_ok=true
+                    break
+                fi
             fi
         done
         if [[ "$found" != true ]]; then
@@ -3460,9 +3470,9 @@ cmd_submit() {
             echo "which is not one of this run's --allow-namespace grants." >&2
             exit 1
         fi
-        if [[ -n "$gport" ]] && (( gport != port_probe )); then
-            echo "Error: --reach-probe '$probe' uses port $port_probe, but the" >&2
-            echo "--allow-namespace grant for '$ns_seg' names port $gport --" >&2
+        if [[ "$port_ok" != true ]]; then
+            echo "Error: --reach-probe '$probe' uses port $port_probe, but no" >&2
+            echo "--allow-namespace grant for '$ns_seg' names that port --" >&2
             echo "they must match, or the probe can never pass the gate." >&2
             exit 1
         fi
