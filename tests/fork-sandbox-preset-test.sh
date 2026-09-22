@@ -1411,7 +1411,28 @@ printf 'MODEL_ENDPOINT=http://198.51.100.1:8001/v1\n' > "$real_cfg/model.env"
 real_presets="$real_cfg/presets"
 mkdir -p "$real_presets"
 
-proj="$(mktemp -d "$HOME/src/fs-preset-test.XXXXXX")"; tmpdirs+=("$proj")
+# Every real fork-sandbox.sh fixture below runs under this scratch HOME, not
+# the operator's: sandbox-run-log.py's archive dir and run log are
+# deliberately hardcoded under ~/.claude (no flag can aim them elsewhere),
+# so a fixture run under the real HOME appends handoff archives that are
+# indistinguishable from an operator's real work. A scratch HOME also
+# empties the launcher's ${FORK_SANDBOX_CONFIG_DIR:-$HOME/.config/
+# fork-sandbox}, so machine config -- credential balancing above all --
+# cannot route a fixture run, nor refuse it outright when the machine's
+# live quota is tight.
+launcher_home="$(mktemp -d)"; tmpdirs+=("$launcher_home")
+# The launcher's own security boundary requires the project to live under
+# ~/src -- which it resolves against the scratch HOME above, so fixture
+# projects must live there too.
+mkdir -p "$launcher_home/src"
+# --review-loop (reached here via presets with a review pipeline step, e.g.
+# composed/reviewloop/sealed-review/fixseat) refuses to start unless the
+# review kit's skill directories exist under $HOME/.claude/skills.
+mkdir -p "$launcher_home/.claude/skills/commit-then-review" \
+    "$launcher_home/.claude/skills/code-review-portable"
+operator_archive_dir="$HOME/.claude/sandbox-handoffs"
+
+proj="$(mktemp -d "$launcher_home/src/fs-preset-test.XXXXXX")"; tmpdirs+=("$proj")
 (
     cd "$proj" \
         && git init -q . \
@@ -1439,7 +1460,7 @@ prep_stub() {
 run_stubbed() {
     # Launcher args only; prep_stub ran first. Prints the run dir.
     local out rc rd
-    out="$(PATH="$real_stub:$PATH" FAKE_COUNT_FILE="$count" \
+    out="$(HOME="$launcher_home" PATH="$real_stub:$PATH" FAKE_COUNT_FILE="$count" \
         FAKE_ARGV_LOG="$argv_log" FAKE_SCRIPT="$script_file" \
         FORK_SANDBOX_CONFIG_DIR="$real_cfg" FORK_SANDBOX_BACKEND=fake-image \
         timeout 60 "$launcher" --foreground "$@" "$proj" "$handoff" 2>&1)"
@@ -1452,7 +1473,7 @@ run_stubbed() {
     printf '%s' "$rd"
 }
 
-if PATH="$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$real_cfg" \
+if HOME="$launcher_home" PATH="$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$real_cfg" \
     FORK_SANDBOX_BACKEND=fake-image "$launcher" --harness claude \
     --codex-args '-c model_reasoning_effort=high' "$proj" "$handoff" \
     > /dev/null 2>"$err"; then
@@ -1814,7 +1835,7 @@ stage_tmp="$(mktemp -d)"; tmpdirs+=("$stage_tmp")
 err_stage="$tmp/err-stage"
 bad_handoff="$tmp/not-a-scratch-handoff.md"
 printf 'do the task\n' > "$bad_handoff"
-out="$(TMPDIR="$stage_tmp" PATH="$real_stub:$PATH" \
+out="$(HOME="$launcher_home" TMPDIR="$stage_tmp" PATH="$real_stub:$PATH" \
     FORK_SANDBOX_CONFIG_DIR="$real_cfg" FORK_SANDBOX_BACKEND=fake-image \
     timeout 60 "$launcher" --foreground --preset race "$proj" \
     "$bad_handoff" 2>"$err_stage")"
@@ -1846,7 +1867,7 @@ printf '%s\n' \
 chmod +x "$k8s_scripts/fork-sandbox-k8s.sh"
 stage_tmp_k8s="$(mktemp -d)"; tmpdirs+=("$stage_tmp_k8s")
 err_k8s="$tmp/err-k8s"
-out="$(TMPDIR="$stage_tmp_k8s" PATH="$real_stub:$PATH" \
+out="$(HOME="$launcher_home" TMPDIR="$stage_tmp_k8s" PATH="$real_stub:$PATH" \
     FORK_SANDBOX_CONFIG_DIR="$real_cfg" FORK_SANDBOX_BACKEND=fake-image \
     timeout 60 "$k8s_scripts/fork-sandbox.sh" --preset race \
     --k8s "$proj" "$handoff" 2>"$err_k8s")"
@@ -1878,7 +1899,7 @@ pipeline:
     agent: coder
 EOF
 err_ep="$tmp/err-ep"
-out_ep="$(TMPDIR="$stage_tmp_k8s" PATH="$real_stub:$PATH" \
+out_ep="$(HOME="$launcher_home" TMPDIR="$stage_tmp_k8s" PATH="$real_stub:$PATH" \
     FORK_SANDBOX_CONFIG_DIR="$real_cfg" FORK_SANDBOX_BACKEND=fake-image \
     timeout 60 "$k8s_scripts/fork-sandbox.sh" --preset ep \
     --k8s "$proj" "$handoff" 2>"$err_ep")"
@@ -1893,7 +1914,7 @@ else
         "rc=$rc_ep out=$(printf '%s' "$out_ep" | head -3) err=$(head -3 "$err_ep")"
 fi
 err_ep2="$tmp/err-ep2"
-out_ep2="$(TMPDIR="$stage_tmp_k8s" PATH="$real_stub:$PATH" \
+out_ep2="$(HOME="$launcher_home" TMPDIR="$stage_tmp_k8s" PATH="$real_stub:$PATH" \
     FORK_SANDBOX_CONFIG_DIR="$real_cfg" FORK_SANDBOX_BACKEND=fake-image \
     timeout 60 "$k8s_scripts/fork-sandbox.sh" --preset ep \
     --endpoint other --k8s "$proj" "$handoff" 2>"$err_ep2")"
@@ -1912,7 +1933,7 @@ contains "the --endpoint override is announced on stderr" \
 # endpoint key (unlike model/args/repeat): the k8s dispatch still
 # forwards it, and the seat-override note never claims it was dropped.
 err_ep3="$tmp/err-ep3"
-out_ep3="$(TMPDIR="$stage_tmp_k8s" PATH="$real_stub:$PATH" \
+out_ep3="$(HOME="$launcher_home" TMPDIR="$stage_tmp_k8s" PATH="$real_stub:$PATH" \
     FORK_SANDBOX_CONFIG_DIR="$real_cfg" FORK_SANDBOX_BACKEND=fake-image \
     timeout 60 "$k8s_scripts/fork-sandbox.sh" --preset ep \
     --harness pi --model moonshotai/kimi-k3 --k8s "$proj" "$handoff" 2>"$err_ep3")"
@@ -2212,6 +2233,22 @@ else
     no "sandbox-run-log.py record archives the preset definition" \
         "prior stubbed run failed, or $run_log is not executable"
 fi
+
+printf '\n== fixture runs leave no handoff archives in the operator home ==\n'
+# Own-run-ids shape, not a before/after snapshot diff: a snapshot diff would
+# also catch a concurrent real run or another suite's fixtures archiving
+# during this suite's own window, which is not this suite's leak to report.
+# Every run dir this suite creates is already in tmpdirs (appended right
+# after each launcher call), so that is the complete own-run-ids list; a
+# leaked fixture archive is always named "<run-dir-basename>.md".
+leaked=""
+for d in "${tmpdirs[@]}"; do
+    [[ -n "$d" && -d "$d" ]] || continue
+    cand="$operator_archive_dir/$(basename -- "$d").md"
+    [[ -f "$cand" ]] && leaked+="$cand "
+done
+check "fixture runs append no handoff archives to the operator's durable state" \
+    "" "$leaked"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))
