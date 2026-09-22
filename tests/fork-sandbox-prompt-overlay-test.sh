@@ -308,6 +308,28 @@ check "a non-git prompts directory records no rev" \
 
 printf '\n== real runs: rendered prompt and provenance ==\n'
 
+# Every real fork-sandbox.sh fixture below runs under this scratch HOME, not
+# the operator's: sandbox-run-log.py's archive dir and run log are
+# deliberately hardcoded under ~/.claude (no flag can aim them elsewhere),
+# so a fixture run under the real HOME appends handoff archives that are
+# indistinguishable from an operator's real work. A scratch HOME also
+# empties the launcher's ${FORK_SANDBOX_CONFIG_DIR:-$HOME/.config/
+# fork-sandbox}, so machine config -- credential balancing above all --
+# cannot route a fixture run, nor refuse it outright when the machine's
+# live quota is tight.
+launcher_home="$(mktemp -d)"; tmpdirs+=("$launcher_home")
+# The launcher's own security boundary requires the project to live under
+# ~/src -- which it resolves against the scratch HOME above, so fixture
+# projects must live there too.
+mkdir -p "$launcher_home/src"
+# --review-loop refuses to start unless the review kit's skill directories
+# exist under $HOME/.claude/skills (fork-sandbox.sh's review_skill_src
+# check) -- real content is never read, fs_emit_review_prompt_body only
+# ever quotes the path, so an empty directory satisfies it.
+mkdir -p "$launcher_home/.claude/skills/commit-then-review" \
+    "$launcher_home/.claude/skills/code-review-portable"
+operator_archive_dir="$HOME/.claude/sandbox-handoffs"
+
 # claude-sandboxed itself is never exercised below -- this stub replaces it
 # entirely, so what is under test is only what fork-sandbox.sh does before
 # handing off to the sandbox wrapper: composing handoff.md and writing the
@@ -326,7 +348,7 @@ chmod +x "$stub_bin/claude-sandboxed"
 # command-substitution subshell and never reach the trap.
 new_project() {
     local d
-    d="$(mktemp -d "$HOME/src/fs-prompt-overlay-test.XXXXXX")"
+    d="$(mktemp -d "$launcher_home/src/fs-prompt-overlay-test.XXXXXX")"
     (
         cd "$d" \
             && git init -q . \
@@ -346,7 +368,8 @@ new_project() {
 run_real() {
     local proj="$1" cfg="$2" handoff="$3"; shift 3
     local out rc rd
-    out="$(PATH="$stub_bin:$PATH" FORK_SANDBOX_CONFIG_DIR="$cfg" FORK_SANDBOX_BROWSER=0 \
+    out="$(HOME="$launcher_home" PATH="$stub_bin:$PATH" FORK_SANDBOX_CONFIG_DIR="$cfg" \
+        FORK_SANDBOX_BROWSER=0 \
         timeout 60 "$launcher" --foreground --harness claude "$@" \
         "$proj" "$handoff" 2>&1)"
     rc=$?
@@ -476,7 +499,7 @@ STUB
     pi_config="$(new_empty_config)"; tmpdirs+=("$pi_config")
     printf 'MODEL_ENDPOINT=http://127.0.0.1:1/v1\n' > "$pi_config/model.env"
 
-    pi_out="$(PATH="$stub_bin:$PATH" FORK_SANDBOX_CONFIG_DIR="$pi_config" \
+    pi_out="$(HOME="$launcher_home" PATH="$stub_bin:$PATH" FORK_SANDBOX_CONFIG_DIR="$pi_config" \
         timeout 60 "$launcher" --foreground --harness pi-local "$proj" "$handoff" 2>&1)"
     pi_rc=$?
     pi_rd="$(printf '%s\n' "$pi_out" | sed -n 's/^  run dir:  *//p' | head -1)"
@@ -657,8 +680,8 @@ if [[ -n "$rd4" ]]; then
     # Mirrors fork-sandbox.sh's own review_skill_dir resolution: bound only
     # when this host has the code-review-portable skill installed.
     review_skill_dir4=""
-    [[ -d "$HOME/.claude/skills/code-review-portable" ]] \
-        && review_skill_dir4="$HOME/.claude/skills/code-review-portable"
+    [[ -d "$launcher_home/.claude/skills/code-review-portable" ]] \
+        && review_skill_dir4="$launcher_home/.claude/skills/code-review-portable"
 
     expected_review="$(cat <<EXPECTED
 # Your working directory
@@ -1243,6 +1266,22 @@ else
     no "sandbox-run-log.py record accepts a run with a prompt overlay" \
         "prior run_real step failed, or $run_log is not executable"
 fi
+
+printf '\n== fixture runs leave no handoff archives in the operator home ==\n'
+# Own-run-ids shape, not a before/after snapshot diff: a snapshot diff would
+# also catch a concurrent real run or another suite's fixtures archiving
+# during this suite's own window, which is not this suite's leak to report.
+# Every run dir this suite creates is already in tmpdirs (appended right
+# after each launcher call), so that is the complete own-run-ids list; a
+# leaked fixture archive is always named "<run-dir-basename>.md".
+leaked=""
+for d in "${tmpdirs[@]}"; do
+    [[ -n "$d" && -d "$d" ]] || continue
+    cand="$operator_archive_dir/$(basename -- "$d").md"
+    [[ -f "$cand" ]] && leaked+="$cand "
+done
+check "fixture runs append no handoff archives to the operator's durable state" \
+    "" "$leaked"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))
