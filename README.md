@@ -563,7 +563,15 @@ run's own outcome instead of `status.sh`'s own always-0 exit:
 | `0` | the run's own exit code was `0` |
 | `1`-`255` | the run's own exit code, unchanged |
 | `124` | `--wait-timeout` expired; the run is still going, untouched |
-| `125` | no exit-code file was ever written (run dir gone, runner abandoned, or it never started — the printed line says which) |
+| `125` | the outcome is unknowable: no exit-code file was ever written (run dir gone, runner abandoned, or it never started), or the watcher itself failed before certifying a terminal state — the printed line says which |
+
+A run whose own exit code happens to be `124` or `125` is
+indistinguishable from a timeout or an unknowable outcome on the exit
+code alone — the same compromise GNU `timeout` makes; the lines `--wait`
+prints disambiguate. And the exit code is the *run's* outcome, not the
+branch's: a run that exits `0` having committed nothing, or whose branch
+fetch failed, still yields `0` — when the branch itself is what you
+need, check `fetched` in the printed summary (or `summary.json`).
 
 `--wait-timeout <secs>` wraps the watch in `timeout --foreground <secs>`;
 on expiry it does not stop, signal, or clean up the run — that is a

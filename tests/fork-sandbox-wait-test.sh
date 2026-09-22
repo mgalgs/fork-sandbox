@@ -427,6 +427,59 @@ else
 fi
 
 # =====================================================================
+printf '\n== watcher failure: a crashed watcher yields 125, never a mapped code ==\n'
+# =====================================================================
+# status.sh --monitor-terminal exits 0 on every terminal state, so any
+# other non-zero watcher exit means the watcher never got to look -- and
+# --wait must say so and exit 125 rather than fall through to the
+# exit-code mapping (which could label the watcher's own failure as the
+# run's outcome, or call a live run abandoned). Same shim mechanism as
+# the race case above: this one crashes (exit 7) the moment it is asked
+# to wrap the watcher.
+crash_shim_bin="$(mktemp -d /var/tmp/claude-scratch/fs-wait-crash.XXXXXX)"
+tmpdirs+=("$crash_shim_bin")
+cat > "$crash_shim_bin/timeout" <<'SHIM'
+#!/usr/bin/env bash
+set -uo pipefail
+if [[ "${1:-}" == "--version" ]]; then
+    printf 'timeout (GNU coreutils) 9.0\n'
+    exit 0
+fi
+case " $* " in
+    *' --monitor-terminal '*) exit 7 ;;
+    *) exec /usr/bin/timeout "$@" ;;
+esac
+SHIM
+chmod +x "$crash_shim_bin/timeout"
+
+out_crash="$(mktemp)"; tmpdirs+=("$out_crash")
+new_tmux_tmpdir
+HOME="$launcher_home" PATH="$crash_shim_bin:$stub_bin:$PATH" \
+    FAKE_SLEEP_SECONDS=999 \
+    TMUX_TMPDIR="$case_tmux" \
+    /usr/bin/timeout 60 "$launcher" --harness claude --wait --wait-timeout 30 \
+    "$proj" "$handoff" > "$out_crash" 2>&1
+rc_crash=$?
+rd_crash="$(run_dir_from_output "$out_crash")"
+if [[ -n "$rd_crash" ]]; then
+    tmpdirs+=("$rd_crash")
+    owned_run_dirs+=("$rd_crash")
+    check "watcher failure: --wait exits 125" "125" "$rc_crash"
+    contains "watcher failure: names the watcher's exit code" \
+        "watcher exited 7" "$(cat "$out_crash")"
+    check "watcher failure: did not map a code for a run still going (no exit-code yet)" \
+        "0" "$([[ -e "$rd_crash/exit-code" ]] && echo 1 || echo 0)"
+    HOME="$launcher_home" TMUX_TMPDIR="$case_tmux" \
+        "$repo_dir/scripts/fork-sandbox-stop.sh" "$rd_crash" >/dev/null 2>&1 || true
+    branch_crash="$(sed -n 's/^branch=//p' "$rd_crash/run.env" 2>/dev/null | head -1)"
+    [[ -n "$branch_crash" ]] && (cd "$proj" && git branch -q -D "$branch_crash" >/dev/null 2>&1) || true
+else
+    no "watcher failure: --wait exits 125" "no run dir ever appeared: $(cat "$out_crash")"
+    no "watcher failure: names the watcher's exit code" "no run dir"
+    no "watcher failure: did not map a code for a run still going (no exit-code yet)" "no run dir"
+fi
+
+# =====================================================================
 printf '\n== refusals (no real launch needed) ==\n'
 # =====================================================================
 

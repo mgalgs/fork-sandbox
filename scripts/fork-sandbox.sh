@@ -376,13 +376,14 @@
 #                        this run's own dir and block until it reaches a
 #                        terminal state, then exit with the run's own
 #                        outcome: its own exit code (0, or 1-255) when
-#                        exit-code was written, 125 when it never was (the
-#                        run dir is gone, the runner was abandoned, or it
-#                        never started -- the printed line says which), and
-#                        124 only with --wait-timeout below, once it
-#                        expires. Refused with --k8s (v1 is local runs
-#                        only) and with --foreground (which already
-#                        blocks).
+#                        exit-code was written, 125 when the outcome is
+#                        unknowable (the run dir is gone, the runner was
+#                        abandoned, it never started, or the watcher itself
+#                        failed before certifying a terminal state -- the
+#                        printed line says which), and 124 only with
+#                        --wait-timeout below, once it expires. Refused
+#                        with --k8s (v1 is local runs only) and with
+#                        --foreground (which already blocks).
 # --wait-timeout <secs>: with --wait, give up waiting after <secs> and exit
 #                        124. The run itself is left running, untouched --
 #                        stop it with fork-sandbox stop, or re-arm
@@ -9925,6 +9926,22 @@ if $wait_requested; then
         echo "$run_dir', or keep waiting with 'fork-sandbox-status.sh" >&2
         echo "--monitor-terminal $run_dir'." >&2
         exit 124
+    fi
+
+    if (( watch_rc != 0 )); then
+        # status.sh --monitor-terminal exits 0 on EVERY terminal state, so
+        # any other non-zero watcher exit -- a die out of status.sh,
+        # $FS_TIMEOUT itself failing (125), an exec failure (126/127) --
+        # means the watcher never certified a terminal state, and the
+        # exit-code file below may describe a run that is still fetching
+        # its branch back, or not exist yet for a run still going. Mapping
+        # it would label the WATCHER's failure as the RUN's outcome; say
+        # what actually happened instead.
+        echo "fork-sandbox run --wait: the watcher exited $watch_rc without reaching" >&2
+        echo "a terminal state, so the run's outcome is unknown -- it may still be" >&2
+        echo "running, untouched. Check 'fork-sandbox-status.sh $run_dir', or keep" >&2
+        echo "waiting with 'fork-sandbox-status.sh --monitor-terminal $run_dir'." >&2
+        exit 125
     fi
 
     if [[ -f "$run_dir/exit-code" && ! -L "$run_dir/exit-code" ]]; then
