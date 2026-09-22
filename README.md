@@ -22,6 +22,8 @@ installed and callable under its own name — `fork-sandbox status` and
   (`--harness`, `--review-loop`, `--refresh-at`, `--preset`, `--k8s`, ...)
 - `fork-sandbox status <run-dir>` — watch it (`--result`, `--monitor`, `--monitor-terminal`)
 - `fork-sandbox say <run-dir> <text>` — steer a running agent
+- `fork-sandbox stop [--timeout SECS] <run-dir>` — abandon a local run,
+  with a ledger trail
 - `fork-sandbox k8s submit|fetch --branch <name> ...` — start a cluster
   run from one machine, collect it from another
 - `fork-sandbox log list|stats` — the run ledger: harness, model, tokens,
@@ -515,6 +517,12 @@ fork-sandbox status --monitor-terminal <run-dir>  # the arm the skills use: the 
 # Steer it while it runs — delivered at the session's next tool call
 fork-sandbox say <run-dir> "stop refactoring the tests; ship the fix first"
 
+# Abandon it. TERM to the runner, wait up to --timeout (default 60s) for
+# its own teardown to fetch the branch back and record why it ended, then
+# fall back to doing that host-side if it does not respond in time.
+fork-sandbox stop <run-dir>
+fork-sandbox stop --timeout 120 <run-dir>
+
 # Run in a cluster: submit from anywhere, collect from anywhere
 # (fork-sandbox run --k8s is the one-shot submit+wait+fetch form)
 fork-sandbox k8s submit --branch sbx-fix --model sonnet ~/src/proj handoff.md
@@ -530,6 +538,17 @@ fork-sandbox log stats --by model,task.kind
 # The same sandbox, interactively — you at the keyboard
 claude-sandboxed ~/src/proj
 ```
+
+`fork-sandbox stop` is local-run only — a `--k8s` run is refused, with a
+message pointing at `fork-sandbox-k8s.sh rm` instead. It records why the
+run ended, distinguishing three cases in `fork-sandbox status`'s state
+line: `stopped` (the runner got the signal and tore itself down normally),
+`stop-timeout` (it did not respond within `--timeout`, so the verb
+completed the run itself — fetch, branch cleanup, exit code, ledger
+record — the same way a crash recovery would), and `salvaged` (the runner
+was already dead when the verb ran, e.g. after a raw `tmux kill-session`,
+so it went straight to that same host-side completion). Run against an
+already-ended run, it is a no-op.
 
 ## Why
 

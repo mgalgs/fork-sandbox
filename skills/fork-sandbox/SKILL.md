@@ -779,8 +779,11 @@ up there. Everything it printed is in the run directory.
 - **No commits, branch removed.** The session did work but never committed, or
   it failed early. Read `fork-sandbox status --result <run-dir>` and
   `--log <run-dir>`. The clone still holds whatever it wrote.
-- **`abandoned`.** The tmux session was killed, or the runner was. Nothing was
-  fetched; the clone still holds the work.
+- **`abandoned`.** The tmux session was killed, or the runner was, outside
+  `fork-sandbox stop`. Nothing was fetched; the clone still holds the work.
+  `fork-sandbox stop <run-dir>` closes this after the fact — it fetches the
+  branch back and records the run's end, same as it does when you use it to
+  abandon a run in the first place instead of killing the session by hand.
 - **Non-zero exit.** `--log <run-dir>` carries the sandbox wrapper's own
   errors — an expired access token is the common one.
 - **An addendum was never acted on.** Check the count in the status block

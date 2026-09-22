@@ -585,6 +585,16 @@ exit_code() {
     printf '%s' "${rc//[^0-9-]/}"
 }
 
+# summary.json's end_reason: absent on every ordinary run (it ended on its
+# own), and on any run whose summary.json does not exist yet or at all.
+# 'fork-sandbox stop' is the only thing that ever writes stopped,
+# stop-timeout, or salvaged there.
+end_reason_value() {
+    local json
+    json="$(run_file_read summary.json 2>/dev/null)" || return 0
+    printf '%s' "$json" | jq -r '.end_reason // empty' 2>/dev/null
+}
+
 # The refresh loop's continuation legs tee into events.jsonl AND their own
 # file, so their events are already counted through events.jsonl. Skipping
 # the copy here keeps the total exact; counting both would double every
@@ -657,8 +667,16 @@ print_status_block() {
     state="$(run_state)"
     printf 'state:    %s' "$state"
     case "$state" in
-        done|failed) printf ' (exit %s, after %s)' "$(exit_code)" "$(elapsed_human)" ;;
-        *)           printf ' (%s elapsed)' "$(elapsed_human)" ;;
+        done|failed)
+            printf ' (exit %s, after %s' "$(exit_code)" "$(elapsed_human)"
+            case "$(end_reason_value)" in
+                stopped)      printf ', stopped by operator' ;;
+                stop-timeout) printf ', stop timeout kill' ;;
+                salvaged)     printf ', salvaged after external kill' ;;
+            esac
+            printf ')'
+            ;;
+        *) printf ' (%s elapsed)' "$(elapsed_human)" ;;
     esac
     printf '\n'
     printf 'branch:   %s\n' "$branch"

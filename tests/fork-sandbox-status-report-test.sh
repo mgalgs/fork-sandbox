@@ -611,4 +611,38 @@ if "$status" --result "$rd_new" >/dev/null 2>&1; then
     echo "symlinked composed verdict was accepted"; exit 1
 fi
 
-echo "35 passed, 0 failed"
+# 16. The state line's done|failed case-arm annotates summary.json's
+# end_reason -- stopped, stop-timeout, salvaged -- and adds nothing when
+# the key is absent, so a run from before 'fork-sandbox stop' existed
+# prints exactly as it always did.
+new_run_dir
+printf '0\n' > "$rd_new/exit-code"
+printf '{"branch":"test","end_reason":"stopped"}\n' > "$rd_new/summary.json"
+out="$(timeout 12 "$status" "$rd_new" 2>&1)"
+[[ "$out" == *"state:    done (exit 0, after "*", stopped by operator)"* ]] \
+    || { echo "stopped end_reason not annotated: $out"; exit 1; }
+
+new_run_dir
+printf '143\n' > "$rd_new/exit-code"
+printf '{"branch":"test","end_reason":"stop-timeout"}\n' > "$rd_new/summary.json"
+out="$(timeout 12 "$status" "$rd_new" 2>&1)"
+[[ "$out" == *"state:    failed (exit 143, after "*", stop timeout kill)"* ]] \
+    || { echo "stop-timeout end_reason not annotated: $out"; exit 1; }
+
+new_run_dir
+printf '143\n' > "$rd_new/exit-code"
+printf '{"branch":"test","end_reason":"salvaged"}\n' > "$rd_new/summary.json"
+out="$(timeout 12 "$status" "$rd_new" 2>&1)"
+[[ "$out" == *"state:    failed (exit 143, after "*", salvaged after external kill)"* ]] \
+    || { echo "salvaged end_reason not annotated: $out"; exit 1; }
+
+new_run_dir
+printf '0\n' > "$rd_new/exit-code"
+printf '{"branch":"test"}\n' > "$rd_new/summary.json"
+out="$(timeout 12 "$status" "$rd_new" 2>&1)"
+[[ "$out" == *"state:    done (exit 0, after "*")"* ]] \
+    || { echo "plain done state line missing: $out"; exit 1; }
+[[ "$out" != *"stopped by operator"* && "$out" != *"salvaged"* && "$out" != *"timeout kill"* ]] \
+    || { echo "absent end_reason wrongly annotated: $out"; exit 1; }
+
+echo "39 passed, 0 failed"
