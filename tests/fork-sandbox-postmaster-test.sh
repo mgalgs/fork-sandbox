@@ -610,7 +610,8 @@ not_contains "unresolvable Cc: the folded name does not emit a fresh route-dead 
     "$(cat "$work/once.out")" "route-dead"
 
 # @operator in Cc: is exempt exactly like @operator in To:, never treated
-# as unresolvable (pm_expand_to's own @operator guard covers both paths).
+# as unresolvable (fleet expand's @operator sink covers both paths: it
+# succeeds with zero candidates, so pm_expand_to never sees it fail).
 new_scratch_root FORK_SANDBOX_MAIL_ROOT
 export FORK_SANDBOX_MAIL_ROOT
 mid_op_cc="$(send_msg '@alice' '@bob' 'operator cc test' 'body' 8 '@operator')"
@@ -752,6 +753,45 @@ fi
 check "@operator in To: does not clobber a real flag reason" \
     "spawn failed for alice: $mid_op" \
     "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid_op" 2>/dev/null)"
+
+# ============================================================
+printf '\n== @operator sink: zero wake candidates, never unresolvable ==\n'
+# ============================================================
+# fleet expand's @operator sink (see docs/agent-mail.md, "the header
+# contract") succeeds for @operator with zero candidates -- so it wakes
+# nobody by itself, composes with a real seat address without changing
+# that seat's wake, and never lands in a route-dead event or an
+# unresolvable flag, since it was never unresolved to begin with.
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+mid_op_bob="$(send_msg '@alice' '@operator,@bob' 'operator sink plus a real seat' 'body' 8)"
+tid_op_bob="$(thread_of "$mid_op_bob")"
+short_op_bob="${tid_op_bob:0:8}"
+: > "$STUB_ARGV_LOG"
+once
+check "@operator,@bob: bob wakes" 1 \
+    "$(grep -c -- "^sbx-mail-$short_op_bob-bob-" "$STUB_ARGV_LOG")"
+check "@operator,@bob: carol does not wake" 0 \
+    "$(grep -c -- "^sbx-mail-$short_op_bob-carol-" "$STUB_ARGV_LOG")"
+check "@operator,@bob: exactly one seat spawned" 1 \
+    "$(grep -c -- '^----CALL----$' "$STUB_ARGV_LOG")"
+check "@operator,@bob: thread is not flagged needs-operator" "" \
+    "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid_op_bob" 2>/dev/null || true)"
+not_contains "@operator,@bob: no route-dead event fires" \
+    "$(cat "$work/once.out")" "route-dead"
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+mid_op_only="$(send_msg '@alice' '@operator' 'operator sink alone' 'body' 8)"
+tid_op_only="$(thread_of "$mid_op_only")"
+: > "$STUB_ARGV_LOG"
+rc="$(once_rc)"
+check "@operator alone: deliver --once still exits 0" "0" "$rc"
+check "@operator alone: nobody wakes" 0 \
+    "$(grep -c -- '^----CALL----$' "$STUB_ARGV_LOG")"
+check "@operator alone: thread is not flagged needs-operator" "" \
+    "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid_op_only" 2>/dev/null || true)"
 
 # ============================================================
 printf '\n== seat resolution reaches launcher argv ==\n'

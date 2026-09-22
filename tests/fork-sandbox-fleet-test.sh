@@ -841,6 +841,23 @@ exp_all_compose="$("$fleet" expand @riffler,@all)"
 check "expand: @all composes inside a longer address list and dedupes" \
     "$(printf '@riffler\n@tuner\n@scout\n@observer\n@loud')" "$exp_all_compose"
 
+# @operator is a real address for routing purposes with zero wake
+# candidates behind it: it must succeed (never fall to the
+# unknown-address error, see cmd_expand) while contributing no names, so
+# a To:/Cc: containing only @operator wakes nobody without ever being
+# flagged as an unresolvable typo.
+exp_operator_out="$("$fleet" expand @operator)"; exp_operator_rc=$?
+check "expand: @operator exits 0" "0" "$exp_operator_rc"
+check "expand: @operator prints nothing" "" "$exp_operator_out"
+
+exp_all_operator="$("$fleet" expand @all,@operator)"
+check "expand: @all,@operator is identical to plain @all" \
+    "$exp_all" "$exp_all_operator"
+
+exp_operator_tuner="$("$fleet" expand @operator,@tuner)"
+check "expand: @operator,@tuner contributes only @tuner" \
+    "@tuner" "$exp_operator_tuner"
+
 printf '\n== roster ==\n'
 
 roster_out="$("$fleet" roster 2>&1)"; roster_rc=$?

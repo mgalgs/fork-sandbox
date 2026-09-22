@@ -58,9 +58,10 @@
 #   handler      agent, thread, exit=<status> -- a handler seat's wake ran
 #                to completion (every run, not just failures)
 #   route-dead   thread, unresolved=<count> -- rule 0's To: expansion hit
-#                one or more @-shaped names (typo'd seat, missing fleet
-#                file -- never `@operator`, which is excepted, see
-#                pm_expand_to) that `fleet expand` could not resolve, and
+#                one or more @-shaped names that `fleet expand` could not
+#                resolve (typo'd seat, missing fleet file -- never
+#                `@operator`, which `fleet expand` resolves successfully
+#                via its zero-candidate sink, see docs/agent-mail.md) and
 #                that this thread had not already recorded before
 #                (reply-all reintroduces the same unresolved name on
 #                every later message, and a name once recorded -- flagged
@@ -800,18 +801,21 @@ pm_trim() {
 # every address that is @-shaped (`^@` -- agents are always addressed
 # "@name", so an @-shaped input that fails to expand is a typo'd seat
 # name or a missing fleet file, never a legitimate external address) and
-# whose `fleet expand` failed -- EXCEPT `@operator`, which `fleet expand`
-# also fails on (fleet.sh's FLEET_RESERVED_NAMES refuses it as an agent
-# name on purpose) but which rule 0 above documents as the one @-shaped
-# address that legitimately never resolves: every documented `mail
-# send`/`mail reply` sends operator mail as the literal address
-# `@operator`, so reply-all on an operator-initiated thread puts it in
-# the To: of every reply. Treating it as a typo would flag that thread on
-# every single reply, clobbering any real flag reason already there
-# (pm_flag overwrites, not appends). A caller that leaves the variable
-# unset gets none of this -- reset and record both no-op -- so existing
-# call sites are unaffected. This can't be a plain global/nameref because
-# the caller invokes this function inside a `<( ... )` process
+# whose `fleet expand` failed. `@operator` never lands here: `fleet
+# expand` resolves it successfully, with zero candidates, through
+# cmd_expand's dedicated @operator sink (fleet.sh's FLEET_RESERVED_NAMES
+# still refuses it as an agent name, but cmd_expand gives the address its
+# own branch that succeeds with no output rather than falling through to
+# the unknown-address error) -- so this function needs no exception of
+# its own for it. Rule 0 above documents why the sink exists: every
+# documented `mail send`/`mail reply` sends operator mail as the literal
+# address `@operator`, so reply-all on an operator-initiated thread puts
+# it in the To: of every reply. Treating it as a typo would flag that
+# thread on every single reply, clobbering any real flag reason already
+# there (pm_flag overwrites, not appends). A caller that leaves the
+# variable unset gets none of this -- reset and record both no-op -- so
+# existing call sites are unaffected. This can't be a plain global/nameref
+# because the caller invokes this function inside a `<( ... )` process
 # substitution, which forks a subshell; a file survives that fork, an
 # in-memory variable would not.
 pm_expand_to() {
@@ -824,7 +828,7 @@ pm_expand_to() {
         [[ -n "$a" ]] || continue
         local expanded
         if ! expanded="$("$FLEET" expand "$a" 2>/dev/null)"; then
-            if [[ -n "${PM_EXPAND_UNRESOLVED_FILE:-}" && "$a" == @* && "$a" != "@operator" ]]; then
+            if [[ -n "${PM_EXPAND_UNRESOLVED_FILE:-}" && "$a" == @* ]]; then
                 printf '%s\n' "$a" >> "$PM_EXPAND_UNRESOLVED_FILE"
             fi
             continue
@@ -2219,10 +2223,11 @@ pm_process_message() {
     # The keyword is built here from the two booleans, not derived from
     # combined_reason by pm_flag_keyword: that function is a closed,
     # start-anchored case match specifically so an @-shaped name's raw
-    # text (attacker-controlled: any To:/Cc: value starting with "@" and
-    # not "@operator" lands in the reason verbatim, see pm_expand_to)
-    # can never influence which keyword comes out. Building the keyword
-    # from $to_reason/$cc_reason's presence rather than by re-matching
+    # text (attacker-controlled: any To:/Cc: value starting with "@" --
+    # other than "@operator", which fleet expand's zero-candidate sink
+    # resolves before this path is ever reached -- lands in the reason
+    # verbatim) can never influence which keyword comes out. Building the
+    # keyword from $to_reason/$cc_reason's presence rather than by re-matching
     # substrings inside the combined text keeps that guarantee -- a name
     # crafted to contain the literal text "unresolvable Cc:" must not be
     # able to inject that keyword into a To:-only flag.

@@ -522,6 +522,15 @@ cmd_expand() {
                 done
                 (( already )) || result+=("@$m")
             done < <(fleet_all_agent_names "$dump")
+        elif [[ "$name" == "operator" ]]; then
+            # @operator is a real address for routing purposes with ZERO
+            # wake candidates behind it -- succeeding with no output,
+            # never resolving to anything expandable, IS the safety
+            # property (see docs/agent-mail.md, "the header contract" /
+            # routing rules). Do not "fix" this into resolving to
+            # something: every patch message on every thread would
+            # convert to paid wakes with no error anywhere.
+            :
         elif fleet_is_list "$dump" "$name"; then
             while IFS= read -r m; do
                 [[ -n "$m" ]] || continue
