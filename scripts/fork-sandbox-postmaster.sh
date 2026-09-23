@@ -3208,9 +3208,25 @@ FORK_SANDBOX_POSTMASTER_WAKE_DEAD_GRACE="${FORK_SANDBOX_POSTMASTER_WAKE_DEAD_GRA
 # instead of actually rebooting the host it runs on.
 FORK_SANDBOX_POSTMASTER_PROC_STAT="${FORK_SANDBOX_POSTMASTER_PROC_STAT:-/proc/stat}"
 
+# A recorded pid is only meaningful in the pid namespace and boot it was
+# written in: a restarted pod gets a fresh pid namespace on the SAME node
+# boot, so a small old pid can name an unrelated live process in the new
+# pod, which the btime check above cannot see. A k8s wake records
+# `<pidns> <boot_id>` next to its pid (fork-sandbox-k8s-wake.sh); both
+# sources are overridable so the tests can fake a new pod.
+FORK_SANDBOX_POSTMASTER_PROC_PIDNS="${FORK_SANDBOX_POSTMASTER_PROC_PIDNS:-/proc/self/ns/pid}"
+FORK_SANDBOX_POSTMASTER_BOOT_ID="${FORK_SANDBOX_POSTMASTER_BOOT_ID:-/proc/sys/kernel/random/boot_id}"
+
+pm_pid_identity() {
+    local ns boot
+    ns="$(readlink -- "$FORK_SANDBOX_POSTMASTER_PROC_PIDNS" 2>/dev/null)" || ns=""
+    boot="$(cat -- "$FORK_SANDBOX_POSTMASTER_BOOT_ID" 2>/dev/null)" || boot=""
+    printf '%s %s' "$ns" "$(pm_trim "$boot")"
+}
+
 pm_wake_is_dead() {
     local run_dir="$1" env_file="$2"
-    local pid_file="$run_dir/pid" now ref_mtime pid btime
+    local pid_file="$run_dir/pid" now ref_mtime pid btime recorded_identity
     now="$(date +%s)"
     btime="$(awk '/^btime /{print $2}' "$FORK_SANDBOX_POSTMASTER_PROC_STAT" 2>/dev/null)"
     [[ "$btime" =~ ^[0-9]+$ ]] || btime=""
@@ -3221,6 +3237,10 @@ pm_wake_is_dead() {
             : # pid file predates this boot; the pid it names, even if
               # live, belongs to a different boot's process table and
               # cannot be this run's own process.
+        elif recorded_identity="$(cat -- "$run_dir/pid-identity" 2>/dev/null)" \
+            && [[ "$(pm_trim "$recorded_identity")" != "$(pm_pid_identity)" ]]; then
+            : # written under another pid namespace or boot: the pid names
+              # nothing of ours here, live or not.
         elif [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
             return 1
         fi

@@ -28,6 +28,9 @@
 # Foreground mode (no --detach) blocks until the launch finishes and
 # leaves, in <wake-dir>:
 #   pid          this wrapper's own pid, written first, before the launch
+#   pid-identity `<pid namespace> <boot id>` the pid was written under; the
+#                postmaster trusts the pid only in that same namespace and
+#                boot (a restarted pod's pids are unrelated to the old ones)
 #   launch.log   the launch's combined stdout+stderr
 #   k8s-run-dir  the k8s run directory scraped from launch.log (may be
 #                empty: a refusal before submit)
@@ -90,6 +93,16 @@ fs_k8s_wake_write_atomic() {
     mv -f -- "$tmp" "$dest"
 }
 
+# `<pidns> <boot_id>`: the identity the recorded pid is only valid under.
+# The postmaster's pm_pid_identity reads the same two sources, with the
+# same overrides.
+fs_k8s_wake_pid_identity() {
+    local ns boot
+    ns="$(readlink -- "${FORK_SANDBOX_POSTMASTER_PROC_PIDNS:-/proc/self/ns/pid}" 2>/dev/null)" || ns=""
+    boot="$(cat -- "${FORK_SANDBOX_POSTMASTER_BOOT_ID:-/proc/sys/kernel/random/boot_id}" 2>/dev/null)" || boot=""
+    printf '%s %s' "$ns" "$boot"
+}
+
 fs_k8s_wake_branch_from_argv() {
     local -n _fs_k8s_wake_argv="$1"
     local i
@@ -113,6 +126,7 @@ fs_k8s_wake_run() {
     # wrapper is alive" apart from "nothing has run yet" the same way a
     # local wake's own pid file does.
     fs_k8s_wake_write_atomic "$wake_dir/pid" "$$"
+    fs_k8s_wake_write_atomic "$wake_dir/pid-identity" "$(fs_k8s_wake_pid_identity)"
 
     local -a fs_argv
     fs_k8s_wake_read_nul fs_argv "$wake_dir/fs-argv"

@@ -2298,6 +2298,41 @@ check "same boot: a live pid whose pid file postdates the boot is left alone" 0 
 check "same boot: not harvested (a genuinely running wake is left alone)" "0" \
     "$(find "$FORK_SANDBOX_MAIL_ROOT/.postmaster/harvested" -type f | wc -l)"
 
+# A restarted pod has a fresh pid namespace on the SAME boot, so the pid a
+# wake recorded can name a live, unrelated process in the new pod. The
+# wake records `<pidns> <boot_id>` beside its pid; a pid is trusted only
+# under the identity it was written in. The test's own $$ is the live pid.
+pid_identity_case() {
+    local label="$1" identity="$2" want_dead="$3" fake_ns="$4"
+    local mid tid run_env run_dir
+    new_scratch_root FORK_SANDBOX_MAIL_ROOT
+    export FORK_SANDBOX_MAIL_ROOT
+    mid="$(send_msg '@carol' '@alice' "pid identity: $label" 'body' 8)"
+    tid="$(thread_of "$mid")"
+    : > "$STUB_ARGV_LOG"
+    once
+    run_env="$(env_file_for_agent alice)"
+    run_dir="$(sed -n 's/^RUN_DIR=//p' "$run_env")"
+    printf '%s\n' "$$" > "$run_dir/pid"
+    [[ -z "$identity" ]] || printf '%s' "$identity" > "$run_dir/pid-identity"
+    ln -sfn "$fake_ns" "$FORK_SANDBOX_MAIL_ROOT/fake-pidns"
+    printf 'boot-aaaa\n' > "$FORK_SANDBOX_MAIL_ROOT/fake-boot-id"
+    export FORK_SANDBOX_POSTMASTER_PROC_PIDNS="$FORK_SANDBOX_MAIL_ROOT/fake-pidns"
+    export FORK_SANDBOX_POSTMASTER_BOOT_ID="$FORK_SANDBOX_MAIL_ROOT/fake-boot-id"
+    export FORK_SANDBOX_POSTMASTER_WAKE_DEAD_GRACE=0
+    once
+    unset FORK_SANDBOX_POSTMASTER_PROC_PIDNS FORK_SANDBOX_POSTMASTER_BOOT_ID \
+        FORK_SANDBOX_POSTMASTER_WAKE_DEAD_GRACE
+    check "pid identity, $label: flagged as dead" "$want_dead" \
+        "$( [[ -e "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid" ]] && echo 1 || echo 0 )"
+    check "pid identity, $label: harvested" "$want_dead" \
+        "$(find "$FORK_SANDBOX_MAIL_ROOT/.postmaster/harvested" -type f | wc -l)"
+}
+pid_identity_case "other pid namespace, live pid" 'pid:[4026531111] boot-aaaa' 1 'pid:[4026532222]'
+pid_identity_case "other boot id, live pid" 'pid:[4026532222] boot-zzzz' 1 'pid:[4026532222]'
+pid_identity_case "matching identity, live pid" 'pid:[4026532222] boot-aaaa' 0 'pid:[4026532222]'
+pid_identity_case "no identity file, live pid" '' 0 'pid:[4026532222]'
+
 # ============================================================
 printf '\n== spawn launcher is resolved independent of PATH ==\n'
 # ============================================================
