@@ -340,6 +340,13 @@
 # where it looks for a local wake's. `FORK_SANDBOX_POSTMASTER_K8S_DETACH=
 # inline` (test seam only) runs the wrapper synchronously in the current
 # process instead of detaching it, so a test never depends on tmux.
+# `FORK_SANDBOX_POSTMASTER_K8S_WAKE_ROOT` (test seam only, default
+# /var/tmp/claude-scratch/forks) overrides where wake dirs are created, and
+# `FORK_SANDBOX_POSTMASTER_K8S_WAKE_SCRIPT` (test seam only, default
+# $script_dir/fork-sandbox-k8s-wake.sh) overrides which wrapper is run, so a
+# test can point both at its own throwaway root instead of leaving real
+# directories behind and instead of the wrapper's own script_dir resolving
+# to the real fork-sandbox-k8s.sh.
 #
 # fork-sandbox.sh refuses five flags on --k8s -- --clone-dir,
 # --session-state, --resume-session, --session-id, --refresh-at -- so
@@ -2241,7 +2248,7 @@ pm_spawn_wake() {
         # is the wake dir, not a fork-sandbox.sh run dir). Session
         # continuity (--session-state/--resume-session/--session-id/
         # --clone-dir/--refresh-at) and --preset are dropped outright:
-        # fork-sandbox.sh refuses the first four with --k8s, and `fleet
+        # fork-sandbox.sh refuses all five with --k8s, and `fleet
         # check` never lets a k8s seat carry a preset -- seat continuity on
         # k8s is later work (see the brief's Out of scope).
         local -a spawn_args=(--branch "$branch" --harness "$harness" --network "$network")
@@ -2255,9 +2262,10 @@ pm_spawn_wake() {
         [[ -n "$endpoint" ]] && spawn_args+=(--endpoint "$endpoint")
         spawn_args+=(--timeout "${FORK_SANDBOX_POSTMASTER_K8S_TIMEOUT:-14400}")
 
-        mkdir -p /var/tmp/claude-scratch/forks
+        local wake_root="${FORK_SANDBOX_POSTMASTER_K8S_WAKE_ROOT:-/var/tmp/claude-scratch/forks}"
+        mkdir -p -- "$wake_root"
         local wake_dir
-        wake_dir="$(mktemp -d /var/tmp/claude-scratch/forks/pm-k8s-wake.XXXXXX)"
+        wake_dir="$(mktemp -d "$wake_root/pm-k8s-wake.XXXXXX")"
         spawn_args+=(--outbox-dir "$wake_dir/outbox")
 
         # Grant flags, forwarded in file order: every ALLOW_NAMESPACE line,
@@ -2303,7 +2311,7 @@ pm_spawn_wake() {
             printf '%s=%s\0' "$k" "${!k}" >> "$env_file"
         done < <(compgen -e | grep '^FORK_SANDBOX_' || true)
 
-        local pm_k8s_wake="$script_dir/fork-sandbox-k8s-wake.sh"
+        local pm_k8s_wake="${FORK_SANDBOX_POSTMASTER_K8S_WAKE_SCRIPT:-$script_dir/fork-sandbox-k8s-wake.sh}"
         local rc=0 launch_failed=0
         set +e
         if [[ "${FORK_SANDBOX_POSTMASTER_K8S_DETACH:-}" == inline ]]; then
@@ -3165,12 +3173,15 @@ pm_harvest_run() {
     local project="$1" rid="$2"
     local f="$RUNS/$rid.env"
     local agent tid trigger run_dir harness model network resumed_field
+    local backend branch
     agent="$(fs_pm_env_get "$f" AGENT)"
     tid="$(fs_pm_env_get "$f" THREAD)"
     trigger="$(fs_pm_env_get "$f" TRIGGER)"
     run_dir="$(fs_pm_env_get "$f" RUN_DIR)"
     harness="$(fs_pm_env_get "$f" HARNESS)"
     model="$(fs_pm_env_get "$f" MODEL)"
+    backend="$(fs_pm_env_get "$f" BACKEND)"
+    branch="$(fs_pm_env_get "$f" BRANCH)"
     network="$(fs_pm_env_get "$f" NETWORK)"
     resumed_field="$(fs_pm_env_get "$f" RESUMED)"
     # A given-mode harness (pi) derives its id fresh on every spawn (see
@@ -3222,7 +3233,20 @@ pm_harvest_run() {
     else
         local exit_code
         exit_code="$(pm_trim "$(cat -- "$run_dir/exit-code" 2>/dev/null)")"
-        if [[ "$exit_code" != "0" ]]; then
+        if [[ "$backend" == k8s && "$exit_code" == "1" ]]; then
+            # rc 1 from fork-sandbox-k8s.sh run is a wait timeout, not a
+            # crash: the pod is still running and holding its work
+            # (fork-sandbox-k8s.sh's own message, "the pod is still
+            # running, holding its work"). Feeding this into the same
+            # crash-retry path as rc 2 (a dead pod) would schedule
+            # pm_retry_schedule below, and the retry would spawn a second
+            # Job for this seat while the first one is still live -- so
+            # this is flagged on its own, distinct from the generic
+            # non-zero-exit branch below, and was_failure is left 0: no
+            # retry is scheduled, and the still-running Job is left alone
+            # for an operator to fetch or remove by hand.
+            pm_flag "$tid" "k8s wake for $agent timed out waiting on its Job (run $rid); the Job is still running -- fetch it with fork-sandbox-k8s.sh fetch --branch $branch, or remove it with fork-sandbox-k8s.sh rm --branch $branch, before it is retried automatically"
+        elif [[ "$exit_code" != "0" ]]; then
             # Harvest whatever outbox there is (a crash mid-reply may still
             # have written a file), but flag regardless: an empty outbox from
             # a non-zero exit is a failure, not the documented "no reply is a

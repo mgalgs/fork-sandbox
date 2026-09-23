@@ -4877,6 +4877,28 @@ export FORK_SANDBOX_POSTMASTER_K8S_DETACH=inline
 new_root K8S_TEST_CONFIG_DIR
 export FORK_SANDBOX_CONFIG_DIR="$K8S_TEST_CONFIG_DIR"
 
+# The wake wrapper resolves its own reap target (`fork-sandbox-k8s.sh rm`)
+# from its own script_dir -- so it is run from a throwaway copy next to a
+# stub fork-sandbox-k8s.sh, never the real scripts/ directory, and every
+# case's wake dir is rooted under this suite's own scratch dir instead of
+# the real /var/tmp/claude-scratch/forks/, so both are cleaned up by the
+# same tmpdirs trap as everything else this suite creates.
+new_root K8S_WAKE_BIN
+cp -- "$repo_dir/scripts/fork-sandbox-k8s-wake.sh" "$K8S_WAKE_BIN/fork-sandbox-k8s-wake.sh"
+chmod +x -- "$K8S_WAKE_BIN/fork-sandbox-k8s-wake.sh"
+cat > "$K8S_WAKE_BIN/fork-sandbox-k8s.sh" <<STUB
+#!/usr/bin/env bash
+# Stands in for the real fork-sandbox-k8s.sh's \`rm\` verb: this suite
+# must never shell out to the real cluster script (let alone a cluster).
+set -uo pipefail
+printf '%s\n' "\$*" >> "$K8S_WAKE_BIN/rm-calls.log"
+exit 0
+STUB
+chmod +x -- "$K8S_WAKE_BIN/fork-sandbox-k8s.sh"
+export FORK_SANDBOX_POSTMASTER_K8S_WAKE_SCRIPT="$K8S_WAKE_BIN/fork-sandbox-k8s-wake.sh"
+new_root K8S_WAKE_ROOT
+export FORK_SANDBOX_POSTMASTER_K8S_WAKE_ROOT="$K8S_WAKE_ROOT"
+
 # Most recent runs/<run-id>.env for $1, regardless of harvested state -- a
 # k8s wake finishes synchronously (FORK_SANDBOX_POSTMASTER_K8S_DETACH=inline)
 # within the SAME `once` pass that spawned it, so by the time `once`
@@ -4991,6 +5013,33 @@ check "k8s case5: retry handoff carries the retry section" 1 \
     "$(grep -c -- '^## This is a retry$' "$k5_retry_handoff")"
 unset STUB_K8S_EXIT STUB_K8S_NO_SUMMARY
 
+# ---- case 5b: rc 1 (wait timeout, pod still running) is not a crash ----
+# fork-sandbox-k8s.sh run's own rc 1 means the wait deadline passed with
+# the pod still running, holding its work -- not a dead pod (rc 2). Feeding
+# it into the same crash-retry path as case 5 would spawn a second Job for
+# this seat while the first is still live (the bug this case guards
+# against): no retry may be scheduled, and the flag must name the timeout
+# specifically rather than the generic "exited N" crash message.
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+
+k5b_mid="$(send_msg '@carol' '@karen' 'k8s timeout topic' 'first' 8)"
+k5b_tid="$(thread_of "$k5b_mid")"
+export STUB_K8S_EXIT=1 STUB_K8S_NO_SUMMARY=1 STUB_K8S_NO_REPLY=1
+once
+unset STUB_K8S_EXIT STUB_K8S_NO_SUMMARY STUB_K8S_NO_REPLY
+contains "k8s case5b: thread flagged as a timeout, not a generic exit" \
+    "$(cat "$PM_STATE_DIR/needs-operator/$k5b_tid" 2>/dev/null)" "timed out waiting on its Job"
+check "k8s case5b: no retry scheduled -- a live Job is not a crash" 0 \
+    "$( [[ -e "$PM_STATE_DIR/retries/$k5b_tid/karen" ]] && echo 1 || echo 0 )"
+
+: > "$STUB_ARGV_LOG"
+once
+check "k8s case5b: no second Job launched behind the still-running one" 0 \
+    "$(grep -c -- '^--k8s$' "$STUB_ARGV_LOG")"
+
 # ---- case 6: rc 3 zero-harvest -> harvested clean, kept Job reaped ----
 
 new_scratch_root FORK_SANDBOX_MAIL_ROOT
@@ -5008,7 +5057,10 @@ check "k8s case6: no retry schedule (a clean exit)" 0 \
     "$( [[ -e "$PM_STATE_DIR/retries/$k6_tid/karen" ]] && echo 1 || echo 0 )"
 k6_env="$(latest_env_for_agent karen)"
 k6_rundir="$(env_val "$k6_env" RUN_DIR)"
+k6_branch="$(env_val "$k6_env" BRANCH)"
 check "k8s case6: recorded exit-code normalized to 0" 0 "$(cat "$k6_rundir/exit-code" 2>/dev/null)"
+check "k8s case6: the stub fork-sandbox-k8s.sh was called with rm --branch" \
+    "rm --branch $k6_branch" "$(cat "$K8S_WAKE_BIN/rm-calls.log" 2>/dev/null)"
 contains "k8s case6: the wrapper attempted to reap the kept Job" \
     "$(cat "$k6_rundir/launch.log" 2>/dev/null)" "reaping zero-harvest Job for branch"
 unset FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF

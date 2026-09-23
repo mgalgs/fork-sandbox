@@ -488,7 +488,7 @@ A k8s wake still runs as one `fork-sandbox.sh --k8s` launch under
 `fork-sandbox-k8s-wake.sh`, the postmaster's async wrapper for it (see
 that script's own header) — every wake is a **fresh session**: none of
 `--session-state`/`--resume-session`/`--session-id`/`--clone-dir`/
-`--refresh-at` is passed (`fork-sandbox.sh` refuses the first four with
+`--refresh-at` is passed (`fork-sandbox.sh` refuses all five with
 `--k8s` outright; seat continuity on k8s is later work). It also gets
 **no live delivery**: a message addressed to an agent already running a
 k8s wake just pends, the same fallback a non-claude harness gets locally
@@ -501,7 +501,7 @@ already ran), only that one seat waits, flagged once with reason
 `no grant for k8s seat <agent>: <message-id>` (keyword `no-grant`). Run
 `fork-sandbox-mail.sh grant <thread-id> ...` (above) to release it — the
 next `deliver` pass picks the grant up and dispatches the held trigger. See
-"The held state file is a read contract" above for the on-disk record, and
+"The held state file is a read contract" below for the on-disk record, and
 `status`'s `held:` section for what's currently waiting.
 
 `$FORK_SANDBOX_POSTMASTER_K8S_TIMEOUT` sets the `--timeout` seconds a k8s
@@ -939,7 +939,7 @@ history to recover from.
 
 `held/<thread-id>/<agent>` holds one `backend: k8s` seat with
 `grant: required` and no grant file yet for this thread (see "Cluster
-seats" below) — same read-contract posture as `retries/` above, a full
+seats" above) — same read-contract posture as `retries/` above, a full
 mktemp+mv rewrite on every write, never a partial one:
 
 | Field | Meaning |
@@ -953,7 +953,7 @@ would otherwise spawn with no grant file present. A new message addressed
 to a held seat supersedes the record (`TRIGGER` moves to the new message,
 `SINCE` stays). Deleted on release, by `pm_held_pass`, once the grant
 file exists or the seat no longer resolves `grant: required` at all — see
-"Cluster seats" below.
+"Cluster seats" above.
 
 ### Router state
 
