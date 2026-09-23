@@ -417,8 +417,15 @@
 #                        session instead of into compaction. Default 0.5 (half
 #                        the model's context window); 0 disables it. A value
 #                        above 1 is an absolute token count instead of a
-#                        fraction. claude only for now — see "A run that
-#                        refreshes itself" below. Refused with any other
+#                        fraction. Each leg is actually nudged at
+#                        max(T, min(B + T, CEILING)), B being that leg's OWN
+#                        starting usage — see "A run that refreshes itself"
+#                        below for why. A leg that hands off without moving
+#                        the branch ends the chain as "stalled" rather than
+#                        forking another leg from it (the first leg is
+#                        exempt). A brief that already eats a large share of
+#                        the threshold on its own is warned about at launch.
+#                        claude only for now. Refused with any other
 #                        --harness. Works with --k8s too, with the same
 #                        default, resolved by fork-sandbox-k8s.sh submit.
 # --refresh-max <n>:     how many continuation legs may follow the first
@@ -630,8 +637,19 @@
 # human in the loop: when a coding leg's context crosses the threshold, a hook
 # nudges it, once, through the same channel an operator addendum uses, to
 # finish the step it is on, commit, write a self-contained hand-off for a
-# fresh session to <run-dir>/outbox/handoff.md, and end its turn. If it does,
-# this script moves that file to <run-dir>/handoff-N.md (the record) and runs
+# fresh session to <run-dir>/outbox/handoff.md, and end its turn.
+#
+# Each leg's own threshold is not the flat --refresh-at value: it is
+# eff = max(T, min(B + T, CEILING)), B being that leg's own first usage
+# reading and CEILING floor(0.8 x the model's context window) -- a leg that
+# starts a continuation already well into its context (a 188 KB brief was
+# observed doing exactly this) still gets a real T tokens of working room
+# from where IT started, capped short of the harness's own compaction, and
+# an explicit --refresh-at above the ceiling is never lowered. A brief large
+# enough on its own to matter here is warned about once, at launch.
+#
+# If the leg does write a hand-off, this script moves that file to
+# <run-dir>/handoff-N.md (the record) and runs
 # a fresh session on the SAME clone and branch with it as the prompt —
 # continuation N, whose prompt also embeds <run-dir>/handoff-original.md, a
 # verbatim snapshot of the hand-off this run itself was launched with, ahead
