@@ -221,6 +221,12 @@
 #     only the placeholder "not shown" line does. The plain (non-
 #     --postmaster) install stays byte-identical, pinned against a fixture
 #     captured before this feature existed.
+#   - The client Role in manifests/k8s/10-rbac.yaml and the postmaster Role
+#     in manifests/k8s/40-postmaster.yaml grant the same rules (same
+#     resource+verb sets, order-independent): both need watch/patch and
+#     the services/networkpolicies/secrets resources for submit and rm's
+#     label-based cleanup delete, so a kubeconfig bound to the client Role
+#     does not fail at cleanup the way the older, narrower client Role did.
 #   - K8S_PROXY_ENDPOINTS, the named-keyless-endpoint registry: a legacy
 #     K8S_PROXY_UPSTREAM install renders byte-identical to
 #     tests/fixtures/k8s-proxy-legacy-install.yaml, a render captured before
@@ -13105,6 +13111,65 @@ else
     no "the dry-run prints the Secret placeholder line instead of its content" "$pm_secret_out"
 fi
 rm -f /tmp/fs-k8s-test-pm-secret.err
+
+printf '\n== client Role vs postmaster Role: same rules ==\n'
+rbac_yaml="$repo_dir/manifests/k8s/10-rbac.yaml"
+pm_yaml="$repo_dir/manifests/k8s/40-postmaster.yaml"
+if command -v yq >/dev/null 2>&1; then
+    rbac_rules="$(yq -r '
+        select(.kind == "Role" and .metadata.name == "fork-sandbox-client") | .rules[]
+        | .apiGroups[] as $g | .resources[] as $r | .verbs[] as $v
+        | "\($g)/\($r)/\($v)"
+    ' "$rbac_yaml" | sort)"
+    pm_rules="$(yq -r '
+        select(.kind == "Role" and .metadata.name == "fork-sandbox-postmaster") | .rules[]
+        | .apiGroups[] as $g | .resources[] as $r | .verbs[] as $v
+        | "\($g)/\($r)/\($v)"
+    ' "$pm_yaml" | sort)"
+else
+    rbac_rules="$(python3 -c '
+import sys
+import yaml
+
+with open(sys.argv[1]) as f:
+    docs = list(yaml.safe_load_all(f))
+rules = []
+for d in docs:
+    if d and d.get("kind") == "Role" and d.get("metadata", {}).get("name") == sys.argv[2]:
+        for rule in d.get("rules", []):
+            for g in rule.get("apiGroups", []):
+                for r in rule.get("resources", []):
+                    for v in rule.get("verbs", []):
+                        rules.append("{}/{}/{}".format(g, r, v))
+for line in sorted(rules):
+    print(line)
+' "$rbac_yaml" "fork-sandbox-client")"
+    pm_rules="$(python3 -c '
+import sys
+import yaml
+
+with open(sys.argv[1]) as f:
+    docs = list(yaml.safe_load_all(f))
+rules = []
+for d in docs:
+    if d and d.get("kind") == "Role" and d.get("metadata", {}).get("name") == sys.argv[2]:
+        for rule in d.get("rules", []):
+            for g in rule.get("apiGroups", []):
+                for r in rule.get("resources", []):
+                    for v in rule.get("verbs", []):
+                        rules.append("{}/{}/{}".format(g, r, v))
+for line in sorted(rules):
+    print(line)
+' "$pm_yaml" "fork-sandbox-postmaster")"
+fi
+if [[ -z "$rbac_rules" || -z "$pm_rules" ]]; then
+    no "client and postmaster Roles both parsed" "rbac_rules='$rbac_rules' pm_rules='$pm_rules'"
+elif [[ "$rbac_rules" == "$pm_rules" ]]; then
+    ok "client Role and postmaster Role grant the same resource+verb rules"
+else
+    no "client Role and postmaster Role grant the same resource+verb rules" \
+        "$(diff <(echo "$rbac_rules") <(echo "$pm_rules"))"
+fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))

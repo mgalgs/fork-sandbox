@@ -1,10 +1,19 @@
 ---
 # The identity a fork-sandbox client runs as: enough to submit a Job, fetch
-# its result over kubectl exec, and clean up, and nothing more. It holds no
-# secret of its own -- the provider key lives in a Secret this ServiceAccount
-# cannot read, since submit, fetch and rm never need to. A CI pipeline can
-# bind a kubeconfig to this ServiceAccount's token exactly as a workstation
-# operator binds their own kubectl context to it.
+# its result over kubectl exec, and clean up, and nothing more.
+#
+# This identity can read every Secret in this namespace: the Role lists
+# `secrets` with get/list/watch, because the cleanup path (submit and rm's
+# label-based delete of `pod,service,secret,configmap,networkpolicy`) needs
+# list and delete on secrets. That is not a new exposure -- anything that
+# can create a Job can already mount any Secret in its own namespace by
+# naming it in that Job's spec, whether or not its own Role lists
+# `secrets` -- but it does mean a kubeconfig bound to this ServiceAccount's
+# token reaches every credential in the namespace, so bind it only to
+# trusted operators or CI, not to untrusted callers. Untrusted callers will
+# reach the store through a narrower mail API, planned, instead. See
+# manifests/k8s/40-postmaster.yaml for the postmaster Role, which grants
+# the same rules for the same reason.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -19,10 +28,10 @@ metadata:
 rules:
   - apiGroups: ["batch"]
     resources: ["jobs"]
-    verbs: ["create", "get", "list", "delete"]
+    verbs: ["get", "list", "watch", "create", "patch", "delete"]
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["get", "list", "delete"]
+    verbs: ["get", "list", "watch", "create", "patch", "delete"]
   - apiGroups: [""]
     resources: ["pods/exec"]
     verbs: ["create"]
@@ -30,8 +39,11 @@ rules:
     resources: ["pods/log"]
     verbs: ["get"]
   - apiGroups: [""]
-    resources: ["configmaps"]
-    verbs: ["create", "get", "delete"]
+    resources: ["configmaps", "services", "secrets"]
+    verbs: ["get", "list", "watch", "create", "patch", "delete"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["get", "list", "watch", "create", "patch", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
