@@ -9325,7 +9325,7 @@ refresh_block_file="$(newdir)/refresh-block.sh"; tmpdirs+=("$(dirname "$refresh_
 printf '%s\n' 'set -euo pipefail' "$refresh_ep_fns" "$claude_block" \
     'printf "CLAUDE_BLOCK_PI_RC=%s\n" "$pi_rc"' > "$refresh_block_file"
 # $1 threshold ("" = refresh off), $2 legs that write a hand-off, $3 legs that
-# exit 1, $4 REFRESH_MAX, $5 RESUME_SESSION. Sets RB_WORK/_HOME/_CALLS/_OUT/_RC/_ENVS.
+# exit 1, $4 REFRESH_MAX, $5 RESUME_SESSION. Sets RB_WORK/_REC/_CALLS/_OUT/_RC.
 refresh_block_run() {
     local stub_dir mounts home rec
     stub_dir="$(newdir)"; tmpdirs+=("$stub_dir")
@@ -9358,7 +9358,7 @@ refresh_block_run() {
         '[[ " $RB_FAIL_LEGS " == *" $n "* ]] && exit 1' \
         'exit 0' > "$stub_dir/claude"
     chmod +x "$stub_dir/claude"
-    RB_HOME="$home"; RB_REC="$rec"
+    RB_REC="$rec"
     RB_OUT="$(PATH="$stub_dir:$PATH" HOME="$home" TMPDIR="$rec" \
         HARNESS=claude MODEL="claude-test-model" \
         CLAUDE_PROXY_BASE_URL="http://fs-k8s-test-proxy.invalid" \
@@ -9494,6 +9494,7 @@ fi
 
 # Snapshot position: it follows the LAST continuation, so the newest
 # transcript in the pushed-back store is the second continuation's (leg 3).
+# shellcheck disable=SC2012  # names are fixed by the stub
 if [[ "$(ls -t "$RB_WORK"/session-store/-stub-slug/ | head -1)" == leg-3.jsonl ]]; then
     ok "after two continuations the newest stored transcript is the last continuation's"
 else
