@@ -175,19 +175,19 @@ spec:
             # >>> personas env
             - name: FORK_SANDBOX_PERSONAS_DIR
               value: /etc/fork-sandbox/personas
-            # <<< personas env
+              # <<< personas env
             # >>> prompts env
             - name: FORK_SANDBOX_PROMPTS_DIR
               value: /etc/fork-sandbox/prompts
-            # <<< prompts env
+              # <<< prompts env
             # >>> handlers env
             - name: FORK_SANDBOX_HANDLERS_DIR
               value: /etc/fork-sandbox/handlers
-            # <<< handlers env
+              # <<< handlers env
             # >>> presets env
             - name: FORK_SANDBOX_PRESETS_DIR
               value: /etc/fork-sandbox/presets
-          # <<< presets env
+              # <<< presets env
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -229,22 +229,22 @@ spec:
             - name: personas
               mountPath: /etc/fork-sandbox/personas
               readOnly: true
-            # <<< personas volumeMount
+              # <<< personas volumeMount
             # >>> prompts volumeMount
             - name: prompts
               mountPath: /etc/fork-sandbox/prompts
               readOnly: true
-            # <<< prompts volumeMount
+              # <<< prompts volumeMount
             # >>> handlers volumeMount
             - name: handlers
               mountPath: /etc/fork-sandbox/handlers
               readOnly: true
-            # <<< handlers volumeMount
+              # <<< handlers volumeMount
             # >>> presets volumeMount
             - name: presets
               mountPath: /etc/fork-sandbox/presets
               readOnly: true
-      # <<< presets volumeMount
+              # <<< presets volumeMount
       volumes:
         - name: data
           persistentVolumeClaim:
@@ -264,18 +264,18 @@ spec:
         - name: personas
           configMap:
             name: fork-sandbox-postmaster-personas
-        # <<< personas volume
+            # <<< personas volume
         # >>> prompts volume
         - name: prompts
           configMap:
             name: fork-sandbox-postmaster-prompts
-        # <<< prompts volume
+            # <<< prompts volume
         # >>> handlers volume
         - name: handlers
           configMap:
             name: fork-sandbox-postmaster-handlers
             defaultMode: 0555
-        # <<< handlers volume
+            # <<< handlers volume
         # >>> presets volume
         - name: presets
           configMap:

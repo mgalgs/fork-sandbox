@@ -194,6 +194,33 @@
 #     before; and `fork-sandbox.sh --k8s --checkout REF` is no longer
 #     refused -- it forwards the flag, and its render matches a direct
 #     `run --dry-run --checkout REF` byte-for-byte.
+#   - `install --postmaster`: renders and applies manifests/k8s/40-postmaster.yaml
+#     alongside the base install, driven against a stubbed kubectl (a real
+#     kubectl refuses --context=<fixture-context> even under
+#     --dry-run=client, so every case here needs the stub, unlike plain
+#     --dry-run elsewhere in this file). Every required key
+#     (K8S_POSTMASTER_IMAGE/_REPO_URL/_GIT_KEY_FILE/_KNOWN_HOSTS_FILE)
+#     refuses when missing, and a malformed repo URL or project name
+#     refuses, all before any kubectl call; storageClassName renders iff
+#     K8S_POSTMASTER_STORAGE_CLASS is set; the access mode defaults to
+#     ReadWriteOncePod, accepts ReadWriteOnce, and refuses anything else;
+#     each of personas/prompts/handlers/presets renders (env, volumeMount,
+#     volume, and its own ConfigMap) iff the matching config dir exists,
+#     independently, in every combination -- including the mixed ones
+#     (some present, some not), which is the case a template-indentation
+#     bug in an earlier round of this work broke (a stray comment
+#     indentation on the LAST surviving optional block only, fixed in
+#     manifests/k8s/40-postmaster.yaml); a subdirectory inside one of
+#     those config dirs refuses, naming it; a non-executable file under
+#     handlers/ is skipped with a warning, not refused, and does not reach
+#     the rendered ConfigMap while its executable sibling does; the total
+#     ConfigMap payload is capped at 900 KiB, refusing and naming the
+#     biggest file over that; the checksum/pm-config annotation changes
+#     when fleet.yaml's content changes; and the git deploy key and known
+#     hosts file content never appear in the command's stdout or stderr --
+#     only the placeholder "not shown" line does. The plain (non-
+#     --postmaster) install stays byte-identical, pinned against a fixture
+#     captured before this feature existed.
 #   - K8S_PROXY_ENDPOINTS, the named-keyless-endpoint registry: a legacy
 #     K8S_PROXY_UPSTREAM install renders byte-identical to
 #     tests/fixtures/k8s-proxy-legacy-install.yaml, a render captured before
@@ -12696,6 +12723,388 @@ cg_nl_ctx_dir="/var/tmp/claude-scratch/forks/check-grant-nl-test.$$/$(printf 'x\
 mkdir -p -- "$cg_nl_ctx_dir"; tmpdirs+=("/var/tmp/claude-scratch/forks/check-grant-nl-test.$$")
 cg_run --context-ro "$cg_nl_ctx_dir" >/dev/null 2>&1
 check "context-ro whose real path contains a newline: exit 2" "2" "$?"
+
+printf '\n== install --postmaster ==\n'
+# A real kubectl refuses --context=<name> for a context that does not
+# exist in the active kubeconfig, even for a pure --dry-run=client
+# render that touches no network -- so every case here needs a stubbed
+# kubectl on PATH ahead of the real one, unlike plain --dry-run tests
+# elsewhere in this file (which never invoke kubectl at all). The stub
+# renders a faithful ConfigMap/Secret --dry-run=client -o yaml from
+# --from-file=key=path pairs, using the real file content, so the
+# checksum-changes-with-fleet.yaml case below is a genuine content hash,
+# not a canned string.
+pm_make_kubectl_stub() {
+    local bin_dir
+    bin_dir="$(newdir)"; tmpdirs+=("$bin_dir")
+    cat > "$bin_dir/kubectl" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$K8S_STUB_LOG"
+args=()
+skip_next=false
+for a in "$@"; do
+    if $skip_next; then skip_next=false; continue; fi
+    case "$a" in
+        --context=*) continue ;;
+        -n) skip_next=true; continue ;;
+    esac
+    args+=("$a")
+done
+case "${args[0]:-} ${args[1]:-}" in
+    "apply -f")
+        cat >/dev/null
+        exit 0
+        ;;
+    "create configmap")
+        kind=ConfigMap; name="${args[2]:-}"
+        ;;
+    "create secret")
+        kind=Secret; name="${args[3]:-}"
+        ;;
+    *)
+        cat >/dev/null 2>/dev/null || true
+        exit 0
+        ;;
+esac
+printf 'apiVersion: v1\nkind: %s\nmetadata:\n  name: %s\ndata:\n' "$kind" "$name"
+for a in "${args[@]}"; do
+    case "$a" in
+        --from-file=*)
+            kv="${a#--from-file=}"
+            k="${kv%%=*}"
+            path="${kv#*=}"
+            printf '  %s: |\n' "$k"
+            sed 's/^/    /' "$path"
+            ;;
+    esac
+done
+exit 0
+STUB
+    chmod +x "$bin_dir/kubectl"
+    printf '%s' "$bin_dir"
+}
+pm_stub_bin="$(pm_make_kubectl_stub)"
+
+pm_base_config_dir() {
+    local d
+    d="$(newdir)"; tmpdirs+=("$d")
+    cat > "$d/k8s.env" <<EOF
+K8S_CONTEXT=test-context
+K8S_NAMESPACE=fork-sandbox-test
+K8S_IMAGE=registry.example/you/fork-sandbox:latest
+K8S_PROXY_UPSTREAM=https://openrouter.ai
+K8S_DENIED_PROBE=10.0.0.1:443
+K8S_RUN_TTL=1800
+K8S_POSTMASTER_IMAGE=registry.example/you/fork-sandbox-postmaster:abc1234
+K8S_POSTMASTER_REPO_URL=ssh://git@git.example/you/proj.git
+K8S_POSTMASTER_GIT_KEY_FILE=$d/deploy-key
+K8S_POSTMASTER_KNOWN_HOSTS_FILE=$d/known_hosts
+EOF
+    install -m 600 /dev/null "$d/pi.env"
+    printf 'OPENROUTER_API_KEY=sk-test-dummy\n' >> "$d/pi.env"
+    chmod 600 "$d/pi.env"
+    install -m 600 /dev/null "$d/deploy-key"
+    printf 'dummy-key-material-for-tests-only\n' >> "$d/deploy-key"
+    printf 'git.example ssh-ed25519 AAAAtest\n' > "$d/known_hosts"
+    printf '%s' "$d"
+}
+
+pm_cfg_without_key() {
+    local base="$1" key="$2" d
+    d="$(newdir)"; tmpdirs+=("$d")
+    cp -r "$base"/. "$d"/
+    chmod 600 "$d/deploy-key" "$d/pi.env"
+    grep -v "^${key}=" "$base/k8s.env" > "$d/k8s.env"
+    printf '%s' "$d"
+}
+
+# 1. The base fixture (no optional dirs) renders with no leftover
+# placeholder and is yamllint-clean.
+pm_cfg1="$(pm_base_config_dir)"
+pm_log1="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$pm_log1")")
+pm_out1="$(newdir)/pm-install.yaml"; tmpdirs+=("$(dirname "$pm_out1")")
+if PATH="$pm_stub_bin:$PATH" K8S_STUB_LOG="$pm_log1" FORK_SANDBOX_CONFIG_DIR="$pm_cfg1" \
+    "$k8s_sh" install --postmaster --dry-run > "$pm_out1" 2>/tmp/fs-k8s-test-pm1.err; then
+    ok "install --postmaster --dry-run exits 0 on the base fixture"
+else
+    no "install --postmaster --dry-run exits 0 on the base fixture" "$(cat /tmp/fs-k8s-test-pm1.err)"
+fi
+check "base fixture dry-run leaves no __ placeholder" "0" "$(grep -c '__' "$pm_out1")"
+if command -v yamllint >/dev/null 2>&1; then
+    out="$(yamllint "$pm_out1" 2>&1)"
+    if [[ -z "$out" ]]; then ok "yamllint: base fixture install --postmaster --dry-run"; else no "yamllint: base fixture install --postmaster --dry-run" "$out"; fi
+fi
+rm -f /tmp/fs-k8s-test-pm1.err
+
+# 2. storageClassName: absent by default (only the header comment's own
+# mention of the token name, at (cluster default), survives -- the
+# field's own "  storageClassName: <value>" line does not), present
+# when the key is set.
+check "storageClassName field absent when K8S_POSTMASTER_STORAGE_CLASS is unset" \
+    "0" "$(grep -c '^  storageClassName:' "$pm_out1")"
+pm_cfg_sc="$(newdir)"; tmpdirs+=("$pm_cfg_sc")
+cp -r "$pm_cfg1"/. "$pm_cfg_sc"/
+chmod 600 "$pm_cfg_sc/deploy-key" "$pm_cfg_sc/pi.env"
+printf 'K8S_POSTMASTER_STORAGE_CLASS=fast-ssd\n' >> "$pm_cfg_sc/k8s.env"
+pm_log_sc="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$pm_log_sc")")
+pm_out_sc="$(PATH="$pm_stub_bin:$PATH" K8S_STUB_LOG="$pm_log_sc" FORK_SANDBOX_CONFIG_DIR="$pm_cfg_sc" \
+    "$k8s_sh" install --postmaster --dry-run 2>/dev/null)"
+check "storageClassName renders the configured class" \
+    "1" "$(grep -c '^  storageClassName: fast-ssd' <<< "$pm_out_sc")"
+
+# 3. access mode: default, explicit override, and refusal.
+check "access mode defaults to ReadWriteOncePod" \
+    "1" "$(grep -c '^    - ReadWriteOncePod$' "$pm_out1")"
+pm_cfg_rwo="$(newdir)"; tmpdirs+=("$pm_cfg_rwo")
+cp -r "$pm_cfg1"/. "$pm_cfg_rwo"/
+chmod 600 "$pm_cfg_rwo/deploy-key" "$pm_cfg_rwo/pi.env"
+printf 'K8S_POSTMASTER_ACCESS_MODE=ReadWriteOnce\n' >> "$pm_cfg_rwo/k8s.env"
+pm_log_rwo="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$pm_log_rwo")")
+pm_out_rwo="$(PATH="$pm_stub_bin:$PATH" K8S_STUB_LOG="$pm_log_rwo" FORK_SANDBOX_CONFIG_DIR="$pm_cfg_rwo" \
+    "$k8s_sh" install --postmaster --dry-run 2>/dev/null)"
+check "access mode ReadWriteOnce renders" "1" "$(grep -c '^    - ReadWriteOnce$' <<< "$pm_out_rwo")"
+
+pm_cfg_badam="$(newdir)"; tmpdirs+=("$pm_cfg_badam")
+cp -r "$pm_cfg1"/. "$pm_cfg_badam"/
+chmod 600 "$pm_cfg_badam/deploy-key" "$pm_cfg_badam/pi.env"
+printf 'K8S_POSTMASTER_ACCESS_MODE=ReadWriteMany\n' >> "$pm_cfg_badam/k8s.env"
+pm_log_badam="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$pm_log_badam")")
+refuses "an invalid K8S_POSTMASTER_ACCESS_MODE refuses" \
+    "ReadWriteOncePod or ReadWriteOnce" \
+    env PATH="$pm_stub_bin:$PATH" K8S_STUB_LOG="$pm_log_badam" FORK_SANDBOX_CONFIG_DIR="$pm_cfg_badam" \
+    "$k8s_sh" install --postmaster --dry-run
+if [[ -s "$pm_log_badam" ]]; then
+    no "invalid access mode never invokes kubectl" "$(cat "$pm_log_badam")"
+else
+    ok "invalid access mode never invokes kubectl"
+fi
+
+# 4. Each optional block renders (env, volumeMount, volume, its own
+# ConfigMap) iff its config dir exists, checked one integration at a
+# time, plus a mixed combination (the shape a template-indentation bug
+# in an earlier round of this work broke -- see manifests/k8s/
+# 40-postmaster.yaml's marker comments) and all four together.
+pm_check_integration() {
+    local label="$1" dirname_="$2" envvar="$3" cfgdir="$4" out="$5"
+    if [[ -d "$cfgdir/$dirname_" ]]; then
+        if grep -q "$envvar" <<< "$out"; then ok "$label: present"; else no "$label: present" "$out"; fi
+    else
+        if grep -q "$envvar" <<< "$out"; then no "$label: absent" "$out"; else ok "$label: absent"; fi
+    fi
+}
+
+pm_mk_optdir() {
+    local base="$1" name="$2" d
+    d="$(newdir)"; tmpdirs+=("$d")
+    cp -r "$base"/. "$d"/
+    chmod 600 "$d/deploy-key" "$d/pi.env"
+    mkdir -p "$d/$name"
+    echo content > "$d/$name/file1.txt"
+    printf '%s' "$d"
+}
+
+for pm_name in personas prompts handlers presets; do
+    case "$pm_name" in
+        personas) pm_env=FORK_SANDBOX_PERSONAS_DIR ;;
+        prompts) pm_env=FORK_SANDBOX_PROMPTS_DIR ;;
+        handlers) pm_env=FORK_SANDBOX_HANDLERS_DIR ;;
+        presets) pm_env=FORK_SANDBOX_PRESETS_DIR ;;
+    esac
+    pm_cfg_one="$(pm_mk_optdir "$pm_cfg1" "$pm_name")"
+    [[ "$pm_name" == handlers ]] && chmod 755 "$pm_cfg_one/handlers/file1.txt"
+    pm_log_one="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$pm_log_one")")
+    pm_out_one="$(PATH="$pm_stub_bin:$PATH" K8S_STUB_LOG="$pm_log_one" FORK_SANDBOX_CONFIG_DIR="$pm_cfg_one" \
+        "$k8s_sh" install --postmaster --dry-run 2>/dev/null)"
+    check "yamllint: only $pm_name present" "" "$(command -v yamllint >/dev/null 2>&1 && printf '%s\n' "$pm_out_one" | yamllint - 2>&1)"
+    if grep -q "$pm_env" <<< "$pm_out_one"; then
+        ok "$pm_name alone: its env var renders"
+    else
+        no "$pm_name alone: its env var renders" "$pm_out_one"
+    fi
+    for pm_other in personas prompts handlers presets; do
+        [[ "$pm_other" == "$pm_name" ]] && continue
+        case "$pm_other" in
+            personas) pm_oenv=FORK_SANDBOX_PERSONAS_DIR ;;
+            prompts) pm_oenv=FORK_SANDBOX_PROMPTS_DIR ;;
+            handlers) pm_oenv=FORK_SANDBOX_HANDLERS_DIR ;;
+            presets) pm_oenv=FORK_SANDBOX_PRESETS_DIR ;;
+        esac
+        if grep -q "$pm_oenv" <<< "$pm_out_one"; then
+            no "$pm_name alone: $pm_other stays absent" "$pm_out_one"
+        else
+            ok "$pm_name alone: $pm_other stays absent"
+        fi
+    done
+done
+
+# The previously-broken mixed case: personas+prompts present,
+# handlers+presets absent.
+pm_cfg_mixed="$(pm_mk_optdir "$pm_cfg1" personas)"
+mkdir -p "$pm_cfg_mixed/prompts"; echo content > "$pm_cfg_mixed/prompts/file1.txt"
+pm_log_mixed="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$pm_log_mixed")")
+pm_out_mixed="$(PATH="$pm_stub_bin:$PATH" K8S_STUB_LOG="$pm_log_mixed" FORK_SANDBOX_CONFIG_DIR="$pm_cfg_mixed" \
+    "$k8s_sh" install --postmaster --dry-run 2>/dev/null)"
+if command -v yamllint >/dev/null 2>&1; then
+    out="$(printf '%s\n' "$pm_out_mixed" | yamllint - 2>&1)"
+    if [[ -z "$out" ]]; then
+        ok "yamllint: mixed optional blocks (personas+prompts present, handlers+presets absent)"
+    else
+        no "yamllint: mixed optional blocks (personas+prompts present, handlers+presets absent)" "$out"
+    fi
+fi
+check "mixed: personas present" "1" "$(grep -c FORK_SANDBOX_PERSONAS_DIR <<< "$pm_out_mixed")"
+check "mixed: prompts present" "1" "$(grep -c FORK_SANDBOX_PROMPTS_DIR <<< "$pm_out_mixed")"
+check "mixed: handlers absent" "0" "$(grep -c FORK_SANDBOX_HANDLERS_DIR <<< "$pm_out_mixed")"
+check "mixed: presets absent" "0" "$(grep -c FORK_SANDBOX_PRESETS_DIR <<< "$pm_out_mixed")"
+
+# All four present together.
+pm_cfg_all="$(pm_mk_optdir "$pm_cfg1" personas)"
+mkdir -p "$pm_cfg_all/prompts" "$pm_cfg_all/handlers" "$pm_cfg_all/presets"
+echo content > "$pm_cfg_all/prompts/file1.txt"
+install -m 755 /dev/null "$pm_cfg_all/handlers/file1.txt"
+printf '#!/bin/sh\n' > "$pm_cfg_all/handlers/file1.txt"
+chmod 755 "$pm_cfg_all/handlers/file1.txt"
+echo content > "$pm_cfg_all/presets/file1.txt"
+pm_log_all="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$pm_log_all")")
+pm_out_all="$(PATH="$pm_stub_bin:$PATH" K8S_STUB_LOG="$pm_log_all" FORK_SANDBOX_CONFIG_DIR="$pm_cfg_all" \
+    "$k8s_sh" install --postmaster --dry-run 2>/dev/null)"
+if command -v yamllint >/dev/null 2>&1; then
+    out="$(printf '%s\n' "$pm_out_all" | yamllint - 2>&1)"
+    if [[ -z "$out" ]]; then ok "yamllint: all four optional blocks present"; else no "yamllint: all four optional blocks present" "$out"; fi
+fi
+check "all four: no leftover __ placeholder" "0" "$(grep -c '__' <<< "$pm_out_all")"
+
+# 6. A subdirectory inside an optional dir refuses, naming it, before
+# any kubectl call.
+pm_cfg_subdir="$(pm_mk_optdir "$pm_cfg1" personas)"
+mkdir -p "$pm_cfg_subdir/personas/nested"
+pm_log_subdir="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$pm_log_subdir")")
+refuses "a subdirectory inside personas/ refuses, naming it" \
+    "personas/nested" \
+    env PATH="$pm_stub_bin:$PATH" K8S_STUB_LOG="$pm_log_subdir" FORK_SANDBOX_CONFIG_DIR="$pm_cfg_subdir" \
+    "$k8s_sh" install --postmaster --dry-run
+if [[ -s "$pm_log_subdir" ]]; then
+    no "the subdirectory refusal happens before any kubectl call" "$(cat "$pm_log_subdir")"
+else
+    ok "the subdirectory refusal happens before any kubectl call"
+fi
+
+# 7. A non-executable file under handlers/ is skipped with a warning,
+# install still succeeds, and its name never reaches the rendered
+# ConfigMap while its executable sibling's does.
+pm_cfg_handlers="$(pm_mk_optdir "$pm_cfg1" handlers)"
+mv "$pm_cfg_handlers/handlers/file1.txt" "$pm_cfg_handlers/handlers/executable-hook.sh"
+chmod 755 "$pm_cfg_handlers/handlers/executable-hook.sh"
+echo content > "$pm_cfg_handlers/handlers/not-executable.sh"
+chmod 644 "$pm_cfg_handlers/handlers/not-executable.sh"
+pm_log_handlers="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$pm_log_handlers")")
+pm_out_handlers="$(PATH="$pm_stub_bin:$PATH" K8S_STUB_LOG="$pm_log_handlers" FORK_SANDBOX_CONFIG_DIR="$pm_cfg_handlers" \
+    "$k8s_sh" install --postmaster --dry-run 2>/tmp/fs-k8s-test-pm-handlers.err)"
+pm_handlers_rc=$?
+check "a non-executable handler does not fail the install" "0" "$pm_handlers_rc"
+if grep -q "is not executable; skipping it from the handlers" /tmp/fs-k8s-test-pm-handlers.err; then
+    ok "a non-executable handler is skipped with a warning"
+else
+    no "a non-executable handler is skipped with a warning" "$(cat /tmp/fs-k8s-test-pm-handlers.err)"
+fi
+check "the executable handler reaches the rendered ConfigMap" \
+    "1" "$(grep -c 'executable-hook.sh' <<< "$pm_out_handlers")"
+check "the non-executable handler never reaches the rendered ConfigMap" \
+    "0" "$(grep -c 'not-executable.sh' <<< "$pm_out_handlers")"
+rm -f /tmp/fs-k8s-test-pm-handlers.err
+
+# 8. The 900 KiB total ConfigMap payload guard.
+pm_cfg_big="$(pm_mk_optdir "$pm_cfg1" personas)"
+rm -f "$pm_cfg_big/personas/file1.txt"
+head -c $(( 901 * 1024 )) /dev/zero > "$pm_cfg_big/personas/big-file.txt"
+pm_log_big="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$pm_log_big")")
+refuses "the 900 KiB ConfigMap payload guard refuses, naming the biggest file" \
+    "big-file.txt" \
+    env PATH="$pm_stub_bin:$PATH" K8S_STUB_LOG="$pm_log_big" FORK_SANDBOX_CONFIG_DIR="$pm_cfg_big" \
+    "$k8s_sh" install --postmaster --dry-run
+if [[ -s "$pm_log_big" ]]; then
+    no "the oversize guard runs before any kubectl call" "$(cat "$pm_log_big")"
+else
+    ok "the oversize guard runs before any kubectl call"
+fi
+
+# 9. Each missing required key refuses before any kubectl call.
+for pm_key in K8S_POSTMASTER_IMAGE K8S_POSTMASTER_REPO_URL \
+    K8S_POSTMASTER_GIT_KEY_FILE K8S_POSTMASTER_KNOWN_HOSTS_FILE; do
+    pm_cfg_missing="$(pm_cfg_without_key "$pm_cfg1" "$pm_key")"
+    pm_log_missing="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$pm_log_missing")")
+    refuses "missing $pm_key refuses" \
+        "$pm_key is not set" \
+        env PATH="$pm_stub_bin:$PATH" K8S_STUB_LOG="$pm_log_missing" FORK_SANDBOX_CONFIG_DIR="$pm_cfg_missing" \
+        "$k8s_sh" install --postmaster --dry-run
+    if [[ -s "$pm_log_missing" ]]; then
+        no "missing $pm_key never invokes kubectl" "$(cat "$pm_log_missing")"
+    else
+        ok "missing $pm_key never invokes kubectl"
+    fi
+done
+
+# 10. A malformed repo URL and a malformed project name each refuse.
+pm_cfg_badurl="$(newdir)"; tmpdirs+=("$pm_cfg_badurl")
+cp -r "$pm_cfg1"/. "$pm_cfg_badurl"/
+chmod 600 "$pm_cfg_badurl/deploy-key" "$pm_cfg_badurl/pi.env"
+sed -i 's|^K8S_POSTMASTER_REPO_URL=.*|K8S_POSTMASTER_REPO_URL=https://git.example/you/proj.git|' "$pm_cfg_badurl/k8s.env"
+pm_log_badurl="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$pm_log_badurl")")
+refuses "a malformed K8S_POSTMASTER_REPO_URL refuses" \
+    "recognized ssh URL" \
+    env PATH="$pm_stub_bin:$PATH" K8S_STUB_LOG="$pm_log_badurl" FORK_SANDBOX_CONFIG_DIR="$pm_cfg_badurl" \
+    "$k8s_sh" install --postmaster --dry-run
+
+pm_cfg_badproj="$(newdir)"; tmpdirs+=("$pm_cfg_badproj")
+cp -r "$pm_cfg1"/. "$pm_cfg_badproj"/
+chmod 600 "$pm_cfg_badproj/deploy-key" "$pm_cfg_badproj/pi.env"
+printf 'K8S_POSTMASTER_PROJECT=../escape\n' >> "$pm_cfg_badproj/k8s.env"
+pm_log_badproj="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$pm_log_badproj")")
+refuses "a malformed K8S_POSTMASTER_PROJECT refuses" \
+    "is not a valid" \
+    env PATH="$pm_stub_bin:$PATH" K8S_STUB_LOG="$pm_log_badproj" FORK_SANDBOX_CONFIG_DIR="$pm_cfg_badproj" \
+    "$k8s_sh" install --postmaster --dry-run
+
+# 11. The checksum/pm-config annotation changes when fleet.yaml changes.
+pm_cfg_fleet="$(newdir)"; tmpdirs+=("$pm_cfg_fleet")
+cp -r "$pm_cfg1"/. "$pm_cfg_fleet"/
+chmod 600 "$pm_cfg_fleet/deploy-key" "$pm_cfg_fleet/pi.env"
+printf 'seats: []\n' > "$pm_cfg_fleet/fleet.yaml"
+pm_log_fleet1="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$pm_log_fleet1")")
+pm_sum1="$(PATH="$pm_stub_bin:$PATH" K8S_STUB_LOG="$pm_log_fleet1" FORK_SANDBOX_CONFIG_DIR="$pm_cfg_fleet" \
+    "$k8s_sh" install --postmaster --dry-run 2>/dev/null | grep -o 'checksum/pm-config: "[a-f0-9]*"')"
+printf 'seats: [{name: demo}]\n' > "$pm_cfg_fleet/fleet.yaml"
+pm_log_fleet2="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$pm_log_fleet2")")
+pm_sum2="$(PATH="$pm_stub_bin:$PATH" K8S_STUB_LOG="$pm_log_fleet2" FORK_SANDBOX_CONFIG_DIR="$pm_cfg_fleet" \
+    "$k8s_sh" install --postmaster --dry-run 2>/dev/null | grep -o 'checksum/pm-config: "[a-f0-9]*"')"
+if [[ -n "$pm_sum1" && -n "$pm_sum2" && "$pm_sum1" != "$pm_sum2" ]]; then
+    ok "checksum/pm-config changes when fleet.yaml changes"
+else
+    no "checksum/pm-config changes when fleet.yaml changes" "sum1=$pm_sum1 sum2=$pm_sum2"
+fi
+
+# 12. The Secret's key file content never appears in stdout or stderr.
+pm_log_secret="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$pm_log_secret")")
+pm_secret_out="$(PATH="$pm_stub_bin:$PATH" K8S_STUB_LOG="$pm_log_secret" FORK_SANDBOX_CONFIG_DIR="$pm_cfg1" \
+    "$k8s_sh" install --postmaster --dry-run 2>/tmp/fs-k8s-test-pm-secret.err)"
+if grep -qF 'dummy-key-material-for-tests-only' <<< "$pm_secret_out" || \
+   grep -qF 'dummy-key-material-for-tests-only' /tmp/fs-k8s-test-pm-secret.err; then
+    no "the deploy key content never appears in dry-run stdout/stderr" "leaked"
+else
+    ok "the deploy key content never appears in dry-run stdout/stderr"
+fi
+if grep -qF 'git.example ssh-ed25519 AAAAtest' <<< "$pm_secret_out" || \
+   grep -qF 'git.example ssh-ed25519 AAAAtest' /tmp/fs-k8s-test-pm-secret.err; then
+    no "the known_hosts content never appears in dry-run stdout/stderr" "leaked"
+else
+    ok "the known_hosts content never appears in dry-run stdout/stderr"
+fi
+if grep -qF '# (dry-run) would create Secret fork-sandbox-postmaster-git ... -- not shown.' <<< "$pm_secret_out"; then
+    ok "the dry-run prints the Secret placeholder line instead of its content"
+else
+    no "the dry-run prints the Secret placeholder line instead of its content" "$pm_secret_out"
+fi
+rm -f /tmp/fs-k8s-test-pm-secret.err
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))
