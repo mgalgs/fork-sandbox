@@ -310,29 +310,47 @@ mail_write_grant() {
     local out
     out="$(mail_check_grant "$@")" || return $?
     local grants_dir="$MAIL_ROOT/.postmaster/grants"
-    mkdir -p -- "$grants_dir"
+    mkdir -p -- "$grants_dir" || return 1
     local dest="$grants_dir/$tid.env"
-    local tmp; tmp="$(mktemp "$grants_dir/.grant.XXXXXX")"
-    printf '%s\n' "$out" > "$tmp"
+    local tmp
+    tmp="$(mktemp "$grants_dir/.grant.XXXXXX")" || return 1
+    printf '%s\n' "$out" > "$tmp" || { rm -f -- "$tmp"; return 1; }
     if [[ -f "$dest" ]] && cmp -s -- "$tmp" "$dest"; then
         rm -f -- "$tmp"
     else
-        mv -- "$tmp" "$dest"
+        mv -- "$tmp" "$dest" || { rm -f -- "$tmp"; return 1; }
     fi
     return 0
 }
 
 # Escapes a string for embedding in a JSON string context. Grant values
 # are shell tokens the k8s validators have already shape-checked (a
-# thread id, an NS[:PORT], a HOST:PORT, or a realpath), so this only
-# needs to be correct, not permissive.
+# thread id, an NS[:PORT], a HOST:PORT, or a realpath) but
+# validate_context_ro_dir only checks path shape, not byte content, so a
+# directory basename may legally carry any control byte a filesystem
+# allows; every U+0000-U+001F byte is escaped here, not just the common
+# ones, so --show --json always emits valid JSON.
 mail_json_escape() {
-    local s="$1"
+    local s="$1" out="" i n c code esc
     s="${s//\\/\\\\}"
     s="${s//\"/\\\"}"
-    s="${s//$'\n'/\\n}"
-    s="${s//$'\t'/\\t}"
-    printf '%s' "$s"
+    n=${#s}
+    for (( i = 0; i < n; i++ )); do
+        c="${s:i:1}"
+        case "$c" in
+            $'\n') out+='\n'; continue ;;
+            $'\r') out+='\r'; continue ;;
+            $'\t') out+='\t'; continue ;;
+        esac
+        LC_ALL=C printf -v code '%d' "'$c"
+        if (( code < 0x20 )); then
+            printf -v esc '\\u%04x' "$code"
+            out+="$esc"
+        else
+            out+="$c"
+        fi
+    done
+    printf '%s' "$out"
 }
 
 # Prints a JSON array of already-escaped double-quoted strings from a

@@ -11021,20 +11021,21 @@ refuses "--k8s --task-meta with invalid JSON is still refused (by cmd_submit, fo
 
 printf '\n== fork-sandbox.sh --k8s: --pi-args is forwarded, not refused ==\n'
 piargs_out="$(newdir)/dispatch.yaml"; tmpdirs+=("$(dirname "$piargs_out")")
+piargs_err="$(dirname "$piargs_out")/piargs.err"
 if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
     --harness pi --branch fs-k8s-flag-test-piargs --model moonshotai/kimi-k3 \
     --pi-args '--thinking high' \
-    "$k8s_flag_proj" "$k8s_flag_handoff" > "$piargs_out" 2>/tmp/fs-k8s-test-piargs.err; then
+    "$k8s_flag_proj" "$k8s_flag_handoff" > "$piargs_out" 2>"$piargs_err"; then
     ok "fork-sandbox.sh --k8s --pi-args is no longer refused"
 else
-    no "fork-sandbox.sh --k8s --pi-args is no longer refused" "$(cat /tmp/fs-k8s-test-piargs.err)"
+    no "fork-sandbox.sh --k8s --pi-args is no longer refused" "$(cat "$piargs_err")"
 fi
-if grep -q "is not supported with --k8s" /tmp/fs-k8s-test-piargs.err 2>/dev/null; then
-    no "the old --pi-args refusal message is gone" "$(cat /tmp/fs-k8s-test-piargs.err)"
+if grep -q "is not supported with --k8s" "$piargs_err" 2>/dev/null; then
+    no "the old --pi-args refusal message is gone" "$(cat "$piargs_err")"
 else
     ok "the old --pi-args refusal message is gone"
 fi
-rm -f /tmp/fs-k8s-test-piargs.err
+rm -f "$piargs_err"
 
 piargs_direct_out="$(newdir)/direct.yaml"; tmpdirs+=("$(dirname "$piargs_direct_out")")
 FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" run --dry-run \
