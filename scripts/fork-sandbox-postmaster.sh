@@ -5,6 +5,7 @@
 #
 # Usage: fork-sandbox-postmaster.sh deliver --project <path> [--once] [--cluster]
 #        fork-sandbox-postmaster.sh status
+#        fork-sandbox-postmaster.sh status --thread <thread-id> --json
 #        fork-sandbox-postmaster.sh flag <thread-id> [reason]
 #        fork-sandbox-postmaster.sh unflag <thread-id>
 #
@@ -29,6 +30,17 @@
 # status prints one screen: how many messages are unrouted, every live run
 # (agent, thread, run dir), every thread flagged needs-operator with its
 # reason, and each thread's spawn count.
+#
+# status --thread <thread-id> --json is the per-thread machine view, one JSON
+# object read from the same files: the thread's unrouted message count, its
+# flag ({reason, events}, events null when there is no journal, or null for
+# no flag), whether it has a grant, its spawn count, every run recorded for
+# it (harvested ones too, state "harvested" or "live"), every retry record
+# (all states, state as recorded, due_s floored at 0) and every held seat
+# (the full trigger id). Agent names are as stored, without the '@'. The
+# two flags must be given together: the text view is whole-store and the
+# JSON view is per-thread, so either alone exits 2. Plain `status` output
+# is unchanged.
 #
 # flag/unflag set or clear a thread's needs-operator flag by hand, e.g. to
 # silence a thread the operator intends to leave alone, or to re-arm one
@@ -857,6 +869,10 @@ RETRIES="$STATE/retries"
 PM_SESSION_ID_RE='^[0-9a-f][0-9a-f-]{7,63}$'
 
 PM_ADDR_RE='^@[a-z0-9][a-z0-9-]*$'
+
+# The shape of a thread id. Must match MAIL_ID_RE in fork-sandbox-mail.sh:
+# a thread id is a Message-ID that script generated.
+PM_THREAD_ID_RE='^[0-9a-f][0-9a-f-]{7,63}$'
 
 # ---- tiny header/store helpers (mail_header et al. are private to
 # fork-sandbox-mail.sh and not sourceable -- same shape, reimplemented) ----
@@ -3893,7 +3909,137 @@ cmd_deliver() {
     exit 0
 }
 
+# The per-thread JSON view of `status`. Facts are gathered here as a stream of
+# NUL-terminated tokens, tag first, and python3 turns them into JSON; nothing
+# is interpolated into python source. Read-only: unlike the text view it
+# creates no state directories.
+cmd_status_json() {
+    local tid="$1" f mid n=0 unrouted=0
+    local now; now="$(date +%s)"
+    for f in "$MAIL_ROOT/threads/$tid"/*.msg; do
+        [[ -e "$f" ]] || continue
+        # A routed marker is named for the message's Message-ID header
+        # (see pm_process_message), not for its file.
+        mid="$(pm_header "$f" Message-ID)"
+        [[ -n "$mid" && -e "$ROUTED/$mid" ]] || unrouted=$(( unrouted + 1 ))
+    done
+
+    {
+        printf '%s\0' thread "$tid" unrouted "$unrouted"
+
+        if [[ -f "$NEEDS_OPERATOR/$tid" ]]; then
+            local events=""
+            # Same meaning as the text view: only `flag` lines count, and no
+            # journal at all is unknown history (null), not zero.
+            if [[ -f "$NEEDS_OPERATOR_JOURNAL/$tid" ]]; then
+                events="$(awk -F'\t' '$2=="flag"{c++} END{print c+0}' "$NEEDS_OPERATOR_JOURNAL/$tid")"
+            fi
+            printf '%s\0' flag "$(cat -- "$NEEDS_OPERATOR/$tid")" "$events"
+        fi
+
+        if [[ -e "$STATE/grants/$tid.env" ]]; then
+            printf '%s\0' grant
+        fi
+
+        if [[ -f "$SPAWNS/$tid" ]]; then
+            n="$(wc -l < "$SPAWNS/$tid")"
+        fi
+        printf '%s\0' spawns "${n//[[:space:]]/}"
+
+        local rid agent run_state run_dir resumed
+        for f in "$RUNS"/*.env; do
+            [[ -e "$f" ]] || continue
+            [[ "$(fs_pm_env_get "$f" THREAD)" == "$tid" ]] || continue
+            rid="$(basename -- "$f" .env)"
+            run_state=live
+            [[ -e "$HARVESTED/$rid" ]] && run_state=harvested
+            agent="$(fs_pm_env_get "$f" AGENT)"
+            run_dir="$(fs_pm_env_get "$f" RUN_DIR)"
+            resumed="$(fs_pm_env_get "$f" RESUMED)"
+            printf '%s\0' run "$rid" "$agent" "$run_state" "$run_dir" "$resumed"
+        done
+
+        local rfile rattempt rnotbefore rdue
+        for rfile in "$RETRIES/$tid"/*; do
+            [[ -f "$rfile" ]] || continue
+            rattempt="$(fs_pm_env_get "$rfile" ATTEMPT)"
+            [[ "$rattempt" =~ ^[0-9]+$ ]] || rattempt=0
+            rnotbefore="$(fs_pm_env_get "$rfile" NOT_BEFORE)"
+            [[ "$rnotbefore" =~ ^[0-9]+$ ]] || rnotbefore=0
+            rdue=$(( rnotbefore - now ))
+            (( rdue < 0 )) && rdue=0
+            printf '%s\0' retry "$(basename -- "$rfile")" "$(fs_pm_env_get "$rfile" STATE)" "$rattempt" "$rdue"
+        done
+
+        local hf hsince
+        for hf in "$STATE/held/$tid"/*; do
+            [[ -f "$hf" ]] || continue
+            hsince="$(fs_pm_env_get "$hf" SINCE)"
+            [[ "$hsince" =~ ^[0-9]+$ ]] || hsince=0
+            printf '%s\0' held "$(basename -- "$hf")" "$(fs_pm_env_get "$hf" TRIGGER)" "$(( now - hsince ))"
+        done
+    } | python3 -c '
+import json, sys
+
+tok = [t.decode("utf-8", "replace") for t in sys.stdin.buffer.read().split(b"\0")]
+if tok and tok[-1] == "":
+    tok.pop()
+out = {"thread": None, "unrouted": 0, "flag": None, "grant": False,
+       "spawns": 0, "runs": [], "retries": [], "held": []}
+arity = {"thread": 1, "unrouted": 1, "flag": 2, "grant": 0, "spawns": 1,
+         "run": 5, "retry": 4, "held": 3}
+i = 0
+while i < len(tok):
+    tag = tok[i]
+    a = tok[i + 1:i + 1 + arity[tag]]
+    i += 1 + arity[tag]
+    if tag == "thread":
+        out["thread"] = a[0]
+    elif tag == "unrouted":
+        out["unrouted"] = int(a[0])
+    elif tag == "flag":
+        out["flag"] = {"reason": a[0], "events": int(a[1]) if a[1] else None}
+    elif tag == "grant":
+        out["grant"] = True
+    elif tag == "spawns":
+        out["spawns"] = int(a[0] or 0)
+    elif tag == "run":
+        out["runs"].append({"run_id": a[0], "agent": a[1], "state": a[2],
+                            "run_dir": a[3], "resumed": a[4] or None})
+    elif tag == "retry":
+        out["retries"].append({"agent": a[0], "state": a[1] or None,
+                               "attempt": int(a[2]), "due_s": int(a[3])})
+    elif tag == "held":
+        out["held"].append({"agent": a[0], "trigger": a[1], "age_s": int(a[2])})
+print(json.dumps(out))
+'
+}
+
 cmd_status() {
+    local thread="" have_thread=0 json=0
+    while (( $# )); do
+        case "$1" in
+            --thread)
+                (( $# >= 2 )) || { echo "fork-sandbox-postmaster: status: --thread requires a thread id" >&2; exit 2; }
+                thread="$2"; have_thread=1; shift 2 ;;
+            --json) json=1; shift ;;
+            -h|--help) usage; exit 0 ;;
+            *) echo "fork-sandbox-postmaster: status: unknown argument '$1'" >&2; exit 2 ;;
+        esac
+    done
+    if (( json != have_thread )); then
+        echo "fork-sandbox-postmaster: status: --thread and --json go together (the text view is whole-store, the JSON view is per-thread)" >&2
+        exit 2
+    fi
+    if (( json )); then
+        if [[ ! "$thread" =~ $PM_THREAD_ID_RE ]]; then
+            echo "fork-sandbox-postmaster: status: '$thread' is not a valid thread id" >&2
+            exit 2
+        fi
+        cmd_status_json "$thread"
+        return
+    fi
+
     mkdir -p -- "$MAIL_ROOT" "$ROUTED" "$RUNS" "$HARVESTED" "$NEEDS_OPERATOR" "$SPAWNS" "$TRIAGED"
 
     local total=0 routed_count=0 f

@@ -1,0 +1,23 @@
+unrouted: 3
+
+live runs:
+  run-live  agent=bob thread=aaaaaaaa-1111-4111-8111-000000000001 resumed=sess-1234abcd run_dir=/runs/one
+  run-other  agent=dana thread=cccccccc-3333-4333-8333-000000000003 session=fresh run_dir=/runs/three
+
+needs-operator:
+  aaaaaaaa-1111-4111-8111-000000000001: hops exhausted at aaaaaaaa-1111-4111-8111-000000000001 (2 events)
+  bbbbbbbb-2222-4222-8222-000000000002: flagged before the journal existed (no journal)
+
+spawns per thread:
+  aaaaaaaa-1111-4111-8111-000000000001: 3 spawns
+
+pending retries:
+  aaaaaaaa-1111-4111-8111-000000000001: agent=bob attempt=1 due=30s
+
+grants:
+  aaaaaaaa: 2 keys
+
+held:
+  aaaaaaaa: agent=karl trigger=eeeeeeee age=12s
+
+triaged: 0

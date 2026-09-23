@@ -5861,5 +5861,129 @@ else
     no "dispatcher wiring" "scripts/fork-sandbox is not executable"
 fi
 
+# ============================================================
+printf '\n== status: plain text unchanged; --thread --json per-thread view ==\n'
+# ============================================================
+
+# BEGIN status-fixture
+# A hand-written, fully deterministic postmaster state: fixed ids, and every
+# time-derived value pinned by the stub `date` below, so the plain `status`
+# text can be compared byte for byte against a golden file.
+SFX_T1="aaaaaaaa-1111-4111-8111-000000000001"
+SFX_T2="bbbbbbbb-2222-4222-8222-000000000002"
+SFX_T3="cccccccc-3333-4333-8333-000000000003"
+SFX_NOW=1700000000
+
+sfx_msg() {
+    local root="$1" tid="$2" seq="$3" mid="$4" from="$5"
+    mkdir -p -- "$root/threads/$tid"
+    printf 'Message-ID: %s\nThread-ID: %s\nDate: Tue, 14 Nov 2023 22:13:20 +0000\nFrom: %s\nTo: @bob\nSubject: fixture\nX-Hops: 8\n\nbody\n' \
+        "$mid" "$tid" "$from" > "$root/threads/$tid/$seq-$mid.msg"
+}
+
+sfx_build() {
+    local root="$1" st="$1/.postmaster"
+    sfx_msg "$root" "$SFX_T1" 001 "$SFX_T1" @alice
+    sfx_msg "$root" "$SFX_T1" 002 "dddddddd-0000-4000-8000-000000000004" @bob
+    sfx_msg "$root" "$SFX_T1" 003 "eeeeeeee-0000-4000-8000-000000000005" @alice
+    sfx_msg "$root" "$SFX_T2" 001 "$SFX_T2" @alice
+    sfx_msg "$root" "$SFX_T3" 001 "$SFX_T3" @carol
+    mkdir -p "$st"/{routed,runs,harvested,needs-operator,needs-operator-journal,spawns,retries/"$SFX_T1",held/"$SFX_T1",grants}
+    : > "$st/routed/$SFX_T1"
+    : > "$st/routed/dddddddd-0000-4000-8000-000000000004"
+    printf 'hops exhausted at %s\n' "$SFX_T1" > "$st/needs-operator/$SFX_T1"
+    printf '2023-11-14T22:00:00Z\tflag\thops-exhausted\thops exhausted\n2023-11-14T22:05:00Z\tunflag\t\t\n2023-11-14T22:10:00Z\tflag\thops-exhausted\thops exhausted again\n' \
+        > "$st/needs-operator-journal/$SFX_T1"
+    printf 'flagged before the journal existed\n' > "$st/needs-operator/$SFX_T2"
+    printf 'ALLOW_NAMESPACE=ns-a\nREACH_PROBE=svc.ns-a:80\n' > "$st/grants/$SFX_T1.env"
+    printf 'one\ntwo\nthree\n' > "$st/spawns/$SFX_T1"
+    printf 'AGENT=bob\nTHREAD=%s\nRUN_DIR=/runs/one\nRESUMED=sess-1234abcd\n' "$SFX_T1" > "$st/runs/run-live.env"
+    printf 'AGENT=carol\nTHREAD=%s\nRUN_DIR=/runs/two\n' "$SFX_T1" > "$st/runs/run-done.env"
+    : > "$st/harvested/run-done"
+    printf 'AGENT=dana\nTHREAD=%s\nRUN_DIR=/runs/three\n' "$SFX_T3" > "$st/runs/run-other.env"
+    printf 'FAILS=1\nSTATE=pending\nTRIGGER=dddddddd-0000-4000-8000-000000000004\nATTEMPT=1\nNOT_BEFORE=%s\n' \
+        "$(( SFX_NOW + 30 ))" > "$st/retries/$SFX_T1/bob"
+    printf 'STATE=exhausted\nTRIGGER=eeeeeeee-0000-4000-8000-000000000005\nATTEMPT=3\n' > "$st/retries/$SFX_T1/carol"
+    printf 'TRIGGER=eeeeeeee-0000-4000-8000-000000000005\nSINCE=%s\nRETRY=0\n' "$(( SFX_NOW - 12 ))" \
+        > "$st/held/$SFX_T1/karl"
+}
+
+# Puts a `date` on PATH that answers `+%s` with SFX_NOW and defers to the
+# real one for everything else; prints the directory.
+sfx_date_stub_dir() {
+    local dir real
+    dir="$(mktemp -d)"; tmpdirs+=("$dir")
+    real="$(command -v date)"
+    # shellcheck disable=SC2016  # the stub's own $1/$@ must stay literal
+    printf '#!/bin/sh\nif [ "$1" = "+%%s" ]; then echo %s; else exec %s "$@"; fi\n' "$SFX_NOW" "$real" > "$dir/date"
+    chmod +x "$dir/date"
+    printf '%s' "$dir"
+}
+# END status-fixture
+
+sfx_root="$(mktemp -d)"; tmpdirs+=("$sfx_root")
+sfx_build "$sfx_root"
+sfx_stub="$(sfx_date_stub_dir)"
+sfx_pm() { FORK_SANDBOX_MAIL_ROOT="$sfx_root" PATH="$sfx_stub:$PATH" "$postmaster" "$@"; }
+
+sfx_pm status > "$work/status-plain.out" 2>&1
+if cmp -s "$work/status-plain.out" "$repo_dir/tests/fixtures/postmaster-status-plain.txt"; then
+    ok "status: plain output is byte-identical to the golden captured before --json existed"
+else
+    no "status: plain output is byte-identical to the golden" "$(diff "$repo_dir/tests/fixtures/postmaster-status-plain.txt" "$work/status-plain.out" | head -5)"
+fi
+
+sfx_json="$(sfx_pm status --thread "$SFX_T1" --json 2>"$work/sfx.err")"
+check "status --json: exits 0 and prints one line" "1" "$(printf '%s\n' "$sfx_json" | wc -l)"
+sfx_check="$(python3 - "$sfx_json" "$SFX_T1" <<'PY'
+import json, sys
+d = json.loads(sys.argv[1]); t = sys.argv[2]
+bad = []
+def want(label, got, exp):
+    if got != exp:
+        bad.append(f"{label}: expected {exp!r}, got {got!r}")
+want("keys", sorted(d), ["flag", "grant", "held", "retries", "runs", "spawns", "thread", "unrouted"])
+want("thread", d["thread"], t)
+want("unrouted counts this thread only, keyed on Message-ID", d["unrouted"], 1)
+want("flag", d["flag"], {"reason": "hops exhausted at " + t, "events": 2})
+want("grant", d["grant"], True)
+want("spawns", d["spawns"], 3)
+runs = {r["run_id"]: r for r in d["runs"]}
+want("run ids: the other thread's run is excluded", sorted(runs), ["run-done", "run-live"])
+want("live run", runs["run-live"], {"run_id": "run-live", "agent": "bob", "state": "live",
+                                     "run_dir": "/runs/one", "resumed": "sess-1234abcd"})
+want("harvested run", runs["run-done"], {"run_id": "run-done", "agent": "carol", "state": "harvested",
+                                          "run_dir": "/runs/two", "resumed": None})
+rt = {r["agent"]: r for r in d["retries"]}
+want("pending retry", rt["bob"], {"agent": "bob", "state": "pending", "attempt": 1, "due_s": 30})
+want("exhausted retry is listed too", rt["carol"], {"agent": "carol", "state": "exhausted", "attempt": 3, "due_s": 0})
+want("held (full trigger id)", d["held"], [{"agent": "karl", "trigger": "eeeeeeee-0000-4000-8000-000000000005", "age_s": 12}])
+print("\n".join(bad) if bad else "ALL-OK")
+PY
+)"
+check "status --json: every field of a fully populated thread" "ALL-OK" "$sfx_check"
+
+sfx_nojournal="$(sfx_pm status --thread "$SFX_T2" --json)"
+check "status --json: a flag without its journal has events null" \
+    '{"reason": "flagged before the journal existed", "events": null}' \
+    "$(python3 -c 'import json,sys; print(json.dumps(json.loads(sys.argv[1])["flag"]))' "$sfx_nojournal")"
+
+sfx_empty="$(sfx_pm status --thread "ffffffff-4444-4444-8444-000000000009" --json)"
+check "status --json: a thread with no state is all empty or zero" \
+    '{"thread": "ffffffff-4444-4444-8444-000000000009", "unrouted": 0, "flag": null, "grant": false, "spawns": 0, "runs": [], "retries": [], "held": []}' \
+    "$sfx_empty"
+
+sfx_rc=0; sfx_out="$(sfx_pm status --json 2>&1)" || sfx_rc=$?
+check "status --json alone exits 2" "2" "$sfx_rc"
+contains "status --json alone says the flags go together" "$sfx_out" "--thread and --json go together"
+sfx_rc=0; sfx_out="$(sfx_pm status --thread "$SFX_T1" 2>&1)" || sfx_rc=$?
+check "status --thread alone exits 2" "2" "$sfx_rc"
+check "status --thread alone is a one-line error" "1" "$(printf '%s\n' "$sfx_out" | wc -l)"
+sfx_rc=0; sfx_out="$(sfx_pm status --thread '../x' --json 2>&1)" || sfx_rc=$?
+check "status --json with a bad thread-id shape exits 2" "2" "$sfx_rc"
+contains "status --json names the bad thread id" "$sfx_out" "not a valid thread id"
+sfx_rc=0; sfx_out="$(sfx_pm status --thread 2>&1)" || sfx_rc=$?
+check "status --thread with no value exits 2" "2" "$sfx_rc"
+
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 (( fail == 0 )) || exit 1
