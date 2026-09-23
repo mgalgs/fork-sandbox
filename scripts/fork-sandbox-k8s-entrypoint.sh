@@ -865,8 +865,8 @@ else
     RESUME_FAIL_RE+='|failed to (load|parse|read).*(session|transcript|conversation)'
     if [[ -n "$RESUME_SESSION" ]] && (( pi_rc != 0 )) \
         && grep -qiE "$RESUME_FAIL_RE" "$work_dir/claude-stderr.log"; then
-        echo "fork-sandbox-k8s-entrypoint: resume failed ($RESUME_SESSION)," >&2
-        echo "fork-sandbox-k8s-entrypoint: retrying fresh" >&2
+        echo "fork-sandbox-k8s-entrypoint: resume failed, retrying fresh" \
+            "(session $RESUME_SESSION)" >&2
         claude_argv=("${claude_argv_fresh[@]}")
         pi_rc=0
         run_claude_attempt || pi_rc=$?
