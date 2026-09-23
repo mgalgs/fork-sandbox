@@ -1375,6 +1375,13 @@ KEYS
 # "original brief" every continuation prompt restates). Indented like
 # render_claude_configmap_keys; refresh.sh's lines stay <= 96 columns so the
 # 4-column indent fits the YAML line limit.
+#
+# handoff-original.md is byte-exact, trailing newlines included: the block
+# scalar's chomping indicator (- strip, clip, + keep) is chosen from the
+# file's own count of final newlines, and the function's output ends one
+# newline short of the file's last line so the caller can capture it with a
+# sentinel (`$(...; printf X)`) and let the newline that follows it in the
+# rendered document end the scalar.
 render_refresh_configmap_keys() {
     local refresh_src="$1" header_text="$2" handoff_src="$3"
     cat <<KEYS
@@ -1382,9 +1389,21 @@ render_refresh_configmap_keys() {
 $(indent_block < "$refresh_src")
   continuation-header.md: |
 $(printf '%s' "$header_text" | indent_block)
-  handoff-original.md: |
-$(indent_block < "$handoff_src")
 KEYS
+    local raw stripped trailing chomp body
+    raw="$(cat -- "$handoff_src"; printf X)"
+    raw="${raw%X}"
+    stripped="${raw%"${raw##*[!$'\n']}"}"
+    trailing=$(( ${#raw} - ${#stripped} ))
+    case "$trailing" in
+        0) chomp='-' ;;
+        1) chomp='' ;;
+        *) chomp='+' ;;
+    esac
+    printf '  handoff-original.md: |%s\n' "$chomp"
+    body="$(indent_block < "$handoff_src"; printf X)"
+    body="${body%X}"
+    printf '%s' "${body%$'\n'}"
 }
 
 # The --context-ro-only handoff.md section, appended after the shared
@@ -4309,8 +4328,9 @@ CENV
     if [[ "$refresh_enabled" == 1 ]]; then
         [[ -r "$refresh_sh" ]] \
             || { echo "Error: $refresh_sh is missing or unreadable." >&2; exit 1; }
-        refresh_configmap_keys=$'\n'"$(render_refresh_configmap_keys \
-            "$refresh_sh" "$continuation_header" "$handoff_file")"
+        refresh_configmap_keys="$(render_refresh_configmap_keys \
+            "$refresh_sh" "$continuation_header" "$handoff_file"; printf X)"
+        refresh_configmap_keys=$'\n'"${refresh_configmap_keys%X}"
     fi
 
     local job_rendered rendered
@@ -5507,6 +5527,10 @@ cmd_collect() {
     local evidence_dir
     evidence_dir="$(dirname -- "$outbox_dest")/evidence"
     local evidence_ok=true
+    # An earlier collect's refresh.json must not stand in for this pod's:
+    # summary.json reads it below, and a pod with no record (or a failed
+    # capture) has to leave the refresh keys absent, not inherit old ones.
+    rm -f -- "$evidence_dir/refresh.json"
     local events_tar events_err events_rc=0
     events_tar="$(mktemp)"
     events_err="$(mktemp)"
