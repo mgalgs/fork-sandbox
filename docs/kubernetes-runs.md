@@ -138,7 +138,7 @@ runner ever starts (the review loop, unlike those two, DOES run on this
 path — see "The cluster review loop" below). Most of `fork-sandbox.sh`'s
 other flags describe that local machinery and have nothing to attach to on
 a cluster run, so `--k8s` refuses each of them by name (`--harness` values
-other than `pi`, `--pi-args`, `--prompts-dir`, and several more) rather
+other than `pi`, `--prompts-dir`, and several more) rather
 than accepting and silently dropping it. The flags `run` itself accepts are
 the ones that are carried, `--checkout REF` among them — the dispatcher
 forwards it, and the push description below says what it does. See the
@@ -1274,8 +1274,9 @@ double-quoted YAML scalar — with nothing created for a refused value,
 and `--harness claude` is refused with it: only the pi harness
 starts pi. Unset or empty means the flag was not given — no env var is
 rendered and no arguments are added, since an empty string argument
-would be a positional pi rejects. `fork-sandbox.sh --k8s` still refuses
-`--pi-args` by name; use `fork-sandbox-k8s.sh` directly for it.
+would be a positional pi rejects. `fork-sandbox.sh --k8s` forwards
+`--pi-args` unvalidated; the harness cross-check above is what refuses
+it, not the dispatcher.
 
 ### 1b. proxy, per-run, for claude — **Status: built.**
 

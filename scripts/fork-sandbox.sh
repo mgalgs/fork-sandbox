@@ -858,14 +858,12 @@
 # run can start from any ref the origin repo names, not only the repo's
 # current HEAD.
 #
-# --pi-args is the one capability this script refuses even though
-# fork-sandbox-k8s.sh carries it: submit and run both accept --pi-args and
-# thread it into the pod's pi invocation -- see '--pi-args' under
-# 'Model access' in docs/kubernetes-runs.md. This dispatcher simply does
-# not forward it, and refuses by name rather than dropping it: an operator
-# who wants it has a working path one hop away, in fork-sandbox-k8s.sh
-# directly, and a silent drop here would look identical to a run that
-# honored it.
+# --pi-args is forwarded the same way: fork-sandbox-k8s.sh's submit and run
+# both accept --pi-args and thread it into the pod's pi invocation -- see
+# '--pi-args' under 'Model access' in docs/kubernetes-runs.md. This
+# dispatcher carries the value through unvalidated; fork-sandbox-k8s.sh's
+# own cross-check against --harness (a claude run never starts pi) is the
+# one place that refuses it.
 #
 # --k8s runs also append to the durable run log described below
 # (~/.claude/sandbox-runs.jsonl): --k8s forwards --task-meta to
@@ -2857,14 +2855,6 @@ if [[ "$k8s_mode" == true ]]; then
     # Flags that name a real capability this --k8s path does not carry yet
     # -- a later round of work, not a permanent no. Each message says what
     # is missing and, where the capability exists elsewhere, where it is.
-    if [[ -n "$pi_extra_args" ]]; then
-        echo "Error: --pi-args is not supported with --k8s: this dispatcher" >&2
-        echo "does not forward it to fork-sandbox-k8s.sh. The capability" >&2
-        echo "exists there -- fork-sandbox-k8s.sh submit and run both accept" >&2
-        echo "--pi-args and carry the extra arguments into the pod. Use" >&2
-        echo "fork-sandbox-k8s.sh directly for it." >&2
-        exit 1
-    fi
     if [[ -n "$prompts_dir_arg" ]]; then
         echo "Error: --prompts-dir is not yet supported with --k8s. The overlay" >&2
         echo "is layered onto a generated per-leg prompt, and the cluster path" >&2
@@ -3069,6 +3059,11 @@ if [[ "$k8s_mode" == true ]]; then
     # submit argv the same way -- an empty value at run's parse would be
     # an argument error, not "no model".
     [[ -n "$model" ]] && k8s_argv+=(--model "$model")
+    # fork-sandbox-k8s.sh's own submit is the one place that cross-checks
+    # --pi-args against --harness (a claude run never starts pi, so it
+    # refuses the combination there); this dispatch just carries the value
+    # through unvalidated, like --review-loop's JSON above.
+    [[ -n "$pi_extra_args" ]] && k8s_argv+=(--pi-args "$pi_extra_args")
     # Forwarded whenever resolved to something -- flag, claude-env, or a
     # balancer choice -- so fork-sandbox-k8s.sh's own cmd_submit sees an
     # operator-supplied --claude-credentials and skips its own resolution

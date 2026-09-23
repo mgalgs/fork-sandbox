@@ -7867,11 +7867,11 @@ refuses "--k8s --keep-session is refused" \
 # --checkout is carried through, not refused -- its own section below
 # drives both verbs, stubbed, and proves the flag reaches the dispatcher's
 # render.
-refuses "--k8s --pi-args is refused (the dispatcher does not forward it)" \
-    "--pi-args is not supported with --k8s" \
-    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
-    --harness pi --model moonshotai/kimi-k3 --pi-args "--thinking low" \
-    unused-project unused-handoff
+# --pi-args is carried through too, not refused -- its own section below
+# ("fork-sandbox.sh --k8s: --pi-args is forwarded, not refused") drives
+# both verbs and proves the value reaches the rendered Job byte-for-byte
+# the same as a direct run, and that a claude harness is still refused by
+# fork-sandbox-k8s.sh's own cross-check, not this dispatcher's.
 # --context-ro is carried through, not refused -- fork-sandbox-k8s.sh's own
 # submit applies the directory-under-/var/tmp/claude-scratch/forks/,
 # no-symlinks, 256 MiB constraints itself, so the fixture below needs a real
@@ -11017,6 +11017,38 @@ refuses "--k8s --task-meta with invalid JSON is still refused (by cmd_submit, fo
     env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
     --harness pi --branch fs-k8s-flag-test-taskmeta-bad --model moonshotai/kimi-k3 \
     --task-meta 'not json' \
+    "$k8s_flag_proj" "$k8s_flag_handoff"
+
+printf '\n== fork-sandbox.sh --k8s: --pi-args is forwarded, not refused ==\n'
+piargs_out="$(newdir)/dispatch.yaml"; tmpdirs+=("$(dirname "$piargs_out")")
+if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
+    --harness pi --branch fs-k8s-flag-test-piargs --model moonshotai/kimi-k3 \
+    --pi-args '--thinking high' \
+    "$k8s_flag_proj" "$k8s_flag_handoff" > "$piargs_out" 2>/tmp/fs-k8s-test-piargs.err; then
+    ok "fork-sandbox.sh --k8s --pi-args is no longer refused"
+else
+    no "fork-sandbox.sh --k8s --pi-args is no longer refused" "$(cat /tmp/fs-k8s-test-piargs.err)"
+fi
+if grep -q "is not supported with --k8s" /tmp/fs-k8s-test-piargs.err 2>/dev/null; then
+    no "the old --pi-args refusal message is gone" "$(cat /tmp/fs-k8s-test-piargs.err)"
+else
+    ok "the old --pi-args refusal message is gone"
+fi
+rm -f /tmp/fs-k8s-test-piargs.err
+
+piargs_direct_out="$(newdir)/direct.yaml"; tmpdirs+=("$(dirname "$piargs_direct_out")")
+FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" run --dry-run \
+    --branch fs-k8s-flag-test-piargs --model moonshotai/kimi-k3 \
+    --harness pi --pi-args '--thinking high' \
+    "$k8s_flag_proj" "$k8s_flag_handoff" > "$piargs_direct_out" 2>/dev/null
+check "--k8s --pi-args renders byte-for-byte the same as a direct run --dry-run" \
+    "$(cat "$piargs_direct_out")" "$(cat "$piargs_out")"
+
+refuses "--k8s --harness claude --pi-args is still refused (by cmd_submit's harness cross-check, forwarded through)" \
+    "passes flags to pi, which a claude run" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
+    --harness claude --branch fs-k8s-flag-test-piargs-bad --model claude-sonnet-5 \
+    --pi-args '--thinking high' \
     "$k8s_flag_proj" "$k8s_flag_handoff"
 
 printf '\n== the fixture run log: every row this suite appends carries source=test ==\n'
