@@ -221,8 +221,8 @@ check "section order: brief, addenda, stale, hand-off" \
 
 printf '\n== fs_refresh_resolve (fork-sandbox-lib.sh) ==\n'
 # Each case runs in a subshell that sources the library, so no result leaks
-# into the next. Prints "rc|at|enabled|max|window|tokens" and, on refusal, the
-# first line of the message after a tab.
+# into the next. Prints "rc|at|enabled|max|window|tokens|ceiling" and, on
+# refusal, the first line of the message after a tab.
 resolve() {
     (
         # shellcheck source=../scripts/fork-sandbox-lib.sh
@@ -231,31 +231,31 @@ resolve() {
         errf="$(mktemp)"
         fs_refresh_resolve "$@" 2> "$errf" > /dev/null; rc=$?
         err="$(cat "$errf")"; rm -f "$errf"
-        printf '%s|%s|%s|%s|%s|%s\t%s\n' "$rc" "${refresh_at-}" "${refresh_enabled-}" \
+        printf '%s|%s|%s|%s|%s|%s|%s\t%s\n' "$rc" "${refresh_at-}" "${refresh_enabled-}" \
             "${refresh_max-}" "${refresh_context_window-}" "${refresh_threshold_tokens-}" \
-            "$(printf '%s' "$err" | head -n 1)"
+            "${refresh_ceiling_tokens-}" "$(printf '%s' "$err" | head -n 1)"
     )
 }
 unset FORK_SANDBOX_CONTEXT_WINDOW
-check "claude default is 0.5 of 200k" "0|0.5|1|6|200000|100000	" \
+check "claude default is 0.5 of 200k" "0|0.5|1|6|200000|100000|160000	" \
     "$(resolve claude "" false "" some-model)"
-check "a [1m] model gets the 1M window" "0|0.5|1|6|1000000|500000	" \
+check "a [1m] model gets the 1M window" "0|0.5|1|6|1000000|500000|800000	" \
     "$(resolve claude "" false "" 'some-model[1m]')"
-check "a fraction scales by the window" "0|0.25|1|6|200000|50000	" \
+check "a fraction scales by the window" "0|0.25|1|6|200000|50000|160000	" \
     "$(resolve claude 0.25 true "" m)"
-check "a count above 1 is taken as tokens" "0|150000|1|6|200000|150000	" \
+check "a count above 1 is taken as tokens" "0|150000|1|6|200000|150000|160000	" \
     "$(resolve claude 150000 true "" m)"
-check "0 disables and clears the window and threshold" "0|0|0|6||	" \
+check "0 disables and clears the window, threshold and ceiling" "0|0|0|6|||	" \
     "$(resolve claude 0 true "" m)"
-check "FORK_SANDBOX_CONTEXT_WINDOW overrides the guess" "0|0.5|1|6|400000|200000	" \
+check "FORK_SANDBOX_CONTEXT_WINDOW overrides the guess" "0|0.5|1|6|400000|200000|320000	" \
     "$(FORK_SANDBOX_CONTEXT_WINDOW=400000 resolve claude "" false "" m)"
-check "--refresh-max is taken" "0|0.5|1|3|200000|100000	" \
+check "--refresh-max is taken" "0|0.5|1|3|200000|100000|160000	" \
     "$(resolve claude "" false 3 m)"
-check "--refresh-max 0 is allowed" "0|0.5|1|0|200000|100000	" \
+check "--refresh-max 0 is allowed" "0|0.5|1|0|200000|100000|160000	" \
     "$(resolve claude "" false 0 m)"
 contains "pi refuses an explicit --refresh-at" "Error: --refresh-at only works with --harness claude" \
     "$(resolve pi 0.5 true "" m)"
-check "pi without --refresh-at stays silent and disabled" "0|0|0|6||	" \
+check "pi without --refresh-at stays silent and disabled" "0|0|0|6|||	" \
     "$(resolve pi "" false "" m)"
 contains "pi refuses --refresh-max" "Error: --refresh-max only applies with --harness claude" \
     "$(resolve pi "" false 2 m)"

@@ -3186,7 +3186,7 @@ cmd_submit() {
     # fs_refresh_resolve sets these; refresh_context_window is only local scratch.
     # shellcheck disable=SC2034
     local refresh_at="" refresh_enabled=0 refresh_max="" refresh_context_window=""
-    local refresh_threshold_tokens=""
+    local refresh_threshold_tokens="" refresh_ceiling_tokens=""
     local -a labels_raw=() allow_ns_raw=() reach_probe_raw=()
     while (( $# )); do
         case "$1" in
@@ -4182,6 +4182,8 @@ CENV
               value: "$refresh_threshold_tokens"
             - name: REFRESH_MAX
               value: "$refresh_max"
+            - name: REFRESH_CEILING_TOKENS
+              value: "$refresh_ceiling_tokens"
 CENV
 )"
     fi

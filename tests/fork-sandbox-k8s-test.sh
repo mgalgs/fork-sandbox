@@ -3621,6 +3621,8 @@ check "claude default: REFRESH_THRESHOLD_TOKENS is 100000" "100000" \
     "$(refresh_env_val REFRESH_THRESHOLD_TOKENS "$refresh_default_out")"
 check "claude default: REFRESH_MAX is 6" "6" \
     "$(refresh_env_val REFRESH_MAX "$refresh_default_out")"
+check "claude default: REFRESH_CEILING_TOKENS is 160000 (0.8 of 200k)" "160000" \
+    "$(refresh_env_val REFRESH_CEILING_TOKENS "$refresh_default_out")"
 for key in refresh.sh continuation-header.md handoff-original.md; do
     if grep -qx "  $key: |" <<< "$refresh_default_out"; then
         ok "claude default: ConfigMap carries $key"
@@ -3670,7 +3672,7 @@ if command -v yamllint >/dev/null 2>&1; then
     else no "yamllint: refresh.sh ConfigMap key with line-length enabled" "$out"; fi
 fi
 refresh_off_out="$(refresh_dry --harness claude --refresh-at 0)"
-for pat in '- name: REFRESH_THRESHOLD_TOKENS' '- name: REFRESH_MAX' '  refresh.sh: |' '  continuation-header.md: |' '  handoff-original.md: |'; do
+for pat in '- name: REFRESH_THRESHOLD_TOKENS' '- name: REFRESH_MAX' '- name: REFRESH_CEILING_TOKENS' '  refresh.sh: |' '  continuation-header.md: |' '  handoff-original.md: |'; do
     if grep -qF -- "$pat" <<< "$refresh_off_out"; then
         no "--refresh-at 0: no '$pat' in the render" "found"
     else
@@ -3681,6 +3683,8 @@ refresh_tok_out="$(refresh_dry --harness claude --refresh-at 150000 --refresh-ma
 check "--refresh-at 150000: REFRESH_THRESHOLD_TOKENS" "150000" \
     "$(refresh_env_val REFRESH_THRESHOLD_TOKENS "$refresh_tok_out")"
 check "--refresh-max 3: REFRESH_MAX" "3" "$(refresh_env_val REFRESH_MAX "$refresh_tok_out")"
+check "--refresh-at 150000: REFRESH_CEILING_TOKENS still 160000 (window-based)" "160000" \
+    "$(refresh_env_val REFRESH_CEILING_TOKENS "$refresh_tok_out")"
 refuses "pi + --refresh-at is refused with the local message" \
     "Error: --refresh-at only works with --harness claude" \
     env HOME="$claude_home" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
@@ -9495,6 +9499,7 @@ refresh_block_run() {
         inbox_dir="$RB_WORK/inbox" outbox_dir="$RB_WORK/outbox" \
         session_store_dir="$RB_WORK/session-store" SESSION_HARNESS_STORE=1 \
         RESUME_SESSION="${5:-}" REFRESH_THRESHOLD_TOKENS="${1:-}" REFRESH_MAX="${4:-6}" \
+        REFRESH_CEILING_TOKENS="${RB_CEILING:-}" \
         RB_REC="$rec" RB_OUTBOX="$RB_WORK/outbox" RB_CLONE="$RB_WORK/clone" \
         RB_HANDOFF_LEGS="${2:-}" RB_FAIL_LEGS="${3:-}" \
         RB_ADDENDUM_LEGS="${RB_ADDENDUM_LEGS:-}" \
@@ -9553,15 +9558,16 @@ PATH="$refresh_cfg_stub_dir:$PATH" HOME="$(newdir)" TMPDIR="$(newdir)" HARNESS=c
     clone_dir="$refresh_cfg_work/clone" inbox_dir="$refresh_cfg_work/inbox" \
     outbox_dir="$refresh_cfg_work/outbox" session_store_dir="$refresh_cfg_work/store" \
     SESSION_HARNESS_STORE="" RESUME_SESSION="" REFRESH_THRESHOLD_TOKENS=123456 \
-    REFRESH_MAX=6 RB_WORK_DIR="$refresh_cfg_work" \
+    REFRESH_MAX=6 REFRESH_CEILING_TOKENS=98765 RB_WORK_DIR="$refresh_cfg_work" \
     bash "$(refresh_cfg_probe)" > /dev/null 2>&1 || true
 if [[ "$(cat "$refresh_cfg_work/config-seen" 2>/dev/null)" == \
     "THRESHOLD_TOKENS=123456
 OUTBOX_DIR=$refresh_cfg_work/outbox
-CLONE_DIR=$refresh_cfg_work/clone" ]]; then
-    ok "the first leg runs with .refresh-config (threshold, outbox, clone) in the inbox"
+CLONE_DIR=$refresh_cfg_work/clone
+CEILING_TOKENS=98765" ]]; then
+    ok "the first leg runs with .refresh-config (threshold, outbox, clone, ceiling) in the inbox"
 else
-    no "the first leg runs with .refresh-config (threshold, outbox, clone) in the inbox" \
+    no "the first leg runs with .refresh-config (threshold, outbox, clone, ceiling) in the inbox" \
         "seen: $(cat "$refresh_cfg_work/config-seen" 2>/dev/null)"
 fi
 

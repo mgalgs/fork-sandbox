@@ -103,7 +103,9 @@ new_transcript() {
 hook_run() {
     # The env prefix has to sit directly on "$hook", the SECOND command of
     # the pipe -- on jq, upstream of the pipe, it would only ever be seen by
-    # jq itself.
+    # jq itself. baseline_marker falls back to a per-call throwaway path
+    # when a test never set one, so the cases above that predate
+    # CEILING_TOKENS need no changes.
     local inbox="$1" event="$2" transcript="$3"
     jq -n --arg ev "$event" --arg t "$transcript" \
         '{hook_event_name: $ev, transcript_path: $t}' \
@@ -112,7 +114,31 @@ hook_run() {
         FORK_SANDBOX_NUDGE_MARKER="$nudge_marker" \
         FORK_SANDBOX_NUDGE_REMINDED="$nudge_reminded" \
         FORK_SANDBOX_STALE_REMINDED="$stale_reminded" \
+        FORK_SANDBOX_NUDGE_BASELINE="${baseline_marker:-$(mktemp -u)}" \
         "$hook" 2>/dev/null
+}
+
+# Same call, but stderr (the nudge line, including the effective threshold
+# it names) lands in $hook_stderr instead of being thrown away, without
+# capturing it via a command substitution -- which would fork a subshell
+# and lose the assignment the moment it returned (the same gotcha
+# new_inbox's own comment documents). Redirecting straight to a file
+# sidesteps that: nothing here relies on a variable assignment made inside
+# the pipeline surviving past it, only the file's contents read back in
+# this function's own frame.
+hook_run_stderr() {
+    local inbox="$1" event="$2" transcript="$3" err_file
+    err_file="$(mktemp -u)"; tmpdirs+=("$err_file")
+    jq -n --arg ev "$event" --arg t "$transcript" \
+        '{hook_event_name: $ev, transcript_path: $t}' \
+    | FORK_SANDBOX_INBOX="$inbox" \
+        FORK_SANDBOX_INBOX_SEEN="$inbox/../seen-$$" \
+        FORK_SANDBOX_NUDGE_MARKER="$nudge_marker" \
+        FORK_SANDBOX_NUDGE_REMINDED="$nudge_reminded" \
+        FORK_SANDBOX_STALE_REMINDED="$stale_reminded" \
+        FORK_SANDBOX_NUDGE_BASELINE="${baseline_marker:-$(mktemp -u)}" \
+        "$hook" > /dev/null 2> "$err_file"
+    hook_stderr="$(cat "$err_file" 2>/dev/null)"
 }
 
 # Below the threshold: 100 total tokens against a 1000-token cap.
@@ -263,6 +289,87 @@ tmpdirs+=("$nudge_marker" "$nudge_reminded" "$stale_reminded")
 out="$(hook_run "$inbox" PostToolUse "/nonexistent/transcript.jsonl")"
 contains "with no refresh config, addenda still deliver" \
     "do the other thing" "$out"
+
+# =====================================================================
+printf '\n== fork-sandbox-inbox-hook.sh: the per-leg budget (CEILING_TOKENS) ==\n'
+# =====================================================================
+# eff = max(T, min(B + T, CEILING)), B being the first usage_tokens reading
+# this leg ever took. Each case below drives the hook through a sequence of
+# calls on the SAME leg (same marker files), each with a transcript naming
+# that call's own usage, so B is set by the first call and every later
+# call's nudge decision can be checked against the formula directly.
+
+# No CEILING at all (an older launcher's config): the leg nudges at exactly
+# T, same as before this feature existed, regardless of its own baseline.
+inbox="$(new_inbox)"; tmpdirs+=("$inbox")
+printf 'THRESHOLD_TOKENS=100000\nOUTBOX_DIR=%s/outbox\n' "$inbox" > "$inbox/.refresh-config"
+mkdir -p "$inbox/outbox"
+nudge_marker="$(mktemp -u)"; nudge_reminded="$(mktemp -u)"; stale_reminded="$(mktemp -u)"
+baseline_marker="$(mktemp -u)"
+tmpdirs+=("$nudge_marker" "$nudge_reminded" "$stale_reminded" "$baseline_marker")
+t="$(new_transcript 60000 0 0)"; tmpdirs+=("$(dirname "$t")")
+out="$(hook_run "$inbox" PostToolUse "$t")"
+check "no CEILING, usage 60000 < T 100000: no nudge" "" "$out"
+t="$(new_transcript 100000 0 0)"; tmpdirs+=("$(dirname "$t")")
+hook_run_stderr "$inbox" PostToolUse "$t"
+contains "no CEILING: nudges at exactly T" \
+    "nudged (usage >= 100000 tokens)" "$hook_stderr"
+
+# B=55000, T=100000, C=160000: eff = min(55000+100000, 160000) = 155000.
+inbox="$(new_inbox)"; tmpdirs+=("$inbox")
+printf 'THRESHOLD_TOKENS=100000\nOUTBOX_DIR=%s/outbox\nCEILING_TOKENS=160000\n' \
+    "$inbox" > "$inbox/.refresh-config"
+mkdir -p "$inbox/outbox"
+nudge_marker="$(mktemp -u)"; nudge_reminded="$(mktemp -u)"; stale_reminded="$(mktemp -u)"
+baseline_marker="$(mktemp -u)"
+tmpdirs+=("$nudge_marker" "$nudge_reminded" "$stale_reminded" "$baseline_marker")
+t="$(new_transcript 55000 0 0)"; tmpdirs+=("$(dirname "$t")")
+hook_run "$inbox" PostToolUse "$t" >/dev/null
+check "the first measurement writes the baseline" "55000" "$(cat "$baseline_marker" 2>/dev/null)"
+t="$(new_transcript 120000 0 0)"; tmpdirs+=("$(dirname "$t")")
+out="$(hook_run "$inbox" PostToolUse "$t")"
+check "B=55000: usage 120000 < eff 155000: no nudge" "" "$out"
+check "a later measurement does not overwrite the baseline" \
+    "55000" "$(cat "$baseline_marker" 2>/dev/null)"
+t="$(new_transcript 155000 0 0)"; tmpdirs+=("$(dirname "$t")")
+hook_run_stderr "$inbox" PostToolUse "$t"
+contains "B=55000: nudges at eff 155000, not T alone" \
+    "nudged (usage >= 155000 tokens)" "$hook_stderr"
+
+# B=20000, T=100000, C=160000: eff = min(20000+100000, 160000) = 120000.
+inbox="$(new_inbox)"; tmpdirs+=("$inbox")
+printf 'THRESHOLD_TOKENS=100000\nOUTBOX_DIR=%s/outbox\nCEILING_TOKENS=160000\n' \
+    "$inbox" > "$inbox/.refresh-config"
+mkdir -p "$inbox/outbox"
+nudge_marker="$(mktemp -u)"; nudge_reminded="$(mktemp -u)"; stale_reminded="$(mktemp -u)"
+baseline_marker="$(mktemp -u)"
+tmpdirs+=("$nudge_marker" "$nudge_reminded" "$stale_reminded" "$baseline_marker")
+t="$(new_transcript 20000 0 0)"; tmpdirs+=("$(dirname "$t")")
+hook_run "$inbox" PostToolUse "$t" >/dev/null
+t="$(new_transcript 120000 0 0)"; tmpdirs+=("$(dirname "$t")")
+hook_run_stderr "$inbox" PostToolUse "$t"
+contains "B=20000: nudges at eff 120000" \
+    "nudged (usage >= 120000 tokens)" "$hook_stderr"
+
+# T=180000, C=160000: eff = max(180000, min(B+180000, 160000)) = 180000 --
+# never lowered below the launcher's own explicit threshold.
+inbox="$(new_inbox)"; tmpdirs+=("$inbox")
+printf 'THRESHOLD_TOKENS=180000\nOUTBOX_DIR=%s/outbox\nCEILING_TOKENS=160000\n' \
+    "$inbox" > "$inbox/.refresh-config"
+mkdir -p "$inbox/outbox"
+nudge_marker="$(mktemp -u)"; nudge_reminded="$(mktemp -u)"; stale_reminded="$(mktemp -u)"
+baseline_marker="$(mktemp -u)"
+tmpdirs+=("$nudge_marker" "$nudge_reminded" "$stale_reminded" "$baseline_marker")
+t="$(new_transcript 50000 0 0)"; tmpdirs+=("$(dirname "$t")")
+hook_run "$inbox" PostToolUse "$t" >/dev/null
+t="$(new_transcript 160000 0 0)"; tmpdirs+=("$(dirname "$t")")
+out="$(hook_run "$inbox" PostToolUse "$t")"
+check "T above C: usage at C alone (160000) does not nudge" "" "$out"
+t="$(new_transcript 180000 0 0)"; tmpdirs+=("$(dirname "$t")")
+hook_run_stderr "$inbox" PostToolUse "$t"
+contains "T above C: nudges at T (180000), never lowered to C" \
+    "nudged (usage >= 180000 tokens)" "$hook_stderr"
+unset baseline_marker
 
 # =====================================================================
 printf '\n== the outer loop: real fork-sandbox.sh runs, claude-sandboxed stubbed ==\n'

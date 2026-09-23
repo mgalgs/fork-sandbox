@@ -95,25 +95,33 @@ refresh_config="$inbox/.refresh-config"
 refresh_threshold=""
 outbox_dir=""
 clone_dir=""
+# CEILING_TOKENS, when the launcher wrote one (an older launcher's config
+# has none): floor(0.8 * the model's context window), fs_refresh_resolve's
+# resolution. Feeds the per-leg budget formula below.
+refresh_ceiling=""
 if [[ -f "$refresh_config" ]]; then
     while IFS='=' read -r _rk _rv || [[ -n "$_rk" ]]; do
         case "$_rk" in
             THRESHOLD_TOKENS) refresh_threshold="$_rv" ;;
             OUTBOX_DIR) outbox_dir="$_rv" ;;
             CLONE_DIR) clone_dir="$_rv" ;;
+            CEILING_TOKENS) refresh_ceiling="$_rv" ;;
         esac
     done < "$refresh_config"
 fi
 
-# Three per-leg markers, all in the ephemeral tmpfs (see the header comment
+# Four per-leg markers, all in the ephemeral tmpfs (see the header comment
 # above): one for "this leg has been nudged, do not measure again", one for
 # "this leg has already been reminded once, at Stop, that no hand-off showed
 # up", one for "this leg has already been sent back once, at Stop, because
-# its hand-off predated its last commit". Overridable for the test script,
-# matching FORK_SANDBOX_INBOX_SEEN.
+# its hand-off predated its last commit", and one holding this leg's own
+# usage baseline -- the first usage_tokens reading this leg ever took,
+# which the per-leg budget formula below measures from. Overridable for
+# the test script, matching FORK_SANDBOX_INBOX_SEEN.
 nudge_marker="${FORK_SANDBOX_NUDGE_MARKER:-/tmp/fork-sandbox-nudged}"
 nudge_reminded_marker="${FORK_SANDBOX_NUDGE_REMINDED:-/tmp/fork-sandbox-nudge-reminded}"
 stale_reminded_marker="${FORK_SANDBOX_STALE_REMINDED:-/tmp/fork-sandbox-stale-reminded}"
+baseline_marker="${FORK_SANDBOX_NUDGE_BASELINE:-/tmp/fork-sandbox-nudge-baseline}"
 
 nudged=0
 [[ -f "$nudge_marker" ]] && nudged=1
@@ -233,6 +241,7 @@ event="$(printf '%s' "$payload" | jq -r '.hook_event_name // empty' 2>/dev/null)
 # the case where a racing call already won the nudge while this one was
 # reading.
 nudge_now=0
+refresh_effective="$refresh_threshold"
 if (( measure_usage )); then
     transcript="$(printf '%s' "$payload" | jq -r '.transcript_path // empty' 2>/dev/null)"
     if [[ -n "$transcript" && -r "$transcript" ]]; then
@@ -243,9 +252,31 @@ if (( measure_usage )); then
                 ((.input_tokens // 0) + (.cache_read_input_tokens // 0)
                  + (.cache_creation_input_tokens // 0))
               end' 2>/dev/null)"
-        if [[ "$usage_tokens" =~ ^[0-9]+$ && "$refresh_threshold" =~ ^[0-9]+$ ]] \
-            && (( usage_tokens >= refresh_threshold )); then
-            nudge_now=1
+        if [[ "$usage_tokens" =~ ^[0-9]+$ && "$refresh_threshold" =~ ^[0-9]+$ ]]; then
+            # The per-leg budget: the first usage_tokens reading this leg
+            # ever took is its baseline B, recorded once (tmp + mv) and
+            # never rewritten, so a leg is measured against T tokens of
+            # real working room from where IT started, not always the same
+            # absolute threshold -- see the header comment's "Bug" this
+            # fixes. eff = max(T, min(B + T, CEILING)): the CEILING keeps a
+            # leg from running into the harness's own compaction; the outer
+            # max(T, ...) means an explicit --refresh-at above the ceiling
+            # is never lowered. No CEILING (an older launcher's config) or
+            # an unreadable baseline falls back to exactly T, today's rule.
+            baseline=""
+            if [[ -f "$baseline_marker" ]]; then
+                IFS= read -r baseline < "$baseline_marker" 2>/dev/null || true
+            else
+                printf '%s' "$usage_tokens" > "$baseline_marker.tmp" 2>/dev/null \
+                    && mv -f -- "$baseline_marker.tmp" "$baseline_marker" 2>/dev/null
+                baseline="$usage_tokens"
+            fi
+            if [[ "$refresh_ceiling" =~ ^[0-9]+$ && "$baseline" =~ ^[0-9]+$ ]]; then
+                refresh_effective=$(( baseline + refresh_threshold ))
+                (( refresh_effective > refresh_ceiling )) && refresh_effective="$refresh_ceiling"
+                (( refresh_effective < refresh_threshold )) && refresh_effective="$refresh_threshold"
+            fi
+            (( usage_tokens >= refresh_effective )) && nudge_now=1
         fi
     fi
 fi
@@ -457,7 +488,7 @@ if (( ${#unread[@]} || ${#unread_mail[@]} )); then
     printf '%s delivered %s\n' "$STDERR_TAG" "$all_names" >&2
 fi
 if (( nudge_now )); then
-    printf '%s nudged (usage >= %s tokens)\n' "$STDERR_TAG_REFRESH" "$refresh_threshold" >&2
+    printf '%s nudged (usage >= %s tokens)\n' "$STDERR_TAG_REFRESH" "$refresh_effective" >&2
 fi
 if (( handoff_missing )); then
     printf '%s reminded (no hand-off yet)\n' "$STDERR_TAG_REFRESH" >&2

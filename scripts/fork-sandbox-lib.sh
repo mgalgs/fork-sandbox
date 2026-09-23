@@ -2861,9 +2861,9 @@ fs_normalize_authorship() {
 # refused outright on every harness but claude (the threshold is measured by
 # a hook installed into the claude session), and only when GIVEN, so the 0.5
 # default stays silent on a plain pi run. On success it sets, in the caller's
-# scope, refresh_at, refresh_enabled (0|1), refresh_max, refresh_context_window
-# and refresh_threshold_tokens (the last two empty when disabled). Returns 1
-# after printing the reason on refusal.
+# scope, refresh_at, refresh_enabled (0|1), refresh_max, refresh_context_window,
+# refresh_threshold_tokens and refresh_ceiling_tokens (the last three empty
+# when disabled). Returns 1 after printing the reason on refusal.
 # shellcheck disable=SC2034  # the results are read by the caller
 fs_refresh_resolve() {
     local harness="$1" refresh_at_arg="$2" refresh_at_given="$3" \
@@ -2908,6 +2908,7 @@ fs_refresh_resolve() {
     fi
     refresh_context_window=""
     refresh_threshold_tokens=""
+    refresh_ceiling_tokens=""
     if (( refresh_enabled )); then
         # A one-line, one-place guess: a model whose name carries "[1m]" gets
         # the 1,000,000-token beta window; everything else gets the standard
@@ -2927,6 +2928,13 @@ fs_refresh_resolve() {
         else
             refresh_threshold_tokens="$(awk -v f="$refresh_at" 'BEGIN{printf "%d", f}')"
         fi
+        # The per-leg working-room ceiling the inbox hook measures a leg's
+        # OWN usage against, floor(0.8 * window): high enough to leave a
+        # leg real room to work before the harness's own compaction, low
+        # enough that a leg's nudge always fires before that compaction
+        # would. See the hook's own comment on the B + T formula this feeds.
+        refresh_ceiling_tokens="$(awk -v w="$refresh_context_window" \
+            'BEGIN{printf "%d", 0.8*w}')"
     fi
     return 0
 }

@@ -158,7 +158,14 @@
 #                   refresh: no .refresh-config, no continuation legs.
 #   REFRESH_MAX     the most continuation legs one run may chain. Default
 #                   6, the same default the local runner uses.
+#   REFRESH_CEILING_TOKENS
+#                   floor(0.8 * the model's context window), resolved
+#                   alongside REFRESH_THRESHOLD_TOKENS. Fed to the inbox
+#                   hook as CEILING_TOKENS, so each leg gets its own
+#                   working budget from where IT started rather than
+#                   always nudging at the same absolute threshold.
 #
+
 # Reads from /mnt/fork-sandbox/ (the scripts ConfigMap, mounted read-only):
 #   handoff.md              the run's whole prompt, on the coding harness's
 #                           stdin.
@@ -238,6 +245,7 @@ fi
 : "${SESSION_ID:=}"
 : "${REFRESH_THRESHOLD_TOKENS:=}"
 : "${REFRESH_MAX:=6}"
+: "${REFRESH_CEILING_TOKENS:=}"
 if [[ "$REVIEW_LOOP_CAP" =~ ^[1-9][0-9]*$ ]]; then
     : "${BASE_SHA:?BASE_SHA must be set when REVIEW_LOOP_CAP is set}"
     if [[ "$HARNESS" == claude && -z "$REVIEW_MODEL" ]]; then
@@ -1011,7 +1019,8 @@ else
             leg_env+=("FORK_SANDBOX_NUDGE_MARKER=$claude_hook_dir/nudged"
                 "FORK_SANDBOX_NUDGE_REMINDED=$claude_hook_dir/nudge-reminded"
                 "FORK_SANDBOX_STALE_REMINDED=$claude_hook_dir/stale-reminded"
-                "FORK_SANDBOX_INBOX_SEEN=$claude_hook_dir/inbox-seen")
+                "FORK_SANDBOX_INBOX_SEEN=$claude_hook_dir/inbox-seen"
+                "FORK_SANDBOX_NUDGE_BASELINE=$claude_hook_dir/nudge-baseline")
         fi
         env "${leg_env[@]}" "${claude_argv[@]}" \
             < "${1:-$mounts_dir/handoff.md}" \
@@ -1024,6 +1033,7 @@ else
         source "$mounts_dir/refresh.sh"
         printf '%s\n' "THRESHOLD_TOKENS=$REFRESH_THRESHOLD_TOKENS" \
             "OUTBOX_DIR=$outbox_dir" "CLONE_DIR=$clone_dir" \
+            "CEILING_TOKENS=$REFRESH_CEILING_TOKENS" \
             > "$inbox_dir/.refresh-config"
         claude_hook_leg 1
     fi

@@ -3367,10 +3367,11 @@ fi
 # --refresh-at / --refresh-max: validation, defaults and the token threshold
 # live in fs_refresh_resolve (fork-sandbox-lib.sh), shared with the k8s submit
 # path. See the "A run that refreshes itself" section above.
-# It sets refresh_at, refresh_enabled, refresh_max, refresh_context_window and
-# refresh_threshold_tokens, which the rest of this script reads.
+# It sets refresh_at, refresh_enabled, refresh_max, refresh_context_window,
+# refresh_threshold_tokens and refresh_ceiling_tokens, which the rest of
+# this script reads.
 refresh_at="" refresh_max="" refresh_enabled=0
-refresh_context_window="" refresh_threshold_tokens=""
+refresh_context_window="" refresh_threshold_tokens="" refresh_ceiling_tokens=""
 fs_refresh_resolve "$harness" "$refresh_at_arg" "$refresh_at_given" \
     "$refresh_max_arg" "$model" || exit 1
 
@@ -5474,6 +5475,12 @@ if (( refresh_enabled )); then
         # the run's layout -- see its own comment on why the reflog and not
         # the index.
         printf 'CLONE_DIR=%s\n' "$clone_dir"
+        # CEILING_TOKENS: floor(0.8 * the model's context window), resolved
+        # alongside THRESHOLD_TOKENS by fs_refresh_resolve. The hook uses it
+        # to give each leg its own working budget from where IT started,
+        # rather than always nudging at the same absolute THRESHOLD_TOKENS
+        # -- see the hook's own comment on the formula.
+        printf 'CEILING_TOKENS=%s\n' "$refresh_ceiling_tokens"
     } > "$refresh_config"
     fs_reject_unsafe_chars "$refresh_config"
 fi
