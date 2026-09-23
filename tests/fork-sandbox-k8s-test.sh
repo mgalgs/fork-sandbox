@@ -7547,6 +7547,53 @@ else
         "not found in /tmp/fs-k8s-flag-test-cr.yaml"
 fi
 rm -f /tmp/fs-k8s-flag-test-cr.err /tmp/fs-k8s-flag-test-cr.yaml
+# --attach-dir and --thread-dir are carried through too, not refused --
+# fork-sandbox-k8s.sh's own submit applies fs_validate_scratch_dir's wider
+# whole-scratch-root boundary itself, so a directory under the scratch root
+# but outside forks/ is enough here (unlike --context-ro's fixture above,
+# which needs the narrower forks/ prefix).
+k8s_flag_attach_dir="$(mktemp -d /var/tmp/claude-scratch/fs-k8s-flag-test-attach.XXXXXX)"
+tmpdirs+=("$k8s_flag_attach_dir")
+printf 'an attachment\n' > "$k8s_flag_attach_dir/file.txt"
+if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
+    --harness pi --model moonshotai/kimi-k3 \
+    --attach-dir "$k8s_flag_attach_dir" \
+    --branch fs-k8s-flag-test-attach-branch \
+    "$k8s_flag_proj" "$k8s_flag_handoff" \
+    > /tmp/fs-k8s-flag-test-attach.yaml 2>/tmp/fs-k8s-flag-test-attach.err; then
+    ok "--k8s --attach-dir --dry-run is no longer refused"
+else
+    no "--k8s --attach-dir --dry-run is no longer refused" \
+        "$(cat /tmp/fs-k8s-flag-test-attach.err)"
+fi
+if grep -qF 'mountPath: /attachments' /tmp/fs-k8s-flag-test-attach.yaml; then
+    ok "--k8s --attach-dir --dry-run forwards the flag to fork-sandbox-k8s.sh"
+else
+    no "--k8s --attach-dir --dry-run forwards the flag to fork-sandbox-k8s.sh" \
+        "not found in /tmp/fs-k8s-flag-test-attach.yaml"
+fi
+rm -f /tmp/fs-k8s-flag-test-attach.err /tmp/fs-k8s-flag-test-attach.yaml
+k8s_flag_thread_dir="$(mktemp -d /var/tmp/claude-scratch/fs-k8s-flag-test-thread.XXXXXX)"
+tmpdirs+=("$k8s_flag_thread_dir")
+printf 'thread.txt\n' > "$k8s_flag_thread_dir/thread.txt"
+if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
+    --harness pi --model moonshotai/kimi-k3 \
+    --thread-dir "$k8s_flag_thread_dir" \
+    --branch fs-k8s-flag-test-thread-branch \
+    "$k8s_flag_proj" "$k8s_flag_handoff" \
+    > /tmp/fs-k8s-flag-test-thread.yaml 2>/tmp/fs-k8s-flag-test-thread.err; then
+    ok "--k8s --thread-dir --dry-run is no longer refused"
+else
+    no "--k8s --thread-dir --dry-run is no longer refused" \
+        "$(cat /tmp/fs-k8s-flag-test-thread.err)"
+fi
+if grep -qF 'mountPath: /thread' /tmp/fs-k8s-flag-test-thread.yaml; then
+    ok "--k8s --thread-dir --dry-run forwards the flag to fork-sandbox-k8s.sh"
+else
+    no "--k8s --thread-dir --dry-run forwards the flag to fork-sandbox-k8s.sh" \
+        "not found in /tmp/fs-k8s-flag-test-thread.yaml"
+fi
+rm -f /tmp/fs-k8s-flag-test-thread.err /tmp/fs-k8s-flag-test-thread.yaml
 # --endpoint is carried through, not refused -- on a K8S_PROXY_ENDPOINTS
 # install the forwarded flag must reach the render: the Job's PROXY_BASE_URL
 # lands at the named endpoint's /e/<name>/v1 instead of the legacy /api/v1

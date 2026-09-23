@@ -208,14 +208,18 @@
 #                        enough to reach another run's clone or the rest
 #                        of the mail store. The postmaster uses this to
 #                        hand a wake its thread's own attachments
-#                        directory under the mail store. Refused with
-#                        --k8s.
+#                        directory under the mail store. With --k8s,
+#                        forwarded to fork-sandbox-k8s.sh, which presents
+#                        the same content at the same /attachments path
+#                        inside the pod — see docs/kubernetes-runs.md.
 # --thread-dir <dir>:    bind an existing rendered mail-thread directory
 #                        read-only at /thread inside a local run. The
 #                        directory must live under /var/tmp/claude-scratch/
 #                        (or the /tmp/claude-scratch compat path), never an
-#                        arbitrary host path. Refused with --k8s for the
-#                        same host-bind reason.
+#                        arbitrary host path. With --k8s, forwarded to
+#                        fork-sandbox-k8s.sh, which presents the same
+#                        content at the same /thread path inside the pod —
+#                        see docs/kubernetes-runs.md.
 # --session-state <dir>: bind <dir> read-WRITE into the sandbox at the
 #                        harness's own session store — sandbox HOME's
 #                        ~/.claude/projects for claude, ~/.codex/sessions for
@@ -829,14 +833,21 @@
 # --review-model, since a habit-typed --model-shaped value like "opus" would
 # otherwise only fail after a paid coding leg instead of at validation.
 #
-# --context-ro and --endpoint are the remaining capabilities that ARE
-# carried: --k8s forwards --context-ro to fork-sandbox-k8s.sh run, which
-# threads it to cmd_submit the same way a local run's own --context-ro
-# reaches the sandbox -- see 'Getting files in' in docs/kubernetes-runs.md.
-# cmd_submit applies the same directory-under-/var/tmp/claude-scratch/forks/,
-# no-symlinks, 256 MiB constraints itself, so there is nothing left for this
-# script's own local-path check, below, to duplicate for a --k8s run -- it
-# never reaches that check at all. --endpoint names which
+# --context-ro, --attach-dir, --thread-dir and --endpoint are the remaining
+# capabilities that ARE carried: --k8s forwards --context-ro to
+# fork-sandbox-k8s.sh run, which threads it to cmd_submit the same way a
+# local run's own --context-ro reaches the sandbox -- see 'Getting files in'
+# in docs/kubernetes-runs.md. cmd_submit applies the same
+# directory-under-/var/tmp/claude-scratch/forks/, no-symlinks, 256 MiB
+# constraints itself, so there is nothing left for this script's own
+# local-path check, below, to duplicate for a --k8s run -- it never reaches
+# that check at all. --attach-dir and --thread-dir are forwarded the same
+# way, raw and unresolved, to fork-sandbox-k8s.sh's own
+# fs_validate_scratch_dir-based checks, which enforce the wider
+# whole-scratch-root boundary these two flags use locally (not the narrower
+# forks/ prefix --context-ro enforces); the pod then presents them at the
+# same /attachments and /thread paths a local run does. --endpoint names
+# which
 # K8S_PROXY_ENDPOINTS entry the pod talks to, and it rides the same
 # dispatch: forwarded as-is, resolved against the registry on the
 # fork-sandbox-k8s.sh side, where the registered names are known.
@@ -2798,18 +2809,6 @@ if [[ "$k8s_mode" == true ]]; then
         echo "to bind." >&2
         exit 1
     fi
-    if [[ -n "$attach_dir" ]]; then
-        echo "Error: --attach-dir is not supported with --k8s. It binds a host" >&2
-        echo "directory into a local sandbox; a cluster run has no host directory" >&2
-        echo "to bind." >&2
-        exit 1
-    fi
-    if [[ -n "$thread_dir" ]]; then
-        echo "Error: --thread-dir is not supported with --k8s. It binds a host" >&2
-        echo "directory into a local sandbox; a cluster run has no host directory" >&2
-        echo "to bind." >&2
-        exit 1
-    fi
     if [[ -n "$claude_extra_args" ]]; then
         echo "Error: --claude-args is not supported with --k8s. It passes flags" >&2
         echo "to the claude CLI, and the pod's own claude invocation (when" >&2
@@ -3055,6 +3054,8 @@ if [[ "$k8s_mode" == true ]]; then
     # sync.
     [[ -n "$outbox_max_arg" ]] && k8s_argv+=(--outbox-max "$outbox_max_arg")
     [[ -n "$context_ro" ]] && k8s_argv+=(--context-ro "$context_ro")
+    [[ -n "$attach_dir" ]] && k8s_argv+=(--attach-dir "$attach_dir")
+    [[ -n "$thread_dir" ]] && k8s_argv+=(--thread-dir "$thread_dir")
     # Forwarded as the raw string, not the compacted-and-validated form the
     # local path produces further down (this dispatch runs ahead of that
     # code, which this exec never reaches): fork-sandbox-k8s.sh's own

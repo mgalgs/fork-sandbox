@@ -62,6 +62,17 @@ while [[ $# -gt 0 && "$1" != -- ]]; do shift; done
 STUB
 chmod +x "$work/bin/pi" "$work/bin/curl" "$work/bin/sandbox-backend-test"
 printf 'MODEL_ENDPOINT=http://127.0.0.1:8080/v1\n' > "$work/config/model.env"
+# A legacy k8s.env, so --k8s --dry-run below has an install to dispatch
+# against; this is the same fixture shape tests/fork-sandbox-k8s-test.sh
+# builds for its own config_dir.
+cat > "$work/config/k8s.env" <<'CONF'
+K8S_CONTEXT=test-context
+K8S_NAMESPACE=fork-sandbox-test
+K8S_IMAGE=registry.example/you/fork-sandbox:latest
+K8S_PROXY_UPSTREAM=https://openrouter.ai
+K8S_DENIED_PROBE=10.0.0.1:443
+K8S_RUN_TTL=1800
+CONF
 
 run_launcher() {
     local attach_arg="$1" capture="$2"; shift 2
@@ -128,11 +139,23 @@ else
     no "thread-dir naming a plain file is refused" "$out"
 fi
 
-out="$(run_launcher "$attach" "$work/k8s-argv" --k8s --model vendor/model)"; rc=$?
-if (( rc != 0 )) && [[ "$out" == *"not supported with --k8s"* ]]; then
-    ok "--thread-dir refused with --k8s"
+# --thread-dir is forwarded, not refused, with --k8s: fork-sandbox-k8s.sh's
+# own submit renders an emptyDir mount at /thread for it (see
+# tests/fork-sandbox-k8s-test.sh's td_test_scratch_push). This dispatcher
+# call must skip run_launcher's --harness pi-local (refused with --k8s) and
+# needs the project/handoff fixtures directly, not through run_launcher's
+# own arg-shape. A fresh directory, not $attach -- the refusal tests above
+# grew a symlink inside it.
+k8s_thread="$(mktemp -d /var/tmp/claude-scratch/fs-thread-dir-k8s.XXXXXX)"; tmpdirs+=("$k8s_thread")
+printf 'thread.txt\n' > "$k8s_thread/thread.txt"
+k8s_dry_run_out="$(HOME="$home" PATH="$work/bin:$PATH" FORK_SANDBOX_CONFIG_DIR="$work/config" \
+    FORK_SANDBOX_RUN_SOURCE=test \
+    timeout 30 "$launcher" --k8s --dry-run --model moonshotai/kimi-k3 \
+    --thread-dir "$k8s_thread" "$project" "$handoff" 2>&1)"; rc=$?
+if (( rc == 0 )) && grep -qF 'mountPath: /thread' <<< "$k8s_dry_run_out"; then
+    ok "--thread-dir is forwarded with --k8s, not refused"
 else
-    no "--thread-dir refused with --k8s" "$out"
+    no "--thread-dir is forwarded with --k8s, not refused" "$k8s_dry_run_out"
 fi
 
 plain="$work/plain-argv"
