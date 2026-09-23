@@ -15,6 +15,10 @@ to be right are cheaper to get right on paper. It is a companion to
 part of this that varies by cluster: this document is the shape of a run,
 that one is the interface a specific cluster's CNI dialect implements.
 
+Running the agent-mail postmaster itself as a cluster Deployment, rather
+than on a laptop, is a separate piece built on top of this one; see
+[docs/cluster-postmaster.md](cluster-postmaster.md).
+
 The goal is a self-hosted cloud agent: submit a task from anywhere with cluster
 access, and a few minutes later fetch a branch. Anyone who can reach the cluster
 gets an agent, which is what makes it usable from CI rather than only from a

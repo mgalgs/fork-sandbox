@@ -542,6 +542,9 @@ fork-sandbox postmaster flag   <thread-id> [reason]
 fork-sandbox postmaster unflag <thread-id>
 ```
 
+The postmaster can also run as a cluster Deployment instead of on a
+laptop; see [docs/cluster-postmaster.md](cluster-postmaster.md).
+
 Before anything else, `deliver` runs `fleet check` once and refuses to
 start at all if it fails (skipped only when there is no fleet file, or no
 personas directory, to check) — a fleet.yaml typo in one agent's
