@@ -677,7 +677,13 @@ RUN_LABEL_VALUES=()
 # `set -u` even on a verb that never calls cmd_submit.
 K8S_LAST_SUBMIT_RUN_DIR=""
 
-if [[ ! "$K8S_NAMESPACE" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]]; then
+# check-grant needs none of the checks in this block (it renders no
+# manifest, spawns no run, and never reads any of these keys) except
+# K8S_CLUSTER_DOMAIN just below -- so, like the file-existence and
+# K8S_CONTEXT checks above, each is skipped for that verb. Otherwise a
+# k8s.env value check-grant never consumes (K8S_RUN_TTL, say) would make
+# `mail grant` fail for a reason it has nothing to do with.
+if [[ "${1-}" != check-grant && ! "$K8S_NAMESPACE" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]]; then
     echo "Error: K8S_NAMESPACE='$K8S_NAMESPACE' is not a valid namespace name." >&2
     exit 1
 fi
@@ -687,22 +693,24 @@ fi
 # other key of this kind (K8S_NAMESPACE above) -- not just the generic
 # fs_reject_unsafe_chars pass below, which lets through characters (a
 # space, a `;`, a `|`) that break the sed substitution or the rendered
-# nginx directive without ever naming this key as the cause.
+# nginx directive without ever naming this key as the cause. check-grant
+# DOES need this one -- it validates --reach-probe hosts against
+# K8S_CLUSTER_DOMAIN -- so this check runs for every verb.
 if [[ ! "$K8S_CLUSTER_DOMAIN" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]]; then
     echo "Error: K8S_CLUSTER_DOMAIN='$K8S_CLUSTER_DOMAIN' is not a valid DNS" >&2
     echo "domain name." >&2
     exit 1
 fi
-if [[ -n "$K8S_RUN_TTL" && ! "$K8S_RUN_TTL" =~ ^[0-9]+$ ]]; then
+if [[ "${1-}" != check-grant && -n "$K8S_RUN_TTL" && ! "$K8S_RUN_TTL" =~ ^[0-9]+$ ]]; then
     echo "Error: K8S_RUN_TTL must be a number of seconds, got '$K8S_RUN_TTL'." >&2
     exit 1
 fi
-if [[ -n "$K8S_ALLOW_UNLISTED_MODEL" && "$K8S_ALLOW_UNLISTED_MODEL" != 1 ]]; then
+if [[ "${1-}" != check-grant && -n "$K8S_ALLOW_UNLISTED_MODEL" && "$K8S_ALLOW_UNLISTED_MODEL" != 1 ]]; then
     echo "Error: K8S_ALLOW_UNLISTED_MODEL in $k8s_env must be 1 (or unset)," >&2
     echo "got '$K8S_ALLOW_UNLISTED_MODEL'." >&2
     exit 1
 fi
-if [[ -n "$K8S_RUN_OWNER" ]] && ! k8s_valid_label_value "$K8S_RUN_OWNER"; then
+if [[ "${1-}" != check-grant && -n "$K8S_RUN_OWNER" ]] && ! k8s_valid_label_value "$K8S_RUN_OWNER"; then
     echo "Error: K8S_RUN_OWNER='$K8S_RUN_OWNER' in $k8s_env is not a valid" >&2
     echo "Kubernetes label value -- it must be at most 63 characters and" >&2
     echo 'match [a-zA-Z0-9]([-_.a-zA-Z0-9]*[a-zA-Z0-9])?. An operator-typed' >&2
@@ -711,19 +719,25 @@ if [[ -n "$K8S_RUN_OWNER" ]] && ! k8s_valid_label_value "$K8S_RUN_OWNER"; then
     echo "refusing -- see docs/kubernetes-runs.md." >&2
     exit 1
 fi
-if [[ ! "$K8S_SERVICES_MAX" =~ ^[0-9]+$ ]]; then
+if [[ "${1-}" != check-grant && ! "$K8S_SERVICES_MAX" =~ ^[0-9]+$ ]]; then
     echo "Error: K8S_SERVICES_MAX must be a positive integer, got '$K8S_SERVICES_MAX'." >&2
     exit 1
 fi
 
-fs_reject_unsafe_chars "$K8S_CONTEXT" "$K8S_NAMESPACE" "$K8S_IMAGE" \
-    "$K8S_PROXY_UPSTREAM" "$K8S_PROXY_ENDPOINTS" "$K8S_PROXY_ENDPOINT_KEYS" \
-    "$K8S_PROXY_ALLOW" \
-    "$K8S_PROXY_ALLOW_NS" "$K8S_CLUSTER_DOMAIN" \
-    "$K8S_DENIED_PROBE" "$GIT_USER_NAME" "$GIT_USER_EMAIL" \
-    "$K8S_SERVICE_MAX_CPU" "$K8S_SERVICE_MAX_MEMORY" \
-    "$K8S_RUN_OWNER" "$K8S_RUN_LABELS" \
-    || exit 1
+# None of these keys feed check-grant's extracted validators (which read
+# only K8S_CLUSTER_DOMAIN, itself already shape-checked above by a regex
+# stricter than "no unsafe chars"), so this pass is skipped for that verb
+# too, same reasoning as the block above.
+if [[ "${1-}" != check-grant ]]; then
+    fs_reject_unsafe_chars "$K8S_CONTEXT" "$K8S_NAMESPACE" "$K8S_IMAGE" \
+        "$K8S_PROXY_UPSTREAM" "$K8S_PROXY_ENDPOINTS" "$K8S_PROXY_ENDPOINT_KEYS" \
+        "$K8S_PROXY_ALLOW" \
+        "$K8S_PROXY_ALLOW_NS" "$K8S_CLUSTER_DOMAIN" \
+        "$K8S_DENIED_PROBE" "$GIT_USER_NAME" "$GIT_USER_EMAIL" \
+        "$K8S_SERVICE_MAX_CPU" "$K8S_SERVICE_MAX_MEMORY" \
+        "$K8S_RUN_OWNER" "$K8S_RUN_LABELS" \
+        || exit 1
+fi
 
 kubectl() {
     command kubectl --context="$K8S_CONTEXT" -n "$K8S_NAMESPACE" "$@"
@@ -2841,6 +2855,15 @@ validate_run_allow_ns() {
     local -a allow_ns_raw=("$@")
     _vrans_ns=()
     _vrans_port=()
+    # check-grant prints each raw value back out verbatim, one per line
+    # (see cmd_check_grant) -- a value containing a newline would forge
+    # further lines in that output, and the grant file is a straight copy
+    # of it (mail_write_grant), so this is a boundary check, not a style
+    # one. fs_reject_unsafe_chars already refuses newline (and a single
+    # quote, which cmd_submit's own downstream shell-outs need refused
+    # too); reused rather than reimplemented, same as every other sink in
+    # this file.
+    fs_reject_unsafe_chars "${allow_ns_raw[@]}" || exit 1
     if (( ${#allow_ns_raw[@]} > 0 )); then
         local allow_ns_joined
         allow_ns_joined="$(IFS=,; printf '%s' "${allow_ns_raw[*]}")"
@@ -2867,6 +2890,17 @@ validate_run_reach_probes() {
     shift 4
     local -a reach_probe_raw=("$@")
     _vrrp_probes=()
+
+    # Same boundary as validate_run_allow_ns above, and for the same
+    # reason: a --reach-probe value reaches check-grant's verbatim stdout
+    # (REACH_PROBE=<value exactly as given>) and from there the grant
+    # file, so a newline here forges a line neither check-grant nor its
+    # caller ever validated. Checked before the HOST:PORT split below --
+    # bash's "${probe%:*}" and the read into host_labels operate on the
+    # string as a whole and would happily carry an embedded newline
+    # through shape validation unnoticed (read stops at the first one,
+    # not the caller-intended end of the host).
+    fs_reject_unsafe_chars "${reach_probe_raw[@]}" || exit 1
 
     if (( ${#reach_probe_raw[@]} > 0 && allow_ns_count == 0 )); then
         echo "Error: --reach-probe requires --allow-namespace. A reach probe" >&2
@@ -2982,6 +3016,12 @@ validate_run_reach_probes() {
 validate_context_ro_dir() {
     local context_ro="$1" context_ro_real
     context_ro_real="$("$FS_REALPATH" -m "$context_ro")"
+    # Same boundary as the two validators above: this path is check-grant's
+    # CONTEXT_RO= line verbatim, and a directory basename may legally
+    # contain a newline (only NUL and '/' are forbidden in a filename), so
+    # without this a crafted --context-ro forges further lines in the
+    # grant file the same way a crafted probe or namespace would.
+    fs_reject_unsafe_chars "$context_ro_real" || exit 1
     if [[ "$context_ro_real" != /var/tmp/claude-scratch/forks/* ]]; then
         echo "Error: --context-ro must name a directory under" >&2
         echo "/var/tmp/claude-scratch/forks/ — got '$context_ro_real'. The" >&2

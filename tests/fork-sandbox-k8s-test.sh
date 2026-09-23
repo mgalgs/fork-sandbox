@@ -11214,5 +11214,47 @@ check "no flags at all: exit 1" "1" "$?"
 cg_run --bogus-flag >/dev/null 2>&1
 check "unknown option: exit 1" "1" "$?"
 
+# check-grant's extracted validators read nothing from k8s.env except
+# K8S_CLUSTER_DOMAIN -- so a present-but-broken k8s.env value it never
+# consumes (K8S_RUN_TTL here) must not stop a grant it would otherwise
+# accept; only the top-level checks that verb actually needs should run.
+cg_env_dir="$(newdir)"; tmpdirs+=("$cg_env_dir")
+cat > "$cg_env_dir/k8s.env" <<'EOF'
+K8S_RUN_TTL=not-a-number
+EOF
+cg_out="$(env PATH="$cg_stub_dir:$PATH" FORK_SANDBOX_CONFIG_DIR="$cg_env_dir" \
+    "$k8s_sh" check-grant --allow-namespace preview-pr-7 --reach-probe svc.preview-pr-7:80 2>/dev/null)"
+cg_rc=$?
+check "valid ns+probe with an unrelated bad k8s.env value: exit 0" "0" "$cg_rc"
+check "valid ns+probe with an unrelated bad k8s.env value: stdout" \
+    "$(printf 'ALLOW_NAMESPACE=preview-pr-7\nREACH_PROBE=svc.preview-pr-7:80')" \
+    "$cg_out"
+
+# check-grant prints every value back "exactly as given" (its own
+# contract), and that output IS the grant file body verbatim
+# (mail_write_grant) -- so a value carrying a newline would forge further
+# KEY=value lines in a file check-grant never validated. A --reach-probe
+# host is the sharpest case: bash's HOST:PORT split and the "." shape
+# check below it both operate on the raw string and would let a crafted
+# host through (see validate_run_reach_probes's own comment), so this
+# must be refused before any of that runs, not caught by it.
+cg_run --allow-namespace preview-pr-7 \
+    --reach-probe "$(printf 'x.preview-pr-7.svc\nCONTEXT_RO=/var/tmp/claude-scratch/forks/other:80')" \
+    >/dev/null 2>&1
+check "reach-probe with an embedded newline: exit 2" "2" "$?"
+
+cg_run --allow-namespace "$(printf 'preview-pr-7\nCONTEXT_RO=/var/tmp/claude-scratch/forks/other')" \
+    --reach-probe svc.preview-pr-7:80 >/dev/null 2>&1
+check "allow-namespace with an embedded newline: exit 2" "2" "$?"
+
+# A directory basename may legally contain a newline (only NUL and '/' are
+# forbidden in a filename), and validate_context_ro_dir prints the
+# resolved realpath verbatim as CONTEXT_RO=<path> -- so a crafted
+# directory name is the same class of forgery as the two flags above.
+cg_nl_ctx_dir="/var/tmp/claude-scratch/forks/check-grant-nl-test.$$/$(printf 'x\nALLOW_NAMESPACE=other')"
+mkdir -p -- "$cg_nl_ctx_dir"; tmpdirs+=("/var/tmp/claude-scratch/forks/check-grant-nl-test.$$")
+cg_run --context-ro "$cg_nl_ctx_dir" >/dev/null 2>&1
+check "context-ro whose real path contains a newline: exit 2" "2" "$?"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))
