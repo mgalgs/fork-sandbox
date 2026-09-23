@@ -83,7 +83,9 @@
 # complete through this wait again (pod Failed, pod Succeeded and exited,
 # job Failed condition, pod gone, malformed sentinel) -- give the run up;
 # exit 1 is the probe's own deadline with the run possibly still going (or
-# a usage error): probe again.
+# a usage error): probe again. exit 4 (only with --probe): the cluster
+# could not be asked; the run's state is unknown -- neither adopt nor give
+# up; probe again later.
 #
 # collect is run's third and last phase on its own: it reads the review
 # loop's outcome (only when --review-loop N is given and non-zero), pulls
@@ -1301,6 +1303,44 @@ k8s_find_pod() {
             -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
     fi
     printf '%s' "$pod_name"
+}
+
+# --probe-only pod lookup: unlike k8s_find_pod above, a kubectl failure is
+# NOT swallowed -- cmd_wait's --probe path needs to tell "the API answered:
+# no pod" apart from "could not ask". Same safe/legacy name fallback, and
+# every call carries --request-timeout so a hung API server cannot block
+# past $3 seconds. Prints the pod name (possibly empty, when kubectl did
+# answer) on stdout and returns 0, or prints nothing and returns 1 on any
+# kubectl failure.
+k8s_probe_find_pod() {
+    local safe_name="$1" legacy_name="$2" req_timeout="$3" pod_name
+    pod_name="$(kubectl get pod -l "job-name=$safe_name" \
+        --request-timeout="${req_timeout}s" \
+        -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)" || return 1
+    if [[ -z "$pod_name" && "$legacy_name" != "$safe_name" ]]; then
+        pod_name="$(kubectl get pod -l "job-name=$legacy_name" \
+            --request-timeout="${req_timeout}s" \
+            -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)" || return 1
+    fi
+    printf '%s' "$pod_name"
+}
+
+# --probe-only Job existence check, safe name then legacy: prints "" when
+# kubectl answered "no such Job" (--ignore-not-found suppresses the
+# NotFound error rather than failing the call) or a non-empty object name
+# when it still exists, and returns 0 -- or prints nothing and returns 1 on
+# any kubectl failure. Used by cmd_wait --probe to tell "the pod is simply
+# gone (evicted, not yet scheduled)" -- Job still exists, not terminal --
+# apart from "the run itself is gone" -- no Job either, terminal.
+k8s_probe_find_job() {
+    local safe_name="$1" legacy_name="$2" req_timeout="$3" job_name
+    job_name="$(kubectl get job "$safe_name" --ignore-not-found -o name \
+        --request-timeout="${req_timeout}s" 2>/dev/null)" || return 1
+    if [[ -z "$job_name" && "$legacy_name" != "$safe_name" ]]; then
+        job_name="$(kubectl get job "$legacy_name" --ignore-not-found -o name \
+            --request-timeout="${req_timeout}s" 2>/dev/null)" || return 1
+    fi
+    printf '%s' "$job_name"
 }
 
 # Renders the four --review-loop-only ConfigMap keys: the review and fix
@@ -5149,11 +5189,44 @@ cmd_wait() {
     local safe_name legacy_name pod_name
     safe_name="$(k8s_safe_name fork-sandbox-agent "$branch")"
     legacy_name="$(k8s_legacy_safe_name fork-sandbox-agent "$branch")"
-    pod_name="$(k8s_find_pod "$safe_name" "$legacy_name")"
-    if [[ -z "$pod_name" ]]; then
-        echo "Error: no pod found for branch '$branch' (job $safe_name). It may" >&2
-        echo "have already been fetched and removed, or the run never started." >&2
-        exit 2
+
+    # Every kubectl call on the probe path carries this bound, capped at
+    # 10s, so a single hung API server call cannot block past --timeout
+    # (or hang forever, absent this, if the API never answers at all).
+    local probe_req_timeout=10
+    if [[ "$probe" == true ]] && (( probe_req_timeout > timeout )); then
+        probe_req_timeout=$timeout
+    fi
+    local -a probe_kubectl_opts=()
+    [[ "$probe" == true ]] && probe_kubectl_opts=(--request-timeout="${probe_req_timeout}s")
+
+    if [[ "$probe" == true ]]; then
+        if ! pod_name="$(k8s_probe_find_pod "$safe_name" "$legacy_name" "$probe_req_timeout")"; then
+            echo "Error: fork-sandbox-k8s: cannot reach the cluster to probe branch $branch" >&2
+            exit 4
+        fi
+        if [[ -z "$pod_name" ]]; then
+            local job_name
+            if ! job_name="$(k8s_probe_find_job "$safe_name" "$legacy_name" "$probe_req_timeout")"; then
+                echo "Error: fork-sandbox-k8s: cannot reach the cluster to probe branch $branch" >&2
+                exit 4
+            fi
+            if [[ -n "$job_name" ]]; then
+                # The Job outlives its pod across an eviction, or a pod
+                # not yet scheduled -- not terminal, probe again.
+                exit 1
+            fi
+            echo "Error: no pod found for branch '$branch' (job $safe_name). It may" >&2
+            echo "have already been fetched and removed, or the run never started." >&2
+            exit 2
+        fi
+    else
+        pod_name="$(k8s_find_pod "$safe_name" "$legacy_name")"
+        if [[ -z "$pod_name" ]]; then
+            echo "Error: no pod found for branch '$branch' (job $safe_name). It may" >&2
+            echo "have already been fetched and removed, or the run never started." >&2
+            exit 2
+        fi
     fi
 
     if [[ "$probe" != true ]]; then
@@ -5169,7 +5242,7 @@ cmd_wait() {
         # One kubectl exec per probe, as the header comment promises -- this
         # single call both checks for the sentinel and reads it, so a
         # completed run needs no second round trip.
-        if run_complete="$(kubectl exec "$pod_name" -- cat /work/.run-complete 2>/dev/null)"; then
+        if run_complete="$(kubectl exec "${probe_kubectl_opts[@]}" "$pod_name" -- cat /work/.run-complete 2>/dev/null)"; then
             break
         fi
 
@@ -5189,7 +5262,7 @@ cmd_wait() {
         # collect reads the outbox the same way, and exec cannot run
         # against an exited container -- so nothing this tool offers can
         # reach what is left in the pod's /work volume.
-        phase="$(kubectl get pod "$pod_name" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+        phase="$(kubectl get pod "${probe_kubectl_opts[@]}" "$pod_name" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
         if [[ "$phase" == Failed ]]; then
             echo "Error: pod $pod_name is Failed -- it died before writing" >&2
             echo "/work/.run-complete. Inspect it with:" >&2
@@ -5214,7 +5287,7 @@ cmd_wait() {
             echo "  fork-sandbox-k8s.sh rm --branch $branch" >&2
             exit 2
         fi
-        job_failed="$(kubectl get job "$safe_name" \
+        job_failed="$(kubectl get job "${probe_kubectl_opts[@]}" "$safe_name" \
             -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null || true)"
         if [[ "$job_failed" == True ]]; then
             echo "Error: job $safe_name reports a Failed condition -- it" >&2
@@ -5249,7 +5322,18 @@ cmd_wait() {
             echo "fork-sandbox-k8s: still waiting on branch $branch (${elapsed}s elapsed)" >&2
             last_report_ts=$now
         fi
-        sleep 10
+        if [[ "$probe" == true ]]; then
+            # Never sleep past the deadline: a --probe --timeout 5 must not
+            # block for a full 10s poll interval against a still-running
+            # pod.
+            local remaining poll=10
+            (( remaining = timeout - elapsed ))
+            (( remaining < poll )) && poll=$remaining
+            (( poll < 0 )) && poll=0
+            sleep "$poll"
+        else
+            sleep 10
+        fi
     done
 
     if [[ ! "$run_complete" =~ ^[0-9]+$ ]]; then

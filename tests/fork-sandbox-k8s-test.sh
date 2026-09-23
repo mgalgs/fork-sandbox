@@ -6192,7 +6192,20 @@ cat > "$waitstub_dir/kubectl" <<'STUB'
 printf '%s\n' "$*" >> "$K8S_STUB_LOG"
 case " $* " in
     *" get pod -l job-name="*)
+        # K8S_STUB_POD_GET_RC simulates the API refusing/failing to answer
+        # this lookup at all -- distinct from a successful-but-empty
+        # answer (no K8S_STUB_POD_NAME), which is a determinate "no pod".
+        [[ -n "${K8S_STUB_POD_GET_RC:-}" ]] && exit "$K8S_STUB_POD_GET_RC"
         [[ -n "${K8S_STUB_POD_NAME:-}" ]] && printf '%s\n' "$K8S_STUB_POD_NAME"
+        exit 0 ;;
+    *" get job "*"--ignore-not-found -o name"*)
+        # The probe-only Job existence check (k8s_probe_find_job):
+        # K8S_STUB_JOB_GET_RC simulates the API failing this call;
+        # K8S_STUB_JOB_EXISTS=1 answers "still exists", anything else
+        # answers "" (kubectl's own --ignore-not-found behavior for a
+        # missing Job).
+        [[ -n "${K8S_STUB_JOB_GET_RC:-}" ]] && exit "$K8S_STUB_JOB_GET_RC"
+        [[ "${K8S_STUB_JOB_EXISTS:-}" == 1 ]] && printf 'job.batch/stub-job\n'
         exit 0 ;;
     *" get pod "*)
         printf '%s' "${K8S_STUB_POD_PHASE:-Running}"
@@ -6213,6 +6226,15 @@ waitstub_wait() {
     # answers (sentinel value/rc, pod phase, job condition).
     local log="$1" out="$2" err="$3"; shift 3
     K8S_STUB_POD_NAME="${K8S_STUB_POD_NAME:-stub-pod}" \
+    PATH="$waitstub_dir:$PATH" K8S_STUB_LOG="$log" \
+    FORK_SANDBOX_CONFIG_DIR="$config_dir" \
+    "$k8s_sh" wait "$@" > "$out" 2> "$err"
+}
+# Same as waitstub_wait, but with no default for K8S_STUB_POD_NAME -- an
+# empty/unset value here really means "kubectl answered: no pod", the case
+# waitstub_wait's own always-stub-pod default can never exercise.
+waitstub_wait_nopod() {
+    local log="$1" out="$2" err="$3"; shift 3
     PATH="$waitstub_dir:$PATH" K8S_STUB_LOG="$log" \
     FORK_SANDBOX_CONFIG_DIR="$config_dir" \
     "$k8s_sh" wait "$@" > "$out" 2> "$err"
@@ -6330,6 +6352,109 @@ if (( rc == 2 )) && grep -q 'pod stub-pod is Succeeded -- the run completed and'
     ok "a Succeeded pod fails the wait with the terminal code 2, without fetch advice"
 else
     no "a Succeeded pod fails the wait with the terminal code 2, without fetch advice" "rc=$rc: $(cat "$wait_err6")"
+fi
+
+# 7. --probe: the pod lookup itself cannot reach the cluster (kubectl
+# fails, not just an empty answer) -- this is NOT the same as "no pod",
+# and must not be read as one: exit 4, the run's state is unknown.
+wait_log7="$(newdir)/kubectl.log"; wait_out7="$(newdir)/out7.txt"; wait_err7="$(newdir)/err7.txt"
+tmpdirs+=("$(dirname "$wait_log7")")
+rc=0
+K8S_STUB_POD_GET_RC=1 \
+    waitstub_wait_nopod "$wait_log7" "$wait_out7" "$wait_err7" \
+    --branch fs-k8s-test-wait-probe-unreachable --timeout 5 --probe || rc=$?
+if (( rc == 4 )) && grep -q 'cannot reach the cluster to probe branch' "$wait_err7"; then
+    ok "--probe: an unreachable API on the pod lookup exits 4, not 2"
+else
+    no "--probe: an unreachable API on the pod lookup exits 4, not 2" "rc=$rc: $(cat "$wait_err7")"
+fi
+
+# 8. --probe: no pod, but the Job still exists (evicted pod, or not yet
+# scheduled) -- not terminal, probe again (exit 1).
+wait_log8="$(newdir)/kubectl.log"; wait_out8="$(newdir)/out8.txt"; wait_err8="$(newdir)/err8.txt"
+tmpdirs+=("$(dirname "$wait_log8")")
+rc=0
+K8S_STUB_JOB_EXISTS=1 \
+    waitstub_wait_nopod "$wait_log8" "$wait_out8" "$wait_err8" \
+    --branch fs-k8s-test-wait-probe-nopod-job --timeout 5 --probe || rc=$?
+if (( rc == 1 )) && [[ ! -s "$wait_err8" ]]; then
+    ok "--probe: no pod but the Job still exists is not terminal (exit 1)"
+else
+    no "--probe: no pod but the Job still exists is not terminal (exit 1)" "rc=$rc: $(cat "$wait_err8")"
+fi
+
+# 9. --probe: no pod AND no Job -- only this combination is terminal
+# (exit 2), unchanged from before finding 1.
+wait_log9="$(newdir)/kubectl.log"; wait_out9="$(newdir)/out9.txt"; wait_err9="$(newdir)/err9.txt"
+tmpdirs+=("$(dirname "$wait_log9")")
+rc=0
+waitstub_wait_nopod "$wait_log9" "$wait_out9" "$wait_err9" \
+    --branch fs-k8s-test-wait-probe-nopod-nojob --timeout 5 --probe || rc=$?
+if (( rc == 2 )) && grep -q 'no pod found for branch' "$wait_err9"; then
+    ok "--probe: no pod and no Job is terminal (exit 2)"
+else
+    no "--probe: no pod and no Job is terminal (exit 2)" "rc=$rc: $(cat "$wait_err9")"
+fi
+
+# 10. --probe: the Job lookup itself cannot reach the cluster -- exit 4,
+# same as the pod lookup failing.
+wait_log10="$(newdir)/kubectl.log"; wait_out10="$(newdir)/out10.txt"; wait_err10="$(newdir)/err10.txt"
+tmpdirs+=("$(dirname "$wait_log10")")
+rc=0
+K8S_STUB_JOB_GET_RC=1 \
+    waitstub_wait_nopod "$wait_log10" "$wait_out10" "$wait_err10" \
+    --branch fs-k8s-test-wait-probe-job-unreachable --timeout 5 --probe || rc=$?
+if (( rc == 4 )) && grep -q 'cannot reach the cluster to probe branch' "$wait_err10"; then
+    ok "--probe: an unreachable API on the Job lookup exits 4"
+else
+    no "--probe: an unreachable API on the Job lookup exits 4" "rc=$rc: $(cat "$wait_err10")"
+fi
+
+# 11. The same failing pod-get stub, WITHOUT --probe, keeps today's exit
+# code: k8s_find_pod (unlike k8s_probe_find_pod) still swallows the
+# kubectl failure as "no pod" -- pinned so finding 1 never touches the
+# non-probe path.
+wait_log11="$(newdir)/kubectl.log"; wait_out11="$(newdir)/out11.txt"; wait_err11="$(newdir)/err11.txt"
+tmpdirs+=("$(dirname "$wait_log11")")
+rc=0
+K8S_STUB_POD_GET_RC=1 \
+    waitstub_wait_nopod "$wait_log11" "$wait_out11" "$wait_err11" \
+    --branch fs-k8s-test-wait-nonprobe-podfail --timeout 5 || rc=$?
+if (( rc == 2 )) && grep -q 'no pod found for branch' "$wait_err11" \
+    && ! grep -q -- '--request-timeout' "$wait_log11"; then
+    ok "non-probe wait: a failing pod-get keeps the old exit 2, no --request-timeout added"
+else
+    no "non-probe wait: a failing pod-get keeps the old exit 2, no --request-timeout added" \
+        "rc=$rc err=$(cat "$wait_err11") log=$(cat "$wait_log11")"
+fi
+
+# 12. --probe never sleeps past its own deadline: a still-running pod with
+# --probe --timeout 5 must return (exit 1) well under the old ~10s a
+# single unconditional poll-interval sleep would have cost.
+wait_log12="$(newdir)/kubectl.log"; wait_out12="$(newdir)/out12.txt"; wait_err12="$(newdir)/err12.txt"
+tmpdirs+=("$(dirname "$wait_log12")")
+rc=0
+SECONDS=0
+waitstub_wait "$wait_log12" "$wait_out12" "$wait_err12" \
+    --branch fs-k8s-test-wait-probe-nosleeppast --timeout 5 --probe || rc=$?
+wait12_elapsed=$SECONDS
+if (( rc == 1 )) && (( wait12_elapsed < 8 )); then
+    ok "--probe caps its poll sleep to the remaining deadline (${wait12_elapsed}s < 8s)"
+else
+    no "--probe caps its poll sleep to the remaining deadline" \
+        "rc=$rc elapsed=${wait12_elapsed}s: $(cat "$wait_err12")"
+fi
+
+# 13. Every kubectl call on the probe path carries --request-timeout,
+# capped at 10s: the pod lookup, the sentinel exec, and the per-poll phase
+# and Job-condition checks (test 12's still-running pod exercises all of
+# them at least once).
+wait12_rt_count="$(grep -c -- '--request-timeout=5s' "$wait_log12" || true)"
+if (( wait12_rt_count >= 3 )); then
+    ok "--probe: every kubectl call on the probe path carries --request-timeout"
+else
+    no "--probe: every kubectl call on the probe path carries --request-timeout" \
+        "count=$wait12_rt_count: $(cat "$wait_log12")"
 fi
 
 printf '\n== fork-sandbox-k8s.sh collect: direct drive vs stubbed kubectl ==\n'
