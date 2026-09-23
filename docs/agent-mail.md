@@ -945,13 +945,13 @@ mktemp+mv rewrite on every write, never a partial one:
 | Field | Meaning |
 |---|---|
 | `TRIGGER` | the message id whose wake is being held |
-| `SINCE` | epoch seconds the seat started waiting on this trigger — kept across a re-check of the same trigger, reset when a newer message supersedes it |
+| `SINCE` | epoch seconds the record was first created, kept across a superseding `TRIGGER` |
 | `RETRY` | `1` when this hold was entered from `pm_retry_pass` firing an already-scheduled retry into it, else `0` |
 
 Created the first time a `backend: k8s`, `grant: required` seat's wake
 would otherwise spawn with no grant file present. A new message addressed
 to a held seat supersedes the record (`TRIGGER` moves to the new message,
-`SINCE` resets). Deleted on release, by `pm_held_pass`, once the grant
+`SINCE` stays). Deleted on release, by `pm_held_pass`, once the grant
 file exists or the seat no longer resolves `grant: required` at all — see
 "Cluster seats" below.
 

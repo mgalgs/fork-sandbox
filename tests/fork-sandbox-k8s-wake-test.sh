@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# fork-sandbox-k8s-wake-test.sh — Exercise fork-sandbox-k8s-wake.sh's
+# fork-sandbox-k8s-wake-test.sh -- Exercise fork-sandbox-k8s-wake.sh's
 # foreground run (pid/launch.log/k8s-run-dir/exit-code/summary.json
 # normalization) and its --detach entry point, against a stub launcher
 # and a stub fork-sandbox-k8s.sh, never a real cluster.
@@ -221,6 +221,30 @@ STUB
         esac
     else
         no "env: dump written" "$dump missing"
+    fi
+}
+
+# ---- case: an inherited stale FORK_SANDBOX_* var is scrubbed, not leaked ----
+{
+    root=""
+    setup_root root
+    write_nul "$root/wake/fs-argv" \
+        "$root/bin/launcher.sh" --branch "test-branch-stale" \
+        --outbox-dir "$root/wake/outbox"
+    write_nul "$root/wake/env" "GOOD_VAR=hello"
+    dump="$root/env-dump-stale.txt"
+    ( export FORK_SANDBOX_STALE=old-value
+      STUB_ENV_DUMP="$dump" STUB_K8S_LAUNCH_RC=0 \
+        "$root/bin/fork-sandbox-k8s-wake.sh" "$root/wake" ) >/dev/null
+    if [[ -f "$dump" ]]; then
+        contains "stale env: good record still exported" "$(cat -- "$dump")" "GOOD_VAR=hello"
+        case "$(cat -- "$dump")" in
+            *"FORK_SANDBOX_STALE"*) no "stale env: inherited FORK_SANDBOX_* scrubbed" \
+                "FORK_SANDBOX_STALE leaked into launcher env" ;;
+            *) ok "stale env: inherited FORK_SANDBOX_* scrubbed" ;;
+        esac
+    else
+        no "stale env: dump written" "$dump missing"
     fi
 }
 

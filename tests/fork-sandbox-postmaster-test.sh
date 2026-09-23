@@ -5072,10 +5072,14 @@ check "k8s case7: still holding a record" 1 \
 k8a_mid="$(send_msg '@carol' '@karl' 'supersede topic' 'first' 8)"
 k8_tid="$(thread_of "$k8a_mid")"
 once
+k8_since_before="$(env_val "$PM_STATE_DIR/held/$k8_tid/karl" SINCE)"
+sleep 1
 k8b_mid="$(reply_msg '@carol' "$k8a_mid" 'second message')"
 once
 contains "k8s case8: the held record's TRIGGER moved to the new mid" \
     "$(cat "$PM_STATE_DIR/held/$k8_tid/karl" 2>/dev/null)" "TRIGGER=$k8b_mid"
+check "k8s case8: the held record's SINCE survives the supersede" \
+    "$k8_since_before" "$(env_val "$PM_STATE_DIR/held/$k8_tid/karl" SINCE)"
 
 "$MAIL" grant "$k8_tid" --allow-namespace ns-a --reach-probe svc.ns-a:80 >/dev/null 2>&1
 : > "$STUB_ARGV_LOG"

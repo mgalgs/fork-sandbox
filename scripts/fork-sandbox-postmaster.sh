@@ -2177,7 +2177,7 @@ pm_spawn_wake() {
         if [[ ! -e "$grant_file" ]]; then
             local held_file="$STATE/held/$tid/$agent" old_trigger="" since retry_flag=0
             old_trigger="$(fs_pm_env_get "$held_file" TRIGGER)"
-            if [[ "$old_trigger" == "$mid" ]]; then
+            if [[ -e "$held_file" ]]; then
                 since="$(fs_pm_env_get "$held_file" SINCE)"
             else
                 since="$(date +%s)"

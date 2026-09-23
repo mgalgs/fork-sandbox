@@ -20,7 +20,10 @@
 #             rest its arguments.
 #   env       NUL-delimited KEY=VALUE records to export before running.
 #             Parsed strictly: a record is honored only when KEY matches
-#             ^[A-Za-z_][A-Za-z0-9_]*$ -- never sourced or eval'd.
+#             ^[A-Za-z_][A-Za-z0-9_]*$ -- never sourced or eval'd. Every
+#             inherited FORK_SANDBOX_* variable is unset first, so a value
+#             left over in a long-lived tmux server's own environment can
+#             never outlive the postmaster that used to set it.
 #
 # Foreground mode (no --detach) blocks until the launch finishes and
 # leaves, in <wake-dir>:
@@ -113,6 +116,18 @@ fs_k8s_wake_run() {
         echo "Error: fork-sandbox-k8s-wake: $wake_dir/fs-argv is empty or missing." >&2
         exit 1
     fi
+
+    # tmux's detached session inherits whatever the tmux SERVER's own
+    # environment was when it first started -- not this process's current
+    # one -- so a long-lived server can still be carrying a FORK_SANDBOX_*
+    # value a later postmaster no longer sets (or sets differently). Clear
+    # every inherited FORK_SANDBOX_* key before applying the ones the
+    # postmaster actually wrote to `env`, so a stale value can never leak
+    # through unnoticed.
+    local stale_var
+    for stale_var in "${!FORK_SANDBOX_@}"; do
+        unset "$stale_var"
+    done
 
     local -a env_records
     fs_k8s_wake_read_nul env_records "$wake_dir/env"
