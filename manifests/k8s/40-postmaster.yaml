@@ -1,0 +1,273 @@
+---
+# The cluster postmaster: a single-replica Deployment running the same
+# fork-sandbox-postmaster.sh a laptop runs, so a review panel keeps working
+# with no laptop on. __NAMESPACE__, __PM_IMAGE__, __PM_ACCESS_MODE__,
+# __PM_STORAGE__, __PM_STORAGE_CLASS__ and __PM_CONFIG_CHECKSUM__ are
+# placeholder tokens; fork-sandbox-k8s.sh's `install --postmaster`
+# substitutes them from K8S_NAMESPACE and the K8S_POSTMASTER_* keys in
+# k8s.env before applying. This file is skipped by plain `install` (the
+# same way 31-claude-proxy.yaml is) since those placeholders have no value
+# to take without --postmaster.
+#
+# The trick that keeps this small: the PVC below is mounted at the exact
+# paths a laptop postmaster uses (/var/tmp/claude-scratch, $HOME/src,
+# $HOME/.claude) and the config ConfigMap at $HOME/.config/fork-sandbox, so
+# the postmaster, fork-sandbox-k8s.sh, agent-mail and the wake script need
+# no path changes at all to run here. See docs/cluster-postmaster.md.
+#
+# This identity (the ServiceAccount/Role/RoleBinding below) can read every
+# Secret in this namespace: the Role lists `secrets` with get/list/watch,
+# because the cleanup path (submit and rm's label-based delete of
+# `pod,service,secret,configmap,networkpolicy`) needs list and delete on
+# secrets even on a pi-only run. That is not a new exposure -- anything
+# that can create a Job can already mount any Secret in its own namespace
+# by naming it in that Job's spec, whether or not its own Role lists
+# `secrets` -- but it does mean `kubectl exec` into this pod reaches every
+# credential in the namespace, so keep that to cluster admins. See
+# manifests/k8s/10-rbac.yaml for the client Role, which grants the same
+# rules for the same reason.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fork-sandbox-postmaster
+  namespace: __NAMESPACE__
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: fork-sandbox-postmaster
+  namespace: __NAMESPACE__
+rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch", "create", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "create", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["configmaps", "services", "secrets"]
+    verbs: ["get", "list", "watch", "create", "patch", "delete"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["get", "list", "watch", "create", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: fork-sandbox-postmaster
+  namespace: __NAMESPACE__
+subjects:
+  - kind: ServiceAccount
+    name: fork-sandbox-postmaster
+    namespace: __NAMESPACE__
+roleRef:
+  kind: Role
+  name: fork-sandbox-postmaster
+  apiGroup: rbac.authorization.k8s.io
+---
+# storageClassName is a whole-line placeholder: `install --postmaster`
+# strips the line entirely when K8S_POSTMASTER_STORAGE_CLASS is empty, so
+# the PVC falls back to the cluster's default StorageClass rather than
+# naming one that does not exist.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: fork-sandbox-postmaster
+  namespace: __NAMESPACE__
+spec:
+  accessModes:
+    - __PM_ACCESS_MODE__
+  resources:
+    requests:
+      storage: __PM_STORAGE__
+  storageClassName: __PM_STORAGE_CLASS__
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fork-sandbox-postmaster
+  namespace: __NAMESPACE__
+  labels:
+    app: fork-sandbox-postmaster
+spec:
+  replicas: 1
+  # A single writer: the mail store's lock is a local flock, which only
+  # protects against concurrent access within one pod. Recreate tears the
+  # old pod down before the new one starts, so two postmaster processes
+  # are never up against the same PVC at once; RollingUpdate would overlap
+  # them.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: fork-sandbox-postmaster
+  template:
+    metadata:
+      labels:
+        app: fork-sandbox-postmaster
+      annotations:
+        # A hash of the rendered config ConfigMaps, filled in by `install
+        # --postmaster` at render time. Annotating the POD TEMPLATE (not
+        # the Deployment's own metadata) is what makes a config-only change
+        # roll the pod -- see 30-proxy.yaml's checksum/nginx-conf annotation
+        # for the same reasoning, measured against a live cluster there.
+        fork-sandbox/config-checksum: "__PM_CONFIG_CHECKSUM__"
+    spec:
+      serviceAccountName: fork-sandbox-postmaster
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        # kubelet creates a subPath directory that does not yet exist on
+        # first mount, but as root -- so the main container, running as
+        # uid 1000 with a read-only root filesystem, could find
+        # /var/tmp/claude-scratch (etc.) owned by root and unwritable.
+        # Creating the three subPath directories ourselves, as uid 1000,
+        # before the main container starts avoids that.
+        - name: pvc-dirs
+          image: __PM_IMAGE__
+          imagePullPolicy: IfNotPresent
+          command: ["mkdir", "-p", "/data/scratch", "/data/src", "/data/home-claude"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      containers:
+        - name: postmaster
+          image: __PM_IMAGE__
+          imagePullPolicy: IfNotPresent
+          command: ["fork-sandbox-postmaster-pod-init.sh"]
+          env:
+            - name: HOME
+              value: /home/fs
+            # >>> personas env
+            - name: FORK_SANDBOX_PERSONAS_DIR
+              value: /etc/fork-sandbox/personas
+            # <<< personas env
+            # >>> prompts env
+            - name: FORK_SANDBOX_PROMPTS_DIR
+              value: /etc/fork-sandbox/prompts
+            # <<< prompts env
+            # >>> handlers env
+            - name: FORK_SANDBOX_HANDLERS_DIR
+              value: /etc/fork-sandbox/handlers
+            # <<< handlers env
+            # >>> presets env
+            - name: FORK_SANDBOX_PRESETS_DIR
+              value: /etc/fork-sandbox/presets
+          # <<< presets env
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          # Mounts nest over the emptyDir $HOME below: /home/fs/src and
+          # /home/fs/.claude are subPath mounts inside the same /home/fs
+          # an earlier mount in this list already covers, which Kubernetes
+          # supports (the more specific mountPath simply takes over that
+          # subtree).
+          volumeMounts:
+            - name: home
+              mountPath: /home/fs
+            - name: tmp
+              mountPath: /tmp
+            - name: data
+              mountPath: /var/tmp/claude-scratch
+              subPath: scratch
+            - name: data
+              mountPath: /home/fs/src
+              subPath: src
+            - name: data
+              mountPath: /home/fs/.claude
+              subPath: home-claude
+            - name: config
+              mountPath: /home/fs/.config/fork-sandbox
+              readOnly: true
+            - name: git
+              mountPath: /etc/fork-sandbox/git
+              readOnly: true
+            # >>> personas volumeMount
+            - name: personas
+              mountPath: /etc/fork-sandbox/personas
+              readOnly: true
+            # <<< personas volumeMount
+            # >>> prompts volumeMount
+            - name: prompts
+              mountPath: /etc/fork-sandbox/prompts
+              readOnly: true
+            # <<< prompts volumeMount
+            # >>> handlers volumeMount
+            - name: handlers
+              mountPath: /etc/fork-sandbox/handlers
+              readOnly: true
+            # <<< handlers volumeMount
+            # >>> presets volumeMount
+            - name: presets
+              mountPath: /etc/fork-sandbox/presets
+              readOnly: true
+      # <<< presets volumeMount
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: fork-sandbox-postmaster
+        - name: home
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+        - name: config
+          configMap:
+            name: fork-sandbox-postmaster-config
+        - name: git
+          secret:
+            secretName: fork-sandbox-postmaster-git
+            defaultMode: 0440
+        # >>> personas volume
+        - name: personas
+          configMap:
+            name: fork-sandbox-postmaster-personas
+        # <<< personas volume
+        # >>> prompts volume
+        - name: prompts
+          configMap:
+            name: fork-sandbox-postmaster-prompts
+        # <<< prompts volume
+        # >>> handlers volume
+        - name: handlers
+          configMap:
+            name: fork-sandbox-postmaster-handlers
+            defaultMode: 0555
+        # <<< handlers volume
+        # >>> presets volume
+        - name: presets
+          configMap:
+            name: fork-sandbox-postmaster-presets
+            # <<< presets volume
