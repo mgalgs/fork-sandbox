@@ -1312,15 +1312,25 @@ k8s_find_pod() {
 # past $3 seconds. Prints the pod name (possibly empty, when kubectl did
 # answer) on stdout and returns 0, or prints nothing and returns 1 on any
 # kubectl failure.
+#
+# Deliberately uses {.items[*]...}, NOT {.items[0]...}: kubectl's jsonpath
+# engine treats an out-of-range index as a template error (exit 1, "array
+# index out of bounds") on a genuinely empty, successfully-fetched list --
+# indistinguishable from a real API failure, which is exactly the
+# distinction this function exists to make. {.items[*]...} returns exit 0
+# with empty output for an empty list instead, so a real kubectl failure
+# stays a kubectl failure.
 k8s_probe_find_pod() {
     local safe_name="$1" legacy_name="$2" req_timeout="$3" pod_name
     pod_name="$(kubectl get pod -l "job-name=$safe_name" \
         --request-timeout="${req_timeout}s" \
-        -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)" || return 1
+        -o jsonpath='{.items[*].metadata.name}' 2>/dev/null)" || return 1
+    pod_name="${pod_name%% *}"
     if [[ -z "$pod_name" && "$legacy_name" != "$safe_name" ]]; then
         pod_name="$(kubectl get pod -l "job-name=$legacy_name" \
             --request-timeout="${req_timeout}s" \
-            -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)" || return 1
+            -o jsonpath='{.items[*].metadata.name}' 2>/dev/null)" || return 1
+        pod_name="${pod_name%% *}"
     fi
     printf '%s' "$pod_name"
 }

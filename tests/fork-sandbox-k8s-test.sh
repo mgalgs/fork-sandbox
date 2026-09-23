@@ -6262,7 +6262,21 @@ case " $* " in
         # this lookup at all -- distinct from a successful-but-empty
         # answer (no K8S_STUB_POD_NAME), which is a determinate "no pod".
         [[ -n "${K8S_STUB_POD_GET_RC:-}" ]] && exit "$K8S_STUB_POD_GET_RC"
-        [[ -n "${K8S_STUB_POD_NAME:-}" ]] && printf '%s\n' "$K8S_STUB_POD_NAME"
+        if [[ -n "${K8S_STUB_POD_NAME:-}" ]]; then
+            printf '%s\n' "$K8S_STUB_POD_NAME"
+            exit 0
+        fi
+        # No matching pod. Real kubectl's exit code on a genuinely empty
+        # PodList depends on the jsonpath template: {.items[0]...} is a
+        # template error (array index out of bounds) that exits 1, while
+        # {.items[*]...} succeeds with empty output. Mimic that split so
+        # a probe-path regression to the [0] form (finding 1) fails this
+        # suite instead of passing it.
+        case " $* " in
+            *'items[0]'*)
+                echo 'error: error executing jsonpath "{.items[0].metadata.name}": Error executing template: array index out of bounds: index 0, length 0' >&2
+                exit 1 ;;
+        esac
         exit 0 ;;
     *" get job "*"--ignore-not-found -o name"*)
         # The probe-only Job existence check (k8s_probe_find_job):
