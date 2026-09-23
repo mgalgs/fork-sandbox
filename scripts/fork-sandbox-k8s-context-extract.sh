@@ -23,7 +23,9 @@
 #      the whole archive -- no partial extraction -- if any entry is an
 #      absolute path, contains a `..` path component, or is a symlink or
 #      hard link of any kind.
-#   3. Only then extract, into a freshly created directory, stripping
+#   3. Only then extract, into a freshly created directory (or an
+#      existing, EMPTY one -- an emptyDir volume the pod spec already
+#      mounted there, for a --thread-dir/--attach-dir push), stripping
 #      ownership and permission bits from the archive.
 #
 # Someone will later think step 2 is redundant with tar's own
@@ -67,8 +69,11 @@
 # an inherited environment variable can carry a stray value into an
 # invocation nobody meant it for, and argv cannot.
 #
-#   context (default) -- fork-sandbox-k8s.sh's --context-ro push, over the
-#     kubectl-exec/stdin channel: 256 MiB, matching its own CONTEXT_MAX_BYTES.
+#   context (default) -- fork-sandbox-k8s.sh's --context-ro, --thread-dir
+#     and --attach-dir pushes, over the kubectl-exec/stdin channel: 256 MiB,
+#     matching its own CONTEXT_MAX_BYTES. --thread-dir/--attach-dir reuse
+#     this literal CALLER rather than adding their own arms -- the ceiling
+#     is identical either way, so a new arm would be pure duplication.
 #   outbox -- fork-sandbox-k8s-outbox-extract.sh's own wrapper, which runs
 #     entirely on the host against a tar already on disk (FS_EXTRACT_INPUT_FILE):
 #     no ceiling, since --outbox-max is documented as having none.
@@ -176,15 +181,26 @@ while IFS= read -r path; do
     esac
 done < "$tf_out"
 
-# Freshly created: mkdir, not mkdir -p, so this fails loudly if dest_dir
-# already exists rather than merging a second push into a first. Named
-# explicitly here rather than left to mkdir's own generic "File exists"
-# message, so a caller (and a test) can pin what refused it.
+# Freshly created (mkdir, not mkdir -p), UNLESS DEST_DIR already exists as
+# an empty directory -- fork-sandbox-k8s.sh's --thread-dir/--attach-dir
+# push targets an emptyDir volume the pod spec already mounted there, so
+# DEST_DIR pre-exists on every one of those pushes and mkdir would fail on
+# the mount point itself. An existing NON-empty directory is still
+# refused: that is still a second push merging into a first, the case
+# this check exists for. --context-ro's own destination (POD_CONTEXT_DIR)
+# never pre-exists, so this leaves its behaviour unchanged.
 if [ -e "$dest_dir" ]; then
-    echo "$label: DEST_DIR '$dest_dir' already exists; refusing." >&2
-    exit 1
+    if [ ! -d "$dest_dir" ]; then
+        echo "$label: DEST_DIR '$dest_dir' exists and is not a directory; refusing." >&2
+        exit 1
+    fi
+    if [ -n "$(find "$dest_dir" -mindepth 1 -print -quit)" ]; then
+        echo "$label: DEST_DIR '$dest_dir' already exists and is not empty; refusing." >&2
+        exit 1
+    fi
+else
+    mkdir -- "$dest_dir"
 fi
-mkdir -- "$dest_dir"
 
 # Never as anyone but the invoking user -- no sudo, nothing
 # privilege-related; --no-same-owner/--no-same-permissions strip whatever

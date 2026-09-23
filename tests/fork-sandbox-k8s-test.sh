@@ -5085,6 +5085,191 @@ else
 fi
 rm -f /tmp/fs-k8s-test-cr-exec.out
 
+# --thread-dir/--attach-dir: same transport as --context-ro (spooled tar,
+# kubectl exec through the same extractor, same CONTEXT_MAX_BYTES cap,
+# checked before --dry-run's early exit), but validated with
+# fs_validate_scratch_dir's whole-scratch-root rule, not --context-ro's
+# narrower forks/-only rule -- the postmaster stages these under its mail
+# root, which is under the scratch root but not under forks/, so
+# --context-ro's own rule would refuse every real wake. One function, run
+# for each flag, to avoid two near-identical copies of the same battery.
+td_test_scratch_push() {
+    local flag="$1" pod_path="$2" tag="$3"
+    local d wf_out rc
+    d="$(mktemp -d "/var/tmp/claude-scratch/fs-k8s-test-${tag}.XXXXXX")"; tmpdirs+=("$d")
+    printf 'gathered notes\n' > "$d/notes.md"
+
+    wf_out="$(newdir)/${tag}-submit.yaml"; tmpdirs+=("$(dirname "$wf_out")")
+    if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+        --branch "fs-k8s-test-${tag}-branch" --model moonshotai/kimi-k3 "$flag" "$d" \
+        "$proj_dir" "$handoff_file" > "$wf_out" 2>"/tmp/fs-k8s-test-${tag}.err"; then
+        ok "submit --dry-run $flag exits 0"
+    else
+        no "submit --dry-run $flag exits 0" "$(cat "/tmp/fs-k8s-test-${tag}.err")"
+    fi
+    rm -f "/tmp/fs-k8s-test-${tag}.err"
+
+    if grep -qF "mountPath: $pod_path" "$wf_out"; then
+        ok "submit $flag renders the emptyDir mount at $pod_path"
+    else
+        no "submit $flag renders the emptyDir mount at $pod_path" "not found in $wf_out"
+    fi
+    if grep -qF "mountPath: $pod_path" "$submit_out"; then
+        no "submit without $flag renders no mount at $pod_path" "found in $submit_out"
+    else
+        ok "submit without $flag renders no mount at $pod_path"
+    fi
+
+    # Outside the whole scratch root: refused by name, before any kubectl call.
+    local outside; outside="$(mktemp -d)"; tmpdirs+=("$outside")
+    refuses "submit $flag outside the scratch root is refused" \
+        "must name a directory under" \
+        env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+        --branch "fs-k8s-test-$tag-bad" --model moonshotai/kimi-k3 "$flag" "$outside" \
+        "$proj_dir" "$handoff_file"
+
+    # Missing directory: refused even though its name is under the scratch root.
+    refuses "submit $flag on a missing directory is refused" \
+        "does not exist" \
+        env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+        --branch "fs-k8s-test-${tag}-missing" --model moonshotai/kimi-k3 \
+        "$flag" "/var/tmp/claude-scratch/fs-k8s-test-${tag}-missing-xyz" \
+        "$proj_dir" "$handoff_file"
+
+    # A dir under the scratch root but OUTSIDE forks/ is ACCEPTED -- the
+    # case that distinguishes this flag's rule from --context-ro's.
+    local outside_forks; outside_forks="$(mktemp -d "/var/tmp/claude-scratch/fs-k8s-test-${tag}-outside-forks.XXXXXX")"; tmpdirs+=("$outside_forks")
+    printf 'x\n' > "$outside_forks/f.txt"
+    if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+        --branch "fs-k8s-test-${tag}-of" --model moonshotai/kimi-k3 "$flag" "$outside_forks" \
+        "$proj_dir" "$handoff_file" >"/tmp/fs-k8s-test-${tag}-of.out" 2>&1; then
+        ok "submit $flag under the scratch root but outside forks/ is accepted"
+    else
+        no "submit $flag under the scratch root but outside forks/ is accepted" \
+            "$(cat "/tmp/fs-k8s-test-${tag}-of.out")"
+    fi
+    rm -f "/tmp/fs-k8s-test-${tag}-of.out"
+
+    # Symlink: refused on the host, before the Job is ever created.
+    local sym_dir; sym_dir="$(mktemp -d "/var/tmp/claude-scratch/fs-k8s-test-${tag}-sym.XXXXXX")"; tmpdirs+=("$sym_dir")
+    ln -s /etc/passwd "$sym_dir/evil"
+    refuses "submit $flag containing a symlink is refused" \
+        "contains a symlink" \
+        env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+        --branch "fs-k8s-test-${tag}-sym" --model moonshotai/kimi-k3 "$flag" "$sym_dir" \
+        "$proj_dir" "$handoff_file"
+
+    # Hard link: refused on the host too, same reason as --context-ro's own check.
+    local hl_dir; hl_dir="$(mktemp -d "/var/tmp/claude-scratch/fs-k8s-test-${tag}-hl.XXXXXX")"; tmpdirs+=("$hl_dir")
+    printf 'x\n' > "$hl_dir/f.txt"
+    ln "$hl_dir/f.txt" "$hl_dir/g.txt"
+    refuses "submit $flag containing a hard link is refused" \
+        "contains a hard-linked file" \
+        env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+        --branch "fs-k8s-test-${tag}-hl" --model moonshotai/kimi-k3 "$flag" "$hl_dir" \
+        "$proj_dir" "$handoff_file"
+
+    # run --dry-run forwards to submit rather than growing a divergent copy.
+    local run_out; run_out="$(newdir)/${tag}-run.yaml"; tmpdirs+=("$(dirname "$run_out")")
+    if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" run --dry-run \
+        --branch "fs-k8s-test-${tag}-branch" --model moonshotai/kimi-k3 "$flag" "$d" \
+        "$proj_dir" "$handoff_file" > "$run_out" 2>"/tmp/fs-k8s-test-${tag}-run.err"; then
+        ok "run --dry-run $flag exits 0"
+    else
+        no "run --dry-run $flag exits 0" "$(cat "/tmp/fs-k8s-test-${tag}-run.err")"
+    fi
+    rm -f "/tmp/fs-k8s-test-${tag}-run.err"
+    check "run --dry-run $flag renders byte-for-byte the same as submit --dry-run $flag" \
+        "$(cat "$wf_out")" "$(cat "$run_out")"
+
+    # Over-cap: refused before any kubectl apply, same tar-stub trick as
+    # --context-ro's own over-cap test.
+    local big_dir order_stub order_log order_kubectl
+    big_dir="$(mktemp -d "/var/tmp/claude-scratch/fs-k8s-test-${tag}-big.XXXXXX")"; tmpdirs+=("$big_dir")
+    printf 'too large\n' > "$big_dir/file.txt"
+    order_stub="$(newdir)"; tmpdirs+=("$order_stub")
+    cat > "$order_stub/tar" <<'STUB'
+#!/usr/bin/env bash
+truncate -s $((256 * 1024 * 1024 + 1)) "$2"
+STUB
+    chmod +x "$order_stub/tar"
+    order_log="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$order_log")")
+    order_kubectl="$(newdir)/kubectl"; tmpdirs+=("$(dirname "$order_kubectl")")
+    cat > "$order_kubectl" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$K8S_STUB_LOG"
+STUB
+    chmod +x "$order_kubectl"
+    PATH="$order_stub:$(dirname "$order_kubectl"):$PATH" K8S_STUB_LOG="$order_log" \
+        FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit \
+        --branch "fs-k8s-test-${tag}-over-cap" --model moonshotai/kimi-k3 "$flag" "$big_dir" \
+        "$proj_dir" "$handoff_file" >"/tmp/fs-k8s-test-${tag}-big.out" 2>&1
+    rc=$?
+    if (( rc == 0 )); then
+        no "oversized $flag is refused before kubectl apply" "submit unexpectedly succeeded"
+    elif [[ ! -s "$order_log" ]] && grep -q 'over the .* byte' "/tmp/fs-k8s-test-${tag}-big.out"; then
+        ok "oversized $flag is refused before kubectl apply"
+    else
+        no "oversized $flag is refused before kubectl apply" \
+            "log=$(cat "$order_log") out=$(cat "/tmp/fs-k8s-test-${tag}-big.out")"
+    fi
+    rm -f "/tmp/fs-k8s-test-${tag}-big.out"
+
+    # The non-dry-run push issues an exec to the extractor with the right
+    # destination, before the sentinel exec -- mirrors --context-ro's own
+    # exec-failure-removes-tar fixture, adapted to confirm the destination
+    # and ordering rather than re-testing failure-cleanup a third time.
+    local exec_tmp exec_git exec_kubectl exec_log
+    exec_tmp="$(newdir)"; tmpdirs+=("$exec_tmp")
+    exec_git="$(newdir)/git"; tmpdirs+=("$(dirname "$exec_git")")
+    cat > "$exec_git" <<'STUB'
+#!/usr/bin/env bash
+case " $* " in
+    *" push "*) exit 0 ;;
+esac
+exec /usr/bin/git "$@"
+STUB
+    chmod +x "$exec_git"
+    exec_kubectl="$(newdir)/kubectl"; tmpdirs+=("$(dirname "$exec_kubectl")")
+    cat > "$exec_kubectl" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$K8S_STUB_LOG"
+verb=""; for arg in "$@"; do case "$arg" in apply|wait|exec|get) verb="$arg" ;; esac; done
+case "$verb" in
+    apply|wait) cat >/dev/null ;;
+    get) printf 'stub-pod\n' ;;
+    exec) cat >/dev/null ;;
+esac
+STUB
+    chmod +x "$exec_kubectl"
+    exec_log="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$exec_log")")
+    PATH="$(dirname "$exec_git"):$(dirname "$exec_kubectl"):$PATH" \
+        TMPDIR="$exec_tmp" K8S_STUB_LOG="$exec_log" \
+        FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit \
+        --branch "fs-k8s-test-${tag}-exec-order" --model moonshotai/kimi-k3 "$flag" "$d" \
+        "$proj_dir" "$handoff_file" >"/tmp/fs-k8s-test-${tag}-exec.out" 2>&1
+    rc=$?
+    if (( rc == 0 )) \
+        && grep -qF "exec -i stub-pod -- sh /mnt/fork-sandbox/context-extract.sh $pod_path" "$exec_log" \
+        && [[ "$(grep -n "exec -i stub-pod -- sh /mnt/fork-sandbox/context-extract.sh $pod_path" "$exec_log" | head -1 | cut -d: -f1)" \
+              -lt "$(grep -n "touch /work/.inputs-complete" "$exec_log" | head -1 | cut -d: -f1)" ]]; then
+        ok "the non-dry-run push for $flag execs the extractor at $pod_path before the sentinel"
+    else
+        no "the non-dry-run push for $flag execs the extractor at $pod_path before the sentinel" \
+            "rc=$rc log=$(cat "$exec_log") out=$(cat "/tmp/fs-k8s-test-${tag}-exec.out")"
+    fi
+    rm -f "/tmp/fs-k8s-test-${tag}-exec.out"
+}
+
+printf '\n== fork-sandbox-k8s.sh submit/run --dry-run --thread-dir ==\n'
+td_test_scratch_push --thread-dir /thread thread
+
+printf '\n== fork-sandbox-k8s.sh submit/run --dry-run --attach-dir ==\n'
+td_test_scratch_push --attach-dir /attachments attach
+
+printf '\n== fork-sandbox-k8s-context-extract.sh: existing-empty-destination acceptance is exercised above ==\n'
+# (covered in the extraction-guards section below, not repeated here.)
+
 printf '\n== fork-sandbox-k8s.sh run: poll/fetch/pull-back vs stubbed kubectl ==\n'
 # The sequence cmd_run drives after submit was previously only executable
 # against a live cluster (see this file's header); it is now driven end to
@@ -6622,12 +6807,33 @@ else
 fi
 rm -f /tmp/fs-k8s-ctx-phrase.err
 
-# refuses an existing DEST_DIR: a second push must not merge into a first.
+# An existing, EMPTY DEST_DIR is accepted -- the shape a --thread-dir/
+# --attach-dir push always sees, since the pod spec's emptyDir volume
+# mount pre-creates DEST_DIR before this script ever runs.
 cf_exist_dest="$cf_parent/exist_dest"
 mkdir -p "$cf_exist_dest"
-refuses "an existing DEST_DIR is refused" \
-    "already exists; refusing" \
-    "$context_extract_sh" "$cf_exist_dest" 100000000 < "$cf_wf_tar"
+if "$context_extract_sh" "$cf_exist_dest" 100000000 < "$cf_wf_tar" \
+        >/tmp/fs-k8s-ctx-exist.err 2>&1; then
+    ok "an existing EMPTY DEST_DIR is accepted"
+else
+    no "an existing EMPTY DEST_DIR is accepted" "$(cat /tmp/fs-k8s-ctx-exist.err)"
+fi
+if [[ "$(cat "$cf_exist_dest/foo.txt" 2>/dev/null)" == "hello" ]]; then
+    ok "an existing EMPTY DEST_DIR: the archive's files land inside it"
+else
+    no "an existing EMPTY DEST_DIR: the archive's files land inside it" \
+        "$(find "$cf_exist_dest" 2>&1)"
+fi
+rm -f /tmp/fs-k8s-ctx-exist.err
+
+# An existing NON-empty DEST_DIR is still refused: a second push must not
+# merge into a first.
+cf_nonempty_dest="$cf_parent/nonempty_dest"
+mkdir -p "$cf_nonempty_dest"
+touch "$cf_nonempty_dest/already-here.txt"
+refuses "an existing NON-EMPTY DEST_DIR is refused" \
+    "already exists and is not empty; refusing" \
+    "$context_extract_sh" "$cf_nonempty_dest" 100000000 < "$cf_wf_tar"
 
 # absolute path: refused outright, whole archive, before anything is
 # extracted -- the dest directory must not even be created.

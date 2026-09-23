@@ -6,7 +6,7 @@
 #                            [--endpoint NAME] [--harness pi|claude]
 #                            [--pi-args ARGS] [--review-loop N] [--review-model MODEL]
 #                            [--outbox-max SIZE]
-#                            [--context-ro DIR]
+#                            [--context-ro DIR] [--thread-dir DIR] [--attach-dir DIR]
 #                            [--checkout REF] [--services-trust-ref REF]
 #                            [--claude-credentials PATH]
 #                            [--label key=value]... [--task-meta JSON]
@@ -17,7 +17,7 @@
 #                            [--harness pi|claude] [--pi-args ARGS]
 #                            [--review-loop N] [--review-model MODEL]
 #                            [--outbox-dir DIR] [--outbox-max SIZE]
-#                            [--context-ro DIR]
+#                            [--context-ro DIR] [--thread-dir DIR] [--attach-dir DIR]
 #                            [--checkout REF] [--services-trust-ref REF]
 #                            [--claude-credentials PATH]
 #                            [--label key=value]... [--task-meta JSON]
@@ -229,6 +229,33 @@
 # subdirectory, so read-only here is enforced by the prompt text the agent
 # reads (a `## Gathered context` section appended to handoff.md), not by
 # the filesystem.
+#
+# --thread-dir DIR / --attach-dir DIR (submit, run): push DIR into the pod
+# at /thread / /attachments respectively -- the same in-pod paths a LOCAL
+# sandbox run binds these two flags to (fork-sandbox.sh's own --thread-dir
+# and --attach-dir), so the postmaster's generated prompt, which names
+# those paths, needs no idea which backend a wake landed on. Validated with
+# fs_validate_scratch_dir (the same whole-scratch-root rule
+# fork-sandbox.sh's local --attach-dir/--thread-dir apply, not
+# --context-ro's narrower forks/-only rule): the postmaster stages these
+# under its mail root, which sits under the scratch root but not under
+# forks/, so --context-ro's own rule would refuse every real wake.
+# Symlinks and hard-linked files inside DIR are refused for the same
+# tar-turns-a-link-into-a-link-entry reason --context-ro refuses them.
+# Transport mirrors --context-ro exactly: spooled to its own tar, capped at
+# the same CONTEXT_MAX_BYTES, pushed with its own kubectl exec through the
+# same pod-side extractor, in the same window (after the repository push,
+# before the .inputs-complete sentinel). The destination is an emptyDir
+# volume, mounted only when the matching flag is given -- the pod's root
+# filesystem is read-only, so nothing could mkdir /thread or /attachments
+# for the extractor to write into otherwise. That emptyDir is writable, not
+# read-only: read-only here is a convention the agent is expected to honor,
+# not a filesystem guarantee, exactly like --context-ro's own
+# not-really-read-only emptyDir above. This is accepted rather than a gap --
+# the pod's copy is a disposable per-wake copy, and the host directory
+# named by --thread-dir/--attach-dir is never written back, so an agent
+# writing into its own /thread or /attachments only ever harms its own view
+# of it.
 #
 # --pi-args ARGS (submit, run): extra arguments, verbatim, for the pod's
 # pi coding-leg invocation -- e.g. "--thinking low" for a persona whose
@@ -729,6 +756,21 @@ POD_OUTBOX_DIR=/work/outbox
 # the agent, and to push into -- since nothing else (cmd_say, cmd_collect) ever
 # touches it.
 POD_CONTEXT_DIR=/work/context
+
+# The pod-side destinations for --thread-dir/--attach-dir, mirroring the
+# local sandbox's own /thread and /attachments paths so the postmaster's
+# generated prompt needs no idea which backend a wake landed on. Unlike
+# POD_CONTEXT_DIR above these are NOT under /work: they are their own
+# top-level emptyDir mounts (see the volume render in cmd_submit), so
+# there is no clone-sibling requirement to track here. These constants
+# are threaded to the exec-push calls as DEST_DIR; the volume render
+# itself hardcodes the same two paths directly in the YAML, the same way
+# POD_CONTEXT_DIR coexists with the work/tmp/home volumeMounts' own
+# hardcoded literals above -- the mount path in the pod spec and the
+# DEST_DIR argument to the extractor must independently agree with each
+# other and with the postmaster's own convention.
+POD_THREAD_DIR=/thread
+POD_ATTACH_DIR=/attachments
 
 # The pod-side context-extract.sh cap: 256 MiB, fixed. A context directory
 # is gathered notes and small caches, not build artifacts or datasets, so
@@ -2705,10 +2747,35 @@ cmd_install() {
     echo "fork-sandbox-k8s: installed into namespace $K8S_NAMESPACE" >&2
 }
 
+# Shared by --thread-dir and --attach-dir (Section 1 of the thread/attach
+# work): the same tar-cf-turns-a-symlink-into-a-link-entry hazard
+# --context-ro's own inline checks (in cmd_submit, below) guard against
+# applies to any directory pushed through this transport. Kept as its own
+# function rather than a third inline copy of the same two `find`s;
+# --context-ro's own inline copy is left untouched, matching text, so
+# either check's error message stays exactly what its own tests pin.
+k8s_refuse_dir_links() {
+    local dir="$1" flag="$2" sym hl
+    sym="$(find "$dir" -type l -print -quit)"
+    if [[ -n "$sym" ]]; then
+        echo "Error: $flag directory '$dir' contains a symlink" >&2
+        echo "('$sym'); links are not allowed in a pushed directory." >&2
+        return 1
+    fi
+    hl="$(find "$dir" -type f -links +1 -print -quit)"
+    if [[ -n "$hl" ]]; then
+        echo "Error: $flag directory '$dir' contains a hard-linked file" >&2
+        echo "('$hl'); links are not allowed in a pushed directory." >&2
+        return 1
+    fi
+    return 0
+}
+
 cmd_submit() {
     local dry_run=false branch="" model="" review_loop_cap="" outbox_max_arg=""
     local context_ro="" harness="pi" review_model="" endpoint="" checkout_ref=""
     local pi_args="" services_trust_ref="" task_meta="" claude_credentials_flag=""
+    local thread_dir="" attach_dir=""
     local -a labels_raw=() allow_ns_raw=() reach_probe_raw=()
     while (( $# )); do
         case "$1" in
@@ -2724,6 +2791,8 @@ cmd_submit() {
             --review-model) review_model="${2:?--review-model requires a model id}"; shift 2 ;;
             --outbox-max) outbox_max_arg="${2:?--outbox-max requires a size}"; shift 2 ;;
             --context-ro) context_ro="${2:?--context-ro requires a directory}"; shift 2 ;;
+            --thread-dir) thread_dir="${2:?--thread-dir requires a directory}"; shift 2 ;;
+            --attach-dir) attach_dir="${2:?--attach-dir requires a directory}"; shift 2 ;;
             --claude-credentials) claude_credentials_flag="${2:?--claude-credentials requires a path}"; shift 2 ;;
             --label) labels_raw+=("${2:?--label requires key=value}"); shift 2 ;;
             --task-meta) task_meta="${2:?--task-meta requires a JSON object}"; shift 2 ;;
@@ -3184,6 +3253,30 @@ cmd_submit() {
             exit 1
         fi
         context_ro="$context_ro_real"
+    fi
+
+    # --thread-dir/--attach-dir use fs_validate_scratch_dir's rule, not
+    # --context-ro's: the postmaster stages these under its mail root,
+    # which is under the scratch root but not under forks/, so
+    # --context-ro's forks/-only rule would refuse every real wake. Plus
+    # the same symlink/hard-link refusals --context-ro applies above,
+    # via k8s_refuse_dir_links -- refused here, before any cluster object
+    # exists, even though the pod-side extractor refuses them too.
+    if [[ -n "$thread_dir" ]]; then
+        thread_dir="$(fs_validate_scratch_dir "$thread_dir" --thread-dir)" || exit 1
+        if [[ ! -d "$thread_dir" ]]; then
+            echo "Error: --thread-dir directory '$thread_dir' does not exist." >&2
+            exit 1
+        fi
+        k8s_refuse_dir_links "$thread_dir" --thread-dir || exit 1
+    fi
+    if [[ -n "$attach_dir" ]]; then
+        attach_dir="$(fs_validate_scratch_dir "$attach_dir" --attach-dir)" || exit 1
+        if [[ ! -d "$attach_dir" ]]; then
+            echo "Error: --attach-dir directory '$attach_dir' does not exist." >&2
+            exit 1
+        fi
+        k8s_refuse_dir_links "$attach_dir" --attach-dir || exit 1
     fi
 
     if [[ ! -d "$project_path" ]]; then
@@ -3765,6 +3858,46 @@ CENV
 )"
     fi
 
+    # The emptyDir volume + mount for --thread-dir/--attach-dir, rendered
+    # only when the matching flag was given -- locally the mount is
+    # likewise absent when the flag is absent, and the postmaster's own
+    # prompt says "when that mount is present", so the pod must match.
+    # A writable emptyDir, not read-only: the pod's own filesystem is
+    # readOnlyRootFilesystem, so nothing can mkdir /thread or /attachments
+    # for the exec extractor (below) to write into unless the mount itself
+    # is writable. This is accepted, not a gap -- the pod's copy is a
+    # disposable per-wake copy, the host source directory named by
+    # --thread-dir/--attach-dir is never written back, so an agent writing
+    # into its own /thread or /attachments only ever harms its own view of
+    # it. A sidecar or second container to enforce read-only here would be
+    # pure ceremony for a property nothing downstream reads.
+    local thread_volume_mount="" thread_volume=""
+    if [[ -n "$thread_dir" ]]; then
+        thread_volume_mount=$'\n'"$(cat <<CENV
+            - name: thread
+              mountPath: /thread
+CENV
+)"
+        thread_volume=$'\n'"$(cat <<CENV
+        - name: thread
+          emptyDir: {}
+CENV
+)"
+    fi
+    local attach_volume_mount="" attach_volume=""
+    if [[ -n "$attach_dir" ]]; then
+        attach_volume_mount=$'\n'"$(cat <<CENV
+            - name: attachments
+              mountPath: /attachments
+CENV
+)"
+        attach_volume=$'\n'"$(cat <<CENV
+        - name: attachments
+          emptyDir: {}
+CENV
+)"
+    fi
+
     # The exact prompt text the pod's ConfigMap embeds under handoff.md --
     # preamble, then the optional context/services sections, then the
     # operator's own handoff -- captured here once so run_dir's own
@@ -3893,7 +4026,7 @@ spec:
             - name: tmp
               mountPath: /tmp
             - name: home
-              mountPath: /home/agent
+              mountPath: /home/agent${thread_volume_mount}${attach_volume_mount}
       volumes:
         - name: scripts
           configMap:
@@ -3913,7 +4046,7 @@ spec:
         - name: tmp
           emptyDir: {}
         - name: home
-          emptyDir: {}${services_volumes}
+          emptyDir: {}${thread_volume}${attach_volume}${services_volumes}
 EOF
 )"
     rendered="${grant_rendered}${claude_proxy_rendered}${job_rendered}"
@@ -4057,6 +4190,8 @@ EOF
     # later submit failures, so a large temporary archive cannot leak.
     local context_tar="" context_size=""
     K8S_SUBMIT_CONTEXT_TAR=""
+    K8S_SUBMIT_THREAD_TAR=""
+    K8S_SUBMIT_ATTACH_TAR=""
     if [[ -n "$context_ro" ]]; then
         context_tar="$(mktemp)"
         K8S_SUBMIT_CONTEXT_TAR="$context_tar"
@@ -4065,12 +4200,46 @@ EOF
         # trap -- so this one covers both: a tar/stat failure or an
         # over-cap archive here is still before any cluster object, and
         # must still take run_dir with it.
-        trap 'rm -f -- "${K8S_SUBMIT_CONTEXT_TAR:-}"; rm -rf -- "$run_dir"' EXIT
+        trap 'rm -f -- "${K8S_SUBMIT_CONTEXT_TAR:-}" "${K8S_SUBMIT_THREAD_TAR:-}" "${K8S_SUBMIT_ATTACH_TAR:-}"; rm -rf -- "$run_dir"' EXIT
         tar cf "$context_tar" -C "$context_ro" .
         context_size="$("$FS_STAT" -c '%s' -- "$context_tar")"
         if (( context_size > CONTEXT_MAX_BYTES )); then
             echo "Error: --context-ro directory '$context_ro' tars to" >&2
             echo "$context_size bytes, over the $CONTEXT_MAX_BYTES byte" >&2
+            echo "(256 MiB) cap." >&2
+            exit 1
+        fi
+    fi
+
+    # Same spool-then-cap treatment as --context-ro above, one tar apiece,
+    # same CONTEXT_MAX_BYTES cap -- a context directory and a gathered
+    # thread/attachments directory are the same shape of thing (gathered
+    # notes and small caches), so they share the one cap rather than
+    # growing a --thread-max/--attach-max nobody has needed yet.
+    local thread_tar="" thread_size=""
+    if [[ -n "$thread_dir" ]]; then
+        thread_tar="$(mktemp)"
+        K8S_SUBMIT_THREAD_TAR="$thread_tar"
+        trap 'rm -f -- "${K8S_SUBMIT_CONTEXT_TAR:-}" "${K8S_SUBMIT_THREAD_TAR:-}" "${K8S_SUBMIT_ATTACH_TAR:-}"; rm -rf -- "$run_dir"' EXIT
+        tar cf "$thread_tar" -C "$thread_dir" .
+        thread_size="$("$FS_STAT" -c '%s' -- "$thread_tar")"
+        if (( thread_size > CONTEXT_MAX_BYTES )); then
+            echo "Error: --thread-dir directory '$thread_dir' tars to" >&2
+            echo "$thread_size bytes, over the $CONTEXT_MAX_BYTES byte" >&2
+            echo "(256 MiB) cap." >&2
+            exit 1
+        fi
+    fi
+    local attach_tar="" attach_size=""
+    if [[ -n "$attach_dir" ]]; then
+        attach_tar="$(mktemp)"
+        K8S_SUBMIT_ATTACH_TAR="$attach_tar"
+        trap 'rm -f -- "${K8S_SUBMIT_CONTEXT_TAR:-}" "${K8S_SUBMIT_THREAD_TAR:-}" "${K8S_SUBMIT_ATTACH_TAR:-}"; rm -rf -- "$run_dir"' EXIT
+        tar cf "$attach_tar" -C "$attach_dir" .
+        attach_size="$("$FS_STAT" -c '%s' -- "$attach_tar")"
+        if (( attach_size > CONTEXT_MAX_BYTES )); then
+            echo "Error: --attach-dir directory '$attach_dir' tars to" >&2
+            echo "$attach_size bytes, over the $CONTEXT_MAX_BYTES byte" >&2
             echo "(256 MiB) cap." >&2
             exit 1
         fi
@@ -4112,7 +4281,7 @@ EOF
     K8S_SUBMIT_SAFE_NAME="$safe_name"
     K8S_SUBMIT_BRANCH="$branch"
     trap '
-        rm -f -- "${K8S_SUBMIT_CONTEXT_TAR:-}"
+        rm -f -- "${K8S_SUBMIT_CONTEXT_TAR:-}" "${K8S_SUBMIT_THREAD_TAR:-}" "${K8S_SUBMIT_ATTACH_TAR:-}"
         kubectl delete pod,service,secret,configmap,networkpolicy \
             -l fork-sandbox/branch="$K8S_SUBMIT_SAFE_NAME" --ignore-not-found >&2
         echo "fork-sandbox-k8s: submit failed -- removed this run'"'"'s cluster" >&2
@@ -4148,7 +4317,7 @@ EOF
         # pre-sized context archive, if this run has one.
         # K8S_SUBMIT_SAFE_NAME/K8S_SUBMIT_BRANCH are already set, above.
         trap '
-            rm -f -- "${K8S_SUBMIT_CONTEXT_TAR:-}"
+            rm -f -- "${K8S_SUBMIT_CONTEXT_TAR:-}" "${K8S_SUBMIT_THREAD_TAR:-}" "${K8S_SUBMIT_ATTACH_TAR:-}"
             kubectl delete secret "$K8S_SUBMIT_SAFE_NAME-claude-token" --ignore-not-found >&2
             kubectl delete pod,service,secret,configmap,networkpolicy \
                 -l fork-sandbox/branch="$K8S_SUBMIT_SAFE_NAME" --ignore-not-found >&2
@@ -4244,6 +4413,23 @@ EOF
         kubectl exec -i "$pod_name" -- sh /mnt/fork-sandbox/context-extract.sh \
             "$POD_CONTEXT_DIR" "$CONTEXT_MAX_BYTES" context < "$context_tar"
         rm -f -- "$context_tar"
+    fi
+
+    # Same push, same extractor, same CALLER literal "context" as
+    # --context-ro above: the 256 MiB ceiling is identical either way, so a
+    # new CALLER arm in the extractor would be pure duplication for no
+    # different behaviour.
+    if [[ -n "$thread_dir" ]]; then
+        echo "fork-sandbox-k8s: pushing thread ($thread_dir) to pod $pod_name" >&2
+        kubectl exec -i "$pod_name" -- sh /mnt/fork-sandbox/context-extract.sh \
+            "$POD_THREAD_DIR" "$CONTEXT_MAX_BYTES" context < "$thread_tar"
+        rm -f -- "$thread_tar"
+    fi
+    if [[ -n "$attach_dir" ]]; then
+        echo "fork-sandbox-k8s: pushing attachments ($attach_dir) to pod $pod_name" >&2
+        kubectl exec -i "$pod_name" -- sh /mnt/fork-sandbox/context-extract.sh \
+            "$POD_ATTACH_DIR" "$CONTEXT_MAX_BYTES" context < "$attach_tar"
+        rm -f -- "$attach_tar"
     fi
 
     kubectl exec "$pod_name" -- sh -c 'touch /work/.inputs-complete'
@@ -5144,6 +5330,7 @@ cmd_run() {
     local dry_run=false keep=false timeout=3600 branch="" model="" review_loop_cap=""
     local outbox_dir="" outbox_max_arg="" context_ro="" harness="" review_model="" endpoint=""
     local checkout_ref="" pi_args="" services_trust_ref="" task_meta="" claude_credentials_flag=""
+    local thread_dir="" attach_dir=""
     local -a labels_raw=() allow_ns_raw=() reach_probe_raw=()
     while (( $# )); do
         case "$1" in
@@ -5162,6 +5349,8 @@ cmd_run() {
             --outbox-dir) outbox_dir="${2:?--outbox-dir requires a path}"; shift 2 ;;
             --outbox-max) outbox_max_arg="${2:?--outbox-max requires a size}"; shift 2 ;;
             --context-ro) context_ro="${2:?--context-ro requires a directory}"; shift 2 ;;
+            --thread-dir) thread_dir="${2:?--thread-dir requires a directory}"; shift 2 ;;
+            --attach-dir) attach_dir="${2:?--attach-dir requires a directory}"; shift 2 ;;
             --claude-credentials) claude_credentials_flag="${2:?--claude-credentials requires a path}"; shift 2 ;;
             --label) labels_raw+=("${2:?--label requires key=value}"); shift 2 ;;
             --task-meta) task_meta="${2:?--task-meta requires a JSON object}"; shift 2 ;;
@@ -5239,6 +5428,8 @@ cmd_run() {
     [[ -n "$review_model" ]] && submit_argv+=(--review-model "$review_model")
     [[ -n "$outbox_max_arg" ]] && submit_argv+=(--outbox-max "$outbox_max_arg")
     [[ -n "$context_ro" ]] && submit_argv+=(--context-ro "$context_ro")
+    [[ -n "$thread_dir" ]] && submit_argv+=(--thread-dir "$thread_dir")
+    [[ -n "$attach_dir" ]] && submit_argv+=(--attach-dir "$attach_dir")
     [[ -n "$claude_credentials_flag" ]] && submit_argv+=(--claude-credentials "$claude_credentials_flag")
     # Passed through only when given, like every other optional option
     # above: an empty --checkout at submit's parse would be an argument
