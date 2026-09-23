@@ -9466,6 +9466,9 @@ refresh_block_run() {
         '  echo "handoff written by leg $n" > "$RB_OUTBOX/handoff.md"' \
         '  echo "{\"stderr\":\"fork-sandbox-refresh: nudged\"}"' \
         'fi' \
+        'if [[ " ${RB_ADDENDUM_LEGS:-} " == *" $n "* ]]; then' \
+        '  echo "operator addendum for leg $n" > "$RB_OUTBOX/../inbox/addendum-$n.md"' \
+        'fi' \
         '[[ " $RB_FAIL_LEGS " == *" $n "* ]] && exit 1' \
         'exit 0' > "$stub_dir/claude"
     chmod +x "$stub_dir/claude"
@@ -9479,6 +9482,7 @@ refresh_block_run() {
         RESUME_SESSION="${5:-}" REFRESH_THRESHOLD_TOKENS="${1:-}" REFRESH_MAX="${4:-6}" \
         RB_REC="$rec" RB_OUTBOX="$RB_WORK/outbox" \
         RB_HANDOFF_LEGS="${2:-}" RB_FAIL_LEGS="${3:-}" \
+        RB_ADDENDUM_LEGS="${RB_ADDENDUM_LEGS:-}" \
         bash "$refresh_block_file" 2>&1)"
     RB_RC="$(grep -o 'CLAUDE_BLOCK_PI_RC=.*' <<<"$RB_OUT" | tail -1 | cut -d= -f2)"
     RB_CALLS="$(cat "$rec/count" 2>/dev/null || echo 0)"
@@ -9566,6 +9570,65 @@ if [[ "$RB_CALLS" == 2 && "$RB_RC" == 0 ]] \
 else
     no "a hand-off on leg 1 starts one fresh continuation with brief + hand-off on stdin" \
         "calls=$RB_CALLS rc=$RB_RC argv: $(cat "$RB_REC/argv") out=$RB_OUT"
+fi
+
+# The refresh loop archives addenda out of /work/inbox, so the review and
+# fix prompts must carry them: append_archived_addenda folds the archive into
+# a copy of a prompt, oldest leg first, and writes nothing when there is none.
+RB_ADDENDUM_LEGS="1 2" refresh_block_run 100000 "1" "" 6
+addenda_fn="$(sed -n '/^append_archived_addenda() {/,/^}/p' "$entrypoint_sh")"
+addenda_probe="$(newdir)/addenda-probe.sh"; tmpdirs+=("$(dirname "$addenda_probe")")
+printf '%s\n' 'set -euo pipefail' "$addenda_fn" \
+    'source "$REFRESH_SH"' \
+    'append_archived_addenda "$SRC" "$DEST"' > "$addenda_probe"
+printf 'REVIEW PROMPT BODY\n' > "$RB_WORK/src-prompt.md"
+addenda_rc=0
+REFRESH_SH="$repo_dir/scripts/fork-sandbox-refresh.sh" work_dir="$RB_WORK" \
+    SRC="$RB_WORK/src-prompt.md" DEST="$RB_WORK/dest-prompt.md" \
+    bash "$addenda_probe" > /dev/null 2>&1 || addenda_rc=$?
+if [[ -n "$addenda_fn" && "$addenda_rc" == 0 ]] \
+    && [[ ! -e "$RB_WORK/inbox/addendum-1.md" && ! -e "$RB_WORK/inbox/addendum-2.md" ]] \
+    && [[ "$(head -1 "$RB_WORK/dest-prompt.md")" == 'REVIEW PROMPT BODY' ]] \
+    && grep -qF 'operator addendum for leg 1' "$RB_WORK/dest-prompt.md" \
+    && grep -qF 'operator addendum for leg 2' "$RB_WORK/dest-prompt.md" \
+    && [[ "$(grep -n 'addendum for leg' "$RB_WORK/dest-prompt.md" | cut -d: -f1 | head -1)" \
+        -lt "$(grep -n 'addendum for leg 2' "$RB_WORK/dest-prompt.md" | cut -d: -f1)" ]]; then
+    ok "archived addenda are folded into the review/fix prompt copy after the refresh loop"
+else
+    no "archived addenda are folded into the review/fix prompt copy after the refresh loop" \
+        "rc=$addenda_rc dest: $(cat "$RB_WORK/dest-prompt.md" 2>/dev/null)"
+fi
+# Nothing archived (refresh off / no addenda): rc 1 and no copy written.
+rm -rf "$RB_WORK/inbox-delivered" "$RB_WORK/dest-prompt.md"
+addenda_rc=0
+REFRESH_SH="$repo_dir/scripts/fork-sandbox-refresh.sh" work_dir="$RB_WORK" \
+    SRC="$RB_WORK/src-prompt.md" DEST="$RB_WORK/dest-prompt.md" \
+    bash "$addenda_probe" > /dev/null 2>&1 || addenda_rc=$?
+if [[ "$addenda_rc" == 1 && ! -e "$RB_WORK/dest-prompt.md" ]]; then
+    ok "no archived addenda: append_archived_addenda returns 1 and writes no copy"
+else
+    no "no archived addenda: append_archived_addenda returns 1 and writes no copy" \
+        "rc=$addenda_rc"
+fi
+# Without refresh.sh sourced (refresh off) the helper is inert too.
+addenda_rc=0
+work_dir="$RB_WORK" SRC="$RB_WORK/src-prompt.md" DEST="$RB_WORK/dest-prompt.md" \
+    bash -c "$addenda_fn"'
+append_archived_addenda "$SRC" "$DEST"' > /dev/null 2>&1 || addenda_rc=$?
+if [[ "$addenda_rc" == 1 && ! -e "$RB_WORK/dest-prompt.md" ]]; then
+    ok "append_archived_addenda is inert when refresh.sh was never sourced"
+else
+    no "append_archived_addenda is inert when refresh.sh was never sourced" "rc=$addenda_rc"
+fi
+# The review block hands the loop the addenda-carrying copies.
+# shellcheck disable=SC2016
+if grep -qF -- '--fix-header "$fix_header_path"' "$entrypoint_sh" \
+    && grep -qF 'review_prompt_path="$work_dir/review-prompt-addenda.md"' "$entrypoint_sh" \
+    && grep -qF 'fix_header_path="$work_dir/fix-prompt-header-addenda.md"' "$entrypoint_sh"; then
+    ok "the pod review loop is handed the addenda-carrying review and fix prompts"
+else
+    no "the pod review loop is handed the addenda-carrying review and fix prompts" \
+        "missing fix_header_path / review-prompt-addenda wiring in $entrypoint_sh"
 fi
 
 # Cap: REFRESH_MAX=1 with a hand-off on legs 1 and 2 -> two legs, ended cap,

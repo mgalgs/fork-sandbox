@@ -872,6 +872,37 @@ run_claude_continuations() {
         "($n continuation leg(s) ran)" >&2
 }
 
+# The refresh loop archives every addendum out of /work/inbox the moment a
+# claude leg ends, so the review and fix legs that follow no longer find
+# them in the live inbox. Like the local review walker, fold the archived
+# ones into a copy of a review or fix prompt. $1 source prompt, $2 copy to
+# write. Returns 1, writing nothing, when there are none (refresh off, or
+# nothing was sent).
+append_archived_addenda() {
+    local list dir f
+    declare -F fs_refresh_addenda_dirs > /dev/null || return 1
+    list="$(fs_refresh_addenda_dirs "$work_dir")"
+    [[ -n "$list" ]] || return 1
+    {
+        cat -- "$1"
+        printf '\n---\n\n## Operator addenda delivered to earlier legs of this run\n\n'
+        printf 'The operator sent the messages below to an earlier leg of this run,\n'
+        printf 'oldest first. The live inbox no longer holds them -- the coding\n'
+        printf 'session archived what it saw the moment each leg ended -- so this\n'
+        printf 'is the only copy this leg will see. Check the work against each\n'
+        printf 'one: an addendum the branch does not follow is a finding, citing\n'
+        printf 'the message file itself.\n'
+        while IFS= read -r dir; do
+            [[ -n "$dir" ]] || continue
+            for f in "$dir"/*.md; do
+                [[ -f "$f" ]] || continue
+                printf '\n### %s\n\n' "${f##*/}"
+                cat -- "$f"
+            done
+        done <<< "$list"
+    } > "$2"
+}
+
 pi_rc=0
 if [[ "$HARNESS" == pi ]]; then
     # REVIEW_MODEL, when set, is folded in up front so the review loop
@@ -1074,6 +1105,14 @@ if [[ "$REVIEW_LOOP_CAP" =~ ^[1-9][0-9]*$ ]]; then
         else
             echo "fork-sandbox-k8s-entrypoint: running the review loop" >&2
         fi
+        fix_header_path="$mounts_dir/fix-prompt-header.md"
+        if append_archived_addenda "$review_prompt_path" \
+            "$work_dir/review-prompt-addenda.md"; then
+            review_prompt_path="$work_dir/review-prompt-addenda.md"
+            append_archived_addenda "$fix_header_path" \
+                "$work_dir/fix-prompt-header-addenda.md"
+            fix_header_path="$work_dir/fix-prompt-header-addenda.md"
+        fi
         # The review loop always runs pi, regardless of the coding leg's
         # harness, and always prefers REVIEW_MODEL over MODEL when set --
         # required at startup when HARNESS=claude, see the validation
@@ -1098,7 +1137,7 @@ if [[ "$REVIEW_LOOP_CAP" =~ ^[1-9][0-9]*$ ]]; then
             --cap "$REVIEW_LOOP_CAP" \
             --base-sha "$BASE_SHA" \
             --review-prompt "$review_prompt_path" \
-            --fix-header "$mounts_dir/fix-prompt-header.md" \
+            --fix-header "$fix_header_path" \
             --verdict "$clone_dir/.git/review-verdict.md" \
             --work-dir "$work_dir" \
             --out "$work_dir/review-loop.json" \
