@@ -119,6 +119,18 @@ new_project() {
 refusal_home="$(mktmp_dir "$scratch/fs-resume-home.XXXXXX")"
 refusal_proj="$(new_project "$refusal_home")"
 refusal_cfg="$(mktmp_dir "$scratch/fs-resume-cfg.XXXXXX")"
+# A fixture Claude credential, the same shape tests/fork-sandbox-k8s-test.sh
+# uses: a --harness claude --k8s --dry-run still renders a Secret with a
+# sanitized credential in it, so it reads a real (fixture) credential file
+# even though nothing is applied to a cluster. Harmless for every other
+# case below -- fs_balance_claude_credential only reads it when a pool is
+# configured (it is not, here), and every plain refusal case below exits
+# before this file would ever be read.
+mkdir -p "$refusal_home/.claude"
+cat > "$refusal_home/.claude/.credentials.json" <<JSON
+{"claudeAiOauth": {"accessToken": "fixture-access-token", "refreshToken": "fixture-refresh-token", "refreshTokenExpiresAt": 123, "expiresAt": $(( ($(date +%s) + 7200) * 1000 )), "scopes": ["user:inference"]}}
+JSON
+chmod 600 "$refusal_home/.claude/.credentials.json"
 # Minimal fixture k8s config (no real cluster), the same shape
 # tests/fork-sandbox-k8s-test.sh uses for its own "--dry-run, no cluster"
 # section: this is enough for fork-sandbox-k8s.sh's own --dry-run to
@@ -184,16 +196,22 @@ else
 fi
 # --session-state/--resume-session/--session-id are accepted with --k8s now:
 # fork-sandbox-k8s.sh keeps a mail seat's conversation across cluster wakes
-# the same way a local seat does. This --dry-run exits inside
-# fork-sandbox.sh, before the exec into fork-sandbox-k8s.sh, so it exercises
-# only that the flags are no longer refused there and are reported resolved
-# -- not the k8s push/pull, which tests/fork-sandbox-k8s-test.sh covers with
-# its own kubectl stub.
+# the same way a local seat does. Unlike every other --dry-run case in this
+# suite, the --k8s branch does not exit inside fork-sandbox.sh -- it execs
+# into fork-sandbox-k8s.sh's own `run`/`submit --dry-run`, which renders the
+# full Job/ConfigMap YAML, so what these three cases check for is that
+# rendered shape (the SESSION_HARNESS_STORE/RESUME_SESSION/SESSION_ID env
+# stanzas), not a "session_state=..." line -- that line is only ever printed
+# by fork-sandbox.sh's own local-path dry-run print block, further down.
+# This still exercises only that the flags are no longer refused and are
+# forwarded resolved -- not the k8s push/pull itself, which
+# tests/fork-sandbox-k8s-test.sh covers with its own kubectl stub.
 k8s_state_out="$(dry_run --k8s --model vendor/model \
     --session-state "$scratch/fs-resume-unused")"
 k8s_state_rc=$?
 if (( k8s_state_rc == 0 )) && printf '%s\n' "$k8s_state_out" \
-    | grep -q '^session_state='; then
+    | grep -A1 -F -- '- name: SESSION_HARNESS_STORE' \
+    | grep -q 'value: "1"'; then
     ok "--session-state accepted with --k8s"
 else
     no "--session-state accepted with --k8s" "$k8s_state_out"
@@ -203,7 +221,8 @@ k8s_resume_out="$(dry_run --k8s --harness claude --model vendor/model \
     --resume-session 0123abcd-4567-89ab-cdef-0123456789ab)"
 k8s_resume_rc=$?
 if (( k8s_resume_rc == 0 )) && printf '%s\n' "$k8s_resume_out" \
-    | grep -qx 'resume_session=0123abcd-4567-89ab-cdef-0123456789ab'; then
+    | grep -A1 -F -- '- name: RESUME_SESSION' \
+    | grep -qF -- '0123abcd-4567-89ab-cdef-0123456789ab'; then
     ok "--resume-session accepted with --k8s"
 else
     no "--resume-session accepted with --k8s" "$k8s_resume_out"
@@ -220,7 +239,8 @@ k8s_sid_out="$(dry_run --k8s --model vendor/model \
     --session-id 0123abcd-4567-89ab-cdef-0123456789ab)"
 k8s_sid_rc=$?
 if (( k8s_sid_rc == 0 )) && printf '%s\n' "$k8s_sid_out" \
-    | grep -qx 'session_id=0123abcd-4567-89ab-cdef-0123456789ab'; then
+    | grep -A1 -F -- '- name: SESSION_ID' \
+    | grep -qF -- '0123abcd-4567-89ab-cdef-0123456789ab'; then
     ok "--session-id accepted with --k8s (default pi harness)"
 else
     no "--session-id accepted with --k8s (default pi harness)" "$k8s_sid_out"
