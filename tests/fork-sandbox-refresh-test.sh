@@ -555,6 +555,12 @@ run_real() {
     trap 'rm -rf -- "$handoff_dir"' RETURN
     handoff="$handoff_dir/handoff.md"
     printf 'do the task\n' > "$handoff"
+    # FAKE_BRIEF_PAD_BYTES: pad the brief to at least this many bytes, to
+    # exercise the launch warning for a large brief.
+    if [[ -n "${FAKE_BRIEF_PAD_BYTES:-}" ]]; then
+        head -c "$FAKE_BRIEF_PAD_BYTES" /dev/zero | tr '\0' 'x' >> "$handoff"
+        printf '\n' >> "$handoff"
+    fi
     : > "$count_file"
     # A leg that writes a hand-off now also commits by default (the stub's
     # own doc comment explains why), so a run that used to leave the
@@ -656,6 +662,22 @@ if [[ -n "$rd" ]]; then
         no "the continuation's leg number is 2" "no summary.json"
         no "an on-time hand-off is not marked stale in summary.json" "no summary.json"
     fi
+fi
+
+# -- a large brief: the launch warning goes to the launching terminal (the
+# captured output run_real parses) AND, exactly once, into the run's own
+# sandbox.log -- which is created after the warning is computed, so it has to
+# be carried there rather than appended early.
+count_file="$(mktemp)"; tmpdirs+=("$count_file")
+FAKE_BRIEF_PAD_BYTES=5000
+rd="$(run_real "$proj" "$count_file" "" "" --refresh-at 1000)"
+FAKE_BRIEF_PAD_BYTES=""
+[[ -n "$rd" ]] && tmpdirs+=("$rd")
+if [[ -f "$rd/sandbox.log" ]]; then
+    check "a large brief's launch warning is in sandbox.log exactly once" \
+        "1" "$(grep -c 'this brief is [0-9]* bytes' "$rd/sandbox.log")"
+else
+    no "a large brief's launch warning is in sandbox.log exactly once" "no sandbox.log"
 fi
 
 # -- an addendum delivered to leg 1: archived out of inbox/ into its own

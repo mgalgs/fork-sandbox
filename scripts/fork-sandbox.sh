@@ -5520,6 +5520,7 @@ handoff_copy="$run_dir/handoff.md"
 # calls it, so the snapshot itself is skipped otherwise -- see SKILL.md's
 # "--refresh-at only" note on this file.
 handoff_original="$run_dir/handoff-original.md"
+brief_warning=""
 if (( refresh_enabled )); then
     fs_reject_unsafe_chars "$handoff_original"
     cat -- "$handoff_file" > "$handoff_original.part"
@@ -5528,16 +5529,12 @@ if (( refresh_enabled )); then
     # working budget is the single biggest cause of a chain that nudges
     # repeatedly and commits nothing -- see fs_refresh_warn_brief's own
     # comment. Printed here, at launch, so it is seen before any leg runs;
-    # also appended to sandbox.log when that file already exists so it
-    # survives in the run's own record, not just the launching terminal.
+    # the text is kept in brief_warning and appended to sandbox.log once
+    # that file is created (it is truncated, so nothing written earlier
+    # would survive), so it also lands in the run's own record.
     brief_warning="$(fs_refresh_warn_brief "$handoff_original" "$refresh_threshold_tokens")"
     if [[ -n "$brief_warning" ]]; then
         printf '%s\n' "$brief_warning" >&2
-        # sandbox_log (set later, once the clone exists) is not in scope
-        # yet this early -- checked by its eventual literal path instead, so
-        # a rerun that somehow already has one still gets the line appended.
-        [[ -f "$run_dir/sandbox.log" ]] && printf '%s\n' "$brief_warning" \
-            >> "$run_dir/sandbox.log"
     fi
 fi
 
@@ -7073,6 +7070,7 @@ started_at="$(date +%s)"
     printf 'outbox_max_bytes=%q\n' "$outbox_max_bytes"
     printf 'continuation_prompt_header=%q\n' "$continuation_prompt_header"
     printf 'handoff_original=%q\n' "$handoff_original"
+    printf 'brief_warning=%q\n' "$brief_warning"
     printf 'user_shell=%q\n' "$user_shell"
     printf 'keep_open=%q\n' "$keep_open"
     printf 'services_enabled=%q\n' "$services_enabled"
@@ -7258,6 +7256,9 @@ printf '%s\n' "$$" > "$run_dir/pid"
 rm -f "$run_dir/exit-code"
 : > "$events"
 : > "$sandbox_log"
+if [[ -n "$brief_warning" ]]; then
+    printf '%s\n' "$brief_warning" >> "$sandbox_log"
+fi
 
 # Every later leg of this run -- a --refresh-at continuation, a review leg, a
 # fix leg -- is a fresh sandbox with a fresh /tmp, bound to this same inbox
