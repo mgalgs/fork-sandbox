@@ -6,6 +6,8 @@
 #                              --subject <s> (--body <file>|-)
 #                              [--attach <file>]... [--hops <n>]
 #                              [--header 'X-Name: value']...
+#                              [--allow-namespace NS[:PORT]]...
+#                              [--reach-probe HOST:PORT]... [--context-ro DIR]
 #        fork-sandbox-mail.sh reply --from @a --reply-to <message-id>
 #                              (--body <file>|-) [--to @b[,@c]] [--cc @d[,@e]]
 #                              [--subject <s>] [--attach <file>]... [--hops <n>]
@@ -15,6 +17,10 @@
 #        fork-sandbox-mail.sh list
 #        fork-sandbox-mail.sh inbox <name> [--all]
 #        fork-sandbox-mail.sh seen <name> <message-id>...
+#        fork-sandbox-mail.sh grant <thread-id> [--allow-namespace NS[:PORT]]...
+#                              [--reach-probe HOST:PORT]... [--context-ro DIR]
+#        fork-sandbox-mail.sh grant <thread-id> --clear
+#        fork-sandbox-mail.sh grant <thread-id> --show [--json]
 #
 # This is a store, not a router: `send`/`reply` write messages, `show`/
 # `tree`/`list`/`inbox`/`seen` read them back. There is no agent spawning, no
@@ -27,6 +33,8 @@
 #   <root>/threads/<thread-id>/<NNN>-<uuid>.msg   # NNN = 3-digit arrival seq
 #   <root>/threads/<thread-id>/attachments/<basename>
 #   <root>/agents/<name>/seen                     # append-only message-id list
+#   <root>/.postmaster/grants/<thread-id>.env     # per-thread k8s egress grant,
+#                                                  # see the `grant` verb below
 #
 # <thread-id> is the Message-ID of the thread's root message (the message
 # `send` created it with). NNN starts at 001 and counts arrival order within
@@ -119,6 +127,11 @@ MAIL_ROOT="${FORK_SANDBOX_MAIL_ROOT:-/var/tmp/claude-scratch/agent-mail}"
 MAIL_ATTACH_MAX_BYTES=$(( 4 * 1024 * 1024 ))
 MAIL_ADDR_RE='^@[a-z0-9][a-z0-9-]*$'
 MAIL_SEQ_MAX_TRIES=10000
+
+# Scripts are symlinked into ~/.claude/scripts, so a plain "dirname $0" is
+# wrong; this matches how fork-sandbox.sh and fork-sandbox-fleet.sh locate
+# their own siblings.
+script_dir="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 
 usage() {
     # The header block is the documentation: print it from line 2 down to
@@ -258,6 +271,109 @@ mail_find_by_id() {
     return 1
 }
 
+# Confirms $1 names an existing thread ROOT (a message whose own
+# Message-ID equals its Thread-ID) without ever building a path from the
+# caller-supplied id directly: mail_find_by_id locates the file by
+# scanning and comparing header content, so an id shaped like a path
+# traversal can't escape the store.
+mail_thread_root_exists() {
+    local tid="$1" f
+    f="$(mail_find_by_id "$tid")" || return 1
+    [[ "$(mail_header "$f" Thread-ID)" == "$tid" ]]
+}
+
+# Runs check-grant on the given args, mapping its exit status to this
+# store's grant-flag contract: 2 = refused value, 1 = usage/other
+# failure. Prints check-grant's stdout on success; its stderr passes
+# through to this script's own stderr either way.
+mail_check_grant() {
+    local out rc=0
+    out="$("$script_dir/fork-sandbox-k8s.sh" check-grant "$@")" || rc=$?
+    if (( rc == 2 )); then
+        return 2
+    elif (( rc != 0 )); then
+        return 1
+    fi
+    printf '%s' "$out"
+    return 0
+}
+
+# Writes the per-thread grant file for <tid> from check-grant's output,
+# atomically (mktemp in the same dir, then mv) and idempotently: an
+# unchanged grant leaves the file's mtime alone, a changed one replaces
+# it wholesale (never merges). This is the one place outside the
+# postmaster that writes postmaster state (.postmaster/grants/); a
+# single store-tool writing one postmaster-state file is an accepted
+# coupling.
+mail_write_grant() {
+    local tid="$1"; shift
+    local out
+    out="$(mail_check_grant "$@")" || return $?
+    local grants_dir="$MAIL_ROOT/.postmaster/grants"
+    mkdir -p -- "$grants_dir"
+    local dest="$grants_dir/$tid.env"
+    local tmp; tmp="$(mktemp "$grants_dir/.grant.XXXXXX")"
+    printf '%s\n' "$out" > "$tmp"
+    if [[ -f "$dest" ]] && cmp -s -- "$tmp" "$dest"; then
+        rm -f -- "$tmp"
+    else
+        mv -- "$tmp" "$dest"
+    fi
+    return 0
+}
+
+# Escapes a string for embedding in a JSON string context. Grant values
+# are shell tokens the k8s validators have already shape-checked (a
+# thread id, an NS[:PORT], a HOST:PORT, or a realpath), so this only
+# needs to be correct, not permissive.
+mail_json_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\t'/\\t}"
+    printf '%s' "$s"
+}
+
+# Prints a JSON array of already-escaped double-quoted strings from a
+# nameref array, e.g. ("a" "b") -> ["a", "b"], () -> [].
+mail_json_string_array() {
+    local -n arr_ref="$1"
+    if (( ${#arr_ref[@]} == 0 )); then
+        printf '[]'
+        return 0
+    fi
+    local out="[" first=1 v
+    for v in "${arr_ref[@]}"; do
+        if (( first )); then first=0; else out+=", "; fi
+        out+="\"$v\""
+    done
+    out+="]"
+    printf '%s' "$out"
+}
+
+# Prints the JSON form of thread $1's grant file $2 (or the literal null
+# when there is none), for `grant --show --json`.
+mail_grant_print_json() {
+    local tid="$1" grant_file="$2"
+    if [[ ! -f "$grant_file" ]]; then
+        printf 'null\n'
+        return 0
+    fi
+    local -a ns=() probe=()
+    local ctx="null" line
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        case "$line" in
+            ALLOW_NAMESPACE=*) ns+=("$(mail_json_escape "${line#ALLOW_NAMESPACE=}")") ;;
+            REACH_PROBE=*) probe+=("$(mail_json_escape "${line#REACH_PROBE=}")") ;;
+            CONTEXT_RO=*) ctx="\"$(mail_json_escape "${line#CONTEXT_RO=}")\"" ;;
+        esac
+    done < "$grant_file"
+    printf '{"thread": "%s", "allow_namespace": %s, "reach_probe": %s, "context_ro": %s}\n' \
+        "$(mail_json_escape "$tid")" "$(mail_json_string_array ns)" "$(mail_json_string_array probe)" "$ctx"
+}
+
 # Validates and copies each --attach file into <thread-dir>/attachments/,
 # printing a '/'-separated list of one basename per *distinct staged file*
 # on stdout (two --attach args with the same basename collapse to one
@@ -388,6 +504,8 @@ mail_body_is_empty() {
 cmd_send() {
     local from="" to="" cc="" subject="" body_arg="" hops=8
     local -a attach_files=() extra_headers=()
+    local -a grant_allow_ns=() grant_reach_probe=()
+    local grant_context_ro=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --from) from="${2:?--from requires an address}"; shift 2 ;;
@@ -398,6 +516,9 @@ cmd_send() {
             --attach) attach_files+=("${2:?--attach requires a file}"); shift 2 ;;
             --hops) hops="${2:?--hops requires a number}"; shift 2 ;;
             --header) extra_headers+=("${2:?--header requires 'X-Name: value'}"); shift 2 ;;
+            --allow-namespace) grant_allow_ns+=("${2:?--allow-namespace requires NS[:PORT]}"); shift 2 ;;
+            --reach-probe) grant_reach_probe+=("${2:?--reach-probe requires HOST:PORT}"); shift 2 ;;
+            --context-ro) grant_context_ro="${2:?--context-ro requires a directory}"; shift 2 ;;
             -h|--help) usage; exit 0 ;;
             *) echo "Error: send: unknown option '$1'." >&2; return 1 ;;
         esac
@@ -422,6 +543,25 @@ cmd_send() {
     cc_norm=""
     [[ -n "$cc" ]] && { cc_norm="$(mail_validate_addr_list "$cc")" || return 1; }
 
+    # A grant, if given, is checked before anything is written -- a
+    # refused grant must leave no thread dir, no staged attachment, no
+    # message -- and the grant file itself is written right after the
+    # thread dir exists, before mail_place_message renames the message
+    # into place, so a route pass can never see the thread without its
+    # grant.
+    local -a grant_args=()
+    local gv
+    for gv in "${grant_allow_ns[@]:-}"; do [[ -n "$gv" ]] && grant_args+=(--allow-namespace "$gv"); done
+    for gv in "${grant_reach_probe[@]:-}"; do [[ -n "$gv" ]] && grant_args+=(--reach-probe "$gv"); done
+    [[ -n "$grant_context_ro" ]] && grant_args+=(--context-ro "$grant_context_ro")
+    local saw_grant=0
+    (( ${#grant_args[@]} > 0 )) && saw_grant=1
+    if (( saw_grant )); then
+        local grant_rc=0
+        mail_check_grant "${grant_args[@]}" >/dev/null || grant_rc=$?
+        (( grant_rc == 0 )) || return "$grant_rc"
+    fi
+
     local body_file; body_file="$(mktemp "$MAIL_ROOT/.mail.body.XXXXXX")"
     mail_read_body_arg "$body_arg" "$body_file" || { rm -f -- "$body_file"; return 1; }
     if mail_body_is_empty "$body_file"; then
@@ -434,9 +574,22 @@ cmd_send() {
     local thread_dir; thread_dir="$(mail_thread_dir "$uuid")"
     mkdir -p -- "$thread_dir"
 
+    if (( saw_grant )); then
+        local write_rc=0
+        mail_write_grant "$uuid" "${grant_args[@]}" || write_rc=$?
+        if (( write_rc != 0 )); then
+            rm -f -- "$body_file"
+            return "$write_rc"
+        fi
+    fi
+
     local attach_csv=""
     if (( ${#attach_files[@]} > 0 )); then
-        attach_csv="$(mail_stage_attachments "$thread_dir" "${attach_files[@]}")" || { rm -f -- "$body_file"; return 1; }
+        attach_csv="$(mail_stage_attachments "$thread_dir" "${attach_files[@]}")" || {
+            (( saw_grant )) && rm -f -- "$MAIL_ROOT/.postmaster/grants/$uuid.env"
+            rm -f -- "$body_file"
+            return 1
+        }
     fi
 
     local date_hdr; date_hdr="$(date -u +'%a, %d %b %Y %H:%M:%S +0000')"
@@ -462,7 +615,11 @@ cmd_send() {
     fi
     local headers; headers="$(printf '%s\n' "${hlines[@]}")"
 
-    mail_place_message "$headers" "$body_file" "$thread_dir" "$uuid" >/dev/null || { rm -f -- "$body_file"; return 1; }
+    mail_place_message "$headers" "$body_file" "$thread_dir" "$uuid" >/dev/null || {
+        (( saw_grant )) && rm -f -- "$MAIL_ROOT/.postmaster/grants/$uuid.env"
+        rm -f -- "$body_file"
+        return 1
+    }
     rm -f -- "$body_file"
     echo "fork-sandbox mail: sent ${uuid} as a new thread" >&2
     printf '%s\n' "$uuid"
@@ -482,6 +639,11 @@ cmd_reply() {
             --attach) attach_files+=("${2:?--attach requires a file}"); shift 2 ;;
             --hops) hops_override="${2:?--hops requires a number}"; shift 2 ;;
             --header) extra_headers+=("${2:?--header requires 'X-Name: value'}"); shift 2 ;;
+            --allow-namespace|--reach-probe|--context-ro)
+                echo "Error: reply: grant flags apply to a new thread only (mail send); for an existing thread use" >&2
+                echo "fork-sandbox mail grant <thread-id> ..." >&2
+                return 1
+                ;;
             -h|--help) usage; exit 0 ;;
             *) echo "Error: reply: unknown option '$1'." >&2; return 1 ;;
         esac
@@ -757,6 +919,68 @@ cmd_inbox() {
     done
 }
 
+cmd_grant() {
+    local tid="${1:?Usage: fork-sandbox-mail.sh grant <thread-id> [options]}"
+    shift
+    local -a allow_ns=() reach_probe=()
+    local context_ro="" clear=0 show=0 json=0 saw_value=0
+    while (( $# )); do
+        case "$1" in
+            --allow-namespace) allow_ns+=("${2:?--allow-namespace requires NS[:PORT]}"); saw_value=1; shift 2 ;;
+            --reach-probe) reach_probe+=("${2:?--reach-probe requires HOST:PORT}"); saw_value=1; shift 2 ;;
+            --context-ro) context_ro="${2:?--context-ro requires a directory}"; saw_value=1; shift 2 ;;
+            --clear) clear=1; shift ;;
+            --show) show=1; shift ;;
+            --json) json=1; shift ;;
+            -h|--help) usage; exit 0 ;;
+            *) echo "Error: grant: unknown option '$1'." >&2; return 1 ;;
+        esac
+    done
+
+    if (( json && ! show )); then
+        echo "Error: grant: --json is only valid together with --show." >&2
+        return 1
+    fi
+    if (( clear && (show || saw_value) )); then
+        echo "Error: grant: --clear may not be combined with --show or a grant value." >&2
+        return 1
+    fi
+    if (( show && saw_value )); then
+        echo "Error: grant: --show may not be combined with a grant value." >&2
+        return 1
+    fi
+    if (( ! clear && ! show && ! saw_value )); then
+        echo "Error: grant: give --allow-namespace/--reach-probe/--context-ro, --clear or --show." >&2
+        return 1
+    fi
+
+    mail_thread_root_exists "$tid" || { echo "Error: grant: no such thread '$tid'." >&2; return 1; }
+
+    local grant_file="$MAIL_ROOT/.postmaster/grants/$tid.env"
+
+    if (( show )); then
+        if (( json )); then
+            mail_grant_print_json "$tid" "$grant_file"
+        elif [[ -f "$grant_file" ]]; then
+            cat -- "$grant_file"
+        fi
+        return 0
+    fi
+
+    if (( clear )); then
+        rm -f -- "$grant_file"
+        return 0
+    fi
+
+    local -a args=()
+    local v
+    for v in "${allow_ns[@]}"; do args+=(--allow-namespace "$v"); done
+    for v in "${reach_probe[@]}"; do args+=(--reach-probe "$v"); done
+    [[ -n "$context_ro" ]] && args+=(--context-ro "$context_ro")
+
+    mail_write_grant "$tid" "${args[@]}"
+}
+
 cmd_seen() {
     local name="${1:?Usage: fork-sandbox-mail.sh seen <name> <message-id>...}"
     shift
@@ -798,6 +1022,7 @@ case "${1-}" in
     list) shift; cmd_list "$@" ;;
     inbox) shift; cmd_inbox "$@" ;;
     seen) shift; cmd_seen "$@" ;;
+    grant) shift; cmd_grant "$@" ;;
     "")
         usage >&2
         exit 1

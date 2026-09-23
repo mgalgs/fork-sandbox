@@ -510,5 +510,112 @@ refuses "reply refuses --header X-Hops (store-owned)" \
 refuses "reply refuses a --header value containing a newline" \
     "$mail" reply --from @bob --reply-to "$hdr_id" --body - --header "$(printf 'X-AI-Persona: bad\nvalue')" <<< "x"
 
+printf '\n== grant: per-thread k8s grants (real check-grant, no stub) ==\n'
+# These use the REAL fork-sandbox-k8s.sh check-grant, with an empty temp
+# config dir, so no k8s.env leaks in from a real ~/.config/fork-sandbox --
+# this is what proves the "one grant parser" property, not a stub.
+
+new_root FORK_SANDBOX_MAIL_ROOT; export FORK_SANDBOX_MAIL_ROOT
+new_root FORK_SANDBOX_CONFIG_DIR; export FORK_SANDBOX_CONFIG_DIR
+k8s_sh="$repo_dir/scripts/fork-sandbox-k8s.sh"
+
+grant_tid="$("$mail" send --from @alice --to @bob --subject "Grant thread" --body - <<< "hi" 2>diag.txt)"
+
+cg_ctx_dir_grant="/var/tmp/claude-scratch/forks/mail-grant-test.$$"
+mkdir -p "$cg_ctx_dir_grant"; tmpdirs+=("$cg_ctx_dir_grant")
+
+expected_grant="$("$k8s_sh" check-grant --allow-namespace preview-pr-7 --reach-probe svc.preview-pr-7:80)"
+"$mail" grant "$grant_tid" --allow-namespace preview-pr-7 --reach-probe svc.preview-pr-7:80
+rc=$?
+check "grant happy path exits 0" "0" "$rc"
+grant_file="$FORK_SANDBOX_MAIL_ROOT/.postmaster/grants/$grant_tid.env"
+check "grant file exists" "1" "$([[ -f "$grant_file" ]] && echo 1 || echo 0)"
+check "grant file content matches check-grant's own output exactly" "$expected_grant" "$(cat -- "$grant_file")"
+
+mtime1="$(stat -c %Y -- "$grant_file")"
+sleep 1
+"$mail" grant "$grant_tid" --allow-namespace preview-pr-7 --reach-probe svc.preview-pr-7:80
+mtime2="$(stat -c %Y -- "$grant_file")"
+check "writing the same grant values again leaves mtime unchanged" "$mtime1" "$mtime2"
+
+"$mail" grant "$grant_tid" --allow-namespace preview-pr-7:80 --reach-probe svc.preview-pr-7:80
+rc=$?
+check "writing different grant values exits 0" "0" "$rc"
+contains "different grant values replace the file's content" "$(cat -- "$grant_file")" "ALLOW_NAMESPACE=preview-pr-7:80"
+
+"$mail" grant "$grant_tid" --clear
+rc=$?
+check "--clear exits 0" "0" "$rc"
+check "--clear removes the grant file" "0" "$([[ -f "$grant_file" ]] && echo 1 || echo 0)"
+"$mail" grant "$grant_tid" --clear
+rc=$?
+check "--clear exits 0 a second time with nothing to clear" "0" "$rc"
+
+check "--show with no grant prints nothing" "" "$("$mail" grant "$grant_tid" --show)"
+show_json_empty="$("$mail" grant "$grant_tid" --show --json)"
+check "--show --json with no grant prints null" "null" "$show_json_empty"
+
+"$mail" grant "$grant_tid" --allow-namespace preview-pr-7 --reach-probe svc.preview-pr-7:80 --context-ro "$cg_ctx_dir_grant"
+expected_grant_ctx="$("$k8s_sh" check-grant --allow-namespace preview-pr-7 --reach-probe svc.preview-pr-7:80 --context-ro "$cg_ctx_dir_grant")"
+check "--show with a grant prints the grant file content" "$expected_grant_ctx" "$("$mail" grant "$grant_tid" --show)"
+
+show_json="$("$mail" grant "$grant_tid" --show --json)"
+contains "--show --json names the thread" "$show_json" "\"thread\": \"$grant_tid\""
+contains "--show --json carries the namespace value" "$show_json" "preview-pr-7"
+contains "--show --json carries the probe value" "$show_json" "svc.preview-pr-7:80"
+"$mail" grant "$grant_tid" --clear
+
+refuses "grant on an unknown thread exits 1" "$mail" grant "not-a-real-thread-id" --allow-namespace preview-pr-7 --reach-probe svc.preview-pr-7:80
+
+grant_before="$(find "$FORK_SANDBOX_MAIL_ROOT/.postmaster/grants" -name '*.env' 2>/dev/null | wc -l)"
+out="$("$mail" grant "$grant_tid" --reach-probe svc.preview-pr-7:80 2>&1)"
+rc=$?
+check "a refused grant value (probe without ns) exits 2" "2" "$rc"
+check "a refused grant value writes no file" "$grant_before" \
+    "$(find "$FORK_SANDBOX_MAIL_ROOT/.postmaster/grants" -name '*.env' 2>/dev/null | wc -l)"
+
+printf '\n== send: grant flags ==\n'
+
+send_out="$("$mail" send --from @alice --to @bob --subject "Send with grant" --body - \
+    --allow-namespace preview-pr-7 --reach-probe svc.preview-pr-7:80 <<< "hi" 2>diag.txt)"
+rc=$?
+check "send with valid grant flags exits 0" "0" "$rc"
+send_grant_file="$FORK_SANDBOX_MAIL_ROOT/.postmaster/grants/$send_out.env"
+check "send with valid grant flags writes a grant file for the printed uuid" "1" \
+    "$([[ -f "$send_grant_file" ]] && echo 1 || echo 0)"
+check "the grant file's content is right" "$expected_grant" "$(cat -- "$send_grant_file")"
+
+threads_before="$(find "$FORK_SANDBOX_MAIL_ROOT/threads" -maxdepth 1 -type d | wc -l)"
+grants_before="$(find "$FORK_SANDBOX_MAIL_ROOT/.postmaster/grants" -name '*.env' 2>/dev/null | wc -l)"
+out="$("$mail" send --from @alice --to @bob --subject "Send with bad grant" --body - \
+    --reach-probe svc.preview-pr-7:80 <<< "hi" 2>&1)"
+rc=$?
+check "send with a refused grant value exits 2" "2" "$rc"
+check "send with a refused grant value creates no new thread dir" "$threads_before" \
+    "$(find "$FORK_SANDBOX_MAIL_ROOT/threads" -maxdepth 1 -type d | wc -l)"
+check "send with a refused grant value writes no grant file" "$grants_before" \
+    "$(find "$FORK_SANDBOX_MAIL_ROOT/.postmaster/grants" -name '*.env' 2>/dev/null | wc -l)"
+
+grants_before="$(find "$FORK_SANDBOX_MAIL_ROOT/.postmaster/grants" -name '*.env' 2>/dev/null | wc -l)"
+out="$("$mail" send --from @alice --to @bob --subject "Send with big attach" --body - \
+    --allow-namespace preview-pr-7 --reach-probe svc.preview-pr-7:80 \
+    --attach "$big" <<< "x" 2>&1)"
+rc=$?
+if (( rc != 0 )); then
+    ok "send with a valid grant but a failing attachment fails"
+else
+    no "send with a valid grant but a failing attachment fails" "it succeeded"
+fi
+check "no orphaned grant file is left behind" "$grants_before" \
+    "$(find "$FORK_SANDBOX_MAIL_ROOT/.postmaster/grants" -name '*.env' 2>/dev/null | wc -l)"
+
+printf '\n== reply: grant flags are refused ==\n'
+
+out="$("$mail" reply --from @bob --reply-to "$grant_tid" --body - \
+    --allow-namespace preview-pr-7 --reach-probe svc.preview-pr-7:80 <<< "x" 2>&1)"
+rc=$?
+check "reply with a grant flag exits 1" "1" "$rc"
+contains "reply's refusal names send as the way to set a grant" "$out" "grant flags apply to a new thread only"
+
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 (( fail == 0 )) || exit 1
