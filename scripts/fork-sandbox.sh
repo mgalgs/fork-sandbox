@@ -235,7 +235,11 @@
 #                        under) — the directory is writable from inside an
 #                        unattended session, so where it may point is a
 #                        security boundary. Refused on a harness with no
-#                        session-resume capability, and refused with --k8s.
+#                        session-resume capability. Accepted with --k8s,
+#                        forwarded to fork-sandbox-k8s.sh, which pushes the
+#                        bound directory into the pod and pulls it back at
+#                        collect time -- see "Kubernetes seats keep their
+#                        conversation" in docs/kubernetes-runs.md.
 #                        A sealed pi run (--harness pi --network sealed, and
 #                        its pi-local alias) dispatches through
 #                        agent-sandboxed rather than execing pi directly, but
@@ -317,7 +321,8 @@
 #                        discover. Requires --session-state. Refused on a
 #                        harness whose id is "discovered" instead (claude,
 #                        codex; use --resume-session there) or with no
-#                        session-resume capability, and refused with --k8s.
+#                        session-resume capability. Accepted with --k8s, same
+#                        as --session-state above.
 #                        Accepted with --harness pi --network sealed (and its
 #                        pi-local alias), same as --session-state above:
 #                        agent-sandboxed's own --session-dir/--session-id
@@ -2813,22 +2818,6 @@ if [[ "$k8s_mode" == true ]]; then
         echo "--harness claude) is fixed -- there is no flag yet to extend it." >&2
         exit 1
     fi
-    if [[ -n "$session_state" ]]; then
-        echo "Error: --session-state is not supported with --k8s. It binds a host" >&2
-        echo "directory into the sandbox, and a cluster run has no host directory" >&2
-        echo "to bind -- the pod's filesystem dies with the Job." >&2
-        exit 1
-    fi
-    if [[ -n "$resume_session" ]]; then
-        echo "Error: --resume-session is not supported with --k8s. It needs" >&2
-        echo "--session-state, which a cluster run cannot have." >&2
-        exit 1
-    fi
-    if [[ -n "$session_id_arg" ]]; then
-        echo "Error: --session-id is not supported with --k8s. It needs" >&2
-        echo "--session-state, which a cluster run cannot have." >&2
-        exit 1
-    fi
     if [[ -n "$clone_dir_flag" ]]; then
         echo "Error: --clone-dir is not supported with --k8s. It persists a clone" >&2
         echo "on a host directory between wakes, and a cluster Job's pod" >&2
@@ -3010,6 +2999,14 @@ if [[ "$k8s_mode" == true ]]; then
     fs_require_scratch_handoff "$handoff_file" || exit 1
     fs_require_src_project "$project_path" || exit 1
 
+    # --session-state, --resume-session and --session-id: the identical
+    # check the local path applies further down, run here so a --k8s run
+    # refuses exactly what a local run refuses, with the same messages,
+    # before anything is submitted to the cluster. See
+    # fs_validate_session_flags in fork-sandbox-lib.sh.
+    session_state="$(fs_validate_session_flags "$harness" "$session_state" \
+        "$resume_session" "$session_id_arg")" || exit 1
+
     # Unlike fork-sandbox-k8s.sh run, this script generates a branch name
     # when one is not given -- the same convenience --branch has locally.
     # Naming it the way `submit` itself does when --branch is omitted
@@ -3059,6 +3056,13 @@ if [[ "$k8s_mode" == true ]]; then
     # submit argv the same way -- an empty value at run's parse would be
     # an argument error, not "no model".
     [[ -n "$model" ]] && k8s_argv+=(--model "$model")
+    # --session-state was already validated (and resolved to a realpath)
+    # above; --resume-session and --session-id were already regex-checked
+    # there too, so these are forwarded as given, with nothing left for
+    # fork-sandbox-k8s.sh's own cmd_submit to re-validate.
+    [[ -n "$session_state" ]] && k8s_argv+=(--session-state "$session_state")
+    [[ -n "$resume_session" ]] && k8s_argv+=(--resume-session "$resume_session")
+    [[ -n "$session_id_arg" ]] && k8s_argv+=(--session-id "$session_id_arg")
     # fork-sandbox-k8s.sh's own submit is the one place that cross-checks
     # --pi-args against --harness (a claude run never starts pi, so it
     # refuses the combination there); this dispatch just carries the value
@@ -3686,70 +3690,11 @@ fi
 # --session-state, --resume-session and --session-id, validated here rather
 # than beside the other path checks below because --dry-run exits before
 # those run: a caller asking what a run would do must be told the flag is
-# refused, and must be shown the resolved directory. Nothing is CREATED here
-# for the same reason — the mkdir waits until after the dry-run exit.
-#
-# Which harnesses accept these at all, and which of --resume-session /
-# --session-id apply, comes from the capability table rather than a
-# harness-name check here: fs_harness_session_caps is the one place that
-# knows claude and codex discover their id at run end while pi's is given up
-# front.
-fs_harness_session_caps "$harness"
-if [[ -n "$session_state" || -n "$resume_session" || -n "$session_id_arg" ]]; then
-    if [[ "$FS_HARNESS_RESUMABLE" != true ]]; then
-        echo "Error: --session-state, --resume-session and --session-id all need" >&2
-        echo "a harness with a session-resume capability; this run's harness is" >&2
-        echo "'$harness', which has none." >&2
-        exit 1
-    fi
-fi
-if [[ -n "$resume_session" && "$FS_HARNESS_ID_MODE" != discover ]]; then
-    echo "Error: --resume-session names a session id to discover-then-resume," >&2
-    echo "which harness '$harness' does not do. Use --session-id instead if" >&2
-    echo "the harness takes one." >&2
-    exit 1
-fi
-if [[ -n "$session_id_arg" && "$FS_HARNESS_ID_MODE" != given ]]; then
-    echo "Error: --session-id supplies an id for a harness with nothing to" >&2
-    echo "discover; harness '$harness' discovers its id instead. Use" >&2
-    echo "--resume-session instead if the harness takes one." >&2
-    exit 1
-fi
-if [[ -n "$resume_session" && -z "$session_state" ]]; then
-    echo "Error: --resume-session requires --session-state. The session to be" >&2
-    echo "resumed is read out of that directory; with no bind there is no" >&2
-    echo "transcript inside the sandbox to resume from." >&2
-    exit 1
-fi
-if [[ -n "$session_id_arg" && -z "$session_state" ]]; then
-    echo "Error: --session-id requires --session-state. The id names a session" >&2
-    echo "inside that directory; with no bind there is nowhere for it to live." >&2
-    exit 1
-fi
-if [[ -n "$resume_session" && ! "$resume_session" =~ ^[0-9a-f][0-9a-f-]{7,63}$ ]]; then
-    echo "Error: --resume-session '$resume_session' is not a session id. It is" >&2
-    echo "used as a transcript filename stem, so it must match" >&2
-    echo "^[0-9a-f][0-9a-f-]{7,63}\$ — no slashes, no dots, no leading hyphen," >&2
-    echo "no other characters." >&2
-    exit 1
-fi
-if [[ -n "$session_id_arg" && ! "$session_id_arg" =~ ^[0-9a-f][0-9a-f-]{7,63}$ ]]; then
-    echo "Error: --session-id '$session_id_arg' is not a session id. It is" >&2
-    echo "used as a directory/filename component, so it must match" >&2
-    echo "^[0-9a-f][0-9a-f-]{7,63}\$ — no slashes, no dots, no leading hyphen," >&2
-    echo "no other characters." >&2
-    exit 1
-fi
-if [[ -n "$session_state" ]]; then
-    # The bind is read-WRITE and the sandbox is unattended, so where it may
-    # point is a security boundary of the same kind --context-ro enforces —
-    # and a wider one, because this one grants write. The prefix is the
-    # scratch root rather than forks/: callers that keep durable per-agent
-    # state (the postmaster, under the mail root) live beside forks/, not in
-    # it. Shared with --clone-dir below, which grants the same kind of write
-    # access for a different directory.
-    session_state="$(fs_validate_scratch_dir "$session_state" --session-state)" || exit 1
-fi
+# refused, and must be shown the resolved directory. The k8s dispatch above
+# already ran this same check, with the same messages, before its own exec
+# -- see fs_validate_session_flags in fork-sandbox-lib.sh.
+session_state="$(fs_validate_session_flags "$harness" "$session_state" \
+    "$resume_session" "$session_id_arg")" || exit 1
 
 # --clone-dir, validated the same way as --session-state just above and for
 # the same reason (a directory an unattended session writes into is a

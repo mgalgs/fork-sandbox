@@ -119,6 +119,23 @@ new_project() {
 refusal_home="$(mktmp_dir "$scratch/fs-resume-home.XXXXXX")"
 refusal_proj="$(new_project "$refusal_home")"
 refusal_cfg="$(mktmp_dir "$scratch/fs-resume-cfg.XXXXXX")"
+# Minimal fixture k8s config (no real cluster), the same shape
+# tests/fork-sandbox-k8s-test.sh uses for its own "--dry-run, no cluster"
+# section: this is enough for fork-sandbox-k8s.sh's own --dry-run to
+# resolve and print, without any kubectl call, so the --k8s cases below can
+# run a full launcher-to-launcher dry run rather than stopping at "not
+# supported with --k8s".
+cat > "$refusal_cfg/k8s.env" <<'CONF'
+K8S_CONTEXT=test-context
+K8S_NAMESPACE=fork-sandbox-test
+K8S_IMAGE=registry.example/you/fork-sandbox:latest
+K8S_PROXY_UPSTREAM=https://openrouter.ai
+K8S_DENIED_PROBE=10.0.0.1:443
+K8S_RUN_TTL=1800
+CONF
+install -m 600 /dev/null "$refusal_cfg/pi.env"
+printf 'OPENROUTER_API_KEY=sk-test-dummy\n' >> "$refusal_cfg/pi.env"
+chmod 600 "$refusal_cfg/pi.env"
 
 # Runs the launcher with --dry-run (so nothing is created) and prints its
 # combined output; the exit status is the launcher's.
@@ -165,18 +182,49 @@ if (( codex_state_rc == 0 )) && printf '%s\n' "$codex_state_out" \
 else
     no "--session-state accepted on --harness codex" "$codex_state_out"
 fi
-refuses "--session-state refused with --k8s" \
-    "not supported with --k8s" --k8s --model vendor/model \
-    --session-state "$scratch/fs-resume-unused"
-refuses "--resume-session refused with --k8s" \
-    "not supported with --k8s" --k8s --model vendor/model \
-    --resume-session 0123abcd-4567-89ab-cdef-0123456789ab
+# --session-state/--resume-session/--session-id are accepted with --k8s now:
+# fork-sandbox-k8s.sh keeps a mail seat's conversation across cluster wakes
+# the same way a local seat does. This --dry-run exits inside
+# fork-sandbox.sh, before the exec into fork-sandbox-k8s.sh, so it exercises
+# only that the flags are no longer refused there and are reported resolved
+# -- not the k8s push/pull, which tests/fork-sandbox-k8s-test.sh covers with
+# its own kubectl stub.
+k8s_state_out="$(dry_run --k8s --model vendor/model \
+    --session-state "$scratch/fs-resume-unused")"
+k8s_state_rc=$?
+if (( k8s_state_rc == 0 )) && printf '%s\n' "$k8s_state_out" \
+    | grep -q '^session_state='; then
+    ok "--session-state accepted with --k8s"
+else
+    no "--session-state accepted with --k8s" "$k8s_state_out"
+fi
+k8s_resume_out="$(dry_run --k8s --harness claude --model vendor/model \
+    --session-state "$scratch/fs-resume-unused" \
+    --resume-session 0123abcd-4567-89ab-cdef-0123456789ab)"
+k8s_resume_rc=$?
+if (( k8s_resume_rc == 0 )) && printf '%s\n' "$k8s_resume_out" \
+    | grep -qx 'resume_session=0123abcd-4567-89ab-cdef-0123456789ab'; then
+    ok "--resume-session accepted with --k8s"
+else
+    no "--resume-session accepted with --k8s" "$k8s_resume_out"
+fi
 refuses "--resume-session refused without --session-state" \
     "requires --session-state" --harness claude \
     --resume-session 0123abcd-4567-89ab-cdef-0123456789ab
-refuses "--session-id refused with --k8s" \
-    "not supported with --k8s" --k8s --model vendor/model \
-    --session-id 0123abcd-4567-89ab-cdef-0123456789ab
+refuses "bad --resume-session refused on --k8s exactly as locally" \
+    "is not a session id" --k8s --harness claude --model vendor/model \
+    --session-state "$scratch/fs-resume-unused" \
+    --resume-session "not-a-session-id"
+k8s_sid_out="$(dry_run --k8s --model vendor/model \
+    --session-state "$scratch/fs-resume-unused" \
+    --session-id 0123abcd-4567-89ab-cdef-0123456789ab)"
+k8s_sid_rc=$?
+if (( k8s_sid_rc == 0 )) && printf '%s\n' "$k8s_sid_out" \
+    | grep -qx 'session_id=0123abcd-4567-89ab-cdef-0123456789ab'; then
+    ok "--session-id accepted with --k8s (default pi harness)"
+else
+    no "--session-id accepted with --k8s (default pi harness)" "$k8s_sid_out"
+fi
 refuses "--session-id refused without --session-state" \
     "requires --session-state" --harness pi --model vendor/model \
     --session-id 0123abcd-4567-89ab-cdef-0123456789ab

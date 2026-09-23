@@ -297,6 +297,85 @@ fs_validate_scratch_dir() {
     return 0
 }
 
+# Validate --session-state, --resume-session and --session-id together, the
+# same rules regardless of whether the run ends up local or on --k8s: a
+# caller asking what a run would do (--dry-run, or a --k8s submit that fails
+# before a Job exists) must be told the flag is refused with the identical
+# message either path would give. Nothing is CREATED here -- the mkdir
+# waits until after the caller's own dry-run exit, if it has one.
+#
+# Which harnesses accept these at all, and which of --resume-session /
+# --session-id apply, comes from the capability table rather than a
+# harness-name check here: fs_harness_session_caps is the one place that
+# knows claude and codex discover their id at run end while pi's is given up
+# front.
+#
+# Prints the resolved --session-state directory (via fs_validate_scratch_dir)
+# on success, empty when --session-state was not given. Returns 1 on any
+# refusal, having already printed the error.
+fs_validate_session_flags() {
+    local harness="$1" session_state="$2" resume_session="$3" session_id_arg="$4"
+
+    fs_harness_session_caps "$harness"
+    if [[ -n "$session_state" || -n "$resume_session" || -n "$session_id_arg" ]]; then
+        if [[ "$FS_HARNESS_RESUMABLE" != true ]]; then
+            echo "Error: --session-state, --resume-session and --session-id all need" >&2
+            echo "a harness with a session-resume capability; this run's harness is" >&2
+            echo "'$harness', which has none." >&2
+            return 1
+        fi
+    fi
+    if [[ -n "$resume_session" && "$FS_HARNESS_ID_MODE" != discover ]]; then
+        echo "Error: --resume-session names a session id to discover-then-resume," >&2
+        echo "which harness '$harness' does not do. Use --session-id instead if" >&2
+        echo "the harness takes one." >&2
+        return 1
+    fi
+    if [[ -n "$session_id_arg" && "$FS_HARNESS_ID_MODE" != given ]]; then
+        echo "Error: --session-id supplies an id for a harness with nothing to" >&2
+        echo "discover; harness '$harness' discovers its id instead. Use" >&2
+        echo "--resume-session instead if the harness takes one." >&2
+        return 1
+    fi
+    if [[ -n "$resume_session" && -z "$session_state" ]]; then
+        echo "Error: --resume-session requires --session-state. The session to be" >&2
+        echo "resumed is read out of that directory; with no bind there is no" >&2
+        echo "transcript inside the sandbox to resume from." >&2
+        return 1
+    fi
+    if [[ -n "$session_id_arg" && -z "$session_state" ]]; then
+        echo "Error: --session-id requires --session-state. The id names a session" >&2
+        echo "inside that directory; with no bind there is nowhere for it to live." >&2
+        return 1
+    fi
+    if [[ -n "$resume_session" && ! "$resume_session" =~ ^[0-9a-f][0-9a-f-]{7,63}$ ]]; then
+        echo "Error: --resume-session '$resume_session' is not a session id. It is" >&2
+        echo "used as a transcript filename stem, so it must match" >&2
+        echo "^[0-9a-f][0-9a-f-]{7,63}\$ — no slashes, no dots, no leading hyphen," >&2
+        echo "no other characters." >&2
+        return 1
+    fi
+    if [[ -n "$session_id_arg" && ! "$session_id_arg" =~ ^[0-9a-f][0-9a-f-]{7,63}$ ]]; then
+        echo "Error: --session-id '$session_id_arg' is not a session id. It is" >&2
+        echo "used as a directory/filename component, so it must match" >&2
+        echo "^[0-9a-f][0-9a-f-]{7,63}\$ — no slashes, no dots, no leading hyphen," >&2
+        echo "no other characters." >&2
+        return 1
+    fi
+    if [[ -n "$session_state" ]]; then
+        # The bind is read-WRITE and the sandbox is unattended, so where it
+        # may point is a security boundary of the same kind --context-ro
+        # enforces — and a wider one, because this one grants write. The
+        # prefix is the scratch root rather than forks/: callers that keep
+        # durable per-agent state (the postmaster, under the mail root) live
+        # beside forks/, not in it. Shared with --clone-dir, which grants the
+        # same kind of write access for a different directory.
+        session_state="$(fs_validate_scratch_dir "$session_state" --session-state)" || return 1
+    fi
+    printf '%s' "$session_state"
+    return 0
+}
+
 # Reuse an existing --clone-dir clone for a new wake instead of making a
 # fresh one: fetch from its origin remote (named 'origin' -- fs_make_clone
 # never passes git clone a -o, so this is git's own default), then start a
