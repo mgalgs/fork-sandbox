@@ -314,6 +314,55 @@
 # it -- the timeout is what bounds that, not any concurrency -- see
 # LIMITATIONS.
 #
+# CLUSTER SEATS
+#
+# A seat resolving `backend: k8s` (fleet resolve's 13th line; `fleet check`
+# already refuses one with a preset, a sealed network, or a harness other
+# than claude/pi) is woken a third way, alongside the sandbox and handler
+# variants above: `fork-sandbox.sh --k8s` execs into fork-sandbox-k8s.sh
+# run, which submits a cluster Job and blocks in the FOREGROUND until it
+# ends, so this script never runs it directly -- it launches
+# fork-sandbox-k8s-wake.sh, a thin wrapper, detached in its own tmux
+# session (`cc-k8s-<branch>`, deliberately not the `cc-sbx-*` prefix a
+# local run uses -- an operator scanning tmux sessions should be able to
+# tell a cluster wake apart from local run machinery in flight), so
+# `deliver` keeps moving while the Job runs. The wrapper reads its argv
+# and environment from files pm_spawn_wake writes into a fresh wake dir
+# (`mktemp -d` under forks/pm-k8s-wake.*) before launch, runs
+# fork-sandbox.sh --k8s to completion, and normalizes whatever it left
+# behind into the same pid/exit-code/summary.json shape a local
+# tmux-detached wake produces -- see its own header for the exact
+# mapping, including how it turns fork-sandbox-k8s.sh run's exit 3
+# (zero-harvest: agent exited 0, nothing to harvest -- a valid "no reply"
+# mail outcome) into exit-code 0 and reaps the Job that exit code leaves
+# behind. The wake dir IS this run's RUN_DIR (see STATE below); its
+# outbox is passed as --outbox-dir so the harvester finds replies exactly
+# where it looks for a local wake's. `FORK_SANDBOX_POSTMASTER_K8S_DETACH=
+# inline` (test seam only) runs the wrapper synchronously in the current
+# process instead of detaching it, so a test never depends on tmux.
+#
+# fork-sandbox.sh refuses five flags on --k8s -- --clone-dir,
+# --session-state, --resume-session, --session-id, --refresh-at -- so
+# pm_spawn_wake never passes them for a k8s seat: every wake is a fresh
+# session in a fresh clone, and seat continuity (a durable workspace or a
+# resumed conversation, the way a local seat gets one -- see STATE and
+# LIMITATIONS below) is later work, not this round's. `--timeout
+# "${FORK_SANDBOX_POSTMASTER_K8S_TIMEOUT:-14400}"` bounds how long the Job
+# may run; a non-numeric value refuses `deliver` at startup with a clear
+# message rather than failing confusingly on the first k8s wake.
+#
+# rule 4's live delivery (above) never reaches a k8s wake: there is no
+# inbox to deliver into (the wrapper drives one fork-sandbox.sh --k8s run
+# to completion, not an interactive sandbox with a polling inbox dir), so
+# a second message to a busy k8s seat pends and rides the next follow-up
+# wake, exactly as it already does for a busy pi or codex seat today.
+#
+# A `grant: required` seat (fleet resolve's 15th line) additionally waits
+# for a per-thread grant file before it is allowed to spawn at all: see
+# the `refuse ... reason=no-grant` and `held-release` events above, and
+# docs/agent-mail.md's "Cluster seats" and "The held state file is a read
+# contract" sections for the grant file, the hold, and its release.
+#
 # REPLY HARVEST
 #
 # A wake replies by writing one file per outgoing message to its run's
@@ -424,7 +473,13 @@
 #                                   To: or only reached via Cc: (list
 #                                   expansion included); recomputed from
 #                                   the trigger message's own To: at spawn
-#                                   time, see pm_wake_via). A handler seat's
+#                                   time, see pm_wake_via), BACKEND (local
+#                                   or k8s -- see CLUSTER SEATS above; a
+#                                   k8s run's RUN_DIR is the wrapper's wake
+#                                   dir, not a fork-sandbox.sh run dir, and
+#                                   its INBOX and RESUMED are always empty:
+#                                   no rule-4 live delivery, no session
+#                                   resume). A handler seat's
 #                                   run (see THE WAKE's handler variant)
 #                                   writes a deliberately minimal record
 #                                   instead: AGENT, THREAD, TRIGGER,
@@ -488,6 +543,21 @@
 #                                   UTC timestamp (date -u) -- a skip is a
 #                                   routing decision and must be visible,
 #                                   `status` prints its count
+#   held/<thread-id>/<agent>       one `backend: k8s`, `grant: required`
+#                                   seat waiting on a grant file for this
+#                                   thread (see CLUSTER SEATS above):
+#                                   TRIGGER (the message id that will be
+#                                   re-dispatched on release), SINCE (the
+#                                   epoch the record was first created,
+#                                   kept across a superseding TRIGGER),
+#                                   RETRY (1 when the hold absorbed a
+#                                   retry that would otherwise have fired,
+#                                   else 0). Written atomically
+#                                   (tmp+mv) by pm_spawn_wake, released by
+#                                   pm_held_pass; a full read/write
+#                                   contract for this file lives in
+#                                   docs/agent-mail.md's "The held state
+#                                   file is a read contract"
 #   seq/<thread-id>                one line appended per spawn, NEVER
 #                                   reset -- line count feeds the branch
 #                                   name's sequence number, so a name can
