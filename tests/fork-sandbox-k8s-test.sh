@@ -3669,7 +3669,7 @@ if command -v yamllint >/dev/null 2>&1; then
     else no "yamllint: refresh.sh ConfigMap key with line-length enabled" "$out"; fi
 fi
 refresh_off_out="$(refresh_dry --harness claude --refresh-at 0)"
-for pat in REFRESH_THRESHOLD_TOKENS REFRESH_MAX '  refresh.sh: |' '  continuation-header.md: |' '  handoff-original.md: |'; do
+for pat in '- name: REFRESH_THRESHOLD_TOKENS' '- name: REFRESH_MAX' '  refresh.sh: |' '  continuation-header.md: |' '  handoff-original.md: |'; do
     if grep -qF -- "$pat" <<< "$refresh_off_out"; then
         no "--refresh-at 0: no '$pat' in the render" "found"
     else
@@ -3690,7 +3690,7 @@ refuses "a bad --refresh-max is refused" \
     env HOME="$claude_home" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-branch --model claude-sonnet-5 --harness claude --refresh-max nope \
     "$proj_dir" "$handoff_file"
-if grep -qF REFRESH_THRESHOLD_TOKENS "$submit_out"; then
+if grep -qF -- '- name: REFRESH_THRESHOLD_TOKENS' "$submit_out"; then
     no "a pi run (default harness) renders no refresh env" "found in $submit_out"
 else
     ok "a pi run (default harness) renders no refresh env"
@@ -9108,12 +9108,13 @@ claude_launch_checks=(
     'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1'
     'DISABLE_AUTOUPDATER=1'
     'TERM=dumb'
+    'env "${leg_env[@]}" "${claude_argv[@]}"'
     'claude --dangerously-skip-permissions --print --verbose'
     '--output-format stream-json --model "$MODEL"'
     '--settings "$work_dir/inbox-settings.json" --include-hook-events'
-    '< "$mounts_dir/handoff.md"'
-    '> "$work_dir/events.jsonl"'
-    '2> "$work_dir/claude-stderr.log"'
+    '< "${1:-$mounts_dir/handoff.md}"'
+    '> "${2:-$work_dir/events.jsonl}"'
+    '2> "${3:-$work_dir/claude-stderr.log}"'
 )
 claude_launch_missing=""
 for needle in "${claude_launch_checks[@]}"; do
@@ -9312,6 +9313,211 @@ if [[ "$CLAUDE_BLOCK_PI_RC" == 0 ]] \
 else
     no "a failed session-store snapshot warns and keeps the store the wake started from" \
         "pi_rc=$CLAUDE_BLOCK_PI_RC out=$CLAUDE_BLOCK_OUT"
+fi
+
+printf '\n== entrypoint: claude continuation legs (--refresh-at, pod side) ==\n'
+# The block plus the two column-0 helpers it calls, run against a stub
+# claude that counts its calls and, on chosen legs, writes a hand-off into
+# the outbox and prints the inbox hook's nudge line.
+refresh_ep_fns="$(sed -n '/^claude_hook_leg() {/,/^}/p;/^run_claude_continuations() {/,/^}/p' \
+    "$entrypoint_sh")"
+refresh_block_file="$(newdir)/refresh-block.sh"; tmpdirs+=("$(dirname "$refresh_block_file")")
+printf '%s\n' 'set -euo pipefail' "$refresh_ep_fns" "$claude_block" \
+    'printf "CLAUDE_BLOCK_PI_RC=%s\n" "$pi_rc"' > "$refresh_block_file"
+# $1 threshold ("" = refresh off), $2 legs that write a hand-off, $3 legs that
+# exit 1, $4 REFRESH_MAX, $5 RESUME_SESSION. Sets RB_WORK/_HOME/_CALLS/_OUT/_RC/_ENVS.
+refresh_block_run() {
+    local stub_dir mounts home rec
+    stub_dir="$(newdir)"; tmpdirs+=("$stub_dir")
+    mounts="$(newdir)"; tmpdirs+=("$mounts")
+    RB_WORK="$(newdir)"; tmpdirs+=("$RB_WORK")
+    home="$(newdir)"; tmpdirs+=("$home")
+    rec="$(newdir)"; tmpdirs+=("$rec")
+    mkdir -p "$RB_WORK/inbox" "$RB_WORK/session-store" "$RB_WORK/outbox" "$RB_WORK/clone"
+    printf 'Do the thing.\n' > "$mounts/handoff.md"
+    printf 'ORIGINAL BRIEF\n' > "$mounts/handoff-original.md"
+    printf 'CONTINUATION HEADER\n' > "$mounts/continuation-header.md"
+    cp "$repo_dir/scripts/fork-sandbox-refresh.sh" "$mounts/refresh.sh"
+    printf '{}' > "$mounts/claude-credentials.json"
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$mounts/inbox-hook.sh"
+    printf '%s\n' '#!/usr/bin/env bash' \
+        'n=$(( $(cat "$RB_REC/count" 2>/dev/null || echo 0) + 1 ))' \
+        'echo "$n" > "$RB_REC/count"' \
+        'printf "%s\n" "$*" >> "$RB_REC/argv"' \
+        'cat > "$RB_REC/stdin-$n.txt"' \
+        'printf "%s|%s|%s|%s\n" "${FORK_SANDBOX_NUDGE_MARKER:-}" \' \
+        '  "${FORK_SANDBOX_NUDGE_REMINDED:-}" "${FORK_SANDBOX_STALE_REMINDED:-}" \' \
+        '  "${FORK_SANDBOX_INBOX_SEEN:-}" >> "$RB_REC/envs"' \
+        'mkdir -p "$HOME/.claude/projects/-stub-slug"' \
+        'echo "{}" > "$HOME/.claude/projects/-stub-slug/leg-$n.jsonl"' \
+        'touch -d "@$((1700000000 + n))" "$HOME/.claude/projects/-stub-slug/leg-$n.jsonl"' \
+        'if [[ " $RB_HANDOFF_LEGS " == *" $n "* ]]; then' \
+        '  echo "handoff written by leg $n" > "$RB_OUTBOX/handoff.md"' \
+        '  echo "{\"stderr\":\"fork-sandbox-refresh: nudged\"}"' \
+        'fi' \
+        '[[ " $RB_FAIL_LEGS " == *" $n "* ]] && exit 1' \
+        'exit 0' > "$stub_dir/claude"
+    chmod +x "$stub_dir/claude"
+    RB_HOME="$home"; RB_REC="$rec"
+    RB_OUT="$(PATH="$stub_dir:$PATH" HOME="$home" TMPDIR="$rec" \
+        HARNESS=claude MODEL="claude-test-model" \
+        CLAUDE_PROXY_BASE_URL="http://fs-k8s-test-proxy.invalid" \
+        mounts_dir="$mounts" work_dir="$RB_WORK" clone_dir="$RB_WORK/clone" \
+        inbox_dir="$RB_WORK/inbox" outbox_dir="$RB_WORK/outbox" \
+        session_store_dir="$RB_WORK/session-store" SESSION_HARNESS_STORE=1 \
+        RESUME_SESSION="${5:-}" REFRESH_THRESHOLD_TOKENS="${1:-}" REFRESH_MAX="${4:-6}" \
+        RB_REC="$rec" RB_OUTBOX="$RB_WORK/outbox" \
+        RB_HANDOFF_LEGS="${2:-}" RB_FAIL_LEGS="${3:-}" \
+        bash "$refresh_block_file" 2>&1)"
+    RB_RC="$(grep -o 'CLAUDE_BLOCK_PI_RC=.*' <<<"$RB_OUT" | tail -1 | cut -d= -f2)"
+    RB_CALLS="$(cat "$rec/count" 2>/dev/null || echo 0)"
+}
+
+refresh_block_run 100000 "" "" 6
+if [[ "$RB_CALLS" == 1 && "$RB_RC" == 0 ]] \
+    && [[ "$(jq -r .ended "$RB_WORK/refresh.json")" == empty-outbox ]] \
+    && [[ "$(jq -c .continuations "$RB_WORK/refresh.json")" == '[]' ]] \
+    && [[ ! -e "$RB_WORK/inbox/.refresh-config" ]] \
+    && [[ ! -e "$RB_WORK/refresh.json.tmp" ]]; then
+    ok "refresh on, no hand-off: one leg, ended empty-outbox, refresh.json written"
+else
+    no "refresh on, no hand-off: one leg, ended empty-outbox, refresh.json written" \
+        "calls=$RB_CALLS rc=$RB_RC out=$RB_OUT"
+fi
+
+# A zero cap runs no continuation, and the waiting hand-off stays put.
+refresh_block_run 100000 "1" "" 0
+if [[ "$RB_CALLS" == 1 ]] && [[ "$(jq -r .ended "$RB_WORK/refresh.json")" == cap ]] \
+    && [[ -f "$RB_WORK/outbox/handoff.md" ]]; then
+    ok "REFRESH_MAX=0 with a hand-off waiting: no continuation, ended cap"
+else
+    no "REFRESH_MAX=0 with a hand-off waiting: no continuation, ended cap" \
+        "calls=$RB_CALLS out=$RB_OUT"
+fi
+
+# The .refresh-config the hook reads is present while the legs run.
+refresh_cfg_probe() {
+    local ep_copy
+    ep_copy="$(newdir)/probe.sh"; tmpdirs+=("$(dirname "$ep_copy")")
+    printf '%s\n' 'set -euo pipefail' "$refresh_ep_fns" "$claude_block" > "$ep_copy"
+    printf '%s' "$ep_copy"
+}
+refresh_cfg_stub_dir="$(newdir)"; tmpdirs+=("$refresh_cfg_stub_dir")
+printf '%s\n' '#!/usr/bin/env bash' 'cat > /dev/null' \
+    'cp "$RB_WORK_DIR/inbox/.refresh-config" "$RB_WORK_DIR/config-seen"' \
+    > "$refresh_cfg_stub_dir/claude"
+chmod +x "$refresh_cfg_stub_dir/claude"
+refresh_cfg_work="$(newdir)"; tmpdirs+=("$refresh_cfg_work")
+refresh_cfg_mounts="$(newdir)"; tmpdirs+=("$refresh_cfg_mounts")
+mkdir -p "$refresh_cfg_work/inbox" "$refresh_cfg_work/outbox" "$refresh_cfg_work/clone"
+printf 'x\n' > "$refresh_cfg_mounts/handoff.md"
+printf 'x\n' > "$refresh_cfg_mounts/continuation-header.md"
+printf 'x\n' > "$refresh_cfg_mounts/handoff-original.md"
+printf '{}' > "$refresh_cfg_mounts/claude-credentials.json"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$refresh_cfg_mounts/inbox-hook.sh"
+cp "$repo_dir/scripts/fork-sandbox-refresh.sh" "$refresh_cfg_mounts/refresh.sh"
+PATH="$refresh_cfg_stub_dir:$PATH" HOME="$(newdir)" TMPDIR="$(newdir)" HARNESS=claude \
+    MODEL=m CLAUDE_PROXY_BASE_URL=http://fs-k8s-test-proxy.invalid \
+    mounts_dir="$refresh_cfg_mounts" work_dir="$refresh_cfg_work" \
+    clone_dir="$refresh_cfg_work/clone" inbox_dir="$refresh_cfg_work/inbox" \
+    outbox_dir="$refresh_cfg_work/outbox" session_store_dir="$refresh_cfg_work/store" \
+    SESSION_HARNESS_STORE="" RESUME_SESSION="" REFRESH_THRESHOLD_TOKENS=123456 \
+    REFRESH_MAX=6 RB_WORK_DIR="$refresh_cfg_work" \
+    bash "$(refresh_cfg_probe)" > /dev/null 2>&1 || true
+if [[ "$(cat "$refresh_cfg_work/config-seen" 2>/dev/null)" == \
+    "THRESHOLD_TOKENS=123456
+OUTBOX_DIR=$refresh_cfg_work/outbox
+CLONE_DIR=$refresh_cfg_work/clone" ]]; then
+    ok "the first leg runs with .refresh-config (threshold, outbox, clone) in the inbox"
+else
+    no "the first leg runs with .refresh-config (threshold, outbox, clone) in the inbox" \
+        "seen: $(cat "$refresh_cfg_work/config-seen" 2>/dev/null)"
+fi
+
+# Hand-off on leg 1: one continuation, fresh (no --resume even with
+# RESUME_SESSION set), original brief + hand-off on its stdin, the hand-off
+# recorded in /work and gone from the outbox.
+refresh_block_run 100000 "1" "" 6 resumeid-0001-aaaa-bbbb-cccccccccccc
+if [[ "$RB_CALLS" == 2 && "$RB_RC" == 0 ]] \
+    && [[ "$(sed -n 1p "$RB_REC/argv")" == *"--resume resumeid-0001"* ]] \
+    && [[ "$(sed -n 2p "$RB_REC/argv")" != *"--resume"* ]] \
+    && grep -qF 'ORIGINAL BRIEF' "$RB_REC/stdin-2.txt" \
+    && grep -qF 'CONTINUATION HEADER' "$RB_REC/stdin-2.txt" \
+    && grep -qF 'handoff written by leg 1' "$RB_REC/stdin-2.txt" \
+    && cmp -s "$RB_REC/stdin-2.txt" "$RB_WORK/continuation-prompt-1.md" \
+    && [[ -f "$RB_WORK/handoff-1.md" && ! -e "$RB_WORK/outbox/handoff.md" ]] \
+    && [[ -f "$RB_WORK/events-continuation-1.jsonl" ]] \
+    && [[ -f "$RB_WORK/claude-stderr-continuation-1.log" ]] \
+    && [[ "$(jq -r .ended "$RB_WORK/refresh.json")" == empty-outbox ]] \
+    && [[ "$(jq -c '.continuations | map({leg, exit, handoff})' "$RB_WORK/refresh.json")" \
+        == '[{"leg":2,"exit":0,"handoff":"handoff-1.md"}]' ]]; then
+    ok "a hand-off on leg 1 starts one fresh continuation with brief + hand-off on stdin"
+else
+    no "a hand-off on leg 1 starts one fresh continuation with brief + hand-off on stdin" \
+        "calls=$RB_CALLS rc=$RB_RC argv: $(cat "$RB_REC/argv") out=$RB_OUT"
+fi
+
+# Cap: REFRESH_MAX=1 with a hand-off on legs 1 and 2 -> two legs, ended cap,
+# and the second hand-off is left for the operator to see in the outbox.
+refresh_block_run 100000 "1 2" "" 1
+if [[ "$RB_CALLS" == 2 && "$(jq -r .ended "$RB_WORK/refresh.json")" == cap ]]; then
+    ok "REFRESH_MAX=1 with hand-offs on legs 1 and 2: two legs, ended cap"
+else
+    no "REFRESH_MAX=1 with hand-offs on legs 1 and 2: two legs, ended cap" \
+        "calls=$RB_CALLS out=$RB_OUT"
+fi
+
+# A continuation that crashes ends the loop with leg-error, pi_rc is its
+# exit, and a hand-off it left behind is kept in /work, not the outbox.
+refresh_block_run 100000 "1 2" "2" 6
+if [[ "$RB_CALLS" == 2 && "$RB_RC" == 1 ]] \
+    && [[ "$(jq -r .ended "$RB_WORK/refresh.json")" == leg-error ]] \
+    && [[ "$(jq -r '.continuations[0].exit' "$RB_WORK/refresh.json")" == 1 ]] \
+    && [[ -f "$RB_WORK/handoff-leg-2-after-error.md" && ! -e "$RB_WORK/outbox/handoff.md" ]]; then
+    ok "a crashed continuation: leg-error, pi_rc is its exit, leftover hand-off kept"
+else
+    no "a crashed continuation: leg-error, pi_rc is its exit, leftover hand-off kept" \
+        "calls=$RB_CALLS rc=$RB_RC out=$RB_OUT"
+fi
+
+# Every leg gets its own hook-state directory, leg 1 included.
+refresh_block_run 100000 "1 2" "" 6
+refresh_env_dirs="$(cut -d'|' -f1 "$RB_REC/envs" | xargs -n1 dirname | sort -u | wc -l)"
+if [[ "$RB_CALLS" == 3 && "$refresh_env_dirs" == 3 ]] \
+    && [[ "$(sed -n 1p "$RB_REC/envs")" == "$RB_REC/fs-hook-leg-1/nudged|$RB_REC/fs-hook-leg-1/nudge-reminded|$RB_REC/fs-hook-leg-1/stale-reminded|$RB_REC/fs-hook-leg-1/inbox-seen" ]] \
+    && [[ "$(sed -n 3p "$RB_REC/envs")" == "$RB_REC/fs-hook-leg-3/nudged|"* ]]; then
+    ok "every leg runs with its own fresh hook-state directory"
+else
+    no "every leg runs with its own fresh hook-state directory" \
+        "dirs=$refresh_env_dirs envs: $(cat "$RB_REC/envs")"
+fi
+
+# Snapshot position: it follows the LAST continuation, so the newest
+# transcript in the pushed-back store is the second continuation's (leg 3).
+if [[ "$(ls -t "$RB_WORK"/session-store/-stub-slug/ | head -1)" == leg-3.jsonl ]]; then
+    ok "after two continuations the newest stored transcript is the last continuation's"
+else
+    no "after two continuations the newest stored transcript is the last continuation's" \
+        "store: $(ls -lt "$RB_WORK"/session-store/-stub-slug/ 2>&1)"
+fi
+
+# Refresh off: no config, no loop, no hook env, no refresh.json.
+refresh_block_run "" "1" "" 6
+if [[ "$RB_CALLS" == 1 && "$RB_RC" == 0 ]] \
+    && [[ ! -e "$RB_WORK/inbox/.refresh-config" && ! -e "$RB_WORK/refresh.json" ]] \
+    && [[ "$(cat "$RB_REC/envs")" == '|||' ]] \
+    && [[ -f "$RB_WORK/outbox/handoff.md" ]]; then
+    ok "REFRESH_THRESHOLD_TOKENS empty: no config, no loop, no hook env, no refresh.json"
+else
+    no "REFRESH_THRESHOLD_TOKENS empty: no config, no loop, no hook env, no refresh.json" \
+        "calls=$RB_CALLS out=$RB_OUT"
+fi
+
+ep_long="$(awk 'length > 96 { printf "%d ", FNR }' "$entrypoint_sh")"
+if [[ -z "$ep_long" ]]; then
+    ok "no entrypoint line exceeds 96 columns (it ships inside a ConfigMap)"
+else
+    no "no entrypoint line exceeds 96 columns (it ships inside a ConfigMap)" "lines: $ep_long"
 fi
 
 # The review loop always runs pi and always prefers REVIEW_MODEL over

@@ -150,10 +150,23 @@
 #   SESSION_ID      the pi session id for the coding leg's --session-id,
 #                   when HARNESS=pi and SESSION_HARNESS_STORE=1. Optional
 #                   even then, same reason as RESUME_SESSION.
+#   REFRESH_THRESHOLD_TOKENS
+#                   set by fork-sandbox-k8s.sh's `submit` when the run
+#                   refreshes itself (--refresh-at, claude only): the
+#                   context-token count past which the inbox hook nudges a
+#                   leg to write a hand-off. Unset or empty means no
+#                   refresh: no .refresh-config, no continuation legs.
+#   REFRESH_MAX     the most continuation legs one run may chain. Default
+#                   6, the same default the local runner uses.
 #
 # Reads from /mnt/fork-sandbox/ (the scripts ConfigMap, mounted read-only):
 #   handoff.md              the run's whole prompt, on the coding harness's
 #                           stdin.
+#   refresh.sh, continuation-header.md, handoff-original.md
+#                           only when REFRESH_THRESHOLD_TOKENS is set: the
+#                           shared refresh logic (sourced), the continuation
+#                           prompt's preamble, and the operator's own
+#                           hand-off file, verbatim.
 #   pi-agent-settings.json  optional; this repo's pi-agent/settings.json,
 #                           the same file agent-sandboxed seeds a sealed
 #                           local run's ~/.pi/agent from. Only the
@@ -223,6 +236,8 @@ fi
 : "${SESSION_HARNESS_STORE:=}"
 : "${RESUME_SESSION:=}"
 : "${SESSION_ID:=}"
+: "${REFRESH_THRESHOLD_TOKENS:=}"
+: "${REFRESH_MAX:=6}"
 if [[ "$REVIEW_LOOP_CAP" =~ ^[1-9][0-9]*$ ]]; then
     : "${BASE_SHA:?BASE_SHA must be set when REVIEW_LOOP_CAP is set}"
     if [[ "$HARNESS" == claude && -z "$REVIEW_MODEL" ]]; then
@@ -761,6 +776,102 @@ commit_uncommitted_work() {
     fi
 }
 
+# Per-leg state for the inbox hook. Locally every leg is a fresh tmpfs, so
+# the hook's nudge markers and seen-list start empty; a pod's /tmp outlives
+# every leg, so each leg gets its own directory instead (TMPDIR overrides
+# the root, for tests).
+claude_hook_leg() {
+    claude_hook_dir="${TMPDIR:-/tmp}/fs-hook-leg-$1"
+    rm -rf "$claude_hook_dir"
+    mkdir -p "$claude_hook_dir"
+}
+
+# The continuation loop, the pod-side twin of the local runner's: while the
+# leg that just ended left a hand-off in the outbox, start a FRESH claude
+# session (never --resume) on the same clone with the original brief plus
+# that hand-off. The pure logic is fs_refresh_* from refresh.sh, the same
+# file the local runner sources. Records live in /work, not the outbox, so
+# nothing here is harvested as mail. pi_rc ends as the LAST leg's exit.
+# Ends with refresh.json: { ended, continuations }.
+run_claude_continuations() {
+    local log="$work_dir/refresh.log" ended="" n=0 leg_no next_n rec
+    local stale rc prompt stale_json merged last_events="$work_dir/events.jsonl"
+    local continuations='[]'
+    if (( pi_rc == 0 )); then
+        fs_refresh_archive_inbox "$inbox_dir" "$work_dir" 1 "$log"
+    fi
+    while :; do
+        if [[ -f "$outbox_dir/handoff.md" ]]; then
+            if (( n >= REFRESH_MAX )); then
+                ended=cap
+                break
+            fi
+            next_n=$(( n + 1 ))
+            if ! fs_refresh_take_handoff "$outbox_dir" "$work_dir" \
+                "$next_n" "$log" > /dev/null; then
+                ended=no-handoff
+                break
+            fi
+            n=$next_n
+            leg_no=$(( n + 1 ))
+            rec="handoff-$n.md"
+            stale=0
+            if fs_refresh_handoff_stale "$clone_dir" "$work_dir/$rec"; then
+                stale=1
+            fi
+            prompt="$work_dir/continuation-prompt-$n.md"
+            fs_refresh_build_prompt "$n" "$work_dir/$rec" "$prompt" "$stale" \
+                "$mounts_dir/continuation-header.md" \
+                "$mounts_dir/handoff-original.md" "$work_dir"
+            claude_hook_leg "$leg_no"
+            claude_argv=("${claude_argv_fresh[@]}")
+            last_events="$work_dir/events-continuation-$n.jsonl"
+            echo "fork-sandbox-k8s-entrypoint: continuation leg $leg_no" \
+                "(from $rec)" >&2
+            rc=0
+            run_claude_attempt "$prompt" "$last_events" \
+                "$work_dir/claude-stderr-continuation-$n.log" || rc=$?
+            pi_rc=$rc
+            echo "fork-sandbox-k8s-entrypoint: claude exited $rc" >&2
+            if (( rc == 0 )); then
+                fs_refresh_archive_inbox "$inbox_dir" "$work_dir" "$leg_no" "$log"
+            fi
+            stale_json=false
+            if (( stale )); then
+                stale_json=true
+            fi
+            merged="$(jq -c -n --argjson prev "$continuations" \
+                --argjson leg "$leg_no" --argjson exit "$rc" \
+                --arg handoff "$rec" --argjson stale "$stale_json" \
+                '$prev + [{leg: $leg, exit: $exit, handoff: $handoff,
+                    handoff_stale: $stale}]')"
+            continuations="$merged"
+            if (( rc != 0 )); then
+                if [[ -f "$outbox_dir/handoff.md" && ! -L "$outbox_dir/handoff.md" ]]; then
+                    mv -f -- "$outbox_dir/handoff.md" \
+                        "$work_dir/handoff-leg-$leg_no-after-error.md"
+                fi
+                ended=leg-error
+                break
+            fi
+            continue
+        fi
+        if fs_refresh_leg_was_nudged "$last_events"; then
+            ended=no-handoff
+        else
+            ended=empty-outbox
+        fi
+        break
+    done
+    rm -f -- "$inbox_dir/.refresh-config"
+    jq -n --arg ended "$ended" --argjson continuations "$continuations" \
+        '{ended: $ended, continuations: $continuations}' \
+        > "$work_dir/refresh.json.tmp"
+    mv -f "$work_dir/refresh.json.tmp" "$work_dir/refresh.json"
+    echo "fork-sandbox-k8s-entrypoint: refresh ended: $ended" \
+        "($n continuation leg(s) ran)" >&2
+}
+
 pi_rc=0
 if [[ "$HARNESS" == pi ]]; then
     # REVIEW_MODEL, when set, is folded in up front so the review loop
@@ -840,16 +951,33 @@ else
         claude_argv=("${claude_argv[0]}" --resume "$RESUME_SESSION" "${claude_argv[@]:1}")
     fi
 
+    # $1 stdin, $2 events, $3 stderr: leg 1's own files unless a
+    # continuation names its own. The inbox hook's state paths are set
+    # only while a refreshing run has a per-leg directory (claude_hook_dir).
     run_claude_attempt() {
-        ANTHROPIC_BASE_URL="$CLAUDE_PROXY_BASE_URL" \
-            CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
-            DISABLE_AUTOUPDATER=1 \
-            TERM=dumb \
-            "${claude_argv[@]}" \
-            < "$mounts_dir/handoff.md" \
-            > "$work_dir/events.jsonl" \
-            2> "$work_dir/claude-stderr.log"
+        local -a leg_env=(ANTHROPIC_BASE_URL="$CLAUDE_PROXY_BASE_URL"
+            CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 DISABLE_AUTOUPDATER=1
+            TERM=dumb)
+        if [[ -n "${claude_hook_dir:-}" ]]; then
+            leg_env+=("FORK_SANDBOX_NUDGE_MARKER=$claude_hook_dir/nudged"
+                "FORK_SANDBOX_NUDGE_REMINDED=$claude_hook_dir/nudge-reminded"
+                "FORK_SANDBOX_STALE_REMINDED=$claude_hook_dir/stale-reminded"
+                "FORK_SANDBOX_INBOX_SEEN=$claude_hook_dir/inbox-seen")
+        fi
+        env "${leg_env[@]}" "${claude_argv[@]}" \
+            < "${1:-$mounts_dir/handoff.md}" \
+            > "${2:-$work_dir/events.jsonl}" \
+            2> "${3:-$work_dir/claude-stderr.log}"
     }
+
+    if [[ -n "${REFRESH_THRESHOLD_TOKENS:-}" ]]; then
+        # shellcheck source=/dev/null
+        source "$mounts_dir/refresh.sh"
+        printf '%s\n' "THRESHOLD_TOKENS=$REFRESH_THRESHOLD_TOKENS" \
+            "OUTBOX_DIR=$outbox_dir" "CLONE_DIR=$clone_dir" \
+            > "$inbox_dir/.refresh-config"
+        claude_hook_leg 1
+    fi
 
     echo "fork-sandbox-k8s-entrypoint: running claude" >&2
     run_claude_attempt || pi_rc=$?
@@ -871,6 +999,10 @@ else
         pi_rc=0
         run_claude_attempt || pi_rc=$?
         echo "fork-sandbox-k8s-entrypoint: claude exited $pi_rc" >&2
+    fi
+
+    if [[ -n "${REFRESH_THRESHOLD_TOKENS:-}" ]]; then
+        run_claude_continuations
     fi
 
     if [[ "$SESSION_HARNESS_STORE" == 1 ]]; then
