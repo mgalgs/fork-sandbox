@@ -775,20 +775,35 @@ pm_retry_fails_get() {
 # The one place that actually writes $RETRIES/$tid/$agent, taking every
 # field verbatim -- callers read whatever they want to keep BEFORE calling
 # this (see pm_retry_fails_set and pm_retry_schedule below), rather than
-# this function merging on their behalf. An absent/zero $fails with an
-# empty $trigger means nothing is left to store, so the file is removed
-# outright; otherwise FAILS is written only when non-(empty/zero), and
-# TRIGGER/ATTEMPT/NOT_BEFORE only when $trigger is non-empty (an ATTEMPT
-# or NOT_BEFORE with no TRIGGER makes no sense -- there is nothing left to
-# retry). Same mktemp + mv full-file rewrite as the rest of this file --
-# an external reader (pm_retry_pass, cmd_status) must never see a partial
-# write.
+# this function merging on their behalf. This is a READ CONTRACT: an
+# external tool may read this file to tell a pending retry from an
+# exhausted or a recovered one, so every state transition below writes a
+# complete record, not just whatever this call happens to touch.
+#   FAILS            the wedge-bound consecutive-failure counter
+#   STATE            pending | exhausted | recovered (absent: no retry
+#                     history, or a superseded/refused schedule with
+#                     nothing left to report)
+#   TRIGGER/ATTEMPT/NOT_BEFORE   the pending retry's own fields (STATE
+#                     pending only)
+#   MAX              the retry cap in effect when STATE was last set to
+#                     pending or exhausted
+#   LAST_FAILED_RUN  the run id of the wake whose failure produced this
+#                     STATE (pending or exhausted)
+#   RECOVERED_AT     epoch seconds a recovered STATE was reached
+# An absent/zero $fails with an empty $trigger and empty $state means
+# nothing is left to store, so the file is removed outright; otherwise
+# each field is written only when non-empty (an ATTEMPT or NOT_BEFORE with
+# no TRIGGER makes no sense -- there is nothing left to retry). Same
+# mktemp + mv full-file rewrite as the rest of this file -- an external
+# reader (pm_retry_pass, cmd_status) must never see a partial write.
 pm_retry_raw_write() {
-    local tid="$1" agent="$2" fails="$3" trigger="$4" attempt="$5" not_before="$6"
-    local has_fails=0 has_trigger=0
+    local tid="$1" agent="$2" fails="$3" trigger="$4" attempt="$5" not_before="$6" \
+          rstate="$7" max="$8" last_failed_run="$9" recovered_at="${10}"
+    local has_fails=0 has_trigger=0 has_state=0
     [[ -n "$fails" && "$fails" != 0 ]] && has_fails=1
     [[ -n "$trigger" ]] && has_trigger=1
-    if (( ! has_fails && ! has_trigger )); then
+    [[ -n "$rstate" ]] && has_state=1
+    if (( ! has_fails && ! has_trigger && ! has_state )); then
         rm -f -- "$RETRIES/$tid/$agent"
         return 0
     fi
@@ -797,45 +812,90 @@ pm_retry_raw_write() {
     tmp="$(mktemp "$RETRIES/$tid/.tmp.XXXXXX")"
     {
         (( has_fails )) && printf 'FAILS=%s\n' "$fails"
+        (( has_state )) && printf 'STATE=%s\n' "$rstate"
         if (( has_trigger )); then
             printf 'TRIGGER=%s\n' "$trigger"
             printf 'ATTEMPT=%s\n' "${attempt:-0}"
             [[ -n "$not_before" ]] && printf 'NOT_BEFORE=%s\n' "$not_before"
         fi
+        [[ -n "$max" ]] && printf 'MAX=%s\n' "$max"
+        [[ -n "$last_failed_run" ]] && printf 'LAST_FAILED_RUN=%s\n' "$last_failed_run"
+        [[ -n "$recovered_at" ]] && printf 'RECOVERED_AT=%s\n' "$recovered_at"
     } > "$tmp"
     mv -- "$tmp" "$RETRIES/$tid/$agent"
 }
 
-# fails=0 drops the whole file, TRIGGER/ATTEMPT/NOT_BEFORE included -- an
-# exit-0 harvest is exactly the "this pair carried no unresolved retry
-# forward" statement (see pm_harvest_run's pending-message branch and
-# pm_retry_schedule's own comment on supersession). A nonzero fails
-# preserves whatever retry schedule is already on file: this function is
-# the wedge bound's own bookkeeping (pm_harvest_run), a different, merely
-# neighboring concern from the retry schedule pm_retry_schedule below
-# writes into the same file.
+# Persists an updated FAILS count (the wedge bound's own bookkeeping,
+# a concern merely neighboring the retry schedule below, not part of it)
+# while leaving every other field on file exactly as it is -- callers
+# needing a bare reset with nothing else disturbed use pm_retry_wedge_reset
+# instead (see its own comment for why the two must not be the same
+# function).
 pm_retry_fails_set() {
     local tid="$1" agent="$2" fails="$3"
-    if [[ "$fails" == 0 ]]; then
-        pm_retry_raw_write "$tid" "$agent" 0 "" "" ""
-        return 0
-    fi
-    local f="$RETRIES/$tid/$agent" trigger attempt not_before
+    local f="$RETRIES/$tid/$agent" trigger attempt not_before rstate max last_failed_run
     trigger="$(fs_pm_env_get "$f" TRIGGER)"
     attempt="$(fs_pm_env_get "$f" ATTEMPT)"
     not_before="$(fs_pm_env_get "$f" NOT_BEFORE)"
-    pm_retry_raw_write "$tid" "$agent" "$fails" "$trigger" "$attempt" "$not_before"
+    rstate="$(fs_pm_env_get "$f" STATE)"
+    max="$(fs_pm_env_get "$f" MAX)"
+    last_failed_run="$(fs_pm_env_get "$f" LAST_FAILED_RUN)"
+    pm_retry_raw_write "$tid" "$agent" "$fails" "$trigger" "$attempt" "$not_before" \
+        "$rstate" "$max" "$last_failed_run" ""
 }
 
-# Drops a pending retry schedule (TRIGGER/ATTEMPT/NOT_BEFORE) without
-# touching FAILS -- called wherever a wake for (tid, agent) is about to be
-# spawned some other way, so a stale scheduled retry for an older trigger
-# can never fire later and double-wake the seat (see pm_wake_or_pend's
-# route-path spawn, the one caller today).
+# The wedge bound's own reset: FAILS back to 0 when it trips (3
+# consecutive failed resumed wakes), with every other field on file left
+# untouched. This must NOT go through a fails=0-clears-everything path:
+# pm_retry_schedule runs immediately after this, in the same harvest, and
+# needs the real ATTEMPT/MAX still on file to tell a genuine cap
+# exhaustion from a fresh schedule -- wiping them here was the bug that let
+# a wedge trip coinciding with the last permitted retry silently grant one
+# more retry than the configured cap.
+pm_retry_wedge_reset() {
+    local tid="$1" agent="$2"
+    local f="$RETRIES/$tid/$agent" trigger attempt not_before rstate max last_failed_run recovered_at
+    trigger="$(fs_pm_env_get "$f" TRIGGER)"
+    attempt="$(fs_pm_env_get "$f" ATTEMPT)"
+    not_before="$(fs_pm_env_get "$f" NOT_BEFORE)"
+    rstate="$(fs_pm_env_get "$f" STATE)"
+    max="$(fs_pm_env_get "$f" MAX)"
+    last_failed_run="$(fs_pm_env_get "$f" LAST_FAILED_RUN)"
+    recovered_at="$(fs_pm_env_get "$f" RECOVERED_AT)"
+    pm_retry_raw_write "$tid" "$agent" 0 "$trigger" "$attempt" "$not_before" \
+        "$rstate" "$max" "$last_failed_run" "$recovered_at"
+}
+
+# A clean exit-0 harvest. FAILS resets to 0 and any pending schedule is
+# dropped (see pm_retry_schedule's own comment on supersession) -- but if
+# this pair ever failed before (a retries file already exists), that
+# history does not just vanish: it becomes a persistent STATE=recovered
+# record (RECOVERED_AT, LAST_FAILED_RUN kept) so an external reader can
+# still see that this pair was failing and came back, not just that it is
+# quiet now. A pair with no prior retry file (never failed) gets no
+# recovered record either -- there is nothing to recover from.
+pm_retry_recover() {
+    local tid="$1" agent="$2"
+    local f="$RETRIES/$tid/$agent"
+    [[ -e "$f" ]] || return 0
+    local last_failed_run
+    last_failed_run="$(fs_pm_env_get "$f" LAST_FAILED_RUN)"
+    pm_retry_raw_write "$tid" "$agent" 0 "" "" "" recovered "" "$last_failed_run" "$(date +%s)"
+}
+
+# Drops a pending retry schedule (STATE/TRIGGER/ATTEMPT/NOT_BEFORE/MAX)
+# without touching FAILS -- called wherever a wake for (tid, agent) is
+# about to be spawned some other way, so a stale scheduled retry for an
+# older trigger can never fire later and double-wake the seat (see
+# pm_wake_or_pend's route-path spawn, and pm_harvest_run's pending-message
+# branch, which supersedes a retry the same way). Neither pending nor
+# exhausted nor recovered describes "superseded", so this leaves no STATE
+# behind rather than inventing a fourth one the read contract does not
+# define.
 pm_retry_clear_schedule() {
     local tid="$1" agent="$2" fails
     fails="$(pm_retry_fails_get "$tid" "$agent")"
-    pm_retry_raw_write "$tid" "$agent" "$fails" "" "" ""
+    pm_retry_raw_write "$tid" "$agent" "$fails" "" "" "" "" "" "" ""
 }
 
 pm_new_uuid() {
@@ -1461,17 +1521,21 @@ pm_parse_retry_backoff() {
     PM_RETRY_BACKOFF=()
     local raw="${FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF-300,1200}"
     [[ -z "$raw" ]] && return 0
+    # Validate the whole string against the grammar BEFORE splitting --
+    # bash's own `read -a` silently drops a trailing empty field (so
+    # "300," would otherwise slip through as the one-entry list "300"),
+    # and a leading or doubled comma likewise produces an empty $p that
+    # the per-entry check below would also have to special-case. One
+    # regex covers all three shapes at once, matching the grammar this
+    # error message (and the docs) actually promise: one or more
+    # non-negative integers, joined by single commas, nothing more.
+    if [[ ! "$raw" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
+        echo "Error: postmaster: \$FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF '$raw' is not a comma-separated list of non-negative integers (seconds)." >&2
+        return 1
+    fi
     local -a parts
     IFS=',' read -ra parts <<< "$raw"
-    local p
-    for p in "${parts[@]}"; do
-        if [[ ! "$p" =~ ^[0-9]+$ ]]; then
-            echo "Error: postmaster: \$FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF entry '$p' is not a non-negative integer (seconds)." >&2
-            echo "  Full value: '$raw'" >&2
-            return 1
-        fi
-        PM_RETRY_BACKOFF+=("$p")
-    done
+    PM_RETRY_BACKOFF=("${parts[@]}")
     return 0
 }
 
@@ -1484,7 +1548,8 @@ pm_require_retry_backoff() {
 }
 
 pm_write_handoff() {
-    local out="$1" agent="$2" persona_path="$3" tid="$4" trigger_mid="$5" via="$6" trigger_only="$7"
+    local out="$1" agent="$2" persona_path="$3" tid="$4" trigger_mid="$5" via="$6" \
+          trigger_only="$7" is_retry="${8:-}"
     local render_rc=0 kit_path kit_text via_label
     kit_path="$(pm_kit_path)" || {
         echo "Error: postmaster: fleet kit missing (checked loudly at deliver" >&2
@@ -1551,6 +1616,14 @@ pm_write_handoff() {
         fi
         printf '\n'
         printf 'The triggering message for this wake is: %s\n\n' "$trigger_mid"
+        if [[ "$is_retry" == 1 ]]; then
+            printf '## This is a retry\n\n'
+            printf 'Your previous wake for this same message did not finish cleanly (it\n'
+            printf 'crashed, or was killed) and is being retried. If you already sent a\n'
+            printf 'reply before it died, that reply is already posted on the thread above --\n'
+            printf 'look for a message already From: @%s answering this trigger before\n' "$agent"
+            printf 'writing a new one, and do not send the same reply twice.\n\n'
+        fi
         cat <<'INSTR'
 ## Replying
 
@@ -1865,7 +1938,7 @@ pm_exec_wake() {
 }
 
 pm_spawn_wake() {
-    local project="$1" agent="$2" tid="$3" mid="$4"
+    local project="$1" agent="$2" tid="$3" mid="$4" is_retry="${5:-}"
     local harness model thinking network persona_path description wake_on_cc \
           refresh_at triage preset handler command
     # description and wake_on_cc (resolve's 6th and 7th lines) are read to
@@ -1945,7 +2018,7 @@ pm_spawn_wake() {
 
     mkdir -p -- "$HANDOFFS"
     local handoff_file="$HANDOFFS/$run_id.md"
-    if ! pm_write_handoff "$handoff_file" "$agent" "$persona_path" "$tid" "$mid" "$via" "$trigger_only"; then
+    if ! pm_write_handoff "$handoff_file" "$agent" "$persona_path" "$tid" "$mid" "$via" "$trigger_only" "$is_retry"; then
         pm_flag "$tid" "handoff render failed for $agent: $mid"
         return 0
     fi
@@ -2594,7 +2667,7 @@ pm_harvest_one_file() {
 }
 
 pm_followup_wake() {
-    local project="$1" agent="$2" tid="$3" mid="$4" f
+    local project="$1" agent="$2" tid="$3" mid="$4" is_retry="${5:-}" f
     # Returns 1 on every early refusal below (never reaching pm_spawn_wake)
     # and 0 once it does -- pm_retry_pass (the only caller that checks this
     # return) treats 1 as terminal for that trigger's retry schedule: hops
@@ -2621,7 +2694,7 @@ pm_followup_wake() {
         pm_flag "$tid" "thread budget $budget exhausted"
         return 1
     fi
-    pm_spawn_wake "$project" "$agent" "$tid" "$mid"
+    pm_spawn_wake "$project" "$agent" "$tid" "$mid" "$is_retry"
 }
 
 # events.jsonl is fork-sandbox.sh's own event stream for this run
@@ -2701,32 +2774,36 @@ pm_wake_is_dead() {
 }
 
 # Schedules a bounded, deferred retry of $trigger for (tid, agent) after a
-# wake failed outright (nonzero exit, or no summary.json) with no pending
-# message to supersede it -- see pm_harvest_run's call site, which is also
-# the reason this never fires for a run-dir-vanished harvest (that branch
-# returns before $was_failure is ever set) or a spawn failure (no run, no
-# harvest, nothing to schedule from). $PM_RETRY_BACKOFF's length is the
-# retry cap; retry k (0-indexed -- "how many retries already spent for
-# this trigger") uses backoff entry k, so an empty backoff list (cap 0)
-# schedules nothing and flags exhaustion on the very first failure. FAILS
-# (Section 1's wedge-bound counter, already written for this harvest by
-# the time this runs) is read fresh and passed through untouched -- the
-# two mechanisms share a file but not a purpose.
+# wake (run id $rid) failed outright (nonzero exit, or no summary.json)
+# with no pending message to supersede it -- see pm_harvest_run's call
+# site, which is also the reason this never fires for a run-dir-vanished
+# harvest (that branch returns before $was_failure is ever set) or a spawn
+# failure (no run, no harvest, nothing to schedule from). $PM_RETRY_BACKOFF's
+# length is the retry cap; retry k (0-indexed -- "how many retries already
+# spent for this trigger") uses backoff entry k, so an empty backoff list
+# (cap 0) schedules nothing and flags exhaustion on the very first failure.
+# FAILS (Section 1's wedge-bound counter, already written for this harvest
+# by the time this runs) is read fresh and passed through untouched -- the
+# two mechanisms share a file but not a purpose. Every call here writes a
+# terminal-or-pending STATE plus MAX and LAST_FAILED_RUN, so an external
+# reader can always tell which of the two this pair is in and which run
+# put it there.
 pm_retry_schedule() {
-    local tid="$1" agent="$2" trigger="$3"
+    local tid="$1" agent="$2" trigger="$3" rid="$4"
     local fails attempt cap
     fails="$(pm_retry_fails_get "$tid" "$agent")"
     attempt="$(fs_pm_env_get "$RETRIES/$tid/$agent" ATTEMPT)"
     [[ "$attempt" =~ ^[0-9]+$ ]] || attempt=0
     cap="${#PM_RETRY_BACKOFF[@]}"
     if (( attempt >= cap )); then
-        pm_retry_raw_write "$tid" "$agent" "$fails" "" "" ""
+        pm_retry_raw_write "$tid" "$agent" "$fails" "" "" "" exhausted "$cap" "$rid" ""
         pm_flag "$tid" "wake for $agent failed after $cap retries (trigger ${trigger:0:8})"
         return 0
     fi
     local not_before
     not_before=$(( $(date +%s) + PM_RETRY_BACKOFF[attempt] ))
-    pm_retry_raw_write "$tid" "$agent" "$fails" "$trigger" "$attempt" "$not_before"
+    pm_retry_raw_write "$tid" "$agent" "$fails" "$trigger" "$attempt" "$not_before" \
+        pending "$cap" "$rid" ""
 }
 
 pm_harvest_run() {
@@ -2845,7 +2922,7 @@ pm_harvest_run() {
             # Any exit-0 harvest resets the wedge-bound counter, regardless
             # of sessions_tracked -- a given-mode harness's clean finish is
             # just as much evidence of health as a discover-mode one's.
-            pm_retry_fails_set "$tid" "$agent" 0
+            pm_retry_recover "$tid" "$agent"
         fi
     fi
 
@@ -2891,27 +2968,34 @@ pm_harvest_run() {
         fails=$(( $(pm_retry_fails_get "$tid" "$agent") + 1 ))
         if (( fails >= 3 )); then
             pm_session_clear "$tid" "$agent"
-            fails=0
+            # A bare FAILS reset, NOT a full clear: pm_retry_schedule below
+            # (or the one a later pass runs after this same trigger's
+            # retry fires again) still needs the real ATTEMPT/MAX on file
+            # to tell a genuine cap exhaustion from a fresh schedule.
+            pm_retry_wedge_reset "$tid" "$agent"
+        else
+            pm_retry_fails_set "$tid" "$agent" "$fails"
         fi
-        pm_retry_fails_set "$tid" "$agent" "$fails"
     fi
 
     local pending
     pending="$(fs_pm_env_get "$f" PENDING_MSGS)"
     if [[ -n "$pending" ]]; then
+        # This follow-up wake already re-wakes the seat on the newest
+        # pending message, so it supersedes any deferred retry of the
+        # (older) trigger this run itself answered (whether or not that
+        # older trigger was live-delivered) -- drop the stale schedule
+        # here, in both sub-branches below, rather than leaving it to fire
+        # later against a trigger the conversation has already moved past.
+        pm_retry_clear_schedule "$tid" "$agent"
         local newest="${pending##*,}"
         if pm_mail_delivered_live "$run_dir" "$newest"; then
             pm_ledger_delivered_live "$tid" "$agent" "$newest" "$rid"
         else
-            # This follow-up wake already re-wakes the seat on the newest
-            # pending message, so it supersedes any deferred retry of the
-            # (older) trigger this run itself answered -- schedule none
-            # (see pm_retry_schedule's own comment on when it does NOT
-            # fire).
             pm_followup_wake "$project" "$agent" "$tid" "$newest"
         fi
     elif (( was_failure )); then
-        pm_retry_schedule "$tid" "$agent" "$trigger"
+        pm_retry_schedule "$tid" "$agent" "$trigger" "$rid"
     fi
 }
 
@@ -2962,15 +3046,19 @@ pm_retry_pass() {
             if fs_pm_find_live_run "$agent" "$tid" >/dev/null; then
                 continue
             fi
-            local fails attempt
+            local fails attempt rstate max last_failed_run
             fails="$(pm_retry_fails_get "$tid" "$agent")"
             attempt="$(fs_pm_env_get "$f" ATTEMPT)"
             [[ "$attempt" =~ ^[0-9]+$ ]] || attempt=0
             attempt=$(( attempt + 1 ))
-            pm_retry_raw_write "$tid" "$agent" "$fails" "$trigger" "$attempt" "$not_before"
+            rstate="$(fs_pm_env_get "$f" STATE)"
+            max="$(fs_pm_env_get "$f" MAX)"
+            last_failed_run="$(fs_pm_env_get "$f" LAST_FAILED_RUN)"
+            pm_retry_raw_write "$tid" "$agent" "$fails" "$trigger" "$attempt" "$not_before" \
+                "$rstate" "$max" "$last_failed_run" ""
             pm_event "retry thread=${tid:0:8} agent=$agent trigger=${trigger:0:8} attempt=$attempt"
-            if ! pm_followup_wake "$project" "$agent" "$tid" "$trigger"; then
-                pm_retry_raw_write "$tid" "$agent" "$fails" "" "" ""
+            if ! pm_followup_wake "$project" "$agent" "$tid" "$trigger" 1; then
+                pm_retry_raw_write "$tid" "$agent" "$fails" "" "" "" "" "" "$last_failed_run" ""
             fi
         done
     done

@@ -752,14 +752,22 @@ message that arrived during the run already queued a follow-up wake for
 that seat (that follow-up re-wakes it already, so scheduling a second,
 redundant wake would just double-spawn it — see "The wake" above).
 `FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF`, a comma-separated list of
-seconds (default `300,1200` — 5 minutes then 20), sets each retry's delay
-before firing and, via the list's length, the retry cap: a credential
-rollover fails in seconds and the host token typically rolls within
-minutes, so the very next retry usually catches it, while a quota death
-gets longer to clear. An empty value is legal and means zero retries. A
-malformed value (anything other than a comma-separated list of
-non-negative integers) fails `deliver` at startup, the same posture as
-its other `pm_require_*` startup gates.
+non-negative integers (default `300,1200` — 5 minutes then 20), sets each
+retry's delay before firing and, via the list's length, the retry cap: a
+credential rollover fails in seconds and the host token typically rolls
+within minutes, so the very next retry usually catches it, while a quota
+death gets longer to clear. An empty value is legal and means zero
+retries. Anything else — a non-numeric entry, a negative one, or a
+leading, trailing, or doubled comma — fails `deliver` at startup with the
+full value quoted, the same posture as its other `pm_require_*` startup
+gates; the whole string is checked against the grammar before it is ever
+split, so a trailing comma cannot silently vanish into a shorter list.
+
+A wake resumed for a retry is told so in its handoff (a "This is a retry"
+section, right after the triggering message is named): if it already sent
+a reply before the previous attempt died, that reply is already on the
+thread, and the handoff asks it to check for one from itself before
+writing a new one, rather than resend it.
 
 `deliver`'s loop runs a retry pass between routing and harvesting each
 scan: a due retry (its backoff elapsed, and the seat has no run in
@@ -770,16 +778,43 @@ either gate is permanent for that trigger, so its schedule is dropped
 rather than retried again next pass; firing one (successfully or not)
 emits a `retry` event (see "The event stream" above). Exhausting the cap
 — every retry spent, still failing — flags the thread by name, naming the
-agent and the trigger, and drops the schedule.
+agent and the trigger, and turns the record into a persistent `exhausted`
+one (see below) rather than dropping it outright.
 
 A retry schedule is superseded — dropped without ever firing — by a new
 message the router spawns a fresh wake for (that wake carries the seat
-forward instead) or by a clean exit-0 harvest of the pair. It shares its
-one state file with the session-resume wedge bound below (`retries/`),
-but is otherwise unrelated: a resumed session repeatedly failing bounds
-by clearing the session, a wake repeatedly dying outright bounds by
-giving up and flagging — a seat can hit either, both, or neither
-independently.
+forward instead), or by a pending message a failed wake's own harvest
+answers with a follow-up wake of its own (same reasoning: the follow-up
+carries the seat forward, so the older trigger's schedule is dropped
+first, not left to fire later against a trigger the conversation has
+already moved past). It shares its one state file with the session-resume
+wedge bound below (`retries/`), but is otherwise unrelated: a resumed
+session repeatedly failing bounds by clearing the session, a wake
+repeatedly dying outright bounds by giving up and flagging — a seat can
+hit either, both, or neither independently.
+
+#### The retry state file is a read contract
+
+`retries/<thread-id>/<agent>` is meant to be read by tools other than the
+postmaster itself, so every write leaves a complete record, not a partial
+one — an external reader must always be able to tell a pending retry from
+an exhausted one from a recovered one, not just see fields disappear:
+
+| Field | Meaning |
+|---|---|
+| `FAILS` | the session-resume wedge bound's own counter (below); shares this file, not this state machine |
+| `STATE` | `pending`, `exhausted`, or `recovered` — absent means no retry history yet, or a schedule that was superseded or refused (neither outcome is one of the three above, so none is recorded) |
+| `TRIGGER` / `ATTEMPT` / `NOT_BEFORE` | the pending retry's own fields; present only when `STATE=pending` |
+| `MAX` | the retry cap (`$FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF`'s length) in effect when `STATE` was last set to `pending` or `exhausted` |
+| `LAST_FAILED_RUN` | the run id of the wake whose failure produced the current `pending` or `exhausted` state |
+| `RECOVERED_AT` | epoch seconds a `recovered` state was reached |
+
+A `recovered` record is written the first time a pair that had ever
+failed before harvests exit-0 clean: `RECOVERED_AT` and the `LAST_FAILED_RUN`
+it recovered from are kept rather than the file simply vanishing, so a
+reader can see that this pair was failing and came back, not just that it
+is quiet now. A pair that never failed gets no file at all — there is
+nothing to recover from.
 
 ### Router state
 
@@ -802,7 +837,7 @@ own thread scans never see it:
 | `wake-threads/<run-id>/thread.txt` | the rendered full-thread snapshot bound read-only at `/thread` in that one wake (`--thread-dir`), written per wake just before its handoff; a trigger-only handoff points at this mount for the rest of the thread, and a snapshot that cannot be written falls the wake back to the legacy full-thread handoff with no mount and flags the thread. Never reaped, like `handoffs/` and `runs/` |
 | `state/<thread-id>/<agent>/` | the harness's transcript/session store for that pair (claude, codex or pi, sealed or not) |
 | `sessions/<thread-id>/<agent>` | the session id that pair's last wake ended on |
-| `retries/<thread-id>/<agent>` | the wedge-bound FAILS counter (session resume, below) and, when a retry is pending, its TRIGGER/ATTEMPT/NOT_BEFORE fields (see "Retrying a dead wake" above) — one file, two independent purposes |
+| `retries/<thread-id>/<agent>` | the wedge-bound FAILS counter (session resume, below) and the retry read contract's STATE/TRIGGER/ATTEMPT/NOT_BEFORE/MAX/LAST_FAILED_RUN/RECOVERED_AT fields (see "Retrying a dead wake" above) — one file, two independent purposes |
 | `workspaces/<thread-id>/<agent>/` | the persistent clone for that (thread, agent) seat, bound into every wake of it (every harness, not just claude) with `--clone-dir`; removed only by `fleet teardown` |
 
 All state transitions are marker-file creation, never deletion of
@@ -886,7 +921,10 @@ never applies to it either: pi has no recorded id to clear, so if pi's
 own session store ever becomes unloadable, every later wake presents it
 the same derived id. Recovery
 there is `fleet teardown` (or removing the seat's `state/` directory),
-not automatic.
+not automatic. The reset touches only FAILS: an in-flight retry schedule
+sharing the same file (above) is left exactly as it was, so a wedge trip
+landing on the same failure that also spends the retry cap's last attempt
+still exhausts at the configured cap, not one retry later.
 
 **A resumed session and the seat's clone both cross wakes; the run dir does
 not.** Every wake still gets a fresh run dir — a new log, handoff,

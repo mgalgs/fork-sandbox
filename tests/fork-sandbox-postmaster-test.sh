@@ -2632,6 +2632,172 @@ contains "retry: exhaustion flags the thread, naming the agent and trigger" \
     "wake for alice failed after 2 retries (trigger ${rt_mid1:0:8})"
 check "retry: the exhausted schedule is removed (no lingering trigger)" 0 \
     "$( [[ -n "$(sed -n 's/^TRIGGER=//p' "$PM_STATE_DIR/retries/$rt_tid/alice" 2>/dev/null)" ]] && echo 1 || echo 0 )"
+contains "retry: exhaustion is a persistent STATE, not just a dropped file" \
+    "$(cat "$PM_STATE_DIR/retries/$rt_tid/alice" 2>/dev/null)" "STATE=exhausted"
+contains "retry: the exhausted record names the cap it hit" \
+    "$(cat "$PM_STATE_DIR/retries/$rt_tid/alice" 2>/dev/null)" "MAX=2"
+check "retry: the exhausted record names the run that last failed" 1 \
+    "$( [[ -n "$(sed -n 's/^LAST_FAILED_RUN=//p' "$PM_STATE_DIR/retries/$rt_tid/alice" 2>/dev/null)" ]] && echo 1 || echo 0 )"
+
+# ============================================================
+printf '\n== retry: the state file is a read contract (pending, then recovered) ==\n'
+# ============================================================
+# STATE/MAX/LAST_FAILED_RUN/RECOVERED_AT let a tool other than the
+# postmaster itself tell a pending retry from an exhausted one (above)
+# from a recovered one (here), without guessing from which fields happen
+# to still be on file.
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+
+sc_mid1="$(send_msg '@carol' '@alice' 'schema topic' 'first message' 8)"
+sc_tid="$(thread_of "$sc_mid1")"
+sc_retries="$PM_STATE_DIR/retries/$sc_tid/alice"
+
+once
+finish_run alice 1
+once
+contains "schema: a scheduled retry's record is STATE=pending" \
+    "$(cat "$sc_retries" 2>/dev/null)" "STATE=pending"
+check "schema: a scheduled retry's record names the run that failed" 1 \
+    "$( [[ -n "$(sed -n 's/^LAST_FAILED_RUN=//p' "$sc_retries" 2>/dev/null)" ]] && echo 1 || echo 0 )"
+contains "schema: a scheduled retry's record carries the configured cap" \
+    "$(cat "$sc_retries" 2>/dev/null)" "MAX=2"
+
+once
+finish_run alice 0 deadbeef-cafe-0000-1111-222233334444
+once
+contains "schema: a later success turns pending into a persistent recovered record" \
+    "$(cat "$sc_retries" 2>/dev/null)" "STATE=recovered"
+check "schema: the recovered record has no lingering TRIGGER" 0 \
+    "$( [[ -n "$(sed -n 's/^TRIGGER=//p' "$sc_retries" 2>/dev/null)" ]] && echo 1 || echo 0 )"
+contains "schema: the recovered record is timestamped" \
+    "$(cat "$sc_retries" 2>/dev/null)" "RECOVERED_AT="
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+
+nf_mid1="$(send_msg '@carol' '@alice' 'never failed topic' 'first message' 8)"
+nf_tid="$(thread_of "$nf_mid1")"
+once
+finish_run alice 0 cafebabe-0000-1111-2222-333344445566
+once
+check "schema: a pair that never failed gets no retry file at all" 0 \
+    "$( [[ -e "$PM_STATE_DIR/retries/$nf_tid/alice" ]] && echo 1 || echo 0 )"
+
+# ============================================================
+printf '\n== session resume: a wedge trip coinciding with the retry cap does not grant an extra retry ==\n'
+# ============================================================
+
+# Regression: the wedge bound's own FAILS-reset-to-0 used to go through
+# the same fails=0-clears-everything path a clean exit-0 harvest uses,
+# wiping the in-flight retry's own ATTEMPT/MAX along with it. When the
+# wedge's 3rd-in-a-row trip landed on the exact wake that also spent the
+# retry cap's last attempt, pm_retry_schedule (called right after, in the
+# same harvest) then read attempt=0 off the just-wiped file and happily
+# scheduled one more retry than $FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF's
+# length allows.
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+
+wr_sid=01234567-89ab-cdef-0123-456789abcdef
+wr_mid1="$(send_msg '@carol' '@alice' 'wedge+retry topic' 'first message' 8)"
+wr_tid="$(thread_of "$wr_mid1")"
+wr_sessions="$PM_STATE_DIR/sessions/$wr_tid/alice"
+wr_retries="$PM_STATE_DIR/retries/$wr_tid/alice"
+
+once
+finish_run alice 0 "$wr_sid"
+once
+
+wr_mid2="$(reply_msg '@carol' "$wr_mid1" 'wr msg 2' --to '@alice')"
+once
+finish_run alice 1
+once
+once
+finish_run alice 1
+once
+once
+finish_run alice 1
+once
+
+check "wedge+retry cap: the session is cleared (wedge tripped at 3)" 0 \
+    "$( [[ -e "$wr_sessions" ]] && echo 1 || echo 0 )"
+contains "wedge+retry cap: the cap is exhausted, not silently extended by the wedge trip" \
+    "$(cat "$PM_STATE_DIR/needs-operator/$wr_tid" 2>/dev/null)" \
+    "wake for alice failed after 2 retries (trigger ${wr_mid2:0:8})"
+check "wedge+retry cap: no pending schedule remains" 0 \
+    "$( [[ -n "$(sed -n 's/^TRIGGER=//p' "$wr_retries" 2>/dev/null)" ]] && echo 1 || echo 0 )"
+: > "$STUB_ARGV_LOG"
+once
+check "wedge+retry cap: no further retry fires past the cap" 0 \
+    "$(grep -c -- '----CALL----' "$STUB_ARGV_LOG")"
+
+# ============================================================
+printf '\n== retry: a retried wake'"'"'s own pending message clears its stale schedule ==\n'
+# ============================================================
+
+# Regression: a wake dispatched BY the retry pass itself (already
+# resuming an older trigger) that received a new message while live, and
+# then also failed, answered that new message with a follow-up wake of
+# its own -- but never cleared the OLDER trigger's still-pending retry
+# schedule first. Left lying around, a stale schedule like that could
+# fire again later against a trigger the conversation had already moved
+# past.
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+
+sr_mid1="$(send_msg '@carol' '@alice' 'stale retry topic' 'first message' 8)"
+sr_tid="$(thread_of "$sr_mid1")"
+sr_retries="$PM_STATE_DIR/retries/$sr_tid/alice"
+
+once
+finish_run alice 1
+once
+once
+
+sr_mid2="$(reply_msg '@carol' "$sr_mid1" 'second message' --to '@alice')"
+once
+finish_run alice 1
+once
+
+contains "stale retry: the pending message's own follow-up wake fired" \
+    "$(cat "$(live_env_for_agent alice)")" "TRIGGER=$sr_mid2"
+check "stale retry: the stale older-trigger schedule was cleared, not left lying around" 0 \
+    "$( [[ -n "$(sed -n 's/^TRIGGER=//p' "$sr_retries" 2>/dev/null)" ]] && echo 1 || echo 0 )"
+
+# ============================================================
+printf '\n== retry: a retried wake'"'"'s handoff warns against duplicate replies ==\n'
+# ============================================================
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+
+hf_mid1="$(send_msg '@carol' '@alice' 'handoff retry topic' 'first message' 8)"
+hf_tid="$(thread_of "$hf_mid1")"
+
+once
+hf_first_run_id="$(basename "$(live_env_for_agent alice)" .env)"
+hf_first_handoff="$PM_STATE_DIR/handoffs/$hf_first_run_id.md"
+check "handoff: a normal (non-retry) wake's handoff carries no retry section" 0 \
+    "$(grep -c -- '^## This is a retry$' "$hf_first_handoff")"
+
+finish_run alice 1
+once
+once
+hf_retry_run_id="$(basename "$(live_env_for_agent alice)" .env)"
+hf_retry_handoff="$PM_STATE_DIR/handoffs/$hf_retry_run_id.md"
+check "handoff: a retried wake's handoff DOES carry the retry section" 1 \
+    "$(grep -c -- '^## This is a retry$' "$hf_retry_handoff")"
+contains "handoff: the retry section warns against resending an already-posted reply" \
+    "$(cat "$hf_retry_handoff")" "do not send the same reply twice"
 
 # ============================================================
 printf '\n== retry: a failed wake WITH a pending message schedules no retry ==\n'
@@ -2758,6 +2924,18 @@ FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF=abc refuses \
     "$postmaster" deliver --project "$PROJECT_DIR" --once
 FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF=300,-5 refuses \
     "retry: a negative backoff entry refuses deliver" \
+    "$postmaster" deliver --project "$PROJECT_DIR" --once
+# bash's `read -a` silently drops a trailing empty field, so a naive
+# per-entry check (splitting first) never sees the missing entry that
+# made this malformed in the first place.
+FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF=300, refuses \
+    "retry: a trailing comma refuses deliver (read -a would silently drop it)" \
+    "$postmaster" deliver --project "$PROJECT_DIR" --once
+FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF=,300 refuses \
+    "retry: a leading comma refuses deliver" \
+    "$postmaster" deliver --project "$PROJECT_DIR" --once
+FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF=300,,1200 refuses \
+    "retry: a doubled comma refuses deliver" \
     "$postmaster" deliver --project "$PROJECT_DIR" --once
 
 # ============================================================
