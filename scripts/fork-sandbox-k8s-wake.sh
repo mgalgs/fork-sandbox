@@ -13,6 +13,8 @@
 #
 # Usage: fork-sandbox-k8s-wake.sh <wake-dir>
 #        fork-sandbox-k8s-wake.sh --detach <wake-dir>
+#        fork-sandbox-k8s-wake.sh --adopt <wake-dir>
+#        fork-sandbox-k8s-wake.sh --adopt --detach <wake-dir>
 #
 # <wake-dir> is prepared by the caller with:
 #   fs-argv   NUL-delimited argv; element 0 is the launcher to run (the
@@ -55,12 +57,26 @@
 # that is the k8s path's own evidence policy for a real failure, not this
 # wrapper's to override.
 #
+# --adopt <wake-dir> takes over a wake whose wrapper died (a postmaster
+# host restart, a pod eviction) while its Job kept running: it writes pid
+# and pid-identity, applies `env`, finds the k8s run directory (the
+# k8s-run-dir file when it names an existing directory, else the
+# "  run dir:" line in launch.log), appends
+# `--- fork-sandbox-k8s-wake: adopting <branch> (attempt <n>) ---` to
+# launch.log (never truncating it), runs
+# `fork-sandbox-k8s.sh resume --run-dir <dir>` with its output appended
+# there, and then normalizes the result exactly as above. No run
+# directory is a failure: exit-code 1 and a synthesized summary.json.
+# <n> is <wake-dir>/adopt-count, an integer the CALLER (the postmaster)
+# increments atomically before each adoption; this script never writes it.
+#
 # --detach <wake-dir> starts this same script on <wake-dir>, in the
 # foreground mode above, inside a detached tmux session named
 # cc-k8s-<branch, sanitized to [A-Za-z0-9_-]>, and returns 0 -- or exits 1
 # if tmux cannot start one. Named cc-k8s-*, not cc-sbx-* (fork-sandbox.sh's
 # own local-wake prefix): operators treat a live cc-sbx-* session as
-# local-run machinery in flight, and a k8s wake is not that.
+# local-run machinery in flight, and a k8s wake is not that. With --adopt
+# the run.sh it writes execs `--adopt <wake-dir>`.
 
 set -euo pipefail
 
@@ -114,35 +130,15 @@ fs_k8s_wake_branch_from_argv() {
     done
 }
 
-fs_k8s_wake_run() {
-    local wake_dir="$1"
-    [[ -d "$wake_dir" ]] || {
-        echo "Error: fork-sandbox-k8s-wake: no such wake directory: $wake_dir" >&2
-        exit 1
-    }
-
-    # Written first, before the launch even starts: this is what lets a
-    # caller (fs_pm_env_get/pm_wake_is_dead's pid-file check) tell "this
-    # wrapper is alive" apart from "nothing has run yet" the same way a
-    # local wake's own pid file does.
-    fs_k8s_wake_write_atomic "$wake_dir/pid" "$$"
-    fs_k8s_wake_write_atomic "$wake_dir/pid-identity" "$(fs_k8s_wake_pid_identity)"
-
-    local -a fs_argv
-    fs_k8s_wake_read_nul fs_argv "$wake_dir/fs-argv"
-    if (( ${#fs_argv[@]} == 0 )); then
-        echo "Error: fork-sandbox-k8s-wake: $wake_dir/fs-argv is empty or missing." >&2
-        exit 1
-    fi
-
-    # tmux's detached session inherits whatever the tmux SERVER's own
-    # environment was when it first started -- not this process's current
-    # one -- so a long-lived server can still be carrying a FORK_SANDBOX_*
-    # value a later postmaster no longer sets (or sets differently). Clear
-    # every inherited FORK_SANDBOX_* key before applying the ones the
-    # postmaster actually wrote to `env`, so a stale value can never leak
-    # through unnoticed.
-    local stale_var
+# Clears every inherited FORK_SANDBOX_* variable, then exports the wake
+# dir's own `env` records. tmux's detached session inherits whatever the
+# tmux SERVER's own environment was when it first started -- not this
+# process's current one -- so a long-lived server can still be carrying a
+# FORK_SANDBOX_* value a later postmaster no longer sets (or sets
+# differently). Clearing first means a stale value can never leak through
+# unnoticed.
+fs_k8s_wake_apply_env() {
+    local wake_dir="$1" stale_var
     for stale_var in "${!FORK_SANDBOX_@}"; do
         unset "$stale_var"
     done
@@ -156,22 +152,22 @@ fs_k8s_wake_run() {
         [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
         export "$key=${rec#*=}"
     done
+}
 
-    local branch
-    branch="$(fs_k8s_wake_branch_from_argv fs_argv)"
+# The normalization tail both paths share: k8s-run-dir, k8s-timeout, the
+# rc 3 -> 0 normalization with its reap, exit-code, and summary.json last.
+# Args: wake_dir rc branch [run_dir_hint] [log_offset]. run_dir_hint, when
+# non-empty, is used instead of scraping launch.log (the adopt path already
+# resolved it); log_offset is the byte size launch.log had before this
+# attempt's own output began, so a timeout message left by an EARLIER
+# attempt is never mistaken for this one's. Exits with the final rc.
+fs_k8s_wake_finish() {
+    local wake_dir="$1" rc="$2" branch="$3" run_dir_hint="${4-}" log_offset="${5-0}"
 
-    # `set -e` must never kill this wrapper before summary.json/exit-code
-    # are written below -- a wrapper that dies here leaves the harvester
-    # with neither, wedged exactly like the crash this file exists to make
-    # visible instead of hidden.
-    local rc=0
-    set +e
-    "${fs_argv[@]}" > "$wake_dir/launch.log" 2>&1
-    rc=$?
-    set -e
-
-    local k8s_run_dir
-    k8s_run_dir="$(sed -n 's/^  run dir:  *//p' "$wake_dir/launch.log" | head -n1)"
+    local k8s_run_dir="$run_dir_hint"
+    if [[ -z "$k8s_run_dir" ]]; then
+        k8s_run_dir="$(sed -n 's/^  run dir:  *//p' "$wake_dir/launch.log" | head -n1)"
+    fi
     fs_k8s_wake_write_atomic "$wake_dir/k8s-run-dir" "$k8s_run_dir"
 
     # A timeout is the one rc 1 that writes no summary.json (collect never
@@ -179,7 +175,8 @@ fs_k8s_wake_run() {
     # agent's exit 1 on the ordinary failure-and-retry path.
     local timed_out=0
     if (( rc == 1 )) && [[ -n "$k8s_run_dir" && ! -e "$k8s_run_dir/summary.json" ]] \
-        && grep -q '^Error: timed out after [0-9]*s waiting for branch' "$wake_dir/launch.log"; then
+        && tail -c "+$((log_offset + 1))" "$wake_dir/launch.log" \
+            | grep -q '^Error: timed out after [0-9]*s waiting for branch'; then
         timed_out=1
     fi
     fs_k8s_wake_write_atomic "$wake_dir/k8s-timeout" "$timed_out"
@@ -213,8 +210,109 @@ fs_k8s_wake_run() {
     exit "$rc"
 }
 
-fs_k8s_wake_detach() {
+fs_k8s_wake_run() {
     local wake_dir="$1"
+    [[ -d "$wake_dir" ]] || {
+        echo "Error: fork-sandbox-k8s-wake: no such wake directory: $wake_dir" >&2
+        exit 1
+    }
+
+    # Written first, before the launch even starts: this is what lets a
+    # caller (fs_pm_env_get/pm_wake_is_dead's pid-file check) tell "this
+    # wrapper is alive" apart from "nothing has run yet" the same way a
+    # local wake's own pid file does.
+    fs_k8s_wake_write_atomic "$wake_dir/pid" "$$"
+    fs_k8s_wake_write_atomic "$wake_dir/pid-identity" "$(fs_k8s_wake_pid_identity)"
+
+    local -a fs_argv
+    fs_k8s_wake_read_nul fs_argv "$wake_dir/fs-argv"
+    if (( ${#fs_argv[@]} == 0 )); then
+        echo "Error: fork-sandbox-k8s-wake: $wake_dir/fs-argv is empty or missing." >&2
+        exit 1
+    fi
+
+    fs_k8s_wake_apply_env "$wake_dir"
+
+    local branch
+    branch="$(fs_k8s_wake_branch_from_argv fs_argv)"
+
+    # `set -e` must never kill this wrapper before summary.json/exit-code
+    # are written below -- a wrapper that dies here leaves the harvester
+    # with neither, wedged exactly like the crash this file exists to make
+    # visible instead of hidden.
+    local rc=0
+    set +e
+    "${fs_argv[@]}" > "$wake_dir/launch.log" 2>&1
+    rc=$?
+    set -e
+
+    fs_k8s_wake_finish "$wake_dir" "$rc" "$branch"
+}
+
+# Picks the run dir an adopted wake resumes: k8s-run-dir when it names an
+# existing directory, else the "  run dir:" line submit left in launch.log.
+fs_k8s_wake_find_run_dir() {
+    local wake_dir="$1" cand
+    if cand="$(cat -- "$wake_dir/k8s-run-dir" 2>/dev/null)" \
+        && [[ -n "$cand" && -d "$cand" ]]; then
+        printf '%s' "$cand"
+        return 0
+    fi
+    cand="$(sed -n 's/^  run dir:  *//p' "$wake_dir/launch.log" 2>/dev/null | head -n1)"
+    if [[ -n "$cand" && -d "$cand" ]]; then
+        printf '%s' "$cand"
+        return 0
+    fi
+    return 1
+}
+
+# Takes over a wake whose original wrapper died while its Job kept going:
+# skips submit, resumes wait + collect into the same directories, and
+# normalizes the result exactly as the normal path does.
+fs_k8s_wake_adopt() {
+    local wake_dir="$1"
+    [[ -d "$wake_dir" ]] || {
+        echo "Error: fork-sandbox-k8s-wake: no such wake directory: $wake_dir" >&2
+        exit 1
+    }
+
+    fs_k8s_wake_write_atomic "$wake_dir/pid" "$$"
+    fs_k8s_wake_write_atomic "$wake_dir/pid-identity" "$(fs_k8s_wake_pid_identity)"
+
+    fs_k8s_wake_apply_env "$wake_dir"
+
+    local -a fs_argv
+    fs_k8s_wake_read_nul fs_argv "$wake_dir/fs-argv"
+    local branch attempt
+    branch="$(fs_k8s_wake_branch_from_argv fs_argv)"
+    attempt="$(cat -- "$wake_dir/adopt-count" 2>/dev/null || true)"
+    [[ "$attempt" =~ ^[0-9]+$ ]] || attempt=1
+
+    local log_offset=0
+    [[ -f "$wake_dir/launch.log" ]] && log_offset="$(wc -c < "$wake_dir/launch.log")"
+    log_offset="${log_offset//[[:space:]]/}"
+
+    local run_dir="" rc=0
+    if ! run_dir="$(fs_k8s_wake_find_run_dir "$wake_dir")"; then
+        run_dir=""
+        {
+            echo "--- fork-sandbox-k8s-wake: adopting $branch (attempt $attempt) ---"
+            echo "Error: fork-sandbox-k8s-wake: cannot adopt: no k8s run directory recorded for this wake."
+        } >> "$wake_dir/launch.log"
+        rc=1
+    else
+        echo "--- fork-sandbox-k8s-wake: adopting $branch (attempt $attempt) ---" >> "$wake_dir/launch.log"
+        set +e
+        "$script_dir/fork-sandbox-k8s.sh" resume --run-dir "$run_dir" >> "$wake_dir/launch.log" 2>&1
+        rc=$?
+        set -e
+    fi
+
+    fs_k8s_wake_finish "$wake_dir" "$rc" "$branch" "$run_dir" "$log_offset"
+}
+
+fs_k8s_wake_detach() {
+    local wake_dir="$1" adopt="$2"
     [[ -d "$wake_dir" ]] || {
         echo "Error: fork-sandbox-k8s-wake: no such wake directory: $wake_dir" >&2
         exit 1
@@ -227,12 +325,18 @@ fs_k8s_wake_detach() {
     local session_name
     session_name="cc-k8s-$(printf '%s' "$branch" | tr -c 'A-Za-z0-9_-' '-')"
 
+    local -a self=("$script_dir/fork-sandbox-k8s-wake.sh")
+    (( adopt )) && self+=(--adopt)
+    self+=("$wake_dir")
+
     # tmux's own multi-argv command handling is not to be relied on (see
     # header) -- write a tiny run.sh, the same shape fork-sandbox.sh's own
     # tmux launch uses, and pass tmux that ONE path as its command.
     {
         printf '#!/usr/bin/env bash\n'
-        printf 'exec %q %q\n' "$script_dir/fork-sandbox-k8s-wake.sh" "$wake_dir"
+        printf 'exec'
+        printf ' %q' "${self[@]}"
+        printf '\n'
     } > "$wake_dir/run.sh"
     chmod +x -- "$wake_dir/run.sh"
 
@@ -244,15 +348,25 @@ fs_k8s_wake_detach() {
     exit 0
 }
 
-if [[ "${1-}" == -h || "${1-}" == --help ]]; then
-    usage
-    exit 0
-fi
+adopt=0 detach=0 wake_dir=""
+while (( $# )); do
+    case "$1" in
+        -h|--help) usage; exit 0 ;;
+        --adopt) adopt=1; shift ;;
+        --detach) detach=1; shift ;;
+        -*) echo "Error: fork-sandbox-k8s-wake: unknown option '$1'." >&2; exit 1 ;;
+        *) wake_dir="$1"; shift ;;
+    esac
+done
+[[ -n "$wake_dir" ]] || {
+    echo "Usage: fork-sandbox-k8s-wake.sh [--adopt] [--detach] <wake-dir>" >&2
+    exit 1
+}
 
-if [[ "${1-}" == --detach ]]; then
-    wake_dir="${2:?Usage: fork-sandbox-k8s-wake.sh --detach <wake-dir>}"
-    fs_k8s_wake_detach "$wake_dir"
+if (( detach )); then
+    fs_k8s_wake_detach "$wake_dir" "$adopt"
+elif (( adopt )); then
+    fs_k8s_wake_adopt "$wake_dir"
 else
-    wake_dir="${1:?Usage: fork-sandbox-k8s-wake.sh <wake-dir>}"
     fs_k8s_wake_run "$wake_dir"
 fi

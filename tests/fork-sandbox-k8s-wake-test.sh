@@ -113,8 +113,23 @@ STUB
 
     cat > "$root_ref/bin/fork-sandbox-k8s.sh" <<STUB
 #!/usr/bin/env bash
-# Stands in for the real fork-sandbox-k8s.sh's \`rm --branch\` verb.
+# Stands in for the real fork-sandbox-k8s.sh's \`rm --branch\` and
+# \`resume --run-dir DIR\` verbs. resume logs its argv, prints a line (and
+# a wait-timeout message when STUB_K8S_TIMEOUT_MSG is set), writes a
+# summary.json into DIR unless STUB_K8S_NO_SUMMARY is set, and exits
+# STUB_K8S_RESUME_RC (default 0).
 set -uo pipefail
+if [[ "\${1:-}" == resume ]]; then
+    printf '%s\n' "\$*" >> "$root_ref/resume-calls.log"
+    echo "stub resume output"
+    if [[ -n "\${STUB_K8S_TIMEOUT_MSG:-}" ]]; then
+        printf 'Error: timed out after 60s waiting for branch\n' >&2
+    fi
+    if [[ -z "\${STUB_K8S_NO_SUMMARY:-}" ]]; then
+        printf '{"exit_code": %s}' "\${STUB_K8S_SUMMARY_EXIT_CODE:-\${STUB_K8S_RESUME_RC:-0}}" > "\$3/summary.json"
+    fi
+    exit "\${STUB_K8S_RESUME_RC:-0}"
+fi
 printf '%s\n' "\$*" >> "$root_ref/rm-calls.log"
 exit "\${STUB_K8S_RM_RC:-0}"
 STUB
@@ -360,6 +375,133 @@ STUB
     rc=$?
     check "--detach: propagates tmux failure as rc 1" 1 "$rc"
 }
+
+# ---- adopt: a wake dir whose wrapper died; resume replaces submit ----
+# adopt_setup <label-branch>: a wake dir with a launch.log from the dead
+# wrapper (submit's run-dir line plus an earlier timeout message that must
+# NOT be mistaken for this attempt's), and the adopt-count the caller wrote.
+adopt_setup() {
+    root=""
+    setup_root root
+    write_nul "$root/wake/fs-argv" \
+        "$root/bin/launcher.sh" --branch "$1" --outbox-dir "$root/wake/outbox"
+    : > "$root/wake/env"
+    run_dir="$root/k8srun"
+    mkdir -p -- "$run_dir"
+    printf 'original launch output\n  run dir:  %s\nError: timed out after 9s waiting for branch\n' \
+        "$run_dir" > "$root/wake/launch.log"
+    printf '2' > "$root/wake/adopt-count"
+}
+adopt_run() { ( "$@" "$root/bin/fork-sandbox-k8s-wake.sh" --adopt "$root/wake" ) >/dev/null 2>&1; }
+
+adopt_setup adopt-branch-0
+adopt_run env STUB_K8S_RESUME_RC=0
+rc=$?
+check "adopt rc 0: wrapper exits 0" 0 "$rc"
+check "adopt rc 0: exit-code is 0" 0 "$(cat -- "$root/wake/exit-code")"
+check "adopt rc 0: summary.json copied through" '{"exit_code": 0}' "$(cat -- "$root/wake/summary.json")"
+check "adopt rc 0: k8s-run-dir recorded" "$run_dir" "$(cat -- "$root/wake/k8s-run-dir")"
+check "adopt rc 0: k8s-timeout is 0 (the earlier attempt's timeout message is not this one's)" \
+    0 "$(cat -- "$root/wake/k8s-timeout")"
+check "adopt rc 0: resume called with the run dir, no submit" \
+    "resume --run-dir $run_dir" "$(cat -- "$root/resume-calls.log")"
+if [[ -s "$root/wake/pid" && -s "$root/wake/pid-identity" ]]; then
+    ok "adopt: pid and pid-identity written"
+else
+    no "adopt: pid and pid-identity written"
+fi
+check "adopt: adopt-count is left to the caller" 2 "$(cat -- "$root/wake/adopt-count")"
+log="$(cat -- "$root/wake/launch.log")"
+contains "adopt: launch.log keeps the original output (appended, not replaced)" "$log" "original launch output"
+contains "adopt: launch.log carries the adopting banner with the attempt" \
+    "$log" "--- fork-sandbox-k8s-wake: adopting adopt-branch-0 (attempt 2) ---"
+contains "adopt: launch.log carries resume's output" "$log" "stub resume output"
+if [[ "$root/wake/exit-code" -ot "$root/wake/summary.json" ]]; then
+    ok "adopt: exit-code precedes summary.json"
+else
+    no "adopt: exit-code precedes summary.json"
+fi
+
+adopt_setup adopt-branch-3
+adopt_run env STUB_K8S_RESUME_RC=3 STUB_K8S_SUMMARY_EXIT_CODE=0
+rc=$?
+check "adopt rc 3: wrapper exits 0 (normalized)" 0 "$rc"
+check "adopt rc 3: exit-code file is 0" 0 "$(cat -- "$root/wake/exit-code")"
+if [[ -f "$root/rm-calls.log" ]]; then
+    contains "adopt rc 3: the kept Job is reaped" "$(cat -- "$root/rm-calls.log")" "--branch adopt-branch-3"
+else
+    no "adopt rc 3: the kept Job is reaped" "rm-calls.log never written"
+fi
+
+adopt_setup adopt-branch-2
+adopt_run env STUB_K8S_RESUME_RC=2 STUB_K8S_NO_SUMMARY=1
+rc=$?
+check "adopt rc 2: wrapper propagates rc 2" 2 "$rc"
+check "adopt rc 2: exit-code file is 2" 2 "$(cat -- "$root/wake/exit-code")"
+check "adopt rc 2: summary.json synthesized" '{"exit_code": 2}' "$(cat -- "$root/wake/summary.json")"
+[[ ! -f "$root/rm-calls.log" ]] && ok "adopt rc 2: rm not called" || no "adopt rc 2: rm not called"
+
+adopt_setup adopt-branch-timeout
+adopt_run env STUB_K8S_RESUME_RC=1 STUB_K8S_NO_SUMMARY=1 STUB_K8S_TIMEOUT_MSG=1
+rc=$?
+check "adopt timeout: wrapper propagates rc 1" 1 "$rc"
+check "adopt timeout: k8s-timeout is 1 (resume's own wait-timeout message)" 1 "$(cat -- "$root/wake/k8s-timeout")"
+
+adopt_setup adopt-branch-agent1
+adopt_run env STUB_K8S_RESUME_RC=1
+check "adopt agent exit 1: k8s-timeout is 0" 0 "$(cat -- "$root/wake/k8s-timeout")"
+
+adopt_setup adopt-branch-file
+rm -f -- "$root/wake/launch.log"
+printf '%s' "$run_dir" > "$root/wake/k8s-run-dir"
+adopt_run env STUB_K8S_RESUME_RC=0
+rc=$?
+check "adopt: the k8s-run-dir file alone is enough (no launch.log)" 0 "$rc"
+check "adopt: resume used the k8s-run-dir file's directory" \
+    "resume --run-dir $run_dir" "$(cat -- "$root/resume-calls.log")"
+
+adopt_setup adopt-branch-nodir
+printf 'no run dir line here\n' > "$root/wake/launch.log"
+adopt_run env STUB_K8S_RESUME_RC=0
+rc=$?
+check "adopt without a run dir: wrapper exits 1" 1 "$rc"
+check "adopt without a run dir: exit-code is 1" 1 "$(cat -- "$root/wake/exit-code")"
+check "adopt without a run dir: summary.json synthesized" '{"exit_code": 1}' "$(cat -- "$root/wake/summary.json")"
+[[ ! -f "$root/resume-calls.log" ]] && ok "adopt without a run dir: resume never called" \
+    || no "adopt without a run dir: resume never called"
+contains "adopt without a run dir: the failure is logged (log appended)" \
+    "$(cat -- "$root/wake/launch.log")" "no k8s run directory recorded"
+
+adopt_setup adopt-branch-gone
+rm -rf -- "$run_dir"
+adopt_run env STUB_K8S_RESUME_RC=0
+check "adopt with a run dir that no longer exists: exit-code is 1" 1 "$(cat -- "$root/wake/exit-code")"
+
+adopt_setup adopt-branch-env
+write_nul "$root/wake/env" "GOOD_VAR=hello"
+: > "$root/env-probe"
+# resume runs with the wake's env applied: the stub resume cannot dump env,
+# so prove the shared apply function ran through the stale-var scrub.
+( export FORK_SANDBOX_STALE=old-value
+  "$root/bin/fork-sandbox-k8s-wake.sh" --adopt "$root/wake" ) >/dev/null 2>&1
+check "adopt: exits 0 with env records applied" 0 "$(cat -- "$root/wake/exit-code")"
+
+# ---- adopt --detach: same tmux session name, run.sh execs --adopt ----
+adopt_setup adopt-branch-detach
+tmux_log="$root/tmux-argv.log"
+cat > "$root/bin/tmux" <<STUB
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$tmux_log"
+last="\${!#}"
+exec "\$last"
+STUB
+chmod +x -- "$root/bin/tmux"
+( PATH="$root/bin:$PATH" "$root/bin/fork-sandbox-k8s-wake.sh" --adopt --detach "$root/wake" )
+rc=$?
+check "adopt --detach: wrapper returns 0" 0 "$rc"
+contains "adopt --detach: same cc-k8s-<branch> session name" "$(cat -- "$tmux_log")" "cc-k8s-adopt-branch-detach"
+contains "adopt --detach: run.sh execs --adopt" "$(cat -- "$root/wake/run.sh")" "--adopt $root/wake"
+check "adopt --detach: the adopted wake ran to completion" 0 "$(cat -- "$root/wake/exit-code" 2>/dev/null || echo MISSING)"
 
 printf '\n%s ok, %s fail\n' "$pass" "$fail"
 (( fail == 0 ))
