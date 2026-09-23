@@ -550,6 +550,48 @@ check "shim: the scripts run --remote directly too (mail)" "0" \
 check "shim: the scripts run --remote directly too (postmaster)" "0" \
     "$(FORK_SANDBOX_MAIL_API_URL="http://$listen" FORK_SANDBOX_MAIL_API_TOKEN_FILE="$tok/laptop" "$pm" --remote status > /dev/null 2>&1; echo $?)"
 
+printf '== 9. rc passthrough ==\n'
+
+bad_id="00000000-0000-4000-8000-000000000000"
+as_ ci-kickoff mail --remote show "$bad_id" > "$work/out" 2> "$work/err"
+shim_rc=$?
+"$mail" show "$bad_id" > "$work/lout" 2> "$work/lerr"
+local_rc=$?
+check "rc passthrough: a well-formed but nonexistent id: same rc" "$local_rc" "$shim_rc"
+check "rc passthrough: a well-formed but nonexistent id: same stderr" "$(cat "$work/lerr")" "$(cat "$work/err")"
+check "rc passthrough: a well-formed but nonexistent id: same stdout" "$(cat "$work/lout")" "$(cat "$work/out")"
+
+malformed_id="not_an_id"
+as_ ci-kickoff mail --remote show "$malformed_id" > "$work/out" 2> "$work/err"
+shim_rc=$?
+"$mail" show "$malformed_id" > "$work/lout" 2> "$work/lerr"
+local_rc=$?
+check "rc passthrough: a malformed id: same rc" "$local_rc" "$shim_rc"
+check "rc passthrough: a malformed id: same stderr" "$(cat "$work/lerr")" "$(cat "$work/err")"
+
+printf '== 10. byte-exact json views through the shim ==\n'
+
+as_ ci-kickoff mail --remote export "$tid" --json > "$work/shim-export.json" 2> "$work/shim-export.err"
+check "shim export --json: rc 0" "0" "$?"
+"$mail" export "$tid" --json > "$work/local-export.json" 2> "$work/local-export.err"
+check "local export --json: rc 0" "0" "$?"
+check "export --json: byte-exact via shim" "0" \
+    "$(cmp -s "$work/local-export.json" "$work/shim-export.json"; echo $?)"
+
+as_ ci-kickoff postmaster --remote status --thread "$tid" --json > "$work/shim-status.json" 2> "$work/shim-status.err"
+check "shim status --thread --json: rc 0" "0" "$?"
+"$pm" status --thread "$tid" --json > "$work/local-status.json" 2> "$work/local-status.err"
+check "local status --thread --json: rc 0" "0" "$?"
+check "status --thread --json: byte-exact via shim" "0" \
+    "$(cmp -s "$work/local-status.json" "$work/shim-status.json"; echo $?)"
+
+as_ ci-kickoff mail --remote show "$tid" > "$work/shim-show.out" 2> "$work/shim-show.err"
+check "shim show: rc 0" "0" "$?"
+"$mail" show "$tid" > "$work/local-show.out" 2> "$work/local-show.err"
+check "local show: rc 0" "0" "$?"
+check "mail show: byte-exact via shim" "0" \
+    "$(cmp -s "$work/local-show.out" "$work/shim-show.out"; echo $?)"
+
 printf '== 13. the log ==\n'
 
 sleep 0.2
