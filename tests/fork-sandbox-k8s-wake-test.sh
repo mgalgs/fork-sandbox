@@ -1,0 +1,307 @@
+#!/usr/bin/env bash
+# fork-sandbox-k8s-wake-test.sh — Exercise fork-sandbox-k8s-wake.sh's
+# foreground run (pid/launch.log/k8s-run-dir/exit-code/summary.json
+# normalization) and its --detach entry point, against a stub launcher
+# and a stub fork-sandbox-k8s.sh, never a real cluster.
+#
+# Usage: tests/fork-sandbox-k8s-wake-test.sh
+
+set -uo pipefail
+
+repo_dir="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+wrapper_src="$repo_dir/scripts/fork-sandbox-k8s-wake.sh"
+
+pass=0
+fail=0
+tmpdirs=()
+
+cleanup() {
+    local d
+    for d in "${tmpdirs[@]-}"; do
+        [[ -n "$d" && -d "$d" ]] && rm -rf -- "$d"
+    done
+}
+trap cleanup EXIT
+
+ok() { printf '  ok    %s\n' "$1"; pass=$(( pass + 1 )); }
+no() { printf '  FAIL  %s\n' "$1"; [[ -n "${2:-}" ]] && printf '        %s\n' "$2"; fail=$(( fail + 1 )); }
+
+check() {
+    local label="$1" expected="$2" actual="$3"
+    if [[ "$expected" == "$actual" ]]; then
+        ok "$label"
+    else
+        no "$label" "expected '$expected', got '$actual'"
+    fi
+}
+
+contains() {
+    local label="$1" haystack="$2" needle="$3"
+    case "$haystack" in
+        *"$needle"*) ok "$label" ;;
+        *) no "$label" "'$needle' not found in: $haystack" ;;
+    esac
+}
+
+new_root() {
+    local -n out_ref="$1"
+    out_ref="$(mktemp -d)"
+    tmpdirs+=("$out_ref")
+}
+
+# NUL-delimited argv/env file writer -- one record per argument.
+write_nul() {
+    local file="$1"; shift
+    : > "$file"
+    local a
+    for a in "$@"; do
+        printf '%s\0' "$a" >> "$file"
+    done
+}
+
+# Every test gets its own root with:
+#   $root/bin/fork-sandbox-k8s-wake.sh   a COPY of the real wrapper, so its
+#                                         own script_dir resolves to $root/bin
+#   $root/bin/launcher.sh                the stub standing in for
+#                                         `fork-sandbox.sh --k8s`
+#   $root/bin/fork-sandbox-k8s.sh        the stub `rm --branch` target
+#   $root/wake                           the wake dir under test
+setup_root() {
+    local -n root_ref="$1"
+    new_root root_ref
+    mkdir -p -- "$root_ref/bin" "$root_ref/wake"
+    cp -- "$wrapper_src" "$root_ref/bin/fork-sandbox-k8s-wake.sh"
+    chmod +x -- "$root_ref/bin/fork-sandbox-k8s-wake.sh"
+
+    cat > "$root_ref/bin/launcher.sh" <<'STUB'
+#!/usr/bin/env bash
+# Stands in for `fork-sandbox.sh --k8s`: prints the run-dir line the real
+# launcher prints (unless STUB_K8S_NO_RUN_DIR is set), writes a
+# summary.json into it (unless STUB_K8S_NO_SUMMARY is set), writes a
+# mail-*.md into whatever --outbox-dir it was given, and exits
+# STUB_K8S_LAUNCH_RC (default 0).
+set -uo pipefail
+rc="${STUB_K8S_LAUNCH_RC:-0}"
+run_dir="${STUB_K8S_RUN_DIR:-}"
+if [[ -n "$run_dir" && -z "${STUB_K8S_NO_RUN_DIR:-}" ]]; then
+    mkdir -p -- "$run_dir"
+    printf '  run dir:  %s\n' "$run_dir" >&2
+    if [[ -z "${STUB_K8S_NO_SUMMARY:-}" ]]; then
+        printf '{"exit_code": %s}' "${STUB_K8S_SUMMARY_EXIT_CODE:-$rc}" > "$run_dir/summary.json"
+    fi
+fi
+outbox=""
+while (( $# )); do
+    case "$1" in
+        --outbox-dir) outbox="$2"; shift 2 ;;
+        *) shift ;;
+    esac
+done
+if [[ -n "$outbox" ]]; then
+    mkdir -p -- "$outbox"
+    printf 'To: @operator\n\nstub reply\n' > "$outbox/mail-1.md"
+fi
+if [[ -n "${STUB_ENV_DUMP:-}" ]]; then
+    env > "$STUB_ENV_DUMP"
+fi
+exit "$rc"
+STUB
+    chmod +x -- "$root_ref/bin/launcher.sh"
+
+    cat > "$root_ref/bin/fork-sandbox-k8s.sh" <<STUB
+#!/usr/bin/env bash
+# Stands in for the real fork-sandbox-k8s.sh's \`rm --branch\` verb.
+set -uo pipefail
+printf '%s\n' "\$*" >> "$root_ref/rm-calls.log"
+exit "\${STUB_K8S_RM_RC:-0}"
+STUB
+    chmod +x -- "$root_ref/bin/fork-sandbox-k8s.sh"
+}
+
+# ---- case: rc 0, a real reply ----
+{
+    root=""
+    setup_root root
+    write_nul "$root/wake/fs-argv" \
+        "$root/bin/launcher.sh" --branch "test-branch-1" \
+        --outbox-dir "$root/wake/outbox"
+    : > "$root/wake/env"
+    run_dir="$root/k8srun"
+    ( STUB_K8S_RUN_DIR="$run_dir" STUB_K8S_LAUNCH_RC=0 \
+        "$root/bin/fork-sandbox-k8s-wake.sh" "$root/wake" )
+    rc=$?
+    check "rc 0: wrapper itself exits 0" 0 "$rc"
+    check "rc 0: exit-code file is 0" 0 "$(cat -- "$root/wake/exit-code")"
+    if [[ -s "$root/wake/pid" ]]; then ok "rc 0: pid file present"; else no "rc 0: pid file present"; fi
+    check "rc 0: k8s-run-dir scraped" "$run_dir" "$(cat -- "$root/wake/k8s-run-dir")"
+    check "rc 0: summary.json copied through" \
+        '{"exit_code": 0}' "$(cat -- "$root/wake/summary.json")"
+}
+
+# ---- case: rc 3, zero-harvest -- normalized to 0, kept Job reaped ----
+{
+    root=""
+    setup_root root
+    write_nul "$root/wake/fs-argv" \
+        "$root/bin/launcher.sh" --branch "test-branch-3" \
+        --outbox-dir "$root/wake/outbox"
+    : > "$root/wake/env"
+    run_dir="$root/k8srun"
+    ( STUB_K8S_RUN_DIR="$run_dir" STUB_K8S_LAUNCH_RC=3 STUB_K8S_SUMMARY_EXIT_CODE=0 \
+        "$root/bin/fork-sandbox-k8s-wake.sh" "$root/wake" )
+    rc=$?
+    check "rc 3: wrapper exits 0 (normalized)" 0 "$rc"
+    check "rc 3: exit-code file is 0" 0 "$(cat -- "$root/wake/exit-code")"
+    check "rc 3: summary exit_code stays 0" \
+        '{"exit_code": 0}' "$(cat -- "$root/wake/summary.json")"
+    if [[ -f "$root/rm-calls.log" ]]; then
+        contains "rc 3: stub rm --branch was called" \
+            "$(cat -- "$root/rm-calls.log")" "--branch test-branch-3"
+    else
+        no "rc 3: stub rm --branch was called" "rm-calls.log never written"
+    fi
+}
+
+# ---- case: rc 2 (dead pod), no k8s summary ----
+{
+    root=""
+    setup_root root
+    write_nul "$root/wake/fs-argv" \
+        "$root/bin/launcher.sh" --branch "test-branch-2" \
+        --outbox-dir "$root/wake/outbox"
+    : > "$root/wake/env"
+    run_dir="$root/k8srun"
+    ( STUB_K8S_RUN_DIR="$run_dir" STUB_K8S_LAUNCH_RC=2 STUB_K8S_NO_SUMMARY=1 \
+        "$root/bin/fork-sandbox-k8s-wake.sh" "$root/wake" )
+    rc=$?
+    check "rc 2: wrapper propagates rc 2" 2 "$rc"
+    check "rc 2: exit-code file is 2" 2 "$(cat -- "$root/wake/exit-code")"
+    check "rc 2: summary.json synthesized" \
+        '{"exit_code": 2}' "$(cat -- "$root/wake/summary.json")"
+    if [[ -f "$root/rm-calls.log" ]]; then
+        no "rc 2: rm not called" "rm-calls.log unexpectedly written"
+    else
+        ok "rc 2: rm not called"
+    fi
+}
+
+# ---- case: launcher refuses before submit -- no run dir line at all ----
+{
+    root=""
+    setup_root root
+    write_nul "$root/wake/fs-argv" \
+        "$root/bin/launcher.sh" --branch "test-branch-refuse" \
+        --outbox-dir "$root/wake/outbox"
+    : > "$root/wake/env"
+    ( STUB_K8S_LAUNCH_RC=1 STUB_K8S_NO_RUN_DIR=1 \
+        "$root/bin/fork-sandbox-k8s-wake.sh" "$root/wake" )
+    rc=$?
+    check "refusal: wrapper propagates rc 1" 1 "$rc"
+    check "refusal: k8s-run-dir is empty" "" "$(cat -- "$root/wake/k8s-run-dir")"
+    check "refusal: summary.json synthesized" \
+        '{"exit_code": 1}' "$(cat -- "$root/wake/summary.json")"
+}
+
+# ---- case: a bad-KEY env record is ignored, a good one is exported ----
+{
+    root=""
+    setup_root root
+    write_nul "$root/wake/fs-argv" \
+        "$root/bin/launcher.sh" --branch "test-branch-env" \
+        --outbox-dir "$root/wake/outbox"
+    write_nul "$root/wake/env" "BAD-KEY=nope" "GOOD_VAR=hello"
+    dump="$root/env-dump.txt"
+    ( STUB_ENV_DUMP="$dump" STUB_K8S_LAUNCH_RC=0 \
+        "$root/bin/fork-sandbox-k8s-wake.sh" "$root/wake" ) >/dev/null
+    if [[ -f "$dump" ]]; then
+        contains "env: good record exported" "$(cat -- "$dump")" "GOOD_VAR=hello"
+        case "$(cat -- "$dump")" in
+            *"BAD-KEY"*) no "env: bad-KEY record ignored" "BAD-KEY leaked into launcher env" ;;
+            *) ok "env: bad-KEY record ignored" ;;
+        esac
+    else
+        no "env: dump written" "$dump missing"
+    fi
+}
+
+# ---- case: exit-code is written strictly before summary.json ----
+{
+    root=""
+    setup_root root
+    write_nul "$root/wake/fs-argv" \
+        "$root/bin/launcher.sh" --branch "test-branch-order" \
+        --outbox-dir "$root/wake/outbox"
+    : > "$root/wake/env"
+    ( STUB_K8S_LAUNCH_RC=0 "$root/bin/fork-sandbox-k8s-wake.sh" "$root/wake" ) >/dev/null
+    if [[ "$root/wake/exit-code" -ot "$root/wake/summary.json" ]]; then
+        ok "order: exit-code precedes summary.json"
+    else
+        no "order: exit-code precedes summary.json" "exit-code is not older than summary.json"
+    fi
+}
+
+# ---- case: --help prints usage and exits 0 ----
+{
+    root=""
+    setup_root root
+    out="$("$root/bin/fork-sandbox-k8s-wake.sh" --help)"
+    rc=$?
+    check "--help exits 0" 0 "$rc"
+    contains "--help mentions Usage" "$out" "Usage:"
+}
+
+# ---- case: --detach starts a tmux session named cc-k8s-<branch> ----
+{
+    root=""
+    setup_root root
+    write_nul "$root/wake/fs-argv" \
+        "$root/bin/launcher.sh" --branch "weird/branch name!" \
+        --outbox-dir "$root/wake/outbox"
+    : > "$root/wake/env"
+
+    tmux_log="$root/tmux-argv.log"
+    cat > "$root/bin/tmux" <<STUB
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$tmux_log"
+# Run the command tmux was given (the last arg) so the rest of the test
+# can observe the wrapper's own side effects too.
+last="\${!#}"
+exec "\$last"
+STUB
+    chmod +x -- "$root/bin/tmux"
+
+    ( PATH="$root/bin:$PATH" STUB_K8S_LAUNCH_RC=0 \
+        "$root/bin/fork-sandbox-k8s-wake.sh" --detach "$root/wake" )
+    rc=$?
+    check "--detach: wrapper returns 0" 0 "$rc"
+    if [[ -f "$tmux_log" ]]; then
+        contains "--detach: session named cc-k8s-<sanitized branch>" \
+            "$(cat -- "$tmux_log")" "cc-k8s-weird-branch-name-"
+        contains "--detach: run.sh passed as the one command" \
+            "$(cat -- "$tmux_log")" "$root/wake/run.sh"
+    else
+        no "--detach: tmux was invoked" "tmux-argv.log missing"
+    fi
+    check "--detach: exit-code eventually written" 0 "$(cat -- "$root/wake/exit-code" 2>/dev/null || echo MISSING)"
+}
+
+# ---- case: --detach exits 1 when tmux cannot start a session ----
+{
+    root=""
+    setup_root root
+    write_nul "$root/wake/fs-argv" \
+        "$root/bin/launcher.sh" --branch "test-branch-notmux" \
+        --outbox-dir "$root/wake/outbox"
+    : > "$root/wake/env"
+    cat > "$root/bin/tmux" <<'STUB'
+#!/usr/bin/env bash
+exit 1
+STUB
+    chmod +x -- "$root/bin/tmux"
+    ( PATH="$root/bin:$PATH" "$root/bin/fork-sandbox-k8s-wake.sh" --detach "$root/wake" ) >/dev/null 2>&1
+    rc=$?
+    check "--detach: propagates tmux failure as rc 1" 1 "$rc"
+}
+
+printf '\n%s ok, %s fail\n' "$pass" "$fail"
+(( fail == 0 ))
