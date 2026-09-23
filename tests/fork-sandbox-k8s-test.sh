@@ -6769,6 +6769,12 @@ printf '\n== fork-sandbox-k8s-context-extract.sh: extraction guards (no cluster)
 # well-formed: the shape `tar cf - -C CONTEXT_DIR .` on the host produces
 # -- relative entries, no `..`, no links. Must extract cleanly.
 cf_src="$(newdir)"; tmpdirs+=("$cf_src")
+# mktemp -d defaults to mode 0700; pinned explicitly (rather than left at
+# that default) so the archived top-level `./` entry's mode is known to
+# differ from 0700, which the metadata-preservation test below chmods its
+# own DEST_DIR to -- otherwise a coincidental match would hide a real
+# restore-on-extract.
+chmod 0755 "$cf_src"
 mkdir -p "$cf_src/sub"
 printf 'hello\n' > "$cf_src/foo.txt"
 printf 'world\n' > "$cf_src/sub/bar.txt"
@@ -6825,6 +6831,36 @@ else
         "$(find "$cf_exist_dest" 2>&1)"
 fi
 rm -f /tmp/fs-k8s-ctx-exist.err
+
+# An existing DEST_DIR's own mode survives extraction untouched. This
+# pins --no-overwrite-dir on the pre-existing-DEST_DIR branch: a
+# --thread-dir/--attach-dir push targets a kubelet-created emptyDir owned
+# by root, and GNU tar's default (--overwrite-dir) would try to chmod/utime
+# that mount point to match the archive's top-level `./` entry -- a call
+# that fails with EPERM for a non-owner with no capabilities, which is not
+# reproducible here since the test itself owns cf_meta_dest and so CAN
+# chmod it. What this test catches instead is whether that restore attempt
+# happens at all: without --no-overwrite-dir, tar (run as the owner) would
+# succeed in changing cf_meta_dest's mode away from 0700 to match the
+# archive; with it, the mode is left alone.
+cf_meta_dest="$cf_parent/meta_dest"
+mkdir -p "$cf_meta_dest"
+chmod 0700 "$cf_meta_dest"
+if "$context_extract_sh" "$cf_meta_dest" 100000000 < "$cf_wf_tar" \
+        >/tmp/fs-k8s-ctx-meta.err 2>&1; then
+    ok "an existing DEST_DIR's own metadata survives extraction"
+else
+    no "an existing DEST_DIR's own metadata survives extraction" \
+        "$(cat /tmp/fs-k8s-ctx-meta.err)"
+fi
+cf_meta_mode="$(stat -c '%a' "$cf_meta_dest")"
+if [[ "$cf_meta_mode" == "700" ]]; then
+    ok "an existing DEST_DIR's own permission bits are not overwritten from the archive"
+else
+    no "an existing DEST_DIR's own permission bits are not overwritten from the archive" \
+        "mode is $cf_meta_mode, expected 700"
+fi
+rm -f /tmp/fs-k8s-ctx-meta.err
 
 # An existing NON-empty DEST_DIR is still refused: a second push must not
 # merge into a first.

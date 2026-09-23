@@ -189,6 +189,7 @@ done < "$tf_out"
 # refused: that is still a second push merging into a first, the case
 # this check exists for. --context-ro's own destination (POD_CONTEXT_DIR)
 # never pre-exists, so this leaves its behaviour unchanged.
+overwrite_dir_flag=""
 if [ -e "$dest_dir" ]; then
     if [ ! -d "$dest_dir" ]; then
         echo "$label: DEST_DIR '$dest_dir' exists and is not a directory; refusing." >&2
@@ -198,6 +199,22 @@ if [ -e "$dest_dir" ]; then
         echo "$label: DEST_DIR '$dest_dir' already exists and is not empty; refusing." >&2
         exit 1
     fi
+    # The mount point itself is kubelet-created (an emptyDir), owned by
+    # root even though fsGroup makes it group-writable -- this process
+    # runs as a non-root uid with every capability dropped. GNU tar's
+    # default (--overwrite-dir) tries to chmod/utime the directory this
+    # archive's top-level `./` entry maps onto, and chmod/utime with
+    # explicit times both require owning the target or CAP_FOWNER; neither
+    # holds here, so that restore attempt fails and tar's exit status goes
+    # nonzero even though every file underneath extracted fine, and this
+    # script's `set -eu` then reports the whole push as failed. Passing
+    # --no-overwrite-dir skips that restore for DEST_DIR itself, which is
+    # all this needs: DEST_DIR already has the mode/group the mount wants,
+    # and freshly-created subdirectories inside it are still owned by this
+    # process, so their own metadata restore is untouched. Only reached on
+    # this pre-existing-DEST_DIR branch, so --context-ro's destination
+    # (always freshly mkdir'd below) stays byte-identical.
+    overwrite_dir_flag="--no-overwrite-dir"
 else
     mkdir -- "$dest_dir"
 fi
@@ -205,4 +222,5 @@ fi
 # Never as anyone but the invoking user -- no sudo, nothing
 # privilege-related; --no-same-owner/--no-same-permissions strip whatever
 # the archive itself claims.
-tar -xf "$tar_file" -C "$dest_dir" --no-same-owner --no-same-permissions
+tar -xf "$tar_file" -C "$dest_dir" --no-same-owner --no-same-permissions \
+    ${overwrite_dir_flag:+"$overwrite_dir_flag"}
