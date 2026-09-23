@@ -3358,71 +3358,11 @@ if [[ "$maintainer_harness_given" == true && "$network" == "sealed" \
     echo "contents to $maintainer_harness's model provider. Proceeding." >&2
 fi
 
-# --refresh-at: refused outright, by name, on every harness but claude --
-# see the "A run that refreshes itself" section above for why. Refused only
-# when GIVEN explicitly, so the 0.5 default stays silent on a plain pi or
-# codex run rather than erroring on every launch that never mentioned it.
-if [[ "$refresh_at_given" == true && "$harness" != "claude" ]]; then
-    echo "Error: --refresh-at only works with --harness claude. The context" >&2
-    echo "threshold is measured by a hook installed into the claude session;" >&2
-    echo "the other harnesses have no hook system to measure with, and this" >&2
-    echo "is not built for them yet." >&2
-    exit 1
-fi
-if [[ -n "$refresh_max_arg" && "$harness" != "claude" ]]; then
-    echo "Error: --refresh-max only applies with --harness claude, alongside" >&2
-    echo "--refresh-at." >&2
-    exit 1
-fi
-refresh_at="0"
-[[ "$harness" == "claude" ]] && refresh_at="${refresh_at_arg:-0.5}"
-if [[ ! "$refresh_at" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
-    echo "Error: --refresh-at takes a fraction (0-1) of the context window, an" >&2
-    echo "absolute token count above 1, or 0 to disable it -- not '$refresh_at'." >&2
-    exit 1
-fi
-# awk, not bash arithmetic, for the ">0" test: $refresh_at can be a fraction
-# ("0.5"), and bash's (( )) only understands integers.
-refresh_enabled=0
-awk -v v="$refresh_at" 'BEGIN{exit !(v>0)}' && refresh_enabled=1
-if [[ -n "$refresh_max_arg" && "$refresh_enabled" == "0" ]]; then
-    echo "Error: --refresh-max requires --refresh-at (which is on by default," >&2
-    echo "so this only happens with an explicit --refresh-at 0). With refresh" >&2
-    echo "disabled there is no continuation loop for it to cap." >&2
-    exit 1
-fi
-refresh_max=6
-if [[ -n "$refresh_max_arg" ]]; then
-    if [[ ! "$refresh_max_arg" =~ ^[0-9]+$ ]]; then
-        echo "Error: --refresh-max takes a non-negative integer -- the number of" >&2
-        echo "continuation legs that may follow the first -- not '$refresh_max_arg'." >&2
-        exit 1
-    fi
-    refresh_max="$refresh_max_arg"
-fi
-refresh_context_window=""
-refresh_threshold_tokens=""
-if (( refresh_enabled )); then
-    # A one-line, one-place guess, kept here rather than duplicated in the
-    # hook: a model whose name carries "[1m]" gets the 1,000,000-token beta
-    # window; everything else gets the standard 200,000.
-    # FORK_SANDBOX_CONTEXT_WINDOW overrides the guess outright, and
-    # --refresh-at <tokens> (an absolute count above 1) sidesteps it
-    # entirely, since the comparison below then needs no window at all.
-    refresh_context_window="${FORK_SANDBOX_CONTEXT_WINDOW:-}"
-    if [[ -z "$refresh_context_window" ]]; then
-        case "${model,,}" in
-            *'[1m]'*) refresh_context_window=1000000 ;;
-            *)        refresh_context_window=200000 ;;
-        esac
-    fi
-    if awk -v v="$refresh_at" 'BEGIN{exit !(v<=1)}'; then
-        refresh_threshold_tokens="$(awk -v f="$refresh_at" -v w="$refresh_context_window" \
-            'BEGIN{printf "%d", f*w}')"
-    else
-        refresh_threshold_tokens="$(awk -v f="$refresh_at" 'BEGIN{printf "%d", f}')"
-    fi
-fi
+# --refresh-at / --refresh-max: validation, defaults and the token threshold
+# live in fs_refresh_resolve (fork-sandbox-lib.sh), shared with the k8s submit
+# path. See the "A run that refreshes itself" section above.
+fs_refresh_resolve "$harness" "$refresh_at_arg" "$refresh_at_given" \
+    "$refresh_max_arg" "$model" || exit 1
 
 # The resolved model values are what --dry-run prints, so they have to clear
 # the shell-safety check before it prints them. The full sweep over every
