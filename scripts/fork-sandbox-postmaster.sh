@@ -3195,6 +3195,14 @@ pm_harvest_run() {
     # returns early); gates the FAILS/retry bookkeeping done once, after
     # the pending-message read near the end of this function.
     local was_failure=0
+    # Set only by the k8s wait-timeout branch below: the Job this harvest
+    # just flagged may still be running, so the pending-message block near
+    # the end of this function must not wake this seat again on top of
+    # it -- that would spawn a second Job for the same (agent, tid) pair
+    # (fs_pm_find_live_run stops treating this rid as live the moment this
+    # harvest marks it $HARVESTED, a few lines below, regardless of
+    # whether the k8s Job itself is done).
+    local k8s_still_running=0
     if [[ ! -d "$run_dir" ]]; then
         # Vanished (scratch root cleaned up, or never existed) rather than
         # merely still running -- this is the one crash shape distinct
@@ -3233,7 +3241,17 @@ pm_harvest_run() {
     else
         local exit_code
         exit_code="$(pm_trim "$(cat -- "$run_dir/exit-code" 2>/dev/null)")"
-        if [[ "$backend" == k8s && "$exit_code" == "1" ]]; then
+        # k8s-run-dir (written by fork-sandbox-k8s-wake.sh, step 3) is
+        # empty exactly when nothing was ever submitted -- a refusal
+        # before submit (e.g. fork-sandbox.sh's or fork-sandbox-k8s.sh's
+        # own argument checks) also exits 1, and there is no Job to wait
+        # on or point an operator at in that case, so it is told apart
+        # from a genuine wait timeout here rather than sharing rc 1 alone.
+        local k8s_run_dir=""
+        if [[ "$backend" == k8s && -f "$run_dir/k8s-run-dir" ]]; then
+            k8s_run_dir="$(pm_trim "$(cat -- "$run_dir/k8s-run-dir" 2>/dev/null)")"
+        fi
+        if [[ "$backend" == k8s && "$exit_code" == "1" && -n "$k8s_run_dir" ]]; then
             # rc 1 from fork-sandbox-k8s.sh run is a wait timeout, not a
             # crash: the pod is still running and holding its work
             # (fork-sandbox-k8s.sh's own message, "the pod is still
@@ -3243,9 +3261,11 @@ pm_harvest_run() {
             # Job for this seat while the first one is still live -- so
             # this is flagged on its own, distinct from the generic
             # non-zero-exit branch below, and was_failure is left 0: no
-            # retry is scheduled, and the still-running Job is left alone
-            # for an operator to fetch or remove by hand.
-            pm_flag "$tid" "k8s wake for $agent timed out waiting on its Job (run $rid); the Job is still running -- fetch it with fork-sandbox-k8s.sh fetch --branch $branch, or remove it with fork-sandbox-k8s.sh rm --branch $branch, before it is retried automatically"
+            # retry is ever scheduled on this path, and the still-running
+            # Job is left alone for an operator to fetch or remove by
+            # hand.
+            pm_flag "$tid" "k8s wake for $agent timed out waiting on its Job (run $rid); the Job is still running -- fetch it with fork-sandbox-k8s.sh fetch --branch $branch, or remove it with fork-sandbox-k8s.sh rm --branch $branch"
+            k8s_still_running=1
         elif [[ "$exit_code" != "0" ]]; then
             # Harvest whatever outbox there is (a crash mid-reply may still
             # have written a file), but flag regardless: an empty outbox from
@@ -3380,7 +3400,17 @@ pm_harvest_run() {
         # finish acting on it, so the newest message still needs an
         # actual wake exactly like the non-live case, not a ledger entry
         # standing in for one that never happened.
-        if (( ! was_failure )) && pm_mail_delivered_live "$run_dir" "$newest"; then
+        if (( k8s_still_running )); then
+            # Do not wake here: the Job this harvest just flagged may
+            # still be running, and fs_pm_find_live_run no longer sees
+            # this pair as busy the moment this harvest marks $rid
+            # $HARVESTED below, so a follow-up wake here would spawn a
+            # second Job for the same (agent, tid) pair on top of the
+            # first. This pending message is left unanswered until the
+            # operator's fetch/rm resolves the flagged Job and a later
+            # message routes the seat forward again.
+            :
+        elif (( ! was_failure )) && pm_mail_delivered_live "$run_dir" "$newest"; then
             pm_ledger_delivered_live "$tid" "$agent" "$newest" "$rid"
         else
             pm_followup_wake "$project" "$agent" "$tid" "$newest"

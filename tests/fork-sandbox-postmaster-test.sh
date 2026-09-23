@@ -5040,6 +5040,62 @@ once
 check "k8s case5b: no second Job launched behind the still-running one" 0 \
     "$(grep -c -- '^--k8s$' "$STUB_ARGV_LOG")"
 
+# ---- case 5b2: a pending message must not wake behind a still-running Job ----
+# was_failure is deliberately left 0 by the rc-1 branch above (no
+# crash-retry), but the pending-message follow-up used to fire regardless
+# of was_failure: pm_mail_delivered_live has no events.jsonl to check for
+# a k8s run (there is no inbox hook to log into), so it always fell
+# through to pm_followup_wake and spawned a second Job for the same seat
+# and thread while the first one was still running -- fs_pm_find_live_run
+# stops treating a run as live the instant this harvest marks it
+# $HARVESTED, whether or not the k8s Job itself is done. A second message
+# on the same thread, sent before the first wake is harvested, reproduces
+# the window: route_pass processes both in one pass (debounce is off for
+# this whole file), so the second one pends against the still-unharvested
+# run, and only then does harvest_pass run.
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+
+k5b2_mid1="$(send_msg '@carol' '@karen' 'k8s timeout pending topic' 'first' 8)"
+k5b2_tid="$(thread_of "$k5b2_mid1")"
+k5b2_mid2="$(reply_msg '@carol' "$k5b2_mid1" 'second' --to '@karen')"
+export STUB_K8S_EXIT=1 STUB_K8S_NO_SUMMARY=1 STUB_K8S_NO_REPLY=1
+: > "$STUB_ARGV_LOG"
+once
+unset STUB_K8S_EXIT STUB_K8S_NO_SUMMARY STUB_K8S_NO_REPLY
+check "k8s case5b2: only one Job launched, not a second behind it" 1 \
+    "$(grep -c -- '^--k8s$' "$STUB_ARGV_LOG")"
+k5b2_env="$(latest_env_for_agent karen)"
+contains "k8s case5b2: the second message was still recorded as pending" \
+    "$(cat "$k5b2_env" 2>/dev/null)" "PENDING_MSGS=$k5b2_mid2"
+
+# ---- case 5c: rc 1 with no run dir recorded is an ordinary failure ----
+# fork-sandbox.sh's and fork-sandbox-k8s.sh's own argument-check refusals
+# also exit 1, before any Job is ever submitted. fork-sandbox-k8s-wake.sh's
+# own k8s-run-dir file is empty in that case (see its step 3), unlike a
+# genuine wait timeout where a Job exists -- confusing the two flagged a
+# refusal as "the Job is still running -- fetch/rm it" (a Job that never
+# existed) and, since was_failure stayed 0, never scheduled the retry a
+# plain failure gets everywhere else.
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+
+k5c_mid="$(send_msg '@carol' '@karen' 'k8s refusal topic' 'first' 8)"
+k5c_tid="$(thread_of "$k5c_mid")"
+export STUB_K8S_EXIT=1 STUB_K8S_NO_RUNDIR=1 STUB_K8S_NO_REPLY=1
+once
+unset STUB_K8S_EXIT STUB_K8S_NO_RUNDIR STUB_K8S_NO_REPLY
+contains "k8s case5c: flagged as an ordinary exit, not a Job timeout" \
+    "$(cat "$PM_STATE_DIR/needs-operator/$k5c_tid" 2>/dev/null)" "wake for karen exited 1"
+check "k8s case5c: no Job-timeout wording without a Job" 0 \
+    "$( [[ "$(cat "$PM_STATE_DIR/needs-operator/$k5c_tid" 2>/dev/null)" == *"timed out waiting on its Job"* ]] && echo 1 || echo 0 )"
+contains "k8s case5c: a retry was scheduled, same as any other failure" \
+    "$(cat "$PM_STATE_DIR/retries/$k5c_tid/karen" 2>/dev/null)" "STATE=pending"
+
 # ---- case 6: rc 3 zero-harvest -> harvested clean, kept Job reaped ----
 
 new_scratch_root FORK_SANDBOX_MAIL_ROOT
