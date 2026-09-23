@@ -261,6 +261,13 @@ export FORK_SANDBOX_POSTMASTER_LAUNCHER="$STUB_BIN/fork-sandbox.sh"
 export FORK_SANDBOX_POSTMASTER_DEBOUNCE=0
 
 new_root PROJECT_DIR
+# A real (throwaway) git repo, not just a directory: pm_lineage_checkout
+# (k8s --checkout forwarding, exercised far below) does a real read-only
+# git rev-parse against this path, and the stub fork-sandbox.sh never
+# touches git itself, so nothing else in this suite needs it to be one.
+git -C "$PROJECT_DIR" init -q
+git -C "$PROJECT_DIR" -c user.email=test@example.com -c user.name=test \
+    commit -q --allow-empty -m init
 
 # ---- test helpers ----
 
@@ -4934,15 +4941,45 @@ check "k8s case1: --k8s is in argv" 1 "$(grep -c -- '^--k8s$' "$STUB_ARGV_LOG")"
 check "k8s case1: --outbox-dir is in argv" 1 "$(grep -c -- '^--outbox-dir$' "$STUB_ARGV_LOG")"
 check "k8s case1: --thread-dir is in argv" 1 "$(grep -c -- '^--thread-dir$' "$STUB_ARGV_LOG")"
 check "k8s case1: --timeout defaults to 14400" 14400 "$(argv_after --timeout "$STUB_ARGV_LOG")"
-for df in --clone-dir --session-state --resume-session --session-id --refresh-at; do
+for df in --clone-dir --refresh-at; do
     check "k8s case1: $df is absent (fork-sandbox.sh --k8s refuses it)" 0 \
         "$(grep -c -- "^$df\$" "$STUB_ARGV_LOG")"
 done
+check "k8s case1: --session-state forwarded (k8s seats keep their session)" \
+    "$PM_STATE_DIR/state/$k1_tid/karen" "$(argv_after --session-state "$STUB_ARGV_LOG")"
+check "k8s case1: no --resume-session on a first wake (nothing to resume)" 0 \
+    "$(grep -c -- '^--resume-session$' "$STUB_ARGV_LOG")"
+check "k8s case1: no --session-id (claude is discover-mode)" 0 \
+    "$(grep -c -- '^--session-id$' "$STUB_ARGV_LOG")"
+check "k8s case1: no --checkout on a first wake (no prior run to resolve)" 0 \
+    "$(grep -c -- '^--checkout$' "$STUB_ARGV_LOG")"
 k1_env="$(latest_env_for_agent karen)"
 check "k8s case1: .env BACKEND=k8s" k8s "$(env_val "$k1_env" BACKEND)"
 check "k8s case1: .env RESUMED is empty" "" "$(env_val "$k1_env" RESUMED)"
 k1_rendered="$("$MAIL_RENDER" --text --thread "$k1_tid" "$FORK_SANDBOX_MAIL_ROOT" 2>/dev/null)"
 contains "k8s case1: the stub's k8s reply was harvested" "$k1_rendered" "hello from k8s stub"
+
+# ---- case 1b: a second wake resumes the session and gets a --checkout ----
+# Fixtures stand in for what a real harvest would have recorded after
+# case1: a session id under sessions/ (pm_session_record's own format --
+# see its header) and a branch that actually resolves in PROJECT_DIR
+# (case1's own BRANCH, which the stub fork-sandbox.sh never really
+# creates). A second wake for the same (thread, agent) must read the
+# session id back as --resume-session, and pm_lineage_checkout must
+# resolve karen's own prior BRANCH -- a real git rev-parse, not just a
+# file read.
+k1_branch="$(env_val "$k1_env" BRANCH)"
+git -C "$PROJECT_DIR" branch "$k1_branch" >/dev/null 2>&1
+k1_fixture_sid=aaaa1111-2222-3333-4444-555566667777
+mkdir -p -- "$PM_STATE_DIR/sessions/$k1_tid"
+printf '%s\n' "$k1_fixture_sid" > "$PM_STATE_DIR/sessions/$k1_tid/karen"
+reply_msg '@carol' "$k1_mid" 'second' --to '@karen' >/dev/null
+: > "$STUB_ARGV_LOG"
+once
+check "k8s case1b: --resume-session forwarded from the recorded session" \
+    "$k1_fixture_sid" "$(argv_after --resume-session "$STUB_ARGV_LOG")"
+check "k8s case1b: --checkout forwarded (lineage from karen's own prior run)" \
+    "$k1_branch" "$(argv_after --checkout "$STUB_ARGV_LOG")"
 
 # ---- case 2: a local seat on the same fleet spawns exactly as before ----
 
@@ -4984,6 +5021,16 @@ once
 check "k8s case4: --endpoint forwarded" kim-endpoint "$(argv_after --endpoint "$STUB_ARGV_LOG")"
 check "k8s case4: pi thinking forwarded as --pi-args" '--thinking medium' \
     "$(argv_after --pi-args "$STUB_ARGV_LOG")"
+# A pi seat is given-mode (fs_harness_session_caps): --session-id is
+# derived, not discovered, so it arrives on the very first wake -- unlike
+# karen's (claude, discover-mode) case1 above, which gets no --session-id
+# until a prior wake's transcript has been found.
+check "k8s case4: a pi seat gets --session-state" \
+    1 "$(grep -c -- '^--session-state$' "$STUB_ARGV_LOG")"
+check "k8s case4: a pi seat gets --session-id on its first wake" \
+    1 "$(grep -c -- '^--session-id$' "$STUB_ARGV_LOG")"
+check "k8s case4: a pi seat gets no --resume-session (create-if-missing, not discovered)" \
+    0 "$(grep -c -- '^--resume-session$' "$STUB_ARGV_LOG")"
 
 # ---- case 5: rc 2 (dead pod), no k8s summary -> flagged, retried, retry handoff ----
 

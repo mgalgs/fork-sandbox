@@ -348,15 +348,22 @@
 # directories behind and instead of the wrapper's own script_dir resolving
 # to the real fork-sandbox-k8s.sh.
 #
-# fork-sandbox.sh refuses five flags on --k8s -- --clone-dir,
-# --session-state, --resume-session, --session-id, --refresh-at -- so
-# pm_spawn_wake never passes them for a k8s seat: every wake is a fresh
-# session in a fresh clone, and seat continuity (a durable workspace or a
-# resumed conversation, the way a local seat gets one -- see STATE and
-# LIMITATIONS below) is later work, not this round's. `--timeout
-# "${FORK_SANDBOX_POSTMASTER_K8S_TIMEOUT:-14400}"` bounds how long the Job
-# may run; a non-numeric value refuses `deliver` at startup with a clear
-# message rather than failing confusingly on the first k8s wake.
+# fork-sandbox.sh refuses two flags on --k8s -- --clone-dir and
+# --refresh-at -- so pm_spawn_wake never passes them for a k8s seat: there
+# is no durable per-seat clone on k8s (a fresh clone every wake) and no
+# mid-run credential refresh there, unlike a local seat -- see STATE and
+# LIMITATIONS below. --session-state/--resume-session/--session-id ARE
+# forwarded now, the same way and via the same pm_session_spawn_args the
+# local branch below uses: a k8s seat keeps its conversation across wakes
+# exactly like a local one, bound into the pod's own transcript store by
+# fork-sandbox-k8s-entrypoint.sh. A k8s seat's wake also gets a
+# --checkout when pm_lineage_checkout finds one (see its own comment) --
+# a local wake gets this for free from its own persistent --clone-dir,
+# but a k8s wake's clone is fresh every time, so lineage has to be found
+# explicitly. `--timeout "${FORK_SANDBOX_POSTMASTER_K8S_TIMEOUT:-14400}"`
+# bounds how long the Job may run; a non-numeric value refuses `deliver`
+# at startup with a clear message rather than failing confusingly on the
+# first k8s wake.
 #
 # rule 4's live delivery (above) never reaches a k8s wake: there is no
 # inbox to deliver into (the wrapper drives one fork-sandbox.sh --k8s run
@@ -1056,6 +1063,81 @@ pm_trim() {
     s="${s#"${s%%[![:space:]]*}"}"
     s="${s%"${s##*[![:space:]]}"}"
     printf '%s' "$s"
+}
+
+# Session-continuity spawn args for a resumable-harness seat -- the piece
+# pm_spawn_wake's local and k8s branches now share, so an agent woken again
+# and again on one thread is ONE conversation on EITHER backend. Prints one
+# arg per line (a --session-state/--session-id/--resume-session flag,
+# then its value) followed by a final "RESUMED=<id>" line (id empty when
+# nothing resumed, or when the harness is not resumable at all) -- no line
+# embeds a newline of its own, so a plain line-at-a-time read is safe even
+# though PM_SESSION_STATE itself could contain spaces. Caller reads it with
+# `mapfile -t`, takes the last line as RESUMED and everything before it as
+# spawn_args, exactly the way the old inline block did before it was two
+# copies.
+pm_session_spawn_args() {
+    local harness="$1" tid="$2" agent="$3" resumed=""
+    fs_harness_session_caps "$harness"
+    if [[ "$FS_HARNESS_RESUMABLE" == true ]]; then
+        printf -- '--session-state\n%s\n' "$PM_SESSION_STATE/$tid/$agent"
+        if [[ "$FS_HARNESS_ID_MODE" == given ]]; then
+            # No discovery: the id is derived, not read back from a prior
+            # wake, so it is available -- and passed -- from the first wake
+            # of this seat onward. sessions/ is never touched for this
+            # harness.
+            local sid
+            sid="$(pm_pi_session_id "$tid" "$agent")"
+            printf -- '--session-id\n%s\n' "$sid"
+            resumed="$sid"
+        else
+            local sid_file="$PM_SESSIONS/$tid/$agent" sid
+            if [[ -f "$sid_file" ]]; then
+                sid="$(pm_trim "$(cat -- "$sid_file" 2>/dev/null)")"
+                if [[ "$sid" =~ $PM_SESSION_ID_RE ]]; then
+                    printf -- '--resume-session\n%s\n' "$sid"
+                    resumed="$sid"
+                fi
+            fi
+        fi
+    fi
+    printf 'RESUMED=%s\n' "$resumed"
+}
+
+# Picks a --checkout branch for a k8s seat's wake: this thread's SEQ
+# history (append-only, never truncated -- see pm_next_seq), walked from
+# its newest entry back toward its oldest, for the first run belonging to
+# the SAME agent whose recorded BRANCH still resolves to a commit in the
+# project repo. Read-only git against the project repo itself, never a
+# clone. Neither backend is preferred: a resolving local-seat branch wins
+# exactly like a resolving k8s-seat branch would. A run whose branch no
+# longer resolves (a local zero-commit wake, cleaned up after the fact) is
+# silently skipped in favor of an older one; a k8s zero-commit branch
+# equals its own start point and still resolves, so it is a fine answer.
+# Prints the branch name and returns 0, or prints nothing and returns 1
+# when no run in the thread's history resolves -- the caller then starts
+# the seat from HEAD, as it always has.
+pm_lineage_checkout() {
+    local project="$1" tid="$2" agent="$3"
+    [[ -f "$SEQ/$tid" ]] || return 1
+    local -a rids=()
+    mapfile -t rids < "$SEQ/$tid"
+    local i rid f a branch
+    for (( i = ${#rids[@]} - 1; i >= 0; i-- )); do
+        rid="${rids[i]}"
+        [[ -n "$rid" ]] || continue
+        f="$RUNS/$rid.env"
+        [[ -f "$f" ]] || continue
+        a="$(fs_pm_env_get "$f" AGENT)"
+        [[ "$a" == "$agent" ]] || continue
+        branch="$(fs_pm_env_get "$f" BRANCH)"
+        [[ -n "$branch" ]] || continue
+        if git -C "$project" rev-parse -q --verify "refs/heads/$branch^{commit}" >/dev/null 2>&1; then
+            printf '%s' "$branch"
+            return 0
+        fi
+    done
+    return 1
 }
 
 # Expands a To:/Cc:-shaped comma list one address at a time (fleet expand
@@ -2246,11 +2328,16 @@ pm_spawn_wake() {
         # from a synchronous launch the way the local branch does below --
         # the wrapper's own wake dir plays that role instead (RUN_DIR below
         # is the wake dir, not a fork-sandbox.sh run dir). Session
-        # continuity (--session-state/--resume-session/--session-id/
-        # --clone-dir/--refresh-at) and --preset are dropped outright:
-        # fork-sandbox.sh refuses all five with --k8s, and `fleet
-        # check` never lets a k8s seat carry a preset -- seat continuity on
-        # k8s is later work (see the brief's Out of scope).
+        # continuity (--session-state/--resume-session/--session-id) is
+        # forwarded exactly as the local branch forwards it below, via the
+        # same pm_session_spawn_args -- fork-sandbox.sh accepts all three
+        # with --k8s now, and fork-sandbox-k8s-entrypoint.sh binds the same
+        # host-side transcript store into the pod that a local wake gets.
+        # --clone-dir/--refresh-at and --preset are still dropped outright:
+        # fork-sandbox.sh refuses the first two with --k8s, and `fleet
+        # check` never lets a k8s seat carry a preset -- a persistent
+        # per-seat clone and mid-run credential refresh on k8s are later
+        # work (see the brief's Out of scope).
         local -a spawn_args=(--branch "$branch" --harness "$harness" --network "$network")
         [[ -n "$model" ]] && spawn_args+=(--model "$model")
         if [[ "$harness" == pi && -n "$thinking" ]]; then
@@ -2261,6 +2348,23 @@ pm_spawn_wake() {
         spawn_args+=(--k8s)
         [[ -n "$endpoint" ]] && spawn_args+=(--endpoint "$endpoint")
         spawn_args+=(--timeout "${FORK_SANDBOX_POSTMASTER_K8S_TIMEOUT:-14400}")
+
+        local resumed=""
+        local -a session_lines=()
+        mapfile -t session_lines < <(pm_session_spawn_args "$harness" "$tid" "$agent")
+        local session_last=$(( ${#session_lines[@]} - 1 ))
+        resumed="${session_lines[session_last]#RESUMED=}"
+        spawn_args+=("${session_lines[@]:0:session_last}")
+
+        # Lineage: pick up where the same agent's own most recent run on
+        # this thread left off (either backend) instead of always starting
+        # a k8s seat fresh from HEAD -- see pm_lineage_checkout's own
+        # comment. Computed before this wake's own run-id is appended to
+        # $SEQ/$tid below, so it never sees itself.
+        local checkout_branch
+        if checkout_branch="$(pm_lineage_checkout "$project" "$tid" "$agent")"; then
+            spawn_args+=(--checkout "$checkout_branch")
+        fi
 
         local wake_root="${FORK_SANDBOX_POSTMASTER_K8S_WAKE_ROOT:-/var/tmp/claude-scratch/forks}"
         mkdir -p -- "$wake_root"
@@ -2352,7 +2456,7 @@ pm_spawn_wake() {
             printf 'MODEL=%s\n' "$model"
             printf 'NETWORK=%s\n' "$network"
             printf 'BRANCH=%s\n' "$branch"
-            printf 'RESUMED=\n'
+            printf 'RESUMED=%s\n' "$resumed"
             printf 'PENDING_MSGS=\n'
             printf 'VIA=%s\n' "$via"
             printf 'BACKEND=k8s\n'
@@ -2396,36 +2500,19 @@ pm_spawn_wake() {
     # An agent woken again and again on one thread should be ONE
     # conversation, not a series of amnesiacs. The transcript store for
     # this (thread, agent) pair is bound into every wake of a resumable
-    # harness (fs_harness_session_caps); a non-resumable harness gets
-    # neither flag -- fork-sandbox.sh refuses both there. A sealed pi seat
-    # (network "sealed") -- the postmaster's own default local-model seat --
-    # is wired the same as any other resumable harness now: agent-sandboxed
-    # has its own --session-dir/--session-id, which bind the durable store
-    # into the sandbox and point pi at it there.
+    # harness (pm_session_spawn_args, via fs_harness_session_caps); a
+    # non-resumable harness gets neither flag -- fork-sandbox.sh refuses
+    # both there. A sealed pi seat (network "sealed") -- the postmaster's
+    # own default local-model seat -- is wired the same as any other
+    # resumable harness now: agent-sandboxed has its own
+    # --session-dir/--session-id, which bind the durable store into the
+    # sandbox and point pi at it there.
     local resumed=""
-    fs_harness_session_caps "$harness"
-    if [[ "$FS_HARNESS_RESUMABLE" == true ]]; then
-        spawn_args+=(--session-state "$PM_SESSION_STATE/$tid/$agent")
-        if [[ "$FS_HARNESS_ID_MODE" == given ]]; then
-            # No discovery: the id is derived, not read back from a prior
-            # wake, so it is available -- and passed -- from the first wake
-            # of this seat onward. sessions/ is never touched for this
-            # harness.
-            local sid
-            sid="$(pm_pi_session_id "$tid" "$agent")"
-            spawn_args+=(--session-id "$sid")
-            resumed="$sid"
-        else
-            local sid_file="$PM_SESSIONS/$tid/$agent" sid
-            if [[ -f "$sid_file" ]]; then
-                sid="$(pm_trim "$(cat -- "$sid_file" 2>/dev/null)")"
-                if [[ "$sid" =~ $PM_SESSION_ID_RE ]]; then
-                    spawn_args+=(--resume-session "$sid")
-                    resumed="$sid"
-                fi
-            fi
-        fi
-    fi
+    local -a session_lines=()
+    mapfile -t session_lines < <(pm_session_spawn_args "$harness" "$tid" "$agent")
+    local session_last=$(( ${#session_lines[@]} - 1 ))
+    resumed="${session_lines[session_last]#RESUMED=}"
+    spawn_args+=("${session_lines[@]:0:session_last}")
 
     local launch_out rc run_dir
     set +e
