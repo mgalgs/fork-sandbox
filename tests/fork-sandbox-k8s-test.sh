@@ -9194,6 +9194,28 @@ else
         "found reviewer-transcript.jsonl under $CLAUDE_BLOCK_STORE"
 fi
 
+# A failed snapshot (here: the work dir is read-only, so the staging copy
+# cannot be created) must not kill the block under set -e, and must keep
+# the store the wake started from -- a partial copy would be pulled back
+# over the host's complete store.
+claude_block_run ok "" '
+    printf "pushed\n" > "$CLAUDE_BLOCK_STORE/pushed-marker.jsonl"
+    for f in inbox-settings.json events.jsonl claude-stderr.log; do
+        : > "$(dirname "$CLAUDE_BLOCK_STORE")/$f"
+    done
+    chmod 555 "$(dirname "$CLAUDE_BLOCK_STORE")"
+'
+chmod 755 "$(dirname "$CLAUDE_BLOCK_STORE")"
+if [[ "$CLAUDE_BLOCK_PI_RC" == 0 ]] \
+    && [[ "$(cat "$CLAUDE_BLOCK_STORE/pushed-marker.jsonl" 2>/dev/null)" == pushed ]] \
+    && [[ ! -e "$CLAUDE_BLOCK_STORE.new" ]] \
+    && grep -q 'session store snapshot failed' <<<"$CLAUDE_BLOCK_OUT"; then
+    ok "a failed session-store snapshot warns and keeps the store the wake started from"
+else
+    no "a failed session-store snapshot warns and keeps the store the wake started from" \
+        "pi_rc=$CLAUDE_BLOCK_PI_RC out=$CLAUDE_BLOCK_OUT"
+fi
+
 # The review loop always runs pi and always prefers REVIEW_MODEL over
 # MODEL when set, regardless of harness -- required at startup for
 # HARNESS=claude (checked above), optional otherwise.

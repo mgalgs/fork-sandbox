@@ -881,9 +881,19 @@ else
         # before the review loop -- so cmd_collect's pull (which reads
         # only /work/session-store) carries the CODING leg's conversation,
         # never a reviewer's.
+        # Staged, then swapped: a partial copy (a full emptyDir) must never
+        # replace the pushed store, since cmd_collect would pull it back
+        # over the host's complete one. On failure the pushed store stays.
         echo "fork-sandbox-k8s-entrypoint: snapshotting the claude session store" >&2
-        rm -rf "$session_store_dir"
-        cp -a "$HOME/.claude/projects" "$session_store_dir"
+        rm -rf "$session_store_dir.new"
+        if cp -a "$HOME/.claude/projects" "$session_store_dir.new"; then
+            rm -rf "$session_store_dir"
+            mv "$session_store_dir.new" "$session_store_dir"
+        else
+            rm -rf "$session_store_dir.new"
+            echo "fork-sandbox-k8s-entrypoint: warning: session store" \
+                "snapshot failed; keeping the store this wake started from" >&2
+        fi
     fi
 fi
 
