@@ -4980,6 +4980,87 @@ check "k8s case1b: --resume-session forwarded from the recorded session" \
     "$k1_fixture_sid" "$(argv_after --resume-session "$STUB_ARGV_LOG")"
 check "k8s case1b: --checkout forwarded (lineage from karen's own prior run)" \
     "$k1_branch" "$(argv_after --checkout "$STUB_ARGV_LOG")"
+# The wedge bound (pm_followup_wake's own accounting) counts a k8s wake
+# via its .env RESUMED field, the same as a local wake's -- this run was
+# launched with --resume-session above, so RESUMED must record that id,
+# not be left empty the way case1's own FIRST wake (nothing to resume)
+# correctly was.
+k1b_env="$(latest_env_for_agent karen)"
+check "k8s case1b: .env RESUMED records the resumed session id" \
+    "$k1_fixture_sid" "$(env_val "$k1b_env" RESUMED)"
+
+# ---- case 1c: lineage picks the newest RESOLVING branch, for the right
+# agent, skipping a deleted one ----
+# Hand-built RUNS/*.env + seq fixtures (marked harvested so the harvest
+# pass and the live-run check both leave them alone) stand in for a
+# longer history than a real sequence of wakes would be worth paying for
+# here -- pm_lineage_checkout itself only ever reads AGENT/BRANCH off
+# these files and walks $SEQ/$tid, so a hand-built history exercises it
+# identically to a real one.
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+mkdir -p -- "$PM_STATE_DIR/runs" "$PM_STATE_DIR/harvested" "$PM_STATE_DIR/seq"
+
+seed_lineage_run() {
+    # $1=tid $2=rid $3=agent $4=branch $5=1 to actually create the branch
+    # (a branch pm_lineage_checkout must find "deleted", i.e. never
+    # resolve, is simply never created here).
+    local tid="$1" rid="$2" agent="$3" branch="$4" real="${5:-0}"
+    {
+        printf 'AGENT=%s\n' "$agent"
+        printf 'BRANCH=%s\n' "$branch"
+    } > "$PM_STATE_DIR/runs/$rid.env"
+    : > "$PM_STATE_DIR/harvested/$rid"
+    (( real )) && git -C "$PROJECT_DIR" branch "$branch" >/dev/null 2>&1
+    printf '%s\n' "$rid" >> "$PM_STATE_DIR/seq/$tid"
+}
+
+k1c_mid="$(send_msg '@carol' '@karen' 'lineage skip topic' 'hello karen' 8)"
+k1c_tid="$(thread_of "$k1c_mid")"
+# Oldest to newest: a resolving branch for karen (the expected answer),
+# then a NEWER resolving branch for a different agent (dave -- must be
+# skipped on agent alone), then a NEWER STILL branch for karen that was
+# never created (must be skipped as unresolving). The walk is newest
+# first, so this only lands on the right answer if both skips work.
+seed_lineage_run "$k1c_tid" pm-lineage-skip-rid1 karen pm-lineage-test-fallback 1
+seed_lineage_run "$k1c_tid" pm-lineage-skip-rid2 dave pm-lineage-test-dave 1
+seed_lineage_run "$k1c_tid" pm-lineage-skip-rid3 karen pm-lineage-test-deleted 0
+: > "$STUB_ARGV_LOG"
+once
+check "k8s case1c: --checkout skips another agent's and a deleted branch, falling back to the oldest resolving one" \
+    "pm-lineage-test-fallback" "$(argv_after --checkout "$STUB_ARGV_LOG")"
+
+# ---- case 1d: among two resolving branches for the SAME agent, lineage
+# picks the newest, not the first found chronologically ----
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+mkdir -p -- "$PM_STATE_DIR/runs" "$PM_STATE_DIR/harvested" "$PM_STATE_DIR/seq"
+
+k1d_mid="$(send_msg '@carol' '@karen' 'lineage newest topic' 'hello karen' 8)"
+k1d_tid="$(thread_of "$k1d_mid")"
+seed_lineage_run "$k1d_tid" pm-lineage-newest-rid1 karen pm-lineage-test-older 1
+seed_lineage_run "$k1d_tid" pm-lineage-newest-rid2 karen pm-lineage-test-newer 1
+: > "$STUB_ARGV_LOG"
+once
+check "k8s case1d: --checkout picks the newest of two resolving branches for the same agent" \
+    "pm-lineage-test-newer" "$(argv_after --checkout "$STUB_ARGV_LOG")"
+
+# ---- case 1e: no resolving branch anywhere in the history -> no --checkout,
+# start from HEAD as today ----
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+mkdir -p -- "$PM_STATE_DIR/runs" "$PM_STATE_DIR/harvested" "$PM_STATE_DIR/seq"
+
+k1e_mid="$(send_msg '@carol' '@karen' 'lineage none topic' 'hello karen' 8)"
+k1e_tid="$(thread_of "$k1e_mid")"
+seed_lineage_run "$k1e_tid" pm-lineage-none-rid1 karen pm-lineage-test-nonexistent 0
+: > "$STUB_ARGV_LOG"
+once
+check "k8s case1e: no --checkout when nothing in the history resolves" \
+    0 "$(grep -c -- '^--checkout$' "$STUB_ARGV_LOG")"
 
 # ---- case 2: a local seat on the same fleet spawns exactly as before ----
 

@@ -5557,6 +5557,17 @@ cat > "$runstub_dir/kubectl" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$K8S_STUB_LOG"
 case " $* " in
+    *"context-extract.sh /work/session-store "*)
+        # The session-store push (cmd_submit, alongside --context-ro's own
+        # push): capture the piped tar stream whenever a test asks, so it
+        # can prove the host --session-state directory's own content is
+        # what got pushed, not just that the call happened.
+        if [[ -n "${K8S_STUB_SESSION_PUSH_CAPTURE:-}" ]]; then
+            cat > "$K8S_STUB_SESSION_PUSH_CAPTURE"
+        else
+            cat >/dev/null
+        fi
+        exit 0 ;;
     *" apply -f -"*)
         if [[ -n "${K8S_STUB_APPLY_MANIFEST:-}" ]]; then
             cat > "$K8S_STUB_APPLY_MANIFEST"
@@ -6164,6 +6175,16 @@ case " $* " in
         # serve K8S_STUB_SESSION_DIR's contents whenever it is set,
         # independently of the exit status, so a test can pair a fixture
         # with a non-zero rc to simulate an EPIPE-under-cap read.
+        # K8S_STUB_SESSION_OVERSIZE, when set, ignores K8S_STUB_SESSION_DIR
+        # and streams a cheap cap+1-byte /dev/zero run instead: the
+        # session-store cap (CONTEXT_MAX_BYTES) has no --outbox-max-shaped
+        # override, so a stream genuinely past the 256 MiB cap is the only
+        # way to drive the pull's own size check, the same SIGPIPE-shaped
+        # emulation the outbox pull's own substantially-over-cap case uses.
+        if [[ -n "${K8S_STUB_SESSION_OVERSIZE:-}" ]]; then
+            head -c $((256 * 1024 * 1024 + 1)) /dev/zero
+            exit 141
+        fi
         if [[ -n "${K8S_STUB_SESSION_DIR:-}" ]]; then
             ( cd "$K8S_STUB_SESSION_DIR" && tar cf - . ) || true
         fi
@@ -6740,7 +6761,36 @@ else
         "collect exited nonzero: $(cat "$collect_out22")"
 fi
 
-printf '\n== collect: pulling /work/session-store back (push side covered elsewhere) ==\n'
+printf '\n== submit/run: pushing /work/session-store ==\n'
+# --session-state's host directory is pushed into the pod the same way
+# --context-ro is (cmd_submit, "Same push, same extractor" above) -- proven
+# here via `run`, capturing the pushed tar's own bytes through the runstub
+# kubectl's context-extract.sh capture arm, rather than just asserting the
+# call happened.
+session_push_dir="$(mktemp -d /var/tmp/claude-scratch/forks/claude-fork-sandbox.XXXXXX)"; tmpdirs+=("$session_push_dir")
+printf '{"pushed":true}\n' > "$session_push_dir/66666666-6666-6666-6666-666666666666.jsonl"
+session_push_capture="$(newdir)/session-push.tar"; tmpdirs+=("$(dirname "$session_push_capture")")
+session_push_log="$(newdir)/kubectl.log"; session_push_out="$(newdir)/out-push.txt"
+tmpdirs+=("$(dirname "$session_push_log")" "$(dirname "$session_push_out")")
+if K8S_STUB_SESSION_PUSH_CAPTURE="$session_push_capture" runstub_run "$session_push_log" "$session_push_out" \
+    --branch fs-k8s-test-session-push --model moonshotai/kimi-k3 \
+    --session-state "$session_push_dir" \
+    --outbox-dir "$(dirname "$session_push_out")/outbox-push" \
+    "$proj_dir" "$handoff_file"; then
+    session_push_listing="$(tar tf "$session_push_capture" 2>/dev/null)"
+    if grep -q 'context-extract.sh /work/session-store' "$session_push_log" \
+        && printf '%s\n' "$session_push_listing" | grep -q '66666666-6666-6666-6666-666666666666\.jsonl'; then
+        ok "--session-state's host directory is pushed into the pod's /work/session-store"
+    else
+        no "--session-state's host directory is pushed into the pod's /work/session-store" \
+            "log=$(cat "$session_push_log") listing=$session_push_listing"
+    fi
+else
+    no "--session-state's host directory is pushed into the pod's /work/session-store" \
+        "run exited nonzero: $(cat "$session_push_out")"
+fi
+
+printf '\n== collect: pulling /work/session-store back ==\n'
 # session_state/session_id are read back from run.env (only submit's
 # --session-state/--session-id know them), exactly like harness/model
 # above -- so every case here drives collect through --run-dir with a
@@ -6898,6 +6948,47 @@ if (( rc == 3 )) \
 else
     no "the rc-3 zero-harvest path still carries session_state/session_id in summary.json" \
         "rc=$rc summary=$(cat "$session_pull_rd_d/summary.json" 2>/dev/null) out=$(cat "$session_pull_out_d")"
+fi
+
+# E. An over-cap store: the pull warns about the cap (not a read failure),
+# leaves the host store byte-identical, and summary.json reports the OLD
+# id -- the same preserve-on-failure contract as case B (exec failure) and
+# case C (extractor refusal) above, driven this time by the size check
+# itself.
+session_pull_branch_e=fs-k8s-test-collect-session-pull-overcap
+git -C "$proj_dir" update-ref "refs/heads/$session_pull_branch_e" "$(git -C "$proj_dir" rev-parse HEAD)"
+session_pull_host_e="$(newdir)/session-store-e"; tmpdirs+=("$session_pull_host_e")
+mkdir -p -- "$session_pull_host_e"
+printf '{"kept":true}\n' > "$session_pull_host_e/55555555-5555-5555-5555-555555555555.jsonl"
+session_pull_host_e_before="$(find "$session_pull_host_e" -type f -exec sha256sum {} +)"
+session_pull_rd_e="$(mktemp -d /var/tmp/claude-scratch/forks/claude-fork-sandbox.XXXXXX)"; tmpdirs+=("$session_pull_rd_e")
+{
+    printf 'mode=run\n'
+    printf 'harness=claude\n'
+    printf 'model=some-model\n'
+    printf 'session_state=%s\n' "$session_pull_host_e"
+} > "$session_pull_rd_e/run.env"
+printf 'test\n' > "$session_pull_rd_e/run-source"
+session_pull_log_e="$(newdir)/kubectl.log"; session_pull_out_e="$(newdir)/out-e.txt"; session_pull_dest_e="$(newdir)/outbox-e"
+tmpdirs+=("$(dirname "$session_pull_log_e")" "$(dirname "$session_pull_dest_e")")
+if K8S_STUB_SESSION_OVERSIZE=1 \
+    K8S_STUB_OUTBOX_DIR="$collect_outbox11" K8S_STUB_OUTBOX_RC=0 \
+    collectstub_collect "$session_pull_log_e" "$session_pull_out_e" \
+    --branch "$session_pull_branch_e" --outbox-dir "$session_pull_dest_e" \
+    --run-dir "$session_pull_rd_e" "$proj_dir"; then
+    session_pull_host_e_after="$(find "$session_pull_host_e" -type f -exec sha256sum {} +)"
+    if [[ "$session_pull_host_e_before" == "$session_pull_host_e_after" ]] \
+        && grep -q 'over the .* byte cap; leaving the host session store as it was' "$session_pull_out_e" \
+        && ! grep -q 'could not read the session store' "$session_pull_out_e" \
+        && [[ "$(jq -r '.session_id' "$session_pull_rd_e/summary.json" 2>/dev/null)" == "55555555-5555-5555-5555-555555555555" ]]; then
+        ok "an over-cap session-store pull leaves the host store byte-identical and reports the old id"
+    else
+        no "an over-cap session-store pull leaves the host store byte-identical and reports the old id" \
+            "before=$session_pull_host_e_before after=$session_pull_host_e_after summary=$(cat "$session_pull_rd_e/summary.json" 2>/dev/null) out=$(cat "$session_pull_out_e")"
+    fi
+else
+    no "an over-cap session-store pull leaves the host store byte-identical and reports the old id" \
+        "collect exited nonzero: $(cat "$session_pull_out_e")"
 fi
 
 printf '\n== fork-sandbox-k8s.sh say: argument validation (no cluster) ==\n'

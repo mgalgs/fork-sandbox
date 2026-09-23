@@ -238,8 +238,8 @@
 #                        session-resume capability. Accepted with --k8s,
 #                        forwarded to fork-sandbox-k8s.sh, which pushes the
 #                        bound directory into the pod and pulls it back at
-#                        collect time -- see "Kubernetes seats keep their
-#                        conversation" in docs/kubernetes-runs.md.
+#                        collect time -- see "Cluster seats" in
+#                        docs/agent-mail.md.
 #                        A sealed pi run (--harness pi --network sealed, and
 #                        its pi-local alias) dispatches through
 #                        agent-sandboxed rather than execing pi directly, but
@@ -809,11 +809,10 @@
 #
 # That also means most of this script's flags have nothing to attach to on a
 # cluster run: they describe local-sandbox machinery -- bubblewrap, per-run
-# docker-compose services, the detached tmux session, a host directory bound
-# in to outlive the run (--session-state, and --resume-session with it) --
-# that a Kubernetes pod
-# has no equivalent of, they describe a real capability (--prompts-dir)
-# the cluster path has
+# docker-compose services, the detached tmux session, a host directory that
+# persists a clone between wakes (--clone-dir) -- that a Kubernetes pod's
+# filesystem, which dies with the Job, has no equivalent of, they describe
+# a real capability (--prompts-dir) the cluster path has
 # not been built to carry yet, or -- --claude-args alone, since --harness
 # claude landed here -- the pod's own invocation of the flag's target IS
 # built, but fixed: a --harness claude pod really does run the claude CLI,
