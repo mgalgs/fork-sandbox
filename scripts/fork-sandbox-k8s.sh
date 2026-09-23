@@ -4645,6 +4645,15 @@ EOF
     if [[ -z "$run_log_base_sha" ]]; then
         run_log_base_sha="$(cd "$origin_repo" && git rev-parse HEAD 2>/dev/null || true)"
     fi
+    # Resolved to absolute now, at the caller's cwd, rather than left
+    # relative: `resume` reads this back later and would otherwise resolve
+    # a relative path against ITS OWN cwd, not the cwd a direct CLI `run`
+    # was invoked from. Empty (no --outbox-dir) stays empty -- feeding the
+    # empty string through the resolver would instead yield the cwd
+    # itself, which is not "no outbox dir" and must not be recorded as
+    # though it were.
+    local outbox_dir_recorded=""
+    [[ -n "$outbox_dir" ]] && outbox_dir_recorded="$("$FS_REALPATH" -m -- "$outbox_dir")"
     {
         printf 'mode=run\n'
         printf 'harness=%s\n' "$harness"
@@ -4658,7 +4667,7 @@ EOF
         # from its directory alone.
         printf 'BRANCH=%s\n' "$branch"
         printf 'PROJECT=%s\n' "$origin_repo"
-        printf 'OUTBOX_DIR=%s\n' "$outbox_dir"
+        printf 'OUTBOX_DIR=%s\n' "$outbox_dir_recorded"
         printf 'OUTBOX_MAX_BYTES=%s\n' "$outbox_max_bytes"
         printf 'REVIEW_LOOP=%s\n' "$review_loop_recorded"
         printf 'KEEP=%s\n' "$keep"

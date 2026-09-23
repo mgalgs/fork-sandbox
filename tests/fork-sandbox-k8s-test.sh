@@ -6001,6 +6001,72 @@ else
     no "resume refuses a run dir without run.env" "rc=$rc out=$(cat "$resume_empty_dir/out")"
 fi
 
+# resume's default --timeout (no --timeout given) is the recorded TIMEOUT
+# minus time elapsed since SUBMITTED_AT -- cmd_wait's own startup line
+# (printed to stderr only when --probe is not given, which resume's
+# internal cmd_wait call never passes) reveals the timeout it actually
+# computed.
+resume_rd_f="$(resume_submit fs-k8s-test-resume-timeout-default --timeout 900)"
+sed -i "s/^SUBMITTED_AT=.*/SUBMITTED_AT=$(( $(date +%s) - 100 ))/" "$resume_rd_f/run.env"
+resume_log_f="$(newdir)/kubectl.log"; resume_out_f="$(dirname "$resume_log_f")/out.txt"
+tmpdirs+=("$(dirname "$resume_log_f")")
+rc=0
+runstub_verb "$resume_log_f" "$resume_out_f" resume --run-dir "$resume_rd_f" || rc=$?
+resume_f_timeout="$(grep -oE 'timeout [0-9]+s\)' "$resume_out_f" | grep -oE '[0-9]+')"
+if (( rc == 0 )) && [[ -n "$resume_f_timeout" ]] \
+    && (( resume_f_timeout >= 790 && resume_f_timeout <= 800 )); then
+    ok "resume's default --timeout is the recorded timeout minus time elapsed since submit"
+else
+    no "resume's default --timeout is the recorded timeout minus time elapsed since submit" \
+        "rc=$rc timeout=$resume_f_timeout out=$(cat "$resume_out_f")"
+fi
+
+# The same default, floored at 60s once elapsed time exceeds the recorded
+# timeout.
+resume_rd_g="$(resume_submit fs-k8s-test-resume-timeout-floor --timeout 120)"
+sed -i "s/^SUBMITTED_AT=.*/SUBMITTED_AT=$(( $(date +%s) - 10000 ))/" "$resume_rd_g/run.env"
+resume_log_g="$(newdir)/kubectl.log"; resume_out_g="$(dirname "$resume_log_g")/out.txt"
+tmpdirs+=("$(dirname "$resume_log_g")")
+rc=0
+runstub_verb "$resume_log_g" "$resume_out_g" resume --run-dir "$resume_rd_g" || rc=$?
+resume_g_timeout="$(grep -oE 'timeout [0-9]+s\)' "$resume_out_g" | grep -oE '[0-9]+')"
+if (( rc == 0 )) && [[ "$resume_g_timeout" == 60 ]]; then
+    ok "resume's default --timeout floors at 60s once elapsed exceeds the recorded timeout"
+else
+    no "resume's default --timeout floors at 60s once elapsed exceeds the recorded timeout" \
+        "rc=$rc timeout=$resume_g_timeout out=$(cat "$resume_out_g")"
+fi
+
+# A relative --outbox-dir given to a direct CLI `submit` is recorded
+# absolute, resolved against submit's own cwd -- not left relative, which
+# would resolve against `resume`'s cwd later instead of the original
+# caller's.
+resume_reldir_home="$(newdir)"; tmpdirs+=("$resume_reldir_home")
+resume_reldir_cwd="$(newdir)"; tmpdirs+=("$resume_reldir_cwd")
+resume_reldir_d="$(newdir)"; tmpdirs+=("$resume_reldir_d")
+rc=0
+[[ "$HOME" == "$k8s_test_operator_home" ]] && resume_reldir_run_home="$k8s_test_home" \
+    || resume_reldir_run_home="$HOME"
+(
+    cd "$resume_reldir_cwd" \
+        && HOME="$resume_reldir_run_home" PATH="$runstub_dir:$PATH" \
+            K8S_STUB_LOG="$resume_reldir_d/submit.log" \
+            K8S_STUB_BASE_SHA="$(git -C "$proj_dir" rev-parse HEAD)" \
+            FORK_SANDBOX_CONFIG_DIR="$config_dir" \
+            "$k8s_sh" submit --branch fs-k8s-test-resume-reloutbox \
+            --model moonshotai/kimi-k3 --outbox-dir relative-subdir \
+            "$proj_dir" "$handoff_file" > "$resume_reldir_d/submit.out" 2>&1
+) || rc=$?
+resume_reldir_rd="$(sed -n 's/^  run dir:  *//p' "$resume_reldir_d/submit.out" | head -1)"
+if (( rc == 0 )) \
+    && grep -qxF "OUTBOX_DIR=$(realpath -m "$resume_reldir_cwd/relative-subdir")" \
+        "$resume_reldir_rd/run.env"; then
+    ok "submit records a relative --outbox-dir absolute, resolved against its own cwd"
+else
+    no "submit records a relative --outbox-dir absolute, resolved against its own cwd" \
+        "rc=$rc run.env=$(cat "$resume_reldir_rd/run.env" 2>/dev/null)"
+fi
+
 # 2. A failed read with NOTHING on stderr is reported as silent, not as an
 # empty block: the explicit "wrote nothing" line, and not the heading the
 # non-empty case prints.
