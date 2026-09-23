@@ -3,7 +3,7 @@
 # harness/model/network/thinking seat each runs on, and which lists name
 # groups of them
 #
-# Usage: fork-sandbox-fleet.sh check
+# Usage: fork-sandbox-fleet.sh check [--cluster]
 #        fork-sandbox-fleet.sh resolve <name>
 #        fork-sandbox-fleet.sh resolve-triage
 #        fork-sandbox-fleet.sh expand <addr>[,<addr>...]
@@ -88,6 +88,24 @@
 #                  operator's mail address, see docs/agent-mail.md) --
 #                  either would let the reserved address resolve as a
 #                  real seat.
+#   check --cluster
+#                  Everything `check` does, plus the refusals for a
+#                  postmaster running inside a pod (`fork-sandbox-
+#                  postmaster.sh deliver --cluster` runs this at startup),
+#                  each error naming the agent (or the triage block) and
+#                  the reason: an agent seat (not a handler seat) whose
+#                  resolved `backend` is not `k8s` (a cluster postmaster
+#                  cannot run local seats, they need bwrap); a top-level
+#                  `triage:` block (the classifier runs in a local
+#                  sandbox); an agent seat whose resolved harness is not
+#                  `pi`, or whose resolved preset names any agent whose
+#                  harness is not `pi` (claude and codex seats are not
+#                  supported in a cluster postmaster yet). A harness is
+#                  compared by its part before any `/` (a preset may
+#                  write `codex/<model>`); presets are read with
+#                  fork-sandbox-preset-parse.py, never a second parser.
+#                  Handler seats stay legal. Without --cluster, `check`
+#                  behaves exactly as it always has.
 #   resolve <name> Print exactly fifteen lines for one agent: harness,
 #                  model, thinking, network, persona-path, description,
 #                  wake-on-cc, refresh-at, triage, preset, handler,
@@ -249,6 +267,8 @@ fleet_validate_thread() {
 }
 
 cmd_check() {
+    local cluster=0
+    [[ "${1-}" == --cluster ]] && cluster=1
     if [[ ! -f "$FLEET_FILE" ]]; then
         echo "Error: check: no fleet file at '$FLEET_FILE'." >&2
         return 1
@@ -315,6 +335,52 @@ cmd_check() {
                 rc=1
             fi
         fi
+    done
+    if (( cluster )); then
+        check_cluster "$dump" "${agent_names[@]}" || rc=1
+    fi
+    return "$rc"
+}
+
+# The extra refusals of `check --cluster` (see the header). $1 is the fleet
+# dump, the rest are every agent name. Prints every error found, not just
+# the first.
+check_cluster() {
+    local dump="$1"; shift
+    local rc=0 name harness preset handler backend
+    local -a seat
+    if grep -q $'^triage\t' <<< "$dump"; then
+        echo "Error: triage: the triage classifier runs in a local sandbox, which a cluster postmaster cannot run." >&2
+        rc=1
+    fi
+    for name in "$@"; do
+        # Not $(...): that strips the trailing empty lines of the fifteen.
+        mapfile -t seat < <(resolve_with_dump "$dump" "$name")
+        harness="${seat[0]-}" preset="${seat[9]-}" handler="${seat[10]-}" backend="${seat[12]-}"
+        [[ "$handler" == exec ]] && continue
+        if [[ "$backend" != k8s ]]; then
+            echo "Error: agents.$name: a cluster postmaster cannot run local seats (they need bwrap); set backend: k8s." >&2
+            rc=1
+        fi
+        if [[ "${harness%%/*}" != pi ]]; then
+            echo "Error: agents.$name.harness: claude and codex seats are not supported in a cluster postmaster yet; only pi (resolved harness '${harness:-claude}')." >&2
+            rc=1
+        fi
+        [[ -n "$preset" && -f "$PRESETS_DIR/$preset.yaml" ]] || continue
+        local preset_out preset_kind preset_agent preset_field preset_value
+        if ! preset_out="$(python3 "$script_dir/fork-sandbox-preset-parse.py" \
+            "$PRESETS_DIR/$preset.yaml" "$preset" "$PRESETS_DIR/$preset.yaml")"; then
+            echo "Error: agents.$name.preset: preset '$preset' could not be parsed, so a cluster postmaster cannot tell what harnesses it runs." >&2
+            rc=1
+            continue
+        fi
+        while IFS=$'\t' read -r preset_kind preset_agent preset_field preset_value; do
+            [[ "$preset_kind" == agent && "$preset_field" == harness ]] || continue
+            if [[ "${preset_value%%/*}" != pi ]]; then
+                echo "Error: agents.$name.preset: preset '$preset' agent '$preset_agent' uses harness '$preset_value'; claude and codex seats are not supported in a cluster postmaster yet; only pi." >&2
+                rc=1
+            fi
+        done <<< "$preset_out"
     done
     return "$rc"
 }

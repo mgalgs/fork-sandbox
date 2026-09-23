@@ -1271,6 +1271,151 @@ path_state "teardown: frank workspace gone once the postmaster lock clears" \
 
 unset FORK_SANDBOX_MAIL_ROOT
 
+printf '\n== check --cluster ==\n'
+
+# Each fleet is built in its own throwaway dirs and checked with the env
+# passed inline, so nothing here leaks into the sections around it.
+cl_dir="" cl_out="" cl_rc=0
+cl_fleet() {
+    # fleet.yaml body on stdin; leaves the dirs under $cl_dir.
+    new_root cl_dir
+    mkdir -p -- "$cl_dir/personas" "$cl_dir/presets" "$cl_dir/handlers"
+    cat > "$cl_dir/fleet.yaml"
+    printf 'Standing instructions.\n' > "$cl_dir/personas/alpha.md"
+    printf 'Standing instructions.\n' > "$cl_dir/personas/beta.md"
+    printf '#!/bin/sh\nexit 0\n' > "$cl_dir/handlers/echo-handler"
+    chmod +x -- "$cl_dir/handlers/echo-handler"
+    cat > "$cl_dir/presets/all-pi.yaml" <<'YAML'
+agents:
+  coder: {harness: pi, model: small}
+pipeline:
+  - action: code
+    agent: coder
+YAML
+    cat > "$cl_dir/presets/has-codex.yaml" <<'YAML'
+agents:
+  coder: {harness: pi, model: small}
+  reviewer: {harness: codex, model: gpt-5}
+pipeline:
+  - action: code
+    agent: coder
+  - action: review
+    agent: reviewer
+    repeat: 2
+YAML
+}
+cl_run() {
+    # $1 = "--cluster" or "" (plain check); sets cl_out and cl_rc. Not run
+    # in a command substitution, or cl_rc would be lost with the subshell.
+    cl_out="$(FORK_SANDBOX_FLEET_FILE="$cl_dir/fleet.yaml" \
+        FORK_SANDBOX_PERSONAS_DIR="$cl_dir/personas" \
+        FORK_SANDBOX_PRESETS_DIR="$cl_dir/presets" \
+        FORK_SANDBOX_HANDLERS_DIR="$cl_dir/handlers" \
+        "$fleet" check ${1:+"$1"} 2>&1)"
+    cl_rc=$?
+}
+lacks() {
+    local label="$1" haystack="$2" needle="$3"
+    case "$haystack" in
+        *"$needle"*) no "$label" "'$needle' unexpectedly found in: $haystack" ;;
+        *) ok "$label" ;;
+    esac
+}
+
+cl_fleet <<'EOF'
+agents:
+  alpha: {harness: pi, backend: k8s}
+  beta: {harness: pi, backend: k8s}
+  notifier: {handler: exec, command: echo-handler}
+lists:
+  all-hands: {members: [alpha, beta, notifier]}
+EOF
+cl_run --cluster
+check "cluster: an all-pi k8s fleet with a handler seat passes" "0" "$cl_rc"
+check "cluster: ... and prints nothing" "" "$cl_out"
+cl_run ""
+check "cluster: the same fleet passes plain check" "0" "$cl_rc"
+
+cl_fleet <<'EOF'
+agents:
+  alpha: {harness: pi, backend: k8s}
+  beta: {harness: pi}
+EOF
+cl_run --cluster
+check "cluster: a local seat is refused" "1" "$cl_rc"
+contains "cluster: the local-seat error names the agent" "$cl_out" "agents.beta"
+contains "cluster: the local-seat error gives the reason" "$cl_out" \
+    "a cluster postmaster cannot run local seats (they need bwrap)"
+lacks "cluster: the k8s seat is not named" "$cl_out" "agents.alpha"
+cl_run ""
+check "cluster: the same local-seat fleet passes plain check" "0" "$cl_rc"
+
+cl_fleet <<'EOF'
+agents:
+  alpha: {harness: pi, backend: local}
+EOF
+cl_run --cluster
+check "cluster: an explicit backend: local seat is refused" "1" "$cl_rc"
+
+cl_fleet <<'EOF'
+triage: {}
+agents:
+  alpha: {harness: pi, backend: k8s}
+EOF
+cl_run --cluster
+check "cluster: a top-level triage block is refused" "1" "$cl_rc"
+contains "cluster: the triage error says why" "$cl_out" "the triage classifier runs in a local sandbox"
+cl_run ""
+check "cluster: the same triage fleet passes plain check" "0" "$cl_rc"
+
+cl_fleet <<'EOF'
+agents:
+  alpha: {harness: pi, backend: k8s}
+  beta: {harness: claude, backend: k8s}
+EOF
+cl_run --cluster
+check "cluster: a claude seat is refused" "1" "$cl_rc"
+contains "cluster: the harness error names the agent" "$cl_out" "agents.beta.harness"
+contains "cluster: the harness error gives the reason" "$cl_out" \
+    "claude and codex seats are not supported in a cluster postmaster yet; only pi"
+cl_run ""
+check "cluster: the same claude fleet passes plain check" "0" "$cl_rc"
+
+cl_fleet <<'EOF'
+agents:
+  alpha: {backend: k8s}
+EOF
+cl_run --cluster
+check "cluster: a seat with no harness anywhere (claude by default) is refused" "1" "$cl_rc"
+
+cl_fleet <<'EOF'
+agents:
+  alpha: {harness: pi, preset: has-codex}
+EOF
+cl_run --cluster
+check "cluster: a preset naming a codex agent is refused" "1" "$cl_rc"
+contains "cluster: the preset error names the seat, preset and agent" "$cl_out" \
+    "agents.alpha.preset: preset 'has-codex' agent 'reviewer' uses harness 'codex'"
+cl_run ""
+check "cluster: the same preset fleet passes plain check" "0" "$cl_rc"
+
+cl_fleet <<'EOF'
+agents:
+  alpha: {harness: pi, preset: all-pi}
+EOF
+cl_run --cluster
+lacks "cluster: a pi-only preset adds no preset error" "$cl_out" "agents.alpha.preset"
+
+cl_fleet <<'EOF'
+agents:
+  alpha: {harness: claude}
+  beta: {harness: pi}
+triage: {}
+EOF
+cl_run --cluster
+check "cluster: every problem is reported, not just the first" "4" \
+    "$(printf '%s\n' "$cl_out" | grep -c '^Error:')"
+
 printf '\n== dispatcher wiring ==\n'
 
 dispatcher="$repo_dir/scripts/fork-sandbox"
