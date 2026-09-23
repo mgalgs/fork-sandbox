@@ -6832,35 +6832,128 @@ else
 fi
 rm -f /tmp/fs-k8s-ctx-exist.err
 
-# An existing DEST_DIR's own mode survives extraction untouched. This
-# pins --no-overwrite-dir on the pre-existing-DEST_DIR branch: a
-# --thread-dir/--attach-dir push targets a kubelet-created emptyDir owned
-# by root, and GNU tar's default (--overwrite-dir) would try to chmod/utime
-# that mount point to match the archive's top-level `./` entry -- a call
-# that fails with EPERM for a non-owner with no capabilities, which is not
-# reproducible here since the test itself owns cf_meta_dest and so CAN
-# chmod it. What this test catches instead is whether that restore attempt
-# happens at all: without --no-overwrite-dir, tar (run as the owner) would
-# succeed in changing cf_meta_dest's mode away from 0700 to match the
-# archive; with it, the mode is left alone.
-cf_meta_dest="$cf_parent/meta_dest"
-mkdir -p "$cf_meta_dest"
-chmod 0700 "$cf_meta_dest"
-if "$context_extract_sh" "$cf_meta_dest" 100000000 < "$cf_wf_tar" \
-        >/tmp/fs-k8s-ctx-meta.err 2>&1; then
-    ok "an existing DEST_DIR's own metadata survives extraction"
+# An existing DEST_DIR's own metadata survives extraction even when this
+# process is denied every chmod/utime/chown on it -- the real
+# --thread-dir/--attach-dir shape: a kubelet-created emptyDir mount, owned
+# by root, that this non-root, no-capabilities process cannot touch at
+# all. A prior version of this test only asserted that a mode chmod'd to
+# 0700 by the TEST ITSELF (which owns the directory and so CAN chmod it)
+# came out as 0700 -- that passed whether or not any restore attempt
+# happened, since chmod'ing 0700 to 0700 is a no-op either way, and it
+# stayed green through a real regression (see commit c6d5cc1c37's own
+# reviewer finding: --no-overwrite-dir does not actually stop GNU tar from
+# attempting that chmod, and a non-owner gets EPERM from it regardless of
+# whether the mode would change). The actual fix lives one level up, in
+# fork-sandbox-k8s.sh's spooling for these two flags: it packs the
+# directory's ENTRIES (find -mindepth 1 -maxdepth 1 -printf '%P\0' | tar
+# --null -T -), never `.` itself, so no member in the archive ever maps
+# onto DEST_DIR and this extractor never attempts to touch it. Proved
+# here by actually denying chmod/fchmodat/utime/utimensat/chown on
+# DEST_DIR through an LD_PRELOAD shim standing in for "not the owner, no
+# CAP_FOWNER" -- a real EPERM, not a same-value coincidence. Skipped if no
+# C compiler is on PATH to build the shim.
+if command -v cc >/dev/null 2>&1; then
+    cf_shim_dir="$(newdir)"; tmpdirs+=("$cf_shim_dir")
+    cat > "$cf_shim_dir/shim.c" <<'SHIM_C'
+#define _GNU_SOURCE
+#include <stdlib.h>
+#include <sys/types.h>
+#include <errno.h>
+#include <string.h>
+#include <utime.h>
+#include <dlfcn.h>
+
+static int is_target(const char *path) {
+    const char *target = getenv("FS_K8S_TEST_SHIM_TARGET");
+    return target && path && strcmp(path, target) == 0;
+}
+
+int chmod(const char *path, mode_t mode) {
+    if (is_target(path)) { errno = EPERM; return -1; }
+    static int (*real)(const char *, mode_t);
+    if (!real) real = dlsym(RTLD_NEXT, "chmod");
+    return real(path, mode);
+}
+
+int fchmodat(int dirfd, const char *path, mode_t mode, int flags) {
+    if (is_target(path)) { errno = EPERM; return -1; }
+    static int (*real)(int, const char *, mode_t, int);
+    if (!real) real = dlsym(RTLD_NEXT, "fchmodat");
+    return real(dirfd, path, mode, flags);
+}
+
+int utime(const char *path, const struct utimbuf *times) {
+    if (is_target(path)) { errno = EPERM; return -1; }
+    static int (*real)(const char *, const struct utimbuf *);
+    if (!real) real = dlsym(RTLD_NEXT, "utime");
+    return real(path, times);
+}
+
+int utimensat(int dirfd, const char *path, const struct timespec times[2], int flags) {
+    if (path && is_target(path)) { errno = EPERM; return -1; }
+    static int (*real)(int, const char *, const struct timespec *, int);
+    if (!real) real = dlsym(RTLD_NEXT, "utimensat");
+    return real(dirfd, path, times, flags);
+}
+
+int chown(const char *path, uid_t owner, gid_t group) {
+    if (is_target(path)) { errno = EPERM; return -1; }
+    static int (*real)(const char *, uid_t, gid_t);
+    if (!real) real = dlsym(RTLD_NEXT, "chown");
+    return real(path, owner, group);
+}
+SHIM_C
+    if cc -shared -fPIC -o "$cf_shim_dir/shim.so" "$cf_shim_dir/shim.c" -ldl \
+            >/tmp/fs-k8s-ctx-shim-cc.err 2>&1; then
+        # The fixture shape a real --thread-dir/--attach-dir push produces
+        # now: entries only, no top-level `.` member.
+        cf_meta_src="$(newdir)"; tmpdirs+=("$cf_meta_src")
+        printf 'hello\n' > "$cf_meta_src/foo.txt"
+        mkdir -p "$cf_meta_src/sub"
+        printf 'world\n' > "$cf_meta_src/sub/bar.txt"
+        cf_meta_tar="$cf_parent/meta_entries.tar"
+        find "$cf_meta_src" -mindepth 1 -maxdepth 1 -printf '%P\0' \
+            | tar cf "$cf_meta_tar" -C "$cf_meta_src" --null -T -
+
+        # 0777, not 0700: group/other-writable is the shape a kubelet
+        # fsGroup-managed emptyDir mount actually has, and it is the shape
+        # that made GNU tar attempt the chmod restore in the first place
+        # (a 0700 pre-existing dest never triggers that attempt at all,
+        # which is exactly how the old, buggy test above passed).
+        cf_meta_dest="$cf_parent/meta_dest"
+        mkdir -p "$cf_meta_dest"
+        chmod 0777 "$cf_meta_dest"
+        if FS_K8S_TEST_SHIM_TARGET="." LD_PRELOAD="$cf_shim_dir/shim.so" \
+                "$context_extract_sh" "$cf_meta_dest" 100000000 < "$cf_meta_tar" \
+                >/tmp/fs-k8s-ctx-meta.err 2>&1; then
+            ok "an existing DEST_DIR's own metadata survives extraction under denied chmod/utime/chown"
+        else
+            no "an existing DEST_DIR's own metadata survives extraction under denied chmod/utime/chown" \
+                "$(cat /tmp/fs-k8s-ctx-meta.err)"
+        fi
+        cf_meta_mode="$(stat -c '%a' "$cf_meta_dest")"
+        if [[ "$cf_meta_mode" == "777" ]]; then
+            ok "an existing DEST_DIR's own permission bits are untouched under denied chmod/utime/chown"
+        else
+            no "an existing DEST_DIR's own permission bits are untouched under denied chmod/utime/chown" \
+                "mode is $cf_meta_mode, expected 777"
+        fi
+        if [[ "$(cat "$cf_meta_dest/foo.txt" 2>/dev/null)" == "hello" \
+            && "$(cat "$cf_meta_dest/sub/bar.txt" 2>/dev/null)" == "world" ]]; then
+            ok "an existing DEST_DIR: the entries-only archive's files still land inside it"
+        else
+            no "an existing DEST_DIR: the entries-only archive's files still land inside it" \
+                "$(find "$cf_meta_dest" 2>&1)"
+        fi
+        rm -f /tmp/fs-k8s-ctx-meta.err
+    else
+        printf '  SKIP  metadata-survives-EPERM test: could not compile the LD_PRELOAD shim\n'
+        printf '        %s\n' "$(cat /tmp/fs-k8s-ctx-shim-cc.err)"
+    fi
+    rm -f /tmp/fs-k8s-ctx-shim-cc.err
 else
-    no "an existing DEST_DIR's own metadata survives extraction" \
-        "$(cat /tmp/fs-k8s-ctx-meta.err)"
+    printf '  SKIP  metadata-survives-EPERM test: no C compiler (cc) on PATH\n'
 fi
-cf_meta_mode="$(stat -c '%a' "$cf_meta_dest")"
-if [[ "$cf_meta_mode" == "700" ]]; then
-    ok "an existing DEST_DIR's own permission bits are not overwritten from the archive"
-else
-    no "an existing DEST_DIR's own permission bits are not overwritten from the archive" \
-        "mode is $cf_meta_mode, expected 700"
-fi
-rm -f /tmp/fs-k8s-ctx-meta.err
 
 # An existing NON-empty DEST_DIR is still refused: a second push must not
 # merge into a first.

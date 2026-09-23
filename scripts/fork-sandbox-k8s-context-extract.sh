@@ -189,7 +189,6 @@ done < "$tf_out"
 # refused: that is still a second push merging into a first, the case
 # this check exists for. --context-ro's own destination (POD_CONTEXT_DIR)
 # never pre-exists, so this leaves its behaviour unchanged.
-overwrite_dir_flag=""
 if [ -e "$dest_dir" ]; then
     if [ ! -d "$dest_dir" ]; then
         echo "$label: DEST_DIR '$dest_dir' exists and is not a directory; refusing." >&2
@@ -202,19 +201,26 @@ if [ -e "$dest_dir" ]; then
     # The mount point itself is kubelet-created (an emptyDir), owned by
     # root even though fsGroup makes it group-writable -- this process
     # runs as a non-root uid with every capability dropped. GNU tar's
-    # default (--overwrite-dir) tries to chmod/utime the directory this
-    # archive's top-level `./` entry maps onto, and chmod/utime with
-    # explicit times both require owning the target or CAP_FOWNER; neither
-    # holds here, so that restore attempt fails and tar's exit status goes
-    # nonzero even though every file underneath extracted fine, and this
-    # script's `set -eu` then reports the whole push as failed. Passing
-    # --no-overwrite-dir skips that restore for DEST_DIR itself, which is
-    # all this needs: DEST_DIR already has the mode/group the mount wants,
-    # and freshly-created subdirectories inside it are still owned by this
-    # process, so their own metadata restore is untouched. Only reached on
-    # this pre-existing-DEST_DIR branch, so --context-ro's destination
-    # (always freshly mkdir'd below) stays byte-identical.
-    overwrite_dir_flag="--no-overwrite-dir"
+    # default (--overwrite-dir) chmods/utimes the directory that an
+    # archive's top-level `./` entry maps onto, and a non-owner with no
+    # CAP_FOWNER gets EPERM from that chmod even when the target mode is
+    # already what the archive asks for -- setattr_prepare requires
+    # ownership or CAP_FOWNER regardless of whether the mode actually
+    # changes. --no-overwrite-dir does NOT avoid this: it still restores
+    # the directory to a permissive working mode partway through
+    # extraction (that restore is unconditional, not gated by the flag),
+    # so the EPERM hits regardless and tar's exit status goes nonzero even
+    # though every file underneath extracted fine; this script's `set -eu`
+    # then reports the whole push as failed. The only fix that actually
+    # avoids the chmod/utime call is to never give tar a member that maps
+    # onto DEST_DIR in the first place: fork-sandbox-k8s.sh's
+    # --thread-dir/--attach-dir spooling packs the directory's ENTRIES
+    # (`tar cf ARCHIVE -C DIR --null -T -` fed the top-level names), not
+    # `.` itself, so no member here ever resolves to DEST_DIR and this
+    # extractor never attempts to touch its metadata. Only reached on this
+    # pre-existing-DEST_DIR branch, so --context-ro's destination (always
+    # freshly mkdir'd below, and always packed as `-C DIR .`) is unaffected
+    # either way.
 else
     mkdir -- "$dest_dir"
 fi
@@ -222,5 +228,4 @@ fi
 # Never as anyone but the invoking user -- no sudo, nothing
 # privilege-related; --no-same-owner/--no-same-permissions strip whatever
 # the archive itself claims.
-tar -xf "$tar_file" -C "$dest_dir" --no-same-owner --no-same-permissions \
-    ${overwrite_dir_flag:+"$overwrite_dir_flag"}
+tar -xf "$tar_file" -C "$dest_dir" --no-same-owner --no-same-permissions

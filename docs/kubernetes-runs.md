@@ -1505,7 +1505,19 @@ directory is spooled to its own tar and pushed with its own `kubectl exec
 -i <pod> -- sh .../context-extract.sh DEST MAX_BYTES CALLER` over the same
 gated channel, in the same window — after the repository push, before the
 `.inputs-complete` sentinel — so a failed push fails the run closed rather
-than leaving a half-received directory for the agent to find. Both flags
+than leaving a half-received directory for the agent to find. One detail
+does NOT carry over from `--context-ro`: its tar is `tar cf - -C DIR .`,
+archiving the directory itself as a top-level member, but `--thread-dir`/
+`--attach-dir` archive only DIR's own entries (`find DIR -mindepth 1
+-maxdepth 1 -printf '%P\0' | tar cf - --null -T -`). `/thread` and
+`/attachments` are `emptyDir` mounts that already exist by the time the
+extractor runs (see below), unlike `--context-ro`'s destination, which the
+extractor creates fresh — and GNU tar's restore of a pre-existing
+directory's own metadata, on the one archive member that maps onto it,
+fails with EPERM for this uid against a root-owned mount no matter what
+that metadata restore would set it to. Archiving entries rather than `.`
+means no member ever maps onto the mount point, so that restore is never
+attempted. Both flags
 are capped at the same `CONTEXT_MAX_BYTES` (256 MiB) `--context-ro` uses,
 checked twice, independently, exactly as `--context-ro` is: on the host
 before anything is created or pushed, and again by the pod-side extractor
