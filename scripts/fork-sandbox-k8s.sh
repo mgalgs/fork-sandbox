@@ -3469,6 +3469,10 @@ cmd_submit() {
             echo "Error: the access token in $(fs_claude_credential_source "$claude_credentials_override") has expired." >&2
             echo "Log in with claude on the host, then retry." >&2
             exit 1
+        elif (( claude_mins_left < 5 )); then
+            echo "Error: the access token in $(fs_claude_credential_source "$claude_credentials_override") expires in ${claude_mins_left}m." >&2
+            echo "The pod cannot refresh the token, so the pod's session would die almost at once. Log in with claude on the host, then retry." >&2
+            exit 1
         elif (( claude_mins_left < 60 )); then
             echo "Warning: the access token expires in ${claude_mins_left}m; the pod's session dies then." >&2
         fi

@@ -4355,6 +4355,18 @@ else
     no "a credential expiring within an hour warns but still renders" "$soon_out"
 fi
 
+claude_home_floor="$(newdir)"; tmpdirs+=("$claude_home_floor")
+mkdir -p "$claude_home_floor/.claude"
+claude_floor_ms=$(( ($(date +%s) + 180) * 1000 ))
+cat > "$claude_home_floor/.claude/.credentials.json" <<JSON
+{"claudeAiOauth": {"accessToken": "tok", "expiresAt": $claude_floor_ms}}
+JSON
+refuses "a credential expiring within 5 minutes is refused (the pod cannot refresh it)" \
+    "the pod's session would die almost at once" \
+    env HOME="$claude_home_floor" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model claude-sonnet-5 --harness claude \
+    "$proj_dir" "$handoff_file"
+
 printf '\n== fork-sandbox-k8s.sh rm removes the per-run claude-proxy objects ==\n'
 # No live cluster here (see this file's own header), so `rm`'s kubectl
 # calls are checked against a stub kubectl placed ahead of the real one on
