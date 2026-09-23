@@ -3363,6 +3363,10 @@ fi
 # --refresh-at / --refresh-max: validation, defaults and the token threshold
 # live in fs_refresh_resolve (fork-sandbox-lib.sh), shared with the k8s submit
 # path. See the "A run that refreshes itself" section above.
+# It sets refresh_at, refresh_enabled, refresh_max, refresh_context_window and
+# refresh_threshold_tokens, which the rest of this script reads.
+refresh_at="" refresh_max="" refresh_enabled=0
+refresh_context_window="" refresh_threshold_tokens=""
 fs_refresh_resolve "$harness" "$refresh_at_arg" "$refresh_at_given" \
     "$refresh_max_arg" "$model" || exit 1
 
