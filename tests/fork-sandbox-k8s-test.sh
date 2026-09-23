@@ -11113,5 +11113,61 @@ fi
 kill "$gate_listener_pid" 2>/dev/null
 wait "$gate_listener_pid" 2>/dev/null
 
+printf '\n== check-grant: the one grant parser, no kubectl, no cluster ==\n'
+# An empty config dir -- no k8s.env at all -- to prove check-grant needs
+# neither the file nor a cluster, unlike every other verb. A kubectl stub
+# that fails the test if invoked at all backs that up: check-grant must
+# never shell out to it.
+cg_config_dir="$(newdir)"; tmpdirs+=("$cg_config_dir")
+cg_stub_dir="$(newdir)"; tmpdirs+=("$cg_stub_dir")
+cat > "$cg_stub_dir/kubectl" <<'STUB'
+#!/usr/bin/env bash
+echo "FAIL: check-grant invoked kubectl: $*" >&2
+exit 99
+STUB
+chmod +x "$cg_stub_dir/kubectl"
+cg_run() {
+    env PATH="$cg_stub_dir:$PATH" FORK_SANDBOX_CONFIG_DIR="$cg_config_dir" \
+        "$k8s_sh" check-grant "$@"
+}
+
+cg_out="$(cg_run --allow-namespace preview-pr-7 --reach-probe svc.preview-pr-7:80 2>/dev/null)"
+cg_rc=$?
+check "valid ns+probe: exit 0" "0" "$cg_rc"
+check "valid ns+probe: stdout" \
+    "$(printf 'ALLOW_NAMESPACE=preview-pr-7\nREACH_PROBE=svc.preview-pr-7:80')" \
+    "$cg_out"
+
+cg_run --allow-namespace preview-pr-7:443 --reach-probe svc.preview-pr-7:80 >/dev/null 2>&1
+check "ns:443 + probe on 80: exit 2" "2" "$?"
+
+cg_run --reach-probe svc.preview-pr-7:80 >/dev/null 2>&1
+check "probe without ns: exit 2" "2" "$?"
+
+cg_run --allow-namespace preview-pr-7 >/dev/null 2>&1
+check "ns without probe: exit 2" "2" "$?"
+
+cg_run --allow-namespace preview-pr-7 --reach-probe badhost:80 >/dev/null 2>&1
+check "bad probe host shape: exit 2" "2" "$?"
+
+cg_run --context-ro /tmp >/dev/null 2>&1
+check "context-ro outside forks/: exit 2" "2" "$?"
+
+cg_run --context-ro /var/tmp/claude-scratch/forks/does-not-exist-check-grant-test >/dev/null 2>&1
+check "context-ro nonexistent dir: exit 2" "2" "$?"
+
+cg_ctx_dir="/var/tmp/claude-scratch/forks/check-grant-test.$$"
+mkdir -p "$cg_ctx_dir"; tmpdirs+=("$cg_ctx_dir")
+cg_out="$(cg_run --context-ro "$cg_ctx_dir" 2>/dev/null)"
+cg_rc=$?
+check "context-ro-only grant: exit 0" "0" "$cg_rc"
+check "context-ro-only grant: only the CONTEXT_RO= line" "CONTEXT_RO=$cg_ctx_dir" "$cg_out"
+
+cg_run >/dev/null 2>&1
+check "no flags at all: exit 1" "1" "$?"
+
+cg_run --bogus-flag >/dev/null 2>&1
+check "unknown option: exit 1" "1" "$?"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))

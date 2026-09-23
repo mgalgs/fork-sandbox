@@ -1006,6 +1006,30 @@ submit's own failure trap.
 On the local (non-`--k8s`) path, both flags are refused with a message that
 they are `--k8s`-only: a local sandbox has no cluster namespaces to grant.
 
+### Checking a grant ahead of time: `check-grant`
+
+`fork-sandbox-k8s.sh check-grant [--allow-namespace NS[:PORT]]...
+[--reach-probe HOST:PORT]... [--context-ro DIR]` runs the grant-time half of
+the checks `submit` runs on these three flags — the pairing rule, the
+per-probe HOST:PORT/DNS-shape/grant-match checks above, and `--context-ro`'s
+forks/-only-and-no-links checks — sharing the exact same functions, so a
+grant `check-grant` accepts is one `submit` will also accept later, and a
+grant it refuses is refused for the identical reason. It contacts no
+cluster: no `kubectl`, and it needs no `k8s.env` at all (every other verb
+does). This is what lets kickoff tooling validate a per-thread grant before
+a Job is ever submitted for it.
+
+Exit codes: **0** on success, printing to stdout only — nothing else — one
+line per flag in the order given: `ALLOW_NAMESPACE=<value>` (one per
+`--allow-namespace`, value exactly as given, not normalized), then
+`REACH_PROBE=<value>` (same, per `--reach-probe`), then, only when
+`--context-ro` was given, `CONTEXT_RO=<realpath of DIR>`. **1** for no flags
+at all or an unknown option — a usage error. **2** for a refused value,
+printing the same message `submit` would print for the same input.
+
+This stdout format IS the grant file format `fork-sandbox mail grant`
+writes verbatim — see "Per-thread k8s grants" in `docs/agent-mail.md`.
+
 ## Model access: three modes, one built
 
 Model access is **orthogonal to the platform plugin** — every mode below works

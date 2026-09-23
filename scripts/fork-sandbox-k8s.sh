@@ -31,6 +31,8 @@
 #        fork-sandbox-k8s.sh say --branch NAME <text>
 #        fork-sandbox-k8s.sh say --branch NAME -        # text from stdin
 #        fork-sandbox-k8s.sh rm --branch NAME
+#        fork-sandbox-k8s.sh check-grant [--allow-namespace NS[:PORT]]...
+#                            [--reach-probe HOST:PORT]... [--context-ro DIR]
 #
 # --model MODEL is REQUIRED on a K8S_PROXY_UPSTREAM (legacy) install. On a
 # K8S_PROXY_ENDPOINTS install it is optional: the pod discovers the model
@@ -118,6 +120,21 @@
 # that argument with a far larger one. This is a separate command instead.
 #
 # rm deletes the run's Job, its pod, and its ConfigMap.
+#
+# check-grant validates a --allow-namespace/--reach-probe/--context-ro grant
+# with NO kubectl and NO cluster -- it runs exactly the same checks submit
+# runs on those three flags (the pairing rule, the per-probe HOST:PORT/DNS
+# shape/grant-match checks, and --context-ro's forks/-only + no-links
+# checks), sharing the same functions, so a grant check-grant accepts is one
+# submit will also accept later, for the identical reason. It needs no
+# k8s.env either. Exit 0 and, on stdout only, one line per flag in the order
+# given (ALLOW_NAMESPACE=..., REACH_PROBE=..., then CONTEXT_RO=<realpath of
+# DIR> when --context-ro was given) -- this is the grant file format the
+# postmaster's per-thread grant store (fork-sandbox-mail.sh's `grant` verb)
+# writes verbatim. Exit 1 for no flags at all or an unknown option (a usage
+# error). Exit 2 for a refused value, printing the same message submit would
+# print for the same input. See "Per-run namespace grants" in
+# docs/kubernetes-runs.md.
 #
 # --dry-run (install, submit, run): print the rendered YAML and exit 0.
 # Contacts nothing -- no kubectl, no git push, no cluster reachability
@@ -558,7 +575,11 @@ k8s_valid_label_key() {
     (( ${#key} <= 63 )) && [[ "$key" =~ ^[a-zA-Z0-9]([-_.a-zA-Z0-9]*[a-zA-Z0-9])?$ ]]
 }
 
-if [[ ! -f "$k8s_env" ]]; then
+# check-grant runs no kubectl and touches no cluster -- it is the grant
+# parser alone -- so it must work with no k8s.env at all (the postmaster
+# round's kickoff tooling may call it before install has ever run). Every
+# other verb still requires the file and K8S_CONTEXT in it, checked below.
+if [[ "${1-}" != check-grant && ! -f "$k8s_env" ]]; then
     echo "Error: $k8s_env not found. A Kubernetes run reads cluster-specific" >&2
     echo "settings from that file, one NAME=VALUE per line:" >&2
     echo "  mkdir -p $config_dir" >&2
@@ -575,7 +596,7 @@ if [[ ! -f "$k8s_env" ]]; then
 fi
 
 K8S_CONTEXT="$(read_env_value "$k8s_env" K8S_CONTEXT || true)"
-if [[ -z "$K8S_CONTEXT" ]]; then
+if [[ -z "$K8S_CONTEXT" && "${1-}" != check-grant ]]; then
     echo "Error: K8S_CONTEXT is not set in $k8s_env. This is never defaulted:" >&2
     echo "a wrong-cluster write is the failure mode worth an error message." >&2
     echo "Add a line: K8S_CONTEXT=your-cluster-context" >&2
@@ -2805,6 +2826,250 @@ k8s_spool_dir_entries() {
     fi
 }
 
+# --allow-namespace's own parse + validate: the comma-join into
+# parse_proxy_allow_ns and the per-run announce, exactly as cmd_submit ran
+# them inline before this round. Fills the caller's namespaces/ports
+# arrays (namerefs, named by the caller since both cmd_submit and
+# check-grant keep going with the raw values afterward -- cmd_submit's
+# probe loop right after, check-grant's own copy of that same loop).
+# Exits 1 on a refused value, same message as always; check-grant runs
+# this in a subshell and maps the subshell's exit status to 2 itself, so
+# this function's own exit behaviour need not change.
+validate_run_allow_ns() {
+    local -n _vrans_ns="$1" _vrans_port="$2"
+    shift 2
+    local -a allow_ns_raw=("$@")
+    _vrans_ns=()
+    _vrans_port=()
+    if (( ${#allow_ns_raw[@]} > 0 )); then
+        local allow_ns_joined
+        allow_ns_joined="$(IFS=,; printf '%s' "${allow_ns_raw[*]}")"
+        parse_proxy_allow_ns "$allow_ns_joined" --allow-namespace || exit 1
+        _vrans_ns=("${PROXY_ALLOW_NS_NAMESPACES[@]}")
+        _vrans_port=("${PROXY_ALLOW_NS_PORTS[@]}")
+        announce_run_allow_ns
+    fi
+}
+
+# --reach-probe's own parse + validate: the pairing rule against
+# --allow-namespace (a probe needs a namespace, a namespace needs at least
+# one probe) and the per-probe HOST:PORT/DNS-shape/grant-match checks,
+# unchanged from cmd_submit's old inline loop. $1 is a nameref to the
+# caller's probes-out array; $2/$3 are namerefs to the (already-filled, by
+# validate_run_allow_ns above) namespaces/ports arrays; $4 is the number of
+# --allow-namespace flags actually given (not always the same length as
+# $2 in theory, so passed explicitly rather than inferred from it, the
+# same value cmd_submit's own pairing check used: ${#allow_ns_raw[@]}).
+# Same exit-1-on-refusal contract as validate_run_allow_ns above.
+validate_run_reach_probes() {
+    local -n _vrrp_probes="$1" _vrrp_ns="$2" _vrrp_port="$3"
+    local allow_ns_count="$4"
+    shift 4
+    local -a reach_probe_raw=("$@")
+    _vrrp_probes=()
+
+    if (( ${#reach_probe_raw[@]} > 0 && allow_ns_count == 0 )); then
+        echo "Error: --reach-probe requires --allow-namespace. A reach probe" >&2
+        echo "verifies a grant the gate actually exercises; there is nothing" >&2
+        echo "to verify without one." >&2
+        exit 1
+    fi
+    if (( allow_ns_count > 0 && ${#reach_probe_raw[@]} == 0 )); then
+        echo "Error: --allow-namespace requires at least one --reach-probe." >&2
+        echo "A missing policy once passed the gate silently -- every grant" >&2
+        echo "must be exercised by at least one probe, or refuse." >&2
+        exit 1
+    fi
+
+    # Per-probe validation: HOST must be <svc>.<ns>, <svc>.<ns>.svc, or
+    # <svc>.<ns>.svc.$K8S_CLUSTER_DOMAIN (the same three shapes this file
+    # accepts elsewhere for a Service DNS name), <ns> must be one of this
+    # run's granted namespaces, and if that namespace's grant names a port
+    # the probe's port must equal it -- otherwise the probe can never pass
+    # and the run would only fail 60s later at the gate, for a reason
+    # submit could have named right here. Shape is checked by splitting on
+    # "." and counting/comparing labels, not with [[ =~ ]] or a "*.*.svc"
+    # style glob: K8S_CLUSTER_DOMAIN may contain literal dots, an ERE dot
+    # is a metacharacter, and a glob's "*" absorbs embedded dots too --
+    # "*.*.svc" wrongly accepts "svc.ns.extra.svc" (see this file's other
+    # glob-not-regex host comparisons, which use a single suffix "*" and
+    # don't have this trap).
+    local probe host port_probe ns_seg gi found gport port_ok shape_ok
+    local -a host_labels domain_labels
+    local di domain_match
+    for probe in "${reach_probe_raw[@]}"; do
+        host="${probe%:*}"
+        port_probe="${probe##*:}"
+        if [[ "$port_probe" == "$probe" || -z "$host" || -z "$port_probe" ]]; then
+            echo "Error: --reach-probe '$probe' must be HOST:PORT." >&2
+            exit 1
+        fi
+        if [[ ! "$port_probe" =~ ^[0-9]{1,5}$ ]] || (( 10#$port_probe < 1 || 10#$port_probe > 65535 )); then
+            echo "Error: --reach-probe '$probe' has an invalid port" >&2
+            echo "'$port_probe' -- must be 1-65535." >&2
+            exit 1
+        fi
+        port_probe=$(( 10#$port_probe ))
+
+        shape_ok=false
+        IFS='.' read -r -a host_labels <<< "$host"
+        IFS='.' read -r -a domain_labels <<< "$K8S_CLUSTER_DOMAIN"
+        if (( ${#host_labels[@]} == 2 )); then
+            shape_ok=true
+        elif (( ${#host_labels[@]} == 3 )) && [[ "${host_labels[2]}" == svc ]]; then
+            shape_ok=true
+        elif (( ${#host_labels[@]} == 3 + ${#domain_labels[@]} )) \
+                && [[ "${host_labels[2]}" == svc ]]; then
+            domain_match=true
+            for (( di = 0; di < ${#domain_labels[@]}; di++ )); do
+                [[ "${host_labels[3 + di]}" == "${domain_labels[$di]}" ]] || domain_match=false
+            done
+            [[ "$domain_match" == true ]] && shape_ok=true
+        fi
+        if [[ "$shape_ok" != true ]]; then
+            echo "Error: --reach-probe '$probe' has host '$host', which must be" >&2
+            echo "<svc>.<ns>, <svc>.<ns>.svc, or <svc>.<ns>.svc.$K8S_CLUSTER_DOMAIN." >&2
+            exit 1
+        fi
+        ns_seg="${host#*.}"
+        ns_seg="${ns_seg%%.*}"
+
+        # A namespace can be granted more than once with different ports
+        # (--allow-namespace ns:443 --allow-namespace ns:80 is legal, both
+        # are repeatable per the flag's own contract, and render-grant
+        # emits both as separate egress rules) -- so the probe's port must
+        # be checked against EVERY grant entry for this namespace, not just
+        # the first one found, or a probe on the second-declared port is
+        # wrongly refused even though the gate would actually let it through.
+        found=false
+        port_ok=false
+        for (( gi = 0; gi < ${#_vrrp_ns[@]}; gi++ )); do
+            if [[ "${_vrrp_ns[$gi]}" == "$ns_seg" ]]; then
+                found=true
+                gport="${_vrrp_port[$gi]}"
+                if [[ -z "$gport" ]] || (( gport == port_probe )); then
+                    port_ok=true
+                    break
+                fi
+            fi
+        done
+        if [[ "$found" != true ]]; then
+            echo "Error: --reach-probe '$probe' targets namespace '$ns_seg'," >&2
+            echo "which is not one of this run's --allow-namespace grants." >&2
+            exit 1
+        fi
+        if [[ "$port_ok" != true ]]; then
+            echo "Error: --reach-probe '$probe' uses port $port_probe, but no" >&2
+            echo "--allow-namespace grant for '$ns_seg' names that port --" >&2
+            echo "they must match, or the probe can never pass the gate." >&2
+            exit 1
+        fi
+        _vrrp_probes+=("$host:$port_probe")
+    done
+}
+
+# --context-ro's own validate: the resolved real path must sit under
+# /var/tmp/claude-scratch/forks/, must exist, and must contain no symlink
+# or hard-linked file (tar cf's ordinary walk turns either into a link
+# entry the pod-side extractor refuses -- but only after the Job exists,
+# the pod is Ready and the repository has already been pushed; refusing
+# here catches it before any cluster object is created). Prints the
+# resolved real path on stdout on success -- callers run it via command
+# substitution, e.g. context_ro="$(validate_context_ro_dir "$context_ro")"
+# || exit 1, which already runs it in a subshell of its own, so exit 1
+# inside here never has to be distinguished from exit 2 the way the two
+# functions above do.
+validate_context_ro_dir() {
+    local context_ro="$1" context_ro_real
+    context_ro_real="$("$FS_REALPATH" -m "$context_ro")"
+    if [[ "$context_ro_real" != /var/tmp/claude-scratch/forks/* ]]; then
+        echo "Error: --context-ro must name a directory under" >&2
+        echo "/var/tmp/claude-scratch/forks/ — got '$context_ro_real'. The" >&2
+        echo "pod reads it after it is pushed, so which paths may be" >&2
+        echo "handed to a pod this way is a security boundary. Stage the" >&2
+        echo "context in a mktemp directory there and rerun." >&2
+        exit 1
+    fi
+    if [[ ! -d "$context_ro_real" ]]; then
+        echo "Error: --context-ro directory '$context_ro_real' does not exist." >&2
+        exit 1
+    fi
+    local context_ro_symlink
+    context_ro_symlink="$(find "$context_ro_real" -type l -print -quit)"
+    if [[ -n "$context_ro_symlink" ]]; then
+        echo "Error: --context-ro directory '$context_ro_real' contains a symlink" >&2
+        echo "('$context_ro_symlink'); links are not allowed in a pushed context" >&2
+        echo "directory." >&2
+        exit 1
+    fi
+    local context_ro_hardlink
+    context_ro_hardlink="$(find "$context_ro_real" -type f -links +1 -print -quit)"
+    if [[ -n "$context_ro_hardlink" ]]; then
+        echo "Error: --context-ro directory '$context_ro_real' contains a hard-linked file" >&2
+        echo "('$context_ro_hardlink'); links are not allowed in a pushed context" >&2
+        echo "directory." >&2
+        exit 1
+    fi
+    printf '%s\n' "$context_ro_real"
+}
+
+# check-grant: runs ONLY the three validators above (no kubectl, no
+# cluster), the grant half of what cmd_submit checks -- the "one grant
+# parser" the postmaster's per-thread grants (mail grant, Section 5) rely
+# on: a grant accepted here is one submit will also accept later, and a
+# grant refused here is refused for the identical reason. See
+# docs/kubernetes-runs.md.
+cmd_check_grant() {
+    local -a allow_ns_raw=() reach_probe_raw=()
+    local context_ro="" saw_any=false
+    while (( $# )); do
+        case "$1" in
+            --allow-namespace) allow_ns_raw+=("${2:?--allow-namespace requires NS[:PORT]}"); saw_any=true; shift 2 ;;
+            --reach-probe) reach_probe_raw+=("${2:?--reach-probe requires HOST:PORT}"); saw_any=true; shift 2 ;;
+            --context-ro) context_ro="${2:?--context-ro requires a directory}"; saw_any=true; shift 2 ;;
+            *)
+                echo "Usage: fork-sandbox-k8s.sh check-grant [--allow-namespace NS[:PORT]]..." >&2
+                echo "                            [--reach-probe HOST:PORT]... [--context-ro DIR]" >&2
+                exit 1
+                ;;
+        esac
+    done
+    if [[ "$saw_any" != true ]]; then
+        echo "Usage: fork-sandbox-k8s.sh check-grant [--allow-namespace NS[:PORT]]..." >&2
+        echo "                            [--reach-probe HOST:PORT]... [--context-ro DIR]" >&2
+        exit 1
+    fi
+
+    # Run in a subshell so the extracted validators' own "exit 1 on
+    # refusal" (unchanged, so submit's behaviour above stays identical)
+    # becomes THIS verb's exit 2 -- and so the success-case stdout lines
+    # below print only once validation has fully passed, never a partial
+    # set ahead of a later refusal.
+    if ! (
+        local -a run_allow_ns_namespaces=() run_allow_ns_ports=() run_reach_probes=()
+        validate_run_allow_ns run_allow_ns_namespaces run_allow_ns_ports "${allow_ns_raw[@]}"
+        validate_run_reach_probes run_reach_probes run_allow_ns_namespaces run_allow_ns_ports \
+            "${#allow_ns_raw[@]}" "${reach_probe_raw[@]}"
+        local context_ro_real=""
+        if [[ -n "$context_ro" ]]; then
+            context_ro_real="$(validate_context_ro_dir "$context_ro")" || exit 1
+        fi
+        local v
+        for v in "${allow_ns_raw[@]}"; do
+            printf 'ALLOW_NAMESPACE=%s\n' "$v"
+        done
+        for v in "${reach_probe_raw[@]}"; do
+            printf 'REACH_PROBE=%s\n' "$v"
+        done
+        if [[ -n "$context_ro" ]]; then
+            printf 'CONTEXT_RO=%s\n' "$context_ro_real"
+        fi
+        exit 0
+    ); then
+        exit 2
+    fi
+}
+
 cmd_submit() {
     local dry_run=false branch="" model="" review_loop_cap="" outbox_max_arg=""
     local context_ro="" harness="pi" review_model="" endpoint="" checkout_ref=""
@@ -3237,56 +3502,14 @@ cmd_submit() {
     # The same rule fork-sandbox.sh's own local --context-ro flag applies to
     # its --bind-ro (scripts/fork-sandbox.sh, around the FS_REALPATH check
     # near its argument validation): the directory's real path must be
-    # under /var/tmp/claude-scratch/forks/, and it must exist. A
-    # blanket-approved script must not be pointable at an arbitrary host
-    # directory (~/.ssh, say) to ship it into a pod. Checked here, ahead of
-    # --dry-run's early exit below, so a bad path is refused with no
-    # cluster involved -- the size cap, which needs an actual tar of the
+    # under /var/tmp/claude-scratch/forks/, and it must exist. Checked here,
+    # ahead of --dry-run's early exit below, so a bad path is refused with
+    # no cluster involved -- the size cap, which needs an actual tar of the
     # directory, is checked later, alongside the real push, which --dry-run
-    # never reaches.
+    # never reaches. Extracted into validate_context_ro_dir above so
+    # check-grant can run the identical check with no cluster.
     if [[ -n "$context_ro" ]]; then
-        local context_ro_real
-        context_ro_real="$("$FS_REALPATH" -m "$context_ro")"
-        if [[ "$context_ro_real" != /var/tmp/claude-scratch/forks/* ]]; then
-            echo "Error: --context-ro must name a directory under" >&2
-            echo "/var/tmp/claude-scratch/forks/ — got '$context_ro_real'. The" >&2
-            echo "pod reads it after it is pushed, so which paths may be" >&2
-            echo "handed to a pod this way is a security boundary. Stage the" >&2
-            echo "context in a mktemp directory there and rerun." >&2
-            exit 1
-        fi
-        if [[ ! -d "$context_ro_real" ]]; then
-            echo "Error: --context-ro directory '$context_ro_real' does not exist." >&2
-            exit 1
-        fi
-        # tar cf's ordinary (non -h) walk turns a symlink into a link
-        # entry, which fork-sandbox-k8s-context-extract.sh refuses -- but
-        # only after the Job exists, the pod is Ready and the repository
-        # has already been pushed. Catching it here refuses before
-        # any of that happens. A hard link gets the same "link entry"
-        # treatment from tar (it sees the same device+inode a second time
-        # under a different name), so it needs its own check here too --
-        # `find -type l` only ever matches symlinks.
-        local context_ro_symlink
-        context_ro_symlink="$(find "$context_ro_real" -type l -print -quit)"
-        if [[ -n "$context_ro_symlink" ]]; then
-            echo "Error: --context-ro directory '$context_ro_real' contains a symlink" >&2
-            echo "('$context_ro_symlink'); links are not allowed in a pushed context" >&2
-            echo "directory." >&2
-            exit 1
-        fi
-        # Any link count above one is enough to refuse the file. Looking only
-        # for an inode seen twice inside this tree misses the dangerous case
-        # where the other name is outside the context directory.
-        local context_ro_hardlink
-        context_ro_hardlink="$(find "$context_ro_real" -type f -links +1 -print -quit)"
-        if [[ -n "$context_ro_hardlink" ]]; then
-            echo "Error: --context-ro directory '$context_ro_real' contains a hard-linked file" >&2
-            echo "('$context_ro_hardlink'); links are not allowed in a pushed context" >&2
-            echo "directory." >&2
-            exit 1
-        fi
-        context_ro="$context_ro_real"
+        context_ro="$(validate_context_ro_dir "$context_ro")" || exit 1
     fi
 
     # --thread-dir/--attach-dir use fs_validate_scratch_dir's rule, not
@@ -3488,123 +3711,19 @@ cmd_submit() {
     fi
 
     # This run's own --allow-namespace grant, on top of (never instead of)
-    # K8S_AGENT_ALLOW_NS above. Comma-joined and run through the same
-    # parser as the static key, with a distinct label so a bad entry's
-    # error names the flag, not the env var. parse_proxy_allow_ns fills
+    # K8S_AGENT_ALLOW_NS above, plus the paired --reach-probe checks --
+    # both extracted into validate_run_allow_ns / validate_run_reach_probes
+    # above so check-grant can run the identical checks with no cluster.
+    # parse_proxy_allow_ns (inside validate_run_allow_ns) fills
     # PROXY_ALLOW_NS_* -- already fully consumed by the static-key block's
     # own announce_agent_allow_ns call just above -- so overwriting it here
-    # is safe. Copied into this function's own arrays immediately after,
-    # since nothing downstream may be assumed to leave PROXY_ALLOW_NS_*
-    # alone.
+    # is safe.
     local -a run_allow_ns_namespaces=() run_allow_ns_ports=()
-    if (( ${#allow_ns_raw[@]} > 0 )); then
-        local allow_ns_joined
-        allow_ns_joined="$(IFS=,; printf '%s' "${allow_ns_raw[*]}")"
-        parse_proxy_allow_ns "$allow_ns_joined" --allow-namespace || exit 1
-        run_allow_ns_namespaces=("${PROXY_ALLOW_NS_NAMESPACES[@]}")
-        run_allow_ns_ports=("${PROXY_ALLOW_NS_PORTS[@]}")
-        announce_run_allow_ns
-    fi
+    validate_run_allow_ns run_allow_ns_namespaces run_allow_ns_ports "${allow_ns_raw[@]}"
 
-    if (( ${#reach_probe_raw[@]} > 0 && ${#allow_ns_raw[@]} == 0 )); then
-        echo "Error: --reach-probe requires --allow-namespace. A reach probe" >&2
-        echo "verifies a grant the gate actually exercises; there is nothing" >&2
-        echo "to verify without one." >&2
-        exit 1
-    fi
-    if (( ${#allow_ns_raw[@]} > 0 && ${#reach_probe_raw[@]} == 0 )); then
-        echo "Error: --allow-namespace requires at least one --reach-probe." >&2
-        echo "A missing policy once passed the gate silently -- every grant" >&2
-        echo "must be exercised by at least one probe, or refuse." >&2
-        exit 1
-    fi
-
-    # Per-probe validation: HOST must be <svc>.<ns>, <svc>.<ns>.svc, or
-    # <svc>.<ns>.svc.$K8S_CLUSTER_DOMAIN (the same three shapes this file
-    # accepts elsewhere for a Service DNS name), <ns> must be one of this
-    # run's granted namespaces, and if that namespace's grant names a port
-    # the probe's port must equal it -- otherwise the probe can never pass
-    # and the run would only fail 60s later at the gate, for a reason
-    # submit could have named right here. Shape is checked by splitting on
-    # "." and counting/comparing labels, not with [[ =~ ]] or a "*.*.svc"
-    # style glob: K8S_CLUSTER_DOMAIN may contain literal dots, an ERE dot
-    # is a metacharacter, and a glob's "*" absorbs embedded dots too --
-    # "*.*.svc" wrongly accepts "svc.ns.extra.svc" (see this file's other
-    # glob-not-regex host comparisons, which use a single suffix "*" and
-    # don't have this trap).
     local -a run_reach_probes=()
-    local probe host port_probe ns_seg gi found gport port_ok shape_ok
-    local -a host_labels domain_labels
-    local di domain_match
-    for probe in "${reach_probe_raw[@]}"; do
-        host="${probe%:*}"
-        port_probe="${probe##*:}"
-        if [[ "$port_probe" == "$probe" || -z "$host" || -z "$port_probe" ]]; then
-            echo "Error: --reach-probe '$probe' must be HOST:PORT." >&2
-            exit 1
-        fi
-        if [[ ! "$port_probe" =~ ^[0-9]{1,5}$ ]] || (( 10#$port_probe < 1 || 10#$port_probe > 65535 )); then
-            echo "Error: --reach-probe '$probe' has an invalid port" >&2
-            echo "'$port_probe' -- must be 1-65535." >&2
-            exit 1
-        fi
-        port_probe=$(( 10#$port_probe ))
-
-        shape_ok=false
-        IFS='.' read -r -a host_labels <<< "$host"
-        IFS='.' read -r -a domain_labels <<< "$K8S_CLUSTER_DOMAIN"
-        if (( ${#host_labels[@]} == 2 )); then
-            shape_ok=true
-        elif (( ${#host_labels[@]} == 3 )) && [[ "${host_labels[2]}" == svc ]]; then
-            shape_ok=true
-        elif (( ${#host_labels[@]} == 3 + ${#domain_labels[@]} )) \
-                && [[ "${host_labels[2]}" == svc ]]; then
-            domain_match=true
-            for (( di = 0; di < ${#domain_labels[@]}; di++ )); do
-                [[ "${host_labels[3 + di]}" == "${domain_labels[$di]}" ]] || domain_match=false
-            done
-            [[ "$domain_match" == true ]] && shape_ok=true
-        fi
-        if [[ "$shape_ok" != true ]]; then
-            echo "Error: --reach-probe '$probe' has host '$host', which must be" >&2
-            echo "<svc>.<ns>, <svc>.<ns>.svc, or <svc>.<ns>.svc.$K8S_CLUSTER_DOMAIN." >&2
-            exit 1
-        fi
-        ns_seg="${host#*.}"
-        ns_seg="${ns_seg%%.*}"
-
-        # A namespace can be granted more than once with different ports
-        # (--allow-namespace ns:443 --allow-namespace ns:80 is legal, both
-        # are repeatable per the flag's own contract, and render-grant
-        # emits both as separate egress rules) -- so the probe's port must
-        # be checked against EVERY grant entry for this namespace, not just
-        # the first one found, or a probe on the second-declared port is
-        # wrongly refused even though the gate would actually let it through.
-        found=false
-        port_ok=false
-        for (( gi = 0; gi < ${#run_allow_ns_namespaces[@]}; gi++ )); do
-            if [[ "${run_allow_ns_namespaces[$gi]}" == "$ns_seg" ]]; then
-                found=true
-                gport="${run_allow_ns_ports[$gi]}"
-                if [[ -z "$gport" ]] || (( gport == port_probe )); then
-                    port_ok=true
-                    break
-                fi
-            fi
-        done
-        if [[ "$found" != true ]]; then
-            echo "Error: --reach-probe '$probe' targets namespace '$ns_seg'," >&2
-            echo "which is not one of this run's --allow-namespace grants." >&2
-            exit 1
-        fi
-        if [[ "$port_ok" != true ]]; then
-            echo "Error: --reach-probe '$probe' uses port $port_probe, but no" >&2
-            echo "--allow-namespace grant for '$ns_seg' names that port --" >&2
-            echo "they must match, or the probe can never pass the gate." >&2
-            exit 1
-        fi
-        run_reach_probes+=("$host:$port_probe")
-    done
+    validate_run_reach_probes run_reach_probes run_allow_ns_namespaces run_allow_ns_ports \
+        "${#allow_ns_raw[@]}" "${reach_probe_raw[@]}"
 
     resolve_platform || exit 1
     local icmp_check=0
@@ -5582,8 +5701,9 @@ case "$verb" in
     fetch) cmd_fetch "$@" ;;
     say) cmd_say "$@" ;;
     rm) cmd_rm "$@" ;;
+    check-grant) cmd_check_grant "$@" ;;
     *)
-        echo "Error: unknown command '$verb'. Use install, submit, run, wait, collect, fetch, say or rm." >&2
+        echo "Error: unknown command '$verb'. Use install, submit, run, wait, collect, fetch, say, rm or check-grant." >&2
         exit 1
         ;;
 esac
