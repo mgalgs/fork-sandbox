@@ -3694,10 +3694,16 @@ head -c 200 /dev/zero | tr '\0' 'x' > "$big_brief_handoff"
 big_brief_out="$(HOME="$claude_home" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" \
     submit --dry-run --branch fs-k8s-test-branch --model claude-sonnet-5 \
     --harness claude --refresh-at 100 "$proj_dir" "$big_brief_handoff" 2>&1)"
-contains "submit warns at launch for a large brief" \
-    "this brief is 200 bytes" "$big_brief_out"
-contains "submit's large-brief warning names the threshold" \
-    "100-token --refresh-at threshold" "$big_brief_out"
+if grep -qF -- 'this brief is 200 bytes' <<< "$big_brief_out"; then
+    ok "submit warns at launch for a large brief"
+else
+    no "submit warns at launch for a large brief" "not found in: $big_brief_out"
+fi
+if grep -qF -- '100-token --refresh-at threshold' <<< "$big_brief_out"; then
+    ok "submit's large-brief warning names the threshold"
+else
+    no "submit's large-brief warning names the threshold" "not found in: $big_brief_out"
+fi
 small_brief_out="$(HOME="$claude_home" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" \
     submit --dry-run --branch fs-k8s-test-branch --model claude-sonnet-5 \
     --harness claude --refresh-at 100 "$proj_dir" "$handoff_file" 2>&1)"
