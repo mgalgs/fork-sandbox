@@ -267,9 +267,16 @@ if (( measure_usage )); then
             if [[ -f "$baseline_marker" ]]; then
                 IFS= read -r baseline < "$baseline_marker" 2>/dev/null || true
             else
-                printf '%s' "$usage_tokens" > "$baseline_marker.tmp" 2>/dev/null \
-                    && mv -f -- "$baseline_marker.tmp" "$baseline_marker" 2>/dev/null
-                baseline="$usage_tokens"
+                # Only a baseline that actually landed on disk counts: if the
+                # write or move fails, every later call would otherwise take
+                # its own usage as B again and the nudge would drift to the
+                # ceiling. Left empty, it falls back to exactly T.
+                if printf '%s' "$usage_tokens" > "$baseline_marker.tmp" 2>/dev/null \
+                    && mv -f -- "$baseline_marker.tmp" "$baseline_marker" 2>/dev/null; then
+                    baseline="$usage_tokens"
+                else
+                    rm -f -- "$baseline_marker.tmp" 2>/dev/null || true
+                fi
             fi
             if [[ "$refresh_ceiling" =~ ^[0-9]+$ && "$baseline" =~ ^[0-9]+$ ]]; then
                 refresh_effective=$(( baseline + refresh_threshold ))

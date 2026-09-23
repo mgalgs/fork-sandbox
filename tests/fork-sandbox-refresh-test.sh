@@ -369,6 +369,27 @@ t="$(new_transcript 180000 0 0)"; tmpdirs+=("$(dirname "$t")")
 hook_run_stderr "$inbox" PostToolUse "$t"
 contains "T above C: nudges at T (180000), never lowered to C" \
     "nudged (usage >= 180000 tokens)" "$hook_stderr"
+
+# A baseline that cannot be written (its directory does not exist) must fall
+# back to eff = T, not to "this call's own usage is B": with usage 110000 and
+# T=100000, C=160000 the second reading would put eff at the ceiling and the
+# nudge would silently wait for 160000 on every call.
+inbox="$(new_inbox)"; tmpdirs+=("$inbox")
+printf 'THRESHOLD_TOKENS=100000\nOUTBOX_DIR=%s/outbox\nCEILING_TOKENS=160000\n' \
+    "$inbox" > "$inbox/.refresh-config"
+mkdir -p "$inbox/outbox"
+nudge_marker="$(mktemp -u)"; nudge_reminded="$(mktemp -u)"; stale_reminded="$(mktemp -u)"
+baseline_marker="$inbox/no-such-dir/baseline"
+tmpdirs+=("$nudge_marker" "$nudge_reminded" "$stale_reminded")
+t="$(new_transcript 110000 0 0)"; tmpdirs+=("$(dirname "$t")")
+hook_run_stderr "$inbox" PostToolUse "$t"
+contains "an unwritable baseline falls back to T: first call nudges at 100000" \
+    "nudged (usage >= 100000 tokens)" "$hook_stderr"
+rm -f -- "$nudge_marker"
+hook_run_stderr "$inbox" PostToolUse "$t"
+contains "an unwritable baseline falls back to T: a later call nudges at 100000 too" \
+    "nudged (usage >= 100000 tokens)" "$hook_stderr"
+marker "an unwritable baseline leaves no stray .tmp behind" "$baseline_marker.tmp" no
 unset baseline_marker
 
 # =====================================================================
