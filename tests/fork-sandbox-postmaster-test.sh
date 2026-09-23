@@ -5686,6 +5686,86 @@ adopt_launch_fail_case() {
 }
 adopt_launch_fail_case
 
+# ---- cluster mode: deliver --cluster ----
+
+# The suite's shared fleet holds local seats, which a cluster postmaster
+# cannot run: startup refuses before anything is routed or spawned.
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+: > "$STUB_ARGV_LOG"
+send_msg '@carol' '@karen' 'cluster refusal topic' 'hello' 8 >/dev/null
+cl_rc=0
+"$postmaster" deliver --project "$PROJECT_DIR" --cluster --once \
+    >"$work/cl.out" 2>"$work/cl.err" || cl_rc=$?
+check "cluster: deliver --cluster --once refuses a fleet with local seats" 1 "$cl_rc"
+contains "cluster: the refusal names the reason" "$(cat "$work/cl.err")" \
+    "a cluster postmaster cannot run local seats (they need bwrap)"
+check "cluster: nothing was spawned" 0 "$(grep -c -- '^----CALL----$' "$STUB_ARGV_LOG")"
+check "cluster: nothing was routed" 0 \
+    "$(find "$PM_STATE_DIR/routed" -type f 2>/dev/null | wc -l)"
+cl_rc=0
+"$postmaster" deliver --project "$PROJECT_DIR" --once >/dev/null 2>&1 || cl_rc=$?
+check "cluster: the same fleet delivers without --cluster" 0 "$cl_rc"
+
+# An all-pi k8s fleet: a spawned wake (and an adopted one) is launched
+# under setsid, and tmux is never touched.
+cl_fleet_dir=""; new_root cl_fleet_dir
+cl_personas=""; new_root cl_personas
+cp -- "$FORK_SANDBOX_PERSONAS_DIR/kim.md" "$cl_personas/kim.md"
+cat > "$cl_fleet_dir/fleet.yaml" <<'EOF'
+agents:
+  kim:
+    harness: pi
+    model: vendor/kimmodel
+    backend: k8s
+EOF
+cl_bin=""; new_root cl_bin
+cat > "$cl_bin/setsid" <<STUB
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$cl_bin/setsid-argv.log"
+exit 0
+STUB
+cat > "$cl_bin/tmux" <<STUB
+#!/usr/bin/env bash
+printf 'called\n' >> "$cl_bin/tmux-called.log"
+exit 1
+STUB
+chmod +x -- "$cl_bin/setsid" "$cl_bin/tmux"
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+send_msg '@carol' '@kim' 'cluster setsid topic' 'hello' 8 >/dev/null
+cl_pass() {
+    env -u FORK_SANDBOX_POSTMASTER_K8S_DETACH \
+        FORK_SANDBOX_FLEET_FILE="$cl_fleet_dir/fleet.yaml" \
+        FORK_SANDBOX_PERSONAS_DIR="$cl_personas" \
+        PATH="$cl_bin:$PATH" \
+        "$postmaster" deliver --project "$PROJECT_DIR" --cluster --once \
+        >"$work/cl.out" 2>"$work/cl.err"
+}
+cl_pass
+cl_rc=$?
+check "cluster: an all-pi k8s fleet starts" 0 "$cl_rc"
+check "cluster: the k8s wake was launched with setsid" 1 \
+    "$(grep -c -- 'run.sh$' "$cl_bin/setsid-argv.log" 2>/dev/null)"
+contains "cluster: setsid detaches with --fork" "$(cat "$cl_bin/setsid-argv.log")" "--fork"
+check "cluster: tmux is never called" 0 "$( [[ -e "$cl_bin/tmux-called.log" ]] && echo 1 || echo 0 )"
+cl_env="$(latest_env_for_agent kim)"
+cl_wake_dir="$(env_val "$cl_env" RUN_DIR)"
+check "cluster: wake.out is the setsid output target" 1 "$( [[ -e "$cl_wake_dir/wake.out" ]] && echo 1 || echo 0 )"
+
+# The setsid stub never ran the wake, so its pid never appeared: with no
+# grace left it reads as a dead wake, whose Job the probe finds running.
+printf '1\n' > "$K8S_WAKE_BIN/probe-rc"
+FORK_SANDBOX_POSTMASTER_WAKE_DEAD_GRACE=0 cl_pass
+check "cluster: the adoption launch also used setsid" 2 \
+    "$(grep -c -- 'run.sh$' "$cl_bin/setsid-argv.log" 2>/dev/null)"
+contains "cluster: the adoption run.sh execs --adopt" "$(cat "$cl_wake_dir/run.sh")" "--adopt"
+check "cluster: adoption never touched tmux" 0 "$( [[ -e "$cl_bin/tmux-called.log" ]] && echo 1 || echo 0 )"
+contains "cluster: pm adopt event" "$(cat "$work/cl.out")" "pm adopt thread="
+
 unset FORK_SANDBOX_POSTMASTER_K8S_DETACH
 unset FORK_SANDBOX_POSTMASTER_K8S
 unset FORK_SANDBOX_CONFIG_DIR

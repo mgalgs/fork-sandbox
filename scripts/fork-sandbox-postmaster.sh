@@ -3,7 +3,7 @@
 # wakes addressed agents by spawning fork-sandbox runs, harvests their
 # replies back into the store, and enforces the fleet's stop rules
 #
-# Usage: fork-sandbox-postmaster.sh deliver --project <path> [--once]
+# Usage: fork-sandbox-postmaster.sh deliver --project <path> [--once] [--cluster]
 #        fork-sandbox-postmaster.sh status
 #        fork-sandbox-postmaster.sh flag <thread-id> [reason]
 #        fork-sandbox-postmaster.sh unflag <thread-id>
@@ -15,6 +15,16 @@
 # surface); without it, deliver loops -- scan, route, harvest, sleep
 # $FORK_SANDBOX_POSTMASTER_INTERVAL seconds (default 15) -- until
 # SIGTERM/SIGINT, then exits 0.
+#
+# --cluster is for a postmaster running inside a pod, and changes exactly two
+# things. At startup, deliver runs `fork-sandbox-fleet.sh check --cluster`
+# (a fleet.yaml is required) and refuses to start when the fleet holds a
+# seat a pod cannot run: a local (non-k8s) seat, a top-level `triage:`
+# block, or a claude/codex seat -- see that script's header for the exact
+# refusals. And every k8s wake (normal and --adopt) is launched detached
+# with `setsid` (stdin /dev/null, output to the wake dir's wake.out)
+# instead of a tmux session, via fork-sandbox-k8s-wake.sh --detach-mode
+# setsid; a pod has no tmux.
 #
 # status prints one screen: how many messages are unrouted, every live run
 # (agent, thread, run dir), every thread flagged needs-operator with its
@@ -1463,6 +1473,10 @@ pm_next_seq() {
 # is reached via the standalone `flag`/`unflag` verbs instead.
 PM_EVENTS_ENABLED=0
 
+# Set by `deliver --cluster`: refuse seats a pod cannot run at startup, and
+# launch k8s wakes with setsid instead of tmux.
+PM_CLUSTER=0
+
 # Prints one porcelain line to stdout for a route/harvest-pass action
 # worth operator eyes (see the EVENT STREAM header comment for the format
 # and the fixed event vocabulary). The one rule every call site must
@@ -1674,6 +1688,16 @@ pm_require_kit() {
 # pm_exec_wake); re-running full fleet validation on every pass would tax
 # every route pass for a mid-run edit the next restart would catch anyway.
 pm_require_fleet_check() {
+    if (( PM_CLUSTER )); then
+        # Never skipped under --cluster: a fleet with no fleet.yaml is all
+        # local seats, and a missing personas dir is a check error here.
+        if [[ ! -f "$FLEET_FILE" ]]; then
+            echo "Error: postmaster: --cluster needs a fleet file at '$FLEET_FILE' declaring backend: k8s seats." >&2
+            return 1
+        fi
+        "$FLEET" check --cluster
+        return
+    fi
     [[ -f "$FLEET_FILE" ]] || return 0
     [[ -d "$PERSONAS_DIR" ]] || return 0
     "$FLEET" check
@@ -3318,6 +3342,8 @@ pm_retry_schedule() {
 pm_k8s_wake_launch() {
     local wake_dir="$1" adopt="$2" rc=0
     local wake="${FORK_SANDBOX_POSTMASTER_K8S_WAKE_SCRIPT:-$script_dir/fork-sandbox-k8s-wake.sh}"
+    local -a detach=(--detach)
+    (( PM_CLUSTER )) && detach+=(--detach-mode setsid)
     set +e
     if [[ "${FORK_SANDBOX_POSTMASTER_K8S_DETACH:-}" == inline ]]; then
         if (( adopt )); then
@@ -3326,10 +3352,10 @@ pm_k8s_wake_launch() {
             "$wake" "$wake_dir" >/dev/null 2>&1
         fi
     elif (( adopt )); then
-        "$wake" --adopt --detach "$wake_dir" >/dev/null 2>&1
+        "$wake" --adopt "${detach[@]}" "$wake_dir" >/dev/null 2>&1
         rc=$?
     else
-        "$wake" --detach "$wake_dir" >/dev/null 2>&1
+        "$wake" "${detach[@]}" "$wake_dir" >/dev/null 2>&1
         rc=$?
     fi
     set -e
@@ -3778,6 +3804,7 @@ cmd_deliver() {
         case "$1" in
             --project) project="${2:?--project requires a path}"; shift 2 ;;
             --once) once=1; shift ;;
+            --cluster) PM_CLUSTER=1; shift ;;
             -h|--help) usage; exit 0 ;;
             *) echo "Error: deliver: unknown option '$1'." >&2; return 1 ;;
         esac

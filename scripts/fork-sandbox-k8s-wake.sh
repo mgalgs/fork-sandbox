@@ -15,6 +15,7 @@
 #        fork-sandbox-k8s-wake.sh --detach <wake-dir>
 #        fork-sandbox-k8s-wake.sh --adopt <wake-dir>
 #        fork-sandbox-k8s-wake.sh --adopt --detach <wake-dir>
+#        fork-sandbox-k8s-wake.sh --detach --detach-mode setsid <wake-dir>
 #
 # <wake-dir> is prepared by the caller with:
 #   fs-argv   NUL-delimited argv; element 0 is the launcher to run (the
@@ -77,6 +78,12 @@
 # own local-wake prefix): operators treat a live cc-sbx-* session as
 # local-run machinery in flight, and a k8s wake is not that. With --adopt
 # the run.sh it writes execs `--adopt <wake-dir>`.
+#
+# --detach-mode setsid|tmux (default tmux) picks how --detach detaches. With
+# setsid (a postmaster running in a pod has no tmux) the same run.sh is
+# started under `setsid --fork`, stdin from /dev/null and stdout/stderr to
+# <wake-dir>/wake.out; --detach returns 0 once setsid has forked, or exits 1
+# if it could not. The pid the wake records is its own either way.
 
 set -euo pipefail
 
@@ -340,6 +347,13 @@ fs_k8s_wake_detach() {
     } > "$wake_dir/run.sh"
     chmod +x -- "$wake_dir/run.sh"
 
+    if [[ "$detach_mode" == setsid ]]; then
+        if ! setsid --fork "$wake_dir/run.sh" </dev/null >"$wake_dir/wake.out" 2>&1; then
+            echo "Error: fork-sandbox-k8s-wake: setsid could not start the wake." >&2
+            exit 1
+        fi
+        exit 0
+    fi
     if ! tmux new-session -d -s "$session_name" -n "$session_name" \
         "$wake_dir/run.sh"; then
         echo "Error: fork-sandbox-k8s-wake: tmux could not start a detached session." >&2
@@ -348,18 +362,25 @@ fs_k8s_wake_detach() {
     exit 0
 }
 
-adopt=0 detach=0 wake_dir=""
+adopt=0 detach=0 detach_mode=tmux wake_dir=""
 while (( $# )); do
     case "$1" in
         -h|--help) usage; exit 0 ;;
         --adopt) adopt=1; shift ;;
         --detach) detach=1; shift ;;
+        --detach-mode)
+            detach_mode="${2:?--detach-mode requires setsid or tmux}"
+            case "$detach_mode" in
+                setsid|tmux) ;;
+                *) echo "Error: fork-sandbox-k8s-wake: --detach-mode takes setsid or tmux, not '$detach_mode'." >&2; exit 1 ;;
+            esac
+            shift 2 ;;
         -*) echo "Error: fork-sandbox-k8s-wake: unknown option '$1'." >&2; exit 1 ;;
         *) wake_dir="$1"; shift ;;
     esac
 done
 [[ -n "$wake_dir" ]] || {
-    echo "Usage: fork-sandbox-k8s-wake.sh [--adopt] [--detach] <wake-dir>" >&2
+    echo "Usage: fork-sandbox-k8s-wake.sh [--adopt] [--detach [--detach-mode setsid|tmux]] <wake-dir>" >&2
     exit 1
 }
 

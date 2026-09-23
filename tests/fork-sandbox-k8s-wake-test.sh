@@ -117,11 +117,12 @@ STUB
 # \`resume --run-dir DIR\` verbs. resume logs its argv, prints a line (and
 # a wait-timeout message when STUB_K8S_TIMEOUT_MSG is set), writes a
 # summary.json into DIR unless STUB_K8S_NO_SUMMARY is set, and exits
-# STUB_K8S_RESUME_RC (default 0).
+# STUB_K8S_RESUME_RC (default 0); it dumps its env to STUB_ENV_DUMP when set.
 set -uo pipefail
 if [[ "\${1:-}" == resume ]]; then
     printf '%s\n' "\$*" >> "$root_ref/resume-calls.log"
     echo "stub resume output"
+    [[ -z "\${STUB_ENV_DUMP:-}" ]] || env > "\$STUB_ENV_DUMP"
     if [[ -n "\${STUB_K8S_TIMEOUT_MSG:-}" ]]; then
         printf 'Error: timed out after 60s waiting for branch\n' >&2
     fi
@@ -439,7 +440,7 @@ rc=$?
 check "adopt rc 2: wrapper propagates rc 2" 2 "$rc"
 check "adopt rc 2: exit-code file is 2" 2 "$(cat -- "$root/wake/exit-code")"
 check "adopt rc 2: summary.json synthesized" '{"exit_code": 2}' "$(cat -- "$root/wake/summary.json")"
-[[ ! -f "$root/rm-calls.log" ]] && ok "adopt rc 2: rm not called" || no "adopt rc 2: rm not called"
+check "adopt rc 2: rm not called" 0 "$( [[ -f "$root/rm-calls.log" ]] && echo 1 || echo 0 )"
 
 adopt_setup adopt-branch-timeout
 adopt_run env STUB_K8S_RESUME_RC=1 STUB_K8S_NO_SUMMARY=1 STUB_K8S_TIMEOUT_MSG=1
@@ -467,8 +468,7 @@ rc=$?
 check "adopt without a run dir: wrapper exits 1" 1 "$rc"
 check "adopt without a run dir: exit-code is 1" 1 "$(cat -- "$root/wake/exit-code")"
 check "adopt without a run dir: summary.json synthesized" '{"exit_code": 1}' "$(cat -- "$root/wake/summary.json")"
-[[ ! -f "$root/resume-calls.log" ]] && ok "adopt without a run dir: resume never called" \
-    || no "adopt without a run dir: resume never called"
+check "adopt without a run dir: resume never called" 0 "$( [[ -f "$root/resume-calls.log" ]] && echo 1 || echo 0 )"
 contains "adopt without a run dir: the failure is logged (log appended)" \
     "$(cat -- "$root/wake/launch.log")" "no k8s run directory recorded"
 
@@ -479,12 +479,15 @@ check "adopt with a run dir that no longer exists: exit-code is 1" 1 "$(cat -- "
 
 adopt_setup adopt-branch-env
 write_nul "$root/wake/env" "GOOD_VAR=hello"
-: > "$root/env-probe"
-# resume runs with the wake's env applied: the stub resume cannot dump env,
-# so prove the shared apply function ran through the stale-var scrub.
-( export FORK_SANDBOX_STALE=old-value
-  "$root/bin/fork-sandbox-k8s-wake.sh" --adopt "$root/wake" ) >/dev/null 2>&1
-check "adopt: exits 0 with env records applied" 0 "$(cat -- "$root/wake/exit-code")"
+adopt_dump="$root/env-dump-adopt.txt"
+FORK_SANDBOX_STALE=old-value STUB_ENV_DUMP="$adopt_dump" \
+    "$root/bin/fork-sandbox-k8s-wake.sh" --adopt "$root/wake" >/dev/null 2>&1
+check "adopt: exits 0" 0 "$(cat -- "$root/wake/exit-code")"
+contains "adopt: resume runs with the env records applied" "$(cat -- "$adopt_dump" 2>/dev/null)" "GOOD_VAR=hello"
+case "$(cat -- "$adopt_dump" 2>/dev/null)" in
+    *FORK_SANDBOX_STALE*) no "adopt: inherited FORK_SANDBOX_* scrubbed" "FORK_SANDBOX_STALE leaked into resume's env" ;;
+    *) ok "adopt: inherited FORK_SANDBOX_* scrubbed" ;;
+esac
 
 # ---- adopt --detach: same tmux session name, run.sh execs --adopt ----
 adopt_setup adopt-branch-detach
@@ -502,6 +505,74 @@ check "adopt --detach: wrapper returns 0" 0 "$rc"
 contains "adopt --detach: same cc-k8s-<branch> session name" "$(cat -- "$tmux_log")" "cc-k8s-adopt-branch-detach"
 contains "adopt --detach: run.sh execs --adopt" "$(cat -- "$root/wake/run.sh")" "--adopt $root/wake"
 check "adopt --detach: the adopted wake ran to completion" 0 "$(cat -- "$root/wake/exit-code" 2>/dev/null || echo MISSING)"
+
+# ---- --detach-mode setsid: no tmux, the same run.sh under setsid ----
+setsid_stubs() {
+    # $1 = root; a setsid stub that logs its argv and runs the command, and
+    # a tmux stub that records any call (there must be none).
+    cat > "$1/bin/setsid" <<STUB
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$1/setsid-argv.log"
+last="\${!#}"
+exec "\$last"
+STUB
+    cat > "$1/bin/tmux" <<STUB
+#!/usr/bin/env bash
+printf 'called\n' >> "$1/tmux-called.log"
+exit 1
+STUB
+    chmod +x -- "$1/bin/setsid" "$1/bin/tmux"
+}
+
+{
+    root=""
+    setup_root root
+    write_nul "$root/wake/fs-argv" \
+        "$root/bin/launcher.sh" --branch "setsid-branch" \
+        --outbox-dir "$root/wake/outbox"
+    : > "$root/wake/env"
+    setsid_stubs "$root"
+    ( PATH="$root/bin:$PATH" STUB_K8S_LAUNCH_RC=0 \
+        "$root/bin/fork-sandbox-k8s-wake.sh" --detach --detach-mode setsid "$root/wake" )
+    rc=$?
+    check "--detach-mode setsid: wrapper returns 0" 0 "$rc"
+    contains "--detach-mode setsid: run.sh is the command setsid was given" \
+        "$(cat -- "$root/setsid-argv.log" 2>/dev/null)" "$root/wake/run.sh"
+    check "--detach-mode setsid: tmux is never called" 0 \
+        "$( [[ -e "$root/tmux-called.log" ]] && echo 1 || echo 0 )"
+    check "--detach-mode setsid: the wake ran to completion" 0 \
+        "$(cat -- "$root/wake/exit-code" 2>/dev/null || echo MISSING)"
+    check "--detach-mode setsid: wake.out exists (stdout/stderr target)" 1 \
+        "$( [[ -e "$root/wake/wake.out" ]] && echo 1 || echo 0 )"
+    check "--detach-mode setsid: the wake recorded its own pid" 1 \
+        "$( [[ -s "$root/wake/pid" ]] && echo 1 || echo 0 )"
+}
+
+adopt_setup adopt-setsid-branch
+setsid_stubs "$root"
+( PATH="$root/bin:$PATH" "$root/bin/fork-sandbox-k8s-wake.sh" --adopt --detach --detach-mode setsid "$root/wake" )
+rc=$?
+check "adopt --detach-mode setsid: wrapper returns 0" 0 "$rc"
+contains "adopt --detach-mode setsid: run.sh execs --adopt" "$(cat -- "$root/wake/run.sh")" "--adopt $root/wake"
+check "adopt --detach-mode setsid: tmux is never called" 0 \
+    "$( [[ -e "$root/tmux-called.log" ]] && echo 1 || echo 0 )"
+check "adopt --detach-mode setsid: the adopted wake ran to completion" 0 \
+    "$(cat -- "$root/wake/exit-code" 2>/dev/null || echo MISSING)"
+
+{
+    root=""
+    setup_root root
+    write_nul "$root/wake/fs-argv" "$root/bin/launcher.sh" --branch "setsid-fail"
+    : > "$root/wake/env"
+    printf '#!/usr/bin/env bash\nexit 1\n' > "$root/bin/setsid"
+    chmod +x -- "$root/bin/setsid"
+    ( PATH="$root/bin:$PATH" "$root/bin/fork-sandbox-k8s-wake.sh" --detach --detach-mode setsid "$root/wake" ) >/dev/null 2>&1
+    rc=$?
+    check "--detach-mode setsid: propagates a setsid failure as rc 1" 1 "$rc"
+    ( PATH="$root/bin:$PATH" "$root/bin/fork-sandbox-k8s-wake.sh" --detach --detach-mode bogus "$root/wake" ) >/dev/null 2>&1
+    rc=$?
+    check "--detach-mode: an unknown mode is refused" 1 "$rc"
+}
 
 printf '\n%s ok, %s fail\n' "$pass" "$fail"
 (( fail == 0 ))
