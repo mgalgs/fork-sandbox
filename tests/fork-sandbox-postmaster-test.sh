@@ -2576,6 +2576,212 @@ check "reset count: the 3rd failure since the reset clears it" 0 \
     "$( [[ -e "$rs_sessions" ]] && echo 1 || echo 0 )"
 
 # ============================================================
+printf '\n== retry: a failed wake with no pending message is retried, bounded, then flagged ==\n'
+# ============================================================
+
+# 0,0: two retries, zero backoff -- the very next pass's retry check
+# always finds NOT_BEFORE already due, so the test never has to sleep.
+export FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF=0,0
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+
+rt_mid1="$(send_msg '@carol' '@alice' 'retry topic' 'first message' 8)"
+rt_tid="$(thread_of "$rt_mid1")"
+rt_short="${rt_tid:0:8}"
+
+once
+finish_run alice 1
+: > "$STUB_ARGV_LOG"
+once
+check "retry: nothing spawns on the same pass the failure is harvested" 0 \
+    "$(grep -c -- '----CALL----' "$STUB_ARGV_LOG")"
+
+: > "$STUB_ARGV_LOG"
+: > "$work/once.out"
+once
+check "retry: a failed wake with no pending message is re-spawned on the next pass" 1 \
+    "$(grep -c -- '----CALL----' "$STUB_ARGV_LOG")"
+contains "retry: the retry event is emitted" "$(cat "$work/once.out")" \
+    "pm retry thread=$rt_short agent=alice trigger=${rt_mid1:0:8} attempt=1"
+contains "retry: the retry wake's trigger is the original message" \
+    "$(cat "$(live_env_for_agent alice)")" "TRIGGER=$rt_mid1"
+
+finish_run alice 1
+: > "$STUB_ARGV_LOG"
+once
+check "retry: nothing spawns on the pass that harvests the 2nd failure" 0 \
+    "$(grep -c -- '----CALL----' "$STUB_ARGV_LOG")"
+
+: > "$STUB_ARGV_LOG"
+: > "$work/once.out"
+once
+check "retry: a second failure is also re-spawned (2nd retry, cap 2)" 1 \
+    "$(grep -c -- '----CALL----' "$STUB_ARGV_LOG")"
+contains "retry: the 2nd retry event names attempt=2" "$(cat "$work/once.out")" \
+    "pm retry thread=$rt_short agent=alice trigger=${rt_mid1:0:8} attempt=2"
+
+finish_run alice 1
+: > "$STUB_ARGV_LOG"
+once
+check "retry: a third failure does NOT retry again (cap exhausted)" 0 \
+    "$(grep -c -- '----CALL----' "$STUB_ARGV_LOG")"
+contains "retry: exhaustion flags the thread, naming the agent and trigger" \
+    "$(cat "$PM_STATE_DIR/needs-operator/$rt_tid" 2>/dev/null)" \
+    "wake for alice failed after 2 retries (trigger ${rt_mid1:0:8})"
+check "retry: the exhausted schedule is removed (no lingering trigger)" 0 \
+    "$( [[ -n "$(sed -n 's/^TRIGGER=//p' "$PM_STATE_DIR/retries/$rt_tid/alice" 2>/dev/null)" ]] && echo 1 || echo 0 )"
+
+# ============================================================
+printf '\n== retry: a failed wake WITH a pending message schedules no retry ==\n'
+# ============================================================
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+
+fp_mid1="$(send_msg '@carol' '@alice' 'failed with pending' 'first message' 8)"
+fp_tid="$(thread_of "$fp_mid1")"
+once
+fp_run_env="$(live_env_for_agent alice)"
+
+fp_mid2="$(reply_msg '@carol' "$fp_mid1" 'second message' --to '@alice')"
+once
+contains "retry+pending: the new message is recorded as pending on the live run" \
+    "$(cat "$fp_run_env")" "PENDING_MSGS=$fp_mid2"
+
+finish_run alice 1
+: > "$STUB_ARGV_LOG"
+once
+check "retry+pending: harvest fires exactly one wake (the pending follow-up)" 1 \
+    "$(grep -c -- '----CALL----' "$STUB_ARGV_LOG")"
+contains "retry+pending: the follow-up wake's trigger is the pending message, not a retry" \
+    "$(cat "$(live_env_for_agent alice)")" "TRIGGER=$fp_mid2"
+check "retry+pending: no retry was scheduled for the failed trigger" 0 \
+    "$( [[ -e "$PM_STATE_DIR/retries/$fp_tid/alice" ]] && echo 1 || echo 0 )"
+
+: > "$STUB_ARGV_LOG"
+once
+check "retry+pending: a later pass spawns nothing extra (no retry lying in wait)" 0 \
+    "$(grep -c -- '----CALL----' "$STUB_ARGV_LOG")"
+
+# ============================================================
+printf '\n== retry: hops-0 and budget-exhausted triggers are refused by the existing gates ==\n'
+# ============================================================
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+
+hz_mid="$(send_msg '@carol' '@alice' 'hops zero retry' 'body' 0)"
+hz_tid="$(thread_of "$hz_mid")"
+mkdir -p -- "$PM_STATE_DIR/retries/$hz_tid"
+printf 'TRIGGER=%s\nATTEMPT=0\nNOT_BEFORE=0\n' "$hz_mid" > "$PM_STATE_DIR/retries/$hz_tid/alice"
+: > "$STUB_ARGV_LOG"
+once
+check "retry: a hops-0 trigger is refused, not spawned" 0 \
+    "$(grep -c -- '----CALL----' "$STUB_ARGV_LOG")"
+check "retry: the hops-0 schedule is dropped after refusal (no infinite loop)" 0 \
+    "$( [[ -n "$(sed -n 's/^TRIGGER=//p' "$PM_STATE_DIR/retries/$hz_tid/alice" 2>/dev/null)" ]] && echo 1 || echo 0 )"
+
+bg_mid="$(send_msg '@carol' '@alice' 'budget exhausted retry' 'body' 8)"
+bg_tid="$(thread_of "$bg_mid")"
+mkdir -p -- "$PM_STATE_DIR/spawns"
+seq 1 32 > "$PM_STATE_DIR/spawns/$bg_tid"
+mkdir -p -- "$PM_STATE_DIR/retries/$bg_tid"
+printf 'TRIGGER=%s\nATTEMPT=0\nNOT_BEFORE=0\n' "$bg_mid" > "$PM_STATE_DIR/retries/$bg_tid/alice"
+: > "$STUB_ARGV_LOG"
+once
+check "retry: a budget-exhausted trigger is refused, not spawned" 0 \
+    "$(grep -c -- '----CALL----' "$STUB_ARGV_LOG")"
+check "retry: the budget-exhausted schedule is dropped after refusal" 0 \
+    "$( [[ -n "$(sed -n 's/^TRIGGER=//p' "$PM_STATE_DIR/retries/$bg_tid/alice" 2>/dev/null)" ]] && echo 1 || echo 0 )"
+
+# ============================================================
+printf '\n== retry: NOT_BEFORE in the future is not retried early ==\n'
+# ============================================================
+
+export FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF=100000,100000
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+
+nb_mid1="$(send_msg '@carol' '@alice' 'not before future' 'first message' 8)"
+nb_tid="$(thread_of "$nb_mid1")"
+once
+finish_run alice 1
+once
+check "retry: a far-future NOT_BEFORE is recorded" 1 \
+    "$( [[ -e "$PM_STATE_DIR/retries/$nb_tid/alice" ]] && echo 1 || echo 0 )"
+: > "$STUB_ARGV_LOG"
+once
+check "retry: a NOT_BEFORE in the future is not retried early" 0 \
+    "$(grep -c -- '----CALL----' "$STUB_ARGV_LOG")"
+
+# ============================================================
+printf '\n== retry: a new message routed to the seat before the retry is due cancels it ==\n'
+# ============================================================
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+
+sp_mid1="$(send_msg '@carol' '@alice' 'supersede topic' 'first message' 8)"
+sp_tid="$(thread_of "$sp_mid1")"
+once
+finish_run alice 1
+once
+check "supersede: the failure scheduled a retry" 1 \
+    "$( [[ -e "$PM_STATE_DIR/retries/$sp_tid/alice" ]] && echo 1 || echo 0 )"
+
+sp_mid2="$(reply_msg '@carol' "$sp_mid1" 'second message' --to '@alice')"
+: > "$STUB_ARGV_LOG"
+once
+check "supersede: the new message spawns normally" 1 \
+    "$(grep -c -- '----CALL----' "$STUB_ARGV_LOG")"
+contains "supersede: the new wake's trigger is the new message, not the stale retry" \
+    "$(cat "$(live_env_for_agent alice)")" "TRIGGER=$sp_mid2"
+check "supersede: the stale retry schedule was cancelled" 0 \
+    "$( [[ -n "$(sed -n 's/^TRIGGER=//p' "$PM_STATE_DIR/retries/$sp_tid/alice" 2>/dev/null)" ]] && echo 1 || echo 0 )"
+
+# ============================================================
+printf '\n== retry: malformed backoff refuses deliver at startup ==\n'
+# ============================================================
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+
+FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF=abc refuses \
+    "retry: a non-numeric backoff entry refuses deliver" \
+    "$postmaster" deliver --project "$PROJECT_DIR" --once
+FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF=300,-5 refuses \
+    "retry: a negative backoff entry refuses deliver" \
+    "$postmaster" deliver --project "$PROJECT_DIR" --once
+
+# ============================================================
+printf '\n== retry: status lists pending retries ==\n'
+# ============================================================
+
+export FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF=100000,100000
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+
+st_mid1="$(send_msg '@carol' '@alice' 'status retry topic' 'first message' 8)"
+st_tid="$(thread_of "$st_mid1")"
+once
+finish_run alice 1
+once
+st_status="$("$postmaster" status 2>&1)"
+contains "status: pending retries section header" "$st_status" "pending retries:"
+contains "status: pending retry names the thread and agent" "$st_status" "$st_tid: agent=alice"
+
+unset FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF
+
+# ============================================================
 printf '\n== persistent workspace: --clone-dir path is stable across wakes ==\n'
 # ============================================================
 
