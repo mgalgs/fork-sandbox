@@ -5015,6 +5015,15 @@ contains "k8s case3: grant flags forwarded in file order" "$k3_joined" "$k3_expe
 
 # ---- case 4: endpoint -> --endpoint; a pi seat's thinking -> --pi-args ----
 
+# Fresh root: case3's own grant-topic reply (no explicit To:, so
+# reply-all to carol) is still an unrouted message at this point -- left
+# in place, this case's own `once` would route it too and wake carol (a
+# real local fleet seat) alongside kim, doubling counts like
+# --session-state's in the exact-count checks below.
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+
 : > "$STUB_ARGV_LOG"
 send_msg '@carol' '@kim' 'endpoint topic' 'hello kim' 8 >/dev/null
 once
