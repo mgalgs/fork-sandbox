@@ -1864,6 +1864,146 @@ else
         "rc=$coderep_rc: $coderep_out"
 fi
 
+printf '\n== every fix pass sees addenda delivered to an earlier pass ==\n'
+
+# A preset fix seat with repeat: 2, exercised end to end: the fix leg's
+# prompt used to be built ONCE and rerun for both passes, so an addendum
+# the operator sent while pass 1 was running never reached pass 2. Pass 2's
+# own prompt file, read straight off disk, is the observable here -- no
+# stub-side assertion needed, since fs_refresh_emit_addenda's whole point is
+# what lands in that file.
+addenda_stub="$(mktemp -d /var/tmp/claude-scratch/fs-review-fix-addenda.XXXXXX)"
+tmpdirs+=("$addenda_stub")
+cat > "$addenda_stub/claude-sandboxed" <<'STUB'
+#!/usr/bin/env bash
+set -uo pipefail
+is_pi_leg=0
+session_dir=""
+outbox=""
+prev=""
+for a in "$@"; do
+    [[ "$a" == "--exec" ]] && is_pi_leg=1
+    [[ "$prev" == "--session-dir" ]] && session_dir="$a"
+    [[ "$prev" == "--bind-rw" ]] && outbox="$a"
+    prev="$a"
+done
+clone_dir=""
+for a in "$@"; do
+    [[ -d "$a/.git" ]] && clone_dir="$a"
+done
+cat >/dev/null
+n=0
+[[ -f "$FAKE_COUNT_FILE" ]] && n="$(cat "$FAKE_COUNT_FILE")"
+n=$(( n + 1 ))
+printf '%s' "$n" > "$FAKE_COUNT_FILE"
+case "$n" in
+1)
+    # coder (pi): commit the work under review.
+    git -c user.email=t@fork-sandbox.invalid -c user.name=Tester \
+        -C "$clone_dir" commit --allow-empty -q -m "addenda-fix coder"
+    ;;
+2)
+    # reviewer (claude): findings, so a repeat: 2 fix leg runs.
+    printf 'FINDINGS\n\nfile.txt:1 not quite right\n\n## Report\nOne issue.\n' \
+        > "$clone_dir/.git/review-verdict.md"
+    ;;
+3)
+    # fix pass 1 (claude): commit, and -- mid-pass -- deliver an operator
+    # addendum straight into the run's own inbox, the same host-write
+    # fork-sandbox-say.sh would make. This stub bypasses bwrap entirely, so
+    # it can write there directly, the same trick fork-sandbox-refresh-
+    # test.sh's own stub uses.
+    git -c user.email=t@fork-sandbox.invalid -c user.name=Tester \
+        -C "$clone_dir" commit --allow-empty -q -m "addenda-fix pass 1"
+    if [[ -n "$outbox" ]]; then
+        run_dir_for_addendum="$(dirname "$outbox")"
+        if [[ -d "$run_dir_for_addendum/inbox" ]]; then
+            printf 'address the null check too\n' \
+                > "$run_dir_for_addendum/inbox/9999999900-01.md"
+        fi
+    fi
+    ;;
+4)
+    # fix pass 2 (claude): commit and finish clean. What this pass's own
+    # PROMPT carried is checked from the file on disk, after the run.
+    git -c user.email=t@fork-sandbox.invalid -c user.name=Tester \
+        -C "$clone_dir" commit --allow-empty -q -m "addenda-fix pass 2"
+    ;;
+esac
+if (( is_pi_leg )); then
+    mkdir -p "$session_dir"
+    printf '{"role":"assistant","stopReason":"stop","usage":{"input":100,"output":10,"cacheRead":0,"cacheWrite":0,"totalTokens":110,"cost":{"total":0.001}}}\n' \
+        > "$session_dir/session.jsonl"
+else
+    printf '{"type":"result","subtype":"success","total_cost_usd":0.01,"usage":{"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}\n'
+fi
+exit 0
+STUB
+chmod +x "$addenda_stub/claude-sandboxed"
+
+addenda_cfg="$(mktemp -d)"; tmpdirs+=("$addenda_cfg")
+install -m 600 /dev/null "$addenda_cfg/pi.env"
+printf 'OPENROUTER_API_KEY=fake\n' > "$addenda_cfg/pi.env"
+addenda_presets="$addenda_cfg/presets"
+mkdir -p "$addenda_presets"
+cat > "$addenda_presets/fixaddenda.yaml" <<'EOF'
+agents:
+  coder:
+    harness: pi/some-model
+  reviewer:
+    harness: claude
+    model: some-model
+  fixer:
+    harness: claude
+    model: some-model
+    repeat: 2
+pipeline:
+  - action: code
+    agent: coder
+  - action: review
+    repeat: 1
+    agent: reviewer
+    fix_agent: fixer
+EOF
+
+addenda_count="$(mktemp)"; tmpdirs+=("$addenda_count")
+addenda_out="$(HOME="$launcher_home" PATH="$addenda_stub:$real_stub:$PATH" \
+    FORK_SANDBOX_CONFIG_DIR="$addenda_cfg" FORK_SANDBOX_BACKEND=fake-image \
+    FAKE_COUNT_FILE="$addenda_count" \
+    timeout 60 "$launcher" --foreground --preset fixaddenda \
+    --branch "sandbox-test-fix-addenda-$$" "$proj" "$handoff" 2>&1)"
+addenda_rc=$?
+addenda_rd="$(printf '%s\n' "$addenda_out" | sed -n 's/^  run dir:  *//p' | head -1)"
+if [[ -n "$addenda_rd" ]]; then
+    tmpdirs+=("$addenda_rd")
+    fix_p1="$(find "$addenda_rd" -maxdepth 1 -name '*fix-prompt-1.md' 2>/dev/null | head -1)"
+    fix_p2="$(find "$addenda_rd" -maxdepth 1 -name '*fix-prompt-1-p2.md' 2>/dev/null | head -1)"
+    if [[ -n "$fix_p1" ]]; then
+        if grep -q 'Operator addenda delivered' "$fix_p1"; then
+            no "fix pass 1's own prompt carries no addenda (none existed yet when it was built)"
+        else
+            ok "fix pass 1's own prompt carries no addenda (none existed yet when it was built)"
+        fi
+    else
+        no "fix pass 1's own prompt carries no addenda (none existed yet when it was built)" \
+            "no fix-prompt-1.md found under $addenda_rd"
+    fi
+    if [[ -n "$fix_p2" ]]; then
+        contains "fix pass 2's prompt carries the addendum delivered during pass 1" \
+            "address the null check too" "$(cat "$fix_p2")"
+        contains "fix pass 2's prompt has the addenda heading" \
+            "## Operator addenda delivered to earlier legs of this run" "$(cat "$fix_p2")"
+    else
+        no "fix pass 2's prompt carries the addendum delivered during pass 1" \
+            "no fix-prompt-1-p2.md found under $addenda_rd"
+        no "fix pass 2's prompt has the addenda heading" \
+            "no fix-prompt-1-p2.md found under $addenda_rd"
+    fi
+else
+    no "a repeat: 2 fix seat produced a run directory" \
+        "rc=$addenda_rc: $addenda_out"
+fi
+
 printf '\n== fixture runs leave no handoff archives in the operator home ==\n'
 # Own-run-ids shape, not a before/after snapshot diff: a snapshot diff would
 # also catch a concurrent real run or another suite's fixtures archiving

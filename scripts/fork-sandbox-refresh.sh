@@ -137,6 +137,33 @@ fs_refresh_archive_inbox() {
     done
 }
 
+# Every addendum archived out of an earlier leg of THIS run, rendered as a
+# standalone section for a prompt that has no "original brief" of its own to
+# attach it to -- the fix and maintainer-fix prompts, which fs_refresh_
+# addenda_dirs' caller (fork-sandbox.sh) now builds fresh on every repeat
+# pass rather than once, so an addendum delivered mid-pass reaches every
+# later pass instead of only the one after it was archived. $1 record dir
+# (fs_refresh_addenda_dirs' own argument). Prints nothing when the run has
+# archived no addenda yet, so a caller can always append this call's output
+# unconditionally.
+fs_refresh_emit_addenda() {
+    local record_dir="$1" addenda_list d f
+    addenda_list="$(fs_refresh_addenda_dirs "$record_dir")"
+    [[ -n "$addenda_list" ]] || return 0
+    printf '\n---\n\n## Operator addenda delivered to earlier legs of this run\n\n'
+    printf 'The operator sent the messages below to an earlier leg of this run,\n'
+    printf 'oldest first. They carry the same authority as the brief this run was\n'
+    printf 'launched with and outrank it where the two conflict.\n'
+    while IFS= read -r d; do
+        [[ -n "$d" ]] || continue
+        for f in "$d"/*.md; do
+            [[ -f "$f" ]] || continue
+            printf '\n### %s\n\n' "${f##*/}"
+            cat -- "$f"
+        done
+    done <<< "$addenda_list"
+}
+
 # Build continuation <n>'s prompt. $1 continuation number (1 for the first
 # continuation, the count named in handoff-N.md and continuation-prompt-N.md),
 # $2 the hand-off, already moved to its record, $3 the destination path, $4

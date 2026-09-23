@@ -8797,33 +8797,43 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count && stop_requested != 1; cur
                         else
                             # The fix leg's prompt: the generated header
                             # (the fix seat's own, when a preset seated
-                            # one), then the verdict. Built as a file and
-                            # redirected -- the verdict has no size limit,
-                            # and one argv string is capped at 128KB.
+                            # one), then the verdict. The base name, unchanged
+                            # from before per-pass addenda existed; a repeat
+                            # pass N > 1 gets its own "$cur_fix_base-pN.md".
                             if [[ "$cur_kind" == maintainer ]]; then
-                                cur_fix_prompt="$run_dir/maintainer-fix-prompt-${cur_i}.md"
+                                cur_fix_base="$run_dir/maintainer-fix-prompt-${cur_i}"
                                 cur_fix_header="$fix_prompt_header"
                                 [[ -n "${fxm_fix_prompt_header:-}" ]] && cur_fix_header="$fxm_fix_prompt_header"
                             else
-                                cur_fix_prompt="$run_dir/fix-prompt-${cur_i}.md"
+                                cur_fix_base="$run_dir/fix-prompt-${cur_i}"
                                 cur_fix_header="$fix_prompt_header"
                                 [[ -n "${fxr_fix_prompt_header:-}" ]] && cur_fix_header="$fxr_fix_prompt_header"
                             fi
-                            { cat -- "$cur_fix_header"; printf '\n---\n\n'; awk '/^## Report$/ { exit } { print }' "$cur_copy"; } > "$cur_fix_prompt.part"
-                            mv -f "$cur_fix_prompt.part" "$cur_fix_prompt"
                             cur_fix_cost=null; cur_fix_known=1
                             # A fix agent with repeat: N runs the fix as N
-                            # passes on the same prompt -- distrust of a
-                            # cheap model's premature "done": there is no
-                            # early exit on a pass that looks finished;
-                            # only a harness error stops the passes. The
-                            # iteration records the LAST pass's exit, the
-                            # SUM of the passes' costs (null when any pass
-                            # went unpriced), and -- for a single pass --
-                            # its usage; multi-pass usage stays null, each
-                            # pass's own events file carrying the detail.
+                            # passes -- distrust of a cheap model's premature
+                            # "done": there is no early exit on a pass that
+                            # looks finished; only a harness error stops the
+                            # passes. The header and verdict are the same
+                            # every pass, but the prompt is BUILT fresh each
+                            # time (not once, reused): fs_refresh_emit_addenda
+                            # picks up whatever this run has archived as of
+                            # THIS pass, so an addendum the operator sends
+                            # mid-repeat reaches every pass after it arrived,
+                            # not just the immediate next one. The iteration
+                            # records the LAST pass's exit, the SUM of the
+                            # passes' costs (null when any pass went
+                            # unpriced), and -- for a single pass -- its
+                            # usage; multi-pass usage stays null, each pass's
+                            # own events file carrying the detail.
                             for ((cur_fix_pass = 1; cur_fix_pass <= cur_fix_repeat; cur_fix_pass++)); do
                                 cur_fix_leg="$cur_i"; (( cur_fix_pass > 1 )) && cur_fix_leg="$cur_i-p$cur_fix_pass"
+                                cur_fix_prompt="$cur_fix_base.md"
+                                (( cur_fix_pass > 1 )) && cur_fix_prompt="$cur_fix_base-p$cur_fix_pass.md"
+                                { cat -- "$cur_fix_header"; printf '\n---\n\n'; \
+                                  awk '/^## Report$/ { exit } { print }' "$cur_copy"; \
+                                  fs_refresh_emit_addenda "$run_dir"; } > "$cur_fix_prompt.part"
+                                mv -f "$cur_fix_prompt.part" "$cur_fix_prompt"
                                 run_leg "$cur_fix_kind" "$cur_fix_leg" "$cur_fix_prompt"
                                 cur_fix_exit="$leg_rc"
                                 if [[ -n "$leg_cost" ]]; then
@@ -8860,10 +8870,18 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count && stop_requested != 1; cur
                 elif [[ "$cur_line" == FINDINGS ]]; then
                     cur_findings="$(awk 'NR == 1 { next } /^## Report$/ { exit } /^[[:space:]]*$/ { if (hit) n++; hit = 0; next } /[^[:space:]:]+:[0-9]+/ { hit = 1 } END { if (hit) n++; print n + 0 }' "$cur_copy" 2>/dev/null)"
                     [[ "$cur_findings" =~ ^[0-9]+$ ]] || cur_findings=null
-                    cur_fix_prompt="$run_dir/${cur_step_idx}-fix-prompt-${cur_i}.md"; cur_fix_header_var="${cur_step_idx}fix_prompt_header"; { cat -- "${!cur_fix_header_var}"; printf '\n---\n\n'; awk '/^## Report$/ { exit } { print }' "$cur_copy"; } > "$cur_fix_prompt"
+                    # Base name unchanged; built fresh per pass, same reason
+                    # and same fs_refresh_emit_addenda call as the legacy
+                    # fix/maintainer-fix block above.
+                    cur_fix_base="$run_dir/${cur_step_idx}-fix-prompt-${cur_i}"; cur_fix_header_var="${cur_step_idx}fix_prompt_header"
                     cur_fix_cost=null; cur_fix_known=1
                     for ((cur_fix_pass = 1; cur_fix_pass <= cur_fix_repeat; cur_fix_pass++)); do
                         cur_fix_leg="$cur_i"; (( cur_fix_pass > 1 )) && cur_fix_leg="$cur_i-p$cur_fix_pass"
+                        cur_fix_prompt="$cur_fix_base.md"
+                        (( cur_fix_pass > 1 )) && cur_fix_prompt="$cur_fix_base-p$cur_fix_pass.md"
+                        { cat -- "${!cur_fix_header_var}"; printf '\n---\n\n'; \
+                          awk '/^## Report$/ { exit } { print }' "$cur_copy"; \
+                          fs_refresh_emit_addenda "$run_dir"; } > "$cur_fix_prompt"
                         run_leg fix "$cur_fix_leg" "$cur_fix_prompt" "$cur_step_idx"; cur_fix_exit="$leg_rc"
                         if [[ -n "$leg_cost" ]]; then
                             [[ "$cur_fix_cost" != null ]] && cur_fix_cost="$(jq -n --argjson a "$cur_fix_cost" --argjson b "$leg_cost" '$a + $b')" || cur_fix_cost="$leg_cost"
