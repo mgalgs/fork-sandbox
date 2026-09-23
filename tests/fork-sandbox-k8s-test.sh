@@ -4176,10 +4176,14 @@ pialg_run() {
     if [[ $# -gt 0 ]]; then
         PI_ARGS="$1" PI_ARGV_RECORD="$record" PATH="$stub_dir:$PATH" \
             MODEL="moonshotai/kimi-k3" mounts_dir="$mounts" work_dir="$work" \
+            SESSION_HARNESS_STORE="${PIALG_SESSION_HARNESS_STORE:-}" \
+            SESSION_ID="${PIALG_SESSION_ID:-}" session_store_dir="$work/session-store" \
             bash "$pialg_fn_file" >/dev/null
     else
         PI_ARGV_RECORD="$record" PATH="$stub_dir:$PATH" \
             MODEL="moonshotai/kimi-k3" mounts_dir="$mounts" work_dir="$work" \
+            SESSION_HARNESS_STORE="${PIALG_SESSION_HARNESS_STORE:-}" \
+            SESSION_ID="${PIALG_SESSION_ID:-}" session_store_dir="$work/session-store" \
             bash "$pialg_fn_file" >/dev/null
     fi
 }
@@ -4221,6 +4225,57 @@ for case_none in "none:$pialg_none" "empty:$pialg_empty"; do
             "record: $(printf '%s\n' "$pialg_case_val" | tr '\n' '|')"
     fi
 done
+
+# SESSION_HARNESS_STORE=1 (R3a section 4): run_pi_coding_leg appends
+# --session-dir/--session-id to the pi argv right after the base flags
+# and ahead of PI_ARGS -- coding leg only, since this function is never
+# called for a review-loop pi leg.
+PIALG_SESSION_HARNESS_STORE=1 PIALG_SESSION_ID=deadbeef-0000-0000-0000-000000000000 \
+    pialg_run
+pialg_sess="$(cat "$PIALG_RECORD")"
+# The literal work dir is only known inside pialg_run, so compare the
+# session-dir line by its own basename rather than the whole path.
+if [[ "$(printf '%s\n' "$pialg_sess" | head -n1)" == 11 ]] \
+    && [[ "$(printf '%s\n' "$pialg_sess" | sed -n '2,8p')" == "$pialg_base" ]] \
+    && [[ "$(printf '%s\n' "$pialg_sess" | sed -n '9p')" == "--session-dir" ]] \
+    && [[ "$(printf '%s\n' "$pialg_sess" | sed -n '10p')" == */session-store ]] \
+    && [[ "$(printf '%s\n' "$pialg_sess" | sed -n '11,12p')" == $'--session-id\ndeadbeef-0000-0000-0000-000000000000' ]]; then
+    ok "SESSION_HARNESS_STORE=1 appends --session-dir/--session-id to the pi coding leg's argv"
+else
+    no "SESSION_HARNESS_STORE=1 appends --session-dir/--session-id to the pi coding leg's argv" \
+        "record: $(printf '%s\n' "$pialg_sess" | tr '\n' '|')"
+fi
+PIALG_SESSION_HARNESS_STORE="" PIALG_SESSION_ID="" pialg_run
+pialg_nosess="$(cat "$PIALG_RECORD")"
+if [[ "$(printf '%s\n' "$pialg_nosess" | head -n1)" == 7 ]] \
+    && [[ "$(printf '%s\n' "$pialg_nosess" | tail -n +2)" == "$pialg_base" ]]; then
+    ok "an unset SESSION_HARNESS_STORE adds no session flags to the pi coding leg's argv"
+else
+    no "an unset SESSION_HARNESS_STORE adds no session flags to the pi coding leg's argv" \
+        "record: $(printf '%s\n' "$pialg_nosess" | tr '\n' '|')"
+fi
+PIALG_SESSION_HARNESS_STORE=1 pialg_run
+pialg_sess_noid="$(cat "$PIALG_RECORD")"
+if [[ "$(printf '%s\n' "$pialg_sess_noid" | head -n1)" == 9 ]] \
+    && [[ "$(printf '%s\n' "$pialg_sess_noid" | sed -n '2,8p')" == "$pialg_base" ]] \
+    && [[ "$(printf '%s\n' "$pialg_sess_noid" | sed -n '9p')" == "--session-dir" ]] \
+    && ! printf '%s\n' "$pialg_sess_noid" | grep -qxF -- '--session-id'; then
+    ok "SESSION_HARNESS_STORE=1 with no SESSION_ID adds --session-dir but no --session-id"
+else
+    no "SESSION_HARNESS_STORE=1 with no SESSION_ID adds --session-dir but no --session-id" \
+        "record: $(printf '%s\n' "$pialg_sess_noid" | tr '\n' '|')"
+fi
+PIALG_SESSION_HARNESS_STORE="" PIALG_SESSION_ID=""
+# run_pi_coding_leg (used by the coding leg only) is the sole caller of
+# --session-dir/--session-id in the entrypoint -- review-loop.sh, the
+# review/fix legs' own control flow, is a separate script this function
+# never touches, so those legs get no session flags by construction.
+if [[ "$(grep -c -- '--session-dir' "$entrypoint_sh")" == 1 ]]; then
+    ok "the entrypoint names --session-dir exactly once, inside run_pi_coding_leg (coding leg only)"
+else
+    no "the entrypoint names --session-dir exactly once, inside run_pi_coding_leg (coding leg only)" \
+        "$(grep -n -- '--session-dir' "$entrypoint_sh")"
+fi
 
 # An unsafe character in the value is refused at parse time -- and the
 # refusal is before any Job, Secret or proxy Pod exists. Proven against a
@@ -8835,6 +8890,170 @@ if [[ -z "$claude_launch_missing" ]]; then
 else
     no "entrypoint's claude launch line carries every required flag/env/redirect" \
         "$claude_launch_missing"
+fi
+
+printf '\n== entrypoint: claude coding leg keeps its conversation (R3a section 4) ==\n'
+# RESUME_FAIL_RE must match claude-sandboxed's own copy literally -- the
+# entrypoint splits it across three assignments to stay under the
+# ConfigMap-embedded YAML's line-length limit, so reconstruct it before
+# comparing.
+claude_sandboxed_sh="$repo_dir/scripts/claude-sandboxed"
+ep_resume_re="$(awk -F"'" '/^ *RESUME_FAIL_RE\+?=/{printf "%s", $2}' "$entrypoint_sh")"
+cs_resume_re="$(awk -F"'" '/^RESUME_FAIL_RE=/{printf "%s", $2}' "$claude_sandboxed_sh")"
+if [[ -n "$ep_resume_re" && "$ep_resume_re" == "$cs_resume_re" ]]; then
+    ok "the entrypoint's RESUME_FAIL_RE (reassembled) matches claude-sandboxed's literally"
+else
+    no "the entrypoint's RESUME_FAIL_RE (reassembled) matches claude-sandboxed's literally" \
+        "entrypoint: $ep_resume_re | claude-sandboxed: $cs_resume_re"
+fi
+
+# The claude coding-leg block: the pi_rc=0 .. fi span that decides
+# HARNESS, and for HARNESS=claude seeds/resumes/snapshots the session
+# store. Extracted and run standalone against a stubbed claude, the same
+# function-extraction technique this suite uses for discover_model_facts
+# and run_pi_coding_leg -- this one is an if/else rather than a function
+# because that is how the entrypoint itself is shaped, so the sed range
+# is anchored on the unindented "fi" that closes it (every "fi" for a
+# block nested inside it is itself indented).
+claude_block="$(sed -n '/^pi_rc=0$/,/^fi$/p' "$entrypoint_sh")"
+claude_block_file="$(newdir)/claude-block.sh"; tmpdirs+=("$(dirname "$claude_block_file")")
+if [[ -n "$claude_block" ]]; then
+    printf '%s\n' 'set -euo pipefail' "$claude_block" \
+        'printf "CLAUDE_BLOCK_PI_RC=%s\n" "$pi_rc"' > "$claude_block_file"
+    ok "the claude coding-leg block (pi_rc=0..fi) is isolable in the entrypoint"
+else
+    no "the claude coding-leg block (pi_rc=0..fi) is isolable in the entrypoint" \
+        "block not found in $entrypoint_sh"
+fi
+
+# $1 = CLAUDE_STUB_MODE (ok|resume-fail|other-fail), $2 = RESUME_SESSION
+# (empty for none), $3 = a shell snippet run to pre-seed $CLAUDE_BLOCK_HOME
+# or $CLAUDE_BLOCK_STORE before the block runs (empty for none). Sets
+# CLAUDE_BLOCK_HOME/_STORE/_CLONE/_RECORD/_OUT/_PI_RC/_CALLS after running.
+claude_block_run() {
+    local stub_dir mounts work home store clone record
+    stub_dir="$(newdir)"; tmpdirs+=("$stub_dir")
+    mounts="$(newdir)"; tmpdirs+=("$mounts")
+    work="$(newdir)"; tmpdirs+=("$work")
+    home="$(newdir)"; tmpdirs+=("$home")
+    record="$(newdir)/claude-argv.txt"; tmpdirs+=("$(dirname "$record")")
+    : > "$record"
+    store="$work/session-store"
+    clone="$work/clone"
+    mkdir -p "$work/inbox" "$store"
+    printf 'Do the thing.\n' > "$mounts/handoff.md"
+    printf '{}' > "$mounts/claude-credentials.json"
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$mounts/inbox-hook.sh"
+    printf '%s\n' '#!/usr/bin/env bash' \
+        'printf "%s\n" "$*" >> "$CLAUDE_STUB_RECORD"' \
+        'case "$CLAUDE_STUB_MODE" in' \
+        '  resume-fail)' \
+        '    if printf "%s" "$*" | grep -q -- "--resume"; then' \
+        '      echo "No conversation found with session ID: abc" >&2' \
+        '      exit 1' \
+        '    fi' \
+        '    exit 0 ;;' \
+        '  other-fail)' \
+        '    echo "some other unrelated error" >&2' \
+        '    exit 1 ;;' \
+        '  *) exit 0 ;;' \
+        'esac' > "$stub_dir/claude"
+    chmod +x "$stub_dir/claude"
+    CLAUDE_BLOCK_HOME="$home"
+    CLAUDE_BLOCK_STORE="$store"
+    CLAUDE_BLOCK_CLONE="$clone"
+    CLAUDE_BLOCK_RECORD="$record"
+    if [[ -n "${3:-}" ]]; then eval "$3"; fi
+    CLAUDE_BLOCK_OUT="$(PATH="$stub_dir:$PATH" HOME="$home" \
+        HARNESS=claude MODEL="claude-test-model" \
+        CLAUDE_PROXY_BASE_URL="http://fs-k8s-test-proxy.invalid" \
+        mounts_dir="$mounts" work_dir="$work" clone_dir="$clone" inbox_dir="$work/inbox" \
+        session_store_dir="$store" \
+        SESSION_HARNESS_STORE=1 RESUME_SESSION="${2:-}" \
+        CLAUDE_STUB_MODE="${1:-ok}" CLAUDE_STUB_RECORD="$record" \
+        bash "$claude_block_file" 2>&1)"
+    CLAUDE_BLOCK_PI_RC="$(grep -o 'CLAUDE_BLOCK_PI_RC=.*' <<<"$CLAUDE_BLOCK_OUT" | tail -1 | cut -d= -f2)"
+    CLAUDE_BLOCK_CALLS="$(wc -l < "$record")"
+}
+
+# Resume flag passed when RESUME_SESSION is set.
+claude_block_run ok resumeid-0001-aaaa-bbbb-cccccccccccc
+if grep -qF -- '--resume resumeid-0001-aaaa-bbbb-cccccccccccc' "$CLAUDE_BLOCK_RECORD" \
+    && [[ "$CLAUDE_BLOCK_PI_RC" == 0 ]] && [[ "$CLAUDE_BLOCK_CALLS" == 1 ]]; then
+    ok "the claude coding leg passes --resume when RESUME_SESSION is set"
+else
+    no "the claude coding leg passes --resume when RESUME_SESSION is set" \
+        "record: $(cat "$CLAUDE_BLOCK_RECORD") pi_rc=$CLAUDE_BLOCK_PI_RC out=$CLAUDE_BLOCK_OUT"
+fi
+
+# A resume-shaped failure retries once, fresh (no --resume on the retry),
+# and the retry's own success is what pi_rc reports.
+claude_block_run resume-fail resumeid-0001-aaaa-bbbb-cccccccccccc
+if [[ "$CLAUDE_BLOCK_CALLS" == 2 ]] \
+    && [[ "$(sed -n 1p "$CLAUDE_BLOCK_RECORD")" == *"--resume resumeid-0001-aaaa-bbbb-cccccccccccc"* ]] \
+    && [[ "$(sed -n 2p "$CLAUDE_BLOCK_RECORD")" != *"--resume"* ]] \
+    && [[ "$CLAUDE_BLOCK_PI_RC" == 0 ]]; then
+    ok "a resume-shaped claude failure retries once, fresh, and the retry's exit code wins"
+else
+    no "a resume-shaped claude failure retries once, fresh, and the retry's exit code wins" \
+        "calls=$CLAUDE_BLOCK_CALLS record: $(cat "$CLAUDE_BLOCK_RECORD") pi_rc=$CLAUDE_BLOCK_PI_RC"
+fi
+
+# A failure that does NOT match RESUME_FAIL_RE is the run's own -- no retry.
+claude_block_run other-fail resumeid-0001-aaaa-bbbb-cccccccccccc
+if [[ "$CLAUDE_BLOCK_CALLS" == 1 ]] && [[ "$CLAUDE_BLOCK_PI_RC" != 0 ]]; then
+    ok "a non-resume-shaped claude failure is not retried"
+else
+    no "a non-resume-shaped claude failure is not retried" \
+        "calls=$CLAUDE_BLOCK_CALLS record: $(cat "$CLAUDE_BLOCK_RECORD") pi_rc=$CLAUDE_BLOCK_PI_RC"
+fi
+
+# No RESUME_SESSION at all: no --resume on the one and only attempt.
+claude_block_run ok ""
+if [[ "$CLAUDE_BLOCK_CALLS" == 1 ]] \
+    && ! grep -qF -- '--resume' "$CLAUDE_BLOCK_RECORD" \
+    && [[ "$CLAUDE_BLOCK_PI_RC" == 0 ]]; then
+    ok "no RESUME_SESSION means no --resume and a single attempt"
+else
+    no "no RESUME_SESSION means no --resume and a single attempt" \
+        "calls=$CLAUDE_BLOCK_CALLS record: $(cat "$CLAUDE_BLOCK_RECORD") pi_rc=$CLAUDE_BLOCK_PI_RC"
+fi
+
+# Flatten: a transcript pulled in under a FOREIGN slug directory is also
+# copied into THIS pod's own slug directory (cwd with "/" -> "-"), with
+# its original mtime kept -- the newest-mtime discovery rule depends on
+# that mtime surviving the copy. The original under the foreign slug is
+# left in place too.
+claude_block_run ok "" '
+    mkdir -p "$CLAUDE_BLOCK_STORE/-some-other-slug"
+    printf "{}\n" > "$CLAUDE_BLOCK_STORE/-some-other-slug/foreign-transcript.jsonl"
+    touch -d "2020-01-01T00:00:00Z" "$CLAUDE_BLOCK_STORE/-some-other-slug/foreign-transcript.jsonl"
+'
+pod_slug="${CLAUDE_BLOCK_CLONE//\//-}"
+flatten_src="$CLAUDE_BLOCK_HOME/.claude/projects/-some-other-slug/foreign-transcript.jsonl"
+flatten_dst="$CLAUDE_BLOCK_HOME/.claude/projects/$pod_slug/foreign-transcript.jsonl"
+if [[ -f "$flatten_src" ]] && [[ -f "$flatten_dst" ]] \
+    && [[ "$(stat -c '%Y' -- "$flatten_src")" == 1577836800 ]] \
+    && [[ "$(stat -c '%Y' -- "$flatten_dst")" == 1577836800 ]]; then
+    ok "a foreign-slug transcript is flattened into this pod's own slug directory, mtime kept"
+else
+    no "a foreign-slug transcript is flattened into this pod's own slug directory, mtime kept" \
+        "src=$([[ -f "$flatten_src" ]] && echo present || echo missing) dst=$([[ -f "$flatten_dst" ]] && echo present || echo missing) out=$CLAUDE_BLOCK_OUT"
+fi
+
+# Snapshot: the block copies ~/.claude/projects into the store BEFORE
+# returning, so a "reviewer" write into ~/.claude/projects that happens
+# only AFTER the block has finished (as review-loop.sh's own claude/pi
+# legs would, sharing the same $HOME) must never appear in the store --
+# it is a point-in-time copy, not a live link.
+claude_block_run ok ""
+mkdir -p "$CLAUDE_BLOCK_HOME/.claude/projects/-work-clone"
+printf '{"reviewer":true}\n' > "$CLAUDE_BLOCK_HOME/.claude/projects/-work-clone/reviewer-transcript.jsonl"
+if ! find "$CLAUDE_BLOCK_STORE" -name 'reviewer-transcript.jsonl' | grep -q .; then
+    ok "a post-block ~/.claude/projects write (simulating the review loop) never appears in the store"
+else
+    no "a post-block ~/.claude/projects write (simulating the review loop) never appears in the store" \
+        "found reviewer-transcript.jsonl under $CLAUDE_BLOCK_STORE"
 fi
 
 # The review loop always runs pi and always prefers REVIEW_MODEL over

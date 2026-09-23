@@ -136,6 +136,20 @@
 #                   not source that file. Set by fork-sandbox-k8s.sh's
 #                   `submit` to the effective value (default, or raised by
 #                   --outbox-max).
+#   SESSION_HARNESS_STORE
+#                   set to 1 by fork-sandbox-k8s.sh's `submit` when it
+#                   pushed a --session-state store into the pod at
+#                   /work/session-store, so this script keeps one
+#                   conversation across wakes the same way a local
+#                   --session-state run does. Unset means today's
+#                   behaviour: no seed, no resume, no snapshot.
+#   RESUME_SESSION  the claude session id to resume, when HARNESS=claude
+#                   and SESSION_HARNESS_STORE=1. Optional even then -- a
+#                   first wake on a thread has no prior transcript to
+#                   resume and starts fresh.
+#   SESSION_ID      the pi session id for the coding leg's --session-id,
+#                   when HARNESS=pi and SESSION_HARNESS_STORE=1. Optional
+#                   even then, same reason as RESUME_SESSION.
 #
 # Reads from /mnt/fork-sandbox/ (the scripts ConfigMap, mounted read-only):
 #   handoff.md              the run's whole prompt, on the coding harness's
@@ -206,6 +220,9 @@ fi
 : "${REVIEW_LOOP_CAP:=0}"
 : "${REVIEW_MODEL:=}"
 : "${OUTBOX_MAX_BYTES:=67108864}"  # must match FS_OUTBOX_MAX_BYTES in fork-sandbox-lib.sh
+: "${SESSION_HARNESS_STORE:=}"
+: "${RESUME_SESSION:=}"
+: "${SESSION_ID:=}"
 if [[ "$REVIEW_LOOP_CAP" =~ ^[1-9][0-9]*$ ]]; then
     : "${BASE_SHA:?BASE_SHA must be set when REVIEW_LOOP_CAP is set}"
     if [[ "$HARNESS" == claude && -z "$REVIEW_MODEL" ]]; then
@@ -477,6 +494,10 @@ mounts_dir=/mnt/fork-sandbox
 work_dir=/work
 repo_bare="$work_dir/repo.git"
 clone_dir="$work_dir/clone"
+# Literal path, not a shared constant: this script and fork-sandbox-k8s.sh
+# (where the host-side push/pull lives) have no constants file between
+# them, so both sides simply agree on /work/session-store by convention.
+session_store_dir="$work_dir/session-store"
 inbox_dir="$work_dir/inbox"
 outbox_dir="$work_dir/outbox"
 skill_dir="$work_dir/skills/code-review-portable"
@@ -703,6 +724,17 @@ synthesize_pi_config() {
 run_pi_coding_leg() {
     local -a pi_argv=(pi --provider proxy --model "$MODEL" --mode json -p)
     local -a pi_extra_argv=()
+    # The durable session store, coding leg only -- matches the local
+    # sandbox's own gate (only the coding/continuation leg binds
+    # --session-state; review, fix and maintainer legs never do), so a pi
+    # seat resumes the same conversation across wakes without a review
+    # leg's own turns landing in it.
+    if [[ "$SESSION_HARNESS_STORE" == 1 ]]; then
+        pi_argv+=(--session-dir "$session_store_dir")
+        if [[ -n "$SESSION_ID" ]]; then
+            pi_argv+=(--session-id "$SESSION_ID")
+        fi
+    fi
     if [[ -n "$PI_ARGS" ]]; then
         read -r -a pi_extra_argv <<< "$PI_ARGS"
     fi
@@ -767,19 +799,92 @@ else
         },
     }' > "$work_dir/inbox-settings.json"
 
+    # The durable session store, seeded into this pod's own ~/.claude
+    # before the claude call so --resume below can find the transcript it
+    # names. Pulled in whole (every project's transcripts, not just this
+    # one) because the pod's own cwd-derived slug may not be the slug the
+    # transcript was written under on a PRIOR pod -- see the flatten step
+    # right after.
+    claude_argv=(claude --dangerously-skip-permissions --print --verbose
+        --output-format stream-json --model "$MODEL"
+        --settings "$work_dir/inbox-settings.json" --include-hook-events)
+    if [[ "$SESSION_HARNESS_STORE" == 1 ]]; then
+        echo "fork-sandbox-k8s-entrypoint: seeding the claude session store" >&2
+        mkdir -p "$HOME/.claude/projects"
+        if [[ -d "$session_store_dir" ]]; then
+            cp -a "$session_store_dir/." "$HOME/.claude/projects/"
+        fi
+        # claude looks up a --resume id inside the CURRENT project's own
+        # slug directory (cwd with every "/" replaced by "-"), so a
+        # transcript that landed here under a different cwd's slug would
+        # not be found. Flatten every transcript into this run's slug
+        # directory too, keeping the original in place -- cp -p keeps its
+        # mtime, which fs_session_discover_id's newest-mtime rule depends
+        # on to find the right one back on the host.
+        pod_slug="${clone_dir//\//-}"
+        mkdir -p "$HOME/.claude/projects/$pod_slug"
+        while IFS= read -r -d '' transcript_file; do
+            case "$transcript_file" in
+                "$HOME/.claude/projects/$pod_slug/"*) continue ;;
+            esac
+            cp -p "$transcript_file" "$HOME/.claude/projects/$pod_slug/"
+        done < <(find "$HOME/.claude/projects" -maxdepth 2 -name '*.jsonl' \
+            -type f -print0 2>/dev/null)
+    fi
+
+    # The fresh form is kept whether or not a resume was asked for: it is
+    # what the retry below falls back to. Built the same way
+    # claude-sandboxed builds its own TARGET_CMD/TARGET_CMD_FRESH pair.
+    claude_argv_fresh=("${claude_argv[@]}")
+    if [[ -n "$RESUME_SESSION" ]]; then
+        claude_argv=("${claude_argv[0]}" --resume "$RESUME_SESSION" "${claude_argv[@]:1}")
+    fi
+
+    run_claude_attempt() {
+        ANTHROPIC_BASE_URL="$CLAUDE_PROXY_BASE_URL" \
+            CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
+            DISABLE_AUTOUPDATER=1 \
+            TERM=dumb \
+            "${claude_argv[@]}" \
+            < "$mounts_dir/handoff.md" \
+            > "$work_dir/events.jsonl" \
+            2> "$work_dir/claude-stderr.log"
+    }
+
     echo "fork-sandbox-k8s-entrypoint: running claude" >&2
-    ANTHROPIC_BASE_URL="$CLAUDE_PROXY_BASE_URL" \
-        CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
-        DISABLE_AUTOUPDATER=1 \
-        TERM=dumb \
-        claude --dangerously-skip-permissions --print --verbose \
-            --output-format stream-json --model "$MODEL" \
-            --settings "$work_dir/inbox-settings.json" --include-hook-events \
-        < "$mounts_dir/handoff.md" \
-        > "$work_dir/events.jsonl" \
-        2> "$work_dir/claude-stderr.log" \
-        || pi_rc=$?
+    run_claude_attempt || pi_rc=$?
     echo "fork-sandbox-k8s-entrypoint: claude exited $pi_rc" >&2
+
+    # What stderr has to say for a failure to count as "the resume did not
+    # work" rather than "the work did not work" -- must match
+    # claude-sandboxed RESUME_FAIL_RE literally, copied from there.
+    # Deliberately narrow: a false positive here reruns a session that
+    # already did its work, at full price.
+    RESUME_FAIL_RE='no conversation found with session id:'
+    RESUME_FAIL_RE+='|corrupt.*(session|transcript|conversation)'
+    RESUME_FAIL_RE+='|failed to (load|parse|read).*(session|transcript|conversation)'
+    if [[ -n "$RESUME_SESSION" ]] && (( pi_rc != 0 )) \
+        && grep -qiE "$RESUME_FAIL_RE" "$work_dir/claude-stderr.log"; then
+        echo "fork-sandbox-k8s-entrypoint: resume failed ($RESUME_SESSION)," >&2
+        echo "fork-sandbox-k8s-entrypoint: retrying fresh" >&2
+        claude_argv=("${claude_argv_fresh[@]}")
+        pi_rc=0
+        run_claude_attempt || pi_rc=$?
+        echo "fork-sandbox-k8s-entrypoint: claude exited $pi_rc" >&2
+    fi
+
+    if [[ "$SESSION_HARNESS_STORE" == 1 ]]; then
+        # THE TRAP THIS DESIGN EXISTS FOR: the review loop below, when
+        # there is one, shares this same $HOME, so its own claude/pi legs
+        # would write newer transcripts into ~/.claude/projects. Snapshot
+        # right after the coding leg -- before commit_uncommitted_work and
+        # before the review loop -- so cmd_collect's pull (which reads
+        # only /work/session-store) carries the CODING leg's conversation,
+        # never a reviewer's.
+        echo "fork-sandbox-k8s-entrypoint: snapshotting the claude session store" >&2
+        rm -rf "$session_store_dir"
+        cp -a "$HOME/.claude/projects" "$session_store_dir"
+    fi
 fi
 
 commit_uncommitted_work "coding leg"
