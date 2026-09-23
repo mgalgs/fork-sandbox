@@ -266,5 +266,33 @@ contains "a bad --refresh-max is refused" "Error: --refresh-max takes a non-nega
 contains "--refresh-max with --refresh-at 0 is refused" "Error: --refresh-max requires --refresh-at" \
     "$(resolve claude 0 true 2 m)"
 
+printf '\n== fs_refresh_warn_brief (fork-sandbox-lib.sh) ==\n'
+warn_brief() {
+    (
+        # shellcheck source=../scripts/fork-sandbox-lib.sh
+        # shellcheck disable=SC1091  # plain shellcheck cannot follow it; use -x
+        source "$repo_dir/scripts/fork-sandbox-lib.sh"
+        fs_refresh_warn_brief "$@"
+    )
+}
+t="$(new_tmp)"
+# 1000 bytes, threshold 1000: bytes >= threshold, so it warns.
+head -c 1000 /dev/zero | tr '\0' 'x' > "$t/big.md"
+out="$(warn_brief "$t/big.md" 1000)"
+contains "a brief at the threshold's byte count warns" \
+    "this brief is 1000 bytes" "$out"
+contains "the warning names the threshold" \
+    "1000-token --refresh-at threshold" "$out"
+contains "the warning names a [1m] model as one fix" "[1m]" "$out"
+contains "the warning names --refresh-at in tokens as the other fix" \
+    "--refresh-at <tokens>" "$out"
+# 999 bytes, threshold 1000: just under, so it stays quiet.
+head -c 999 /dev/zero | tr '\0' 'x' > "$t/small.md"
+check "a brief just under the threshold's byte count is quiet" \
+    "" "$(warn_brief "$t/small.md" 1000)"
+check "a missing brief file is quiet" "" "$(warn_brief "$t/nonexistent.md" 1000)"
+check "a non-numeric threshold is quiet" "" "$(warn_brief "$t/big.md" abc)"
+check "an empty threshold is quiet" "" "$(warn_brief "$t/big.md" "")"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))

@@ -991,6 +991,43 @@ if [[ -n "$rd" ]]; then
         "0" "$(jq '.continuations | length' "$rd/summary.json" 2>/dev/null)"
 fi
 
+# -- a large brief warns at launch, before any leg runs: byte count >= the
+# token threshold (roughly a quarter of it or more, at ~4 bytes/token).
+# --refresh-at 100 (above 1, so an absolute token count, not a fraction)
+# keeps the fixture brief small. Not run through run_real: that helper
+# always writes its own fixed 'do the task' handoff, too small to trigger
+# this, so this launches directly with a custom one instead.
+big_handoff_dir="$(mktemp -d /var/tmp/claude-scratch/fs-refresh-warn.XXXXXX)"; tmpdirs+=("$big_handoff_dir")
+big_handoff="$big_handoff_dir/handoff.md"
+head -c 200 /dev/zero | tr '\0' 'x' > "$big_handoff"
+count_file="$(mktemp)"; tmpdirs+=("$count_file")
+out="$(HOME="$launcher_home" PATH="$stub_bin:$PATH" \
+    FAKE_CLAUDE_COUNT_FILE="$count_file" \
+    timeout 60 "$launcher" --foreground --harness claude --refresh-at 100 \
+    "$proj" "$big_handoff" 2>&1)"
+rd="$(printf '%s\n' "$out" | sed -n 's/^  run dir:  *//p' | head -1)"
+[[ -n "$rd" ]] && tmpdirs+=("$rd")
+contains "a large brief warns at launch" "this brief is 200 bytes" "$out"
+contains "the launch warning names the threshold" \
+    "100-token --refresh-at threshold" "$out"
+
+# -- a small brief, same threshold: no warning at all.
+small_handoff_dir="$(mktemp -d /var/tmp/claude-scratch/fs-refresh-warn.XXXXXX)"; tmpdirs+=("$small_handoff_dir")
+small_handoff="$small_handoff_dir/handoff.md"
+printf 'do the task\n' > "$small_handoff"
+count_file="$(mktemp)"; tmpdirs+=("$count_file")
+out="$(HOME="$launcher_home" PATH="$stub_bin:$PATH" \
+    FAKE_CLAUDE_COUNT_FILE="$count_file" \
+    timeout 60 "$launcher" --foreground --harness claude --refresh-at 100 \
+    "$proj" "$small_handoff" 2>&1)"
+rd="$(printf '%s\n' "$out" | sed -n 's/^  run dir:  *//p' | head -1)"
+[[ -n "$rd" ]] && tmpdirs+=("$rd")
+if grep -q 'this brief is' <<< "$out"; then
+    no "a small brief triggers no launch warning"
+else
+    ok "a small brief triggers no launch warning"
+fi
+
 # -- harness refusal, no stub needed: fails during flag validation, before
 # any clone or run directory exists.
 if HOME="$launcher_home" PATH="$stub_bin:$PATH" "$launcher" --harness pi --model demo/model \

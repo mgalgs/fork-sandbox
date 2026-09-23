@@ -2938,3 +2938,33 @@ fs_refresh_resolve() {
     fi
     return 0
 }
+
+# Usage: fs_refresh_warn_brief <brief-file> <threshold-tokens>
+#
+# A large brief eats most of a leg's own working budget before it does any
+# work at all: a 188 KB (~47k-token) brief against a 100k-token threshold
+# left six continuations in a row spending most of their budget on setup and
+# nudging with zero commits made. Advisory only -- never refuses the run.
+#
+# Prints ONE multi-line warning to STDOUT (not stderr: the caller decides
+# where the text goes -- a terminal, a log, both) when the brief alone is
+# already roughly a quarter or more of the threshold, at ~4 bytes per token
+# -- i.e. its byte count is >= the token threshold itself, so no fraction
+# math is needed to test it. Prints nothing and returns 0 when the brief is
+# missing, the threshold is not a plain integer, or the brief is small
+# enough that this does not apply.
+fs_refresh_warn_brief() {
+    local brief_file="$1" threshold_tokens="$2" bytes approx_tokens
+    [[ -f "$brief_file" && "$threshold_tokens" =~ ^[0-9]+$ ]] || return 0
+    bytes="$(wc -c < "$brief_file" 2>/dev/null || printf 0)"
+    [[ "$bytes" =~ ^[0-9]+$ ]] || return 0
+    (( bytes >= threshold_tokens )) || return 0
+    approx_tokens=$(( bytes / 4 ))
+    printf 'fork-sandbox: this brief is %s bytes (roughly %s tokens), already a\n' \
+        "$bytes" "$approx_tokens"
+    printf 'quarter or more of the %s-token --refresh-at threshold -- every leg\n' \
+        "$threshold_tokens"
+    printf 'will spend a large share of its own budget just reading it. Consider\n'
+    printf 'a "[1m]" model for a bigger context window, or a larger\n'
+    printf '"--refresh-at <tokens>" given as an absolute token count.\n'
+}

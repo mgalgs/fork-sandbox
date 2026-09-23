@@ -5506,6 +5506,21 @@ if (( refresh_enabled )); then
     fs_reject_unsafe_chars "$handoff_original"
     cat -- "$handoff_file" > "$handoff_original.part"
     mv -- "$handoff_original.part" "$handoff_original"
+    # Advisory only: a brief that is already a large share of a leg's own
+    # working budget is the single biggest cause of a chain that nudges
+    # repeatedly and commits nothing -- see fs_refresh_warn_brief's own
+    # comment. Printed here, at launch, so it is seen before any leg runs;
+    # also appended to sandbox.log when that file already exists so it
+    # survives in the run's own record, not just the launching terminal.
+    brief_warning="$(fs_refresh_warn_brief "$handoff_original" "$refresh_threshold_tokens")"
+    if [[ -n "$brief_warning" ]]; then
+        printf '%s\n' "$brief_warning" >&2
+        # sandbox_log (set later, once the clone exists) is not in scope
+        # yet this early -- checked by its eventual literal path instead, so
+        # a rerun that somehow already has one still gets the line appended.
+        [[ -f "$run_dir/sandbox.log" ]] && printf '%s\n' "$brief_warning" \
+            >> "$run_dir/sandbox.log"
+    fi
 fi
 
 # fs_emit_prompt_preamble (fork-sandbox-lib.sh) takes its network argument

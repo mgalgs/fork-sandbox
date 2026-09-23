@@ -3685,6 +3685,28 @@ check "--refresh-at 150000: REFRESH_THRESHOLD_TOKENS" "150000" \
 check "--refresh-max 3: REFRESH_MAX" "3" "$(refresh_env_val REFRESH_MAX "$refresh_tok_out")"
 check "--refresh-at 150000: REFRESH_CEILING_TOKENS still 160000 (window-based)" "160000" \
     "$(refresh_env_val REFRESH_CEILING_TOKENS "$refresh_tok_out")"
+
+# A brief that is already a large share of a leg's own working budget warns
+# at submit time too, same rule and same fs_refresh_warn_brief helper as the
+# local runner's --dry-run still runs far enough to reach this check.
+big_brief_handoff="$(newdir)/big-handoff.md"; tmpdirs+=("$(dirname "$big_brief_handoff")")
+head -c 200 /dev/zero | tr '\0' 'x' > "$big_brief_handoff"
+big_brief_out="$(HOME="$claude_home" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" \
+    submit --dry-run --branch fs-k8s-test-branch --model claude-sonnet-5 \
+    --harness claude --refresh-at 100 "$proj_dir" "$big_brief_handoff" 2>&1)"
+contains "submit warns at launch for a large brief" \
+    "this brief is 200 bytes" "$big_brief_out"
+contains "submit's large-brief warning names the threshold" \
+    "100-token --refresh-at threshold" "$big_brief_out"
+small_brief_out="$(HOME="$claude_home" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" \
+    submit --dry-run --branch fs-k8s-test-branch --model claude-sonnet-5 \
+    --harness claude --refresh-at 100 "$proj_dir" "$handoff_file" 2>&1)"
+if grep -q 'this brief is' <<< "$small_brief_out"; then
+    no "submit triggers no large-brief warning for a small brief"
+else
+    ok "submit triggers no large-brief warning for a small brief"
+fi
+
 refuses "pi + --refresh-at is refused with the local message" \
     "Error: --refresh-at only works with --harness claude" \
     env HOME="$claude_home" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \

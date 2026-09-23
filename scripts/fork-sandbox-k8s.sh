@@ -3865,6 +3865,14 @@ cmd_submit() {
         echo "whole prompt." >&2
         exit 1
     fi
+    # Advisory only, same rule as the local runner's: a brief that already
+    # eats a large share of a leg's own working budget is the single
+    # biggest cause of a chain that nudges repeatedly and commits nothing.
+    if (( refresh_enabled )); then
+        local brief_warning
+        brief_warning="$(fs_refresh_warn_brief "$handoff_file" "$refresh_threshold_tokens")"
+        [[ -n "$brief_warning" ]] && printf '%s\n' "$brief_warning" >&2
+    fi
 
     if [[ -z "$K8S_IMAGE" ]]; then
         echo "Error: K8S_IMAGE is not set in $k8s_env. This project ships a" >&2
