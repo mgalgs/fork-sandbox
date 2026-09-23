@@ -6104,6 +6104,16 @@ case " $* " in
         fi
         [[ -n "${K8S_STUB_OUTBOX_STDERR:-}" ]] && printf '%s' "$K8S_STUB_OUTBOX_STDERR" >&2
         exit "${K8S_STUB_OUTBOX_RC:-1}" ;;
+    *" tar cf - -C /work/session-store "*)
+        # Same trick as the outbox arm above, for the session-store pull:
+        # serve K8S_STUB_SESSION_DIR's contents whenever it is set,
+        # independently of the exit status, so a test can pair a fixture
+        # with a non-zero rc to simulate an EPIPE-under-cap read.
+        if [[ -n "${K8S_STUB_SESSION_DIR:-}" ]]; then
+            ( cd "$K8S_STUB_SESSION_DIR" && tar cf - . ) || true
+        fi
+        [[ -n "${K8S_STUB_SESSION_STDERR:-}" ]] && printf '%s' "$K8S_STUB_SESSION_STDERR" >&2
+        exit "${K8S_STUB_SESSION_RC:-1}" ;;
     *" delete "*) exit 0 ;;
 esac
 exit 0
@@ -6673,6 +6683,166 @@ if K8S_STUB_RUN_COMPLETE=0 K8S_STUB_BASE_SHA_RC=1 K8S_STUB_FETCH_REF="$collect_u
 else
     no "an unreadable base with new commits fetched writes commits: null, not 0" \
         "collect exited nonzero: $(cat "$collect_out22")"
+fi
+
+printf '\n== collect: pulling /work/session-store back (push side covered elsewhere) ==\n'
+# session_state/session_id are read back from run.env (only submit's
+# --session-state/--session-id know them), exactly like harness/model
+# above -- so every case here drives collect through --run-dir with a
+# hand-built run.env, the same shape as the undecidable-commits case (21)
+# above.
+
+# A. A clean pull: the host store is swapped for the pod's, and
+# summary.json's session_id is discovered fresh from what is now there --
+# not whatever the host store held before.
+session_pull_branch_a=fs-k8s-test-collect-session-pull-ok
+git -C "$proj_dir" update-ref "refs/heads/$session_pull_branch_a" "$(git -C "$proj_dir" rev-parse HEAD)"
+session_pull_host_a="$(newdir)/session-store-a"; tmpdirs+=("$session_pull_host_a")
+mkdir -p -- "$session_pull_host_a"
+printf '{"old":true}\n' > "$session_pull_host_a/old-transcript.jsonl"
+session_pull_pod_a="$(newdir)"; tmpdirs+=("$session_pull_pod_a")
+printf '{"new":true}\n' > "$session_pull_pod_a/22222222-2222-2222-2222-222222222222.jsonl"
+session_pull_rd_a="$(mktemp -d /var/tmp/claude-scratch/forks/claude-fork-sandbox.XXXXXX)"; tmpdirs+=("$session_pull_rd_a")
+{
+    printf 'mode=run\n'
+    printf 'harness=claude\n'
+    printf 'model=some-model\n'
+    printf 'session_state=%s\n' "$session_pull_host_a"
+} > "$session_pull_rd_a/run.env"
+printf 'test\n' > "$session_pull_rd_a/run-source"
+session_pull_log_a="$(newdir)/kubectl.log"; session_pull_out_a="$(newdir)/out-a.txt"; session_pull_dest_a="$(newdir)/outbox-a"
+tmpdirs+=("$(dirname "$session_pull_log_a")" "$(dirname "$session_pull_dest_a")")
+if K8S_STUB_SESSION_DIR="$session_pull_pod_a" K8S_STUB_SESSION_RC=0 \
+    K8S_STUB_OUTBOX_DIR="$collect_outbox11" K8S_STUB_OUTBOX_RC=0 \
+    collectstub_collect "$session_pull_log_a" "$session_pull_out_a" \
+    --branch "$session_pull_branch_a" --outbox-dir "$session_pull_dest_a" \
+    --run-dir "$session_pull_rd_a" "$proj_dir"; then
+    if [[ -f "$session_pull_host_a/22222222-2222-2222-2222-222222222222.jsonl" ]] \
+        && [[ ! -e "$session_pull_host_a/old-transcript.jsonl" ]] \
+        && [[ "$(jq -r '.session_id' "$session_pull_rd_a/summary.json" 2>/dev/null)" == "22222222-2222-2222-2222-222222222222" ]] \
+        && [[ "$(jq -r '.session_state' "$session_pull_rd_a/summary.json" 2>/dev/null)" == "$session_pull_host_a" ]]; then
+        ok "a clean session-store pull swaps the host store and summary.json reports the newest id"
+    else
+        no "a clean session-store pull swaps the host store and summary.json reports the newest id" \
+            "host=$(find "$session_pull_host_a" 2>/dev/null) summary=$(cat "$session_pull_rd_a/summary.json" 2>/dev/null)"
+    fi
+else
+    no "a clean session-store pull swaps the host store and summary.json reports the newest id" \
+        "collect exited nonzero: $(cat "$session_pull_out_a")"
+fi
+
+# B. A failed exec (the pod's tar dies non-zero, well under the cap so it
+# is a genuine read failure, not the over-cap case) must leave the host
+# store byte-identical and summary.json must report the OLD id -- the
+# pull failed, so the previous turn's id is what is still there.
+session_pull_branch_b=fs-k8s-test-collect-session-pull-execfail
+git -C "$proj_dir" update-ref "refs/heads/$session_pull_branch_b" "$(git -C "$proj_dir" rev-parse HEAD)"
+session_pull_host_b="$(newdir)/session-store-b"; tmpdirs+=("$session_pull_host_b")
+mkdir -p -- "$session_pull_host_b"
+printf '{"kept":true}\n' > "$session_pull_host_b/11111111-1111-1111-1111-111111111111.jsonl"
+session_pull_host_b_before="$(find "$session_pull_host_b" -type f -exec sha256sum {} +)"
+session_pull_rd_b="$(mktemp -d /var/tmp/claude-scratch/forks/claude-fork-sandbox.XXXXXX)"; tmpdirs+=("$session_pull_rd_b")
+{
+    printf 'mode=run\n'
+    printf 'harness=claude\n'
+    printf 'model=some-model\n'
+    printf 'session_state=%s\n' "$session_pull_host_b"
+} > "$session_pull_rd_b/run.env"
+printf 'test\n' > "$session_pull_rd_b/run-source"
+session_pull_log_b="$(newdir)/kubectl.log"; session_pull_out_b="$(newdir)/out-b.txt"; session_pull_dest_b="$(newdir)/outbox-b"
+tmpdirs+=("$(dirname "$session_pull_log_b")" "$(dirname "$session_pull_dest_b")")
+if K8S_STUB_SESSION_RC=1 K8S_STUB_SESSION_STDERR='stub-kubectl says: session store read exploded' \
+    K8S_STUB_OUTBOX_DIR="$collect_outbox11" K8S_STUB_OUTBOX_RC=0 \
+    collectstub_collect "$session_pull_log_b" "$session_pull_out_b" \
+    --branch "$session_pull_branch_b" --outbox-dir "$session_pull_dest_b" \
+    --run-dir "$session_pull_rd_b" "$proj_dir"; then
+    session_pull_host_b_after="$(find "$session_pull_host_b" -type f -exec sha256sum {} +)"
+    if [[ "$session_pull_host_b_before" == "$session_pull_host_b_after" ]] \
+        && grep -q 'could not read the session store' "$session_pull_out_b" \
+        && grep -q 'session store read exploded' "$session_pull_out_b" \
+        && [[ "$(jq -r '.session_id' "$session_pull_rd_b/summary.json" 2>/dev/null)" == "11111111-1111-1111-1111-111111111111" ]]; then
+        ok "a failed session-store exec leaves the host store byte-identical and reports the old id"
+    else
+        no "a failed session-store exec leaves the host store byte-identical and reports the old id" \
+            "before=$session_pull_host_b_before after=$session_pull_host_b_after summary=$(cat "$session_pull_rd_b/summary.json" 2>/dev/null) out=$(cat "$session_pull_out_b")"
+    fi
+else
+    no "a failed session-store exec leaves the host store byte-identical and reports the old id" \
+        "collect exited nonzero: $(cat "$session_pull_out_b")"
+fi
+
+# C. An archive the extractor must refuse -- a symlink entry, same guard
+# the outbox pull relies on -- must also leave the host store untouched
+# and report the old id, not a partial extraction.
+session_pull_branch_c=fs-k8s-test-collect-session-pull-symlink
+git -C "$proj_dir" update-ref "refs/heads/$session_pull_branch_c" "$(git -C "$proj_dir" rev-parse HEAD)"
+session_pull_host_c="$(newdir)/session-store-c"; tmpdirs+=("$session_pull_host_c")
+mkdir -p -- "$session_pull_host_c"
+printf '{"kept":true}\n' > "$session_pull_host_c/33333333-3333-3333-3333-333333333333.jsonl"
+session_pull_host_c_before="$(find "$session_pull_host_c" -type f -exec sha256sum {} +)"
+session_pull_pod_c="$(newdir)"; tmpdirs+=("$session_pull_pod_c")
+ln -s /etc/passwd "$session_pull_pod_c/evil-link.jsonl"
+session_pull_rd_c="$(mktemp -d /var/tmp/claude-scratch/forks/claude-fork-sandbox.XXXXXX)"; tmpdirs+=("$session_pull_rd_c")
+{
+    printf 'mode=run\n'
+    printf 'harness=claude\n'
+    printf 'model=some-model\n'
+    printf 'session_state=%s\n' "$session_pull_host_c"
+} > "$session_pull_rd_c/run.env"
+printf 'test\n' > "$session_pull_rd_c/run-source"
+session_pull_log_c="$(newdir)/kubectl.log"; session_pull_out_c="$(newdir)/out-c.txt"; session_pull_dest_c="$(newdir)/outbox-c"
+tmpdirs+=("$(dirname "$session_pull_log_c")" "$(dirname "$session_pull_dest_c")")
+if K8S_STUB_SESSION_DIR="$session_pull_pod_c" K8S_STUB_SESSION_RC=0 \
+    K8S_STUB_OUTBOX_DIR="$collect_outbox11" K8S_STUB_OUTBOX_RC=0 \
+    collectstub_collect "$session_pull_log_c" "$session_pull_out_c" \
+    --branch "$session_pull_branch_c" --outbox-dir "$session_pull_dest_c" \
+    --run-dir "$session_pull_rd_c" "$proj_dir"; then
+    session_pull_host_c_after="$(find "$session_pull_host_c" -type f -exec sha256sum {} +)"
+    if [[ "$session_pull_host_c_before" == "$session_pull_host_c_after" ]] \
+        && grep -q 'could not extract the session store tarball' "$session_pull_out_c" \
+        && [[ "$(jq -r '.session_id' "$session_pull_rd_c/summary.json" 2>/dev/null)" == "33333333-3333-3333-3333-333333333333" ]]; then
+        ok "a session-store archive with a symlink entry is refused, leaving the host store intact"
+    else
+        no "a session-store archive with a symlink entry is refused, leaving the host store intact" \
+            "before=$session_pull_host_c_before after=$session_pull_host_c_after summary=$(cat "$session_pull_rd_c/summary.json" 2>/dev/null) out=$(cat "$session_pull_out_c")"
+    fi
+else
+    no "a session-store archive with a symlink entry is refused, leaving the host store intact" \
+        "collect exited nonzero: $(cat "$session_pull_out_c")"
+fi
+
+# D. The rc-3 zero-harvest path (see case 21 above) still writes
+# session_state/session_id: the summary write happens before that check,
+# and a suspicious run is still worth resuming from.
+session_pull_branch_d=fs-k8s-test-collect-session-pull-rc3
+git -C "$proj_dir" update-ref "refs/heads/$session_pull_branch_d" "$(git -C "$proj_dir" rev-parse HEAD)"
+session_pull_host_d="$(newdir)/session-store-d"; tmpdirs+=("$session_pull_host_d")
+session_pull_pod_d="$(newdir)"; tmpdirs+=("$session_pull_pod_d")
+printf '{"new":true}\n' > "$session_pull_pod_d/44444444-4444-4444-4444-444444444444.jsonl"
+session_pull_rd_d="$(mktemp -d /var/tmp/claude-scratch/forks/claude-fork-sandbox.XXXXXX)"; tmpdirs+=("$session_pull_rd_d")
+{
+    printf 'mode=run\n'
+    printf 'harness=claude\n'
+    printf 'model=some-model\n'
+    printf 'session_state=%s\n' "$session_pull_host_d"
+} > "$session_pull_rd_d/run.env"
+printf 'test\n' > "$session_pull_rd_d/run-source"
+session_pull_log_d="$(newdir)/kubectl.log"; session_pull_out_d="$(newdir)/out-d.txt"; session_pull_dest_d="$(newdir)/outbox-d"
+tmpdirs+=("$(dirname "$session_pull_log_d")" "$(dirname "$session_pull_dest_d")")
+rc=0
+K8S_STUB_RUN_COMPLETE=0 K8S_STUB_SESSION_DIR="$session_pull_pod_d" K8S_STUB_SESSION_RC=0 \
+    K8S_STUB_OUTBOX_DIR="$collect_outbox11" K8S_STUB_OUTBOX_RC=0 \
+    collectstub_collect "$session_pull_log_d" "$session_pull_out_d" \
+    --branch "$session_pull_branch_d" --outbox-dir "$session_pull_dest_d" \
+    --run-dir "$session_pull_rd_d" "$proj_dir" || rc=$?
+if (( rc == 3 )) \
+    && grep -q 'SUSPICIOUS: this run produced nothing' "$session_pull_out_d" \
+    && [[ "$(jq -r '.session_id' "$session_pull_rd_d/summary.json" 2>/dev/null)" == "44444444-4444-4444-4444-444444444444" ]] \
+    && [[ "$(jq -r '.session_state' "$session_pull_rd_d/summary.json" 2>/dev/null)" == "$session_pull_host_d" ]]; then
+    ok "the rc-3 zero-harvest path still carries session_state/session_id in summary.json"
+else
+    no "the rc-3 zero-harvest path still carries session_state/session_id in summary.json" \
+        "rc=$rc summary=$(cat "$session_pull_rd_d/summary.json" 2>/dev/null) out=$(cat "$session_pull_out_d")"
 fi
 
 printf '\n== fork-sandbox-k8s.sh say: argument validation (no cluster) ==\n'

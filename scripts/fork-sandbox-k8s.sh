@@ -5443,6 +5443,102 @@ cmd_collect() {
         rm -f -- "$pod_json_err"
     fi
 
+    # Pull /work/session-store back into the host's --session-state store,
+    # so the NEXT wake on this seat resumes the same conversation instead
+    # of starting fresh -- the k8s half of the continuity --session-state
+    # already gives a local run. Read back from run.env, not accepted as
+    # collect's own flag: only submit knows session_state/session_id, the
+    # same reason harness/model are read back rather than re-specified
+    # here (see the run_dir block below). Runs BEFORE cmd_fetch, for the
+    # same reason the outbox and evidence pulls above do: cmd_fetch
+    # touches /work/.fetched, the pod's own signal to exit, and a kubectl
+    # exec into a completed pod fails.
+    #
+    # Best-effort like the outbox pull above, but stricter: a failure here
+    # -- an exec error, an over-cap store, or an archive the extractor
+    # refuses (a link entry, an absolute path, a `..` component) -- warns
+    # and falls through, never touching the function's exit code, and
+    # never touching the host store either. The swap below only happens
+    # once the spool AND the extraction have both already succeeded, so
+    # any earlier failure leaves the pre-pull store byte-identical.
+    # fs_session_discover_id (called at the summary write further down)
+    # then reports whichever id the store actually holds -- the previous
+    # one, on a failed pull: the seat keeps its persona and loses only
+    # this turn.
+    local pull_session_state="" pull_session_id=""
+    if [[ -n "$run_dir" ]]; then
+        pull_session_state="$(read_env_value "$run_dir/run.env" session_state || true)"
+        pull_session_id="$(read_env_value "$run_dir/run.env" session_id || true)"
+    fi
+    if [[ -n "$pull_session_state" ]]; then
+        local session_pull_ok=true
+        local session_pull_tar session_pull_err session_pull_rc=0 session_pull_tmp=""
+        session_pull_tar="$(mktemp)"
+        session_pull_err="$(mktemp)"
+        kubectl exec --request-timeout=60s "$pod_name" -- tar cf - -C /work/session-store . 2> "$session_pull_err" \
+                | head -c "$((CONTEXT_MAX_BYTES + 1))" > "$session_pull_tar" \
+                || session_pull_rc=$?
+        # Same size-check-before-exit-status ordering as the outbox pull
+        # above, for the identical reason: an over-cap store makes head -c
+        # exit early, kubectl then dies of EPIPE and the pipeline is
+        # non-zero under pipefail -- that IS the over-cap case, not a read
+        # failure.
+        if (( $("$FS_STAT" -c '%s' -- "$session_pull_tar") > CONTEXT_MAX_BYTES )); then
+            echo "fork-sandbox-k8s: warning: pod $pod_name's session store is over the $CONTEXT_MAX_BYTES byte cap; leaving the host session store as it was." >&2
+            session_pull_ok=false
+        elif (( session_pull_rc != 0 )); then
+            echo "fork-sandbox-k8s: warning: could not read the session store from pod $pod_name; leaving the host session store as it was." >&2
+            fs_report_captured_stderr "kubectl exec into pod $pod_name (session store read)" "$session_pull_err"
+            session_pull_ok=false
+        fi
+        rm -f -- "$session_pull_err"
+
+        if [[ "$session_pull_ok" == true ]] && ! mkdir -p -- "$(dirname -- "$pull_session_state")"; then
+            echo "fork-sandbox-k8s: warning: could not create $(dirname -- "$pull_session_state"); session store not pulled back." >&2
+            session_pull_ok=false
+        fi
+        if [[ "$session_pull_ok" == true ]] \
+            && ! session_pull_tmp="$(mktemp -d -- "$(dirname -- "$pull_session_state")/.session-pull.XXXXXX")"; then
+            echo "fork-sandbox-k8s: warning: could not create a staging directory for the session store; leaving it as it was." >&2
+            session_pull_ok=false
+        fi
+        if [[ "$session_pull_ok" == true ]] \
+            && ! "$script_dir/fork-sandbox-k8s-outbox-extract.sh" "$session_pull_tar" "$session_pull_tmp" "$CONTEXT_MAX_BYTES"; then
+            echo "fork-sandbox-k8s: warning: could not extract the session store tarball; leaving the host session store as it was." >&2
+            session_pull_ok=false
+        fi
+        rm -f -- "$session_pull_tar"
+
+        if [[ "$session_pull_ok" == true ]]; then
+            # Atomic swap: move the current store aside, move the pulled
+            # one into place, then remove the old one -- only once the new
+            # one is confirmed in place. A missing pull_session_state (a
+            # first-ever collect run on a host that never held this store,
+            # e.g. a different host than the one that ran submit) skips
+            # straight to installing the pulled store, nothing to move
+            # aside.
+            local session_pull_old=""
+            if [[ -e "$pull_session_state" ]]; then
+                session_pull_old="$(mktemp -u -- "${pull_session_state}.old.XXXXXX")"
+                if ! mv -- "$pull_session_state" "$session_pull_old"; then
+                    echo "fork-sandbox-k8s: warning: could not move aside the existing session store $pull_session_state; leaving it as it was." >&2
+                    session_pull_ok=false
+                fi
+            fi
+            if [[ "$session_pull_ok" == true ]]; then
+                if ! mv -- "$session_pull_tmp" "$pull_session_state"; then
+                    echo "fork-sandbox-k8s: warning: could not install the pulled session store at $pull_session_state; restoring the previous one." >&2
+                    [[ -n "$session_pull_old" && -e "$session_pull_old" ]] && mv -- "$session_pull_old" "$pull_session_state"
+                    session_pull_ok=false
+                else
+                    chmod 700 -- "$pull_session_state"
+                    [[ -n "$session_pull_old" && -e "$session_pull_old" ]] && rm -rf -- "$session_pull_old"
+                fi
+            fi
+        fi
+        [[ -n "$session_pull_tmp" && -e "$session_pull_tmp" ]] && rm -rf -- "$session_pull_tmp"
+    fi
+
     # The agent's own exit code, from the sentinel the entrypoint writes
     # after the agent exits. Read here rather than taken from a caller so
     # the zero-harvest check below works for a standalone collect the same
@@ -5547,6 +5643,18 @@ cmd_collect() {
         if [[ -n "$base_sha" && -n "$after_sha" ]]; then
             run_log_commits="$(cd "$origin_repo" && git rev-list --count "$base_sha..$after_sha" 2>/dev/null || true)"
         fi
+        # Read AFTER the session-store pull above resolves, whichever way
+        # it went: a successful pull discovers the newest id from the
+        # freshly-swapped store, and a failed one (left byte-identical)
+        # discovers the same id it would have before the pull was
+        # attempted -- the previous turn's id, on purpose. Present only
+        # when this run carried a store at all (pull_session_state
+        # non-empty), same absent-not-null convention fork-sandbox.sh's
+        # own local summary.json uses for this same pair.
+        local run_log_session_id=""
+        if [[ -n "$pull_session_state" ]]; then
+            run_log_session_id="$(fs_session_discover_id "$run_log_harness" "$pull_session_state" "$pull_session_id")"
+        fi
         jq -n \
             --arg mode "run" \
             --arg harness "$run_log_harness" \
@@ -5559,6 +5667,8 @@ cmd_collect() {
             --arg commits "$run_log_commits" \
             --arg claude_credentials_source "$run_log_claude_source" \
             --arg claude_credentials_via "$run_log_claude_via" \
+            --arg session_state "$pull_session_state" \
+            --arg session_id "$run_log_session_id" \
             '{
                 mode: $mode,
                 harness: $harness,
@@ -5573,6 +5683,10 @@ cmd_collect() {
             + (if $claude_credentials_via == "" then {} else {
                 claude_credentials_source: $claude_credentials_source,
                 claude_credentials_via: $claude_credentials_via,
+            } end)
+            + (if $session_state == "" then {} else {
+                session_state: $session_state,
+                session_id: (if $session_id == "" then null else $session_id end),
             } end)' > "$run_dir/summary.json" 2>/dev/null \
             || rm -f "$run_dir/summary.json"
 
