@@ -381,8 +381,15 @@ legs, the same way it already does for `--review-loop`.
 **`claude` only, for now.** The threshold is measured by a hook installed into
 the local sandbox's claude session, which reads the transcript on every tool
 call; `pi` and `codex` have no hook system to measure with, so
-`--refresh-at` is refused outright on those harnesses, and on `--k8s`, whose
-pod runs a different entrypoint.
+`--refresh-at` is refused outright on those harnesses.
+
+**On `--k8s`** the pod runs the same loop, from the same shared code and with
+the same default (`--refresh-at`/`--refresh-max` are accepted and behave as
+above). Two things differ: the pod never measures cost, so a continuation
+entry in `summary.json` carries its leg, exit and hand-off but no cost or
+usage; and the pod's records (`handoff-N.md`, `continuation-prompt-N.md`,
+`events-continuation-N.jsonl`, `refresh.json`) are pulled back as run
+evidence instead of landing in a local run directory.
 
 ## Driving sandbox-coder-mode
 

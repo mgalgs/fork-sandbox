@@ -419,12 +419,13 @@
 #                        above 1 is an absolute token count instead of a
 #                        fraction. claude only for now — see "A run that
 #                        refreshes itself" below. Refused with any other
-#                        --harness, and with --k8s.
+#                        --harness. Works with --k8s too, with the same
+#                        default, resolved by fork-sandbox-k8s.sh submit.
 # --refresh-max <n>:     how many continuation legs may follow the first
 #                        before the run gives up and moves on to the review
 #                        loop anyway. Default 6. Requires --refresh-at (which
 #                        is on by default), so it inherits the same harness
-#                        and --k8s restrictions.
+#                        restriction. Forwarded as given with --k8s.
 # --k8s:                 submit this run as a Kubernetes Job instead of a
 #                        local sandbox, by exec'ing fork-sandbox-k8s.sh run
 #                        with the arguments below. Defaults --harness to pi,
@@ -660,7 +661,17 @@
 # fork-sandbox-inbox-hook.sh, which already runs on every tool call and reads
 # the transcript path off the hook payload — pi and codex have no
 # hook system to measure with, so --refresh-at is refused outright on those
-# harnesses, and on --k8s, whose pod runs a different entrypoint.
+# harnesses.
+#
+# --k8s runs the same loop inside the pod, from the same shared logic
+# (fork-sandbox-refresh.sh, shipped to the pod as a ConfigMap key), with the
+# same default and the same --refresh-max cap. What differs: the pod never
+# measures cost or tokens, so summary.json's `continuations` entries carry
+# leg, exit, handoff and handoff_stale but no cost or usage; and the pod's
+# records (handoff-N.md, continuation-prompt-N.md, events-continuation-N.jsonl,
+# claude-stderr-continuation-N.log, refresh.json) live under /work and come
+# back as run evidence rather than under a local run dir. A continuation's
+# events go to events-continuation-N.jsonl, not appended to events.jsonl.
 #
 # Sandboxed mode trades isolation for silence: the session never asks for
 # permission, because the sandbox is the boundary instead of the prompt.

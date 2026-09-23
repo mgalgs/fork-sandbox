@@ -1603,6 +1603,41 @@ in `summary.json` (`session_id`/`session_state`) the way a local run's own
 summary does — a failed pull leaves DIR untouched and reports the previous
 id, so the seat keeps its persona and loses only that one wake's turn.
 
+### A claude pod refreshes its own context: `--refresh-at`
+
+`--refresh-at`/`--refresh-max` work on `--k8s` with the same defaults as a
+local run: claude only, `--refresh-at 0.5` unless told otherwise, `0`
+disables it, `--refresh-max 6`, and pi is refused with the local message.
+`cmd_submit` resolves the threshold with the same `fs_refresh_resolve`
+(fork-sandbox-lib.sh) the local runner uses. When enabled, the Job gets
+`REFRESH_THRESHOLD_TOKENS`/`REFRESH_MAX`, `run.env` records `refresh_at`,
+`refresh_max` and `refresh_threshold_tokens`, and the ConfigMap carries
+three more keys: `refresh.sh` (the shared logic,
+`fork-sandbox-refresh.sh`, so the local and pod loops cannot drift),
+`continuation-header.md`, and `handoff-original.md`. When disabled none of
+these appear.
+
+In the pod, the entrypoint writes the inbox hook's `.refresh-config`, runs
+the first leg, and while a leg leaves a hand-off in the outbox runs a FRESH
+claude session (never `--resume`) on the same clone with the original brief
+plus that hand-off as its prompt, up to `--refresh-max` continuations. Each
+leg gets fresh hook state under `/tmp`, because `/tmp` persists across legs
+in a pod, unlike a local leg's tmpfs. The hand-off is moved out of the
+outbox to `/work/handoff-N.md`, so it is never harvested as mail. The
+session snapshot runs after the LAST continuation, so the next wake resumes
+the last continuation's transcript.
+
+`collect` pulls `handoff-N.md`, `continuation-prompt-N.md`,
+`events-continuation-N.jsonl`, `claude-stderr-continuation-N.log`,
+`refresh.json` and `refresh.log` into the evidence directory, and
+`summary.json` gains `refresh` (`none`, `empty-outbox`, `cap`,
+`no-handoff` or `leg-error`) and `continuations` (leg, exit, handoff,
+handoff_stale). A run with refresh disabled reports `none` and `[]`; an
+enabled run whose `refresh.json` did not come back leaves both keys absent
+and warns. There is no per-continuation cost: k8s runs measure none.
+Continuations lengthen the pod's runtime inside the same Job deadline, and
+a deadline kill skips the snapshot, so the host keeps the last pushed store.
+
 DIR is capped at `CONTEXT_MAX_BYTES` (256 MiB), checked on the host before
 anything is created — but unlike every other capped flag here, a store over
 the cap does not refuse the run: `submit` warns and the run proceeds with

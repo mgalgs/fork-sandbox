@@ -436,10 +436,9 @@ frontmatter refuses all three — a seat must not know its own backend):
 | `endpoint` | RFC 1123 label (`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`) | only with `backend: k8s` |
 | `grant` | the literal string `required` | only with `backend: k8s` |
 
-`refresh-at` is accepted and ignored on a `backend: k8s` seat for now — the
-cluster path does not support session resume yet — rather than refused,
-since it may arrive from repo persona frontmatter the machine cannot
-unset.
+`refresh-at` works on a `backend: k8s` claude seat exactly as on a local one
+(it is forwarded as `--refresh-at`); on a pi seat it is accepted and ignored,
+since it may arrive from repo persona frontmatter the machine cannot unset.
 
 ### The `grant` verb
 
@@ -496,9 +495,13 @@ same agent, on EITHER backend, whose branch still resolves in the
 project repo, so a k8s wake resumes from that branch instead of always
 starting fresh from HEAD (a local seat gets this for free from its own
 persistent `--clone-dir`; a k8s seat's clone is fresh every wake, so this
-is how it gets the same lineage). `--clone-dir` and `--refresh-at` are
-still refused outright with `--k8s` — no durable per-seat clone and no
-mid-run credential refresh on k8s yet. A few accepted limits: a seat
+is how it gets the same lineage). `--clone-dir` is still refused outright
+with `--k8s` — no durable per-seat clone on k8s yet. A k8s claude seat
+refreshes like a local one (`--refresh-at`, on by default): a wake that fills
+its context chains fresh continuation sessions inside the same pod, and the
+next wake resumes the LAST continuation's transcript, since continuations
+still write the session store and the snapshot follows the last one. A few
+accepted limits: a seat
 switching backend mid-thread is not "fixed" (a k8s-to-local resume starts
 from the local clone's own HEAD and ignores intervening k8s branches; a
 claude transcript may not resume across that switch at all, since the
