@@ -927,6 +927,19 @@ agents:
     backend: k8s
 EOF
 
+# tuner.md carries no frontmatter at all, so a bare `backend: k8s` here
+# leaves harness unset on both sides -- the resolved value the postmaster
+# actually spawns with is claude (harness="${harness:-claude}"), so the
+# k8s-backend check must judge it as claude, not as an empty/invalid
+# harness.
+cat > "$FORK_SANDBOX_FLEET_FILE" <<'EOF'
+agents:
+  tuner:
+    backend: k8s
+EOF
+check "backend k8s seat with harness unset everywhere defaults to claude and passes" "0" \
+    "$("$fleet" check >/dev/null 2>&1; echo $?)"
+
 bad "backend k8s seat with resolved network sealed is refused" \
     "NetworkPolicy's job" <<'EOF'
 agents:

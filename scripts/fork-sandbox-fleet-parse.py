@@ -775,7 +775,12 @@ def cmd_check(fleet_file, label, personas_dir):
                 f"agents.{name}", errors)
             resolved_presets[name] = agent["preset"] or fm.get("preset", "")
             if agent["backend"] == "k8s":
-                resolved_harness = agent["harness"] or fm["harness"]
+                # Unlike check_network_harness_pair's own no-defaulting
+                # rule above, this check judges the RESOLVED value a k8s
+                # seat actually spawns with, and postmaster.sh's
+                # harness="${harness:-claude}" is that default -- so an
+                # empty harness here means claude, not "no harness".
+                resolved_harness = agent["harness"] or fm["harness"] or "claude"
                 resolved_network = agent["network"] or fm["network"]
                 if resolved_harness not in ("claude", "pi"):
                     errors.append(
