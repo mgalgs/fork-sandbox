@@ -1580,6 +1580,40 @@ per-wake copy, and the host directory named by `--thread-dir`/
 `--attach-dir` is never written back, so an agent writing into its own
 in-pod `/thread` or `/attachments` only ever harms its own view of it.
 
+## Getting files in: --session-state, --resume-session, --session-id
+
+A k8s seat keeps the same harness conversation across many wakes the same
+way a local seat with `--session-state` does. `submit`/`run` accept
+`--session-state DIR`, plus `--resume-session ID` (claude, which discovers
+its own id) or `--session-id ID` (pi, which is given one up front) — the
+same three flags and the same validation
+(`fs_validate_session_flags`/`fs_harness_session_caps` in
+fork-sandbox-lib.sh) the local path uses, and the same rule that
+`--resume-session`/`--session-id` each require `--session-state`.
+
+The transport reuses `--context-ro`'s own push, into a fixed
+`/work/session-store` path: `cmd_submit` tars DIR and pushes it before the
+`.inputs-complete` sentinel, `fork-sandbox-k8s-entrypoint.sh` copies it into
+the harness's own transcript directory (`~/.claude/projects` for claude,
+the pi `--session-dir` for pi) before the coding leg and snapshots it back
+right after, so a review loop's own transcripts never leak into what gets
+pulled back. `cmd_collect` pulls `/work/session-store` back into DIR before
+`fetch`, swapping it in only on success, and reports the newest session id
+in `summary.json` (`session_id`/`session_state`) the way a local run's own
+summary does — a failed pull leaves DIR untouched and reports the previous
+id, so the seat keeps its persona and loses only that one wake's turn.
+
+DIR is capped at `CONTEXT_MAX_BYTES` (256 MiB), checked on the host before
+anything is created — but unlike every other capped flag here, a store over
+the cap does not refuse the run: `submit` warns and the run proceeds with
+no push and no `session_state` recorded in `run.env`, so `collect` cannot
+pull one back either. Since `--session-state` names a directory the
+postmaster passes unchanged on every wake, and the store only ever grows,
+refusing outright would wedge every later wake of that seat until an
+operator trimmed it by hand; warning instead costs that one wake its
+continuity and nothing else. There is no `--outbox-max`-shaped flag to
+raise this particular ceiling.
+
 ## Per-run services
 
 A repo commits `.agents/sandbox-services/services.yaml` to get throwaway

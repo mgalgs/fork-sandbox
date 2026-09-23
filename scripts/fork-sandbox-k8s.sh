@@ -8,6 +8,7 @@
 #                            [--outbox-max SIZE]
 #                            [--context-ro DIR] [--thread-dir DIR] [--attach-dir DIR]
 #                            [--checkout REF] [--services-trust-ref REF]
+#                            [--session-state DIR] [--resume-session ID | --session-id ID]
 #                            [--claude-credentials PATH]
 #                            [--label key=value]... [--task-meta JSON]
 #                            [--allow-namespace NS[:PORT]]... [--reach-probe HOST:PORT]...
@@ -19,6 +20,7 @@
 #                            [--outbox-dir DIR] [--outbox-max SIZE]
 #                            [--context-ro DIR] [--thread-dir DIR] [--attach-dir DIR]
 #                            [--checkout REF] [--services-trust-ref REF]
+#                            [--session-state DIR] [--resume-session ID | --session-id ID]
 #                            [--claude-credentials PATH]
 #                            [--label key=value]... [--task-meta JSON]
 #                            [--allow-namespace NS[:PORT]]... [--reach-probe HOST:PORT]...
@@ -166,6 +168,27 @@
 # trusting an unanchored ref, and a --checkout whose ref changed
 # .agents/sandbox-services/ relative to REF disables them too -- both cases
 # warn naming why. See docs/kubernetes-runs.md's "Per-run services" section.
+#
+# --session-state DIR / --resume-session ID / --session-id ID (submit, run):
+# give this run the same harness conversation across many k8s wakes,
+# exactly what a local run's own --session-state gives a persistent seat.
+# cmd_submit pushes DIR into the pod at /work/session-store before the Job
+# starts (same channel and window as --context-ro's own push); the
+# entrypoint binds it into the harness's transcript directory and, for
+# claude, resumes RESUME_SESSION, or, for pi, opens SESSION_ID under
+# --session-dir; cmd_collect pulls the store back into DIR afterward, using
+# fs_session_discover_id to report session_id in summary.json the way a
+# local run's does. --resume-session (claude, discover-mode) and
+# --session-id (pi, given-mode) each require --session-state, and only the
+# one matching --harness applies -- see fs_harness_session_caps in
+# fork-sandbox-lib.sh. DIR is validated with fs_validate_scratch_dir, the
+# same whole-scratch-root rule --thread-dir/--attach-dir apply above. The
+# store is tarred and capped at CONTEXT_MAX_BYTES (256 MiB), like
+# --context-ro -- but unlike --context-ro, a store over the cap does not
+# refuse the run: it warns and the run proceeds with no push and no
+# session_state recorded in run.env, so a later collect will not pull one
+# back either. The seat simply loses continuity for that one wake; there is
+# no flag to raise this cap, unlike --outbox-max. See docs/kubernetes-runs.md.
 #
 # --outbox-dir DIR (run, collect): where to land the pod's /work/outbox after the
 # agent finishes. Defaults to
@@ -3347,6 +3370,50 @@ cmd_submit() {
     # fork-sandbox-lib.sh.
     session_state="$(fs_validate_session_flags "$harness" "$session_state" \
         "$resume_session" "$session_id_arg")" || exit 1
+
+    # The session store's size cap is checked here, right after validation,
+    # rather than at push time (where it used to live): the SESSION_HARNESS_
+    # STORE/RESUME_SESSION/SESSION_ID env block below and run.env further
+    # down both bake $session_state's presence in well before push, so a
+    # decision made at push time is too late to keep either in sync.
+    # Skipped under --dry-run, which creates and contacts nothing -- the
+    # mkdir below would otherwise break that contract; a real submit still
+    # catches an oversized store here, before anything is created in the
+    # cluster. mkdir+chmod here (not any earlier) for the same reason: session_
+    # state was only validated (not created) by fs_validate_session_flags
+    # above, the same "nothing is created before --dry-run's exit" rule
+    # every other flag in this function follows. Same 0700 rule as the local
+    # path's equivalent (fork-sandbox.sh, session_state block): the store
+    # holds a whole conversation transcript.
+    #
+    # A store over the cap does not fail the run: the design here is
+    # "warned, not fixed" (a store this large loses k8s continuity, not the
+    # run) -- refusing outright would wedge every later wake of a seat once
+    # its store, which only grows, crosses the cap. So this run proceeds
+    # without session continuity instead: no push below, and no session_state
+    # in run.env, so cmd_collect will not pull either.
+    local session_tar="" session_size=""
+    if [[ -n "$session_state" && "$dry_run" != true ]]; then
+        mkdir -p -- "$session_state"
+        chmod 700 -- "$session_state"
+        session_tar="$(mktemp)"
+        K8S_SUBMIT_SESSION_TAR="$session_tar"
+        trap 'rm -f -- "${K8S_SUBMIT_SESSION_TAR:-}"' EXIT
+        tar cf "$session_tar" -C "$session_state" .
+        session_size="$("$FS_STAT" -c '%s' -- "$session_tar")"
+        if (( session_size > CONTEXT_MAX_BYTES )); then
+            echo "Warning: --session-state directory '$session_state' tars to" >&2
+            echo "$session_size bytes, over the $CONTEXT_MAX_BYTES byte" >&2
+            echo "(256 MiB) cap. Running this wake without session" >&2
+            echo "continuity -- see docs/kubernetes-runs.md." >&2
+            rm -f -- "$session_tar"
+            K8S_SUBMIT_SESSION_TAR=""
+            session_tar=""
+            session_state=""
+            resume_session=""
+            session_id_arg=""
+        fi
+    fi
     # pi_args is additionally embedded in the rendered Job's PI_ARGS env
     # var as a YAML double-quoted scalar, so a double quote or a
     # backslash is refused on top of the guard above: an unescaped quote
@@ -4355,8 +4422,10 @@ EOF
     # first kubectl create/apply below: from that point on, a cluster
     # object may already exist, and this directory is what cmd_collect's
     # own record call needs to read back, exactly like every run that
-    # does reach the cluster.
-    trap 'rm -rf -- "$run_dir"' EXIT
+    # does reach the cluster. Also covers the session store's own tar, in
+    # case it was already spooled above (the session cap check runs before
+    # run_dir exists, so its own trap could not yet reference run_dir too).
+    trap 'rm -f -- "${K8S_SUBMIT_SESSION_TAR:-}"; rm -rf -- "$run_dir"' EXIT
 
     # Printed as soon as the directory exists, not only once submit
     # finishes: a submit that dies below at the repository push or any
@@ -4451,11 +4520,13 @@ EOF
     # Spool and size the context before creating anything in the cluster or
     # pushing the repository. The EXIT trap covers tar/stat failures and
     # later submit failures, so a large temporary archive cannot leak.
+    # K8S_SUBMIT_SESSION_TAR is deliberately NOT reset here: the session
+    # store, if any, was already spooled above (before run_dir existed), and
+    # resetting it now would drop the trap's only reference to that tar.
     local context_tar="" context_size=""
     K8S_SUBMIT_CONTEXT_TAR=""
     K8S_SUBMIT_THREAD_TAR=""
     K8S_SUBMIT_ATTACH_TAR=""
-    K8S_SUBMIT_SESSION_TAR=""
     if [[ -n "$context_ro" ]]; then
         context_tar="$(mktemp)"
         K8S_SUBMIT_CONTEXT_TAR="$context_tar"
@@ -4514,35 +4585,12 @@ EOF
         fi
     fi
 
-    # The harness session store, pushed even when session_state maps to a
-    # brand-new (empty) directory -- unlike --context-ro/--thread-dir/
-    # --attach-dir above, which are pushed only when given at all, a run
-    # with --session-state must always end up with SOMETHING at
-    # POD_SESSION_DIR, since the entrypoint unconditionally reads it when
-    # SESSION_HARNESS_STORE=1 is set. mkdir+chmod here, not earlier: session_
-    # state was only validated (not created) by fs_validate_session_flags
-    # above, the same "nothing is created before --dry-run's exit" rule
-    # every other flag in this function follows -- and cmd_submit's own
-    # --dry-run exit is still ahead of this point. Same 0700 rule as the
-    # local path's equivalent (fork-sandbox.sh, session_state block): the
-    # store holds a whole conversation transcript.
-    local session_tar="" session_size=""
-    if [[ -n "$session_state" ]]; then
-        mkdir -p -- "$session_state"
-        chmod 700 -- "$session_state"
-        session_tar="$(mktemp)"
-        K8S_SUBMIT_SESSION_TAR="$session_tar"
-        trap 'rm -f -- "${K8S_SUBMIT_CONTEXT_TAR:-}" "${K8S_SUBMIT_THREAD_TAR:-}" "${K8S_SUBMIT_ATTACH_TAR:-}" "${K8S_SUBMIT_SESSION_TAR:-}"; rm -rf -- "$run_dir"' EXIT
-        tar cf "$session_tar" -C "$session_state" .
-        session_size="$("$FS_STAT" -c '%s' -- "$session_tar")"
-        if (( session_size > CONTEXT_MAX_BYTES )); then
-            echo "Error: --session-state directory '$session_state' tars to" >&2
-            echo "$session_size bytes, over the $CONTEXT_MAX_BYTES byte" >&2
-            echo "(256 MiB) cap. A store this large loses k8s continuity --" >&2
-            echo "see docs/kubernetes-runs.md." >&2
-            exit 1
-        fi
-    fi
+    # The harness session store's tar, size cap and mkdir/chmod are handled
+    # earlier, right after fs_validate_session_flags -- before this
+    # function's dry-run print and before run.env is written, both of
+    # which need to already know whether the store fit. $session_tar and
+    # $session_state (cleared there if oversized) are reused below,
+    # unchanged, for the push.
 
     # The stale-grant check: does a NetworkPolicy named $grant_name
     # already exist, most likely left behind by an earlier run on this

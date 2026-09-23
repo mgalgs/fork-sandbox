@@ -360,7 +360,11 @@
 # --checkout when pm_lineage_checkout finds one (see its own comment) --
 # a local wake gets this for free from its own persistent --clone-dir,
 # but a k8s wake's clone is fresh every time, so lineage has to be found
-# explicitly. `--timeout "${FORK_SANDBOX_POSTMASTER_K8S_TIMEOUT:-14400}"`
+# explicitly. That --checkout is paired with a --services-trust-ref set to
+# the project's current HEAD: cmd_submit's own services-trust gate
+# otherwise reads an unanchored --checkout as untrusted and silently turns
+# per-run services off from the seat's second wake on. `--timeout
+# "${FORK_SANDBOX_POSTMASTER_K8S_TIMEOUT:-14400}"`
 # bounds how long the Job may run; a non-numeric value refuses `deliver`
 # at startup with a clear message rather than failing confusingly on the
 # first k8s wake.
@@ -2364,6 +2368,18 @@ pm_spawn_wake() {
         local checkout_branch
         if checkout_branch="$(pm_lineage_checkout "$project" "$tid" "$agent")"; then
             spawn_args+=(--checkout "$checkout_branch")
+            # A --checkout with no --services-trust-ref reads as an
+            # unanchored, untrusted ref to cmd_submit's own services-trust
+            # gate (fork-sandbox-k8s.sh), which would then silently run
+            # this seat's every wake past the first with per-run services
+            # OFF. The checkout above is this same agent's own prior
+            # branch, not third-party data, so the project's current HEAD
+            # is a fine trust anchor -- the gate's diff check still
+            # disables services on its own if that branch changed
+            # .agents/sandbox-services/ relative to HEAD.
+            local checkout_trust_ref
+            checkout_trust_ref="$(git -C "$project" rev-parse HEAD 2>/dev/null || true)"
+            [[ -n "$checkout_trust_ref" ]] && spawn_args+=(--services-trust-ref "$checkout_trust_ref")
         fi
 
         local wake_root="${FORK_SANDBOX_POSTMASTER_K8S_WAKE_ROOT:-/var/tmp/claude-scratch/forks}"

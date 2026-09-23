@@ -6790,6 +6790,53 @@ else
         "run exited nonzero: $(cat "$session_push_out")"
 fi
 
+# A store that tars to more than 256 MiB must not fail the run: the
+# handoff's own out-of-scope list says such a store "loses k8s continuity
+# (warned, not fixed)" -- refusing outright would wedge every later wake of
+# a seat once its store, which only ever grows, crosses the cap. So this
+# run must still succeed, but with no push (no continuity for this wake)
+# and no session_state recorded in run.env (so a standalone collect cannot
+# pull a store back over the host one). A tar stub fakes the over-cap
+# archive without allocating 256 MiB of test data, the same trick the
+# --context-ro over-cap case above uses -- but falls back to the real tar
+# for every other call, since this run (unlike the --context-ro case) runs
+# to completion and collect's own outbox pull needs a real tar.
+session_cap_dir="$(mktemp -d /var/tmp/claude-scratch/forks/claude-fork-sandbox.XXXXXX)"; tmpdirs+=("$session_cap_dir")
+printf 'too large\n' > "$session_cap_dir/big-transcript.jsonl"
+session_cap_tar_stub="$(newdir)"; tmpdirs+=("$session_cap_tar_stub")
+cat > "$session_cap_tar_stub/tar" <<'STUB'
+#!/usr/bin/env bash
+if [[ "$1" == "cf" && "$3" == "-C" && -e "$4/big-transcript.jsonl" ]]; then
+    truncate -s $((256 * 1024 * 1024 + 1)) "$2"
+else
+    exec /usr/bin/tar "$@"
+fi
+STUB
+chmod +x "$session_cap_tar_stub/tar"
+session_cap_log="$(newdir)/kubectl.log"; session_cap_out="$(newdir)/out-cap.txt"
+tmpdirs+=("$(dirname "$session_cap_log")" "$(dirname "$session_cap_out")")
+if PATH="$session_cap_tar_stub:$PATH" runstub_run "$session_cap_log" "$session_cap_out" \
+    --branch fs-k8s-test-session-cap --model moonshotai/kimi-k3 \
+    --session-state "$session_cap_dir" \
+    --outbox-dir "$(dirname "$session_cap_out")/outbox-cap" \
+    "$proj_dir" "$handoff_file"; then
+    session_cap_rd="$(sed -n 's/^  run dir:  *//p' "$session_cap_out" | head -1)"
+    if grep -q 'Warning: --session-state' "$session_cap_out" \
+        && grep -q 'over the .* byte' "$session_cap_out" \
+        && grep -q 'without session' "$session_cap_out" \
+        && ! grep -q 'context-extract.sh /work/session-store' "$session_cap_log" \
+        && [[ -n "$session_cap_rd" && -f "$session_cap_rd/run.env" ]] \
+        && ! grep -q '^session_state=' "$session_cap_rd/run.env"; then
+        ok "an over-cap --session-state warns and runs without pushing or recording the store"
+    else
+        no "an over-cap --session-state warns and runs without pushing or recording the store" \
+            "out=$(cat "$session_cap_out") log=$(cat "$session_cap_log") run.env=$(cat "${session_cap_rd:-/nonexistent}/run.env" 2>/dev/null)"
+    fi
+else
+    no "an over-cap --session-state warns and runs without pushing or recording the store" \
+        "run exited nonzero: $(cat "$session_cap_out")"
+fi
+
 printf '\n== collect: pulling /work/session-store back ==\n'
 # session_state/session_id are read back from run.env (only submit's
 # --session-state/--session-id know them), exactly like harness/model

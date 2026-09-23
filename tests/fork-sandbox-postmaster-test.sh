@@ -4953,6 +4953,8 @@ check "k8s case1: no --session-id (claude is discover-mode)" 0 \
     "$(grep -c -- '^--session-id$' "$STUB_ARGV_LOG")"
 check "k8s case1: no --checkout on a first wake (no prior run to resolve)" 0 \
     "$(grep -c -- '^--checkout$' "$STUB_ARGV_LOG")"
+check "k8s case1: no --services-trust-ref on a first wake (no lineage checkout to anchor)" 0 \
+    "$(grep -c -- '^--services-trust-ref$' "$STUB_ARGV_LOG")"
 k1_env="$(latest_env_for_agent karen)"
 check "k8s case1: .env BACKEND=k8s" k8s "$(env_val "$k1_env" BACKEND)"
 check "k8s case1: .env RESUMED is empty" "" "$(env_val "$k1_env" RESUMED)"
@@ -4980,6 +4982,12 @@ check "k8s case1b: --resume-session forwarded from the recorded session" \
     "$k1_fixture_sid" "$(argv_after --resume-session "$STUB_ARGV_LOG")"
 check "k8s case1b: --checkout forwarded (lineage from karen's own prior run)" \
     "$k1_branch" "$(argv_after --checkout "$STUB_ARGV_LOG")"
+# A --checkout with no --services-trust-ref reads as untrusted to cmd_submit's
+# own services-trust gate (fork-sandbox-k8s.sh), which would silently turn
+# per-run services off for every wake past the first. pm_spawn_wake must
+# anchor trust to the project's current HEAD alongside the lineage checkout.
+check "k8s case1b: --services-trust-ref forwarded alongside the lineage checkout" \
+    "$(git -C "$PROJECT_DIR" rev-parse HEAD)" "$(argv_after --services-trust-ref "$STUB_ARGV_LOG")"
 # The wedge bound (pm_followup_wake's own accounting) counts a k8s wake
 # via its .env RESUMED field, the same as a local wake's -- this run was
 # launched with --resume-session above, so RESUMED must record that id,
