@@ -348,11 +348,12 @@
 # directories behind and instead of the wrapper's own script_dir resolving
 # to the real fork-sandbox-k8s.sh.
 #
-# fork-sandbox.sh refuses two flags on --k8s -- --clone-dir and
-# --refresh-at -- so pm_spawn_wake never passes them for a k8s seat: there
-# is no durable per-seat clone on k8s (a fresh clone every wake) and no
-# mid-run credential refresh there, unlike a local seat -- see STATE and
-# LIMITATIONS below. --session-state/--resume-session/--session-id ARE
+# fork-sandbox.sh refuses --clone-dir on --k8s, so pm_spawn_wake never
+# passes it for a k8s seat: there is no durable per-seat clone on k8s (a
+# fresh clone every wake) -- see STATE and LIMITATIONS below. --refresh-at
+# IS forwarded for a claude k8s seat, exactly as for a local one: the pod
+# refreshes its own context and the next wake resumes the last
+# continuation's transcript. --session-state/--resume-session/--session-id ARE
 # forwarded now, the same way and via the same pm_session_spawn_args the
 # local branch below uses: a k8s seat keeps its conversation across wakes
 # exactly like a local one, bound into the pod's own transcript store by
@@ -2337,15 +2338,19 @@ pm_spawn_wake() {
         # same pm_session_spawn_args -- fork-sandbox.sh accepts all three
         # with --k8s now, and fork-sandbox-k8s-entrypoint.sh binds the same
         # host-side transcript store into the pod that a local wake gets.
-        # --clone-dir/--refresh-at and --preset are still dropped outright:
-        # fork-sandbox.sh refuses the first two with --k8s, and `fleet
-        # check` never lets a k8s seat carry a preset -- a persistent
-        # per-seat clone and mid-run credential refresh on k8s are later
-        # work (see the brief's Out of scope).
+        # --clone-dir and --preset are still dropped outright:
+        # fork-sandbox.sh refuses the first with --k8s, and `fleet check`
+        # never lets a k8s seat carry a preset -- a persistent per-seat
+        # clone on k8s is later work (see the brief's Out of scope).
+        # --refresh-at is forwarded for claude seats, as the local branch
+        # does below.
         local -a spawn_args=(--branch "$branch" --harness "$harness" --network "$network")
         [[ -n "$model" ]] && spawn_args+=(--model "$model")
         if [[ "$harness" == pi && -n "$thinking" ]]; then
             spawn_args+=(--pi-args "--thinking $thinking")
+        fi
+        if [[ "$harness" == claude && -n "$refresh_at" ]]; then
+            spawn_args+=(--refresh-at "$refresh_at")
         fi
         (( has_attach_dir )) && spawn_args+=(--attach-dir "$attach_dir")
         [[ "$trigger_only" == 1 ]] && spawn_args+=(--thread-dir "$snap_dir")

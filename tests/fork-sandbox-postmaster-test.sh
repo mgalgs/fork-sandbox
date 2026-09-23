@@ -148,6 +148,9 @@ EOF
 cat > "$FORK_SANDBOX_PERSONAS_DIR/karl.md" <<'EOF'
 Karl is a backend: k8s seat with grant: required, used by the hold tests.
 EOF
+cat > "$FORK_SANDBOX_PERSONAS_DIR/kara.md" <<'EOF'
+Kara is a claude backend: k8s seat with refresh-at, used by the refresh-at tests.
+EOF
 cat > "$FORK_SANDBOX_PERSONAS_DIR/kim.md" <<'EOF'
 ---
 thinking: medium
@@ -183,6 +186,11 @@ agents:
     model: vendor/kimmodel
     backend: k8s
     endpoint: kim-endpoint
+    refresh-at: 0.4
+  kara:
+    harness: claude
+    backend: k8s
+    refresh-at: 0.4
 lists:
   team:
     members: [alice, bob, carol]
@@ -4941,10 +4949,10 @@ check "k8s case1: --k8s is in argv" 1 "$(grep -c -- '^--k8s$' "$STUB_ARGV_LOG")"
 check "k8s case1: --outbox-dir is in argv" 1 "$(grep -c -- '^--outbox-dir$' "$STUB_ARGV_LOG")"
 check "k8s case1: --thread-dir is in argv" 1 "$(grep -c -- '^--thread-dir$' "$STUB_ARGV_LOG")"
 check "k8s case1: --timeout defaults to 14400" 14400 "$(argv_after --timeout "$STUB_ARGV_LOG")"
-for df in --clone-dir --refresh-at; do
-    check "k8s case1: $df is absent (fork-sandbox.sh --k8s refuses it)" 0 \
-        "$(grep -c -- "^$df\$" "$STUB_ARGV_LOG")"
-done
+check "k8s case1: --clone-dir is absent (fork-sandbox.sh --k8s refuses it)" 0 \
+    "$(grep -c -- '^--clone-dir$' "$STUB_ARGV_LOG")"
+check "k8s case1: --refresh-at is absent for a seat that configures none" 0 \
+    "$(grep -c -- '^--refresh-at$' "$STUB_ARGV_LOG")"
 check "k8s case1: --session-state forwarded (k8s seats keep their session)" \
     "$PM_STATE_DIR/state/$k1_tid/karen" "$(argv_after --session-state "$STUB_ARGV_LOG")"
 check "k8s case1: no --resume-session on a first wake (nothing to resume)" 0 \
@@ -5129,6 +5137,29 @@ check "k8s case4: a pi seat gets --session-id on its first wake" \
     1 "$(grep -c -- '^--session-id$' "$STUB_ARGV_LOG")"
 check "k8s case4: a pi seat gets no --resume-session (create-if-missing, not discovered)" \
     0 "$(grep -c -- '^--resume-session$' "$STUB_ARGV_LOG")"
+
+# ---- case 4b: --refresh-at is forwarded for a claude k8s seat, not a pi one ----
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+
+: > "$STUB_ARGV_LOG"
+send_msg '@carol' '@kara' 'refresh topic' 'hello kara' 8 >/dev/null
+once
+check "k8s case4b: a claude k8s seat gets --refresh-at" 0.4 \
+    "$(argv_after --refresh-at "$STUB_ARGV_LOG")"
+check "k8s case4b: --clone-dir stays absent" 0 "$(grep -c -- '^--clone-dir$' "$STUB_ARGV_LOG")"
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+
+: > "$STUB_ARGV_LOG"
+send_msg '@carol' '@kim' 'refresh pi topic' 'hello kim again' 8 >/dev/null
+once
+check "k8s case4b: a pi k8s seat with refresh-at gets no --refresh-at" 0 \
+    "$(grep -c -- '^--refresh-at$' "$STUB_ARGV_LOG")"
 
 # ---- case 5: rc 2 (dead pod), no k8s summary -> flagged, retried, retry handoff ----
 
