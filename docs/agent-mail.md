@@ -375,10 +375,11 @@ absence of the key entirely means no Cc wake is ever gated.
 
 ```bash
 fork-sandbox fleet check              # validate everything, report every error
-fork-sandbox fleet resolve <name>     # twelve lines: harness, model, thinking,
+fork-sandbox fleet resolve <name>     # fifteen lines: harness, model, thinking,
                                       # network, persona-path, description,
                                       # wake-on-cc, refresh-at, triage,
-                                      # preset, handler, command
+                                      # preset, handler, command, backend,
+                                      # endpoint, grant
 fork-sandbox fleet resolve-triage     # two lines: harness, model, for the
                                       # top-level triage: block (see above);
                                       # every line empty when there is none
@@ -392,7 +393,7 @@ fork-sandbox fleet teardown --all     # destroy persistent (thread, agent)
 
 `check` accumulates every error across the fleet file and every persona
 it declares — addressed by path, like `agents.reviewer.modle` — rather
-than stopping at the first. `resolve` always prints exactly twelve lines;
+than stopping at the first. `resolve` always prints exactly fifteen lines;
 an unconfigured field is an empty line, never a missing one.
 
 `teardown` is how an operator reclaims a seat's persistent state (the
@@ -416,6 +417,65 @@ or agent, unexpanded — exactly as a real mailing-list archive keeps
 `To: list@example.com` rather than rewriting it to every subscriber.
 Change a list's membership and past mail is unaffected; future routing
 uses the new membership.
+
+## Per-thread k8s grants
+
+A `backend: k8s` seat (see "The fleet registry" above) runs its wake as a
+Kubernetes Job reviewing a per-thread preview environment, so it needs a
+per-thread egress grant: which cluster namespace(s)/ports it may reach,
+which host:port probes to run, and optionally a read-only context
+directory. Those values differ per thread and so cannot live in
+fleet.yaml; they live in a grant file instead, keyed by thread.
+
+Three fleet.yaml-only keys mark a seat this way and configure it (persona
+frontmatter refuses all three — a seat must not know its own backend):
+
+| key | values | rule |
+|---|---|---|
+| `backend` | `local` (default when absent) or `k8s` | anything else refused |
+| `endpoint` | RFC 1123 label (`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`) | only with `backend: k8s` |
+| `grant` | the literal string `required` | only with `backend: k8s` |
+
+`refresh-at` is accepted and ignored on a `backend: k8s` seat for now — the
+cluster path does not support session resume yet — rather than refused,
+since it may arrive from repo persona frontmatter the machine cannot
+unset.
+
+### The `grant` verb
+
+```bash
+fork-sandbox-mail.sh grant <thread-id> [--allow-namespace NS[:PORT]]...
+                              [--reach-probe HOST:PORT]... [--context-ro DIR]
+fork-sandbox-mail.sh grant <thread-id> --clear
+fork-sandbox-mail.sh grant <thread-id> --show [--json]
+```
+
+The value form writes (or replaces) the grant for an existing thread;
+`--clear` removes it (idempotent — exit 0 whether or not one existed);
+`--show` prints it back, plain or as one JSON object with `--json`. Every
+value is validated by `fork-sandbox-k8s.sh check-grant` before anything is
+written — see "Checking a grant ahead of time: `check-grant`" in
+docs/kubernetes-runs.md for the pairing rule, the per-probe checks and the
+exit codes (0 ok, 1 usage/unknown thread, 2 refused value); `grant` shares
+that exact behavior rather than re-checking anything itself.
+
+`mail send` accepts the same three flags to grant a brand-new thread at
+creation time; the check runs before the thread is created, so a refused
+value leaves nothing behind. `mail reply` refuses all three — a grant
+applies only at thread creation, never on an existing thread (use the
+`grant` verb for that instead).
+
+### The grant file as a read contract
+
+Path: `$MAIL_ROOT/.postmaster/grants/<thread-id>.env`. Written atomically
+(mktemp in the same directory, then `mv`), so a reader never observes a
+partial file. The body is `check-grant`'s stdout verbatim: repeatable
+`ALLOW_NAMESPACE=<value>` and `REACH_PROBE=<value>` lines, one per flag, in
+the order given, values exactly as given (not normalized), plus a trailing
+`CONTEXT_RO=<realpath>` line only when `--context-ro` was given.
+
+This file applies only to `backend: k8s` seats; a local seat on the same
+thread has nothing that reads it and ignores it by construction.
 
 ## The postmaster
 
