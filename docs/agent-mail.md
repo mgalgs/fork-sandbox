@@ -486,14 +486,28 @@ able to tell which backend woke it.
 
 A k8s wake still runs as one `fork-sandbox.sh --k8s` launch under
 `fork-sandbox-k8s-wake.sh`, the postmaster's async wrapper for it (see
-that script's own header) — every wake is a **fresh session**: none of
-`--session-state`/`--resume-session`/`--session-id`/`--clone-dir`/
-`--refresh-at` is passed (`fork-sandbox.sh` refuses all five with
-`--k8s` outright; seat continuity on k8s is later work). It also gets
-**no live delivery**: a message addressed to an agent already running a
-k8s wake just pends, the same fallback a non-claude harness gets locally
-(see "The wake" below) — there is no inbox hook to write a banner into
-mid-Job.
+that script's own header). A k8s seat keeps **one conversation** across
+wakes, the same way a local seat does:
+`--session-state`/`--resume-session`/`--session-id` are forwarded (the
+same host-side transcript store `fork-sandbox-k8s-entrypoint.sh` binds
+into the pod), and its wake picks up a `--checkout` too — the thread's
+own append-only run history is walked back to the newest run for this
+same agent, on EITHER backend, whose branch still resolves in the
+project repo, so a k8s wake resumes from that branch instead of always
+starting fresh from HEAD (a local seat gets this for free from its own
+persistent `--clone-dir`; a k8s seat's clone is fresh every wake, so this
+is how it gets the same lineage). `--clone-dir` and `--refresh-at` are
+still refused outright with `--k8s` — no durable per-seat clone and no
+mid-run credential refresh on k8s yet. A few accepted limits: a seat
+switching backend mid-thread is not "fixed" (a k8s-to-local resume starts
+from the local clone's own HEAD and ignores intervening k8s branches; a
+claude transcript may not resume across that switch at all, since the
+project slug differs; a local run left `fetched: NO` holds commits a
+later k8s wake will not see); and a transcript store over 256 MiB loses
+k8s continuity (warned about, not enforced). It also gets **no live
+delivery**: a message addressed to an agent already running a k8s wake
+just pends, the same fallback a non-claude harness gets locally (see "The
+wake" below) — there is no inbox hook to write a banner into mid-Job.
 
 A `grant: required` seat with no grant file yet for a thread **holds**
 instead of failing: the message itself still routes normally (Cc triage
