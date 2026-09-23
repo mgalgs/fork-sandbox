@@ -2906,20 +2906,6 @@ if [[ "$k8s_mode" == true ]]; then
         # before this whole --k8s block, already refused --review-harness pi
         # with no model, so review_model is guaranteed non-empty already.
     fi
-    if [[ "$refresh_at_given" == true ]]; then
-        echo "Error: --refresh-at is not supported with --k8s. It is measured by" >&2
-        echo "a hook fork-sandbox-inbox-hook.sh installs into the local" >&2
-        echo "sandbox's claude session; the pod runs a different entrypoint with" >&2
-        echo "no such hook." >&2
-        exit 1
-    fi
-    if [[ -n "$refresh_max_arg" ]]; then
-        echo "Error: --refresh-max is not supported with --k8s, for the same" >&2
-        echo "reason as --refresh-at: there is no context-refresh mechanism on" >&2
-        echo "the cluster path to cap." >&2
-        exit 1
-    fi
-
     # Which Claude credential the pod's claude CLI authenticates as:
     # --claude-credentials, else CLAUDE_CREDENTIALS in claude.env, else a
     # launcher-balanced choice from an operator-configured pool
@@ -3062,6 +3048,11 @@ if [[ "$k8s_mode" == true ]]; then
     [[ -n "$session_state" ]] && k8s_argv+=(--session-state "$session_state")
     [[ -n "$resume_session" ]] && k8s_argv+=(--resume-session "$resume_session")
     [[ -n "$session_id_arg" ]] && k8s_argv+=(--session-id "$session_id_arg")
+    # Forwarded raw and only when given: fork-sandbox-k8s.sh's cmd_submit
+    # resolves them with the same fs_refresh_resolve the local path uses, so
+    # the 0.5 default, "0 disables" and the pi refusal are applied there.
+    [[ "$refresh_at_given" == true ]] && k8s_argv+=(--refresh-at "$refresh_at_arg")
+    [[ -n "$refresh_max_arg" ]] && k8s_argv+=(--refresh-max "$refresh_max_arg")
     # fork-sandbox-k8s.sh's own submit is the one place that cross-checks
     # --pi-args against --harness (a claude run never starts pi, so it
     # refuses the combination there); this dispatch just carries the value
