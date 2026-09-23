@@ -792,6 +792,15 @@ POD_OUTBOX_DIR=/work/outbox
 # touches it.
 POD_CONTEXT_DIR=/work/context
 
+# The pod's harness session store, populated from a --session-state push
+# and read back by cmd_collect before cmd_fetch. Same sibling-of-clone
+# reasoning as POD_CONTEXT_DIR above -- it lives in the `work` emptyDir,
+# not its own top-level mount like POD_THREAD_DIR/POD_ATTACH_DIR below.
+# The entrypoint (fork-sandbox-k8s-entrypoint.sh) hardcodes this same
+# literal path on the pod side; the two are kept in sync by comment only,
+# the same convention POD_INBOX_DIR documents above.
+POD_SESSION_DIR=/work/session-store
+
 # The pod-side destinations for --thread-dir/--attach-dir, mirroring the
 # local sandbox's own /thread and /attachments paths so the postmaster's
 # generated prompt needs no idea which backend a wake landed on. Unlike
@@ -3115,6 +3124,7 @@ cmd_submit() {
     local context_ro="" harness="pi" review_model="" endpoint="" checkout_ref=""
     local pi_args="" services_trust_ref="" task_meta="" claude_credentials_flag=""
     local thread_dir="" attach_dir=""
+    local session_state="" resume_session="" session_id_arg=""
     local -a labels_raw=() allow_ns_raw=() reach_probe_raw=()
     while (( $# )); do
         case "$1" in
@@ -3132,6 +3142,9 @@ cmd_submit() {
             --context-ro) context_ro="${2:?--context-ro requires a directory}"; shift 2 ;;
             --thread-dir) thread_dir="${2:?--thread-dir requires a directory}"; shift 2 ;;
             --attach-dir) attach_dir="${2:?--attach-dir requires a directory}"; shift 2 ;;
+            --session-state) session_state="${2:?--session-state requires a directory}"; shift 2 ;;
+            --resume-session) resume_session="${2:?--resume-session requires a session id}"; shift 2 ;;
+            --session-id) session_id_arg="${2:?--session-id requires a session id}"; shift 2 ;;
             --claude-credentials) claude_credentials_flag="${2:?--claude-credentials requires a path}"; shift 2 ;;
             --label) labels_raw+=("${2:?--label requires key=value}"); shift 2 ;;
             --task-meta) task_meta="${2:?--task-meta requires a JSON object}"; shift 2 ;;
@@ -3323,6 +3336,17 @@ cmd_submit() {
     # the double quote and backslash, rather than anywhere pod-side.
     fs_reject_unsafe_chars "$branch" "$model" "$checkout_ref" "$pi_args" \
         "$services_trust_ref" || exit 1
+
+    # Re-validated independently here, the same defense-in-depth rule
+    # every other flag in this function follows (branch/model/checkout_ref
+    # above, claude_credentials_flag below): fork-sandbox.sh already ran
+    # this exact check before dispatch, but cmd_submit is directly
+    # callable (the postmaster calls it without going through
+    # fork-sandbox.sh at all), so the identical refusal must run again
+    # here, before anything is created. See fs_validate_session_flags in
+    # fork-sandbox-lib.sh.
+    session_state="$(fs_validate_session_flags "$harness" "$session_state" \
+        "$resume_session" "$session_id_arg")" || exit 1
     # pi_args is additionally embedded in the rendered Job's PI_ARGS env
     # var as a YAML double-quoted scalar, so a double quote or a
     # backslash is refused on top of the guard above: an unescaped quote
@@ -4002,6 +4026,35 @@ CENV
 )"
     fi
 
+    # SESSION_HARNESS_STORE/RESUME_SESSION/SESSION_ID: the pod-side half of
+    # continuity across wakes, set only when --session-state was given (a
+    # store was pushed below). RESUME_SESSION/SESSION_ID are already
+    # regex-validated by fs_validate_session_flags (hex and hyphens only),
+    # so unlike PI_ARGS above there is no double-quote/backslash concern
+    # for the YAML double-quoted scalar here.
+    local session_harness_store_env="" resume_session_env="" session_id_env=""
+    if [[ -n "$session_state" ]]; then
+        session_harness_store_env=$'\n'"$(cat <<CENV
+            - name: SESSION_HARNESS_STORE
+              value: "1"
+CENV
+)"
+    fi
+    if [[ "$harness" == claude && -n "$resume_session" ]]; then
+        resume_session_env=$'\n'"$(cat <<CENV
+            - name: RESUME_SESSION
+              value: "$resume_session"
+CENV
+)"
+    fi
+    if [[ "$harness" == pi && -n "$session_id_arg" ]]; then
+        session_id_env=$'\n'"$(cat <<CENV
+            - name: SESSION_ID
+              value: "$session_id_arg"
+CENV
+)"
+    fi
+
     # The sandbox-env ConfigMap key, present only when the services spec
     # carried a `sandboxEnv` map -- copied verbatim, pod-side, to
     # .env.sandbox in the clone (fork-sandbox-k8s-entrypoint.sh), the same
@@ -4208,7 +4261,7 @@ spec:
             - name: RUN_TTL
               value: "$K8S_RUN_TTL"
             - name: OUTBOX_MAX_BYTES
-              value: "$outbox_max_bytes"${model_discovery_env}${allow_unlisted_model_env}${review_loop_env}${claude_env}${review_model_env}${pi_args_env}
+              value: "$outbox_max_bytes"${model_discovery_env}${allow_unlisted_model_env}${review_loop_env}${claude_env}${review_model_env}${pi_args_env}${session_harness_store_env}${resume_session_env}${session_id_env}
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -4378,6 +4431,19 @@ EOF
             printf 'claude_credentials_source=%s\n' "${claude_credentials_override:-default}"
             printf 'claude_credentials_via=%s\n' "$claude_credentials_via"
         fi
+        # Read back by cmd_collect, before cmd_fetch, so a standalone
+        # collect (no run.env in scope of the calling process) still
+        # knows where to pull the session store from and which harness's
+        # discovery rules apply. fork-sandbox.sh's own local run.env
+        # carries no equivalent keys -- it never needs to round-trip this
+        # across a process boundary the way k8s's submit/collect split
+        # does -- so these key names are free; chosen to match the names
+        # fork-sandbox.sh's own --dry-run print block already uses for
+        # the same three flags, for a reader's sake, not because anything
+        # parses them positionally.
+        [[ -z "$session_state" ]] || printf 'session_state=%s\n' "$session_state"
+        [[ -z "$resume_session" ]] || printf 'resume_session=%s\n' "$resume_session"
+        [[ -z "$session_id_arg" ]] || printf 'session_id=%s\n' "$session_id_arg"
     } > "$run_dir/run.env"
 
     K8S_LAST_SUBMIT_RUN_DIR="$run_dir"
@@ -4389,6 +4455,7 @@ EOF
     K8S_SUBMIT_CONTEXT_TAR=""
     K8S_SUBMIT_THREAD_TAR=""
     K8S_SUBMIT_ATTACH_TAR=""
+    K8S_SUBMIT_SESSION_TAR=""
     if [[ -n "$context_ro" ]]; then
         context_tar="$(mktemp)"
         K8S_SUBMIT_CONTEXT_TAR="$context_tar"
@@ -4397,7 +4464,7 @@ EOF
         # trap -- so this one covers both: a tar/stat failure or an
         # over-cap archive here is still before any cluster object, and
         # must still take run_dir with it.
-        trap 'rm -f -- "${K8S_SUBMIT_CONTEXT_TAR:-}" "${K8S_SUBMIT_THREAD_TAR:-}" "${K8S_SUBMIT_ATTACH_TAR:-}"; rm -rf -- "$run_dir"' EXIT
+        trap 'rm -f -- "${K8S_SUBMIT_CONTEXT_TAR:-}" "${K8S_SUBMIT_THREAD_TAR:-}" "${K8S_SUBMIT_ATTACH_TAR:-}" "${K8S_SUBMIT_SESSION_TAR:-}"; rm -rf -- "$run_dir"' EXIT
         tar cf "$context_tar" -C "$context_ro" .
         context_size="$("$FS_STAT" -c '%s' -- "$context_tar")"
         if (( context_size > CONTEXT_MAX_BYTES )); then
@@ -4422,7 +4489,7 @@ EOF
     if [[ -n "$thread_dir" ]]; then
         thread_tar="$(mktemp)"
         K8S_SUBMIT_THREAD_TAR="$thread_tar"
-        trap 'rm -f -- "${K8S_SUBMIT_CONTEXT_TAR:-}" "${K8S_SUBMIT_THREAD_TAR:-}" "${K8S_SUBMIT_ATTACH_TAR:-}"; rm -rf -- "$run_dir"' EXIT
+        trap 'rm -f -- "${K8S_SUBMIT_CONTEXT_TAR:-}" "${K8S_SUBMIT_THREAD_TAR:-}" "${K8S_SUBMIT_ATTACH_TAR:-}" "${K8S_SUBMIT_SESSION_TAR:-}"; rm -rf -- "$run_dir"' EXIT
         k8s_spool_dir_entries "$thread_dir" "$thread_tar"
         thread_size="$("$FS_STAT" -c '%s' -- "$thread_tar")"
         if (( thread_size > CONTEXT_MAX_BYTES )); then
@@ -4436,13 +4503,43 @@ EOF
     if [[ -n "$attach_dir" ]]; then
         attach_tar="$(mktemp)"
         K8S_SUBMIT_ATTACH_TAR="$attach_tar"
-        trap 'rm -f -- "${K8S_SUBMIT_CONTEXT_TAR:-}" "${K8S_SUBMIT_THREAD_TAR:-}" "${K8S_SUBMIT_ATTACH_TAR:-}"; rm -rf -- "$run_dir"' EXIT
+        trap 'rm -f -- "${K8S_SUBMIT_CONTEXT_TAR:-}" "${K8S_SUBMIT_THREAD_TAR:-}" "${K8S_SUBMIT_ATTACH_TAR:-}" "${K8S_SUBMIT_SESSION_TAR:-}"; rm -rf -- "$run_dir"' EXIT
         k8s_spool_dir_entries "$attach_dir" "$attach_tar"
         attach_size="$("$FS_STAT" -c '%s' -- "$attach_tar")"
         if (( attach_size > CONTEXT_MAX_BYTES )); then
             echo "Error: --attach-dir directory '$attach_dir' tars to" >&2
             echo "$attach_size bytes, over the $CONTEXT_MAX_BYTES byte" >&2
             echo "(256 MiB) cap." >&2
+            exit 1
+        fi
+    fi
+
+    # The harness session store, pushed even when session_state maps to a
+    # brand-new (empty) directory -- unlike --context-ro/--thread-dir/
+    # --attach-dir above, which are pushed only when given at all, a run
+    # with --session-state must always end up with SOMETHING at
+    # POD_SESSION_DIR, since the entrypoint unconditionally reads it when
+    # SESSION_HARNESS_STORE=1 is set. mkdir+chmod here, not earlier: session_
+    # state was only validated (not created) by fs_validate_session_flags
+    # above, the same "nothing is created before --dry-run's exit" rule
+    # every other flag in this function follows -- and cmd_submit's own
+    # --dry-run exit is still ahead of this point. Same 0700 rule as the
+    # local path's equivalent (fork-sandbox.sh, session_state block): the
+    # store holds a whole conversation transcript.
+    local session_tar="" session_size=""
+    if [[ -n "$session_state" ]]; then
+        mkdir -p -- "$session_state"
+        chmod 700 -- "$session_state"
+        session_tar="$(mktemp)"
+        K8S_SUBMIT_SESSION_TAR="$session_tar"
+        trap 'rm -f -- "${K8S_SUBMIT_CONTEXT_TAR:-}" "${K8S_SUBMIT_THREAD_TAR:-}" "${K8S_SUBMIT_ATTACH_TAR:-}" "${K8S_SUBMIT_SESSION_TAR:-}"; rm -rf -- "$run_dir"' EXIT
+        tar cf "$session_tar" -C "$session_state" .
+        session_size="$("$FS_STAT" -c '%s' -- "$session_tar")"
+        if (( session_size > CONTEXT_MAX_BYTES )); then
+            echo "Error: --session-state directory '$session_state' tars to" >&2
+            echo "$session_size bytes, over the $CONTEXT_MAX_BYTES byte" >&2
+            echo "(256 MiB) cap. A store this large loses k8s continuity --" >&2
+            echo "see docs/kubernetes-runs.md." >&2
             exit 1
         fi
     fi
@@ -4483,7 +4580,7 @@ EOF
     K8S_SUBMIT_SAFE_NAME="$safe_name"
     K8S_SUBMIT_BRANCH="$branch"
     trap '
-        rm -f -- "${K8S_SUBMIT_CONTEXT_TAR:-}" "${K8S_SUBMIT_THREAD_TAR:-}" "${K8S_SUBMIT_ATTACH_TAR:-}"
+        rm -f -- "${K8S_SUBMIT_CONTEXT_TAR:-}" "${K8S_SUBMIT_THREAD_TAR:-}" "${K8S_SUBMIT_ATTACH_TAR:-}" "${K8S_SUBMIT_SESSION_TAR:-}"
         kubectl delete pod,service,secret,configmap,networkpolicy \
             -l fork-sandbox/branch="$K8S_SUBMIT_SAFE_NAME" --ignore-not-found >&2
         echo "fork-sandbox-k8s: submit failed -- removed this run'"'"'s cluster" >&2
@@ -4519,7 +4616,7 @@ EOF
         # pre-sized context archive, if this run has one.
         # K8S_SUBMIT_SAFE_NAME/K8S_SUBMIT_BRANCH are already set, above.
         trap '
-            rm -f -- "${K8S_SUBMIT_CONTEXT_TAR:-}" "${K8S_SUBMIT_THREAD_TAR:-}" "${K8S_SUBMIT_ATTACH_TAR:-}"
+            rm -f -- "${K8S_SUBMIT_CONTEXT_TAR:-}" "${K8S_SUBMIT_THREAD_TAR:-}" "${K8S_SUBMIT_ATTACH_TAR:-}" "${K8S_SUBMIT_SESSION_TAR:-}"
             kubectl delete secret "$K8S_SUBMIT_SAFE_NAME-claude-token" --ignore-not-found >&2
             kubectl delete pod,service,secret,configmap,networkpolicy \
                 -l fork-sandbox/branch="$K8S_SUBMIT_SAFE_NAME" --ignore-not-found >&2
@@ -4632,6 +4729,18 @@ EOF
         kubectl exec -i "$pod_name" -- sh /mnt/fork-sandbox/context-extract.sh \
             "$POD_ATTACH_DIR" "$CONTEXT_MAX_BYTES" context < "$attach_tar"
         rm -f -- "$attach_tar"
+    fi
+
+    # Same push, same extractor, same CALLER literal "context" as the three
+    # above -- pushed even for an empty store (session_tar always exists
+    # when session_state is set, see the spool above), so the pod always
+    # has SOMETHING at POD_SESSION_DIR once SESSION_HARNESS_STORE=1 tells
+    # the entrypoint to look.
+    if [[ -n "$session_state" ]]; then
+        echo "fork-sandbox-k8s: pushing session store ($session_state) to pod $pod_name" >&2
+        kubectl exec -i "$pod_name" -- sh /mnt/fork-sandbox/context-extract.sh \
+            "$POD_SESSION_DIR" "$CONTEXT_MAX_BYTES" context < "$session_tar"
+        rm -f -- "$session_tar"
     fi
 
     kubectl exec "$pod_name" -- sh -c 'touch /work/.inputs-complete'
@@ -5533,6 +5642,7 @@ cmd_run() {
     local outbox_dir="" outbox_max_arg="" context_ro="" harness="" review_model="" endpoint=""
     local checkout_ref="" pi_args="" services_trust_ref="" task_meta="" claude_credentials_flag=""
     local thread_dir="" attach_dir=""
+    local session_state="" resume_session="" session_id_arg=""
     local -a labels_raw=() allow_ns_raw=() reach_probe_raw=()
     while (( $# )); do
         case "$1" in
@@ -5553,6 +5663,9 @@ cmd_run() {
             --context-ro) context_ro="${2:?--context-ro requires a directory}"; shift 2 ;;
             --thread-dir) thread_dir="${2:?--thread-dir requires a directory}"; shift 2 ;;
             --attach-dir) attach_dir="${2:?--attach-dir requires a directory}"; shift 2 ;;
+            --session-state) session_state="${2:?--session-state requires a directory}"; shift 2 ;;
+            --resume-session) resume_session="${2:?--resume-session requires a session id}"; shift 2 ;;
+            --session-id) session_id_arg="${2:?--session-id requires a session id}"; shift 2 ;;
             --claude-credentials) claude_credentials_flag="${2:?--claude-credentials requires a path}"; shift 2 ;;
             --label) labels_raw+=("${2:?--label requires key=value}"); shift 2 ;;
             --task-meta) task_meta="${2:?--task-meta requires a JSON object}"; shift 2 ;;
@@ -5632,6 +5745,11 @@ cmd_run() {
     [[ -n "$context_ro" ]] && submit_argv+=(--context-ro "$context_ro")
     [[ -n "$thread_dir" ]] && submit_argv+=(--thread-dir "$thread_dir")
     [[ -n "$attach_dir" ]] && submit_argv+=(--attach-dir "$attach_dir")
+    # Forwarded unchanged, like --pi-args above: cmd_submit re-runs
+    # fs_validate_session_flags itself before anything is created.
+    [[ -n "$session_state" ]] && submit_argv+=(--session-state "$session_state")
+    [[ -n "$resume_session" ]] && submit_argv+=(--resume-session "$resume_session")
+    [[ -n "$session_id_arg" ]] && submit_argv+=(--session-id "$session_id_arg")
     [[ -n "$claude_credentials_flag" ]] && submit_argv+=(--claude-credentials "$claude_credentials_flag")
     # Passed through only when given, like every other optional option
     # above: an empty --checkout at submit's parse would be an argument
