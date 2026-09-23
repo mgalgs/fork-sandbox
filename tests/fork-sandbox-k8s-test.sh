@@ -6254,7 +6254,9 @@ case " $* " in
         # K8S_STUB_WORK_DIR is set, same trick as the outbox read above.
         if [[ -n "${K8S_STUB_WORK_DIR:-}" ]]; then
             ( cd "$K8S_STUB_WORK_DIR" && find . -maxdepth 1 \
-                \( -name "events*.jsonl" -o -name "pi-stderr.log" -o -name "claude-stderr.log" \) \
+                \( -name "events*.jsonl" -o -name "pi-stderr.log" -o -name "claude-stderr.log" \
+                   -o -name "claude-stderr-*.log" -o -name "handoff-*.md" -o -name "refresh.json" \
+                   -o -name "continuation-prompt-*.md" -o -name "refresh.log" \) \
                 | tar cf - --files-from=- ) || true
         fi
         [[ -n "${K8S_STUB_WORK_STDERR:-}" ]] && printf '%s' "$K8S_STUB_WORK_STDERR" >&2
@@ -6857,6 +6859,98 @@ if K8S_STUB_RUN_COMPLETE=0 K8S_STUB_BASE_SHA_RC=1 K8S_STUB_FETCH_REF="$collect_u
 else
     no "an unreadable base with new commits fetched writes commits: null, not 0" \
         "collect exited nonzero: $(cat "$collect_out22")"
+fi
+
+# Refresh records in summary.json. Three shapes, each on a hand-built run
+# dir: disabled (no refresh_threshold_tokens in run.env) -> "none" and [];
+# enabled with the pod's refresh.json pulled -> its ended and continuations
+# (no cost or usage inside an entry); enabled with no usable refresh.json
+# (missing, or garbage) -> both keys ABSENT and a warning.
+refresh_sum_branch=fs-k8s-test-collect-refresh-summary
+git -C "$proj_dir" update-ref "refs/heads/$refresh_sum_branch" "$(git -C "$proj_dir" rev-parse HEAD)"
+refresh_sum_case() {
+    # refresh_sum_case <tag> <threshold-or-empty> <work-dir>; sets
+    # refresh_sum_rd and refresh_sum_out, returns collect's status.
+    local tag="$1" tokens="$2" work="$3"
+    refresh_sum_rd="$(mktemp -d /var/tmp/claude-scratch/forks/claude-fork-sandbox.XXXXXX)"; tmpdirs+=("$refresh_sum_rd")
+    {
+        printf 'mode=run\n'
+        printf 'harness=claude\n'
+        printf 'model=some-model\n'
+        [[ -z "$tokens" ]] || printf 'refresh_threshold_tokens=%s\n' "$tokens"
+    } > "$refresh_sum_rd/run.env"
+    printf 'test\n' > "$refresh_sum_rd/run-source"
+    local klog
+    klog="$(newdir)/kubectl.log"; refresh_sum_out="$(newdir)/out-$tag.txt"; refresh_sum_dest="$(newdir)/outbox-$tag"
+    tmpdirs+=("$(dirname "$klog")" "$(dirname "$refresh_sum_dest")")
+    K8S_STUB_WORK_DIR="$work" K8S_STUB_RUN_COMPLETE=0 K8S_STUB_FETCH_REF="$refresh_sum_branch" \
+        K8S_STUB_OUTBOX_DIR="$refresh_sum_outbox" K8S_STUB_OUTBOX_RC=0 \
+        collectstub_collect "$klog" "$refresh_sum_out" \
+        --branch "$refresh_sum_branch" --outbox-dir "$refresh_sum_dest" \
+        --run-dir "$refresh_sum_rd" "$proj_dir"
+}
+refresh_sum_work="$(newdir)/pod-work-rs"; tmpdirs+=("$refresh_sum_work")
+mkdir -p -- "$refresh_sum_work"
+# An outbox with an agent-written file, so collect does not call the run
+# a zero-harvest and exit 3.
+refresh_sum_outbox="$(newdir)/outbox-rs"; tmpdirs+=("$refresh_sum_outbox")
+mkdir -p -- "$refresh_sum_outbox"
+printf 'reply\n' > "$refresh_sum_outbox/reply.md"
+printf '{"type":"result"}\n' > "$refresh_sum_work/events.jsonl"
+printf '{"type":"result"}\n' > "$refresh_sum_work/events-continuation-1.jsonl"
+printf 'handoff one\n' > "$refresh_sum_work/handoff-1.md"
+printf 'prompt one\n' > "$refresh_sum_work/continuation-prompt-1.md"
+printf 'stderr one\n' > "$refresh_sum_work/claude-stderr-continuation-1.log"
+printf 'notes\n' > "$refresh_sum_work/refresh.log"
+printf 'not evidence\n' > "$refresh_sum_work/notes.md"
+
+# disabled
+if refresh_sum_case dis "" "$refresh_sum_work" \
+    && [[ "$(jq -c '[.refresh, .continuations]' "$refresh_sum_rd/summary.json")" == '["none",[]]' ]]; then
+    ok "collect: a run without refresh writes refresh none and continuations []"
+else
+    no "collect: a run without refresh writes refresh none and continuations []" \
+        "summary=$(cat "$refresh_sum_rd/summary.json" 2>/dev/null; echo NOFILE) out=$(cat "$refresh_sum_out")"
+fi
+
+# enabled, refresh.json pulled
+printf '%s\n' '{"ended":"cap","continuations":[{"leg":2,"exit":0,"handoff":"/work/handoff-1.md","handoff_stale":false,"cost_usd":9}]}' \
+    > "$refresh_sum_work/refresh.json"
+if refresh_sum_case en 100000 "$refresh_sum_work" \
+    && [[ "$(jq -r '.refresh' "$refresh_sum_rd/summary.json")" == cap ]] \
+    && [[ "$(jq -r '.continuations | length' "$refresh_sum_rd/summary.json")" == 1 ]] \
+    && [[ "$(jq -r '.continuations[0].leg' "$refresh_sum_rd/summary.json")" == 2 ]] \
+    && [[ "$(jq -r '.continuations[0].handoff' "$refresh_sum_rd/summary.json")" == /work/handoff-1.md ]] \
+    && [[ "$(jq -r '.continuations[0] | has("cost_usd")' "$refresh_sum_rd/summary.json")" == false ]] \
+    && ! grep -q 'no usable refresh.json' "$refresh_sum_out" \
+    && refresh_sum_ev="$(dirname -- "$refresh_sum_dest")/evidence" \
+    && [[ -f "$refresh_sum_ev/handoff-1.md" && -f "$refresh_sum_ev/continuation-prompt-1.md" ]] \
+    && [[ -f "$refresh_sum_ev/claude-stderr-continuation-1.log" && -f "$refresh_sum_ev/refresh.json" ]] \
+    && [[ -f "$refresh_sum_ev/events-continuation-1.jsonl" && ! -e "$refresh_sum_ev/notes.md" ]]; then
+    ok "collect: an enabled run copies ended and continuations from the pulled refresh.json"
+else
+    no "collect: an enabled run copies ended and continuations from the pulled refresh.json" \
+        "summary=$(cat "$refresh_sum_rd/summary.json" 2>/dev/null; echo NOFILE) out=$(cat "$refresh_sum_out")"
+fi
+
+# enabled, refresh.json garbage, then missing
+printf 'not json{\n' > "$refresh_sum_work/refresh.json"
+if refresh_sum_case bad 100000 "$refresh_sum_work" \
+    && [[ "$(jq -r 'has("refresh") or has("continuations")' "$refresh_sum_rd/summary.json")" == false ]] \
+    && grep -q 'no usable refresh.json' "$refresh_sum_out"; then
+    ok "collect: an unparseable refresh.json leaves both keys absent and warns"
+else
+    no "collect: an unparseable refresh.json leaves both keys absent and warns" \
+        "summary=$(cat "$refresh_sum_rd/summary.json" 2>/dev/null; echo NOFILE) out=$(cat "$refresh_sum_out")"
+fi
+rm -f -- "$refresh_sum_work/refresh.json"
+if refresh_sum_case gone 100000 "$refresh_sum_work" \
+    && [[ "$(jq -r 'has("refresh") or has("continuations")' "$refresh_sum_rd/summary.json")" == false ]] \
+    && grep -q 'no usable refresh.json' "$refresh_sum_out"; then
+    ok "collect: a missing refresh.json leaves both keys absent and warns"
+else
+    no "collect: a missing refresh.json leaves both keys absent and warns" \
+        "summary=$(cat "$refresh_sum_rd/summary.json" 2>/dev/null; echo NOFILE) out=$(cat "$refresh_sum_out")"
 fi
 
 printf '\n== submit/run: pushing /work/session-store ==\n'
@@ -9340,6 +9434,7 @@ refresh_block_run() {
     cp "$repo_dir/scripts/fork-sandbox-refresh.sh" "$mounts/refresh.sh"
     printf '{}' > "$mounts/claude-credentials.json"
     printf '#!/usr/bin/env bash\nexit 0\n' > "$mounts/inbox-hook.sh"
+    # shellcheck disable=SC1003  # a literal backslash inside the generated stub
     printf '%s\n' '#!/usr/bin/env bash' \
         'n=$(( $(cat "$RB_REC/count" 2>/dev/null || echo 0) + 1 ))' \
         'echo "$n" > "$RB_REC/count"' \

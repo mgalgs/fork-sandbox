@@ -5511,7 +5511,7 @@ cmd_collect() {
     events_tar="$(mktemp)"
     events_err="$(mktemp)"
     kubectl exec --request-timeout=60s "$pod_name" -- \
-            sh -c 'cd /work && find . -maxdepth 1 -name "events*.jsonl" -o -name "pi-stderr.log" -o -name "claude-stderr.log" | tar cf - --files-from=-' \
+            sh -c 'cd /work && find . -maxdepth 1 -name "events*.jsonl" -o -name "pi-stderr.log" -o -name "claude-stderr.log" -o -name "claude-stderr-*.log" -o -name "handoff-*.md" -o -name "continuation-prompt-*.md" -o -name "refresh.json" -o -name "refresh.log" | tar cf - --files-from=-' \
             2> "$events_err" \
             | head -c "$((FS_RUN_EVIDENCE_MAX_BYTES + 1))" > "$events_tar" \
             || events_rc=$?
@@ -5789,6 +5789,24 @@ cmd_collect() {
         if [[ -n "$pull_session_state" ]]; then
             run_log_session_id="$(fs_session_discover_id "$run_log_harness" "$pull_session_state" "$pull_session_id")"
         fi
+        # The refresh keys, same three-way shape as the local summary:
+        # disabled (no threshold in run.env) is "none" and []; enabled
+        # takes the pod's own refresh.json, pulled as evidence above; and
+        # enabled with no usable record leaves both keys ABSENT (a warning,
+        # not "none": the run was set to refresh and we cannot say whether
+        # it did). The pod records no per-continuation cost or usage.
+        local run_log_refresh_block='{"refresh":"none","continuations":[]}'
+        local run_log_refresh_tokens run_log_refresh_json
+        run_log_refresh_tokens="$(read_env_value "$run_dir/run.env" refresh_threshold_tokens || true)"
+        if [[ -n "$run_log_refresh_tokens" ]]; then
+            if run_log_refresh_json="$(jq -ce 'select((.ended | type == "string") and (.continuations | type == "array")) | {refresh: .ended, continuations: [.continuations[] | {leg, exit, handoff, handoff_stale}]}' < "$evidence_dir/refresh.json" 2>/dev/null)" \
+                && [[ -n "$run_log_refresh_json" ]]; then
+                run_log_refresh_block="$run_log_refresh_json"
+            else
+                run_log_refresh_block='{}'
+                echo "fork-sandbox-k8s: warning: this run had --refresh-at enabled but no usable refresh.json came back from the pod; summary.json carries no refresh or continuations keys." >&2
+            fi
+        fi
         jq -n \
             --arg mode "run" \
             --arg harness "$run_log_harness" \
@@ -5803,6 +5821,7 @@ cmd_collect() {
             --arg claude_credentials_via "$run_log_claude_via" \
             --arg session_state "$pull_session_state" \
             --arg session_id "$run_log_session_id" \
+            --argjson refresh_block "$run_log_refresh_block" \
             '{
                 mode: $mode,
                 harness: $harness,
@@ -5821,7 +5840,8 @@ cmd_collect() {
             + (if $session_state == "" then {} else {
                 session_state: $session_state,
                 session_id: (if $session_id == "" then null else $session_id end),
-            } end)' > "$run_dir/summary.json" 2>/dev/null \
+            } end)
+            + $refresh_block' > "$run_dir/summary.json" 2>/dev/null \
             || rm -f "$run_dir/summary.json"
 
         fs_record_run_log "$run_dir"
