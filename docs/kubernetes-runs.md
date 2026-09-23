@@ -1487,6 +1487,60 @@ directory — a general "hand the pod any host path" mechanism, or a
 provisioned cache shared across runs — has no broader answer yet; that
 remains a later round, once real usage says what shape it should take.
 
+## Getting files in: --thread-dir and --attach-dir
+
+A local sandbox run accepts `--thread-dir DIR` (bound read-only at
+`/thread`, where the agent reads `thread.txt`) and `--attach-dir DIR`
+(bound read-only at `/attachments`) — the two flags a fleet postmaster
+passes on every wake. The cluster path accepts the same two flags and
+lands their content at the same two in-pod paths, `/thread` and
+`/attachments`, for the same reason `--context-ro` and the repository push
+already share one transport instead of each backend inventing its own: the
+postmaster's generated prompt names those paths once, and a seat must not
+need to know whether the wake it is answering landed on a local bwrap
+sandbox or a cluster pod.
+
+The transport is `--context-ro`'s, reused rather than duplicated: each
+directory is spooled to its own tar and pushed with its own `kubectl exec
+-i <pod> -- sh .../context-extract.sh DEST MAX_BYTES CALLER` over the same
+gated channel, in the same window — after the repository push, before the
+`.inputs-complete` sentinel — so a failed push fails the run closed rather
+than leaving a half-received directory for the agent to find. Both flags
+are capped at the same `CONTEXT_MAX_BYTES` (256 MiB) `--context-ro` uses,
+checked twice, independently, exactly as `--context-ro` is: on the host
+before anything is created or pushed, and again by the pod-side extractor
+before it extracts anything. They also reuse `--context-ro`'s own `context`
+CALLER on the extractor rather than adding new arms — the ceiling is
+identical either way, so a separate arm would be pure duplication.
+
+Validation differs from `--context-ro` in exactly one way, deliberately:
+`--thread-dir`/`--attach-dir` use `fs_validate_scratch_dir`, the same
+whole-scratch-root rule the LOCAL `--thread-dir`/`--attach-dir` flags
+apply to their own bind, not `--context-ro`'s narrower rule requiring a
+path under `/var/tmp/claude-scratch/forks/`. The postmaster stages both
+directories under its own mail root, which sits under the scratch root but
+not under `forks/`, so holding these two flags to `--context-ro`'s rule
+would refuse every real postmaster wake. Everything else `--context-ro`
+checks on the host still applies: DIR must be a real, existing directory,
+and it must not contain a symlink or a hard-linked file, refused before
+anything is created or pushed — a `tar cf` walk turns either into a link
+entry, which the pod-side extractor also refuses, but only after the Job
+exists, the pod is Ready, and the repository has already been pushed.
+
+The destination in each case is an `emptyDir` volume, mounted on the agent
+container at `/thread` or `/attachments`, rendered only when the matching
+flag is given. The mount has to exist before the extractor can write into
+it: the pod's root filesystem is read-only, so nothing could `mkdir
+/thread` or `/attachments` otherwise. That emptyDir is writable, not
+read-only — unlike the local flag's real `--bind-ro`, an emptyDir cannot be
+bound read-only per subdirectory, so read-only here is a convention the
+agent is expected to honor, not a filesystem guarantee, exactly like
+`--context-ro`'s own not-really-read-only emptyDir above. This is accepted
+rather than treated as a gap to close: the pod's copy is a disposable
+per-wake copy, and the host directory named by `--thread-dir`/
+`--attach-dir` is never written back, so an agent writing into its own
+in-pod `/thread` or `/attachments` only ever harms its own view of it.
+
 ## Per-run services
 
 A repo commits `.agents/sandbox-services/services.yaml` to get throwaway
