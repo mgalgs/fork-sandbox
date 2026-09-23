@@ -1,0 +1,11 @@
+# BuildKit's per-Dockerfile ignore file for images/postmaster/Dockerfile.
+# The build context is the repo root (the Dockerfile COPYs scripts/, share/
+# and manifests/ from it), so without this file the whole checkout -- .git,
+# every untracked file, every other image's build context -- would enter the
+# build. Exclude everything, then allow back in only what the Dockerfile
+# actually COPYs.
+*
+!scripts/
+!share/
+!manifests/
+scripts/__pycache__

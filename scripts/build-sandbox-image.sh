@@ -2,6 +2,7 @@
 # build-sandbox-image.sh -- Build the sandbox image the container backend runs
 #
 # Usage: build-sandbox-image.sh [--tag NAME] [--claude VER] [--codex VER] [--pi VER] [--no-cache]
+#        build-sandbox-image.sh --postmaster --base IMAGE [--tag NAME] [--no-cache]
 #
 # The container backend gets its userland from an image rather than from the
 # host, which is what makes macOS possible and what makes the toolchain this
@@ -15,6 +16,18 @@
 #
 #   export FORK_SANDBOX_BACKEND=container
 #   export FORK_SANDBOX_CONTAINER_IMAGE=fork-sandbox:latest
+#
+# --postmaster builds images/postmaster/Dockerfile instead: a thin layer
+# (ssh, kubectl, this checkout's scripts/share/manifests) over an already-
+# built sandbox image, for running fork-sandbox-postmaster.sh as a cluster
+# Deployment -- see docs/cluster-postmaster.md. --base names that sandbox
+# image and is required with --postmaster; this script reads no config file,
+# so it cannot default --base the way K8S_IMAGE defaults it elsewhere.
+# --tag still overrides the default, which is
+# fork-sandbox-postmaster:<git short sha>, with -dirty appended when the
+# working tree has uncommitted changes. --claude/--codex/--pi do not apply
+# (the base image already decided those) and are refused together with
+# --postmaster.
 #
 # This script never pushes anywhere, and this project never ships a built
 # image or a registry of its own -- deliberately: the image carries the agent
@@ -37,11 +50,14 @@ set -euo pipefail
 script_dir="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 repo_root="$(dirname "$script_dir")"
 dockerfile="$repo_root/images/sandbox/Dockerfile"
+postmaster_dockerfile="$repo_root/images/postmaster/Dockerfile"
 
-TAG="fork-sandbox:latest"
+TAG=""
 CLAUDE_VERSION="latest"
 CODEX_VERSION="latest"
 PI_VERSION="latest"
+POSTMASTER=false
+BASE_IMAGE=""
 EXTRA=()
 
 while (( $# )); do
@@ -50,6 +66,8 @@ while (( $# )); do
         --claude) CLAUDE_VERSION="${2:?--claude requires a version or 'none'}"; shift 2 ;;
         --codex) CODEX_VERSION="${2:?--codex requires a version or 'none'}"; shift 2 ;;
         --pi) PI_VERSION="${2:?--pi requires a version or 'none'}"; shift 2 ;;
+        --postmaster) POSTMASTER=true; shift ;;
+        --base) BASE_IMAGE="${2:?--base requires an image reference}"; shift 2 ;;
         --no-cache) EXTRA+=(--no-cache); shift ;;
         -h|--help)
             sed -n '2,/^$/p' "$(readlink -f "${BASH_SOURCE[0]}")" | sed 's/^# \{0,1\}//'
@@ -66,6 +84,51 @@ command -v "$CLI" >/dev/null || {
     echo "Docker-compatible CLI under another name." >&2
     exit 1
 }
+
+if [[ "$POSTMASTER" == true ]]; then
+    [[ -z "$BASE_IMAGE" ]] && {
+        echo "Error: --postmaster requires --base IMAGE -- the sandbox image" >&2
+        echo "(built by this same script, without --postmaster) to layer" >&2
+        echo "ssh and kubectl on top of." >&2
+        exit 1
+    }
+    [[ -f "$postmaster_dockerfile" ]] || {
+        echo "Error: $postmaster_dockerfile not found. Run this from a" >&2
+        echo "fork-sandbox checkout." >&2
+        exit 1
+    }
+
+    commit="$(git -C "$repo_root" rev-parse HEAD 2>/dev/null || echo unknown)"
+    short_sha="$(git -C "$repo_root" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+    dirty=""
+    if [[ -n "$(git -C "$repo_root" status --porcelain 2>/dev/null)" ]]; then
+        dirty="-dirty"
+        echo "Warning: working tree has uncommitted changes; tagging -dirty." >&2
+    fi
+    [[ -z "$TAG" ]] && TAG="fork-sandbox-postmaster:${short_sha}${dirty}"
+
+    echo "Building $TAG from $postmaster_dockerfile" >&2
+    echo "  base=$BASE_IMAGE" >&2
+
+    "$CLI" build \
+        --tag "$TAG" \
+        --file "$postmaster_dockerfile" \
+        --build-arg "BASE_IMAGE=$BASE_IMAGE" \
+        --build-arg "FORK_SANDBOX_COMMIT=$commit" \
+        "${EXTRA[@]+"${EXTRA[@]}"}" \
+        "$repo_root"
+
+    echo "" >&2
+    echo "Built $TAG. What is inside it:" >&2
+    "$CLI" run --rm --entrypoint cat "$TAG" /etc/fork-sandbox-image >&2 || true
+    echo "" >&2
+    echo "Push it to the registry your cluster pulls from, then set:" >&2
+    echo "  K8S_POSTMASTER_IMAGE=$TAG" >&2
+    exit 0
+fi
+
+[[ -z "$TAG" ]] && TAG="fork-sandbox:latest"
+
 [[ -f "$dockerfile" ]] || {
     echo "Error: $dockerfile not found. Run this from a fork-sandbox checkout." >&2
     exit 1
