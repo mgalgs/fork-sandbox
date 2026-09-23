@@ -9566,73 +9566,13 @@ removed_json=false
 (( removed )) && removed_json=true
 session_dir_json=""
 [[ -d "$run_dir/pi-session" ]] && session_dir_json="$run_dir/pi-session"
-# With --session-state, name the session a later run could resume. Which
-# harnesses get here at all, and whether the id is discovered or was given
-# up front, comes from fs_harness_session_caps (FS_HARNESS_ID_MODE), not a
-# harness-name check.
-#
-# For "discover" harnesses (claude, codex): the CLI files each transcript
-# under a per-project directory of the store, keyed by its own session id,
-# and records nowhere which one is this run's, so this is a documented
-# heuristic: the newest by mtime. A --refresh-at chain writes one transcript
-# per leg and the newest is the leg a resume should continue; only the
-# coding legs are bound at all, so no review or maintainer conversation
-# competes for newest (see --session-state in the header). Empty when the
-# flag was not given, or when the store has no transcript -- a session that
-# died before writing one.
-#
-# For "given" harnesses (pi): the id was supplied by the caller via
-# --session-id and pi's own create-if-missing behavior makes resume
-# implicit, so it is simply echoed back -- there is nothing to discover.
-#
-# The mtimes come from GNU stat, which fs_require_gnu_tools has already
-# proven is on PATH, and not from `find -printf`: that flag is GNU findutils
-# only, and `brew install coreutils` does not supply find. On macOS -- a
-# platform the container backend supports -- BSD find would reject it, and
-# with its error swallowed this would report session_id as null on every
-# single run, which is a silent no-op rather than a failure anyone can see.
-# find itself is given only -maxdepth/-name/-print0, which BSD find has.
+# With --session-state, name the session a later run could resume. See
+# fs_session_discover_id in fork-sandbox-lib.sh for the discovery rules.
+# Empty when the flag was not given, or when the store has no transcript --
+# a session that died before writing one.
 session_id_json=""
 if [[ -n "$session_state" ]]; then
-    fs_harness_session_caps "$harness"
-    case "$FS_HARNESS_ID_MODE" in
-    given)
-        # pi: create-if-missing means the id is meaningful the moment
-        # --session-id was passed, whether or not the sandbox ever actually
-        # started -- there is nothing to discover.
-        session_id_json="$session_id_given"
-        ;;
-    discover)
-        if [[ -d "$session_state" ]]; then
-            transcripts=()
-            case "$harness" in
-            codex) find_maxdepth=5 ;;
-            *) find_maxdepth=2 ;;
-            esac
-            while IFS= read -r -d '' transcript_file; do
-                transcripts+=("$transcript_file")
-            done < <(find "$session_state" -maxdepth "$find_maxdepth" \
-                -name '*.jsonl' -type f -print0 2>/dev/null)
-            if (( ${#transcripts[@]} )); then
-                newest_transcript="$("$FS_STAT" -c '%Y %n' -- "${transcripts[@]}" \
-                    | sort -rn | head -1)"
-                if [[ -n "$newest_transcript" ]]; then
-                    stem="$(basename "${newest_transcript#* }" .jsonl)"
-                    if [[ "$harness" == codex ]]; then
-                        # codex rollout filenames are
-                        # rollout-<timestamp>-<uuid>.jsonl; a UUID is always
-                        # exactly 36 characters, so take the last 36 rather
-                        # than stripping a timestamp prefix whose format is
-                        # not this script's contract to track.
-                        session_id_json="${stem: -36}"
-                    else
-                        session_id_json="$stem"
-                    fi
-                fi
-            fi
-        fi
-        ;;
-    esac
+    session_id_json="$(fs_session_discover_id "$harness" "$session_state" "$session_id_given")"
 fi
 ended_at="$(date +%s)"
 

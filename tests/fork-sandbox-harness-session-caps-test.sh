@@ -82,5 +82,31 @@ check "resumable resets to false" "false" "$FS_HARNESS_RESUMABLE"
 check "session root resets to empty" "" "$FS_HARNESS_SESSION_ROOT"
 check "id mode resets to empty" "" "$FS_HARNESS_ID_MODE"
 
+echo ""
+echo "== fs_session_discover_id: given mode echoes =="
+check "pi given mode echoes the supplied id" "abc-123" \
+    "$(fs_session_discover_id pi "" "abc-123")"
+
+echo ""
+echo "== fs_session_discover_id: discover mode, empty/missing dir =="
+discover_tmp="$(mktemp -d)"
+trap 'rm -rf -- "$discover_tmp"' EXIT
+check "no store dir yields empty" "" \
+    "$(fs_session_discover_id claude "$discover_tmp/does-not-exist" "")"
+mkdir -p "$discover_tmp/empty-project"
+check "an empty store dir yields empty" "" \
+    "$(fs_session_discover_id claude "$discover_tmp/empty-project" "")"
+
+echo ""
+echo "== fs_session_discover_id: discover mode, newest mtime wins =="
+mkdir -p "$discover_tmp/proj/sub"
+touch -d '2024-01-01 00:00:00' "$discover_tmp/proj/older-session.jsonl"
+touch -d '2024-01-02 00:00:00' "$discover_tmp/proj/sub/newer-session.jsonl"
+check "the newest transcript's stem wins" "newer-session" \
+    "$(fs_session_discover_id claude "$discover_tmp/proj" "")"
+
+rm -rf -- "$discover_tmp"
+trap - EXIT
+
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 (( fail == 0 )) || exit 1
