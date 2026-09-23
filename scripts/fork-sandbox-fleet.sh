@@ -22,9 +22,12 @@
 #   - The fleet file, a YAML mapping of `agents` (name -> optional
 #     persona/harness/model/network/thinking/wake-on-cc/refresh-at/triage/
 #     preset overrides, OR handler/command for a script seat -- see
-#     "Handler seats" below), `lists` (name -> members, a list of agent names),
-#     and an optional top-level `triage` block (harness/model for the
-#     wake classifier's own sandbox seat -- see `resolve-triage` below).
+#     "Handler seats" below; plus backend/endpoint/grant, fleet.yaml-only
+#     keys with their own rules -- see fork-sandbox-fleet-parse.py's
+#     module docstring, not restated here), `lists` (name -> members, a
+#     list of agent names), and an optional top-level `triage` block
+#     (harness/model for the wake classifier's own sandbox seat -- see
+#     `resolve-triage` below).
 #     $FORK_SANDBOX_FLEET_FILE, default ~/.config/fork-sandbox/fleet.yaml.
 #
 # Precedence per seat field is fleet.yaml agent entry, then persona
@@ -85,16 +88,21 @@
 #                  operator's mail address, see docs/agent-mail.md) --
 #                  either would let the reserved address resolve as a
 #                  real seat.
-#   resolve <name> Print exactly twelve lines for one agent: harness,
+#   resolve <name> Print exactly fifteen lines for one agent: harness,
 #                  model, thinking, network, persona-path, description,
 #                  wake-on-cc, refresh-at, triage, preset, handler,
-#                  command. A field with nothing configured anywhere
-#                  prints as an empty line -- output is always twelve
-#                  lines, never fewer. A handler seat's harness/model/
-#                  thinking/network/triage/preset/refresh-at lines are
-#                  always empty (refused together at `check` time); its
-#                  handler/command lines are the only ones populated
-#                  besides persona-path/description/wake-on-cc.
+#                  command, backend, endpoint, grant. A field with
+#                  nothing configured anywhere prints as an empty line --
+#                  output is always fifteen lines, never fewer. A handler
+#                  seat's harness/model/thinking/network/triage/preset/
+#                  refresh-at lines are always empty (refused together at
+#                  `check` time); its handler/command lines are the only
+#                  ones populated besides persona-path/description/
+#                  wake-on-cc. The last three (backend/endpoint/grant) are
+#                  fleet.yaml-only (see fork-sandbox-fleet-parse.py's
+#                  module docstring for their rules) and so carry no
+#                  persona-frontmatter fallback -- printed straight from
+#                  the fleet file, empty when unset.
 #   resolve-triage Print exactly two lines for the wake classifier's own
 #                  sandbox seat: harness, model. Reads only the fleet
 #                  file's top-level `triage` block (no persona fallback --
@@ -326,6 +334,7 @@ fleet_read_agent() {
     fleet_network="" fleet_thinking="" fleet_description=""
     fleet_wake_on_cc="" fleet_refresh_at="" fleet_triage=""
     fleet_preset="" fleet_handler="" fleet_command=""
+    fleet_backend="" fleet_endpoint="" fleet_grant=""
     agent_declared=0
     [[ -n "$dump" ]] || return 0
     while IFS=$'\t' read -r kind aname field value; do
@@ -344,6 +353,9 @@ fleet_read_agent() {
             preset) fleet_preset="$value" ;;
             handler) fleet_handler="$value" ;;
             command) fleet_command="$value" ;;
+            backend) fleet_backend="$value" ;;
+            endpoint) fleet_endpoint="$value" ;;
+            grant) fleet_grant="$value" ;;
         esac
     done <<< "$dump"
 }
@@ -415,6 +427,11 @@ resolve_with_dump() {
     # the header's "Handler seats" paragraph.
     printf '%s\n' "$fleet_handler"
     printf '%s\n' "$fleet_command"
+    # backend/endpoint/grant are likewise fleet.yaml-only -- no
+    # frontmatter fallback, see fork-sandbox-fleet-parse.py's docstring.
+    printf '%s\n' "$fleet_backend"
+    printf '%s\n' "$fleet_endpoint"
+    printf '%s\n' "$fleet_grant"
 }
 
 cmd_resolve() {

@@ -494,11 +494,12 @@ export FORK_SANDBOX_FLEET_FILE="$saved"
 printf '\n== resolve ==\n'
 
 resolve_lines() {
-    # Reads the twelve-line contract into named globals for assertions.
+    # Reads the fifteen-line contract into named globals for assertions.
     { read -r r_harness; read -r r_model; read -r r_thinking; read -r r_network; \
       read -r r_persona; read -r r_description; read -r r_wake_on_cc; \
       read -r r_refresh_at; read -r r_triage; read -r r_preset; \
-      read -r r_handler; read -r r_command; } < <("$fleet" resolve "$1")
+      read -r r_handler; read -r r_command; read -r r_backend; \
+      read -r r_endpoint; read -r r_grant; } < <("$fleet" resolve "$1")
 }
 
 resolve_lines riffler
@@ -523,12 +524,15 @@ check "resolve: all-empty agent, triage empty" "" "$r_triage"
 check "resolve: all-empty agent, preset empty" "" "$r_preset"
 check "resolve: all-empty agent, handler empty" "" "$r_handler"
 check "resolve: all-empty agent, command empty" "" "$r_command"
+check "resolve: all-empty agent, backend empty" "" "$r_backend"
+check "resolve: all-empty agent, endpoint empty" "" "$r_endpoint"
+check "resolve: all-empty agent, grant empty" "" "$r_grant"
 check "resolve: all-empty agent still resolves a persona path" "$FORK_SANDBOX_PERSONAS_DIR/tuner.md" "$r_persona"
 
 # Piped, not captured via $(...): command substitution strips trailing
 # newlines, which would silently swallow the count when the last field
-# (command) is empty, as it is for tuner.
-check "resolve: output is exactly twelve lines" "12" "$("$fleet" resolve tuner | wc -l)"
+# (grant) is empty, as it is for tuner.
+check "resolve: output is exactly fifteen lines" "15" "$("$fleet" resolve tuner | wc -l)"
 
 printf '\n== resolve: wake-on-cc / refresh-at ==\n'
 
@@ -812,6 +816,156 @@ rm -rf "$PRESETS_TEST_DIR/dirpreset.yaml"
 
 printf '%s\n' "$saved_fleet_for_preset" > "$FORK_SANDBOX_FLEET_FILE"
 unset FORK_SANDBOX_PRESETS_DIR
+
+printf '\n== backend ==\n'
+
+saved_fleet_for_backend="$(cat "$FORK_SANDBOX_FLEET_FILE")"
+saved_riffler_md_for_backend="$(cat "$FORK_SANDBOX_PERSONAS_DIR/riffler.md")"
+
+cat > "$FORK_SANDBOX_FLEET_FILE" <<'EOF'
+agents:
+  riffler:
+    backend: local
+EOF
+check "backend: local seat passes check" "0" \
+    "$("$fleet" check >/dev/null 2>&1; echo $?)"
+resolve_lines riffler
+check "backend: local resolves verbatim" "local" "$r_backend"
+
+cat > "$FORK_SANDBOX_FLEET_FILE" <<'EOF'
+agents:
+  riffler:
+    backend: k8s
+EOF
+check "backend: k8s seat (legal harness/network/no-preset) passes check" "0" \
+    "$("$fleet" check >/dev/null 2>&1; echo $?)"
+resolve_lines riffler
+check "backend: k8s resolves verbatim" "k8s" "$r_backend"
+
+bad "backend garbage value is refused" "takes 'local' or 'k8s'" <<'EOF'
+agents:
+  riffler:
+    backend: garbage
+EOF
+
+cat > "$FORK_SANDBOX_FLEET_FILE" <<'EOF'
+agents:
+  riffler:
+    backend: k8s
+    endpoint: preview-pr-7
+EOF
+check "endpoint with backend k8s passes check" "0" \
+    "$("$fleet" check >/dev/null 2>&1; echo $?)"
+resolve_lines riffler
+check "endpoint resolves verbatim" "preview-pr-7" "$r_endpoint"
+
+bad "endpoint shape is refused (uppercase)" "takes a name matching" <<'EOF'
+agents:
+  riffler:
+    backend: k8s
+    endpoint: Preview-PR-7
+EOF
+
+bad "endpoint without backend k8s is refused" \
+    "endpoint: only valid with 'backend: k8s'" <<'EOF'
+agents:
+  riffler:
+    endpoint: preview-pr-7
+EOF
+
+cat > "$FORK_SANDBOX_FLEET_FILE" <<'EOF'
+agents:
+  riffler:
+    backend: k8s
+    grant: required
+EOF
+check "grant: required with backend k8s passes check" "0" \
+    "$("$fleet" check >/dev/null 2>&1; echo $?)"
+resolve_lines riffler
+check "grant resolves verbatim" "required" "$r_grant"
+
+bad "grant takes required" "takes 'required'" <<'EOF'
+agents:
+  riffler:
+    backend: k8s
+    grant: nonsense
+EOF
+
+bad "grant without backend k8s is refused" \
+    "grant: only valid with 'backend: k8s'" <<'EOF'
+agents:
+  riffler:
+    grant: required
+EOF
+
+bad "handler seat naming backend is refused" \
+    "agents.riffler.backend: not allowed alongside 'handler: exec'" <<'EOF'
+agents:
+  riffler:
+    handler: exec
+    command: some-handler
+    backend: k8s
+EOF
+
+cat > "$FORK_SANDBOX_PERSONAS_DIR/riffler.md" <<'EOF'
+---
+backend: k8s
+---
+EOF
+bad "backend in persona frontmatter is refused as an unknown key" \
+    "frontmatter.backend: unknown key" <<'EOF'
+agents:
+  riffler: {}
+EOF
+printf '%s\n' "$saved_riffler_md_for_backend" > "$FORK_SANDBOX_PERSONAS_DIR/riffler.md"
+
+bad "backend k8s seat with harness codex is refused" \
+    "the cluster path runs only claude or pi" <<'EOF'
+agents:
+  riffler:
+    harness: codex
+    backend: k8s
+EOF
+
+bad "backend k8s seat with resolved network sealed is refused" \
+    "NetworkPolicy's job" <<'EOF'
+agents:
+  scout:
+    harness: pi
+    backend: k8s
+EOF
+
+bad "backend k8s seat with a preset resolved is refused" \
+    "carries no maintainer tier" <<'EOF'
+agents:
+  riffler:
+    backend: k8s
+    preset: anything
+EOF
+
+cat > "$FORK_SANDBOX_PERSONAS_DIR/lkml.md" <<'EOF'
+---
+harness: pi
+network: sealed
+---
+EOF
+bad "frontmatter-sealed pi seat with backend k8s and no network override is refused" \
+    "NetworkPolicy's job" <<'EOF'
+agents:
+  lkml:
+    backend: k8s
+EOF
+cat > "$FORK_SANDBOX_FLEET_FILE" <<'EOF'
+agents:
+  lkml:
+    backend: k8s
+    network: pinned
+EOF
+check "frontmatter-sealed pi seat with backend k8s passes once network is pinned" "0" \
+    "$("$fleet" check >/dev/null 2>&1; echo $?)"
+rm -f "$FORK_SANDBOX_PERSONAS_DIR/lkml.md"
+
+printf '%s\n' "$saved_fleet_for_backend" > "$FORK_SANDBOX_FLEET_FILE"
 
 printf '\n== expand ==\n'
 

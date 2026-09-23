@@ -44,6 +44,20 @@ named preset file is checked bash-side (fork-sandbox-fleet.sh's `check`),
 against the same presets directory `--preset` itself resolves against --
 this script only validates the name's shape.
 
+`backend`, `endpoint` and `grant` are fleet.yaml-only (absent from
+FRONTMATTER_FIELDS, so a persona setting any of them is refused as an
+unknown key -- a seat must not know its own backend). `backend` is
+`local` (the default when absent -- not written by this parser, see the
+no-defaulting rule above) or `k8s`. `endpoint` and `grant` are valid only
+alongside `backend: k8s`; `endpoint` matches the same RFC-1123-label
+regex as fork-sandbox.sh's own `--endpoint` flag, and `grant` is only
+ever the literal string `required`. `check` additionally refuses a
+`backend: k8s` seat whose resolved harness is not `claude`/`pi`, whose
+resolved network is `sealed` (a pod's isolation is the NetworkPolicy's
+job, not a sealed harness's), or that resolves any preset (the cluster
+path is single-leg only in this phase, no maintainer tier, no repeat, no
+composed pipeline).
+
 This script owns every validation rule for both documents -- YAML
 validity, the schema, name shape, the harness/network enums (including
 refusing `pi-local`, which fork-sandbox-preset-parse.py accepts but this
@@ -77,7 +91,7 @@ routine instead of two.
 
 `dump` emits tab-separated facts about the fleet file:
 
-    agent\t<name>\tpersona\t<value>        (twelve lines per agent, always,
+    agent\t<name>\tpersona\t<value>        (fifteen lines per agent, always,
     agent\t<name>\tharness\t<value>         empty value when unset -- the
     agent\t<name>\tmodel\t<value>           bash side treats unset and
     agent\t<name>\tnetwork\t<value>         empty identically via ${x:-y})
@@ -89,6 +103,9 @@ routine instead of two.
     agent\t<name>\tpreset\t<value>
     agent\t<name>\thandler\t<value>
     agent\t<name>\tcommand\t<value>
+    agent\t<name>\tbackend\t<value>
+    agent\t<name>\tendpoint\t<value>
+    agent\t<name>\tgrant\t<value>
     list\t<name>                           (once per list, so an empty
     list_member\t<name>\t<member>           list still appears; members
                                              in file order)
@@ -137,9 +154,15 @@ NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 # distinct from NAME_RE (agent/list names, no underscore) -- mirrors
 # fork-sandbox.sh's own --preset name-shape check.
 PRESET_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+BACKENDS = ("local", "k8s")
+# Copied byte-for-byte from fork-sandbox.sh's own --endpoint flag parse
+# (its "--endpoint takes a name matching" error) -- one shape in two
+# places is a bug, so if that regex ever changes, this one must change
+# with it.
+ENDPOINT_RE = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$")
 FIELDS = ("persona", "harness", "model", "network", "thinking",
           "description", "wake-on-cc", "refresh-at", "triage", "preset",
-          "handler", "command")
+          "handler", "command", "backend", "endpoint", "grant")
 # handler/command are deliberately absent here -- see the module
 # docstring's "handler: exec" paragraph: a handler seat is host config,
 # fleet.yaml-only, and refused as an unknown key in persona frontmatter.
@@ -151,7 +174,8 @@ FRONTMATTER_FIELDS = ("harness", "model", "network", "thinking",
 # deliberately absent: it governs routing (does this seat wake on a Cc at
 # all), which applies to a handler exactly as it does an LLM seat.
 LLM_ONLY_FIELDS = ("harness", "model", "network", "thinking", "triage",
-                    "persona", "refresh-at", "preset")
+                    "persona", "refresh-at", "preset", "backend",
+                    "endpoint", "grant")
 # Only these two are wired up on the postmaster side (pm_triage_wake's
 # pi and claude arms); a triage seat naming any other harness would
 # validate here and then silently run as claude at launch, so the
@@ -405,6 +429,45 @@ def check_command(value, path, errors):
     return value
 
 
+def check_backend(value, path, errors):
+    """The backend a seat spawns on: 'local' (the default, never written
+    here by this parser -- see the header's no-defaulting rule) or 'k8s'."""
+    if value not in BACKENDS:
+        errors.append(f"{path}: takes 'local' or 'k8s', not '{value}'")
+        return ""
+    return value
+
+
+def check_endpoint(value, path, errors):
+    """A K8S_PROXY_ENDPOINTS entry name; only meaningful with
+    'backend: k8s', enforced by check_backend_fields_pair."""
+    if not ENDPOINT_RE.fullmatch(value):
+        errors.append(f"{path}: takes a name matching "
+                       f"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$, not '{value}'")
+        return ""
+    return value
+
+
+def check_grant(value, path, errors):
+    """The only accepted value is the literal string 'required'; only
+    meaningful with 'backend: k8s', enforced by check_backend_fields_pair."""
+    if value != "required":
+        errors.append(f"{path}: takes 'required', not '{value}'")
+        return ""
+    return value
+
+
+def check_backend_fields_pair(backend, endpoint, grant, path, errors):
+    """endpoint/grant only mean anything to the k8s spawn path; on any
+    other backend they would silently do nothing, so refuse the
+    combination here, on the raw per-document value, the same way
+    check_network_harness_pair does for harness/network."""
+    if endpoint and backend != "k8s":
+        errors.append(f"{path}.endpoint: only valid with 'backend: k8s'")
+    if grant and backend != "k8s":
+        errors.append(f"{path}.grant: only valid with 'backend: k8s'")
+
+
 def load_and_validate(fleet_file, label, errors):
     """Returns (agents, lists, triage), best-effort -- callers only trust
     them when `errors` is still empty afterward. `triage` is None when the
@@ -502,10 +565,25 @@ def load_and_validate(fleet_file, label, errors):
                 v = scalar(value, path, errors)
                 if v is not None:
                     agent["command"] = check_command(v, path, errors)
+            elif prop == "backend":
+                v = scalar(value, path, errors)
+                if v is not None:
+                    agent["backend"] = check_backend(v, path, errors)
+            elif prop == "endpoint":
+                v = scalar(value, path, errors)
+                if v is not None:
+                    agent["endpoint"] = check_endpoint(v, path, errors)
+            elif prop == "grant":
+                v = scalar(value, path, errors)
+                if v is not None:
+                    agent["grant"] = check_grant(v, path, errors)
             else:
                 errors.append(f"{label}: {path}: unknown key")
         check_network_harness_pair(agent["harness"], agent["network"],
                                     f"{label}: agents.{name}", errors)
+        check_backend_fields_pair(agent["backend"], agent["endpoint"],
+                                   agent["grant"], f"{label}: agents.{name}",
+                                   errors)
         if agent["handler"]:
             if not agent["command"]:
                 errors.append(f"{label}: agents.{name}.command: required "
@@ -696,6 +774,25 @@ def cmd_check(fleet_file, label, personas_dir):
                 agent["network"] or fm["network"],
                 f"agents.{name}", errors)
             resolved_presets[name] = agent["preset"] or fm.get("preset", "")
+            if agent["backend"] == "k8s":
+                resolved_harness = agent["harness"] or fm["harness"]
+                resolved_network = agent["network"] or fm["network"]
+                if resolved_harness not in ("claude", "pi"):
+                    errors.append(
+                        f"agents.{name}: backend 'k8s' seat: the cluster "
+                        f"path runs only claude or pi, not "
+                        f"'{resolved_harness}'")
+                if resolved_network == "sealed":
+                    errors.append(
+                        f"agents.{name}: backend 'k8s' seat: a pod's "
+                        f"isolation is the NetworkPolicy's job; set "
+                        f"'network: pinned' for this seat")
+                if resolved_presets[name]:
+                    errors.append(
+                        f"agents.{name}: a preset seat cannot run on "
+                        f"backend k8s yet: the cluster path carries no "
+                        f"maintainer tier, no repeat and no composed "
+                        f"pipeline")
         # The bash side (fleet_is_agent) treats a bare <name>.md under
         # personas-dir as making `name` an agent even with no fleet.yaml
         # entry at all -- so a list sharing that name is the same
