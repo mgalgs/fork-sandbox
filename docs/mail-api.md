@@ -1,8 +1,8 @@
 # The mail API
 
 The mail store and the postmaster's state live on the postmaster's host. A
-caller with no shell there — a CI job kicking off a review thread, an
-operator interjecting from a laptop, a dashboard doing a read-only export —
+caller with no shell there -- a CI job kicking off a review thread, an
+operator interjecting from a laptop, a dashboard doing a read-only export --
 still needs to reach them. `kubectl exec` into the postmaster's pod would
 work, but exec carries the pod's ServiceAccount powers, which reach every
 Secret in the namespace. The mail API is a small HTTP server instead: it
@@ -22,13 +22,22 @@ underneath, so a laptop and a CI job invoke the identical command line.
 
 ## Why `@operator` is operator-only
 
-The postmaster treats a message From `@operator` as rule-1 authority: it
-clears a thread's flag and resets its budget. If any client token could
-send `--from @operator`, any CI job holding that token could clear a flag
-the operator had set, and the operator's authority would mean nothing. So
-the loader refuses to start if a client entry's identities include
+The postmaster's rule 1 clears a thread's flag and resets its spawn budget
+when a message arrives whose From is not a fleet agent. `@operator` is the
+usual such sender, but the rule keys on "not a fleet agent", not on the
+name `@operator`. If any client token could send `--from @operator`, any
+CI job holding that token could act with the operator's authority. So the
+loader refuses to start if a client entry's identities include
 `@operator`, `mint` refuses to mint one, and the allowlist refuses
 `--from @operator` from anything but an operator token, unconditionally.
+
+Known limit: this does not stop a client from clearing a flag. A client
+identity such as `@ci-kickoff` is not a fleet seat either, so a client
+that replies into a flagged thread with `--from @ci-kickoff` triggers rule
+1 just as `@operator` would. The server checks argv structure and the
+token's identities; it does not look at postmaster state. Until that is
+closed, treat a client token as able to re-arm any thread it can reply
+into, and do not hand one to a job you would not trust with that.
 
 ## The tokens file
 
@@ -115,8 +124,8 @@ the request body, a file, or an argv value.
 The server checks argv *structure* only: which verb, which flags exist for
 it, whether a flag takes a value, and how many positionals. The values
 themselves are left to `mail` and `postmaster`, which already validate
-them. A flag must match exactly — no `--flag=value`, no abbreviation, no
-combined short flags — and its value is the very next argv element. A
+them. A flag must match exactly -- no `--flag=value`, no abbreviation, no
+combined short flags -- and its value is the very next argv element. A
 positional that starts with `-` (other than a lone `-`) is treated as a
 flag and refused, since there is no way to tell it from one.
 
@@ -151,7 +160,7 @@ refused to load any client entry that lists it.
 
 `send` and `grant` refuse `--context-ro` (403: "a host path has no meaning
 over the API") even for an operator, since it names a path on the
-server's own host and the API has no way to honor it — it is left out of
+server's own host and the API has no way to honor it -- it is left out of
 the table entirely rather than given a value form.
 
 `mail`'s own rule that a namespace grant needs at least one
@@ -191,7 +200,7 @@ The client's request has no proxy and follows no redirect, so the token
 only ever goes to the configured URL. On a 200 response it writes the
 decoded stdout and stderr byte-exact and exits with the verb's own rc. On
 any other status it prints one line, `fork-sandbox <tool> --remote: HTTP
-<code>: <error>`, to stderr and exits 2 — this covers a `401` (bad token)
+<code>: <error>`, to stderr and exits 2 -- this covers a `401` (bad token)
 and a `403` (not allowed) the same as any other failure. A connection
 failure is also a one-line error with exit 2.
 
@@ -200,7 +209,7 @@ failure is also a one-line error with exit 2.
     fork-sandbox mail-api serve --tokens /path/to/tokens --listen 0.0.0.0:8080
 
 `serve` runs `mail` and `postmaster` by absolute path, next to its own
-script, with the environment it was started under — so `FORK_SANDBOX_MAIL_ROOT`
+script, with the environment it was started under -- so `FORK_SANDBOX_MAIL_ROOT`
 reaches it the same way it reaches a local invocation. It never opens a
 shell.
 

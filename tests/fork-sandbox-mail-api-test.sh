@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# fork-sandbox-mail-api-test.sh — Exercise fork-sandbox-mail-api.py: the tokens
+# fork-sandbox-mail-api-test.sh -- Exercise fork-sandbox-mail-api.py: the tokens
 # file loader, mint, the auth rules, the verb allowlist and the size caps.
 #
 # Usage: tests/fork-sandbox-mail-api-test.sh

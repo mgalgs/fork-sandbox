@@ -35,8 +35,10 @@ read, grant and seen (or '-'). Startup refuses the file (exit 2, one line
 naming the label, never the hash) on a malformed line, an unknown role or
 cap, a malformed identity, a shared hash or label, an empty table, an
 operator entry with identities or caps, or a client entry that lists
-@operator. Only an operator may post as @operator: the postmaster treats a
-message from @operator as authority that clears a thread's flag.
+@operator. Only an operator may post as @operator. That does not keep a
+client from clearing a thread's flag: the postmaster's rule 1 applies to any
+From that is not a fleet agent, so a client's own identity, replying into a
+flagged thread, clears it too (see docs/mail-api.md).
 
 HTTP:
 
