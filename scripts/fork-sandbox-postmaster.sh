@@ -3241,21 +3241,18 @@ pm_harvest_run() {
     else
         local exit_code
         exit_code="$(pm_trim "$(cat -- "$run_dir/exit-code" 2>/dev/null)")"
-        # k8s-run-dir (written by fork-sandbox-k8s-wake.sh, step 3) is
-        # empty exactly when nothing was ever submitted -- a refusal
-        # before submit (e.g. fork-sandbox.sh's or fork-sandbox-k8s.sh's
-        # own argument checks) also exits 1, and there is no Job to wait
-        # on or point an operator at in that case, so it is told apart
-        # from a genuine wait timeout here rather than sharing rc 1 alone.
-        local k8s_run_dir=""
-        if [[ "$backend" == k8s && -f "$run_dir/k8s-run-dir" ]]; then
-            k8s_run_dir="$(pm_trim "$(cat -- "$run_dir/k8s-run-dir" 2>/dev/null)")"
+        # rc 1 is ambiguous from fork-sandbox-k8s.sh run: a pre-submit
+        # refusal, the agent's own exit 1, a collect failure, or a wait
+        # timeout. Only the last leaves a live Job; fork-sandbox-k8s-wake.sh
+        # tells it apart and writes k8s-timeout=1 (see its header).
+        local k8s_timeout=""
+        if [[ "$backend" == k8s && -f "$run_dir/k8s-timeout" ]]; then
+            k8s_timeout="$(pm_trim "$(cat -- "$run_dir/k8s-timeout" 2>/dev/null)")"
         fi
-        if [[ "$backend" == k8s && "$exit_code" == "1" && -n "$k8s_run_dir" ]]; then
-            # rc 1 from fork-sandbox-k8s.sh run is a wait timeout, not a
-            # crash: the pod is still running and holding its work
-            # (fork-sandbox-k8s.sh's own message, "the pod is still
-            # running, holding its work"). Feeding this into the same
+        if [[ "$backend" == k8s && "$exit_code" == "1" && "$k8s_timeout" == 1 ]]; then
+            # A wait timeout is not a crash: the pod is still running and
+            # holding its work (fork-sandbox-k8s.sh's own message, "the
+            # pod is still running, holding its work"). Feeding this into the same
             # crash-retry path as rc 2 (a dead pod) would schedule
             # pm_retry_schedule below, and the retry would spawn a second
             # Job for this seat while the first one is still live -- so

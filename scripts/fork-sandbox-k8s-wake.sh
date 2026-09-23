@@ -31,6 +31,10 @@
 #   launch.log   the launch's combined stdout+stderr
 #   k8s-run-dir  the k8s run directory scraped from launch.log (may be
 #                empty: a refusal before submit)
+#   k8s-timeout  1 when the launch ended in run's wait timeout -- the Job
+#                is still running, holding its work -- else 0. rc 1 alone
+#                cannot say so: run also exits 1 for an agent that exited
+#                1, and for a collect failure, and neither leaves a live Job
 #   exit-code    the launch's exit code (rc 3, a zero-harvest run, is
 #                normalized to 0 -- see below)
 #   summary.json written LAST (its presence is what marks the wake done):
@@ -155,6 +159,16 @@ fs_k8s_wake_run() {
     local k8s_run_dir
     k8s_run_dir="$(sed -n 's/^  run dir:  *//p' "$wake_dir/launch.log" | head -n1)"
     fs_k8s_wake_write_atomic "$wake_dir/k8s-run-dir" "$k8s_run_dir"
+
+    # A timeout is the one rc 1 that writes no summary.json (collect never
+    # ran) and prints cmd_wait's own message; requiring both keeps an
+    # agent's exit 1 on the ordinary failure-and-retry path.
+    local timed_out=0
+    if (( rc == 1 )) && [[ -n "$k8s_run_dir" && ! -e "$k8s_run_dir/summary.json" ]] \
+        && grep -q '^Error: timed out after [0-9]*s waiting for branch' "$wake_dir/launch.log"; then
+        timed_out=1
+    fi
+    fs_k8s_wake_write_atomic "$wake_dir/k8s-timeout" "$timed_out"
 
     if (( rc == 3 )); then
         rc=0

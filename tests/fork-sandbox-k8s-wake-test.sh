@@ -90,6 +90,9 @@ if [[ -n "$run_dir" && -z "${STUB_K8S_NO_RUN_DIR:-}" ]]; then
         printf '{"exit_code": %s}' "${STUB_K8S_SUMMARY_EXIT_CODE:-$rc}" > "$run_dir/summary.json"
     fi
 fi
+if [[ -n "${STUB_K8S_TIMEOUT_MSG:-}" ]]; then
+    printf 'Error: timed out after 60s waiting for branch\n' >&2
+fi
 outbox=""
 while (( $# )); do
     case "$1" in
@@ -200,6 +203,37 @@ STUB
     check "refusal: k8s-run-dir is empty" "" "$(cat -- "$root/wake/k8s-run-dir")"
     check "refusal: summary.json synthesized" \
         '{"exit_code": 1}' "$(cat -- "$root/wake/summary.json")"
+    check "refusal: k8s-timeout is 0" 0 "$(cat -- "$root/wake/k8s-timeout")"
+}
+
+# ---- case: rc 1 from run's wait timeout -- k8s-timeout is 1 ----
+{
+    root=""
+    setup_root root
+    write_nul "$root/wake/fs-argv" \
+        "$root/bin/launcher.sh" --branch "test-branch-timeout" \
+        --outbox-dir "$root/wake/outbox"
+    : > "$root/wake/env"
+    ( STUB_K8S_RUN_DIR="$root/k8srun" STUB_K8S_LAUNCH_RC=1 STUB_K8S_NO_SUMMARY=1 \
+        STUB_K8S_TIMEOUT_MSG=1 "$root/bin/fork-sandbox-k8s-wake.sh" "$root/wake" )
+    rc=$?
+    check "timeout: wrapper propagates rc 1" 1 "$rc"
+    check "timeout: k8s-timeout is 1" 1 "$(cat -- "$root/wake/k8s-timeout")"
+}
+
+# ---- case: rc 1 from the agent's own exit 1 -- not a timeout ----
+{
+    root=""
+    setup_root root
+    write_nul "$root/wake/fs-argv" \
+        "$root/bin/launcher.sh" --branch "test-branch-agent1" \
+        --outbox-dir "$root/wake/outbox"
+    : > "$root/wake/env"
+    ( STUB_K8S_RUN_DIR="$root/k8srun" STUB_K8S_LAUNCH_RC=1 \
+        "$root/bin/fork-sandbox-k8s-wake.sh" "$root/wake" )
+    rc=$?
+    check "agent exit 1: wrapper propagates rc 1" 1 "$rc"
+    check "agent exit 1: k8s-timeout is 0" 0 "$(cat -- "$root/wake/k8s-timeout")"
 }
 
 # ---- case: a bad-KEY env record is ignored, a good one is exported ----

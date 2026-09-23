@@ -233,6 +233,9 @@ if (( is_k8s )); then
             printf '{"exit_code": %s}' "${STUB_K8S_SUMMARY_EXIT:-$rc}" > "$run_dir/summary.json"
         fi
     fi
+    if [[ -n "${STUB_K8S_TIMEOUT_MSG:-}" ]]; then
+        printf 'Error: timed out after 60s waiting for branch\n' >&2
+    fi
     if [[ -n "$outbox" && -z "${STUB_K8S_NO_REPLY:-}" ]]; then
         mkdir -p -- "$outbox"
         printf 'Subject: stub k8s reply\n\nhello from k8s stub\n' > "$outbox/mail-1.md"
@@ -5027,9 +5030,9 @@ PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
 
 k5b_mid="$(send_msg '@carol' '@karen' 'k8s timeout topic' 'first' 8)"
 k5b_tid="$(thread_of "$k5b_mid")"
-export STUB_K8S_EXIT=1 STUB_K8S_NO_SUMMARY=1 STUB_K8S_NO_REPLY=1
+export STUB_K8S_EXIT=1 STUB_K8S_NO_SUMMARY=1 STUB_K8S_NO_REPLY=1 STUB_K8S_TIMEOUT_MSG=1
 once
-unset STUB_K8S_EXIT STUB_K8S_NO_SUMMARY STUB_K8S_NO_REPLY
+unset STUB_K8S_EXIT STUB_K8S_NO_SUMMARY STUB_K8S_NO_REPLY STUB_K8S_TIMEOUT_MSG
 contains "k8s case5b: thread flagged as a timeout, not a generic exit" \
     "$(cat "$PM_STATE_DIR/needs-operator/$k5b_tid" 2>/dev/null)" "timed out waiting on its Job"
 check "k8s case5b: no retry scheduled -- a live Job is not a crash" 0 \
@@ -5059,12 +5062,11 @@ export FORK_SANDBOX_MAIL_ROOT
 PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
 
 k5b2_mid1="$(send_msg '@carol' '@karen' 'k8s timeout pending topic' 'first' 8)"
-k5b2_tid="$(thread_of "$k5b2_mid1")"
 k5b2_mid2="$(reply_msg '@carol' "$k5b2_mid1" 'second' --to '@karen')"
-export STUB_K8S_EXIT=1 STUB_K8S_NO_SUMMARY=1 STUB_K8S_NO_REPLY=1
+export STUB_K8S_EXIT=1 STUB_K8S_NO_SUMMARY=1 STUB_K8S_NO_REPLY=1 STUB_K8S_TIMEOUT_MSG=1
 : > "$STUB_ARGV_LOG"
 once
-unset STUB_K8S_EXIT STUB_K8S_NO_SUMMARY STUB_K8S_NO_REPLY
+unset STUB_K8S_EXIT STUB_K8S_NO_SUMMARY STUB_K8S_NO_REPLY STUB_K8S_TIMEOUT_MSG
 check "k8s case5b2: only one Job launched, not a second behind it" 1 \
     "$(grep -c -- '^--k8s$' "$STUB_ARGV_LOG")"
 k5b2_env="$(latest_env_for_agent karen)"
@@ -5095,6 +5097,27 @@ check "k8s case5c: no Job-timeout wording without a Job" 0 \
     "$( [[ "$(cat "$PM_STATE_DIR/needs-operator/$k5c_tid" 2>/dev/null)" == *"timed out waiting on its Job"* ]] && echo 1 || echo 0 )"
 contains "k8s case5c: a retry was scheduled, same as any other failure" \
     "$(cat "$PM_STATE_DIR/retries/$k5c_tid/karen" 2>/dev/null)" "STATE=pending"
+
+# ---- case 5d: rc 1 after a completed run (the agent's own exit 1) ----
+# fork-sandbox-k8s.sh run exits with the agent's code once collect has
+# run, so a claude seat that died on a 401 also lands here as rc 1 with
+# a run dir and a summary -- a crash to retry, not a live Job.
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+
+k5d_mid="$(send_msg '@carol' '@karen' 'k8s agent exit topic' 'first' 8)"
+k5d_tid="$(thread_of "$k5d_mid")"
+export STUB_K8S_EXIT=1 STUB_K8S_NO_REPLY=1
+once
+unset STUB_K8S_EXIT STUB_K8S_NO_REPLY
+contains "k8s case5d: flagged as an ordinary exit" \
+    "$(cat "$PM_STATE_DIR/needs-operator/$k5d_tid" 2>/dev/null)" "wake for karen exited 1"
+check "k8s case5d: no Job-timeout wording for a finished run" 0 \
+    "$( [[ "$(cat "$PM_STATE_DIR/needs-operator/$k5d_tid" 2>/dev/null)" == *"timed out waiting on its Job"* ]] && echo 1 || echo 0 )"
+contains "k8s case5d: a retry was scheduled" \
+    "$(cat "$PM_STATE_DIR/retries/$k5d_tid/karen" 2>/dev/null)" "STATE=pending"
 
 # ---- case 6: rc 3 zero-harvest -> harvested clean, kept Job reaped ----
 
