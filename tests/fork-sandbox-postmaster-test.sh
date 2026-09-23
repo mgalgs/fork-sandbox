@@ -5136,16 +5136,93 @@ FORK_SANDBOX_POSTMASTER_K8S_TIMEOUT=abc refuses \
     "k8s case10: a non-numeric K8S_TIMEOUT refuses deliver" \
     "$postmaster" deliver --project "$PROJECT_DIR" --once
 
+# ---- case 11: a busy backend: k8s seat gets no live delivery; the second
+#      message pends and rides the follow-up wake after harvest (Section 3) ----
+
+# Every case above drives the wrapper with
+# FORK_SANDBOX_POSTMASTER_K8S_DETACH=inline, which runs it to completion
+# synchronously inside the very pm_route_pass call that spawned it (see
+# latest_env_for_agent's comment) -- so by the time a second message could
+# route, the first run is already harvested and pm_wake_or_pend's
+# BACKEND=k8s check never actually gets exercised against a still-live run.
+# This fabricates that live run by hand instead (the same technique the
+# "delivered-live" harness group above uses for events.jsonl), with a real,
+# writable INBOX dir: if the backend gate in pm_wake_or_pend were missing
+# or wrong, pm_deliver_live would actually succeed in writing a banner
+# there, and this test would catch it.
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+
+kb_mid1="$(send_msg '@carol' '@karen' 'busy k8s topic' 'first' 8)"
+kb_tid="$(thread_of "$kb_mid1")"
+kb_run_dir="$(mktemp -d "$STUB_RUN_PREFIX/run.XXXXXX")"
+mkdir -p -- "$kb_run_dir/inbox"
+mkdir -p -- "$PM_STATE_DIR/runs"
+{
+    printf 'AGENT=karen\n'
+    printf 'THREAD=%s\n' "$kb_tid"
+    printf 'TRIGGER=%s\n' "$kb_mid1"
+    printf 'RUN_DIR=%s\n' "$kb_run_dir"
+    printf 'INBOX=%s\n' "$kb_run_dir/inbox"
+    printf 'HARNESS=claude\n'
+    printf 'MODEL=sonnet\n'
+    printf 'NETWORK=\n'
+    printf 'BRANCH=sbx-mail-fakebusy-karen-1\n'
+    printf 'RESUMED=\n'
+    printf 'PENDING_MSGS=\n'
+    printf 'VIA=to\n'
+    printf 'BACKEND=k8s\n'
+} > "$PM_STATE_DIR/runs/fake-busy-run.env"
+# kb_mid1 stands in for the trigger of the (fabricated) already-running
+# wake above -- mark it routed by hand, the same as a real pm_process_message
+# would have before ever reaching pm_wake_or_pend, so the next route pass
+# doesn't treat it as a fresh, still-unrouted message and pend it too.
+mkdir -p -- "$PM_STATE_DIR/routed"
+: > "$PM_STATE_DIR/routed/$kb_mid1"
+
+kb_mid2="$(reply_msg '@carol' "$kb_mid1" 'second message' --to '@karen')"
+: > "$STUB_ARGV_LOG"
+once
+check "k8s case11: busy backend:k8s seat gets no second spawn" 0 \
+    "$(grep -c -- '^--k8s$' "$STUB_ARGV_LOG")"
+check "k8s case11: no live-delivery banner written into the run's inbox" 0 \
+    "$(find "$kb_run_dir/inbox" -type f | wc -l)"
+contains "k8s case11: the second message recorded as pending on the live run" \
+    "$(cat "$PM_STATE_DIR/runs/fake-busy-run.env")" "PENDING_MSGS=$kb_mid2"
+
+mkdir -p -- "$kb_run_dir/outbox"
+printf '0\n' > "$kb_run_dir/exit-code"
+printf '{}\n' > "$kb_run_dir/summary.json"
+printf '\nAcknowledged, thanks.\n' > "$kb_run_dir/outbox/mail-1.md"
+: > "$STUB_ARGV_LOG"
+once
+check "k8s case11: harvest fires a follow-up wake for the pending message" 1 \
+    "$(grep -c -- '^--k8s$' "$STUB_ARGV_LOG")"
+kb_followup_env=""
+for kb_f in "$PM_STATE_DIR/runs"/*.env; do
+    [[ -e "$kb_f" ]] || continue
+    kb_rid="$(basename "$kb_f" .env)"
+    [[ -e "$PM_STATE_DIR/harvested/$kb_rid" ]] && continue
+    grep -q '^AGENT=karen$' "$kb_f" && kb_followup_env="$kb_f"
+done
+contains "k8s case11: follow-up wake's TRIGGER is the pending message" \
+    "$(cat "$kb_followup_env")" "TRIGGER=$kb_mid2"
+
 # ---- status shows grants and held seats ----
 
 k11_mid="$(send_msg '@carol' '@karl' 'status topic' 'first' 8)"
 k11_tid="$(thread_of "$k11_mid")"
 once
-"$MAIL" send --from '@carol' --to '@karen' --subject 'status grant topic' \
-    --body "$work/body.tmp" --hops 8 --allow-namespace ns-a --reach-probe svc.ns-a:80 >/dev/null 2>&1
+k11_grant_mid="$("$MAIL" send --from '@carol' --to '@karen' --subject 'status grant topic' \
+    --body "$work/body.tmp" --hops 8 --allow-namespace ns-a --reach-probe svc.ns-a:80 2>/dev/null)"
+k11_grant_tid="$(thread_of "$k11_grant_mid")"
 k11_status="$("$postmaster" status 2>&1)"
 contains "k8s status: grants section header" "$k11_status" "grants:"
 contains "k8s status: held section header" "$k11_status" "held:"
+contains "k8s status: grant entry names the thread and key count" "$k11_status" \
+    "${k11_grant_tid:0:8}: 2 keys"
 contains "k8s status: held section names the thread and agent" "$k11_status" "${k11_tid:0:8}: agent=karl"
 
 unset FORK_SANDBOX_POSTMASTER_K8S_DETACH
