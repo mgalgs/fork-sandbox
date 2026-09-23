@@ -2832,16 +2832,26 @@ pm_wake_is_dead() {
 # (cap 0) schedules nothing and flags exhaustion on the very first failure.
 # FAILS (Section 1's wedge-bound counter, already written for this harvest
 # by the time this runs) is read fresh and passed through untouched -- the
-# two mechanisms share a file but not a purpose. Every call here writes a
-# terminal-or-pending STATE plus TRIGGER/ATTEMPT/MAX/LAST_FAILED_RUN, so
-# an external reader can always tell which of the two this pair is in,
-# which trigger and attempt count got it there, and which run put it
-# there.
+# two mechanisms share a file but not a purpose. The on-file ATTEMPT is
+# only reused when the on-file TRIGGER is this same $trigger -- i.e. this
+# is a later failure of a retry this function itself already scheduled.
+# Any other on-file TRIGGER means the file's ATTEMPT/STATE belong to a
+# previous, unrelated trigger's terminal record (exhausted or recovered):
+# FAILS persists across triggers, but the retry fields do not (see
+# pm_retry_raw_write's read contract), so a new trigger starts at attempt
+# 0 -- and the pm_retry_raw_write call below overwrites the stale
+# STATE/TRIGGER/ATTEMPT with this trigger's own, retiring the old record.
+# Every call here writes a terminal-or-pending STATE plus
+# TRIGGER/ATTEMPT/MAX/LAST_FAILED_RUN, so an external reader can always
+# tell which of the two this pair is in, which trigger and attempt count
+# got it there, and which run put it there.
 pm_retry_schedule() {
     local tid="$1" agent="$2" trigger="$3" rid="$4"
-    local fails attempt cap
+    local fails attempt cap on_file_trigger
     fails="$(pm_retry_fails_get "$tid" "$agent")"
-    attempt="$(fs_pm_env_get "$RETRIES/$tid/$agent" ATTEMPT)"
+    on_file_trigger="$(fs_pm_env_get "$RETRIES/$tid/$agent" TRIGGER)"
+    attempt=""
+    [[ "$on_file_trigger" == "$trigger" ]] && attempt="$(fs_pm_env_get "$RETRIES/$tid/$agent" ATTEMPT)"
     [[ "$attempt" =~ ^[0-9]+$ ]] || attempt=0
     cap="${#PM_RETRY_BACKOFF[@]}"
     if (( attempt >= cap )); then

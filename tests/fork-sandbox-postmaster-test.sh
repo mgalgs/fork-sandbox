@@ -2793,6 +2793,110 @@ check "schema: a pair that never failed gets no retry file at all" 0 \
     "$( [[ -e "$PM_STATE_DIR/retries/$nf_tid/alice" ]] && echo 1 || echo 0 )"
 
 # ============================================================
+printf '\n== retry: a new trigger after an EXHAUSTED record starts its own attempt count ==\n'
+# ============================================================
+# Regression: pm_retry_schedule used to read ATTEMPT off whatever was on
+# file without checking whose TRIGGER it belonged to. Once a pair's
+# retries/ file held a terminal exhausted record, its stale ATTEMPT (at
+# the cap) leaked into the very next trigger's failure, flagging that
+# brand-new trigger exhausted with zero retries ever attempted -- and
+# nothing ever respawned it.
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+
+pe_mid1="$(send_msg '@carol' '@alice' 'post-exhaust topic' 'first message' 8)"
+pe_tid="$(thread_of "$pe_mid1")"
+pe_retries="$PM_STATE_DIR/retries/$pe_tid/alice"
+
+once                # spawn
+finish_run alice 1
+once                # harvest -> schedule pending, attempt 0
+once                # retry pass fires attempt 1's dispatch
+finish_run alice 1
+once                # harvest -> still pending, attempt 1 (below cap 2)
+once                # retry pass fires attempt 2's dispatch
+finish_run alice 1
+once                # harvest -> attempt 2 >= cap 2: exhausted
+contains "post-exhaust setup: the first trigger is exhausted (STATE=exhausted)" \
+    "$(cat "$pe_retries" 2>/dev/null)" "STATE=exhausted"
+contains "post-exhaust setup: exhaustion names the first trigger" \
+    "$(cat "$pe_retries" 2>/dev/null)" "TRIGGER=$pe_mid1"
+
+pe_mid2="$(reply_msg '@carol' "$pe_mid1" 'post-exhaust followup' --to '@alice')"
+: > "$STUB_ARGV_LOG"
+once
+check "post-exhaust: the new message's wake still spawns despite the exhausted record" 1 \
+    "$(grep -c -- '----CALL----' "$STUB_ARGV_LOG")"
+
+finish_run alice 1
+once
+contains "post-exhaust: the new trigger's failure schedules a fresh retry, not exhaustion" \
+    "$(cat "$pe_retries" 2>/dev/null)" "STATE=pending"
+contains "post-exhaust: the pending record names the NEW trigger" \
+    "$(cat "$pe_retries" 2>/dev/null)" "TRIGGER=$pe_mid2"
+check "post-exhaust: the new trigger's attempt count starts at 0, not carried over from the old exhaustion" 1 \
+    "$(grep -c -- '^ATTEMPT=0$' "$pe_retries" 2>/dev/null)"
+
+: > "$STUB_ARGV_LOG"
+once
+check "post-exhaust: the new trigger's first retry actually fires" 1 \
+    "$(grep -c -- '----CALL----' "$STUB_ARGV_LOG")"
+
+# ============================================================
+printf '\n== retry: a new trigger after a RECOVERED record starts its own attempt count ==\n'
+# ============================================================
+# Same regression as above, for the other terminal STATE the read
+# contract defines: a pair that recovered after spending its full retry
+# budget must not have that spent-budget ATTEMPT carried into the next,
+# unrelated trigger's failure either.
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+
+pr_mid1="$(send_msg '@carol' '@alice' 'post-recover topic' 'first message' 8)"
+pr_tid="$(thread_of "$pr_mid1")"
+pr_retries="$PM_STATE_DIR/retries/$pr_tid/alice"
+
+once                # spawn
+finish_run alice 1
+once                # harvest -> schedule pending, attempt 0
+once                # retry pass fires attempt 1's dispatch
+finish_run alice 1
+once                # harvest -> still pending, attempt 1 (below cap 2)
+once                # retry pass fires attempt 2's dispatch
+finish_run alice 0 deadbeef-1111-2222-3333-444455556666
+once                # harvest of a clean exit-0 at the cap -> recovered, attempt 2
+contains "post-recover setup: the first trigger recovered at the retry cap (STATE=recovered)" \
+    "$(cat "$pr_retries" 2>/dev/null)" "STATE=recovered"
+contains "post-recover setup: recovery names the first trigger" \
+    "$(cat "$pr_retries" 2>/dev/null)" "TRIGGER=$pr_mid1"
+contains "post-recover setup: recovery happened at the cap (ATTEMPT=2)" \
+    "$(cat "$pr_retries" 2>/dev/null)" "ATTEMPT=2"
+
+pr_mid2="$(reply_msg '@carol' "$pr_mid1" 'post-recover followup' --to '@alice')"
+: > "$STUB_ARGV_LOG"
+once
+check "post-recover: the new message's wake still spawns despite the recovered record" 1 \
+    "$(grep -c -- '----CALL----' "$STUB_ARGV_LOG")"
+
+finish_run alice 1
+once
+contains "post-recover: the new trigger's failure schedules a fresh retry, not immediate exhaustion" \
+    "$(cat "$pr_retries" 2>/dev/null)" "STATE=pending"
+contains "post-recover: the pending record names the NEW trigger" \
+    "$(cat "$pr_retries" 2>/dev/null)" "TRIGGER=$pr_mid2"
+check "post-recover: the new trigger's attempt count starts at 0, not carried over from the old recovery" 1 \
+    "$(grep -c -- '^ATTEMPT=0$' "$pr_retries" 2>/dev/null)"
+
+: > "$STUB_ARGV_LOG"
+once
+check "post-recover: the new trigger's first retry actually fires" 1 \
+    "$(grep -c -- '----CALL----' "$STUB_ARGV_LOG")"
+
+# ============================================================
 printf '\n== session resume: a wedge trip coinciding with the retry cap does not grant an extra retry ==\n'
 # ============================================================
 
