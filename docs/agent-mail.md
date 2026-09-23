@@ -765,9 +765,13 @@ split, so a trailing comma cannot silently vanish into a shorter list.
 
 A wake resumed for a retry is told so in its handoff (a "This is a retry"
 section, right after the triggering message is named): if it already sent
-a reply before the previous attempt died, that reply is already on the
-thread, and the handoff asks it to check for one from itself before
-writing a new one, rather than resend it.
+a reply before the previous attempt died, the handoff asks it to check for
+one from itself before writing a new one, rather than resend it. Where
+that earlier reply actually is depends on the handoff form: an ordinary
+trigger-only handoff renders only the triggering message, so the section
+points the agent at `/thread/thread.txt` instead of "above"; the legacy
+full-thread handoff (used when a thread snapshot could not be written)
+already renders the whole thread above, so the section points there.
 
 `deliver`'s loop runs a retry pass between routing and harvesting each
 scan: a due retry (its backoff elapsed, and the seat has no run in
@@ -775,23 +779,32 @@ flight) re-invokes the same follow-up-wake path a pending message uses,
 so it is gated by the same hops/thread-budget checks as any other wake,
 and counts against the thread's spawn budget like one. A retry refused by
 either gate is permanent for that trigger, so its schedule is dropped
-rather than retried again next pass; firing one (successfully or not)
-emits a `retry` event (see "The event stream" above). Exhausting the cap
-— every retry spent, still failing — flags the thread by name, naming the
-agent and the trigger, and turns the record into a persistent `exhausted`
-one (see below) rather than dropping it outright.
+rather than retried again next pass. So is a dispatch that passed both
+gates but still left no run behind: spawning can fail on its own account
+(seat resolution, handoff render, or launcher failure) without raising —
+each just flags the thread and returns as if it had spawned — so the
+retry pass checks for the run itself rather than trust that return alone,
+and drops the schedule exactly as a gate refusal would rather than bump
+`ATTEMPT` forever against a cap nothing is left to check it against.
+Firing one (successfully or not) emits a `retry` event (see "The event
+stream" above). Exhausting the cap — every retry spent, still failing —
+flags the thread by name, naming the agent and the trigger, and turns the
+record into a persistent `exhausted` one (see below) rather than dropping
+it outright.
 
-A retry schedule is superseded — dropped without ever firing — by a new
-message the router spawns a fresh wake for (that wake carries the seat
-forward instead), or by a pending message a failed wake's own harvest
-answers with a follow-up wake of its own (same reasoning: the follow-up
-carries the seat forward, so the older trigger's schedule is dropped
-first, not left to fire later against a trigger the conversation has
-already moved past). It shares its one state file with the session-resume
-wedge bound below (`retries/`), but is otherwise unrelated: a resumed
-session repeatedly failing bounds by clearing the session, a wake
-repeatedly dying outright bounds by giving up and flagging — a seat can
-hit either, both, or neither independently.
+A retry schedule is superseded — dropped without ever firing — once (not
+before) a new message the router spawns a fresh wake for actually results
+in a run (that wake carries the seat forward instead; a spawn that fails
+on its own account leaves the old schedule standing, since nothing
+replaced it), or by a pending message a failed wake's own harvest answers
+with a follow-up wake of its own (same reasoning: the follow-up carries
+the seat forward, so the older trigger's schedule is dropped first, not
+left to fire later against a trigger the conversation has already moved
+past). It shares its one state file with the session-resume wedge bound
+below (`retries/`), but is otherwise unrelated: a resumed session
+repeatedly failing bounds by clearing the session, a wake repeatedly
+dying outright bounds by giving up and flagging — a seat can hit either,
+both, or neither independently.
 
 #### The retry state file is a read contract
 
@@ -804,17 +817,18 @@ an exhausted one from a recovered one, not just see fields disappear:
 |---|---|
 | `FAILS` | the session-resume wedge bound's own counter (below); shares this file, not this state machine |
 | `STATE` | `pending`, `exhausted`, or `recovered` — absent means no retry history yet, or a schedule that was superseded or refused (neither outcome is one of the three above, so none is recorded) |
-| `TRIGGER` / `ATTEMPT` / `NOT_BEFORE` | the pending retry's own fields; present only when `STATE=pending` |
+| `TRIGGER` / `ATTEMPT` | which trigger `STATE` is about and how many retries it had spent when `STATE` was reached — carried forward into `exhausted` and `recovered`, not dropped, so a reader can tell WHICH trigger and count exhausted or recovered, not only that one did |
+| `NOT_BEFORE` | the pending retry's own field; present only when `STATE=pending` — meaningless once a trigger is no longer waiting |
 | `MAX` | the retry cap (`$FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF`'s length) in effect when `STATE` was last set to `pending` or `exhausted` |
 | `LAST_FAILED_RUN` | the run id of the wake whose failure produced the current `pending` or `exhausted` state |
 | `RECOVERED_AT` | epoch seconds a `recovered` state was reached |
 
 A `recovered` record is written the first time a pair that had ever
-failed before harvests exit-0 clean: `RECOVERED_AT` and the `LAST_FAILED_RUN`
-it recovered from are kept rather than the file simply vanishing, so a
-reader can see that this pair was failing and came back, not just that it
-is quiet now. A pair that never failed gets no file at all — there is
-nothing to recover from.
+failed before harvests exit-0 clean: `TRIGGER`/`ATTEMPT`/`MAX`/
+`LAST_FAILED_RUN` and the new `RECOVERED_AT` are all kept rather than the
+file simply vanishing, so a reader can see WHICH trigger this pair was
+failing on and came back from, not just that it is quiet now. A pair that
+never failed gets no file at all — there is nothing to recover from.
 
 ### Router state
 

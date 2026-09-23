@@ -2630,8 +2630,10 @@ check "retry: a third failure does NOT retry again (cap exhausted)" 0 \
 contains "retry: exhaustion flags the thread, naming the agent and trigger" \
     "$(cat "$PM_STATE_DIR/needs-operator/$rt_tid" 2>/dev/null)" \
     "wake for alice failed after 2 retries (trigger ${rt_mid1:0:8})"
-check "retry: the exhausted schedule is removed (no lingering trigger)" 0 \
-    "$( [[ -n "$(sed -n 's/^TRIGGER=//p' "$PM_STATE_DIR/retries/$rt_tid/alice" 2>/dev/null)" ]] && echo 1 || echo 0 )"
+contains "retry: the exhausted record names the trigger that exhausted (read contract)" \
+    "$(cat "$PM_STATE_DIR/retries/$rt_tid/alice" 2>/dev/null)" "TRIGGER=$rt_mid1"
+check "retry: the exhausted record carries no NOT_BEFORE (nothing left waiting)" 0 \
+    "$( [[ -n "$(sed -n 's/^NOT_BEFORE=//p' "$PM_STATE_DIR/retries/$rt_tid/alice" 2>/dev/null)" ]] && echo 1 || echo 0 )"
 contains "retry: exhaustion is a persistent STATE, not just a dropped file" \
     "$(cat "$PM_STATE_DIR/retries/$rt_tid/alice" 2>/dev/null)" "STATE=exhausted"
 contains "retry: the exhausted record names the cap it hit" \
@@ -2670,8 +2672,10 @@ finish_run alice 0 deadbeef-cafe-0000-1111-222233334444
 once
 contains "schema: a later success turns pending into a persistent recovered record" \
     "$(cat "$sc_retries" 2>/dev/null)" "STATE=recovered"
-check "schema: the recovered record has no lingering TRIGGER" 0 \
-    "$( [[ -n "$(sed -n 's/^TRIGGER=//p' "$sc_retries" 2>/dev/null)" ]] && echo 1 || echo 0 )"
+contains "schema: the recovered record still names the trigger it recovered from (read contract)" \
+    "$(cat "$sc_retries" 2>/dev/null)" "TRIGGER=$sc_mid1"
+check "schema: the recovered record carries no NOT_BEFORE (nothing left waiting)" 0 \
+    "$( [[ -n "$(sed -n 's/^NOT_BEFORE=//p' "$sc_retries" 2>/dev/null)" ]] && echo 1 || echo 0 )"
 contains "schema: the recovered record is timestamped" \
     "$(cat "$sc_retries" 2>/dev/null)" "RECOVERED_AT="
 
@@ -2730,8 +2734,10 @@ check "wedge+retry cap: the session is cleared (wedge tripped at 3)" 0 \
 contains "wedge+retry cap: the cap is exhausted, not silently extended by the wedge trip" \
     "$(cat "$PM_STATE_DIR/needs-operator/$wr_tid" 2>/dev/null)" \
     "wake for alice failed after 2 retries (trigger ${wr_mid2:0:8})"
-check "wedge+retry cap: no pending schedule remains" 0 \
-    "$( [[ -n "$(sed -n 's/^TRIGGER=//p' "$wr_retries" 2>/dev/null)" ]] && echo 1 || echo 0 )"
+contains "wedge+retry cap: the exhausted record still names the trigger (read contract)" \
+    "$(cat "$wr_retries" 2>/dev/null)" "TRIGGER=$wr_mid2"
+check "wedge+retry cap: no pending schedule remains (no NOT_BEFORE)" 0 \
+    "$( [[ -n "$(sed -n 's/^NOT_BEFORE=//p' "$wr_retries" 2>/dev/null)" ]] && echo 1 || echo 0 )"
 : > "$STUB_ARGV_LOG"
 once
 check "wedge+retry cap: no further retry fires past the cap" 0 \
@@ -2797,7 +2803,15 @@ hf_retry_handoff="$PM_STATE_DIR/handoffs/$hf_retry_run_id.md"
 check "handoff: a retried wake's handoff DOES carry the retry section" 1 \
     "$(grep -c -- '^## This is a retry$' "$hf_retry_handoff")"
 contains "handoff: the retry section warns against resending an already-posted reply" \
-    "$(cat "$hf_retry_handoff")" "do not send the same reply twice"
+    "$(cat "$hf_retry_handoff")" "do not send it again"
+# This handoff is the ordinary trigger-only form (the thread snapshot
+# mount succeeds in this test), which renders only the triggering message
+# -- so an already-posted reply is not "above" at all, and the retry
+# section must send the agent to /thread/thread.txt instead of claiming
+# otherwise (see the P1 finding this pins).
+contains "handoff: a trigger-only retry points at /thread/thread.txt, not a false 'above'" \
+    "$(cat "$hf_retry_handoff")" "read
+/thread/thread.txt first"
 
 # ============================================================
 printf '\n== retry: a failed wake WITH a pending message schedules no retry ==\n'
@@ -2865,6 +2879,65 @@ check "retry: the budget-exhausted schedule is dropped after refusal" 0 \
     "$( [[ -n "$(sed -n 's/^TRIGGER=//p' "$PM_STATE_DIR/retries/$bg_tid/alice" 2>/dev/null)" ]] && echo 1 || echo 0 )"
 
 # ============================================================
+printf '\n== retry: a dispatch that silently fails to spawn is bounded, not looped forever ==\n'
+# ============================================================
+
+# Regression: pm_followup_wake returns 0 once it reaches pm_spawn_wake,
+# even when pm_spawn_wake itself then fails outright (seat resolution,
+# handoff render, or launcher failure -- each just pm_flag's the thread
+# and returns 0, the same as a real spawn). With no run ever created,
+# there is nothing for a harvest to see, so pm_retry_schedule's own cap
+# check -- which only runs from a harvest -- never fires either: left
+# unchecked, NOT_BEFORE stays due and every later pass bumps ATTEMPT and
+# dispatches again, forever, never consulting the retry cap.
+
+export FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF=0,0
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+
+sr_mid1="$(send_msg '@carol' '@alice' 'silent retry-fail topic' 'first message' 8)"
+sr_tid="$(thread_of "$sr_mid1")"
+once
+finish_run alice 1
+once
+check "retry-fail: the failure scheduled a retry" 1 \
+    "$( [[ -e "$PM_STATE_DIR/retries/$sr_tid/alice" ]] && echo 1 || echo 0 )"
+
+new_root SR_STUB_DIR
+sr_renderer="$SR_STUB_DIR/render"
+sr_postmaster="$SR_STUB_DIR/postmaster"
+cat > "$sr_renderer" <<EOF
+#!/usr/bin/env bash
+exit 1
+EOF
+chmod +x "$sr_renderer"
+cp "$postmaster" "$sr_postmaster"
+sed -i "s|^REPO_FLEET_KIT=.*|REPO_FLEET_KIT=\"$repo_dir/share/fleet-kit.md\"|" "$sr_postmaster"
+ln -s "$repo_dir/scripts/fork-sandbox-mail.sh" "$SR_STUB_DIR/fork-sandbox-mail.sh"
+ln -s "$repo_dir/scripts/fork-sandbox-fleet.sh" "$SR_STUB_DIR/fork-sandbox-fleet.sh"
+ln -s "$repo_dir/scripts/fork-sandbox-lib.sh" "$SR_STUB_DIR/fork-sandbox-lib.sh"
+cp "$sr_renderer" "$SR_STUB_DIR/fork-sandbox-mail-render.py"
+
+: > "$STUB_ARGV_LOG"
+postmaster="$sr_postmaster"
+once
+postmaster="$repo_dir/scripts/fork-sandbox-postmaster.sh"
+check "retry-fail: the broken-handoff retry dispatch does not launch" 0 \
+    "$(grep -c -- '^--branch$' "$STUB_ARGV_LOG")"
+contains "retry-fail: the retry dispatch's handoff failure is flagged" \
+    "$(cat "$PM_STATE_DIR/needs-operator/$sr_tid" 2>/dev/null)" \
+    "handoff render failed for alice"
+check "retry-fail: the schedule is dropped rather than left to loop forever" 0 \
+    "$( [[ -n "$(sed -n 's/^TRIGGER=//p' "$PM_STATE_DIR/retries/$sr_tid/alice" 2>/dev/null)" ]] && echo 1 || echo 0 )"
+
+: > "$STUB_ARGV_LOG"
+once
+check "retry-fail: a later pass (healthy renderer again) spawns nothing -- the schedule really is gone" 0 \
+    "$(grep -c -- '^--branch$' "$STUB_ARGV_LOG")"
+
+# ============================================================
 printf '\n== retry: NOT_BEFORE in the future is not retried early ==\n'
 # ============================================================
 
@@ -2911,6 +2984,56 @@ contains "supersede: the new wake's trigger is the new message, not the stale re
     "$(cat "$(live_env_for_agent alice)")" "TRIGGER=$sp_mid2"
 check "supersede: the stale retry schedule was cancelled" 0 \
     "$( [[ -n "$(sed -n 's/^TRIGGER=//p' "$PM_STATE_DIR/retries/$sp_tid/alice" 2>/dev/null)" ]] && echo 1 || echo 0 )"
+
+# ============================================================
+printf '\n== retry: a route-path spawn failure must not destroy the retry it would have superseded ==\n'
+# ============================================================
+
+# Regression: pm_wake_or_pend used to drop the OLD trigger's retry
+# schedule before knowing whether the new message's own spawn would
+# succeed. If that spawn's handoff render then fails, no run is created
+# to take the old schedule's place -- and with it already gone, the seat
+# is left with neither trigger recoverable.
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+
+sf_mid1="$(send_msg '@carol' '@alice' 'supersede-fail topic' 'first message' 8)"
+sf_tid="$(thread_of "$sf_mid1")"
+once
+finish_run alice 1
+once
+check "supersede-fail: the failure scheduled a retry" 1 \
+    "$( [[ -e "$PM_STATE_DIR/retries/$sf_tid/alice" ]] && echo 1 || echo 0 )"
+
+new_root SF_STUB_DIR
+sf_renderer="$SF_STUB_DIR/render"
+sf_postmaster="$SF_STUB_DIR/postmaster"
+cat > "$sf_renderer" <<EOF
+#!/usr/bin/env bash
+exit 1
+EOF
+chmod +x "$sf_renderer"
+cp "$postmaster" "$sf_postmaster"
+sed -i "s|^REPO_FLEET_KIT=.*|REPO_FLEET_KIT=\"$repo_dir/share/fleet-kit.md\"|" "$sf_postmaster"
+ln -s "$repo_dir/scripts/fork-sandbox-mail.sh" "$SF_STUB_DIR/fork-sandbox-mail.sh"
+ln -s "$repo_dir/scripts/fork-sandbox-fleet.sh" "$SF_STUB_DIR/fork-sandbox-fleet.sh"
+ln -s "$repo_dir/scripts/fork-sandbox-lib.sh" "$SF_STUB_DIR/fork-sandbox-lib.sh"
+cp "$sf_renderer" "$SF_STUB_DIR/fork-sandbox-mail-render.py"
+
+sf_mid2="$(reply_msg '@carol' "$sf_mid1" 'second message' --to '@alice')"
+: > "$STUB_ARGV_LOG"
+postmaster="$sf_postmaster"
+once
+postmaster="$repo_dir/scripts/fork-sandbox-postmaster.sh"
+check "supersede-fail: the new message's broken-handoff spawn does not launch" 0 \
+    "$(grep -c -- '^--branch$' "$STUB_ARGV_LOG")"
+contains "supersede-fail: the new spawn's handoff failure is flagged" \
+    "$(cat "$PM_STATE_DIR/needs-operator/$sf_tid" 2>/dev/null)" \
+    "handoff render failed for alice"
+contains "supersede-fail: the old retry schedule survives the failed supersession" \
+    "$(cat "$PM_STATE_DIR/retries/$sf_tid/alice" 2>/dev/null)" "TRIGGER=$sf_mid1"
 
 # ============================================================
 printf '\n== retry: malformed backoff refuses deliver at startup ==\n'

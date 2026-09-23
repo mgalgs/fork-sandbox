@@ -59,6 +59,16 @@ exit 0
 BACKEND
 chmod +x "$bin/sandbox-backend-test"
 
+# claude-sandboxed resolves the claude binary on PATH before it ever reaches
+# the token-life check below (host-toolchain backend, same as the stub
+# above reports) -- a fake one belongs here so this suite runs offline on a
+# host with no real claude installed, not just one that happens to have one.
+cat > "$bin/claude" <<'CLAUDE'
+#!/usr/bin/env bash
+exit 0
+CLAUDE
+chmod +x "$bin/claude"
+
 test_home="$work/home"; mkdir -p "$test_home"
 future_ms=$(( ($(date +%s) + 7200) * 1000 ))
 

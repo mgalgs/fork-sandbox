@@ -783,8 +783,13 @@ pm_retry_fails_get() {
 #   STATE            pending | exhausted | recovered (absent: no retry
 #                     history, or a superseded/refused schedule with
 #                     nothing left to report)
-#   TRIGGER/ATTEMPT/NOT_BEFORE   the pending retry's own fields (STATE
-#                     pending only)
+#   TRIGGER/ATTEMPT  which trigger this STATE is about and how many
+#                     retries it had spent when this STATE was reached --
+#                     carried forward into exhausted and recovered, not
+#                     just pending, so a reader can tell WHICH trigger/
+#                     count exhausted or recovered, not only that one did
+#   NOT_BEFORE       the pending retry's own field (STATE pending only;
+#                     meaningless once a trigger is no longer waiting)
 #   MAX              the retry cap in effect when STATE was last set to
 #                     pending or exhausted
 #   LAST_FAILED_RUN  the run id of the wake whose failure produced this
@@ -866,32 +871,38 @@ pm_retry_wedge_reset() {
         "$rstate" "$max" "$last_failed_run" "$recovered_at"
 }
 
-# A clean exit-0 harvest. FAILS resets to 0 and any pending schedule is
-# dropped (see pm_retry_schedule's own comment on supersession) -- but if
-# this pair ever failed before (a retries file already exists), that
-# history does not just vanish: it becomes a persistent STATE=recovered
-# record (RECOVERED_AT, LAST_FAILED_RUN kept) so an external reader can
-# still see that this pair was failing and came back, not just that it is
-# quiet now. A pair with no prior retry file (never failed) gets no
-# recovered record either -- there is nothing to recover from.
+# A clean exit-0 harvest. FAILS resets to 0 and NOT_BEFORE (the only field
+# that only ever means something for a still-pending retry) is dropped --
+# but if this pair ever failed before (a retries file already exists),
+# that history does not just vanish: it becomes a persistent
+# STATE=recovered record (TRIGGER/ATTEMPT/MAX/LAST_FAILED_RUN kept,
+# RECOVERED_AT added) so an external reader can still see WHICH trigger
+# this pair was failing on and came back from, not just that it is quiet
+# now. A pair with no prior retry file (never failed) gets no recovered
+# record either -- there is nothing to recover from.
 pm_retry_recover() {
     local tid="$1" agent="$2"
     local f="$RETRIES/$tid/$agent"
     [[ -e "$f" ]] || return 0
-    local last_failed_run
+    local trigger attempt max last_failed_run
+    trigger="$(fs_pm_env_get "$f" TRIGGER)"
+    attempt="$(fs_pm_env_get "$f" ATTEMPT)"
+    max="$(fs_pm_env_get "$f" MAX)"
     last_failed_run="$(fs_pm_env_get "$f" LAST_FAILED_RUN)"
-    pm_retry_raw_write "$tid" "$agent" 0 "" "" "" recovered "" "$last_failed_run" "$(date +%s)"
+    pm_retry_raw_write "$tid" "$agent" 0 "$trigger" "$attempt" "" recovered "$max" "$last_failed_run" "$(date +%s)"
 }
 
 # Drops a pending retry schedule (STATE/TRIGGER/ATTEMPT/NOT_BEFORE/MAX)
-# without touching FAILS -- called wherever a wake for (tid, agent) is
-# about to be spawned some other way, so a stale scheduled retry for an
+# without touching FAILS -- called wherever a wake for (tid, agent) has
+# just been spawned some other way, so a stale scheduled retry for an
 # older trigger can never fire later and double-wake the seat (see
-# pm_wake_or_pend's route-path spawn, and pm_harvest_run's pending-message
-# branch, which supersedes a retry the same way). Neither pending nor
-# exhausted nor recovered describes "superseded", so this leaves no STATE
-# behind rather than inventing a fourth one the read contract does not
-# define.
+# pm_wake_or_pend's route-path spawn, which checks for the resulting run
+# before calling this -- pm_spawn_wake fails silently, so clearing before
+# knowing the spawn worked could destroy the schedule for nothing -- and
+# pm_harvest_run's pending-message branch, which supersedes a retry the
+# same way). Neither pending nor exhausted nor recovered describes
+# "superseded", so this leaves no STATE behind rather than inventing a
+# fourth one the read contract does not define.
 pm_retry_clear_schedule() {
     local tid="$1" agent="$2" fails
     fails="$(pm_retry_fails_get "$tid" "$agent")"
@@ -1620,9 +1631,15 @@ pm_write_handoff() {
             printf '## This is a retry\n\n'
             printf 'Your previous wake for this same message did not finish cleanly (it\n'
             printf 'crashed, or was killed) and is being retried. If you already sent a\n'
-            printf 'reply before it died, that reply is already posted on the thread above --\n'
-            printf 'look for a message already From: @%s answering this trigger before\n' "$agent"
-            printf 'writing a new one, and do not send the same reply twice.\n\n'
+            printf 'reply before it died, do not send it again --\n'
+            if [[ "$trigger_only" == 1 ]]; then
+                printf 'this handoff renders only the triggering message above, so read\n'
+                printf '/thread/thread.txt first and look for a message already From: @%s\n' "$agent"
+                printf 'answering this trigger before writing a new one.\n\n'
+            else
+                printf 'look for a message already From: @%s answering this trigger, in the\n' "$agent"
+                printf 'thread rendered above, before writing a new one.\n\n'
+            fi
         fi
         cat <<'INSTR'
 ## Replying
@@ -2149,9 +2166,17 @@ pm_wake_or_pend() {
         # A new message routed to this seat with no live run supersedes
         # anything pm_retry_schedule left pending for an older trigger --
         # this wake carries the seat forward instead (see
-        # pm_retry_clear_schedule's own comment).
-        pm_retry_clear_schedule "$tid" "$agent"
+        # pm_retry_clear_schedule's own comment). But only once the new
+        # wake actually exists: pm_spawn_wake pm_flag's and returns 0 on
+        # its own failures (seat resolution, handoff render, launcher) the
+        # same as it does on success, so clearing first -- before knowing
+        # whether a run resulted -- could destroy the old schedule and
+        # leave the seat with neither trigger recoverable. Checking for
+        # the run afterward is the one signal that is always honest.
         pm_spawn_wake "$project" "$agent" "$tid" "$mid"
+        if fs_pm_find_live_run "$agent" "$tid" >/dev/null; then
+            pm_retry_clear_schedule "$tid" "$agent"
+        fi
     fi
 }
 
@@ -2785,9 +2810,10 @@ pm_wake_is_dead() {
 # FAILS (Section 1's wedge-bound counter, already written for this harvest
 # by the time this runs) is read fresh and passed through untouched -- the
 # two mechanisms share a file but not a purpose. Every call here writes a
-# terminal-or-pending STATE plus MAX and LAST_FAILED_RUN, so an external
-# reader can always tell which of the two this pair is in and which run
-# put it there.
+# terminal-or-pending STATE plus TRIGGER/ATTEMPT/MAX/LAST_FAILED_RUN, so
+# an external reader can always tell which of the two this pair is in,
+# which trigger and attempt count got it there, and which run put it
+# there.
 pm_retry_schedule() {
     local tid="$1" agent="$2" trigger="$3" rid="$4"
     local fails attempt cap
@@ -2796,7 +2822,7 @@ pm_retry_schedule() {
     [[ "$attempt" =~ ^[0-9]+$ ]] || attempt=0
     cap="${#PM_RETRY_BACKOFF[@]}"
     if (( attempt >= cap )); then
-        pm_retry_raw_write "$tid" "$agent" "$fails" "" "" "" exhausted "$cap" "$rid" ""
+        pm_retry_raw_write "$tid" "$agent" "$fails" "$trigger" "$attempt" "" exhausted "$cap" "$rid" ""
         pm_flag "$tid" "wake for $agent failed after $cap retries (trigger ${trigger:0:8})"
         return 0
     fi
@@ -3022,10 +3048,14 @@ pm_harvest_pass() {
 # "retries spent" count) before dispatching: a refusal from
 # pm_followup_wake's hops/thread-budget gates is permanent for that
 # trigger, so the schedule is dropped outright rather than retried again
-# next pass (see pm_followup_wake's own comment on its return contract); a
-# successful dispatch leaves TRIGGER/ATTEMPT standing, so a LATER failure
-# of the wake just spawned can schedule the next retry against the right
-# attempt count.
+# next pass (see pm_followup_wake's own comment on its return contract),
+# and so is a dispatch that reached pm_spawn_wake but left no live run
+# behind (seat resolution, handoff render, or launcher failure -- each of
+# those pm_flag's and returns 0 rather than raising, so a return-code
+# check alone cannot tell them from a real spawn; checking for the run
+# itself can). Anything else is a successful dispatch, and leaves
+# TRIGGER/ATTEMPT standing, so a LATER failure of the wake just spawned
+# can schedule the next retry against the right attempt count.
 pm_retry_pass() {
     local project="$1"
     mkdir -p -- "$RETRIES"
@@ -3057,7 +3087,26 @@ pm_retry_pass() {
             pm_retry_raw_write "$tid" "$agent" "$fails" "$trigger" "$attempt" "$not_before" \
                 "$rstate" "$max" "$last_failed_run" ""
             pm_event "retry thread=${tid:0:8} agent=$agent trigger=${trigger:0:8} attempt=$attempt"
-            if ! pm_followup_wake "$project" "$agent" "$tid" "$trigger" 1; then
+            local dispatched=1
+            pm_followup_wake "$project" "$agent" "$tid" "$trigger" 1 || dispatched=0
+            if (( dispatched )) && ! fs_pm_find_live_run "$agent" "$tid" >/dev/null; then
+                # pm_followup_wake's own gates let this through (it
+                # reached pm_spawn_wake), but pm_spawn_wake failed outright
+                # (seat resolution, handoff render, or launcher failure --
+                # each just pm_flag's the thread and returns 0, the same
+                # as a real spawn, since those are ordinary operational
+                # hiccups the route path must not abort over). No run was
+                # created, so this trigger can never be harvested, and
+                # pm_retry_schedule's own cap check -- which only runs
+                # from a harvest -- would never fire either: left alone,
+                # ATTEMPT would climb forever with no bound. Detected here
+                # instead by the one signal that is always honest: no live
+                # run after a "successful" dispatch means nothing actually
+                # spawned, so the schedule is dropped exactly as a
+                # hops/budget refusal drops it.
+                dispatched=0
+            fi
+            if (( ! dispatched )); then
                 pm_retry_raw_write "$tid" "$agent" "$fails" "" "" "" "" "" "$last_failed_run" ""
             fi
         done
@@ -3204,7 +3253,11 @@ cmd_status() {
         tid_r="$(basename -- "$tid_dir")"
         for rfile in "$tid_dir"*; do
             [[ -f "$rfile" ]] || continue
-            [[ -n "$(fs_pm_env_get "$rfile" TRIGGER)" ]] || continue
+            # STATE, not bare TRIGGER: TRIGGER/ATTEMPT now persist on an
+            # exhausted or recovered record too (the read contract above
+            # pm_retry_raw_write), so only STATE=pending is actually still
+            # waiting to fire.
+            [[ "$(fs_pm_env_get "$rfile" STATE)" == pending ]] || continue
             ragent="$(basename -- "$rfile")"
             rattempt="$(fs_pm_env_get "$rfile" ATTEMPT)"
             [[ "$rattempt" =~ ^[0-9]+$ ]] || rattempt=0
