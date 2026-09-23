@@ -2771,6 +2771,36 @@ k8s_refuse_dir_links() {
     return 0
 }
 
+# Shared by --thread-dir and --attach-dir: packs DIR's top-level entries
+# (including dotfiles) into TAR as child members named ./<entry>, never
+# as `.` itself -- see fork-sandbox-k8s-context-extract.sh's own
+# pre-existing-DEST_DIR comment for the pod-side EPERM that avoids.
+# Entries are enumerated with a bash glob rather than find(1): this
+# spool runs on the host, which may be macOS, and BSD find has no
+# -printf. The `./` prefix keeps a name starting with `-` from being
+# read as a tar option; names travel to tar as separate argv words from
+# an array, so spaces and other odd bytes are safe with no --null -T
+# dance needed.
+k8s_spool_dir_entries() {
+    local dir="$1" tar_out="$2"
+    local -a entries=()
+    local entry
+    while IFS= read -r -d '' entry; do
+        entries+=("$entry")
+    done < <(
+        shopt -s dotglob nullglob
+        for entry in "$dir"/*; do
+            printf './%s\0' "${entry#"$dir"/}"
+        done
+    )
+    if (( ${#entries[@]} == 0 )); then
+        # tar refuses to create an archive with no members at all.
+        tar cf "$tar_out" -T /dev/null
+    else
+        tar cf "$tar_out" -C "$dir" -- "${entries[@]}"
+    fi
+}
+
 cmd_submit() {
     local dry_run=false branch="" model="" review_loop_cap="" outbox_max_arg=""
     local context_ro="" harness="pi" review_model="" endpoint="" checkout_ref=""
@@ -4217,27 +4247,16 @@ EOF
     # notes and small caches), so they share the one cap rather than
     # growing a --thread-max/--attach-max nobody has needed yet.
     #
-    # Unlike --context-ro's `-C DIR .` (whose destination is always
-    # freshly mkdir'd on the pod side), --thread-dir/--attach-dir push into
-    # a DEST_DIR that already exists as a mounted emptyDir, owned by root
-    # with this process holding no CAP_FOWNER. A `.` member in the archive
-    # maps onto that pre-existing DEST_DIR, and GNU tar's directory-restore
-    # step chmods/utimes whatever member maps onto the extraction root
-    # regardless of --no-overwrite-dir, which EPERMs there and fails the
-    # whole push. So these two are packed as the directory's top-level
-    # ENTRIES instead of `.` itself -- fed to tar via -T so a name
-    # containing a space or other odd byte cannot be split across two
-    # arguments -- meaning no member here ever resolves to DEST_DIR, and
-    # the pod-side extractor never attempts to touch its metadata. See
-    # fork-sandbox-k8s-context-extract.sh's own pre-existing-DEST_DIR
-    # comment for the failure this avoids.
+    # Unlike --context-ro's `-C DIR .`, these two push into a DEST_DIR
+    # that already exists as a mounted emptyDir -- k8s_spool_dir_entries
+    # (above) packs the directory's top-level entries instead of `.`
+    # itself; see its own comment for why.
     local thread_tar="" thread_size=""
     if [[ -n "$thread_dir" ]]; then
         thread_tar="$(mktemp)"
         K8S_SUBMIT_THREAD_TAR="$thread_tar"
         trap 'rm -f -- "${K8S_SUBMIT_CONTEXT_TAR:-}" "${K8S_SUBMIT_THREAD_TAR:-}" "${K8S_SUBMIT_ATTACH_TAR:-}"; rm -rf -- "$run_dir"' EXIT
-        find "$thread_dir" -mindepth 1 -maxdepth 1 -printf '%P\0' \
-            | tar cf "$thread_tar" -C "$thread_dir" --null -T -
+        k8s_spool_dir_entries "$thread_dir" "$thread_tar"
         thread_size="$("$FS_STAT" -c '%s' -- "$thread_tar")"
         if (( thread_size > CONTEXT_MAX_BYTES )); then
             echo "Error: --thread-dir directory '$thread_dir' tars to" >&2
@@ -4251,8 +4270,7 @@ EOF
         attach_tar="$(mktemp)"
         K8S_SUBMIT_ATTACH_TAR="$attach_tar"
         trap 'rm -f -- "${K8S_SUBMIT_CONTEXT_TAR:-}" "${K8S_SUBMIT_THREAD_TAR:-}" "${K8S_SUBMIT_ATTACH_TAR:-}"; rm -rf -- "$run_dir"' EXIT
-        find "$attach_dir" -mindepth 1 -maxdepth 1 -printf '%P\0' \
-            | tar cf "$attach_tar" -C "$attach_dir" --null -T -
+        k8s_spool_dir_entries "$attach_dir" "$attach_tar"
         attach_size="$("$FS_STAT" -c '%s' -- "$attach_tar")"
         if (( attach_size > CONTEXT_MAX_BYTES )); then
             echo "Error: --attach-dir directory '$attach_dir' tars to" >&2

@@ -214,8 +214,7 @@ if [ -e "$dest_dir" ]; then
     # then reports the whole push as failed. The only fix that actually
     # avoids the chmod/utime call is to never give tar a member that maps
     # onto DEST_DIR in the first place: fork-sandbox-k8s.sh's
-    # --thread-dir/--attach-dir spooling packs the directory's ENTRIES
-    # (`tar cf ARCHIVE -C DIR --null -T -` fed the top-level names), not
+    # k8s_spool_dir_entries packs the directory's top-level ENTRIES, not
     # `.` itself, so no member here ever resolves to DEST_DIR and this
     # extractor never attempts to touch its metadata. Only reached on this
     # pre-existing-DEST_DIR branch, so --context-ro's destination (always
