@@ -2561,6 +2561,140 @@ cmd_install() {
         esac
     done
 
+    # --postmaster's own validation, kept visually separate from the
+    # proxy's checks below and run first, so "validate before rendering or
+    # applying anything" holds for both halves of this command
+    # independently. The ssh-URL and project-name regexes are copied
+    # verbatim from fork-sandbox-postmaster-pod-init.sh's own "2. config"
+    # section -- if you touch one, touch both, so the two validators can
+    # never disagree.
+    local pm_project=""
+    if $postmaster; then
+        if [[ -z "$K8S_POSTMASTER_IMAGE" ]]; then
+            echo "Error: K8S_POSTMASTER_IMAGE is not set in $k8s_env. install" >&2
+            echo "--postmaster needs the image ref build-sandbox-image.sh" >&2
+            echo "--postmaster built and you pushed. Add a line:" >&2
+            echo "  K8S_POSTMASTER_IMAGE=registry.example/you/fork-sandbox-postmaster:abc1234" >&2
+            exit 1
+        fi
+        if [[ -z "$K8S_POSTMASTER_REPO_URL" ]]; then
+            echo "Error: K8S_POSTMASTER_REPO_URL is not set in $k8s_env." >&2
+            exit 1
+        fi
+        if [[ "$K8S_POSTMASTER_REPO_URL" =~ ^ssh://([A-Za-z0-9._-]+@)?[A-Za-z0-9._-]+(:[0-9]+)?/[^[:space:]]+$ ]]; then
+            :
+        elif [[ "$K8S_POSTMASTER_REPO_URL" =~ ^[A-Za-z0-9._-]+@[A-Za-z0-9._-]+:[^[:space:]]+$ ]]; then
+            :
+        else
+            echo "Error: K8S_POSTMASTER_REPO_URL='$K8S_POSTMASTER_REPO_URL' is not a" >&2
+            echo "recognized ssh URL (ssh://host/path, ssh://user@host/path or" >&2
+            echo "user@host:path)." >&2
+            exit 1
+        fi
+        pm_project="$K8S_POSTMASTER_PROJECT"
+        if [[ -z "$pm_project" ]]; then
+            pm_project="${K8S_POSTMASTER_REPO_URL##*/}"
+            pm_project="${pm_project%.git}"
+        fi
+        if [[ ! "$pm_project" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+            echo "Error: K8S_POSTMASTER_PROJECT (or the name derived from" >&2
+            echo "K8S_POSTMASTER_REPO_URL) '$pm_project' is not a valid directory" >&2
+            echo "name. Set K8S_POSTMASTER_PROJECT explicitly." >&2
+            exit 1
+        fi
+        if [[ -z "$K8S_POSTMASTER_GIT_KEY_FILE" ]]; then
+            echo "Error: K8S_POSTMASTER_GIT_KEY_FILE is not set in $k8s_env." >&2
+            exit 1
+        fi
+        if [[ -z "$K8S_POSTMASTER_KNOWN_HOSTS_FILE" ]]; then
+            echo "Error: K8S_POSTMASTER_KNOWN_HOSTS_FILE is not set in $k8s_env." >&2
+            exit 1
+        fi
+        require_secret_file "$K8S_POSTMASTER_GIT_KEY_FILE" || exit 1
+        if [[ -L "$K8S_POSTMASTER_KNOWN_HOSTS_FILE" || ! -f "$K8S_POSTMASTER_KNOWN_HOSTS_FILE" ]]; then
+            echo "Error: K8S_POSTMASTER_KNOWN_HOSTS_FILE='$K8S_POSTMASTER_KNOWN_HOSTS_FILE' is" >&2
+            echo "not a regular file." >&2
+            exit 1
+        fi
+        if [[ ! -s "$K8S_POSTMASTER_KNOWN_HOSTS_FILE" ]]; then
+            echo "Error: K8S_POSTMASTER_KNOWN_HOSTS_FILE='$K8S_POSTMASTER_KNOWN_HOSTS_FILE' is" >&2
+            echo "empty. The cluster postmaster trusts no host on first use --" >&2
+            echo "populate it (e.g. ssh-keyscan) before install." >&2
+            exit 1
+        fi
+        if [[ ! "$K8S_POSTMASTER_STORAGE" =~ ^[0-9]+(Mi|Gi|Ti)$ ]]; then
+            echo "Error: K8S_POSTMASTER_STORAGE='$K8S_POSTMASTER_STORAGE' must match" >&2
+            echo '^[0-9]+(Mi|Gi|Ti)$.' >&2
+            exit 1
+        fi
+        if [[ "$K8S_POSTMASTER_ACCESS_MODE" != ReadWriteOncePod && "$K8S_POSTMASTER_ACCESS_MODE" != ReadWriteOnce ]]; then
+            echo "Error: K8S_POSTMASTER_ACCESS_MODE='$K8S_POSTMASTER_ACCESS_MODE' must be" >&2
+            echo "ReadWriteOncePod or ReadWriteOnce." >&2
+            exit 1
+        fi
+    fi
+
+    # ConfigMap file collection for --postmaster: the four optional
+    # integrations (personas/prompts/handlers/presets), each included only
+    # when its laptop config dir exists, plus the always-present
+    # k8s.env/fleet.yaml config. Done here, still before any render or
+    # apply, so the 900 KiB total-size guard and the subdirectory refusal
+    # both fail loudly before a single kubectl call.
+    local -a pm_config_paths=() pm_config_args=()
+    local -a pm_personas_args=() pm_prompts_args=() pm_handlers_args=() pm_presets_args=()
+    local -a pm_personas_paths=() pm_prompts_paths=() pm_handlers_paths=() pm_presets_paths=()
+    local pm_have_personas=false pm_have_prompts=false pm_have_handlers=false pm_have_presets=false
+    if $postmaster; then
+        pm_config_args=(--from-file="k8s.env=$k8s_env")
+        pm_config_paths=("$k8s_env")
+        if [[ -f "$config_dir/fleet.yaml" ]]; then
+            pm_config_args+=(--from-file="fleet.yaml=$config_dir/fleet.yaml")
+            pm_config_paths+=("$config_dir/fleet.yaml")
+        fi
+
+        if [[ -d "$config_dir/personas" ]]; then
+            pm_have_personas=true
+            pm_collect_configmap_files "$config_dir/personas" false || exit 1
+            pm_personas_args=("${PM_CONFIGMAP_FILE_ARGS[@]}")
+            pm_personas_paths=("${PM_CONFIGMAP_FILE_PATHS[@]}")
+        fi
+        if [[ -d "$config_dir/prompts" ]]; then
+            pm_have_prompts=true
+            pm_collect_configmap_files "$config_dir/prompts" false || exit 1
+            pm_prompts_args=("${PM_CONFIGMAP_FILE_ARGS[@]}")
+            pm_prompts_paths=("${PM_CONFIGMAP_FILE_PATHS[@]}")
+        fi
+        if [[ -d "$config_dir/handlers" ]]; then
+            pm_have_handlers=true
+            pm_collect_configmap_files "$config_dir/handlers" true || exit 1
+            pm_handlers_args=("${PM_CONFIGMAP_FILE_ARGS[@]}")
+            pm_handlers_paths=("${PM_CONFIGMAP_FILE_PATHS[@]}")
+        fi
+        if [[ -d "$config_dir/presets" ]]; then
+            pm_have_presets=true
+            pm_collect_configmap_files "$config_dir/presets" false || exit 1
+            pm_presets_args=("${PM_CONFIGMAP_FILE_ARGS[@]}")
+            pm_presets_paths=("${PM_CONFIGMAP_FILE_PATHS[@]}")
+        fi
+
+        local pm_total=0 pm_biggest_file="" pm_biggest_bytes=0 pm_path pm_bytes
+        for pm_path in "${pm_config_paths[@]}" "${pm_personas_paths[@]}" \
+            "${pm_prompts_paths[@]}" "${pm_handlers_paths[@]}" "${pm_presets_paths[@]}"; do
+            pm_bytes="$("$FS_STAT" -c '%s' -- "$pm_path")"
+            pm_total=$(( pm_total + pm_bytes ))
+            if (( pm_bytes > pm_biggest_bytes )); then
+                pm_biggest_bytes=$pm_bytes
+                pm_biggest_file="$pm_path"
+            fi
+        done
+        if (( pm_total > 900 * 1024 )); then
+            echo "Error: the postmaster ConfigMaps would total $pm_total bytes," >&2
+            echo "over the 900 KiB guard (a Kubernetes object is capped at 1 MiB)." >&2
+            echo "The biggest file is $pm_biggest_file ($pm_biggest_bytes bytes)." >&2
+            exit 1
+        fi
+    fi
+
     if [[ -n "$K8S_PROXY_UPSTREAM" && -n "$K8S_PROXY_ENDPOINTS" ]]; then
         echo "Error: K8S_PROXY_UPSTREAM and K8S_PROXY_ENDPOINTS are mutually" >&2
         echo "exclusive -- set one or the other, never both. K8S_PROXY_UPSTREAM" >&2
@@ -2974,6 +3108,77 @@ cmd_install() {
         fi
         rendered+="$file_rendered"$'\n'
     done
+
+    # --postmaster's own render: the config ConfigMaps (client-side, so no
+    # cluster is contacted yet), the checksum over them, and the postmaster
+    # manifest template with its placeholders filled and its absent
+    # optional blocks stripped. Needs $manifests_dir, just computed above.
+    local pm_config_yaml="" pm_personas_yaml="" pm_prompts_yaml="" pm_handlers_yaml="" pm_presets_yaml=""
+    local pm_config_checksum="" pm_file_rendered="" tag
+    if $postmaster; then
+        pm_config_yaml="$(kubectl create configmap fork-sandbox-postmaster-config \
+            "${pm_config_args[@]}" --dry-run=client -o yaml)"
+        $pm_have_personas && pm_personas_yaml="$(kubectl create configmap fork-sandbox-postmaster-personas \
+            "${pm_personas_args[@]}" --dry-run=client -o yaml)"
+        $pm_have_prompts && pm_prompts_yaml="$(kubectl create configmap fork-sandbox-postmaster-prompts \
+            "${pm_prompts_args[@]}" --dry-run=client -o yaml)"
+        $pm_have_handlers && pm_handlers_yaml="$(kubectl create configmap fork-sandbox-postmaster-handlers \
+            "${pm_handlers_args[@]}" --dry-run=client -o yaml)"
+        $pm_have_presets && pm_presets_yaml="$(kubectl create configmap fork-sandbox-postmaster-presets \
+            "${pm_presets_args[@]}" --dry-run=client -o yaml)"
+
+        pm_config_checksum="$(printf '%s%s%s%s%s' \
+            "$pm_config_yaml" "$pm_personas_yaml" "$pm_prompts_yaml" \
+            "$pm_handlers_yaml" "$pm_presets_yaml" | k8s_sha256_stdin)"
+
+        pm_file_rendered="$(sed \
+            -e "s|__NAMESPACE__|$K8S_NAMESPACE|g" \
+            -e "s|__PM_IMAGE__|$K8S_POSTMASTER_IMAGE|g" \
+            -e "s|__PM_ACCESS_MODE__|$K8S_POSTMASTER_ACCESS_MODE|g" \
+            -e "s|__PM_STORAGE__|$K8S_POSTMASTER_STORAGE|g" \
+            -e "s|__PM_CONFIG_CHECKSUM__|$pm_config_checksum|g" \
+            "$manifests_dir/40-postmaster.yaml")"
+        if [[ -z "$K8S_POSTMASTER_STORAGE_CLASS" ]]; then
+            local pm_scline pm_stripped
+            pm_scline=$'  storageClassName: __PM_STORAGE_CLASS__\n'
+            pm_stripped="${pm_file_rendered/"$pm_scline"/}"
+            if [[ "$pm_stripped" == "$pm_file_rendered" ]]; then
+                echo "Error: could not find the storageClassName placeholder line" >&2
+                echo "in the rendered postmaster PVC -- manifests/k8s/40-postmaster.yaml" >&2
+                echo "and cmd_install have drifted apart." >&2
+                exit 1
+            fi
+            pm_file_rendered="$pm_stripped"
+            # The line itself is gone, but the file's own header comment
+            # names every placeholder token by literal text -- including
+            # this one -- so it still needs a substitution, not just the
+            # field.
+            pm_file_rendered="${pm_file_rendered//__PM_STORAGE_CLASS__/(cluster default)}"
+        else
+            pm_file_rendered="${pm_file_rendered//__PM_STORAGE_CLASS__/$K8S_POSTMASTER_STORAGE_CLASS}"
+        fi
+        if ! $pm_have_personas; then
+            for tag in "personas env" "personas volumeMount" "personas volume"; do
+                pm_file_rendered="$(strip_pm_optional_block "$pm_file_rendered" "$tag")" || exit 1
+            done
+        fi
+        if ! $pm_have_prompts; then
+            for tag in "prompts env" "prompts volumeMount" "prompts volume"; do
+                pm_file_rendered="$(strip_pm_optional_block "$pm_file_rendered" "$tag")" || exit 1
+            done
+        fi
+        if ! $pm_have_handlers; then
+            for tag in "handlers env" "handlers volumeMount" "handlers volume"; do
+                pm_file_rendered="$(strip_pm_optional_block "$pm_file_rendered" "$tag")" || exit 1
+            done
+        fi
+        if ! $pm_have_presets; then
+            for tag in "presets env" "presets volumeMount" "presets volume"; do
+                pm_file_rendered="$(strip_pm_optional_block "$pm_file_rendered" "$tag")" || exit 1
+            done
+        fi
+    fi
+
     # K8S_AGENT_ALLOW_NS becomes one --allow-namespace per entry. It reuses
     # the proxy key's parser -- identical syntax, identical validation, and
     # the same DNAT reasoning -- but the RULE is rendered by the plugin, not
@@ -3021,6 +3226,19 @@ cmd_install() {
             printf '# (dry-run) would create/update Secret fork-sandbox-upstream-key entry for K8S_PROXY_ENDPOINTS endpoint '\''%s'\'' here -- not shown.\n' \
                 "$dry_key_name"
         done
+        if $postmaster; then
+            # kubectl's own -o yaml render carries no leading `---`, unlike
+            # every manifests/k8s/*.yaml file (each already opens with
+            # one) -- so each ConfigMap needs one added here to keep the
+            # whole dry-run stream valid multi-document YAML.
+            printf -- '---\n%s\n' "$pm_config_yaml"
+            $pm_have_personas && printf -- '---\n%s\n' "$pm_personas_yaml"
+            $pm_have_prompts  && printf -- '---\n%s\n' "$pm_prompts_yaml"
+            $pm_have_handlers && printf -- '---\n%s\n' "$pm_handlers_yaml"
+            $pm_have_presets  && printf -- '---\n%s\n' "$pm_presets_yaml"
+            printf '# (dry-run) would create Secret fork-sandbox-postmaster-git ... -- not shown.\n'
+            printf '%s\n' "$pm_file_rendered"
+        fi
         exit 0
     fi
 
@@ -3047,6 +3265,22 @@ cmd_install() {
         kubectl create secret generic fork-sandbox-upstream-key \
             --from-literal="upstream-key.conf=$secret_content" \
             --dry-run=client -o yaml | kubectl apply -f -
+    fi
+
+    # Postmaster ConfigMaps and Secret before the Deployment (bundled with
+    # the SA/Role/RoleBinding/PVC in $pm_file_rendered) -- so the Deployment
+    # never comes up racing a config or credential that is not there yet.
+    if $postmaster; then
+        printf '%s\n' "$pm_config_yaml" | kubectl apply -f -
+        $pm_have_personas && printf '%s\n' "$pm_personas_yaml" | kubectl apply -f -
+        $pm_have_prompts  && printf '%s\n' "$pm_prompts_yaml" | kubectl apply -f -
+        $pm_have_handlers && printf '%s\n' "$pm_handlers_yaml" | kubectl apply -f -
+        $pm_have_presets  && printf '%s\n' "$pm_presets_yaml" | kubectl apply -f -
+        kubectl create secret generic fork-sandbox-postmaster-git \
+            --from-file="deploy-key=$K8S_POSTMASTER_GIT_KEY_FILE" \
+            --from-file="known_hosts=$K8S_POSTMASTER_KNOWN_HOSTS_FILE" \
+            --dry-run=client -o yaml | kubectl apply -f -
+        printf '%s\n' "$pm_file_rendered" | kubectl apply -f -
     fi
 
     echo "fork-sandbox-k8s: installed into namespace $K8S_NAMESPACE" >&2

@@ -1,13 +1,23 @@
 ---
 # The cluster postmaster: a single-replica Deployment running the same
 # fork-sandbox-postmaster.sh a laptop runs, so a review panel keeps working
-# with no laptop on. __NAMESPACE__, __PM_IMAGE__, __PM_ACCESS_MODE__,
-# __PM_STORAGE__, __PM_STORAGE_CLASS__ and __PM_CONFIG_CHECKSUM__ are
-# placeholder tokens; fork-sandbox-k8s.sh's `install --postmaster`
-# substitutes them from K8S_NAMESPACE and the K8S_POSTMASTER_* keys in
-# k8s.env before applying. This file is skipped by plain `install` (the
-# same way 31-claude-proxy.yaml is) since those placeholders have no value
-# to take without --postmaster.
+# with no laptop on. fork-sandbox-k8s.sh's `install --postmaster`
+# substitutes these placeholder tokens from K8S_NAMESPACE and the
+# K8S_POSTMASTER_* keys in k8s.env (K8S_POSTMASTER_IMAGE,
+# K8S_POSTMASTER_ACCESS_MODE, K8S_POSTMASTER_STORAGE,
+# K8S_POSTMASTER_STORAGE_CLASS, and a sha256 install computes over the
+# rendered ConfigMaps), one token per line below
+# with nothing else on the line, so a long substituted value (an image
+# ref, a checksum) cannot push a line past yamllint's line-length rule:
+#   __NAMESPACE__
+#   __PM_IMAGE__
+#   __PM_ACCESS_MODE__
+#   __PM_STORAGE__
+#   __PM_STORAGE_CLASS__
+#   __PM_CONFIG_CHECKSUM__
+# This file is skipped by plain `install` (the same way
+# 31-claude-proxy.yaml is) since those placeholders have no value to take
+# without --postmaster.
 #
 # The trick that keeps this small: the PVC below is mounted at the exact
 # paths a laptop postmaster uses (/var/tmp/claude-scratch, $HOME/src,
@@ -117,7 +127,7 @@ spec:
         # the Deployment's own metadata) is what makes a config-only change
         # roll the pod -- see 30-proxy.yaml's checksum/nginx-conf annotation
         # for the same reasoning, measured against a live cluster there.
-        fork-sandbox/config-checksum: "__PM_CONFIG_CHECKSUM__"
+        checksum/pm-config: "__PM_CONFIG_CHECKSUM__"
     spec:
       serviceAccountName: fork-sandbox-postmaster
       terminationGracePeriodSeconds: 60
