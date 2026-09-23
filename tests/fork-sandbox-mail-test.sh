@@ -567,6 +567,35 @@ contains "--show --json carries the probe value" "$show_json" "svc.preview-pr-7:
 
 refuses "grant on an unknown thread exits 1" "$mail" grant "not-a-real-thread-id" --allow-namespace preview-pr-7 --reach-probe svc.preview-pr-7:80
 
+# A thread id is only ever mail_new_uuid output, never caller-supplied --
+# but a hand-placed (not `send`-generated) root message could carry any
+# byte string as its Message-ID/Thread-ID, so a caller passing that string
+# to `grant` must not have it built straight into a path. Craft such a
+# root directly (bypassing `send`, the only path that would normally
+# create one) and confirm the traversal id is refused by shape before any
+# path outside the grants dir is touched.
+traversal_thread_dir="$FORK_SANDBOX_MAIL_ROOT/threads/traversal-root"
+mkdir -p "$traversal_thread_dir"
+cat > "$traversal_thread_dir/001-traversal.msg" <<'EOF'
+Message-ID: ../../evil
+Thread-ID: ../../evil
+Date: Mon, 01 Jan 2024 00:00:00 +0000
+From: @alice
+To: @bob
+Subject: traversal
+
+hi
+EOF
+victim_file="$FORK_SANDBOX_MAIL_ROOT/evil.env"
+: > "$victim_file"
+out="$("$mail" grant '../../evil' --clear 2>&1)"
+rc=$?
+check "grant with a path-traversal-shaped thread id exits 1" "1" "$rc"
+check "the path-traversal id is refused before deleting anything outside the grants dir" "1" \
+    "$([[ -f "$victim_file" ]] && echo 1 || echo 0)"
+rm -f -- "$victim_file"
+rm -rf -- "$traversal_thread_dir"
+
 grant_before="$(find "$FORK_SANDBOX_MAIL_ROOT/.postmaster/grants" -name '*.env' 2>/dev/null | wc -l)"
 out="$("$mail" grant "$grant_tid" --reach-probe svc.preview-pr-7:80 2>&1)"
 rc=$?

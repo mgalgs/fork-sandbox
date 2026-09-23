@@ -126,6 +126,11 @@ set -euo pipefail
 MAIL_ROOT="${FORK_SANDBOX_MAIL_ROOT:-/var/tmp/claude-scratch/agent-mail}"
 MAIL_ATTACH_MAX_BYTES=$(( 4 * 1024 * 1024 ))
 MAIL_ADDR_RE='^@[a-z0-9][a-z0-9-]*$'
+# Same hex-id shape as fork-sandbox.sh's own session-id check: no slashes,
+# no dots, no leading hyphen. mail_new_uuid never generates anything else,
+# so a caller-supplied id failing this shape is not a thread id this store
+# could have created.
+MAIL_ID_RE='^[0-9a-f][0-9a-f-]{7,63}$'
 MAIL_SEQ_MAX_TRIES=10000
 
 # Scripts are symlinked into ~/.claude/scripts, so a plain "dirname $0" is
@@ -280,6 +285,20 @@ mail_thread_root_exists() {
     local tid="$1" f
     f="$(mail_find_by_id "$tid")" || return 1
     [[ "$(mail_header "$f" Thread-ID)" == "$tid" ]]
+}
+
+# Rejects a thread id that isn't shaped like a Message-ID this store would
+# ever generate (mail_new_uuid) -- required before the id is ever used to
+# build a path directly (the grant file, e.g.) rather than routed through
+# mail_find_by_id's scan-and-compare, since mail_thread_root_exists above
+# only confirms a message with that id-as-header-text exists, not that the
+# id is itself path-safe.
+mail_validate_thread_id() {
+    if [[ ! "$1" =~ $MAIL_ID_RE ]]; then
+        echo "Error: grant: '$1' is not a valid thread id." >&2
+        return 1
+    fi
+    return 0
 }
 
 # Runs check-grant on the given args, mapping its exit status to this
@@ -972,6 +991,7 @@ cmd_grant() {
         return 1
     fi
 
+    mail_validate_thread_id "$tid" || return 1
     mail_thread_root_exists "$tid" || { echo "Error: grant: no such thread '$tid'." >&2; return 1; }
 
     local grant_file="$MAIL_ROOT/.postmaster/grants/$tid.env"
