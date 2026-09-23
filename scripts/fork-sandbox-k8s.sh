@@ -31,6 +31,7 @@
 #        fork-sandbox-k8s.sh collect --branch NAME [--outbox-dir DIR]
 #                            [--outbox-max SIZE] [--review-loop N]
 #                            [--keep] [--run-dir DIR] <project-path>
+#        fork-sandbox-k8s.sh resume --run-dir DIR [--timeout SECONDS]
 #        fork-sandbox-k8s.sh fetch --branch NAME <project-path>
 #        fork-sandbox-k8s.sh say --branch NAME <text>
 #        fork-sandbox-k8s.sh say --branch NAME -        # text from stdin
@@ -104,6 +105,20 @@
 # wait and collect exist so a caller fanning out several runs can submit
 # them all up front and then wait on and collect them independently, rather
 # than blocking one run at a time through run.
+#
+# resume is run's own tail (wait, collect, the "run complete" line and its
+# exit code) for a run submit already created, taking only that run's
+# directory: a caller whose `run` process died while the Job kept going
+# (a postmaster host restart, a pod eviction) picks the run up again
+# without submitting a second Job. Everything the tail needs is read back
+# from DIR/run.env, which submit writes -- BRANCH, PROJECT, OUTBOX_DIR,
+# OUTBOX_MAX_BYTES, REVIEW_LOOP, KEEP, TIMEOUT and SUBMITTED_AT -- with
+# the same strict KEY=VALUE reader collect uses (a file is never
+# sourced). --timeout defaults to the run's recorded TIMEOUT minus the
+# time elapsed since SUBMITTED_AT, floored at 60 seconds. A run
+# directory with no run.env, or one without BRANCH or PROJECT, is refused
+# (exit 1). Exit codes are run's own: the agent's, or the wait's nonzero
+# rc (2 for a dead pod, after writing the run-log row; 1 for a timeout).
 #
 # fetch runs `git fetch` against the pod's clone, the same channel in
 # reverse, landing the branch in your real repo. It also signals the pod
@@ -3181,6 +3196,8 @@ cmd_submit() {
     local context_ro="" harness="pi" review_model="" endpoint="" checkout_ref=""
     local pi_args="" services_trust_ref="" task_meta="" claude_credentials_flag=""
     local thread_dir="" attach_dir=""
+    # Recorded in run.env for `resume` only; submit itself acts on none.
+    local outbox_dir="" keep=false run_timeout=3600
     local session_state="" resume_session="" session_id_arg=""
     local refresh_at_arg="" refresh_at_given=false refresh_max_arg=""
     # fs_refresh_resolve sets these; refresh_context_window is only local scratch.
@@ -3201,6 +3218,9 @@ cmd_submit() {
             --review-loop) review_loop_cap="${2:?--review-loop requires a positive integer}"; shift 2 ;;
             --review-model) review_model="${2:?--review-model requires a model id}"; shift 2 ;;
             --outbox-max) outbox_max_arg="${2:?--outbox-max requires a size}"; shift 2 ;;
+            --outbox-dir) outbox_dir="${2:?--outbox-dir requires a path}"; shift 2 ;;
+            --keep) keep=true; shift ;;
+            --timeout) run_timeout="${2:?--timeout requires a number of seconds}"; shift 2 ;;
             --context-ro) context_ro="${2:?--context-ro requires a directory}"; shift 2 ;;
             --thread-dir) thread_dir="${2:?--thread-dir requires a directory}"; shift 2 ;;
             --attach-dir) attach_dir="${2:?--attach-dir requires a directory}"; shift 2 ;;
@@ -3490,7 +3510,12 @@ cmd_submit() {
         echo "number of review-then-fix iterations — not '$review_loop_cap'." >&2
         exit 1
     fi
+    local review_loop_recorded="$review_loop_cap"
     review_loop_cap="${review_loop_cap:-0}"
+    if [[ ! "$run_timeout" =~ ^[0-9]+$ ]]; then
+        echo "Error: --timeout must be a whole number of seconds, got '$run_timeout'." >&2
+        exit 1
+    fi
 
     # Resolved here, before anything is created, same as the checks above --
     # fs_parse_size_bytes already prints its own error naming what was given.
@@ -4588,6 +4613,17 @@ EOF
         printf 'branch=%s\n' "$branch"
         printf 'origin_repo=%s\n' "$origin_repo"
         printf 'base_sha=%s\n' "$run_log_base_sha"
+        # Read back by cmd_resume (upper-case: its own keys, apart from the
+        # run-log fallback keys above), so a run can be picked up again
+        # from its directory alone.
+        printf 'BRANCH=%s\n' "$branch"
+        printf 'PROJECT=%s\n' "$origin_repo"
+        printf 'OUTBOX_DIR=%s\n' "$outbox_dir"
+        printf 'OUTBOX_MAX_BYTES=%s\n' "$outbox_max_bytes"
+        printf 'REVIEW_LOOP=%s\n' "$review_loop_recorded"
+        printf 'KEEP=%s\n' "$keep"
+        printf 'TIMEOUT=%s\n' "$run_timeout"
+        printf 'SUBMITTED_AT=%s\n' "$(date +%s)"
         if [[ "$harness" == claude ]]; then
             printf 'claude_credentials_source=%s\n' "${claude_credentials_override:-default}"
             printf 'claude_credentials_via=%s\n' "$claude_credentials_via"
@@ -5916,6 +5952,125 @@ cmd_collect() {
     fi
 }
 
+# run's tail, shared by cmd_run and cmd_resume so there is exactly one:
+# wait, then collect, then the "run complete" line, then exit with the
+# agent's code (or the wait's own nonzero rc). Never returns.
+# Args: run_dir branch timeout project_path outbox_dir outbox_max_bytes
+#       review_loop_cap keep(true|false)
+k8s_run_tail() {
+    local run_dir="$1" branch="$2" timeout="$3" project_path="$4"
+    local outbox_dir="$5" outbox_max_bytes="$6" review_loop_cap="$7" keep="$8"
+
+    # The wait runs in a $(...) subshell to capture the agent's exit code
+    # from its stdout. An `exit` inside a subshell stops only the
+    # subshell, so a dead-pod, timeout or malformed-sentinel failure would
+    # otherwise be swallowed and the run would carry on with an empty code:
+    # propagate it explicitly. cmd_collect below is NOT captured -- it is
+    # called normally, so its own exit paths behave exactly as they did
+    # inline before this extraction.
+    local agent_rc wait_rc=0
+    agent_rc="$(cmd_wait --branch "$branch" --timeout "$timeout")" || wait_rc=$?
+    if (( wait_rc != 0 )); then
+        # cmd_wait failed before the agent's sentinel appeared (a dead pod
+        # or a malformed sentinel, both terminal codes -- exit 2 -- or a
+        # timeout, exit 1) -- cmd_collect, the only other caller of
+        # sandbox-run-log.py record, is never reached in that case, and the
+        # run directory cmd_submit created would otherwise carry no
+        # summary.json and no row in the durable run log: exactly the "a
+        # seat is silently failing" case this log exists to surface.
+        # cmd_wait's own error already told the operator the job and pod
+        # are left in place for inspection, so this does not attempt any of
+        # collect's pod reads (outbox, evidence, fetch) against a pod that
+        # is dead -- it records only what submit already knew, via
+        # record's own run.env fallback for a run directory with no
+        # summary.json. exit_code stays absent (record's null): none is
+        # known.
+        #
+        # A timeout (wait_rc 1) is excluded: cmd_wait's own message for it
+        # says the opposite of "this run ended" -- "the pod is still
+        # running, holding its work" -- and a run_end row written while the
+        # run is still going would be a false record no later collect ever
+        # supersedes (a by-hand fetch/rm, the advice cmd_wait gives, passes
+        # no --run-dir). Every other wait_rc (2: dead pod, malformed
+        # sentinel, an already-Succeeded pod, pod not found) is terminal
+        # from wait's own perspective -- no further wait will ever turn
+        # into a normal completion -- so those still get the row.
+        if [[ -n "$run_dir" && "$wait_rc" != 1 ]]; then
+            fs_record_run_log "$run_dir"
+        fi
+        exit "$wait_rc"
+    fi
+
+    local -a collect_argv=(--branch "$branch")
+    [[ -n "$outbox_dir" ]] && collect_argv+=(--outbox-dir "$outbox_dir")
+    # The parsed byte count, always: it is either the operator's --outbox-max
+    # or the same default collect would apply itself, so there is nothing to
+    # distinguish at the forwarding point.
+    collect_argv+=(--outbox-max "$outbox_max_bytes")
+    # Passed through whenever the flag was given at all, "0" included --
+    # cmd_submit already did the positive-integer validation above, and
+    # collect's own copy only decides whether the loop read happens.
+    [[ -n "$review_loop_cap" ]] && collect_argv+=(--review-loop "$review_loop_cap")
+    [[ "$keep" == true ]] && collect_argv+=(--keep)
+    [[ -n "$run_dir" ]] && collect_argv+=(--run-dir "$run_dir")
+    cmd_collect "${collect_argv[@]}" "$project_path"
+
+    # The one line this verb prints that none of its three phases can: it
+    # reports the agent's exit code, which collect does not know.
+    echo "fork-sandbox-k8s: run complete. branch=$branch agent_exit=$agent_rc landed_in=$project_path" >&2
+    exit "$agent_rc"
+}
+
+# resume: run's tail for a run submit already created; see the header.
+cmd_resume() {
+    local run_dir="" timeout_arg=""
+    while (( $# )); do
+        case "$1" in
+            --run-dir) run_dir="${2:?--run-dir requires a directory}"; shift 2 ;;
+            --timeout) timeout_arg="${2:?--timeout requires a number of seconds}"; shift 2 ;;
+            *) echo "Error: unknown argument '$1' for resume." >&2; exit 1 ;;
+        esac
+    done
+    [[ -n "$run_dir" ]] || { echo "Error: resume requires --run-dir." >&2; exit 1; }
+    [[ -d "$run_dir" ]] || { echo "Error: resume: no such run directory: $run_dir" >&2; exit 1; }
+    local env_file="$run_dir/run.env"
+    [[ -f "$env_file" ]] || {
+        echo "Error: resume: $run_dir has no run.env; nothing to resume." >&2
+        exit 1
+    }
+    local branch project outbox_dir outbox_max_bytes review_loop keep rec_timeout submitted_at
+    branch="$(read_env_value "$env_file" BRANCH || true)"
+    project="$(read_env_value "$env_file" PROJECT || true)"
+    if [[ -z "$branch" || -z "$project" ]]; then
+        echo "Error: resume: $env_file lacks BRANCH or PROJECT; cannot resume." >&2
+        exit 1
+    fi
+    outbox_dir="$(read_env_value "$env_file" OUTBOX_DIR || true)"
+    outbox_max_bytes="$(read_env_value "$env_file" OUTBOX_MAX_BYTES || true)"
+    [[ "$outbox_max_bytes" =~ ^[0-9]+$ ]] || outbox_max_bytes="$FS_OUTBOX_MAX_BYTES"
+    review_loop="$(read_env_value "$env_file" REVIEW_LOOP || true)"
+    keep="$(read_env_value "$env_file" KEEP || true)"
+    [[ "$keep" == true ]] || keep=false
+    rec_timeout="$(read_env_value "$env_file" TIMEOUT || true)"
+    [[ "$rec_timeout" =~ ^[0-9]+$ ]] || rec_timeout=3600
+    submitted_at="$(read_env_value "$env_file" SUBMITTED_AT || true)"
+
+    local timeout="$timeout_arg"
+    if [[ -z "$timeout" ]]; then
+        local elapsed=0
+        [[ "$submitted_at" =~ ^[0-9]+$ ]] && elapsed=$(( $(date +%s) - submitted_at ))
+        (( elapsed < 0 )) && elapsed=0
+        timeout=$(( rec_timeout - elapsed ))
+        (( 60 <= timeout )) || timeout=60
+    elif [[ ! "$timeout" =~ ^[0-9]+$ ]]; then
+        echo "Error: --timeout must be a whole number of seconds, got '$timeout'." >&2
+        exit 1
+    fi
+
+    k8s_run_tail "$run_dir" "$branch" "$timeout" "$project" \
+        "$outbox_dir" "$outbox_max_bytes" "$review_loop" "$keep"
+}
+
 # submit, then wait, then collect -- see the header comment above for why.
 # Each phase's body lives in its own verb (cmd_wait, cmd_collect, plus
 # cmd_fetch and cmd_rm inside cmd_collect), so a caller fanning out several
@@ -6030,6 +6185,10 @@ cmd_run() {
     [[ -n "$review_loop_cap" ]] && submit_argv+=(--review-loop "$review_loop_cap")
     [[ -n "$review_model" ]] && submit_argv+=(--review-model "$review_model")
     [[ -n "$outbox_max_arg" ]] && submit_argv+=(--outbox-max "$outbox_max_arg")
+    # Recorded by submit in run.env for `resume`; submit acts on none.
+    [[ -n "$outbox_dir" ]] && submit_argv+=(--outbox-dir "$outbox_dir")
+    [[ "$keep" == true ]] && submit_argv+=(--keep)
+    submit_argv+=(--timeout "$timeout")
     [[ -n "$context_ro" ]] && submit_argv+=(--context-ro "$context_ro")
     [[ -n "$thread_dir" ]] && submit_argv+=(--thread-dir "$thread_dir")
     [[ -n "$attach_dir" ]] && submit_argv+=(--attach-dir "$attach_dir")
@@ -6080,64 +6239,8 @@ cmd_run() {
     # docs/kubernetes-runs.md.
     local run_dir="$K8S_LAST_SUBMIT_RUN_DIR"
 
-    # The wait runs in a $(...) subshell to capture the agent's exit code
-    # from its stdout. An `exit` inside a subshell stops only the
-    # subshell, so a dead-pod, timeout or malformed-sentinel failure would
-    # otherwise be swallowed and the run would carry on with an empty code:
-    # propagate it explicitly. cmd_collect below is NOT captured -- it is
-    # called normally, so its own exit paths behave exactly as they did
-    # inline before this extraction.
-    local agent_rc wait_rc=0
-    agent_rc="$(cmd_wait --branch "$branch" --timeout "$timeout")" || wait_rc=$?
-    if (( wait_rc != 0 )); then
-        # cmd_wait failed before the agent's sentinel appeared (a dead pod
-        # or a malformed sentinel, both terminal codes -- exit 2 -- or a
-        # timeout, exit 1) -- cmd_collect, the only other caller of
-        # sandbox-run-log.py record, is never reached in that case, and the
-        # run directory cmd_submit created would otherwise carry no
-        # summary.json and no row in the durable run log: exactly the "a
-        # seat is silently failing" case this log exists to surface.
-        # cmd_wait's own error already told the operator the job and pod
-        # are left in place for inspection, so this does not attempt any of
-        # collect's pod reads (outbox, evidence, fetch) against a pod that
-        # is dead -- it records only what submit already knew, via
-        # record's own run.env fallback for a run directory with no
-        # summary.json. exit_code stays absent (record's null): none is
-        # known.
-        #
-        # A timeout (wait_rc 1) is excluded: cmd_wait's own message for it
-        # says the opposite of "this run ended" -- "the pod is still
-        # running, holding its work" -- and a run_end row written while the
-        # run is still going would be a false record no later collect ever
-        # supersedes (a by-hand fetch/rm, the advice cmd_wait gives, passes
-        # no --run-dir). Every other wait_rc (2: dead pod, malformed
-        # sentinel, an already-Succeeded pod, pod not found) is terminal
-        # from wait's own perspective -- no further wait will ever turn
-        # into a normal completion -- so those still get the row.
-        if [[ -n "$run_dir" && "$wait_rc" != 1 ]]; then
-            fs_record_run_log "$run_dir"
-        fi
-        exit "$wait_rc"
-    fi
-
-    local -a collect_argv=(--branch "$branch")
-    [[ -n "$outbox_dir" ]] && collect_argv+=(--outbox-dir "$outbox_dir")
-    # The parsed byte count, always: it is either the operator's --outbox-max
-    # or the same default collect would apply itself, so there is nothing to
-    # distinguish at the forwarding point.
-    collect_argv+=(--outbox-max "$outbox_max_bytes")
-    # Passed through whenever the flag was given at all, "0" included --
-    # cmd_submit already did the positive-integer validation above, and
-    # collect's own copy only decides whether the loop read happens.
-    [[ -n "$review_loop_cap" ]] && collect_argv+=(--review-loop "$review_loop_cap")
-    [[ "$keep" == true ]] && collect_argv+=(--keep)
-    [[ -n "$run_dir" ]] && collect_argv+=(--run-dir "$run_dir")
-    cmd_collect "${collect_argv[@]}" "$project_path"
-
-    # The one line this verb prints that none of its three phases can: it
-    # reports the agent's exit code, which collect does not know.
-    echo "fork-sandbox-k8s: run complete. branch=$branch agent_exit=$agent_rc landed_in=$project_path" >&2
-    exit "$agent_rc"
+    k8s_run_tail "$run_dir" "$branch" "$timeout" "$project_path" \
+        "$outbox_dir" "$outbox_max_bytes" "$review_loop_cap" "$keep"
 }
 
 verb="${1-}"
@@ -6148,6 +6251,7 @@ case "$verb" in
     install) cmd_install "$@" ;;
     submit) cmd_submit "$@" ;;
     run) cmd_run "$@" ;;
+    resume) cmd_resume "$@" ;;
     wait) cmd_wait "$@" ;;
     collect) cmd_collect "$@" ;;
     fetch) cmd_fetch "$@" ;;
@@ -6155,7 +6259,7 @@ case "$verb" in
     rm) cmd_rm "$@" ;;
     check-grant) cmd_check_grant "$@" ;;
     *)
-        echo "Error: unknown command '$verb'. Use install, submit, run, wait, collect, fetch, say, rm or check-grant." >&2
+        echo "Error: unknown command '$verb'. Use install, submit, run, resume, wait, collect, fetch, say, rm or check-grant." >&2
         exit 1
         ;;
 esac

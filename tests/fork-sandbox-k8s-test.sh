@@ -5747,7 +5747,13 @@ case " $* " in
         if [[ -n "${K8S_STUB_RUN_COMPLETE_RC:-}" ]]; then
             exit "$K8S_STUB_RUN_COMPLETE_RC"
         fi
-        printf '0\n' ;;
+        # A still-running pod: the sentinel read fails until the Nth poll.
+        if [[ -n "${K8S_STUB_RUN_COMPLETE_AFTER:-}" ]]; then
+            n=$(( $(cat "$K8S_STUB_COUNTER" 2>/dev/null || echo 0) + 1 ))
+            printf '%s' "$n" > "$K8S_STUB_COUNTER"
+            (( n > K8S_STUB_RUN_COMPLETE_AFTER )) || exit 1
+        fi
+        printf '%s\n' "${K8S_STUB_RUN_COMPLETE_VALUE:-0}" ;;
 esac
 exit 0
 STUB
@@ -5868,6 +5874,131 @@ if (( rc == 1 )) && [[ ! -f "$reallog3_home/.claude/sandbox-runs.jsonl" ]]; then
 else
     no "cmd_run's wait-failure path records nothing for a timeout (not terminal, exit 1)" \
         "rc=$rc log=$(cat "$reallog3_home/.claude/sandbox-runs.jsonl" 2>/dev/null) out=$(cat "$reallog3_out")"
+fi
+
+# 1d. `resume`: run's tail, for a run submit already created. Each case
+# submits for real (against the stubs) and then resumes from the run
+# directory alone.
+resume_nosleep="$(newdir)"; tmpdirs+=("$resume_nosleep")
+printf '#!/usr/bin/env bash\nexit 0\n' > "$resume_nosleep/sleep"
+chmod +x "$resume_nosleep/sleep"
+runstub_verb() {
+    # $1 = kubectl log, $2 = output file, $3 = verb, rest = its args.
+    local log="$1" out="$2" verb="$3" run_home="$HOME"; shift 3
+    [[ "$run_home" == "$k8s_test_operator_home" ]] && run_home="$k8s_test_home"
+    HOME="$run_home" PATH="${RESUME_EXTRA_PATH:+$RESUME_EXTRA_PATH:}$runstub_dir:$PATH" \
+        K8S_STUB_LOG="$log" \
+        K8S_STUB_BASE_SHA="${K8S_STUB_BASE_SHA:-$(git -C "$proj_dir" rev-parse HEAD)}" \
+        K8S_STUB_OUTBOX_DIR="${K8S_STUB_OUTBOX_DIR:-$runstub_pod_outbox}" \
+        FORK_SANDBOX_CONFIG_DIR="$config_dir" \
+        "$k8s_sh" "$verb" "$@" > "$out" 2>&1
+}
+# Submits a run and prints its run dir; $1 = branch, rest = extra submit args.
+resume_submit() {
+    local branch="$1"; shift
+    local d; d="$(newdir)"; tmpdirs+=("$d")
+    runstub_verb "$d/submit.log" "$d/submit.out" submit --branch "$branch" \
+        --model moonshotai/kimi-k3 "$@" "$proj_dir" "$handoff_file" || return 1
+    sed -n 's/^  run dir:  *//p' "$d/submit.out" | head -1
+}
+
+resume_rd_a="$(resume_submit fs-k8s-test-resume-done \
+    --outbox-dir "$(newdir)/resume-outbox-a" --timeout 900 --keep)"
+resume_env_a="$resume_rd_a/run.env"
+for kv in BRANCH=fs-k8s-test-resume-done "PROJECT=$proj_dir" TIMEOUT=900 KEEP=true \
+    REVIEW_LOOP= "OUTBOX_MAX_BYTES=$((64 * 1024 * 1024))"; do
+    if grep -qxF -- "$kv" "$resume_env_a"; then ok "submit records $kv in run.env"
+    else no "submit records $kv in run.env" "$(cat "$resume_env_a" 2>/dev/null)"; fi
+done
+if grep -qE '^OUTBOX_DIR=.+/resume-outbox-a$' "$resume_env_a" \
+    && grep -qE '^SUBMITTED_AT=[0-9]+$' "$resume_env_a"; then
+    ok "submit records OUTBOX_DIR and SUBMITTED_AT in run.env"
+else
+    no "submit records OUTBOX_DIR and SUBMITTED_AT in run.env" "$(cat "$resume_env_a" 2>/dev/null)"
+fi
+resume_log_a="$(newdir)/kubectl.log"; resume_out_a="$(dirname "$resume_log_a")/out.txt"
+tmpdirs+=("$(dirname "$resume_log_a")")
+rc=0
+K8S_STUB_RUN_COMPLETE_VALUE=7 K8S_STUB_OUTBOX_RC=0 \
+    runstub_verb "$resume_log_a" "$resume_out_a" resume --run-dir "$resume_rd_a" || rc=$?
+if (( rc == 7 )) && grep -q 'run complete. branch=fs-k8s-test-resume-done agent_exit=7' "$resume_out_a" \
+    && [[ -f "$resume_rd_a/summary.json" ]] \
+    && [[ -f "$(sed -n 's/^OUTBOX_DIR=//p' "$resume_env_a")/hello.txt" ]] \
+    && ! grep -q ' delete ' "$resume_log_a"; then
+    ok "resume on a completed run collects and exits with the agent's code (outbox dir and keep read back)"
+else
+    no "resume on a completed run collects and exits with the agent's code (outbox dir and keep read back)" \
+        "rc=$rc out=$(cat "$resume_out_a") log=$(cat "$resume_log_a")"
+fi
+if ! grep -q 'apply -f -' "$resume_log_a"; then
+    ok "resume submits nothing"
+else
+    no "resume submits nothing" "$(cat "$resume_log_a")"
+fi
+
+resume_rd_b="$(resume_submit fs-k8s-test-resume-running)"
+resume_log_b="$(newdir)/kubectl.log"; resume_out_b="$(dirname "$resume_log_b")/out.txt"
+tmpdirs+=("$(dirname "$resume_log_b")")
+rc=0
+RESUME_EXTRA_PATH="$resume_nosleep" K8S_STUB_RUN_COMPLETE_AFTER=2 \
+    K8S_STUB_COUNTER="$(dirname "$resume_log_b")/count" \
+    runstub_verb "$resume_log_b" "$resume_out_b" resume --run-dir "$resume_rd_b" || rc=$?
+if (( rc == 0 )) && [[ "$(cat "$(dirname "$resume_log_b")/count")" -ge 3 ]] \
+    && grep -q 'run complete. branch=fs-k8s-test-resume-running agent_exit=0' "$resume_out_b" \
+    && [[ -f "$resume_rd_b/summary.json" ]]; then
+    ok "resume on a still-running run waits, then collects"
+else
+    no "resume on a still-running run waits, then collects" "rc=$rc out=$(cat "$resume_out_b")"
+fi
+
+resume_rd_c="$(resume_submit fs-k8s-test-resume-dead)"
+resume_home_c="$(newdir)"; tmpdirs+=("$resume_home_c")
+resume_log_c="$(newdir)/kubectl.log"; resume_out_c="$(dirname "$resume_log_c")/out.txt"
+tmpdirs+=("$(dirname "$resume_log_c")")
+rc=0
+HOME="$resume_home_c" RESUME_EXTRA_PATH="$repo_dir/scripts" \
+    K8S_STUB_RUN_COMPLETE_RC=1 K8S_STUB_POD_PHASE=Failed \
+    runstub_verb "$resume_log_c" "$resume_out_c" resume --run-dir "$resume_rd_c" || rc=$?
+resume_line_c="$(tail -1 "$resume_home_c/.claude/sandbox-runs.jsonl" 2>/dev/null)"
+if (( rc == 2 )) && [[ "$(jq -r '.branch' <<< "$resume_line_c")" == fs-k8s-test-resume-dead ]] \
+    && [[ "$(jq -r '.summary_missing' <<< "$resume_line_c")" == true ]]; then
+    ok "resume on a dead pod exits 2 and writes the run-log row"
+else
+    no "resume on a dead pod exits 2 and writes the run-log row" \
+        "rc=$rc line=$resume_line_c out=$(cat "$resume_out_c")"
+fi
+
+resume_rd_d="$(resume_submit fs-k8s-test-resume-timeout)"
+resume_home_d="$(newdir)"; tmpdirs+=("$resume_home_d")
+resume_log_d="$(newdir)/kubectl.log"; resume_out_d="$(dirname "$resume_log_d")/out.txt"
+tmpdirs+=("$(dirname "$resume_log_d")")
+rc=0
+HOME="$resume_home_d" RESUME_EXTRA_PATH="$repo_dir/scripts" K8S_STUB_RUN_COMPLETE_RC=1 \
+    runstub_verb "$resume_log_d" "$resume_out_d" resume --run-dir "$resume_rd_d" --timeout 0 || rc=$?
+if (( rc == 1 )) && grep -q 'timed out after 0s waiting for branch' "$resume_out_d" \
+    && [[ ! -f "$resume_home_d/.claude/sandbox-runs.jsonl" ]]; then
+    ok "resume: a wait timeout exits 1 and records nothing (the Job is still running)"
+else
+    no "resume: a wait timeout exits 1 and records nothing (the Job is still running)" \
+        "rc=$rc out=$(cat "$resume_out_d")"
+fi
+
+resume_rd_e="$(resume_submit fs-k8s-test-resume-nobranch)"
+sed -i '/^BRANCH=/d' "$resume_rd_e/run.env"
+rc=0
+runstub_verb "$(newdir)/kubectl.log" "$resume_rd_e/resume.out" resume --run-dir "$resume_rd_e" || rc=$?
+if (( rc == 1 )) && grep -q 'lacks BRANCH or PROJECT' "$resume_rd_e/resume.out"; then
+    ok "resume refuses a run.env missing BRANCH"
+else
+    no "resume refuses a run.env missing BRANCH" "rc=$rc out=$(cat "$resume_rd_e/resume.out")"
+fi
+resume_empty_dir="$(newdir)"; tmpdirs+=("$resume_empty_dir")
+rc=0
+runstub_verb "$(newdir)/kubectl.log" "$resume_empty_dir/out" resume --run-dir "$resume_empty_dir" || rc=$?
+if (( rc == 1 )) && grep -q 'has no run.env' "$resume_empty_dir/out"; then
+    ok "resume refuses a run dir without run.env"
+else
+    no "resume refuses a run dir without run.env" "rc=$rc out=$(cat "$resume_empty_dir/out")"
 fi
 
 # 2. A failed read with NOTHING on stderr is reported as silent, not as an
