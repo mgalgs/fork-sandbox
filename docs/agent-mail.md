@@ -473,10 +473,12 @@ Every route/harvest pass, `deliver` prints one porcelain line per action
 worth operator eyes to stdout, unbuffered enough to `tail -F` or pipe
 live: `pm <event> thread=<short-id> agent=<name> key=val...`, where
 `thread` is the thread id's first 8 characters and `agent` is always the
-resolved fleet registry name, never raw header text. The seven events are
+resolved fleet registry name, never raw header text. The eight events are
 `spawn` (agent, thread, run, via=to|cc), `harvest` (agent, thread,
 replies=<count>, emitted for both LLM and handler seats), `flag` (thread,
-reason=<fixed keyword>), `refuse` (agent, thread, reason=hops|budget — at
+reason=<fixed keyword>), `retry` (thread, agent, trigger=<short-id>,
+attempt=<n> — a deferred retry firing; see "Retrying a dead wake" below),
+`refuse` (agent, thread, reason=hops|budget — at
 route-pass time this names only the message's `To:` candidates, since a
 refused message skips Cc resolution outright, but the same gate is
 re-checked at follow-up-wake time against whichever agent owns the live
@@ -513,7 +515,7 @@ rule 1's reset in the same pass that performed it.
 code, gated the same way — it only prints one when reached via
 `deliver`'s own route/harvest pass, so running `flag` directly prints
 nothing. `unflag` prints nothing ever, in or out of `deliver`: it has no
-event of its own in the seven above, so a thread being flagged and later
+event of its own in the eight above, so a thread being flagged and later
 auto-cleared (rule 1, operator mail) is invisible on this stream — only
 the flag is observable, not its clearing. This is a stable contract, not
 a log file — stderr is unchanged (errors only), and nothing
@@ -729,7 +731,10 @@ A non-zero exit, and a wake that died without writing `summary.json`, are
 harvested exactly like success — their outbox, if any, is still posted —
 but they also flag the thread: an empty outbox from a crashed wake is not
 the documented "no reply is a valid outcome", and needs an operator's
-eyes.
+eyes. The seat itself does not just go back to sleep on this, though:
+unless a message queued during the run already re-wakes it, this failure
+also schedules a bounded, deferred retry of the same trigger — see
+"Retrying a dead wake" below.
 
 A malformed reply file — bad address, unparseable stanza, or a `mail`
 call that itself fails — is skipped and flags the thread with the
@@ -738,6 +743,43 @@ replies. The run is then marked harvested exactly once.
 
 Posted replies are new unrouted messages. The next scan routes them. That
 loop is the whole conversation.
+
+### Retrying a dead wake
+
+A wake that fails outright — non-zero exit, or no `summary.json` ever
+landed — gets a bounded, deferred retry of its own trigger, unless a
+message that arrived during the run already queued a follow-up wake for
+that seat (that follow-up re-wakes it already, so scheduling a second,
+redundant wake would just double-spawn it — see "The wake" above).
+`FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF`, a comma-separated list of
+seconds (default `300,1200` — 5 minutes then 20), sets each retry's delay
+before firing and, via the list's length, the retry cap: a credential
+rollover fails in seconds and the host token typically rolls within
+minutes, so the very next retry usually catches it, while a quota death
+gets longer to clear. An empty value is legal and means zero retries. A
+malformed value (anything other than a comma-separated list of
+non-negative integers) fails `deliver` at startup, the same posture as
+its other `pm_require_*` startup gates.
+
+`deliver`'s loop runs a retry pass between routing and harvesting each
+scan: a due retry (its backoff elapsed, and the seat has no run in
+flight) re-invokes the same follow-up-wake path a pending message uses,
+so it is gated by the same hops/thread-budget checks as any other wake,
+and counts against the thread's spawn budget like one. A retry refused by
+either gate is permanent for that trigger, so its schedule is dropped
+rather than retried again next pass; firing one (successfully or not)
+emits a `retry` event (see "The event stream" above). Exhausting the cap
+— every retry spent, still failing — flags the thread by name, naming the
+agent and the trigger, and drops the schedule.
+
+A retry schedule is superseded — dropped without ever firing — by a new
+message the router spawns a fresh wake for (that wake carries the seat
+forward instead) or by a clean exit-0 harvest of the pair. It shares its
+one state file with the session-resume wedge bound below (`retries/`),
+but is otherwise unrelated: a resumed session repeatedly failing bounds
+by clearing the session, a wake repeatedly dying outright bounds by
+giving up and flagging — a seat can hit either, both, or neither
+independently.
 
 ### Router state
 
@@ -760,6 +802,7 @@ own thread scans never see it:
 | `wake-threads/<run-id>/thread.txt` | the rendered full-thread snapshot bound read-only at `/thread` in that one wake (`--thread-dir`), written per wake just before its handoff; a trigger-only handoff points at this mount for the rest of the thread, and a snapshot that cannot be written falls the wake back to the legacy full-thread handoff with no mount and flags the thread. Never reaped, like `handoffs/` and `runs/` |
 | `state/<thread-id>/<agent>/` | the harness's transcript/session store for that pair (claude, codex or pi, sealed or not) |
 | `sessions/<thread-id>/<agent>` | the session id that pair's last wake ended on |
+| `retries/<thread-id>/<agent>` | the wedge-bound FAILS counter (session resume, below) and, when a retry is pending, its TRIGGER/ATTEMPT/NOT_BEFORE fields (see "Retrying a dead wake" above) — one file, two independent purposes |
 | `workspaces/<thread-id>/<agent>/` | the persistent clone for that (thread, agent) seat, bound into every wake of it (every harness, not just claude) with `--clone-dir`; removed only by `fleet teardown` |
 
 All state transitions are marker-file creation, never deletion of
@@ -820,13 +863,28 @@ It works through three `fork-sandbox.sh` flags:
 For a "given" harness (pi) it is simply `--session-id` echoed back. The
 postmaster reads it at harvest and, for a discover-mode harness, writes
 `sessions/<thread>/<agent>`; that file present means the next wake
-resumes, absent means fresh, and it is cleared when a wake fails
-outright or ends with a null session id, so a broken session can never
-wedge a seat. A given-mode harness (pi) never touches `sessions/` at all
-— its id is derived fresh every spawn, not read back. That also makes
-the self-clearing above a discover-mode behavior only: pi has no
-recorded id to clear, so if pi's own session store ever becomes
-unloadable, every later wake presents it the same derived id. Recovery
+resumes, absent means fresh. A wake that fails outright — non-zero exit,
+or no `summary.json` — no longer clears it on that alone: if the crash's
+own `summary.json` still names a usable (id-shaped) session id, that id
+is recorded exactly like a success (it may be the id a `--refresh-at`
+mid-run credential rollover left behind); otherwise whatever was recorded
+before is left standing. Only a clean exit-0 with a null/absent session
+id clears it outright — a deliberate "no transcript" statement from the
+launcher, not a guess made from a crash. This is what keeps a mid-wake
+credential rollover, or a plain crash, from wiping the seat's persona.
+
+A genuinely broken session must still not wedge a seat forever, though:
+a per-(thread, agent) FAILS counter, under `retries/` (see the state
+table above), tracks consecutive failed harvests of a wake that had
+something to resume (`RESUMED` was non-empty in its run record) — a wake
+that never resumed anything has no session for clearing to help, so it
+never counts. Three in a row clears the recorded session and resets the
+counter; any exit-0 harvest resets it to 0 as well, regardless of what
+it resumed. A given-mode harness (pi) never touches `sessions/` at all
+— its id is derived fresh every spawn, not read back, so this counter
+never applies to it either: pi has no recorded id to clear, so if pi's
+own session store ever becomes unloadable, every later wake presents it
+the same derived id. Recovery
 there is `fleet teardown` (or removing the seat's `state/` directory),
 not automatic.
 
