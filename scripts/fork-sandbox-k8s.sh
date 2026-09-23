@@ -9,6 +9,7 @@
 #                            [--context-ro DIR] [--thread-dir DIR] [--attach-dir DIR]
 #                            [--checkout REF] [--services-trust-ref REF]
 #                            [--session-state DIR] [--resume-session ID | --session-id ID]
+#                            [--refresh-at N] [--refresh-max N]
 #                            [--claude-credentials PATH]
 #                            [--label key=value]... [--task-meta JSON]
 #                            [--allow-namespace NS[:PORT]]... [--reach-probe HOST:PORT]...
@@ -21,6 +22,7 @@
 #                            [--context-ro DIR] [--thread-dir DIR] [--attach-dir DIR]
 #                            [--checkout REF] [--services-trust-ref REF]
 #                            [--session-state DIR] [--resume-session ID | --session-id ID]
+#                            [--refresh-at N] [--refresh-max N]
 #                            [--claude-credentials PATH]
 #                            [--label key=value]... [--task-meta JSON]
 #                            [--allow-namespace NS[:PORT]]... [--reach-probe HOST:PORT]...
@@ -189,6 +191,17 @@
 # session_state recorded in run.env, so a later collect will not pull one
 # back either. The seat simply loses continuity for that one wake; there is
 # no flag to raise this cap, unlike --outbox-max. See docs/kubernetes-runs.md.
+#
+# --refresh-at N / --refresh-max N (submit, run; claude only): the same
+# self-refresh loop a local run has. N <= 1 is a fraction of the model's
+# context window, larger is tokens; 0 disables; the default is 0.5, so
+# every claude run refreshes unless told not to (--refresh-max defaults
+# to 6 continuations). The threshold and cap reach the pod as
+# REFRESH_THRESHOLD_TOKENS / REFRESH_MAX; the entrypoint runs the
+# continuation legs and records them under /work, which collect pulls
+# back as evidence and summarizes as refresh/continuations in
+# summary.json. Resolved by fs_refresh_resolve in fork-sandbox-lib.sh, so
+# local and k8s runs agree on defaults and refusals (pi is refused).
 #
 # --outbox-dir DIR (run, collect): where to land the pod's /work/outbox after the
 # agent finishes. Defaults to
@@ -1353,6 +1366,24 @@ render_claude_configmap_keys() {
 $(printf '%s\n' "$configmap_cred" | indent_block)
   inbox-hook.sh: |
 $(indent_block < "$inbox_hook_src")
+KEYS
+}
+
+# The three refresh-loop ConfigMap keys: the shared refresh.sh the pod's
+# entrypoint sources, the continuation header (everything in handoff.md
+# before the operator's own text), and the operator's handoff verbatim (the
+# "original brief" every continuation prompt restates). Indented like
+# render_claude_configmap_keys; refresh.sh's lines stay <= 96 columns so the
+# 4-column indent fits the YAML line limit.
+render_refresh_configmap_keys() {
+    local refresh_src="$1" header_text="$2" handoff_src="$3"
+    cat <<KEYS
+  refresh.sh: |
+$(indent_block < "$refresh_src")
+  continuation-header.md: |
+$(printf '%s' "$header_text" | indent_block)
+  handoff-original.md: |
+$(indent_block < "$handoff_src")
 KEYS
 }
 
@@ -3148,6 +3179,11 @@ cmd_submit() {
     local pi_args="" services_trust_ref="" task_meta="" claude_credentials_flag=""
     local thread_dir="" attach_dir=""
     local session_state="" resume_session="" session_id_arg=""
+    local refresh_at_arg="" refresh_at_given=false refresh_max_arg=""
+    # fs_refresh_resolve sets these; refresh_context_window is only local scratch.
+    # shellcheck disable=SC2034
+    local refresh_at="" refresh_enabled=0 refresh_max="" refresh_context_window=""
+    local refresh_threshold_tokens=""
     local -a labels_raw=() allow_ns_raw=() reach_probe_raw=()
     while (( $# )); do
         case "$1" in
@@ -3168,6 +3204,8 @@ cmd_submit() {
             --session-state) session_state="${2:?--session-state requires a directory}"; shift 2 ;;
             --resume-session) resume_session="${2:?--resume-session requires a session id}"; shift 2 ;;
             --session-id) session_id_arg="${2:?--session-id requires a session id}"; shift 2 ;;
+            --refresh-at) refresh_at_arg="${2:?--refresh-at requires a value}"; refresh_at_given=true; shift 2 ;;
+            --refresh-max) refresh_max_arg="${2:?--refresh-max requires a value}"; shift 2 ;;
             --claude-credentials) claude_credentials_flag="${2:?--claude-credentials requires a path}"; shift 2 ;;
             --label) labels_raw+=("${2:?--label requires key=value}"); shift 2 ;;
             --task-meta) task_meta="${2:?--task-meta requires a JSON object}"; shift 2 ;;
@@ -3370,6 +3408,13 @@ cmd_submit() {
     # fork-sandbox-lib.sh.
     session_state="$(fs_validate_session_flags "$harness" "$session_state" \
         "$resume_session" "$session_id_arg")" || exit 1
+
+    # One resolver shared with the local runner: same defaults (claude 0.5),
+    # same refusals (pi), same threshold arithmetic. Sets refresh_enabled,
+    # refresh_max and refresh_threshold_tokens for the Job env, ConfigMap
+    # keys and run.env below.
+    fs_refresh_resolve "$harness" "$refresh_at_arg" "$refresh_at_given" \
+        "$refresh_max_arg" "$model" || exit 1
 
     # The session store's size cap is checked here, right after validation,
     # rather than at push time (where it used to live): the SESSION_HARNESS_
@@ -4012,6 +4057,7 @@ cmd_submit() {
     local inbox_write_sh="$script_dir/fork-sandbox-k8s-inbox-write.sh"
     local context_extract_sh="$script_dir/fork-sandbox-k8s-context-extract.sh"
     local inbox_hook_sh="$script_dir/fork-sandbox-inbox-hook.sh"
+    local refresh_sh="$script_dir/fork-sandbox-refresh.sh"
     for f in "$entrypoint_sh" "$gate_sh" "$inbox_write_sh" "$review_loop_sh" "$context_extract_sh"; do
         [[ -x "$f" ]] || { echo "Error: $f is missing or not executable." >&2; exit 1; }
     done
@@ -4122,6 +4168,21 @@ CENV
 )"
     fi
 
+    # REFRESH_THRESHOLD_TOKENS/REFRESH_MAX: the pod-side half of the
+    # self-refresh loop, set only when fs_refresh_resolve enabled it (claude
+    # only, by construction). Both are validated integers, so no quoting
+    # concern inside the YAML double-quoted scalars.
+    local refresh_env=""
+    if [[ "$refresh_enabled" == 1 ]]; then
+        refresh_env=$'\n'"$(cat <<CENV
+            - name: REFRESH_THRESHOLD_TOKENS
+              value: "$refresh_threshold_tokens"
+            - name: REFRESH_MAX
+              value: "$refresh_max"
+CENV
+)"
+    fi
+
     # The sandbox-env ConfigMap key, present only when the services spec
     # carried a `sandboxEnv` map -- copied verbatim, pod-side, to
     # .env.sandbox in the clone (fork-sandbox-k8s-entrypoint.sh), the same
@@ -4224,15 +4285,33 @@ CENV
     # the archive retains blank lines at the end of the operator's handoff.
     # The ConfigMap's enclosing pipeline strips those newlines before YAML's
     # clip chomping gives the pod one trailing newline.
-    local rendered_handoff
-    rendered_handoff="$({ fs_emit_prompt_preamble "$pod_clone_dir" "$POD_INBOX_DIR" "$harness" gated "$POD_OUTBOX_DIR" pod \
+    # The part before the separator is also the continuation header the pod's
+    # refresh loop re-sends on every continuation leg, so it is rendered on
+    # its own by the same calls (never string-split back out of the whole).
+    local continuation_header rendered_handoff
+    continuation_header="$({ fs_emit_prompt_preamble "$pod_clone_dir" "$POD_INBOX_DIR" "$harness" gated "$POD_OUTBOX_DIR" pod \
        "$outbox_max_bytes"
    [[ -n "$context_ro" ]] && render_context_section "$POD_CONTEXT_DIR"
    [[ -n "$services_prompt_text" ]] && render_services_section "$services_prompt_text" "$sandbox_env_present"
+   printf 'X'; })"
+    continuation_header="${continuation_header%X}"
+    rendered_handoff="$({ printf '%s' "$continuation_header"
    printf '\n---\n\n'
    cat -- "$handoff_file"
    printf 'X'; })"
     rendered_handoff="${rendered_handoff%X}"
+
+    # The refresh loop's three ConfigMap keys, present only when refresh is
+    # enabled -- see render_refresh_configmap_keys. The header keeps its own
+    # trailing newlines (indent_block/YAML clip them to one), which is all
+    # fs_refresh_build_prompt needs.
+    local refresh_configmap_keys=""
+    if [[ "$refresh_enabled" == 1 ]]; then
+        [[ -r "$refresh_sh" ]] \
+            || { echo "Error: $refresh_sh is missing or unreadable." >&2; exit 1; }
+        refresh_configmap_keys=$'\n'"$(render_refresh_configmap_keys \
+            "$refresh_sh" "$continuation_header" "$handoff_file")"
+    fi
 
     local job_rendered rendered
     job_rendered="$(cat <<EOF
@@ -4255,7 +4334,7 @@ $(indent_block < "$inbox_write_sh")
   context-extract.sh: |
 $(indent_block < "$context_extract_sh")
   handoff.md: |
-$(printf '%s' "$rendered_handoff" | indent_block)${review_loop_configmap_keys}${claude_configmap_keys}${services_env_configmap_key}
+$(printf '%s' "$rendered_handoff" | indent_block)${review_loop_configmap_keys}${claude_configmap_keys}${refresh_configmap_keys}${services_env_configmap_key}
 ---
 apiVersion: batch/v1
 kind: Job
@@ -4328,7 +4407,7 @@ spec:
             - name: RUN_TTL
               value: "$K8S_RUN_TTL"
             - name: OUTBOX_MAX_BYTES
-              value: "$outbox_max_bytes"${model_discovery_env}${allow_unlisted_model_env}${review_loop_env}${claude_env}${review_model_env}${pi_args_env}${session_harness_store_env}${resume_session_env}${session_id_env}
+              value: "$outbox_max_bytes"${model_discovery_env}${allow_unlisted_model_env}${review_loop_env}${claude_env}${review_model_env}${pi_args_env}${session_harness_store_env}${resume_session_env}${session_id_env}${refresh_env}
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -4513,6 +4592,13 @@ EOF
         [[ -z "$session_state" ]] || printf 'session_state=%s\n' "$session_state"
         [[ -z "$resume_session" ]] || printf 'resume_session=%s\n' "$resume_session"
         [[ -z "$session_id_arg" ]] || printf 'session_id=%s\n' "$session_id_arg"
+        # Absent when refresh is off: cmd_collect reads a missing
+        # refresh_threshold_tokens as "disabled".
+        if [[ "$refresh_enabled" == 1 ]]; then
+            printf 'refresh_at=%s\n' "$refresh_at"
+            printf 'refresh_max=%s\n' "$refresh_max"
+            printf 'refresh_threshold_tokens=%s\n' "$refresh_threshold_tokens"
+        fi
     } > "$run_dir/run.env"
 
     K8S_LAST_SUBMIT_RUN_DIR="$run_dir"
@@ -5805,6 +5891,7 @@ cmd_run() {
     local checkout_ref="" pi_args="" services_trust_ref="" task_meta="" claude_credentials_flag=""
     local thread_dir="" attach_dir=""
     local session_state="" resume_session="" session_id_arg=""
+    local refresh_at_arg="" refresh_at_given=false refresh_max_arg=""
     local -a labels_raw=() allow_ns_raw=() reach_probe_raw=()
     while (( $# )); do
         case "$1" in
@@ -5828,6 +5915,8 @@ cmd_run() {
             --session-state) session_state="${2:?--session-state requires a directory}"; shift 2 ;;
             --resume-session) resume_session="${2:?--resume-session requires a session id}"; shift 2 ;;
             --session-id) session_id_arg="${2:?--session-id requires a session id}"; shift 2 ;;
+            --refresh-at) refresh_at_arg="${2:?--refresh-at requires a value}"; refresh_at_given=true; shift 2 ;;
+            --refresh-max) refresh_max_arg="${2:?--refresh-max requires a value}"; shift 2 ;;
             --claude-credentials) claude_credentials_flag="${2:?--claude-credentials requires a path}"; shift 2 ;;
             --label) labels_raw+=("${2:?--label requires key=value}"); shift 2 ;;
             --task-meta) task_meta="${2:?--task-meta requires a JSON object}"; shift 2 ;;
@@ -5912,6 +6001,8 @@ cmd_run() {
     [[ -n "$session_state" ]] && submit_argv+=(--session-state "$session_state")
     [[ -n "$resume_session" ]] && submit_argv+=(--resume-session "$resume_session")
     [[ -n "$session_id_arg" ]] && submit_argv+=(--session-id "$session_id_arg")
+    [[ "$refresh_at_given" == true ]] && submit_argv+=(--refresh-at "$refresh_at_arg")
+    [[ -n "$refresh_max_arg" ]] && submit_argv+=(--refresh-max "$refresh_max_arg")
     [[ -n "$claude_credentials_flag" ]] && submit_argv+=(--claude-credentials "$claude_credentials_flag")
     # Passed through only when given, like every other optional option
     # above: an empty --checkout at submit's parse would be an argument

@@ -3605,6 +3605,104 @@ else
 fi
 rm -f /tmp/fs-k8s-test-claude-submit.err
 
+printf '\n== fork-sandbox-k8s.sh submit --dry-run: --refresh-at / --refresh-max ==\n'
+# A claude run refreshes by default (0.5 of a 200k window = 100000 tokens,
+# cap 6), exactly like a local one: Job env, three ConfigMap keys, run.env.
+refresh_dry() {
+    HOME="$claude_home" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+        --branch fs-k8s-test-branch --model claude-sonnet-5 "$@" \
+        "$proj_dir" "$handoff_file" 2>&1
+}
+refresh_env_val() {
+    grep -A1 "name: $1\$" <<< "$2" | sed -n 's/.*value: "\(.*\)"/\1/p'
+}
+refresh_default_out="$(refresh_dry --harness claude)"
+check "claude default: REFRESH_THRESHOLD_TOKENS is 100000" "100000" \
+    "$(refresh_env_val REFRESH_THRESHOLD_TOKENS "$refresh_default_out")"
+check "claude default: REFRESH_MAX is 6" "6" \
+    "$(refresh_env_val REFRESH_MAX "$refresh_default_out")"
+for key in refresh.sh continuation-header.md handoff-original.md; do
+    if grep -qx "  $key: |" <<< "$refresh_default_out"; then
+        ok "claude default: ConfigMap carries $key"
+    else
+        no "claude default: ConfigMap carries $key" "not found"
+    fi
+done
+if grep -qF 'fs_refresh_take_handoff()' <<< "$refresh_default_out"; then
+    ok "claude default: refresh.sh key carries the shared refresh functions"
+else
+    no "claude default: refresh.sh key carries the shared refresh functions" "not found"
+fi
+# handoff-original.md is the operator's file verbatim; the header is the
+# rendered text BEFORE the separator, so header + separator + original is
+# exactly the handoff.md key.
+refresh_key_body() {
+    awk -v k="  $1: |" '
+        $0 == k { on = 1; next }
+        on && /^  [a-z][a-z.-]*: / { exit }
+        on && /^---$/ { exit }
+        on { sub(/^    /, ""); print }' <<< "$2"
+}
+check "claude default: handoff-original.md is the operator handoff" \
+    "$(cat "$handoff_file")" "$(refresh_key_body handoff-original.md "$refresh_default_out")"
+check "claude default: handoff.md is header + separator + operator handoff" \
+    "$(refresh_key_body continuation-header.md "$refresh_default_out")"$'\n\n---\n\n'"$(cat "$handoff_file")" \
+    "$(refresh_key_body handoff.md "$refresh_default_out")"
+if command -v yamllint >/dev/null 2>&1; then
+    refresh_yaml="$(newdir)/refresh.yaml"; tmpdirs+=("$(dirname "$refresh_yaml")")
+    printf '%s\n' "$refresh_default_out" > "$refresh_yaml"
+    out="$(yamllint -d "{extends: default, rules: {line-length: disable}}" "$refresh_yaml" 2>&1)"
+    if [[ -z "$out" ]]; then ok "yamllint: refresh-enabled claude render"
+    else no "yamllint: refresh-enabled claude render" "$out"; fi
+    # The key the pod sources must fit the 100-column YAML limit once
+    # indented: run yamllint with line-length ENABLED over a document that
+    # holds only the refresh keys.
+    refresh_keys_yaml="$(newdir)/refresh-keys.yaml"; tmpdirs+=("$(dirname "$refresh_keys_yaml")")
+    {
+        printf '%s\n' '---' 'data:'
+        awk '$0 == "  refresh.sh: |" { on = 1 }
+             on && /^  [a-z][a-z.-]*: / && $0 != "  refresh.sh: |" { exit }
+             on { print }' <<< "$refresh_default_out"
+    } > "$refresh_keys_yaml"
+    out="$(yamllint -d "{extends: default, rules: {line-length: {max: 100}}}" "$refresh_keys_yaml" 2>&1)"
+    if [[ -z "$out" ]]; then ok "yamllint: refresh.sh ConfigMap key with line-length enabled"
+    else no "yamllint: refresh.sh ConfigMap key with line-length enabled" "$out"; fi
+fi
+refresh_off_out="$(refresh_dry --harness claude --refresh-at 0)"
+for pat in REFRESH_THRESHOLD_TOKENS REFRESH_MAX '  refresh.sh: |' '  continuation-header.md: |' '  handoff-original.md: |'; do
+    if grep -qF -- "$pat" <<< "$refresh_off_out"; then
+        no "--refresh-at 0: no '$pat' in the render" "found"
+    else
+        ok "--refresh-at 0: no '$pat' in the render"
+    fi
+done
+refresh_tok_out="$(refresh_dry --harness claude --refresh-at 150000 --refresh-max 3)"
+check "--refresh-at 150000: REFRESH_THRESHOLD_TOKENS" "150000" \
+    "$(refresh_env_val REFRESH_THRESHOLD_TOKENS "$refresh_tok_out")"
+check "--refresh-max 3: REFRESH_MAX" "3" "$(refresh_env_val REFRESH_MAX "$refresh_tok_out")"
+refuses "pi + --refresh-at is refused with the local message" \
+    "Error: --refresh-at only works with --harness claude" \
+    env HOME="$claude_home" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model claude-sonnet-5 --harness pi --refresh-at 0.5 \
+    "$proj_dir" "$handoff_file"
+refuses "a bad --refresh-max is refused" \
+    "--refresh-max" \
+    env HOME="$claude_home" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model claude-sonnet-5 --harness claude --refresh-max nope \
+    "$proj_dir" "$handoff_file"
+if grep -qF REFRESH_THRESHOLD_TOKENS "$submit_out"; then
+    no "a pi run (default harness) renders no refresh env" "found in $submit_out"
+else
+    ok "a pi run (default harness) renders no refresh env"
+fi
+# run delegates: the same flags reach submit through cmd_run.
+run_refresh_out="$(HOME="$claude_home" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" run --dry-run \
+    --branch fs-k8s-test-branch --model claude-sonnet-5 --harness claude \
+    --refresh-at 150000 --refresh-max 3 "$proj_dir" "$handoff_file" 2>&1)"
+check "run --dry-run forwards --refresh-at" "150000" \
+    "$(refresh_env_val REFRESH_THRESHOLD_TOKENS "$run_refresh_out")"
+check "run --dry-run forwards --refresh-max" "3" "$(refresh_env_val REFRESH_MAX "$run_refresh_out")"
+
 printf '\n== fork-sandbox-k8s.sh submit --dry-run --harness claude, CLAUDE_CREDENTIALS override ==\n'
 # An empty HOME -- no ~/.claude at all -- so the default credential lookup
 # has nothing to fall back to. Any of the three checks below succeeding
