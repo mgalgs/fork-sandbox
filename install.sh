@@ -327,6 +327,7 @@ PLUMBING=(
     fork-sandbox-k8s-services-parse.py
     fork-sandbox-lib.sh
     fork-sandbox-preset-parse.py
+    fork-sandbox-refresh.sh
     sandbox-backend-bwrap
     sandbox-backend-container
 )

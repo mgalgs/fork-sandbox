@@ -7190,6 +7190,8 @@ started_at="$(date +%s)"
 # Load shared predicates used by the status script as well as this runner, so
 # report display and summary provenance cannot drift between processes.
 source "$script_dir/fork-sandbox-lib.sh"
+# The --refresh-at loop's pure logic, shared with the pod (ConfigMap key refresh.sh).
+source "$script_dir/fork-sandbox-refresh.sh"
 
 # fork-sandbox-stop.sh's graceful path signals this runner's whole process
 # GROUP with TERM (a bash trap does not fire while a foreground child is
@@ -7324,32 +7326,9 @@ rm -f "$run_dir/exit-code"
 # function ever runs. A separate directory nothing reads back satisfies both:
 # gone from the live inbox, and never re-surfaced under the wrong authority.
 fs_archive_inbox() {
-    local leg_no="$1" leg_harness="$2" leg_rc="$3" inbox_dir="$run_dir/inbox" \
-        dest="" mail_dest="" f moved=0
+    local leg_no="$1" leg_harness="$2" leg_rc="$3"
     [[ "$leg_harness" == "claude" && "$leg_rc" == "0" ]] || return 0
-    for f in "$inbox_dir"/*.md; do
-        [[ -e "$f" || -L "$f" ]] || continue
-        if [[ -L "$f" ]]; then
-            printf 'fork-sandbox: %s is a symlink; refusing to archive it.\n' "$f" \
-                >> "$sandbox_log"
-            continue
-        fi
-        [[ -f "$f" ]] || continue
-        if [[ "${f##*/}" == mail-banner-* ]]; then
-            if [[ -z "$mail_dest" ]]; then
-                mail_dest="$run_dir/mail-delivered/leg-$leg_no"
-                mkdir -p "$mail_dest"
-            fi
-            mv -f -- "$f" "$mail_dest/"
-            continue
-        fi
-        if (( ! moved )); then
-            dest="$run_dir/inbox-delivered/leg-$leg_no"
-            mkdir -p "$dest"
-        fi
-        mv -f -- "$f" "$dest/"
-        moved=1
-    done
+    fs_refresh_archive_inbox "$run_dir/inbox" "$run_dir" "$leg_no" "$sandbox_log"
 }
 
 # Every addendum fs_archive_inbox has moved out of a strictly earlier leg of
@@ -7360,12 +7339,7 @@ fs_archive_inbox() {
 # just what happens to still be sitting in the live inbox this leg's own
 # sandbox has bound.
 fs_addenda_dirs() {
-    local d leg_n
-    for d in "$run_dir"/inbox-delivered/leg-*; do
-        [[ -d "$d" && ! -L "$d" ]] || continue
-        leg_n="${d##*/leg-}"
-        printf '%s %s\n' "$leg_n" "$d"
-    done | sort -n -k1,1 | cut -d' ' -f2-
+    fs_refresh_addenda_dirs "$run_dir"
 }
 
 printf '== fork-sandbox ==\n'
@@ -7992,7 +7966,7 @@ refresh_last_events="$events"
 # --include-hook-events folds into this leg's own event stream as a
 # hook_response event, so it is right there in whichever file this leg wrote.
 refresh_leg_was_nudged() {
-    grep -q 'fork-sandbox-refresh: nudged' "$1" 2>/dev/null
+    fs_refresh_leg_was_nudged "$1"
 }
 
 # $1 continuation number (1 for the first continuation -- the same count
@@ -8007,68 +7981,8 @@ refresh_leg_was_nudged() {
 # set, and finally the previous leg's own hand-off -- there is no
 # verdict-style body to append here, unlike the fix leg's prompt.
 refresh_build_prompt() {
-    local n="$1" handoff="$2" out="$3" stale="${4:-0}"
-    # Every addendum fs_archive_inbox has moved out of a strictly earlier leg
-    # of THIS run, oldest first: sorted by leg number rather than by
-    # directory name, since "leg-10" must not sort before "leg-2". The review
-    # loop rebuilds its own review-prompt copy with the same list, for the
-    # same reason -- a continuation is the same task continued, so it gets
-    # all of them, not just the ones its immediate predecessor saw.
-    local addenda_list f
-    addenda_list="$(fs_addenda_dirs)"
-    {
-        cat -- "$continuation_prompt_header"
-        printf '\n---\n\n# This is continuation %s of a run that refreshed its context\n\n' "$n"
-        printf 'A previous session, in this same clone and on this same branch, used up\n'
-        printf 'most of its context window and wrote a hand-off for a fresh session to\n'
-        printf 'continue from. You are that fresh session, with none of its memory.\n'
-        if [[ -n "$addenda_list" ]]; then
-            printf 'Three documents follow: the original brief this run was launched\n'
-            printf 'with, any operator addenda delivered to earlier legs of this run,\n'
-            printf 'and the hand-off the previous leg wrote against it.\n\n'
-        else
-            printf 'Two documents follow: the original brief this run was launched with,\n'
-            printf 'and the hand-off the previous leg wrote against it.\n\n'
-        fi
-        printf 'The brief is authoritative for what the task IS -- check its own list\n'
-        printf 'of items, not the hand-off'"'"'s account of it, to decide what is left.\n'
-        if [[ -n "$addenda_list" ]]; then
-            printf 'The addenda carry the same authority as the brief and outrank it\n'
-            printf 'where the two conflict -- see their own section below for what each\n'
-            printf 'one asked for.\n'
-        fi
-        printf 'The hand-off is authoritative for what has been done against the brief\n'
-        printf 'so far. Where the hand-off summarises, abbreviates or omits items the\n'
-        printf 'brief contains, the brief wins.\n\n'
-        printf '\n---\n\n## The original brief\n\n'
-        cat -- "$handoff_original"
-        if [[ -n "$addenda_list" ]]; then
-            printf '\n---\n\n## Operator addenda delivered to earlier legs\n\n'
-            printf 'The operator sent the messages below to an earlier leg of this same\n'
-            printf 'run, oldest first. They carry the same authority as the brief above\n'
-            printf 'and outrank it where the two conflict. Where a message asks for\n'
-            printf 'something to be done, the leg that received it has most likely\n'
-            printf 'already done it -- check `git log --oneline` before redoing any of\n'
-            printf 'it. Where a message is a constraint or a correction, it still binds.\n'
-            while IFS= read -r d; do
-                [[ -n "$d" ]] || continue
-                for f in "$d"/*.md; do
-                    [[ -f "$f" ]] || continue
-                    printf '\n### %s\n\n' "${f##*/}"
-                    cat -- "$f"
-                done
-            done <<< "$addenda_list"
-        fi
-        if (( stale )); then
-            printf '\n---\n\n## Warning: this hand-off is stale\n\n'
-            printf 'It was written before the last commit on this branch, so its "done"\n'
-            printf 'and "left" lists may be wrong. Run `git log --oneline` and `git status`\n'
-            printf 'first and reconcile against the brief above before doing anything.\n'
-        fi
-        printf '\n---\n\n## Hand-off from the previous leg\n\n'
-        cat -- "$handoff"
-    } > "$out.part"
-    mv -- "$out.part" "$out"
+    fs_refresh_build_prompt "$1" "$2" "$3" "${4:-0}" "$continuation_prompt_header" \
+        "$handoff_original" "$run_dir"
 }
 
 if [[ "$refresh_enabled" == "1" ]]; then
@@ -8082,55 +7996,18 @@ if [[ "$refresh_enabled" == "1" ]]; then
                 refresh_ended="cap"
                 break
             fi
-            # The hand-off is written by a session, so a symlink at that path
-            # is not a hand-off: refuse it rather than follow it out of the
-            # clone -- the same guard the review loop's verdict file gets.
-            if [[ -L "$outbox_dir/handoff.md" ]]; then
-                printf 'fork-sandbox: outbox handoff.md is a symlink; refusing it.\n' \
-                    >> "$sandbox_log"
-                rm -f -- "$outbox_dir/handoff.md" 2>/dev/null
+            # fs_refresh_take_handoff refuses a symlink, an oversized or an
+            # empty hand-off (logging why) and otherwise moves it to its
+            # $run_dir record, checked to be a plain file.
+            refresh_next_n=$(( refresh_leg_n + 1 ))
+            if ! fs_refresh_take_handoff "$outbox_dir" "$run_dir" \
+                "$refresh_next_n" "$sandbox_log" > /dev/null; then
                 refresh_ended="no-handoff"
                 break
             fi
-            # An oversized hand-off is refused rather than trusted -- moved
-            # aside so it is not silently reconsidered on the next check, and
-            # the run proceeds as if this leg had written nothing at all.
-            handoff_bytes="$(wc -c < "$outbox_dir/handoff.md" 2>/dev/null || printf 0)"
-            if (( handoff_bytes > 65536 )); then
-                printf 'fork-sandbox: outbox handoff.md is %s bytes, over the 64 KiB cap; refusing it.\n' \
-                    "$handoff_bytes" >> "$sandbox_log"
-                mv -f -- "$outbox_dir/handoff.md" "$run_dir/handoff-refused-too-large.md" 2>/dev/null
-                refresh_ended="no-handoff"
-                break
-            fi
-            # An empty or dangling hand-off (wc -c failing on it falls back to
-            # 0, which passes the cap above) is refused the same way -- it
-            # would otherwise launch a whole continuation with nothing under
-            # "Read the hand-off as your task".
-            if [[ ! -s "$outbox_dir/handoff.md" ]]; then
-                printf 'fork-sandbox: outbox handoff.md is empty; refusing it.\n' \
-                    >> "$sandbox_log"
-                mv -f -- "$outbox_dir/handoff.md" "$run_dir/handoff-refused-empty.md" 2>/dev/null
-                refresh_ended="no-handoff"
-                break
-            fi
-
-            refresh_leg_n=$(( refresh_leg_n + 1 ))
+            refresh_leg_n="$refresh_next_n"
             leg_no=$(( refresh_leg_n + 1 ))
             record_name="handoff-$refresh_leg_n.md"
-            mv -f -- "$outbox_dir/handoff.md" "$run_dir/$record_name"
-            # Guard the window between the checks above and this mv: what
-            # gets cat'd into the prompt below must be a plain file that
-            # actually landed in the run dir, never a symlink followed here.
-            if [[ -L "$run_dir/$record_name" || ! -f "$run_dir/$record_name" ]]; then
-                printf 'fork-sandbox: %s is not a regular file after the move; refusing it.\n' \
-                    "$record_name" >> "$sandbox_log"
-                rm -f -- "$run_dir/$record_name" 2>/dev/null
-                refresh_leg_n=$(( refresh_leg_n - 1 ))
-                leg_no=$(( leg_no - 1 ))
-                refresh_ended="no-handoff"
-                break
-            fi
 
             # Bug B's host-side backstop: the sandbox-side Stop check cannot
             # help a leg that died (quota, crash, timeout) right after
@@ -8140,8 +8017,7 @@ if [[ "$refresh_enabled" == "1" ]]; then
             # stays forbidden on the host (see the review-loop commit count
             # below, "nothing may run git in the clone to count them there").
             handoff_stale=0
-            if [[ -f "$clone_dir/.git/logs/HEAD" \
-                && "$clone_dir/.git/logs/HEAD" -nt "$run_dir/$record_name" ]]; then
+            if fs_refresh_handoff_stale "$clone_dir" "$run_dir/$record_name"; then
                 handoff_stale=1
                 printf "fork-sandbox: %s predates the clone's last commit; continuation leg %s is warned\n" \
                     "$record_name" "$leg_no" | tee -a "$sandbox_log"
