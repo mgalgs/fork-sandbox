@@ -545,6 +545,13 @@ contains "--message renders a discoverable malformed entry's error card" "$malfo
 if python3 "$renderer" --text --thread "$root_id" --message does-not-exist "$FORK_SANDBOX_MAIL_ROOT" >/dev/null 2>&1; then no "--message unknown id fails"; else ok "--message unknown id fails"; fi
 if python3 "$renderer" --thread "$root_id" --message "$reply2_id" "$FORK_SANDBOX_MAIL_ROOT" >/dev/null 2>&1; then no "--message requires text"; else ok "--message requires text"; fi
 if python3 "$renderer" --text --message "$reply2_id" "$FORK_SANDBOX_MAIL_ROOT" >/dev/null 2>&1; then no "--message requires thread"; else ok "--message requires thread"; fi
+if python3 "$renderer" --json "$FORK_SANDBOX_MAIL_ROOT" >/dev/null 2>&1; then no "--json requires --thread"; else ok "--json requires --thread"; fi
+json_rc=0
+python3 "$renderer" --json --thread does-not-exist "$FORK_SANDBOX_MAIL_ROOT" >/dev/null 2>json_err.txt || json_rc=$?
+if [[ "$json_rc" -eq 1 && "$(wc -l < json_err.txt)" -eq 1 ]]; then ok "--json unknown thread exits 1 with a one-line error"; else no "--json unknown thread exits 1 with a one-line error" "rc=$json_rc"; fi
+json_out="$(python3 "$renderer" --json --thread "$root_id" "$FORK_SANDBOX_MAIL_ROOT" 2>/dev/null)"
+contains "--json lists the malformed entry in place" "$json_out" '"file": "005-badfile.msg"'
+contains "--json carries the thread id" "$json_out" "\"thread\": \"$root_id\""
 if python3 -m py_compile "$renderer"; then ok "renderer compiles"; else no "renderer compiles"; fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"

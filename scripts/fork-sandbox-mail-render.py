@@ -6,6 +6,7 @@ Usage: fork-sandbox-mail-render.py <mail-root> -o threads.html
        fork-sandbox-mail-render.py <mail-root> --thread <id> -o t.html
        fork-sandbox-mail-render.py --text <mail-root> [--thread <id>] [--message <id>]
        fork-sandbox-mail-render.py <mail-root> -o threads.html --live [SECONDS]
+       fork-sandbox-mail-render.py --json <mail-root> --thread <id>
 
 Reads the store fork-sandbox-mail.sh writes under <mail-root>/threads/
 (<thread-id>/NNN-<uuid>.msg -- an RFC 5322-shaped header block, a blank
@@ -51,6 +52,21 @@ renderer's own grammar never emits an unquoted line from a body, so
 anything carrying a leading '> ' reads as quoted body text no matter
 what it says.
 
+--json is the raw export for dashboards: one JSON object on stdout for a
+single thread (--thread is required; an unknown thread exits 1 with a
+one-line error). It carries "thread", "messages" (NNN arrival order; each
+with seq, id, every header line in file order as [name, value] pairs,
+from, to and cc as lists, subject, date, in_reply_to or null, the body
+verbatim, and attachments as {name, bytes}), "senders" (messages per From)
+and "addressed" (the sorted union of every To and Cc). An attachment's
+"bytes" is the size of <thread>/attachments/<name>, or null when that
+file is missing or the name is not a plain basename; the bytes are never
+read. A malformed .msg appears in place as {"seq", "error", "file"}. The
+body is read without newline translation and decoded as UTF-8 with
+errors="replace", so bytes that are not valid UTF-8 become U+FFFD. The
+JSON is ASCII-only (non-ASCII text is \\u-escaped), so it survives any
+stdout encoding.
+
 --live [SECONDS] turns this into a standing process for watching an
 in-progress thread in a browser: render, write the output file
 atomically (temp file in the same directory, then os.replace -- the
@@ -76,6 +92,7 @@ sleep so a test can land a signal inside the render window on purpose.
 """
 import argparse
 import html
+import json
 import os
 import signal
 import stat
@@ -88,13 +105,13 @@ def esc(s):
     return html.escape(s, quote=True)
 
 
-def parse_msg(path, seq, fn):
+def parse_msg(path, seq, fn, newline=None):
     """Parses one .msg file defensively. Returns a dict; entries that
     fail to parse carry ok=False and an "error" message instead of
     raising, so one bad file never aborts the whole render."""
     entry = {"seq": seq, "fn": fn, "ok": False, "error": None}
     try:
-        with open(path, encoding="utf-8", errors="replace") as f:
+        with open(path, encoding="utf-8", errors="replace", newline=newline) as f:
             raw = f.read()
     except OSError as e:
         entry["error"] = f"could not read {fn}: {e}"
@@ -113,6 +130,11 @@ def parse_msg(path, seq, fn):
         return entry
     hdr = {}
     attachments = []
+    header_lines = []
+    for line in head.split("\n"):
+        hname, hsep, hvalue = line.partition(":")
+        if hsep:
+            header_lines.append([hname, hvalue.strip()])
     for line in head.splitlines():
         name, part, value = line.partition(": ")
         if not part:
@@ -137,6 +159,7 @@ def parse_msg(path, seq, fn):
         "subject": hdr.get("Subject", ""),
         "hops": hdr.get("X-Hops", ""),
         "attachments": attachments,
+        "headers": header_lines,
         "body": body,
         "ai_harness": hdr.get("X-AI-Harness", ""),
         "ai_model": hdr.get("X-AI-Model", ""),
@@ -155,7 +178,7 @@ def attribution_str(e):
     return " · ".join(parts)
 
 
-def load_thread(thread_dir):
+def load_thread(thread_dir, newline=None):
     """Every NNN-<uuid>.msg entry in a thread dir, in NNN order. Only
     files ending in .msg are considered, which naturally skips the
     NNN.seq reservation directories the store leaves behind."""
@@ -172,7 +195,7 @@ def load_thread(thread_dir):
             seq = int(fn.split("-", 1)[0])
         except ValueError:
             seq = 0
-        entries.append(parse_msg(path, seq, fn))
+        entries.append(parse_msg(path, seq, fn, newline))
     entries.sort(key=lambda e: e["seq"])
     return entries
 
@@ -257,9 +280,9 @@ def list_thread_ids(mail_root):
     )
 
 
-def render_thread_data(mail_root, thread_id):
+def render_thread_data(mail_root, thread_id, newline=None):
     thread_dir = os.path.join(mail_root, "threads", thread_id)
-    entries = load_thread(thread_dir)
+    entries = load_thread(thread_dir, newline)
     root, trace = build_thread(thread_id, entries)
     return {"thread_id": thread_id, "entries": entries, "root": root, "trace": trace}
 
@@ -567,6 +590,61 @@ def render_text(mail_root, thread_ids):
     return "\n".join(out) + ("\n" if out else "")
 
 
+def attachment_size(thread_dir, ref):
+    """Size in bytes of <thread>/attachments/<name> for an X-Attachment
+    value, or None when the file is missing or the name is not a plain
+    basename (the value is agent-written, so it is never used to walk out
+    of attachments/). Never reads the file."""
+    name = ref[len("attachments/"):] if ref.startswith("attachments/") else ref
+    if not name or "/" in name or "\0" in name or name in (".", ".."):
+        return None
+    try:
+        return os.stat(os.path.join(thread_dir, "attachments", name)).st_size
+    except OSError:
+        return None
+
+
+def export_json(mail_root, thread_id):
+    """The raw JSON export of one thread; see the --json note above."""
+    thread_dir = os.path.join(mail_root, "threads", thread_id)
+    data = render_thread_data(mail_root, thread_id, newline="")
+    messages = []
+    senders = {}
+    addressed = set()
+    for e in data["entries"]:
+        if not e["ok"]:
+            messages.append({"seq": e["seq"], "error": e["error"], "file": e["fn"]})
+            continue
+        attachments = []
+        for ref in e["attachments"]:
+            name = ref[len("attachments/"):] if ref.startswith("attachments/") else ref
+            attachments.append({"name": name, "bytes": attachment_size(thread_dir, ref)})
+        to = addr_list(e["to"])
+        cc = addr_list(e["cc"])
+        senders[e["from"]] = senders.get(e["from"], 0) + 1
+        addressed.update(to)
+        addressed.update(cc)
+        messages.append({
+            "seq": e["seq"],
+            "id": e["id"],
+            "headers": e["headers"],
+            "from": e["from"],
+            "to": to,
+            "cc": cc,
+            "subject": e["subject"],
+            "date": e["date"],
+            "in_reply_to": e["in_reply_to"] or None,
+            "body": e["body"],
+            "attachments": attachments,
+        })
+    return {
+        "thread": thread_id,
+        "messages": messages,
+        "senders": senders,
+        "addressed": sorted(addressed),
+    }
+
+
 def write_atomic(path, content):
     """Writes content to path via a temp file in the same directory plus
     os.replace, so a concurrent reader (the browser, on its meta-refresh
@@ -662,6 +740,7 @@ def main(argv=None):
     parser.add_argument("--message", metavar="ID", help="render only this message (requires --text and --thread)")
     parser.add_argument("-o", "--output", metavar="FILE", help="write HTML to FILE instead of stdout")
     parser.add_argument("--text", action="store_true", help="render as plain text to stdout instead of HTML")
+    parser.add_argument("--json", action="store_true", help="print one thread (--thread required) as a JSON object to stdout")
     parser.add_argument("--title", default="Mail threads", help="HTML page title (default: %(default)s)")
     parser.add_argument(
         "--live", metavar="SECONDS", nargs="?", type=int, const=15, default=None,
@@ -671,6 +750,13 @@ def main(argv=None):
     parser.add_argument("--live-render-delay", type=float, default=0, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
 
+    if args.json:
+        if not args.thread:
+            print("Error: --json requires --thread", file=sys.stderr)
+            return 1
+        if args.text or args.output or args.message or args.live is not None:
+            print("Error: --json cannot be combined with --text, --message, -o or --live", file=sys.stderr)
+            return 1
     if args.message and not args.text:
         print("Error: --message requires --text", file=sys.stderr)
         return 1
@@ -702,6 +788,11 @@ def main(argv=None):
         thread_ids = [args.thread]
     else:
         thread_ids = all_ids
+
+    if args.json:
+        json.dump(export_json(args.mail_root, args.thread), sys.stdout)
+        sys.stdout.write("\n")
+        return 0
 
     if args.text:
         if args.output:

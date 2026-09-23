@@ -14,6 +14,7 @@
 #                              [--header 'X-Name: value']...
 #        fork-sandbox-mail.sh show <message-id>
 #        fork-sandbox-mail.sh tree <thread-id>
+#        fork-sandbox-mail.sh export <thread-id> --json
 #        fork-sandbox-mail.sh list
 #        fork-sandbox-mail.sh inbox <name> [--all]
 #        fork-sandbox-mail.sh seen <name> <message-id>...
@@ -21,6 +22,12 @@
 #                              [--reach-probe HOST:PORT]... [--context-ro DIR]
 #        fork-sandbox-mail.sh grant <thread-id> --clear
 #        fork-sandbox-mail.sh grant <thread-id> --show [--json]
+#
+# `export <thread-id> --json` prints one thread as a JSON object (every
+# header line, the verbatim body, attachment sizes, per-sender counts) for
+# dashboards. --json is required: export has no other format. It is
+# fork-sandbox-mail-render.py --json, run against this store; nothing is
+# written.
 #
 # This is a store, not a router: `send`/`reply` write messages, `show`/
 # `tree`/`list`/`inbox`/`seen` read them back. There is no agent spawning, no
@@ -295,7 +302,7 @@ mail_thread_root_exists() {
 # id is itself path-safe.
 mail_validate_thread_id() {
     if [[ ! "$1" =~ $MAIL_ID_RE ]]; then
-        echo "Error: grant: '$1' is not a valid thread id." >&2
+        echo "Error: ${2:-grant}: '$1' is not a valid thread id." >&2
         return 1
     fi
     return 0
@@ -878,6 +885,24 @@ cmd_tree() {
     mail_tree_print ids parents froms subjects attach seqs "$root" 0
 }
 
+cmd_export() {
+    local tid="" json=0
+    while (( $# )); do
+        case "$1" in
+            --json) json=1; shift ;;
+            -h|--help) usage; exit 0 ;;
+            -*) echo "Error: export: unknown option '$1'." >&2; return 1 ;;
+            *)
+                [[ -z "$tid" ]] || { echo "Error: export: exactly one thread id is allowed." >&2; return 1; }
+                tid="$1"; shift ;;
+        esac
+    done
+    [[ -n "$tid" ]] || { echo "Usage: fork-sandbox-mail.sh export <thread-id> --json" >&2; return 1; }
+    (( json )) || { echo "Error: export: --json is required (it is the only export format)." >&2; return 1; }
+    mail_validate_thread_id "$tid" export || return 1
+    exec python3 "$script_dir/fork-sandbox-mail-render.py" --json "$MAIL_ROOT" --thread "$tid"
+}
+
 cmd_list() {
     local threads_dir; threads_dir="$(mail_threads_dir)"
     [[ -d "$threads_dir" ]] || return 0
@@ -1057,6 +1082,7 @@ case "${1-}" in
     reply) shift; cmd_reply "$@" ;;
     show) shift; cmd_show "$@" ;;
     tree) shift; cmd_tree "$@" ;;
+    export) shift; cmd_export "$@" ;;
     list) shift; cmd_list "$@" ;;
     inbox) shift; cmd_inbox "$@" ;;
     seen) shift; cmd_seen "$@" ;;

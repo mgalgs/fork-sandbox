@@ -646,5 +646,102 @@ rc=$?
 check "reply with a grant flag exits 1" "1" "$rc"
 contains "reply's refusal names send as the way to set a grant" "$out" "grant flags apply to a new thread only"
 
+printf '\n== export --json ==\n'
+
+new_root FORK_SANDBOX_MAIL_ROOT; export FORK_SANDBOX_MAIL_ROOT
+printf 'attach-bytes-1234' > patch.diff
+ex_root="$("$mail" send --from @a --to @b --subject "Export me" --header 'X-Custom: one' \
+    --header 'X-Custom: two' --body - <<< $'line one\n\nline three  ' 2>/dev/null)"
+ex_r1="$("$mail" reply --from @b --reply-to "$ex_root" --cc @c --attach patch.diff \
+    --body - <<< "first reply" 2>/dev/null)"
+ex_r2="$("$mail" reply --from @a --reply-to "$ex_r1" --to @b --body - <<< "second reply" 2>/dev/null)"
+
+export_out="$("$mail" export "$ex_root" --json 2>diag.txt)"
+rc=$?
+check "export --json exits 0" "0" "$rc"
+schema_check="$(python3 - "$export_out" "$ex_root" "$ex_r1" "$ex_r2" <<'PY'
+import json, sys
+doc = json.loads(sys.argv[1])
+root, r1, r2 = sys.argv[2:5]
+bad = []
+def want(label, got, exp):
+    if got != exp:
+        bad.append(f"{label}: expected {exp!r}, got {got!r}")
+want("top keys", sorted(doc), ["addressed", "messages", "senders", "thread"])
+want("thread", doc["thread"], root)
+m = doc["messages"]
+want("message count", len(m), 3)
+want("seq", [x["seq"] for x in m], [1, 2, 3])
+want("ids", [x["id"] for x in m], [root, r1, r2])
+want("message keys", sorted(m[0]), ["attachments", "body", "cc", "date", "from", "headers",
+                                    "id", "in_reply_to", "seq", "subject", "to"])
+want("from", [x["from"] for x in m], ["@a", "@b", "@a"])
+want("to", [x["to"] for x in m], [["@b"], ["@a"], ["@b"]])
+want("cc", [x["cc"] for x in m], [[], ["@c"], []])
+want("subject", [x["subject"] for x in m], ["Export me", "Re: Export me", "Re: Export me"])
+want("in_reply_to", [x["in_reply_to"] for x in m], [None, root, r1])
+want("root body verbatim", m[0]["body"], "line one\n\nline three  \n")
+want("attachments root", m[0]["attachments"], [])
+want("attachments reply", m[1]["attachments"], [{"name": "patch.diff", "bytes": 17}])
+want("date is text", all(isinstance(x["date"], str) and x["date"] for x in m), True)
+h = m[0]["headers"]
+want("header pairs are lists", all(isinstance(p, list) and len(p) == 2 for p in h), True)
+want("header order", [p[0] for p in h][:4], ["Message-ID", "Thread-ID", "Date", "From"])
+want("repeated X- header survives", [p[1] for p in h if p[0] == "X-Custom"], ["one", "two"])
+want("X-Hops kept", ["X-Hops", "8"] in h, True)
+want("attachment header kept", ["X-Attachment", "attachments/patch.diff"] in m[1]["headers"], True)
+want("senders", doc["senders"], {"@a": 2, "@b": 1})
+want("addressed", doc["addressed"], ["@a", "@b", "@c"])
+print("\n".join(bad) if bad else "ALL-OK")
+PY
+)"
+check "export --json: every schema field" "ALL-OK" "$schema_check"
+
+out="$("$mail" export "$ex_root" 2>&1)"; rc=$?
+check "export without --json is refused" "1" "$rc"
+contains "export without --json says --json is required" "$out" "--json is required"
+contains "usage header mentions export --json" "$("$mail" --help)" "export <thread-id> --json"
+out="$("$mail" export "../etc" --json 2>&1)"; rc=$?
+check "export with a bad thread-id shape is refused" "1" "$rc"
+contains "export bad thread-id names the shape problem" "$out" "not a valid thread id"
+out="$("$mail" export "00000000-0000-4000-8000-000000000000" --json 2>&1)"; rc=$?
+check "export of an unknown thread exits 1" "1" "$rc"
+contains "export of an unknown thread says so" "$out" "no thread"
+
+ex_bad_dir="$FORK_SANDBOX_MAIL_ROOT/threads/$ex_root"
+printf 'Subject: no blank line\n' > "$ex_bad_dir/004-broken.msg"
+export_bad="$("$mail" export "$ex_root" --json 2>/dev/null)"; rc=$?
+check "export with a malformed message still exits 0" "0" "$rc"
+bad_check="$(python3 - "$export_bad" <<'PY'
+import json, sys
+m = json.loads(sys.argv[1])["messages"]
+print(len(m), m[3])
+PY
+)"
+check "a malformed message appears in place" \
+    "4 {'seq': 4, 'error': '004-broken.msg: no blank line separating headers from body', 'file': '004-broken.msg'}" \
+    "$bad_check"
+
+printf 'Message-ID: %s\nFrom: @a\nTo: @b\nSubject: bytes\n\nbad \xff\xfe byte\r\nnext\n' \
+    "11111111-1111-4111-8111-111111111111" > "$ex_bad_dir/005-bytes.msg"
+export_bytes="$("$mail" export "$ex_root" --json 2>/dev/null)"
+bytes_check="$(python3 - "$export_bytes" <<'PY'
+import json, sys
+m = json.loads(sys.argv[1])["messages"]
+print(ascii(m[4]["body"]))
+PY
+)"
+check "non-UTF-8 body bytes are replaced; CRLF is kept" "'bad \\ufffd\\ufffd byte\\r\\nnext\\n'" "$bytes_check"
+
+printf 'Message-ID: %s\nFrom: @a\nTo: @b\nSubject: gone\nX-Attachment: attachments/missing.bin\n\nx\n' \
+    "22222222-2222-4222-8222-222222222222" > "$ex_bad_dir/006-missing.msg"
+export_missing="$("$mail" export "$ex_root" --json 2>/dev/null)"
+missing_check="$(python3 - "$export_missing" <<'PY'
+import json, sys
+print(json.loads(sys.argv[1])["messages"][5]["attachments"])
+PY
+)"
+check "a missing attachment file has bytes null" "[{'name': 'missing.bin', 'bytes': None}]" "$missing_check"
+
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 (( fail == 0 )) || exit 1
