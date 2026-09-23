@@ -389,7 +389,39 @@ rm -f -- "$nudge_marker"
 hook_run_stderr "$inbox" PostToolUse "$t"
 contains "an unwritable baseline falls back to T: a later call nudges at 100000 too" \
     "nudged (usage >= 100000 tokens)" "$hook_stderr"
-marker "an unwritable baseline leaves no stray .tmp behind" "$baseline_marker.tmp" no
+marker "an unwritable baseline leaves no stray .tmp behind" "$baseline_marker.tmp.$$" no
+unset baseline_marker
+
+# Concurrent first measurements: every racing call must end up using the ONE
+# baseline that landed (110000 -> eff 160000), so none of them nudges at
+# usage 110000. A loser that treated its failed publish as "unwritable"
+# would fall back to T=100000 and nudge. Repeated rounds, since the race is
+# timing-dependent.
+race_nudges=0
+for _ in 1 2 3 4 5 6; do
+    inbox="$(new_inbox)"; tmpdirs+=("$inbox")
+    printf 'THRESHOLD_TOKENS=100000\nOUTBOX_DIR=%s/outbox\nCEILING_TOKENS=160000\n' \
+        "$inbox" > "$inbox/.refresh-config"
+    mkdir -p "$inbox/outbox"
+    nudge_marker="$(mktemp -u)"; nudge_reminded="$(mktemp -u)"; stale_reminded="$(mktemp -u)"
+    baseline_marker="$(mktemp -u)"
+    tmpdirs+=("$nudge_marker" "$nudge_reminded" "$stale_reminded" "$baseline_marker")
+    t="$(new_transcript 110000 0 0)"; tmpdirs+=("$(dirname "$t")")
+    race_dir="$(mktemp -d)"; tmpdirs+=("$race_dir")
+    for i in 1 2 3 4 5 6 7 8; do
+        jq -n --arg t "$t" '{hook_event_name: "PostToolUse", transcript_path: $t}' \
+        | FORK_SANDBOX_INBOX="$inbox" \
+            FORK_SANDBOX_INBOX_SEEN="$inbox/../seen-$$" \
+            FORK_SANDBOX_NUDGE_MARKER="$nudge_marker" \
+            FORK_SANDBOX_NUDGE_REMINDED="$nudge_reminded" \
+            FORK_SANDBOX_STALE_REMINDED="$stale_reminded" \
+            FORK_SANDBOX_NUDGE_BASELINE="$baseline_marker" \
+            "$hook" > /dev/null 2> "$race_dir/err-$i" &
+    done
+    wait
+    race_nudges=$(( race_nudges + $(cat "$race_dir"/err-* | grep -c 'nudged' || true) ))
+done
+check "racing first measurements: none falls back to T and nudges" "0" "$race_nudges"
 unset baseline_marker
 
 # =====================================================================

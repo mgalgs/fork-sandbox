@@ -271,12 +271,19 @@ if (( measure_usage )); then
                 # write or move fails, every later call would otherwise take
                 # its own usage as B again and the nudge would drift to the
                 # ceiling. Left empty, it falls back to exactly T.
-                if printf '%s' "$usage_tokens" > "$baseline_marker.tmp" 2>/dev/null \
-                    && mv -f -- "$baseline_marker.tmp" "$baseline_marker" 2>/dev/null; then
-                    baseline="$usage_tokens"
-                else
-                    rm -f -- "$baseline_marker.tmp" 2>/dev/null || true
+                # Two first calls can race here. Each writes its own tmp
+                # file and publishes it with `ln`, which fails if the marker
+                # already exists, so exactly one wins; every caller then
+                # reads the marker back and uses the winner's value.
+                baseline_tmp="$baseline_marker.tmp.$$"
+                if printf '%s' "$usage_tokens" > "$baseline_tmp" 2>/dev/null; then
+                    ln -- "$baseline_tmp" "$baseline_marker" 2>/dev/null \
+                        || [[ -f "$baseline_marker" ]] \
+                        || mv -f -- "$baseline_tmp" "$baseline_marker" 2>/dev/null \
+                        || true
+                    IFS= read -r baseline < "$baseline_marker" 2>/dev/null || true
                 fi
+                rm -f -- "$baseline_tmp" 2>/dev/null || true
             fi
             if [[ "$refresh_ceiling" =~ ^[0-9]+$ && "$baseline" =~ ^[0-9]+$ ]]; then
                 refresh_effective=$(( baseline + refresh_threshold ))
