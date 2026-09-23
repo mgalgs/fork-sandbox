@@ -4885,9 +4885,11 @@ export FORK_SANDBOX_CONFIG_DIR="$K8S_TEST_CONFIG_DIR"
 # mode never stays for long).
 latest_env_for_agent() {
     local agent="$1" f
-    for f in $(ls -t "$PM_STATE_DIR/runs"/*.env 2>/dev/null); do
+    while IFS= read -r f; do
         grep -q "^AGENT=$agent\$" "$f" && { printf '%s' "$f"; return 0; }
-    done
+    done < <(for f in "$PM_STATE_DIR/runs"/*.env; do
+        [[ -e "$f" ]] && printf '%s %s\n' "$(stat -c %Y -- "$f")" "$f"
+    done | sort -rn | cut -d' ' -f2-)
     return 1
 }
 
@@ -4978,7 +4980,13 @@ contains "k8s case5: a retry was scheduled" \
 once
 k5_retry_run_id="$(basename "$(latest_env_for_agent karen)" .env)"
 k5_retry_handoff="$PM_STATE_DIR/handoffs/$k5_retry_run_id.md"
-check "k8s case5: the retry actually fired" 1 "$(grep -c -- '----CALL----' "$STUB_ARGV_LOG")"
+# --k8s count, not a raw CALL count: the first crash's outbox reply is
+# harvested (and posted/routed) exactly like any local wake's crash-time
+# reply (see "dead pid, reply already on disk" above) -- it reply-alls to
+# @carol, a real local fleet seat, who is legitimately woken by THIS
+# pass's own route step alongside karen's retry. Same pattern case7 uses
+# to tell a k8s wake apart from a co-occurring local one.
+check "k8s case5: the retry actually fired" 1 "$(grep -c -- '^--k8s$' "$STUB_ARGV_LOG")"
 check "k8s case5: retry handoff carries the retry section" 1 \
     "$(grep -c -- '^## This is a retry$' "$k5_retry_handoff")"
 unset STUB_K8S_EXIT STUB_K8S_NO_SUMMARY
@@ -5095,8 +5103,13 @@ contains "k8s case9: the real run failed and scheduled a retry" \
 : > "$STUB_ARGV_LOG"
 once
 unset STUB_K8S_EXIT STUB_K8S_NO_SUMMARY
+# --k8s count, not a raw CALL count: same reasoning as case5 above -- the
+# first run's crash-time outbox reply is harvested and reply-alls to
+# @carol, a real local fleet seat, who is legitimately woken by this
+# pass's own route step even though karl's retry itself falls into the
+# hold and never reaches the launcher.
 check "k8s case9: no launcher call -- the retry fell into a hold" 0 \
-    "$(grep -c -- '----CALL----' "$STUB_ARGV_LOG")"
+    "$(grep -c -- '^--k8s$' "$STUB_ARGV_LOG")"
 check "k8s case9: the retry schedule was dropped" "" \
     "$(sed -n 's/^TRIGGER=//p' "$PM_STATE_DIR/retries/$k9_tid/karl" 2>/dev/null)"
 contains "k8s case9: the held record carries RETRY=1" \
