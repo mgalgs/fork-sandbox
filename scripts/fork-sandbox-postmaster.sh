@@ -67,6 +67,13 @@
 #                `grant: required` at all. The held record is deleted and
 #                trigger's wake is re-dispatched via pm_followup_wake in
 #                the same pass.
+#   adopt        agent, thread, run=<run id>, attempt=<n> -- a `backend:
+#                k8s` wake's wrapper process died (postmaster restart) but
+#                its Job is still running or finished-but-uncollected, so
+#                a new wrapper was launched with `--adopt` to wait for and
+#                collect it instead of declaring the seat dead. At most 2
+#                per run (`adopt-count` in the wake dir); see ADOPTION
+#                below.
 #   triage-skip  agent, thread -- the Cc triage classifier skipped this
 #                candidate for this message
 #   handler      agent, thread, exit=<status> -- a handler seat's wake ran
@@ -369,6 +376,23 @@
 # bounds how long the Job may run; a non-numeric value refuses `deliver`
 # at startup with a clear message rather than failing confusingly on the
 # first k8s wake.
+#
+# ADOPTION. For a k8s wake the Job is the liveness, not the wrapper's pid:
+# a postmaster host restart (or pod rollout) kills every wrapper while its
+# Job keeps running, and harvesting each as dead would spawn a second Job
+# for a seat that is still working. So when a k8s wake has no summary.json
+# and its wrapper is dead (pm_wake_is_dead), pm_harvest_run asks the
+# cluster first: `fork-sandbox-k8s.sh wait --branch <branch> --probe
+# --timeout 5`. Exit 0 (complete, uncollected) or 1 (still running) means
+# adopt: `adopt-count` in the wake dir is incremented and a new wrapper is
+# launched with `fork-sandbox-k8s-wake.sh --adopt --detach`, which skips
+# submit and does wait + collect into the same directories; the harvest
+# reports "not done yet" and emits the `adopt` event. Exit 2 (pod failed or
+# gone) is dead exactly as before. After 2 adoptions of one run the seat is
+# dead as before, and a failed adoption launch is flagged with the reason.
+# Local wakes never adopt. `FORK_SANDBOX_POSTMASTER_K8S` (test seam only,
+# default $script_dir/fork-sandbox-k8s.sh) overrides the script the probe
+# runs.
 #
 # rule 4's live delivery (above) never reaches a k8s wake: there is no
 # inbox to deliver into (the wrapper drives one fork-sandbox.sh --k8s run
@@ -1895,6 +1919,21 @@ INSTR
 
 # ---- spawn ----
 
+# Sets KEY=value in a run env file: rewritten to a temp file in the same
+# directory and renamed over it, so a reader (or a crash) never sees a
+# half-written file. value is an id list or a counter -- never text that
+# needs sed escaping.
+pm_run_env_set() {
+    local f="$1" key="$2" value="$3" tmp
+    tmp="$(mktemp "$(dirname -- "$f")/.tmp.XXXXXX")"
+    if grep -q "^$key=" "$f"; then
+        sed "s/^$key=.*/$key=$value/" "$f" > "$tmp"
+    else
+        { cat -- "$f"; printf '%s=%s\n' "$key" "$value"; } > "$tmp"
+    fi
+    mv -- "$tmp" "$f"
+}
+
 pm_append_pending() {
     local rid="$1" mid="$2"
     local f="$RUNS/$rid.env" existing
@@ -1903,11 +1942,7 @@ pm_append_pending() {
         *",$mid,"*) return 0 ;;
     esac
     local new="${existing:+$existing,}$mid"
-    if grep -q '^PENDING_MSGS=' "$f"; then
-        sed -i "s/^PENDING_MSGS=.*/PENDING_MSGS=$new/" "$f"
-    else
-        printf 'PENDING_MSGS=%s\n' "$new" >> "$f"
-    fi
+    pm_run_env_set "$f" PENDING_MSGS "$new"
 }
 
 # Per-run delivery counter for pm_deliver_live's filenames, so two
@@ -1917,11 +1952,7 @@ pm_next_mail_seq() {
     n="$(fs_pm_env_get "$f" MAIL_SEQ)"
     [[ "$n" =~ ^[0-9]+$ ]] || n=0
     n=$((n + 1))
-    if grep -q '^MAIL_SEQ=' "$f"; then
-        sed -i "s/^MAIL_SEQ=.*/MAIL_SEQ=$n/" "$f"
-    else
-        printf 'MAIL_SEQ=%s\n' "$n" >> "$f"
-    fi
+    pm_run_env_set "$f" MAIL_SEQ "$n"
     printf '%s' "$n"
 }
 
@@ -2436,29 +2467,8 @@ pm_spawn_wake() {
             printf '%s=%s\0' "$k" "${!k}" >> "$env_file"
         done < <(compgen -e | grep '^FORK_SANDBOX_' || true)
 
-        local pm_k8s_wake="${FORK_SANDBOX_POSTMASTER_K8S_WAKE_SCRIPT:-$script_dir/fork-sandbox-k8s-wake.sh}"
-        local rc=0 launch_failed=0
-        set +e
-        if [[ "${FORK_SANDBOX_POSTMASTER_K8S_DETACH:-}" == inline ]]; then
-            # The test seam: this blocks until the whole wake (submit,
-            # wait, collect) finishes, so its own exit code mirrors the
-            # AGENT's eventual outcome (0/1/2, or 0 normalized from a
-            # zero-harvest 3) -- already captured in wake_dir's own
-            # exit-code/summary.json for harvest to read -- not a signal
-            # that launching itself failed. Every inline invocation counts
-            # as spawned.
-            "$pm_k8s_wake" "$wake_dir" >/dev/null 2>&1
-        else
-            # --detach returns almost immediately (the wake itself runs in
-            # its own detached tmux session): 0 means the session started,
-            # 1 means tmux could not start one at all -- a real launch
-            # failure, the k8s counterpart of the local branch's own
-            # launcher-failed check below.
-            "$pm_k8s_wake" --detach "$wake_dir" >/dev/null 2>&1
-            rc=$?
-            (( rc != 0 )) && launch_failed=1
-        fi
-        set -e
+        local launch_failed=0
+        pm_k8s_wake_launch "$wake_dir" 0 || launch_failed=1
         if (( launch_failed )); then
             echo "Error: postmaster: launching $agent for thread $tid (k8s) failed" >&2
             pm_flag "$tid" "spawn failed for $agent: $mid"
@@ -3297,6 +3307,72 @@ pm_retry_schedule() {
         pending "$cap" "$rid" ""
 }
 
+# Starts fork-sandbox-k8s-wake.sh on $1 (a wake dir): a normal wake when
+# $2 is 0, `--adopt` when 1. Returns 0 when it started, 1 when the detached
+# launch itself failed (tmux could not start a session -- the k8s
+# counterpart of the local branch's launcher-failed check). Under
+# FORK_SANDBOX_POSTMASTER_K8S_DETACH=inline (test seam only) it blocks
+# until the whole wake finishes and always returns 0: the wake's own exit
+# code mirrors the AGENT's eventual outcome, already captured in the wake
+# dir's exit-code/summary.json for harvest to read, not a launch failure.
+pm_k8s_wake_launch() {
+    local wake_dir="$1" adopt="$2" rc=0
+    local wake="${FORK_SANDBOX_POSTMASTER_K8S_WAKE_SCRIPT:-$script_dir/fork-sandbox-k8s-wake.sh}"
+    set +e
+    if [[ "${FORK_SANDBOX_POSTMASTER_K8S_DETACH:-}" == inline ]]; then
+        if (( adopt )); then
+            "$wake" --adopt "$wake_dir" >/dev/null 2>&1
+        else
+            "$wake" "$wake_dir" >/dev/null 2>&1
+        fi
+    elif (( adopt )); then
+        "$wake" --adopt --detach "$wake_dir" >/dev/null 2>&1
+        rc=$?
+    else
+        "$wake" --detach "$wake_dir" >/dev/null 2>&1
+        rc=$?
+    fi
+    set -e
+    (( rc == 0 ))
+}
+
+# A k8s wake whose wrapper is gone is not necessarily a dead seat: the Job
+# outlives the process that was waiting on it (postmaster host restart,
+# pod rollout). Asks the cluster instead of the pid. Returns 0 when the Job
+# is still running or finished-but-uncollected and a `--adopt` wake was
+# launched over it (the caller treats the run as not done yet); 1 when the
+# seat really is dead (adoptions used up, or the pod is failed or gone) and
+# the caller flags it as before; 2 when the adoption launch itself failed.
+# $1 = wake dir, $2 = run id, $3 = agent, $4 = thread id, $5 = branch.
+pm_try_adopt() {
+    local run_dir="$1" rid="$2" agent="$3" tid="$4" branch="$5"
+    local count
+    count="$(pm_trim "$(cat -- "$run_dir/adopt-count" 2>/dev/null || true)")"
+    [[ "$count" =~ ^[0-9]+$ ]] || count=0
+    (( count >= 2 )) && return 1
+    [[ -n "$branch" ]] || return 1
+    local k8s="${FORK_SANDBOX_POSTMASTER_K8S:-$script_dir/fork-sandbox-k8s.sh}" probe_rc=0
+    "$k8s" wait --branch "$branch" --probe --timeout 5 >/dev/null 2>&1 || probe_rc=$?
+    case "$probe_rc" in
+        0|1) ;;
+        *) return 1 ;;
+    esac
+    count=$((count + 1))
+    local tmp
+    tmp="$(mktemp "$run_dir/.tmp.XXXXXX")"
+    printf '%s\n' "$count" > "$tmp"
+    mv -- "$tmp" "$run_dir/adopt-count"
+    # The dead wake's pid file stays until the adopting wake rewrites it
+    # (its first act), so a pass that lands in between must not read the
+    # stale pid as another death and adopt twice: drop it and let the
+    # grace window, aged off the run env, cover the gap.
+    rm -f -- "$run_dir/pid" "$run_dir/pid-identity"
+    touch -- "$RUNS/$rid.env"
+    pm_k8s_wake_launch "$run_dir" 1 || return 2
+    pm_event "adopt thread=${tid:0:8} agent=$agent run=$rid attempt=$count"
+    return 0
+}
+
 pm_harvest_run() {
     local project="$1" rid="$2"
     local f="$RUNS/$rid.env"
@@ -3356,6 +3432,15 @@ pm_harvest_run() {
         if ! pm_wake_is_dead "$run_dir" "$f"; then
             return 0
         fi
+        local adopt_failed=""
+        if [[ "$backend" == k8s ]]; then
+            local adopt_rc=0
+            pm_try_adopt "$run_dir" "$rid" "$agent" "$tid" "$branch" || adopt_rc=$?
+            case "$adopt_rc" in
+                0) return 0 ;;
+                2) adopt_failed=" (adopting its still-live Job failed: could not launch fork-sandbox-k8s-wake.sh --adopt)" ;;
+            esac
+        fi
         # Same crash shape as a non-zero exit code below -- no summary.json
         # ever landed, but the outbox is a host directory bind-mounted rw
         # into the sandbox, so a reply the agent finished composing before
@@ -3364,7 +3449,7 @@ pm_harvest_run() {
         # below. No summary.json means no evidence either way about the
         # session, so the prior recorded id (if any) is left standing
         # rather than cleared on nothing.
-        pm_flag "$tid" "wake never produced summary.json: $rid"
+        pm_flag "$tid" "wake never produced summary.json: $rid$adopt_failed"
         was_failure=1
     else
         local exit_code

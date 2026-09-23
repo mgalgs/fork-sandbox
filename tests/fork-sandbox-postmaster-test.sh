@@ -4941,13 +4941,26 @@ cp -- "$repo_dir/scripts/fork-sandbox-k8s-wake.sh" "$K8S_WAKE_BIN/fork-sandbox-k
 chmod +x -- "$K8S_WAKE_BIN/fork-sandbox-k8s-wake.sh"
 cat > "$K8S_WAKE_BIN/fork-sandbox-k8s.sh" <<STUB
 #!/usr/bin/env bash
-# Stands in for the real fork-sandbox-k8s.sh's \`rm\` verb: this suite
-# must never shell out to the real cluster script (let alone a cluster).
+# Stands in for the real fork-sandbox-k8s.sh's \`rm\`, \`wait\` (the
+# adoption probe: exit code read from probe-rc, default 2) and \`resume\`
+# verbs: this suite must never shell out to the real cluster script (let
+# alone a cluster).
 set -uo pipefail
+case "\${1:-}" in
+    wait)
+        printf '%s\n' "\$*" >> "$K8S_WAKE_BIN/probe-calls.log"
+        rc=2
+        [[ -f "$K8S_WAKE_BIN/probe-rc" ]] && rc="\$(cat "$K8S_WAKE_BIN/probe-rc")"
+        exit "\$rc" ;;
+    resume)
+        printf '%s\n' "\$*" >> "$K8S_WAKE_BIN/resume-calls.log"
+        exit 0 ;;
+esac
 printf '%s\n' "\$*" >> "$K8S_WAKE_BIN/rm-calls.log"
 exit 0
 STUB
 chmod +x -- "$K8S_WAKE_BIN/fork-sandbox-k8s.sh"
+export FORK_SANDBOX_POSTMASTER_K8S="$K8S_WAKE_BIN/fork-sandbox-k8s.sh"
 export FORK_SANDBOX_POSTMASTER_K8S_WAKE_SCRIPT="$K8S_WAKE_BIN/fork-sandbox-k8s-wake.sh"
 new_root K8S_WAKE_ROOT
 export FORK_SANDBOX_POSTMASTER_K8S_WAKE_ROOT="$K8S_WAKE_ROOT"
@@ -5567,7 +5580,114 @@ contains "k8s status: grant entry names the thread and key count" "$k11_status" 
     "${k11_grant_tid:0:8}: 2 keys"
 contains "k8s status: held section names the thread and agent" "$k11_status" "${k11_tid:0:8}: agent=karl"
 
+# ---- adoption: a k8s wake whose wrapper died is asked about, not assumed dead ----
+# A real spawn (inline wake, no reply, so nothing to re-post) builds the run
+# env, wake dir and thread; the wake is then made to LOOK orphaned -- its
+# summary.json/exit-code gone, its harvested marker cleared, its pid a
+# process that has exited -- which is what a postmaster host restart leaves.
+# $1 label, $2 probe exit code, $3 adopt-count on file ("" = none),
+# $4 backend override for the run env ("" = leave k8s).
+adopt_case() {
+    local label="$1" probe_rc="$2" count="$3" backend="${4:-}"
+    local mid tid env rid wake_dir
+    new_scratch_root FORK_SANDBOX_MAIL_ROOT
+    export FORK_SANDBOX_MAIL_ROOT
+    PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+    export FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF=0,0
+    mid="$(send_msg '@carol' '@karen' "adopt topic: $label" 'first' 8)"
+    tid="$(thread_of "$mid")"
+    STUB_K8S_NO_REPLY=1 once
+    env="$(latest_env_for_agent karen)"
+    rid="$(basename "$env" .env)"
+    wake_dir="$(env_val "$env" RUN_DIR)"
+    rm -f -- "$PM_STATE_DIR/harvested/$rid" "$wake_dir/summary.json" "$wake_dir/exit-code" \
+        "$wake_dir/k8s-run-dir" "$wake_dir/k8s-timeout" "$wake_dir/pid-identity"
+    dead_pid_of > "$wake_dir/pid"
+    [[ -z "$count" ]] || printf '%s\n' "$count" > "$wake_dir/adopt-count"
+    [[ -z "$backend" ]] || sed -i "s/^BACKEND=.*/BACKEND=$backend/" "$env"
+    printf '%s\n' "$probe_rc" > "$K8S_WAKE_BIN/probe-rc"
+    rm -f -- "$K8S_WAKE_BIN/probe-calls.log" "$K8S_WAKE_BIN/resume-calls.log"
+    FORK_SANDBOX_POSTMASTER_WAKE_DEAD_GRACE=0 once
+    ADOPT_TID="$tid" ADOPT_RID="$rid" ADOPT_WAKE_DIR="$wake_dir"
+    ADOPT_FLAG="$( [[ -e "$PM_STATE_DIR/needs-operator/$tid" ]] && echo 1 || echo 0 )"
+    ADOPT_HARVESTED="$( [[ -e "$PM_STATE_DIR/harvested/$rid" ]] && echo 1 || echo 0 )"
+    ADOPT_PROBES="$(wc -l < "$K8S_WAKE_BIN/probe-calls.log" 2>/dev/null || echo 0)"
+    ADOPT_RESUMES="$(wc -l < "$K8S_WAKE_BIN/resume-calls.log" 2>/dev/null || echo 0)"
+    unset FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF
+}
+
+for adopt_probe_rc in 1 0; do
+    adopt_case "probe exit $adopt_probe_rc" "$adopt_probe_rc" ""
+    check "k8s adopt (probe $adopt_probe_rc): not flagged" 0 "$ADOPT_FLAG"
+    check "k8s adopt (probe $adopt_probe_rc): not harvested" 0 "$ADOPT_HARVESTED"
+    check "k8s adopt (probe $adopt_probe_rc): adopt-count is 1" 1 \
+        "$(cat "$ADOPT_WAKE_DIR/adopt-count" 2>/dev/null)"
+    check "k8s adopt (probe $adopt_probe_rc): the probe named the branch, --probe, --timeout 5" 1 \
+        "$(grep -c -- '^wait --branch .* --probe --timeout 5$' "$K8S_WAKE_BIN/probe-calls.log")"
+    check "k8s adopt (probe $adopt_probe_rc): the wake was launched with --adopt (resume ran)" 1 "$ADOPT_RESUMES"
+    contains "k8s adopt (probe $adopt_probe_rc): pm adopt event" "$(cat "$work/once.out")" \
+        "pm adopt thread=${ADOPT_TID:0:8} agent=karen run=$ADOPT_RID attempt=1"
+    check "k8s adopt (probe $adopt_probe_rc): no retry scheduled" 0 \
+        "$( [[ -e "$PM_STATE_DIR/retries/$ADOPT_TID/karen" ]] && echo 1 || echo 0 )"
+done
+
+adopt_case "probe exit 2" 2 ""
+check "k8s adopt (probe 2): flagged as before" 1 "$ADOPT_FLAG"
+contains "k8s adopt (probe 2): flag reason is the dead-wake one" \
+    "$(cat "$PM_STATE_DIR/needs-operator/$ADOPT_TID")" "wake never produced summary.json"
+check "k8s adopt (probe 2): harvested as before" 1 "$ADOPT_HARVESTED"
+check "k8s adopt (probe 2): the seat was probed once" 1 "$ADOPT_PROBES"
+check "k8s adopt (probe 2): nothing adopted" 0 "$ADOPT_RESUMES"
+check "k8s adopt (probe 2): no adopt-count written" 0 \
+    "$( [[ -e "$ADOPT_WAKE_DIR/adopt-count" ]] && echo 1 || echo 0 )"
+contains "k8s adopt (probe 2): a retry was scheduled as before" \
+    "$(cat "$PM_STATE_DIR/retries/$ADOPT_TID/karen" 2>/dev/null)" "STATE=pending"
+
+adopt_case "adoptions used up" 1 2
+check "k8s adopt (count 2): flagged as before" 1 "$ADOPT_FLAG"
+check "k8s adopt (count 2): harvested as before" 1 "$ADOPT_HARVESTED"
+check "k8s adopt (count 2): the cluster is not even probed" 0 "$ADOPT_PROBES"
+check "k8s adopt (count 2): nothing adopted" 0 "$ADOPT_RESUMES"
+check "k8s adopt (count 2): adopt-count left at 2" 2 "$(cat "$ADOPT_WAKE_DIR/adopt-count")"
+
+adopt_case "local wake" 1 "" local
+check "k8s adopt (local backend): flagged as before" 1 "$ADOPT_FLAG"
+check "k8s adopt (local backend): the cluster is not probed" 0 "$ADOPT_PROBES"
+check "k8s adopt (local backend): nothing adopted" 0 "$ADOPT_RESUMES"
+
+# A failed adoption launch is a dead seat, and the flag says why.
+adopt_launch_fail_case() {
+    local mid tid env rid wake_dir save_detach="$FORK_SANDBOX_POSTMASTER_K8S_DETACH"
+    new_scratch_root FORK_SANDBOX_MAIL_ROOT
+    export FORK_SANDBOX_MAIL_ROOT
+    PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+    mid="$(send_msg '@carol' '@karen' 'adopt topic: launch fails' 'first' 8)"
+    tid="$(thread_of "$mid")"
+    STUB_K8S_NO_REPLY=1 once
+    env="$(latest_env_for_agent karen)"
+    rid="$(basename "$env" .env)"
+    wake_dir="$(env_val "$env" RUN_DIR)"
+    rm -f -- "$PM_STATE_DIR/harvested/$rid" "$wake_dir/summary.json" "$wake_dir/exit-code"
+    dead_pid_of > "$wake_dir/pid"
+    printf '1\n' > "$K8S_WAKE_BIN/probe-rc"
+    # A wrapper that cannot start a detached session (no tmux on PATH to
+    # find): the non-inline path, with tmux absent from a minimal PATH.
+    local fake_bin
+    new_root fake_bin
+    printf '#!/bin/sh\nexit 1\n' > "$fake_bin/tmux"
+    chmod +x -- "$fake_bin/tmux"
+    export FORK_SANDBOX_POSTMASTER_K8S_DETACH=
+    PATH="$fake_bin:$PATH" FORK_SANDBOX_POSTMASTER_WAKE_DEAD_GRACE=0 once
+    export FORK_SANDBOX_POSTMASTER_K8S_DETACH="$save_detach"
+    contains "k8s adopt (launch fails): flag names the adoption failure" \
+        "$(cat "$PM_STATE_DIR/needs-operator/$tid" 2>/dev/null)" "adopting its still-live Job failed"
+    check "k8s adopt (launch fails): harvested (dead as before)" 1 \
+        "$( [[ -e "$PM_STATE_DIR/harvested/$rid" ]] && echo 1 || echo 0 )"
+}
+adopt_launch_fail_case
+
 unset FORK_SANDBOX_POSTMASTER_K8S_DETACH
+unset FORK_SANDBOX_POSTMASTER_K8S
 unset FORK_SANDBOX_CONFIG_DIR
 
 # ============================================================
