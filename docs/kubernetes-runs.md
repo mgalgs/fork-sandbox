@@ -1508,8 +1508,10 @@ gated channel, in the same window — after the repository push, before the
 than leaving a half-received directory for the agent to find. One detail
 does NOT carry over from `--context-ro`: its tar is `tar cf - -C DIR .`,
 archiving the directory itself as a top-level member, but `--thread-dir`/
-`--attach-dir` archive only DIR's own entries (`find DIR -mindepth 1
--maxdepth 1 -printf '%P\0' | tar cf - --null -T -`). `/thread` and
+`--attach-dir` archive only DIR's own entries, via the `k8s_spool_dir_entries`
+helper in `fork-sandbox-k8s.sh`: a bash `dotglob`/`nullglob` glob over DIR's
+top level (no `find`, so this also runs on macOS), each entry added to the
+tar as a `./<entry>` child member. `/thread` and
 `/attachments` are `emptyDir` mounts that already exist by the time the
 extractor runs (see below), unlike `--context-ro`'s destination, which the
 extractor creates fresh — and GNU tar's restore of a pre-existing
