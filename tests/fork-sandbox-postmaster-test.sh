@@ -5686,6 +5686,78 @@ adopt_launch_fail_case() {
 }
 adopt_launch_fail_case
 
+# ---- adoption: a probe that cannot reach the cluster (exit 4, or any code
+# outside the probe's 0/1/2 contract) defers instead of declaring the seat
+# dead, and only flags after 20 such passes ----
+adopt_deferred_setup() {
+    local mid
+    new_scratch_root FORK_SANDBOX_MAIL_ROOT
+    export FORK_SANDBOX_MAIL_ROOT
+    PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+    export FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF=0,0
+    mid="$(send_msg '@carol' '@karen' 'adopt topic: deferred' 'first' 8)"
+    AD_TID="$(thread_of "$mid")"
+    STUB_K8S_NO_REPLY=1 once
+    AD_ENV="$(latest_env_for_agent karen)"
+    AD_RID="$(basename "$AD_ENV" .env)"
+    AD_WAKE_DIR="$(env_val "$AD_ENV" RUN_DIR)"
+    rm -f -- "$PM_STATE_DIR/harvested/$AD_RID" "$AD_WAKE_DIR/summary.json" "$AD_WAKE_DIR/exit-code" \
+        "$AD_WAKE_DIR/k8s-run-dir" "$AD_WAKE_DIR/k8s-timeout" "$AD_WAKE_DIR/pid-identity"
+    dead_pid_of > "$AD_WAKE_DIR/pid"
+    rm -f -- "$K8S_WAKE_BIN/probe-calls.log" "$K8S_WAKE_BIN/resume-calls.log"
+}
+adopt_deferred_setup
+
+printf '4\n' > "$K8S_WAKE_BIN/probe-rc"
+FORK_SANDBOX_POSTMASTER_WAKE_DEAD_GRACE=0 once
+check "k8s adopt-deferred (probe 4): not flagged" 0 \
+    "$( [[ -e "$PM_STATE_DIR/needs-operator/$AD_TID" ]] && echo 1 || echo 0 )"
+check "k8s adopt-deferred (probe 4): run still live (not harvested)" 0 \
+    "$( [[ -e "$PM_STATE_DIR/harvested/$AD_RID" ]] && echo 1 || echo 0 )"
+check "k8s adopt-deferred (probe 4): no adopt-count written" 0 \
+    "$( [[ -e "$AD_WAKE_DIR/adopt-count" ]] && echo 1 || echo 0 )"
+check "k8s adopt-deferred (probe 4): probe-fail-count is 1" 1 \
+    "$(cat "$AD_WAKE_DIR/probe-fail-count" 2>/dev/null)"
+check "k8s adopt-deferred (probe 4): nothing adopted" 0 \
+    "$(wc -l < "$K8S_WAKE_BIN/resume-calls.log" 2>/dev/null || echo 0)"
+check "k8s adopt-deferred (probe 4): no retry scheduled" 0 \
+    "$( [[ -e "$PM_STATE_DIR/retries/$AD_TID/karen" ]] && echo 1 || echo 0 )"
+contains "k8s adopt-deferred (probe 4): pm adopt-deferred event" "$(cat "$work/once.out")" \
+    "pm adopt-deferred thread=${AD_TID:0:8} agent=karen run=$AD_RID probe_rc=4"
+
+for _ in $(seq 2 20); do
+    FORK_SANDBOX_POSTMASTER_WAKE_DEAD_GRACE=0 once
+done
+check "k8s adopt-deferred (20 passes): probe-fail-count is 20" 20 \
+    "$(cat "$AD_WAKE_DIR/probe-fail-count" 2>/dev/null)"
+check "k8s adopt-deferred (20 passes): flagged" 1 \
+    "$( [[ -e "$PM_STATE_DIR/needs-operator/$AD_TID" ]] && echo 1 || echo 0 )"
+contains "k8s adopt-deferred (20 passes): flag reason names the run" \
+    "$(cat "$PM_STATE_DIR/needs-operator/$AD_TID" 2>/dev/null)" "cannot probe the cluster for $AD_RID"
+check "k8s adopt-deferred (20 passes): flagged exactly once" 1 \
+    "$(grep -c -- $'\tflag\t' "$PM_STATE_DIR/needs-operator-journal/$AD_TID" 2>/dev/null || echo 0)"
+check "k8s adopt-deferred (20 passes): still not harvested (never declared dead)" 0 \
+    "$( [[ -e "$PM_STATE_DIR/harvested/$AD_RID" ]] && echo 1 || echo 0 )"
+
+# A 21st deferred pass keeps deferring and does not re-flag.
+FORK_SANDBOX_POSTMASTER_WAKE_DEAD_GRACE=0 once
+check "k8s adopt-deferred (21st pass): probe-fail-count is 21" 21 \
+    "$(cat "$AD_WAKE_DIR/probe-fail-count" 2>/dev/null)"
+check "k8s adopt-deferred (21st pass): still flagged exactly once" 1 \
+    "$(grep -c -- $'\tflag\t' "$PM_STATE_DIR/needs-operator-journal/$AD_TID" 2>/dev/null || echo 0)"
+
+# A subsequent determinate probe (exit 1) adopts, as if this were the
+# first probe, and removes the probe-fail-count.
+printf '1\n' > "$K8S_WAKE_BIN/probe-rc"
+FORK_SANDBOX_POSTMASTER_WAKE_DEAD_GRACE=0 once
+check "k8s adopt-deferred: a later determinate probe adopts" 1 \
+    "$(cat "$AD_WAKE_DIR/adopt-count" 2>/dev/null)"
+check "k8s adopt-deferred: probe-fail-count is removed on adoption" 0 \
+    "$( [[ -e "$AD_WAKE_DIR/probe-fail-count" ]] && echo 1 || echo 0 )"
+check "k8s adopt-deferred: still not harvested" 0 \
+    "$( [[ -e "$PM_STATE_DIR/harvested/$AD_RID" ]] && echo 1 || echo 0 )"
+unset FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF
+
 # ---- cluster mode: deliver --cluster ----
 
 # The suite's shared fleet holds local seats, which a cluster postmaster

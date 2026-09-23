@@ -84,6 +84,10 @@
 #                collect it instead of declaring the seat dead. At most 2
 #                per run (`adopt-count` in the wake dir); see ADOPTION
 #                below.
+#   adopt-deferred agent, thread, run=<run id>, probe_rc=<n> -- the
+#                adoption probe could not reach the cluster (exit 4, or any
+#                code outside its 0/1/2 contract), so the run is left live
+#                rather than adopted or declared dead; see ADOPTION below.
 #   triage-skip  agent, thread -- the Cc triage classifier skipped this
 #                candidate for this message
 #   handler      agent, thread, exit=<status> -- a handler seat's wake ran
@@ -403,6 +407,19 @@
 # Local wakes never adopt. `FORK_SANDBOX_POSTMASTER_K8S` (test seam only,
 # default $script_dir/fork-sandbox-k8s.sh) overrides the script the probe
 # runs.
+#
+# Exit 4 (or any code the probe's 0/1/2 contract does not cover) means the
+# cluster could not even be asked -- the API was unreachable, slow, or
+# refused the request. That is neither "adopt" nor "dead": it is left live
+# (pm_harvest_run treats it exactly like an adoption, returning early
+# without flagging or retrying) and a `probe-fail-count` in the wake dir is
+# incremented, emitting `adopt-deferred` each pass. adopt-count is left
+# untouched -- an indeterminate probe never spends an adoption. Once
+# probe-fail-count reaches 20 the thread is flagged once with reason
+# "cannot probe the cluster for <run id>" (never re-flagged while that
+# stays the current reason) and deferral continues indefinitely -- a run
+# is never declared dead just because the cluster stayed unreachable. Any
+# later determinate probe (0, 1, or 2) clears probe-fail-count.
 #
 # rule 4's live delivery (above) never reaches a k8s wake: there is no
 # inbox to deliver into (the wrapper drives one fork-sandbox.sh --k8s run
@@ -3368,7 +3385,11 @@ pm_k8s_wake_launch() {
 # is still running or finished-but-uncollected and a `--adopt` wake was
 # launched over it (the caller treats the run as not done yet); 1 when the
 # seat really is dead (adoptions used up, or the pod is failed or gone) and
-# the caller flags it as before; 2 when the adoption launch itself failed.
+# the caller flags it as before; 2 when the adoption launch itself failed;
+# 3 when the probe itself could not reach the cluster (exit 4, or any code
+# outside 0/1/2) -- the run's state is unknown, so the caller treats this
+# like 0 (not done yet) without spending an adoption or flagging, per the
+# ADOPTION header comment above.
 # $1 = wake dir, $2 = run id, $3 = agent, $4 = thread id, $5 = branch.
 pm_try_adopt() {
     local run_dir="$1" rid="$2" agent="$3" tid="$4" branch="$5"
@@ -3381,8 +3402,25 @@ pm_try_adopt() {
     "$k8s" wait --branch "$branch" --probe --timeout 5 >/dev/null 2>&1 || probe_rc=$?
     case "$probe_rc" in
         0|1) ;;
-        *) return 1 ;;
+        2) rm -f -- "$run_dir/probe-fail-count"; return 1 ;;
+        *)
+            local fail_count ftmp
+            fail_count="$(pm_trim "$(cat -- "$run_dir/probe-fail-count" 2>/dev/null || true)")"
+            [[ "$fail_count" =~ ^[0-9]+$ ]] || fail_count=0
+            fail_count=$((fail_count + 1))
+            ftmp="$(mktemp "$run_dir/.tmp.XXXXXX")"
+            printf '%s\n' "$fail_count" > "$ftmp"
+            mv -- "$ftmp" "$run_dir/probe-fail-count"
+            pm_event "adopt-deferred thread=${tid:0:8} agent=$agent run=$rid probe_rc=$probe_rc"
+            if (( fail_count >= 20 )); then
+                local flag_reason="cannot probe the cluster for $rid" cur_reason
+                cur_reason="$(cat -- "$NEEDS_OPERATOR/$tid" 2>/dev/null || true)"
+                [[ "$cur_reason" == "$flag_reason" ]] || pm_flag "$tid" "$flag_reason"
+            fi
+            return 3
+            ;;
     esac
+    rm -f -- "$run_dir/probe-fail-count"
     count=$((count + 1))
     local tmp
     tmp="$(mktemp "$run_dir/.tmp.XXXXXX")"
@@ -3463,7 +3501,7 @@ pm_harvest_run() {
             local adopt_rc=0
             pm_try_adopt "$run_dir" "$rid" "$agent" "$tid" "$branch" || adopt_rc=$?
             case "$adopt_rc" in
-                0) return 0 ;;
+                0|3) return 0 ;;
                 2) adopt_failed=" (adopting its still-live Job failed: could not launch fork-sandbox-k8s-wake.sh --adopt)" ;;
             esac
         fi
