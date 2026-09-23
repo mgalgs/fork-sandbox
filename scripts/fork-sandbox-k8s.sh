@@ -2778,9 +2778,14 @@ k8s_refuse_dir_links() {
 # Entries are enumerated with a bash glob rather than find(1): this
 # spool runs on the host, which may be macOS, and BSD find has no
 # -printf. The `./` prefix keeps a name starting with `-` from being
-# read as a tar option; names travel to tar as separate argv words from
-# an array, so spaces and other odd bytes are safe with no --null -T
-# dance needed.
+# read as a tar option; names travel to tar as separate argv words, so
+# spaces and other odd bytes are safe with no --null -T dance needed.
+# Those words go through xargs -0 rather than one `tar` call: a wide
+# directory (tens of thousands of entries) can overflow a single
+# invocation's argv before tar ever gets to see it, and xargs -0 knows
+# the host's real ARG_MAX and batches accordingly. Batching starts from
+# the same empty archive the zero-entries case below creates, so the
+# archive-size cap the caller checks stays the actual limit.
 k8s_spool_dir_entries() {
     local dir="$1" tar_out="$2"
     local -a entries=()
@@ -2793,11 +2798,10 @@ k8s_spool_dir_entries() {
             printf './%s\0' "${entry#"$dir"/}"
         done
     )
-    if (( ${#entries[@]} == 0 )); then
-        # tar refuses to create an archive with no members at all.
-        tar cf "$tar_out" -T /dev/null
-    else
-        tar cf "$tar_out" -C "$dir" -- "${entries[@]}"
+    # tar refuses to create an archive with no members at all.
+    tar cf "$tar_out" -T /dev/null
+    if (( ${#entries[@]} > 0 )); then
+        printf '%s\0' "${entries[@]}" | xargs -0 tar rf "$tar_out" -C "$dir" --
     fi
 }
 
