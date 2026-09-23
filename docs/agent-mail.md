@@ -594,9 +594,13 @@ thread routes it.
    inbox, and its inbox hook surfaces it alongside operator addenda (a pi
    or codex seat gets neither — those harnesses have no hook to deliver
    through). At harvest, if that live delivery is confirmed to have
-   reached the wake, no follow-up wake is spawned for it; otherwise rules
-   2–3 are re-checked and a follow-up wake is spawned for the newest
-   pending message if they still pass.
+   reached the wake AND the wake itself then finished clean, no
+   follow-up wake is spawned for it — the running agent saw it and its
+   own outbox is trusted to have answered it. A wake that failed after
+   live delivery never finished acting on what it saw, so it is treated
+   exactly like an undelivered pending message: rules 2-3 are
+   re-checked and a follow-up wake is spawned for the newest pending
+   message if they still pass.
 
 Together with "a Cc-only wake replies only when something genuinely
 matters, not routinely", those rules are the stop rules. Hops bound the
@@ -823,12 +827,18 @@ an exhausted one from a recovered one, not just see fields disappear:
 | `LAST_FAILED_RUN` | the run id of the wake whose failure produced the current `pending` or `exhausted` state |
 | `RECOVERED_AT` | epoch seconds a `recovered` state was reached |
 
-A `recovered` record is written the first time a pair that had ever
-failed before harvests exit-0 clean: `TRIGGER`/`ATTEMPT`/`MAX`/
-`LAST_FAILED_RUN` and the new `RECOVERED_AT` are all kept rather than the
-file simply vanishing, so a reader can see WHICH trigger this pair was
-failing on and came back from, not just that it is quiet now. A pair that
-never failed gets no file at all — there is nothing to recover from.
+A `recovered` record is written the first time a pair with an actual
+retry history (`STATE` `pending` or `exhausted`) harvests exit-0 clean:
+`TRIGGER`/`ATTEMPT`/`MAX`/`LAST_FAILED_RUN` and the new `RECOVERED_AT`
+are all kept rather than the file simply vanishing, so a reader can see
+WHICH trigger this pair was failing on and came back from, not just that
+it is quiet now. It is not rewritten by a later clean harvest once
+already `recovered` — `RECOVERED_AT` stays the moment recovery actually
+happened. A pair that never failed gets no file at all, and a pair whose
+file holds only the wedge-bound `FAILS` counter (a failure whose retry
+schedule was superseded by a pending message before one was ever
+scheduled) gets no `recovered` record either — neither has any retry
+history to recover from.
 
 ### Router state
 

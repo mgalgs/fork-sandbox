@@ -873,17 +873,34 @@ pm_retry_wedge_reset() {
 
 # A clean exit-0 harvest. FAILS resets to 0 and NOT_BEFORE (the only field
 # that only ever means something for a still-pending retry) is dropped --
-# but if this pair ever failed before (a retries file already exists),
-# that history does not just vanish: it becomes a persistent
-# STATE=recovered record (TRIGGER/ATTEMPT/MAX/LAST_FAILED_RUN kept,
-# RECOVERED_AT added) so an external reader can still see WHICH trigger
-# this pair was failing on and came back from, not just that it is quiet
-# now. A pair with no prior retry file (never failed) gets no recovered
-# record either -- there is nothing to recover from.
+# but if this pair had an actual retry history (STATE pending or exhausted
+# -- both of which pm_retry_schedule always writes with a TRIGGER), that
+# history does not just vanish: it becomes a persistent STATE=recovered
+# record (TRIGGER/ATTEMPT/MAX/LAST_FAILED_RUN kept, RECOVERED_AT added) so
+# an external reader can still see WHICH trigger this pair was failing on
+# and came back from, not just that it is quiet now. A pair with no prior
+# retry file (never failed) does nothing (nothing on file to reset). A
+# pair whose file holds only the wedge bound's FAILS counter (a failure
+# superseded by a pending message, or a pending schedule superseded by a
+# route-spawned wake, before any retry history existed -- see
+# pm_retry_clear_schedule) still gets FAILS reset to 0 on this clean
+# harvest, same as any other case, but fabricates no STATE: absent means
+# exactly that, not "quiet since a FAILS bump". Once already recovered, a
+# later clean harvest leaves it alone too -- RECOVERED_AT must stay the
+# moment recovery actually happened, not slide forward on every unrelated
+# clean wake, or the field would mean "last clean wake" instead of what
+# the read contract promises.
 pm_retry_recover() {
     local tid="$1" agent="$2"
     local f="$RETRIES/$tid/$agent"
     [[ -e "$f" ]] || return 0
+    local rstate
+    rstate="$(fs_pm_env_get "$f" STATE)"
+    if [[ -z "$rstate" ]]; then
+        pm_retry_fails_set "$tid" "$agent" 0
+        return 0
+    fi
+    [[ "$rstate" == pending || "$rstate" == exhausted ]] || return 0
     local trigger attempt max last_failed_run
     trigger="$(fs_pm_env_get "$f" TRIGGER)"
     attempt="$(fs_pm_env_get "$f" ATTEMPT)"
@@ -900,11 +917,17 @@ pm_retry_recover() {
 # before calling this -- pm_spawn_wake fails silently, so clearing before
 # knowing the spawn worked could destroy the schedule for nothing -- and
 # pm_harvest_run's pending-message branch, which supersedes a retry the
-# same way). Neither pending nor exhausted nor recovered describes
-# "superseded", so this leaves no STATE behind rather than inventing a
-# fourth one the read contract does not define.
+# same way). Only a live STATE=pending schedule is actually superseded by
+# a new wake -- an exhausted or recovered record is history, not a
+# schedule waiting to fire, so a new wake spawning has nothing to cancel
+# there and this leaves the file untouched rather than deleting that
+# history out from under a reader (a FAILS-only file, with no STATE at
+# all, is likewise left alone: nothing on it is a schedule either).
 pm_retry_clear_schedule() {
-    local tid="$1" agent="$2" fails
+    local tid="$1" agent="$2"
+    local f="$RETRIES/$tid/$agent"
+    [[ "$(fs_pm_env_get "$f" STATE)" == pending ]] || return 0
+    local fails
     fails="$(pm_retry_fails_get "$tid" "$agent")"
     pm_retry_raw_write "$tid" "$agent" "$fails" "" "" "" "" "" "" ""
 }
@@ -2988,8 +3011,12 @@ pm_harvest_run() {
     # The wedge bound: only a RESUMED wake's failure counts (a wake that
     # never resumed anything has no session for clearing to help), and 3
     # in a row for the same pair clears the recorded session so the next
-    # wake starts fresh rather than wedging on it forever.
-    if (( was_failure )) && [[ -n "$resumed_field" ]]; then
+    # wake starts fresh rather than wedging on it forever. Gated on
+    # sessions_tracked too: a given-mode harness (pi) always sets RESUMED
+    # (its id is derived, not discovered -- see pm_spawn_wake), so RESUMED
+    # alone would count every failed pi wake toward a clear that can never
+    # help it (pi's id is never read back from sessions/ to begin with).
+    if (( was_failure )) && [[ "$sessions_tracked" == true ]] && [[ -n "$resumed_field" ]]; then
         local fails
         fails=$(( $(pm_retry_fails_get "$tid" "$agent") + 1 ))
         if (( fails >= 3 )); then
@@ -3015,7 +3042,15 @@ pm_harvest_run() {
         # later against a trigger the conversation has already moved past.
         pm_retry_clear_schedule "$tid" "$agent"
         local newest="${pending##*,}"
-        if pm_mail_delivered_live "$run_dir" "$newest"; then
+        # Live delivery only means the running agent SAW the newest
+        # message before it exited -- on a clean finish that is reason
+        # enough to trust its outbox already answered it, so a ledger
+        # entry is all that is needed. A wake this harvest just flagged
+        # as failed never got that far: whatever it saw, it did not
+        # finish acting on it, so the newest message still needs an
+        # actual wake exactly like the non-live case, not a ledger entry
+        # standing in for one that never happened.
+        if (( ! was_failure )) && pm_mail_delivered_live "$run_dir" "$newest"; then
             pm_ledger_delivered_live "$tid" "$agent" "$newest" "$rid"
         else
             pm_followup_wake "$project" "$agent" "$tid" "$newest"

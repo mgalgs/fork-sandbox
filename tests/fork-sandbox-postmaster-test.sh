@@ -1026,6 +1026,59 @@ check "delivered-live: ledger records the message as delivered-live" 1 \
     "$( [[ -f "$FORK_SANDBOX_MAIL_ROOT/.postmaster/delivered-live/$tid" ]] && grep -c -- "$mid2" "$FORK_SANDBOX_MAIL_ROOT/.postmaster/delivered-live/$tid" || echo 0 )"
 
 # ============================================================
+printf '\n== harvest: a run that saw a live-delivered message but then failed still gets a follow-up wake ==\n'
+# ============================================================
+
+# The suppression above only holds because the run that saw the message
+# went on to finish clean, so its own outbox is trusted to have answered
+# it. A run that dies after seeing it never got that far -- treating it
+# like the success case would leave the newest message unanswered and the
+# seat asleep, exactly the goal-2 gap the retry work was meant to close.
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+fl_mid1="$(send_msg '@carol' '@alice' 'failed after live-delivery test' 'first message' 8)"
+fl_tid="$(thread_of "$fl_mid1")"
+fl_short="${fl_tid:0:8}"
+: > "$STUB_ARGV_LOG"
+once
+fl_run_env="$(env_file_for_agent alice)"
+fl_run_dir="$(sed -n 's/^RUN_DIR=//p' "$fl_run_env")"
+
+fl_mid2="$(reply_msg '@carol' "$fl_mid1" 'second message' --to '@alice')"
+fl_short2="${fl_mid2:0:8}"
+: > "$STUB_ARGV_LOG"
+once
+contains "failed+live: message id recorded as pending on the live run" \
+    "$(cat "$fl_run_env")" "PENDING_MSGS=$fl_mid2"
+
+# Same fabricated confirmation as the suppression case above, but this run
+# then dies instead of finishing clean.
+mkdir -p -- "$fl_run_dir/outbox"
+printf '{"type":"system","subtype":"hook_response","stderr":"fork-sandbox-inbox: delivered mail-banner-001-%s.md\\n"}\n' \
+    "$fl_short2" > "$fl_run_dir/events.jsonl"
+printf '1\n' > "$fl_run_dir/exit-code"
+printf '{"session_id":null}\n' > "$fl_run_dir/summary.json"
+: > "$STUB_ARGV_LOG"
+once
+check "failed+live: a follow-up wake IS spawned when the run that saw it failed" 1 \
+    "$(grep -c -- "^sbx-mail-$fl_short-alice-" "$STUB_ARGV_LOG")"
+# live_env_for_agent (used by the resume tests below) isn't defined yet at
+# this point in the script, so find the not-yet-harvested run by hand.
+fl_followup_env=""
+for fl_f in "$FORK_SANDBOX_MAIL_ROOT/.postmaster/runs"/*.env; do
+    [[ -e "$fl_f" ]] || continue
+    fl_rid="$(basename -- "$fl_f" .env)"
+    [[ -e "$FORK_SANDBOX_MAIL_ROOT/.postmaster/harvested/$fl_rid" ]] && continue
+    grep -q '^AGENT=alice$' "$fl_f" && fl_followup_env="$fl_f"
+done
+contains "failed+live: the follow-up wake's trigger is the live-delivered message" \
+    "$(cat "$fl_followup_env")" "TRIGGER=$fl_mid2"
+check "failed+live: no delivered-live ledger entry for a run that never finished acting on it" 0 \
+    "$( [[ -f "$FORK_SANDBOX_MAIL_ROOT/.postmaster/delivered-live/$fl_tid" ]] && grep -c -- "$fl_mid2" "$FORK_SANDBOX_MAIL_ROOT/.postmaster/delivered-live/$fl_tid" || echo 0 )"
+check "failed+live: no retry scheduled for the older trigger (the follow-up carries the seat forward)" 0 \
+    "$( [[ -e "$FORK_SANDBOX_MAIL_ROOT/.postmaster/retries/$fl_tid/alice" ]] && grep -qc -- "TRIGGER=$fl_mid1" "$FORK_SANDBOX_MAIL_ROOT/.postmaster/retries/$fl_tid/alice" && echo 1 || echo 0 )"
+
+# ============================================================
 printf '\n== live delivery: same-thread mail lands in a busy run inbox ==\n'
 # ============================================================
 
@@ -2527,6 +2580,45 @@ check "wedge bound: 3rd consecutive failed resumed wake clears it" 0 \
     "$( [[ -e "$wb_sessions" ]] && echo 1 || echo 0 )"
 
 # ============================================================
+printf '\n== session resume: the wedge bound never counts a given-mode (pi) harness ==\n'
+# ============================================================
+
+# pi (frank) derives --session-id fresh on every spawn and never reads
+# sessions/ back (sessions_tracked is false for it -- FS_HARNESS_ID_MODE
+# is "given"), so RESUMED is non-empty on every pi wake same as a
+# discover-mode harness's. The FAILS counter must still never count a pi
+# failure: clearing sessions/ can never help a pair that never reads it
+# back, and docs/agent-mail.md promises a pi pair's retries/ file never
+# carries a FAILS value.
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+
+pw_mid1="$(send_msg '@carol' '@frank' 'pi wedge topic' 'first message' 8)"
+pw_tid="$(thread_of "$pw_mid1")"
+pw_retries="$PM_STATE_DIR/retries/$pw_tid/frank"
+
+once
+finish_run frank 1
+once
+check "pi wedge: 1st consecutive failed pi wake writes no FAILS" 0 \
+    "$(if [[ -e "$pw_retries" ]]; then grep -c '^FAILS=' "$pw_retries"; else echo 0; fi)"
+
+reply_msg '@carol' "$pw_mid1" 'pw msg 2' --to '@frank' >/dev/null
+once
+finish_run frank 1
+once
+check "pi wedge: 2nd consecutive failed pi wake writes no FAILS" 0 \
+    "$(if [[ -e "$pw_retries" ]]; then grep -c '^FAILS=' "$pw_retries"; else echo 0; fi)"
+
+reply_msg '@carol' "$pw_mid1" 'pw msg 3' --to '@frank' >/dev/null
+once
+finish_run frank 1
+once
+check "pi wedge: 3rd consecutive failed pi wake still writes no FAILS (never wedges)" 0 \
+    "$(if [[ -e "$pw_retries" ]]; then grep -c '^FAILS=' "$pw_retries"; else echo 0; fi)"
+
+# ============================================================
 printf '\n== session resume: an exit-0 harvest in between resets the wedge count ==\n'
 # ============================================================
 
@@ -2679,6 +2771,15 @@ check "schema: the recovered record carries no NOT_BEFORE (nothing left waiting)
 contains "schema: the recovered record is timestamped" \
     "$(cat "$sc_retries" 2>/dev/null)" "RECOVERED_AT="
 
+sc_recovered_at_1="$(sed -n 's/^RECOVERED_AT=//p' "$sc_retries" 2>/dev/null)"
+sleep 1.1 # RECOVERED_AT is epoch seconds; force a distinguishable value if it moves
+reply_msg '@carol' "$sc_mid1" 'schema follow-up' --to '@alice' >/dev/null
+once
+finish_run alice 0 deadbeef-cafe-0000-1111-222233334444
+once
+check "schema: a later unrelated clean harvest does not slide RECOVERED_AT forward" \
+    "$sc_recovered_at_1" "$(sed -n 's/^RECOVERED_AT=//p' "$sc_retries" 2>/dev/null)"
+
 new_scratch_root FORK_SANDBOX_MAIL_ROOT
 export FORK_SANDBOX_MAIL_ROOT
 PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
@@ -2786,8 +2887,7 @@ new_scratch_root FORK_SANDBOX_MAIL_ROOT
 export FORK_SANDBOX_MAIL_ROOT
 PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
 
-hf_mid1="$(send_msg '@carol' '@alice' 'handoff retry topic' 'first message' 8)"
-hf_tid="$(thread_of "$hf_mid1")"
+send_msg '@carol' '@alice' 'handoff retry topic' 'first message' 8 >/dev/null
 
 once
 hf_first_run_id="$(basename "$(live_env_for_agent alice)" .env)"
@@ -2845,6 +2945,59 @@ check "retry+pending: no retry was scheduled for the failed trigger" 0 \
 once
 check "retry+pending: a later pass spawns nothing extra (no retry lying in wait)" 0 \
     "$(grep -c -- '----CALL----' "$STUB_ARGV_LOG")"
+
+# ============================================================
+printf '\n== retry: a FAILS-only file (failure superseded by a pending message) never becomes recovered ==\n'
+# ============================================================
+
+# A resumed wake that fails WITH a pending message never reaches
+# pm_retry_schedule (the pending follow-up supersedes it -- see
+# pm_retry_clear_schedule's call site), so the wedge bound's FAILS bump is
+# the only thing that ever touches its retries/ file: no TRIGGER, no
+# STATE. pm_retry_recover must treat that the same as no retry history at
+# all, not as something to declare "recovered" -- the read contract's
+# STATE is either absent, pending, exhausted, or recovered, and a
+# FAILS-only file matches the first, never the last.
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+
+fo_sid=cafebeef-1111-2222-3333-444455556666
+fo_mid1="$(send_msg '@carol' '@alice' 'fails-only recover topic' 'first message' 8)"
+fo_tid="$(thread_of "$fo_mid1")"
+fo_retries="$PM_STATE_DIR/retries/$fo_tid/alice"
+
+once
+finish_run alice 0 "$fo_sid"
+once
+
+fo_mid2="$(reply_msg '@carol' "$fo_mid1" 'second message' --to '@alice')"
+once
+contains "fails-only: the 2nd wake resumes the recorded session" \
+    "$(cat "$(live_env_for_agent alice)")" "TRIGGER=$fo_mid2"
+
+fo_mid3="$(reply_msg '@carol' "$fo_mid1" 'third message' --to '@alice')"
+once
+contains "fails-only: the third message is recorded as pending on the resumed (2nd) run" \
+    "$(cat "$(live_env_for_agent alice)")" "PENDING_MSGS=$fo_mid3"
+
+finish_run alice 1
+: > "$STUB_ARGV_LOG"
+once
+check "fails-only: the resumed wake's failure bumps FAILS to 1" \
+    1 "$(sed -n 's/^FAILS=//p' "$fo_retries" 2>/dev/null)"
+check "fails-only: no STATE is written for a failure the pending message superseded" 0 \
+    "$(grep -c -- '^STATE=' "$fo_retries" 2>/dev/null)"
+
+finish_run alice 0 "$fo_sid"
+once
+# The FAILS-only file has nothing left to reset FAILS from and no retry
+# history to recover, so the exit-0 harvest removes it outright -- absent
+# is the correct way to observe "no STATE, no RECOVERED_AT" here.
+check "fails-only: an exit-0 harvest of the superseding wake does not fabricate STATE=recovered" 0 \
+    "$(if [[ -e "$fo_retries" ]]; then grep -c -- '^STATE=' "$fo_retries"; else echo 0; fi)"
+check "fails-only: RECOVERED_AT is not written either" 0 \
+    "$(if [[ -e "$fo_retries" ]]; then grep -c -- '^RECOVERED_AT=' "$fo_retries"; else echo 0; fi)"
 
 # ============================================================
 printf '\n== retry: hops-0 and budget-exhausted triggers are refused by the existing gates ==\n'
@@ -3022,7 +3175,7 @@ ln -s "$repo_dir/scripts/fork-sandbox-fleet.sh" "$SF_STUB_DIR/fork-sandbox-fleet
 ln -s "$repo_dir/scripts/fork-sandbox-lib.sh" "$SF_STUB_DIR/fork-sandbox-lib.sh"
 cp "$sf_renderer" "$SF_STUB_DIR/fork-sandbox-mail-render.py"
 
-sf_mid2="$(reply_msg '@carol' "$sf_mid1" 'second message' --to '@alice')"
+reply_msg '@carol' "$sf_mid1" 'second message' --to '@alice' >/dev/null
 : > "$STUB_ARGV_LOG"
 postmaster="$sf_postmaster"
 once
