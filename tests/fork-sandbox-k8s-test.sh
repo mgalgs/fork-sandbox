@@ -5098,6 +5098,11 @@ td_test_scratch_push() {
     local d wf_out rc
     d="$(mktemp -d "/var/tmp/claude-scratch/fs-k8s-test-${tag}.XXXXXX")"; tmpdirs+=("$d")
     printf 'gathered notes\n' > "$d/notes.md"
+    mkdir -p "$d/sub"
+    printf 'nested\n' > "$d/sub/nested.txt"
+    printf 'dotfile\n' > "$d/.dotfile"
+    printf 'space\n' > "$d/name with space.txt"
+    printf 'dash\n' > "$d/-dashname.txt"
 
     wf_out="$(newdir)/${tag}-submit.yaml"; tmpdirs+=("$(dirname "$wf_out")")
     if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
@@ -5219,7 +5224,7 @@ STUB
     # destination, before the sentinel exec -- mirrors --context-ro's own
     # exec-failure-removes-tar fixture, adapted to confirm the destination
     # and ordering rather than re-testing failure-cleanup a third time.
-    local exec_tmp exec_git exec_kubectl exec_log
+    local exec_tmp exec_git exec_kubectl exec_log exec_tar
     exec_tmp="$(newdir)"; tmpdirs+=("$exec_tmp")
     exec_git="$(newdir)/git"; tmpdirs+=("$(dirname "$exec_git")")
     cat > "$exec_git" <<'STUB'
@@ -5238,13 +5243,21 @@ verb=""; for arg in "$@"; do case "$arg" in apply|wait|exec|get) verb="$arg" ;; 
 case "$verb" in
     apply|wait) cat >/dev/null ;;
     get) printf 'stub-pod\n' ;;
-    exec) cat >/dev/null ;;
+    exec)
+        if [[ -n "${K8S_STUB_CAPTURE_TAR:-}" ]] && [[ " $* " == *" ${K8S_STUB_CAPTURE_DEST:-} "* ]]; then
+            cat > "$K8S_STUB_CAPTURE_TAR"
+        else
+            cat >/dev/null
+        fi
+        ;;
 esac
 STUB
     chmod +x "$exec_kubectl"
     exec_log="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$exec_log")")
+    exec_tar="$exec_tmp/captured.tar"
     PATH="$(dirname "$exec_git"):$(dirname "$exec_kubectl"):$PATH" \
         TMPDIR="$exec_tmp" K8S_STUB_LOG="$exec_log" \
+        K8S_STUB_CAPTURE_DEST="$pod_path" K8S_STUB_CAPTURE_TAR="$exec_tar" \
         FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit \
         --branch "fs-k8s-test-${tag}-exec-order" --model moonshotai/kimi-k3 "$flag" "$d" \
         "$proj_dir" "$handoff_file" >"/tmp/fs-k8s-test-${tag}-exec.out" 2>&1
@@ -5259,6 +5272,31 @@ STUB
             "rc=$rc log=$(cat "$exec_log") out=$(cat "/tmp/fs-k8s-test-${tag}-exec.out")"
     fi
     rm -f "/tmp/fs-k8s-test-${tag}-exec.out"
+
+    # The archive actually pushed for this flag: real k8s_spool_dir_entries
+    # output, captured off the stubbed kubectl exec's stdin above -- not a
+    # re-typed pipeline standing in for it.
+    if [[ -s "$exec_tar" ]]; then
+        local tar_members
+        tar_members="$(tar tf "$exec_tar")"
+        if ! grep -qxF '.' <<< "$tar_members" && ! grep -qxF './' <<< "$tar_members"; then
+            ok "the captured $flag archive has no top-level '.' or './' member"
+        else
+            no "the captured $flag archive has no top-level '.' or './' member" "$tar_members"
+        fi
+        local missing="" want
+        for want in './notes.md' './sub/nested.txt' './.dotfile' \
+                    './name with space.txt' './-dashname.txt'; do
+            grep -qxF "$want" <<< "$tar_members" || missing+="$want "
+        done
+        if [[ -z "$missing" ]]; then
+            ok "the captured $flag archive contains every fixture entry"
+        else
+            no "the captured $flag archive contains every fixture entry" "missing: $missing"
+        fi
+    else
+        no "the captured $flag archive contains every fixture entry" "no archive captured at $exec_tar"
+    fi
 }
 
 printf '\n== fork-sandbox-k8s.sh submit/run --dry-run --thread-dir ==\n'
@@ -5266,6 +5304,141 @@ td_test_scratch_push --thread-dir /thread thread
 
 printf '\n== fork-sandbox-k8s.sh submit/run --dry-run --attach-dir ==\n'
 td_test_scratch_push --attach-dir /attachments attach
+
+printf '\n== fork-sandbox-k8s.sh submit: empty --attach-dir ==\n'
+# An empty --attach-dir must still push cleanly: k8s_spool_dir_entries'
+# no-members branch (tar cf ... -T /dev/null) and the extractor's
+# existing-empty-DEST_DIR acceptance are the two halves that make that
+# work end to end.
+empty_attach_dir="$(mktemp -d "/var/tmp/claude-scratch/fs-k8s-test-empty-attach.XXXXXX")"; tmpdirs+=("$empty_attach_dir")
+empty_attach_git="$(newdir)/git"; tmpdirs+=("$(dirname "$empty_attach_git")")
+cat > "$empty_attach_git" <<'STUB'
+#!/usr/bin/env bash
+case " $* " in
+    *" push "*) exit 0 ;;
+esac
+exec /usr/bin/git "$@"
+STUB
+chmod +x "$empty_attach_git"
+empty_attach_kubectl="$(newdir)/kubectl"; tmpdirs+=("$(dirname "$empty_attach_kubectl")")
+cat > "$empty_attach_kubectl" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$K8S_STUB_LOG"
+verb=""; for arg in "$@"; do case "$arg" in apply|wait|exec|get) verb="$arg" ;; esac; done
+case "$verb" in
+    apply|wait) cat >/dev/null ;;
+    get) printf 'stub-pod\n' ;;
+    exec)
+        if [[ -n "${K8S_STUB_CAPTURE_TAR:-}" ]] && [[ " $* " == *" ${K8S_STUB_CAPTURE_DEST:-} "* ]]; then
+            cat > "$K8S_STUB_CAPTURE_TAR"
+        else
+            cat >/dev/null
+        fi
+        ;;
+esac
+STUB
+chmod +x "$empty_attach_kubectl"
+empty_attach_log="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$empty_attach_log")")
+empty_attach_tar="$(newdir)/captured.tar"; tmpdirs+=("$(dirname "$empty_attach_tar")")
+if PATH="$(dirname "$empty_attach_git"):$(dirname "$empty_attach_kubectl"):$PATH" \
+        K8S_STUB_LOG="$empty_attach_log" K8S_STUB_CAPTURE_DEST="/attachments" \
+        K8S_STUB_CAPTURE_TAR="$empty_attach_tar" \
+        FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit \
+        --branch fs-k8s-test-empty-attach --model moonshotai/kimi-k3 \
+        --attach-dir "$empty_attach_dir" "$proj_dir" "$handoff_file" \
+        >"$empty_attach_log.submit-out" 2>&1; then
+    ok "submit with an empty --attach-dir exits 0"
+else
+    no "submit with an empty --attach-dir exits 0" "$(cat "$empty_attach_log.submit-out")"
+fi
+if [[ -f "$empty_attach_tar" ]] && [[ -z "$(tar tf "$empty_attach_tar")" ]]; then
+    ok "the captured empty --attach-dir archive has zero members"
+else
+    no "the captured empty --attach-dir archive has zero members" \
+        "$(tar tf "$empty_attach_tar" 2>&1)"
+fi
+empty_attach_dest="$(newdir)/dest"; mkdir -p "$empty_attach_dest"; tmpdirs+=("$(dirname "$empty_attach_dest")")
+if "$context_extract_sh" "$empty_attach_dest" 100000000 < "$empty_attach_tar" \
+        >"$empty_attach_log.extract-err" 2>&1; then
+    ok "extracting the empty --attach-dir archive into an existing empty dir exits 0"
+else
+    no "extracting the empty --attach-dir archive into an existing empty dir exits 0" \
+        "$(cat "$empty_attach_log.extract-err")"
+fi
+
+printf '\n== fork-sandbox-k8s.sh submit: --thread-dir spool is portable to a find(1)-less host ==\n'
+# k8s_spool_dir_entries must not shell out to find(1) at all -- BSD find
+# (macOS) has no -printf, so the old find|tar pipeline broke there. Prove
+# it by putting a find(1) on PATH that unconditionally fails and checking
+# the spool still succeeds.
+find_stub_dir="$(newdir)"; tmpdirs+=("$find_stub_dir")
+cat > "$find_stub_dir/find" <<'STUB'
+#!/usr/bin/env bash
+exit 1
+STUB
+chmod +x "$find_stub_dir/find"
+portable_src="$(mktemp -d "/var/tmp/claude-scratch/fs-k8s-test-portable.XXXXXX")"; tmpdirs+=("$portable_src")
+printf 'gathered notes\n' > "$portable_src/notes.md"
+mkdir -p "$portable_src/sub"
+printf 'nested\n' > "$portable_src/sub/nested.txt"
+printf 'dotfile\n' > "$portable_src/.dotfile"
+portable_git="$(newdir)/git"; tmpdirs+=("$(dirname "$portable_git")")
+cat > "$portable_git" <<'STUB'
+#!/usr/bin/env bash
+case " $* " in
+    *" push "*) exit 0 ;;
+esac
+exec /usr/bin/git "$@"
+STUB
+chmod +x "$portable_git"
+portable_kubectl="$(newdir)/kubectl"; tmpdirs+=("$(dirname "$portable_kubectl")")
+cat > "$portable_kubectl" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$K8S_STUB_LOG"
+verb=""; for arg in "$@"; do case "$arg" in apply|wait|exec|get) verb="$arg" ;; esac; done
+case "$verb" in
+    apply|wait) cat >/dev/null ;;
+    get) printf 'stub-pod\n' ;;
+    exec)
+        if [[ -n "${K8S_STUB_CAPTURE_TAR:-}" ]] && [[ " $* " == *" ${K8S_STUB_CAPTURE_DEST:-} "* ]]; then
+            cat > "$K8S_STUB_CAPTURE_TAR"
+        else
+            cat >/dev/null
+        fi
+        ;;
+esac
+STUB
+chmod +x "$portable_kubectl"
+portable_log="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$portable_log")")
+portable_tar="$(newdir)/captured.tar"; tmpdirs+=("$(dirname "$portable_tar")")
+if PATH="$find_stub_dir:$(dirname "$portable_git"):$(dirname "$portable_kubectl"):$PATH" \
+        K8S_STUB_LOG="$portable_log" K8S_STUB_CAPTURE_DEST="/thread" \
+        K8S_STUB_CAPTURE_TAR="$portable_tar" \
+        FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit \
+        --branch fs-k8s-test-portable --model moonshotai/kimi-k3 \
+        --thread-dir "$portable_src" "$proj_dir" "$handoff_file" \
+        >"$portable_log.submit-out" 2>&1; then
+    ok "submit --thread-dir succeeds with no working find(1) on PATH"
+else
+    no "submit --thread-dir succeeds with no working find(1) on PATH" \
+        "$(cat "$portable_log.submit-out")"
+fi
+if [[ -s "$portable_tar" ]]; then
+    portable_members="$(tar tf "$portable_tar")"
+    if grep -qxF './notes.md' <<< "$portable_members" \
+        && grep -qxF './sub/nested.txt' <<< "$portable_members" \
+        && grep -qxF './.dotfile' <<< "$portable_members" \
+        && ! grep -qxF '.' <<< "$portable_members" \
+        && ! grep -qxF './' <<< "$portable_members"; then
+        ok "the archive captured with no working find(1) has the correct entries-only shape"
+    else
+        no "the archive captured with no working find(1) has the correct entries-only shape" \
+            "$portable_members"
+    fi
+else
+    no "the archive captured with no working find(1) has the correct entries-only shape" \
+        "no archive captured at $portable_tar"
+fi
 
 printf '\n== fork-sandbox-k8s-context-extract.sh: existing-empty-destination acceptance is exercised above ==\n'
 # (covered in the extraction-guards section below, not repeated here.)
@@ -6844,10 +7017,9 @@ rm -f /tmp/fs-k8s-ctx-exist.err
 # reviewer finding: --no-overwrite-dir does not actually stop GNU tar from
 # attempting that chmod, and a non-owner gets EPERM from it regardless of
 # whether the mode would change). The actual fix lives one level up, in
-# fork-sandbox-k8s.sh's spooling for these two flags: it packs the
-# directory's ENTRIES (find -mindepth 1 -maxdepth 1 -printf '%P\0' | tar
-# --null -T -), never `.` itself, so no member in the archive ever maps
-# onto DEST_DIR and this extractor never attempts to touch it. Proved
+# fork-sandbox-k8s.sh's k8s_spool_dir_entries, which packs the directory's
+# ENTRIES, never `.` itself, so no member in the archive ever maps onto
+# DEST_DIR and this extractor never attempts to touch it. Proved
 # here by actually denying chmod/fchmodat/utime/utimensat/chown on
 # DEST_DIR through an LD_PRELOAD shim standing in for "not the owner, no
 # CAP_FOWNER" -- a real EPERM, not a same-value coincidence. Skipped if no
@@ -6905,15 +7077,53 @@ int chown(const char *path, uid_t owner, gid_t group) {
 SHIM_C
     if cc -shared -fPIC -o "$cf_shim_dir/shim.so" "$cf_shim_dir/shim.c" -ldl \
             >/tmp/fs-k8s-ctx-shim-cc.err 2>&1; then
-        # The fixture shape a real --thread-dir/--attach-dir push produces
-        # now: entries only, no top-level `.` member.
-        cf_meta_src="$(newdir)"; tmpdirs+=("$cf_meta_src")
+        # The fixture archive: a real --thread-dir push through a stubbed
+        # submit, captured off the stubbed kubectl exec's stdin -- the
+        # actual entries-only shape k8s_spool_dir_entries produces, not a
+        # re-typed pipeline standing in for it.
+        cf_meta_src="$(mktemp -d "/var/tmp/claude-scratch/fs-k8s-test-meta.XXXXXX")"; tmpdirs+=("$cf_meta_src")
         printf 'hello\n' > "$cf_meta_src/foo.txt"
         mkdir -p "$cf_meta_src/sub"
         printf 'world\n' > "$cf_meta_src/sub/bar.txt"
+        cf_meta_git="$(newdir)/git"; tmpdirs+=("$(dirname "$cf_meta_git")")
+        cat > "$cf_meta_git" <<'STUB'
+#!/usr/bin/env bash
+case " $* " in
+    *" push "*) exit 0 ;;
+esac
+exec /usr/bin/git "$@"
+STUB
+        chmod +x "$cf_meta_git"
+        cf_meta_kubectl="$(newdir)/kubectl"; tmpdirs+=("$(dirname "$cf_meta_kubectl")")
+        cat > "$cf_meta_kubectl" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$K8S_STUB_LOG"
+verb=""; for arg in "$@"; do case "$arg" in apply|wait|exec|get) verb="$arg" ;; esac; done
+case "$verb" in
+    apply|wait) cat >/dev/null ;;
+    get) printf 'stub-pod\n' ;;
+    exec)
+        if [[ -n "${K8S_STUB_CAPTURE_TAR:-}" ]] && [[ " $* " == *" ${K8S_STUB_CAPTURE_DEST:-} "* ]]; then
+            cat > "$K8S_STUB_CAPTURE_TAR"
+        else
+            cat >/dev/null
+        fi
+        ;;
+esac
+STUB
+        chmod +x "$cf_meta_kubectl"
+        cf_meta_log="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$cf_meta_log")")
         cf_meta_tar="$cf_parent/meta_entries.tar"
-        find "$cf_meta_src" -mindepth 1 -maxdepth 1 -printf '%P\0' \
-            | tar cf "$cf_meta_tar" -C "$cf_meta_src" --null -T -
+        cf_meta_submit_err="$(newdir)/submit.err"; tmpdirs+=("$(dirname "$cf_meta_submit_err")")
+        if ! PATH="$(dirname "$cf_meta_git"):$(dirname "$cf_meta_kubectl"):$PATH" \
+                K8S_STUB_LOG="$cf_meta_log" K8S_STUB_CAPTURE_DEST="/thread" \
+                K8S_STUB_CAPTURE_TAR="$cf_meta_tar" \
+                FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit \
+                --branch fs-k8s-test-meta-shim --model moonshotai/kimi-k3 \
+                --thread-dir "$cf_meta_src" "$proj_dir" "$handoff_file" \
+                >"$cf_meta_submit_err" 2>&1; then
+            no "the metadata-survives-EPERM fixture's real spool submit succeeds" "$(cat "$cf_meta_submit_err")"
+        fi
 
         # 0777, not 0700: group/other-writable is the shape a kubelet
         # fsGroup-managed emptyDir mount actually has, and it is the shape
@@ -6923,13 +7133,14 @@ SHIM_C
         cf_meta_dest="$cf_parent/meta_dest"
         mkdir -p "$cf_meta_dest"
         chmod 0777 "$cf_meta_dest"
+        cf_meta_extract_err="$(newdir)/extract.err"; tmpdirs+=("$(dirname "$cf_meta_extract_err")")
         if FS_K8S_TEST_SHIM_TARGET="." LD_PRELOAD="$cf_shim_dir/shim.so" \
                 "$context_extract_sh" "$cf_meta_dest" 100000000 < "$cf_meta_tar" \
-                >/tmp/fs-k8s-ctx-meta.err 2>&1; then
+                >"$cf_meta_extract_err" 2>&1; then
             ok "an existing DEST_DIR's own metadata survives extraction under denied chmod/utime/chown"
         else
             no "an existing DEST_DIR's own metadata survives extraction under denied chmod/utime/chown" \
-                "$(cat /tmp/fs-k8s-ctx-meta.err)"
+                "$(cat "$cf_meta_extract_err")"
         fi
         cf_meta_mode="$(stat -c '%a' "$cf_meta_dest")"
         if [[ "$cf_meta_mode" == "777" ]]; then
@@ -6945,7 +7156,6 @@ SHIM_C
             no "an existing DEST_DIR: the entries-only archive's files still land inside it" \
                 "$(find "$cf_meta_dest" 2>&1)"
         fi
-        rm -f /tmp/fs-k8s-ctx-meta.err
     else
         printf '  SKIP  metadata-survives-EPERM test: could not compile the LD_PRELOAD shim\n'
         printf '        %s\n' "$(cat /tmp/fs-k8s-ctx-shim-cc.err)"
