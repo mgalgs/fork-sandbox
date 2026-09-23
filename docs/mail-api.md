@@ -31,13 +31,21 @@ loader refuses to start if a client entry's identities include
 `@operator`, `mint` refuses to mint one, and the allowlist refuses
 `--from @operator` from anything but an operator token, unconditionally.
 
-Known limit: this does not stop a client from clearing a flag. A client
-identity such as `@ci-kickoff` is not a fleet seat either, so a client
-that replies into a flagged thread with `--from @ci-kickoff` triggers rule
-1 just as `@operator` would. The server checks argv structure and the
-token's identities; it does not look at postmaster state. Until that is
-closed, treat a client token as able to re-arm any thread it can reply
-into, and do not hand one to a job you would not trust with that.
+That alone would not protect a flag: a client identity such as
+`@ci-kickoff` is not a fleet seat either, so a client that replied into a
+flagged thread with `--from @ci-kickoff` would trigger rule 1 just as
+`@operator` would. So the server also refuses a client's `reply` whose
+`--reply-to` is a message in a flagged (needs-operator) thread, with 403.
+Only an operator token may post into a flagged thread. `send` always
+starts a fresh thread, so it needs no such check.
+
+Known limits. The check reads the flag when the request arrives; a flag
+set a moment later, or a client message already stored but not yet routed
+when an operator flags its thread, is not covered. Rule 1 also resets the
+spawn budget of an unflagged thread for any client reply, and `reply
+--hops` lets a client set the hop budget of its own message. Treat a
+client token as able to keep waking agents in any unflagged thread it can
+reply into.
 
 ## The tokens file
 

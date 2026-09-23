@@ -304,6 +304,16 @@ check "the operator's flag: rc 0" "0" "$(rjson rc)"
 check "the flag file appears" "stuck on CI" "$(cat "$flag_file" 2>/dev/null)"
 check "a client cannot clear it" "403" "$(xr "$tok/ci-kickoff" --tool postmaster -- unflag "$seed")"
 check "the flag file is still there" "1" "$([[ -e "$flag_file" ]] && echo 1 || echo 0)"
+seed_msgs="$(find "$FORK_SANDBOX_MAIL_ROOT/threads/$seed" -name '*.msg' | wc -l)"
+seed_id="$(cd "$FORK_SANDBOX_MAIL_ROOT/threads/$seed" && grep -h -m1 '^Message-ID: ' -- *.msg | tail -n 1 | sed 's/^Message-ID: //')"
+check "a client replies into the flagged thread: 403" "403" \
+    "$(xr "$tok/ci-kickoff" --tool mail --stdin hi -- reply --from @ci-kickoff --reply-to "$seed_id" --body -)"
+contains "... and the error says the thread is flagged" "$(rjson error)" "flagged"
+check "no message was posted into the flagged thread" "$seed_msgs" \
+    "$(find "$FORK_SANDBOX_MAIL_ROOT/threads/$seed" -name '*.msg' | wc -l)"
+check "the flag file survives the client's reply" "stuck on CI" "$(cat "$flag_file" 2>/dev/null)"
+check "the operator may still reply into the flagged thread" "0" \
+    "$(xr "$tok/laptop" --tool mail --stdin hi -- reply --from @operator --reply-to "$seed_id" --body - >/dev/null; rjson rc)"
 check "the operator runs unflag: rc 0" "0" "$(xr "$tok/laptop" --tool postmaster -- unflag "$seed" >/dev/null; rjson rc)"
 check "the flag file clears" "0" "$([[ -e "$flag_file" ]] && echo 1 || echo 0)"
 check "flag with no thread id: 400" "400" "$(xr "$tok/laptop" --tool postmaster -- flag)"

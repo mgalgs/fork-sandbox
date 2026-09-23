@@ -35,10 +35,11 @@ read, grant and seen (or '-'). Startup refuses the file (exit 2, one line
 naming the label, never the hash) on a malformed line, an unknown role or
 cap, a malformed identity, a shared hash or label, an empty table, an
 operator entry with identities or caps, or a client entry that lists
-@operator. Only an operator may post as @operator. That does not keep a
-client from clearing a thread's flag: the postmaster's rule 1 applies to any
-From that is not a fleet agent, so a client's own identity, replying into a
-flagged thread, clears it too (see docs/mail-api.md).
+@operator. Only an operator may post as @operator. That alone would not
+protect a thread's flag: the postmaster's rule 1 applies to any From that is
+not a fleet agent, so a client's own identity would clear it too. So the
+server also refuses a client's `reply` whose --reply-to is a message in a
+flagged (needs-operator) thread, with 403 (see docs/mail-api.md).
 
 HTTP:
 
@@ -363,6 +364,54 @@ def authorize(entry, tool, verb, positionals, flags):
     need(entry, "read")
 
 
+def flagged_thread_of(message_id):
+    """Return the flagged thread the message belongs to, or None. Reads the
+    postmaster's needs-operator directory and the thread's .msg headers
+    directly; it never builds a path from the caller's id, only compares it
+    to header text (the same way mail_find_by_id does)."""
+    root = os.environ.get("FORK_SANDBOX_MAIL_ROOT",
+                          "/var/tmp/claude-scratch/agent-mail")
+    try:
+        flagged = os.listdir(os.path.join(root, ".postmaster",
+                                          "needs-operator"))
+    except OSError:
+        return None
+    want = "Message-ID: " + message_id
+    for tid in flagged:
+        tdir = os.path.join(root, "threads", tid)
+        try:
+            names = os.listdir(tdir)
+        except OSError:
+            continue
+        for name in names:
+            if not name.endswith(".msg"):
+                continue
+            try:
+                with open(os.path.join(tdir, name), "rb") as f:
+                    for raw in f:
+                        line = raw.decode("utf-8", "replace").rstrip("\r\n")
+                        if not line:
+                            break
+                        if line == want:
+                            return tid
+            except OSError:
+                continue
+    return None
+
+
+def refuse_flagged_reply(entry, tool, verb, flags):
+    """The postmaster's rule 1 clears a thread's flag and resets its spawn
+    budget for any message whose From is not a fleet agent, and a client's
+    identity is not one. So a client reply into a flagged thread would
+    re-arm it. Only an operator token may post into a flagged thread."""
+    if entry.is_operator() or (tool, verb) != ("mail", "reply"):
+        return
+    target = flags.get("--reply-to")
+    if target and flagged_thread_of(target[0]) is not None:
+        raise ApiError(403, "that thread is flagged needs-operator; only an "
+                            "operator token may post into it")
+
+
 def need(entry, cap):
     if not entry.can(cap):
         raise ApiError(403, "this token lacks the '%s' cap" % cap)
@@ -446,6 +495,7 @@ def handle_exec(entry, raw, ctx):
     verb, positionals, flags, attach_at = parse_argv(tool, argv)
     ctx["verb"] = verb
     authorize(entry, tool, verb, positionals, flags)
+    refuse_flagged_reply(entry, tool, verb, flags)
 
     if (tool, verb) in (("mail", "send"), ("mail", "reply")):
         if flags.get("--body", ["-"]) != ["-"]:
