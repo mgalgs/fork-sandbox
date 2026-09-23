@@ -57,6 +57,13 @@
 # reads its provider key from. Idempotent -- safe to run again after
 # changing config.
 #
+# install --postmaster does everything plain install does, then also
+# renders and applies the cluster postmaster: a single-replica Deployment
+# running the same fork-sandbox-postmaster.sh a laptop runs. See the
+# K8S_POSTMASTER_* keys below and docs/cluster-postmaster.md for the full
+# setup. --dry-run covers this too, printing a placeholder line for the
+# git deploy-key Secret instead of its content.
+#
 # submit renders a Job for one run, applies it, pushes the project's repo
 # into the pod over the same `kubectl exec` channel the work later returns
 # on, and writes the sentinel that lets the pod's entrypoint proceed. The
@@ -561,6 +568,50 @@
 #                         key-by-key by --label on a given invocation. See
 #                         --label above.
 #
+# The following keys are read only by `install --postmaster` and by the
+# postmaster pod's own init step; no other verb or key changes behavior
+# based on them. See docs/cluster-postmaster.md.
+#   K8S_POSTMASTER_IMAGE= the image ref scripts/build-sandbox-image.sh
+#                         --postmaster built and you pushed. REQUIRED with
+#                         --postmaster, never defaulted, same reasoning as
+#                         K8S_IMAGE above.
+#   K8S_POSTMASTER_REPO_URL=
+#                         ssh URL of the project repo the postmaster pod
+#                         clones: ssh://[user@]host[:port]/path or the
+#                         scp-like user@host:path form. REQUIRED with
+#                         --postmaster; anything else (https://, a bare
+#                         hostname) is refused -- the pod holds a
+#                         read-only deploy key, never a token or password.
+#   K8S_POSTMASTER_PROJECT=
+#                         directory name under $HOME/src in the pod.
+#                         Optional; defaults to K8S_POSTMASTER_REPO_URL's
+#                         last path component with a trailing .git
+#                         stripped. Must match ^[A-Za-z0-9][A-Za-z0-9._-]*$
+#                         (so it can never be "." or "..").
+#   K8S_POSTMASTER_GIT_KEY_FILE=
+#                         laptop path to the read-only deploy private key
+#                         for K8S_POSTMASTER_REPO_URL. REQUIRED with
+#                         --postmaster; must be a regular file, owned by
+#                         you, mode 0600 or stricter (require_secret_file).
+#   K8S_POSTMASTER_KNOWN_HOSTS_FILE=
+#                         laptop path to a known_hosts file for that
+#                         remote. REQUIRED with --postmaster and must be
+#                         non-empty: the pod never trusts a host on first
+#                         use.
+#   K8S_POSTMASTER_STORAGE_CLASS=
+#                         the postmaster PVC's storageClassName. Optional;
+#                         empty (the default) omits the field entirely, so
+#                         the cluster's default StorageClass applies.
+#   K8S_POSTMASTER_STORAGE=
+#                         the postmaster PVC's requested size. Optional,
+#                         defaults to 20Gi; must match ^[0-9]+(Mi|Gi|Ti)$.
+#   K8S_POSTMASTER_ACCESS_MODE=
+#                         the postmaster PVC's access mode. Optional,
+#                         defaults to ReadWriteOncePod; ReadWriteOnce is
+#                         also accepted (for a StorageClass/CSI driver
+#                         that does not support RWOP yet). Any other value
+#                         is refused.
+#
 # The provider key is NOT in this file. install reads it from
 # ~/.config/fork-sandbox/pi.env (OPENROUTER_API_KEY=...), the same file a
 # local --harness pi run reads, so there is one credential source shared
@@ -713,6 +764,21 @@ GIT_USER_EMAIL="${GIT_USER_EMAIL:-agent@fork-sandbox.invalid}"
 # here but parsed by parse_proxy_endpoints inside cmd_install/cmd_submit.
 K8S_RUN_OWNER="$(read_env_value "$k8s_env" K8S_RUN_OWNER || true)"
 K8S_RUN_LABELS="$(read_env_value "$k8s_env" K8S_RUN_LABELS || true)"
+# Read unconditionally, like every other key above -- but only
+# `install --postmaster` (and the pod's own init step, a separate script)
+# ever act on them; every required-ness and shape check lives in
+# cmd_install, gated on --postmaster, so a plain install or any other verb
+# never fails over a key it does not use. See the header table above.
+K8S_POSTMASTER_IMAGE="$(read_env_value "$k8s_env" K8S_POSTMASTER_IMAGE || true)"
+K8S_POSTMASTER_REPO_URL="$(read_env_value "$k8s_env" K8S_POSTMASTER_REPO_URL || true)"
+K8S_POSTMASTER_PROJECT="$(read_env_value "$k8s_env" K8S_POSTMASTER_PROJECT || true)"
+K8S_POSTMASTER_GIT_KEY_FILE="$(read_env_value "$k8s_env" K8S_POSTMASTER_GIT_KEY_FILE || true)"
+K8S_POSTMASTER_KNOWN_HOSTS_FILE="$(read_env_value "$k8s_env" K8S_POSTMASTER_KNOWN_HOSTS_FILE || true)"
+K8S_POSTMASTER_STORAGE_CLASS="$(read_env_value "$k8s_env" K8S_POSTMASTER_STORAGE_CLASS || true)"
+K8S_POSTMASTER_STORAGE="$(read_env_value "$k8s_env" K8S_POSTMASTER_STORAGE || true)"
+K8S_POSTMASTER_STORAGE="${K8S_POSTMASTER_STORAGE:-20Gi}"
+K8S_POSTMASTER_ACCESS_MODE="$(read_env_value "$k8s_env" K8S_POSTMASTER_ACCESS_MODE || true)"
+K8S_POSTMASTER_ACCESS_MODE="${K8S_POSTMASTER_ACCESS_MODE:-ReadWriteOncePod}"
 # Free-form labels for this run, populated by resolve_run_labels in
 # cmd_submit. Declared empty here (module-global) so build_extra_label_lines
 # can read them under `set -u` even on a verb that never calls
@@ -789,6 +855,10 @@ if [[ "${1-}" != check-grant ]]; then
         "$K8S_DENIED_PROBE" "$GIT_USER_NAME" "$GIT_USER_EMAIL" \
         "$K8S_SERVICE_MAX_CPU" "$K8S_SERVICE_MAX_MEMORY" \
         "$K8S_RUN_OWNER" "$K8S_RUN_LABELS" \
+        "$K8S_POSTMASTER_IMAGE" "$K8S_POSTMASTER_REPO_URL" \
+        "$K8S_POSTMASTER_PROJECT" "$K8S_POSTMASTER_GIT_KEY_FILE" \
+        "$K8S_POSTMASTER_KNOWN_HOSTS_FILE" "$K8S_POSTMASTER_STORAGE_CLASS" \
+        "$K8S_POSTMASTER_STORAGE" "$K8S_POSTMASTER_ACCESS_MODE" \
         || exit 1
 fi
 
@@ -2336,6 +2406,67 @@ strip_proxy_key_volume() {
     printf '%s' "$stripped"
 }
 
+# Removes one of the postmaster Deployment's marker-fenced optional blocks
+# (manifests/k8s/40-postmaster.yaml's "# >>> $tag" / "# <<< $tag" comment
+# pairs -- personas/prompts/handlers/presets, each fencing an env entry, a
+# volumeMount entry and a volume entry, three tags per name) from $1, for
+# `install --postmaster` when that name's laptop config dir does not
+# exist -- the pod must see the same "absent dir means absent" semantics
+# the postmaster itself already applies locally. sed's range-delete finds
+# the pair by the marker text alone, regardless of indentation (yamllint's
+# comments-indentation rule requires each marker's own indentation to
+# match, which is a per-manifest-edit concern, not this function's).
+# Errors out, rather than silently no-op'ing, if a marker pair is not
+# found -- same drift-detection discipline as strip_proxy_key_volume
+# above: manifests/k8s/40-postmaster.yaml and this function's tags must
+# never quietly disagree.
+strip_pm_optional_block() {
+    local text="$1" tag="$2" out
+    out="$(printf '%s' "$text" | sed "/# >>> ${tag}\$/,/# <<< ${tag}\$/d")"
+    if [[ "$out" == "$text" ]]; then
+        echo "Error: could not find the '$tag' block in the rendered" >&2
+        echo "postmaster Deployment -- manifests/k8s/40-postmaster.yaml" >&2
+        echo "and cmd_install have drifted apart." >&2
+        return 1
+    fi
+    printf '%s' "$out"
+}
+
+# Fills the module-global PM_CONFIGMAP_FILE_ARGS (one --from-file=key=path
+# per file, for kubectl create configmap) and PM_CONFIGMAP_FILE_PATHS (the
+# bare paths, for the 900 KiB total-size guard in cmd_install) from every
+# regular top-level file in $1 -- never recursing, since a ConfigMap
+# volume cannot hold subdirectories, so a nested one is refused by name
+# rather than silently flattened or dropped. $2 ("true"/"false") requires
+# each included file to be executable, for the handlers dir: a
+# non-executable one is skipped with a warning rather than refused,
+# mirroring what the postmaster itself does with a non-executable
+# handler (see FLEET/PM's own handler-exec checks).
+pm_collect_configmap_files() {
+    local dir="$1" require_exec="$2" sub f base
+    PM_CONFIGMAP_FILE_ARGS=()
+    PM_CONFIGMAP_FILE_PATHS=()
+    sub="$(find "$dir" -mindepth 1 -maxdepth 1 -type d -print -quit)"
+    if [[ -n "$sub" ]]; then
+        echo "Error: '$sub' is a subdirectory of $dir -- a ConfigMap can only" >&2
+        echo "hold flat files. Remove it or move its content up a level." >&2
+        return 1
+    fi
+    for f in "$dir"/*; do
+        [[ -f "$f" ]] || continue
+        base="$(basename "$f")"
+        if [[ "$require_exec" == true && ! -x "$f" ]]; then
+            echo "Warning: $f is not executable; skipping it from the handlers" >&2
+            echo "ConfigMap -- the postmaster itself would skip a" >&2
+            echo "non-executable handler the same way." >&2
+            continue
+        fi
+        PM_CONFIGMAP_FILE_ARGS+=(--from-file="$base=$f")
+        PM_CONFIGMAP_FILE_PATHS+=("$f")
+    done
+    return 0
+}
+
 render_proxy_locations_body() {
     local upstream_host="$1"
 
@@ -2421,10 +2552,11 @@ EOF
 }
 
 cmd_install() {
-    local dry_run=false
+    local dry_run=false postmaster=false
     while (( $# )); do
         case "$1" in
             --dry-run) dry_run=true; shift ;;
+            --postmaster) postmaster=true; shift ;;
             *) echo "Error: unknown option '$1' for install." >&2; exit 1 ;;
         esac
     done
@@ -2789,6 +2921,13 @@ cmd_install() {
         # it from. Applying it here would apply a broken manifest with a
         # literal, unsubstituted __RUN_NAME__ in it.
         [[ "$(basename "$f")" == 31-claude-proxy.yaml ]] && continue
+        # 40-postmaster.yaml carries __PM_*__ placeholders that only
+        # `install --postmaster` has values for (see that block, below the
+        # base render loop and the platform NetworkPolicy render) -- plain
+        # install must skip it exactly like 31-claude-proxy.yaml above, or
+        # this loop would apply a manifest with literal, unsubstituted
+        # placeholders in it.
+        [[ "$(basename "$f")" == 40-postmaster.yaml ]] && continue
         local file_rendered
         file_rendered="$(sed \
             -e "s|__NAMESPACE__|$K8S_NAMESPACE|g" \
