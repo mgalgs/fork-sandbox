@@ -797,11 +797,28 @@ run_claude_continuations() {
     local log="$work_dir/refresh.log" ended="" n=0 leg_no next_n rec
     local stale rc prompt stale_json merged last_events="$work_dir/events.jsonl"
     local continuations='[]'
+    # The branch head as of just before the most recently run leg (the
+    # coding leg, for the first iteration, or a continuation): the pod owns
+    # its clone, so this reads it directly, unlike the local runner's
+    # ls-remote. Compared at the top of the next iteration to detect a
+    # stall -- see fs_refresh_is_stall (refresh.sh).
+    local leg_head_before=""
+    leg_head_before="$(git -C "$clone_dir" rev-parse HEAD 2>/dev/null || true)"
     if (( pi_rc == 0 )); then
         fs_refresh_archive_inbox "$inbox_dir" "$work_dir" 1 "$log"
     fi
     while :; do
         if [[ -f "$outbox_dir/handoff.md" ]]; then
+            local now_head
+            now_head="$(git -C "$clone_dir" rev-parse HEAD 2>/dev/null || true)"
+            if fs_refresh_is_stall "$(( n + 1 ))" "$leg_head_before" "$now_head"; then
+                ended=stalled
+                mv -f -- "$outbox_dir/handoff.md" \
+                    "$work_dir/handoff-stalled-$(( n + 1 )).md" 2>/dev/null
+                echo "fork-sandbox-k8s-entrypoint: continuation leg $(( n + 1 ))" \
+                    "stalled (hand-off waiting, branch head unchanged)" >&2
+                break
+            fi
             if (( n >= REFRESH_MAX )); then
                 ended=cap
                 break
@@ -828,6 +845,7 @@ run_claude_continuations() {
             last_events="$work_dir/events-continuation-$n.jsonl"
             echo "fork-sandbox-k8s-entrypoint: continuation leg $leg_no" \
                 "(from $rec)" >&2
+            leg_head_before="$(git -C "$clone_dir" rev-parse HEAD 2>/dev/null || true)"
             rc=0
             run_claude_attempt "$prompt" "$last_events" \
                 "$work_dir/claude-stderr-continuation-$n.log" || rc=$?

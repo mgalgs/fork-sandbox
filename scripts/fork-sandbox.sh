@@ -637,10 +637,13 @@
 # verbatim snapshot of the hand-off this run itself was launched with, ahead
 # of the previous leg's own hand-off. That repeats, on the same nudge-and-
 # check cycle, until a leg ends with nothing waiting in the outbox (the
-# ordinary ending), until --refresh-max legs have run, or until a nudged leg
-# ends without writing a hand-off at all. The review loop above, when both
-# flags are given, then runs once, after the LAST coding leg, over every
-# commit the whole chain made.
+# ordinary ending), until --refresh-max legs have run, until a nudged leg
+# ends without writing a hand-off at all, or until a leg (other than the
+# first) leaves a hand-off without moving the branch at all -- a stall,
+# ended rather than chased, since a leg that commits nothing is not going
+# to start committing on a fresh continuation of the same non-progress. The
+# review loop above, when both flags are given, then runs once, after the
+# LAST coding leg, over every commit the whole chain made.
 #
 # A hand-off can go stale: a session may keep working and committing long
 # after writing it and never rewrite it. The inbox hook sends a Stop back
@@ -655,7 +658,8 @@
 # cost and usage, and how the chain ended (`none`, `empty-outbox`, `cap`,
 # `no-handoff` for a nudged leg that never wrote one, or `leg-error` for a
 # continuation that exited non-zero) — and `total_cost_usd` folds every
-# continuation in beside the review loop's own legs.
+# continuation in beside the review loop's own legs. `stalled` is a leg
+# (other than the first) that left a hand-off without moving the branch.
 #
 # claude only, for now. The threshold is measured in
 # fork-sandbox-inbox-hook.sh, which already runs on every tool call and reads
@@ -7906,6 +7910,12 @@ refresh_leg_n=0
 # appended to it yet at this point), and becomes each continuation's own
 # events-continuation-N.jsonl in turn.
 refresh_last_events="$events"
+# The branch head as of just before the most recently run continuation (or
+# the implement leg, for the first iteration): captured right before that
+# leg's own fs_run_lock_closed call, below. Compared against the current
+# head at the top of the next iteration to detect a stall -- see
+# fs_refresh_is_stall (fork-sandbox-refresh.sh).
+refresh_leg_head_before=""
 
 # Continuation legs share fork-sandbox-inbox-hook.sh's own tag rather than
 # invent a second one: that hook already writes it to stderr, which
@@ -7938,6 +7948,20 @@ if [[ "$refresh_enabled" == "1" ]]; then
             break
         fi
         if [[ -f "$outbox_dir/handoff.md" ]]; then
+            # A stall: the leg that just ran (numbered refresh_leg_n + 1 in
+            # the same "handoff-N.md is leg N's own" scheme as everywhere
+            # else here) left a hand-off without moving the branch. Checked
+            # before the cap below, so a stalled chain that also happens to
+            # be at the cap reports "stalled", the more specific diagnosis.
+            if fs_refresh_is_stall "$(( refresh_leg_n + 1 ))" \
+                "$refresh_leg_head_before" "$(clone_branch_head)"; then
+                refresh_ended="stalled"
+                mv -f -- "$outbox_dir/handoff.md" \
+                    "$run_dir/handoff-stalled-$(( refresh_leg_n + 1 )).md" 2>/dev/null
+                printf 'fork-sandbox: continuation leg %s stalled (hand-off waiting, branch head unchanged); ending the refresh chain\n' \
+                    "$(( refresh_leg_n + 1 ))" | tee -a "$sandbox_log"
+                break
+            fi
             if (( refresh_leg_n >= refresh_max )); then
                 refresh_ended="cap"
                 break
@@ -7991,6 +8015,9 @@ if [[ "$refresh_enabled" == "1" ]]; then
             # transcript-store flags, where a continuation leg writes into
             # the store and never resumes out of it -- see where the array
             # is built, in the launcher above.
+            # Recorded just before this leg runs, for the stall check at the
+            # top of the next iteration (fs_refresh_is_stall above).
+            refresh_leg_head_before="$(clone_branch_head)"
             if [[ -n "$formatter" ]]; then
                 fs_run_lock_closed "${cont_sandbox_cmd[@]}" < "$cont_prompt" \
                     2> >(tee -a "$sandbox_log" >&2) \

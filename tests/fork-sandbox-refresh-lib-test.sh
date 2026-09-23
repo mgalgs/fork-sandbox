@@ -140,6 +140,22 @@ rm -f "$t/clone/.git/logs/HEAD"
 fs_refresh_handoff_stale "$t/clone" "$t/handoff.md" && r=yes || r=no
 check "no commit log is never stale" no "$r"
 
+printf '\n== fs_refresh_is_stall ==\n'
+fs_refresh_is_stall 1 abc abc && r=yes || r=no
+check "leg 1 is exempt even when the head did not move" no "$r"
+fs_refresh_is_stall 2 abc abc && r=yes || r=no
+check "leg 2 with an unmoved head is a stall" yes "$r"
+fs_refresh_is_stall 2 abc def && r=yes || r=no
+check "leg 2 with a moved head is not a stall" no "$r"
+fs_refresh_is_stall 3 abc abc && r=yes || r=no
+check "leg 3 (or later) with an unmoved head is a stall too" yes "$r"
+fs_refresh_is_stall 2 "" abc && r=yes || r=no
+check "an empty before-head is never a stall" no "$r"
+fs_refresh_is_stall 2 abc "" && r=yes || r=no
+check "an empty now-head is never a stall" no "$r"
+fs_refresh_is_stall 2 "" "" && r=yes || r=no
+check "two empty heads is never a stall" no "$r"
+
 printf '\n== fs_refresh_addenda_dirs ==\n'
 t="$(new_tmp)"
 mkdir -p "$t/inbox-delivered/leg-2" "$t/inbox-delivered/leg-10" "$t/inbox-delivered/leg-3"

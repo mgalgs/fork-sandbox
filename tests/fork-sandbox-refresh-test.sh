@@ -293,8 +293,14 @@ cat > "$stub_bin/claude-sandboxed" <<'STUB'
 # loop reacts to. Which invocation this is (1 = implement leg, 2 = first
 # continuation, ...) comes from a counter file so a scenario can control each
 # leg independently; FAKE_NUDGE_LEGS, FAKE_HANDOFF_LEGS, FAKE_SYMLINK_LEGS,
-# FAKE_FAIL_LEGS, FAKE_STALE_LEGS, FAKE_ADDENDUM_LEGS and FAKE_MAIL_BANNER_LEGS
-# are comma lists of leg numbers (or the literal "all"), read fresh per call.
+# FAKE_FAIL_LEGS, FAKE_STALE_LEGS, FAKE_ADDENDUM_LEGS, FAKE_MAIL_BANNER_LEGS
+# and FAKE_NOCOMMIT_LEGS are comma lists of leg numbers (or the literal
+# "all"), read fresh per call. A leg that writes a hand-off also commits a
+# tiny change in the clone by default -- a real leg that hands off has
+# almost always committed something first, and the stall-stop machinery
+# needs a way to tell a leg that DIDN'T apart from one that did.
+# FAKE_NOCOMMIT_LEGS opts a leg out of that default commit, to simulate a
+# stall.
 set -uo pipefail
 
 outbox=""
@@ -317,6 +323,7 @@ symlink_legs=",${FAKE_SYMLINK_LEGS:-},"
 fail_legs=",${FAKE_FAIL_LEGS:-},"
 stale_legs=",${FAKE_STALE_LEGS:-},"
 addendum_legs=",${FAKE_ADDENDUM_LEGS:-},"
+nocommit_legs=",${FAKE_NOCOMMIT_LEGS:-},"
 
 # The stub bypasses bwrap and its --bind-ro entirely, so it can write into
 # the inbox the same way a real fork-sandbox-say.sh would -- found the same
@@ -351,18 +358,32 @@ if [[ "${FAKE_SYMLINK_LEGS:-}" == "all" || "$symlink_legs" == *",$n,"* ]]; then
     [[ -n "$outbox" ]] && ln -sf "${FAKE_SYMLINK_TARGET:-/etc/hostname}" "$outbox/handoff.md"
 elif [[ "${FAKE_HANDOFF_LEGS:-}" == "all" || "$handoff_legs" == *",$n,"* ]]; then
     if [[ -n "$outbox" ]]; then
+        # The clone is the run dir's own "clone/<name>" sibling of this
+        # outbox.
+        run_dir="$(dirname "$outbox")"
+        clone_dir="$(find "$run_dir/clone" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -1)"
+        # A leg that hands off has, in real use, almost always committed
+        # something first -- so commit a tiny change by default, BEFORE the
+        # hand-off is written (an on-time hand-off always postdates the
+        # work it describes; writing it first would make every default
+        # commit look stale to the host's own check), unless this leg
+        # opted out (FAKE_NOCOMMIT_LEGS), which is how a scenario
+        # simulates the stall the host-side loop is meant to catch: a leg
+        # that leaves a hand-off without moving the branch.
+        if [[ -n "$clone_dir" ]] \
+            && ! { [[ "${FAKE_NOCOMMIT_LEGS:-}" == "all" ]] || [[ "$nocommit_legs" == *",$n,"* ]]; }; then
+            ( cd "$clone_dir" \
+                && printf 'leg %s\n' "$n" >> fake-refresh-progress.txt \
+                && git add fake-refresh-progress.txt \
+                && git commit -q -m "fake progress from leg $n" ) >/dev/null 2>&1
+        fi
         printf 'HANDOFF from leg %s\n' "$n" > "$outbox/handoff.md"
         # The host's stale-hand-off backstop compares this hand-off's mtime
-        # against the clone's HEAD reflog. The clone is the run dir's own
-        # "clone/<name>" sibling of this outbox -- touch its reflog into the
+        # against the clone's HEAD reflog -- touch its reflog into the
         # future, deterministically, rather than racing a real mtime.
         if [[ "${FAKE_STALE_LEGS:-}" == "all" || "$stale_legs" == *",$n,"* ]] \
-            && [[ -n "$outbox" ]]; then
-            run_dir="$(dirname "$outbox")"
-            clone_dir="$(find "$run_dir/clone" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -1)"
-            if [[ -n "$clone_dir" && -f "$clone_dir/.git/logs/HEAD" ]]; then
-                touch -d '+1 hour' "$clone_dir/.git/logs/HEAD"
-            fi
+            && [[ -n "$clone_dir" && -f "$clone_dir/.git/logs/HEAD" ]]; then
+            touch -d '+1 hour' "$clone_dir/.git/logs/HEAD"
         fi
     fi
 fi
@@ -396,7 +417,7 @@ new_project() {
 run_real() {
     local proj="$1" count_file="$2" nudge_legs="$3" handoff_legs="$4"
     shift 4
-    local handoff_dir handoff out rc rd
+    local handoff_dir handoff out rc rd branch_name
     handoff_dir="$(mktemp -d /var/tmp/claude-scratch/fs-refresh-handoff.XXXXXX)"
     # Appending to tmpdirs here would land in this function's own frame, not
     # the EXIT trap's array -- run_real is always called as a command
@@ -407,6 +428,14 @@ run_real() {
     handoff="$handoff_dir/handoff.md"
     printf 'do the task\n' > "$handoff"
     : > "$count_file"
+    # A leg that writes a hand-off now also commits by default (the stub's
+    # own doc comment explains why), so a run that used to leave the
+    # default timestamped branch name unclaimed (removed at the end for
+    # having zero commits) now often keeps it -- and the default name's
+    # second resolution collides across this suite's own rapid-fire calls.
+    # An explicit, unique name per call sidesteps that instead of relying
+    # on wall-clock spacing.
+    branch_name="fs-refresh-test-$(date +%s%N)-$RANDOM"
     out="$(HOME="$launcher_home" PATH="$stub_bin:$PATH" \
         FAKE_CLAUDE_COUNT_FILE="$count_file" \
         FAKE_NUDGE_LEGS="$nudge_legs" \
@@ -417,7 +446,8 @@ run_real() {
         FAKE_STALE_LEGS="${FAKE_STALE_LEGS:-}" \
         FAKE_ADDENDUM_LEGS="${FAKE_ADDENDUM_LEGS:-}" \
         FAKE_MAIL_BANNER_LEGS="${FAKE_MAIL_BANNER_LEGS:-}" \
-        timeout 60 "$launcher" --foreground --harness claude "$@" \
+        FAKE_NOCOMMIT_LEGS="${FAKE_NOCOMMIT_LEGS:-}" \
+        timeout 60 "$launcher" --foreground --harness claude --branch "$branch_name" "$@" \
         "$proj" "$handoff" 2>&1)"
     rc=$?
     rd="$(printf '%s\n' "$out" | sed -n 's/^  run dir:  *//p' | head -1)"
@@ -805,6 +835,40 @@ if [[ -n "$rd" ]]; then
         "1" "$(jq -r '.continuations[0].exit' "$rd/summary.json" 2>/dev/null)"
     check "a crashed continuation: its hand-off is recovered into the run dir" \
         "HANDOFF from leg 2" "$(cat "$rd/handoff-leg-2-after-error.md" 2>/dev/null)"
+fi
+
+# -- a stall: a continuation leg (leg 2, the first one) leaves a hand-off
+# without committing anything. The chain must end rather than fork a third
+# leg from a hand-off that describes no real progress, and the stalled
+# hand-off is kept as its own record rather than silently dropped.
+count_file="$(mktemp)"; tmpdirs+=("$count_file")
+FAKE_NOCOMMIT_LEGS=2
+rd="$(run_real "$proj" "$count_file" "1,2" "1,2" --refresh-at 0.5)"
+FAKE_NOCOMMIT_LEGS=""
+[[ -n "$rd" ]] && tmpdirs+=("$rd")
+if [[ -n "$rd" ]]; then
+    check "a stalled continuation: only two legs ran" "2" "$(cat "$count_file")"
+    check "a stalled continuation: refresh ends stalled" \
+        "stalled" "$(jq -r '.refresh' "$rd/summary.json" 2>/dev/null)"
+    check "a stalled continuation: its hand-off is kept at handoff-stalled-2.md" \
+        "HANDOFF from leg 2" "$(cat "$rd/handoff-stalled-2.md" 2>/dev/null)"
+    check "a stalled continuation: no third leg's record exists" \
+        "no" "$([[ -f "$rd/handoff-2.md" ]] && echo yes || echo no)"
+fi
+
+# -- leg 1 (the implement leg) hands off without committing: leg 1 is
+# exempt from the stall check (a survey leg may legitimately hand off
+# without committing once), so a second leg still runs from it.
+count_file="$(mktemp)"; tmpdirs+=("$count_file")
+FAKE_NOCOMMIT_LEGS=1
+rd="$(run_real "$proj" "$count_file" 1 1 --refresh-at 0.5)"
+FAKE_NOCOMMIT_LEGS=""
+[[ -n "$rd" ]] && tmpdirs+=("$rd")
+if [[ -n "$rd" ]]; then
+    check "leg 1 hands off without committing: leg 2 still runs" \
+        "2" "$(cat "$count_file")"
+    check "leg 1 hands off without committing: not treated as a stall" \
+        "empty-outbox" "$(jq -r '.refresh' "$rd/summary.json" 2>/dev/null)"
 fi
 
 # -- --refresh-at 0: never nudges, never binds an outbox, so even a stub

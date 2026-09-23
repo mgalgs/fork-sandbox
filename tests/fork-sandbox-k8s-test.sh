@@ -9444,6 +9444,15 @@ refresh_block_run() {
     home="$(newdir)"; tmpdirs+=("$home")
     rec="$(newdir)"; tmpdirs+=("$rec")
     mkdir -p "$RB_WORK/inbox" "$RB_WORK/session-store" "$RB_WORK/outbox" "$RB_WORK/clone"
+    # A real (tiny) git repo, not just a directory: the stall-stop check
+    # reads the branch head with `git -C "$clone_dir" rev-parse HEAD`, and
+    # the stub below commits into it by default on a leg that hands off,
+    # the same "a leg that hands off has almost always committed
+    # something" rule the local runner's own stub fixture uses.
+    (cd "$RB_WORK/clone" && git init -q . \
+        && GIT_AUTHOR_NAME=rb-stub GIT_AUTHOR_EMAIL=rb-stub@fork-sandbox.invalid \
+           GIT_COMMITTER_NAME=rb-stub GIT_COMMITTER_EMAIL=rb-stub@fork-sandbox.invalid \
+           git commit -q --allow-empty -m init) >/dev/null 2>&1
     printf 'Do the thing.\n' > "$mounts/handoff.md"
     printf 'ORIGINAL BRIEF\n' > "$mounts/handoff-original.md"
     printf 'CONTINUATION HEADER\n' > "$mounts/continuation-header.md"
@@ -9463,6 +9472,12 @@ refresh_block_run() {
         'echo "{}" > "$HOME/.claude/projects/-stub-slug/leg-$n.jsonl"' \
         'touch -d "@$((1700000000 + n))" "$HOME/.claude/projects/-stub-slug/leg-$n.jsonl"' \
         'if [[ " $RB_HANDOFF_LEGS " == *" $n "* ]]; then' \
+        '  if [[ -n "$RB_CLONE" ]] && [[ " ${RB_NOCOMMIT_LEGS:-} " != *" $n "* ]]; then' \
+        '    ( cd "$RB_CLONE" && echo "leg $n" >> progress.txt && git add progress.txt \' \
+        '      && GIT_AUTHOR_NAME=rb-stub GIT_AUTHOR_EMAIL=rb-stub@fork-sandbox.invalid \' \
+        '      GIT_COMMITTER_NAME=rb-stub GIT_COMMITTER_EMAIL=rb-stub@fork-sandbox.invalid \' \
+        '      git commit -q -m "leg $n" ) >/dev/null 2>&1' \
+        '  fi' \
         '  echo "handoff written by leg $n" > "$RB_OUTBOX/handoff.md"' \
         '  echo "{\"stderr\":\"fork-sandbox-refresh: nudged\"}"' \
         'fi' \
@@ -9480,9 +9495,10 @@ refresh_block_run() {
         inbox_dir="$RB_WORK/inbox" outbox_dir="$RB_WORK/outbox" \
         session_store_dir="$RB_WORK/session-store" SESSION_HARNESS_STORE=1 \
         RESUME_SESSION="${5:-}" REFRESH_THRESHOLD_TOKENS="${1:-}" REFRESH_MAX="${4:-6}" \
-        RB_REC="$rec" RB_OUTBOX="$RB_WORK/outbox" \
+        RB_REC="$rec" RB_OUTBOX="$RB_WORK/outbox" RB_CLONE="$RB_WORK/clone" \
         RB_HANDOFF_LEGS="${2:-}" RB_FAIL_LEGS="${3:-}" \
         RB_ADDENDUM_LEGS="${RB_ADDENDUM_LEGS:-}" \
+        RB_NOCOMMIT_LEGS="${RB_NOCOMMIT_LEGS:-}" \
         bash "$refresh_block_file" 2>&1)"
     RB_RC="$(grep -o 'CLAUDE_BLOCK_PI_RC=.*' <<<"$RB_OUT" | tail -1 | cut -d= -f2)"
     RB_CALLS="$(cat "$rec/count" 2>/dev/null || echo 0)"
@@ -9640,6 +9656,33 @@ else
     no "REFRESH_MAX=1 with hand-offs on legs 1 and 2: two legs, ended cap" \
         "calls=$RB_CALLS out=$RB_OUT"
 fi
+
+# A stall: leg 2 (the first continuation) hands off without committing.
+# The chain ends rather than forking a third leg from it, and the stalled
+# hand-off is kept as its own record.
+RB_NOCOMMIT_LEGS="2" refresh_block_run 100000 "1 2" "" 6
+if [[ "$RB_CALLS" == 2 ]] \
+    && [[ "$(jq -r .ended "$RB_WORK/refresh.json")" == stalled ]] \
+    && [[ "$(cat "$RB_WORK/handoff-stalled-2.md" 2>/dev/null)" == "handoff written by leg 2" ]] \
+    && [[ ! -e "$RB_WORK/handoff-2.md" ]]; then
+    ok "a continuation that hands off without committing: two legs, ended stalled"
+else
+    no "a continuation that hands off without committing: two legs, ended stalled" \
+        "calls=$RB_CALLS out=$RB_OUT ended=$(jq -r .ended "$RB_WORK/refresh.json" 2>/dev/null)"
+fi
+RB_NOCOMMIT_LEGS=""
+
+# Leg 1 (the coding leg) is exempt from the stall check: a hand-off it
+# writes without committing still starts a second leg.
+RB_NOCOMMIT_LEGS="1" refresh_block_run 100000 "1" "" 6
+if [[ "$RB_CALLS" == 2 ]] \
+    && [[ "$(jq -r .ended "$RB_WORK/refresh.json")" == empty-outbox ]]; then
+    ok "leg 1 hands off without committing: not a stall, leg 2 still runs"
+else
+    no "leg 1 hands off without committing: not a stall, leg 2 still runs" \
+        "calls=$RB_CALLS out=$RB_OUT ended=$(jq -r .ended "$RB_WORK/refresh.json" 2>/dev/null)"
+fi
+RB_NOCOMMIT_LEGS=""
 
 # A continuation that crashes ends the loop with leg-error, pi_rc is its
 # exit, and a hand-off it left behind is kept in /work, not the outbox.

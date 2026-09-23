@@ -1631,7 +1631,8 @@ the last continuation's transcript.
 `events-continuation-N.jsonl`, `claude-stderr-continuation-N.log`,
 `refresh.json` and `refresh.log` into the evidence directory, and
 `summary.json` gains `refresh` (`none`, `empty-outbox`, `cap`,
-`no-handoff` or `leg-error`) and `continuations` (leg, exit, handoff,
+`no-handoff`, `leg-error` or `stalled` -- a continuation leg, other than
+the first, left a hand-off without moving the branch) and `continuations` (leg, exit, handoff,
 handoff_stale). A run with refresh disabled reports `none` and `[]`; an
 enabled run whose `refresh.json` did not come back leaves both keys absent
 and warns. There is no per-continuation cost: k8s runs measure none.

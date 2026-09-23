@@ -76,6 +76,21 @@ fs_refresh_handoff_stale() {
     [[ -f "$1/.git/logs/HEAD" && "$1/.git/logs/HEAD" -nt "$2" ]]
 }
 
+# True iff a CONTINUATION leg's hand-off is a stall: the leg number that
+# wrote it is >= 2 (leg 1, the first coding leg, may legitimately hand off
+# without committing once -- a survey leg), both heads are non-empty, and
+# they are equal, meaning the leg that just ran left a hand-off without
+# moving the branch. $1 the leg number that wrote the waiting hand-off, $2
+# the branch head read just before that leg ran, $3 the branch head read
+# now. Pure: no git, no I/O.
+fs_refresh_is_stall() {
+    local leg_no="$1" head_before="$2" head_now="$3"
+    [[ "$leg_no" =~ ^[0-9]+$ ]] || return 1
+    (( leg_no >= 2 )) || return 1
+    [[ -n "$head_before" && -n "$head_now" ]] || return 1
+    [[ "$head_before" == "$head_now" ]]
+}
+
 # Every addendum archived out of an earlier leg, oldest first, one line per
 # inbox-delivered leg directory. Sorted by leg number, not directory name:
 # "leg-10" must not sort before "leg-2". $1 record dir.

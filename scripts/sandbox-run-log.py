@@ -124,8 +124,12 @@ claude harness):
                  whether or not any continuation ran), `cap` (--refresh-max
                  legs ran and a hand-off was still waiting), `no-handoff`
                  (a leg was nudged and ended its turn without writing one),
-                 or `leg-error` (a continuation leg exited non-zero -- a
-                 crash, not an ordinary ending; see `continuations[].exit`).
+                 `leg-error` (a continuation leg exited non-zero -- a crash,
+                 not an ordinary ending; see `continuations[].exit`), or
+                 `stalled` (a continuation leg, other than the first, left a
+                 hand-off without moving the branch -- the chain ends
+                 rather than chasing a leg that is not making progress; see
+                 `handoff-stalled-N.md` in the run record).
                  Present on every claude run made after this field existed,
                  even one that never came near its threshold -- readers
                  comparing against `none` do not also need to check for a
