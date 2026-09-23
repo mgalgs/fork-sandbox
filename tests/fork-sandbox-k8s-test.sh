@@ -3643,56 +3643,12 @@ refresh_key_body() {
         on && /^---$/ { exit }
         on { sub(/^    /, ""); print }' <<< "$2"
 }
+# Compared modulo trailing newlines (command substitution): the key is clip-chomped.
 check "claude default: handoff-original.md is the operator handoff" \
     "$(cat "$handoff_file")" "$(refresh_key_body handoff-original.md "$refresh_default_out")"
 check "claude default: handoff.md is header + separator + operator handoff" \
     "$(refresh_key_body continuation-header.md "$refresh_default_out")"$'\n\n---\n\n'"$(cat "$handoff_file")" \
     "$(refresh_key_body handoff.md "$refresh_default_out")"
-# Byte equality, not command-substitution equality: decode the key the way a
-# YAML loader does (strip the 4-column indent, apply the chomping indicator)
-# and cmp it against the file, for a handoff with no final newline, one, and
-# several.
-refresh_key_bytes() {
-    awk -v k="  $1: " '
-        index($0, k) == 1 && !on { on = 1; mode = substr($0, length(k) + 1); next }
-        on && /^  [a-z][a-z.-]*: / { exit }
-        on && /^---$/ { exit }
-        on { sub(/^    /, ""); lines[++n] = $0 }
-        END {
-            while (n > 0 && lines[n] == "") { n--; blanks++ }
-            for (i = 1; i <= n; i++) printf "%s%s", lines[i], (i < n ? "\n" : "")
-            if (mode == "|-") tail = 0
-            else if (mode == "|") tail = 1
-            else tail = 1 + blanks
-            if (n == 0) tail = 0
-            for (i = 0; i < tail; i++) printf "\n"
-        }' <<< "$2"
-}
-for refresh_tail in none one three; do
-    refresh_tail_file="$(newdir)/handoff-$refresh_tail.md"; tmpdirs+=("$(dirname "$refresh_tail_file")")
-    case "$refresh_tail" in
-        none) printf 'do the task\n\nsecond paragraph' > "$refresh_tail_file" ;;
-        one) printf 'do the task\n\nsecond paragraph\n' > "$refresh_tail_file" ;;
-        three) printf 'do the task\n\nsecond paragraph\n\n\n' > "$refresh_tail_file" ;;
-    esac
-    refresh_tail_out="$(HOME="$claude_home" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
-        --branch fs-k8s-test-branch --model claude-sonnet-5 --harness claude \
-        "$proj_dir" "$refresh_tail_file" 2>&1)"
-    refresh_tail_got="$(newdir)/got-$refresh_tail"; tmpdirs+=("$(dirname "$refresh_tail_got")")
-    refresh_key_bytes handoff-original.md "$refresh_tail_out" > "$refresh_tail_got"
-    if cmp -s "$refresh_tail_file" "$refresh_tail_got"; then
-        ok "claude refresh: handoff-original.md is byte-exact ($refresh_tail final newlines)"
-    else
-        no "claude refresh: handoff-original.md is byte-exact ($refresh_tail final newlines)" \
-            "want $(od -c "$refresh_tail_file" | tail -3) got $(od -c "$refresh_tail_got" | tail -3)"
-    fi
-    if [[ "$refresh_tail" == three ]] && command -v yamllint >/dev/null 2>&1; then
-        printf '%s\n' "$refresh_tail_out" > "$refresh_tail_got.yaml"
-        out="$(yamllint -d "{extends: default, rules: {line-length: disable, empty-lines: disable}}" "$refresh_tail_got.yaml" 2>&1)"
-        if [[ -z "$out" ]]; then ok "yamllint: refresh render with trailing blank lines in the handoff"
-        else no "yamllint: refresh render with trailing blank lines in the handoff" "$out"; fi
-    fi
-done
 if command -v yamllint >/dev/null 2>&1; then
     refresh_yaml="$(newdir)/refresh.yaml"; tmpdirs+=("$(dirname "$refresh_yaml")")
     printf '%s\n' "$refresh_default_out" > "$refresh_yaml"
