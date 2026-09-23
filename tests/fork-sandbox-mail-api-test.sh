@@ -6,13 +6,17 @@
 #
 # Starts the server on 127.0.0.1 with an ephemeral port, a temp
 # FORK_SANDBOX_MAIL_ROOT (the postmaster's state lives under it) and a tokens
-# file made with `mint`. Requests go through a small raw HTTP helper. No
+# file made with `mint`. It is driven through the real client shim
+# (`fork-sandbox mail --remote ...`) wherever the shim can express the case,
+# and through a small raw HTTP helper for the malformed-request cases. No
 # cluster, no network beyond loopback. The server is killed on exit.
 
 set -uo pipefail
 
 repo_dir="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 mail="$repo_dir/scripts/fork-sandbox-mail.sh"
+pm="$repo_dir/scripts/fork-sandbox-postmaster.sh"
+disp="$repo_dir/scripts/fork-sandbox"
 api="$repo_dir/scripts/fork-sandbox-mail-api.py"
 
 pass=0
@@ -415,6 +419,137 @@ for i in $(seq 17); do many_argv+=(--attach "f$i"); done
 check "17 attachments: 413" "413" \
     "$(xr "$tok/ci-kickoff" --tool mail --stdin hi "${many_files[@]}" -- "${many_argv[@]}")"
 
+printf '== 2. the client shim: send with a body file and an attachment ==\n'
+
+# One shim call as one identity. The URL and token file come from the
+# environment, as in CI.
+as_() {
+    local who="$1"; shift
+    FORK_SANDBOX_MAIL_API_URL="http://$listen" \
+        FORK_SANDBOX_MAIL_API_TOKEN_FILE="$tok/$who" "$disp" "$@"
+}
+
+printf 'line one\nBODY-SENTINEL-4471\n\nlast line, no newline' > "$work/body.txt"
+printf 'a\0b\377\n---\r\nPATCH-SENTINEL\n' > "$work/patch.diff"
+tid="$(as_ ci-kickoff mail --remote send --from @ci-kickoff --to @reviewer \
+    --subject "kickoff" --body "$work/body.txt" --attach "$work/patch.diff" 2>"$work/send.err")"
+rc=$?
+check "shim send: rc 0" "0" "$rc"
+check "shim send: the thread id is on stdout" "1" "$([[ "$tid" =~ ^[0-9a-f][0-9a-f-]{7,63}$ ]] && echo 1 || echo 0)"
+contains "shim send: the local 'sent' line is on stderr" "$(cat "$work/send.err")" "sent"
+shown="$("$mail" show "$tid")"
+contains "the local mail show has the body" "$shown" "BODY-SENTINEL-4471"
+contains "the local mail show has the sender" "$shown" "From: @ci-kickoff"
+check "the attachment is byte-exact" "0" \
+    "$(cmp -s "$work/patch.diff" "$FORK_SANDBOX_MAIL_ROOT/threads/$tid/attachments/patch.diff"; echo $?)"
+body_out="$("$mail" export "$tid" --json | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["messages"][0]["body"]))')"
+check "the stored body is the file, verbatim" \
+    "$(python3 -c 'import json,sys; print(json.dumps(open(sys.argv[1]).read()))' "$work/body.txt")" "$body_out"
+
+tid2="$(printf 'from stdin\n' | as_ ci-kickoff mail --remote send --from @ci-kickoff --to @reviewer --subject "two" --body - 2>/dev/null)"
+check "shim send with --body -: stdin is the body" "1" \
+    "$([[ "$("$mail" show "$tid2")" == *'from stdin'* ]] && echo 1 || echo 0)"
+reply_out="$(printf 'a reply\n' | as_ ci-kickoff mail --remote reply --from @ci-kickoff --reply-to "$tid" --body - 2>&1)"
+check "shim reply: rc 0" "0" "$?"
+contains "shim reply: the reply landed in the thread" "$("$mail" tree "$tid")" "@ci-kickoff"
+lacks "shim reply: no error text" "$reply_out" "Error"
+
+printf '== shim: exit codes, refusals and config ==\n'
+
+head -c 5242880 /dev/zero > "$work/big.bin"
+as_ ci-kickoff mail --remote send --from @ci-kickoff --to @reviewer --subject big \
+    --body "$work/body.txt" --attach "$work/big.bin" > /dev/null 2> "$work/err"
+check "shim: an oversize upload exits 2" "2" "$?"
+contains "shim: an oversize upload prints the HTTP line" "$(cat "$work/err")" "fork-sandbox mail --remote: HTTP 413:"
+
+mkdir -p "$work/other"; cp "$work/patch.diff" "$work/other/patch.diff"
+threads_before="$(find "$FORK_SANDBOX_MAIL_ROOT/threads" -mindepth 1 -maxdepth 1 | wc -l)"
+as_ ci-kickoff mail --remote send --from @ci-kickoff --to @reviewer --subject dup \
+    --body "$work/body.txt" --attach "$work/patch.diff" --attach "$work/other/patch.diff" > /dev/null 2> "$work/err"
+check "shim: two attachments with one basename: rc 2" "2" "$?"
+contains "shim: ... refused locally, naming the basename" "$(cat "$work/err")" "patch.diff"
+check "shim: ... and nothing was sent" "$threads_before" "$(find "$FORK_SANDBOX_MAIL_ROOT/threads" -mindepth 1 -maxdepth 1 | wc -l)"
+
+as_ ci-kickoff mail --remote send --from @ci-kickoff --to @reviewer --subject s \
+    --body "$work/no-such-file" > "$work/out" 2> "$work/err"
+shim_rc=$?
+"$mail" send --from @ci-kickoff --to @reviewer --subject s --body "$work/no-such-file" > "$work/lout" 2> "$work/lerr"
+local_rc=$?
+check "shim: a missing body file has the local rc" "$local_rc" "$shim_rc"
+check "shim: a missing body file has the local message" "$(cat "$work/lerr")" "$(cat "$work/err")"
+
+as_ ci-kickoff mail --remote send --from @operator --to @x --subject s --body - <<< hi > "$work/out" 2> "$work/err"
+check "shim: a 403 exits 2" "2" "$?"
+check "shim: a 403 prints one HTTP line" "1" "$(wc -l < "$work/err")"
+contains "shim: a 403 names the code" "$(cat "$work/err")" "fork-sandbox mail --remote: HTTP 403: "
+check "shim: a 403 prints nothing on stdout" "0" "$(wc -c < "$work/out")"
+
+as_ wrong mail --remote list > /dev/null 2> "$work/err"
+check "shim: a wrong token exits 2" "2" "$?"
+check "shim: a wrong token: the message" "fork-sandbox mail --remote: HTTP 401: missing or bad token" "$(cat "$work/err")"
+as_ ci-kickoff postmaster --remote flag "$tid" > /dev/null 2> "$work/err"
+check "shim: postmaster flag as a client exits 2" "2" "$?"
+contains "shim: postmaster flag as a client: the message" "$(cat "$work/err")" "fork-sandbox postmaster --remote: HTTP 403: "
+as_ laptop postmaster --remote flag "$tid" "by shim" > /dev/null 2>&1
+check "shim: postmaster flag as the operator: rc 0" "0" "$?"
+check "shim: ... and the flag file is there" "by shim" "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid")"
+as_ laptop postmaster --remote unflag "$tid" > /dev/null 2>&1
+check "shim: postmaster unflag as the operator: rc 0" "0" "$?"
+
+FORK_SANDBOX_MAIL_API_URL="http://127.0.0.1:1" FORK_SANDBOX_MAIL_API_TOKEN_FILE="$tok/laptop" \
+    "$disp" mail --remote list > /dev/null 2> "$work/err"
+check "shim: a connection failure exits 2" "2" "$?"
+check "shim: a connection failure is one line" "1" "$(wc -l < "$work/err")"
+contains "shim: a connection failure names the tool" "$(cat "$work/err")" "fork-sandbox mail --remote: cannot reach http://127.0.0.1:1"
+
+check "shim: an http proxy in the environment is ignored" "0" \
+    "$(http_proxy=http://127.0.0.1:1 HTTP_PROXY=http://127.0.0.1:1 as_ laptop mail --remote list > /dev/null 2>&1; echo $?)"
+
+# Config: the environment first, else k8s.env; never sourced.
+# shellcheck disable=SC2016  # the $( ) is the point: it must stay literal
+printf 'K8S_MAIL_API_URL=http://%s\nK8S_MAIL_API_TOKEN_FILE=%s\nK8S_OTHER=$(touch %s/sourced)\n' \
+    "$listen" "$tok/laptop" "$work" > "$FORK_SANDBOX_CONFIG_DIR/k8s.env"
+check "shim: config from k8s.env" "0" "$("$disp" mail --remote list > /dev/null 2>&1; echo $?)"
+check "shim: k8s.env is not sourced" "0" "$([[ -e "$work/sourced" ]] && echo 1 || echo 0)"
+check "shim: the environment beats k8s.env" "2" \
+    "$(FORK_SANDBOX_MAIL_API_TOKEN_FILE="$tok/wrong" "$disp" mail --remote list > /dev/null 2>&1; echo $?)"
+rm -f "$FORK_SANDBOX_CONFIG_DIR/k8s.env"
+
+"$disp" mail --remote list > /dev/null 2> "$work/err"
+check "shim: no URL exits 2" "2" "$?"
+contains "shim: no URL names FORK_SANDBOX_MAIL_API_URL" "$(cat "$work/err")" "FORK_SANDBOX_MAIL_API_URL"
+contains "shim: no URL names K8S_MAIL_API_URL" "$(cat "$work/err")" "K8S_MAIL_API_URL"
+check "shim: no URL is one line" "1" "$(wc -l < "$work/err")"
+FORK_SANDBOX_MAIL_API_URL="http://$listen" "$disp" mail --remote list > /dev/null 2> "$work/err"
+check "shim: no token file exits 2" "2" "$?"
+contains "shim: no token file names FORK_SANDBOX_MAIL_API_TOKEN_FILE" "$(cat "$work/err")" "FORK_SANDBOX_MAIL_API_TOKEN_FILE"
+contains "shim: no token file names K8S_MAIL_API_TOKEN_FILE" "$(cat "$work/err")" "K8S_MAIL_API_TOKEN_FILE"
+: > "$work/empty-token"
+FORK_SANDBOX_MAIL_API_URL="http://$listen" FORK_SANDBOX_MAIL_API_TOKEN_FILE="$work/empty-token" \
+    "$disp" mail --remote list > /dev/null 2> "$work/err"
+check "shim: an empty token file exits 2" "2" "$?"
+FORK_SANDBOX_MAIL_API_URL="http://$listen" FORK_SANDBOX_MAIL_API_TOKEN_FILE="$work/missing-token" \
+    "$disp" mail --remote list > /dev/null 2> "$work/err"
+check "shim: an unreadable token file exits 2" "2" "$?"
+
+# --remote is checked before a local store or local state is made, and it is
+# only special as the first argument.
+none_root="$work/no-local-root"
+FORK_SANDBOX_MAIL_ROOT="$none_root" "$disp" mail --remote list > /dev/null 2>&1
+check "shim: mail --remote makes no local store" "0" "$([[ -e "$none_root" ]] && echo 1 || echo 0)"
+FORK_SANDBOX_MAIL_ROOT="$none_root" "$disp" postmaster --remote status > /dev/null 2>&1
+check "shim: postmaster --remote makes no local state" "0" "$([[ -e "$none_root" ]] && echo 1 || echo 0)"
+out="$(FORK_SANDBOX_MAIL_API_URL="http://127.0.0.1:1" FORK_SANDBOX_MAIL_API_TOKEN_FILE="$tok/laptop" \
+    "$mail" show --remote 2>&1)"
+lacks "shim: --remote after the verb is not special" "$out" "cannot reach"
+out="$(as_ laptop mail --remote --help 2>&1)"; rc=$?
+check "shim: --remote --help prints the client usage" "0" "$rc"
+contains "shim: --remote --help names the tool" "$out" "mail|postmaster"
+check "shim: the scripts run --remote directly too (mail)" "0" \
+    "$(FORK_SANDBOX_MAIL_API_URL="http://$listen" FORK_SANDBOX_MAIL_API_TOKEN_FILE="$tok/laptop" "$mail" --remote list > /dev/null 2>&1; echo $?)"
+check "shim: the scripts run --remote directly too (postmaster)" "0" \
+    "$(FORK_SANDBOX_MAIL_API_URL="http://$listen" FORK_SANDBOX_MAIL_API_TOKEN_FILE="$tok/laptop" "$pm" --remote status > /dev/null 2>&1; echo $?)"
+
 printf '== 13. the log ==\n'
 
 sleep 0.2
@@ -425,6 +560,9 @@ for t in "$tok/laptop" "$tok/ci-kickoff" "$tok/bot" "$tok/reader"; do
 done
 check "the log holds no token" "0" "$leaked"
 lacks "the log holds no body string" "$log_text" "/etc/passwd"
+lacks "the log holds no shim body string" "$log_text" "BODY-SENTINEL-4471"
+lacks "the log holds no attachment name" "$log_text" "patch.diff"
+lacks "the log holds no attachment content" "$log_text" "PATCH-SENTINEL"
 lacks "the log holds no argv value" "$log_text" "stuck on CI"
 contains "the log has a line with the label, tool, verb and status" "$log_text" " ci-kickoff mail send 200 rc=0"
 contains "the log has the operator's flag call" "$log_text" " laptop postmaster flag 200 rc=0"

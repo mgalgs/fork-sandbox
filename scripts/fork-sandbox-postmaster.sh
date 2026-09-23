@@ -8,6 +8,13 @@
 #        fork-sandbox-postmaster.sh status --thread <thread-id> --json
 #        fork-sandbox-postmaster.sh flag <thread-id> [reason]
 #        fork-sandbox-postmaster.sh unflag <thread-id>
+#        fork-sandbox-postmaster.sh --remote <status|flag|unflag> ...
+#
+# `--remote` as the first argument runs status/flag/unflag against the mail
+# API server (fork-sandbox-mail-api.py) instead of this host's state, with the
+# same arguments and exit code; it needs FORK_SANDBOX_MAIL_API_URL and
+# FORK_SANDBOX_MAIL_API_TOKEN_FILE (see docs/mail-api.md). Anywhere else in
+# the arguments it is not special.
 #
 # deliver scans fork-sandbox-mail.sh's store for unrouted messages, routes
 # each one (see ROUTING RULES below), spawns a fork-sandbox.sh run per
@@ -773,6 +780,16 @@ usage() {
 }
 
 script_dir="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+
+# --remote runs the verb against the mail API server instead of this host's
+# state (see fork-sandbox-mail-remote.py). It comes before anything is
+# sourced or created: a remote client needs no GNU tools and has no local
+# state.
+if [[ "${1-}" == "--remote" ]]; then
+    shift
+    exec "$script_dir/fork-sandbox-mail-remote.py" postmaster "$@"
+fi
+
 MAIL="$script_dir/fork-sandbox-mail.sh"
 FLEET="$script_dir/fork-sandbox-fleet.sh"
 MAIL_RENDER="$script_dir/fork-sandbox-mail-render.py"

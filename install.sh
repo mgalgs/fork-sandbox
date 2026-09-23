@@ -298,6 +298,7 @@ PORCELAIN=(
     fork-sandbox
     fork-sandbox-fleet.sh
     fork-sandbox-k8s.sh
+    fork-sandbox-mail-api.py
     fork-sandbox-mail-render.py
     fork-sandbox-mail.sh
     fork-sandbox-postmaster.sh
@@ -326,6 +327,7 @@ PLUMBING=(
     fork-sandbox-k8s-review-loop.sh
     fork-sandbox-k8s-services-parse.py
     fork-sandbox-lib.sh
+    fork-sandbox-mail-remote.py
     fork-sandbox-preset-parse.py
     fork-sandbox-refresh.sh
     sandbox-backend-bwrap

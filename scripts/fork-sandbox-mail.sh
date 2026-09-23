@@ -22,6 +22,13 @@
 #                              [--reach-probe HOST:PORT]... [--context-ro DIR]
 #        fork-sandbox-mail.sh grant <thread-id> --clear
 #        fork-sandbox-mail.sh grant <thread-id> --show [--json]
+#        fork-sandbox-mail.sh --remote <verb> ...
+#
+# `--remote` as the first argument runs the verb against the mail API server
+# (fork-sandbox-mail-api.py) instead of the local store, with the same
+# arguments and the same exit code; it needs FORK_SANDBOX_MAIL_API_URL and
+# FORK_SANDBOX_MAIL_API_TOKEN_FILE (see docs/mail-api.md). Anywhere else in
+# the arguments it is not special.
 #
 # `export <thread-id> --json` prints one thread as a JSON object (every
 # header line, the verbatim body, attachment sizes, per-sender counts) for
@@ -1073,6 +1080,14 @@ cmd_seen() {
         fi
     done
 }
+
+# --remote runs the verb against the mail API server instead of this host's
+# store (see fork-sandbox-mail-remote.py). It is checked before the local
+# store dir is made: a remote client has no store of its own.
+if [[ "${1-}" == "--remote" ]]; then
+    shift
+    exec "$script_dir/fork-sandbox-mail-remote.py" mail "$@"
+fi
 
 mkdir -p -- "$MAIL_ROOT"
 
