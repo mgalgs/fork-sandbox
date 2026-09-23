@@ -41,18 +41,32 @@
 #   harvest      agent, thread, replies=<count posted this pass>
 #   flag         thread, reason=<fixed keyword> (no agent -- a thread-level
 #                condition, not a per-agent one; see pm_flag_keyword)
-#   refuse       agent, thread, reason=hops|budget -- an agent's wake was
-#                refused (X-Hops or thread-budget gate); the thread itself
-#                is also separately flag'd. At route-pass time (a message
-#                the gate refuses wholesale) this only names To: candidates
-#                -- Cc resolution (wake-on-cc, triage) is skipped outright
-#                for that message, so there is no per-agent decision left
-#                to report one for. But the same gate is re-checked at
-#                follow-up-wake time for a message pending on a live run
-#                (pm_followup_wake), against whichever agent owns that run
-#                -- and that agent can be one who was originally woken via
-#                Cc, so a Cc-woken seat's follow-up can still produce a
-#                refuse line.
+#   refuse       agent, thread, reason=hops|budget|no-grant -- an agent's
+#                wake was refused (X-Hops or thread-budget gate, or a
+#                `backend: k8s` seat with `grant: required` and no grant
+#                file yet for this thread -- see "Cluster seats" below);
+#                the thread itself is also separately flag'd for hops and
+#                budget (keyword hops-exhausted/budget-exhausted), and for
+#                a NEW or superseded no-grant hold (keyword no-grant; a
+#                repeat check of the same hold emits this event again but
+#                does not re-flag). At route-pass time (a message the
+#                hops/budget gate refuses wholesale) this only names To:
+#                candidates -- Cc resolution (wake-on-cc, triage) is
+#                skipped outright for that message, so there is no
+#                per-agent decision left to report one for. But the same
+#                gate is re-checked at follow-up-wake time for a message
+#                pending on a live run (pm_followup_wake), against
+#                whichever agent owns that run -- and that agent can be one
+#                who was originally woken via Cc, so a Cc-woken seat's
+#                follow-up can still produce a refuse line. reason=no-grant
+#                fires from pm_spawn_wake itself, not pm_followup_wake --
+#                see "Cluster seats" below.
+#   held-release thread, agent, trigger=<short-id> -- a held `backend: k8s`
+#                seat (reason=no-grant above) was released by pm_held_pass:
+#                its grant file showed up, or its seat stopped resolving
+#                `grant: required` at all. The held record is deleted and
+#                trigger's wake is re-dispatched via pm_followup_wake in
+#                the same pass.
 #   triage-skip  agent, thread -- the Cc triage classifier skipped this
 #                candidate for this message
 #   handler      agent, thread, exit=<status> -- a handler seat's wake ran
@@ -1319,6 +1333,7 @@ pm_flag_keyword() {
         "wake never produced summary.json"*) printf 'no-summary' ;;
         "wake for"*"exited"*) printf 'wake-exit' ;;
         "wake for"*"failed after"*"retries"*) printf 'retry-exhausted' ;;
+        "no grant for k8s seat"*) printf 'no-grant' ;;
         *) printf 'other' ;;
     esac
 }
@@ -1579,6 +1594,28 @@ pm_parse_retry_backoff() {
 # schedule) every retry for the life of this deliver process.
 pm_require_retry_backoff() {
     pm_parse_retry_backoff
+}
+
+# Validates $FORK_SANDBOX_POSTMASTER_K8S_TIMEOUT, the --timeout a k8s
+# wake's spawn_args passes to fork-sandbox.sh --k8s. Unset or empty is
+# legal -- pm_spawn_wake's own "${FORK_SANDBOX_POSTMASTER_K8S_TIMEOUT:-14400}"
+# substitution supplies the default (14400s = 4h) at spawn time -- but a
+# value that IS set must be a positive integer of seconds; a malformed one
+# is a config error, reported here, once, rather than left for every k8s
+# spawn to pass a bad --timeout to fork-sandbox.sh one at a time.
+pm_parse_k8s_timeout() {
+    local raw="${FORK_SANDBOX_POSTMASTER_K8S_TIMEOUT-}"
+    [[ -z "$raw" ]] && return 0
+    if [[ ! "$raw" =~ ^[1-9][0-9]*$ ]]; then
+        echo "Error: postmaster: \$FORK_SANDBOX_POSTMASTER_K8S_TIMEOUT '$raw' is not a positive integer (seconds)." >&2
+        return 1
+    fi
+    return 0
+}
+
+# Startup gate, same posture as pm_require_retry_backoff above.
+pm_require_k8s_timeout() {
+    pm_parse_k8s_timeout
 }
 
 pm_write_handoff() {
@@ -1977,10 +2014,28 @@ pm_exec_wake() {
     printf '%s\n' "$run_id" >> "$SEQ/$tid"
 }
 
+# Atomic tmp+mv write of one held-seat record, $STATE/held/<tid>/<agent> --
+# see the pm_spawn_wake hold check and pm_held_pass, and the "held/" read
+# contract in docs/agent-mail.md. Same full-file mktemp+mv idiom as
+# pm_retry_raw_write: an external reader (`status`, pm_held_pass itself on
+# a later pass) must never see a partial write.
+pm_held_write() {
+    local tid="$1" agent="$2" trigger="$3" since="$4" retry="$5"
+    mkdir -p -- "$STATE/held/$tid"
+    local tmp
+    tmp="$(mktemp "$STATE/held/$tid/.tmp.XXXXXX")"
+    {
+        printf 'TRIGGER=%s\n' "$trigger"
+        printf 'SINCE=%s\n' "$since"
+        printf 'RETRY=%s\n' "$retry"
+    } > "$tmp"
+    mv -- "$tmp" "$STATE/held/$tid/$agent"
+}
+
 pm_spawn_wake() {
     local project="$1" agent="$2" tid="$3" mid="$4" is_retry="${5:-}"
     local harness model thinking network persona_path description wake_on_cc \
-          refresh_at triage preset handler command
+          refresh_at triage preset handler command backend endpoint grant
     # description and wake_on_cc (resolve's 6th and 7th lines) are read to
     # keep resolve's line contract explicit even though neither is needed
     # by a wake -- wake_on_cc is a routing decision made before a wake is
@@ -1993,11 +2048,21 @@ pm_spawn_wake() {
     # handler/command (11th/12th lines) ARE used: a non-empty handler
     # branches straight to pm_exec_wake, below, before any of the
     # LLM-only spawn_args/session logic that follows.
+    # backend/endpoint/grant (13th/14th/15th lines): an empty or "local"
+    # backend is today's behavior unchanged; "k8s" branches the rest of
+    # this function into the k8s spawn path below (spawn_args, wake dir,
+    # launch) instead of the local fork-sandbox.sh path -- see that
+    # branch's own comments. endpoint is forwarded as --endpoint when set.
+    # grant "required" gates a k8s seat on a per-thread grant file (see
+    # the hold check just below) -- meaningless for a local seat, and
+    # `fleet check` refuses grant/backend/endpoint on anything but a k8s
+    # seat, so this read never has to special-case a local seat carrying
+    # one.
     # shellcheck disable=SC2034
     if ! { read -r harness; read -r model; read -r thinking; read -r network; \
            read -r persona_path; read -r description; read -r wake_on_cc; \
            read -r refresh_at; read -r triage; read -r preset; read -r handler; \
-           read -r command; \
+           read -r command; read -r backend; read -r endpoint; read -r grant; \
          } < <("$FLEET" resolve "$agent" 2>/dev/null); then
         pm_flag "$tid" "seat resolution failed for $agent: $mid"
         return 0
@@ -2029,6 +2094,33 @@ pm_spawn_wake() {
         model="${model:-sonnet}"
     fi
     network="${network:-pinned}"
+
+    # A `backend: k8s` seat with `grant: required` and no grant file yet
+    # for this thread holds here -- before anything else this function
+    # would otherwise do (snapshot, seq, handoff, .env) -- rather than
+    # failing the wake outright: the grant is expected to show up later
+    # (an operator runs `mail grant`), and the message itself has already
+    # routed (Cc triage already ran), so only this one seat waits, not the
+    # whole message. See pm_held_pass for the release side.
+    if [[ "$backend" == k8s && "$grant" == required ]]; then
+        local grant_file="$MAIL_ROOT/.postmaster/grants/$tid.env"
+        if [[ ! -e "$grant_file" ]]; then
+            local held_file="$STATE/held/$tid/$agent" old_trigger="" since retry_flag=0
+            old_trigger="$(fs_pm_env_get "$held_file" TRIGGER)"
+            if [[ "$old_trigger" == "$mid" ]]; then
+                since="$(fs_pm_env_get "$held_file" SINCE)"
+            else
+                since="$(date +%s)"
+            fi
+            [[ -n "$is_retry" ]] && retry_flag=1
+            pm_held_write "$tid" "$agent" "$mid" "$since" "$retry_flag"
+            pm_event "refuse thread=${tid:0:8} agent=$agent reason=no-grant"
+            if [[ "$old_trigger" != "$mid" ]]; then
+                pm_flag "$tid" "no grant for k8s seat $agent: $mid"
+            fi
+            return 0
+        fi
+    fi
 
     local run_id
     run_id="$(pm_new_uuid)"
@@ -2063,6 +2155,137 @@ pm_spawn_wake() {
         return 0
     fi
 
+    local attach_dir="$MAIL_ROOT/threads/$tid/attachments"
+    local has_attach_dir=0
+    if [[ -d "$attach_dir" && -n "$(find "$attach_dir" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
+        has_attach_dir=1
+    fi
+
+    if [[ "$backend" == k8s ]]; then
+        # A k8s seat spawns via the async wrapper (fork-sandbox-k8s-wake.sh)
+        # instead of fork-sandbox.sh directly: `fork-sandbox.sh --k8s` execs
+        # into fork-sandbox-k8s.sh run, which blocks in the foreground until
+        # the cluster Job ends, so this branch cannot scrape a run-dir line
+        # from a synchronous launch the way the local branch does below --
+        # the wrapper's own wake dir plays that role instead (RUN_DIR below
+        # is the wake dir, not a fork-sandbox.sh run dir). Session
+        # continuity (--session-state/--resume-session/--session-id/
+        # --clone-dir/--refresh-at) and --preset are dropped outright:
+        # fork-sandbox.sh refuses the first four with --k8s, and `fleet
+        # check` never lets a k8s seat carry a preset -- seat continuity on
+        # k8s is later work (see the brief's Out of scope).
+        local -a spawn_args=(--branch "$branch" --harness "$harness" --network "$network")
+        [[ -n "$model" ]] && spawn_args+=(--model "$model")
+        if [[ "$harness" == pi && -n "$thinking" ]]; then
+            spawn_args+=(--pi-args "--thinking $thinking")
+        fi
+        (( has_attach_dir )) && spawn_args+=(--attach-dir "$attach_dir")
+        [[ "$trigger_only" == 1 ]] && spawn_args+=(--thread-dir "$snap_dir")
+        spawn_args+=(--k8s)
+        [[ -n "$endpoint" ]] && spawn_args+=(--endpoint "$endpoint")
+        spawn_args+=(--timeout "${FORK_SANDBOX_POSTMASTER_K8S_TIMEOUT:-14400}")
+
+        mkdir -p /var/tmp/claude-scratch/forks
+        local wake_dir
+        wake_dir="$(mktemp -d /var/tmp/claude-scratch/forks/pm-k8s-wake.XXXXXX)"
+        spawn_args+=(--outbox-dir "$wake_dir/outbox")
+
+        # Grant flags, forwarded in file order: every ALLOW_NAMESPACE line,
+        # then every REACH_PROBE line (both repeatable, so fs_pm_env_get's
+        # last-match-wins read is the wrong tool -- read every line), then
+        # the single optional CONTEXT_RO line. Forwarded for ANY k8s seat
+        # that has a grant file, `grant: required` or not -- an optional
+        # grant still shapes network/context access when present.
+        local grant_file="$MAIL_ROOT/.postmaster/grants/$tid.env" g_line
+        if [[ -e "$grant_file" ]]; then
+            while IFS= read -r g_line; do
+                spawn_args+=(--allow-namespace "$g_line")
+            done < <(sed -n 's/^ALLOW_NAMESPACE=//p' "$grant_file")
+            while IFS= read -r g_line; do
+                spawn_args+=(--reach-probe "$g_line")
+            done < <(sed -n 's/^REACH_PROBE=//p' "$grant_file")
+            local context_ro
+            context_ro="$(fs_pm_env_get "$grant_file" CONTEXT_RO)"
+            [[ -n "$context_ro" ]] && spawn_args+=(--context-ro "$context_ro")
+        fi
+
+        # fs-argv: element 0 is the launcher itself, then its arguments,
+        # then the two positionals -- exactly what pm_k8s_wake execs.
+        local fs_argv_file="$wake_dir/fs-argv" a
+        : > "$fs_argv_file"
+        printf '%s\0' "$FORK_SANDBOX" >> "$fs_argv_file"
+        for a in "${spawn_args[@]}"; do
+            printf '%s\0' "$a" >> "$fs_argv_file"
+        done
+        printf '%s\0' "$project" >> "$fs_argv_file"
+        printf '%s\0' "$handoff_file" >> "$fs_argv_file"
+
+        # env: PATH, HOME, and every currently-exported FORK_SANDBOX_*
+        # variable -- the tmux server --detach starts under does not
+        # inherit this process's environment, so settings like
+        # FORK_SANDBOX_CONFIG_DIR must be re-supplied explicitly.
+        local env_file="$wake_dir/env" k
+        : > "$env_file"
+        printf 'PATH=%s\0' "$PATH" >> "$env_file"
+        printf 'HOME=%s\0' "$HOME" >> "$env_file"
+        while IFS= read -r k; do
+            [[ -n "$k" ]] || continue
+            printf '%s=%s\0' "$k" "${!k}" >> "$env_file"
+        done < <(compgen -e | grep '^FORK_SANDBOX_' || true)
+
+        local pm_k8s_wake="$script_dir/fork-sandbox-k8s-wake.sh"
+        local rc=0 launch_failed=0
+        set +e
+        if [[ "${FORK_SANDBOX_POSTMASTER_K8S_DETACH:-}" == inline ]]; then
+            # The test seam: this blocks until the whole wake (submit,
+            # wait, collect) finishes, so its own exit code mirrors the
+            # AGENT's eventual outcome (0/1/2, or 0 normalized from a
+            # zero-harvest 3) -- already captured in wake_dir's own
+            # exit-code/summary.json for harvest to read -- not a signal
+            # that launching itself failed. Every inline invocation counts
+            # as spawned.
+            "$pm_k8s_wake" "$wake_dir" >/dev/null 2>&1
+        else
+            # --detach returns almost immediately (the wake itself runs in
+            # its own detached tmux session): 0 means the session started,
+            # 1 means tmux could not start one at all -- a real launch
+            # failure, the k8s counterpart of the local branch's own
+            # launcher-failed check below.
+            "$pm_k8s_wake" --detach "$wake_dir" >/dev/null 2>&1
+            rc=$?
+            (( rc != 0 )) && launch_failed=1
+        fi
+        set -e
+        if (( launch_failed )); then
+            echo "Error: postmaster: launching $agent for thread $tid (k8s) failed" >&2
+            pm_flag "$tid" "spawn failed for $agent: $mid"
+            rm -rf -- "$wake_dir"
+            return 0
+        fi
+
+        mkdir -p -- "$RUNS"
+        {
+            printf 'AGENT=%s\n' "$agent"
+            printf 'THREAD=%s\n' "$tid"
+            printf 'TRIGGER=%s\n' "$mid"
+            printf 'RUN_DIR=%s\n' "$wake_dir"
+            printf 'INBOX=\n'
+            printf 'HARNESS=%s\n' "$harness"
+            printf 'MODEL=%s\n' "$model"
+            printf 'NETWORK=%s\n' "$network"
+            printf 'BRANCH=%s\n' "$branch"
+            printf 'RESUMED=\n'
+            printf 'PENDING_MSGS=\n'
+            printf 'VIA=%s\n' "$via"
+            printf 'BACKEND=k8s\n'
+        } > "$RUNS/$run_id.env"
+        mkdir -p -- "$SPAWNS" "$SEQ"
+        printf '%s\n' "$run_id" >> "$SPAWNS/$tid"
+        printf '%s\n' "$run_id" >> "$SEQ/$tid"
+        pm_event "spawn thread=${tid:0:8} agent=$agent run=$(basename -- "$wake_dir") via=$via"
+        return 0
+    fi
+
     local -a spawn_args=(--branch "$branch" --harness "$harness" --network "$network")
     # --preset goes first -- documentation only, `fork-sandbox.sh` applies
     # flags over the preset key-by-key regardless of argv order (see
@@ -2089,10 +2312,7 @@ pm_spawn_wake() {
     # most threads carry no attachments at all, so the bind is added only
     # when the directory exists and actually holds something -- an empty or
     # absent mount is noise no wake needs.
-    local attach_dir="$MAIL_ROOT/threads/$tid/attachments"
-    if [[ -d "$attach_dir" && -n "$(find "$attach_dir" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
-        spawn_args+=(--attach-dir "$attach_dir")
-    fi
+    (( has_attach_dir )) && spawn_args+=(--attach-dir "$attach_dir")
     [[ "$trigger_only" == 1 ]] && spawn_args+=(--thread-dir "$snap_dir")
 
     # An agent woken again and again on one thread should be ONE
@@ -2156,6 +2376,7 @@ pm_spawn_wake() {
         printf 'RESUMED=%s\n' "$resumed"
         printf 'PENDING_MSGS=\n'
         printf 'VIA=%s\n' "$via"
+        printf 'BACKEND=local\n'
     } > "$RUNS/$run_id.env"
     mkdir -p -- "$SPAWNS" "$SEQ"
     printf '%s\n' "$run_id" >> "$SPAWNS/$tid"
@@ -2180,9 +2401,14 @@ pm_wake_or_pend() {
         # banner isn't one. Skipping the render costs nothing: the message
         # stays pending and rules 2-3 re-check for a follow-up wake exactly
         # as they did before live delivery existed.
-        local harness
+        local harness backend
         harness="$(fs_pm_env_get "$RUNS/$run_id.env" HARNESS)"
-        if [[ -z "$harness" || "$harness" == claude ]]; then
+        # A k8s wake has no inbox hook to deliver into (the wrapper drives
+        # fork-sandbox.sh --k8s to completion, not an interactive sandbox
+        # this process can write a banner file for) -- skip live delivery
+        # for it exactly as for any other non-claude harness above.
+        backend="$(fs_pm_env_get "$RUNS/$run_id.env" BACKEND)"
+        if [[ "$backend" != k8s && ( -z "$harness" || "$harness" == claude ) ]]; then
             pm_deliver_live "$run_id" "$tid" "$mid"
         fi
     else
@@ -3158,6 +3384,58 @@ pm_retry_pass() {
     done
 }
 
+# ---- held pass ----
+
+# Releases a $STATE/held/<tid>/<agent> seat (see pm_spawn_wake's hold
+# check) once its grant shows up, or once its seat no longer resolves
+# `grant: required` at all -- including a seat that stops resolving
+# entirely, whose released follow-up wake then fails resolution and flags
+# the ordinary way (pm_spawn_wake's own "seat resolution failed" path).
+# Runs between pm_route_pass and pm_retry_pass in cmd_deliver: a released
+# seat's follow-up wake should count against the same pass' retry/harvest
+# work, not wait a full pass behind it.
+pm_held_pass() {
+    local project="$1" tid_dir
+    mkdir -p -- "$STATE/held"
+    for tid_dir in "$STATE/held"/*/; do
+        [[ -d "$tid_dir" ]] || continue
+        local tid f
+        tid="$(basename -- "$tid_dir")"
+        for f in "$tid_dir"*; do
+            [[ -f "$f" ]] || continue
+            local agent
+            agent="$(basename -- "$f")"
+            # A live run for this pair means the seat is no longer
+            # actually held (e.g. a stale record left over from before it
+            # last went into hold) -- leave it for a later pass rather
+            # than double-wake it.
+            if fs_pm_find_live_run "$agent" "$tid" >/dev/null; then
+                continue
+            fi
+            local release=0
+            if [[ -e "$MAIL_ROOT/.postmaster/grants/$tid.env" ]]; then
+                release=1
+            else
+                local resolve_out g
+                if resolve_out="$("$FLEET" resolve "$agent" 2>/dev/null)"; then
+                    g="$(printf '%s\n' "$resolve_out" | sed -n '15p')"
+                    [[ "$g" != required ]] && release=1
+                else
+                    release=1
+                fi
+            fi
+            (( release )) || continue
+            local trigger retry_flag is_retry=""
+            trigger="$(fs_pm_env_get "$f" TRIGGER)"
+            retry_flag="$(fs_pm_env_get "$f" RETRY)"
+            [[ "$retry_flag" == 1 ]] && is_retry=1
+            rm -f -- "$f"
+            pm_event "held-release thread=${tid:0:8} agent=$agent trigger=${trigger:0:8}"
+            pm_followup_wake "$project" "$agent" "$tid" "$trigger" "$is_retry"
+        done
+    done
+}
+
 # ---- verbs ----
 
 cmd_deliver() {
@@ -3185,6 +3463,7 @@ cmd_deliver() {
     pm_require_routing_source || return 1
     pm_require_fleet_check || return 1
     pm_require_retry_backoff || return 1
+    pm_require_k8s_timeout || return 1
 
     mkdir -p -- "$MAIL_ROOT" "$STATE"
     pm_lock_acquire || return 1
@@ -3194,6 +3473,7 @@ cmd_deliver() {
 
     if (( once )); then
         pm_route_pass "$project"
+        pm_held_pass "$project"
         pm_retry_pass "$project"
         pm_harvest_pass "$project"
         return 0
@@ -3203,6 +3483,7 @@ cmd_deliver() {
     trap 'stop=1' TERM INT
     while (( ! stop )); do
         pm_route_pass "$project"
+        pm_held_pass "$project"
         pm_retry_pass "$project"
         pm_harvest_pass "$project"
         (( stop )) && break
@@ -3316,6 +3597,37 @@ cmd_status() {
         done
     done
     (( any_retry )) || printf '  (none)\n'
+
+    printf '\ngrants:\n'
+    local any_grant=0 gf gtid gcount
+    for gf in "$MAIL_ROOT/.postmaster/grants"/*.env; do
+        [[ -e "$gf" ]] || continue
+        gtid="$(basename -- "$gf" .env)"
+        gcount="$(wc -l < "$gf")"
+        printf '  %s: %s keys\n' "${gtid:0:8}" "$gcount"
+        any_grant=1
+    done
+    (( any_grant )) || printf '  (none)\n'
+
+    printf '\nheld:\n'
+    local any_held=0 htid_dir htid hf hagent htrigger hsince hage hnow
+    mkdir -p -- "$STATE/held"
+    for htid_dir in "$STATE/held"/*/; do
+        [[ -d "$htid_dir" ]] || continue
+        htid="$(basename -- "$htid_dir")"
+        for hf in "$htid_dir"*; do
+            [[ -f "$hf" ]] || continue
+            hagent="$(basename -- "$hf")"
+            htrigger="$(fs_pm_env_get "$hf" TRIGGER)"
+            hsince="$(fs_pm_env_get "$hf" SINCE)"
+            [[ "$hsince" =~ ^[0-9]+$ ]] || hsince=0
+            hnow="$(date +%s)"
+            hage=$(( hnow - hsince ))
+            printf '  %s: agent=%s trigger=%s age=%ss\n' "${htid:0:8}" "$hagent" "${htrigger:0:8}" "$hage"
+            any_held=1
+        done
+    done
+    (( any_held )) || printf '  (none)\n'
 
     local triaged_count=0
     for f in "$TRIAGED"/*; do

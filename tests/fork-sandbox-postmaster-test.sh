@@ -21,6 +21,7 @@ repo_dir="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 postmaster="$repo_dir/scripts/fork-sandbox-postmaster.sh"
 MAIL="$repo_dir/scripts/fork-sandbox-mail.sh"
 FLEET="$repo_dir/scripts/fork-sandbox-fleet.sh"
+MAIL_RENDER="$repo_dir/scripts/fork-sandbox-mail-render.py"
 
 pass=0
 fail=0
@@ -141,6 +142,18 @@ EOF
 cat > "$FORK_SANDBOX_PERSONAS_DIR/gina.md" <<'EOF'
 Gina is the preset seat used by the --preset passthrough tests.
 EOF
+cat > "$FORK_SANDBOX_PERSONAS_DIR/karen.md" <<'EOF'
+Karen is a plain backend: k8s seat with no grant requirement.
+EOF
+cat > "$FORK_SANDBOX_PERSONAS_DIR/karl.md" <<'EOF'
+Karl is a backend: k8s seat with grant: required, used by the hold tests.
+EOF
+cat > "$FORK_SANDBOX_PERSONAS_DIR/kim.md" <<'EOF'
+---
+thinking: medium
+---
+Kim is a pi/k8s seat with an endpoint, used by the endpoint/pi-args tests.
+EOF
 
 cat > "$FORK_SANDBOX_FLEET_FILE" <<'EOF'
 agents:
@@ -160,6 +173,16 @@ agents:
     harness: pi
     model: vendor/ginamodel
     preset: solo
+  karen:
+    backend: k8s
+  karl:
+    backend: k8s
+    grant: required
+  kim:
+    harness: pi
+    model: vendor/kimmodel
+    backend: k8s
+    endpoint: kim-endpoint
 lists:
   team:
     members: [alice, bob, carol]
@@ -188,6 +211,35 @@ set -euo pipefail
 printf -- '----CALL----\n' >> "$STUB_ARGV_LOG"
 for a in "$@"; do printf '%s\n' "$a" >> "$STUB_ARGV_LOG"; done
 run_dir="$(mktemp -d "$STUB_RUN_PREFIX/run.XXXXXX")"
+
+# A `--k8s` invocation stands in for the whole `fork-sandbox-k8s.sh run`
+# verb (see fork-sandbox-k8s-wake.sh, which execs this stub as its own
+# fs-argv element 0): print the run-dir line, write that dir's
+# summary.json, write a reply into --outbox-dir, exit $STUB_K8S_EXIT.
+is_k8s=0
+outbox=""
+args=("$@")
+for (( _i = 0; _i < ${#args[@]}; _i++ )); do
+    case "${args[$_i]}" in
+        --k8s) is_k8s=1 ;;
+        --outbox-dir) outbox="${args[$(( _i + 1 ))]}" ;;
+    esac
+done
+if (( is_k8s )); then
+    rc="${STUB_K8S_EXIT:-0}"
+    if [[ -z "${STUB_K8S_NO_RUNDIR:-}" ]]; then
+        printf '  run dir:  %s\n' "$run_dir" >&2
+        if [[ -z "${STUB_K8S_NO_SUMMARY:-}" ]]; then
+            printf '{"exit_code": %s}' "${STUB_K8S_SUMMARY_EXIT:-$rc}" > "$run_dir/summary.json"
+        fi
+    fi
+    if [[ -n "$outbox" && -z "${STUB_K8S_NO_REPLY:-}" ]]; then
+        mkdir -p -- "$outbox"
+        printf 'Subject: stub k8s reply\n\nhello from k8s stub\n' > "$outbox/mail-1.md"
+    fi
+    exit "$rc"
+fi
+
 mkdir -p -- "$run_dir/outbox" "$run_dir/inbox"
 if [[ -n "${STUB_IMMEDIATE_EXIT:-}" ]]; then
     printf '%s\n' "${STUB_IMMEDIATE_EXIT}" > "$run_dir/exit-code"
@@ -4816,6 +4868,271 @@ check "debounce: per-thread -- the aged thread routes" 1 \
 check "debounce: per-thread -- the fresh thread does not" 0 \
     "$(grep -c -- "^sbx-mail-$short_fresh-bob-" "$STUB_ARGV_LOG")"
 export FORK_SANDBOX_POSTMASTER_DEBOUNCE=0
+
+# ============================================================
+printf '\n== backend: k8s seats ==\n'
+# ============================================================
+
+export FORK_SANDBOX_POSTMASTER_K8S_DETACH=inline
+new_root K8S_TEST_CONFIG_DIR
+export FORK_SANDBOX_CONFIG_DIR="$K8S_TEST_CONFIG_DIR"
+
+# Most recent runs/<run-id>.env for $1, regardless of harvested state -- a
+# k8s wake finishes synchronously (FORK_SANDBOX_POSTMASTER_K8S_DETACH=inline)
+# within the SAME `once` pass that spawned it, so by the time `once`
+# returns it is often already harvested, unlike a local wake (live_env_for_agent
+# above only ever finds an UNharvested one, which a k8s wake in this test
+# mode never stays for long).
+latest_env_for_agent() {
+    local agent="$1" f
+    for f in $(ls -t "$PM_STATE_DIR/runs"/*.env 2>/dev/null); do
+        grep -q "^AGENT=$agent\$" "$f" && { printf '%s' "$f"; return 0; }
+    done
+    return 1
+}
+
+env_val() { sed -n "s/^$2=//p" "$1" | tail -n1; }
+
+# ---- case 1: a plain backend: k8s seat -- argv shape, harvest, .env ----
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+
+: > "$STUB_ARGV_LOG"
+k1_mid="$(send_msg '@carol' '@karen' 'k8s topic' 'hello karen' 8)"
+k1_tid="$(thread_of "$k1_mid")"
+once
+check "k8s case1: --k8s is in argv" 1 "$(grep -c -- '^--k8s$' "$STUB_ARGV_LOG")"
+check "k8s case1: --outbox-dir is in argv" 1 "$(grep -c -- '^--outbox-dir$' "$STUB_ARGV_LOG")"
+check "k8s case1: --thread-dir is in argv" 1 "$(grep -c -- '^--thread-dir$' "$STUB_ARGV_LOG")"
+check "k8s case1: --timeout defaults to 14400" 14400 "$(argv_after --timeout "$STUB_ARGV_LOG")"
+for df in --clone-dir --session-state --resume-session --session-id --refresh-at; do
+    check "k8s case1: $df is absent (fork-sandbox.sh --k8s refuses it)" 0 \
+        "$(grep -c -- "^$df\$" "$STUB_ARGV_LOG")"
+done
+k1_env="$(latest_env_for_agent karen)"
+check "k8s case1: .env BACKEND=k8s" k8s "$(env_val "$k1_env" BACKEND)"
+check "k8s case1: .env RESUMED is empty" "" "$(env_val "$k1_env" RESUMED)"
+k1_rendered="$("$MAIL_RENDER" --text --thread "$k1_tid" "$FORK_SANDBOX_MAIL_ROOT" 2>/dev/null)"
+contains "k8s case1: the stub's k8s reply was harvested" "$k1_rendered" "hello from k8s stub"
+
+# ---- case 2: a local seat on the same fleet spawns exactly as before ----
+
+# Fresh root: case1's k8s reply (no explicit To:, so reply-all to its
+# trigger's sender) is still an unrouted message at this point -- routing
+# it here, in the same MAIL_ROOT, would wake @carol too and pollute this
+# case's --clone-dir count with a spawn this case never asked for.
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+
+: > "$STUB_ARGV_LOG"
+send_msg '@carol' '@alice' 'local topic' 'hello alice' 8 >/dev/null
+once
+check "k8s case2: a local seat still gets --clone-dir" 1 "$(grep -c -- '^--clone-dir$' "$STUB_ARGV_LOG")"
+check "k8s case2: a local seat carries no --k8s" 0 "$(grep -c -- '^--k8s$' "$STUB_ARGV_LOG")"
+
+# ---- case 3: grant forwarding, in file order ----
+
+k3_ctx_dir="$(mktemp -d /var/tmp/claude-scratch/forks/pm-k8s-test-ctx.XXXXXX)"
+tmpdirs+=("$k3_ctx_dir")
+printf '%s\n' 'grant body' > "$work/body.tmp"
+"$MAIL" send --from '@carol' --to '@karen' --subject 'grant topic' \
+    --body "$work/body.tmp" --hops 8 \
+    --allow-namespace ns-one --allow-namespace ns-two \
+    --reach-probe svc.ns-one:80 --reach-probe svc.ns-two:443 \
+    --context-ro "$k3_ctx_dir" >/dev/null 2>&1
+: > "$STUB_ARGV_LOG"
+once
+k3_joined="$(tr '\n' $'\x01' < "$STUB_ARGV_LOG")"
+k3_expected="--allow-namespace"$'\x01'"ns-one"$'\x01'"--allow-namespace"$'\x01'"ns-two"$'\x01'"--reach-probe"$'\x01'"svc.ns-one:80"$'\x01'"--reach-probe"$'\x01'"svc.ns-two:443"$'\x01'"--context-ro"$'\x01'"$k3_ctx_dir"
+contains "k8s case3: grant flags forwarded in file order" "$k3_joined" "$k3_expected"
+
+# ---- case 4: endpoint -> --endpoint; a pi seat's thinking -> --pi-args ----
+
+: > "$STUB_ARGV_LOG"
+send_msg '@carol' '@kim' 'endpoint topic' 'hello kim' 8 >/dev/null
+once
+check "k8s case4: --endpoint forwarded" kim-endpoint "$(argv_after --endpoint "$STUB_ARGV_LOG")"
+check "k8s case4: pi thinking forwarded as --pi-args" '--thinking medium' \
+    "$(argv_after --pi-args "$STUB_ARGV_LOG")"
+
+# ---- case 5: rc 2 (dead pod), no k8s summary -> flagged, retried, retry handoff ----
+
+export FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF=0,0
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+
+k5_mid="$(send_msg '@carol' '@karen' 'k8s crash topic' 'first' 8)"
+k5_tid="$(thread_of "$k5_mid")"
+export STUB_K8S_EXIT=2 STUB_K8S_NO_SUMMARY=1
+once
+contains "k8s case5: thread flagged wake exited 2" \
+    "$(cat "$PM_STATE_DIR/needs-operator/$k5_tid" 2>/dev/null)" "wake for karen exited 2"
+contains "k8s case5: a retry was scheduled" \
+    "$(cat "$PM_STATE_DIR/retries/$k5_tid/karen" 2>/dev/null)" "STATE=pending"
+
+: > "$STUB_ARGV_LOG"
+once
+k5_retry_run_id="$(basename "$(latest_env_for_agent karen)" .env)"
+k5_retry_handoff="$PM_STATE_DIR/handoffs/$k5_retry_run_id.md"
+check "k8s case5: the retry actually fired" 1 "$(grep -c -- '----CALL----' "$STUB_ARGV_LOG")"
+check "k8s case5: retry handoff carries the retry section" 1 \
+    "$(grep -c -- '^## This is a retry$' "$k5_retry_handoff")"
+unset STUB_K8S_EXIT STUB_K8S_NO_SUMMARY
+
+# ---- case 6: rc 3 zero-harvest -> harvested clean, kept Job reaped ----
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+
+k6_mid="$(send_msg '@carol' '@karen' 'k8s zero harvest topic' 'first' 8)"
+k6_tid="$(thread_of "$k6_mid")"
+export STUB_K8S_EXIT=3 STUB_K8S_NO_REPLY=1 STUB_K8S_SUMMARY_EXIT=0
+once
+unset STUB_K8S_EXIT STUB_K8S_NO_REPLY STUB_K8S_SUMMARY_EXIT
+check "k8s case6: no flag on a zero-harvest exit" 0 \
+    "$( [[ -e "$PM_STATE_DIR/needs-operator/$k6_tid" ]] && echo 1 || echo 0 )"
+check "k8s case6: no retry schedule (a clean exit)" 0 \
+    "$( [[ -e "$PM_STATE_DIR/retries/$k6_tid/karen" ]] && echo 1 || echo 0 )"
+k6_env="$(latest_env_for_agent karen)"
+k6_rundir="$(env_val "$k6_env" RUN_DIR)"
+check "k8s case6: recorded exit-code normalized to 0" 0 "$(cat "$k6_rundir/exit-code" 2>/dev/null)"
+contains "k8s case6: the wrapper attempted to reap the kept Job" \
+    "$(cat "$k6_rundir/launch.log" 2>/dev/null)" "reaping zero-harvest Job for branch"
+unset FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF
+
+# ---- case 7: grant: required hold ----
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+
+k7_mid="$(send_msg '@carol' '@karl,@alice' 'hold topic' 'first' 8)"
+k7_tid="$(thread_of "$k7_mid")"
+k7_short="${k7_tid:0:8}"
+: > "$STUB_ARGV_LOG"
+: > "$work/once.out"
+once
+check "k8s case7: the local seat (alice) WAS woken" 1 "$(grep -c -- '^--clone-dir$' "$STUB_ARGV_LOG")"
+check "k8s case7: the held seat (karl) was NOT launched" 0 "$(grep -c -- '^--k8s$' "$STUB_ARGV_LOG")"
+contains "k8s case7: a no-grant refuse event fired" "$(cat "$work/once.out")" \
+    "pm refuse thread=$k7_short agent=karl reason=no-grant"
+contains "k8s case7: the thread is flagged no-grant" \
+    "$(cat "$PM_STATE_DIR/needs-operator/$k7_tid" 2>/dev/null)" "no grant for k8s seat karl"
+check "k8s case7: a held record exists" 1 \
+    "$( [[ -f "$PM_STATE_DIR/held/$k7_tid/karl" ]] && echo 1 || echo 0 )"
+contains "k8s case7: the held record's TRIGGER is the message" \
+    "$(cat "$PM_STATE_DIR/held/$k7_tid/karl")" "TRIGGER=$k7_mid"
+
+: > "$STUB_ARGV_LOG"
+: > "$work/once.out"
+once
+check "k8s case7: second pass -- still not launched" 0 "$(grep -c -- '^--k8s$' "$STUB_ARGV_LOG")"
+not_contains "k8s case7: second pass -- no new no-grant event" \
+    "$(cat "$work/once.out")" "reason=no-grant"
+
+"$MAIL" grant "$k7_tid" --allow-namespace ns-a --reach-probe svc.ns-a:80 >/dev/null 2>&1
+: > "$STUB_ARGV_LOG"
+: > "$work/once.out"
+once
+contains "k8s case7: a held-release event fired" "$(cat "$work/once.out")" \
+    "pm held-release thread=$k7_short agent=karl trigger=${k7_mid:0:8}"
+check "k8s case7: karl now spawns with --k8s" 1 "$(grep -c -- '^--k8s$' "$STUB_ARGV_LOG")"
+check "k8s case7: karl's argv carries the grant flag" 1 \
+    "$(grep -c -- '^--allow-namespace$' "$STUB_ARGV_LOG")"
+check "k8s case7: the held record is gone after release" 0 \
+    "$( [[ -f "$PM_STATE_DIR/held/$k7_tid/karl" ]] && echo 1 || echo 0 )"
+
+k7b_mid="$(send_msg '@carol' '@karl' 'hold clear topic' 'first' 8)"
+k7b_tid="$(thread_of "$k7b_mid")"
+once
+"$MAIL" grant "$k7b_tid" --allow-namespace ns-a --reach-probe svc.ns-a:80 >/dev/null 2>&1
+"$MAIL" grant "$k7b_tid" --clear >/dev/null 2>&1
+: > "$STUB_ARGV_LOG"
+once
+check "k8s case7: grant --clear before release -- still held" 0 \
+    "$(grep -c -- '^--k8s$' "$STUB_ARGV_LOG")"
+check "k8s case7: still holding a record" 1 \
+    "$( [[ -f "$PM_STATE_DIR/held/$k7b_tid/karl" ]] && echo 1 || echo 0 )"
+
+# ---- case 8: hold supersede -- a second message while held ----
+
+k8a_mid="$(send_msg '@carol' '@karl' 'supersede topic' 'first' 8)"
+k8_tid="$(thread_of "$k8a_mid")"
+once
+k8b_mid="$(reply_msg '@carol' "$k8a_mid" 'second message')"
+once
+contains "k8s case8: the held record's TRIGGER moved to the new mid" \
+    "$(cat "$PM_STATE_DIR/held/$k8_tid/karl" 2>/dev/null)" "TRIGGER=$k8b_mid"
+
+"$MAIL" grant "$k8_tid" --allow-namespace ns-a --reach-probe svc.ns-a:80 >/dev/null 2>&1
+: > "$STUB_ARGV_LOG"
+once
+k8_env="$(latest_env_for_agent karl)"
+check "k8s case8: release wakes on the NEW mid" "$k8b_mid" "$(env_val "$k8_env" TRIGGER)"
+
+# ---- case 9: a retry that fires into a hold ----
+
+export FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF=0,0
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+
+printf '%s\n' 'grant body' > "$work/body.tmp"
+k9_mid="$("$MAIL" send --from '@carol' --to '@karl' --subject 'retry-into-hold topic' \
+    --body "$work/body.tmp" --hops 8 --allow-namespace ns-a --reach-probe svc.ns-a:80 2>/dev/null)"
+k9_tid="$(thread_of "$k9_mid")"
+export STUB_K8S_EXIT=2 STUB_K8S_NO_SUMMARY=1
+once
+contains "k8s case9: the real run failed and scheduled a retry" \
+    "$(cat "$PM_STATE_DIR/retries/$k9_tid/karl" 2>/dev/null)" "STATE=pending"
+
+"$MAIL" grant "$k9_tid" --clear >/dev/null 2>&1
+: > "$STUB_ARGV_LOG"
+once
+unset STUB_K8S_EXIT STUB_K8S_NO_SUMMARY
+check "k8s case9: no launcher call -- the retry fell into a hold" 0 \
+    "$(grep -c -- '----CALL----' "$STUB_ARGV_LOG")"
+check "k8s case9: the retry schedule was dropped" "" \
+    "$(sed -n 's/^TRIGGER=//p' "$PM_STATE_DIR/retries/$k9_tid/karl" 2>/dev/null)"
+contains "k8s case9: the held record carries RETRY=1" \
+    "$(cat "$PM_STATE_DIR/held/$k9_tid/karl" 2>/dev/null)" "RETRY=1"
+
+"$MAIL" grant "$k9_tid" --allow-namespace ns-a --reach-probe svc.ns-a:80 >/dev/null 2>&1
+: > "$STUB_ARGV_LOG"
+once
+k9_run_id="$(basename "$(latest_env_for_agent karl)" .env)"
+check "k8s case9: the released wake's handoff carries the retry section" 1 \
+    "$(grep -c -- '^## This is a retry$' "$PM_STATE_DIR/handoffs/$k9_run_id.md")"
+unset FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF
+
+# ---- case 10: a malformed K8S_TIMEOUT refuses deliver at startup ----
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+
+FORK_SANDBOX_POSTMASTER_K8S_TIMEOUT=abc refuses \
+    "k8s case10: a non-numeric K8S_TIMEOUT refuses deliver" \
+    "$postmaster" deliver --project "$PROJECT_DIR" --once
+
+# ---- status shows grants and held seats ----
+
+k11_mid="$(send_msg '@carol' '@karl' 'status topic' 'first' 8)"
+k11_tid="$(thread_of "$k11_mid")"
+once
+"$MAIL" send --from '@carol' --to '@karen' --subject 'status grant topic' \
+    --body "$work/body.tmp" --hops 8 --allow-namespace ns-a --reach-probe svc.ns-a:80 >/dev/null 2>&1
+k11_status="$("$postmaster" status 2>&1)"
+contains "k8s status: grants section header" "$k11_status" "grants:"
+contains "k8s status: held section header" "$k11_status" "held:"
+contains "k8s status: held section names the thread and agent" "$k11_status" "${k11_tid:0:8}: agent=karl"
+
+unset FORK_SANDBOX_POSTMASTER_K8S_DETACH
+unset FORK_SANDBOX_CONFIG_DIR
 
 # ============================================================
 printf '\n== --help and dispatcher wiring ==\n'

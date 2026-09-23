@@ -477,6 +477,41 @@ the order given, values exactly as given (not normalized), plus a trailing
 This file applies only to `backend: k8s` seats; a local seat on the same
 thread has nothing that reads it and ignores it by construction.
 
+### Cluster seats
+
+Mark a seat this way with `backend: k8s` in fleet.yaml (see the table
+above) — everything else about routing, hops, the thread budget, and the
+reply harvest format is unchanged from a local seat; the fleet must not be
+able to tell which backend woke it.
+
+A k8s wake still runs as one `fork-sandbox.sh --k8s` launch under
+`fork-sandbox-k8s-wake.sh`, the postmaster's async wrapper for it (see
+that script's own header) — every wake is a **fresh session**: none of
+`--session-state`/`--resume-session`/`--session-id`/`--clone-dir`/
+`--refresh-at` is passed (`fork-sandbox.sh` refuses the first four with
+`--k8s` outright; seat continuity on k8s is later work). It also gets
+**no live delivery**: a message addressed to an agent already running a
+k8s wake just pends, the same fallback a non-claude harness gets locally
+(see "The wake" below) — there is no inbox hook to write a banner into
+mid-Job.
+
+A `grant: required` seat with no grant file yet for a thread **holds**
+instead of failing: the message itself still routes normally (Cc triage
+already ran), only that one seat waits, flagged once with reason
+`no grant for k8s seat <agent>: <message-id>` (keyword `no-grant`). Run
+`fork-sandbox-mail.sh grant <thread-id> ...` (above) to release it — the
+next `deliver` pass picks the grant up and dispatches the held trigger. See
+"The held state file is a read contract" above for the on-disk record, and
+`status`'s `held:` section for what's currently waiting.
+
+`$FORK_SANDBOX_POSTMASTER_K8S_TIMEOUT` sets the `--timeout` seconds a k8s
+wake gets (default 14400 = 4h); a value that is set but not a positive
+integer fails `deliver` at startup, the same posture as
+`$FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF`.
+`$FORK_SANDBOX_POSTMASTER_K8S_DETACH=inline` runs the wake wrapper
+synchronously instead of inside its own detached tmux session — a test
+seam, not an operator setting.
+
 ## The postmaster
 
 `fork-sandbox postmaster` is the host-side router: it watches the store,
@@ -900,6 +935,26 @@ schedule was superseded by a pending message before one was ever
 scheduled) gets no `recovered` record either — neither has any retry
 history to recover from.
 
+#### The held state file is a read contract
+
+`held/<thread-id>/<agent>` holds one `backend: k8s` seat with
+`grant: required` and no grant file yet for this thread (see "Cluster
+seats" below) — same read-contract posture as `retries/` above, a full
+mktemp+mv rewrite on every write, never a partial one:
+
+| Field | Meaning |
+|---|---|
+| `TRIGGER` | the message id whose wake is being held |
+| `SINCE` | epoch seconds the seat started waiting on this trigger — kept across a re-check of the same trigger, reset when a newer message supersedes it |
+| `RETRY` | `1` when this hold was entered from `pm_retry_pass` firing an already-scheduled retry into it, else `0` |
+
+Created the first time a `backend: k8s`, `grant: required` seat's wake
+would otherwise spawn with no grant file present. A new message addressed
+to a held seat supersedes the record (`TRIGGER` moves to the new message,
+`SINCE` resets). Deleted on release, by `pm_held_pass`, once the grant
+file exists or the seat no longer resolves `grant: required` at all — see
+"Cluster seats" below.
+
 ### Router state
 
 Under `$FORK_SANDBOX_MAIL_ROOT/.postmaster/`, dot-prefixed so the store's
@@ -922,6 +977,7 @@ own thread scans never see it:
 | `state/<thread-id>/<agent>/` | the harness's transcript/session store for that pair (claude, codex or pi, sealed or not) |
 | `sessions/<thread-id>/<agent>` | the session id that pair's last wake ended on |
 | `retries/<thread-id>/<agent>` | the wedge-bound FAILS counter (session resume, below) and the retry read contract's STATE/TRIGGER/ATTEMPT/NOT_BEFORE/MAX/LAST_FAILED_RUN/RECOVERED_AT fields (see "Retrying a dead wake" above) — one file, two independent purposes |
+| `held/<thread-id>/<agent>` | a `backend: k8s`, `grant: required` seat waiting on a grant file for this thread — see "The held state file is a read contract" above |
 | `workspaces/<thread-id>/<agent>/` | the persistent clone for that (thread, agent) seat, bound into every wake of it (every harness, not just claude) with `--clone-dir`; removed only by `fleet teardown` |
 
 All state transitions are marker-file creation, never deletion of
