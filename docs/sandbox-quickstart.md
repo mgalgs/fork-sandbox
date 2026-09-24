@@ -57,7 +57,11 @@ the `fork-sandbox` skill does everything below. By hand:
    ```
 
 4. When it ends, the branch is already fetched back into your repo. Read the
-   diff before you build or merge it.
+   diff before you build or merge it. fork-sandbox also points the branch's
+   upstream at whatever your checked-out branch was tracking when the run
+   started, or the remote's default branch if it was not tracking anything.
+   This is best-effort, so `git status` and `git branch -vv` show
+   ahead/behind without a manual `git branch -u` afterward.
 
 ### Review a pull request
 

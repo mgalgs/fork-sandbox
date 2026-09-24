@@ -276,6 +276,14 @@ constraint it imposes:
   when someone fetches. More moving parts; worth it once runs are routine.
   Not built in v1.
 
+### The upstream rule
+
+`fetch` and `collect` also point the fetched branch's upstream at whatever
+the origin repo's branch was tracking when the run was submitted, falling
+back to the remote default branch if it was not tracking anything. This is
+best-effort — a failure to set it never fails the fetch itself, since
+`collect` calls `fetch` internally and both go through the same code path.
+
 ## Getting artifacts back: the outbox
 
 `fetch` gets the branch back; it says nothing about anything that is not a
