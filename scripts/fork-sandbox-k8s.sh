@@ -628,14 +628,21 @@
 #                         non-empty: the pod never trusts a host on first
 #                         use.
 #   K8S_POSTMASTER_STORAGE_CLASS=
-#                         the postmaster PVC's storageClassName. Optional;
-#                         empty (the default) omits the field entirely, so
-#                         the cluster's default StorageClass applies.
+#                         the storageClassName of both postmaster PVCs.
+#                         Optional; empty (the default) omits the field
+#                         entirely, so the cluster's default StorageClass
+#                         applies.
 #   K8S_POSTMASTER_STORAGE=
-#                         the postmaster PVC's requested size. Optional,
-#                         defaults to 20Gi; must match ^[0-9]+(Mi|Gi|Ti)$.
+#                         the postmaster data PVC's requested size.
+#                         Optional, defaults to 20Gi; must match
+#                         ^[0-9]+(Mi|Gi|Ti)$.
+#   K8S_POSTMASTER_MAIL_STORAGE=
+#                         the postmaster mail PVC's requested size (the
+#                         mail store, the only volume the mail API sees).
+#                         Optional, defaults to 2Gi; same pattern as
+#                         K8S_POSTMASTER_STORAGE.
 #   K8S_POSTMASTER_ACCESS_MODE=
-#                         the postmaster PVC's access mode. Optional,
+#                         the access mode of both postmaster PVCs. Optional,
 #                         defaults to ReadWriteOncePod; ReadWriteOnce is
 #                         also accepted (for a StorageClass/CSI driver
 #                         that does not support RWOP yet). Any other value
@@ -879,6 +886,8 @@ K8S_POSTMASTER_KNOWN_HOSTS_FILE="$(read_env_value "$k8s_env" K8S_POSTMASTER_KNOW
 K8S_POSTMASTER_STORAGE_CLASS="$(read_env_value "$k8s_env" K8S_POSTMASTER_STORAGE_CLASS || true)"
 K8S_POSTMASTER_STORAGE="$(read_env_value "$k8s_env" K8S_POSTMASTER_STORAGE || true)"
 K8S_POSTMASTER_STORAGE="${K8S_POSTMASTER_STORAGE:-20Gi}"
+K8S_POSTMASTER_MAIL_STORAGE="$(read_env_value "$k8s_env" K8S_POSTMASTER_MAIL_STORAGE || true)"
+K8S_POSTMASTER_MAIL_STORAGE="${K8S_POSTMASTER_MAIL_STORAGE:-2Gi}"
 K8S_POSTMASTER_ACCESS_MODE="$(read_env_value "$k8s_env" K8S_POSTMASTER_ACCESS_MODE || true)"
 K8S_POSTMASTER_ACCESS_MODE="${K8S_POSTMASTER_ACCESS_MODE:-ReadWriteOncePod}"
 K8S_POSTMASTER_OPERATORS="$(read_env_value "$k8s_env" K8S_POSTMASTER_OPERATORS || true)"
@@ -965,7 +974,8 @@ if [[ "${1-}" != check-grant ]]; then
         "$K8S_POSTMASTER_IMAGE" "$K8S_POSTMASTER_REPO_URL" \
         "$K8S_POSTMASTER_PROJECT" "$K8S_POSTMASTER_GIT_KEY_FILE" \
         "$K8S_POSTMASTER_KNOWN_HOSTS_FILE" "$K8S_POSTMASTER_STORAGE_CLASS" \
-        "$K8S_POSTMASTER_STORAGE" "$K8S_POSTMASTER_ACCESS_MODE" \
+        "$K8S_POSTMASTER_STORAGE" "$K8S_POSTMASTER_MAIL_STORAGE" \
+        "$K8S_POSTMASTER_ACCESS_MODE" \
         "$K8S_POSTMASTER_OPERATORS" "$K8S_POSTMASTER_HOOKS_SECRET" \
         "$K8S_MAIL_API_TOKENS_FILE" "$K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE" \
         || exit 1
@@ -2777,6 +2787,11 @@ cmd_install() {
             echo '^[0-9]+(Mi|Gi|Ti)$.' >&2
             exit 1
         fi
+        if [[ ! "$K8S_POSTMASTER_MAIL_STORAGE" =~ ^[0-9]+(Mi|Gi|Ti)$ ]]; then
+            echo "Error: K8S_POSTMASTER_MAIL_STORAGE='$K8S_POSTMASTER_MAIL_STORAGE' must match" >&2
+            echo '^[0-9]+(Mi|Gi|Ti)$.' >&2
+            exit 1
+        fi
         if [[ "$K8S_POSTMASTER_ACCESS_MODE" != ReadWriteOncePod && "$K8S_POSTMASTER_ACCESS_MODE" != ReadWriteOnce ]]; then
             echo "Error: K8S_POSTMASTER_ACCESS_MODE='$K8S_POSTMASTER_ACCESS_MODE' must be" >&2
             echo "ReadWriteOncePod or ReadWriteOnce." >&2
@@ -3503,6 +3518,7 @@ cmd_install() {
             -e "s|__PM_IMAGE__|$K8S_POSTMASTER_IMAGE|g" \
             -e "s|__PM_ACCESS_MODE__|$K8S_POSTMASTER_ACCESS_MODE|g" \
             -e "s|__PM_STORAGE__|$K8S_POSTMASTER_STORAGE|g" \
+            -e "s|__PM_MAIL_STORAGE__|$K8S_POSTMASTER_MAIL_STORAGE|g" \
             -e "s|__PM_CONFIG_CHECKSUM__|$pm_config_checksum|g" \
             -e "s|__PM_OPERATORS__|$K8S_POSTMASTER_OPERATORS|g" \
             -e "s|__PM_HOOKS_SECRET__|${K8S_POSTMASTER_HOOKS_SECRET:-(none)}|g" \
@@ -3510,10 +3526,10 @@ cmd_install() {
         if [[ -z "$K8S_POSTMASTER_STORAGE_CLASS" ]]; then
             local pm_scline pm_stripped
             pm_scline=$'  storageClassName: __PM_STORAGE_CLASS__\n'
-            pm_stripped="${pm_file_rendered/"$pm_scline"/}"
+            pm_stripped="${pm_file_rendered//"$pm_scline"/}"
             if [[ "$pm_stripped" == "$pm_file_rendered" ]]; then
                 echo "Error: could not find the storageClassName placeholder line" >&2
-                echo "in the rendered postmaster PVC -- manifests/k8s/40-postmaster.yaml" >&2
+                echo "in the rendered postmaster PVCs -- manifests/k8s/40-postmaster.yaml" >&2
                 echo "and cmd_install have drifted apart." >&2
                 exit 1
             fi

@@ -13160,6 +13160,9 @@ case "${args[0]:-} ${args[1]:-}" in
     "apply -f")
         body="$(cat)"
         printf 'applied: %s\n' "$(grep -m1 '^  name:' <<< "$body")" >> "$K8S_STUB_LOG"
+        if [[ -n "${K8S_STUB_APPLY_CAPTURE:-}" ]]; then
+            printf '%s\n---\n' "$body" >> "$K8S_STUB_APPLY_CAPTURE"
+        fi
         exit 0
         ;;
     "create configmap")
@@ -13262,12 +13265,12 @@ printf 'K8S_POSTMASTER_STORAGE_CLASS=fast-ssd\n' >> "$pm_cfg_sc/k8s.env"
 pm_log_sc="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$pm_log_sc")")
 pm_out_sc="$(PATH="$pm_stub_bin:$PATH" K8S_STUB_LOG="$pm_log_sc" FORK_SANDBOX_CONFIG_DIR="$pm_cfg_sc" \
     "$k8s_sh" install --postmaster --dry-run 2>/dev/null)"
-check "storageClassName renders the configured class" \
-    "1" "$(grep -c '^  storageClassName: fast-ssd' <<< "$pm_out_sc")"
+check "storageClassName renders the configured class on both PVCs" \
+    "2" "$(grep -c '^  storageClassName: fast-ssd' <<< "$pm_out_sc")"
 
 # 3. access mode: default, explicit override, and refusal.
-check "access mode defaults to ReadWriteOncePod" \
-    "1" "$(grep -c '^    - ReadWriteOncePod$' "$pm_out1")"
+check "access mode defaults to ReadWriteOncePod on both PVCs" \
+    "2" "$(grep -c '^    - ReadWriteOncePod$' "$pm_out1")"
 pm_cfg_rwo="$(newdir)"; tmpdirs+=("$pm_cfg_rwo")
 cp -r "$pm_cfg1"/. "$pm_cfg_rwo"/
 chmod 600 "$pm_cfg_rwo/deploy-key" "$pm_cfg_rwo/pi.env"
@@ -13275,7 +13278,7 @@ printf 'K8S_POSTMASTER_ACCESS_MODE=ReadWriteOnce\n' >> "$pm_cfg_rwo/k8s.env"
 pm_log_rwo="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$pm_log_rwo")")
 pm_out_rwo="$(PATH="$pm_stub_bin:$PATH" K8S_STUB_LOG="$pm_log_rwo" FORK_SANDBOX_CONFIG_DIR="$pm_cfg_rwo" \
     "$k8s_sh" install --postmaster --dry-run 2>/dev/null)"
-check "access mode ReadWriteOnce renders" "1" "$(grep -c '^    - ReadWriteOnce$' <<< "$pm_out_rwo")"
+check "access mode ReadWriteOnce renders on both PVCs" "2" "$(grep -c '^    - ReadWriteOnce$' <<< "$pm_out_rwo")"
 
 pm_cfg_badam="$(newdir)"; tmpdirs+=("$pm_cfg_badam")
 cp -r "$pm_cfg1"/. "$pm_cfg_badam"/
@@ -13715,15 +13718,13 @@ check "tokens file: the mail-api container mounts none of git/config/sa-token" "
     "$(pm_api_dep '.spec.template.spec.containers[] | select(.name == "mail-api") | .volumeMounts[] | select(.name == "git" or .name == "config" or .name == "sa-token") | .name' | grep -c .)"
 check "tokens file: the mail-api container mounts neither src nor home-claude" "0" \
     "$(pm_api_dep '.spec.template.spec.containers[] | select(.name == "mail-api") | .volumeMounts[] | select(.mountPath == "/home/fs/src" or .mountPath == "/home/fs/.claude") | .mountPath' | grep -c .)"
-check "tokens file: the mail-api container shares only the data volume with the postmaster" "data" \
+check "tokens file: the mail-api container shares only the mail volume with the postmaster" "mail" \
     "$(pm_api_dep '.spec.template.spec.containers | ([.[] | select(.name == "mail-api") | .volumeMounts[].name]) as $a | [.[] | select(.name == "postmaster") | .volumeMounts[].name | select(. as $n | $a | index($n))] | unique | join(" ")')"
-check "tokens file: the mail-api container mounts only the mail root of the data volume" \
-    "/var/tmp/claude-scratch/agent-mail scratch/agent-mail" \
-    "$(pm_api_dep '.spec.template.spec.containers[] | select(.name == "mail-api") | .volumeMounts[] | select(.name == "data") | .mountPath + " " + .subPath')"
+check "tokens file: the mail-api container mounts the mail volume at the mail root" \
+    "/var/tmp/claude-scratch/agent-mail" \
+    "$(pm_api_dep '.spec.template.spec.containers[] | select(.name == "mail-api") | .volumeMounts[] | select(.name == "mail") | .mountPath')"
 check "tokens file: the mail-api container mounts nothing over the scratch root or forks/" "0" \
     "$(pm_api_dep '.spec.template.spec.containers[] | select(.name == "mail-api") | .volumeMounts[] | select(.mountPath == "/var/tmp/claude-scratch" or (.mountPath | startswith("/var/tmp/claude-scratch/forks")))' | grep -c .)"
-check "tokens file: pvc-dirs creates the mail root subPath" "1" \
-    "$(pm_api_dep '.spec.template.spec.initContainers[] | select(.name == "pvc-dirs") | .command[] | select(. == "/data/scratch/agent-mail")' | grep -c .)"
 check "tokens file: both containers carry the configured operator list" "@alice,@operator @alice,@operator" \
     "$(pm_api_dep '.spec.template.spec.containers[] | .env[] | select(.name == "FORK_SANDBOX_OPERATORS") | .value' | paste -sd' ')"
 if command -v yamllint >/dev/null 2>&1; then
@@ -14146,13 +14147,85 @@ pm_api_refused "claude-seat gate: without the credential key, the same fleet is 
 pm_claude_real_wd="$(newdir)"; tmpdirs+=("$pm_claude_real_wd")
 mkdir -p "$pm_claude_real_wd/tmp"
 env PATH="$pm_stub_bin:$PATH" K8S_STUB_LOG="$pm_claude_real_wd/kubectl.log" \
+    K8S_STUB_APPLY_CAPTURE="$pm_claude_real_wd/applied.yaml" \
     TMPDIR="$pm_claude_real_wd/tmp" FORK_SANDBOX_CONFIG_DIR="$pm_cfg_claude" \
     "$k8s_sh" install --postmaster >/dev/null 2>"$pm_claude_real_wd/err"
 check "claude credentials: a real install exits 0" "0" "$?"
+check "real install: the applied stream carries both PersistentVolumeClaims" \
+    "fork-sandbox-postmaster fork-sandbox-postmaster-mail" \
+    "$(yq -r 'select(.kind == "PersistentVolumeClaim") | .metadata.name' "$pm_claude_real_wd/applied.yaml" | sort | paste -sd' ')"
+check "real install: the applied stream carries the postmaster Deployment" "fork-sandbox-postmaster" \
+    "$(yq -r 'select(.kind == "Deployment" and .metadata.name == "fork-sandbox-postmaster") | .metadata.name' "$pm_claude_real_wd/applied.yaml")"
+check "real install: the applied Deployment has no subPath anywhere" "0" \
+    "$(yq -r 'select(.kind == "Deployment" and .metadata.name == "fork-sandbox-postmaster") | [.spec.template.spec.containers[], (.spec.template.spec.initContainers // [])[]] | [.[].volumeMounts[]? | select(has("subPath"))] | length' "$pm_claude_real_wd/applied.yaml")"
 check "claude credentials: a real install hits no unbound variable" "0" \
     "$(grep -c 'unbound variable' "$pm_claude_real_wd/err")"
 check "claude credentials: a real install leaves no claude.env temp file" "" \
     "$(grep -rl 'CLAUDE_CREDENTIALS=' "$pm_claude_real_wd/tmp" 2>/dev/null)"
+
+# 14e. Storage layout: two whole PVCs, no subPath anywhere.
+pm_ctrs='[.spec.template.spec.containers[], (.spec.template.spec.initContainers // [])[]]'
+pm_mounts_of() {   # container name -> "volume path" lines
+    pm_api_dep ".spec.template.spec.containers[] | select(.name == \"$1\") | .volumeMounts[] | .name + \" \" + .mountPath"
+}
+pm_pvc() { yq -r "select(.kind == \"PersistentVolumeClaim\" and .metadata.name == \"$1\") | $2" <<< "$pm_api_out"; }
+
+pm_api_install "$pm_cfg_api"
+check "storage: mail API enabled: no subPath in any container" "0" \
+    "$(pm_api_dep "$pm_ctrs | [.[].volumeMounts[]? | select(has(\"subPath\"))] | length")"
+check "storage: no pvc-dirs init container" "0" \
+    "$(pm_api_dep '[(.spec.template.spec.initContainers // [])[] | select(.name == "pvc-dirs")] | length')"
+check "storage: postmaster mounts data at the scratch root" "1" \
+    "$(pm_mounts_of postmaster | grep -cx 'data /var/tmp/claude-scratch')"
+check "storage: postmaster mounts mail at the mail root" "1" \
+    "$(pm_mounts_of postmaster | grep -cx 'mail /var/tmp/claude-scratch/agent-mail')"
+check "storage: postmaster mounts nothing at \$HOME/src or \$HOME/.claude" "0" \
+    "$(pm_mounts_of postmaster | grep -cE ' /home/fs/(src|\.claude)$')"
+check "storage: mail-api mounts mail at the mail root" "1" \
+    "$(pm_mounts_of mail-api | grep -cx 'mail /var/tmp/claude-scratch/agent-mail')"
+check "storage: mail-api has no mount of the data volume" "0" \
+    "$(pm_mounts_of mail-api | grep -c '^data ')"
+check "storage: the mail volume claims fork-sandbox-postmaster-mail" "fork-sandbox-postmaster-mail" \
+    "$(pm_api_dep '.spec.template.spec.volumes[] | select(.name == "mail") | .persistentVolumeClaim.claimName')"
+check "storage: the data volume claims fork-sandbox-postmaster" "fork-sandbox-postmaster" \
+    "$(pm_api_dep '.spec.template.spec.volumes[] | select(.name == "data") | .persistentVolumeClaim.claimName')"
+
+pm_api_install "$pm_cfg1"
+check "storage: mail API disabled: no subPath in any container" "0" \
+    "$(pm_api_dep "$pm_ctrs | [.[].volumeMounts[]? | select(has(\"subPath\"))] | length")"
+check "storage: mail API disabled: postmaster still mounts mail at the mail root" "1" \
+    "$(pm_mounts_of postmaster | grep -cx 'mail /var/tmp/claude-scratch/agent-mail')"
+check "storage: mail API disabled: the mail volume is still declared" "fork-sandbox-postmaster-mail" \
+    "$(pm_api_dep '.spec.template.spec.volumes[] | select(.name == "mail") | .persistentVolumeClaim.claimName')"
+check "storage: both PVCs render" "fork-sandbox-postmaster fork-sandbox-postmaster-mail" \
+    "$(yq -r 'select(.kind == "PersistentVolumeClaim") | .metadata.name' <<< "$pm_api_out" | sort | paste -sd' ')"
+check "storage: the mail PVC defaults to 2Gi" "2Gi" \
+    "$(pm_pvc fork-sandbox-postmaster-mail '.spec.resources.requests.storage')"
+check "storage: the data PVC keeps its 20Gi default" "20Gi" \
+    "$(pm_pvc fork-sandbox-postmaster '.spec.resources.requests.storage')"
+check "storage: no storageClassName on either PVC by default" "0" \
+    "$(yq -r 'select(.kind == "PersistentVolumeClaim") | .spec | has("storageClassName")' <<< "$pm_api_out" | grep -c true)"
+
+pm_cfg_mailsz="$(pm_api_cfg K8S_POSTMASTER_MAIL_STORAGE=5Gi K8S_POSTMASTER_STORAGE_CLASS=invented-class K8S_POSTMASTER_ACCESS_MODE=ReadWriteOnce)"
+pm_api_install "$pm_cfg_mailsz"
+check "storage: K8S_POSTMASTER_MAIL_STORAGE sizes the mail PVC" "5Gi" \
+    "$(pm_pvc fork-sandbox-postmaster-mail '.spec.resources.requests.storage')"
+check "storage: K8S_POSTMASTER_MAIL_STORAGE leaves the data PVC alone" "20Gi" \
+    "$(pm_pvc fork-sandbox-postmaster '.spec.resources.requests.storage')"
+check "storage: the storage class lands on both PVCs" "invented-class invented-class" \
+    "$(yq -r 'select(.kind == "PersistentVolumeClaim") | .spec.storageClassName' <<< "$pm_api_out" | paste -sd' ')"
+check "storage: the access mode lands on both PVCs" "ReadWriteOnce ReadWriteOnce" \
+    "$(yq -r 'select(.kind == "PersistentVolumeClaim") | .spec.accessModes[0]' <<< "$pm_api_out" | paste -sd' ')"
+check "storage: no leftover __PM_ placeholder" "0" "$(grep -c '__PM_' <<< "$pm_api_out")"
+
+pm_cfg_badmail="$(pm_api_cfg K8S_POSTMASTER_MAIL_STORAGE=5GB)"
+pm_api_refused "storage: K8S_POSTMASTER_MAIL_STORAGE=5GB is refused" \
+    "K8S_POSTMASTER_MAIL_STORAGE='5GB' must match" "$pm_cfg_badmail"
+pm_badmail_wd="$(newdir)"; tmpdirs+=("$pm_badmail_wd")
+env PATH="$pm_stub_bin:$PATH" K8S_STUB_LOG="$pm_badmail_wd/log" FORK_SANDBOX_CONFIG_DIR="$pm_cfg_badmail" \
+    "$k8s_sh" install --postmaster >/dev/null 2>&1
+check "storage: a refused real install exits 1" "1" "$?"
+check "storage: a refused real install applies nothing" "0" "$(cat "$pm_badmail_wd/log" 2>/dev/null | grep -c 'apply')"
 
 printf '\n== client Role vs postmaster Role: same rules ==\n'
 rbac_yaml="$repo_dir/manifests/k8s/10-rbac.yaml"

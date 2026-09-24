@@ -5,7 +5,8 @@
 # substitutes these placeholder tokens from K8S_NAMESPACE and the
 # K8S_POSTMASTER_* keys in k8s.env (K8S_POSTMASTER_IMAGE,
 # K8S_POSTMASTER_ACCESS_MODE, K8S_POSTMASTER_STORAGE,
-# K8S_POSTMASTER_STORAGE_CLASS, K8S_POSTMASTER_OPERATORS,
+# K8S_POSTMASTER_MAIL_STORAGE, K8S_POSTMASTER_STORAGE_CLASS,
+# K8S_POSTMASTER_OPERATORS,
 # K8S_POSTMASTER_HOOKS_SECRET, and a sha256
 # install computes over the rendered ConfigMaps and Secrets), one token per
 # line below with nothing else on the line, so a long substituted value (an image
@@ -14,6 +15,7 @@
 #   __PM_IMAGE__
 #   __PM_ACCESS_MODE__
 #   __PM_STORAGE__
+#   __PM_MAIL_STORAGE__
 #   __PM_STORAGE_CLASS__
 #   __PM_CONFIG_CHECKSUM__
 #   __PM_OPERATORS__
@@ -28,11 +30,13 @@
 # install, not a placeholder -- its name never varies) and tell
 # `fleet check --cluster` a claude credential is available.
 #
-# The trick that keeps this small: the PVC below is mounted at the exact
-# paths a laptop postmaster uses (/var/tmp/claude-scratch, $HOME/src,
-# $HOME/.claude) and the config ConfigMap at $HOME/.config/fork-sandbox, so
-# the postmaster, fork-sandbox-k8s.sh, agent-mail and the wake script need
-# no path changes at all to run here. See docs/cluster-postmaster.md.
+# The trick that keeps this small: the data PVC below is mounted at the
+# scratch path a laptop postmaster uses (/var/tmp/claude-scratch), the mail
+# PVC at its agent-mail directory, and the config ConfigMap at
+# $HOME/.config/fork-sandbox; the pod init script links $HOME/src and
+# $HOME/.claude onto the data volume. So the postmaster, fork-sandbox-k8s.sh,
+# agent-mail and the wake script need no path changes at all to run here.
+# See docs/cluster-postmaster.md.
 #
 # This identity (the ServiceAccount/Role/RoleBinding below) can read every
 # Secret in this namespace: the Role lists `secrets` with get/list/watch,
@@ -91,9 +95,9 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
 ---
 # storageClassName is a whole-line placeholder: `install --postmaster`
-# strips the line entirely when K8S_POSTMASTER_STORAGE_CLASS is empty, so
-# the PVC falls back to the cluster's default StorageClass rather than
-# naming one that does not exist.
+# strips the line entirely (in both PVCs) when K8S_POSTMASTER_STORAGE_CLASS
+# is empty, so the PVC falls back to the cluster's default StorageClass
+# rather than naming one that does not exist.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -105,6 +109,19 @@ spec:
   resources:
     requests:
       storage: __PM_STORAGE__
+  storageClassName: __PM_STORAGE_CLASS__
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: fork-sandbox-postmaster-mail
+  namespace: __NAMESPACE__
+spec:
+  accessModes:
+    - __PM_ACCESS_MODE__
+  resources:
+    requests:
+      storage: __PM_MAIL_STORAGE__
   storageClassName: __PM_STORAGE_CLASS__
 ---
 apiVersion: apps/v1
@@ -153,39 +170,6 @@ spec:
         fsGroup: 1000
         seccompProfile:
           type: RuntimeDefault
-      initContainers:
-        # kubelet creates a subPath directory that does not yet exist on
-        # first mount, but as root -- so the main container, running as
-        # uid 1000 with a read-only root filesystem, could find
-        # /var/tmp/claude-scratch (etc.) owned by root and unwritable.
-        # Creating the subPath directories ourselves (the three below plus
-        # the mail root the mail-api container mounts on its own), as uid
-        # 1000, before the main containers start avoids that.
-        - name: pvc-dirs
-          image: __PM_IMAGE__
-          imagePullPolicy: IfNotPresent
-          command:
-            - mkdir
-            - -p
-            - /data/scratch
-            - /data/scratch/agent-mail
-            - /data/src
-            - /data/home-claude
-          securityContext:
-            allowPrivilegeEscalation: false
-            readOnlyRootFilesystem: true
-            capabilities:
-              drop: ["ALL"]
-          resources:
-            requests:
-              cpu: 250m
-              memory: 512Mi
-            limits:
-              cpu: "1"
-              memory: 1Gi
-          volumeMounts:
-            - name: data
-              mountPath: /data
       containers:
         - name: postmaster
           image: __PM_IMAGE__
@@ -236,11 +220,11 @@ spec:
             limits:
               cpu: "1"
               memory: 1Gi
-          # Mounts nest over the emptyDir $HOME below: /home/fs/src and
-          # /home/fs/.claude are subPath mounts inside the same /home/fs
-          # an earlier mount in this list already covers, which Kubernetes
-          # supports (the more specific mountPath simply takes over that
-          # subtree).
+          # No subPath: kubelet may create a missing subPath directory as
+          # root, which a non-root pod cannot then write. The pod init
+          # script makes the directories it needs on the volume root. The
+          # mail volume nests inside the data volume; the mount-point
+          # directory it covers in `data` never matters.
           volumeMounts:
             - name: home
               mountPath: /home/fs
@@ -248,13 +232,8 @@ spec:
               mountPath: /tmp
             - name: data
               mountPath: /var/tmp/claude-scratch
-              subPath: scratch
-            - name: data
-              mountPath: /home/fs/src
-              subPath: src
-            - name: data
-              mountPath: /home/fs/.claude
-              subPath: home-claude
+            - name: mail
+              mountPath: /var/tmp/claude-scratch/agent-mail
             - name: config
               mountPath: /home/fs/.config/fork-sandbox
               readOnly: true
@@ -336,7 +315,7 @@ spec:
               cpu: 500m
               memory: 256Mi
           # Its own HOME and /tmp, never the postmaster's, and only the mail
-          # root of the scratch volume: the postmaster container reads
+          # volume: the postmaster container reads
           # $HOME/.kube/config, $HOME/.gitconfig and the deploy key under
           # $HOME/.ssh, and execs the launch records it keeps in the wake
           # dirs under forks/, so anything of those this network-facing
@@ -349,9 +328,8 @@ spec:
               mountPath: /home/fs
             - name: mail-api-tmp
               mountPath: /tmp
-            - name: data
+            - name: mail
               mountPath: /var/tmp/claude-scratch/agent-mail
-              subPath: scratch/agent-mail
             - name: mail-api-tokens
               mountPath: /etc/fork-sandbox/mail-api
               readOnly: true
@@ -360,6 +338,9 @@ spec:
         - name: data
           persistentVolumeClaim:
             claimName: fork-sandbox-postmaster
+        - name: mail
+          persistentVolumeClaim:
+            claimName: fork-sandbox-postmaster-mail
         - name: home
           emptyDir: {}
         - name: tmp
