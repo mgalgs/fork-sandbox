@@ -879,5 +879,112 @@ PY
 )"
 check "a missing attachment file has bytes null" "[{'name': 'missing.bin', 'bytes': None}]" "$missing_check"
 
+printf '\n== list: --json and --header ==\n'
+
+saved_mail_root="$FORK_SANDBOX_MAIL_ROOT"
+ls_root=""; new_root ls_root; export FORK_SANDBOX_MAIL_ROOT="$ls_root"
+ls_sha="0123456789abcdef0123456789abcdef01234567"
+
+ls_empty_json="$("$mail" list --json 2>/dev/null)"
+check "list --json on an empty store prints []" "[]" "$ls_empty_json"
+
+ls_a="$("$mail" send --from @ci-demo --to @bob --subject "Review A" --body - \
+    --header 'X-Demo-PR: 42' --header 'X-Demo-Kind: review' \
+    --review-target "feature:$ls_sha" <<< "a" 2>/dev/null)"
+ls_b="$("$mail" send --from @ci-demo --to @bob --subject "Review B" --body - \
+    --header 'X-Demo-PR: 43' <<< "b" 2>/dev/null)"
+ls_c="$("$mail" send --from @ci-demo --to @bob --subject "Review C" --body - <<< "c" 2>/dev/null)"
+"$mail" reply --from @bob --reply-to "$ls_a" --body - <<< "ack" >/dev/null 2>&1
+"$mail" reply --from @bob --reply-to "$ls_c" --body - --header 'X-Demo-PR: 42' <<< "reply" >/dev/null 2>&1
+
+ls_ids() {
+    python3 -c 'import json,sys; print(" ".join(t["thread"] for t in json.load(sys.stdin)))'
+}
+
+ls_out="$("$mail" list --bogus 2>ls_err.txt)"; rc=$?
+check "list --bogus exits 1" "1" "$rc"
+check "list --bogus prints nothing on stdout" "" "$ls_out"
+contains "list --bogus names the option on stderr" "$(cat ls_err.txt)" "unknown option '--bogus'"
+ls_out="$("$mail" list extra-positional 2>ls_err.txt)"; rc=$?
+check "list with a positional exits 1" "1" "$rc"
+check "list with a positional prints nothing on stdout" "" "$ls_out"
+ls_out="$("$mail" list --json --header 2>ls_err.txt)"; rc=$?
+check "list --header without a value exits 1" "1" "$rc"
+
+ls_bare="$("$mail" list)"
+ls_expect_lines=()
+for d in "$ls_root"/threads/*/; do
+    ls_tid="$(basename -- "$d")"
+    ls_first="$(find "$d" -maxdepth 1 -name '*.msg' | sort | head -n1)"
+    ls_last="$(find "$d" -maxdepth 1 -name '*.msg' | sort | tail -n1)"
+    ls_expect_lines+=("$(printf '%s\t%s\t%s\t%s' "$ls_tid" \
+        "$(find "$d" -maxdepth 1 -name '*.msg' | wc -l)" \
+        "$(sed -n 's/^Subject: //p' "$ls_first" | head -n1)" \
+        "$(sed -n 's/^Date: //p' "$ls_last" | head -n1)")")
+done
+ls_expect="$(printf '%s\n' "${ls_expect_lines[@]}")"
+check "bare list output is the unchanged four-column TSV" "$ls_expect" "$ls_bare"
+
+check "list --json with no filter lists every thread" \
+    "$(printf '%s\n' "$ls_a" "$ls_b" "$ls_c" | LC_ALL=C sort | tr '\n' ' ' | sed 's/ $//')" \
+    "$("$mail" list --json | ls_ids)"
+
+check "root-only match: only the thread whose ROOT carries the header (a reply's header does not count)" \
+    "$ls_a" "$("$mail" list --json --header 'X-Demo-PR: 42' | ls_ids)"
+check "header name matches case-insensitively" \
+    "$ls_a" "$("$mail" list --json --header 'x-demo-pr: 42' | ls_ids)"
+check "header value matches exactly (a prefix does not match)" \
+    "[]" "$("$mail" list --json --header 'X-Demo-PR: 4')"
+check "two filters are ANDed (mismatch)" "[]" \
+    "$("$mail" list --json --header 'X-Demo-PR: 42' --header 'X-Demo-Kind: other')"
+check "two filters are ANDed (match)" "$ls_a" \
+    "$("$mail" list --json --header 'X-Demo-PR: 42' --header 'X-Demo-Kind: review' | ls_ids)"
+check "a core header can be filtered on" \
+    "$(printf '%s\n' "$ls_a" "$ls_b" "$ls_c" | LC_ALL=C sort | tr '\n' ' ' | sed 's/ $//')" \
+    "$("$mail" list --json --header 'From: @ci-demo' | ls_ids)"
+check "X-Review-Target-Set is filterable" "$ls_a" \
+    "$("$mail" list --json --header "X-Review-Target-Set: feature $ls_sha" | ls_ids)"
+
+ls_shape="$("$mail" list --json | python3 -c '
+import json, sys
+d = {t["thread"]: t for t in json.load(sys.stdin)}
+keys = sorted(d[sys.argv[1]])
+print(" ".join(keys))
+print(json.dumps(d[sys.argv[1]]["review_target"], sort_keys=True))
+print(d[sys.argv[2]]["review_target"])
+print(d[sys.argv[3]]["messages"], d[sys.argv[3]]["subject"], d[sys.argv[3]]["from"])
+print(["X-Demo-PR", "42"] in d[sys.argv[1]]["root_headers"])
+' "$ls_a" "$ls_b" "$ls_c")"
+check "list --json objects carry exactly the documented keys and review_target" \
+    "date from last_date messages review_target root_headers subject thread
+{\"branch\": \"feature\", \"sha\": \"$ls_sha\", \"version\": \"1\"}
+None
+2 Review C @ci-demo
+True" "$ls_shape"
+
+check "list --header (no --json) prints that thread's TSV line only" \
+    "$(grep -F "$ls_a" <<< "$ls_bare")" "$("$mail" list --header 'X-Demo-PR: 42')"
+
+for ls_bad in 'NoColon' ': v' '1Bad: v'; do
+    ls_out="$("$mail" list --json --header "$ls_bad" 2>ls_err.txt)"; rc=$?
+    check "malformed filter '$ls_bad' exits 1" "1" "$rc"
+    check "malformed filter '$ls_bad' prints nothing on stdout" "" "$ls_out"
+    contains "malformed filter '$ls_bad' gives an Error: list: line" "$(cat ls_err.txt)" "Error: list: "
+done
+
+ls_bad_dir="$ls_root/threads/00000000-0000-4000-8000-000000000000"
+mkdir -p "$ls_bad_dir"
+printf 'no blank line here\n' > "$ls_bad_dir/001-broken.msg"
+check "an unparsable root appears with an error and no other keys when unfiltered" \
+    "['error', 'messages', 'thread']" \
+    "$("$mail" list --json | python3 -c '
+import json, sys
+d = {t["thread"]: t for t in json.load(sys.stdin)}
+print(sorted(d["00000000-0000-4000-8000-000000000000"]))')"
+check "an unparsable root never matches a filter" "$ls_a" \
+    "$("$mail" list --json --header 'X-Demo-PR: 42' | ls_ids)"
+
+export FORK_SANDBOX_MAIL_ROOT="$saved_mail_root"
+
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 (( fail == 0 )) || exit 1

@@ -17,7 +17,7 @@
 #        fork-sandbox-mail.sh show <message-id>
 #        fork-sandbox-mail.sh tree <thread-id>
 #        fork-sandbox-mail.sh export <thread-id> --json
-#        fork-sandbox-mail.sh list
+#        fork-sandbox-mail.sh list [--json] [--header 'Name: value']...
 #        fork-sandbox-mail.sh inbox <name> [--all]
 #        fork-sandbox-mail.sh seen <name> <message-id>...
 #        fork-sandbox-mail.sh grant <thread-id> [--allow-namespace NS[:PORT]]...
@@ -38,6 +38,15 @@
 # dashboards. --json is required: export has no other format. It is
 # fork-sandbox-mail-render.py --json, run against this store; nothing is
 # written.
+#
+# `list` prints one TSV line per thread: thread id, message count, root
+# Subject, last message's Date. With --json it prints one JSON array, one
+# object per thread; each --header 'Name: value' (split on the first colon)
+# keeps only threads whose ROOT message has that header -- any name,
+# case-insensitive name, exact value, several ANDed; replies never count.
+# Bare `list` runs here in bash; with any flag it is
+# fork-sandbox-mail-render.py --list, which owns the parsing and the filter.
+# The JSON object shape is documented in docs/agent-mail.md.
 #
 # This is a store, not a router: `send`/`reply` write messages, `show`/
 # `tree`/`list`/`inbox`/`seen` read them back. There is no agent spawning, no
@@ -1028,6 +1037,21 @@ cmd_export() {
 }
 
 cmd_list() {
+    if (( $# )); then
+        local -a list_args=()
+        while (( $# )); do
+            case "$1" in
+                --json) list_args+=(--json); shift ;;
+                --header)
+                    (( $# >= 2 )) || { echo "Error: list: --header requires 'Name: value'." >&2; return 1; }
+                    list_args+=("--header=$2"); shift 2 ;;
+                -h|--help) usage; exit 0 ;;
+                -*) echo "Error: list: unknown option '$1'." >&2; return 1 ;;
+                *) echo "Error: list: unexpected argument '$1'." >&2; return 1 ;;
+            esac
+        done
+        exec python3 "$script_dir/fork-sandbox-mail-render.py" --list "$MAIL_ROOT" "${list_args[@]}"
+    fi
     local threads_dir; threads_dir="$(mail_threads_dir)"
     [[ -d "$threads_dir" ]] || return 0
     local d thread_id

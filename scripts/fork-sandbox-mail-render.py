@@ -7,6 +7,7 @@ Usage: fork-sandbox-mail-render.py <mail-root> -o threads.html
        fork-sandbox-mail-render.py --text <mail-root> [--thread <id>] [--message <id>]
        fork-sandbox-mail-render.py <mail-root> -o threads.html --live [SECONDS]
        fork-sandbox-mail-render.py --json <mail-root> --thread <id>
+       fork-sandbox-mail-render.py --list <mail-root> [--json] [--header 'Name: value']...
 
 Reads the store fork-sandbox-mail.sh writes under <mail-root>/threads/
 (<thread-id>/NNN-<uuid>.msg -- an RFC 5322-shaped header block, a blank
@@ -67,6 +68,17 @@ errors="replace", so bytes that are not valid UTF-8 become U+FFFD. The
 JSON is ASCII-only (non-ASCII text is \\u-escaped), so it survives any
 stdout encoding.
 
+--list is `fork-sandbox-mail.sh list` when it is given flags: one line per
+thread (thread id, message count, root Subject, last message's Date, tab
+separated), or with --json one JSON array with one object per thread (see
+docs/agent-mail.md for the shape). Each --header 'Name: value' (split on
+the first colon, both sides stripped) keeps only threads whose ROOT message
+-- the first .msg in sort order -- has a header of that name (any name,
+case-insensitive) with exactly that value; several --header are ANDed. A
+thread whose root cannot be parsed never matches a filter. Threads are
+sorted by thread id. --list is exclusive with --thread, --message, --text,
+-o and --live; --header requires --list.
+
 --live [SECONDS] turns this into a standing process for watching an
 in-progress thread in a browser: render, write the output file
 atomically (temp file in the same directory, then os.replace -- the
@@ -94,6 +106,7 @@ import argparse
 import html
 import json
 import os
+import re
 import signal
 import stat
 import sys
@@ -645,6 +658,72 @@ def export_json(mail_root, thread_id):
     }
 
 
+HEADER_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9-]*$")
+
+
+def parse_header_filter(raw):
+    """Splits a --header 'Name: value' filter on its first colon. Returns
+    (lowercased name, value) or raises ValueError with a one-line reason."""
+    name, sep, value = raw.partition(":")
+    if not sep:
+        raise ValueError(f"--header '{raw}' must look like 'Name: value'")
+    name = name.strip()
+    if not HEADER_NAME_RE.match(name):
+        raise ValueError(f"--header name '{name}' must match [A-Za-z][A-Za-z0-9-]*")
+    return name.lower(), value.strip()
+
+
+def read_review_target(mail_root, thread_id):
+    """The thread's current review target from its state file as
+    {branch, sha, version}, or None when the file is absent or lacks BRANCH
+    or SHA. Plain KEY=value lines; the file is never sourced."""
+    path = os.path.join(mail_root, ".postmaster", "review-target", thread_id + ".env")
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return None
+    kv = {}
+    for line in lines:
+        key, sep, value = line.partition("=")
+        if sep:
+            kv[key] = value
+    if not kv.get("BRANCH") or not kv.get("SHA"):
+        return None
+    return {"branch": kv["BRANCH"], "sha": kv["SHA"], "version": kv.get("VERSION", "")}
+
+
+def list_threads(mail_root, filters):
+    """One record per thread that has at least one .msg and whose root
+    matches every filter; see the --list note above."""
+    records = []
+    for thread_id in list_thread_ids(mail_root):
+        entries = load_thread(os.path.join(mail_root, "threads", thread_id))
+        if not entries:
+            continue
+        root, last = entries[0], entries[-1]
+        if not root["ok"]:
+            if not filters:
+                records.append({"thread": thread_id, "messages": len(entries), "error": root["error"]})
+            continue
+        if not all(
+            any(n.strip().lower() == name and v == value for n, v in root["headers"])
+            for name, value in filters
+        ):
+            continue
+        records.append({
+            "thread": thread_id,
+            "messages": len(entries),
+            "subject": root["subject"],
+            "from": root["from"],
+            "date": root["date"],
+            "last_date": last["date"] if last["ok"] else "",
+            "root_headers": root["headers"],
+            "review_target": read_review_target(mail_root, thread_id),
+        })
+    return records
+
+
 def write_atomic(path, content):
     """Writes content to path via a temp file in the same directory plus
     os.replace, so a concurrent reader (the browser, on its meta-refresh
@@ -741,6 +820,8 @@ def main(argv=None):
     parser.add_argument("-o", "--output", metavar="FILE", help="write HTML to FILE instead of stdout")
     parser.add_argument("--text", action="store_true", help="render as plain text to stdout instead of HTML")
     parser.add_argument("--json", action="store_true", help="print one thread (--thread required) as a JSON object to stdout")
+    parser.add_argument("--list", action="store_true", help="list threads (TSV, or a JSON array with --json), optionally filtered by --header")
+    parser.add_argument("--header", action="append", default=[], metavar="'NAME: VALUE'", help="with --list: keep threads whose root has this header (repeatable, ANDed)")
     parser.add_argument("--title", default="Mail threads", help="HTML page title (default: %(default)s)")
     parser.add_argument(
         "--live", metavar="SECONDS", nargs="?", type=int, const=15, default=None,
@@ -749,6 +830,29 @@ def main(argv=None):
     parser.add_argument("--live-cycles", type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--live-render-delay", type=float, default=0, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+
+    if args.header and not args.list:
+        print("Error: --header requires --list", file=sys.stderr)
+        return 1
+    if args.list:
+        if args.thread or args.message or args.text or args.output or args.live is not None:
+            print("Error: --list cannot be combined with --thread, --message, --text, -o or --live", file=sys.stderr)
+            return 1
+        try:
+            filters = [parse_header_filter(h) for h in args.header]
+        except ValueError as e:
+            print(f"Error: list: {e}", file=sys.stderr)
+            return 1
+        records = list_threads(args.mail_root, filters)
+        if args.json:
+            json.dump(records, sys.stdout)
+            sys.stdout.write("\n")
+        else:
+            for r in records:
+                if "error" in r:
+                    r = {**r, "subject": "", "last_date": ""}
+                sys.stdout.write(f"{r['thread']}\t{r['messages']}\t{r['subject']}\t{r['last_date']}\n")
+        return 0
 
     if args.json:
         if not args.thread:
