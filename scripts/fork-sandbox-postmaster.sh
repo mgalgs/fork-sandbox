@@ -582,7 +582,18 @@
 #                                   dir, not a fork-sandbox.sh run dir, and
 #                                   its INBOX and RESUMED are always empty:
 #                                   no rule-4 live delivery, no session
-#                                   resume). A handler seat's
+#                                   resume). REVIEW_TARGET (sets, follow, or
+#                                   empty -- the seat's resolved
+#                                   review-target key at spawn time, for
+#                                   every wake). REVIEW_TARGET_BRANCH,
+#                                   REVIEW_TARGET_SHA, REVIEW_TARGET_VERSION
+#                                   (present only for a `follow` seat spawned
+#                                   at a thread's review target -- what the
+#                                   wake was actually spawned at, so a later
+#                                   harvest stamps the reply with the target
+#                                   it read, not one that may have moved
+#                                   since -- see docs/agent-mail.md). A
+#                                   handler seat's
 #                                   run (see THE WAKE's handler variant)
 #                                   writes a deliberately minimal record
 #                                   instead: AGENT, THREAD, TRIGGER,
@@ -1600,6 +1611,7 @@ pm_flag_keyword() {
         "wake for"*"exited"*) printf 'wake-exit' ;;
         "wake for"*"failed after"*"retries"*) printf 'retry-exhausted' ;;
         "no grant for k8s seat"*) printf 'no-grant' ;;
+        "review target "*|"Version: "*) printf 'review-target' ;;
         *) printf 'other' ;;
     esac
 }
@@ -2064,6 +2076,29 @@ pm_run_env_set() {
     mv -- "$tmp" "$f"
 }
 
+# Writes the per-thread review-target state file for <tid>, atomically
+# (mktemp in the same dir, then mv) -- this store's own copy of mail.sh's
+# mail_write_review_target, which is private to that script. The one
+# caller (pm_harvest_one_file) writes here only after the post that moves
+# the target has already succeeded, so this is always a wholesale replace
+# of an existing file, never mail.sh's fresh-file case.
+pm_write_review_target() {
+    local tid="$1" branch="$2" sha="$3" version="$4" set_by="$5"
+    local rt_dir="$MAIL_ROOT/.postmaster/review-target"
+    mkdir -p -- "$rt_dir" || return 1
+    local dest="$rt_dir/$tid.env"
+    local tmp
+    tmp="$(mktemp "$rt_dir/.review-target.XXXXXX")" || return 1
+    {
+        printf 'BRANCH=%s\n' "$branch"
+        printf 'SHA=%s\n' "$sha"
+        printf 'VERSION=%s\n' "$version"
+        printf 'SET_BY=%s\n' "$set_by"
+        printf 'SET_AT=%s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+    } > "$tmp" || { rm -f -- "$tmp"; return 1; }
+    mv -- "$tmp" "$dest"
+}
+
 pm_append_pending() {
     local rid="$1" mid="$2"
     local f="$RUNS/$rid.env" existing
@@ -2307,7 +2342,7 @@ pm_exec_wake() {
     local mf replies=0
     for mf in "$outbox"/mail-*.md; do
         [[ -e "$mf" ]] || continue
-        if pm_harvest_one_file "$mf" "$agent" "$tid" "$mid" "$trigger_hops" "" "" ""; then
+        if pm_harvest_one_file "$mf" "$agent" "$tid" "$mid" "$trigger_hops" "" "" "" "" "" "" "" "" ""; then
             replies=$(( replies + 1 ))
         fi
     done
@@ -2360,7 +2395,8 @@ pm_held_write() {
 pm_spawn_wake() {
     local project="$1" agent="$2" tid="$3" mid="$4" is_retry="${5:-}"
     local harness model thinking network persona_path description wake_on_cc \
-          refresh_at triage preset handler command backend endpoint grant
+          refresh_at triage preset handler command backend endpoint grant \
+          review_target
     # description and wake_on_cc (resolve's 6th and 7th lines) are read to
     # keep resolve's line contract explicit even though neither is needed
     # by a wake -- wake_on_cc is a routing decision made before a wake is
@@ -2388,6 +2424,7 @@ pm_spawn_wake() {
            read -r persona_path; read -r description; read -r wake_on_cc; \
            read -r refresh_at; read -r triage; read -r preset; read -r handler; \
            read -r command; read -r backend; read -r endpoint; read -r grant; \
+           read -r review_target; \
          } < <("$FLEET" resolve "$agent" 2>/dev/null); then
         pm_flag "$tid" "seat resolution failed for $agent: $mid"
         return 0
@@ -2419,6 +2456,32 @@ pm_spawn_wake() {
         model="${model:-sonnet}"
     fi
     network="${network:-pinned}"
+
+    # A `follow` seat on a thread that has a review target spawns checked
+    # out at that target's sha instead of its own lineage branch (see the
+    # k8s spawn branch below) -- resolved once, here, before the grant hold
+    # gate, so a missing sha can flag and refuse the wake before anything
+    # else is written. `fleet check` refuses `review-target: follow` on
+    # anything but a `backend: k8s` seat, so rt_sha is only ever non-empty
+    # in the k8s branch below.
+    local rt_branch="" rt_sha="" rt_version=""
+    if [[ "$review_target" == follow ]]; then
+        local rt_file="$MAIL_ROOT/.postmaster/review-target/$tid.env"
+        if [[ -f "$rt_file" ]]; then
+            rt_branch="$(fs_pm_env_get "$rt_file" BRANCH)"
+            rt_sha="$(fs_pm_env_get "$rt_file" SHA)"
+            rt_version="$(fs_pm_env_get "$rt_file" VERSION)"
+            if [[ -n "$rt_sha" ]] && ! git -C "$project" cat-file -e "$rt_sha^{commit}" 2>/dev/null; then
+                if git -C "$project" remote get-url origin >/dev/null 2>&1; then
+                    git -c core.hooksPath=/dev/null -C "$project" fetch --quiet origin "refs/heads/$rt_branch" 2>/dev/null || true
+                fi
+                if ! git -C "$project" cat-file -e "$rt_sha^{commit}" 2>/dev/null; then
+                    pm_flag "$tid" "review target $rt_branch $rt_sha not found in the project repo" "review-target"
+                    return 0
+                fi
+            fi
+        fi
+    fi
 
     # A `backend: k8s` seat with `grant: required` and no grant file yet
     # for this thread holds here -- before anything else this function
@@ -2531,17 +2594,28 @@ pm_spawn_wake() {
         # a k8s seat fresh from HEAD -- see pm_lineage_checkout's own
         # comment. Computed before this wake's own run-id is appended to
         # $SEQ/$tid below, so it never sees itself.
-        local checkout_branch
-        if checkout_branch="$(pm_lineage_checkout "$project" "$tid" "$agent")"; then
+        # A follow seat on a thread with a review target checks out that
+        # target's sha instead of its own lineage branch (rt_sha, resolved
+        # above) -- the author's service definitions are not trusted
+        # because they are under review, so --services-trust-ref is still
+        # the project's own HEAD in either case, never the target.
+        local checkout_branch=""
+        if [[ -n "$rt_sha" ]]; then
+            checkout_branch="$rt_sha"
+        else
+            checkout_branch="$(pm_lineage_checkout "$project" "$tid" "$agent" || true)"
+        fi
+        if [[ -n "$checkout_branch" ]]; then
             spawn_args+=(--checkout "$checkout_branch")
             # A --checkout with no --services-trust-ref reads as an
             # unanchored, untrusted ref to cmd_submit's own services-trust
             # gate (fork-sandbox-k8s.sh), which would then silently run
             # this seat's every wake past the first with per-run services
-            # OFF. The checkout above is this same agent's own prior
-            # branch, not third-party data, so the project's current HEAD
-            # is a fine trust anchor -- the gate's diff check still
-            # disables services on its own if that branch changed
+            # OFF. The checkout above is either this same agent's own prior
+            # branch or the thread's review target, neither of which is
+            # trusted more than the project's current HEAD, so HEAD is the
+            # anchor in both cases -- the gate's diff check still disables
+            # services on its own if that branch changed
             # .agents/sandbox-services/ relative to HEAD.
             local checkout_trust_ref
             checkout_trust_ref="$(git -C "$project" rev-parse HEAD 2>/dev/null || true)"
@@ -2621,6 +2695,12 @@ pm_spawn_wake() {
             printf 'PENDING_MSGS=\n'
             printf 'VIA=%s\n' "$via"
             printf 'BACKEND=k8s\n'
+            printf 'REVIEW_TARGET=%s\n' "${review_target:-empty}"
+            if [[ -n "$rt_sha" ]]; then
+                printf 'REVIEW_TARGET_BRANCH=%s\n' "$rt_branch"
+                printf 'REVIEW_TARGET_SHA=%s\n' "$rt_sha"
+                printf 'REVIEW_TARGET_VERSION=%s\n' "$rt_version"
+            fi
         } > "$RUNS/$run_id.env"
         mkdir -p -- "$SPAWNS" "$SEQ"
         printf '%s\n' "$run_id" >> "$SPAWNS/$tid"
@@ -2703,6 +2783,7 @@ pm_spawn_wake() {
         printf 'PENDING_MSGS=\n'
         printf 'VIA=%s\n' "$via"
         printf 'BACKEND=local\n'
+        printf 'REVIEW_TARGET=%s\n' "${review_target:-empty}"
     } > "$RUNS/$run_id.env"
     mkdir -p -- "$SPAWNS" "$SEQ"
     printf '%s\n' "$run_id" >> "$SPAWNS/$tid"
@@ -3093,7 +3174,7 @@ pm_route_pass() {
 # point at.
 pm_parse_reply_file() {
     local mf="$1" body_out="$2"
-    local to="" cc="" subject="" reply_to_id="" line in_body=0
+    local to="" cc="" subject="" reply_to_id="" version="" line in_body=0
     local to_line="" cc_line=""
     : > "$body_out"
     while IFS= read -r line || [[ -n "$line" ]]; do
@@ -3110,6 +3191,13 @@ pm_parse_reply_file() {
             Cc:*) cc="$(pm_trim "${line#Cc:}")"; cc_line="$line" ;;
             Subject:*) subject="$(pm_trim "${line#Subject:}")" ;;
             Reply-To-Id:*) reply_to_id="$(pm_trim "${line#Reply-To-Id:}")" ;;
+            Version:*)
+                version="$(pm_trim "${line#Version:}")"
+                if [[ ! "$version" =~ ^[1-9][0-9]{0,3}$ ]]; then
+                    [[ -n "${PM_PARSE_BAD_LINE_FILE:-}" ]] && printf '%s' "$line" > "$PM_PARSE_BAD_LINE_FILE"
+                    return 1
+                fi
+                ;;
             *)
                 [[ -n "${PM_PARSE_BAD_LINE_FILE:-}" ]] && printf '%s' "$line" > "$PM_PARSE_BAD_LINE_FILE"
                 return 1
@@ -3137,7 +3225,7 @@ pm_parse_reply_file() {
             fi
         done
     fi
-    printf '%s\x1f%s\x1f%s\x1f%s\n' "$to" "$cc" "$subject" "$reply_to_id"
+    printf '%s\x1f%s\x1f%s\x1f%s\x1f%s\n' "$to" "$cc" "$subject" "$reply_to_id" "$version"
     return 0
 }
 
@@ -3155,7 +3243,9 @@ pm_flag_quote_line() {
 
 pm_harvest_one_file() {
     local mf="$1" agent="$2" tid="$3" trigger="$4" trigger_hops="$5"
-    local harness="${6:-}" model="${7:-}" network="${8:-}"
+    local harness="${6:-}" model="${7:-}" network="${8:-}" project="${9:-}"
+    local review_target_key="${10:-}" wake_branch="${11:-}"
+    local spawn_rt_branch="${12:-}" spawn_rt_sha="${13:-}" spawn_rt_version="${14:-}"
     local body_file parsed
     body_file="$(mktemp "$MAIL_ROOT/.postmaster.body.XXXXXX")"
     local bad_line_file bad_line=""
@@ -3174,12 +3264,23 @@ pm_harvest_one_file() {
     fi
     unset PM_PARSE_BAD_LINE_FILE
     rm -f -- "$bad_line_file"
-    local to cc subject reply_to_id
+    local to cc subject reply_to_id version
     # \x1f, not \t: bash's `read` collapses runs of IFS-whitespace
     # delimiters (tab counts, even set alone), so an empty Cc field would
     # merge with its neighboring delimiter and shift every field after it.
-    IFS=$'\x1f' read -r to cc subject reply_to_id <<< "$parsed"
+    IFS=$'\x1f' read -r to cc subject reply_to_id version <<< "$parsed"
     [[ -n "$reply_to_id" ]] || reply_to_id="$trigger"
+
+    # A Version: header repoints what every reviewer seat reviews -- only
+    # the seat carrying `review-target: sets` may move it. Checked before
+    # anything else this reply might do, on the existing malformed path (no
+    # new keyword: a reviewer trying to move the target is exactly as
+    # malformed as any other reply this store refuses to post).
+    if [[ -n "$version" && "$review_target_key" != sets ]]; then
+        rm -f -- "$body_file"
+        pm_flag "$tid" "malformed reply file $(basename -- "$mf"): Version: header from a seat without review-target: sets"
+        return 1
+    fi
 
     # Hops come from the message this reply actually answers, not always
     # the wake's trigger -- live delivery (see pm_deliver_live) makes
@@ -3250,6 +3351,44 @@ pm_harvest_one_file() {
     [[ -n "$model" ]] && cmd+=(--header "X-AI-Model: $model")
     [[ -n "$network" ]] && cmd+=(--header "X-AI-Network: $network")
 
+    # The review-target contract's three headers (see docs/agent-mail.md):
+    # a `sets` seat's Version: reply moves the target and stamps the setter
+    # pair plus the new version; a `sets` seat's ordinary reply just stamps
+    # the current version; a `follow` seat's reply stamps the target it was
+    # SPAWNED at (spawn_rt_*), never a fresh read of the (possibly since
+    # moved) current state.
+    local rt_write_sha="" rt_write_branch="" rt_write_version=""
+    if [[ -n "$version" ]]; then
+        # review_target_key == sets, guaranteed by the malformed check above.
+        local rt_new_sha
+        rt_new_sha="$(git -C "$project" rev-parse --verify --quiet "refs/heads/$wake_branch^{commit}" 2>/dev/null)"
+        if [[ -z "$rt_new_sha" ]]; then
+            rm -f -- "$body_file"
+            pm_flag "$tid" "Version: $version but the wake's branch $wake_branch did not come back"
+            return 1
+        fi
+        local rt_file="$MAIL_ROOT/.postmaster/review-target/$tid.env" rt_current=""
+        [[ -f "$rt_file" ]] && rt_current="$(fs_pm_env_get "$rt_file" VERSION)"
+        if [[ "$rt_current" =~ ^[0-9]+$ ]] && (( version <= rt_current )); then
+            rm -f -- "$body_file"
+            pm_flag "$tid" "Version: $version does not advance the review target (at $rt_current)"
+            return 1
+        fi
+        cmd+=(--header "X-Review-Target-Set: $wake_branch $rt_new_sha")
+        cmd+=(--header "X-Review-Target: $wake_branch $rt_new_sha")
+        cmd+=(--header "X-Version: $version")
+        rt_write_branch="$wake_branch" rt_write_sha="$rt_new_sha" rt_write_version="$version"
+    elif [[ "$review_target_key" == sets ]]; then
+        local rt_file="$MAIL_ROOT/.postmaster/review-target/$tid.env" rt_current=""
+        if [[ -f "$rt_file" ]]; then
+            rt_current="$(fs_pm_env_get "$rt_file" VERSION)"
+            [[ -n "$rt_current" ]] && cmd+=(--header "X-Version: $rt_current")
+        fi
+    elif [[ "$review_target_key" == follow && -n "$spawn_rt_sha" ]]; then
+        cmd+=(--header "X-Review-Target: $spawn_rt_branch $spawn_rt_sha")
+        cmd+=(--header "X-Version: $spawn_rt_version")
+    fi
+
     if ! "${cmd[@]}" >/dev/null 2>"$body_file.err"; then
         rc=1
     fi
@@ -3266,6 +3405,16 @@ pm_harvest_one_file() {
         # pm_exec_wake call site above (see pm_flag_keyword's own comment).
         pm_flag "$tid" "malformed reply file $(basename -- "$mf"): $err_out" "malformed-reply"
         return 1
+    fi
+
+    # The state file records the target ONLY after the post that announces
+    # it has actually succeeded -- a failed post above already returned 1
+    # without reaching here, so nothing announced never moves what everyone
+    # else reviews.
+    if [[ -n "$rt_write_sha" ]]; then
+        if ! pm_write_review_target "$tid" "$rt_write_branch" "$rt_write_sha" "$rt_write_version" "@$agent"; then
+            pm_flag "$tid" "review target not recorded after posting"
+        fi
     fi
     return 0
 }
@@ -3548,6 +3697,7 @@ pm_harvest_run() {
     local f="$RUNS/$rid.env"
     local agent tid trigger run_dir harness model network resumed_field
     local backend branch
+    local review_target review_target_branch review_target_sha review_target_version
     agent="$(fs_pm_env_get "$f" AGENT)"
     tid="$(fs_pm_env_get "$f" THREAD)"
     trigger="$(fs_pm_env_get "$f" TRIGGER)"
@@ -3558,6 +3708,10 @@ pm_harvest_run() {
     branch="$(fs_pm_env_get "$f" BRANCH)"
     network="$(fs_pm_env_get "$f" NETWORK)"
     resumed_field="$(fs_pm_env_get "$f" RESUMED)"
+    review_target="$(fs_pm_env_get "$f" REVIEW_TARGET)"
+    review_target_branch="$(fs_pm_env_get "$f" REVIEW_TARGET_BRANCH)"
+    review_target_sha="$(fs_pm_env_get "$f" REVIEW_TARGET_SHA)"
+    review_target_version="$(fs_pm_env_get "$f" REVIEW_TARGET_VERSION)"
     # A given-mode harness (pi) derives its id fresh on every spawn (see
     # pm_pi_session_id) and never reads sessions/ back -- so harvest must
     # not write one there either, or a stale file sits unread forever. Only
@@ -3729,7 +3883,9 @@ pm_harvest_run() {
     local mf replies=0
     for mf in "$run_dir/outbox"/mail-*.md; do
         [[ -e "$mf" ]] || continue
-        if pm_harvest_one_file "$mf" "$agent" "$tid" "$trigger" "$trigger_hops" "$harness" "$model" "$network"; then
+        if pm_harvest_one_file "$mf" "$agent" "$tid" "$trigger" "$trigger_hops" "$harness" "$model" "$network" \
+                "$project" "$review_target" "$branch" \
+                "$review_target_branch" "$review_target_sha" "$review_target_version"; then
             replies=$(( replies + 1 ))
         fi
     done
@@ -4032,6 +4188,14 @@ cmd_status_json() {
             printf '%s\0' grant
         fi
 
+        if [[ -f "$STATE/review-target/$tid.env" ]]; then
+            local rtf="$STATE/review-target/$tid.env"
+            printf '%s\0' review_target \
+                "$(fs_pm_env_get "$rtf" BRANCH)" "$(fs_pm_env_get "$rtf" SHA)" \
+                "$(fs_pm_env_get "$rtf" VERSION)" "$(fs_pm_env_get "$rtf" SET_BY)" \
+                "$(fs_pm_env_get "$rtf" SET_AT)"
+        fi
+
         if [[ -f "$SPAWNS/$tid" ]]; then
             n="$(wc -l < "$SPAWNS/$tid")"
         fi
@@ -4076,8 +4240,10 @@ tok = [t.decode("utf-8", "replace") for t in sys.stdin.buffer.read().split(b"\0"
 if tok and tok[-1] == "":
     tok.pop()
 out = {"thread": None, "unrouted": 0, "flag": None, "grant": False,
+       "review_target": None,
        "spawns": 0, "runs": [], "retries": [], "held": []}
-arity = {"thread": 1, "unrouted": 1, "flag": 2, "grant": 0, "spawns": 1,
+arity = {"thread": 1, "unrouted": 1, "flag": 2, "grant": 0,
+         "review_target": 5, "spawns": 1,
          "run": 5, "retry": 4, "held": 3}
 i = 0
 while i < len(tok):
@@ -4092,6 +4258,10 @@ while i < len(tok):
         out["flag"] = {"reason": a[0], "events": int(a[1]) if a[1] else None}
     elif tag == "grant":
         out["grant"] = True
+    elif tag == "review_target":
+        out["review_target"] = {"branch": a[0], "sha": a[1],
+                                 "version": int(a[2]) if a[2] else None,
+                                 "set_by": a[3], "set_at": a[4]}
     elif tag == "spawns":
         out["spawns"] = int(a[0] or 0)
     elif tag == "run":
