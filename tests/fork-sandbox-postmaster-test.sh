@@ -5373,6 +5373,21 @@ k3_joined="$(tr '\n' $'\x01' < "$STUB_ARGV_LOG")"
 k3_expected="--allow-namespace"$'\x01'"ns-one"$'\x01'"--allow-namespace"$'\x01'"ns-two"$'\x01'"--reach-probe"$'\x01'"svc.ns-one:80"$'\x01'"--reach-probe"$'\x01'"svc.ns-two:443"$'\x01'"--context-ro"$'\x01'"$k3_ctx_dir"
 contains "k8s case3: grant flags forwarded in file order" "$k3_joined" "$k3_expected"
 
+# ---- case 3b: a grant's context Secret is forwarded as --context-secret ----
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+
+"$MAIL" send --from '@carol' --to '@karen' --subject 'secret grant topic' \
+    --body "$work/body.tmp" --hops 8 --context-secret preview-ctx >/dev/null 2>&1
+: > "$STUB_ARGV_LOG"
+once
+check "k8s case3b: --context-secret forwarded with the grant's Secret name" preview-ctx \
+    "$(argv_after --context-secret "$STUB_ARGV_LOG")"
+check "k8s case3b: the k8s seat also carries --k8s" 1 "$(grep -c -- '^--k8s$' "$STUB_ARGV_LOG")"
+check "k8s case3b: no --context-ro is forwarded" 0 "$(grep -c -- '^--context-ro$' "$STUB_ARGV_LOG")"
+
 # ---- case 4: endpoint -> --endpoint; a pi seat's thinking -> --pi-args ----
 
 # Fresh root: case3's own grant-topic reply (no explicit To:, so

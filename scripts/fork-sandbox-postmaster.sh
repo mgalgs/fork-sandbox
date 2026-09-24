@@ -2830,9 +2830,10 @@ pm_spawn_wake() {
         # Grant flags, forwarded in file order: every ALLOW_NAMESPACE line,
         # then every REACH_PROBE line (both repeatable, so fs_pm_env_get's
         # last-match-wins read is the wrong tool -- read every line), then
-        # the single optional CONTEXT_RO line. Forwarded for ANY k8s seat
-        # that has a grant file, `grant: required` or not -- an optional
-        # grant still shapes network/context access when present.
+        # the single optional CONTEXT_RO and CONTEXT_SECRET lines. Forwarded
+        # for ANY k8s seat that has a grant file, `grant: required` or not
+        # -- an optional grant still shapes network/context access when
+        # present.
         local grant_file="$MAIL_ROOT/.postmaster/grants/$tid.env" g_line
         if [[ -e "$grant_file" ]]; then
             while IFS= read -r g_line; do
@@ -2844,6 +2845,9 @@ pm_spawn_wake() {
             local context_ro
             context_ro="$(fs_pm_env_get "$grant_file" CONTEXT_RO)"
             [[ -n "$context_ro" ]] && spawn_args+=(--context-ro "$context_ro")
+            local context_secret
+            context_secret="$(fs_pm_env_get "$grant_file" CONTEXT_SECRET)"
+            [[ -n "$context_secret" ]] && spawn_args+=(--context-secret "$context_secret")
         fi
 
         # fs-argv: element 0 is the launcher itself, then its arguments,
