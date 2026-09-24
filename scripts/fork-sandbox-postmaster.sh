@@ -8,6 +8,7 @@
 #        fork-sandbox-postmaster.sh status --thread <thread-id> --json
 #        fork-sandbox-postmaster.sh flag <thread-id> [reason]
 #        fork-sandbox-postmaster.sh unflag <thread-id>
+#        fork-sandbox-postmaster.sh hook fire --thread <thread-id> --event on-target|on-quiescent
 #        fork-sandbox-postmaster.sh --remote <status|flag|unflag> ...
 #
 # `--remote` as the first argument runs status/flag/unflag against the mail
@@ -2257,6 +2258,18 @@ pm_run_env_set() {
     mv -- "$tmp" "$f"
 }
 
+# Succeeds when <sha> is a commit in the project repo, fetching <branch>
+# from origin first when it is not there yet (an agent's branch may only
+# exist on the remote). Shared by the follow-seat spawn and on-target.
+pm_target_sha_present() {
+    local project="$1" branch="$2" sha="$3"
+    git -C "$project" cat-file -e "$sha^{commit}" 2>/dev/null && return 0
+    if git -C "$project" remote get-url origin >/dev/null 2>&1; then
+        git -c core.hooksPath=/dev/null -C "$project" fetch --quiet origin "refs/heads/$branch" 2>/dev/null || true
+    fi
+    git -C "$project" cat-file -e "$sha^{commit}" 2>/dev/null
+}
+
 # Writes the per-thread review-target state file for <tid>, atomically
 # (mktemp in the same dir, then mv) -- this store's own copy of mail.sh's
 # mail_write_review_target, which is private to that script. The one
@@ -2521,6 +2534,7 @@ pm_exec_wake() {
     rm -f -- "$stderr_capture"
 
     local mf replies=0
+    PM_HARVEST_POSTED=()
     for mf in "$outbox"/mail-*.md; do
         [[ -e "$mf" ]] || continue
         if pm_harvest_one_file "$mf" "$agent" "$tid" "$mid" "$trigger_hops" "" "" "" "" "" "" "" "" ""; then
@@ -2534,7 +2548,6 @@ pm_exec_wake() {
     # $STATE, which nothing else ever removes -- fleet teardown only
     # touches the paths fs_pm_state_paths names, and none of those is
     # this. Every byte a handler ever wrote here is already either
-    PM_HARVEST_POSTED=()
     # harvested into the mail store above or was malformed and named in a
     # pm_flag reason, so there is nothing left worth keeping it for.
     rm -rf -- "$outbox"
@@ -2554,6 +2567,8 @@ pm_exec_wake() {
     mkdir -p -- "$SPAWNS" "$SEQ"
     printf '%s\n' "$run_id" >> "$SPAWNS/$tid"
     printf '%s\n' "$run_id" >> "$SEQ/$tid"
+
+    pm_hook_on_harvest "$tid" "$run_id" "" "$agent" "${PM_HARVEST_POSTED[@]}"
 }
 
 # Atomic tmp+mv write of one held-seat record, $STATE/held/<tid>/<agent> --
@@ -2567,8 +2582,6 @@ pm_held_write() {
     local tmp
     tmp="$(mktemp "$STATE/held/$tid/.tmp.XXXXXX")"
     {
-
-    pm_hook_on_harvest "$tid" "$run_id" "" "$agent" "${PM_HARVEST_POSTED[@]}"
         printf 'TRIGGER=%s\n' "$trigger"
         printf 'SINCE=%s\n' "$since"
         printf 'RETRY=%s\n' "$retry"
@@ -2661,14 +2674,9 @@ pm_spawn_wake() {
             rt_branch="$(fs_pm_env_get "$rt_file" BRANCH)"
             rt_sha="$(fs_pm_env_get "$rt_file" SHA)"
             rt_version="$(fs_pm_env_get "$rt_file" VERSION)"
-            if [[ -n "$rt_sha" ]] && ! git -C "$project" cat-file -e "$rt_sha^{commit}" 2>/dev/null; then
-                if git -C "$project" remote get-url origin >/dev/null 2>&1; then
-                    git -c core.hooksPath=/dev/null -C "$project" fetch --quiet origin "refs/heads/$rt_branch" 2>/dev/null || true
-                fi
-                if ! git -C "$project" cat-file -e "$rt_sha^{commit}" 2>/dev/null; then
-                    pm_flag "$tid" "review target $rt_branch $rt_sha not found in the project repo" "review-target"
-                    return 0
-                fi
+            if [[ -n "$rt_sha" ]] && ! pm_target_sha_present "$project" "$rt_branch" "$rt_sha"; then
+                pm_flag "$tid" "review target $rt_branch $rt_sha not found in the project repo" "review-target"
+                return 0
             fi
         fi
     fi
@@ -3426,14 +3434,6 @@ pm_parse_reply_file() {
 # (newlines included, so a captured line can never fake a second header or
 # corrupt `status`'s one-line-per-thread listing) and truncates so one long
 # line can't crowd out the fixed prose around it.
-pm_flag_quote_line() {
-    local s
-    s="$(tr -d '[:cntrl:]' <<< "$1")"
-    printf '%s' "${s:0:120}"
-}
-
-pm_harvest_one_file() {
-    local mf="$1" agent="$2" tid="$3" trigger="$4" trigger_hops="$5"
 # The Message-ID of every message pm_harvest_one_file posted since the caller
 # last reset this, in posting order -- what on-harvest reports.
 PM_HARVEST_POSTED=()
@@ -3449,6 +3449,14 @@ pm_hook_on_harvest() {
         "FS_HOOK_BRANCH=$branch" "FS_HOOK_AGENT=$agent"
 }
 
+pm_flag_quote_line() {
+    local s
+    s="$(tr -d '[:cntrl:]' <<< "$1")"
+    printf '%s' "${s:0:120}"
+}
+
+pm_harvest_one_file() {
+    local mf="$1" agent="$2" tid="$3" trigger="$4" trigger_hops="$5"
     local harness="${6:-}" model="${7:-}" network="${8:-}" project="${9:-}"
     local review_target_key="${10:-}" wake_branch="${11:-}"
     local spawn_rt_branch="${12:-}" spawn_rt_sha="${13:-}" spawn_rt_version="${14:-}"
@@ -3623,6 +3631,7 @@ pm_hook_on_harvest() {
             pm_flag "$tid" "review target not recorded after posting"
         fi
     fi
+    [[ -z "$posted_id" ]] || PM_HARVEST_POSTED+=("$posted_id")
     return 0
 }
 
@@ -3631,7 +3640,6 @@ pm_followup_wake() {
     # Returns 1 on every early refusal below (never reaching pm_spawn_wake)
     # and 0 once it does -- pm_retry_pass (the only caller that checks this
     # return) treats 1 as terminal for that trigger's retry schedule: hops
-    [[ -z "$posted_id" ]] || PM_HARVEST_POSTED+=("$posted_id")
     # and thread-budget stay refused forever once tripped, so leaving the
     # schedule in place would just retry into the same gate on every later
     # pass. The pre-existing pending-message caller (pm_harvest_run) never
@@ -4089,6 +4097,7 @@ pm_harvest_run() {
     [[ "$trigger_hops" =~ ^[0-9]+$ ]] || trigger_hops=0
 
     local mf replies=0
+    PM_HARVEST_POSTED=()
     for mf in "$run_dir/outbox"/mail-*.md; do
         [[ -e "$mf" ]] || continue
         if pm_harvest_one_file "$mf" "$agent" "$tid" "$trigger" "$trigger_hops" "$harness" "$model" "$network" \
@@ -4097,8 +4106,8 @@ pm_harvest_run() {
             replies=$(( replies + 1 ))
         fi
     done
-    PM_HARVEST_POSTED=()
     pm_event "harvest thread=${tid:0:8} agent=$agent replies=$replies"
+    local -a posted_ids=("${PM_HARVEST_POSTED[@]}")
 
     mkdir -p -- "$HARVESTED"
     : > "$HARVESTED/$rid"
@@ -4107,7 +4116,6 @@ pm_harvest_run() {
     # never resumed anything has no session for clearing to help), and 3
     # in a row for the same pair clears the recorded session so the next
     # wake starts fresh rather than wedging on it forever. Gated on
-    local -a posted_ids=("${PM_HARVEST_POSTED[@]}")
     # sessions_tracked too: a given-mode harness (pi) always sets RESUMED
     # (its id is derived, not discovered -- see pm_spawn_wake), so RESUMED
     # alone would count every failed pi wake toward a clear that can never
@@ -4164,6 +4172,8 @@ pm_harvest_run() {
     elif (( was_failure )); then
         pm_retry_schedule "$tid" "$agent" "$trigger" "$rid"
     fi
+
+    pm_hook_on_harvest "$tid" "$rid" "$branch" "$agent" "${posted_ids[@]}"
 }
 
 pm_harvest_pass() {
@@ -4172,8 +4182,6 @@ pm_harvest_pass() {
     for f in "$RUNS"/*.env; do
         [[ -e "$f" ]] || continue
         rid="$(basename -- "$f" .env)"
-
-    pm_hook_on_harvest "$tid" "$rid" "$branch" "$agent" "${posted_ids[@]}"
         [[ -e "$HARVESTED/$rid" ]] && continue
         pm_harvest_run "$project" "$rid"
     done
@@ -4310,6 +4318,175 @@ pm_held_pass() {
 
 # ---- verbs ----
 
+# ---- hook pass: on-target and on-quiescent ----
+#
+# Both are detected by comparing the store with $HOOK_MARKS, not called from
+# whatever caused them: the kickoff's target is written by mail.sh, which
+# this script never sees happen, and quiescence is a state, not an action.
+# A marker is written BEFORE its hook fires (a crash loses at most one event
+# and never repeats one) and is kept whether or not a hook exists, so
+# installing a hook later replays no history.
+HOOK_MARKS="$STATE/hook-marks"
+
+pm_hook_mark() {
+    local dir="$1" name="$2" value="$3" tmp
+    mkdir -p -- "$dir"
+    tmp="$(mktemp "$dir/.tmp.XXXXXX")"
+    printf '%s\n' "$value" > "$tmp"
+    mv -- "$tmp" "$dir/$name"
+}
+
+pm_thread_message_count() {
+    local tid="$1" f n=0
+    for f in "$MAIL_ROOT/threads/$tid"/*.msg; do
+        [[ -e "$f" ]] && n=$(( n + 1 ))
+    done
+    printf '%s' "$n"
+}
+
+# A thread is quiescent when nothing is running or waiting on it: no live
+# run, no unrouted message (this covers the debounce gate), no retry record
+# and no held seat. A flagged thread can be quiescent.
+pm_thread_is_quiescent() {
+    local tid="$1" f rid
+    for f in "$RUNS"/*.env; do
+        [[ -e "$f" ]] || continue
+        [[ "$(fs_pm_env_get "$f" THREAD)" == "$tid" ]] || continue
+        rid="$(basename -- "$f" .env)"
+        [[ -e "$HARVESTED/$rid" ]] || return 1
+    done
+    [[ "$(pm_thread_unrouted_count "$tid")" == 0 ]] || return 1
+    for f in "$RETRIES/$tid"/* "$STATE/held/$tid"/*; do
+        [[ -e "$f" ]] && return 1
+    done
+    return 0
+}
+
+# The extra env words on-quiescent carries, into PM_HOOK_QUIESCENT.
+pm_hook_quiescent_env() {
+    local tid="$1" count="$2" flagged=0 reason=""
+    if [[ -f "$NEEDS_OPERATOR/$tid" ]]; then
+        flagged=1
+        reason="$(cat -- "$NEEDS_OPERATOR/$tid")"
+    fi
+    PM_HOOK_QUIESCENT=("FS_HOOK_MESSAGE_COUNT=$count" "FS_HOOK_FLAGGED=$flagged" "FS_HOOK_FLAG_REASON=$reason")
+}
+
+pm_hook_pass() {
+    local project="$1" rt tid count cur d
+    local -a PM_HOOK_QUIESCENT=()
+    if [[ ! -d "$HOOK_MARKS" ]]; then
+        # First pass on a store that has never run hooks: record where it
+        # is, fire nothing. Built aside and renamed so a crash never leaves
+        # a half-seeded directory that would fire for the rest.
+        local seed
+        seed="$(mktemp -d "$STATE/.hook-marks.XXXXXX")"
+        for rt in "$STATE/review-target"/*.env; do
+            [[ -e "$rt" ]] || continue
+            tid="$(basename -- "$rt" .env)"
+            pm_hook_mark "$seed/target" "$tid" "$(fs_pm_env_get "$rt" VERSION) $(fs_pm_env_get "$rt" SHA)"
+        done
+        for d in "$MAIL_ROOT/threads"/*/; do
+            [[ -d "$d" ]] || continue
+            tid="$(basename -- "$d")"
+            count="$(pm_thread_message_count "$tid")"
+            (( count > 0 )) || continue
+            pm_thread_is_quiescent "$tid" || continue
+            pm_hook_mark "$seed/quiescent" "$tid" "$count"
+        done
+        mkdir -p -- "$seed/target" "$seed/quiescent"
+        mv -- "$seed" "$HOOK_MARKS"
+        return 0
+    fi
+
+    for rt in "$STATE/review-target"/*.env; do
+        [[ -e "$rt" ]] || continue
+        tid="$(basename -- "$rt" .env)"
+        cur="$(fs_pm_env_get "$rt" VERSION) $(fs_pm_env_get "$rt" SHA)"
+        [[ "$(cat -- "$HOOK_MARKS/target/$tid" 2>/dev/null)" == "$cur" ]] && continue
+        pm_hook_mark "$HOOK_MARKS/target" "$tid" "$cur"
+        [[ -n "$(pm_hook_files on-target)" ]] || continue
+        local present=0
+        if pm_target_sha_present "$project" "$(fs_pm_env_get "$rt" BRANCH)" "$(fs_pm_env_get "$rt" SHA)"; then
+            present=1
+        fi
+        pm_hook_fire on-target "$tid" "FS_TARGET_SHA_PRESENT=$present"
+    done
+
+    for d in "$MAIL_ROOT/threads"/*/; do
+        [[ -d "$d" ]] || continue
+        tid="$(basename -- "$d")"
+        count="$(pm_thread_message_count "$tid")"
+        (( count > 0 )) || continue
+        [[ "$(cat -- "$HOOK_MARKS/quiescent/$tid" 2>/dev/null)" == "$count" ]] && continue
+        pm_thread_is_quiescent "$tid" || continue
+        pm_hook_mark "$HOOK_MARKS/quiescent" "$tid" "$count"
+        pm_hook_quiescent_env "$tid" "$count"
+        pm_hook_fire on-quiescent "$tid" "${PM_HOOK_QUIESCENT[@]}"
+    done
+}
+
+# `hook fire --thread <tid> --event on-target|on-quiescent [--project <path>]`:
+# re-fire one event by hand, for an operator recovering from a failed
+# deploy. Same env as an automatic fire, markers ignored and untouched,
+# every matching hook file run in the FOREGROUND under the same timeout, one
+# `file=<name> exit=<n>` line per file on stdout (the hooks' own output goes
+# to stderr). No store lock, no hook record. Exits 1 when any hook failed.
+cmd_hook() {
+    [[ "${1:-}" == fire ]] || { echo "Usage: fork-sandbox-postmaster.sh hook fire --thread <thread-id> --event on-target|on-quiescent [--project <path>]" >&2; return 2; }
+    shift
+    local tid="" event="" project=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --thread) tid="${2:?--thread requires a thread id}"; shift 2 ;;
+            --event) event="${2:?--event requires an event name}"; shift 2 ;;
+            --project) project="${2:?--project requires a path}"; shift 2 ;;
+            *) echo "Error: hook fire: unknown option '$1'." >&2; return 2 ;;
+        esac
+    done
+    [[ "$tid" =~ $PM_THREAD_ID_RE ]] || { echo "Error: hook fire: --thread must be a thread id." >&2; return 2; }
+    case "$event" in
+        on-target|on-quiescent) ;;
+        on-harvest) echo "Error: hook fire: on-harvest needs a run's context and cannot be re-fired by hand." >&2; return 2 ;;
+        *) echo "Error: hook fire: --event must be on-target or on-quiescent." >&2; return 2 ;;
+    esac
+    [[ -d "$MAIL_ROOT/threads/$tid" ]] || { echo "Error: hook fire: no such thread." >&2; return 1; }
+    if [[ -z "$project" ]]; then
+        project="$(cat -- "$STATE/project" 2>/dev/null || true)"
+    fi
+    PM_PROJECT="$project"
+    local -a extra=()
+    if [[ "$event" == on-target ]]; then
+        local rt="$STATE/review-target/$tid.env" present=0
+        [[ -f "$rt" ]] || { echo "Error: hook fire: thread has no review target." >&2; return 1; }
+        if [[ -n "$project" ]] && pm_target_sha_present "$project" "$(fs_pm_env_get "$rt" BRANCH)" "$(fs_pm_env_get "$rt" SHA)"; then
+            present=1
+        fi
+        extra=("FS_TARGET_SHA_PRESENT=$present")
+    else
+        local -a PM_HOOK_QUIESCENT=()
+        pm_hook_quiescent_env "$tid" "$(pm_thread_message_count "$tid")"
+        extra=("${PM_HOOK_QUIESCENT[@]}")
+    fi
+    local files file rc failed=0 hook
+    files="$(pm_hook_files "$event")"
+    if [[ -z "$files" ]]; then
+        echo "Error: hook fire: no executable hook for $event in $HOOKS_DIR." >&2
+        return 1
+    fi
+    pm_hook_env "$event" "$tid" "${extra[@]}"
+    while IFS= read -r file; do
+        hook="$HOOKS_DIR/$file"
+        set +e
+        env "${PM_HOOK_ENV[@]}" "$FS_TIMEOUT" --kill-after 10 "${FORK_SANDBOX_HOOK_TIMEOUT:-300}" "$hook" < /dev/null >&2
+        rc=$?
+        set -e
+        printf 'file=%s exit=%s\n' "$file" "$rc"
+        (( rc == 0 )) || failed=1
+    done <<< "$files"
+    return "$failed"
+}
+
 cmd_deliver() {
     local project="" once=0
     while [[ $# -gt 0 ]]; do
@@ -4345,6 +4522,7 @@ cmd_deliver() {
 
     PM_EVENTS_ENABLED=1
     PM_PROJECT="$project"
+    printf '%s\n' "$project" > "$STATE/project"
 
     if (( once )); then
         pm_hook_reap
@@ -4352,6 +4530,7 @@ cmd_deliver() {
         pm_held_pass "$project"
         pm_retry_pass "$project"
         pm_harvest_pass "$project"
+        pm_hook_pass "$project"
         return 0
     fi
 
@@ -4363,6 +4542,7 @@ cmd_deliver() {
         pm_held_pass "$project"
         pm_retry_pass "$project"
         pm_harvest_pass "$project"
+        pm_hook_pass "$project"
         (( stop )) && break
         sleep "${FORK_SANDBOX_POSTMASTER_INTERVAL:-15}" || true
     done
@@ -4371,20 +4551,27 @@ cmd_deliver() {
     exit 0
 }
 
+# How many of a thread's messages have no routed marker yet. A routed marker
+# is named for the message's Message-ID header (see pm_process_message), not
+# for its file; a message the debounce gate is holding is unrouted too.
+pm_thread_unrouted_count() {
+    local tid="$1" f mid unrouted=0
+    for f in "$MAIL_ROOT/threads/$tid"/*.msg; do
+        [[ -e "$f" ]] || continue
+        mid="$(pm_header "$f" Message-ID)"
+        [[ -n "$mid" && -e "$ROUTED/$mid" ]] || unrouted=$(( unrouted + 1 ))
+    done
+    printf '%s' "$unrouted"
+}
+
 # The per-thread JSON view of `status`. Facts are gathered here as a stream of
 # NUL-terminated tokens, tag first, and python3 turns them into JSON; nothing
 # is interpolated into python source. Read-only: unlike the text view it
 # creates no state directories.
 cmd_status_json() {
-    local tid="$1" f mid n=0 unrouted=0
+    local tid="$1" f n=0 unrouted
     local now; now="$(date +%s)"
-    for f in "$MAIL_ROOT/threads/$tid"/*.msg; do
-        [[ -e "$f" ]] || continue
-        # A routed marker is named for the message's Message-ID header
-        # (see pm_process_message), not for its file.
-        mid="$(pm_header "$f" Message-ID)"
-        [[ -n "$mid" && -e "$ROUTED/$mid" ]] || unrouted=$(( unrouted + 1 ))
-    done
+    unrouted="$(pm_thread_unrouted_count "$tid")"
 
     {
         printf '%s\0' thread "$tid" unrouted "$unrouted"
@@ -4693,9 +4880,10 @@ case "$verb" in
     status) cmd_status "$@" ;;
     flag) cmd_flag "$@" ;;
     unflag) cmd_unflag "$@" ;;
+    hook) cmd_hook "$@" ;;
     *)
         printf "fork-sandbox-postmaster: unknown verb '%s'\n" "$verb" >&2
-        printf '%s\n' 'Verbs: deliver status flag unflag' >&2
+        printf '%s\n' 'Verbs: deliver status flag unflag hook' >&2
         exit 2
         ;;
 esac

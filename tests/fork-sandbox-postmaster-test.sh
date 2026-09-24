@@ -4403,6 +4403,31 @@ fi
 check "happy: thread is not flagged" 0 \
     "$([[ -e "$FORK_SANDBOX_MAIL_ROOT/.postmaster/needs-operator/$tid" ]] && echo 1 || echo 0)"
 
+# --- on-harvest from a handler seat: empty branch, one posted id ---
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+hk_install on-harvest
+hkm_mid="$(send_msg '@carol' '@happy' 'Hook handler' 'do the hooked thing')"
+hkm_tid="$(thread_of "$hkm_mid")"
+once
+check "on-harvest (handler): fires once" 1 "$(hk_count on-harvest)"
+check "on-harvest (handler): FS_HOOK_BRANCH is empty" "" "$(hk_env on-harvest FS_HOOK_BRANCH)"
+check "on-harvest (handler): FS_HOOK_AGENT is the seat" "happy" "$(hk_env on-harvest FS_HOOK_AGENT)"
+check "on-harvest (handler): FS_HOOK_THREAD is the full thread id" "$hkm_tid" "$(hk_env on-harvest FS_HOOK_THREAD)"
+hk_reply_file=""
+for f in "$FORK_SANDBOX_MAIL_ROOT/threads/$hkm_tid"/*.msg; do
+    grep -qF 'Handled, thanks.' "$f" && hk_reply_file="$f"
+done
+check "on-harvest (handler): FS_HOOK_MESSAGES is the posted message id" \
+    "$(header_of_file "$hk_reply_file" Message-ID)" "$(hk_env on-harvest FS_HOOK_MESSAGES)"
+contains "on-harvest (handler): the event line carries the hook file" \
+    "$(cat "$work/once.out")" "pm hook thread=${hkm_tid:0:8} hook=on-harvest file=on-harvest exit=0"
+: > "$HANDLER_LOG"
+hkm_mid="$(send_msg '@carol' '@noreply' 'Hook noreply' 'nothing to say')"
+once
+check "on-harvest (handler): a harvest that posted nothing fires nothing" 1 "$(hk_count on-harvest)"
+hk_uninstall
+
 # --- scenario: a reader that hangs up right after the first event line
 #     must not kill deliver on its next pm_event write -- pm_event traps
 #     and ignores SIGPIPE around its own printf, scoped per-call (see
@@ -4624,30 +4649,6 @@ check "handler-outbox: no run-id directory survives across every scenario above"
 
 unset FORK_SANDBOX_POSTMASTER_TRIAGE_LAUNCHER
 unset FORK_SANDBOX_HANDLERS_DIR
-# --- on-harvest from a handler seat: empty branch, one posted id ---
-new_scratch_root FORK_SANDBOX_MAIL_ROOT
-export FORK_SANDBOX_MAIL_ROOT
-hk_install on-harvest
-hkm_mid="$(send_msg '@carol' '@happy' 'Hook handler' 'do the hooked thing')"
-hkm_tid="$(thread_of "$hkm_mid")"
-once
-check "on-harvest (handler): fires once" 1 "$(hk_count on-harvest)"
-check "on-harvest (handler): FS_HOOK_BRANCH is empty" "" "$(hk_env on-harvest FS_HOOK_BRANCH)"
-check "on-harvest (handler): FS_HOOK_AGENT is the seat" "happy" "$(hk_env on-harvest FS_HOOK_AGENT)"
-check "on-harvest (handler): FS_HOOK_THREAD is the full thread id" "$hkm_tid" "$(hk_env on-harvest FS_HOOK_THREAD)"
-hk_reply_file=""
-for f in "$FORK_SANDBOX_MAIL_ROOT/threads/$hkm_tid"/*.msg; do
-    grep -qF 'Handled, thanks.' "$f" && hk_reply_file="$f"
-done
-check "on-harvest (handler): FS_HOOK_MESSAGES is the posted message id" \
-    "$(header_of_file "$hk_reply_file" Message-ID)" "$(hk_env on-harvest FS_HOOK_MESSAGES)"
-contains "on-harvest (handler): the event line carries the hook file" \
-    "$(cat "$work/once.out")" "pm hook thread=${hkm_tid:0:8} hook=on-harvest file=on-harvest exit=0"
-: > "$HANDLER_LOG"
-hkm_mid="$(send_msg '@carol' '@noreply' 'Hook noreply' 'nothing to say')"
-once
-check "on-harvest (handler): a harvest that posted nothing fires nothing" 1 "$(hk_count on-harvest)"
-hk_uninstall
 export FORK_SANDBOX_FLEET_FILE="$SAVED_FLEET_FILE"
 export FORK_SANDBOX_PERSONAS_DIR="$SAVED_PERSONAS_DIR"
 
@@ -6047,7 +6048,8 @@ contains "review-target case B1: state file SHA updated to the wake's resolved s
 new_scratch_root FORK_SANDBOX_MAIL_ROOT
 export FORK_SANDBOX_MAIL_ROOT
 PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
-hk_install on-harvest
+hk_install on-harvest on-target
+once
 printf '%s\n' 'kick off review' > "$work/body.tmp"
 hkh_mid="$("$MAIL" send --from '@carol' --to '@ken' --subject 'hook harvest topic' \
     --body "$work/body.tmp" --hops 8 --review-target "pm-review-target-test-seed5:$rt5_seed_sha" 2>/dev/null)"
@@ -6055,6 +6057,12 @@ hkh_tid="$(thread_of "$hkh_mid")"
 once
 check "on-harvest: the first harvest (the stub's one reply) fires once" 1 "$(hk_count on-harvest)"
 check "on-harvest: FS_TARGET_VERSION is 1 before the target moves" 1 "$(hk_env on-harvest FS_TARGET_VERSION)"
+check "on-target: the kickoff (version 1) fired it once" 1 "$(hk_count on-target)"
+check "on-target: the kickoff's version is 1" 1 "$(hk_env on-target FS_TARGET_VERSION)"
+check "on-target: the kickoff's branch" "pm-review-target-test-seed5" "$(hk_env on-target FS_TARGET_BRANCH)"
+check "on-target: the kickoff's sha" "$rt5_seed_sha" "$(hk_env on-target FS_TARGET_SHA)"
+check "on-target: the sha is in the repo" 1 "$(hk_env on-target FS_TARGET_SHA_PRESENT)"
+check "on-target: the event names the thread" "$hkh_tid" "$(hk_env on-target FS_HOOK_THREAD)"
 hkh_env="$(latest_env_for_agent ken)"
 hkh_run_dir="$(env_val "$hkh_env" RUN_DIR)"
 hkh_branch="$(env_val "$hkh_env" BRANCH)"
@@ -6079,6 +6087,9 @@ check "on-harvest: FS_HOOK_RUN is the run id" "$(basename "$hkh_env" .env)" "$(h
 check "on-harvest: FS_HOOK_BRANCH is the wake's branch" "$hkh_branch" "$(hk_env on-harvest FS_HOOK_BRANCH)"
 check "on-harvest: FS_HOOK_AGENT is the resolved seat" "ken" "$(hk_env on-harvest FS_HOOK_AGENT)"
 check "on-harvest: the hook sees the moved target (FS_TARGET_VERSION=2)" 2 "$(hk_env on-harvest FS_TARGET_VERSION)"
+check "on-target: a sets seat's Version: 2 fires it again" 2 "$(hk_count on-target)"
+check "on-target: the moved target is version 2" 2 "$(hk_env on-target FS_TARGET_VERSION)"
+check "on-target: the moved target's setter" "@ken" "$(hk_env on-target FS_TARGET_SET_BY)"
 check "on-harvest: FS_TARGET_BRANCH is the moved branch" "$hkh_branch" "$(hk_env on-harvest FS_TARGET_BRANCH)"
 check "on-harvest: FS_TARGET_SET_BY names the setter" "@ken" "$(hk_env on-harvest FS_TARGET_SET_BY)"
 check "on-harvest: FS_TARGET_REPO is the deliver --project path" "$PROJECT_DIR" "$(hk_env on-harvest FS_TARGET_REPO)"
@@ -6091,6 +6102,7 @@ printf '0\n' > "$hkh_run_dir/exit-code"
 printf '{}\n' > "$hkh_run_dir/summary.json"
 once
 check "on-harvest: a harvest that posted nothing fires nothing" 2 "$(hk_count on-harvest)"
+check "on-target: a harvest that moved nothing does not fire it again" 2 "$(hk_count on-target)"
 hk_uninstall
 
 # ---- review-target case B2: Version: 1 on a thread already at VERSION=1
@@ -6579,6 +6591,144 @@ for (( hk_i = 0; hk_i < 105; hk_i++ )); do : > "$HK_STATE/hooks/logs/old-$hk_i.l
 hk_call pm_hook_reap >/dev/null 2>&1
 check "hooks: hooks/logs keeps the newest 100 files" "100" \
     "$(find "$HK_STATE/hooks/logs" -type f | wc -l)"
+
+# ============================================================
+printf '\n== hooks: on-target and on-quiescent are detected, once per change ==\n'
+# ============================================================
+
+hk_finish_runs() {
+    local f rd
+    for f in "$FORK_SANDBOX_MAIL_ROOT/.postmaster/runs"/*.env; do
+        [[ -e "$f" ]] || continue
+        [[ -e "$FORK_SANDBOX_MAIL_ROOT/.postmaster/harvested/$(basename "$f" .env)" ]] && continue
+        rd="$(sed -n 's/^RUN_DIR=//p' "$f")"
+        mkdir -p -- "$rd/outbox"
+        printf '0\n' > "$rd/exit-code"
+        printf '{}\n' > "$rd/summary.json"
+    done
+}
+hk_target_sha="$(git -C "$PROJECT_DIR" rev-parse HEAD)"
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+HK_ST="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+hk_install on-target on-quiescent
+once
+printf '%s\n' 'review this' > "$work/body.tmp"
+hk_mid="$("$MAIL" send --from '@alice' --to '@carol' --subject 'hook detect' \
+    --body "$work/body.tmp" --hops 8 --review-target "hk-branch:$hk_target_sha" 2>/dev/null)"
+hk_tid="$(thread_of "$hk_mid")"
+once
+check "hooks: the kickoff's target fires on-target once" 1 "$(hk_count on-target)"
+check "on-target: VERSION is 1" 1 "$(hk_env on-target FS_TARGET_VERSION)"
+check "on-target: BRANCH" "hk-branch" "$(hk_env on-target FS_TARGET_BRANCH)"
+check "on-target: SHA" "$hk_target_sha" "$(hk_env on-target FS_TARGET_SHA)"
+check "on-target: SHA_PRESENT is 1 for a commit in the repo" 1 "$(hk_env on-target FS_TARGET_SHA_PRESENT)"
+check "on-quiescent: not while a run is live" 0 "$(hk_count on-quiescent)"
+once
+check "on-target: the next pass does not fire it again" 1 "$(hk_count on-target)"
+hk_finish_runs
+once
+check "on-quiescent: fires once the run is harvested" 1 "$(hk_count on-quiescent)"
+check "on-quiescent: FS_HOOK_MESSAGE_COUNT" 1 "$(hk_env on-quiescent FS_HOOK_MESSAGE_COUNT)"
+check "on-quiescent: FS_HOOK_FLAGGED is 0" 0 "$(hk_env on-quiescent FS_HOOK_FLAGGED)"
+check "on-quiescent: the target env rides along on every event" 1 "$(hk_env on-quiescent FS_TARGET_VERSION)"
+once
+check "on-quiescent: not again on the next pass" 1 "$(hk_count on-quiescent)"
+
+# A new message the debounce gate holds is unrouted: not quiescent.
+export FORK_SANDBOX_POSTMASTER_DEBOUNCE=300
+reply_msg '@alice' "$hk_mid" 'more thoughts' --to '@carol' >/dev/null
+once
+check "on-quiescent: not while a message is unrouted (debounce)" 1 "$(hk_count on-quiescent)"
+export FORK_SANDBOX_POSTMASTER_DEBOUNCE=0
+once
+check "on-quiescent: not while the woken run is live" 1 "$(hk_count on-quiescent)"
+hk_finish_runs
+once
+check "on-quiescent: fires again after a new message cycle" 2 "$(hk_count on-quiescent)"
+check "on-quiescent: the count moved to 2" 2 "$(hk_env on-quiescent FS_HOOK_MESSAGE_COUNT)"
+check "on-target: no new target, no new on-target" 1 "$(hk_count on-target)"
+
+# The blockers, asked directly.
+hk_q() { pm_thread_is_quiescent "$hk_tid" && echo yes || echo no; }
+check "quiescence: an idle thread is quiescent" yes "$(hk_call hk_q)"
+mkdir -p "$HK_ST/retries/$hk_tid"; printf 'STATE=pending\n' > "$HK_ST/retries/$hk_tid/carol"
+check "quiescence: a retry record blocks it" no "$(hk_call hk_q)"
+rm -rf "$HK_ST/retries/$hk_tid"
+mkdir -p "$HK_ST/held/$hk_tid"; printf 'TRIGGER=x\n' > "$HK_ST/held/$hk_tid/carol"
+check "quiescence: a held seat blocks it" no "$(hk_call hk_q)"
+rm -rf "$HK_ST/held/$hk_tid"
+check "quiescence: clear again" yes "$(hk_call hk_q)"
+
+# A flagged thread can settle; the hook is told.
+"$postmaster" flag "$hk_tid" "needs a human" >/dev/null 2>&1
+rm -f "$HK_ST/hook-marks/quiescent/$hk_tid"
+once
+check "on-quiescent: a flagged thread that settles fires" 3 "$(hk_count on-quiescent)"
+check "on-quiescent: FS_HOOK_FLAGGED is 1" 1 "$(hk_env on-quiescent FS_HOOK_FLAGGED)"
+check "on-quiescent: FS_HOOK_FLAG_REASON is the flag's content" "needs a human" "$(hk_env on-quiescent FS_HOOK_FLAG_REASON)"
+
+# Manual re-fire: same env, markers untouched, foreground, no lock, no record.
+hk_mark_before="$(cat "$HK_ST/hook-marks/target/$hk_tid")"
+hk_out="$("$postmaster" hook fire --thread "$hk_tid" --event on-target 2>/dev/null)"; hk_rc=$?
+check "hook fire: on-target prints one file line" "file=on-target exit=0" "$hk_out"
+check "hook fire: exit 0 when the hook succeeded" 0 "$hk_rc"
+check "hook fire: the hook ran (count moved)" 2 "$(hk_count on-target)"
+check "hook fire: SHA_PRESENT is computed (deliver recorded the project)" 1 "$(hk_env on-target FS_TARGET_SHA_PRESENT)"
+check "hook fire: the target marker is untouched" "$hk_mark_before" "$(cat "$HK_ST/hook-marks/target/$hk_tid")"
+check "hook fire: no hook record is written" 0 "$(find "$HK_ST/hooks/run" -mindepth 1 2>/dev/null | wc -l)"
+hk_out="$("$postmaster" hook fire --thread "$hk_tid" --event on-quiescent 2>/dev/null)"
+check "hook fire: on-quiescent prints one file line" "file=on-quiescent exit=0" "$hk_out"
+check "hook fire: on-quiescent carries the current count" 2 "$(hk_env on-quiescent FS_HOOK_MESSAGE_COUNT)"
+check "hook fire: on-quiescent carries the flag state" 1 "$(hk_env on-quiescent FS_HOOK_FLAGGED)"
+printf '#!/usr/bin/env bash\nexit 3\n' > "$HK_DIR/on-target.zz-fail"; chmod +x "$HK_DIR/on-target.zz-fail"
+hk_out="$("$postmaster" hook fire --thread "$hk_tid" --event on-target 2>/dev/null)"; hk_rc=$?
+check "hook fire: one line per file, in order" "file=on-target exit=0
+file=on-target.zz-fail exit=3" "$hk_out"
+check "hook fire: non-zero when any hook failed" 1 "$hk_rc"
+rm -f "$HK_DIR/on-target.zz-fail"
+hk_rc=0; "$postmaster" hook fire --thread "$hk_tid" --event on-harvest >/dev/null 2>&1 || hk_rc=$?
+check "hook fire: on-harvest is refused" 2 "$hk_rc"
+hk_uninstall
+
+# SHA_PRESENT is 0 for a sha that is not in the repo, and the hook still fires.
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+hk_install on-target
+once
+hk_mid="$("$MAIL" send --from '@alice' --to '@carol' --subject 'hook missing sha' \
+    --body "$work/body.tmp" --hops 8 --review-target "hk-missing:1111111111111111111111111111111111111111" 2>/dev/null)"
+once
+check "on-target: fires for a sha that is absent" 1 "$(hk_count on-target)"
+check "on-target: SHA_PRESENT is 0 for it" 0 "$(hk_env on-target FS_TARGET_SHA_PRESENT)"
+hk_uninstall
+
+# Seeding: a store with a target and a finished thread before the first
+# hook-aware pass fires nothing; later activity does.
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+HK_ST="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+hk_mid="$("$MAIL" send --from '@alice' --to '@carol' --subject 'hook seed' \
+    --body "$work/body.tmp" --hops 8 --review-target "hk-branch:$hk_target_sha" 2>/dev/null)"
+hk_tid="$(thread_of "$hk_mid")"
+once
+hk_finish_runs
+once
+rm -rf "$HK_ST/hook-marks"
+hk_install on-target on-quiescent
+once
+check "seeding: an old target fires nothing" 0 "$(hk_count on-target)"
+check "seeding: an old finished thread fires nothing" 0 "$(hk_count on-quiescent)"
+once
+check "seeding: nor does the next pass" 0 "$(hk_count on-quiescent)"
+reply_msg '@alice' "$hk_mid" 'fresh activity' --to '@carol' >/dev/null
+once
+hk_finish_runs
+once
+check "seeding: new activity then a harvest fires on-quiescent" 1 "$(hk_count on-quiescent)"
+check "seeding: and still no on-target" 0 "$(hk_count on-target)"
+hk_uninstall
 
 # ============================================================
 printf '\n== --help and dispatcher wiring ==\n'
