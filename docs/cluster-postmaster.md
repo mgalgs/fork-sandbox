@@ -173,7 +173,10 @@ Seat pods cannot reach it: the agent NetworkPolicy pins their egress.
 **Security.** The API container holds no ServiceAccount token: the pod
 turns off the automatic mount and projects the token into the postmaster
 container only, so the network-facing container cannot read the
-namespace's Secrets. It speaks plain HTTP; a site that wants TLS fronts it
+namespace's Secrets. It has its own `$HOME` and `/tmp`, never the
+postmaster's, since the postmaster reads its kubeconfig, gitconfig and
+deploy key from `$HOME`; the only volume the two containers share is the
+mail root. It speaks plain HTTP; a site that wants TLS fronts it
 itself.
 
 ## Operators

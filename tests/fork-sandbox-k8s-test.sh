@@ -13315,6 +13315,8 @@ check "tokens file: the mail-api container mounts none of git/config/sa-token" "
     "$(pm_api_dep '.spec.template.spec.containers[] | select(.name == "mail-api") | .volumeMounts[] | select(.name == "git" or .name == "config" or .name == "sa-token") | .name' | grep -c .)"
 check "tokens file: the mail-api container mounts neither src nor home-claude" "0" \
     "$(pm_api_dep '.spec.template.spec.containers[] | select(.name == "mail-api") | .volumeMounts[] | select(.mountPath == "/home/fs/src" or .mountPath == "/home/fs/.claude") | .mountPath' | grep -c .)"
+check "tokens file: the mail-api container shares only the data volume with the postmaster" "data" \
+    "$(pm_api_dep '.spec.template.spec.containers | ([.[] | select(.name == "mail-api") | .volumeMounts[].name]) as $a | [.[] | select(.name == "postmaster") | .volumeMounts[].name | select(. as $n | $a | index($n))] | unique | join(" ")')"
 check "tokens file: both containers carry the configured operator list" "@alice,@operator @alice,@operator" \
     "$(pm_api_dep '.spec.template.spec.containers[] | .env[] | select(.name == "FORK_SANDBOX_OPERATORS") | .value' | paste -sd' ')"
 if command -v yamllint >/dev/null 2>&1; then

@@ -294,10 +294,15 @@ spec:
             limits:
               cpu: 500m
               memory: 256Mi
+          # Its own HOME and /tmp, never the postmaster's: the postmaster
+          # container reads $HOME/.kube/config, $HOME/.gitconfig and the
+          # deploy key under $HOME/.ssh, so a writable HOME shared with
+          # this network-facing container would let it plant code that
+          # runs where the service-account token is mounted.
           volumeMounts:
-            - name: home
+            - name: mail-api-home
               mountPath: /home/fs
-            - name: tmp
+            - name: mail-api-tmp
               mountPath: /tmp
             - name: data
               mountPath: /var/tmp/claude-scratch
@@ -340,6 +345,10 @@ spec:
                       fieldRef:
                         fieldPath: metadata.namespace
         # >>> mail-api volume
+        - name: mail-api-home
+          emptyDir: {}
+        - name: mail-api-tmp
+          emptyDir: {}
         - name: mail-api-tokens
           secret:
             secretName: fork-sandbox-mail-api-tokens
