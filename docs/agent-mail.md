@@ -443,7 +443,7 @@ A `backend: k8s` seat (see "The fleet registry" above) runs its wake as a
 Kubernetes Job reviewing a per-thread preview environment, so it needs a
 per-thread egress grant: which cluster namespace(s)/ports it may reach,
 which host:port probes to run, and optionally a read-only context
-directory. Those values differ per thread and so cannot live in
+directory or a labeled Kubernetes Secret. Those values differ per thread and so cannot live in
 fleet.yaml; they live in a grant file instead, keyed by thread.
 
 Three fleet.yaml-only keys mark a seat this way and configure it (persona
@@ -469,6 +469,7 @@ since it may arrive from repo persona frontmatter the machine cannot unset.
 ```bash
 fork-sandbox-mail.sh grant <thread-id> [--allow-namespace NS[:PORT]]...
                               [--reach-probe HOST:PORT]... [--context-ro DIR]
+                              [--context-secret NAME]
 fork-sandbox-mail.sh grant <thread-id> --clear
 fork-sandbox-mail.sh grant <thread-id> --show [--json]
 ```
@@ -482,9 +483,16 @@ docs/kubernetes-runs.md for the pairing rule, the per-probe checks and the
 exit codes (0 ok, 1 usage/unknown thread, 2 refused value); `grant` shares
 that exact behavior rather than re-checking anything itself.
 
-`mail send` accepts the same three flags to grant a brand-new thread at
+`--context-secret NAME` mounts a Kubernetes Secret read-only at
+`/work/context` in the seat's pod. `check-grant` checks the name, refuses
+reserved names, and refuses it together with `--context-ro`; the
+Secret's labels are checked when the seat is submitted. See "Getting a
+Secret in: --context-secret" in docs/kubernetes-runs.md. `grant --show
+--json` reports it as `context_secret`, `null` when absent.
+
+`mail send` accepts the same four flags to grant a brand-new thread at
 creation time; the check runs before the thread is created, so a refused
-value leaves nothing behind. `mail reply` refuses all three — a grant
+value leaves nothing behind. `mail reply` refuses all four — a grant
 applies only at thread creation, never on an existing thread (use the
 `grant` verb for that instead).
 
@@ -495,7 +503,10 @@ Path: `$MAIL_ROOT/.postmaster/grants/<thread-id>.env`. Written atomically
 partial file. The body is `check-grant`'s stdout verbatim: repeatable
 `ALLOW_NAMESPACE=<value>` and `REACH_PROBE=<value>` lines, one per flag, in
 the order given, values exactly as given (not normalized), plus a trailing
-`CONTEXT_RO=<realpath>` line only when `--context-ro` was given.
+`CONTEXT_RO=<realpath>` line only when `--context-ro` was given, then a
+trailing `CONTEXT_SECRET=<name>` line only when `--context-secret` was
+given (always the last line). The postmaster forwards it to a k8s seat as
+`--context-secret <name>`.
 
 This file applies only to `backend: k8s` seats; a local seat on the same
 thread has nothing that reads it and ignores it by construction.

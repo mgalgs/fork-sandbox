@@ -155,7 +155,7 @@ flag and refused, since there is no way to tell it from one.
 
 | verb | positionals | flags | auth |
 |---|---|---|---|
-| send | 0 | `--from --to --cc --subject --body --attach* --hops --header* --allow-namespace* --reach-probe* --review-target` | `--from` in the token's identities; `--allow-namespace`/`--reach-probe` also need cap `grant`; `--review-target` also needs cap `target` |
+| send | 0 | `--from --to --cc --subject --body --attach* --hops --header* --allow-namespace* --reach-probe* --context-secret --review-target` | `--from` in the token's identities; `--allow-namespace`/`--reach-probe`/`--context-secret` also need cap `grant`; `--review-target` also needs cap `target` |
 | reply | 0 | `--from --reply-to --body --to --cc --subject --attach* --hops --header*` | `--from` in the token's identities |
 | show | 1 | | `read` |
 | tree | 1 | | `read` |
@@ -163,7 +163,7 @@ flag and refused, since there is no way to tell it from one.
 | inbox | 1 | `--all` | `read` |
 | export | 1 | `--json` | `read` |
 | seen | 1+ | | the first positional in the token's identities, and cap `seen` |
-| grant | 1 | `--allow-namespace* --reach-probe* --clear --show --json` | `--show` alone needs `read`; anything else needs `grant` |
+| grant | 1 | `--allow-namespace* --reach-probe* --context-secret --clear --show --json` | `--show` alone needs `read`; anything else needs `grant` |
 
 (`*` marks a repeatable flag.)
 
@@ -183,7 +183,9 @@ the loader already refused to load any client entry that lists one.
 `send` and `grant` refuse `--context-ro` (403: "a host path has no meaning
 over the API") even for an operator, since it names a path on the
 server's own host and the API has no way to honor it -- it is left out of
-the table entirely rather than given a value form.
+the table entirely rather than given a value form. `--context-secret` is
+allowed: a Secret name means the same thing over the API as on the host. It
+is a single-value flag and needs cap `grant`, like the other grant flags.
 
 `mail`'s own rule that a namespace grant needs at least one
 `--reach-probe` still applies over the API: the server only checks that

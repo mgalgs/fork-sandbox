@@ -249,7 +249,7 @@ edges are the flags' own — plus the edges of the two preset-only knobs:
 
 What a preset deliberately cannot set: the task-shaped flags. `--branch`,
 `--checkout`, `--k8s`, `--review-only`, `--task-meta`, `--context-ro`,
-`--prompts-dir` and the rest describe *this run's task*; a preset
+`--context-secret`, `--prompts-dir` and the rest describe *this run's task*; a preset
 describes *how much machine a class of task deserves*. Keeping the file
 to the second kind is what keeps one preset reusable across many runs.
 

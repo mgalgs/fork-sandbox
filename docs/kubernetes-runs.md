@@ -1026,10 +1026,12 @@ they are `--k8s`-only: a local sandbox has no cluster namespaces to grant.
 ### Checking a grant ahead of time: `check-grant`
 
 `fork-sandbox-k8s.sh check-grant [--allow-namespace NS[:PORT]]...
-[--reach-probe HOST:PORT]... [--context-ro DIR]` runs the grant-time half of
-the checks `submit` runs on these three flags — the pairing rule, the
-per-probe HOST:PORT/DNS-shape/grant-match checks above, and `--context-ro`'s
-forks/-only-and-no-links checks — sharing the exact same functions, so a
+[--reach-probe HOST:PORT]... [--context-ro DIR | --context-secret NAME]` runs
+the grant-time half of the checks `submit` runs on these flags — the pairing
+rule, the per-probe HOST:PORT/DNS-shape/grant-match checks above,
+`--context-ro`'s forks/-only-and-no-links checks, and `--context-secret`'s
+name checks (see "Getting a Secret in: --context-secret") — sharing the exact
+same functions, so a
 grant `check-grant` accepts is one `submit` will also accept later, and a
 grant it refuses is refused for the identical reason. It contacts no
 cluster: no `kubectl`, and it needs no `k8s.env` at all (every other verb
@@ -1040,9 +1042,14 @@ Exit codes: **0** on success, printing to stdout only — nothing else — one
 line per flag in the order given: `ALLOW_NAMESPACE=<value>` (one per
 `--allow-namespace`, value exactly as given, not normalized), then
 `REACH_PROBE=<value>` (same, per `--reach-probe`), then, only when
-`--context-ro` was given, `CONTEXT_RO=<realpath of DIR>`. **1** for no flags
+`--context-ro` was given, `CONTEXT_RO=<realpath of DIR>`, then, only when
+`--context-secret` was given, `CONTEXT_SECRET=<name>` as the last line.
+`--context-ro` and `--context-secret` together are refused. **1** for no flags
 at all or an unknown option — a usage error. **2** for a refused value,
 printing the same message `submit` would print for the same input.
+
+`check-grant` checks the Secret's *name* only. The Secret's labels need the
+cluster, so `submit` checks those.
 
 This stdout format IS the grant file format `fork-sandbox mail grant`
 writes verbatim — see "Per-thread k8s grants" in `docs/agent-mail.md`.
@@ -1528,6 +1535,62 @@ A run that needs something larger or more specific still than one pushed
 directory — a general "hand the pod any host path" mechanism, or a
 provisioned cache shared across runs — has no broader answer yet; that
 remains a later round, once real usage says what shape it should take.
+
+## Getting a Secret in: --context-secret
+
+`--context-secret NAME` (on `submit`, `run` and `fork-sandbox.sh --k8s`)
+mounts the Kubernetes Secret `NAME` read-only at `/work/context` in the
+agent container, one file per key. Use it when a task depends on a
+credential, such as an API key for a preview environment the seat must
+exercise. The handoff gets a `## Context secret` section that names the
+Secret and tells the agent to read what the task needs and never print,
+copy, log or commit its contents. It never includes a value.
+
+Anything that can create a pod can mount any Secret in its namespace,
+whatever its own Secret permissions say. A name in a flag would therefore
+hand a seat the provider key if nothing stopped it. Two label rules and a
+list of reserved names stop it:
+
+- The Secret must carry the label `fork-sandbox/context=true`. This is the
+  opt-in: only a Secret someone labeled for this purpose can be mounted.
+- The Secret must **not** carry the label `fork-sandbox/branch`. `rm` and
+  the submit failure trap delete Secrets by that label, so a context Secret
+  carrying it would be deleted by the first run that used it. The per-run
+  Claude token Secrets carry it too.
+- Names starting `fork-sandbox-` are refused. Every Secret the installer
+  creates starts that way (the upstream key, the postmaster's git
+  credentials, the mail API tokens). Names ending `-claude-token` are
+  refused too: those are the per-run token Secrets.
+
+The name must also be a DNS-1123 subdomain. `check-grant` and `submit`
+check the name and the reserved names with no cluster. `submit` checks the
+labels with `kubectl get secret NAME -o json`, after `--dry-run` has
+exited, and refuses with a one-line reason when the Secret does not exist,
+lacks `fork-sandbox/context=true`, or carries `fork-sandbox/branch`. It
+reads only the labels, never the data. `--dry-run` renders the volume and
+the mount and skips the label check.
+
+The mount is on the agent container only, not the init containers. The
+volume uses `defaultMode: 0440`; the pod runs with `fsGroup: 1000`, so the
+group read bit is enough.
+
+The site creates the Secret in the fork-sandbox namespace and labels it. The
+installer does not:
+
+```bash
+kubectl create secret generic preview-ctx --from-literal=API_KEY=...
+kubectl label secret preview-ctx fork-sandbox/context=true
+```
+
+`--context-secret` and `--context-ro` cannot be combined, in `check-grant`,
+`submit` and `fork-sandbox.sh`. `--context-ro` extracts its tar into
+`/work/context`, the same path the Secret mounts at. A local (non-`--k8s`)
+run refuses `--context-secret`: a local sandbox has no Secrets, and
+`--context-ro` already hands it a directory. A preset cannot set it.
+
+A thread can carry it as a grant: see "Per-thread k8s grants" in
+`docs/agent-mail.md`. The postmaster passes it to every k8s seat on that
+thread.
 
 ## Getting files in: --thread-dir and --attach-dir
 
