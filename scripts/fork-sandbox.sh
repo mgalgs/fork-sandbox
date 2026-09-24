@@ -433,6 +433,21 @@
 #                        loop anyway. Default 6. Requires --refresh-at (which
 #                        is on by default), so it inherits the same harness
 #                        restriction. Forwarded as given with --k8s.
+# --kit-skill <name>:    bind one more skill from $HOME/.claude/skills/<name>
+#                        into every seat of this run, read-only, on top of
+#                        the machine's agent kit (AGENT_KIT_SKILLS in
+#                        $config_dir/kit.env, names separated by spaces
+#                        and/or commas). Repeatable, and additive: the
+#                        machine list comes first, then these in the order
+#                        given. Repeats are dropped, and so are the review
+#                        kit's own two skills, which are always bound. A
+#                        name that does not resolve to a directory holding
+#                        SKILL.md is a launch error, before anything is
+#                        created. A skill must be self-contained: symlinks
+#                        that point outside its directory dangle in the
+#                        sandbox. pi legs are also handed --skill for each.
+#                        Refused with --k8s, which ships no extra skills; a
+#                        machine kit with --k8s prints a NOTICE and goes on.
 # --k8s:                 submit this run as a Kubernetes Job instead of a
 #                        local sandbox, by exec'ing fork-sandbox-k8s.sh run
 #                        with the arguments below. Defaults --harness to pi,
@@ -768,6 +783,11 @@
 # toolbox are bound in; pi is handed each skill with --skill, because its $HOME
 # here is a fresh tmpfs with no settings file to discover them from. A handoff
 # should ask for a skill by name rather than with a slash command.
+#
+# The agent kit is the same mechanism for skills of your own. Name them in
+# AGENT_KIT_SKILLS in $config_dir/kit.env, or per launch with --kit-skill; each
+# is bound read-only from $HOME/.claude/skills/<name> into every seat, and a pi
+# leg is handed --skill for it on every leg, not only review legs.
 # code-review-portable is a stand-in for the built-in /code-review, which is
 # compiled into claude and so exists on no other harness.
 #
@@ -1582,6 +1602,7 @@ prompts_dir_arg=""
 refresh_at_arg=""
 refresh_at_given=false
 refresh_max_arg=""
+kit_skill_flags=()
 k8s_mode=false
 k8s_timeout=""
 k8s_keep=false
@@ -1747,6 +1768,10 @@ while [[ "${1:-}" == -* ]]; do
             ;;
         --refresh-max)
             refresh_max_arg="${2:?--refresh-max requires a non-negative integer}"
+            shift 2
+            ;;
+        --kit-skill)
+            kit_skill_flags+=("${2:?--kit-skill requires a skill name}")
             shift 2
             ;;
         --k8s)
@@ -2760,6 +2785,65 @@ if [[ "$maintainer_harness_given" == true \
     echo "$maintainer_harness yet -- only pi has one." >&2
     exit 1
 fi
+
+# The agent kit: machine-level extra skills, bound like the review kit (see
+# review_kit_flags below). The list is AGENT_KIT_SKILLS in kit.env, then every
+# --kit-skill in the order given. Repeats are dropped, first one wins, and so
+# are the review kit's own two skills, which are bound anyway. Resolved here,
+# above the --k8s dispatch, so a bad name fails before anything is created and
+# the cluster refusal sits ahead of the exec.
+agent_kit_names=()
+agent_kit_sources=()
+agent_kit_dirs=()
+agent_kit_seen=" commit-then-review code-review-portable "
+agent_kit_raw="$(fs_read_env_value "$config_dir/kit.env" AGENT_KIT_SKILLS || true)"
+agent_kit_raw="${agent_kit_raw#\"}"; agent_kit_raw="${agent_kit_raw%\"}"
+agent_kit_raw="${agent_kit_raw#\'}"; agent_kit_raw="${agent_kit_raw%\'}"
+agent_kit_raw="${agent_kit_raw//,/ }"
+read -r -a agent_kit_machine <<< "$agent_kit_raw"
+for agent_kit_name in "${agent_kit_machine[@]}"; do
+    [[ "$agent_kit_seen" == *" $agent_kit_name "* ]] && continue
+    agent_kit_seen+="$agent_kit_name "
+    agent_kit_names+=("$agent_kit_name")
+    agent_kit_sources+=("kit.env")
+done
+for agent_kit_name in "${kit_skill_flags[@]}"; do
+    [[ "$agent_kit_seen" == *" $agent_kit_name "* ]] && continue
+    agent_kit_seen+="$agent_kit_name "
+    agent_kit_names+=("$agent_kit_name")
+    agent_kit_sources+=("--kit-skill")
+done
+if [[ "$k8s_mode" == true ]]; then
+    if (( ${#kit_skill_flags[@]} )); then
+        echo "Error: --kit-skill is not supported with --k8s. The cluster path does not ship extra skills." >&2
+        exit 1
+    fi
+    if (( ${#agent_kit_names[@]} )); then
+        echo "NOTICE: this --k8s run will not have the agent kit skills named in kit.env: ${agent_kit_names[*]}. The cluster path does not ship extra skills." >&2
+    fi
+else
+    for agent_kit_i in "${!agent_kit_names[@]}"; do
+        agent_kit_name="${agent_kit_names[$agent_kit_i]}"
+        agent_kit_src="${agent_kit_sources[$agent_kit_i]}"
+        if [[ ! "$agent_kit_name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+            echo "Error: agent kit skill '$agent_kit_name' (from $agent_kit_src) is not a valid skill name." >&2
+            echo "A name starts with a letter or digit and holds only letters, digits, '.', '_' and '-'." >&2
+            exit 1
+        fi
+        agent_kit_dir="$HOME/.claude/skills/$agent_kit_name"
+        if [[ ! -d "$agent_kit_dir" ]]; then
+            echo "Error: agent kit skill '$agent_kit_name' (from $agent_kit_src) has no directory at $agent_kit_dir." >&2
+            exit 1
+        fi
+        if [[ ! -f "$agent_kit_dir/SKILL.md" ]]; then
+            echo "Error: agent kit skill '$agent_kit_name' (from $agent_kit_src) has no SKILL.md in $agent_kit_dir." >&2
+            exit 1
+        fi
+        fs_reject_unsafe_chars "$agent_kit_dir" || exit 1
+        agent_kit_dirs+=("$agent_kit_dir")
+    done
+fi
+unset agent_kit_raw agent_kit_machine agent_kit_name agent_kit_src agent_kit_dir agent_kit_i agent_kit_seen agent_kit_sources
 
 # --k8s dispatches the whole run to fork-sandbox-k8s.sh run, which submits it
 # as a Kubernetes Job -- see the header comment above and
