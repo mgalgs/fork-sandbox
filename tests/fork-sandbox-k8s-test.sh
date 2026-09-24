@@ -13821,9 +13821,56 @@ printf 'agents:\n  alpha: {harness: pi, backend: k8s}\n  notifier: {handler: exe
 pm_empty_dir="$(newdir)"; tmpdirs+=("$pm_empty_dir")
 pm_api_install "$pm_cfg_pin"
 check "a handler seat whose command is in \$config_dir/handlers installs" "0" "$pm_api_rc"
-pm_api_install "$pm_cfg_pin" FORK_SANDBOX_HANDLERS_DIR="$pm_empty_dir" FORK_SANDBOX_PRESETS_DIR="$pm_empty_dir" \
-    FORK_SANDBOX_PERSONAS_DIR="$pm_empty_dir" FORK_SANDBOX_FLEET_FILE=/nonexistent
-check "a caller env pointing the fleet dirs elsewhere does not change the result" "0" "$pm_api_rc"
+pm_api_install "$pm_cfg_pin" FORK_SANDBOX_HANDLERS_DIR="$pm_empty_dir" FORK_SANDBOX_PRESETS_DIR="$pm_empty_dir"
+check "a caller env pointing handlers/presets elsewhere does not change the result" "0" "$pm_api_rc"
+
+# 14f-bis. FORK_SANDBOX_FLEET_FILE / FORK_SANDBOX_PERSONAS_DIR: unlike
+# handlers/presets above, these two DO take their fleet file and personas
+# dir from the caller's env when set, so a site can keep them in a repo
+# of its own instead of $config_dir.
+pm_fp_dir="$(newdir)"; tmpdirs+=("$pm_fp_dir")
+mkdir -p "$pm_fp_dir/personas"
+printf 'agents:\n  gamma: {harness: pi, backend: k8s}\n' > "$pm_fp_dir/fleet.yaml"
+printf 'Standing instructions for gamma.\n' > "$pm_fp_dir/personas/gamma.md"
+pm_api_install "$pm_cfg1" FORK_SANDBOX_FLEET_FILE="$pm_fp_dir/fleet.yaml" \
+    FORK_SANDBOX_PERSONAS_DIR="$pm_fp_dir/personas"
+check "env fleet/personas: install exits 0" "0" "$pm_api_rc"
+check "env fleet file: the config ConfigMap ships the env file's content" "1" \
+    "$(yq -r 'select(.kind == "ConfigMap" and .metadata.name == "fork-sandbox-postmaster-config") | .data."fleet.yaml"' <<< "$pm_api_out" | grep -c gamma)"
+check "env personas dir: the personas ConfigMap ships the env dir's file" "1" \
+    "$(yq -r 'select(.kind == "ConfigMap" and .metadata.name == "fork-sandbox-postmaster-personas") | .data | keys | .[]' <<< "$pm_api_out" | grep -c '^gamma.md$')"
+check "env fleet file: the gate ran against it, not \$config_dir/fleet.yaml (alpha is absent)" "0" \
+    "$(yq -r 'select(.kind == "ConfigMap" and .metadata.name == "fork-sandbox-postmaster-config") | .data."fleet.yaml"' <<< "$pm_api_out" | grep -c alpha)"
+check "env fleet file: the stderr note names the path" "1" \
+    "$(grep -c "shipping fleet file $pm_fp_dir/fleet.yaml" <<< "$pm_api_err")"
+check "env personas dir: the stderr note names the path" "1" \
+    "$(grep -c "shipping personas dir $pm_fp_dir/personas" <<< "$pm_api_err")"
+
+# unset: falls back to $config_dir, byte-identical to the base fixture's
+# earlier dry-run ($pm_out1 is a file path, not the content itself).
+pm_api_install "$pm_cfg1"
+check "unset FORK_SANDBOX_FLEET_FILE/PERSONAS_DIR: output unchanged from the base fixture" \
+    "$(cat "$pm_out1")" "$pm_api_out"
+
+# env names a missing file/dir: refused, naming the variable, before any
+# kubectl call.
+pm_api_refused "FORK_SANDBOX_FLEET_FILE naming a missing file refuses" \
+    "FORK_SANDBOX_FLEET_FILE='/nonexistent/fleet.yaml' is not a" \
+    "$pm_cfg1" FORK_SANDBOX_FLEET_FILE=/nonexistent/fleet.yaml
+pm_api_refused "FORK_SANDBOX_PERSONAS_DIR naming a missing dir refuses" \
+    "FORK_SANDBOX_PERSONAS_DIR='/nonexistent/personas' is not a" \
+    "$pm_cfg1" FORK_SANDBOX_PERSONAS_DIR=/nonexistent/personas
+
+# a symlinked personas dir is followed.
+pm_fp_real="$(newdir)"; tmpdirs+=("$pm_fp_real")
+printf 'Standing instructions for gamma.\n' > "$pm_fp_real/gamma.md"
+pm_fp_link_parent="$(newdir)"; tmpdirs+=("$pm_fp_link_parent")
+ln -s "$pm_fp_real" "$pm_fp_link_parent/personas"
+pm_api_install "$pm_cfg1" FORK_SANDBOX_FLEET_FILE="$pm_fp_dir/fleet.yaml" \
+    FORK_SANDBOX_PERSONAS_DIR="$pm_fp_link_parent/personas"
+check "a symlinked personas dir is followed: install exits 0" "0" "$pm_api_rc"
+check "a symlinked personas dir is followed: its file ships" "1" \
+    "$(yq -r 'select(.kind == "ConfigMap" and .metadata.name == "fork-sandbox-postmaster-personas") | .data | keys | .[]' <<< "$pm_api_out" | grep -c '^gamma.md$')"
 
 # 14g. Hooks: the laptop hooks dir ships as ConfigMap
 # fork-sandbox-postmaster-hooks, mounted in the postmaster container only,

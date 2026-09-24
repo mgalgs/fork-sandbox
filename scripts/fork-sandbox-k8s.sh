@@ -690,6 +690,15 @@
 #
 # FORK_SANDBOX_K8S_PLATFORM names the platform plugin; default generic. See
 # docs/k8s-platform.md.
+#
+# FORK_SANDBOX_FLEET_FILE / FORK_SANDBOX_PERSONAS_DIR, when set in the
+# caller's shell, are the laptop fleet file and personas dir
+# `install --postmaster` ships into the postmaster's ConfigMaps, instead
+# of $config_dir/fleet.yaml and $config_dir/personas -- for a site that
+# keeps its fleet and personas in a repo of its own. Unset or empty falls
+# back to $config_dir, unchanged from before this pair of keys existed.
+# Every other install-time dir (prompts, handlers, hooks, presets) still
+# reads only $config_dir; see docs/kubernetes-runs.md.
 
 set -euo pipefail
 
@@ -2767,6 +2776,38 @@ cmd_install() {
                     ;;
             esac
         fi
+        # FORK_SANDBOX_FLEET_FILE / FORK_SANDBOX_PERSONAS_DIR, when the
+        # caller's shell sets them, let a site keep its fleet and personas
+        # outside $config_dir (its own repo, say) -- resolved once, here,
+        # so the presence check below, the fleet-check gate, and the
+        # ConfigMaps all agree on the same path. Unset or empty falls back
+        # to $config_dir/fleet.yaml and $config_dir/personas, unchanged
+        # from before this pair of keys existed. A set value that names
+        # nothing is refused by the variable's own name -- the caller set
+        # it on purpose, so this is not a silent fallback to $config_dir.
+        # $FS_REALPATH resolves any symlink in the path, so a symlinked
+        # personas directory is followed, same as $FS_REALPATH is used
+        # for every other path in this function.
+        local pm_fleet_file="$config_dir/fleet.yaml"
+        if [[ -n "${FORK_SANDBOX_FLEET_FILE:-}" ]]; then
+            if [[ ! -f "$FORK_SANDBOX_FLEET_FILE" ]]; then
+                echo "Error: FORK_SANDBOX_FLEET_FILE='$FORK_SANDBOX_FLEET_FILE' is not a" >&2
+                echo "regular file." >&2
+                exit 1
+            fi
+            pm_fleet_file="$("$FS_REALPATH" -- "$FORK_SANDBOX_FLEET_FILE")"
+        fi
+        local pm_personas_dir="$config_dir/personas"
+        if [[ -n "${FORK_SANDBOX_PERSONAS_DIR:-}" ]]; then
+            if [[ ! -d "$FORK_SANDBOX_PERSONAS_DIR" ]]; then
+                echo "Error: FORK_SANDBOX_PERSONAS_DIR='$FORK_SANDBOX_PERSONAS_DIR' is not a" >&2
+                echo "directory." >&2
+                exit 1
+            fi
+            pm_personas_dir="$("$FS_REALPATH" -- "$FORK_SANDBOX_PERSONAS_DIR")"
+        fi
+        echo "fork-sandbox-k8s: shipping fleet file $pm_fleet_file" >&2
+        echo "fork-sandbox-k8s: shipping personas dir $pm_personas_dir" >&2
         # deliver --cluster refuses to start at all with no fleet file
         # (pm_require_fleet_check: "--cluster needs a fleet file ...
         # declaring backend: k8s seats"), so an install with no
@@ -2774,26 +2815,27 @@ cmd_install() {
         # crash-loops forever. Catch that here, before anything is
         # rendered or applied, instead of leaving it for `kubectl logs`
         # to discover after the fact.
-        if [[ ! -f "$config_dir/fleet.yaml" ]]; then
-            echo "Error: no fleet file at $config_dir/fleet.yaml. install" >&2
+        if [[ ! -f "$pm_fleet_file" ]]; then
+            echo "Error: no fleet file at $pm_fleet_file. install" >&2
             echo "--postmaster needs one: the cluster postmaster's 'deliver" >&2
             echo "--cluster' refuses to start without a fleet file declaring" >&2
             echo "backend: k8s seats." >&2
             exit 1
         fi
-        # The check the pod runs at startup, pinned to the four dirs this
-        # install ships into the ConfigMaps rather than whatever
-        # FORK_SANDBOX_*_DIR the caller's shell exports: it must see what
-        # the pod will see.
+        # The check the pod runs at startup, against the fleet file and
+        # personas dir this install will ship (resolved above), and the
+        # handlers/presets dirs pinned to $config_dir rather than whatever
+        # FORK_SANDBOX_*_DIR the caller's shell exports otherwise: it must
+        # see what the pod will see.
         local -a pm_fleet_env=(
-            FORK_SANDBOX_FLEET_FILE="$config_dir/fleet.yaml"
-            FORK_SANDBOX_PERSONAS_DIR="$config_dir/personas"
+            FORK_SANDBOX_FLEET_FILE="$pm_fleet_file"
+            FORK_SANDBOX_PERSONAS_DIR="$pm_personas_dir"
             FORK_SANDBOX_HANDLERS_DIR="$config_dir/handlers"
             FORK_SANDBOX_PRESETS_DIR="$config_dir/presets"
         )
         if ! env "${pm_fleet_env[@]}" "$script_dir/fork-sandbox-fleet.sh" check --cluster; then
             echo "Error: the cluster postmaster would crash-loop on this fleet" >&2
-            echo "($config_dir/fleet.yaml): 'deliver --cluster' runs the same" >&2
+            echo "($pm_fleet_file): 'deliver --cluster' runs the same" >&2
             echo "check at startup. Fix the errors above and re-run install." >&2
             exit 1
         fi
@@ -2858,14 +2900,14 @@ cmd_install() {
     if $postmaster; then
         pm_config_args=(--from-file="k8s.env=$k8s_env")
         pm_config_paths=("$k8s_env")
-        if [[ -f "$config_dir/fleet.yaml" ]]; then
-            pm_config_args+=(--from-file="fleet.yaml=$config_dir/fleet.yaml")
-            pm_config_paths+=("$config_dir/fleet.yaml")
+        if [[ -f "$pm_fleet_file" ]]; then
+            pm_config_args+=(--from-file="fleet.yaml=$pm_fleet_file")
+            pm_config_paths+=("$pm_fleet_file")
         fi
 
-        if [[ -d "$config_dir/personas" ]]; then
+        if [[ -d "$pm_personas_dir" ]]; then
             pm_have_personas=true
-            pm_collect_configmap_files "$config_dir/personas" false || exit 1
+            pm_collect_configmap_files "$pm_personas_dir" false || exit 1
             pm_personas_args=("${PM_CONFIGMAP_FILE_ARGS[@]}")
             pm_personas_paths=("${PM_CONFIGMAP_FILE_PATHS[@]}")
         fi
