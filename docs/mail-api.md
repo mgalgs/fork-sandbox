@@ -20,32 +20,35 @@ mail-api serve` or `fork-sandbox mail-api mint`. The client is
 <verb> ...` and `fork-sandbox postmaster --remote <verb> ...` run
 underneath, so a laptop and a CI job invoke the identical command line.
 
-## Why `@operator` is operator-only
+## Who may post as which name
 
-The postmaster's rule 1 clears a thread's flag and resets its spawn budget
-when a message arrives whose From is not a fleet agent. `@operator` is the
-usual such sender, but the rule keys on "not a fleet agent", not on the
-name `@operator`. If any client token could send `--from @operator`, any
-CI job holding that token could act with the operator's authority. So the
-loader refuses to start if a client entry's identities include
-`@operator`, `mint` refuses to mint one, and the allowlist refuses
-`--from @operator` from anything but an operator token, unconditionally.
+The postmaster's rule 1 clears a thread's needs-operator flag and resets its
+spawn budget when a message arrives whose From is not a fleet agent. The
+API's part is to decide which names a caller may put in `--from`; what the
+mail then does to a thread is the postmaster's rule.
 
-That alone would not protect a flag: a client identity such as
-`@ci-kickoff` is not a fleet seat either, so a client that replied into a
-flagged thread with `--from @ci-kickoff` would trigger rule 1 just as
-`@operator` would. So the server also refuses a client's `reply` whose
-`--reply-to` is a message in a flagged (needs-operator) thread, with 403.
-Only an operator token may post into a flagged thread. `send` always
-starts a fresh thread, so it needs no such check.
+The operator list is `$FORK_SANDBOX_OPERATORS`: comma-separated `@name`s,
+no spaces, no empty elements; unset or empty means `@operator`. The server
+and the postmaster read the same variable, so there is one source. Only an
+operator token may post as a name on the list. The loader refuses to start
+if a client entry's identities include a listed name, `mint` refuses to
+mint one, and the allowlist refuses `--from <listed name>` from anything
+but an operator token, unconditionally.
 
-Known limits. The check reads the flag when the request arrives; a flag
-set a moment later, or a client message already stored but not yet routed
-when an operator flags its thread, is not covered. Rule 1 also resets the
-spawn budget of an unflagged thread for any client reply, and `reply
---hops` lets a client set the hop budget of its own message. Treat a
-client token as able to keep waking agents in any unflagged thread it can
-reply into.
+What a client's mail can do depends on which postmaster reads it:
+
+- **Cluster postmaster** (`deliver --cluster`). Only names on the operator
+  list carry rule-1 authority. Mail from any other non-fleet sender, a
+  client identity such as `@ci-kickoff` included, is delivered and routed
+  like fleet mail, but it leaves a thread's flag and spawn budget alone. A
+  client `reply` into a flagged thread returns 200 and the flag stays.
+- **Laptop postmaster** (`deliver` without `--cluster`). Rule 1 still gives
+  every non-fleet sender authority, client identities included. Do not
+  issue client tokens against a laptop store.
+
+Known limit. `reply --hops` lets a client set the hop budget of its own
+message, so treat a client token as able to keep waking agents in any
+thread it can reply into.
 
 ## The tokens file
 
@@ -77,7 +80,7 @@ naming the offending label, never a hash) when:
 - any line is malformed, or has an unknown role or cap, or a malformed
   identity;
 - two entries share a hash or a label;
-- a client entry's identities include `@operator`;
+- a client entry's identities include a name on the operator list;
 - an operator entry has anything but `-` for identities or caps;
 - the table has no entries at all.
 
@@ -90,8 +93,19 @@ naming the offending label, never a hash) when:
 prints it alone on the first line of stdout; the second line is the
 tokens-file line to append (with the token's hash, not the token). It
 writes no file. It applies the same validation the loader applies, so
-`mint --role client --as @operator` is refused before a line is ever
-produced.
+`mint --role client --as @operator` (or any other listed name) is refused
+before a line is ever produced.
+
+## `check`
+
+    fork-sandbox mail-api check --tokens <file>
+
+`check` runs the loader `serve` runs, under the same
+`$FORK_SANDBOX_OPERATORS`, and exits. On a good file it prints `ok: <n>
+entries (<k> operator, <m> client)` and exits 0. On a bad one it prints the
+one line `serve` would refuse with and exits 2. It never prints a hash or a
+token. `install --postmaster` runs it on `K8S_MAIL_API_TOKENS_FILE` before
+rendering anything.
 
 ## HTTP
 
@@ -163,8 +177,8 @@ flag and refused, since there is no way to tell it from one.
 
 An operator token passes every auth column, for any identity. A client's
 identity check compares the flag's value against its own identities list
-exactly, so a client can never pass `--from @operator`: the loader already
-refused to load any client entry that lists it.
+exactly, so a client can never pass `--from` a name on the operator list:
+the loader already refused to load any client entry that lists one.
 
 `send` and `grant` refuse `--context-ro` (403: "a host path has no meaning
 over the API") even for an operator, since it names a path on the
@@ -225,6 +239,5 @@ shell.
 
 This server does not filter by review target (no `X-Review-Target*`
 header handling), does not reload tokens without a restart, does not rate
-limit, and does not terminate TLS. It is code only: the Deployment,
-Service, tokens Secret and `install --postmaster` wiring that put it in a
-cluster are handled elsewhere.
+limit, and does not terminate TLS. Deploying it in a cluster is covered in
+[docs/cluster-postmaster.md](cluster-postmaster.md).

@@ -15,9 +15,9 @@ does on a workstation.
   get woken; anything else is refused rather than silently mis-scheduled.
 - **A fresh store.** The pod starts from an empty agent-mail store. Threads
   on a laptop's store are not imported.
-- **No remote mail access.** Nothing outside the cluster can read or post
-  to the store yet. Until a narrower mail API exists, the only way to reach
-  it is:
+- **Remote mail access is opt-in.** Without a tokens file (see "The mail
+  API" below) nothing outside the pod can read or post to the store, and
+  the only way to reach it is:
 
   ```
   kubectl exec deploy/fork-sandbox-postmaster -- fork-sandbox mail ...
@@ -59,6 +59,8 @@ Do these in order.
    | `K8S_POSTMASTER_STORAGE_CLASS` | no | PVC `storageClassName`; empty (the default) omits the field, so the cluster's default StorageClass applies |
    | `K8S_POSTMASTER_STORAGE` | no | PVC requested size; default `20Gi`; must match `^[0-9]+(Mi\|Gi\|Ti)$` |
    | `K8S_POSTMASTER_ACCESS_MODE` | no | `ReadWriteOncePod` (default) or `ReadWriteOnce`, for a StorageClass or CSI driver that does not support RWOP yet; anything else is refused |
+   | `K8S_POSTMASTER_OPERATORS` | no | comma-separated `@names` that carry rule-1 authority; default `@operator`. See "Operators". |
+   | `K8S_MAIL_API_TOKENS_FILE` | no | laptop path to the mail API tokens file; when set, the mail API is deployed. See "The mail API". |
 
    The rest of `k8s.env` (`K8S_CONTEXT`, `K8S_NAMESPACE`, and the rest) is
    read the same way a laptop run reads it, since the whole file is copied
@@ -76,11 +78,19 @@ Do these in order.
    scripts/fork-sandbox-k8s.sh install --postmaster
    ```
 
-   This applies the base cluster manifests exactly as plain `install`
-   does, then renders and applies the postmaster's own pieces: a
+   Before rendering anything, install runs `fork-sandbox-fleet.sh check
+   --cluster` on the fleet it is about to ship (the `fleet.yaml`,
+   `personas/`, `handlers/` and `presets/` under the config dir) and
+   refuses a fleet the pod could not run: the postmaster runs the same
+   check at startup and would crash-loop on a local, triage or
+   claude/codex seat.
+
+   It then applies the base cluster manifests exactly as plain `install`
+   does, and renders and applies the postmaster's own pieces: a
    ServiceAccount, Role and RoleBinding, a PVC, a Secret holding the deploy
-   key and known_hosts, one or more ConfigMaps, and the Deployment itself.
-   `--dry-run` prints everything it would apply, with the Secret's content
+   key and known_hosts, one or more ConfigMaps, and the Deployment itself
+   (plus the mail API's Secret and Service when it is enabled).
+   `--dry-run` prints everything it would apply, with each Secret's content
    replaced by a placeholder line — its bytes never reach stdout or stderr
    either way.
 
@@ -96,8 +106,12 @@ Do these in order.
 - **Config changes** (`k8s.env`, `fleet.yaml`, personas, prompts, handlers,
   presets) need `install --postmaster` run again. The Deployment's pod
   template carries a `checksum/pm-config` annotation computed over the
-  rendered ConfigMaps; a changed checksum is a changed pod template, which
-  rolls the pod.
+  rendered ConfigMaps and Secrets; a changed checksum is a changed pod
+  template, which rolls the pod.
+- **Rotating the git deploy key** is the same: replace the file named by
+  `K8S_POSTMASTER_GIT_KEY_FILE` (or `K8S_POSTMASTER_KNOWN_HOSTS_FILE`) and
+  run `install --postmaster` again. The Secret is part of the checksum, so
+  the pod rolls and picks the new key up at init.
 - **A new fork-sandbox version** needs a new postmaster image and a new
   `K8S_POSTMASTER_IMAGE` in `k8s.env`, then `install --postmaster` again.
 - **New commits on the project repo** reach the pod only at pod start: the
@@ -108,6 +122,83 @@ Do these in order.
 - **In-flight seats survive a rollout.** A restarted postmaster adopts
   still-running Jobs instead of re-spawning them, so a rollout does not
   lose a seat's work in progress.
+
+## The mail API
+
+The mail API is a small HTTP server that runs the `mail` and `postmaster`
+verbs from a fixed allowlist, so a CI job or a laptop can reach the pod's
+mail store without `kubectl exec`. It runs as a second container in the
+postmaster pod; the protocol, the tokens file and the verb allowlist are
+described in [docs/mail-api.md](mail-api.md).
+
+To enable it:
+
+1. Mint an operator token first, then one token per client:
+
+   ```
+   fork-sandbox mail-api mint --role operator --label laptop
+   fork-sandbox mail-api mint --role client --label ci-kickoff \
+       --as @ci-kickoff --caps read,grant
+   ```
+
+   Each prints the raw token on its first line (keep it) and the tokens-file
+   line, holding only the token's hash, on its second.
+2. Put the tokens-file lines in one file, mode 0600, owned by you, and set
+   `K8S_MAIL_API_TOKENS_FILE` in `k8s.env` to its path.
+3. Run `install --postmaster`. Install checks the file with
+   `fork-sandbox-mail-api.py check` (under `K8S_POSTMASTER_OPERATORS`) and
+   refuses on the loader's one-line error, then creates a Secret from it
+   and adds the container and a ClusterIP Service,
+   `fork-sandbox-mail-api`. With the key unset, install strips all three
+   and prints one note that the API is not deployed.
+
+**Rotation.** Edit the tokens file and re-run `install --postmaster`. The
+server reads its tokens once at startup; the Secret is part of the
+`checksum/pm-config` annotation, so a changed file rolls the pod.
+
+**From a laptop**, through a port-forward:
+
+```
+kubectl port-forward svc/fork-sandbox-mail-api 8765:80
+```
+
+then set `K8S_MAIL_API_URL=http://127.0.0.1:8765` and
+`K8S_MAIL_API_TOKEN_FILE=<file holding the raw token>` in `k8s.env` and use
+`fork-sandbox mail --remote <verb> ...` (and `fork-sandbox postmaster
+--remote <verb> ...`).
+
+**In-cluster callers** use `http://fork-sandbox-mail-api.<namespace>.svc`.
+Seat pods cannot reach it: the agent NetworkPolicy pins their egress.
+
+**Security.** The API container holds no ServiceAccount token: the pod
+turns off the automatic mount and projects the token into the postmaster
+container only, so the network-facing container cannot read the
+namespace's Secrets. It speaks plain HTTP; a site that wants TLS fronts it
+itself.
+
+## Operators
+
+`K8S_POSTMASTER_OPERATORS` is a comma-separated list of `@names`, no
+spaces; the default is `@operator`. It is rendered into the Deployment as
+`FORK_SANDBOX_OPERATORS` on both the postmaster and the mail API container,
+so the two agree.
+
+It matters because of the postmaster's rule 1: mail from a sender that is
+not a fleet agent clears its thread's needs-operator flag and resets the
+thread's spawn budget. On a laptop every such sender carries that
+authority. In the cluster, CI jobs and other clients post through the mail
+API under names that are not fleet agents, so only the names on this list
+carry it. Any other non-fleet sender is delivered and can still wake the
+seats it addresses, but leaves the flag and the budget alone.
+
+Install refuses when:
+
+- an element is not an `@name` matching `^@[a-z0-9][a-z0-9-]*$`, or is
+  empty (`@a,,@b`, a trailing comma);
+- a listed name resolves as an agent in the fleet: a fleet seat's own
+  replies would otherwise carry operator authority;
+- a client entry in the tokens file lists a listed name. The API refuses to
+  load such a file, and `check` reports it.
 
 ## Capacity
 
