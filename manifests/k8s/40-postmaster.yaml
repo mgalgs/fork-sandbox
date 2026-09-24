@@ -21,7 +21,12 @@
 # This file is skipped by plain `install` (the same way
 # 31-claude-proxy.yaml is) since those placeholders have no value to take
 # without --postmaster. The mail-api container, its tokens volume and its
-# Service are stripped when K8S_MAIL_API_TOKENS_FILE is unset.
+# Service are stripped when K8S_MAIL_API_TOKENS_FILE is unset. The
+# claude-credentials env/volumeMount/volume (postmaster container only)
+# are stripped when K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE is unset; when
+# set, they mount Secret fork-sandbox-postmaster-claude (created by
+# install, not a placeholder -- its name never varies) and tell
+# `fleet check --cluster` a claude credential is available.
 #
 # The trick that keeps this small: the PVC below is mounted at the exact
 # paths a laptop postmaster uses (/var/tmp/claude-scratch, $HOME/src,
@@ -211,6 +216,10 @@ spec:
             - name: FS_HOOK_SECRET_DIR
               value: /etc/fork-sandbox/hook-secret
               # <<< hook-secret env
+            # >>> claude-credentials env
+            - name: FORK_SANDBOX_CLUSTER_CLAUDE
+              value: "1"
+              # <<< claude-credentials env
             # >>> presets env
             - name: FORK_SANDBOX_PRESETS_DIR
               value: /etc/fork-sandbox/presets
@@ -280,6 +289,11 @@ spec:
               mountPath: /etc/fork-sandbox/hook-secret
               readOnly: true
               # <<< hook-secret volumeMount
+            # >>> claude-credentials volumeMount
+            - name: claude-credentials
+              mountPath: /etc/fork-sandbox/claude
+              readOnly: true
+              # <<< claude-credentials volumeMount
             # >>> presets volumeMount
             - name: presets
               mountPath: /etc/fork-sandbox/presets
@@ -413,6 +427,12 @@ spec:
             secretName: __PM_HOOKS_SECRET__
             defaultMode: 0440
             # <<< hook-secret volume
+        # >>> claude-credentials volume
+        - name: claude-credentials
+          secret:
+            secretName: fork-sandbox-postmaster-claude
+            defaultMode: 0440
+            # <<< claude-credentials volume
         # >>> presets volume
         - name: presets
           configMap:

@@ -681,6 +681,29 @@
 #                         `fork-sandbox-mail-api.py check` under
 #                         K8S_POSTMASTER_OPERATORS -- install refuses
 #                         otherwise. Rotating its content rolls the pod.
+#   K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE=
+#                         laptop path to a claude credentials JSON, minted
+#                         with `claude setup-token` (a long-lived OAuth
+#                         token; the cluster postmaster never refreshes
+#                         it). Optional; when set, install creates Secret
+#                         fork-sandbox-postmaster-claude from it, mounts it
+#                         read-only at /etc/fork-sandbox/claude in the
+#                         postmaster container only, ships a claude.env
+#                         pointing CLAUDE_CREDENTIALS at it, and sets
+#                         FORK_SANDBOX_CLUSTER_CLAUDE=1 on that container so
+#                         `fleet check --cluster` accepts claude seats.
+#                         Unset: no claude credential, and a claude seat is
+#                         refused in the cluster, same as before this key
+#                         existed. Must be a regular file, owned by you,
+#                         mode 0600 or stricter (require_secret_file), with
+#                         a non-empty .claudeAiOauth.accessToken and a
+#                         .claudeAiOauth.expiresAt at least 7 days in the
+#                         future -- install refuses otherwise, since a
+#                         shorter-lived token (an interactive login's, say)
+#                         would leave every claude seat in flight stranded
+#                         when it expires. See docs/kubernetes-runs.md,
+#                         "Claude seats in a cluster postmaster". Rotating
+#                         its content rolls the pod.
 #
 # The provider key is NOT in this file. install reads it from
 # ~/.config/fork-sandbox/pi.env (OPENROUTER_API_KEY=...), the same file a
@@ -862,6 +885,7 @@ K8S_POSTMASTER_OPERATORS="$(read_env_value "$k8s_env" K8S_POSTMASTER_OPERATORS |
 K8S_POSTMASTER_OPERATORS="${K8S_POSTMASTER_OPERATORS:-@operator}"
 K8S_POSTMASTER_HOOKS_SECRET="$(read_env_value "$k8s_env" K8S_POSTMASTER_HOOKS_SECRET || true)"
 K8S_MAIL_API_TOKENS_FILE="$(read_env_value "$k8s_env" K8S_MAIL_API_TOKENS_FILE || true)"
+K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE="$(read_env_value "$k8s_env" K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE || true)"
 # Free-form labels for this run, populated by resolve_run_labels in
 # cmd_submit. Declared empty here (module-global) so build_extra_label_lines
 # can read them under `set -u` even on a verb that never calls
@@ -943,7 +967,7 @@ if [[ "${1-}" != check-grant ]]; then
         "$K8S_POSTMASTER_KNOWN_HOSTS_FILE" "$K8S_POSTMASTER_STORAGE_CLASS" \
         "$K8S_POSTMASTER_STORAGE" "$K8S_POSTMASTER_ACCESS_MODE" \
         "$K8S_POSTMASTER_OPERATORS" "$K8S_POSTMASTER_HOOKS_SECRET" \
-        "$K8S_MAIL_API_TOKENS_FILE" \
+        "$K8S_MAIL_API_TOKENS_FILE" "$K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE" \
         || exit 1
 fi
 
@@ -2871,6 +2895,43 @@ cmd_install() {
                 exit 1
             fi
         fi
+        # K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE, when set, ships a
+        # long-lived claude OAuth token into the cluster postmaster (see
+        # docs/kubernetes-runs.md, "Claude seats in a cluster postmaster").
+        # The token is never captured into a shell variable here -- every
+        # check below is a boolean jq -e test against the file directly --
+        # so there is nothing to accidentally echo. expiresAt is not
+        # secret, so it alone is read out, to compute the 7-day floor.
+        if [[ -n "$K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE" ]]; then
+            require_secret_file "$K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE" || exit 1
+            if ! jq -e '(.claudeAiOauth.accessToken | type == "string" and length > 0)' \
+                "$K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE" >/dev/null 2>&1; then
+                echo "Error: K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE=" >&2
+                echo "'$K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE' has no non-empty" >&2
+                echo ".claudeAiOauth.accessToken." >&2
+                exit 1
+            fi
+            if ! jq -e '(.claudeAiOauth.expiresAt | type == "number")' \
+                "$K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE" >/dev/null 2>&1; then
+                echo "Error: K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE=" >&2
+                echo "'$K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE' has no numeric" >&2
+                echo ".claudeAiOauth.expiresAt." >&2
+                exit 1
+            fi
+            local pm_claude_expires_at_ms pm_claude_min_expiry_ms
+            pm_claude_expires_at_ms="$(jq -r '.claudeAiOauth.expiresAt | floor' \
+                "$K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE")"
+            pm_claude_min_expiry_ms=$(( ($(date +%s) + 7 * 86400) * 1000 ))
+            if (( pm_claude_expires_at_ms < pm_claude_min_expiry_ms )); then
+                echo "Error: the access token in K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE" >&2
+                echo "expires too soon for a cluster that never refreshes it -- the" >&2
+                echo "postmaster pod loads it once at start and holds it for every" >&2
+                echo "claude seat until this file is replaced and install is rerun." >&2
+                echo "Mint a long-lived one with 'claude setup-token'; see" >&2
+                echo "docs/kubernetes-runs.md, 'Claude seats in a cluster postmaster'." >&2
+                exit 1
+            fi
+        fi
         # The postmaster image ships no platform plugin beyond generic and
         # the Deployment sets no FORK_SANDBOX_K8S_PLATFORM, so a seat
         # submitted from inside the pod always resolves the generic
@@ -2894,6 +2955,7 @@ cmd_install() {
     # apply, so the 900 KiB total-size guard and the subdirectory refusal
     # both fail loudly before a single kubectl call.
     local -a pm_config_paths=() pm_config_args=()
+    local pm_claude_env=""
     local -a pm_personas_args=() pm_prompts_args=() pm_handlers_args=() pm_hooks_args=() pm_presets_args=()
     local -a pm_personas_paths=() pm_prompts_paths=() pm_handlers_paths=() pm_hooks_paths=() pm_presets_paths=()
     local pm_have_personas=false pm_have_prompts=false pm_have_handlers=false pm_have_hooks=false pm_have_presets=false
@@ -2903,6 +2965,17 @@ cmd_install() {
         if [[ -f "$pm_fleet_file" ]]; then
             pm_config_args+=(--from-file="fleet.yaml=$pm_fleet_file")
             pm_config_paths+=("$pm_fleet_file")
+        fi
+        # The operator's own $config_dir/claude.env, if any, is never
+        # shipped -- it names laptop paths. This one line is the pod's
+        # own, pointing at the mount the claude Secret (below) lands on.
+        if [[ -n "$K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE" ]]; then
+            pm_claude_env="$(mktemp)"
+            trap 'rm -f -- "$pm_claude_env"' EXIT
+            printf 'CLAUDE_CREDENTIALS=/etc/fork-sandbox/claude/credentials.json\n' \
+                > "$pm_claude_env"
+            pm_config_args+=(--from-file="claude.env=$pm_claude_env")
+            pm_config_paths+=("$pm_claude_env")
         fi
 
         if [[ -d "$pm_personas_dir" ]]; then
@@ -3375,7 +3448,7 @@ cmd_install() {
     # optional blocks stripped. Needs $manifests_dir, just computed above.
     local pm_config_yaml="" pm_personas_yaml="" pm_prompts_yaml="" pm_handlers_yaml="" pm_hooks_yaml="" pm_presets_yaml=""
     local pm_config_checksum="" pm_file_rendered="" tag
-    local pm_git_secret_yaml="" pm_tokens_secret_yaml=""
+    local pm_git_secret_yaml="" pm_tokens_secret_yaml="" pm_claude_secret_yaml=""
     if $postmaster; then
         pm_config_yaml="$(kubectl create configmap fork-sandbox-postmaster-config \
             "${pm_config_args[@]}" --dry-run=client -o yaml)"
@@ -3404,11 +3477,17 @@ cmd_install() {
                 --from-file="tokens=$K8S_MAIL_API_TOKENS_FILE" \
                 --dry-run=client -o yaml)"
         fi
+        if [[ -n "$K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE" ]]; then
+            pm_claude_secret_yaml="$(kubectl create secret generic fork-sandbox-postmaster-claude \
+                --from-file="credentials.json=$K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE" \
+                --dry-run=client -o yaml)"
+        fi
 
-        pm_config_checksum="$(printf '%s%s%s%s%s%s%s%s' \
+        pm_config_checksum="$(printf '%s%s%s%s%s%s%s%s%s' \
             "$pm_config_yaml" "$pm_personas_yaml" "$pm_prompts_yaml" \
             "$pm_handlers_yaml" "$pm_hooks_yaml" "$pm_presets_yaml" \
-            "$pm_git_secret_yaml" "$pm_tokens_secret_yaml" | k8s_sha256_stdin)"
+            "$pm_git_secret_yaml" "$pm_tokens_secret_yaml" \
+            "$pm_claude_secret_yaml" | k8s_sha256_stdin)"
 
         pm_file_rendered="$(sed \
             -e "s|__NAMESPACE__|$K8S_NAMESPACE|g" \
@@ -3460,6 +3539,11 @@ cmd_install() {
         fi
         if [[ -z "$K8S_POSTMASTER_HOOKS_SECRET" ]]; then
             for tag in "hook-secret env" "hook-secret volumeMount" "hook-secret volume"; do
+                pm_file_rendered="$(strip_pm_optional_block "$pm_file_rendered" "$tag")" || exit 1
+            done
+        fi
+        if [[ -z "$K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE" ]]; then
+            for tag in "claude-credentials env" "claude-credentials volumeMount" "claude-credentials volume"; do
                 pm_file_rendered="$(strip_pm_optional_block "$pm_file_rendered" "$tag")" || exit 1
             done
         fi
@@ -3538,6 +3622,8 @@ cmd_install() {
             printf '# (dry-run) would create Secret fork-sandbox-postmaster-git ... -- not shown.\n'
             [[ -z "$K8S_MAIL_API_TOKENS_FILE" ]] || \
                 printf '# (dry-run) would create Secret fork-sandbox-mail-api-tokens ... -- not shown.\n'
+            [[ -z "$K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE" ]] || \
+                printf '# (dry-run) would create Secret fork-sandbox-postmaster-claude ... -- not shown.\n'
             printf '%s\n' "$pm_file_rendered"
         fi
         exit 0
@@ -3581,6 +3667,8 @@ cmd_install() {
         printf '%s\n' "$pm_git_secret_yaml" | kubectl apply -f -
         [[ -z "$pm_tokens_secret_yaml" ]] || \
             printf '%s\n' "$pm_tokens_secret_yaml" | kubectl apply -f -
+        [[ -z "$pm_claude_secret_yaml" ]] || \
+            printf '%s\n' "$pm_claude_secret_yaml" | kubectl apply -f -
         printf '%s\n' "$pm_file_rendered" | kubectl apply -f -
     fi
 

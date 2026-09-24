@@ -13990,6 +13990,133 @@ for pm_own in fork-sandbox-upstream-key fork-sandbox-postmaster-git fork-sandbox
         "$(pm_api_cfg K8S_POSTMASTER_HOOKS_SECRET=$pm_own)"
 done
 
+# 14i. Claude credential Secret: optional, from
+# K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE, rendered exactly as the git-key
+# Secret is (client-side dry-run, folded into the checksum, its text never
+# printed), mounted read-only at /etc/fork-sandbox/claude in the
+# postmaster container only, with a claude.env pointing CLAUDE_CREDENTIALS
+# at that mount and FORK_SANDBOX_CLUSTER_CLAUDE=1 -- the signal
+# `fleet check --cluster` reads to accept claude seats (see the fleet
+# suite for that half).
+pm_claude_fixture_token='sk-ant-oat01-TESTTOKEN'
+
+# pm_claude_cred_file <dir> <expires_at_ms> [access_token]: writes a 0600
+# credentials JSON at $dir/claude-cluster.json and prints its path.
+pm_claude_cred_file() {
+    local d="$1" exp="$2" tok="${3:-$pm_claude_fixture_token}" f
+    f="$d/claude-cluster.json"
+    jq -n --arg t "$tok" --argjson e "$exp" \
+        '{claudeAiOauth: {accessToken: $t, expiresAt: $e}}' > "$f"
+    chmod 600 "$f"
+    printf '%s' "$f"
+}
+pm_claude_future_ms=$(( ($(date +%s) + 30 * 86400) * 1000 ))
+pm_claude_soon_ms=$(( ($(date +%s) + 3600) * 1000 ))
+
+pm_cfg_claude="$(pm_api_cfg)"
+pm_claude_file="$(pm_claude_cred_file "$pm_cfg_claude" "$pm_claude_future_ms")"
+printf 'K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE=%s\n' "$pm_claude_file" >> "$pm_cfg_claude/k8s.env"
+pm_api_install "$pm_cfg_claude"
+check "claude credentials: install exits 0" "0" "$pm_api_rc"
+# The Secret's own YAML is never printed by a dry-run, same as the git-key
+# and mail-api-tokens Secrets -- only this placeholder comment proves the
+# conditional branch ran; the --from-file=credentials.json=... key name is
+# asserted directly against cmd_install's source below instead.
+check "claude credentials: the dry-run placeholder names the Secret" "1" \
+    "$(grep -c 'would create Secret fork-sandbox-postmaster-claude' <<< "$pm_api_out")"
+check "claude credentials: cmd_install renders the Secret with key credentials.json" "1" \
+    "$(grep -c 'from-file="credentials.json=\$K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE"' "$k8s_sh")"
+check "claude credentials: the postmaster container mounts it read-only" \
+    "claude-credentials /etc/fork-sandbox/claude true" \
+    "$(pm_hooks_mounts_of postmaster | grep '^claude-credentials ')"
+check "claude credentials: the mail-api container gets no mount" "0" \
+    "$(pm_hooks_mounts_of mail-api | grep -c '^claude-credentials ')"
+check "claude credentials: the postmaster container sets FORK_SANDBOX_CLUSTER_CLAUDE=1" \
+    "FORK_SANDBOX_CLUSTER_CLAUDE=1" \
+    "$(pm_hooks_env_of postmaster | grep '^FORK_SANDBOX_CLUSTER_CLAUDE=')"
+check "claude credentials: the mail-api container gets no such env" "0" \
+    "$(pm_hooks_env_of mail-api | grep -c 'CLUSTER_CLAUDE')"
+check "claude credentials: the config ConfigMap carries claude.env" \
+    "CLAUDE_CREDENTIALS=/etc/fork-sandbox/claude/credentials.json" \
+    "$(yq -r 'select(.kind == "ConfigMap" and .metadata.name == "fork-sandbox-postmaster-config") | .data["claude.env"]' <<< "$pm_api_out")"
+check "claude credentials: no leftover placeholders" "0" "$(grep -c '__PM_' <<< "$pm_api_out")"
+check "claude credentials: the token text never reaches stdout" "0" \
+    "$(grep -c "$pm_claude_fixture_token" <<< "$pm_api_out")"
+check "claude credentials: the token text never reaches stderr" "0" \
+    "$(grep -c "$pm_claude_fixture_token" <<< "$pm_api_err")"
+if command -v yamllint >/dev/null 2>&1; then
+    check "yamllint: claude credentials present" "" "$(printf '%s\n' "$pm_api_out" | yamllint - 2>&1)"
+fi
+
+pm_claude_sum_with="$(pm_api_sum)"
+pm_claude_file2="$(pm_claude_cred_file "$pm_cfg_claude" "$pm_claude_future_ms" 'sk-ant-oat01-TESTTOKEN-ROTATED')"
+sed -i "s|^K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE=.*|K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE=$pm_claude_file2|" "$pm_cfg_claude/k8s.env"
+pm_api_install "$pm_cfg_claude"
+check "claude credentials: rotating the token changes the checksum" "1" \
+    "$([[ -n "$pm_claude_sum_with" && "$(pm_api_sum)" != "$pm_claude_sum_with" ]] && echo 1 || echo 0)"
+
+# Unset (the mail-API fixture, same base as pm_cfg1): no Secret, no
+# marker lines, no claude.env, output byte-identical to the very first
+# base-fixture dry-run -- the legacy fixture must not change.
+pm_api_install "$pm_cfg1"
+check "no claude credentials: output identical to the base fixture" "1" \
+    "$([[ "$pm_api_out" == "$(cat "$pm_out1")" ]] && echo 1 || echo 0)"
+check "no claude credentials: no Secret" "0" \
+    "$(yq -r 'select(.kind == "Secret") | .metadata.name' <<< "$pm_api_out" | grep -c 'fork-sandbox-postmaster-claude')"
+check "no claude credentials: no marker lines left" "0" \
+    "$(grep -cE '# (>>>|<<<) claude-credentials' <<< "$pm_api_out")"
+check "no claude credentials: no claude.env key" "0" "$(grep -c 'claude.env' <<< "$pm_api_out")"
+
+# Refusals, before any kubectl call, none printing the token.
+pm_cfg_claude_missing="$(pm_api_cfg)"
+printf 'K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE=%s/nonexistent.json\n' "$pm_cfg_claude_missing" >> "$pm_cfg_claude_missing/k8s.env"
+pm_api_refused "a missing claude credentials file refuses" "not found" "$pm_cfg_claude_missing"
+check "a missing claude credentials file refuses: no token leak" "0" \
+    "$(grep -c "$pm_claude_fixture_token" <<< "$pm_api_err$pm_api_out")"
+
+pm_cfg_claude_badjson="$(pm_api_cfg)"
+pm_claude_badjson_file="$pm_cfg_claude_badjson/claude-cluster.json"
+printf 'not json\n' > "$pm_claude_badjson_file"
+chmod 600 "$pm_claude_badjson_file"
+printf 'K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE=%s\n' "$pm_claude_badjson_file" >> "$pm_cfg_claude_badjson/k8s.env"
+pm_api_refused "malformed JSON refuses" "accessToken" "$pm_cfg_claude_badjson"
+check "malformed JSON refuses: no token leak" "0" \
+    "$(grep -c "$pm_claude_fixture_token" <<< "$pm_api_err$pm_api_out")"
+
+pm_cfg_claude_noaccess="$(pm_api_cfg)"
+pm_claude_noaccess_file="$pm_cfg_claude_noaccess/claude-cluster.json"
+jq -n --argjson e "$pm_claude_future_ms" '{claudeAiOauth: {expiresAt: $e}}' > "$pm_claude_noaccess_file"
+chmod 600 "$pm_claude_noaccess_file"
+printf 'K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE=%s\n' "$pm_claude_noaccess_file" >> "$pm_cfg_claude_noaccess/k8s.env"
+pm_api_refused "no accessToken refuses" "no non-empty" "$pm_cfg_claude_noaccess"
+check "no accessToken refuses: no token leak" "0" \
+    "$(grep -c "$pm_claude_fixture_token" <<< "$pm_api_err$pm_api_out")"
+
+pm_cfg_claude_noexp="$(pm_api_cfg)"
+pm_claude_noexp_file="$pm_cfg_claude_noexp/claude-cluster.json"
+jq -n --arg t "$pm_claude_fixture_token" '{claudeAiOauth: {accessToken: $t}}' > "$pm_claude_noexp_file"
+chmod 600 "$pm_claude_noexp_file"
+printf 'K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE=%s\n' "$pm_claude_noexp_file" >> "$pm_cfg_claude_noexp/k8s.env"
+pm_api_refused "no expiresAt refuses" "no numeric" "$pm_cfg_claude_noexp"
+check "no expiresAt refuses: no token leak" "0" \
+    "$(grep -c "$pm_claude_fixture_token" <<< "$pm_api_err$pm_api_out")"
+
+pm_cfg_claude_strexp="$(pm_api_cfg)"
+pm_claude_strexp_file="$pm_cfg_claude_strexp/claude-cluster.json"
+jq -n --arg t "$pm_claude_fixture_token" '{claudeAiOauth: {accessToken: $t, expiresAt: "soon"}}' > "$pm_claude_strexp_file"
+chmod 600 "$pm_claude_strexp_file"
+printf 'K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE=%s\n' "$pm_claude_strexp_file" >> "$pm_cfg_claude_strexp/k8s.env"
+pm_api_refused "a string expiresAt refuses" "no numeric" "$pm_cfg_claude_strexp"
+check "a string expiresAt refuses: no token leak" "0" \
+    "$(grep -c "$pm_claude_fixture_token" <<< "$pm_api_err$pm_api_out")"
+
+pm_cfg_claude_soon="$(pm_api_cfg)"
+pm_claude_soon_file="$(pm_claude_cred_file "$pm_cfg_claude_soon" "$pm_claude_soon_ms")"
+printf 'K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE=%s\n' "$pm_claude_soon_file" >> "$pm_cfg_claude_soon/k8s.env"
+pm_api_refused "an access token expiring within 7 days refuses" "expires too soon" "$pm_cfg_claude_soon"
+check "an access token expiring within 7 days refuses: no token leak" "0" \
+    "$(grep -c "$pm_claude_fixture_token" <<< "$pm_api_err$pm_api_out")"
+
 printf '\n== client Role vs postmaster Role: same rules ==\n'
 rbac_yaml="$repo_dir/manifests/k8s/10-rbac.yaml"
 pm_yaml="$repo_dir/manifests/k8s/40-postmaster.yaml"
