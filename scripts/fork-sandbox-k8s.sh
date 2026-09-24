@@ -5792,7 +5792,27 @@ EOF
     printf '%s\n' "$job_rendered" | kubectl apply -f -
 
     echo "fork-sandbox-k8s: waiting for pod (job $safe_name) to be ready" >&2
-    kubectl wait --for=condition=Ready "pod" -l "job-name=$safe_name" --timeout=180s
+    # The Job controller creates the pod asynchronously, and `kubectl wait`
+    # with a label selector fails at once ("no matching resources found")
+    # when nothing matches yet -- so poll for the pod's existence first,
+    # then wait for Ready, both inside one budget. External date/sleep, not
+    # bash builtins, so the tests can stub them; no `wait --for=create`
+    # (needs kubectl 1.31+).
+    local pod_budget=180 pod_start pod_elapsed pod_remaining
+    pod_start="$(date +%s)"
+    while [[ -z "$(kubectl get pod -l "job-name=$safe_name" -o name 2>/dev/null || true)" ]]; do
+        if (( $(date +%s) - pod_start >= pod_budget )); then
+            echo "Error: job $safe_name created no pod within ${pod_budget}s. The Job controller" >&2
+            echo "may be blocked (quota, admission, or pod security). Inspect it with:" >&2
+            echo "  kubectl --context=$K8S_CONTEXT -n $K8S_NAMESPACE describe job $safe_name" >&2
+            exit 1
+        fi
+        sleep 2
+    done
+    pod_elapsed=$(( $(date +%s) - pod_start ))
+    pod_remaining=$(( pod_budget - pod_elapsed ))
+    (( pod_remaining >= 10 )) || pod_remaining=10
+    kubectl wait --for=condition=Ready "pod" -l "job-name=$safe_name" --timeout="${pod_remaining}s"
 
     local pod_name
     pod_name="$(kubectl get pod -l "job-name=$safe_name" -o jsonpath='{.items[0].metadata.name}')"

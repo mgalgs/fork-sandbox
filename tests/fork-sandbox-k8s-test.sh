@@ -1414,6 +1414,145 @@ else
 fi
 rm -f /tmp/fs-k8s-test-claude-jobfail.out
 
+# The Job controller creates a Job's pod asynchronously, and a real
+# `kubectl wait -l ...` exits at once with "no matching resources found"
+# while nothing matches yet. submit must poll for the pod's existence first,
+# then wait for Ready, and give up (cleaning up) only when no pod ever shows.
+printf '\n== submit: waits for the Job'"'"'s pod to exist before waiting on Ready ==\n'
+podwait_name_out="$(newdir)/podwait-name.yaml"; tmpdirs+=("$(dirname "$podwait_name_out")")
+FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-podwait-never --model moonshotai/kimi-k3 --harness pi \
+    "$proj_dir" "$handoff_file" > "$podwait_name_out"
+podwait_never_safe_name="$(awk '/^kind: Job$/{job=1} job && /^  name:/{print $2; exit}' "$podwait_name_out")"
+podwait_stub_dir="$(newdir)"; tmpdirs+=("$podwait_stub_dir")
+cat > "$podwait_stub_dir/git" <<'STUB'
+#!/usr/bin/env bash
+case " $* " in
+    *" push "*) exit 0 ;;
+esac
+exec /usr/bin/git "$@"
+STUB
+cat > "$podwait_stub_dir/sleep" <<'STUB'
+#!/usr/bin/env bash
+exit 0
+STUB
+# K8S_STUB_PODS_AFTER is how many `get pod -l job-name=` calls print nothing
+# before a pod name appears; "never" means it never does.
+cat > "$podwait_stub_dir/kubectl" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$K8S_STUB_LOG"
+verb=""; for arg in "$@"; do case "$arg" in apply|wait|exec|get|delete) verb="$arg" ;; esac; done
+seen() { [[ -f "$K8S_STUB_COUNTER" ]] && cat "$K8S_STUB_COUNTER" || echo 0; }
+pod_visible() {
+    [[ "$K8S_STUB_PODS_AFTER" != never ]] && (( $(seen) > K8S_STUB_PODS_AFTER ))
+}
+case "$verb" in
+    apply|exec) cat >/dev/null ;;
+    get)
+        case "$*" in
+            *"pod -l job-name="*"-o name"*)
+                echo $(( $(seen) + 1 )) > "$K8S_STUB_COUNTER"
+                pod_visible && printf 'pod/stub-pod\n'
+                ;;
+            *) printf 'stub-pod\n' ;;
+        esac
+        ;;
+    wait)
+        case "$*" in
+            *"-l job-name="*)
+                if ! pod_visible; then
+                    echo "error: no matching resources found" >&2
+                    exit 1
+                fi
+                ;;
+        esac
+        ;;
+esac
+exit 0
+STUB
+chmod +x "$podwait_stub_dir/git" "$podwait_stub_dir/sleep" "$podwait_stub_dir/kubectl"
+
+podwait_home="$(newdir)"; tmpdirs+=("$podwait_home")
+podwait_log="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$podwait_log")")
+podwait_counter="$(newdir)/counter"; tmpdirs+=("$(dirname "$podwait_counter")")
+PATH="$podwait_stub_dir:$PATH" K8S_STUB_LOG="$podwait_log" HOME="$podwait_home" \
+    K8S_STUB_COUNTER="$podwait_counter" K8S_STUB_PODS_AFTER=2 \
+    FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit \
+    --branch fs-k8s-test-podwait --model moonshotai/kimi-k3 --harness pi \
+    "$proj_dir" "$handoff_file" >/tmp/fs-k8s-test-podwait.out 2>&1 </dev/null
+podwait_rc=$?
+podwait_rd="$(sed -n 's/^  run dir:  *//p' /tmp/fs-k8s-test-podwait.out | head -1)"
+[[ -n "$podwait_rd" && -d "$podwait_rd" ]] && tmpdirs+=("$podwait_rd")
+if (( podwait_rc == 0 )); then
+    ok "a pod that appears only after the Job apply does not fail submit"
+else
+    no "a pod that appears only after the Job apply does not fail submit" \
+        "rc=$podwait_rc out=$(cat /tmp/fs-k8s-test-podwait.out) log=$(cat "$podwait_log")"
+fi
+podwait_first_wait="$(grep -n ' wait .*-l job-name=' "$podwait_log" | head -1 | cut -d: -f1)"
+podwait_polls_before=0
+if [[ -n "$podwait_first_wait" ]]; then
+    podwait_polls_before="$(head -n "$(( podwait_first_wait - 1 ))" "$podwait_log" \
+        | grep -c 'get pod -l job-name=.* -o name')"
+fi
+if [[ -n "$podwait_first_wait" ]] && (( podwait_polls_before >= 3 )); then
+    ok "submit polls for the pod at least three times before the first Ready wait"
+else
+    no "submit polls for the pod at least three times before the first Ready wait" \
+        "first_wait=$podwait_first_wait polls_before=$podwait_polls_before log=$(cat "$podwait_log")"
+fi
+if grep -q ' delete ' "$podwait_log"; then
+    no "a submit that only had to wait for its pod deletes nothing" "$(cat "$podwait_log")"
+else
+    ok "a submit that only had to wait for its pod deletes nothing"
+fi
+rm -f /tmp/fs-k8s-test-podwait.out
+
+# No pod ever: a date stub whose `+%s` grows by 100 per call runs the 180s
+# budget out instantly (sleep is stubbed too); every other date call is the
+# real one, whose path is baked in before PATH changes.
+podwait_real_date="$(type -P date)"
+cat > "$podwait_stub_dir/date" <<STUB
+#!/usr/bin/env bash
+if [[ "\$*" == "+%s" ]]; then
+    n=\$(cat "\$K8S_STUB_DATE_COUNTER" 2>/dev/null || echo 0)
+    n=\$(( n + 1 ))
+    echo "\$n" > "\$K8S_STUB_DATE_COUNTER"
+    echo \$(( n * 100 ))
+else
+    exec "$podwait_real_date" "\$@"
+fi
+STUB
+chmod +x "$podwait_stub_dir/date"
+podwait_never_log="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$podwait_never_log")")
+podwait_never_counter="$(newdir)/counter"; tmpdirs+=("$(dirname "$podwait_never_counter")")
+podwait_never_date_counter="$(newdir)/date-counter"; tmpdirs+=("$(dirname "$podwait_never_date_counter")")
+PATH="$podwait_stub_dir:$PATH" K8S_STUB_LOG="$podwait_never_log" HOME="$podwait_home" \
+    K8S_STUB_COUNTER="$podwait_never_counter" K8S_STUB_PODS_AFTER=never \
+    K8S_STUB_DATE_COUNTER="$podwait_never_date_counter" \
+    FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit \
+    --branch fs-k8s-test-podwait-never --model moonshotai/kimi-k3 --harness pi \
+    "$proj_dir" "$handoff_file" >/tmp/fs-k8s-test-podwait-never.out 2>&1 </dev/null
+podwait_never_rc=$?
+if (( podwait_never_rc != 0 )) && grep -q 'created no pod within 180s' /tmp/fs-k8s-test-podwait-never.out \
+    && grep -qE "describe job $podwait_never_safe_name\$" /tmp/fs-k8s-test-podwait-never.out; then
+    ok "a Job that never gets a pod fails submit, naming the timeout and the describe command"
+else
+    no "a Job that never gets a pod fails submit, naming the timeout and the describe command" \
+        "rc=$podwait_never_rc out=$(cat /tmp/fs-k8s-test-podwait-never.out)"
+fi
+if grep -q ' wait ' "$podwait_never_log"; then
+    no "a Job that never gets a pod never reaches the Ready wait" "$(cat "$podwait_never_log")"
+else
+    ok "a Job that never gets a pod never reaches the Ready wait"
+fi
+if grep -qF "delete job,pod,service,secret,configmap,networkpolicy -l fork-sandbox/branch=$podwait_never_safe_name --ignore-not-found" "$podwait_never_log"; then
+    ok "a Job that never gets a pod is cleaned up by the failure trap"
+else
+    no "a Job that never gets a pod is cleaned up by the failure trap" "$(cat "$podwait_never_log")"
+fi
+rm -f /tmp/fs-k8s-test-podwait-never.out
+
 # fs_emit_prompt_preamble (fork-sandbox-lib.sh), shared with fork-sandbox.sh's
 # local path: the rendered handoff.md must carry the clone-path and
 # gated-egress blocks, must carry an "Operator inbox" section naming
