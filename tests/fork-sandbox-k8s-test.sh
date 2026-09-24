@@ -13151,6 +13151,54 @@ else
 fi
 rm -f /tmp/fs-k8s-test-pm-secret.err
 
+# 13. FORK_SANDBOX_K8S_PLATFORM set to a non-generic plugin warns but does
+# not refuse: the postmaster pod always resolves the generic plugin, so a
+# mismatched laptop platform is a warning, not an install-time failure.
+# The plugin named by FORK_SANDBOX_K8S_PLATFORM still has to resolve for
+# plain install to proceed at all, so this uses a copy of the real generic
+# plugin under a different name -- it is name-agnostic -- rather than a
+# name nothing provides.
+pm_platform_dir="$(newdir)"; tmpdirs+=("$pm_platform_dir")
+cp "$repo_dir/scripts/fork-sandbox-k8s-platform-generic" \
+    "$pm_platform_dir/fork-sandbox-k8s-platform-some-other-plugin"
+chmod +x "$pm_platform_dir/fork-sandbox-k8s-platform-some-other-plugin"
+pm_log_platform="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$pm_log_platform")")
+if PATH="$pm_platform_dir:$pm_stub_bin:$PATH" K8S_STUB_LOG="$pm_log_platform" FORK_SANDBOX_CONFIG_DIR="$pm_cfg1" \
+    FORK_SANDBOX_K8S_PLATFORM=some-other-plugin \
+    "$k8s_sh" install --postmaster --dry-run >/dev/null 2>/tmp/fs-k8s-test-pm-platform.err; then
+    ok "install --postmaster still succeeds with a non-generic FORK_SANDBOX_K8S_PLATFORM"
+else
+    no "install --postmaster still succeeds with a non-generic FORK_SANDBOX_K8S_PLATFORM" \
+        "$(cat /tmp/fs-k8s-test-pm-platform.err)"
+fi
+if grep -qF "FORK_SANDBOX_K8S_PLATFORM='some-other-plugin' is set" /tmp/fs-k8s-test-pm-platform.err; then
+    ok "a non-generic FORK_SANDBOX_K8S_PLATFORM warns on stderr"
+else
+    no "a non-generic FORK_SANDBOX_K8S_PLATFORM warns on stderr" "$(cat /tmp/fs-k8s-test-pm-platform.err)"
+fi
+rm -f /tmp/fs-k8s-test-pm-platform.err
+
+pm_log_platform_unset="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$pm_log_platform_unset")")
+PATH="$pm_stub_bin:$PATH" K8S_STUB_LOG="$pm_log_platform_unset" FORK_SANDBOX_CONFIG_DIR="$pm_cfg1" \
+    "$k8s_sh" install --postmaster --dry-run >/dev/null 2>/tmp/fs-k8s-test-pm-platform-unset.err
+if grep -qF "FORK_SANDBOX_K8S_PLATFORM" /tmp/fs-k8s-test-pm-platform-unset.err; then
+    no "no warning when FORK_SANDBOX_K8S_PLATFORM is unset" "$(cat /tmp/fs-k8s-test-pm-platform-unset.err)"
+else
+    ok "no warning when FORK_SANDBOX_K8S_PLATFORM is unset"
+fi
+rm -f /tmp/fs-k8s-test-pm-platform-unset.err
+
+pm_log_platform_generic="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$pm_log_platform_generic")")
+PATH="$pm_stub_bin:$PATH" K8S_STUB_LOG="$pm_log_platform_generic" FORK_SANDBOX_CONFIG_DIR="$pm_cfg1" \
+    FORK_SANDBOX_K8S_PLATFORM=generic \
+    "$k8s_sh" install --postmaster --dry-run >/dev/null 2>/tmp/fs-k8s-test-pm-platform-generic.err
+if grep -qF "FORK_SANDBOX_K8S_PLATFORM" /tmp/fs-k8s-test-pm-platform-generic.err; then
+    no "no warning when FORK_SANDBOX_K8S_PLATFORM=generic" "$(cat /tmp/fs-k8s-test-pm-platform-generic.err)"
+else
+    ok "no warning when FORK_SANDBOX_K8S_PLATFORM=generic"
+fi
+rm -f /tmp/fs-k8s-test-pm-platform-generic.err
+
 printf '\n== client Role vs postmaster Role: same rules ==\n'
 rbac_yaml="$repo_dir/manifests/k8s/10-rbac.yaml"
 pm_yaml="$repo_dir/manifests/k8s/40-postmaster.yaml"

@@ -140,8 +140,11 @@ that submit and render-grant use for that seat-pod policy. It is a laptop
 environment variable, not a `k8s.env` key, and the postmaster image ships
 no plugin binary beyond `generic` and sets no such variable in the
 Deployment. So a seat submitted from inside the pod always resolves the
-`generic` plugin, even when a site's laptop runs a different one -- there
-is no warning today when the two disagree.
+`generic` plugin, even when a site's laptop runs a different one.
+`install --postmaster` warns on stderr when it is run with
+`FORK_SANDBOX_K8S_PLATFORM` set to anything but `generic`, naming the
+mismatch, but it does not refuse: some sites may intend the pod to use
+generic even when the laptop runs something else.
 
 ## Security posture
 

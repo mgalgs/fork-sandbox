@@ -36,8 +36,8 @@
 #      checked-out branch to its upstream (a fetch alone only moves
 #      refs/remotes/origin/*; the postmaster itself never fetches, so
 #      without this HEAD would stay pinned at whatever commit the first
-#      clone produced -- see docs/cluster-postmaster.md's "getting new
-#      commits into the pod" section). A failed fetch on an existing
+#      clone produced -- see docs/cluster-postmaster.md's "Updating"
+#      section). A failed fetch on an existing
 #      clone is a warning (the remote may be briefly down and the
 #      postmaster can still route on what is already on disk); so is a
 #      fast-forward that is not possible (a diverged local branch, e.g.
