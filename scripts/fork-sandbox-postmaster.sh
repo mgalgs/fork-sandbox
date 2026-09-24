@@ -107,6 +107,10 @@
 #                adoption probe could not reach the cluster (exit 4, or any
 #                code outside its 0/1/2 contract), so the run is left live
 #                rather than adopted or declared dead; see ADOPTION below.
+#   external-mail thread -- `deliver --cluster` only: a non-fleet sender
+#                that is not on the operator list ($FORK_SANDBOX_OPERATORS)
+#                posted to this thread; it routes like fleet mail and
+#                carries no rule-1 authority. The sender is not named.
 #   triage-skip  agent, thread -- the Cc triage classifier skipped this
 #                candidate for this message
 #   handler      agent, thread, exit=<status> -- a handler seat's wake ran
@@ -200,7 +204,13 @@
 #      (rather than the harvester's automatic per-wake decrement) needs
 #      `mail send --hops` on a fresh thread: an operator's own `mail
 #      reply` still copies the parent's X-Hops verbatim, since only the
-#      harvester's reply-posting call (below) passes --hops.
+#      harvester's reply-posting call (below) passes --hops. Under
+#      `deliver --cluster` only a From on the operator list
+#      ($FORK_SANDBOX_OPERATORS, comma-separated @names, default
+#      @operator) carries this authority; any other non-fleet sender
+#      routes exactly like fleet mail (rules 2-4) and emits an
+#      external-mail event. A name on the list must not be a fleet
+#      agent, and a malformed list refuses startup (exit 2).
 #   2. X-Hops gate: M's X-Hops == 0 means no wakes from M -- flag T
 #      needs-operator, reason "hops exhausted at <message-id>".
 #   3. Thread budget: spawns-so-far(T) >= budget (default 32,
@@ -1880,6 +1890,48 @@ pm_require_k8s_timeout() {
     pm_parse_k8s_timeout
 }
 
+# The cluster operator list: the From addresses whose mail carries rule-1
+# authority (clears the thread's needs-operator flag, resets its spawn
+# budget) under `deliver --cluster`. $FORK_SANDBOX_OPERATORS is a
+# comma-separated list of @names with no spaces; unset or empty means
+# @operator. Read once, at startup, and only in cluster mode -- the laptop
+# postmaster gives every non-fleet sender that authority and ignores the
+# variable. An operator name must not resolve as a fleet agent: a seat's own
+# replies would otherwise carry operator authority.
+PM_OPERATORS=()
+
+pm_parse_operators() {
+    PM_OPERATORS=()
+    (( PM_CLUSTER )) || return 0
+    local raw="${FORK_SANDBOX_OPERATORS-}" el
+    [[ -n "$raw" ]] || raw="@operator"
+    local -a parts
+    IFS=',' read -ra parts <<< "$raw,"
+    for el in "${parts[@]}"; do
+        if [[ ! "$el" =~ $PM_ADDR_RE ]]; then
+            echo "Error: postmaster: \$FORK_SANDBOX_OPERATORS element '$el' is not an @name (comma-separated, no spaces, no empty elements)." >&2
+            return 2
+        fi
+        if "$FLEET" resolve "${el#@}" >/dev/null 2>&1; then
+            echo "Error: postmaster: \$FORK_SANDBOX_OPERATORS names '$el', which is a fleet agent; an operator name must not be a fleet agent." >&2
+            return 2
+        fi
+        PM_OPERATORS+=("$el")
+    done
+}
+
+pm_require_operators() {
+    pm_parse_operators
+}
+
+pm_is_operator() {
+    local a="$1" o
+    for o in "${PM_OPERATORS[@]}"; do
+        [[ "$o" == "$a" ]] && return 0
+    done
+    return 1
+}
+
 pm_write_handoff() {
     local out="$1" agent="$2" persona_path="$3" tid="$4" trigger_mid="$5" via="$6" \
           trigger_only="$7" is_retry="${8:-}"
@@ -2737,11 +2789,15 @@ pm_process_message() {
     local from_name="${from#@}"
 
     if ! "$FLEET" resolve "$from_name" >/dev/null 2>&1; then
-        operator_mail=1
-        # rule 1: operator/external mail resets the thread before rules 2-3.
-        pm_unflag "$tid"
-        mkdir -p -- "$SPAWNS"
-        : > "$SPAWNS/$tid"
+        if (( ! PM_CLUSTER )) || pm_is_operator "$from"; then
+            operator_mail=1
+            # rule 1: operator/external mail resets the thread before rules 2-3.
+            pm_unflag "$tid"
+            mkdir -p -- "$SPAWNS"
+            : > "$SPAWNS/$tid"
+        else
+            pm_event "external-mail thread=${tid:0:8}"
+        fi
     fi
 
     # Expanded regardless of the gate below: a refused message still needs
@@ -3894,6 +3950,7 @@ cmd_deliver() {
     pm_require_kit || return 1
     pm_require_routing_source || return 1
     pm_require_fleet_check || return 1
+    pm_require_operators || return 2
     pm_require_retry_backoff || return 1
     pm_require_k8s_timeout || return 1
 

@@ -5838,6 +5838,100 @@ contains "cluster: the adoption run.sh execs --adopt" "$(cat "$cl_wake_dir/run.s
 check "cluster: adoption never touched tmux" 0 "$( [[ -e "$cl_bin/tmux-called.log" ]] && echo 1 || echo 0 )"
 contains "cluster: pm adopt event" "$(cat "$work/cl.out")" "pm adopt thread="
 
+# ---- cluster mode: the operator list carries rule-1 authority ----
+
+# Under --cluster only a From on $FORK_SANDBOX_OPERATORS (default
+# @operator) clears a flag and resets a thread's budget; any other
+# non-fleet sender routes like fleet mail. The laptop keeps giving every
+# non-fleet sender that authority. cl_fleet_dir/cl_personas/cl_bin are the
+# all-pi k8s fleet built above.
+op_pass() {
+    env -u FORK_SANDBOX_POSTMASTER_K8S_DETACH \
+        FORK_SANDBOX_FLEET_FILE="$cl_fleet_dir/fleet.yaml" \
+        FORK_SANDBOX_PERSONAS_DIR="$cl_personas" \
+        PATH="$cl_bin:$PATH" \
+        "$postmaster" deliver --project "$PROJECT_DIR" "$@" --once \
+        >"$work/op.out" 2>"$work/op.err"
+}
+# A thread with one routed root message from @operator to @kim (so a
+# reply-all's To resolves, never tripping the unresolvable-To flag), a
+# flag and a spent budget; sets op_tid/op_root/op_short.
+op_fixture() {
+    new_scratch_root FORK_SANDBOX_MAIL_ROOT
+    export FORK_SANDBOX_MAIL_ROOT
+    PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+    op_root="$(send_msg '@operator' '@kim' 'operator list topic' 'first' 8)"
+    op_tid="$(thread_of "$op_root")"
+    op_short="${op_tid:0:8}"
+    op_pass --cluster
+    "$postmaster" flag "$op_tid" "stale reason" >/dev/null 2>&1
+    printf 'stale-1\nstale-2\nstale-3\n' > "$PM_STATE_DIR/spawns/$op_tid"
+}
+op_flag_present() { [[ -e "$PM_STATE_DIR/needs-operator/$op_tid" ]] && echo 1 || echo 0; }
+
+op_fixture
+reply_msg '@ci-kickoff' "$op_root" 'ci posts into a flagged thread' >/dev/null
+op_pass --cluster
+check "cluster operators: a non-operator non-fleet reply leaves the flag" 1 "$(op_flag_present)"
+check "cluster operators: it does not reset the spawn budget" 3 \
+    "$(grep -c -- '^stale-' "$PM_STATE_DIR/spawns/$op_tid")"
+contains "cluster operators: it emits external-mail" "$(cat "$work/op.out")" \
+    "pm external-mail thread=$op_short"
+not_contains "cluster operators: the event does not name the sender" "$(cat "$work/op.out")" "ci-kickoff"
+
+op_fixture
+reply_msg '@operator' "$op_root" 'operator re-arms the thread' >/dev/null
+op_pass --cluster
+check "cluster operators: @operator (default list) clears the flag" 0 "$(op_flag_present)"
+check "cluster operators: @operator resets the budget" 0 "$(spawn_count_of "$op_tid")"
+not_contains "cluster operators: @operator emits no external-mail" "$(cat "$work/op.out")" "external-mail"
+
+op_fixture
+reply_msg '@alice' "$op_root" 'alice is on the list' >/dev/null
+FORK_SANDBOX_OPERATORS=@alice,@operator op_pass --cluster
+check "cluster operators: a listed name (@alice) clears the flag" 0 "$(op_flag_present)"
+op_fixture
+reply_msg '@bob' "$op_root" 'bob is not on the list' >/dev/null
+FORK_SANDBOX_OPERATORS=@alice,@operator op_pass --cluster
+check "cluster operators: an unlisted name (@bob) does not clear it" 1 "$(op_flag_present)"
+
+# A sender with no authority still wakes the seat it addresses.
+op_fixture
+"$postmaster" unflag "$op_tid" >/dev/null 2>&1
+printf 'one\n' > "$PM_STATE_DIR/spawns/$op_tid"
+rm -f -- "$PM_STATE_DIR/runs"/*.env
+send_msg '@ci-kickoff' '@kim' 'fresh ci thread' 'wake kim' 8 >/dev/null
+fresh_before="$(grep -c -- 'run.sh$' "$cl_bin/setsid-argv.log")"
+op_pass --cluster
+check "cluster operators: a non-operator sender's mail still wakes the addressed seat" 1 \
+    "$(( $(grep -c -- 'run.sh$' "$cl_bin/setsid-argv.log") - fresh_before ))"
+
+for op_bad in '@a,,@b' 'Bad' '@a,' ',@a' '@a, @b'; do
+    op_rc=0
+    FORK_SANDBOX_OPERATORS="$op_bad" op_pass --cluster || op_rc=$?
+    check "cluster operators: FORK_SANDBOX_OPERATORS='$op_bad' exits 2" 2 "$op_rc"
+    check "cluster operators: '$op_bad' refusal is one line" 1 "$(wc -l < "$work/op.err")"
+done
+FORK_SANDBOX_OPERATORS='@a,,@b' op_pass --cluster
+contains "cluster operators: the empty element is named" "$(cat "$work/op.err")" "element ''"
+FORK_SANDBOX_OPERATORS='Bad' op_pass --cluster
+contains "cluster operators: a bad name is named" "$(cat "$work/op.err")" "'Bad'"
+op_rc=0
+FORK_SANDBOX_OPERATORS='@operator,@kim' op_pass --cluster || op_rc=$?
+check "cluster operators: a list naming a fleet agent exits 2" 2 "$op_rc"
+contains "cluster operators: the fleet agent is named" "$(cat "$work/op.err")" "'@kim'"
+contains "cluster operators: the refusal says why" "$(cat "$work/op.err")" "must not be a fleet agent"
+
+# The laptop ignores the variable: every non-fleet sender clears the flag.
+op_fixture
+reply_msg '@ci-kickoff' "$op_root" 'ci posts on the laptop' >/dev/null
+FORK_SANDBOX_OPERATORS=@alice op_pass
+check "laptop: FORK_SANDBOX_OPERATORS is ignored, a non-fleet sender clears the flag" 0 "$(op_flag_present)"
+not_contains "laptop: no external-mail event" "$(cat "$work/op.out")" "external-mail"
+op_rc=0
+FORK_SANDBOX_OPERATORS='@a,,@b' op_pass || op_rc=$?
+check "laptop: a malformed FORK_SANDBOX_OPERATORS does not refuse startup" 0 "$op_rc"
+
 unset FORK_SANDBOX_POSTMASTER_K8S_DETACH
 unset FORK_SANDBOX_POSTMASTER_K8S
 unset FORK_SANDBOX_CONFIG_DIR
