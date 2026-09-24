@@ -2968,3 +2968,138 @@ fs_refresh_warn_brief() {
     printf 'a "[1m]" model for a bigger context window, or a larger\n'
     printf '"--refresh-at <tokens>" given as an absolute token count.\n'
 }
+
+# fs_resolve_upstream <origin-repo> <checkout-ref-or-empty>
+#
+# Decides what the fetched-back branch's upstream should be, so the caller can
+# set it once fetch-back has actually happened -- see fs_apply_upstream below.
+# Resolved HERE, at launch, rather than at fetch time: a long run's HEAD can
+# move while the sandbox works, and the upstream that made sense when the
+# session was launched is the one the caller decided on, not whatever HEAD
+# happens to be pointing at hours later.
+#
+# First match wins:
+#
+#   1. checkout-ref is given, and resolves (git rev-parse --symbolic-full-name)
+#      to a remote-tracking ref (refs/remotes/...): that ref.
+#   2. checkout-ref resolves to a local branch (refs/heads/X) that itself has
+#      an upstream: X's upstream. This is what makes a second round on
+#      --checkout sbx-foo inherit sbx-foo's own upstream.
+#   3. Otherwise -- no checkout-ref, a local branch with no upstream, a tag, a
+#      bare sha: if HEAD is on a branch that has an upstream, that upstream.
+#   4. Otherwise: the remote's default branch (refs/remotes/origin/HEAD).
+#   5. Otherwise: no upstream. Not an error -- plenty of repos have no remote,
+#      or a remote with no default branch configured.
+#
+# Prints the upstream as a short ref name (e.g. "origin/dev") on stdout and
+# returns 0. When there is none (case 5), prints nothing on stdout, a one-line
+# reason on stderr, and still returns 0: every git call here is guarded, so a
+# caller running under `set -euo pipefail` is never taken down by this
+# resolution alone, which matters because losing the upstream note is a much
+# smaller problem than losing the run's actual work over it.
+fs_resolve_upstream() {
+    local origin_repo="$1" checkout_ref="${2:-}"
+    local symbolic branch_name upstream
+
+    if [[ -n "$checkout_ref" ]]; then
+        symbolic="$(cd "$origin_repo" \
+            && git rev-parse --symbolic-full-name --quiet "$checkout_ref" 2>/dev/null)" \
+            || symbolic=""
+        if [[ "$symbolic" == refs/remotes/* ]]; then
+            printf '%s\n' "${symbolic#refs/remotes/}"
+            return 0
+        fi
+        if [[ "$symbolic" == refs/heads/* ]]; then
+            branch_name="${symbolic#refs/heads/}"
+            upstream="$(cd "$origin_repo" \
+                && git rev-parse --abbrev-ref --symbolic-full-name \
+                    "$branch_name@{upstream}" 2>/dev/null)" || upstream=""
+            if [[ -n "$upstream" ]]; then
+                printf '%s\n' "$upstream"
+                return 0
+            fi
+        fi
+    fi
+
+    upstream="$(cd "$origin_repo" \
+        && git rev-parse --abbrev-ref --symbolic-full-name 'HEAD@{upstream}' 2>/dev/null)" \
+        || upstream=""
+    if [[ -n "$upstream" ]]; then
+        printf '%s\n' "$upstream"
+        return 0
+    fi
+
+    symbolic="$(cd "$origin_repo" \
+        && git symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null)" || symbolic=""
+    if [[ -n "$symbolic" ]]; then
+        printf '%s\n' "${symbolic#refs/remotes/}"
+        return 0
+    fi
+
+    echo "no remote-tracking --checkout, no upstream to inherit, HEAD has none, and origin has no default branch" >&2
+    return 0
+}
+
+# fs_apply_upstream <origin-repo> <branch> <upstream-or-empty> <reason-if-empty>
+#
+# Applies the upstream fs_resolve_upstream decided on, once the branch has
+# actually landed in the origin repo by a fetch. Never fails the caller: every
+# outcome, including every reason this does nothing, is a single line on
+# stdout (the caller routes it wherever its own summary goes -- a terminal, a
+# run's summary.txt, a k8s fetch's stderr), and the return value is always 0.
+# An upstream is a convenience for `git status`/`git branch -vv`; it must
+# never be the thing that makes a fetch-back look like it failed.
+#
+# In order:
+#   - the branch does not exist in the origin repo (the 0-commit path deletes
+#     it before this runs): skip.
+#   - the branch already has an upstream: leave it alone. A re-fetch of a
+#     branch the caller has already pointed somewhere must not clobber that
+#     choice.
+#   - no upstream was resolved: skip, with the reason fs_resolve_upstream gave
+#     on its stderr, passed through here as the 4th argument.
+#   - the resolved upstream ref no longer exists in the origin repo (deleted
+#     or never fetched between launch and now): skip.
+#   - otherwise, set it, with hooks disabled: this is bookkeeping on a branch
+#     that already exists, not an event any hook needs to see.
+fs_apply_upstream() {
+    local origin_repo="$1" branch="$2" upstream="$3" reason="${4:-}"
+    local existing
+
+    if ! (cd "$origin_repo" \
+        && git rev-parse --verify --quiet "refs/heads/$branch") >/dev/null 2>&1; then
+        printf 'fork-sandbox: upstream not set on %s: branch not found\n' "$branch"
+        return 0
+    fi
+
+    existing="$(cd "$origin_repo" \
+        && git rev-parse --abbrev-ref --symbolic-full-name \
+            "$branch@{upstream}" 2>/dev/null)" || existing=""
+    if [[ -n "$existing" ]]; then
+        printf 'fork-sandbox: upstream not set on %s: already tracks %s\n' \
+            "$branch" "$existing"
+        return 0
+    fi
+
+    if [[ -z "$upstream" ]]; then
+        printf 'fork-sandbox: upstream not set on %s: %s\n' \
+            "$branch" "${reason:-no upstream resolved}"
+        return 0
+    fi
+
+    if ! (cd "$origin_repo" \
+        && git rev-parse --verify --quiet "refs/remotes/$upstream") >/dev/null 2>&1; then
+        printf 'fork-sandbox: upstream not set on %s: %s no longer exists\n' \
+            "$branch" "$upstream"
+        return 0
+    fi
+
+    if (cd "$origin_repo" && git -c core.hooksPath=/dev/null \
+        branch --set-upstream-to="$upstream" "$branch") >/dev/null 2>&1; then
+        printf 'fork-sandbox: upstream of %s set to %s\n' "$branch" "$upstream"
+    else
+        printf 'fork-sandbox: upstream not set on %s: git branch --set-upstream-to failed\n' \
+            "$branch"
+    fi
+    return 0
+}
