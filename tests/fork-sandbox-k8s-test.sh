@@ -12924,6 +12924,175 @@ mkdir -p -- "$cg_nl_ctx_dir"; tmpdirs+=("/var/tmp/claude-scratch/forks/check-gra
 cg_run --context-ro "$cg_nl_ctx_dir" >/dev/null 2>&1
 check "context-ro whose real path contains a newline: exit 2" "2" "$?"
 
+printf '\n== check-grant / submit / run --context-secret ==\n'
+cg_out="$(cg_run --context-secret preview-ctx 2>/dev/null)"
+cg_rc=$?
+check "context-secret grant: exit 0" "0" "$cg_rc"
+check "context-secret grant: only the CONTEXT_SECRET= line" "CONTEXT_SECRET=preview-ctx" "$cg_out"
+
+cg_out="$(cg_run --allow-namespace preview-pr-7 --reach-probe svc.preview-pr-7:80 \
+    --context-secret preview-ctx 2>/dev/null)"
+check "ns+probe+context-secret: CONTEXT_SECRET= is the last line" \
+    "$(printf 'ALLOW_NAMESPACE=preview-pr-7\nREACH_PROBE=svc.preview-pr-7:80\nCONTEXT_SECRET=preview-ctx')" \
+    "$cg_out"
+
+cg_run --context-secret preview-ctx --context-ro "$cg_ctx_dir" >/dev/null 2>&1
+check "context-secret with context-ro: exit 2" "2" "$?"
+
+for cs_bad in "Bad_Name" "-lead" "trail-" "has space" "UPPER" \
+        fork-sandbox-upstream-key fork-sandbox-anything sbx-foo-claude-token \
+        "$(printf 'a%.0s' {1..254})"; do
+    cg_run --context-secret "$cs_bad" >/dev/null 2>&1
+    check "context-secret '${cs_bad:0:30}' refused: exit 2" "2" "$?"
+done
+cg_run --context-secret fork-sandbox-upstream-key >/dev/null 2>"$cg_config_dir/err"
+check "reserved fork-sandbox- prefix names the rule" "yes" \
+    "$(grep -q "starts with 'fork-sandbox-'" "$cg_config_dir/err" && echo yes || echo no)"
+cg_run --context-secret sbx-foo-claude-token >/dev/null 2>"$cg_config_dir/err"
+check "reserved -claude-token suffix names the rule" "yes" \
+    "$(grep -q "ends with '-claude-token'" "$cg_config_dir/err" && echo yes || echo no)"
+cg_run --context-secret preview.ctx-2 >/dev/null 2>&1
+check "a dotted DNS-1123 subdomain name is accepted" "0" "$?"
+
+cs_submit_out="$(newdir)/cs-submit.yaml"; tmpdirs+=("$(dirname "$cs_submit_out")")
+if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-cs-branch --model moonshotai/kimi-k3 --context-secret preview-ctx \
+    "$proj_dir" "$handoff_file" > "$cs_submit_out" 2>"$cg_config_dir/err"; then
+    ok "submit --dry-run --context-secret exits 0"
+else
+    no "submit --dry-run --context-secret exits 0" "$(cat "$cg_config_dir/err")"
+fi
+if python3 -c 'import yaml' 2>/dev/null; then
+    cs_shape="$(python3 - "$cs_submit_out" <<'PY'
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]
+job = next(d for d in docs if d.get("kind") == "Job")
+spec = job["spec"]["template"]["spec"]
+def mount(c):
+    return [m for m in c.get("volumeMounts", []) if m["name"] == "context-secret"]
+agent = next(c for c in spec["containers"] if c["name"] == "agent")
+print("agent-mount", [(m["mountPath"], m.get("readOnly")) for m in mount(agent)])
+print("other-mounts", sum(len(mount(c)) for c in spec["initContainers"] + spec["containers"] if c is not agent))
+print("volume", [(v["secret"]["secretName"], v["secret"]["defaultMode"]) for v in spec["volumes"] if v["name"] == "context-secret"])
+PY
+)"
+    check "context-secret: agent container mounts it read-only at /work/context" \
+        "agent-mount [('/work/context', True)]" "$(grep '^agent-mount' <<< "$cs_shape")"
+    check "context-secret: no other container mounts it" "other-mounts 0" "$(grep '^other-mounts' <<< "$cs_shape")"
+    check "context-secret: volume names the Secret with mode 0440" \
+        "volume [('preview-ctx', 288)]" "$(grep '^volume' <<< "$cs_shape")"
+fi
+if grep -q '## Context secret' "$cs_submit_out" && grep -qF 'Secret `preview-ctx` is mounted read-only' "$cs_submit_out"; then
+    ok "context-secret: the handoff carries the Secret section naming the Secret"
+else
+    no "context-secret: the handoff carries the Secret section naming the Secret" "not found in $cs_submit_out"
+fi
+if grep -q -e 'named with `--context-ro`' -e '## Gathered context' "$cs_submit_out"; then
+    no "context-secret: the handoff carries no --context-ro text" "found in $cs_submit_out"
+else
+    ok "context-secret: the handoff carries no --context-ro text"
+fi
+if grep -q 'secretName' "$submit_out"; then
+    no "a run without --context-secret renders no context-secret volume" "found"
+else
+    ok "a run without --context-secret renders no context-secret volume"
+fi
+
+# `run --dry-run` forwards the flag, rendering the same volume.
+if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" run --dry-run \
+    --branch fs-k8s-test-cs-branch --model moonshotai/kimi-k3 --context-secret preview-ctx \
+    "$proj_dir" "$handoff_file" 2>/dev/null | grep -q 'secretName: preview-ctx'; then
+    ok "run --dry-run forwards --context-secret to submit"
+else
+    no "run --dry-run forwards --context-secret to submit"
+fi
+
+refuses "submit --context-secret with --context-ro is refused" \
+    "cannot be combined" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-cs-both --model moonshotai/kimi-k3 \
+    --context-secret preview-ctx --context-ro "$cr_dir" "$proj_dir" "$handoff_file"
+refuses "submit --context-secret with a reserved name is refused" \
+    "starts with 'fork-sandbox-'" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-cs-res --model moonshotai/kimi-k3 \
+    --context-secret fork-sandbox-upstream-key "$proj_dir" "$handoff_file"
+
+# The label checks run in submit proper (after --dry-run's exit). The stub
+# answers `get secret` from CS_SECRET_JSON (empty means not found) and fails
+# the Job apply, so a good Secret is seen to get past the check and reach
+# the apply.
+cs_stub_dir="$(newdir)"; tmpdirs+=("$cs_stub_dir")
+cs_log="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$cs_log")")
+cat > "$cs_stub_dir/kubectl" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$K8S_STUB_LOG"
+verb=""; res=""
+for arg in "$@"; do
+    case "$arg" in
+        apply|get|delete) [[ -z "$verb" ]] && verb="$arg" ;;
+        secret) res=secret ;;
+    esac
+done
+case "$verb" in
+    get)
+        if [[ "$res" == secret ]]; then
+            [[ -n "${CS_SECRET_JSON:-}" ]] || { echo 'Error from server (NotFound)' >&2; exit 1; }
+            printf '%s\n' "$CS_SECRET_JSON"
+        fi
+        ;;
+    apply)
+        cat >/dev/null
+        echo "kubectl: stub apply failure" >&2
+        exit 1
+        ;;
+esac
+exit 0
+STUB
+chmod +x "$cs_stub_dir/kubectl"
+cs_home="$(newdir)"; tmpdirs+=("$cs_home")
+cs_submit() {
+    : > "$cs_log"
+    env PATH="$cs_stub_dir:$PATH" K8S_STUB_LOG="$cs_log" HOME="$cs_home" FORK_SANDBOX_RUN_SOURCE=test \
+        FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit \
+        --branch fs-k8s-test-cs-live --model moonshotai/kimi-k3 --context-secret preview-ctx \
+        "$proj_dir" "$handoff_file"
+}
+cs_data='"data":{"API_KEY":"c2VjcmV0LXZhbHVl"}'
+
+CS_SECRET_JSON="" cs_submit >"$cg_config_dir/out" 2>&1
+check "submit: a missing context Secret is refused" "yes" \
+    "$(grep -q "no such Secret" "$cg_config_dir/out" && echo yes || echo no)"
+check "submit: a missing context Secret creates nothing" "0" "$(grep -c ' apply' "$cs_log")"
+
+CS_SECRET_JSON="{\"metadata\":{\"labels\":{\"app\":\"x\"}},$cs_data}" cs_submit >"$cg_config_dir/out" 2>&1
+check "submit: a Secret without fork-sandbox/context=true is refused" "yes" \
+    "$(grep -q 'lacks the label' "$cg_config_dir/out" && echo yes || echo no)"
+check "submit: an unlabeled Secret creates nothing" "0" "$(grep -c ' apply' "$cs_log")"
+
+CS_SECRET_JSON="{\"metadata\":{},$cs_data}" cs_submit >"$cg_config_dir/out" 2>&1
+check "submit: a Secret with no labels at all is refused" "yes" \
+    "$(grep -q 'lacks the label' "$cg_config_dir/out" && echo yes || echo no)"
+
+CS_SECRET_JSON="{\"metadata\":{\"labels\":{\"fork-sandbox/context\":\"false\"}},$cs_data}" cs_submit >"$cg_config_dir/out" 2>&1
+check "submit: fork-sandbox/context set to anything but true is refused" "yes" \
+    "$(grep -q 'lacks the label' "$cg_config_dir/out" && echo yes || echo no)"
+
+CS_SECRET_JSON="{\"metadata\":{\"labels\":{\"fork-sandbox/context\":\"true\",\"fork-sandbox/branch\":\"other\"}},$cs_data}" \
+    cs_submit >"$cg_config_dir/out" 2>&1
+check "submit: a context Secret carrying fork-sandbox/branch is refused" "yes" \
+    "$(grep -q 'carries the label' "$cg_config_dir/out" && echo yes || echo no)"
+check "submit: a branch-labeled Secret creates nothing" "0" "$(grep -c ' apply' "$cs_log")"
+check "submit: a refused Secret's data is never printed" "no" \
+    "$(grep -q 'c2VjcmV0' "$cg_config_dir/out" && echo yes || echo no)"
+
+CS_SECRET_JSON="{\"metadata\":{\"labels\":{\"fork-sandbox/context\":\"true\"}},$cs_data}" \
+    cs_submit >"$cg_config_dir/out" 2>&1
+check "submit: a properly labeled Secret gets past the check to the apply" "yes" \
+    "$(grep -q ' apply' "$cs_log" && echo yes || echo no)"
+check "submit: the label check reads the named Secret as JSON" "yes" \
+    "$(grep -q 'get secret preview-ctx -o json' "$cs_log" && echo yes || echo no)"
+
 printf '\n== install --postmaster ==\n'
 # A real kubectl refuses --context=<name> for a context that does not
 # exist in the active kubeconfig, even for a pure --dry-run=client

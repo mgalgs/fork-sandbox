@@ -6,7 +6,8 @@
 #                            [--endpoint NAME] [--harness pi|claude]
 #                            [--pi-args ARGS] [--review-loop N] [--review-model MODEL]
 #                            [--outbox-max SIZE]
-#                            [--context-ro DIR] [--thread-dir DIR] [--attach-dir DIR]
+#                            [--context-ro DIR | --context-secret NAME]
+#                            [--thread-dir DIR] [--attach-dir DIR]
 #                            [--checkout REF] [--services-trust-ref REF]
 #                            [--session-state DIR] [--resume-session ID | --session-id ID]
 #                            [--refresh-at N] [--refresh-max N]
@@ -19,7 +20,8 @@
 #                            [--harness pi|claude] [--pi-args ARGS]
 #                            [--review-loop N] [--review-model MODEL]
 #                            [--outbox-dir DIR] [--outbox-max SIZE]
-#                            [--context-ro DIR] [--thread-dir DIR] [--attach-dir DIR]
+#                            [--context-ro DIR | --context-secret NAME]
+#                            [--thread-dir DIR] [--attach-dir DIR]
 #                            [--checkout REF] [--services-trust-ref REF]
 #                            [--session-state DIR] [--resume-session ID | --session-id ID]
 #                            [--refresh-at N] [--refresh-max N]
@@ -39,7 +41,8 @@
 #        fork-sandbox-k8s.sh say --branch NAME -        # text from stdin
 #        fork-sandbox-k8s.sh rm --branch NAME
 #        fork-sandbox-k8s.sh check-grant [--allow-namespace NS[:PORT]]...
-#                            [--reach-probe HOST:PORT]... [--context-ro DIR]
+#                            [--reach-probe HOST:PORT]...
+#                            [--context-ro DIR | --context-secret NAME]
 #
 # --model MODEL is REQUIRED on a K8S_PROXY_UPSTREAM (legacy) install. On a
 # K8S_PROXY_ENDPOINTS install it is optional: the pod discovers the model
@@ -157,15 +160,17 @@
 #
 # rm deletes the run's Job, its pod, and its ConfigMap.
 #
-# check-grant validates a --allow-namespace/--reach-probe/--context-ro grant
-# with NO kubectl and NO cluster -- it runs exactly the same checks submit
-# runs on those three flags (the pairing rule, the per-probe HOST:PORT/DNS
-# shape/grant-match checks, and --context-ro's forks/-only + no-links
-# checks), sharing the same functions, so a grant check-grant accepts is one
+# check-grant validates a --allow-namespace/--reach-probe/--context-ro/
+# --context-secret grant with NO kubectl and NO cluster -- it runs exactly
+# the same checks submit runs on those flags (the pairing rule, the
+# per-probe HOST:PORT/DNS shape/grant-match checks, --context-ro's
+# forks/-only + no-links checks, and --context-secret's name checks),
+# sharing the same functions, so a grant check-grant accepts is one
 # submit will also accept later, for the identical reason. It needs no
 # k8s.env either. Exit 0 and, on stdout only, one line per flag in the order
 # given (ALLOW_NAMESPACE=..., REACH_PROBE=..., then CONTEXT_RO=<realpath of
-# DIR> when --context-ro was given) -- this is the grant file format the
+# DIR> when --context-ro was given, then CONTEXT_SECRET=<name> when
+# --context-secret was given, always last) -- this is the grant file format the
 # postmaster's per-thread grant store (fork-sandbox-mail.sh's `grant` verb)
 # writes verbatim. Exit 1 for no flags at all or an unknown option (a usage
 # error). Exit 2 for a refused value, printing the same message submit would
@@ -314,6 +319,22 @@
 # subdirectory, so read-only here is enforced by the prompt text the agent
 # reads (a `## Gathered context` section appended to handoff.md), not by
 # the filesystem.
+#
+# --context-secret NAME (submit, run): mount the Kubernetes Secret NAME
+# read-only at /work/context in the agent container, one file per key. For
+# a credential the task depends on, such as an API key for a preview
+# environment. Anything that can create a pod can mount any Secret in its
+# namespace, so the Secret must opt in: it must carry the label
+# fork-sandbox/context=true and must NOT carry fork-sandbox/branch (rm and
+# the submit trap delete Secrets by that label, so a context Secret carrying
+# it would be deleted by the first run that uses it). Names starting
+# fork-sandbox- (every installer-created Secret) and ending -claude-token
+# (the per-run token Secrets) are refused by name. The name is checked with
+# no cluster (check-grant, submit); the labels are checked by submit, after
+# --dry-run's exit, with kubectl get secret. Mutually exclusive with
+# --context-ro, which extracts into the same /work/context path. The
+# handoff names the Secret and tells the agent never to print, copy, log or
+# commit its contents.
 #
 # --thread-dir DIR / --attach-dir DIR (submit, run): push DIR into the pod
 # at /thread / /attachments respectively -- the same in-pod paths a LOCAL
@@ -1599,6 +1620,24 @@ The directory named with \`--context-ro\` on the host is at:
 
 here, read-only by convention. Do not write to it and do not copy it into
 the clone.
+EOF
+}
+
+# The --context-secret-only handoff.md section, in the slot
+# render_context_section takes for --context-ro. Names the Secret, never
+# any value.
+render_context_secret_section() {
+    local pod_context_dir="$1" secret_name="$2"
+    cat <<EOF
+
+## Context secret
+
+The Kubernetes Secret \`$secret_name\` is mounted read-only at:
+
+    $pod_context_dir
+
+One file per key. Read what the task needs. Never print, copy, log or
+commit its contents.
 EOF
 }
 
@@ -3777,6 +3816,38 @@ validate_context_ro_dir() {
     printf '%s\n' "$context_ro_real"
 }
 
+# --context-secret's name check, shared by check-grant and submit (no
+# kubectl -- the label checks need the cluster and run in submit). A
+# DNS-1123 subdomain that is not a name fork-sandbox reserves for itself.
+# exit 1 on refusal, like the validators above.
+validate_context_secret_name() {
+    local name="$1"
+    if (( ${#name} > 253 )) || [[ ! "$name" =~ ^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$ ]]; then
+        echo "Error: --context-secret '$name' is not a valid Secret name: it" >&2
+        echo "must be a DNS-1123 subdomain (lowercase letters, digits, '-' and" >&2
+        echo "'.', starting and ending alphanumeric, at most 253 characters)." >&2
+        exit 1
+    fi
+    if [[ "$name" == fork-sandbox-* ]]; then
+        echo "Error: --context-secret '$name' starts with 'fork-sandbox-', a" >&2
+        echo "prefix reserved for the Secrets fork-sandbox itself creates" >&2
+        echo "(provider key, mail tokens). Name a Secret made for this purpose." >&2
+        exit 1
+    fi
+    if [[ "$name" == *-claude-token ]]; then
+        echo "Error: --context-secret '$name' ends with '-claude-token', a" >&2
+        echo "suffix reserved for the per-run Claude token Secrets." >&2
+        exit 1
+    fi
+}
+
+# --context-secret and --context-ro both populate /work/context.
+refuse_context_secret_with_ro() {
+    echo "Error: --context-secret and --context-ro cannot be combined: both" >&2
+    echo "populate /work/context." >&2
+    exit 1
+}
+
 # check-grant: runs ONLY the three validators above (no kubectl, no
 # cluster), the grant half of what cmd_submit checks -- the "one grant
 # parser" the postmaster's per-thread grants (mail grant, Section 5) rely
@@ -3785,22 +3856,25 @@ validate_context_ro_dir() {
 # docs/kubernetes-runs.md.
 cmd_check_grant() {
     local -a allow_ns_raw=() reach_probe_raw=()
-    local context_ro="" saw_any=false
+    local context_ro="" context_secret="" saw_any=false
     while (( $# )); do
         case "$1" in
             --allow-namespace) allow_ns_raw+=("${2:?--allow-namespace requires NS[:PORT]}"); saw_any=true; shift 2 ;;
             --reach-probe) reach_probe_raw+=("${2:?--reach-probe requires HOST:PORT}"); saw_any=true; shift 2 ;;
             --context-ro) context_ro="${2:?--context-ro requires a directory}"; saw_any=true; shift 2 ;;
+            --context-secret) context_secret="${2:?--context-secret requires a Secret name}"; saw_any=true; shift 2 ;;
             *)
                 echo "Usage: fork-sandbox-k8s.sh check-grant [--allow-namespace NS[:PORT]]..." >&2
-                echo "                            [--reach-probe HOST:PORT]... [--context-ro DIR]" >&2
+                echo "                            [--reach-probe HOST:PORT]..." >&2
+                echo "                            [--context-ro DIR | --context-secret NAME]" >&2
                 exit 1
                 ;;
         esac
     done
     if [[ "$saw_any" != true ]]; then
         echo "Usage: fork-sandbox-k8s.sh check-grant [--allow-namespace NS[:PORT]]..." >&2
-        echo "                            [--reach-probe HOST:PORT]... [--context-ro DIR]" >&2
+        echo "                            [--reach-probe HOST:PORT]..." >&2
+        echo "                            [--context-ro DIR | --context-secret NAME]" >&2
         exit 1
     fi
 
@@ -3818,6 +3892,10 @@ cmd_check_grant() {
         if [[ -n "$context_ro" ]]; then
             context_ro_real="$(validate_context_ro_dir "$context_ro")" || exit 1
         fi
+        if [[ -n "$context_secret" ]]; then
+            [[ -z "$context_ro" ]] || refuse_context_secret_with_ro
+            validate_context_secret_name "$context_secret"
+        fi
         local v
         for v in "${allow_ns_raw[@]}"; do
             printf 'ALLOW_NAMESPACE=%s\n' "$v"
@@ -3828,6 +3906,9 @@ cmd_check_grant() {
         if [[ -n "$context_ro" ]]; then
             printf 'CONTEXT_RO=%s\n' "$context_ro_real"
         fi
+        if [[ -n "$context_secret" ]]; then
+            printf 'CONTEXT_SECRET=%s\n' "$context_secret"
+        fi
         exit 0
     ); then
         exit 2
@@ -3836,7 +3917,7 @@ cmd_check_grant() {
 
 cmd_submit() {
     local dry_run=false branch="" model="" review_loop_cap="" outbox_max_arg=""
-    local context_ro="" harness="pi" review_model="" endpoint="" checkout_ref=""
+    local context_ro="" context_secret="" harness="pi" review_model="" endpoint="" checkout_ref=""
     local pi_args="" services_trust_ref="" task_meta="" claude_credentials_flag=""
     local thread_dir="" attach_dir=""
     # Recorded in run.env for `resume` only; submit itself acts on none.
@@ -3865,6 +3946,7 @@ cmd_submit() {
             --keep) keep=true; shift ;;
             --timeout) run_timeout="${2:?--timeout requires a number of seconds}"; shift 2 ;;
             --context-ro) context_ro="${2:?--context-ro requires a directory}"; shift 2 ;;
+            --context-secret) context_secret="${2:?--context-secret requires a Secret name}"; shift 2 ;;
             --thread-dir) thread_dir="${2:?--thread-dir requires a directory}"; shift 2 ;;
             --attach-dir) attach_dir="${2:?--attach-dir requires a directory}"; shift 2 ;;
             --session-state) session_state="${2:?--session-state requires a directory}"; shift 2 ;;
@@ -4359,6 +4441,10 @@ cmd_submit() {
     # directory, is checked later, alongside the real push, which --dry-run
     # never reaches. Extracted into validate_context_ro_dir above so
     # check-grant can run the identical check with no cluster.
+    if [[ -n "$context_secret" ]]; then
+        [[ -z "$context_ro" ]] || refuse_context_secret_with_ro
+        validate_context_secret_name "$context_secret"
+    fi
     if [[ -n "$context_ro" ]]; then
         context_ro="$(validate_context_ro_dir "$context_ro")" || exit 1
     fi
@@ -4970,6 +5056,25 @@ CENV
 )"
     fi
 
+    # --context-secret's mount and volume, agent container only. defaultMode
+    # 0440 with the pod's fsGroup 1000 gives the agent group read.
+    local context_secret_volume_mount="" context_secret_volume=""
+    if [[ -n "$context_secret" ]]; then
+        context_secret_volume_mount=$'\n'"$(cat <<CENV
+            - name: context-secret
+              mountPath: $POD_CONTEXT_DIR
+              readOnly: true
+CENV
+)"
+        context_secret_volume=$'\n'"$(cat <<CENV
+        - name: context-secret
+          secret:
+            secretName: $context_secret
+            defaultMode: 0440
+CENV
+)"
+    fi
+
     # The exact prompt text the pod's ConfigMap embeds under handoff.md --
     # preamble, then the optional context/services sections, then the
     # operator's own handoff -- captured here once so run_dir's own
@@ -4986,6 +5091,7 @@ CENV
     continuation_header="$({ fs_emit_prompt_preamble "$pod_clone_dir" "$POD_INBOX_DIR" "$harness" gated "$POD_OUTBOX_DIR" pod \
        "$outbox_max_bytes"
    [[ -n "$context_ro" ]] && render_context_section "$POD_CONTEXT_DIR"
+   [[ -n "$context_secret" ]] && render_context_secret_section "$POD_CONTEXT_DIR" "$context_secret"
    [[ -n "$services_prompt_text" ]] && render_services_section "$services_prompt_text" "$sandbox_env_present"
    printf 'X'; })"
     continuation_header="${continuation_header%X}"
@@ -5116,7 +5222,7 @@ spec:
             - name: tmp
               mountPath: /tmp
             - name: home
-              mountPath: /home/agent${thread_volume_mount}${attach_volume_mount}
+              mountPath: /home/agent${thread_volume_mount}${attach_volume_mount}${context_secret_volume_mount}
       volumes:
         - name: scripts
           configMap:
@@ -5136,7 +5242,7 @@ spec:
         - name: tmp
           emptyDir: {}
         - name: home
-          emptyDir: {}${thread_volume}${attach_volume}${services_volumes}
+          emptyDir: {}${thread_volume}${attach_volume}${context_secret_volume}${services_volumes}
 EOF
 )"
     rendered="${grant_rendered}${claude_proxy_rendered}${job_rendered}"
@@ -5414,6 +5520,36 @@ EOF
             echo "left behind. Reusing it here would silently widen this run's" >&2
             echo "egress to whatever that grant named. Remove it first:" >&2
             echo "  fork-sandbox-k8s.sh rm --branch $branch" >&2
+            exit 1
+        fi
+    fi
+
+    # --context-secret's label checks, the cluster half of the name checks
+    # above. Anything that can create a pod can mount any Secret in its
+    # namespace, so the Secret must opt in with fork-sandbox/context=true,
+    # and must not carry fork-sandbox/branch: rm and the trap below delete
+    # Secrets by that label. Only the labels are read; never the data.
+    if [[ -n "$context_secret" ]]; then
+        local ctx_secret_labels
+        if ! ctx_secret_labels="$(kubectl get secret "$context_secret" -o json 2>/dev/null \
+                | jq -r '(.metadata.labels // {}) | "\(.["fork-sandbox/context"] // "")\t\(has("fork-sandbox/branch"))"')" \
+            || [[ -z "$ctx_secret_labels" ]]; then
+            echo "Error: --context-secret '$context_secret': no such Secret in the" >&2
+            echo "cluster namespace." >&2
+            exit 1
+        fi
+        local ctx_secret_ctx_label="${ctx_secret_labels%%$'\t'*}"
+        local ctx_secret_has_branch="${ctx_secret_labels##*$'\t'}"
+        if [[ "$ctx_secret_ctx_label" != true ]]; then
+            echo "Error: --context-secret '$context_secret' lacks the label" >&2
+            echo "fork-sandbox/context=true. Label it to opt it in:" >&2
+            echo "  kubectl label secret $context_secret fork-sandbox/context=true" >&2
+            exit 1
+        fi
+        if [[ "$ctx_secret_has_branch" == true ]]; then
+            echo "Error: --context-secret '$context_secret' carries the label" >&2
+            echo "fork-sandbox/branch, so rm and the submit trap would delete it." >&2
+            echo "Remove that label from the Secret." >&2
             exit 1
         fi
     fi
@@ -6843,7 +6979,7 @@ cmd_resume() {
 # itself and the final completion line.
 cmd_run() {
     local dry_run=false keep=false timeout=3600 branch="" model="" review_loop_cap=""
-    local outbox_dir="" outbox_max_arg="" context_ro="" harness="" review_model="" endpoint=""
+    local outbox_dir="" outbox_max_arg="" context_ro="" context_secret="" harness="" review_model="" endpoint=""
     local checkout_ref="" pi_args="" services_trust_ref="" task_meta="" claude_credentials_flag=""
     local thread_dir="" attach_dir=""
     local session_state="" resume_session="" session_id_arg=""
@@ -6866,6 +7002,7 @@ cmd_run() {
             --outbox-dir) outbox_dir="${2:?--outbox-dir requires a path}"; shift 2 ;;
             --outbox-max) outbox_max_arg="${2:?--outbox-max requires a size}"; shift 2 ;;
             --context-ro) context_ro="${2:?--context-ro requires a directory}"; shift 2 ;;
+            --context-secret) context_secret="${2:?--context-secret requires a Secret name}"; shift 2 ;;
             --thread-dir) thread_dir="${2:?--thread-dir requires a directory}"; shift 2 ;;
             --attach-dir) attach_dir="${2:?--attach-dir requires a directory}"; shift 2 ;;
             --session-state) session_state="${2:?--session-state requires a directory}"; shift 2 ;;
@@ -6954,6 +7091,7 @@ cmd_run() {
     [[ "$keep" == true ]] && submit_argv+=(--keep)
     submit_argv+=(--timeout "$timeout")
     [[ -n "$context_ro" ]] && submit_argv+=(--context-ro "$context_ro")
+    [[ -n "$context_secret" ]] && submit_argv+=(--context-secret "$context_secret")
     [[ -n "$thread_dir" ]] && submit_argv+=(--thread-dir "$thread_dir")
     [[ -n "$attach_dir" ]] && submit_argv+=(--attach-dir "$attach_dir")
     # Forwarded unchanged, like --pi-args above: cmd_submit re-runs
