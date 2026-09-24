@@ -71,7 +71,7 @@ entry with `hmac.compare_digest`.
 - A client entry's `identities` field is a comma-separated list of the
   `@name`s it may use as `--from` (matched against mail's address
   pattern), or `-` for none. Its `caps` field is a subset of `read`,
-  `grant` and `seen`, or `-`.
+  `grant`, `seen` and `target`, or `-`.
 
 `serve` reads this file once, at startup; rotating a token means rewriting
 the file and restarting the server. It refuses to start (exit 2, one line
@@ -87,7 +87,7 @@ naming the offending label, never a hash) when:
 ## `mint`
 
     fork-sandbox mail-api mint --role operator|client --label <label>
-                           [--as @a[,@b]] [--caps read,grant,seen]
+                           [--as @a[,@b]] [--caps read,grant,seen,target]
 
 `mint` generates a token with a cryptographically random 32-byte value and
 prints it alone on the first line of stdout; the second line is the
@@ -155,7 +155,7 @@ flag and refused, since there is no way to tell it from one.
 
 | verb | positionals | flags | auth |
 |---|---|---|---|
-| send | 0 | `--from --to --cc --subject --body --attach* --hops --header* --allow-namespace* --reach-probe*` | `--from` in the token's identities; `--allow-namespace`/`--reach-probe` also need cap `grant` |
+| send | 0 | `--from --to --cc --subject --body --attach* --hops --header* --allow-namespace* --reach-probe* --review-target` | `--from` in the token's identities; `--allow-namespace`/`--reach-probe` also need cap `grant`; `--review-target` also needs cap `target` |
 | reply | 0 | `--from --reply-to --body --to --cc --subject --attach* --hops --header*` | `--from` in the token's identities |
 | show | 1 | | `read` |
 | tree | 1 | | `read` |
@@ -189,6 +189,13 @@ the table entirely rather than given a value form.
 `--reach-probe` still applies over the API: the server only checks that
 the flags are individually allowed, not that they are used together, so
 that check happens in `mail grant`/`mail send` as it always has.
+
+On `mail send` and `mail reply`, `--header` refuses any name that is
+`X-Version` or starts with `X-Review-Target`, compared case-insensitively
+(403, one line naming the reason). Those headers are the review-target
+contract (see [docs/agent-mail.md](agent-mail.md)): only `mail send
+--review-target` and the postmaster may write them, so no caller may set
+them through `--header`, including an operator token.
 
 ## `--body` and `--attach` over the API
 
@@ -237,7 +244,6 @@ shell.
 
 ## Out of scope here
 
-This server does not filter by review target (no `X-Review-Target*`
-header handling), does not reload tokens without a restart, does not rate
-limit, and does not terminate TLS. Deploying it in a cluster is covered in
+This server does not reload tokens without a restart, does not rate limit,
+and does not terminate TLS. Deploying it in a cluster is covered in
 [docs/cluster-postmaster.md](cluster-postmaster.md).

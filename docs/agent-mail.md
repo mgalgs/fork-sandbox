@@ -89,6 +89,9 @@ Under `$FORK_SANDBOX_MAIL_ROOT` (default
 <root>/threads/<thread-id>/attachments/<basename>
 <root>/agents/<name>/seen                       append-only message-id list
 <root>/.postmaster/                             router state (see below)
+<root>/.postmaster/review-target/<thread-id>.env  a thread's shared review
+                                                   target (see "The review
+                                                   target" below)
 ```
 
 A thread id is the Message-ID of the message that started it, so a thread
@@ -195,6 +198,22 @@ authority is written down.
     are claims someone actually made. No fallback to To:/Cc: derivation.
   - Trust: a verdict is exactly as trustworthy as the thread root's
     author. Anchored, not self-certifying.
+- **`X-Review-Target-Set`**: stamped only on the message that set or
+  moved a thread's shared review target — `mail send --review-target`
+  opening the thread, or the `sets` seat's harvested reply carrying
+  `Version:`. It is the sole setter signal; a message without it never
+  moved the target, whatever else it says. See "The review target" below.
+- **`X-Review-Target`**: stamped on every harvested reply from a `follow`
+  seat, and also present on the setter message itself. On a `follow`
+  reply, it is the target that wake was **spawned** at, recorded at spawn
+  time and never re-read at harvest — the target can move while that
+  reviewer is still working from the old one, and the header must say
+  what the reply is actually about, not what is current now.
+- **`X-Version`**: the version of the review target a message belongs to.
+  On the setter message, the new version. On a `follow` reply, the
+  spawned target's version. On any other harvested reply from the `sets`
+  seat while a target exists, the current version. Absent when the
+  thread has no review target.
 
 ### Addresses
 
@@ -375,11 +394,11 @@ absence of the key entirely means no Cc wake is ever gated.
 
 ```bash
 fork-sandbox fleet check              # validate everything, report every error
-fork-sandbox fleet resolve <name>     # fifteen lines: harness, model, thinking,
+fork-sandbox fleet resolve <name>     # sixteen lines: harness, model, thinking,
                                       # network, persona-path, description,
                                       # wake-on-cc, refresh-at, triage,
                                       # preset, handler, command, backend,
-                                      # endpoint, grant
+                                      # endpoint, grant, review-target
 fork-sandbox fleet resolve-triage     # two lines: harness, model, for the
                                       # top-level triage: block (see above);
                                       # every line empty when there is none
@@ -393,7 +412,7 @@ fork-sandbox fleet teardown --all     # destroy persistent (thread, agent)
 
 `check` accumulates every error across the fleet file and every persona
 it declares — addressed by path, like `agents.reviewer.modle` — rather
-than stopping at the first. `resolve` always prints exactly fifteen lines;
+than stopping at the first. `resolve` always prints exactly sixteen lines;
 an unconfigured field is an empty line, never a missing one.
 
 `teardown` is how an operator reclaims a seat's persistent state (the
@@ -428,13 +447,18 @@ directory. Those values differ per thread and so cannot live in
 fleet.yaml; they live in a grant file instead, keyed by thread.
 
 Three fleet.yaml-only keys mark a seat this way and configure it (persona
-frontmatter refuses all three — a seat must not know its own backend):
+frontmatter refuses all three — a seat must not know its own backend). A
+fourth, `review-target`, is fleet.yaml-only for the same reason — a seat
+must not know it is the one moving a thread's shared review target — and
+is likewise refused on any seat that does not resolve to `backend: k8s`;
+see "The review target" below for what `sets` and `follow` mean:
 
 | key | values | rule |
 |---|---|---|
 | `backend` | `local` (default when absent) or `k8s` | anything else refused |
 | `endpoint` | RFC 1123 label (`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`) | only with `backend: k8s` |
 | `grant` | the literal string `required` | only with `backend: k8s` |
+| `review-target` | the literal string `sets` or `follow` | only with `backend: k8s`; at most one seat per fleet may be `sets` |
 
 `refresh-at` works on a `backend: k8s` claude seat exactly as on a local one
 (it is forwarded as `--refresh-at`); on a pi seat it is accepted and ignored,
@@ -528,6 +552,108 @@ integer fails `deliver` at startup, the same posture as
 `$FORK_SANDBOX_POSTMASTER_K8S_DETACH=inline` runs the wake wrapper
 synchronously instead of inside its own detached tmux session — a test
 seam, not an operator setting.
+
+## The review target
+
+A review thread (a patch series a panel of seats is reviewing) needs one
+shared answer to "which commit are we reviewing now": a branch, a sha,
+and a version number. Without it, each seat tracks its own lineage and
+the panel can silently review different commits. The review target is
+that shared answer, and it moves in exactly two ways: a kickoff sets it
+when the thread opens, and the author seat moves it when it posts a new
+version.
+
+Two `review-target` fleet keys assign the roles (see the table above;
+either value is refused on a seat that is not `backend: k8s`, since only
+the k8s spawn path takes `--checkout`):
+
+- `sets` — the author seat. At most one per fleet. Its harvested reply
+  moves the target by carrying a `Version: <n>` header.
+- `follow` — a reviewer seat. It spawns checked out at the thread's
+  target sha instead of its own lineage branch.
+
+### Setting it: `mail send --review-target <branch>:<sha>`
+
+A kickoff (CI or an operator) opens a review thread with:
+
+```
+fork-sandbox-mail.sh send --review-target <branch>:<sha> ...
+```
+
+The value splits on the **last** `:` — a branch name cannot itself
+contain `:` (`git check-ref-format`), so the split is unambiguous. Both
+halves are validated before anything is written: the branch must pass
+`git check-ref-format --branch` and contain no whitespace; the sha must
+match `^[0-9a-f]{40}$` or `^[0-9a-f]{64}$`. Mail itself never resolves
+refs or runs git against a project — it also runs inside the mail API's
+container, which is deliberately confined to the mail root — so the
+postmaster is what checks the sha against the project repo, at spawn
+time (below). `reply` refuses `--review-target` outright: a target moves
+only through the `sets` seat's `Version:` header, never through an
+arbitrary reply.
+
+A valid `send --review-target` writes the thread's state file (see
+below) with `VERSION=1`, then stamps the message with
+`X-Review-Target-Set: <branch> <sha>` and `X-Version: 1`. A later
+failure (attachment staging, placement) removes the state file again,
+the same rollback a k8s grant gets.
+
+### The state file
+
+`$MAIL_ROOT/.postmaster/review-target/<thread-id>.env`, `KEY=value`
+lines, written atomically (a temp file in the same directory, then
+renamed into place, so a reader never sees a partial write):
+
+```
+BRANCH=<branch>
+SHA=<40- or 64-character lowercase hex>
+VERSION=<positive integer>
+SET_BY=@<name>
+SET_AT=<UTC ISO-8601>
+```
+
+Its absence means the thread has no review target — every seat still
+reviews its own lineage, exactly as before this feature existed.
+
+### Spawning a `follow` seat at the target
+
+When a `follow` seat wakes on a thread that has a state file, the
+postmaster passes `--checkout <sha>` instead of the seat's own lineage
+checkout. `--services-trust-ref` is unchanged: it stays the repo's HEAD,
+never the target, because the author's service definitions are not
+trusted just because they are under review. If the sha is not yet in the
+project repo, the postmaster fetches `refs/heads/<branch>` from `origin`
+(when one is configured) and checks again; still missing, the thread is
+flagged (keyword `review-target`) and the triggering message stays
+pending rather than spawn a seat with nothing to check out. A `follow`
+seat on a thread with no state file, and a `sets` seat always, keep the
+ordinary lineage path.
+
+### Moving it: the `sets` seat's `Version:` header
+
+The `sets` seat moves the target by writing a `Version: <n>` header in
+its reply file (a positive integer, no leading zero). At harvest:
+
+- `Version:` from any other seat is flagged as malformed — a reviewer
+  must never be able to repoint what the whole panel reviews.
+- `Version: <n>` that does not strictly advance the current `VERSION` is
+  flagged and not posted; the state file is unchanged.
+- Otherwise the post is stamped `X-Review-Target-Set: <branch> <sha>` and
+  `X-Version: <n>` (the sha is resolved from the branch this wake itself
+  committed to), and the state file is rewritten **only after the post
+  succeeds** — a failed post must never move a target that nothing on
+  the thread announced.
+
+A harvested reply from the `sets` seat that carries no `Version:` while a
+target exists is stamped `X-Version: <current VERSION>` and nothing else
+changes. See "The header contract" above for the full meaning of all
+three headers.
+
+### Status
+
+`postmaster status --thread <tid> --json` includes a `review_target`
+field: an object with `branch`, `sha`, `version`, `set_by`, `set_at`, or
+`null` when the thread has no review target.
 
 ## The postmaster
 
