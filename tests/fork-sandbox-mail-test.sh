@@ -905,6 +905,13 @@ ls_out="$("$mail" list --bogus 2>ls_err.txt)"; rc=$?
 check "list --bogus exits 1" "1" "$rc"
 check "list --bogus prints nothing on stdout" "" "$ls_out"
 contains "list --bogus names the option on stderr" "$(cat ls_err.txt)" "unknown option '--bogus'"
+for ls_help in --help -h; do
+    ls_out="$("$mail" list "$ls_help" 2>ls_err.txt)"; rc=$?
+    check "list $ls_help exits 1" "1" "$rc"
+    check "list $ls_help prints nothing on stdout" "" "$ls_out"
+    contains "list $ls_help is a one-line unknown-option error" "$(cat ls_err.txt)" "Error: list: unknown option '$ls_help'"
+    check "list $ls_help error is one line" "1" "$(wc -l < ls_err.txt)"
+done
 ls_out="$("$mail" list extra-positional 2>ls_err.txt)"; rc=$?
 check "list with a positional exits 1" "1" "$rc"
 check "list with a positional prints nothing on stdout" "" "$ls_out"

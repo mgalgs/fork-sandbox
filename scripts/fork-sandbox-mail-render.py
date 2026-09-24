@@ -866,7 +866,7 @@ def run_list(mail_root, as_json, raw_filters):
     return 0
 
 
-def list_main(args, parser):
+def list_main(args):
     """`fork-sandbox-mail.sh list <flags>` lands here as
     `--list <mail-root> <flags>`. The shell forwards the flags untouched, so
     this is the one place they are parsed; it is hand-rolled because
@@ -888,9 +888,6 @@ def list_main(args, parser):
                 return 1
             i += 1
             raw_filters.append(rest[i])
-        elif a in ("-h", "--help"):
-            parser.print_help()
-            return 0
         elif a.startswith("-"):
             print(f"Error: list: unknown option '{one_line(a)}'.", file=sys.stderr)
             return 1
@@ -920,7 +917,7 @@ def main(argv=None):
     parser.add_argument("--live-render-delay", type=float, default=0, help=argparse.SUPPRESS)
     argv = sys.argv[1:] if argv is None else list(argv)
     if argv[:1] == ["--list"]:
-        return list_main(argv[1:], parser)
+        return list_main(argv[1:])
     args = parser.parse_args(argv)
 
     if args.header and not args.list:
