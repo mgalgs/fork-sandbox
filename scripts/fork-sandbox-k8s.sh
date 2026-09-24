@@ -32,7 +32,9 @@
 #                            [--outbox-max SIZE] [--review-loop N]
 #                            [--keep] [--run-dir DIR] <project-path>
 #        fork-sandbox-k8s.sh resume --run-dir DIR [--timeout SECONDS]
-#        fork-sandbox-k8s.sh fetch --branch NAME <project-path>
+#        fork-sandbox-k8s.sh fetch --branch NAME
+#                            [--upstream REF | --upstream-none REASON]
+#                            <project-path>
 #        fork-sandbox-k8s.sh say --branch NAME <text>
 #        fork-sandbox-k8s.sh say --branch NAME -        # text from stdin
 #        fork-sandbox-k8s.sh rm --branch NAME
@@ -132,6 +134,12 @@
 # fetch runs `git fetch` against the pod's clone, the same channel in
 # reverse, landing the branch in your real repo. It also signals the pod
 # that the run has been collected, so it does not idle out its full TTL.
+# It then points the fetched branch's upstream at whatever collect (via
+# --upstream/--upstream-none) tells it submit resolved -- see "The upstream
+# rule" in docs/kubernetes-runs.md. A standalone fetch, with neither flag,
+# resolves it itself instead, against this repo's own HEAD or the remote
+# default branch. Never fails the run either way: at worst it notes that no
+# upstream was set.
 #
 # say sends an operator addendum to a run that is already going -- the
 # Kubernetes analogue of fork-sandbox-say.sh, over the same kubectl exec
@@ -4454,6 +4462,19 @@ cmd_submit() {
         fi
     fi
 
+    # The upstream the branch this run creates should track, resolved once,
+    # here, in the same repo --checkout was resolved in -- HEAD in
+    # $origin_repo can move while the run is in flight on the cluster, so
+    # this must not be re-derived at collect or fetch time. Recorded in
+    # run.env below for cmd_collect to read back and hand to cmd_fetch; a
+    # standalone fetch with no run.env in scope resolves it itself instead
+    # (rules 3-5, no checkout ref).
+    local upstream_errf upstream="" upstream_reason=""
+    upstream_errf="$(mktemp)"
+    upstream="$(fs_resolve_upstream "$origin_repo" "$checkout_ref" 2>"$upstream_errf")"
+    upstream_reason="$(cat "$upstream_errf")"
+    rm -f "$upstream_errf"
+
     if [[ ! -f "$handoff_file" ]]; then
         echo "Error: handoff file '$handoff_file' not found." >&2
         exit 1
@@ -5206,6 +5227,13 @@ EOF
         printf 'KEEP=%s\n' "$keep"
         printf 'TIMEOUT=%s\n' "$run_timeout"
         printf 'SUBMITTED_AT=%s\n' "$(date +%s)"
+        # Read back by cmd_collect, before cmd_fetch, and handed to
+        # cmd_fetch's own --upstream/--upstream-none: resolved once above,
+        # at submit time, so a later collect or re-collect applies the same
+        # upstream rather than re-resolving it against whatever HEAD is by
+        # then.
+        printf 'UPSTREAM=%s\n' "$upstream"
+        printf 'UPSTREAM_REASON=%s\n' "$upstream_reason"
         if [[ "$harness" == claude ]]; then
             printf 'claude_credentials_source=%s\n' "${claude_credentials_override:-default}"
             printf 'claude_credentials_via=%s\n' "$claude_credentials_via"
@@ -5519,20 +5547,45 @@ EOF
 }
 
 cmd_fetch() {
-    local branch=""
+    local branch="" upstream_ref="" upstream_none_reason=""
+    local upstream_ref_given=false upstream_none_given=false
     while (( $# )); do
         case "$1" in
             --branch) branch="${2:?--branch requires a name}"; shift 2 ;;
+            # Set by cmd_collect, which reads UPSTREAM/UPSTREAM_REASON back
+            # from the run's own run.env -- the resolution submit already
+            # made, once, before the run started. A standalone fetch (no
+            # collect in the picture) passes neither, and this function
+            # resolves it itself below instead.
+            --upstream) upstream_ref="${2:?--upstream requires a ref}"; upstream_ref_given=true; shift 2 ;;
+            --upstream-none) upstream_none_reason="${2:?--upstream-none requires a reason}"; upstream_none_given=true; shift 2 ;;
             -*) echo "Error: unknown option '$1' for fetch." >&2; exit 1 ;;
             *) break ;;
         esac
     done
-    local project_path="${1:?Usage: fork-sandbox-k8s.sh fetch --branch NAME <project-path>}"
+    local project_path="${1:?Usage: fork-sandbox-k8s.sh fetch [options] --branch NAME <project-path>}"
     [[ -n "$branch" ]] || { echo "Error: fetch requires --branch." >&2; exit 1; }
+    if $upstream_ref_given && $upstream_none_given; then
+        echo "Error: --upstream and --upstream-none are mutually exclusive." >&2
+        exit 1
+    fi
     fs_reject_unsafe_chars "$branch" || exit 1
 
     local origin_repo
     origin_repo="$(fs_repo_toplevel "$project_path")" || exit 1
+
+    local upstream="$upstream_ref" upstream_reason="$upstream_none_reason"
+    if ! $upstream_ref_given && ! $upstream_none_given; then
+        # A standalone fetch, with no submit/collect context: resolve now,
+        # with no checkout ref, same as a run with no --checkout would
+        # (rules 3-5 of the upstream rule: HEAD's own upstream in this
+        # repo, else the remote default branch, else none).
+        local upstream_errf
+        upstream_errf="$(mktemp)"
+        upstream="$(fs_resolve_upstream "$origin_repo" "" 2>"$upstream_errf")"
+        upstream_reason="$(cat "$upstream_errf")"
+        rm -f "$upstream_errf"
+    fi
 
     local safe_name legacy_name pod_name
     safe_name="$(k8s_safe_name fork-sandbox-agent "$branch")"
@@ -5559,6 +5612,14 @@ cmd_fetch() {
 
     kubectl exec "$pod_name" -- sh -c 'touch /work/.fetched' || true
     echo "fork-sandbox-k8s: fetched into $origin_repo as branch $branch" >&2
+
+    # set -euo pipefail above already stopped this function if the fetch
+    # itself failed, so reaching here means the branch exists in
+    # $origin_repo -- the only precondition fs_apply_upstream needs. It
+    # never fails the fetch: it always returns 0.
+    local upstream_line
+    upstream_line="$(fs_apply_upstream "$origin_repo" "$branch" "$upstream" "$upstream_reason")"
+    echo "$upstream_line" >&2
 }
 
 cmd_say() {
@@ -6399,7 +6460,22 @@ cmd_collect() {
     rm -f -- "$base_err"
 
     echo "fork-sandbox-k8s: fetching branch $branch" >&2
-    cmd_fetch --branch "$branch" "$project_path"
+    # UPSTREAM/UPSTREAM_REASON: read back from run.env, the same way
+    # pull_session_state above is, and handed to cmd_fetch's own
+    # --upstream/--upstream-none rather than re-resolved here -- submit
+    # already resolved this once, before the run started, and a re-collect
+    # must apply that same answer, not derive a fresh one against whatever
+    # HEAD is by now. A standalone collect (no --run-dir) leaves both
+    # empty, so cmd_fetch resolves it itself instead.
+    local -a fetch_argv=(--branch "$branch")
+    if [[ -n "$run_dir" ]]; then
+        local upstream_from_env="" upstream_reason_from_env=""
+        upstream_from_env="$(read_env_value "$run_dir/run.env" UPSTREAM || true)"
+        upstream_reason_from_env="$(read_env_value "$run_dir/run.env" UPSTREAM_REASON || true)"
+        [[ -n "$upstream_from_env" ]] && fetch_argv+=(--upstream "$upstream_from_env")
+        [[ -n "$upstream_reason_from_env" ]] && fetch_argv+=(--upstream-none "$upstream_reason_from_env")
+    fi
+    cmd_fetch "${fetch_argv[@]}" "$project_path"
     after_sha="$(git -C "$origin_repo" rev-parse -q --verify "refs/heads/$branch" 2>/dev/null || true)"
     if [[ -n "$base_sha" ]]; then
         [[ "$base_sha" == "$after_sha" ]] && zero_commits=true

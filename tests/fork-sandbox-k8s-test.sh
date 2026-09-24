@@ -7370,6 +7370,200 @@ else
         "summary=$(cat "$refresh_sum_rd/summary.json" 2>/dev/null; echo NOFILE) out=$(cat "$refresh_sum_out")"
 fi
 
+printf '\n== fetch-back sets the branch upstream (k8s path) ==\n'
+# The same rule fork-sandbox.sh's own local runner applies on the k8s path
+# (see tests/fork-sandbox-upstream-test.sh for fs_resolve_upstream/
+# fs_apply_upstream themselves): submit resolves the upstream once, before
+# the run starts, because HEAD in the origin repo can move while the pod
+# runs; records it in run.env; collect reads it back and hands it to
+# cmd_fetch's own --upstream/--upstream-none; and a standalone fetch, with
+# neither flag, resolves it itself at fetch time instead.
+# git branch --set-upstream-to needs a REAL configured remote, not just a
+# hand-crafted refs/remotes/... ref -- so this builds a genuine bare
+# "remote", seeds it with a dev branch, and clones from it: the clone
+# checks out dev tracking origin/dev automatically, since dev is the bare
+# repo's own HEAD.
+upstream_remote_dir="$(newdir)"; tmpdirs+=("$upstream_remote_dir")
+git init -q --bare "$upstream_remote_dir"
+upstream_seed_dir="$(newdir)"; tmpdirs+=("$upstream_seed_dir")
+git -C "$upstream_seed_dir" init -q
+git -C "$upstream_seed_dir" config user.email t@fork-sandbox.invalid
+git -C "$upstream_seed_dir" config user.name Tester
+git -C "$upstream_seed_dir" commit -q --allow-empty -m init
+git -C "$upstream_seed_dir" branch -M dev
+git -C "$upstream_seed_dir" push -q "$upstream_remote_dir" dev
+git -C "$upstream_remote_dir" symbolic-ref HEAD refs/heads/dev
+upstream_proj_dir="$(newdir)"; tmpdirs+=("$upstream_proj_dir")
+git clone -q "$upstream_remote_dir" "$upstream_proj_dir"
+git -C "$upstream_proj_dir" config user.email t@fork-sandbox.invalid
+git -C "$upstream_proj_dir" config user.name Tester
+
+# A dedicated copy of runstub_dir's own kubectl+git stub pair, NOT
+# runstub_dir/runstub_verb itself: runstub_dir's git stub's fetch
+# emulation builds its update-ref target as "refs/heads/${arg#*:}", but
+# ${arg#*:} on the real refspec refs/heads/X:refs/heads/X is already
+# refs/heads/X -- so runstub_dir actually lands the stub fetch at
+# refs/heads/refs/heads/X. Every existing test that uses runstub_dir only
+# ever checks that SOMETHING fetched (a file, an output line), never the
+# exact ref, so this has never mattered before -- but these tests check
+# the fetched branch's own @{upstream}, which needs the ref at its real
+# name. kubectl's stub here is byte-for-byte runstub_dir's own (same
+# cases, same env knobs); only the git stub's update-ref line differs.
+upstream_stub_dir="$(newdir)"; tmpdirs+=("$upstream_stub_dir")
+cat > "$upstream_stub_dir/git" <<'STUB'
+#!/usr/bin/env bash
+case " $* " in
+    *" push "*) exit 0 ;;
+    *" fetch "*)
+        base="${K8S_STUB_BASE_SHA:-$(git -C . rev-parse -q --verify HEAD 2>/dev/null || true)}"
+        for arg in "$@"; do
+            case "$arg" in
+                refs/heads/*:refs/heads/*)
+                    tip="$base"
+                    if [[ -n "${K8S_STUB_FETCH_REF:-}" ]]; then
+                        parent="$(git -C . rev-parse -q --verify "$base" 2>/dev/null || true)"
+                        if [[ -n "$parent" ]]; then
+                            tip="$(GIT_AUTHOR_NAME=stub-fetch GIT_AUTHOR_EMAIL=stub-fetch@fork-sandbox.invalid \
+                                GIT_COMMITTER_NAME=stub-fetch GIT_COMMITTER_EMAIL=stub-fetch@fork-sandbox.invalid \
+                                git -C . commit-tree "$(git -C . hash-object -t tree /dev/null)" -p "$parent" -m "stub: fetched commit")"
+                        fi
+                    fi
+                    [[ -n "$tip" ]] && git -C . update-ref "${arg#*:}" "$tip"
+                    ;;
+            esac
+        done
+        exit 0 ;;
+esac
+exec /usr/bin/git "$@"
+STUB
+cat > "$upstream_stub_dir/kubectl" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$K8S_STUB_LOG"
+case " $* " in
+    *"context-extract.sh /work/session-store "*)
+        if [[ -n "${K8S_STUB_SESSION_PUSH_CAPTURE:-}" ]]; then
+            cat > "$K8S_STUB_SESSION_PUSH_CAPTURE"
+        else
+            cat >/dev/null
+        fi
+        exit 0 ;;
+    *" apply -f -"*)
+        if [[ -n "${K8S_STUB_APPLY_MANIFEST:-}" ]]; then
+            cat > "$K8S_STUB_APPLY_MANIFEST"
+        else
+            cat >/dev/null
+        fi
+        exit "${K8S_STUB_APPLY_RC:-0}" ;;
+    *" wait "*) exit 0 ;;
+    *" get pod -l job-name="*) printf 'stub-pod\n' ;;
+    *" -o jsonpath={.status.phase} "*)
+        printf '%s\n' "${K8S_STUB_POD_PHASE:-Running}"; exit 0 ;;
+    *" get pod "*)
+        spec="${K8S_STUB_POD_SPEC:-}"
+        [[ -n "$spec" ]] || spec='{"spec":{"containers":[{"name":"agent"}]}}'
+        printf '%s\n' "$spec" ;;
+    *" get "*) printf 'stub-pod\n' ;;
+    *" /work/repo.git rev-parse "*)
+        printf '%s\n' "${K8S_STUB_BASE_SHA:-}"
+        exit 0 ;;
+    *" delete "*) exit 0 ;;
+    *" logs "*) printf 'stub pod log: entrypoint narration\n'; exit 0 ;;
+    *" tar cf - -C /work/outbox "*)
+        if [[ -n "${K8S_STUB_OUTBOX_DIR:-}" ]]; then
+            ( cd "$K8S_STUB_OUTBOX_DIR" && tar cf - . ) || true
+        fi
+        [[ -n "${K8S_STUB_OUTBOX_STDERR:-}" ]] && printf '%s' "$K8S_STUB_OUTBOX_STDERR" >&2
+        exit "${K8S_STUB_OUTBOX_RC:-1}"
+        ;;
+    *" cat /work/.run-complete "*)
+        if [[ -n "${K8S_STUB_RUN_COMPLETE_RC:-}" ]]; then
+            exit "$K8S_STUB_RUN_COMPLETE_RC"
+        fi
+        if [[ -n "${K8S_STUB_RUN_COMPLETE_AFTER:-}" ]]; then
+            n=$(( $(cat "$K8S_STUB_COUNTER" 2>/dev/null || echo 0) + 1 ))
+            printf '%s' "$n" > "$K8S_STUB_COUNTER"
+            (( n > K8S_STUB_RUN_COMPLETE_AFTER )) || exit 1
+        fi
+        printf '%s\n' "${K8S_STUB_RUN_COMPLETE_VALUE:-0}" ;;
+esac
+exit 0
+STUB
+chmod +x "$upstream_stub_dir/git" "$upstream_stub_dir/kubectl"
+upstream_verb() {
+    # $1 = kubectl log, $2 = output file, $3 = verb, rest = its args.
+    local log="$1" out="$2" verb="$3"; shift 3
+    HOME="$k8s_test_home" PATH="$upstream_stub_dir:$PATH" \
+        K8S_STUB_LOG="$log" \
+        K8S_STUB_BASE_SHA="${K8S_STUB_BASE_SHA:-$(git -C "$upstream_proj_dir" rev-parse HEAD)}" \
+        K8S_STUB_OUTBOX_DIR="${K8S_STUB_OUTBOX_DIR:-$runstub_pod_outbox}" \
+        FORK_SANDBOX_CONFIG_DIR="$config_dir" \
+        "$k8s_sh" "$verb" "$@" > "$out" 2>&1
+}
+
+# 1. submit --checkout origin/dev resolves rule 1 and records it; collect
+# reads that back and cmd_fetch applies it once the branch has landed.
+upstream_submit_d="$(newdir)"; tmpdirs+=("$upstream_submit_d")
+rc=0
+K8S_STUB_BASE_SHA="$(git -C "$upstream_proj_dir" rev-parse HEAD)" \
+    upstream_verb "$upstream_submit_d/submit.log" "$upstream_submit_d/submit.out" submit \
+    --branch fs-k8s-test-upstream-checkout --model moonshotai/kimi-k3 \
+    --checkout origin/dev "$upstream_proj_dir" "$handoff_file" || rc=$?
+upstream_rd1="$(sed -n 's/^  run dir:  *//p' "$upstream_submit_d/submit.out" | head -1)"
+if (( rc == 0 )) && grep -qxF 'UPSTREAM=origin/dev' "$upstream_rd1/run.env" \
+    && grep -qxF 'UPSTREAM_REASON=' "$upstream_rd1/run.env"; then
+    ok "submit --checkout origin/dev records UPSTREAM=origin/dev in run.env"
+else
+    no "submit --checkout origin/dev records UPSTREAM=origin/dev in run.env" \
+        "rc=$rc run.env=$(cat "$upstream_rd1/run.env" 2>/dev/null)"
+fi
+
+upstream_collect_out1="$(newdir)/collect1.out"; tmpdirs+=("$(dirname "$upstream_collect_out1")")
+rc=0
+K8S_STUB_BASE_SHA="$(git -C "$upstream_proj_dir" rev-parse HEAD)" \
+    upstream_verb "$(newdir)/kubectl1.log" "$upstream_collect_out1" collect \
+    --branch fs-k8s-test-upstream-checkout --run-dir "$upstream_rd1" "$upstream_proj_dir" || rc=$?
+upstream_tracked1="$(git -C "$upstream_proj_dir" rev-parse --abbrev-ref 'fs-k8s-test-upstream-checkout@{upstream}' 2>/dev/null || true)"
+if [[ "$upstream_tracked1" == origin/dev ]] \
+    && grep -q 'fork-sandbox: upstream of fs-k8s-test-upstream-checkout set to origin/dev' \
+        "$upstream_collect_out1"; then
+    ok "collect after submit --checkout origin/dev sets the fetched branch's upstream to origin/dev"
+else
+    no "collect after submit --checkout origin/dev sets the fetched branch's upstream to origin/dev" \
+        "rc=$rc tracked=$upstream_tracked1 out=$(cat "$upstream_collect_out1")"
+fi
+
+# 2. A standalone fetch (no submit/collect context, so neither --upstream
+# nor --upstream-none is given) resolves it itself, via rule 3: the origin
+# repo's own HEAD already tracks origin/dev (set up above).
+upstream_fetch_out2="$(newdir)/fetch2.out"; tmpdirs+=("$(dirname "$upstream_fetch_out2")")
+rc=0
+K8S_STUB_BASE_SHA="$(git -C "$upstream_proj_dir" rev-parse HEAD)" \
+    upstream_verb "$(newdir)/kubectl2.log" "$upstream_fetch_out2" fetch \
+    --branch fs-k8s-test-upstream-standalone "$upstream_proj_dir" || rc=$?
+upstream_tracked2="$(git -C "$upstream_proj_dir" rev-parse --abbrev-ref 'fs-k8s-test-upstream-standalone@{upstream}' 2>/dev/null || true)"
+if (( rc == 0 )) && [[ "$upstream_tracked2" == origin/dev ]] \
+    && grep -q 'fork-sandbox: upstream of fs-k8s-test-upstream-standalone set to origin/dev' \
+        "$upstream_fetch_out2"; then
+    ok "a standalone fetch with no submit/collect context resolves the upstream itself (rule 3)"
+else
+    no "a standalone fetch with no submit/collect context resolves the upstream itself (rule 3)" \
+        "rc=$rc tracked=$upstream_tracked2 out=$(cat "$upstream_fetch_out2")"
+fi
+
+# 3. --upstream and --upstream-none together are refused, before any pod is
+# ever contacted.
+upstream_fetch_out3="$(newdir)/fetch3.out"; tmpdirs+=("$(dirname "$upstream_fetch_out3")")
+rc=0
+upstream_verb "$(newdir)/kubectl3.log" "$upstream_fetch_out3" fetch \
+    --branch fs-k8s-test-upstream-mutex --upstream origin/dev \
+    --upstream-none "no reason" "$upstream_proj_dir" || rc=$?
+if (( rc != 0 )) && grep -q 'mutually exclusive' "$upstream_fetch_out3"; then
+    ok "fetch --upstream and --upstream-none together are refused"
+else
+    no "fetch --upstream and --upstream-none together are refused" \
+        "rc=$rc out=$(cat "$upstream_fetch_out3")"
+fi
+
 printf '\n== submit/run: pushing /work/session-store ==\n'
 # --session-state's host directory is pushed into the pod the same way
 # --context-ro is (cmd_submit, "Same push, same extractor" above) -- proven
