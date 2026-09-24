@@ -6368,9 +6368,11 @@ contains "cluster: pm adopt event" "$(cat "$work/cl.out")" "pm adopt thread="
 # A run record can be rewritten by the mail API container (it writes under
 # .postmaster), so a cluster adoption only execs a wake dir this postmaster
 # made: a RUN_DIR pointed anywhere else is refused, never launched.
-send_msg '@carol' '@kim' 'cluster planted run dir topic' 'hello' 8 >/dev/null
+cl_tid2="$(send_msg '@carol' '@kim' 'cluster planted run dir topic' 'hello' 8)"
 cl_pass
-cl_env2="$(latest_env_for_agent kim)"
+# By thread, not latest_env_for_agent: its one-second mtime can tie with the
+# first thread's run, whose wake dir already carries an adopt-count.
+cl_env2="$(grep -l -- "^THREAD=$cl_tid2\$" "$PM_STATE_DIR/runs"/*.env | head -n 1)"
 cl_rid2="$(basename "$cl_env2" .env)"
 cl_decoy=""; new_root cl_decoy
 cp -a -- "$(env_val "$cl_env2" RUN_DIR)/." "$cl_decoy/"
