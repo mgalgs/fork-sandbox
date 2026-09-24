@@ -106,10 +106,11 @@ Do these in order.
 
 ## Capacity
 
-The namespace `ResourceQuota` caps `pods` at 10. The postmaster pod itself
-takes one of those, so a panel gets at most nine seat pods running at
-once. A site that needs more raises the quota where `00-namespace.yaml` is
-rendered.
+The namespace `ResourceQuota` caps `pods` at 10. Plain install already runs
+the always-on `fork-sandbox-proxy` Deployment, and `install --postmaster`
+adds the postmaster pod alongside it, so two of those ten are already
+spoken for. A panel gets at most eight seat pods running at once. A site
+that needs more raises the quota where `00-namespace.yaml` is rendered.
 
 ## Storage
 

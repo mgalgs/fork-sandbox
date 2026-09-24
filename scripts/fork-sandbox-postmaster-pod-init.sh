@@ -115,7 +115,17 @@ else
 fi
 
 if [[ -z "$project" ]]; then
-    project="${repo_url##*/}"
+    # scp-like URLs (user@host:path) have no scheme and no guaranteed "/"
+    # -- a root-level path like user@host:proj.git has none at all -- so
+    # strip the "host:" prefix first; the scp-form regex above guarantees
+    # the first ":" is that separator, since host chars exclude ":".
+    # ssh:// URLs always have a "/" before the path, so "##*/" alone works.
+    if [[ "$repo_url" == ssh://* ]]; then
+        project="${repo_url##*/}"
+    else
+        project="${repo_url#*:}"
+        project="${project##*/}"
+    fi
     project="${project%.git}"
 fi
 if [[ ! "$project" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then

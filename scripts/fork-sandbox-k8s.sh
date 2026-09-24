@@ -2437,7 +2437,10 @@ strip_pm_optional_block() {
 # bare paths, for the 900 KiB total-size guard in cmd_install) from every
 # regular top-level file in $1 -- never recursing, since a ConfigMap
 # volume cannot hold subdirectories, so a nested one is refused by name
-# rather than silently flattened or dropped. $2 ("true"/"false") requires
+# rather than silently flattened or dropped. A symlink is refused by name
+# too, never followed: kubectl would copy whatever it points at (even
+# outside $1) into the ConfigMap, which --dry-run would then print.
+# $2 ("true"/"false") requires
 # each included file to be executable, for the handlers dir: a
 # non-executable one is skipped with a warning rather than refused,
 # mirroring what the postmaster itself does with a non-executable
@@ -2453,6 +2456,13 @@ pm_collect_configmap_files() {
         return 1
     fi
     for f in "$dir"/*; do
+        if [[ -L "$f" ]]; then
+            echo "Error: '$f' is a symlink -- a ConfigMap can only hold" >&2
+            echo "regular files copied by value, never a symlink that might" >&2
+            echo "point outside $dir. Remove it or replace it with a real" >&2
+            echo "file." >&2
+            return 1
+        fi
         [[ -f "$f" ]] || continue
         base="$(basename "$f")"
         if [[ "$require_exec" == true && ! -x "$f" ]]; then
@@ -2593,7 +2603,19 @@ cmd_install() {
         fi
         pm_project="$K8S_POSTMASTER_PROJECT"
         if [[ -z "$pm_project" ]]; then
-            pm_project="${K8S_POSTMASTER_REPO_URL##*/}"
+            # Mirrors fork-sandbox-postmaster-pod-init.sh's own derivation --
+            # touch one, touch both. scp-like URLs have no scheme and no
+            # guaranteed "/" (a root-level path like user@host:proj.git has
+            # none at all), so strip the "host:" prefix first; the scp-form
+            # regex above guarantees the first ":" is that separator, since
+            # host chars exclude ":". ssh:// URLs always have a "/" before
+            # the path, so "##*/" alone works.
+            if [[ "$K8S_POSTMASTER_REPO_URL" == ssh://* ]]; then
+                pm_project="${K8S_POSTMASTER_REPO_URL##*/}"
+            else
+                pm_project="${K8S_POSTMASTER_REPO_URL#*:}"
+                pm_project="${pm_project##*/}"
+            fi
             pm_project="${pm_project%.git}"
         fi
         if [[ ! "$pm_project" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then

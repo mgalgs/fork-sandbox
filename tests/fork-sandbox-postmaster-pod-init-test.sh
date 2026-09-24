@@ -343,5 +343,23 @@ else
 fi
 rm -f /tmp/pi-test-out.log
 
+printf '\n== scp-like root-level URL derives a project with no explicit K8S_POSTMASTER_PROJECT ==\n'
+setup_env
+write_k8s_env <<'EOF'
+K8S_CONTEXT=my-context
+K8S_POSTMASTER_REPO_URL=git@git.example:proj.git
+EOF
+run_init >/tmp/pi-test-out.log 2>&1
+rc=$?
+if (( rc == 0 )); then
+    ok "scp-like root-level URL (user@host:proj.git), no explicit project: accepted"
+else
+    no "scp-like root-level URL (user@host:proj.git), no explicit project: accepted" \
+        "$(cat /tmp/pi-test-out.log)"
+fi
+check "derived project name is 'proj', not 'git@git.example:proj'" \
+    "clone git@git.example:proj.git $home/src/proj" "$(grep '^clone ' "$git_log")"
+rm -f /tmp/pi-test-out.log
+
 printf '\n%d ok / %d fail\n' "$pass" "$fail"
 (( fail == 0 ))

@@ -13071,6 +13071,25 @@ refuses "a malformed K8S_POSTMASTER_PROJECT refuses" \
     env PATH="$pm_stub_bin:$PATH" K8S_STUB_LOG="$pm_log_badproj" FORK_SANDBOX_CONFIG_DIR="$pm_cfg_badproj" \
     "$k8s_sh" install --postmaster --dry-run
 
+# 10b. A root-level scp-like URL (user@host:proj.git, no "/" at all) with
+# no explicit K8S_POSTMASTER_PROJECT must still derive "proj", not the
+# unstripped "user@host:proj" -- this mirrors
+# fork-sandbox-postmaster-pod-init.sh's own derivation, which the same
+# fixture URL exercises there.
+pm_cfg_rootscp="$(newdir)"; tmpdirs+=("$pm_cfg_rootscp")
+cp -r "$pm_cfg1"/. "$pm_cfg_rootscp"/
+chmod 600 "$pm_cfg_rootscp/deploy-key" "$pm_cfg_rootscp/pi.env"
+sed -i 's|^K8S_POSTMASTER_REPO_URL=.*|K8S_POSTMASTER_REPO_URL=git@git.example:proj.git|' "$pm_cfg_rootscp/k8s.env"
+pm_log_rootscp="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$pm_log_rootscp")")
+if PATH="$pm_stub_bin:$PATH" K8S_STUB_LOG="$pm_log_rootscp" FORK_SANDBOX_CONFIG_DIR="$pm_cfg_rootscp" \
+    "$k8s_sh" install --postmaster --dry-run >/dev/null 2>/tmp/fs-k8s-test-rootscp.err; then
+    ok "root-level scp URL with no explicit project derives a valid name"
+else
+    no "root-level scp URL with no explicit project derives a valid name" \
+        "$(cat /tmp/fs-k8s-test-rootscp.err)"
+fi
+rm -f /tmp/fs-k8s-test-rootscp.err
+
 # 11. The checksum/pm-config annotation changes when fleet.yaml changes.
 pm_cfg_fleet="$(newdir)"; tmpdirs+=("$pm_cfg_fleet")
 cp -r "$pm_cfg1"/. "$pm_cfg_fleet"/

@@ -59,15 +59,19 @@ PI_VERSION="latest"
 POSTMASTER=false
 BASE_IMAGE=""
 EXTRA=()
+CLAUDE_SET=false
+CODEX_SET=false
+PI_SET=false
+BASE_SET=false
 
 while (( $# )); do
     case "$1" in
         --tag) TAG="${2:?--tag requires a name}"; shift 2 ;;
-        --claude) CLAUDE_VERSION="${2:?--claude requires a version or 'none'}"; shift 2 ;;
-        --codex) CODEX_VERSION="${2:?--codex requires a version or 'none'}"; shift 2 ;;
-        --pi) PI_VERSION="${2:?--pi requires a version or 'none'}"; shift 2 ;;
+        --claude) CLAUDE_VERSION="${2:?--claude requires a version or 'none'}"; CLAUDE_SET=true; shift 2 ;;
+        --codex) CODEX_VERSION="${2:?--codex requires a version or 'none'}"; CODEX_SET=true; shift 2 ;;
+        --pi) PI_VERSION="${2:?--pi requires a version or 'none'}"; PI_SET=true; shift 2 ;;
         --postmaster) POSTMASTER=true; shift ;;
-        --base) BASE_IMAGE="${2:?--base requires an image reference}"; shift 2 ;;
+        --base) BASE_IMAGE="${2:?--base requires an image reference}"; BASE_SET=true; shift 2 ;;
         --no-cache) EXTRA+=(--no-cache); shift ;;
         -h|--help)
             sed -n '2,/^$/p' "$(readlink -f "${BASH_SOURCE[0]}")" | sed 's/^# \{0,1\}//'
@@ -76,6 +80,17 @@ while (( $# )); do
         *) echo "Error: unknown option '$1'." >&2; exit 1 ;;
     esac
 done
+
+if [[ "$POSTMASTER" == true ]]; then
+    if [[ "$CLAUDE_SET" == true || "$CODEX_SET" == true || "$PI_SET" == true ]]; then
+        echo "Error: --claude/--codex/--pi do not apply to --postmaster -- the" >&2
+        echo "base image (--base) already decided those." >&2
+        exit 1
+    fi
+elif [[ "$BASE_SET" == true ]]; then
+    echo "Error: --base only applies to --postmaster." >&2
+    exit 1
+fi
 
 CLI="${FORK_SANDBOX_CONTAINER_CLI:-docker}"
 command -v "$CLI" >/dev/null || {

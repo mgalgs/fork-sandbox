@@ -82,6 +82,24 @@ else
     ok "--postmaster without --base never calls docker build"
 fi
 
+printf '\n== --postmaster refuses --claude/--codex/--pi ==\n'
+rm -f "$record"
+refuses "--postmaster --claude refuses" "do not apply to --postmaster" \
+    run_build --postmaster --base registry.example/you/fork-sandbox:latest --claude none
+check "--postmaster --claude never calls docker build" "" "$([[ -s "$record" ]] && cat "$record" || true)"
+rm -f "$record"
+refuses "--postmaster --codex refuses" "do not apply to --postmaster" \
+    run_build --postmaster --base registry.example/you/fork-sandbox:latest --codex none
+rm -f "$record"
+refuses "--postmaster --pi refuses" "do not apply to --postmaster" \
+    run_build --postmaster --base registry.example/you/fork-sandbox:latest --pi 1.2.3
+
+printf '\n== plain build refuses --base ==\n'
+rm -f "$record"
+refuses "plain build --base refuses" "only applies to --postmaster" \
+    run_build --base registry.example/you/fork-sandbox:latest
+check "plain build --base never calls docker build" "" "$([[ -s "$record" ]] && cat "$record" || true)"
+
 printf '\n== --postmaster --base renders the expected build ==\n'
 rm -f "$record"
 if run_build --postmaster --base registry.example/you/fork-sandbox:latest >/tmp/bsi-test-out.log 2>&1; then
