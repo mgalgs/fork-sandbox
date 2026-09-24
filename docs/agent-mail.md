@@ -833,7 +833,7 @@ foreground; it is a test seam, not for real use.)
 
 Each launch (one per hook file) gets a record directory,
 `hooks/run/<id>/`, where `<id>` is
-`<epoch>-<event>-<short8>-<random>`. It holds `event`, `thread`, the
+`<epoch>-<event>-<short8>-<random>`. It holds `event`, `thread`, `file` (the hook's basename), the
 wrapper's pid with its pid-namespace and boot identity, `log`, and, once
 the hook finishes, `exit` (the timeout-wrapped exit status). At the start
 of every pass the postmaster reaps records: it emits the event line, moves
@@ -872,7 +872,9 @@ A thread is quiescent when ALL of these hold:
   a `harvested/<run-id>`;
 - no unrouted message. This covers debounce, since a message the debounce
   gate holds is unrouted;
-- no retry record under `retries/<thread-id>/`;
+- no pending retry under `retries/<thread-id>/` (a record with
+  `STATE=pending`; `recovered`, `exhausted` and `FAILS`-only records are
+  history and do not count);
 - no held seat under `held/<thread-id>/`.
 
 A flagged thread can be quiescent: `FS_HOOK_FLAGGED` is `1`. "The round
@@ -1273,7 +1275,7 @@ own thread scans never see it:
 | `project` | the `--project` path the last `deliver` ran with; `hook fire` reads it when `--project` is not given |
 | `hook-marks/target/<thread-id>` | `<VERSION> <SHA>` of the review target the last `on-target` pass saw, written before the hook fires. The whole `hook-marks/` tree is created by seeding on the first pass; see "Hooks" |
 | `hook-marks/quiescent/<thread-id>` | the message count the last `on-quiescent` pass saw, written before the hook fires |
-| `hooks/run/<id>/` | one hook launch in flight: `event`, `thread`, the wrapper pid with its pid-namespace and boot identity, `log`, and `exit` once finished. Reaped at the start of the next pass |
+| `hooks/run/<id>/` | one hook launch in flight: `event`, `thread`, `file`, the wrapper pid with its pid-namespace and boot identity, `log`, and `exit` once finished. Reaped at the start of the next pass |
 | `hooks/logs/<id>.log` | a reaped hook's stdout and stderr; the newest 100 are kept |
 | `workspaces/<thread-id>/<agent>/` | the persistent clone for that (thread, agent) seat, bound into every wake of it (every harness, not just claude) with `--clone-dir`; removed only by `fleet teardown` |
 

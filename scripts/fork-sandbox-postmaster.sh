@@ -4345,8 +4345,10 @@ pm_thread_message_count() {
 }
 
 # A thread is quiescent when nothing is running or waiting on it: no live
-# run, no unrouted message (this covers the debounce gate), no retry record
-# and no held seat. A flagged thread can be quiescent.
+# run, no unrouted message (this covers the debounce gate), no pending retry
+# and no held seat. Only STATE=pending is a retry still waiting to fire; the
+# recovered, exhausted and FAILS-only files are permanent history. A flagged
+# thread can be quiescent.
 pm_thread_is_quiescent() {
     local tid="$1" f rid
     for f in "$RUNS"/*.env; do
@@ -4356,7 +4358,11 @@ pm_thread_is_quiescent() {
         [[ -e "$HARVESTED/$rid" ]] || return 1
     done
     [[ "$(pm_thread_unrouted_count "$tid")" == 0 ]] || return 1
-    for f in "$RETRIES/$tid"/* "$STATE/held/$tid"/*; do
+    for f in "$RETRIES/$tid"/*; do
+        [[ -f "$f" ]] || continue
+        [[ "$(fs_pm_env_get "$f" STATE)" == pending ]] && return 1
+    done
+    for f in "$STATE/held/$tid"/*; do
         [[ -e "$f" ]] && return 1
     done
     return 0
