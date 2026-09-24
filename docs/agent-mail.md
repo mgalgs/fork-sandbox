@@ -906,6 +906,9 @@ line per file (`file=<basename> exit=<n>`), and exits non-zero if any hook
 failed. It takes no store lock and writes no hook record. `on-harvest` is
 refused, because it needs a run's context.
 
+`FS_HOOK_REPO` and `FS_TARGET_REPO` come from `--project <path>` when given,
+else from the project of the last `deliver` (recorded in `$STATE/project`).
+
 ### Routing rules
 
 Applied in order to each unrouted message M in thread T. A message is
@@ -1267,6 +1270,7 @@ own thread scans never see it:
 | `sessions/<thread-id>/<agent>` | the session id that pair's last wake ended on |
 | `retries/<thread-id>/<agent>` | the wedge-bound FAILS counter (session resume, below) and the retry read contract's STATE/TRIGGER/ATTEMPT/NOT_BEFORE/MAX/LAST_FAILED_RUN/RECOVERED_AT fields (see "Retrying a dead wake" above) — one file, two independent purposes |
 | `held/<thread-id>/<agent>` | a `backend: k8s`, `grant: required` seat waiting on a grant file for this thread — see "The held state file is a read contract" above |
+| `project` | the `--project` path the last `deliver` ran with; `hook fire` reads it when `--project` is not given |
 | `hook-marks/target/<thread-id>` | `<VERSION> <SHA>` of the review target the last `on-target` pass saw, written before the hook fires. The whole `hook-marks/` tree is created by seeding on the first pass; see "Hooks" |
 | `hook-marks/quiescent/<thread-id>` | the message count the last `on-quiescent` pass saw, written before the hook fires |
 | `hooks/run/<id>/` | one hook launch in flight: `event`, `thread`, the wrapper pid with its pid-namespace and boot identity, `log`, and `exit` once finished. Reaped at the start of the next pass |
