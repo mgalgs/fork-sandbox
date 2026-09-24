@@ -74,9 +74,50 @@ fork-sandbox mail send --from @operator --to @reviewer,@scribe \
 fork-sandbox mail reply --from @reviewer --reply-to <message-id> --body -
 fork-sandbox mail show  <message-id>
 fork-sandbox mail tree  <thread-id>
-fork-sandbox mail list
+fork-sandbox mail list [--json] [--header 'Name: value']...
 fork-sandbox mail inbox reviewer [--all]
 fork-sandbox mail seen  reviewer <message-id>...
+```
+
+### Listing and filtering threads
+
+Bare `list` prints one tab-separated line per thread: thread id, message
+count, the root's `Subject`, the last message's `Date`. Any flag switches
+to the filterable form, which sorts by thread id:
+
+- `--json` prints one JSON array (`[]` when nothing matches), one object
+  per thread.
+- `--header 'Name: value'` (repeatable) keeps only threads whose **root**
+  message -- the first `.msg` in the thread -- has that header. It uses
+  the same spelling as `send --header` (split on the first `:`, both sides
+  stripped), but any header name is allowed, core or `X-`. The name matches
+  case-insensitively, the value exactly; several `--header`s are ANDed; a
+  header repeated on the root matches if any occurrence's value equals.
+  Replies never count, and a thread whose root cannot be parsed never
+  matches. It works with or without `--json`.
+- Any other flag or a positional is an error (exit 1).
+
+Each JSON object:
+
+| key | meaning |
+|---|---|
+| `thread` | the thread id |
+| `messages` | number of `.msg` files |
+| `subject`, `from`, `date` | the root's `Subject`, `From`, `Date` |
+| `last_date` | `Date` of the last message |
+| `root_headers` | every header line of the root, in file order, as `[name, value]` pairs (the same shape as `export --json`'s `headers`) |
+| `review_target` | the thread's **current** target `{"branch", "sha", "version"}` from its state file, which the postmaster moves as the author re-rolls; `null` when there is none |
+
+A root's `X-Review-Target-Set` header (visible in `root_headers`) is the
+*original* target; `review_target` is where it stands now. A thread whose
+root cannot be parsed appears, unfiltered only, as
+`{"thread", "messages", "error"}`.
+
+Example: find the open review thread for a PR, stamped at kickoff with
+`--header 'X-Demo-PR: 42'`:
+
+```bash
+fork-sandbox mail --remote list --json --header 'X-Demo-PR: 42'
 ```
 
 ### Layout

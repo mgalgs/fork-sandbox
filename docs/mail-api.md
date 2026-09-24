@@ -159,7 +159,7 @@ flag and refused, since there is no way to tell it from one.
 | reply | 0 | `--from --reply-to --body --to --cc --subject --attach* --hops --header*` | `--from` in the token's identities |
 | show | 1 | | `read` |
 | tree | 1 | | `read` |
-| list | 0 | | `read` |
+| list | 0 | `--json --header*` | `read` |
 | inbox | 1 | `--all` | `read` |
 | export | 1 | `--json` | `read` |
 | seen | 1+ | | the first positional in the token's identities, and cap `seen` |
@@ -197,7 +197,8 @@ On `mail send` and `mail reply`, `--header` refuses any name that is
 (403, one line naming the reason). Those headers are the review-target
 contract (see [docs/agent-mail.md](agent-mail.md)): only `mail send
 --review-target` and the postmaster may write them, so no caller may set
-them through `--header`, including an operator token.
+them through `--header`, including an operator token. `list`'s `--header`
+is a read-only filter and is never subject to this restriction.
 
 ## `--body` and `--attach` over the API
 
