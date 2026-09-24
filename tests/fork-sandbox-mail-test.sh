@@ -646,6 +646,58 @@ rc=$?
 check "reply with a grant flag exits 1" "1" "$rc"
 contains "reply's refusal names send as the way to set a grant" "$out" "grant flags apply to a new thread only"
 
+printf '\n== grant / send: --context-secret ==\n'
+
+"$mail" grant "$grant_tid" --allow-namespace preview-pr-7 --reach-probe svc.preview-pr-7:80 --context-secret preview-ctx
+rc=$?
+check "grant with --context-secret exits 0" "0" "$rc"
+expected_grant_secret="$("$k8s_sh" check-grant --allow-namespace preview-pr-7 --reach-probe svc.preview-pr-7:80 --context-secret preview-ctx)"
+check "grant file matches check-grant's own output, CONTEXT_SECRET= last" "$expected_grant_secret" "$(cat -- "$grant_file")"
+check "the last grant line is CONTEXT_SECRET=preview-ctx" "CONTEXT_SECRET=preview-ctx" "$(tail -n 1 -- "$grant_file")"
+
+secret_json="$("$mail" grant "$grant_tid" --show --json)"
+contains "--show --json carries context_secret" "$secret_json" '"context_secret": "preview-ctx"'
+contains "--show --json still carries context_ro as null" "$secret_json" '"context_ro": null'
+"$mail" grant "$grant_tid" --clear
+
+"$mail" grant "$grant_tid" --allow-namespace preview-pr-7 --reach-probe svc.preview-pr-7:80
+contains "--show --json with no secret carries context_secret null" \
+    "$("$mail" grant "$grant_tid" --show --json)" '"context_secret": null'
+"$mail" grant "$grant_tid" --clear
+
+grants_before="$(find "$FORK_SANDBOX_MAIL_ROOT/.postmaster/grants" -name '*.env' 2>/dev/null | wc -l)"
+"$mail" grant "$grant_tid" --context-secret fork-sandbox-upstream-key >/dev/null 2>&1
+check "grant with a reserved Secret name exits 2" "2" "$?"
+"$mail" grant "$grant_tid" --context-secret sbx-foo-claude-token >/dev/null 2>&1
+check "grant with a -claude-token Secret name exits 2" "2" "$?"
+"$mail" grant "$grant_tid" --context-secret preview-ctx --context-ro "$cg_ctx_dir_grant" >/dev/null 2>&1
+check "grant with --context-secret and --context-ro exits 2" "2" "$?"
+check "refused Secret grants write no file" "$grants_before" \
+    "$(find "$FORK_SANDBOX_MAIL_ROOT/.postmaster/grants" -name '*.env' 2>/dev/null | wc -l)"
+
+cs_send_out="$("$mail" send --from @alice --to @bob --subject "Send with secret" --body - \
+    --context-secret preview-ctx <<< "hi" 2>diag.txt)"
+rc=$?
+check "send with --context-secret exits 0" "0" "$rc"
+check "send with --context-secret writes CONTEXT_SECRET=preview-ctx" "CONTEXT_SECRET=preview-ctx" \
+    "$(cat -- "$FORK_SANDBOX_MAIL_ROOT/.postmaster/grants/$cs_send_out.env")"
+
+threads_before="$(find "$FORK_SANDBOX_MAIL_ROOT/threads" -maxdepth 1 -type d | wc -l)"
+grants_before="$(find "$FORK_SANDBOX_MAIL_ROOT/.postmaster/grants" -name '*.env' 2>/dev/null | wc -l)"
+"$mail" send --from @alice --to @bob --subject "Send with reserved secret" --body - \
+    --context-secret fork-sandbox-mail-api-tokens <<< "hi" >/dev/null 2>&1
+check "send with a reserved Secret name exits 2" "2" "$?"
+check "send with a reserved Secret name creates no new thread dir" "$threads_before" \
+    "$(find "$FORK_SANDBOX_MAIL_ROOT/threads" -maxdepth 1 -type d | wc -l)"
+check "send with a reserved Secret name writes no grant file" "$grants_before" \
+    "$(find "$FORK_SANDBOX_MAIL_ROOT/.postmaster/grants" -name '*.env' 2>/dev/null | wc -l)"
+
+out="$("$mail" reply --from @bob --reply-to "$grant_tid" --body - \
+    --context-secret preview-ctx <<< "x" 2>&1)"
+rc=$?
+check "reply with --context-secret exits 1" "1" "$rc"
+contains "reply's refusal names the grant flags rule" "$out" "grant flags apply to a new thread only"
+
 printf '\n== send: --review-target ==\n'
 
 rt_sha1="0123456789abcdef0123456789abcdef01234567"

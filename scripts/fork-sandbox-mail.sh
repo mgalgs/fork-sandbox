@@ -8,6 +8,7 @@
 #                              [--header 'X-Name: value']...
 #                              [--allow-namespace NS[:PORT]]...
 #                              [--reach-probe HOST:PORT]... [--context-ro DIR]
+#                              [--context-secret NAME]
 #                              [--review-target <branch>:<sha>]
 #        fork-sandbox-mail.sh reply --from @a --reply-to <message-id>
 #                              (--body <file>|-) [--to @b[,@c]] [--cc @d[,@e]]
@@ -21,6 +22,7 @@
 #        fork-sandbox-mail.sh seen <name> <message-id>...
 #        fork-sandbox-mail.sh grant <thread-id> [--allow-namespace NS[:PORT]]...
 #                              [--reach-probe HOST:PORT]... [--context-ro DIR]
+#                              [--context-secret NAME]
 #        fork-sandbox-mail.sh grant <thread-id> --clear
 #        fork-sandbox-mail.sh grant <thread-id> --show [--json]
 #        fork-sandbox-mail.sh --remote <verb> ...
@@ -487,17 +489,18 @@ mail_grant_print_json() {
         return 0
     fi
     local -a ns=() probe=()
-    local ctx="null" line
+    local ctx="null" ctx_secret="null" line
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
         case "$line" in
             ALLOW_NAMESPACE=*) ns+=("$(mail_json_escape "${line#ALLOW_NAMESPACE=}")") ;;
             REACH_PROBE=*) probe+=("$(mail_json_escape "${line#REACH_PROBE=}")") ;;
             CONTEXT_RO=*) ctx="\"$(mail_json_escape "${line#CONTEXT_RO=}")\"" ;;
+            CONTEXT_SECRET=*) ctx_secret="\"$(mail_json_escape "${line#CONTEXT_SECRET=}")\"" ;;
         esac
     done < "$grant_file"
-    printf '{"thread": "%s", "allow_namespace": %s, "reach_probe": %s, "context_ro": %s}\n' \
-        "$(mail_json_escape "$tid")" "$(mail_json_string_array ns)" "$(mail_json_string_array probe)" "$ctx"
+    printf '{"thread": "%s", "allow_namespace": %s, "reach_probe": %s, "context_ro": %s, "context_secret": %s}\n' \
+        "$(mail_json_escape "$tid")" "$(mail_json_string_array ns)" "$(mail_json_string_array probe)" "$ctx" "$ctx_secret"
 }
 
 # Validates and copies each --attach file into <thread-dir>/attachments/,
@@ -631,7 +634,7 @@ cmd_send() {
     local from="" to="" cc="" subject="" body_arg="" hops=8
     local -a attach_files=() extra_headers=()
     local -a grant_allow_ns=() grant_reach_probe=()
-    local grant_context_ro="" review_target_arg=""
+    local grant_context_ro="" grant_context_secret="" review_target_arg=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --from) from="${2:?--from requires an address}"; shift 2 ;;
@@ -645,6 +648,7 @@ cmd_send() {
             --allow-namespace) grant_allow_ns+=("${2:?--allow-namespace requires NS[:PORT]}"); shift 2 ;;
             --reach-probe) grant_reach_probe+=("${2:?--reach-probe requires HOST:PORT}"); shift 2 ;;
             --context-ro) grant_context_ro="${2:?--context-ro requires a directory}"; shift 2 ;;
+            --context-secret) grant_context_secret="${2:?--context-secret requires a Secret name}"; shift 2 ;;
             --review-target) review_target_arg="${2:?--review-target requires <branch>:<sha>}"; shift 2 ;;
             -h|--help) usage; exit 0 ;;
             *) echo "Error: send: unknown option '$1'." >&2; return 1 ;;
@@ -681,6 +685,7 @@ cmd_send() {
     for gv in "${grant_allow_ns[@]:-}"; do [[ -n "$gv" ]] && grant_args+=(--allow-namespace "$gv"); done
     for gv in "${grant_reach_probe[@]:-}"; do [[ -n "$gv" ]] && grant_args+=(--reach-probe "$gv"); done
     [[ -n "$grant_context_ro" ]] && grant_args+=(--context-ro "$grant_context_ro")
+    [[ -n "$grant_context_secret" ]] && grant_args+=(--context-secret "$grant_context_secret")
     local saw_grant=0
     (( ${#grant_args[@]} > 0 )) && saw_grant=1
     if (( saw_grant )); then
@@ -797,7 +802,7 @@ cmd_reply() {
             --attach) attach_files+=("${2:?--attach requires a file}"); shift 2 ;;
             --hops) hops_override="${2:?--hops requires a number}"; shift 2 ;;
             --header) extra_headers+=("${2:?--header requires 'X-Name: value'}"); shift 2 ;;
-            --allow-namespace|--reach-probe|--context-ro)
+            --allow-namespace|--reach-probe|--context-ro|--context-secret)
                 echo "Error: reply: grant flags apply to a new thread only (mail send); for an existing thread use" >&2
                 echo "fork-sandbox mail grant <thread-id> ..." >&2
                 return 1
@@ -1104,12 +1109,13 @@ cmd_grant() {
     local tid="${1:?Usage: fork-sandbox-mail.sh grant <thread-id> [options]}"
     shift
     local -a allow_ns=() reach_probe=()
-    local context_ro="" clear=0 show=0 json=0 saw_value=0
+    local context_ro="" context_secret="" clear=0 show=0 json=0 saw_value=0
     while (( $# )); do
         case "$1" in
             --allow-namespace) allow_ns+=("${2:?--allow-namespace requires NS[:PORT]}"); saw_value=1; shift 2 ;;
             --reach-probe) reach_probe+=("${2:?--reach-probe requires HOST:PORT}"); saw_value=1; shift 2 ;;
             --context-ro) context_ro="${2:?--context-ro requires a directory}"; saw_value=1; shift 2 ;;
+            --context-secret) context_secret="${2:?--context-secret requires a Secret name}"; saw_value=1; shift 2 ;;
             --clear) clear=1; shift ;;
             --show) show=1; shift ;;
             --json) json=1; shift ;;
@@ -1131,7 +1137,7 @@ cmd_grant() {
         return 1
     fi
     if (( ! clear && ! show && ! saw_value )); then
-        echo "Error: grant: give --allow-namespace/--reach-probe/--context-ro, --clear or --show." >&2
+        echo "Error: grant: give --allow-namespace/--reach-probe/--context-ro/--context-secret, --clear or --show." >&2
         return 1
     fi
 
@@ -1159,6 +1165,7 @@ cmd_grant() {
     for v in "${allow_ns[@]}"; do args+=(--allow-namespace "$v"); done
     for v in "${reach_probe[@]}"; do args+=(--reach-probe "$v"); done
     [[ -n "$context_ro" ]] && args+=(--context-ro "$context_ro")
+    [[ -n "$context_secret" ]] && args+=(--context-secret "$context_secret")
 
     mail_write_grant "$tid" "${args[@]}"
 }
