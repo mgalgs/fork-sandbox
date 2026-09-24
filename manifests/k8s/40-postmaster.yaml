@@ -151,12 +151,19 @@ spec:
         # first mount, but as root -- so the main container, running as
         # uid 1000 with a read-only root filesystem, could find
         # /var/tmp/claude-scratch (etc.) owned by root and unwritable.
-        # Creating the three subPath directories ourselves, as uid 1000,
-        # before the main container starts avoids that.
+        # Creating the subPath directories ourselves (the three below plus
+        # the mail root the mail-api container mounts on its own), as uid
+        # 1000, before the main containers start avoids that.
         - name: pvc-dirs
           image: __PM_IMAGE__
           imagePullPolicy: IfNotPresent
-          command: ["mkdir", "-p", "/data/scratch", "/data/src", "/data/home-claude"]
+          command:
+            - mkdir
+            - -p
+            - /data/scratch
+            - /data/scratch/agent-mail
+            - /data/src
+            - /data/home-claude
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -294,19 +301,23 @@ spec:
             limits:
               cpu: 500m
               memory: 256Mi
-          # Its own HOME and /tmp, never the postmaster's: the postmaster
-          # container reads $HOME/.kube/config, $HOME/.gitconfig and the
-          # deploy key under $HOME/.ssh, so a writable HOME shared with
-          # this network-facing container would let it plant code that
-          # runs where the service-account token is mounted.
+          # Its own HOME and /tmp, never the postmaster's, and only the mail
+          # root of the scratch volume: the postmaster container reads
+          # $HOME/.kube/config, $HOME/.gitconfig and the deploy key under
+          # $HOME/.ssh, and execs the launch records it keeps in the wake
+          # dirs under forks/, so anything of those this network-facing
+          # container could write would run where the service-account token
+          # is mounted. The postmaster also refuses to adopt a run whose
+          # RUN_DIR is not one of its own wake dirs, since the run records
+          # under the mail root's .postmaster are writable from here.
           volumeMounts:
             - name: mail-api-home
               mountPath: /home/fs
             - name: mail-api-tmp
               mountPath: /tmp
             - name: data
-              mountPath: /var/tmp/claude-scratch
-              subPath: scratch
+              mountPath: /var/tmp/claude-scratch/agent-mail
+              subPath: scratch/agent-mail
             - name: mail-api-tokens
               mountPath: /etc/fork-sandbox/mail-api
               readOnly: true

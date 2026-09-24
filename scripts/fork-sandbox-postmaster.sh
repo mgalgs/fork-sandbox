@@ -107,6 +107,10 @@
 #                adoption probe could not reach the cluster (exit 4, or any
 #                code outside its 0/1/2 contract), so the run is left live
 #                rather than adopted or declared dead; see ADOPTION below.
+#   adopt-refused agent, thread, run=<run id> -- `deliver --cluster` only:
+#                the run record's RUN_DIR is not one of this postmaster's own
+#                wake directories (pm-k8s-wake.* under the wake root), so it
+#                was not adopted and the seat is treated as dead.
 #   external-mail thread -- `deliver --cluster` only: a non-fleet sender
 #                that is not on the operator list ($FORK_SANDBOX_OPERATORS)
 #                posted to this thread; it routes like fleet mail and
@@ -3482,6 +3486,19 @@ pm_k8s_wake_launch() {
 # $1 = wake dir, $2 = run id, $3 = agent, $4 = thread id, $5 = branch.
 pm_try_adopt() {
     local run_dir="$1" rid="$2" agent="$3" tid="$4" branch="$5"
+    if (( PM_CLUSTER )); then
+        # An adoption execs the wake dir's fs-argv, and RUN_DIR comes from a
+        # run record under $MAIL_ROOT/.postmaster, which the cluster mail API
+        # container can write. Only a directory this postmaster made itself
+        # (a pm-k8s-wake.* child of the wake root) is ever adopted.
+        local wake_root real_dir
+        wake_root="$("$FS_REALPATH" -m -- "${FORK_SANDBOX_POSTMASTER_K8S_WAKE_ROOT:-/var/tmp/claude-scratch/forks}")"
+        real_dir="$("$FS_REALPATH" -m -- "$run_dir")"
+        if [[ "$(dirname -- "$real_dir")" != "$wake_root" || "$(basename -- "$real_dir")" != pm-k8s-wake.* ]]; then
+            pm_event "adopt-refused thread=${tid:0:8} agent=$agent run=$rid"
+            return 1
+        fi
+    fi
     local count
     count="$(pm_trim "$(cat -- "$run_dir/adopt-count" 2>/dev/null || true)")"
     [[ "$count" =~ ^[0-9]+$ ]] || count=0

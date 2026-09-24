@@ -5838,6 +5838,26 @@ contains "cluster: the adoption run.sh execs --adopt" "$(cat "$cl_wake_dir/run.s
 check "cluster: adoption never touched tmux" 0 "$( [[ -e "$cl_bin/tmux-called.log" ]] && echo 1 || echo 0 )"
 contains "cluster: pm adopt event" "$(cat "$work/cl.out")" "pm adopt thread="
 
+# A run record can be rewritten by the mail API container (it writes under
+# .postmaster), so a cluster adoption only execs a wake dir this postmaster
+# made: a RUN_DIR pointed anywhere else is refused, never launched.
+send_msg '@carol' '@kim' 'cluster planted run dir topic' 'hello' 8 >/dev/null
+cl_pass
+cl_env2="$(latest_env_for_agent kim)"
+cl_rid2="$(basename "$cl_env2" .env)"
+cl_decoy=""; new_root cl_decoy
+cp -a -- "$(env_val "$cl_env2" RUN_DIR)/." "$cl_decoy/"
+sed -i "s|^RUN_DIR=.*|RUN_DIR=$cl_decoy|" "$cl_env2"
+dead_pid_of > "$cl_decoy/pid"
+rm -f -- "$cl_decoy/summary.json" "$cl_decoy/exit-code" "$cl_decoy/pid-identity"
+FORK_SANDBOX_POSTMASTER_WAKE_DEAD_GRACE=0 cl_pass
+check "cluster: a RUN_DIR outside the wake root is never launched" 0 \
+    "$(grep -cF -- "$cl_decoy" "$cl_bin/setsid-argv.log" 2>/dev/null)"
+check "cluster: the refused adoption wrote no adopt-count" 0 \
+    "$( [[ -e "$cl_decoy/adopt-count" ]] && echo 1 || echo 0 )"
+contains "cluster: pm adopt-refused event" "$(cat "$work/cl.out")" "pm adopt-refused thread="
+contains "cluster: the refused run is named" "$(cat "$work/cl.out")" "run=$cl_rid2"
+
 # ---- cluster mode: the operator list carries rule-1 authority ----
 
 # Under --cluster only a From on $FORK_SANDBOX_OPERATORS (default

@@ -13317,6 +13317,13 @@ check "tokens file: the mail-api container mounts neither src nor home-claude" "
     "$(pm_api_dep '.spec.template.spec.containers[] | select(.name == "mail-api") | .volumeMounts[] | select(.mountPath == "/home/fs/src" or .mountPath == "/home/fs/.claude") | .mountPath' | grep -c .)"
 check "tokens file: the mail-api container shares only the data volume with the postmaster" "data" \
     "$(pm_api_dep '.spec.template.spec.containers | ([.[] | select(.name == "mail-api") | .volumeMounts[].name]) as $a | [.[] | select(.name == "postmaster") | .volumeMounts[].name | select(. as $n | $a | index($n))] | unique | join(" ")')"
+check "tokens file: the mail-api container mounts only the mail root of the data volume" \
+    "/var/tmp/claude-scratch/agent-mail scratch/agent-mail" \
+    "$(pm_api_dep '.spec.template.spec.containers[] | select(.name == "mail-api") | .volumeMounts[] | select(.name == "data") | .mountPath + " " + .subPath')"
+check "tokens file: the mail-api container mounts nothing over the scratch root or forks/" "0" \
+    "$(pm_api_dep '.spec.template.spec.containers[] | select(.name == "mail-api") | .volumeMounts[] | select(.mountPath == "/var/tmp/claude-scratch" or (.mountPath | startswith("/var/tmp/claude-scratch/forks")))' | grep -c .)"
+check "tokens file: pvc-dirs creates the mail root subPath" "1" \
+    "$(pm_api_dep '.spec.template.spec.initContainers[] | select(.name == "pvc-dirs") | .command[] | select(. == "/data/scratch/agent-mail")' | grep -c .)"
 check "tokens file: both containers carry the configured operator list" "@alice,@operator @alice,@operator" \
     "$(pm_api_dep '.spec.template.spec.containers[] | .env[] | select(.name == "FORK_SANDBOX_OPERATORS") | .value' | paste -sd' ')"
 if command -v yamllint >/dev/null 2>&1; then
