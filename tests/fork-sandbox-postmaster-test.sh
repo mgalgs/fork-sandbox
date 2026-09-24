@@ -157,6 +157,12 @@ thinking: medium
 ---
 Kim is a pi/k8s seat with an endpoint, used by the endpoint/pi-args tests.
 EOF
+cat > "$FORK_SANDBOX_PERSONAS_DIR/ken.md" <<'EOF'
+Ken is the review-target: sets backend: k8s seat, used by the review-target tests.
+EOF
+cat > "$FORK_SANDBOX_PERSONAS_DIR/kai.md" <<'EOF'
+Kai is the review-target: follow backend: k8s seat, used by the review-target tests.
+EOF
 
 cat > "$FORK_SANDBOX_FLEET_FILE" <<'EOF'
 agents:
@@ -191,6 +197,12 @@ agents:
     harness: claude
     backend: k8s
     refresh-at: 0.4
+  ken:
+    backend: k8s
+    review-target: sets
+  kai:
+    backend: k8s
+    review-target: follow
 lists:
   team:
     members: [alice, bob, carol]
@@ -5126,6 +5138,131 @@ once
 check "k8s case1e: no --checkout when nothing in the history resolves" \
     0 "$(grep -c -- '^--checkout$' "$STUB_ARGV_LOG")"
 
+# ---- review-target case A1: a `follow` seat (kai) on a thread WITH a
+# review target checks out the target's sha instead of doing lineage
+# resolution, and --services-trust-ref still anchors to the project's own
+# HEAD, never the target ----
+# The target sha is a real commit in PROJECT_DIR (commit-tree + update-ref,
+# so it lands without disturbing PROJECT_DIR's own current branch/HEAD,
+# which other cases in this suite compare against) -- pm_spawn_wake does a
+# real `git cat-file -e` against it.
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+
+rt1_branch="pm-review-target-test-1"
+rt1_tree="$(git -C "$PROJECT_DIR" rev-parse 'HEAD^{tree}')"
+rt1_parent="$(git -C "$PROJECT_DIR" rev-parse HEAD)"
+rt1_sha="$(git -C "$PROJECT_DIR" -c user.email=test@example.com -c user.name=test \
+    commit-tree "$rt1_tree" -p "$rt1_parent" -m 'review target commit 1')"
+git -C "$PROJECT_DIR" update-ref "refs/heads/$rt1_branch" "$rt1_sha"
+
+printf '%s\n' 'kick off review' > "$work/body.tmp"
+rt1_mid="$("$MAIL" send --from '@carol' --to '@kai' --subject 'review target spawn topic' \
+    --body "$work/body.tmp" --hops 8 --review-target "$rt1_branch:$rt1_sha" 2>/dev/null)"
+rt1_tid="$(thread_of "$rt1_mid")"
+rt1_short="${rt1_tid:0:8}"
+: > "$STUB_ARGV_LOG"
+once
+check "review-target case A1: follow seat spawns with --checkout at the target sha, not lineage" \
+    "$rt1_sha" "$(argv_after --checkout "$STUB_ARGV_LOG")"
+check "review-target case A1: --services-trust-ref is still the project's own HEAD, not the target" \
+    "$(git -C "$PROJECT_DIR" rev-parse HEAD)" "$(argv_after --services-trust-ref "$STUB_ARGV_LOG")"
+contains "review-target case A1: spawn event fires for kai" \
+    "$(cat "$work/once.out")" "pm spawn thread=$rt1_short agent=kai"
+rt1_env="$(latest_env_for_agent kai)"
+check "review-target case A1: .env REVIEW_TARGET=follow" "follow" "$(env_val "$rt1_env" REVIEW_TARGET)"
+check "review-target case A1: .env REVIEW_TARGET_BRANCH matches the state file" \
+    "$rt1_branch" "$(env_val "$rt1_env" REVIEW_TARGET_BRANCH)"
+check "review-target case A1: .env REVIEW_TARGET_SHA matches the state file" \
+    "$rt1_sha" "$(env_val "$rt1_env" REVIEW_TARGET_SHA)"
+check "review-target case A1: .env REVIEW_TARGET_VERSION matches the state file" \
+    "1" "$(env_val "$rt1_env" REVIEW_TARGET_VERSION)"
+
+# ---- review-target case A2: a `follow` seat on a thread with NO review
+# target is unaffected -- ordinary lineage path, nothing forced ----
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+
+send_msg '@carol' '@kai' 'no review target topic' 'hello kai' 8 >/dev/null
+: > "$STUB_ARGV_LOG"
+once
+check "review-target case A2: no --checkout when the thread has no review target" \
+    0 "$(grep -c -- '^--checkout$' "$STUB_ARGV_LOG")"
+rt2_env="$(latest_env_for_agent kai)"
+check "review-target case A2: .env REVIEW_TARGET is still 'follow' (a seat property, stamped regardless)" \
+    "follow" "$(env_val "$rt2_env" REVIEW_TARGET)"
+check "review-target case A2: no REVIEW_TARGET_BRANCH written when there is no target" \
+    0 "$(grep -c '^REVIEW_TARGET_BRANCH=' "$rt2_env")"
+check "review-target case A2: no REVIEW_TARGET_SHA written when there is no target" \
+    0 "$(grep -c '^REVIEW_TARGET_SHA=' "$rt2_env")"
+check "review-target case A2: no REVIEW_TARGET_VERSION written when there is no target" \
+    0 "$(grep -c '^REVIEW_TARGET_VERSION=' "$rt2_env")"
+
+# ---- review-target case A3: a target sha absent from the project repo,
+# with no `origin` remote configured, flags and refuses the wake instead of
+# spawning ----
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+
+rt3_branch="pm-review-target-test-missing"
+rt3_sha="$(printf 'a%.0s' {1..40})"
+printf '%s\n' 'kick off review' > "$work/body.tmp"
+rt3_mid="$("$MAIL" send --from '@carol' --to '@kai' --subject 'review target missing sha topic' \
+    --body "$work/body.tmp" --hops 8 --review-target "$rt3_branch:$rt3_sha" 2>/dev/null)"
+rt3_tid="$(thread_of "$rt3_mid")"
+rt3_short="${rt3_tid:0:8}"
+: > "$STUB_ARGV_LOG"
+once
+rt3_flag="$(cat "$PM_STATE_DIR/needs-operator/$rt3_tid" 2>/dev/null)"
+contains "review-target case A3: a missing target sha with no origin is flagged ('not found')" \
+    "$rt3_flag" "not found"
+contains "review-target case A3: flag event uses the review-target keyword" \
+    "$(cat "$work/once.out")" "pm flag thread=$rt3_short reason=review-target"
+check "review-target case A3: no --checkout was ever forwarded" 0 \
+    "$(grep -c -- '^--checkout$' "$STUB_ARGV_LOG")"
+check "review-target case A3: no k8s launch at all -- the wake was refused before spawning" 0 \
+    "$(grep -c -- '^--k8s$' "$STUB_ARGV_LOG")"
+check "review-target case A3: no run record for kai was ever written" \
+    "1" "$(latest_env_for_agent kai >/dev/null 2>&1; echo $?)"
+
+# ---- review-target case A4: a target sha absent locally but present on an
+# `origin` remote is fetched on demand, and the spawn then proceeds ----
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+
+new_root RT_ORIGIN_BARE
+git init -q --bare "$RT_ORIGIN_BARE"
+new_root RT_ORIGIN_SRC
+git -C "$RT_ORIGIN_SRC" init -q
+git -C "$RT_ORIGIN_SRC" -c user.email=test@example.com -c user.name=test \
+    commit -q --allow-empty -m 'origin target commit'
+rt4_branch="pm-review-target-test-origin"
+rt4_sha="$(git -C "$RT_ORIGIN_SRC" rev-parse HEAD)"
+git -C "$RT_ORIGIN_SRC" push -q "$RT_ORIGIN_BARE" "HEAD:refs/heads/$rt4_branch"
+git -C "$PROJECT_DIR" remote add origin "$RT_ORIGIN_BARE"
+check "review-target case A4 setup: the target sha is not yet present locally" \
+    "1" "$(git -C "$PROJECT_DIR" cat-file -e "$rt4_sha^{commit}" >/dev/null 2>&1 && echo 0 || echo 1)"
+
+printf '%s\n' 'kick off review' > "$work/body.tmp"
+rt4_mid="$("$MAIL" send --from '@carol' --to '@kai' --subject 'review target origin fetch topic' \
+    --body "$work/body.tmp" --hops 8 --review-target "$rt4_branch:$rt4_sha" 2>/dev/null)"
+rt4_tid="$(thread_of "$rt4_mid")"
+: > "$STUB_ARGV_LOG"
+once
+check "review-target case A4: the sha is fetched from origin and the spawn proceeds with --checkout" \
+    "$rt4_sha" "$(argv_after --checkout "$STUB_ARGV_LOG")"
+check "review-target case A4: the thread is not flagged" 0 \
+    "$( [[ -e "$PM_STATE_DIR/needs-operator/$rt4_tid" ]] && echo 1 || echo 0 )"
+git -C "$PROJECT_DIR" remote remove origin
+
 # ---- case 2: a local seat on the same fleet spawns exactly as before ----
 
 # Fresh root: case1's k8s reply (no explicit To:, so reply-all to its
@@ -5757,6 +5894,256 @@ check "k8s adopt-deferred: probe-fail-count is removed on adoption" 0 \
 check "k8s adopt-deferred: still not harvested" 0 \
     "$( [[ -e "$PM_STATE_DIR/harvested/$AD_RID" ]] && echo 1 || echo 0 )"
 unset FORK_SANDBOX_POSTMASTER_RETRY_BACKOFF
+
+# ---- review-target harvest: a `sets` seat's (ken) Version: header, and a
+# `follow` seat's (kai) spawn-time header stamping ----
+# review-target: sets/follow are k8s-only fleet keys, so hand-writing
+# outbox reply files against a k8s-stub-spawned run (as every case above
+# does) is the natural way to drive pm_harvest_one_file's review-target
+# branch -- the harvest logic itself runs identically for a local wake.
+
+# ---- review-target case B1: ken's (sets) Version: 2 reply on a thread at
+# VERSION=1 advances the target: X-Review-Target-Set/X-Review-Target/
+# X-Version are stamped, and the state file is updated only after the post
+# succeeds ----
+# Version:'s new sha comes from resolving the WAKE's OWN branch in the
+# project repo (the agent's real work landing there), not the review
+# target's own branch -- same fixture technique as k8s case1b above.
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+
+rt5_seed_sha="$(printf 'b%.0s' {1..40})"
+printf '%s\n' 'kick off review' > "$work/body.tmp"
+rt5_mid="$("$MAIL" send --from '@carol' --to '@ken' --subject 'review target advance topic' \
+    --body "$work/body.tmp" --hops 8 --review-target "pm-review-target-test-seed5:$rt5_seed_sha" 2>/dev/null)"
+rt5_tid="$(thread_of "$rt5_mid")"
+# A single `once` under this suite's FORK_SANDBOX_POSTMASTER_K8S_DETACH=inline
+# both spawns AND harvests synchronously -- fork-sandbox-k8s-wake.sh's
+# fs_k8s_wake_finish always writes its own wake_dir/summary.json as its last
+# step (synthesizing one even when the raw stub wrote none), so this spawn
+# is harvested immediately with the stub's own canned "hello from k8s stub"
+# reply. The harvested marker and that run's summary.json/exit-code are
+# cleared below -- the same technique adopt_case (above) uses to make a
+# completed run look still-live -- before this case writes its real
+# Version: content and re-harvests.
+once
+
+rt5_env="$(latest_env_for_agent ken)"
+rt5_run_dir="$(env_val "$rt5_env" RUN_DIR)"
+rt5_branch="$(env_val "$rt5_env" BRANCH)"
+git -C "$PROJECT_DIR" branch "$rt5_branch" >/dev/null 2>&1
+rt5_branch_sha="$(git -C "$PROJECT_DIR" rev-parse "$rt5_branch")"
+
+rm -f -- "$PM_STATE_DIR/harvested/$(basename "$rt5_env" .env)" \
+    "$rt5_run_dir/summary.json" "$rt5_run_dir/exit-code"
+mkdir -p -- "$rt5_run_dir/outbox"
+printf 'Version: 2\n\nBumping the review target to v2.\n' > "$rt5_run_dir/outbox/mail-1.md"
+printf '0\n' > "$rt5_run_dir/exit-code"
+printf '{}\n' > "$rt5_run_dir/summary.json"
+once
+
+rt5_posted=""
+for f in "$FORK_SANDBOX_MAIL_ROOT/threads/$rt5_tid"/*.msg; do
+    [[ -e "$f" ]] || continue
+    grep -qF 'Bumping the review target to v2.' "$f" && rt5_posted="$f"
+done
+if [[ -n "$rt5_posted" ]]; then
+    ok "review-target case B1: sets seat's advancing Version: reply was posted"
+    check "review-target case B1: X-Review-Target-Set names the wake's own branch/sha" \
+        "$rt5_branch $rt5_branch_sha" "$(header_of_file "$rt5_posted" X-Review-Target-Set)"
+    check "review-target case B1: X-Review-Target carries the same value as X-Review-Target-Set" \
+        "$rt5_branch $rt5_branch_sha" "$(header_of_file "$rt5_posted" X-Review-Target)"
+    check "review-target case B1: X-Version is the new version" "2" \
+        "$(header_of_file "$rt5_posted" X-Version)"
+else
+    no "review-target case B1: sets seat's advancing Version: reply was posted"
+fi
+rt5_state="$(cat "$PM_STATE_DIR/review-target/$rt5_tid.env" 2>/dev/null)"
+contains "review-target case B1: state file VERSION advanced to 2" "$rt5_state" "VERSION=2"
+contains "review-target case B1: state file BRANCH updated to the wake's branch" "$rt5_state" "BRANCH=$rt5_branch"
+contains "review-target case B1: state file SHA updated to the wake's resolved sha" "$rt5_state" "SHA=$rt5_branch_sha"
+
+# ---- review-target case B2: Version: 1 on a thread already at VERSION=1
+# does not advance -- flagged, not posted, state unchanged ----
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+
+rt6_seed_sha="$(printf 'c%.0s' {1..40})"
+printf '%s\n' 'kick off review' > "$work/body.tmp"
+rt6_mid="$("$MAIL" send --from '@carol' --to '@ken' --subject 'review target non-advance topic' \
+    --body "$work/body.tmp" --hops 8 --review-target "pm-review-target-test-seed6:$rt6_seed_sha" 2>/dev/null)"
+rt6_tid="$(thread_of "$rt6_mid")"
+rt6_short="${rt6_tid:0:8}"
+# See case B1's comment: the initial spawn is harvested inline with the
+# stub's own canned reply; clear it before writing Version: 1 below.
+once
+
+rt6_env="$(latest_env_for_agent ken)"
+rt6_run_dir="$(env_val "$rt6_env" RUN_DIR)"
+rt6_branch="$(env_val "$rt6_env" BRANCH)"
+git -C "$PROJECT_DIR" branch "$rt6_branch" >/dev/null 2>&1
+
+rm -f -- "$PM_STATE_DIR/harvested/$(basename "$rt6_env" .env)" \
+    "$rt6_run_dir/summary.json" "$rt6_run_dir/exit-code"
+mkdir -p -- "$rt6_run_dir/outbox"
+printf 'Version: 1\n\nThis should not advance anything.\n' > "$rt6_run_dir/outbox/mail-1.md"
+printf '0\n' > "$rt6_run_dir/exit-code"
+printf '{}\n' > "$rt6_run_dir/summary.json"
+once
+
+rt6_flag="$(cat "$PM_STATE_DIR/needs-operator/$rt6_tid" 2>/dev/null)"
+contains "review-target case B2: a non-advancing Version: is flagged ('does not advance')" \
+    "$rt6_flag" "does not advance"
+contains "review-target case B2: flag event uses the review-target keyword" \
+    "$(cat "$work/once.out")" "pm flag thread=$rt6_short reason=review-target"
+rt6_posted=0
+for f in "$FORK_SANDBOX_MAIL_ROOT/threads/$rt6_tid"/*.msg; do
+    [[ -e "$f" ]] || continue
+    grep -qF 'This should not advance anything.' "$f" && rt6_posted=1
+done
+check "review-target case B2: the non-advancing reply was never posted" 0 "$rt6_posted"
+rt6_state="$(cat "$PM_STATE_DIR/review-target/$rt6_tid.env" 2>/dev/null)"
+contains "review-target case B2: state file VERSION is unchanged" "$rt6_state" "VERSION=1"
+contains "review-target case B2: state file SHA is unchanged" "$rt6_state" "SHA=$rt6_seed_sha"
+
+# ---- review-target case B3: a Version: header from a seat that is NOT
+# review-target: sets (karen, a plain backend: k8s seat) is flagged on the
+# existing malformed-reply path, not the review-target one ----
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+
+rt7_mid="$(send_msg '@carol' '@karen' 'not a sets seat topic' 'hello karen' 8)"
+rt7_tid="$(thread_of "$rt7_mid")"
+rt7_short="${rt7_tid:0:8}"
+# See case B1's comment: the initial spawn is harvested inline with the
+# stub's own canned reply; clear it before writing Version: 3 below.
+once
+rt7_env="$(latest_env_for_agent karen)"
+rt7_run_dir="$(env_val "$rt7_env" RUN_DIR)"
+rm -f -- "$PM_STATE_DIR/harvested/$(basename "$rt7_env" .env)" \
+    "$rt7_run_dir/summary.json" "$rt7_run_dir/exit-code"
+mkdir -p -- "$rt7_run_dir/outbox"
+printf 'Version: 3\n\nI am not the sets seat.\n' > "$rt7_run_dir/outbox/mail-1.md"
+printf '0\n' > "$rt7_run_dir/exit-code"
+printf '{}\n' > "$rt7_run_dir/summary.json"
+once
+rt7_flag="$(cat "$PM_STATE_DIR/needs-operator/$rt7_tid" 2>/dev/null)"
+contains "review-target case B3: Version: from a non-sets seat is flagged malformed" \
+    "$rt7_flag" "Version: header from a seat without review-target: sets"
+contains "review-target case B3: flag event stays on the existing malformed-reply keyword" \
+    "$(cat "$work/once.out")" "pm flag thread=$rt7_short reason=malformed-reply"
+check "review-target case B3: no state file was created" 0 \
+    "$( [[ -e "$PM_STATE_DIR/review-target/$rt7_tid.env" ]] && echo 1 || echo 0 )"
+
+# ---- review-target case B4: a `follow` seat's (kai) harvested reply
+# stamps the target it was SPAWNED at, even after the state file moves
+# between his spawn and his own harvest -- the trickiest invariant (a
+# stale spawn-time value, never a fresh read of current state) ----
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+
+rt8_branch="pm-review-target-test-8"
+rt8_tree="$(git -C "$PROJECT_DIR" rev-parse 'HEAD^{tree}')"
+rt8_parent="$(git -C "$PROJECT_DIR" rev-parse HEAD)"
+rt8_sha="$(git -C "$PROJECT_DIR" -c user.email=test@example.com -c user.name=test \
+    commit-tree "$rt8_tree" -p "$rt8_parent" -m 'review target commit 8')"
+git -C "$PROJECT_DIR" update-ref "refs/heads/$rt8_branch" "$rt8_sha"
+
+printf '%s\n' 'kick off review, both reviewers' > "$work/body.tmp"
+rt8_mid="$("$MAIL" send --from '@carol' --to '@kai,@ken' --subject 'review target stale spawn topic' \
+    --body "$work/body.tmp" --hops 8 --review-target "$rt8_branch:$rt8_sha" 2>/dev/null)"
+rt8_tid="$(thread_of "$rt8_mid")"
+# See case B1's comment: the initial spawn harvests BOTH kai's and ken's
+# runs inline with the stub's own canned reply. Both are cleared below (kai's
+# left cleared, i.e. pending, until after the move; ken's immediately
+# rewritten) so this case can move the target via ken's harvest first, then
+# harvest kai's separately, further down.
+once
+
+rt8_kai_env="$(latest_env_for_agent kai)"
+rt8_kai_run_dir="$(env_val "$rt8_kai_env" RUN_DIR)"
+check "review-target case B4 setup: kai spawned at the review target sha" \
+    "$rt8_sha" "$(env_val "$rt8_kai_env" REVIEW_TARGET_SHA)"
+
+rt8_ken_env="$(latest_env_for_agent ken)"
+rt8_ken_run_dir="$(env_val "$rt8_ken_env" RUN_DIR)"
+rt8_ken_branch="$(env_val "$rt8_ken_env" BRANCH)"
+git -C "$PROJECT_DIR" branch "$rt8_ken_branch" >/dev/null 2>&1
+
+# Move the target out from under kai BEFORE his own reply is ever harvested:
+# ken's Version: 2 harvest goes first, in its own pass, while kai's run is
+# left live (summary.json/exit-code cleared, same as case B1) so this pass
+# cannot harvest kai too.
+rm -f -- "$PM_STATE_DIR/harvested/$(basename "$rt8_kai_env" .env)" \
+    "$rt8_kai_run_dir/summary.json" "$rt8_kai_run_dir/exit-code"
+rm -f -- "$PM_STATE_DIR/harvested/$(basename "$rt8_ken_env" .env)" \
+    "$rt8_ken_run_dir/summary.json" "$rt8_ken_run_dir/exit-code"
+mkdir -p -- "$rt8_ken_run_dir/outbox"
+printf 'Version: 2\n\nMoving the target.\n' > "$rt8_ken_run_dir/outbox/mail-1.md"
+printf '0\n' > "$rt8_ken_run_dir/exit-code"
+printf '{}\n' > "$rt8_ken_run_dir/summary.json"
+once
+rt8_state_after_move="$(cat "$PM_STATE_DIR/review-target/$rt8_tid.env" 2>/dev/null)"
+contains "review-target case B4 setup: the state file actually moved to VERSION=2" \
+    "$rt8_state_after_move" "VERSION=2"
+
+mkdir -p -- "$rt8_kai_run_dir/outbox"
+printf '\nAcknowledged, reviewing the target I was spawned at.\n' > "$rt8_kai_run_dir/outbox/mail-1.md"
+printf '0\n' > "$rt8_kai_run_dir/exit-code"
+printf '{}\n' > "$rt8_kai_run_dir/summary.json"
+once
+
+rt8_kai_posted=""
+for f in "$FORK_SANDBOX_MAIL_ROOT/threads/$rt8_tid"/*.msg; do
+    [[ -e "$f" ]] || continue
+    grep -qF 'Acknowledged, reviewing the target I was spawned at.' "$f" && rt8_kai_posted="$f"
+done
+if [[ -n "$rt8_kai_posted" ]]; then
+    ok "review-target case B4: kai's reply was posted"
+    check "review-target case B4: X-Review-Target stamps the target kai was SPAWNED at, not the now-current one" \
+        "$rt8_branch $rt8_sha" "$(header_of_file "$rt8_kai_posted" X-Review-Target)"
+    check "review-target case B4: X-Version is kai's spawn-time version, not the state file's current one" \
+        "1" "$(header_of_file "$rt8_kai_posted" X-Version)"
+else
+    no "review-target case B4: kai's reply was posted"
+fi
+
+# ---- review-target case B5: a Version: reply whose wake's own branch never
+# landed in the project repo (never created here, mirroring k8s case1c's
+# "deleted" branch fixture above) is flagged, not treated as advancing or
+# non-advancing ----
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+
+rt9_mid="$(send_msg '@carol' '@ken' 'branch never came back topic' 'hello ken' 8)"
+rt9_tid="$(thread_of "$rt9_mid")"
+# See case B1's comment: the initial spawn is harvested inline with the
+# stub's own canned reply; clear it before writing Version: 1 below.
+once
+rt9_env="$(latest_env_for_agent ken)"
+rt9_run_dir="$(env_val "$rt9_env" RUN_DIR)"
+rm -f -- "$PM_STATE_DIR/harvested/$(basename "$rt9_env" .env)" \
+    "$rt9_run_dir/summary.json" "$rt9_run_dir/exit-code"
+mkdir -p -- "$rt9_run_dir/outbox"
+printf 'Version: 1\n\nThe branch never landed.\n' > "$rt9_run_dir/outbox/mail-1.md"
+printf '0\n' > "$rt9_run_dir/exit-code"
+printf '{}\n' > "$rt9_run_dir/summary.json"
+once
+rt9_flag="$(cat "$PM_STATE_DIR/needs-operator/$rt9_tid" 2>/dev/null)"
+contains "review-target case B5: a Version: reply whose wake branch never landed is flagged ('did not come back')" \
+    "$rt9_flag" "did not come back"
+check "review-target case B5: no state file was written" 0 \
+    "$( [[ -e "$PM_STATE_DIR/review-target/$rt9_tid.env" ]] && echo 1 || echo 0 )"
 
 # ---- cluster mode: deliver --cluster ----
 
