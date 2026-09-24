@@ -5727,7 +5727,7 @@ EOF
     K8S_SUBMIT_BRANCH="$branch"
     trap '
         rm -f -- "${K8S_SUBMIT_CONTEXT_TAR:-}" "${K8S_SUBMIT_THREAD_TAR:-}" "${K8S_SUBMIT_ATTACH_TAR:-}" "${K8S_SUBMIT_SESSION_TAR:-}"
-        kubectl delete pod,service,secret,configmap,networkpolicy \
+        kubectl delete job,pod,service,secret,configmap,networkpolicy \
             -l fork-sandbox/branch="$K8S_SUBMIT_SAFE_NAME" --ignore-not-found >&2
         echo "fork-sandbox-k8s: submit failed -- removed this run'"'"'s cluster" >&2
         echo "objects, if any were created (branch $K8S_SUBMIT_BRANCH)." >&2
@@ -5764,13 +5764,9 @@ EOF
         trap '
             rm -f -- "${K8S_SUBMIT_CONTEXT_TAR:-}" "${K8S_SUBMIT_THREAD_TAR:-}" "${K8S_SUBMIT_ATTACH_TAR:-}" "${K8S_SUBMIT_SESSION_TAR:-}"
             kubectl delete secret "$K8S_SUBMIT_SAFE_NAME-claude-token" --ignore-not-found >&2
-            kubectl delete pod,service,secret,configmap,networkpolicy \
+            kubectl delete job,pod,service,secret,configmap,networkpolicy \
                 -l fork-sandbox/branch="$K8S_SUBMIT_SAFE_NAME" --ignore-not-found >&2
-            echo "fork-sandbox-k8s: submit failed -- removed this run'"'"'s per-run" >&2
-            echo "proxy Pod/Service and token Secret (branch $K8S_SUBMIT_BRANCH)." >&2
-            echo "fork-sandbox-k8s: if a Job for this branch was also created," >&2
-            echo "finish cleanup with:" >&2
-            echo "  fork-sandbox-k8s.sh rm --branch $K8S_SUBMIT_BRANCH" >&2
+            echo "fork-sandbox-k8s: submit failed -- removed this run'"'"'s cluster objects, if any were created (branch $K8S_SUBMIT_BRANCH)." >&2
         ' EXIT
         kubectl create secret generic "$safe_name-claude-token" \
             --from-literal="upstream-key.conf=set \$upstream_key \"$claude_access_token\";" \

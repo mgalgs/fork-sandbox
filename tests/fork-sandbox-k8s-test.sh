@@ -1348,13 +1348,71 @@ if (( pi_fail_rc != 0 )); then
 else
     no "a pi-harness run whose Job apply fails makes submit fail" "submit unexpectedly succeeded"
 fi
-if grep -qF "delete pod,service,secret,configmap,networkpolicy -l fork-sandbox/branch=$pi_fail_safe_name --ignore-not-found" "$pi_fail_log"; then
+if grep -qF "delete job,pod,service,secret,configmap,networkpolicy -l fork-sandbox/branch=$pi_fail_safe_name --ignore-not-found" "$pi_fail_log"; then
     ok "the failure trap deletes the grant (and every other cluster object) for a pi-harness run too"
 else
     no "the failure trap deletes the grant (and every other cluster object) for a pi-harness run too" \
         "not found in $pi_fail_log: $(cat "$pi_fail_log")"
 fi
 rm -f /tmp/fs-k8s-test-pi-grant-fail.out
+
+# The claude harness installs its own, richer failure trap. Once the Job
+# has been applied, a failure in a later step (here, the Job's pod Ready
+# wait) must remove the Job too -- and the trap's message must no longer
+# tell the operator to finish the cleanup by hand.
+printf '\n== submit: claude-harness failure after the Job apply also deletes the Job ==\n'
+claude_jobfail_home="$(newdir)"; tmpdirs+=("$claude_jobfail_home")
+mkdir -p "$claude_jobfail_home/.claude"
+claude_jobfail_future_ms=$(( ($(date +%s) + 7200) * 1000 ))
+cat > "$claude_jobfail_home/.claude/.credentials.json" <<JSON
+{"claudeAiOauth": {"accessToken": "fixture-jobfail-token", "refreshToken": "fixture-refresh-token", "refreshTokenExpiresAt": 123, "expiresAt": $claude_jobfail_future_ms, "scopes": ["user:inference"]}}
+JSON
+claude_jobfail_name_out="$(newdir)/claude-jobfail-name.yaml"; tmpdirs+=("$(dirname "$claude_jobfail_name_out")")
+HOME="$claude_jobfail_home" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-claude-jobfail --model claude-sonnet-5 --harness claude \
+    "$proj_dir" "$handoff_file" > "$claude_jobfail_name_out"
+claude_jobfail_safe_name="$(awk '/^kind: Job$/{job=1} job && /^  name:/{print $2; exit}' "$claude_jobfail_name_out")"
+claude_jobfail_stub_dir="$(newdir)"; tmpdirs+=("$claude_jobfail_stub_dir")
+claude_jobfail_log="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$claude_jobfail_log")")
+cat > "$claude_jobfail_stub_dir/kubectl" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$K8S_STUB_LOG"
+verb=""; for arg in "$@"; do case "$arg" in apply|wait|get|delete) verb="$arg" ;; esac; done
+case "$verb" in
+    apply) cat >/dev/null ;;
+    get) printf 'stub-pod\n' ;;
+    wait)
+        case "$*" in
+            *job-name=*) echo "kubectl: stub Ready wait failure" >&2; exit 1 ;;
+        esac
+        ;;
+esac
+STUB
+chmod +x "$claude_jobfail_stub_dir/kubectl"
+PATH="$claude_jobfail_stub_dir:$PATH" K8S_STUB_LOG="$claude_jobfail_log" HOME="$claude_jobfail_home" \
+    FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit \
+    --branch fs-k8s-test-claude-jobfail --model claude-sonnet-5 --harness claude \
+    "$proj_dir" "$handoff_file" >/tmp/fs-k8s-test-claude-jobfail.out 2>&1
+claude_jobfail_rc=$?
+if (( claude_jobfail_rc != 0 )) && grep -q 'job-name=' "$claude_jobfail_log"; then
+    ok "a claude-harness run whose Job pod never becomes Ready makes submit fail"
+else
+    no "a claude-harness run whose Job pod never becomes Ready makes submit fail" \
+        "rc=$claude_jobfail_rc log=$(cat "$claude_jobfail_log")"
+fi
+if grep -qF "delete job,pod,service,secret,configmap,networkpolicy -l fork-sandbox/branch=$claude_jobfail_safe_name --ignore-not-found" "$claude_jobfail_log"; then
+    ok "the claude failure trap deletes the run's Job along with its other cluster objects"
+else
+    no "the claude failure trap deletes the run's Job along with its other cluster objects" \
+        "not found in $claude_jobfail_log: $(cat "$claude_jobfail_log")"
+fi
+if grep -qF "if a Job for this branch was also created" /tmp/fs-k8s-test-claude-jobfail.out; then
+    no "the claude failure trap no longer tells the operator to remove the Job by hand" \
+        "$(cat /tmp/fs-k8s-test-claude-jobfail.out)"
+else
+    ok "the claude failure trap no longer tells the operator to remove the Job by hand"
+fi
+rm -f /tmp/fs-k8s-test-claude-jobfail.out
 
 # fs_emit_prompt_preamble (fork-sandbox-lib.sh), shared with fork-sandbox.sh's
 # local path: the rendered handoff.md must carry the clone-path and
