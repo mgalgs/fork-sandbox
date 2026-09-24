@@ -733,6 +733,34 @@ check "... that send ran: rc 0" "0" "$(rjson rc)"
 check "--review-target on reply is refused" "403" \
     "$(xr "$tok/targeter" --tool mail --stdin hi -- reply --from @targeter --reply-to "$seed" --body - --review-target "$rt_branch:$rt_sha")"
 
+printf '== 12. list --json --header for a read token ==\n'
+
+demo_tid="$(xr "$tok/ci-kickoff" --tool mail --stdin hi -- send --from @ci-kickoff --to @x --subject demo --body - --header "X-Demo-PR: 42" >/dev/null; rjson stdout | tr -d '\n')"
+check "list: a demo thread with X-Demo-PR: 42 exists" "1" "$([[ -n "$demo_tid" ]] && echo 1 || echo 0)"
+as_ reader mail --remote list --json --header 'X-Demo-PR: 42' > "$work/list.json" 2> "$work/list.err"
+check "list: a read token runs list --json --header via the shim: rc 0" "0" "$?"
+check "list: the shim returns exactly the filtered array" "$demo_tid" \
+    "$(python3 -c 'import json,sys; print(" ".join(t["thread"] for t in json.load(open(sys.argv[1]))))' "$work/list.json")"
+"$mail" list --json --header 'X-Demo-PR: 42' > "$work/list-local.json" 2>/dev/null
+check "list: byte-exact against the local run" "0" "$(cmp -s "$work/list-local.json" "$work/list.json"; echo $?)"
+
+check "list: a review-target header filter is allowed for a read token" "200" \
+    "$(xr "$tok/reader" --tool mail -- list --json --header "X-Review-Target-Set: $rt_branch $rt_sha")"
+check "list: ... and it ran: rc 0" "0" "$(rjson rc)"
+check "list: ... and it found the review thread" "$rt_tid" \
+    "$(rjson stdout | python3 -c 'import json,sys; print(" ".join(t["thread"] for t in json.load(sys.stdin)))')"
+check "list: an X-Review-Target filter is allowed too" "200" \
+    "$(xr "$tok/reader" --tool mail -- list --json --header "X-Review-Target: $rt_branch $rt_sha")"
+
+check "list: a token without read gets 403 on list --json" "403" "$(xr "$tok/bot" --tool mail -- list --json)"
+check "list: a token without read gets 403 on a filtered list" "403" \
+    "$(xr "$tok/bot" --tool mail -- list --json --header 'X-Demo-PR: 42')"
+check "list: an unknown flag is 403 at the allowlist" "403" "$(xr "$tok/reader" --tool mail -- list --bogus)"
+check "list: a positional is 400/403, never run" "1" \
+    "$([[ "$(xr "$tok/reader" --tool mail -- list extra)" =~ ^40[03]$ ]] && echo 1 || echo 0)"
+check "send --header X-Review-Target-Set is still refused" "403" \
+    "$(xr "$tok/ci-kickoff" --tool mail --stdin hi -- send --from @ci-kickoff --to @x --subject h --body - --header "X-Review-Target-Set: x y")"
+
 printf '== 13. the log ==\n'
 
 sleep 0.2

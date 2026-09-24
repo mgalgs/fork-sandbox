@@ -75,7 +75,8 @@ mail:
             target)
     reply   0; --from --reply-to --body --to --cc --subject --attach* --hops
             --header*; --from in the token's identities
-    show tree list export inbox: read (export needs --json; inbox takes --all)
+    show tree export inbox: read (export needs --json; inbox takes --all)
+    list    0; --json --header*; read
     seen    1+; the first positional in the identities, and cap seen
     grant   1; --allow-namespace* --reach-probe* --context-secret --clear
             --show --json;
@@ -83,7 +84,8 @@ mail:
 postmaster:
     status  0; --thread --json; read
     flag unflag: operator only
-(* = repeatable.) On mail send and mail reply, --header may not set
+(* = repeatable.) On mail send and mail reply (never on list, whose --header
+is a read-only filter), --header may not set
 X-Version or a name that starts with X-Review-Target (case-insensitively):
 those headers are the review-target contract, and only mail's own
 --review-target flag and the postmaster may write them -- this refusal
@@ -155,7 +157,7 @@ SPEC = {
             "--attach": MULTI, "--hops": VALUE, "--header": MULTI}),
         "show": (1, 1, {}),
         "tree": (1, 1, {}),
-        "list": (0, 0, {}),
+        "list": (0, 0, {"--json": BOOL, "--header": MULTI}),
         "inbox": (1, 1, {"--all": BOOL}),
         "export": (1, 1, {"--json": BOOL}),
         "seen": (1, None, {}),
