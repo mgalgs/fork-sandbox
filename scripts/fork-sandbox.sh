@@ -6938,6 +6938,7 @@ started_at="$(date +%s)"
     printf 'return_base_sha=%s\n' "$return_base_sha"
     printf 'upstream=%s\n' "$upstream"
     printf 'upstream_reason=%s\n' "$upstream_reason"
+    printf 'agent_kit=%s\n' "${agent_kit_names[*]}"
     printf 'checkout=%s\n' "$checkout_ref"
     printf 'harness=%s\n' "$harness"
     printf 'harness_version=%s\n' "$harness_version"
@@ -7034,6 +7035,7 @@ started_at="$(date +%s)"
     printf 'return_base_sha=%q\n' "$return_base_sha"
     printf 'upstream=%q\n' "$upstream"
     printf 'upstream_reason=%q\n' "$upstream_reason"
+    printf 'agent_kit=%q\n' "${agent_kit_names[*]}"
     printf 'handoff=%q\n' "$handoff_copy"
     printf 'formatter=%q\n' "$run_formatter"
     printf 'harness=%q\n' "$harness"
@@ -9624,6 +9626,7 @@ jq -n \
     --arg claude_credentials_source "$claude_credentials_source" \
     --arg claude_credentials_via "$claude_credentials_via" \
     --arg end_reason "${end_reason:-}" \
+    --arg agent_kit "$agent_kit" \
     '{
         version: $version,
         mode: $mode,
@@ -9636,6 +9639,7 @@ jq -n \
         clone_dir: $clone_dir,
         run_dir: $run_dir,
         base_sha: $base_sha,
+        agent_kit: ($agent_kit | split(" ") | map(select(. != ""))),
         exit_code: $exit_code,
         harness_error: (if $harness_error == "" then null else $harness_error end),
         commits: $commits,

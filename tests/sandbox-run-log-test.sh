@@ -245,6 +245,47 @@ out="$(query show "$(basename "$rd_env")")"
 contains "run.env fallback still carries network" '"network": "sealed"' "$out"
 contains "run.env fallback marks summary_missing" '"summary_missing": true' "$out"
 
+printf '\n== record: agent_kit is lifted from summary.json ==\n'
+rd_kit="$(mk_run_dir kit)"
+tmpdirs+=("$rd_kit")
+cat > "$rd_kit/summary.json" <<'EOF'
+{"harness":"claude","network":"pinned","model":null,"branch":"fixture-branch","origin_repo":"/var/tmp/claude-scratch/forks/fixture-origin","base_sha":"0123456789abcdef0123456789abcdef01234567","agent_kit":["kit-alpha","kit-beta"],"exit_code":0,"commits":0,"cost_usd":0.0,"usage":{"input_tokens":10,"output_tokens":1},"duration_seconds":0}
+EOF
+printf '0\n' > "$rd_kit/exit-code"
+record "$rd_kit" >/dev/null 2>"$tmp/err"
+check "a run's agent_kit is recorded as a list" '["kit-alpha","kit-beta"]' \
+    "$(query show "$(basename "$rd_kit")" | jq -c '.agent_kit')"
+
+rd_nokit="$(mk_run_dir nokit)"
+tmpdirs+=("$rd_nokit")
+sed 's/"agent_kit":\["kit-alpha","kit-beta"\]/"agent_kit":[]/' "$rd_kit/summary.json" > "$rd_nokit/summary.json"
+printf '0\n' > "$rd_nokit/exit-code"
+record "$rd_nokit" >/dev/null 2>"$tmp/err"
+check "an empty agent_kit is recorded as an empty list" '[]' \
+    "$(query show "$(basename "$rd_nokit")" | jq -c '.agent_kit')"
+
+out="$(query stats --by agent_kit 2>/dev/null)"
+contains "stats --by agent_kit groups on the joined names" "kit-alpha kit-beta" "$out"
+case "$out" in
+    *"["*) no "stats --by agent_kit does not print a list repr" "$out" ;;
+    *) ok "stats --by agent_kit does not print a list repr" ;;
+esac
+
+rd_kit_env="$(mk_run_dir kitenv)"
+tmpdirs+=("$rd_kit_env")
+cat > "$rd_kit_env/run.env" <<'EOF'
+harness=claude
+network=pinned
+branch=fixture-branch
+origin_repo=/var/tmp/claude-scratch/forks/fixture-origin
+base_sha=0123456789abcdef0123456789abcdef01234567
+agent_kit=kit-alpha kit-beta
+EOF
+printf '0\n' > "$rd_kit_env/exit-code"
+record "$rd_kit_env" >/dev/null 2>"$tmp/err"
+check "the run.env fallback carries agent_kit as a list" '["kit-alpha","kit-beta"]' \
+    "$(query show "$(basename "$rd_kit_env")" | jq -c '.agent_kit')"
+
 printf '\n== read-time normalization of a historical pi-local row ==\n'
 before_bytes="$(cat "$log_file")"
 # A row shaped exactly like a run recorded before this round: harness is

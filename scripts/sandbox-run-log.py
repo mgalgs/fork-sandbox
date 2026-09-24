@@ -60,6 +60,12 @@ Network (isolation):
   network` answers the isolation question, and `stats --by harness` stops
   splitting one binary across two names.
 
+Agent kit (agent_kit):
+  The extra skills the run was launched with (kit.env and --kit-skill), as a
+  list of names; an empty list on a run with none. `stats --by agent_kit`
+  groups on the names joined by spaces, so runs with the same kit share a
+  row and a run with none reads "-".
+
 Claude credential attribution (claude_credentials_source, claude_credentials_via):
   Present on a --harness claude run's record whenever the launcher resolved
   a credential override (absent on a default-Keychain/default-file run's
@@ -260,6 +266,7 @@ SUMMARY_FIELDS = [
     "branch",
     "origin_repo",
     "base_sha",
+    "agent_kit",
     "exit_code",
     "harness_error",
     "commits",
@@ -675,6 +682,8 @@ def cmd_record(args):
                   "claude_credentials_via"):
             if env.get(k):
                 rec[k] = env[k]
+        if env.get("agent_kit"):
+            rec["agent_kit"] = env["agent_kit"].split()
         try:
             with open(os.path.join(rd, "exit-code"), encoding="utf-8") as f:
                 rec["exit_code"] = int(f.read().strip())
@@ -962,6 +971,15 @@ def cmd_show(args):
     print(json.dumps(runs[args.run_id], indent=2))
 
 
+def dim_text(v):
+    """A stats grouping value as text: a list (agent_kit) is its members
+    joined by spaces, so runs with the same set share a group; an empty
+    list and a missing value both read as "-"."""
+    if isinstance(v, list):
+        v = " ".join(str(x) for x in v) or None
+    return str(v) if v is not None else "-"
+
+
 def cmd_stats(args):
     rows = apply_filters(merged_runs(read_log()), args)
     if not rows:
@@ -970,8 +988,7 @@ def cmd_stats(args):
     dims = [d.strip() for d in args.by.split(",") if d.strip()]
     groups = {}
     for r in rows:
-        key = tuple(str(get_path(r, d) if get_path(r, d) is not None else "-")
-                    for d in dims)
+        key = tuple(dim_text(get_path(r, d)) for d in dims)
         groups.setdefault(key, []).append(r)
 
     hdr = tuple(d.upper() for d in dims) + (

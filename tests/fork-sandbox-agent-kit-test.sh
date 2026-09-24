@@ -323,6 +323,8 @@ fi
 exit 0
 STUB
 chmod +x "$img_stub"/*
+# The runner finds the ledger writer on PATH; use this checkout's, not an installed one.
+ln -s "$repo_dir/scripts/sandbox-run-log.py" "$img_stub/sandbox-run-log.py"
 install -m 600 /dev/null "$cfg/pi.env"
 printf 'OPENROUTER_API_KEY=fake\n' > "$cfg/pi.env"
 mkdir -p "$cfg/presets"
@@ -446,6 +448,43 @@ else
     no "a composed preset with a pi review seat launches"
 fi
 rm -f "$cfg/kit.env"
+
+# --- recording --------------------------------------------------------------
+printf '\n== recording: run.env, summary.json, ledger ==\n'
+check() {
+    local label="$1" expected="$2" actual="$3"
+    if [[ "$expected" == "$actual" ]]; then
+        ok "$label"
+    else
+        no "$label" "expected '$expected', got '$actual'"
+    fi
+}
+
+set_kit 'kit-alpha'
+if launch_real --harness claude --kit-skill kit-beta; then
+    check "run.env carries the kit names" "agent_kit=kit-alpha kit-beta" \
+        "$(grep '^agent_kit=' "$RD/run.env")"
+    check "the runner carries the kit names, %q-quoted" 'agent_kit=kit-alpha\ kit-beta' \
+        "$(grep '^agent_kit=' "$RD/run.sh")"
+    check "summary.json carries agent_kit as a list" '["kit-alpha","kit-beta"]' \
+        "$(jq -c '.agent_kit' "$RD/summary.json" 2>&1)"
+    check "the ledger row carries agent_kit" '["kit-alpha","kit-beta"]' \
+        "$(tail -1 "$home/.claude/sandbox-runs.jsonl" 2>/dev/null | jq -c '.agent_kit' 2>&1)"
+else
+    no "a run with a kit launches for the recording checks"
+fi
+
+rm -f "$cfg/kit.env"
+if launch_real --harness claude; then
+    check "run.env has an empty agent_kit for a run with no kit" "agent_kit=" \
+        "$(grep '^agent_kit' "$RD/run.env")"
+    check "summary.json has agent_kit [] for a run with no kit" '[]' \
+        "$(jq -c '.agent_kit' "$RD/summary.json" 2>&1)"
+    check "the ledger row has agent_kit [] for a run with no kit" '[]' \
+        "$(tail -1 "$home/.claude/sandbox-runs.jsonl" 2>/dev/null | jq -c '.agent_kit' 2>&1)"
+else
+    no "a run with no kit launches for the recording checks"
+fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))
