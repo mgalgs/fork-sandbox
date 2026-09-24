@@ -5,9 +5,9 @@
 # substitutes these placeholder tokens from K8S_NAMESPACE and the
 # K8S_POSTMASTER_* keys in k8s.env (K8S_POSTMASTER_IMAGE,
 # K8S_POSTMASTER_ACCESS_MODE, K8S_POSTMASTER_STORAGE,
-# K8S_POSTMASTER_STORAGE_CLASS, and a sha256 install computes over the
-# rendered ConfigMaps), one token per line below
-# with nothing else on the line, so a long substituted value (an image
+# K8S_POSTMASTER_STORAGE_CLASS, K8S_POSTMASTER_OPERATORS, and a sha256
+# install computes over the rendered ConfigMaps and Secrets), one token per
+# line below with nothing else on the line, so a long substituted value (an image
 # ref, a checksum) cannot push a line past yamllint's line-length rule:
 #   __NAMESPACE__
 #   __PM_IMAGE__
@@ -15,9 +15,11 @@
 #   __PM_STORAGE__
 #   __PM_STORAGE_CLASS__
 #   __PM_CONFIG_CHECKSUM__
+#   __PM_OPERATORS__
 # This file is skipped by plain `install` (the same way
 # 31-claude-proxy.yaml is) since those placeholders have no value to take
-# without --postmaster.
+# without --postmaster. The mail-api container, its tokens volume and its
+# Service are stripped when K8S_MAIL_API_TOKENS_FILE is unset.
 #
 # The trick that keeps this small: the PVC below is mounted at the exact
 # paths a laptop postmaster uses (/var/tmp/claude-scratch, $HOME/src,
@@ -122,14 +124,20 @@ spec:
       labels:
         app: fork-sandbox-postmaster
       annotations:
-        # A hash of the rendered config ConfigMaps, filled in by `install
-        # --postmaster` at render time. Annotating the POD TEMPLATE (not
-        # the Deployment's own metadata) is what makes a config-only change
+        # A hash of the rendered config ConfigMaps and the git and mail-API
+        # Secrets, filled in by `install --postmaster` at render time.
+        # Annotating the POD TEMPLATE (not the Deployment's own metadata)
+        # is what makes a config-only change
         # roll the pod -- see 30-proxy.yaml's checksum/nginx-conf annotation
         # for the same reasoning, measured against a live cluster there.
         checksum/pm-config: "__PM_CONFIG_CHECKSUM__"
     spec:
       serviceAccountName: fork-sandbox-postmaster
+      # Off on purpose: the service-account token can read every Secret in
+      # this namespace, and the mail-api container is the network-facing
+      # one, so only the postmaster container mounts it (the sa-token
+      # volume below). The API container must never get the token.
+      automountServiceAccountToken: false
       terminationGracePeriodSeconds: 60
       securityContext:
         runAsNonRoot: true
@@ -172,6 +180,8 @@ spec:
           env:
             - name: HOME
               value: /home/fs
+            - name: FORK_SANDBOX_OPERATORS
+              value: "__PM_OPERATORS__"
             # >>> personas env
             - name: FORK_SANDBOX_PERSONAS_DIR
               value: /etc/fork-sandbox/personas
@@ -225,6 +235,9 @@ spec:
             - name: git
               mountPath: /etc/fork-sandbox/git
               readOnly: true
+            - name: sa-token
+              mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+              readOnly: true
             # >>> personas volumeMount
             - name: personas
               mountPath: /etc/fork-sandbox/personas
@@ -245,6 +258,54 @@ spec:
               mountPath: /etc/fork-sandbox/presets
               readOnly: true
               # <<< presets volumeMount
+        # >>> mail-api container
+        - name: mail-api
+          image: __PM_IMAGE__
+          imagePullPolicy: IfNotPresent
+          command:
+            - fork-sandbox-mail-api.py
+            - serve
+            - --tokens
+            - /etc/fork-sandbox/mail-api/tokens
+            - --listen
+            - 0.0.0.0:8080
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: HOME
+              value: /home/fs
+            - name: FORK_SANDBOX_OPERATORS
+              value: "__PM_OPERATORS__"
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          volumeMounts:
+            - name: home
+              mountPath: /home/fs
+            - name: tmp
+              mountPath: /tmp
+            - name: data
+              mountPath: /var/tmp/claude-scratch
+              subPath: scratch
+            - name: mail-api-tokens
+              mountPath: /etc/fork-sandbox/mail-api
+              readOnly: true
+              # <<< mail-api container
       volumes:
         - name: data
           persistentVolumeClaim:
@@ -260,6 +321,30 @@ spec:
           secret:
             secretName: fork-sandbox-postmaster-git
             defaultMode: 0440
+        # The same volume Kubernetes automounts by default, so pod-init's
+        # default service-account directory keeps working unchanged.
+        - name: sa-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  expirationSeconds: 3607
+              - configMap:
+                  name: kube-root-ca.crt
+                  items:
+                    - key: ca.crt
+                      path: ca.crt
+              - downwardAPI:
+                  items:
+                    - path: namespace
+                      fieldRef:
+                        fieldPath: metadata.namespace
+        # >>> mail-api volume
+        - name: mail-api-tokens
+          secret:
+            secretName: fork-sandbox-mail-api-tokens
+            defaultMode: 0440
+            # <<< mail-api volume
         # >>> personas volume
         - name: personas
           configMap:
@@ -281,3 +366,19 @@ spec:
           configMap:
             name: fork-sandbox-postmaster-presets
             # <<< presets volume
+# >>> mail-api service
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fork-sandbox-mail-api
+  namespace: __NAMESPACE__
+spec:
+  type: ClusterIP
+  selector:
+    app: fork-sandbox-postmaster
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      # <<< mail-api service
