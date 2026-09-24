@@ -1525,6 +1525,99 @@ else
         "rc=$rc_noname: $out_noname"
 fi
 
+printf '\n== fetch-back sets the branch'"'"'s upstream: caller-side glue ==\n'
+
+# fs_resolve_upstream/fs_apply_upstream themselves are exercised directly,
+# unit-style, by tests/fork-sandbox-upstream-test.sh. Nothing until now ran
+# the caller side in scripts/fork-sandbox.sh that resolves at launch and
+# applies after fetch-back, through a real launcher run whose branch
+# actually survives to be checked -- so this reuses the same
+# commit-producing stub idiom the authorship section above introduced (a
+# 0-commit run has its branch removed before an upstream would ever apply).
+upstream_commit_stub="$(mktemp -d /var/tmp/claude-scratch/fs-upstream-commit.XXXXXX)"
+tmpdirs+=("$upstream_commit_stub")
+cat > "$upstream_commit_stub/claude-sandboxed" <<'STUB'
+#!/usr/bin/env bash
+set -uo pipefail
+prev="" clone_dir=""
+for a in "$@"; do
+    [[ "$a" == "--dangerously-skip-permissions" ]] && clone_dir="$prev"
+    prev="$a"
+done
+cat >/dev/null
+git -c user.email=t@fork-sandbox.invalid -c user.name=Tester \
+    -C "$clone_dir" commit --allow-empty -q -m "upstream test commit"
+printf '{"type":"result","subtype":"success","total_cost_usd":0.01,"usage":{"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}\n'
+exit 0
+STUB
+chmod +x "$upstream_commit_stub/claude-sandboxed"
+
+# A bare "remote" whose only branch is dev, so a clone of it checks out dev
+# tracking origin/dev automatically (git clone's own default), with no
+# --checkout on the launcher's own command line -- rule 3: HEAD's own
+# upstream, inherited as-is.
+upstream_seed="$(mktemp -d /var/tmp/claude-scratch/fs-upstream-seed.XXXXXX)"
+tmpdirs+=("$upstream_seed")
+(
+    cd "$upstream_seed" \
+        && git init -q -b dev . \
+        && git config user.email t@fork-sandbox.invalid \
+        && git config user.name Tester \
+        && printf 'hello\n' > file.txt \
+        && git add file.txt \
+        && git commit -q -m init
+) >/dev/null 2>&1
+upstream_remote="$(mktemp -d /var/tmp/claude-scratch/fs-upstream-remote.XXXXXX)"
+tmpdirs+=("$upstream_remote")
+(cd "$upstream_seed" && git clone -q --bare . "$upstream_remote") >/dev/null 2>&1
+upstream_proj="$(mktemp -d "$launcher_home/src/fs-upstream-test.XXXXXX")"
+tmpdirs+=("$upstream_proj")
+(cd "$upstream_remote" && git clone -q . "$upstream_proj") >/dev/null 2>&1
+
+out_upstream="$(HOME="$launcher_home" PATH="$upstream_commit_stub:$real_stub:$PATH" \
+    FORK_SANDBOX_CONFIG_DIR="$real_cfg" FORK_SANDBOX_BACKEND=fake-image \
+    timeout 60 "$launcher" --foreground --harness claude \
+    --branch "sandbox-test-upstream-dev-$$" \
+    "$upstream_proj" "$handoff" 2>&1)"
+rc_upstream=$?
+rd_upstream="$(printf '%s\n' "$out_upstream" | sed -n 's/^  run dir:  *//p' | head -1)"
+if (( rc_upstream == 0 )) && [[ -n "$rd_upstream" ]]; then
+    tmpdirs+=("$rd_upstream")
+    contains "worktree tracking origin/dev: summary.txt reports the upstream set" \
+        "fork-sandbox: upstream of sandbox-test-upstream-dev-$$ set to origin/dev" \
+        "$(cat "$rd_upstream/summary.txt")"
+    check "worktree tracking origin/dev: the fetched branch itself tracks origin/dev" \
+        "origin/dev" \
+        "$(cd "$upstream_proj" && git rev-parse --abbrev-ref "sandbox-test-upstream-dev-$$@{upstream}" 2>/dev/null)"
+else
+    no "worktree tracking origin/dev: summary.txt reports the upstream set" \
+        "rc=$rc_upstream: $out_upstream"
+    no "worktree tracking origin/dev: the fetched branch itself tracks origin/dev" \
+        "rc=$rc_upstream: $out_upstream"
+fi
+
+# proj has no remote at all (new_project's own fixture): rule 5 -- origin
+# has no default branch either -- so resolution finds nothing to inherit,
+# and the summary carries the plain not-set note rather than any upstream
+# line. The run's own exit status is unaffected either way.
+out_noremote="$(HOME="$launcher_home" PATH="$upstream_commit_stub:$real_stub:$PATH" \
+    FORK_SANDBOX_CONFIG_DIR="$real_cfg" FORK_SANDBOX_BACKEND=fake-image \
+    timeout 60 "$launcher" --foreground --harness claude \
+    --branch "sandbox-test-upstream-noremote-$$" \
+    "$proj" "$handoff" 2>&1)"
+rc_noremote=$?
+rd_noremote="$(printf '%s\n' "$out_noremote" | sed -n 's/^  run dir:  *//p' | head -1)"
+if [[ -n "$rd_noremote" ]]; then
+    tmpdirs+=("$rd_noremote")
+    check "no-remote origin: run's exit status is unaffected" "0" "$rc_noremote"
+    contains "no-remote origin: summary.txt notes the upstream was not set" \
+        "fork-sandbox: upstream not set on sandbox-test-upstream-noremote-$$" \
+        "$(cat "$rd_noremote/summary.txt")"
+else
+    no "no-remote origin: run's exit status is unaffected" "rc=$rc_noremote: $out_noremote"
+    no "no-remote origin: summary.txt notes the upstream was not set" "no run dir"
+fi
+
 printf '\n== fixture runs leave no handoff archives in the operator home ==\n'
 # Own-run-ids shape, not a before/after snapshot diff: a snapshot diff would
 # also catch a concurrent real run or another suite's fixtures archiving

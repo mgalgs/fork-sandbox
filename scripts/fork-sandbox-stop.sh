@@ -173,6 +173,11 @@ return_base_sha="$(fs_read_env_value "$run_env" return_base_sha || true)"
 # miscount this field exists to fix (identical to base_sha on every run
 # except --review-only with a review-base older than the checkout).
 [[ -n "$return_base_sha" ]] || return_base_sha="$base_sha"
+# A run.env written before this field existed has none -- fs_apply_upstream
+# treats an empty upstream/reason the same as "no upstream resolved" and
+# just says so, same as any other run this happens on.
+upstream="$(fs_read_env_value "$run_env" upstream || true)"
+upstream_reason="$(fs_read_env_value "$run_env" upstream_reason || true)"
 session="$(fs_read_env_value "$run_env" session || true)"
 [[ -n "$branch" && -n "$origin_repo" && -n "$clone_dir" && -n "$base_sha" ]] \
     || die "'$run_dir' has an incomplete run.env (missing branch/origin_repo/clone_dir/base_sha)"
@@ -241,7 +246,7 @@ fi
 # inside the clone. Every git command below runs in the origin repo.
 complete_run_host_side() {
     local reason="$1" kill_tmux="$2"
-    local fetched=0 n_commits=0 removed=0 fetch_failed=0
+    local fetched=0 n_commits=0 removed=0 fetch_failed=0 upstream_line=""
 
     if [[ "$kill_tmux" == 1 ]]; then
         if [[ -n "$session" ]]; then
@@ -288,6 +293,7 @@ complete_run_host_side() {
         reconcile_branch_after_fetch
         n_commits="$reconcile_n_commits"
         removed="$reconcile_removed"
+        upstream_line="$(fs_apply_upstream "$origin_repo" "$branch" "$upstream" "$upstream_reason")"
     fi
 
     if [[ -L "$exit_code_file" ]]; then
@@ -318,6 +324,7 @@ complete_run_host_side() {
     printf 'end_reason: %s; branch %s, %s new commit(s)%s.\n' \
         "$reason" "$branch" "$n_commits" \
         "$( (( removed )) && printf ', branch removed (no new commits)' || true )"
+    [[ -n "$upstream_line" ]] && printf '%s\n' "$upstream_line"
     return 0
 }
 

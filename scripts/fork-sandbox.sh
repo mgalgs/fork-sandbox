@@ -3619,6 +3619,8 @@ fi
 checkout_sha=""
 base_sha=""
 return_base_sha=""
+upstream=""
+upstream_reason=""
 if [[ "$review_only" == true ]]; then
     if [[ ! -d "$project_path" ]]; then
         echo "Error: project path '$project_path' is not a directory" >&2
@@ -3630,6 +3632,13 @@ if [[ "$review_only" == true ]]; then
         exit 1
     fi
     return_base_sha="$checkout_sha"
+    # Resolved here, once, in the same repo --checkout was resolved in: a
+    # review-only run makes no commits of its own, but the branch it fetches
+    # back still deserves an upstream, same as any other run.
+    upstream_errf="$(mktemp)"
+    upstream="$(fs_resolve_upstream "$review_only_origin_repo" "$checkout_ref" 2>"$upstream_errf")"
+    upstream_reason="$(cat "$upstream_errf")"
+    rm -f "$upstream_errf"
     if [[ -n "$review_base_ref" ]]; then
         if ! base_sha="$(cd "$review_only_origin_repo" && git rev-parse --verify --quiet "$review_base_ref^{commit}")"; then
             echo "Error: --review-base '$review_base_ref' does not name a commit in $review_only_origin_repo." >&2
@@ -4745,6 +4754,17 @@ elif ! base_sha="$(cd "$origin_repo" && git rev-parse HEAD 2>/dev/null)"; then
 else
     checkout_sha="$base_sha"
     return_base_sha="$base_sha"
+fi
+
+# Resolved once, here, in the origin repo -- not in the clone, and not later
+# when the branch comes back, since HEAD can move while the run is in
+# flight. --review-only resolved its own above, in review_only_origin_repo;
+# skip so this does not clobber it.
+if [[ "$review_only" != true ]]; then
+    upstream_errf="$(mktemp)"
+    upstream="$(fs_resolve_upstream "$origin_repo" "$checkout_ref" 2>"$upstream_errf")"
+    upstream_reason="$(cat "$upstream_errf")"
+    rm -f "$upstream_errf"
 fi
 
 fs_warn_if_dirty "$project_path" "$origin_repo"
@@ -6791,6 +6811,8 @@ started_at="$(date +%s)"
     printf 'branch=%s\n' "$branch"
     printf 'base_sha=%s\n' "$base_sha"
     printf 'return_base_sha=%s\n' "$return_base_sha"
+    printf 'upstream=%s\n' "$upstream"
+    printf 'upstream_reason=%s\n' "$upstream_reason"
     printf 'checkout=%s\n' "$checkout_ref"
     printf 'harness=%s\n' "$harness"
     printf 'harness_version=%s\n' "$harness_version"
@@ -6885,6 +6907,8 @@ started_at="$(date +%s)"
     printf 'branch=%q\n' "$branch"
     printf 'base_sha=%q\n' "$base_sha"
     printf 'return_base_sha=%q\n' "$return_base_sha"
+    printf 'upstream=%q\n' "$upstream"
+    printf 'upstream_reason=%q\n' "$upstream_reason"
     printf 'handoff=%q\n' "$handoff_copy"
     printf 'formatter=%q\n' "$run_formatter"
     printf 'harness=%q\n' "$harness"
@@ -9005,6 +9029,14 @@ if (( fetched )); then
     fi
 fi
 
+# The upstream is a convenience for `git status`/`git branch -vv`, applied
+# only after a fetch actually landed the branch -- fs_apply_upstream's own
+# check covers the 0-commit path above deleting it again.
+upstream_line=""
+if (( fetched )); then
+    upstream_line="$(fs_apply_upstream "$origin_repo" "$branch" "$upstream" "$upstream_reason")"
+fi
+
 # Now that the origin repo holds the objects, each loop iteration's
 # commits_added can be counted. It could not be taken while the loop ran:
 # counting needs the commits locally, and nothing may run git in the clone to
@@ -9333,6 +9365,7 @@ loop_findings() {
     else
         printf 'fetched:   yes. Branch %s is now in %s\n' "$branch" "$origin_repo"
     fi
+    [[ -n "$upstream_line" ]] && printf '%s\n' "$upstream_line"
     if (( fetched )) && [[ "$n_commits" != "0" ]]; then
         # The commits are untrusted, and git passes a subject through
         # verbatim when stdout is not a tty. Strip control characters so an
