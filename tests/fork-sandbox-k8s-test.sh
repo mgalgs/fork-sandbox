@@ -14140,6 +14140,20 @@ pm_api_refused "claude-seat gate: without the credential key, the same fleet is 
     FORK_SANDBOX_FLEET_FILE="$pm_claude_gate_dir/fleet.yaml" \
     FORK_SANDBOX_PERSONAS_DIR="$pm_claude_gate_dir/personas"
 
+# A real (non-dry-run) install with the key set: the apply path returns
+# from cmd_install, so the claude.env temp file's EXIT trap fires after
+# cmd_install's locals are gone. It must still exit 0 and remove the file.
+pm_claude_real_wd="$(newdir)"; tmpdirs+=("$pm_claude_real_wd")
+mkdir -p "$pm_claude_real_wd/tmp"
+env PATH="$pm_stub_bin:$PATH" K8S_STUB_LOG="$pm_claude_real_wd/kubectl.log" \
+    TMPDIR="$pm_claude_real_wd/tmp" FORK_SANDBOX_CONFIG_DIR="$pm_cfg_claude" \
+    "$k8s_sh" install --postmaster >/dev/null 2>"$pm_claude_real_wd/err"
+check "claude credentials: a real install exits 0" "0" "$?"
+check "claude credentials: a real install hits no unbound variable" "0" \
+    "$(grep -c 'unbound variable' "$pm_claude_real_wd/err")"
+check "claude credentials: a real install leaves no claude.env temp file" "" \
+    "$(grep -rl 'CLAUDE_CREDENTIALS=' "$pm_claude_real_wd/tmp" 2>/dev/null)"
+
 printf '\n== client Role vs postmaster Role: same rules ==\n'
 rbac_yaml="$repo_dir/manifests/k8s/10-rbac.yaml"
 pm_yaml="$repo_dir/manifests/k8s/40-postmaster.yaml"

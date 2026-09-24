@@ -251,7 +251,11 @@ To make the credential file:
 claude setup-token
 jq -n --arg t "$TOKEN" --argjson e "<expiry in epoch ms>" \
     '{claudeAiOauth: {accessToken: $t, expiresAt: $e}}' > claude-cluster.json
+chmod 600 claude-cluster.json
 ```
+
+The file must be owned by you and mode 0600 or stricter; install refuses
+it otherwise.
 
 Compute the expiry as `$(( $(date -d '+1 year' +%s) * 1000 ))` on Linux or
 `$(( $(date -v+1y +%s) * 1000 ))` on macOS, and use the expiry

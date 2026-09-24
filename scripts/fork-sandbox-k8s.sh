@@ -2962,7 +2962,6 @@ cmd_install() {
     # apply, so the 900 KiB total-size guard and the subdirectory refusal
     # both fail loudly before a single kubectl call.
     local -a pm_config_paths=() pm_config_args=()
-    local pm_claude_env=""
     local -a pm_personas_args=() pm_prompts_args=() pm_handlers_args=() pm_hooks_args=() pm_presets_args=()
     local -a pm_personas_paths=() pm_prompts_paths=() pm_handlers_paths=() pm_hooks_paths=() pm_presets_paths=()
     local pm_have_personas=false pm_have_prompts=false pm_have_handlers=false pm_have_hooks=false pm_have_presets=false
@@ -2977,12 +2976,15 @@ cmd_install() {
         # shipped -- it names laptop paths. This one line is the pod's
         # own, pointing at the mount the claude Secret (below) lands on.
         if [[ -n "$K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE" ]]; then
-            pm_claude_env="$(mktemp)"
-            trap 'rm -f -- "$pm_claude_env"' EXIT
+            # A global, not a local, and :- in the trap: the apply path
+            # returns from cmd_install, so a local is out of scope when the
+            # EXIT trap fires, and set -u aborts the trap with exit 1.
+            K8S_INSTALL_CLAUDE_ENV="$(mktemp)"
+            trap 'rm -f -- "${K8S_INSTALL_CLAUDE_ENV:-}"' EXIT
             printf 'CLAUDE_CREDENTIALS=/etc/fork-sandbox/claude/credentials.json\n' \
-                > "$pm_claude_env"
-            pm_config_args+=(--from-file="claude.env=$pm_claude_env")
-            pm_config_paths+=("$pm_claude_env")
+                > "$K8S_INSTALL_CLAUDE_ENV"
+            pm_config_args+=(--from-file="claude.env=$K8S_INSTALL_CLAUDE_ENV")
+            pm_config_paths+=("$K8S_INSTALL_CLAUDE_ENV")
         fi
 
         if [[ -d "$pm_personas_dir" ]]; then
