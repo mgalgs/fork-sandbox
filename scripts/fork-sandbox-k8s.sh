@@ -2850,13 +2850,20 @@ cmd_install() {
         # personas dir this install will ship (resolved above), and the
         # handlers/presets dirs pinned to $config_dir rather than whatever
         # FORK_SANDBOX_*_DIR the caller's shell exports otherwise: it must
-        # see what the pod will see.
+        # see what the pod will see. FORK_SANDBOX_CLUSTER_CLAUDE mirrors the
+        # env var the manifest sets on the postmaster container (below) when
+        # a claude credential is being shipped, so this gate and the pod's
+        # own `deliver --cluster` startup check agree on whether claude
+        # seats are accepted.
         local -a pm_fleet_env=(
             FORK_SANDBOX_FLEET_FILE="$pm_fleet_file"
             FORK_SANDBOX_PERSONAS_DIR="$pm_personas_dir"
             FORK_SANDBOX_HANDLERS_DIR="$config_dir/handlers"
             FORK_SANDBOX_PRESETS_DIR="$config_dir/presets"
         )
+        if [[ -n "$K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE" ]]; then
+            pm_fleet_env+=(FORK_SANDBOX_CLUSTER_CLAUDE=1)
+        fi
         if ! env "${pm_fleet_env[@]}" "$script_dir/fork-sandbox-fleet.sh" check --cluster; then
             echo "Error: the cluster postmaster would crash-loop on this fleet" >&2
             echo "($pm_fleet_file): 'deliver --cluster' runs the same" >&2

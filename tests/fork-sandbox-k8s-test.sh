@@ -14117,6 +14117,29 @@ pm_api_refused "an access token expiring within 7 days refuses" "expires too soo
 check "an access token expiring within 7 days refuses: no token leak" "0" \
     "$(grep -c "$pm_claude_fixture_token" <<< "$pm_api_err$pm_api_out")"
 
+# The key also feeds the install-time gate (`fleet check --cluster`): a
+# claude-harness seat passes when the key is set, and is refused (the
+# same way `fleet check --cluster` refuses it standalone -- see the fleet
+# suite) when it is not. Uses FORK_SANDBOX_FLEET_FILE/PERSONAS_DIR to swap
+# in a small claude-seat fleet instead of a whole new pm_*_cfg variant.
+pm_claude_gate_dir="$(newdir)"; tmpdirs+=("$pm_claude_gate_dir")
+mkdir -p "$pm_claude_gate_dir/personas"
+printf 'agents:\n  delta: {harness: claude, backend: k8s}\n' > "$pm_claude_gate_dir/fleet.yaml"
+printf 'Standing instructions for delta.\n' > "$pm_claude_gate_dir/personas/delta.md"
+
+pm_cfg_claude_gate="$(pm_api_cfg)"
+pm_claude_gate_file="$(pm_claude_cred_file "$pm_cfg_claude_gate" "$pm_claude_future_ms")"
+printf 'K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE=%s\n' "$pm_claude_gate_file" >> "$pm_cfg_claude_gate/k8s.env"
+pm_api_install "$pm_cfg_claude_gate" \
+    FORK_SANDBOX_FLEET_FILE="$pm_claude_gate_dir/fleet.yaml" \
+    FORK_SANDBOX_PERSONAS_DIR="$pm_claude_gate_dir/personas"
+check "claude-seat gate: with the credential key set, a claude-seat fleet passes" "0" "$pm_api_rc"
+
+pm_api_refused "claude-seat gate: without the credential key, the same fleet is refused" \
+    "agents.delta.harness" "$pm_cfg1" \
+    FORK_SANDBOX_FLEET_FILE="$pm_claude_gate_dir/fleet.yaml" \
+    FORK_SANDBOX_PERSONAS_DIR="$pm_claude_gate_dir/personas"
+
 printf '\n== client Role vs postmaster Role: same rules ==\n'
 rbac_yaml="$repo_dir/manifests/k8s/10-rbac.yaml"
 pm_yaml="$repo_dir/manifests/k8s/40-postmaster.yaml"

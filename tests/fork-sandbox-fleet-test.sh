@@ -1369,14 +1369,28 @@ pipeline:
     agent: reviewer
     repeat: 2
 YAML
+    cat > "$cl_dir/presets/has-claude.yaml" <<'YAML'
+agents:
+  coder: {harness: pi, model: small}
+  reviewer: {harness: claude, model: opus}
+pipeline:
+  - action: code
+    agent: coder
+  - action: review
+    agent: reviewer
+    repeat: 2
+YAML
 }
 cl_run() {
-    # $1 = "--cluster" or "" (plain check); sets cl_out and cl_rc. Not run
-    # in a command substitution, or cl_rc would be lost with the subshell.
+    # $1 = "--cluster" or "" (plain check); $2 = "1" to set
+    # FORK_SANDBOX_CLUSTER_CLAUDE=1, else unset. Sets cl_out and cl_rc. Not
+    # run in a command substitution, or cl_rc would be lost with the
+    # subshell.
     cl_out="$(FORK_SANDBOX_FLEET_FILE="$cl_dir/fleet.yaml" \
         FORK_SANDBOX_PERSONAS_DIR="$cl_dir/personas" \
         FORK_SANDBOX_PRESETS_DIR="$cl_dir/presets" \
         FORK_SANDBOX_HANDLERS_DIR="$cl_dir/handlers" \
+        FORK_SANDBOX_CLUSTER_CLAUDE="${2:-}" \
         "$fleet" check ${1:+"$1"} 2>&1)"
     cl_rc=$?
 }
@@ -1440,12 +1454,15 @@ agents:
   beta: {harness: claude, backend: k8s}
 EOF
 cl_run --cluster
-check "cluster: a claude seat is refused" "1" "$cl_rc"
+check "cluster: a claude seat is refused without the credential var" "1" "$cl_rc"
 contains "cluster: the harness error names the agent" "$cl_out" "agents.beta.harness"
-contains "cluster: the harness error gives the reason" "$cl_out" \
-    "claude and codex seats are not supported in a cluster postmaster yet; only pi"
-cl_run ""
+contains "cluster: the harness error names the k8s.env key" "$cl_out" \
+    "K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE"
+cl_run "" ""
 check "cluster: the same claude fleet passes plain check" "0" "$cl_rc"
+cl_run --cluster 1
+check "cluster: a claude seat is accepted with the credential var" "0" "$cl_rc"
+check "cluster: ... and prints nothing" "" "$cl_out"
 
 cl_fleet <<'EOF'
 agents:
@@ -1462,8 +1479,28 @@ cl_run --cluster
 check "cluster: a preset naming a codex agent is refused" "1" "$cl_rc"
 contains "cluster: the preset error names the seat, preset and agent" "$cl_out" \
     "agents.alpha.preset: preset 'has-codex' agent 'reviewer' uses harness 'codex'"
-cl_run ""
+cl_run "" ""
 check "cluster: the same preset fleet passes plain check" "0" "$cl_rc"
+cl_run --cluster 1
+check "cluster: a codex preset leg is refused even with the credential var" "1" "$cl_rc"
+
+cl_fleet <<'EOF'
+agents:
+  alpha: {harness: pi, preset: has-claude}
+EOF
+cl_run --cluster
+check "cluster: a preset naming a claude agent is refused without the credential var" "1" "$cl_rc"
+contains "cluster: the claude-preset error names the seat, preset and agent" "$cl_out" \
+    "agents.alpha.preset: preset 'has-claude' agent 'reviewer' uses harness 'claude'"
+cl_run --cluster 1
+# backend: k8s is deliberately left off this fleet, same as the has-codex
+# fixture above: a preset seat on backend k8s is refused outright for an
+# unrelated reason (fork-sandbox-fleet-parse.py, no maintainer tier / repeat
+# / composed pipeline support yet), so rc can't be 0 here either way. This
+# isolates the claude-preset-leg check itself: with the var set, its error
+# no longer appears.
+lacks "cluster: a preset naming a claude agent adds no preset error with the credential var" \
+    "$cl_out" "agents.alpha.preset"
 
 cl_fleet <<'EOF'
 agents:
