@@ -76,7 +76,9 @@ the first colon, both sides stripped) keeps only threads whose ROOT message
 -- the first .msg in sort order -- has a header of that name (any name,
 case-insensitive) with exactly that value; several --header are ANDed. A
 thread whose root cannot be parsed never matches a filter. Threads are
-sorted by thread id. --list is exclusive with --thread, --message, --text,
+sorted by thread id. When --list is the first argument (the shell's
+forwarding) RENDER alone parses the flags and every error is one line,
+exit 1. --list is exclusive with --thread, --message, --text,
 -o and --live; --header requires --list.
 
 --live [SECONDS] turns this into a standing process for watching an
@@ -661,15 +663,21 @@ def export_json(mail_root, thread_id):
 HEADER_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9-]*$")
 
 
+def one_line(text):
+    """text with control characters escaped, so it can sit in a diagnostic
+    that must stay on one line."""
+    return "".join(c if c.isprintable() else c.encode("unicode_escape").decode("ascii") for c in text)
+
+
 def parse_header_filter(raw):
     """Splits a --header 'Name: value' filter on its first colon. Returns
     (lowercased name, value) or raises ValueError with a one-line reason."""
     name, sep, value = raw.partition(":")
     if not sep:
-        raise ValueError(f"--header '{raw}' must look like 'Name: value'")
+        raise ValueError(f"--header '{one_line(raw)}' must look like 'Name: value'")
     name = name.strip()
     if not HEADER_NAME_RE.match(name):
-        raise ValueError(f"--header name '{name}' must match [A-Za-z][A-Za-z0-9-]*")
+        raise ValueError(f"--header name '{one_line(name)}' must match [A-Za-z][A-Za-z0-9-]*")
     return name.lower(), value.strip()
 
 
@@ -693,18 +701,45 @@ def read_review_target(mail_root, thread_id):
     return {"branch": kv["BRANCH"], "sha": kv["SHA"], "version": kv.get("VERSION", "")}
 
 
+def raw_date(path):
+    """The value of the first Date: header line, read the way `list`'s bash
+    path reads it, so a message parse_msg rejects still reports its date."""
+    try:
+        with open(path, encoding="utf-8", errors="replace", newline="") as f:
+            text = f.read()
+        for line in text.split("\n"):
+            if not line:
+                break
+            if line.startswith("Date:"):
+                return line[len("Date: "):] if line.startswith("Date: ") else line
+    except OSError:
+        pass
+    return ""
+
+
 def list_threads(mail_root, filters):
     """One record per thread that has at least one .msg and whose root
-    matches every filter; see the --list note above."""
+    matches every filter; see the --list note above. Root and last are the
+    first and last .msg by plain filename order, as bare `list` takes them
+    -- not load_thread's numeric-sequence order, which differs once a
+    thread passes 999 messages."""
     records = []
     for thread_id in list_thread_ids(mail_root):
-        entries = load_thread(os.path.join(mail_root, "threads", thread_id))
-        if not entries:
+        thread_dir = os.path.join(mail_root, "threads", thread_id)
+        try:
+            names = sorted(
+                n for n in os.listdir(thread_dir)
+                if n.endswith(".msg") and os.path.isfile(os.path.join(thread_dir, n))
+            )
+        except OSError:
             continue
-        root, last = entries[0], entries[-1]
+        if not names:
+            continue
+        root = parse_msg(os.path.join(thread_dir, names[0]), 0, names[0])
+        last_path = os.path.join(thread_dir, names[-1])
         if not root["ok"]:
             if not filters:
-                records.append({"thread": thread_id, "messages": len(entries), "error": root["error"]})
+                records.append({"thread": thread_id, "messages": len(names), "error": root["error"]})
             continue
         if not all(
             any(n.strip().lower() == name and v == value for n, v in root["headers"])
@@ -713,11 +748,11 @@ def list_threads(mail_root, filters):
             continue
         records.append({
             "thread": thread_id,
-            "messages": len(entries),
+            "messages": len(names),
             "subject": root["subject"],
             "from": root["from"],
             "date": root["date"],
-            "last_date": last["date"] if last["ok"] else "",
+            "last_date": raw_date(last_path),
             "root_headers": root["headers"],
             "review_target": read_review_target(mail_root, thread_id),
         })
@@ -812,6 +847,60 @@ def run_live(mail_root, output, title, thread_filter, interval, cycles, render_d
     return 0
 
 
+def run_list(mail_root, as_json, raw_filters):
+    """`--list`: prints the thread listing and returns the exit code."""
+    try:
+        filters = [parse_header_filter(h) for h in raw_filters]
+    except ValueError as e:
+        print(f"Error: list: {e}", file=sys.stderr)
+        return 1
+    records = list_threads(mail_root, filters)
+    if as_json:
+        json.dump(records, sys.stdout)
+        sys.stdout.write("\n")
+    else:
+        for r in records:
+            if "error" in r:
+                r = {**r, "subject": "", "last_date": ""}
+            sys.stdout.write(f"{r['thread']}\t{r['messages']}\t{r['subject']}\t{r['last_date']}\n")
+    return 0
+
+
+def list_main(args, parser):
+    """`fork-sandbox-mail.sh list <flags>` lands here as
+    `--list <mail-root> <flags>`. The shell forwards the flags untouched, so
+    this is the one place they are parsed; it is hand-rolled because
+    argparse would exit 2 with multi-line usage, where list promises a
+    one-line `Error: list: ...` and exit 1."""
+    if not args:
+        print("Error: list: missing mail root", file=sys.stderr)
+        return 1
+    mail_root, rest = args[0], args[1:]
+    as_json, raw_filters = False, []
+    i = 0
+    while i < len(rest):
+        a = rest[i]
+        if a == "--json":
+            as_json = True
+        elif a == "--header":
+            if i + 1 >= len(rest):
+                print("Error: list: --header requires 'Name: value'.", file=sys.stderr)
+                return 1
+            i += 1
+            raw_filters.append(rest[i])
+        elif a in ("-h", "--help"):
+            parser.print_help()
+            return 0
+        elif a.startswith("-"):
+            print(f"Error: list: unknown option '{one_line(a)}'.", file=sys.stderr)
+            return 1
+        else:
+            print(f"Error: list: unexpected argument '{one_line(a)}'.", file=sys.stderr)
+            return 1
+        i += 1
+    return run_list(mail_root, as_json, raw_filters)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("mail_root", help="fork-sandbox-mail.sh store root")
@@ -829,6 +918,9 @@ def main(argv=None):
     )
     parser.add_argument("--live-cycles", type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--live-render-delay", type=float, default=0, help=argparse.SUPPRESS)
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv[:1] == ["--list"]:
+        return list_main(argv[1:], parser)
     args = parser.parse_args(argv)
 
     if args.header and not args.list:
@@ -838,21 +930,7 @@ def main(argv=None):
         if args.thread or args.message or args.text or args.output or args.live is not None:
             print("Error: --list cannot be combined with --thread, --message, --text, -o or --live", file=sys.stderr)
             return 1
-        try:
-            filters = [parse_header_filter(h) for h in args.header]
-        except ValueError as e:
-            print(f"Error: list: {e}", file=sys.stderr)
-            return 1
-        records = list_threads(args.mail_root, filters)
-        if args.json:
-            json.dump(records, sys.stdout)
-            sys.stdout.write("\n")
-        else:
-            for r in records:
-                if "error" in r:
-                    r = {**r, "subject": "", "last_date": ""}
-                sys.stdout.write(f"{r['thread']}\t{r['messages']}\t{r['subject']}\t{r['last_date']}\n")
-        return 0
+        return run_list(args.mail_root, args.json, args.header)
 
     if args.json:
         if not args.thread:

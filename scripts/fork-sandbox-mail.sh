@@ -1038,19 +1038,7 @@ cmd_export() {
 
 cmd_list() {
     if (( $# )); then
-        local -a list_args=()
-        while (( $# )); do
-            case "$1" in
-                --json) list_args+=(--json); shift ;;
-                --header)
-                    (( $# >= 2 )) || { echo "Error: list: --header requires 'Name: value'." >&2; return 1; }
-                    list_args+=("--header=$2"); shift 2 ;;
-                -h|--help) usage; exit 0 ;;
-                -*) echo "Error: list: unknown option '$1'." >&2; return 1 ;;
-                *) echo "Error: list: unexpected argument '$1'." >&2; return 1 ;;
-            esac
-        done
-        exec python3 "$script_dir/fork-sandbox-mail-render.py" --list "$MAIL_ROOT" "${list_args[@]}"
+        exec python3 "$script_dir/fork-sandbox-mail-render.py" --list "$MAIL_ROOT" "$@"
     fi
     local threads_dir; threads_dir="$(mail_threads_dir)"
     [[ -d "$threads_dir" ]] || return 0

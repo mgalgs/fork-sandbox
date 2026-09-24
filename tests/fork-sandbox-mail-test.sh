@@ -984,6 +984,39 @@ print(sorted(d["00000000-0000-4000-8000-000000000000"]))')"
 check "an unparsable root never matches a filter" "$ls_a" \
     "$("$mail" list --json --header 'X-Demo-PR: 42' | ls_ids)"
 
+ls_msg() {
+    printf 'Message-ID: <%s@ls.example>\nFrom: @ci-demo\nSubject: %s\nDate: %s\n\nbody\n' "$2" "$3" "$4" > "$1"
+}
+
+ls_wide="$ls_root/threads/00000000-0000-4000-8000-000000000001"
+mkdir -p "$ls_wide"
+ls_msg "$ls_wide/001-a.msg" wide-1 Wide "date-001"
+ls_msg "$ls_wide/999-a.msg" wide-999 "Re: Wide" "date-999"
+ls_msg "$ls_wide/1000-a.msg" wide-1000 "Re: Wide" "date-1000"
+ls_wide_tsv="$("$mail" list --header 'Subject: Wide' | cut -f1,2,4)"
+check "past 999 messages, the last date follows filename order like bare list" \
+    "$("$mail" list | grep -F 00000000-0000-4000-8000-000000000001 | cut -f1,2,4)" \
+    "$ls_wide_tsv"
+check "past 999 messages, JSON last_date is the filename-order last" "date-999" \
+    "$("$mail" list --json --header 'Subject: Wide' | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["last_date"])')"
+
+ls_odd="$ls_root/threads/00000000-0000-4000-8000-000000000002"
+mkdir -p "$ls_odd"
+ls_msg "$ls_odd/001-a.msg" odd-1 Odd "date-ok"
+printf 'From: @ci-demo\nDate: malformed-date\n\nno message id\n' > "$ls_odd/002-a.msg"
+check "an unparsable last message still reports its Date, as bare list does" \
+    "$("$mail" list | grep -F 00000000-0000-4000-8000-000000000002 | cut -f4)" \
+    "$("$mail" list --header 'Subject: Odd' | cut -f4)"
+check "an unparsable last message still reports its Date in JSON" "malformed-date" \
+    "$("$mail" list --json --header 'Subject: Odd' | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["last_date"])')"
+
+ls_err="$("$mail" list --header $'Bad\nName: v' 2>&1 >/dev/null)"; rc=$?
+check "a control character in a header name still gives a one-line error" "1 1" \
+    "$rc $(printf '%s\n' "$ls_err" | wc -l)"
+ls_err="$("$mail" list --header $'No\nColon' 2>&1 >/dev/null)"
+check "a control character in a colon-less filter still gives a one-line error" "1" \
+    "$(printf '%s\n' "$ls_err" | wc -l)"
+
 export FORK_SANDBOX_MAIL_ROOT="$saved_mail_root"
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
