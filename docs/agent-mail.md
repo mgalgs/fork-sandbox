@@ -730,8 +730,8 @@ run a pending message is waiting on, and that agent can be one originally
 woken via Cc — so a Cc-woken seat's follow-up can still produce a refuse
 line), `triage-skip` (agent, thread), `handler` (agent,
 thread, exit=<status>), `hook` (thread, hook=<event>, file=<basename>,
-exit=<n|timeout|lost|launch>; a hook finished or failed to launch, and
-the one line with no `agent` field; see "Hooks" below), and `route-dead`
+exit=<n|timeout|lost|launch>; a hook finished or failed to launch; it
+has no `agent` field; see "Hooks" below), and `route-dead`
 (thread, unresolved=<count> — one
 or more `To:` names in rule 0's expansion were @-shaped but did not
 resolve as a fleet agent, so the thread is also separately flag'd with

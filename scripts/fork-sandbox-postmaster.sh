@@ -3428,12 +3428,6 @@ pm_parse_reply_file() {
     return 0
 }
 
-# Sanitizes one line of message-body-controlled text for embedding in a
-# flag reason ($NEEDS_OPERATOR/<tid>'s whole content is one line, and
-# `status` prints it on one line too) -- strips control characters
-# (newlines included, so a captured line can never fake a second header or
-# corrupt `status`'s one-line-per-thread listing) and truncates so one long
-# line can't crowd out the fixed prose around it.
 # The Message-ID of every message pm_harvest_one_file posted since the caller
 # last reset this, in posting order -- what on-harvest reports.
 PM_HARVEST_POSTED=()
@@ -3449,6 +3443,12 @@ pm_hook_on_harvest() {
         "FS_HOOK_BRANCH=$branch" "FS_HOOK_AGENT=$agent"
 }
 
+# Sanitizes one line of message-body-controlled text for embedding in a
+# flag reason ($NEEDS_OPERATOR/<tid>'s whole content is one line, and
+# `status` prints it on one line too) -- strips control characters
+# (newlines included, so a captured line can never fake a second header or
+# corrupt `status`'s one-line-per-thread listing) and truncates so one long
+# line can't crowd out the fixed prose around it.
 pm_flag_quote_line() {
     local s
     s="$(tr -d '[:cntrl:]' <<< "$1")"
