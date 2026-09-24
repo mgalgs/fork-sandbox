@@ -63,13 +63,22 @@ case "$1" in
         exit 0
         ;;
     -C)
-        if [[ "$3" == fetch ]]; then
-            if [[ -n "${GIT_FETCH_FAIL:-}" ]]; then
-                echo "stub git: fetch failed" >&2
-                exit 1
-            fi
-            exit 0
-        fi
+        case "$3" in
+            fetch)
+                if [[ -n "${GIT_FETCH_FAIL:-}" ]]; then
+                    echo "stub git: fetch failed" >&2
+                    exit 1
+                fi
+                exit 0
+                ;;
+            merge)
+                if [[ -n "${GIT_MERGE_FAIL:-}" ]]; then
+                    echo "stub git: merge failed" >&2
+                    exit 1
+                fi
+                exit 0
+                ;;
+        esac
         ;;
 esac
 exit 0
@@ -120,6 +129,7 @@ run_init() {
     GIT_LOG="$git_log" \
     GIT_CLONE_FAIL="${TEST_GIT_CLONE_FAIL:-}" \
     GIT_FETCH_FAIL="${TEST_GIT_FETCH_FAIL:-}" \
+    GIT_MERGE_FAIL="${TEST_GIT_MERGE_FAIL:-}" \
     PATH="$tools" \
     "$script" "$@"
 }
@@ -284,6 +294,26 @@ if grep -q '^clone ' "$git_log"; then
     no "present repo: git clone is NOT called" "$(cat "$git_log")"
 else
     ok "present repo: git clone is NOT called"
+fi
+if grep -q '^-C .*merge --ff-only @{u}' "$git_log"; then
+    ok "present repo: a successful fetch fast-forwards to its upstream"
+else
+    no "present repo: a successful fetch fast-forwards to its upstream" "$(cat "$git_log")"
+fi
+
+printf '\n== a diverged branch (ff-only fails) warns and continues ==\n'
+setup_env
+write_k8s_env <<'EOF'
+K8S_CONTEXT=my-context
+K8S_POSTMASTER_REPO_URL=ssh://git.example/proj.git
+EOF
+mkdir -p "$home/src/proj/.git"
+out="$(TEST_GIT_MERGE_FAIL=1 run_init 2>&1)"
+rc=$?
+if (( rc == 0 )) && [[ "$out" == *"Warning"*"fast-forward"* ]]; then
+    ok "a clone whose local branch diverged from origin warns and exits 0"
+else
+    no "a clone whose local branch diverged from origin warns and exits 0" "status $rc: $out"
 fi
 
 printf '\n== failed fetch warns and continues; failed clone is fatal ==\n'

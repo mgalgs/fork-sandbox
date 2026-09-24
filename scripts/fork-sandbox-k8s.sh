@@ -2654,6 +2654,34 @@ cmd_install() {
             echo "ReadWriteOncePod or ReadWriteOnce." >&2
             exit 1
         fi
+        # deliver --cluster refuses to start at all with no fleet file
+        # (pm_require_fleet_check: "--cluster needs a fleet file ...
+        # declaring backend: k8s seats"), so an install with no
+        # fleet.yaml renders and applies a Deployment whose pod
+        # crash-loops forever. Catch that here, before anything is
+        # rendered or applied, instead of leaving it for `kubectl logs`
+        # to discover after the fact.
+        if [[ ! -f "$config_dir/fleet.yaml" ]]; then
+            echo "Error: no fleet file at $config_dir/fleet.yaml. install" >&2
+            echo "--postmaster needs one: the cluster postmaster's 'deliver" >&2
+            echo "--cluster' refuses to start without a fleet file declaring" >&2
+            echo "backend: k8s seats." >&2
+            exit 1
+        fi
+        # The postmaster image ships no platform plugin beyond generic and
+        # the Deployment sets no FORK_SANDBOX_K8S_PLATFORM, so a seat
+        # submitted from inside the pod always resolves the generic
+        # plugin, regardless of what this install itself is running with.
+        # Warn rather than refuse: some sites may intend the pod to use
+        # generic even when the laptop runs something else.
+        if [[ -n "${FORK_SANDBOX_K8S_PLATFORM:-}" && "$FORK_SANDBOX_K8S_PLATFORM" != generic ]]; then
+            echo "Warning: FORK_SANDBOX_K8S_PLATFORM='$FORK_SANDBOX_K8S_PLATFORM' is set," >&2
+            echo "but the cluster postmaster pod always uses the generic platform" >&2
+            echo "plugin (it ships no other plugin binary and the Deployment sets no" >&2
+            echo "such variable). Seats submitted from inside the pod will use" >&2
+            echo "generic even though this install is running under" >&2
+            echo "'$FORK_SANDBOX_K8S_PLATFORM'." >&2
+        fi
     fi
 
     # ConfigMap file collection for --postmaster: the four optional

@@ -32,10 +32,17 @@
 #      $HOME/.ssh (0600/0644) and exports GIT_SSH_COMMAND so the postmaster's
 #      own later git calls inherit it.
 #   5. Clones $K8S_POSTMASTER_REPO_URL to $HOME/src/$project if that
-#      directory has no .git yet, else fetches it. A failed fetch on an
-#      existing clone is a warning (the remote may be briefly down and the
-#      postmaster can still route on what is already on disk); a failed
-#      clone is fatal, since there is nothing to route on at all.
+#      directory has no .git yet, else fetches it and fast-forwards the
+#      checked-out branch to its upstream (a fetch alone only moves
+#      refs/remotes/origin/*; the postmaster itself never fetches, so
+#      without this HEAD would stay pinned at whatever commit the first
+#      clone produced -- see docs/cluster-postmaster.md's "getting new
+#      commits into the pod" section). A failed fetch on an existing
+#      clone is a warning (the remote may be briefly down and the
+#      postmaster can still route on what is already on disk); so is a
+#      fast-forward that is not possible (a diverged local branch, e.g.
+#      from manual `kubectl exec` surgery). A failed clone is fatal,
+#      since there is nothing to route on at all.
 #   6. execs fork-sandbox-postmaster.sh deliver --cluster --project
 #      $HOME/src/$project, resolved next to this script (not via PATH).
 #
@@ -238,7 +245,12 @@ mkdir -p "$src_dir"
 repo_dir="$src_dir/$project"
 
 if [[ -d "$repo_dir/.git" ]]; then
-    if ! git -C "$repo_dir" fetch --prune origin; then
+    if git -C "$repo_dir" fetch --prune origin; then
+        if ! git -C "$repo_dir" merge --ff-only '@{u}' >/dev/null 2>&1; then
+            echo "Warning: could not fast-forward $repo_dir to its upstream" >&2
+            echo "(diverged?); continuing with what is already on disk." >&2
+        fi
+    else
         echo "Warning: fetch failed for existing clone at $repo_dir;" >&2
         echo "continuing with what is already on disk." >&2
     fi

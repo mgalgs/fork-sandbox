@@ -12812,6 +12812,7 @@ EOF
     install -m 600 /dev/null "$d/deploy-key"
     printf 'dummy-key-material-for-tests-only\n' >> "$d/deploy-key"
     printf 'git.example ssh-ed25519 AAAAtest\n' > "$d/known_hosts"
+    printf 'agents: {}\n' > "$d/fleet.yaml"
     printf '%s' "$d"
 }
 
@@ -13089,6 +13090,25 @@ else
         "$(cat /tmp/fs-k8s-test-rootscp.err)"
 fi
 rm -f /tmp/fs-k8s-test-rootscp.err
+
+# 10c. No fleet.yaml on the laptop refuses before any kubectl call: a
+# cluster postmaster's `deliver --cluster` refuses to start at all
+# without one, so installing anyway would render and apply a Deployment
+# whose pod crash-loops forever with no signal at install time.
+pm_cfg_nofleet="$(newdir)"; tmpdirs+=("$pm_cfg_nofleet")
+cp -r "$pm_cfg1"/. "$pm_cfg_nofleet"/
+chmod 600 "$pm_cfg_nofleet/deploy-key" "$pm_cfg_nofleet/pi.env"
+rm -f "$pm_cfg_nofleet/fleet.yaml"
+pm_log_nofleet="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$pm_log_nofleet")")
+refuses "no fleet.yaml refuses" \
+    "no fleet file" \
+    env PATH="$pm_stub_bin:$PATH" K8S_STUB_LOG="$pm_log_nofleet" FORK_SANDBOX_CONFIG_DIR="$pm_cfg_nofleet" \
+    "$k8s_sh" install --postmaster --dry-run
+if [[ -s "$pm_log_nofleet" ]]; then
+    no "missing fleet.yaml never invokes kubectl" "$(cat "$pm_log_nofleet")"
+else
+    ok "missing fleet.yaml never invokes kubectl"
+fi
 
 # 11. The checksum/pm-config annotation changes when fleet.yaml changes.
 pm_cfg_fleet="$(newdir)"; tmpdirs+=("$pm_cfg_fleet")

@@ -100,6 +100,11 @@ Do these in order.
   rolls the pod.
 - **A new fork-sandbox version** needs a new postmaster image and a new
   `K8S_POSTMASTER_IMAGE` in `k8s.env`, then `install --postmaster` again.
+- **New commits on the project repo** reach the pod only at pod start: the
+  pod init clones once (or, on a restart, fetches and fast-forwards the
+  existing clone to `origin`'s tip) and the postmaster itself never fetches
+  again afterward. A running pod does not pick up new commits on its own;
+  restart it (a rollout, or deleting the pod) to pull them in.
 - **In-flight seats survive a rollout.** A restarted postmaster adopts
   still-running Jobs instead of re-spawning them, so a rollout does not
   lose a seat's work in progress.
@@ -129,6 +134,14 @@ and nothing else; a site that wants to seal that egress can add its own
 policy. This does not change seat isolation: seat pods still get whatever
 NetworkPolicy the platform plugin renders for them, unrelated to the
 postmaster pod's own network posture.
+
+`FORK_SANDBOX_K8S_PLATFORM` (default `generic`) names the platform plugin
+that submit and render-grant use for that seat-pod policy. It is a laptop
+environment variable, not a `k8s.env` key, and the postmaster image ships
+no plugin binary beyond `generic` and sets no such variable in the
+Deployment. So a seat submitted from inside the pod always resolves the
+`generic` plugin, even when a site's laptop runs a different one -- there
+is no warning today when the two disagree.
 
 ## Security posture
 
