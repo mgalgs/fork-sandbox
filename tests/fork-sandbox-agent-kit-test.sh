@@ -113,6 +113,9 @@ home="${E[0]}" cfg="${E[1]}" proj="${E[2]}"
 tmpdirs+=("$home" "$cfg")
 skills="$home/.claude/skills"
 
+bound() { argv_has_flag_value "$ARGV" --bind-ro "$skills/$1"; }
+bind_count() { grep -cxF -- "$skills/$1" "$ARGV" || true; }
+
 set_kit() { printf 'AGENT_KIT_SKILLS=%s\n' "$1" > "$cfg/kit.env"; }
 
 # Runs the launcher against the fixture. Leaves the combined output in OUT,
@@ -131,32 +134,94 @@ launch() {
 }
 
 
-printf '== the list resolves ==\n'
+# 1. Reads the machine list: spaces, commas, or both; quotes are tolerated.
+printf '== the machine list ==\n'
 run_fg() { launch --foreground --harness claude "$@" "$proj" "$handoff_dir/handoff.md"; }
 
-for spec in '"kit-alpha kit-beta"' 'kit-alpha,kit-beta' 'kit-alpha, kit-beta' \
-            'kit-alpha kit-alpha commit-then-review'; do
-    set_kit "$spec"
-    run_fg --kit-skill kit-alpha --kit-skill code-review-portable
-    if (( RC == 0 )); then
-        ok "kit.env $spec resolves"
-    else
-        no "kit.env $spec resolves" "rc=$RC $OUT"
-    fi
-done
+set_kit '"kit-alpha kit-beta"'
+run_fg
+if (( RC == 0 )) && bound kit-alpha && bound kit-beta; then
+    ok "space-separated, quoted list binds both skills"
+else
+    no "space-separated, quoted list binds both skills" "rc=$RC $OUT"
+fi
+
+set_kit 'kit-alpha,kit-beta'
+run_fg
+if (( RC == 0 )) && bound kit-alpha && bound kit-beta; then
+    ok "comma-separated list binds both skills"
+else
+    no "comma-separated list binds both skills" "rc=$RC $OUT"
+fi
+
+set_kit 'kit-alpha, kit-beta'
+run_fg
+if (( RC == 0 )) && bound kit-alpha && bound kit-beta; then
+    ok "comma-and-space list binds both skills"
+else
+    no "comma-and-space list binds both skills" "rc=$RC $OUT"
+fi
+
 rm -f "$cfg/kit.env"
 run_fg
-if (( RC == 0 )); then
+if (( RC == 0 )) && ! bound kit-alpha && ! bound kit-beta; then
     ok "no kit.env means an empty machine kit"
 else
     no "no kit.env means an empty machine kit" "rc=$RC $OUT"
 fi
+
 printf 'SOMETHING_ELSE=1\n' > "$cfg/kit.env"
 run_fg
-if (( RC == 0 )); then
+if (( RC == 0 )) && ! bound kit-alpha; then
     ok "a kit.env without the key means an empty machine kit"
 else
     no "a kit.env without the key means an empty machine kit" "rc=$RC $OUT"
+fi
+
+# 2. --kit-skill is additive.
+printf '\n== --kit-skill ==\n'
+rm -f "$cfg/kit.env"
+run_fg --kit-skill kit-beta
+if (( RC == 0 )) && bound kit-beta && ! bound kit-alpha; then
+    ok "--kit-skill alone binds just that skill"
+else
+    no "--kit-skill alone binds just that skill" "rc=$RC $OUT"
+fi
+
+set_kit 'kit-alpha'
+run_fg --kit-skill kit-beta
+if (( RC == 0 )) && bound kit-alpha && bound kit-beta; then
+    ok "--kit-skill adds to the machine list, it does not replace it"
+else
+    no "--kit-skill adds to the machine list, it does not replace it" "rc=$RC $OUT"
+fi
+
+# 3. Dedup and review-kit names.
+printf '\n== dedup ==\n'
+set_kit 'kit-alpha kit-alpha commit-then-review'
+run_fg --kit-skill kit-alpha --kit-skill code-review-portable --kit-skill kit-beta
+if (( RC == 0 )) && [[ "$(bind_count kit-alpha)" == 1 && "$(bind_count kit-beta)" == 1 ]]; then
+    ok "a repeated name is bound once"
+else
+    no "a repeated name is bound once" "rc=$RC alpha=$(bind_count kit-alpha) beta=$(bind_count kit-beta)"
+fi
+if [[ "$(bind_count commit-then-review)" == 1 && "$(bind_count code-review-portable)" == 1 ]]; then
+    ok "review kit names in the agent kit are dropped, not bound twice"
+else
+    no "review kit names in the agent kit are dropped, not bound twice" \
+        "ctr=$(bind_count commit-then-review) crp=$(bind_count code-review-portable)"
+fi
+lacks "dropping a review kit name is silent" "kit" "$(printf '%s' "$OUT" | grep -i 'error\|warn\|notice' || true)"
+
+# 4. Order: machine list first, then flags in the order given.
+printf '\n== order ==\n'
+set_kit 'kit-beta'
+run_fg --kit-skill kit-alpha
+order="$(grep -nxF -e "$skills/kit-alpha" -e "$skills/kit-beta" "$ARGV" | sed 's/^[0-9]*://' | tr '\n' ' ')"
+if [[ "$order" == "$skills/kit-beta $skills/kit-alpha " ]]; then
+    ok "the machine list is bound before --kit-skill names"
+else
+    no "the machine list is bound before --kit-skill names" "$order"
 fi
 
 # 5. Failures come before anything is created, naming skill and source.
@@ -238,6 +303,149 @@ printf '\n== --help ==\n'
 helptext="$("$launcher" --help 2>&1)"
 contains "--help documents --kit-skill" "--kit-skill" "$helptext"
 contains "--help documents kit.env" "kit.env" "$helptext"
+
+# --- binding into each seat's command -------------------------------------
+# A real (foreground) run with every wrapper stubbed and the backend faked into
+# image mode, so pi resolves without a host install. The built commands are
+# read back out of the run's run.sh.
+printf '\n== binding: every seat ==\n'
+img_stub="$(mktemp -d /var/tmp/claude-scratch/fs-agent-kit-img-stub.XXXXXX)"
+tmpdirs+=("$img_stub")
+for w in claude-sandboxed agent-sandboxed; do
+    printf '#!/usr/bin/env bash\ncat >/dev/null\nexit 0\n' > "$img_stub/$w"
+done
+cat > "$img_stub/sandbox-backend-fake-image" <<'STUB'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "--capabilities" ]]; then
+    printf 'toolchain=image\n'
+    exit 0
+fi
+exit 0
+STUB
+chmod +x "$img_stub"/*
+install -m 600 /dev/null "$cfg/pi.env"
+printf 'OPENROUTER_API_KEY=fake\n' > "$cfg/pi.env"
+mkdir -p "$cfg/presets"
+
+# Leaves the run dir in RD ("" on failure).
+launch_real() {
+    local out rc
+    out="$(HOME="$home" PATH="$img_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$cfg" \
+        FORK_SANDBOX_BACKEND=fake-image \
+        timeout 60 "$launcher" --foreground "$@" "$proj" "$handoff_dir/handoff.md" 2>&1)"
+    rc=$?
+    RD="$(printf '%s\n' "$out" | sed -n 's/^  run dir:  *//p' | head -1)"
+    if (( rc != 0 )) || [[ -z "$RD" ]]; then
+        printf 'launch_real failed (rc=%s):\n%s\n' "$rc" "$out" >&2
+        RD=""
+        return 1
+    fi
+    tmpdirs+=("$RD")
+}
+
+# One assignment line of run.sh, e.g. cmd_line sandbox_cmd.
+cmd_line() { grep "^$1=" "$RD/run.sh" | head -1; }
+
+set_kit 'kit-alpha'
+if launch_real --harness claude --review-loop 1 --model opus --review-model opus; then
+    for v in sandbox_cmd review_sandbox_cmd; do
+        contains "claude: $v binds the kit skill" "--bind-ro $skills/kit-alpha" "$(cmd_line $v)"
+        lacks "claude: $v carries no --skill" "--skill $skills/kit-alpha" "$(cmd_line $v)"
+    done
+else
+    no "claude run with a kit skill launches"
+fi
+
+if launch_real --harness pi --model example/model --review-loop 1; then
+    contains "pi: the implement command binds the kit skill" \
+        "--bind-ro $skills/kit-alpha" "$(cmd_line sandbox_cmd)"
+    contains "pi: the implement command is handed --skill for it" \
+        "--skill $skills/kit-alpha" "$(cmd_line sandbox_cmd)"
+    contains "pi: the review leg (the implement command) is handed --skill" \
+        "--skill $skills/kit-alpha" "$(cmd_line review_sandbox_cmd)"
+else
+    no "pi run with a kit skill launches"
+fi
+
+if launch_real --harness claude --model opus --review-loop 1 --review-harness pi --review-model example/model; then
+    lacks "claude implement + pi review: the claude leg has no --skill" \
+        "--skill $skills/kit-alpha" "$(cmd_line sandbox_cmd)"
+    contains "claude implement + pi review: the pi review leg is handed --skill" \
+        "--skill $skills/kit-alpha" "$(cmd_line review_sandbox_cmd)"
+    contains "claude implement + pi review: the pi review leg binds it" \
+        "--bind-ro $skills/kit-alpha" "$(cmd_line review_sandbox_cmd)"
+else
+    no "claude implement + pi review launches"
+fi
+
+if launch_real --harness claude --model opus --review-loop 1 --review-harness pi \
+    --review-model example/model --maintainer-loop 1 --maintainer-harness pi \
+    --maintainer-model example/model; then
+    contains "a named pi maintainer harness is handed --skill" \
+        "--skill $skills/kit-alpha" "$(cmd_line maintainer_sandbox_cmd)"
+else
+    no "claude implement + pi review + pi maintainer launches"
+fi
+
+# A preset whose review seat is pi, in a legacy shape and a composed one.
+cat > "$cfg/presets/pi-review.yaml" <<'YAML'
+agents:
+  coder:
+    harness: claude
+    model: opus
+  reviewer:
+    harness: pi
+    model: example/model
+pipeline:
+  - action: code
+    agent: coder
+  - action: review
+    repeat: 1
+    agent: reviewer
+YAML
+if launch_real --preset pi-review; then
+    contains "a legacy preset's pi review seat is handed --skill" \
+        "--skill $skills/kit-alpha" "$(cmd_line review_sandbox_cmd)"
+    lacks "a legacy preset's claude code seat is not" \
+        "--skill $skills/kit-alpha" "$(cmd_line sandbox_cmd)"
+else
+    no "a legacy preset with a pi review seat launches"
+fi
+
+cat > "$cfg/presets/pi-composed.yaml" <<'YAML'
+agents:
+  coder:
+    harness: pi
+    model: example/model
+  reviewer:
+    harness: pi
+    model: example/model
+  checker:
+    harness: claude
+    model: opus
+pipeline:
+  - action: code
+    agent: coder
+  - action: review
+    repeat: 1
+    agent: reviewer
+  - action: review
+    repeat: 1
+    agent: checker
+YAML
+if launch_real --preset pi-composed; then
+    contains "a composed preset's pi code step is handed --skill" \
+        "--skill $skills/kit-alpha" "$(cmd_line s1_sandbox_cmd)"
+    contains "a composed preset's pi review step is handed --skill" \
+        "--skill $skills/kit-alpha" "$(cmd_line s2_sandbox_cmd)"
+    contains "a composed preset's claude review step binds it" \
+        "--bind-ro $skills/kit-alpha" "$(cmd_line s3_sandbox_cmd)"
+    lacks "a composed preset's claude review step is not handed --skill" \
+        "--skill $skills/kit-alpha" "$(cmd_line s3_sandbox_cmd)"
+else
+    no "a composed preset with a pi review seat launches"
+fi
+rm -f "$cfg/kit.env"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))

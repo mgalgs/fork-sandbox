@@ -5446,6 +5446,33 @@ for skill_name in commit-then-review code-review-portable; do
         rev_harness_cmd+=(--skill "$skill_dir")
     fi
 done
+# The agent kit rides in the same array, so it lands under $HOME/.claude/skills
+# by the same shallowest-first bind order the comment above describes. Every
+# seat gets the bind. A pi-family leg is also handed --skill, on every leg that
+# runs pi -- implement, review, maintain and both fix seats -- not only the
+# review legs the review kit is for. A seat that has no command of its own
+# (review, maintain and fix legs fall back to the implement command) already
+# has it from the implement leg.
+for skill_dir in "${agent_kit_dirs[@]}"; do
+    review_kit_flags+=(--bind-ro "$skill_dir")
+    if [[ "$harness" == "pi" || "$harness" == "pi-local" ]]; then
+        impl_harness_cmd+=(--skill "$skill_dir")
+    fi
+    if [[ "$review_harness_given" == true \
+        && ( "$review_harness" == "pi" || "$review_harness" == "pi-local" ) ]]; then
+        rev_harness_cmd+=(--skill "$skill_dir")
+    fi
+    if [[ "$maintainer_harness_given" == true \
+        && ( "$maintainer_harness" == "pi" || "$maintainer_harness" == "pi-local" ) ]]; then
+        mnt_harness_cmd+=(--skill "$skill_dir")
+    fi
+    if [[ "$fix_harness" == "pi" || "$fix_harness" == "pi-local" ]]; then
+        fxr_harness_cmd+=(--skill "$skill_dir")
+    fi
+    if [[ "$mntfix_harness" == "pi" || "$mntfix_harness" == "pi-local" ]]; then
+        fxm_harness_cmd+=(--skill "$skill_dir")
+    fi
+done
 if [[ -d "$HOME/.claude/scripts" ]]; then
     review_kit_flags+=(--bind-ro "$HOME/.claude/scripts"
                        --prepend-path "$HOME/.claude/scripts")
@@ -6847,6 +6874,20 @@ if [[ "$preset_is_legacy_shaped" != true ]]; then
                 fi
             done
         fi
+        # The agent kit goes to every pi step, code steps included.
+        for skill_dir in "${agent_kit_dirs[@]}"; do
+            if [[ "${preset_agent_harness[${preset_step_agent[$preset_k]}]}" == pi || "${preset_agent_harness[${preset_step_agent[$preset_k]}]}" == pi-local ]]; then
+                declare -n kit_k_cmd="s${preset_k}_harness_cmd"
+                kit_k_cmd+=(--skill "$skill_dir")
+                unset -n kit_k_cmd
+            fi
+            if [[ "${preset_step_action[$preset_k]}" != code \
+                && ( "${preset_step_fix_harness[$preset_k]}" == pi || "${preset_step_fix_harness[$preset_k]}" == pi-local ) ]]; then
+                declare -n kit_k_fix_cmd="s${preset_k}fix_harness_cmd"
+                kit_k_fix_cmd+=(--skill "$skill_dir")
+                unset -n kit_k_fix_cmd
+            fi
+        done
         fs_build_sandbox_cmd "s${preset_k}" "s${preset_k}_sandbox_cmd"
         if [[ "${preset_step_action[$preset_k]}" != code ]]; then
             fs_build_sandbox_cmd "s${preset_k}fix" "s${preset_k}fix_sandbox_cmd"
