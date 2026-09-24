@@ -8,9 +8,13 @@ does on a workstation.
 
 ## What it is not, yet
 
-- **Pi seats only.** The cluster postmaster refuses to wake a `claude` or
-  `codex` seat. Those harnesses need a credential in the pod, and that is
-  deferred; a pi seat needs none.
+- **No codex seats.** The cluster postmaster always refuses to wake a
+  `codex` seat; that harness needs a credential in the pod, and shipping
+  one is deferred.
+- **Claude seats need a credential installed.** A pi seat always works,
+  no credential needed. A `claude` seat is refused until a site installs
+  a claude credential -- see "Claude seats in a cluster postmaster"
+  below.
 - **No local or bwrap seats, no triage.** Only seats a pod can actually run
   get woken; anything else is refused rather than silently mis-scheduled.
 - **A fresh store.** The pod starts from an empty agent-mail store. Threads
@@ -62,6 +66,7 @@ Do these in order.
    | `K8S_POSTMASTER_OPERATORS` | no | comma-separated `@names` that carry rule-1 authority; default `@operator`. See "Operators". |
    | `K8S_POSTMASTER_HOOKS_SECRET` | no | the name of a Secret you create in the namespace, to hand your hooks credentials. Install never creates or reads it, only references it. Must be a DNS-1123 subdomain name. See "Hooks". |
    | `K8S_MAIL_API_TOKENS_FILE` | no | laptop path to the mail API tokens file; when set, the mail API is deployed. See "The mail API". |
+   | `K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE` | no | laptop path to a claude credentials JSON; when set, claude seats are accepted in the cluster. See "Claude seats in a cluster postmaster". |
 
    The rest of `k8s.env` (`K8S_CONTEXT`, `K8S_NAMESPACE`, and the rest) is
    read the same way a laptop run reads it, since the whole file is copied
@@ -69,9 +74,16 @@ Do these in order.
    any of `personas/`, `prompts/`, `handlers/`, `presets/` (all directly
    under `$HOME/.config/fork-sandbox`), those come along too: each becomes
    its own ConfigMap, included only if the matching directory exists on the
-   laptop. Files under `handlers/` must be executable to be included; a
-   non-executable one is skipped with a warning, the same way the laptop
-   postmaster would skip it.
+   laptop. `FORK_SANDBOX_FLEET_FILE` and `FORK_SANDBOX_PERSONAS_DIR`, when
+   set in the installing shell's environment, override the fleet file and
+   personas dir source: install ships that file and that dir instead of
+   `$config_dir/fleet.yaml` and `$config_dir/personas`, for a site that
+   keeps its fleet and personas in a repo of its own. Unset or empty falls
+   back to `$config_dir`, unchanged from before this pair of variables
+   existed. Every other install-time dir (prompts, handlers, hooks,
+   presets) still reads only `$config_dir`. Files under `handlers/` must
+   be executable to be included; a non-executable one is skipped with a
+   warning, the same way the laptop postmaster would skip it.
 
    The laptop's `hooks/` dir (same config dir as `handlers/`) ships the
    same way, into ConfigMap `fork-sandbox-postmaster-hooks`, and again only
@@ -89,8 +101,9 @@ Do these in order.
    --cluster` on the fleet it is about to ship (the `fleet.yaml`,
    `personas/`, `handlers/` and `presets/` under the config dir) and
    refuses a fleet the pod could not run: the postmaster runs the same
-   check at startup and would crash-loop on a local, triage or
-   claude/codex seat.
+   check at startup and would crash-loop on a local, triage or codex
+   seat, or a claude seat with no credential installed (see "Claude
+   seats in a cluster postmaster" below).
 
    It then applies the base cluster manifests exactly as plain `install`
    does, and renders and applies the postmaster's own pieces: a
@@ -217,6 +230,49 @@ environment. The value must be a DNS-1123 subdomain name. Install also
 refuses its own Secret names, `fork-sandbox-upstream-key`,
 `fork-sandbox-postmaster-git` and `fork-sandbox-mail-api-tokens`, so a typo
 cannot hand a hook the provider key.
+
+## Claude seats in a cluster postmaster
+
+By default the cluster postmaster refuses to wake a `claude` seat, the
+same as a `codex` seat: nothing in the pod holds a claude credential. A
+site that wants claude seats installs one long-lived credential that every
+claude seat in the pod shares.
+
+The credential is a long-lived OAuth token, minted once and never
+refreshed in the cluster. An interactive login's access token lasts only
+hours and nothing in the pod refreshes it; and a refresh revokes the
+previous access token at once, which would cut off every claude seat in
+flight, since each run's claude-proxy loads its token once at pod start. A
+long-lived token has neither problem.
+
+To make the credential file:
+
+```
+claude setup-token
+jq -n --arg t "$TOKEN" --argjson e "<expiry in epoch ms>" \
+    '{claudeAiOauth: {accessToken: $t, expiresAt: $e}}' > claude-cluster.json
+```
+
+Compute the expiry as `$(( $(date -d '+1 year' +%s) * 1000 ))` on Linux or
+`$(( $(date -v+1y +%s) * 1000 ))` on macOS, and use the expiry
+`claude setup-token` itself reports if it differs from a flat one-year
+guess.
+
+Set `K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE` in `k8s.env` to that file's
+path and run `install --postmaster`. Install refuses a token expiring
+within 7 days: a cluster that never refreshes the token cannot afford one
+that expires soon, so mint a longer-lived one with `claude setup-token`
+instead.
+
+One token serves every claude seat in the cluster, and every seat bills
+that subscription. A claude seat's in-pod review loop still runs pi: `--k8s
+--harness claude` requires `--review-harness pi`, unchanged by this
+feature.
+
+**Rotation** is the same as any other config change: replace the file at
+`K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE` and re-run `install --postmaster`.
+The credential is part of the `checksum/pm-config` annotation, so a
+changed file rolls the pod.
 
 ## Operators
 

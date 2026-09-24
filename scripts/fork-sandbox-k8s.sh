@@ -701,7 +701,7 @@
 #                         future -- install refuses otherwise, since a
 #                         shorter-lived token (an interactive login's, say)
 #                         would leave every claude seat in flight stranded
-#                         when it expires. See docs/kubernetes-runs.md,
+#                         when it expires. See docs/cluster-postmaster.md,
 #                         "Claude seats in a cluster postmaster". Rotating
 #                         its content rolls the pod.
 #
@@ -721,7 +721,7 @@
 # keeps its fleet and personas in a repo of its own. Unset or empty falls
 # back to $config_dir, unchanged from before this pair of keys existed.
 # Every other install-time dir (prompts, handlers, hooks, presets) still
-# reads only $config_dir; see docs/kubernetes-runs.md.
+# reads only $config_dir; see docs/cluster-postmaster.md.
 
 set -euo pipefail
 
@@ -2904,7 +2904,7 @@ cmd_install() {
         fi
         # K8S_POSTMASTER_CLAUDE_CREDENTIALS_FILE, when set, ships a
         # long-lived claude OAuth token into the cluster postmaster (see
-        # docs/kubernetes-runs.md, "Claude seats in a cluster postmaster").
+        # docs/cluster-postmaster.md, "Claude seats in a cluster postmaster").
         # The token is never captured into a shell variable here -- every
         # check below is a boolean jq -e test against the file directly --
         # so there is nothing to accidentally echo. expiresAt is not
@@ -2935,7 +2935,7 @@ cmd_install() {
                 echo "postmaster pod loads it once at start and holds it for every" >&2
                 echo "claude seat until this file is replaced and install is rerun." >&2
                 echo "Mint a long-lived one with 'claude setup-token'; see" >&2
-                echo "docs/kubernetes-runs.md, 'Claude seats in a cluster postmaster'." >&2
+                echo "docs/cluster-postmaster.md, 'Claude seats in a cluster postmaster'." >&2
                 exit 1
             fi
         fi
