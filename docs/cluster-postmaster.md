@@ -60,9 +60,10 @@ Do these in order.
    | `K8S_POSTMASTER_PROJECT` | no | directory name under `$HOME/src` in the pod; defaults to the URL's last path component with a trailing `.git` stripped. Must match `^[A-Za-z0-9][A-Za-z0-9._-]*$`, so it can never be `.` or `..`. |
    | `K8S_POSTMASTER_GIT_KEY_FILE` | yes | laptop path to the deploy private key from step 2 |
    | `K8S_POSTMASTER_KNOWN_HOSTS_FILE` | yes | laptop path to the known_hosts file from step 2 |
-   | `K8S_POSTMASTER_STORAGE_CLASS` | no | PVC `storageClassName`; empty (the default) omits the field, so the cluster's default StorageClass applies |
-   | `K8S_POSTMASTER_STORAGE` | no | PVC requested size; default `20Gi`; must match `^[0-9]+(Mi\|Gi\|Ti)$` |
-   | `K8S_POSTMASTER_ACCESS_MODE` | no | `ReadWriteOncePod` (default) or `ReadWriteOnce`, for a StorageClass or CSI driver that does not support RWOP yet; anything else is refused |
+   | `K8S_POSTMASTER_STORAGE_CLASS` | no | `storageClassName` of both PVCs; empty (the default) omits the field, so the cluster's default StorageClass applies |
+   | `K8S_POSTMASTER_STORAGE` | no | the data volume's requested size; default `20Gi`; must match `^[0-9]+(Mi\|Gi\|Ti)$` |
+   | `K8S_POSTMASTER_MAIL_STORAGE` | no | the mail volume's requested size; default `2Gi`; same pattern as `K8S_POSTMASTER_STORAGE` |
+   | `K8S_POSTMASTER_ACCESS_MODE` | no | access mode of both PVCs: `ReadWriteOncePod` (default) or `ReadWriteOnce`, for a StorageClass or CSI driver that does not support RWOP yet; anything else is refused |
    | `K8S_POSTMASTER_OPERATORS` | no | comma-separated `@names` that carry rule-1 authority; default `@operator`. See "Operators". |
    | `K8S_POSTMASTER_HOOKS_SECRET` | no | the name of a Secret you create in the namespace, to hand your hooks credentials. Install never creates or reads it, only references it. Must be a DNS-1123 subdomain name. See "Hooks". |
    | `K8S_MAIL_API_TOKENS_FILE` | no | laptop path to the mail API tokens file; when set, the mail API is deployed. See "The mail API". |
@@ -107,7 +108,7 @@ Do these in order.
 
    It then applies the base cluster manifests exactly as plain `install`
    does, and renders and applies the postmaster's own pieces: a
-   ServiceAccount, Role and RoleBinding, a PVC, a Secret holding the deploy
+   ServiceAccount, Role and RoleBinding, two PVCs, a Secret holding the deploy
    key and known_hosts, one or more ConfigMaps, and the Deployment itself
    (plus the mail API's Secret and Service when it is enabled).
    `--dry-run` prints everything it would apply, with each Secret's content
@@ -139,6 +140,12 @@ Do these in order.
   existing clone to `origin`'s tip) and the postmaster itself never fetches
   again afterward. A running pod does not pick up new commits on its own;
   restart it (a rollout, or deleting the pod) to pull them in.
+- **Moving to the two-volume storage layout.** An install made before it
+  has one PVC laid out in subPath directories that may be root-owned, which
+  the pod cannot write. Scale the Deployment to 0, delete PVC
+  `fork-sandbox-postmaster`, then run `install --postmaster` again. This
+  discards the old store; it holds no imported threads (see "A fresh
+  store").
 - **In-flight seats survive a rollout.** A restarted postmaster adopts
   still-running Jobs instead of re-spawning them, so a rollout does not
   lose a seat's work in progress.
@@ -195,10 +202,10 @@ turns off the automatic mount and projects the token into the postmaster
 container only, so the network-facing container cannot read the
 namespace's Secrets. It has its own `$HOME` and `/tmp`, never the
 postmaster's, since the postmaster reads its kubeconfig, gitconfig and
-deploy key from `$HOME`. It also mounts only the mail root
-(`/var/tmp/claude-scratch/agent-mail`) of the scratch volume, not the whole
-scratch root: the postmaster's wake directories under `forks/` hold the
-launch records it executes, and stay out of the API container's reach. The
+deploy key from `$HOME`. It also mounts only the mail volume
+(at `/var/tmp/claude-scratch/agent-mail`), never the data volume: the
+postmaster's wake directories under `forks/` hold the launch records it
+executes, and stay out of the API container's reach. The
 mail root's `.postmaster` state is writable from the API (it needs that for
 `flag` and `unflag`), and holds run records naming a wake directory, so in
 cluster mode the postmaster only adopts a run whose directory is one of its
@@ -312,12 +319,23 @@ that needs more raises the quota where `00-namespace.yaml` is rendered.
 
 ## Storage
 
-One PVC backs the whole pod. `ReadWriteOncePod` (or `ReadWriteOnce` as a
-fallback) together with the Deployment's `Recreate` strategy keeps exactly
-one writer at a time, which matters because the store's lock is a local
-`flock` with no cluster-wide coordination behind it. The PVC holds the
-scratch tree, the run directories, the project clone under `$HOME/src`,
-and the durable run log and other state under `$HOME/.claude`.
+Two PVCs back the pod. The data volume, `fork-sandbox-postmaster`, mounts at
+`/var/tmp/claude-scratch` and holds the scratch tree, the run directories,
+and, under `.pm-home/`, the project clone and `~/.claude` (the durable run
+log and other state), which pod init links from `$HOME/src` and
+`$HOME/.claude`. The mail volume, `fork-sandbox-postmaster-mail`, mounts at
+`/var/tmp/claude-scratch/agent-mail` inside it, holds the mail store, and is
+the only volume the mail API container sees.
+
+`ReadWriteOncePod` (or `ReadWriteOnce` as a fallback) together with the
+Deployment's `Recreate` strategy keeps exactly one writer at a time on each
+volume, which matters because the store's lock is a local `flock` with no
+cluster-wide coordination behind it.
+
+Both volumes must be writable at their root by the pod's `fsGroup`. Nothing
+uses `subPath`, because kubelet may create a missing subPath directory as
+root, which a non-root pod cannot write; pod init makes the directories it
+needs on the volume roots instead.
 
 ## Network
 
