@@ -353,6 +353,27 @@ handoff_file_for_agent() {
     printf '%s' "$FORK_SANDBOX_MAIL_ROOT/.postmaster/handoffs/$run_id.md"
 }
 
+# ---- hook fixtures shared by the on-harvest / on-target / on-quiescent tests ----
+# Every hook writes the FS_* part of its environment to <event>.last and one
+# line to <event>.count in $HK_OUT; the tests read those back.
+hk_install() {
+    local ev
+    new_root HK_DIR
+    new_root HK_OUT
+    export HK_OUT FORK_SANDBOX_HOOKS_DIR="$HK_DIR" FORK_SANDBOX_POSTMASTER_HOOK_DETACH=inline
+    for ev in "$@"; do
+        cat > "$HK_DIR/$ev" <<'HOOK'
+#!/usr/bin/env bash
+env | grep '^FS_' | sort > "$HK_OUT/$FS_HOOK_EVENT.last"
+echo x >> "$HK_OUT/$FS_HOOK_EVENT.count"
+HOOK
+        chmod +x "$HK_DIR/$ev"
+    done
+}
+hk_uninstall() { unset FORK_SANDBOX_HOOKS_DIR FORK_SANDBOX_POSTMASTER_HOOK_DETACH HK_OUT; }
+hk_count() { [[ -f "$HK_OUT/$1.count" ]] && wc -l < "$HK_OUT/$1.count" || echo 0; }
+hk_env() { sed -n "s/^$2=//p" "$HK_OUT/$1.last" 2>/dev/null; }
+
 # ============================================================
 printf '\n== To wakes, Cc wakes by default; list wakes every member once; direct+list dedup ==\n'
 # ============================================================
@@ -4360,6 +4381,7 @@ check "happy: FS_HANDLER_VIA is 'to' for a direct To: wake" "VIA:to" \
     "$(grep -- '^VIA:' "$HANDLER_LOG")"
 contains "happy: the rendered thread reaches stdin (subject present)" \
     "$(sed -n '/----STDIN----/,/----END----/p' "$HANDLER_LOG")" "Happy path"
+
 happy_reply=""
 for f in "$FORK_SANDBOX_MAIL_ROOT/threads/$tid"/*.msg; do
     [[ -e "$f" ]] || continue
@@ -4602,6 +4624,30 @@ check "handler-outbox: no run-id directory survives across every scenario above"
 
 unset FORK_SANDBOX_POSTMASTER_TRIAGE_LAUNCHER
 unset FORK_SANDBOX_HANDLERS_DIR
+# --- on-harvest from a handler seat: empty branch, one posted id ---
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+hk_install on-harvest
+hkm_mid="$(send_msg '@carol' '@happy' 'Hook handler' 'do the hooked thing')"
+hkm_tid="$(thread_of "$hkm_mid")"
+once
+check "on-harvest (handler): fires once" 1 "$(hk_count on-harvest)"
+check "on-harvest (handler): FS_HOOK_BRANCH is empty" "" "$(hk_env on-harvest FS_HOOK_BRANCH)"
+check "on-harvest (handler): FS_HOOK_AGENT is the seat" "happy" "$(hk_env on-harvest FS_HOOK_AGENT)"
+check "on-harvest (handler): FS_HOOK_THREAD is the full thread id" "$hkm_tid" "$(hk_env on-harvest FS_HOOK_THREAD)"
+hk_reply_file=""
+for f in "$FORK_SANDBOX_MAIL_ROOT/threads/$hkm_tid"/*.msg; do
+    grep -qF 'Handled, thanks.' "$f" && hk_reply_file="$f"
+done
+check "on-harvest (handler): FS_HOOK_MESSAGES is the posted message id" \
+    "$(header_of_file "$hk_reply_file" Message-ID)" "$(hk_env on-harvest FS_HOOK_MESSAGES)"
+contains "on-harvest (handler): the event line carries the hook file" \
+    "$(cat "$work/once.out")" "pm hook thread=${hkm_tid:0:8} hook=on-harvest file=on-harvest exit=0"
+: > "$HANDLER_LOG"
+hkm_mid="$(send_msg '@carol' '@noreply' 'Hook noreply' 'nothing to say')"
+once
+check "on-harvest (handler): a harvest that posted nothing fires nothing" 1 "$(hk_count on-harvest)"
+hk_uninstall
 export FORK_SANDBOX_FLEET_FILE="$SAVED_FLEET_FILE"
 export FORK_SANDBOX_PERSONAS_DIR="$SAVED_PERSONAS_DIR"
 
@@ -5996,6 +6042,56 @@ rt5_state="$(cat "$PM_STATE_DIR/review-target/$rt5_tid.env" 2>/dev/null)"
 contains "review-target case B1: state file VERSION advanced to 2" "$rt5_state" "VERSION=2"
 contains "review-target case B1: state file BRANCH updated to the wake's branch" "$rt5_state" "BRANCH=$rt5_branch"
 contains "review-target case B1: state file SHA updated to the wake's resolved sha" "$rt5_state" "SHA=$rt5_branch_sha"
+
+# ---- on-harvest: a sets seat's two-reply harvest, the second carrying Version: 2 ----
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+hk_install on-harvest
+printf '%s\n' 'kick off review' > "$work/body.tmp"
+hkh_mid="$("$MAIL" send --from '@carol' --to '@ken' --subject 'hook harvest topic' \
+    --body "$work/body.tmp" --hops 8 --review-target "pm-review-target-test-seed5:$rt5_seed_sha" 2>/dev/null)"
+hkh_tid="$(thread_of "$hkh_mid")"
+once
+check "on-harvest: the first harvest (the stub's one reply) fires once" 1 "$(hk_count on-harvest)"
+check "on-harvest: FS_TARGET_VERSION is 1 before the target moves" 1 "$(hk_env on-harvest FS_TARGET_VERSION)"
+hkh_env="$(latest_env_for_agent ken)"
+hkh_run_dir="$(env_val "$hkh_env" RUN_DIR)"
+hkh_branch="$(env_val "$hkh_env" BRANCH)"
+git -C "$PROJECT_DIR" branch "$hkh_branch" >/dev/null 2>&1
+rm -f -- "$PM_STATE_DIR/harvested/$(basename "$hkh_env" .env)" "$hkh_run_dir/summary.json" "$hkh_run_dir/exit-code"
+mkdir -p -- "$hkh_run_dir/outbox"
+rm -f -- "$hkh_run_dir/outbox"/*
+printf 'Version: 2\n\nHook harvest first reply.\n' > "$hkh_run_dir/outbox/mail-1.md"
+printf '\nHook harvest second reply.\n' > "$hkh_run_dir/outbox/mail-2.md"
+printf '0\n' > "$hkh_run_dir/exit-code"
+printf '{}\n' > "$hkh_run_dir/summary.json"
+once
+check "on-harvest: a harvest posting two replies fires once more, not twice" 2 "$(hk_count on-harvest)"
+hkh_ids=()
+for hkh_body in 'Hook harvest first reply.' 'Hook harvest second reply.'; do
+    for f in "$FORK_SANDBOX_MAIL_ROOT/threads/$hkh_tid"/*.msg; do
+        grep -qF "$hkh_body" "$f" && hkh_ids+=("$(header_of_file "$f" Message-ID)")
+    done
+done
+check "on-harvest: FS_HOOK_MESSAGES is both ids, in posting order" "${hkh_ids[*]}" "$(hk_env on-harvest FS_HOOK_MESSAGES)"
+check "on-harvest: FS_HOOK_RUN is the run id" "$(basename "$hkh_env" .env)" "$(hk_env on-harvest FS_HOOK_RUN)"
+check "on-harvest: FS_HOOK_BRANCH is the wake's branch" "$hkh_branch" "$(hk_env on-harvest FS_HOOK_BRANCH)"
+check "on-harvest: FS_HOOK_AGENT is the resolved seat" "ken" "$(hk_env on-harvest FS_HOOK_AGENT)"
+check "on-harvest: the hook sees the moved target (FS_TARGET_VERSION=2)" 2 "$(hk_env on-harvest FS_TARGET_VERSION)"
+check "on-harvest: FS_TARGET_BRANCH is the moved branch" "$hkh_branch" "$(hk_env on-harvest FS_TARGET_BRANCH)"
+check "on-harvest: FS_TARGET_SET_BY names the setter" "@ken" "$(hk_env on-harvest FS_TARGET_SET_BY)"
+check "on-harvest: FS_TARGET_REPO is the deliver --project path" "$PROJECT_DIR" "$(hk_env on-harvest FS_TARGET_REPO)"
+check "on-harvest: FS_HOOK_MAIL_ROOT is the mail root" "$FORK_SANDBOX_MAIL_ROOT" "$(hk_env on-harvest FS_HOOK_MAIL_ROOT)"
+
+# A harvest that posts nothing fires nothing.
+rm -f -- "$PM_STATE_DIR/harvested/$(basename "$hkh_env" .env)" "$hkh_run_dir/summary.json" "$hkh_run_dir/exit-code"
+rm -f -- "$hkh_run_dir/outbox"/*
+printf '0\n' > "$hkh_run_dir/exit-code"
+printf '{}\n' > "$hkh_run_dir/summary.json"
+once
+check "on-harvest: a harvest that posted nothing fires nothing" 2 "$(hk_count on-harvest)"
+hk_uninstall
 
 # ---- review-target case B2: Version: 1 on a thread already at VERSION=1
 # does not advance -- flagged, not posted, state unchanged ----

@@ -2534,6 +2534,7 @@ pm_exec_wake() {
     # $STATE, which nothing else ever removes -- fleet teardown only
     # touches the paths fs_pm_state_paths names, and none of those is
     # this. Every byte a handler ever wrote here is already either
+    PM_HARVEST_POSTED=()
     # harvested into the mail store above or was malformed and named in a
     # pm_flag reason, so there is nothing left worth keeping it for.
     rm -rf -- "$outbox"
@@ -2566,6 +2567,8 @@ pm_held_write() {
     local tmp
     tmp="$(mktemp "$STATE/held/$tid/.tmp.XXXXXX")"
     {
+
+    pm_hook_on_harvest "$tid" "$run_id" "" "$agent" "${PM_HARVEST_POSTED[@]}"
         printf 'TRIGGER=%s\n' "$trigger"
         printf 'SINCE=%s\n' "$since"
         printf 'RETRY=%s\n' "$retry"
@@ -3431,6 +3434,21 @@ pm_flag_quote_line() {
 
 pm_harvest_one_file() {
     local mf="$1" agent="$2" tid="$3" trigger="$4" trigger_hops="$5"
+# The Message-ID of every message pm_harvest_one_file posted since the caller
+# last reset this, in posting order -- what on-harvest reports.
+PM_HARVEST_POSTED=()
+
+# Fires on-harvest once for one run's harvest when it posted anything:
+# pm_hook_on_harvest <tid> <run-id> <branch> <agent> <posted-id>...
+pm_hook_on_harvest() {
+    local tid="$1" run="$2" branch="$3" agent="$4"
+    shift 4
+    (( $# )) || return 0
+    local IFS=' '
+    pm_hook_fire on-harvest "$tid" "FS_HOOK_MESSAGES=$*" "FS_HOOK_RUN=$run" \
+        "FS_HOOK_BRANCH=$branch" "FS_HOOK_AGENT=$agent"
+}
+
     local harness="${6:-}" model="${7:-}" network="${8:-}" project="${9:-}"
     local review_target_key="${10:-}" wake_branch="${11:-}"
     local spawn_rt_branch="${12:-}" spawn_rt_sha="${13:-}" spawn_rt_version="${14:-}"
@@ -3577,7 +3595,8 @@ pm_harvest_one_file() {
         cmd+=(--header "X-Version: $spawn_rt_version")
     fi
 
-    if ! "${cmd[@]}" >/dev/null 2>"$body_file.err"; then
+    local posted_id=""
+    if ! posted_id="$("${cmd[@]}" 2>"$body_file.err")"; then
         rc=1
     fi
     local err_out=""
@@ -3612,6 +3631,7 @@ pm_followup_wake() {
     # Returns 1 on every early refusal below (never reaching pm_spawn_wake)
     # and 0 once it does -- pm_retry_pass (the only caller that checks this
     # return) treats 1 as terminal for that trigger's retry schedule: hops
+    [[ -z "$posted_id" ]] || PM_HARVEST_POSTED+=("$posted_id")
     # and thread-budget stay refused forever once tripped, so leaving the
     # schedule in place would just retry into the same gate on every later
     # pass. The pre-existing pending-message caller (pm_harvest_run) never
@@ -4077,6 +4097,7 @@ pm_harvest_run() {
             replies=$(( replies + 1 ))
         fi
     done
+    PM_HARVEST_POSTED=()
     pm_event "harvest thread=${tid:0:8} agent=$agent replies=$replies"
 
     mkdir -p -- "$HARVESTED"
@@ -4086,6 +4107,7 @@ pm_harvest_run() {
     # never resumed anything has no session for clearing to help), and 3
     # in a row for the same pair clears the recorded session so the next
     # wake starts fresh rather than wedging on it forever. Gated on
+    local -a posted_ids=("${PM_HARVEST_POSTED[@]}")
     # sessions_tracked too: a given-mode harness (pi) always sets RESUMED
     # (its id is derived, not discovered -- see pm_spawn_wake), so RESUMED
     # alone would count every failed pi wake toward a clear that can never
@@ -4150,6 +4172,8 @@ pm_harvest_pass() {
     for f in "$RUNS"/*.env; do
         [[ -e "$f" ]] || continue
         rid="$(basename -- "$f" .env)"
+
+    pm_hook_on_harvest "$tid" "$rid" "$branch" "$agent" "${posted_ids[@]}"
         [[ -e "$HARVESTED/$rid" ]] && continue
         pm_harvest_run "$project" "$rid"
     done
