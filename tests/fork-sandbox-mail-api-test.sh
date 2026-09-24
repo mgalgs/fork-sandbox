@@ -395,6 +395,35 @@ check "read only: send with a grant flag is 403 (needs grant)" "403" \
 check "grant cap: send with a grant flag is 200" "200" \
     "$(xr "$tok/ci-kickoff" --tool mail --stdin hi -- send --from @ci-kickoff --to @x --subject s --body - --allow-namespace preview-pr-7 --reach-probe svc.preview-pr-7:80)"
 check "grant cap: that send ran: rc 0" "0" "$(rjson rc)"
+check "grant cap: grant --context-secret: rc 0" "0" \
+    "$(xr "$tok/ci-kickoff" --tool mail -- grant "$seed" --context-secret preview-ctx >/dev/null; rjson rc)"
+check "grant cap: the grant file carries CONTEXT_SECRET=preview-ctx" "CONTEXT_SECRET=preview-ctx" \
+    "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/grants/$seed.env" 2>/dev/null)"
+check "grant cap: grant --show --json carries context_secret" "1" \
+    "$(xr "$tok/ci-kickoff" --tool mail -- grant "$seed" --show --json >/dev/null; rjson stdout | grep -c '"context_secret": "preview-ctx"')"
+check "the operator clears the secret grant: rc 0" "0" \
+    "$(xr "$tok/laptop" --tool mail -- grant "$seed" --clear >/dev/null; rjson rc)"
+check "no caps: grant --context-secret is 403" "403" \
+    "$(xr "$tok/bot" --tool mail -- grant "$seed" --context-secret preview-ctx)"
+check "no caps: the refused grant wrote nothing" "0" \
+    "$([[ -f "$FORK_SANDBOX_MAIL_ROOT/.postmaster/grants/$seed.env" ]] && echo 1 || echo 0)"
+check "read only: send with --context-secret is 403 (needs grant)" "403" \
+    "$(xr "$tok/reader" --tool mail --stdin hi -- send --from @reader --to @x --subject s --body - --context-secret preview-ctx)"
+cs_threads_before="$(find "$FORK_SANDBOX_MAIL_ROOT/threads" -maxdepth 1 -type d | wc -l)"
+check "no caps: send with --context-secret is 403" "403" \
+    "$(xr "$tok/bot" --tool mail --stdin hi -- send --from @bot --to @x --subject s --body - --context-secret preview-ctx)"
+check "no caps: the refused send created no thread" "$cs_threads_before" \
+    "$(find "$FORK_SANDBOX_MAIL_ROOT/threads" -maxdepth 1 -type d | wc -l)"
+check "grant cap: send with --context-secret is 200" "200" \
+    "$(xr "$tok/ci-kickoff" --tool mail --stdin hi -- send --from @ci-kickoff --to @x --subject s --body - --context-secret preview-ctx)"
+check "grant cap: that send ran: rc 0" "0" "$(rjson rc)"
+cs_send_tid="$(rjson stdout | tr -d '\n')"
+check "grant cap: that send wrote CONTEXT_SECRET=preview-ctx" "CONTEXT_SECRET=preview-ctx" \
+    "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/grants/$cs_send_tid.env" 2>/dev/null)"
+check "grant cap: a reserved Secret name passes the allowlist, check-grant refuses (rc 2)" "2" \
+    "$(xr "$tok/ci-kickoff" --tool mail -- grant "$seed" --context-secret fork-sandbox-upstream-key >/dev/null; rjson rc)"
+check "grant cap: a repeated --context-secret: 400" "400" \
+    "$(xr "$tok/ci-kickoff" --tool mail -- grant "$seed" --context-secret a --context-secret b)"
 check "the operator clears the grant: rc 0" "0" \
     "$(xr "$tok/laptop" --tool mail -- grant "$seed" --clear >/dev/null; rjson rc)"
 
@@ -622,6 +651,16 @@ shim_rc=$?
 local_rc=$?
 check "rc passthrough: a malformed id: same rc" "$local_rc" "$shim_rc"
 check "rc passthrough: a malformed id: same stderr" "$(cat "$work/lerr")" "$(cat "$work/err")"
+
+shim_cs_tid="$(as_ ci-kickoff mail --remote send --from @ci-kickoff --to @reviewer \
+    --subject "with secret" --body "$work/body.txt" --context-secret preview-ctx 2>"$work/send.err")"
+check "shim send --context-secret: rc 0" "0" "$?"
+check "shim send --context-secret: the grant file carries the flag" "CONTEXT_SECRET=preview-ctx" \
+    "$(cat "$FORK_SANDBOX_MAIL_ROOT/.postmaster/grants/$shim_cs_tid.env" 2>/dev/null)"
+as_ reader mail --remote send --from @reader --to @reviewer --subject "no cap" \
+    --body "$work/body.txt" --context-secret preview-ctx >/dev/null 2>"$work/err"
+check "shim send --context-secret without the grant cap: exit 2" "2" "$?"
+contains "shim send --context-secret without the grant cap: HTTP 403" "$(cat "$work/err")" "HTTP 403"
 
 printf '== 10. byte-exact json views through the shim ==\n'
 

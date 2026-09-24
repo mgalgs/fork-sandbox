@@ -69,14 +69,16 @@ is the next argv element. A lone '-' is a positional; any other token that
 starts with '-' is a flag, so a positional that starts with '-' is refused.
 mail:
     send    0; --from --to --cc --subject --body --attach* --hops --header*
-            --allow-namespace* --reach-probe* --review-target; --from in the
-            token's identities (the two grant flags also need cap grant,
-            --review-target needs cap target)
+            --allow-namespace* --reach-probe* --context-secret
+            --review-target; --from in the token's identities (the three
+            grant flags also need cap grant, --review-target needs cap
+            target)
     reply   0; --from --reply-to --body --to --cc --subject --attach* --hops
             --header*; --from in the token's identities
     show tree list export inbox: read (export needs --json; inbox takes --all)
     seen    1+; the first positional in the identities, and cap seen
-    grant   1; --allow-namespace* --reach-probe* --clear --show --json;
+    grant   1; --allow-namespace* --reach-probe* --context-secret --clear
+            --show --json;
             --show needs read, anything else needs grant
 postmaster:
     status  0; --thread --json; read
@@ -146,7 +148,7 @@ SPEC = {
             "--subject": VALUE, "--body": VALUE, "--attach": MULTI,
             "--hops": VALUE, "--header": MULTI,
             "--allow-namespace": MULTI, "--reach-probe": MULTI,
-            "--review-target": VALUE}),
+            "--context-secret": VALUE, "--review-target": VALUE}),
         "reply": (0, 0, {
             "--from": VALUE, "--reply-to": VALUE, "--body": VALUE,
             "--to": VALUE, "--cc": VALUE, "--subject": VALUE,
@@ -159,6 +161,7 @@ SPEC = {
         "seen": (1, None, {}),
         "grant": (1, 1, {
             "--allow-namespace": MULTI, "--reach-probe": MULTI,
+            "--context-secret": VALUE,
             "--clear": BOOL, "--show": BOOL, "--json": BOOL}),
     },
     "postmaster": {
@@ -171,6 +174,8 @@ SPEC = {
 # --context-ro takes a host directory to mount read-only into a run. A path
 # on the server's host means nothing to a remote caller, and would let one
 # name a directory of the store's host, so it is refused outright.
+# --context-secret is not refused: a Secret name means the same thing over
+# the API, and the grant cap gates it like the other grant flags.
 REFUSED_FLAGS = {
     ("mail", "send"): {"--context-ro"},
     ("mail", "grant"): {"--context-ro"},
@@ -194,7 +199,7 @@ def refused_header_name(raw):
 OPERATORS = frozenset(["@operator"])
 
 OPERATOR_ONLY = {("postmaster", "flag"), ("postmaster", "unflag")}
-GRANT_FLAGS = ("--allow-namespace", "--reach-probe")
+GRANT_FLAGS = ("--allow-namespace", "--reach-probe", "--context-secret")
 
 
 class ConfigError(Exception):

@@ -47,7 +47,7 @@ TOKEN_KEYS = ("FORK_SANDBOX_MAIL_API_TOKEN_FILE", "K8S_MAIL_API_TOKEN_FILE")
 VALUE_FLAGS = {
     "--from", "--to", "--cc", "--subject", "--body", "--attach", "--hops",
     "--header", "--allow-namespace", "--reach-probe", "--context-ro",
-    "--reply-to",
+    "--context-secret", "--reply-to",
 }
 
 
