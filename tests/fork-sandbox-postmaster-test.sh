@@ -6376,6 +6376,115 @@ unset FORK_SANDBOX_POSTMASTER_K8S
 unset FORK_SANDBOX_CONFIG_DIR
 
 # ============================================================
+printf '\n== hooks: the detached runner, its timeout, its records and its event line ==\n'
+# ============================================================
+
+# Direct calls: the script defines everything and runs nothing when sourced.
+hk_call() {
+    (
+        export FORK_SANDBOX_HOOKS_DIR="$HK_DIR"
+        # shellcheck disable=SC1090
+        source "$postmaster"
+        # shellcheck disable=SC2034  # read by the sourced functions
+        PM_EVENTS_ENABLED=1
+        # shellcheck disable=SC2034  # read by the sourced functions
+        PM_PROJECT="$PROJECT_DIR"
+        "$@"
+    )
+}
+
+hk_lock_and_fire() { pm_lock_acquire && pm_hook_fire on-target "$HK_TID"; }
+hk_lock_and_say() { pm_lock_acquire && echo locked; }
+
+new_scratch_root HK_ROOT
+export FORK_SANDBOX_MAIL_ROOT="$HK_ROOT"
+new_root HK_DIR
+HK_TID="aaaaaaaa-1111-4111-8111-000000000001"
+HK_STATE="$HK_ROOT/.postmaster"
+
+out="$(hk_call pm_hook_fire on-target "$HK_TID" 2>&1)"
+check "hooks: no hook file, no event line" "" "$out"
+check "hooks: no hook file, no record" "no" "$([[ -e "$HK_STATE/hooks" ]] && echo yes || echo no)"
+
+printf '#!/usr/bin/env bash\nexit 0\n' > "$HK_DIR/on-target"
+chmod -x "$HK_DIR/on-target"
+out="$(hk_call pm_hook_fire on-target "$HK_TID" 2>&1)"
+check "hooks: a non-executable hook is silent" "" "$out"
+check "hooks: a non-executable hook leaves no record" "no" "$([[ -e "$HK_STATE/hooks" ]] && echo yes || echo no)"
+
+printf '#!/usr/bin/env bash\necho "hook says hi"\nexit 3\n' > "$HK_DIR/on-target"
+chmod +x "$HK_DIR/on-target"
+export FORK_SANDBOX_POSTMASTER_HOOK_DETACH=inline
+out="$(hk_call pm_hook_fire on-target "$HK_TID" 2>&1)"
+check "hooks: an inline hook that exits 3 is reaped with its status" \
+    "pm hook thread=aaaaaaaa hook=on-target file=on-target exit=3" "$out"
+check "hooks: the record dir is gone after the reap" "0" \
+    "$(find "$HK_STATE/hooks/run" -mindepth 1 -maxdepth 1 | wc -l)"
+check "hooks: the log is kept under hooks/logs" "hook says hi" \
+    "$(cat "$HK_STATE"/hooks/logs/*-on-target-aaaaaaaa-*.log)"
+
+printf '#!/usr/bin/env bash\nsleep 20\n' > "$HK_DIR/on-target"
+out="$(FORK_SANDBOX_HOOK_TIMEOUT=1 hk_call pm_hook_fire on-target "$HK_TID" 2>&1)"
+check "hooks: a hook that outlives FORK_SANDBOX_HOOK_TIMEOUT reads exit=timeout" \
+    "pm hook thread=aaaaaaaa hook=on-target file=on-target exit=timeout" "$out"
+
+# Several files per event: on-<event> and on-<event>.<anything>, in name order.
+rm -f "$HK_DIR"/on-target*
+for hk_f in on-target.b on-target on-target.a; do
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$HK_DIR/$hk_f"
+    chmod +x "$HK_DIR/$hk_f"
+done
+printf '#!/usr/bin/env bash\nexit 0\n' > "$HK_DIR/on-targetx"; chmod +x "$HK_DIR/on-targetx"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$HK_DIR/on-target.off"
+out="$(hk_call pm_hook_fire on-target "$HK_TID" 2>&1)"
+check "hooks: on-<event> and on-<event>.* fire in name order, one line each" \
+    "pm hook thread=aaaaaaaa hook=on-target file=on-target exit=0
+pm hook thread=aaaaaaaa hook=on-target file=on-target.a exit=0
+pm hook thread=aaaaaaaa hook=on-target file=on-target.b exit=0" "$out"
+unset FORK_SANDBOX_POSTMASTER_HOOK_DETACH
+
+# Detached: returns at once, and the child holds no store lock.
+rm -f "$HK_DIR"/on-target*
+printf '#!/usr/bin/env bash\ntrap '"'"'kill $!'"'"' TERM\nsleep 20 &\nwait\n' > "$HK_DIR/on-target"
+chmod +x "$HK_DIR/on-target"
+hk_start="$(date +%s)"
+hk_call hk_lock_and_fire >/dev/null 2>&1 || true
+hk_took=$(( $(date +%s) - hk_start ))
+check "hooks: a detached fire returns without waiting for the hook" "yes" "$( (( hk_took < 10 )) && echo yes)"
+hk_rc2=0
+hk_out2="$(hk_call hk_lock_and_say 2>&1)" || hk_rc2=$?
+check "hooks: a running detached hook does not hold the store lock" "0:locked" "$hk_rc2:$hk_out2"
+hk_recs="$(find "$HK_STATE/hooks/run" -mindepth 1 -maxdepth 1 | wc -l)"
+check "hooks: the running detached hook has a record" "1" "$hk_recs"
+pkill -f "$HK_DIR/on-target" 2>/dev/null || true
+sleep 1
+out="$(hk_call pm_hook_reap 2>&1)"
+contains "hooks: a killed detached hook is reaped, not left behind" "$out" "hook=on-target file=on-target exit="
+check "hooks: nothing is left in run/ after that reap" "0" \
+    "$(find "$HK_STATE/hooks/run" -mindepth 1 -maxdepth 1 | wc -l)"
+
+# A record whose process is gone and that never wrote exit.
+hk_dead="$HK_STATE/hooks/run/1-on-quiescent-aaaaaaaa-1"
+mkdir -p "$hk_dead"
+printf 'on-quiescent\n' > "$hk_dead/event"
+printf 'on-quiescent\n' > "$hk_dead/file"
+printf '%s\n' "$HK_TID" > "$hk_dead/thread"
+: > "$hk_dead/log"
+sleep 0 & hk_pid=$!; wait "$hk_pid"
+printf '%s\n' "$hk_pid" > "$hk_dead/pid"
+out="$(hk_call pm_hook_reap 2>&1)"
+check "hooks: a dead pid with no exit is reaped as lost" \
+    "pm hook thread=aaaaaaaa hook=on-quiescent file=on-quiescent exit=lost" "$out"
+check "hooks: the lost record's log is kept" "yes" \
+    "$([[ -e "$HK_STATE/hooks/logs/1-on-quiescent-aaaaaaaa-1.log" ]] && echo yes || echo no)"
+
+# The log directory keeps the newest 100.
+for (( hk_i = 0; hk_i < 105; hk_i++ )); do : > "$HK_STATE/hooks/logs/old-$hk_i.log"; done
+hk_call pm_hook_reap >/dev/null 2>&1
+check "hooks: hooks/logs keeps the newest 100 files" "100" \
+    "$(find "$HK_STATE/hooks/logs" -type f | wc -l)"
+
+# ============================================================
 printf '\n== --help and dispatcher wiring ==\n'
 # ============================================================
 

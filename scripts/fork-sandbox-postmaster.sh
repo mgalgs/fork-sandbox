@@ -137,6 +137,27 @@
 #                never appear on this line, only the count -- they are
 #                raw header text, and the flag reason is where they
 #                belong.
+#   hook         thread, hook=<event>, file=<hook file basename>,
+#                exit=<n|timeout|lost|launch> -- a site hook (see HOOKS
+#                below) finished. `timeout` is a wrapped status of 124 or
+#                137, `lost` is a record whose process vanished without
+#                writing a status, `launch` is a launch that failed (emitted
+#                at fire time; every other exit is emitted by the next pass).
+#
+# HOOKS
+#
+# The postmaster emits three generic events and runs site-supplied
+# executables on them: on-harvest (a harvest of one run posted at least one
+# message), on-target (a thread's review target was set or moved) and
+# on-quiescent (a thread went quiet). They live in
+# $FORK_SANDBOX_HOOKS_DIR (default ~/.config/fork-sandbox/hooks): the file
+# named exactly on-<event> and every file named on-<event>.<anything>, each
+# executable, fired independently in name order. A missing hook is silent.
+# A hook is detached (setsid, stdin /dev/null, output in a log file) and
+# never blocks routing or harvest; it runs under $FORK_SANDBOX_HOOK_TIMEOUT
+# seconds (default 300, then SIGKILL 10 s after SIGTERM). See pm_hook_fire.
+# FORK_SANDBOX_POSTMASTER_HOOK_DETACH=inline runs hooks in the foreground:
+# a test seam only.
 #
 # stderr is unchanged (errors only). Nothing sender-controlled (Subject,
 # body, raw From, attachment names) is ever a field value here -- see
@@ -881,6 +902,10 @@ NEEDS_OPERATOR_JOURNAL="$STATE/needs-operator-journal"
 # subprocess via $FLEET, never sourced), so this is its own copy of the
 # identical line.
 HANDLERS_DIR="${FORK_SANDBOX_HANDLERS_DIR:-$HOME/.config/fork-sandbox/handlers}"
+# Where the three hook executables (on-harvest, on-target, on-quiescent)
+# live -- see HOOKS in the header. Same shape as HANDLERS_DIR; hooks are
+# looked up by their fixed event name, never from anything in the store.
+HOOKS_DIR="${FORK_SANDBOX_HOOKS_DIR:-$HOME/.config/fork-sandbox/hooks}"
 # Same reasoning, same duplication, for fleet.sh's own FLEET_FILE
 # (fleet.sh:164) -- used only by pm_require_fleet_check below to decide
 # whether the startup `fleet check` gate applies at all: a personas-only
@@ -1685,6 +1710,162 @@ pm_lock_acquire() {
 pm_lock_release() {
     flock -u "$pm_lock_fd" 2>/dev/null || true
     exec {pm_lock_fd}>&- 2>/dev/null || true
+}
+
+# ---- hooks ----
+#
+# pm_hook_fire <event> <tid> [VAR=value ...] runs $HOOKS_DIR/<event> when it
+# exists and is executable, detached: the hook never blocks routing or
+# harvest. Its record lives under $STATE/hooks/run/<id>/ until pm_hook_reap
+# (start of every pass) turns it into a `pm hook` event line and moves its
+# log to $STATE/hooks/logs/. See HOOKS in the header.
+#
+# Detached means setsid with stdin /dev/null and stdout+stderr in the
+# record's log, under the same timeout binary and shape pm_exec_wake uses
+# for handlers. The child closes the store lock fd first: flock belongs to
+# the open file description, so a hook that inherited it would keep the
+# store locked after `deliver` exits and the next `deliver` would be refused.
+#
+# FORK_SANDBOX_POSTMASTER_HOOK_DETACH=inline (test seam only) runs the hook
+# in the foreground, still under the timeout and still writing its record,
+# and reaps it straight away.
+PM_PROJECT=""
+
+# shellcheck disable=SC2016  # runs in the child shell, not here
+pm_hook_wrapper='rec=$1; tmo=$2; hook=$3; to=$4
+printf "%s\n" "$$" > "$rec/pid.tmp" && mv -- "$rec/pid.tmp" "$rec/pid"
+"$to" --kill-after 10 "$tmo" "$hook" < /dev/null > "$rec/log" 2>&1
+rc=$?
+printf "%s\n" "$rc" > "$rec/exit.tmp" && mv -- "$rec/exit.tmp" "$rec/exit"'
+
+# The executables that answer $1: the one named exactly on-<event> and every
+# on-<event>.<anything>, in C-locale name order. Flat files only -- the
+# cluster ships HOOKS_DIR as a ConfigMap, which holds no subdirectories.
+pm_hook_files() {
+    local event="$1" f
+    for f in "$HOOKS_DIR/$event" "$HOOKS_DIR/$event".*; do
+        if [[ -f "$f" && -x "$f" ]]; then printf '%s\n' "${f##*/}"; fi
+    done | LC_ALL=C sort
+}
+
+# Fills PM_HOOK_ENV (an array of NAME=value words for `env`) with what every
+# hook gets: the fixed FS_HOOK_* set plus the thread's review target, when it
+# has one, then the caller's extra VAR=value words.
+pm_hook_env() {
+    local event="$1" tid="$2"
+    shift 2
+    PM_HOOK_ENV=("FS_HOOK_EVENT=$event" "FS_HOOK_THREAD=$tid"
+        "FS_HOOK_MAIL_ROOT=$MAIL_ROOT" "FS_HOOK_REPO=$PM_PROJECT")
+    local rt="$STATE/review-target/$tid.env"
+    if [[ -f "$rt" ]]; then
+        PM_HOOK_ENV+=("FS_TARGET_BRANCH=$(fs_pm_env_get "$rt" BRANCH)"
+            "FS_TARGET_SHA=$(fs_pm_env_get "$rt" SHA)"
+            "FS_TARGET_VERSION=$(fs_pm_env_get "$rt" VERSION)"
+            "FS_TARGET_SET_BY=$(fs_pm_env_get "$rt" SET_BY)"
+            "FS_TARGET_SET_AT=$(fs_pm_env_get "$rt" SET_AT)"
+            "FS_TARGET_REPO=$PM_PROJECT")
+    fi
+    PM_HOOK_ENV+=("$@")
+}
+
+pm_hook_fire() {
+    local event="$1" tid="$2"
+    shift 2
+    local name
+    name="$(pm_hook_files "$event")"
+    [[ -n "$name" ]] || return 0
+    pm_hook_env "$event" "$tid" "$@"
+    local file
+    while IFS= read -r file; do
+        pm_hook_launch "$event" "$tid" "$file"
+    done <<< "$name"
+    return 0
+}
+
+pm_hook_launch() {
+    local event="$1" tid="$2" file="$3"
+    local hook="$HOOKS_DIR/$file"
+    local id rec timeout_s
+    id="$(date +%s)-$event-${tid:0:8}-$RANDOM$RANDOM"
+    rec="$STATE/hooks/run/$id"
+    timeout_s="${FORK_SANDBOX_HOOK_TIMEOUT:-300}"
+    if ! mkdir -p -- "$rec" "$STATE/hooks/logs"; then
+        pm_event "hook thread=${tid:0:8} hook=$event file=$file exit=launch"
+        return 0
+    fi
+    printf '%s\n' "$event" > "$rec/event"
+    printf '%s\n' "$file" > "$rec/file"
+    printf '%s\n' "$tid" > "$rec/thread"
+    pm_pid_identity > "$rec/pid-identity"
+
+    if [[ "${FORK_SANDBOX_POSTMASTER_HOOK_DETACH:-}" == inline ]]; then
+        env "${PM_HOOK_ENV[@]}" bash -c "$pm_hook_wrapper" _ "$rec" "$timeout_s" "$hook" "$FS_TIMEOUT" || true
+        pm_hook_reap
+        return 0
+    fi
+    if ! (
+        [[ -z "${pm_lock_fd:-}" ]] || exec {pm_lock_fd}>&-
+        exec setsid --fork env "${PM_HOOK_ENV[@]}" bash -c "$pm_hook_wrapper" _ "$rec" "$timeout_s" "$hook" "$FS_TIMEOUT"
+    ) < /dev/null > /dev/null 2>&1; then
+        rm -rf -- "$rec"
+        pm_event "hook thread=${tid:0:8} hook=$event file=$file exit=launch"
+    fi
+    return 0
+}
+
+# True when the hook record's wrapper process is gone: pid dead, recorded
+# under another pid namespace or boot, or (no pid yet, launched more than
+# 10 s ago) never started. Same identity rule as pm_wake_is_dead.
+pm_hook_is_gone() {
+    local rec="$1" pid recorded now mtime
+    if pid="$(cat -- "$rec/pid" 2>/dev/null)"; then
+        pid="$(pm_trim "$pid")"
+        if recorded="$(cat -- "$rec/pid-identity" 2>/dev/null)" \
+            && [[ "$(pm_trim "$recorded")" != "$(pm_pid_identity)" ]]; then
+            return 0
+        fi
+        [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null && return 1
+        return 0
+    fi
+    now="$(date +%s)"
+    mtime="$("$FS_STAT" -c %Y -- "$rec/event" 2>/dev/null)" || mtime="$now"
+    (( now - mtime >= 10 ))
+}
+
+pm_hook_reap() {
+    local run_dir="$STATE/hooks/run" logs="$STATE/hooks/logs" rec id ev tid rc f file
+    [[ -d "$run_dir" ]] || return 0
+    for rec in "$run_dir"/*/; do
+        [[ -d "$rec" ]] || continue
+        rec="${rec%/}"
+        id="${rec##*/}"
+        if [[ -f "$rec/exit" ]]; then
+            rc="$(pm_trim "$(cat -- "$rec/exit" 2>/dev/null)")"
+            case "$rc" in
+                124|137) rc=timeout ;;
+                ''|*[!0-9]*) rc=lost ;;
+            esac
+        elif pm_hook_is_gone "$rec"; then
+            rc=lost
+        else
+            continue
+        fi
+        ev="$(pm_trim "$(cat -- "$rec/event" 2>/dev/null)")"
+        tid="$(pm_trim "$(cat -- "$rec/thread" 2>/dev/null)")"
+        file="$(pm_trim "$(cat -- "$rec/file" 2>/dev/null)")"
+        pm_event "hook thread=${tid:0:8} hook=$ev file=$file exit=$rc"
+        mkdir -p -- "$logs"
+        if [[ -f "$rec/log" ]]; then
+            mv -- "$rec/log" "$logs/$id.log" 2>/dev/null || true
+        else
+            : > "$logs/$id.log"
+        fi
+        rm -rf -- "$rec"
+    done
+    [[ -d "$logs" ]] || return 0
+    while IFS= read -r f; do
+        rm -f -- "${logs:?}/$f"
+    done < <(find "$logs" -maxdepth 1 -type f -printf '%T@ %f\n' | sort -rn | tail -n +101 | cut -d' ' -f2-)
 }
 
 # ---- handoff generation ----
@@ -4139,8 +4320,10 @@ cmd_deliver() {
     trap pm_lock_release EXIT
 
     PM_EVENTS_ENABLED=1
+    PM_PROJECT="$project"
 
     if (( once )); then
+        pm_hook_reap
         pm_route_pass "$project"
         pm_held_pass "$project"
         pm_retry_pass "$project"
@@ -4151,6 +4334,7 @@ cmd_deliver() {
     local stop=0
     trap 'stop=1' TERM INT
     while (( ! stop )); do
+        pm_hook_reap
         pm_route_pass "$project"
         pm_held_pass "$project"
         pm_retry_pass "$project"
@@ -4462,6 +4646,10 @@ cmd_unflag() {
     mkdir -p -- "$STATE"
     pm_unflag "$tid"
 }
+
+# Sourced (the test suite calls pm_hook_fire/pm_hook_reap directly): define
+# everything, run nothing.
+[[ "${BASH_SOURCE[0]}" == "$0" ]] || return 0
 
 if (($# == 0)); then
     usage >&2
