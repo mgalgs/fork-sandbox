@@ -26,9 +26,12 @@ USER root
 # openssh-client: the base image has git, curl, python3 and jq, but no ssh,
 # and the postmaster's pod init clones/fetches the project over ssh (deploy
 # key only -- see docs/cluster-postmaster.md).
+# python3-yaml: `deliver --cluster` parses the fleet file at startup and
+# exits without PyYAML. The import check fails the build, not the pod.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends openssh-client \
-    && rm -rf /var/lib/apt/lists/*
+    && apt-get install -y --no-install-recommends openssh-client python3-yaml \
+    && rm -rf /var/lib/apt/lists/* \
+    && python3 -c 'import yaml'
 
 # kubectl is not in the base image at all: a laptop postmaster uses whatever
 # kubectl is on the operator's PATH, but a pod has to carry its own. Pinned
