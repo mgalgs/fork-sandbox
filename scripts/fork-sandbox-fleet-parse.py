@@ -58,6 +58,14 @@ job, not a sealed harness's), or that resolves any preset (the cluster
 path is single-leg only in this phase, no maintainer tier, no repeat, no
 composed pipeline).
 
+`review-target` is fleet.yaml-only too, same reason as `backend`: a seat
+must not know it is the one moving a review thread's shared target.
+Value is the literal string `sets` or `follow` (see docs/agent-mail.md
+for what each means to the postmaster). `check` refuses more than one
+`sets` seat per fleet, and refuses either value on a seat that does not
+also resolve to `backend: k8s` -- only the k8s spawn path takes
+`--checkout`, so a local seat has no way to spawn at a target anyway.
+
 This script owns every validation rule for both documents -- YAML
 validity, the schema, name shape, the harness/network enums (including
 refusing `pi-local`, which fork-sandbox-preset-parse.py accepts but this
@@ -162,7 +170,8 @@ BACKENDS = ("local", "k8s")
 ENDPOINT_RE = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$")
 FIELDS = ("persona", "harness", "model", "network", "thinking",
           "description", "wake-on-cc", "refresh-at", "triage", "preset",
-          "handler", "command", "backend", "endpoint", "grant")
+          "handler", "command", "backend", "endpoint", "grant",
+          "review-target")
 # handler/command are deliberately absent here -- see the module
 # docstring's "handler: exec" paragraph: a handler seat is host config,
 # fleet.yaml-only, and refused as an unknown key in persona frontmatter.
@@ -175,7 +184,7 @@ FRONTMATTER_FIELDS = ("harness", "model", "network", "thinking",
 # all), which applies to a handler exactly as it does an LLM seat.
 LLM_ONLY_FIELDS = ("harness", "model", "network", "thinking", "triage",
                     "persona", "refresh-at", "preset", "backend",
-                    "endpoint", "grant")
+                    "endpoint", "grant", "review-target")
 # Only these two are wired up on the postmaster side (pm_triage_wake's
 # pi and claude arms); a triage seat naming any other harness would
 # validate here and then silently run as claude at launch, so the
@@ -457,6 +466,18 @@ def check_grant(value, path, errors):
     return value
 
 
+def check_review_target(value, path, errors):
+    """The only accepted values are the literal strings 'sets' and
+    'follow'. Cross-seat rules (at most one 'sets' seat per fleet, either
+    value only alongside 'backend: k8s') are business logic over the
+    whole document, not a single field's shape, so they live in
+    cmd_check, not here."""
+    if value not in ("sets", "follow"):
+        errors.append(f"{path}: takes 'sets' or 'follow', not '{value}'")
+        return ""
+    return value
+
+
 def check_backend_fields_pair(backend, endpoint, grant, path, errors):
     """endpoint/grant only mean anything to the k8s spawn path; on any
     other backend they would silently do nothing, so refuse the
@@ -577,6 +598,10 @@ def load_and_validate(fleet_file, label, errors):
                 v = scalar(value, path, errors)
                 if v is not None:
                     agent["grant"] = check_grant(v, path, errors)
+            elif prop == "review-target":
+                v = scalar(value, path, errors)
+                if v is not None:
+                    agent["review-target"] = check_review_target(v, path, errors)
             else:
                 errors.append(f"{label}: {path}: unknown key")
         check_network_harness_pair(agent["harness"], agent["network"],
@@ -733,6 +758,18 @@ def cmd_check(fleet_file, label, personas_dir):
     # agent just to learn `preset`.
     resolved_presets = {}
     if not errors:
+        setters = [name for name, agent in agents.items()
+                   if agent["review-target"] == "sets"]
+        if len(setters) > 1:
+            errors.append(
+                f"{label}: agents.{'/'.join(sorted(setters))}: only one "
+                f"seat may carry 'review-target: sets' per fleet")
+        for name, agent in agents.items():
+            if agent["review-target"] and agent["backend"] != "k8s":
+                errors.append(
+                    f"{label}: agents.{name}.review-target: only a "
+                    f"'backend: k8s' seat can take '--checkout'; a local "
+                    f"seat keeps its persistent clone")
         for name, agent in agents.items():
             # A handler seat is a script, not an LLM seat -- the wake
             # contract never injects a persona body into it (stdin is

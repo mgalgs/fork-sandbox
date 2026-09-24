@@ -436,6 +436,8 @@ agents:
 EOF
 rm -f "$FORK_SANDBOX_PERSONAS_DIR/all.md"
 
+# shellcheck disable=SC2016  # deliberately literal -- the heading names
+# the $USER-conditional case this section refutes, not a expansion to run.
 printf '\n== "operator" is always reserved (not $USER-conditional) ==\n'
 
 bad "an agent named 'operator' is refused, naming the reservation" \
@@ -494,12 +496,13 @@ export FORK_SANDBOX_FLEET_FILE="$saved"
 printf '\n== resolve ==\n'
 
 resolve_lines() {
-    # Reads the fifteen-line contract into named globals for assertions.
+    # Reads the sixteen-line contract into named globals for assertions.
     { read -r r_harness; read -r r_model; read -r r_thinking; read -r r_network; \
       read -r r_persona; read -r r_description; read -r r_wake_on_cc; \
       read -r r_refresh_at; read -r r_triage; read -r r_preset; \
       read -r r_handler; read -r r_command; read -r r_backend; \
-      read -r r_endpoint; read -r r_grant; } < <("$fleet" resolve "$1")
+      read -r r_endpoint; read -r r_grant; read -r r_review_target; \
+    } < <("$fleet" resolve "$1")
 }
 
 resolve_lines riffler
@@ -527,12 +530,13 @@ check "resolve: all-empty agent, command empty" "" "$r_command"
 check "resolve: all-empty agent, backend empty" "" "$r_backend"
 check "resolve: all-empty agent, endpoint empty" "" "$r_endpoint"
 check "resolve: all-empty agent, grant empty" "" "$r_grant"
+check "resolve: all-empty agent, review-target empty" "" "$r_review_target"
 check "resolve: all-empty agent still resolves a persona path" "$FORK_SANDBOX_PERSONAS_DIR/tuner.md" "$r_persona"
 
 # Piped, not captured via $(...): command substitution strips trailing
 # newlines, which would silently swallow the count when the last field
-# (grant) is empty, as it is for tuner.
-check "resolve: output is exactly fifteen lines" "15" "$("$fleet" resolve tuner | wc -l)"
+# (review-target) is empty, as it is for tuner.
+check "resolve: output is exactly sixteen lines" "16" "$("$fleet" resolve tuner | wc -l)"
 
 printf '\n== resolve: wake-on-cc / refresh-at ==\n'
 
@@ -979,6 +983,68 @@ check "frontmatter-sealed pi seat with backend k8s passes once network is pinned
 rm -f "$FORK_SANDBOX_PERSONAS_DIR/lkml.md"
 
 printf '%s\n' "$saved_fleet_for_backend" > "$FORK_SANDBOX_FLEET_FILE"
+
+printf '\n== review-target ==\n'
+
+saved_fleet_for_review_target="$(cat "$FORK_SANDBOX_FLEET_FILE")"
+
+cat > "$FORK_SANDBOX_FLEET_FILE" <<'EOF'
+agents:
+  riffler:
+    backend: k8s
+    review-target: sets
+EOF
+check "review-target: sets on a backend k8s seat passes check" "0" \
+    "$("$fleet" check >/dev/null 2>&1; echo $?)"
+resolve_lines riffler
+check "review-target: sets resolves verbatim" "sets" "$r_review_target"
+
+cat > "$FORK_SANDBOX_FLEET_FILE" <<'EOF'
+agents:
+  riffler:
+    backend: k8s
+    review-target: follow
+EOF
+check "review-target: follow on a backend k8s seat passes check" "0" \
+    "$("$fleet" check >/dev/null 2>&1; echo $?)"
+resolve_lines riffler
+check "review-target: follow resolves verbatim" "follow" "$r_review_target"
+
+bad "review-target: bad value is refused" "takes 'sets' or 'follow'" <<'EOF'
+agents:
+  riffler:
+    backend: k8s
+    review-target: nonsense
+EOF
+
+bad "review-target: two sets seats are refused" \
+    "only one seat may carry 'review-target: sets'" <<'EOF'
+agents:
+  riffler:
+    backend: k8s
+    review-target: sets
+  tuner:
+    backend: k8s
+    review-target: sets
+EOF
+
+bad "review-target: follow on a non-k8s seat is refused" \
+    "'backend: k8s' seat" <<'EOF'
+agents:
+  riffler:
+    review-target: follow
+EOF
+
+bad "review-target: handler seat cannot carry review-target" \
+    "not allowed alongside 'handler: exec'" <<'EOF'
+agents:
+  riffler:
+    handler: exec
+    command: some-handler
+    review-target: follow
+EOF
+
+printf '%s\n' "$saved_fleet_for_review_target" > "$FORK_SANDBOX_FLEET_FILE"
 
 printf '\n== expand ==\n'
 

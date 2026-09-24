@@ -401,6 +401,7 @@ fleet_read_agent() {
     fleet_wake_on_cc="" fleet_refresh_at="" fleet_triage=""
     fleet_preset="" fleet_handler="" fleet_command=""
     fleet_backend="" fleet_endpoint="" fleet_grant=""
+    fleet_review_target=""
     agent_declared=0
     [[ -n "$dump" ]] || return 0
     while IFS=$'\t' read -r kind aname field value; do
@@ -422,6 +423,7 @@ fleet_read_agent() {
             backend) fleet_backend="$value" ;;
             endpoint) fleet_endpoint="$value" ;;
             grant) fleet_grant="$value" ;;
+            review-target) fleet_review_target="$value" ;;
         esac
     done <<< "$dump"
 }
@@ -498,6 +500,11 @@ resolve_with_dump() {
     printf '%s\n' "$fleet_backend"
     printf '%s\n' "$fleet_endpoint"
     printf '%s\n' "$fleet_grant"
+    # review-target is likewise fleet.yaml-only -- no frontmatter
+    # fallback, see fork-sandbox-fleet-parse.py's docstring. This is the
+    # 16th and last resolve line; a new one must always be appended here,
+    # never inserted, or every positional reader below breaks.
+    printf '%s\n' "$fleet_review_target"
 }
 
 cmd_resolve() {
