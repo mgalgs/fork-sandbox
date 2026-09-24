@@ -8855,6 +8855,29 @@ else
         *) no "a project outside ~/src is refused" "$(cat "$err")" ;;
     esac
 fi
+
+# ~/src as a symlink (the cluster postmaster's pod links it onto its data
+# volume): a project inside it is accepted, a link inside ~/src pointing
+# outward is still refused.
+srclink_home="$(mktemp -d /var/tmp/claude-scratch/fs-k8s-srclink-test.XXXXXX)"
+tmpdirs+=("$srclink_home")
+mkdir -p "$srclink_home/home" "$srclink_home/vol/src/proj" "$srclink_home/outside/evil"
+ln -s "$srclink_home/vol/src" "$srclink_home/home/src"
+ln -s "$srclink_home/outside/evil" "$srclink_home/vol/src/escape"
+if HOME="$srclink_home/home" fs_require_src_project "$srclink_home/home/src/proj" 2>"$err"; then
+    ok "a project under a symlinked ~/src is accepted"
+else
+    no "a project under a symlinked ~/src is accepted" "$(cat "$err")"
+fi
+if HOME="$srclink_home/home" fs_require_src_project "$srclink_home/home/src/escape" 2>"$err"; then
+    no "a link inside a symlinked ~/src that points outside is refused"
+else
+    case "$(cat "$err")" in
+        *"must live under ~/src"*)
+            ok "a link inside a symlinked ~/src that points outside is refused" ;;
+        *) no "a link inside a symlinked ~/src that points outside is refused" "$(cat "$err")" ;;
+    esac
+fi
 rm -f "$err"
 
 printf '\n== fs_parse_size_bytes (fork-sandbox-lib.sh) ==\n'

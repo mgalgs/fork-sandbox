@@ -504,10 +504,15 @@ fs_pm_find_live_run() {
     return 1
 }
 
+# Real path against real path: ~/src may itself be a symlink (the cluster
+# postmaster's pod links it onto its data volume), and a project inside it
+# resolves to the link's target. A link INSIDE ~/src that points outward
+# still resolves outside the resolved ~/src, so it is still refused.
 fs_require_src_project() {
-    local project_path="$1" real
+    local project_path="$1" real src_real
     real="$("$FS_REALPATH" -m "$project_path")"
-    if [[ "$real" != "$HOME"/src/* && "$real" != "$HOME/src" ]]; then
+    src_real="$("$FS_REALPATH" -m "$HOME/src")"
+    if [[ "$real" != "$src_real"/* && "$real" != "$src_real" ]]; then
         echo "Error: the project must live under ~/src — got '$real'." >&2
         echo "An unattended agent gets the whole clone, and for most harnesses it" >&2
         echo "gets internet too, so which repos may be handed over is a security" >&2

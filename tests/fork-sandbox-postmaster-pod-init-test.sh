@@ -414,6 +414,13 @@ if [[ -d "$data_dir/.pm-home/src/proj/.git" ]]; then
 else
     no "the clone lands on the data volume" "$(find "$data_dir" 2>&1)"
 fi
+# The postmaster hands every seat's fork-sandbox.sh $HOME/src/<project>;
+# with $HOME/src a link, that path must still pass the ~/src boundary.
+if err="$(HOME="$home" bash -c 'source "$1"; fs_require_src_project "$HOME/src/proj"' _ "$repo_dir/scripts/fork-sandbox-lib.sh" 2>&1)"; then
+    ok "the linked clone passes fs_require_src_project"
+else
+    no "the linked clone passes fs_require_src_project" "$err"
+fi
 
 printf '\n== a container restart (same HOME and data dir) keeps the links ==\n'
 out="$(run_init 2>&1)"

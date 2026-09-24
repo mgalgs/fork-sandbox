@@ -3891,15 +3891,7 @@ if [[ "$handoff_real" == /var/tmp/claude-scratch/forks/* || "$handoff_real" == /
     echo "exists to stop. Stage the handoff in the scratch root itself." >&2
     exit 1
 fi
-project_real="$("$FS_REALPATH" -m "$project_path")"
-if [[ "$project_real" != "$HOME"/src/* && "$project_real" != "$HOME/src" ]]; then
-    echo "Error: the project must live under ~/src — got '$project_real'." >&2
-    echo "An unattended agent gets the whole clone, and for most harnesses it" >&2
-    echo "gets internet too, so which repos may be handed over is a security" >&2
-    echo "boundary. Work from a checkout under ~/src, or launch" >&2
-    echo "claude-sandboxed by hand for something else." >&2
-    exit 1
-fi
+fs_require_src_project "$project_path" || exit 1
 # --context-ro is the reviewed home for the one extra bind a caller may
 # need: context a host-side script gathered for the session to read. The
 # path constraint is what keeps it from becoming the --bind-ro primitive
