@@ -278,6 +278,7 @@ mint_into laptop --role operator
 mint_into ci-kickoff --role client --as @ci-kickoff --caps read,grant
 mint_into bot --role client --as @bot
 mint_into reader --role client --as @reader --caps read,seen
+mint_into targeter --role client --as @targeter --caps target,read
 printf '# a comment\n\n' | cat - "$tokens_file" > "$tokens_file.new" && mv "$tokens_file.new" "$tokens_file"
 
 server_log="$work/server.log"
@@ -644,6 +645,54 @@ check "shim show: rc 0" "0" "$?"
 check "local show: rc 0" "0" "$?"
 check "mail show: byte-exact via shim" "0" \
     "$(cmp -s "$work/local-show.out" "$work/shim-show.out"; echo $?)"
+
+printf '== 11. review-target: the target cap, and header refusal ==\n'
+
+rt_branch="main"
+rt_sha="$(printf 'a%.0s' $(seq 40))"
+
+out="$(xr "$tok/targeter" --tool mail --stdin hi -- send --from @targeter --to @x --subject rt --body - --review-target "$rt_branch:$rt_sha")"
+check "target cap: send --review-target: 200" "200" "$out"
+check "target cap: that send ran: rc 0" "0" "$(rjson rc)"
+rt_tid="$(rjson stdout | tr -d '\n')"
+check "target cap: a review-target state file appears" "1" \
+    "$([[ -f "$FORK_SANDBOX_MAIL_ROOT/.postmaster/review-target/$rt_tid.env" ]] && echo 1 || echo 0)"
+check "review-target state: BRANCH" "BRANCH=$rt_branch" \
+    "$(grep '^BRANCH=' "$FORK_SANDBOX_MAIL_ROOT/.postmaster/review-target/$rt_tid.env")"
+check "review-target state: VERSION=1" "VERSION=1" \
+    "$(grep '^VERSION=' "$FORK_SANDBOX_MAIL_ROOT/.postmaster/review-target/$rt_tid.env")"
+shown_rt="$("$mail" show "$rt_tid")"
+contains "the setter message carries X-Review-Target-Set" "$shown_rt" "X-Review-Target-Set: $rt_branch $rt_sha"
+contains "the setter message also carries plain X-Review-Target" "$shown_rt" "X-Review-Target: $rt_branch $rt_sha"
+contains "the setter message carries X-Version: 1" "$shown_rt" "X-Version: 1"
+
+threads_before_rt="$(find "$FORK_SANDBOX_MAIL_ROOT/threads" -mindepth 1 -maxdepth 1 | wc -l)"
+check "no target cap: send --review-target: 403" "403" \
+    "$(xr "$tok/bot" --tool mail --stdin hi -- send --from @bot --to @x --subject rt2 --body - --review-target "$rt_branch:$rt_sha")"
+check "no target cap: nothing written" "$threads_before_rt" \
+    "$(find "$FORK_SANDBOX_MAIL_ROOT/threads" -mindepth 1 -maxdepth 1 | wc -l)"
+
+check "X-Review-Target-Set header refused on send" "403" \
+    "$(xr "$tok/ci-kickoff" --tool mail --stdin hi -- send --from @ci-kickoff --to @x --subject h --body - --header "X-Review-Target-Set: $rt_branch $rt_sha")"
+contains "... says why" "$(rjson error)" "review-target"
+check "x-version header (lowercase name) refused on send" "403" \
+    "$(xr "$tok/ci-kickoff" --tool mail --stdin hi -- send --from @ci-kickoff --to @x --subject h --body - --header "x-version: 3")"
+check "X-Review-Target header refused on send" "403" \
+    "$(xr "$tok/ci-kickoff" --tool mail --stdin hi -- send --from @ci-kickoff --to @x --subject h --body - --header "X-Review-Target: $rt_branch $rt_sha")"
+check "X-Review-Target-Set header refused on reply" "403" \
+    "$(xr "$tok/ci-kickoff" --tool mail --stdin hi -- reply --from @ci-kickoff --reply-to "$seed" --body - --header "X-Review-Target-Set: $rt_branch $rt_sha")"
+check "x-version header (lowercase name) refused on reply" "403" \
+    "$(xr "$tok/ci-kickoff" --tool mail --stdin hi -- reply --from @ci-kickoff --reply-to "$seed" --body - --header "x-version: 3")"
+check "X-Review-Target header refused on reply" "403" \
+    "$(xr "$tok/ci-kickoff" --tool mail --stdin hi -- reply --from @ci-kickoff --reply-to "$seed" --body - --header "X-Review-Target: $rt_branch $rt_sha")"
+check "header refusal applies to the operator too" "403" \
+    "$(xr "$tok/laptop" --tool mail --stdin hi -- send --from @operator --to @x --subject h --body - --header "X-Version: 1")"
+check "an ordinary X-Foo header still passes" "200" \
+    "$(xr "$tok/ci-kickoff" --tool mail --stdin hi -- send --from @ci-kickoff --to @x --subject h --body - --header "X-Foo: bar")"
+check "... that send ran: rc 0" "0" "$(rjson rc)"
+
+check "--review-target on reply is refused" "403" \
+    "$(xr "$tok/targeter" --tool mail --stdin hi -- reply --from @targeter --reply-to "$seed" --body - --review-target "$rt_branch:$rt_sha")"
 
 printf '== 13. the log ==\n'
 

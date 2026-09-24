@@ -5,7 +5,7 @@ postmaster, for callers that must not have a shell on the store's host.
 Usage: fork-sandbox-mail-api.py serve --tokens <file> [--listen 0.0.0.0:8080]
        fork-sandbox-mail-api.py check --tokens <file>
        fork-sandbox-mail-api.py mint --role operator|client --label <label>
-                                [--as @a[,@b]] [--caps read,grant,seen]
+                                [--as @a[,@b]] [--caps read,grant,seen,target]
 
 The server runs ONLY the existing verbs of fork-sandbox-mail.sh (mail) and
 fork-sandbox-postmaster.sh (postmaster), from a fixed allowlist, and
@@ -41,7 +41,7 @@ Tokens file, one entry per line ('#' comments and blank lines ignored):
 The file holds the SHA-256 of each token, never the token. An operator may run
 any verb and use any identity; its identities and caps must be '-'. A client
 lists the @names it may use as --from (or '-') and its caps, a subset of
-read, grant and seen (or '-'). Startup refuses the file (exit 2, one line
+read, grant, seen and target (or '-'). Startup refuses the file (exit 2, one line
 naming the label, never the hash) on a malformed line, an unknown role or
 cap, a malformed identity, a shared hash or label, an empty table, an
 operator entry with identities or caps, or a client entry that lists a name
@@ -69,8 +69,9 @@ is the next argv element. A lone '-' is a positional; any other token that
 starts with '-' is a flag, so a positional that starts with '-' is refused.
 mail:
     send    0; --from --to --cc --subject --body --attach* --hops --header*
-            --allow-namespace* --reach-probe*; --from in the token's
-            identities (the two grant flags also need cap grant)
+            --allow-namespace* --reach-probe* --review-target; --from in the
+            token's identities (the two grant flags also need cap grant,
+            --review-target needs cap target)
     reply   0; --from --reply-to --body --to --cc --subject --attach* --hops
             --header*; --from in the token's identities
     show tree list export inbox: read (export needs --json; inbox takes --all)
@@ -80,7 +81,12 @@ mail:
 postmaster:
     status  0; --thread --json; read
     flag unflag: operator only
-(* = repeatable.) An operator passes every check. --body must be '-': the
+(* = repeatable.) On mail send and mail reply, --header may not set
+X-Version or a name that starts with X-Review-Target (case-insensitively):
+those headers are the review-target contract, and only mail's own
+--review-target flag and the postmaster may write them -- this refusal
+applies to an operator token too. An operator passes every other check.
+--body must be '-': the
 body comes in stdin_b64. --attach names a key of "files" (a plain basename,
 at most 4 MiB decoded, at most 16 files, no unreferenced keys); the server
 writes each file to a private temp directory and deletes it after the call.
@@ -109,7 +115,7 @@ import time
 
 PROG = "fork-sandbox-mail-api"
 ROLES = ("operator", "client")
-CAPS = ("read", "grant", "seen")
+CAPS = ("read", "grant", "seen", "target")
 ADDR_RE = re.compile(r"@[a-z0-9][a-z0-9-]*")
 OPERATORS_ENV = "FORK_SANDBOX_OPERATORS"
 LABEL_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
@@ -139,7 +145,8 @@ SPEC = {
             "--from": VALUE, "--to": VALUE, "--cc": VALUE,
             "--subject": VALUE, "--body": VALUE, "--attach": MULTI,
             "--hops": VALUE, "--header": MULTI,
-            "--allow-namespace": MULTI, "--reach-probe": MULTI}),
+            "--allow-namespace": MULTI, "--reach-probe": MULTI,
+            "--review-target": VALUE}),
         "reply": (0, 0, {
             "--from": VALUE, "--reply-to": VALUE, "--body": VALUE,
             "--to": VALUE, "--cc": VALUE, "--subject": VALUE,
@@ -169,6 +176,20 @@ REFUSED_FLAGS = {
     ("mail", "grant"): {"--context-ro"},
 }
 REFUSED_WHY = "a host path has no meaning over the API"
+
+# The review-target contract's headers: only mail's own --review-target
+# flag and the postmaster may write them, so --header is refused for both
+# names, for every caller including the operator (see authorize(), which
+# returns immediately for an operator and so cannot enforce this).
+REVIEW_TARGET_HEADER_WHY = (
+    "--header may not set a review-target header: only --review-target "
+    "and the postmaster may set it")
+
+
+def refused_header_name(raw):
+    name = raw.split(":", 1)[0].strip().upper()
+    return name == "X-VERSION" or name.startswith("X-REVIEW-TARGET")
+
 
 OPERATORS = frozenset(["@operator"])
 
@@ -378,6 +399,8 @@ def authorize(entry, tool, verb, positionals, flags):
             raise ApiError(403, "--from is not one of this token's identities")
         if key == ("mail", "send") and any(f in flags for f in GRANT_FLAGS):
             need(entry, "grant")
+        if key == ("mail", "send") and "--review-target" in flags:
+            need(entry, "target")
         return
     if key == ("mail", "seen"):
         if "@" + positionals[0] not in entry.identities:
@@ -481,6 +504,9 @@ def handle_exec(entry, raw, ctx):
     authorize(entry, tool, verb, positionals, flags)
 
     if (tool, verb) in (("mail", "send"), ("mail", "reply")):
+        for raw in flags.get("--header", []):
+            if refused_header_name(raw):
+                raise ApiError(403, REVIEW_TARGET_HEADER_WHY)
         if flags.get("--body", ["-"]) != ["-"]:
             raise ApiError(400, "--body must be '-' over the API; send the "
                                 "body as stdin_b64")
