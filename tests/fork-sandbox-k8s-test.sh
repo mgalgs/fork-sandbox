@@ -9307,6 +9307,43 @@ else
 fi
 rm -f /tmp/fs-k8s-flag-test-claude-review.err
 
+# --context-secret is forwarded to fork-sandbox-k8s.sh (which validates the
+# name and, in a real submit, the labels); refused without --k8s, and refused
+# together with --context-ro on either path, before anything is created.
+if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
+    --harness pi --model moonshotai/kimi-k3 \
+    --context-secret preview-ctx --branch fs-k8s-flag-test-cs-branch \
+    "$k8s_flag_proj" "$k8s_flag_handoff" \
+    > /tmp/fs-k8s-flag-test-cs.yaml 2>/tmp/fs-k8s-flag-test-cs.err \
+    && grep -q 'secretName: preview-ctx' /tmp/fs-k8s-flag-test-cs.yaml \
+    && grep -q '## Context secret' /tmp/fs-k8s-flag-test-cs.yaml; then
+    ok "--k8s --context-secret --dry-run forwards the flag to fork-sandbox-k8s.sh"
+else
+    no "--k8s --context-secret --dry-run forwards the flag to fork-sandbox-k8s.sh" \
+        "$(cat /tmp/fs-k8s-flag-test-cs.err)"
+fi
+rm -f /tmp/fs-k8s-flag-test-cs.err /tmp/fs-k8s-flag-test-cs.yaml
+refuses "--k8s --context-secret with a reserved name is refused by fork-sandbox-k8s.sh" \
+    "starts with 'fork-sandbox-'" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
+    --harness pi --model moonshotai/kimi-k3 \
+    --context-secret fork-sandbox-upstream-key --branch fs-k8s-flag-test-cs-res \
+    "$k8s_flag_proj" "$k8s_flag_handoff"
+refuses "--context-secret without --k8s is refused" \
+    "only apply with --k8s" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --dry-run \
+    --context-secret preview-ctx unused-project unused-handoff
+refuses "--context-secret with --context-ro is refused with --k8s" \
+    "cannot be combined" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
+    --context-secret preview-ctx --context-ro "$k8s_flag_cr_dir" \
+    unused-project unused-handoff
+refuses "--context-secret with --context-ro is refused without --k8s" \
+    "cannot be combined" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --dry-run \
+    --context-secret preview-ctx --context-ro "$k8s_flag_cr_dir" \
+    unused-project unused-handoff
+
 refuses "--timeout without --k8s is refused" \
     "only apply with --k8s" \
     env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --dry-run \

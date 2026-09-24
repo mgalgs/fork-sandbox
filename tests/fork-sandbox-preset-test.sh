@@ -877,6 +877,17 @@ pipeline:
     agent: coder
 EOF
 
+bad "a context-secret key is refused: a preset cannot set task-shaped flags" \
+    "unknown top-level key 'context-secret'" <<'EOF'
+agents:
+  coder:
+    harness: claude
+context-secret: preview-ctx
+pipeline:
+  - action: code
+    agent: coder
+EOF
+
 bad "an empty file is refused" "must be a mapping" </dev/null
 
 bad "invalid YAML surfaces as a parse error" "not valid YAML" <<'EOF'

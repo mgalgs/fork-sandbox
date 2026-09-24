@@ -191,6 +191,16 @@
 #                        /var/tmp/claude-scratch/forks/ — a staging path a
 #                        host-side script created on purpose — never an
 #                        arbitrary host path.
+# --context-secret <name>:
+#                        with --k8s, mount the Kubernetes Secret <name>
+#                        read-only at /work/context in the pod, one file per
+#                        key -- for a credential the task depends on. The
+#                        Secret must carry the label fork-sandbox/context=true
+#                        and must not carry fork-sandbox/branch; the name and
+#                        labels are checked by fork-sandbox-k8s.sh submit.
+#                        Refused without --k8s (a local sandbox has no
+#                        Secrets) and together with --context-ro. See
+#                        "Getting a Secret in" in docs/kubernetes-runs.md.
 # --fixtures <dir>:      bind an existing fixture staging directory under
 #                        /var/tmp/claude-scratch/fixtures/ read-only at /fixtures
 #                        inside a local run, and set
@@ -890,6 +900,10 @@
 # --review-model, since a habit-typed --model-shaped value like "opus" would
 # otherwise only fail after a paid coding leg instead of at validation.
 #
+# --context-secret is k8s-only and rides the same dispatch: forwarded raw
+# into k8s_argv below, refused on the local path (a local sandbox has no
+# Secrets), and refused together with --context-ro on either path.
+#
 # --context-ro, --attach-dir, --thread-dir and --endpoint are the remaining
 # capabilities that ARE carried: --k8s forwards --context-ro to
 # fork-sandbox-k8s.sh run, which threads it to cmd_submit the same way a
@@ -1556,6 +1570,7 @@ codex_extra_args=""
 sandbox_args=""
 task_meta=""
 context_ro=""
+context_secret=""
 fixtures_dir=""
 attach_dir=""
 thread_dir=""
@@ -1685,6 +1700,10 @@ while [[ "${1:-}" == -* ]]; do
             ;;
         --context-ro)
             context_ro="${2:?--context-ro requires a directory}"
+            shift 2
+            ;;
+        --context-secret)
+            context_secret="${2:?--context-secret requires a Secret name}"
             shift 2
             ;;
         --fixtures)
@@ -1891,6 +1910,14 @@ if $wait_requested; then
 fi
 if [[ -n "$wait_timeout_arg" ]] && ! $wait_requested; then
     echo "Error: --wait-timeout requires --wait." >&2
+    exit 1
+fi
+
+# Both populate /work/context in a pod, so they cannot be combined. Checked
+# here, ahead of everything that creates anything, on either path.
+if [[ -n "$context_secret" && -n "$context_ro" ]]; then
+    echo "Error: --context-secret and --context-ro cannot be combined: both" >&2
+    echo "populate /work/context." >&2
     exit 1
 fi
 
@@ -3143,6 +3170,9 @@ if [[ "$k8s_mode" == true ]]; then
     # sync.
     [[ -n "$outbox_max_arg" ]] && k8s_argv+=(--outbox-max "$outbox_max_arg")
     [[ -n "$context_ro" ]] && k8s_argv+=(--context-ro "$context_ro")
+    # Forwarded raw: fork-sandbox-k8s.sh's cmd_submit checks the name and,
+    # against the cluster, the Secret's labels before anything is created.
+    [[ -n "$context_secret" ]] && k8s_argv+=(--context-secret "$context_secret")
     [[ -n "$attach_dir" ]] && k8s_argv+=(--attach-dir "$attach_dir")
     [[ -n "$thread_dir" ]] && k8s_argv+=(--thread-dir "$thread_dir")
     # Forwarded as the raw string, not the compacted-and-validated form the
@@ -3217,11 +3247,13 @@ fi
 
 if [[ -n "$k8s_timeout" || "$k8s_keep" == true || -n "$k8s_outbox_dir" \
     || -n "$k8s_endpoint" || ${#k8s_allow_ns_raw[@]} -gt 0 \
-    || ${#k8s_reach_probe_raw[@]} -gt 0 ]]; then
+    || ${#k8s_reach_probe_raw[@]} -gt 0 || -n "$context_secret" ]]; then
     echo "Error: --timeout, --keep, --outbox-dir, --endpoint," >&2
-    echo "--allow-namespace and --reach-probe only apply with --k8s," >&2
+    echo "--allow-namespace, --reach-probe and --context-secret" >&2
+    echo "only apply with --k8s," >&2
     echo "which passes them on to fork-sandbox-k8s.sh run. Add --k8s, or drop" >&2
-    echo "the flag. A local sandbox has no namespaces to grant." >&2
+    echo "the flag. A local sandbox has no namespaces to grant and no Secrets" >&2
+    echo "to mount." >&2
     # The preset's endpoint key lands in the same variable --endpoint sets
     # (an explicit flag wins when both are present), so when the preset
     # supplied it, "drop the flag" names a flag the user never passed.
