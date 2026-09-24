@@ -717,7 +717,7 @@ Every route/harvest pass, `deliver` prints one porcelain line per action
 worth operator eyes to stdout, unbuffered enough to `tail -F` or pipe
 live: `pm <event> thread=<short-id> agent=<name> key=val...`, where
 `thread` is the thread id's first 8 characters and `agent` is always the
-resolved fleet registry name, never raw header text. The eight events are
+resolved fleet registry name, never raw header text. The nine events are
 `spawn` (agent, thread, run, via=to|cc), `harvest` (agent, thread,
 replies=<count>, emitted for both LLM and handler seats), `flag` (thread,
 reason=<fixed keyword>), `retry` (thread, agent, trigger=<short-id>,
@@ -729,7 +729,10 @@ re-checked at follow-up-wake time against whichever agent owns the live
 run a pending message is waiting on, and that agent can be one originally
 woken via Cc — so a Cc-woken seat's follow-up can still produce a refuse
 line), `triage-skip` (agent, thread), `handler` (agent,
-thread, exit=<status>), and `route-dead` (thread, unresolved=<count> — one
+thread, exit=<status>), `hook` (thread, hook=<event>, file=<basename>,
+exit=<n|timeout|lost|launch>; a hook finished or failed to launch, and
+the one line with no `agent` field; see "Hooks" below), and `route-dead`
+(thread, unresolved=<count> — one
 or more `To:` names in rule 0's expansion were @-shaped but did not
 resolve as a fleet agent, so the thread is also separately flag'd with
 reason `unresolvable To: <names> at <message-id>` (keyword
@@ -759,12 +762,149 @@ rule 1's reset in the same pass that performed it.
 code, gated the same way — it only prints one when reached via
 `deliver`'s own route/harvest pass, so running `flag` directly prints
 nothing. `unflag` prints nothing ever, in or out of `deliver`: it has no
-event of its own in the eight above, so a thread being flagged and later
+event of its own in the nine above, so a thread being flagged and later
 auto-cleared (rule 1, operator mail) is invisible on this stream — only
 the flag is observable, not its clearing. This is a stable contract, not
 a log file — stderr is unchanged (errors only), and nothing
 sender-controlled (Subject, body, raw From, attachment names) ever
 becomes a field value on one of these lines.
+
+### Hooks
+
+The postmaster knows harvests, not rounds: a round is a peer's protocol.
+It emits three generic events and runs site-supplied executables on them,
+so a site can deploy a preview, publish a bundle, or decide a review round
+has ended, without the postmaster knowing why.
+
+| Event | Fires |
+|---|---|
+| `on-harvest` | after a harvest of one run posted at least one message |
+| `on-target` | when a thread's review target is set or moves: the kickoff's `send --review-target` is version 1, and a `review-target: sets` seat's `Version:` reply moves it (see "The review target") |
+| `on-quiescent` | once per quiescence of a thread |
+
+A hook is an executable in `$FORK_SANDBOX_HOOKS_DIR` (default
+`~/.config/fork-sandbox/hooks`; the handlers dir,
+`$FORK_SANDBOX_HANDLERS_DIR`, has the same shape). For an event, discovery
+runs the executable named exactly `on-<event>` AND every executable named
+`on-<event>.<anything>`, in lexical order of file name. Each file fires
+independently, with its own record, timeout and event line. The dir is
+flat files only, never an `on-<event>.d/` directory: the cluster ships it
+as a ConfigMap, which cannot hold subdirectories. A missing or
+non-executable file means no hook: nothing runs and no event line is
+printed. This works the same on a laptop postmaster and a
+cluster one; see [docs/cluster-postmaster.md](cluster-postmaster.md) for
+how the cluster one gets its hooks.
+
+#### The environment a hook gets
+
+A hook inherits the postmaster's own environment, plus:
+
+| Variable | Set when | Value |
+|---|---|---|
+| `FS_HOOK_EVENT` | always | `on-harvest`, `on-target` or `on-quiescent` |
+| `FS_HOOK_THREAD` | always | the full thread id |
+| `FS_HOOK_MAIL_ROOT` | always | the mail root |
+| `FS_HOOK_REPO` | always | the `deliver --project` repo path |
+| `FS_TARGET_BRANCH`, `FS_TARGET_SHA`, `FS_TARGET_VERSION`, `FS_TARGET_SET_BY`, `FS_TARGET_SET_AT` | the thread has a review target, on every event | the fields of the thread's review target |
+| `FS_TARGET_REPO` | the thread has a review target, on every event | same value as `FS_HOOK_REPO` |
+| `FS_HOOK_MESSAGES` | `on-harvest` | ids of the messages that run's harvest posted, space-separated, in posting order |
+| `FS_HOOK_RUN` | `on-harvest` | the run id |
+| `FS_HOOK_BRANCH` | `on-harvest` | the wake's branch; empty for a handler seat |
+| `FS_HOOK_AGENT` | `on-harvest` | the resolved fleet name |
+| `FS_TARGET_SHA_PRESENT` | `on-target` | `1` or `0`: whether the sha is present in the repo. The postmaster first tries to fetch `origin` for it, and fires either way |
+| `FS_HOOK_MESSAGE_COUNT` | `on-quiescent` | the thread's message count |
+| `FS_HOOK_FLAGGED` | `on-quiescent` | `1` or `0` |
+| `FS_HOOK_FLAG_REASON` | `on-quiescent` | the needs-operator flag file's content; empty when not flagged |
+| `FS_HOOK_SECRET_DIR` | cluster only, when `K8S_POSTMASTER_HOOKS_SECRET` is set | `/etc/fork-sandbox/hook-secret` (the postmaster's environment passes through to hooks) |
+
+`on-harvest` fires once per run, after everything else that run's harvest
+does, including the review-target write, so the target variables a hook
+sees are the moved ones. A harvest that posted nothing fires no hook.
+
+#### How a hook runs
+
+A hook is detached: launched with `setsid`, stdin `/dev/null`, stdout and
+stderr to a log file. It never blocks routing or harvest. It is wrapped in
+`timeout`: after `$FORK_SANDBOX_HOOK_TIMEOUT` seconds (default 300) it gets
+SIGTERM, and SIGKILL 10 seconds after that. It closes the store lock fd, so
+a running hook never blocks the next `deliver`. Nothing retries a failed
+hook. (`FORK_SANDBOX_POSTMASTER_HOOK_DETACH=inline` runs hooks in the
+foreground; it is a test seam, not for real use.)
+
+Each launch (one per hook file) gets a record directory,
+`hooks/run/<id>/`, where `<id>` is
+`<epoch>-<event>-<short8>-<random>`. It holds `event`, `thread`, the
+wrapper's pid with its pid-namespace and boot identity, `log`, and, once
+the hook finishes, `exit` (the timeout-wrapped exit status). At the start
+of every pass the postmaster reaps records: it emits the event line, moves
+the log to `hooks/logs/<id>.log`, and deletes the record directory. A
+record with no `exit` whose process is gone is reaped as `exit=lost`.
+`hooks/logs/` keeps the newest 100 files. Both live under the router
+state tree (see "Router state").
+
+The event line is `pm hook thread=<short8> hook=<event> file=<basename>
+exit=<n|timeout|lost|launch>`, one per hook file. `timeout` means the wrapped status was 124
+or 137. `launch` means the launch itself failed; that one is emitted at
+fire time, not at reap time.
+
+#### At most once, and seeding
+
+`on-harvest` fires from the harvest itself. `on-target` and `on-quiescent`
+are detected by a pass that runs after the harvest pass, in both `--once`
+and the loop. That pass compares the store with markers under
+`hook-marks/`: `target/<thread-id>` holds `<VERSION> <SHA>`, and
+`quiescent/<thread-id>` holds the thread's message count. A marker is
+written BEFORE its hook fires, so a crash loses at most one event and never
+repeats one.
+
+Markers are kept whether or not a hook exists, so installing a hook later
+never replays history. When `hook-marks/` does not exist, the first pass
+seeds it (a marker for every thread with a target, and for every thread
+quiescent right now) without firing anything. Upgrading a postmaster with
+a long store therefore fires nothing for old threads. A thread still busy
+at seeding fires when it goes quiet.
+
+#### Quiescence
+
+A thread is quiescent when ALL of these hold:
+
+- no live run for it: no `runs/*.env` with `THREAD=<thread-id>` that lacks
+  a `harvested/<run-id>`;
+- no unrouted message. This covers debounce, since a message the debounce
+  gate holds is unrouted;
+- no retry record under `retries/<thread-id>/`;
+- no held seat under `held/<thread-id>/`.
+
+A flagged thread can be quiescent: `FS_HOOK_FLAGGED` is `1`. "The round
+ended because someone must act" is still a round ending, and the hook
+decides what to do with it.
+
+`on-quiescent` fires once per quiescence: when the message count differs
+from the marker and the thread is quiescent. Messages are append-only, so
+new activity raises the count, and the hook fires again after the next
+message cycle settles.
+
+Quiescent means nothing is running on the thread, NOT that its
+participants agreed. A thread where every seat went quiet without a
+verdict is quiescent too. A hook that decides a review converged needs a
+positive per-seat signal from the messages themselves, not the absence of
+objections.
+
+#### Re-firing by hand
+
+For an operator recovering from a failed deploy:
+
+```bash
+fork-sandbox-postmaster.sh hook fire --thread <tid> --event on-target|on-quiescent
+```
+
+It builds the same environment as an automatic fire: the current review
+target and, for `on-quiescent`, the current message count, flag state and
+flag reason. It ignores the markers and does not touch them. It runs every
+matching hook file in the FOREGROUND under the same timeout, prints one
+line per file (`file=<basename> exit=<n>`), and exits non-zero if any hook
+failed. It takes no store lock and writes no hook record. `on-harvest` is
+refused, because it needs a run's context.
 
 ### Routing rules
 
@@ -1127,6 +1267,10 @@ own thread scans never see it:
 | `sessions/<thread-id>/<agent>` | the session id that pair's last wake ended on |
 | `retries/<thread-id>/<agent>` | the wedge-bound FAILS counter (session resume, below) and the retry read contract's STATE/TRIGGER/ATTEMPT/NOT_BEFORE/MAX/LAST_FAILED_RUN/RECOVERED_AT fields (see "Retrying a dead wake" above) — one file, two independent purposes |
 | `held/<thread-id>/<agent>` | a `backend: k8s`, `grant: required` seat waiting on a grant file for this thread — see "The held state file is a read contract" above |
+| `hook-marks/target/<thread-id>` | `<VERSION> <SHA>` of the review target the last `on-target` pass saw, written before the hook fires. The whole `hook-marks/` tree is created by seeding on the first pass; see "Hooks" |
+| `hook-marks/quiescent/<thread-id>` | the message count the last `on-quiescent` pass saw, written before the hook fires |
+| `hooks/run/<id>/` | one hook launch in flight: `event`, `thread`, the wrapper pid with its pid-namespace and boot identity, `log`, and `exit` once finished. Reaped at the start of the next pass |
+| `hooks/logs/<id>.log` | a reaped hook's stdout and stderr; the newest 100 are kept |
 | `workspaces/<thread-id>/<agent>/` | the persistent clone for that (thread, agent) seat, bound into every wake of it (every harness, not just claude) with `--clone-dir`; removed only by `fleet teardown` |
 
 All state transitions are marker-file creation, never deletion of
@@ -1333,6 +1477,8 @@ marker**, so strip leading whitespace first, then test for `> `.
 | `FORK_SANDBOX_POSTMASTER_TRIAGE_TIMEOUT` | `120` (seconds) | Cc triage classifier call |
 | `FORK_SANDBOX_HANDLERS_DIR` | `~/.config/fork-sandbox/handlers` | registry, router (`handler: exec` seats) |
 | `FORK_SANDBOX_HANDLER_TIMEOUT` | `300` (seconds) | router (`handler: exec` wake) |
+| `FORK_SANDBOX_HOOKS_DIR` | `~/.config/fork-sandbox/hooks` | router (`on-harvest`, `on-target`, `on-quiescent` hooks) |
+| `FORK_SANDBOX_HOOK_TIMEOUT` | `300` (seconds) | router (each hook; SIGTERM, then SIGKILL 10 s later) |
 
 The registry needs PyYAML, as the preset parser does. A machine without
 it gets a plain error naming the package, not a traceback.

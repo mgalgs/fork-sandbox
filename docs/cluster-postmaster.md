@@ -60,6 +60,7 @@ Do these in order.
    | `K8S_POSTMASTER_STORAGE` | no | PVC requested size; default `20Gi`; must match `^[0-9]+(Mi\|Gi\|Ti)$` |
    | `K8S_POSTMASTER_ACCESS_MODE` | no | `ReadWriteOncePod` (default) or `ReadWriteOnce`, for a StorageClass or CSI driver that does not support RWOP yet; anything else is refused |
    | `K8S_POSTMASTER_OPERATORS` | no | comma-separated `@names` that carry rule-1 authority; default `@operator`. See "Operators". |
+   | `K8S_POSTMASTER_HOOKS_SECRET` | no | the name of a Secret you create in the namespace, to hand your hooks credentials. Install never creates or reads it, only references it. Must be a DNS-1123 subdomain name. See "Hooks". |
    | `K8S_MAIL_API_TOKENS_FILE` | no | laptop path to the mail API tokens file; when set, the mail API is deployed. See "The mail API". |
 
    The rest of `k8s.env` (`K8S_CONTEXT`, `K8S_NAMESPACE`, and the rest) is
@@ -71,6 +72,12 @@ Do these in order.
    laptop. Files under `handlers/` must be executable to be included; a
    non-executable one is skipped with a warning, the same way the laptop
    postmaster would skip it.
+
+   The laptop's `hooks/` dir (same config dir as `handlers/`) ships the
+   same way, into ConfigMap `fork-sandbox-postmaster-hooks`, and again only
+   executable files are included. The dir is flat files (`on-<event>` and
+   `on-<event>.<suffix>`), since a ConfigMap cannot hold subdirectories.
+   See "Hooks" below.
 
 4. **Install:**
 
@@ -187,6 +194,30 @@ tamper with mail and postmaster state, and restrict who holds API tokens
 accordingly. It speaks plain HTTP; a site
 that wants TLS fronts it itself.
 
+## Hooks
+
+The postmaster runs site-supplied hooks on harvest, review-target and
+quiescence events; the events, environment and rules are in
+[docs/agent-mail.md](agent-mail.md), "Hooks". In the cluster they ship
+like handlers do. The installer reads the laptop dir `hooks/` (under the
+same config dir as `handlers/`), takes executable files only, and puts
+them in the ConfigMap `fork-sandbox-postmaster-hooks` as flat files
+(`on-<event>` and `on-<event>.<suffix>`; no subdirectories, which a
+ConfigMap cannot hold). It is mounted at
+`/etc/fork-sandbox/hooks` in the postmaster container only, with
+`FORK_SANDBOX_HOOKS_DIR` set to that path. Like any config change, editing
+a hook needs `install --postmaster` run again.
+
+A hook that needs a credential of its own gets it from a Secret the site
+creates. Set `K8S_POSTMASTER_HOOKS_SECRET=<name>` in `k8s.env`. Install
+never creates or reads that Secret; it only references it. It is mounted
+read-only at `/etc/fork-sandbox/hook-secret` in the postmaster container
+only, and `FS_HOOK_SECRET_DIR` is set to that path in every hook's
+environment. The value must be a DNS-1123 subdomain name. Install also
+refuses its own Secret names, `fork-sandbox-upstream-key`,
+`fork-sandbox-postmaster-git` and `fork-sandbox-mail-api-tokens`, so a typo
+cannot hand a hook the provider key.
+
 ## Operators
 
 `K8S_POSTMASTER_OPERATORS` is a comma-separated list of `@names`, no
@@ -263,5 +294,10 @@ by label when a run finishes or is removed).
 
 The practical consequence: `kubectl exec` into the postmaster pod reaches
 every credential the ServiceAccount can read, not just the mail store.
-Keep that to cluster admins. See `manifests/k8s/40-postmaster.yaml` and
+Keep that to cluster admins.
+
+Hooks run in the postmaster pod, in the same trust tier as handlers,
+beside the credentials the postmaster already holds.
+
+See `manifests/k8s/40-postmaster.yaml` and
 `manifests/k8s/10-rbac.yaml` for the exact rules.
