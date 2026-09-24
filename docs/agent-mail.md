@@ -594,9 +594,11 @@ arbitrary reply.
 
 A valid `send --review-target` writes the thread's state file (see
 below) with `VERSION=1`, then stamps the message with
-`X-Review-Target-Set: <branch> <sha>` and `X-Version: 1`. A later
-failure (attachment staging, placement) removes the state file again,
-the same rollback a k8s grant gets.
+`X-Review-Target-Set: <branch> <sha>`, `X-Review-Target: <branch> <sha>`
+(the same value — every message about a commit carries `X-Review-Target`,
+and the setter also carries `X-Review-Target-Set` on top of it), and
+`X-Version: 1`. A later failure (attachment staging, placement) removes
+the state file again, the same rollback a k8s grant gets.
 
 ### The state file
 
@@ -638,11 +640,12 @@ its reply file (a positive integer, no leading zero). At harvest:
   must never be able to repoint what the whole panel reviews.
 - `Version: <n>` that does not strictly advance the current `VERSION` is
   flagged and not posted; the state file is unchanged.
-- Otherwise the post is stamped `X-Review-Target-Set: <branch> <sha>` and
-  `X-Version: <n>` (the sha is resolved from the branch this wake itself
-  committed to), and the state file is rewritten **only after the post
-  succeeds** — a failed post must never move a target that nothing on
-  the thread announced.
+- Otherwise the post is stamped `X-Review-Target-Set: <branch> <sha>`,
+  `X-Review-Target: <branch> <sha>` (the same value), and `X-Version: <n>`
+  (the sha is resolved from the branch this wake itself committed to),
+  and the state file is rewritten **only after the post succeeds** — a
+  failed post must never move a target that nothing on the thread
+  announced.
 
 A harvested reply from the `sets` seat that carries no `Version:` while a
 target exists is stamped `X-Version: <current VERSION>` and nothing else
