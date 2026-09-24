@@ -504,8 +504,8 @@ def handle_exec(entry, raw, ctx):
     authorize(entry, tool, verb, positionals, flags)
 
     if (tool, verb) in (("mail", "send"), ("mail", "reply")):
-        for raw in flags.get("--header", []):
-            if refused_header_name(raw):
+        for hdr in flags.get("--header", []):
+            if refused_header_name(hdr):
                 raise ApiError(403, REVIEW_TARGET_HEADER_WHY)
         if flags.get("--body", ["-"]) != ["-"]:
             raise ApiError(400, "--body must be '-' over the API; send the "
