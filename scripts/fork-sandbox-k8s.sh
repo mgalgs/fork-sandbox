@@ -630,6 +630,25 @@
 #                         fleet (refused otherwise). Rendered into the
 #                         Deployment as FORK_SANDBOX_OPERATORS on both the
 #                         postmaster and the mail-api container.
+#   K8S_POSTMASTER_HOOKS_SECRET=
+#                         name of a Kubernetes Secret YOU create in
+#                         K8S_NAMESPACE holding whatever credentials the
+#                         postmaster's hooks (on-harvest, on-target,
+#                         on-quiescent, shipped from
+#                         ~/.config/fork-sandbox/hooks) need. Optional;
+#                         when set, install mounts it read-only at
+#                         /etc/fork-sandbox/hook-secret in the postmaster
+#                         container only (never the mail-api container)
+#                         and sets FS_HOOK_SECRET_DIR there. install never
+#                         creates, reads or prints it, and it is not in the
+#                         pod's config checksum, so changing its content
+#                         does not roll the pod. Must be a DNS-1123
+#                         subdomain name (<= 253 chars, lowercase
+#                         alphanumerics, '-' and '.'); install refuses
+#                         its own Secret names (fork-sandbox-upstream-key,
+#                         fork-sandbox-postmaster-git,
+#                         fork-sandbox-mail-api-tokens) so a config typo
+#                         can never hand a hook the provider or deploy key.
 #   K8S_MAIL_API_TOKENS_FILE=
 #                         laptop path to the mail API tokens file (see
 #                         `fork-sandbox-mail-api.py mint`). Optional; when
@@ -811,6 +830,7 @@ K8S_POSTMASTER_ACCESS_MODE="$(read_env_value "$k8s_env" K8S_POSTMASTER_ACCESS_MO
 K8S_POSTMASTER_ACCESS_MODE="${K8S_POSTMASTER_ACCESS_MODE:-ReadWriteOncePod}"
 K8S_POSTMASTER_OPERATORS="$(read_env_value "$k8s_env" K8S_POSTMASTER_OPERATORS || true)"
 K8S_POSTMASTER_OPERATORS="${K8S_POSTMASTER_OPERATORS:-@operator}"
+K8S_POSTMASTER_HOOKS_SECRET="$(read_env_value "$k8s_env" K8S_POSTMASTER_HOOKS_SECRET || true)"
 K8S_MAIL_API_TOKENS_FILE="$(read_env_value "$k8s_env" K8S_MAIL_API_TOKENS_FILE || true)"
 # Free-form labels for this run, populated by resolve_run_labels in
 # cmd_submit. Declared empty here (module-global) so build_extra_label_lines
@@ -892,7 +912,8 @@ if [[ "${1-}" != check-grant ]]; then
         "$K8S_POSTMASTER_PROJECT" "$K8S_POSTMASTER_GIT_KEY_FILE" \
         "$K8S_POSTMASTER_KNOWN_HOSTS_FILE" "$K8S_POSTMASTER_STORAGE_CLASS" \
         "$K8S_POSTMASTER_STORAGE" "$K8S_POSTMASTER_ACCESS_MODE" \
-        "$K8S_POSTMASTER_OPERATORS" "$K8S_MAIL_API_TOKENS_FILE" \
+        "$K8S_POSTMASTER_OPERATORS" "$K8S_POSTMASTER_HOOKS_SECRET" \
+        "$K8S_MAIL_API_TOKENS_FILE" \
         || exit 1
 fi
 
@@ -2442,7 +2463,7 @@ strip_proxy_key_volume() {
 
 # Removes one of the postmaster Deployment's marker-fenced optional blocks
 # (manifests/k8s/40-postmaster.yaml's "# >>> $tag" / "# <<< $tag" comment
-# pairs -- personas/prompts/handlers/presets, each fencing an env entry, a
+# pairs -- personas/prompts/handlers/hooks/presets, each fencing an env entry, a
 # volumeMount entry and a volume entry, three tags per name) from $1, for
 # `install --postmaster` when that name's laptop config dir does not
 # exist -- the pod must see the same "absent dir means absent" semantics
@@ -2475,12 +2496,13 @@ strip_pm_optional_block() {
 # too, never followed: kubectl would copy whatever it points at (even
 # outside $1) into the ConfigMap, which --dry-run would then print.
 # $2 ("true"/"false") requires
-# each included file to be executable, for the handlers dir: a
+# each included file to be executable, for the handlers and hooks dirs: a
 # non-executable one is skipped with a warning rather than refused,
 # mirroring what the postmaster itself does with a non-executable
-# handler (see FLEET/PM's own handler-exec checks).
+# handler or hook (see FLEET/PM's own exec checks). $3 names the dir
+# in that warning ("handlers" or "hooks").
 pm_collect_configmap_files() {
-    local dir="$1" require_exec="$2" sub f base
+    local dir="$1" require_exec="$2" what="${3:-handlers}" sub f base
     PM_CONFIGMAP_FILE_ARGS=()
     PM_CONFIGMAP_FILE_PATHS=()
     sub="$(find "$dir" -mindepth 1 -maxdepth 1 -type d -print -quit)"
@@ -2500,9 +2522,9 @@ pm_collect_configmap_files() {
         [[ -f "$f" ]] || continue
         base="$(basename "$f")"
         if [[ "$require_exec" == true && ! -x "$f" ]]; then
-            echo "Warning: $f is not executable; skipping it from the handlers" >&2
+            echo "Warning: $f is not executable; skipping it from the $what" >&2
             echo "ConfigMap -- the postmaster itself would skip a" >&2
-            echo "non-executable handler the same way." >&2
+            echo "non-executable ${what%s} the same way." >&2
             continue
         fi
         PM_CONFIGMAP_FILE_ARGS+=(--from-file="$base=$f")
@@ -2688,6 +2710,24 @@ cmd_install() {
             echo "ReadWriteOncePod or ReadWriteOnce." >&2
             exit 1
         fi
+        if [[ -n "$K8S_POSTMASTER_HOOKS_SECRET" ]]; then
+            if (( ${#K8S_POSTMASTER_HOOKS_SECRET} > 253 )) \
+                || [[ ! "$K8S_POSTMASTER_HOOKS_SECRET" =~ ^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$ ]]; then
+                echo "Error: K8S_POSTMASTER_HOOKS_SECRET='$K8S_POSTMASTER_HOOKS_SECRET' is not a" >&2
+                echo "valid Secret name: at most 253 characters matching" >&2
+                echo '^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$ (a DNS-1123 subdomain).' >&2
+                exit 1
+            fi
+            case "$K8S_POSTMASTER_HOOKS_SECRET" in
+                fork-sandbox-upstream-key|fork-sandbox-postmaster-git|fork-sandbox-mail-api-tokens)
+                    echo "Error: K8S_POSTMASTER_HOOKS_SECRET='$K8S_POSTMASTER_HOOKS_SECRET' is one of" >&2
+                    echo "this installer's own Secrets; a hook must never be handed the" >&2
+                    echo "provider key, the deploy key or the mail API tokens. Name a" >&2
+                    echo "Secret you created for the hooks alone." >&2
+                    exit 1
+                    ;;
+            esac
+        fi
         # deliver --cluster refuses to start at all with no fleet file
         # (pm_require_fleet_check: "--cluster needs a fleet file ...
         # declaring backend: k8s seats"), so an install with no
@@ -2767,15 +2807,15 @@ cmd_install() {
     fi
 
     # ConfigMap file collection for --postmaster: the four optional
-    # integrations (personas/prompts/handlers/presets), each included only
+    # integrations (personas/prompts/handlers/hooks/presets), each included only
     # when its laptop config dir exists, plus the always-present
     # k8s.env/fleet.yaml config. Done here, still before any render or
     # apply, so the 900 KiB total-size guard and the subdirectory refusal
     # both fail loudly before a single kubectl call.
     local -a pm_config_paths=() pm_config_args=()
-    local -a pm_personas_args=() pm_prompts_args=() pm_handlers_args=() pm_presets_args=()
-    local -a pm_personas_paths=() pm_prompts_paths=() pm_handlers_paths=() pm_presets_paths=()
-    local pm_have_personas=false pm_have_prompts=false pm_have_handlers=false pm_have_presets=false
+    local -a pm_personas_args=() pm_prompts_args=() pm_handlers_args=() pm_hooks_args=() pm_presets_args=()
+    local -a pm_personas_paths=() pm_prompts_paths=() pm_handlers_paths=() pm_hooks_paths=() pm_presets_paths=()
+    local pm_have_personas=false pm_have_prompts=false pm_have_handlers=false pm_have_hooks=false pm_have_presets=false
     if $postmaster; then
         pm_config_args=(--from-file="k8s.env=$k8s_env")
         pm_config_paths=("$k8s_env")
@@ -2798,9 +2838,15 @@ cmd_install() {
         fi
         if [[ -d "$config_dir/handlers" ]]; then
             pm_have_handlers=true
-            pm_collect_configmap_files "$config_dir/handlers" true || exit 1
+            pm_collect_configmap_files "$config_dir/handlers" true handlers || exit 1
             pm_handlers_args=("${PM_CONFIGMAP_FILE_ARGS[@]}")
             pm_handlers_paths=("${PM_CONFIGMAP_FILE_PATHS[@]}")
+        fi
+        if [[ -d "$config_dir/hooks" ]]; then
+            pm_have_hooks=true
+            pm_collect_configmap_files "$config_dir/hooks" true hooks || exit 1
+            pm_hooks_args=("${PM_CONFIGMAP_FILE_ARGS[@]}")
+            pm_hooks_paths=("${PM_CONFIGMAP_FILE_PATHS[@]}")
         fi
         if [[ -d "$config_dir/presets" ]]; then
             pm_have_presets=true
@@ -2811,7 +2857,8 @@ cmd_install() {
 
         local pm_total=0 pm_biggest_file="" pm_biggest_bytes=0 pm_path pm_bytes
         for pm_path in "${pm_config_paths[@]}" "${pm_personas_paths[@]}" \
-            "${pm_prompts_paths[@]}" "${pm_handlers_paths[@]}" "${pm_presets_paths[@]}"; do
+            "${pm_prompts_paths[@]}" "${pm_handlers_paths[@]}" \
+            "${pm_hooks_paths[@]}" "${pm_presets_paths[@]}"; do
             pm_bytes="$("$FS_STAT" -c '%s' -- "$pm_path")"
             pm_total=$(( pm_total + pm_bytes ))
             if (( pm_bytes > pm_biggest_bytes )); then
@@ -3245,7 +3292,7 @@ cmd_install() {
     # cluster is contacted yet), the checksum over them, and the postmaster
     # manifest template with its placeholders filled and its absent
     # optional blocks stripped. Needs $manifests_dir, just computed above.
-    local pm_config_yaml="" pm_personas_yaml="" pm_prompts_yaml="" pm_handlers_yaml="" pm_presets_yaml=""
+    local pm_config_yaml="" pm_personas_yaml="" pm_prompts_yaml="" pm_handlers_yaml="" pm_hooks_yaml="" pm_presets_yaml=""
     local pm_config_checksum="" pm_file_rendered="" tag
     local pm_git_secret_yaml="" pm_tokens_secret_yaml=""
     if $postmaster; then
@@ -3257,6 +3304,8 @@ cmd_install() {
             "${pm_prompts_args[@]}" --dry-run=client -o yaml)"
         $pm_have_handlers && pm_handlers_yaml="$(kubectl create configmap fork-sandbox-postmaster-handlers \
             "${pm_handlers_args[@]}" --dry-run=client -o yaml)"
+        $pm_have_hooks && pm_hooks_yaml="$(kubectl create configmap fork-sandbox-postmaster-hooks \
+            "${pm_hooks_args[@]}" --dry-run=client -o yaml)"
         $pm_have_presets && pm_presets_yaml="$(kubectl create configmap fork-sandbox-postmaster-presets \
             "${pm_presets_args[@]}" --dry-run=client -o yaml)"
 
@@ -3275,9 +3324,9 @@ cmd_install() {
                 --dry-run=client -o yaml)"
         fi
 
-        pm_config_checksum="$(printf '%s%s%s%s%s%s%s' \
+        pm_config_checksum="$(printf '%s%s%s%s%s%s%s%s' \
             "$pm_config_yaml" "$pm_personas_yaml" "$pm_prompts_yaml" \
-            "$pm_handlers_yaml" "$pm_presets_yaml" \
+            "$pm_handlers_yaml" "$pm_hooks_yaml" "$pm_presets_yaml" \
             "$pm_git_secret_yaml" "$pm_tokens_secret_yaml" | k8s_sha256_stdin)"
 
         pm_file_rendered="$(sed \
@@ -3287,6 +3336,7 @@ cmd_install() {
             -e "s|__PM_STORAGE__|$K8S_POSTMASTER_STORAGE|g" \
             -e "s|__PM_CONFIG_CHECKSUM__|$pm_config_checksum|g" \
             -e "s|__PM_OPERATORS__|$K8S_POSTMASTER_OPERATORS|g" \
+            -e "s|__PM_HOOKS_SECRET__|${K8S_POSTMASTER_HOOKS_SECRET:-(none)}|g" \
             "$manifests_dir/40-postmaster.yaml")"
         if [[ -z "$K8S_POSTMASTER_STORAGE_CLASS" ]]; then
             local pm_scline pm_stripped
@@ -3319,6 +3369,16 @@ cmd_install() {
         fi
         if ! $pm_have_handlers; then
             for tag in "handlers env" "handlers volumeMount" "handlers volume"; do
+                pm_file_rendered="$(strip_pm_optional_block "$pm_file_rendered" "$tag")" || exit 1
+            done
+        fi
+        if ! $pm_have_hooks; then
+            for tag in "hooks env" "hooks volumeMount" "hooks volume"; do
+                pm_file_rendered="$(strip_pm_optional_block "$pm_file_rendered" "$tag")" || exit 1
+            done
+        fi
+        if [[ -z "$K8S_POSTMASTER_HOOKS_SECRET" ]]; then
+            for tag in "hook-secret env" "hook-secret volumeMount" "hook-secret volume"; do
                 pm_file_rendered="$(strip_pm_optional_block "$pm_file_rendered" "$tag")" || exit 1
             done
         fi
@@ -3392,6 +3452,7 @@ cmd_install() {
             $pm_have_personas && printf -- '---\n%s\n' "$pm_personas_yaml"
             $pm_have_prompts  && printf -- '---\n%s\n' "$pm_prompts_yaml"
             $pm_have_handlers && printf -- '---\n%s\n' "$pm_handlers_yaml"
+            $pm_have_hooks    && printf -- '---\n%s\n' "$pm_hooks_yaml"
             $pm_have_presets  && printf -- '---\n%s\n' "$pm_presets_yaml"
             printf '# (dry-run) would create Secret fork-sandbox-postmaster-git ... -- not shown.\n'
             [[ -z "$K8S_MAIL_API_TOKENS_FILE" ]] || \
@@ -3434,6 +3495,7 @@ cmd_install() {
         $pm_have_personas && printf '%s\n' "$pm_personas_yaml" | kubectl apply -f -
         $pm_have_prompts  && printf '%s\n' "$pm_prompts_yaml" | kubectl apply -f -
         $pm_have_handlers && printf '%s\n' "$pm_handlers_yaml" | kubectl apply -f -
+        $pm_have_hooks    && printf '%s\n' "$pm_hooks_yaml" | kubectl apply -f -
         $pm_have_presets  && printf '%s\n' "$pm_presets_yaml" | kubectl apply -f -
         printf '%s\n' "$pm_git_secret_yaml" | kubectl apply -f -
         [[ -z "$pm_tokens_secret_yaml" ]] || \

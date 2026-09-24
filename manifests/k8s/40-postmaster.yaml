@@ -5,7 +5,8 @@
 # substitutes these placeholder tokens from K8S_NAMESPACE and the
 # K8S_POSTMASTER_* keys in k8s.env (K8S_POSTMASTER_IMAGE,
 # K8S_POSTMASTER_ACCESS_MODE, K8S_POSTMASTER_STORAGE,
-# K8S_POSTMASTER_STORAGE_CLASS, K8S_POSTMASTER_OPERATORS, and a sha256
+# K8S_POSTMASTER_STORAGE_CLASS, K8S_POSTMASTER_OPERATORS,
+# K8S_POSTMASTER_HOOKS_SECRET, and a sha256
 # install computes over the rendered ConfigMaps and Secrets), one token per
 # line below with nothing else on the line, so a long substituted value (an image
 # ref, a checksum) cannot push a line past yamllint's line-length rule:
@@ -16,6 +17,7 @@
 #   __PM_STORAGE_CLASS__
 #   __PM_CONFIG_CHECKSUM__
 #   __PM_OPERATORS__
+#   __PM_HOOKS_SECRET__
 # This file is skipped by plain `install` (the same way
 # 31-claude-proxy.yaml is) since those placeholders have no value to take
 # without --postmaster. The mail-api container, its tokens volume and its
@@ -201,6 +203,14 @@ spec:
             - name: FORK_SANDBOX_HANDLERS_DIR
               value: /etc/fork-sandbox/handlers
               # <<< handlers env
+            # >>> hooks env
+            - name: FORK_SANDBOX_HOOKS_DIR
+              value: /etc/fork-sandbox/hooks
+              # <<< hooks env
+            # >>> hook-secret env
+            - name: FS_HOOK_SECRET_DIR
+              value: /etc/fork-sandbox/hook-secret
+              # <<< hook-secret env
             # >>> presets env
             - name: FORK_SANDBOX_PRESETS_DIR
               value: /etc/fork-sandbox/presets
@@ -260,6 +270,16 @@ spec:
               mountPath: /etc/fork-sandbox/handlers
               readOnly: true
               # <<< handlers volumeMount
+            # >>> hooks volumeMount
+            - name: hooks
+              mountPath: /etc/fork-sandbox/hooks
+              readOnly: true
+              # <<< hooks volumeMount
+            # >>> hook-secret volumeMount
+            - name: hook-secret
+              mountPath: /etc/fork-sandbox/hook-secret
+              readOnly: true
+              # <<< hook-secret volumeMount
             # >>> presets volumeMount
             - name: presets
               mountPath: /etc/fork-sandbox/presets
@@ -381,6 +401,18 @@ spec:
             name: fork-sandbox-postmaster-handlers
             defaultMode: 0555
             # <<< handlers volume
+        # >>> hooks volume
+        - name: hooks
+          configMap:
+            name: fork-sandbox-postmaster-hooks
+            defaultMode: 0555
+            # <<< hooks volume
+        # >>> hook-secret volume
+        - name: hook-secret
+          secret:
+            secretName: __PM_HOOKS_SECRET__
+            defaultMode: 0440
+            # <<< hook-secret volume
         # >>> presets volume
         - name: presets
           configMap:

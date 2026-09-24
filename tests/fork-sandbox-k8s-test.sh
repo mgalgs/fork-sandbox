@@ -13619,6 +13619,124 @@ pm_api_install "$pm_cfg_pin" FORK_SANDBOX_HANDLERS_DIR="$pm_empty_dir" FORK_SAND
     FORK_SANDBOX_PERSONAS_DIR="$pm_empty_dir" FORK_SANDBOX_FLEET_FILE=/nonexistent
 check "a caller env pointing the fleet dirs elsewhere does not change the result" "0" "$pm_api_rc"
 
+# 14g. Hooks: the laptop hooks dir ships as ConfigMap
+# fork-sandbox-postmaster-hooks, mounted in the postmaster container only,
+# exactly as handlers are; an optional site-created Secret
+# (K8S_POSTMASTER_HOOKS_SECRET) is only referenced, never created.
+# pm_hooks_cfg [extra k8s.env lines...]: the mail-API fixture (so a
+# second, mail-api container exists to prove "postmaster only") plus a
+# hooks dir holding one executable on-target and one non-executable file.
+pm_hooks_cfg() {
+    local d
+    d="$(pm_api_cfg "$@")"
+    mkdir -p "$d/hooks"
+    printf '#!/bin/sh\nexit 0\n' > "$d/hooks/on-target"
+    chmod 755 "$d/hooks/on-target"
+    printf 'notes\n' > "$d/hooks/README-not-exec"
+    chmod 644 "$d/hooks/README-not-exec"
+    printf '%s' "$d"
+}
+pm_hooks_env_of() {   # container name -> "NAME=value" lines
+    pm_api_dep ".spec.template.spec.containers[] | select(.name == \"$1\") | .env[]? | \"\(.name)=\(.value)\""
+}
+pm_hooks_mounts_of() {   # container name -> "name path readOnly" lines
+    pm_api_dep ".spec.template.spec.containers[] | select(.name == \"$1\") | .volumeMounts[]? | \"\(.name) \(.mountPath) \(.readOnly)\""
+}
+
+pm_cfg_hooks="$(pm_hooks_cfg)"
+pm_api_install "$pm_cfg_hooks"
+check "hooks dir: install exits 0" "0" "$pm_api_rc"
+check "hooks dir: the non-executable file is skipped with the warning" "1" \
+    "$(grep -c 'README-not-exec is not executable; skipping it from the hooks' <<< "$pm_api_err")"
+check "hooks dir: the ConfigMap holds the executable on-target" "on-target" \
+    "$(yq -r 'select(.kind == "ConfigMap" and .metadata.name == "fork-sandbox-postmaster-hooks") | .data | keys | .[]' <<< "$pm_api_out")"
+check "hooks dir: the skipped file never reaches the render" "0" "$(grep -c 'README-not-exec' <<< "$pm_api_out")"
+check "hooks dir: the postmaster container sets FORK_SANDBOX_HOOKS_DIR" \
+    "FORK_SANDBOX_HOOKS_DIR=/etc/fork-sandbox/hooks" \
+    "$(pm_hooks_env_of postmaster | grep '^FORK_SANDBOX_HOOKS_DIR=')"
+check "hooks dir: the postmaster container mounts it read-only" \
+    "hooks /etc/fork-sandbox/hooks true" "$(pm_hooks_mounts_of postmaster | grep '^hooks ')"
+check "hooks dir: the mail-api container gets no hooks env" "0" \
+    "$(pm_hooks_env_of mail-api | grep -c 'HOOKS')"
+check "hooks dir: the mail-api container gets no hooks mount" "0" \
+    "$(pm_hooks_mounts_of mail-api | grep -c '^hooks ')"
+check "hooks dir: the volume is the ConfigMap" "fork-sandbox-postmaster-hooks" \
+    "$(pm_api_dep '.spec.template.spec.volumes[] | select(.name == "hooks") | .configMap.name')"
+check "hooks dir: the volume mode is 0555, as handlers" "1" \
+    "$(grep -A4 -- '- name: hooks$' <<< "$pm_api_out" | grep -c 'defaultMode: 0555')"
+check "hooks dir: no leftover placeholders" "0" "$(grep -c '__PM_' <<< "$pm_api_out")"
+check "hooks dir alone: no hook-secret pieces" "0" "$(grep -c 'FS_HOOK_SECRET_DIR\|hook-secret' <<< "$pm_api_out")"
+if command -v yamllint >/dev/null 2>&1; then
+    check "yamllint: hooks dir present" "" "$(printf '%s\n' "$pm_api_out" | yamllint - 2>&1)"
+fi
+pm_hooks_sum_with="$(pm_api_sum)"
+printf '#!/bin/sh\nexit 1\n' > "$pm_cfg_hooks/hooks/on-target"
+pm_api_install "$pm_cfg_hooks"
+check "hooks content is in the checksum (changing it rolls the pod)" "1" \
+    "$([[ -n "$pm_hooks_sum_with" && "$(pm_api_sum)" != "$pm_hooks_sum_with" ]] && echo 1 || echo 0)"
+
+# A hooks dir with a subdirectory refuses, naming it, before kubectl.
+pm_cfg_hooks_sub="$(pm_hooks_cfg)"
+mkdir -p "$pm_cfg_hooks_sub/hooks/nested"
+pm_api_refused "a subdirectory inside hooks/ refuses, naming it" "hooks/nested" "$pm_cfg_hooks_sub"
+
+# Hooks dir absent (the mail-API fixture has none): nothing hooks-shaped.
+pm_api_install "$pm_cfg_api"
+check "no hooks dir: install exits 0" "0" "$pm_api_rc"
+check "no hooks dir: no FORK_SANDBOX_HOOKS_DIR" "0" "$(grep -c 'FORK_SANDBOX_HOOKS_DIR' <<< "$pm_api_out")"
+check "no hooks dir: no hooks volume or mount" "0" "$(grep -c -- '- name: hooks$' <<< "$pm_api_out")"
+check "no hooks dir: no hooks ConfigMap" "0" "$(grep -c 'fork-sandbox-postmaster-hooks' <<< "$pm_api_out")"
+check "no hooks dir: no hooks marker lines left" "0" "$(grep -cE '# (>>>|<<<) hooks' <<< "$pm_api_out")"
+
+# K8S_POSTMASTER_HOOKS_SECRET set: referenced, mounted read-only in the
+# postmaster container only, env set; the installer never creates it.
+pm_cfg_hs="$(pm_api_cfg K8S_POSTMASTER_HOOKS_SECRET=site-hooks)"
+pm_api_install "$pm_cfg_hs"
+check "hooks secret: install exits 0" "0" "$pm_api_rc"
+check "hooks secret: the postmaster container sets FS_HOOK_SECRET_DIR" \
+    "FS_HOOK_SECRET_DIR=/etc/fork-sandbox/hook-secret" \
+    "$(pm_hooks_env_of postmaster | grep '^FS_HOOK_SECRET_DIR=')"
+check "hooks secret: the postmaster container mounts it read-only" \
+    "hook-secret /etc/fork-sandbox/hook-secret true" "$(pm_hooks_mounts_of postmaster | grep '^hook-secret ')"
+check "hooks secret: the mail-api container gets neither env nor mount" "0" \
+    "$(( $(pm_hooks_env_of mail-api | grep -c 'HOOK_SECRET') + $(pm_hooks_mounts_of mail-api | grep -c '^hook-secret ') ))"
+check "hooks secret: the volume names the site's Secret" "site-hooks" \
+    "$(pm_api_dep '.spec.template.spec.volumes[] | select(.name == "hook-secret") | .secret.secretName')"
+check "hooks secret: without a hooks dir there is still no hooks mount" "0" \
+    "$(grep -c 'FORK_SANDBOX_HOOKS_DIR' <<< "$pm_api_out")"
+check "hooks secret: the installer does not create the Secret" "0" \
+    "$(yq -r 'select(.kind == "Secret") | .metadata.name' <<< "$pm_api_out" | grep -c 'site-hooks')"
+check "hooks secret: no leftover placeholders" "0" "$(grep -c '__PM_' <<< "$pm_api_out")"
+if command -v yamllint >/dev/null 2>&1; then
+    check "yamllint: hooks secret present" "" "$(printf '%s\n' "$pm_api_out" | yamllint - 2>&1)"
+fi
+# Both together.
+pm_cfg_hs2="$(pm_hooks_cfg K8S_POSTMASTER_HOOKS_SECRET=site-hooks.v2)"
+pm_api_install "$pm_cfg_hs2"
+check "hooks dir + secret: install exits 0" "0" "$pm_api_rc"
+check "hooks dir + secret: both mounts on the postmaster container" "hooks hook-secret" \
+    "$(pm_hooks_mounts_of postmaster | awk '$1 == "hooks" || $1 == "hook-secret" {print $1}' | paste -sd' ')"
+if command -v yamllint >/dev/null 2>&1; then
+    check "yamllint: hooks dir + secret" "" "$(printf '%s\n' "$pm_api_out" | yamllint - 2>&1)"
+fi
+
+# Unset (the mail-API fixture): all three hook-secret blocks are gone.
+pm_api_install "$pm_cfg_api"
+check "no hooks secret: no FS_HOOK_SECRET_DIR, no volume, no marker lines" "0" \
+    "$(grep -cE 'FS_HOOK_SECRET_DIR|hook-secret|# (>>>|<<<) hook-secret' <<< "$pm_api_out")"
+
+# Refusals, before any kubectl call.
+pm_api_refused "a hooks Secret name with uppercase refuses" "K8S_POSTMASTER_HOOKS_SECRET" \
+    "$(pm_api_cfg K8S_POSTMASTER_HOOKS_SECRET=Site_Hooks)"
+pm_api_refused "a hooks Secret name ending in a dash refuses" "at most 253 characters" \
+    "$(pm_api_cfg K8S_POSTMASTER_HOOKS_SECRET=site-hooks-)"
+pm_api_refused "a hooks Secret name over 253 characters refuses" "at most 253 characters" \
+    "$(pm_api_cfg "K8S_POSTMASTER_HOOKS_SECRET=$(printf 'a%.0s' $(seq 1 254))")"
+for pm_own in fork-sandbox-upstream-key fork-sandbox-postmaster-git fork-sandbox-mail-api-tokens; do
+    pm_api_refused "the installer's own Secret $pm_own refuses as the hooks Secret" "one of" \
+        "$(pm_api_cfg K8S_POSTMASTER_HOOKS_SECRET=$pm_own)"
+done
+
 printf '\n== client Role vs postmaster Role: same rules ==\n'
 rbac_yaml="$repo_dir/manifests/k8s/10-rbac.yaml"
 pm_yaml="$repo_dir/manifests/k8s/40-postmaster.yaml"
