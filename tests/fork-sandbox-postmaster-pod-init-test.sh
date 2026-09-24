@@ -46,7 +46,7 @@ newdir() { mktemp -d; }
 # never execs either -- it only needs them to exist for the self-check,
 # and to build the GIT_SSH_COMMAND string).
 full_tools="$(newdir)"; tmpdirs+=("$full_tools")
-for t in bash dirname readlink mkdir chmod cat mv sed flock setsid python3 tar; do
+for t in bash dirname readlink mkdir chmod cat mv sed ln id flock setsid python3 tar; do
     p="$(command -v "$t" 2>/dev/null || true)"
     [[ -n "$p" ]] && ln -sf "$p" "$full_tools/$t"
 done
@@ -97,6 +97,7 @@ setup_env() {
     sa_dir="$home/sa"; mkdir -p "$sa_dir"
     printf 'fake-token\n' > "$sa_dir/token"
     printf 'fake-ca\n' > "$sa_dir/ca.crt"
+    data_dir="$home/data"; mkdir -p "$data_dir/agent-mail"
     secret_dir="$home/git-secret"; mkdir -p "$secret_dir"
     printf 'FAKE PRIVATE KEY\n' > "$secret_dir/deploy-key"
     printf 'git.example ssh-ed25519 FAKEHOSTKEY\n' > "$secret_dir/known_hosts"
@@ -122,6 +123,7 @@ run_init() {
     HOME="$home" \
     FORK_SANDBOX_CONFIG_DIR="$config_dir" \
     FORK_SANDBOX_SA_DIR="$sa_dir" \
+    FORK_SANDBOX_PM_DATA_DIR="$data_dir" \
     FORK_SANDBOX_GIT_SECRET_DIR="$secret_dir" \
     FORK_SANDBOX_POSTMASTER_BIN="$home/pm" \
     KUBERNETES_SERVICE_HOST="${TEST_K8S_HOST:-198.51.100.10}" \
@@ -283,7 +285,7 @@ write_k8s_env <<'EOF'
 K8S_CONTEXT=my-context
 K8S_POSTMASTER_REPO_URL=ssh://git.example/proj.git
 EOF
-mkdir -p "$home/src/proj/.git"
+mkdir -p "$data_dir/.pm-home/src/proj/.git"
 run_init >/dev/null 2>&1
 if grep -q '^-C .*fetch' "$git_log"; then
     ok "present repo: git fetch is called instead of clone"
@@ -307,7 +309,7 @@ write_k8s_env <<'EOF'
 K8S_CONTEXT=my-context
 K8S_POSTMASTER_REPO_URL=ssh://git.example/proj.git
 EOF
-mkdir -p "$home/src/proj/.git"
+mkdir -p "$data_dir/.pm-home/src/proj/.git"
 out="$(TEST_GIT_MERGE_FAIL=1 run_init 2>&1)"
 rc=$?
 if (( rc == 0 )) && [[ "$out" == *"Warning"*"fast-forward"* ]]; then
@@ -322,7 +324,7 @@ write_k8s_env <<'EOF'
 K8S_CONTEXT=my-context
 K8S_POSTMASTER_REPO_URL=ssh://git.example/proj.git
 EOF
-mkdir -p "$home/src/proj/.git"
+mkdir -p "$data_dir/.pm-home/src/proj/.git"
 out="$(TEST_GIT_FETCH_FAIL=1 run_init 2>&1)"
 rc=$?
 if (( rc == 0 )) && [[ "$out" == *"Warning"* ]]; then
@@ -390,6 +392,86 @@ fi
 check "derived project name is 'proj', not 'git@git.example:proj'" \
     "clone git@git.example:proj.git $home/src/proj" "$(grep '^clone ' "$git_log")"
 rm -f /tmp/pi-test-out.log
+
+printf '\n== state directories: home links onto the data volume ==\n'
+setup_env
+write_k8s_env <<'EOF'
+K8S_CONTEXT=my-context
+K8S_POSTMASTER_REPO_URL=ssh://git.example/proj.git
+EOF
+run_init >/dev/null 2>&1
+rc=$?
+check "fresh run exits 0" "0" "$rc"
+check "\$HOME/src links to the data volume" "$data_dir/.pm-home/src" "$(readlink "$home/src" 2>/dev/null)"
+check "\$HOME/.claude links to the data volume" "$data_dir/.pm-home/claude" "$(readlink "$home/.claude" 2>/dev/null)"
+if [[ -d "$data_dir/.pm-home/src" && -d "$data_dir/.pm-home/claude" ]]; then
+    ok "both link targets exist"
+else
+    no "both link targets exist" "$(ls -la "$data_dir/.pm-home" 2>&1)"
+fi
+if [[ -d "$data_dir/.pm-home/src/proj/.git" ]]; then
+    ok "the clone lands on the data volume"
+else
+    no "the clone lands on the data volume" "$(find "$data_dir" 2>&1)"
+fi
+
+printf '\n== a container restart (same HOME and data dir) keeps the links ==\n'
+out="$(run_init 2>&1)"
+rc=$?
+check "second run exits 0" "0" "$rc"
+[[ "$rc" == 0 ]] || printf '        %s\n' "$out"
+check "second run: \$HOME/src still links to the same target" "$data_dir/.pm-home/src" "$(readlink "$home/src" 2>/dev/null)"
+check "second run: \$HOME/.claude still links to the same target" "$data_dir/.pm-home/claude" "$(readlink "$home/.claude" 2>/dev/null)"
+if [[ -e "$data_dir/.pm-home/src/src" || -L "$data_dir/.pm-home/src/src" ]]; then
+    no "second run: no link nested inside the src target"
+else
+    ok "second run: no link nested inside the src target"
+fi
+if [[ -e "$data_dir/.pm-home/claude/claude" || -L "$data_dir/.pm-home/claude/claude" ]]; then
+    no "second run: no link nested inside the claude target"
+else
+    ok "second run: no link nested inside the claude target"
+fi
+
+printf '\n== a real directory at a link path is refused ==\n'
+setup_env
+write_k8s_env <<'EOF'
+K8S_CONTEXT=my-context
+K8S_POSTMASTER_REPO_URL=ssh://git.example/proj.git
+EOF
+mkdir -p "$home/src"
+refuses "real \$HOME/src directory refuses, naming it" "$home/src" run_init
+check "real \$HOME/src: git never called" "" "$([[ -f "$git_log" ]] && cat "$git_log" || true)"
+
+setup_env
+write_k8s_env <<'EOF'
+K8S_CONTEXT=my-context
+K8S_POSTMASTER_REPO_URL=ssh://git.example/proj.git
+EOF
+mkdir -p "$home/.claude"
+refuses "real \$HOME/.claude directory refuses, naming it" "$home/.claude" run_init
+
+printf '\n== unwritable data volume or mail mount point is refused ==\n'
+setup_env
+write_k8s_env <<'EOF'
+K8S_CONTEXT=my-context
+K8S_POSTMASTER_REPO_URL=ssh://git.example/proj.git
+EOF
+rmdir "$data_dir/agent-mail"
+refuses "missing agent-mail refuses, naming it" "$data_dir/agent-mail" run_init
+
+if (( $(id -u) == 0 )); then
+    printf '  note  running as root: skipping the non-writable data dir case\n'
+else
+    setup_env
+    write_k8s_env <<'EOF'
+K8S_CONTEXT=my-context
+K8S_POSTMASTER_REPO_URL=ssh://git.example/proj.git
+EOF
+    chmod 0555 "$data_dir"
+    refuses "non-writable data dir refuses, naming it" "$data_dir is not writable" run_init
+    chmod 0755 "$data_dir"
+fi
 
 printf '\n%d ok / %d fail\n' "$pass" "$fail"
 (( fail == 0 ))

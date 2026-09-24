@@ -19,7 +19,18 @@
 #      user@host:path git URL -- anything else is refused) and
 #      K8S_POSTMASTER_PROJECT (default: the URL's last path component
 #      minus a trailing .git; must match ^[A-Za-z0-9][A-Za-z0-9._-]*$).
-#   3. Writes $HOME/.kube/config from the pod's own ServiceAccount: a
+#   3. Makes the state directories the postmaster needs, as this uid, on
+#      the data volume (default /var/tmp/claude-scratch): checks that the
+#      volume root and its agent-mail mount point are writable, creates
+#      $data_dir/.pm-home/src and $data_dir/.pm-home/claude, and links
+#      $HOME/src and $HOME/.claude to them. The pod mounts no subPath (a
+#      missing subPath directory can be created by kubelet as root, which a
+#      non-root pod then cannot write), so $HOME -- an emptyDir -- holds
+#      only these two links and everything behind them persists. A link
+#      left by an earlier start of the same pod is replaced; a real
+#      directory or file already at either path is refused, since leaving
+#      it would put the clone or the run log on the ephemeral emptyDir.
+#   4. Writes $HOME/.kube/config from the pod's own ServiceAccount: a
 #      single cluster pointed at the in-cluster API server, a single user
 #      whose credential is a *reference* to the SA token file (never the
 #      token's contents, so a rotated token is picked up with no restart),
@@ -27,11 +38,11 @@
 #      $K8S_NAMESPACE, set current. Naming the context $K8S_CONTEXT (not
 #      some fixed "in-cluster" name) is what lets every other script's
 #      `kubectl --context=$K8S_CONTEXT` wrapper work unmodified in the pod.
-#   4. Copies the mounted deploy key and known_hosts
+#   5. Copies the mounted deploy key and known_hosts
 #      ($FORK_SANDBOX_GIT_SECRET_DIR, default /etc/fork-sandbox/git) into
 #      $HOME/.ssh (0600/0644) and exports GIT_SSH_COMMAND so the postmaster's
 #      own later git calls inherit it.
-#   5. Clones $K8S_POSTMASTER_REPO_URL to $HOME/src/$project if that
+#   6. Clones $K8S_POSTMASTER_REPO_URL to $HOME/src/$project if that
 #      directory has no .git yet, else fetches it and fast-forwards the
 #      checked-out branch to its upstream (a fetch alone only moves
 #      refs/remotes/origin/*; the postmaster itself never fetches, so
@@ -43,12 +54,14 @@
 #      fast-forward that is not possible (a diverged local branch, e.g.
 #      from manual `kubectl exec` surgery). A failed clone is fatal,
 #      since there is nothing to route on at all.
-#   6. execs fork-sandbox-postmaster.sh deliver --cluster --project
+#   7. execs fork-sandbox-postmaster.sh deliver --cluster --project
 #      $HOME/src/$project, resolved next to this script (not via PATH).
 #
 # FORK_SANDBOX_SA_DIR overrides the ServiceAccount directory (default
-# /var/run/secrets/kubernetes.io/serviceaccount); FORK_SANDBOX_POSTMASTER_BIN
-# overrides the postmaster binary this execs. Both exist for tests only.
+# /var/run/secrets/kubernetes.io/serviceaccount); FORK_SANDBOX_PM_DATA_DIR
+# overrides the data volume mount (default /var/tmp/claude-scratch);
+# FORK_SANDBOX_POSTMASTER_BIN overrides the postmaster binary this execs.
+# All three exist for tests only.
 
 set -euo pipefail
 
@@ -141,7 +154,37 @@ if [[ ! "$project" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
     exit 1
 fi
 
-# --- 3. kubeconfig --------------------------------------------------------
+# --- 3. state directories ---------------------------------------------------
+
+data_dir="${FORK_SANDBOX_PM_DATA_DIR:-/var/tmp/claude-scratch}"
+
+for d in "$data_dir" "$data_dir/agent-mail"; do
+    if [[ ! -d "$d" || ! -w "$d" ]]; then
+        echo "Error: $d is not writable by uid $(id -u); the postmaster's data" >&2
+        echo "volumes must be writable by the pod (fsGroup) at their root." >&2
+        exit 1
+    fi
+done
+
+pm_home="$data_dir/.pm-home"
+mkdir -p "$pm_home/src" "$pm_home/claude"
+
+link_state_dir() {
+    local link="$1" target="$2"
+    if [[ -L "$link" ]]; then
+        ln -sfnT "$target" "$link"
+    elif [[ -e "$link" ]]; then
+        echo "Error: $link already exists and is not a symlink; it must link to" >&2
+        echo "$target so its contents survive a pod restart." >&2
+        exit 1
+    else
+        ln -sT "$target" "$link"
+    fi
+}
+link_state_dir "$HOME/src" "$pm_home/src"
+link_state_dir "$HOME/.claude" "$pm_home/claude"
+
+# --- 4. kubeconfig --------------------------------------------------------
 
 sa_dir="${FORK_SANDBOX_SA_DIR:-/var/run/secrets/kubernetes.io/serviceaccount}"
 token_file="$sa_dir/token"
@@ -204,7 +247,7 @@ current-context: "${context_q}"
 EOF
 mv -- "$tmp" "$kubeconfig"
 
-# --- 4. ssh ---------------------------------------------------------------
+# --- 5. ssh ---------------------------------------------------------------
 
 git_secret_dir="${FORK_SANDBOX_GIT_SECRET_DIR:-/etc/fork-sandbox/git}"
 mounted_key="$git_secret_dir/deploy-key"
@@ -238,7 +281,7 @@ mv -- "$tmp" "$known_hosts"
 
 export GIT_SSH_COMMAND="ssh -i $deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$known_hosts"
 
-# --- 5. repo ----------------------------------------------------------
+# --- 6. repo ----------------------------------------------------------
 
 src_dir="$HOME/src"
 mkdir -p "$src_dir"
@@ -258,7 +301,7 @@ else
     git clone "$repo_url" "$repo_dir"
 fi
 
-# --- 6. hand off to the postmaster ----------------------------------------
+# --- 7. hand off to the postmaster ----------------------------------------
 
 pm_bin="${FORK_SANDBOX_POSTMASTER_BIN:-$script_dir/fork-sandbox-postmaster.sh}"
 exec "$pm_bin" deliver --cluster --project "$repo_dir"
