@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# fork-sandbox-agent-kit-test.sh — The agent kit: machine-level extra skills
+# fork-sandbox-agent-kit-test.sh -- The agent kit: machine-level extra skills
 #
 # Usage: tests/fork-sandbox-agent-kit-test.sh
 #
