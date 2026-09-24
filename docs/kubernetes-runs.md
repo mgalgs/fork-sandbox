@@ -805,6 +805,11 @@ the same structural reason `/work/inbox` is a sibling: the entrypoint's
 `git add -A` safety net is scoped to the clone it runs in, so nothing
 outside it can ever be swept into a commit.
 
+The cluster path ships no skills beyond that one. `--kit-skill` is refused
+with `--k8s`. A machine agent kit (`AGENT_KIT_SKILLS` in `kit.env`) does not
+fail a cluster run: the launcher prints one `NOTICE:` line naming the skills
+the run will not have, and goes on.
+
 The loop's outcome lands in the pod at `/work/review-loop.json`, written
 after every leg rather than only at the end, so a pod killed mid-loop still
 leaves behind the iterations it finished — the same discipline the local

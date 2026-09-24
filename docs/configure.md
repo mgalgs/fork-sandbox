@@ -9,16 +9,17 @@ anything:
 | `model.env` | `MODEL_ENDPOINT`, `MODEL_ID`, `MODEL_CTX` — a local model endpoint |
 | `k8s.env` | `K8S_CONTEXT`, `K8S_NAMESPACE`, `K8S_IMAGE`, `K8S_PROXY_UPSTREAM`, `K8S_DENIED_PROBE` |
 | `claude.env` | `CLAUDE_CREDENTIALS` — a path to read instead of `$HOME/.claude/.credentials.json` for every `--harness claude` leg on this machine, e.g. to point sandbox agents at a separate team-plan account. Missing file or key means today's default (that file, falling back to the login Keychain on macOS). Beaten by `fork-sandbox.sh`'s own `--claude-credentials <path>` for one launch (which also works, and is forwarded, on the `--k8s` path); `fork-sandbox-k8s.sh`'s own direct entry point reads this same key the same way. `CLAUDE_CREDENTIAL_POOL` + `CLAUDE_HEADROOM_HOOK` are an alternative to a single `CLAUDE_CREDENTIALS` pin — an operator-configured pool balanced by a headroom hook plugin; see [docs/credential-balancing.md](credential-balancing.md) for the pool/hook contract and precedence. `fork-sandbox-discover-claude` only reports whether a credential is ready (see below) — none of these three keys are on the allowlist a discoverer can target, so `configure` does not write this file |
+| `kit.env` | `AGENT_KIT_SKILLS` — extra skills for the agent kit, names separated by spaces and/or commas, each a directory under `$HOME/.claude/skills`. Every run on this machine binds them read-only into every seat, beside the review kit. `fork-sandbox.sh --kit-skill <name>` adds more for one launch. A missing file or key means an empty kit. `configure` does not write this file |
 | `coder-mode.env` | `CODER_MODE_*` — the `sandbox-coder-mode` skill's launch defaults: a composition spelled key-per-flag (`CODER_MODE_HARNESS`, `CODER_MODE_MODEL`, `CODER_MODE_NETWORK`, the `REVIEW` and `MAINTAINER` sets), or `CODER_MODE_PRESET` naming one preset in place of all of them. The skill owns the key list; these are read by the orchestrating session, not by any script, and `configure` does not write the file |
 
 Assembling that by hand means copying key names out of docs and typing a
 `chmod 600`. `configure` does it instead: it discovers what is already on
 this machine — an `OPENROUTER_API_KEY` in your environment, a local model
 endpoint, a kubectl context — shows you what it found, and writes the
-pieces you pick into the files above, **except `coder-mode.env` and
-`claude.env`** — neither has a target on the allowlist a discoverer can
-write to, so `configure` never installs anything into either; see the rows
-above.
+pieces you pick into the files above, **except `coder-mode.env`,
+`claude.env` and `kit.env`** — none has a target on the allowlist a
+discoverer can write to, so `configure` never installs anything into them;
+see the rows above.
 
 ```
 fork-sandbox.sh configure [--remove] [--all] [--dry-run]

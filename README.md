@@ -152,6 +152,17 @@ Every harness gets the same clone, the same provisioning, the same fetch-back,
 and a review kit — two skills that let the run review its own work before it
 reports back.
 
+An operator can add skills of their own to every run, the same way: the agent
+kit. Name them in `AGENT_KIT_SKILLS` in `~/.config/fork-sandbox/kit.env`
+(spaces or commas between names), or per launch with `--kit-skill <name>`,
+which is repeatable and adds to the machine list. Each name must be a
+directory under `~/.claude/skills` that holds a `SKILL.md`; anything else
+stops the launch before the clone is made. The skill is bound read-only into
+every seat, and a `pi` leg is handed `--skill` for it. Keep a kit skill
+self-contained. Scripts it calls must already be on the bound script toolbox,
+and a symlink that points out of the skill directory dangles inside the
+sandbox. `--kit-skill` is refused with `--k8s`, which ships no extra skills.
+
 `pi` reads its per-machine config (an OpenRouter key, a model endpoint) from
 `~/.config/fork-sandbox/`. `fork-sandbox configure`
 discovers and installs it for you — see [docs/configure.md](docs/configure.md).
