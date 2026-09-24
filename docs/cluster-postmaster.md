@@ -175,9 +175,15 @@ turns off the automatic mount and projects the token into the postmaster
 container only, so the network-facing container cannot read the
 namespace's Secrets. It has its own `$HOME` and `/tmp`, never the
 postmaster's, since the postmaster reads its kubeconfig, gitconfig and
-deploy key from `$HOME`; the only volume the two containers share is the
-mail root. It speaks plain HTTP; a site that wants TLS fronts it
-itself.
+deploy key from `$HOME`. The two containers do share one volume: the
+whole scratch root (`/var/tmp/claude-scratch`), writable from both. That
+holds the mail root and its `.postmaster` state, but also the postmaster's
+own wake directories, from which it later executes launch records. So the
+token boundary is not airtight: a compromised API container could rewrite
+that state and get code run in the postmaster container, where the token
+is mounted. Treat the API as able to reach the token's authority, and
+restrict who holds API tokens accordingly. It speaks plain HTTP; a site
+that wants TLS fronts it itself.
 
 ## Operators
 
