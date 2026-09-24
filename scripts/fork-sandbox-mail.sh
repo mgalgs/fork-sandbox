@@ -8,6 +8,7 @@
 #                              [--header 'X-Name: value']...
 #                              [--allow-namespace NS[:PORT]]...
 #                              [--reach-probe HOST:PORT]... [--context-ro DIR]
+#                              [--review-target <branch>:<sha>]
 #        fork-sandbox-mail.sh reply --from @a --reply-to <message-id>
 #                              (--body <file>|-) [--to @b[,@c]] [--cc @d[,@e]]
 #                              [--subject <s>] [--attach <file>]... [--hops <n>]
@@ -49,6 +50,14 @@
 #   <root>/agents/<name>/seen                     # append-only message-id list
 #   <root>/.postmaster/grants/<thread-id>.env     # per-thread k8s egress grant,
 #                                                  # see the `grant` verb below
+#   <root>/.postmaster/review-target/<thread-id>.env  # a review thread's
+#                                                  # shared review target
+#                                                  # (BRANCH/SHA/VERSION/
+#                                                  # SET_BY/SET_AT), written by
+#                                                  # `send --review-target`
+#                                                  # here and moved by the
+#                                                  # postmaster's `sets` seat
+#                                                  # -- see docs/agent-mail.md
 #
 # <thread-id> is the Message-ID of the thread's root message (the message
 # `send` created it with). NNN starts at 001 and counts arrival order within
@@ -84,8 +93,25 @@
 #                                 headers are refused by the name pattern
 #                                 alone) and may not be X-Hops or
 #                                 X-Attachment, which this store writes
-#                                 itself.
+#                                 itself. --header does not refuse
+#                                 X-Review-Target/X-Review-Target-Set/
+#                                 X-Version -- those are stamped by
+#                                 `send --review-target` and by the
+#                                 postmaster (see docs/agent-mail.md); a
+#                                 remote client is refused them at the mail
+#                                 API instead (docs/mail-api.md).
 #   X-Attachment: attachments/<basename>   one line per attachment
+#   X-Review-Target-Set: <branch> <sha>    `send --review-target
+#                                 <branch>:<sha>` only: the message that
+#                                 opened this thread's shared review
+#                                 target, VERSION 1 (see the state-file
+#                                 layout above and docs/agent-mail.md)
+#   X-Review-Target: <branch> <sha>        the same value, present on
+#                                 every message about the target -- see
+#                                 docs/agent-mail.md's header contract
+#   X-Version: <n>                the review target's version this
+#                                 message belongs to; 1 on the message
+#                                 that opened the thread
 #
 # Unlike the RFC-2822-style angle-bracket/domain ids this repo's old
 # lkml-mailbox.sh used, ids here are bare uuids with no "<...>" wrapping and
@@ -356,6 +382,55 @@ mail_write_grant() {
     return 0
 }
 
+# Validates a `--review-target <branch>:<sha>` value, split on the LAST
+# ':' -- a branch name cannot itself contain ':' (git check-ref-format),
+# so the split is unambiguous. Prints "<branch>\t<sha>" on success. This
+# store never resolves refs or runs git against a project (see the header
+# comment): check-ref-format validates the branch NAME's shape only, no
+# repository required, so it stays within that rule.
+mail_validate_review_target() {
+    local raw="$1" branch sha
+    mail_validate_no_newline "$raw" "--review-target" || return 1
+    if [[ "$raw" != *:* ]]; then
+        echo "Error: --review-target '$raw' must look like '<branch>:<sha>'." >&2
+        return 1
+    fi
+    branch="${raw%:*}"
+    sha="${raw##*:}"
+    if [[ -z "$branch" ]] || [[ "$branch" == *[[:space:]]* ]] || \
+       ! git check-ref-format --branch "$branch" >/dev/null 2>&1; then
+        echo "Error: --review-target: '$branch' is not a valid branch name." >&2
+        return 1
+    fi
+    if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]] && [[ ! "$sha" =~ ^[0-9a-f]{64}$ ]]; then
+        echo "Error: --review-target: '$sha' must be a 40- or 64-character" >&2
+        echo "lowercase hex sha." >&2
+        return 1
+    fi
+    printf '%s\t%s' "$branch" "$sha"
+}
+
+# Writes the per-thread review-target state file for <tid>, atomically
+# (mktemp in the same dir, then mv) -- mirrors mail_write_grant, but this
+# is always a fresh write for a brand-new thread id (send-only, see
+# cmd_send), never a replace of an existing file.
+mail_write_review_target() {
+    local tid="$1" branch="$2" sha="$3" version="$4" set_by="$5"
+    local rt_dir="$MAIL_ROOT/.postmaster/review-target"
+    mkdir -p -- "$rt_dir" || return 1
+    local dest="$rt_dir/$tid.env"
+    local tmp
+    tmp="$(mktemp "$rt_dir/.review-target.XXXXXX")" || return 1
+    {
+        printf 'BRANCH=%s\n' "$branch"
+        printf 'SHA=%s\n' "$sha"
+        printf 'VERSION=%s\n' "$version"
+        printf 'SET_BY=%s\n' "$set_by"
+        printf 'SET_AT=%s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+    } > "$tmp" || { rm -f -- "$tmp"; return 1; }
+    mv -- "$tmp" "$dest" || { rm -f -- "$tmp"; return 1; }
+}
+
 # Escapes a string for embedding in a JSON string context. Grant values
 # are shell tokens the k8s validators have already shape-checked (a
 # thread id, an NS[:PORT], a HOST:PORT, or a realpath) but
@@ -556,7 +631,7 @@ cmd_send() {
     local from="" to="" cc="" subject="" body_arg="" hops=8
     local -a attach_files=() extra_headers=()
     local -a grant_allow_ns=() grant_reach_probe=()
-    local grant_context_ro=""
+    local grant_context_ro="" review_target_arg=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --from) from="${2:?--from requires an address}"; shift 2 ;;
@@ -570,6 +645,7 @@ cmd_send() {
             --allow-namespace) grant_allow_ns+=("${2:?--allow-namespace requires NS[:PORT]}"); shift 2 ;;
             --reach-probe) grant_reach_probe+=("${2:?--reach-probe requires HOST:PORT}"); shift 2 ;;
             --context-ro) grant_context_ro="${2:?--context-ro requires a directory}"; shift 2 ;;
+            --review-target) review_target_arg="${2:?--review-target requires <branch>:<sha>}"; shift 2 ;;
             -h|--help) usage; exit 0 ;;
             *) echo "Error: send: unknown option '$1'." >&2; return 1 ;;
         esac
@@ -613,6 +689,16 @@ cmd_send() {
         (( grant_rc == 0 )) || return "$grant_rc"
     fi
 
+    # A review target, if given, is validated before anything is written --
+    # same reasoning as the grant check just above.
+    local review_target_branch="" review_target_sha=""
+    if [[ -n "$review_target_arg" ]]; then
+        local rt_out
+        rt_out="$(mail_validate_review_target "$review_target_arg")" || return 1
+        review_target_branch="${rt_out%%$'\t'*}"
+        review_target_sha="${rt_out#*$'\t'}"
+    fi
+
     local body_file; body_file="$(mktemp "$MAIL_ROOT/.mail.body.XXXXXX")"
     mail_read_body_arg "$body_arg" "$body_file" || { rm -f -- "$body_file"; return 1; }
     if mail_body_is_empty "$body_file"; then
@@ -634,10 +720,22 @@ cmd_send() {
         fi
     fi
 
+    local saw_review_target=0
+    [[ -n "$review_target_sha" ]] && saw_review_target=1
+    if (( saw_review_target )); then
+        if ! mail_write_review_target "$uuid" "$review_target_branch" \
+                "$review_target_sha" 1 "$from"; then
+            (( saw_grant )) && rm -f -- "$MAIL_ROOT/.postmaster/grants/$uuid.env"
+            rm -f -- "$body_file"
+            return 1
+        fi
+    fi
+
     local attach_csv=""
     if (( ${#attach_files[@]} > 0 )); then
         attach_csv="$(mail_stage_attachments "$thread_dir" "${attach_files[@]}")" || {
             (( saw_grant )) && rm -f -- "$MAIL_ROOT/.postmaster/grants/$uuid.env"
+            (( saw_review_target )) && rm -f -- "$MAIL_ROOT/.postmaster/review-target/$uuid.env"
             rm -f -- "$body_file"
             return 1
         }
@@ -653,6 +751,14 @@ cmd_send() {
     [[ -n "$cc_norm" ]] && hlines+=("Cc: $cc_norm")
     hlines+=("Subject: $subject")
     hlines+=("X-Hops: $hops")
+    if (( saw_review_target )); then
+        # The setter signal, plus the ordinary per-message target headers
+        # (every message about a commit carries X-Review-Target; see
+        # docs/agent-mail.md's header contract).
+        hlines+=("X-Review-Target-Set: $review_target_branch $review_target_sha")
+        hlines+=("X-Review-Target: $review_target_branch $review_target_sha")
+        hlines+=("X-Version: 1")
+    fi
     for hline in "${validated_headers[@]:-}"; do
         [[ -n "$hline" ]] && hlines+=("$hline")
     done
@@ -668,6 +774,7 @@ cmd_send() {
 
     mail_place_message "$headers" "$body_file" "$thread_dir" "$uuid" >/dev/null || {
         (( saw_grant )) && rm -f -- "$MAIL_ROOT/.postmaster/grants/$uuid.env"
+        (( saw_review_target )) && rm -f -- "$MAIL_ROOT/.postmaster/review-target/$uuid.env"
         rm -f -- "$body_file"
         return 1
     }
@@ -693,6 +800,11 @@ cmd_reply() {
             --allow-namespace|--reach-probe|--context-ro)
                 echo "Error: reply: grant flags apply to a new thread only (mail send); for an existing thread use" >&2
                 echo "fork-sandbox mail grant <thread-id> ..." >&2
+                return 1
+                ;;
+            --review-target)
+                echo "Error: reply: --review-target applies to a new thread only (mail send); a reply that moves" >&2
+                echo "the target is the 'sets' seat's own Version: header instead." >&2
                 return 1
                 ;;
             -h|--help) usage; exit 0 ;;

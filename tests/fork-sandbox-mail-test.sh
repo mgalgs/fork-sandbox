@@ -646,6 +646,90 @@ rc=$?
 check "reply with a grant flag exits 1" "1" "$rc"
 contains "reply's refusal names send as the way to set a grant" "$out" "grant flags apply to a new thread only"
 
+printf '\n== send: --review-target ==\n'
+
+rt_sha1="0123456789abcdef0123456789abcdef01234567"
+rt_sha_upper="0123456789ABCDEF0123456789abcdef01234567"
+rt_sha_short="0123456789abcdef"
+
+rt_out="$("$mail" send --from @alice --to @bob --subject "Review thread" --body - \
+    --review-target "review/p2r3:$rt_sha1" <<< "hi" 2>diag.txt)"
+rc=$?
+check "send with a valid review-target exits 0" "0" "$rc"
+rt_state_file="$FORK_SANDBOX_MAIL_ROOT/.postmaster/review-target/$rt_out.env"
+check "review-target state file exists" "1" "$([[ -f "$rt_state_file" ]] && echo 1 || echo 0)"
+rt_state_content="$(cat -- "$rt_state_file")"
+contains "state file has BRANCH" "$rt_state_content" "BRANCH=review/p2r3"
+contains "state file has SHA" "$rt_state_content" "SHA=$rt_sha1"
+contains "state file has VERSION=1" "$rt_state_content" "VERSION=1"
+contains "state file has SET_BY" "$rt_state_content" "SET_BY=@alice"
+contains "state file has SET_AT" "$rt_state_content" "SET_AT="
+check "state file has exactly five keys" "5" "$(grep -c '=' -- "$rt_state_file")"
+
+rt_raw="$("$mail" show "$rt_out")"
+contains "X-Review-Target-Set header" "$rt_raw" "X-Review-Target-Set: review/p2r3 $rt_sha1"
+contains "X-Review-Target header (the setter carries the ordinary header too)" "$rt_raw" "X-Review-Target: review/p2r3 $rt_sha1"
+contains "X-Version header" "$rt_raw" "X-Version: 1"
+
+rt_threads_before="$(find "$FORK_SANDBOX_MAIL_ROOT/threads" -maxdepth 1 -type d | wc -l)"
+rt_files_before="$(find "$FORK_SANDBOX_MAIL_ROOT/.postmaster/review-target" -name '*.env' 2>/dev/null | wc -l)"
+
+out="$("$mail" send --from @alice --to @bob --subject "Bad branch" --body - \
+    --review-target "bad branch:$rt_sha1" <<< "hi" 2>&1)"
+rc=$?
+check "send with a bad branch name exits nonzero" "1" "$rc"
+check "bad branch creates no new thread dir" "$rt_threads_before" \
+    "$(find "$FORK_SANDBOX_MAIL_ROOT/threads" -maxdepth 1 -type d | wc -l)"
+check "bad branch writes no state file" "$rt_files_before" \
+    "$(find "$FORK_SANDBOX_MAIL_ROOT/.postmaster/review-target" -name '*.env' 2>/dev/null | wc -l)"
+
+out="$("$mail" send --from @alice --to @bob --subject "Short sha" --body - \
+    --review-target "review/p2r3:$rt_sha_short" <<< "hi" 2>&1)"
+rc=$?
+check "send with a short sha exits nonzero" "1" "$rc"
+check "short sha creates no new thread dir" "$rt_threads_before" \
+    "$(find "$FORK_SANDBOX_MAIL_ROOT/threads" -maxdepth 1 -type d | wc -l)"
+check "short sha writes no state file" "$rt_files_before" \
+    "$(find "$FORK_SANDBOX_MAIL_ROOT/.postmaster/review-target" -name '*.env' 2>/dev/null | wc -l)"
+
+out="$("$mail" send --from @alice --to @bob --subject "Uppercase sha" --body - \
+    --review-target "review/p2r3:$rt_sha_upper" <<< "hi" 2>&1)"
+rc=$?
+check "send with an uppercase sha exits nonzero" "1" "$rc"
+check "uppercase sha creates no new thread dir" "$rt_threads_before" \
+    "$(find "$FORK_SANDBOX_MAIL_ROOT/threads" -maxdepth 1 -type d | wc -l)"
+check "uppercase sha writes no state file" "$rt_files_before" \
+    "$(find "$FORK_SANDBOX_MAIL_ROOT/.postmaster/review-target" -name '*.env' 2>/dev/null | wc -l)"
+
+out="$("$mail" send --from @alice --to @bob --subject "No colon" --body - \
+    --review-target "review/p2r3-$rt_sha1" <<< "hi" 2>&1)"
+rc=$?
+check "send with no ':' in the value exits nonzero" "1" "$rc"
+check "no-colon value creates no new thread dir" "$rt_threads_before" \
+    "$(find "$FORK_SANDBOX_MAIL_ROOT/threads" -maxdepth 1 -type d | wc -l)"
+check "no-colon value writes no state file" "$rt_files_before" \
+    "$(find "$FORK_SANDBOX_MAIL_ROOT/.postmaster/review-target" -name '*.env' 2>/dev/null | wc -l)"
+
+rt_files_before="$(find "$FORK_SANDBOX_MAIL_ROOT/.postmaster/review-target" -name '*.env' 2>/dev/null | wc -l)"
+out="$("$mail" send --from @alice --to @bob --subject "Send review-target big attach" --body - \
+    --review-target "review/p2r3:$rt_sha1" --attach "$big" <<< "x" 2>&1)"
+rc=$?
+if (( rc != 0 )); then
+    ok "send with a valid review-target but a failing attachment fails"
+else
+    no "send with a valid review-target but a failing attachment fails" "it succeeded"
+fi
+check "no orphaned review-target state file is left behind" "$rt_files_before" \
+    "$(find "$FORK_SANDBOX_MAIL_ROOT/.postmaster/review-target" -name '*.env' 2>/dev/null | wc -l)"
+
+printf '\n== reply: --review-target is refused ==\n'
+
+out="$("$mail" reply --from @bob --reply-to "$rt_out" --body - \
+    --review-target "review/p2r3:$rt_sha1" <<< "x" 2>&1)"
+rc=$?
+check "reply with --review-target exits 1" "1" "$rc"
+contains "reply's refusal names send as the way to set a review target" "$out" "applies to a new thread only"
+
 printf '\n== export --json ==\n'
 
 new_root FORK_SANDBOX_MAIL_ROOT; export FORK_SANDBOX_MAIL_ROOT
