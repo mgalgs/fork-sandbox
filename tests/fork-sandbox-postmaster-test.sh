@@ -5202,6 +5202,37 @@ check "review-target case A2: no REVIEW_TARGET_SHA written when there is no targ
 check "review-target case A2: no REVIEW_TARGET_VERSION written when there is no target" \
     0 "$(grep -c '^REVIEW_TARGET_VERSION=' "$rt2_env")"
 
+# ---- review-target case A5: the `sets` seat (ken) on a kickoff-opened
+# thread spawns at the target until it has a lineage of its own, then
+# keeps its lineage ----
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+mkdir -p -- "$PM_STATE_DIR/runs" "$PM_STATE_DIR/harvested" "$PM_STATE_DIR/seq"
+
+printf '%s\n' 'please revise' > "$work/body.tmp"
+"$MAIL" send --from '@carol' --to '@ken' --subject 'review target author first wake' \
+    --body "$work/body.tmp" --hops 8 --review-target "$rt1_branch:$rt1_sha" >/dev/null 2>&1
+: > "$STUB_ARGV_LOG"
+once
+check "review-target case A5: sets seat with no lineage spawns with --checkout at the target sha" \
+    "$rt1_sha" "$(argv_after --checkout "$STUB_ARGV_LOG")"
+
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+mkdir -p -- "$PM_STATE_DIR/runs" "$PM_STATE_DIR/harvested" "$PM_STATE_DIR/seq"
+
+rt5b_mid="$("$MAIL" send --from '@carol' --to '@ken' --subject 'review target author later wake' \
+    --body "$work/body.tmp" --hops 8 --review-target "$rt1_branch:$rt1_sha" 2>/dev/null)"
+rt5b_tid="$(thread_of "$rt5b_mid")"
+seed_lineage_run "$rt5b_tid" pm-rt-author-rid1 ken pm-lineage-test-newer 1
+: > "$STUB_ARGV_LOG"
+once
+check "review-target case A5: sets seat with a lineage keeps it, not the target" \
+    "pm-lineage-test-newer" "$(argv_after --checkout "$STUB_ARGV_LOG")"
+
 # ---- review-target case A3: a target sha absent from the project repo,
 # with no `origin` remote configured, flags and refuses the wake instead of
 # spawning ----
@@ -5914,7 +5945,8 @@ new_scratch_root FORK_SANDBOX_MAIL_ROOT
 export FORK_SANDBOX_MAIL_ROOT
 PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
 
-rt5_seed_sha="$(printf 'b%.0s' {1..40})"
+# A real commit: the sets seat's first wake spawns at the kickoff target.
+rt5_seed_sha="$rt1_sha"
 printf '%s\n' 'kick off review' > "$work/body.tmp"
 rt5_mid="$("$MAIL" send --from '@carol' --to '@ken' --subject 'review target advance topic' \
     --body "$work/body.tmp" --hops 8 --review-target "pm-review-target-test-seed5:$rt5_seed_sha" 2>/dev/null)"
@@ -5972,7 +6004,7 @@ new_scratch_root FORK_SANDBOX_MAIL_ROOT
 export FORK_SANDBOX_MAIL_ROOT
 PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
 
-rt6_seed_sha="$(printf 'c%.0s' {1..40})"
+rt6_seed_sha="$rt1_sha"
 printf '%s\n' 'kick off review' > "$work/body.tmp"
 rt6_mid="$("$MAIL" send --from '@carol' --to '@ken' --subject 'review target non-advance topic' \
     --body "$work/body.tmp" --hops 8 --review-target "pm-review-target-test-seed6:$rt6_seed_sha" 2>/dev/null)"

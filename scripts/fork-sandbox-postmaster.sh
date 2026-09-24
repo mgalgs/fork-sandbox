@@ -2464,8 +2464,14 @@ pm_spawn_wake() {
     # else is written. `fleet check` refuses `review-target: follow` on
     # anything but a `backend: k8s` seat, so rt_sha is only ever non-empty
     # in the k8s branch below.
+    # The `sets` seat takes the target too, but only until it has a lineage
+    # of its own: its first wake on a kickoff-opened thread must start from
+    # the commit it is revising, not HEAD. After that its lineage IS the
+    # target it last set, so lineage wins.
     local rt_branch="" rt_sha="" rt_version=""
-    if [[ "$review_target" == follow ]]; then
+    if [[ "$review_target" == follow ]] \
+        || { [[ "$review_target" == sets ]] \
+             && ! pm_lineage_checkout "$project" "$tid" "$agent" >/dev/null; }; then
         local rt_file="$MAIL_ROOT/.postmaster/review-target/$tid.env"
         if [[ -f "$rt_file" ]]; then
             rt_branch="$(fs_pm_env_get "$rt_file" BRANCH)"
@@ -2594,7 +2600,8 @@ pm_spawn_wake() {
         # a k8s seat fresh from HEAD -- see pm_lineage_checkout's own
         # comment. Computed before this wake's own run-id is appended to
         # $SEQ/$tid below, so it never sees itself.
-        # A follow seat on a thread with a review target checks out that
+        # A follow seat on a thread with a review target (or the sets seat,
+        # before it has a lineage) checks out that
         # target's sha instead of its own lineage branch (rt_sha, resolved
         # above) -- the author's service definitions are not trusted
         # because they are under review, so --services-trust-ref is still
