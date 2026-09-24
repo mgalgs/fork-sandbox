@@ -6056,11 +6056,12 @@ bad = []
 def want(label, got, exp):
     if got != exp:
         bad.append(f"{label}: expected {exp!r}, got {got!r}")
-want("keys", sorted(d), ["flag", "grant", "held", "retries", "runs", "spawns", "thread", "unrouted"])
+want("keys", sorted(d), ["flag", "grant", "held", "retries", "review_target", "runs", "spawns", "thread", "unrouted"])
 want("thread", d["thread"], t)
 want("unrouted counts this thread only, keyed on Message-ID", d["unrouted"], 1)
 want("flag", d["flag"], {"reason": "hops exhausted at " + t, "events": 2})
 want("grant", d["grant"], True)
+want("review_target absent for a thread with no target", d["review_target"], None)
 want("spawns", d["spawns"], 3)
 runs = {r["run_id"]: r for r in d["runs"]}
 want("run ids: the other thread's run is excluded", sorted(runs), ["run-done", "run-live"])
@@ -6084,7 +6085,7 @@ check "status --json: a flag without its journal has events null" \
 
 sfx_empty="$(sfx_pm status --thread "ffffffff-4444-4444-8444-000000000009" --json)"
 check "status --json: a thread with no state is all empty or zero" \
-    '{"thread": "ffffffff-4444-4444-8444-000000000009", "unrouted": 0, "flag": null, "grant": false, "spawns": 0, "runs": [], "retries": [], "held": []}' \
+    '{"thread": "ffffffff-4444-4444-8444-000000000009", "unrouted": 0, "flag": null, "grant": false, "review_target": null, "spawns": 0, "runs": [], "retries": [], "held": []}' \
     "$sfx_empty"
 
 sfx_rc=0; sfx_out="$(sfx_pm status --json 2>&1)" || sfx_rc=$?
