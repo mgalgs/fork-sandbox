@@ -12758,7 +12758,8 @@ for a in "$@"; do
 done
 case "${args[0]:-} ${args[1]:-}" in
     "apply -f")
-        cat >/dev/null
+        body="$(cat)"
+        printf 'applied: %s\n' "$(grep -m1 '^  name:' <<< "$body")" >> "$K8S_STUB_LOG"
         exit 0
         ;;
     "create configmap")
@@ -12812,7 +12813,12 @@ EOF
     install -m 600 /dev/null "$d/deploy-key"
     printf 'dummy-key-material-for-tests-only\n' >> "$d/deploy-key"
     printf 'git.example ssh-ed25519 AAAAtest\n' > "$d/known_hosts"
-    printf 'agents: {}\n' > "$d/fleet.yaml"
+    # A fleet the cluster postmaster can run: install --postmaster runs
+    # `fleet check --cluster` against these exact dirs, and that check
+    # requires a personas dir holding each agent's persona.
+    printf 'agents:\n  alpha: {harness: pi, backend: k8s}\n' > "$d/fleet.yaml"
+    mkdir -p "$d/personas"
+    printf 'Standing instructions.\n' > "$d/personas/alpha.md"
     printf '%s' "$d"
 }
 
@@ -12910,9 +12916,12 @@ pm_mk_optdir() {
     printf '%s' "$d"
 }
 
-for pm_name in personas prompts handlers presets; do
+# personas is not in this loop: the fleet check every install runs requires
+# the dir, so the base fixture always carries it (asserted just below).
+check "the base fixture's personas dir always renders its env var" \
+    "1" "$(grep -c FORK_SANDBOX_PERSONAS_DIR "$pm_out1")"
+for pm_name in prompts handlers presets; do
     case "$pm_name" in
-        personas) pm_env=FORK_SANDBOX_PERSONAS_DIR ;;
         prompts) pm_env=FORK_SANDBOX_PROMPTS_DIR ;;
         handlers) pm_env=FORK_SANDBOX_HANDLERS_DIR ;;
         presets) pm_env=FORK_SANDBOX_PRESETS_DIR ;;
@@ -12928,10 +12937,9 @@ for pm_name in personas prompts handlers presets; do
     else
         no "$pm_name alone: its env var renders" "$pm_out_one"
     fi
-    for pm_other in personas prompts handlers presets; do
+    for pm_other in prompts handlers presets; do
         [[ "$pm_other" == "$pm_name" ]] && continue
         case "$pm_other" in
-            personas) pm_oenv=FORK_SANDBOX_PERSONAS_DIR ;;
             prompts) pm_oenv=FORK_SANDBOX_PROMPTS_DIR ;;
             handlers) pm_oenv=FORK_SANDBOX_HANDLERS_DIR ;;
             presets) pm_oenv=FORK_SANDBOX_PRESETS_DIR ;;
@@ -13114,11 +13122,12 @@ fi
 pm_cfg_fleet="$(newdir)"; tmpdirs+=("$pm_cfg_fleet")
 cp -r "$pm_cfg1"/. "$pm_cfg_fleet"/
 chmod 600 "$pm_cfg_fleet/deploy-key" "$pm_cfg_fleet/pi.env"
-printf 'seats: []\n' > "$pm_cfg_fleet/fleet.yaml"
+printf 'agents:\n  alpha: {harness: pi, backend: k8s}\n' > "$pm_cfg_fleet/fleet.yaml"
 pm_log_fleet1="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$pm_log_fleet1")")
 pm_sum1="$(PATH="$pm_stub_bin:$PATH" K8S_STUB_LOG="$pm_log_fleet1" FORK_SANDBOX_CONFIG_DIR="$pm_cfg_fleet" \
     "$k8s_sh" install --postmaster --dry-run 2>/dev/null | grep -o 'checksum/pm-config: "[a-f0-9]*"')"
-printf 'seats: [{name: demo}]\n' > "$pm_cfg_fleet/fleet.yaml"
+printf 'Standing instructions.\n' > "$pm_cfg_fleet/personas/beta.md"
+printf 'agents:\n  alpha: {harness: pi, backend: k8s}\n  beta: {harness: pi, backend: k8s}\n' > "$pm_cfg_fleet/fleet.yaml"
 pm_log_fleet2="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$pm_log_fleet2")")
 pm_sum2="$(PATH="$pm_stub_bin:$PATH" K8S_STUB_LOG="$pm_log_fleet2" FORK_SANDBOX_CONFIG_DIR="$pm_cfg_fleet" \
     "$k8s_sh" install --postmaster --dry-run 2>/dev/null | grep -o 'checksum/pm-config: "[a-f0-9]*"')"
@@ -13198,6 +13207,214 @@ else
     ok "no warning when FORK_SANDBOX_K8S_PLATFORM=generic"
 fi
 rm -f /tmp/fs-k8s-test-pm-platform-generic.err
+
+# 14. The mail API: deployed beside the postmaster only when
+# K8S_MAIL_API_TOKENS_FILE is set; the operator list; the install-time
+# fleet check; both Secrets in the checksum, neither ever printed.
+printf '\n== install --postmaster: mail API, operator list, fleet check ==\n'
+pm_api_mint="$repo_dir/scripts/fork-sandbox-mail-api.py"
+pm_api_marker_tokens='MARKER-TOKENS-FILE-7f3a91'
+pm_api_marker_key='MARKER-GIT-KEY-c04d5e'
+
+# pm_api_cfg [extra k8s.env lines...]: the base fixture plus its own copy of
+# the key files and a valid tokens file (one operator, one client); prints
+# the config dir.
+pm_api_cfg() {
+    local d line
+    d="$(newdir)"; tmpdirs+=("$d")
+    cp -r "$pm_cfg1"/. "$d"/
+    chmod 600 "$d/deploy-key" "$d/pi.env"
+    sed -i "s|^K8S_POSTMASTER_GIT_KEY_FILE=.*|K8S_POSTMASTER_GIT_KEY_FILE=$d/deploy-key|; s|^K8S_POSTMASTER_KNOWN_HOSTS_FILE=.*|K8S_POSTMASTER_KNOWN_HOSTS_FILE=$d/known_hosts|" "$d/k8s.env"
+    printf '# %s\n' "$pm_api_marker_key" >> "$d/deploy-key"
+    install -m 600 /dev/null "$d/mail-api-tokens"
+    {
+        printf '# %s\n' "$pm_api_marker_tokens"
+        "$pm_api_mint" mint --role operator --label laptop | sed -n 2p
+        "$pm_api_mint" mint --role client --label ci-kickoff --as @ci-kickoff --caps read | sed -n 2p
+    } >> "$d/mail-api-tokens"
+    printf 'K8S_MAIL_API_TOKENS_FILE=%s/mail-api-tokens\n' "$d" >> "$d/k8s.env"
+    for line in "$@"; do printf '%s\n' "$line" >> "$d/k8s.env"; done
+    printf '%s' "$d"
+}
+
+# pm_api_install <cfgdir> [VAR=value ...]: a dry-run install; stdout lands
+# in $pm_api_out, stderr in $pm_api_err, the status in $pm_api_rc, and the
+# kubectl stub's call log path in $pm_api_log.
+pm_api_out="" pm_api_err="" pm_api_rc=0 pm_api_log=""
+pm_api_install() {
+    local cfg="$1" wd; shift
+    wd="$(newdir)"; tmpdirs+=("$wd")
+    pm_api_log="$wd/kubectl.log"
+    pm_api_out="$(env PATH="$pm_stub_bin:$PATH" K8S_STUB_LOG="$pm_api_log" \
+        FORK_SANDBOX_CONFIG_DIR="$cfg" "$@" "$k8s_sh" install --postmaster --dry-run 2>"$wd/err")"
+    pm_api_rc=$?
+    pm_api_err="$(<"$wd/err")"
+}
+pm_api_dep() { yq -r "select(.kind == \"Deployment\" and .metadata.name == \"fork-sandbox-postmaster\") | $1" <<< "$pm_api_out"; }
+pm_api_sum() { grep -o 'checksum/pm-config: "[a-f0-9]*"' <<< "$pm_api_out"; }
+
+# pm_api_refused <label> <needle> <cfgdir> [VAR=value ...]: install refuses
+# with the needle in its output, before a single kubectl call.
+pm_api_refused() {
+    local label="$1" needle="$2"; shift 2
+    pm_api_install "$@"
+    if (( pm_api_rc != 0 )) && [[ "$pm_api_err" == *"$needle"* ]]; then
+        ok "$label"
+    else
+        no "$label" "status $pm_api_rc: $pm_api_err"
+    fi
+    if [[ -s "$pm_api_log" ]]; then
+        no "$label: before any kubectl call" "$(cat "$pm_api_log")"
+    else
+        ok "$label: before any kubectl call"
+    fi
+}
+
+# 14a. Tokens file unset (the base fixture): no API pieces, no marker
+# lines left, the operator env still on the postmaster container, and one
+# stderr note pointing at the docs.
+pm_api_install "$pm_cfg1"
+check "no tokens file: install exits 0" "0" "$pm_api_rc"
+check "no tokens file: only the postmaster container" "postmaster" \
+    "$(pm_api_dep '.spec.template.spec.containers[].name')"
+check "no tokens file: no mail-api Service" "0" "$(grep -c 'fork-sandbox-mail-api' <<< "$pm_api_out")"
+check "no tokens file: no mail-api-tokens volume" "0" "$(grep -c 'mail-api-tokens' <<< "$pm_api_out")"
+check "no tokens file: no mail-api marker lines left" "0" "$(grep -cE '# (>>>|<<<) mail-api ' <<< "$pm_api_out")"
+check "no tokens file: the note names the key" "1" \
+    "$(grep -c 'K8S_MAIL_API_TOKENS_FILE is' <<< "$pm_api_err")"
+check "no tokens file: exactly one note" "1" "$(grep -c 'mail API is not deployed' <<< "$pm_api_err")"
+check "no tokens file: postmaster carries FORK_SANDBOX_OPERATORS=@operator" "@operator" \
+    "$(pm_api_dep '.spec.template.spec.containers[] | select(.name == "postmaster") | .env[] | select(.name == "FORK_SANDBOX_OPERATORS") | .value')"
+if ! grep -q 'mail API is not deployed' "$pm_out1"; then ok "the note goes to stderr, not stdout"; else no "the note goes to stderr, not stdout"; fi
+if command -v yamllint >/dev/null 2>&1; then
+    out="$(printf '%s\n' "$pm_api_out" | yamllint - 2>&1)"
+    if [[ -z "$out" ]]; then ok "yamllint: no tokens file"; else no "yamllint: no tokens file" "$out"; fi
+fi
+
+# 14b. Tokens file set: every piece renders, the API container is
+# unprivileged, the SA token is projected into the postmaster only.
+pm_cfg_api="$(pm_api_cfg K8S_POSTMASTER_OPERATORS=@alice,@operator)"
+pm_api_install "$pm_cfg_api"
+check "tokens file: install exits 0" "0" "$pm_api_rc"
+check "tokens file: no note on stderr" "0" "$(grep -c 'mail API is not deployed' <<< "$pm_api_err")"
+check "tokens file: containers are postmaster, mail-api" "postmaster mail-api" \
+    "$(pm_api_dep '.spec.template.spec.containers[].name' | paste -sd' ')"
+check "tokens file: Service fork-sandbox-mail-api present" "fork-sandbox-mail-api" \
+    "$(yq -r 'select(.kind == "Service" and .metadata.name == "fork-sandbox-mail-api") | .metadata.name' <<< "$pm_api_out")"
+check "tokens file: the Service selects the postmaster pod on port 80 -> http" "app=fork-sandbox-postmaster 80 http" \
+    "$(yq -r 'select(.kind == "Service" and .metadata.name == "fork-sandbox-mail-api") | "app=\(.spec.selector.app) \(.spec.ports[0].port) \(.spec.ports[0].targetPort)"' <<< "$pm_api_out")"
+check "tokens file: the mail-api-tokens volume is present" "fork-sandbox-mail-api-tokens" \
+    "$(pm_api_dep '.spec.template.spec.volumes[] | select(.name == "mail-api-tokens") | .secret.secretName')"
+check "tokens file: automountServiceAccountToken is false" "false" \
+    "$(pm_api_dep '.spec.template.spec.automountServiceAccountToken')"
+check "tokens file: the postmaster container mounts sa-token at the SA path" "sa-token" \
+    "$(pm_api_dep '.spec.template.spec.containers[] | select(.name == "postmaster") | .volumeMounts[] | select(.mountPath == "/var/run/secrets/kubernetes.io/serviceaccount") | .name')"
+check "tokens file: the mail-api container has no mount at the SA path" "0" \
+    "$(pm_api_dep '.spec.template.spec.containers[] | select(.name == "mail-api") | .volumeMounts[] | select(.mountPath | startswith("/var/run/secrets"))' | grep -c .)"
+check "tokens file: the mail-api container mounts none of git/config/sa-token" "0" \
+    "$(pm_api_dep '.spec.template.spec.containers[] | select(.name == "mail-api") | .volumeMounts[] | select(.name == "git" or .name == "config" or .name == "sa-token") | .name' | grep -c .)"
+check "tokens file: the mail-api container mounts neither src nor home-claude" "0" \
+    "$(pm_api_dep '.spec.template.spec.containers[] | select(.name == "mail-api") | .volumeMounts[] | select(.mountPath == "/home/fs/src" or .mountPath == "/home/fs/.claude") | .mountPath' | grep -c .)"
+check "tokens file: both containers carry the configured operator list" "@alice,@operator @alice,@operator" \
+    "$(pm_api_dep '.spec.template.spec.containers[] | .env[] | select(.name == "FORK_SANDBOX_OPERATORS") | .value' | paste -sd' ')"
+if command -v yamllint >/dev/null 2>&1; then
+    out="$(printf '%s\n' "$pm_api_out" | yamllint - 2>&1)"
+    if [[ -z "$out" ]]; then ok "yamllint: tokens file set"; else no "yamllint: tokens file set" "$out"; fi
+fi
+check "tokens file: the dry-run prints the tokens Secret placeholder" "1" \
+    "$(grep -cF '# (dry-run) would create Secret fork-sandbox-mail-api-tokens ... -- not shown.' <<< "$pm_api_out")"
+check "no tokens file: no tokens Secret placeholder" "0" \
+    "$(grep -cF 'fork-sandbox-mail-api-tokens' "$pm_out1")"
+pm_api_apply_order_wd="$(newdir)"; tmpdirs+=("$pm_api_apply_order_wd")
+env PATH="$pm_stub_bin:$PATH" K8S_STUB_LOG="$pm_api_apply_order_wd/log" FORK_SANDBOX_CONFIG_DIR="$pm_cfg_api" \
+    "$k8s_sh" install --postmaster >/dev/null 2>&1
+pm_api_t_line="$(grep -n '^applied:   name: fork-sandbox-mail-api-tokens$' "$pm_api_apply_order_wd/log" | head -1 | cut -d: -f1)"
+pm_api_d_line="$(grep -n '^applied:   name: fork-sandbox-postmaster$' "$pm_api_apply_order_wd/log" | tail -1 | cut -d: -f1)"
+pm_api_g_line="$(grep -n '^applied:   name: fork-sandbox-postmaster-git$' "$pm_api_apply_order_wd/log" | head -1 | cut -d: -f1)"
+if [[ -n "$pm_api_t_line" && -n "$pm_api_d_line" && -n "$pm_api_g_line" ]] \
+    && (( pm_api_t_line < pm_api_d_line && pm_api_g_line < pm_api_d_line )); then
+    ok "a real install applies the git and tokens Secrets before the Deployment bundle"
+else
+    no "a real install applies the git and tokens Secrets before the Deployment bundle" \
+        "tokens=$pm_api_t_line git=$pm_api_g_line bundle=$pm_api_d_line: $(cat "$pm_api_apply_order_wd/log")"
+fi
+
+# 14c. The checksum covers both Secrets, and neither is ever printed.
+pm_api_install "$pm_cfg_api"
+pm_sum_base="$(pm_api_sum)"
+check "neither planted marker appears in stdout" "0" \
+    "$(grep -cE "$pm_api_marker_tokens|$pm_api_marker_key" <<< "$pm_api_out")"
+check "neither planted marker appears in stderr" "0" \
+    "$(grep -cE "$pm_api_marker_tokens|$pm_api_marker_key" <<< "$pm_api_err")"
+printf '# rotated\n' >> "$pm_cfg_api/mail-api-tokens"
+pm_api_install "$pm_cfg_api"
+if [[ -n "$pm_sum_base" && -n "$(pm_api_sum)" && "$(pm_api_sum)" != "$pm_sum_base" ]]; then
+    ok "changing only the tokens file changes checksum/pm-config"
+else
+    no "changing only the tokens file changes checksum/pm-config" "before=$pm_sum_base after=$(pm_api_sum)"
+fi
+pm_sum_tok="$(pm_api_sum)"
+printf '# rotated\n' >> "$pm_cfg_api/deploy-key"
+pm_api_install "$pm_cfg_api"
+if [[ -n "$(pm_api_sum)" && "$(pm_api_sum)" != "$pm_sum_tok" ]]; then
+    ok "changing only the git key file changes checksum/pm-config"
+else
+    no "changing only the git key file changes checksum/pm-config" "before=$pm_sum_tok after=$(pm_api_sum)"
+fi
+check "the rotated contents are still never printed" "0" "$(grep -c 'rotated' <<< "$pm_api_out$pm_api_err")"
+
+# 14d. Tokens file refusals: malformed, symlink, missing.
+pm_cfg_badtok="$(pm_api_cfg)"
+printf 'not a valid entry\n' >> "$pm_cfg_badtok/mail-api-tokens"
+pm_api_refused "a malformed tokens file refuses with the loader's line" "fork-sandbox-mail-api.py check" "$pm_cfg_badtok"
+check "the loader's own line is passed through" "1" \
+    "$(grep -c 'line 4' <<< "$pm_api_err")"
+check "a malformed tokens file leaks no hash" "0" "$(grep -cE '[0-9a-f]{64}' <<< "$pm_api_err")"
+
+pm_cfg_lnk="$(pm_api_cfg)"
+mv "$pm_cfg_lnk/mail-api-tokens" "$pm_cfg_lnk/real-tokens"
+ln -s "$pm_cfg_lnk/real-tokens" "$pm_cfg_lnk/mail-api-tokens"
+pm_api_refused "a symlinked tokens file refuses" "is a symlink" "$pm_cfg_lnk"
+
+pm_cfg_missing_tok="$(pm_api_cfg)"
+rm -f "$pm_cfg_missing_tok/mail-api-tokens"
+pm_api_refused "a missing tokens file refuses" "not found" "$pm_cfg_missing_tok"
+
+# 14e. The operator list: refusals and the client-token cross-check.
+pm_cfg_op1="$(pm_api_cfg K8S_POSTMASTER_OPERATORS=@a,,@b)"
+pm_api_refused "K8S_POSTMASTER_OPERATORS=@a,,@b refuses, naming the empty element" "K8S_POSTMASTER_OPERATORS element ''" "$pm_cfg_op1"
+pm_cfg_op2="$(pm_api_cfg K8S_POSTMASTER_OPERATORS=Bad)"
+pm_api_refused "K8S_POSTMASTER_OPERATORS=Bad refuses, naming it" "element 'Bad'" "$pm_cfg_op2"
+pm_cfg_op3="$(pm_api_cfg K8S_POSTMASTER_OPERATORS=@a,)"
+pm_api_refused "a trailing comma refuses" "K8S_POSTMASTER_OPERATORS element ''" "$pm_cfg_op3"
+pm_cfg_op4="$(pm_api_cfg K8S_POSTMASTER_OPERATORS=@operator,@alpha)"
+pm_api_refused "an operator name that is a fleet agent refuses" "names '@alpha', which is a fleet" "$pm_cfg_op4"
+pm_cfg_op5="$(pm_api_cfg K8S_POSTMASTER_OPERATORS=@ci-kickoff,@operator)"
+pm_api_refused "a client token listing an operator-list name refuses (through check)" "ci-kickoff" "$pm_cfg_op5"
+check "... and the refusal names the operator name" "1" "$(grep -c '@ci-kickoff' <<< "$pm_api_err")"
+
+# 14f. The fleet check at install: refuses what the pod could not run,
+# before anything renders, and looks only at $config_dir's dirs.
+pm_cfg_local="$(pm_api_cfg)"
+printf 'agents:\n  alpha: {harness: pi, backend: local}\n' > "$pm_cfg_local/fleet.yaml"
+pm_api_refused "a backend: local seat refuses install --postmaster" "would crash-loop on this fleet" "$pm_cfg_local"
+check "... after the fleet script's own error, naming the seat" "1" "$(grep -c 'agents.alpha' <<< "$pm_api_err")"
+pm_cfg_triage="$(pm_api_cfg)"
+printf 'triage: {}\nagents:\n  alpha: {harness: pi, backend: k8s}\n' > "$pm_cfg_triage/fleet.yaml"
+pm_api_refused "a top-level triage: block refuses install --postmaster" "would crash-loop on this fleet" "$pm_cfg_triage"
+
+pm_cfg_pin="$(pm_api_cfg)"
+mkdir -p "$pm_cfg_pin/handlers"
+printf '#!/bin/sh\nexit 0\n' > "$pm_cfg_pin/handlers/echo-handler"
+chmod 755 "$pm_cfg_pin/handlers/echo-handler"
+printf 'agents:\n  alpha: {harness: pi, backend: k8s}\n  notifier: {handler: exec, command: echo-handler}\n' \
+    > "$pm_cfg_pin/fleet.yaml"
+pm_empty_dir="$(newdir)"; tmpdirs+=("$pm_empty_dir")
+pm_api_install "$pm_cfg_pin"
+check "a handler seat whose command is in \$config_dir/handlers installs" "0" "$pm_api_rc"
+pm_api_install "$pm_cfg_pin" FORK_SANDBOX_HANDLERS_DIR="$pm_empty_dir" FORK_SANDBOX_PRESETS_DIR="$pm_empty_dir" \
+    FORK_SANDBOX_PERSONAS_DIR="$pm_empty_dir" FORK_SANDBOX_FLEET_FILE=/nonexistent
+check "a caller env pointing the fleet dirs elsewhere does not change the result" "0" "$pm_api_rc"
 
 printf '\n== client Role vs postmaster Role: same rules ==\n'
 rbac_yaml="$repo_dir/manifests/k8s/10-rbac.yaml"

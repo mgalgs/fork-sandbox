@@ -611,6 +611,28 @@
 #                         also accepted (for a StorageClass/CSI driver
 #                         that does not support RWOP yet). Any other value
 #                         is refused.
+#   K8S_POSTMASTER_OPERATORS=
+#                         comma-separated @names (no spaces) that carry
+#                         rule-1 authority in the cluster postmaster: only
+#                         mail From one of them clears a thread's
+#                         needs-operator flag or resets its spawn budget.
+#                         Optional; defaults to @operator. Each name must
+#                         match ^@[a-z0-9][a-z0-9-]*$, no empty elements,
+#                         and none may resolve as an agent in the laptop
+#                         fleet (refused otherwise). Rendered into the
+#                         Deployment as FORK_SANDBOX_OPERATORS on both the
+#                         postmaster and the mail-api container.
+#   K8S_MAIL_API_TOKENS_FILE=
+#                         laptop path to the mail API tokens file (see
+#                         `fork-sandbox-mail-api.py mint`). Optional; when
+#                         set, install deploys the mail API beside the
+#                         postmaster (container, tokens Secret, ClusterIP
+#                         Service); when unset it is not deployed. Must be
+#                         a regular file, owned by you, mode 0600 or
+#                         stricter (require_secret_file), and pass
+#                         `fork-sandbox-mail-api.py check` under
+#                         K8S_POSTMASTER_OPERATORS -- install refuses
+#                         otherwise. Rotating its content rolls the pod.
 #
 # The provider key is NOT in this file. install reads it from
 # ~/.config/fork-sandbox/pi.env (OPENROUTER_API_KEY=...), the same file a
@@ -779,6 +801,9 @@ K8S_POSTMASTER_STORAGE="$(read_env_value "$k8s_env" K8S_POSTMASTER_STORAGE || tr
 K8S_POSTMASTER_STORAGE="${K8S_POSTMASTER_STORAGE:-20Gi}"
 K8S_POSTMASTER_ACCESS_MODE="$(read_env_value "$k8s_env" K8S_POSTMASTER_ACCESS_MODE || true)"
 K8S_POSTMASTER_ACCESS_MODE="${K8S_POSTMASTER_ACCESS_MODE:-ReadWriteOncePod}"
+K8S_POSTMASTER_OPERATORS="$(read_env_value "$k8s_env" K8S_POSTMASTER_OPERATORS || true)"
+K8S_POSTMASTER_OPERATORS="${K8S_POSTMASTER_OPERATORS:-@operator}"
+K8S_MAIL_API_TOKENS_FILE="$(read_env_value "$k8s_env" K8S_MAIL_API_TOKENS_FILE || true)"
 # Free-form labels for this run, populated by resolve_run_labels in
 # cmd_submit. Declared empty here (module-global) so build_extra_label_lines
 # can read them under `set -u` even on a verb that never calls
@@ -859,6 +884,7 @@ if [[ "${1-}" != check-grant ]]; then
         "$K8S_POSTMASTER_PROJECT" "$K8S_POSTMASTER_GIT_KEY_FILE" \
         "$K8S_POSTMASTER_KNOWN_HOSTS_FILE" "$K8S_POSTMASTER_STORAGE_CLASS" \
         "$K8S_POSTMASTER_STORAGE" "$K8S_POSTMASTER_ACCESS_MODE" \
+        "$K8S_POSTMASTER_OPERATORS" "$K8S_MAIL_API_TOKENS_FILE" \
         || exit 1
 fi
 
@@ -2668,6 +2694,54 @@ cmd_install() {
             echo "backend: k8s seats." >&2
             exit 1
         fi
+        # The check the pod runs at startup, pinned to the four dirs this
+        # install ships into the ConfigMaps rather than whatever
+        # FORK_SANDBOX_*_DIR the caller's shell exports: it must see what
+        # the pod will see.
+        local -a pm_fleet_env=(
+            FORK_SANDBOX_FLEET_FILE="$config_dir/fleet.yaml"
+            FORK_SANDBOX_PERSONAS_DIR="$config_dir/personas"
+            FORK_SANDBOX_HANDLERS_DIR="$config_dir/handlers"
+            FORK_SANDBOX_PRESETS_DIR="$config_dir/presets"
+        )
+        if ! env "${pm_fleet_env[@]}" "$script_dir/fork-sandbox-fleet.sh" check --cluster; then
+            echo "Error: the cluster postmaster would crash-loop on this fleet" >&2
+            echo "($config_dir/fleet.yaml): 'deliver --cluster' runs the same" >&2
+            echo "check at startup. Fix the errors above and re-run install." >&2
+            exit 1
+        fi
+        # Same parse as the postmaster's own $FORK_SANDBOX_OPERATORS: comma
+        # separated, no spaces, each an @name, no empty element (the
+        # appended comma makes a trailing one visible).
+        local pm_op_el pm_op_re='^@[a-z0-9][a-z0-9-]*$'
+        local -a pm_op_parts
+        IFS=',' read -ra pm_op_parts <<< "$K8S_POSTMASTER_OPERATORS,"
+        for pm_op_el in "${pm_op_parts[@]}"; do
+            if [[ ! "$pm_op_el" =~ $pm_op_re ]]; then
+                echo "Error: K8S_POSTMASTER_OPERATORS element '$pm_op_el' is not an @name" >&2
+                echo "(comma-separated, no spaces, no empty elements, each matching" >&2
+                echo "$pm_op_re)." >&2
+                exit 1
+            fi
+            if env "${pm_fleet_env[@]}" "$script_dir/fork-sandbox-fleet.sh" \
+                resolve "${pm_op_el#@}" >/dev/null 2>&1; then
+                echo "Error: K8S_POSTMASTER_OPERATORS names '$pm_op_el', which is a fleet" >&2
+                echo "agent; an operator name must not be a fleet agent." >&2
+                exit 1
+            fi
+        done
+        if [[ -n "$K8S_MAIL_API_TOKENS_FILE" ]]; then
+            require_secret_file "$K8S_MAIL_API_TOKENS_FILE" || exit 1
+            local pm_tokens_out=""
+            if ! pm_tokens_out="$(FORK_SANDBOX_OPERATORS="$K8S_POSTMASTER_OPERATORS" \
+                "$script_dir/fork-sandbox-mail-api.py" check \
+                --tokens "$K8S_MAIL_API_TOKENS_FILE" 2>&1)"; then
+                echo "Error: K8S_MAIL_API_TOKENS_FILE='$K8S_MAIL_API_TOKENS_FILE' failed" >&2
+                echo "fork-sandbox-mail-api.py check:" >&2
+                printf '%s\n' "$pm_tokens_out" >&2
+                exit 1
+            fi
+        fi
         # The postmaster image ships no platform plugin beyond generic and
         # the Deployment sets no FORK_SANDBOX_K8S_PLATFORM, so a seat
         # submitted from inside the pod always resolves the generic
@@ -3165,6 +3239,7 @@ cmd_install() {
     # optional blocks stripped. Needs $manifests_dir, just computed above.
     local pm_config_yaml="" pm_personas_yaml="" pm_prompts_yaml="" pm_handlers_yaml="" pm_presets_yaml=""
     local pm_config_checksum="" pm_file_rendered="" tag
+    local pm_git_secret_yaml="" pm_tokens_secret_yaml=""
     if $postmaster; then
         pm_config_yaml="$(kubectl create configmap fork-sandbox-postmaster-config \
             "${pm_config_args[@]}" --dry-run=client -o yaml)"
@@ -3177,9 +3252,25 @@ cmd_install() {
         $pm_have_presets && pm_presets_yaml="$(kubectl create configmap fork-sandbox-postmaster-presets \
             "${pm_presets_args[@]}" --dry-run=client -o yaml)"
 
-        pm_config_checksum="$(printf '%s%s%s%s%s' \
+        # Both Secrets are rendered here, once, and folded into the
+        # checksum: the API server reads its tokens at startup and the git
+        # key is read at pod init, so rotating either must roll the pod.
+        # Their text goes into the hash and the apply phase only -- never
+        # to any output stream.
+        pm_git_secret_yaml="$(kubectl create secret generic fork-sandbox-postmaster-git \
+            --from-file="deploy-key=$K8S_POSTMASTER_GIT_KEY_FILE" \
+            --from-file="known_hosts=$K8S_POSTMASTER_KNOWN_HOSTS_FILE" \
+            --dry-run=client -o yaml)"
+        if [[ -n "$K8S_MAIL_API_TOKENS_FILE" ]]; then
+            pm_tokens_secret_yaml="$(kubectl create secret generic fork-sandbox-mail-api-tokens \
+                --from-file="tokens=$K8S_MAIL_API_TOKENS_FILE" \
+                --dry-run=client -o yaml)"
+        fi
+
+        pm_config_checksum="$(printf '%s%s%s%s%s%s%s' \
             "$pm_config_yaml" "$pm_personas_yaml" "$pm_prompts_yaml" \
-            "$pm_handlers_yaml" "$pm_presets_yaml" | k8s_sha256_stdin)"
+            "$pm_handlers_yaml" "$pm_presets_yaml" \
+            "$pm_git_secret_yaml" "$pm_tokens_secret_yaml" | k8s_sha256_stdin)"
 
         pm_file_rendered="$(sed \
             -e "s|__NAMESPACE__|$K8S_NAMESPACE|g" \
@@ -3187,6 +3278,7 @@ cmd_install() {
             -e "s|__PM_ACCESS_MODE__|$K8S_POSTMASTER_ACCESS_MODE|g" \
             -e "s|__PM_STORAGE__|$K8S_POSTMASTER_STORAGE|g" \
             -e "s|__PM_CONFIG_CHECKSUM__|$pm_config_checksum|g" \
+            -e "s|__PM_OPERATORS__|$K8S_POSTMASTER_OPERATORS|g" \
             "$manifests_dir/40-postmaster.yaml")"
         if [[ -z "$K8S_POSTMASTER_STORAGE_CLASS" ]]; then
             local pm_scline pm_stripped
@@ -3226,6 +3318,13 @@ cmd_install() {
             for tag in "presets env" "presets volumeMount" "presets volume"; do
                 pm_file_rendered="$(strip_pm_optional_block "$pm_file_rendered" "$tag")" || exit 1
             done
+        fi
+        if [[ -z "$K8S_MAIL_API_TOKENS_FILE" ]]; then
+            for tag in "mail-api container" "mail-api volume" "mail-api service"; do
+                pm_file_rendered="$(strip_pm_optional_block "$pm_file_rendered" "$tag")" || exit 1
+            done
+            echo "fork-sandbox-k8s: the mail API is not deployed (K8S_MAIL_API_TOKENS_FILE is" >&2
+            echo "not set); see docs/cluster-postmaster.md to enable it." >&2
         fi
     fi
 
@@ -3287,6 +3386,8 @@ cmd_install() {
             $pm_have_handlers && printf -- '---\n%s\n' "$pm_handlers_yaml"
             $pm_have_presets  && printf -- '---\n%s\n' "$pm_presets_yaml"
             printf '# (dry-run) would create Secret fork-sandbox-postmaster-git ... -- not shown.\n'
+            [[ -z "$K8S_MAIL_API_TOKENS_FILE" ]] || \
+                printf '# (dry-run) would create Secret fork-sandbox-mail-api-tokens ... -- not shown.\n'
             printf '%s\n' "$pm_file_rendered"
         fi
         exit 0
@@ -3326,10 +3427,9 @@ cmd_install() {
         $pm_have_prompts  && printf '%s\n' "$pm_prompts_yaml" | kubectl apply -f -
         $pm_have_handlers && printf '%s\n' "$pm_handlers_yaml" | kubectl apply -f -
         $pm_have_presets  && printf '%s\n' "$pm_presets_yaml" | kubectl apply -f -
-        kubectl create secret generic fork-sandbox-postmaster-git \
-            --from-file="deploy-key=$K8S_POSTMASTER_GIT_KEY_FILE" \
-            --from-file="known_hosts=$K8S_POSTMASTER_KNOWN_HOSTS_FILE" \
-            --dry-run=client -o yaml | kubectl apply -f -
+        printf '%s\n' "$pm_git_secret_yaml" | kubectl apply -f -
+        [[ -z "$pm_tokens_secret_yaml" ]] || \
+            printf '%s\n' "$pm_tokens_secret_yaml" | kubectl apply -f -
         printf '%s\n' "$pm_file_rendered" | kubectl apply -f -
     fi
 
