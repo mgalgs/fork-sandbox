@@ -191,6 +191,52 @@ refuses_tokens "an empty file" "no entries" ""
 refuses_tokens "a comments-only file" "no entries" \
     "# nothing here"$'\n\n'
 
+# The operator list: $FORK_SANDBOX_OPERATORS, same parse as the postmaster.
+alice_line="client $good_hash alicec @alice read"$'\n'
+printf '%s' "$alice_line" > "$work/alice.tokens"
+out="$(env -u FORK_SANDBOX_OPERATORS timeout 10 "$api" check --tokens "$work/alice.tokens" 2>&1)"; rc=$?
+check "loader accepts a client listing @alice when the env is unset: exit 0" "0" "$rc"
+out="$(FORK_SANDBOX_OPERATORS=@alice,@operator timeout 10 "$api" check --tokens "$work/alice.tokens" 2>&1)"; rc=$?
+check "loader refuses a client listing @alice under the operator list: exit 2" "2" "$rc"
+contains "... naming the label" "$out" "alicec"
+contains "... and the name" "$out" "@alice"
+lacks "... and no hash" "$out" "$good_hash"
+out="$(FORK_SANDBOX_OPERATORS=@alice,@operator timeout 10 "$api" serve --tokens "$work/alice.tokens" --listen 127.0.0.1:0 2>&1)"; rc=$?
+check "serve refuses it too: exit 2" "2" "$rc"
+for bad_ops in '@a,,@b' 'Bad' '@a,' '@a, @b'; do
+    out="$(FORK_SANDBOX_OPERATORS="$bad_ops" timeout 10 "$api" check --tokens "$work/alice.tokens" 2>&1)"; rc=$?
+    check "loader refuses FORK_SANDBOX_OPERATORS='$bad_ops': exit 2" "2" "$rc"
+    check "... one line" "1" "$(printf '%s\n' "$out" | wc -l)"
+    contains "... naming the variable" "$out" "FORK_SANDBOX_OPERATORS"
+done
+out="$(FORK_SANDBOX_OPERATORS=@alice,@operator "$api" mint --role client --label x --as @alice 2>&1)"; rc=$?
+check "mint refuses --as @alice under that env: exit 2" "2" "$rc"
+contains "... says why" "$out" "@alice"
+out="$(FORK_SANDBOX_OPERATORS=@alice "$api" mint --role client --label x --as @operator 2>&1)"; rc=$?
+check "the env list replaces the default: @operator is then a plain name" "0" "$rc"
+out="$(FORK_SANDBOX_OPERATORS='@a,,@b' "$api" mint --role client --label x 2>&1)"; rc=$?
+check "mint refuses a malformed env: exit 2" "2" "$rc"
+
+# check: the count line, the one-line refusal, never a hash.
+printf 'operator %s laptopchk - -\nclient %s c1 @c1 read\nclient %s c2 - -\n' \
+    "$good_hash" "$other_hash" "$(printf 'third' | sha256sum | cut -d' ' -f1)" > "$work/good.tokens"
+out="$("$api" check --tokens "$work/good.tokens" 2>&1)"; rc=$?
+check "check: a good file exits 0" "0" "$rc"
+check "check: prints the count line" "ok: 3 entries (1 operator, 2 client)" "$out"
+out="$("$api" check --tokens "$work/alice.tokens" --bogus 2>&1)"; rc=$?
+check "check: an unknown flag is refused" "2" "$rc"
+printf 'client %s badcheck @a read,write\n' "$good_hash" > "$work/bad.tokens"
+out="$("$api" check --tokens "$work/bad.tokens" 2>&1)"; rc=$?
+check "check: a bad file exits 2" "2" "$rc"
+contains "check: names the label" "$out" "badcheck"
+check "check: never prints a 64-hex string" "0" \
+    "$(printf '%s\n' "$out" | grep -cE '[0-9a-fA-F]{64}')"
+check "check: a good file never prints one either" "0" \
+    "$("$api" check --tokens "$work/good.tokens" 2>&1 | grep -cE '[0-9a-fA-F]{64}')"
+out="$("$api" check --tokens "$work/does-not-exist" 2>&1)"; rc=$?
+check "check: a missing file exits 2" "2" "$rc"
+contains "check: --help lists the verb" "$("$api" --help)" "check --tokens"
+
 out="$(timeout 10 "$api" serve --tokens "$work/does-not-exist" --listen 127.0.0.1:0 2>&1)"; rc=$?
 check "loader refuses a missing file: exit 2" "2" "$rc"
 
@@ -306,14 +352,11 @@ check "a client cannot clear it" "403" "$(xr "$tok/ci-kickoff" --tool postmaster
 check "the flag file is still there" "1" "$([[ -e "$flag_file" ]] && echo 1 || echo 0)"
 seed_msgs="$(find "$FORK_SANDBOX_MAIL_ROOT/threads/$seed" -name '*.msg' | wc -l)"
 seed_id="$(cd "$FORK_SANDBOX_MAIL_ROOT/threads/$seed" && grep -h -m1 '^Message-ID: ' -- *.msg | tail -n 1 | sed 's/^Message-ID: //')"
-check "a client replies into the flagged thread: 403" "403" \
-    "$(xr "$tok/ci-kickoff" --tool mail --stdin hi -- reply --from @ci-kickoff --reply-to "$seed_id" --body -)"
-contains "... and the error says the thread is flagged" "$(rjson error)" "flagged"
-check "no message was posted into the flagged thread" "$seed_msgs" \
+check "a client replies into the flagged thread: 200, the verb runs" "0" \
+    "$(xr "$tok/ci-kickoff" --tool mail --stdin hi -- reply --from @ci-kickoff --reply-to "$seed_id" --body - >/dev/null; rjson rc)"
+check "the reply landed in the flagged thread" "$(( seed_msgs + 1 ))" \
     "$(find "$FORK_SANDBOX_MAIL_ROOT/threads/$seed" -name '*.msg' | wc -l)"
-check "the flag file survives the client's reply" "stuck on CI" "$(cat "$flag_file" 2>/dev/null)"
-check "the operator may still reply into the flagged thread" "0" \
-    "$(xr "$tok/laptop" --tool mail --stdin hi -- reply --from @operator --reply-to "$seed_id" --body - >/dev/null; rjson rc)"
+check "no postmaster is running here, so the flag file is untouched" "stuck on CI" "$(cat "$flag_file" 2>/dev/null)"
 check "the operator runs unflag: rc 0" "0" "$(xr "$tok/laptop" --tool postmaster -- unflag "$seed" >/dev/null; rjson rc)"
 check "the flag file clears" "0" "$([[ -e "$flag_file" ]] && echo 1 || echo 0)"
 check "flag with no thread id: 400" "400" "$(xr "$tok/laptop" --tool postmaster -- flag)"

@@ -3,6 +3,7 @@
 postmaster, for callers that must not have a shell on the store's host.
 
 Usage: fork-sandbox-mail-api.py serve --tokens <file> [--listen 0.0.0.0:8080]
+       fork-sandbox-mail-api.py check --tokens <file>
        fork-sandbox-mail-api.py mint --role operator|client --label <label>
                                 [--as @a[,@b]] [--caps read,grant,seen]
 
@@ -16,6 +17,15 @@ docs/mail-api.md.
 serve reads the tokens file once, at startup. Rotation is a restart. It runs
 the scripts by absolute path from its own directory, with the environment it
 was started with (so FORK_SANDBOX_MAIL_ROOT passes through), without a shell.
+
+check runs the loader serve runs on the tokens file and exits: it prints
+"ok: <n> entries (<k> operator, <m> client)" and exits 0, or prints the one
+line serve would and exits 2. It never prints a hash or a token.
+
+The operator list is $FORK_SANDBOX_OPERATORS, the same variable the
+postmaster reads: comma-separated @names, no spaces, no empty elements;
+unset or empty means @operator. serve, check and mint all apply it, and a
+malformed value refuses them with exit 2.
 
 mint makes a token. It prints the raw token alone on the first line of stdout
 and the tokens-file line on the second. It never writes a file, and it checks
@@ -34,12 +44,11 @@ lists the @names it may use as --from (or '-') and its caps, a subset of
 read, grant and seen (or '-'). Startup refuses the file (exit 2, one line
 naming the label, never the hash) on a malformed line, an unknown role or
 cap, a malformed identity, a shared hash or label, an empty table, an
-operator entry with identities or caps, or a client entry that lists
-@operator. Only an operator may post as @operator. That alone would not
-protect a thread's flag: the postmaster's rule 1 applies to any From that is
-not a fleet agent, so a client's own identity would clear it too. So the
-server also refuses a client's `reply` whose --reply-to is a message in a
-flagged (needs-operator) thread, with 403 (see docs/mail-api.md).
+operator entry with identities or caps, or a client entry that lists a name
+on the operator list. Only an operator token may post as a name on the
+operator list; what a client's mail can do to a thread is the postmaster's
+rule 1, which in cluster mode gives authority only to that list (see
+docs/mail-api.md).
 
 HTTP:
 
@@ -102,6 +111,7 @@ PROG = "fork-sandbox-mail-api"
 ROLES = ("operator", "client")
 CAPS = ("read", "grant", "seen")
 ADDR_RE = re.compile(r"@[a-z0-9][a-z0-9-]*")
+OPERATORS_ENV = "FORK_SANDBOX_OPERATORS"
 LABEL_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
 HASH_RE = re.compile(r"[0-9a-fA-F]{64}")
 
@@ -160,6 +170,8 @@ REFUSED_FLAGS = {
 }
 REFUSED_WHY = "a host path has no meaning over the API"
 
+OPERATORS = frozenset(["@operator"])
+
 OPERATOR_ONLY = {("postmaster", "flag"), ("postmaster", "unflag")}
 GRANT_FLAGS = ("--allow-namespace", "--reach-probe")
 
@@ -196,7 +208,23 @@ def parse_list(field):
     return field.split(",")
 
 
-def validate_entry(role, digest, label, identities, caps):
+def operator_names():
+    """The operator list from $FORK_SANDBOX_OPERATORS, parsed and validated
+    as the postmaster does: comma-separated @names, no spaces, no empty
+    elements; unset or empty means @operator."""
+    raw = os.environ.get(OPERATORS_ENV, "")
+    if not raw:
+        return frozenset(["@operator"])
+    names = raw.split(",")
+    for name in names:
+        if not ADDR_RE.fullmatch(name):
+            raise ConfigError(
+                "$%s element %s is not an @name (comma-separated, no "
+                "spaces, no empty elements)" % (OPERATORS_ENV, ascii(name)))
+    return frozenset(names)
+
+
+def validate_entry(role, digest, label, identities, caps, operators):
     """The one rule set for a tokens-file entry, shared by the loader and
     mint. Fields are strings as they appear in the file ('-' for none).
     Returns an Entry or raises ConfigError. A message never carries the
@@ -217,17 +245,17 @@ def validate_entry(role, digest, label, identities, caps):
         for ident in ids:
             if not ADDR_RE.fullmatch(ident):
                 raise ConfigError("malformed identity")
-            if ident == "@operator":
+            if ident in operators:
                 raise ConfigError(
-                    "a client entry may not list @operator: only an "
-                    "operator token may post as @operator")
+                    "a client entry may not list %s: only an operator "
+                    "token may post as a name on the operator list" % ident)
         for cap in cap_list:
             if cap not in CAPS:
                 raise ConfigError("unknown cap")
     return Entry(role, digest.lower(), label, ids, cap_list)
 
 
-def load_tokens(path):
+def load_tokens(path, operators):
     try:
         with open(path, encoding="utf-8") as f:
             lines = f.read().splitlines()
@@ -248,7 +276,8 @@ def load_tokens(path):
         if LABEL_RE.fullmatch(label) and not HASH_RE.fullmatch(label):
             where = "entry '%s'" % label
         try:
-            entry = validate_entry(role, digest, label, identities, caps)
+            entry = validate_entry(role, digest, label, identities, caps,
+                                   operators)
         except ConfigError as e:
             raise ConfigError("%s: %s" % (where, e))
         if entry.label in by_label:
@@ -333,8 +362,8 @@ def parse_argv(tool, argv):
 def authorize(entry, tool, verb, positionals, flags):
     """Raise ApiError(403) unless this token may run this call. Client
     identity checks compare the flag's value to the entry's identities
-    exactly; a client entry never holds @operator (the loader refuses it),
-    so a client can never post as @operator."""
+    exactly; a client entry never holds an operator-list name (the loader
+    refuses it), so a client can never post as one."""
     if entry.is_operator():
         return
     key = (tool, verb)
@@ -342,6 +371,9 @@ def authorize(entry, tool, verb, positionals, flags):
         raise ApiError(403, "%s %s needs an operator token" % key)
     if key in (("mail", "send"), ("mail", "reply")):
         sender = flags.get("--from")
+        if sender is not None and sender[0] in OPERATORS:
+            raise ApiError(403, "only an operator token may post as a name "
+                                "on the operator list")
         if sender is not None and sender[0] not in entry.identities:
             raise ApiError(403, "--from is not one of this token's identities")
         if key == ("mail", "send") and any(f in flags for f in GRANT_FLAGS):
@@ -362,54 +394,6 @@ def authorize(entry, tool, verb, positionals, flags):
             need(entry, "grant")
         return
     need(entry, "read")
-
-
-def flagged_thread_of(message_id):
-    """Return the flagged thread the message belongs to, or None. Reads the
-    postmaster's needs-operator directory and the thread's .msg headers
-    directly; it never builds a path from the caller's id, only compares it
-    to header text (the same way mail_find_by_id does)."""
-    root = os.environ.get("FORK_SANDBOX_MAIL_ROOT",
-                          "/var/tmp/claude-scratch/agent-mail")
-    try:
-        flagged = os.listdir(os.path.join(root, ".postmaster",
-                                          "needs-operator"))
-    except OSError:
-        return None
-    want = "Message-ID: " + message_id
-    for tid in flagged:
-        tdir = os.path.join(root, "threads", tid)
-        try:
-            names = os.listdir(tdir)
-        except OSError:
-            continue
-        for name in names:
-            if not name.endswith(".msg"):
-                continue
-            try:
-                with open(os.path.join(tdir, name), "rb") as f:
-                    for raw in f:
-                        line = raw.decode("utf-8", "replace").rstrip("\r\n")
-                        if not line:
-                            break
-                        if line == want:
-                            return tid
-            except OSError:
-                continue
-    return None
-
-
-def refuse_flagged_reply(entry, tool, verb, flags):
-    """The postmaster's rule 1 clears a thread's flag and resets its spawn
-    budget for any message whose From is not a fleet agent, and a client's
-    identity is not one. So a client reply into a flagged thread would
-    re-arm it. Only an operator token may post into a flagged thread."""
-    if entry.is_operator() or (tool, verb) != ("mail", "reply"):
-        return
-    target = flags.get("--reply-to")
-    if target and flagged_thread_of(target[0]) is not None:
-        raise ApiError(403, "that thread is flagged needs-operator; only an "
-                            "operator token may post into it")
 
 
 def need(entry, cap):
@@ -495,7 +479,6 @@ def handle_exec(entry, raw, ctx):
     verb, positionals, flags, attach_at = parse_argv(tool, argv)
     ctx["verb"] = verb
     authorize(entry, tool, verb, positionals, flags)
-    refuse_flagged_reply(entry, tool, verb, flags)
 
     if (tool, verb) in (("mail", "send"), ("mail", "reply")):
         if flags.get("--body", ["-"]) != ["-"]:
@@ -660,11 +643,27 @@ def parse_listen(text):
     return host.strip("[]") or "0.0.0.0", int(port)
 
 
-def cmd_serve(args):
+def load_or_die(path):
+    """Load the tokens file under the env operator list, or exit 2 with one
+    line. Returns (entries, operators)."""
     try:
-        entries = load_tokens(args.tokens)
+        operators = operator_names()
+        return load_tokens(path, operators), operators
     except ConfigError as e:
-        die("%s: %s" % (args.tokens, e))
+        die("%s: %s" % (path, e))
+
+
+def cmd_check(args):
+    entries, _ = load_or_die(args.tokens)
+    ops = sum(1 for e in entries if e.is_operator())
+    sys.stdout.write("ok: %d entries (%d operator, %d client)\n"
+                     % (len(entries), ops, len(entries) - ops))
+    return 0
+
+
+def cmd_serve(args):
+    global OPERATORS
+    entries, OPERATORS = load_or_die(args.tokens)
     for path in TOOL_SCRIPTS.values():
         if not os.access(path, os.X_OK):
             die("%s is not executable" % path)
@@ -697,7 +696,8 @@ def cmd_mint(args):
     token = secrets.token_urlsafe(32)
     digest = hashlib.sha256(token.encode("ascii")).hexdigest()
     try:
-        validate_entry(args.role, digest, args.label, ids or "-", caps or "-")
+        validate_entry(args.role, digest, args.label, ids or "-", caps or "-",
+                       operator_names())
     except ConfigError as e:
         die("mint: %s" % e)
     sys.stdout.write("%s\n%s %s %s %s %s\n"
@@ -718,6 +718,8 @@ def main(argv):
     serve = sub.add_parser("serve", add_help=False, allow_abbrev=False)
     serve.add_argument("--tokens", required=True)
     serve.add_argument("--listen", default="0.0.0.0:8080")
+    check = sub.add_parser("check", add_help=False, allow_abbrev=False)
+    check.add_argument("--tokens", required=True)
     mint = sub.add_parser("mint", add_help=False, allow_abbrev=False)
     mint.add_argument("--role", required=True)
     mint.add_argument("--label", required=True)
@@ -726,9 +728,11 @@ def main(argv):
     args = parser.parse_args(argv[1:])
     if args.cmd == "serve":
         return cmd_serve(args)
+    if args.cmd == "check":
+        return cmd_check(args)
     if args.cmd == "mint":
         return cmd_mint(args)
-    parser.error("expected serve or mint")
+    parser.error("expected serve, check or mint")
 
 
 if __name__ == "__main__":
