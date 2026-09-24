@@ -118,7 +118,7 @@ if [[ "$help" == *'run'* && "$help" == *'status'* && "$help" == *'say'* &&
     "$help" == *'configure'* && "$help" == *'k8s'* && "$help" == *'log'* &&
     "$help" == *'validate-services'* && "$help" == *'mail'* && "$help" == *'fleet'* &&
     "$help" == *'postmaster'* &&
-    "$help" == *'fork-sandbox mail-api <serve|mint>'* &&
+    "$help" == *'fork-sandbox mail-api <serve|mint|check>'* &&
     "$help" == *'mail-api   fork-sandbox-mail-api.py'* ]]; then
     ok '--help names all verbs'
 else

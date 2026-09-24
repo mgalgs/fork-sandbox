@@ -10,7 +10,7 @@
 #        fork-sandbox configure [options]
 #        fork-sandbox validate-services <file>
 #        fork-sandbox mail <verb> [options]
-#        fork-sandbox mail-api <serve|mint> [options]
+#        fork-sandbox mail-api <serve|mint|check> [options]
 #        fork-sandbox fleet <verb> [options]
 #        fork-sandbox postmaster <verb> [options]
 #
