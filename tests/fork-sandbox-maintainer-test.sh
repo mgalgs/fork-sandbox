@@ -752,6 +752,14 @@ if (( rc3 == 0 )) && [[ -n "$rd3" ]]; then
     contains "the embedded verdict carries the review leg's account" \
         "Checked: the whole diff line by line." \
         "$(cat "$rd3/maintainer-prompt-1.md")"
+    # A headless leg that ends its turn on pending background work is never
+    # woken, and exits with no verdict.
+    contains "the review prompt forbids ending the turn on background work" \
+        "nothing wakes you when a background task finishes" \
+        "$(cat "$rd3/review-prompt.md")"
+    contains "the maintainer prompt forbids ending the turn on background work" \
+        "nothing wakes you when a background task finishes" \
+        "$(cat "$rd3/maintainer-prompt.md")"
     # Every prompt that actually went to a leg in this run -- two review
     # iterations, the fix leg, the maintainer leg -- carries the handoff,
     # and carries it exactly once. The review prompt is rendered once at

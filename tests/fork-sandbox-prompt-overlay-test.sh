@@ -798,6 +798,13 @@ Write it to exactly this path:
 That file is the only thing read back. A report written anywhere else — your
 final message included — is discarded, so put the whole verdict in the file.
 
+Finish before you stop. This session is headless: when your turn ends, the
+session ends, and nothing wakes you when a background task finishes. Run
+tests and builds in the foreground, or wait for every background task you
+started to finish (or kill it) before you end your turn. Write the verdict
+file before your turn ends, every time. A leg that stops early leaves no
+verdict, and the run treats that as a failure.
+
 Its format is fixed, because a program reads the first line:
 
   - **The first line is exactly \`APPROVED\` or \`FINDINGS\`**, one word, alone

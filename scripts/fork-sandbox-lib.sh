@@ -2505,6 +2505,8 @@ Write it to exactly this path:
 That file is the only thing read back. A report written anywhere else — your
 final message included — is discarded, so put the whole verdict in the file.
 
+$(fs_emit_verdict_finish_para)
+
 Its format is fixed, because a program reads the first line:
 
   - **The first line is exactly \`APPROVED\` or \`FINDINGS\`**, one word, alone
@@ -2546,6 +2548,20 @@ own account. Keep the \`Checked:\` paragraph where it is, in the verdict body,
 before this heading.
 EOF
     fs_emit_handoff_spec_section "$handoff_file" "$flavor"
+}
+
+# Shared by the review and maintainer bodies, right after "put the whole
+# verdict in the file": a headless leg that ends its turn while its own
+# background task runs is never woken again, so it exits with no verdict.
+fs_emit_verdict_finish_para() {
+    cat <<'EOF'
+Finish before you stop. This session is headless: when your turn ends, the
+session ends, and nothing wakes you when a background task finishes. Run
+tests and builds in the foreground, or wait for every background task you
+started to finish (or kill it) before you end your turn. Write the verdict
+file before your turn ends, every time. A leg that stops early leaves no
+verdict, and the run treats that as a failure.
+EOF
 }
 
 # inner_review is "yes" when a --review-loop ran before this one and "no"
@@ -2638,6 +2654,8 @@ Write it to exactly this path:
 
 That file is the only thing read back. A report written anywhere else — your
 final message included — is discarded, so put the whole verdict in the file.
+
+$(fs_emit_verdict_finish_para)
 
 Its format is fixed, because a program reads the first line:
 
