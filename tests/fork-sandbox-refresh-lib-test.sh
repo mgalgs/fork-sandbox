@@ -237,21 +237,31 @@ resolve() {
     )
 }
 unset FORK_SANDBOX_CONTEXT_WINDOW
-check "claude default is 0.5 of 200k" "0|0.5|1|6|200000|100000|160000	" \
-    "$(resolve claude "" false "" some-model)"
+check "claude default is 0.5 of 1M (opus)" "0|0.5|1|6|1000000|500000|800000	" \
+    "$(resolve claude "" false "" opus)"
+check "sonnet gets the 1M window" "0|0.5|1|6|1000000|500000|800000	" \
+    "$(resolve claude "" false "" sonnet)"
 check "a [1m] model gets the 1M window" "0|0.5|1|6|1000000|500000|800000	" \
-    "$(resolve claude "" false "" 'some-model[1m]')"
-check "a fraction scales by the window" "0|0.25|1|6|200000|50000|160000	" \
+    "$(resolve claude "" false "" 'claude-opus-5-5[1m]')"
+check "haiku keeps the 200k window" "0|0.5|1|6|200000|100000|160000	" \
+    "$(resolve claude "" false "" claude-haiku-4-5)"
+check "haiku is matched case-insensitively" "0|0.5|1|6|200000|100000|160000	" \
+    "$(resolve claude "" false "" Claude-Haiku-4-5)"
+check "FORK_SANDBOX_CONTEXT_WINDOW beats the model default" "0|0.5|1|6|300000|150000|240000	" \
+    "$(FORK_SANDBOX_CONTEXT_WINDOW=300000 resolve claude "" false "" opus)"
+check "an absolute --refresh-at ignores the window" "0|150000|1|6|1000000|150000|800000	" \
+    "$(resolve claude 150000 true "" opus)"
+check "a fraction scales by the window" "0|0.25|1|6|1000000|250000|800000	" \
     "$(resolve claude 0.25 true "" m)"
-check "a count above 1 is taken as tokens" "0|150000|1|6|200000|150000|160000	" \
+check "a count above 1 is taken as tokens" "0|150000|1|6|1000000|150000|800000	" \
     "$(resolve claude 150000 true "" m)"
 check "0 disables and clears the window, threshold and ceiling" "0|0|0|6|||	" \
     "$(resolve claude 0 true "" m)"
 check "FORK_SANDBOX_CONTEXT_WINDOW overrides the guess" "0|0.5|1|6|400000|200000|320000	" \
     "$(FORK_SANDBOX_CONTEXT_WINDOW=400000 resolve claude "" false "" m)"
-check "--refresh-max is taken" "0|0.5|1|3|200000|100000|160000	" \
+check "--refresh-max is taken" "0|0.5|1|3|1000000|500000|800000	" \
     "$(resolve claude "" false 3 m)"
-check "--refresh-max 0 is allowed" "0|0.5|1|0|200000|100000|160000	" \
+check "--refresh-max 0 is allowed" "0|0.5|1|0|1000000|500000|800000	" \
     "$(resolve claude "" false 0 m)"
 contains "pi refuses an explicit --refresh-at" "Error: --refresh-at only works with --harness claude" \
     "$(resolve pi 0.5 true "" m)"
@@ -283,7 +293,10 @@ contains "a brief at the threshold's byte count warns" \
     "this brief is 1000 bytes" "$out"
 contains "the warning names the threshold" \
     "1000-token --refresh-at threshold" "$out"
-contains "the warning names a [1m] model as one fix" "[1m]" "$out"
+case "$out" in
+    *'[1m]'*) no "the warning no longer advises a [1m] model" "$out" ;;
+    *) ok "the warning no longer advises a [1m] model" ;;
+esac
 contains "the warning names --refresh-at in tokens as the other fix" \
     "--refresh-at <tokens>" "$out"
 # 999 bytes, threshold 1000: just under, so it stays quiet.

@@ -3836,7 +3836,7 @@ fi
 rm -f /tmp/fs-k8s-test-claude-submit.err
 
 printf '\n== fork-sandbox-k8s.sh submit --dry-run: --refresh-at / --refresh-max ==\n'
-# A claude run refreshes by default (0.5 of a 200k window = 100000 tokens,
+# A claude run refreshes by default (0.5 of a 1M window = 500000 tokens,
 # cap 6), exactly like a local one: Job env, three ConfigMap keys, run.env.
 refresh_dry() {
     HOME="$claude_home" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
@@ -3847,11 +3847,11 @@ refresh_env_val() {
     grep -A1 "name: $1\$" <<< "$2" | sed -n 's/.*value: "\(.*\)"/\1/p'
 }
 refresh_default_out="$(refresh_dry --harness claude)"
-check "claude default: REFRESH_THRESHOLD_TOKENS is 100000" "100000" \
+check "claude default: REFRESH_THRESHOLD_TOKENS is 500000" "500000" \
     "$(refresh_env_val REFRESH_THRESHOLD_TOKENS "$refresh_default_out")"
 check "claude default: REFRESH_MAX is 6" "6" \
     "$(refresh_env_val REFRESH_MAX "$refresh_default_out")"
-check "claude default: REFRESH_CEILING_TOKENS is 160000 (0.8 of 200k)" "160000" \
+check "claude default: REFRESH_CEILING_TOKENS is 800000 (0.8 of 1M)" "800000" \
     "$(refresh_env_val REFRESH_CEILING_TOKENS "$refresh_default_out")"
 for key in refresh.sh continuation-header.md handoff-original.md; do
     if grep -qx "  $key: |" <<< "$refresh_default_out"; then
@@ -3913,7 +3913,7 @@ refresh_tok_out="$(refresh_dry --harness claude --refresh-at 150000 --refresh-ma
 check "--refresh-at 150000: REFRESH_THRESHOLD_TOKENS" "150000" \
     "$(refresh_env_val REFRESH_THRESHOLD_TOKENS "$refresh_tok_out")"
 check "--refresh-max 3: REFRESH_MAX" "3" "$(refresh_env_val REFRESH_MAX "$refresh_tok_out")"
-check "--refresh-at 150000: REFRESH_CEILING_TOKENS still 160000 (window-based)" "160000" \
+check "--refresh-at 150000: REFRESH_CEILING_TOKENS still 800000 (window-based)" "800000" \
     "$(refresh_env_val REFRESH_CEILING_TOKENS "$refresh_tok_out")"
 
 # A brief that is already a large share of a leg's own working budget warns

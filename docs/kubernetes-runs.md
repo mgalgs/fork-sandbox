@@ -1690,7 +1690,9 @@ local run: claude only, `--refresh-at 0.5` unless told otherwise, `0`
 disables it, `--refresh-max 6`, and pi is refused with the local message.
 `cmd_submit` resolves the threshold with the same `fs_refresh_resolve`
 (fork-sandbox-lib.sh) the local runner uses, which also resolves
-`refresh_ceiling_tokens` (floor(0.8 x the model's context window): each
+`refresh_ceiling_tokens` (floor(0.8 x the model's context window, assumed
+1,000,000 tokens for every claude model but haiku's 200,000, or
+`FORK_SANDBOX_CONTEXT_WINDOW` when set): each
 leg's own nudge point is `max(T, min(B + T, CEILING))`, B being that
 leg's own first usage reading, not the flat threshold -- see
 fork-sandbox.sh's "A run that refreshes itself" for why. `submit` also

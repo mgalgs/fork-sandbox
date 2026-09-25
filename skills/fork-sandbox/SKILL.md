@@ -226,7 +226,9 @@ reach it — see "What it gives up".)
    Pass `--refresh-at 0` to disable it outright — for a task you know fits in
    one context, or while debugging something else and one fewer moving part
    helps. A number above `1` is an absolute token count instead of a fraction
-   of the model's context window (`--refresh-at 100000`); `--refresh-max`
+   of the model's context window (`--refresh-at 100000`); the window is
+   assumed to be 1,000,000 tokens for every claude model but haiku's
+   200,000, and `FORK_SANDBOX_CONTEXT_WINDOW` overrides that. `--refresh-max`
    caps how many continuations may chain before the run gives up and moves on
    to the review loop anyway.
 

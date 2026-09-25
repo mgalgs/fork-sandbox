@@ -2915,16 +2915,14 @@ fs_refresh_resolve() {
     refresh_threshold_tokens=""
     refresh_ceiling_tokens=""
     if (( refresh_enabled )); then
-        # A one-line, one-place guess: a model whose name carries "[1m]" gets
-        # the 1,000,000-token beta window; everything else gets the standard
-        # 200,000. FORK_SANDBOX_CONTEXT_WINDOW overrides the guess outright,
-        # and --refresh-at <tokens> (an absolute count above 1) sidesteps it,
-        # since the comparison then needs no window at all.
+        # The claude CLI runs the current default models at 1,000,000 tokens;
+        # haiku is the known 200,000 exception; fs_refresh_window_mismatch
+        # (refresh.sh) warns when a leg reports otherwise. The env var wins.
         refresh_context_window="${FORK_SANDBOX_CONTEXT_WINDOW:-}"
         if [[ -z "$refresh_context_window" ]]; then
             case "${model,,}" in
-                *'[1m]'*) refresh_context_window=1000000 ;;
-                *)        refresh_context_window=200000 ;;
+                *haiku*) refresh_context_window=200000 ;;
+                *)       refresh_context_window=1000000 ;;
             esac
         fi
         if awk -v v="$refresh_at" 'BEGIN{exit !(v<=1)}'; then
@@ -2969,9 +2967,9 @@ fs_refresh_warn_brief() {
         "$bytes" "$approx_tokens"
     printf 'quarter or more of the %s-token --refresh-at threshold -- every leg\n' \
         "$threshold_tokens"
-    printf 'will spend a large share of its own budget just reading it. Consider\n'
-    printf 'a "[1m]" model for a bigger context window, or a larger\n'
-    printf '"--refresh-at <tokens>" given as an absolute token count.\n'
+    printf 'will spend a large share of its own budget just reading it. Use\n'
+    printf '"--refresh-at <tokens>", an absolute token count, for a larger\n'
+    printf 'threshold.\n'
 }
 
 # fs_resolve_upstream <origin-repo> <checkout-ref-or-empty>
