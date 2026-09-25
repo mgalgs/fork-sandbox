@@ -103,10 +103,10 @@ formatter="$script_dir/fork-sandbox-format.sh"
 # re-invoke it once per run dir (see run_fleet_json).
 self="$(readlink -f "${BASH_SOURCE[0]}")"
 
-RUN_DIR_PREFIX="/var/tmp/claude-scratch/forks/claude-fork-sandbox."
+RUN_DIR_PREFIX="$FS_SCRATCH_ROOT/forks/claude-fork-sandbox."
 # The pre-consolidation location, still accepted so a run dir from before the
 # move can be read. New runs never land here.
-RUN_DIR_PREFIX_LEGACY="/var/tmp/claude-fork-sandbox."
+RUN_DIR_PREFIX_LEGACY="$("$FS_REALPATH" -m /var/tmp)/claude-fork-sandbox."
 POLL_SECONDS=5
 HEARTBEAT_SECONDS=300
 # The runner writes its pid as its first act. Still no pid after this long and

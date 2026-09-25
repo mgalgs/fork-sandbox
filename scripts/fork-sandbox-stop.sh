@@ -98,10 +98,10 @@ source "$script_dir/fork-sandbox-lib.sh"
 # BSD tools of the same name. Say so here, before anything is signaled.
 fs_require_gnu_tools || exit 1
 
-RUN_DIR_PREFIX="/var/tmp/claude-scratch/forks/claude-fork-sandbox."
+RUN_DIR_PREFIX="$FS_SCRATCH_ROOT/forks/claude-fork-sandbox."
 # The pre-consolidation location, still accepted so an old run dir can still
 # be stopped. New runs never land here.
-RUN_DIR_PREFIX_LEGACY="/var/tmp/claude-fork-sandbox."
+RUN_DIR_PREFIX_LEGACY="$("$FS_REALPATH" -m /var/tmp)/claude-fork-sandbox."
 
 die() {
     echo "Error: $*" >&2

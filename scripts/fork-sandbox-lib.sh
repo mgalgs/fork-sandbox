@@ -58,6 +58,15 @@ FS_STAT="$(_fs_resolve_gnu_tool stat || echo stat)"
 # shellcheck disable=SC2034  # written here, read by the sourcing scripts
 FS_TIMEOUT="$(_fs_resolve_gnu_tool timeout || echo timeout)"
 
+# The scratch roots as a realpath'd argument spells them. On macOS /var and
+# /tmp are symlinks into /private, so a literal /var/tmp/... prefix never
+# matches. Only the root-owned parents are resolved: claude-scratch itself
+# stays literal, so a symlink planted there cannot move the boundary.
+# shellcheck disable=SC2034  # written here, read by the sourcing scripts
+FS_SCRATCH_ROOT="$("$FS_REALPATH" -m /var/tmp)/claude-scratch"
+# shellcheck disable=SC2034  # written here, read by the sourcing scripts
+FS_SCRATCH_COMPAT_ROOT="$("$FS_REALPATH" -m /tmp)/claude-scratch"
+
 # Say so once, early, in words. Call this from an entry script before anything
 # is created; the failure otherwise lands mid-run as an unknown-option error
 # from a tool the reader has no reason to suspect.
@@ -239,7 +248,7 @@ fs_check_branch_free() {
 fs_require_scratch_handoff() {
     local handoff_file="$1" real
     real="$("$FS_REALPATH" -m "$handoff_file")"
-    if [[ "$real" != /var/tmp/claude-scratch/* && "$real" != /tmp/claude-scratch/* ]]; then
+    if [[ "$real" != "$FS_SCRATCH_ROOT"/* && "$real" != "$FS_SCRATCH_COMPAT_ROOT"/* ]]; then
         echo "Error: handoff files must live under /var/tmp/claude-scratch/ (or the" >&2
         echo "/tmp/claude-scratch compat symlink) — got '$real'. The handoff" >&2
         echo "becomes the prompt of a session with internet access, so this path is a" >&2
@@ -251,7 +260,7 @@ fs_require_scratch_handoff() {
     # stage dirs, and the codex credential staging dir. A handoff there would
     # read a file the machinery wrote (the credential above all) into the
     # prompt of a session with internet access. Handoffs go in the scratch root.
-    if [[ "$real" == /var/tmp/claude-scratch/forks/* || "$real" == /tmp/claude-scratch/forks/* ]]; then
+    if [[ "$real" == "$FS_SCRATCH_ROOT"/forks/* || "$real" == "$FS_SCRATCH_COMPAT_ROOT"/forks/* ]]; then
         echo "Error: handoff files must not live under the forks/ machinery" >&2
         echo "directory — got '$real'. forks/ holds run dirs, staging" >&2
         echo "dirs and credential files that approved scripts create; reading one" >&2
@@ -281,7 +290,7 @@ fs_validate_scratch_dir() {
         return 1
     fi
     real="$("$FS_REALPATH" -m "$path")"
-    if [[ "$real" != /var/tmp/claude-scratch/* && "$real" != /tmp/claude-scratch/* ]]; then
+    if [[ "$real" != "$FS_SCRATCH_ROOT"/* && "$real" != "$FS_SCRATCH_COMPAT_ROOT"/* ]]; then
         echo "Error: $flag must name a directory under" >&2
         echo "/var/tmp/claude-scratch/ (or the /tmp/claude-scratch compat" >&2
         echo "path) — got '$real'. The directory is written to from inside an" >&2
