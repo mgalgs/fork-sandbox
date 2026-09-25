@@ -132,12 +132,45 @@ path outside what the script fixes," and it is the one you are actually
 approving.
 
 **`lane-mail-watch.sh` — read-only.** It only ever calls `lane-mail.sh inbox
-<lane>` in a loop and prints what comes back. It mutates nothing.
+<lane>` in a loop and prints what comes back. It mutates nothing. Its
+`--wait` mode is the same read-only loop with a different exit condition —
+it blocks until that call returns something, then exits — so the same
+approval covers it.
 
-## Hooks: lane-mail and the scratch root
+## context-usage.sh
 
-Three hook commands are meant to run on every prompt or stop, for
-`lane-mail.sh` and `ensure-scratch-dirs.sh`. In `~/.claude/settings.json`:
+One more script is safe to blanket-approve, for the same shape of reason as
+`lane-mail-watch.sh`: it only ever reads.
+
+```json
+{
+  "permissions": {
+    "allow": [
+      "Bash(context-usage.sh:*)",
+      "Bash(~/.claude/scripts/context-usage.sh:*)",
+      "Bash(/home/<you>/.claude/scripts/context-usage.sh:*)"
+    ]
+  }
+}
+```
+
+Replace `<you>` with your own username, for the same reason as above: a
+rule matches literal command text, and this script gets invoked by all
+three spellings.
+
+**`context-usage.sh` — read-only, and bounded to your own reading.** It
+only ever reads one file under your own `/tmp/claude-$UID/context-nudge/`
+— the stash `statusline-stash.sh` writes for the session id it is given —
+and prints what it finds. A session id is either its own
+(`CLAUDE_CODE_SESSION_ID`) or one passed explicitly, but every session's
+stash lives under that same uid-scoped directory, so this can never read
+another user's data, and it mutates nothing.
+
+## Hooks: lane-mail, the scratch root, and context-nudge
+
+Four hook commands are meant to run on every prompt or stop, for
+`lane-mail.sh`, `ensure-scratch-dirs.sh` and `context-nudge.py`. In
+`~/.claude/settings.json`:
 
 ```json
 {
@@ -146,7 +179,8 @@ Three hook commands are meant to run on every prompt or stop, for
       {
         "hooks": [
           { "type": "command", "command": "lane-mail-hook.sh prompt" },
-          { "type": "command", "command": "ensure-scratch-dirs.sh" }
+          { "type": "command", "command": "ensure-scratch-dirs.sh" },
+          { "type": "command", "command": "context-nudge.py" }
         ]
       }
     ],
@@ -176,6 +210,54 @@ before blocking, so it never fires twice on the same stop and cannot loop.
 `/tmp/claude-scratch` compat symlink) on every prompt. `install.sh` already
 runs it once at install time; the hook is what keeps that guarantee true
 after a reboot empties `/tmp`, or after anything else removes the symlink.
+
+**`context-nudge.py`** reads the session's stashed context-window reading
+(written by `statusline-stash.sh`) and, at 35%, 80% and 90% usage, injects
+a short system nudge telling the model to run `/freshly-forked` at the
+next natural break. It is rate-limited to once per session per step — a
+later climb past the same step stays silent until usage drops back under
+30%, which re-arms every step — and it swallows any internal error rather
+than surfacing it, since a hook must never break prompt submission.
+
+## statusLine: the context-window stash writer
+
+Claude Code runs exactly one `statusLine` command, and hands it the only
+copy of the true context-window size and the model's `[1m]` suffix that
+exists outside Claude Code itself. `statusline-stash.sh` stashes those
+numbers per session and then runs your own display command, passing it the
+exact stdin bytes it received — so wiring it in is not a permission rule
+(there is nothing to approve; it runs as your statusLine, not as a tool
+call invocation), just a `settings.json` entry:
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "statusline-stash.sh"
+  }
+}
+```
+
+Or, wrapping your own display script instead of getting the bare one-line
+default `statusline-stash.sh` prints on its own:
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "statusline-stash.sh ~/.claude/scripts/my-status-line.sh"
+  }
+}
+```
+
+There is exactly one `statusLine` slot, which is why the stash writer
+wraps a display command instead of replacing it outright — if your own
+script already renders colours, cost or cwd, `statusline-stash.sh` is the
+only way to keep that and still have the stash written. `context-usage.sh`,
+`context-nudge.py` and `/freshly-forked`'s model carry-over step all depend
+on `statusline-stash.sh` actually running as the `statusLine` command; if
+it never runs, no stash file ever exists, and each falls back to (or
+fails with) whatever they document for that case.
 
 ## `fork-task.sh` is not on this list
 
