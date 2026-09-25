@@ -306,6 +306,11 @@ PORCELAIN=(
     fork-sandbox-status.sh
     fork-sandbox-stop.sh
     fork-sandbox.sh
+    fork-task.sh
+    lane-jump.sh
+    lane-mail-hook.sh         # Stop/UserPromptSubmit hook command: settings.json invokes it by bare name
+    lane-mail-watch.sh
+    lane-mail.sh
     pi-sandboxed
     sandbox-run-log.py        # fork-sandbox.sh looks it up on PATH before falling back to this hardcoded path
 )
