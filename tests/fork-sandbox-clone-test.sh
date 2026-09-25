@@ -239,6 +239,26 @@ esac
 check "the other refs are still mirrored" \
     "$upstream_dev" "$(git -C "$clone" rev-parse refs/remotes/origin/dev)"
 
+# A remote-tracking name that collides directory/file-wise with a local branch
+# (local "feature" vs origin/feature/x) cannot be written next to the mapping
+# the clone already has. That must warn, not fail the clone, and every ref
+# that CAN be written is still mirrored.
+origin="$(new_origin)"
+(cd "$origin" && git branch dev && git branch feature)
+env_commit "$origin" collide-tip >/dev/null 2>&1
+upstream_dev="$(git -C "$origin" rev-parse HEAD)"
+git -C "$origin" update-ref refs/remotes/origin/dev "$upstream_dev"
+git -C "$origin" update-ref refs/remotes/origin/feature/x "$upstream_dev"
+clone="$(new_clone_path)"
+out="$(fs_make_clone "$origin" "sandbox/collide" "$clone" 2>&1)"
+check "a ref-name collision does not fail the clone" "0" "$?"
+case "$out" in
+    *"refs/remotes/origin/feature/x"*) ok "the colliding ref is named in a warning" ;;
+    *) no "the colliding ref is named in a warning" "output: $out" ;;
+esac
+check "refs that can be written are still mirrored" \
+    "$upstream_dev" "$(git -C "$clone" rev-parse refs/remotes/origin/dev)"
+
 printf '\n== the rest of the contract ==\n'
 
 # A fourth argument still starts the branch at that commit, and the seeding

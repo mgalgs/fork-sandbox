@@ -570,17 +570,25 @@ fs_make_clone() {
     # packed too. Branches with no host origin/<b> keep the local-branch
     # mapping. Objects resolve through the alternates; an sha that does not is
     # skipped rather than failing the clone.
-    local sha ref updates=""
+    local sha ref updates="" pairs=()
     while read -r sha ref; do
         [[ -n "$ref" && "$ref" != refs/remotes/origin/HEAD ]] || continue
         if git -C "$dest" cat-file -e "${sha}^{commit}" 2>/dev/null; then
             updates+="update $ref $sha"$'\n'
+            pairs+=("$ref $sha")
         else
             echo "fork-sandbox: warning: $ref ($sha) does not resolve in the clone; leaving its mapping alone" >&2
         fi
     done < <(git -C "$repo" for-each-ref --format='%(objectname) %(refname)' refs/remotes/origin/ 2>/dev/null)
-    if [[ -n "$updates" ]]; then
-        printf '%s' "$updates" | git -C "$dest" update-ref --stdin || return 1
+    # Best effort: one transaction is atomic, so a single directory/file name
+    # collision (origin branch "a" vs "a/b") would drop every ref. On failure
+    # fall back to per-ref updates and warn on the ones that cannot be written.
+    if [[ -n "$updates" ]] && ! printf '%s' "$updates" | git -C "$dest" update-ref --stdin 2>/dev/null; then
+        local pair
+        for pair in "${pairs[@]}"; do
+            git -C "$dest" update-ref "${pair% *}" "${pair#* }" 2>/dev/null ||
+                echo "fork-sandbox: warning: could not write ${pair% *} in the clone; leaving its mapping alone" >&2
+        done
     fi
     if [[ "$dissociate" == true ]]; then
         git -C "$dest" repack -a -d --quiet || return 1
