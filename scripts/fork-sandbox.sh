@@ -7240,6 +7240,7 @@ started_at="$(date +%s)"
     printf 'review_verdict_file=%q\n' "$review_verdict_file"
     printf 'refresh_enabled=%q\n' "$refresh_enabled"
     printf 'refresh_max=%q\n' "$refresh_max"
+    printf 'refresh_context_window=%q\n' "$refresh_context_window"
     printf 'refresh_config=%q\n' "$refresh_config"
     printf 'outbox_dir=%q\n' "$outbox_dir"
     printf 'outbox_max_bytes=%q\n' "$outbox_max_bytes"
@@ -8158,6 +8159,8 @@ refresh_build_prompt() {
 }
 
 if [[ "$refresh_enabled" == "1" ]]; then
+    fs_refresh_window_mismatch "$events" "$refresh_context_window" \
+        | tee -a "$sandbox_log"
     while :; do
         if [[ "${stop_requested:-0}" == 1 ]]; then
             refresh_ended="stop-requested"
@@ -8247,6 +8250,8 @@ if [[ "$refresh_enabled" == "1" ]]; then
             rc="${PIPESTATUS[0]:-1}"
             fs_archive_inbox "$leg_no" "$harness" "$rc"
             refresh_last_events="$cont_events"
+            fs_refresh_window_mismatch "$cont_events" "$refresh_context_window" \
+                | tee -a "$sandbox_log"
 
             cont_cost="$("$formatter" --cost "$cont_events" 2>/dev/null)"
             cont_usage="$("$formatter" --usage "$cont_events" 2>/dev/null)"

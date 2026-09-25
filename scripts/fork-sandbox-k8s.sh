@@ -234,7 +234,8 @@
 # context window, larger is tokens; 0 disables; the default is 0.5, so
 # every claude run refreshes unless told not to (--refresh-max defaults
 # to 6 continuations). The threshold and cap reach the pod as
-# REFRESH_THRESHOLD_TOKENS / REFRESH_MAX; the entrypoint runs the
+# REFRESH_THRESHOLD_TOKENS / REFRESH_MAX (and the assumed window as
+# REFRESH_CONTEXT_WINDOW, for a warning only); the entrypoint runs the
 # continuation legs and records them under /work, which collect pulls
 # back as evidence and summarizes as refresh/continuations in
 # summary.json. Resolved by fs_refresh_resolve in fork-sandbox-lib.sh, so
@@ -5114,6 +5115,8 @@ CENV
               value: "$refresh_max"
             - name: REFRESH_CEILING_TOKENS
               value: "$refresh_ceiling_tokens"
+            - name: REFRESH_CONTEXT_WINDOW
+              value: "$refresh_context_window"
 CENV
 )"
     fi

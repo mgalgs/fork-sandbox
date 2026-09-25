@@ -164,6 +164,10 @@
 #                   hook as CEILING_TOKENS, so each leg gets its own
 #                   working budget from where IT started rather than
 #                   always nudging at the same absolute threshold.
+#   REFRESH_CONTEXT_WINDOW
+#                   the context window (tokens) REFRESH_THRESHOLD_TOKENS was
+#                   computed against. Only used to warn when a leg reports a
+#                   different one (fs_refresh_window_mismatch).
 #
 
 # Reads from /mnt/fork-sandbox/ (the scripts ConfigMap, mounted read-only):
@@ -246,6 +250,7 @@ fi
 : "${REFRESH_THRESHOLD_TOKENS:=}"
 : "${REFRESH_MAX:=6}"
 : "${REFRESH_CEILING_TOKENS:=}"
+: "${REFRESH_CONTEXT_WINDOW:=}"
 if [[ "$REVIEW_LOOP_CAP" =~ ^[1-9][0-9]*$ ]]; then
     : "${BASE_SHA:?BASE_SHA must be set when REVIEW_LOOP_CAP is set}"
     if [[ "$HARNESS" == claude && -z "$REVIEW_MODEL" ]]; then
@@ -812,6 +817,8 @@ run_claude_continuations() {
     # stall -- see fs_refresh_is_stall (refresh.sh).
     local leg_head_before=""
     leg_head_before="$(git -C "$clone_dir" rev-parse HEAD 2>/dev/null || true)"
+    fs_refresh_window_mismatch "$work_dir/events.jsonl" \
+        "${REFRESH_CONTEXT_WINDOW:-}" >&2
     if (( pi_rc == 0 )); then
         fs_refresh_archive_inbox "$inbox_dir" "$work_dir" 1 "$log"
     fi
@@ -859,6 +866,8 @@ run_claude_continuations() {
                 "$work_dir/claude-stderr-continuation-$n.log" || rc=$?
             pi_rc=$rc
             echo "fork-sandbox-k8s-entrypoint: claude exited $rc" >&2
+            fs_refresh_window_mismatch "$last_events" \
+                "${REFRESH_CONTEXT_WINDOW:-}" >&2
             if (( rc == 0 )); then
                 fs_refresh_archive_inbox "$inbox_dir" "$work_dir" "$leg_no" "$log"
             fi

@@ -21,6 +21,25 @@ fs_refresh_leg_was_nudged() {
     grep -q 'fork-sandbox-refresh: nudged' "$1" 2>/dev/null
 }
 
+# Warn when a leg's own result events report a context window other than the
+# one --refresh-at assumed. $1 the leg's events file, $2 the assumed window.
+# Prints ONE line on stdout when any "contextWindow" value in the file differs
+# from $2 (naming the first that does), nothing otherwise -- also nothing for
+# a missing file, no such key, or an empty/non-integer $2. Always returns 0.
+# grep only: the pod image and macOS need no jq for this.
+fs_refresh_window_mismatch() {
+    local events="$1" assumed="$2" seen=""
+    [[ "$assumed" =~ ^[0-9]+$ && -f "$events" ]] || return 0
+    seen="$(grep -oE '"contextWindow": ?[0-9]+' "$events" 2>/dev/null \
+        | grep -oE '[0-9]+$' | grep -vxF "$assumed" | head -n 1)" || true
+    [[ -n "$seen" ]] || return 0
+    printf 'fork-sandbox: this leg ran with a %s-token context window, ' "$seen"
+    printf 'but --refresh-at assumed %s; ' "$assumed"
+    printf 'set FORK_SANDBOX_CONTEXT_WINDOW=%s or pass --refresh-at <tokens>.\n' \
+        "$seen"
+    return 0
+}
+
 # Move the hand-off out of the outbox into the run record, refusing what
 # is not a usable hand-off. $1 outbox dir, $2 record dir, $3 the number
 # the taken hand-off will carry (handoff-<n>.md), $4 log file for refusal

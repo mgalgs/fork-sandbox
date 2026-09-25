@@ -553,6 +553,10 @@ if [[ "${FAKE_FAIL_LEGS:-}" == "all" || "$fail_legs" == *",$n,"* ]]; then
     exit 1
 fi
 
+if [[ -n "${FAKE_CONTEXT_WINDOW:-}" ]]; then
+    printf '{"type":"result","subtype":"success","total_cost_usd":0.01,"usage":{"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"modelUsage":{"fake-model":{"contextWindow":%s}}}\n' "$FAKE_CONTEXT_WINDOW"
+    exit 0
+fi
 printf '{"type":"result","subtype":"success","total_cost_usd":0.01,"usage":{"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}\n'
 exit 0
 STUB
@@ -613,6 +617,7 @@ run_real() {
         FAKE_ADDENDUM_LEGS="${FAKE_ADDENDUM_LEGS:-}" \
         FAKE_MAIL_BANNER_LEGS="${FAKE_MAIL_BANNER_LEGS:-}" \
         FAKE_NOCOMMIT_LEGS="${FAKE_NOCOMMIT_LEGS:-}" \
+        FAKE_CONTEXT_WINDOW="${FAKE_CONTEXT_WINDOW:-}" \
         timeout 60 "$launcher" --foreground --harness claude --branch "$branch_name" "$@" \
         "$proj" "$handoff" 2>&1)"
     rc=$?
@@ -1036,6 +1041,29 @@ if [[ -n "$rd" ]]; then
         "HANDOFF from leg 2" "$(cat "$rd/handoff-stalled-2.md" 2>/dev/null)"
     check "a stalled continuation: no third leg's record exists" \
         "no" "$([[ -f "$rd/handoff-2.md" ]] && echo yes || echo no)"
+fi
+
+# -- a leg that reports a different context window than --refresh-at assumed:
+# warn (once per leg, in the run's sandbox.log), and change nothing else.
+count_file="$(mktemp)"; tmpdirs+=("$count_file")
+FAKE_CONTEXT_WINDOW=200000
+rd="$(run_real "$proj" "$count_file" 1 1 --refresh-at 0.5 --model claude-opus-5-5)"
+FAKE_CONTEXT_WINDOW=""
+[[ -n "$rd" ]] && tmpdirs+=("$rd")
+if [[ -n "$rd" ]]; then
+    check "a window mismatch: both legs still ran" "2" "$(cat "$count_file")"
+    check "a window mismatch: each leg is warned about in sandbox.log" "2" \
+        "$(grep -c 'ran with a 200000-token context window, but --refresh-at assumed 1000000' \
+            "$rd/sandbox.log" 2>/dev/null)"
+fi
+count_file="$(mktemp)"; tmpdirs+=("$count_file")
+FAKE_CONTEXT_WINDOW=1000000
+rd="$(run_real "$proj" "$count_file" 1 1 --refresh-at 0.5 --model claude-opus-5-5)"
+FAKE_CONTEXT_WINDOW=""
+[[ -n "$rd" ]] && tmpdirs+=("$rd")
+if [[ -n "$rd" ]]; then
+    check "a matching window: no warning in sandbox.log" "0" \
+        "$(grep -c 'token context window' "$rd/sandbox.log" 2>/dev/null)"
 fi
 
 # -- leg 1 (the implement leg) hands off without committing: leg 1 is

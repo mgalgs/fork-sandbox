@@ -140,6 +140,33 @@ rm -f "$t/clone/.git/logs/HEAD"
 fs_refresh_handoff_stale "$t/clone" "$t/handoff.md" && r=yes || r=no
 check "no commit log is never stale" no "$r"
 
+printf '\n== fs_refresh_window_mismatch ==\n'
+t="$(new_tmp)"
+printf '{"type":"result","modelUsage":{"m":{"contextWindow":1000000}}}\n' > "$t/one.jsonl"
+check "a matching window prints nothing" "" "$(fs_refresh_window_mismatch "$t/one.jsonl" 1000000)"
+check "a mismatching window prints the exact line" \
+    "fork-sandbox: this leg ran with a 1000000-token context window, but --refresh-at assumed 200000; set FORK_SANDBOX_CONTEXT_WINDOW=1000000 or pass --refresh-at <tokens>." \
+    "$(fs_refresh_window_mismatch "$t/one.jsonl" 200000)"
+printf '%s\n' '{"modelUsage":{"a":{"contextWindow":1000000}}}' \
+    '{"modelUsage":{"b":{"contextWindow":200000},"c":{"contextWindow":300000}}}' \
+    > "$t/two.jsonl"
+out="$(fs_refresh_window_mismatch "$t/two.jsonl" 1000000)"
+contains "two values: the first differing one is named" "a 200000-token context window" "$out"
+check "two values: exactly one line" "1" "$(printf '%s\n' "$out" | wc -l | tr -d ' ')"
+check "a missing file prints nothing" "" "$(fs_refresh_window_mismatch "$t/none.jsonl" 1000000)"
+fs_refresh_window_mismatch "$t/none.jsonl" 1000000 && r=yes || r=no
+check "a missing file returns 0" yes "$r"
+printf '{"type":"result"}\n' > "$t/nokey.jsonl"
+check "no contextWindow key prints nothing" "" "$(fs_refresh_window_mismatch "$t/nokey.jsonl" 1000000)"
+fs_refresh_window_mismatch "$t/nokey.jsonl" 1000000 && r=yes || r=no
+check "no contextWindow key returns 0" yes "$r"
+check "an empty assumed window prints nothing" "" "$(fs_refresh_window_mismatch "$t/one.jsonl" "")"
+check "a non-integer assumed window prints nothing" "" \
+    "$(fs_refresh_window_mismatch "$t/one.jsonl" abc)"
+( set -euo pipefail; fs_refresh_window_mismatch "$t/nokey.jsonl" 1000000 > /dev/null
+  fs_refresh_window_mismatch "$t/one.jsonl" 1000000 > /dev/null ) && r=yes || r=no
+check "no-output paths survive set -euo pipefail" yes "$r"
+
 printf '\n== fs_refresh_is_stall ==\n'
 fs_refresh_is_stall 1 abc abc && r=yes || r=no
 check "leg 1 is exempt even when the head did not move" no "$r"

@@ -3851,6 +3851,8 @@ check "claude default: REFRESH_THRESHOLD_TOKENS is 500000" "500000" \
     "$(refresh_env_val REFRESH_THRESHOLD_TOKENS "$refresh_default_out")"
 check "claude default: REFRESH_MAX is 6" "6" \
     "$(refresh_env_val REFRESH_MAX "$refresh_default_out")"
+check "claude default: REFRESH_CONTEXT_WINDOW is 1000000" "1000000" \
+    "$(refresh_env_val REFRESH_CONTEXT_WINDOW "$refresh_default_out")"
 check "claude default: REFRESH_CEILING_TOKENS is 800000 (0.8 of 1M)" "800000" \
     "$(refresh_env_val REFRESH_CEILING_TOKENS "$refresh_default_out")"
 for key in refresh.sh continuation-header.md handoff-original.md; do
@@ -10336,6 +10338,9 @@ refresh_block_run() {
         'if [[ " ${RB_ADDENDUM_LEGS:-} " == *" $n "* ]]; then' \
         '  echo "operator addendum for leg $n" > "$RB_OUTBOX/../inbox/addendum-$n.md"' \
         'fi' \
+        'if [[ -n "${RB_STUB_WINDOW:-}" ]]; then' \
+        '  echo "{\"type\":\"result\",\"modelUsage\":{\"m\":{\"contextWindow\":$RB_STUB_WINDOW}}}"' \
+        'fi' \
         '[[ " $RB_FAIL_LEGS " == *" $n "* ]] && exit 1' \
         'exit 0' > "$stub_dir/claude"
     chmod +x "$stub_dir/claude"
@@ -10348,6 +10353,7 @@ refresh_block_run() {
         session_store_dir="$RB_WORK/session-store" SESSION_HARNESS_STORE=1 \
         RESUME_SESSION="${5:-}" REFRESH_THRESHOLD_TOKENS="${1:-}" REFRESH_MAX="${4:-6}" \
         REFRESH_CEILING_TOKENS="${RB_CEILING:-}" \
+        REFRESH_CONTEXT_WINDOW="${RB_WINDOW:-}" RB_STUB_WINDOW="${RB_STUB_WINDOW:-}" \
         RB_REC="$rec" RB_OUTBOX="$RB_WORK/outbox" RB_CLONE="$RB_WORK/clone" \
         RB_HANDOFF_LEGS="${2:-}" RB_FAIL_LEGS="${3:-}" \
         RB_ADDENDUM_LEGS="${RB_ADDENDUM_LEGS:-}" \
@@ -10525,6 +10531,21 @@ else
         "calls=$RB_CALLS out=$RB_OUT ended=$(jq -r .ended "$RB_WORK/refresh.json" 2>/dev/null)"
 fi
 RB_NOCOMMIT_LEGS=""
+
+# A leg that reports a context window other than the one the pod was told
+# --refresh-at assumed: one warning per leg in the pod log, nothing else changes.
+RB_WINDOW=1000000 RB_STUB_WINDOW=200000 refresh_block_run 100000 "1" "" 6
+check "a window mismatch: both legs still ran" "2" "$RB_CALLS"
+check "a window mismatch: the coding leg and the continuation are each warned about" "2" \
+    "$(grep -c 'ran with a 200000-token context window, but --refresh-at assumed 1000000' \
+        <<< "$RB_OUT")"
+RB_WINDOW=1000000 RB_STUB_WINDOW=1000000 refresh_block_run 100000 "1" "" 6
+check "a matching window: no warning in the pod log" "0" \
+    "$(grep -c 'token context window' <<< "$RB_OUT")"
+RB_WINDOW="" RB_STUB_WINDOW=200000 refresh_block_run 100000 "1" "" 6
+check "no window given to the pod: no warning" "0" \
+    "$(grep -c 'token context window' <<< "$RB_OUT")"
+RB_WINDOW="" RB_STUB_WINDOW=""
 
 # Leg 1 (the coding leg) is exempt from the stall check: a hand-off it
 # writes without committing still starts a second leg.
