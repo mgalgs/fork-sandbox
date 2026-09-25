@@ -5055,6 +5055,13 @@ origin_map_pod="$(fs_emit_prompt_preamble "$pod_clone_dir_expected" \
     "$pod_inbox_dir_expected" pi gated "" pod)"
 origin_map_local="$(fs_emit_prompt_preamble /work/clone /work/inbox claude "" "")"
 origin_map_sealed="$(fs_emit_prompt_preamble /work/clone /work/inbox pi sealed "")"
+origin_map_reused="$(FS_PREAMBLE_CLONE_REUSED=true fs_emit_prompt_preamble \
+    /work/clone /work/inbox claude "" "")"
+if [[ "$origin_map_reused" != *'origin/<b>'* ]]; then
+    ok "a reused-clone preamble does not describe the origin/<b> mapping"
+else
+    no "a reused-clone preamble does not describe the origin/<b> mapping" "sentence present"
+fi
 if [[ "$origin_map_pod" != *'origin/<b>'* ]]; then
     ok "a pod preamble does not describe the origin/<b> mapping"
 else

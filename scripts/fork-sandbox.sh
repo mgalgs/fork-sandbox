@@ -5201,6 +5201,7 @@ else
     # not undo that.
     clone_dir="$clone_dir_flag"
     clone_reused=true
+    FS_PREAMBLE_CLONE_REUSED=true
 
     echo "Reusing '$clone_dir' for the sandbox..." >&2
     fs_lock_clone_dir "$clone_dir"

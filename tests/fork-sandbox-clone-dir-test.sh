@@ -399,6 +399,27 @@ else
         "no handoff.md at '${second_rundir:-<empty>}'"
 fi
 
+# fs_reuse_clone's fetch overwrites the origin/<b> refs the first wake's
+# fs_make_clone mirrored, so only the first wake's preamble may describe that
+# mapping.
+first_fields=()
+mapfile -t first_fields <<<"$first_result"
+first_rundir="${first_fields[3]:-}"
+if [[ -n "$first_rundir" && -f "$first_rundir/handoff.md" ]] \
+    && grep -qF -- 'origin/<b>' "$first_rundir/handoff.md"; then
+    ok "first wake: the preamble describes the origin/<b> mapping"
+else
+    no "first wake: the preamble describes the origin/<b> mapping" \
+        "no origin/<b> sentence in '${first_rundir:-<empty>}/handoff.md'"
+fi
+if [[ -n "$second_rundir" && -f "$second_rundir/handoff.md" ]] \
+    && ! grep -qF -- 'origin/<b>' "$second_rundir/handoff.md"; then
+    ok "second wake: the preamble does not describe the origin/<b> mapping a reuse fetch overwrites"
+else
+    no "second wake: the preamble does not describe the origin/<b> mapping a reuse fetch overwrites" \
+        "origin/<b> sentence present or no handoff.md at '${second_rundir:-<empty>}'"
+fi
+
 # ---------------------------------------------------------------------------
 printf '\n== fork-sandbox.sh: --clone-dir reuse fetches forward ==\n'
 # ---------------------------------------------------------------------------

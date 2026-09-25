@@ -2037,6 +2037,12 @@ EOF
 #                above FS_OUTBOX_MAX_BYTES by --outbox-max. Defaults to
 #                FS_OUTBOX_MAX_BYTES so a caller that has no override still
 #                gets a true number. Unused when $5 is empty.
+#
+# FS_PREAMBLE_CLONE_REUSED=true (a variable rather than an argument, so the
+# launcher sets it once for every leg's preamble) marks a reused persistent
+# --clone-dir. fs_reuse_clone re-fetches origin's default refspec, which
+# overwrites the origin/<b> refs fs_make_clone mirrored with the host's local
+# branches, so the origin/<b> sentence would be false and is omitted.
 fs_emit_prompt_preamble() {
     local clone_dir="$1" inbox_dir="$2" harness="$3" network="$4"
     local outbox_dir="$5"
@@ -2058,10 +2064,12 @@ missing file rather than a wrong path.
 That directory is the only writable thing here. Everything else in the sandbox
 is read-only or ephemeral.
 EOF
-    # Only fs_make_clone mirrors the host's origin/<b> refs; a pod clones from
-    # a bare repo and gets no such mapping, so say nothing there. The "no
+    # Only fs_make_clone mirrors the host's origin/<b> refs, and only until a
+    # later wake's fs_reuse_clone fetch overwrites them; a pod clones from a
+    # bare repo and gets no such mapping, so say nothing there either. The "no
     # network" clause is likewise true only for a sealed run.
-    if [[ "$inbox_write" != "pod" && "$network" != "gated" ]]; then
+    if [[ "$inbox_write" != "pod" && "$network" != "gated" \
+        && "${FS_PREAMBLE_CLONE_REUSED:-}" != "true" ]]; then
         cat <<EOF
 
 In this clone, \`origin/<b>\` is the host repo's own \`origin/<b>\` as of launch
