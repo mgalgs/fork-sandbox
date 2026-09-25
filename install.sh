@@ -307,7 +307,6 @@ PORCELAIN=(
     fork-sandbox-stop.sh
     fork-sandbox.sh
     fork-task.sh
-    lane-jump.sh
     lane-mail-hook.sh         # Stop/UserPromptSubmit hook command: settings.json invokes it by bare name
     lane-mail-watch.sh
     lane-mail.sh
