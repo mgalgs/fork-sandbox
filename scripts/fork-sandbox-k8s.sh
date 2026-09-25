@@ -4080,8 +4080,8 @@ cmd_submit() {
     local outbox_dir="" keep=false run_timeout=3600
     local session_state="" resume_session="" session_id_arg=""
     local refresh_at_arg="" refresh_at_given=false refresh_max_arg=""
-    # fs_refresh_resolve sets these; refresh_context_window is only local scratch.
-    # shellcheck disable=SC2034
+    # fs_refresh_resolve sets these; refresh_context_window is rendered into the
+    # Job as REFRESH_CONTEXT_WINDOW, which the entrypoint's window warning reads.
     local refresh_at="" refresh_enabled=0 refresh_max="" refresh_context_window=""
     local refresh_threshold_tokens="" refresh_ceiling_tokens=""
     local -a labels_raw=() allow_ns_raw=() reach_probe_raw=()

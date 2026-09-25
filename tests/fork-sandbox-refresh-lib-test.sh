@@ -147,12 +147,16 @@ check "a matching window prints nothing" "" "$(fs_refresh_window_mismatch "$t/on
 check "a mismatching window prints the exact line" \
     "fork-sandbox: this leg ran with a 1000000-token context window, but --refresh-at assumed 200000; set FORK_SANDBOX_CONTEXT_WINDOW=1000000 or pass --refresh-at <tokens>." \
     "$(fs_refresh_window_mismatch "$t/one.jsonl" 200000)"
-printf '%s\n' '{"modelUsage":{"a":{"contextWindow":1000000}}}' \
+printf '%s\n' '{"modelUsage":{"a":{"contextWindow":250000}}}' \
     '{"modelUsage":{"b":{"contextWindow":200000},"c":{"contextWindow":300000}}}' \
     > "$t/two.jsonl"
 out="$(fs_refresh_window_mismatch "$t/two.jsonl" 1000000)"
-contains "two values: the first differing one is named" "a 200000-token context window" "$out"
+contains "two values, none matching: the first is named" "a 250000-token context window" "$out"
 check "two values: exactly one line" "1" "$(printf '%s\n' "$out" | wc -l | tr -d ' ')"
+printf '%s\n' '{"type":"result","modelUsage":{"h":{"contextWindow":200000},"o":{"contextWindow":1000000}}}' \
+    > "$t/helper.jsonl"
+check "a helper model's smaller window beside a matching one is silent" "" \
+    "$(fs_refresh_window_mismatch "$t/helper.jsonl" 1000000)"
 check "a missing file prints nothing" "" "$(fs_refresh_window_mismatch "$t/none.jsonl" 1000000)"
 fs_refresh_window_mismatch "$t/none.jsonl" 1000000 && r=yes || r=no
 check "a missing file returns 0" yes "$r"

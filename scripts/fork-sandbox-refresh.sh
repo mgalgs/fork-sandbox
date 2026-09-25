@@ -23,15 +23,20 @@ fs_refresh_leg_was_nudged() {
 
 # Warn when a leg's own result events report a context window other than the
 # one --refresh-at assumed. $1 the leg's events file, $2 the assumed window.
-# Prints ONE line on stdout when any "contextWindow" value in the file differs
-# from $2 (naming the first that does), nothing otherwise -- also nothing for
-# a missing file, no such key, or an empty/non-integer $2. Always returns 0.
+# A result's modelUsage has one contextWindow per model the leg called, and
+# helper models (haiku) report a smaller one on a healthy leg, so the warning
+# fires only when NO value equals $2. Prints ONE line on stdout naming the
+# first value in the file, nothing otherwise -- also nothing for a missing
+# file, no such key, or an empty/non-integer $2. Always returns 0.
 # grep only: the pod image and macOS need no jq for this.
 fs_refresh_window_mismatch() {
-    local events="$1" assumed="$2" seen=""
+    local events="$1" assumed="$2" values="" seen=""
     [[ "$assumed" =~ ^[0-9]+$ && -f "$events" ]] || return 0
-    seen="$(grep -oE '"contextWindow": ?[0-9]+' "$events" 2>/dev/null \
-        | grep -oE '[0-9]+$' | grep -vxF "$assumed" | head -n 1)" || true
+    values="$(grep -oE '"contextWindow": ?[0-9]+' "$events" 2>/dev/null \
+        | grep -oE '[0-9]+$')" || true
+    [[ -n "$values" ]] || return 0
+    printf '%s\n' "$values" | grep -qxF "$assumed" && return 0
+    seen="$(printf '%s\n' "$values" | head -n 1)"
     [[ -n "$seen" ]] || return 0
     printf 'fork-sandbox: this leg ran with a %s-token context window, ' "$seen"
     printf 'but --refresh-at assumed %s; ' "$assumed"
