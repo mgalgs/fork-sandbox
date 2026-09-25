@@ -2057,11 +2057,20 @@ missing file rather than a wrong path.
 
 That directory is the only writable thing here. Everything else in the sandbox
 is read-only or ephemeral.
+EOF
+    # Only fs_make_clone mirrors the host's origin/<b> refs; a pod clones from
+    # a bare repo and gets no such mapping, so say nothing there. The "no
+    # network" clause is likewise true only for a sealed run.
+    if [[ "$inbox_write" != "pod" && "$network" != "gated" ]]; then
+        cat <<EOF
 
 In this clone, \`origin/<b>\` is the host repo's own \`origin/<b>\` as of launch
-where it has one, and the host's local branch \`<b>\` otherwise. There is no
-network to fetch fresher refs.
+where it has one, and the host's local branch \`<b>\` otherwise.
 EOF
+        if [[ "$network" == "sealed" ]]; then
+            printf 'There is no network to fetch fresher refs.\n'
+        fi
+    fi
     if [[ -n "$inbox_dir" ]]; then
         # Same convention as the working-directory block above: name the
         # absolute path once so nothing has to build it by hand.

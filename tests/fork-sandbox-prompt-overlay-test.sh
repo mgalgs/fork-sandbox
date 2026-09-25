@@ -411,8 +411,7 @@ That directory is the only writable thing here. Everything else in the sandbox
 is read-only or ephemeral.
 
 In this clone, \`origin/<b>\` is the host repo's own \`origin/<b>\` as of launch
-where it has one, and the host's local branch \`<b>\` otherwise. There is no
-network to fetch fresher refs.
+where it has one, and the host's local branch \`<b>\` otherwise.
 
 ## Operator inbox
 
@@ -704,8 +703,7 @@ That directory is the only writable thing here. Everything else in the sandbox
 is read-only or ephemeral.
 
 In this clone, \`origin/<b>\` is the host repo's own \`origin/<b>\` as of launch
-where it has one, and the host's local branch \`<b>\` otherwise. There is no
-network to fetch fresher refs.
+where it has one, and the host's local branch \`<b>\` otherwise.
 
 ## Operator inbox
 
@@ -908,8 +906,7 @@ That directory is the only writable thing here. Everything else in the sandbox
 is read-only or ephemeral.
 
 In this clone, \`origin/<b>\` is the host repo's own \`origin/<b>\` as of launch
-where it has one, and the host's local branch \`<b>\` otherwise. There is no
-network to fetch fresher refs.
+where it has one, and the host's local branch \`<b>\` otherwise.
 
 ## Operator inbox
 

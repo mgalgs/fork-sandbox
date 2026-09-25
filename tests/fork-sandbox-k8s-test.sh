@@ -5048,6 +5048,29 @@ else
         "found '## Artifact outbox' despite an empty outbox_dir argument"
 fi
 
+# Item: the origin/<b> mapping sentence is true only for a clone made by
+# fs_make_clone, so a pod preamble must not carry it, and the "no network"
+# clause belongs to a sealed run alone.
+origin_map_pod="$(fs_emit_prompt_preamble "$pod_clone_dir_expected" \
+    "$pod_inbox_dir_expected" pi gated "" pod)"
+origin_map_local="$(fs_emit_prompt_preamble /work/clone /work/inbox claude "" "")"
+origin_map_sealed="$(fs_emit_prompt_preamble /work/clone /work/inbox pi sealed "")"
+if [[ "$origin_map_pod" != *'origin/<b>'* ]]; then
+    ok "a pod preamble does not describe the origin/<b> mapping"
+else
+    no "a pod preamble does not describe the origin/<b> mapping" "sentence present"
+fi
+if [[ "$origin_map_local" == *'origin/<b>'* && "$origin_map_local" != *'no network'* ]]; then
+    ok "an unrestricted local preamble describes origin/<b> without claiming there is no network"
+else
+    no "an unrestricted local preamble describes origin/<b> without claiming there is no network" "wrong text"
+fi
+if [[ "$origin_map_sealed" == *'origin/<b>'* && "$origin_map_sealed" == *'no network'* ]]; then
+    ok "a sealed local preamble describes origin/<b> and says there is no network"
+else
+    no "a sealed local preamble describes origin/<b> and says there is no network" "wrong text"
+fi
+
 # Item: --review-loop 0 and a non-numeric value are both rejected, before
 # any kubectl call -- --dry-run proves that, the same way it does for every
 # other flag-validation case in this file.
