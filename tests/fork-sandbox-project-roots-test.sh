@@ -279,6 +279,76 @@ else
     esac
 fi
 
+# git init plus one commit, with no dependence on any global git config.
+make_repo() {
+    git init -q "$1" \
+        && git -C "$1" -c user.name=t -c user.email=t@example.invalid \
+            -c commit.gpgsign=false commit -q --allow-empty -m init
+}
+
+printf '\n== a plain dir under an outer git repo is refused: the repo is what gets cloned ==\n'
+outer_home="$(new_home)"; tmpdirs+=("$outer_home")
+outer_config="$outer_home/.config/fork-sandbox"
+make_repo "$outer_home" >/dev/null 2>&1
+mkdir -p "$outer_home/src/plain"
+if HOME="$outer_home" fs_require_project_root "$outer_home/src/plain" "$outer_config" 2>"$err"; then
+    no "a plain dir inside an outer repo is refused (default roots)"
+else
+    case "$(cat "$err")" in
+        *"inside the git repository '$outer_home'"*"outside"*"~/src"*)
+            ok "a plain dir inside an outer repo is refused (default roots)" ;;
+        *) no "a plain dir inside an outer repo is refused (default roots)" "$(cat "$err")" ;;
+    esac
+fi
+
+printf '\n== a repo of its own under the root is accepted even with an outer repo above ==\n'
+mkdir -p "$outer_home/src/inner"
+make_repo "$outer_home/src/inner" >/dev/null 2>&1
+if HOME="$outer_home" fs_require_project_root "$outer_home/src/inner" "$outer_config" 2>"$err"; then
+    ok "a project that is its own repo under the root is accepted"
+else
+    no "a project that is its own repo under the root is accepted" "$(cat "$err")"
+fi
+
+printf '\n== a project in no git repo at all is left to fs_repo_toplevel ==\n'
+norepo_home="$(new_home)"; tmpdirs+=("$norepo_home")
+norepo_config="$norepo_home/.config/fork-sandbox"
+mkdir -p "$norepo_home/src/plain"
+if HOME="$norepo_home" fs_require_project_root "$norepo_home/src/plain" "$norepo_config" 2>"$err"; then
+    ok "a project outside any git repo is still accepted here"
+else
+    no "a project outside any git repo is still accepted here" "$(cat "$err")"
+fi
+
+printf '\n== the outer-repo refusal lists the configured roots ==\n'
+outercfg_home="$(new_home)"; tmpdirs+=("$outercfg_home")
+outercfg_config="$outercfg_home/.config/fork-sandbox"
+make_repo "$outercfg_home" >/dev/null 2>&1
+write_projects_env "$outercfg_config" '~/code'
+mkdir -p "$outercfg_home/code/plain"
+if HOME="$outercfg_home" fs_require_project_root "$outercfg_home/code/plain" "$outercfg_config" 2>"$err"; then
+    no "a plain dir inside an outer repo is refused (configured roots)"
+else
+    case "$(cat "$err")" in
+        *"inside the git repository '$outercfg_home'"*"outside"*"Configured roots:"*"  - $outercfg_home/code"*"$outercfg_config/projects.env"*)
+            ok "a plain dir inside an outer repo is refused (configured roots)" ;;
+        *) no "a plain dir inside an outer repo is refused (configured roots)" "$(cat "$err")" ;;
+    esac
+fi
+
+printf '\n== a repo inside a symlinked root is accepted ==\n'
+lrepo_stage="$(mktemp -d)"; tmpdirs+=("$lrepo_stage")
+mkdir -p "$lrepo_stage/home" "$lrepo_stage/vol/root/proj"
+ln -s "$lrepo_stage/vol/root" "$lrepo_stage/home/projects"
+make_repo "$lrepo_stage/vol/root/proj" >/dev/null 2>&1
+lrepo_config="$lrepo_stage/home/.config/fork-sandbox"
+write_projects_env "$lrepo_config" "$lrepo_stage/home/projects"
+if HOME="$lrepo_stage/home" fs_require_project_root "$lrepo_stage/home/projects/proj" "$lrepo_config" 2>"$err"; then
+    ok "a repo under a symlinked root is accepted (top level resolves under the resolved root)"
+else
+    no "a repo under a symlinked root is accepted (top level resolves under the resolved root)" "$(cat "$err")"
+fi
+
 rm -f "$err"
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"

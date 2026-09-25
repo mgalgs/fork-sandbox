@@ -3869,6 +3869,7 @@ fi
 #   - The project is CLONED INTO the sandbox, same channel. Repos under the
 #     configured project roots (PROJECT_ROOTS in $config_dir/projects.env,
 #     default ~/src) are the working material; nothing else is.
+#     The check is on the repository the project belongs to, not only its path.
 #   - --sandbox-args passes through to claude-sandboxed, where --bind-ro
 #     would mount any host path — ~/.ssh, say — into that same sandbox.
 #     Only --unpin-egress may pass; the script adds every bind it needs

@@ -513,6 +513,30 @@ fs_pm_find_live_run() {
     return 1
 }
 
+# Returns 0 when real path $1 equals or lies under one of the real roots.
+_fs_under_roots() {
+    local real="$1" root_real
+    shift
+    for root_real in "$@"; do
+        if [[ "$real" == "$root_real" || "$real" == "$root_real"/* ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+_fs_print_roots() {
+    local root_real
+    for root_real in "$@"; do
+        echo "  - $root_real" >&2
+    done
+}
+
+_fs_roots_allow_hint() {
+    echo "To allow another directory, add it to PROJECT_ROOTS in" >&2
+    echo "$1/projects.env (colon-separated)." >&2
+}
+
 # The project roots are configurable per machine via $config_dir/projects.env
 # (PROJECT_ROOTS, colon-separated; read with fs_read_env_value, never
 # `source`d). An absent file, absent key, or empty value all mean the
@@ -529,10 +553,14 @@ fs_pm_find_live_run() {
 # that itself covers $config_dir or $HOME/.ssh (which would admit those
 # token-holding directories even though it is not $HOME or an ancestor of
 # it -- e.g. PROJECT_ROOTS=~/.config) all abort the run.
+#
+# The root check applies to the project's git repository top level too,
+# because that is what gets cloned. A path in no repository at all is left
+# to fs_repo_toplevel.
 fs_require_project_root() {
     local project_path="$1" config_dir="$2" env_file raw is_default=0
     local -a root_reals=()
-    local entry expanded real home_real root_real config_dir_real ssh_real
+    local entry expanded real top top_real home_real root_real config_dir_real ssh_real
 
     env_file="$config_dir/projects.env"
     raw="$(fs_read_env_value "$env_file" PROJECT_ROOTS || true)"
@@ -595,32 +623,45 @@ fs_require_project_root() {
     fi
 
     real="$("$FS_REALPATH" -m "$project_path")"
-    for root_real in "${root_reals[@]}"; do
-        if [[ "$real" == "$root_real" || "$real" == "$root_real"/* ]]; then
-            return 0
+    if ! _fs_under_roots "$real" "${root_reals[@]}"; then
+        if (( is_default )); then
+            echo "Error: the project must live under ~/src — got '$real'." >&2
+        else
+            echo "Error: the project must live under one of the configured roots —" >&2
+            echo "got '$real'. Configured roots:" >&2
+            _fs_print_roots "${root_reals[@]}"
         fi
-    done
+        echo "An unattended agent gets the whole clone, and for most harnesses it" >&2
+        echo "gets internet too, so which repos may be handed over is a security" >&2
+        if (( is_default )); then
+            echo "boundary. Work from a checkout under ~/src, or launch" >&2
+        else
+            echo "boundary. Work from a checkout under one of the roots above, or launch" >&2
+        fi
+        echo "claude-sandboxed by hand for something else." >&2
+        _fs_roots_allow_hint "$config_dir"
+        return 1
+    fi
 
-    if (( is_default )); then
-        echo "Error: the project must live under ~/src — got '$real'." >&2
-    else
-        echo "Error: the project must live under one of the configured roots —" >&2
-        echo "got '$real'. Configured roots:" >&2
-        for root_real in "${root_reals[@]}"; do
-            echo "  - $root_real" >&2
-        done
+    top="$(cd "$project_path" 2>/dev/null && git rev-parse --show-toplevel 2>/dev/null)" || top=""
+    [[ -n "$top" ]] || return 0
+    top_real="$("$FS_REALPATH" -m "$top")"
+    if ! _fs_under_roots "$top_real" "${root_reals[@]}"; then
+        if (( is_default )); then
+            echo "Error: '$real' is inside the git repository '$top_real'," >&2
+            echo "which is outside ~/src. The sandbox would get a clone of that whole" >&2
+            echo "repository. Run on a checkout whose repository lives under ~/src." >&2
+        else
+            echo "Error: '$real' is inside the git repository '$top_real'," >&2
+            echo "which is outside the configured roots. The sandbox would get a clone" >&2
+            echo "of that whole repository. Run on a checkout whose repository lives" >&2
+            echo "under one of the configured roots. Configured roots:" >&2
+            _fs_print_roots "${root_reals[@]}"
+        fi
+        _fs_roots_allow_hint "$config_dir"
+        return 1
     fi
-    echo "An unattended agent gets the whole clone, and for most harnesses it" >&2
-    echo "gets internet too, so which repos may be handed over is a security" >&2
-    if (( is_default )); then
-        echo "boundary. Work from a checkout under ~/src, or launch" >&2
-    else
-        echo "boundary. Work from a checkout under one of the roots above, or launch" >&2
-    fi
-    echo "claude-sandboxed by hand for something else." >&2
-    echo "To allow another directory, add it to PROJECT_ROOTS in" >&2
-    echo "$config_dir/projects.env (colon-separated)." >&2
-    return 1
+    return 0
 }
 
 fs_warn_if_dirty() {
