@@ -26,6 +26,12 @@
 # Only panes tmux reports as live are trusted, so stale entries on either
 # side are silently dropped rather than shown as ghosts.
 #
+# tmux-map-claude-session.sh is NOT part of this repo. Without a SessionStart
+# hook that writes the pane map above, this always sees zero panes and reads
+# exactly like "no live lane sessions" -- not a crash, just an empty picker.
+# Supply that hook yourself (keyed as `pane_key` below expects) before
+# binding this script to a key.
+#
 # Overridable for tests: LANE_JUMP_LANES_DIR, LANE_JUMP_PANES_DIR,
 # LANE_JUMP_TMUX (path to a stand-in for the tmux binary).
 
