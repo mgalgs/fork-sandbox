@@ -848,6 +848,25 @@ fi
 contains_quiet "an unreadable override is not called expired" "could not be read" "$err"
 chmod 600 "$unreadable_override"
 
+# On macOS a credentials file can hold only MCP OAuth entries while the login
+# lives in the Keychain. uname and security are stubbed as functions so the
+# Darwin branch runs on every host and no real Keychain is read.
+uname() { echo Darwin; }
+security() { printf '{"claudeAiOauth":{"accessToken":"kc-tok","expiresAt":1}}'; }
+FS_CLAUDE_KEYCHAIN_SERVICES=("fork-sandbox-test-stub-service")
+mcp_home="$scratch/mcp-home"
+mkdir -p "$mcp_home/.claude"
+printf '{"mcpOAuth":{"x":{"accessToken":"mcp-tok"}}}\n' > "$mcp_home/.claude/.credentials.json"
+HOME="$mcp_home"
+out="$(fs_read_claude_credential)"
+contains_quiet "darwin: a file with no login falls back to the Keychain" '"accessToken":"kc-tok"' "$out"
+check "darwin: the source then names the Keychain" "the login Keychain" "$(fs_claude_credential_source)"
+HOME="$cred_home"
+out="$(fs_read_claude_credential)"
+contains_quiet "darwin: a file with a login still wins over the Keychain" '"accessToken":"tok"' "$out"
+unset -f uname security
+FS_CLAUDE_KEYCHAIN_SERVICES=("fork-sandbox-test-service-that-does-not-exist")
+
 HOME="$real_home"
 
 echo ""

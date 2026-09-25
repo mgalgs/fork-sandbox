@@ -1565,6 +1565,16 @@ fs_gitconfig_bind() {
 # in turn, and the error below says how to look it up by hand.
 FS_CLAUDE_KEYCHAIN_SERVICES=("Claude Code-credentials")
 
+# On macOS the CLI keeps the login in the Keychain, and a
+# ~/.claude/.credentials.json there can hold only other entries (MCP OAuth
+# tokens). Such a file must not shadow the Keychain. An unreadable file does
+# not count, so it still gets its own error below.
+_fs_claude_file_lacks_login() {
+    local file="$1"
+    [[ "$(uname -s)" == Darwin && -f "$file" && -r "$file" ]] || return 1
+    ! jq -e '.claudeAiOauth.accessToken' "$file" >/dev/null 2>&1
+}
+
 # A human name for where the credential comes from, for error messages. Reads
 # nothing and holds no secret, so it is safe to call from anywhere, as often as
 # a message needs it.
@@ -1575,7 +1585,7 @@ fs_claude_credential_source() {
         return 0
     fi
     local file="$HOME/.claude/.credentials.json"
-    if [[ ! -f "$file" && "$(uname -s)" == Darwin ]]; then
+    if [[ ! -f "$file" && "$(uname -s)" == Darwin ]] || _fs_claude_file_lacks_login "$file"; then
         printf '%s\n' "the login Keychain"
     else
         printf '%s\n' "$file"
@@ -1586,7 +1596,7 @@ fs_read_claude_credential() {
     local override="${1:-}"
     local file="${override:-$HOME/.claude/.credentials.json}" svc out
 
-    if [[ ! -f "$file" ]]; then
+    if [[ ! -f "$file" ]] || { [[ -z "$override" ]] && _fs_claude_file_lacks_login "$file"; }; then
         if [[ -n "$override" ]]; then
             echo "Error: $override not found. --claude-credentials (or" >&2
             echo "CLAUDE_CREDENTIALS in claude.env) named this path explicitly," >&2
@@ -1604,9 +1614,10 @@ fs_read_claude_credential() {
                 printf '%s' "$out"
                 return 0
             done
-            echo "Error: no Claude credential found. $file does not exist, which is" >&2
-            echo "expected on macOS -- the CLI keeps it in the login Keychain -- but" >&2
-            echo "no usable item was there either. Tried: ${FS_CLAUDE_KEYCHAIN_SERVICES[*]}" >&2
+            echo "Error: no Claude credential found. $file does not exist or holds no" >&2
+            echo "Claude login, which is expected on macOS -- the CLI keeps it in the" >&2
+            echo "login Keychain -- but no usable item was there either." >&2
+            echo "Tried: ${FS_CLAUDE_KEYCHAIN_SERVICES[*]}" >&2
             echo "Log in with claude first. If you are already logged in, the service" >&2
             echo "name may have changed; find it with:" >&2
             echo "  security dump-keychain | grep -i claude" >&2
