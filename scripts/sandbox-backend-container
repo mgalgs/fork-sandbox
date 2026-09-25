@@ -426,7 +426,9 @@ if [[ "$NET_MODE" == pinned ]]; then
     # access() on the resolved path, which answers correctly for a closed fd 0
     # but says "readable" for a socket that then fails to open. A pinned run
     # must not depend on the caller having bothered to give us a usable stdin.
-    if exec 3< /dev/stdin 2>/dev/null; then
+    # The group scopes 2>/dev/null to the probe; on exec itself it would
+    # silence stderr for the rest of this script.
+    if { exec 3< /dev/stdin; } 2>/dev/null; then
         "$CLI" start --attach --interactive "$CONTAINER" <&3 &
         attach_pid=$!
         exec 3<&-

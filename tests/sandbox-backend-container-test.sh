@@ -225,6 +225,38 @@ else
     # branch itself remains unverified" is the honest statement.
 fi
 
+# A failing pin helper must say so on stderr. The stdin probe used to be
+# `exec 3< /dev/stdin 2>/dev/null`, and exec with no command keeps every
+# redirection, so stderr went to /dev/null for the rest of the script. The
+# run gets an openable stdin so the probe's first branch is the one taken.
+cat > "$dwn/bin/failcli" <<'EOF'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "network create") echo fake-net; exit 0 ;;
+  "network inspect") case "$*" in *Gateway*) echo 203.0.113.1 ;; *Subnet*) echo 203.0.113.0/24 ;; esac; exit 0 ;;
+  "network rm") exit 0 ;;
+esac
+case "$1" in
+  create) echo fake-container; exit 0 ;;
+  start)  sleep 1; exit 0 ;;
+  wait)   echo 0; exit 0 ;;
+  rm)     exit 0 ;;
+  inspect) case "$*" in *State.Running*) echo true ;; *) echo 2026-01-01T00:00:00Z ;; esac; exit 0 ;;
+  run) [[ "$*" == *NET_ADMIN* ]] && { echo "pin refused by fake" >&2; exit 125; }; exit 0 ;;
+esac
+exit 0
+EOF
+chmod +x "$dwn/bin/failcli"
+if PATH="$dwn/bin:$PATH" FORK_SANDBOX_CONTAINER_CLI="$dwn/bin/failcli" \
+    "$backend" --workdir "$dwn/work-fail" --net pinned --image fake -- true </dev/null >/dev/null 2>"$dwn/fail.err"; then
+    no "a failing pin helper fails the run" "exit 0"
+else
+    ok "a failing pin helper fails the run"
+fi
+contains_err="$(cat "$dwn/fail.err")"
+case "$contains_err" in *"pin helper failed"*) ok "a failing pin helper is reported on stderr" ;;
+    *) no "a failing pin helper is reported on stderr" "$contains_err" ;; esac
+
 printf '\n== runtime integration ==\n'
 runtime="${FORK_SANDBOX_CONTAINER_CLI:-docker}"
 if ! command -v "$runtime" >/dev/null 2>&1 || ! "$runtime" info >/dev/null 2>&1; then
