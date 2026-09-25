@@ -201,6 +201,14 @@ is_refused_work_dir "$WORK_DIR" && { echo "Error: refusing '$WORK_DIR' as the wo
 check_mount_path --workdir "$WORK_DIR" || exit 1
 
 MOUNTS=(--mount "type=bind,src=$WORK_DIR,dst=$WORK_DIR")
+# On macOS /var and /tmp live under /private, and callers pass the realpath,
+# while prompts name files by the short /var/tmp/... spelling. Mount the work
+# dir at that spelling too so both resolve inside the container.
+if [[ "$WORK_DIR" == /private/* ]]; then
+    work_dir_short="${WORK_DIR#/private}"
+    check_mount_path --workdir "$work_dir_short" || exit 1
+    MOUNTS+=(--mount "type=bind,src=$WORK_DIR,dst=$work_dir_short")
+fi
 for d in "${BIND_RO[@]}"; do [[ -e "$d" ]] || { echo "Error: --bind-ro '$d' does not exist." >&2; exit 1; }; s="$("$FS_REALPATH" "$d")"; r="$("$FS_REALPATH" -s "$d")"; check_mount_path --bind-ro "$s" && check_mount_path --bind-ro "$r" || exit 1; MOUNTS+=(--mount "type=bind,src=$s,dst=$r,readonly"); done
 for d in "${BIND_RW[@]}"; do
     [[ -e "$d" ]] || { echo "Error: --bind-rw '$d' does not exist." >&2; exit 1; }; r="$("$FS_REALPATH" "$d")"

@@ -305,6 +305,13 @@ else
         # shellcheck disable=SC2016  # expanded by bash inside the container
         out="$(run --workdir "$rw" --net sealed -- bash -c 'printf "%s|" "$HOME"; find "$HOME" -mindepth 1 -print -quit')"
         check "HOME path and emptiness" "$HOME|" "$out"
+        # On macOS mktemp returns /var/folders/..., whose realpath is
+        # /private/var/folders/...; the short spelling must resolve inside the
+        # container too. On Linux the two spellings are the same path.
+        # shellcheck disable=SC2016  # expanded by bash inside the container
+        out="$(run --workdir "$("$(command -v grealpath || echo realpath)" "$rw")" --net sealed -- bash -c 'touch "$1/seen" && echo yes' _ "$rw")"
+        check "work dir is reachable by its short /var spelling" "yes" "$out"
+        rm -f "$rw/seen"
         export FORK_SANDBOX_SECRET_SHOULD_NOT_LEAK=secret
         # shellcheck disable=SC2016  # expanded by bash inside the container
         out="$(run --workdir "$rw" --net sealed --setenv PASSED='right value' -- bash -c 'printf "%s|%s|%s" "${FORK_SANDBOX_SECRET_SHOULD_NOT_LEAK-unset}" "${IMAGE_BAKED_SECRET-unset}" "$PASSED"')"
