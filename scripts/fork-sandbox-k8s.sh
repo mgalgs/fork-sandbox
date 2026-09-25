@@ -3924,7 +3924,7 @@ validate_context_ro_dir() {
     # without this a crafted --context-ro forges further lines in the
     # grant file the same way a crafted probe or namespace would.
     fs_reject_unsafe_chars "$context_ro_real" || exit 1
-    if [[ "$context_ro_real" != /var/tmp/claude-scratch/forks/* ]]; then
+    if [[ "$context_ro_real" != "$FS_SCRATCH_ROOT"/forks/* ]]; then
         echo "Error: --context-ro must name a directory under" >&2
         echo "/var/tmp/claude-scratch/forks/ — got '$context_ro_real'. The" >&2
         echo "pod reads it after it is pushed, so which paths may be" >&2

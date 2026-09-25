@@ -3871,7 +3871,7 @@ fi
 #     Only --unpin-egress may pass; the script adds every bind it needs
 #     itself.
 handoff_real="$("$FS_REALPATH" -m "$handoff_file")"
-if [[ "$handoff_real" != /var/tmp/claude-scratch/* && "$handoff_real" != /tmp/claude-scratch/* ]]; then
+if [[ "$handoff_real" != "$FS_SCRATCH_ROOT"/* && "$handoff_real" != "$FS_SCRATCH_COMPAT_ROOT"/* ]]; then
     echo "Error: handoff files must live under /var/tmp/claude-scratch/ (or the" >&2
     echo "/tmp/claude-scratch compat symlink) — got '$handoff_real'. The handoff" >&2
     echo "becomes the prompt of a session with internet access, so this path is a" >&2
@@ -3883,7 +3883,7 @@ fi
 # dirs, and the codex credential staging dir. A handoff there would read a
 # file the machinery wrote (the credential above all) into the prompt of a
 # session with internet access. Handoffs go in the scratch root.
-if [[ "$handoff_real" == /var/tmp/claude-scratch/forks/* || "$handoff_real" == /tmp/claude-scratch/forks/* ]]; then
+if [[ "$handoff_real" == "$FS_SCRATCH_ROOT"/forks/* || "$handoff_real" == "$FS_SCRATCH_COMPAT_ROOT"/forks/* ]]; then
     echo "Error: handoff files must not live under the forks/ machinery" >&2
     echo "directory — got '$handoff_real'. forks/ holds run dirs, staging" >&2
     echo "dirs and credential files that approved scripts create; reading one" >&2
@@ -3908,7 +3908,7 @@ fi
 # else — no $HOME, no ~/.ssh, no secrets.
 if [[ -n "$context_ro" ]]; then
     context_ro_real="$("$FS_REALPATH" -m "$context_ro")"
-    if [[ "$context_ro_real" != /var/tmp/claude-scratch/forks/* ]]; then
+    if [[ "$context_ro_real" != "$FS_SCRATCH_ROOT"/forks/* ]]; then
         echo "Error: --context-ro must name a directory under" >&2
         echo "/var/tmp/claude-scratch/forks/ — got '$context_ro_real'. An" >&2
         echo "unattended agent can read the bind, and for most harnesses it has" >&2
@@ -3930,7 +3930,7 @@ fi
 # read-only host bind.
 if [[ -n "$fixtures_dir" ]]; then
     fixtures_dir="$("$FS_REALPATH" -m "$fixtures_dir")"
-    if [[ "$fixtures_dir" != /var/tmp/claude-scratch/fixtures/* ]]; then
+    if [[ "$fixtures_dir" != "$FS_SCRATCH_ROOT"/fixtures/* ]]; then
         echo "Error: --fixtures must name a directory under" >&2
         echo "/var/tmp/claude-scratch/fixtures/ — got '$fixtures_dir'. An" >&2
         echo "unattended agent can read the bind, and for most harnesses it has" >&2
