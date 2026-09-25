@@ -5201,6 +5201,7 @@ else
     # not undo that.
     clone_dir="$clone_dir_flag"
     clone_reused=true
+    # shellcheck disable=SC2034  # read by fs_emit_prompt_preamble in the lib
     FS_PREAMBLE_CLONE_REUSED=true
 
     echo "Reusing '$clone_dir' for the sandbox..." >&2
