@@ -267,6 +267,11 @@ cd ~/src/fork-sandbox
 Everything installs as symlinks back into the checkout, so upgrading is
 `git pull`.
 
+A run clones its project out of `~/src` by default; keep projects elsewhere
+and add your own root(s) to `PROJECT_ROOTS` in
+`~/.config/fork-sandbox/projects.env` (colon-separated) — see
+[docs/sandbox-quickstart.md](docs/sandbox-quickstart.md).
+
 You need `bwrap`, `pasta`, `git` and `jq`. `tmux`, `socat`, `setsid`, `docker`
 and `python3` each unlock a harness or a flag, and `--check` names which.
 

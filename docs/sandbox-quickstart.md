@@ -25,8 +25,17 @@ the session wrote safe — review the fetched branch like a stranger's PR.
 
 ## Day one: any repo, zero setup
 
-Every repo under `~/src` works today. Nothing needs to be added to the
+Every repo under `~/src` works by default. Nothing needs to be added to the
 project for these two flows.
+
+Keep projects somewhere else? A sandboxed run gets the whole clone and
+usually internet access, so which directories may be handed to it is a
+security boundary, not a path preference — add your own root(s) in
+`~/.config/fork-sandbox/projects.env`:
+
+```
+PROJECT_ROOTS=~/src:~/code
+```
 
 The easiest entry: tell a Claude session to "fork this task to a sandbox" —
 the `fork-sandbox` skill does everything below. By hand:

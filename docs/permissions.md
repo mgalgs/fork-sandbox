@@ -78,7 +78,10 @@ dangerous primitives, and each is constrained:
   unconstrained path would be arbitrary-file-read plus exfiltration. Handoffs
   must live under the scratch root, where sessions stage them deliberately.
 - The **project** is cloned into the sandbox — the same channel. It must be a
-  repository under your source root.
+  repository under one of the configured project roots (`PROJECT_ROOTS` in
+  `~/.config/fork-sandbox/projects.env`, defaulting to `~/src`). Editing that
+  file widens what an approved call can hand to a sandbox, so treat it with
+  the same care as the allowlist itself.
 - **Sandbox arguments** are not passed through. The script adds every bind the
   run needs; a caller cannot ask it to mount `~/.ssh`.
 
