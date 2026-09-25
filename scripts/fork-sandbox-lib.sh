@@ -836,11 +836,16 @@ fs_services_dir() {
     printf '%s\n' "$root/.agents/sandbox-services"
 }
 
+# An optional third argument names the directory the list is read from
+# (default: the clone's own services dir). The clone's list is the checked-out
+# ref's copy, so a caller that cannot trust the ref passes the ORIGIN's own
+# services dir instead: the bind sources are still checked exactly as below.
 fs_provision_ro() {
-    local origin_repo="$1" clone_dir="$2" list rel src dest src_real dest_real
+    local origin_repo="$1" clone_dir="$2" list_dir="${3:-}" list rel src dest src_real dest_real
     local origin_real clone_real
     FS_PROVISION_RO_FLAGS=()
-    list="$(fs_services_dir "$clone_dir")/provision-ro"
+    [[ -n "$list_dir" ]] || list_dir="$(fs_services_dir "$clone_dir")"
+    list="$list_dir/provision-ro"
     [[ -f "$list" ]] || return 0
     origin_real="$("$FS_REALPATH" -m "$origin_repo")"
     clone_real="$("$FS_REALPATH" -m "$clone_dir")"

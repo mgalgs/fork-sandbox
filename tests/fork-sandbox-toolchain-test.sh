@@ -541,6 +541,143 @@ contains "a real checkout's venv bin goes on PATH too" \
 lacks "and it binds nothing into a tree that already has it" "--bind-ro-at $pr_origin/.venv " \
     "${FS_PROVISION_RO_FLAGS[*]} "
 
+# The list may come from somewhere other than the clone: an unanchored
+# --checkout must not trust the ref's own copy, which can name any untracked
+# path in the origin. Every safety check stays in force either way.
+pr_list_dir="$scratch/pr-trusted-list"
+mkdir -p "$pr_list_dir" "$pr_origin/only-in-clone-list"
+printf '.venv\n' > "$pr_list_dir/provision-ro"
+printf '.venv\nonly-in-clone-list\nescape\n' > "$pr_clone/.agents/sandbox-services/provision-ro"
+fs_provision_ro "$pr_origin" "$pr_clone" "$pr_list_dir" 2>"$scratch/pr-dir-err.log"
+contains "a third argument names where the list is read from" \
+    "$pr_origin/.venv $pr_clone/.venv" "${FS_PROVISION_RO_FLAGS[*]}"
+lacks "an entry only the clone's list names is not bound" "only-in-clone-list" \
+    "${FS_PROVISION_RO_FLAGS[*]}"
+printf '.venv\nescape\n/etc\n' > "$pr_list_dir/provision-ro"
+fs_provision_ro "$pr_origin" "$pr_clone" "$pr_list_dir" 2>"$scratch/pr-dir-err.log"
+contains "an escaping symlink in the given list is still refused" \
+    "resolves outside the repo" "$(cat "$scratch/pr-dir-err.log")"
+contains "an absolute entry in the given list is still refused" \
+    "not a repo-relative path" "$(cat "$scratch/pr-dir-err.log")"
+
+echo ""
+echo "== --checkout and provision-ro (launcher) =="
+
+# The launcher, end to end, against a stub sandbox that records its argv. The
+# services hook is host-side code and stays off for a ref with no trust anchor;
+# provision-ro is a different decision, and there the list must be the
+# ORIGIN's own, never the ref's.
+pc_home="$scratch/pc-home"
+pc_bin="$scratch/pc-bin"
+pc_proj="$pc_home/src/pc-project"
+mkdir -p "$pc_home/src" "$pc_bin" "$pc_proj/.agents/sandbox-services"
+mkdir -p "$pc_home/.claude/skills/commit-then-review" \
+    "$pc_home/.claude/skills/code-review-portable"
+pc_git() { GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null git -C "$pc_proj" \
+    -c user.name=Tester -c user.email=t@fork-sandbox.invalid "$@"; }
+pc_git init -q -b main
+printf '.venv\n' > "$pc_proj/.agents/sandbox-services/provision-ro"
+cat > "$pc_proj/.agents/sandbox-services/sandbox-services.sh" <<'HOOK'
+#!/usr/bin/env bash
+: > "$FS_TEST_HOOK_MARKER"
+HOOK
+chmod +x "$pc_proj/.agents/sandbox-services/sandbox-services.sh"
+printf 'base\n' > "$pc_proj/file.txt"
+pc_git add . && pc_git commit -q -m base
+# Untracked in the origin, so only a provision-ro bind can put them in a clone.
+mkdir -p "$pc_proj/.venv" "$pc_proj/.secret-dir"
+# A ref that only edits code: the contract is unchanged relative to main.
+pc_git switch -q -c ref-same
+printf 'edit\n' >> "$pc_proj/file.txt"
+pc_git commit -q -am "code only"
+# A ref that rewrites the provision-ro list to add a path the origin's list
+# does not name, and edits the hook.
+pc_git switch -q -c ref-hostile main
+printf '.venv\n.secret-dir\n' > "$pc_proj/.agents/sandbox-services/provision-ro"
+cat > "$pc_proj/.agents/sandbox-services/sandbox-services.sh" <<'HOOK'
+#!/usr/bin/env bash
+: > "$FS_TEST_HOOK_MARKER"
+# edited
+HOOK
+pc_git commit -q -am "hostile contract"
+pc_git switch -q main
+
+cat > "$pc_bin/claude-sandboxed" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$@" > "$FS_TEST_ARGV"
+cat >/dev/null
+printf '{"type":"result","subtype":"success","result":"ok"}\n'
+exit 0
+STUB
+cat > "$pc_bin/docker" <<'STUB'
+#!/usr/bin/env bash
+exit 0
+STUB
+cat > "$pc_bin/sandbox-backend-fake-host" <<'STUB'
+#!/usr/bin/env bash
+[[ "${1:-}" == "--capabilities" ]] && { printf 'toolchain=host\n'; exit 0; }
+exit 0
+STUB
+chmod +x "$pc_bin"/*
+pc_cfg="$scratch/pc-config"; mkdir -p "$pc_cfg"
+pc_handoff_dir="$(mktemp -d /var/tmp/claude-scratch/fs-toolchain-handoff.XXXXXX)"; tmpdirs+=("$pc_handoff_dir")
+pc_handoff="$pc_handoff_dir/handoff.md"; printf 'do the task\n' > "$pc_handoff"
+pc_venv_real="$(realpath "$pc_proj/.venv")"
+pc_secret_real="$(realpath "$pc_proj/.secret-dir")"
+
+# pc_run <label> <launcher args...>: fills pc_out, pc_argv and pc_rundir.
+pc_run() {
+    local label="$1"; shift
+    pc_argv="$scratch/pc-argv-$label"; pc_marker="$scratch/pc-marker-$label"
+    rm -f "$pc_argv" "$pc_marker"
+    pc_out="$(HOME="$pc_home" PATH="$pc_bin:$PATH" FORK_SANDBOX_CONFIG_DIR="$pc_cfg" \
+        FORK_SANDBOX_BACKEND=fake-host FORK_SANDBOX_RUN_SOURCE=test \
+        FS_TEST_ARGV="$pc_argv" FS_TEST_HOOK_MARKER="$pc_marker" \
+        GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null \
+        timeout 120 "$repo_dir/scripts/fork-sandbox.sh" --foreground --harness claude \
+        --model sonnet --branch "pc-$label" "$@" "$pc_proj" "$pc_handoff" 2>&1 </dev/null)"
+    pc_rundir="$(printf '%s\n' "$pc_out" | sed -n 's/^  run dir:  *//p' | head -1)"
+    [[ -z "$pc_rundir" ]] || tmpdirs+=("$pc_rundir")
+    pc_flags="$(cat "$pc_argv" 2>/dev/null || true)"
+}
+
+# Control: a plain run from the checkout gets its list bound and the hook run,
+# which is what makes the negative assertions below able to fail.
+pc_run plain
+contains "control: a plain run binds the origin's .venv" "$pc_venv_real" "$pc_flags"
+if [[ -e "$pc_marker" ]]; then ok "control: a plain run runs the services hook"
+else no "control: a plain run runs the services hook" "$pc_out"; fi
+
+pc_run unanchored --checkout ref-hostile
+contains "unanchored --checkout binds the origin's own list entry" "$pc_venv_real" "$pc_flags"
+lacks "unanchored --checkout does not bind a path only the ref's list names" \
+    "$pc_secret_real" "$pc_flags"
+lacks "unanchored --checkout does not bind a path only the ref's list names (relative)" \
+    ".secret-dir" "$pc_flags"
+if [[ -e "$pc_marker" ]]; then no "unanchored --checkout runs no services hook" "hook ran"
+else ok "unanchored --checkout runs no services hook"; fi
+contains "the unanchored warning says provision-ro comes from the origin's list" \
+    "from the origin checkout's own list" "$pc_out"
+
+pc_run unanchored-same --checkout ref-same
+contains "an unanchored ref that leaves the contract alone still binds the origin's .venv" \
+    "$pc_venv_real" "$pc_flags"
+if [[ -e "$pc_marker" ]]; then no "an unanchored code-only ref runs no services hook" "hook ran"
+else ok "an unanchored code-only ref runs no services hook"; fi
+
+pc_run anchored-same --checkout ref-same --services-trust-ref main
+contains "control: an anchored ref with an unchanged contract binds .venv" "$pc_venv_real" "$pc_flags"
+if [[ -e "$pc_marker" ]]; then ok "control: an anchored ref with an unchanged contract runs the hook"
+else no "control: an anchored ref with an unchanged contract runs the hook" "$pc_out"; fi
+
+pc_run anchored-changed --checkout ref-hostile --services-trust-ref main
+lacks "a ref that changes the contract gets no provision-ro at all" "--bind-ro-at" "$pc_flags"
+if [[ -e "$pc_marker" ]]; then no "a ref that changes the contract runs no hook" "hook ran"
+else ok "a ref that changes the contract runs no hook"; fi
+
+pc_run nosvc --checkout ref-hostile --no-services
+lacks "--no-services still disables provision-ro" "--bind-ro-at" "$pc_flags"
+
 echo ""
 echo "== fs_read_claude_credential =="
 

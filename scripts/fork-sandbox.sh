@@ -5294,6 +5294,7 @@ fs_node_provision "$origin_repo" "$clone_dir" "$clone_reused"
 # change the hook relative to that ref.
 services_enabled=0        # docker compose services are stood up
 provision_enabled=0       # provision-ro binds are honored
+provision_list_dir=""     # where the provision-ro list is read from; empty = the clone's
 services_hook_dir="$(fs_services_dir "$clone_dir")"
 if ! $no_services && [[ -d "$services_hook_dir" ]]; then
     services_trusted=1
@@ -5302,11 +5303,20 @@ if ! $no_services && [[ -d "$services_hook_dir" ]]; then
         # pull-request head, say. A services hook is host-side code, and this
         # script is blanket-approved, so the boundary is here, not a prompt: a
         # checked-out ref does not get its hook run without a trust anchor.
+        #
+        # provision-ro is a separate decision: its list is read from the clone,
+        # i.e. the ref's own copy, which could name the origin's .env. So the
+        # list comes from the ORIGIN checkout's own contract instead — the
+        # same list a plain run from that checkout would use.
         echo "Warning: --checkout names an unanchored ref, so its per-run" >&2
         echo "services hook is NOT run — a hook is host-side code and the ref" >&2
         echo "may be untrusted. Pass --services-trust-ref <trusted-base> to" >&2
-        echo "enable it, or --no-services to skip this quietly." >&2
+        echo "enable it, or --no-services to skip this quietly. provision-ro" >&2
+        echo "binds still apply, from the origin checkout's own list, not the" >&2
+        echo "ref's." >&2
         services_trusted=0
+        provision_enabled=1
+        provision_list_dir="$(fs_services_dir "$origin_repo")"
     elif [[ -n "$services_trust_ref" ]]; then
         # Run git in the ORIGIN, never the clone: the clone's git config is
         # writable by the sandbox. Three-dot, so only what the checked-out ref
@@ -5350,12 +5360,20 @@ if ! $no_services && [[ -d "$services_hook_dir" ]]; then
             fi
         fi
     fi
+elif ! $no_services && [[ -n "$checkout_ref" && -z "$services_trust_ref" ]]; then
+    # An unanchored ref that carries no contract directory of its own: there
+    # is no hook to distrust, but the origin's own provision-ro list still
+    # applies, exactly as in the branch above.
+    provision_enabled=1
+    provision_list_dir="$(fs_services_dir "$origin_repo")"
 fi
 
-# Provision-ro binds (read-only origin paths into the clone), gated by the same
-# trust decision as the services. fs_provision_ro fills FS_PROVISION_RO_FLAGS.
+# Provision-ro binds (read-only origin paths into the clone). Gated by the trust
+# decision above, but not the same one as the services: an unanchored
+# --checkout keeps services off while reading the list from the origin.
+# fs_provision_ro fills FS_PROVISION_RO_FLAGS.
 if (( provision_enabled )); then
-    fs_provision_ro "$origin_repo" "$clone_dir"
+    fs_provision_ro "$origin_repo" "$clone_dir" "$provision_list_dir"
 fi
 
 # A services compose must pull its images, never build them: a `build:` runs
