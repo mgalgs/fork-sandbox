@@ -50,8 +50,9 @@ writing a detailed handoff so nothing gets dropped.
 4. **Launch the new session** as a split in the current window,
    **carrying the current session's model over** — a refresh must not
    silently change models (a Fable session forks to Fable, not to the
-   CLI default). Read the model from the status-line stash, the same
-   source `context-usage.sh` prints:
+   CLI default). Read the model from the stash `statusline-stash.sh`
+   writes (wiring it as your statusLine command is covered in
+   docs/permissions.md), the same source `context-usage.sh` prints:
    ```bash
    model="$(jq -r .model "/tmp/claude-$(id -u)/context-nudge/ctx-$CLAUDE_CODE_SESSION_ID.json")"
    fork-task.sh --split --model "$model" . <handoff-file>
@@ -86,12 +87,15 @@ writing a detailed handoff so nothing gets dropped.
    hooks stay silent. If `lane-mail.sh registration` prints a lane,
    put three lines in the handoff's entry protocol: run
    `lane-mail.sh register <lane>` on entry, process
-   `lane-mail.sh inbox <lane>`, and arm the lane watch so mail wakes
-   the session (`Monitor({command: "lane-mail-watch.sh <lane>",
-   persistent: true})`). Then, AFTER launching the continuation, run
-   `lane-mail.sh unregister` in THIS session: an outgoing session
-   still registered gets stop-blocked on -- and may mark seen, i.e.
-   steal -- mail that belongs to its successor.
+   `lane-mail.sh inbox <lane>`, and run `lane-mail-watch.sh <lane> --wait`
+   as a background Bash command (`run_in_background: true`) so mail wakes
+   the session once when it lands — a Monitor would wake it on a timer
+   even with nothing to read. After processing what it wakes for, mark
+   the mail `seen`, then relaunch the same background command. Then,
+   AFTER launching the continuation, run `lane-mail.sh unregister` in
+   THIS session: an outgoing session still registered gets stop-blocked
+   on -- and may mark seen, i.e. steal -- mail that belongs to its
+   successor.
 
 5. **Confirm** to the user that the handoff is ready and the new session
    is running in the split below.
