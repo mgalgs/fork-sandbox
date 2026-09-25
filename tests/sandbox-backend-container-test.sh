@@ -79,6 +79,21 @@ PY
 pids+=("$!"); for _ in {1..50}; do [[ -S "$comma_name_sock" ]] && break; sleep .02; done
 refuses "rejects comma in the bridge socket filename" comma "$backend" --workdir "$w" --net sealed --image "$image" --bridge "$comma_name_sock=3002" -- true
 
+# is_refused_work_dir runs on realpaths, which macOS spells under /private.
+# Extracted and called directly, so these cases run on any host.
+eval "$(sed -n '/^is_refused_work_dir() {/,/^}/p' "$backend")"
+refused_case() { # label, path, want (refused|allowed), HOME
+    local got=allowed
+    HOME="$4" is_refused_work_dir "$2" && got=refused
+    check "$1" "$3" "$got"
+}
+refused_case "/private/etc is refused" /private/etc refused /home/u
+refused_case "/private/var/tmp is refused" /private/var/tmp refused /home/u
+refused_case "/private itself is refused" /private refused /home/u
+refused_case "a run clone under /private is allowed" /private/var/tmp/claude-scratch/forks/claude-fork-sandbox.x/clone/r allowed /home/u
+refused_case "a HOME spelled under /private is refused" /private/var/root refused /private/var/root
+refused_case "a plain project dir is allowed" /home/u/src/r allowed /home/u
+
 printf '\n== Darwin pin route program (no runtime required) ==\n'
 # The Darwin branch only runs on a Mac, which is why it has never executed in
 # any test. It does not need a Mac to run, though: every input it reads comes

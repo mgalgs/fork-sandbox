@@ -142,9 +142,14 @@ case "$NET_MODE" in pinned|sealed|unpinned) ;; "") echo "Error: --net is require
 [[ -n "$IMAGE" ]] || { echo "Error: --image is required (or set FORK_SANDBOX_CONTAINER_IMAGE)." >&2; exit 1; }
 
 is_refused_work_dir() {
-    local d="$1" p
-    case "$d" in /|"$HOME"|/home|/root|/boot|/var|/var/tmp|/var/tmp/claude-scratch|/var/tmp/claude-scratch/forks|/tmp|/opt|/srv|/mnt|/nix) return 0 ;; esac
-    for p in /usr /etc /bin /sbin /lib /lib64 /proc /sys /dev /run /boot; do [[ "$d" == "$p" || "$d" == "$p"/* ]] && return 0; done
+    local d p
+    [[ "$1" == /private ]] && return 0
+    # Callers pass realpaths, and macOS spells /etc, /var and /tmp as
+    # /private/etc and so on, so judge a /private path by both spellings.
+    for d in "$1" "${1#/private}"; do
+        case "$d" in /|"$HOME"|/home|/root|/boot|/var|/var/tmp|/var/tmp/claude-scratch|/var/tmp/claude-scratch/forks|/tmp|/opt|/srv|/mnt|/nix) return 0 ;; esac
+        for p in /usr /etc /bin /sbin /lib /lib64 /proc /sys /dev /run /boot; do [[ "$d" == "$p" || "$d" == "$p"/* ]] && return 0; done
+    done
     return 1
 }
 check_remap_dest() {
