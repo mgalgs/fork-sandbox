@@ -133,8 +133,9 @@ claude harness):
                  `leg-error` (a continuation leg exited non-zero -- a crash,
                  not an ordinary ending; see `continuations[].exit`), or
                  `stalled` (a continuation leg, other than the first, left a
-                 hand-off without moving the branch -- the chain ends
-                 rather than chasing a leg that is not making progress; see
+                 hand-off without moving the branch or writing to its
+                 outbox -- the chain ends rather than chasing a leg that is
+                 not making progress; see
                  `handoff-stalled-N.md` in the run record).
                  Present on every claude run made after this field existed,
                  even one that never came near its threshold -- readers
