@@ -326,8 +326,10 @@ PLUMBING=(
     fork-sandbox-k8s-platform-generic
     fork-sandbox-k8s-review-loop.sh
     fork-sandbox-k8s-services-parse.py
+    fork-sandbox-k8s-wake.sh
     fork-sandbox-lib.sh
     fork-sandbox-mail-remote.py
+    fork-sandbox-postmaster-pod-init.sh
     fork-sandbox-preset-parse.py
     fork-sandbox-refresh.sh
     sandbox-backend-bwrap
