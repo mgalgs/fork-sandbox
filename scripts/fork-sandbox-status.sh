@@ -886,9 +886,22 @@ case "$mode" in
                         "$state" "$(elapsed_human)"
                     ;;
                 *)
-                    printf 'The session wrote no result. It ended as "%s" after %s,\n' \
-                        "$state" "$(elapsed_human)"
-                    printf 'so it never finished its turn.\n'
+                    # A leg that died on a provider error (spend cap, revoked
+                    # token) wrote no result, and summary.json carries the
+                    # cause; say that instead of the generic account.
+                    herr=""
+                    if herr_json="$(run_file_read summary.json 2>/dev/null)"; then
+                        herr="$(printf '%s' "$herr_json" \
+                            | jq -r '.harness_error // empty' 2>/dev/null \
+                            | tr -d '\000-\037\177')"
+                    fi
+                    if [[ -n "$herr" ]]; then
+                        printf 'The session failed on a harness error: %s\n' "$herr"
+                    else
+                        printf 'The session wrote no result. It ended as "%s" after %s,\n' \
+                            "$state" "$(elapsed_human)"
+                        printf 'so it never finished its turn.\n'
+                    fi
                     print_tail_of_log
                     ;;
             esac

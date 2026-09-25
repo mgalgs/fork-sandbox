@@ -8073,6 +8073,14 @@ fi
 # A reader should not have to tell "no tokens" from "tokens not reported".
 [[ -n "$run_usage" ]] || run_usage=null
 
+# codex and claude record a failure only in their own event stream (pi's is
+# read from its session file above, so a pi error is already in run_error).
+# Read it here so a leg that died in seconds on a provider error says why,
+# rather than the summary saying only that the session wrote no result.
+if [[ -z "$run_error" ]]; then
+    run_error="$(fs_harness_error "$harness" "$events")"
+fi
+
 # Format once, here, and record it where a caller can read it without
 # parsing prose. %.6f rather than the raw number: a sum of floats carries
 # noise, and a cheap run is small enough that jq hands back scientific
@@ -8388,6 +8396,7 @@ next_leg_no=$(( ${leg_no:-1} + 1 ))
 leg_cost=""
 leg_usage=null
 leg_error=""
+leg_harness_error=""
 # The summary block's review line gates on this being non-empty, unguarded
 # (the maintainer line's sibling carries its own ${...:-} default instead,
 # since a no-maintainer run.sh never emits maintainer_loop_ended at all) --
@@ -8398,8 +8407,10 @@ review_loop_detail=""
 
 # Run one leg: kind (review or fix), iteration number, prompt file. Sets
 # leg_rc, leg_cost (a number, or empty when the harness does not report one),
-# leg_usage (a JSON object, or null) and leg_error (a model-error or
-# retry-exhaustion message, or empty).
+# leg_usage (a JSON object, or null), leg_error (a model-error or
+# retry-exhaustion message, or empty) and leg_harness_error (the provider's
+# error from a codex or claude leg's own event stream, or empty; see
+# fs_harness_error).
 run_leg() {
     local kind="$1" n="$2" prompt="$3" step_idx="${4:-}"
     # A legacy-shaped run never passes step_idx, so leg_tag is exactly
@@ -8512,6 +8523,7 @@ run_leg() {
     leg_cost=""
     leg_usage=""
     leg_error=""
+    leg_harness_error=""
     : > "$leg_events"
 
     # pi records its transcript, and the tokens with it, in a session
@@ -8647,6 +8659,11 @@ run_leg() {
     [[ -n "$leg_usage" ]] || leg_usage=null
     if [[ ! "$leg_cost" =~ ^-?[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?$ ]]; then
         leg_cost=""
+    fi
+    leg_harness_error="$(fs_harness_error "$leg_harness" "$leg_events")"
+    if [[ -n "$leg_harness_error" && "$leg_rc" != "0" ]]; then
+        printf 'fork-sandbox: the %s leg of iteration %s exited %s: %s\n' \
+            "$kind" "$n" "$leg_rc" "$leg_harness_error" >> "$sandbox_log"
     fi
     if [[ -n "$leg_error" && "$leg_rc" == "0" ]]; then
         # Never turn a non-zero exit into a different one: the process's own
@@ -8971,7 +8988,7 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count && stop_requested != 1; cur
         [[ "$cur_legacy" == 1 ]] && cur_save_live
         if [[ "$cur_legacy" == 1 ]]; then
             if [[ "$leg_rc" != 0 ]]; then
-                cur_ended=harness-error; cur_detail="the $cur_kind leg of iteration $cur_i exited $leg_rc${leg_error:+ ($leg_error)}"
+                cur_ended=harness-error; cur_detail="the $cur_kind leg of iteration $cur_i exited $leg_rc${leg_error:+ ($leg_error)}${leg_harness_error:+: $leg_harness_error}"
             # The verdict is DATA. It is copied, counted and concatenated
             # into a prompt file -- never sourced, never evaluated, never
             # put on a command line. It is also written by a session, so
@@ -9069,7 +9086,7 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count && stop_requested != 1; cur
                             (( cur_fix_repeat == 1 )) && cur_fix_usage="${leg_usage:-null}"
                             cur_after="$(clone_branch_head)"
                             if [[ "$leg_rc" != 0 ]]; then
-                                cur_ended=harness-error; cur_detail="the fix leg of iteration $cur_i exited $leg_rc${leg_error:+ ($leg_error)}"
+                                cur_ended=harness-error; cur_detail="the fix leg of iteration $cur_i exited $leg_rc${leg_error:+ ($leg_error)}${leg_harness_error:+: $leg_harness_error}"
                             elif [[ -z "$cur_after" ]]; then
                                 cur_ended=harness-error; cur_detail="branch $branch could not be read from the clone after the fix leg of iteration $cur_i"
                             elif [[ "$cur_after" == "$cur_before" ]]; then
@@ -9086,6 +9103,7 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count && stop_requested != 1; cur
             fi
         else
             if [[ "$leg_rc" != 0 || ! -s "$cur_verdict_file" || -L "$cur_verdict_file" ]]; then cur_ended=harness-error; cur_detail="the $cur_kind leg of iteration $cur_i left no usable verdict"
+                [[ "$leg_rc" != 0 && -n "$leg_harness_error" ]] && cur_detail+=": $leg_harness_error"
             else
                 cur_copy="$run_dir/${cur_step_idx}-$([[ "$cur_kind" == maintainer ]] && echo maintain || echo review)-verdict-${cur_i}.md"
                 cp -- "$cur_verdict_file" "$cur_copy"; rm -f "$cur_verdict_file"
@@ -9115,7 +9133,7 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count && stop_requested != 1; cur
                     (( cur_fix_known )) || cur_fix_cost=null
                     (( cur_fix_repeat == 1 )) && cur_fix_usage="${leg_usage:-null}"
                     cur_after="$(clone_branch_head)"
-                    if [[ "$leg_rc" != 0 ]]; then cur_ended=harness-error; cur_detail="the fix leg of iteration $cur_i exited $leg_rc"
+                    if [[ "$leg_rc" != 0 ]]; then cur_ended=harness-error; cur_detail="the fix leg of iteration $cur_i exited $leg_rc${leg_error:+ ($leg_error)}${leg_harness_error:+: $leg_harness_error}"
                     elif [[ -z "$cur_after" ]]; then cur_ended=harness-error; cur_detail="branch $branch could not be read from the clone after the fix leg of iteration $cur_i"
                     elif [[ "$cur_after" == "$cur_before" ]]; then cur_ended=no-progress
                     else cur_head="$cur_after"; fi
@@ -9146,7 +9164,7 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count && stop_requested != 1; cur
         printf 'fork-sandbox: review verdict: %s\n' "$run_dir/review-verdict-1.md"
         run_cost="$leg_cost"
         run_usage="$leg_usage"
-        run_error="$leg_error"
+        run_error="${leg_error:-$leg_harness_error}"
         if [[ "$run_cost" =~ ^-?[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?$ ]]; then
             run_cost_fmt="$(printf '%.6f' "$run_cost")"
         else
@@ -9474,6 +9492,9 @@ loop_findings() {
     printf 'origin:    %s\n' "$origin_repo"
     printf 'clone:     %s\n' "$clone_dir"
     printf 'exit:      %s\n' "$rc"
+    if [[ -n "$run_error" ]]; then
+        printf 'error:     %s\n' "$run_error"
+    fi
     printf 'commits:   %s\n' "$n_commits"
     if [[ -n "$run_cost_fmt" ]]; then
         printf 'cost:      $%s\n' "$run_cost_fmt"

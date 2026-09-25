@@ -679,6 +679,80 @@ pc_run nosvc --checkout ref-hostile --no-services
 lacks "--no-services still disables provision-ro" "--bind-ro-at" "$pc_flags"
 
 echo ""
+echo "== fs_harness_error =="
+
+he_dir="$scratch/harness-error"; mkdir -p "$he_dir"
+he() { fs_harness_error "$1" "$he_dir/$2"; }
+
+# codex: a spend cap ends the stream in error then turn.failed.
+printf '%s\n' '{"type":"thread.started","thread_id":"t"}' \
+    '{"type":"error","message":"You hit your spend cap for the fixture account."}' \
+    '{"type":"turn.failed","error":{"message":"You hit your spend cap for the fixture account."}}' \
+    > "$he_dir/codex-cap.jsonl"
+check "codex: a turn.failed is reported" \
+    "You hit your spend cap for the fixture account." "$(he codex codex-cap.jsonl)"
+
+# A trailing error with no turn.failed after it is reported too.
+printf '%s\n' '{"type":"error","message":"stream closed early"}' > "$he_dir/codex-error-only.jsonl"
+check "codex: a trailing error event is reported" "stream closed early" \
+    "$(he codex codex-error-only.jsonl)"
+
+# An error the run recovered from is not a failure.
+printf '%s\n' '{"type":"error","message":"Reconnecting... 1/5"}' \
+    '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}' \
+    > "$he_dir/codex-recovered.jsonl"
+check "codex: a turn.completed after an error means it recovered" "" \
+    "$(he codex codex-recovered.jsonl)"
+printf '%s\n' '{"type":"turn.failed","error":{"message":"first turn failed"}}' \
+    '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}' \
+    > "$he_dir/codex-failed-then-ok.jsonl"
+check "codex: a turn.completed after a turn.failed means it recovered" "" \
+    "$(he codex codex-failed-then-ok.jsonl)"
+
+# claude: the real shape of a top-level result event that ended in an API error
+# (captured from claude -p --output-format stream-json with a rejected key).
+printf '%s\n' '{"type":"system","subtype":"init","session_id":"s"}' \
+    '{"duration_api_ms":0,"stop_reason":"stop_sequence","session_id":"s","total_cost_usd":0,"terminal_reason":"api_error","is_error":true,"num_turns":1,"subtype":"success","api_error_status":401,"result":"Failed to authenticate. API Error: 401 API key is invalid.","type":"result","duration_ms":714}' \
+    > "$he_dir/claude-401.jsonl"
+check "claude: an is_error result event is reported" \
+    "Failed to authenticate. API Error: 401 API key is invalid." "$(he claude claude-401.jsonl)"
+
+# is_error inside a tool_result content block is an ordinary tool failure.
+printf '%s\n' '{"type":"user","message":{"content":[{"type":"tool_result","is_error":true,"content":"command not found"}]}}' \
+    '{"type":"result","subtype":"success","is_error":false,"result":"all done"}' \
+    > "$he_dir/claude-tool-error.jsonl"
+check "claude: a failed tool_result inside a successful run is not a harness error" "" \
+    "$(he claude claude-tool-error.jsonl)"
+
+# Without a top-level result event there is nothing to report, even with a
+# failed tool_result in the stream.
+printf '%s\n' '{"type":"user","message":{"content":[{"type":"tool_result","is_error":true,"content":"x"}]}}' \
+    > "$he_dir/claude-no-result.jsonl"
+check "claude: no result event reports nothing" "" "$(he claude claude-no-result.jsonl)"
+
+# An error result with no text falls back to the subtype rather than nothing.
+printf '%s\n' '{"type":"result","subtype":"error_max_turns","is_error":true}' \
+    > "$he_dir/claude-max-turns.jsonl"
+check "claude: an error result with no text names its subtype" \
+    "the session ended in an error (error_max_turns)" "$(he claude claude-max-turns.jsonl)"
+
+# Malformed lines never break it, and control characters and length are handled.
+printf '%s\n' 'not json at all {' '' '{"type":"turn.failed","error":{"message":"boom"}}' '{"truncated":' \
+    > "$he_dir/codex-malformed.jsonl"
+check "a malformed line is skipped" "boom" "$(he codex codex-malformed.jsonl)"
+printf '{"type":"turn.failed","error":{"message":"line one\\nline\\ttwo\\u001b[31m red"}}\n' \
+    > "$he_dir/codex-control.jsonl"
+long_msg="$(printf 'x%.0s' $(seq 1 400))"
+printf '{"type":"turn.failed","error":{"message":"%s"}}\n' "$long_msg" > "$he_dir/codex-long.jsonl"
+check "a message is flattened to one line with control characters stripped" \
+    "line one line two [31m red" "$(he codex codex-control.jsonl)"
+check "a long message is cut to 300 characters" "300" "$(he codex codex-long.jsonl | tr -d '\n' | wc -c)"
+
+check "pi is left to its session-file logic" "" "$(he pi codex-cap.jsonl)"
+check "a missing events file prints nothing" "" "$(he codex does-not-exist.jsonl)"
+check "an empty events file prints nothing" "" "$(: > "$he_dir/empty.jsonl"; he codex empty.jsonl)"
+
+echo ""
 echo "== fs_read_claude_credential =="
 
 # The Keychain is NOT addressed through $HOME, so overriding HOME does not

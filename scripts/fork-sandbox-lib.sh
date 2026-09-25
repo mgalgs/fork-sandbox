@@ -1248,6 +1248,49 @@ fs_harness_session_caps() {
     esac
 }
 
+# The provider's error message when a leg's event stream ENDS in a failure,
+# and nothing when it does not. A leg that dies in seconds on a spend cap or a
+# revoked token exits non-zero having written no result, and the cause lives
+# only in its stream; this lifts it out so the summary can say it.
+#
+#   codex   the last terminal event (turn.failed, turn.completed or error)
+#           decides: a turn.failed gives .error.message, a trailing error
+#           event gives .message, and a turn.completed after either means it
+#           recovered.
+#   claude  the last top-level "result" event, when is_error is true: its
+#           .result text, else .errors, else the subtype. An is_error on a
+#           tool_result content block is an ordinary tool failure and is
+#           never looked at -- only a top-level result event counts.
+#   pi      nothing: its failure is read from the session file by the caller.
+#
+# The message is provider text, so it is flattened to one line, stripped of
+# control characters (it reaches a terminal) and cut to 300 characters.
+# Malformed lines are skipped, never fatal. Args: harness, events file.
+fs_harness_error() {
+    local harness="$1" events="$2" pick
+    [[ -s "$events" ]] || return 0
+    case "$harness" in
+    codex)
+        pick='[.[] | select(.type == "turn.failed" or .type == "turn.completed" or .type == "error")]
+            | last // empty
+            | if .type == "turn.failed" then (.error.message // .message // "the turn failed")
+              elif .type == "error" then (.message // "the harness reported an error")
+              else empty end'
+        ;;
+    claude)
+        pick='[.[] | select(.type == "result")] | last // empty
+            | select(.is_error == true)
+            | ((.result | strings | select(length > 0))
+               // ((.errors // []) | map(tostring) | join("; ") | select(length > 0))
+               // "the session ended in an error (\(.subtype // "unknown"))")'
+        ;;
+    *) return 0 ;;
+    esac
+    jq -R -n -r '[inputs | fromjson? | select(type == "object")] | '"$pick"'
+        | tostring | gsub("[\u0000-\u001f\u007f]+"; " ")
+        | gsub("^ +| +$"; "") | .[0:300]' "$events" 2>/dev/null || true
+}
+
 # Discover which session id a --session-state run should be reported as
 # resumable under. Which harnesses get here at all, and whether the id is
 # discovered or was given up front, comes from fs_harness_session_caps

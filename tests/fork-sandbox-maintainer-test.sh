@@ -1618,6 +1618,108 @@ else
     no "no-remote origin: summary.txt notes the upstream was not set" "no run dir"
 fi
 
+printf '\n== a leg that dies on a provider error says why (codex) ==\n'
+
+# A codex leg that hits a spend cap exits 1 within seconds, writes no result,
+# and records the cause only in its event stream. summary.json, summary.txt,
+# `status --result` and the loop record must all carry it, not "wrote no
+# result". Both stubs stand in for the real harness behind claude-sandboxed,
+# which fronts codex too.
+codex_cap_stub="$(mktemp -d /var/tmp/claude-scratch/fs-maintainer-codex-cap.XXXXXX)"
+tmpdirs+=("$codex_cap_stub")
+cat > "$codex_cap_stub/claude-sandboxed" <<'STUB'
+#!/usr/bin/env bash
+set -uo pipefail
+clone_dir=""
+for a in "$@"; do
+    [[ -d "$a/.git" ]] && clone_dir="$a"
+done
+cat >/dev/null
+n=0
+[[ -f "$FAKE_COUNT_FILE" ]] && n="$(cat "$FAKE_COUNT_FILE")"
+n=$(( n + 1 ))
+printf '%s' "$n" > "$FAKE_COUNT_FILE"
+cap() {
+    printf '%s\n' '{"type":"thread.started","thread_id":"fixture"}' \
+        '{"type":"error","message":"You hit your spend cap for the fixture account."}' \
+        '{"type":"turn.failed","error":{"message":"You hit your spend cap for the fixture account."}}'
+}
+done_turn() { printf '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":1}}\n'; }
+case "${CAP_SCENARIO:-implement}:$n" in
+implement:1) cap; exit 1 ;;
+mntfix:1)
+    git -c user.email=t@fork-sandbox.invalid -c user.name=Tester \
+        -C "$clone_dir" commit --allow-empty -q -m "cap implement"
+    done_turn ;;
+mntfix:2)
+    printf 'FINDINGS\n\nfile.txt:1 a finding for the fix leg\n' \
+        > "$clone_dir/.git/maintainer-verdict.md"
+    done_turn ;;
+mntfix:3) cap; exit 1 ;;
+esac
+exit 0
+STUB
+chmod +x "$codex_cap_stub/claude-sandboxed"
+
+count_cap1="$(mktemp)"; tmpdirs+=("$count_cap1")
+out_cap1="$(HOME="$launcher_home" PATH="$codex_cap_stub:$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$real_cfg" \
+    CODEX_HOME="$real_codex_home" FORK_SANDBOX_BACKEND=fake-image \
+    FAKE_COUNT_FILE="$count_cap1" CAP_SCENARIO=implement \
+    timeout 60 "$launcher" --foreground --harness codex --model fixture-model \
+    --branch "sandbox-test-cap-impl-$$" "$proj" "$handoff" 2>&1)"
+rd_cap1="$(printf '%s\n' "$out_cap1" | sed -n 's/^  run dir:  *//p' | head -1)"
+if [[ -n "$rd_cap1" ]]; then
+    tmpdirs+=("$rd_cap1")
+    check "the failed codex session's exit code is the run's" "1" "$(cat "$rd_cap1/exit-code")"
+    check "summary.json carries the provider's error" \
+        "You hit your spend cap for the fixture account." \
+        "$(jq -r '.harness_error' "$rd_cap1/summary.json")"
+    contains "summary.txt names the error beneath the exit code" \
+        $'exit:      1\nerror:     You hit your spend cap for the fixture account.\ncommits:' \
+        "$(cat "$rd_cap1/summary.txt")"
+    status_out="$("$repo_dir/scripts/fork-sandbox-status.sh" --result "$rd_cap1" 2>&1)"
+    contains "status --result prints the harness error" \
+        "The session failed on a harness error: You hit your spend cap for the fixture account." \
+        "$status_out"
+    lacks "status --result no longer says the session wrote no result" \
+        "wrote no result" "$status_out"
+else
+    no "a codex run that hits a spend cap leaves a run dir" "$out_cap1"
+fi
+
+# A plain success carries no error: the field is null and no error line prints.
+rd_ok="$(run_real --harness claude)" && tmpdirs+=("$rd_ok")
+if [[ -n "$rd_ok" ]]; then
+    check "a clean run's summary.json harness_error is null" "null" \
+        "$(jq -r '.harness_error' "$rd_ok/summary.json")"
+    lacks "a clean run's summary.txt has no error line" $'\nerror:' "$(cat "$rd_ok/summary.txt")"
+fi
+
+# The same message reaches the loop record when the maintainer-fix leg dies:
+# the record used to say only that the leg "exited 1".
+count_cap2="$(mktemp)"; tmpdirs+=("$count_cap2")
+out_cap2="$(HOME="$launcher_home" PATH="$codex_cap_stub:$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$real_cfg" \
+    CODEX_HOME="$real_codex_home" FORK_SANDBOX_BACKEND=fake-image \
+    FAKE_COUNT_FILE="$count_cap2" CAP_SCENARIO=mntfix \
+    timeout 60 "$launcher" --foreground --harness codex --model fixture-model \
+    --maintainer-loop 2 --maintainer-model fixture-model \
+    --branch "sandbox-test-cap-mntfix-$$" "$proj" "$handoff" 2>&1)"
+rd_cap2="$(printf '%s\n' "$out_cap2" | sed -n 's/^  run dir:  *//p' | head -1)"
+if [[ -n "$rd_cap2" ]]; then
+    tmpdirs+=("$rd_cap2")
+    check "three legs ran: implement, maintainer, maintainer-fix" "3" "$(cat "$count_cap2")"
+    check "the loop ended on a harness error" "harness-error" \
+        "$(jq -r '.ended' "$rd_cap2/maintainer-loop.json")"
+    check "the loop record's detail carries the provider's error" \
+        "the fix leg of iteration 1 exited 1: You hit your spend cap for the fixture account." \
+        "$(jq -r '.detail' "$rd_cap2/maintainer-loop.json")"
+    contains "sandbox.log carries the same line" \
+        "the mntfix leg of iteration 1 exited 1: You hit your spend cap for the fixture account." \
+        "$(cat "$rd_cap2/sandbox.log")"
+else
+    no "a codex run whose maintainer-fix leg hits a spend cap leaves a run dir" "$out_cap2"
+fi
+
 printf '\n== fixture runs leave no handoff archives in the operator home ==\n'
 # Own-run-ids shape, not a before/after snapshot diff: a snapshot diff would
 # also catch a concurrent real run or another suite's fixtures archiving
