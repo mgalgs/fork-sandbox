@@ -12443,6 +12443,15 @@ else
     no "submit prints a run dir path and it exists" \
         "rc=$rundir_submit_rc out=$(cat "$rundir_submit_out")"
 fi
+# The scripts ConfigMap outgrows the 256 KiB last-applied annotation that a
+# client-side apply writes, so the Job stream must go server-side.
+if grep -q 'kind: Job' "$rundir_manifest" 2>/dev/null \
+    && grep -qE -- '(^| )apply -f - --server-side$' "$rundir_kubectl_log"; then
+    ok "submit applies the ConfigMap+Job stream server-side"
+else
+    no "submit applies the ConfigMap+Job stream server-side" \
+        "$(grep -F ' apply ' "$rundir_kubectl_log")"
+fi
 
 if [[ -n "$rundir_rd" && -d "$rundir_rd" ]]; then
     check "the run dir's basename is prefixed claude-fork-sandbox." \

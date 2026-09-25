@@ -5792,7 +5792,10 @@ EOF
         kubectl wait --for=condition=Ready "pod/$safe_name-claude-proxy" --timeout=120s
     fi
 
-    printf '%s\n' "$job_rendered" | kubectl apply -f -
+    # Server-side: client-side apply copies the whole object into the
+    # last-applied-configuration annotation, and the scripts ConfigMap
+    # (every script plus the rendered handoff) outgrows its 256 KiB cap.
+    printf '%s\n' "$job_rendered" | kubectl apply -f - --server-side
 
     echo "fork-sandbox-k8s: waiting for pod (job $safe_name) to be ready" >&2
     # The Job controller creates the pod asynchronously, and `kubectl wait`
