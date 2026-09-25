@@ -334,7 +334,7 @@ else
         out="$(run --workdir "$rw" --net sealed -- /opt/image-tool)"
         check "image-only absolute command" image-tool "$out"
         run --workdir "$rw" --net sealed --bind-ro "$ro" -- bash -c 'touch written; cat '"$ro"'/file; ! touch '"$ro"'/blocked' >/dev/null
-        if [[ -f "$rw/written" && "$(stat -c %u:%g "$rw/written")" == "$(id -u):$(id -g)" ]]; then ok "persistent writes are host-owned; read-only bind rejects writes"; else no "persistent writes are host-owned; read-only bind rejects writes"; fi
+        if [[ -f "$rw/written" && "$("$(command -v gstat || echo stat)" -c %u:%g "$rw/written")" == "$(id -u):$(id -g)" ]]; then ok "persistent writes are host-owned; read-only bind rejects writes"; else no "persistent writes are host-owned; read-only bind rejects writes"; fi
         run --workdir "$rw" --net sealed -- bash -c 'exit 42' >/dev/null 2>&1; check "exit 42 passes through" 42 "$?"
         run --workdir "$rw" --net sealed -- bash -c 'kill -9 $$' >/dev/null 2>&1; check "self-SIGKILL reports 137" 137 "$?"
         if run --workdir "$rw" --net sealed -- bash -c 'exec 3<>/dev/tcp/1.1.1.1/443' >/dev/null 2>&1; then no "sealed public egress fails"; else ok "sealed public egress fails"; fi
