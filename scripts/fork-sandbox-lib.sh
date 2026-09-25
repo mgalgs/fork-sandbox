@@ -562,6 +562,26 @@ fs_make_clone() {
     local repo="$1" branch="$2" dest="$3" start_sha="${4:-}" dissociate="${5:-false}" key value
     git clone --shared --quiet "$repo" "$dest" || return 1
     (cd "$dest" && git checkout --quiet -b "$branch" ${start_sha:+"$start_sha"}) || return 1
+    # A shared clone maps the origin's refs/heads/* to its own
+    # refs/remotes/origin/*, so "origin/dev" here would mean the host's LOCAL
+    # dev, while on the host it means the upstream's dev (refs/remotes/origin/
+    # dev), possibly far apart. Overwrite each clone origin/<b> the host also
+    # has a remote-tracking ref for, before any repack so those objects get
+    # packed too. Branches with no host origin/<b> keep the local-branch
+    # mapping. Objects resolve through the alternates; an sha that does not is
+    # skipped rather than failing the clone.
+    local sha ref updates=""
+    while read -r sha ref; do
+        [[ -n "$ref" && "$ref" != refs/remotes/origin/HEAD ]] || continue
+        if git -C "$dest" cat-file -e "${sha}^{commit}" 2>/dev/null; then
+            updates+="update $ref $sha"$'\n'
+        else
+            echo "fork-sandbox: warning: $ref ($sha) does not resolve in the clone; leaving its mapping alone" >&2
+        fi
+    done < <(git -C "$repo" for-each-ref --format='%(objectname) %(refname)' refs/remotes/origin/ 2>/dev/null)
+    if [[ -n "$updates" ]]; then
+        printf '%s' "$updates" | git -C "$dest" update-ref --stdin || return 1
+    fi
     if [[ "$dissociate" == true ]]; then
         git -C "$dest" repack -a -d --quiet || return 1
         rm -f "$dest/.git/objects/info/alternates"
@@ -1981,6 +2001,10 @@ missing file rather than a wrong path.
 
 That directory is the only writable thing here. Everything else in the sandbox
 is read-only or ephemeral.
+
+In this clone, \`origin/<b>\` is the host repo's own \`origin/<b>\` as of launch
+where it has one, and the host's local branch \`<b>\` otherwise. There is no
+network to fetch fresher refs.
 EOF
     if [[ -n "$inbox_dir" ]]; then
         # Same convention as the working-directory block above: name the

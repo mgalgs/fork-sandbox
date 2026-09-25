@@ -410,6 +410,10 @@ missing file rather than a wrong path.
 That directory is the only writable thing here. Everything else in the sandbox
 is read-only or ephemeral.
 
+In this clone, \`origin/<b>\` is the host repo's own \`origin/<b>\` as of launch
+where it has one, and the host's local branch \`<b>\` otherwise. There is no
+network to fetch fresher refs.
+
 ## Operator inbox
 
 The person who launched this run can send you further instructions while you
@@ -699,6 +703,10 @@ missing file rather than a wrong path.
 That directory is the only writable thing here. Everything else in the sandbox
 is read-only or ephemeral.
 
+In this clone, \`origin/<b>\` is the host repo's own \`origin/<b>\` as of launch
+where it has one, and the host's local branch \`<b>\` otherwise. There is no
+network to fetch fresher refs.
+
 ## Operator inbox
 
 The person who launched this run can send you further instructions while you
@@ -898,6 +906,10 @@ missing file rather than a wrong path.
 
 That directory is the only writable thing here. Everything else in the sandbox
 is read-only or ephemeral.
+
+In this clone, \`origin/<b>\` is the host repo's own \`origin/<b>\` as of launch
+where it has one, and the host's local branch \`<b>\` otherwise. There is no
+network to fetch fresher refs.
 
 ## Operator inbox
 

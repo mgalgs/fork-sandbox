@@ -192,6 +192,53 @@ n="$( (cd "$clone" && git config --local --list) | grep -c '^user\.' )"
 check "no user.* key is written at all" "0" "$n"
 export GIT_CONFIG_GLOBAL="$saved_global"
 
+printf '\n== origin/<b> in the clone means the host'"'"'s origin/<b> ==\n'
+
+# A shared clone maps the origin's LOCAL branches to its origin/*. A handoff
+# that says "rebase onto origin/dev" means the host's remote-tracking dev, so
+# where the host has one the clone's origin/dev must be that, not the host's
+# (possibly stale) local dev.
+origin="$(new_origin)"
+(cd "$origin" && git branch dev && git branch localonly)
+stale_dev="$(git -C "$origin" rev-parse dev)"
+env_commit "$origin" upstream-tip >/dev/null 2>&1
+upstream_dev="$(git -C "$origin" rev-parse HEAD)"
+git -C "$origin" update-ref refs/remotes/origin/dev "$upstream_dev"
+git -C "$origin" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/dev
+clone="$(new_clone_path)"
+out="$(fs_make_clone "$origin" "sandbox/mirror" "$clone" 2>&1)"
+check "fs_make_clone succeeds with remote-tracking refs on the host" "0" "$?"
+check "the mirroring is silent" "" "$out"
+check "the clone's origin/dev is the host's origin/dev" \
+    "$upstream_dev" "$(git -C "$clone" rev-parse refs/remotes/origin/dev)"
+if [[ "$(git -C "$clone" rev-parse refs/remotes/origin/dev)" != "$stale_dev" ]]; then
+    ok "the clone's origin/dev is not the host's stale local dev"
+else
+    no "the clone's origin/dev is not the host's stale local dev"
+fi
+check "a host branch with no origin/<b> still appears as the clone's origin/<b>" \
+    "$(git -C "$origin" rev-parse localonly)" \
+    "$(git -C "$clone" rev-parse refs/remotes/origin/localonly)"
+# origin/HEAD is a symref: fs_make_clone must not write the host's into it.
+check "the clone's origin/HEAD is what git clone made it" \
+    "refs/remotes/origin/$(git -C "$origin" symbolic-ref --short HEAD)" \
+    "$(git -C "$clone" symbolic-ref refs/remotes/origin/HEAD)"
+
+# A ref whose object the clone cannot read is skipped with a warning; the
+# clone still succeeds and everything else is still mirrored.
+git -C "$origin" update-ref refs/remotes/origin/ghost "$upstream_dev"
+printf '%s\n' "0123456789012345678901234567890123456789" \
+    > "$origin/.git/refs/remotes/origin/ghost"
+clone="$(new_clone_path)"
+out="$(fs_make_clone "$origin" "sandbox/ghost" "$clone" 2>&1)"
+check "an unresolvable origin/<b> does not fail the clone" "0" "$?"
+case "$out" in
+    *"refs/remotes/origin/ghost"*) ok "the skipped ref is named in a warning" ;;
+    *) no "the skipped ref is named in a warning" "output: $out" ;;
+esac
+check "the other refs are still mirrored" \
+    "$upstream_dev" "$(git -C "$clone" rev-parse refs/remotes/origin/dev)"
+
 printf '\n== the rest of the contract ==\n'
 
 # A fourth argument still starts the branch at that commit, and the seeding
