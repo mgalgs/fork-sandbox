@@ -79,6 +79,21 @@ PY
 pids+=("$!"); for _ in {1..50}; do [[ -S "$comma_name_sock" ]] && break; sleep .02; done
 refuses "rejects comma in the bridge socket filename" comma "$backend" --workdir "$w" --net sealed --image "$image" --bridge "$comma_name_sock=3002" -- true
 
+# is_refused_work_dir runs on realpaths, which macOS spells under /private.
+# Extracted and called directly, so these cases run on any host.
+eval "$(sed -n '/^is_refused_work_dir() {/,/^}/p' "$backend")"
+refused_case() { # label, path, want (refused|allowed), HOME
+    local got=allowed
+    HOME="$4" is_refused_work_dir "$2" && got=refused
+    check "$1" "$3" "$got"
+}
+refused_case "/private/etc is refused" /private/etc refused /home/u
+refused_case "/private/var/tmp is refused" /private/var/tmp refused /home/u
+refused_case "/private itself is refused" /private refused /home/u
+refused_case "a run clone under /private is allowed" /private/var/tmp/claude-scratch/forks/claude-fork-sandbox.x/clone/r allowed /home/u
+refused_case "a HOME spelled under /private is refused" /private/var/root refused /private/var/root
+refused_case "a plain project dir is allowed" /home/u/src/r allowed /home/u
+
 printf '\n== Darwin pin route program (no runtime required) ==\n'
 # The Darwin branch only runs on a Mac, which is why it has never executed in
 # any test. It does not need a Mac to run, though: every input it reads comes
@@ -225,6 +240,72 @@ else
     # branch itself remains unverified" is the honest statement.
 fi
 
+# The pin helper joins the container's network namespace, which exists only
+# once the container is RUNNING. Start runs in the background, so a container
+# slow to start (many mounts) used to lose the race and fail the helper with
+# "cannot join network namespace of a non running container".
+cat > "$dwn/bin/slowcli" <<EOF
+#!/usr/bin/env bash
+case "\$1 \$2" in
+  "network create") echo fake-net; exit 0 ;;
+  "network inspect") case "\$*" in *Gateway*) echo 203.0.113.1 ;; *Subnet*) echo 203.0.113.0/24 ;; esac; exit 0 ;;
+  "network rm") exit 0 ;;
+esac
+case "\$1" in
+  create) echo fake-container; exit 0 ;;
+  start)  sleep 0.5; touch "$dwn/running"; sleep 1; exit 0 ;;
+  wait)   echo 0; exit 0 ;;
+  rm)     exit 0 ;;
+  inspect) case "\$*" in *State.Running*) [[ -e "$dwn/running" ]] && echo true || echo false ;; *) echo 2026-01-01T00:00:00Z ;; esac; exit 0 ;;
+  run)
+    if [[ "\$*" == *NET_ADMIN* && ! -e "$dwn/running" ]]; then
+      echo "Error response from daemon: cannot join network namespace of a non running container" >&2; exit 125
+    fi
+    exit 0 ;;
+esac
+exit 0
+EOF
+chmod +x "$dwn/bin/slowcli"
+rm -f "$dwn/running"
+if PATH="$dwn/bin:$PATH" FORK_SANDBOX_CONTAINER_CLI="$dwn/bin/slowcli" \
+    "$backend" --workdir "$dwn/work-slow" --net pinned --image fake -- true >/dev/null 2>"$dwn/slow.err"; then
+    ok "pin helper waits for a slow-starting container"
+else
+    no "pin helper waits for a slow-starting container" "$(cat "$dwn/slow.err")"
+fi
+
+# A failing pin helper must say so on stderr. The stdin probe used to be
+# `exec 3< /dev/stdin 2>/dev/null`, and exec with no command keeps every
+# redirection, so stderr went to /dev/null for the rest of the script. The
+# run gets an openable stdin so the probe's first branch is the one taken.
+cat > "$dwn/bin/failcli" <<'EOF'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "network create") echo fake-net; exit 0 ;;
+  "network inspect") case "$*" in *Gateway*) echo 203.0.113.1 ;; *Subnet*) echo 203.0.113.0/24 ;; esac; exit 0 ;;
+  "network rm") exit 0 ;;
+esac
+case "$1" in
+  create) echo fake-container; exit 0 ;;
+  start)  sleep 1; exit 0 ;;
+  wait)   echo 0; exit 0 ;;
+  rm)     exit 0 ;;
+  inspect) case "$*" in *State.Running*) echo true ;; *) echo 2026-01-01T00:00:00Z ;; esac; exit 0 ;;
+  run) [[ "$*" == *NET_ADMIN* ]] && { echo "pin refused by fake" >&2; exit 125; }; exit 0 ;;
+esac
+exit 0
+EOF
+chmod +x "$dwn/bin/failcli"
+if PATH="$dwn/bin:$PATH" FORK_SANDBOX_CONTAINER_CLI="$dwn/bin/failcli" \
+    "$backend" --workdir "$dwn/work-fail" --net pinned --image fake -- true </dev/null >/dev/null 2>"$dwn/fail.err"; then
+    no "a failing pin helper fails the run" "exit 0"
+else
+    ok "a failing pin helper fails the run"
+fi
+contains_err="$(cat "$dwn/fail.err")"
+case "$contains_err" in *"pin helper failed"*) ok "a failing pin helper is reported on stderr" ;;
+    *) no "a failing pin helper is reported on stderr" "$contains_err" ;; esac
+
 printf '\n== runtime integration ==\n'
 runtime="${FORK_SANDBOX_CONTAINER_CLI:-docker}"
 if ! command -v "$runtime" >/dev/null 2>&1 || ! "$runtime" info >/dev/null 2>&1; then
@@ -239,6 +320,13 @@ else
         # shellcheck disable=SC2016  # expanded by bash inside the container
         out="$(run --workdir "$rw" --net sealed -- bash -c 'printf "%s|" "$HOME"; find "$HOME" -mindepth 1 -print -quit')"
         check "HOME path and emptiness" "$HOME|" "$out"
+        # On macOS mktemp returns /var/folders/..., whose realpath is
+        # /private/var/folders/...; the short spelling must resolve inside the
+        # container too. On Linux the two spellings are the same path.
+        # shellcheck disable=SC2016  # expanded by bash inside the container
+        out="$(run --workdir "$("$(command -v grealpath || echo realpath)" "$rw")" --net sealed -- bash -c 'touch "$1/seen" && echo yes' _ "$rw")"
+        check "work dir is reachable by its short /var spelling" "yes" "$out"
+        rm -f "$rw/seen"
         export FORK_SANDBOX_SECRET_SHOULD_NOT_LEAK=secret
         # shellcheck disable=SC2016  # expanded by bash inside the container
         out="$(run --workdir "$rw" --net sealed --setenv PASSED='right value' -- bash -c 'printf "%s|%s|%s" "${FORK_SANDBOX_SECRET_SHOULD_NOT_LEAK-unset}" "${IMAGE_BAKED_SECRET-unset}" "$PASSED"')"
@@ -246,7 +334,7 @@ else
         out="$(run --workdir "$rw" --net sealed -- /opt/image-tool)"
         check "image-only absolute command" image-tool "$out"
         run --workdir "$rw" --net sealed --bind-ro "$ro" -- bash -c 'touch written; cat '"$ro"'/file; ! touch '"$ro"'/blocked' >/dev/null
-        if [[ -f "$rw/written" && "$(stat -c %u:%g "$rw/written")" == "$(id -u):$(id -g)" ]]; then ok "persistent writes are host-owned; read-only bind rejects writes"; else no "persistent writes are host-owned; read-only bind rejects writes"; fi
+        if [[ -f "$rw/written" && "$("$(command -v gstat || echo stat)" -c %u:%g "$rw/written")" == "$(id -u):$(id -g)" ]]; then ok "persistent writes are host-owned; read-only bind rejects writes"; else no "persistent writes are host-owned; read-only bind rejects writes"; fi
         run --workdir "$rw" --net sealed -- bash -c 'exit 42' >/dev/null 2>&1; check "exit 42 passes through" 42 "$?"
         run --workdir "$rw" --net sealed -- bash -c 'kill -9 $$' >/dev/null 2>&1; check "self-SIGKILL reports 137" 137 "$?"
         if run --workdir "$rw" --net sealed -- bash -c 'exec 3<>/dev/tcp/1.1.1.1/443' >/dev/null 2>&1; then no "sealed public egress fails"; else ok "sealed public egress fails"; fi

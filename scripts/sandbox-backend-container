@@ -142,9 +142,14 @@ case "$NET_MODE" in pinned|sealed|unpinned) ;; "") echo "Error: --net is require
 [[ -n "$IMAGE" ]] || { echo "Error: --image is required (or set FORK_SANDBOX_CONTAINER_IMAGE)." >&2; exit 1; }
 
 is_refused_work_dir() {
-    local d="$1" p
-    case "$d" in /|"$HOME"|/home|/root|/boot|/var|/var/tmp|/var/tmp/claude-scratch|/var/tmp/claude-scratch/forks|/tmp|/opt|/srv|/mnt|/nix) return 0 ;; esac
-    for p in /usr /etc /bin /sbin /lib /lib64 /proc /sys /dev /run /boot; do [[ "$d" == "$p" || "$d" == "$p"/* ]] && return 0; done
+    local d p
+    [[ "$1" == /private ]] && return 0
+    # Callers pass realpaths, and macOS spells /etc, /var and /tmp as
+    # /private/etc and so on, so judge a /private path by both spellings.
+    for d in "$1" "${1#/private}"; do
+        case "$d" in /|"$HOME"|/home|/root|/boot|/var|/var/tmp|/var/tmp/claude-scratch|/var/tmp/claude-scratch/forks|/tmp|/opt|/srv|/mnt|/nix) return 0 ;; esac
+        for p in /usr /etc /bin /sbin /lib /lib64 /proc /sys /dev /run /boot; do [[ "$d" == "$p" || "$d" == "$p"/* ]] && return 0; done
+    done
     return 1
 }
 check_remap_dest() {
@@ -201,6 +206,14 @@ is_refused_work_dir "$WORK_DIR" && { echo "Error: refusing '$WORK_DIR' as the wo
 check_mount_path --workdir "$WORK_DIR" || exit 1
 
 MOUNTS=(--mount "type=bind,src=$WORK_DIR,dst=$WORK_DIR")
+# On macOS /var and /tmp live under /private, and callers pass the realpath,
+# while prompts name files by the short /var/tmp/... spelling. Mount the work
+# dir at that spelling too so both resolve inside the container.
+if [[ "$WORK_DIR" == /private/* ]]; then
+    work_dir_short="${WORK_DIR#/private}"
+    check_mount_path --workdir "$work_dir_short" || exit 1
+    MOUNTS+=(--mount "type=bind,src=$WORK_DIR,dst=$work_dir_short")
+fi
 for d in "${BIND_RO[@]}"; do [[ -e "$d" ]] || { echo "Error: --bind-ro '$d' does not exist." >&2; exit 1; }; s="$("$FS_REALPATH" "$d")"; r="$("$FS_REALPATH" -s "$d")"; check_mount_path --bind-ro "$s" && check_mount_path --bind-ro "$r" || exit 1; MOUNTS+=(--mount "type=bind,src=$s,dst=$r,readonly"); done
 for d in "${BIND_RW[@]}"; do
     [[ -e "$d" ]] || { echo "Error: --bind-rw '$d' does not exist." >&2; exit 1; }; r="$("$FS_REALPATH" "$d")"
@@ -426,7 +439,9 @@ if [[ "$NET_MODE" == pinned ]]; then
     # access() on the resolved path, which answers correctly for a closed fd 0
     # but says "readable" for a socket that then fails to open. A pinned run
     # must not depend on the caller having bothered to give us a usable stdin.
-    if exec 3< /dev/stdin 2>/dev/null; then
+    # The group scopes 2>/dev/null to the probe; on exec itself it would
+    # silence stderr for the rest of this script.
+    if { exec 3< /dev/stdin; } 2>/dev/null; then
         "$CLI" start --attach --interactive "$CONTAINER" <&3 &
         attach_pid=$!
         exec 3<&-
@@ -434,6 +449,14 @@ if [[ "$NET_MODE" == pinned ]]; then
         "$CLI" start --attach --interactive "$CONTAINER" < /dev/null &
         attach_pid=$!
     fi
+    # The helper joins the container's network namespace, which exists only
+    # once start has reached running. Start is in the background, so wait for
+    # it: a container with many mounts is slow enough to lose that race.
+    for _ in $(seq 1 100); do
+        [[ "$("$CLI" inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null)" == true ]] && break
+        kill -0 "$attach_pid" 2>/dev/null || break
+        sleep 0.1
+    done
     "$CLI" run --rm --network "container:$CONTAINER" --cap-add=NET_ADMIN --user 0 --entrypoint /bin/bash "$IMAGE" -c "$routes" || { echo "Error: pin helper failed; command was not run." >&2; exit 1; }
     wait "$attach_pid" || true
 else
