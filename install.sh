@@ -294,6 +294,8 @@ PORCELAIN=(
     agent-sandboxed
     build-sandbox-image.sh
     claude-sandboxed
+    context-nudge.py          # UserPromptSubmit hook command: settings.json invokes it by bare name
+    context-usage.sh
     ensure-scratch-dirs.sh    # UserPromptSubmit hook command: settings.json invokes it by bare name
     fork-sandbox
     fork-sandbox-fleet.sh
@@ -312,6 +314,7 @@ PORCELAIN=(
     lane-mail.sh
     pi-sandboxed
     sandbox-run-log.py        # fork-sandbox.sh looks it up on PATH before falling back to this hardcoded path
+    statusline-stash.sh       # statusLine command: settings.json invokes it by bare name
 )
 
 PLUMBING=(
