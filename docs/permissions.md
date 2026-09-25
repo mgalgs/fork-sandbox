@@ -46,8 +46,10 @@ script by an absolute path, that spelling needs its own rule. The
 `additionalDirectories` entry is what lets a session write a handoff file
 without prompting; without it the write prompts even though the launch does not.
 
-Nothing else here should be blanket-approved. In particular `claude-sandboxed`,
-`agent-sandboxed` and `sandbox-backend-bwrap` take `--bind-ro` and `--bind-rw`,
+Nothing else in this section should be blanket-approved (the lane-mail rules
+further down are the only other exception, argued separately). In particular
+`claude-sandboxed`, `agent-sandboxed` and `sandbox-backend-bwrap` take
+`--bind-ro` and `--bind-rw`,
 which mount arbitrary host paths into the sandbox — approving those hands over
 exactly the power the sandbox exists to withhold. The backend is the sharpest
 of those three, because it is the one that actually performs the mount and it
@@ -82,9 +84,9 @@ dangerous primitives, and each is constrained:
 
 ## lane-mail and lane-mail-watch
 
-Two more scripts are safe to blanket-approve, for the same reason as the
-three above: their inputs cannot pick a path outside what the script itself
-already fixes.
+Two more scripts are safe to blanket-approve, though the argument for
+`lane-mail.sh` is not quite the one above: it fixes *where it writes*, not
+what it reads. See below.
 
 ```json
 {
@@ -115,6 +117,19 @@ root from colliding with the unrelated fleet mail store. `register` and
 `unregister` only ever write the calling session's own
 `/tmp/claude-$UID/lane-mail-lanes/<session-id>` file, named from
 `$CLAUDE_CODE_SESSION_ID`, so one session cannot touch another's registration.
+
+That fixed root bounds where this writes, not what it reads. `send` and
+`reply` pass `"$@"` straight through to `fork-sandbox-mail.sh`, whose
+`--body <file>` and `--attach <file>` read any path the caller can already
+read, and whose k8s grant flags (`--allow-namespace`, `--context-ro`,
+`--context-secret`) ride along on `send` too. So approving this script
+approves that whole surface, not just the fixed store. It is still a
+reasonable blanket approval — the session already has the read access and
+grant authority these flags exercise some other way, the files this script
+writes are 0600 via `mktemp`, and no networked sandbox or postmaster reads
+from this root — but that is a weaker, different claim than "cannot pick a
+path outside what the script fixes," and it is the one you are actually
+approving.
 
 **`lane-mail-watch.sh` — read-only.** It only ever calls `lane-mail.sh inbox
 <lane>` in a loop and prints what comes back. It mutates nothing.

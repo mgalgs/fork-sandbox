@@ -86,25 +86,21 @@ set -euo pipefail
 
 script_dir="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 
-# The lib belongs to fork-sandbox (github.com/mgalgs/fork-sandbox), which is a
-# separate checkout, so it is NOT beside this script. Find it where install.sh
-# puts it, and resolve the symlink so the rest of that repo's scripts are
-# reachable from the same directory.
+# fork-task.sh now lives in fork-sandbox's own scripts/ (this repo,
+# github.com/mgalgs/fork-sandbox), beside fork-sandbox-lib.sh, so the first
+# candidate below is the one that matches in a normal install: this script
+# is reached via a symlink from install.sh's PORCELAIN link (or run in
+# place from a checkout), and either way readlink -f resolves script_dir to
+# this scripts/ directory. The other candidates are defensive fallbacks --
+# a copy of this script running somewhere else on PATH, or a
+# ~/.claude/scripts/ layout -- kept in case fork-sandbox-lib.sh is not
+# beside it for some reason; they are not expected to fire in the normal
+# case.
 #
-# The PATH-shaped candidates below stopped being enough once fork-sandbox
-# split its scripts into porcelain (symlinked onto PATH by its install.sh)
-# and plumbing (not) -- the lib is plumbing, so on any machine whose
-# install.sh has run since that split, none of them resolve and every
-# fork-task invocation dies, not just --sandboxed. Anchor on the porcelain
-# entry point, which is on PATH by definition, and take the lib from beside
-# its resolved path: both live in that checkout's scripts directory.
-#
-# "Not just --sandboxed" is worth spelling out, because the error below used
-# to blame that flag: fs_reject_unsafe_chars guards the paths and values this
-# script records and interpolates, on all three passes, including the prompt
-# file only the NON-sandboxed path builds. So the source stays eager and the
-# failure stays unconditional -- the alternative is a second copy of a
-# security check, which is the drift the shared lib exists to prevent.
+# The source stays eager and the failure below unconditional -- both the
+# --sandboxed and NON-sandboxed paths call into fs_reject_unsafe_chars from
+# the lib, so there is no path that can skip needing it, and no reason to
+# duplicate that check instead of sharing it.
 fork_sandbox_lib=""
 fork_sandbox_porcelain="$(command -v fork-sandbox.sh 2>/dev/null || true)"
 fork_sandbox_beside=""
@@ -123,9 +119,8 @@ done
 if [[ -z "$fork_sandbox_lib" ]]; then
     echo "Error: cannot find fork-sandbox-lib.sh, which every fork needs" >&2
     echo "(--sandboxed or not) for its shared input checks." >&2
-    echo "Install fork-sandbox: https://github.com/mgalgs/fork-sandbox" >&2
-    echo "Already installed? Check that fork-sandbox.sh is on your PATH --" >&2
-    echo "the lib is taken from beside its resolved path." >&2
+    echo "It should be beside this script in fork-sandbox's scripts/ --" >&2
+    echo "check that your fork-sandbox checkout is not missing files." >&2
     exit 1
 fi
 # shellcheck source=/dev/null

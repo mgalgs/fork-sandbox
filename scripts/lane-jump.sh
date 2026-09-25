@@ -9,8 +9,7 @@
 #   --list      print the rows (tab-separated: lane, target, window, cwd,
 #               pane_id) and exit -- no fzf, for scripting and tests
 #
-# Meant to be bound to a key as a display-popup (binding lives in conf-files,
-# not here), e.g.:
+# Meant to be bound to a key as a display-popup, e.g.:
 #   bind @ display-popup -E -w 80% -h 50% "~/.claude/scripts/lane-jump.sh"
 #
 # Joins two independently-written, independently-stale /tmp registries:
@@ -37,7 +36,7 @@ PANES_DIR="${LANE_JUMP_PANES_DIR:-/tmp/claude-tmux-panes-$(id -u)}"
 TMUX_BIN="${LANE_JUMP_TMUX:-tmux}"
 
 usage() {
-    sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 # Keyed by pane_id with every non-alphanumeric char turned into '_' -- must
