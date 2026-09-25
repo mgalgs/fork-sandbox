@@ -23,8 +23,11 @@ writing a detailed handoff so nothing gets dropped.
 2. **Write the handoff doc** straight to a file with the Write tool — do NOT
    run `mktemp` first. Pre-creating the file makes the Write tool demand a
    redundant Read of the empty file, and a guaranteed-unique name isn't needed
-   (overwriting a spent handoff is harmless). `/var/tmp/claude-scratch/` always
-   exists, so just Write to a descriptive path like
+   (overwriting a spent handoff is harmless). `/var/tmp/claude-scratch/`
+   always exists: `install.sh` creates it via `ensure-scratch-dirs.sh`, and
+   that same script, wired as a `UserPromptSubmit` hook (see
+   docs/permissions.md), recreates it on every prompt if anything ever
+   removed it. Just Write to a descriptive path like
    `/var/tmp/claude-scratch/claude-handoff-<slug>.md` in one step.
 
    Structure the handoff as:
