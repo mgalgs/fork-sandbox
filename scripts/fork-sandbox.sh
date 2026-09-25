@@ -3126,9 +3126,9 @@ if [[ "$k8s_mode" == true ]]; then
     # with internet access, and project_path is what gets pushed into the
     # pod, so both need the same constraint here that the local path enforces
     # for the same reason -- see fs_require_scratch_handoff and
-    # fs_require_src_project in fork-sandbox-lib.sh.
+    # fs_require_project_root in fork-sandbox-lib.sh.
     fs_require_scratch_handoff "$handoff_file" || exit 1
-    fs_require_src_project "$project_path" || exit 1
+    fs_require_project_root "$project_path" "$config_dir" || exit 1
 
     # --session-state, --resume-session and --session-id: the identical
     # check the local path applies further down, run here so a --k8s run
@@ -3866,8 +3866,9 @@ fi
 #     access, so an unconstrained path is arbitrary-file-read plus
 #     exfiltration. Handoffs live in the scratch dir, where sessions
 #     stage them on purpose.
-#   - The project is CLONED INTO the sandbox, same channel. Repos under
-#     ~/src are the working material; nothing else is.
+#   - The project is CLONED INTO the sandbox, same channel. Repos under the
+#     configured project roots (PROJECT_ROOTS in $config_dir/projects.env,
+#     default ~/src) are the working material; nothing else is.
 #   - --sandbox-args passes through to claude-sandboxed, where --bind-ro
 #     would mount any host path — ~/.ssh, say — into that same sandbox.
 #     Only --unpin-egress may pass; the script adds every bind it needs
@@ -3893,7 +3894,7 @@ if [[ "$handoff_real" == "$FS_SCRATCH_ROOT"/forks/* || "$handoff_real" == "$FS_S
     echo "exists to stop. Stage the handoff in the scratch root itself." >&2
     exit 1
 fi
-fs_require_src_project "$project_path" || exit 1
+fs_require_project_root "$project_path" "$config_dir" || exit 1
 # --context-ro is the reviewed home for the one extra bind a caller may
 # need: context a host-side script gathered for the session to read. The
 # path constraint is what keeps it from becoming the --bind-ro primitive

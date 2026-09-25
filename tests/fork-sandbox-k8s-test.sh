@@ -99,7 +99,7 @@
 #     exception, the readlink -f bootstrap that runs before the library
 #     is sourced.
 #   - fork-sandbox.sh --k8s: the two new lib functions it shares with the
-#     local path (fs_require_scratch_handoff, fs_require_src_project), that
+#     local path (fs_require_scratch_handoff, fs_require_project_root), that
 #     it defaults a bare --k8s to --harness pi, that a model-less --k8s run
 #     passes the launcher on ANY install -- on a legacy install the
 #     refusal is fork-sandbox-k8s.sh's own run verb, and on an endpoints
@@ -9036,7 +9036,7 @@ check "skipped: ended=skipped" "skipped" "$(rl_json "$out" '.ended')"
 check "skipped: no iterations ran" "0" "$(rl_json "$out" '.iterations | length')"
 
 
-printf '\n== fs_require_scratch_handoff / fs_require_src_project (fork-sandbox-lib.sh) ==\n'
+printf '\n== fs_require_scratch_handoff / fs_require_project_root (fork-sandbox-lib.sh) ==\n'
 # Unit-level, sourcing the lib directly -- the same level fork-sandbox-clone-
 # test.sh tests fs_make_clone at. These are the two checks that let
 # fork-sandbox.sh be blanket-approved as its own security boundary, shared
@@ -9046,6 +9046,11 @@ printf '\n== fs_require_scratch_handoff / fs_require_src_project (fork-sandbox-l
 lib_test_scratch_dir="$(mktemp -d /var/tmp/claude-scratch/fs-k8s-flag-lib-test.XXXXXX)"
 tmpdirs+=("$lib_test_scratch_dir")
 err="$(mktemp)"
+# No projects.env under this scratch config dir, so the default (exactly
+# $HOME/src) applies -- these cases exercise the default, not the config
+# file (that gets its own suite, fork-sandbox-project-roots-test.sh).
+lib_test_config_dir="$(mktemp -d /var/tmp/claude-scratch/fs-k8s-flag-lib-test-cfg.XXXXXX)"
+tmpdirs+=("$lib_test_config_dir")
 
 if fs_require_scratch_handoff "$lib_test_scratch_dir/handoff.md" 2>"$err"; then
     ok "a scratch-dir handoff accepted"
@@ -9070,12 +9075,12 @@ else
         *) no "a handoff under forks/ is refused" "$(cat "$err")" ;;
     esac
 fi
-if fs_require_src_project "$HOME/src/anything" 2>"$err"; then
+if fs_require_project_root "$HOME/src/anything" "$lib_test_config_dir" 2>"$err"; then
     ok "a ~/src project is accepted"
 else
     no "a ~/src project is accepted" "$(cat "$err")"
 fi
-if fs_require_src_project "/tmp/outside-src" 2>"$err"; then
+if fs_require_project_root "/tmp/outside-src" "$lib_test_config_dir" 2>"$err"; then
     no "a project outside ~/src is refused"
 else
     case "$(cat "$err")" in
@@ -9093,12 +9098,14 @@ tmpdirs+=("$srclink_home")
 mkdir -p "$srclink_home/home" "$srclink_home/vol/src/proj" "$srclink_home/outside/evil"
 ln -s "$srclink_home/vol/src" "$srclink_home/home/src"
 ln -s "$srclink_home/outside/evil" "$srclink_home/vol/src/escape"
-if HOME="$srclink_home/home" fs_require_src_project "$srclink_home/home/src/proj" 2>"$err"; then
+if HOME="$srclink_home/home" fs_require_project_root "$srclink_home/home/src/proj" \
+    "$srclink_home/home/.config/fork-sandbox" 2>"$err"; then
     ok "a project under a symlinked ~/src is accepted"
 else
     no "a project under a symlinked ~/src is accepted" "$(cat "$err")"
 fi
-if HOME="$srclink_home/home" fs_require_src_project "$srclink_home/home/src/escape" 2>"$err"; then
+if HOME="$srclink_home/home" fs_require_project_root "$srclink_home/home/src/escape" \
+    "$srclink_home/home/.config/fork-sandbox" 2>"$err"; then
     no "a link inside a symlinked ~/src that points outside is refused"
 else
     case "$(cat "$err")" in
@@ -9147,7 +9154,7 @@ rm -f "$err_file"
 
 printf '\n== fork-sandbox.sh --k8s (fixture config, no cluster) ==\n'
 # Real fixtures: unlike --dry-run's own local exit, fs_require_scratch_handoff
-# and fs_require_src_project run for every --k8s call, including a --dry-run
+# and fs_require_project_root run for every --k8s call, including a --dry-run
 # one, so a placeholder path is refused rather than ignored. Only the flag-
 # refusal cases below get away with a placeholder -- each fails on its own
 # flag before reaching these checks. new_src_project mirrors fork-sandbox-
@@ -9174,7 +9181,7 @@ new_src_project() {
 }
 k8s_flag_proj="$(new_src_project)"; tmpdirs+=("$k8s_flag_proj")
 # A project fixture rooted under claude_home's own $HOME/src, not the real
-# one -- fs_require_src_project checks the project path against $HOME/src
+# one -- fs_require_project_root checks the project path against $HOME/src
 # at call time, so a --harness claude case run with HOME="$claude_home" (to
 # pick up its fixture credential) needs a project under that same fixture
 # HOME, not the real one k8s_flag_proj lives under.
@@ -9454,7 +9461,7 @@ refuses "--k8s --prompts-dir is refused as not yet supported" \
 # --review-loop is carried through, not refused -- the cluster analogue of
 # fork-sandbox.sh's own local loop, running pod-side. Real fixtures
 # required (k8s_flag_proj / k8s_flag_handoff): --dry-run's own validation
-# runs after fs_require_scratch_handoff / fs_require_src_project, unlike
+# runs after fs_require_scratch_handoff / fs_require_project_root, unlike
 # the flag-refusal cases above, which fail on their own flag first and so
 # get away with a placeholder.
 if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
@@ -12989,7 +12996,7 @@ printf '\n== fork-sandbox.sh --k8s: --task-meta is forwarded, not refused ==\n'
 # k8s_flag_proj/k8s_flag_handoff (set up above, under $HOME/src and
 # /var/tmp/claude-scratch respectively) are required here: unlike a direct
 # fork-sandbox-k8s.sh call, fs_require_scratch_handoff and
-# fs_require_src_project run for every --k8s call, dry-run included.
+# fs_require_project_root run for every --k8s call, dry-run included.
 taskmeta_out="$(newdir)/dispatch.yaml"; tmpdirs+=("$(dirname "$taskmeta_out")")
 if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
     --harness pi --branch fs-k8s-flag-test-taskmeta --model moonshotai/kimi-k3 \

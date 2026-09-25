@@ -513,23 +513,98 @@ fs_pm_find_live_run() {
     return 1
 }
 
-# Real path against real path: ~/src may itself be a symlink (the cluster
-# postmaster's pod links it onto its data volume), and a project inside it
-# resolves to the link's target. A link INSIDE ~/src that points outward
-# still resolves outside the resolved ~/src, so it is still refused.
-fs_require_src_project() {
-    local project_path="$1" real src_real
-    real="$("$FS_REALPATH" -m "$project_path")"
-    src_real="$("$FS_REALPATH" -m "$HOME/src")"
-    if [[ "$real" != "$src_real"/* && "$real" != "$src_real" ]]; then
-        echo "Error: the project must live under ~/src — got '$real'." >&2
-        echo "An unattended agent gets the whole clone, and for most harnesses it" >&2
-        echo "gets internet too, so which repos may be handed over is a security" >&2
-        echo "boundary. Work from a checkout under ~/src, or launch" >&2
-        echo "claude-sandboxed by hand for something else." >&2
-        return 1
+# The project roots are configurable per machine via $config_dir/projects.env
+# (PROJECT_ROOTS, colon-separated; read with fs_read_env_value, never
+# `source`d). An absent file, absent key, or empty value all mean the
+# default: exactly $HOME/src.
+#
+# Real path against real path: a root may itself be a symlink (the cluster
+# postmaster's pod links ~/src onto its data volume), and a project inside it
+# resolves to the link's target. A link INSIDE a root that points outward
+# still resolves outside the resolved root, so it is still refused.
+#
+# A misconfigured projects.env is refused loudly rather than silently
+# widening the boundary: a relative entry, an entry resolving to '/', or an
+# entry resolving to $HOME's real path or an ancestor of it (which would
+# admit ~/.ssh and ~/.config/fork-sandbox, holding tokens) all abort the run.
+fs_require_project_root() {
+    local project_path="$1" config_dir="$2" env_file raw is_default=0
+    local -a root_reals=()
+    local entry expanded real home_real root_real
+
+    env_file="$config_dir/projects.env"
+    raw="$(fs_read_env_value "$env_file" PROJECT_ROOTS || true)"
+
+    home_real="$("$FS_REALPATH" -m "$HOME")"
+
+    if [[ -z "$raw" ]]; then
+        is_default=1
+        root_reals=("$("$FS_REALPATH" -m "$HOME/src")")
+    else
+        local -a entries=()
+        IFS=':' read -ra entries <<< "$raw"
+        for entry in "${entries[@]}"; do
+            [[ -z "$entry" ]] && continue
+            expanded="$entry"
+            # A literal string-prefix match, not shell tilde expansion (which
+            # never runs here -- PROJECT_ROOTS values reach this function
+            # through fs_read_env_value, not word splitting).
+            # shellcheck disable=SC2088
+            if [[ "$expanded" == "~/"* ]]; then
+                expanded="$HOME/${expanded#"~/"}"
+            elif [[ "$expanded" == "~" ]]; then
+                expanded="$HOME"
+            fi
+            if [[ "$expanded" != /* ]]; then
+                echo "Error: PROJECT_ROOTS in '$env_file' names '$entry', which is not" >&2
+                echo "an absolute path. Every entry must be absolute (a leading ~/ or a" >&2
+                echo "bare ~ is expanded to \$HOME)." >&2
+                return 1
+            fi
+            root_real="$("$FS_REALPATH" -m "$expanded")"
+            if [[ "$root_real" == "/" ]]; then
+                echo "Error: PROJECT_ROOTS in '$env_file' names '$entry', which resolves" >&2
+                echo "to '/'. That would admit any directory on the machine, defeating" >&2
+                echo "the point of the boundary." >&2
+                return 1
+            fi
+            if [[ "$root_real" == "$home_real" || "$home_real" == "$root_real"/* ]]; then
+                echo "Error: PROJECT_ROOTS in '$env_file' names '$entry', which resolves" >&2
+                echo "to '$root_real', \$HOME's real path or an ancestor of it. That" >&2
+                echo "would admit ~/.ssh and ~/.config/fork-sandbox, which holds tokens." >&2
+                return 1
+            fi
+            root_reals+=("$root_real")
+        done
     fi
-    return 0
+
+    real="$("$FS_REALPATH" -m "$project_path")"
+    for root_real in "${root_reals[@]}"; do
+        if [[ "$real" == "$root_real" || "$real" == "$root_real"/* ]]; then
+            return 0
+        fi
+    done
+
+    if (( is_default )); then
+        echo "Error: the project must live under ~/src — got '$real'." >&2
+    else
+        echo "Error: the project must live under one of the configured roots —" >&2
+        echo "got '$real'. Configured roots:" >&2
+        for root_real in "${root_reals[@]}"; do
+            echo "  - $root_real" >&2
+        done
+    fi
+    echo "An unattended agent gets the whole clone, and for most harnesses it" >&2
+    echo "gets internet too, so which repos may be handed over is a security" >&2
+    if (( is_default )); then
+        echo "boundary. Work from a checkout under ~/src, or launch" >&2
+    else
+        echo "boundary. Work from a checkout under one of the roots above, or launch" >&2
+    fi
+    echo "claude-sandboxed by hand for something else." >&2
+    echo "To allow another directory, add it to PROJECT_ROOTS in" >&2
+    echo "$config_dir/projects.env (colon-separated)." >&2
+    return 1
 }
 
 fs_warn_if_dirty() {
