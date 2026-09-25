@@ -1713,8 +1713,8 @@ leg gets fresh hook state under `/tmp`, because `/tmp` persists across legs
 in a pod, unlike a local leg's tmpfs. The hand-off is moved out of the
 outbox to `/work/handoff-N.md`, so it is never harvested as mail. A
 continuation (other than the first) that hands off without moving the
-branch ends the chain as `stalled` rather than forking another leg from
-it, its hand-off kept at `/work/handoff-stalled-N.md`. The session
+branch or writing to its outbox ends the chain as `stalled` rather than
+forking another leg from it, its hand-off kept at `/work/handoff-stalled-N.md`. The session
 snapshot runs after the LAST continuation, so the next wake resumes the
 last continuation's transcript.
 
@@ -1723,7 +1723,8 @@ last continuation's transcript.
 `refresh.json` and `refresh.log` into the evidence directory, and
 `summary.json` gains `refresh` (`none`, `empty-outbox`, `cap`,
 `no-handoff`, `leg-error` or `stalled` -- a continuation leg, other than
-the first, left a hand-off without moving the branch) and `continuations`
+the first, left a hand-off without moving the branch or writing to its
+outbox) and `continuations`
 (leg, exit, handoff, handoff_stale). A run with refresh disabled reports
 `none` and `[]`; an enabled run whose `refresh.json` did not come back
 leaves both keys absent and warns. There is no per-continuation cost: k8s

@@ -460,7 +460,8 @@ cat > "$stub_bin/claude-sandboxed" <<'STUB'
 # almost always committed something first, and the stall-stop machinery
 # needs a way to tell a leg that DIDN'T apart from one that did.
 # FAKE_NOCOMMIT_LEGS opts a leg out of that default commit, to simulate a
-# stall.
+# stall. FAKE_OUTBOX_LEGS makes a leg write reply-<n>.md into the outbox (the
+# progress a seat that never commits makes), before its hand-off.
 set -uo pipefail
 
 outbox=""
@@ -536,6 +537,9 @@ elif [[ "${FAKE_HANDOFF_LEGS:-}" == "all" || "$handoff_legs" == *",$n,"* ]]; the
                 && printf 'leg %s\n' "$n" >> fake-refresh-progress.txt \
                 && git add fake-refresh-progress.txt \
                 && git commit -q -m "fake progress from leg $n" ) >/dev/null 2>&1
+        fi
+        if [[ "${FAKE_OUTBOX_LEGS:-}" == "all" ]] || [[ ",${FAKE_OUTBOX_LEGS:-}," == *",$n,"* ]]; then
+            printf 'reply from leg %s\n' "$n" > "$outbox/reply-$n.md"
         fi
         printf 'HANDOFF from leg %s\n' "$n" > "$outbox/handoff.md"
         # The host's stale-hand-off backstop compares this hand-off's mtime
@@ -617,6 +621,7 @@ run_real() {
         FAKE_ADDENDUM_LEGS="${FAKE_ADDENDUM_LEGS:-}" \
         FAKE_MAIL_BANNER_LEGS="${FAKE_MAIL_BANNER_LEGS:-}" \
         FAKE_NOCOMMIT_LEGS="${FAKE_NOCOMMIT_LEGS:-}" \
+        FAKE_OUTBOX_LEGS="${FAKE_OUTBOX_LEGS:-}" \
         FAKE_CONTEXT_WINDOW="${FAKE_CONTEXT_WINDOW:-}" \
         timeout 60 "$launcher" --foreground --harness claude --branch "$branch_name" "$@" \
         "$proj" "$handoff" 2>&1)"
@@ -1041,6 +1046,24 @@ if [[ -n "$rd" ]]; then
         "HANDOFF from leg 2" "$(cat "$rd/handoff-stalled-2.md" 2>/dev/null)"
     check "a stalled continuation: no third leg's record exists" \
         "no" "$([[ -f "$rd/handoff-2.md" ]] && echo yes || echo no)"
+fi
+
+# -- the mirror: a continuation leg that commits nothing but writes a file
+# into the outbox (a review or reply seat's kind of work) is progress, not a
+# stall -- the chain goes on to leg 3, which hands off nothing.
+count_file="$(mktemp)"; tmpdirs+=("$count_file")
+FAKE_NOCOMMIT_LEGS=2
+FAKE_OUTBOX_LEGS=2
+rd="$(run_real "$proj" "$count_file" "1,2" "1,2" --refresh-at 0.5)"
+FAKE_NOCOMMIT_LEGS=""
+FAKE_OUTBOX_LEGS=""
+[[ -n "$rd" ]] && tmpdirs+=("$rd")
+if [[ -n "$rd" ]]; then
+    check "an outbox-writing continuation: a third leg ran" "3" "$(cat "$count_file")"
+    check "an outbox-writing continuation: not ended as stalled" \
+        "empty-outbox" "$(jq -r '.refresh' "$rd/summary.json" 2>/dev/null)"
+    check "an outbox-writing continuation: no stalled record exists" \
+        "no" "$([[ -f "$rd/handoff-stalled-2.md" ]] && echo yes || echo no)"
 fi
 
 # -- a leg that reports a different context window than --refresh-at assumed:

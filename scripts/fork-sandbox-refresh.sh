@@ -95,19 +95,36 @@ fs_refresh_handoff_stale() {
     [[ -f "$1/.git/logs/HEAD" && "$1/.git/logs/HEAD" -nt "$2" ]]
 }
 
+# Deterministic signature of every regular file under an outbox dir except
+# the top-level handoff.md (the waiting hand-off itself). cksum, not a
+# listing: a seat can rewrite a file it already wrote, and that is progress
+# too. POSIX find and cksum only, so the local runner works on macOS. A
+# missing or empty dir prints nothing. $1 the outbox dir.
+fs_refresh_outbox_sig() {
+    local dir="$1"
+    [[ -d "$dir" ]] || return 0
+    { find "$dir" -type f ! -path "$dir/handoff.md" -exec cksum {} + \
+        | LC_ALL=C sort; } 2> /dev/null || true
+}
+
 # True iff a CONTINUATION leg's hand-off is a stall: the leg number that
 # wrote it is >= 2 (leg 1, the first coding leg, may legitimately hand off
-# without committing once -- a survey leg), both heads are non-empty, and
-# they are equal, meaning the leg that just ran left a hand-off without
-# moving the branch. $1 the leg number that wrote the waiting hand-off, $2
-# the branch head read just before that leg ran, $3 the branch head read
-# now. Pure: no git, no I/O.
+# without committing once -- a survey leg), both heads are non-empty, they
+# are equal, and the outbox signatures are equal, meaning the leg that just
+# ran left a hand-off without moving the branch or writing to its outbox
+# (review and reply seats do their work as outbox files). $1 the leg number
+# that wrote the waiting hand-off, $2 the branch head read just before that
+# leg ran, $3 the branch head read now, $4 the outbox signature read just
+# before that leg ran, $5 the outbox signature read now. Pure: no git, no
+# I/O.
 fs_refresh_is_stall() {
     local leg_no="$1" head_before="$2" head_now="$3"
+    local sig_before="${4:-}" sig_now="${5:-}"
     [[ "$leg_no" =~ ^[0-9]+$ ]] || return 1
     (( leg_no >= 2 )) || return 1
     [[ -n "$head_before" && -n "$head_now" ]] || return 1
-    [[ "$head_before" == "$head_now" ]]
+    [[ "$head_before" == "$head_now" ]] || return 1
+    [[ "$sig_before" == "$sig_now" ]]
 }
 
 # Every addendum archived out of an earlier leg, oldest first, one line per

@@ -814,9 +814,11 @@ run_claude_continuations() {
     # coding leg, for the first iteration, or a continuation): the pod owns
     # its clone, so this reads it directly, unlike the local runner's
     # ls-remote. Compared at the top of the next iteration to detect a
-    # stall -- see fs_refresh_is_stall (refresh.sh).
-    local leg_head_before=""
+    # stall -- see fs_refresh_is_stall (refresh.sh). leg_outbox_before is the
+    # outbox signature (fs_refresh_outbox_sig) captured at the same points.
+    local leg_head_before="" leg_outbox_before=""
     leg_head_before="$(git -C "$clone_dir" rev-parse HEAD 2>/dev/null || true)"
+    leg_outbox_before="$(fs_refresh_outbox_sig "$outbox_dir")"
     fs_refresh_window_mismatch "$work_dir/events.jsonl" \
         "${REFRESH_CONTEXT_WINDOW:-}" >&2
     if (( pi_rc == 0 )); then
@@ -826,12 +828,13 @@ run_claude_continuations() {
         if [[ -f "$outbox_dir/handoff.md" ]]; then
             local now_head
             now_head="$(git -C "$clone_dir" rev-parse HEAD 2>/dev/null || true)"
-            if fs_refresh_is_stall "$(( n + 1 ))" "$leg_head_before" "$now_head"; then
+            if fs_refresh_is_stall "$(( n + 1 ))" "$leg_head_before" "$now_head" \
+                "$leg_outbox_before" "$(fs_refresh_outbox_sig "$outbox_dir")"; then
                 ended=stalled
                 mv -f -- "$outbox_dir/handoff.md" \
                     "$work_dir/handoff-stalled-$(( n + 1 )).md" 2>/dev/null
                 echo "fork-sandbox-k8s-entrypoint: continuation leg $(( n + 1 ))" \
-                    "stalled (hand-off waiting, branch head unchanged)" >&2
+                    "stalled (hand-off waiting, branch head and outbox unchanged)" >&2
                 break
             fi
             if (( n >= REFRESH_MAX )); then
@@ -861,6 +864,7 @@ run_claude_continuations() {
             echo "fork-sandbox-k8s-entrypoint: continuation leg $leg_no" \
                 "(from $rec)" >&2
             leg_head_before="$(git -C "$clone_dir" rev-parse HEAD 2>/dev/null || true)"
+            leg_outbox_before="$(fs_refresh_outbox_sig "$outbox_dir")"
             rc=0
             run_claude_attempt "$prompt" "$last_events" \
                 "$work_dir/claude-stderr-continuation-$n.log" || rc=$?

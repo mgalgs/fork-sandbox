@@ -10332,6 +10332,9 @@ refresh_block_run() {
         '      GIT_COMMITTER_NAME=rb-stub GIT_COMMITTER_EMAIL=rb-stub@fork-sandbox.invalid \' \
         '      git commit -q -m "leg $n" ) >/dev/null 2>&1' \
         '  fi' \
+        '  if [[ " ${RB_OUTBOX_LEGS:-} " == *" $n "* ]]; then' \
+        '    echo "reply from leg $n" > "$RB_OUTBOX/reply-$n.md"' \
+        '  fi' \
         '  echo "handoff written by leg $n" > "$RB_OUTBOX/handoff.md"' \
         '  echo "{\"stderr\":\"fork-sandbox-refresh: nudged\"}"' \
         'fi' \
@@ -10357,7 +10360,7 @@ refresh_block_run() {
         RB_REC="$rec" RB_OUTBOX="$RB_WORK/outbox" RB_CLONE="$RB_WORK/clone" \
         RB_HANDOFF_LEGS="${2:-}" RB_FAIL_LEGS="${3:-}" \
         RB_ADDENDUM_LEGS="${RB_ADDENDUM_LEGS:-}" \
-        RB_NOCOMMIT_LEGS="${RB_NOCOMMIT_LEGS:-}" \
+        RB_NOCOMMIT_LEGS="${RB_NOCOMMIT_LEGS:-}" RB_OUTBOX_LEGS="${RB_OUTBOX_LEGS:-}" \
         bash "$refresh_block_file" 2>&1)"
     RB_RC="$(grep -o 'CLAUDE_BLOCK_PI_RC=.*' <<<"$RB_OUT" | tail -1 | cut -d= -f2)"
     RB_CALLS="$(cat "$rec/count" 2>/dev/null || echo 0)"
@@ -10531,6 +10534,20 @@ else
         "calls=$RB_CALLS out=$RB_OUT ended=$(jq -r .ended "$RB_WORK/refresh.json" 2>/dev/null)"
 fi
 RB_NOCOMMIT_LEGS=""
+
+# The mirror: leg 2 commits nothing but writes a file into the outbox (a
+# review or reply seat's work), so it is progress: leg 3 runs, and hands off
+# nothing.
+RB_NOCOMMIT_LEGS="2" RB_OUTBOX_LEGS="2" refresh_block_run 100000 "1 2" "" 6
+if [[ "$RB_CALLS" == 3 ]] \
+    && [[ "$(jq -r .ended "$RB_WORK/refresh.json")" == empty-outbox ]] \
+    && [[ ! -e "$RB_WORK/handoff-stalled-2.md" ]]; then
+    ok "a continuation that writes to its outbox without committing: not a stall"
+else
+    no "a continuation that writes to its outbox without committing: not a stall" \
+        "calls=$RB_CALLS out=$RB_OUT ended=$(jq -r .ended "$RB_WORK/refresh.json" 2>/dev/null)"
+fi
+RB_NOCOMMIT_LEGS="" RB_OUTBOX_LEGS=""
 
 # A leg that reports a context window other than the one the pod was told
 # --refresh-at assumed: one warning per leg in the pod log, nothing else changes.

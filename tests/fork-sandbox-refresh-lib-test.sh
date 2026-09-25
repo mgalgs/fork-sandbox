@@ -167,20 +167,61 @@ check "a non-integer assumed window prints nothing" "" \
   fs_refresh_window_mismatch "$t/one.jsonl" 1000000 > /dev/null ) && r=yes || r=no
 check "no-output paths survive set -euo pipefail" yes "$r"
 
+printf '\n== fs_refresh_outbox_sig ==\n'
+t="$(new_tmp)"
+check "a missing dir has an empty signature" "" "$(fs_refresh_outbox_sig "$t/none")"
+mkdir -p "$t/out"
+check "an empty dir has an empty signature" "" "$(fs_refresh_outbox_sig "$t/out")"
+sig0="$(fs_refresh_outbox_sig "$t/out")"
+printf 'one\n' > "$t/out/reply.md"
+sig1="$(fs_refresh_outbox_sig "$t/out")"
+[[ -n "$sig1" && "$sig1" != "$sig0" ]] && r=yes || r=no
+check "a new file changes the signature" yes "$r"
+check "the signature is deterministic" "$sig1" "$(fs_refresh_outbox_sig "$t/out")"
+printf 'two, longer\n' > "$t/out/reply.md"
+sig2="$(fs_refresh_outbox_sig "$t/out")"
+[[ "$sig2" != "$sig1" ]] && r=yes || r=no
+check "a rewritten file with new content changes the signature" yes "$r"
+printf 'hand-off\n' > "$t/out/handoff.md"
+check "adding handoff.md does not change the signature" "$sig2" \
+    "$(fs_refresh_outbox_sig "$t/out")"
+printf 'a different hand-off\n' > "$t/out/handoff.md"
+check "changing handoff.md does not change the signature" "$sig2" \
+    "$(fs_refresh_outbox_sig "$t/out")"
+mkdir -p "$t/out/sub"
+printf 'nested\n' > "$t/out/sub/note.md"
+[[ "$(fs_refresh_outbox_sig "$t/out")" != "$sig2" ]] && r=yes || r=no
+check "a file in a subdirectory counts" yes "$r"
+mkdir -p "$t/out2/sub"
+printf 'x\n' > "$t/out2/sub/handoff.md"
+[[ -n "$(fs_refresh_outbox_sig "$t/out2")" ]] && r=yes || r=no
+check "only the top-level handoff.md is excluded" yes "$r"
+( set -euo pipefail; fs_refresh_outbox_sig "$t/none" > /dev/null
+  fs_refresh_outbox_sig "$t/out" > /dev/null ) && r=yes || r=no
+check "the signature survives set -euo pipefail" yes "$r"
+
 printf '\n== fs_refresh_is_stall ==\n'
-fs_refresh_is_stall 1 abc abc && r=yes || r=no
-check "leg 1 is exempt even when the head did not move" no "$r"
-fs_refresh_is_stall 2 abc abc && r=yes || r=no
-check "leg 2 with an unmoved head is a stall" yes "$r"
-fs_refresh_is_stall 2 abc def && r=yes || r=no
-check "leg 2 with a moved head is not a stall" no "$r"
-fs_refresh_is_stall 3 abc abc && r=yes || r=no
-check "leg 3 (or later) with an unmoved head is a stall too" yes "$r"
-fs_refresh_is_stall 2 "" abc && r=yes || r=no
+fs_refresh_is_stall 1 abc abc s s && r=yes || r=no
+check "leg 1 is exempt even when nothing moved" no "$r"
+fs_refresh_is_stall 2 abc abc s s && r=yes || r=no
+check "leg 2, heads equal, sigs equal is a stall" yes "$r"
+fs_refresh_is_stall 2 abc abc "" "" && r=yes || r=no
+check "leg 2, heads equal, both outboxes empty is a stall" yes "$r"
+fs_refresh_is_stall 2 abc abc s t && r=yes || r=no
+check "leg 2, heads equal, sigs differ is NOT a stall" no "$r"
+fs_refresh_is_stall 2 abc abc "" t && r=yes || r=no
+check "leg 2, heads equal, outbox went from empty to written is NOT a stall" no "$r"
+fs_refresh_is_stall 2 abc def s s && r=yes || r=no
+check "leg 2, heads differ, sigs equal is not a stall" no "$r"
+fs_refresh_is_stall 2 abc def s t && r=yes || r=no
+check "leg 2, heads differ, sigs differ is not a stall" no "$r"
+fs_refresh_is_stall 3 abc abc s s && r=yes || r=no
+check "leg 3 (or later) with nothing moved is a stall too" yes "$r"
+fs_refresh_is_stall 2 "" abc s s && r=yes || r=no
 check "an empty before-head is never a stall" no "$r"
-fs_refresh_is_stall 2 abc "" && r=yes || r=no
+fs_refresh_is_stall 2 abc "" s s && r=yes || r=no
 check "an empty now-head is never a stall" no "$r"
-fs_refresh_is_stall 2 "" "" && r=yes || r=no
+fs_refresh_is_stall 2 "" "" s s && r=yes || r=no
 check "two empty heads is never a stall" no "$r"
 
 printf '\n== fs_refresh_addenda_dirs ==\n'
