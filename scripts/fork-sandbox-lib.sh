@@ -524,18 +524,22 @@ fs_pm_find_live_run() {
 # still resolves outside the resolved root, so it is still refused.
 #
 # A misconfigured projects.env is refused loudly rather than silently
-# widening the boundary: a relative entry, an entry resolving to '/', or an
-# entry resolving to $HOME's real path or an ancestor of it (which would
-# admit ~/.ssh and ~/.config/fork-sandbox, holding tokens) all abort the run.
+# widening the boundary: a relative entry, an entry resolving to '/', an
+# entry resolving to $HOME's real path or an ancestor of it, or an entry
+# that itself covers $config_dir or $HOME/.ssh (which would admit those
+# token-holding directories even though it is not $HOME or an ancestor of
+# it -- e.g. PROJECT_ROOTS=~/.config) all abort the run.
 fs_require_project_root() {
     local project_path="$1" config_dir="$2" env_file raw is_default=0
     local -a root_reals=()
-    local entry expanded real home_real root_real
+    local entry expanded real home_real root_real config_dir_real ssh_real
 
     env_file="$config_dir/projects.env"
     raw="$(fs_read_env_value "$env_file" PROJECT_ROOTS || true)"
 
     home_real="$("$FS_REALPATH" -m "$HOME")"
+    config_dir_real="$("$FS_REALPATH" -m "$config_dir")"
+    ssh_real="$("$FS_REALPATH" -m "$HOME/.ssh")"
 
     if [[ -z "$raw" ]]; then
         is_default=1
@@ -572,6 +576,18 @@ fs_require_project_root() {
                 echo "Error: PROJECT_ROOTS in '$env_file' names '$entry', which resolves" >&2
                 echo "to '$root_real', \$HOME's real path or an ancestor of it. That" >&2
                 echo "would admit ~/.ssh and ~/.config/fork-sandbox, which holds tokens." >&2
+                return 1
+            fi
+            if [[ "$config_dir_real" == "$root_real" || "$config_dir_real" == "$root_real"/* ]]; then
+                echo "Error: PROJECT_ROOTS in '$env_file' names '$entry', which resolves" >&2
+                echo "to '$root_real', which covers '$config_dir_real'. That directory" >&2
+                echo "holds tokens and must not be reachable as a project root." >&2
+                return 1
+            fi
+            if [[ "$ssh_real" == "$root_real" || "$ssh_real" == "$root_real"/* ]]; then
+                echo "Error: PROJECT_ROOTS in '$env_file' names '$entry', which resolves" >&2
+                echo "to '$root_real', which covers '$ssh_real'. That directory holds" >&2
+                echo "tokens and must not be reachable as a project root." >&2
                 return 1
             fi
             root_reals+=("$root_real")

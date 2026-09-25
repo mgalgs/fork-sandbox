@@ -220,6 +220,36 @@ else
     esac
 fi
 
+printf "\n== a root that covers \$config_dir without being \$HOME or an ancestor is refused ==\n"
+cfgcover_home="$(new_home)"; tmpdirs+=("$cfgcover_home")
+cfgcover_config="$cfgcover_home/.config/fork-sandbox"
+write_projects_env "$cfgcover_config" '~/.config'
+if HOME="$cfgcover_home" fs_require_project_root \
+    "$cfgcover_home/.config/fork-sandbox" "$cfgcover_config" 2>"$err"; then
+    no "a root covering \$config_dir is refused"
+else
+    case "$(cat "$err")" in
+        *"PROJECT_ROOTS"*"covers"*"$cfgcover_config"*)
+            ok "a root covering \$config_dir is refused" ;;
+        *) no "a root covering \$config_dir is refused" "$(cat "$err")" ;;
+    esac
+fi
+
+printf "\n== a root that covers \$HOME/.ssh without being \$HOME or an ancestor is refused ==\n"
+sshcover_home="$(new_home)"; tmpdirs+=("$sshcover_home")
+sshcover_config="$sshcover_home/.config/fork-sandbox"
+write_projects_env "$sshcover_config" '~/.ssh'
+if HOME="$sshcover_home" fs_require_project_root \
+    "$sshcover_home/.ssh" "$sshcover_config" 2>"$err"; then
+    no "a root covering \$HOME/.ssh is refused"
+else
+    case "$(cat "$err")" in
+        *"PROJECT_ROOTS"*"covers"*"$sshcover_home/.ssh"*)
+            ok "a root covering \$HOME/.ssh is refused" ;;
+        *) no "a root covering \$HOME/.ssh is refused" "$(cat "$err")" ;;
+    esac
+fi
+
 printf '\n== empty entries (a::b, a trailing :) are skipped ==\n'
 skip_home="$(new_home)"; tmpdirs+=("$skip_home")
 skip_config="$skip_home/.config/fork-sandbox"

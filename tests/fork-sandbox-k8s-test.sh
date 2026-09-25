@@ -9646,6 +9646,64 @@ refuses "--k8s refuses a project outside ~/src" \
     --harness pi --model moonshotai/kimi-k3 --branch fs-k8s-flag-test-branch \
     /tmp/fs-k8s-flag-test-outside-src "$k8s_flag_handoff"
 
+# The --config_dir wiring itself, not just the default it falls back to: a
+# fixture HOME with its own projects.env, naming a root that is NOT ~/src,
+# proves the $config_dir this call site passes to fs_require_project_root is
+# the one --k8s actually resolved (FORK_SANDBOX_CONFIG_DIR here), not a
+# hardcoded ~/.config/fork-sandbox or an unset/misspelled variable -- either
+# of those would still pass every other case above, which all use the
+# default root.
+projroot_home="$(mktemp -d /var/tmp/claude-scratch/fs-k8s-projroot-test.XXXXXX)"
+tmpdirs+=("$projroot_home")
+projroot_config="$projroot_home/.config/fork-sandbox"
+mkdir -p "$projroot_config"
+printf 'PROJECT_ROOTS=~/code\n' > "$projroot_config/projects.env"
+# The --k8s --dry-run path still reads k8s.env/pi.env from this same
+# config dir (fs_require_project_root is only one of several things it
+# checks before printing), so this fixture needs copies of the same ones
+# $config_dir already has above, or the accept case below fails on a
+# missing k8s.env rather than proving anything about PROJECT_ROOTS.
+cp "$config_dir/k8s.env" "$config_dir/pi.env" "$projroot_config/"
+mkdir -p "$projroot_home/code"
+projroot_proj="$(mktemp -d "$projroot_home/code/fs-k8s-projroot-test.XXXXXX")"
+(
+    cd "$projroot_proj" \
+        && git init -q . \
+        && git config user.email t@fork-sandbox.invalid \
+        && git config user.name Tester \
+        && printf 'hello\n' > file.txt \
+        && git add file.txt \
+        && git commit -q -m init
+) >/dev/null 2>&1
+if HOME="$projroot_home" FORK_SANDBOX_CONFIG_DIR="$projroot_config" "$fs_sh" --k8s --dry-run \
+    --harness pi --model moonshotai/kimi-k3 --branch fs-k8s-flag-test-projroot \
+    "$projroot_proj" "$k8s_flag_handoff" \
+    > /dev/null 2>/tmp/fs-k8s-flag-test-projroot.err; then
+    ok "--k8s accepts a project under a configured PROJECT_ROOTS root"
+else
+    no "--k8s accepts a project under a configured PROJECT_ROOTS root" \
+        "$(cat /tmp/fs-k8s-flag-test-projroot.err)"
+fi
+rm -f /tmp/fs-k8s-flag-test-projroot.err
+refuses "--k8s refuses a project outside a configured PROJECT_ROOTS root, naming projects.env" \
+    "$projroot_config/projects.env" \
+    env HOME="$projroot_home" FORK_SANDBOX_CONFIG_DIR="$projroot_config" "$fs_sh" --k8s --dry-run \
+    --harness pi --model moonshotai/kimi-k3 --branch fs-k8s-flag-test-projroot-refuse \
+    "$projroot_home/other/proj" "$k8s_flag_handoff"
+
+# The local (no --k8s) call site's own wiring, not just the --k8s one
+# above: this path cannot be exercised with --dry-run (fork-sandbox.sh
+# exits on --dry-run before it ever reaches fs_require_project_root on
+# the local path), but a refusal needs nothing past that check, so this
+# fails fast -- no clone, no launch -- and still proves this call site's
+# $config_dir is the one FORK_SANDBOX_CONFIG_DIR resolved, not a
+# hardcoded default or an unset/misspelled variable.
+mkdir -p "$projroot_home/other/proj"
+refuses "run (no --k8s) refuses a project outside a configured PROJECT_ROOTS root, naming projects.env" \
+    "$projroot_config/projects.env" \
+    env HOME="$projroot_home" FORK_SANDBOX_CONFIG_DIR="$projroot_config" "$fs_sh" \
+    "$projroot_home/other/proj" "$k8s_flag_handoff"
+
 # The positive case: --k8s --harness pi --dry-run has to actually reach
 # fork-sandbox-k8s.sh, and with the arguments this dispatcher promises. Prove
 # it the same way this file already proves `run --dry-run` delegates to
