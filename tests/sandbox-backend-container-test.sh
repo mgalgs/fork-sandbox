@@ -225,6 +225,40 @@ else
     # branch itself remains unverified" is the honest statement.
 fi
 
+# The pin helper joins the container's network namespace, which exists only
+# once the container is RUNNING. Start runs in the background, so a container
+# slow to start (many mounts) used to lose the race and fail the helper with
+# "cannot join network namespace of a non running container".
+cat > "$dwn/bin/slowcli" <<EOF
+#!/usr/bin/env bash
+case "\$1 \$2" in
+  "network create") echo fake-net; exit 0 ;;
+  "network inspect") case "\$*" in *Gateway*) echo 203.0.113.1 ;; *Subnet*) echo 203.0.113.0/24 ;; esac; exit 0 ;;
+  "network rm") exit 0 ;;
+esac
+case "\$1" in
+  create) echo fake-container; exit 0 ;;
+  start)  sleep 0.5; touch "$dwn/running"; sleep 1; exit 0 ;;
+  wait)   echo 0; exit 0 ;;
+  rm)     exit 0 ;;
+  inspect) case "\$*" in *State.Running*) [[ -e "$dwn/running" ]] && echo true || echo false ;; *) echo 2026-01-01T00:00:00Z ;; esac; exit 0 ;;
+  run)
+    if [[ "\$*" == *NET_ADMIN* && ! -e "$dwn/running" ]]; then
+      echo "Error response from daemon: cannot join network namespace of a non running container" >&2; exit 125
+    fi
+    exit 0 ;;
+esac
+exit 0
+EOF
+chmod +x "$dwn/bin/slowcli"
+rm -f "$dwn/running"
+if PATH="$dwn/bin:$PATH" FORK_SANDBOX_CONTAINER_CLI="$dwn/bin/slowcli" \
+    "$backend" --workdir "$dwn/work-slow" --net pinned --image fake -- true >/dev/null 2>"$dwn/slow.err"; then
+    ok "pin helper waits for a slow-starting container"
+else
+    no "pin helper waits for a slow-starting container" "$(cat "$dwn/slow.err")"
+fi
+
 # A failing pin helper must say so on stderr. The stdin probe used to be
 # `exec 3< /dev/stdin 2>/dev/null`, and exec with no command keeps every
 # redirection, so stderr went to /dev/null for the rest of the script. The

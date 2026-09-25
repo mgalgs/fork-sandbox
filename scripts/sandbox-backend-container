@@ -436,6 +436,14 @@ if [[ "$NET_MODE" == pinned ]]; then
         "$CLI" start --attach --interactive "$CONTAINER" < /dev/null &
         attach_pid=$!
     fi
+    # The helper joins the container's network namespace, which exists only
+    # once start has reached running. Start is in the background, so wait for
+    # it: a container with many mounts is slow enough to lose that race.
+    for _ in $(seq 1 100); do
+        [[ "$("$CLI" inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null)" == true ]] && break
+        kill -0 "$attach_pid" 2>/dev/null || break
+        sleep 0.1
+    done
     "$CLI" run --rm --network "container:$CONTAINER" --cap-add=NET_ADMIN --user 0 --entrypoint /bin/bash "$IMAGE" -c "$routes" || { echo "Error: pin helper failed; command was not run." >&2; exit 1; }
     wait "$attach_pid" || true
 else
