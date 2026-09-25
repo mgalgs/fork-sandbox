@@ -1698,7 +1698,9 @@ leg's own first usage reading, not the flat threshold -- see
 fork-sandbox.sh's "A run that refreshes itself" for why. `submit` also
 warns once, before the Job is created, when the brief alone is already a
 large share of the threshold (`fs_refresh_warn_brief`). When enabled, the
-Job gets `REFRESH_THRESHOLD_TOKENS`/`REFRESH_MAX`/`REFRESH_CEILING_TOKENS`,
+Job gets `REFRESH_THRESHOLD_TOKENS`/`REFRESH_MAX`/`REFRESH_CEILING_TOKENS`
+and `REFRESH_CONTEXT_WINDOW` (the assumed window, used only to warn when a
+leg reports a different one),
 `run.env` records `refresh_at`, `refresh_max` and
 `refresh_threshold_tokens`, and the ConfigMap carries three more keys:
 `refresh.sh` (the shared logic, `fork-sandbox-refresh.sh`, so the local
