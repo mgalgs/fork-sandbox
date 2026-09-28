@@ -1418,6 +1418,9 @@ check "a preset file wins over the spec its name spells" \
     "preset=csonnet2-rsol2-mopus2" "$(head -1 <<< "$out")"
 refuses "a name that is neither a file nor a spec still lists the presets" \
     "Available presets:" --preset nope-at-all
+contains "the spec compiler's --help prints its header" \
+    "$(python3 "$repo_dir/scripts/fork-sandbox-pipeline-spec.py" --help)" \
+    "Usage: fork-sandbox-pipeline-spec.py <spec>"
 out="$(run --pipeline csonnetclaude 2>"$err")"
 check "a native harness suffix is accepted" \
     $'pipeline=csonnetclaude\nharness=claude\nmodel=sonnet' "$out"
@@ -1837,12 +1840,17 @@ else
 fi
 
 # --review-only over a preset drops its code step and runs the rest once.
+# Each step has its own model, so a leg seated on the dropped coder shows.
 cat > "$real_presets/ro-alias.yaml" <<'EOF'
 agents:
   coder:
     harness: claude
     model: haiku
     repeat: 2
+    claude-args: --effort high
+  reviewer:
+    harness: claude
+    model: sonnet
   elder:
     harness: claude
     model: opus
@@ -1851,7 +1859,7 @@ pipeline:
     agent: coder
   - action: review
     repeat: 2
-    agent: coder
+    agent: reviewer
   - action: maintain
     repeat: 2
     agent: elder
@@ -1862,10 +1870,81 @@ if rd_ra="$(run_stubbed --preset ro-alias --review-only --checkout "ro-target-$$
     tmpdirs+=("$rd_ra")
     check "--review-only over a preset runs its review and maintain once each" \
         "2" "$(cat "$count")"
-    check "--review-only's review runs on the review agent's model" "haiku" \
+    check "--review-only's review runs on the review agent's model" "sonnet" \
         "$(jq -r '.steps[0].model' "$rd_ra/pipeline.json")"
+    check "--review-only's maintain runs on the maintain agent's model" "opus" \
+        "$(jq -r '.steps[1].model' "$rd_ra/pipeline.json")"
+    lacks "the dropped coder's arguments reach no leg" \
+        "$(grep 'sandbox_cmd=' "$rd_ra/run.sh")" "--effort high"
+    contains "the review leg is told a maintainer reads its verdict next" \
+        "$(cat "$rd_ra/review-prompt-1.md")" "a maintainer reads your"
+    lacks "the review leg is not told its FINDINGS end the run" \
+        "$(cat "$rd_ra/review-prompt-1.md")" "verdict ends the run outright"
 else
     no "--review-only over a preset launches"
+fi
+
+# The coder that also reviews keeps its seat; its coding arguments do not.
+cat > "$real_presets/ro-self.yaml" <<'EOF'
+agents:
+  coder:
+    harness: claude
+    model: haiku
+    claude-args: --effort high
+  elder:
+    harness: claude
+    model: opus
+pipeline:
+  - action: code
+    agent: coder
+  - action: review
+    repeat: 1
+    agent: coder
+  - action: maintain
+    repeat: 1
+    agent: elder
+EOF
+if out="$(HOME="$launcher_home" FORK_SANDBOX_CONFIG_DIR="$real_cfg" "$launcher" \
+    --dry-run --preset ro-self --review-only --checkout "ro-target-$$" \
+    --review-base "$ro_base" "$proj" "$handoff" 2>"$err")"; then
+    ok "--review-only accepts a preset whose coder, with arguments, also reviews"
+    contains "that coder sits the review seat" "$out" "model=haiku"
+else
+    no "--review-only accepts a preset whose coder, with arguments, also reviews" \
+        "$(cat "$err")"
+fi
+
+ro_dry() {
+    HOME="$launcher_home" FORK_SANDBOX_CONFIG_DIR="$real_cfg" "$launcher" \
+        --dry-run "$@" --checkout "ro-target-$$" --review-base "$ro_base" \
+        "$proj" "$handoff"
+}
+ro_refuses() {
+    local label="$1" needle="$2"; shift 2
+    if ro_dry "$@" >/dev/null 2>"$err"; then
+        no "$label" "expected a refusal, got exit 0"
+    else
+        contains "$label" "$(cat "$err")" "$needle"
+    fi
+}
+ro_refuses "--model is refused on a maintain-only read-only pipeline" \
+    "override it with --maintainer-model" --pipeline mopus --model sonnet
+ro_refuses "--harness is refused on a maintain-only read-only pipeline" \
+    "override it with --maintainer-model" --pipeline mopus --harness claude
+ro_refuses "--maintainer-loop is refused on a read-only pipeline" \
+    "--maintainer-loop has nothing to set" --pipeline rhaiku-mopus --maintainer-loop 3
+ro_refuses "--maintainer-model cannot add a maintain leg to a read-only review" \
+    "has no maintain step" --pipeline ropus --maintainer-model sonnet
+if out="$(ro_dry --pipeline mopus --maintainer-model sonnet 2>"$err")"; then
+    contains "--maintainer-model overrides a read-only maintain seat" "$out" \
+        "maintainer_model=sonnet"
+else
+    no "--maintainer-model overrides a read-only maintain seat" "$(cat "$err")"
+fi
+if out="$(ro_dry --pipeline ropus --model sonnet 2>"$err")"; then
+    contains "--model overrides a read-only review seat" "$out" "model=sonnet"
+else
+    no "--model overrides a read-only review seat" "$(cat "$err")"
 fi
 
 refuses "a read-only pipeline needs --checkout" \

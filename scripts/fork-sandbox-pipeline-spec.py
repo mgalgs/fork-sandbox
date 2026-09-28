@@ -115,6 +115,9 @@ def compile_spec(spec):
 
 
 if __name__ == "__main__":
+    if len(sys.argv) == 2 and sys.argv[1] in ("-h", "--help"):
+        sys.stdout.write(__doc__)
+        sys.exit(0)
     if len(sys.argv) != 2 or not sys.argv[1]:
         sys.stderr.write("Usage: fork-sandbox-pipeline-spec.py <spec>\n")
         sys.exit(1)

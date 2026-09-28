@@ -2564,14 +2564,28 @@ EOF
 #                         addendum-sourced finding can cite it.
 # $6  handoff_file        the caller's original handoff, embedded at the end
 #                         of the body; see fs_append_handoff_brief.
-# $7  flavor              "spec" (default) or "review-only", forwarded to
-#                         fs_emit_handoff_spec_section verbatim.
+# $7  flavor              "spec" (default), "review-only", or
+#                         "review-only-maintained" (review-only, with a
+#                         maintain leg reading the verdict next).
 fs_emit_review_prompt_body() {
     local branch="$1" base_sha="$2" review_skill_dir="$3"
     local review_verdict_file="$4" inbox_dir="$5"
     local handoff_file="$6" flavor="${7:-spec}"
     local review_role_para addendum_para hands_off_para approved_clause
-    local invented_para
+    local invented_para ro_next_sentence ro_output_sentence
+    local handoff_flavor="$flavor"
+    # review-only-maintained: a read-only pipeline whose maintain leg reads
+    # this verdict next. Everything else is the review-only wording.
+    ro_next_sentence="A --review-only run has no fix leg -- a FINDINGS
+verdict ends the run outright"
+    ro_output_sentence="Your verdict is this run's whole output"
+    if [[ "$flavor" == "review-only-maintained" ]]; then
+        flavor=review-only
+        handoff_flavor=review-only
+        ro_next_sentence="This run has no fix leg -- a maintainer reads your
+verdict next and builds on it, and then the run ends"
+        ro_output_sentence="Your verdict is what the maintainer builds on"
+    fi
     if [[ "$flavor" == "review-only" ]]; then
         review_role_para="This branch was not built in this sandbox -- it was built elsewhere,
 against a spec this sandbox never had. You are reviewing it cold, with none
@@ -2587,10 +2601,9 @@ with it."
         addendum_para="You read the operator inbox as part of every session; this leg is where that
 reading has to show up in the verdict. If an addendum asks for work that the
 commits under review do not contain, that is a finding. Report it as one,
-with the addendum quoted. A --review-only run has no fix leg -- a FINDINGS
-verdict ends the run outright -- so reporting the gap is all this leg can do
-about it; do not withhold it on the assumption something downstream will act
-on it instead. Do not approve a branch that leaves an operator instruction
+with the addendum quoted. $ro_next_sentence -- so reporting the gap is all
+this leg can do about it; do not withhold it on the assumption something
+downstream will act on it instead. Do not approve a branch that leaves an operator instruction
 unfollowed. You are reporting the gap here, not closing it — the next
 section still applies."
     else
@@ -2603,7 +2616,7 @@ gap here, not closing it — the next section still applies."
     fi
     if [[ "$flavor" == "review-only" ]]; then
         hands_off_para="Do not fix anything. Do not edit, stage, commit, amend, rebase or revert.
-Your verdict is this run's whole output: nothing downstream applies fixes, and
+$ro_output_sentence: nothing downstream applies fixes, and
 every change you make in this clone is thrown away with the sandbox. Touching
 the code is not someone else's job here, it is pure waste. Reading, building
 and running the tests is fine — changing tracked files is not."
@@ -2699,7 +2712,7 @@ author's message. The orchestrator reads this report instead of the author's
 own account. Keep the \`Checked:\` paragraph where it is, in the verdict body,
 before this heading.
 EOF
-    fs_emit_handoff_spec_section "$handoff_file" "$flavor"
+    fs_emit_handoff_spec_section "$handoff_file" "$handoff_flavor"
 }
 
 # Shared by the review and maintainer bodies, right after "put the whole

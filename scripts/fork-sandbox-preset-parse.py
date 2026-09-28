@@ -321,14 +321,16 @@ def main():
                 s["cap"] = 1
         # Seats count from what remains: an agent that only sat a dropped
         # code step is neither checked nor warned about, and a kept one's
-        # coding-only properties have nothing left to apply to.
+        # coding-only properties (repeat, refresh, endpoint, and the
+        # arguments tuned for its coding legs) have nothing left to apply to.
         seated_ro = {s["agent"] for s in steps}
         agents = {n: a for n, a in agents.items()
                   if n in seated_ro or n not in dropped_agents}
         if DROP_CODE:
             for agent in agents.values():
                 agent.update(repeat=1, refresh_at="", refresh_max="",
-                             endpoint="")
+                             endpoint="", claude_args="", pi_args="",
+                             codex_args="")
 
     # ---- pipeline: pass 2, seat resolution ----
     # Fix seats default to the first code step's agent, in pipeline order,

@@ -2206,6 +2206,26 @@ if [[ -n "$preset_name" ]]; then
                 preset_maintain_fix_default=1
             fi
         done
+        # Flags may override a seat the pipeline runs, never add a leg or
+        # land on a seat nothing runs.
+        if [[ -n "$maintainer_loop_arg" ]]; then
+            echo "Error: preset '$preset_name' is read-only: each step runs once, so" >&2
+            echo "--maintainer-loop has nothing to set." >&2
+            exit 1
+        fi
+        if [[ -z "$preset_maintain_agent" ]] \
+            && [[ -n "$maintainer_model" || "$maintainer_harness_given" == true ]]; then
+            echo "Error: preset '$preset_name' is read-only and has no maintain step" >&2
+            echo "for --maintainer-model/--maintainer-harness to seat." >&2
+            exit 1
+        fi
+        if [[ "$preset_ro_review" != true ]] \
+            && [[ "$model_given" == true || "$harness_given" == true ]]; then
+            echo "Error: preset '$preset_name' is a read-only maintain step, which runs on" >&2
+            echo "the maintainer seat: override it with --maintainer-model or" >&2
+            echo "--maintainer-harness, not --model/--harness." >&2
+            exit 1
+        fi
     elif [[ "$preset_is_legacy_shaped" == true ]]; then
         preset_impl_agent="${preset_step_agent[1]}"
         preset_impl_repeat="${preset_step_repeat[1]:-1}"
@@ -3402,11 +3422,6 @@ if [[ -n "$preset_name" && "$preset_is_legacy_shaped" != true ]]; then
     fi
     if [[ "$maintainer_harness_given" == true ]]; then
         echo "Error: --maintainer-harness cannot be combined with preset '$preset_name':" >&2
-        echo "composed pipeline; edit the preset or pick another." >&2
-        exit 1
-    fi
-    if [[ "$review_only" == true ]]; then
-        echo "Error: --review-only cannot be combined with preset '$preset_name':" >&2
         echo "composed pipeline; edit the preset or pick another." >&2
         exit 1
     fi
@@ -6122,6 +6137,10 @@ maintainer_verdict_file=""
 # Read by the review and maintainer prompt builders below.
 review_prompt_flavor=spec
 [[ "$review_only" == true ]] && review_prompt_flavor=review-only
+# The review leg's own wording, when a read-only maintain leg reads it next.
+review_leg_flavor="$review_prompt_flavor"
+[[ "$review_only" == true ]] && (( maintainer_loop_cap > 0 )) \
+    && review_leg_flavor=review-only-maintained
 # Survives the cap-scalar retirement -- see the justification on
 # maintainer_loop_cap's read above (fixed-name legacy artifact, not a
 # run_step_kind gate a composed step could also satisfy).
@@ -6150,7 +6169,7 @@ if (( review_loop_cap > 0 )); then
         fs_emit_prompt_overlay review
         fs_emit_review_prompt_body "$branch" "$base_sha" "$review_skill_dir" \
             "$review_verdict_file" "$inbox_dir" "$handoff_file" \
-            "$review_prompt_flavor"
+            "$review_leg_flavor"
     } > "$review_prompt.part"
     mv -- "$review_prompt.part" "$review_prompt"
 fi
@@ -8547,6 +8566,7 @@ run_leg() {
     else
         leg_tag="$kind-$n"
     fi
+    legs_run=$(( ${legs_run:-0} + 1 ))
     local leg_events="$run_dir/events-$leg_tag.jsonl"
     # A review-only run has no implement leg, so its first leg's events are
     # the run's own; a read-only maintain leg after it keeps its own file.
@@ -9276,8 +9296,8 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count && stop_requested != 1; cur
         fi
     fi
     # A review-only run is one review leg, one maintain leg, or a review
-    # then a maintain leg (a read-only pipeline); each reports here, and
-    # the last one publishes the run's cost.
+    # then a maintain leg (a read-only pipeline). Each reports here and
+    # republishes the run's cost so far, so a stop between legs keeps it.
     if [[ "$cur_legacy" == 1 && "$mode" == "review-only" ]]; then
         cur_ro_what="review"
         [[ "$cur_kind" == maintainer ]] && cur_ro_what="maintainer"
@@ -9290,20 +9310,20 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count && stop_requested != 1; cur
         printf 'fork-sandbox: %s verdict: %s\n' "$cur_ro_what" "$run_dir/$cur_ro_what-verdict-1.md"
         [[ -n "${run_error:-}" ]] || run_error="${leg_error:-$leg_harness_error}"
         [[ "$cur_ended" == "harness-error" ]] && rc=1
-        if (( cur_step_no == run_step_count )); then
-            if (( run_step_count == 1 )); then
-                run_cost="$leg_cost"
-                run_usage="$leg_usage"
-            else
-                run_cost=""
-                [[ "$loop_cost_unknown" == 1 ]] || run_cost="$loop_cost_sum"
-                run_usage=null
-            fi
-            if [[ "$run_cost" =~ ^-?[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?$ ]]; then
-                run_cost_fmt="$(printf '%.6f' "$run_cost")"
-            else
-                run_cost_fmt=""
-            fi
+        if (( run_step_count == 1 )); then
+            run_cost="$leg_cost"
+            run_usage="$leg_usage"
+        else
+            # No leg run means no cost known, not a cost of zero.
+            run_cost=""
+            (( ${legs_run:-0} > 0 )) && [[ "$loop_cost_unknown" != 1 ]] \
+                && run_cost="$loop_cost_sum"
+            run_usage=null
+        fi
+        if [[ "$run_cost" =~ ^-?[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?$ ]]; then
+            run_cost_fmt="$(printf '%.6f' "$run_cost")"
+        else
+            run_cost_fmt=""
         fi
     fi
 done
