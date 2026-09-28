@@ -4027,6 +4027,24 @@ else
 fi
 rm -f /tmp/fs-k8s-test-claude-override.err
 
+# A `claude setup-token` credential carries no scopes, and a CLI that finds
+# no scopes on its OAuth credential reports "Not logged in" and exits before
+# any request. The placeholder must supply the inference scope itself.
+cat > "$claude_override_cred" <<JSON
+{"claudeAiOauth": {"accessToken": "$claude_override_token", "expiresAt": $claude_future_ms}}
+JSON
+claude_noscope_out="$(newdir)/claude-noscope-submit.yaml"; tmpdirs+=("$(dirname "$claude_noscope_out")")
+HOME="$claude_override_home" FORK_SANDBOX_CONFIG_DIR="$claude_override_config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-branch --model claude-sonnet-5 --harness claude \
+    "$proj_dir" "$handoff_file" > "$claude_noscope_out" 2>/dev/null || true
+noscope_cred="$(sed -n '/claude-credentials.json: |/,/inbox-hook.sh: |/p' "$claude_noscope_out")"
+if grep -qF '"user:inference"' <<< "$noscope_cred"; then
+    ok "a scopeless (setup-token) credential renders a placeholder with the inference scope"
+else
+    no "a scopeless (setup-token) credential renders a placeholder with the inference scope" \
+        "cred: ${noscope_cred:-<none>}"
+fi
+
 # A CLAUDE_CREDENTIALS naming a file that does not exist must fail naming
 # that path, not silently fall back to $HOME/.claude/.credentials.json
 # (which this HOME does not even have) or the macOS Keychain.

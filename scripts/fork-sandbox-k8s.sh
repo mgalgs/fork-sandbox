@@ -4580,11 +4580,14 @@ cmd_submit() {
         # the proxy supplies the real bearer on the way past. After this
         # substitution the file holds no secret (just scopes, subscription
         # type, expiry), which is what makes a ConfigMap -- not a Secret --
-        # the right place for it.
+        # the right place for it. A `claude setup-token` credential has no
+        # scopes, and a CLI that finds none reports "Not logged in" before
+        # any request, so the placeholder supplies the inference scope.
         claude_configmap_cred="$(printf '%s' "$claude_cred_json" | jq '
             del(.mcpOAuth)
             | del(.claudeAiOauth.refreshToken, .claudeAiOauth.refreshTokenExpiresAt)
             | .claudeAiOauth.accessToken = "sandbox"
+            | .claudeAiOauth.scopes //= ["user:inference"]
         ')"
     fi
 
