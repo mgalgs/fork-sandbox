@@ -3725,6 +3725,23 @@ else
     no "rendered claude-proxy nginx.conf forwards exactly the two v1/messages paths" \
         "not found in $claude_submit_out"
 fi
+# A 403 on the CLI's HEAD /api/hello preflight makes claude exit 1 before
+# its first real call, so the proxy must answer it -- locally, with no
+# proxy_pass, so it opens no upstream path and never carries the token.
+hello_block="$(sed -n '/location = \/api\/hello {/,/}/p' "$claude_submit_out")"
+if grep -qF 'return 200;' <<< "$hello_block" && ! grep -qE 'proxy_pass|upstream_key' <<< "$hello_block"; then
+    ok "rendered claude-proxy nginx.conf answers /api/hello locally, never forwarding it"
+else
+    no "rendered claude-proxy nginx.conf answers /api/hello locally, never forwarding it" \
+        "block: ${hello_block:-<none>}"
+fi
+default_block="$(sed -n '/location \/ {/,/}/p' "$claude_submit_out")"
+if grep -qF 'return 403;' <<< "$default_block"; then
+    ok "rendered claude-proxy nginx.conf still 403s every other path"
+else
+    no "rendered claude-proxy nginx.conf still 403s every other path" \
+        "block: ${default_block:-<none>}"
+fi
 # The manifest's own comments explain in prose that anthropic-beta is
 # passed through untouched, so this checks for a directive that would
 # actually intercept it (proxy_set_header/proxy_hide_header naming it),

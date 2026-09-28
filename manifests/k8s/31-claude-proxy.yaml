@@ -92,6 +92,14 @@ data:
                 return 403;
             }
 
+            # Claude Code's startup connectivity preflight (HEAD, newer
+            # CLIs): a 403 here makes the CLI exit 1 before any real
+            # call. Answered locally, never forwarded -- no new upstream
+            # path, and the credential never rides on it.
+            location = /api/hello {
+                return 200;
+            }
+
             location = /v1/messages {
                 limit_req zone=fork_sandbox burst=10 nodelay;
 
