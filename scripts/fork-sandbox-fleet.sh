@@ -232,6 +232,27 @@ fleet_is_reserved() {
 script_dir="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 PARSE="$script_dir/fork-sandbox-fleet-parse.py"
 
+# A preset name with no file under PRESETS_DIR may still be a --pipeline
+# spec: fork-sandbox.sh's --preset falls back to compiling it (see
+# fork-sandbox-pipeline-spec.py), and a file always wins. Validation must
+# accept what that launch accepts.
+fleet_preset_is_spec() {
+    python3 "$script_dir/fork-sandbox-pipeline-spec.py" "$1" >/dev/null 2>&1
+}
+
+# The preset parser's output for a preset name: its file, or else its
+# compiled spec, piped so nothing lands on disk.
+fleet_parse_preset() {
+    local preset="$1" file="$PRESETS_DIR/$1.yaml"
+    if [[ -f "$file" ]]; then
+        python3 "$script_dir/fork-sandbox-preset-parse.py" "$file" "$preset" "$file"
+    else
+        python3 "$script_dir/fork-sandbox-pipeline-spec.py" "$preset" \
+            | python3 "$script_dir/fork-sandbox-preset-parse.py" /dev/stdin \
+                "$preset" "--pipeline $preset"
+    fi
+}
+
 # Only the teardown verb needs this (fs_pm_state_paths, fs_pm_find_live_run
 # below) -- sourced unconditionally anyway, since every other verb's cost
 # from doing so is a no-op: no vars this script already uses are shadowed.
@@ -333,8 +354,8 @@ cmd_check() {
         preset="${check_preset[$name]:-}"
         if [[ -n "$preset" ]]; then
             preset_path="$PRESETS_DIR/$preset.yaml"
-            if [[ ! -f "$preset_path" ]]; then
-                echo "Error: agents.$name.preset: preset '$preset' does not exist at '$preset_path'." >&2
+            if [[ ! -f "$preset_path" ]] && ! fleet_preset_is_spec "$preset"; then
+                echo "Error: agents.$name.preset: preset '$preset' does not exist at '$preset_path', and does not parse as a --pipeline spec either." >&2
                 rc=1
             fi
         fi
@@ -375,10 +396,10 @@ check_cluster() {
             fi
             rc=1
         fi
-        [[ -n "$preset" && -f "$PRESETS_DIR/$preset.yaml" ]] || continue
+        [[ -n "$preset" ]] || continue
         local preset_out preset_kind preset_agent preset_field preset_value
-        if ! preset_out="$(python3 "$script_dir/fork-sandbox-preset-parse.py" \
-            "$PRESETS_DIR/$preset.yaml" "$preset" "$PRESETS_DIR/$preset.yaml")"; then
+        [[ -f "$PRESETS_DIR/$preset.yaml" ]] || fleet_preset_is_spec "$preset" || continue
+        if ! preset_out="$(fleet_parse_preset "$preset")"; then
             echo "Error: agents.$name.preset: preset '$preset' could not be parsed, so a cluster postmaster cannot tell what harnesses it runs." >&2
             rc=1
             continue

@@ -818,6 +818,46 @@ check "preset: a directory at <name>.yaml fails check" "1" "$preset_dir_rc"
 contains "preset: directory-preset error names the agent path" "$preset_dir_err" "agents.riffler.preset"
 rm -rf "$PRESETS_TEST_DIR/dirpreset.yaml"
 
+# A preset name with no file that parses as a --pipeline spec (see
+# fork-sandbox-pipeline-spec.py) must pass check the same way a file would
+# -- fork-sandbox.sh's own --preset falls back to running it as one, and a
+# fleet seat naming a spec is exercising that same fallback.
+cat > "$FORK_SANDBOX_FLEET_FILE" <<'EOF'
+agents:
+  riffler:
+    preset: ropus
+  tuner: {}
+  scout:
+    harness: pi
+lists:
+  jam-band:
+    members: [riffler, tuner, scout]
+EOF
+check "preset: a --pipeline spec with no file passes check" "0" \
+    "$("$fleet" check >/dev/null 2>&1; echo $?)"
+resolve_lines riffler
+check "preset: the spec-preset itself still resolves as its bare name" "ropus" "$r_preset"
+
+# A name that is neither a preset file nor a valid spec still fails, with
+# the same file-not-found error as before -- the fallback only widens what
+# counts as found, it never widens what "not found" means.
+cat > "$FORK_SANDBOX_FLEET_FILE" <<'EOF'
+agents:
+  riffler:
+    preset: nonexistent
+  tuner: {}
+  scout:
+    harness: pi
+lists:
+  jam-band:
+    members: [riffler, tuner, scout]
+EOF
+preset_spec_err="$("$fleet" check 2>&1)"; preset_spec_rc=$?
+check "preset: a name that is neither a file nor a spec still fails check" \
+    "1" "$preset_spec_rc"
+contains "preset: its error still names the missing file" "$preset_spec_err" \
+    "$PRESETS_TEST_DIR/nonexistent.yaml"
+
 printf '%s\n' "$saved_fleet_for_preset" > "$FORK_SANDBOX_FLEET_FILE"
 unset FORK_SANDBOX_PRESETS_DIR
 
@@ -1508,6 +1548,37 @@ agents:
 EOF
 cl_run --cluster
 lacks "cluster: a pi-only preset adds no preset error" "$cl_out" "agents.alpha.preset"
+
+# A preset name with no file that parses as a --pipeline spec must get the
+# same cluster harness-compatibility check a preset file gets -- before
+# fleet_resolve_preset_yaml, `-f $PRESETS_DIR/$preset.yaml` was false for a
+# spec, so check_cluster's `[[ ... ]] || continue` silently skipped it,
+# letting a codex-harness spec through a cluster check clean.
+cl_fleet <<'EOF'
+agents:
+  alpha: {harness: pi, preset: rsol}
+EOF
+cl_run --cluster
+check "cluster: a --pipeline spec naming a codex agent is refused" "1" "$cl_rc"
+contains "cluster: the spec-preset error names the seat, preset and agent" "$cl_out" \
+    "agents.alpha.preset: preset 'rsol' agent 'reviewer' uses harness 'codex'"
+cl_run "" ""
+check "cluster: the same spec-preset fleet passes plain check" "0" "$cl_rc"
+cl_run --cluster 1
+check "cluster: a codex spec-preset leg is refused even with the credential var" "1" "$cl_rc"
+
+cl_fleet <<'EOF'
+agents:
+  alpha: {harness: pi, preset: ropus}
+EOF
+cl_run --cluster
+check "cluster: a --pipeline spec naming a claude agent is refused without the credential var" \
+    "1" "$cl_rc"
+contains "cluster: the claude-spec-preset error names the seat, preset and agent" "$cl_out" \
+    "agents.alpha.preset: preset 'ropus' agent 'reviewer' uses harness 'claude'"
+cl_run --cluster 1
+lacks "cluster: a claude spec-preset adds no preset error with the credential var" \
+    "$cl_out" "agents.alpha.preset"
 
 cl_fleet <<'EOF'
 agents:
