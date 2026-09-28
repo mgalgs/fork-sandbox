@@ -235,7 +235,10 @@ spec in `preset.json` as `pipeline`, with the spec as its `name`.
 
 What the grammar cannot say — a `fix_agent`, per-seat arguments, a
 network — stays a preset file. `--pipeline` and `--preset` are mutually
-exclusive.
+exclusive, but `--preset <name>` falls back to `--pipeline <name>` when no
+file has that name and the name parses as a spec, so a composition name
+works whether or not its file exists; a file always wins. A spec with no
+`c` stage is a read-only pipeline (see "Read-only pipelines" above).
 
 ## Flags override, key by key
 

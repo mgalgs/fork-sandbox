@@ -172,6 +172,15 @@ reach it — see "What it gives up".)
    shape — never task-shaped flags like `--branch`, `--checkout` or
    `--k8s`, which stay on the command line.
 
+   ### `--pipeline <spec>` — a preset written inline
+
+   `--pipeline csonnet2-rsol2-mopus2` is the preset its composition name
+   spells: `-`-joined `<stage><model>[<N>]` segments, stage `c`/`r`/`m` in
+   that order, each model on its native harness, `N` defaulting to 1. It
+   runs exactly as the equivalent preset file would. `--preset <name>`
+   falls back to it when no file has that name, so a composition name
+   works either way. Grammar and model table: docs/presets.md.
+
    ### `--review-only` — review a branch after the fact
 
    Requires `--checkout <ref>` and runs exactly one review leg over the

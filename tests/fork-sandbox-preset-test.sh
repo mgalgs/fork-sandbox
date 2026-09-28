@@ -1408,6 +1408,16 @@ refuses "a harness suffix needs the model's id on that harness" \
     "model 'sol' has no pi id; it runs on codex" --pipeline csolpi2
 refuses "a malformed segment is refused" \
     "is not <stage><model>[<repeat>]" --pipeline 'chaiku--rsol'
+out="$(run --preset csonnet-rsol 2>"$err")"
+check "--preset falls back to a spec when no file has the name" \
+    "pipeline=csonnet-rsol" "$(head -1 <<< "$out")"
+contains "the fallback is announced" "$(cat "$err")" \
+    "no preset file 'csonnet-rsol'; running it as --pipeline csonnet-rsol"
+out="$(run --preset csonnet2-rsol2-mopus2 2>"$err")"
+check "a preset file wins over the spec its name spells" \
+    "preset=csonnet2-rsol2-mopus2" "$(head -1 <<< "$out")"
+refuses "a name that is neither a file nor a spec still lists the presets" \
+    "Available presets:" --preset nope-at-all
 out="$(run --pipeline csonnetclaude 2>"$err")"
 check "a native harness suffix is accepted" \
     $'pipeline=csonnetclaude\nharness=claude\nmodel=sonnet' "$out"

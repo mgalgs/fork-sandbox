@@ -161,8 +161,11 @@
 #                        csonnet2-rsol2-mopus2. Each model runs on its
 #                        native harness; N defaults to 1. It compiles to a
 #                        preset and runs exactly as --preset would, fix legs
-#                        riding the code seat. Refused with --preset. See
-#                        docs/presets.md.
+#                        riding the code seat. Refused with --preset, which
+#                        falls back to this when no preset file has the
+#                        name. With no c stage it is read-only: ropus,
+#                        mopus or rsonnet-mopus review --checkout once per
+#                        leg. See docs/presets.md.
 # --task-meta '<json>':  one JSON object of orchestrator-supplied task
 #                        metadata -- kind, difficulty, size,
 #                        prompt_template_id, stage -- stored beside the run
@@ -1996,7 +1999,17 @@ if [[ -n "$preset_name" && -z "$pipeline_spec" ]]; then
         exit 1
     fi
     preset_file="$preset_dir/$preset_name.yaml"
-    if [[ ! -f "$preset_file" ]]; then
+    # A name with no file that parses as a --pipeline spec runs as one, so
+    # a composition name works whether or not its file exists; a file
+    # always wins.
+    if [[ ! -f "$preset_file" ]] \
+        && python3 "$script_dir/fork-sandbox-pipeline-spec.py" "$preset_name" \
+            >/dev/null 2>&1; then
+        echo "fork-sandbox: no preset file '$preset_name'; running it as --pipeline $preset_name" >&2
+        pipeline_spec="$preset_name"
+        preset_file=""
+        preset_label="--pipeline"
+    elif [[ ! -f "$preset_file" ]]; then
         echo "Error: no preset '$preset_name' at $(display_config_path "$preset_file")." >&2
         if [[ -d "$preset_dir" ]]; then
             preset_available=""
@@ -2016,8 +2029,9 @@ if [[ -n "$preset_name" && -z "$pipeline_spec" ]]; then
             echo "docs/presets.md for the file format." >&2
         fi
         exit 1
+    else
+        preset_label="$(display_config_path "$preset_file")"
     fi
-    preset_label="$(display_config_path "$preset_file")"
 fi
 if [[ -n "$preset_name" ]]; then
     # ---- parse ----
