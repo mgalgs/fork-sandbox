@@ -306,6 +306,26 @@ everything — they are host-side operator tools. An agent that only calls
 `inbox` for its own name sees only its own mail; anything with
 filesystem access to the store sees all of it.
 
+## Lane mail
+
+`lane-mail.sh` is this store at a separate root, for mail between
+interactive sessions working in lanes (`@frontend`, `@docs`). A mailbox
+belongs to the lane, not the session, so mail survives a handoff to the
+next session. Its header has the details and why the root is separate.
+
+A session takes a lane with `lane-mail.sh register <lane>`. That lets the
+unread-mail hooks show the inbox between turns, but it does not wake an
+idle session. To be woken, run the watcher's `--wait` mode as a
+background command, not a Monitor, which expires on a timer:
+
+```
+lane-mail-watch.sh <lane> --wait     # run_in_background; exits when mail lands
+```
+
+Handle the mail, mark it `lane-mail.sh seen <lane> <id>...`, then launch
+`--wait` again. Relaunching before marking fires again at once on the same
+messages.
+
 ## The fleet registry
 
 `fork-sandbox fleet` answers "who are the agents, and what seat does each

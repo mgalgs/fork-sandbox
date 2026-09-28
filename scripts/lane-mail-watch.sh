@@ -7,34 +7,31 @@
 # when mail lands, while senders keep addressing the lane name with no
 # handle to any session.
 #
-# Streaming mode (default) scans the lane's unread inbox every --interval
+# A session watching its own lane uses --wait, run as a background Bash
+# command -- not a Monitor, which expires on a timer and has to be re-armed
+# even when nothing arrived:
+#
+#   Bash({command: "lane-mail-watch.sh frontend --wait",
+#         run_in_background: true})
+#
+# --wait blocks until the lane's unread view is non-empty, prints one line
+# per unread message, then exits 0 -- there is no timeout. Mail already
+# unread at launch is printed at once. Relaunch contract: mark the messages
+# you handled `seen` BEFORE relaunching --wait, or it fires again at once on
+# the same ids.
+#
+# Streaming mode (the default, without --wait) is for dashboards, tests and
+# other long-lived readers: it scans the unread inbox every --interval
 # seconds (default 15) and prints one line per message id not yet printed,
 # including anything already unread at startup -- an armed watch over a
 # non-empty inbox must say so rather than sit silent. A message read and
 # marked seen between scans is never printed, which is the point of
 # scanning the unread view instead of the raw store. A scan failure prints
 # one error line and keeps looping (the store may be mid-write); --once
-# does a single scan and exits, for tests and ad-hoc checks. Arm streaming
-# mode as a persistent Monitor:
-#
-#   Monitor({command: "lane-mail-watch.sh frontend",
-#            description: "lane-mail for @frontend", persistent: true})
-#
-# --wait mode blocks until the lane's unread view is non-empty, prints one
-# line per unread message in the same format, then exits 0 -- there is no
-# timeout. Mail already unread at launch is printed at once. Run it as a
-# background Bash command instead of a Monitor, since a Monitor wakes on a
-# timer even when there is nothing to read, while --wait only wakes the
-# session when mail actually lands:
-#
-#   Bash({command: "lane-mail-watch.sh frontend --wait",
-#         run_in_background: true})
-#
-# Relaunch contract: mark the messages you handled `seen` BEFORE relaunching
-# --wait, or it fires again at once on the same ids. And a trap to avoid:
-# `lane-mail-watch.sh <lane> | head -1` is not a substitute for --wait --
-# the streaming watcher prints nothing while no mail arrives, so head never
-# takes SIGPIPE and the pipeline never ends.
+# does a single scan and exits, for tests and ad-hoc checks. A trap to
+# avoid: `lane-mail-watch.sh <lane> | head -1` is not a substitute for
+# --wait -- the streaming watcher prints nothing while no mail arrives, so
+# head never takes SIGPIPE and the pipeline never ends.
 #
 # A scan failure in --wait mode counts toward a consecutive-failure limit:
 # on the 5th failure in a row it prints the error line and exits 1, so a

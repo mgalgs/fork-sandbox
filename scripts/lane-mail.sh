@@ -53,6 +53,10 @@ case "$cmd" in
         mkdir -p "$LANES_DIR"
         printf '%s\n' "$lane" > "$LANES_DIR/$sid"
         echo "lane-mail: session ${sid:0:8}... registered as @$lane"
+        # Registering arms no watch. Say how, here, where the caller acts.
+        echo "lane-mail: to be woken when mail lands, run 'lane-mail-watch.sh $lane --wait'"
+        echo "lane-mail: as a background command (not a Monitor, which expires); mark"
+        echo "lane-mail: handled mail seen before relaunching it."
         ;;
     registration)
         sid="${CLAUDE_CODE_SESSION_ID:-}"
