@@ -152,6 +152,14 @@
 #                        step, then at most one maintain step, in that
 #                        order). Needs PyYAML. See docs/presets.md for the
 #                        file format.
+# --pipeline <spec>:     a preset written inline, in the composition-name
+#                        grammar: -joined <stage><model>[<harness>][<N>]
+#                        segments, stage c/r/m in that order, e.g.
+#                        csonnet2-rsol2-mopus2. Each model runs on its
+#                        native harness; N defaults to 1. It compiles to a
+#                        preset and runs exactly as --preset would, fix legs
+#                        riding the code seat. Refused with --preset. See
+#                        docs/presets.md.
 # --task-meta '<json>':  one JSON object of orchestrator-supplied task
 #                        metadata -- kind, difficulty, size,
 #                        prompt_template_id, stage -- stored beside the run
@@ -1593,6 +1601,9 @@ maintainer_model=""
 maintainer_network=""
 preset_name=""
 preset_file=""
+# What messages call the preset: its file, or the --pipeline spec.
+preset_label=""
+pipeline_spec=""
 preset_sha256=""
 preset_staged_bytes=""
 # Preset-only pipeline knobs -- no flag sets these, the preset compiler
@@ -1759,6 +1770,10 @@ while [[ "${1:-}" == -* ]]; do
             ;;
         --preset)
             preset_name="${2:?--preset requires a preset name}"
+            shift 2
+            ;;
+        --pipeline)
+            pipeline_spec="${2:?--pipeline requires a spec, e.g. csonnet2-rsol2-mopus2}"
             shift 2
             ;;
         --foreground|--no-window)
@@ -1947,7 +1962,19 @@ preset_stage_cleanup() {
 # list to inspect.
 preset_is_legacy_shaped=true
 preset_step_count=0
-if [[ -n "$preset_name" ]]; then
+# --pipeline is a preset written inline in the composition-name grammar: it
+# is compiled to a preset document and from there runs the --preset path
+# unchanged, named by its spec.
+if [[ -n "$pipeline_spec" ]]; then
+    if [[ -n "$preset_name" ]]; then
+        echo "Error: --pipeline and --preset are mutually exclusive; each" >&2
+        echo "names the whole pipeline." >&2
+        exit 1
+    fi
+    preset_name="$pipeline_spec"
+    preset_label="--pipeline"
+fi
+if [[ -n "$preset_name" && -z "$pipeline_spec" ]]; then
     preset_dir="${FORK_SANDBOX_PRESETS_DIR:-$config_dir/presets}"
     # The same single-path-component rule discoverer ids follow: with no
     # slash and no leading dot, the name cannot climb out of the presets
@@ -1981,7 +2008,9 @@ if [[ -n "$preset_name" ]]; then
         fi
         exit 1
     fi
-
+    preset_label="$(display_config_path "$preset_file")"
+fi
+if [[ -n "$preset_name" ]]; then
     # ---- parse ----
     # The file is YAML, and everything about the FILE -- validity, the
     # schema, the repeat-loop pipeline structure, the engine-shape rules --
@@ -2054,11 +2083,17 @@ if [[ -n "$preset_name" ]]; then
     # trap; this one removes the staged bytes on any such exit. run_cleanup
     # does the same for the endings that do reach it.
     trap preset_stage_cleanup EXIT
-    cp -- "$preset_file" "$preset_staged_bytes"
+    if [[ -n "$pipeline_spec" ]]; then
+        # The compiler writes its own error to stderr on failure.
+        python3 "$script_dir/fork-sandbox-pipeline-spec.py" "$pipeline_spec" \
+            > "$preset_staged_bytes" || exit 1
+    else
+        cp -- "$preset_file" "$preset_staged_bytes"
+    fi
     preset_sha256="$(sha256sum -- "$preset_staged_bytes" | cut -d' ' -f1)"
     # The parser already wrote its error to stderr when this fails.
     if ! preset_tsv="$(python3 "$script_dir/fork-sandbox-preset-parse.py" \
-        "$preset_staged_bytes" "$preset_name" "$(display_config_path "$preset_file")")"; then
+        "$preset_staged_bytes" "$preset_name" "$preset_label")"; then
         exit 1
     fi
     while IFS=$'\t' read -r preset_f1 preset_f2 preset_f3 preset_f4; do
@@ -2183,7 +2218,7 @@ if [[ -n "$preset_name" ]]; then
         preset_summary+=", maintain $(preset_seat_desc "$preset_maintain_agent") repeat=$preset_maintain_max"
         [[ -z "$preset_maintain_fix_name" ]] || preset_summary+=" fix=$preset_maintain_fix_name"
     fi
-    echo "fork-sandbox: preset '$preset_name' ($(display_config_path "$preset_file")): $preset_summary" >&2
+    echo "fork-sandbox: preset '$preset_name' ($preset_label): $preset_summary" >&2
 
     # ---- compile, flags winning key by key ----
     # Snapshot what the FLAGS gave before any preset value lands, counting a
@@ -2396,7 +2431,7 @@ if [[ -n "$preset_name" ]]; then
         fi
     fi
     else
-        echo "fork-sandbox: preset '$preset_name' ($(display_config_path "$preset_file")): composed pipeline, $preset_step_count steps" >&2
+        echo "fork-sandbox: preset '$preset_name' ($preset_label): composed pipeline, $preset_step_count steps" >&2
     fi
 fi
 
@@ -2899,7 +2934,7 @@ if [[ "$k8s_mode" == true ]]; then
     # absence of any --maintainer-* forwarding at all -- a pre-existing gap
     # left untouched here). Refuse outright rather than silently dropping
     # every step past the first three that happen to line up.
-    if [[ -n "$preset_file" && "$preset_is_legacy_shaped" != true ]]; then
+    if [[ -n "$preset_name" && "$preset_is_legacy_shaped" != true ]]; then
         echo "Error: --k8s does not support a composed pipeline preset ('$preset_name')" >&2
         echo "yet -- only a legacy-shaped preset (one code step, then at most one" >&2
         echo "review step, then at most one maintain step, in that order) can" >&2
@@ -3278,7 +3313,7 @@ fi
 # a composed pipeline. --model/--harness are narrower: they only become
 # ambiguous for every composed pipeline: command-line overrides do not name
 # a step. The runner walks the preset's step list directly.
-if [[ -n "$preset_file" && "$preset_is_legacy_shaped" != true ]]; then
+if [[ -n "$preset_name" && "$preset_is_legacy_shaped" != true ]]; then
     if [[ -n "$review_loop_arg" ]]; then
         echo "Error: --review-loop cannot be combined with preset '$preset_name':" >&2
         echo "composed pipeline; edit the preset or pick another." >&2
@@ -3800,7 +3835,11 @@ if [[ -n "$clone_dir_flag" ]]; then
 fi
 
 if [[ "$dry_run" == true ]]; then
-    [[ -z "$preset_name" ]] || printf 'preset=%s\n' "$preset_name"
+    if [[ -n "$pipeline_spec" ]]; then
+        printf 'pipeline=%s\n' "$pipeline_spec"
+    elif [[ -n "$preset_name" ]]; then
+        printf 'preset=%s\n' "$preset_name"
+    fi
     printf 'harness=%s\nmodel=%s\n' "$harness" "$model"
     [[ -z "$review_model" ]] || printf 'review_model=%s\n' "$review_model"
     [[ "$review_harness_given" != true ]] || printf 'review_harness=%s\n' "$review_harness"
@@ -4923,11 +4962,14 @@ if [[ -n "$preset_name" ]]; then
     # sandbox-run-log.py archives it under this sha256, deduplicated for
     # free by that key.
     mv -- "$preset_staged_bytes" "$run_dir/preset.yaml"
+    # A --pipeline run has no file; its spec is recorded instead.
     jq -n \
         --arg name "$preset_name" \
         --arg file "$preset_file" \
+        --arg pipeline "$pipeline_spec" \
         --arg sha256 "$preset_sha256" \
-        '{name: $name, file: $file, sha256: $sha256}' \
+        'if $pipeline == "" then {name: $name, file: $file, sha256: $sha256}
+         else {name: $name, pipeline: $pipeline, sha256: $sha256} end' \
         > "$run_dir/preset.json"
 fi
 # The prompt overlay's provenance, beside the run for the same reason: what

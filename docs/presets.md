@@ -181,6 +181,39 @@ loop's no-progress check compares the branch across the whole N-pass
 round. Passes after the first do not context-refresh — the refresh chain
 belongs to the first pass of the code step alone.
 
+## Inline pipelines: `--pipeline`
+
+A preset whose name already spells its pipeline need not exist as a file.
+`--pipeline <spec>` takes that name and compiles it:
+
+```
+fork-sandbox.sh --pipeline csonnet2-rsol2-mopus2 ~/src/myrepo handoff.md
+```
+
+The spec is `-`-joined segments, `<stage><model>[<harness>][<N>]`:
+
+- **stage** is `c` (code), `r` (review) or `m` (maintain), each at most
+  once, in that order.
+- **model** is a name from the table at the top of
+  `scripts/fork-sandbox-pipeline-spec.py`, and runs on its native harness:
+  `haiku`, `sonnet`, `opus`, `fable` on claude; `luna`, `terra`, `sol` on
+  codex. A new model is a one-line addition there.
+- **harness**, optional, seats the model on a non-native harness
+  (`csolpi2`); the table must carry the model's id for that harness.
+- **N**, optional and 1 by default, is the code agent's `repeat`, or a
+  review or maintain step's loop cap. `csonnet-rsol-mopus` is one of each.
+
+The spec compiles to the preset document a hand-written preset with the
+same shape would be, and from there runs the `--preset` path unchanged:
+the same parser, the same rules, the same flag overrides (`--claude-args`
+reaches the code seat as it does over a preset). Fix legs ride the code
+seat. `--dry-run` prints the compiled seats, and the run records the
+spec in `preset.json` as `pipeline`, with the spec as its `name`.
+
+What the grammar cannot say — a `fix_agent`, per-seat arguments, a
+network — stays a preset file. `--pipeline` and `--preset` are mutually
+exclusive.
+
 ## Flags override, key by key
 
 A preset value lands in exactly the variable its flag counterpart sets,
@@ -344,6 +377,8 @@ What `preset.json` pins is which document produced all of it, so an
 edit to a preset shows up as a changed hash rather than as two
 indistinguishable runs. No `preset` key at all when the run used no
 preset — the same absence convention every optional record key follows.
+A `--pipeline` run has no file: its `preset.json` carries `pipeline`, the
+spec, in place of `file`, and `preset.yaml` is the compiled document.
 
 Two accounting notes for multi-pass rounds: an iteration's `fix_cost_usd`
 is the passes' sum (null when any pass went unpriced), and its

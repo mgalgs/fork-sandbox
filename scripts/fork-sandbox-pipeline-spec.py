@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+"""Compile a --pipeline spec into a preset document, for fork-sandbox.sh.
+
+Usage: fork-sandbox-pipeline-spec.py <spec>
+
+A spec is a preset's composition name used as the preset itself:
+`-`-joined segments `<stage><model>[<harness>][<repeat>]`, e.g.
+`csonnet2-rsol2-mopus2` (code sonnet x2, review sol x2, maintain opus x2).
+
+    stage    c (code), r (review) or m (maintain); each at most once, in
+             that order.
+    model    a name from MODELS below. It runs on its native harness, the
+             first one listed for it.
+    harness  optional: claude, codex or pi, to seat the model on a
+             non-native harness (`csolpi2`). The model needs an id for that
+             harness in MODELS.
+    repeat   optional, default 1. On the code step it is the agent's
+             repeat, so it reaches the fix legs too, as in a hand-written
+             preset; on a review or maintain step it is the loop cap.
+
+Fix legs ride the code seat: no step names a fix_agent. Anything the
+grammar cannot say (fix_agent, per-seat arguments on another seat, network)
+stays a preset file.
+
+The document is printed on stdout as YAML, and fork-sandbox.sh hands it
+to fork-sandbox-preset-parse.py like any preset file, so every schema and
+engine-shape rule is enforced in one place. Errors go to stderr and exit 1.
+"""
+
+import re
+import sys
+
+# Model name -> {harness: model id}. The first harness is the native one.
+# Names are lowercase letters only: trailing digits are the repeat count.
+MODELS = {
+    "haiku": {"claude": "haiku"},
+    "sonnet": {"claude": "sonnet"},
+    "opus": {"claude": "opus"},
+    "fable": {"claude": "fable"},
+    "luna": {"codex": "gpt-5.6-luna"},
+    "terra": {"codex": "gpt-5.6-terra"},
+    "sol": {"codex": "gpt-5.6-sol"},
+}
+
+HARNESSES = ("claude", "codex", "pi")
+
+STAGES = {"c": "code", "r": "review", "m": "maintain"}
+
+AGENT_NAMES = {"c": "coder", "r": "reviewer", "m": "maintainer"}
+
+
+def fail(spec, msg):
+    sys.stderr.write(f"Error: --pipeline '{spec}': {msg}\n")
+    sys.exit(1)
+
+
+def parse_seat(spec, seg, body):
+    """Split a segment's model[harness] body into (harness, model id)."""
+    if body in MODELS:
+        harness, model_id = next(iter(MODELS[body].items()))
+        return harness, model_id
+    for harness in HARNESSES:
+        name = body[: -len(harness)]
+        if body.endswith(harness) and name in MODELS:
+            ids = MODELS[name]
+            if harness not in ids:
+                fail(spec, f"segment '{seg}': model '{name}' has no "
+                           f"{harness} id; it runs on "
+                           f"{', '.join(ids)}")
+            return harness, ids[harness]
+    fail(spec, f"segment '{seg}': unknown model '{body}'; known models: "
+               f"{', '.join(MODELS)}")
+
+
+def compile_spec(spec):
+    segments = spec.split("-")
+    seen = []
+    seats = []
+    for seg in segments:
+        m = re.fullmatch(r"([a-z])([a-z]+)([0-9]*)", seg)
+        if not m:
+            fail(spec, f"segment '{seg}' is not <stage><model>[<repeat>], "
+                       f"e.g. csonnet2")
+        stage, body, digits = m.groups()
+        if stage not in STAGES:
+            fail(spec, f"segment '{seg}': stage '{stage}' is not c (code), "
+                       f"r (review) or m (maintain)")
+        if stage in seen:
+            fail(spec, f"stage '{stage}' appears twice; each stage appears "
+                       f"at most once")
+        if seen and "crm".index(stage) < "crm".index(seen[-1]):
+            fail(spec, "stages run in the order c, r, m")
+        seen.append(stage)
+        if digits and (digits.startswith("0")):
+            fail(spec, f"segment '{seg}': the repeat count is a positive "
+                       f"integer without a leading zero")
+        repeat = int(digits) if digits else 1
+        harness, model_id = parse_seat(spec, seg, body)
+        seats.append((stage, harness, model_id, repeat))
+
+    lines = [f"# Compiled from --pipeline {spec}", "agents:"]
+    for stage, harness, model_id, repeat in seats:
+        lines += [f"  {AGENT_NAMES[stage]}:",
+                  f"    harness: {harness}",
+                  f"    model: {model_id}"]
+        if stage == "c" and repeat != 1:
+            lines.append(f"    repeat: {repeat}")
+    lines.append("pipeline:")
+    for stage, _, _, repeat in seats:
+        lines += [f"  - action: {STAGES[stage]}",
+                  f"    agent: {AGENT_NAMES[stage]}"]
+        if stage != "c":
+            lines.append(f"    repeat: {repeat}")
+    return "".join(line + "\n" for line in lines)
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 2 or not sys.argv[1]:
+        sys.stderr.write("Usage: fork-sandbox-pipeline-spec.py <spec>\n")
+        sys.exit(1)
+    sys.stdout.write(compile_spec(sys.argv[1]))

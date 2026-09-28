@@ -1270,6 +1270,72 @@ out="$(run --preset spare 2>"$err")"
 contains "an agent that sits no seat draws a warning" "$(cat "$err")" \
     "agent 'spare' is defined but sits no seat"
 
+printf '\n== --pipeline: an inline preset in the composition-name grammar ==\n'
+
+# The same shape as a hand-written preset must compile to the same launch.
+cat > "$presets_dir/csonnet2-rsol2-mopus2.yaml" <<'EOF'
+agents:
+  coder:
+    harness: claude
+    model: sonnet
+    repeat: 2
+  sol:
+    harness: codex/gpt-5.6-sol
+  maintainer:
+    harness: claude
+    model: opus
+pipeline:
+  - action: code
+    agent: coder
+  - action: review
+    repeat: 2
+    agent: sol
+  - action: maintain
+    repeat: 2
+    agent: maintainer
+EOF
+from_file="$(run --preset csonnet2-rsol2-mopus2 2>/dev/null | tail -n +2)"
+out="$(run --pipeline csonnet2-rsol2-mopus2 2>"$err")"
+check "--pipeline prints its spec" "pipeline=csonnet2-rsol2-mopus2" \
+    "$(head -1 <<< "$out")"
+check "--pipeline compiles like the equivalent preset file" "$from_file" \
+    "$(tail -n +2 <<< "$out")"
+contains "--pipeline announces the compiled seats" "$(cat "$err")" \
+    "(--pipeline): code coder (claude/sonnet) x2, review reviewer (codex/gpt-5.6-sol) repeat=2, maintain maintainer (claude/opus) repeat=2"
+
+out="$(run --pipeline csonnet-rsol-mopus 2>"$err")"
+contains "an omitted repeat count is 1" "$(cat "$err")" \
+    "code coder (claude/sonnet), review reviewer (codex/gpt-5.6-sol) repeat=1, maintain maintainer (claude/opus) repeat=1"
+lacks "an omitted code repeat leaves code_repeat unset" "$out" "code_repeat="
+
+out="$(run --pipeline chaiku3 2>"$err")"
+check "a code-only spec compiles" \
+    $'pipeline=chaiku3\nharness=claude\nmodel=haiku\ncode_repeat=3' "$out"
+
+accepts "per-seat flags are accepted over --pipeline" \
+    --pipeline chaiku --claude-args '--effort high'
+
+refuses "--pipeline and --preset are mutually exclusive" \
+    "--pipeline and --preset are mutually exclusive" \
+    --pipeline chaiku --preset fast
+refuses "an unknown model is refused, naming the known ones" \
+    "unknown model 'gpt'; known models: haiku" --pipeline cgpt
+refuses "stages out of order are refused" \
+    "stages run in the order c, r, m" --pipeline mopus-csonnet
+refuses "a repeated stage is refused" \
+    "stage 'r' appears twice" --pipeline chaiku-rsol-rsol
+refuses "an unknown stage letter is refused" \
+    "stage 'x' is not c (code)" --pipeline xsonnet
+refuses "a zero repeat is refused" \
+    "positive integer without a leading zero" --pipeline chaiku0
+refuses "a harness suffix needs the model's id on that harness" \
+    "model 'sol' has no pi id; it runs on codex" --pipeline csolpi2
+refuses "a malformed segment is refused" \
+    "is not <stage><model>[<repeat>]" --pipeline 'chaiku--rsol'
+out="$(run --pipeline csonnetclaude 2>"$err")"
+check "a native harness suffix is accepted" \
+    $'pipeline=csonnetclaude\nharness=claude\nmodel=sonnet' "$out"
+
 printf '\n== the presets directory ==\n'
 
 alt="$tmp/alt-presets"
@@ -1599,6 +1665,29 @@ if rd_a="$(run_stubbed --preset rep3 \
         "$(find "$rd_a" -maxdepth 1 -type f -exec basename {} \; | LC_ALL=C sort)"
 else
     no "rep3 launch succeeds"
+fi
+
+# A --pipeline run records its spec, not a file, and archives the compiled
+# document like any preset definition.
+prep_stub $'commit\nnoop'
+if rd_p="$(run_stubbed --pipeline chaiku2 \
+    --branch "sandbox-test-pipeline-$$")"; then
+    tmpdirs+=("$rd_p")
+    check "a --pipeline run runs its compiled repeat" "2" "$(cat "$count")"
+    check "preset.json records the spec as name and pipeline, and no file" \
+        '{"name":"chaiku2","pipeline":"chaiku2"}' \
+        "$(jq -c '{name, pipeline, file}|del(.file|nulls)' "$rd_p/preset.json")"
+    if cmp -s "$rd_p/preset.yaml" \
+        <(python3 "$repo_dir/scripts/fork-sandbox-pipeline-spec.py" chaiku2); then
+        ok "preset.yaml is the compiled document"
+    else
+        no "preset.yaml is the compiled document" "$(cat "$rd_p/preset.yaml")"
+    fi
+    check "a --pipeline run's sha256 is the compiled document's hash" \
+        "$(jq -r '.sha256' "$rd_p/preset.json")" \
+        "$(sha256sum "$rd_p/preset.yaml" | cut -d' ' -f1)"
+else
+    no "a --pipeline launch succeeds"
 fi
 
 # The round-one composed shape exercises consecutive review steps, a finding
