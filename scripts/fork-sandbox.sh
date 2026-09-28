@@ -2542,6 +2542,15 @@ if [[ "$review_only" == true ]]; then
         echo "Error: --refresh-at is not supported with --review-only." >&2
         exit 1
     fi
+    # The session store belongs to the coding conversation and nothing else
+    # (see the resume splice further down, onto impl_sandbox_cmd alone) --
+    # a review-only run has no coding leg, so these would be silently
+    # ignored rather than resuming anything, if left unrefused.
+    if [[ -n "$session_state" || -n "$resume_session" || -n "$session_id_arg" ]]; then
+        echo "Error: --session-state, --resume-session and --session-id are not supported" >&2
+        echo "with --review-only: there is no coding leg for a session to belong to." >&2
+        exit 1
+    fi
     if [[ "$k8s_mode" == true ]]; then
         echo "Error: --review-only is not supported with --k8s." >&2
         exit 1
@@ -4651,10 +4660,23 @@ claude_credentials_config="$(fs_read_env_value "$config_dir/claude.env" CLAUDE_C
 # invoke the operator's headroom hook -- hook invocation is observable, and
 # this run has no claude leg to balance a credential for). Same test used
 # below for the inbox hook.
+#
+# A read-only pipeline whose only step is a maintain step seats nothing on
+# the implement role at all: preset_impl_agent above is set to that step's
+# agent only so the read-only translation has a seat to describe, but the
+# one leg this run actually makes runs on the maintainer role (resolved
+# separately below), not the implement one. $harness/$model still carry
+# whatever that agent's own (possibly flag-overridden-away) definition
+# says, so counting them here would blame -- or credit -- a leg that never
+# runs, up to invoking the credential balancer for a run that never touches
+# claude at all.
+impl_seat_is_phantom=false
+[[ "$preset_read_only" == true && "$preset_ro_review" != true ]] \
+    && impl_seat_is_phantom=true
 has_claude_leg=false
-if [[ "$harness" == "claude" || "$review_harness" == "claude" \
-    || "$maintainer_harness" == "claude" || "$fix_harness" == "claude" \
-    || "$mntfix_harness" == "claude" ]]; then
+if { [[ "$harness" == "claude" ]] && [[ "$impl_seat_is_phantom" != true ]]; } \
+    || [[ "$review_harness" == "claude" || "$maintainer_harness" == "claude" \
+        || "$fix_harness" == "claude" || "$mntfix_harness" == "claude" ]]; then
     has_claude_leg=true
 fi
 
@@ -4733,7 +4755,29 @@ fi
 # The generated runner deletes all of them when it ends (run_cleanup) --
 # see the codex arm of fs_resolve_harness for why the list and not one.
 codex_auth_dirs=()
-fs_resolve_harness "$harness" "$model" impl "$network"
+if [[ "$impl_seat_is_phantom" == true ]]; then
+    # No leg runs on the implement role for this shape (see
+    # impl_seat_is_phantom above) -- initialize its resolved state the same
+    # empty way fs_resolve_harness itself would, without running its
+    # harness-specific resolution, which can demand config (a pi.env, a
+    # codex login) for a harness nothing here will ever invoke.
+    impl_harness_bin=""; impl_harness_version=""; impl_harness_env_file=""
+    # shellcheck disable=SC2034  # read by fs_build_sandbox_cmd across the
+    # nameref-name boundary, the same false positive fs_resolve_harness's
+    # own namerefs hit for these same names.
+    impl_harness_flags=()
+    impl_harness_cmd=()
+    # shellcheck disable=SC2034
+    impl_harness_exec=0
+    impl_harness_sandbox_bin=""; impl_run_formatter="$formatter"
+    impl_usage_source=""
+    # shellcheck disable=SC2034
+    impl_harness=""
+    # shellcheck disable=SC2034
+    impl_model=""
+else
+    fs_resolve_harness "$harness" "$model" impl "$network"
+fi
 # Compatibility copy: the run record (run.env, the generated runner) and
 # the review-loop accounting below still read these bare names -- moving
 # THEM onto "impl_"/"rev_" is per-leg accounting, a later commit's job, not

@@ -1947,10 +1947,57 @@ else
     no "--model overrides a read-only review seat" "$(cat "$err")"
 fi
 
+# A read-only pipeline has no coding leg for a session to belong to -- the
+# session store is spliced onto the coding conversation alone (see the
+# resume splice further down in fork-sandbox.sh), so these flags would
+# otherwise be silently ignored rather than refused.
+ro_session_state_dir="$(mktemp -d)"; tmpdirs+=("$ro_session_state_dir")
+ro_refuses "--session-state is refused on a read-only pipeline" \
+    "there is no coding leg for a session to belong to" \
+    --pipeline ropus --session-state "$ro_session_state_dir"
+ro_refuses "--resume-session is refused on a read-only pipeline" \
+    "there is no coding leg for a session to belong to" \
+    --pipeline ropus --resume-session some-session-id
+ro_refuses "--session-id is refused on a read-only pipeline" \
+    "there is no coding leg for a session to belong to" \
+    --pipeline ropus --session-id some-session-id
+
 refuses "a read-only pipeline needs --checkout" \
     "is read-only (no code step), so it" --pipeline ropus
 refuses "a read-only --pipeline step with repeat > 1 is refused" \
     "'repeat' is 2 on a read-only review step" --pipeline ropus2 --checkout HEAD
+
+# A maintain-only read-only preset seats its lone step's agent on the
+# implement role too (so the read-only translation and its flag refusals
+# have a seat to describe), even though no leg actually runs there -- the
+# one leg this pipeline makes runs on the maintainer seat instead. Before
+# the fix, that phantom implement seat still went through the ordinary
+# harness resolution (fs_resolve_harness), which can demand config --
+# here, pi.env -- for a harness nothing in this run ever invokes, once
+# --maintainer-harness moves the real (only) leg somewhere else.
+cat > "$real_presets/mnt-only-pi.yaml" <<'EOF'
+agents:
+  elder:
+    harness: pi
+    model: vendor/discovered-model
+pipeline:
+  - action: maintain
+    repeat: 1
+    agent: elder
+EOF
+mv "$real_cfg/pi.env" "$real_cfg/pi.env.aside"
+prep_stub 'approved'
+if rd_pi="$(run_stubbed --preset mnt-only-pi --maintainer-harness claude \
+    --maintainer-model haiku --checkout "ro-target-$$" --review-base "$ro_base")"; then
+    tmpdirs+=("$rd_pi")
+    check "a read-only maintain-only run moved off its preset harness needs no pi.env" \
+        "1" "$(cat "$count")"
+    check "the maintain step really ran on the override harness" "claude" \
+        "$(jq -r '.steps[0].harness' "$rd_pi/pipeline.json")"
+else
+    no "a read-only maintain-only run moved off its preset harness needs no pi.env"
+fi
+mv "$real_cfg/pi.env.aside" "$real_cfg/pi.env"
 
 # The round-one composed shape exercises consecutive review steps, a finding
 # and fix round, and the preceding-verdict handoff to maintain.
