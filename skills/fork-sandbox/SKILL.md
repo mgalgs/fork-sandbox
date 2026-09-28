@@ -179,6 +179,13 @@ reach it — see "What it gives up".)
    with `HEAD`). It is useful for a post-hoc review or a bake-off comparing
    two reviewers on the same branch; it creates no coding or fix leg.
 
+   A pipeline with no code step does the same job, with a choice of seats:
+   `--pipeline ropus --checkout <branch>` reviews once on opus,
+   `--pipeline rsonnet-mopus` adds a maintainer who builds on that review,
+   and `--pipeline mopus` is a maintainer's read alone — each leg once, no
+   fix legs. `--review-only` over a preset drops its code step and runs the
+   rest that way.
+
    **Watching one is no different.** The run counts as running until the last
    leg is done, so the Monitor tool still fires exactly one terminal event,
    at the end of the whole loop, with the summary — which now carries a

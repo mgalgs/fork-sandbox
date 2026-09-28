@@ -137,7 +137,7 @@ omitted, it defaults to the agent's `repeat` property.
 |---|---|
 | `agent` | who reads and writes the verdict. |
 | `repeat` | required — the loop cap: how many verdict-then-fix rounds may run. |
-| `fix_agent` | who acts on findings — any agent, running on its own harness and model, with its own `repeat`. Omitted, it defaults to the first code step's agent in pipeline order, riding the implement command exactly as fix legs always have. A pipeline with no code step has no such default, so a `review`/`maintain` step without an explicit `fix_agent` there is a parse error. |
+| `fix_agent` | who acts on findings — any agent, running on its own harness and model, with its own `repeat`. Omitted, it defaults to the first code step's agent in pipeline order, riding the implement command exactly as fix legs always have. A pipeline with no code step has no such default: with no `fix_agent` anywhere it is read-only (below), and otherwise every `review`/`maintain` step needs one. |
 
 Today's local run engine walks arbitrary linear pipelines. Kubernetes still
 accepts only a **legacy-shaped** pipeline — one code step, then at most one
@@ -159,6 +159,29 @@ then the branch's only review.
 
 The same agent may sit any number of seats; an agent that sits none
 draws a warning, not an error.
+
+### Read-only pipelines
+
+A pipeline with no `code` step and no `fix_agent` has nothing that could
+act on a finding, so it reviews an existing branch instead: each step
+writes its verdict once and the run ends. It takes the `--review-only`
+range — `--checkout <ref>`, from `--review-base` or the merge-base with
+`HEAD` — and the review-only prompt wording, which says no fix leg
+follows. The shapes are a `review` step, a `maintain` step, or a `review`
+step then a `maintain` step, which builds on the review's verdict as it
+does in a coding pipeline. `repeat` must be 1: with no fix leg there is
+nothing to loop on.
+
+```
+fork-sandbox.sh --pipeline ropus --checkout my-branch ~/src/myrepo brief.md
+fork-sandbox.sh --pipeline rsol-mopus --checkout my-branch ~/src/myrepo brief.md
+```
+
+`--review-only` without a preset is the one-review-leg case, seated by
+`--harness`/`--model`. Over a preset it drops the code step and fix seats
+and runs the remaining review and maintain steps this way, once each,
+whatever their `repeat` says (a note says so). Like `--review-only`, a
+read-only pipeline is refused with `--k8s`.
 
 ### Repeat passes
 

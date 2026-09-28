@@ -23,7 +23,10 @@
 #                        still leaves the repo unchanged.
 # --review-only:         review an existing branch once, without a coding or
 #                        fix leg. Requires --checkout; use --review-base to
-#                        choose the start of the review range.
+#                        choose the start of the review range. Over a
+#                        preset, drops its code step and runs its review and
+#                        maintain steps once each -- the same as a
+#                        read-only pipeline (docs/presets.md).
 # --review-base <ref>:   commit the review range starts from. Defaults to the
 #                        origin repo's merge-base of --checkout and HEAD.
 # --model <model>:       model or model alias for the session (e.g. fable,
@@ -1962,6 +1965,12 @@ preset_stage_cleanup() {
 # list to inspect.
 preset_is_legacy_shaped=true
 preset_step_count=0
+# A preset with no code step and no fix seat: review, maintain, or review
+# then maintain, each run once over --checkout, as --review-only does.
+preset_read_only=false
+preset_ro_review=false
+# Whether --review-only itself was given, before a read-only preset sets it.
+review_only_flag="$review_only"
 # --pipeline is a preset written inline in the composition-name grammar: it
 # is compiled to a preset document and from there runs the --preset path
 # unchanged, named by its spec.
@@ -2091,8 +2100,12 @@ if [[ -n "$preset_name" ]]; then
         cp -- "$preset_file" "$preset_staged_bytes"
     fi
     preset_sha256="$(sha256sum -- "$preset_staged_bytes" | cut -d' ' -f1)"
+    # --review-only over a preset keeps only its review and maintain steps.
+    preset_parse_args=()
+    [[ "$review_only" == true ]] && preset_parse_args=(--drop-code)
     # The parser already wrote its error to stderr when this fails.
     if ! preset_tsv="$(python3 "$script_dir/fork-sandbox-preset-parse.py" \
+        "${preset_parse_args[@]}" \
         "$preset_staged_bytes" "$preset_name" "$preset_label")"; then
         exit 1
     fi
@@ -2111,7 +2124,10 @@ if [[ -n "$preset_name" ]]; then
                 esac
                 ;;
             pipeline)
-                preset_step_count="$preset_f3"
+                case "$preset_f2" in
+                    steps) preset_step_count="$preset_f3" ;;
+                    readonly) preset_read_only=true ;;
+                esac
                 ;;
             step)
                 preset_step_k="$preset_f2"
@@ -2147,7 +2163,10 @@ if [[ -n "$preset_name" ]]; then
     # silently pick a step, and it skips this translation instead. It runs
     # through the walker's own arbitrary-step-list walk unchanged.
     preset_is_legacy_shaped=false
-    if (( preset_step_count == 1 )) && [[ "${preset_step_action[1]}" == code ]]; then
+    if [[ "$preset_read_only" == true ]]; then
+        # The parser allows only review, maintain, or review then maintain.
+        preset_is_legacy_shaped=true
+    elif (( preset_step_count == 1 )) && [[ "${preset_step_action[1]}" == code ]]; then
         preset_is_legacy_shaped=true
     elif (( preset_step_count == 2 )) && [[ "${preset_step_action[1]}" == code ]] \
         && [[ "${preset_step_action[2]}" == review || "${preset_step_action[2]}" == maintain ]]; then
@@ -2158,7 +2177,22 @@ if [[ -n "$preset_name" ]]; then
         preset_is_legacy_shaped=true
     fi
 
-    if [[ "$preset_is_legacy_shaped" == true ]]; then
+    preset_ro_review=false
+    if [[ "$preset_read_only" == true ]]; then
+        # The first step's agent takes the implement seat, which is where
+        # the review-only leg runs; a maintain step also takes the maintain
+        # seat, run once with no fix leg.
+        review_only=true
+        preset_impl_agent="${preset_step_agent[1]}"
+        [[ "${preset_step_action[1]}" == review ]] && preset_ro_review=true
+        for ((preset_k = 1; preset_k <= preset_step_count; preset_k++)); do
+            if [[ "${preset_step_action[$preset_k]}" == maintain ]]; then
+                preset_maintain_agent="${preset_step_agent[$preset_k]}"
+                preset_maintain_max=1
+                preset_maintain_fix_default=1
+            fi
+        done
+    elif [[ "$preset_is_legacy_shaped" == true ]]; then
         preset_impl_agent="${preset_step_agent[1]}"
         preset_impl_repeat="${preset_step_repeat[1]:-1}"
         preset_impl_refresh_at="${preset_step_refresh_at[1]:-}"
@@ -2208,8 +2242,14 @@ if [[ -n "$preset_name" ]]; then
     if [[ "$preset_is_legacy_shaped" == true ]]; then
     # Announced before the compile below, so the picture of what the preset
     # says comes first and any "--x overrides ..." notes read against it.
-    preset_summary="code $(preset_seat_desc "$preset_impl_agent")"
-    [[ "$preset_impl_repeat" == "1" ]] || preset_summary+=" x$preset_impl_repeat"
+    if [[ "$preset_read_only" == true ]]; then
+        preset_summary="read-only"
+        [[ "$preset_ro_review" == true ]] \
+            && preset_summary+=", review $(preset_seat_desc "$preset_impl_agent")"
+    else
+        preset_summary="code $(preset_seat_desc "$preset_impl_agent")"
+        [[ "$preset_impl_repeat" == "1" ]] || preset_summary+=" x$preset_impl_repeat"
+    fi
     if [[ -n "$preset_review_agent" ]]; then
         preset_summary+=", review $(preset_seat_desc "$preset_review_agent") repeat=$preset_review_max"
         [[ -z "$preset_review_fix_name" ]] || preset_summary+=" fix=$preset_review_fix_name"
@@ -2438,7 +2478,12 @@ fi
 if [[ "$review_only" == true ]]; then
     mode=review-only
     if [[ -z "$checkout_ref" ]]; then
-        echo "Error: --review-only requires --checkout <ref>." >&2
+        if [[ "$review_only_flag" != true ]]; then
+            echo "Error: preset '$preset_name' is read-only (no code step), so it" >&2
+            echo "reviews an existing branch: name it with --checkout <ref>." >&2
+        else
+            echo "Error: --review-only requires --checkout <ref>." >&2
+        fi
         exit 1
     fi
     if [[ -n "$review_model" || "$review_harness_given" == true || -n "$review_loop_arg" ]]; then
@@ -2446,7 +2491,9 @@ if [[ "$review_only" == true ]]; then
         echo "with --harness/--model." >&2
         exit 1
     fi
-    if [[ -n "$maintainer_model" || "$maintainer_harness_given" == true || -n "$maintainer_loop_arg" ]]; then
+    # A read-only pipeline seats its maintain step here itself.
+    if [[ "$preset_read_only" != true ]] \
+        && [[ -n "$maintainer_model" || "$maintainer_harness_given" == true || -n "$maintainer_loop_arg" ]]; then
         echo "Error: --review-only runs one review leg and has no coding leg" >&2
         echo "whose branch a maintainer would review -- --maintainer-loop and" >&2
         echo "its harness and model flags are not supported with --review-only." >&2
@@ -3461,10 +3508,12 @@ if [[ "$maintainer_loop_cap" != "0" && -z "$maintainer_model" ]]; then
     exit 1
 fi
 if [[ -n "$review_base_ref" && "$review_only" != true ]]; then
-    echo "Error: --review-base only applies with --review-only." >&2
+    echo "Error: --review-base only applies with --review-only or a read-only pipeline." >&2
     exit 1
 fi
-if [[ "$review_only" == true ]]; then
+# A read-only pipeline of one maintain step has no review leg.
+if [[ "$review_only" == true ]] \
+    && [[ "$preset_read_only" != true || "$preset_ro_review" == true ]]; then
     review_loop_cap=1
 fi
 # FORK_SANDBOX_RUN_SOURCE is a token that ends up in the durable run log,
@@ -6056,6 +6105,9 @@ fix_prompt_header=""
 review_verdict_file=""
 maintainer_prompt=""
 maintainer_verdict_file=""
+# Read by the review and maintainer prompt builders below.
+review_prompt_flavor=spec
+[[ "$review_only" == true ]] && review_prompt_flavor=review-only
 # Survives the cap-scalar retirement -- see the justification on
 # maintainer_loop_cap's read above (fixed-name legacy artifact, not a
 # run_step_kind gate a composed step could also satisfy).
@@ -6070,16 +6122,13 @@ if (( review_loop_cap > 0 )); then
     # for this run. fs_emit_review_prompt_body's default "spec" flavor
     # would tell the reviewer to treat that brief as the spec and report
     # its own "what to look at" language as missing work -- see
-    # fs_emit_handoff_spec_section. This is the only site that needs a
-    # flavor, but not because it is the only one review-only reaches: the
+    # fs_emit_handoff_spec_section. The maintainer prompt below (a
+    # read-only pipeline's maintain step) takes the same flavor. The
     # fix-header site just below is gated on review_loop_cap > 0, which
     # --review-only forces to 1, so it would render too. A review-only run
     # can never build a fix leg -- a FINDINGS verdict ends the run -- so
     # that site is gated off there outright rather than flavored. The k8s
-    # path refuses --review-only, and the maintainer prompt is built only
-    # with --maintainer-loop, which --review-only refuses.
-    review_prompt_flavor=spec
-    [[ "$review_only" == true ]] && review_prompt_flavor=review-only
+    # path refuses --review-only.
     {
         fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" \
             "$review_preamble_harness" "$review_preamble_network" "$outbox_dir" \
@@ -6161,7 +6210,7 @@ if (( maintainer_loop_cap > 0 )); then
         fs_emit_prompt_overlay maintainer
         fs_emit_maintainer_prompt_body "$branch" "$base_sha" \
             "$maintainer_verdict_file" "$inbox_dir" "$mnt_inner_review" \
-            "$handoff_file"
+            "$handoff_file" "$review_prompt_flavor"
     } > "$maintainer_prompt.part"
     mv -- "$maintainer_prompt.part" "$maintainer_prompt"
 fi
@@ -8485,7 +8534,12 @@ run_leg() {
         leg_tag="$kind-$n"
     fi
     local leg_events="$run_dir/events-$leg_tag.jsonl"
-    [[ "$mode" == "review-only" ]] && leg_events="$run_dir/events.jsonl"
+    # A review-only run has no implement leg, so its first leg's events are
+    # the run's own; a read-only maintain leg after it keeps its own file.
+    if [[ "$mode" == "review-only" && "${ro_events_claimed:-0}" != 1 ]]; then
+        leg_events="$run_dir/events.jsonl"
+        ro_events_claimed=1
+    fi
     local leg_session="" leg_session_copy="" idx
     local leg_retry_error="" leg_head_before="" leg_head_after="" leg_failed_retry=""
     local -a cmd=("${sandbox_cmd[@]}")
@@ -8823,7 +8877,7 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count && stop_requested != 1; cur
     cur_fix_kind=fix
     [[ "$cur_legacy" == 1 && "$cur_kind" == maintainer ]] && cur_fix_kind=mntfix
     cur_coding_rc="$rc"
-    [[ "$cur_legacy" == 1 && "$cur_kind" == review && "$mode" == "review-only" ]] && cur_coding_rc=""
+    [[ "$cur_legacy" == 1 && "$mode" == "review-only" ]] && cur_coding_rc=""
     # The first code pass is the historical implementation invocation.
     if [[ "$cur_kind" == code ]]; then
         cur_pass=1
@@ -8983,10 +9037,15 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count && stop_requested != 1; cur
                         printf 'The review loop read the diff line by line before this loop\n'
                         printf 'started. Its verdict from iteration %s is below, in full: this\n' "$cur_mp_n"
                         printf 'is the "findings to build on" the prompt above names. Build on\n'
-                        printf 'it rather than re-review what the loop already reviewed -- but\n'
-                        printf 'it is the loop'\''s account of the branch as it stood when the\n'
-                        printf 'loop ended, and the fix legs have committed since, so check\n'
-                        printf 'each finding against what is there now.\n\n'
+                        printf 'it rather than re-review what the loop already reviewed'
+                        if [[ "$mode" == "review-only" ]]; then
+                            printf '. This run\nhas no fix leg, so the branch is unchanged since it was written.\n\n'
+                        else
+                            printf ' -- but\n'
+                            printf 'it is the loop'\''s account of the branch as it stood when the\n'
+                            printf 'loop ended, and the fix legs have committed since, so check\n'
+                            printf 'each finding against what is there now.\n\n'
+                        fi
                         cat -- "$cur_mp_verdict"
                     else
                         printf '\n---\n\n## The inner review left no verdict\n\n'
@@ -9079,7 +9138,7 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count && stop_requested != 1; cur
                         [[ "$cur_findings" =~ ^[0-9]+$ ]] || cur_findings=null
                         printf 'fork-sandbox: %s iteration %s: FINDINGS (%s cited)\n' "$cur_kind" "$cur_i" "$cur_findings"
                         cur_save_live
-                        if [[ "$cur_kind" == review && "$mode" == "review-only" ]]; then
+                        if [[ "$mode" == "review-only" ]]; then
                             cur_ended=findings
                         else
                             # The fix leg's prompt: the generated header
@@ -9202,21 +9261,36 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count && stop_requested != 1; cur
             printf 'fork-sandbox: review loop ended: %s\n' "$cur_ended"
         fi
     fi
-    if [[ "$cur_legacy" == 1 && "$cur_kind" == review && "$mode" == "review-only" ]]; then
+    # A review-only run is one review leg, one maintain leg, or a review
+    # then a maintain leg (a read-only pipeline); each reports here, and
+    # the last one publishes the run's cost.
+    if [[ "$cur_legacy" == 1 && "$mode" == "review-only" ]]; then
+        cur_ro_what="review"
+        [[ "$cur_kind" == maintainer ]] && cur_ro_what="maintainer"
+        cur_ro_tag="review-only"
+        [[ "$cur_kind" == maintainer ]] && cur_ro_tag="review-only maintainer"
         case "$cur_ended" in
-            approved) printf 'fork-sandbox: review-only: APPROVED\n' ;;
-            findings) printf 'fork-sandbox: review-only: FINDINGS (%s cited)\n' "$cur_findings" ;;
+            approved) printf 'fork-sandbox: %s: APPROVED\n' "$cur_ro_tag" ;;
+            findings) printf 'fork-sandbox: %s: FINDINGS (%s cited)\n' "$cur_ro_tag" "$cur_findings" ;;
         esac
-        printf 'fork-sandbox: review verdict: %s\n' "$run_dir/review-verdict-1.md"
-        run_cost="$leg_cost"
-        run_usage="$leg_usage"
-        run_error="${leg_error:-$leg_harness_error}"
-        if [[ "$run_cost" =~ ^-?[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?$ ]]; then
-            run_cost_fmt="$(printf '%.6f' "$run_cost")"
-        else
-            run_cost_fmt=""
-        fi
+        printf 'fork-sandbox: %s verdict: %s\n' "$cur_ro_what" "$run_dir/$cur_ro_what-verdict-1.md"
+        [[ -n "${run_error:-}" ]] || run_error="${leg_error:-$leg_harness_error}"
         [[ "$cur_ended" == "harness-error" ]] && rc=1
+        if (( cur_step_no == run_step_count )); then
+            if (( run_step_count == 1 )); then
+                run_cost="$leg_cost"
+                run_usage="$leg_usage"
+            else
+                run_cost=""
+                [[ "$loop_cost_unknown" == 1 ]] || run_cost="$loop_cost_sum"
+                run_usage=null
+            fi
+            if [[ "$run_cost" =~ ^-?[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?$ ]]; then
+                run_cost_fmt="$(printf '%.6f' "$run_cost")"
+            else
+                run_cost_fmt=""
+            fi
+        fi
     fi
 done
 

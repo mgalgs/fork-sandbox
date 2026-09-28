@@ -364,9 +364,10 @@ refuses "an unknown preset is refused and the listing names the rest" \
 refuses "a path-shaped preset name is refused" \
     "never" --preset ../evil
 
-refuses "a preset with loops is refused with --review-only" \
-    "--review-only runs one review leg" \
-    --preset deep --review-only --checkout HEAD
+# --review-only over a preset keeps its review and maintain steps, once
+# each; the read-only tests below launch it against a real range.
+refuses "--review-only over a preset still requires --checkout" \
+    "--review-only requires --checkout" --preset deep --review-only
 
 # harness: pi-local already means sealed; a conflicting explicit key is
 # refused rather than silently resolved one way or the other.
@@ -525,8 +526,8 @@ pipeline:
   - action: code
     agent: coder
 EOF
-refuses "a repeating code seat is refused with --review-only" \
-    "nothing to repeat" \
+refuses "--review-only over a code-only preset leaves nothing to run" \
+    "drops the code step, and this pipeline has no review or maintain step left" \
     --preset fast3 --review-only --checkout HEAD
 
 refuses "a preset's compiled values meet the --k8s refusals like flags do" \
@@ -610,8 +611,8 @@ refuses "--harness is refused against a composed pipeline with more than one cod
 refuses "--k8s is refused against a composed pipeline preset" \
     "does not support a composed pipeline preset ('composed')" \
     --preset composed --k8s
-refuses "--review-only is refused against a composed pipeline preset" \
-    "composed pipeline; edit the preset or pick another" \
+refuses "--review-only refuses a preset whose remaining steps are not a read-only shape" \
+    "a read-only pipeline (no code step, no fix_agent) is a review step, a maintain step, or a review step then a maintain step" \
     --preset composed --review-only --checkout HEAD
 
 accepts "a composed pipeline preset launches with no conflicting flags" --preset composed
@@ -1175,9 +1176,8 @@ pipeline:
     agent: coder
 EOF
 
-parse_refuses "a codeless pipeline without fix_agent is refused" \
-    "the review step needs 'fix_agent' -- this pipeline has no code step" \
-    <<'EOF'
+parses "a codeless pipeline without fix_agent is read-only" \
+    "pipeline	readonly	1" "step	1	max	1" <<'EOF'
 agents:
   reviewer:
     harness: claude
@@ -1187,6 +1187,82 @@ pipeline:
     repeat: 1
     agent: reviewer
 EOF
+lacks "a read-only step has no fix seat" "$(python3 "$preset_parser" \
+    "$tmp/parse.yaml" parsetest x 2>&1)" "fix_"
+
+parse_refuses "a codeless pipeline with a fix_agent on only one step still needs it on the other" \
+    "the maintain step needs 'fix_agent' -- this pipeline has no code step" <<'EOF'
+agents:
+  reviewer:
+    harness: claude
+    model: opus
+pipeline:
+  - action: review
+    repeat: 1
+    agent: reviewer
+    fix_agent: reviewer
+  - action: maintain
+    repeat: 1
+    agent: reviewer
+EOF
+
+parse_refuses "a read-only step with repeat > 1 is refused" \
+    "'repeat' is 2 on a read-only review step" <<'EOF'
+agents:
+  reviewer:
+    harness: claude
+    model: opus
+pipeline:
+  - action: review
+    repeat: 2
+    agent: reviewer
+EOF
+
+parse_refuses "a read-only pipeline must be review, maintain, or review then maintain" \
+    "a read-only pipeline (no code step, no fix_agent) is a review step" <<'EOF'
+agents:
+  reviewer:
+    harness: claude
+    model: opus
+pipeline:
+  - action: maintain
+    repeat: 1
+    agent: reviewer
+  - action: review
+    repeat: 1
+    agent: reviewer
+EOF
+
+cat > "$tmp/parse.yaml" <<'EOF'
+agents:
+  coder:
+    harness: claude
+    model: sonnet
+    repeat: 2
+    claude-args: --effort high
+  reviewer:
+    harness: claude
+    model: opus
+pipeline:
+  - action: code
+    agent: coder
+  - action: review
+    repeat: 2
+    agent: reviewer
+  - action: maintain
+    repeat: 2
+    agent: reviewer
+EOF
+out="$(python3 "$preset_parser" --drop-code "$tmp/parse.yaml" parsetest x 2>"$err")"
+contains "--drop-code makes the pipeline read-only" "$out" "pipeline	readonly	1"
+contains "--drop-code: the review step comes first" "$out" "step	1	action	review"
+contains "--drop-code: the maintain step follows" "$out" "step	2	action	maintain"
+contains "--drop-code: the maintain step runs once" "$out" "step	2	max	1"
+lacks "--drop-code: no fix seat survives" "$out" "fix_"
+lacks "--drop-code: the dropped coder's arguments are not checked" "$(cat "$err")" "Error"
+contains "--drop-code: a clamped repeat is announced" "$out" \
+    "warn	--review-only runs the review step once, not its repeat of 2"
+lacks "--drop-code: the dropped coder draws no unused warning" "$out" "agent 'coder'"
 
 # A codeless pipeline WITH an explicit fix_agent on every review/maintain
 # step is fine.
@@ -1417,7 +1493,7 @@ printf '%s\n' "$*" >> "$FAKE_ARGV_LOG"
 # The scripted role: FAKE_SCRIPT holds one action per line, indexed by call
 # number -- "commit", "findings", "approved", or "noop".
 action="$(sed -n "${n}p" "$FAKE_SCRIPT" 2>/dev/null)"
-verdict_name="$(printf '%s\n' "$prompt" | sed -nE 's|.*\.git/(s[0-9]+-verdict\.md).*|\1|p' | head -1)"
+verdict_name="$(printf '%s\n' "$prompt" | sed -nE 's#.*\.git/(s[0-9]+-verdict\.md|maintainer-verdict\.md).*#\1#p' | head -1)"
 [[ -n "$verdict_name" ]] || verdict_name=review-verdict.md
 case "$action" in
 commit)
@@ -1689,6 +1765,103 @@ if rd_p="$(run_stubbed --pipeline chaiku2 \
 else
     no "a --pipeline launch succeeds"
 fi
+
+# Read-only pipelines review an existing branch: each step writes its
+# verdict once, a maintain step builds on the review's, and no fix leg runs.
+ro_base="$(git -C "$proj" rev-parse HEAD)"
+git -C "$proj" branch -q "ro-target-$$"
+git -C "$proj" -c user.email=t@fork-sandbox.invalid -c user.name=Tester \
+    commit -q --allow-empty -m "work under review"
+git -C "$proj" branch -q -f "ro-target-$$" HEAD
+git -C "$proj" reset -q --hard "$ro_base"
+
+prep_stub $'findings\napproved'
+if rd_ro="$(run_stubbed --pipeline rhaiku-mopus --checkout "ro-target-$$" \
+    --review-base "$ro_base")"; then
+    tmpdirs+=("$rd_ro")
+    check "a read-only review-then-maintain pipeline runs two legs" "2" "$(cat "$count")"
+    check "the review verdict is kept" "FINDINGS" "$(head -1 "$rd_ro/review-verdict-1.md" 2>/dev/null)"
+    check "the maintain verdict is kept" "APPROVED" "$(head -1 "$rd_ro/maintainer-verdict-1.md" 2>/dev/null)"
+    contains "the maintainer prompt carries the review's verdict" \
+        "$(cat "$rd_ro/maintainer-prompt-1.md")" "the stub found a problem"
+    contains "the maintainer prompt says no fix leg follows" \
+        "$(cat "$rd_ro/maintainer-prompt-1.md")" "This run has no fix leg"
+    lacks "the maintainer prompt is not the spec flavor" \
+        "$(cat "$rd_ro/maintainer-prompt-1.md")" "Another session applies the fixes"
+    if compgen -G "$rd_ro/*fix-prompt*" >/dev/null; then
+        no "a read-only run builds no fix prompt" "$(ls "$rd_ro")"
+    else
+        ok "a read-only run builds no fix prompt"
+    fi
+    check "the review leg's events are the run's own" "1" \
+        "$( [[ -s "$rd_ro/events.jsonl" && -s "$rd_ro/events-maintainer-1.jsonl" ]] && echo 1)"
+    check "a read-only run exits 0" "0" "$(cat "$rd_ro/exit-code" 2>/dev/null)"
+    check "the review step ended on findings" "findings" \
+        "$(jq -r '.ended' "$rd_ro/review-loop.json")"
+    check "the maintain step approved" "approved" \
+        "$(jq -r '.ended' "$rd_ro/maintainer-loop.json")"
+    check "the total cost sums both legs" "0.020000" \
+        "$(jq -r '.total_cost_usd' "$rd_ro/summary.json")"
+    check "pipeline.json records review then maintain, no code step" \
+        "review,maintain" "$(jq -r '[.steps[].action] | join(",")' "$rd_ro/pipeline.json")"
+else
+    no "a read-only review-then-maintain launch succeeds"
+fi
+
+prep_stub 'findings'
+if rd_rm="$(run_stubbed --pipeline mopus --checkout "ro-target-$$" \
+    --review-base "$ro_base")"; then
+    tmpdirs+=("$rd_rm")
+    check "a read-only maintain step runs one leg" "1" "$(cat "$count")"
+    check "its FINDINGS verdict is kept" "FINDINGS" \
+        "$(head -1 "$rd_rm/maintainer-verdict-1.md" 2>/dev/null)"
+    check "no review leg ran" "" "$(compgen -G "$rd_rm/review-verdict-*" || true)"
+    contains "a lone maintainer reads the diff itself" \
+        "$(cat "$rd_rm/maintainer-prompt-1.md")" "No review has read"
+    check "the maintain step ended on findings, with no fix" "findings" \
+        "$(jq -r '.ended' "$rd_rm/maintainer-loop.json")"
+    check "its leg's events are the run's own" "1" \
+        "$( [[ -s "$rd_rm/events.jsonl" ]] && echo 1)"
+else
+    no "a read-only maintain-only launch succeeds"
+fi
+
+# --review-only over a preset drops its code step and runs the rest once.
+cat > "$real_presets/ro-alias.yaml" <<'EOF'
+agents:
+  coder:
+    harness: claude
+    model: haiku
+    repeat: 2
+  elder:
+    harness: claude
+    model: opus
+pipeline:
+  - action: code
+    agent: coder
+  - action: review
+    repeat: 2
+    agent: coder
+  - action: maintain
+    repeat: 2
+    agent: elder
+EOF
+prep_stub $'approved\napproved'
+if rd_ra="$(run_stubbed --preset ro-alias --review-only --checkout "ro-target-$$" \
+    --review-base "$ro_base")"; then
+    tmpdirs+=("$rd_ra")
+    check "--review-only over a preset runs its review and maintain once each" \
+        "2" "$(cat "$count")"
+    check "--review-only's review runs on the review agent's model" "haiku" \
+        "$(jq -r '.steps[0].model' "$rd_ra/pipeline.json")"
+else
+    no "--review-only over a preset launches"
+fi
+
+refuses "a read-only pipeline needs --checkout" \
+    "is read-only (no code step), so it" --pipeline ropus
+refuses "a read-only --pipeline step with repeat > 1 is refused" \
+    "'repeat' is 2 on a read-only review step" --pipeline ropus2 --checkout HEAD
 
 # The round-one composed shape exercises consecutive review steps, a finding
 # and fix round, and the preceding-verdict handoff to maintain.

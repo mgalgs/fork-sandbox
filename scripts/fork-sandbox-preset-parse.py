@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """Parse and validate one fork-sandbox preset file, for fork-sandbox.sh.
 
-Usage: fork-sandbox-preset-parse.py <file> <name> <label>
+Usage: fork-sandbox-preset-parse.py [--drop-code] <file> <name> <label>
 
 A preset is a YAML document shaped like a CI workflow file: an `agents`
 mapping and a `pipeline` list of steps -- each `action: code`, `review` or
 `maintain`, in any order and any count, so long as there is at least one.
 A `code` step is a coding leg; a `review`/`maintain` step is a loop with a
 `repeat` cap and an optional `fix_agent` of its own (see docs/presets.md).
+A pipeline with no code step and no fix_agent is read-only: each step
+writes its verdict once. --drop-code (for --review-only) removes the code
+steps and fix seats, making any pipeline read-only.
 This script owns everything about the FILE -- YAML validity, the schema,
 the pipeline structure, the engine-shape rules -- and emits the result as
 tab-separated lines on stdout for fork-sandbox.sh to compile into its own
@@ -21,6 +24,7 @@ ordered step list:
     agent <name> endpoint <value>       (empty value when unset)
     agent <name> network <value>        (empty value when unset)
     pipeline steps <n>                  (the number of pipeline steps)
+    pipeline readonly 1                 (read-only: no fix_* step lines)
     step <k> action <code|review|maintain>   (k is 1-based, pipeline order)
     step <k> agent <name>
     step <k> repeat <n>                 (code step only, when != 1)
@@ -281,6 +285,51 @@ def main():
             steps.append({"index": i, "action": verb, "agent": reviewer,
                           "cap": cap, "fix_ref": fix_ref})
 
+    # ---- read-only pipelines ----
+    # With no code step and no fix_agent, nothing can act on a finding, so
+    # the pipeline reviews an existing branch: each step writes its verdict
+    # once. --drop-code (fork-sandbox.sh's --review-only over a preset)
+    # makes any pipeline read-only by dropping its code steps and fix seats.
+    dropped_agents = set()
+    early_warns = []
+    if DROP_CODE:
+        dropped_agents = {s["agent"] for s in steps if s["action"] == "code"}
+        dropped_agents |= {s["fix_ref"] for s in steps
+                           if s["action"] != "code" and s["fix_ref"]}
+        steps = [s for s in steps if s["action"] != "code"]
+        if not steps:
+            fail("--review-only drops the code step, and this pipeline has "
+                 "no review or maintain step left to run")
+        for s in steps:
+            s["fix_ref"] = None
+    read_only = (all(s["action"] != "code" for s in steps)
+                 and all(s["fix_ref"] is None for s in steps))
+    if read_only:
+        shape = [s["action"] for s in steps]
+        if shape not in (["review"], ["maintain"], ["review", "maintain"]):
+            fail("a read-only pipeline (no code step, no fix_agent) is a "
+                 "review step, a maintain step, or a review step then a "
+                 "maintain step")
+        for s in steps:
+            if s["cap"] != 1:
+                if not DROP_CODE:
+                    fail(f"pipeline[{s['index']}]: 'repeat' is {s['cap']} on "
+                         f"a read-only {s['action']} step -- with no fix "
+                         f"leg there is nothing to loop on; use 1")
+                early_warns.append(f"--review-only runs the {s['action']} "
+                                   f"step once, not its repeat of {s['cap']}")
+                s["cap"] = 1
+        # Seats count from what remains: an agent that only sat a dropped
+        # code step is neither checked nor warned about, and a kept one's
+        # coding-only properties have nothing left to apply to.
+        seated_ro = {s["agent"] for s in steps}
+        agents = {n: a for n, a in agents.items()
+                  if n in seated_ro or n not in dropped_agents}
+        if DROP_CODE:
+            for agent in agents.values():
+                agent.update(repeat=1, refresh_at="", refresh_max="",
+                             endpoint="")
+
     # ---- pipeline: pass 2, seat resolution ----
     # Fix seats default to the first code step's agent, in pipeline order,
     # regardless of where the review/maintain step needing one sits --
@@ -298,6 +347,8 @@ def main():
         if s["action"] == "code":
             s["repeat_eff"] = (s["repeat"] if s["repeat"] is not None
                                 else agents[s["agent"]]["repeat"])
+        elif read_only:
+            s["fix_resolved"] = None
         else:
             if s["fix_ref"] is None:
                 if not first_code_agent:
@@ -313,7 +364,7 @@ def main():
     # ---- engine-shape rules that need the seats ----
     code_step_agents = {s["agent"] for s in steps if s["action"] == "code"}
     fix_agents = {s["fix_resolved"] for s in steps
-                  if s["action"] in ("review", "maintain")}
+                  if s["action"] in ("review", "maintain")} - {None}
     coding = code_step_agents | fix_agents
     seated = coding | {s["agent"] for s in steps
                         if s["action"] in ("review", "maintain")}
@@ -324,7 +375,7 @@ def main():
             fail(f"agents.{first_code_agent}: refresh keys on a code seat "
                  f"whose harness is '{impl['harness']}' -- context refresh "
                  f"is claude-only")
-    warns = []
+    warns = early_warns
     for name, agent in agents.items():
         if name != first_code_agent and (agent["claude_args"] or agent["pi_args"]
                                          or agent["codex_args"]):
@@ -369,8 +420,9 @@ def main():
                     "endpoint", "network"):
             out.append(f"agent\t{name}\t{prop}\t{agent[prop]}")
     out.append(f"pipeline\tsteps\t{len(steps)}")
-    for s in steps:
-        k = s["index"] + 1
+    if read_only:
+        out.append("pipeline\treadonly\t1")
+    for k, s in enumerate(steps, 1):
         out.append(f"step\t{k}\taction\t{s['action']}")
         out.append(f"step\t{k}\tagent\t{s['agent']}")
         if s["action"] == "code":
@@ -382,6 +434,8 @@ def main():
                     out.append(f"step\t{k}\trefresh_at\t{impl['refresh_at']}")
                 if impl["refresh_max"]:
                     out.append(f"step\t{k}\trefresh_max\t{impl['refresh_max']}")
+        elif read_only:
+            out.append(f"step\t{k}\tmax\t{s['cap']}")
         else:
             out.append(f"step\t{k}\tmax\t{s['cap']}")
             fixer = agents[s["fix_resolved"]]
@@ -399,9 +453,13 @@ def main():
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 4:
-        sys.stderr.write(
-            "Usage: fork-sandbox-preset-parse.py <file> <name> <label>\n")
+    argv = sys.argv[1:]
+    DROP_CODE = bool(argv) and argv[0] == "--drop-code"
+    if DROP_CODE:
+        argv = argv[1:]
+    if len(argv) != 3:
+        sys.stderr.write("Usage: fork-sandbox-preset-parse.py [--drop-code] "
+                         "<file> <name> <label>\n")
         sys.exit(1)
-    FILE, NAME, LABEL = sys.argv[1], sys.argv[2], sys.argv[3]
+    FILE, NAME, LABEL = argv
     main()

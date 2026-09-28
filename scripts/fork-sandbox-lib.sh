@@ -2735,13 +2735,67 @@ EOF
 #
 # $6  handoff_file  the caller's original handoff, embedded at the end of
 #                   the body; see fs_append_handoff_brief.
+# $7  flavor        "spec" (default) or "review-only", as for
+#                   fs_emit_review_prompt_body and for the same reasons: in a
+#                   read-only pipeline the branch was built elsewhere, the
+#                   handoff is a review brief, and no fix leg follows.
 fs_emit_maintainer_prompt_body() {
     local branch="$1" base_sha="$2"
     local maintainer_verdict_file="$3" inbox_dir="$4"
     local inner_review="$5"
-    local handoff_file="$6"
-    local mnt_role_para
-    if [[ "$inner_review" == "yes" ]]; then
+    local handoff_file="$6" flavor="${7:-spec}"
+    local mnt_role_para addendum_para hands_off_para invented_para
+    if [[ "$flavor" == "review-only" ]]; then
+        mnt_role_para="This branch was not built in this sandbox -- it was built elsewhere,
+against a spec this sandbox never had. You are the MAINTAINER, deciding
+whether it is ready to land, and you are reading it cold."
+        if [[ "$inner_review" == "yes" ]]; then
+            mnt_role_para+=" A review leg has
+already read the diff line by line -- bugs, broken tests, style -- and its
+verdict is appended to this prompt, so you have its findings to build on,
+not to redo. Read the surrounding code, not the diff: the callers of what the
+change touches, the conventions the touched files follow, the invariants the
+area holds, and how this change interacts with what already exists."
+        else
+            mnt_role_para+=" No review has read
+the diff before you, so your review covers both sides: read the diff close --
+bugs, broken tests, style -- and read the surrounding code too: the callers
+of what the change touches, the conventions the touched files follow, the
+invariants the area holds, and how this change interacts with what already
+exists."
+        fi
+        addendum_para="You read the operator inbox as part of every session; this leg is where that
+reading has to show up in the verdict. If an addendum asks for work that the
+commits under review do not contain, that is a finding. Report it as one,
+with the addendum quoted. This run has no fix leg -- a FINDINGS verdict ends
+it -- so reporting the gap is all this leg can do about it. Do not approve a
+branch that leaves an operator instruction unfollowed. You are reporting the
+gap here, not closing it — the next section still applies."
+        hands_off_para="Do not fix anything. Do not edit, stage, commit, amend, rebase or revert.
+Your verdict is this run's output: nothing downstream applies fixes, and
+every change you make in this clone is thrown away with the sandbox.
+Reading, building and running the tests is fine — changing tracked files is
+not."
+        invented_para="Say \`APPROVED\` when you mean it. An invented finding costs the operator real
+time chasing it, and can talk a working branch into a change it did not need."
+    else
+        addendum_para="You read the operator inbox as part of every session; this leg is where that
+reading has to show up in the verdict. If an addendum asks for work that the
+commits under review do not contain, that is a finding. Report it as one,
+with the addendum quoted, so the fix leg can carry it out. Do not approve a
+branch that leaves an operator instruction unfollowed. You are reporting the
+gap here, not closing it — the next section still applies."
+        hands_off_para="Do not fix anything. Do not edit, stage, commit, amend, rebase or revert.
+Another session applies the fixes; a review that quietly repaired what it
+found leaves nobody able to tell the two apart. Reading, building and running
+the tests is fine — changing tracked files is not."
+        invented_para="Say \`APPROVED\` when you mean it. An invented finding costs a whole extra
+fix session and can talk a working branch into a change it did not need —
+and there is no inner review left behind you to catch it."
+    fi
+    if [[ "$flavor" == "review-only" ]]; then
+        : # set above
+    elif [[ "$inner_review" == "yes" ]]; then
         mnt_role_para="Another session worked in this same clone and committed to the branch
 \`$branch\`, and an inner review loop has already read that diff line by line
 — bugs, broken tests, style. That pass is done. You are the MAINTAINER, a
@@ -2784,19 +2838,11 @@ the way a line-by-line checker does.
 
 ## An unfollowed addendum is a finding
 
-You read the operator inbox as part of every session; this leg is where that
-reading has to show up in the verdict. If an addendum asks for work that the
-commits under review do not contain, that is a finding. Report it as one,
-with the addendum quoted, so the fix leg can carry it out. Do not approve a
-branch that leaves an operator instruction unfollowed. You are reporting the
-gap here, not closing it — the next section still applies.
+$addendum_para
 
 ## Do not touch the code
 
-Do not fix anything. Do not edit, stage, commit, amend, rebase or revert.
-Another session applies the fixes; a review that quietly repaired what it
-found leaves nobody able to tell the two apart. Reading, building and running
-the tests is fine — changing tracked files is not.
+$hands_off_para
 
 ## Your verdict is a file
 
@@ -2835,9 +2881,7 @@ Its format is fixed, because a program reads the first line:
 Order the findings worst first, and write each as a sentence or two of what
 is wrong and what it breaks, not as a patch.
 
-Say \`APPROVED\` when you mean it. An invented finding costs a whole extra
-fix session and can talk a working branch into a change it did not need —
-and there is no inner review left behind you to catch it.
+$invented_para
 
 ## Report
 
@@ -2852,7 +2896,7 @@ author's message. The orchestrator reads this report instead of the
 author's own account. Keep the \`Checked:\` paragraph where it is, in the
 verdict body, before this heading.
 EOF
-    fs_emit_handoff_spec_section "$handoff_file"
+    fs_emit_handoff_spec_section "$handoff_file" "$flavor"
 }
 
 # The fix leg's task text, for fork-sandbox.sh's --review-loop and the
