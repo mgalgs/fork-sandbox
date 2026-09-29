@@ -7791,6 +7791,8 @@ fs_run_claude_leg_with_retry() {
             printf 'fork-sandbox: %s failed on a transient error (%s); retry %s/%s in %ss\n' \
                 "$desc" "$err" "$attempt" "$num_delays" "$delay" >> "$sandbox_log"
             if ! fs_leg_retry_wait "$delay"; then
+                printf 'fork-sandbox: %s: stop requested during the retry backoff; retry %s/%s cancelled\n' \
+                    "$desc" "$attempt" "$num_delays" >> "$sandbox_log"
                 attempt=$(( attempt - 1 ))
                 break
             fi

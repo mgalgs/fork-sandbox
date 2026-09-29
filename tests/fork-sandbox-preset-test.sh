@@ -3807,6 +3807,9 @@ if [[ -n "$rd_retrystop" ]]; then
                 "1" "$(cat "$count" 2>/dev/null)"
             lacks "a stop during the retry backoff never logs a successful retry" \
                 "$(cat "$rd_retrystop/sandbox.log" 2>/dev/null)" "succeeded on retry"
+            contains "a stop during the retry backoff logs the cancelled retry" \
+                "$(cat "$rd_retrystop/sandbox.log" 2>/dev/null)" \
+                "the implement leg: stop requested during the retry backoff; retry 1/2 cancelled"
         else
             no "a stop during the retry backoff makes no further attempt" \
                 "no exit-code ever appeared"
