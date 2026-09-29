@@ -631,10 +631,15 @@ if (( ! EXEC_MODE )); then
     # one snapshot, but a long run, or a host that refreshes for an unrelated
     # reason, or a caller with no interactive session to refresh by hand,
     # would otherwise leave the sandbox holding a token the server has since
-    # revoked. Only for a file-backed credential with a host claude to refresh
-    # it -- exactly the same gate the pre-step check above used. A Keychain-
-    # backed credential is untouched, as always: it can prompt, and this loop
-    # runs unattended.
+    # revoked. Runs for any file-backed credential, regardless of whether a
+    # host claude binary was found -- the copy-forward half (steps further
+    # down) needs no claude binary at all, only jq, so a run with no host
+    # claude still gets its sandbox copy kept in step with whatever refreshes
+    # the host file some OTHER way (an interactive host session, a different
+    # sandboxed step's own loop). Only the fs_claude_refresh_if_needed call
+    # below is gated on HOST_CLAUDE_BIN, and it is already a no-op without
+    # one. A Keychain-backed credential is untouched, as always: it can
+    # prompt, and this loop runs unattended.
     #
     # Every 2s it: about every 60s, FIRST calls fs_claude_refresh_if_needed
     # itself, so a long-running step, or a fleet with no interactive host
@@ -680,13 +685,37 @@ if (( ! EXEC_MODE )); then
     # Exits on its own once its parent (this script) is gone, so a SIGKILLed
     # parent cannot leave it spinning against a STATE_DIR that either is
     # about to be, or already was, removed; the cleanup trap above also kills
-    # it directly on every normal exit path.
-    if [[ -n "$CRED_FILE" && -n "$HOST_CLAUDE_BIN" ]]; then
+    # it directly on every normal exit path (with `kill`, i.e. SIGTERM, which
+    # this loop can be blocked against inside the up-to-40s
+    # fs_claude_refresh_if_needed call below -- see the EXIT trap set just
+    # inside this subshell for what still cleans that up).
+    if [[ -n "$CRED_FILE" ]]; then
         (
             parent_pid=$$
             sandbox_file="$STATE_DIR/claude/.credentials.json"
             tick=0
+            # This subshell is a fresh process with no EXIT trap of its own,
+            # so it is safe to own one outright -- unlike
+            # fs_claude_refresh_if_needed itself, which is also called from
+            # contexts (the pre-step check above, tests) that may already
+            # have one; see that function's SECURITY INVARIANT comment.
+            # cleanup's `kill "$SYNC_LOOP_PID"` (a SIGTERM) can land while
+            # this loop is blocked inside fs_claude_refresh_if_needed's own
+            # up-to-40s refresh call, holding claude's two locks with a
+            # scratch dir (holding the real refresh token) open on disk; this
+            # trap is what still releases and removes them when that happens
+            # instead of at the loop's own next normal statement, which a
+            # kill never lets it reach.
+            cred_dir="$(dirname -- "$CRED_FILE")"
+            sync_lock1="$cred_dir/.oauth_refresh.lock"
+            sync_lock2="$("$FS_REALPATH" -m "$cred_dir").lock"
+            trap '_fs_claude_refresh_emergency_cleanup "$sync_lock1" "$sync_lock2"' EXIT
             while kill -0 "$parent_pid" 2>/dev/null; do
+                # A no-op when HOST_CLAUDE_BIN is empty (see
+                # fs_claude_refresh_if_needed); the loop still runs, and the
+                # copy-forward steps below still keep the sandbox file in
+                # step with the host's, even on a machine with no host claude
+                # to refresh with.
                 if (( tick % 30 == 0 )); then
                     fs_claude_refresh_if_needed "$CRED_FILE" "$HOST_CLAUDE_BIN"
                 fi

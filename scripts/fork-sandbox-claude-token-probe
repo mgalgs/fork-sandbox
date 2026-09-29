@@ -40,10 +40,10 @@
 #                                   the file should come back UNCHANGED,
 #                                   proving claude waited on the lock and
 #                                   gave up rather than refreshing anyway.
-#   3. stale lock is broken     -- as (2), but the lock's mtime is 61s in the
-#                                   past; the file should be blanked, proving
-#                                   claude judged the lock stale and refreshed
-#                                   through it.
+#   3. stale lock is broken     -- as (2), both lock paths in turn, but each
+#                                   lock's mtime is 61s in the past; the file
+#                                   should be blanked, proving claude judged
+#                                   the lock stale and refreshed through it.
 #   4. 401 handler takes the    -- a bogus access token, a far-future expiry,
 #      refresh-token branch        and this repo's own placeholder refresh
 #                                   token (see FS_CLAUDE_PLACEHOLDER_REFRESH_
@@ -216,18 +216,33 @@ check_lock_live() {
 
 # shellcheck disable=SC2329  # invoked indirectly, through CHECK_FNS below
 check_stale_lock() {
-    local dir lock
-    dir="$(_probe_make_scratch "$BOGUS_ACCESS" "$BOGUS_REFRESH" 1)"
-    lock="$dir/.oauth_refresh.lock"
-    mkdir "$lock"
-    touch -d '61 seconds ago' "$lock"
-    _probe_run_claude "$dir" "$CLAUDE_BIN" mcp list
-    if _probe_blanked "$dir/.credentials.json"; then
-        rm -rf "$dir"
-        return 0
+    local dir1 dir2 legacy_lock reasons=() ok=1
+
+    dir1="$(_probe_make_scratch "$BOGUS_ACCESS" "$BOGUS_REFRESH" 1)"
+    mkdir "$dir1/.oauth_refresh.lock"
+    touch -d '61 seconds ago' "$dir1/.oauth_refresh.lock"
+    _probe_run_claude "$dir1" "$CLAUDE_BIN" mcp list
+    if ! _probe_blanked "$dir1/.credentials.json"; then
+        ok=0
+        reasons+=("claude did not refresh through a stale (61s+) .oauth_refresh.lock")
     fi
-    PROBE_REASON="claude did not refresh through a stale (61s+) .oauth_refresh.lock; it may now treat any existing lock as live regardless of age"
-    rm -rf "$dir"
+    rm -rf "$dir1"
+
+    dir2="$(_probe_make_scratch "$BOGUS_ACCESS" "$BOGUS_REFRESH" 1)"
+    legacy_lock="$("$FS_REALPATH" -m "$dir2").lock"
+    mkdir "$legacy_lock"
+    touch -d '61 seconds ago' "$legacy_lock"
+    _probe_run_claude "$dir2" "$CLAUDE_BIN" mcp list
+    if ! _probe_blanked "$dir2/.credentials.json"; then
+        ok=0
+        reasons+=("claude did not refresh through a stale (61s+) legacy <dir>.lock")
+    fi
+    rmdir "$legacy_lock" 2>/dev/null || true
+    rm -rf "$dir2"
+
+    (( ok )) && return 0
+    local IFS='; '
+    PROBE_REASON="${reasons[*]}; claude may now treat any existing lock as live regardless of age"
     return 1
 }
 

@@ -1887,6 +1887,13 @@ _fs_claude_take_lock() {
     done
 }
 
+# Holds _fs_claude_do_refresh's scratch dir path for exactly as long as that
+# dir exists and contains the real refresh token, so a signal that arrives
+# mid-refresh -- including while blocked inside the up-to-40s `claude mcp
+# list` call below -- can still find and remove it. See
+# fs_claude_refresh_if_needed's EXIT trap, which reads this.
+_FS_CLAUDE_REFRESH_SCRATCH=""
+
 # Does the actual refresh, once both locks are held and the re-check under
 # them still says the token is due. Builds a scratch CLAUDE_CONFIG_DIR
 # holding ONLY the real credential with expiresAt forced into the past (so
@@ -1906,6 +1913,7 @@ _fs_claude_do_refresh() {
         return 0
     fi
     chmod 700 "$scratch"
+    _FS_CLAUDE_REFRESH_SCRATCH="$scratch"
 
     old_token="$(jq -r '.claudeAiOauth.accessToken // ""' "$cred_file" 2>/dev/null)" || old_token=""
 
@@ -1935,6 +1943,7 @@ _fs_claude_do_refresh() {
         || (( new_expires <= threshold_ms )); then
         echo "Warning: could not refresh the Claude access token on the host; log in with claude on the host if this persists." >&2
         rm -rf "$scratch"
+        _FS_CLAUDE_REFRESH_SCRATCH=""
         return 0
     fi
 
@@ -1947,6 +1956,7 @@ _fs_claude_do_refresh() {
     if [[ -z "$tmp" ]]; then
         echo "Warning: could not refresh the Claude access token on the host; log in with claude on the host if this persists." >&2
         rm -rf "$scratch"
+        _FS_CLAUDE_REFRESH_SCRATCH=""
         return 0
     fi
     if ! jq --slurpfile new "$scratch/.credentials.json" \
@@ -1954,11 +1964,13 @@ _fs_claude_do_refresh() {
         echo "Warning: could not refresh the Claude access token on the host; log in with claude on the host if this persists." >&2
         rm -f "$tmp"
         rm -rf "$scratch"
+        _FS_CLAUDE_REFRESH_SCRATCH=""
         return 0
     fi
     chmod 600 "$tmp"
     mv -f "$tmp" "$cred_file"
     rm -rf "$scratch"
+    _FS_CLAUDE_REFRESH_SCRATCH=""
 
     local left_min=$(( new_expires / 60000 - $(date +%s) / 60 ))
     printf 'claude-sandboxed: refreshed the host'"'"'s Claude access token (%dm left; now %dh%02dm)\n' \
@@ -1983,10 +1995,30 @@ _fs_claude_do_refresh() {
 # SECURITY INVARIANT: the real refresh token never leaves this function's own
 # scratch directory, which lives under /var/tmp/claude-scratch/forks/ (never
 # a run's own STATE_DIR or clone), is mode 700, and is removed before this
-# function returns on every path. It is never passed as an argument -- only
-# ever read and written as file content -- so it is never visible in `ps` or
-# in a log line. The functions below print exactly one line on success or
-# failure, and neither line contains a token.
+# function returns on every path that returns normally. It is never passed as
+# an argument -- only ever read and written as file content -- so it is never
+# visible in `ps` or in a log line. The functions below print exactly one
+# line on success or failure, and neither line contains a token.
+#
+# This function (and _fs_claude_do_refresh, which it calls) can spend up to
+# 40s blocked inside a `claude mcp list` call with both locks held and the
+# scratch dir on disk. A signal that kills the calling process in that window
+# skips the cleanup at the end of this function entirely -- there is no trap
+# HERE, deliberately: an EXIT trap set inside a plain function is a process-
+# wide trap, and this function is called from contexts (a test's own top-
+# level shell, a `$(...)` command substitution) that may already own one of
+# their own for unrelated cleanup; saving and restoring it around this call
+# was tried and is unsafe -- restoring it inside a command-substitution
+# subshell registers it as THAT subshell's own EXIT trap, which then fires
+# (and can delete real, still-in-use files) the moment the subshell exits,
+# long before the caller's real end. The one caller that both needs this
+# protection and safely owns its whole process's EXIT trap is claude-
+# sandboxed's live-sync loop, a dedicated background subshell with no trap of
+# its own; see _fs_claude_refresh_emergency_cleanup below and the loop itself
+# for where the trap actually lives. Every other caller (the pre-step check,
+# and every test) accepts the narrower, pre-existing risk of a leaked scratch
+# dir on an exact, rare signal race, rather than this function reaching into
+# a caller's own trap.
 #
 # _fs_claude_do_refresh is always invoked as `_fs_claude_do_refresh ... ||
 # true` (see below): calling it in a tested context, rather than as a bare
@@ -2010,6 +2042,30 @@ _fs_claude_do_refresh() {
 # either lock is not an error: some other process is presumably refreshing
 # right now, and the sync loop (or the next call here) will pick up its
 # result.
+# Emergency cleanup for a call to fs_claude_refresh_if_needed that a signal
+# interrupts before it reaches its own end-of-function rmdir calls: removes
+# _fs_claude_do_refresh's scratch dir (via the global below, which tracks it
+# for exactly as long as it exists) and releases both named lock dirs.
+# Idempotent -- every operation here is a harmless no-op against something
+# already removed -- so it is safe to register as a long-lived EXIT trap and
+# let it fire, possibly as a no-op, whenever its process actually exits.
+#
+# Installed only by claude-sandboxed's live-sync loop, once, for its whole
+# lifetime, around every call it makes to fs_claude_refresh_if_needed -- see
+# the loop itself. That is the one caller that both needs the protection (it
+# is the only one a caller ever sends an external kill signal to, from
+# claude-sandboxed's own `cleanup`) and safely owns its entire process's EXIT
+# trap outright (a dedicated background subshell with no trap of its own).
+# See fs_claude_refresh_if_needed's SECURITY INVARIANT comment for why this
+# is not wired in there instead.
+_fs_claude_refresh_emergency_cleanup() {
+    local lock1="$1" lock2="$2"
+    [[ -n "$_FS_CLAUDE_REFRESH_SCRATCH" ]] && rm -rf "$_FS_CLAUDE_REFRESH_SCRATCH" 2>/dev/null
+    rmdir "$lock2" 2>/dev/null
+    rmdir "$lock1" 2>/dev/null
+    true
+}
+
 fs_claude_refresh_if_needed() {
     local cred_file="$1" claude_bin="${2:-}"
     [[ -n "$claude_bin" ]] || return 0
@@ -2095,7 +2151,25 @@ fs_claude_token_contract_check() {
 
     if [[ ! -e "$marker_ok" && ! -e "$marker_fail" ]]; then
         lockdir="$dir/.probe-$version.lock"
+        local probe_stale_sec="${FS_CLAUDE_PROBE_LOCK_STALE_SEC:-300}"
+        local acquired=0
         if mkdir "$lockdir" 2>/dev/null; then
+            acquired=1
+        # A held lock with no verdict marker next to it is either a probe
+        # genuinely in flight (the common case; the probe itself can take
+        # up to roughly a couple of minutes worst case, so this threshold
+        # sits comfortably above that) or one left behind by a step that was
+        # killed mid-probe -- with no signal handling here, that is the only
+        # way this lock is ever released short of this staleness check. Break
+        # it and retry once, the same way _fs_claude_take_lock does for
+        # claude's own refresh locks; a later step then gets to run the probe
+        # instead of every later step seeing the lock forever and only ever
+        # printing "pending".
+        elif (( $(_fs_dir_mtime_age_secs "$lockdir") >= probe_stale_sec )) \
+            && rmdir "$lockdir" 2>/dev/null && mkdir "$lockdir" 2>/dev/null; then
+            acquired=1
+        fi
+        if (( acquired )); then
             local probe_out probe_rc
             # `if var=$(...)` rather than `var=$(...)` on its own line: this
             # runs under the sourcing script's `set -e`, and a probe FAILURE
