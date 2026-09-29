@@ -430,7 +430,13 @@ PIPELINE_FIX_KEYS = ("harness", "model", "repeat")
 # and luna then wanted "l" too -- names that differ by an arbitrary
 # leftover letter encode nothing. Actions are a closed set and keep their
 # letters; models are an open set and get their name.
-MODEL_ALIASES = ("sonnet", "opus", "haiku", "terra", "sol", "luna")
+#
+# Every name --pipeline's own MODELS table (fork-sandbox-pipeline-spec.py)
+# can compile onto a seat belongs here too, or a spec using it displays
+# under a slug-plus-hash name that does not parse back as a spec --
+# test_model_aliases_cover_pipeline_spec_models below holds the two tables
+# in step so a model added to one and not the other fails loudly.
+MODEL_ALIASES = ("sonnet", "opus", "haiku", "fable", "terra", "sol", "luna")
 STAGE_LETTERS = {"code": "c", "review": "r", "maintain": "m"}
 
 STEP_LOOP_RE = re.compile(r"step-([0-9]+)-loop\.json")

@@ -181,19 +181,23 @@ reach it — see "What it gives up".)
    falls back to it when no file has that name, so a composition name
    works either way. Grammar and model table: docs/presets.md.
 
-   ### `--review-only` — review a branch after the fact
+   ### Read-only pipelines — review a branch after the fact
 
-   Requires `--checkout <ref>` and runs exactly one review leg over the
-   checkout's commits since `--review-base` (or the origin repo's merge-base
-   with `HEAD`). It is useful for a post-hoc review or a bake-off comparing
-   two reviewers on the same branch; it creates no coding or fix leg.
+   A pipeline with no code step reviews an existing branch instead of writing
+   one, with a choice of seats: `--pipeline ropus --checkout <branch>`
+   reviews once on opus, `--pipeline rsonnet-mopus` adds a maintainer who
+   builds on that review, and `--pipeline mopus` is a maintainer's read
+   alone — each leg once, no fix legs, over the checkout's commits since
+   `--review-base` (or the origin repo's merge-base with `HEAD`). It is
+   useful for a post-hoc review or a bake-off comparing two reviewers on the
+   same branch.
 
-   A pipeline with no code step does the same job, with a choice of seats:
-   `--pipeline ropus --checkout <branch>` reviews once on opus,
-   `--pipeline rsonnet-mopus` adds a maintainer who builds on that review,
-   and `--pipeline mopus` is a maintainer's read alone — each leg once, no
-   fix legs. `--review-only` over a preset drops its code step and runs the
-   rest that way.
+   `--review-only` is a deprecated bare flag that does the one-reviewer case
+   of the same thing (`--pipeline r<model>`): requires `--checkout <ref>`,
+   runs exactly one review leg, creates no coding or fix leg. Over a preset
+   it drops the code step and runs the rest the read-only way. Prefer the
+   `--pipeline` form above in new callers; `--review-only` stays only for
+   callers that already depend on it.
 
    **Watching one is no different.** The run counts as running until the last
    leg is done, so the Monitor tool still fires exactly one terminal event,
@@ -542,7 +546,7 @@ What it cannot do yet, and why saying so matters: a flag this path cannot honor 
 
 ### Review-shaped tasks on the cluster
 
-`--review-only` is refused with `--k8s`, but that refuses a flag, not the task: a cluster review is an ordinary run whose handoff is a review brief. The recipe, proven end to end:
+`--review-only` and a read-only `--pipeline` are both refused with `--k8s`, but that refuses a flag, not the task: a cluster review is an ordinary run whose handoff is a review brief. The recipe, proven end to end:
 
 1. **Gather the evidence on the host**, where the credentials are — the pull request description, comments and diff via the forge CLI, CI logs, whatever the review needs. Stage it in a directory under `/var/tmp/claude-scratch/forks/`. The pod holds no forge credential and has no route to one, so anything not gathered here does not exist for the reviewer.
 2. **Launch with `--checkout <ref-under-review>` and `--context-ro <that dir>`**, so the clone sits on the code being reviewed and the evidence rides along (the pod's handoff gains a "Gathered context" section naming where it landed).

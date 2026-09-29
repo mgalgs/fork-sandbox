@@ -518,5 +518,45 @@ fi
 contains "the fresh-HOME record is readable back" "\"$(basename "$rd_fresh")\"" \
     "$(cat "$fresh_home/.claude/sandbox-runs.jsonl" 2>/dev/null)"
 
+printf '\n== record: composition_short stays in step with --pipeline'"'"'s model table ==\n'
+# fork-sandbox-pipeline-spec.py's MODELS is the "a new model is a one-line
+# add" table --pipeline compiles specs against; MODEL_ALIASES above is a
+# second, hand-maintained table the two must agree on, or a spec using a
+# model MODELS just gained displays under an unparseable slug-plus-hash
+# name instead of the pretty one. Loaded by file path, not name: both
+# scripts' filenames have hyphens, which are not valid module names.
+alias_drift="$(python3 -c '
+import importlib.util, sys
+
+def load(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+runlog = load("sandbox_run_log", sys.argv[1])
+pipeline_spec = load("fork_sandbox_pipeline_spec", sys.argv[2])
+missing = sorted(set(pipeline_spec.MODELS) - set(runlog.MODEL_ALIASES))
+print(" ".join(missing))
+' "$repo_dir/scripts/sandbox-run-log.py" "$repo_dir/scripts/fork-sandbox-pipeline-spec.py")"
+check "every --pipeline MODELS entry has a MODEL_ALIASES entry" "" "$alias_drift"
+
+# The concrete case the drift check above would have caught: a spec using
+# "fable" (fork-sandbox-pipeline-spec.py's MODELS) must shortname to
+# "fable", not fall back to the slug-plus-hash form composition_slug gives
+# an unregistered model id.
+rd_fable="$(mk_run_dir comp-fable)"
+tmpdirs+=("$rd_fable")
+cat > "$rd_fable/pipeline.json" <<'EOF'
+{"steps":[
+  {"action":"code","harness":"claude","model":"claude-fable-5-1","repeat":2,"network":null,"fix":null},
+  {"action":"review","harness":"codex","model":"gpt-5.6-sol","repeat":2,"network":null,"fix":null}
+]}
+EOF
+printf '0\n' > "$rd_fable/exit-code"
+record "$rd_fable" >/dev/null 2>"$tmp/err"
+check "a fable step's shortname is the registered alias, not a slug-plus-hash" \
+    "cfable2-rsol2" "$(record_field "$(basename "$rd_fable")" composition_short)"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))

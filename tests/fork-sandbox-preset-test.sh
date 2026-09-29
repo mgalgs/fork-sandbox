@@ -1947,6 +1947,23 @@ else
     no "--model overrides a read-only review seat" "$(cat "$err")"
 fi
 
+# --claude-args/--pi-args/--codex-args have no maintainer-seat route the
+# way --model/--harness do above (there is no --maintainer-args flag): a
+# maintain-only read-only pipeline's implement seat is phantom, so these
+# flags must be refused outright rather than landing on a seat nothing
+# runs. Before the fix: --pipeline mopus (implement seat's harness happens
+# to be claude, same as the flag) accepted --claude-args and silently
+# dropped it; --pipeline msol (implement seat's harness is codex) instead
+# fell through to the generic --claude-args/--harness mismatch error,
+# which blamed the phantom seat's harness rather than naming the real
+# problem.
+ro_refuses "--claude-args is refused on a maintain-only read-only pipeline whose phantom seat happens to share its harness" \
+    "have no route" --pipeline mopus --claude-args "--effort max"
+ro_refuses "--claude-args is refused on a maintain-only read-only pipeline before the harness-mismatch error can blame the phantom seat" \
+    "have no route" --pipeline msol --claude-args "--effort max"
+ro_refuses "--codex-args is refused on a maintain-only read-only pipeline" \
+    "have no route" --pipeline mopus --codex-args "--foo"
+
 # A read-only pipeline has no coding leg for a session to belong to -- the
 # session store is spliced onto the coding conversation alone (see the
 # resume splice further down in fork-sandbox.sh), so these flags would
@@ -1994,10 +2011,30 @@ if rd_pi="$(run_stubbed --preset mnt-only-pi --maintainer-harness claude \
         "1" "$(cat "$count")"
     check "the maintain step really ran on the override harness" "claude" \
         "$(jq -r '.steps[0].harness' "$rd_pi/pipeline.json")"
+    # The phantom implement seat still carries the preset's own pi/
+    # vendor-discovered-model definition (preset_impl_agent above is seated
+    # from it so the read-only translation has something to describe) --
+    # but no leg ever runs on it, so run.env's flat harness/model, which
+    # stats/list grouping reads as plain fact, must name the maintainer leg
+    # that actually ran instead.
+    check "run.env's harness names the maintainer leg that ran, not the phantom implement seat" \
+        "claude" "$(sed -n 's/^harness=//p' "$rd_pi/run.env" | head -1)"
+    check "run.env's model names the maintainer leg that ran, not the phantom implement seat" \
+        "haiku" "$(sed -n 's/^model=//p' "$rd_pi/run.env" | head -1)"
+    check "summary.json's harness names the maintainer leg that ran, not the phantom implement seat" \
+        "claude" "$(jq -r '.harness' "$rd_pi/summary.json")"
+    check "summary.json's model names the maintainer leg that ran, not the phantom implement seat" \
+        "haiku" "$(jq -r '.model' "$rd_pi/summary.json")"
 else
     no "a read-only maintain-only run moved off its preset harness needs no pi.env"
 fi
 mv "$real_cfg/pi.env.aside" "$real_cfg/pi.env"
+
+# --pipeline has no model that natively seats pi (see MODELS in
+# fork-sandbox-pipeline-spec.py), so this case needs a hand-written preset
+# -- the same mnt-only-pi fixture used above, whose lone step runs on pi.
+ro_refuses "--pi-args is refused on a maintain-only read-only preset" \
+    "have no route" --preset mnt-only-pi --pi-args "--foo"
 
 # The round-one composed shape exercises consecutive review steps, a finding
 # and fix round, and the preceding-verdict handoff to maintain.

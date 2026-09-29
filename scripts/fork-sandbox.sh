@@ -21,12 +21,14 @@
 #                        commit also becomes the base the session's work is
 #                        measured against, so a session that commits nothing
 #                        still leaves the repo unchanged.
-# --review-only:         review an existing branch once, without a coding or
-#                        fix leg. Requires --checkout; use --review-base to
-#                        choose the start of the review range. Over a
-#                        preset, drops its code step and runs its review and
+# --review-only:         deprecated: a bare-flag alias for a read-only
+#                        --pipeline r<model> (docs/presets.md) -- review an
+#                        existing branch once, without a coding or fix leg.
+#                        Requires --checkout; use --review-base to choose
+#                        the start of the review range. Over a preset,
+#                        drops its code step and runs its review and
 #                        maintain steps once each -- the same as a
-#                        read-only pipeline (docs/presets.md).
+#                        read-only pipeline.
 # --review-base <ref>:   commit the review range starts from. Defaults to the
 #                        origin repo's merge-base of --checkout and HEAD.
 # --model <model>:       model or model alias for the session (e.g. fable,
@@ -1669,6 +1671,8 @@ while [[ "${1:-}" == -* ]]; do
             ;;
         --review-only)
             review_only=true
+            echo "fork-sandbox: --review-only is deprecated; use a read-only" >&2
+            echo "--pipeline instead, e.g. --pipeline rsonnet (docs/presets.md)." >&2
             shift
             ;;
         --review-base)
@@ -2224,6 +2228,21 @@ if [[ -n "$preset_name" ]]; then
             echo "Error: preset '$preset_name' is a read-only maintain step, which runs on" >&2
             echo "the maintainer seat: override it with --maintainer-model or" >&2
             echo "--maintainer-harness, not --model/--harness." >&2
+            exit 1
+        fi
+        # --claude-args/--pi-args/--codex-args have no maintainer-seat route
+        # the way --model/--harness do above (there is no --maintainer-args
+        # flag): fs_build_sandbox_cmd splices them in only for the implement
+        # prefix, which is phantom here, so silently accepting them would
+        # either drop them without a word or, for a harness that does not
+        # match the phantom seat's, fail later against that seat's harness
+        # instead of naming the real problem.
+        if [[ "$preset_ro_review" != true ]] \
+            && { [[ -n "$claude_extra_args" ]] || [[ -n "$pi_extra_args" ]] \
+                || [[ -n "$codex_extra_args" ]]; }; then
+            echo "Error: preset '$preset_name' is a read-only maintain step, which runs on" >&2
+            echo "the maintainer seat: --claude-args/--pi-args/--codex-args have no route" >&2
+            echo "there to seat them on. Drop them." >&2
             exit 1
         fi
     elif [[ "$preset_is_legacy_shaped" == true ]]; then
@@ -4825,6 +4844,23 @@ if [[ "$maintainer_harness_given" == true ]]; then
     fs_resolve_harness "$maintainer_harness" "$maintainer_model" mnt "$maintainer_network"
 fi
 
+# run.env/summary.json's flat harness/harness_version/model fields, read by
+# the run log's ledger and its `stats --by model` grouping as plain fact.
+# For every ordinary run these are just $harness/$harness_version/$model.
+# A maintain-only read-only pipeline is the one exception: its implement
+# seat is phantom (impl_seat_is_phantom above) and never runs a leg, so
+# those three still name the phantom seat's own definition -- the maintainer
+# seat is the one leg that actually runs, and the record must name that one
+# instead.
+record_harness="$harness"
+record_harness_version="$harness_version"
+record_model="$model"
+if [[ "$impl_seat_is_phantom" == true ]]; then
+    record_harness="$maintainer_harness"
+    record_harness_version="$mnt_harness_version"
+    record_model="$maintainer_model"
+fi
+
 # A composed (non-legacy-shaped) preset has no single code/review/maintain
 # seat for the five fixed calls above to resolve, so it gets its own
 # resolution loop instead: one fs_resolve_harness call per step, into
@@ -7156,10 +7192,10 @@ started_at="$(date +%s)"
     printf 'upstream_reason=%s\n' "$upstream_reason"
     printf 'agent_kit=%s\n' "${agent_kit_names[*]}"
     printf 'checkout=%s\n' "$checkout_ref"
-    printf 'harness=%s\n' "$harness"
-    printf 'harness_version=%s\n' "$harness_version"
+    printf 'harness=%s\n' "$record_harness"
+    printf 'harness_version=%s\n' "$record_harness_version"
     printf 'network=%s\n' "$network"
-    printf 'model=%s\n' "$model"
+    printf 'model=%s\n' "$record_model"
     printf 'review_model=%s\n' "$review_model"
     printf 'review_harness=%s\n' "$review_harness"
     printf 'review_network=%s\n' "$review_network"
@@ -8010,6 +8046,26 @@ if [[ -z "$model" && -s "$sandbox_log" ]]; then
         "$sandbox_log" | head -n1)"
 fi
 
+# run.env/summary.json's flat harness/harness_version/model fields, same
+# exception as the launcher's own $record_harness/$record_model (which wrote
+# run.env's first copy of these three): a maintain-only read-only pipeline's
+# implement seat is phantom and never runs a leg, so $harness/$model/
+# $harness_version here still name that seat's own definition, not the
+# maintainer leg that actually ran. mode == review-only with review_loop_cap
+# left at its default 0 is exactly that shape -- every other review-only run
+# forces review_loop_cap to 1 (see the launcher's own forcing beside
+# "A read-only pipeline of one maintain step has no review leg."), so this
+# reads back the same fact the launcher decided from, without needing a new
+# variable threaded through just to carry it.
+record_harness="$harness"
+record_harness_version="$harness_version"
+record_model="$model"
+if [[ "$mode" == "review-only" && "$review_loop_cap" == "0" ]]; then
+    record_harness="$maintainer_harness"
+    record_harness_version="$mnt_harness_version"
+    record_model="$maintainer_model"
+fi
+
 # Every pi-local seat in this run -- any step (code, review or maintain)
 # whose harness/network pair reads "pi"/"sealed" with no model yet, and any
 # fix seat whose harness reads the literal "pi-local" -- owes the reader the
@@ -8288,7 +8344,7 @@ fi
 if [[ -n "$model" ]] \
     && [[ -s "$run_dir/run.env" ]] \
     && grep -v '^model=' "$run_dir/run.env" > "$run_dir/run.env.part" 2>/dev/null; then
-    printf 'model=%s\n' "$model" >> "$run_dir/run.env.part"
+    printf 'model=%s\n' "$record_model" >> "$run_dir/run.env.part"
     mv -f "$run_dir/run.env.part" "$run_dir/run.env"
 else
     rm -f "$run_dir/run.env.part"
@@ -9864,12 +9920,12 @@ ended_at="$(date +%s)"
 jq -n \
     --argjson version 1 \
     --arg mode "$mode" \
-    --arg harness "$harness" \
-    --arg harness_version "$harness_version" \
+    --arg harness "$record_harness" \
+    --arg harness_version "$record_harness_version" \
     --arg network "$network" \
     --arg usage_source "$usage_source" \
     --argjson usage "$run_usage" \
-    --arg model "$model" \
+    --arg model "$record_model" \
     --arg branch "$branch" \
     --arg origin_repo "$origin_repo" \
     --arg clone_dir "$clone_dir" \

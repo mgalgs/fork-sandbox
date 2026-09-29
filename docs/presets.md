@@ -177,11 +177,14 @@ fork-sandbox.sh --pipeline ropus --checkout my-branch ~/src/myrepo brief.md
 fork-sandbox.sh --pipeline rsol-mopus --checkout my-branch ~/src/myrepo brief.md
 ```
 
-`--review-only` without a preset is the one-review-leg case, seated by
-`--harness`/`--model`. Over a preset it drops the code step and fix seats
-and runs the remaining review and maintain steps this way, once each,
-whatever their `repeat` says (a note says so). Like `--review-only`, a
-read-only pipeline is refused with `--k8s`.
+`--review-only` is a deprecated bare-flag alias for this: without a preset
+it is the one-review-leg case, seated by `--harness`/`--model`. Over a
+preset it drops the code step and fix seats and runs the remaining review
+and maintain steps this way, once each, whatever their `repeat` says (a
+note says so). Prefer a read-only `--pipeline` (`--pipeline r<model>`) in
+new callers; `--review-only` stays only as "drop the code step, review
+`--checkout`" for callers that already depend on it. Like `--review-only`,
+a read-only pipeline is refused with `--k8s`.
 
 ### Repeat passes
 
@@ -471,7 +474,7 @@ is the exact problem this design removes):
   key: per step, in order, `<stage-letter><model-token><repeat>` joined
   with `-` (`code`/`review`/`maintain` → `c`/`r`/`m`; a model id one of
   whose separator-delimited segments is a registered alias —
-  `sonnet`, `opus`, `haiku`, `terra`, `sol`, `luna` — contributes that
+  `sonnet`, `opus`, `haiku`, `fable`, `terra`, `sol`, `luna` — contributes that
   alias spelled out; anything else slugs to the first 4 lowercased
   `[a-z0-9]` characters after its last `/`, or `x` for no model).
   Actions are a closed set, so they keep single letters; models are an
