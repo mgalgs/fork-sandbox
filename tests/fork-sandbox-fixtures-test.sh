@@ -6,6 +6,12 @@ set -uo pipefail
 repo_dir="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 launcher="$repo_dir/scripts/fork-sandbox.sh"
 pass=0; fail=0; tmpdirs=()
+fs_by_session_scratch="$(mktemp -d)"; tmpdirs+=("$fs_by_session_scratch")
+# Every real launch below writes launcher_session_id/creates a by-session
+# symlink from CLAUDE_CODE_SESSION_ID -- scoped here so a real session
+# running this suite never has its own by-session index polluted with
+# entries for these throwaway fixture runs.
+export FORK_SANDBOX_BY_SESSION_DIR="$fs_by_session_scratch"
 cleanup() { local d; for d in "${tmpdirs[@]-}"; do [[ -n "$d" && -e "$d" ]] && rm -rf -- "$d"; done; }
 trap cleanup EXIT
 ok() { printf '  ok    %s\n' "$1"; pass=$((pass + 1)); }

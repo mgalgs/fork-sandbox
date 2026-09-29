@@ -37,6 +37,12 @@ launcher="$repo_dir/scripts/fork-sandbox.sh"
 pass=0
 fail=0
 tmpdirs=()
+fs_by_session_scratch="$(mktemp -d)"; tmpdirs+=("$fs_by_session_scratch")
+# Every real launch below writes launcher_session_id/creates a by-session
+# symlink from CLAUDE_CODE_SESSION_ID -- scoped here so a real session
+# running this suite never has its own by-session index polluted with
+# entries for these throwaway fixture runs.
+export FORK_SANDBOX_BY_SESSION_DIR="$fs_by_session_scratch"
 
 cleanup() {
     local d
@@ -780,7 +786,7 @@ if (( rc3 == 0 )) && [[ -n "$rd3" ]]; then
     # family a migration is most likely to rename or drop, and a pin that
     # never exercises it would not catch that.
     check "the combined review+maintainer legacy run keeps its historical filename set" \
-        $'continuation-prompt-header.md\nevents-fix-1.jsonl\nevents-maintainer-1.jsonl\nevents-maintainer-2.jsonl\nevents-mntfix-1.jsonl\nevents-review-1.jsonl\nevents-review-2.jsonl\nevents.jsonl\nexit-code\nfix-prompt-1.md\nfix-prompt-header.md\nhandoff-original.md\nhandoff.md\nmaintainer-fix-prompt-1.md\nmaintainer-loop.json\nmaintainer-prompt-1.md\nmaintainer-prompt-2.md\nmaintainer-prompt.md\nmaintainer-verdict-1.md\nmaintainer-verdict-2.md\npid\nreview-loop.json\nreview-prompt-1.md\nreview-prompt-2.md\nreview-prompt.md\nreview-verdict-1.md\nreview-verdict-2.md\nrun-source\nrun.env\nrun.sh\nsandbox.log\nsummary.json\nsummary.txt' \
+        $'continuation-prompt-header.md\nevents-fix-1.jsonl\nevents-maintainer-1.jsonl\nevents-maintainer-2.jsonl\nevents-mntfix-1.jsonl\nevents-review-1.jsonl\nevents-review-2.jsonl\nevents.jsonl\nexit-code\nfix-prompt-1.md\nfix-prompt-header.md\nhandoff-original.md\nhandoff.md\nmaintainer-fix-prompt-1.md\nmaintainer-loop.json\nmaintainer-prompt-1.md\nmaintainer-prompt-2.md\nmaintainer-prompt.md\nmaintainer-verdict-1.md\nmaintainer-verdict-2.md\npid\nprogress.json\nreview-loop.json\nreview-prompt-1.md\nreview-prompt-2.md\nreview-prompt.md\nreview-verdict-1.md\nreview-verdict-2.md\nrun-source\nrun.env\nrun.sh\nsandbox.log\nsummary.json\nsummary.txt' \
         "$(find "$rd3" -maxdepth 1 -type f -exec basename {} \; | LC_ALL=C sort)"
     # run.sh's run_step_* serialization used to fire only for composed
     # runs (preset_is_legacy_shaped != true); a legacy run's generated

@@ -48,6 +48,12 @@ export FORK_SANDBOX_RUN_SOURCE=test
 pass=0
 fail=0
 tmpdirs=()
+fs_by_session_scratch="$(mktemp -d)"; tmpdirs+=("$fs_by_session_scratch")
+# Every real launch below writes launcher_session_id/creates a by-session
+# symlink from CLAUDE_CODE_SESSION_ID -- scoped here so a real session
+# running this suite never has its own by-session index polluted with
+# entries for these throwaway fixture runs.
+export FORK_SANDBOX_BY_SESSION_DIR="$fs_by_session_scratch"
 # Real fork-sandbox.sh fixtures below run under this scratch HOME, not the
 # operator's -- sandbox-run-log.py's archive dir and run log are
 # hardcoded under ~/.claude, so a fixture run under the real HOME appends

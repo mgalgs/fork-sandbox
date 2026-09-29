@@ -38,6 +38,12 @@ source "$repo_dir/scripts/fork-sandbox-lib.sh"
 pass=0
 fail=0
 tmpdirs=()
+fs_by_session_scratch="$(mktemp -d)"; tmpdirs+=("$fs_by_session_scratch")
+# Every real launch below writes launcher_session_id/creates a by-session
+# symlink from CLAUDE_CODE_SESSION_ID -- scoped here so a real session
+# running this suite never has its own by-session index polluted with
+# entries for these throwaway fixture runs.
+export FORK_SANDBOX_BY_SESSION_DIR="$fs_by_session_scratch"
 
 cleanup() {
     local d

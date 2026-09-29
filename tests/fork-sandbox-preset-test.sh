@@ -23,6 +23,15 @@ export FORK_SANDBOX_RUN_SOURCE=test
 pass=0
 fail=0
 tmpdirs=()
+fs_by_session_scratch="$(mktemp -d)"; tmpdirs+=("$fs_by_session_scratch")
+# Every real launch below writes launcher_session_id/creates a by-session
+# symlink from CLAUDE_CODE_SESSION_ID -- scoped here so a real session
+# running this suite never has its own by-session index polluted with
+# entries for these throwaway fixture runs. The dedicated launcher_
+# session_id/by-session tests further down set their own explicit
+# FORK_SANDBOX_BY_SESSION_DIR per call instead, which overrides this
+# default for that one command only.
+export FORK_SANDBOX_BY_SESSION_DIR="$fs_by_session_scratch"
 
 cleanup() {
     local d
@@ -1504,10 +1513,18 @@ printf '%s' "$n" > "$FAKE_COUNT_FILE"
 printf '%s\n' "$*" >> "$FAKE_ARGV_LOG"
 
 # The scripted role: FAKE_SCRIPT holds one action per line, indexed by call
-# number -- "commit", "findings", "approved", or "noop".
+# number -- "commit", "findings", "approved", "fail", or "noop".
 action="$(sed -n "${n}p" "$FAKE_SCRIPT" 2>/dev/null)"
 verdict_name="$(printf '%s\n' "$prompt" | sed -nE 's#.*\.git/(s[0-9]+-verdict\.md|maintainer-verdict\.md).*#\1#p' | head -1)"
 [[ -n "$verdict_name" ]] || verdict_name=review-verdict.md
+# "fail": a leg that dies without committing or leaving a verdict -- the
+# progress.json contract's "a code step whose leg exits non-zero is
+# failed" and "a harness error makes that step failed" both need a leg
+# that can actually fail, which commit/findings/approved/noop never do.
+if [[ "$action" == fail ]]; then
+    printf 'stub: scripted failure on call %s\n' "$n" >&2
+    exit 1
+fi
 case "$action" in
 commit)
     # An empty clone_dir would make this `git -C ""`, which commits into the
@@ -1639,6 +1656,58 @@ run_stubbed() {
     printf '%s' "$rd"
 }
 
+run_stubbed_expect_fail() {
+    # Like run_stubbed, but for a launch expected to exit non-zero -- a
+    # scripted "fail" leg, say -- where that exit code IS the scenario
+    # under test rather than a harness failure to report. --foreground
+    # execs run.sh, so this process's own exit code is the run's own $rc.
+    # Prints "<run dir>\t<rc>" on stdout.
+    local out rc rd
+    out="$(HOME="$launcher_home" PATH="$real_stub:$PATH" FAKE_COUNT_FILE="$count" \
+        FAKE_ARGV_LOG="$argv_log" FAKE_SCRIPT="$script_file" \
+        FORK_SANDBOX_CONFIG_DIR="$real_cfg" FORK_SANDBOX_BACKEND=fake-image \
+        timeout 60 "$launcher" --foreground "$@" "$proj" "$handoff" 2>&1)"
+    rc=$?
+    rd="$(printf '%s\n' "$out" | sed -n 's/^  run dir:  *//p' | head -1)"
+    if [[ -z "$rd" ]]; then
+        printf 'run_stubbed_expect_fail found no run dir (rc=%s):\n%s\n' "$rc" "$out" >&2
+        return 1
+    fi
+    printf '%s\t%s' "$rd" "$rc"
+}
+
+# Not run_stubbed: the launcher_session_id/by-session tests need the
+# launcher's own stderr (the by-session warning lives there, and
+# run_stubbed's success path discards everything but the "run dir:" line)
+# and an explicit CLAUDE_CODE_SESSION_ID/FORK_SANDBOX_BY_SESSION_DIR pair
+# per call, neither of which run_stubbed's fixed env-var list carries. $1
+# is CLAUDE_CODE_SESSION_ID, or the empty string to force it UNSET (via
+# `env -u`, not just omitted) -- the orchestrating session running this
+# very suite may have its own exported, which must never leak into the
+# "no session id" case. $2 is FORK_SANDBOX_BY_SESSION_DIR. $3.. are
+# launcher args. Sets LWS_OUT/LWS_RC/LWS_RD rather than returning them:
+# LWS_OUT is the merged stdout+stderr a caller needs to inspect for the
+# warning text, which a return value cannot carry alongside an exit code.
+launch_with_session() {
+    local sid="$1" bsd="$2"; shift 2
+    if [[ -n "$sid" ]]; then
+        LWS_OUT="$(HOME="$launcher_home" PATH="$real_stub:$PATH" FAKE_COUNT_FILE="$count" \
+            FAKE_ARGV_LOG="$argv_log" FAKE_SCRIPT="$script_file" \
+            FORK_SANDBOX_CONFIG_DIR="$real_cfg" FORK_SANDBOX_BACKEND=fake-image \
+            CLAUDE_CODE_SESSION_ID="$sid" FORK_SANDBOX_BY_SESSION_DIR="$bsd" \
+            timeout 60 "$launcher" --foreground "$@" "$proj" "$handoff" 2>&1)"
+    else
+        LWS_OUT="$(HOME="$launcher_home" PATH="$real_stub:$PATH" FAKE_COUNT_FILE="$count" \
+            FAKE_ARGV_LOG="$argv_log" FAKE_SCRIPT="$script_file" \
+            FORK_SANDBOX_CONFIG_DIR="$real_cfg" FORK_SANDBOX_BACKEND=fake-image \
+            FORK_SANDBOX_BY_SESSION_DIR="$bsd" \
+            env -u CLAUDE_CODE_SESSION_ID \
+            timeout 60 "$launcher" --foreground "$@" "$proj" "$handoff" 2>&1)"
+    fi
+    LWS_RC=$?
+    LWS_RD="$(printf '%s\n' "$LWS_OUT" | sed -n 's/^  run dir:  *//p' | head -1)"
+}
+
 if HOME="$launcher_home" PATH="$real_stub:$PATH" FORK_SANDBOX_CONFIG_DIR="$real_cfg" \
     FORK_SANDBOX_BACKEND=fake-image "$launcher" --harness claude \
     --codex-args '-c model_reasoning_effort=high' "$proj" "$handoff" \
@@ -1750,7 +1819,7 @@ if rd_a="$(run_stubbed --preset rep3 \
     check "pipeline.json's step 0 harness is claude" "claude" \
         "$(jq -r '.steps[0].harness' "$rd_a/pipeline.json")"
     check "legacy preset run keeps its historical filename set" \
-        $'continuation-prompt-header.md\nevents-code-2.jsonl\nevents-code-3.jsonl\nevents.jsonl\nexit-code\nhandoff-original.md\nhandoff.md\npid\npipeline.json\npreset.json\npreset.yaml\nrun-source\nrun.env\nrun.sh\nsandbox.log\nsummary.json\nsummary.txt' \
+        $'continuation-prompt-header.md\nevents-code-2.jsonl\nevents-code-3.jsonl\nevents.jsonl\nexit-code\nhandoff-original.md\nhandoff.md\npid\npipeline.json\npreset.json\npreset.yaml\nprogress.json\nrun-source\nrun.env\nrun.sh\nsandbox.log\nsummary.json\nsummary.txt' \
         "$(find "$rd_a" -maxdepth 1 -type f -exec basename {} \; | LC_ALL=C sort)"
 else
     no "rep3 launch succeeds"
@@ -2567,6 +2636,196 @@ if rd_h2="$(run_stubbed --preset skiptest \
         "review:    1 iteration(s), findings 0; loop exit: approved"
 else
     no "skiptest (commit) launch succeeds"
+fi
+
+printf '\n== progress.json: a live per-step status file ==\n'
+
+# One entry per pipeline step, in order, as "<action>/<state>/<i>/<cap>/<ended>"
+# (ended reads the literal string "null" through jq -r, not empty) -- the
+# compact shape every check below reduces a run's progress.json to.
+progress_steps() {
+    jq -r '[.steps[] | "\(.action)/\(.state)/\(.i)/\(.cap)/\(.ended)"] | join(" ")' \
+        "$1/progress.json" 2>/dev/null
+}
+
+# Spot-check three shapes already built above, rather than launching them
+# again: a composed multi-review-then-maintain pipeline that ends approved
+# (rd_composed), a read-only review-then-maintain pipeline with no code
+# step at all (rd_ro), and a code leg that commits nothing, skipping its
+# review step (rd_h1).
+if [[ -n "${rd_composed:-}" ]]; then
+    check "composed run's progress.json exists, not a symlink" "1" \
+        "$( [[ -f "$rd_composed/progress.json" && ! -L "$rd_composed/progress.json" ]] && echo 1)"
+    check "composed run's progress.json spec is the preset name" \
+        "composed" "$(jq -r '.spec' "$rd_composed/progress.json")"
+    check "composed run's progress.json state is done" \
+        "done" "$(jq -r '.state' "$rd_composed/progress.json")"
+    check "composed run's progress.json updated is an integer" "true" \
+        "$(jq -r '(.updated | type == "number") and (.updated == (.updated | floor))' \
+            "$rd_composed/progress.json")"
+    check "composed run's progress.json has one entry per pipeline step" \
+        "4" "$(jq -r '.steps | length' "$rd_composed/progress.json")"
+    check "composed run's progress.json steps, in pipeline order" \
+        "code/done/1/1/null review/done/1/1/cap review/done/1/1/approved maintain/done/1/2/approved" \
+        "$(progress_steps "$rd_composed")"
+    check "composed run's progress.json .part file is gone" "0" \
+        "$(find "$rd_composed" -maxdepth 1 -name 'progress.json.part' | wc -l)"
+else
+    no "rd_composed unavailable for progress.json checks"
+fi
+
+if [[ -n "${rd_ro:-}" ]]; then
+    check "a read-only pipeline's progress.json spec is the pipeline string" \
+        "rhaiku-mopus" "$(jq -r '.spec' "$rd_ro/progress.json")"
+    check "a read-only pipeline's progress.json state is done" \
+        "done" "$(jq -r '.state' "$rd_ro/progress.json")"
+    check "a read-only pipeline's progress.json has no code step" \
+        "review/done/1/1/findings maintain/done/1/1/approved" \
+        "$(progress_steps "$rd_ro")"
+else
+    no "rd_ro unavailable for progress.json checks"
+fi
+
+if [[ -n "${rd_h1:-}" ]]; then
+    check "a coder that commits nothing: the review step is skipped" \
+        "code/done/1/1/null review/skipped/0/1/skipped" \
+        "$(progress_steps "$rd_h1")"
+    check "a coder that commits nothing: the run itself is still done" \
+        "done" "$(jq -r '.state' "$rd_h1/progress.json")"
+else
+    no "rd_h1 unavailable for progress.json checks"
+fi
+
+# label strips a leading sandbox/-style prefix (one path segment); spec is
+# null for a plain-flags run with neither --preset nor --pipeline.
+prep_stub 'commit'
+if rd_prog_plain="$(run_stubbed --harness claude --model haiku \
+    --branch "sandbox/prog-plain-$$")"; then
+    tmpdirs+=("$rd_prog_plain")
+    check "a plain run's progress.json label strips the sandbox/ prefix" \
+        "prog-plain-$$" "$(jq -r '.label' "$rd_prog_plain/progress.json")"
+    check "a plain run's progress.json spec is null" \
+        "null" "$(jq -r '.spec' "$rd_prog_plain/progress.json")"
+    check "a plain run's progress.json state is done" \
+        "done" "$(jq -r '.state' "$rd_prog_plain/progress.json")"
+    check "a plain run's progress.json has one code step" \
+        "code/done/1/1/null" "$(progress_steps "$rd_prog_plain")"
+else
+    no "progress.json plain-run launch succeeds"
+fi
+
+# A --pipeline run with a code, a review and a maintain step, the review
+# approving on its first pass: spec is the raw spec string, not a preset
+# name, and action "maintain" (not run_leg's own "maintainer" vocabulary).
+prep_stub $'commit\napproved\napproved'
+if rd_prog_pipeline="$(run_stubbed --pipeline csonnet-rsonnet-msonnet \
+    --branch "sandbox-test-prog-pipeline-$$")"; then
+    tmpdirs+=("$rd_prog_pipeline")
+    check "a --pipeline run's progress.json spec is the spec string" \
+        "csonnet-rsonnet-msonnet" "$(jq -r '.spec' "$rd_prog_pipeline/progress.json")"
+    check "a --pipeline code+review+maintain run's progress.json steps" \
+        "code/done/1/1/null review/done/1/1/approved maintain/done/1/1/approved" \
+        "$(progress_steps "$rd_prog_pipeline")"
+    check "a --pipeline code+review+maintain run's state is done" \
+        "done" "$(jq -r '.state' "$rd_prog_pipeline/progress.json")"
+else
+    no "progress.json --pipeline launch succeeds"
+fi
+
+# A review loop that never approves runs to its cap: the fix leg commits
+# each time (so the loop never ends early on no-progress), and the loop
+# entry itself is done, ended "cap" -- a harness error, not a stop.
+prep_stub $'commit\nfindings\ncommit\nfindings\ncommit'
+if rd_prog_cap="$(run_stubbed --preset reviewloop --review-loop 2 \
+    --branch "sandbox-test-prog-cap-$$")"; then
+    tmpdirs+=("$rd_prog_cap")
+    check "a review loop exhausting its cap: the step ends cap, at cap/cap" \
+        "code/done/1/1/null review/done/2/2/cap" "$(progress_steps "$rd_prog_cap")"
+    check "a review loop exhausting its cap: the run itself is still done" \
+        "done" "$(jq -r '.state' "$rd_prog_cap/progress.json")"
+else
+    no "progress.json review-loop-cap launch succeeds"
+fi
+
+# A failing leg: the coding leg itself exits non-zero, --foreground execs
+# run.sh, so this run's own exit code IS that leg's. The step is failed,
+# and so -- unlike a review-loop harness error, which never touches $rc in
+# an ordinary run -- is the run itself.
+prep_stub 'fail'
+if rd_prog_fail_rc="$(run_stubbed_expect_fail --harness claude --model haiku \
+    --branch "sandbox-test-prog-fail-$$")"; then
+    rd_prog_fail="${rd_prog_fail_rc%%$'\t'*}"
+    prog_fail_rc="${rd_prog_fail_rc##*$'\t'}"
+    tmpdirs+=("$rd_prog_fail")
+    check "a failing code leg's own exit code is non-zero" "1" "$prog_fail_rc"
+    check "a failing code leg's exit-code file agrees" "1" \
+        "$(cat "$rd_prog_fail/exit-code" 2>/dev/null)"
+    check "a failing code leg's progress.json step is failed" \
+        "code/failed/1/1/null" "$(progress_steps "$rd_prog_fail")"
+    check "a failing code leg's progress.json run state is failed" \
+        "failed" "$(jq -r '.state' "$rd_prog_fail/progress.json")"
+else
+    no "progress.json failing-leg launch produced a run dir"
+fi
+
+printf '\n== launcher_session_id and the by-session symlink ==\n'
+
+by_session_tmp="$(mktemp -d)"; tmpdirs+=("$by_session_tmp")
+
+# A valid session id: run.env records it, and the run dir is linked under
+# <by-session-root>/<id>/<run-dir-basename>.
+prep_stub 'commit'
+launch_with_session "fixture-session-$$" "$by_session_tmp/valid" \
+    --harness claude --model haiku --branch "sandbox-test-session-ok-$$"
+if [[ "$LWS_RC" -eq 0 && -n "$LWS_RD" ]]; then
+    rd_sess_ok="$LWS_RD"; tmpdirs+=("$rd_sess_ok")
+    contains "run.env records the launching session id" \
+        "$(cat "$rd_sess_ok/run.env")" "launcher_session_id=fixture-session-$$"
+    link_path="$by_session_tmp/valid/fixture-session-$$/$(basename "$rd_sess_ok")"
+    check "the by-session symlink exists" "1" \
+        "$( [[ -L "$link_path" ]] && echo 1)"
+    check "the by-session symlink resolves to the run dir" "$rd_sess_ok" \
+        "$(readlink -f "$link_path" 2>/dev/null)"
+else
+    no "session-id launch succeeds" "$LWS_OUT"
+fi
+
+# An unsafe session id (not a single safe path component): run.env still
+# records the raw value, exactly what CLAUDE_CODE_SESSION_ID held, but no
+# symlink is attempted -- in particular "../x" must never be allowed to
+# turn into a path one level outside the by-session root.
+prep_stub 'commit'
+launch_with_session "../x" "$by_session_tmp/unsafe" \
+    --harness claude --model haiku --branch "sandbox-test-session-unsafe-$$"
+if [[ "$LWS_RC" -eq 0 && -n "$LWS_RD" ]]; then
+    rd_sess_unsafe="$LWS_RD"; tmpdirs+=("$rd_sess_unsafe")
+    contains "run.env records the unsafe session id verbatim" \
+        "$(cat "$rd_sess_unsafe/run.env")" "launcher_session_id=../x"
+    contains "an unsafe session id is warned about, not silently dropped" \
+        "$LWS_OUT" "is not a safe"
+    check "an unsafe session id creates no by-session directory at all" "0" \
+        "$(find "$by_session_tmp/unsafe" -mindepth 0 2>/dev/null | wc -l)"
+    check "an unsafe session id never escapes the by-session root" "0" \
+        "$( [[ -e "$by_session_tmp/x" ]] && echo 1 || echo 0)"
+else
+    no "unsafe-session-id launch succeeds" "$LWS_OUT"
+fi
+
+# No session id at all (the ordinary terminal-launch case): run.env records
+# an empty value, and no by-session directory is created. CLAUDE_CODE_
+# SESSION_ID is force-unset by launch_with_session itself here, not just
+# omitted -- the session running this very suite may have its own exported.
+prep_stub 'commit'
+launch_with_session "" "$by_session_tmp/none" \
+    --harness claude --model haiku --branch "sandbox-test-session-none-$$"
+if [[ "$LWS_RC" -eq 0 && -n "$LWS_RD" ]]; then
+    rd_sess_none="$LWS_RD"; tmpdirs+=("$rd_sess_none")
+    contains "run.env records an empty session id when none was given" \
+        "$(cat "$rd_sess_none/run.env")" $'launcher_session_id=\n'
+    check "no session id means no by-session directory is created" "0" \
+        "$( [[ -e "$by_session_tmp/none" ]] && echo 1 || echo 0)"
+else
+    no "no-session-id launch succeeds" "$LWS_OUT"
 fi
 
 printf '\n== sandbox-run-log.py: the preset definition in the archive ==\n'

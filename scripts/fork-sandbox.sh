@@ -7173,6 +7173,24 @@ fi
 
 started_at="$(date +%s)"
 
+# progress.json's own identity, fixed at launch: label is the branch with a
+# leading sandbox/-style prefix (one path segment) stripped, so a status
+# line's per-run key matches the short name a human actually typed rather
+# than a team- or tool-prefixed branch. ${branch#*/} is a no-op when the
+# branch carries no "/" at all. spec is preset_name, which already reads
+# back as the pipeline spec string for --pipeline (and for a --preset name
+# that fell back to running as one -- see preset_name's own assignment
+# above) and as the plain preset name for an ordinary --preset; empty for a
+# run launched with neither.
+progress_label="${branch#*/}"
+progress_spec="$preset_name"
+# The orchestrating Claude session's own id, when this run was launched from
+# one: recorded into run.env below, and used further down (after run.sh is
+# generated) to link this run dir under the by-session index a status line
+# reads. Empty when the launching shell carries no such variable -- a plain
+# terminal launch, or a harness that does not set it.
+launcher_session_id="${CLAUDE_CODE_SESSION_ID:-}"
+
 {
     printf 'version=1\n'
     printf 'run_dir=%s\n' "$run_dir"
@@ -7230,6 +7248,11 @@ started_at="$(date +%s)"
     fi
     printf 'outbox_max_bytes=%s\n' "$outbox_max_bytes"
     printf 'started_at=%s\n' "$started_at"
+    # The launching Claude session's id, always printed (never conditional
+    # like the maintainer/claude-credentials blocks above) so a reader can
+    # tell "no session" from "run.env predates this key" -- see
+    # launcher_session_id's own comment above.
+    printf 'launcher_session_id=%s\n' "$launcher_session_id"
     # Per-account attribution, printed only when a leg of this run actually
     # reads a Claude credential -- same conditional-key convention as the
     # maintainer block above. Path only, never token material.
@@ -7577,6 +7600,10 @@ started_at="$(date +%s)"
         done
         printf ')\n'
     done
+    # progress.json's own fixed-at-launch identity -- see progress_label/
+    # progress_spec's own comment above, beside where they are computed.
+    printf 'progress_label=%q\n' "$progress_label"
+    printf 'progress_spec=%q\n' "$progress_spec"
     printf '\n'
     cat <<'RUNNER'
 # Load shared predicates used by the status script as well as this runner, so
@@ -7663,6 +7690,60 @@ rm -f "$run_dir/exit-code"
 if [[ -n "$brief_warning" ]]; then
     printf '%s\n' "$brief_warning" >> "$sandbox_log"
 fi
+
+# progress.json: a live, one-glyph-per-step status file a status line (or
+# any other reader outside this run) can poll without shelling into tmux or
+# reading the event log. Rewritten atomically -- build beside the
+# destination and rename -- at every step/leg/run transition below.
+# progress_state/progress_i/progress_ended are 1-indexed, parallel to
+# run_step_kind/idx/cap: "pending" until a step's first leg starts,
+# "running" while it is the active step, then "done", "failed" or
+# "skipped". Writing this file must never fail the run, so every jq call
+# below is best-effort and every write falls back to removing its own
+# .part rather than leaving a half-written file behind.
+declare -a progress_state=() progress_i=() progress_ended=()
+for (( _pg_k = 1; _pg_k <= run_step_count; _pg_k++ )); do
+    progress_state[_pg_k]="pending"
+    progress_i[_pg_k]=0
+    progress_ended[_pg_k]=""
+done
+# Set the moment any step's state becomes "failed" -- a harness error in a
+# review/maintainer loop does not by itself change $rc (see the walker's own
+# comment on that below), so the run-level state this writes has to track
+# failure independently of $rc rather than only at the very end.
+progress_any_step_failed=0
+
+progress_write() {
+    local run_state="$1" _pg_j action ended_val step_json steps_ndjson=""
+    for (( _pg_j = 1; _pg_j <= run_step_count; _pg_j++ )); do
+        action="${run_step_kind[_pg_j]}"
+        [[ "$action" == maintainer ]] && action="maintain"
+        ended_val="${progress_ended[_pg_j]:-}"
+        step_json="$(jq -cn \
+            --arg action "$action" \
+            --arg state "${progress_state[_pg_j]}" \
+            --argjson i "${progress_i[_pg_j]:-0}" \
+            --argjson cap "${run_step_cap[_pg_j]}" \
+            --arg ended "$ended_val" \
+            '{action:$action, state:$state, i:$i, cap:$cap,
+              ended:(if $ended == "" then null else $ended end)}' \
+            2>/dev/null)" || step_json=""
+        [[ -n "$step_json" ]] && steps_ndjson+="$step_json"$'\n'
+    done
+    jq -n \
+        --arg label "$progress_label" \
+        --arg spec "$progress_spec" \
+        --arg state "$run_state" \
+        --argjson updated "$(date +%s)" \
+        --argjson steps "$(printf '%s' "$steps_ndjson" | jq -cs '.' 2>/dev/null || printf '[]')" \
+        '{schema:1, label:$label,
+          spec:(if $spec == "" then null else $spec end),
+          state:$state, updated:$updated, steps:$steps}' \
+        > "$run_dir/progress.json.part" 2>/dev/null \
+        && mv -f "$run_dir/progress.json.part" "$run_dir/progress.json" \
+        || rm -f "$run_dir/progress.json.part" 2>/dev/null
+}
+progress_write running
 
 # Every later leg of this run -- a --refresh-at continuation, a review leg, a
 # fix leg -- is a fresh sandbox with a fresh /tmp, bound to this same inbox
@@ -7951,6 +8032,14 @@ fi
 # here too.
 rc=0
 if [[ "$mode" != "review-only" ]] && { [[ "${composed_pipeline:-0}" != 1 ]] || [[ "${run_step_kind[1]}" == code ]]; }; then
+# This block is always step 1's own pass 1 -- see the condition just above,
+# which only ever runs when run_step_kind[1] is code. The walker below
+# finalizes this step (to done or failed) once it knows there are no more
+# repeat passes or --refresh-at continuations coming; here it only becomes
+# the active step.
+progress_state[1]="running"
+progress_i[1]=1
+progress_write running
 # stderr goes through a real pipeline into $sandbox_log, not a `2> >(tee)`
 # process substitution: bash does not wait on the latter (claude-sandboxed's
 # own RESUME_FAIL_RE names this exact hazard beside its ERR_CAPTURE), so
@@ -8012,6 +8101,7 @@ fi
 # The implement leg is leg 1. Archive right after its exit code is known,
 # same as every later leg below.
 fs_archive_inbox 1 "$harness" "$rc"
+progress_write running
 # exit-code is what fork-sandbox-status.sh reads as "this run is over": it
 # reports the run finished the moment the file exists, and --monitor fires its
 # one terminal event there. With a review loop still to come that would be a
@@ -8510,6 +8600,11 @@ if [[ "$refresh_enabled" == "1" ]]; then
             fi
             rc="${PIPESTATUS[0]:-1}"
             fs_archive_inbox "$leg_no" "$harness" "$rc"
+            # A continuation is the same conversation as step 1's pass 1,
+            # not a new pass -- see progress_i[1]'s own comment where pass 1
+            # begins, above -- so this is a leg-end transition only: the
+            # step stays running and i stays at 1 until the chain ends.
+            progress_write running
             refresh_last_events="$cont_events"
             fs_refresh_window_mismatch "$cont_events" "$refresh_context_window" \
                 | tee -a "$sandbox_log"
@@ -9016,10 +9111,26 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count && stop_requested != 1; cur
     if [[ "$cur_kind" == code ]]; then
         cur_pass=1
         if (( cur_step_no == cur_first_code && cur_first_code_ran )); then cur_pass=2; fi
+        # Already "running" (from pass 1, above) for the first code step;
+        # for any other code step this is where it becomes the active one.
+        # progress_i starts at the passes already run outside this loop
+        # (1 for the first code step, 0 for any other).
+        progress_state[cur_step_no]="running"
+        progress_i[cur_step_no]=$(( cur_pass - 1 ))
+        progress_write running
         for ((; cur_pass <= cur_cap && rc == 0 && stop_requested != 1; cur_pass++)); do
             run_leg code "$cur_pass" "$handoff" "$cur_step_idx"
             rc="$leg_rc"
+            progress_i[cur_step_no]="$cur_pass"
+            progress_write running
         done
+        if [[ "$rc" == "0" ]]; then
+            progress_state[cur_step_no]="done"
+        else
+            progress_state[cur_step_no]="failed"
+            progress_any_step_failed=1
+        fi
+        progress_write running
         continue
     fi
     if [[ "$cur_legacy" == 1 ]]; then
@@ -9031,6 +9142,9 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count && stop_requested != 1; cur
     else
         cur_loop_json="$run_dir/step-${cur_step_no}-loop.json"
     fi
+    progress_state[cur_step_no]="running"
+    progress_i[cur_step_no]=0
+    progress_write running
     cur_ended=""; cur_detail=""; cur_iters='[]'
     cur_head="$(clone_branch_head)"
     if [[ -z "$cur_head" ]]; then
@@ -9090,6 +9204,11 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count && stop_requested != 1; cur
     for ((cur_i = 1; cur_i <= cur_cap; cur_i++)); do
         if [[ -n "$cur_ended" ]]; then break; fi
         if [[ "${stop_requested:-0}" == 1 ]]; then cur_ended=stop-requested; break; fi
+        # i counts iterations BEGUN, so this counts before the leg runs --
+        # the step's own state/ended are finalized once, after this whole
+        # loop ends, below.
+        progress_i[cur_step_no]="$cur_i"
+        progress_write running
         rm -f "$cur_verdict_file"
         if [[ "$cur_legacy" == 1 ]]; then
             if [[ "$cur_kind" == maintainer ]]; then
@@ -9381,9 +9500,35 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count && stop_requested != 1; cur
         fi
         cur_iters="$(jq -cn --argjson old "$cur_iters" --argjson cur "$(cur_iter_record)" '$old + $cur')"
         cur_save
+        # Leg-end transition for this iteration. state/ended stay as they
+        # are until the loop as a whole ends, below -- cur_ended may
+        # already be set here (approved, findings, harness-error, ...), but
+        # the contract is "done/failed/skipped once the loop is over", not
+        # mid-iteration.
+        progress_write running
     done
     [[ -n "$cur_ended" ]] || cur_ended=cap
     cur_save
+    # This step's own final state, from the walker's own cur_ended
+    # vocabulary: skipped (nothing to review, or a stop caught it before any
+    # iteration ran), failed (a harness error -- see progress_any_step_failed's
+    # own comment, above, for why the run's own state must track this
+    # independently of $rc), or done for every other reason a loop ends
+    # (approved, findings, no-progress, cap).
+    case "$cur_ended" in
+        skipped|stop-requested)
+            progress_state[cur_step_no]="skipped"
+            ;;
+        harness-error)
+            progress_state[cur_step_no]="failed"
+            progress_any_step_failed=1
+            ;;
+        *)
+            progress_state[cur_step_no]="done"
+            ;;
+    esac
+    progress_ended[cur_step_no]="$cur_ended"
+    progress_write running
     if [[ "$cur_legacy" == 1 ]]; then
         if [[ "$cur_kind" == maintainer ]]; then
             maintainer_loop_ended="$cur_ended"
@@ -9436,6 +9581,45 @@ done
 # writing it again costs nothing and keeps this the one place that ends a
 # loop run.
 printf '%s\n' "$rc" > "$run_dir/exit-code"
+
+# progress.json's own final write. This is the one place every run reaches,
+# whatever shape it was -- a plain single-code run whose exit-code write
+# above is early and this one merely repeats, a review/maintainer loop, a
+# read-only pipeline, or a stop -- so it is where any step this runner's own
+# steps above never got to finalize is swept to a terminal state: "pending"
+# means the outer walker loop above never reached it at all (only
+# stop_requested can do that -- see its own gate on that loop), and
+# "running" means a step was the active one when a stop's TERM killed its
+# leg out from under it (harness-error and every other ending finalize
+# their own step inline, above, so a step already "done"/"failed"/"skipped"
+# here is untouched). Either way that step becomes "skipped" ("stop
+# requested" is a known reason to record) unless the run is failing for a
+# reason that has nothing to do with a stop, in which case the step that was
+# actually running becomes "failed" instead, so the one step that was in
+# flight when things went wrong is not reported as having never run.
+for (( _pg_k = 1; _pg_k <= run_step_count; _pg_k++ )); do
+    case "${progress_state[_pg_k]}" in
+        pending|running)
+            if [[ "${stop_requested:-0}" == 1 ]]; then
+                progress_state[_pg_k]="skipped"
+                progress_ended[_pg_k]="stop-requested"
+            elif [[ "$rc" != "0" ]] || (( progress_any_step_failed )); then
+                progress_state[_pg_k]="failed"
+                progress_any_step_failed=1
+            else
+                progress_state[_pg_k]="skipped"
+                progress_ended[_pg_k]="skipped"
+            fi
+            ;;
+    esac
+done
+progress_final_state="done"
+if [[ "${stop_requested:-0}" == 1 ]]; then
+    progress_final_state="stopped"
+elif [[ "$rc" != "0" ]] || (( progress_any_step_failed )); then
+    progress_final_state="failed"
+fi
+progress_write "$progress_final_state"
 
 # Absent (empty here becomes an absent key below) unless a stop request
 # actually reached one of the loop checks above -- "stopped" is the only
@@ -10041,6 +10225,35 @@ exit "$rc"
 RUNNER
 } > "$run_dir/run.sh"
 chmod +x "$run_dir/run.sh"
+
+# The per-session index a status line reads to find every run this Claude
+# session launched: <by-session-root>/<session-id>/<run-dir-basename> ->
+# run_dir. launcher_session_id (recorded into run.env above) is not
+# validated by whoever set CLAUDE_CODE_SESSION_ID, so it is checked again
+# here against the one shape this path may safely take -- a single path
+# component, never empty, "." or ".." and never carrying a "/" -- before it
+# is allowed anywhere near a path. FORK_SANDBOX_BY_SESSION_DIR overrides the
+# root so a test never touches the real one. No pruning of old links: a
+# session that never relaunches simply leaves its index directory as is.
+# Failing to create the link is a warning, never a launch failure -- nothing
+# about the run itself depends on it existing.
+if [[ -n "$launcher_session_id" ]]; then
+    by_session_root="${FORK_SANDBOX_BY_SESSION_DIR:-$FS_SCRATCH_ROOT/forks/by-session}"
+    if [[ "$launcher_session_id" =~ ^[A-Za-z0-9._-]+$ \
+        && "$launcher_session_id" != "." && "$launcher_session_id" != ".." ]]; then
+        if mkdir -p "$by_session_root/$launcher_session_id" 2>/dev/null; then
+            if ! ln -s "$run_dir" \
+                "$by_session_root/$launcher_session_id/$(basename "$run_dir")" 2>/dev/null; then
+                echo "Warning: could not link this run under $by_session_root/$launcher_session_id" >&2
+            fi
+        else
+            echo "Warning: could not create $by_session_root/$launcher_session_id" >&2
+        fi
+    else
+        echo "Warning: CLAUDE_CODE_SESSION_ID '$launcher_session_id' is not a safe" >&2
+        echo "single path component; skipping the by-session link." >&2
+    fi
+fi
 
 # The launcher's own hold on the workspace lock ends here: everything that
 # touches this workspace's git state or provisions it happens above, and
