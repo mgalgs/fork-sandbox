@@ -176,6 +176,14 @@
 # unchanged. No other seat gets the ref, and the postmaster keeps no
 # "answered" state: the persona decides whether it has answered the push.
 #
+# A `sets` seat's `Version:` reply whose wake branch did not come back is
+# normally flagged; but when the thread's upstream-head file records exactly
+# the current review target's sha (the human pushed the target's own tip
+# unchanged, so the seat committed nothing and its empty branch was
+# deleted), the reply is accepted and stamped with the CURRENT target's
+# branch and sha and the new X-Version; the review-target file keeps its sha
+# and takes the new VERSION.
+#
 # HOOKS
 #
 # The postmaster emits three generic events and runs site-supplied
@@ -3697,24 +3705,39 @@ pm_harvest_one_file() {
     local rt_write_sha="" rt_write_branch="" rt_write_version=""
     if [[ -n "$version" ]]; then
         # review_target_key == sets, guaranteed by the malformed check above.
-        local rt_new_sha
+        local rt_new_sha rt_new_branch="$wake_branch"
         rt_new_sha="$(git -C "$project" rev-parse --verify --quiet "refs/heads/$wake_branch^{commit}" 2>/dev/null)"
-        if [[ -z "$rt_new_sha" ]]; then
-            rm -f -- "$body_file"
-            pm_flag "$tid" "Version: $version but the wake's branch $wake_branch did not come back"
-            return 1
-        fi
         local rt_file="$MAIL_ROOT/.postmaster/review-target/$tid.env" rt_current=""
         [[ -f "$rt_file" ]] && rt_current="$(fs_pm_env_get "$rt_file" VERSION)"
+        if [[ -z "$rt_new_sha" ]]; then
+            # A wake branch that never came back is normally a failed
+            # leg. The one exception: the human pushed the current
+            # target's own tip unchanged, the seat's `git reset --hard
+            # upstream` was a no-op, it committed nothing, and the empty
+            # branch was deleted. Then the new version keeps the CURRENT
+            # target (same branch, same sha). Recognised by the thread's
+            # upstream-head file recording exactly the target's sha.
+            local uh_file="$MAIL_ROOT/.postmaster/upstream-head/$tid.env" uh_sha_same="" rt_sha_cur=""
+            [[ -f "$uh_file" ]] && uh_sha_same="$(fs_pm_env_get "$uh_file" SHA)"
+            [[ -f "$rt_file" ]] && rt_sha_cur="$(fs_pm_env_get "$rt_file" SHA)"
+            if [[ -n "$uh_sha_same" && "$uh_sha_same" == "$rt_sha_cur" ]]; then
+                rt_new_sha="$rt_sha_cur"
+                rt_new_branch="$(fs_pm_env_get "$rt_file" BRANCH)"
+            else
+                rm -f -- "$body_file"
+                pm_flag "$tid" "Version: $version but the wake's branch $wake_branch did not come back"
+                return 1
+            fi
+        fi
         if [[ "$rt_current" =~ ^[0-9]+$ ]] && (( version <= rt_current )); then
             rm -f -- "$body_file"
             pm_flag "$tid" "Version: $version does not advance the review target (at $rt_current)"
             return 1
         fi
-        cmd+=(--header "X-Review-Target-Set: $wake_branch $rt_new_sha")
-        cmd+=(--header "X-Review-Target: $wake_branch $rt_new_sha")
+        cmd+=(--header "X-Review-Target-Set: $rt_new_branch $rt_new_sha")
+        cmd+=(--header "X-Review-Target: $rt_new_branch $rt_new_sha")
         cmd+=(--header "X-Version: $version")
-        rt_write_branch="$wake_branch" rt_write_sha="$rt_new_sha" rt_write_version="$version"
+        rt_write_branch="$rt_new_branch" rt_write_sha="$rt_new_sha" rt_write_version="$version"
     elif [[ "$review_target_key" == sets ]]; then
         local rt_file="$MAIL_ROOT/.postmaster/review-target/$tid.env" rt_current=""
         if [[ -f "$rt_file" ]]; then

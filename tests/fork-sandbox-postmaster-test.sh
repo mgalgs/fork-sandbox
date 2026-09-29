@@ -6301,6 +6301,82 @@ contains "review-target case B1b: state file records the non-descendant sha" "$r
 check "review-target case B1b: the thread is not flagged" 0 \
     "$( [[ -e "$PM_STATE_DIR/needs-operator/$rtn_tid" ]] && echo 1 || echo 0 )"
 
+# ---- review-target case Bunch: a Version: reply whose wake branch never came
+# back (the human pushed the target's own tip unchanged, the seat's reset
+# was a no-op, its empty branch was deleted) ----
+# rtu_run <announce-sha|""> <label>: opens a thread targeting the rt1
+# commit, optionally announces <announce-sha> as the upstream head from a
+# non-fleet sender, lets ken wake, then harvests a `Version: 2` reply while
+# the wake branch does NOT exist in the project repo. Leaves RTU_TID,
+# RTU_POSTED (the posted message file, or "") for the caller.
+rtu_run() {
+    local announce_sha="$1" label="$2" mid env run_dir branch f
+    uh_kickoff ken; mid="$UH_MID"
+    RTU_TID="$(thread_of "$mid")"
+    if [[ -n "$announce_sha" ]]; then
+        reply_msg '@ci-demo' "$mid" 'pushed' --to '@ken' --upstream-head "$rt1_branch:$announce_sha" >/dev/null
+    else
+        reply_msg '@carol' "$mid" 'nothing pushed' --to '@ken' >/dev/null
+    fi
+    once
+    env="$(latest_env_for_agent ken)"
+    run_dir="$(env_val "$env" RUN_DIR)"
+    branch="$(env_val "$env" BRANCH)"
+    git -C "$PROJECT_DIR" update-ref -d "refs/heads/$branch" 2>/dev/null || true
+    check "$label setup: the wake branch does not exist" 0 \
+        "$(git -C "$PROJECT_DIR" rev-parse --verify --quiet "refs/heads/$branch" >/dev/null && echo 1 || echo 0)"
+    rm -f -- "$PM_STATE_DIR/harvested/$(basename "$env" .env)" \
+        "$run_dir/summary.json" "$run_dir/exit-code"
+    mkdir -p -- "$run_dir/outbox"
+    rm -f -- "$run_dir/outbox"/*
+    printf 'To: @carol\nVersion: 2\n\nThe push is unchanged, posting it as v2.\n' > "$run_dir/outbox/mail-1.md"
+    printf '0\n' > "$run_dir/exit-code"
+    printf '{}\n' > "$run_dir/summary.json"
+    once
+    RTU_POSTED=""
+    for f in "$FORK_SANDBOX_MAIL_ROOT/threads/$RTU_TID"/*.msg; do
+        [[ -e "$f" ]] || continue
+        grep -qF 'posting it as v2.' "$f" && RTU_POSTED="$f"
+    done
+    return 0
+}
+
+# Accepted: the upstream-head file records exactly the current target's sha.
+rtu_run "$rt1_sha" "review-target case Bunch"
+check "review-target case Bunch: the Version: reply was posted" 1 \
+    "$( [[ -n "$RTU_POSTED" ]] && echo 1 || echo 0 )"
+check "review-target case Bunch: X-Review-Target-Set carries the CURRENT target" \
+    "$rt1_branch $rt1_sha" "$( [[ -n "$RTU_POSTED" ]] && header_of_file "$RTU_POSTED" X-Review-Target-Set )"
+check "review-target case Bunch: X-Review-Target carries the CURRENT target" \
+    "$rt1_branch $rt1_sha" "$( [[ -n "$RTU_POSTED" ]] && header_of_file "$RTU_POSTED" X-Review-Target )"
+check "review-target case Bunch: X-Version is the new version" 2 \
+    "$( [[ -n "$RTU_POSTED" ]] && header_of_file "$RTU_POSTED" X-Version )"
+rtu_state="$(cat "$PM_STATE_DIR/review-target/$RTU_TID.env" 2>/dev/null)"
+contains "review-target case Bunch: state file VERSION moves to 2" "$rtu_state" "VERSION=2"
+contains "review-target case Bunch: state file keeps the same sha" "$rtu_state" "SHA=$rt1_sha"
+contains "review-target case Bunch: state file keeps the same branch" "$rtu_state" "BRANCH=$rt1_branch"
+# (The stub seat's own answer to the non-fleet announcer routes as an
+# unresolvable To: and flags the thread; that is unrelated to the Version:
+# reply, so only a review-target flag counts here.)
+not_contains "review-target case Bunch: not flagged 'did not come back'" \
+    "$(cat "$PM_STATE_DIR/needs-operator/$RTU_TID" 2>/dev/null)" "did not come back"
+
+# Still flagged: no upstream-head file at all.
+rtu_run "" "review-target case Bunchb"
+check "review-target case Bunchb: no Version: reply is posted" 0 "$( [[ -n "$RTU_POSTED" ]] && echo 1 || echo 0 )"
+contains "review-target case Bunchb: flagged 'did not come back'" \
+    "$(cat "$PM_STATE_DIR/needs-operator/$RTU_TID" 2>/dev/null)" "did not come back"
+contains "review-target case Bunchb: the target is not moved" \
+    "$(cat "$PM_STATE_DIR/review-target/$RTU_TID.env" 2>/dev/null)" "VERSION=1"
+
+# Still flagged: the announced head is a different commit than the target.
+rtu_run "$uh_sha" "review-target case Bunchc"
+check "review-target case Bunchc: no Version: reply is posted" 0 "$( [[ -n "$RTU_POSTED" ]] && echo 1 || echo 0 )"
+contains "review-target case Bunchc: flagged 'did not come back'" \
+    "$(cat "$PM_STATE_DIR/needs-operator/$RTU_TID" 2>/dev/null)" "did not come back"
+contains "review-target case Bunchc: the target is not moved" \
+    "$(cat "$PM_STATE_DIR/review-target/$RTU_TID.env" 2>/dev/null)" "SHA=$rt1_sha"
+
 # ---- on-harvest: a sets seat's two-reply harvest, the second carrying Version: 2 ----
 new_scratch_root FORK_SANDBOX_MAIL_ROOT
 export FORK_SANDBOX_MAIL_ROOT

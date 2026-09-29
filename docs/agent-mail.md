@@ -791,6 +791,17 @@ home). The persona may reset its wake branch to `upstream` and post
 that is not a descendant of the previous one (the human rebased or
 squashed) is accepted and recorded as is.
 
+One case needs no commit: the human pushed the current target's own tip
+unchanged, so the seat's `git reset --hard upstream` is a no-op and its
+empty wake branch is deleted. When a `sets` seat's `Version:` reply finds
+no wake branch **and** the thread's upstream-head file records exactly the
+current review target's sha, the reply is accepted instead of flagged
+"did not come back": it is stamped with the CURRENT target's branch and sha
+(`X-Review-Target-Set`/`X-Review-Target`) and the new `X-Version`, and the
+review-target file keeps its sha and takes the new `VERSION`. Any other
+missing branch (no upstream-head file, or a different sha) is flagged as
+before.
+
 The seat sees the announcement in its thread view: `mail-render --text`
 prints an `Upstream-Head: <branch> <sha>` line right after `Hops:` for a
 message carrying `X-Upstream-Head` (the only `X-*` header it shows). Like
