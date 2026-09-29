@@ -9144,9 +9144,13 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count && stop_requested != 1; cur
         progress_i[cur_step_no]=$(( cur_pass - 1 ))
         progress_write running
         for ((; cur_pass <= cur_cap && rc == 0 && stop_requested != 1; cur_pass++)); do
+            # i counts passes BEGUN, so this counts before the leg runs --
+            # the same rule the review/maintain loop below applies to its
+            # own cur_i.
+            progress_i[cur_step_no]="$cur_pass"
+            progress_write running
             run_leg code "$cur_pass" "$handoff" "$cur_step_idx"
             rc="$leg_rc"
-            progress_i[cur_step_no]="$cur_pass"
             progress_write running
         done
         # stop_requested outranks $rc here the same way it does in the
