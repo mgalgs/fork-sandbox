@@ -6,14 +6,18 @@ Usage: fork-sandbox-pipeline-spec.py <spec>
 A spec is a preset's composition name used as the preset itself:
 `-`-joined segments `<stage><model>[<harness>][<repeat>]`, e.g.
 `csonnet2-rsol2-mopus2` (code sonnet x2, review sol x2, maintain opus x2),
-or `ropus-rsonnet-mopus-msonnet` (opus review, sonnet review, opus
-maintain, sonnet maintain -- no code step at all).
+or `ropus-msonnet` (opus review, sonnet maintain -- no code step at all).
 
     stage    c (code), r (review) or m (maintain). At most one c segment,
              which must come first if present; any number of r segments;
              any number of m segments -- in that order (c, r*, m*). An r
              segment after an m is refused; consecutive r's or consecutive
-             m's are not.
+             m's are not -- UNLESS there is no c segment: a codeless spec
+             compiles to a read-only pipeline (see
+             fork-sandbox-preset-parse.py), which only ever runs as a
+             review step, a maintain step, or a review step then a
+             maintain step, so a codeless spec takes at most one r and at
+             most one m.
     model    a name from MODELS below. It runs on its native harness, the
              first one listed for it.
     harness  optional: claude, codex or pi, to seat the model on a
@@ -126,6 +130,11 @@ def compile_spec(spec):
         agent = (AGENT_NAMES[stage] if occurrence == 1
                  else f"{AGENT_NAMES[stage]}{occurrence}")
         seats.append((stage, harness, model_id, repeat, agent))
+
+    if c_count == 0 and (occurrences["r"] > 1 or occurrences["m"] > 1):
+        fail(spec, "a codeless spec compiles to a read-only pipeline, which "
+                   "runs at most one review step and one maintain step; "
+                   "add a code segment to repeat review or maintain stages")
 
     lines = [f"# Compiled from --pipeline {spec}", "agents:"]
     for stage, harness, model_id, repeat, agent in seats:

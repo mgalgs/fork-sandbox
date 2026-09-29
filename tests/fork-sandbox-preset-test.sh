@@ -1463,6 +1463,18 @@ python3 "$repo_dir/scripts/fork-sandbox-pipeline-spec.py" \
         "pipeline	steps	5" \
         "step	2	agent	reviewer" "step	3	agent	reviewer2" \
         "step	4	agent	maintainer" "step	5	agent	maintainer2"
+# A codeless spec compiles to a read-only pipeline, which the preset parser
+# only ever accepts as a review step, a maintain step, or a review step
+# then a maintain step (see the read-only tests below) -- so, unlike a
+# spec with a code stage, a codeless spec cannot repeat review or maintain
+# stages. Refused here, in the compiler, rather than left to surface as a
+# confusing read-only-shape error out of fork-sandbox-preset-parse.py.
+refuses "a repeated review stage with no code stage is refused" \
+    "a codeless spec compiles to a read-only pipeline" --pipeline ropus-rsonnet
+refuses "a repeated maintain stage with no code stage is refused" \
+    "a codeless spec compiles to a read-only pipeline" --pipeline mopus-msonnet
+refuses "a repeated maintain stage after a single review stage, with no code stage, is refused" \
+    "a codeless spec compiles to a read-only pipeline" --pipeline rhaiku-mopus-msonnet
 refuses "an unknown stage letter is refused" \
     "stage 'x' is not c (code)" --pipeline xsonnet
 refuses "a zero repeat is refused" \
