@@ -2783,11 +2783,9 @@ fi
 # one place this suite can see a state the terminal file below always
 # overwrites: "running" with the right i, not yet finalized.
 #
-# A code step with repeat 3: 200cd3c552 fixed an undercount where the
-# active pass's own leg saw the PREVIOUS pass's i -- exactly the kind of bug
-# a terminal-only check cannot catch, since by the end every pass has come
-# and gone. Each of the three snapshots must show the step already
-# "running" at that pass's own i, not the one before it.
+# A code step with repeat 3: each of the three snapshots must show the step
+# already "running" at that pass's own i, not the one before it -- an
+# undercount a terminal-only check cannot see.
 snapshot_dir_repeat="$(mktemp -d)"; tmpdirs+=("$snapshot_dir_repeat")
 prep_stub $'commit\nnoop\ncommit'
 if rd_prog_repeat="$(SNAPSHOT_DIR="$snapshot_dir_repeat" run_stubbed --preset rep3 \
@@ -2805,8 +2803,8 @@ fi
 
 # A review loop iteration: each review leg (the odd-numbered calls below)
 # must see the review step already "running" at that iteration's own i,
-# the same class of off-by-one the repeat-pass fix above closed, just for
-# the loop walker's cur_i instead of the repeat counter.
+# the same off-by-one the repeat-pass check above guards against, for the
+# loop walker's cur_i instead of the repeat counter.
 snapshot_dir_review="$(mktemp -d)"; tmpdirs+=("$snapshot_dir_review")
 prep_stub $'commit\nfindings\ncommit\nfindings\ncommit'
 if rd_prog_review_snap="$(SNAPSHOT_DIR="$snapshot_dir_review" run_stubbed \
