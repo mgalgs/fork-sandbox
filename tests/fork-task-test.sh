@@ -14,6 +14,9 @@
 # session-lineage tests need to reach the launch itself, so they stub tmux
 # (and claude/codex) on PATH and point the registry at a scratch file via
 # $FORK_TASK_REGISTRY -- never a real tmux server or the real registry.
+# They also cover every caller spelling of an existing resume/continue
+# that fork-task.sh must recognize and leave alone: --session-id,
+# --session-id=<id>, --resume, -r, --resume=<id>, --continue, -c.
 
 set -uo pipefail
 
@@ -302,6 +305,59 @@ if [[ "$occurrences" == "0" && "$eq_occurrences" == "1" && "$reg_id" == "$caller
 else
     no "a caller-supplied --session-id=<uuid> in --claude-args is recorded, not duplicated" \
         "occurrences=$occurrences eq_occurrences=$eq_occurrences registry session_id='$reg_id': $(cat "$err")"
+fi
+
+# A caller-supplied -c (short --continue) in --claude-args must be treated
+# the same as --continue: no second --session-id injected. claude refuses
+# --session-id alongside --continue/--resume unless --fork-session is also
+# given, so injecting one here would kill the launch outright.
+reg="$tmp/registry-caller-dash-c.jsonl"
+: > "$tmux_log"
+: > "$claude_argv_log"
+FORK_TASK_REGISTRY="$reg" "$launcher" --claude-args "-c" \
+    "$lineage_project" "$lineage_handoff" > /dev/null 2>"$err"
+occurrences="$(grep -cx -- '--session-id' "$claude_argv_log")"
+reg_id="$(jq -r '.session_id' "$reg" 2>/dev/null)"
+if [[ "$occurrences" == "0" && "$reg_id" == "null" ]]; then
+    ok "a caller-supplied -c in --claude-args is not given a second --session-id"
+else
+    no "a caller-supplied -c in --claude-args is not given a second --session-id" \
+        "occurrences=$occurrences registry session_id='$reg_id': $(cat "$err")"
+fi
+
+# The same, but with -r <id> (short --resume with a value) -- the caller's
+# id is claude's resume target, not the new session's id, so the registry
+# still records session_id: null, and no --session-id is injected.
+reg="$tmp/registry-caller-dash-r.jsonl"
+: > "$tmux_log"
+: > "$claude_argv_log"
+resume_uuid="33333333-3333-3333-3333-333333333333"
+FORK_TASK_REGISTRY="$reg" "$launcher" --claude-args "-r $resume_uuid" \
+    "$lineage_project" "$lineage_handoff" > /dev/null 2>"$err"
+occurrences="$(grep -cx -- '--session-id' "$claude_argv_log")"
+reg_id="$(jq -r '.session_id' "$reg" 2>/dev/null)"
+if [[ "$occurrences" == "0" && "$reg_id" == "null" ]]; then
+    ok "a caller-supplied -r <id> in --claude-args is not given a second --session-id"
+else
+    no "a caller-supplied -r <id> in --claude-args is not given a second --session-id" \
+        "occurrences=$occurrences registry session_id='$reg_id': $(cat "$err")"
+fi
+
+# The same, but with --resume=<id> (equals form) -- must be recognized too,
+# not treated as unrecognized and given a second, generated --session-id.
+reg="$tmp/registry-caller-resume-eq.jsonl"
+: > "$tmux_log"
+: > "$claude_argv_log"
+resume_uuid="44444444-4444-4444-4444-444444444444"
+FORK_TASK_REGISTRY="$reg" "$launcher" --claude-args "--resume=$resume_uuid" \
+    "$lineage_project" "$lineage_handoff" > /dev/null 2>"$err"
+occurrences="$(grep -cx -- '--session-id' "$claude_argv_log")"
+reg_id="$(jq -r '.session_id' "$reg" 2>/dev/null)"
+if [[ "$occurrences" == "0" && "$reg_id" == "null" ]]; then
+    ok "a caller-supplied --resume=<id> in --claude-args is not given a second --session-id"
+else
+    no "a caller-supplied --resume=<id> in --claude-args is not given a second --session-id" \
+        "occurrences=$occurrences registry session_id='$reg_id': $(cat "$err")"
 fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"

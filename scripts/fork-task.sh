@@ -422,11 +422,13 @@ fi
 # Session lineage: give the claude harness a session id up front so the
 # registry (below) can record the edge from this launcher to the child.
 # Codex has no --session-id flag, so a codex launch always records null.
-# If the caller already passed --session-id, --resume, or --continue
-# inside --claude-args, the child's identity is already spoken for --
-# adding a second --session-id would just conflict with claude's own flag
-# parsing -- so this only generates one when the caller gave none of the
-# three. /proc/sys/kernel/random/uuid is preferred over uuidgen because
+# If the caller already passed --session-id (or its --session-id=<id>
+# form), --resume/-r (or --resume=<id>), or --continue/-c inside
+# --claude-args, the child's identity is already spoken for -- adding a
+# second --session-id would just conflict with claude's own flag parsing
+# (claude refuses --session-id alongside --continue/--resume unless
+# --fork-session is also given) -- so this only generates one when the
+# caller gave none of those. /proc/sys/kernel/random/uuid is preferred over uuidgen because
 # it needs no extra package on a bare Linux host (this script is Linux-only
 # already, via tmux and /var/tmp/claude-scratch); uuidgen is the fallback
 # for a host where that pseudo-file is missing.
@@ -444,7 +446,11 @@ if [[ "$harness" == "claude" ]] && ! $sandboxed; then
                 caller_supplied_id=true
                 child_session_id="${claude_extra_argv[$_i]#--session-id=}"
                 ;;
-            --resume|--continue)
+            --resume|--continue|-r|-c)
+                caller_supplied_id=true
+                child_session_id=""
+                ;;
+            --resume=*)
                 caller_supplied_id=true
                 child_session_id=""
                 ;;
