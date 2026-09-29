@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck extended-analysis=false  # dataflow analysis of this file needs ~5G
 # fork-sandbox-postmaster-test.sh — Exercise fork-sandbox-postmaster.sh's
 # routing rules, wake spawning, and reply harvest against throwaway
 # fixtures, stubbing fork-sandbox.sh the same way tests/lkml-round-test.sh
