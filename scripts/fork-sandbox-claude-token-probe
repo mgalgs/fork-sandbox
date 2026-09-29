@@ -107,6 +107,19 @@ if [[ -z "$CLAUDE_BIN" ]]; then
     echo "Error: no claude binary found on PATH or in ~/.local/bin, and no --claude was given." >&2
     exit 2
 fi
+# Every check below cd's into a scratch CLAUDE_CONFIG_DIR before invoking
+# $CLAUDE_BIN, so a relative path -- command -v can return one when PATH
+# holds a relative entry, and --claude accepts one too -- would silently stop
+# resolving once cwd changes. Resolve to an absolute path now. A bare command
+# name (no "/") is left alone: it is looked up on PATH fresh at call time
+# regardless of cwd.
+if [[ "$CLAUDE_BIN" == */* ]]; then
+    CLAUDE_BIN="$(readlink -f "$CLAUDE_BIN" 2>/dev/null || true)"
+    if [[ -z "$CLAUDE_BIN" ]]; then
+        echo "Error: could not resolve the claude binary to an absolute path." >&2
+        exit 2
+    fi
+fi
 
 BOGUS_ACCESS="sk-ant-oat01-probe-bogus"
 BOGUS_REFRESH="sk-ant-ort01-probe-bogus"

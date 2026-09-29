@@ -1901,6 +1901,10 @@ _fs_claude_do_refresh() {
     local dir scratch old_token
     dir="$(dirname -- "$cred_file")"
     scratch="$(mktemp -d /var/tmp/claude-scratch/forks/claude-fork-token-refresh.XXXXXX)"
+    if [[ -z "$scratch" || ! -d "$scratch" ]]; then
+        echo "Warning: could not refresh the Claude access token on the host; log in with claude on the host if this persists." >&2
+        return 0
+    fi
     chmod 700 "$scratch"
 
     old_token="$(jq -r '.claudeAiOauth.accessToken // ""' "$cred_file" 2>/dev/null)" || old_token=""
@@ -1940,8 +1944,18 @@ _fs_claude_do_refresh() {
     # copy) at mode 600 before it ever lands on the real path.
     local tmp
     tmp="$(mktemp "$dir/.credentials.json.XXXXXX")"
-    jq --slurpfile new "$scratch/.credentials.json" \
-        '.claudeAiOauth = $new[0].claudeAiOauth' "$cred_file" > "$tmp"
+    if [[ -z "$tmp" ]]; then
+        echo "Warning: could not refresh the Claude access token on the host; log in with claude on the host if this persists." >&2
+        rm -rf "$scratch"
+        return 0
+    fi
+    if ! jq --slurpfile new "$scratch/.credentials.json" \
+        '.claudeAiOauth = $new[0].claudeAiOauth' "$cred_file" > "$tmp"; then
+        echo "Warning: could not refresh the Claude access token on the host; log in with claude on the host if this persists." >&2
+        rm -f "$tmp"
+        rm -rf "$scratch"
+        return 0
+    fi
     chmod 600 "$tmp"
     mv -f "$tmp" "$cred_file"
     rm -rf "$scratch"
@@ -1973,6 +1987,18 @@ _fs_claude_do_refresh() {
 # ever read and written as file content -- so it is never visible in `ps` or
 # in a log line. The functions below print exactly one line on success or
 # failure, and neither line contains a token.
+#
+# _fs_claude_do_refresh is always invoked as `_fs_claude_do_refresh ... ||
+# true` (see below): calling it in a tested context, rather than as a bare
+# statement, is what makes a failing command anywhere inside it -- its own or
+# one it calls -- fall through to ITS OWN next line instead of tripping the
+# sourcing script's `set -e` and skipping the scratch/lock cleanup below.
+# (Bash exempts every command run while evaluating a tested command, in any
+# function it calls, from -e; that is a documented property of `||`/`&&`/
+# `if`, unlike a RETURN trap, which does not reliably stay scoped to the
+# function that set it when combined with `set +e` -- reproduced by a
+# failing second mktemp otherwise leaving the scratch dir, with a real
+# refresh token in it, and both lock directories, on disk.)
 #
 # Takes claude's own two locks, in claude's own order, so a refresh here and
 # a refresh claude itself might be attempting inside a still-running sandbox
@@ -2014,7 +2040,12 @@ fs_claude_refresh_if_needed() {
     # were waiting for it.
     mins_left="$(_fs_claude_mins_left "$cred_file")"
     if (( mins_left < before_min )); then
-        _fs_claude_do_refresh "$cred_file" "$claude_bin" "$before_min" "$mins_left"
+        # `|| true`: see _fs_claude_do_refresh's own SECURITY INVARIANT
+        # comment. Without it, a failing command anywhere inside that
+        # function (or a function IT calls) would trip this sourcing
+        # script's `set -e` right here, skipping the rmdir cleanup below and
+        # leaking both locks.
+        _fs_claude_do_refresh "$cred_file" "$claude_bin" "$before_min" "$mins_left" || true
     fi
 
     rmdir "$lock2" 2>/dev/null || true

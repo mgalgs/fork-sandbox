@@ -447,6 +447,15 @@ if (( ! EXEC_MODE )); then
     if [[ -z "$HOST_CLAUDE_BIN" && -x "$HOME/.local/bin/claude" ]]; then
         HOST_CLAUDE_BIN="$HOME/.local/bin/claude"
     fi
+    # command -v can return a relative path when PATH holds a relative entry
+    # (e.g. "./bin/claude"). Both the contract probe and the host refresh
+    # below cd into a scratch directory before invoking this path, so resolve
+    # it to an absolute path now, while the cwd is still the caller's. A bare
+    # command name (no "/") is left alone: it is looked up on PATH fresh at
+    # call time regardless of cwd, so it survives the cd unchanged.
+    if [[ "$HOST_CLAUDE_BIN" == */* ]]; then
+        HOST_CLAUDE_BIN="$(readlink -f "$HOST_CLAUDE_BIN" 2>/dev/null || true)"
+    fi
     CRED_FILE="$(fs_claude_credential_file "$CLAUDE_CREDENTIALS")" || CRED_FILE=""
 
     # Before anything else credential-related: the contract probe (loud,
@@ -627,22 +636,36 @@ if (( ! EXEC_MODE )); then
     # backed credential is untouched, as always: it can prompt, and this loop
     # runs unattended.
     #
-    # Every 2s it: rebuilds the expected sandbox JSON from the host file with
-    # the SAME jq filter (fs_claude_sandbox_credential) the launch-time write
-    # above used, so the two can never drift apart; compares it against the
-    # sandbox's own copy on the three fields that matter (access token,
-    # refresh token placeholder, expiry) rather than byte-for-byte, because
-    # claude itself may rewrite the sandbox file with extra fields that are
-    # not this loop's business; and, on a difference, writes the new JSON in
-    # atomically (temp file in the same directory, mode 600, then `mv -f`).
-    # One rule covers both directions this can happen: a host refresh (the
-    # sandbox's accessToken was non-empty and different) and a repair (the
-    # sandbox's OWN claude blanked its copy after failing a forced refresh
-    # with the placeholder token, taken care of by fs_claude_refresh_if_needed
-    # on the host side before that ever gets far). About every 60s it also
-    # calls fs_claude_refresh_if_needed itself, so a long-running step, or a
-    # fleet with no interactive host session at all, never runs out the clock
-    # waiting for someone else to refresh it.
+    # Every 2s it: about every 60s, FIRST calls fs_claude_refresh_if_needed
+    # itself, so a long-running step, or a fleet with no interactive host
+    # session at all, never runs out the clock waiting for someone else to
+    # refresh it; THEN, in the same tick, rebuilds the expected sandbox JSON
+    # from the (possibly just-refreshed) host file with the SAME jq filter
+    # (fs_claude_sandbox_credential) the launch-time write above used, so the
+    # two can never drift apart; compares it against the sandbox's own copy
+    # on the three fields that matter (access token, refresh token
+    # placeholder, expiry) rather than byte-for-byte, because claude itself
+    # may rewrite the sandbox file with extra fields that are not this loop's
+    # business; and, on a difference, writes the new JSON in atomically (temp
+    # file in the same directory, mode 600, then `mv -f`). One rule covers
+    # both directions this can happen: a host refresh (the sandbox's
+    # accessToken was non-empty and different) and a repair (the sandbox's
+    # OWN claude blanked its copy after failing a forced refresh with the
+    # placeholder token, taken care of by fs_claude_refresh_if_needed on the
+    # host side before that ever gets far).
+    #
+    # Refresh-then-sync, in that order within one tick, matters: a refresh
+    # this loop itself triggers publishes a new host token and can get the
+    # old one revoked server-side, so the sync half of the SAME tick must
+    # run after it, not before, or the sandbox would keep the now-revoked
+    # token for a whole extra tick. This does not close every such window --
+    # a refresh triggered by some OTHER process (an interactive host session,
+    # a different sandboxed step's own loop) can still land in the up-to-2s
+    # gap between two ticks, and a request that hits a revoked token in that
+    # gap can still see a terminal 401 before the next tick's sync repairs
+    # it. Closing that fully would mean the 401 path itself waiting for or
+    # fetching the newly published token, which is a different mechanism
+    # than the polling this loop does; out of scope here.
     #
     # This prints to its own inherited stderr, not through the ERR_CAPTURE
     # pipe run_attempt sets up further down for the --resume-session retry:
@@ -664,6 +687,9 @@ if (( ! EXEC_MODE )); then
             sandbox_file="$STATE_DIR/claude/.credentials.json"
             tick=0
             while kill -0 "$parent_pid" 2>/dev/null; do
+                if (( tick % 30 == 0 )); then
+                    fs_claude_refresh_if_needed "$CRED_FILE" "$HOST_CLAUDE_BIN"
+                fi
                 if [[ -f "$CRED_FILE" ]]; then
                     expected=""
                     expected="$(fs_claude_sandbox_credential < "$CRED_FILE" 2>/dev/null)" || expected=""
@@ -696,9 +722,6 @@ if (( ! EXEC_MODE )); then
                             fi
                         fi
                     fi
-                fi
-                if (( tick % 30 == 0 )); then
-                    fs_claude_refresh_if_needed "$CRED_FILE" "$HOST_CLAUDE_BIN"
                 fi
                 tick=$(( tick + 1 ))
                 sleep 2

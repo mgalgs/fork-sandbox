@@ -307,6 +307,73 @@ else
     no "the broken stale lock is gone afterwards" "$stale_dir/.oauth_refresh.lock still exists"
 fi
 
+printf '\n== a failing second mktemp does not leak the scratch dir or lock dirs, and does not abort the caller ==\n'
+# A PATH-shadowing wrapper, real mktemp underneath: delegates every call
+# except the SECOND mktemp inside _fs_claude_do_refresh (the one staging the
+# merged real file next to the credential -- fork-sandbox-lib.sh, the
+# `mktemp "$dir/.credentials.json.XXXXXX"` line), which it fails outright.
+# The first mktemp (the -d scratch dir) is unaffected, so this isolates
+# exactly the reviewer's own repro: a successful stub refresh followed by
+# that one mktemp failing.
+real_mktemp="$(command -v mktemp)"
+mktemp_fail_bin="$work/mktemp-fail-bin"
+mkdir -p "$mktemp_fail_bin"
+cat > "$mktemp_fail_bin/mktemp" <<WRAP
+#!/usr/bin/env bash
+case "\$*" in
+    *.credentials.json.XXXXXX*) exit 1 ;;
+    *) exec "$real_mktemp" "\$@" ;;
+esac
+WRAP
+chmod +x "$mktemp_fail_bin/mktemp"
+mktemp_fail_cred="$work/mktemp-fail-credentials.json"
+write_cred "$mktemp_fail_cred" 10
+before_mtime_fail="$(cat "$mktemp_fail_cred")"
+before_scratch_count="$(count_refresh_scratch_dirs)"
+mktemp_fail_dir="$(dirname "$mktemp_fail_cred")"
+# Run under set -e in a subshell, matching how claude-sandboxed and the
+# live-sync loop actually call this (a bare statement under `set -e`) -- the
+# exact context the leak needed to happen in. Deliberately NOT `... || rc=$?`
+# here: wrapping the substitution itself in a tested context would exempt
+# everything run inside it from -e too (bash extends that exemption into
+# subshells), masking exactly the failure mode this test exists to catch.
+mktemp_fail_out="$(
+    set -e
+    PATH="$mktemp_fail_bin:$PATH" \
+        STUB_MODE=success fs_claude_refresh_if_needed "$mktemp_fail_cred" "$stub"
+)"
+mktemp_fail_rc=$?
+if [[ "$mktemp_fail_rc" == 0 ]]; then
+    ok "a failing second mktemp does not abort the caller under set -e"
+else
+    no "a failing second mktemp does not abort the caller under set -e" "exit $mktemp_fail_rc: $mktemp_fail_out"
+fi
+after_mtime_fail="$(cat "$mktemp_fail_cred")"
+if [[ "$before_mtime_fail" == "$after_mtime_fail" ]]; then
+    ok "a failing second mktemp leaves the real file byte-identical"
+else
+    no "a failing second mktemp leaves the real file byte-identical" "before: $before_mtime_fail / after: $after_mtime_fail"
+fi
+if [[ ! -d "$mktemp_fail_dir/.oauth_refresh.lock" ]]; then
+    ok "a failing second mktemp leaves no .oauth_refresh.lock behind"
+else
+    no "a failing second mktemp leaves no .oauth_refresh.lock behind" "lock still exists"
+    rmdir "$mktemp_fail_dir/.oauth_refresh.lock" 2>/dev/null || true
+fi
+mktemp_fail_legacy_lock="$(cd "$mktemp_fail_dir" && pwd -P).lock"
+if [[ ! -d "$mktemp_fail_legacy_lock" ]]; then
+    ok "a failing second mktemp leaves no legacy <dir>.lock behind"
+else
+    no "a failing second mktemp leaves no legacy <dir>.lock behind" "lock still exists"
+    rmdir "$mktemp_fail_legacy_lock" 2>/dev/null || true
+fi
+after_scratch_count="$(count_refresh_scratch_dirs)"
+if [[ "$after_scratch_count" == "$before_scratch_count" ]]; then
+    ok "a failing second mktemp leaves no refresh scratch dir behind"
+else
+    no "a failing second mktemp leaves no refresh scratch dir behind" "scratch dir count went from $before_scratch_count to $after_scratch_count"
+fi
+
 for mode in blank failexit; do
     printf '\n== a failed refresh (stub %s) leaves the real file byte-identical, and warns ==\n' "$mode"
     fail_cred="$work/fail-$mode-credentials.json"
