@@ -451,6 +451,45 @@ from the verdict of the highest step index that produced one (ties break to
 the highest iteration) — in a legacy-shaped run that is the maintainer's
 verdict, same as it always was, just stated as one rule instead of two.
 
+### `progress.json`: a live per-step status file
+
+Every non-`--k8s` run also writes `<run-dir>/progress.json`, rewritten
+atomically at every step start, leg start and end, and run end, so a reader
+never sees a half-written file. It has one entry per pipeline step, legacy
+or composed alike, in `pipeline.json` order (a legacy run's own translated
+steps get the same one-entry-per-step treatment even though it never writes
+`pipeline.json`):
+
+```json
+{"schema": 1, "label": "sbx-foo", "spec": "composed", "state": "running",
+ "updated": 1234567890,
+ "steps": [{"action": "code", "state": "done", "i": 1, "cap": 1, "ended": null},
+           {"action": "review", "state": "running", "i": 1, "cap": 2, "ended": null}]}
+```
+
+`label` is the branch with a leading `sandbox/`-style prefix (one path
+segment) stripped, and `spec` is the preset name, the `--pipeline` spec
+string, or null for a plain-flags run — both fixed at launch. A review or
+maintain loop is one entry regardless of its cap; `i` counts iterations
+begun (or, for a code step with `repeat: N`, passes run so far), and
+`ended` takes the walker's own vocabulary verbatim (`approved`, `findings`,
+`cap`, `no-progress`, `harness-error`, `skipped`, `stop-requested`, …), same
+spelling as `review-loop.json`/`step-<K>-loop.json`'s own `ended` key. The
+run's own `state` is `failed` when the final exit code is non-zero *or* any
+step ended `failed` — a review-loop harness error does not by itself
+change the run's exit code (see "Composed runs" above), so this is the one
+place that failure is visible without reading the loop record too.
+
+`fork-sandbox.sh` also links every run it launches under a per-session
+index, from `$CLAUDE_CODE_SESSION_ID` at launch time:
+`<by-session-root>/<session-id>/<run-dir-basename>` → the run directory
+(default root `/var/tmp/claude-scratch/forks/by-session`, overridable with
+`FORK_SANDBOX_BY_SESSION_DIR`). `fork-sandbox-status.sh --session <id>
+--progress` reads that index and prints one compact line per linked run,
+oldest first, e.g. `sbx-foo  running  code:done review:running(1/2)`, so a
+status line can show one glyph per pipeline step for every run a session
+has started without shelling into tmux.
+
 ### Keying the run log by composition, not by name
 
 `sandbox-run-log.py record` computes two fields from `pipeline.json`'s
