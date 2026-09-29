@@ -1440,6 +1440,49 @@ fs_harness_error() {
         | gsub("^ +| +$"; "") | .[0:300]' "$events" 2>/dev/null || true
 }
 
+# fs_leg_error_retryable <harness> <text>: is <text> -- the provider error
+# fs_harness_error extracted from a leg's OWN event stream, never a model
+# error or a missing-verdict message -- worth restarting the leg over. Only
+# ever true for claude (codex and pi have their own retry behavior) and only
+# for the two shapes host-verified to be transient rather than the run's own
+# doing: a revoked/expired OAuth token (401, alongside a word naming the
+# cause -- a bare "401" is not enough, since a 429 usage-limit response also
+# carries a 4xx code this must never match) and a provider-side 5xx/overload.
+# A 429 is deliberately excluded: it is a usage cap, waiting a couple of
+# minutes does not lift it, and claude already retries it internally. Case-
+# insensitive throughout, since the provider's own casing is not a contract.
+#
+# Shared by fork-sandbox.sh's own local runner (fs_run_claude_leg_with_retry,
+# in the RUNNER heredoc) and fork-sandbox-k8s-entrypoint.sh's simpler retry
+# around the pod's claude coding leg -- one classifier, so the two paths can
+# never drift on which errors are worth restarting a leg over.
+fs_leg_error_retryable() {
+    local harness="$1" text="$2" low
+    [[ "$harness" == claude ]] || return 1
+    [[ -n "$text" ]] || return 1
+    low="$(printf '%s' "$text" | tr '[:upper:]' '[:lower:]')"
+    # A forbidden status code anywhere in the text vetoes a retry outright,
+    # even alongside a word ("overloaded", "authentication") that would
+    # otherwise match below -- e.g. "API Error: 429 overloaded_error" is a
+    # usage-limit response that happens to carry claude's own retry-hint
+    # wording, not a transient failure.
+    if [[ "$low" =~ (^|[^0-9])(400|403|404|413|429)([^0-9]|$) ]]; then
+        return 1
+    fi
+    if [[ "$low" == *401* ]]; then
+        case "$low" in
+            *revoked*|*expired*|*oauth*|*authentication*|*"failed to authenticate"*)
+                return 0 ;;
+        esac
+    fi
+    if [[ "$low" =~ api\ error:\ 5[0-9][0-9] ]] \
+        || [[ "$low" == *"internal server error"* ]] \
+        || [[ "$low" == *overloaded* ]]; then
+        return 0
+    fi
+    return 1
+}
+
 # Discover which session id a --session-state run should be reported as
 # resumable under. Which harnesses get here at all, and whether the id is
 # discovered or was given up front, comes from fs_harness_session_caps

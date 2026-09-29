@@ -3322,9 +3322,10 @@ fi
 
 printf '\n== the claude leg retry backstop: fs_leg_error_retryable ==\n'
 # A table-driven unit test of the classifier itself, extracted verbatim from
-# the generated RUNNER heredoc (never hand-copied, so this cannot drift from
-# what a real run.sh actually carries). Self-contained: no other function or
-# runtime state is needed to call it.
+# fork-sandbox-lib.sh (never hand-copied, so this cannot drift from what a
+# real run.sh, and fork-sandbox-k8s-entrypoint.sh's own retry, actually
+# carry -- both share this one function). Self-contained: no other function
+# or runtime state is needed to call it.
 extract_runner_fn() {
     awk -v fn="$1" '
         $0 ~ "^" fn "\\(\\) \\{" { p = 1 }
@@ -3332,8 +3333,15 @@ extract_runner_fn() {
         p && /^}$/ { exit }
     ' "$launcher"
 }
+extract_lib_fn() {
+    awk -v fn="$1" '
+        $0 ~ "^" fn "\\(\\) \\{" { p = 1 }
+        p { print }
+        p && /^}$/ { exit }
+    ' "$repo_dir/scripts/fork-sandbox-lib.sh"
+}
 classifier_src="$(mktemp)"; tmpdirs+=("$classifier_src")
-extract_runner_fn fs_leg_error_retryable > "$classifier_src"
+extract_lib_fn fs_leg_error_retryable > "$classifier_src"
 if [[ -s "$classifier_src" ]]; then
     # shellcheck source=/dev/null
     source "$classifier_src"
@@ -3362,7 +3370,7 @@ if [[ -s "$classifier_src" ]]; then
         check "fs_leg_error_retryable($rc_harness, ${rc_text:-<empty>})" "$rc_want" "$rc_got"
     done
 else
-    no "fs_leg_error_retryable extracted from scripts/fork-sandbox.sh" \
+    no "fs_leg_error_retryable extracted from scripts/fork-sandbox-lib.sh" \
         "extraction found nothing -- has the function been renamed?"
 fi
 
@@ -3376,15 +3384,17 @@ fi
 # only a fresh temp dir seeded by hand can set up.
 retry_fn_src="$(mktemp)"; tmpdirs+=("$retry_fn_src")
 {
-    extract_runner_fn fs_leg_error_retryable
     extract_runner_fn fs_leg_retry_wait
     extract_runner_fn fs_run_claude_leg_with_retry
 } > "$retry_fn_src"
 if [[ -s "$retry_fn_src" ]]; then
-    # shellcheck source=/dev/null
-    source "$retry_fn_src"
+    # fs_leg_error_retryable, which fs_run_claude_leg_with_retry (extracted
+    # above) calls, now lives in fork-sandbox-lib.sh -- sourced before the
+    # extracted fragment so the call below resolves.
     # shellcheck source=/dev/null
     source "$repo_dir/scripts/fork-sandbox-lib.sh"
+    # shellcheck source=/dev/null
+    source "$retry_fn_src"
     stale_dir="$(mktemp -d)"; tmpdirs+=("$stale_dir")
     stale_events="$stale_dir/events.jsonl"
     : > "$stale_events"

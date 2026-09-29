@@ -7704,43 +7704,8 @@ IFS=' ' read -r -a FS_LEG_RETRY_DELAYS_ARR <<< "${FS_LEG_RETRY_DELAYS:-30 120}"
 # leg's own record.
 total_leg_retries=0
 
-# fs_leg_error_retryable <harness> <text>: is <text> -- the provider error
-# fs_harness_error extracted from a leg's OWN event stream, never a model
-# error or a missing-verdict message -- worth restarting the leg over. Only
-# ever true for claude (codex and pi have their own retry behavior) and only
-# for the two shapes host-verified to be transient rather than the run's own
-# doing: a revoked/expired OAuth token (401, alongside a word naming the
-# cause -- a bare "401" is not enough, since a 429 usage-limit response also
-# carries a 4xx code this must never match) and a provider-side 5xx/overload.
-# A 429 is deliberately excluded: it is a usage cap, waiting a couple of
-# minutes does not lift it, and claude already retries it internally. Case-
-# insensitive throughout, since the provider's own casing is not a contract.
-fs_leg_error_retryable() {
-    local harness="$1" text="$2" low
-    [[ "$harness" == claude ]] || return 1
-    [[ -n "$text" ]] || return 1
-    low="$(printf '%s' "$text" | tr '[:upper:]' '[:lower:]')"
-    # A forbidden status code anywhere in the text vetoes a retry outright,
-    # even alongside a word ("overloaded", "authentication") that would
-    # otherwise match below -- e.g. "API Error: 429 overloaded_error" is a
-    # usage-limit response that happens to carry claude's own retry-hint
-    # wording, not a transient failure.
-    if [[ "$low" =~ (^|[^0-9])(400|403|404|413|429)([^0-9]|$) ]]; then
-        return 1
-    fi
-    if [[ "$low" == *401* ]]; then
-        case "$low" in
-            *revoked*|*expired*|*oauth*|*authentication*|*"failed to authenticate"*)
-                return 0 ;;
-        esac
-    fi
-    if [[ "$low" =~ api\ error:\ 5[0-9][0-9] ]] \
-        || [[ "$low" == *"internal server error"* ]] \
-        || [[ "$low" == *overloaded* ]]; then
-        return 0
-    fi
-    return 1
-}
+# fs_leg_error_retryable is in fork-sandbox-lib.sh, shared with the k8s
+# entrypoint's own claude-leg retry.
 
 # fs_leg_retry_wait <seconds>: sleep, but in chunks of at most 5s so a stop
 # request lands within that long rather than waiting out the whole backoff --
