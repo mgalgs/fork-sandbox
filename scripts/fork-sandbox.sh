@@ -7689,6 +7689,14 @@ fs_leg_error_retryable() {
     [[ "$harness" == claude ]] || return 1
     [[ -n "$text" ]] || return 1
     low="$(printf '%s' "$text" | tr '[:upper:]' '[:lower:]')"
+    # A forbidden status code anywhere in the text vetoes a retry outright,
+    # even alongside a word ("overloaded", "authentication") that would
+    # otherwise match below -- e.g. "API Error: 429 overloaded_error" is a
+    # usage-limit response that happens to carry claude's own retry-hint
+    # wording, not a transient failure.
+    if [[ "$low" =~ (^|[^0-9])(400|403|404|413|429)([^0-9]|$) ]]; then
+        return 1
+    fi
     if [[ "$low" == *401* ]]; then
         case "$low" in
             *revoked*|*expired*|*oauth*|*authentication*|*"failed to authenticate"*)
@@ -7758,6 +7766,14 @@ fs_run_claude_leg_with_retry() {
     fs_retry_records='[]'
     fs_retry_count=0
     fs_retry_extra_cost=""
+    # A runner re-run by hand in the same run dir (see the pi-session-copy
+    # precedent above, in run_leg) is the case that leaves a stale
+    # "<events_file>.attemptN" from an earlier invocation lying around; the
+    # cost walk below globs every such file, so an old one left in place
+    # would bill this invocation for usage it never spent. This leg has not
+    # made its first attempt yet, so any archive already at this name belongs
+    # to a previous invocation, never this one.
+    rm -f -- "$events_file".attempt* 2>/dev/null
     "$attempt_fn"
     rc="$_fs_leg_attempt_rc"
     err=""
@@ -8241,16 +8257,26 @@ progress_write running
 # form used to feed directly; the trailing `exit` makes the group's own
 # exit code the command's, not tee's, since PIPESTATUS[0] below reads the
 # group as a single pipeline stage.
+_fs_impl_attempt_n=0
 _fs_impl_attempt() {
+    # The first attempt is the caller's own coding session -- --resume-session
+    # asked for, if any -- but a retry must never replay that: the handoff's
+    # "restart fresh" rule applies here exactly as it does to the codex
+    # resume-retry below, so every attempt after the first runs
+    # cont_sandbox_cmd instead, the same fresh, never-resumed command a
+    # --refresh-at continuation uses.
+    local _fs_impl_cmd=("${impl_sandbox_cmd[@]}")
+    (( _fs_impl_attempt_n > 0 )) && _fs_impl_cmd=("${cont_sandbox_cmd[@]}")
+    (( _fs_impl_attempt_n++ ))
     if [[ -n "$formatter" ]]; then
-        { fs_run_lock_closed "${impl_sandbox_cmd[@]}" < "$handoff" \
+        { fs_run_lock_closed "${_fs_impl_cmd[@]}" < "$handoff" \
             2>&1 1>&3 | tee -a "$sandbox_log" >&2
           exit "${PIPESTATUS[0]}"
         } 3>&1 \
             | tee -a "$events" \
             | "$formatter"
     else
-        { fs_run_lock_closed "${impl_sandbox_cmd[@]}" < "$handoff" \
+        { fs_run_lock_closed "${_fs_impl_cmd[@]}" < "$handoff" \
             2>&1 1>&3 | tee -a "$sandbox_log" >&2
           exit "${PIPESTATUS[0]}"
         } 3>&1 \

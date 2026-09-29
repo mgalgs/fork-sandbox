@@ -3324,6 +3324,7 @@ if [[ -s "$classifier_src" ]]; then
         'claude|API Error: 403 forbidden|1'
         'claude|API Error: 404 not found|1'
         'claude|API Error: 413 request too large|1'
+        'claude|API Error: 429 overloaded_error|1'
         'claude||1'
         'codex|Failed to authenticate. API Error: 401 OAuth access token has been revoked|1'
         'pi|overloaded_error|1'
@@ -3335,6 +3336,73 @@ if [[ -s "$classifier_src" ]]; then
     done
 else
     no "fs_leg_error_retryable extracted from scripts/fork-sandbox.sh" \
+        "extraction found nothing -- has the function been renamed?"
+fi
+
+# A manual rerun of run.sh in the same run dir (the same scenario run_leg's
+# own pi-session-copy comment names, "A runner re-run by hand in the same
+# run dir is the case that does it") must not let a stale
+# "<events>.attemptN" left over from an EARLIER invocation bleed into THIS
+# invocation's retry-cost sum. Exercised directly against the extracted
+# driver, with a fake --cost formatter, rather than through the stubbed
+# engine: the scenario is "a file already existed before this call", which
+# only a fresh temp dir seeded by hand can set up.
+retry_fn_src="$(mktemp)"; tmpdirs+=("$retry_fn_src")
+{
+    extract_runner_fn fs_leg_error_retryable
+    extract_runner_fn fs_leg_retry_wait
+    extract_runner_fn fs_run_claude_leg_with_retry
+} > "$retry_fn_src"
+if [[ -s "$retry_fn_src" ]]; then
+    # shellcheck source=/dev/null
+    source "$retry_fn_src"
+    # shellcheck source=/dev/null
+    source "$repo_dir/scripts/fork-sandbox-lib.sh"
+    stale_dir="$(mktemp -d)"; tmpdirs+=("$stale_dir")
+    stale_events="$stale_dir/events.jsonl"
+    : > "$stale_events"
+    # A stale archive from an earlier invocation of this same run dir, with
+    # a cost that would be impossible to miss in the total below if it
+    # survived into this invocation's own sum.
+    printf '{"type":"result","subtype":"error","is_error":true,"result":"stale"}\n' \
+        > "${stale_events}.attempt7"
+    fake_fmt="$(mktemp)"; tmpdirs+=("$fake_fmt")
+    cat > "$fake_fmt" <<'FMT'
+#!/usr/bin/env bash
+[[ "$1" == "--cost" ]] || exit 0
+case "$2" in
+    *.attempt7) printf '999\n' ;;
+    *) printf '0.5\n' ;;
+esac
+FMT
+    chmod +x "$fake_fmt"
+    # Both read by fs_run_claude_leg_with_retry, sourced above from a
+    # dynamically extracted fragment shellcheck cannot trace the use through.
+    # shellcheck disable=SC2034
+    FS_LEG_RETRY_DELAYS_ARR=(0 0)
+    # shellcheck disable=SC2034
+    stop_requested=0
+    _stale_attempt_n=0
+    _stale_attempt() {
+        (( ++_stale_attempt_n ))
+        if (( _stale_attempt_n == 1 )); then
+            printf '{"type":"result","subtype":"error","is_error":true,"result":"API Error: 401 OAuth access token has been revoked"}\n' \
+                > "$stale_events"
+            _fs_leg_attempt_rc=1
+        else
+            printf '{"type":"result","subtype":"success"}\n' > "$stale_events"
+            _fs_leg_attempt_rc=0
+        fi
+    }
+    fs_run_claude_leg_with_retry claude "$stale_events" "$stale_dir/sandbox.log" \
+        "the stale-archive leg" _stale_attempt "$fake_fmt"
+    check "a stale .attempt archive from an earlier invocation is gone once this one starts" \
+        "gone" "$([[ -e "${stale_events}.attempt7" ]] && echo present || echo gone)"
+    # shellcheck disable=SC2154  # set by the sourced fragment above
+    check "this invocation's own retry cost excludes the stale archive's inflated cost" \
+        "0.5" "$fs_retry_extra_cost"
+else
+    no "fs_run_claude_leg_with_retry extracted from scripts/fork-sandbox.sh" \
         "extraction found nothing -- has the function been renamed?"
 fi
 
@@ -3468,6 +3536,30 @@ if rd_retry3="$(run_stubbed --harness claude --model haiku \
         "null" "$(jq -r '.harness_error' "$rd_retry3/summary.json" 2>/dev/null)"
 else
     no "a retried implement leg's run still exits clean" "launch failed"
+fi
+
+# B3b. When the implement leg was launched with --session-state and
+# --resume-session, a retry must not replay --resume-session: resuming the
+# very session that just failed on a transient error would reload its
+# broken state instead of restarting fresh, exactly the hazard
+# impl_sandbox_cmd/cont_sandbox_cmd's own comment (above, near
+# fs_build_sandbox_cmd) already documents for a --refresh-at continuation.
+rd_retry3b_state="$(mktemp -d /var/tmp/claude-scratch/fs-preset-session-state.XXXXXX)"
+tmpdirs+=("$rd_retry3b_state")
+prep_stub $'auth401\ncommit'
+if rd_retry3b="$(run_stubbed --harness claude --model haiku \
+    --session-state "$rd_retry3b_state" --resume-session deadbeef01 \
+    --branch "sandbox-test-retry-impl-resume-$$")"; then
+    tmpdirs+=("$rd_retry3b")
+    check "a retried implement leg's run with --resume-session still exits clean" \
+        "0" "$(cat "$rd_retry3b/exit-code" 2>/dev/null)"
+    contains "the implement leg's first attempt resumes the caller's session" \
+        "$(sed -n 1p "$argv_log")" "--resume-session deadbeef01"
+    lacks "the implement leg's retry does not replay --resume-session" \
+        "$(sed -n 2p "$argv_log")" "--resume-session"
+else
+    no "a retried implement leg's run with --resume-session still exits clean" \
+        "launch failed"
 fi
 
 # B4. A leg that keeps failing on the same transient error exhausts exactly
