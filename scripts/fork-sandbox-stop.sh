@@ -234,6 +234,40 @@ if kill -0 "$pid" 2>/dev/null; then
     runner_alive=1
 fi
 
+# The runner's own progress.json finalization (fork-sandbox.sh, right after
+# it writes exit-code) never runs on either path that reaches
+# complete_run_host_side: a salvaged run's process is already gone, and a
+# timed-out run gets KILLed before it can get there. Both leave
+# progress.json exactly as its last mid-run rewrite left it -- some step
+# "running", top-level state "running" -- forever, since nothing else ever
+# rewrites the file again. This closes it the same way the runner's own
+# final write would for a stop: top-level "running" becomes "stopped", and
+# any step still "pending" or "running" becomes "skipped" with ended
+# "stop-requested". A state that is not "running" (the run already reached
+# its own terminal write by the time this runs) is left untouched rather
+# than overwritten with a host-side guess. Best-effort, like the runner's
+# own writes: this must never fail the stop, so any jq error just leaves
+# progress.json as it was.
+finalize_progress_host_side() {
+    local progress_file="$run_dir/progress.json" updated
+    [[ -L "$progress_file" || ! -f "$progress_file" ]] && return 0
+    updated="$(date +%s)"
+    if jq --argjson updated "$updated" '
+        if .state == "running" then
+            .state = "stopped"
+            | .updated = $updated
+            | .steps = [ .steps[]? |
+                if (.state == "pending" or .state == "running")
+                then .state = "skipped" | .ended = "stop-requested"
+                else . end ]
+        else . end
+    ' -- "$progress_file" > "$progress_file.part" 2>/dev/null; then
+        mv -f "$progress_file.part" "$progress_file"
+    else
+        rm -f "$progress_file.part" 2>/dev/null
+    fi
+}
+
 # Bring the work back and close the ledger, host-side. Shared by the timeout
 # fallback and the runner-dead salvage path: both complete a run that will
 # never reach its own teardown again.
@@ -301,6 +335,8 @@ complete_run_host_side() {
     else
         printf '143\n' > "$exit_code_file"
     fi
+
+    finalize_progress_host_side
 
     # No stub summary.json is fabricated here: a fabricated one holding only
     # end_reason/ended_at/branch would suppress sandbox-run-log.py record's

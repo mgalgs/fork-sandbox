@@ -379,6 +379,14 @@ EOF
 ( : ) & dead_pid=$!
 wait "$dead_pid" 2>/dev/null || true
 printf '%s\n' "$dead_pid" > "$rd_salvage/pid"
+# A progress.json left mid-run by a runner that died before it could
+# finalize its own: one step still "running", the run still "running".
+# complete_run_host_side is the only thing left that will ever touch this
+# file, since the process that would have finalized it is already gone.
+cat > "$rd_salvage/progress.json" <<'EOF'
+{"schema":1,"label":"fs-stop-salvage","spec":null,"state":"running","updated":1,
+ "steps":[{"action":"code","state":"running","i":1,"cap":1,"ended":null}]}
+EOF
 out_salvage="$(HOME="$launcher_home" "$stop" "$rd_salvage" 2>&1)"; rc_salvage=$?
 check "salvage: exits 0" "0" "$rc_salvage"
 contains "salvage: reports end_reason salvaged" "salvaged" "$out_salvage"
@@ -393,6 +401,14 @@ check "salvage: branch fetched back with its commit" \
     "1" "$(cd "$salvage_origin" && git rev-list --count "$salvage_base_sha..fs-stop-salvage" 2>/dev/null)"
 check "salvage: branch NOT removed (it has a real commit)" \
     "1" "$(cd "$salvage_origin" && git show-ref --quiet "refs/heads/fs-stop-salvage" && echo 1 || echo 0)"
+check "salvage: progress.json finalized to stopped (never left 'running')" \
+    "stopped" "$(jq -r '.state' "$rd_salvage/progress.json" 2>/dev/null)"
+check "salvage: progress.json's in-flight step is skipped, not left running" \
+    "skipped" "$(jq -r '.steps[0].state' "$rd_salvage/progress.json" 2>/dev/null)"
+check "salvage: progress.json's in-flight step records why it stopped" \
+    "stop-requested" "$(jq -r '.steps[0].ended' "$rd_salvage/progress.json" 2>/dev/null)"
+check "salvage: no leftover progress.json.part" \
+    "0" "$([[ -e "$rd_salvage/progress.json.part" ]] && echo 1 || echo 0)"
 
 # A fake runner: writes its own pid as its first act (mirroring the real
 # runner), then either honors or ignores TERM depending on which script is
@@ -838,6 +854,13 @@ clone_dir=$timeout_clone
 base_sha=$timeout_base_sha
 session=cc-sbx-fs-stop-timeout-does-not-exist
 EOF
+# Same mid-run progress.json as the salvage fixture above: the fake runner
+# never writes one itself, so this stands in for whatever the real runner's
+# last rewrite would have left behind before the forced KILL path took over.
+cat > "$rd_timeout/progress.json" <<'EOF'
+{"schema":1,"label":"fs-stop-timeout","spec":null,"state":"running","updated":1,
+ "steps":[{"action":"code","state":"running","i":1,"cap":1,"ended":null}]}
+EOF
 RUN_DIR="$rd_timeout" setsid --fork "$fake_runner_ignores_term" \
     < /dev/null > "$rd_timeout/fake-runner.log" 2>&1 &
 timeout_job=$!
@@ -856,6 +879,14 @@ if wait_for_file "$rd_timeout/pid"; then
         "1" "$(cd "$timeout_origin" && git rev-list --count "$timeout_base_sha..fs-stop-timeout" 2>/dev/null)"
     check "timeout: branch NOT removed (it has a real commit)" \
         "1" "$(cd "$timeout_origin" && git show-ref --quiet "refs/heads/fs-stop-timeout" && echo 1 || echo 0)"
+    check "timeout: progress.json finalized to stopped (never left 'running')" \
+        "stopped" "$(jq -r '.state' "$rd_timeout/progress.json" 2>/dev/null)"
+    check "timeout: progress.json's in-flight step is skipped, not left running" \
+        "skipped" "$(jq -r '.steps[0].state' "$rd_timeout/progress.json" 2>/dev/null)"
+    check "timeout: progress.json's in-flight step records why it stopped" \
+        "stop-requested" "$(jq -r '.steps[0].ended' "$rd_timeout/progress.json" 2>/dev/null)"
+    check "timeout: no leftover progress.json.part" \
+        "0" "$([[ -e "$rd_timeout/progress.json.part" ]] && echo 1 || echo 0)"
     fake_pid="$(cat "$rd_timeout/pid" 2>/dev/null)"
     # The fake runner ignores TERM by design AND there is no real tmux
     # session for this fixture's name, so tmux kill-session is a no-op --
@@ -885,6 +916,10 @@ else
     no "timeout: run-log marks summary_missing" "fake runner never wrote a pid file"
     no "timeout: branch fetched back with its commit" "fake runner never wrote a pid file"
     no "timeout: branch NOT removed (it has a real commit)" "fake runner never wrote a pid file"
+    no "timeout: progress.json finalized to stopped (never left 'running')" "fake runner never wrote a pid file"
+    no "timeout: progress.json's in-flight step is skipped, not left running" "fake runner never wrote a pid file"
+    no "timeout: progress.json's in-flight step records why it stopped" "fake runner never wrote a pid file"
+    no "timeout: no leftover progress.json.part" "fake runner never wrote a pid file"
     no "timeout: the forced path actually kills the sessionless runner" "fake runner never wrote a pid file"
 fi
 wait "$timeout_job" 2>/dev/null || true
