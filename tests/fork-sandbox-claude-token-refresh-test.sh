@@ -67,9 +67,12 @@ count_refresh_scratch_dirs() {
 #
 # One executable, two personalities, picked by which env vars the caller
 # sets:
-#   - STUB_MODE=success|blank|failexit|noop -- a simple, unconditional
+#   - STUB_MODE=success|blank|failexit|noop|sleep -- a simple, unconditional
 #     refresh outcome, for fs_claude_refresh_if_needed's own tests, which
-#     only ever invoke it as `claude mcp list`.
+#     only ever invoke it as `claude mcp list`. `sleep` (for
+#     STUB_SLEEP_SECS, default 20s) never returns on its own within a test's
+#     timescale, so a SIGTERM sent to the caller while it is still running
+#     exercises the interrupted-refresh path below.
 #   - PROBE_BREAK_CHECK=<name>, or neither set -- a small, faithful model of
 #     claude's real OAuth-refresh contract (startup refresh on an expired
 #     token, the 401 handler's forced refresh, honouring a live lock,
@@ -149,6 +152,7 @@ if [[ -n "${STUB_MODE:-}" ]]; then
         blank) blank ;;
         failexit) exit 1 ;;
         noop) : ;;
+        sleep) sleep "${STUB_SLEEP_SECS:-20}" ;;
     esac
     exit 0
 fi
@@ -392,6 +396,59 @@ for mode in blank failexit; do
         no "a failed refresh (stub $mode) prints a warning" "$fail_out"
     fi
 done
+
+printf '\n== a SIGTERM mid-refresh kills the backgrounded claude child instead of orphaning it ==\n'
+# Regression test: fs_claude_refresh_if_needed used to run `claude mcp list`
+# synchronously inside `( ... ) || true`. A SIGTERM landing on the caller
+# while blocked there (exactly what claude-sandboxed's cleanup trap sends the
+# live-sync loop) killed the caller but left that grandchild running as an
+# orphan for up to 40s -- see _FS_CLAUDE_REFRESH_CHILD_PID's own comment in
+# fork-sandbox-lib.sh. Reproduce the loop's exact setup: a subshell installing
+# _fs_claude_refresh_emergency_cleanup as its own EXIT trap around the call,
+# then a SIGTERM sent while the stub is still sleeping.
+sigterm_cred="$work/sigterm-credentials.json"
+write_cred "$sigterm_cred" 10
+sigterm_dir="$(dirname "$sigterm_cred")"
+sigterm_lock1="$sigterm_dir/.oauth_refresh.lock"
+sigterm_lock2="$(realpath -m "$sigterm_dir").lock"
+before_scratch="$(count_refresh_scratch_dirs)"
+
+(
+    trap '_fs_claude_refresh_emergency_cleanup "$sigterm_lock1" "$sigterm_lock2"' EXIT
+    STUB_MODE=sleep STUB_SLEEP_SECS=20 fs_claude_refresh_if_needed "$sigterm_cred" "$stub"
+) &
+sigterm_pid=$!
+sleep 2
+kill -TERM "$sigterm_pid" 2>/dev/null
+wait "$sigterm_pid" 2>/dev/null
+
+orphan=""
+for _ in 1 2 3 4 5; do
+    orphan="$(pgrep -f "$stub" 2>/dev/null || true)"
+    [[ -z "$orphan" ]] && break
+    sleep 1
+done
+if [[ -z "$orphan" ]]; then
+    ok "an interrupted refresh leaves no orphaned claude process running"
+else
+    no "an interrupted refresh leaves no orphaned claude process running" "still running: $orphan"
+    # shellcheck disable=SC2086
+    kill -9 $orphan 2>/dev/null || true
+fi
+
+if [[ ! -d "$sigterm_lock1" && ! -d "$sigterm_lock2" ]]; then
+    ok "an interrupted refresh still releases both lock dirs"
+else
+    no "an interrupted refresh still releases both lock dirs" "a lock dir is still present"
+    rmdir "$sigterm_lock1" "$sigterm_lock2" 2>/dev/null || true
+fi
+
+after_scratch="$(count_refresh_scratch_dirs)"
+if [[ "$after_scratch" == "$before_scratch" ]]; then
+    ok "an interrupted refresh leaves no refresh scratch dir behind"
+else
+    no "an interrupted refresh leaves no refresh scratch dir behind" "count went from $before_scratch to $after_scratch"
+fi
 
 echo
 echo '=== fork-sandbox-claude-token-probe ==='

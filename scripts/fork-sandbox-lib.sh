@@ -1895,6 +1895,18 @@ _fs_claude_take_lock() {
 # cleanup) that reads this.
 _FS_CLAUDE_REFRESH_SCRATCH=""
 
+# Holds the PID of the backgrounded `claude mcp list` call for exactly as
+# long as that process (up to 40s, via timeout) is running, so a signal that
+# arrives mid-refresh can still find and kill it before removing the locks
+# and scratch dir it depends on. Without this, a SIGTERM that lands on this
+# process while it is `wait`-ing here only kills the wait, not the
+# backgrounded child: the child becomes an orphan, keeps running against the
+# real host, and -- if it completes a real refresh -- rotates the host's
+# refresh token with nowhere left to merge the result, while the locks that
+# were meant to keep another refresher out are already gone. See
+# _fs_claude_refresh_emergency_cleanup below, which reads this.
+_FS_CLAUDE_REFRESH_CHILD_PID=""
+
 # Set to a non-empty value for exactly as long as fs_claude_refresh_if_needed
 # actually holds the correspondingly-named lock directory, so
 # _fs_claude_refresh_emergency_cleanup can tell "we hold this lock, a signal
@@ -1939,9 +1951,23 @@ _fs_claude_do_refresh() {
     # discarded, since this is a plumbing call, not an interactive one; a
     # non-zero exit is expected and tolerated -- only the file it leaves
     # behind is checked.
+    #
+    # Backgrounded, with its PID recorded in _FS_CLAUDE_REFRESH_CHILD_PID,
+    # rather than run synchronously: a `wait` on a known PID can be
+    # interrupted (the wait returns; the child keeps running) exactly like
+    # any other blocking call, but unlike a bare synchronous command, a
+    # tracked PID is one _fs_claude_refresh_emergency_cleanup can still kill
+    # from outside if that happens -- see its own comment and the global
+    # above. `exec` inside the subshell replaces that subshell's own process
+    # with timeout's, so the PID recorded here IS timeout's PID: killing it
+    # delivers the signal straight to timeout, which forwards it to claude in
+    # turn, instead of orphaning both underneath a dead subshell.
     touch "$dir/.oauth_refresh.lock" "$("$FS_REALPATH" -m "$dir").lock" 2>/dev/null || true
-    ( cd "$scratch" && CLAUDE_CONFIG_DIR="$scratch" "$FS_TIMEOUT" 40 "$claude_bin" mcp list \
-        </dev/null >/dev/null 2>&1 ) || true
+    ( cd "$scratch" && CLAUDE_CONFIG_DIR="$scratch" exec "$FS_TIMEOUT" 40 "$claude_bin" mcp list \
+        </dev/null >/dev/null 2>&1 ) &
+    _FS_CLAUDE_REFRESH_CHILD_PID=$!
+    wait "$_FS_CLAUDE_REFRESH_CHILD_PID" 2>/dev/null || true
+    _FS_CLAUDE_REFRESH_CHILD_PID=""
 
     local new_token new_refresh new_expires now_ms threshold_ms
     new_token="$(jq -r '.claudeAiOauth.accessToken // ""' "$scratch/.credentials.json" 2>/dev/null)" || new_token=""
@@ -1991,10 +2017,16 @@ _fs_claude_do_refresh() {
 }
 
 # Emergency cleanup for a call to fs_claude_refresh_if_needed that a signal
-# interrupts before it reaches its own end-of-function rmdir calls: removes
-# _fs_claude_do_refresh's scratch dir (via the global below, which tracks it
-# for exactly as long as it exists) and releases whichever of the two named
-# lock dirs this process still holds, per _FS_CLAUDE_REFRESH_LOCK{1,2}_HELD.
+# interrupts before it reaches its own end-of-function rmdir calls: kills and
+# reaps the backgrounded `claude mcp list` child if one is still running (via
+# _FS_CLAUDE_REFRESH_CHILD_PID), removes _fs_claude_do_refresh's scratch dir
+# (via the global below, which tracks it for exactly as long as it exists)
+# and releases whichever of the two named lock dirs this process still
+# holds, per _FS_CLAUDE_REFRESH_LOCK{1,2}_HELD. The child is stopped and
+# waited on BEFORE the scratch dir and locks go: otherwise an orphaned
+# refresh keeps running against the real host with no locks left to keep
+# another refresher out, and -- if it completes -- rotates the host's
+# refresh token with the scratch dir already gone to merge it into.
 # It is installed as a long-lived EXIT trap that fires on every exit of its
 # process, most of which have nothing to do with a refresh in progress (the
 # ordinary end of the sandbox run, with no refresh ever attempted this tick);
@@ -2015,6 +2047,11 @@ _fs_claude_do_refresh() {
 # is not wired in there instead.
 _fs_claude_refresh_emergency_cleanup() {
     local lock1="$1" lock2="$2"
+    if [[ -n "$_FS_CLAUDE_REFRESH_CHILD_PID" ]]; then
+        kill "$_FS_CLAUDE_REFRESH_CHILD_PID" 2>/dev/null
+        wait "$_FS_CLAUDE_REFRESH_CHILD_PID" 2>/dev/null
+        _FS_CLAUDE_REFRESH_CHILD_PID=""
+    fi
     [[ -n "$_FS_CLAUDE_REFRESH_SCRATCH" ]] && rm -rf "$_FS_CLAUDE_REFRESH_SCRATCH" 2>/dev/null
     if [[ -n "$_FS_CLAUDE_REFRESH_LOCK2_HELD" ]]; then
         rmdir "$lock2" 2>/dev/null
