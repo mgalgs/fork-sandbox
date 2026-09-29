@@ -226,9 +226,13 @@ The spec is `-`-joined segments, `<stage><model>[<harness>][<N>]`:
   `astra` on codex. A codex model there is a bare tier name, not a
   generation-pinned slug — `resolve_model` turns it into a real model id
   at launch the same way it does for any other seat (see "Model aliases
-  resolve at launch" below). A new tier is a one-line addition to that
-  table; a new *generation* of an existing tier needs no table edit at
-  all — see "Bumping a generation" below.
+  resolve at launch" below). A new tier needs a one-line addition to
+  that table *and* a matching one-line addition to `MODEL_ALIASES` in
+  `scripts/sandbox-run-log.py` — a test in
+  `tests/sandbox-run-log-test.sh` enforces the two stay in step, and
+  skipping the second leaves the tier displaying under a hashed slug
+  in composition output instead of its name. A new *generation* of an
+  existing tier needs neither edit — see "Bumping a generation" below.
 - **harness**, optional, seats the model on a non-native harness
   (`csolpi2`); the table must carry the model's id for that harness.
 - **N**, optional and 1 by default, is the code agent's `repeat`, or a
