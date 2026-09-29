@@ -1774,6 +1774,337 @@ fs_read_claude_credential() {
     return 0
 }
 
+# Prints the FILE a Claude credential would be read from, and returns 0 --
+# or returns 1 with nothing printed when the source is the macOS Keychain
+# rather than a file. Mirrors fs_claude_credential_source's own branching
+# exactly, but for callers that need the path itself (to watch it, or to
+# refresh it) rather than a human-readable description of it: the token
+# refresh below and the live-sync loop in claude-sandboxed both apply only
+# to a file-backed credential -- the Keychain is untouched, as it always has
+# been, because it can prompt and a prompt has no place in an unattended
+# refresh.
+fs_claude_credential_file() {
+    local override="${1:-}"
+    if [[ -n "$override" ]]; then
+        printf '%s\n' "$override"
+        return 0
+    fi
+    local file="$HOME/.claude/.credentials.json"
+    if [[ ! -f "$file" && "$(uname -s)" == Darwin ]] || _fs_claude_file_lacks_login "$file"; then
+        return 1
+    fi
+    printf '%s\n' "$file"
+    return 0
+}
+
+# The fixed, non-secret placeholder that stands in for the real refresh
+# token in every sandbox-facing copy of the Claude credential -- the one
+# claude-sandboxed writes at launch and the one its live-sync loop keeps in
+# step with the host afterwards (see claude-sandboxed's SYNC LOOP). It is
+# there because claude's own 401 handler adopts a changed access token only
+# when the stored credential carries A refresh token at all (verified by
+# fork-sandbox-claude-token-probe, check 4, below); with none, a revoked
+# access token is a terminal 401 inside the sandbox even when the host's own
+# copy is perfectly healthy. The placeholder satisfies that check without
+# being a secret -- the real OAuth server rejects it, so a sandboxed claude's
+# own forced refresh with it fails loudly (invalid_grant) rather than
+# quietly working.
+FS_CLAUDE_PLACEHOLDER_REFRESH_TOKEN="fork-sandbox-placeholder-not-a-token"
+
+# The claude version fs_claude_refresh_if_needed and
+# fork-sandbox-claude-token-probe's checks were last verified against by
+# hand. Bump it, by hand, only after re-running the probe against a new
+# claude release and confirming its checks still hold.
+FS_CLAUDE_TOKEN_CONTRACT_VERIFIED="2.1.280"
+
+# The one jq filter that turns a real Claude credential into the sandbox's
+# own copy: JSON in on stdin, JSON out on stdout. Kept in exactly one place
+# because it runs at two moments that must never drift apart -- claude-
+# sandboxed's own launch-time write, and its live-sync loop's rewrite every
+# time the host's copy changes (see Part 3 in the sandboxed script) -- and a
+# difference between the two would show up only as an intermittent,
+# unreproducible 401 hours into an unrelated run.
+#
+# Drops mcpOAuth (unrelated MCP server tokens, never needed inside the
+# sandbox) and refreshTokenExpiresAt (meaningless once the refresh token
+# itself is not real), and REPLACES the real refreshToken with the fixed
+# placeholder above rather than deleting it outright -- see the placeholder's
+# own comment for why a refresh token has to be present at all. The access
+# token, its expiry, the scopes and the subscription type all survive
+# untouched; those are what let the sandbox authenticate in the first place.
+fs_claude_sandbox_credential() {
+    jq --arg placeholder "$FS_CLAUDE_PLACEHOLDER_REFRESH_TOKEN" \
+        'del(.mcpOAuth)
+            | del(.claudeAiOauth.refreshTokenExpiresAt)
+            | .claudeAiOauth.refreshToken = $placeholder'
+}
+
+# Minutes left on a Claude credential FILE's access token, as of now. Prints
+# 0 (not an error) for a file that is missing, unreadable or not valid JSON,
+# which callers below treat as "needs a refresh" rather than crashing on it
+# -- a mid-write file (a concurrent refresh is replacing it right now) must
+# not be mistaken for anything other than "check again shortly".
+_fs_claude_mins_left() {
+    local file="$1" ms
+    ms="$(jq -r '.claudeAiOauth.expiresAt // 0' "$file" 2>/dev/null)" || ms=0
+    [[ "$ms" =~ ^[0-9]+$ ]] || ms=0
+    printf '%s' $(( ms / 60000 - $(date +%s) / 60 ))
+}
+
+# Age of a directory's mtime in whole seconds. $FS_STAT is resolved once, at
+# source time, to whichever of `stat`/`gstat` actually speaks GNU's `-c` --
+# see the block at the top of this file -- so this needs no BSD/macOS
+# fallback of its own; fs_require_gnu_tools already refused to let the
+# sourcing script start without one.
+_fs_dir_mtime_age_secs() {
+    local dir="$1" mtime
+    mtime="$("$FS_STAT" -c %Y "$dir" 2>/dev/null)" || { printf '999999'; return 0; }
+    printf '%s' $(( $(date +%s) - mtime ))
+}
+
+# Takes one mkdir-style lock directory, breaking it first if it is already
+# stale (mtime 60s or older -- claude's own staleness threshold, so a
+# contract probe can tell the two apart), and retrying on live contention
+# for up to `budget` seconds. Prints nothing; returns 0 once `lockdir` exists
+# and is ours, 1 if the budget ran out first. FS_CLAUDE_REFRESH_LOCK_BUDGET_SEC
+# overrides the default budget passed in by the caller -- a test hook, so a
+# "lock held past the wait budget" case does not need a real 30s wait.
+_fs_claude_take_lock() {
+    local lockdir="$1" budget="$2" waited=0 age
+    while :; do
+        if mkdir "$lockdir" 2>/dev/null; then
+            return 0
+        fi
+        age="$(_fs_dir_mtime_age_secs "$lockdir")"
+        if (( age >= 60 )) && rmdir "$lockdir" 2>/dev/null; then
+            continue
+        fi
+        if (( waited >= budget )); then
+            return 1
+        fi
+        sleep 1
+        waited=$(( waited + 1 ))
+    done
+}
+
+# Does the actual refresh, once both locks are held and the re-check under
+# them still says the token is due. Builds a scratch CLAUDE_CONFIG_DIR
+# holding ONLY the real credential with expiresAt forced into the past (so
+# claude's own startup check forces a refresh rather than skipping one), runs
+# claude in it, and validates what came back before ever touching the real
+# file. See fs_claude_refresh_if_needed's own comment for the security
+# invariant this validation exists to enforce: the real refresh token must
+# never reach $STATE_DIR, the sandbox, argv or a log, and a failed or
+# unconvincing refresh must leave the real file byte-identical.
+_fs_claude_do_refresh() {
+    local cred_file="$1" claude_bin="$2" before_min="$3" mins_left="$4"
+    local dir scratch old_token
+    dir="$(dirname -- "$cred_file")"
+    scratch="$(mktemp -d /var/tmp/claude-scratch/forks/claude-fork-token-refresh.XXXXXX)"
+    chmod 700 "$scratch"
+
+    old_token="$(jq -r '.claudeAiOauth.accessToken // ""' "$cred_file" 2>/dev/null)" || old_token=""
+
+    jq '.claudeAiOauth.expiresAt = 1' "$cred_file" > "$scratch/.credentials.json" 2>/dev/null
+    chmod 600 "$scratch/.credentials.json"
+    printf '{"hasCompletedOnboarding": true}' > "$scratch/.claude.json"
+
+    # Refresh both lock dirs' mtimes so our own hold does not go stale to a
+    # concurrent checker while claude runs. cwd = scratch, so no project
+    # .mcp.json outside it is ever picked up; stdin from /dev/null and output
+    # discarded, since this is a plumbing call, not an interactive one; a
+    # non-zero exit is expected and tolerated -- only the file it leaves
+    # behind is checked.
+    touch "$dir/.oauth_refresh.lock" "$("$FS_REALPATH" -m "$dir").lock" 2>/dev/null || true
+    ( cd "$scratch" && CLAUDE_CONFIG_DIR="$scratch" "$FS_TIMEOUT" 40 "$claude_bin" mcp list \
+        </dev/null >/dev/null 2>&1 ) || true
+
+    local new_token new_refresh new_expires now_ms threshold_ms
+    new_token="$(jq -r '.claudeAiOauth.accessToken // ""' "$scratch/.credentials.json" 2>/dev/null)" || new_token=""
+    new_refresh="$(jq -r '.claudeAiOauth.refreshToken // ""' "$scratch/.credentials.json" 2>/dev/null)" || new_refresh=""
+    new_expires="$(jq -r '.claudeAiOauth.expiresAt // 0' "$scratch/.credentials.json" 2>/dev/null)" || new_expires=0
+    [[ "$new_expires" =~ ^[0-9]+$ ]] || new_expires=0
+    now_ms=$(( $(date +%s) * 1000 ))
+    threshold_ms=$(( now_ms + before_min * 60000 ))
+
+    if [[ -z "$new_token" || "$new_token" == "$old_token" || -z "$new_refresh" ]] \
+        || (( new_expires <= threshold_ms )); then
+        echo "Warning: could not refresh the Claude access token on the host; log in with claude on the host if this persists." >&2
+        rm -rf "$scratch"
+        return 0
+    fi
+
+    # Merge: the real file, untouched but for .claudeAiOauth, so mcpOAuth and
+    # every other top-level key survive. Written to a temp file in the same
+    # directory (so the final `mv -f` is an atomic rename, not a cross-device
+    # copy) at mode 600 before it ever lands on the real path.
+    local tmp
+    tmp="$(mktemp "$dir/.credentials.json.XXXXXX")"
+    jq --slurpfile new "$scratch/.credentials.json" \
+        '.claudeAiOauth = $new[0].claudeAiOauth' "$cred_file" > "$tmp"
+    chmod 600 "$tmp"
+    mv -f "$tmp" "$cred_file"
+    rm -rf "$scratch"
+
+    local left_min=$(( new_expires / 60000 - $(date +%s) / 60 ))
+    printf 'claude-sandboxed: refreshed the host'"'"'s Claude access token (%dm left; now %dh%02dm)\n' \
+        "$mins_left" $(( left_min / 60 )) $(( left_min % 60 )) >&2
+    return 0
+}
+
+# Refreshes a FILE-backed Claude credential on the host when less than
+# FS_CLAUDE_REFRESH_BEFORE_MIN minutes (default 120; a test hook) remain on
+# its access token, so no step starts, or runs long, on a token close enough
+# to expiry that the server might revoke it mid-run. Called from claude-
+# sandboxed's pre-step path and, every ~60s, from its live-sync loop -- see
+# both there.
+#
+# Applies only to a file: <credential-file> must be the path
+# fs_claude_credential_file resolved (the caller decides that; this function
+# takes it as given), and <claude-bin> must be a host claude binary. Either
+# missing (a Keychain source, or no claude found) is a silent no-op, exactly
+# like "nothing to refresh here" -- there is no error case in that gap, only
+# "this machine cannot do it".
+#
+# SECURITY INVARIANT: the real refresh token never leaves this function's own
+# scratch directory, which lives under /var/tmp/claude-scratch/forks/ (never
+# a run's own STATE_DIR or clone), is mode 700, and is removed before this
+# function returns on every path. It is never passed as an argument -- only
+# ever read and written as file content -- so it is never visible in `ps` or
+# in a log line. The functions below print exactly one line on success or
+# failure, and neither line contains a token.
+#
+# Takes claude's own two locks, in claude's own order, so a refresh here and
+# a refresh claude itself might be attempting inside a still-running sandbox
+# never race each other: first $(dirname credential-file)/.oauth_refresh.lock,
+# then the legacy $(realpath dirname).lock. Both are mkdir-style directories;
+# a live one is waited out (1s steps, ~30s budget, overridable through
+# FS_CLAUDE_REFRESH_LOCK_BUDGET_SEC for tests); a stale one (mtime 60s or
+# older, matching claude's own threshold) is broken and retried. Giving up on
+# either lock is not an error: some other process is presumably refreshing
+# right now, and the sync loop (or the next call here) will pick up its
+# result.
+fs_claude_refresh_if_needed() {
+    local cred_file="$1" claude_bin="${2:-}"
+    [[ -n "$claude_bin" ]] || return 0
+    [[ -f "$cred_file" ]] || return 0
+
+    local before_min="${FS_CLAUDE_REFRESH_BEFORE_MIN:-120}"
+    local mins_left
+    mins_left="$(_fs_claude_mins_left "$cred_file")"
+    (( mins_left >= before_min )) && return 0
+
+    local dir lock1 lock2 budget
+    dir="$(dirname -- "$cred_file")"
+    lock1="$dir/.oauth_refresh.lock"
+    lock2="$("$FS_REALPATH" -m "$dir").lock"
+    budget="${FS_CLAUDE_REFRESH_LOCK_BUDGET_SEC:-30}"
+
+    if ! _fs_claude_take_lock "$lock1" "$budget"; then
+        echo "claude-sandboxed: could not acquire $lock1 within ${budget}s (another process appears to be refreshing); skipping the host token refresh this time." >&2
+        return 0
+    fi
+    if ! _fs_claude_take_lock "$lock2" "$budget"; then
+        rmdir "$lock1" 2>/dev/null || true
+        echo "claude-sandboxed: could not acquire $lock2 within ${budget}s (another process appears to be refreshing); skipping the host token refresh this time." >&2
+        return 0
+    fi
+
+    # Re-check under the lock: another process may have refreshed while we
+    # were waiting for it.
+    mins_left="$(_fs_claude_mins_left "$cred_file")"
+    if (( mins_left < before_min )); then
+        _fs_claude_do_refresh "$cred_file" "$claude_bin" "$before_min" "$mins_left"
+    fi
+
+    rmdir "$lock2" 2>/dev/null || true
+    rmdir "$lock1" 2>/dev/null || true
+    return 0
+}
+
+# Where fs_claude_token_contract_check caches fork-sandbox-claude-token-
+# probe's verdict, one marker per claude version. FS_CLAUDE_TOKEN_CONTRACT_DIR
+# overrides it -- a test hook, so a test's stub claude (whose --version says
+# nothing real) can never share a marker, or a lock, with this machine's own
+# cache of the real claude's verdict.
+_fs_claude_contract_dir() {
+    printf '%s\n' "${FS_CLAUDE_TOKEN_CONTRACT_DIR:-/var/tmp/claude-scratch/forks/.claude-token-contract}"
+}
+
+# Runs fork-sandbox-claude-token-probe at most once per claude version,
+# caching the verdict under _fs_claude_contract_dir so every later step on
+# this machine, until the next claude upgrade, pays nothing for it. Called
+# from claude-sandboxed's pre-step path, before anything else credential-
+# related, whenever the credential is file-backed and a host claude binary
+# was found.
+#
+# Parts 1-3 (the placeholder refresh token, the early host refresh, the live-
+# sync loop) all depend on specific, undocumented behaviour of claude's own
+# OAuth-refresh internals. A claude upgrade could silently change that
+# behaviour, and steps would go back to dying mid-run on a 401 with nothing
+# to explain why. This function is what makes that failure LOUD instead:
+# never fatal -- a probe failure changes nothing about whether the caller
+# proceeds, only what it is told on stderr -- but impossible to miss in
+# sandbox.log.
+#
+# A step that finds another step's probe already in flight (the mkdir lock
+# under the contract dir is held) does not wait for it: it prints a "still
+# pending" note and moves on, so one slow first probe can never stall a
+# whole fleet of otherwise-independent legs.
+fs_claude_token_contract_check() {
+    local claude_bin="$1" probe_script="$2"
+    local dir version marker_ok marker_fail lockdir
+
+    dir="$(_fs_claude_contract_dir)"
+    version="$("$claude_bin" --version 2>/dev/null | head -1)" || version=""
+    version="${version%% *}"
+    mkdir -p "$dir" 2>/dev/null || true
+    marker_ok="$dir/$version.ok"
+    marker_fail="$dir/$version.fail"
+
+    if [[ ! -e "$marker_ok" && ! -e "$marker_fail" ]]; then
+        lockdir="$dir/.probe-$version.lock"
+        if mkdir "$lockdir" 2>/dev/null; then
+            local probe_out probe_rc
+            # `if var=$(...)` rather than `var=$(...)` on its own line: this
+            # runs under the sourcing script's `set -e`, and a probe FAILURE
+            # (exit 1, the whole point of this call) is an ordinary outcome
+            # here, not a bug -- but a bare assignment's exit status is the
+            # command substitution's own, so without the `if` a failing probe
+            # would abort claude-sandboxed itself instead of being recorded.
+            if probe_out="$("$probe_script" --claude "$claude_bin" 2>&1)"; then
+                probe_rc=0
+            else
+                probe_rc=$?
+            fi
+            if (( probe_rc == 0 )); then
+                : > "$marker_ok"
+            else
+                printf '%s\n' "$probe_out" > "$marker_fail"
+            fi
+            rmdir "$lockdir" 2>/dev/null || true
+        else
+            echo "claude-sandboxed: the Claude OAuth-refresh contract check for claude '$version' is still pending (another step is running it); proceeding without it this time." >&2
+        fi
+    fi
+
+    if [[ -e "$marker_fail" ]]; then
+        {
+            echo "claude-sandboxed: WARNING -- the Claude OAuth-refresh internals this"
+            echo "  sandbox's credential placeholder, early refresh and live-sync loop"
+            echo "  all depend on no longer match claude '$version' (last verified"
+            echo "  against $FS_CLAUDE_TOKEN_CONTRACT_VERIFIED). Failed checks:"
+            sed -n 's/^FAIL  /  - /p' "$marker_fail"
+            echo "  This step may die mid-run with '401 OAuth access token has been"
+            echo "  revoked' the next time the host refreshes its credential. See"
+            echo "  scripts/fork-sandbox-claude-token-probe and docs/claude-sandboxed.md."
+        } >&2
+    elif [[ -e "$marker_ok" && -n "$version" && "$version" != "$FS_CLAUDE_TOKEN_CONTRACT_VERIFIED" ]]; then
+        echo "claude-sandboxed: note: the Claude OAuth-refresh contract was last verified against claude $FS_CLAUDE_TOKEN_CONTRACT_VERIFIED; this host runs $version." >&2
+    fi
+    return 0
+}
+
 # Picks a Claude credential from an operator-configured pool when neither
 # --claude-credentials nor CLAUDE_CREDENTIALS pinned one, so a run does not
 # default to an account that may be nearly exhausted. The pool

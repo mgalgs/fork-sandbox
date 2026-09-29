@@ -43,8 +43,10 @@ Ordered by how much they matter.
 2. **Namespaces, not a virtual machine.** A kernel bug breaks out. Only a VM
    fixes this.
 3. **The access token is inside the sandbox.** Whatever runs there can spend
-   the subscription. Mitigated only in duration: the refresh token stays on
-   the host, so a leaked copy dies at token expiry.
+   the subscription. Mitigated only in duration: the real refresh token
+   never leaves the host, so a leaked copy is only ever as long-lived as
+   whatever's left on the access token at the moment it leaked -- see
+   "Credential refresh" below for how long that now tends to be.
 4. **Unrestricted egress is an exfiltration channel** for anything the sandbox
    can read. That is the deliberate trade for full internet.
 5. **The local LAN is reachable.** LAN services that trust network position
@@ -52,6 +54,44 @@ Ordered by how much they matter.
    the default-route interface, so the tailnet, WireGuard and the libvirt and
    docker bridges are unreachable.
 6. **No OS package installation.** See below.
+
+## Credential refresh
+
+A file-backed Claude credential (the default `~/.claude/.credentials.json`,
+or a `--claude-credentials` override -- not the macOS Keychain) no longer
+dies at token expiry.
+
+- **Placeholder refresh token.** The sandbox's own credential copy carries a
+  fixed, non-secret placeholder (`FS_CLAUDE_PLACEHOLDER_REFRESH_TOKEN` in
+  fork-sandbox-lib.sh) instead of no refresh token at all. Claude's 401
+  handler only adopts a changed access token when a refresh token is
+  present, so the placeholder is what lets a sandboxed claude survive a
+  token swap; it is never accepted by the real OAuth server, so it cannot
+  itself refresh anything.
+- **Live-sync loop.** Once the sandbox's own credential file exists, a
+  background host process (`fs_claude_sandbox_credential` in
+  fork-sandbox-lib.sh, run from claude-sandboxed) checks every 2s whether the
+  host's credential has changed -- a refresh, or the sandbox's own copy
+  having been blanked after a failed forced refresh -- and rewrites the
+  sandbox's copy to match. It exits when the sandbox does.
+- **Early host refresh.** The same host process, and the sandbox's own
+  pre-step, refresh the HOST's credential (`fs_claude_refresh_if_needed`)
+  whenever less than 2h remain on it (`FS_CLAUDE_REFRESH_BEFORE_MIN`),
+  before a step starts and roughly every 60s while it runs -- so an
+  unattended fleet with no interactive host session still keeps a live
+  token.
+- **Locking.** The refresh takes claude's own two locks, in claude's own
+  order (`.oauth_refresh.lock`, then the legacy `<dir>.lock`), so a host-side
+  refresh here and one claude itself might attempt never race.
+- **Contract probe.** All of the above depends on specific, undocumented
+  claude behaviour. `fork-sandbox-claude-token-probe` checks it against
+  whatever claude is installed, cached per version, and claude-sandboxed
+  warns loudly (never refusing to launch) when the installed claude no
+  longer matches.
+- **Known gap: the Kubernetes path does not do any of this.** A `--k8s` run's
+  pod credential is still a one-shot copy with a hardcoded placeholder
+  access token (see docs/kubernetes-runs.md); there is no live-sync loop and
+  no early refresh there yet.
 
 ## Sealed egress
 
@@ -340,9 +380,10 @@ instead, which costs nothing to maintain and is easier to vary per task.
   state dir the rescue copies from is an empty mountpoint and
   `claude-session/` does not appear. `<dir>` is the durable copy in that
   case, and it holds every leg of the run.
-- **The session dies when the access token expires**, with no way to refresh.
-  The script prints the remaining lifetime. Start long runs early in a
-  token's life.
+- **A file-backed credential no longer dies at token expiry** -- see
+  "Credential refresh" above. A Keychain-backed one (macOS, with no override)
+  still does: it has no refresh path, the script prints the remaining
+  lifetime, and long runs there should still start early in a token's life.
 - **Commits work, pushing does not.** No key, token or agent is reachable.
   Work leaves the sandbox as files in the work dir.
 - **The sandbox has none of the user-level Claude config.** No global

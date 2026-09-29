@@ -70,7 +70,20 @@ CLAUDE
 chmod +x "$bin/claude"
 
 test_home="$work/home"; mkdir -p "$test_home"
-future_ms=$(( ($(date +%s) + 7200) * 1000 ))
+# claude-sandboxed's pre-step now runs the OAuth-refresh contract probe
+# against whatever "claude" it finds on PATH -- the stub above, here -- and
+# caches the verdict per version under this directory. Point it at a scratch
+# location private to this run rather than the real machine's
+# /var/tmp/claude-scratch/forks/.claude-token-contract default, so this
+# suite's stub (whose --version says nothing real) can never share a marker
+# or a lock with this machine's own cache of the real claude's verdict.
+export FS_CLAUDE_TOKEN_CONTRACT_DIR="$work/token-contract"
+# Comfortably above fs_claude_refresh_if_needed's 120-minute default
+# threshold, so the pre-step refresh and the live-sync loop's own periodic
+# check both see "plenty left" and skip locking and the stub-claude refresh
+# attempt entirely -- this suite is about the CREDENTIAL COPY, not the
+# refresh helper (covered by tests/fork-sandbox-claude-token-refresh-test.sh).
+future_ms=$(( ($(date +%s) + 14400) * 1000 ))
 
 printf '\n== --claude-credentials and --exec ==\n'
 work_dir="$work/exec-wd"; mkdir -p "$work_dir"
@@ -116,17 +129,81 @@ else
     no "the sandbox's credentials.json carries the override's access token" \
         "$(cat "$creds_capture" 2>/dev/null)"
 fi
-if [[ -s "$creds_capture" ]] && grep -q 'refreshToken' "$creds_capture"; then
-    no "the sandbox's credentials.json carries no refreshToken (override still stripped)" \
-        "found 'refreshToken' in $(cat "$creds_capture")"
+if [[ -s "$creds_capture" ]] && grep -qF 'fixture-refresh-should-be-stripped' "$creds_capture"; then
+    no "the sandbox's credentials.json carries no real refreshToken (override still stripped)" \
+        "found the real refresh token in $(cat "$creds_capture")"
 else
-    ok "the sandbox's credentials.json carries no refreshToken (override still stripped)"
+    ok "the sandbox's credentials.json carries no real refreshToken (override still stripped)"
+fi
+if [[ -s "$creds_capture" ]] && grep -qF 'fork-sandbox-placeholder-not-a-token' "$creds_capture"; then
+    ok "the sandbox's credentials.json carries the placeholder refresh token"
+else
+    no "the sandbox's credentials.json carries the placeholder refresh token" \
+        "$(cat "$creds_capture" 2>/dev/null)"
+fi
+if [[ -s "$creds_capture" ]] && grep -q 'refreshTokenExpiresAt' "$creds_capture"; then
+    no "the sandbox's credentials.json carries no refreshTokenExpiresAt (override still stripped)" \
+        "found 'refreshTokenExpiresAt' in $(cat "$creds_capture")"
+else
+    ok "the sandbox's credentials.json carries no refreshTokenExpiresAt (override still stripped)"
 fi
 if [[ -s "$creds_capture" ]] && grep -q 'mcpOAuth' "$creds_capture"; then
     no "the sandbox's credentials.json carries no mcpOAuth (override still stripped)" \
         "found 'mcpOAuth' in $(cat "$creds_capture")"
 else
     ok "the sandbox's credentials.json carries no mcpOAuth (override still stripped)"
+fi
+# The real refresh token is a secret; the only place it should ever appear
+# on disk here is inside the override fixture itself (which the test wrote)
+# -- nowhere the run produced, and nowhere reachable once the run is done.
+# claude-sandboxed's own STATE_DIR is gone by the time this process returns
+# (its EXIT trap removes it), so $creds_capture -- the copy the stub backend
+# pulled out of STATE_DIR before that trap ran, per the header comment above
+# -- is what stands in for it.
+if grep -rqF 'fixture-refresh-should-be-stripped' "$work" \
+    --exclude="$(basename "$override_cred")" 2>/dev/null; then
+    no "the real refresh token appears nowhere outside the override fixture itself" \
+        "found it under $work outside $override_cred"
+else
+    ok "the real refresh token appears nowhere outside the override fixture itself"
+fi
+rm -f /tmp/claude-sandboxed-cred-test.out
+
+printf '\n== the default credential path (no --claude-credentials override) is stripped the same way ==\n'
+mkdir -p "$test_home/.claude"
+default_token="fixture-sandboxed-default-token-do-not-leak"
+cat > "$test_home/.claude/.credentials.json" <<JSON
+{"claudeAiOauth": {"accessToken": "$default_token", "refreshToken": "fixture-default-refresh-should-be-stripped", "refreshTokenExpiresAt": 999, "expiresAt": $future_ms, "scopes": ["user:inference"]}, "mcpOAuth": {"someserver": {"accessToken": "fixture-mcp-should-be-stripped"}}}
+JSON
+work_dir_default="$work/default-strip-wd"; mkdir -p "$work_dir_default"
+default_creds_capture="$work/captured-default-credentials.json"
+if PATH="$bin:$PATH" FORK_SANDBOX_BACKEND=test HOME="$test_home" \
+    CREDS_CAPTURE="$default_creds_capture" \
+    "$client" "$work_dir_default" --print hello \
+    >/tmp/claude-sandboxed-cred-test.out 2>&1; then
+    ok "a default-credential-path run against the stub backend exits 0"
+else
+    no "a default-credential-path run against the stub backend exits 0" \
+        "$(cat /tmp/claude-sandboxed-cred-test.out)"
+fi
+if [[ -s "$default_creds_capture" ]] && grep -qF "\"$default_token\"" "$default_creds_capture"; then
+    ok "the sandbox's credentials.json carries the default path's access token"
+else
+    no "the sandbox's credentials.json carries the default path's access token" \
+        "$(cat "$default_creds_capture" 2>/dev/null)"
+fi
+if [[ -s "$default_creds_capture" ]] && grep -qF 'fork-sandbox-placeholder-not-a-token' "$default_creds_capture"; then
+    ok "the sandbox's credentials.json (default path) carries the placeholder refresh token"
+else
+    no "the sandbox's credentials.json (default path) carries the placeholder refresh token" \
+        "$(cat "$default_creds_capture" 2>/dev/null)"
+fi
+if grep -rqF 'fixture-default-refresh-should-be-stripped' "$work" \
+    --exclude="$(basename "$test_home/.claude/.credentials.json")" 2>/dev/null; then
+    no "the real default-path refresh token appears nowhere outside its own fixture" \
+        "found it under $work"
+else
+    ok "the real default-path refresh token appears nowhere outside its own fixture"
 fi
 rm -f /tmp/claude-sandboxed-cred-test.out
 

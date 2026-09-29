@@ -1371,9 +1371,14 @@ same chain itself before delegating and always forwards the result as
 once per run, never twice.
 
 **The pod's own credential is a placeholder.** The operator's real
-`.credentials.json` is passed through the same `jq` filter
-`claude-sandboxed` uses — `del(.mcpOAuth) | del(.claudeAiOauth.refreshToken,
-.claudeAiOauth.refreshTokenExpiresAt)` — and then
+`.credentials.json` is passed through `fork-sandbox-k8s.sh`'s own copy of
+the stripping filter — `del(.mcpOAuth) | del(.claudeAiOauth.refreshToken,
+.claudeAiOauth.refreshTokenExpiresAt)` (kept separate from
+`fs_claude_sandbox_credential` in `fork-sandbox-lib.sh`, which
+`claude-sandboxed` uses locally and which keeps a placeholder refresh token
+rather than dropping it — see docs/claude-sandboxed.md's "Credential
+refresh"; the two paths do not share a live-sync loop or an early refresh)
+— and then
 `.claudeAiOauth.accessToken` is overwritten with the literal string
 `sandbox`. After that substitution the file holds no secret (scopes,
 subscription type, expiry survive; the one thing that could ever be spent

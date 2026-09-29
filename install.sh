@@ -318,6 +318,7 @@ PORCELAIN=(
 )
 
 PLUMBING=(
+    fork-sandbox-claude-token-probe
     fork-sandbox-discover-claude
     fork-sandbox-discover-k8s
     fork-sandbox-discover-model

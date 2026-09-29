@@ -1,0 +1,298 @@
+#!/usr/bin/env bash
+# fork-sandbox-claude-token-probe -- verify claude's undocumented OAuth-refresh internals
+#
+# Usage: fork-sandbox-claude-token-probe [--claude <bin>] [--json]
+#
+# claude-sandboxed's credential handling (the placeholder refresh token, the
+# early host refresh, the live-sync loop -- see fork-sandbox-lib.sh's
+# fs_claude_refresh_if_needed and docs/claude-sandboxed.md) all depend on
+# specific behaviour of the installed `claude` binary that is not a
+# documented interface: what it does at startup when a token is near expiry,
+# how its 401 handler decides whether to adopt a changed token, and how it
+# takes and honours its own refresh locks. A claude upgrade could change any
+# of that silently. This script checks each behaviour against whatever
+# claude is actually installed and reports, per check, whether it still
+# holds -- so a mismatch shows up as a loud warning in sandbox.log instead of
+# as an unexplained string of 401s hours into unattended runs.
+#
+# --claude names the binary to check; without it, PATH is searched, then
+# ~/.local/bin/claude. --json prints the same result as one JSON object
+# instead of the default line-per-check text.
+#
+# Exit status: 0 when every check passes, 1 when any check fails, 2 on a
+# usage or setup error (no claude binary found, bad arguments).
+#
+# Every check runs in its own scratch CLAUDE_CONFIG_DIR (mode 700, removed
+# on exit) holding only BOGUS, invented tokens -- sk-ant-oat01-probe-bogus
+# and sk-ant-ort01-probe-bogus, which the real OAuth server rejects outright.
+# This script never reads or writes $HOME/.claude or any real credential; it
+# never sees, and cannot leak, a real token.
+#
+# The checks:
+#   1. refresh at startup       -- an expired, bogus credential; `claude mcp
+#                                   list` should blank both tokens, proving
+#                                   claude attempted a refresh and handled
+#                                   the resulting invalid_grant the way the
+#                                   sync loop expects.
+#   2. refresh lock path, live  -- as (1), but with .oauth_refresh.lock (then,
+#                                   in a fresh scratch dir, the legacy
+#                                   <dir>.lock) held with a fresh mtime first;
+#                                   the file should come back UNCHANGED,
+#                                   proving claude waited on the lock and
+#                                   gave up rather than refreshing anyway.
+#   3. stale lock is broken     -- as (2), but the lock's mtime is 61s in the
+#                                   past; the file should be blanked, proving
+#                                   claude judged the lock stale and refreshed
+#                                   through it.
+#   4. 401 handler takes the    -- a bogus access token, a far-future expiry,
+#      refresh-token branch        and this repo's own placeholder refresh
+#                                   token (see FS_CLAUDE_PLACEHOLDER_REFRESH_
+#                                   TOKEN); `claude -p ok --model haiku
+#                                   --max-turns 1` is rejected with a 401
+#                                   before any inference happens (nothing is
+#                                   billed), and the file should end up
+#                                   blanked -- proving the 401 handler found a
+#                                   refresh token, attempted the forced
+#                                   refresh, and got invalid_grant. That is
+#                                   the same branch that adopts a changed
+#                                   token when one is present instead.
+#   5. mtime re-read            -- cannot be observed black-box without a
+#                                   real token, so this one is static: the
+#                                   claude binary must contain the marker
+#                                   strings `tengu_oauth_401_recovered_from_
+#                                   keychain` and `.oauth_refresh.lock`.
+#                                   Weaker than the others -- string presence,
+#                                   not behaviour -- and reported as such.
+
+set -euo pipefail
+
+if [[ "${1-}" == -h || "${1-}" == --help ]]; then
+    sed -n '2,/^$/p' "$(readlink -f "${BASH_SOURCE[0]}")" | sed 's/^# \{0,1\}//'
+    exit 0
+fi
+
+script_dir="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=fork-sandbox-lib.sh
+# shellcheck disable=SC1091  # plain shellcheck cannot follow it; use -x
+source "$script_dir/fork-sandbox-lib.sh"
+fs_require_gnu_tools || exit 2
+
+CLAUDE_BIN=""
+JSON_OUT=0
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --claude)
+            CLAUDE_BIN="${2:?--claude requires a path}"
+            shift 2
+            ;;
+        --json)
+            JSON_OUT=1
+            shift
+            ;;
+        *)
+            echo "Error: unknown argument '$1'. See --help." >&2
+            exit 2
+            ;;
+    esac
+done
+
+if [[ -z "$CLAUDE_BIN" ]]; then
+    CLAUDE_BIN="$(command -v claude 2>/dev/null || true)"
+    if [[ -z "$CLAUDE_BIN" && -x "$HOME/.local/bin/claude" ]]; then
+        CLAUDE_BIN="$HOME/.local/bin/claude"
+    fi
+fi
+if [[ -z "$CLAUDE_BIN" ]]; then
+    echo "Error: no claude binary found on PATH or in ~/.local/bin, and no --claude was given." >&2
+    exit 2
+fi
+
+BOGUS_ACCESS="sk-ant-oat01-probe-bogus"
+BOGUS_REFRESH="sk-ant-ort01-probe-bogus"
+
+# A fresh scratch CLAUDE_CONFIG_DIR (mode 700) holding only the given, bogus
+# tokens plus the onboarding file claude expects, so a run against it never
+# stalls waiting on a trust or onboarding prompt. Printed on stdout; the
+# caller removes it.
+# shellcheck disable=SC2329  # invoked indirectly, through CHECK_FNS below
+_probe_make_scratch() {
+    local access="$1" refresh="$2" expires="$3" dir
+    dir="$(mktemp -d /var/tmp/claude-scratch/forks/claude-fork-token-probe.XXXXXX)"
+    chmod 700 "$dir"
+    jq -n --arg at "$access" --arg rt "$refresh" --argjson exp "$expires" \
+        '{claudeAiOauth: {accessToken: $at, refreshToken: $rt, expiresAt: $exp,
+            scopes: ["user:inference"], subscriptionType: "pro"}}' \
+        > "$dir/.credentials.json"
+    chmod 600 "$dir/.credentials.json"
+    printf '{"hasCompletedOnboarding": true}' > "$dir/.claude.json"
+    printf '%s' "$dir"
+}
+
+# shellcheck disable=SC2329  # invoked indirectly, through CHECK_FNS below
+_probe_field() {
+    local file="$1" field="$2"
+    jq -r --arg f "$field" '.claudeAiOauth[$f] // ""' "$file" 2>/dev/null || printf ''
+}
+
+# shellcheck disable=SC2329  # invoked indirectly, through CHECK_FNS below
+_probe_blanked() {
+    local file="$1"
+    [[ "$(_probe_field "$file" accessToken)" == "" && "$(_probe_field "$file" refreshToken)" == "" ]]
+}
+
+# shellcheck disable=SC2329  # invoked indirectly, through CHECK_FNS below
+_probe_unchanged() {
+    local file="$1" orig_at="$2" orig_rt="$3" orig_exp="$4"
+    [[ "$(_probe_field "$file" accessToken)" == "$orig_at" \
+        && "$(_probe_field "$file" refreshToken)" == "$orig_rt" \
+        && "$(_probe_field "$file" expiresAt)" == "$orig_exp" ]]
+}
+
+# shellcheck disable=SC2329  # invoked indirectly, through CHECK_FNS below
+_probe_run_claude() {
+    local dir="$1"; shift
+    ( cd "$dir" && CLAUDE_CONFIG_DIR="$dir" "$FS_TIMEOUT" 40 "$@" </dev/null >/dev/null 2>&1 ) || true
+}
+
+PROBE_REASON=""
+
+# shellcheck disable=SC2329  # invoked indirectly, through CHECK_FNS below
+check_startup_refresh() {
+    local dir
+    dir="$(_probe_make_scratch "$BOGUS_ACCESS" "$BOGUS_REFRESH" 1)"
+    _probe_run_claude "$dir" "$CLAUDE_BIN" mcp list
+    if _probe_blanked "$dir/.credentials.json"; then
+        rm -rf "$dir"
+        return 0
+    fi
+    PROBE_REASON="claude did not blank the tokens after a forced startup refresh with an invalid refresh token; it may no longer refresh at startup when expiresAt is in the past"
+    rm -rf "$dir"
+    return 1
+}
+
+# shellcheck disable=SC2329  # invoked indirectly, through CHECK_FNS below
+check_lock_live() {
+    local dir1 dir2 legacy_lock reasons=() ok=1
+
+    dir1="$(_probe_make_scratch "$BOGUS_ACCESS" "$BOGUS_REFRESH" 1)"
+    mkdir "$dir1/.oauth_refresh.lock"
+    _probe_run_claude "$dir1" "$CLAUDE_BIN" mcp list
+    if ! _probe_unchanged "$dir1/.credentials.json" "$BOGUS_ACCESS" "$BOGUS_REFRESH" 1; then
+        ok=0
+        reasons+=("claude refreshed the token even though .oauth_refresh.lock was held with a fresh mtime")
+    fi
+    rm -rf "$dir1"
+
+    dir2="$(_probe_make_scratch "$BOGUS_ACCESS" "$BOGUS_REFRESH" 1)"
+    legacy_lock="$("$FS_REALPATH" -m "$dir2").lock"
+    mkdir "$legacy_lock"
+    _probe_run_claude "$dir2" "$CLAUDE_BIN" mcp list
+    if ! _probe_unchanged "$dir2/.credentials.json" "$BOGUS_ACCESS" "$BOGUS_REFRESH" 1; then
+        ok=0
+        reasons+=("claude refreshed the token even though the legacy <dir>.lock was held with a fresh mtime")
+    fi
+    rmdir "$legacy_lock" 2>/dev/null || true
+    rm -rf "$dir2"
+
+    (( ok )) && return 0
+    local IFS='; '
+    PROBE_REASON="${reasons[*]}; claude may no longer honour either refresh lock"
+    return 1
+}
+
+# shellcheck disable=SC2329  # invoked indirectly, through CHECK_FNS below
+check_stale_lock() {
+    local dir lock
+    dir="$(_probe_make_scratch "$BOGUS_ACCESS" "$BOGUS_REFRESH" 1)"
+    lock="$dir/.oauth_refresh.lock"
+    mkdir "$lock"
+    touch -d '61 seconds ago' "$lock"
+    _probe_run_claude "$dir" "$CLAUDE_BIN" mcp list
+    if _probe_blanked "$dir/.credentials.json"; then
+        rm -rf "$dir"
+        return 0
+    fi
+    PROBE_REASON="claude did not refresh through a stale (61s+) .oauth_refresh.lock; it may now treat any existing lock as live regardless of age"
+    rm -rf "$dir"
+    return 1
+}
+
+# shellcheck disable=SC2329  # invoked indirectly, through CHECK_FNS below
+check_401_handler() {
+    local dir far_future
+    far_future=$(( ($(date +%s) + 3600) * 1000 ))
+    dir="$(_probe_make_scratch "$BOGUS_ACCESS" "$FS_CLAUDE_PLACEHOLDER_REFRESH_TOKEN" "$far_future")"
+    _probe_run_claude "$dir" "$CLAUDE_BIN" -p ok --model haiku --max-turns 1
+    if _probe_blanked "$dir/.credentials.json"; then
+        rm -rf "$dir"
+        return 0
+    fi
+    PROBE_REASON="claude did not blank the tokens after a 401 with a present (placeholder) refresh token; the 401 handler may no longer take the forced-refresh branch on an invalid_grant"
+    rm -rf "$dir"
+    return 1
+}
+
+# shellcheck disable=SC2329  # invoked indirectly, through CHECK_FNS below
+check_mtime_reread() {
+    local real c1 c2
+    real="$(readlink -f "$CLAUDE_BIN")"
+    c1="$(grep -a -c -F 'tengu_oauth_401_recovered_from_keychain' "$real" 2>/dev/null || true)"
+    c2="$(grep -a -c -F '.oauth_refresh.lock' "$real" 2>/dev/null || true)"
+    [[ "$c1" =~ ^[0-9]+$ ]] || c1=0
+    [[ "$c2" =~ ^[0-9]+$ ]] || c2=0
+    if (( c1 > 0 && c2 > 0 )); then
+        return 0
+    fi
+    PROBE_REASON="marker strings not found in the claude binary (this is a weaker, string-level check only)"
+    return 1
+}
+
+CHECK_KEYS=(startup_refresh lock_live stale_lock handler_401 mtime_reread)
+CHECK_LABELS=(
+    "refresh at startup"
+    "refresh lock path, live"
+    "stale lock is broken"
+    "401 handler takes the refresh-token branch"
+    "mtime re-read (weaker, string-level check)"
+)
+CHECK_FNS=(check_startup_refresh check_lock_live check_stale_lock check_401_handler check_mtime_reread)
+
+RESULT_OK=()
+RESULT_REASON=()
+OVERALL=0
+
+for i in "${!CHECK_FNS[@]}"; do
+    PROBE_REASON=""
+    if "${CHECK_FNS[$i]}"; then
+        RESULT_OK+=(1)
+        RESULT_REASON+=("")
+        (( JSON_OUT )) || printf 'ok    %s\n' "${CHECK_LABELS[$i]}"
+    else
+        RESULT_OK+=(0)
+        RESULT_REASON+=("$PROBE_REASON")
+        OVERALL=1
+        (( JSON_OUT )) || printf 'FAIL  %s -- %s\n' "${CHECK_LABELS[$i]}" "$PROBE_REASON"
+    fi
+done
+
+CLAUDE_VERSION="$("$CLAUDE_BIN" --version 2>/dev/null | head -1)" || CLAUDE_VERSION=""
+CLAUDE_VERSION="${CLAUDE_VERSION%% *}"
+
+if (( JSON_OUT )); then
+    jq -n --arg version "$CLAUDE_VERSION" --arg verified "$FS_CLAUDE_TOKEN_CONTRACT_VERIFIED" \
+        --argjson checks "$(
+            for i in "${!CHECK_KEYS[@]}"; do
+                jq -n --arg name "${CHECK_KEYS[$i]}" --arg label "${CHECK_LABELS[$i]}" \
+                    --argjson ok "$([[ "${RESULT_OK[$i]}" == 1 ]] && echo true || echo false)" \
+                    --arg reason "${RESULT_REASON[$i]}" \
+                    '{name: $name, label: $label, ok: $ok, reason: $reason}'
+            done | jq -s '.'
+        )" \
+        '{claude_version: $version, contract_verified_version: $verified, checks: $checks}'
+else
+    printf 'claude %s (contract last verified against %s)\n' \
+        "${CLAUDE_VERSION:-unknown}" "$FS_CLAUDE_TOKEN_CONTRACT_VERIFIED"
+fi
+
+exit "$OVERALL"

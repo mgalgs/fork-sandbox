@@ -165,15 +165,26 @@
 #     that host mountpoint is namespace-local, so the transcript rescue
 #     below finds an empty directory and copies nothing. The
 #     --session-state directory IS the durable copy in that case.
-#   - Credentials: the copy holds the short-lived access token only. The
-#     refresh token and the mcpOAuth tokens stay on the host. A leaked
-#     sandbox credential dies at token expiry, and the session cannot
-#     outlive the access token.
+#   - Credentials: the copy holds the short-lived access token, plus a fixed,
+#     non-secret PLACEHOLDER refresh token (see fs_claude_sandbox_credential
+#     in fork-sandbox-lib.sh) rather than none at all -- claude's own 401
+#     handler only adopts a changed access token when some refresh token is
+#     present, which the live-sync loop below depends on. The real refresh
+#     token and the mcpOAuth tokens never leave the host. A leaked sandbox
+#     credential still cannot itself mint a working token: the real OAuth
+#     server rejects the placeholder outright.
 #     Where the original is read from is the platform's business: a file at
 #     ~/.claude/.credentials.json on Linux, the login Keychain on macOS,
 #     where that file does not exist. It is read once, at launch, on the
 #     host -- the Keychain can prompt, and a prompt has no place inside an
 #     unattended run -- and it never reaches any command line.
+#     For a FILE-backed credential (not Keychain), a background host process
+#     keeps the sandbox's copy in step with the host's for as long as the
+#     sandbox runs, refreshing the host's own token on this machine when
+#     under 2h remain and repairing the sandbox copy within a couple of
+#     seconds of any change -- see docs/claude-sandboxed.md's "Credential
+#     refresh" section, and fs_claude_refresh_if_needed and
+#     fs_claude_token_contract_check in fork-sandbox-lib.sh.
 #   - Git: the host identity is carried in, with commit and tag signing
 #     switched off, because the signing key lives in the masked ~/.ssh.
 #     Commits work; pushing does not, since no key, token or agent is
@@ -421,7 +432,35 @@ CLAUDE_BIN=""
 CLAUDE_REAL=""
 CLAUDE_CRED_JSON=""
 MINS_LEFT=0
+# Set below, in non-exec mode only, when the credential is file-backed: the
+# host claude binary the pre-step refresh/probe and the live-sync loop (after
+# the sandbox's own credential copy is written, further down) both use.
+# Independent of CLAUDE_BIN above -- that one applies only under a
+# toolchain=host backend, and is resolved further down; this one is needed
+# regardless of which toolchain the SANDBOX runs, because the refresh always
+# happens on the HOST.
+HOST_CLAUDE_BIN=""
+CRED_FILE=""
+SYNC_LOOP_PID=""
 if (( ! EXEC_MODE )); then
+    HOST_CLAUDE_BIN="$(command -v claude 2>/dev/null || true)"
+    if [[ -z "$HOST_CLAUDE_BIN" && -x "$HOME/.local/bin/claude" ]]; then
+        HOST_CLAUDE_BIN="$HOME/.local/bin/claude"
+    fi
+    CRED_FILE="$(fs_claude_credential_file "$CLAUDE_CREDENTIALS")" || CRED_FILE=""
+
+    # Before anything else credential-related: the contract probe (loud,
+    # cached, never fatal -- see fs_claude_token_contract_check) and the
+    # early refresh itself (fs_claude_refresh_if_needed), both host-side and
+    # both no-ops for a Keychain-backed credential or when no host claude was
+    # found. This has to run before the credential is even read below: the
+    # whole point is to refresh it first when it is close to expiry, rather
+    # than copy a token into the sandbox that is about to be revoked.
+    if [[ -n "$CRED_FILE" && -n "$HOST_CLAUDE_BIN" ]]; then
+        fs_claude_token_contract_check "$HOST_CLAUDE_BIN" "$script_dir/fork-sandbox-claude-token-probe"
+        fs_claude_refresh_if_needed "$CRED_FILE" "$HOST_CLAUDE_BIN"
+    fi
+
     # Where this comes from is the platform's business, not this script's:
     # a file on Linux, the login Keychain on macOS. Read it ONCE, here, before
     # anything is created -- the Keychain can prompt, and a prompt belongs at
@@ -439,10 +478,7 @@ if (( ! EXEC_MODE )); then
     # even if it were bound, so claude comes from the image and is found on
     # the sandbox's own PATH.
     if [[ "$FS_BACKEND_TOOLCHAIN" == host ]]; then
-        CLAUDE_BIN="$(command -v claude 2>/dev/null || true)"
-        if [[ -z "$CLAUDE_BIN" && -x "$HOME/.local/bin/claude" ]]; then
-            CLAUDE_BIN="$HOME/.local/bin/claude"
-        fi
+        CLAUDE_BIN="$HOST_CLAUDE_BIN"
         if [[ -z "$CLAUDE_BIN" ]]; then
             echo "Error: cannot find the claude binary on PATH or in ~/.local/bin." >&2
             exit 1
@@ -450,8 +486,12 @@ if (( ! EXEC_MODE )); then
         CLAUDE_REAL="$(readlink -f "$CLAUDE_BIN")"
     fi
 
-    # The sandbox cannot refresh the token, so the session dies at expiry.
-    # Check the remaining lifetime up front.
+    # A file-backed credential no longer dies at expiry: the live-sync loop
+    # started further down (once the sandbox's own copy exists) keeps it in
+    # step with the host, including a host-side refresh, for as long as this
+    # sandbox runs. A Keychain-backed credential, or a run with no host
+    # claude to refresh with, gets none of that, so the warning below still
+    # applies to it.
     EXPIRES_AT_MS=$(printf '%s' "$CLAUDE_CRED_JSON" | jq -r '.claudeAiOauth.expiresAt // 0')
     MINS_LEFT=$(( EXPIRES_AT_MS / 60000 - $(date +%s) / 60 ))
     if (( MINS_LEFT <= 0 )); then
@@ -463,7 +503,11 @@ if (( ! EXEC_MODE )); then
         echo "The sandbox cannot refresh the token, so the session would die almost at once. Log in with claude on the host, then retry." >&2
         exit 1
     elif (( MINS_LEFT < 60 )); then
-        echo "Warning: the access token expires in ${MINS_LEFT}m; the sandbox session dies then." >&2
+        if [[ -n "$CRED_FILE" && -n "$HOST_CLAUDE_BIN" ]]; then
+            echo "Warning: the access token expires in ${MINS_LEFT}m; the live-sync loop will refresh it on the host before then." >&2
+        else
+            echo "Warning: the access token expires in ${MINS_LEFT}m; the sandbox session dies then." >&2
+        fi
     fi
 fi
 
@@ -492,6 +536,15 @@ cleanup() {
     # A pipeline here is a trap of its own — `find | head` takes SIGPIPE,
     # and pipefail turns that into a failure that would abort the handler.
     set +e
+    # The live-sync loop (started below, once it exists) outlives nothing on
+    # its own -- it watches SYNC_LOOP_PID for this script's own death, but
+    # that check only runs once every 2s, and a normal exit should not leave
+    # it spinning even that briefly against a STATE_DIR this handler is about
+    # to remove.
+    if [[ -n "$SYNC_LOOP_PID" ]]; then
+        kill "$SYNC_LOOP_PID" 2>/dev/null
+        wait "$SYNC_LOOP_PID" 2>/dev/null
+    fi
     # There is no transcript in --exec mode: that directory is claude's.
     if (( ! EXEC_MODE )) \
         && find "$STATE_DIR/claude/projects" -name '*.jsonl' -print -quit 2>/dev/null \
@@ -552,14 +605,107 @@ if (( ! EXEC_MODE )); then
         claude_mountpoint "$SESSION_STATE" "$HOME/.claude/projects"
     fi
 
-    # Keep the access token. Drop the refresh token, which is long-lived and
-    # single-use — a sandbox refresh would invalidate the host's copy. Drop
-    # mcpOAuth, which holds unrelated MCP server tokens.
+    # Keep the access token. Replace the real refresh token with the fixed,
+    # non-secret placeholder (fs_claude_sandbox_credential in fork-sandbox-
+    # lib.sh) rather than dropping it outright — a real one is long-lived and
+    # single-use, so a sandbox refresh with it would invalidate the host's
+    # copy, but claude's own 401 handler only adopts a changed access token
+    # when SOME refresh token is present at all, and the sync loop below
+    # depends on that. The placeholder is not a secret: the real OAuth server
+    # rejects it. Drop mcpOAuth, which holds unrelated MCP server tokens.
     install -m 600 /dev/null "$STATE_DIR/claude/.credentials.json"
     printf '%s' "$CLAUDE_CRED_JSON" \
-        | jq 'del(.mcpOAuth)
-            | del(.claudeAiOauth.refreshToken, .claudeAiOauth.refreshTokenExpiresAt)' \
+        | fs_claude_sandbox_credential \
         > "$STATE_DIR/claude/.credentials.json"
+
+    # The live-sync loop. A run can outlive its token: sandbox launch copied
+    # one snapshot, but a long run, or a host that refreshes for an unrelated
+    # reason, or a caller with no interactive session to refresh by hand,
+    # would otherwise leave the sandbox holding a token the server has since
+    # revoked. Only for a file-backed credential with a host claude to refresh
+    # it -- exactly the same gate the pre-step check above used. A Keychain-
+    # backed credential is untouched, as always: it can prompt, and this loop
+    # runs unattended.
+    #
+    # Every 2s it: rebuilds the expected sandbox JSON from the host file with
+    # the SAME jq filter (fs_claude_sandbox_credential) the launch-time write
+    # above used, so the two can never drift apart; compares it against the
+    # sandbox's own copy on the three fields that matter (access token,
+    # refresh token placeholder, expiry) rather than byte-for-byte, because
+    # claude itself may rewrite the sandbox file with extra fields that are
+    # not this loop's business; and, on a difference, writes the new JSON in
+    # atomically (temp file in the same directory, mode 600, then `mv -f`).
+    # One rule covers both directions this can happen: a host refresh (the
+    # sandbox's accessToken was non-empty and different) and a repair (the
+    # sandbox's OWN claude blanked its copy after failing a forced refresh
+    # with the placeholder token, taken care of by fs_claude_refresh_if_needed
+    # on the host side before that ever gets far). About every 60s it also
+    # calls fs_claude_refresh_if_needed itself, so a long-running step, or a
+    # fleet with no interactive host session at all, never runs out the clock
+    # waiting for someone else to refresh it.
+    #
+    # This prints to its own inherited stderr, not through the ERR_CAPTURE
+    # pipe run_attempt sets up further down for the --resume-session retry:
+    # that pipe is local to the `{ ... } 3>&1` construct wrapping ONE backend
+    # invocation, built after this loop is already running and forked with
+    # today's file descriptor table, so this loop's writes bypass it
+    # entirely and land directly in whatever this whole script's stderr
+    # already goes to -- the run's sandbox.log. They can never be mistaken
+    # for a resume failure (RESUME_FAIL_RE) either: the sentences below match
+    # none of those patterns.
+    #
+    # Exits on its own once its parent (this script) is gone, so a SIGKILLed
+    # parent cannot leave it spinning against a STATE_DIR that either is
+    # about to be, or already was, removed; the cleanup trap above also kills
+    # it directly on every normal exit path.
+    if [[ -n "$CRED_FILE" && -n "$HOST_CLAUDE_BIN" ]]; then
+        (
+            parent_pid=$$
+            sandbox_file="$STATE_DIR/claude/.credentials.json"
+            tick=0
+            while kill -0 "$parent_pid" 2>/dev/null; do
+                if [[ -f "$CRED_FILE" ]]; then
+                    expected=""
+                    expected="$(fs_claude_sandbox_credential < "$CRED_FILE" 2>/dev/null)" || expected=""
+                    if [[ -n "$expected" ]]; then
+                        exp_key=""
+                        exp_key="$(jq -c '{at: .claudeAiOauth.accessToken,
+                                rt: .claudeAiOauth.refreshToken,
+                                exp: .claudeAiOauth.expiresAt}' <<<"$expected" 2>/dev/null)" || exp_key=""
+                        cur_key=""
+                        cur_at=""
+                        if [[ -n "$exp_key" && -f "$sandbox_file" ]]; then
+                            cur_key="$(jq -c '{at: .claudeAiOauth.accessToken,
+                                    rt: .claudeAiOauth.refreshToken,
+                                    exp: .claudeAiOauth.expiresAt}' "$sandbox_file" 2>/dev/null)" || cur_key=""
+                            cur_at="$(jq -r '.claudeAiOauth.accessToken // ""' "$sandbox_file" 2>/dev/null)" || cur_at=""
+                        fi
+                        if [[ -n "$exp_key" && "$cur_key" != "$exp_key" ]]; then
+                            kind="the host's Claude token changed"
+                            [[ -z "$cur_at" ]] && kind="the sandbox's Claude credential was blanked; repaired it from the host's copy"
+                            tmp="$(mktemp "$STATE_DIR/claude/.credentials.json.XXXXXX")" || tmp=""
+                            if [[ -n "$tmp" ]]; then
+                                printf '%s' "$expected" > "$tmp"
+                                chmod 600 "$tmp"
+                                mv -f "$tmp" "$sandbox_file"
+                                new_exp_ms="$(jq -r '.exp // 0' <<<"$exp_key" 2>/dev/null)" || new_exp_ms=0
+                                [[ "$new_exp_ms" =~ ^[0-9]+$ ]] || new_exp_ms=0
+                                left_min=$(( new_exp_ms / 60000 - $(date +%s) / 60 ))
+                                printf 'claude-sandboxed: %s; updated the sandbox copy (now %dh%02dm)\n' \
+                                    "$kind" $(( left_min / 60 )) $(( left_min % 60 )) >&2
+                            fi
+                        fi
+                    fi
+                fi
+                if (( tick % 30 == 0 )); then
+                    fs_claude_refresh_if_needed "$CRED_FILE" "$HOST_CLAUDE_BIN"
+                fi
+                tick=$(( tick + 1 ))
+                sleep 2
+            done
+        ) &
+        SYNC_LOOP_PID=$!
+    fi
 fi
 
 # The git identity, signing switched off, so a session in here can commit.
