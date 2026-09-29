@@ -782,6 +782,71 @@ rc=$?
 check "reply with --review-target exits 1" "1" "$rc"
 contains "reply's refusal names send as the way to set a review target" "$out" "applies to a new thread only"
 
+printf '\n== reply: --upstream-head ==\n'
+
+uh_sha="fedcba9876543210fedcba9876543210fedcba98"
+uh_thread_dir="$FORK_SANDBOX_MAIL_ROOT/threads/$rt_out"
+
+uh_id="$("$mail" reply --from @ci-demo --reply-to "$rt_out" --to @pr-author \
+    --upstream-head "feature/x:$uh_sha" --body - <<< "pushed" 2>diag.txt)"
+rc=$?
+check "reply --upstream-head exits 0" "0" "$rc"
+uh_raw="$("$mail" show "$uh_id")"
+contains "reply --upstream-head stamps X-Upstream-Head, space-separated" "$uh_raw" \
+    "X-Upstream-Head: feature/x $uh_sha"
+check "the header appears exactly once" "1" "$(grep -c '^X-Upstream-Head:' <<< "$uh_raw")"
+
+uh_plain="$("$mail" reply --from @ci-demo --reply-to "$rt_out" --to @pr-author \
+    --body - <<< "plain" 2>/dev/null)"
+check "a reply without the flag carries no X-Upstream-Head" "0" \
+    "$("$mail" show "$uh_plain" | grep -c '^X-Upstream-Head:')"
+
+uh_threads_before="$(find "$FORK_SANDBOX_MAIL_ROOT/threads" -maxdepth 1 -type d | wc -l)"
+out="$("$mail" send --from @ci-demo --to @pr-author --subject "No thread to move" --body - \
+    --upstream-head "feature/x:$uh_sha" <<< "x" 2>&1)"
+rc=$?
+check "send --upstream-head exits 1" "1" "$rc"
+contains "send's refusal says it applies to a reply only" "$out" "applies to a reply only"
+check "send --upstream-head creates no thread" "$uh_threads_before" \
+    "$(find "$FORK_SANDBOX_MAIL_ROOT/threads" -maxdepth 1 -type d | wc -l)"
+
+uh_msgs_before="$(find "$uh_thread_dir" -name '*.msg' | wc -l)"
+uh_bad() {
+    local label="$1" value="$2" out rc
+    out="$("$mail" reply --from @ci-demo --reply-to "$rt_out" --to @pr-author \
+        --upstream-head "$value" --body - <<< "x" 2>&1)"
+    rc=$?
+    check "reply --upstream-head $label exits 1" "1" "$rc"
+    contains "reply --upstream-head $label names the flag" "$out" "--upstream-head"
+}
+uh_bad "with no ':'" "feature/x-$uh_sha"
+uh_bad "with a bad branch name" "bad branch:$uh_sha"
+uh_bad "with an empty branch" ":$uh_sha"
+uh_bad "with a short sha" "feature/x:0123456789abcdef"
+uh_bad "with an uppercase sha" "feature/x:FEDCBA9876543210fedcba9876543210fedcba98"
+uh_bad "with a 64-hex sha" "feature/x:${uh_sha}${uh_sha:0:24}"
+uh_bad "with a newline in the value" $'feature/x:'"$uh_sha"$'\nX-Hops: 99'
+check "the refused replies wrote no message" "$uh_msgs_before" \
+    "$(find "$uh_thread_dir" -name '*.msg' | wc -l)"
+
+out="$("$mail" reply --from @ci-demo --reply-to "$rt_out" --to @pr-author \
+    --header "X-Upstream-Head: feature/x $uh_sha" --body - <<< "x" 2>&1)"
+rc=$?
+check "reply with a raw --header X-Upstream-Head exits 1" "1" "$rc"
+contains "the raw header refusal names the reserved header" "$out" "reserved header 'X-Upstream-Head'"
+out="$("$mail" send --from @ci-demo --to @pr-author --subject "Raw" --body - \
+    --header "X-Upstream-Head: feature/x $uh_sha" <<< "x" 2>&1)"
+rc=$?
+check "send with a raw --header X-Upstream-Head exits 1" "1" "$rc"
+out="$("$mail" reply --from @ci-demo --reply-to "$rt_out" --to @pr-author \
+    --upstream-head "feature/x:$uh_sha" --header "x-upstream-head: feature/y $uh_sha" \
+    --body - <<< "x" 2>&1)"
+check "a raw header alongside the flag is still refused" "1" "$?"
+check "the refused replies still wrote no message" "$uh_msgs_before" \
+    "$(find "$uh_thread_dir" -name '*.msg' | wc -l)"
+
+contains "usage header documents reply --upstream-head" "$("$mail" --help 2>&1 || true)" "--upstream-head <branch>:<sha>"
+
 printf '\n== export --json ==\n'
 
 new_root FORK_SANDBOX_MAIL_ROOT; export FORK_SANDBOX_MAIL_ROOT

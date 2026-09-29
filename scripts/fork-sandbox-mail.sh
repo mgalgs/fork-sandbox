@@ -14,6 +14,7 @@
 #                              (--body <file>|-) [--to @b[,@c]] [--cc @d[,@e]]
 #                              [--subject <s>] [--attach <file>]... [--hops <n>]
 #                              [--header 'X-Name: value']...
+#                              [--upstream-head <branch>:<sha>]
 #        fork-sandbox-mail.sh show <message-id>
 #        fork-sandbox-mail.sh tree <thread-id>
 #        fork-sandbox-mail.sh export <thread-id> --json
@@ -52,6 +53,15 @@
 # `tree`/`list`/`inbox`/`seen` read them back. There is no agent spawning, no
 # fleet registry, and no delivery beyond what `inbox` computes by scanning
 # headers. Later rounds build a router and a registry on top of this.
+#
+# `reply --upstream-head <branch>:<sha>` tells a running review thread that
+# the upstream moved: <branch> is a git branch name, <sha> a full 40-hex
+# commit sha. It stamps `X-Upstream-Head: <branch> <sha>` on the reply, and
+# the postmaster delivers that commit to the thread's `sets` seat as a local
+# branch named `upstream` (docs/agent-mail.md, "Upstream moved"). Reply only:
+# `send --upstream-head` is refused, since there is no thread to move. It is
+# the ONLY way to produce the header -- a raw `--header X-Upstream-Head: ...`
+# is refused here and at the mail API.
 #
 # Layout, under $FORK_SANDBOX_MAIL_ROOT (default
 # /var/tmp/claude-scratch/agent-mail):
@@ -102,9 +112,11 @@
 #                                 must match ^X-[A-Za-z0-9-]+$ (only custom
 #                                 X- headers may be set this way; core
 #                                 headers are refused by the name pattern
-#                                 alone) and may not be X-Hops or
-#                                 X-Attachment, which this store writes
-#                                 itself. --header does not refuse
+#                                 alone) and may not be X-Hops,
+#                                 X-Attachment or X-Upstream-Head, which
+#                                 this store writes itself (the last only
+#                                 via `reply --upstream-head`). --header
+#                                 does not refuse
 #                                 X-Review-Target/X-Review-Target-Set/
 #                                 X-Version -- those are stamped by
 #                                 `send --review-target` and by the
@@ -123,6 +135,10 @@
 #   X-Version: <n>                the review target's version this
 #                                 message belongs to; 1 on the message
 #                                 that opened the thread
+#   X-Upstream-Head: <branch> <sha>        `reply --upstream-head
+#                                 <branch>:<sha>` only: the upstream moved
+#                                 to that commit -- see the paragraph on
+#                                 `reply --upstream-head` above
 #
 # Unlike the RFC-2822-style angle-bracket/domain ids this repo's old
 # lkml-mailbox.sh used, ids here are bare uuids with no "<...>" wrapping and
@@ -230,7 +246,8 @@ mail_validate_no_newline() {
 # forge or truncate header lines, same reasoning as mail_validate_no_newline),
 # any name that isn't ^X-[A-Za-z0-9-]+$ (core, non-X headers are refused by
 # this pattern alone -- only custom X- headers may be set this way), and the
-# reserved names this store writes itself (X-Hops, X-Attachment).
+# reserved names this store writes itself (X-Hops, X-Attachment,
+# X-Upstream-Head).
 mail_validate_header() {
     local raw="$1" name value
     mail_validate_no_newline "$raw" "--header" || return 1
@@ -246,7 +263,7 @@ mail_validate_header() {
         return 1
     fi
     case "$name" in
-        X-Hops|X-Attachment)
+        X-Hops|X-Attachment|X-Upstream-Head)
             echo "Error: --header may not set reserved header '$name'." >&2
             return 1
             ;;
@@ -416,6 +433,31 @@ mail_validate_review_target() {
     if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]] && [[ ! "$sha" =~ ^[0-9a-f]{64}$ ]]; then
         echo "Error: --review-target: '$sha' must be a 40- or 64-character" >&2
         echo "lowercase hex sha." >&2
+        return 1
+    fi
+    printf '%s\t%s' "$branch" "$sha"
+}
+
+# Validates a `--upstream-head <branch>:<sha>` value, split on the LAST ':'
+# (see mail_validate_review_target). Stricter than a review target: the sha
+# must be a full 40-hex commit sha. Prints "<branch>\t<sha>" on success.
+mail_validate_upstream_head() {
+    local raw="$1" branch sha
+    mail_validate_no_newline "$raw" "--upstream-head" || return 1
+    if [[ "$raw" != *:* ]]; then
+        echo "Error: --upstream-head '$raw' must look like '<branch>:<sha>'." >&2
+        return 1
+    fi
+    branch="${raw%:*}"
+    sha="${raw##*:}"
+    if [[ -z "$branch" ]] || [[ "$branch" == *[[:space:]]* ]] || \
+       ! git check-ref-format --branch "$branch" >/dev/null 2>&1; then
+        echo "Error: --upstream-head: '$branch' is not a valid branch name." >&2
+        return 1
+    fi
+    if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+        echo "Error: --upstream-head: '$sha' must be a full 40-character" >&2
+        echo "lowercase hex commit sha." >&2
         return 1
     fi
     printf '%s\t%s' "$branch" "$sha"
@@ -659,6 +701,11 @@ cmd_send() {
             --context-ro) grant_context_ro="${2:?--context-ro requires a directory}"; shift 2 ;;
             --context-secret) grant_context_secret="${2:?--context-secret requires a Secret name}"; shift 2 ;;
             --review-target) review_target_arg="${2:?--review-target requires <branch>:<sha>}"; shift 2 ;;
+            --upstream-head)
+                echo "Error: send: --upstream-head applies to a reply only (mail reply); a new thread has no" >&2
+                echo "upstream to move." >&2
+                return 1
+                ;;
             -h|--help) usage; exit 0 ;;
             *) echo "Error: send: unknown option '$1'." >&2; return 1 ;;
         esac
@@ -800,6 +847,7 @@ cmd_send() {
 cmd_reply() {
     local from="" reply_to="" body_arg="" to="" cc="" subject_override="" hops_override=""
     local -a attach_files=() extra_headers=()
+    local upstream_head_arg=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --from) from="${2:?--from requires an address}"; shift 2 ;;
@@ -811,6 +859,7 @@ cmd_reply() {
             --attach) attach_files+=("${2:?--attach requires a file}"); shift 2 ;;
             --hops) hops_override="${2:?--hops requires a number}"; shift 2 ;;
             --header) extra_headers+=("${2:?--header requires 'X-Name: value'}"); shift 2 ;;
+            --upstream-head) upstream_head_arg="${2:?--upstream-head requires <branch>:<sha>}"; shift 2 ;;
             --allow-namespace|--reach-probe|--context-ro|--context-secret)
                 echo "Error: reply: grant flags apply to a new thread only (mail send); for an existing thread use" >&2
                 echo "fork-sandbox mail grant <thread-id> ..." >&2
@@ -837,6 +886,12 @@ cmd_reply() {
         hline="$(mail_validate_header "$eh")" || return 1
         validated_headers+=("$hline")
     done
+    local upstream_head_hline=""
+    if [[ -n "$upstream_head_arg" ]]; then
+        local uh_out
+        uh_out="$(mail_validate_upstream_head "$upstream_head_arg")" || return 1
+        upstream_head_hline="X-Upstream-Head: ${uh_out%%$'\t'*} ${uh_out#*$'\t'}"
+    fi
 
     mail_validate_addr "$from" || return 1
     local to_norm="" cc_norm=""
@@ -932,6 +987,7 @@ cmd_reply() {
     hlines+=("In-Reply-To: $p_id")
     hlines+=("References: $references")
     hlines+=("X-Hops: ${hops_override:-$p_hops}")
+    [[ -n "$upstream_head_hline" ]] && hlines+=("$upstream_head_hline")
     for hline in "${validated_headers[@]:-}"; do
         [[ -n "$hline" ]] && hlines+=("$hline")
     done
