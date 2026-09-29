@@ -1664,6 +1664,18 @@ auth401)
     printf '{"type":"result","subtype":"error","is_error":true,"result":"Failed to authenticate. API Error: 401 OAuth access token has been revoked"}\n'
     exit 1
     ;;
+# Same shape as auth401, but the failed attempt's own result event also
+# carries a total_cost_usd -- a real revoked-token failure can still have
+# burned tokens before the server cut it off. This is what proves a
+# retried leg's archived attempt is priced in, not silently dropped: the
+# plain auth401 action above never reports a cost on its failing calls, so
+# no test built on it alone can tell a lost archived cost from one that
+# was never there.
+auth401-cost)
+    printf 'stub: scripted auth401-cost failure on call %s\n' "$n" >&2
+    printf '{"type":"result","subtype":"error","is_error":true,"total_cost_usd":0.02,"result":"Failed to authenticate. API Error: 401 OAuth access token has been revoked"}\n'
+    exit 1
+    ;;
 overloaded)
     printf 'stub: scripted overloaded failure on call %s\n' "$n" >&2
     printf '{"type":"result","subtype":"error","is_error":true,"result":"overloaded_error: Overloaded. API Error: 529"}\n'
@@ -3427,6 +3439,8 @@ if rd_retry1="$(run_stubbed --preset reviewloop --review-loop 2 \
     contains "the retry record's error names the revoked credential" \
         "$(jq -r '.iterations[0].retries[0].error' "$rd_retry1/review-loop.json" 2>/dev/null)" \
         "revoked"
+    check "the retry record is labeled as the fix leg's own" \
+        "fix" "$(jq -r '.iterations[0].retries[0].leg' "$rd_retry1/review-loop.json" 2>/dev/null)"
     contains "sandbox.log announces the retry" \
         "$(cat "$rd_retry1/sandbox.log" 2>/dev/null)" \
         "the fix leg of iteration 1 failed on a transient error"
@@ -3450,6 +3464,42 @@ if rd_retry1="$(run_stubbed --preset reviewloop --review-loop 2 \
 else
     no "a fix leg retried on a 401 lets the review loop reach a second iteration" \
         "launch failed"
+fi
+
+# B1-cost. Same as B3-cost above, but for a run_leg leg rather than the
+# implement leg: a retried fix leg's own archived attempt ($0.02) must join
+# its own leg_cost, which is what feeds both fix_cost_usd and, through
+# loop_cost_sum, total_cost_usd -- so neither loses the archived attempt's
+# price nor counts it twice.
+prep_stub $'commit\nfindings\nauth401-cost\ncommit\napproved'
+if rd_retry1c="$(run_stubbed --preset reviewloop --review-loop 2 \
+    --branch "sandbox-test-retry-fix-cost-$$")"; then
+    tmpdirs+=("$rd_retry1c")
+    check "a retried fix leg's fix_cost_usd includes the archived attempt" \
+        "0.03" "$(jq -r '.iterations[0].fix_cost_usd' "$rd_retry1c/review-loop.json" 2>/dev/null)"
+    check "total_cost_usd counts the retried fix leg's archived attempt once" \
+        "0.060000" "$(jq -r '.total_cost_usd' "$rd_retry1c/summary.json" 2>/dev/null)"
+else
+    no "a retried fix leg's fix_cost_usd includes the archived attempt" \
+        "launch failed"
+fi
+
+# B1b. When the review leg AND the fix leg of the SAME iteration both
+# retry, their retry records must not be indistinguishable {attempt: 1,
+# ...} entries in the shared iteration record -- each carries its own
+# `leg` label.
+prep_stub $'commit\nauth401\nfindings\nauth401\ncommit\napproved'
+if rd_retry1d="$(run_stubbed --preset reviewloop --review-loop 2 \
+    --branch "sandbox-test-retry-both-$$")"; then
+    tmpdirs+=("$rd_retry1d")
+    check "the shared iteration record carries both legs' retries" \
+        "2" "$(jq -r '.iterations[0].retries | length' "$rd_retry1d/review-loop.json" 2>/dev/null)"
+    check "the review leg's retry is labeled review" \
+        "review" "$(jq -r '.iterations[0].retries[0].leg' "$rd_retry1d/review-loop.json" 2>/dev/null)"
+    check "the fix leg's retry is labeled fix" \
+        "fix" "$(jq -r '.iterations[0].retries[1].leg' "$rd_retry1d/review-loop.json" 2>/dev/null)"
+else
+    no "the shared iteration record carries both legs' retries" "launch failed"
 fi
 
 # B2. A review leg and a maintainer leg (a composed pipeline's own step
@@ -3536,6 +3586,27 @@ if rd_retry3="$(run_stubbed --harness claude --model haiku \
         "null" "$(jq -r '.harness_error' "$rd_retry3/summary.json" 2>/dev/null)"
 else
     no "a retried implement leg's run still exits clean" "launch failed"
+fi
+
+# B3-cost. A retried implement leg's failed attempt was not free: its own
+# priced attempt (auth401-cost, $0.02) must join the successful retry's own
+# price ($0.01, the stub's fixed success cost) into cost_usd -- the coding
+# session's own price, which the handoff's "sum leg_cost across all
+# attempts" and "cost is neither lost nor double-counted" both apply to
+# here just as much as to a review/fix leg. total_cost_usd must count the
+# same $0.03 exactly once, since a lone implement leg run has no other leg
+# to add.
+prep_stub $'auth401-cost\ncommit'
+if rd_retry3c="$(run_stubbed --harness claude --model haiku \
+    --branch "sandbox-test-retry-impl-cost-$$")"; then
+    tmpdirs+=("$rd_retry3c")
+    check "the retried implement leg's cost_usd includes the archived attempt" \
+        "0.030000" "$(jq -r '.cost_usd' "$rd_retry3c/summary.json" 2>/dev/null)"
+    check "total_cost_usd counts the archived attempt exactly once" \
+        "0.030000" "$(jq -r '.total_cost_usd' "$rd_retry3c/summary.json" 2>/dev/null)"
+else
+    no "the retried implement leg's cost_usd includes the archived attempt" \
+        "launch failed"
 fi
 
 # B3b. When the implement leg was launched with --session-state and

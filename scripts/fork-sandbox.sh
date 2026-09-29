@@ -640,10 +640,15 @@
 # is a session at that model's price, so N=2 can cost three times a plain
 # run: summary.json's total_cost_usd is the sum of all of them, while
 # cost_usd goes on meaning the coding session alone. When a leg retried, its
-# iteration also carries a `retries` array ({attempt, error, delay_s} per
-# retry, empty otherwise) and its cost sums every attempt, not just the
+# iteration also carries a `retries` array ({attempt, error, delay_s, leg}
+# per retry, empty otherwise) and its cost sums every attempt, not just the
 # last (its usage stays the last attempt's own); summary.json's own
 # `leg_retries` totals every retry the whole run made, coding leg included.
+# `leg` is "review", "maintainer" or "fix" -- the review/maintainer leg and
+# its fix leg(s) share one iteration record, so without it two legs
+# retrying in the same iteration would both write an indistinguishable
+# {attempt: 1, ...}; a fix leg's own element also carries `pass` (which
+# repeat this was) when the fix seat ran more than one.
 #
 # The legs write their own event files (events-review-N.jsonl,
 # events-fix-N.jsonl); events.jsonl stays the coding session's, so --result
@@ -8290,8 +8295,10 @@ rc="$fs_retry_rc"
 impl_leg_retries_count="$fs_retry_count"
 impl_leg_retries_json="$fs_retry_records"
 total_leg_retries=$(( total_leg_retries + impl_leg_retries_count ))
-# Folded into loop_cost_sum once that accumulator exists, below (it is not
-# initialized until just before the refresh loop, well after this point).
+# Folded into run_cost once that is computed, below, the same way a
+# retried review/fix/maintainer leg's archived cost joins its own leg_cost:
+# this is the implement leg's OWN price, not the loop's, so it belongs in
+# cost_usd, not loop_cost_sum.
 impl_leg_retry_extra_cost="$fs_retry_extra_cost"
 # Resume is a continuity optimization for codex too (see claude-sandboxed's
 # own RESUME_FAIL_RE for the analogous claude case, unreachable here because
@@ -8631,6 +8638,23 @@ if [[ "$rc" != "0" ]]; then
     run_error+="$(fs_leg_retry_suffix "${impl_leg_retries_count:-0}")"
 fi
 
+# run_cost above reads only the final attempt (the file left at $events);
+# a retried implement leg's earlier, archived attempts join it here, the
+# same way a retried review/fix/maintainer leg's archived cost joins its
+# own leg_cost below -- so a leg that burned a retry is not billed as if
+# it had not.
+if [[ ! "$run_cost" =~ ^-?[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?$ ]]; then
+    run_cost=""
+fi
+if [[ -n "${impl_leg_retry_extra_cost:-}" ]]; then
+    if [[ -n "$run_cost" ]]; then
+        run_cost="$(jq -n --argjson a "$run_cost" --argjson b "$impl_leg_retry_extra_cost" \
+            '$a + $b' 2>/dev/null)"
+    else
+        run_cost="$impl_leg_retry_extra_cost"
+    fi
+fi
+
 # Format once, here, and record it where a caller can read it without
 # parsing prose. %.6f rather than the raw number: a sum of floats carries
 # noise, and a cheap run is small enough that jq hands back scientific
@@ -8679,17 +8703,10 @@ fi
 # accumulator, so total_cost_usd at the very end is never short a leg.
 loop_cost_sum=0
 loop_cost_unknown=0
-# A retried implement leg's own archived attempts are priced separately from
-# run_cost above (which reads only the final attempt's events) -- fold them
-# in here, the same accumulator every later leg's retries join too.
-if [[ -n "${impl_leg_retry_extra_cost:-}" ]]; then
-    loop_cost_sum="$(jq -n --argjson a "$loop_cost_sum" --argjson b "$impl_leg_retry_extra_cost" \
-        '$a + $b' 2>/dev/null)"
-    if [[ -z "$loop_cost_sum" ]]; then
-        loop_cost_sum=0
-        loop_cost_unknown=1
-    fi
-fi
+# The implement leg's own retried attempts do NOT join this accumulator:
+# their cost is already folded into run_cost above, and total_cost_usd
+# below adds run_cost_fmt and loop_cost_sum together, so counting them
+# here too would bill the run twice for the same retry.
 
 # ---------------------------------------------------------------- refresh --
 # --refresh-at: when a coding leg's own context crossed the threshold,
@@ -9667,7 +9684,13 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count && stop_requested != 1; cur
             cur_save_live
         fi
         run_leg "$cur_kind" "$cur_i" "$cur_prompt_iter" "$cur_step_idx"
-        cur_retries="${leg_retries_json:-[]}"
+        # Tag with which leg retried: the review/maintainer leg and the fix
+        # leg(s) below both fold their own retries into this one array, and
+        # without a label a reader cannot tell a review retry's {attempt: 1}
+        # from a fix retry's own {attempt: 1} in the same iteration.
+        cur_retries="$(jq -cn --argjson a "${leg_retries_json:-[]}" --arg leg "$cur_kind" \
+            '$a | map(. + {leg: $leg})' 2>/dev/null)"
+        [[ -n "$cur_retries" ]] || cur_retries='[]'
         cur_review_exit="$leg_rc"; cur_review_cost="${leg_cost:-null}"; cur_review_usage="${leg_usage:-null}"; cur_fix_exit=null; cur_fix_cost=null; cur_fix_usage=null; cur_findings=null; cur_before="$cur_head"; cur_after=""
         [[ "$cur_legacy" == 1 ]] && cur_save_live
         if [[ "$cur_legacy" == 1 ]]; then
@@ -9764,7 +9787,15 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count && stop_requested != 1; cur
                                 # $updated stuck at the preceding review leg's write.
                                 progress_write running
                                 run_leg "$cur_fix_kind" "$cur_fix_leg" "$cur_fix_prompt"
-                                cur_retries="$(jq -cn --argjson a "$cur_retries" --argjson b "${leg_retries_json:-[]}" '$a + $b' 2>/dev/null)"
+                                # Tag this pass's own retries "fix" (never
+                                # $cur_fix_kind's internal mntfix spelling,
+                                # to match the shape documented at the
+                                # review/maintainer leg's own tag above) plus
+                                # which pass, so a multi-pass repeat's
+                                # retries don't collide with each other or
+                                # with the review/maintainer leg's.
+                                cur_retries="$(jq -cn --argjson a "$cur_retries" --argjson b "${leg_retries_json:-[]}" --argjson pass "$cur_fix_pass" \
+                                    '$a + ($b | map(. + {leg: "fix", pass: $pass}))' 2>/dev/null)"
                                 [[ -n "$cur_retries" ]] || cur_retries='[]'
                                 cur_fix_exit="$leg_rc"
                                 progress_write running
@@ -9820,7 +9851,12 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count && stop_requested != 1; cur
                         # reason as the legacy fix block above.
                         progress_write running
                         run_leg fix "$cur_fix_leg" "$cur_fix_prompt" "$cur_step_idx"; cur_fix_exit="$leg_rc"
-                        cur_retries="$(jq -cn --argjson a "$cur_retries" --argjson b "${leg_retries_json:-[]}" '$a + $b' 2>/dev/null)"
+                        # Same tag as the legacy fix block above: "fix" plus
+                        # which pass, so this leg's retries never collide
+                        # with the review/maintainer leg's in the same
+                        # iteration record.
+                        cur_retries="$(jq -cn --argjson a "$cur_retries" --argjson b "${leg_retries_json:-[]}" --argjson pass "$cur_fix_pass" \
+                            '$a + ($b | map(. + {leg: "fix", pass: $pass}))' 2>/dev/null)"
                         [[ -n "$cur_retries" ]] || cur_retries='[]'
                         progress_write running
                         if [[ -n "$leg_cost" ]]; then

@@ -490,9 +490,12 @@ fresh (see "The loop stops on the first of four things" near the top of
 `fork-sandbox.sh` for what counts); each failed attempt's own events file
 is archived beside the leg's own, as `<name>.jsonl.attempt<k>`, so the file
 at the leg's ordinary name always holds its last attempt. The iteration
-record gains a `retries` array (`{attempt, error, delay_s}` per retry,
-empty when the leg never retried), and its cost sums every attempt rather
-than only the last one.
+record gains a `retries` array (`{attempt, error, delay_s, leg}` per
+retry, empty when the leg never retried), and its cost sums every attempt
+rather than only the last one. The review/maintainer leg and its fix
+leg(s) share one iteration record, so `leg` (`"review"`, `"maintainer"` or
+`"fix"`) says which leg each element belongs to; a fix leg's own element
+also carries `pass` when the fix seat's `repeat` ran more than one.
 
 Note that a composed step's saved loop record always uses the `review_model`/
 `review_harness` field names, even for a `maintain` step — only a
