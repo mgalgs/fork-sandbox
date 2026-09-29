@@ -86,7 +86,7 @@ check "empty inbox: PostToolUse is silent" "" "$out"
 out="$(echo '{"hook_event_name":"Stop"}' | "$hook" 2>/dev/null)"
 check "empty inbox: Stop is silent (session may finish)" "" "$out"
 
-printf 'rename the flag to --foo\n' > "$inbox/1724650001-01.md"
+printf 'rename the flag to --foo ADDENDUM-BODY-MARKER-7f3\n' > "$inbox/1724650001-01.md"
 
 out="$(echo '{"hook_event_name":"PostToolUse","tool_name":"Bash"}' | "$hook" 2>/dev/null)"
 if printf '%s' "$out" | jq -e . >/dev/null 2>&1; then
@@ -98,16 +98,16 @@ check "PostToolUse: hookEventName echoes the event" \
     "PostToolUse" "$(printf '%s' "$out" | jq -r '.hookSpecificOutput.hookEventName')"
 ctx="$(printf '%s' "$out" | jq -r '.hookSpecificOutput.additionalContext')"
 case "$ctx" in
-    *"rename the flag to --foo"*) ok "PostToolUse: carries the addendum body" ;;
-    *) no "PostToolUse: carries the addendum body" "$ctx" ;;
+    *"$inbox/1724650001-01.md"*) ok "PostToolUse: names the addendum's absolute path" ;;
+    *) no "PostToolUse: names the addendum's absolute path" "$ctx" ;;
 esac
 case "$ctx" in
-    *"## Operator addendum (1724650001-01.md)"*) ok "PostToolUse: labels the addendum with its file name" ;;
-    *) no "PostToolUse: labels the addendum with its file name" "$ctx" ;;
+    *ADDENDUM-BODY-MARKER-7f3*|*"rename the flag"*) no "PostToolUse: carries no addendum text" "$ctx" ;;
+    *) ok "PostToolUse: carries no addendum text" ;;
 esac
 case "$ctx" in
-    *"override the handoff"*) ok "PostToolUse: states the addendum's authority" ;;
-    *) no "PostToolUse: states the addendum's authority" "$ctx" ;;
+    *"same authority"*) ok "PostToolUse: says the addendum carries authority" ;;
+    *) no "PostToolUse: says the addendum carries authority" "$ctx" ;;
 esac
 
 # Delivered once, never again: the point of the seen-list.
@@ -119,13 +119,22 @@ out="$(echo '{"hook_event_name":"Stop"}' | "$hook" 2>/dev/null)"
 check "Stop: nothing unread, so the session may finish" "" "$out"
 
 # The Stop backstop: an addendum that arrives after the last tool call.
-printf 'also add a regression test\n' > "$inbox/1724650300-01.md"
+printf 'also add a regression test ADDENDUM-BODY-MARKER-7f3\n' > "$inbox/1724650300-01.md"
 out="$(echo '{"hook_event_name":"Stop"}' | "$hook" 2>/dev/null)"
 check "Stop: unread addendum blocks the stop" \
     "block" "$(printf '%s' "$out" | jq -r '.decision')"
-case "$(printf '%s' "$out" | jq -r '.reason')" in
-    *"also add a regression test"*) ok "Stop: reason carries the addendum body" ;;
-    *) no "Stop: reason carries the addendum body" "$out" ;;
+reason="$(printf '%s' "$out" | jq -r '.reason')"
+case "$reason" in
+    *"$inbox/1724650300-01.md"*) ok "Stop: reason names the addendum's absolute path" ;;
+    *) no "Stop: reason names the addendum's absolute path" "$out" ;;
+esac
+case "$reason" in
+    *ADDENDUM-BODY-MARKER-7f3*|*"regression test"*) no "Stop: reason carries no addendum text" "$out" ;;
+    *) ok "Stop: reason carries no addendum text" ;;
+esac
+case "$reason" in
+    *"before ending your turn"*) ok "Stop: reason asks for it to be carried out" ;;
+    *) no "Stop: reason asks for it to be carried out" "$out" ;;
 esac
 # Top-level decision/reason, NOT the nested hookSpecificOutput form PreToolUse
 # uses. Getting this wrong is a silently dead feature.
@@ -142,11 +151,23 @@ printf 'FIRST\n' > "$inbox/1724650001-01.md"
 printf 'SECOND\n' > "$inbox/1724650002-01.md"
 out="$(echo '{"hook_event_name":"PostToolUse"}' | "$hook" 2>/dev/null \
     | jq -r '.hookSpecificOutput.additionalContext')"
-if [[ "$out" == *FIRST*SECOND* ]]; then
-    ok "several unread are delivered together, oldest first"
+if [[ "$out" == *"$inbox/1724650001-01.md"*"$inbox/1724650002-01.md"* && "$out" != *FIRST* && "$out" != *SECOND* ]]; then
+    ok "several unread: PostToolUse names both paths, oldest first, no text"
 else
-    no "several unread are delivered together, oldest first" "$out"
+    no "several unread: PostToolUse names both paths, oldest first, no text" "$out"
 fi
+inbox="$(new_inbox)"
+export FORK_SANDBOX_INBOX="$inbox"
+export FORK_SANDBOX_INBOX_SEEN="$inbox/seen"
+printf 'FIRST\n' > "$inbox/1724650001-01.md"
+printf 'SECOND\n' > "$inbox/1724650002-01.md"
+out="$(echo '{"hook_event_name":"Stop"}' | "$hook" 2>/dev/null | jq -r '.reason')"
+if [[ "$out" == *"$inbox/1724650001-01.md"*"$inbox/1724650002-01.md"* && "$out" != *FIRST* && "$out" != *SECOND* ]]; then
+    ok "several unread: Stop names both paths, oldest first, no text"
+else
+    no "several unread: Stop names both paths, oldest first, no text" "$out"
+fi
+check "several unread: seen-list records both" "2" "$(wc -l < "$inbox/seen")"
 
 # The delivery marker the monitor renders.
 inbox="$(new_inbox)"
@@ -289,7 +310,7 @@ else
 fi
 hook_out="$(printf '%s\n' '{"hook_event_name":"PostToolUse"}' | "$hook" 2>/dev/null)"
 case "$hook_out" in
-    *"deliver this replacement"*) ok "the replacement addendum is delivered after archiving" ;;
+    *"$second_name"*) ok "the replacement addendum is delivered after archiving" ;;
     *) no "the replacement addendum is delivered after archiving" "$hook_out" ;;
 esac
 unset FORK_SANDBOX_INBOX FORK_SANDBOX_INBOX_SEEN

@@ -11,18 +11,21 @@
 # same thread it was woken for. This script is what puts either kind of file
 # in front of the running session.
 #
-#   PostToolUse  every unread addendum or mail banner is emitted as
+#   PostToolUse  every unread addendum or mail banner is announced as
 #                hookSpecificOutput.additionalContext, which Claude Code
 #                places next to the tool result. So it reaches the session
 #                on its very next tool call, with no cooperation from the
-#                session itself. A mail banner's context is banner-only: a
+#                session itself. An addendum is announced by a pointer: a
+#                short notice naming its file in the inbox, with none of
+#                its text; the session reads the file itself. A mail banner's context is banner-only: a
 #                one-line summary (short-id, From, Subject, a body preview)
 #                plus the in-sandbox path of the full rendered thread — the
 #                thread file's content is never injected, reading it is the
 #                agent's own choice.
 #   Stop         unread addenda AND unread mail banners both block the stop
-#                with decision/reason, so an agent that has gone quiet and is
-#                about to finish gets them too. This is the delivery
+#                with decision/reason (an addendum again as a pointer to its
+#                file), so an agent that has gone quiet and is about to
+#                finish gets them too. This is the delivery
 #                guarantee: a session cannot end with either kind unread.
 #
 # Both contracts are the documented ones (code.claude.com/docs/en/hooks):
@@ -383,11 +386,10 @@ fi
 (( stale_block )) && : > "$stale_reminded_marker"
 
 names=""
-body=""
+paths=""
 for name in "${unread[@]}"; do
     names+="${names:+, }$name"
-    body+=$'\n'"## Operator addendum ($name)"$'\n\n'
-    body+="$(cat -- "$inbox/$name")"$'\n'
+    paths+=$'\n'"$inbox/$name"
 done
 
 mail_names=""
@@ -398,20 +400,11 @@ for name in "${unread_mail[@]}"; do
     mail_body+="$(cat -- "$inbox/$name")"$'\n'
 done
 
-# Say what an addendum IS, every time. Two things have to be established, and
-# leaving either out has been observed to break delivery:
-#
-#   Provenance. On the PostToolUse path the text lands next to a tool result,
-#   which is where injected content comes from, and an addendum that changes
-#   course reads exactly like an injection attempt. A session that treats it
-#   as one reports the text to the operator instead of acting on it — measured,
-#   not theorized. So state where it actually came from: the run's inbox is a
-#   host-side directory mounted read-only, which only the operator can write.
-#
-#   Authority. Without it a session reads a course correction as a footnote to
-#   the handoff and carries on with the original plan.
-provenance="This text is not tool output and did not come from the repository. It was written by the operator who launched this run and wrote your handoff, and it arrived over that run's operator inbox — a host-side directory mounted read-only here, which nothing inside this sandbox can write to."
-authority="An addendum is a continuation of your handoff and carries the same authority: it may override the handoff rather than merely add to it. Where the two conflict, the addendum is the newer instruction and takes precedence."
+# An addendum is delivered as a pointer, never as text. Text beside a tool
+# result reads as injection however it is framed, and a self-certifying
+# provenance line is what an injection would say too. The brief names the
+# inbox, so the leg reads the file from a path its trusted prompt vouched for.
+addendum_pointer="An operator addendum has arrived in this run's operator inbox, the directory your brief describes under \"Operator inbox\". It is a continuation of your handoff with the same authority, as your brief explains; this notice only tells you it is there."
 
 # Mail delivered mid-session gets its own provenance/authority pair, distinct
 # from an addendum's: it is new information from the fork-sandbox postmaster,
@@ -463,8 +456,7 @@ case "$event" in
         # a leg is never trapped.
         reason=""
         if (( ${#unread[@]} )); then
-            reason+="An operator addendum to your handoff arrived before you finished, and you have not acted on it yet. $provenance $authority Read it below and carry it out before ending the turn.
-$body"
+            reason+="$addendum_pointer Read it and carry it out before ending your turn. Read it now: $paths"
         fi
         if [[ -n "$nudge_text" ]]; then
             reason+=$'\n\n'"$nudge_text"
@@ -483,8 +475,7 @@ $body"
     *)
         context=""
         if (( ${#unread[@]} )); then
-            context+="Operator addendum to your handoff, from this fork-sandbox run's inbox. $provenance $authority
-$body"
+            context+="$addendum_pointer Read it now, before your next step: $paths"
         fi
         if [[ -n "$nudge_text" ]]; then
             context+=$'\n\n'"$nudge_text"

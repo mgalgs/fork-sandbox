@@ -4012,10 +4012,10 @@ if grep -q 'inbox-hook.sh: |' "$claude_submit_out"; then
 else
     no "rendered ConfigMap carries the inbox-hook.sh key" "not found in $claude_submit_out"
 fi
-if grep -qF 'Addenda are pushed to you automatically' "$claude_submit_out"; then
-    ok "rendered handoff.md preamble is worded for the claude harness (pushed, not polled)"
+if grep -qF 'naming its file in this directory' "$claude_submit_out"; then
+    ok "rendered handoff.md preamble is worded for the claude harness (a pointer, not polled)"
 else
-    no "rendered handoff.md preamble is worded for the claude harness (pushed, not polled)" \
+    no "rendered handoff.md preamble is worded for the claude harness (a pointer, not polled)" \
         "not found in $claude_submit_out"
 fi
 if grep -q 'name: HARNESS' "$claude_submit_out" \
