@@ -39,7 +39,10 @@ read.
 --text is the agent view: oldest-first, a '---' separator line between
 messages, reply nesting shown by indentation, headers abbreviated to
 Message-ID/From/To/Cc/Subject/hops (deliberately no Date, to save prompt
-tokens); From carries a bracketed [X-AI-* attribution] suffix when the
+tokens), plus an 'Upstream-Head: <branch> <sha>' line, right after Hops, on
+a message carrying X-Upstream-Head (`mail reply --upstream-head`: the
+upstream moved to that commit -- the only X-* header shown, because a seat
+has to see it to act on it); From carries a bracketed [X-AI-* attribution] suffix when the
 message has one (see attribution_str), byte-identical to before that
 existed when it doesn't. The Message-ID is included even though nothing
 else needs it, because it is the handle every id-taking verb (reply
@@ -173,6 +176,7 @@ def parse_msg(path, seq, fn, newline=None):
         "cc": hdr.get("Cc", ""),
         "subject": hdr.get("Subject", ""),
         "hops": hdr.get("X-Hops", ""),
+        "upstream_head": hdr.get("X-Upstream-Head", ""),
         "attachments": attachments,
         "headers": header_lines,
         "body": body,
@@ -589,6 +593,8 @@ def render_text_message(e, depth, orphaned, is_error, out):
         out.append(f"{indent}Cc: {e['cc']}")
     out.append(f"{indent}Subject: {e['subject']}")
     out.append(f"{indent}Hops: {e['hops']}")
+    if e["upstream_head"]:
+        out.append(f"{indent}Upstream-Head: {e['upstream_head']}")
     if e["attachments"]:
         out.append(f"{indent}Attachments: " + ", ".join(e["attachments"]))
     out.append("")

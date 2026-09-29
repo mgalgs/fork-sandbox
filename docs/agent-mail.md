@@ -791,6 +791,12 @@ home). The persona may reset its wake branch to `upstream` and post
 that is not a descendant of the previous one (the human rebased or
 squashed) is accepted and recorded as is.
 
+The seat sees the announcement in its thread view: `mail-render --text`
+prints an `Upstream-Head: <branch> <sha>` line right after `Hops:` for a
+message carrying `X-Upstream-Head` (the only `X-*` header it shows). Like
+every header line it is unquoted, while a body line reading
+`Upstream-Head: ...` renders `> `-quoted, so a body cannot forge one.
+
 Local (non-k8s) seats get no `upstream` branch: the postmaster only logs an
 `upstream-head-local-seat` event when a local `sets` seat wakes on a
 thread with an upstream-head file.

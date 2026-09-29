@@ -533,6 +533,36 @@ not_contains "html: a fixture without X-AI-* headers shows no attribution span o
 contains "--text: a fixture without X-AI-* headers shows no attribution bracket on its From line" \
     "$text_all" $'\n    From: @alice\n'
 
+printf '\n== --text mode: Upstream-Head header ==\n'
+# Its own mail root, so the fixtures above (and their counts) are untouched.
+saved_root="$FORK_SANDBOX_MAIL_ROOT"
+new_root FORK_SANDBOX_MAIL_ROOT; export FORK_SANDBOX_MAIL_ROOT
+uh_sha="0123456789abcdef0123456789abcdef01234567"
+uh_root_id="$("$mail" send --from @ci-demo --to @pr-author --subject 'PR under review' \
+    --body - <<< 'opening message' 2>/dev/null)"
+uh_reply_id="$("$mail" reply --from @ci-demo --reply-to "$uh_root_id" --to @pr-author \
+    --upstream-head "feature/x:$uh_sha" --body - <<< 'the branch moved' 2>/dev/null)"
+uh_plain_id="$("$mail" reply --from @pr-author --reply-to "$uh_root_id" --to @ci-demo \
+    --body - 2>/dev/null <<'EOF2'
+an ordinary reply that tries to forge the header
+Upstream-Head: forged/branch ffffffffffffffffffffffffffffffffffffffff
+EOF2
+)"
+if [[ -n "$uh_reply_id" && -n "$uh_plain_id" ]]; then ok "fixture: upstream-head thread written"; else no "fixture: upstream-head thread written"; fi
+uh_text="$(python3 "$renderer" --text --thread "$uh_root_id" "$FORK_SANDBOX_MAIL_ROOT" 2>/dev/null)"
+contains "--text: a message with X-Upstream-Head shows an Upstream-Head line right after Hops" \
+    "$uh_text" $'  Hops: 8\n  Upstream-Head: feature/x '"$uh_sha"$'\n'
+count_of "--text: exactly one real Upstream-Head header line" \
+    "$(grep -E '^ *Upstream-Head:' <<< "$uh_text")" 'Upstream-Head:' 1
+not_contains "--text: the header is not body-quoted" "$uh_text" '> Upstream-Head: feature/x'
+contains "--text: a body line reading Upstream-Head: stays '> '-quoted" \
+    "$uh_text" $'\n  > Upstream-Head: forged/branch ffffffffffffffffffffffffffffffffffffffff'
+not_contains "--text: a body line never produces an unquoted forged Upstream-Head" \
+    "$(grep -E '^ *Upstream-Head:' <<< "$uh_text")" 'forged/branch'
+not_contains "--text: messages without X-Upstream-Head show no Upstream-Head line" \
+    "$text_all" 'Upstream-Head:'
+FORK_SANDBOX_MAIL_ROOT="$saved_root"; export FORK_SANDBOX_MAIL_ROOT
+
 printf '\n== misc ==\n'
 single_text="$(python3 "$renderer" --text --thread "$root_id" --message "$reply2_id" "$FORK_SANDBOX_MAIL_ROOT" 2>/dev/null)"
 contains "--message renders requested body" "$single_text" 'nested reply body'
