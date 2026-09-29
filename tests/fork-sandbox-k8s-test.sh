@@ -343,6 +343,21 @@ set -uo pipefail
 # Keep git fixtures independent of the operator's global and system config.
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
 
+# cmd_submit and cmd_wait's keeper both resolve a host claude binary via
+# PATH, exactly like claude-sandboxed does (command -v claude, then
+# ~/.local/bin/claude) -- so a machine running this suite that happens to
+# have the real claude CLI installed (a developer's own workstation) would
+# otherwise turn every near-expiry credential fixture below into a live,
+# slow, network-bound OAuth refresh attempt instead of the deterministic
+# no-op these tests need. Restricted to system tool directories only: every
+# external tool the suite uses (git, jq, kubectl, yamllint, docker, the
+# static-analysis linter) lives in one of these, and none of them is a
+# plausible home for a personal claude install. Any test that DOES want
+# to exercise the
+# refresh path stages its own stub claude and prepends its directory
+# explicitly (PATH="$stub_dir:$PATH"), which still wins over this.
+export PATH=/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin
+
 repo_dir="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 
 # Every run this suite launches is a fixture, not real work. Mark its row so
@@ -3719,6 +3734,85 @@ else
     no "rendered claude-proxy Pod mounts this run's own claude-token Secret" \
         "not found in $claude_submit_out"
 fi
+# The claude-proxy Pod's own document, isolated from the ConfigMap/Service/
+# NetworkPolicy docs around it in the same --dry-run stream -- so the
+# checks below can tell "the nginx container has no Secret mount" apart
+# from "no Secret mount ANYWHERE in this whole rendered YAML", which would
+# be trivially true of the ConfigMap doc too.
+claude_proxy_pod_doc="$(awk -v name="$claude_run_name-claude-proxy" '
+    $0 == "kind: Pod" { pod = 1 }
+    pod && $0 == "  name: " name { active = 1 }
+    /^---$/ { if (active) exit; pod = 0; active = 0; next }
+    active { print }
+' "$claude_submit_out")"
+if [[ -n "$claude_proxy_pod_doc" ]]; then
+    ok "the claude-proxy Pod's own document is isolable in the rendered manifest"
+else
+    no "the claude-proxy Pod's own document is isolable in the rendered manifest" \
+        "not found in $claude_submit_out"
+fi
+# The key nginx includes lives in a writable emptyDir, seeded once from the
+# Secret by an initContainer, never mounted straight into the main
+# container -- see manifests/k8s/31-claude-proxy.yaml's own header for why
+# (kubelet never propagates a Secret update into a subPath mount, and
+# there is no mechanism to reload nginx from one anyway).
+if grep -qF 'initContainers:' <<< "$claude_proxy_pod_doc" \
+    && grep -qF 'name: seed-key' <<< "$claude_proxy_pod_doc"; then
+    ok "the claude-proxy Pod carries a seed-key initContainer"
+else
+    no "the claude-proxy Pod carries a seed-key initContainer" "$claude_proxy_pod_doc"
+fi
+if grep -qF 'include /etc/nginx/key/upstream-key.conf' "$claude_submit_out"; then
+    ok "nginx.conf includes the key from the writable emptyDir path"
+else
+    no "nginx.conf includes the key from the writable emptyDir path" \
+        "not found in $claude_submit_out"
+fi
+# The main (nginx) container's own volumeMounts block, isolated from the
+# initContainer's -- both mount something at /etc/nginx/key-ish paths, and
+# the whole point is that only the INIT container ever touches the Secret.
+claude_proxy_main_mounts="$(awk '
+    /^    - name: nginx$/ { main = 1 }
+    main && /^    - name: [a-z-]+$/ && $0 != "    - name: nginx" { exit }
+    main { print }
+' <<< "$claude_proxy_pod_doc")"
+if grep -qF 'name: key-secret' <<< "$claude_proxy_main_mounts"; then
+    no "the main nginx container mounts no Secret volume directly" \
+        "found a key-secret mount in the nginx container: $claude_proxy_main_mounts"
+else
+    ok "the main nginx container mounts no Secret volume directly"
+fi
+if grep -qF 'name: key' <<< "$claude_proxy_main_mounts" \
+    && ! grep -A2 'name: key$' <<< "$claude_proxy_main_mounts" | grep -qF 'readOnly: true'; then
+    ok "the main nginx container's key mount is writable (no readOnly: true)"
+else
+    no "the main nginx container's key mount is writable (no readOnly: true)" \
+        "$claude_proxy_main_mounts"
+fi
+# The Secret volume still exists (feeding the initContainer) and the
+# writable key emptyDir exists too.
+if grep -qF 'name: key-secret' <<< "$claude_proxy_pod_doc" \
+    && grep -qF "secretName: $claude_run_name-claude-token" <<< "$claude_proxy_pod_doc" \
+    && grep -A1 '^    - name: key$' <<< "$claude_proxy_pod_doc" | grep -qF 'emptyDir: {}'; then
+    ok "the claude-proxy Pod declares both the key-secret Secret volume and the writable key emptyDir"
+else
+    no "the claude-proxy Pod declares both the key-secret Secret volume and the writable key emptyDir" \
+        "$claude_proxy_pod_doc"
+fi
+# Every hardening field survives on BOTH containers: non-root at the Pod
+# level, and no-escalation/read-only-rootfs/drop-ALL on each container's
+# own securityContext (the initContainer's included).
+claude_proxy_seccontexts="$(grep -c 'allowPrivilegeEscalation: false' <<< "$claude_proxy_pod_doc")"
+claude_proxy_rofs="$(grep -c 'readOnlyRootFilesystem: true' <<< "$claude_proxy_pod_doc")"
+claude_proxy_dropall="$(grep -c 'drop: \["ALL"\]' <<< "$claude_proxy_pod_doc")"
+if [[ "$claude_proxy_seccontexts" == 2 && "$claude_proxy_rofs" == 2 && "$claude_proxy_dropall" == 2 ]] \
+    && grep -qF 'runAsNonRoot: true' <<< "$claude_proxy_pod_doc" \
+    && grep -qF 'runAsUser: 101' <<< "$claude_proxy_pod_doc"; then
+    ok "every hardening field (non-root, no escalation, read-only rootfs, drop ALL) survives on both containers"
+else
+    no "every hardening field (non-root, no escalation, read-only rootfs, drop ALL) survives on both containers" \
+        "escalation=$claude_proxy_seccontexts rofs=$claude_proxy_rofs dropall=$claude_proxy_dropall doc: $claude_proxy_pod_doc"
+fi
 if grep -qF 'location = /v1/messages {' "$claude_submit_out" \
     && grep -qF 'location = /v1/messages/count_tokens {' "$claude_submit_out"; then
     ok "rendered claude-proxy nginx.conf forwards exactly the two v1/messages paths"
@@ -3807,6 +3901,13 @@ if grep -q 'refreshToken' <<< "$claude_creds_block"; then
         "found 'refreshToken' in: $claude_creds_block"
 else
     ok "rendered claude-credentials.json carries no refreshToken"
+fi
+if grep -qF '"expiresAt": 4102444800000' <<< "$claude_creds_block" \
+    && ! grep -qF "\"expiresAt\": $claude_future_ms" <<< "$claude_creds_block"; then
+    ok "rendered claude-credentials.json carries the far-future placeholder expiresAt"
+else
+    no "rendered claude-credentials.json carries the far-future placeholder expiresAt" \
+        "block: $claude_creds_block"
 fi
 if grep -qF "$claude_fixture_token" "$claude_submit_out"; then
     no "the rendered YAML never contains the fixture's real access token" \
@@ -4845,6 +4946,96 @@ refuses "a credential expiring within 5 minutes is refused (the pod cannot refre
     env HOME="$claude_home_floor" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
     --branch fs-k8s-test-branch --model claude-sonnet-5 --harness claude \
     "$proj_dir" "$handoff_file"
+
+printf '\n== fork-sandbox-k8s.sh submit: fs_claude_refresh_if_needed ==\n'
+# A stub claude that speaks just enough of the real contract for
+# fs_claude_refresh_if_needed's own validation to accept its result: any
+# invocation writes a fresh accessToken/refreshToken/expiresAt into
+# whatever $CLAUDE_CONFIG_DIR/.credentials.json it is pointed at (real
+# claude's own scratch-dir dance, mirrored exactly by
+# fork-sandbox-claude-token-refresh-test.sh's own stub). Every call is
+# logged, so "was the stub invoked at all" is a plain grep.
+refresh_stub_dir="$(newdir)"; tmpdirs+=("$refresh_stub_dir")
+cat > "$refresh_stub_dir/claude" <<'STUB'
+#!/usr/bin/env bash
+[[ -n "${STUB_CALL_LOG:-}" ]] && printf '%s\n' "$*" >> "$STUB_CALL_LOG"
+if [[ "${1:-}" == --version ]]; then
+    printf '9.9.9-test-stub\n'
+    exit 0
+fi
+cred="${CLAUDE_CONFIG_DIR:-}/.credentials.json"
+[[ -f "$cred" ]] || exit 0
+jq --arg at "refreshed-access-token" --arg rt "refreshed-refresh-token" \
+    --argjson exp "$(( ($(date +%s) + 999999) * 1000 ))" \
+    '.claudeAiOauth.accessToken = $at | .claudeAiOauth.refreshToken = $rt | .claudeAiOauth.expiresAt = $exp' \
+    "$cred" > "$cred.tmp" 2>/dev/null && mv "$cred.tmp" "$cred"
+exit 0
+STUB
+chmod +x "$refresh_stub_dir/claude"
+
+# < 120m remaining: fs_claude_refresh_if_needed actually calls the stub
+# (`claude mcp list`) and the refresh lands in the HOST's own credential
+# file. The contract probe is pre-seeded as already-passed for this fake
+# version, so its own several `mcp list` calls (fork-sandbox-claude-token-
+# probe's checks) never show up in the call log and get mistaken for the
+# real refresh's own call.
+refresh_home1="$(newdir)"; tmpdirs+=("$refresh_home1")
+mkdir -p "$refresh_home1/.claude"
+refresh_soon_ms=$(( ($(date +%s) + 3000) * 1000 ))
+cat > "$refresh_home1/.claude/.credentials.json" <<JSON
+{"claudeAiOauth": {"accessToken": "orig-token", "refreshToken": "orig-refresh", "expiresAt": $refresh_soon_ms, "scopes": ["user:inference"]}}
+JSON
+refresh_calllog1="$(newdir)/calls.log"; tmpdirs+=("$(dirname "$refresh_calllog1")")
+refresh_contract_dir1="$(newdir)"; tmpdirs+=("$refresh_contract_dir1")
+touch "$refresh_contract_dir1/9.9.9-test-stub.ok"
+PATH="$refresh_stub_dir:$PATH" HOME="$refresh_home1" \
+    STUB_CALL_LOG="$refresh_calllog1" FS_CLAUDE_TOKEN_CONTRACT_DIR="$refresh_contract_dir1" \
+    FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-refresh-soon --model claude-sonnet-5 --harness claude \
+    "$proj_dir" "$handoff_file" >/dev/null 2>/tmp/fs-k8s-test-refresh1.err
+if grep -qF 'mcp list' "$refresh_calllog1" 2>/dev/null; then
+    ok "submit refreshes the host credential when less than 120m remain"
+else
+    no "submit refreshes the host credential when less than 120m remain" \
+        "call log: $(cat "$refresh_calllog1" 2>/dev/null) err: $(cat /tmp/fs-k8s-test-refresh1.err)"
+fi
+if grep -qF 'refreshed-access-token' "$refresh_home1/.claude/.credentials.json"; then
+    ok "the refreshed token actually lands in the host's own credential file"
+else
+    no "the refreshed token actually lands in the host's own credential file" \
+        "$(cat "$refresh_home1/.claude/.credentials.json")"
+fi
+rm -f /tmp/fs-k8s-test-refresh1.err
+
+# >= 120m remaining: fs_claude_refresh_if_needed is a silent no-op -- the
+# stub is never invoked, and the credential file is untouched.
+refresh_home2="$(newdir)"; tmpdirs+=("$refresh_home2")
+mkdir -p "$refresh_home2/.claude"
+refresh_far_ms=$(( ($(date +%s) + 21600) * 1000 ))
+cat > "$refresh_home2/.claude/.credentials.json" <<JSON
+{"claudeAiOauth": {"accessToken": "orig-token", "refreshToken": "orig-refresh", "expiresAt": $refresh_far_ms, "scopes": ["user:inference"]}}
+JSON
+refresh_calllog2="$(newdir)/calls.log"; tmpdirs+=("$(dirname "$refresh_calllog2")")
+refresh_contract_dir2="$(newdir)"; tmpdirs+=("$refresh_contract_dir2")
+touch "$refresh_contract_dir2/9.9.9-test-stub.ok"
+PATH="$refresh_stub_dir:$PATH" HOME="$refresh_home2" \
+    STUB_CALL_LOG="$refresh_calllog2" FS_CLAUDE_TOKEN_CONTRACT_DIR="$refresh_contract_dir2" \
+    FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-refresh-far --model claude-sonnet-5 --harness claude \
+    "$proj_dir" "$handoff_file" >/dev/null 2>/tmp/fs-k8s-test-refresh2.err
+if grep -qF 'mcp list' "$refresh_calllog2" 2>/dev/null; then
+    no "submit never refreshes when 120m or more remain" \
+        "call log: $(cat "$refresh_calllog2" 2>/dev/null)"
+else
+    ok "submit never refreshes when 120m or more remain"
+fi
+if grep -qF 'orig-token' "$refresh_home2/.claude/.credentials.json"; then
+    ok "the credential file is untouched when no refresh was needed"
+else
+    no "the credential file is untouched when no refresh was needed" \
+        "$(cat "$refresh_home2/.claude/.credentials.json")"
+fi
+rm -f /tmp/fs-k8s-test-refresh2.err
 
 printf '\n== fork-sandbox-k8s.sh rm removes the per-run claude-proxy objects ==\n'
 # No live cluster here (see this file's own header), so `rm`'s kubectl
@@ -6274,6 +6465,45 @@ else
     no "resume on a still-running run waits, then collects" "rc=$rc out=$(cat "$resume_out_b")"
 fi
 
+# resume (and run, through the same k8s_run_tail) must hand cmd_wait
+# --run-dir, or a claude run gets no keeper at all. Driven through the
+# real `$(cmd_wait ...)` subshell, not a top-level `wait`; the real 10s
+# poll interval gives the keeper time to push before the second poll
+# completes the run.
+resume_rd_k="$(resume_submit fs-k8s-test-resume-keeper)"
+resume_cred_k="$resume_rd_k/credentials.json"
+jq -n --arg at resume-keeper-tok --argjson exp "$(( ($(date +%s) + 21600) * 1000 ))" \
+    '{claudeAiOauth: {accessToken: $at, refreshToken: "rt", expiresAt: $exp}}' > "$resume_cred_k"
+sed -i 's/^harness=.*/harness=claude/' "$resume_rd_k/run.env"
+printf 'CLAUDE_CREDENTIAL_PATH=%s\n' "$resume_cred_k" >> "$resume_rd_k/run.env"
+resume_log_k="$(newdir)/kubectl.log"; resume_out_k="$(dirname "$resume_log_k")/out.txt"
+tmpdirs+=("$(dirname "$resume_log_k")")
+rc=0
+K8S_STUB_RUN_COMPLETE_AFTER=1 K8S_STUB_COUNTER="$(dirname "$resume_log_k")/count" \
+    runstub_verb "$resume_log_k" "$resume_out_k" resume --run-dir "$resume_rd_k" || rc=$?
+resume_push_k="$(grep -c -- '-claude-proxy -- sh -c' "$resume_log_k" || true)"
+if (( rc == 0 )) && (( resume_push_k >= 1 )) \
+    && grep -q 'pushed a new Claude access token' "$resume_out_k"; then
+    ok "resume passes --run-dir to cmd_wait: a claude run's keeper pushes to the proxy"
+else
+    no "resume passes --run-dir to cmd_wait: a claude run's keeper pushes to the proxy" \
+        "rc=$rc pushes=$resume_push_k out=$(cat "$resume_out_k")"
+fi
+if grep -qF 'resume-keeper-tok' "$resume_log_k"; then
+    no "the token never appears in any kubectl argv (resume keeper)" "found it in $resume_log_k"
+else
+    ok "the token never appears in any kubectl argv (resume keeper)"
+fi
+jq '.claudeAiOauth.accessToken = "resume-keeper-tok2"' "$resume_cred_k" > "$resume_cred_k.new"
+mv -f "$resume_cred_k.new" "$resume_cred_k"
+sleep 3
+if [[ "$(grep -c -- '-claude-proxy -- sh -c' "$resume_log_k" || true)" == "$resume_push_k" ]]; then
+    ok "the keeper is gone once resume returns: no push for a post-return change"
+else
+    no "the keeper is gone once resume returns: no push for a post-return change" \
+        "log: $(cat "$resume_log_k")"
+fi
+
 resume_rd_c="$(resume_submit fs-k8s-test-resume-dead)"
 resume_home_c="$(newdir)"; tmpdirs+=("$resume_home_c")
 resume_log_c="$(newdir)/kubectl.log"; resume_out_c="$(dirname "$resume_log_c")/out.txt"
@@ -6859,6 +7089,344 @@ else
     no "--probe: every kubectl call on the probe path carries --request-timeout" \
         "count=$wait12_rt_count: $(cat "$wait_log12")"
 fi
+
+printf '\n== fork-sandbox-k8s.sh wait --run-dir: the claude token keeper ==\n'
+# A dedicated kubectl stub, layered on the same pod/sentinel answers
+# waitstub_dir's own stub gives, plus two the keeper needs: `exec ... sh -c
+# ...` against the claude-proxy pod (the live nginx-key push) and `apply -f
+# -` (the Secret update it also re-applies). Both CONSUME AND CAPTURE
+# stdin to a file the test can inspect -- proving the token was actually
+# delivered -- while the kubectl ARGV LOG (`"$*"`, the security invariant
+# under test) never carries anything read from stdin, only real production
+# code's own argv.
+keeper_stub_dir="$(newdir)"; tmpdirs+=("$keeper_stub_dir")
+cat > "$keeper_stub_dir/kubectl" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$K8S_STUB_LOG"
+case " $* " in
+    *" get pod -l job-name="*)
+        [[ -n "${K8S_STUB_POD_NAME:-}" ]] && printf '%s\n' "$K8S_STUB_POD_NAME"
+        exit 0 ;;
+    *" get job "*"--ignore-not-found -o name"*)
+        exit 0 ;;
+    *" get pod "*)
+        printf '%s' "${K8S_STUB_POD_PHASE:-Running}"
+        exit 0 ;;
+    *" get job "*)
+        printf '%s' "${K8S_STUB_JOB_FAILED:-False}"
+        exit 0 ;;
+    *" cat /work/.run-complete "*)
+        if [[ -n "${K8S_STUB_SENTINEL_FILE:-}" && -f "${K8S_STUB_SENTINEL_FILE:-}" ]]; then
+            cat "$K8S_STUB_SENTINEL_FILE"
+            exit 0
+        fi
+        exit 1 ;;
+    *"-claude-proxy -- sh -c "*)
+        [[ -n "${K8S_STUB_EXEC_CAPTURE:-}" ]] && cat > "$K8S_STUB_EXEC_CAPTURE" || cat >/dev/null
+        exit "${K8S_STUB_EXEC_RC:-0}" ;;
+    *" apply -f -"*)
+        [[ -n "${K8S_STUB_APPLY_CAPTURE:-}" ]] && cat > "$K8S_STUB_APPLY_CAPTURE" || cat >/dev/null
+        exit "${K8S_STUB_APPLY_RC:-0}" ;;
+esac
+exit 0
+STUB
+chmod +x "$keeper_stub_dir/kubectl"
+
+# keeper_run <run-dir-with-run.env> <branch> -- launches `wait --run-dir
+# <run-dir> --probe --timeout 30` in the BACKGROUND (a real,
+# unstubbed-in-time credential-file watch needs wall-clock time to pass
+# while it runs) and sets keeper_wait_pid, keeper_log, keeper_out,
+# keeper_err, keeper_exec_capture, keeper_apply_capture, all fresh for
+# this call. Reads K8S_STUB_SENTINEL_FILE/K8S_STUB_POD_PHASE/
+# K8S_STUB_EXEC_RC/K8S_STUB_APPLY_RC from the CALLER's own environment (set
+# as a prefix on the call, e.g. `K8S_STUB_EXEC_RC=1 keeper_run ...`), so
+# each scenario below controls exactly the knobs it needs.
+keeper_run() {
+    local run_dir="$1" branch="$2"
+    keeper_log="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$keeper_log")")
+    keeper_out="$(newdir)/out.txt"; keeper_err="$(newdir)/err.txt"
+    tmpdirs+=("$(dirname "$keeper_out")")
+    keeper_exec_capture="$(newdir)/exec-capture.txt"; tmpdirs+=("$(dirname "$keeper_exec_capture")")
+    keeper_apply_capture="$(newdir)/apply-capture.txt"; tmpdirs+=("$(dirname "$keeper_apply_capture")")
+    PATH="$keeper_stub_dir:$PATH" K8S_STUB_LOG="$keeper_log" K8S_STUB_POD_NAME=stub-pod \
+        K8S_STUB_SENTINEL_FILE="${K8S_STUB_SENTINEL_FILE:-}" \
+        K8S_STUB_POD_PHASE="${K8S_STUB_POD_PHASE:-}" \
+        K8S_STUB_EXEC_RC="${K8S_STUB_EXEC_RC:-}" K8S_STUB_APPLY_RC="${K8S_STUB_APPLY_RC:-}" \
+        K8S_STUB_EXEC_CAPTURE="$keeper_exec_capture" K8S_STUB_APPLY_CAPTURE="$keeper_apply_capture" \
+        FORK_SANDBOX_CONFIG_DIR="$config_dir" \
+        "$k8s_sh" wait --branch "$branch" --timeout 30 --probe --run-dir "$run_dir" \
+        > "$keeper_out" 2> "$keeper_err" &
+    keeper_wait_pid=$!
+}
+
+keeper_future_ms=$(( ($(date +%s) + 21600) * 1000 ))
+
+# 1. Happy path: the keeper pushes the current token once, unconditionally,
+# on start -- it never trusts the on-disk file to already match what the
+# proxy holds (a `resume` or wake-path relaunch can start a keeper long
+# after submit, with the host having refreshed in between) -- then a
+# changed host credential produces exactly one further push (exec + Secret
+# apply), the real token reaches the proxy over stdin only, an unchanged
+# credential produces no further push, and once the wait completes (the
+# sentinel appears) the keeper is gone -- a credential change made AFTER
+# cmd_wait has returned produces no push at all.
+keeper_run_dir1="$(newdir)"; tmpdirs+=("$keeper_run_dir1")
+keeper_cred_file1="$keeper_run_dir1/credentials.json"
+jq -n --arg at tok1 --argjson exp "$keeper_future_ms" \
+    '{claudeAiOauth: {accessToken: $at, refreshToken: "rt", expiresAt: $exp}}' > "$keeper_cred_file1"
+printf 'harness=claude\nCLAUDE_CREDENTIAL_PATH=%s\n' "$keeper_cred_file1" > "$keeper_run_dir1/run.env"
+keeper_sentinel1="$(newdir)/sentinel"; tmpdirs+=("$(dirname "$keeper_sentinel1")")
+
+K8S_STUB_SENTINEL_FILE="$keeper_sentinel1" keeper_run "$keeper_run_dir1" fs-k8s-test-keeper-happy
+sleep 1.5
+keeper_initial_exec_calls="$(grep -c -- '-claude-proxy -- sh -c' "$keeper_log" || true)"
+if [[ "$keeper_initial_exec_calls" == 1 ]] && grep -qF 'tok1' "$keeper_exec_capture"; then
+    ok "the keeper pushes the current token once, unconditionally, on start"
+else
+    no "the keeper pushes the current token once, unconditionally, on start" \
+        "calls=$keeper_initial_exec_calls capture=$(cat "$keeper_exec_capture" 2>/dev/null)"
+fi
+jq '.claudeAiOauth.accessToken = "tok2"' "$keeper_cred_file1" > "$keeper_cred_file1.new"
+mv -f "$keeper_cred_file1.new" "$keeper_cred_file1"
+sleep 3
+keeper_exec_calls_1="$(grep -c -- '-claude-proxy -- sh -c' "$keeper_log" || true)"
+keeper_apply_calls_1="$(grep -c -- ' apply -f -' "$keeper_log" || true)"
+if [[ "$keeper_exec_calls_1" == 2 && "$keeper_apply_calls_1" == 2 ]]; then
+    ok "a changed host credential produces exactly one further exec push and Secret apply"
+else
+    no "a changed host credential produces exactly one further exec push and Secret apply" \
+        "exec=$keeper_exec_calls_1 apply=$keeper_apply_calls_1 log: $(cat "$keeper_log")"
+fi
+if grep -qF 'tok2' "$keeper_exec_capture"; then
+    ok "the new token actually reaches the proxy pod, via stdin"
+else
+    no "the new token actually reaches the proxy pod, via stdin" \
+        "$(cat "$keeper_exec_capture" 2>/dev/null)"
+fi
+keeper_apply_decoded="$(jq -r '.data["upstream-key.conf"]' "$keeper_apply_capture" 2>/dev/null | base64 -d 2>/dev/null)"
+if grep -qF 'tok2' <<< "$keeper_apply_decoded"; then
+    ok "the Secret apply's own payload carries the new token"
+else
+    no "the Secret apply's own payload carries the new token" "$keeper_apply_decoded"
+fi
+if grep -qF 'tok2' "$keeper_log"; then
+    no "the token never appears in any kubectl argv (keeper push)" "found 'tok2' in $keeper_log"
+else
+    ok "the token never appears in any kubectl argv (keeper push)"
+fi
+sleep 3
+keeper_exec_calls_2="$(grep -c -- '-claude-proxy -- sh -c' "$keeper_log" || true)"
+if [[ "$keeper_exec_calls_2" == "$keeper_exec_calls_1" ]]; then
+    ok "an unchanged host credential produces no further push"
+else
+    no "an unchanged host credential produces no further push" \
+        "before=$keeper_exec_calls_1 after=$keeper_exec_calls_2"
+fi
+printf '0\n' > "$keeper_sentinel1"
+keeper_rc=0
+wait "$keeper_wait_pid" || keeper_rc=$?
+if (( keeper_rc == 0 )) && [[ "$(cat "$keeper_out")" == 0 ]]; then
+    ok "the wait itself completes normally once the sentinel appears"
+else
+    no "the wait itself completes normally once the sentinel appears" \
+        "rc=$keeper_rc out=$(cat "$keeper_out") err=$(cat "$keeper_err")"
+fi
+jq '.claudeAiOauth.accessToken = "tok3-after-return"' "$keeper_cred_file1" > "$keeper_cred_file1.new"
+mv -f "$keeper_cred_file1.new" "$keeper_cred_file1"
+sleep 3
+keeper_exec_calls_3="$(grep -c -- '-claude-proxy -- sh -c' "$keeper_log" || true)"
+if [[ "$keeper_exec_calls_3" == "$keeper_exec_calls_1" ]]; then
+    ok "the keeper is gone once cmd_wait returns on completion: no push for a post-return change"
+else
+    no "the keeper is gone once cmd_wait returns on completion: no push for a post-return change" \
+        "before=$keeper_exec_calls_1 after=$keeper_exec_calls_3"
+fi
+
+# 2. A failed nginx -t (K8S_STUB_EXEC_RC=1) must leave the wait running --
+# a push failure is never a reason to abort it -- print a warning, and
+# never re-apply the Secret for a key nginx itself rejected.
+keeper_run_dir2="$(newdir)"; tmpdirs+=("$keeper_run_dir2")
+keeper_cred_file2="$keeper_run_dir2/credentials.json"
+jq -n --arg at tok1 --argjson exp "$keeper_future_ms" \
+    '{claudeAiOauth: {accessToken: $at, refreshToken: "rt", expiresAt: $exp}}' > "$keeper_cred_file2"
+printf 'harness=claude\nCLAUDE_CREDENTIAL_PATH=%s\n' "$keeper_cred_file2" > "$keeper_run_dir2/run.env"
+keeper_sentinel2="$(newdir)/sentinel"; tmpdirs+=("$(dirname "$keeper_sentinel2")")
+K8S_STUB_SENTINEL_FILE="$keeper_sentinel2" K8S_STUB_EXEC_RC=1 \
+    keeper_run "$keeper_run_dir2" fs-k8s-test-keeper-nginxfail
+sleep 1.5
+jq '.claudeAiOauth.accessToken = "tok2"' "$keeper_cred_file2" > "$keeper_cred_file2.new"
+mv -f "$keeper_cred_file2.new" "$keeper_cred_file2"
+sleep 3
+if kill -0 "$keeper_wait_pid" 2>/dev/null; then
+    ok "a failed push (nginx -t rejected) leaves the wait still running"
+else
+    no "a failed push (nginx -t rejected) leaves the wait still running" \
+        "the background wait already exited: $(cat "$keeper_err")"
+fi
+if grep -qi 'warning' "$keeper_err" && ! grep -qF -- ' apply -f -' "$keeper_log"; then
+    ok "a failed push prints one warning and never re-applies the Secret"
+else
+    no "a failed push prints one warning and never re-applies the Secret" \
+        "err=$(cat "$keeper_err") log=$(cat "$keeper_log")"
+fi
+printf '0\n' > "$keeper_sentinel2"
+wait "$keeper_wait_pid" 2>/dev/null || true
+
+# 3. A Keychain-backed (or simply unrecorded) credential: run.env carries
+# harness=claude but no CLAUDE_CREDENTIAL_PATH -- cmd_wait starts no
+# keeper and says so exactly once, and no exec/apply call is ever made.
+keeper_run_dir3="$(newdir)"; tmpdirs+=("$keeper_run_dir3")
+printf 'harness=claude\n' > "$keeper_run_dir3/run.env"
+keeper_sentinel3="$(newdir)/sentinel"; tmpdirs+=("$(dirname "$keeper_sentinel3")")
+printf '0\n' > "$keeper_sentinel3"
+K8S_STUB_SENTINEL_FILE="$keeper_sentinel3" keeper_run "$keeper_run_dir3" fs-k8s-test-keeper-nopath
+wait "$keeper_wait_pid" || true
+if grep -qF 'no Claude credential path was recorded' "$keeper_err"; then
+    ok "an unrecorded credential path prints one note"
+else
+    no "an unrecorded credential path prints one note" "$(cat "$keeper_err")"
+fi
+if ! grep -qF -- '-claude-proxy -- sh -c' "$keeper_log"; then
+    ok "an unrecorded credential path starts no keeper (no exec/apply calls)"
+else
+    no "an unrecorded credential path starts no keeper (no exec/apply calls)" "$(cat "$keeper_log")"
+fi
+
+# 3b. No --run-dir at all -- a hand-run `wait --branch X` with none of the
+# flags submit's own advice suggests. cmd_wait cannot even look up the
+# run's harness in this case, so it must say so rather than silently
+# leaving any claude run's token unprotected, and it starts no keeper. Not
+# --probe: a probe loop (the postmaster's poller) calls wait with no
+# --run-dir on every ordinary poll and must stay silent (see "a probe
+# timeout exits 1 with empty stderr" above), so this note is gated on
+# --probe being absent, like the rest of cmd_wait's own progress output.
+keeper_sentinel3b="$(newdir)/sentinel"; tmpdirs+=("$(dirname "$keeper_sentinel3b")")
+printf '0\n' > "$keeper_sentinel3b"
+keeper_log3b="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$keeper_log3b")")
+keeper_err3b="$(newdir)/err.txt"; tmpdirs+=("$(dirname "$keeper_err3b")")
+PATH="$keeper_stub_dir:$PATH" K8S_STUB_LOG="$keeper_log3b" K8S_STUB_POD_NAME=stub-pod \
+    K8S_STUB_SENTINEL_FILE="$keeper_sentinel3b" \
+    FORK_SANDBOX_CONFIG_DIR="$config_dir" \
+    "$k8s_sh" wait --branch fs-k8s-test-keeper-norundir --timeout 5 \
+    > /dev/null 2> "$keeper_err3b"
+if grep -qF 'no --run-dir given' "$keeper_err3b"; then
+    ok "a hand-run wait with no --run-dir at all prints one note"
+else
+    no "a hand-run wait with no --run-dir at all prints one note" "$(cat "$keeper_err3b")"
+fi
+if ! grep -qF -- '-claude-proxy -- sh -c' "$keeper_log3b"; then
+    ok "a hand-run wait with no --run-dir at all starts no keeper"
+else
+    no "a hand-run wait with no --run-dir at all starts no keeper" "$(cat "$keeper_log3b")"
+fi
+
+# 3c. The same, but --probe: cmd_wait must stay silent with no --run-dir,
+# matching a probe loop's existing "quiet transient wait" contract.
+keeper_err3c="$(newdir)/err.txt"; tmpdirs+=("$(dirname "$keeper_err3c")")
+PATH="$keeper_stub_dir:$PATH" K8S_STUB_POD_NAME=stub-pod \
+    FORK_SANDBOX_CONFIG_DIR="$config_dir" \
+    "$k8s_sh" wait --branch fs-k8s-test-keeper-norundir-probe --timeout 0 --probe \
+    > /dev/null 2> "$keeper_err3c"
+if [[ ! -s "$keeper_err3c" ]]; then
+    ok "a --probe wait with no --run-dir stays silent"
+else
+    no "a --probe wait with no --run-dir stays silent" "$(cat "$keeper_err3c")"
+fi
+
+# 4. A pod that goes Failed mid-wait also stops the keeper: the EXIT trap
+# fires on every exit path of cmd_wait, not only a clean completion.
+keeper_run_dir4="$(newdir)"; tmpdirs+=("$keeper_run_dir4")
+keeper_cred_file4="$keeper_run_dir4/credentials.json"
+jq -n --arg at tok1 --argjson exp "$keeper_future_ms" \
+    '{claudeAiOauth: {accessToken: $at, refreshToken: "rt", expiresAt: $exp}}' > "$keeper_cred_file4"
+printf 'harness=claude\nCLAUDE_CREDENTIAL_PATH=%s\n' "$keeper_cred_file4" > "$keeper_run_dir4/run.env"
+keeper_rc4=0
+K8S_STUB_POD_PHASE=Failed keeper_run "$keeper_run_dir4" fs-k8s-test-keeper-podfail
+wait "$keeper_wait_pid" || keeper_rc4=$?
+keeper_exec_calls_4="$(grep -c -- '-claude-proxy -- sh -c' "$keeper_log" || true)"
+if (( keeper_rc4 == 2 )); then
+    ok "a Failed pod still fails the wait with the terminal code 2"
+else
+    no "a Failed pod still fails the wait with the terminal code 2" "rc=$keeper_rc4"
+fi
+jq '.claudeAiOauth.accessToken = "tok-after-podfail"' "$keeper_cred_file4" > "$keeper_cred_file4.new"
+mv -f "$keeper_cred_file4.new" "$keeper_cred_file4"
+sleep 3
+keeper_exec_calls_5="$(grep -c -- '-claude-proxy -- sh -c' "$keeper_log" || true)"
+if [[ "$keeper_exec_calls_5" == "$keeper_exec_calls_4" ]]; then
+    ok "the keeper is gone once cmd_wait returns on a dead pod: no push for a post-return change"
+else
+    no "the keeper is gone once cmd_wait returns on a dead pod: no push for a post-return change" \
+        "before=$keeper_exec_calls_4 after=$keeper_exec_calls_5"
+fi
+
+# 5. A timeout also stops the keeper: the EXIT trap fires when cmd_wait's
+# own deadline elapses, not only on a clean completion or a dead pod. No
+# K8S_STUB_SENTINEL_FILE is given, so the sentinel never appears and the
+# probe wait runs out its (short) clock.
+keeper_run_dir5="$(newdir)"; tmpdirs+=("$keeper_run_dir5")
+keeper_cred_file5="$keeper_run_dir5/credentials.json"
+jq -n --arg at tok1 --argjson exp "$keeper_future_ms" \
+    '{claudeAiOauth: {accessToken: $at, refreshToken: "rt", expiresAt: $exp}}' > "$keeper_cred_file5"
+printf 'harness=claude\nCLAUDE_CREDENTIAL_PATH=%s\n' "$keeper_cred_file5" > "$keeper_run_dir5/run.env"
+keeper_log5="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$keeper_log5")")
+keeper_out5="$(newdir)/out.txt"; keeper_err5="$(newdir)/err.txt"
+tmpdirs+=("$(dirname "$keeper_out5")")
+PATH="$keeper_stub_dir:$PATH" K8S_STUB_LOG="$keeper_log5" K8S_STUB_POD_NAME=stub-pod \
+    FORK_SANDBOX_CONFIG_DIR="$config_dir" \
+    "$k8s_sh" wait --branch fs-k8s-test-keeper-timeout --timeout 2 --probe \
+    --run-dir "$keeper_run_dir5" > "$keeper_out5" 2> "$keeper_err5" &
+keeper_wait_pid5=$!
+keeper_rc5=0
+wait "$keeper_wait_pid5" || keeper_rc5=$?
+if (( keeper_rc5 == 1 )); then
+    ok "a timeout still fails the probe wait with exit 1"
+else
+    no "a timeout still fails the probe wait with exit 1" "rc=$keeper_rc5"
+fi
+keeper_exec_calls_6="$(grep -c -- '-claude-proxy -- sh -c' "$keeper_log5" || true)"
+jq '.claudeAiOauth.accessToken = "tok-after-timeout"' "$keeper_cred_file5" > "$keeper_cred_file5.new"
+mv -f "$keeper_cred_file5.new" "$keeper_cred_file5"
+sleep 3
+keeper_exec_calls_7="$(grep -c -- '-claude-proxy -- sh -c' "$keeper_log5" || true)"
+if [[ "$keeper_exec_calls_7" == "$keeper_exec_calls_6" ]]; then
+    ok "the keeper is gone once cmd_wait returns on a timeout: no push for a post-return change"
+else
+    no "the keeper is gone once cmd_wait returns on a timeout: no push for a post-return change" \
+        "before=$keeper_exec_calls_6 after=$keeper_exec_calls_7"
+fi
+
+# 6. A signal also stops the keeper: SIGTERM delivered to the blocked wait
+# process must fire its EXIT trap exactly like completion, a dead pod or a
+# timeout -- bash runs the EXIT trap on an untrapped fatal signal too, so
+# this needs no special handling in cmd_wait itself, just proof it happens.
+keeper_run_dir6="$(newdir)"; tmpdirs+=("$keeper_run_dir6")
+keeper_cred_file6="$keeper_run_dir6/credentials.json"
+jq -n --arg at tok1 --argjson exp "$keeper_future_ms" \
+    '{claudeAiOauth: {accessToken: $at, refreshToken: "rt", expiresAt: $exp}}' > "$keeper_cred_file6"
+printf 'harness=claude\nCLAUDE_CREDENTIAL_PATH=%s\n' "$keeper_cred_file6" > "$keeper_run_dir6/run.env"
+keeper_sentinel6="$(newdir)/sentinel"; tmpdirs+=("$(dirname "$keeper_sentinel6")")
+K8S_STUB_SENTINEL_FILE="$keeper_sentinel6" keeper_run "$keeper_run_dir6" fs-k8s-test-keeper-signal
+sleep 1.5
+keeper_exec_calls_8="$(grep -c -- '-claude-proxy -- sh -c' "$keeper_log" || true)"
+kill -TERM "$keeper_wait_pid"
+wait "$keeper_wait_pid" 2>/dev/null || true
+if kill -0 "$keeper_wait_pid" 2>/dev/null; then
+    no "SIGTERM stops the wait process" "still alive after kill -TERM"
+else
+    ok "SIGTERM stops the wait process"
+fi
+jq '.claudeAiOauth.accessToken = "tok-after-signal"' "$keeper_cred_file6" > "$keeper_cred_file6.new"
+mv -f "$keeper_cred_file6.new" "$keeper_cred_file6"
+sleep 3
+keeper_exec_calls_9="$(grep -c -- '-claude-proxy -- sh -c' "$keeper_log" || true)"
+if [[ "$keeper_exec_calls_9" == "$keeper_exec_calls_8" ]]; then
+    ok "the keeper is gone once cmd_wait is killed by a signal: no push for a post-signal change"
+else
+    no "the keeper is gone once cmd_wait is killed by a signal: no push for a post-signal change" \
+        "before=$keeper_exec_calls_8 after=$keeper_exec_calls_9"
+fi
+
 
 printf '\n== fork-sandbox-k8s.sh collect: direct drive vs stubbed kubectl ==\n'
 # The extracted collect verb, driven directly against a stubbed git+kubectl

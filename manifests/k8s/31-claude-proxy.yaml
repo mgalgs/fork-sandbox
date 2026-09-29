@@ -16,6 +16,19 @@
 # nginx.conf never otherwise names, so a `kubectl get configmap` never
 # shows it.
 #
+# The key nginx includes lives in a WRITABLE emptyDir
+# (/etc/nginx/key/upstream-key.conf), not a Secret mount, so a keeper
+# process on the host (started by `cmd_wait` -- see k8s_claude_keeper_start
+# in fork-sandbox-k8s.sh) can replace it live across this run's whole
+# lifetime: kubelet never propagates a Secret update into a subPath mount,
+# and there is no mechanism to reload nginx from one anyway. The Secret is
+# still the initial value's source of truth -- an initContainer (the same
+# nginx:1.27-alpine image and non-root securityContext as the main
+# container) copies it into the emptyDir once, at pod start, before nginx
+# ever runs. The emptyDir survives a container restart
+# (`restartPolicy: Always`), so a restarted nginx comes back with the latest
+# key the keeper pushed, not the Secret's original one.
+#
 # A per-run Pod, not a sidecar: a sidecar shares the agent container's
 # network namespace, so the policy admitting it 0.0.0.0/0:443 would open
 # that same route to the agent container too -- exactly the property this
@@ -82,9 +95,10 @@ data:
         server {
             listen 8080;
 
-            # Defines $upstream_key. Mounted from the Secret, never from
-            # this ConfigMap -- see the header above.
-            include /etc/nginx/upstream-key.conf;
+            # Defines $upstream_key. Read from the writable emptyDir a
+            # keeper process can replace live, never from this ConfigMap --
+            # see the header above.
+            include /etc/nginx/key/upstream-key.conf;
 
             # Deny by default. Only the two paths below are forwarded --
             # the only two Claude Code ever calls under a base URL
@@ -177,6 +191,31 @@ spec:
     runAsGroup: 101
     seccompProfile:
       type: RuntimeDefault
+  initContainers:
+    # Seeds the writable "key" emptyDir from the Secret's initial value,
+    # once, before nginx ever starts -- see the file header for why the
+    # main container never mounts the Secret at all. Same image and
+    # non-root securityContext as the main container; it only needs to
+    # read the Secret mount and write the emptyDir, so
+    # readOnlyRootFilesystem stays true.
+    - name: seed-key
+      image: nginx:1.27-alpine
+      command:
+        - sh
+        - -c
+        - cp /etc/nginx/key-secret/upstream-key.conf /etc/nginx/key/upstream-key.conf
+          && chmod 600 /etc/nginx/key/upstream-key.conf
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      volumeMounts:
+        - name: key-secret
+          mountPath: /etc/nginx/key-secret
+          readOnly: true
+        - name: key
+          mountPath: /etc/nginx/key
   containers:
     - name: nginx
       image: nginx:1.27-alpine
@@ -192,10 +231,13 @@ spec:
           mountPath: /etc/nginx/nginx.conf
           subPath: nginx.conf
           readOnly: true
-        - name: upstream-key
-          mountPath: /etc/nginx/upstream-key.conf
-          subPath: upstream-key.conf
-          readOnly: true
+        # Writable, unlike every other mount here: a keeper process on the
+        # host (k8s_push_claude_key in fork-sandbox-k8s.sh) execs into this
+        # container and replaces upstream-key.conf in place -- see the
+        # file header. No subPath, so `nginx -s reload` sees the same
+        # directory the keeper just wrote into.
+        - name: key
+          mountPath: /etc/nginx/key
         - name: tmp
           mountPath: /tmp
         - name: run
@@ -204,9 +246,11 @@ spec:
     - name: conf
       configMap:
         name: __RUN_NAME__-claude-proxy-conf
-    - name: upstream-key
+    - name: key-secret
       secret:
         secretName: __RUN_NAME__-claude-token
+    - name: key
+      emptyDir: {}
     - name: tmp
       emptyDir: {}
     - name: run

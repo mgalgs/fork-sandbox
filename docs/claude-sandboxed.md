@@ -88,10 +88,16 @@ dies at token expiry.
   whatever claude is installed, cached per version, and claude-sandboxed
   warns loudly (never refusing to launch) when the installed claude no
   longer matches.
-- **Known gap: the Kubernetes path does not do any of this.** A `--k8s` run's
-  pod credential is still a one-shot copy with a hardcoded placeholder
-  access token (see docs/kubernetes-runs.md); there is no live-sync loop and
-  no early refresh there yet.
+- **The Kubernetes path keeps its token alive a different way.** A `--k8s`
+  run's pod credential is still a one-shot copy with a hardcoded placeholder
+  access token, and the pod itself can never refresh anything -- but
+  `fork-sandbox-k8s.sh submit` refreshes the HOST's credential first, the
+  same `fs_claude_refresh_if_needed` this section describes, and `run`,
+  `resume` and `wait --run-dir DIR` each run a background "keeper" for as
+  long as they block that pushes a changed host token straight to the
+  run's own proxy and its backing Secret, live, over `kubectl exec`. A
+  bare `submit`, or a `wait` with no `--run-dir`, starts none. See "1b.
+  proxy, per-run, for claude" in docs/kubernetes-runs.md.
 
 ## Sealed egress
 

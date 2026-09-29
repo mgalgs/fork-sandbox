@@ -1360,17 +1360,82 @@ has to be up first.
 
 **The token never appears in rendered YAML.** `cmd_submit` reads the
 operator's local OAuth access token (the same `fs_read_claude_credential`
-reader `claude-sandboxed` uses locally) and creates the per-run Secret the
-same way `cmd_install` creates the shared one: `kubectl create secret
-generic ... --dry-run=client -o yaml | kubectl apply -f -`, never inside the
-template `31-claude-proxy.yaml` renders. Under `--dry-run` nothing is
-created; one comment line says the Secret would be, with no value. Before
-creating it, `cmd_submit` refuses an already-expired token and warns on
-stderr when it has under an hour left — the same two checks and messages
-`claude-sandboxed` runs before a local sealed run, because the failure mode
-is the same: **a run that outlives its token dies partway through**, on the
-cluster exactly as it would locally. There is no refresh path in either
-place.
+reader `claude-sandboxed` uses locally). Before it reads that token,
+`cmd_submit` refreshes the HOST's credential first when less than
+`FS_CLAUDE_REFRESH_BEFORE_MIN` (2h) remain on it — `fs_claude_refresh_if_needed`
+in `fork-sandbox-lib.sh`, the exact function `claude-sandboxed`'s own
+pre-step calls, preceded by the same `fs_claude_token_contract_check` probe.
+Both are silent no-ops for a Keychain-backed credential, or when no host
+`claude` binary can be found (resolved the same way `claude-sandboxed`
+resolves `HOST_CLAUDE_BIN`: PATH, then `~/.local/bin/claude`).
+
+`cmd_submit` then creates the per-run Secret via
+`k8s_render_claude_token_secret_manifest` — one jq call that reads the real
+token on STDIN ONLY (never argv) and prints a Secret manifest with it
+base64-encoded, piped straight to `kubectl apply -f -`. This is the ONE
+place that ever turns the real token into this Secret's content; the same
+function builds it again every time the keeper (below) pushes a
+replacement, so the two can never render the object differently. Under
+`--dry-run` nothing is created; one comment line says the Secret would be,
+with no value. `cmd_submit` still refuses an already-expired token outright
+and warns on stderr when it has under an hour left — the same two hard
+checks `claude-sandboxed` runs before a local sealed run — but the under-an-
+hour warning is now conditional: with a file-backed credential and a host
+`claude` binary, it says the keeper will refresh it, because one now will.
+
+**The keeper: what actually keeps a cluster run's token alive.** The pod
+itself still cannot refresh anything — but a run no longer dies partway
+through just because the operator's token expired mid-run, as long as
+`wait`, `run` or `resume` stays running against it. `cmd_submit` records the
+resolved credential's file path (never its content) as
+`CLAUDE_CREDENTIAL_PATH` in the run directory's `run.env`. `cmd_wait`, given
+`--run-dir` (which `k8s_run_tail` always supplies, so both `run` and
+`resume` get this automatically), reads that path back and starts
+`k8s_claude_keeper_start` in the background for as long as it blocks:
+
+- **Every 2s** it reads the host credential file's access token (a cheap
+  local read) and, when it differs from the last token THIS keeper pushed
+  — held only as a hash, in a shell variable, never written to disk or a
+  log — pushes the new one via `k8s_push_claude_key`.
+- **About every 60s**, first in the same tick, it calls
+  `fs_claude_refresh_if_needed` itself, so an unattended multi-hour run
+  never simply runs out the clock waiting for some other process to
+  refresh the host credential — and a refresh IT triggers is pushed in the
+  very same tick, costing the pod no extra window on the now-revoked old
+  token.
+- `k8s_push_claude_key` execs into the run's own proxy pod with the new
+  token on stdin only, writes it to a temp file in the SAME writable
+  emptyDir the live key lives in (see below), `mv`s it over the live key
+  only after `nginx -t` accepts it (keeping a backup and restoring it on
+  rejection, so a bad push never breaks the proxy), reloads nginx, and then
+  re-applies the Secret with the same manifest builder `cmd_submit` used —
+  so the Secret and the live key never drift. It prints one line naming no
+  token on success, or one warning on any failure, and never aborts the
+  wait either way.
+- The keeper starts only once `cmd_wait` has resolved a pod to wait on, and
+  stops on every exit path of `cmd_wait` — completion, a dead pod, a
+  timeout, a signal — via an EXIT trap (`k8s_claude_keeper_stop`), which
+  also protects an in-flight refresh with
+  `_fs_claude_refresh_emergency_cleanup`, exactly as claude-sandboxed's own
+  live-sync loop does. With no `--run-dir`, or a run.env with no recorded
+  path (a Keychain-backed credential, or a run submitted before this
+  existed), `cmd_wait` starts no keeper and says so once. A hand-run
+  `wait --branch NAME` needs `--run-dir DIR` to get a keeper at all — `run`
+  and `resume` pass it automatically, but a standalone `wait` only has it if
+  the operator passes the run directory `submit` printed. The bare `submit`
+  verb starts no keeper either — it prints a note naming the run directory
+  and saying the token is only kept alive while `run`, `resume`, or
+  `wait --run-dir DIR` is running.
+
+**The proxy's key lives in a writable emptyDir, not a Secret mount.**
+kubelet never propagates a Secret update into a `subPath` mount, and there
+is no mechanism to reload nginx from one anyway — so `31-claude-proxy.yaml`
+mounts an emptyDir at `/etc/nginx/key` instead, seeded once from the Secret
+by an initContainer (same image, same non-root `securityContext`) before
+nginx ever starts, and left writable in the main container so the keeper
+can replace it live. The emptyDir survives a container restart
+(`restartPolicy: Always`), so a restarted nginx comes back with the
+keeper's latest key, not the Secret's original one.
 
 **Which credential file `cmd_submit` reads is overridable.** Precedence:
 `--claude-credentials <path>` (on `fork-sandbox-k8s.sh run`/`submit`, or
@@ -1390,12 +1455,18 @@ the stripping filter — `del(.mcpOAuth) | del(.claudeAiOauth.refreshToken,
 `fs_claude_sandbox_credential` in `fork-sandbox-lib.sh`, which
 `claude-sandboxed` uses locally and which keeps a placeholder refresh token
 rather than dropping it — see docs/claude-sandboxed.md's "Credential
-refresh"; the two paths do not share a live-sync loop or an early refresh)
-— and then
+refresh"; the two paths share the early refresh
+(`fs_claude_refresh_if_needed`) but not a live-sync loop -- the pod's own
+credential never changes after launch, only the proxy's key does, and
+that's the keeper's job, not this filter's) — and then
 `.claudeAiOauth.accessToken` is overwritten with the literal string
-`sandbox`. After that substitution the file holds no secret (scopes,
-subscription type, expiry survive; the one thing that could ever be spent
-does not), which is why it ships as a ConfigMap key
+`sandbox` and `.claudeAiOauth.expiresAt` with a far-future constant (the
+keeper owns the real token's lifetime; a placeholder that kept the host
+token's expiry would look expired to the pod's claude, which holds no
+refresh token, while the proxy's key is still good). After that
+substitution the file holds no secret (scopes and subscription type
+survive; the one thing that could ever be spent does not), which is why it
+ships as a ConfigMap key
 (`claude-credentials.json`) in the per-run ConfigMap alongside
 `handoff.md`, rather than a Secret. Claude Code starts fine on this file and
 sends `Authorization: Bearer sandbox`; the per-run proxy is what turns that

@@ -32,6 +32,7 @@
 #                            [--allow-namespace NS[:PORT]]... [--reach-probe HOST:PORT]...
 #                            <project-path> <handoff-file>
 #        fork-sandbox-k8s.sh wait --branch NAME [--timeout SECONDS] [--probe]
+#                            [--run-dir DIR]
 #        fork-sandbox-k8s.sh collect --branch NAME [--outbox-dir DIR]
 #                            [--outbox-max SIZE] [--review-loop N]
 #                            [--keep] [--run-dir DIR] <project-path>
@@ -4586,12 +4587,48 @@ cmd_submit() {
             fi
         fi
 
+        # Refresh the HOST's credential first, before it is even read below,
+        # exactly as claude-sandboxed's own pre-step does for a local run:
+        # the whole point is to refresh a token close to expiry rather than
+        # copy one into the run that is about to be revoked. A cluster run
+        # can span hours, well past FS_CLAUDE_REFRESH_BEFORE_MIN (2h) --
+        # unlike the sandboxed path, there is no live-sync loop yet at this
+        # point in submit; that gap is what the keeper cmd_wait starts below
+        # closes for the rest of the run's lifetime (see
+        # k8s_claude_keeper_start). claude_cred_file is empty for a
+        # Keychain-backed credential, which -- like a missing host claude
+        # binary -- makes both the contract check and the refresh silent
+        # no-ops, same as claude-sandboxed. Resolved the same way
+        # claude-sandboxed resolves HOST_CLAUDE_BIN: PATH, then
+        # ~/.local/bin/claude, then resolved to an absolute path to survive
+        # a relative PATH entry across the refresh's own cd -- via
+        # $FS_REALPATH (no flags: every path component here already
+        # exists), not a raw GNU readlink call, since fork-sandbox-lib.sh's
+        # shim is already sourced by this point.
+        local host_claude_bin claude_cred_file
+        host_claude_bin="$(command -v claude 2>/dev/null || true)"
+        if [[ -z "$host_claude_bin" && -x "$HOME/.local/bin/claude" ]]; then
+            host_claude_bin="$HOME/.local/bin/claude"
+        fi
+        if [[ "$host_claude_bin" == */* ]]; then
+            host_claude_bin="$("$FS_REALPATH" "$host_claude_bin" 2>/dev/null || true)"
+        fi
+        claude_cred_file="$(fs_claude_credential_file "$claude_credentials_override")" || claude_cred_file=""
+        if [[ -n "$claude_cred_file" && -n "$host_claude_bin" ]]; then
+            fs_claude_token_contract_check "$host_claude_bin" "$script_dir/fork-sandbox-claude-token-probe"
+            fs_claude_refresh_if_needed "$claude_cred_file" "$host_claude_bin"
+        fi
+
         claude_cred_json="$(fs_read_claude_credential "$claude_credentials_override")" || exit 1
 
-        # The pod cannot refresh the token, so a run that outlives it dies
-        # -- the same lifetime caveat a local claude-sandboxed session has.
-        # Same two messages, adapted from "the sandbox session" to "the
-        # pod's session".
+        # The pod itself still cannot refresh the token -- but a run that
+        # outlives it no longer dies partway through, as long as `wait`,
+        # `run` or `resume` stays running: the keeper cmd_wait starts (see
+        # k8s_claude_keeper_start) pushes a fresh token to the per-run proxy
+        # whenever the host's own copy changes, for as long as that command
+        # blocks. This warning is worded accordingly; the two hard refusals
+        # below are unchanged -- a token already too close to expiry to
+        # survive submit itself is refused outright, keeper or not.
         # Piped with printf, never a here-string: on bash before 5.1 a
         # here-string spills its value to a temp file, and this one holds
         # the live token. Same rule as fs_read_claude_credential's header.
@@ -4607,7 +4644,11 @@ cmd_submit() {
             echo "The pod cannot refresh the token, so the pod's session would die almost at once. Log in with claude on the host, then retry." >&2
             exit 1
         elif (( claude_mins_left < 60 )); then
-            echo "Warning: the access token expires in ${claude_mins_left}m; the pod's session dies then." >&2
+            if [[ -n "$claude_cred_file" && -n "$host_claude_bin" ]]; then
+                echo "Warning: the access token expires in ${claude_mins_left}m; the keeper started by wait/run/resume will refresh it on the host before then." >&2
+            else
+                echo "Warning: the access token expires in ${claude_mins_left}m; the pod's session dies then." >&2
+            fi
         fi
 
         claude_access_token="$(printf '%s' "$claude_cred_json" | jq -r '.claudeAiOauth.accessToken // empty')"
@@ -4631,10 +4672,16 @@ cmd_submit() {
         # the right place for it. A `claude setup-token` credential has no
         # scopes, and a CLI that finds none reports "Not logged in" before
         # any request, so the placeholder supplies the inference scope.
-        claude_configmap_cred="$(printf '%s' "$claude_cred_json" | jq '
+        # expiresAt is pushed far out: the proxy's keeper owns the real
+        # token's lifetime, and a placeholder that inherited the host
+        # token's expiry would read as expired to the pod's claude, with no
+        # refresh token to recover from, while the proxy's key is still good.
+        claude_configmap_cred="$(printf '%s' "$claude_cred_json" | jq \
+            --argjson exp "$K8S_PLACEHOLDER_EXPIRES_AT_MS" '
             del(.mcpOAuth)
             | del(.claudeAiOauth.refreshToken, .claudeAiOauth.refreshTokenExpiresAt)
             | .claudeAiOauth.accessToken = "sandbox"
+            | .claudeAiOauth.expiresAt = $exp
             | .claudeAiOauth.scopes //= ["user:inference"]
         ')"
     fi
@@ -5678,6 +5725,13 @@ EOF
         if [[ "$harness" == claude ]]; then
             printf 'claude_credentials_source=%s\n' "${claude_credentials_override:-default}"
             printf 'claude_credentials_via=%s\n' "$claude_credentials_via"
+            # Read back by cmd_wait (via --run-dir, from k8s_run_tail or a
+            # hand-run `wait --run-dir`) to find the file-backed credential
+            # to keep alive -- never its content, only the path. Empty for
+            # a Keychain-backed credential, which is cmd_wait's own signal
+            # to print a note and start no keeper, same as claude-sandboxed
+            # skips its own live-sync loop for one.
+            printf 'CLAUDE_CREDENTIAL_PATH=%s\n' "$claude_cred_file"
         fi
         # Read back by cmd_collect, before cmd_fetch, so a standalone
         # collect (no run.env in scope of the calling process) still
@@ -6042,6 +6096,28 @@ EOF
     echo "fork-sandbox-k8s: fetch with: fork-sandbox-k8s.sh fetch --branch $branch $project_path" >&2
 }
 
+# Printed only after the bare `submit` verb (see the dispatch case at the
+# bottom of this file) -- never after cmd_run's own internal call to
+# cmd_submit, which goes straight on to k8s_run_tail's cmd_wait and so
+# starts the keeper itself. Reads K8S_LAST_SUBMIT_RUN_DIR's run.env back,
+# the same way cmd_wait itself does, rather than taking any state directly
+# from cmd_submit, since by the time this runs cmd_submit has already
+# returned and its own locals are gone. Silent for a pi run, or a claude
+# run with no file-backed credential recorded (nothing this note would
+# apply to).
+k8s_note_standalone_submit_keeper() {
+    local run_dir="$K8S_LAST_SUBMIT_RUN_DIR" wait_harness claude_cred_path
+    [[ -n "$run_dir" && -f "$run_dir/run.env" ]] || return 0
+    wait_harness="$(read_env_value "$run_dir/run.env" harness || true)"
+    [[ "$wait_harness" == claude ]] || return 0
+    claude_cred_path="$(read_env_value "$run_dir/run.env" CLAUDE_CREDENTIAL_PATH || true)"
+    [[ -n "$claude_cred_path" ]] || return 0
+    echo "fork-sandbox-k8s: the pod's Claude access token is kept alive only" >&2
+    echo "while 'run' or 'resume' is running against this branch, or while" >&2
+    echo "'wait --run-dir $run_dir' is -- a bare 'submit', or 'wait' with no" >&2
+    echo "--run-dir, starts no keeper." >&2
+}
+
 cmd_fetch() {
     local branch="" upstream_ref="" upstream_none_reason=""
     local upstream_ref_given=false upstream_none_given=false
@@ -6243,6 +6319,202 @@ cmd_rm() {
     echo "fork-sandbox-k8s: removed job and configmap for branch $branch" >&2
 }
 
+# k8s_push_claude_key <safe_name> <hm-display> < token-on-stdin
+#
+# Pushes a replacement Claude access token to this run's live proxy pod --
+# an nginx reload, over `kubectl exec` with the token on stdin only -- and
+# then to the Secret backing it, so the two never drift apart. Called only
+# from cmd_wait's keeper (k8s_claude_keeper_start below), which owns the
+# host-side view of "did the credential change". Uses this file's own
+# kubectl() wrapper (which already carries --context/-n), so callers need
+# not thread those through themselves.
+#
+# The token reaches the proxy pod's writable /etc/nginx/key emptyDir (see
+# manifests/k8s/31-claude-proxy.yaml) via a temp file in that SAME
+# directory, `mv`d over the live key only after `nginx -t` accepts it, with
+# the previous key kept as a backup and restored if `nginx -t` rejects the
+# new one -- so a bad push leaves the proxy still serving its last good
+# key rather than a broken config. Every byte the exec'd script itself
+# might print (nginx's own -t/-s reload output) is discarded inside the
+# pod; nothing the pod says comes back through this function's own stdout,
+# which -- because this runs inside cmd_wait's keeper, and cmd_wait's own
+# stdout is the machine-readable exit-code channel k8s_run_tail captures
+# with `$(...)` -- must stay silent no matter what.
+#
+# Prints exactly one line, naming no token, on success ("now
+# <hm-display>"); on ANY failure -- an unsafe token, a failed exec, an
+# nginx -t the pushed key did not pass, a failed Secret apply -- prints
+# exactly one warning line and returns 1. Callers must never treat a
+# failure here as a reason to abort the wait.
+k8s_push_claude_key() {
+    local safe_name="$1" hm="$2" token
+    token="$(cat)"
+    if ! reject_nginx_unsafe_chars "$token" "the Claude access token"; then
+        echo "fork-sandbox-k8s: warning: could not push a new Claude access token to the proxy (the token itself is unsafe for the nginx config)." >&2
+        return 1
+    fi
+
+    # shellcheck disable=SC2016  # a program for the proxy pod's own sh, not this shell
+    local exec_script='dir=/etc/nginx/key
+umask 077
+cp "$dir/upstream-key.conf" "$dir/upstream-key.conf.bak" 2>/dev/null
+cat > "$dir/upstream-key.conf.new" || exit 1
+mv -f "$dir/upstream-key.conf.new" "$dir/upstream-key.conf"
+if nginx -t >/dev/null 2>&1; then
+    nginx -s reload >/dev/null 2>&1
+else
+    rc=$?
+    mv -f "$dir/upstream-key.conf.bak" "$dir/upstream-key.conf" 2>/dev/null
+    exit "$rc"
+fi'
+    # shellcheck disable=SC2016  # the literal text $upstream_key is nginx config, not shell
+    if ! printf 'set $upstream_key "%s";\n' "$token" \
+        | kubectl exec -i "$safe_name-claude-proxy" -- sh -c "$exec_script" >/dev/null 2>&1; then
+        echo "fork-sandbox-k8s: warning: could not push a new Claude access token to the proxy (nginx -t rejected it, or the exec itself failed); the proxy keeps serving its last key." >&2
+        return 1
+    fi
+
+    if ! printf '%s' "$token" \
+        | k8s_render_claude_token_secret_manifest "$safe_name-claude-token" "$K8S_NAMESPACE" \
+        | kubectl apply -f - >/dev/null 2>&1; then
+        echo "fork-sandbox-k8s: warning: pushed a new Claude access token to the proxy but could not update its Secret; they may now differ." >&2
+        return 1
+    fi
+
+    echo "fork-sandbox-k8s: pushed a new Claude access token to the proxy (now $hm)" >&2
+}
+
+# K8S_CLAUDE_KEEPER_PID holds the background keeper's PID for exactly as
+# long as k8s_claude_keeper_start's subshell is alive, so
+# k8s_claude_keeper_stop knows whether there is anything to kill. Global,
+# not local to cmd_wait, for the same reason claude-sandboxed's SYNC_LOOP_PID
+# is a top-level variable: the stop half runs from an EXIT trap, a different
+# call frame than the one that set it.
+K8S_CLAUDE_KEEPER_PID=""
+
+# The pod's placeholder credential's expiresAt (2100-01-01T00:00:00Z) -- see
+# cmd_submit's placeholder jq.
+K8S_PLACEHOLDER_EXPIRES_AT_MS=4102444800000
+
+# k8s_claude_keeper_start <cred-file> <safe_name>
+#
+# Starts, in the background, the loop that keeps this run's proxy Secret
+# and live nginx key in step with the HOST's own Claude credential file
+# (<cred-file>) for as long as cmd_wait -- via `wait`, `run` or `resume` --
+# is still blocked waiting on this run's pod. Mirrors claude-sandboxed's
+# own live-sync loop almost exactly (see there): every 2s it reads the
+# host credential's access token (a local file read, cheap) and pushes it,
+# via k8s_push_claude_key, when it differs from the last one THIS keeper
+# pushed; about every 60s, first in the same tick, it calls
+# fs_claude_refresh_if_needed, so a refresh the keeper itself triggers
+# costs the pod no extra window on a token about to be revoked.
+#
+# The "last pushed" value is held only as a hash, in a shell variable,
+# never written to disk or a log -- and it starts EMPTY, not seeded from
+# the credential file, so the keeper always pushes once, unconditionally,
+# on its very first tick. Seeding it from the file's own current token
+# instead (matching what cmd_submit pushed) would only be safe if nothing
+# could have changed the live proxy's key since submit -- but a `resume`
+# or a wake-path relaunch starts a brand new keeper long after submit, and
+# the host may have refreshed the credential (revoking the token the proxy
+# still holds) in the gap. Pushing once on start, regardless of whether the
+# on-disk token "looks unchanged", is what makes the keeper self-correcting
+# instead of trusting a baseline it never verified against the proxy.
+#
+# Exits on its own once its parent (the process that called this function,
+# i.e. cmd_wait) is gone, the same `kill -0 "$parent_pid"` idiom claude-
+# sandboxed's loop uses, so a SIGKILLed parent cannot leave it running
+# forever; the caller is still expected to kill and wait for it explicitly
+# on every ordinary exit path (see k8s_claude_keeper_stop). Its own EXIT
+# trap protects any refresh it has in flight with
+# _fs_claude_refresh_emergency_cleanup, exactly as claude-sandboxed's loop
+# does, so a kill landing mid-refresh still merges a completed result
+# rather than losing the only live copy of the refresh token.
+#
+# `exec >/dev/null` first, unconditionally: this subshell is forked from
+# inside cmd_wait, whose own stdout may be the write end of a `$(cmd_wait
+# ...)` pipe (see k8s_run_tail) -- dropping this process's copy of that fd
+# immediately, before anything else runs, means it can never hold that pipe
+# open nor leak a stray byte into the exit-code capture, no matter what any
+# function called below does to its own stdout.
+k8s_claude_keeper_start() {
+    local cred_file="$1" safe_name="$2"
+    local host_claude_bin
+    host_claude_bin="$(command -v claude 2>/dev/null || true)"
+    if [[ -z "$host_claude_bin" && -x "$HOME/.local/bin/claude" ]]; then
+        host_claude_bin="$HOME/.local/bin/claude"
+    fi
+    if [[ "$host_claude_bin" == */* ]]; then
+        host_claude_bin="$("$FS_REALPATH" "$host_claude_bin" 2>/dev/null || true)"
+    fi
+    # $BASHPID, not $$: under k8s_run_tail's `$(cmd_wait ...)` the caller is
+    # a subshell, and $$ would name the top-level script, which outlives it.
+    local parent_pid=$BASHPID
+    (
+        exec >/dev/null
+        cred_dir="$(dirname -- "$cred_file")"
+        sync_lock1="$cred_dir/.oauth_refresh.lock"
+        sync_lock2="$("$FS_REALPATH" -m "$cred_dir").lock"
+        trap '_fs_claude_refresh_emergency_cleanup "$sync_lock1" "$sync_lock2"' EXIT
+        # Left empty, deliberately -- see this function's header comment.
+        # No hash of any real token collides with the empty string, so the
+        # very first tick below always finds "the current token differs
+        # from the last one pushed" and pushes it, regardless of whether
+        # the on-disk file has moved since submit.
+        last_pushed_hash=""
+        tick=0
+        while kill -0 "$parent_pid" 2>/dev/null; do
+            if (( tick % 30 == 0 )); then
+                fs_claude_refresh_if_needed "$cred_file" "$host_claude_bin"
+            fi
+            if [[ -f "$cred_file" ]]; then
+                token="$(jq -r '.claudeAiOauth.accessToken // ""' "$cred_file" 2>/dev/null)" || token=""
+                if [[ -n "$token" ]]; then
+                    hash="$(printf '%s' "$token" | sha256sum | cut -d' ' -f1)"
+                    if [[ "$hash" != "$last_pushed_hash" ]]; then
+                        exp_ms="$(jq -r '.claudeAiOauth.expiresAt // 0' "$cred_file" 2>/dev/null)" || exp_ms=0
+                        [[ "$exp_ms" =~ ^[0-9]+$ ]] || exp_ms=0
+                        left_min=$(( exp_ms / 60000 - $(date +%s) / 60 ))
+                        hm="$(printf '%dh%02dm' $(( left_min / 60 )) $(( left_min % 60 )))"
+                        if printf '%s' "$token" | k8s_push_claude_key "$safe_name" "$hm"; then
+                            last_pushed_hash="$hash"
+                        fi
+                    fi
+                fi
+            fi
+            tick=$(( tick + 1 ))
+            sleep 2
+        done
+    ) &
+    K8S_CLAUDE_KEEPER_PID=$!
+}
+
+# Stops whatever k8s_claude_keeper_start last started, if anything: kills
+# the background subshell and waits for it, so its own EXIT trap (which may
+# be mid-refresh, holding claude's locks and a scratch dir with the real
+# refresh token in it) runs to completion before this function returns --
+# see _fs_claude_refresh_emergency_cleanup. Idempotent: called with no
+# keeper running, it does nothing.
+k8s_claude_keeper_stop() {
+    if [[ -n "$K8S_CLAUDE_KEEPER_PID" ]]; then
+        kill "$K8S_CLAUDE_KEEPER_PID" 2>/dev/null
+        # `|| true`: this whole script runs under set -e, and `wait` for a
+        # PID that died BY SIGNAL (exactly what the kill just above causes)
+        # returns 128+signum -- a bare, untested command with that exit
+        # status trips set -e right here, aborting the process with THAT
+        # status before it ever reaches this function's own end. Installed
+        # as an EXIT trap (see cmd_wait), that would silently turn a clean
+        # cmd_wait success (agent_rc already written to stdout) into an
+        # apparent SIGTERM death for whatever called it.
+        wait "$K8S_CLAUDE_KEEPER_PID" 2>/dev/null || true
+        K8S_CLAUDE_KEEPER_PID=""
+    fi
+    # Same defensive ending _fs_claude_refresh_emergency_cleanup uses, for
+    # the same reason: this function's own return status must never be
+    # anything but 0 once installed as cmd_wait's EXIT trap.
+    true
+}
+
 # cmd_run's wait phase, standalone: poll the run's pod until its entrypoint
 # writes /work/.run-complete (which holds the agent's own exit code),
 # failing fast on a dead pod, a Failed job condition, a timeout or a
@@ -6263,12 +6535,19 @@ cmd_rm() {
 # fetched), while exit 1 is the probe's own deadline (the run may still be
 # going) or a usage error.
 cmd_wait() {
-    local timeout=3600 branch="" project_path="${project_path-}" probe=false
+    local timeout=3600 branch="" project_path="${project_path-}" probe=false run_dir=""
     while (( $# )); do
         case "$1" in
             --branch) branch="${2:?--branch requires a name}"; shift 2 ;;
             --timeout) timeout="${2:?--timeout requires a number of seconds}"; shift 2 ;;
             --probe) probe=true; shift ;;
+            # Optional: names the run directory cmd_submit wrote run.env
+            # into, so this wait can find CLAUDE_CREDENTIAL_PATH and keep
+            # a --harness claude run's proxy token alive for as long as
+            # this call blocks -- see k8s_claude_keeper_start below.
+            # k8s_run_tail always passes this when it has a run_dir; a
+            # hand-run `wait` gets the keeper only by passing it too.
+            --run-dir) run_dir="${2:?--run-dir requires a directory}"; shift 2 ;;
             -*) echo "Error: unknown option '$1' for wait." >&2; exit 1 ;;
             *) break ;;
         esac
@@ -6331,6 +6610,44 @@ cmd_wait() {
     if [[ "$probe" != true ]]; then
         echo "fork-sandbox-k8s: waiting for branch $branch to finish (polling" >&2
         echo "every 10s, timeout ${timeout}s)" >&2
+    fi
+
+    # The keeper: for as long as THIS call blocks, keep a --harness claude
+    # run's proxy token in step with the host's own credential file -- see
+    # k8s_claude_keeper_start's own header. Started only once pod_name is
+    # known (every exit above this point never waited on anything worth
+    # keeping alive), and stopped on every exit path below via this trap,
+    # including a signal -- k8s_claude_keeper_stop is idempotent when no
+    # keeper was ever started.
+    trap 'k8s_claude_keeper_stop' EXIT
+    if [[ -n "$run_dir" && -f "$run_dir/run.env" ]]; then
+        local wait_harness claude_cred_path
+        wait_harness="$(read_env_value "$run_dir/run.env" harness || true)"
+        if [[ "$wait_harness" == claude ]]; then
+            claude_cred_path="$(read_env_value "$run_dir/run.env" CLAUDE_CREDENTIAL_PATH || true)"
+            if [[ -n "$claude_cred_path" ]]; then
+                k8s_claude_keeper_start "$claude_cred_path" "$safe_name"
+            else
+                echo "fork-sandbox-k8s: no Claude credential path was recorded for this run" >&2
+                echo "(a Keychain-backed credential, or a run submitted before this" >&2
+                echo "feature existed) -- the pod's access token will not be kept alive." >&2
+            fi
+        fi
+    elif [[ "$probe" != true ]]; then
+        # No --run-dir at all (a hand-run `wait --branch X` that did not
+        # pass the run directory `submit` printed) -- this call cannot even
+        # look up the run's harness, so it cannot know whether there is a
+        # Claude token to keep alive. Say so once rather than silently
+        # leaving it unprotected, matching the note printed after a bare
+        # `submit` (see k8s_note_standalone_submit_keeper) and the "no
+        # keeper" case just above. Gated on --probe, like the startup and
+        # heartbeat messages below: a probe loop (the postmaster's poller)
+        # calls this every few seconds with no --run-dir and promises quiet
+        # stderr on an ordinary still-running result.
+        echo "fork-sandbox-k8s: no --run-dir given -- if this is a --harness" >&2
+        echo "claude run, its pod's access token will not be kept alive for" >&2
+        echo "this wait. Pass --run-dir <dir> (printed by submit as 'run dir:')" >&2
+        echo "to keep it alive." >&2
     fi
 
     local start_ts now elapsed last_report_ts run_complete phase job_failed
@@ -7167,7 +7484,14 @@ k8s_run_tail() {
     # called normally, so its own exit paths behave exactly as they did
     # inline before this extraction.
     local agent_rc wait_rc=0
-    agent_rc="$(cmd_wait --branch "$branch" --timeout "$timeout")" || wait_rc=$?
+    local -a wait_argv=(--branch "$branch" --timeout "$timeout")
+    # Threaded through so cmd_wait can find CLAUDE_CREDENTIAL_PATH in
+    # run.env and keep this run's proxy token alive for as long as it
+    # blocks -- see k8s_claude_keeper_start. Both cmd_run (a fresh submit)
+    # and cmd_resume (an existing run directory) reach this through
+    # k8s_run_tail, so both get the keeper the same way.
+    [[ -n "$run_dir" ]] && wait_argv+=(--run-dir "$run_dir")
+    agent_rc="$(cmd_wait "${wait_argv[@]}")" || wait_rc=$?
     if (( wait_rc != 0 )); then
         # cmd_wait failed before the agent's sentinel appeared (a dead pod
         # or a malformed sentinel, both terminal codes -- exit 2 -- or a
@@ -7451,7 +7775,7 @@ shift
 
 case "$verb" in
     install) cmd_install "$@" ;;
-    submit) cmd_submit "$@" ;;
+    submit) cmd_submit "$@"; k8s_note_standalone_submit_keeper ;;
     run) cmd_run "$@" ;;
     resume) cmd_resume "$@" ;;
     wait) cmd_wait "$@" ;;
