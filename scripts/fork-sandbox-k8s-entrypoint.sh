@@ -525,6 +525,26 @@ discover_model_facts() {
 }
 
 mounts_dir=/mnt/fork-sandbox
+
+# fork-sandbox-lib.sh, shipped in only for --harness claude (see
+# render_claude_configmap_keys in fork-sandbox-k8s.sh): sourced here, before
+# anything else, so fs_leg_error_retryable and fs_harness_error -- both used
+# by the claude coding leg's retry wrapper below -- are the exact same
+# functions the local runner (fork-sandbox.sh's RUNNER heredoc) uses, never
+# a second copy that could drift. Gated on HARNESS, not on the file's own
+# existence: cmd_submit already refuses to render this pod's ConfigMap at
+# all when fork-sandbox-lib.sh is unreadable on the host (see its own
+# `[[ -r "$lib_sh" ]]` check), so a --harness claude pod that reaches this
+# line and still finds no lib.sh has a broken ConfigMap mount -- a bug worth
+# a loud, unguarded `source` failure under `set -e`, the same way the
+# claude-credentials.json install and inbox-hook.sh install just below
+# fail loudly rather than silently skipping. A pi run never reaches this at
+# all, since it never calls either function.
+if [[ "$HARNESS" == claude ]]; then
+    # shellcheck source=/dev/null
+    source "$mounts_dir/lib.sh"
+fi
+
 work_dir=/work
 repo_bare="$work_dir/repo.git"
 clone_dir="$work_dir/clone"
@@ -1112,6 +1132,48 @@ else
         run_claude_attempt || pi_rc=$?
         echo "fork-sandbox-k8s-entrypoint: claude exited $pi_rc" >&2
     fi
+
+    # A claude leg that STILL fails, on an auth or transient provider error
+    # (a revoked/expired OAuth token, an overloaded/5xx model) rather than
+    # the run's own doing, is restarted fresh -- never resumed, the resume
+    # itself already had its one chance above, which is a different trigger
+    # -- up to once per entry of FS_LEG_RETRY_DELAYS (default "30 120", a
+    # test hook exactly like the local runner's own FS_LEG_RETRY_DELAYS --
+    # see fs_run_claude_leg_with_retry in fork-sandbox.sh's RUNNER heredoc).
+    # fs_leg_error_retryable and fs_harness_error are the exact same
+    # functions that backstop uses, sourced from fork-sandbox-lib.sh above
+    # unconditionally for HARNESS=claude (this whole block runs only in
+    # that branch), so no existence guard is needed here -- a missing
+    # lib.sh already failed the source above loudly, before reaching this
+    # point. Simpler than the local runner's own driver: one leg, no
+    # per-attempt archiving (this pod's events.jsonl is simply overwritten
+    # by the next attempt) and no cost accounting (the host reads this
+    # run's cost from the pod's own outbox/evidence afterwards, not from
+    # anything this loop tracks).
+    IFS=' ' read -r -a claude_retry_delays <<< "${FS_LEG_RETRY_DELAYS:-30 120}"
+    claude_retry_attempt=0
+    for claude_retry_delay in "${claude_retry_delays[@]}"; do
+        (( pi_rc != 0 )) || break
+        claude_retry_err="$(fs_harness_error claude "$work_dir/events.jsonl")"
+        fs_leg_error_retryable claude "$claude_retry_err" || break
+        # Pre-increment: this runs under set -e, and a POST-increment
+        # from 0 evaluates the arithmetic command's own result to 0
+        # (the OLD value), which set -e reads as a failing command and
+        # aborts the whole leg right here on the very first retry.
+        (( ++claude_retry_attempt ))
+        echo "fork-sandbox-k8s-entrypoint: claude failed on a transient error" \
+            "($claude_retry_err); retry $claude_retry_attempt/${#claude_retry_delays[@]}" \
+            "in ${claude_retry_delay}s" >&2
+        sleep "$claude_retry_delay"
+        claude_argv=("${claude_argv_fresh[@]}")
+        pi_rc=0
+        run_claude_attempt || pi_rc=$?
+        echo "fork-sandbox-k8s-entrypoint: claude exited $pi_rc" >&2
+        if (( pi_rc == 0 )); then
+            echo "fork-sandbox-k8s-entrypoint: claude succeeded on retry" \
+                "$claude_retry_attempt" >&2
+        fi
+    done
 
     if [[ -n "${REFRESH_THRESHOLD_TOKENS:-}" ]]; then
         run_claude_continuations

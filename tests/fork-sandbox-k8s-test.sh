@@ -3793,9 +3793,18 @@ else
     no "rendered claude-credentials.json carries the sandbox placeholder access token" \
         "not found in $claude_submit_out"
 fi
-if grep -q 'refreshToken' "$claude_submit_out"; then
+# Scoped to the claude-credentials.json block itself, not the whole
+# rendered manifest: the ConfigMap also carries fork-sandbox-lib.sh
+# verbatim (see render_claude_configmap_keys), whose own jq filters
+# legitimately mention refreshToken in source text that is not a secret.
+claude_creds_block="$(awk '
+    /^  claude-credentials\.json: \|$/ { flag=1; next }
+    flag && (length($0)==0 || substr($0,1,4)=="    ") { print; next }
+    flag { exit }
+' "$claude_submit_out")"
+if grep -q 'refreshToken' <<< "$claude_creds_block"; then
     no "rendered claude-credentials.json carries no refreshToken" \
-        "found 'refreshToken' in $claude_submit_out"
+        "found 'refreshToken' in: $claude_creds_block"
 else
     ok "rendered claude-credentials.json carries no refreshToken"
 fi
@@ -3957,8 +3966,15 @@ fi
 small_brief_out="$(HOME="$claude_home" FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" \
     submit --dry-run --branch fs-k8s-test-branch --model claude-sonnet-5 \
     --harness claude --refresh-at 100 "$proj_dir" "$handoff_file" 2>&1)"
-if grep -q 'this brief is' <<< "$small_brief_out"; then
-    no "submit triggers no large-brief warning for a small brief"
+# A plain 'this brief is' substring match would also hit
+# fs_refresh_warn_brief's own printf FORMAT STRING, embedded verbatim as
+# fork-sandbox-lib.sh source in the rendered ConfigMap's lib.sh key (see
+# render_claude_configmap_keys) -- present in every --refresh-at claude
+# render regardless of whether the warning actually fired. Match the
+# substituted form instead (a real byte count in place of the literal
+# "%s"), which only appears when the warning itself printed.
+if grep -qE 'this brief is [0-9]+ bytes' <<< "$small_brief_out"; then
+    no "submit triggers no large-brief warning for a small brief" "$small_brief_out"
 else
     ok "submit triggers no large-brief warning for a small brief"
 fi
@@ -10499,7 +10515,15 @@ fi
 claude_block="$(sed -n '/^pi_rc=0$/,/^fi$/p' "$entrypoint_sh")"
 claude_block_file="$(newdir)/claude-block.sh"; tmpdirs+=("$(dirname "$claude_block_file")")
 if [[ -n "$claude_block" ]]; then
-    printf '%s\n' 'set -euo pipefail' "$claude_block" \
+    # source "$mounts_dir/lib.sh" first, exactly as the real entrypoint does
+    # near its own top (before this block's own sed range begins) -- so
+    # fs_leg_error_retryable and fs_harness_error, which the transient-
+    # error retry inside this block calls, resolve to the exact same
+    # functions a real pod gets, not a second copy. claude_block_run below
+    # stages a real copy of fork-sandbox-lib.sh at $mounts/lib.sh.
+    printf '%s\n' 'set -euo pipefail' \
+        'source "$mounts_dir/lib.sh"' \
+        "$claude_block" \
         'printf "CLAUDE_BLOCK_PI_RC=%s\n" "$pi_rc"' > "$claude_block_file"
     ok "the claude coding-leg block (pi_rc=0..fi) is isolable in the entrypoint"
 else
@@ -10507,24 +10531,31 @@ else
         "block not found in $entrypoint_sh"
 fi
 
-# $1 = CLAUDE_STUB_MODE (ok|resume-fail|other-fail), $2 = RESUME_SESSION
-# (empty for none), $3 = a shell snippet run to pre-seed $CLAUDE_BLOCK_HOME
-# or $CLAUDE_BLOCK_STORE before the block runs (empty for none). Sets
+# $1 = CLAUDE_STUB_MODE (ok|resume-fail|other-fail|transient-then-ok|
+# persistent401|limit429), $2 = RESUME_SESSION (empty for none), $3 = a
+# shell snippet run to pre-seed $CLAUDE_BLOCK_HOME or $CLAUDE_BLOCK_STORE
+# before the block runs (empty for none), $4 = FS_LEG_RETRY_DELAYS
+# (defaults to "0 0" so a retry test finishes in milliseconds, the same
+# test hook fork-sandbox.sh's own RUNNER heredoc honors). Sets
 # CLAUDE_BLOCK_HOME/_STORE/_CLONE/_RECORD/_OUT/_PI_RC/_CALLS after running.
 claude_block_run() {
-    local stub_dir mounts work home store clone record
+    local stub_dir mounts work home store clone record marker
     stub_dir="$(newdir)"; tmpdirs+=("$stub_dir")
     mounts="$(newdir)"; tmpdirs+=("$mounts")
     work="$(newdir)"; tmpdirs+=("$work")
     home="$(newdir)"; tmpdirs+=("$home")
     record="$(newdir)/claude-argv.txt"; tmpdirs+=("$(dirname "$record")")
     : > "$record"
+    marker="$stub_dir/.transient-marker"
     store="$work/session-store"
     clone="$work/clone"
     mkdir -p "$work/inbox" "$store"
     printf 'Do the thing.\n' > "$mounts/handoff.md"
     printf '{}' > "$mounts/claude-credentials.json"
     printf '#!/usr/bin/env bash\nexit 0\n' > "$mounts/inbox-hook.sh"
+    # The real entrypoint sources this from its own ConfigMap-mounted copy
+    # (see render_claude_configmap_keys); staged here the same way.
+    cp "$repo_dir/scripts/fork-sandbox-lib.sh" "$mounts/lib.sh"
     printf '%s\n' '#!/usr/bin/env bash' \
         'printf "%s\n" "$*" >> "$CLAUDE_STUB_RECORD"' \
         'case "$CLAUDE_STUB_MODE" in' \
@@ -10536,6 +10567,20 @@ claude_block_run() {
         '    exit 0 ;;' \
         '  other-fail)' \
         '    echo "some other unrelated error" >&2' \
+        '    exit 1 ;;' \
+        '  transient-then-ok)' \
+        '    if [[ ! -e "$CLAUDE_STUB_MARKER" ]]; then' \
+        '      touch "$CLAUDE_STUB_MARKER"' \
+        '      echo '"'"'{"type":"result","is_error":true,"result":"API Error: 401 OAuth access token has been revoked"}'"'"'' \
+        '      exit 1' \
+        '    fi' \
+        '    echo '"'"'{"type":"result","is_error":false,"result":"ok"}'"'"'' \
+        '    exit 0 ;;' \
+        '  persistent401)' \
+        '    echo '"'"'{"type":"result","is_error":true,"result":"API Error: 401 OAuth access token has been revoked"}'"'"'' \
+        '    exit 1 ;;' \
+        '  limit429)' \
+        '    echo '"'"'{"type":"result","is_error":true,"result":"API Error: 429 rate_limit_error"}'"'"'' \
         '    exit 1 ;;' \
         '  *) exit 0 ;;' \
         'esac' > "$stub_dir/claude"
@@ -10551,7 +10596,8 @@ claude_block_run() {
         mounts_dir="$mounts" work_dir="$work" clone_dir="$clone" inbox_dir="$work/inbox" \
         session_store_dir="$store" \
         SESSION_HARNESS_STORE=1 RESUME_SESSION="${2:-}" \
-        CLAUDE_STUB_MODE="${1:-ok}" CLAUDE_STUB_RECORD="$record" \
+        CLAUDE_STUB_MODE="${1:-ok}" CLAUDE_STUB_RECORD="$record" CLAUDE_STUB_MARKER="$marker" \
+        FS_LEG_RETRY_DELAYS="${4:-0 0}" \
         bash "$claude_block_file" 2>&1)"
     CLAUDE_BLOCK_PI_RC="$(grep -o 'CLAUDE_BLOCK_PI_RC=.*' <<<"$CLAUDE_BLOCK_OUT" | tail -1 | cut -d= -f2)"
     CLAUDE_BLOCK_CALLS="$(wc -l < "$record")"
@@ -10598,6 +10644,126 @@ if [[ "$CLAUDE_BLOCK_CALLS" == 1 ]] \
 else
     no "no RESUME_SESSION means no --resume and a single attempt" \
         "calls=$CLAUDE_BLOCK_CALLS record: $(cat "$CLAUDE_BLOCK_RECORD") pi_rc=$CLAUDE_BLOCK_PI_RC"
+fi
+
+printf '\n== entrypoint: claude coding leg retries a transient provider error ==\n'
+# A claude leg that fails once on a 401-revoked stream-json error is
+# restarted fresh, exactly once, and the retry's success is what pi_rc
+# reports -- the same backstop the local runner's own
+# fs_run_claude_leg_with_retry provides, simplified for one leg with no
+# per-attempt archiving. FS_LEG_RETRY_DELAYS="0 0" (claude_block_run's own
+# default) skips the real 30s/120s backoff.
+claude_block_run transient-then-ok ""
+if [[ "$CLAUDE_BLOCK_CALLS" == 2 ]] && [[ "$CLAUDE_BLOCK_PI_RC" == 0 ]] \
+    && grep -qF 'failed on a transient error' <<< "$CLAUDE_BLOCK_OUT" \
+    && grep -qF 'revoked' <<< "$CLAUDE_BLOCK_OUT" \
+    && grep -qF 'succeeded on retry 1' <<< "$CLAUDE_BLOCK_OUT"; then
+    ok "a 401-revoked claude failure is retried once, fresh, and logs the retry and its success"
+else
+    no "a 401-revoked claude failure is retried once, fresh, and logs the retry and its success" \
+        "calls=$CLAUDE_BLOCK_CALLS pi_rc=$CLAUDE_BLOCK_PI_RC out=$CLAUDE_BLOCK_OUT"
+fi
+# The retry restarts FRESH, never resuming the session that just failed --
+# same rule the resume-failure retry above follows.
+claude_block_run transient-then-ok resumeid-0001-aaaa-bbbb-cccccccccccc
+if [[ "$(sed -n 1p "$CLAUDE_BLOCK_RECORD")" == *"--resume resumeid-0001-aaaa-bbbb-cccccccccccc"* ]] \
+    && [[ "$(sed -n 2p "$CLAUDE_BLOCK_RECORD")" != *"--resume"* ]]; then
+    ok "the transient-error retry restarts fresh, never replaying --resume"
+else
+    no "the transient-error retry restarts fresh, never replaying --resume" \
+        "$(cat "$CLAUDE_BLOCK_RECORD")"
+fi
+
+# A leg that keeps failing on the same transient error exhausts exactly its
+# configured retries (2, from FS_LEG_RETRY_DELAYS="0 0") and the exhaustion
+# is logged too -- 3 calls total (the first attempt plus 2 retries), still
+# failing at the end.
+claude_block_run persistent401 ""
+if [[ "$CLAUDE_BLOCK_CALLS" == 3 ]] && [[ "$CLAUDE_BLOCK_PI_RC" != 0 ]] \
+    && [[ "$(grep -c 'failed on a transient error' <<< "$CLAUDE_BLOCK_OUT")" == 2 ]] \
+    && ! grep -qF 'succeeded on retry' <<< "$CLAUDE_BLOCK_OUT"; then
+    ok "a persistently-failing transient error exhausts its 2 configured retries"
+else
+    no "a persistently-failing transient error exhausts its 2 configured retries" \
+        "calls=$CLAUDE_BLOCK_CALLS pi_rc=$CLAUDE_BLOCK_PI_RC out=$CLAUDE_BLOCK_OUT"
+fi
+
+# A plain failure with no provider error text at all (the "other-fail"
+# stub writes nothing to stdout) is never retried -- fs_harness_error finds
+# nothing in the empty events file to classify.
+claude_block_run other-fail ""
+if [[ "$CLAUDE_BLOCK_CALLS" == 1 ]] && [[ "$CLAUDE_BLOCK_PI_RC" != 0 ]] \
+    && ! grep -qF 'failed on a transient error' <<< "$CLAUDE_BLOCK_OUT"; then
+    ok "a plain claude failure with no provider error text is never retried"
+else
+    no "a plain claude failure with no provider error text is never retried" \
+        "calls=$CLAUDE_BLOCK_CALLS pi_rc=$CLAUDE_BLOCK_PI_RC out=$CLAUDE_BLOCK_OUT"
+fi
+
+# A 429 is a usage cap, not a transient failure -- excluded by
+# fs_leg_error_retryable even though it is a real, parseable provider
+# error, unlike the plain case above.
+claude_block_run limit429 ""
+if [[ "$CLAUDE_BLOCK_CALLS" == 1 ]] && [[ "$CLAUDE_BLOCK_PI_RC" != 0 ]] \
+    && ! grep -qF 'failed on a transient error' <<< "$CLAUDE_BLOCK_OUT"; then
+    ok "a 429 claude failure is never retried"
+else
+    no "a 429 claude failure is never retried" \
+        "calls=$CLAUDE_BLOCK_CALLS pi_rc=$CLAUDE_BLOCK_PI_RC out=$CLAUDE_BLOCK_OUT"
+fi
+
+printf '\n== entrypoint: fork-sandbox-lib.sh sourcing is gated on HARNESS, not file existence ==\n'
+# cmd_submit already refuses to render a --harness claude pod's ConfigMap at
+# all when fork-sandbox-lib.sh is unreadable on the host (its own
+# `[[ -r "$lib_sh" ]]` check) -- so a HARNESS=claude pod that still finds no
+# lib.sh under mounts_dir has a broken ConfigMap mount, a bug worth a loud
+# failure rather than a silently-skipped retry. Extracted the same way as
+# the claude coding-leg block above: the sed range is anchored on this
+# comment's own opening line (NOT the "mounts_dir=..." assignment just
+# above it, which would otherwise reset mounts_dir back to the real pod's
+# hardcoded path and defeat this test's own mounts_dir override below) and
+# the "fi" that closes the HARNESS-gated source.
+lib_source_block="$(sed -n '/^# fork-sandbox-lib.sh, shipped in only for --harness claude/,/^fi$/p' "$entrypoint_sh")"
+lib_source_block_file="$(newdir)/lib-source-block.sh"; tmpdirs+=("$(dirname "$lib_source_block_file")")
+if [[ -n "$lib_source_block" ]]; then
+    printf '%s\n' 'set -euo pipefail' "$lib_source_block" 'echo LIB_SOURCE_BLOCK_OK' \
+        > "$lib_source_block_file"
+    ok "the HARNESS-gated fork-sandbox-lib.sh source is isolable in the entrypoint"
+else
+    no "the HARNESS-gated fork-sandbox-lib.sh source is isolable in the entrypoint" \
+        "block not found in $entrypoint_sh"
+fi
+
+lib_source_empty_mounts="$(newdir)"; tmpdirs+=("$lib_source_empty_mounts")
+lib_source_out="$(mounts_dir="$lib_source_empty_mounts" HARNESS=claude \
+    bash "$lib_source_block_file" 2>&1)"
+lib_source_rc=$?
+if (( lib_source_rc != 0 )) && ! grep -qF 'LIB_SOURCE_BLOCK_OK' <<< "$lib_source_out"; then
+    ok "HARNESS=claude with no lib.sh under mounts_dir fails loudly, not silently"
+else
+    no "HARNESS=claude with no lib.sh under mounts_dir fails loudly, not silently" \
+        "rc=$lib_source_rc out=$lib_source_out"
+fi
+
+lib_source_out="$(mounts_dir="$lib_source_empty_mounts" HARNESS=pi \
+    bash "$lib_source_block_file" 2>&1)"
+lib_source_rc=$?
+if (( lib_source_rc == 0 )) && grep -qF 'LIB_SOURCE_BLOCK_OK' <<< "$lib_source_out"; then
+    ok "HARNESS=pi never attempts to source lib.sh, even when mounts_dir has none"
+else
+    no "HARNESS=pi never attempts to source lib.sh, even when mounts_dir has none" \
+        "rc=$lib_source_rc out=$lib_source_out"
+fi
+
+cp "$repo_dir/scripts/fork-sandbox-lib.sh" "$lib_source_empty_mounts/lib.sh"
+lib_source_out="$(mounts_dir="$lib_source_empty_mounts" HARNESS=claude \
+    bash "$lib_source_block_file" 2>&1)"
+lib_source_rc=$?
+if (( lib_source_rc == 0 )) && grep -qF 'LIB_SOURCE_BLOCK_OK' <<< "$lib_source_out"; then
+    ok "HARNESS=claude with lib.sh present under mounts_dir sources it cleanly"
+else
+    no "HARNESS=claude with lib.sh present under mounts_dir sources it cleanly" \
+        "rc=$lib_source_rc out=$lib_source_out"
 fi
 
 # Flatten: a transcript pulled in under a FOREIGN slug directory is also
