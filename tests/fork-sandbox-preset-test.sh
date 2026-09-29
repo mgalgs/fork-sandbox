@@ -1512,6 +1512,20 @@ n=$(( n + 1 ))
 printf '%s' "$n" > "$FAKE_COUNT_FILE"
 printf '%s\n' "$*" >> "$FAKE_ARGV_LOG"
 
+# Intermediate-state capture for the progress.json tests: while THIS call is
+# "the leg" a pipeline step is running, run.sh's own progress.json already
+# shows that step as "running" (it is written before the leg starts, not
+# after) -- the one moment run_stubbed's caller, which only ever sees the
+# process after it has exited, can never observe directly. clone_dir is
+# "$run_dir/clone/$(basename origin_repo)" (fork-sandbox.sh's own layout),
+# so its grandparent is the run dir with no extra plumbing needed. Only
+# active when a test sets SNAPSHOT_DIR; every other call here is a no-op.
+if [[ -n "${SNAPSHOT_DIR:-}" && -n "$clone_dir" ]]; then
+    snapshot_run_dir="$(dirname "$(dirname "$clone_dir")")"
+    [[ -f "$snapshot_run_dir/progress.json" ]] \
+        && cp -- "$snapshot_run_dir/progress.json" "$SNAPSHOT_DIR/progress-$n.json" 2>/dev/null
+fi
+
 # The scripted role: FAKE_SCRIPT holds one action per line, indexed by call
 # number -- "commit", "findings", "approved", "fail", or "noop".
 action="$(sed -n "${n}p" "$FAKE_SCRIPT" 2>/dev/null)"
@@ -1642,9 +1656,13 @@ prep_stub() {
 
 run_stubbed() {
     # Launcher args only; prep_stub ran first. Prints the run dir.
+    # SNAPSHOT_DIR, when the caller has it set/exported, is forwarded so the
+    # stub's own intermediate-state capture (see claude-sandboxed above) can
+    # be turned on per-call without a second copy of this function.
     local out rc rd
     out="$(HOME="$launcher_home" PATH="$real_stub:$PATH" FAKE_COUNT_FILE="$count" \
         FAKE_ARGV_LOG="$argv_log" FAKE_SCRIPT="$script_file" \
+        SNAPSHOT_DIR="${SNAPSHOT_DIR:-}" \
         FORK_SANDBOX_CONFIG_DIR="$real_cfg" FORK_SANDBOX_BACKEND=fake-image \
         timeout 60 "$launcher" --foreground "$@" "$proj" "$handoff" 2>&1)"
     rc=$?
@@ -2648,6 +2666,15 @@ progress_steps() {
         "$1/progress.json" 2>/dev/null
 }
 
+# Same reduction as progress_steps, but for a snapshot file's own exact
+# path rather than a run dir's progress.json -- the mid-run captures below
+# are named "progress-<call number>.json" beside each other, not one per
+# directory.
+snapshot_steps() {
+    jq -r '[.steps[] | "\(.action)/\(.state)/\(.i)/\(.cap)/\(.ended)"] | join(" ")' \
+        "$1" 2>/dev/null
+}
+
 # Spot-check three shapes already built above, rather than launching them
 # again: a composed multi-review-then-maintain pipeline that ends approved
 # (rd_composed), a read-only review-then-maintain pipeline with no code
@@ -2745,6 +2772,55 @@ if rd_prog_cap="$(run_stubbed --preset reviewloop --review-loop 2 \
         "done" "$(jq -r '.state' "$rd_prog_cap/progress.json")"
 else
     no "progress.json review-loop-cap launch succeeds"
+fi
+
+# Intermediate state, not just the terminal file: progress.json is rewritten
+# BEFORE each leg starts (fork-sandbox.sh's progress_write call precedes the
+# harness invocation), so while a call to the claude-sandboxed stub is in
+# flight, the file on disk already reflects that leg as the active one. The
+# stub's own SNAPSHOT_DIR capture (see claude-sandboxed above) copies
+# progress.json aside on every call, keyed by call number, so this is the
+# one place this suite can see a state the terminal file below always
+# overwrites: "running" with the right i, not yet finalized.
+#
+# A code step with repeat 3: 200cd3c552 fixed an undercount where the
+# active pass's own leg saw the PREVIOUS pass's i -- exactly the kind of bug
+# a terminal-only check cannot catch, since by the end every pass has come
+# and gone. Each of the three snapshots must show the step already
+# "running" at that pass's own i, not the one before it.
+snapshot_dir_repeat="$(mktemp -d)"; tmpdirs+=("$snapshot_dir_repeat")
+prep_stub $'commit\nnoop\ncommit'
+if rd_prog_repeat="$(SNAPSHOT_DIR="$snapshot_dir_repeat" run_stubbed --preset rep3 \
+    --branch "sandbox-test-prog-repeat-$$")"; then
+    tmpdirs+=("$rd_prog_repeat")
+    check "repeat-code pass 1: snapshot shows the step running at i=1" \
+        "code/running/1/3/null" "$(snapshot_steps "$snapshot_dir_repeat/progress-1.json")"
+    check "repeat-code pass 2: snapshot shows the step running at i=2" \
+        "code/running/2/3/null" "$(snapshot_steps "$snapshot_dir_repeat/progress-2.json")"
+    check "repeat-code pass 3: snapshot shows the step running at i=3" \
+        "code/running/3/3/null" "$(snapshot_steps "$snapshot_dir_repeat/progress-3.json")"
+else
+    no "progress.json repeat-code snapshot launch succeeds"
+fi
+
+# A review loop iteration: each review leg (the odd-numbered calls below)
+# must see the review step already "running" at that iteration's own i,
+# the same class of off-by-one the repeat-pass fix above closed, just for
+# the loop walker's cur_i instead of the repeat counter.
+snapshot_dir_review="$(mktemp -d)"; tmpdirs+=("$snapshot_dir_review")
+prep_stub $'commit\nfindings\ncommit\nfindings\ncommit'
+if rd_prog_review_snap="$(SNAPSHOT_DIR="$snapshot_dir_review" run_stubbed \
+    --preset reviewloop --review-loop 2 \
+    --branch "sandbox-test-prog-review-snap-$$")"; then
+    tmpdirs+=("$rd_prog_review_snap")
+    check "review iteration 1: snapshot shows the step running at i=1" \
+        "code/done/1/1/null review/running/1/2/null" \
+        "$(snapshot_steps "$snapshot_dir_review/progress-2.json")"
+    check "review iteration 2: snapshot shows the step running at i=2" \
+        "code/done/1/1/null review/running/2/2/null" \
+        "$(snapshot_steps "$snapshot_dir_review/progress-4.json")"
+else
+    no "progress.json review-loop snapshot launch succeeds"
 fi
 
 # A failing leg: the coding leg itself exits non-zero, --foreground execs
