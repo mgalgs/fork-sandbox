@@ -55,10 +55,14 @@ writing a detailed handoff so nothing gets dropped.
    docs/permissions.md), the same source `context-usage.sh` prints:
    ```bash
    model="$(jq -r .model "/tmp/claude-$(id -u)/context-nudge/ctx-$CLAUDE_CODE_SESSION_ID.json")"
-   fork-task.sh --split --model "$model" . <handoff-file>
+   fork-task.sh --split --relation continuation --model "$model" . <handoff-file>
    ```
    Always use `--split` and `.` (current project) — this is a same-project
-   session refresh, not a cross-project fork.
+   session refresh, not a cross-project fork. Always pass
+   `--relation continuation` too: the new session carries on this same job
+   under a new session id, so the agent registry must record it as a
+   continuation edge, not a delegation — that is what lets a status line
+   reader walk back to this session's runs after the handoff.
 
    **Name the new session with `--purpose`.** Without it the session name
    defaults to the project directory basename, which is generic and breaks
@@ -69,7 +73,7 @@ writing a detailed handoff so nothing gets dropped.
    If the user asked for a specific model (fable, opus, sonnet, or a full
    model ID), use that instead of the stashed one:
    ```bash
-   fork-task.sh --split --model sonnet . <handoff-file>
+   fork-task.sh --split --relation continuation --model sonnet . <handoff-file>
    ```
    Only if the stash file is missing (the status line never ran) and the
    user named no model, omit `--model` and say so in the launch report.
