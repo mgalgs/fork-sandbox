@@ -1,7 +1,9 @@
 ---
-# The per-run Claude Code proxy: rendered and applied by `submit` for a
-# --harness claude run only, in the same kubectl apply stream as that run's
-# Job, never by `install` -- see fork-sandbox-k8s.sh's cmd_install, which
+# The per-run Claude Code proxy: rendered by `submit` for a --harness claude
+# run only, applied and waited on Ready BEFORE that run's own Job (never in
+# the same kubectl apply stream -- the egress-gate initContainer in the
+# Job's pod probes this proxy on its very first poll, so it has to already
+# be up), never by `install` -- see fork-sandbox-k8s.sh's cmd_install, which
 # skips this file by name, since the placeholders below are a value install
 # has no run to take them from. This proxy carries this one run's operator
 # access token, scoped to a Secret named after this run and torn down with

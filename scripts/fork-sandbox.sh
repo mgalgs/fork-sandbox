@@ -476,12 +476,14 @@
 #                        machine kit with --k8s prints a NOTICE and goes on.
 # --k8s:                 submit this run as a Kubernetes Job instead of a
 #                        local sandbox, by exec'ing fork-sandbox-k8s.sh run
-#                        with the arguments below. Defaults --harness to pi,
-#                        the only harness the cluster path builds; claude
-#                        and codex are still refused if named
-#                        explicitly. Most other flags describe LOCAL sandbox
-#                        machinery this run never touches and are refused by
-#                        name rather than silently dropped -- see
+#                        with the arguments below. Defaults --harness to pi;
+#                        --harness claude is also accepted, talking through
+#                        a per-run proxy that swaps in the operator's own
+#                        token. codex has no sandboxed path in the cluster
+#                        and is refused if named explicitly. Most other
+#                        flags describe LOCAL sandbox machinery this run
+#                        never touches and are refused by name rather than
+#                        silently dropped -- see
 #                        "Kubernetes runs" below.
 # --timeout <seconds>:   with --k8s, how long to wait for the agent before
 #                        giving up (passed to fork-sandbox-k8s.sh run).
