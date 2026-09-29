@@ -2226,8 +2226,13 @@ fs_claude_token_contract_check() {
     local dir version marker_ok marker_fail lockdir
 
     dir="$(_fs_claude_contract_dir)"
-    version="$("$claude_bin" --version 2>/dev/null | head -1)" || version=""
+    # </dev/null: this runs before the sandbox is fed its prompt on stdin.
+    version="$("$claude_bin" --version </dev/null 2>/dev/null | head -1)" || version=""
     version="${version%% *}"
+    # The version names the cache marker, so one that is empty or not
+    # version-shaped would poison the cache for every later call. Skip the
+    # check instead: there is nothing sound to cache it under.
+    [[ "$version" =~ ^[0-9][0-9A-Za-z.+-]*$ ]] || return 0
     mkdir -p "$dir" 2>/dev/null || true
     marker_ok="$dir/$version.ok"
     marker_fail="$dir/$version.fail"

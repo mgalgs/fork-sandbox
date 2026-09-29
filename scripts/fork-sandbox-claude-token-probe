@@ -304,7 +304,7 @@ for i in "${!CHECK_FNS[@]}"; do
     fi
 done
 
-CLAUDE_VERSION="$("$CLAUDE_BIN" --version 2>/dev/null | head -1)" || CLAUDE_VERSION=""
+CLAUDE_VERSION="$("$CLAUDE_BIN" --version </dev/null 2>/dev/null | head -1)" || CLAUDE_VERSION=""
 CLAUDE_VERSION="${CLAUDE_VERSION%% *}"
 
 if (( JSON_OUT )); then

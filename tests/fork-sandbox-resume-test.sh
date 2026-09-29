@@ -1053,6 +1053,9 @@ chmod +x "$cs_bin/sandbox-backend-test"
 # and fails on demand with a chosen message on stderr.
 cat > "$cs_bin/claude" <<'CLAUDE'
 #!/usr/bin/env bash
+# claude-sandboxed asks the host claude for its version before a step; that
+# is not an attempt.
+[[ "${1:-}" == --version ]] && exit 0
 printf '%s\n' "$@" >> "$CLAUDE_ARGV_FILE"
 printf -- '--- attempt end ---\n' >> "$CLAUDE_ARGV_FILE"
 cat >> "$CLAUDE_STDIN_FILE"

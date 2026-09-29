@@ -588,6 +588,19 @@ else
 fi
 rmdir "$contract_dir2/.probe-$stub_version.lock" 2>/dev/null || true
 
+printf '\n== an unreadable claude version skips the check, and caches nothing ==\n'
+noversion_stub="$work/claude-noversion"
+printf '#!/usr/bin/env bash\ncat >/dev/null\nexit 0\n' > "$noversion_stub"
+chmod +x "$noversion_stub"
+contract_dir_nv="$work/contract-cache-noversion"
+nv_out="$(printf 'the prompt\n' | FS_CLAUDE_TOKEN_CONTRACT_DIR="$contract_dir_nv" \
+    fs_claude_token_contract_check "$noversion_stub" "$wrapper" 2>&1)"
+if [[ -z "$(ls -A "$contract_dir_nv" 2>/dev/null)" && -z "$nv_out" ]]; then
+    ok "no version means no probe, no marker and no output"
+else
+    no "no version means no probe, no marker and no output" "cache: $(ls -A "$contract_dir_nv" 2>/dev/null); output: $nv_out"
+fi
+
 printf '\n== a failing probe warns loudly, on the first call and every cached call after ==\n'
 contract_dir3="$work/contract-cache-3"
 out1="$(PROBE_BREAK_CHECK=startup_refresh FS_CLAUDE_TOKEN_CONTRACT_DIR="$contract_dir3" \
