@@ -10046,6 +10046,239 @@ else
 fi
 rm -f /tmp/fs-k8s-co-dispatch.err
 
+printf '\n== --extra-ref: extra branches pushed beside the run branch (no cluster) ==\n'
+# submit --extra-ref NAME=SHA pushes one more refspec, <sha>:refs/heads/<name>,
+# in the SAME push as the run's own branch, and carries the names to the pod
+# as EXTRA_REFS. Every value is validated before anything is created. Same
+# stubbed kubectl/git pair as the --checkout section above: the stub git
+# records the push's own arguments, the stub kubectl every invocation.
+er_ref_sha="$co_tag_sha"
+er_missing_sha="$(printf 'a%.0s' {1..40})"
+
+# 1. The push carries the extra refspec, in the same invocation.
+er_dir1="$(newdir)"; tmpdirs+=("$er_dir1")
+PATH="$co_stub:$PATH" K8S_STUB_LOG="$er_dir1/kubectl.log" GIT_STUB_LOG="$er_dir1/git.log" \
+    FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit \
+    --branch fs-k8s-test-er-push --model moonshotai/kimi-k3 \
+    --extra-ref "upstream=$er_ref_sha" \
+    "$co_proj" "$handoff_file" > "$er_dir1/out.txt" 2>&1
+er_rc1=$?
+if (( er_rc1 == 0 )) \
+    && [[ "$(grep -c . "$er_dir1/git.log")" == 1 ]] \
+    && grep -qF -- "HEAD:refs/heads/fs-k8s-test-er-push $er_ref_sha:refs/heads/upstream" "$er_dir1/git.log"; then
+    ok "submit --extra-ref: the same single push carries the run branch and <sha>:refs/heads/upstream"
+else
+    no "submit --extra-ref: the same single push carries the run branch and <sha>:refs/heads/upstream" \
+        "rc=$er_rc1 git=$(cat "$er_dir1/git.log") out=$(cat "$er_dir1/out.txt")"
+fi
+
+# 2. Repeatable: two refs, two refspecs, in the order given.
+er_dir2="$(newdir)"; tmpdirs+=("$er_dir2")
+PATH="$co_stub:$PATH" K8S_STUB_LOG="$er_dir2/kubectl.log" GIT_STUB_LOG="$er_dir2/git.log" \
+    FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit \
+    --branch fs-k8s-test-er-two --model moonshotai/kimi-k3 \
+    --extra-ref "upstream=$er_ref_sha" --extra-ref "other-ref=$co_head_sha" \
+    "$co_proj" "$handoff_file" > "$er_dir2/out.txt" 2>&1
+er_rc2=$?
+if (( er_rc2 == 0 )) \
+    && grep -qF -- "HEAD:refs/heads/fs-k8s-test-er-two $er_ref_sha:refs/heads/upstream $co_head_sha:refs/heads/other-ref" "$er_dir2/git.log"; then
+    ok "submit --extra-ref is repeatable: one refspec per entry, in order"
+else
+    no "submit --extra-ref is repeatable: one refspec per entry, in order" \
+        "rc=$er_rc2 git=$(cat "$er_dir2/git.log") out=$(cat "$er_dir2/out.txt")"
+fi
+
+# 3. Without the flag the push is exactly the run branch, as before.
+er_dir3="$(newdir)"; tmpdirs+=("$er_dir3")
+PATH="$co_stub:$PATH" K8S_STUB_LOG="$er_dir3/kubectl.log" GIT_STUB_LOG="$er_dir3/git.log" \
+    FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit \
+    --branch fs-k8s-test-er-none --model moonshotai/kimi-k3 \
+    "$co_proj" "$handoff_file" > "$er_dir3/out.txt" 2>&1
+if [[ "$(grep -c 'refs/heads/' "$er_dir3/git.log")" == 1 ]] \
+    && [[ "$(grep -o 'refs/heads/[^ ]*' "$er_dir3/git.log" | wc -l)" == 1 ]]; then
+    ok "no --extra-ref: the push carries exactly one refspec, as before"
+else
+    no "no --extra-ref: the push carries exactly one refspec, as before" "git=$(cat "$er_dir3/git.log")"
+fi
+
+# 4. The names and shas reach the pod as EXTRA_REFS, in the Job's env.
+er_out4="$(newdir)/er-4.yaml"; tmpdirs+=("$(dirname "$er_out4")")
+if FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-er-env --model moonshotai/kimi-k3 \
+    --extra-ref "upstream=$er_ref_sha" --extra-ref "other-ref=$co_head_sha" \
+    "$co_proj" "$handoff_file" > "$er_out4" 2>&1 \
+    && grep -A1 'name: EXTRA_REFS' "$er_out4" | grep -qF "value: \"upstream=$er_ref_sha other-ref=$co_head_sha\""; then
+    ok "submit --dry-run --extra-ref renders EXTRA_REFS as space-separated NAME=SHA pairs"
+else
+    no "submit --dry-run --extra-ref renders EXTRA_REFS as space-separated NAME=SHA pairs" "$(grep -n EXTRA_REFS "$er_out4")"
+fi
+er_out4b="$(newdir)/er-4b.yaml"; tmpdirs+=("$(dirname "$er_out4b")")
+FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-er-env --model moonshotai/kimi-k3 \
+    "$co_proj" "$handoff_file" > "$er_out4b" 2>&1
+if ! grep -q 'name: EXTRA_REFS' "$er_out4b"; then
+    ok "submit --dry-run without --extra-ref renders no EXTRA_REFS"
+else
+    no "submit --dry-run without --extra-ref renders no EXTRA_REFS" "$(grep -n 'name: EXTRA_REFS' "$er_out4b")"
+fi
+
+# 5. Every refusal names the problem and leaves both stub logs empty --
+# nothing was created, nothing was pushed.
+er_refused() {
+    local label="$1" needle="$2"; shift 2
+    local d rc
+    d="$(newdir)"; tmpdirs+=("$d")
+    PATH="$co_stub:$PATH" K8S_STUB_LOG="$d/kubectl.log" GIT_STUB_LOG="$d/git.log" \
+        FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit \
+        --branch fs-k8s-test-er-bad --model moonshotai/kimi-k3 "$@" \
+        "$co_proj" "$handoff_file" > "$d/out.txt" 2>&1
+    rc=$?
+    if (( rc != 0 )) && [[ "$(cat "$d/out.txt")" == *"$needle"* ]] \
+        && [[ ! -s "$d/kubectl.log" && ! -s "$d/git.log" ]]; then
+        ok "submit --extra-ref $label is refused before anything is created"
+    else
+        no "submit --extra-ref $label is refused before anything is created" \
+            "rc=$rc kubectl=$(cat "$d/kubectl.log") git=$(cat "$d/git.log") out=$(cat "$d/out.txt")"
+    fi
+}
+er_refused "with no '='" "must look like NAME=SHA" --extra-ref "upstream$er_ref_sha"
+er_refused "with an uppercase name" "must match" --extra-ref "Upstream=$er_ref_sha"
+er_refused "with a name starting with a digit" "must match" --extra-ref "1up=$er_ref_sha"
+er_refused "with an underscore in the name" "must match" --extra-ref "up_stream=$er_ref_sha"
+er_refused "with an empty name" "must match" --extra-ref "=$er_ref_sha"
+er_refused "with a 32-character name" "must match" --extra-ref "$(printf 'a%.0s' {1..32})=$er_ref_sha"
+er_refused "naming the run's own branch" "own branch" --extra-ref "fs-k8s-test-er-bad=$er_ref_sha"
+er_refused "given the same name twice" "given twice" \
+    --extra-ref "upstream=$er_ref_sha" --extra-ref "upstream=$co_head_sha"
+er_refused "with a short sha" "full 40- or 64-character" --extra-ref "upstream=${er_ref_sha:0:12}"
+er_refused "with a symbolic ref instead of a sha" "full 40- or 64-character" --extra-ref "upstream=HEAD"
+er_refused "with an uppercase sha" "full 40- or 64-character" --extra-ref "upstream=${er_ref_sha^^}"
+er_refused "with a sha that is not in the origin repo" "does not name a commit" --extra-ref "upstream=$er_missing_sha"
+er_refused "with a name that hides a refspec separator" "must match" --extra-ref "up:stream=$er_ref_sha"
+# The same validation holds under --dry-run, which exists to exercise it.
+refuses "submit --dry-run --extra-ref with a sha absent from the origin repo is refused" \
+    "does not name a commit" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-er-dry --model moonshotai/kimi-k3 \
+    --extra-ref "upstream=$er_missing_sha" \
+    "$co_proj" "$handoff_file"
+
+# 6. The dispatcher: `run` and fork-sandbox.sh --k8s carry the flag through
+# to submit (proved as the --checkout section does, by diffing renders), and
+# a local fork-sandbox.sh run refuses it by name. It is a carried flag, not
+# a preset key.
+er_out7="$(newdir)/er-7.yaml"; tmpdirs+=("$(dirname "$er_out7")")
+er_out8="$(newdir)/er-8.yaml"; tmpdirs+=("$(dirname "$er_out8")")
+er_out9="$(newdir)/er-9.yaml"; tmpdirs+=("$(dirname "$er_out9")")
+FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" submit --dry-run \
+    --branch fs-k8s-test-er-dispatch --model moonshotai/kimi-k3 --harness pi \
+    --extra-ref "upstream=$er_ref_sha" "$co_proj" "$k8s_flag_handoff" > "$er_out7" 2>&1
+FORK_SANDBOX_CONFIG_DIR="$config_dir" "$k8s_sh" run --dry-run \
+    --branch fs-k8s-test-er-dispatch --model moonshotai/kimi-k3 --harness pi \
+    --extra-ref "upstream=$er_ref_sha" "$co_proj" "$k8s_flag_handoff" > "$er_out8" 2>&1
+FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --k8s --dry-run \
+    --harness pi --model moonshotai/kimi-k3 --branch fs-k8s-test-er-dispatch \
+    --extra-ref "upstream=$er_ref_sha" "$co_proj" "$k8s_flag_handoff" > "$er_out9" 2>&1
+if grep -qF "upstream=$er_ref_sha" "$er_out8" && diff -q "$er_out7" "$er_out8" >/dev/null 2>&1; then
+    ok "run --extra-ref forwards to submit (render matches a direct submit)"
+else
+    no "run --extra-ref forwards to submit (render matches a direct submit)" \
+        "$(diff "$er_out7" "$er_out8" 2>&1 | head -n 10)"
+fi
+if grep -qF "upstream=$er_ref_sha" "$er_out9" && diff -q "$er_out8" "$er_out9" >/dev/null 2>&1; then
+    ok "fork-sandbox.sh --k8s --extra-ref forwards to run (render matches the direct call)"
+else
+    no "fork-sandbox.sh --k8s --extra-ref forwards to run (render matches the direct call)" \
+        "$(diff "$er_out8" "$er_out9" 2>&1 | head -n 10)"
+fi
+refuses "fork-sandbox.sh without --k8s refuses --extra-ref by name" \
+    "--extra-ref only applies with --k8s" \
+    env FORK_SANDBOX_CONFIG_DIR="$config_dir" "$fs_sh" --dry-run \
+    --extra-ref "upstream=$er_ref_sha" "$co_proj" "$k8s_flag_handoff"
+for er_script in "$k8s_sh" "$fs_sh"; do
+    if grep -qF -- '--extra-ref' <(sed -n '2,/^[^#]/p' "$er_script"); then
+        ok "$(basename "$er_script") documents --extra-ref in its header"
+    else
+        no "$(basename "$er_script") documents --extra-ref in its header"
+    fi
+done
+
+# 7. The pod side: the entrypoint's EXTRA_REFS loop, extracted and run against
+# a real bare repo cloned the way the entrypoint clones it. Each name becomes
+# a LOCAL branch at origin/<name> with the pushed sha; the run branch stays
+# checked out.
+er_ep_block="$(sed -n '/^for extra_ref in \${EXTRA_REFS:-}; do$/,/^done$/p' "$entrypoint_sh")"
+if [[ -n "$er_ep_block" ]]; then
+    ok "the entrypoint has an EXTRA_REFS loop"
+else
+    no "the entrypoint has an EXTRA_REFS loop" "not found in $entrypoint_sh"
+fi
+er_ep_root="$(newdir)"; tmpdirs+=("$er_ep_root")
+(
+    cd "$er_ep_root" || exit 1
+    git init -q --bare pod.git
+    git init -q src && cd src \
+        && git config user.email t@fork-sandbox.invalid && git config user.name Tester \
+        && git checkout -q -b fs-er-run \
+        && printf 'run\n' > f && git add f && git commit -q -m run \
+        && git checkout -q --detach && printf 'up\n' > f && git commit -q -am upstream \
+        && git push -q ../pod.git fs-er-run:refs/heads/fs-er-run "HEAD:refs/heads/upstream" \
+        && git push -q ../pod.git "HEAD~0:refs/heads/second-ref"
+) >/dev/null 2>&1
+er_ep_up_sha="$(git --git-dir="$er_ep_root/pod.git" rev-parse refs/heads/upstream 2>/dev/null)"
+er_ep_run_sha="$(git --git-dir="$er_ep_root/pod.git" rev-parse refs/heads/fs-er-run 2>/dev/null)"
+git --git-dir="$er_ep_root/pod.git" symbolic-ref HEAD refs/heads/fs-er-run
+git clone --quiet "$er_ep_root/pod.git" "$er_ep_root/clone" >/dev/null 2>&1
+git -C "$er_ep_root/clone" checkout --quiet fs-er-run >/dev/null 2>&1
+er_run_block() {
+    # $1: EXTRA_REFS value; prints stderr, returns the block's status.
+    ( cd "$er_ep_root/clone" && BRANCH=fs-er-run EXTRA_REFS="$1" \
+        bash -c "set -euo pipefail
+$er_ep_block" 2>&1 )
+}
+if [[ -n "$er_ep_up_sha" && "$er_ep_up_sha" != "$er_ep_run_sha" ]]; then
+    ok "the pod fixture holds a run branch and a distinct upstream commit"
+else
+    no "the pod fixture holds a run branch and a distinct upstream commit" "up=$er_ep_up_sha run=$er_ep_run_sha"
+fi
+er_ep_out="$(er_run_block "upstream=$er_ep_up_sha second-ref=$er_ep_up_sha")"
+er_ep_rc=$?
+check "the entrypoint loop exits 0 for well-formed EXTRA_REFS" "0" "$er_ep_rc"
+check "the entrypoint creates local branch 'upstream' at the pushed sha" "$er_ep_up_sha" \
+    "$(git -C "$er_ep_root/clone" rev-parse refs/heads/upstream 2>/dev/null)"
+check "the entrypoint creates every named local branch" "$er_ep_up_sha" \
+    "$(git -C "$er_ep_root/clone" rev-parse refs/heads/second-ref 2>/dev/null)"
+check "the run branch is still the checked-out one" "fs-er-run" \
+    "$(git -C "$er_ep_root/clone" symbolic-ref --short HEAD)"
+check "the run branch was not moved" "$er_ep_run_sha" \
+    "$(git -C "$er_ep_root/clone" rev-parse refs/heads/fs-er-run)"
+git -C "$er_ep_root/clone" branch -q -D upstream second-ref
+er_ep_out="$(er_run_block "")"
+check "an empty EXTRA_REFS creates nothing and exits 0" "0 0" \
+    "$? $(git -C "$er_ep_root/clone" branch --list upstream | wc -l)"
+er_ep_out="$(er_run_block "upstream=$er_missing_sha")"
+er_ep_rc=$?
+check "a sha that differs from what the pod holds fails the run" "1" "$er_ep_rc"
+contains "... and names the ref and the expected sha" "$er_ep_out" "extra ref 'upstream' is not at $er_missing_sha"
+git -C "$er_ep_root/clone" branch -q -D upstream
+er_ep_out="$(er_run_block "Up=$er_ep_up_sha")"
+check "a malformed EXTRA_REFS name fails the run" "1" "$?"
+er_ep_out="$(er_run_block "fs-er-run=$er_ep_up_sha")"
+check "an EXTRA_REFS entry naming the run branch fails the run" "1" "$?"
+# shellcheck disable=SC2016  # the needles match literal text in the entrypoint
+extra_line="$(grep -n '^for extra_ref in' "$entrypoint_sh" | head -1 | cut -d: -f1)"
+# shellcheck disable=SC2016  # ditto
+co_line="$(grep -n '^git checkout --quiet "\$BRANCH"$' "$entrypoint_sh" | head -1 | cut -d: -f1)"
+# shellcheck disable=SC2016  # ditto
+cfg_line="$(grep -n '^git config user.name' "$entrypoint_sh" | head -1 | cut -d: -f1)"
+if [[ -n "$extra_line" && -n "$co_line" && -n "$cfg_line" ]] \
+    && (( co_line < extra_line && extra_line < cfg_line )); then
+    ok "the EXTRA_REFS loop runs after the clone's checkout of \$BRANCH"
+else
+    no "the EXTRA_REFS loop runs after the clone's checkout of \$BRANCH" \
+        "co=$co_line extra=$extra_line cfg=$cfg_line"
+fi
+
 printf '\n== bare repo HEAD points at the pushed branch before cloning ==\n'
 # cmd_submit only ever pushes refs/heads/$branch into the pod's bare repo,
 # so its default HEAD (set by git init --bare) dangles. The entrypoint must
@@ -11259,7 +11492,7 @@ fi
 # install with a dead endpoint) must surface the container's log -- git's
 # own "connection refused" tells the operator nothing, and nothing else
 # in this script reads the pod log.
-if grep -qF -- '"$push_src:refs/heads/$branch") || push_rc=$?' "$k8s_sh" \
+if grep -qF -- '"$push_src:refs/heads/$branch" "${extra_refspecs[@]}") || push_rc=$?' "$k8s_sh" \
     && grep -A4 -F 'if (( push_rc != 0 )); then' "$k8s_sh" \
         | grep -qF 'kubectl logs "$pod_name"'; then
     ok "a failed repository push surfaces the pod's container log"

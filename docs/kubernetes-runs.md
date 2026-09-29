@@ -604,10 +604,23 @@ between the check and the push, and the push line on stderr reports the
 exact revision. Under `--review-loop`, the review base is that same sha,
 so the pushed branch and the base are the same revision, always.
 
-Only `refs/heads/BRANCH` is ever pushed into the bare repo, so its default
-HEAD dangles; the entrypoint points the bare repo's HEAD at that pushed
-branch before cloning, so the clone lands directly on it instead of warning
-about a nonexistent ref.
+Only `refs/heads/BRANCH` is pushed into the bare repo by default, so its
+default HEAD dangles; the entrypoint points the bare repo's HEAD at that
+pushed branch before cloning, so the clone lands directly on it instead of
+warning about a nonexistent ref.
+
+`submit` and `run` (and `fork-sandbox.sh --k8s`, which forwards it) also
+take a repeatable `--extra-ref NAME=SHA`, which adds one refspec,
+`SHA:refs/heads/NAME`, to that same push. `NAME` must match
+`^[a-z][a-z0-9-]{0,30}$`, may not be the run's own branch or repeat, and
+`SHA` must be a full hex sha of a commit in the origin repo; all of it is
+checked before anything is created. The names and shas reach the pod as the
+`EXTRA_REFS` env var, and after the clone the entrypoint creates a LOCAL
+branch `NAME` at `origin/NAME` (verifying its sha), leaving `BRANCH` checked
+out. Only `BRANCH` is fetched back. The postmaster uses this to give a
+review thread's author seat the human's pushed commit as `upstream` (see
+"Upstream moved" in [docs/agent-mail.md](agent-mail.md)); no preset key sets
+it.
 
 The fetch carries the same flag for a different reason. It writes straight
 into `refs/heads/BRANCH` in the caller's real repository rather than into a

@@ -22,6 +22,12 @@
 #
 # Env:
 #   BRANCH          the branch name the agent's commits land on. Required.
+#   EXTRA_REFS      optional, space-separated NAME=SHA pairs: extra branches
+#                   the client pushed into the repository beside BRANCH
+#                   (fork-sandbox-k8s.sh submit --extra-ref). After the
+#                   clone each NAME becomes a LOCAL branch at origin/NAME,
+#                   whose sha must equal SHA; BRANCH stays checked out and
+#                   only BRANCH is ever fetched back.
 #   HARNESS         "pi" or "claude", the coding leg's harness. Default
 #                   "pi". The review loop, when it runs, always runs pi
 #                   regardless of this -- see REVIEW_MODEL below.
@@ -634,8 +640,9 @@ until [[ -f "$sentinel" ]]; do
 done
 
 
-# Only refs/heads/$BRANCH was ever pushed into this bare repo (cmd_submit
-# pushes exactly "HEAD:refs/heads/$branch"), so the bare repo's default
+# Only refs/heads/$BRANCH (and any --extra-ref branches, see EXTRA_REFS) was
+# ever pushed into this bare repo (cmd_submit pushes "HEAD:refs/heads/$branch"
+# plus one refspec per extra ref), so the bare repo's default
 # HEAD (refs/heads/main or master, set by git init --bare) dangles. Left
 # alone, the clone below would print "warning: remote HEAD refers to
 # nonexistent ref, unable to checkout" and check out nothing. Point HEAD at
@@ -649,6 +656,30 @@ cd "$clone_dir"
 # The clone above already checked out $BRANCH as a local branch (HEAD now
 # points there), so this only needs to switch onto it, not create it.
 git checkout --quiet "$BRANCH"
+
+# Extra refs (submit --extra-ref NAME=SHA): a LOCAL branch per name at
+# origin/NAME, so an agent can `git checkout NAME` or reset onto it without
+# knowing about remotes. Created, never checked out -- BRANCH stays the
+# checked-out branch -- and the sha is verified against what submit said it
+# pushed, so a ref that arrived as something else fails the run here rather
+# than being read as the commit the caller meant. The end-of-leg fetch-back
+# is unchanged: only BRANCH comes home.
+for extra_ref in ${EXTRA_REFS:-}; do
+    extra_ref_name="${extra_ref%%=*}"
+    extra_ref_sha="${extra_ref#*=}"
+    if [[ ! "$extra_ref_name" =~ ^[a-z][a-z0-9-]{0,30}$ ]] \
+        || [[ ! "$extra_ref_sha" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]] \
+        || [[ "$extra_ref_name" == "$BRANCH" ]]; then
+        echo "Error: malformed EXTRA_REFS entry '$extra_ref'." >&2
+        exit 1
+    fi
+    git branch "$extra_ref_name" "origin/$extra_ref_name"
+    if [[ "$(git rev-parse "refs/heads/$extra_ref_name")" != "$extra_ref_sha" ]]; then
+        echo "Error: extra ref '$extra_ref_name' is not at $extra_ref_sha in the pod." >&2
+        exit 1
+    fi
+    echo "fork-sandbox-k8s-entrypoint: local branch $extra_ref_name at $extra_ref_sha" >&2
+done
 
 # Per-run services' sandboxEnv, staged only when the submitted services
 # spec carried one -- see render_services_env_configmap_key in

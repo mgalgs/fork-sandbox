@@ -9,6 +9,7 @@
 #                            [--context-ro DIR | --context-secret NAME]
 #                            [--thread-dir DIR] [--attach-dir DIR]
 #                            [--checkout REF] [--services-trust-ref REF]
+#                            [--extra-ref NAME=SHA]...
 #                            [--session-state DIR] [--resume-session ID | --session-id ID]
 #                            [--refresh-at N] [--refresh-max N]
 #                            [--claude-credentials PATH]
@@ -23,6 +24,7 @@
 #                            [--context-ro DIR | --context-secret NAME]
 #                            [--thread-dir DIR] [--attach-dir DIR]
 #                            [--checkout REF] [--services-trust-ref REF]
+#                            [--extra-ref NAME=SHA]...
 #                            [--session-state DIR] [--resume-session ID | --session-id ID]
 #                            [--refresh-at N] [--refresh-max N]
 #                            [--claude-credentials PATH]
@@ -196,6 +198,20 @@
 # push, the pushed revision is the one the push line reports, and (under
 # --review-loop) the review base is the same revision the branch starts
 # from. With no --checkout, HEAD is resolved and pushed as before.
+#
+# --extra-ref NAME=SHA (submit, run; repeatable): push one more commit into
+# the pod as a branch named NAME, beside the run's own branch, in the SAME
+# push. The pod (fork-sandbox-k8s-entrypoint.sh) then creates a LOCAL
+# branch NAME at origin/NAME, verifies its sha is SHA, and leaves the run's
+# branch checked out; nothing but the run's own branch comes back at fetch.
+# NAME must match ^[a-z][a-z0-9-]{0,30}$, must not be the run's own branch,
+# and may be given once; SHA must be a full 40- or 64-hex commit sha
+# present in the origin repo. All three are checked before anything is
+# created. The names and shas reach the pod as the EXTRA_REFS env var
+# (space-separated NAME=SHA). Nothing else in the tooling passes it today
+# but the postmaster, which hands a review thread's `sets` seat the human
+# author's pushed commit as `upstream` (docs/agent-mail.md, "Upstream
+# moved"). It is deliberately not part of any fork-sandbox.sh preset.
 #
 # --services-trust-ref REF (submit, run): the trusted base a per-run
 # services spec (.agents/sandbox-services/services.yaml) is diffed against
@@ -4084,13 +4100,14 @@ cmd_submit() {
     # Job as REFRESH_CONTEXT_WINDOW, which the entrypoint's window warning reads.
     local refresh_at="" refresh_enabled=0 refresh_max="" refresh_context_window=""
     local refresh_threshold_tokens="" refresh_ceiling_tokens=""
-    local -a labels_raw=() allow_ns_raw=() reach_probe_raw=()
+    local -a labels_raw=() allow_ns_raw=() reach_probe_raw=() extra_refs_raw=()
     while (( $# )); do
         case "$1" in
             --dry-run) dry_run=true; shift ;;
             --branch) branch="${2:?--branch requires a name}"; shift 2 ;;
             --checkout) checkout_ref="${2:?--checkout requires a ref}"; shift 2 ;;
             --services-trust-ref) services_trust_ref="${2:?--services-trust-ref requires a ref}"; shift 2 ;;
+            --extra-ref) extra_refs_raw+=("${2:?--extra-ref requires NAME=SHA}"); shift 2 ;;
             --model) model="${2:?--model requires an OpenRouter model id}"; shift 2 ;;
             --endpoint) endpoint="${2:?--endpoint requires a name}"; shift 2 ;;
             --harness) harness="${2:?--harness requires 'pi' or 'claude'}"; shift 2 ;;
@@ -4657,6 +4674,50 @@ cmd_submit() {
         fi
     fi
 
+    # --extra-ref NAME=SHA: each entry is checked before the Job, the Secret
+    # and the proxy Pod exist, for the same reason --checkout is above. NAME
+    # becomes a branch in the pod's repo and, in the entrypoint, a local
+    # branch, so its shape is pinned (under LC_ALL=C, like
+    # FORK_SANDBOX_RUN_SOURCE above: in a UTF-8 locale [a-z] matches accented
+    # characters) and it may not be the run's own branch or a repeat; SHA
+    # must already be a commit in the origin repo, since the push below sends
+    # it from there.
+    local -a extra_ref_names=() extra_ref_shas=()
+    local extra_ref er_name er_sha er_seen
+    for extra_ref in "${extra_refs_raw[@]}"; do
+        if [[ "$extra_ref" != *=* ]]; then
+            echo "Error: --extra-ref '$extra_ref' must look like NAME=SHA." >&2
+            exit 1
+        fi
+        er_name="${extra_ref%%=*}"
+        er_sha="${extra_ref#*=}"
+        if ! (LC_ALL=C; [[ "$er_name" =~ ^[a-z][a-z0-9-]{0,30}$ ]]); then
+            echo "Error: --extra-ref name '$er_name' must match ^[a-z][a-z0-9-]{0,30}\$." >&2
+            exit 1
+        fi
+        if [[ "$er_name" == "$branch" ]]; then
+            echo "Error: --extra-ref name '$er_name' is this run's own branch." >&2
+            exit 1
+        fi
+        for er_seen in "${extra_ref_names[@]}"; do
+            if [[ "$er_seen" == "$er_name" ]]; then
+                echo "Error: --extra-ref name '$er_name' was given twice." >&2
+                exit 1
+            fi
+        done
+        if ! (LC_ALL=C; [[ "$er_sha" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]]); then
+            echo "Error: --extra-ref '$er_name': '$er_sha' must be a full 40- or 64-character" >&2
+            echo "lowercase hex commit sha." >&2
+            exit 1
+        fi
+        if ! (cd "$origin_repo" && git cat-file -e "$er_sha^{commit}" 2>/dev/null); then
+            echo "Error: --extra-ref '$er_name': '$er_sha' does not name a commit in $origin_repo." >&2
+            exit 1
+        fi
+        extra_ref_names+=("$er_name")
+        extra_ref_shas+=("$er_sha")
+    done
+
     # Per-run services: a repo commits a SPEC, never a hook, so the harness
     # (not repo-controlled code) synthesizes the sidecars from it -- see
     # docs/sandbox-services.md's cluster section. Read from the EXACT
@@ -5076,6 +5137,23 @@ CENV
 )"
     fi
 
+    # EXTRA_REFS, whenever --extra-ref was given: space-separated NAME=SHA
+    # pairs, one per extra branch pushed alongside $branch. The entrypoint
+    # creates a local branch per name and checks the sha. Every character is
+    # already pinned above (a lowercase name, hex), so there is no quoting
+    # concern for the YAML double-quoted scalar.
+    local extra_refs_env="" extra_refs_value="" er_i
+    for er_i in "${!extra_ref_names[@]}"; do
+        extra_refs_value+="${extra_refs_value:+ }${extra_ref_names[$er_i]}=${extra_ref_shas[$er_i]}"
+    done
+    if [[ -n "$extra_refs_value" ]]; then
+        extra_refs_env=$'\n'"$(cat <<CENV
+            - name: EXTRA_REFS
+              value: "$extra_refs_value"
+CENV
+)"
+    fi
+
     # SESSION_HARNESS_STORE/RESUME_SESSION/SESSION_ID: the pod-side half of
     # continuity across wakes, set only when --session-state was given (a
     # store was pushed below). RESUME_SESSION/SESSION_ID are already
@@ -5368,7 +5446,7 @@ spec:
             - name: RUN_TTL
               value: "$K8S_RUN_TTL"
             - name: OUTBOX_MAX_BYTES
-              value: "$outbox_max_bytes"${model_discovery_env}${allow_unlisted_model_env}${review_loop_env}${claude_env}${review_model_env}${pi_args_env}${session_harness_store_env}${resume_session_env}${session_id_env}${refresh_env}
+              value: "$outbox_max_bytes"${model_discovery_env}${allow_unlisted_model_env}${review_loop_env}${claude_env}${review_model_env}${pi_args_env}${extra_refs_env}${session_harness_store_env}${resume_session_env}${session_id_env}${refresh_env}
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -5859,10 +5937,16 @@ EOF
     # or kubectl's own error there is a bare "connection refused" that
     # tells the operator nothing -- the entrypoint's fail-fast message
     # is in the container's log, which is what the branch prints.
+    # One refspec per --extra-ref rides in the SAME push, so the pod's repo
+    # holds every ref by the time the sentinel below is written.
+    local -a extra_refspecs=()
+    for er_i in "${!extra_ref_names[@]}"; do
+        extra_refspecs+=("${extra_ref_shas[$er_i]}:refs/heads/${extra_ref_names[$er_i]}")
+    done
     local push_rc=0
     (cd "$origin_repo" && git -c protocol.ext.allow=always -c core.hooksPath=/dev/null push --quiet \
         "ext::kubectl --context=$K8S_CONTEXT -n $K8S_NAMESPACE exec -i $pod_name -- git-receive-pack /work/repo.git" \
-        "$push_src:refs/heads/$branch") || push_rc=$?
+        "$push_src:refs/heads/$branch" "${extra_refspecs[@]}") || push_rc=$?
     if (( push_rc != 0 )); then
         echo "Error: the repository push to pod $pod_name failed (git exit $push_rc)." >&2
         echo "fork-sandbox-k8s: the pod's agent container log, for the reason:" >&2
@@ -7164,7 +7248,7 @@ cmd_run() {
     local thread_dir="" attach_dir=""
     local session_state="" resume_session="" session_id_arg=""
     local refresh_at_arg="" refresh_at_given=false refresh_max_arg=""
-    local -a labels_raw=() allow_ns_raw=() reach_probe_raw=()
+    local -a labels_raw=() allow_ns_raw=() reach_probe_raw=() extra_refs_raw=()
     while (( $# )); do
         case "$1" in
             --dry-run) dry_run=true; shift ;;
@@ -7173,6 +7257,7 @@ cmd_run() {
             --branch) branch="${2:?--branch requires a name}"; shift 2 ;;
             --checkout) checkout_ref="${2:?--checkout requires a ref}"; shift 2 ;;
             --services-trust-ref) services_trust_ref="${2:?--services-trust-ref requires a ref}"; shift 2 ;;
+            --extra-ref) extra_refs_raw+=("${2:?--extra-ref requires NAME=SHA}"); shift 2 ;;
             --model) model="${2:?--model requires an OpenRouter model id}"; shift 2 ;;
             --endpoint) endpoint="${2:?--endpoint requires a name}"; shift 2 ;;
             --harness) harness="${2:?--harness requires 'pi' or 'claude'}"; shift 2 ;;
@@ -7296,6 +7381,7 @@ cmd_run() {
     for l in "${labels_raw[@]}"; do submit_argv+=(--label "$l"); done
     for l in "${allow_ns_raw[@]}"; do submit_argv+=(--allow-namespace "$l"); done
     for l in "${reach_probe_raw[@]}"; do submit_argv+=(--reach-probe "$l"); done
+    for l in "${extra_refs_raw[@]}"; do submit_argv+=(--extra-ref "$l"); done
     submit_argv+=("$project_path" "$handoff_file")
 
     # cmd_submit does its own full validation (K8S_IMAGE, K8S_DENIED_PROBE,

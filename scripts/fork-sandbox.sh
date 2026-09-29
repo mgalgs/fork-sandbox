@@ -524,6 +524,17 @@
 #                        must confirm is reachable before the run starts.
 #                        Repeatable, required whenever --allow-namespace is
 #                        given, refused without it. Refused without --k8s.
+# --extra-ref <name>=<sha>:
+#                        with --k8s, push one more commit into the pod as a
+#                        branch named <name> beside the run's own branch, in
+#                        the same push; the pod gets it as a local branch
+#                        (never checked out, never fetched back). Repeatable.
+#                        Passed straight to fork-sandbox-k8s.sh, which
+#                        validates the name and the sha (see its --extra-ref
+#                        paragraph). The postmaster uses it to hand a review
+#                        thread's author seat the human's pushed commit as
+#                        `upstream` (docs/agent-mail.md, "Upstream moved");
+#                        no preset key sets it. Refused without --k8s.
 # --outbox-max <size>:   raise the outbox size cap above the default 64 MiB.
 #                        Takes a plain byte count or a size with a K/M/G
 #                        suffix (512K, 256M, 2G). Applies to both the local
@@ -1662,6 +1673,7 @@ k8s_endpoint=""
 k8s_endpoint_given=false
 k8s_allow_ns_raw=()
 k8s_reach_probe_raw=()
+k8s_extra_refs_raw=()
 outbox_max_arg=""
 network_arg="pinned"
 network_given=false
@@ -1874,6 +1886,10 @@ while [[ "${1:-}" == -* ]]; do
             ;;
         --reach-probe)
             k8s_reach_probe_raw+=("${2:?--reach-probe requires HOST:PORT}")
+            shift 2
+            ;;
+        --extra-ref)
+            k8s_extra_refs_raw+=("${2:?--extra-ref requires <name>=<sha>}")
             shift 2
             ;;
         --outbox-max)
@@ -3386,6 +3402,9 @@ if [[ "$k8s_mode" == true ]]; then
     # like every other k8s-only flag this dispatch defers to it.
     for k8s_grant_fwd in "${k8s_allow_ns_raw[@]}"; do k8s_argv+=(--allow-namespace "$k8s_grant_fwd"); done
     for k8s_grant_fwd in "${k8s_reach_probe_raw[@]}"; do k8s_argv+=(--reach-probe "$k8s_grant_fwd"); done
+    # Forwarded raw, like the grant flags: cmd_submit checks the name and the
+    # sha before anything is created.
+    for k8s_grant_fwd in "${k8s_extra_refs_raw[@]}"; do k8s_argv+=(--extra-ref "$k8s_grant_fwd"); done
     k8s_argv+=(--harness "$harness" --branch "$branch" "$project_path" "$handoff_file")
 
     # This path ends in exec, which replaces the shell image and discards
@@ -3414,6 +3433,13 @@ if [[ -n "$k8s_timeout" || "$k8s_keep" == true || -n "$k8s_outbox_dir" \
         echo "(The endpoint '$k8s_endpoint' came from the code seat of" >&2
         echo "preset '$preset_name', not a flag.)" >&2
     fi
+    exit 1
+fi
+
+if [[ ${#k8s_extra_refs_raw[@]} -gt 0 ]]; then
+    echo "Error: --extra-ref only applies with --k8s, which passes it on to" >&2
+    echo "fork-sandbox-k8s.sh run. Add --k8s, or drop the flag: a local" >&2
+    echo "sandbox clones the project itself and has no pod to push a ref into." >&2
     exit 1
 fi
 
