@@ -78,7 +78,8 @@ export FORK_SANDBOX_CONFIG_DIR="$tmp/config"
 presets_dir="$FORK_SANDBOX_CONFIG_DIR/presets"
 mkdir -p "$CODEX_HOME" "$presets_dir"
 cat > "$CODEX_HOME/models_cache.json" <<'JSON'
-{"models":[{"slug":"gpt-5.6-sol","visibility":"list"}]}
+{"models":[{"slug":"gpt-5.6-sol","visibility":"list"},
+           {"slug":"gpt-5.6-astra","visibility":"list"}]}
 JSON
 
 run() {
@@ -627,12 +628,14 @@ refuses "--review-only refuses a preset whose remaining steps are not a read-onl
 accepts "a composed pipeline preset launches with no conflicting flags" --preset composed
 
 # A composed step's own seat on codex, and a composed step's fix seat on
-# codex, hit the same missing-credential gap the legacy "codex fix seat is
-# not yet supported" refusal exists to name (see codex-fix.yaml below) --
-# but that refusal only reads the legacy fix_harness/mntfix_harness
-# scalars, so a composed pipeline needs its own check. The unconditional
-# refusal above already blocks either launch today; this pins the more
-# specific message so it is not silently lost once that refusal lifts.
+# codex, used to hit a missing-credential gap the legacy "codex fix seat is
+# not yet supported" refusal named for the fixed fix seats (see
+# codex-fix.yaml below): the runner wrote CODEX_AUTH_JSON only into
+# harness_env_file/rev_harness_env_file/mnt_harness_env_file, never into a
+# composed step's own "s<K>_*"/"s<K>fix_*" names. The generic per-seat
+# credential writer (beside the trap in the generated runner) now covers
+# every seat the walker can launch, so both dry-run here, and the credential
+# files a real run writes below, are checked instead of a refusal.
 cat > "$presets_dir/composed-codex-step.yaml" <<'EOF'
 agents:
   coder:
@@ -654,8 +657,7 @@ pipeline:
     repeat: 2
     agent: reviewer
 EOF
-refuses "a composed pipeline step seated on codex is refused by name" \
-    "composed pipeline step on codex is not yet" \
+accepts "a composed pipeline step seated on codex launches" \
     --preset composed-codex-step
 
 cat > "$presets_dir/composed-codex-fix.yaml" <<'EOF'
@@ -683,9 +685,42 @@ pipeline:
     repeat: 2
     agent: reviewer
 EOF
-refuses "a composed pipeline step's fix seat on codex is refused by name" \
-    "composed pipeline step on codex is not yet" \
+accepts "a composed pipeline step's fix seat on codex launches" \
     --preset composed-codex-fix
+
+# The motivating goal shape: a repeating codex coder, a codex reviewer and
+# a claude reviewer each running once, then the same two agents each
+# running one maintain round -- fix legs default to the coder seat
+# (codex), so every fix seat here is codex too.
+cat > "$presets_dir/composed-codex-goal.yaml" <<'EOF'
+agents:
+  coder:
+    harness: codex/gpt-5.6-sol
+    repeat: 2
+  astra:
+    harness: codex
+    model: gpt-5.6-astra
+  opus:
+    harness: claude
+    model: opus
+pipeline:
+  - action: code
+    agent: coder
+  - action: review
+    repeat: 1
+    agent: astra
+  - action: review
+    repeat: 1
+    agent: opus
+  - action: maintain
+    repeat: 1
+    agent: astra
+  - action: maintain
+    repeat: 1
+    agent: opus
+EOF
+accepts "the codex-coder/codex+claude-review/codex+claude-maintain goal shape launches" \
+    --preset composed-codex-goal
 
 # claude-args/pi-args reach only the code seat's build today (fs_build_
 # sandbox_cmd splices them in for prefix "impl" alone); a composed pipeline's
@@ -860,8 +895,7 @@ pipeline:
     agent: reviewer
     fix_agent: fixer
 EOF
-refuses "a codex fix seat is refused by name" \
-    "codex fix seat is not yet supported" --preset codex-fix
+accepts "a codex fix seat launches" --preset codex-fix
 
 bad() {
     # Write a preset named bad, expect a parse refusal containing $2 (and
@@ -1527,6 +1561,32 @@ if [[ -n "${SNAPSHOT_DIR:-}" && -n "$clone_dir" ]]; then
         && cp -- "$snapshot_run_dir/progress.json" "$SNAPSHOT_DIR/progress-$n.json" 2>/dev/null
 fi
 
+# Credential-file capture for the codex credential tests: every codex
+# seat's env file is written by run.sh before ANY leg starts (see the
+# generic per-seat writer beside its EXIT trap), so it is already on disk
+# by this, the very first stub call -- and it survives only until
+# run_cleanup removes it at run.sh's own exit, well after run_stubbed's
+# caller gets control back. Grepping run.sh's own text for every
+# "*_harness_env_file=" assignment finds every seat's path -- fixed
+# (harness_env_file, rev_/mnt_/fxr_/fxm_) and composed (s<K>_/s<K>fix_)
+# alike -- the same "%q, then eval" unescaping run.sh's own generation used
+# to write them. Only active when a test sets CRED_SNAPSHOT_DIR, and only
+# on the first call: every later call would just re-find the same paths.
+if [[ -n "${CRED_SNAPSHOT_DIR:-}" && "$n" == 1 && -n "$clone_dir" ]]; then
+    cred_run_dir="$(dirname "$(dirname "$clone_dir")")"
+    if [[ -f "$cred_run_dir/run.sh" ]]; then
+        while IFS= read -r cred_line; do
+            cred_var="${cred_line%%=*}"
+            cred_rhs="${cred_line#*=}"
+            eval "cred_path=$cred_rhs"
+            if [[ -n "$cred_path" && -f "$cred_path" ]]; then
+                cp -p -- "$cred_path" "$CRED_SNAPSHOT_DIR/$cred_var" 2>/dev/null
+                stat -c '%a' "$cred_path" > "$CRED_SNAPSHOT_DIR/$cred_var.mode" 2>/dev/null
+            fi
+        done < <(grep -E '^[A-Za-z0-9_]*harness_env_file=' "$cred_run_dir/run.sh")
+    fi
+fi
+
 # The scripted role: FAKE_SCRIPT holds one action per line, indexed by call
 # number -- "commit", "findings", "approved", "fail", or "noop".
 action="$(sed -n "${n}p" "$FAKE_SCRIPT" 2>/dev/null)"
@@ -1657,13 +1717,14 @@ prep_stub() {
 
 run_stubbed() {
     # Launcher args only; prep_stub ran first. Prints the run dir.
-    # SNAPSHOT_DIR, when the caller has it set/exported, is forwarded so the
-    # stub's own intermediate-state capture (see claude-sandboxed above) can
-    # be turned on per-call without a second copy of this function.
+    # SNAPSHOT_DIR/CRED_SNAPSHOT_DIR, when the caller has either set/
+    # exported, are forwarded so the stub's own intermediate-state capture
+    # (see claude-sandboxed above) can be turned on per-call without a
+    # second copy of this function.
     local out rc rd
     out="$(HOME="$launcher_home" PATH="$real_stub:$PATH" FAKE_COUNT_FILE="$count" \
         FAKE_ARGV_LOG="$argv_log" FAKE_SCRIPT="$script_file" \
-        SNAPSHOT_DIR="${SNAPSHOT_DIR:-}" \
+        SNAPSHOT_DIR="${SNAPSHOT_DIR:-}" CRED_SNAPSHOT_DIR="${CRED_SNAPSHOT_DIR:-}" \
         FORK_SANDBOX_CONFIG_DIR="$real_cfg" FORK_SANDBOX_BACKEND=fake-image \
         timeout 60 "$launcher" --foreground "$@" "$proj" "$handoff" 2>&1)"
     rc=$?
@@ -1754,6 +1815,112 @@ if [[ -n "${rd_codex_args:-}" ]]; then
     else
         no "codex stdin '-' remains the final command argument" "$codex_cmd_line"
     fi
+fi
+
+printf '\n== composed pipelines: a codex seat on any step, not just implement ==\n'
+
+# A composed pipeline with a codex review seat and a codex fix seat (its
+# code and its other review seat stay on claude, to also pin "never for a
+# claude seat"). The generic per-seat credential writer must reach every
+# one of them, not only the fixed implement/review/maintainer names.
+cat > "$real_presets/composed-codex-cred.yaml" <<'EOF'
+agents:
+  coder:
+    harness: claude
+    model: sonnet
+  cxreviewer:
+    harness: codex
+    model: gpt-5.6-sol
+  cxfixer:
+    harness: codex
+    model: gpt-5.6-sol
+pipeline:
+  - action: code
+    agent: coder
+  - action: review
+    repeat: 1
+    agent: coder
+  - action: review
+    repeat: 1
+    agent: cxreviewer
+    fix_agent: cxfixer
+EOF
+cred_dir="$(mktemp -d)"; tmpdirs+=("$cred_dir")
+prep_stub $'commit\napproved\napproved'
+rd_cred="$(CRED_SNAPSHOT_DIR="$cred_dir" run_stubbed --preset composed-codex-cred \
+    --branch "sandbox-test-composed-codex-cred-$$")" && tmpdirs+=("$rd_cred")
+if [[ -n "${rd_cred:-}" ]]; then
+    if [[ -f "$cred_dir/s3_harness_env_file" ]]; then
+        ok "a composed codex review seat's credential file is written"
+        contains "the review seat's credential carries the placeholder refresh token" \
+            "$(cat "$cred_dir/s3_harness_env_file")" "sandbox-placeholder-cannot-refresh"
+        lacks "the review seat's credential does not carry the real refresh token" \
+            "$(cat "$cred_dir/s3_harness_env_file")" '"fixture"'
+        check "the review seat's credential file is mode 0600" \
+            "600" "$(cat "$cred_dir/s3_harness_env_file.mode" 2>/dev/null)"
+    else
+        no "a composed codex review seat's credential file is written"
+    fi
+    if [[ -f "$cred_dir/s3fix_harness_env_file" ]]; then
+        ok "a composed codex fix seat's credential file is written"
+        contains "the fix seat's credential carries the placeholder refresh token" \
+            "$(cat "$cred_dir/s3fix_harness_env_file")" "sandbox-placeholder-cannot-refresh"
+        check "the fix seat's credential file is mode 0600" \
+            "600" "$(cat "$cred_dir/s3fix_harness_env_file.mode" 2>/dev/null)"
+    else
+        no "a composed codex fix seat's credential file is written"
+    fi
+    if [[ -e "$cred_dir/s1_harness_env_file" || -e "$cred_dir/s2_harness_env_file" \
+            || -e "$cred_dir/s2fix_harness_env_file" ]]; then
+        no "no credential file is written for a claude seat"
+    else
+        ok "no credential file is written for a claude seat"
+    fi
+fi
+
+# A codex seat that appears only on a later step (the implement and first
+# review steps are claude; the second review and the maintain step are
+# codex, the same shape as composed-codex-step.yaml above) must still trip
+# the expired-token refusal fs_resolve_harness's codex arm raises -- the
+# check is not special-cased to the implement harness. A separate, expired
+# CODEX_HOME keeps this from disturbing every other test's shared one.
+cat > "$real_presets/codex-later-step.yaml" <<'EOF'
+agents:
+  coder:
+    harness: claude
+    model: sonnet
+  reviewer:
+    harness: codex
+    model: gpt-5.6-sol
+pipeline:
+  - action: code
+    agent: coder
+  - action: review
+    repeat: 1
+    agent: coder
+  - action: review
+    repeat: 1
+    agent: reviewer
+  - action: maintain
+    repeat: 2
+    agent: reviewer
+EOF
+expired_codex_home="$(mktemp -d)"; tmpdirs+=("$expired_codex_home")
+printf '{"tokens":{"access_token":"e30.eyJleHAiOjEwMH0.sig","refresh_token":"fixture"}}\n' \
+    > "$expired_codex_home/auth.json"
+cat > "$expired_codex_home/models_cache.json" <<'JSON'
+{"models":[{"slug":"gpt-5.6-sol","visibility":"list"}]}
+JSON
+if out_expired="$(HOME="$launcher_home" PATH="$real_stub:$PATH" \
+        FORK_SANDBOX_CONFIG_DIR="$real_cfg" FORK_SANDBOX_BACKEND=fake-image \
+        CODEX_HOME="$expired_codex_home" \
+        "$launcher" --preset codex-later-step \
+        --branch "sandbox-test-expired-later-step-$$" "$proj" "$handoff" 2>&1)"; then
+    no "an expired codex token on a later composed step (not implement) is refused" \
+        "expected a refusal, got exit 0: $out_expired"
+else
+    contains "an expired codex token on a later composed step (not implement) is refused" \
+        "$out_expired" "the codex access token expired"
 fi
 
 # --codex-args belongs to the implementation command. A separately resolved

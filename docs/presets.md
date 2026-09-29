@@ -307,8 +307,6 @@ edges are the flags' own — plus the edges of the two preset-only knobs:
   a preset that carries loops — and one whose code seat repeats, since
   there is no coding leg to repeat. A preset with only a code step works
   fine as the seat for `--review-only`.
-- **A codex fix seat is refused** for now: the runner writes a per-seat
-  codex credential for the implement, review and maintainer seats only.
 - **Model aliases resolve at launch, not at authoring time.** A preset
   holding `model: sol` means whatever `aliases.conf` (or the codex model
   cache) says `sol` means on the day of the run.
@@ -611,9 +609,8 @@ the syntax does not have, no engine — present or planned — has either:
   fixing.
 - **No action beyond `code`/`review`/`maintain`**, and no branches or
   graphs — a pipeline is always a single linear chain, of any length.
-- **No per-seat args or refresh** beyond the first code step, and no
-  codex fix seats — each a plumbing gap named by its refusal, not a
-  design position.
+- **No per-seat args or refresh** beyond the first code step — a plumbing
+  gap named by its own refusal, not a design position.
 - **No `input:` key.** The engine fixes the data flow — the code step
   reads the handoff, fix legs read the verdict, review prompts are
   generated — so a key that names a prompt source would promise a choice

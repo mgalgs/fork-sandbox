@@ -2839,17 +2839,6 @@ maintainer_model_given=false
 [[ -n "$maintainer_model" ]] && maintainer_model_given=true
 resolve_model maintainer_model "$maintainer_model_given" "${maintainer_harness:-$harness}" || exit 1
 
-# A codex fix seat needs the per-seat credential file the runner writes for
-# the implement, review and maintainer seats -- a fourth copy of that block
-# no run has needed yet. Refuse it by name rather than let the fix leg fail
-# inside the sandbox with a missing credential.
-if [[ "$fix_harness" == "codex" || "$mntfix_harness" == "codex" ]]; then
-    echo "Error: a codex fix seat is not yet supported -- the runner does not" >&2
-    echo "write a codex credential for fix legs. Seat the fix agent on claude" >&2
-    echo "or pi." >&2
-    exit 1
-fi
-
 # The preset fix seats' models, through the same resolution as every other
 # seat's, against their own harness.
 fix_model_given=false
@@ -3466,27 +3455,6 @@ if [[ -n "$preset_name" && "$preset_is_legacy_shaped" != true ]]; then
         echo "composed pipeline; edit the preset or pick another." >&2
         exit 1
     fi
-    # A composed step or its fix seat on codex has the same credential gap
-    # the "codex fix seat is not yet supported" refusal above names for the
-    # legacy fix seats: the runner writes CODEX_AUTH_JSON only into
-    # harness_env_file/rev_harness_env_file/mnt_harness_env_file -- the
-    # three fixed seats -- never into an "s<K>_harness_env_file" or
-    # "s<K>fix_harness_env_file" fs_resolve_harness names for a composed
-    # step. The walker runs a composed pipeline today, so this check is
-    # live, not preparatory: without it, a codex-seated composed step or
-    # fix seat would launch with no credential file and fail deep inside
-    # the leg instead of being named here, up front.
-    for ((preset_k = 1; preset_k <= preset_step_count; preset_k++)); do
-        preset_k_agent="${preset_step_agent[$preset_k]}"
-        if [[ "${preset_agent_harness[$preset_k_agent]}" == codex \
-            || "${preset_step_fix_harness[$preset_k]:-}" == codex ]]; then
-            echo "Error: preset '$preset_name' seats step $preset_k (or its fix" >&2
-            echo "agent) on codex -- a composed pipeline step on codex is not yet" >&2
-            echo "supported; the runner does not write a per-step codex credential." >&2
-            echo "Seat that step's agent on claude or pi, or edit the preset." >&2
-            exit 1
-        fi
-    done
     # A composed preset's claude_args/pi_args has the same silent-drop gap:
     # the parser (fork-sandbox-preset-parse.py) already refuses claude_args
     # or pi_args on any agent but the pipeline's first code seat, so if
@@ -5845,8 +5813,17 @@ fs_reject_unsafe_chars "$outbox_dir"
 # directory is deleted. Never bind the user's real ~/.codex: it also holds
 # the credential and unrelated interactive history.
 codex_sessions_dir=""
+# A composed pipeline's per-step and per-fix-seat harnesses never land in
+# any of the five fixed scalars above -- preset_agent_harness/preset_step_
+# fix_harness are the only place they live -- so a composed run whose only
+# codex seat is, say, a step-3 review agent would otherwise leave this
+# unset and later bind an empty path (see fs_build_sandbox_cmd's codex arm)
+# into that step's sandbox command. Both arrays are declared empty (never
+# unset) whether or not a preset is in play, so adding them here costs a
+# legacy/no-preset run nothing.
 for leg_harness in "$harness" "$review_harness" "$maintainer_harness" \
-                   "$fix_harness" "$mntfix_harness"; do
+                   "$fix_harness" "$mntfix_harness" \
+                   "${preset_agent_harness[@]}" "${preset_step_fix_harness[@]}"; do
     if [[ "$leg_harness" == codex ]]; then
         codex_sessions_dir="$run_dir/codex-sessions"
         mkdir -p "$codex_sessions_dir"
@@ -7411,6 +7388,10 @@ launcher_session_id="${CLAUDE_CODE_SESSION_ID:-}"
         printf 'fxr_usage_source=%q\n' "$fxr_usage_source"
         printf 'fxr_formatter=%q\n' "$fxr_run_formatter"
         printf 'fxr_fix_prompt_header=%q\n' "$fxr_fix_prompt_header"
+        # The fix seat's own credential-file path, same field the rev_/mnt_
+        # blocks carry -- read at run.sh's runtime by the generic codex
+        # credential writer beside the trap, below.
+        printf 'fxr_harness_env_file=%q\n' "$fxr_harness_env_file"
     fi
     # shellcheck disable=SC2154
     if [[ -n "$mntfix_harness" ]]; then
@@ -7421,6 +7402,7 @@ launcher_session_id="${CLAUDE_CODE_SESSION_ID:-}"
         printf 'fxm_usage_source=%q\n' "$fxm_usage_source"
         printf 'fxm_formatter=%q\n' "$fxm_run_formatter"
         printf 'fxm_fix_prompt_header=%q\n' "$fxm_fix_prompt_header"
+        printf 'fxm_harness_env_file=%q\n' "$fxm_harness_env_file"
     fi
     # A composed (non-legacy-shaped) preset's per-step accounting state, the
     # same six fields the "rev_*"/"mnt_*"/"fxr_*"/"fxm_*" blocks above supply
@@ -7935,48 +7917,64 @@ release_clone_lock() {
     fi
 }
 trap 'run_cleanup; release_clone_lock' EXIT
-if [[ "$harness" == "codex" && -n "$harness_env_file" ]]; then
-    install -m 600 /dev/null "$harness_env_file"
+# Every codex seat's credential file, written once here instead of the
+# three copy-pasted blocks this replaced (one each for the implement,
+# review and maintainer seats, none of which could reach a composed
+# step's "s<K>_*"/"s<K>fix_*" names or the legacy fix seats' own
+# "fxr_*"/"fxm_*" ones). $codex_auth_src -- the host auth.json read at
+# launch -- is the same for every seat; only the refresh token is ever
+# replaced, with a placeholder the sandbox cannot use to log the host out.
+# The dedupe list keeps a seat whose env file is the very same path as one
+# already written (the "rev_*"/"mnt_*" fallback-to-implement case) from
+# being rewritten a second time.
+_fs_codex_cred_written=()
+_fs_write_codex_cred() {
+    local ch="$1" cf="$2" p
+    [[ "$ch" == codex && -n "$cf" ]] || return 0
+    for p in "${_fs_codex_cred_written[@]}"; do
+        [[ "$p" == "$cf" ]] && return 0
+    done
+    install -m 600 /dev/null "$cf"
     {
         printf 'CODEX_AUTH_JSON='
         jq -c '.tokens.refresh_token = "sandbox-placeholder-cannot-refresh"' \
             "$codex_auth_src"
-    } > "$harness_env_file"
-fi
-# The review leg's own credential file, when --review-harness names its
-# own codex independently of the implement harness. review_harness is
-# empty without --review-harness, in which case rev_harness_env_file
-# already equals harness_env_file (fs_resolve_harness was never called a
-# second time -- see the "rev_*" fallback beside review_sandbox_cmd,
-# above) and the path-equality check below skips the duplicate write.
+    } > "$cf"
+    _fs_codex_cred_written+=("$cf")
+}
+_fs_write_codex_cred "$harness" "$harness_env_file"
+# review_harness is empty without --review-harness, in which case
+# rev_harness_env_file already equals harness_env_file (fs_resolve_harness
+# was never called a second time -- see the "rev_*" fallback beside
+# review_sandbox_cmd, above) and the dedupe above skips the duplicate write.
 review_codex_harness="$harness"
 [[ -n "$review_harness" ]] && review_codex_harness="$review_harness"
-if [[ "$review_codex_harness" == "codex" && -n "$rev_harness_env_file" \
-    && "$rev_harness_env_file" != "$harness_env_file" ]]; then
-    install -m 600 /dev/null "$rev_harness_env_file"
-    {
-        printf 'CODEX_AUTH_JSON='
-        jq -c '.tokens.refresh_token = "sandbox-placeholder-cannot-refresh"' \
-            "$codex_auth_src"
-    } > "$rev_harness_env_file"
-fi
-# And the maintainer leg's own credential file, the third of the same
-# pattern: when --maintainer-harness names its own codex independently of
-# the implement harness (and of a separately named review harness, which
-# its own block above already covered). The path-equality check skips the
-# write when the maintainer codex is the implement codex. maintainer_harness
-# and mnt_harness_env_file are unset in a no-maintainer run.sh, so both
-# reads carry defaults: without the loop the whole condition is false.
-if [[ "${maintainer_harness:-$harness}" == "codex" \
-    && -n "${mnt_harness_env_file:-}" \
-    && "$mnt_harness_env_file" != "$harness_env_file" ]]; then
-    install -m 600 /dev/null "$mnt_harness_env_file"
-    {
-        printf 'CODEX_AUTH_JSON='
-        jq -c '.tokens.refresh_token = "sandbox-placeholder-cannot-refresh"' \
-            "$codex_auth_src"
-    } > "$mnt_harness_env_file"
-fi
+_fs_write_codex_cred "$review_codex_harness" "$rev_harness_env_file"
+# maintainer_harness and mnt_harness_env_file are unset entirely in a
+# no-maintainer run.sh, so both reads carry defaults.
+_fs_write_codex_cred "${maintainer_harness:-$harness}" "${mnt_harness_env_file:-}"
+# The legacy fix seats: fix_harness/mntfix_harness and their env-file
+# counterparts are unset entirely in a run.sh with no such fix seat.
+_fs_write_codex_cred "${fix_harness:-}" "${fxr_harness_env_file:-}"
+_fs_write_codex_cred "${mntfix_harness:-}" "${fxm_harness_env_file:-}"
+# A composed pipeline's own per-step seats. run_step_idx/run_step_kind are
+# always populated -- legacy-translated or not, see their own comment
+# above -- so this loop is a no-op for a legacy-shaped or preset-less run,
+# where every run_step_idx entry is empty. A step's fix seat is skipped
+# for kind "code", which never has one.
+for ((_fs_cred_k = 1; _fs_cred_k <= run_step_count; _fs_cred_k++)); do
+    _fs_cred_idx="${run_step_idx[_fs_cred_k]}"
+    [[ -n "$_fs_cred_idx" ]] || continue
+    _fs_cred_hvar="${_fs_cred_idx}_harness"
+    _fs_cred_evar="${_fs_cred_idx}_harness_env_file"
+    _fs_write_codex_cred "${!_fs_cred_hvar}" "${!_fs_cred_evar}"
+    if [[ "${run_step_kind[_fs_cred_k]}" != code ]]; then
+        _fs_cred_hvar="${_fs_cred_idx}fix_harness"
+        _fs_cred_evar="${_fs_cred_idx}fix_harness_env_file"
+        _fs_write_codex_cred "${!_fs_cred_hvar}" "${!_fs_cred_evar}"
+    fi
+done
+unset _fs_cred_k _fs_cred_idx _fs_cred_hvar _fs_cred_evar
 
 # Per-run services: stand them up before the session and point the project's
 # config at the sockets. The teardown is already armed, so a failure here still
