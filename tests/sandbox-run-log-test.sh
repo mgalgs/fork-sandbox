@@ -256,6 +256,15 @@ record "$rd_kit" >/dev/null 2>"$tmp/err"
 check "a run's agent_kit is recorded as a list" '["kit-alpha","kit-beta"]' \
     "$(query show "$(basename "$rd_kit")" | jq -c '.agent_kit')"
 
+printf '\n== record: leg_retries is lifted from summary.json ==\n'
+rd_retries="$(mk_run_dir retries)"
+tmpdirs+=("$rd_retries")
+sed 's/"exit_code":0/"leg_retries":2,"exit_code":0/' "$rd_kit/summary.json" > "$rd_retries/summary.json"
+printf '0\n' > "$rd_retries/exit-code"
+record "$rd_retries" >/dev/null 2>"$tmp/err"
+check "a run's leg_retries is recorded" '2' \
+    "$(query show "$(basename "$rd_retries")" | jq -c '.leg_retries')"
+
 rd_nokit="$(mk_run_dir nokit)"
 tmpdirs+=("$rd_nokit")
 sed 's/"agent_kit":\["kit-alpha","kit-beta"\]/"agent_kit":[]/' "$rd_kit/summary.json" > "$rd_nokit/summary.json"

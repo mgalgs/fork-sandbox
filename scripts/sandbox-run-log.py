@@ -286,6 +286,7 @@ SUMMARY_FIELDS = [
     "claude_credentials_source",
     "claude_credentials_via",
     "end_reason",
+    "leg_retries",
 ]
 
 
