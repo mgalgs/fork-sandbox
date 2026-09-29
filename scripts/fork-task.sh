@@ -44,6 +44,13 @@
 # --purpose <slug>:       short name for the fork, used as the session name for
 #                         cross-session messaging and recorded in the agent
 #                         registry. Defaults to the project directory basename.
+# --relation <kind>:      continuation|delegation (default delegation),
+#                         recorded in the agent registry as the edge from
+#                         this launcher to the new session. "continuation"
+#                         means the new session carries on the same job under
+#                         a new session id (e.g. a freshly-forked refresh);
+#                         "delegation" means separate side work whose runs
+#                         should not be attributed back to this launcher.
 # --sandbox-args "...":   extra arguments passed to claude-sandboxed itself
 #                         (e.g. --unpin-egress)
 # -h, --help:             print this header and exit.
@@ -86,6 +93,28 @@
 # Reviewing still matters. The sandbox contains the session while it runs;
 # it does not make the code it wrote safe. Read the branch before you
 # build it, exactly as you would a pull request from a stranger.
+#
+# Agent registry: every non-sandboxed launch appends one JSON line to
+# $FORK_TASK_REGISTRY (default /var/tmp/claude-scratch/agent-registry.jsonl):
+#   ts                 -- ISO 8601 launch timestamp
+#   pane               -- tmux pane id, for matching against ListAgents rows
+#   project            -- realpath of the launched project directory
+#   handoff            -- path to the handoff file
+#   purpose            -- the --purpose slug (default: project basename)
+#   session_name       -- tmux/SendMessage session name, "" if none
+#   claude_config_dir  -- --claude-config-dir value, "" if unset
+#   session_id         -- the child's Claude session UUID, or null (a codex
+#                         launch, or a caller-supplied --resume/--continue
+#                         inside --claude-args, always records null)
+#   parent_session_id  -- $CLAUDE_CODE_SESSION_ID of the launching session,
+#                         or null if that was unset or empty
+#   relation           -- "continuation" or "delegation", see --relation
+# session_id/parent_session_id let a reader walk the tree of sessions this
+# one launched, and which of those launched sessions in turn -- a
+# continuation edge means the same job under a new session id (follow it
+# to find an ancestor's runs); a delegation edge is separate side work and
+# must not be walked. Readers must tolerate old lines that lack
+# session_id, parent_session_id, or relation -- they predate this format.
 
 set -euo pipefail
 
@@ -156,6 +185,7 @@ sandboxed=false
 sandbox_args=""
 branch=""
 purpose=""
+relation="delegation"
 # Scanned up front so --sol can skip its alias-file requirement when --help
 # is also present: --help should show usage regardless of where it falls
 # relative to --sol, but --sol's own refusal must still fire on a real launch.
@@ -258,6 +288,17 @@ while [[ "${1:-}" == -* ]]; do
             ;;
         --purpose)
             purpose="${2:?--purpose requires a slug}"
+            shift 2
+            ;;
+        --relation)
+            relation="${2:?--relation requires a value}"
+            case "$relation" in
+                continuation|delegation) ;;
+                *)
+                    echo "Error: --relation must be continuation or delegation, got '$relation'" >&2
+                    exit 1
+                    ;;
+            esac
             shift 2
             ;;
         -h|--help)
@@ -378,6 +419,43 @@ if [[ -n "$sandbox_args" ]]; then
     read -r -a sandbox_extra_argv <<< "$sandbox_args"
 fi
 
+# Session lineage: give the claude harness a session id up front so the
+# registry (below) can record the edge from this launcher to the child.
+# Codex has no --session-id flag, so a codex launch always records null.
+# If the caller already passed --session-id, --resume, or --continue
+# inside --claude-args, the child's identity is already spoken for --
+# adding a second --session-id would just conflict with claude's own flag
+# parsing -- so this only generates one when the caller gave none of the
+# three. /proc/sys/kernel/random/uuid is preferred over uuidgen because
+# it needs no extra package on a bare Linux host (this script is Linux-only
+# already, via tmux and /var/tmp/claude-scratch); uuidgen is the fallback
+# for a host where that pseudo-file is missing.
+child_session_id=""
+generate_session_id=false
+if [[ "$harness" == "claude" ]] && ! $sandboxed; then
+    caller_supplied_id=false
+    for ((_i = 0; _i < ${#claude_extra_argv[@]}; _i++)); do
+        case "${claude_extra_argv[$_i]}" in
+            --session-id)
+                caller_supplied_id=true
+                child_session_id="${claude_extra_argv[$((_i + 1))]:-}"
+                ;;
+            --resume|--continue)
+                caller_supplied_id=true
+                child_session_id=""
+                ;;
+        esac
+    done
+    if ! $caller_supplied_id; then
+        generate_session_id=true
+        if [[ -r /proc/sys/kernel/random/uuid ]]; then
+            child_session_id="$(< /proc/sys/kernel/random/uuid)"
+        else
+            child_session_id="$(uuidgen)"
+        fi
+    fi
+fi
+
 # Handle worktree creation
 if [[ -n "$worktree_name" ]]; then
     hook="$project_path/.claude/fork-worktree.sh"
@@ -494,6 +572,7 @@ else
     [[ -n "$model" ]] && prog_argv+=(--model "$model")
     [[ -n "$session_name" ]] && prog_argv+=(--name "$session_name")
     [[ -n "$permission_mode" ]] && prog_argv+=(--permission-mode "$permission_mode")
+    $generate_session_id && prog_argv+=(--session-id "$child_session_id")
     prog_argv+=("${claude_extra_argv[@]}")
 fi
 
@@ -576,10 +655,11 @@ else
 fi
 
 # Record the launch in the agent registry so the orchestrator can
-# match this fork against ListAgents rows by pane ID.
+# match this fork against ListAgents rows by pane ID, and so a reader can
+# walk session lineage via session_id/parent_session_id/relation.
 if ! $sandboxed && [[ -n "${new_pane:-}" ]]; then
-    registry="/var/tmp/claude-scratch/agent-registry.jsonl"
-    mkdir -p /var/tmp/claude-scratch 2>/dev/null || true
+    registry="${FORK_TASK_REGISTRY:-/var/tmp/claude-scratch/agent-registry.jsonl}"
+    mkdir -p "$(dirname "$registry")" 2>/dev/null || true
     jq -nc \
         --arg ts "$(date -Iseconds)" \
         --arg pane "$new_pane" \
@@ -588,7 +668,10 @@ if ! $sandboxed && [[ -n "${new_pane:-}" ]]; then
         --arg purpose "$purpose" \
         --arg session_name "$session_name" \
         --arg claude_config_dir "$claude_config_dir" \
-        '{ts: $ts, pane: $pane, project: $project, handoff: $handoff, purpose: $purpose, session_name: $session_name, claude_config_dir: $claude_config_dir}' \
+        --arg session_id "$child_session_id" \
+        --arg parent_session_id "${CLAUDE_CODE_SESSION_ID:-}" \
+        --arg relation "$relation" \
+        '{ts: $ts, pane: $pane, project: $project, handoff: $handoff, purpose: $purpose, session_name: $session_name, claude_config_dir: $claude_config_dir, session_id: (if $session_id == "" then null else $session_id end), parent_session_id: (if $parent_session_id == "" then null else $parent_session_id end), relation: $relation}' \
         >> "$registry"
     echo "Session name: $session_name (use SendMessage to reach it)"
     echo "Pane: $new_pane"
