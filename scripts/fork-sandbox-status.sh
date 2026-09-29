@@ -91,7 +91,14 @@
 # review and maintainer loop records and the review and maintainer verdicts)
 # and
 # refuses a symlink, so it cannot be turned into a way to read an arbitrary
-# file. It never reads stdin.
+# file. It never reads stdin. --session --progress reads a by-session
+# symlink instead of a <run-dir> argument, but print_progress_view holds
+# each resolved link target to this same prefix-and-run.env rule (and
+# progress.json to the same non-symlink, regular-file rule) before opening
+# it, and validates the session id itself against the launcher's own
+# single-path-component shape before touching the by-session root at all --
+# so neither an adversarial link nor a "--session ../x" can point it
+# anywhere this boundary would otherwise exclude.
 #
 # It deliberately does not inspect the clone. The clone's git config is
 # writable by the sandbox, and a key such as core.fsmonitor makes any git
@@ -199,23 +206,39 @@ run_fleet_json() {
 # --session <id> --progress's own reader: one compact line per run this
 # Claude session has launched, oldest link first. The by-session index is a
 # directory of symlinks fork-sandbox.sh creates at launch time (never
-# pruned), named by the run dir's own basename, so this ignores everything
-# about a run except that path -- it never opens run.env or any other run
-# file directly, only progress.json through the same run-dir shape every
-# other mode here already expects. Sorted by each SYMLINK's own mtime
-# (lstat, not the target's -- the run dir's mtime moves constantly as
+# pruned), named by the run dir's own basename. A link's target is not
+# trusted just because it lives in that index: it is resolved and then held
+# to the exact same "Why this is safe" invariant every other mode here
+# gives -- a directory under RUN_DIR_PREFIX (or the legacy prefix) that
+# holds a real, non-symlink run.env -- before progress.json, itself checked
+# non-symlink and regular, is read from it. Sorted by each SYMLINK's own
+# mtime (lstat, not the target's -- the run dir's mtime moves constantly as
 # progress.json is rewritten, which is not launch order at all), captured
 # once when fork-sandbox.sh created the link and never touched again.
 print_progress_view() {
     local session="$1" by_session_root link mtime base target
+    # The launcher only ever creates an index directory named by its own
+    # validated session id (see the by-session link comment in
+    # fork-sandbox.sh): a single path component, never ".", ".." or
+    # carrying a "/". A session id shaped any other way cannot be a real
+    # index -- most dangerously "..", which "$by_session_root/$session"
+    # would otherwise resolve to the by-session root's own parent -- so it
+    # is refused here the same way an unknown session is: nothing printed,
+    # exit 0.
+    if [[ ! "$session" =~ ^[A-Za-z0-9._-]+$ \
+            || "$session" == "." || "$session" == ".." ]]; then
+        return 0
+    fi
     by_session_root="${FORK_SANDBOX_BY_SESSION_DIR:-$FS_SCRATCH_ROOT/forks/by-session}"
     [[ -d "$by_session_root/$session" ]] || return 0
     while IFS=$'\t' read -r mtime link; do
         [[ -n "$link" ]] || continue
         base="$(basename -- "$link")"
         target="$("$FS_REALPATH" -e -- "$link" 2>/dev/null)"
-        if [[ -z "$target" || -L "$target/progress.json" \
-                || ! -f "$target/progress.json" ]]; then
+        if [[ -z "$target" || ! -d "$target" \
+                || ( "$target" != "$RUN_DIR_PREFIX"* && "$target" != "$RUN_DIR_PREFIX_LEGACY"* ) \
+                || -L "$target/run.env" || ! -f "$target/run.env" \
+                || -L "$target/progress.json" || ! -f "$target/progress.json" ]]; then
             printf '%s  ?\n' "$base"
             continue
         fi

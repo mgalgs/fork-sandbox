@@ -809,4 +809,40 @@ if FORK_SANDBOX_BY_SESSION_DIR="$by_session_root" "$status" --session "$sess" --
     echo "--progress accepted a run-dir argument"; exit 1
 fi
 
-echo "61 passed, 0 failed"
+# 28. --session must be held to the launcher's own session-id shape
+# (fork-sandbox.sh only ever creates an index directory named by a single
+# path component, never "." or ".." or anything with a "/") -- otherwise
+# "$by_session_root/$session" can walk out of the by-session root entirely.
+# ".." is the sharpest case: it is a legal [A-Za-z0-9._-]+ string, so the
+# regex alone would not catch it, and "$by_session_root/.." always exists
+# (it is the by-session root's own parent), so without the extra ".."
+# check this would list whatever else that parent happens to hold.
+out="$(FORK_SANDBOX_BY_SESSION_DIR="$by_session_root" "$status" --session ".." --progress 2>&1)"; rc=$?
+[[ $rc -eq 0 && -z "$out" ]] \
+    || { echo "--session '..' was not refused like an unknown session: rc=$rc out=$out"; exit 1; }
+out="$(FORK_SANDBOX_BY_SESSION_DIR="$by_session_root" "$status" --session "../etc" --progress 2>&1)"; rc=$?
+[[ $rc -eq 0 && -z "$out" ]] \
+    || { echo "--session '../etc' was not refused like an unknown session: rc=$rc out=$out"; exit 1; }
+
+# 29. A by-session link is not trusted just because it lives in the index:
+# its resolved target must still be a real fork-sandbox run directory (the
+# same prefix-and-run.env rule every other mode here already applies)
+# before its progress.json is read. A link to an arbitrary directory outside
+# that boundary -- holding a progress.json of its own, as any directory
+# could -- must print "?" like a missing-progress.json run, never that
+# directory's actual label or state.
+secret_dir="$(mktemp -d)"
+cat > "$secret_dir/progress.json" <<'EOF'
+{"schema":1,"label":"SECRET","spec":null,"state":"running","updated":1,"steps":[]}
+EOF
+sess_hostile="fixture-session-hostile-$$"
+mkdir -p "$by_session_root/$sess_hostile"
+ln -s "$secret_dir" "$by_session_root/$sess_hostile/not-a-run-dir"
+out="$(FORK_SANDBOX_BY_SESSION_DIR="$by_session_root" "$status" --session "$sess_hostile" --progress 2>&1)"
+[[ "$out" == "not-a-run-dir  ?" ]] \
+    || { echo "a link outside the run-dir prefix was not refused: $out"; exit 1; }
+[[ "$out" != *SECRET* ]] \
+    || { echo "a directory outside the run-dir prefix leaked its progress.json: $out"; exit 1; }
+rm -rf -- "$secret_dir"
+
+echo "64 passed, 0 failed"
