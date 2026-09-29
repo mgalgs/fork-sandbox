@@ -5342,6 +5342,200 @@ check "review-target case A4: the thread is not flagged" 0 \
     "$( [[ -e "$PM_STATE_DIR/needs-operator/$rt4_tid" ]] && echo 1 || echo 0 )"
 git -C "$PROJECT_DIR" remote remove origin
 
+# ---- upstream-head: `mail reply --upstream-head` delivers a human's push
+# to the thread's `sets` seat (ken) as --extra-ref upstream=<sha> ----
+# uh_commit <branch>: a commit in PROJECT_DIR (commit-tree + update-ref, so
+# PROJECT_DIR's own HEAD is undisturbed), on <branch>; prints its sha.
+uh_commit() {
+    local branch="$1" tree parent sha
+    tree="$(git -C "$PROJECT_DIR" rev-parse 'HEAD^{tree}')"
+    parent="$(git -C "$PROJECT_DIR" rev-parse HEAD)"
+    sha="$(git -C "$PROJECT_DIR" -c user.email=test@example.com -c user.name=test \
+        commit-tree "$tree" -p "$parent" -m "upstream head commit $branch")"
+    git -C "$PROJECT_DIR" update-ref "refs/heads/$branch" "$sha"
+    printf '%s' "$sha"
+}
+
+uh_branch="feature/x"
+uh_sha="$(uh_commit "$uh_branch")"
+
+# The announcer is '@ci-demo', a name that is not in the fleet: only a
+# non-fleet sender's header is acted on.
+# uh_kickoff <to>: opens a review thread (target = the rt1 commit) addressed
+# to <to>, lets that seat's first wake run and its reply route, and sets
+# UH_MID to the thread's root message id. The argv log is emptied afterward.
+# Not called in a $( ) -- it re-roots the mail store in the CALLER's shell.
+uh_kickoff() {
+    local to="$1"
+    new_scratch_root FORK_SANDBOX_MAIL_ROOT
+    export FORK_SANDBOX_MAIL_ROOT
+    PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+    printf '%s\n' 'please revise' > "$work/body.tmp"
+    UH_MID="$("$MAIL" send --from '@carol' --to "@$to" --subject 'upstream head topic' \
+        --body "$work/body.tmp" --hops 8 --review-target "$rt1_branch:$rt1_sha" 2>/dev/null)"
+    once
+    once
+    : > "$STUB_ARGV_LOG"
+}
+
+# ---- upstream-head case 1: a non-fleet sender's announcement is recorded,
+# and the sets seat's wake carries --extra-ref upstream=<sha> beside its
+# unchanged --checkout ----
+uh_kickoff ken; uh1_mid="$UH_MID"
+uh1_tid="$(thread_of "$uh1_mid")"
+uh1_short="${uh1_tid:0:8}"
+uh1_file="$PM_STATE_DIR/upstream-head/$uh1_tid.env"
+check "upstream-head case 1 setup: no state file before any announcement" 0 \
+    "$( [[ -e "$uh1_file" ]] && echo 1 || echo 0 )"
+uh1_reply="$(reply_msg '@ci-demo' "$uh1_mid" 'pushed' --to '@ken' --upstream-head "$uh_branch:$uh_sha")"
+once
+uh1_state="$(cat "$uh1_file" 2>/dev/null)"
+contains "upstream-head case 1: state file BRANCH" "$uh1_state" "BRANCH=$uh_branch"
+contains "upstream-head case 1: state file SHA" "$uh1_state" "SHA=$uh_sha"
+contains "upstream-head case 1: state file MSGID is the announcing message" "$uh1_state" "MSGID=$uh1_reply"
+contains "upstream-head case 1: state file SET_AT" "$uh1_state" "SET_AT="
+check "upstream-head case 1: state file has exactly four keys" 4 "$(grep -c '=' "$uh1_file")"
+contains "upstream-head case 1: the event names the thread and short sha" \
+    "$(cat "$work/once.out")" "pm upstream-head thread=$uh1_short sha=${uh_sha:0:12}"
+check "upstream-head case 1: ken's wake passes --extra-ref upstream=<sha>" \
+    "upstream=$uh_sha" "$(argv_after --extra-ref "$STUB_ARGV_LOG")"
+check "upstream-head case 1: exactly one --extra-ref" 1 "$(grep -c -- '^--extra-ref$' "$STUB_ARGV_LOG")"
+check "upstream-head case 1: --checkout is unchanged (ken's lineage, not the upstream sha)" \
+    "1" "$( [[ -n "$(argv_after --checkout "$STUB_ARGV_LOG")" && "$(argv_after --checkout "$STUB_ARGV_LOG")" != "$uh_sha" ]] && echo 1 || echo 0 )"
+check "upstream-head case 1: the thread is not flagged" 0 \
+    "$( [[ -e "$PM_STATE_DIR/needs-operator/$uh1_tid" ]] && echo 1 || echo 0 )"
+
+# Every sets-seat wake while the file exists carries it -- no "answered" state.
+: > "$STUB_ARGV_LOG"
+reply_msg '@carol' "$uh1_reply" 'and another thing' --to '@ken' >/dev/null
+once
+check "upstream-head case 1b: a later ordinary wake of ken still passes --extra-ref" \
+    "upstream=$uh_sha" "$(argv_after --extra-ref "$STUB_ARGV_LOG")"
+check "upstream-head case 1b: the file is unchanged by an ordinary message" "$uh1_state" \
+    "$(cat "$uh1_file")"
+
+# The newest announcement replaces the file wholesale.
+uh_sha2="$(uh_commit "$uh_branch-2")"
+: > "$STUB_ARGV_LOG"
+uh1_reply2="$(reply_msg '@ci-demo' "$uh1_reply" 'pushed again' --to '@ken' --upstream-head "$uh_branch-2:$uh_sha2")"
+once
+uh1_state2="$(cat "$uh1_file")"
+contains "upstream-head case 1c: the newest announcement's branch wins" "$uh1_state2" "BRANCH=$uh_branch-2"
+contains "upstream-head case 1c: the newest announcement's sha wins" "$uh1_state2" "SHA=$uh_sha2"
+contains "upstream-head case 1c: MSGID moves to the newest message" "$uh1_state2" "MSGID=$uh1_reply2"
+check "upstream-head case 1c: still four keys (replaced, not appended)" 4 "$(grep -c '=' "$uh1_file")"
+check "upstream-head case 1c: the wake carries the newest sha" \
+    "upstream=$uh_sha2" "$(argv_after --extra-ref "$STUB_ARGV_LOG")"
+
+# ---- upstream-head case 2: a `follow` seat (kai) gets no extra ref, though
+# the thread's state file is written ----
+uh_kickoff kai; uh2_mid="$UH_MID"
+uh2_tid="$(thread_of "$uh2_mid")"
+reply_msg '@ci-demo' "$uh2_mid" 'pushed' --to '@kai' --upstream-head "$uh_branch:$uh_sha" >/dev/null
+once
+check "upstream-head case 2: the state file is written for the thread" 1 \
+    "$( [[ -e "$PM_STATE_DIR/upstream-head/$uh2_tid.env" ]] && echo 1 || echo 0 )"
+check "upstream-head case 2: kai was woken" 1 "$(grep -c -- '^--k8s$' "$STUB_ARGV_LOG")"
+check "upstream-head case 2: a follow seat gets NO --extra-ref" 0 "$(grep -c -- '^--extra-ref$' "$STUB_ARGV_LOG")"
+
+# ---- upstream-head case 3: a fleet sender's header is ignored and logged ----
+uh_kickoff ken; uh3_mid="$UH_MID"
+uh3_tid="$(thread_of "$uh3_mid")"
+uh3_short="${uh3_tid:0:8}"
+pm_flag_file="$PM_STATE_DIR/needs-operator/$uh3_tid"
+mkdir -p -- "$PM_STATE_DIR/needs-operator" "$PM_STATE_DIR/spawns"
+printf 'pre-existing flag\n' > "$pm_flag_file"
+seq 1 5 > "$PM_STATE_DIR/spawns/$uh3_tid"
+reply_msg '@ken' "$uh3_mid" 'i moved it myself' --to '@carol' --upstream-head "$uh_branch:$uh_sha" >/dev/null
+once
+check "upstream-head case 3: no state file for a fleet sender" 0 \
+    "$( [[ -e "$PM_STATE_DIR/upstream-head/$uh3_tid.env" ]] && echo 1 || echo 0 )"
+contains "upstream-head case 3: the ignored header is logged" \
+    "$(cat "$work/once.out")" "pm upstream-head-ignored thread=$uh3_short reason=fleet-sender"
+check "upstream-head case 3: the flag was not cleared" 1 "$( [[ -e "$pm_flag_file" ]] && echo 1 || echo 0 )"
+check "upstream-head case 3: the spawn count was not reset" "1" \
+    "$( [[ "$(wc -l < "$PM_STATE_DIR/spawns/$uh3_tid")" -ge 5 ]] && echo 1 || echo 0 )"
+reply_msg '@carol' "$uh3_mid" 'plain follow-up' --to '@ken' >/dev/null
+: > "$STUB_ARGV_LOG"
+once
+check "upstream-head case 3: a later ken wake carries no --extra-ref" 0 "$(grep -c -- '^--extra-ref$' "$STUB_ARGV_LOG")"
+
+# ---- upstream-head case 4: the announcing message re-arms the thread ----
+uh_kickoff ken; uh4_mid="$UH_MID"
+uh4_tid="$(thread_of "$uh4_mid")"
+mkdir -p -- "$PM_STATE_DIR/needs-operator" "$PM_STATE_DIR/spawns"
+printf 'thread budget 32 exhausted\n' > "$PM_STATE_DIR/needs-operator/$uh4_tid"
+seq 1 32 > "$PM_STATE_DIR/spawns/$uh4_tid"
+uh4_seq_before="$(wc -l < "$PM_STATE_DIR/seq/$uh4_tid")"
+reply_msg '@ci-demo' "$uh4_mid" 'pushed' --to '@ken' --upstream-head "$uh_branch:$uh_sha" >/dev/null
+once
+check "upstream-head case 4: ken woke despite the exhausted budget" \
+    "upstream=$uh_sha" "$(argv_after --extra-ref "$STUB_ARGV_LOG")"
+check "upstream-head case 4: the flag was cleared" 0 \
+    "$( [[ -e "$PM_STATE_DIR/needs-operator/$uh4_tid" ]] && echo 1 || echo 0 )"
+check "upstream-head case 4: the spawn count restarted (one spawn since the reset)" 1 \
+    "$(wc -l < "$PM_STATE_DIR/spawns/$uh4_tid")"
+check "upstream-head case 4: the sequence counter was NOT reset" "1" \
+    "$( [[ "$(wc -l < "$PM_STATE_DIR/seq/$uh4_tid")" -gt "$uh4_seq_before" ]] && echo 1 || echo 0 )"
+
+# ---- upstream-head case 5: a sha that is not in the project repo flags the
+# thread and does not wake -- and a branch that origin can supply is fetched ----
+uh_kickoff ken; uh5_mid="$UH_MID"
+uh5_tid="$(thread_of "$uh5_mid")"
+uh5_short="${uh5_tid:0:8}"
+uh5_missing="$(printf 'c%.0s' {1..40})"
+reply_msg '@ci-demo' "$uh5_mid" 'pushed' --to '@ken' --upstream-head "feature/gone:$uh5_missing" >/dev/null
+once
+contains "upstream-head case 5: a missing sha is flagged" \
+    "$(cat "$PM_STATE_DIR/needs-operator/$uh5_tid" 2>/dev/null)" "upstream head feature/gone $uh5_missing not found"
+contains "upstream-head case 5: the flag event uses the upstream-head keyword" \
+    "$(cat "$work/once.out")" "pm flag thread=$uh5_short reason=upstream-head"
+check "upstream-head case 5: ken was not woken" 0 "$(grep -c -- '^--k8s$' "$STUB_ARGV_LOG")"
+check "upstream-head case 5: no --extra-ref was forwarded" 0 "$(grep -c -- '^--extra-ref$' "$STUB_ARGV_LOG")"
+
+new_root UH_ORIGIN_BARE
+git init -q --bare "$UH_ORIGIN_BARE"
+new_root UH_ORIGIN_SRC
+git -C "$UH_ORIGIN_SRC" init -q
+git -C "$UH_ORIGIN_SRC" -c user.email=test@example.com -c user.name=test \
+    commit -q --allow-empty -m 'origin upstream commit'
+uh_origin_sha="$(git -C "$UH_ORIGIN_SRC" rev-parse HEAD)"
+git -C "$UH_ORIGIN_SRC" push -q "$UH_ORIGIN_BARE" "HEAD:refs/heads/feature/pushed"
+git -C "$PROJECT_DIR" remote add origin "$UH_ORIGIN_BARE"
+
+uh_kickoff ken; uh6_mid="$UH_MID"
+uh6_tid="$(thread_of "$uh6_mid")"
+reply_msg '@ci-demo' "$uh6_mid" 'pushed' --to '@ken' --upstream-head "feature/pushed:$uh_origin_sha" >/dev/null
+once
+check "upstream-head case 6: a sha only on origin's branch is fetched and the wake proceeds" \
+    "upstream=$uh_origin_sha" "$(argv_after --extra-ref "$STUB_ARGV_LOG")"
+check "upstream-head case 6: the thread is not flagged" 0 \
+    "$( [[ -e "$PM_STATE_DIR/needs-operator/$uh6_tid" ]] && echo 1 || echo 0 )"
+
+# The branch moved on again: origin has the branch, but not the announced sha.
+uh_kickoff ken; uh7_mid="$UH_MID"
+uh7_tid="$(thread_of "$uh7_mid")"
+reply_msg '@ci-demo' "$uh7_mid" 'pushed' --to '@ken' --upstream-head "feature/pushed:$uh5_missing" >/dev/null
+once
+contains "upstream-head case 7: a sha the fetched branch does not hold is flagged" \
+    "$(cat "$PM_STATE_DIR/needs-operator/$uh7_tid" 2>/dev/null)" "upstream head feature/pushed $uh5_missing not found"
+check "upstream-head case 7: ken was not woken" 0 "$(grep -c -- '^--k8s$' "$STUB_ARGV_LOG")"
+git -C "$PROJECT_DIR" remote remove origin
+
+# ---- upstream-head case 8: a malformed value (only the store can produce
+# one) is ignored and logged, and resets nothing ----
+uh_kickoff ken; uh8_mid="$UH_MID"
+uh8_tid="$(thread_of "$uh8_mid")"
+uh8_short="${uh8_tid:0:8}"
+uh8_reply="$(reply_msg '@ci-demo' "$uh8_mid" 'pushed' --to '@ken')"
+uh8_file="$(grep -l "^Message-ID: $uh8_reply$" "$FORK_SANDBOX_MAIL_ROOT/threads/$uh8_tid"/*.msg)"
+sed -i "s/^X-Hops: .*/&\nX-Upstream-Head: not-a-sha-pair/" "$uh8_file"
+once
+check "upstream-head case 8: a malformed value writes no state file" 0 \
+    "$( [[ -e "$PM_STATE_DIR/upstream-head/$uh8_tid.env" ]] && echo 1 || echo 0 )"
+contains "upstream-head case 8: the ignored header is logged" \
+    "$(cat "$work/once.out")" "pm upstream-head-ignored thread=$uh8_short reason=malformed"
+
 # ---- case 2: a local seat on the same fleet spawns exactly as before ----
 
 # Fresh root: case1's k8s reply (no explicit To:, so reply-all to its
@@ -6059,6 +6253,53 @@ rt5_state="$(cat "$PM_STATE_DIR/review-target/$rt5_tid.env" 2>/dev/null)"
 contains "review-target case B1: state file VERSION advanced to 2" "$rt5_state" "VERSION=2"
 contains "review-target case B1: state file BRANCH updated to the wake's branch" "$rt5_state" "BRANCH=$rt5_branch"
 contains "review-target case B1: state file SHA updated to the wake's resolved sha" "$rt5_state" "SHA=$rt5_branch_sha"
+
+# ---- review-target case B1b: a Version: reply whose branch tip is NOT a
+# descendant of the old target is accepted and recorded -- the human
+# rebased or squashed, and the persona resets its wake branch to `upstream`
+# ----
+new_scratch_root FORK_SANDBOX_MAIL_ROOT
+export FORK_SANDBOX_MAIL_ROOT
+PM_STATE_DIR="$FORK_SANDBOX_MAIL_ROOT/.postmaster"
+
+printf '%s\n' 'kick off review' > "$work/body.tmp"
+rtn_mid="$("$MAIL" send --from '@carol' --to '@ken' --subject 'review target rebase topic' \
+    --body "$work/body.tmp" --hops 8 --review-target "pm-review-target-test-seedn:$rt1_sha" 2>/dev/null)"
+rtn_tid="$(thread_of "$rtn_mid")"
+once
+rtn_env="$(latest_env_for_agent ken)"
+rtn_run_dir="$(env_val "$rtn_env" RUN_DIR)"
+rtn_branch="$(env_val "$rtn_env" BRANCH)"
+# A sibling of the old target (same parent, different commit): neither is
+# an ancestor of the other, as after a rebase or squash.
+rtn_new_sha="$(git -C "$PROJECT_DIR" -c user.email=test@example.com -c user.name=test \
+    commit-tree "$(git -C "$PROJECT_DIR" rev-parse 'HEAD^{tree}')" \
+    -p "$(git -C "$PROJECT_DIR" rev-parse HEAD)" -m 'rebased sibling of the target')"
+git -C "$PROJECT_DIR" update-ref "refs/heads/$rtn_branch" "$rtn_new_sha"
+check "review-target case B1b setup: the new tip is not a descendant of the old target" 1 \
+    "$(git -C "$PROJECT_DIR" merge-base --is-ancestor "$rt1_sha" "$rtn_new_sha" && echo 0 || echo 1)"
+rm -f -- "$PM_STATE_DIR/harvested/$(basename "$rtn_env" .env)" \
+    "$rtn_run_dir/summary.json" "$rtn_run_dir/exit-code"
+mkdir -p -- "$rtn_run_dir/outbox"
+rm -f -- "$rtn_run_dir/outbox"/*
+printf 'Version: 2\n\nPosting the human push as v2.\n' > "$rtn_run_dir/outbox/mail-1.md"
+printf '0\n' > "$rtn_run_dir/exit-code"
+printf '{}\n' > "$rtn_run_dir/summary.json"
+once
+rtn_posted=""
+for f in "$FORK_SANDBOX_MAIL_ROOT/threads/$rtn_tid"/*.msg; do
+    [[ -e "$f" ]] || continue
+    grep -qF 'Posting the human push as v2.' "$f" && rtn_posted="$f"
+done
+check "review-target case B1b: the non-descendant Version: reply was posted" 1 \
+    "$( [[ -n "$rtn_posted" ]] && echo 1 || echo 0 )"
+check "review-target case B1b: X-Review-Target-Set carries the non-descendant sha" \
+    "$rtn_branch $rtn_new_sha" "$( [[ -n "$rtn_posted" ]] && header_of_file "$rtn_posted" X-Review-Target-Set )"
+rtn_state="$(cat "$PM_STATE_DIR/review-target/$rtn_tid.env" 2>/dev/null)"
+contains "review-target case B1b: state file records VERSION=2" "$rtn_state" "VERSION=2"
+contains "review-target case B1b: state file records the non-descendant sha" "$rtn_state" "SHA=$rtn_new_sha"
+check "review-target case B1b: the thread is not flagged" 0 \
+    "$( [[ -e "$PM_STATE_DIR/needs-operator/$rtn_tid" ]] && echo 1 || echo 0 )"
 
 # ---- on-harvest: a sets seat's two-reply harvest, the second carrying Version: 2 ----
 new_scratch_root FORK_SANDBOX_MAIL_ROOT

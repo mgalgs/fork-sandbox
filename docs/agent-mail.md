@@ -133,6 +133,9 @@ Under `$FORK_SANDBOX_MAIL_ROOT` (default
 <root>/.postmaster/review-target/<thread-id>.env  a thread's shared review
                                                    target (see "The review
                                                    target" below)
+<root>/.postmaster/upstream-head/<thread-id>.env  the last upstream-moved
+                                                   announcement (see "Upstream
+                                                   moved" below)
 ```
 
 A thread id is the Message-ID of the message that started it, so a thread
@@ -171,7 +174,8 @@ router's job, not the store's, and `--hops` is the override the router
 
 `--header 'X-Name: value'` on `send`/`reply` may be repeated and sets an
 arbitrary custom header; the name must match `^X-[A-Za-z0-9-]+$` and may
-not be `X-Hops` or `X-Attachment`, which the store writes itself. The
+not be `X-Hops`, `X-Attachment` or `X-Upstream-Head`, which the store
+writes itself (the last only through `reply --upstream-head`). The
 postmaster uses this to stamp `X-AI-Persona`/`X-AI-Harness`/`X-AI-Model`/
 `X-AI-Network` attribution on every harvested reply (see "The event
 stream" in the postmaster section); the `--text` render view shows it as
@@ -250,6 +254,13 @@ authority is written down.
   time and never re-read at harvest — the target can move while that
   reviewer is still working from the old one, and the header must say
   what the reply is actually about, not what is current now.
+- **`X-Upstream-Head`**: `<branch> <sha>` (space-separated, a full
+  40-hex sha), stamped only by `mail reply --upstream-head
+  <branch>:<sha>`: the human-owned upstream branch moved to that commit.
+  Never settable through `--header` (refused by the store and, for every
+  token, by the mail API). Only a message from a sender that is not a
+  fleet agent is acted on; a fleet agent's copy is ignored. See "Upstream
+  moved" below.
 - **`X-Version`**: the version of the review target a message belongs to.
   On the setter message, the new version. On a `follow` reply, the
   spawned target's version. On any other harvested reply from the `sets`
@@ -724,6 +735,66 @@ target exists is stamped `X-Version: <current VERSION>` and nothing else
 changes. See "The header contract" above for the full meaning of all
 three headers.
 
+### Upstream moved: `mail reply --upstream-head <branch>:<sha>`
+
+A PR under panel review can be pushed to by its human author. The `sets`
+seat (the author persona) then has to post that push as the next
+version, but a seat pod receives exactly one ref — its own wake branch.
+`reply --upstream-head` tells a running review thread that the upstream
+moved:
+
+```
+fork-sandbox-mail.sh reply --from @ci-demo --reply-to <message-id> \
+    --to @pr-author --upstream-head feature/x:<40-hex sha> --body ...
+```
+
+`<branch>` must pass `git check-ref-format --branch` (no whitespace);
+`<sha>` must be a full 40-hex lowercase commit sha — anything else is
+refused. The reply is stamped `X-Upstream-Head: <branch> <sha>`. It is
+reply-only: `send --upstream-head` is refused, since there is no thread
+to move. It is the only way to produce the header — a raw `--header
+X-Upstream-Head: ...` is refused by `mail` and by the mail API (for an
+operator token too). Over the mail API the flag needs the `upstream` cap
+(operator tokens have every cap); see [docs/mail-api.md](mail-api.md).
+
+The message is ordinary mail: address it to the `sets` seat and it wakes
+that seat through the normal path. Additionally, when the postmaster
+routes a message carrying `X-Upstream-Head` **from a sender that is not a
+fleet agent** (a fleet seat's copy is ignored and logged as
+`upstream-head-ignored`; so is a malformed value):
+
+1. **Record.** It writes `$MAIL_ROOT/.postmaster/upstream-head/<thread-id>.env`
+   — `BRANCH`, `SHA`, `MSGID` (the announcing message), `SET_AT` —
+   atomically and wholesale. The newest announcement wins.
+2. **Reset.** Like operator mail (rule 1), it clears the thread's
+   needs-operator flag and resets its spawn budget. `seq/<thread-id>` is
+   never reset. (In a cluster this applies to any non-fleet sender, not
+   only one on the operator list: the `upstream` cap at the API is what
+   authorized the message.)
+3. **Fetch or flag.** Before waking the thread's `sets` seat, if the file
+   exists, it makes sure the sha is in the project repo: it fetches
+   `refs/heads/<branch>` from `origin` (when configured), then requires the
+   sha. Still absent — the branch moved on again — the thread is flagged
+   (keyword `upstream-head`) and the seat is **not** woken.
+4. **Deliver.** The seat's k8s launch gets `--extra-ref upstream=<sha>`, on
+   **every** wake of that seat while the file exists. The postmaster keeps
+   no "answered" state; the persona decides whether it has already
+   answered the push. The seat's `--checkout` is unchanged (its lineage,
+   or the review target before it has one) — `upstream` is an additional
+   ref, not a checkout. No other seat, `follow` included, gets it.
+
+In the pod the commit is a **local branch named `upstream`**, created
+right after the clone from `origin/upstream`; the wake branch stays checked
+out, and the end-of-leg fetch-back is unchanged (only the wake branch comes
+home). The persona may reset its wake branch to `upstream` and post
+`Version:`: nothing on the review-target path checks ancestry, so a target
+that is not a descendant of the previous one (the human rebased or
+squashed) is accepted and recorded as is.
+
+Local (non-k8s) seats get no `upstream` branch: the postmaster only logs an
+`upstream-head-local-seat` event when a local `sets` seat wakes on a
+thread with an upstream-head file.
+
 ### Status
 
 `postmaster status --thread <tid> --json` includes a `review_target`
@@ -789,7 +860,7 @@ Every route/harvest pass, `deliver` prints one porcelain line per action
 worth operator eyes to stdout, unbuffered enough to `tail -F` or pipe
 live: `pm <event> thread=<short-id> agent=<name> key=val...`, where
 `thread` is the thread id's first 8 characters and `agent` is always the
-resolved fleet registry name, never raw header text. The nine events are
+resolved fleet registry name, never raw header text. The twelve events are
 `spawn` (agent, thread, run, via=to|cc), `harvest` (agent, thread,
 replies=<count>, emitted for both LLM and handler seats), `flag` (thread,
 reason=<fixed keyword>), `retry` (thread, agent, trigger=<short-id>,
@@ -800,7 +871,10 @@ refused message skips Cc resolution outright, but the same gate is
 re-checked at follow-up-wake time against whichever agent owns the live
 run a pending message is waiting on, and that agent can be one originally
 woken via Cc — so a Cc-woken seat's follow-up can still produce a refuse
-line), `triage-skip` (agent, thread), `handler` (agent,
+line), `upstream-head` (thread, sha=<12 hex> — an upstream-moved announcement was
+recorded), `upstream-head-ignored` (thread, reason=fleet-sender|malformed),
+`upstream-head-local-seat` (thread, agent — see "Upstream moved" above),
+`triage-skip` (agent, thread), `handler` (agent,
 thread, exit=<status>), `hook` (thread, hook=<event>, file=<basename>,
 exit=<n|timeout|lost|launch>; a hook finished or failed to launch; it
 has no `agent` field; see "Hooks" below), and `route-dead`
@@ -834,7 +908,7 @@ rule 1's reset in the same pass that performed it.
 code, gated the same way — it only prints one when reached via
 `deliver`'s own route/harvest pass, so running `flag` directly prints
 nothing. `unflag` prints nothing ever, in or out of `deliver`: it has no
-event of its own in the nine above, so a thread being flagged and later
+event of its own in the twelve above, so a thread being flagged and later
 auto-cleared (rule 1, operator mail) is invisible on this stream — only
 the flag is observable, not its clearing. This is a stable contract, not
 a log file — stderr is unchanged (errors only), and nothing
@@ -1036,7 +1110,8 @@ thread routes it.
    operator re-arms a stalled thread simply by mailing into it. Raising
    hops is separate, and needs `mail send --hops` on a fresh thread — an
    operator's `mail reply` copies the parent's `X-Hops` verbatim like any
-   other reply.
+   other reply. A message carrying `X-Upstream-Head` from a non-fleet
+   sender resets T the same way (see "Upstream moved").
 2. **Hops gate.** `X-Hops == 0` means no wakes from M. Flag T
    needs-operator, reason `hops exhausted at <message-id>`.
 3. **Thread budget.** Spawns so far ≥ budget (default 32,
@@ -1336,7 +1411,8 @@ own thread scans never see it:
 | `delivered-live/<thread-id>` | one line per message rule 4 confirmed was delivered live at harvest (agent, message id, run id) — an audit trail, not read back by anything |
 | `needs-operator/<thread-id>` | flag file; its content is the reason |
 | `needs-operator-journal/<thread-id>` | append-only history: one line per `pm_flag` call (timestamp, `flag`, keyword, reason) and one per `pm_unflag` call that actually cleared a flag (timestamp, `unflag`, empty keyword, empty reason) — a redundant unflag on an already-clear thread appends nothing. The flag-line count is what `status` shows next to the current reason, or `(no journal)` if this file doesn't exist yet for a thread flagged before the journal did. Operator-readable, nothing routes on it |
-| `spawns/<thread-id>` | one line per spawn, reset by rule 1 — line count is the **budget** count |
+| `spawns/<thread-id>` | one line per spawn, reset by rule 1 (and by an `X-Upstream-Head` message) — line count is the **budget** count |
+| `upstream-head/<thread-id>.env` | the thread's last upstream-moved announcement: `BRANCH`, `SHA`, `MSGID`, `SET_AT` — see "Upstream moved" |
 | `seq/<thread-id>` | one line per spawn, never reset — feeds the branch name |
 | `handoffs/<run-id>.md` | the generated handoff a wake was given |
 | `wake-threads/<run-id>/thread.txt` | the rendered full-thread snapshot bound read-only at `/thread` in that one wake (`--thread-dir`), written per wake just before its handoff; a trigger-only handoff points at this mount for the rest of the thread, and a snapshot that cannot be written falls the wake back to the legacy full-thread handoff with no mount and flags the thread. Never reaped, like `handoffs/` and `runs/` |

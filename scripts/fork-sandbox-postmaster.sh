@@ -116,6 +116,17 @@
 #                that is not on the operator list ($FORK_SANDBOX_OPERATORS)
 #                posted to this thread; it routes like fleet mail and
 #                carries no rule-1 authority. The sender is not named.
+#   upstream-head thread, sha=<short-sha> -- a non-fleet sender's message
+#                carried X-Upstream-Head: the thread's upstream-head state
+#                file was (re)written and the thread's flag and spawn count
+#                were reset. See UPSTREAM HEAD below.
+#   upstream-head-ignored thread, reason=fleet-sender|malformed -- a
+#                message carried X-Upstream-Head but nothing was recorded
+#                (a fleet agent never moves the upstream; the value was not
+#                `<branch> <40-hex sha>`).
+#   upstream-head-local-seat thread, agent -- a local (non-k8s) `sets` seat
+#                was woken on a thread with an upstream-head file; local
+#                seats get no `upstream` branch, so nothing was passed.
 #   triage-skip  agent, thread -- the Cc triage classifier skipped this
 #                candidate for this message
 #   handler      agent, thread, exit=<status> -- a handler seat's wake ran
@@ -144,6 +155,26 @@
 #                137, `lost` is a record whose process vanished without
 #                writing a status, `launch` is a launch that failed (emitted
 #                at fire time; every other exit is emitted by the next pass).
+#
+# UPSTREAM HEAD
+#
+# `mail reply --upstream-head <branch>:<sha>` stamps X-Upstream-Head:
+# <branch> <sha> on a reply (see fork-sandbox-mail.sh and docs/agent-mail.md,
+# "Upstream moved"): the human-owned upstream branch moved to that commit.
+# Routing a message that carries it, from a sender that does NOT resolve as
+# a fleet agent (a fleet agent's copy is ignored and logged), the postmaster
+# (1) writes $MAIL_ROOT/.postmaster/upstream-head/<thread-id>.env (BRANCH,
+# SHA, MSGID, SET_AT), atomically and wholesale -- the newest message wins --
+# and (2) resets the thread exactly as operator mail does (rule 1): clears
+# its needs-operator flag and truncates its spawn count ($SEQ is never
+# reset). Every wake of the thread's `review-target: sets` seat, while the
+# file exists, first makes sure the sha is in the project repo (fetching
+# refs/heads/<branch> from origin) -- flagging the thread (keyword
+# upstream-head) and NOT waking when it is still absent -- and then passes
+# `--extra-ref upstream=<sha>` on to the seat's k8s launch, so the pod sees
+# the commit as a local branch named `upstream`. The seat's --checkout is
+# unchanged. No other seat gets the ref, and the postmaster keeps no
+# "answered" state: the persona decides whether it has answered the push.
 #
 # HOOKS
 #
@@ -1638,6 +1669,7 @@ pm_flag_keyword() {
         "wake for"*"failed after"*"retries"*) printf 'retry-exhausted' ;;
         "no grant for k8s seat"*) printf 'no-grant' ;;
         "review target "*|"Version: "*) printf 'review-target' ;;
+        "upstream head "*) printf 'upstream-head' ;;
         *) printf 'other' ;;
     esac
 }
@@ -2293,6 +2325,54 @@ pm_write_review_target() {
     mv -- "$tmp" "$dest"
 }
 
+# Writes the per-thread upstream-head state file for <tid>, atomically
+# (mktemp in the same dir, then mv) and wholesale, like
+# pm_write_review_target: the newest announcement replaces the last.
+pm_write_upstream_head() {
+    local tid="$1" branch="$2" sha="$3" msgid="$4"
+    local uh_dir="$MAIL_ROOT/.postmaster/upstream-head"
+    mkdir -p -- "$uh_dir" || return 1
+    local dest="$uh_dir/$tid.env"
+    local tmp
+    tmp="$(mktemp "$uh_dir/.upstream-head.XXXXXX")" || return 1
+    {
+        printf 'BRANCH=%s\n' "$branch"
+        printf 'SHA=%s\n' "$sha"
+        printf 'MSGID=%s\n' "$msgid"
+        printf 'SET_AT=%s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+    } > "$tmp" || { rm -f -- "$tmp"; return 1; }
+    mv -- "$tmp" "$dest" || { rm -f -- "$tmp"; return 1; }
+}
+
+# Handles an X-Upstream-Head header on message <mid> of <tid> from <from_name>
+# (see UPSTREAM HEAD in the header). Succeeds only when the announcement was
+# recorded, i.e. the caller should reset the thread; a fleet sender's or a
+# malformed value is ignored and logged. The value is re-validated here --
+# nothing upstream of the store is trusted to have shaped it -- because the
+# branch ends up in a fetch refspec.
+pm_record_upstream_head() {
+    local tid="$1" mid="$2" from_name="$3" value="$4"
+    local branch sha
+    if "$FLEET" resolve "$from_name" >/dev/null 2>&1; then
+        pm_event "upstream-head-ignored thread=${tid:0:8} reason=fleet-sender"
+        return 1
+    fi
+    branch="${value%% *}"
+    sha="${value#* }"
+    if [[ "$value" != "$branch $sha" || -z "$branch" || "$sha" == *[[:space:]]* ]] \
+        || [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]] \
+        || ! git check-ref-format --branch "$branch" >/dev/null 2>&1; then
+        pm_event "upstream-head-ignored thread=${tid:0:8} reason=malformed"
+        return 1
+    fi
+    if ! pm_write_upstream_head "$tid" "$branch" "$sha" "$mid"; then
+        echo "Error: postmaster: could not write the upstream-head file for thread $tid" >&2
+        return 1
+    fi
+    pm_event "upstream-head thread=${tid:0:8} sha=${sha:0:12}"
+    return 0
+}
+
 pm_append_pending() {
     local rid="$1" mid="$2"
     local f="$RUNS/$rid.env" existing
@@ -2681,6 +2761,30 @@ pm_spawn_wake() {
         fi
     fi
 
+    # The `sets` seat is also handed the thread's upstream head, when a
+    # non-fleet sender announced one (see UPSTREAM HEAD in the header): the
+    # commit must be in the project repo, or the wake is refused here for
+    # the same reason a missing review target refuses it above. uh_sha is
+    # passed on as --extra-ref in the k8s branch below, on EVERY wake of
+    # this seat while the file exists -- there is no "answered" state.
+    local uh_sha=""
+    if [[ "$review_target" == sets ]]; then
+        local uh_file="$MAIL_ROOT/.postmaster/upstream-head/$tid.env"
+        if [[ -f "$uh_file" ]]; then
+            if [[ "$backend" == k8s ]]; then
+                local uh_branch
+                uh_branch="$(fs_pm_env_get "$uh_file" BRANCH)"
+                uh_sha="$(fs_pm_env_get "$uh_file" SHA)"
+                if ! pm_target_sha_present "$project" "$uh_branch" "$uh_sha"; then
+                    pm_flag "$tid" "upstream head $uh_branch $uh_sha not found in the project repo" "upstream-head"
+                    return 0
+                fi
+            else
+                pm_event "upstream-head-local-seat thread=${tid:0:8} agent=$agent"
+            fi
+        fi
+    fi
+
     # A `backend: k8s` seat with `grant: required` and no grant file yet
     # for this thread holds here -- before anything else this function
     # would otherwise do (snapshot, seq, handoff, .env) -- rather than
@@ -2820,6 +2924,9 @@ pm_spawn_wake() {
             checkout_trust_ref="$(git -C "$project" rev-parse HEAD 2>/dev/null || true)"
             [[ -n "$checkout_trust_ref" ]] && spawn_args+=(--services-trust-ref "$checkout_trust_ref")
         fi
+        # An ADDITIONAL ref, not a checkout: the pod gets the announced
+        # upstream commit as a local branch named `upstream`.
+        [[ -n "$uh_sha" ]] && spawn_args+=(--extra-ref "upstream=$uh_sha")
 
         local wake_root="${FORK_SANDBOX_POSTMASTER_K8S_WAKE_ROOT:-/var/tmp/claude-scratch/forks}"
         mkdir -p -- "$wake_root"
@@ -3075,6 +3182,8 @@ pm_process_message() {
     cc="$(pm_header "$f" Cc)"
     x_hops="$(pm_header "$f" X-Hops)"
     local from_name="${from#@}"
+    local uh_value
+    uh_value="$(pm_header "$f" X-Upstream-Head)"
 
     if ! "$FLEET" resolve "$from_name" >/dev/null 2>&1; then
         if (( ! PM_CLUSTER )) || pm_is_operator "$from"; then
@@ -3086,6 +3195,16 @@ pm_process_message() {
         else
             pm_event "external-mail thread=${tid:0:8}"
         fi
+    fi
+
+    # An upstream-head announcement (see UPSTREAM HEAD in the header) re-arms
+    # the thread the way operator mail does, whoever the non-fleet sender is:
+    # only mail reply --upstream-head can produce the header, and the mail
+    # API gates that flag on a cap, so reaching here is the authorization.
+    if [[ -n "$uh_value" ]] && pm_record_upstream_head "$tid" "$mid" "$from_name" "$uh_value"; then
+        pm_unflag "$tid"
+        mkdir -p -- "$SPAWNS"
+        : > "$SPAWNS/$tid"
     fi
 
     # Expanded regardless of the gate below: a refused message still needs

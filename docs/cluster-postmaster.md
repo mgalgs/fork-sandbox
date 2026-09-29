@@ -300,6 +300,12 @@ API under names that are not fleet agents, so only the names on this list
 carry it. Any other non-fleet sender is delivered and can still wake the
 seats it addresses, but leaves the flag and the budget alone.
 
+One more message resets a thread's flag and budget regardless of that list:
+a message carrying `X-Upstream-Head` (from `mail reply --upstream-head`) from
+any non-fleet sender. The mail API only lets a token with the `upstream` cap
+(or an operator) produce it, so the cap is the authorization; see "Upstream
+moved" in [docs/agent-mail.md](agent-mail.md).
+
 Install refuses when:
 
 - an element is not an `@name` matching `^@[a-z0-9][a-z0-9-]*$`, or is
