@@ -3,6 +3,7 @@
 #
 # Usage: fork-sandbox-status.sh [--result | --json | --events N | --log | --monitor | --monitor-terminal | --follow] <run-dir>...
 #        fork-sandbox-status.sh --json --set <run-dir>...
+#        fork-sandbox-status.sh --session <id> --progress
 #
 # <run-dir> is the run directory fork-sandbox.sh printed when it launched.
 #
@@ -68,6 +69,19 @@
 #               the Monitor tool wants --monitor-terminal. Ends like
 #               --monitor does,
 #               with the summary, on every terminal state.
+# --session <id> --progress: takes no <run-dir> at all. One compact line per
+#               run this Claude session (CLAUDE_CODE_SESSION_ID at launch)
+#               has started, oldest first, read from each run's own
+#               progress.json via the by-session index fork-sandbox.sh
+#               writes at launch time (FORK_SANDBOX_BY_SESSION_DIR
+#               overrides its root, for tests). Each line is
+#               "<label>  <state>  <action>:<state>[(<i>/<cap>)] ...", one
+#               <action>:<state> per pipeline step, e.g.:
+#                 sbx-foo  running  code:done review:running(1/2) maintain:pending
+#               A run linked under the session but with no progress.json
+#               yet prints its run-dir basename and a bare "?". An unknown
+#               session (no index directory at all) prints nothing and
+#               exits 0. Reads no git, like every other mode here.
 #
 # Why this is safe to blanket-approve. It reads and never writes, it runs no
 # git and no other program except fork-sandbox-format.sh, and it accepts only
@@ -182,11 +196,72 @@ run_fleet_json() {
         }'
 }
 
+# --session <id> --progress's own reader: one compact line per run this
+# Claude session has launched, oldest link first. The by-session index is a
+# directory of symlinks fork-sandbox.sh creates at launch time (never
+# pruned), named by the run dir's own basename, so this ignores everything
+# about a run except that path -- it never opens run.env or any other run
+# file directly, only progress.json through the same run-dir shape every
+# other mode here already expects. Sorted by each SYMLINK's own mtime
+# (lstat, not the target's -- the run dir's mtime moves constantly as
+# progress.json is rewritten, which is not launch order at all), captured
+# once when fork-sandbox.sh created the link and never touched again.
+print_progress_view() {
+    local session="$1" by_session_root link mtime base target
+    by_session_root="${FORK_SANDBOX_BY_SESSION_DIR:-$FS_SCRATCH_ROOT/forks/by-session}"
+    [[ -d "$by_session_root/$session" ]] || return 0
+    while IFS=$'\t' read -r mtime link; do
+        [[ -n "$link" ]] || continue
+        base="$(basename -- "$link")"
+        target="$("$FS_REALPATH" -e -- "$link" 2>/dev/null)"
+        if [[ -z "$target" || -L "$target/progress.json" \
+                || ! -f "$target/progress.json" ]]; then
+            printf '%s  ?\n' "$base"
+            continue
+        fi
+        print_progress_line "$target/progress.json" "$base"
+    done < <(
+        for link in "$by_session_root/$session"/*; do
+            [[ -L "$link" ]] || continue
+            mtime="$("$FS_STAT" -c '%Y' -- "$link" 2>/dev/null)" || continue
+            printf '%s\t%s\n' "$mtime" "$link"
+        done | sort -n -s -k1,1
+    )
+}
+
+# $1 a progress.json path already resolved and confirmed to be a plain
+# file, never a symlink (see print_progress_view's own checks). $2 the
+# run-dir basename, used as the displayed name when the file carries no
+# label (should not happen, but a reader must never print nothing). One
+# line: "<label>  <state>  <action>:<state>(<i>/<cap>) ...", the (<i>/<cap>)
+# suffix only on a step whose cap is not 1 -- a plain one-pass code step
+# never shows it, matching the module's own worked example.
+print_progress_line() {
+    local path="$1" fallback="$2" json
+    json="$(cat -- "$path" 2>/dev/null)"
+    if [[ -z "$json" ]]; then
+        printf '%s  ?\n' "$fallback"
+        return
+    fi
+    printf '%s' "$json" | jq -r --arg fallback "$fallback" '
+        (.label // $fallback) as $label
+        | (.state // "unknown") as $state
+        | ([.steps[]?
+             | (.action // "?") + ":" + (.state // "?")
+               + (if (.cap // 1) != 1
+                  then "(" + ((.i // 0) | tostring) + "/" + ((.cap // 1) | tostring) + ")"
+                  else "" end)
+           ] | join(" ")) as $steps
+        | $label + "  " + $state + "  " + $steps' 2>/dev/null \
+        || printf '%s  ?\n' "$fallback"
+}
+
 mode="status"
 events_n=""
 run_dir_args=()
 fleet_set=0
 terminal_only=0
+session_arg=""
 # The name of a mode flag already parsed, so --monitor-terminal can refuse
 # to follow one — the reverse of the case set_mode refuses, the same broken
 # combination with the arguments swapped.
@@ -210,6 +285,11 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --set) fleet_set=1; shift ;;
+        --session)
+            session_arg="${2:?--session requires a session id}"
+            shift 2
+            ;;
+        --progress) set_mode progress --progress; shift ;;
         -h|--help) usage; exit 0 ;;
         -*) die "unknown option: $1 (try --help)" ;;
         *)
@@ -233,6 +313,13 @@ if (( fleet_set )); then
     [[ "$mode" == "json" ]] || die "--set is only valid with --json"
     (( ${#run_dir_args[@]} > 0 )) || die "--set requires at least one run directory"
 fi
+if [[ -n "$session_arg" && "$mode" != "progress" ]]; then
+    die "--session is only valid with --progress"
+fi
+if [[ "$mode" == "progress" ]]; then
+    [[ -n "$session_arg" ]] || die "--progress requires --session <id>"
+    (( ${#run_dir_args[@]} == 0 )) || die "--progress takes no run directory argument"
+fi
 if (( ${#run_dir_args[@]} > 1 )) && [[ "$mode" != "json" ]]; then
     die "only one run directory may be given"
 fi
@@ -240,6 +327,15 @@ if [[ -n "$events_n" && ! "$events_n" =~ ^[0-9]+$ ]]; then
     die "--events takes a number"
 fi
 [[ -x "$formatter" ]] || die "$formatter is missing. Run install.sh."
+
+# --session --progress takes no run directory at all -- it reads the
+# by-session index fork-sandbox.sh writes at launch, not a run dir named on
+# this command line -- so it is dispatched here, before every check below
+# that assumes exactly one (or, for --json, one-or-more) run-dir argument.
+if [[ "$mode" == "progress" ]]; then
+    print_progress_view "$session_arg"
+    exit 0
+fi
 
 # --json with 2+ run dirs, or --set at any arity (including one -- a
 # one-seat fleet is legal, and lkml's fleet screens must be able to ask

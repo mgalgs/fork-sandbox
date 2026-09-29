@@ -763,4 +763,50 @@ member="$(printf '%s' "$json" | jq -c '.runs[] | select(.run_id == "'"$(basename
 [[ "$(jq -r '.totals.states.unknown' <<<"$json")" == "1" ]] \
     || { echo "totals.states did not count the unknown-state member: $json"; exit 1; }
 
-echo "55 passed, 0 failed"
+# 27. --session <id> --progress: reads the by-session index fork-sandbox.sh
+# writes at launch, never any run-dir argument on this command line, and
+# runs no git. FORK_SANDBOX_BY_SESSION_DIR stands in for the real root, so
+# this fixture never touches /var/tmp/claude-scratch/forks/by-session.
+by_session_root="$(mktemp -d)"
+trap 'rm -rf -- "${run_dirs[@]}" "$by_session_root"' EXIT
+
+new_run_dir; rdProgA="$rd_new"
+cat > "$rdProgA/progress.json" <<'EOF'
+{"schema":1,"label":"sbx-foo","spec":null,"state":"running","updated":1,
+ "steps":[{"action":"code","state":"done","i":1,"cap":1,"ended":null},
+          {"action":"review","state":"running","i":1,"cap":2,"ended":null},
+          {"action":"maintain","state":"pending","i":0,"cap":1,"ended":null}]}
+EOF
+new_run_dir; rdProgB="$rd_new"
+# No progress.json at all -- the "still starting, or too old" case.
+
+sess="fixture-session-$$"
+mkdir -p "$by_session_root/$sess"
+# Linked oldest first, by an explicit mtime on each SYMLINK itself (-h),
+# never on the target -- the target's own mtime moves constantly as
+# progress.json is rewritten, which print_progress_view must not sort by.
+ln -s "$rdProgB" "$by_session_root/$sess/$(basename "$rdProgB")"
+touch -h -d '2020-01-01T00:00:00' "$by_session_root/$sess/$(basename "$rdProgB")"
+ln -s "$rdProgA" "$by_session_root/$sess/$(basename "$rdProgA")"
+touch -h -d '2020-01-02T00:00:00' "$by_session_root/$sess/$(basename "$rdProgA")"
+
+out="$(FORK_SANDBOX_BY_SESSION_DIR="$by_session_root" "$status" --session "$sess" --progress 2>&1)"
+[[ "$out" == "$(basename "$rdProgB")  ?"$'\n'"sbx-foo  running  code:done review:running(1/2) maintain:pending" ]] \
+    || { echo "--session --progress did not print the expected two lines, oldest first: $out"; exit 1; }
+
+out="$(FORK_SANDBOX_BY_SESSION_DIR="$by_session_root" "$status" --session "no-such-session-$$" --progress 2>&1)"; rc=$?
+[[ $rc -eq 0 && -z "$out" ]] \
+    || { echo "an unknown session did not print nothing and exit 0: rc=$rc out=$out"; exit 1; }
+
+if "$status" --session "$sess" >/dev/null 2>&1; then
+    echo "--session with no --progress was accepted"; exit 1
+fi
+if "$status" --progress >/dev/null 2>&1; then
+    echo "--progress with no --session was accepted"; exit 1
+fi
+if FORK_SANDBOX_BY_SESSION_DIR="$by_session_root" "$status" --session "$sess" --progress "$rdProgA" \
+    >/dev/null 2>&1; then
+    echo "--progress accepted a run-dir argument"; exit 1
+fi
+
+echo "61 passed, 0 failed"
