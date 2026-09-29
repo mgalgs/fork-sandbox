@@ -108,15 +108,22 @@ fi
 printf '\n== fork-task.sh: session lineage recorded in the agent registry ==\n'
 
 # These tests reach the tmux launch itself, unlike the --sol tests above, so
-# tmux (and claude/codex, for good measure) are stubbed on PATH. The tmux
-# stub never runs the assembled command -- it just logs every argument it
-# was given (one per line, so the final argument, the full launch command,
-# is the log's last line) and prints a fixed pane id, exactly like a real
-# `tmux new-window -P -F '#{pane_id}' ...` would without actually opening
-# anything.
+# tmux (and claude/codex) are stubbed on PATH. The tmux stub logs every
+# argument it was given (one per line, so the final argument, the full
+# launch command, is the log's last line), then actually EXECUTES that
+# final argument -- exactly like real tmux spawns the pane's shell command
+# -- so the stubbed claude/codex underneath it runs for real and can record
+# its own argv. That is what lets these tests assert on the argv the
+# stubbed launch actually received, rather than pattern-matching the
+# shell-quoted command string (which can pass even when quoting or word
+# splitting would have delivered a different argv to the real program).
+# The stub still prints a fixed pane id, exactly like a real
+# `tmux new-window -P -F '#{pane_id}' ...` would.
 stub_bin="$tmp/stubbin"
 mkdir -p "$stub_bin"
 tmux_log="$tmp/tmux.log"
+claude_argv_log="$tmp/claude-argv.log"
+codex_argv_log="$tmp/codex-argv.log"
 
 cat > "$stub_bin/tmux" <<'STUB'
 #!/usr/bin/env bash
@@ -125,18 +132,43 @@ for a in "$@"; do printf '%s\n' "$a" >> "$TMUX_STUB_LOG"; done
 case "$1" in
     has-session) exit 1 ;;
     list-sessions) echo "  (none)" ;;
-    *) echo "%99" ;;
+    *)
+        eval "${@: -1}" >/dev/null 2>&1
+        echo "%99"
+        ;;
 esac
 STUB
 chmod +x "$stub_bin/tmux"
 
-for stub_prog in claude codex; do
-    printf '#!/usr/bin/env bash\nexit 0\n' > "$stub_bin/$stub_prog"
-    chmod +x "$stub_bin/$stub_prog"
-done
+# Each stub truncates its own argv log at the start of every invocation, so
+# a test only ever sees the argv from its own launch, not a stale one left
+# over from an earlier test.
+cat > "$stub_bin/claude" <<'STUB'
+#!/usr/bin/env bash
+: > "${CLAUDE_STUB_LOG:?CLAUDE_STUB_LOG must be set}"
+for a in "$@"; do printf '%s\n' "$a" >> "$CLAUDE_STUB_LOG"; done
+exit 0
+STUB
+chmod +x "$stub_bin/claude"
+
+cat > "$stub_bin/codex" <<'STUB'
+#!/usr/bin/env bash
+: > "${CODEX_STUB_LOG:?CODEX_STUB_LOG must be set}"
+for a in "$@"; do printf '%s\n' "$a" >> "$CODEX_STUB_LOG"; done
+exit 0
+STUB
+chmod +x "$stub_bin/codex"
 
 export PATH="$stub_bin:$PATH"
 export TMUX_STUB_LOG="$tmux_log"
+export CLAUDE_STUB_LOG="$claude_argv_log"
+export CODEX_STUB_LOG="$codex_argv_log"
+
+# Look up the value that follows a given flag in an argv-per-line log file
+# written by the claude/codex stubs above.
+argv_value_after() {
+    awk -v flag="$2" 'found { print; exit } $0 == flag { found=1 }' "$1"
+}
 
 lineage_project="$tmp/lineage-project"
 mkdir -p "$lineage_project"
@@ -146,23 +178,21 @@ printf 'handoff\n' > "$lineage_handoff"
 uuid_re='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
 
 # A plain claude launch: the registry's session_id is a fresh, valid UUID,
-# and it is the very same UUID the stubbed launch command received via
-# --session-id -- not a second, unrelated one.
+# and it is the very same UUID the stubbed claude process actually received
+# via --session-id -- not a second, unrelated one, and not merely a string
+# that appears somewhere in the shell-quoted launch command.
 reg="$tmp/registry-session-id.jsonl"
 : > "$tmux_log"
 if ! out="$(env -u CLAUDE_CODE_SESSION_ID FORK_TASK_REGISTRY="$reg" "$launcher" "$lineage_project" "$lineage_handoff" 2>&1)"; then
     no "a claude launch's registry line has session_id matching the launch command" "$out"
 else
     reg_id="$(jq -r '.session_id' "$reg")"
-    # The logged command is %q-shell-quoted, so plain spaces may appear as
-    # backslash-space; strip backslashes first so a plain-space match works.
-    cmd_line="$(cat "$tmux_log")"
-    cmd_id="$(printf '%s\n' "${cmd_line//\\/}" | grep -oE -- '--session-id [0-9a-f-]+' | tail -n1 | awk '{print $2}')"
-    if [[ "$reg_id" =~ $uuid_re ]] && [[ "$reg_id" == "$cmd_id" ]]; then
+    argv_id="$(argv_value_after "$claude_argv_log" --session-id)"
+    if [[ "$reg_id" =~ $uuid_re ]] && [[ "$reg_id" == "$argv_id" ]]; then
         ok "a claude launch's registry line has session_id matching the launch command"
     else
         no "a claude launch's registry line has session_id matching the launch command" \
-            "registry session_id='$reg_id' launch command session_id='$cmd_id'"
+            "registry session_id='$reg_id' claude received --session-id '$argv_id'"
     fi
 fi
 
@@ -225,30 +255,35 @@ else
     esac
 fi
 
-# A codex launch has no --session-id flag to give, so it always records null.
+# A codex launch has no --session-id flag to give, so it always records null,
+# and the stubbed codex process never receives one either.
 reg="$tmp/registry-codex.jsonl"
+: > "$codex_argv_log"
 FORK_TASK_REGISTRY="$reg" "$launcher" --harness codex "$lineage_project" "$lineage_handoff" > /dev/null 2>"$err"
 reg_id="$(jq -r '.session_id' "$reg" 2>/dev/null)"
-if [[ "$reg_id" == "null" ]]; then
+if [[ "$reg_id" == "null" ]] && ! grep -qx -- '--session-id' "$codex_argv_log"; then
     ok "a codex launch records session_id: null"
 else
-    no "a codex launch records session_id: null" "got '$reg_id': $(cat "$err")"
+    no "a codex launch records session_id: null" \
+        "registry session_id='$reg_id' codex argv: $(cat "$codex_argv_log") : $(cat "$err")"
 fi
 
 # A caller-supplied --session-id inside --claude-args is recorded as-is and
-# not duplicated by a second, generated --session-id.
+# not duplicated by a second, generated --session-id -- the stubbed claude
+# process receives exactly one --session-id flag, with the caller's value.
 reg="$tmp/registry-caller-session-id.jsonl"
 : > "$tmux_log"
 caller_uuid="11111111-1111-1111-1111-111111111111"
 FORK_TASK_REGISTRY="$reg" "$launcher" --claude-args "--session-id $caller_uuid" \
     "$lineage_project" "$lineage_handoff" > /dev/null 2>"$err"
-occurrences="$(grep -o -- '--session-id' "$tmux_log" | wc -l | tr -d ' ')"
+occurrences="$(grep -cx -- '--session-id' "$claude_argv_log")"
+argv_id="$(argv_value_after "$claude_argv_log" --session-id)"
 reg_id="$(jq -r '.session_id' "$reg" 2>/dev/null)"
-if [[ "$occurrences" == "1" && "$reg_id" == "$caller_uuid" ]]; then
+if [[ "$occurrences" == "1" && "$argv_id" == "$caller_uuid" && "$reg_id" == "$caller_uuid" ]]; then
     ok "a caller-supplied --session-id in --claude-args is recorded, not duplicated"
 else
     no "a caller-supplied --session-id in --claude-args is recorded, not duplicated" \
-        "occurrences=$occurrences registry session_id='$reg_id': $(cat "$err")"
+        "occurrences=$occurrences claude received --session-id '$argv_id' registry session_id='$reg_id': $(cat "$err")"
 fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
