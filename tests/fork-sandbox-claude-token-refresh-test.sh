@@ -644,5 +644,58 @@ else
         "$(dirname "${src_path:-unknown}") still exists"
 fi
 
+printf '\n== a foreign lock held by someone else survives the loop'"'"'s own exit ==\n'
+# Regression test: the live-sync loop's EXIT trap
+# (_fs_claude_refresh_emergency_cleanup) used to rmdir both shared claude
+# lock dirs unconditionally on every exit, even when this run never took
+# them -- breaking claude's refresh mutual exclusion for the whole host the
+# instant any step ended. Reproduce exactly that: pre-create both lock dirs
+# as if another process (the host's interactive claude, or another step's
+# own loop) holds them, then run claude-sandboxed against a credential far
+# from expiry (so fs_claude_refresh_if_needed's own tick never takes them
+# either) and let it exit normally. Both foreign locks must still be there
+# afterwards.
+foreign_work="$work/foreign-lock"; mkdir -p "$foreign_work/bin"
+foreign_bin="$foreign_work/bin"
+cp "$sync_bin/sandbox-backend-test" "$foreign_bin/sandbox-backend-test"
+cp "$sync_bin/claude" "$foreign_bin/claude"
+
+foreign_home="$foreign_work/home"; mkdir -p "$foreign_home"
+foreign_cred="$foreign_work/host-credentials.json"
+write_cred "$foreign_cred" 240
+foreign_wd="$foreign_work/wd"; mkdir -p "$foreign_wd"
+
+foreign_dir="$foreign_work"
+foreign_lock1="$foreign_dir/.oauth_refresh.lock"
+foreign_lock2="$("$FS_REALPATH" -m "$foreign_dir").lock"
+mkdir "$foreign_lock1" "$foreign_lock2"
+
+PATH="$foreign_bin:$PATH" FORK_SANDBOX_BACKEND=test HOME="$foreign_home" \
+    FS_CLAUDE_TOKEN_CONTRACT_DIR="$foreign_work/contract" \
+    SYNC_SLEEP_SECS=3 \
+    "$repo_dir/scripts/claude-sandboxed" --claude-credentials "$foreign_cred" "$foreign_wd" --print hello \
+        > "$foreign_work/run.out" 2>&1
+foreign_rc=$?
+
+if [[ "$foreign_rc" == 0 ]]; then
+    ok "the run under test (with pre-existing foreign locks) exits 0"
+else
+    no "the run under test (with pre-existing foreign locks) exits 0" \
+        "rc=$foreign_rc: $(cat "$foreign_work/run.out" 2>/dev/null)"
+fi
+if [[ -d "$foreign_lock1" ]]; then
+    ok "a foreign .oauth_refresh.lock this run never took survives its exit"
+else
+    no "a foreign .oauth_refresh.lock this run never took survives its exit" \
+        "$foreign_lock1 was removed"
+fi
+if [[ -d "$foreign_lock2" ]]; then
+    ok "a foreign legacy <dir>.lock this run never took survives its exit"
+else
+    no "a foreign legacy <dir>.lock this run never took survives its exit" \
+        "$foreign_lock2 was removed"
+fi
+rmdir "$foreign_lock1" "$foreign_lock2" 2>/dev/null || true
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))

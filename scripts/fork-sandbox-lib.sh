@@ -1890,9 +1890,21 @@ _fs_claude_take_lock() {
 # Holds _fs_claude_do_refresh's scratch dir path for exactly as long as that
 # dir exists and contains the real refresh token, so a signal that arrives
 # mid-refresh -- including while blocked inside the up-to-40s `claude mcp
-# list` call below -- can still find and remove it. See
-# fs_claude_refresh_if_needed's EXIT trap, which reads this.
+# list` call below -- can still find and remove it. See claude-sandboxed's
+# live-sync loop, which installs the EXIT trap (_fs_claude_refresh_emergency_
+# cleanup) that reads this.
 _FS_CLAUDE_REFRESH_SCRATCH=""
+
+# Set to a non-empty value for exactly as long as fs_claude_refresh_if_needed
+# actually holds the correspondingly-named lock directory, so
+# _fs_claude_refresh_emergency_cleanup can tell "we hold this lock, a signal
+# just skipped our own release" from "we never took this lock" (or already
+# released it) and rmdir only the former. Without this, the emergency
+# cleanup would break a live lock held by some other process -- the host's
+# interactive claude, or another step's own loop -- every time it fires,
+# which is unconditionally, on every exit of the process that installs it.
+_FS_CLAUDE_REFRESH_LOCK1_HELD=""
+_FS_CLAUDE_REFRESH_LOCK2_HELD=""
 
 # Does the actual refresh, once both locks are held and the re-check under
 # them still says the token is due. Builds a scratch CLAUDE_CONFIG_DIR
@@ -1978,6 +1990,43 @@ _fs_claude_do_refresh() {
     return 0
 }
 
+# Emergency cleanup for a call to fs_claude_refresh_if_needed that a signal
+# interrupts before it reaches its own end-of-function rmdir calls: removes
+# _fs_claude_do_refresh's scratch dir (via the global below, which tracks it
+# for exactly as long as it exists) and releases whichever of the two named
+# lock dirs this process still holds, per _FS_CLAUDE_REFRESH_LOCK{1,2}_HELD.
+# It is installed as a long-lived EXIT trap that fires on every exit of its
+# process, most of which have nothing to do with a refresh in progress (the
+# ordinary end of the sandbox run, with no refresh ever attempted this tick);
+# rmdir-ing unconditionally there would break claude's shared refresh lock
+# out from under whoever else actually holds it -- the host's interactive
+# claude, or another step's own loop -- which is the mutual exclusion this
+# whole mechanism exists to preserve. So each rmdir below is gated on this
+# process actually having taken that lock and not yet released it; both
+# checks, and the scratch-dir removal, are otherwise idempotent no-ops.
+#
+# Installed only by claude-sandboxed's live-sync loop, once, for its whole
+# lifetime, around every call it makes to fs_claude_refresh_if_needed -- see
+# the loop itself. That is the one caller that both needs the protection (it
+# is the only one a caller ever sends an external kill signal to, from
+# claude-sandboxed's own `cleanup`) and safely owns its entire process's EXIT
+# trap outright (a dedicated background subshell with no trap of its own).
+# See fs_claude_refresh_if_needed's SECURITY INVARIANT comment for why this
+# is not wired in there instead.
+_fs_claude_refresh_emergency_cleanup() {
+    local lock1="$1" lock2="$2"
+    [[ -n "$_FS_CLAUDE_REFRESH_SCRATCH" ]] && rm -rf "$_FS_CLAUDE_REFRESH_SCRATCH" 2>/dev/null
+    if [[ -n "$_FS_CLAUDE_REFRESH_LOCK2_HELD" ]]; then
+        rmdir "$lock2" 2>/dev/null
+        _FS_CLAUDE_REFRESH_LOCK2_HELD=""
+    fi
+    if [[ -n "$_FS_CLAUDE_REFRESH_LOCK1_HELD" ]]; then
+        rmdir "$lock1" 2>/dev/null
+        _FS_CLAUDE_REFRESH_LOCK1_HELD=""
+    fi
+    true
+}
+
 # Refreshes a FILE-backed Claude credential on the host when less than
 # FS_CLAUDE_REFRESH_BEFORE_MIN minutes (default 120; a test hook) remain on
 # its access token, so no step starts, or runs long, on a token close enough
@@ -2014,7 +2063,7 @@ _fs_claude_do_refresh() {
 # long before the caller's real end. The one caller that both needs this
 # protection and safely owns its whole process's EXIT trap is claude-
 # sandboxed's live-sync loop, a dedicated background subshell with no trap of
-# its own; see _fs_claude_refresh_emergency_cleanup below and the loop itself
+# its own; see _fs_claude_refresh_emergency_cleanup above and the loop itself
 # for where the trap actually lives. Every other caller (the pre-step check,
 # and every test) accepts the narrower, pre-existing risk of a leaked scratch
 # dir on an exact, rare signal race, rather than this function reaching into
@@ -2042,30 +2091,6 @@ _fs_claude_do_refresh() {
 # either lock is not an error: some other process is presumably refreshing
 # right now, and the sync loop (or the next call here) will pick up its
 # result.
-# Emergency cleanup for a call to fs_claude_refresh_if_needed that a signal
-# interrupts before it reaches its own end-of-function rmdir calls: removes
-# _fs_claude_do_refresh's scratch dir (via the global below, which tracks it
-# for exactly as long as it exists) and releases both named lock dirs.
-# Idempotent -- every operation here is a harmless no-op against something
-# already removed -- so it is safe to register as a long-lived EXIT trap and
-# let it fire, possibly as a no-op, whenever its process actually exits.
-#
-# Installed only by claude-sandboxed's live-sync loop, once, for its whole
-# lifetime, around every call it makes to fs_claude_refresh_if_needed -- see
-# the loop itself. That is the one caller that both needs the protection (it
-# is the only one a caller ever sends an external kill signal to, from
-# claude-sandboxed's own `cleanup`) and safely owns its entire process's EXIT
-# trap outright (a dedicated background subshell with no trap of its own).
-# See fs_claude_refresh_if_needed's SECURITY INVARIANT comment for why this
-# is not wired in there instead.
-_fs_claude_refresh_emergency_cleanup() {
-    local lock1="$1" lock2="$2"
-    [[ -n "$_FS_CLAUDE_REFRESH_SCRATCH" ]] && rm -rf "$_FS_CLAUDE_REFRESH_SCRATCH" 2>/dev/null
-    rmdir "$lock2" 2>/dev/null
-    rmdir "$lock1" 2>/dev/null
-    true
-}
-
 fs_claude_refresh_if_needed() {
     local cred_file="$1" claude_bin="${2:-}"
     [[ -n "$claude_bin" ]] || return 0
@@ -2086,11 +2111,14 @@ fs_claude_refresh_if_needed() {
         echo "claude-sandboxed: could not acquire $lock1 within ${budget}s (another process appears to be refreshing); skipping the host token refresh this time." >&2
         return 0
     fi
+    _FS_CLAUDE_REFRESH_LOCK1_HELD=1
     if ! _fs_claude_take_lock "$lock2" "$budget"; then
         rmdir "$lock1" 2>/dev/null || true
+        _FS_CLAUDE_REFRESH_LOCK1_HELD=""
         echo "claude-sandboxed: could not acquire $lock2 within ${budget}s (another process appears to be refreshing); skipping the host token refresh this time." >&2
         return 0
     fi
+    _FS_CLAUDE_REFRESH_LOCK2_HELD=1
 
     # Re-check under the lock: another process may have refreshed while we
     # were waiting for it.
@@ -2105,7 +2133,9 @@ fs_claude_refresh_if_needed() {
     fi
 
     rmdir "$lock2" 2>/dev/null || true
+    _FS_CLAUDE_REFRESH_LOCK2_HELD=""
     rmdir "$lock1" 2>/dev/null || true
+    _FS_CLAUDE_REFRESH_LOCK1_HELD=""
     return 0
 }
 
