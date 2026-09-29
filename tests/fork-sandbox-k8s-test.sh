@@ -14402,7 +14402,7 @@ pm_api_refused "a hooks Secret name over 253 characters refuses" "at most 253 ch
     "$(pm_api_cfg "K8S_POSTMASTER_HOOKS_SECRET=$(printf 'a%.0s' $(seq 1 254))")"
 for pm_own in fork-sandbox-upstream-key fork-sandbox-postmaster-git fork-sandbox-mail-api-tokens; do
     pm_api_refused "the installer's own Secret $pm_own refuses as the hooks Secret" "one of" \
-        "$(pm_api_cfg K8S_POSTMASTER_HOOKS_SECRET=$pm_own)"
+        "$(pm_api_cfg "K8S_POSTMASTER_HOOKS_SECRET=$pm_own")"
 done
 
 # 14i. Claude credential Secret: optional, from
