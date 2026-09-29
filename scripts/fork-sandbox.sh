@@ -159,7 +159,7 @@
 #                        file format.
 # --pipeline <spec>:     a preset written inline, in the composition-name
 #                        grammar: -joined <stage><model>[<harness>][<N>]
-#                        segments, stage c/r/m in that order, e.g.
+#                        segments, stage c/r/m in any order, e.g.
 #                        csonnet2-rsol2-mopus2. Each model runs on its
 #                        native harness; N defaults to 1. It compiles to a
 #                        preset and runs exactly as --preset would, fix legs

@@ -8,16 +8,13 @@ A spec is a preset's composition name used as the preset itself:
 `csonnet2-rsol2-mopus2` (code sonnet x2, review sol x2, maintain opus x2),
 or `ropus-msonnet` (opus review, sonnet maintain -- no code step at all).
 
-    stage    c (code), r (review) or m (maintain). At most one c segment,
-             which must come first if present; any number of r segments;
-             any number of m segments -- in that order (c, r*, m*). An r
-             segment after an m is refused; consecutive r's or consecutive
-             m's are not -- UNLESS there is no c segment: a codeless spec
-             compiles to a read-only pipeline (see
-             fork-sandbox-preset-parse.py), which only ever runs as a
-             review step, a maintain step, or a review step then a
-             maintain step, so a codeless spec takes at most one r and at
-             most one m.
+    stage    c (code), r (review) or m (maintain), in any order and any
+             count, exactly as a preset file's pipeline allows --
+             UNLESS there is no c segment: a codeless spec compiles to a
+             read-only pipeline (see fork-sandbox-preset-parse.py), which
+             only ever runs as a review step, a maintain step, or a review
+             step then a maintain step, so a codeless spec takes at most
+             one r and at most one m.
     model    a name from MODELS below. It runs on its native harness, the
              first one listed for it.
     harness  optional: claude, codex or pi, to seat the model on a
@@ -33,7 +30,8 @@ stage's first segment names its agent the plain way ("coder", "reviewer",
 from there ("reviewer2", "reviewer3", ...) -- deterministic on the spec's
 own segment order, not on the model or harness a segment names.
 
-Fix legs ride the code seat: no step names a fix_agent. Anything the
+Fix legs ride the first code seat: no step names a fix_agent, so the
+preset parser's default applies. Anything the
 grammar cannot say (fix_agent, per-seat arguments on another seat, network)
 stays a preset file.
 
@@ -97,8 +95,6 @@ def parse_seat(spec, seg, body):
 def compile_spec(spec):
     segments = spec.split("-")
     seats = []
-    c_count = 0
-    last_rank = -1
     occurrences = {"c": 0, "r": 0, "m": 0}
     for seg in segments:
         m = re.fullmatch(r"([a-z])([a-z]+)([0-9]*)", seg)
@@ -109,17 +105,6 @@ def compile_spec(spec):
         if stage not in STAGES:
             fail(spec, f"segment '{seg}': stage '{stage}' is not c (code), "
                        f"r (review) or m (maintain)")
-        rank = "crm".index(stage)
-        if rank < last_rank:
-            fail(spec, "stages run in the order c, r*, m* -- at most one "
-                       "code stage, then any number of review stages, "
-                       "then any number of maintain stages")
-        if stage == "c":
-            c_count += 1
-            if c_count > 1:
-                fail(spec, f"stage 'c' appears twice; at most one code "
-                           f"stage is allowed")
-        last_rank = rank
         if digits and (digits.startswith("0")):
             fail(spec, f"segment '{seg}': the repeat count is a positive "
                        f"integer without a leading zero")
@@ -131,7 +116,8 @@ def compile_spec(spec):
                  else f"{AGENT_NAMES[stage]}{occurrence}")
         seats.append((stage, harness, model_id, repeat, agent))
 
-    if c_count == 0 and (occurrences["r"] > 1 or occurrences["m"] > 1):
+    if occurrences["c"] == 0 and (occurrences["r"] > 1
+                                  or occurrences["m"] > 1):
         fail(spec, "a codeless spec compiles to a read-only pipeline, which "
                    "runs at most one review step and one maintain step; "
                    "add a code segment to repeat review or maintain stages")

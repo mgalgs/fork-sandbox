@@ -218,11 +218,12 @@ fork-sandbox.sh --pipeline csonnet2-rsol2-mopus2 ~/src/myrepo handoff.md
 
 The spec is `-`-joined segments, `<stage><model>[<harness>][<N>]`:
 
-- **stage** is `c` (code), `r` (review) or `m` (maintain). At most one
-  `c`, which must come first if present; then any number of `r` segments;
-  then any number of `m` segments — order `c, r*, m*`. An `r` after an `m`
-  is still refused; `csonnet-ropus-rsonnet-mopus-msonnet` (one code step,
-  two review steps, two maintain steps) is not.
+- **stage** is `c` (code), `r` (review) or `m` (maintain), in any order
+  and any count, as a preset file's `pipeline` allows:
+  `csonnet-csol-ropus-rsol-mopus-mastra` is two code steps, two review
+  steps and two maintain steps. Fix legs ride the first code step's agent.
+  The one exception is a spec with no `c` at all: it compiles to a
+  read-only pipeline, so it takes at most one `r` and at most one `m`.
 - **model** is a name from the table at the top of
   `scripts/fork-sandbox-pipeline-spec.py`, and runs on its native harness:
   `haiku`, `sonnet`, `opus`, `fable` on claude; `luna`, `terra`, `sol`,

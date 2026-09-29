@@ -1440,12 +1440,27 @@ refuses "--pipeline and --preset are mutually exclusive" \
     --pipeline chaiku --preset fast
 refuses "an unknown model is refused, naming the known ones" \
     "unknown model 'gpt'; known models: haiku" --pipeline cgpt
-refuses "stages out of order are refused" \
-    "stages run in the order c, r*, m*" --pipeline mopus-csonnet
-refuses "a repeated code stage is refused" \
-    "stage 'c' appears twice" --pipeline chaiku-csonnet
-refuses "a review stage after a maintain stage is refused" \
-    "stages run in the order c, r*, m*" --pipeline chaiku-mopus-rsol
+accepts "a maintain stage before the code stage compiles" \
+    --pipeline mopus-csonnet
+accepts "a repeated code stage compiles" --pipeline chaiku-csonnet
+accepts "a review stage after a maintain stage compiles" \
+    --pipeline chaiku-mopus-rsol
+# Two code stages, each on its own agent and harness; fix legs default to
+# the first code step's agent, since the compiler names no fix_agent.
+python3 "$repo_dir/scripts/fork-sandbox-pipeline-spec.py" \
+    csonnet-csol-ropus-rsol-mopus-mastra | \
+    parses "a spec with two of every stage parses to 6 distinct steps" \
+        "pipeline	steps	6" \
+        "step	1	agent	coder" "step	2	agent	coder2" \
+        "step	3	agent	reviewer" "step	3	fix_default	1" \
+        "step	4	agent	reviewer2" \
+        "step	5	agent	maintainer" "step	6	agent	maintainer2"
+python3 "$repo_dir/scripts/fork-sandbox-pipeline-spec.py" \
+    mopus-csonnet-rsol | \
+    parses "a spec that maintains before it codes keeps its order" \
+        "pipeline	steps	3" \
+        "step	1	agent	maintainer" "step	2	agent	coder" \
+        "step	3	agent	reviewer"
 out="$(run --pipeline csonnet2-ropus-rsonnet-mopus-msonnet 2>"$err")"
 check "repeated review/maintain stages compile" \
     $'pipeline=csonnet2-ropus-rsonnet-mopus-msonnet\nharness=claude\nmodel=' \
