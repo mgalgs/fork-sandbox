@@ -294,7 +294,7 @@ nudge_marker="$(mktemp -u)"; nudge_reminded="$(mktemp -u)"; stale_reminded="$(mk
 tmpdirs+=("$nudge_marker" "$nudge_reminded" "$stale_reminded")
 out="$(hook_run "$inbox" PostToolUse "/nonexistent/transcript.jsonl")"
 contains "with no refresh config, addenda still deliver" \
-    "do the other thing" "$out"
+    "$inbox/1724650001-01.md" "$out"
 
 # =====================================================================
 printf '\n== fork-sandbox-inbox-hook.sh: the per-leg budget (CEILING_TOKENS) ==\n'

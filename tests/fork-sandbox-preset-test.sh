@@ -1593,6 +1593,19 @@ n=$(( n + 1 ))
 printf '%s' "$n" > "$FAKE_COUNT_FILE"
 printf '%s\n' "$*" >> "$FAKE_ARGV_LOG"
 
+# Prompt capture and a mid-leg operator addendum, for the repeat-pass
+# addenda tests: only active when a test sets FAKE_PROMPT_DIR (every leg's
+# stdin prompt is saved as prompt-<n>) and FAKE_ADDENDUM_TEXT (the first
+# leg drops that text into the run's inbox, which the runner archives when
+# the leg ends).
+if [[ -n "${FAKE_PROMPT_DIR:-}" ]]; then
+    printf '%s\n' "$prompt" > "$FAKE_PROMPT_DIR/prompt-$n"
+    if [[ "$n" == 1 && -n "${FAKE_ADDENDUM_TEXT:-}" && -n "$clone_dir" ]]; then
+        printf '%s\n' "$FAKE_ADDENDUM_TEXT" \
+            > "$(dirname "$(dirname "$clone_dir")")/inbox/9999999900-01.md"
+    fi
+fi
+
 # Intermediate-state capture for the progress.json tests: while THIS call is
 # "the leg" a pipeline step is running, run.sh's own progress.json already
 # shows that step as "running" (it is written before the leg starts, not
@@ -2108,6 +2121,49 @@ if rd_a="$(run_stubbed --preset rep3 \
 else
     no "rep3 launch succeeds"
 fi
+
+# A repeat code pass is given the addenda an earlier pass received: pass 1
+# archives its addendum into inbox-delivered/leg-1/, and pass 2's prompt is
+# the handoff followed by it. With nothing archived, pass 2's prompt is the
+# handoff itself.
+prompt_dir="$(mktemp -d)"; tmpdirs+=("$prompt_dir")
+prep_stub $'commit\ncommit'
+export FAKE_PROMPT_DIR="$prompt_dir" FAKE_ADDENDUM_TEXT="ADDENDUM-CARRY-MARKER-91c"
+cat > "$real_presets/rep2.yaml" <<'EOF'
+agents:
+  coder:
+    harness: claude
+    model: haiku
+    repeat: 2
+pipeline:
+  - action: code
+    agent: coder
+EOF
+if rd_r="$(run_stubbed --preset rep2 --branch "sandbox-test-rep2-addenda-$$")"; then
+    tmpdirs+=("$rd_r")
+    check "repeat addenda: two coding legs ran" "2" "$(cat "$count")"
+    contains "an addendum archived by pass 1 is in pass 2's prompt" \
+        "$(cat "$prompt_dir/prompt-2" 2>/dev/null)" "ADDENDUM-CARRY-MARKER-91c"
+    contains "pass 2's prompt still starts with the handoff" \
+        "$(cat "$prompt_dir/prompt-2" 2>/dev/null)" "do the task"
+    lacks "pass 1's prompt has no addendum" \
+        "$(cat "$prompt_dir/prompt-1" 2>/dev/null)" "ADDENDUM-CARRY-MARKER-91c"
+else
+    no "repeat addenda: launch succeeds"
+fi
+unset FAKE_ADDENDUM_TEXT
+rm -f "$prompt_dir"/prompt-*
+prep_stub $'commit\ncommit'
+if rd_r="$(run_stubbed --preset rep2 --branch "sandbox-test-rep2-none-$$")"; then
+    tmpdirs+=("$rd_r")
+    check "with no addenda archived, pass 2's prompt equals pass 1's" \
+        "$(cat "$prompt_dir/prompt-1" 2>/dev/null)" "$(cat "$prompt_dir/prompt-2" 2>/dev/null)"
+    contains "with no addenda archived, pass 2's prompt carries the handoff" \
+        "$(cat "$prompt_dir/prompt-2" 2>/dev/null)" "do the task"
+else
+    no "repeat no-addenda: launch succeeds"
+fi
+unset FAKE_PROMPT_DIR
 
 # A --pipeline run records its spec, not a file, and archives the compiled
 # document like any preset definition.

@@ -486,6 +486,11 @@ with `--preset` also writes `pipeline.json` (see "Provenance" above for
 `preset.json`/`preset.yaml`, which are separate files) — its `steps` array
 is the source of truth this section's canonical key is built from.
 
+A code pass after the first also writes `code-prompt-<K>-<P>.md` (step
+`<K>`, pass `<P>`): the handoff plus the addenda earlier legs archived. It
+is written only when an addendum was archived; otherwise the pass's prompt
+is the handoff itself.
+
 A claude leg that failed on an auth or transient provider error is retried
 fresh (see "The loop stops on the first of four things" near the top of
 `fork-sandbox.sh` for what counts); each failed attempt's own events file

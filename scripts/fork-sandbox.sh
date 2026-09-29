@@ -598,8 +598,8 @@
 # means killing it and starting over. Each leg archives what it was shown
 # into <run-dir>/inbox-delivered/leg-<N>/ the moment it ends, so a later
 # leg's fresh sandbox never re-reads it; a --refresh-at continuation's
-# prompt carries every archived addendum forward, while a review or fix leg
-# gets none.
+# prompt carries every archived addendum forward, and so do the review,
+# maintainer, fix and repeat code legs' prompts.
 #
 # The review loop. --review-loop N adds a quality pass after the coding
 # session: a REVIEW leg reads the commits the run just made and writes a
@@ -9676,7 +9676,17 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count && stop_requested != 1; cur
             # own cur_i.
             progress_i[cur_step_no]="$cur_pass"
             progress_write running
-            run_leg code "$cur_pass" "$handoff" "$cur_step_idx"
+            # Built fresh for every pass, like the fix prompt below, so an
+            # addendum archived by an earlier pass reaches this one. With
+            # none archived the prompt is the handoff itself, no copy.
+            cur_code_prompt="$handoff"
+            cur_code_addenda="$(fs_refresh_emit_addenda "$run_dir")"
+            if [[ -n "$cur_code_addenda" ]]; then
+                cur_code_prompt="$run_dir/code-prompt-$cur_step_no-$cur_pass.md"
+                { cat -- "$handoff"; printf '%s\n' "$cur_code_addenda"; } > "$cur_code_prompt.part"
+                mv -f "$cur_code_prompt.part" "$cur_code_prompt"
+            fi
+            run_leg code "$cur_pass" "$cur_code_prompt" "$cur_step_idx"
             rc="$leg_rc"
             progress_write running
         done
