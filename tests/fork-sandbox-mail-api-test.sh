@@ -279,6 +279,7 @@ mint_into ci-kickoff --role client --as @ci-kickoff --caps read,grant
 mint_into bot --role client --as @bot
 mint_into reader --role client --as @reader --caps read,seen
 mint_into targeter --role client --as @targeter --caps target,read
+mint_into upstreamer --role client --as @upstreamer --caps upstream,read
 printf '# a comment\n\n' | cat - "$tokens_file" > "$tokens_file.new" && mv "$tokens_file.new" "$tokens_file"
 
 server_log="$work/server.log"
@@ -732,6 +733,53 @@ check "... that send ran: rc 0" "0" "$(rjson rc)"
 
 check "--review-target on reply is refused" "403" \
     "$(xr "$tok/targeter" --tool mail --stdin hi -- reply --from @targeter --reply-to "$seed" --body - --review-target "$rt_branch:$rt_sha")"
+
+printf '== 11b. upstream-head: the upstream cap, and header refusal ==\n'
+
+uh_sha="$(printf 'b%.0s' $(seq 40))"
+uh_thread_dir="$FORK_SANDBOX_MAIL_ROOT/threads/$rt_tid"
+uh_msgs_before="$(find "$uh_thread_dir" -name '*.msg' | wc -l)"
+
+check "no upstream cap: reply --upstream-head: 403" "403" \
+    "$(xr "$tok/bot" --tool mail --stdin hi -- reply --from @bot --reply-to "$rt_tid" --body - --upstream-head "feature/x:$uh_sha")"
+contains "... says which cap is missing" "$(rjson error)" "'upstream' cap"
+check "a target cap alone does not carry upstream: 403" "403" \
+    "$(xr "$tok/targeter" --tool mail --stdin hi -- reply --from @targeter --reply-to "$rt_tid" --body - --upstream-head "feature/x:$uh_sha")"
+check "no upstream cap: nothing written" "$uh_msgs_before" \
+    "$(find "$uh_thread_dir" -name '*.msg' | wc -l)"
+
+check "upstream cap: reply --upstream-head: 200" "200" \
+    "$(xr "$tok/upstreamer" --tool mail --stdin hi -- reply --from @upstreamer --reply-to "$rt_tid" --body - --upstream-head "feature/x:$uh_sha")"
+check "upstream cap: that reply ran: rc 0" "0" "$(rjson rc)"
+uh_id="$(rjson stderr | sed -n 's/.*replied \([0-9a-f-]*\) to .*/\1/p')"
+contains "upstream cap: the reply carries X-Upstream-Head" "$("$mail" show "$uh_id")" \
+    "X-Upstream-Head: feature/x $uh_sha"
+check "operator: reply --upstream-head: 200" "200" \
+    "$(xr "$tok/laptop" --tool mail --stdin hi -- reply --from @operator --reply-to "$rt_tid" --body - --upstream-head "feature/x:$uh_sha")"
+check "operator: that reply ran: rc 0" "0" "$(rjson rc)"
+check "upstream cap does not unlock another verb's flag: send --upstream-head: 403" "403" \
+    "$(xr "$tok/upstreamer" --tool mail --stdin hi -- send --from @upstreamer --to @x --subject u --body - --upstream-head "feature/x:$uh_sha")"
+check "operator: send --upstream-head is refused too" "403" \
+    "$(xr "$tok/laptop" --tool mail --stdin hi -- send --from @operator --to @x --subject u --body - --upstream-head "feature/x:$uh_sha")"
+check "upstream cap alone does not allow --from another identity: 403" "403" \
+    "$(xr "$tok/upstreamer" --tool mail --stdin hi -- reply --from @bot --reply-to "$rt_tid" --body - --upstream-head "feature/x:$uh_sha")"
+
+uh_msgs_before="$(find "$uh_thread_dir" -name '*.msg' | wc -l)"
+check "raw X-Upstream-Head header refused on reply (upstream cap)" "403" \
+    "$(xr "$tok/upstreamer" --tool mail --stdin hi -- reply --from @upstreamer --reply-to "$rt_tid" --body - --header "X-Upstream-Head: feature/x $uh_sha")"
+contains "... says why" "$(rjson error)" "X-Upstream-Head"
+check "raw x-upstream-head header (lowercase) refused on reply" "403" \
+    "$(xr "$tok/ci-kickoff" --tool mail --stdin hi -- reply --from @ci-kickoff --reply-to "$rt_tid" --body - --header "x-upstream-head: feature/x $uh_sha")"
+check "raw X-Upstream-Head header refused on send" "403" \
+    "$(xr "$tok/ci-kickoff" --tool mail --stdin hi -- send --from @ci-kickoff --to @x --subject h --body - --header "X-Upstream-Head: feature/x $uh_sha")"
+check "raw X-Upstream-Head header refused for an operator token on reply" "403" \
+    "$(xr "$tok/laptop" --tool mail --stdin hi -- reply --from @operator --reply-to "$rt_tid" --body - --header "X-Upstream-Head: feature/x $uh_sha")"
+check "raw X-Upstream-Head header refused for an operator token on send" "403" \
+    "$(xr "$tok/laptop" --tool mail --stdin hi -- send --from @operator --to @x --subject h --body - --header "X-Upstream-Head: feature/x $uh_sha")"
+check "the flag alongside a raw header is refused for an operator" "403" \
+    "$(xr "$tok/laptop" --tool mail --stdin hi -- reply --from @operator --reply-to "$rt_tid" --body - --upstream-head "feature/x:$uh_sha" --header "X-Upstream-Head: feature/y $uh_sha")"
+check "the refused calls wrote no message" "$uh_msgs_before" \
+    "$(find "$uh_thread_dir" -name '*.msg' | wc -l)"
 
 printf '== 12. list --json --header for a read token ==\n'
 

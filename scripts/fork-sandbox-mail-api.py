@@ -74,7 +74,8 @@ mail:
             grant flags also need cap grant, --review-target needs cap
             target)
     reply   0; --from --reply-to --body --to --cc --subject --attach* --hops
-            --header*; --from in the token's identities
+            --header* --upstream-head; --from in the token's identities
+            (--upstream-head also needs cap upstream)
     show tree export inbox: read (export needs --json; inbox takes --all)
     list    0; --json --header*; read
     seen    1+; the first positional in the identities, and cap seen
@@ -86,10 +87,11 @@ postmaster:
     flag unflag: operator only
 (* = repeatable.) On mail send and mail reply (never on list, whose --header
 is a read-only filter), --header may not set
-X-Version or a name that starts with X-Review-Target (case-insensitively):
-those headers are the review-target contract, and only mail's own
---review-target flag and the postmaster may write them -- this refusal
-applies to an operator token too. An operator passes every other check.
+X-Version, X-Upstream-Head or a name that starts with X-Review-Target
+(case-insensitively): the review-target headers are that contract's, and only
+mail's own --review-target flag and the postmaster may write them, and
+X-Upstream-Head only comes from mail reply --upstream-head -- these refusals
+apply to an operator token too. An operator passes every other check.
 --body must be '-': the
 body comes in stdin_b64. --attach names a key of "files" (a plain basename,
 at most 4 MiB decoded, at most 16 files, no unreferenced keys); the server
@@ -119,7 +121,7 @@ import time
 
 PROG = "fork-sandbox-mail-api"
 ROLES = ("operator", "client")
-CAPS = ("read", "grant", "seen", "target")
+CAPS = ("read", "grant", "seen", "target", "upstream")
 ADDR_RE = re.compile(r"@[a-z0-9][a-z0-9-]*")
 OPERATORS_ENV = "FORK_SANDBOX_OPERATORS"
 LABEL_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
@@ -154,7 +156,8 @@ SPEC = {
         "reply": (0, 0, {
             "--from": VALUE, "--reply-to": VALUE, "--body": VALUE,
             "--to": VALUE, "--cc": VALUE, "--subject": VALUE,
-            "--attach": MULTI, "--hops": VALUE, "--header": MULTI}),
+            "--attach": MULTI, "--hops": VALUE, "--header": MULTI,
+            "--upstream-head": VALUE}),
         "show": (1, 1, {}),
         "tree": (1, 1, {}),
         "list": (0, 0, {"--json": BOOL, "--header": MULTI}),
@@ -193,9 +196,21 @@ REVIEW_TARGET_HEADER_WHY = (
     "and the postmaster may set it")
 
 
+# X-Upstream-Head is the same kind of header: only mail's own reply
+# --upstream-head flag (which needs cap upstream) may produce it.
+UPSTREAM_HEAD_HEADER_WHY = (
+    "--header may not set X-Upstream-Head: only reply --upstream-head "
+    "may set it")
+
+
 def refused_header_name(raw):
+    """The reason --header may not set this header, or None if it may."""
     name = raw.split(":", 1)[0].strip().upper()
-    return name == "X-VERSION" or name.startswith("X-REVIEW-TARGET")
+    if name == "X-VERSION" or name.startswith("X-REVIEW-TARGET"):
+        return REVIEW_TARGET_HEADER_WHY
+    if name == "X-UPSTREAM-HEAD":
+        return UPSTREAM_HEAD_HEADER_WHY
+    return None
 
 
 OPERATORS = frozenset(["@operator"])
@@ -408,6 +423,8 @@ def authorize(entry, tool, verb, positionals, flags):
             need(entry, "grant")
         if key == ("mail", "send") and "--review-target" in flags:
             need(entry, "target")
+        if key == ("mail", "reply") and "--upstream-head" in flags:
+            need(entry, "upstream")
         return
     if key == ("mail", "seen"):
         if "@" + positionals[0] not in entry.identities:
@@ -512,8 +529,9 @@ def handle_exec(entry, raw, ctx):
 
     if (tool, verb) in (("mail", "send"), ("mail", "reply")):
         for hdr in flags.get("--header", []):
-            if refused_header_name(hdr):
-                raise ApiError(403, REVIEW_TARGET_HEADER_WHY)
+            why = refused_header_name(hdr)
+            if why:
+                raise ApiError(403, why)
         if flags.get("--body", ["-"]) != ["-"]:
             raise ApiError(400, "--body must be '-' over the API; send the "
                                 "body as stdin_b64")
