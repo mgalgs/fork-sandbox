@@ -39,6 +39,7 @@ export FORK_SANDBOX_CONFIG_DIR="$tmp/config"
 mkdir -p "$CODEX_HOME" "$FORK_SANDBOX_CONFIG_DIR"
 cat > "$CODEX_HOME/models_cache.json" <<'JSON'
 {"models":[{"slug":"gpt-5.6-sol","visibility":"list"},
+           {"slug":"gpt-6-sol","visibility":"list"},
            {"slug":"gpt-5.6-terra","visibility":"list"},
            {"slug":"gpt-5.4","visibility":"list"},
            {"slug":"gpt-5.4-mini","visibility":"list"},
@@ -57,8 +58,8 @@ run() {
 
 printf '== fork-sandbox harness/model resolution ==\n'
 
-out="$(run --harness codex/sol 2>/dev/null)"
-check "combined codex alias resolves" $'harness=codex\nmodel=gpt-5.6-sol' "$out"
+out="$(run --harness codex/terra 2>/dev/null)"
+check "combined codex alias resolves" $'harness=codex\nmodel=gpt-5.6-terra' "$out"
 
 out="$(run --harness pi/moonshotai/kimi-k3 2>/dev/null)"
 check "combined pi id splits only its first slash" \
@@ -67,8 +68,8 @@ check "combined pi id splits only its first slash" \
 out="$(run --harness codex 2>/dev/null)"
 check "harness alone leaves model empty" $'harness=codex\nmodel=' "$out"
 
-out="$(run --harness codex --model sol 2>/dev/null)"
-check "separate model alias resolves" $'harness=codex\nmodel=gpt-5.6-sol' "$out"
+out="$(run --harness codex --model terra 2>/dev/null)"
+check "separate model alias resolves" $'harness=codex\nmodel=gpt-5.6-terra' "$out"
 
 err="$tmp/err"
 out="$(run --harness codex --model gpt-5.6-sol 2>"$err")"
@@ -84,6 +85,22 @@ else
     case "$(cat "$err")" in
         *gpt-5.6-sol*gpt-5.6-terra*) ok "ambiguity lists its candidates" ;;
         *) no "ambiguity lists its candidates" "$(cat "$err")" ;;
+    esac
+fi
+
+# A tier name with two generations visible in the cache (gpt-5.6-sol and
+# gpt-6-sol) is ambiguous by design -- a generation bump is never picked
+# silently -- but unlike a plain unknown-model ambiguity, this refusal has
+# a fix: pin one generation in aliases.conf. The message has to say so by
+# naming the file and the exact line to add.
+if run --harness codex --model sol > /dev/null 2>"$err"; then
+    no "a tier name spanning two generations is refused as ambiguous"
+else
+    case "$(cat "$err")" in
+        *gpt-5.6-sol*gpt-6-sol*aliases.conf*"codex sol gpt"*)
+            ok "the generation-ambiguity refusal names aliases.conf and the line to add" ;;
+        *) no "the generation-ambiguity refusal names aliases.conf and the line to add" \
+            "$(cat "$err")" ;;
     esac
 fi
 
@@ -130,6 +147,7 @@ check "unchecked mode accepts the combined harness/model form" \
 cat > "$FORK_SANDBOX_CONFIG_DIR/aliases.conf" <<'ALIASES'
 # harness  alias  model-id
 codex custom account-specific-model
+codex sol gpt-6-sol
 pi sol provider/pi-sol
 ALIASES
 out="$(HOME="$tmp" run --harness codex/custom 2>"$err")"
@@ -147,6 +165,14 @@ else
 fi
 out="$(run --harness pi/custom 2>/dev/null)"
 check "alias for another harness does not match" $'harness=pi\nmodel=custom' "$out"
+
+# The same tier name that was ambiguous above (two generations in the
+# cache) now resolves once aliases.conf pins a generation -- this is the
+# whole point: a generation bump is a one-line edit there, not a code or
+# preset change.
+out="$(run --harness codex --model sol 2>/dev/null)"
+check "a pinned aliases.conf line resolves a tier spanning two generations" \
+    $'harness=codex\nmodel=gpt-6-sol' "$out"
 
 if run --harness codex/sol --model gpt-5.4 > /dev/null 2>"$err"; then
     no "combined and separate models conflict"
@@ -183,7 +209,7 @@ printf '\n== --review-model resolution (same path as --model) ==\n'
 # testing the refusal rather than the resolution.
 out="$(run --review-loop 2 --harness codex --review-model sol 2>/dev/null)"
 check "review-model alias resolves" \
-    $'harness=codex\nmodel=\nreview_model=gpt-5.6-sol' "$out"
+    $'harness=codex\nmodel=\nreview_model=gpt-6-sol' "$out"
 
 out="$(HOME="$tmp" run --review-loop 2 --harness codex --review-model custom 2>/dev/null)"
 check "review-model user alias beats discovery" \
@@ -318,6 +344,43 @@ check "pi-local with a redundant --network sealed still resolves" \
 
 out="$(run --harness pi-local 2>"$err")"
 check "bare --harness pi-local still resolves" $'harness=pi\nmodel=' "$out"
+
+printf '\n== a codex tier is a bare name, resolved at launch, not at compile time ==\n'
+
+# fork-sandbox-pipeline-spec.py's MODELS table must emit the tier name
+# itself ("sol"), never a generation-pinned slug -- resolve_model is what
+# turns it into a real model id, using aliases.conf first. A spec compiler
+# that baked in "gpt-5.6-sol" would make a generation bump a code change
+# again, exactly what aliases.conf exists to avoid.
+spec_out="$(python3 "$repo_dir/scripts/fork-sandbox-pipeline-spec.py" rsol2)"
+case "$spec_out" in
+    *"model: sol"*) ok "the spec compiler emits the bare tier name" ;;
+    *) no "the spec compiler emits the bare tier name" "$spec_out" ;;
+esac
+case "$spec_out" in
+    *"gpt-5.6"*|*"gpt-6"*)
+        no "the spec compiler does not pin a generation" "$spec_out" ;;
+    *) ok "the spec compiler does not pin a generation" ;;
+esac
+
+# The same resolution a --model flag gets, exercised through a preset's
+# seat instead: a preset holding "model: sol" is exactly what --pipeline
+# compiles to above, and it has to resolve through aliases.conf the same
+# way, generation ambiguity and all.
+preset_tmp_dir="$FORK_SANDBOX_CONFIG_DIR/presets"
+mkdir -p "$preset_tmp_dir"
+cat > "$preset_tmp_dir/tier-seat.yaml" <<'EOF'
+agents:
+  coder:
+    harness: codex
+    model: sol
+pipeline:
+  - action: code
+    agent: coder
+EOF
+out="$(run --preset tier-seat 2>/dev/null)"
+check "a preset seat's bare tier name resolves via aliases.conf" \
+    $'preset=tier-seat\nharness=codex\nmodel=gpt-6-sol' "$out"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))

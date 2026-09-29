@@ -2808,6 +2808,9 @@ resolve_model() {
                 echo "Error: model '$current' is ambiguous for harness codex" >&2
                 echo "($cache_label). Matches:" >&2
                 printf '  %s\n' "${candidates[@]}" >&2
+                echo "Pin it in $(display_config_path "$aliases_file") with a line" >&2
+                echo "naming one of the matches, e.g.:" >&2
+                echo "  $resolve_harness $current ${candidates[0]}" >&2
                 return 1
             fi
 

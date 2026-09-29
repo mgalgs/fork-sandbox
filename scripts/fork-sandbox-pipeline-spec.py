@@ -32,14 +32,21 @@ import sys
 
 # Model name -> {harness: model id}. The first harness is the native one.
 # Names are lowercase letters only: trailing digits are the repeat count.
+#
+# A codex id here is a bare tier name, not a generation-pinned slug:
+# fork-sandbox.sh's resolve_model turns it into a real model id at launch,
+# consulting aliases.conf first and falling back to the codex model cache.
+# Bumping codex to a new generation is a one-line edit to aliases.conf, not
+# to this table -- see docs/presets.md.
 MODELS = {
     "haiku": {"claude": "haiku"},
     "sonnet": {"claude": "sonnet"},
     "opus": {"claude": "opus"},
     "fable": {"claude": "fable"},
-    "luna": {"codex": "gpt-5.6-luna"},
-    "terra": {"codex": "gpt-5.6-terra"},
-    "sol": {"codex": "gpt-5.6-sol"},
+    "luna": {"codex": "luna"},
+    "terra": {"codex": "terra"},
+    "sol": {"codex": "sol"},
+    "astra": {"codex": "astra"},
 }
 
 HARNESSES = ("claude", "codex", "pi")

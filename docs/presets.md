@@ -222,8 +222,13 @@ The spec is `-`-joined segments, `<stage><model>[<harness>][<N>]`:
   once, in that order.
 - **model** is a name from the table at the top of
   `scripts/fork-sandbox-pipeline-spec.py`, and runs on its native harness:
-  `haiku`, `sonnet`, `opus`, `fable` on claude; `luna`, `terra`, `sol` on
-  codex. A new model is a one-line addition there.
+  `haiku`, `sonnet`, `opus`, `fable` on claude; `luna`, `terra`, `sol`,
+  `astra` on codex. A codex model there is a bare tier name, not a
+  generation-pinned slug — `resolve_model` turns it into a real model id
+  at launch the same way it does for any other seat (see "Model aliases
+  resolve at launch" below). A new tier is a one-line addition to that
+  table; a new *generation* of an existing tier needs no table edit at
+  all — see "Bumping a generation" below.
 - **harness**, optional, seats the model on a non-native harness
   (`csolpi2`); the table must carry the model's id for that harness.
 - **N**, optional and 1 by default, is the code agent's `repeat`, or a
@@ -314,6 +319,34 @@ What a preset deliberately cannot set: the task-shaped flags. `--branch`,
 `--context-secret`, `--prompts-dir` and the rest describe *this run's task*; a preset
 describes *how much machine a class of task deserves*. Keeping the file
 to the second kind is what keeps one preset reusable across many runs.
+
+## Bumping a generation
+
+`--pipeline`'s codex tier names (`luna`, `terra`, `sol`, `astra`) name a
+role, not a specific model release — `rsol2` means "the sol tier as
+`aliases.conf` pins it today", nothing more. Moving a whole fleet to a new
+codex generation is therefore an edit to `aliases.conf` and nothing else:
+no preset file or script changes.
+
+```
+# ~/.config/fork-sandbox/aliases.conf
+codex luna gpt-6-luna
+codex sol  gpt-6-sol
+codex astra gpt-6-astra
+```
+
+With no matching line, a tier name falls back to the codex model cache
+(`${CODEX_HOME:-~/.codex}/models_cache.json`), matched by exact id, then by
+unique suffix or substring. Once two generations of the same tier are both
+visible there (`gpt-5.6-sol` and `gpt-6-sol`), that fallback becomes
+ambiguous on purpose — a generation bump is never picked silently — and
+the refusal names `aliases.conf` and the exact line to add. A tier with
+only one visible generation still resolves through the cache with no
+`aliases.conf` line at all.
+
+An **old** generation is pinned the opposite way: name its exact slug in a
+preset file (`model: gpt-5.6-sol`), never in the composition-name grammar,
+which only ever spells tier names.
 
 ## Worked examples
 
@@ -513,11 +546,11 @@ is the exact problem this design removes):
   key: per step, in order, `<stage-letter><model-token><repeat>` joined
   with `-` (`code`/`review`/`maintain` → `c`/`r`/`m`; a model id one of
   whose separator-delimited segments is a registered alias —
-  `sonnet`, `opus`, `haiku`, `fable`, `terra`, `sol`, `luna` — contributes that
-  alias spelled out; anything else slugs to the first 4 lowercased
-  `[a-z0-9]` characters after its last `/`, or `x` for no model).
-  Actions are a closed set, so they keep single letters; models are an
-  open set that grows without warning, so they are spelled out. A single
+  `sonnet`, `opus`, `haiku`, `fable`, `terra`, `sol`, `luna`, `astra` —
+  contributes that alias spelled out; anything else slugs to the first 4
+  lowercased `[a-z0-9]` characters after its last `/`, or `x` for no
+  model). Actions are a closed set, so they keep single letters; models are
+  an open set that grows without warning, so they are spelled out. A single
   letter per model was tried first and collided — sonnet claimed `s`, so
   sol was handed `l`, and luna then wanted `l` as well — which is also
   why `gpt-5.6-terra`, `gpt-5.6-sol` and `gpt-5.6-luna` must not share a
@@ -525,6 +558,15 @@ is the exact problem this design removes):
   `-<4 hex chars>` — the first 4 hex characters of the sha256 of the
   canonical string — is appended, so the reader can tell the shortname
   alone did not pin down the composition.
+
+  This same segment match also means a tier's token does not carry its
+  generation: a `sol` step on `gpt-5.6-sol` and one on `gpt-6-sol` both
+  display as `...sol1...`, identically. They are never merged — grouping
+  is always on the canonical `composition`, which carries the exact
+  resolved model id — but two rows with an identical `composition_short`
+  in a `--by composition_short` table can be different generations of the
+  same tier. Read the canonical value (or `--by composition`) when that
+  distinction matters.
 
 **Renaming or copying a preset file never changes `composition`** — it is
 computed from step content alone, which is exactly what lets `stats` group

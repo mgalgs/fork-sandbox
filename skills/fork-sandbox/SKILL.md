@@ -397,6 +397,15 @@ line; these take precedence over discovery. `--model-unchecked` deliberately
 skips both steps for a newly released model. Use `--dry-run` to inspect the
 resolved harness and model without creating anything.
 
+`--pipeline`'s codex tier names (`luna`, `terra`, `sol`, `astra`) resolve
+through this same file: a preset compiled from `rsol2` holds `model: sol`,
+not a generation-pinned slug, so moving a fleet to a new codex generation is
+a one-line `aliases.conf` edit (`codex sol gpt-6-sol`), never a script or
+preset change. With no such line, a tier name falls back to the model cache
+above — and once two generations of one tier are both visible there, that
+fallback refuses as ambiguous by design, naming `aliases.conf` and the line
+to add. See "Bumping a generation" in [docs/presets.md](../../docs/presets.md).
+
 The same sandbox, the same clone, the same fetch-back — but the session is
 [pi](https://github.com/earendil-works/pi) talking to OpenRouter instead of
 claude:

@@ -1365,7 +1365,8 @@ agents:
     model: sonnet
     repeat: 2
   sol:
-    harness: codex/gpt-5.6-sol
+    harness: codex
+    model: sol
   maintainer:
     harness: claude
     model: opus
@@ -1386,11 +1387,11 @@ check "--pipeline prints its spec" "pipeline=csonnet2-rsol2-mopus2" \
 check "--pipeline compiles like the equivalent preset file" "$from_file" \
     "$(tail -n +2 <<< "$out")"
 contains "--pipeline announces the compiled seats" "$(cat "$err")" \
-    "(--pipeline): code coder (claude/sonnet) x2, review reviewer (codex/gpt-5.6-sol) repeat=2, maintain maintainer (claude/opus) repeat=2"
+    "(--pipeline): code coder (claude/sonnet) x2, review reviewer (codex/sol) repeat=2, maintain maintainer (claude/opus) repeat=2"
 
 out="$(run --pipeline csonnet-rsol-mopus 2>"$err")"
 contains "an omitted repeat count is 1" "$(cat "$err")" \
-    "code coder (claude/sonnet), review reviewer (codex/gpt-5.6-sol) repeat=1, maintain maintainer (claude/opus) repeat=1"
+    "code coder (claude/sonnet), review reviewer (codex/sol) repeat=1, maintain maintainer (claude/opus) repeat=1"
 lacks "an omitted code repeat leaves code_repeat unset" "$out" "code_repeat="
 
 out="$(run --pipeline chaiku3 2>"$err")"
