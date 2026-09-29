@@ -394,6 +394,14 @@ ran, each one's exit, cost and usage, and how the chain ended — and
 `total_cost_usd` folds every continuation in beside the review loop's own
 legs, the same way it already does for `--review-loop`.
 
+A claude leg (implement, continuation, review, fix or maintainer alike)
+that fails on an auth or transient provider error — a revoked OAuth token,
+an overloaded model — is retried, fresh, up to twice before the run gives
+up on it. `summary.json`'s `leg_retries` totals every retry the whole run
+made; a continuation's own retries also show up in its `continuations`
+entry, and a review/fix/maintainer iteration's in its own loop record —
+see `docs/presets.md`'s "Composed runs" section for the exact shape.
+
 **`claude` only, for now.** The threshold is measured by a hook installed into
 the local sandbox's claude session, which reads the transcript on every tool
 call; `pi` and `codex` have no hook system to measure with, so

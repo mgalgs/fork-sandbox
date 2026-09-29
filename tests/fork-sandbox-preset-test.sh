@@ -1651,6 +1651,44 @@ approved)
     printf 'APPROVED\n\nChecked: everything.\n\n## Report\nFine.\n' \
         > "$clone_dir/.git/$verdict_name"
     ;;
+# The retry backstop's three failure shapes, each a single scripted call --
+# a leg that should be retried repeats this line as many times as the
+# suite's FS_LEG_RETRY_DELAYS="0 0" configures retries for (three calls:
+# the first attempt plus both retries), a leg that recovers follows it with
+# an ordinary commit/findings/approved line instead. Each prints exactly
+# the top-level claude "result" event fs_harness_error's claude arm reads
+# (is_error true, .result a string) and exits non-zero, the same shape a
+# revoked-credential or an overloaded-model failure writes for real.
+auth401)
+    printf 'stub: scripted auth401 failure on call %s\n' "$n" >&2
+    printf '{"type":"result","subtype":"error","is_error":true,"result":"Failed to authenticate. API Error: 401 OAuth access token has been revoked"}\n'
+    exit 1
+    ;;
+overloaded)
+    printf 'stub: scripted overloaded failure on call %s\n' "$n" >&2
+    printf '{"type":"result","subtype":"error","is_error":true,"result":"overloaded_error: Overloaded. API Error: 529"}\n'
+    exit 1
+    ;;
+fail-plain)
+    printf 'stub: scripted fail-plain failure on call %s\n' "$n" >&2
+    printf '{"type":"result","subtype":"error","is_error":true,"result":"the model returned an invalid tool call"}\n'
+    exit 1
+    ;;
+# A 429 is a usage cap (claude already retries it internally, and waiting
+# does not lift it) and a 400 is a malformed request -- both excluded from
+# the retryable shapes above deliberately, so each gets its own action here
+# to prove neither is retried even though its digits could be mistaken for
+# one of the 5xx family.
+limit429)
+    printf 'stub: scripted limit429 failure on call %s\n' "$n" >&2
+    printf '{"type":"result","subtype":"error","is_error":true,"result":"API Error: 429 rate_limit_error"}\n'
+    exit 1
+    ;;
+badreq400)
+    printf 'stub: scripted badreq400 failure on call %s\n' "$n" >&2
+    printf '{"type":"result","subtype":"error","is_error":true,"result":"API Error: 400 invalid_request_error"}\n'
+    exit 1
+    ;;
 esac
 
 printf '{"type":"result","subtype":"success","total_cost_usd":0.01,"usage":{"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}\n'
@@ -1757,6 +1795,7 @@ run_stubbed() {
         FAKE_ARGV_LOG="$argv_log" FAKE_SCRIPT="$script_file" \
         SNAPSHOT_DIR="${SNAPSHOT_DIR:-}" CRED_SNAPSHOT_DIR="${CRED_SNAPSHOT_DIR:-}" \
         FORK_SANDBOX_CONFIG_DIR="$real_cfg" FORK_SANDBOX_BACKEND=fake-image \
+        FS_LEG_RETRY_DELAYS="${FS_LEG_RETRY_DELAYS:-0 0}" \
         timeout 60 "$launcher" --foreground "$@" "$proj" "$handoff" 2>&1)"
     rc=$?
     rd="$(printf '%s\n' "$out" | sed -n 's/^  run dir:  *//p' | head -1)"
@@ -1777,6 +1816,7 @@ run_stubbed_expect_fail() {
     out="$(HOME="$launcher_home" PATH="$real_stub:$PATH" FAKE_COUNT_FILE="$count" \
         FAKE_ARGV_LOG="$argv_log" FAKE_SCRIPT="$script_file" \
         FORK_SANDBOX_CONFIG_DIR="$real_cfg" FORK_SANDBOX_BACKEND=fake-image \
+        FS_LEG_RETRY_DELAYS="${FS_LEG_RETRY_DELAYS:-0 0}" \
         timeout 60 "$launcher" --foreground "$@" "$proj" "$handoff" 2>&1)"
     rc=$?
     rd="$(printf '%s\n' "$out" | sed -n 's/^  run dir:  *//p' | head -1)"
@@ -3251,6 +3291,300 @@ if [[ -n "${rd_a:-}" && -x "$run_log" ]]; then
 else
     no "sandbox-run-log.py record archives the preset definition" \
         "prior stubbed run failed, or $run_log is not executable"
+fi
+
+printf '\n== the claude leg retry backstop: fs_leg_error_retryable ==\n'
+# A table-driven unit test of the classifier itself, extracted verbatim from
+# the generated RUNNER heredoc (never hand-copied, so this cannot drift from
+# what a real run.sh actually carries). Self-contained: no other function or
+# runtime state is needed to call it.
+extract_runner_fn() {
+    awk -v fn="$1" '
+        $0 ~ "^" fn "\\(\\) \\{" { p = 1 }
+        p { print }
+        p && /^}$/ { exit }
+    ' "$launcher"
+}
+classifier_src="$(mktemp)"; tmpdirs+=("$classifier_src")
+extract_runner_fn fs_leg_error_retryable > "$classifier_src"
+if [[ -s "$classifier_src" ]]; then
+    # shellcheck source=/dev/null
+    source "$classifier_src"
+    # harness|text|1 if NOT retryable (fs_leg_error_retryable returns 1), 0 if retryable
+    retry_cases=(
+        'claude|Failed to authenticate. API Error: 401 OAuth access token has been revoked|0'
+        'claude|api error: 401, token EXPIRED|0'
+        'claude|API Error: 401 -- OAuth token invalid|0'
+        'claude|the session ended in an error (401)|1'
+        'claude|API Error: 529 {"type":"overloaded_error"}|0'
+        'claude|Internal Server Error|0'
+        'claude|overloaded_error: the model is overloaded, try again|0'
+        'claude|API Error: 429 {"type":"rate_limit_error"}|1'
+        'claude|API Error: 400 {"type":"invalid_request_error"}|1'
+        'claude|API Error: 403 forbidden|1'
+        'claude|API Error: 404 not found|1'
+        'claude|API Error: 413 request too large|1'
+        'claude||1'
+        'codex|Failed to authenticate. API Error: 401 OAuth access token has been revoked|1'
+        'pi|overloaded_error|1'
+    )
+    for rc_case in "${retry_cases[@]}"; do
+        IFS='|' read -r rc_harness rc_text rc_want <<< "$rc_case"
+        if fs_leg_error_retryable "$rc_harness" "$rc_text"; then rc_got=0; else rc_got=1; fi
+        check "fs_leg_error_retryable($rc_harness, ${rc_text:-<empty>})" "$rc_want" "$rc_got"
+    done
+else
+    no "fs_leg_error_retryable extracted from scripts/fork-sandbox.sh" \
+        "extraction found nothing -- has the function been renamed?"
+fi
+
+printf '\n== the claude leg retry backstop: end-to-end (stubbed engine) ==\n'
+
+# B1. A fix leg that hits a revoked-credential error once is retried, fresh,
+# and the review loop continues to a second, approving iteration. Also pins
+# the archived-attempt file contract: the failed attempt's own events land
+# at events-fix-1.jsonl.attempt1, and the file left at events-fix-1.jsonl is
+# the retry's own (no trace of the failure that preceded it).
+prep_stub $'commit\nfindings\nauth401\ncommit\napproved'
+if rd_retry1="$(run_stubbed --preset reviewloop --review-loop 2 \
+    --branch "sandbox-test-retry-fix-$$")"; then
+    tmpdirs+=("$rd_retry1")
+    check "a fix leg retried on a 401 lets the review loop reach a second iteration" \
+        "approved" "$(jq -r '.ended' "$rd_retry1/review-loop.json" 2>/dev/null)"
+    check "the retried iteration's own record carries one retry" \
+        "1" "$(jq -r '.iterations[0].retries | length' "$rd_retry1/review-loop.json" 2>/dev/null)"
+    check "the retry record names the attempt, delay and provider error" \
+        "1 0" "$(jq -r '.iterations[0].retries[0] | "\(.attempt) \(.delay_s)"' \
+            "$rd_retry1/review-loop.json" 2>/dev/null)"
+    contains "the retry record's error names the revoked credential" \
+        "$(jq -r '.iterations[0].retries[0].error' "$rd_retry1/review-loop.json" 2>/dev/null)" \
+        "revoked"
+    contains "sandbox.log announces the retry" \
+        "$(cat "$rd_retry1/sandbox.log" 2>/dev/null)" \
+        "the fix leg of iteration 1 failed on a transient error"
+    contains "sandbox.log confirms the retry succeeded" \
+        "$(cat "$rd_retry1/sandbox.log" 2>/dev/null)" \
+        "the fix leg of iteration 1 succeeded on retry 1"
+    check "summary.json's leg_retries counts the one retry" \
+        "1" "$(jq -r '.leg_retries' "$rd_retry1/summary.json" 2>/dev/null)"
+    check "every scripted call actually ran (impl, review, fix x2, review)" \
+        "5" "$(cat "$count" 2>/dev/null)"
+    if [[ -s "$rd_retry1/events-fix-1.jsonl.attempt1" ]]; then
+        ok "the failed attempt's events are archived to events-fix-1.jsonl.attempt1"
+    else
+        no "the failed attempt's events are archived to events-fix-1.jsonl.attempt1" \
+            "$(find "$rd_retry1" -maxdepth 1 -name 'events-fix-1*' -exec basename {} \; | tr '\n' ' ')"
+    fi
+    contains "the archived attempt holds the failed attempt's own error" \
+        "$(cat "$rd_retry1/events-fix-1.jsonl.attempt1" 2>/dev/null)" "revoked"
+    lacks "the final events-fix-1.jsonl holds only the retry's own attempt" \
+        "$(cat "$rd_retry1/events-fix-1.jsonl" 2>/dev/null)" "revoked"
+else
+    no "a fix leg retried on a 401 lets the review loop reach a second iteration" \
+        "launch failed"
+fi
+
+# B2. A review leg and a maintainer leg (a composed pipeline's own step
+# kinds) are each retried the same way.
+cat > "$real_presets/retry-review-maintain.yaml" <<'EOF'
+agents:
+  coder:
+    harness: claude
+    model: sonnet
+  reviewer:
+    harness: claude
+    model: opus
+pipeline:
+  - action: code
+    agent: coder
+  - action: review
+    repeat: 1
+    agent: reviewer
+  - action: maintain
+    repeat: 1
+    agent: reviewer
+EOF
+prep_stub $'commit\nauth401\napproved\nauth401\napproved'
+if rd_retry2="$(run_stubbed --preset retry-review-maintain \
+    --branch "sandbox-test-retry-revmnt-$$")"; then
+    tmpdirs+=("$rd_retry2")
+    # A bare code+review+maintain pipeline compiles to the legacy-shaped
+    # tiers (preset_is_legacy_shaped), not step-indexed records -- so this
+    # reads review-loop.json/maintainer-loop.json, the same files a
+    # --review-loop/--maintainer-loop run would write, not step-N-loop.json.
+    check "a composed review step's leg is retried and ends approved" \
+        "approved" "$(jq -r '.ended' "$rd_retry2/review-loop.json" 2>/dev/null)"
+    check "a composed maintain step's leg is retried and ends approved" \
+        "approved" "$(jq -r '.ended' "$rd_retry2/maintainer-loop.json" 2>/dev/null)"
+    check "the review step's iteration carries one retry" \
+        "1" "$(jq -r '.iterations[0].retries | length' "$rd_retry2/review-loop.json" 2>/dev/null)"
+    check "the maintain step's iteration carries one retry" \
+        "1" "$(jq -r '.iterations[0].retries | length' "$rd_retry2/maintainer-loop.json" 2>/dev/null)"
+    check "summary.json's leg_retries counts both legs' retries" \
+        "2" "$(jq -r '.leg_retries' "$rd_retry2/summary.json" 2>/dev/null)"
+    check "sandbox.log announces both retries" \
+        "2" "$(grep -c 'failed on a transient error' "$rd_retry2/sandbox.log" 2>/dev/null)"
+    check "sandbox.log confirms both retries succeeded" \
+        "2" "$(grep -c 'succeeded on retry 1' "$rd_retry2/sandbox.log" 2>/dev/null)"
+else
+    no "a composed review step's leg is retried and ends approved" "launch failed"
+fi
+
+# B2b. A GENUINELY composed pipeline (four steps -- code, review, review,
+# maintain -- too many review/maintain steps for the legacy-shape check
+# above to recognize, see preset_is_legacy_shaped's own comment) retries a
+# step-indexed leg the same way, writing to that step's own
+# step-<N>-loop.json rather than review-loop.json/maintainer-loop.json.
+prep_stub $'commit\nfindings\ncommit\nauth401\napproved\napproved'
+if rd_retry2b="$(run_stubbed --preset composed \
+    --branch "sandbox-test-retry-composed-$$")"; then
+    tmpdirs+=("$rd_retry2b")
+    check "a composed (step-indexed) review leg is retried and ends approved" \
+        "approved" "$(jq -r '.ended' "$rd_retry2b/step-3-loop.json" 2>/dev/null)"
+    check "the composed step's iteration carries one retry" \
+        "1" "$(jq -r '.iterations[0].retries | length' "$rd_retry2b/step-3-loop.json" 2>/dev/null)"
+    check "summary.json's leg_retries counts the composed step's retry" \
+        "1" "$(jq -r '.leg_retries' "$rd_retry2b/summary.json" 2>/dev/null)"
+else
+    no "a composed (step-indexed) review leg is retried and ends approved" "launch failed"
+fi
+
+# B3. The top-level implement leg is retried too.
+prep_stub $'auth401\ncommit'
+if rd_retry3="$(run_stubbed --harness claude --model haiku \
+    --branch "sandbox-test-retry-impl-$$")"; then
+    tmpdirs+=("$rd_retry3")
+    check "a retried implement leg's run still exits clean" \
+        "0" "$(cat "$rd_retry3/exit-code" 2>/dev/null)"
+    contains "sandbox.log announces the implement leg's retry" \
+        "$(cat "$rd_retry3/sandbox.log" 2>/dev/null)" \
+        "the implement leg failed on a transient error"
+    contains "sandbox.log confirms the implement leg's retry succeeded" \
+        "$(cat "$rd_retry3/sandbox.log" 2>/dev/null)" \
+        "the implement leg succeeded on retry 1"
+    check "summary.json's leg_retries counts the implement leg's retry" \
+        "1" "$(jq -r '.leg_retries' "$rd_retry3/summary.json" 2>/dev/null)"
+    check "summary.json's harness_error is null once the retry succeeded" \
+        "null" "$(jq -r '.harness_error' "$rd_retry3/summary.json" 2>/dev/null)"
+else
+    no "a retried implement leg's run still exits clean" "launch failed"
+fi
+
+# B4. A leg that keeps failing on the same transient error exhausts exactly
+# its configured retries (2, from this suite's FS_LEG_RETRY_DELAYS="0 0")
+# and only then ends the loop as harness-error, saying so.
+prep_stub $'commit\nauth401\nauth401\nauth401'
+if rd_retry4="$(run_stubbed --preset reviewloop --review-loop 1 \
+    --branch "sandbox-test-retry-exhaust-$$")"; then
+    tmpdirs+=("$rd_retry4")
+    check "a persistently-failing leg ends the loop as harness-error" \
+        "harness-error" "$(jq -r '.ended' "$rd_retry4/review-loop.json" 2>/dev/null)"
+    check "it made exactly 2 retries" \
+        "2" "$(jq -r '.iterations[0].retries | length' "$rd_retry4/review-loop.json" 2>/dev/null)"
+    contains "its detail says it failed after 2 retries" \
+        "$(jq -r '.detail' "$rd_retry4/review-loop.json" 2>/dev/null)" \
+        "failed after 2 retries"
+    contains "sandbox.log says the leg failed after its retries" \
+        "$(cat "$rd_retry4/sandbox.log" 2>/dev/null)" \
+        "failed after 2 retries"
+    check "summary.json's leg_retries counts both exhausted retries" \
+        "2" "$(jq -r '.leg_retries' "$rd_retry4/summary.json" 2>/dev/null)"
+    # A review-loop harness-error never touches the run's own exit code (see
+    # the composed-2code test's own comment on this, above).
+    check "the run's own exit code is untouched by the review loop's harness-error" \
+        "0" "$(cat "$rd_retry4/exit-code" 2>/dev/null)"
+else
+    no "a persistently-failing leg ends the loop as harness-error" "launch failed"
+fi
+
+# B5. A leg that fails on its own merits -- no provider error at all, or one
+# whose code (429, 400) this backstop deliberately excludes -- is never
+# retried: exactly one call is made, and sandbox.log has no retry line.
+for na_action in fail-plain limit429 badreq400; do
+    prep_stub "$na_action"
+    if rd_na="$(run_stubbed_expect_fail --harness claude --model haiku \
+        --branch "sandbox-test-noretry-$na_action-$$")"; then
+        rd_na_dir="${rd_na%%$'\t'*}"
+        tmpdirs+=("$rd_na_dir")
+        check "a $na_action failure makes exactly one attempt" \
+            "1" "$(cat "$count" 2>/dev/null)"
+        lacks "a $na_action failure logs no retry" \
+            "$(cat "$rd_na_dir/sandbox.log" 2>/dev/null)" "retry"
+    else
+        no "a $na_action failure makes exactly one attempt" "launch produced no run dir"
+    fi
+done
+
+# B6. codex has its own retry behavior (a one-shot fresh-resume retry, kept
+# untouched above) -- a 401-shaped provider error must never also trigger
+# THIS backstop for it.
+prep_stub 'auth401'
+if rd_codex401="$(run_stubbed_expect_fail --harness codex/gpt-5.6-sol \
+    --branch "sandbox-test-codex401-$$")"; then
+    rd_codex401_dir="${rd_codex401%%$'\t'*}"
+    tmpdirs+=("$rd_codex401_dir")
+    check "a codex leg with a 401-shaped error makes exactly one attempt" \
+        "1" "$(cat "$count" 2>/dev/null)"
+    lacks "a codex leg with a 401-shaped error logs no retry" \
+        "$(cat "$rd_codex401_dir/sandbox.log" 2>/dev/null)" "retry"
+else
+    no "a codex leg with a 401-shaped error makes exactly one attempt" \
+        "launch produced no run dir"
+fi
+
+# B7. A stop requested while a retry is backing off ends the leg on the
+# attempt already made -- no further attempt starts. Needs a real (if
+# short) delay to have a window to signal into, so this bypasses
+# run_stubbed's fixed "0 0" and launches directly, in the background, the
+# same way tests/fork-sandbox-stop-test.sh signals a real runner.
+prep_stub 'auth401'
+stop_out="$(mktemp)"; tmpdirs+=("$stop_out")
+HOME="$launcher_home" PATH="$real_stub:$PATH" FAKE_COUNT_FILE="$count" \
+    FAKE_ARGV_LOG="$argv_log" FAKE_SCRIPT="$script_file" \
+    FORK_SANDBOX_CONFIG_DIR="$real_cfg" FORK_SANDBOX_BACKEND=fake-image \
+    FS_LEG_RETRY_DELAYS="3 3" \
+    "$launcher" --foreground --harness claude --model haiku \
+    --branch "sandbox-test-retrystop-$$" "$proj" "$handoff" \
+    > "$stop_out" 2>&1 &
+retrystop_pid=$!
+rd_retrystop=""
+for _ in $(seq 1 100); do
+    rd_retrystop="$(sed -n 's/^  run dir:  *//p' "$stop_out" 2>/dev/null | head -1)"
+    [[ -n "$rd_retrystop" ]] && break
+    sleep 0.1
+done
+if [[ -n "$rd_retrystop" ]]; then
+    tmpdirs+=("$rd_retrystop")
+    retry_seen=0
+    for _ in $(seq 1 100); do
+        grep -q 'retry 1/2 in 3s' "$rd_retrystop/sandbox.log" 2>/dev/null \
+            && { retry_seen=1; break; }
+        sleep 0.1
+    done
+    if (( retry_seen )); then
+        kill -TERM "$retrystop_pid" 2>/dev/null
+        wait "$retrystop_pid" 2>/dev/null
+        rc_seen=0
+        for _ in $(seq 1 100); do
+            [[ -f "$rd_retrystop/exit-code" ]] && { rc_seen=1; break; }
+            sleep 0.1
+        done
+        if (( rc_seen )); then
+            check "a stop during the retry backoff makes no further attempt" \
+                "1" "$(cat "$count" 2>/dev/null)"
+            lacks "a stop during the retry backoff never logs a successful retry" \
+                "$(cat "$rd_retrystop/sandbox.log" 2>/dev/null)" "succeeded on retry"
+        else
+            no "a stop during the retry backoff makes no further attempt" \
+                "no exit-code ever appeared"
+        fi
+    else
+        no "a stop during the retry backoff makes no further attempt" \
+            "no retry-announcement line ever appeared: $(cat "$rd_retrystop/sandbox.log" 2>/dev/null)"
+    fi
+else
+    no "a stop during the retry backoff makes no further attempt" \
+        "no run dir ever appeared: $(cat "$stop_out")"
 fi
 
 printf '\n== fixture runs leave no handoff archives in the operator home ==\n'

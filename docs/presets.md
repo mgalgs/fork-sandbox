@@ -483,8 +483,18 @@ number in pipeline order: `step-<K>-loop.json`,
 `events-s<K>-(code|review|maintain|fix)-<N>[-p<P>].jsonl`. A run launched
 with `--preset` also writes `pipeline.json` (see "Provenance" above for
 `preset.json`/`preset.yaml`, which are separate files) — its `steps` array
-is the source of truth this section's canonical key is built from. Note
-that a composed step's saved loop record always uses the `review_model`/
+is the source of truth this section's canonical key is built from.
+
+A claude leg that failed on an auth or transient provider error is retried
+fresh (see "The loop stops on the first of four things" near the top of
+`fork-sandbox.sh` for what counts); each failed attempt's own events file
+is archived beside the leg's own, as `<name>.jsonl.attempt<k>`, so the file
+at the leg's ordinary name always holds its last attempt. The iteration
+record gains a `retries` array (`{attempt, error, delay_s}` per retry,
+empty when the leg never retried), and its cost sums every attempt rather
+than only the last one.
+
+Note that a composed step's saved loop record always uses the `review_model`/
 `review_harness` field names, even for a `maintain` step — only a
 *legacy* maintainer step gets `maintainer_model`/`maintainer_harness`; a
 reader has to consult `pipeline.json`'s own `action` for the step to tell

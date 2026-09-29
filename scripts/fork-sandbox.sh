@@ -610,7 +610,13 @@
 #                  end of the argument.
 #   harness-error  a leg exited non-zero, died of a model error, or left no
 #                  readable verdict. Nothing is inferred from a leg that
-#                  failed — neither approval nor a lack of progress.
+#                  failed — neither approval nor a lack of progress. A
+#                  claude leg that failed on an auth or transient provider
+#                  error (a revoked OAuth token, an overloaded model) is
+#                  retried, fresh, up to twice before this is declared —
+#                  see fs_run_claude_leg_with_retry in the RUNNER below —
+#                  so harness-error here means the retries, if any, are
+#                  also exhausted.
 #
 # The loop is skipped, and says so, only when there is nothing to review: the
 # branch could not be read, or its head sits at base_sha with no commits past
@@ -633,7 +639,11 @@
 # data, how many iterations are worth paying for on a given model. Each leg
 # is a session at that model's price, so N=2 can cost three times a plain
 # run: summary.json's total_cost_usd is the sum of all of them, while
-# cost_usd goes on meaning the coding session alone.
+# cost_usd goes on meaning the coding session alone. When a leg retried, its
+# iteration also carries a `retries` array ({attempt, error, delay_s} per
+# retry, empty otherwise) and its cost sums every attempt, not just the
+# last (its usage stays the last attempt's own); summary.json's own
+# `leg_retries` totals every retry the whole run made, coding leg included.
 #
 # The legs write their own event files (events-review-N.jsonl,
 # events-fix-N.jsonl); events.jsonl stays the coding session's, so --result
@@ -7496,6 +7506,13 @@ launcher_session_id="${CLAUDE_CODE_SESSION_ID:-}"
     # a bare call would fail into the `|| true` and leak the compose stack
     # silently, which is the one outcome the trap exists to prevent.
     printf 'FS_TIMEOUT=%q\n' "$FS_TIMEOUT"
+    # A claude leg that fails on an auth or transient provider error (a
+    # revoked OAuth token, an overloaded model) is retried fresh, at most
+    # once per delay listed here -- see fs_run_claude_leg_with_retry in the
+    # runner below. A test hook, not a flag: the suite sets
+    # FS_LEG_RETRY_DELAYS="0 0" so a retry test finishes in milliseconds
+    # rather than the real 30s/120s backoff.
+    printf 'FS_LEG_RETRY_DELAYS=%q\n' "${FS_LEG_RETRY_DELAYS:-30 120}"
     printf 'sandbox_cmd=('
     printf '%q ' "${sandbox_cmd[@]}"
     printf ')\n'
@@ -7635,6 +7652,180 @@ fi
 # "$@" still runs.
 fs_run_lock_closed() {
     ( { exec {clone_lock_fd}>&-; } 2>/dev/null; "$@" )
+}
+
+# --------------------------------------------------------- claude retry ----
+# The backstop for a claude leg that dies on the provider's own auth or
+# transient failure rather than on anything this run did: the host refreshing
+# its shared OAuth credential revokes the sandbox's copy mid-run, and a
+# 5xx/overloaded response is nobody's fault either. Every claude leg this
+# runner starts -- the implement leg below, a --refresh-at continuation, and
+# every review/fix/maintainer/composed leg through run_leg -- runs through
+# fs_run_claude_leg_with_retry, which restarts a leg that fails this way
+# fresh (never a resume) up to once per entry of FS_LEG_RETRY_DELAYS_ARR,
+# with the wait between attempts interruptible by a stop request. codex and
+# pi legs are untouched: this whole mechanism is gated on the harness being
+# claude, and neither its own resume-retry (codex) nor its retry-exhaustion
+# accounting (pi) is disturbed.
+IFS=' ' read -r -a FS_LEG_RETRY_DELAYS_ARR <<< "${FS_LEG_RETRY_DELAYS:-30 120}"
+# The run-wide total, folded into summary.json's own leg_retries -- a status
+# line's one-glyph way to notice a flaky credential without reading every
+# leg's own record.
+total_leg_retries=0
+
+# fs_leg_error_retryable <harness> <text>: is <text> -- the provider error
+# fs_harness_error extracted from a leg's OWN event stream, never a model
+# error or a missing-verdict message -- worth restarting the leg over. Only
+# ever true for claude (codex and pi have their own retry behavior) and only
+# for the two shapes host-verified to be transient rather than the run's own
+# doing: a revoked/expired OAuth token (401, alongside a word naming the
+# cause -- a bare "401" is not enough, since a 429 usage-limit response also
+# carries a 4xx code this must never match) and a provider-side 5xx/overload.
+# A 429 is deliberately excluded: it is a usage cap, waiting a couple of
+# minutes does not lift it, and claude already retries it internally. Case-
+# insensitive throughout, since the provider's own casing is not a contract.
+fs_leg_error_retryable() {
+    local harness="$1" text="$2" low
+    [[ "$harness" == claude ]] || return 1
+    [[ -n "$text" ]] || return 1
+    low="$(printf '%s' "$text" | tr '[:upper:]' '[:lower:]')"
+    if [[ "$low" == *401* ]]; then
+        case "$low" in
+            *revoked*|*expired*|*oauth*|*authentication*|*"failed to authenticate"*)
+                return 0 ;;
+        esac
+    fi
+    if [[ "$low" =~ api\ error:\ 5[0-9][0-9] ]] \
+        || [[ "$low" == *"internal server error"* ]] \
+        || [[ "$low" == *overloaded* ]]; then
+        return 0
+    fi
+    return 1
+}
+
+# fs_leg_retry_wait <seconds>: sleep, but in chunks of at most 5s so a stop
+# request lands within that long rather than waiting out the whole backoff --
+# up to 120s by default. Returns 1 (and stops waiting) the moment
+# stop_requested is set, whether that happens between chunks or was already
+# true going in; 0 once the full wait elapsed with no stop seen.
+fs_leg_retry_wait() {
+    local total="${1:-0}" waited=0 chunk
+    while (( waited < total )); do
+        if [[ "${stop_requested:-0}" == 1 ]]; then
+            return 1
+        fi
+        chunk=5
+        (( total - waited < chunk )) && chunk=$(( total - waited ))
+        sleep "$chunk"
+        waited=$(( waited + chunk ))
+    done
+    [[ "${stop_requested:-0}" == 1 ]] && return 1
+    return 0
+}
+
+# fs_run_claude_leg_with_retry <harness> <events-file> <sandbox-log> \
+#     <description> <attempt-fn> <formatter>
+#
+# <attempt-fn> is a zero-argument function that runs one attempt at the leg
+# -- exactly the invocation a caller ran unconditionally before this existed
+# -- and sets _fs_leg_attempt_rc to its exit code; it must write this
+# attempt's own events into <events-file> (and may also tee into any other,
+# cumulative file of the caller's own -- this driver never touches those,
+# only <events-file> itself). The first attempt always runs. When the
+# harness is claude and it failed on a fs_leg_error_retryable error, the
+# leg is restarted, fresh, once per entry of FS_LEG_RETRY_DELAYS_ARR, unless
+# a stop was requested during the backoff -- which ends the leg on the
+# attempt already made, with no further attempt, exactly as the failure
+# would have ended it without this mechanism at all. Before each retry, the
+# attempt that just failed has its events file moved aside to
+# "<events-file>.attempt<k>" and <events-file> itself truncated, so the file
+# left at that name after the LAST attempt -- success or exhaustion -- is
+# always that attempt's own, which is what fork-sandbox-status.sh,
+# fs_harness_error and every formatter already expect to read.
+#
+# Sets fs_retry_rc (the final attempt's exit code), fs_retry_error (its own
+# provider error, or empty), fs_retry_records (a JSON array of
+# {attempt, error, delay_s}, "[]" when nothing was retried), fs_retry_count
+# (how many retries actually ran) and fs_retry_extra_cost (the summed
+# --cost of every archived attempt, via <formatter>, when at least one
+# retry ran and priced; empty otherwise -- the caller's own cost for
+# <events-file> still has to be added to this separately, since this
+# driver never reads the caller's cost convention).
+fs_run_claude_leg_with_retry() {
+    local harness="$1" events_file="$2" sandbox_log="$3" desc="$4" \
+        attempt_fn="$5" fmt="$6"
+    local rc err attempt=0 delay num_delays="${#FS_LEG_RETRY_DELAYS_ARR[@]}"
+    fs_retry_records='[]'
+    fs_retry_count=0
+    fs_retry_extra_cost=""
+    "$attempt_fn"
+    rc="$_fs_leg_attempt_rc"
+    err=""
+    [[ "$rc" != 0 ]] && err="$(fs_harness_error "$harness" "$events_file")"
+    fs_retry_rc="$rc"
+    fs_retry_error="$err"
+    if [[ "$harness" == claude ]] && fs_leg_error_retryable "$harness" "$err"; then
+        for delay in "${FS_LEG_RETRY_DELAYS_ARR[@]}"; do
+            (( attempt++ ))
+            printf 'fork-sandbox: %s failed on a transient error (%s); retry %s/%s in %ss\n' \
+                "$desc" "$err" "$attempt" "$num_delays" "$delay" >> "$sandbox_log"
+            if ! fs_leg_retry_wait "$delay"; then
+                attempt=$(( attempt - 1 ))
+                break
+            fi
+            mv -f -- "$events_file" "${events_file}.attempt${attempt}" 2>/dev/null
+            : > "$events_file"
+            fs_retry_records="$(jq -cn --argjson old "$fs_retry_records" \
+                --argjson attempt "$attempt" --arg error "$err" --argjson delay "$delay" \
+                '$old + [{attempt: $attempt, error: $error, delay_s: $delay}]' 2>/dev/null)"
+            [[ -n "$fs_retry_records" ]] || fs_retry_records='[]'
+            "$attempt_fn"
+            rc="$_fs_leg_attempt_rc"
+            err=""
+            [[ "$rc" != 0 ]] && err="$(fs_harness_error "$harness" "$events_file")"
+            fs_retry_rc="$rc"
+            fs_retry_error="$err"
+            if [[ "$rc" == 0 ]]; then
+                printf 'fork-sandbox: %s succeeded on retry %s\n' "$desc" "$attempt" >> "$sandbox_log"
+                break
+            fi
+            fs_leg_error_retryable "$harness" "$err" || break
+        done
+        fs_retry_count="$attempt"
+        if [[ "$rc" != 0 && "$attempt" == "$num_delays" ]]; then
+            printf 'fork-sandbox: %s failed after %s retries\n' "$desc" "$num_delays" >> "$sandbox_log"
+        fi
+    fi
+    if (( fs_retry_count > 0 )) && [[ -n "$fmt" ]]; then
+        local f cost_i
+        for f in "$events_file".attempt*; do
+            [[ -f "$f" ]] || continue
+            cost_i="$("$fmt" --cost "$f" 2>/dev/null)"
+            if [[ "$cost_i" =~ ^-?[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?$ ]]; then
+                if [[ -n "$fs_retry_extra_cost" ]]; then
+                    fs_retry_extra_cost="$(jq -n --argjson a "$fs_retry_extra_cost" --argjson b "$cost_i" \
+                        '$a + $b' 2>/dev/null)"
+                else
+                    fs_retry_extra_cost="$cost_i"
+                fi
+            fi
+        done
+    fi
+}
+
+# A short, human-readable clause naming how many retries a leg burned before
+# it finally failed -- appended to a harness-error detail so "it failed after
+# 2 retries" is not left only to sandbox.log's own line for the last one.
+# Silent (prints nothing) when n is 0, so appending it to every harness-error
+# detail unconditionally is always safe.
+fs_leg_retry_suffix() {
+    local n="${1:-0}"
+    (( n > 0 )) || return 0
+    if (( n == 1 )); then
+        printf ' (failed after 1 retry)'
+    else
+        printf ' (failed after %s retries)' "$n"
+    fi
 }
 
 # The first code step retains the historical top-level implementation leg
@@ -8050,21 +8241,32 @@ progress_write running
 # form used to feed directly; the trailing `exit` makes the group's own
 # exit code the command's, not tee's, since PIPESTATUS[0] below reads the
 # group as a single pipeline stage.
-if [[ -n "$formatter" ]]; then
-    { fs_run_lock_closed "${impl_sandbox_cmd[@]}" < "$handoff" \
-        2>&1 1>&3 | tee -a "$sandbox_log" >&2
-      exit "${PIPESTATUS[0]}"
-    } 3>&1 \
-        | tee -a "$events" \
-        | "$formatter"
-else
-    { fs_run_lock_closed "${impl_sandbox_cmd[@]}" < "$handoff" \
-        2>&1 1>&3 | tee -a "$sandbox_log" >&2
-      exit "${PIPESTATUS[0]}"
-    } 3>&1 \
-        | tee -a "$events"
-fi
-rc="${PIPESTATUS[0]:-1}"
+_fs_impl_attempt() {
+    if [[ -n "$formatter" ]]; then
+        { fs_run_lock_closed "${impl_sandbox_cmd[@]}" < "$handoff" \
+            2>&1 1>&3 | tee -a "$sandbox_log" >&2
+          exit "${PIPESTATUS[0]}"
+        } 3>&1 \
+            | tee -a "$events" \
+            | "$formatter"
+    else
+        { fs_run_lock_closed "${impl_sandbox_cmd[@]}" < "$handoff" \
+            2>&1 1>&3 | tee -a "$sandbox_log" >&2
+          exit "${PIPESTATUS[0]}"
+        } 3>&1 \
+            | tee -a "$events"
+    fi
+    _fs_leg_attempt_rc="${PIPESTATUS[0]:-1}"
+}
+fs_run_claude_leg_with_retry "$harness" "$events" "$sandbox_log" \
+    "the implement leg" _fs_impl_attempt "$formatter"
+rc="$fs_retry_rc"
+impl_leg_retries_count="$fs_retry_count"
+impl_leg_retries_json="$fs_retry_records"
+total_leg_retries=$(( total_leg_retries + impl_leg_retries_count ))
+# Folded into loop_cost_sum once that accumulator exists, below (it is not
+# initialized until just before the refresh loop, well after this point).
+impl_leg_retry_extra_cost="$fs_retry_extra_cost"
 # Resume is a continuity optimization for codex too (see claude-sandboxed's
 # own RESUME_FAIL_RE for the analogous claude case, unreachable here because
 # codex runs through claude-sandboxed's --exec mode, which claude-sandboxed
@@ -8399,6 +8601,9 @@ fi
 if [[ -z "$run_error" ]]; then
     run_error="$(fs_harness_error "$harness" "$events")"
 fi
+if [[ "$rc" != "0" ]]; then
+    run_error+="$(fs_leg_retry_suffix "${impl_leg_retries_count:-0}")"
+fi
 
 # Format once, here, and record it where a caller can read it without
 # parsing prose. %.6f rather than the raw number: a sum of floats carries
@@ -8448,6 +8653,17 @@ fi
 # accumulator, so total_cost_usd at the very end is never short a leg.
 loop_cost_sum=0
 loop_cost_unknown=0
+# A retried implement leg's own archived attempts are priced separately from
+# run_cost above (which reads only the final attempt's events) -- fold them
+# in here, the same accumulator every later leg's retries join too.
+if [[ -n "${impl_leg_retry_extra_cost:-}" ]]; then
+    loop_cost_sum="$(jq -n --argjson a "$loop_cost_sum" --argjson b "$impl_leg_retry_extra_cost" \
+        '$a + $b' 2>/dev/null)"
+    if [[ -z "$loop_cost_sum" ]]; then
+        loop_cost_sum=0
+        loop_cost_unknown=1
+    fi
+fi
 
 # ---------------------------------------------------------------- refresh --
 # --refresh-at: when a coding leg's own context crossed the threshold,
@@ -8589,17 +8805,28 @@ if [[ "$refresh_enabled" == "1" ]]; then
             # top of the next iteration (fs_refresh_is_stall above).
             refresh_leg_head_before="$(clone_branch_head)"
             refresh_leg_outbox_before="$(fs_refresh_outbox_sig "$outbox_dir")"
-            if [[ -n "$formatter" ]]; then
-                fs_run_lock_closed "${cont_sandbox_cmd[@]}" < "$cont_prompt" \
-                    2> >(tee -a "$sandbox_log" >&2) \
-                    | tee -a "$events" -a "$cont_events" \
-                    | "$formatter"
-            else
-                fs_run_lock_closed "${cont_sandbox_cmd[@]}" < "$cont_prompt" \
-                    2> >(tee -a "$sandbox_log" >&2) \
-                    | tee -a "$events" -a "$cont_events"
-            fi
-            rc="${PIPESTATUS[0]:-1}"
+            _fs_cont_attempt() {
+                if [[ -n "$formatter" ]]; then
+                    fs_run_lock_closed "${cont_sandbox_cmd[@]}" < "$cont_prompt" \
+                        2> >(tee -a "$sandbox_log" >&2) \
+                        | tee -a "$events" -a "$cont_events" \
+                        | "$formatter"
+                else
+                    fs_run_lock_closed "${cont_sandbox_cmd[@]}" < "$cont_prompt" \
+                        2> >(tee -a "$sandbox_log" >&2) \
+                        | tee -a "$events" -a "$cont_events"
+                fi
+                _fs_leg_attempt_rc="${PIPESTATUS[0]:-1}"
+            }
+            # events.jsonl (the run's own cumulative log, appended by every
+            # attempt in turn) is never archived or truncated here -- only
+            # cont_events, this continuation's own isolated file, is what the
+            # retry driver moves aside between attempts and what its cost
+            # accounting below reads.
+            fs_run_claude_leg_with_retry "$harness" "$cont_events" "$sandbox_log" \
+                "continuation leg $leg_no" _fs_cont_attempt "$formatter"
+            rc="$fs_retry_rc"
+            total_leg_retries=$(( total_leg_retries + fs_retry_count ))
             fs_archive_inbox "$leg_no" "$harness" "$rc"
             # A continuation is the same conversation as step 1's pass 1,
             # not a new pass -- see progress_i[1]'s own comment where pass 1
@@ -8613,6 +8840,18 @@ if [[ "$refresh_enabled" == "1" ]]; then
             cont_cost="$("$formatter" --cost "$cont_events" 2>/dev/null)"
             cont_usage="$("$formatter" --usage "$cont_events" 2>/dev/null)"
             [[ -n "$cont_usage" ]] || cont_usage=null
+            # Retries: keep leg_usage-style, this leg's usage stays the final
+            # attempt's own (cont_usage above already reads only cont_events,
+            # the final attempt), but cont_cost is summed across every
+            # attempt this leg made, priced or not.
+            if [[ -n "$fs_retry_extra_cost" ]]; then
+                if [[ "$cont_cost" =~ ^-?[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?$ ]]; then
+                    cont_cost="$(jq -n --argjson a "$cont_cost" --argjson b "$fs_retry_extra_cost" \
+                        '$a + $b' 2>/dev/null)"
+                else
+                    cont_cost=""
+                fi
+            fi
             if [[ "$cont_cost" =~ ^-?[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?$ ]]; then
                 summed="$(jq -n --argjson a "$loop_cost_sum" --argjson b "$cont_cost" \
                     '$a + $b' 2>/dev/null)"
@@ -8636,7 +8875,8 @@ if [[ "$refresh_enabled" == "1" ]]; then
                 --argjson usage "$cont_usage" \
                 --arg handoff "$record_name" \
                 --argjson handoff_stale "$handoff_stale_json" \
-                '$prev + [{leg: $leg, exit: $exit, cost_usd: $cost, usage: $usage, handoff: $handoff, handoff_stale: $handoff_stale}]' \
+                --argjson retries "$fs_retry_records" \
+                '$prev + [{leg: $leg, exit: $exit, cost_usd: $cost, usage: $usage, handoff: $handoff, handoff_stale: $handoff_stale, retries: $retries}]' \
                 2>/dev/null)"
             [[ -n "$merged" ]] && continuations_json="$merged"
 
@@ -8854,6 +9094,8 @@ run_leg() {
     leg_usage=""
     leg_error=""
     leg_harness_error=""
+    leg_retries_count=0
+    leg_retries_json='[]'
     : > "$leg_events"
 
     # pi records its transcript, and the tokens with it, in a session
@@ -8897,17 +9139,25 @@ run_leg() {
     # The prompt is a FILE on stdin, never an argument -- see the implement
     # leg's redirect for why (MAX_ARG_STRLEN), and note that the fix prompt
     # carries verdict text of no fixed size.
-    if [[ -n "$leg_formatter" ]]; then
-        fs_run_lock_closed "${cmd[@]}" < "$prompt" \
-            2> >(tee -a "$sandbox_log" >&2) \
-            | tee -a "$leg_events" \
-            | "$leg_formatter"
-    else
-        fs_run_lock_closed "${cmd[@]}" < "$prompt" \
-            2> >(tee -a "$sandbox_log" >&2) \
-            | tee -a "$leg_events"
-    fi
-    leg_rc="${PIPESTATUS[0]:-1}"
+    _fs_leg_attempt() {
+        if [[ -n "$leg_formatter" ]]; then
+            fs_run_lock_closed "${cmd[@]}" < "$prompt" \
+                2> >(tee -a "$sandbox_log" >&2) \
+                | tee -a "$leg_events" \
+                | "$leg_formatter"
+        else
+            fs_run_lock_closed "${cmd[@]}" < "$prompt" \
+                2> >(tee -a "$sandbox_log" >&2) \
+                | tee -a "$leg_events"
+        fi
+        _fs_leg_attempt_rc="${PIPESTATUS[0]:-1}"
+    }
+    fs_run_claude_leg_with_retry "$leg_harness" "$leg_events" "$sandbox_log" \
+        "the $kind leg of iteration $n" _fs_leg_attempt "$leg_formatter"
+    leg_rc="$fs_retry_rc"
+    leg_retries_count="$fs_retry_count"
+    leg_retries_json="$fs_retry_records"
+    total_leg_retries=$(( total_leg_retries + leg_retries_count ))
     fs_archive_inbox "$next_leg_no" "$leg_harness" "$leg_rc"
     next_leg_no=$(( next_leg_no + 1 ))
 
@@ -8989,6 +9239,17 @@ run_leg() {
     [[ -n "$leg_usage" ]] || leg_usage=null
     if [[ ! "$leg_cost" =~ ^-?[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?$ ]]; then
         leg_cost=""
+    fi
+    # A retried leg's own cost above reads only the final attempt (the file
+    # left at $leg_events); every earlier, archived attempt's own price joins
+    # it here, so a leg that burned a retry is not billed as if it had not.
+    if [[ -n "$fs_retry_extra_cost" ]]; then
+        if [[ -n "$leg_cost" ]]; then
+            leg_cost="$(jq -n --argjson a "$leg_cost" --argjson b "$fs_retry_extra_cost" \
+                '$a + $b' 2>/dev/null)"
+        else
+            leg_cost="$fs_retry_extra_cost"
+        fi
     fi
     leg_harness_error="$(fs_harness_error "$leg_harness" "$leg_events")"
     if [[ -n "$leg_harness_error" && "$leg_rc" != "0" ]]; then
@@ -9215,11 +9476,11 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count && stop_requested != 1; cur
     # block (which folds it in for good).
     cur_iter_record() {
         if [[ "$cur_legacy" == 1 && "$cur_kind" == maintainer ]]; then
-            jq -cn --argjson i "$cur_i" --argjson findings "$cur_findings" --argjson maintainer_exit "${cur_review_exit:-null}" --argjson fix_exit "${cur_fix_exit:-null}" --argjson maintainer_cost "${cur_review_cost:-null}" --argjson fix_cost "${cur_fix_cost:-null}" --argjson maintainer_usage "${cur_review_usage:-null}" --argjson fix_usage "${cur_fix_usage:-null}" --arg before "${cur_before:-}" --arg after "${cur_after:-}" \
-                '[{i:$i,findings:$findings,maintainer_exit:$maintainer_exit,fix_exit:$fix_exit,head_before:(if $before=="" then null else $before end),head_after:(if $after=="" then null else $after end),commits_added:null,maintainer_cost_usd:$maintainer_cost,fix_cost_usd:$fix_cost,maintainer_usage:$maintainer_usage,fix_usage:$fix_usage}]'
+            jq -cn --argjson i "$cur_i" --argjson findings "$cur_findings" --argjson maintainer_exit "${cur_review_exit:-null}" --argjson fix_exit "${cur_fix_exit:-null}" --argjson maintainer_cost "${cur_review_cost:-null}" --argjson fix_cost "${cur_fix_cost:-null}" --argjson maintainer_usage "${cur_review_usage:-null}" --argjson fix_usage "${cur_fix_usage:-null}" --arg before "${cur_before:-}" --arg after "${cur_after:-}" --argjson retries "${cur_retries:-[]}" \
+                '[{i:$i,findings:$findings,maintainer_exit:$maintainer_exit,fix_exit:$fix_exit,head_before:(if $before=="" then null else $before end),head_after:(if $after=="" then null else $after end),commits_added:null,maintainer_cost_usd:$maintainer_cost,fix_cost_usd:$fix_cost,maintainer_usage:$maintainer_usage,fix_usage:$fix_usage,retries:$retries}]'
         else
-            jq -cn --argjson i "$cur_i" --argjson findings "$cur_findings" --argjson review_exit "${cur_review_exit:-null}" --argjson fix_exit "${cur_fix_exit:-null}" --argjson review_cost "${cur_review_cost:-null}" --argjson fix_cost "${cur_fix_cost:-null}" --argjson review_usage "${cur_review_usage:-null}" --argjson fix_usage "${cur_fix_usage:-null}" --arg before "${cur_before:-}" --arg after "${cur_after:-}" \
-                '[{i:$i,findings:$findings,review_exit:$review_exit,fix_exit:$fix_exit,head_before:(if $before=="" then null else $before end),head_after:(if $after=="" then null else $after end),commits_added:null,review_cost_usd:$review_cost,fix_cost_usd:$fix_cost,review_usage:$review_usage,fix_usage:$fix_usage}]'
+            jq -cn --argjson i "$cur_i" --argjson findings "$cur_findings" --argjson review_exit "${cur_review_exit:-null}" --argjson fix_exit "${cur_fix_exit:-null}" --argjson review_cost "${cur_review_cost:-null}" --argjson fix_cost "${cur_fix_cost:-null}" --argjson review_usage "${cur_review_usage:-null}" --argjson fix_usage "${cur_fix_usage:-null}" --arg before "${cur_before:-}" --arg after "${cur_after:-}" --argjson retries "${cur_retries:-[]}" \
+                '[{i:$i,findings:$findings,review_exit:$review_exit,fix_exit:$fix_exit,head_before:(if $before=="" then null else $before end),head_after:(if $after=="" then null else $after end),commits_added:null,review_cost_usd:$review_cost,fix_cost_usd:$fix_cost,review_usage:$review_usage,fix_usage:$fix_usage,retries:$retries}]'
         fi
     }
     # Write cur_loop_json with the in-progress iteration folded in WITHOUT
@@ -9374,16 +9635,18 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count && stop_requested != 1; cur
                 cat -- "$cur_prev" >> "$cur_prompt_iter"
             fi
         fi
+        cur_retries='[]'
         if [[ "$cur_legacy" == 1 ]]; then
             cur_review_exit=null; cur_review_cost=null; cur_review_usage=null; cur_fix_exit=null; cur_fix_cost=null; cur_fix_usage=null; cur_findings=null; cur_before="$cur_head"; cur_after=""
             cur_save_live
         fi
         run_leg "$cur_kind" "$cur_i" "$cur_prompt_iter" "$cur_step_idx"
+        cur_retries="${leg_retries_json:-[]}"
         cur_review_exit="$leg_rc"; cur_review_cost="${leg_cost:-null}"; cur_review_usage="${leg_usage:-null}"; cur_fix_exit=null; cur_fix_cost=null; cur_fix_usage=null; cur_findings=null; cur_before="$cur_head"; cur_after=""
         [[ "$cur_legacy" == 1 ]] && cur_save_live
         if [[ "$cur_legacy" == 1 ]]; then
             if [[ "$leg_rc" != 0 ]]; then
-                cur_ended=harness-error; cur_detail="the $cur_kind leg of iteration $cur_i exited $leg_rc${leg_error:+ ($leg_error)}${leg_harness_error:+: $leg_harness_error}"
+                cur_ended=harness-error; cur_detail="the $cur_kind leg of iteration $cur_i exited $leg_rc${leg_error:+ ($leg_error)}${leg_harness_error:+: $leg_harness_error}$(fs_leg_retry_suffix "${leg_retries_count:-0}")"
             # The verdict is DATA. It is copied, counted and concatenated
             # into a prompt file -- never sourced, never evaluated, never
             # put on a command line. It is also written by a session, so
@@ -9475,6 +9738,8 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count && stop_requested != 1; cur
                                 # $updated stuck at the preceding review leg's write.
                                 progress_write running
                                 run_leg "$cur_fix_kind" "$cur_fix_leg" "$cur_fix_prompt"
+                                cur_retries="$(jq -cn --argjson a "$cur_retries" --argjson b "${leg_retries_json:-[]}" '$a + $b' 2>/dev/null)"
+                                [[ -n "$cur_retries" ]] || cur_retries='[]'
                                 cur_fix_exit="$leg_rc"
                                 progress_write running
                                 if [[ -n "$leg_cost" ]]; then
@@ -9486,7 +9751,7 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count && stop_requested != 1; cur
                             (( cur_fix_repeat == 1 )) && cur_fix_usage="${leg_usage:-null}"
                             cur_after="$(clone_branch_head)"
                             if [[ "$leg_rc" != 0 ]]; then
-                                cur_ended=harness-error; cur_detail="the fix leg of iteration $cur_i exited $leg_rc${leg_error:+ ($leg_error)}${leg_harness_error:+: $leg_harness_error}"
+                                cur_ended=harness-error; cur_detail="the fix leg of iteration $cur_i exited $leg_rc${leg_error:+ ($leg_error)}${leg_harness_error:+: $leg_harness_error}$(fs_leg_retry_suffix "${leg_retries_count:-0}")"
                             elif [[ -z "$cur_after" ]]; then
                                 cur_ended=harness-error; cur_detail="branch $branch could not be read from the clone after the fix leg of iteration $cur_i"
                             elif [[ "$cur_after" == "$cur_before" ]]; then
@@ -9504,6 +9769,7 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count && stop_requested != 1; cur
         else
             if [[ "$leg_rc" != 0 || ! -s "$cur_verdict_file" || -L "$cur_verdict_file" ]]; then cur_ended=harness-error; cur_detail="the $cur_kind leg of iteration $cur_i left no usable verdict"
                 [[ "$leg_rc" != 0 && -n "$leg_harness_error" ]] && cur_detail+=": $leg_harness_error"
+                [[ "$leg_rc" != 0 ]] && cur_detail+="$(fs_leg_retry_suffix "${leg_retries_count:-0}")"
             else
                 cur_copy="$run_dir/${cur_step_idx}-$([[ "$cur_kind" == maintainer ]] && echo maintain || echo review)-verdict-${cur_i}.md"
                 cp -- "$cur_verdict_file" "$cur_copy"; rm -f "$cur_verdict_file"
@@ -9528,6 +9794,8 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count && stop_requested != 1; cur
                         # reason as the legacy fix block above.
                         progress_write running
                         run_leg fix "$cur_fix_leg" "$cur_fix_prompt" "$cur_step_idx"; cur_fix_exit="$leg_rc"
+                        cur_retries="$(jq -cn --argjson a "$cur_retries" --argjson b "${leg_retries_json:-[]}" '$a + $b' 2>/dev/null)"
+                        [[ -n "$cur_retries" ]] || cur_retries='[]'
                         progress_write running
                         if [[ -n "$leg_cost" ]]; then
                             [[ "$cur_fix_cost" != null ]] && cur_fix_cost="$(jq -n --argjson a "$cur_fix_cost" --argjson b "$leg_cost" '$a + $b')" || cur_fix_cost="$leg_cost"
@@ -9537,7 +9805,7 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count && stop_requested != 1; cur
                     (( cur_fix_known )) || cur_fix_cost=null
                     (( cur_fix_repeat == 1 )) && cur_fix_usage="${leg_usage:-null}"
                     cur_after="$(clone_branch_head)"
-                    if [[ "$leg_rc" != 0 ]]; then cur_ended=harness-error; cur_detail="the fix leg of iteration $cur_i exited $leg_rc${leg_error:+ ($leg_error)}${leg_harness_error:+: $leg_harness_error}"
+                    if [[ "$leg_rc" != 0 ]]; then cur_ended=harness-error; cur_detail="the fix leg of iteration $cur_i exited $leg_rc${leg_error:+ ($leg_error)}${leg_harness_error:+: $leg_harness_error}$(fs_leg_retry_suffix "${leg_retries_count:-0}")"
                     elif [[ -z "$cur_after" ]]; then cur_ended=harness-error; cur_detail="branch $branch could not be read from the clone after the fix leg of iteration $cur_i"
                     elif [[ "$cur_after" == "$cur_before" ]]; then cur_ended=no-progress
                     else cur_head="$cur_after"; fi
@@ -10186,6 +10454,8 @@ jq -n \
     --arg claude_credentials_via "$claude_credentials_via" \
     --arg end_reason "${end_reason:-}" \
     --arg agent_kit "$agent_kit" \
+    --argjson leg_retries "${total_leg_retries:-0}" \
+    --argjson implement_retries "${impl_leg_retries_json:-[]}" \
     '{
         version: $version,
         mode: $mode,
@@ -10221,6 +10491,8 @@ jq -n \
         started_at: $started_at,
         ended_at: $ended_at,
         duration_seconds: ($ended_at - $started_at),
+        leg_retries: $leg_retries,
+        implement_retries: $implement_retries,
     }
     # Both keys are absent, not null, on a run without --session-state:
     # their presence is how a caller tells a resumable run from one whose
