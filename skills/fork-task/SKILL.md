@@ -1,7 +1,7 @@
 ---
 name: fork-task
 description: Fork a task to a Claude Code or Codex agent in another project directory, a split pane, or a new worktree. Writes a handoff doc, launches the selected agent in a new tmux window or pane. Use when work is needed in a dependent package or sibling project.
-argument-hint: [--harness claude|codex] [--sol] [--split|--hsplit] [--worktree] [--shared] [--sandboxed] [--branch <name>] [--model <model>] [--purpose <slug>] [--claude-args "..."] [--codex-args "..."] <project-path> — path to the target project directory (omit or use "." for same-project handoff). Use --harness codex (or --agent codex) for an interactive Codex pane; `--sol` is shorthand for Codex with `gpt-5.6-sol`; Claude is the default. Use --split to open in a split pane below the current one, or --hsplit to open it beside (side by side) instead. Use --worktree to create an isolated worktree via the project's .claude/fork-worktree.sh hook. Use --shared for shared-db worktrees. Use --sandboxed to run the Claude fork in a throwaway clone inside claude-sandboxed, with no permission prompts; name its branch with --branch. Use --model to pick the model for the new session (fable, opus, sonnet, or a Codex model such as gpt-5.6-sol). Use --purpose to set a session name for cross-session messaging (defaults to the project basename). Use --claude-args or --codex-args to pass extra flags to the selected CLI. Codex uses its normal interactive sandbox and cannot be combined with --sandboxed.
+argument-hint: [--harness claude|codex] [--sol] [--split|--hsplit] [--worktree] [--shared] [--sandboxed] [--branch <name>] [--model <model>] [--purpose <slug>] [--claude-args "..."] [--codex-args "..."] <project-path> — path to the target project directory (omit or use "." for same-project handoff). Use --harness codex (or --agent codex) for an interactive Codex pane; `--sol` is shorthand for Codex with whatever model a `codex sol` line in `~/.config/fork-sandbox/aliases.conf` names; Claude is the default. Use --split to open in a split pane below the current one, or --hsplit to open it beside (side by side) instead. Use --worktree to create an isolated worktree via the project's .claude/fork-worktree.sh hook. Use --shared for shared-db worktrees. Use --sandboxed to run the Claude fork in a throwaway clone inside claude-sandboxed, with no permission prompts; name its branch with --branch. Use --model to pick the model for the new session (fable, opus, sonnet, or a Codex model id). Use --purpose to set a session name for cross-session messaging (defaults to the project basename). Use --claude-args or --codex-args to pass extra flags to the selected CLI. Codex uses its normal interactive sandbox and cannot be combined with --sandboxed.
 ---
 
 # Fork Task
@@ -11,7 +11,7 @@ Launch a Claude Code or Codex session in a new tmux window (or split pane) with 
 ## Modes
 
 - **Cross-project fork:** `<project-path>` is a different directory. Use when work is needed in a dependent package or sibling project.
-- **Codex fork:** pass `--harness codex` (or `--agent codex`). This launches the local interactive `codex` CLI in the tmux pane; its own sandbox remains enabled. Do not combine it with `--sandboxed`, which is the Claude sandbox mode. `--model` is passed as a Codex model ID, such as `gpt-5.6-sol`.
+- **Codex fork:** pass `--harness codex` (or `--agent codex`). This launches the local interactive `codex` CLI in the tmux pane; its own sandbox remains enabled. Do not combine it with `--sandboxed`, which is the Claude sandbox mode. `--model` is passed as a Codex model ID.
 - **Same-project handoff:** `<project-path>` is omitted, `.`, or the current working directory. Use when the user wants to continue the current work in a fresh session (e.g., context is getting long, switching focus areas, or handing off in-progress work).
 - **Worktree fork:** `--worktree` is specified. Creates an isolated worktree before launching. Requires `.claude/fork-worktree.sh` in the target project.
 - **Sandboxed fork:** `--sandboxed` is specified. Clones the repo, runs the session in that clone inside `claude-sandboxed`, and fetches the branch back when it exits. The session never asks for permission. Use it for unattended work — a long build, a broad refactor, a test sweep. It cannot be combined with `--worktree`. See "Sandboxed forks" below.
@@ -100,10 +100,14 @@ immediate fork:
 
    **Codex interactive pane:**
    ```bash
-   fork-task.sh --harness codex --split --model gpt-5.6-sol "<project-path>" "<handoff-file>"
+   fork-task.sh --harness codex --split --model gpt-6-sol "<project-path>" "<handoff-file>"
    fork-task.sh --sol --split "<project-path>" "<handoff-file>"
    ```
-   `--agent codex` is accepted as an alias for `--harness codex`. Use
+   `--agent codex` is accepted as an alias for `--harness codex`; `--model`
+   is passed straight through to the `codex` CLI, so it takes an exact model
+   id, not a tier name. `--sol` is the exception: it reads the model a
+   `codex sol` line in `~/.config/fork-sandbox/aliases.conf` names, and
+   refuses by naming that file when there is no such line. Use
    `--codex-args` for additional Codex CLI flags. The Codex sandbox remains
    enabled; use `fork-sandbox.sh --harness codex` for an unattended run.
 

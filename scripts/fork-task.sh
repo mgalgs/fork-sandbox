@@ -16,9 +16,14 @@
 #                         --worktree-args, prints the worktree path to stdout.
 # --worktree-args "...":  extra arguments forwarded to fork-worktree.sh
 # --harness <name>:        agent to launch: claude (default) or codex
-# --sol:                  shorthand for --harness codex --model gpt-5.6-sol
+# --sol:                  shorthand for --harness codex --model <whatever
+#                         a "codex sol <model-id>" line in aliases.conf
+#                         maps to>. Reads $FORK_SANDBOX_CONFIG_DIR/aliases.conf
+#                         (default ~/.config/fork-sandbox/aliases.conf);
+#                         refuses by naming that file and the line to add
+#                         when it has none.
 # --model <model>:        model for the new session (e.g. fable, opus, sonnet,
-#                         gpt-5.6-sol)
+#                         a Codex model id)
 # --claude-args "...":    extra arguments passed verbatim to the claude CLI
 # --permission-mode <m>:  permission mode the new claude session starts in
 #                         (e.g. auto, acceptEdits, plan). Claude harness only;
@@ -192,7 +197,21 @@ while [[ "${1:-}" == -* ]]; do
             ;;
         --sol)
             harness="codex"
-            model="gpt-5.6-sol"
+            fork_task_aliases_file="${FORK_SANDBOX_CONFIG_DIR:-$HOME/.config/fork-sandbox}/aliases.conf"
+            fork_task_sol_model=""
+            if [[ -f "$fork_task_aliases_file" ]]; then
+                fork_task_sol_model="$(awk '
+                    /^[[:space:]]*($|#)/ { next }
+                    $1 == "codex" && $2 == "sol" { print $3; exit }
+                ' "$fork_task_aliases_file")"
+            fi
+            if [[ -z "$fork_task_sol_model" ]]; then
+                echo "Error: --sol needs a 'codex sol <model-id>' line in" >&2
+                echo "$fork_task_aliases_file. Add one, e.g.:" >&2
+                echo "  codex sol gpt-6-sol" >&2
+                exit 1
+            fi
+            model="$fork_task_sol_model"
             shift
             ;;
         --claude-args)
