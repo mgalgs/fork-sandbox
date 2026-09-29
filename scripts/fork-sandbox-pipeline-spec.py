@@ -5,10 +5,15 @@ Usage: fork-sandbox-pipeline-spec.py <spec>
 
 A spec is a preset's composition name used as the preset itself:
 `-`-joined segments `<stage><model>[<harness>][<repeat>]`, e.g.
-`csonnet2-rsol2-mopus2` (code sonnet x2, review sol x2, maintain opus x2).
+`csonnet2-rsol2-mopus2` (code sonnet x2, review sol x2, maintain opus x2),
+or `ropus-rsonnet-mopus-msonnet` (opus review, sonnet review, opus
+maintain, sonnet maintain -- no code step at all).
 
-    stage    c (code), r (review) or m (maintain); each at most once, in
-             that order.
+    stage    c (code), r (review) or m (maintain). At most one c segment,
+             which must come first if present; any number of r segments;
+             any number of m segments -- in that order (c, r*, m*). An r
+             segment after an m is refused; consecutive r's or consecutive
+             m's are not.
     model    a name from MODELS below. It runs on its native harness, the
              first one listed for it.
     harness  optional: claude, codex or pi, to seat the model on a
@@ -17,6 +22,12 @@ A spec is a preset's composition name used as the preset itself:
     repeat   optional, default 1. On the code step it is the agent's
              repeat, so it reaches the fix legs too, as in a hand-written
              preset; on a review or maintain step it is the loop cap.
+
+Each segment compiles to its own agent and its own pipeline step. A
+stage's first segment names its agent the plain way ("coder", "reviewer",
+"maintainer"); a second and later segment of the same stage numbers it
+from there ("reviewer2", "reviewer3", ...) -- deterministic on the spec's
+own segment order, not on the model or harness a segment names.
 
 Fix legs ride the code seat: no step names a fix_agent. Anything the
 grammar cannot say (fix_agent, per-seat arguments on another seat, network)
@@ -81,8 +92,10 @@ def parse_seat(spec, seg, body):
 
 def compile_spec(spec):
     segments = spec.split("-")
-    seen = []
     seats = []
+    c_count = 0
+    last_rank = -1
+    occurrences = {"c": 0, "r": 0, "m": 0}
     for seg in segments:
         m = re.fullmatch(r"([a-z])([a-z]+)([0-9]*)", seg)
         if not m:
@@ -92,30 +105,39 @@ def compile_spec(spec):
         if stage not in STAGES:
             fail(spec, f"segment '{seg}': stage '{stage}' is not c (code), "
                        f"r (review) or m (maintain)")
-        if stage in seen:
-            fail(spec, f"stage '{stage}' appears twice; each stage appears "
-                       f"at most once")
-        if seen and "crm".index(stage) < "crm".index(seen[-1]):
-            fail(spec, "stages run in the order c, r, m")
-        seen.append(stage)
+        rank = "crm".index(stage)
+        if rank < last_rank:
+            fail(spec, "stages run in the order c, r*, m* -- at most one "
+                       "code stage, then any number of review stages, "
+                       "then any number of maintain stages")
+        if stage == "c":
+            c_count += 1
+            if c_count > 1:
+                fail(spec, f"stage 'c' appears twice; at most one code "
+                           f"stage is allowed")
+        last_rank = rank
         if digits and (digits.startswith("0")):
             fail(spec, f"segment '{seg}': the repeat count is a positive "
                        f"integer without a leading zero")
         repeat = int(digits) if digits else 1
         harness, model_id = parse_seat(spec, seg, body)
-        seats.append((stage, harness, model_id, repeat))
+        occurrences[stage] += 1
+        occurrence = occurrences[stage]
+        agent = (AGENT_NAMES[stage] if occurrence == 1
+                 else f"{AGENT_NAMES[stage]}{occurrence}")
+        seats.append((stage, harness, model_id, repeat, agent))
 
     lines = [f"# Compiled from --pipeline {spec}", "agents:"]
-    for stage, harness, model_id, repeat in seats:
-        lines += [f"  {AGENT_NAMES[stage]}:",
+    for stage, harness, model_id, repeat, agent in seats:
+        lines += [f"  {agent}:",
                   f"    harness: {harness}",
                   f"    model: {model_id}"]
         if stage == "c" and repeat != 1:
             lines.append(f"    repeat: {repeat}")
     lines.append("pipeline:")
-    for stage, _, _, repeat in seats:
+    for stage, _, _, repeat, agent in seats:
         lines += [f"  - action: {STAGES[stage]}",
-                  f"    agent: {AGENT_NAMES[stage]}"]
+                  f"    agent: {agent}"]
         if stage != "c":
             lines.append(f"    repeat: {repeat}")
     return "".join(line + "\n" for line in lines)

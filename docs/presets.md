@@ -218,8 +218,11 @@ fork-sandbox.sh --pipeline csonnet2-rsol2-mopus2 ~/src/myrepo handoff.md
 
 The spec is `-`-joined segments, `<stage><model>[<harness>][<N>]`:
 
-- **stage** is `c` (code), `r` (review) or `m` (maintain), each at most
-  once, in that order.
+- **stage** is `c` (code), `r` (review) or `m` (maintain). At most one
+  `c`, which must come first if present; then any number of `r` segments;
+  then any number of `m` segments — order `c, r*, m*`. An `r` after an `m`
+  is still refused; `csonnet-ropus-rsonnet-mopus-msonnet` (one code step,
+  two review steps, two maintain steps) is not.
 - **model** is a name from the table at the top of
   `scripts/fork-sandbox-pipeline-spec.py`, and runs on its native harness:
   `haiku`, `sonnet`, `opus`, `fable` on claude; `luna`, `terra`, `sol`,
@@ -237,6 +240,12 @@ The spec is `-`-joined segments, `<stage><model>[<harness>][<N>]`:
   (`csolpi2`); the table must carry the model's id for that harness.
 - **N**, optional and 1 by default, is the code agent's `repeat`, or a
   review or maintain step's loop cap. `csonnet-rsol-mopus` is one of each.
+
+Each segment compiles to its own agent and its own pipeline step. A
+stage's first segment names its agent the plain way (`coder`, `reviewer`,
+`maintainer`); a second and later segment of the same stage numbers it
+from there (`reviewer2`, `reviewer3`, …) — deterministic on the spec's
+own segment order, not on the model or harness a segment names.
 
 The spec compiles to the preset document a hand-written preset with the
 same shape would be, and from there runs the `--preset` path unchanged:

@@ -1441,9 +1441,28 @@ refuses "--pipeline and --preset are mutually exclusive" \
 refuses "an unknown model is refused, naming the known ones" \
     "unknown model 'gpt'; known models: haiku" --pipeline cgpt
 refuses "stages out of order are refused" \
-    "stages run in the order c, r, m" --pipeline mopus-csonnet
-refuses "a repeated stage is refused" \
-    "stage 'r' appears twice" --pipeline chaiku-rsol-rsol
+    "stages run in the order c, r*, m*" --pipeline mopus-csonnet
+refuses "a repeated code stage is refused" \
+    "stage 'c' appears twice" --pipeline chaiku-csonnet
+refuses "a review stage after a maintain stage is refused" \
+    "stages run in the order c, r*, m*" --pipeline chaiku-mopus-rsol
+out="$(run --pipeline csonnet2-ropus-rsonnet-mopus-msonnet 2>"$err")"
+check "repeated review/maintain stages compile" \
+    $'pipeline=csonnet2-ropus-rsonnet-mopus-msonnet\nharness=claude\nmodel=' \
+    "$out"
+contains "a composed --pipeline spec with repeated stages announces its step count" \
+    "$(cat "$err")" \
+    "composed pipeline, 5 steps"
+# The compiled YAML itself, through the preset parser directly (same
+# "parses" helper the free-order composition tests above use): a second
+# review segment is its own step, on its own numbered agent, not a
+# silently-dropped duplicate of the first.
+python3 "$repo_dir/scripts/fork-sandbox-pipeline-spec.py" \
+    csonnet2-ropus-rsonnet-mopus-msonnet | \
+    parses "a --pipeline spec with repeated stages parses to 5 distinct steps" \
+        "pipeline	steps	5" \
+        "step	2	agent	reviewer" "step	3	agent	reviewer2" \
+        "step	4	agent	maintainer" "step	5	agent	maintainer2"
 refuses "an unknown stage letter is refused" \
     "stage 'x' is not c (code)" --pipeline xsonnet
 refuses "a zero repeat is refused" \
