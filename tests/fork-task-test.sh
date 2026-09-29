@@ -49,6 +49,21 @@ else
     esac
 fi
 
+# --help must win over --sol's own refusal, regardless of where it falls in
+# the argument list -- a user asking for usage should see it even with no
+# codex sol line in aliases.conf, and even before --help is reached in the
+# option loop.
+if out="$("$launcher" --sol --help 2>"$err")"; then
+    case "$out" in
+        *"Usage: fork-task.sh"*)
+            ok "--sol --help shows usage instead of refusing on the missing alias" ;;
+        *) no "--sol --help shows usage instead of refusing on the missing alias" "$out" ;;
+    esac
+else
+    no "--sol --help shows usage instead of refusing on the missing alias" \
+        "$(cat "$err")"
+fi
+
 cat > "$FORK_SANDBOX_CONFIG_DIR/aliases.conf" <<'ALIASES'
 # harness  alias  model-id
 codex sol gpt-6-sol

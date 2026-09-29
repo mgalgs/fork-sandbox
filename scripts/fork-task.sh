@@ -156,6 +156,18 @@ sandboxed=false
 sandbox_args=""
 branch=""
 purpose=""
+# Scanned up front so --sol can skip its alias-file requirement when --help
+# is also present: --help should show usage regardless of where it falls
+# relative to --sol, but --sol's own refusal must still fire on a real launch.
+help_requested=false
+for fork_task_arg in "$@"; do
+    case "$fork_task_arg" in
+        -h|--help)
+            help_requested=true
+            break
+            ;;
+    esac
+done
 while [[ "${1:-}" == -* ]]; do
     case "$1" in
         --split)
@@ -197,21 +209,23 @@ while [[ "${1:-}" == -* ]]; do
             ;;
         --sol)
             harness="codex"
-            fork_task_aliases_file="${FORK_SANDBOX_CONFIG_DIR:-$HOME/.config/fork-sandbox}/aliases.conf"
-            fork_task_sol_model=""
-            if [[ -f "$fork_task_aliases_file" ]]; then
-                fork_task_sol_model="$(awk '
-                    /^[[:space:]]*($|#)/ { next }
-                    $1 == "codex" && $2 == "sol" { print $3; exit }
-                ' "$fork_task_aliases_file")"
+            if ! $help_requested; then
+                fork_task_aliases_file="${FORK_SANDBOX_CONFIG_DIR:-$HOME/.config/fork-sandbox}/aliases.conf"
+                fork_task_sol_model=""
+                if [[ -f "$fork_task_aliases_file" ]]; then
+                    fork_task_sol_model="$(awk '
+                        /^[[:space:]]*($|#)/ { next }
+                        $1 == "codex" && $2 == "sol" { print $3; exit }
+                    ' "$fork_task_aliases_file")"
+                fi
+                if [[ -z "$fork_task_sol_model" ]]; then
+                    echo "Error: --sol needs a 'codex sol <model-id>' line in" >&2
+                    echo "$fork_task_aliases_file. Add one, e.g.:" >&2
+                    echo "  codex sol gpt-6-sol" >&2
+                    exit 1
+                fi
+                model="$fork_task_sol_model"
             fi
-            if [[ -z "$fork_task_sol_model" ]]; then
-                echo "Error: --sol needs a 'codex sol <model-id>' line in" >&2
-                echo "$fork_task_aliases_file. Add one, e.g.:" >&2
-                echo "  codex sol gpt-6-sol" >&2
-                exit 1
-            fi
-            model="$fork_task_sol_model"
             shift
             ;;
         --claude-args)
