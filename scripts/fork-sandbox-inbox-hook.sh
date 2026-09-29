@@ -17,9 +17,10 @@
 #                on its very next tool call, with no cooperation from the
 #                session itself. An addendum is announced by a pointer: a
 #                short notice naming its file in the inbox, with none of
-#                its text; the session reads the file itself. A mail banner's context is banner-only: a
-#                one-line summary (short-id, From, Subject, a body preview)
-#                plus the in-sandbox path of the full rendered thread — the
+#                its text; the session reads the file itself. A mail
+#                banner's context is banner-only: a one-line summary
+#                (short-id, From, Subject, a body preview) plus the
+#                in-sandbox path of the full rendered thread — the
 #                thread file's content is never injected, reading it is the
 #                agent's own choice.
 #   Stop         unread addenda AND unread mail banners both block the stop
@@ -456,7 +457,7 @@ case "$event" in
         # a leg is never trapped.
         reason=""
         if (( ${#unread[@]} )); then
-            reason+="$addendum_pointer Read it and carry it out before ending your turn. Read it now: $paths"
+            reason+="$addendum_pointer Read it now and carry it out before ending your turn: $paths"
         fi
         if [[ -n "$nudge_text" ]]; then
             reason+=$'\n\n'"$nudge_text"
