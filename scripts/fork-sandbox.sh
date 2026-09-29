@@ -7759,11 +7759,17 @@ fs_leg_retry_wait() {
 # Sets fs_retry_rc (the final attempt's exit code), fs_retry_error (its own
 # provider error, or empty), fs_retry_records (a JSON array of
 # {attempt, error, delay_s}, "[]" when nothing was retried), fs_retry_count
-# (how many retries actually ran) and fs_retry_extra_cost (the summed
-# --cost of every archived attempt, via <formatter>, when at least one
-# retry ran and priced; empty otherwise -- the caller's own cost for
-# <events-file> still has to be added to this separately, since this
-# driver never reads the caller's cost convention).
+# (how many retries actually ran), fs_retry_extra_cost (the summed --cost of
+# every archived attempt that priced, via <formatter>, when at least one
+# retry ran; empty otherwise) and fs_retry_cost_unknown (1 when at least one
+# archived attempt ran but did not price, which makes fs_retry_extra_cost a
+# partial sum rather than a complete one; 0 otherwise). The caller's own
+# cost for <events-file> still has to be added to fs_retry_extra_cost
+# separately, since this driver never reads the caller's cost convention --
+# but a caller MUST treat the combined leg cost as unknown, not as
+# fs_retry_extra_cost alone, whenever fs_retry_cost_unknown is 1 or its own
+# final-attempt cost is itself unpriced: a sum is only honest when every
+# part is a number.
 fs_run_claude_leg_with_retry() {
     local harness="$1" events_file="$2" sandbox_log="$3" desc="$4" \
         attempt_fn="$5" fmt="$6"
@@ -7771,6 +7777,7 @@ fs_run_claude_leg_with_retry() {
     fs_retry_records='[]'
     fs_retry_count=0
     fs_retry_extra_cost=""
+    fs_retry_cost_unknown=0
     # A runner re-run by hand in the same run dir (see the pi-session-copy
     # precedent above, in run_leg) is the case that leaves a stale
     # "<events_file>.attemptN" from an earlier invocation lying around; the
@@ -7829,6 +7836,12 @@ fs_run_claude_leg_with_retry() {
                 else
                     fs_retry_extra_cost="$cost_i"
                 fi
+            else
+                # This archived attempt ran (it left an events file) but did
+                # not price. fs_retry_extra_cost above is still only the sum
+                # of the OTHER attempts, so it must not be mistaken for the
+                # complete archived cost -- tell the caller so.
+                fs_retry_cost_unknown=1
             fi
         done
     fi
@@ -8300,6 +8313,7 @@ total_leg_retries=$(( total_leg_retries + impl_leg_retries_count ))
 # this is the implement leg's OWN price, not the loop's, so it belongs in
 # cost_usd, not loop_cost_sum.
 impl_leg_retry_extra_cost="$fs_retry_extra_cost"
+impl_leg_retry_cost_unknown="$fs_retry_cost_unknown"
 # Resume is a continuity optimization for codex too (see claude-sandboxed's
 # own RESUME_FAIL_RE for the analogous claude case, unreachable here because
 # codex runs through claude-sandboxed's --exec mode, which claude-sandboxed
@@ -8646,13 +8660,15 @@ fi
 if [[ ! "$run_cost" =~ ^-?[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?$ ]]; then
     run_cost=""
 fi
-if [[ -n "${impl_leg_retry_extra_cost:-}" ]]; then
-    if [[ -n "$run_cost" ]]; then
-        run_cost="$(jq -n --argjson a "$run_cost" --argjson b "$impl_leg_retry_extra_cost" \
-            '$a + $b' 2>/dev/null)"
-    else
-        run_cost="$impl_leg_retry_extra_cost"
-    fi
+# A sum is only honest when every part is a number: an unpriced final
+# attempt, or an unpriced archived attempt (impl_leg_retry_cost_unknown),
+# makes the whole implement-leg cost unknown rather than just the retry's
+# own share of it.
+if [[ "${impl_leg_retry_cost_unknown:-0}" == 1 ]]; then
+    run_cost=""
+elif [[ -n "$run_cost" && -n "${impl_leg_retry_extra_cost:-}" ]]; then
+    run_cost="$(jq -n --argjson a "$run_cost" --argjson b "$impl_leg_retry_extra_cost" \
+        '$a + $b' 2>/dev/null)"
 fi
 
 # Format once, here, and record it where a caller can read it without
@@ -8886,8 +8902,12 @@ if [[ "$refresh_enabled" == "1" ]]; then
             # Retries: keep leg_usage-style, this leg's usage stays the final
             # attempt's own (cont_usage above already reads only cont_events,
             # the final attempt), but cont_cost is summed across every
-            # attempt this leg made, priced or not.
-            if [[ -n "$fs_retry_extra_cost" ]]; then
+            # attempt this leg made -- and only when every one of them
+            # priced (fs_retry_cost_unknown flags an archived attempt that
+            # did not); a sum is only honest when every part is a number.
+            if [[ "$fs_retry_cost_unknown" == 1 ]]; then
+                cont_cost=""
+            elif [[ -n "$fs_retry_extra_cost" ]]; then
                 if [[ "$cont_cost" =~ ^-?[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?$ ]]; then
                     cont_cost="$(jq -n --argjson a "$cont_cost" --argjson b "$fs_retry_extra_cost" \
                         '$a + $b' 2>/dev/null)"
@@ -9286,13 +9306,14 @@ run_leg() {
     # A retried leg's own cost above reads only the final attempt (the file
     # left at $leg_events); every earlier, archived attempt's own price joins
     # it here, so a leg that burned a retry is not billed as if it had not.
-    if [[ -n "$fs_retry_extra_cost" ]]; then
-        if [[ -n "$leg_cost" ]]; then
-            leg_cost="$(jq -n --argjson a "$leg_cost" --argjson b "$fs_retry_extra_cost" \
-                '$a + $b' 2>/dev/null)"
-        else
-            leg_cost="$fs_retry_extra_cost"
-        fi
+    # But a sum is only honest when every part is a number: an unpriced
+    # final attempt, or an unpriced archived attempt (fs_retry_cost_unknown),
+    # makes the whole leg cost unknown rather than just the retry's share.
+    if [[ "$fs_retry_cost_unknown" == 1 ]]; then
+        leg_cost=""
+    elif [[ -n "$leg_cost" && -n "$fs_retry_extra_cost" ]]; then
+        leg_cost="$(jq -n --argjson a "$leg_cost" --argjson b "$fs_retry_extra_cost" \
+            '$a + $b' 2>/dev/null)"
     fi
     leg_harness_error="$(fs_harness_error "$leg_harness" "$leg_events")"
     if [[ -n "$leg_harness_error" && "$leg_rc" != "0" ]]; then
@@ -9790,12 +9811,14 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count && stop_requested != 1; cur
                                 # Tag this pass's own retries "fix" (never
                                 # $cur_fix_kind's internal mntfix spelling,
                                 # to match the shape documented at the
-                                # review/maintainer leg's own tag above) plus
-                                # which pass, so a multi-pass repeat's
-                                # retries don't collide with each other or
-                                # with the review/maintainer leg's.
-                                cur_retries="$(jq -cn --argjson a "$cur_retries" --argjson b "${leg_retries_json:-[]}" --argjson pass "$cur_fix_pass" \
-                                    '$a + ($b | map(. + {leg: "fix", pass: $pass}))' 2>/dev/null)"
+                                # review/maintainer leg's own tag above) plus,
+                                # when there is more than one pass to tell
+                                # apart, which pass -- see docs/presets.md's
+                                # own "when the fix seat's repeat ran more
+                                # than one" and the header comment above.
+                                cur_retries="$(jq -cn --argjson a "$cur_retries" --argjson b "${leg_retries_json:-[]}" \
+                                    --argjson pass "$cur_fix_pass" --argjson multi "$(( cur_fix_repeat > 1 ? 1 : 0 ))" \
+                                    '$a + ($b | map(. + {leg: "fix"} + (if $multi == 1 then {pass: $pass} else {} end)))' 2>/dev/null)"
                                 [[ -n "$cur_retries" ]] || cur_retries='[]'
                                 cur_fix_exit="$leg_rc"
                                 progress_write running
@@ -9851,12 +9874,14 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count && stop_requested != 1; cur
                         # reason as the legacy fix block above.
                         progress_write running
                         run_leg fix "$cur_fix_leg" "$cur_fix_prompt" "$cur_step_idx"; cur_fix_exit="$leg_rc"
-                        # Same tag as the legacy fix block above: "fix" plus
-                        # which pass, so this leg's retries never collide
-                        # with the review/maintainer leg's in the same
-                        # iteration record.
-                        cur_retries="$(jq -cn --argjson a "$cur_retries" --argjson b "${leg_retries_json:-[]}" --argjson pass "$cur_fix_pass" \
-                            '$a + ($b | map(. + {leg: "fix", pass: $pass}))' 2>/dev/null)"
+                        # Same tag as the legacy fix block above: "fix" plus,
+                        # when there is more than one pass, which pass, so
+                        # this leg's retries never collide with the
+                        # review/maintainer leg's in the same iteration
+                        # record.
+                        cur_retries="$(jq -cn --argjson a "$cur_retries" --argjson b "${leg_retries_json:-[]}" \
+                            --argjson pass "$cur_fix_pass" --argjson multi "$(( cur_fix_repeat > 1 ? 1 : 0 ))" \
+                            '$a + ($b | map(. + {leg: "fix"} + (if $multi == 1 then {pass: $pass} else {} end)))' 2>/dev/null)"
                         [[ -n "$cur_retries" ]] || cur_retries='[]'
                         progress_write running
                         if [[ -n "$leg_cost" ]]; then

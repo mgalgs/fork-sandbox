@@ -3441,6 +3441,13 @@ if rd_retry1="$(run_stubbed --preset reviewloop --review-loop 2 \
         "revoked"
     check "the retry record is labeled as the fix leg's own" \
         "fix" "$(jq -r '.iterations[0].retries[0].leg' "$rd_retry1/review-loop.json" 2>/dev/null)"
+    # docs/presets.md and the header comment near :650 both say a fix
+    # element carries `pass` only when the fix seat's repeat ran more than
+    # one -- this seat's repeat is the default (1), so `pass` must be
+    # absent here, not present as 1.
+    check "a single-pass fix seat's retry record carries no pass key" \
+        "false" "$(jq -r '.iterations[0].retries[0] | has("pass")' \
+            "$rd_retry1/review-loop.json" 2>/dev/null)"
     contains "sandbox.log announces the retry" \
         "$(cat "$rd_retry1/sandbox.log" 2>/dev/null)" \
         "the fix leg of iteration 1 failed on a transient error"
@@ -3481,6 +3488,25 @@ if rd_retry1c="$(run_stubbed --preset reviewloop --review-loop 2 \
         "0.060000" "$(jq -r '.total_cost_usd' "$rd_retry1c/summary.json" 2>/dev/null)"
 else
     no "a retried fix leg's fix_cost_usd includes the archived attempt" \
+        "launch failed"
+fi
+
+# B1-cost-unknown. Same idea as B3-cost-unknown above, but for a run_leg
+# leg: the fix leg's first archived attempt prices (auth401-cost, $0.02),
+# its second (auth401) does not, and only the third attempt (commit)
+# succeeds -- burning both of this suite's configured retries. fix_cost_usd
+# and total_cost_usd must both be null, not a sum that silently drops the
+# unpriced attempt.
+prep_stub $'commit\nfindings\nauth401-cost\nauth401\ncommit\napproved'
+if rd_retry1u="$(run_stubbed --preset reviewloop --review-loop 2 \
+    --branch "sandbox-test-retry-fix-cost-unknown-$$")"; then
+    tmpdirs+=("$rd_retry1u")
+    check "a fix leg with an unpriced archived attempt gets a null fix_cost_usd" \
+        "null" "$(jq -r '.iterations[0].fix_cost_usd' "$rd_retry1u/review-loop.json" 2>/dev/null)"
+    check "total_cost_usd is null too, not a partial sum" \
+        "null" "$(jq -r '.total_cost_usd' "$rd_retry1u/summary.json" 2>/dev/null)"
+else
+    no "a fix leg with an unpriced archived attempt gets a null fix_cost_usd" \
         "launch failed"
 fi
 
@@ -3606,6 +3632,25 @@ if rd_retry3c="$(run_stubbed --harness claude --model haiku \
         "0.030000" "$(jq -r '.total_cost_usd' "$rd_retry3c/summary.json" 2>/dev/null)"
 else
     no "the retried implement leg's cost_usd includes the archived attempt" \
+        "launch failed"
+fi
+
+# B3-cost-unknown. One archived attempt priced (auth401-cost, $0.02) and the
+# NEXT one (auth401, still retryable but reports no total_cost_usd -- a real
+# revoked-token failure that never got billed) is not: a sum across
+# attempts is only honest when every attempt priced, so cost_usd and
+# total_cost_usd must both come out null, not the $0.03 a walk that silently
+# skips the unpriced attempt would report.
+prep_stub $'auth401-cost\nauth401\ncommit'
+if rd_retry3u="$(run_stubbed --harness claude --model haiku \
+    --branch "sandbox-test-retry-impl-cost-unknown-$$")"; then
+    tmpdirs+=("$rd_retry3u")
+    check "an unpriced archived attempt makes cost_usd null, not a partial sum" \
+        "null" "$(jq -r '.cost_usd' "$rd_retry3u/summary.json" 2>/dev/null)"
+    check "an unpriced archived attempt makes total_cost_usd null too" \
+        "null" "$(jq -r '.total_cost_usd' "$rd_retry3u/summary.json" 2>/dev/null)"
+else
+    no "an unpriced archived attempt makes cost_usd null, not a partial sum" \
         "launch failed"
 fi
 
