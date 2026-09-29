@@ -428,10 +428,8 @@ fi
 # second --session-id would just conflict with claude's own flag parsing
 # (claude refuses --session-id alongside --continue/--resume unless
 # --fork-session is also given) -- so this only generates one when the
-# caller gave none of those. /proc/sys/kernel/random/uuid is preferred over uuidgen because
-# it needs no extra package on a bare Linux host (this script is Linux-only
-# already, via tmux and /var/tmp/claude-scratch); uuidgen is the fallback
-# for a host where that pseudo-file is missing.
+# caller gave none of those. /proc/sys/kernel/random/uuid needs no extra
+# package; uuidgen is the fallback where that pseudo-file is missing.
 child_session_id=""
 generate_session_id=false
 if [[ "$harness" == "claude" ]] && ! $sandboxed; then
