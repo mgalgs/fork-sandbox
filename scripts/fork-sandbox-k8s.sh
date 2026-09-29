@@ -1180,6 +1180,31 @@ reject_nginx_unsafe_chars() {
     return 0
 }
 
+# Builds the per-run Claude token Secret manifest -- name and namespace as
+# arguments, the real access token on STDIN ONLY, never argv, so it never
+# appears in `ps` or a log line. Prints a Secret manifest (JSON, which
+# `kubectl apply -f -` accepts same as YAML) with the token base64-encoded,
+# already in the `set $upstream_key "...";` shape 31-claude-proxy.yaml's
+# nginx.conf includes, to stdout.
+#
+# The ONE place that ever turns the real token into this Secret's content --
+# shared by cmd_submit's initial create below and k8s_push_claude_key's
+# later replacement (see cmd_wait's keeper), so the two can never render
+# this object differently. `-R -s` (raw, slurp) reads the whole of stdin as
+# one JSON string with no interpretation, so the token itself never has to
+# survive being valid JSON or YAML on its own.
+k8s_render_claude_token_secret_manifest() {
+    local name="$1" namespace="$2"
+    jq -R -s --arg name "$name" --arg ns "$namespace" '
+        {
+            apiVersion: "v1",
+            kind: "Secret",
+            metadata: { name: $name, namespace: $ns },
+            type: "Opaque",
+            data: { "upstream-key.conf": ("set $upstream_key \"" + . + "\";\n" | @base64) }
+        }'
+}
+
 # Indents a file's content for embedding under a YAML block scalar (`key:
 # |`), 4 spaces to match this script's ConfigMap templates. Blank lines are
 # left empty rather than padded, so a generated ConfigMap has no trailing
@@ -5839,12 +5864,12 @@ EOF
         # before any cluster object for this run exists, so that every
         # check above (executable checks, ConfigMap key rendering, YAML
         # substitution) has already run and cannot abort submit with a
-        # bare token Secret left behind. Created the same way cmd_install
-        # creates fork-sandbox-upstream-key -- kubectl create secret
-        # generic --dry-run=client -o yaml | kubectl apply -f -, so the
-        # token never appears on any argv beyond that one --from-literal --
-        # then labeled in a SEPARATE command, since `kubectl create secret`
-        # has no --overwrite of its own and this keeps the token off that
+        # bare token Secret left behind. Built by
+        # k8s_render_claude_token_secret_manifest, the same manifest builder
+        # k8s_push_claude_key's later replacement uses (see cmd_wait's
+        # keeper) -- token on STDIN ONLY, never argv, then applied --
+        # then labeled in a SEPARATE command, since the manifest above
+        # carries no labels of its own and this keeps the token off that
         # second command's argv too. Install the trap BEFORE the create
         # command, so a failure in that command or its pipeline still cleans
         # up. The trap covers the gap between
@@ -5861,9 +5886,9 @@ EOF
                 -l fork-sandbox/branch="$K8S_SUBMIT_SAFE_NAME" --ignore-not-found >&2
             echo "fork-sandbox-k8s: submit failed -- removed this run'"'"'s cluster objects, if any were created (branch $K8S_SUBMIT_BRANCH)." >&2
         ' EXIT
-        kubectl create secret generic "$safe_name-claude-token" \
-            --from-literal="upstream-key.conf=set \$upstream_key \"$claude_access_token\";" \
-            --dry-run=client -o yaml | kubectl apply -f -
+        printf '%s' "$claude_access_token" \
+            | k8s_render_claude_token_secret_manifest "$safe_name-claude-token" "$K8S_NAMESPACE" \
+            | kubectl apply -f -
         # The attribution labels go on here too, not just fork-sandbox/branch:
         # this Secret is one of the run's objects, and the docs promise every
         # one of them carries the owner. kubectl label takes key=value;

@@ -4376,6 +4376,15 @@ else
         no "label failure makes submit fail and invokes by-name Secret cleanup" "$(cat "$label_stub_log")"
     fi
 fi
+# The real access token travels only on stdin (k8s_render_claude_token_
+# secret_manifest, piped to `kubectl apply -f -`) -- never on any argv this
+# stub recorded, through this whole real (non-dry-run) submit.
+if grep -qF "$claude_fixture_token" "$label_stub_log"; then
+    no "the real access token never appears in any kubectl argv at submit" \
+        "found the fixture token in $label_stub_log"
+else
+    ok "the real access token never appears in any kubectl argv at submit"
+fi
 rm -f /tmp/fs-k8s-test-label.out
 
 # Long branches with the same truncated prefix must still name distinct
