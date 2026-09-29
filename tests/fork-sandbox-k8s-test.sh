@@ -5780,15 +5780,15 @@ STUB
         else
             no "the captured $flag archive has no top-level '.' or './' member" "$tar_members"
         fi
-        local missing="" want
+        local missing_entries="" want
         for want in './notes.md' './sub/nested.txt' './.dotfile' \
                     './name with space.txt' './-dashname.txt'; do
-            grep -qxF "$want" <<< "$tar_members" || missing+="$want "
+            grep -qxF "$want" <<< "$tar_members" || missing_entries+="$want "
         done
-        if [[ -z "$missing" ]]; then
+        if [[ -z "$missing_entries" ]]; then
             ok "the captured $flag archive contains every fixture entry"
         else
-            no "the captured $flag archive contains every fixture entry" "missing: $missing"
+            no "the captured $flag archive contains every fixture entry" "missing: $missing_entries"
         fi
     else
         no "the captured $flag archive contains every fixture entry" "no archive captured at $exec_tar"
