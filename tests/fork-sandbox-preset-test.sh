@@ -2768,6 +2768,47 @@ else
     no "progress.json failing-leg launch produced a run dir"
 fi
 
+# A composed pipeline with a SECOND code step (code, review, code): the
+# first code leg fails, so $rc is non-zero before either later step's own
+# leg ever runs. Neither the review step nor the second code step gets to
+# run its own leg -- only the leg that actually failed may be "failed"; a
+# step an earlier failure prevented from running must read "skipped", not
+# "failed" (see the code-step branch's own cur_code_already_ran gate for
+# why this is not just $rc == 0).
+cat > "$real_presets/composed-2code.yaml" <<'EOF'
+agents:
+  coder:
+    harness: claude
+    model: sonnet
+  reviewer:
+    harness: claude
+    model: opus
+pipeline:
+  - action: code
+    agent: coder
+  - action: review
+    repeat: 1
+    agent: reviewer
+  - action: code
+    agent: coder
+EOF
+prep_stub 'fail'
+if rd_prog_2code_fail="$(run_stubbed_expect_fail --preset composed-2code \
+    --branch "sandbox-test-prog-2code-fail-$$")"; then
+    rd_prog_2code="${rd_prog_2code_fail%%$'\t'*}"
+    prog_2code_rc="${rd_prog_2code_fail##*$'\t'}"
+    tmpdirs+=("$rd_prog_2code")
+    check "a composed pipeline's first code leg fails: run exit code is non-zero" \
+        "1" "$prog_2code_rc"
+    check "a composed pipeline's first code leg fails: only that step is failed" \
+        "code/failed/1/1/null review/skipped/0/1/skipped code/skipped/0/1/skipped" \
+        "$(progress_steps "$rd_prog_2code")"
+    check "a composed pipeline's first code leg fails: run state is failed" \
+        "failed" "$(jq -r '.state' "$rd_prog_2code/progress.json")"
+else
+    no "progress.json composed-2code failing-first-leg launch produced a run dir"
+fi
+
 printf '\n== launcher_session_id and the by-session symlink ==\n'
 
 by_session_tmp="$(mktemp -d)"; tmpdirs+=("$by_session_tmp")

@@ -9110,7 +9110,32 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count && stop_requested != 1; cur
     # The first code pass is the historical implementation invocation.
     if [[ "$cur_kind" == code ]]; then
         cur_pass=1
-        if (( cur_step_no == cur_first_code && cur_first_code_ran )); then cur_pass=2; fi
+        cur_code_already_ran=0
+        if (( cur_step_no == cur_first_code && cur_first_code_ran )); then
+            cur_pass=2
+            cur_code_already_ran=1
+        fi
+        # Only the step whose own pass 1 already ran (above, outside this
+        # walker) owns whatever $rc/stop_requested it finds here -- that is
+        # ITS OWN pass 1 result. Every other code step is seeing $rc/
+        # stop_requested left behind by an EARLIER step or leg; if either
+        # is already set, this step's own leg never gets to run, so it is
+        # "skipped", not "failed" -- failed is reserved for the leg that
+        # actually ran and lost.
+        if [[ "$cur_code_already_ran" == 0 ]]; then
+            if [[ "${stop_requested:-0}" == 1 ]]; then
+                progress_state[cur_step_no]="skipped"
+                progress_ended[cur_step_no]="stop-requested"
+                progress_write running
+                continue
+            fi
+            if [[ "$rc" != "0" ]]; then
+                progress_state[cur_step_no]="skipped"
+                progress_ended[cur_step_no]="skipped"
+                progress_write running
+                continue
+            fi
+        fi
         # Already "running" (from pass 1, above) for the first code step;
         # for any other code step this is where it becomes the active one.
         # progress_i starts at the passes already run outside this loop
@@ -9124,7 +9149,14 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count && stop_requested != 1; cur
             progress_i[cur_step_no]="$cur_pass"
             progress_write running
         done
-        if [[ "$rc" == "0" ]]; then
+        # stop_requested outranks $rc here the same way it does in the
+        # final sweep below: a leg killed by a TERM-driven stop usually
+        # exits nonzero too, and that nonzero is the stop, not a genuine
+        # failure of this step's own leg.
+        if [[ "${stop_requested:-0}" == 1 ]]; then
+            progress_state[cur_step_no]="skipped"
+            progress_ended[cur_step_no]="stop-requested"
+        elif [[ "$rc" == "0" ]]; then
             progress_state[cur_step_no]="done"
         else
             progress_state[cur_step_no]="failed"
@@ -9433,8 +9465,13 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count && stop_requested != 1; cur
                                   awk '/^## Report$/ { exit } { print }' "$cur_copy"; \
                                   fs_refresh_emit_addenda "$run_dir"; } > "$cur_fix_prompt.part"
                                 mv -f "$cur_fix_prompt.part" "$cur_fix_prompt"
+                                # Leg-start/leg-end transitions for this fix pass --
+                                # a repeated or long-running fix leg must not leave
+                                # $updated stuck at the preceding review leg's write.
+                                progress_write running
                                 run_leg "$cur_fix_kind" "$cur_fix_leg" "$cur_fix_prompt"
                                 cur_fix_exit="$leg_rc"
+                                progress_write running
                                 if [[ -n "$leg_cost" ]]; then
                                     [[ "$cur_fix_cost" != null ]] && cur_fix_cost="$(jq -n --argjson a "$cur_fix_cost" --argjson b "$leg_cost" '$a + $b')" || cur_fix_cost="$leg_cost"
                                 else cur_fix_known=0; fi
@@ -9482,7 +9519,11 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count && stop_requested != 1; cur
                         { cat -- "${!cur_fix_header_var}"; printf '\n---\n\n'; \
                           awk '/^## Report$/ { exit } { print }' "$cur_copy"; \
                           fs_refresh_emit_addenda "$run_dir"; } > "$cur_fix_prompt"
+                        # Leg-start/leg-end transitions for this fix pass, same
+                        # reason as the legacy fix block above.
+                        progress_write running
                         run_leg fix "$cur_fix_leg" "$cur_fix_prompt" "$cur_step_idx"; cur_fix_exit="$leg_rc"
+                        progress_write running
                         if [[ -n "$leg_cost" ]]; then
                             [[ "$cur_fix_cost" != null ]] && cur_fix_cost="$(jq -n --argjson a "$cur_fix_cost" --argjson b "$leg_cost" '$a + $b')" || cur_fix_cost="$leg_cost"
                         else cur_fix_known=0; fi
