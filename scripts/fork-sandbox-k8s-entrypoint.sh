@@ -986,8 +986,17 @@ else
     # one) because the pod's own cwd-derived slug may not be the slug the
     # transcript was written under on a PRIOR pod -- see the flatten step
     # right after.
+    # The CLI grants a model its native 1M window only when
+    # ANTHROPIC_BASE_URL is unset or api.anthropic.com; behind the seat's
+    # proxy it falls back to 200k. The [1m] alias restores 1M. Only the
+    # CLI's own [1m] aliases get it: on any other id it would claim a window
+    # the model may not have.
+    claude_model="$MODEL"
+    case "$claude_model" in
+        opus|sonnet|fable) claude_model+="[1m]" ;;
+    esac
     claude_argv=(claude --dangerously-skip-permissions --print --verbose
-        --output-format stream-json --model "$MODEL"
+        --output-format stream-json --model "$claude_model"
         --settings "$work_dir/inbox-settings.json" --include-hook-events)
     if [[ "$SESSION_HARNESS_STORE" == 1 ]]; then
         echo "fork-sandbox-k8s-entrypoint: seeding the claude session store" >&2

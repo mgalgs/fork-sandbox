@@ -10204,7 +10204,7 @@ claude_launch_checks=(
     'TERM=dumb'
     'env "${leg_env[@]}" "${claude_argv[@]}"'
     'claude --dangerously-skip-permissions --print --verbose'
-    '--output-format stream-json --model "$MODEL"'
+    '--output-format stream-json --model "$claude_model"'
     '--settings "$work_dir/inbox-settings.json" --include-hook-events'
     '< "${1:-$mounts_dir/handoff.md}"'
     '> "${2:-$work_dir/events.jsonl}"'
@@ -10221,6 +10221,22 @@ if [[ -z "$claude_launch_missing" ]]; then
 else
     no "entrypoint's claude launch line carries every required flag/env/redirect" \
         "$claude_launch_missing"
+fi
+
+# Behind the seat's proxy the CLI falls back to a 200k window unless the
+# model is a [1m] alias. Run the entrypoint's own mapping block: the bare
+# aliases gain the suffix, and every other id passes through unchanged.
+claude_1m_block="$(sed -n '/^    claude_model="\$MODEL"$/,/^    esac$/p' "$entrypoint_sh")"
+claude_1m_got=""
+for m in opus sonnet fable haiku claude-opus-5-5 'opus[1m]' Qwen/Qwen3-8B; do
+    claude_1m_got+="$(MODEL="$m" bash -c "$claude_1m_block"$'\nprintf %s "$claude_model"') "
+done
+claude_1m_want="opus[1m] sonnet[1m] fable[1m] haiku claude-opus-5-5 opus[1m] Qwen/Qwen3-8B "
+if [[ -n "$claude_1m_block" && "$claude_1m_got" == "$claude_1m_want" ]]; then
+    ok "entrypoint maps the bare opus/sonnet/fable aliases to [1m] and nothing else"
+else
+    no "entrypoint maps the bare opus/sonnet/fable aliases to [1m] and nothing else" \
+        "got: '$claude_1m_got' want: '$claude_1m_want' block: ${claude_1m_block:-<none>}"
 fi
 
 printf '\n== entrypoint: claude coding leg keeps its conversation (R3a section 4) ==\n'
