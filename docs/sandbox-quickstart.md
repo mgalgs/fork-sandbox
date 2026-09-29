@@ -55,7 +55,12 @@ the `fork-sandbox` skill does everything below. By hand:
    ```
 
    It prints the run directory and the exact watch commands. The run lives in
-   a detached tmux session; you never have to attach.
+   a detached tmux session; you never have to attach. On Linux, where
+   `systemd-run --user --scope` is usable, the run also gets its own
+   transient scope so a runaway tool inside it (say, a linter that eats all
+   the RAM) can be OOM-killed without taking the whole run down with it --
+   see `limits.env` in [docs/configure.md](configure.md) to also cap the
+   run's total memory.
 
 3. Watch, if you want:
 

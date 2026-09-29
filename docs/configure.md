@@ -11,15 +11,16 @@ anything:
 | `claude.env` | `CLAUDE_CREDENTIALS` — a path to read instead of `$HOME/.claude/.credentials.json` for every `--harness claude` leg on this machine, e.g. to point sandbox agents at a separate team-plan account. Missing file or key means today's default (that file, falling back to the login Keychain on macOS). Beaten by `fork-sandbox.sh`'s own `--claude-credentials <path>` for one launch (which also works, and is forwarded, on the `--k8s` path); `fork-sandbox-k8s.sh`'s own direct entry point reads this same key the same way. `CLAUDE_CREDENTIAL_POOL` + `CLAUDE_HEADROOM_HOOK` are an alternative to a single `CLAUDE_CREDENTIALS` pin — an operator-configured pool balanced by a headroom hook plugin; see [docs/credential-balancing.md](credential-balancing.md) for the pool/hook contract and precedence. `fork-sandbox-discover-claude` only reports whether a credential is ready (see below) — none of these three keys are on the allowlist a discoverer can target, so `configure` does not write this file |
 | `kit.env` | `AGENT_KIT_SKILLS`: extra skills for the agent kit, names separated by spaces and/or commas, each a directory under `$HOME/.claude/skills`. Every run on this machine binds them read-only into every seat, beside the review kit. `fork-sandbox.sh --kit-skill <name>` adds more for one launch. A missing file or key means an empty kit. `configure` does not write this file |
 | `coder-mode.env` | `CODER_MODE_*` — the `sandbox-coder-mode` skill's launch defaults: a composition spelled key-per-flag (`CODER_MODE_HARNESS`, `CODER_MODE_MODEL`, `CODER_MODE_NETWORK`, the `REVIEW` and `MAINTAINER` sets), or `CODER_MODE_PRESET` naming one preset in place of all of them. The skill owns the key list; these are read by the orchestrating session, not by any script, and `configure` does not write the file |
+| `limits.env` | `RUN_MEMORY_MAX`: caps the local runner's own process tree memory, a systemd size — digits with an optional `K`/`M`/`G`/`T` suffix, or a percentage from 1 to 100 like `60%` (e.g. `RUN_MEMORY_MAX=8G`). Anything else is refused at launch, naming the file and the key. Covers only the `bwrap` backend's process tree — under `FORK_SANDBOX_BACKEND=container` the agent and its tools run in docker's own cgroups, which this cap never reaches. `RUN_SCOPE=off` disables the per-run systemd scope entirely (see [below](#the-per-run-systemd-scope)) even where one is otherwise available; any other value for the key is refused at launch, the same way. A missing file or key means no cap and the scope left on. `configure` does not write this file |
 
 Assembling that by hand means copying key names out of docs and typing a
 `chmod 600`. `configure` does it instead: it discovers what is already on
 this machine — an `OPENROUTER_API_KEY` in your environment, a local model
 endpoint, a kubectl context — shows you what it found, and writes the
 pieces you pick into the files above, **except `coder-mode.env`,
-`claude.env` and `kit.env`** -- none has a target on the allowlist a
-discoverer can write to, so `configure` never installs anything into them;
-see the rows above.
+`claude.env`, `kit.env` and `limits.env`** -- none has a target on the
+allowlist a discoverer can write to, so `configure` never installs anything
+into them; see the rows above.
 
 ```
 fork-sandbox.sh configure [--remove] [--all] [--dry-run]
@@ -83,6 +84,26 @@ without a terminal.
 written or removed — the target and the same masked rendering the picker
 showed — and touches no file. A secret's real value is never printed by
 `--dry-run` any more than it is printed anywhere else.
+
+## The per-run systemd scope
+
+Every local run launches inside its own transient `systemd-run --user
+--scope` unit, with `OOMPolicy=continue`, whenever that is usable on the
+host — so a tool inside the sandbox that gets OOM-killed (a huge
+`shellcheck` run, say) takes down only itself, not the runner. This is
+always on, with no key to opt in: `limits.env`'s `RUN_MEMORY_MAX` and
+`RUN_SCOPE=off` (see the table above) only adjust it.
+
+Where `systemd-run` is missing, there is no reachable `--user` manager
+(macOS, most containers, a bare box), or the manager refuses the requested
+`RUN_MEMORY_MAX` (no memory controller delegated to it), the run launches
+exactly as it did
+before this existed — silently, unless `RUN_MEMORY_MAX` was set, in which
+case one warning goes to stderr that the cap was not applied.
+
+Each run records what happened to it: `scope=<unit>` (or `scope=none`) and,
+when set, `memory_max=<value>` in the run's `run.env`, and a matching line
+in its `sandbox.log`.
 
 ## Adding a discoverer
 

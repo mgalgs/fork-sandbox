@@ -218,6 +218,29 @@ Two properties fell out of the design and are worth stating:
   variable would read empty at exactly the moment an error message wanted it.
   `fs_claude_credential_source` answers that question separately.
 
+## The per-run systemd scope is Linux-only, and fails open
+
+Every local run tries to launch inside its own transient `systemd-run
+--user --scope`, so a tool that runs away with memory inside it can be
+OOM-killed without the default `OOMPolicy=stop` on tmux's own scope
+stopping the whole run along with it (see `limits.env` in
+[docs/configure.md](configure.md)). Unlike every gap above, this one is
+not something a Mac needs to settle: macOS has no `systemd --user` at all,
+so the launcher's own cheap probe (`command -v systemd-run`, then a real
+`systemd-run --user --scope` call) answers "unavailable" and it launches
+exactly as it always has — silently, unless `RUN_MEMORY_MAX` was set
+explicitly, in which case it says once that the cap was not applied. The
+same fallback covers any Linux box without a reachable user manager (most
+containers, a bare init system).
+
+The scope also only ever covers the runner's own process tree, whether or
+not it is available. Under `FORK_SANDBOX_BACKEND=container` the agent and
+its tools run inside docker-owned containers (and, in a docker-compose
+run, docker-owned services), in cgroups the docker daemon owns, not this
+scope. Neither `OOMPolicy=continue` nor `RUN_MEMORY_MAX` reaches them, on
+Linux or macOS alike, and nothing currently warns when `RUN_MEMORY_MAX` is
+set on a container-backend host.
+
 ## The image
 
 [images/sandbox/Dockerfile](../images/sandbox/Dockerfile), built by
