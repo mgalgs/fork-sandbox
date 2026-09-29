@@ -12,6 +12,18 @@
 # currently set, to take keys back out. See docs/configure.md for the full
 # picture, including how to add a new discoverer.
 #
+# A local run launches inside its own transient systemd scope when
+# `systemd-run --user --scope` is usable on this host, with OOMPolicy=continue
+# -- so a tool inside the sandbox that gets OOM-killed takes down only
+# itself, not the runner. `limits.env`'s RUN_MEMORY_MAX (a systemd size, e.g.
+# 8G or 60%) additionally caps the whole run's memory; RUN_SCOPE=off disables
+# the scope outright. Falls back to today's plain launch, silently, wherever
+# systemd-run or a user manager is missing (macOS, most containers). See
+# docs/configure.md. The scope only ever covers this process tree -- under
+# FORK_SANDBOX_BACKEND=container the agent and its tools run in a docker
+# daemon's own cgroups, which neither OOMPolicy=continue nor MemoryMax
+# reaches.
+#
 # --branch <name>:       branch the session commits on. Defaults to a
 #                        timestamped name.
 # --checkout <ref>:      start the branch at <ref> instead of the repo's HEAD.
@@ -3954,6 +3966,57 @@ if [[ -n "$clone_dir_flag" ]]; then
     clone_dir_flag="$(fs_validate_scratch_dir "$clone_dir_flag" --clone-dir)" || exit 1
 fi
 
+# limits.env's RUN_MEMORY_MAX, validated the same way and for the same
+# "before --dry-run's exit, before anything is created" reason as
+# --session-state and --clone-dir just above: a typo here used to only
+# surface deep in the launch, after mktemp -d and the workspace clone had
+# already run, leaving debris no stop/status tooling knew about. Systemd's
+# own size syntax only: digits with an optional K/M/G/T suffix, or a 1-100
+# percentage -- 0 and 0% are refused too, since a zero cap would OOM-kill
+# the runner the instant it starts, and an absolute value is bounded to 15
+# digits so a value systemd's own (64-bit) size parser would reject cannot
+# sail through this check and reach a live -p MemoryMax=... property later.
+# The scope-availability probe and the property itself are built later,
+# near session_name below, once run_dir exists -- this only validates the
+# string, using the already-set $config_dir.
+limits_env="$config_dir/limits.env"
+run_memory_max=""
+if run_memory_max="$(fs_read_env_value "$limits_env" RUN_MEMORY_MAX)"; then
+    run_memory_max_invalid=1
+    if [[ "$run_memory_max" =~ ^([0-9]+)%$ ]]; then
+        pct="${BASH_REMATCH[1]}"
+        if (( ${#pct} <= 3 )) && (( 10#$pct >= 1 && 10#$pct <= 100 )); then
+            run_memory_max_invalid=0
+        fi
+    elif [[ "$run_memory_max" =~ ^([0-9]+)([KMGT])?$ ]]; then
+        digits="${BASH_REMATCH[1]}"
+        if [[ ! "$digits" =~ ^0+$ ]] && (( ${#digits} <= 15 )); then
+            run_memory_max_invalid=0
+        fi
+    fi
+    if (( run_memory_max_invalid )); then
+        echo "Error: $limits_env sets RUN_MEMORY_MAX='$run_memory_max', which is" >&2
+        echo "not a systemd size -- digits with an optional K/M/G/T suffix, or a" >&2
+        echo "percentage from 1 to 100, e.g. 8G or 60%." >&2
+        exit 1
+    fi
+fi
+
+# limits.env's RUN_SCOPE, validated the same way and for the same reason as
+# RUN_MEMORY_MAX just above: the only recognized value is the exact string
+# "off" (disables the per-run systemd scope). Unlike RUN_MEMORY_MAX, a typo
+# here (RUN_SCOPE=OFF, =0, =false) would silently leave the scope ON with no
+# error -- exactly the host where the operator reached for this knob because
+# the scope misbehaves. Refusing anything else at launch catches that.
+run_scope_flag=""
+if run_scope_flag="$(fs_read_env_value "$limits_env" RUN_SCOPE)" \
+        && [[ "$run_scope_flag" != "off" ]]; then
+    echo "Error: $limits_env sets RUN_SCOPE='$run_scope_flag', which is not" >&2
+    echo "recognized -- the only supported value is 'off' (to disable the" >&2
+    echo "per-run systemd scope). Leave the key unset to keep the scope on." >&2
+    exit 1
+fi
+
 if [[ "$dry_run" == true ]]; then
     if [[ -n "$pipeline_spec" ]]; then
         printf 'pipeline=%s\n' "$pipeline_spec"
@@ -7181,6 +7244,107 @@ if tmux has-session -t "=$session_name" 2>/dev/null; then
     session_name="$session_name-${run_dir##*.}"
 fi
 
+# The runner normally lives in the `tmux-spawn-*.scope` unit tmux's own
+# session creates, whose default OOMPolicy=stop means a single runaway tool
+# OOM-killed inside the sandbox (e.g. shellcheck on a huge file) stops that
+# WHOLE scope -- the runner, its harness, everything -- with no terminal
+# event. Wrapping the runner in its OWN transient scope, with
+# OOMPolicy=continue, contains that: systemd kills only the offending
+# process and the scope (and the runner in it) lives on. `systemd-run
+# --scope` registers the CALLING process into the new scope's cgroup and
+# then execs the target in place, so this changes no pid, pgid or process
+# tree shape that fork-sandbox-stop.sh or the status tooling look at -- see
+# their own comments on pid/pgid.
+#
+# Probed once, here, cheaply: missing systemd-run, or no reachable --user
+# manager (macOS, most containers, a bare box), answers "unavailable" rather
+# than erroring the launch. Stubbing systemd-run on PATH is how tests drive
+# both branches; there is no separate override knob to keep track of.
+#
+# $run_scope_flag itself was already read and validated well above, beside
+# --session-state and --clone-dir (before --dry-run's own exit) -- only ""
+# or "off" can reach here.
+run_scope_reason=""
+run_scope_available=0
+run_scope_unit=""
+run_scope_cmd=()
+run_scope_pane_env=()
+# The probe carries every property the real call will, so a MemoryMax the
+# user manager cannot apply (no memory controller delegated to it) falls
+# back here instead of failing inside the pane, where nothing would notice.
+run_scope_props=(-p OOMPolicy=continue)
+if [[ -n "$run_memory_max" ]]; then
+    run_scope_props+=(-p "MemoryMax=$run_memory_max" -p MemorySwapMax=0)
+fi
+if [[ "$run_scope_flag" == "off" ]]; then
+    run_scope_reason="RUN_SCOPE=off in $limits_env"
+elif ! command -v systemd-run >/dev/null 2>&1; then
+    run_scope_reason="no systemd-run on PATH"
+elif ! systemd-run --user --scope --quiet "${run_scope_props[@]}" true \
+        >/dev/null 2>&1; then
+    run_scope_reason="no usable 'systemd-run --user --scope ${run_scope_props[*]}' on this host"
+else
+    run_scope_available=1
+fi
+
+# RUN_MEMORY_MAX itself was already read and syntax-checked well above,
+# beside --session-state and --clone-dir (before --dry-run's own exit and
+# before run_dir exists) -- $run_memory_max here is that already-validated
+# value, opt-in and independent of scope availability, so a typo is refused
+# at launch even on a host where it would otherwise be silently ignored.
+
+if (( run_scope_available )); then
+    # Deterministic from the run dir's own mktemp suffix, so it is both
+    # stable for this run and effectively unique across runs -- a relaunch
+    # never collides with a unit a previous run left registered. --collect
+    # is a second layer on top of that: it drops the unit's bookkeeping the
+    # moment it exits, successful or not, so even a same-named leftover
+    # can never block a new registration.
+    run_scope_unit="fork-sandbox-run-$(printf '%s' "${run_dir##*/}" \
+        | tr -c 'A-Za-z0-9_-' '-')"
+    run_scope_cmd=(systemd-run --user --scope --quiet --collect \
+        "--unit=$run_scope_unit" "${run_scope_props[@]}" --)
+    # The probe above ran in THIS process's environment, but a detached run
+    # executes as a tmux pane's command instead, and a pane does not inherit
+    # the client's environment -- only the tmux server's own, fixed at
+    # whenever the server itself started. A server that has been running
+    # since before this login (or one started by cron, su, or ssh without
+    # pam_systemd) can predate XDG_RUNTIME_DIR/DBUS_SESSION_BUS_ADDRESS
+    # entirely, so the probe passing here says nothing about what the pane's
+    # own systemd-run will see. Pass both through explicitly by prefixing the
+    # pane's own command with `env` -- NOT tmux new-session's `-e`, which
+    # does the same thing but only exists from tmux 3.2 on (see upstream
+    # tmux's CHANGES, "CHANGES FROM 3.1c TO 3.2"); RHEL/Rocky/Alma 8 (2.7),
+    # Debian 11 (3.1c) and Ubuntu 20.04 (3.0a) all predate it, and `-e` on
+    # those just fails the whole launch. `env` on the pane's own command
+    # line works on any tmux. --foreground needs no such thing since exec
+    # below runs in this process's environment directly.
+    run_scope_pane_env=()
+    [[ -z "${XDG_RUNTIME_DIR:-}" ]] \
+        || run_scope_pane_env+=("XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR")
+    [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]] \
+        || run_scope_pane_env+=("DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS")
+elif [[ -n "$run_memory_max" ]]; then
+    echo "Warning: $limits_env sets RUN_MEMORY_MAX=$run_memory_max, but this run" >&2
+    echo "has no systemd scope ($run_scope_reason) -- launching without it. The" >&2
+    echo "memory cap was NOT applied." >&2
+fi
+
+# The one-line record of the above, written into sandbox.log by the runner
+# itself (see brief_warning's own identical relay just below the RUNNER
+# heredoc's sandbox.log truncation) and, more durably, into run.env's own
+# scope=/memory_max= fields alongside session= below.
+run_scope_note=""
+if (( run_scope_available )); then
+    run_scope_note="fork-sandbox: running inside systemd scope $run_scope_unit (OOMPolicy=continue"
+    if [[ -n "$run_memory_max" ]]; then
+        run_scope_note+=", MemoryMax=$run_memory_max, MemorySwapMax=0"
+    fi
+    run_scope_note+=")"
+else
+    run_scope_note="fork-sandbox: no systemd scope for this run ($run_scope_reason)"
+fi
+
 user_shell="${SHELL:-/bin/bash}"
 # In the foreground the runner holds this terminal, so an interactive shell at
 # the end would never hand it back.
@@ -7241,6 +7405,14 @@ launcher_session_id="${CLAUDE_CODE_SESSION_ID:-}"
     printf 'review_harness=%s\n' "$review_harness"
     printf 'review_network=%s\n' "$review_network"
     printf 'session=%s\n' "$session_name"
+    # What the launch-time OOM-resilience decision above came to -- see the
+    # scope block near session_name's own assignment for the full story.
+    if (( run_scope_available )); then
+        printf 'scope=%s\n' "$run_scope_unit"
+        [[ -z "$run_memory_max" ]] || printf 'memory_max=%s\n' "$run_memory_max"
+    else
+        printf 'scope=none\n'
+    fi
     printf 'review_loop_cap=%s\n' "$review_loop_cap"
     # The maintainer tier's record of itself: printed only when the loop is
     # on, so a no-maintainer run.env is what it has always been.
@@ -7526,6 +7698,7 @@ launcher_session_id="${CLAUDE_CODE_SESSION_ID:-}"
     printf 'continuation_prompt_header=%q\n' "$continuation_prompt_header"
     printf 'handoff_original=%q\n' "$handoff_original"
     printf 'brief_warning=%q\n' "$brief_warning"
+    printf 'run_scope_note=%q\n' "$run_scope_note"
     printf 'user_shell=%q\n' "$user_shell"
     printf 'keep_open=%q\n' "$keep_open"
     printf 'services_enabled=%q\n' "$services_enabled"
@@ -7894,6 +8067,9 @@ rm -f "$run_dir/exit-code"
 : > "$sandbox_log"
 if [[ -n "$brief_warning" ]]; then
     printf '%s\n' "$brief_warning" >> "$sandbox_log"
+fi
+if [[ -n "$run_scope_note" ]]; then
+    printf '%s\n' "$run_scope_note" >> "$sandbox_log"
 fi
 
 # progress.json: a live, one-glyph-per-step status file a status line (or
@@ -10670,13 +10846,27 @@ if [[ -n "$clone_lock_fd" ]]; then
     { exec {clone_lock_fd}>&-; } 2>/dev/null || true
 fi
 
+# run_scope_cmd is empty (no wrapping) when the scope isn't available -- see
+# its own assignment near session_name above. Either way this is what tmux
+# spawns as the pane's command, and what --foreground execs into directly.
+runner_argv=("${run_scope_cmd[@]}" "$run_dir/run.sh")
+
 where="here, in the foreground"
 if ! $foreground; then
+    # run_scope_pane_env (see its own assignment near session_name above) is
+    # applied here, to the pane's own command line via `env`, rather than to
+    # `tmux new-session` via `-e` -- `-e` needs tmux 3.2+, and this launch
+    # must keep working on the older tmux still shipped by several current
+    # distros.
+    pane_argv=("${runner_argv[@]}")
+    if (( ${#run_scope_pane_env[@]} > 0 )); then
+        pane_argv=(env "${run_scope_pane_env[@]}" "${runner_argv[@]}")
+    fi
     # -d leaves it detached, so this never takes the caller's focus and never
     # adds a window to the caller's session. It also works outside tmux: with
     # no server running, tmux starts one.
     if ! tmux new-session -d -s "$session_name" -n "$session_name" \
-        -c "$origin_repo" "$run_dir/run.sh"; then
+        -c "$origin_repo" "${pane_argv[@]}"; then
         echo "Error: tmux could not start a session. Run it here with" >&2
         echo "--foreground, or start the generated runner yourself:" >&2
         echo "$run_dir/run.sh" >&2
@@ -10812,7 +11002,7 @@ Review the branch before you build it.
 EOF
 
 if $foreground; then
-    exec "$run_dir/run.sh"
+    exec "${runner_argv[@]}"
 fi
 
 if $wait_requested; then
