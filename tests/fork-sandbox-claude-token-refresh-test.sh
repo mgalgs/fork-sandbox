@@ -152,7 +152,10 @@ if [[ -n "${STUB_MODE:-}" ]]; then
         blank) blank ;;
         failexit) exit 1 ;;
         noop) : ;;
-        sleep) sleep "${STUB_SLEEP_SECS:-20}" ;;
+        sleep)
+            sleep "${STUB_SLEEP_SECS:-20}"
+            [[ -n "${STUB_SLEEP_THEN_SUCCEED:-}" ]] && succeed
+            ;;
     esac
     exit 0
 fi
@@ -344,7 +347,7 @@ mktemp_fail_dir="$(dirname "$mktemp_fail_cred")"
 mktemp_fail_out="$(
     set -e
     PATH="$mktemp_fail_bin:$PATH" \
-        STUB_MODE=success fs_claude_refresh_if_needed "$mktemp_fail_cred" "$stub"
+        STUB_MODE=success fs_claude_refresh_if_needed "$mktemp_fail_cred" "$stub" 2>&1
 )"
 mktemp_fail_rc=$?
 if [[ "$mktemp_fail_rc" == 0 ]]; then
@@ -371,11 +374,31 @@ else
     no "a failing second mktemp leaves no legacy <dir>.lock behind" "lock still exists"
     rmdir "$mktemp_fail_legacy_lock" 2>/dev/null || true
 fi
+# The stub did refresh, so the scratch dir holds the only live refresh token:
+# it must be kept, and the warning must say where it is.
 after_scratch_count="$(count_refresh_scratch_dirs)"
-if [[ "$after_scratch_count" == "$before_scratch_count" ]]; then
-    ok "a failing second mktemp leaves no refresh scratch dir behind"
+kept_scratch="$(sed -n 's/.*The new credential is in \(.*\)\/\.credentials\.json;.*/\1/p' <<<"$mktemp_fail_out" | head -1)"
+if [[ "$after_scratch_count" == "$(( before_scratch_count + 1 ))" && -n "$kept_scratch" \
+    && "$(jq -r '.claudeAiOauth.accessToken' "$kept_scratch/.credentials.json" 2>/dev/null)" == stub-new-access-* ]]; then
+    ok "a refreshed token that cannot be merged is kept in its scratch dir, and the warning names it"
 else
-    no "a failing second mktemp leaves no refresh scratch dir behind" "scratch dir count went from $before_scratch_count to $after_scratch_count"
+    no "a refreshed token that cannot be merged is kept in its scratch dir, and the warning names it" "count $before_scratch_count -> $after_scratch_count; output: $mktemp_fail_out"
+fi
+[[ -n "$kept_scratch" && "$kept_scratch" == /var/tmp/claude-scratch/forks/claude-fork-token-refresh.* ]] \
+    && rm -rf -- "$kept_scratch"
+
+printf '\n== a refresh is merged even when the new token does not clear the threshold ==\n'
+# The stub issues an 8h token; a 10h threshold means it never clears it. The
+# refresh still rotated the single-use refresh token, so discarding it would
+# log the host out.
+high_cred="$work/high-threshold-credentials.json"
+write_cred "$high_cred" 30
+FS_CLAUDE_REFRESH_BEFORE_MIN=600 STUB_MODE=success fs_claude_refresh_if_needed "$high_cred" "$stub" 2>/dev/null
+high_rt="$(jq -r '.claudeAiOauth.refreshToken' "$high_cred" 2>/dev/null)"
+if [[ "$high_rt" == stub-new-refresh-* ]]; then
+    ok "a refresh below the threshold still lands in the real file"
+else
+    no "a refresh below the threshold still lands in the real file" "refreshToken is '$high_rt'"
 fi
 
 for mode in blank failexit; do
@@ -397,15 +420,14 @@ for mode in blank failexit; do
     fi
 done
 
-printf '\n== a SIGTERM mid-refresh kills the backgrounded claude child instead of orphaning it ==\n'
-# Regression test: fs_claude_refresh_if_needed used to run `claude mcp list`
-# synchronously inside `( ... ) || true`. A SIGTERM landing on the caller
-# while blocked there (exactly what claude-sandboxed's cleanup trap sends the
-# live-sync loop) killed the caller but left that grandchild running as an
-# orphan for up to 40s -- see _FS_CLAUDE_REFRESH_CHILD_PID's own comment in
-# fork-sandbox-lib.sh. Reproduce the loop's exact setup: a subshell installing
+printf '\n== a SIGTERM mid-refresh waits for the claude child and merges its result ==\n'
+# A SIGTERM landing on the caller while it waits on `claude mcp list`
+# (exactly what claude-sandboxed's cleanup trap sends the live-sync loop)
+# must neither orphan the child nor lose what it wrote: once claude has
+# refreshed, the scratch dir holds the only live, single-use refresh token.
+# Reproduce the loop's exact setup: a subshell installing
 # _fs_claude_refresh_emergency_cleanup as its own EXIT trap around the call,
-# then a SIGTERM sent while the stub is still sleeping.
+# then a SIGTERM sent while the stub is still sleeping, before it succeeds.
 sigterm_cred="$work/sigterm-credentials.json"
 write_cred "$sigterm_cred" 10
 sigterm_dir="$(dirname "$sigterm_cred")"
@@ -415,12 +437,20 @@ before_scratch="$(count_refresh_scratch_dirs)"
 
 (
     trap '_fs_claude_refresh_emergency_cleanup "$sigterm_lock1" "$sigterm_lock2"' EXIT
-    STUB_MODE=sleep STUB_SLEEP_SECS=20 fs_claude_refresh_if_needed "$sigterm_cred" "$stub"
+    STUB_MODE=sleep STUB_SLEEP_SECS=4 STUB_SLEEP_THEN_SUCCEED=1 \
+        fs_claude_refresh_if_needed "$sigterm_cred" "$stub"
 ) &
 sigterm_pid=$!
 sleep 2
 kill -TERM "$sigterm_pid" 2>/dev/null
 wait "$sigterm_pid" 2>/dev/null
+
+sigterm_at="$(jq -r '.claudeAiOauth.accessToken' "$sigterm_cred" 2>/dev/null)"
+if [[ "$sigterm_at" == stub-new-access-* ]]; then
+    ok "an interrupted refresh still merges the refreshed token into the real file"
+else
+    no "an interrupted refresh still merges the refreshed token into the real file" "accessToken is '$sigterm_at'"
+fi
 
 orphan=""
 for _ in 1 2 3 4 5; do

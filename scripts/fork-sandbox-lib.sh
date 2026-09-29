@@ -1897,15 +1897,18 @@ _FS_CLAUDE_REFRESH_SCRATCH=""
 
 # Holds the PID of the backgrounded `claude mcp list` call for exactly as
 # long as that process (up to 40s, via timeout) is running, so a signal that
-# arrives mid-refresh can still find and kill it before removing the locks
-# and scratch dir it depends on. Without this, a SIGTERM that lands on this
-# process while it is `wait`-ing here only kills the wait, not the
-# backgrounded child: the child becomes an orphan, keeps running against the
-# real host, and -- if it completes a real refresh -- rotates the host's
-# refresh token with nowhere left to merge the result, while the locks that
-# were meant to keep another refresher out are already gone. See
-# _fs_claude_refresh_emergency_cleanup below, which reads this.
+# arrives mid-refresh can still wait for it and merge its result before
+# removing the locks and scratch dir. A SIGTERM that lands while this process
+# is `wait`-ing interrupts only the wait; the child keeps running, and if it
+# completes a real refresh, its scratch dir holds the only live refresh
+# token. See _fs_claude_refresh_emergency_cleanup below, which reads this.
 _FS_CLAUDE_REFRESH_CHILD_PID=""
+
+# What _fs_claude_refresh_finish needs, set by _fs_claude_do_refresh before
+# it waits on the child, so the emergency cleanup can finish a refresh too.
+_FS_CLAUDE_REFRESH_CRED=""
+_FS_CLAUDE_REFRESH_OLD_TOKEN=""
+_FS_CLAUDE_REFRESH_MINS_LEFT=""
 
 # Set to a non-empty value for exactly as long as fs_claude_refresh_if_needed
 # actually holds the correspondingly-named lock directory, so
@@ -1928,7 +1931,7 @@ _FS_CLAUDE_REFRESH_LOCK2_HELD=""
 # never reach $STATE_DIR, the sandbox, argv or a log, and a failed or
 # unconvincing refresh must leave the real file byte-identical.
 _fs_claude_do_refresh() {
-    local cred_file="$1" claude_bin="$2" before_min="$3" mins_left="$4"
+    local cred_file="$1" claude_bin="$2" mins_left="$3"
     local dir scratch old_token
     dir="$(dirname -- "$cred_file")"
     scratch="$(mktemp -d /var/tmp/claude-scratch/forks/claude-fork-token-refresh.XXXXXX)"
@@ -1953,32 +1956,49 @@ _fs_claude_do_refresh() {
     # behind is checked.
     #
     # Backgrounded, with its PID recorded in _FS_CLAUDE_REFRESH_CHILD_PID,
-    # rather than run synchronously: a `wait` on a known PID can be
-    # interrupted (the wait returns; the child keeps running) exactly like
-    # any other blocking call, but unlike a bare synchronous command, a
-    # tracked PID is one _fs_claude_refresh_emergency_cleanup can still kill
-    # from outside if that happens -- see its own comment and the global
-    # above. `exec` inside the subshell replaces that subshell's own process
-    # with timeout's, so the PID recorded here IS timeout's PID: killing it
-    # delivers the signal straight to timeout, which forwards it to claude in
-    # turn, instead of orphaning both underneath a dead subshell.
+    # rather than run synchronously: a signal interrupts the `wait` but not
+    # the child, and a tracked PID is one _fs_claude_refresh_emergency_cleanup
+    # can wait on again and then merge -- see its own comment and the global
+    # above. `exec` makes the recorded PID timeout's own.
     touch "$dir/.oauth_refresh.lock" "$("$FS_REALPATH" -m "$dir").lock" 2>/dev/null || true
     ( cd "$scratch" && CLAUDE_CONFIG_DIR="$scratch" exec "$FS_TIMEOUT" 40 "$claude_bin" mcp list \
         </dev/null >/dev/null 2>&1 ) &
     _FS_CLAUDE_REFRESH_CHILD_PID=$!
+    _FS_CLAUDE_REFRESH_CRED="$cred_file"
+    _FS_CLAUDE_REFRESH_OLD_TOKEN="$old_token"
+    _FS_CLAUDE_REFRESH_MINS_LEFT="$mins_left"
     wait "$_FS_CLAUDE_REFRESH_CHILD_PID" 2>/dev/null || true
     _FS_CLAUDE_REFRESH_CHILD_PID=""
+    _fs_claude_refresh_finish
+}
 
-    local new_token new_refresh new_expires now_ms threshold_ms
+# Validates what the refresh left in the scratch dir and merges it into the
+# real credential file, then removes the scratch dir. Reads the
+# _FS_CLAUDE_REFRESH_* globals so _fs_claude_refresh_emergency_cleanup can run
+# it too. Idempotent: a second call merges the same tokens again, or finds
+# no scratch dir and does nothing.
+#
+# The refresh token is single-use. Once claude has refreshed, the real file's
+# refresh token is dead and the scratch dir holds the only live one, so a
+# refresh that worked must reach the real file whatever else happens. That is
+# why validation asks only "did claude refresh" (a new, unexpired token) and
+# never whether the token clears FS_CLAUDE_REFRESH_BEFORE_MIN.
+_fs_claude_refresh_finish() {
+    local scratch="$_FS_CLAUDE_REFRESH_SCRATCH" cred_file="$_FS_CLAUDE_REFRESH_CRED"
+    local old_token="$_FS_CLAUDE_REFRESH_OLD_TOKEN" mins_left="$_FS_CLAUDE_REFRESH_MINS_LEFT"
+    [[ -n "$scratch" && -d "$scratch" && -n "$cred_file" ]] || return 0
+    local dir
+    dir="$(dirname -- "$cred_file")"
+
+    local new_token new_refresh new_expires now_ms
     new_token="$(jq -r '.claudeAiOauth.accessToken // ""' "$scratch/.credentials.json" 2>/dev/null)" || new_token=""
     new_refresh="$(jq -r '.claudeAiOauth.refreshToken // ""' "$scratch/.credentials.json" 2>/dev/null)" || new_refresh=""
     new_expires="$(jq -r '.claudeAiOauth.expiresAt // 0' "$scratch/.credentials.json" 2>/dev/null)" || new_expires=0
     [[ "$new_expires" =~ ^[0-9]+$ ]] || new_expires=0
     now_ms=$(( $(date +%s) * 1000 ))
-    threshold_ms=$(( now_ms + before_min * 60000 ))
 
     if [[ -z "$new_token" || "$new_token" == "$old_token" || -z "$new_refresh" ]] \
-        || (( new_expires <= threshold_ms )); then
+        || (( new_expires <= now_ms + 60000 )); then
         echo "Warning: could not refresh the Claude access token on the host; log in with claude on the host if this persists." >&2
         rm -rf "$scratch"
         _FS_CLAUDE_REFRESH_SCRATCH=""
@@ -1989,19 +2009,15 @@ _fs_claude_do_refresh() {
     # every other top-level key survive. Written to a temp file in the same
     # directory (so the final `mv -f` is an atomic rename, not a cross-device
     # copy) at mode 600 before it ever lands on the real path.
+    # A merge that fails here leaves the scratch dir in place, mode 700: it
+    # holds the only live refresh token, and deleting it would log the host
+    # out.
     local tmp
-    tmp="$(mktemp "$dir/.credentials.json.XXXXXX")"
-    if [[ -z "$tmp" ]]; then
-        echo "Warning: could not refresh the Claude access token on the host; log in with claude on the host if this persists." >&2
-        rm -rf "$scratch"
-        _FS_CLAUDE_REFRESH_SCRATCH=""
-        return 0
-    fi
-    if ! jq --slurpfile new "$scratch/.credentials.json" \
+    tmp="$(mktemp "$dir/.credentials.json.XXXXXX")" || tmp=""
+    if [[ -z "$tmp" ]] || ! jq --slurpfile new "$scratch/.credentials.json" \
         '.claudeAiOauth = $new[0].claudeAiOauth' "$cred_file" > "$tmp"; then
-        echo "Warning: could not refresh the Claude access token on the host; log in with claude on the host if this persists." >&2
-        rm -f "$tmp"
-        rm -rf "$scratch"
+        [[ -n "$tmp" ]] && rm -f "$tmp"
+        echo "Warning: claude refreshed the host's Claude token but it could not be written to $cred_file. The new credential is in $scratch/.credentials.json; copy its claudeAiOauth into $cred_file, or log in with claude on the host." >&2
         _FS_CLAUDE_REFRESH_SCRATCH=""
         return 0
     fi
@@ -2017,16 +2033,13 @@ _fs_claude_do_refresh() {
 }
 
 # Emergency cleanup for a call to fs_claude_refresh_if_needed that a signal
-# interrupts before it reaches its own end-of-function rmdir calls: kills and
-# reaps the backgrounded `claude mcp list` child if one is still running (via
-# _FS_CLAUDE_REFRESH_CHILD_PID), removes _fs_claude_do_refresh's scratch dir
-# (via the global below, which tracks it for exactly as long as it exists)
-# and releases whichever of the two named lock dirs this process still
-# holds, per _FS_CLAUDE_REFRESH_LOCK{1,2}_HELD. The child is stopped and
-# waited on BEFORE the scratch dir and locks go: otherwise an orphaned
-# refresh keeps running against the real host with no locks left to keep
-# another refresher out, and -- if it completes -- rotates the host's
-# refresh token with the scratch dir already gone to merge it into.
+# interrupts before it reaches its own end-of-function rmdir calls: waits for
+# the backgrounded `claude mcp list` child if one is still running (via
+# _FS_CLAUDE_REFRESH_CHILD_PID), merges its result the way a normal return
+# would (_fs_claude_refresh_finish), removes the scratch dir, and releases
+# whichever of the two named lock dirs this process still holds, per
+# _FS_CLAUDE_REFRESH_LOCK{1,2}_HELD. The locks go last, so no other
+# refresher starts until the result is in the real file.
 # It is installed as a long-lived EXIT trap that fires on every exit of its
 # process, most of which have nothing to do with a refresh in progress (the
 # ordinary end of the sandbox run, with no refresh ever attempted this tick);
@@ -2047,11 +2060,14 @@ _fs_claude_do_refresh() {
 # is not wired in there instead.
 _fs_claude_refresh_emergency_cleanup() {
     local lock1="$1" lock2="$2"
+    # Wait, never kill: the child may already have rotated the single-use
+    # refresh token, and killing it can lose the only live copy. timeout
+    # bounds the wait at 40s.
     if [[ -n "$_FS_CLAUDE_REFRESH_CHILD_PID" ]]; then
-        kill "$_FS_CLAUDE_REFRESH_CHILD_PID" 2>/dev/null
         wait "$_FS_CLAUDE_REFRESH_CHILD_PID" 2>/dev/null
         _FS_CLAUDE_REFRESH_CHILD_PID=""
     fi
+    _fs_claude_refresh_finish 2>/dev/null || true
     [[ -n "$_FS_CLAUDE_REFRESH_SCRATCH" ]] && rm -rf "$_FS_CLAUDE_REFRESH_SCRATCH" 2>/dev/null
     if [[ -n "$_FS_CLAUDE_REFRESH_LOCK2_HELD" ]]; then
         rmdir "$lock2" 2>/dev/null
@@ -2166,7 +2182,7 @@ fs_claude_refresh_if_needed() {
         # function (or a function IT calls) would trip this sourcing
         # script's `set -e` right here, skipping the rmdir cleanup below and
         # leaking both locks.
-        _fs_claude_do_refresh "$cred_file" "$claude_bin" "$before_min" "$mins_left" || true
+        _fs_claude_do_refresh "$cred_file" "$claude_bin" "$mins_left" || true
     fi
 
     rmdir "$lock2" 2>/dev/null || true
