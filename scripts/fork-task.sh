@@ -440,6 +440,10 @@ if [[ "$harness" == "claude" ]] && ! $sandboxed; then
                 caller_supplied_id=true
                 child_session_id="${claude_extra_argv[$((_i + 1))]:-}"
                 ;;
+            --session-id=*)
+                caller_supplied_id=true
+                child_session_id="${claude_extra_argv[$_i]#--session-id=}"
+                ;;
             --resume|--continue)
                 caller_supplied_id=true
                 child_session_id=""

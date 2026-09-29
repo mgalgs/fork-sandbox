@@ -286,5 +286,23 @@ else
         "occurrences=$occurrences claude received --session-id '$argv_id' registry session_id='$reg_id': $(cat "$err")"
 fi
 
+# The same, but with the caller using --session-id=<uuid> (equals form)
+# instead of two words -- this must be recognized too, not treated as
+# unrecognized and given a second, generated --session-id.
+reg="$tmp/registry-caller-session-id-eq.jsonl"
+: > "$tmux_log"
+caller_uuid="22222222-2222-2222-2222-222222222222"
+FORK_TASK_REGISTRY="$reg" "$launcher" --claude-args "--session-id=$caller_uuid" \
+    "$lineage_project" "$lineage_handoff" > /dev/null 2>"$err"
+occurrences="$(grep -cx -- '--session-id' "$claude_argv_log")"
+eq_occurrences="$(grep -c -- "^--session-id=$caller_uuid\$" "$claude_argv_log")"
+reg_id="$(jq -r '.session_id' "$reg" 2>/dev/null)"
+if [[ "$occurrences" == "0" && "$eq_occurrences" == "1" && "$reg_id" == "$caller_uuid" ]]; then
+    ok "a caller-supplied --session-id=<uuid> in --claude-args is recorded, not duplicated"
+else
+    no "a caller-supplied --session-id=<uuid> in --claude-args is recorded, not duplicated" \
+        "occurrences=$occurrences eq_occurrences=$eq_occurrences registry session_id='$reg_id': $(cat "$err")"
+fi
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))
