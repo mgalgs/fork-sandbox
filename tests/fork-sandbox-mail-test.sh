@@ -145,6 +145,15 @@ id_explicit="$("$mail" reply --from @bob --reply-to "$id_multi" --to @dave --bod
 raw_explicit="$("$mail" show "$id_explicit")"
 check "explicit --to overrides reply-all" "To: @dave" "$(grep '^To:' <<< "$raw_explicit")"
 
+id_rep_send="$("$mail" send --from @alice --to @bob --to @dave,@erin --cc @carol --cc @frank --subject "Repeat" --body - <<< "x" 2>diag.txt)"
+raw_rep_send="$("$mail" show "$id_rep_send")"
+check "send: repeated --to accumulates" "To: @bob, @dave, @erin" "$(grep '^To:' <<< "$raw_rep_send")"
+check "send: repeated --cc accumulates" "Cc: @carol, @frank" "$(grep '^Cc:' <<< "$raw_rep_send")"
+id_rep_reply="$("$mail" reply --from @bob --reply-to "$id_multi" --to @alice --to @dave --cc @carol --cc @erin --body - <<< "y" 2>diag.txt)"
+raw_rep_reply="$("$mail" show "$id_rep_reply")"
+check "reply: repeated --to accumulates" "To: @alice, @dave" "$(grep '^To:' <<< "$raw_rep_reply")"
+check "reply: repeated --cc accumulates" "Cc: @carol, @erin" "$(grep '^Cc:' <<< "$raw_rep_reply")"
+
 printf '\n== X-Hops copy on reply ==\n'
 
 id_hops="$("$mail" send --from @alice --to @bob --subject "Hops" --body - --hops 2 <<< "x" 2>diag.txt)"

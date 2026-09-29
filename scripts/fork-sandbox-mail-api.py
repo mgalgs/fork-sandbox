@@ -68,12 +68,12 @@ exactly (no --flag=value, no abbreviation, no combined short flags); its value
 is the next argv element. A lone '-' is a positional; any other token that
 starts with '-' is a flag, so a positional that starts with '-' is refused.
 mail:
-    send    0; --from --to --cc --subject --body --attach* --hops --header*
+    send    0; --from --to* --cc* --subject --body --attach* --hops --header*
             --allow-namespace* --reach-probe* --context-secret
             --review-target; --from in the token's identities (the three
             grant flags also need cap grant, --review-target needs cap
             target)
-    reply   0; --from --reply-to --body --to --cc --subject --attach* --hops
+    reply   0; --from --reply-to --body --to* --cc* --subject --attach* --hops
             --header* --upstream-head; --from in the token's identities
             (--upstream-head also needs cap upstream)
     show tree export inbox: read (export needs --json; inbox takes --all)
@@ -148,14 +148,14 @@ BOOL, VALUE, MULTI = "bool", "value", "multi"
 SPEC = {
     "mail": {
         "send": (0, 0, {
-            "--from": VALUE, "--to": VALUE, "--cc": VALUE,
+            "--from": VALUE, "--to": MULTI, "--cc": MULTI,
             "--subject": VALUE, "--body": VALUE, "--attach": MULTI,
             "--hops": VALUE, "--header": MULTI,
             "--allow-namespace": MULTI, "--reach-probe": MULTI,
             "--context-secret": VALUE, "--review-target": VALUE}),
         "reply": (0, 0, {
             "--from": VALUE, "--reply-to": VALUE, "--body": VALUE,
-            "--to": VALUE, "--cc": VALUE, "--subject": VALUE,
+            "--to": MULTI, "--cc": MULTI, "--subject": VALUE,
             "--attach": MULTI, "--hops": VALUE, "--header": MULTI,
             "--upstream-head": VALUE}),
         "show": (1, 1, {}),

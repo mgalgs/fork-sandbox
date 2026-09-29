@@ -79,6 +79,10 @@ fork-sandbox mail inbox reviewer [--all]
 fork-sandbox mail seen  reviewer <message-id>...
 ```
 
+`--to` and `--cc` each take a comma-separated list and may be repeated;
+repeats accumulate, so `--to @reviewer --to @scribe` is the same message
+as `--to @reviewer,@scribe`.
+
 ### Listing and filtering threads
 
 Bare `list` prints one tab-separated line per thread: thread id, message

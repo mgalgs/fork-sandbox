@@ -337,6 +337,9 @@ check "a client with no --from: passes through and MAIL refuses (rc 1)" "1" \
     "$(xr "$tok/ci-kickoff" --tool mail --stdin hi -- send --to @x --subject s --body - >/dev/null; rjson rc)"
 check "--from given twice: 400" "400" \
     "$(xr "$tok/ci-kickoff" --tool mail --stdin hi -- send --from @ci-kickoff --from @operator --to @x --subject s --body -)"
+rep_tid="$(xr "$tok/ci-kickoff" --tool mail --stdin hi -- send --from @ci-kickoff --to @x --to @y --cc @z --cc @w --subject s --body - >/dev/null; rjson stdout | tr -d '\n')"
+check "repeated --to/--cc pass through and accumulate" "To: @x, @y|Cc: @z, @w" \
+    "$("$mail" show "$rep_tid" | grep -E '^(To|Cc):' | paste -sd'|')"
 check "--from=@operator form: 403" "403" \
     "$(xr "$tok/ci-kickoff" --tool mail --stdin hi -- send --from=@operator --to @x --subject s --body -)"
 

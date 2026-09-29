@@ -155,8 +155,8 @@ flag and refused, since there is no way to tell it from one.
 
 | verb | positionals | flags | auth |
 |---|---|---|---|
-| send | 0 | `--from --to --cc --subject --body --attach* --hops --header* --allow-namespace* --reach-probe* --context-secret --review-target` | `--from` in the token's identities; `--allow-namespace`/`--reach-probe`/`--context-secret` also need cap `grant`; `--review-target` also needs cap `target` |
-| reply | 0 | `--from --reply-to --body --to --cc --subject --attach* --hops --header* --upstream-head` | `--from` in the token's identities; `--upstream-head` also needs cap `upstream` |
+| send | 0 | `--from --to* --cc* --subject --body --attach* --hops --header* --allow-namespace* --reach-probe* --context-secret --review-target` | `--from` in the token's identities; `--allow-namespace`/`--reach-probe`/`--context-secret` also need cap `grant`; `--review-target` also needs cap `target` |
+| reply | 0 | `--from --reply-to --body --to* --cc* --subject --attach* --hops --header* --upstream-head` | `--from` in the token's identities; `--upstream-head` also needs cap `upstream` |
 | show | 1 | | `read` |
 | tree | 1 | | `read` |
 | list | 0 | `--json --header*` | `read` |

@@ -148,7 +148,8 @@
 # match ^@[a-z0-9][a-z0-9-]*$ -- lowercase alnum, hyphens allowed, no leading
 # hyphen. Anything else is refused with a one-line error. There is no
 # registry: this script does not know or care whether a name refers to a
-# live agent.
+# live agent. --to and --cc each take a comma-separated list and may be
+# repeated; repeats accumulate, so `--to @a --to @b` is `--to @a,@b`.
 #
 # Privacy is addressing, not access control. This store has no ACLs at all:
 # `show`, `tree`, `list` and a raw grep of the store see every message
@@ -689,8 +690,8 @@ cmd_send() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --from) from="${2:?--from requires an address}"; shift 2 ;;
-            --to) to="${2:?--to requires an address list}"; shift 2 ;;
-            --cc) cc="${2:?--cc requires an address list}"; shift 2 ;;
+            --to) to="${to:+$to,}${2:?--to requires an address list}"; shift 2 ;;
+            --cc) cc="${cc:+$cc,}${2:?--cc requires an address list}"; shift 2 ;;
             --subject) subject="${2:?--subject requires text}"; shift 2 ;;
             --body) body_arg="${2:?--body requires a file, or -}"; shift 2 ;;
             --attach) attach_files+=("${2:?--attach requires a file}"); shift 2 ;;
@@ -853,8 +854,8 @@ cmd_reply() {
             --from) from="${2:?--from requires an address}"; shift 2 ;;
             --reply-to) reply_to="${2:?--reply-to requires a message id}"; shift 2 ;;
             --body) body_arg="${2:?--body requires a file, or -}"; shift 2 ;;
-            --to) to="${2:?--to requires an address list}"; shift 2 ;;
-            --cc) cc="${2:?--cc requires an address list}"; shift 2 ;;
+            --to) to="${to:+$to,}${2:?--to requires an address list}"; shift 2 ;;
+            --cc) cc="${cc:+$cc,}${2:?--cc requires an address list}"; shift 2 ;;
             --subject) subject_override="${2:?--subject requires text}"; shift 2 ;;
             --attach) attach_files+=("${2:?--attach requires a file}"); shift 2 ;;
             --hops) hops_override="${2:?--hops requires a number}"; shift 2 ;;
