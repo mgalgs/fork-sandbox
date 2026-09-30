@@ -297,6 +297,24 @@ else
     no "first wake: claude-session/ is excluded via .git/info/exclude" \
         "$(cat "$flow_clone/.git/info/exclude" 2>/dev/null)"
 fi
+if grep -qxF '.env.sandbox' "$flow_clone/.git/info/exclude" 2>/dev/null; then
+    ok "first wake: .env.sandbox is excluded via .git/info/exclude"
+else
+    no "first wake: .env.sandbox is excluded via .git/info/exclude" \
+        "$(cat "$flow_clone/.git/info/exclude" 2>/dev/null)"
+fi
+# A sandbox-services hook writes .env.sandbox into the working tree
+# (docs/sandbox-services.md), not under .git -- the exclude entry above is
+# what keeps it out of the uncommitted-work check (fork-sandbox.sh's own
+# comment near uncommitted_files says why), so prove that end too.
+printf 'SOME_URL=unix:///tmp/does-not-matter.sock\n' > "$flow_clone/.env.sandbox"
+if [[ -z "$(git -C "$flow_clone" status --porcelain)" ]]; then
+    ok "first wake: .env.sandbox in the working tree does not show up as untracked"
+else
+    no "first wake: .env.sandbox in the working tree does not show up as untracked" \
+        "$(git -C "$flow_clone" status --porcelain)"
+fi
+rm -f "$flow_clone/.env.sandbox"
 
 # --- second wake: reuse, new branch built on the first wake's commit ------
 git -C "$flow_clone" -c user.email=t@fork-sandbox.invalid -c user.name=Tester \

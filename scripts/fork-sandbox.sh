@@ -10248,11 +10248,15 @@ fi
 # under, for the same reason nothing below runs git against the clone on
 # the HOST: the clone's .git/config is writable by the sandbox, and a key
 # such as core.fsmonitor runs on the HOST the next time anything there
-# executes git. Everything fork-sandbox itself writes into the clone lives
-# under .git (fs_lock_clone_dir's own comment says why), never the working
-# tree, so this reflects the session's own files only. git status --
-# porcelain's own untrusted stdout goes straight to a file; nothing here
-# parses it as anything but text, and nothing re-runs git on it.
+# executes git. Most of what fork-sandbox itself writes into the clone
+# lives under .git (fs_lock_clone_dir's own comment says why), never the
+# working tree. The one working-tree exception, a services hook's
+# <clone-dir>/.env.sandbox (docs/sandbox-services.md), is listed in
+# .git/info/exclude by fs_make_clone, so git status --porcelain treats it
+# like any other ignored file and this still reflects the session's own
+# files only. git status --porcelain's own untrusted stdout goes straight
+# to a file; nothing here parses it as anything but text, and nothing
+# re-runs git on it.
 # Best-effort: a backend that fails to even run this -- as opposed to
 # running it and finding nothing -- leaves the fact unknown rather than
 # guessed at zero (see uncommitted_files below). The timeout is short

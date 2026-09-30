@@ -430,17 +430,26 @@ fs_reuse_clone() {
         git -C "$dest" repack -a -d --quiet || return 1
         rm -f "$dest/.git/objects/info/alternates"
     fi
+    # A seat created before fs_make_clone excluded .env.sandbox never passes
+    # through fs_make_clone again, so add the entry here too. The sandbox can
+    # write .git: never append through a symlink it planted.
+    if [[ ! -L "$dest/.git/info/exclude" ]] \
+        && ! grep -qxF '.env.sandbox' "$dest/.git/info/exclude" 2>/dev/null; then
+        printf '.env.sandbox\n' >> "$dest/.git/info/exclude"
+    fi
     printf '%s\n' "$start_sha"
     return 0
 }
 
 # Acquire the persistent-workspace lock at $1/.git/fork-sandbox-lock and set
 # the global clone_lock_fd, or print the standard refusal and exit. Under
-# .git, not the working tree: the pi session dir, the review verdict and
-# .env.sandbox all live under .git for the same reason -- git tracks nothing
-# there, so a leg running `git add -A` cannot commit the lock file onto the
-# branch that gets fetched home, and a `git clean -fdx` cannot unlink it out
-# from under a still-live holder. Shared by the launcher (fork-sandbox.sh),
+# .git, not the working tree: the pi session dir and the review verdict
+# live under .git for the same reason -- git tracks nothing there, so a
+# leg running `git add -A` cannot commit the lock file onto the branch
+# that gets fetched home, and a `git clean -fdx` cannot unlink it out
+# from under a still-live holder. (.env.sandbox, by contrast, IS in the
+# working tree -- see fs_make_clone's own .git/info/exclude entry for it.)
+# Shared by the launcher (fork-sandbox.sh),
 # which holds it only while it sets up the workspace, and the generated
 # runner, which reacquires it fresh as its own first action so the lock's
 # lifetime matches the run rather than the launcher or tmux -- see both
@@ -777,6 +786,16 @@ fs_make_clone() {
     # place before the first sandbox ever runs.
     if ! grep -qxF 'claude-session/' "$dest/.git/info/exclude" 2>/dev/null; then
         printf 'claude-session/\n' >> "$dest/.git/info/exclude"
+    fi
+    # A repo with a sandbox-services hook (docs/sandbox-services.md) gets
+    # <dest>/.env.sandbox written into the working tree, not under .git,
+    # by that hook rather than by us -- same reasoning as claude-session/
+    # above, and the same file fork-sandbox-k8s-entrypoint.sh excludes for
+    # the k8s path. Excluded unconditionally, whether or not this repo
+    # actually has a services hook, since it is cheap and it is the hook
+    # script (out of this file's control) that decides whether to write it.
+    if ! grep -qxF '.env.sandbox' "$dest/.git/info/exclude" 2>/dev/null; then
+        printf '.env.sandbox\n' >> "$dest/.git/info/exclude"
     fi
     return 0
 }

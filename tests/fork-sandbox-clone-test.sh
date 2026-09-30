@@ -320,6 +320,49 @@ else
         "$(git -C "$prior_clone" fsck --full 2>&1)"
 fi
 
+# A legacy seat: built before fs_make_clone started excluding .env.sandbox
+# (or with an exclude file that otherwise lacks the entry). A persistent
+# --clone-dir workspace never runs fs_make_clone again after its first
+# wake, so fs_reuse_clone is the only path left to close this gap -- without
+# it, a repo with a sandbox-services hook would report .env.sandbox as
+# uncommitted on every wake of this seat, forever.
+legacy_origin="$(new_origin)"
+legacy_clone="$(new_clone_path)"
+fs_make_clone "$legacy_origin" "legacy-prior-branch" "$legacy_clone" >/dev/null 2>&1
+sed -i '/^\.env\.sandbox$/d' "$legacy_clone/.git/info/exclude"
+config_commit "$legacy_clone" "prior wake work" >/dev/null 2>&1
+
+fs_reuse_clone "$legacy_clone" "legacy-next-branch" "" >/dev/null 2>&1
+check "fs_reuse_clone succeeds on a legacy seat missing the exclude entry" "0" "$?"
+if grep -qxF '.env.sandbox' "$legacy_clone/.git/info/exclude" 2>/dev/null; then
+    ok "reuse adds the .env.sandbox exclude entry a legacy seat was missing"
+else
+    no "reuse adds the .env.sandbox exclude entry a legacy seat was missing" \
+        "$(cat "$legacy_clone/.git/info/exclude" 2>/dev/null)"
+fi
+printf 'SOME_URL=unix:///tmp/does-not-matter.sock\n' > "$legacy_clone/.env.sandbox"
+if [[ -z "$(git -C "$legacy_clone" status --porcelain)" ]]; then
+    ok "reuse: .env.sandbox in the working tree does not show up as untracked"
+else
+    no "reuse: .env.sandbox in the working tree does not show up as untracked" \
+        "$(git -C "$legacy_clone" status --porcelain)"
+fi
+rm -f "$legacy_clone/.env.sandbox"
+
+# The seat's .git is sandbox-writable: an exclude file swapped for a
+# symlink must not turn the append above into a write to its target.
+symlink_origin="$(new_origin)"
+symlink_clone="$(new_clone_path)"
+fs_make_clone "$symlink_origin" "symlink-prior-branch" "$symlink_clone" >/dev/null 2>&1
+config_commit "$symlink_clone" "prior wake work" >/dev/null 2>&1
+symlink_target="$(mktemp)"; printf 'untouched\n' > "$symlink_target"
+rm -f "$symlink_clone/.git/info/exclude"
+ln -s "$symlink_target" "$symlink_clone/.git/info/exclude"
+fs_reuse_clone "$symlink_clone" "symlink-next-branch" "" >/dev/null 2>&1
+check "reuse never appends through a symlinked exclude file" \
+    "untouched" "$(cat "$symlink_target")"
+rm -f "$symlink_target"
+
 # The fallback path: a --clone-dir target that is a valid git repo but has no
 # commits at all (its own HEAD cannot be resolved), the one legitimate way a
 # real reused clone could lack a branch tip to start from.

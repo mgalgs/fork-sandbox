@@ -138,6 +138,9 @@ if [[ -n "${FAKE_LEAVE_UNTRACKED_DIR:-}" ]]; then
     printf 'two\n' > "$clone_dir/newpkg/b.txt"
     printf 'three\n' > "$clone_dir/newpkg/c.txt"
 fi
+if [[ -n "${FAKE_WRITE_ENV_SANDBOX:-}" ]]; then
+    printf 'SOME_URL=unix:///tmp/does-not-matter.sock\n' > "$clone_dir/.env.sandbox"
+fi
 printf '{"type":"result","subtype":"success","total_cost_usd":0.01,"usage":{"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}\n'
 exit 0
 STUB
@@ -273,6 +276,27 @@ else
     no "an untracked-directory run produced a run directory" "run_real failed"
 fi
 unset FAKE_LEAVE_UNTRACKED_DIR
+
+printf '\n== a services hook writes .env.sandbox: not the session own work, not flagged ==\n'
+# docs/sandbox-services.md's `up` contract writes <clone-dir>/.env.sandbox
+# into the working tree itself, not under .git -- fs_make_clone excludes it
+# via .git/info/exclude the same way it excludes claude-session/, so this
+# run-of-the-mill file never shows up as the session's own uncommitted work.
+unset FAKE_COMMIT FAKE_LEAVE_UNCOMMITTED
+export FAKE_WRITE_ENV_SANDBOX=1
+rd_env="$(run_real --harness claude --branch "fs-uncommitted-env-$$")" && tmpdirs+=("$rd_env")
+if [[ -n "$rd_env" ]]; then
+    check "summary.json: .env.sandbox is not counted as uncommitted" "0" \
+        "$(jq -r '.uncommitted_files' "$rd_env/summary.json")"
+    lacks "summary.txt carries no uncommitted-work WARNING for .env.sandbox" \
+        "uncommitted file(s)" "$(cat "$rd_env/summary.txt")"
+    clone_dir_env="$(jq -r '.clone_dir' "$rd_env/summary.json")"
+    check "the services hook's .env.sandbox is still there, untouched" \
+        "SOME_URL=unix:///tmp/does-not-matter.sock" "$(cat "$clone_dir_env/.env.sandbox" 2>/dev/null)"
+else
+    no "a services-hook run produced a run directory" "run_real failed"
+fi
+unset FAKE_WRITE_ENV_SANDBOX
 
 printf '\n== a run that commits AND leaves an uncommitted file: both show ==\n'
 export FAKE_COMMIT="dirty implement"
