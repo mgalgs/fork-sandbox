@@ -887,6 +887,62 @@ else
 fi
 rm -f /tmp/fs-k8s-test-install2.err
 
+printf '\n== install: real (non-dry-run), legacy K8S_PROXY_UPSTREAM ==\n'
+# Same coverage as the K8S_PROXY_ENDPOINT_KEYS real-install check further
+# below, for the legacy single-upstream branch: the API key travels to
+# kubectl on the apply's stdin only (k8s_render_upstream_key_secret_manifest),
+# never in argv, and the apply itself is server-side with the install field
+# manager.
+legacy_install_stub_bin="$(newdir)"; tmpdirs+=("$legacy_install_stub_bin")
+legacy_install_log="$(newdir)/kubectl-legacy-install.log"; tmpdirs+=("$(dirname "$legacy_install_log")")
+legacy_install_apply_capture="$(newdir)/kubectl-legacy-apply-capture.json"
+tmpdirs+=("$(dirname "$legacy_install_apply_capture")")
+cat > "$legacy_install_stub_bin/kubectl" <<STUB
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$legacy_install_log"
+case "\$*" in
+    *" apply -f - --server-side"*) cat > "$legacy_install_apply_capture" ;;
+    *) cat >/dev/null ;;
+esac
+exit 0
+STUB
+chmod +x "$legacy_install_stub_bin/kubectl"
+if PATH="$legacy_install_stub_bin:$PATH" FORK_SANDBOX_CONFIG_DIR="$config_dir" \
+    "$k8s_sh" install >/dev/null 2>/tmp/fs-k8s-test-legacy-real-install.err; then
+    ok "a real (non-dry-run) legacy K8S_PROXY_UPSTREAM install exits 0 against a stubbed kubectl"
+else
+    no "a real (non-dry-run) legacy K8S_PROXY_UPSTREAM install exits 0 against a stubbed kubectl" \
+        "$(cat /tmp/fs-k8s-test-legacy-real-install.err)"
+fi
+if grep -qF 'sk-test-dummy' "$legacy_install_log"; then
+    no "the upstream key never appears in any kubectl argv (legacy)" \
+        "found the fixture value in $legacy_install_log"
+else
+    ok "the upstream key never appears in any kubectl argv (legacy)"
+fi
+legacy_apply_decoded="$(jq -r '.data["upstream-key.conf"]' "$legacy_install_apply_capture" 2>/dev/null | base64 -d 2>/dev/null)"
+# shellcheck disable=SC2016  # $upstream_key is nginx config, not shell
+legacy_expected_conf='set $upstream_key "sk-test-dummy";'
+if [[ "$legacy_apply_decoded" == "$legacy_expected_conf" ]]; then
+    ok "the Secret content on stdin decodes to exactly today's upstream-key.conf text (legacy)"
+else
+    no "the Secret content on stdin decodes to exactly today's upstream-key.conf text (legacy)" \
+        "$legacy_apply_decoded"
+fi
+if grep -qE -- ' apply -f - --server-side --field-manager=fork-sandbox-k8s-install --force-conflicts( |$)' "$legacy_install_log"; then
+    ok "the legacy install's upstream-key Secret apply carries --server-side and its field manager"
+else
+    no "the legacy install's upstream-key Secret apply carries --server-side and its field manager" \
+        "$(cat "$legacy_install_log")"
+fi
+if grep -qF 'sk-test-dummy' /tmp/fs-k8s-test-legacy-real-install.err; then
+    no "the real install's own stderr never carries the upstream key (legacy)" \
+        "$(cat /tmp/fs-k8s-test-legacy-real-install.err)"
+else
+    ok "the real install's own stderr never carries the upstream key (legacy)"
+fi
+rm -f /tmp/fs-k8s-test-legacy-real-install.err
+
 printf '\n== nginx -t on the rendered proxy config ==\n'
 # The gap this closes: yamllint proves the manifest is valid YAML, not that
 # the string embedded in it is a config nginx will actually start on -- see
@@ -3484,14 +3540,18 @@ fi
 # A real (non-dry-run) install, against a stubbed kubectl (no live cluster
 # needed -- same technique as the 'rm' section elsewhere in this file): the
 # Secret this creates carries one 'set $upstream_key_<name> "value";' line
-# for the keyed endpoint, and the value never appears anywhere else.
+# for the keyed endpoint, the value never appears in any kubectl argv (it
+# travels on the apply's stdin only, per k8s_render_upstream_key_secret_manifest),
+# and the apply itself is server-side with the install field manager.
 keyed_install_stub_bin="$(newdir)"; tmpdirs+=("$keyed_install_stub_bin")
 keyed_install_log="$(newdir)/kubectl-keyed-install.log"; tmpdirs+=("$(dirname "$keyed_install_log")")
+keyed_install_apply_capture="$(newdir)/kubectl-keyed-apply-capture.json"
+tmpdirs+=("$(dirname "$keyed_install_apply_capture")")
 cat > "$keyed_install_stub_bin/kubectl" <<STUB
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >> "$keyed_install_log"
 case "\$*" in
-    *"create secret"*) printf 'apiVersion: v1\nkind: Secret\n' ;;
+    *" apply -f - --server-side"*) cat > "$keyed_install_apply_capture" ;;
     *) cat >/dev/null ;;
 esac
 exit 0
@@ -3504,11 +3564,27 @@ else
     no "a real (non-dry-run) keyed endpoints install exits 0 against a stubbed kubectl" \
         "$(cat /tmp/fs-k8s-test-keyed-real-install.err)"
 fi
-# shellcheck disable=SC2016  # $upstream_key_secondary is nginx config, not shell
-if grep -qF 'create secret generic fork-sandbox-upstream-key --from-literal=upstream-key.conf=set $upstream_key_secondary "sk-secondary-test-dummy";' "$keyed_install_log"; then
-    ok "the real install creates the Secret with one 'set \$upstream_key_<name>' line for the keyed endpoint"
+if grep -qF 'sk-secondary-test-dummy' "$keyed_install_log"; then
+    no "the keyed value never appears in any kubectl argv" \
+        "found the fixture value in $keyed_install_log"
 else
-    no "the real install creates the Secret with one 'set \$upstream_key_<name>' line for the keyed endpoint" \
+    ok "the keyed value never appears in any kubectl argv"
+fi
+# The trailing "x" keeps $(...) from stripping the content's final newline.
+keyed_apply_decoded="$(jq -r '.data["upstream-key.conf"]' "$keyed_install_apply_capture" 2>/dev/null | base64 -d 2>/dev/null; printf x)"
+keyed_apply_decoded="${keyed_apply_decoded%x}"
+# shellcheck disable=SC2016  # $upstream_key_secondary is nginx config, not shell
+keyed_expected_conf='set $upstream_key_secondary "sk-secondary-test-dummy";'
+if [[ "$keyed_apply_decoded" == "$keyed_expected_conf"$'\n' ]]; then
+    ok "the Secret content on stdin decodes to exactly today's upstream-key.conf text (keyed)"
+else
+    no "the Secret content on stdin decodes to exactly today's upstream-key.conf text (keyed)" \
+        "$keyed_apply_decoded"
+fi
+if grep -qE -- ' apply -f - --server-side --field-manager=fork-sandbox-k8s-install --force-conflicts( |$)' "$keyed_install_log"; then
+    ok "the keyed install's upstream-key Secret apply carries --server-side and its field manager"
+else
+    no "the keyed install's upstream-key Secret apply carries --server-side and its field manager" \
         "$(cat "$keyed_install_log")"
 fi
 if grep -qF 'sk-secondary-test-dummy' /tmp/fs-k8s-test-keyed-real-install.err; then
@@ -15673,6 +15749,58 @@ check "no claude credentials: no Secret" "0" \
 check "no claude credentials: no marker lines left" "0" \
     "$(grep -cE '# (>>>|<<<) claude-credentials' <<< "$pm_api_out")"
 check "no claude credentials: no claude.env key" "0" "$(grep -c 'claude.env' <<< "$pm_api_out")"
+
+# 14j. A real (non-dry-run) install against pm_cfg_claude (git + tokens +
+# claude credentials all present, so all three postmaster Secrets are
+# applied): each Secret apply carries --server-side, the install field
+# manager, and --force-conflicts, while the ConfigMap and Deployment-bundle
+# applies carry neither. Each `kubectl apply -f -` logs its own raw argv
+# line immediately followed by an `applied:   name: X` line derived from
+# the object it just read on stdin (pm_make_kubectl_stub, above) -- so the
+# Secret/object's name is found first, then the argv line right before it.
+pm_secret_flags_wd="$(newdir)"; tmpdirs+=("$pm_secret_flags_wd")
+env PATH="$pm_stub_bin:$PATH" K8S_STUB_LOG="$pm_secret_flags_wd/log" FORK_SANDBOX_CONFIG_DIR="$pm_cfg_claude" \
+    "$k8s_sh" install --postmaster >/dev/null 2>&1
+pm_secret_flags_raw_line() {
+    local name="$1" which="$2" applied_line
+    applied_line="$(grep -n "^applied:   name: $name\$" "$pm_secret_flags_wd/log" | "$which" -1 | cut -d: -f1)"
+    [[ -n "$applied_line" ]] || return 1
+    sed -n "$((applied_line - 1))p" "$pm_secret_flags_wd/log"
+}
+pm_secret_flags_check() {
+    local name="$1" which="$2" label="$3" raw_line
+    if ! raw_line="$(pm_secret_flags_raw_line "$name" "$which")"; then
+        no "$label" "no 'applied: name: $name' line in $(cat "$pm_secret_flags_wd/log")"
+        return
+    fi
+    if [[ "$raw_line" == *" apply -f - --server-side --field-manager=fork-sandbox-k8s-install --force-conflicts" ]]; then
+        ok "$label"
+    else
+        no "$label" "$raw_line"
+    fi
+}
+pm_nonsecret_flags_check() {
+    local name="$1" which="$2" label="$3" raw_line
+    if ! raw_line="$(pm_secret_flags_raw_line "$name" "$which")"; then
+        no "$label" "no 'applied: name: $name' line in $(cat "$pm_secret_flags_wd/log")"
+        return
+    fi
+    if [[ "$raw_line" == *" apply -f -" && "$raw_line" != *"--server-side"* ]]; then
+        ok "$label"
+    else
+        no "$label" "$raw_line"
+    fi
+}
+pm_secret_flags_check fork-sandbox-postmaster-git head \
+    "the postmaster-git Secret apply carries --server-side, the install field manager and --force-conflicts"
+pm_secret_flags_check fork-sandbox-mail-api-tokens head \
+    "the mail-api-tokens Secret apply carries --server-side, the install field manager and --force-conflicts"
+pm_secret_flags_check fork-sandbox-postmaster-claude head \
+    "the postmaster-claude Secret apply carries --server-side, the install field manager and --force-conflicts"
+pm_nonsecret_flags_check fork-sandbox-postmaster-config head \
+    "the postmaster-config ConfigMap apply carries neither --server-side nor a field manager"
+pm_nonsecret_flags_check fork-sandbox-postmaster tail \
+    "the postmaster Deployment-bundle apply carries neither --server-side nor a field manager"
 
 # Refusals, before any kubectl call, none printing the token.
 pm_cfg_claude_missing="$(pm_api_cfg)"

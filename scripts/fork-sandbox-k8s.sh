@@ -1188,6 +1188,11 @@ reject_nginx_unsafe_chars() {
 # kubectl-client-side-apply, and without it the keeper's push is refused.
 K8S_CLAUDE_TOKEN_FIELD_MANAGER=fork-sandbox-k8s-claude-token
 
+# The field manager for cmd_install's Secrets, applied server-side with
+# --force-conflicts for the same reason as the claude-token Secret above:
+# a re-install over Secrets an older client-side apply created.
+K8S_INSTALL_SECRET_FIELD_MANAGER=fork-sandbox-k8s-install
+
 # Builds the per-run Claude token Secret manifest -- name and namespace as
 # arguments, the real access token on STDIN ONLY, never argv, so it never
 # appears in `ps` or a log line. Prints a Secret manifest (JSON, which
@@ -1210,6 +1215,21 @@ k8s_render_claude_token_secret_manifest() {
             metadata: { name: $name, namespace: $ns },
             type: "Opaque",
             data: { "upstream-key.conf": ("set $upstream_key \"" + . + "\";\n" | @base64) }
+        }'
+}
+
+# Builds the fork-sandbox-upstream-key Secret manifest from the finished
+# upstream-key.conf text on STDIN ONLY (it holds API keys; argv shows in
+# `ps`). Stored byte-for-byte, trailing newline included.
+k8s_render_upstream_key_secret_manifest() {
+    local name="$1" namespace="$2"
+    jq -R -s --arg name "$name" --arg ns "$namespace" '
+        {
+            apiVersion: "v1",
+            kind: "Secret",
+            metadata: { name: $name, namespace: $ns },
+            type: "Opaque",
+            data: { "upstream-key.conf": (. | @base64) }
         }'
 }
 
@@ -3722,17 +3742,18 @@ cmd_install() {
     # proxy_key_include_block/strip_proxy_key_include above for the other
     # half of that) reads no credential from pi.env at all.
     if [[ -n "$K8S_PROXY_UPSTREAM" ]]; then
-        kubectl create secret generic fork-sandbox-upstream-key \
-            --from-literal="upstream-key.conf=set \$upstream_key \"$api_key\";" \
-            --dry-run=client -o yaml | kubectl apply -f -
+        # shellcheck disable=SC2016  # the literal text $upstream_key is nginx config, not shell
+        printf 'set $upstream_key "%s";' "$api_key" \
+            | k8s_render_upstream_key_secret_manifest fork-sandbox-upstream-key "$K8S_NAMESPACE" \
+            | kubectl apply -f - --server-side --field-manager="$K8S_INSTALL_SECRET_FIELD_MANAGER" --force-conflicts
     elif [[ ${#KEYED_ENDPOINT_NAMES[@]} -gt 0 ]]; then
         local secret_content="" key_j
         for (( key_j = 0; key_j < ${#KEYED_ENDPOINT_NAMES[@]}; key_j++ )); do
             secret_content+="set \$${keyed_endpoint_nginx_vars[$key_j]} \"${keyed_endpoint_values[$key_j]}\";"$'\n'
         done
-        kubectl create secret generic fork-sandbox-upstream-key \
-            --from-literal="upstream-key.conf=$secret_content" \
-            --dry-run=client -o yaml | kubectl apply -f -
+        printf '%s' "$secret_content" \
+            | k8s_render_upstream_key_secret_manifest fork-sandbox-upstream-key "$K8S_NAMESPACE" \
+            | kubectl apply -f - --server-side --field-manager="$K8S_INSTALL_SECRET_FIELD_MANAGER" --force-conflicts
     fi
 
     # Postmaster ConfigMaps and Secret before the Deployment (bundled with
@@ -3745,11 +3766,14 @@ cmd_install() {
         $pm_have_handlers && printf '%s\n' "$pm_handlers_yaml" | kubectl apply -f -
         $pm_have_hooks    && printf '%s\n' "$pm_hooks_yaml" | kubectl apply -f -
         $pm_have_presets  && printf '%s\n' "$pm_presets_yaml" | kubectl apply -f -
-        printf '%s\n' "$pm_git_secret_yaml" | kubectl apply -f -
+        printf '%s\n' "$pm_git_secret_yaml" | kubectl apply -f - \
+            --server-side --field-manager="$K8S_INSTALL_SECRET_FIELD_MANAGER" --force-conflicts
         [[ -z "$pm_tokens_secret_yaml" ]] || \
-            printf '%s\n' "$pm_tokens_secret_yaml" | kubectl apply -f -
+            printf '%s\n' "$pm_tokens_secret_yaml" | kubectl apply -f - \
+                --server-side --field-manager="$K8S_INSTALL_SECRET_FIELD_MANAGER" --force-conflicts
         [[ -z "$pm_claude_secret_yaml" ]] || \
-            printf '%s\n' "$pm_claude_secret_yaml" | kubectl apply -f -
+            printf '%s\n' "$pm_claude_secret_yaml" | kubectl apply -f - \
+                --server-side --field-manager="$K8S_INSTALL_SECRET_FIELD_MANAGER" --force-conflicts
         printf '%s\n' "$pm_file_rendered" | kubectl apply -f -
     fi
 
