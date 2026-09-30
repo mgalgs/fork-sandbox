@@ -188,9 +188,13 @@ reach it — see "What it gives up".)
    reviews once on opus, `--pipeline rsonnet-mopus` adds a maintainer who
    builds on that review, and `--pipeline mopus` is a maintainer's read
    alone — each leg once, no fix legs, over the checkout's commits since
-   `--review-base` (or the origin repo's merge-base with `HEAD`). It is
-   useful for a post-hoc review or a bake-off comparing two reviewers on the
-   same branch.
+   `--review-base` (or the origin repo's merge-base with `HEAD`). Any number
+   of `r` and `m` steps in any order works too
+   (`--pipeline ropus-mopus-ropus`): each leg's prompt carries the verbatim
+   verdict of every earlier leg. Those longer shapes refuse the seat-override
+   flags (`--model`, `--harness`, `--review-*`, `--maintainer-*`, `--*-args`),
+   since no single seat could take them. It is useful for a post-hoc review
+   or a bake-off comparing two reviewers on the same branch.
 
    `--review-only` is a deprecated bare flag that does the one-reviewer case
    of the same thing (`--pipeline r<model>`): requires `--checkout <ref>`,

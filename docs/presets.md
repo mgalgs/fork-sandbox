@@ -167,15 +167,32 @@ act on a finding, so it reviews an existing branch instead: each step
 writes its verdict once and the run ends. It takes the `--review-only`
 range — `--checkout <ref>`, from `--review-base` or the merge-base with
 `HEAD` — and the review-only prompt wording, which says no fix leg
-follows. The shapes are a `review` step, a `maintain` step, or a `review`
-step then a `maintain` step, which builds on the review's verdict as it
-does in a coding pipeline. `repeat` must be 1: with no fix leg there is
-nothing to loop on.
+follows. It may hold any number of `review` and `maintain` steps, in any
+order. `repeat` must be 1: with no fix leg there is nothing to loop on.
+
+Every leg builds on every earlier leg. Leg *k*'s prompt embeds the verbatim
+verdict of each earlier leg in this run, oldest first, each under a heading
+naming its step number, action and seat (`### Step 2: maintain
+(claude/opus)`); the first leg's prompt carries none. A `maintain` step
+is told a review already read the diff only when an earlier `review` step
+ran; after maintainers alone, it is told to read the diff itself.
 
 ```
 fork-sandbox.sh --pipeline ropus --checkout my-branch ~/src/myrepo brief.md
 fork-sandbox.sh --pipeline rsol-mopus --checkout my-branch ~/src/myrepo brief.md
+fork-sandbox.sh --pipeline ropus-mopus-ropus --checkout my-branch ~/src/myrepo brief.md
 ```
+
+A `review`, a `maintain`, or a `review` then a `maintain` step runs on the
+fixed review and maintain seats, and `--model`/`--harness`,
+`--maintainer-model`/`--maintainer-harness` and the `--*-args` flags can
+override them. Any other shape is a composed pipeline in read-only mode:
+each step has its own seat and its own files in the run directory
+(`s<K>-<action>-verdict-1.md`, `events-s<K>-<action>-1.jsonl`,
+`step-<K>-loop.json`), and there is no single seat for a flag to land on, so
+the seat-override flags (`--model`, `--harness`, `--review-*`,
+`--maintainer-*`, `--review-loop`, `--maintainer-loop`, `--claude-args`,
+`--pi-args`, `--codex-args`) are refused. Edit the pipeline instead.
 
 `--review-only` is a deprecated bare-flag alias for this: without a preset
 it is the one-review-leg case, seated by `--harness`/`--model`. Over a
@@ -223,7 +240,7 @@ The spec is `-`-joined segments, `<stage><model>[<harness>][<N>]`:
   `csonnet-csol-ropus-rsol-mopus-mastra` is two code steps, two review
   steps and two maintain steps. Fix legs ride the first code step's agent.
   The one exception is a spec with no `c` at all: it compiles to a
-  read-only pipeline, so it takes at most one `r` and at most one `m`.
+  read-only pipeline, so every repeat in it must be 1.
 - **model** is a name from the table at the top of
   `scripts/fork-sandbox-pipeline-spec.py`, and runs on its native harness:
   `haiku`, `sonnet`, `opus`, `fable` on claude; `luna`, `terra`, `sol`,
