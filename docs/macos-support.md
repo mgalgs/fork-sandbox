@@ -253,9 +253,9 @@ On top: `git`, `jq`, `ca-certificates`, `iproute2` (pinned mode), `socat`
 (bridges), `procps`, `less`, `ripgrep`, `python3`, and the three agent CLIs.
 
 Each CLI is installed with `npm install -g`, into `/usr/local`, and never into
-a home directory — `$HOME` inside the sandbox is a fresh tmpfs, so anything
-under it would simply not be there. That rules out claude's native installer,
-which targets `~/.local/bin`. `--claude`, `--codex` and `--pi` pin a version or
+a home directory — `$HOME` inside the sandbox is a fresh, disk-backed scratch
+directory, so anything under it would simply not be there. That rules out
+claude's native installer, which targets `~/.local/bin`. `--claude`, `--codex` and `--pi` pin a version or
 take `none` to leave an agent out. `/etc/fork-sandbox-image` records what
 went in.
 

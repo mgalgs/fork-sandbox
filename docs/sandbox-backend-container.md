@@ -45,10 +45,16 @@ copy to pull: you build the thing you trust.
 
 The contract maps directly to bind mounts, runtime environment and hostname
 options. All mounts use `--mount type=bind`, never `-v`, because `-v` creates a
-missing source as a root-owned host directory. `$HOME` and `/tmp` are tmpfs,
-mounted `rw,nosuid,nodev,exec` — Docker's `--tmpfs` default set includes
-`noexec`, which would silently diverge from bwrap's equivalent scratch space,
-so `exec` is requested explicitly. Neither tmpfs has a size cap.
+missing source as a root-owned host directory. `$HOME` and `/tmp` are
+themselves `--mount type=bind` of a fresh, disk-backed scratch directory
+created for this invocation (`--run-dir` names where; see
+[sandbox-backend.md](sandbox-backend.md)), not Docker's own `--tmpfs` — a
+bind mount carries none of a tmpfs's `noexec`/`nosuid`/`nodev`, so `exec`
+inside them needs no restoring flag, matching bwrap's equivalent scratch
+space, which never restricted it either. Scratch is disk, not memory, so it
+no longer competes with the host's RAM the way a tmpfs did, but it has no
+size cap either, so a runaway sandbox can still fill the disk it lives on;
+`/dev/shm` keeps Docker's own default 64MiB cap.
 The container runs as the host UID/GID, with all capabilities dropped,
 no-new-privileges, Docker's default seccomp profile, and an init process.
 A synthesized passwd/group entry makes the otherwise unknown host UID usable.
@@ -181,13 +187,20 @@ runs after a caller times out.
   startup routing snapshot. DNS uses Docker's embedded resolver in the daemon
   namespace, so VPN-only names may resolve even though their addresses remain
   unreachable: names leak, reachability does not.
-- **Resource limits.** None are set. Docker can express memory, CPU and PID
-  limits with `--memory`, `--cpus`, and `--pids-limit`; this backend does not.
+- **Resource limits.** None are set on CPU or memory. Docker can express
+  memory, CPU and PID limits with `--memory`, `--cpus`, and `--pids-limit`;
+  this backend does not. `/dev/shm` keeps Docker's own default cap (64MiB).
+  Disk is unbounded: the scratch root behind `/tmp` and `$HOME` has no size
+  cap, so a runaway sandbox can fill the disk it lives on.
 - **What SIGKILL leaves behind.** The stopped labeled container, labeled
-  per-run network, and state directory remain; the kernel releases the lock.
-  Find runtime strays with
+  per-run network, state directory, and this run's scratch root remain; the
+  kernel releases the lock. Find runtime strays with
   `docker ps -a --filter label=fork-sandbox-run` and
-  `docker network ls --filter label=fork-sandbox-run`.
+  `docker network ls --filter label=fork-sandbox-run`. A stray scratch root
+  is reclaimed by a later invocation's own startup sweep
+  (`fs_sweep_stale_scratch_roots` in `fork-sandbox-lib.sh`), which checks
+  the root's own lock file to tell an orphan from one still in use rather
+  than guessing from age.
 - **macOS bridges.** Unix-socket bridges are verified only on Linux and
   probably do not survive Docker Desktop or Colima filesystem sharing. Treat a
   sealed run with a bridge as Linux-only until verified on Darwin.

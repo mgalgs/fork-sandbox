@@ -139,8 +139,9 @@ resolves. The second mount is the same bytes, also read-only, behind exactly
 the same escape checks as the first.
 
 The venv's `bin` also goes **first on PATH**, which is the other half of the
-same idea: nothing activates a venv in the sandbox — `$HOME` is a tmpfs, so
-there is no profile and no `VIRTUAL_ENV` — which would otherwise leave bare
+same idea: nothing activates a venv in the sandbox — `$HOME` is a fresh,
+disk-backed scratch directory, so there is no profile and no `VIRTUAL_ENV` —
+which would otherwise leave bare
 `python` as the system interpreter and bare `pytest` as nothing at all. With
 both in place a sandbox looks like the activated shell your docs are already
 written for: `pytest`, `.venv/bin/pytest` and `.venv/bin/python -m pytest` all
@@ -150,8 +151,9 @@ noise in the interactive case, which is the common one.
 
 The venv's **interpreter** must also be reachable inside the sandbox. A venv
 built on the system python needs nothing (`/usr` is mounted), but `uv` and
-`pyenv` install interpreters under `$HOME`, which is an empty tmpfs in the
-sandbox — `.venv/bin/python` would dangle, and every compiled extension
+`pyenv` install interpreters under `$HOME`, which is an empty, disk-backed
+scratch directory in the sandbox — `.venv/bin/python` would dangle, and
+every compiled extension
 behind it would be unusable. The provisioner reads `pyvenv.cfg`'s `home =`
 and binds the interpreter prefix read-only when it sits in a recognized
 store (`~/.local/share/uv/python`, `~/.pyenv/versions`). An interpreter

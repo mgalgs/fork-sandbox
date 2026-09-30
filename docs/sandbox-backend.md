@@ -48,6 +48,7 @@ sandbox-backend-<name> [options] -- COMMAND [ARG...]
 | `--setenv K=V` | Set one variable inside. Repeatable. The environment is otherwise empty. |
 | `--prepend-path DIR` | Prepend DIR to the sandbox `PATH`. Repeatable. |
 | `--hostname NAME` | Set the sandbox hostname, so a prompt can show where it is. |
+| `--run-dir DIR` | A directory the caller already manages for the life of this run. When given, this invocation's scratch root (see guarantee 1 below) is created under it; when absent, it falls back to a fresh directory under the fork machinery's own scratch root. Optional, and gated behind the `run_dir` capability below — a caller passes it only to a backend that advertises `run_dir=1`. |
 | `--` | Ends option parsing. Everything after is the command, passed verbatim. |
 
 Backends may add their own options — a container backend needs an image, and
@@ -94,6 +95,7 @@ defined:
 |---|---|---|
 | `toolchain` | `host` \| `image` | Whether the sandbox inherits the host's userland. |
 | `hosts_alias` | `1` | Whether the backend supports `--hosts-alias`. Callers needing an endpoint hostname must refuse when it is absent. |
+| `run_dir` | `1` | Whether the backend supports `--run-dir`. Absent means the backend predates the option and would reject it like any other unknown flag, so a caller passes `--run-dir` only when this is `1` and otherwise leaves the backend to its own scratch location — costless, since `--run-dir` only chooses where scratch lives and has no effect on isolation. |
 | `chromium_own_sandbox` | `0` \| `1` | Whether chromium's own inner sandbox (nested user namespaces) works under this backend, so a caller never has to discover it by trying `--no-sandbox`. Absent defaults by toolchain: `1` for `host`, `0` for `image`. See [visual-browser.md](visual-browser.md). |
 
 `host` means the backend mounts the host's `/usr`, so a binary bound in from
@@ -119,9 +121,12 @@ A backend that cannot hold all six is not a backend; it is a different tool that
 should say so in its own name.
 
 1. **Filesystem.** The only writable paths are `--workdir`, each `--bind-rw`
-   and `--bind-rw-at`, and ephemeral scratch (`/tmp`) that does not survive the
-   run. Everything else is read-only or absent. Nothing the command writes
-   reaches the host except through those paths.
+   and `--bind-rw-at`, and ephemeral scratch (`/tmp` and `$HOME`) that does
+   not survive the run. Scratch is disk-backed, not memory-backed: each
+   invocation gets its own fresh, mode-0700 directory (see `--run-dir`
+   above), removed when the sandbox exits. Everything else is read-only or
+   absent. Nothing the command writes reaches the host except through those
+   paths.
 2. **The home directory is not inherited.** `$HOME` inside is a fresh, empty,
    ephemeral directory. Host dotfiles — `~/.ssh`, cloud credentials, shell
    history, agent config — are absent unless a `--bind-*` names them
@@ -155,9 +160,22 @@ not. A backend documents, in its own header:
   by network position cannot tell the sandbox from the host. A backend on a
   different network model must say what its equivalent is.
 - **Resource limits.** Whether CPU, memory and disk are bounded. The bwrap
-  backend bounds none of them.
+  backend bounds none of them. Scratch (`/tmp` and `$HOME`) is disk, not
+  memory, in both backends, so it no longer competes with host RAM the way a
+  tmpfs did, but neither backend caps its size, so a runaway sandbox can
+  still fill the disk it lives on. In bwrap, the sandbox's root (`/`) is a
+  separate thing from scratch: it is bwrap's own newroot, an ordinary
+  uncapped tmpfs that this backend never remounts or caps, so anything a
+  workload writes outside `$HOME`, `/tmp`, the work dir and the binds still
+  lands in host RAM.
 - **What a SIGKILL leaves behind.** Teardown that runs from a trap does not run
-  when the trap is skipped.
+  when the trap is skipped, which includes this invocation's scratch root —
+  potentially much larger than the small per-run state dir each backend also
+  leaves. Both backends sweep for orphaned scratch roots on every new
+  invocation, as a backstop: each root's own lock file says whether its
+  owning process is still alive (a still-running sandbox is never touched,
+  regardless of age), and only a root from before this lock existed falls
+  back to an age check.
 
 ## Backends
 
