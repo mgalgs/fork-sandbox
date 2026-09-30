@@ -11268,6 +11268,8 @@ claude_launch_checks=(
     'ANTHROPIC_BASE_URL="$CLAUDE_PROXY_BASE_URL"'
     'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1'
     'DISABLE_AUTOUPDATER=1'
+    'CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1'
+    'BASH_MAX_TIMEOUT_MS=3600000'
     'TERM=dumb'
     'env "${leg_env[@]}" "${claude_argv[@]}"'
     'claude --dangerously-skip-permissions --print --verbose'

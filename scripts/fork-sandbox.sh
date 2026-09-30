@@ -5889,7 +5889,16 @@ if [[ "$harness" == "claude" || "$review_harness" == "claude" \
     # jq builds it so the path is escaped properly rather than interpolated
     # into hand-written JSON. Stop takes no matcher; PostToolUse matches every
     # tool, because an addendum is not about any particular one.
+    #
+    # env: a headless session ends when its turn does, and nothing wakes it
+    # for a background command's result, so background tasks are switched
+    # off; the Bash timeout cap is raised so a long suite can run in the
+    # foreground instead. Mirrored in fork-sandbox-k8s-entrypoint.sh.
     jq -n --arg hook "$inbox_hook" '{
+        env: {
+            CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: "1",
+            BASH_MAX_TIMEOUT_MS: "3600000",
+        },
         hooks: {
             PostToolUse: [ { matcher: "*",
                              hooks: [ { type: "command", command: $hook, timeout: 20 } ] } ],

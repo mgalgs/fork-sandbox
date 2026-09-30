@@ -1085,8 +1085,11 @@ else
     # continuation names its own. The inbox hook's state paths are set
     # only while a refreshing run has a per-leg directory (claude_hook_dir).
     run_claude_attempt() {
+        # No background tasks, and a raised Bash timeout cap: see the env
+        # block in fork-sandbox.sh's inbox settings file.
         local -a leg_env=(ANTHROPIC_BASE_URL="$CLAUDE_PROXY_BASE_URL"
             CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 DISABLE_AUTOUPDATER=1
+            CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1 BASH_MAX_TIMEOUT_MS=3600000
             TERM=dumb)
         if [[ -n "${claude_hook_dir:-}" ]]; then
             leg_env+=("FORK_SANDBOX_NUDGE_MARKER=$claude_hook_dir/nudged"

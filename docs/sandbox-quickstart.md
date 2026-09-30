@@ -14,6 +14,12 @@ tailnet route. A headless Claude session works there unattended, with every
 permission check bypassed, which is safe *because* the sandbox holds nothing
 worth stealing and no way to push.
 
+The session is one turn: when it stops, the run ends, and nothing wakes it
+later. So a Claude session runs with background tasks switched off
+(`CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`) and a one-hour Bash timeout cap,
+which keeps a long test suite in the foreground rather than killed at exit
+along with the session's uncommitted work.
+
 Results come home on their own:
 
 - a task run commits on a branch, which is **fetched back** into your repo;

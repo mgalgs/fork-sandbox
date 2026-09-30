@@ -459,6 +459,10 @@ if [[ -n "$rd_mc" ]]; then
     fi
     contains "the maintainer settings file names the hook" \
         "$rd_mc/inbox/.inbox-hook.sh" "$(cat "$rd_mc/inbox/.settings.json" 2>/dev/null)"
+    check "the settings file switches background tasks off" "1" \
+        "$(jq -r '.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS' "$rd_mc/inbox/.settings.json" 2>/dev/null)"
+    check "the settings file raises the Bash timeout cap to an hour" "3600000" \
+        "$(jq -r '.env.BASH_MAX_TIMEOUT_MS' "$rd_mc/inbox/.settings.json" 2>/dev/null)"
     mnt_line="$(grep '^maintainer_sandbox_cmd=' "$rd_mc/run.sh")"
     contains "the claude maintainer command carries the inbox settings" \
         "--settings $rd_mc/inbox/.settings.json" "$mnt_line"
