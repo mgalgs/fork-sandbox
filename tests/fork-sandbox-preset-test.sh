@@ -800,6 +800,38 @@ refuses "a composed pipeline with exactly one code step refuses --model" \
     "composed pipeline; edit the preset or pick another" \
     --preset composed-reviewfirst --model haiku
 
+# --harness/--model are refused against a composed pipeline (above), so the
+# top-level harness=/model= --dry-run reports has nowhere else to come from
+# but step 1's own seat -- before the fix these always fell back to the
+# phantom code seat's own hardcoded "claude" default instead, regardless of
+# what the preset's first step actually named.
+cat > "$presets_dir/composed-reviewfirst-codex.yaml" <<'EOF'
+agents:
+  cxreviewer:
+    harness: codex
+    model: gpt-5.6-sol
+  coder:
+    harness: claude
+    model: sonnet
+pipeline:
+  - action: review
+    repeat: 1
+    agent: cxreviewer
+    fix_agent: coder
+  - action: code
+    agent: coder
+EOF
+out="$(run --preset composed-reviewfirst-codex 2>"$err")"
+check "a composed pipeline's --dry-run harness/model name step 1's own seat, not the phantom code seat" \
+    $'preset=composed-reviewfirst-codex\nharness=codex\nmodel=gpt-5.6-sol' "$out"
+
+# A legacy-shaped pipeline (code first, review/maintain at most once each,
+# in that order) never runs the composed step-1 seat lookup above -- its
+# harness=/model= lines must stay exactly what they always were.
+out="$(run --preset fast 2>"$err")"
+check "a legacy-shaped preset's --dry-run harness/model is unaffected by the composed-pipeline fix" \
+    $'preset=fast\nharness=claude\nmodel=haiku' "$out"
+
 # The code seat's endpoint: a k8s-only key, so a local launch refuses it
 # before the dry-run exit -- the k8s-side behavior is the stubbed dispatch
 # test in section G.
@@ -1463,7 +1495,7 @@ python3 "$repo_dir/scripts/fork-sandbox-pipeline-spec.py" \
         "step	3	agent	reviewer"
 out="$(run --pipeline csonnet2-ropus-rsonnet-mopus-msonnet 2>"$err")"
 check "repeated review/maintain stages compile" \
-    $'pipeline=csonnet2-ropus-rsonnet-mopus-msonnet\nharness=claude\nmodel=' \
+    $'pipeline=csonnet2-ropus-rsonnet-mopus-msonnet\nharness=claude\nmodel=sonnet' \
     "$out"
 contains "a composed --pipeline spec with repeated stages announces its step count" \
     "$(cat "$err")" \
@@ -1989,6 +2021,116 @@ if [[ -n "${rd_cred:-}" ]]; then
     fi
 fi
 
+# A composed pipeline whose step 1 is not code: run.env's and summary.json's
+# flat harness/model fields used to always name the phantom code seat's own
+# "claude" default (--harness/--model have nowhere else to come from, and
+# are refused against a composed preset), no matter which harness the
+# preset's actual first step -- the leg that actually starts the run -- ran
+# on. A real launch proves the fix reaches both files, not just --dry-run.
+cat > "$real_presets/composed-reviewfirst-codex.yaml" <<'EOF'
+agents:
+  cxreviewer:
+    harness: codex
+    model: gpt-5.6-sol
+  coder:
+    harness: claude
+    model: sonnet
+pipeline:
+  - action: review
+    repeat: 1
+    agent: cxreviewer
+    fix_agent: coder
+  - action: code
+    agent: coder
+EOF
+prep_stub $'approved\ncommit'
+rd_rfc="$(run_stubbed --preset composed-reviewfirst-codex \
+    --branch "sandbox-test-composed-reviewfirst-codex-$$")" && tmpdirs+=("$rd_rfc")
+if [[ -n "${rd_rfc:-}" ]]; then
+    check "run.env's harness names step 1's own seat, not the phantom code seat" \
+        "codex" "$(sed -n 's/^harness=//p' "$rd_rfc/run.env" | head -1)"
+    check "run.env's model names step 1's own seat, not the phantom code seat" \
+        "gpt-5.6-sol" "$(sed -n 's/^model=//p' "$rd_rfc/run.env" | head -1)"
+    check "summary.json's harness names step 1's own seat, not the phantom code seat" \
+        "codex" "$(jq -r '.harness' "$rd_rfc/summary.json")"
+    check "summary.json's model names step 1's own seat, not the phantom code seat" \
+        "gpt-5.6-sol" "$(jq -r '.model' "$rd_rfc/summary.json")"
+else
+    no "run.env's harness names step 1's own seat, not the phantom code seat"
+    no "run.env's model names step 1's own seat, not the phantom code seat"
+    no "summary.json's harness names step 1's own seat, not the phantom code seat"
+    no "summary.json's model names step 1's own seat, not the phantom code seat"
+fi
+
+# A composed pipeline whose step 1 is pi-local with no --model: the model
+# is only known once agent-sandboxed discovers it from the endpoint at run
+# time (the "agent-sandboxed: pi against <model> at <url>" banner), so
+# there is nothing for the step-1 override above to have resolved at
+# launch. The override must fall back to the banner-recovered model rather
+# than clobber it with the empty launch-time value. Two code steps (not
+# code/review/maintain) keeps this a composed, not legacy-shaped, preset.
+cat > "$real_presets/composed-pilocal-step1.yaml" <<'EOF'
+agents:
+  coder:
+    harness: pi-local
+  fixer:
+    harness: claude
+    model: sonnet
+pipeline:
+  - action: code
+    agent: coder
+  - action: code
+    agent: fixer
+EOF
+prep_stub 'noop'
+rd_pilocal1="$(run_stubbed --preset composed-pilocal-step1 \
+    --branch "sandbox-test-composed-pilocal-step1-$$")" && tmpdirs+=("$rd_pilocal1")
+if [[ -n "${rd_pilocal1:-}" ]]; then
+    check "run.env's harness names the sealed step 1 seat, pi-local folded to pi" \
+        "pi" "$(sed -n 's/^harness=//p' "$rd_pilocal1/run.env" | head -1)"
+    check "run.env's model keeps step 1's discovered model, not the empty launch-time one" \
+        "vendor/discovered-model" "$(sed -n 's/^model=//p' "$rd_pilocal1/run.env" | head -1)"
+    check "summary.json's model keeps step 1's discovered model, not null" \
+        "vendor/discovered-model" "$(jq -r '.model' "$rd_pilocal1/summary.json")"
+else
+    no "run.env's harness names the sealed step 1 seat, pi-local folded to pi"
+    no "run.env's model keeps step 1's discovered model, not the empty launch-time one"
+    no "summary.json's model keeps step 1's discovered model, not null"
+fi
+
+# --dry-run's early, own-pair resolution of a composed pipeline's step 1
+# (composed_step1_harness/composed_step1_model, above) used to fold
+# pi-local to pi BEFORE calling resolve_model, while the seat-resolution
+# loop that resolves the same step for the real run (s1_harness/s1_model,
+# below) calls resolve_model with the raw, unfolded "pi-local". An
+# aliases.conf row keyed on "pi-local" matched one call and not the other,
+# so --dry-run could print a different model than the run would actually
+# send. Prove the two now agree by giving --dry-run an alias only a
+# "pi-local"-keyed row would resolve.
+printf 'pi-local qalias vendor/aliased-model\n' > "$real_cfg/aliases.conf"
+cat > "$real_presets/composed-pilocal-alias.yaml" <<'EOF'
+agents:
+  coder:
+    harness: pi-local
+    model: qalias
+  fixer:
+    harness: claude
+    model: sonnet
+pipeline:
+  - action: code
+    agent: coder
+  - action: code
+    agent: fixer
+EOF
+if out="$(HOME="$launcher_home" FORK_SANDBOX_CONFIG_DIR="$real_cfg" "$launcher" \
+    --dry-run --preset composed-pilocal-alias "$proj" "$handoff" 2>"$err")"; then
+    contains "dry-run resolves a pi-local-keyed alias for a composed step 1" \
+        "$out" "model=vendor/aliased-model"
+else
+    no "dry-run resolves a pi-local-keyed alias for a composed step 1" "$(cat "$err")"
+fi
+rm -f "$real_cfg/aliases.conf"
+
 # A codex seat that appears only on a later step (the implement and first
 # review steps are claude; the second review and the maintain step are
 # codex, the same shape as composed-codex-step.yaml above) must still trip
@@ -2226,6 +2368,8 @@ if rd_ro="$(run_stubbed --pipeline rhaiku-mopus --checkout "ro-target-$$" \
         "$(jq -r '.total_cost_usd' "$rd_ro/summary.json")"
     check "pipeline.json records review then maintain, no code step" \
         "review,maintain" "$(jq -r '[.steps[].action] | join(",")' "$rd_ro/pipeline.json")"
+    check "run.env's first_leg_kind names the review leg that actually claims events.jsonl" \
+        "review" "$(sed -n 's/^first_leg_kind=//p' "$rd_ro/run.env" | head -1)"
 else
     no "a read-only review-then-maintain launch succeeds"
 fi
@@ -2244,6 +2388,8 @@ if rd_rm="$(run_stubbed --pipeline mopus --checkout "ro-target-$$" \
         "$(jq -r '.ended' "$rd_rm/maintainer-loop.json")"
     check "its leg's events are the run's own" "1" \
         "$( [[ -s "$rd_rm/events.jsonl" ]] && echo 1)"
+    check "run.env's first_leg_kind names the maintainer leg, the phantom implement seat's" \
+        "maintainer" "$(sed -n 's/^first_leg_kind=//p' "$rd_rm/run.env" | head -1)"
 else
     no "a read-only maintain-only launch succeeds"
 fi
@@ -2602,6 +2748,19 @@ if rd_a3="$(run_stubbed --preset sealed-review \
         "vendor/discovered-model" "$(jq -r '.steps[1].fix.model' "$rd_a3/pipeline.json")"
     check "the review step's default fix seat's repeat is the coder's own" \
         "2" "$(jq -r '.steps[1].fix.repeat' "$rd_a3/pipeline.json")"
+    # A legacy-shaped preset (code, then one review step -- this one) never
+    # touches the composed step-1 override further down (that block is
+    # gated on composed_pipeline == 1, unset for this shape); it goes
+    # through record_model="$model" instead, same as a bare --harness
+    # pi-local run. Coverage for the composed-preset case, where the
+    # override used to clobber the discovered model with an empty
+    # launch-time value, lives with composed-pilocal-step1 above.
+    check "run.env's model keeps the sealed coder's discovered model, not the empty launch-time one" \
+        "vendor/discovered-model" "$(sed -n 's/^model=//p' "$rd_a3/run.env" | head -1)"
+    check "summary.json's model keeps the sealed coder's discovered model, not null" \
+        "vendor/discovered-model" "$(jq -r '.model' "$rd_a3/summary.json")"
+    check "run.env's harness still names the sealed coder's own seat" \
+        "pi" "$(sed -n 's/^harness=//p' "$rd_a3/run.env" | head -1)"
 else
     no "sealed-review launch succeeds"
 fi

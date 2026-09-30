@@ -2894,6 +2894,23 @@ mntfix_model_given=false
 [[ -n "$mntfix_model" ]] && mntfix_model_given=true
 resolve_model mntfix_model "$mntfix_model_given" "${mntfix_harness:-$harness}" || exit 1
 
+# A composed pipeline's step 1, for --dry-run's harness=/model= lines,
+# which print before the seat-resolution loop below runs. Kept apart from
+# $harness/$model: the composed --harness/--model refusal reads those.
+composed_step1_harness=""
+composed_step1_model=""
+if [[ "$preset_is_legacy_shaped" != true ]]; then
+    composed_step1_harness="${preset_agent_harness[${preset_step_agent[1]}]}"
+    composed_step1_model="${preset_agent_model[${preset_step_agent[1]}]}"
+    composed_step1_model_given=false
+    [[ -n "$composed_step1_model" ]] && composed_step1_model_given=true
+    # Resolve against the raw "pi-local" spelling, as the seat loop does, so
+    # an aliases.conf row keyed on it matches both; fold to "pi" only after.
+    resolve_model composed_step1_model "$composed_step1_model_given" \
+        "$composed_step1_harness" || exit 1
+    [[ "$composed_step1_harness" == "pi-local" ]] && composed_step1_harness="pi"
+fi
+
 if [[ "$harness" == "pi" && "$network" != "sealed" && -z "$model" ]]; then
     # A sealed pi run (--network sealed) is model-less by construction --
     # its own arm above sets the model flag only if given one, and
@@ -4024,7 +4041,13 @@ if [[ "$dry_run" == true ]]; then
     elif [[ -n "$preset_name" ]]; then
         printf 'preset=%s\n' "$preset_name"
     fi
-    printf 'harness=%s\nmodel=%s\n' "$harness" "$model"
+    # On a composed pipeline $harness/$model are the phantom implement
+    # seat's defaults; step 1 is what actually runs.
+    if [[ "$preset_is_legacy_shaped" != true ]]; then
+        printf 'harness=%s\nmodel=%s\n' "$composed_step1_harness" "$composed_step1_model"
+    else
+        printf 'harness=%s\nmodel=%s\n' "$harness" "$model"
+    fi
     [[ -z "$review_model" ]] || printf 'review_model=%s\n' "$review_model"
     [[ "$review_harness_given" != true ]] || printf 'review_harness=%s\n' "$review_harness"
     if [[ "$maintainer_loop_cap" != "0" ]]; then
@@ -4946,12 +4969,8 @@ fi
 # "s<K>_*" (fs_resolve_harness is nameref-generic on its prefix argument,
 # so this collides with nothing the fixed prefixes above use), plus a
 # second call into "s<K>fix_*" for whichever steps carry a fix seat
-# (review and maintain -- a code step has none). The composed launch path
-# that would read these is refused further up for now, so this loop's
-# output has no reader yet; it exists on its own so the resolution -- and
-# the "fail before the clone" property the fixed calls above already
-# have -- is in place before the run engine that walks the step list
-# needs it.
+# (review and maintain -- a code step has none). Like the fixed calls, it
+# fails before the clone.
 if [[ "$preset_is_legacy_shaped" != true ]]; then
     for ((preset_k = 1; preset_k <= preset_step_count; preset_k++)); do
         preset_k_agent="${preset_step_agent[$preset_k]}"
@@ -4982,6 +5001,17 @@ if [[ "$preset_is_legacy_shaped" != true ]]; then
                 "${preset_step_fix_network[$preset_k]}"
         fi
     done
+fi
+
+# A composed pipeline's "impl" seat is phantom; record step 1, the leg the
+# run starts on. pi-local folds to "pi" as every other seat's record does.
+# s1_* are written through the seat loop's namerefs, which shellcheck cannot see.
+# shellcheck disable=SC2154
+if [[ "$preset_is_legacy_shaped" != true ]]; then
+    record_harness="$s1_harness"
+    [[ "$record_harness" == "pi-local" ]] && record_harness="pi"
+    record_harness_version="$s1_harness_version"
+    record_model="$s1_model"
 fi
 
 # The single spine every run walks: one set of parallel arrays, 1-indexed by
@@ -8617,6 +8647,15 @@ if [[ "$mode" == "review-only" && "$review_loop_cap" == "0" ]]; then
     record_harness="$maintainer_harness"
     record_harness_version="$mnt_harness_version"
     record_model="$maintainer_model"
+fi
+# A composed pipeline's $harness/$model name the phantom "impl" seat; record
+# step 1 instead. s1_model is empty for a pi-local step 1 with no model (it
+# is discovered at run time), so fall back to $model, banner-recovered above.
+if [[ "${composed_pipeline:-0}" == 1 ]]; then
+    record_harness="$s1_harness"
+    [[ "$record_harness" == "pi-local" ]] && record_harness="pi"
+    record_harness_version="$s1_harness_version"
+    record_model="${s1_model:-$model}"
 fi
 
 # Every pi-local seat in this run -- any step (code, review or maintain)
