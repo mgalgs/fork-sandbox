@@ -6849,6 +6849,12 @@ case " $* " in
     *" cat /work/.run-complete "*)
         [[ -n "${K8S_STUB_RUN_COMPLETE:-}" ]] && printf '%s\n' "$K8S_STUB_RUN_COMPLETE"
         exit "${K8S_STUB_SENTINEL_RC:-1}" ;;
+    *" delete pod/"*)
+        # k8s_teardown_claude_proxy's one call -- the only "delete pod/..."
+        # (TYPE/NAME) invocation in the whole script. K8S_STUB_PROXY_DELETE_RC
+        # simulates the delete itself failing (a live-cluster kubectl error),
+        # distinct from every other stubbed call here, which always succeeds.
+        exit "${K8S_STUB_PROXY_DELETE_RC:-0}" ;;
 esac
 exit 0
 STUB
@@ -7088,6 +7094,145 @@ if (( wait12_rt_count >= 3 )); then
 else
     no "--probe: every kubectl call on the probe path carries --request-timeout" \
         "count=$wait12_rt_count: $(cat "$wait_log12")"
+fi
+
+printf '\n== fork-sandbox-k8s.sh wait: terminal-failure cleanup of the claude proxy and token Secret ==\n'
+# k8s_teardown_claude_proxy's one call is the only "delete pod/..." (TYPE/
+# NAME) invocation anywhere in the script (see the waitstub kubectl stub
+# above), so its presence or absence in a case's kubectl log is exactly
+# "did this wait tear the proxy down".
+wait_teardown_ran() {
+    grep -q 'delete pod/.*-claude-proxy service/.*-claude-proxy configmap/.*-claude-proxy-conf networkpolicy/.*-claude-proxy secret/.*-claude-token --ignore-not-found --wait=false' "$1"
+}
+
+# 14. The success path (a completed sentinel) is unchanged: no teardown.
+wait_log14="$(newdir)/kubectl.log"; wait_out14="$(newdir)/out14.txt"; wait_err14="$(newdir)/err14.txt"
+tmpdirs+=("$(dirname "$wait_log14")")
+K8S_STUB_RUN_COMPLETE=0 K8S_STUB_SENTINEL_RC=0 \
+    waitstub_wait "$wait_log14" "$wait_out14" "$wait_err14" \
+    --branch fs-k8s-test-wait-cleanup-success --timeout 5
+if ! wait_teardown_ran "$wait_log14"; then
+    ok "a completed wait (success path) tears nothing down"
+else
+    no "a completed wait (success path) tears nothing down" "$(cat "$wait_log14")"
+fi
+
+# 15. A Failed pod (terminal, non-probe): the proxy and token Secret come
+# down, but the Job, pod and scripts ConfigMap do not -- cmd_wait never
+# issues those deletes itself (only `rm` does), so their absence here is
+# just the flip side of the same log.
+wait_log15="$(newdir)/kubectl.log"; wait_out15="$(newdir)/out15.txt"; wait_err15="$(newdir)/err15.txt"
+tmpdirs+=("$(dirname "$wait_log15")")
+rc=0
+K8S_STUB_POD_PHASE=Failed \
+    waitstub_wait "$wait_log15" "$wait_out15" "$wait_err15" \
+    --branch fs-k8s-test-wait-cleanup-podfailed --timeout 5 || rc=$?
+if (( rc == 2 )) && wait_teardown_ran "$wait_log15" \
+    && ! grep -q 'delete job ' "$wait_log15" \
+    && ! grep -q -- '-scripts' "$wait_log15" \
+    && grep -q 'rm --branch fs-k8s-test-wait-cleanup-podfailed' "$wait_err15"; then
+    ok "a Failed pod tears down the proxy and token Secret, not the Job/pod/scripts ConfigMap"
+else
+    no "a Failed pod tears down the proxy and token Secret, not the Job/pod/scripts ConfigMap" \
+        "rc=$rc log=$(cat "$wait_log15") err=$(cat "$wait_err15")"
+fi
+
+# 16. The same Failed-job terminal case as finding 3, but WITHOUT --probe:
+# the complement of finding 3 proves the teardown really is gated on
+# --probe, not on which terminal condition fired.
+wait_log16="$(newdir)/kubectl.log"; wait_out16="$(newdir)/out16.txt"; wait_err16="$(newdir)/err16.txt"
+tmpdirs+=("$(dirname "$wait_log16")")
+rc=0
+K8S_STUB_JOB_FAILED=True \
+    waitstub_wait "$wait_log16" "$wait_out16" "$wait_err16" \
+    --branch fs-k8s-test-wait-cleanup-jobfailed --timeout 5 || rc=$?
+if (( rc == 2 )) && wait_teardown_ran "$wait_log16"; then
+    ok "a Failed job condition (non-probe) tears down the proxy and token Secret"
+else
+    no "a Failed job condition (non-probe) tears down the proxy and token Secret" \
+        "rc=$rc: $(cat "$wait_log16")"
+fi
+
+# 17. finding 3 itself (--probe + Failed job condition, exit 2): --probe
+# must never delete anything, on ANY exit code, including a terminal one.
+if wait_teardown_ran "$wait_log3"; then
+    no "--probe never tears down the proxy, even on a terminal (exit 2) failure" \
+        "$(cat "$wait_log3")"
+else
+    ok "--probe never tears down the proxy, even on a terminal (exit 2) failure"
+fi
+
+# 18. A timeout (non-probe, exit 1) tears nothing down -- the pod is still
+# running and using the proxy -- and says so plainly, naming both the
+# still-running pod and that nothing refreshes the token until `wait
+# --run-dir` or `resume` runs again.
+wait_log18="$(newdir)/kubectl.log"; wait_out18="$(newdir)/out18.txt"; wait_err18="$(newdir)/err18.txt"
+tmpdirs+=("$(dirname "$wait_log18")")
+rc=0
+waitstub_wait "$wait_log18" "$wait_out18" "$wait_err18" \
+    --branch fs-k8s-test-wait-cleanup-timeout --timeout 0 || rc=$?
+if (( rc == 1 )) && ! wait_teardown_ran "$wait_log18" \
+    && grep -q 'stay up too, for the still-running pod' "$wait_err18" \
+    && grep -q 'nothing' "$wait_err18" && grep -q 'keeps the token fresh' "$wait_err18" \
+    && grep -q "'wait --run-dir' or 'resume' is run again" "$wait_err18" \
+    && grep -q 'rm --branch fs-k8s-test-wait-cleanup-timeout' "$wait_err18"; then
+    ok "a timeout tears nothing down, and says the proxy/token stay up until wait/resume runs again"
+else
+    no "a timeout tears nothing down, and says the proxy/token stay up until wait/resume runs again" \
+        "rc=$rc log=$(cat "$wait_log18") err=$(cat "$wait_err18")"
+fi
+
+# 19. A --probe timeout (exit 1) tears nothing down either -- same promise
+# as finding 17, on the non-terminal exit code.
+if wait_teardown_ran "$wait_log_probe"; then
+    no "a --probe timeout tears nothing down" "$(cat "$wait_log_probe")"
+else
+    ok "a --probe timeout tears nothing down"
+fi
+
+# 20. A malformed sentinel (terminal, non-probe) tears the proxy down too.
+wait_log20="$(newdir)/kubectl.log"; wait_out20="$(newdir)/out20.txt"; wait_err20="$(newdir)/err20.txt"
+tmpdirs+=("$(dirname "$wait_log20")")
+rc=0
+K8S_STUB_RUN_COMPLETE='not-a-number' K8S_STUB_SENTINEL_RC=0 \
+    waitstub_wait "$wait_log20" "$wait_out20" "$wait_err20" \
+    --branch fs-k8s-test-wait-cleanup-malformed --timeout 5 || rc=$?
+if (( rc == 2 )) && wait_teardown_ran "$wait_log20"; then
+    ok "a malformed sentinel tears down the proxy and token Secret"
+else
+    no "a malformed sentinel tears down the proxy and token Secret" "rc=$rc: $(cat "$wait_log20")"
+fi
+
+# 21. A Succeeded pod (terminal, non-probe) tears the proxy down too.
+wait_log21="$(newdir)/kubectl.log"; wait_out21="$(newdir)/out21.txt"; wait_err21="$(newdir)/err21.txt"
+tmpdirs+=("$(dirname "$wait_log21")")
+rc=0
+K8S_STUB_POD_PHASE=Succeeded \
+    waitstub_wait "$wait_log21" "$wait_out21" "$wait_err21" \
+    --branch fs-k8s-test-wait-cleanup-podsucceeded --timeout 0 || rc=$?
+if (( rc == 2 )) && wait_teardown_ran "$wait_log21"; then
+    ok "a Succeeded pod tears down the proxy and token Secret"
+else
+    no "a Succeeded pod tears down the proxy and token Secret" "rc=$rc: $(cat "$wait_log21")"
+fi
+
+# 22. A delete failure (kubectl itself errors removing the proxy/Secret)
+# prints exactly one warning line and must NOT change cmd_wait's own exit
+# code, or write anything to stdout -- stdout is k8s_run_tail's
+# machine-readable exit-code channel, and a cleanup failure is not the
+# agent's exit code.
+wait_log22="$(newdir)/kubectl.log"; wait_out22="$(newdir)/out22.txt"; wait_err22="$(newdir)/err22.txt"
+tmpdirs+=("$(dirname "$wait_log22")")
+rc=0
+K8S_STUB_POD_PHASE=Failed K8S_STUB_PROXY_DELETE_RC=1 \
+    waitstub_wait "$wait_log22" "$wait_out22" "$wait_err22" \
+    --branch fs-k8s-test-wait-cleanup-delfail --timeout 5 || rc=$?
+warn_count22="$(grep -c 'warning: could not remove' "$wait_err22" || true)"
+if (( rc == 2 )) && [[ ! -s "$wait_out22" ]] && (( warn_count22 == 1 )); then
+    ok "a failed proxy/token cleanup keeps the original exit code and empty stdout, warning once"
+else
+    no "a failed proxy/token cleanup keeps the original exit code and empty stdout, warning once" \
+        "rc=$rc stdout='$(cat "$wait_out22")' warn_count=$warn_count22 err=$(cat "$wait_err22")"
 fi
 
 printf '\n== fork-sandbox-k8s.sh wait --run-dir: the claude token keeper ==\n'

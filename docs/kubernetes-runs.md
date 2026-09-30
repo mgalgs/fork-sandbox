@@ -105,6 +105,15 @@ the run can never complete through this `wait` again (pod `Failed`, pod
 sentinel) — give the run up; exit `1` is the probe's own deadline with
 the run possibly still going, or a usage error — probe again.
 
+A terminal (exit `2`) `wait` that is not `--probe` also removes the run's
+claude proxy and its token Secret once the pod is known — nothing is left
+to refresh that token, and nothing will use it again. `--probe` never
+deletes anything, on any exit code, and a timeout (exit `1`) leaves the
+proxy and token up for the still-running pod. Either way the Job, the
+agent pod, and its scripts ConfigMap are left in place for inspection; see
+"the claude token keeper" below for the proxy/token lifecycle in full, and
+`rm --branch` removes whatever a given case left behind.
+
 Because a *standalone* `wait` may begin after the run already finished,
 it also treats a `Succeeded` pod as terminal: at that point the entrypoint
 has exited — idled out its TTL, or exited right after a successful fetch —
@@ -1417,7 +1426,11 @@ resolved credential's file path (never its content) as
   timeout, a signal — via an EXIT trap (`k8s_claude_keeper_stop`), which
   also protects an in-flight refresh with
   `_fs_claude_refresh_emergency_cleanup`, exactly as claude-sandboxed's own
-  live-sync loop does. With no `--run-dir`, or a run.env with no recorded
+  live-sync loop does. On a non-`--probe` terminal exit (pod `Failed` or
+  `Succeeded`, Job `Failed`, a malformed sentinel), the same trap also
+  deletes the run's claude proxy objects and its token Secret, since
+  nothing is left to refresh that token; a timeout or `--probe` leaves
+  them up. With no `--run-dir`, or a run.env with no recorded
   path (a Keychain-backed credential, or a run submitted before this
   existed), `cmd_wait` starts no keeper and says so once. A hand-run
   `wait --branch NAME` needs `--run-dir DIR` to get a keeper at all — `run`

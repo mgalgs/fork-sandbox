@@ -6515,6 +6515,31 @@ k8s_claude_keeper_stop() {
     true
 }
 
+# k8s_teardown_claude_proxy <safe_name>
+#
+# Deletes this run's claude proxy (every object manifests/k8s/31-claude-
+# proxy.yaml renders) and its claude-token Secret, by name. A no-op for a
+# pi run. Called only from cmd_wait's EXIT trap after a terminal failure:
+# nothing will refresh that token again. Never on a timeout, where the
+# still-running pod needs the proxy. When 31-claude-proxy.yaml gains an
+# object, add it here too.
+#
+# Output goes to stderr only: stdout is cmd_wait's exit-code channel. A
+# delete failure warns once and returns 1; the caller ignores it.
+k8s_teardown_claude_proxy() {
+    local safe_name="$1"
+    if ! kubectl delete \
+        pod/"$safe_name-claude-proxy" \
+        service/"$safe_name-claude-proxy" \
+        configmap/"$safe_name-claude-proxy-conf" \
+        networkpolicy/"$safe_name-claude-proxy" \
+        secret/"$safe_name-claude-token" \
+        --ignore-not-found --wait=false >&2; then
+        echo "fork-sandbox-k8s: warning: could not remove this run's claude proxy and token Secret; they may still be live in the cluster." >&2
+        return 1
+    fi
+}
+
 # cmd_run's wait phase, standalone: poll the run's pod until its entrypoint
 # writes /work/.run-complete (which holds the agent's own exit code),
 # failing fast on a dead pod, a Failed job condition, a timeout or a
@@ -6536,6 +6561,9 @@ k8s_claude_keeper_stop() {
 # going) or a usage error.
 cmd_wait() {
     local timeout=3600 branch="" project_path="${project_path-}" probe=false run_dir=""
+    # Set just before a terminal exit 2 once the pod is known, never under
+    # --probe; the EXIT trap then tears down the claude proxy.
+    local wait_terminal_teardown=false
     while (( $# )); do
         case "$1" in
             --branch) branch="${2:?--branch requires a name}"; shift 2 ;;
@@ -6618,8 +6646,15 @@ cmd_wait() {
     # known (every exit above this point never waited on anything worth
     # keeping alive), and stopped on every exit path below via this trap,
     # including a signal -- k8s_claude_keeper_stop is idempotent when no
-    # keeper was ever started.
-    trap 'k8s_claude_keeper_stop' EXIT
+    # keeper was ever started. The keeper stops before any teardown. On the
+    # success path cmd_wait returns rather than exits, so this trap fires
+    # after its locals are gone: the ${...:-} defaults matter under set -u.
+    trap '
+        k8s_claude_keeper_stop
+        if [[ "${wait_terminal_teardown:-false}" == true ]]; then
+            k8s_teardown_claude_proxy "${safe_name:-}" || true
+        fi
+    ' EXIT
     if [[ -n "$run_dir" && -f "$run_dir/run.env" ]]; then
         local wait_harness claude_cred_path
         wait_harness="$(read_env_value "$run_dir/run.env" harness || true)"
@@ -6686,6 +6721,7 @@ cmd_wait() {
             echo "fork-sandbox-k8s: the job and pod are left in place for" >&2
             echo "inspection. Remove them with:" >&2
             echo "  fork-sandbox-k8s.sh rm --branch $branch" >&2
+            [[ "$probe" == true ]] || wait_terminal_teardown=true
             exit 2
         fi
         if [[ "$phase" == Succeeded ]]; then
@@ -6701,6 +6737,7 @@ cmd_wait() {
             echo "work cannot be recovered through fetch. Remove the job and pod" >&2
             echo "with:" >&2
             echo "  fork-sandbox-k8s.sh rm --branch $branch" >&2
+            [[ "$probe" == true ]] || wait_terminal_teardown=true
             exit 2
         fi
         job_failed="$(kubectl get job "${probe_kubectl_opts[@]}" "$safe_name" \
@@ -6712,6 +6749,7 @@ cmd_wait() {
             echo "fork-sandbox-k8s: the job and pod are left in place for" >&2
             echo "inspection. Remove them with:" >&2
             echo "  fork-sandbox-k8s.sh rm --branch $branch" >&2
+            [[ "$probe" == true ]] || wait_terminal_teardown=true
             exit 2
         fi
 
@@ -6724,10 +6762,14 @@ cmd_wait() {
             echo "Error: timed out after ${timeout}s waiting for branch" >&2
             echo "$branch to finish. The pod is still running, holding its" >&2
             echo "work -- run does not fetch a half-finished branch and does" >&2
-            echo "not remove a still-running pod. Fetch by hand once it" >&2
-            echo "completes:" >&2
+            echo "not remove a still-running pod. Its claude proxy and token" >&2
+            echo "Secret stay up too, for the still-running pod; nothing" >&2
+            echo "keeps the token fresh once this wait exits, unless" >&2
+            echo "'wait --run-dir' or 'resume' is run again." >&2
+            echo "Fetch by hand once it completes:" >&2
             echo "  fork-sandbox-k8s.sh fetch --branch $branch${project_path:+ $project_path}" >&2
-            echo "and clean up afterwards with:" >&2
+            echo "and clean up (job, pod, proxy and token Secret alike)" >&2
+            echo "afterwards with:" >&2
             echo "  fork-sandbox-k8s.sh rm --branch $branch" >&2
             exit 1
         fi
@@ -6761,6 +6803,7 @@ cmd_wait() {
         echo "  fork-sandbox-k8s.sh fetch --branch $branch${project_path:+ $project_path}" >&2
         echo "and clean up afterwards with:" >&2
         echo "  fork-sandbox-k8s.sh rm --branch $branch" >&2
+        [[ "$probe" == true ]] || wait_terminal_teardown=true
         exit 2
     fi
     local agent_rc="$run_complete"
