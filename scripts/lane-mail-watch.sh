@@ -74,10 +74,24 @@ if (( wait_mode )) && (( once )); then
     exit 2
 fi
 
+scan_err="$(mktemp)"
+trap 'rm -f -- "$scan_err"' EXIT
+
+# Sets $unread to the inbox TSV. Only stdout is parsed: a warning on stderr
+# from a scan that succeeded (a getcwd error from a deleted cwd, say) would
+# otherwise read as a "new" mail line. On failure $unread holds the error.
+scan_inbox() {
+    if unread="$(lane-mail.sh inbox "$lane" 2>"$scan_err")"; then
+        return 0
+    fi
+    unread="$(cat -- "$scan_err")${unread:+ $unread}"
+    return 1
+}
+
 if (( wait_mode )); then
     fail_count=0
     while :; do
-        if unread="$(lane-mail.sh inbox "$lane" 2>&1)"; then
+        if scan_inbox; then
             fail_count=0
             if [[ -n "$unread" ]]; then
                 while IFS=$'\t' read -r mid _tid _pos from subject; do
@@ -99,7 +113,7 @@ fi
 
 declare -A printed=()
 while :; do
-    if unread="$(lane-mail.sh inbox "$lane" 2>&1)"; then
+    if scan_inbox; then
         while IFS=$'\t' read -r mid _tid _pos from subject; do
             [[ -n "$mid" ]] || continue
             [[ -n "${printed[$mid]:-}" ]] && continue

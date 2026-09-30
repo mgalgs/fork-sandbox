@@ -43,6 +43,7 @@ case "$cmd" in
                 exit 1
             fi
         fi
+        [[ -n "${STDERR_NOISE:-}" ]] && printf '%s\n' "$STDERR_NOISE" >&2
         cat "${INBOX_FILE:?INBOX_FILE not set}" 2>/dev/null
         ;;
     *)
@@ -152,6 +153,51 @@ if (( rc7 == 0 )) && [[ "$out7" == "$want7" ]]; then
     ok "--once streaming output is unchanged"
 else
     no "--once streaming output is unchanged" "rc=$rc7 out=$out7"
+fi
+
+noise=$'shell-init: error retrieving current directory: getcwd: cannot access parent directories\tNo such file or directory'
+
+echo "== stderr from a successful scan is not parsed as mail (--wait) =="
+dir8="$scratch/case8"; new_env "$dir8"
+printf 'm6\tt5\t0\t@fifth\tReal mail\n' >"$dir8/inbox.tsv"
+out8="$(STDERR_NOISE="$noise" run_wait "$dir8" 2>/dev/null)"; rc8=$?
+want8="$(expect_line x m6 @fifth 'Real mail')"
+if (( rc8 == 0 )) && [[ "$out8" == "$want8" ]]; then
+    ok "--wait: stderr noise on a successful scan prints no mail line"
+else
+    no "--wait: stderr noise on a successful scan prints no mail line" "rc=$rc8 out=$out8"
+fi
+
+echo "== stderr from a successful scan with an empty inbox does not wake --wait =="
+dir9="$scratch/case9"; new_env "$dir9"
+PATH="$stub_bin:$PATH" INBOX_FILE="$dir9/inbox.tsv" FAIL_COUNTDOWN_FILE="$dir9/countdown" STDERR_NOISE="$noise" \
+    timeout 1 "$watcher" testlane --interval 0.1 --wait >"$scratch/case9.out" 2>/dev/null; rc9=$?
+out9="$(cat "$scratch/case9.out")"
+if (( rc9 == 124 )) && [[ -z "$out9" ]]; then
+    ok "--wait: stderr noise alone keeps waiting"
+else
+    no "--wait: stderr noise alone keeps waiting" "rc=$rc9 out=$out9"
+fi
+
+echo "== stderr from a successful scan is not parsed as mail (--once) =="
+dir10="$scratch/case10"; new_env "$dir10"
+out10="$(PATH="$stub_bin:$PATH" INBOX_FILE="$dir10/inbox.tsv" FAIL_COUNTDOWN_FILE="$dir10/countdown" STDERR_NOISE="$noise" \
+    timeout 10 "$watcher" testlane --once 2>/dev/null)"; rc10=$?
+if (( rc10 == 0 )) && [[ -z "$out10" ]]; then
+    ok "--once: stderr noise on a successful scan prints nothing"
+else
+    no "--once: stderr noise on a successful scan prints nothing" "rc=$rc10 out=$out10"
+fi
+
+echo "== a failed scan reports the stderr text (--once) =="
+dir11="$scratch/case11"; new_env "$dir11"
+echo 1 >"$dir11/countdown"
+out11="$(PATH="$stub_bin:$PATH" INBOX_FILE="$dir11/inbox.tsv" FAIL_COUNTDOWN_FILE="$dir11/countdown" \
+    timeout 10 "$watcher" testlane --once 2>/dev/null)"; rc11=$?
+if (( rc11 == 0 )) && [[ "$out11" == "[lane-mail] @testlane: inbox scan failed: stub: simulated inbox failure" ]]; then
+    ok "--once: a failed scan prints one error line with the stderr text"
+else
+    no "--once: a failed scan prints one error line with the stderr text" "rc=$rc11 out=$out11"
 fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
