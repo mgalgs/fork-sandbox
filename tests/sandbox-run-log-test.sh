@@ -265,6 +265,18 @@ record "$rd_retries" >/dev/null 2>"$tmp/err"
 check "a run's leg_retries is recorded" '2' \
     "$(query show "$(basename "$rd_retries")" | jq -c '.leg_retries')"
 
+printf '\n== record: uncommitted_files and uncommitted_files_list are lifted from summary.json ==\n'
+rd_uncommitted="$(mk_run_dir uncommitted)"
+tmpdirs+=("$rd_uncommitted")
+sed 's/"exit_code":0/"uncommitted_files":2,"uncommitted_files_list":[" M file.txt","?? untracked.txt"],"exit_code":0/' \
+    "$rd_kit/summary.json" > "$rd_uncommitted/summary.json"
+printf '0\n' > "$rd_uncommitted/exit-code"
+record "$rd_uncommitted" >/dev/null 2>"$tmp/err"
+check "a run's uncommitted_files is recorded" '2' \
+    "$(query show "$(basename "$rd_uncommitted")" | jq -c '.uncommitted_files')"
+check "a run's uncommitted_files_list is recorded" '[" M file.txt","?? untracked.txt"]' \
+    "$(query show "$(basename "$rd_uncommitted")" | jq -c '.uncommitted_files_list')"
+
 rd_nokit="$(mk_run_dir nokit)"
 tmpdirs+=("$rd_nokit")
 sed 's/"agent_kit":\["kit-alpha","kit-beta"\]/"agent_kit":[]/' "$rd_kit/summary.json" > "$rd_nokit/summary.json"

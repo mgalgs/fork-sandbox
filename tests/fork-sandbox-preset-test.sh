@@ -2103,7 +2103,7 @@ if rd_a="$(run_stubbed --preset rep3 \
     check "pipeline.json's step 0 harness is claude" "claude" \
         "$(jq -r '.steps[0].harness' "$rd_a/pipeline.json")"
     check "legacy preset run keeps its historical filename set" \
-        $'continuation-prompt-header.md\nevents-code-2.jsonl\nevents-code-3.jsonl\nevents.jsonl\nexit-code\nhandoff-original.md\nhandoff.md\npid\npipeline.json\npreset.json\npreset.yaml\nprogress.json\nrun-source\nrun.env\nrun.sh\nsandbox.log\nsummary.json\nsummary.txt' \
+        $'continuation-prompt-header.md\nevents-code-2.jsonl\nevents-code-3.jsonl\nevents.jsonl\nexit-code\ngit-status.log\ngit-status.txt\nhandoff-original.md\nhandoff.md\npid\npipeline.json\npreset.json\npreset.yaml\nprogress.json\nrun-source\nrun.env\nrun.sh\nsandbox.log\nsummary.json\nsummary.txt' \
         "$(find "$rd_a" -maxdepth 1 -type f -exec basename {} \; | LC_ALL=C sort)"
 else
     no "rep3 launch succeeds"

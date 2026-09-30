@@ -29,6 +29,10 @@ Results come home on their own:
 - a PR review writes `REVIEW.md` and a final summary you read from the host;
 - every event lands in a run directory you can watch live.
 
+Only committed work is fetched back. Anything left uncommitted stays in the
+clone, unreviewed, and the run summary says so in a `WARNING` (see the
+README's "How a run works").
+
 The sandbox contains the session while it runs. It does **not** make the code
 the session wrote safe — review the fetched branch like a stranger's PR.
 

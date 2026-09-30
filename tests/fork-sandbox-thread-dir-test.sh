@@ -56,7 +56,11 @@ STUB
 cat > "$work/bin/sandbox-backend-test" <<'STUB'
 #!/usr/bin/env bash
 if [[ "${1-}" == --capabilities ]]; then printf 'toolchain=host\n'; exit 0; fi
-printf '%s\n' "$@" > "$FIXTURE_ARGV"
+# The run-end uncommitted-work check invokes this same stub a second time,
+# after the harness leg -- capture only the first call, the harness leg's
+# own, which is what every caller of this fixture actually wants to assert
+# on.
+[[ -e "$FIXTURE_ARGV" ]] || printf '%s\n' "$@" > "$FIXTURE_ARGV"
 while [[ $# -gt 0 && "$1" != -- ]]; do shift; done
 [[ $# -eq 0 ]] || { shift; "$@"; }
 STUB

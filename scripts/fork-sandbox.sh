@@ -7535,6 +7535,20 @@ launcher_session_id="${CLAUDE_CODE_SESSION_ID:-}"
         printf '%q ' "${codex_auth_dirs[@]}"
     fi
     printf ')\n'
+    # The end-of-run uncommitted-work check (below, in the RUNNER heredoc)
+    # runs its own one-off backend invocation rather than reusing
+    # sandbox_cmd -- it needs no harness binds, only the clone itself -- but
+    # a --shared clone (fs_make_clone) still reads its history through
+    # these object stores via .git/objects/info/alternates, so it needs the
+    # same --bind-ro binds fs_build_sandbox_cmd spliced into sandbox_cmd
+    # above, or git sees no objects at all inside the sandbox. Serialized
+    # here the same %q-per-element way the other launcher-computed arrays
+    # above are, since the check itself runs in the runner, not here.
+    printf 'fs_alternates=('
+    if [[ "${#FS_ALTERNATES[@]}" -gt 0 ]]; then
+        printf '%q ' "${FS_ALTERNATES[@]}"
+    fi
+    printf ')\n'
     printf 'model=%q\n' "$model"
     printf 'review_model=%q\n' "$review_model"
     printf 'review_harness=%q\n' "$review_harness"
@@ -10228,6 +10242,67 @@ if [[ "$rc" != "0" ]]; then
     printf 'fork-sandbox: the session exited %s\n' "$rc"
 fi
 
+# Does the clone still hold uncommitted work -- modified, staged, or
+# untracked-and-not-ignored files the session never committed? Checked
+# INSIDE the sandbox, under the same confinement the harness itself ran
+# under, for the same reason nothing below runs git against the clone on
+# the HOST: the clone's .git/config is writable by the sandbox, and a key
+# such as core.fsmonitor runs on the HOST the next time anything there
+# executes git. Everything fork-sandbox itself writes into the clone lives
+# under .git (fs_lock_clone_dir's own comment says why), never the working
+# tree, so this reflects the session's own files only. git status --
+# porcelain's own untrusted stdout goes straight to a file; nothing here
+# parses it as anything but text, and nothing re-runs git on it.
+# Best-effort: a backend that fails to even run this -- as opposed to
+# running it and finding nothing -- leaves the fact unknown rather than
+# guessed at zero (see uncommitted_files below). The timeout is short
+# because it runs before the fetch, and a hung check must not hold that up.
+#
+# Resolved fresh here rather than carried from the launcher: this runner
+# starts in tmux's own environment (see FORK_SANDBOX_BACKEND's own comment
+# above, where claude-sandboxed resolves it again for the same reason), so
+# a value baked in at generation time could name a different backend than
+# the one actually on PATH when this process runs.
+#
+# The clone itself is bound by --workdir, but a --shared clone
+# (fs_make_clone) carries no objects of its own: it reads its history
+# through .git/objects/info/alternates, pointing at the origin's (and, for
+# a --shared origin, on down the chain). Without those stores bound too,
+# git sees the refs but not the objects behind them -- "bad object HEAD" --
+# so every ordinary run would report the check as failed rather than
+# clean. fs_alternates is fs_collect_alternates's own answer for this
+# clone, frozen into run.sh at generation time (see its own comment there).
+uncommitted_bind_flags=()
+if [[ "${#fs_alternates[@]}" -gt 0 ]]; then
+    for uncommitted_alt in "${fs_alternates[@]}"; do
+        uncommitted_bind_flags+=(--bind-ro "$uncommitted_alt")
+    done
+fi
+if fs_resolve_backend "$script_dir"; then
+    "$FS_TIMEOUT" 20 "$FS_BACKEND_BIN" --workdir "$clone_dir" \
+        "${uncommitted_bind_flags[@]}" --net sealed \
+        --hostname fork-sandbox-status -- git status --porcelain \
+        --untracked-files=all \
+        > "$run_dir/git-status.txt" 2> "$run_dir/git-status.log"
+    uncommitted_status_rc=$?
+else
+    : > "$run_dir/git-status.txt"
+    printf 'fork-sandbox: could not resolve the sandbox backend for the ' \
+        > "$run_dir/git-status.log"
+    printf 'uncommitted-work check.\n' >> "$run_dir/git-status.log"
+    uncommitted_status_rc=1
+fi
+uncommitted_files=""
+uncommitted_paths=()
+if (( uncommitted_status_rc == 0 )); then
+    while IFS= read -r uncommitted_line; do
+        [[ -n "$uncommitted_line" ]] || continue
+        uncommitted_paths+=("$uncommitted_line")
+    done < <(tr -d '\000-\010\013-\037\177' < "$run_dir/git-status.txt")
+    uncommitted_files="${#uncommitted_paths[@]}"
+fi
+uncommitted_paths_capped=("${uncommitted_paths[@]:0:20}")
+
 # Bring the work back. Fetching is the one way into the real repo that cannot
 # be turned into code execution by the clone's config, so the work crosses
 # back as objects and nothing else. Nothing below runs git inside the clone:
@@ -10613,7 +10688,8 @@ loop_findings() {
         printf '\nNothing landed in %s. Whatever the session wrote is still\n' "$origin_repo"
         printf 'in the clone at %s\n' "$clone_dir"
     fi
-    # Last, so it is the hardest line in the summary to skim past.
+    # Second-to-last -- the uncommitted-files warning below is what is now
+    # last, and the hardest line in the summary to skim past.
     if [[ -n "$author_email_bad" ]]; then
         printf '\nWARNING: a returned commit was authored by an unexpected address.\n'
         printf '  expected: %s   (the user.email %s resolves to)\n' \
@@ -10656,6 +10732,26 @@ loop_findings() {
             printf 'unflagged, since the check only ever looks at its own base..branch.\n'
         fi
     fi
+    # Last, so it is the hardest line in the summary to skim past: shown
+    # whether or not the run also committed something, since a leg can
+    # leave files uncommitted even on a branch that otherwise landed, and
+    # an uncommitted file is not fetched back -- review and maintainer
+    # never see it, and it does not leave the sandbox at all.
+    if [[ -z "$uncommitted_files" ]]; then
+        printf '\nWARNING: could not check the clone for uncommitted work.\n'
+        printf 'See %s for the sandboxed git status error.\n' "$run_dir/git-status.log"
+    elif (( uncommitted_files > 0 )); then
+        printf '\nWARNING: the clone holds %s uncommitted file(s) the session never\n' \
+            "$uncommitted_files"
+        printf 'committed. Review and maintainer legs never saw them, and they do\n'
+        printf 'not leave the sandbox:\n'
+        printf '%s\n' "${uncommitted_paths_capped[@]}" | sed 's/^/  /'
+        if (( uncommitted_files > ${#uncommitted_paths_capped[@]} )); then
+            printf '  ... and %s more\n' \
+                "$(( uncommitted_files - ${#uncommitted_paths_capped[@]} ))"
+        fi
+        printf 'The clone is at %s\n' "$clone_dir"
+    fi
 } > "$run_dir/summary.txt" 2>&1
 
 # The same facts, structured, so a caller never has to parse the prose
@@ -10673,6 +10769,17 @@ commit_list="$( (cd "$origin_repo" && git log --format='%H %s' "$return_base_sha
 author_email_bad_json="$(printf '%s' "$author_email_bad" \
     | jq -R -s -c 'split("\n") | map(select(length > 0))' 2>/dev/null)"
 [[ -n "$author_email_bad_json" ]] || author_email_bad_json='[]'
+# uncommitted_files: null when the sandboxed check itself could not run
+# (unknown, never guessed at zero), otherwise the true count -- not capped,
+# unlike the list, which the summary.txt WARNING above caps the same way.
+uncommitted_files_json='null'
+[[ -n "$uncommitted_files" ]] && uncommitted_files_json="$uncommitted_files"
+uncommitted_files_list_json='null'
+if [[ -n "$uncommitted_files" ]]; then
+    uncommitted_files_list_json="$(printf '%s\n' "${uncommitted_paths_capped[@]}" \
+        | jq -R -s -c 'split("\n") | map(select(length > 0))' 2>/dev/null)"
+    [[ -n "$uncommitted_files_list_json" ]] || uncommitted_files_list_json='[]'
+fi
 fetched_json=false
 (( fetched )) && fetched_json=true
 removed_json=false
@@ -10730,6 +10837,8 @@ jq -n \
     --arg agent_kit "$agent_kit" \
     --argjson leg_retries "${total_leg_retries:-0}" \
     --argjson implement_retries "${impl_leg_retries_json:-[]}" \
+    --argjson uncommitted_files "$uncommitted_files_json" \
+    --argjson uncommitted_files_list "$uncommitted_files_list_json" \
     '{
         version: $version,
         mode: $mode,
@@ -10767,6 +10876,8 @@ jq -n \
         duration_seconds: ($ended_at - $started_at),
         leg_retries: $leg_retries,
         implement_retries: $implement_retries,
+        uncommitted_files: $uncommitted_files,
+        uncommitted_files_list: $uncommitted_files_list,
     }
     # Both keys are absent, not null, on a run without --session-state:
     # their presence is how a caller tells a resumable run from one whose

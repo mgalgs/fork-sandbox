@@ -287,6 +287,8 @@ SUMMARY_FIELDS = [
     "claude_credentials_via",
     "end_reason",
     "leg_retries",
+    "uncommitted_files",
+    "uncommitted_files_list",
 ]
 
 

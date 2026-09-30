@@ -563,6 +563,16 @@ dead or timed-out run gets a row instead of vanishing.
   not do. An absent key says "not measured"; a zero would claim the run
   was measured and free -- a permanent false economy on every cluster row
   otherwise.
+- **`uncommitted_files`/`uncommitted_files_list`: omitted entirely, for a
+  different reason than cost -- not unmeasured, structurally moot.** The
+  pod IS the sandbox, so the entrypoint runs `commit_uncommitted_work`
+  directly after the coding leg and again after the review loop: whatever
+  either left uncommitted is swept into a fixed-message commit before the
+  pod ever idles for the fetch. A local run has no such backstop (its
+  session's own turn ending is the only signal it gets), which is what
+  `uncommitted_files` exists to catch there -- see `README.md`'s "How a
+  run works". Adding the same field here would report `0` on every run by
+  construction, which is not a fact worth a key.
 
 **The append is best-effort**, on both paths: a machine without
 `sandbox-run-log.py` on `PATH` or under `$HOME/.claude/scripts/` skips it,
