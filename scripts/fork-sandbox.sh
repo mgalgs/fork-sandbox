@@ -177,9 +177,11 @@
 #                        preset and runs exactly as --preset would, fix legs
 #                        riding the code seat. Refused with --preset, which
 #                        falls back to this when no preset file has the
-#                        name. With no c stage it is read-only: ropus,
-#                        mopus or rsonnet-mopus review --checkout once per
-#                        leg. See docs/presets.md.
+#                        name. With no c stage it is read-only: any number of
+#                        r and m stages, e.g. ropus, rsonnet-mopus or
+#                        ropus-mopus-ropus, review --checkout once per
+#                        leg, each building on every earlier verdict.
+#                        See docs/presets.md.
 # --task-meta '<json>':  one JSON object of orchestrator-supplied task
 #                        metadata -- kind, difficulty, size,
 #                        prompt_template_id, stage -- stored beside the run
@@ -2022,6 +2024,10 @@ preset_step_count=0
 # then maintain, each run once over --checkout, as --review-only does.
 preset_read_only=false
 preset_ro_review=false
+# A read-only pipeline of any other shape (several review/maintain steps, or
+# a maintain step before a review): it runs as a composed pipeline in
+# read-only mode rather than through the single-review/single-maintain seats.
+preset_ro_multi=false
 # Whether --review-only itself was given, before a read-only preset sets it.
 review_only_flag="$review_only"
 # --pipeline is a preset written inline in the composition-name grammar: it
@@ -2228,8 +2234,17 @@ if [[ -n "$preset_name" ]]; then
     # through the walker's own arbitrary-step-list walk unchanged.
     preset_is_legacy_shaped=false
     if [[ "$preset_read_only" == true ]]; then
-        # The parser allows only review, maintain, or review then maintain.
-        preset_is_legacy_shaped=true
+        # Review, maintain, or review then maintain keep the fixed seats;
+        # any other read-only shape is composed, in read-only mode.
+        if (( preset_step_count == 1 )) \
+            || { (( preset_step_count == 2 )) \
+                && [[ "${preset_step_action[1]}" == review \
+                    && "${preset_step_action[2]}" == maintain ]]; }; then
+            preset_is_legacy_shaped=true
+        else
+            preset_ro_multi=true
+            preset_read_only=false
+        fi
     elif (( preset_step_count == 1 )) && [[ "${preset_step_action[1]}" == code ]]; then
         preset_is_legacy_shaped=true
     elif (( preset_step_count == 2 )) && [[ "${preset_step_action[1]}" == code ]] \
@@ -2242,7 +2257,31 @@ if [[ -n "$preset_name" ]]; then
     fi
 
     preset_ro_review=false
-    if [[ "$preset_read_only" == true ]]; then
+    if [[ "$preset_ro_multi" == true ]]; then
+        # There is no single seat for a seat-override flag to land on, so
+        # each is refused, the way a composed pipeline refuses them.
+        ro_multi_flag=""
+        if [[ -n "$review_loop_arg" ]]; then ro_multi_flag="--review-loop"
+        elif [[ -n "$maintainer_loop_arg" ]]; then ro_multi_flag="--maintainer-loop"
+        elif [[ -n "$review_model" ]]; then ro_multi_flag="--review-model"
+        elif [[ "$review_harness_given" == true ]]; then ro_multi_flag="--review-harness"
+        elif [[ -n "$maintainer_model" ]]; then ro_multi_flag="--maintainer-model"
+        elif [[ "$maintainer_harness_given" == true ]]; then ro_multi_flag="--maintainer-harness"
+        elif [[ "$model_given" == true ]]; then ro_multi_flag="--model"
+        elif [[ "$harness_given" == true ]]; then ro_multi_flag="--harness"
+        elif [[ -n "$claude_extra_args" ]]; then ro_multi_flag="--claude-args"
+        elif [[ -n "$pi_extra_args" ]]; then ro_multi_flag="--pi-args"
+        elif [[ -n "$codex_extra_args" ]]; then ro_multi_flag="--codex-args"
+        fi
+        if [[ -n "$ro_multi_flag" ]]; then
+            echo "Error: $ro_multi_flag cannot be combined with preset '$preset_name':" >&2
+            echo "it is a read-only pipeline of $preset_step_count steps, each seated by the" >&2
+            echo "pipeline itself, so there is no single seat for the flag to land on." >&2
+            echo "Edit the pipeline instead." >&2
+            exit 1
+        fi
+        review_only=true
+    elif [[ "$preset_read_only" == true ]]; then
         # The first step's agent takes the implement seat, which is where
         # the review-only leg runs; a maintain step also takes the maintain
         # seat, run once with no fix leg.
@@ -2570,7 +2609,7 @@ if [[ -n "$preset_name" ]]; then
         fi
     fi
     else
-        echo "fork-sandbox: preset '$preset_name' ($preset_label): composed pipeline, $preset_step_count steps" >&2
+        echo "fork-sandbox: preset '$preset_name' ($preset_label): composed pipeline, $preset_step_count steps$([[ "$preset_ro_multi" == true ]] && printf ', read-only')" >&2
     fi
 fi
 
@@ -3613,7 +3652,7 @@ if [[ -n "$review_base_ref" && "$review_only" != true ]]; then
     exit 1
 fi
 # A read-only pipeline of one maintain step has no review leg.
-if [[ "$review_only" == true ]] \
+if [[ "$review_only" == true && "$preset_ro_multi" != true ]] \
     && [[ "$preset_read_only" != true || "$preset_ro_review" == true ]]; then
     review_loop_cap=1
 fi
@@ -4990,7 +5029,8 @@ if [[ "$preset_is_legacy_shaped" != true ]]; then
         fs_resolve_harness "${preset_agent_harness[$preset_k_agent]}" \
             "$preset_k_model" "s${preset_k}" \
             "${preset_agent_network[$preset_k_agent]}"
-        if [[ "${preset_step_action[$preset_k]}" != code ]]; then
+        if [[ "${preset_step_action[$preset_k]}" != code \
+            && "$preset_ro_multi" != true ]]; then
             preset_k_fix_model="${preset_step_fix_model[$preset_k]}"
             preset_k_fix_model_given=false
             [[ -n "$preset_k_fix_model" ]] && preset_k_fix_model_given=true
@@ -5099,7 +5139,8 @@ if [[ "$preset_is_legacy_shaped" != true ]]; then
         preset_k_model_var="s${preset_k}_model"
         preset_k_harness_var="s${preset_k}_harness"
         composed_step_sweep_values+=("${!preset_k_model_var}" "${!preset_k_harness_var}")
-        if [[ "${preset_step_action[$preset_k]}" != code ]]; then
+        if [[ "${preset_step_action[$preset_k]}" != code \
+            && "$preset_ro_multi" != true ]]; then
             preset_k_fix_model_var="s${preset_k}fix_model"
             preset_k_fix_harness_var="s${preset_k}fix_harness"
             composed_step_sweep_values+=(
@@ -5308,7 +5349,8 @@ if [[ -n "$preset_name" ]]; then
                 pipeline_harness="pi"
                 pipeline_network="sealed"
             fi
-            if [[ "${run_step_kind[$preset_k]}" != code ]] \
+            if [[ "${run_step_kind[$preset_k]}" != code \
+                && "$preset_ro_multi" != true ]] \
                 && { [[ "${preset_step_fix_default[$preset_k]:-}" != "1" ]] \
                     || [[ "${preset_step_fix_repeat[$preset_k]:-1}" != "1" ]]; }; then
                 pipeline_fix_model_var="s${preset_k}fix_model"
@@ -6508,6 +6550,14 @@ else
                 step_k_prompt="$run_dir/step-${preset_k}-prompt.md"
                 step_k_verdict_file="$clone_dir/.git/s${preset_k}-verdict.md"
                 fs_reject_unsafe_chars "$step_k_prompt" "$step_k_verdict_file"
+                # A read-only pipeline has no fix leg; a review step that a
+                # later step builds on says so.
+                step_k_review_flavor=spec
+                if [[ "$preset_ro_multi" == true ]]; then
+                    step_k_review_flavor=review-only
+                    (( preset_k < preset_step_count )) \
+                        && step_k_review_flavor=review-only-continued
+                fi
                 # fs_emit_prompt_overlay's "review" bucket is computed once,
                 # near prompt_overlay_fragments above, from the single
                 # legacy review_harness_given/review_network scalars -- it
@@ -6526,27 +6576,35 @@ else
                     fs_emit_step_prompt_overlay review "${!preset_k_resolved_harness_var}" "$preset_k_preamble_network" "${!preset_k_resolved_model_var}"
                     fs_emit_review_prompt_body "$branch" "$base_sha" \
                         "$review_skill_dir" "$step_k_verdict_file" "$inbox_dir" \
-                        "$handoff_file" spec
+                        "$handoff_file" "$step_k_review_flavor"
                 } > "$step_k_prompt.part"
                 mv -- "$step_k_prompt.part" "$step_k_prompt"
                 run_step_prompt[preset_k]="$step_k_prompt"
-                step_k_fix_header="$run_dir/${preset_k}-fix-prompt-header.md"
-                {
-                    fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" \
-                        "${preset_step_fix_harness[$preset_k]}" "${preset_step_fix_network[$preset_k]}" \
-                        "$outbox_dir" "" "$outbox_max_bytes"
-                    preset_k_fix_harness_var="s${preset_k}fix_harness"
-                    preset_k_fix_model_var="s${preset_k}fix_model"
-                    fs_emit_step_prompt_overlay fix "${!preset_k_fix_harness_var}" "${preset_step_fix_network[$preset_k]}" "${!preset_k_fix_model_var}"
-                    fs_emit_fix_prompt_body "$branch" "$base_sha" "$handoff_file"
-                } > "$step_k_fix_header.part"
-                mv -- "$step_k_fix_header.part" "$step_k_fix_header"
-                printf -v "s${preset_k}fix_prompt_header" '%s' "$step_k_fix_header"
+                if [[ "$preset_ro_multi" != true ]]; then
+                    step_k_fix_header="$run_dir/${preset_k}-fix-prompt-header.md"
+                    {
+                        fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" \
+                            "${preset_step_fix_harness[$preset_k]}" "${preset_step_fix_network[$preset_k]}" \
+                            "$outbox_dir" "" "$outbox_max_bytes"
+                        preset_k_fix_harness_var="s${preset_k}fix_harness"
+                        preset_k_fix_model_var="s${preset_k}fix_model"
+                        fs_emit_step_prompt_overlay fix "${!preset_k_fix_harness_var}" "${preset_step_fix_network[$preset_k]}" "${!preset_k_fix_model_var}"
+                        fs_emit_fix_prompt_body "$branch" "$base_sha" "$handoff_file"
+                    } > "$step_k_fix_header.part"
+                    mv -- "$step_k_fix_header.part" "$step_k_fix_header"
+                    printf -v "s${preset_k}fix_prompt_header" '%s' "$step_k_fix_header"
+                fi
                 ;;
             maintain)
                 step_k_prompt="$run_dir/step-${preset_k}-prompt.md"
                 step_k_verdict_file="$clone_dir/.git/s${preset_k}-verdict.md"
                 fs_reject_unsafe_chars "$step_k_prompt" "$step_k_verdict_file"
+                step_k_maintain_flavor=spec
+                if [[ "$preset_ro_multi" == true ]]; then
+                    step_k_maintain_flavor=review-only
+                    (( preset_k < preset_step_count )) \
+                        && step_k_maintain_flavor=review-only-continued
+                fi
                 # A prior step can be skipped or fail before producing a
                 # verdict.  The runner therefore adds the positive inner-
                 # review note only when it finds a usable preceding verdict.
@@ -6562,7 +6620,7 @@ else
                     fs_emit_step_prompt_overlay maintainer "${!preset_k_resolved_harness_var}" "$preset_k_preamble_network" "${!preset_k_resolved_model_var}"
                     fs_emit_maintainer_prompt_body "$branch" "$base_sha" \
                         "$step_k_verdict_file" "$inbox_dir" "$step_k_inner_review" \
-                        "$handoff_file"
+                        "$handoff_file" "$step_k_maintain_flavor"
                 } > "$step_k_prompt.part"
                 mv -- "$step_k_prompt.part" "$step_k_prompt"
                 # The runner can only know at execution time whether an
@@ -6575,23 +6633,26 @@ else
                         "$outbox_dir" "" "$outbox_max_bytes"
                     fs_emit_step_prompt_overlay maintainer "${!preset_k_resolved_harness_var}" "$preset_k_preamble_network" "${!preset_k_resolved_model_var}"
                     fs_emit_maintainer_prompt_body "$branch" "$base_sha" \
-                        "$step_k_verdict_file" "$inbox_dir" yes "$handoff_file"
+                        "$step_k_verdict_file" "$inbox_dir" yes "$handoff_file" \
+                        "$step_k_maintain_flavor"
                 } > "$step_k_inner_prompt.part"
                 mv -- "$step_k_inner_prompt.part" "$step_k_inner_prompt"
                 printf -v "s${preset_k}_prompt_inner_review" '%s' "$step_k_inner_prompt"
                 run_step_prompt[preset_k]="$step_k_prompt"
-                step_k_fix_header="$run_dir/${preset_k}-fix-prompt-header.md"
-                {
-                    fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" \
-                        "${preset_step_fix_harness[$preset_k]}" "${preset_step_fix_network[$preset_k]}" \
-                        "$outbox_dir" "" "$outbox_max_bytes"
-                    preset_k_fix_harness_var="s${preset_k}fix_harness"
-                    preset_k_fix_model_var="s${preset_k}fix_model"
-                    fs_emit_step_prompt_overlay fix "${!preset_k_fix_harness_var}" "${preset_step_fix_network[$preset_k]}" "${!preset_k_fix_model_var}"
-                    fs_emit_fix_prompt_body "$branch" "$base_sha" "$handoff_file"
-                } > "$step_k_fix_header.part"
-                mv -- "$step_k_fix_header.part" "$step_k_fix_header"
-                printf -v "s${preset_k}fix_prompt_header" '%s' "$step_k_fix_header"
+                if [[ "$preset_ro_multi" != true ]]; then
+                    step_k_fix_header="$run_dir/${preset_k}-fix-prompt-header.md"
+                    {
+                        fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" \
+                            "${preset_step_fix_harness[$preset_k]}" "${preset_step_fix_network[$preset_k]}" \
+                            "$outbox_dir" "" "$outbox_max_bytes"
+                        preset_k_fix_harness_var="s${preset_k}fix_harness"
+                        preset_k_fix_model_var="s${preset_k}fix_model"
+                        fs_emit_step_prompt_overlay fix "${!preset_k_fix_harness_var}" "${preset_step_fix_network[$preset_k]}" "${!preset_k_fix_model_var}"
+                        fs_emit_fix_prompt_body "$branch" "$base_sha" "$handoff_file"
+                    } > "$step_k_fix_header.part"
+                    mv -- "$step_k_fix_header.part" "$step_k_fix_header"
+                    printf -v "s${preset_k}fix_prompt_header" '%s' "$step_k_fix_header"
+                fi
                 ;;
         esac
     done
@@ -7251,7 +7312,7 @@ if [[ "$preset_is_legacy_shaped" != true ]]; then
                     preset_k_cmd+=(--skill "$skill_dir")
                     unset -n preset_k_cmd
                 fi
-                if [[ "${preset_step_fix_harness[$preset_k]}" == pi || "${preset_step_fix_harness[$preset_k]}" == pi-local ]]; then
+                if [[ "${preset_step_fix_harness[$preset_k]:-}" == pi || "${preset_step_fix_harness[$preset_k]:-}" == pi-local ]]; then
                     declare -n preset_k_fix_cmd="s${preset_k}fix_harness_cmd"
                     preset_k_fix_cmd+=(--skill "$skill_dir")
                     unset -n preset_k_fix_cmd
@@ -7266,14 +7327,15 @@ if [[ "$preset_is_legacy_shaped" != true ]]; then
                 unset -n kit_k_cmd
             fi
             if [[ "${preset_step_action[$preset_k]}" != code \
-                && ( "${preset_step_fix_harness[$preset_k]}" == pi || "${preset_step_fix_harness[$preset_k]}" == pi-local ) ]]; then
+                && ( "${preset_step_fix_harness[$preset_k]:-}" == pi || "${preset_step_fix_harness[$preset_k]:-}" == pi-local ) ]]; then
                 declare -n kit_k_fix_cmd="s${preset_k}fix_harness_cmd"
                 kit_k_fix_cmd+=(--skill "$skill_dir")
                 unset -n kit_k_fix_cmd
             fi
         done
         fs_build_sandbox_cmd "s${preset_k}" "s${preset_k}_sandbox_cmd"
-        if [[ "${preset_step_action[$preset_k]}" != code ]]; then
+        if [[ "${preset_step_action[$preset_k]}" != code \
+            && "$preset_ro_multi" != true ]]; then
             fs_build_sandbox_cmd "s${preset_k}fix" "s${preset_k}fix_sandbox_cmd"
         fi
     done
@@ -7489,9 +7551,10 @@ launcher_session_id="${CLAUDE_CODE_SESSION_ID:-}"
     fi
     # Which leg writes events.jsonl, for the status script's leg label: a
     # review-only run has no code leg, so its first leg (a review, or the
-    # maintainer when impl_seat_is_phantom) takes that file.
+    # maintainer when impl_seat_is_phantom) takes that file. A composed
+    # read-only run's legs all keep files of their own, so none does.
     first_leg_kind=code
-    if [[ "$review_only" == true ]]; then
+    if [[ "$review_only" == true && "$preset_ro_multi" != true ]]; then
         if [[ "$impl_seat_is_phantom" == true ]]; then
             first_leg_kind=maintainer
         else
@@ -7720,7 +7783,8 @@ launcher_session_id="${CLAUDE_CODE_SESSION_ID:-}"
             printf 's%d_harness=%q\n' "$preset_k" "${!preset_k_var}"
             preset_k_var="s${preset_k}_model"
             printf 's%d_model=%q\n' "$preset_k" "${!preset_k_var}"
-            if [[ "${preset_step_action[$preset_k]}" != code ]]; then
+            if [[ "${preset_step_action[$preset_k]}" != code \
+                && "$preset_ro_multi" != true ]]; then
                 preset_k_var="s${preset_k}fix_usage_source"
                 printf 's%dfix_usage_source=%q\n' "$preset_k" "${!preset_k_var}"
                 preset_k_var="s${preset_k}fix_run_formatter"
@@ -7848,7 +7912,8 @@ launcher_session_id="${CLAUDE_CODE_SESSION_ID:-}"
             printf 's%d_sandbox_cmd=(' "$preset_k"
             printf '%q ' "${preset_k_cmd_ref[@]}"
             printf ')\n'
-            if [[ "${preset_step_action[$preset_k]}" != code ]]; then
+            if [[ "${preset_step_action[$preset_k]}" != code \
+                && "$preset_ro_multi" != true ]]; then
                 declare -n preset_k_cmd_ref="s${preset_k}fix_sandbox_cmd"
                 printf 's%dfix_sandbox_cmd=(' "$preset_k"
                 printf '%q ' "${preset_k_cmd_ref[@]}"
@@ -7860,6 +7925,7 @@ launcher_session_id="${CLAUDE_CODE_SESSION_ID:-}"
     else
         printf 'composed_pipeline=%q\n' 0
     fi
+    printf 'ro_multi=%q\n' "$([[ "$preset_ro_multi" == true ]] && echo 1 || echo 0)"
     printf 'run_step_count=%q\n' "$run_step_count"
     # These arrays are deliberately 1-indexed.  Expanding values alone
     # would rebuild them from index zero in run.sh.  Serialized
@@ -8439,7 +8505,7 @@ for ((_fs_cred_k = 1; _fs_cred_k <= run_step_count; _fs_cred_k++)); do
     if [[ "${run_step_kind[_fs_cred_k]}" != code ]]; then
         _fs_cred_hvar="${_fs_cred_idx}fix_harness"
         _fs_cred_evar="${_fs_cred_idx}fix_harness_env_file"
-        _fs_write_codex_cred "${!_fs_cred_hvar}" "${!_fs_cred_evar}"
+        _fs_write_codex_cred "${!_fs_cred_hvar:-}" "${!_fs_cred_evar:-}"
     fi
 done
 unset _fs_cred_k _fs_cred_idx _fs_cred_hvar _fs_cred_evar
@@ -8643,7 +8709,8 @@ fi
 record_harness="$harness"
 record_harness_version="$harness_version"
 record_model="$model"
-if [[ "$mode" == "review-only" && "$review_loop_cap" == "0" ]]; then
+if [[ "$mode" == "review-only" && "$review_loop_cap" == "0" \
+    && "${composed_pipeline:-0}" != 1 ]]; then
     record_harness="$maintainer_harness"
     record_harness_version="$mnt_harness_version"
     record_model="$maintainer_model"
@@ -9320,8 +9387,9 @@ run_leg() {
     legs_run=$(( ${legs_run:-0} + 1 ))
     local leg_events="$run_dir/events-$leg_tag.jsonl"
     # A review-only run has no implement leg, so its first leg's events are
-    # the run's own; a read-only maintain leg after it keeps its own file.
-    if [[ "$mode" == "review-only" && "${ro_events_claimed:-0}" != 1 ]]; then
+    # the run's own; a read-only maintain leg after it keeps its own file. A
+    # composed read-only step (it has a step_idx) always keeps its own file.
+    if [[ "$mode" == "review-only" && -z "$step_idx" && "${ro_events_claimed:-0}" != 1 ]]; then
         leg_events="$run_dir/events.jsonl"
         ro_events_claimed=1
     fi
@@ -9858,8 +9926,18 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count && stop_requested != 1; cur
                 done
             fi
         fi
+        # The inner-review wording claims a review leg already read the diff,
+        # so a first pass takes it only when an earlier review step ran, not
+        # merely an earlier maintain step.
+        cur_prev_reviewed=1
+        if [[ "$cur_legacy" != 1 && "$cur_kind" == maintainer ]] && (( cur_i == 1 )); then
+            cur_prev_reviewed=0
+            for ((cur_j = 1; cur_j < cur_step_no; cur_j++)); do
+                compgen -G "$run_dir/s${cur_j}-review-verdict-*.md" >/dev/null && { cur_prev_reviewed=1; break; }
+            done
+        fi
         cur_prompt_base="$cur_prompt"
-        [[ -n "$cur_prev" && -f "$cur_prev" && -n "$cur_inner_prompt" ]] && cur_prompt_base="$cur_inner_prompt"
+        [[ "$cur_prev_reviewed" == 1 && -n "$cur_prev" && -f "$cur_prev" && -n "$cur_inner_prompt" ]] && cur_prompt_base="$cur_inner_prompt"
         # A legacy iteration's prompt is rebuilt every pass -- a maintainer
         # pass concatenates a whole review verdict into it -- so it keeps the
         # deleted loops' build-then-rename discipline (see review_prompt's
@@ -9955,7 +10033,32 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count && stop_requested != 1; cur
         if [[ "$cur_legacy" == 1 ]]; then
             mv -- "$cur_prompt_iter_out" "$cur_prompt_iter"
         fi
-        if [[ "$cur_legacy" != 1 && "$cur_kind" == maintainer ]]; then
+        if [[ "$cur_legacy" != 1 && "$mode" == "review-only" ]]; then
+            # A composed read-only step builds on every earlier leg of the
+            # run, not just the nearest: each verdict in full, oldest first,
+            # labeled by its step, action and seat.
+            cur_ro_head_done=0
+            for ((cur_j = 1; cur_j < cur_step_no; cur_j++)); do
+                cur_ro_action=review
+                [[ "${run_step_kind[$cur_j]}" == maintainer ]] && cur_ro_action=maintain
+                cur_ro_verdict="$run_dir/s${cur_j}-${cur_ro_action}-verdict-1.md"
+                [[ -f "$cur_ro_verdict" ]] || continue
+                if (( ! cur_ro_head_done )); then
+                    {
+                        printf '\n---\n\n## Verdicts of the earlier legs of this run\n\n'
+                        printf 'Each earlier leg of this run wrote the verdict below, in full,\n'
+                        printf 'oldest first. This run has no fix leg, so the branch is unchanged\n'
+                        printf 'since each was written. Build on them rather than redo what they\n'
+                        printf 'covered.\n'
+                    } >> "$cur_prompt_iter"
+                    cur_ro_head_done=1
+                fi
+                cur_ro_h_var="s${cur_j}_harness"; cur_ro_m_var="s${cur_j}_model"
+                printf '\n### Step %s: %s (%s%s)\n\n' "$cur_j" "$cur_ro_action" \
+                    "${!cur_ro_h_var}" "${!cur_ro_m_var:+/${!cur_ro_m_var}}" >> "$cur_prompt_iter"
+                cat -- "$cur_ro_verdict" >> "$cur_prompt_iter"
+            done
+        elif [[ "$cur_legacy" != 1 && "$cur_kind" == maintainer ]]; then
             if [[ -n "$cur_prev" && -f "$cur_prev" ]]; then
                 printf '\n---\n\n## The previous verdict\n\n' >> "$cur_prompt_iter"
                 cat -- "$cur_prev" >> "$cur_prompt_iter"
@@ -10120,6 +10223,10 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count && stop_requested != 1; cur
                 elif [[ "$cur_line" == FINDINGS ]]; then
                     cur_findings="$(awk 'NR == 1 { next } /^## Report$/ { exit } /^[[:space:]]*$/ { if (hit) n++; hit = 0; next } /[^[:space:]:]+:[0-9]+/ { hit = 1 } END { if (hit) n++; print n + 0 }' "$cur_copy" 2>/dev/null)"
                     [[ "$cur_findings" =~ ^[0-9]+$ ]] || cur_findings=null
+                    if [[ "$mode" == "review-only" ]]; then
+                        # No fix leg: the verdict is the step's whole output.
+                        cur_ended=findings
+                    else
                     # Base name unchanged; built fresh per pass, same reason
                     # and same fs_refresh_emit_addenda call as the legacy
                     # fix/maintainer-fix block above.
@@ -10158,6 +10265,7 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count && stop_requested != 1; cur
                     elif [[ -z "$cur_after" ]]; then cur_ended=harness-error; cur_detail="branch $branch could not be read from the clone after the fix leg of iteration $cur_i"
                     elif [[ "$cur_after" == "$cur_before" ]]; then cur_ended=no-progress
                     else cur_head="$cur_after"; fi
+                    fi
                 else cur_ended=harness-error; cur_detail="the $cur_kind leg of iteration $cur_i wrote an invalid verdict"; fi
             fi
         fi
@@ -10203,19 +10311,25 @@ for ((cur_step_no = 1; cur_step_no <= run_step_count && stop_requested != 1; cur
             printf 'fork-sandbox: review loop ended: %s\n' "$cur_ended"
         fi
     fi
-    # A review-only run is one review leg, one maintain leg, or a review
-    # then a maintain leg (a read-only pipeline). Each reports here and
-    # republishes the run's cost so far, so a stop between legs keeps it.
-    if [[ "$cur_legacy" == 1 && "$mode" == "review-only" ]]; then
+    # Every leg of a review-only run (--review-only, or a read-only pipeline
+    # of any shape) reports here and republishes the run's cost so far, so a
+    # stop between legs keeps it.
+    if [[ "$mode" == "review-only" ]]; then
         cur_ro_what="review"
         [[ "$cur_kind" == maintainer ]] && cur_ro_what="maintainer"
         cur_ro_tag="review-only"
         [[ "$cur_kind" == maintainer ]] && cur_ro_tag="review-only maintainer"
+        cur_ro_file="$run_dir/$cur_ro_what-verdict-1.md"
+        if [[ "$cur_legacy" != 1 ]]; then
+            # A composed read-only step names itself by its number.
+            cur_ro_tag="review-only step $cur_step_no ($cur_ro_what)"
+            cur_ro_file="$run_dir/${cur_step_idx}-${cur_ro_what/maintainer/maintain}-verdict-1.md"
+        fi
         case "$cur_ended" in
             approved) printf 'fork-sandbox: %s: APPROVED\n' "$cur_ro_tag" ;;
             findings) printf 'fork-sandbox: %s: FINDINGS (%s cited)\n' "$cur_ro_tag" "$cur_findings" ;;
         esac
-        printf 'fork-sandbox: %s verdict: %s\n' "$cur_ro_what" "$run_dir/$cur_ro_what-verdict-1.md"
+        printf 'fork-sandbox: %s verdict: %s\n' "$cur_ro_what" "$cur_ro_file"
         [[ -n "${run_error:-}" ]] || run_error="${leg_error:-$leg_harness_error}"
         [[ "$cur_ended" == "harness-error" ]] && rc=1
         if (( run_step_count == 1 )); then
@@ -10533,6 +10647,41 @@ if [[ -n "$latest_maintainer_report_verdict" ]] \
     report_from="maintainer"
 fi
 
+# A multi-step read-only run keeps its verdicts as sK-<action>-verdict-1.md
+# and has no review-verdict-N / maintainer-verdict-N files, so its account
+# is the last step, in step order, whose verdict carries a usable report.
+ro_steps_json='[]'
+if [[ "${ro_multi:-0}" == 1 ]]; then
+    for ((_k = run_step_count; _k >= 1; _k--)); do
+        _a=review
+        [[ "${run_step_kind[$_k]}" == maintainer ]] && _a=maintain
+        _v="$run_dir/s${_k}-${_a}-verdict-1.md"
+        if [[ -f "$_v" ]] && fs_verdict_has_usable_report "$_v"; then
+            report_from=review
+            [[ "$_a" == maintain ]] && report_from=maintainer
+            break
+        fi
+    done
+    ro_steps_ndjson=""
+    for ((_k = 1; _k <= run_step_count; _k++)); do
+        _a=review
+        [[ "${run_step_kind[$_k]}" == maintainer ]] && _a=maintain
+        _h_var="s${_k}_harness"; _m_var="s${_k}_model"
+        _f=""
+        [[ -s "$run_dir/step-${_k}-loop.json" ]] && _f="$(jq -r '[.iterations[].findings | if . == null then "?" else tostring end] | join(",")' "$run_dir/step-${_k}-loop.json" 2>/dev/null || true)"
+        ro_steps_ndjson+="$(jq -cn --argjson step "$_k" --arg action "$_a" \
+            --arg harness "${!_h_var}" --arg model "${!_m_var:-}" \
+            --arg ended "${progress_ended[$_k]:-}" --arg findings "$_f" \
+            --arg verdict "$run_dir/s${_k}-${_a}-verdict-1.md" \
+            '{step:$step, action:$action, harness:$harness,
+              model:(if $model == "" then null else $model end),
+              ended:(if $ended == "" then null else $ended end),
+              findings:(if $findings == "" then null else $findings end),
+              verdict:$verdict}' 2>/dev/null)"$'\n'
+    done
+    ro_steps_json="$(printf '%s' "$ro_steps_ndjson" | jq -cs '.' 2>/dev/null || printf '[]')"
+fi
+
 # Did the work come back authored by this repo's own identity? The clone is
 # seeded with the origin's effective user.email (fs_make_clone in the lib says
 # why), so it should. Before that seeding existed a repo whose identity was a
@@ -10704,6 +10853,11 @@ loop_findings() {
                     "$_n" "${maintainer_loop_ended}"
             fi
         fi
+    fi
+    # A multi-step read-only run lists every leg and how it ended.
+    if [[ "${ro_multi:-0}" == 1 ]]; then
+        jq -r '.[] | "step \(.step):   \(.action) (\(.harness)\(if .model then "/" + .model else "" end)): \(.ended // "not run")\(if .findings then ", findings " + .findings else "" end)"' \
+            <<<"$ro_steps_json" 2>/dev/null || true
     fi
     # Its sibling for --refresh-at, printed only when something happened --
     # either a continuation actually ran, or a leg was nudged and never wrote
@@ -10891,6 +11045,7 @@ jq -n \
     --argjson authorship_normalized "$authorship_normalized" \
     --arg refresh "$refresh_ended" \
     --arg report_from "$report_from" \
+    --argjson ro_steps "$ro_steps_json" \
     --argjson continuations "$continuations_json" \
     --argjson outbox_bytes "$outbox_bytes" \
     --argjson outbox_max_bytes "$outbox_max_bytes" \
@@ -10962,7 +11117,9 @@ jq -n \
     # Absent, not null, on every normal run -- same convention as the pair
     # above. fork-sandbox-status.sh treats presence as the signal that this
     # run ended other than on its own.
-    + (if $end_reason == "" then {} else {end_reason: $end_reason} end)' \
+    + (if $end_reason == "" then {} else {end_reason: $end_reason} end)
+    # Present only on a multi-step read-only run, one record per leg.
+    + (if ($ro_steps | length) == 0 then {} else {steps: $ro_steps} end)' \
     > "$run_dir/summary.json" 2>/dev/null \
     || rm -f "$run_dir/summary.json"
 

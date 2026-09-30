@@ -653,8 +653,16 @@ all_event_files() {
     EVENT_FILES=()
     local path name
     resolve_run_file events.jsonl 2>/dev/null && EVENT_FILES+=("$RUN_FILE_PATH")
-    for path in "$run_dir"/events-{review,fix,maintainer,mntfix,code,continuation}-*.jsonl \
-            "$run_dir"/events-s[0-9]*-*.jsonl; do
+    local -a candidates=() step_files=()
+    candidates=("$run_dir"/events-{review,fix,maintainer,mntfix,code,continuation}-*.jsonl)
+    # Step files go in numeric step order (s2 before s10), which a plain glob
+    # does not give and latest_event_file's tie rule relies on.
+    step_files=("$run_dir"/events-s[0-9]*-*.jsonl)
+    if [[ -e "${step_files[0]}" ]]; then
+        mapfile -t step_files < <(printf '%s\n' "${step_files[@]}" | sort -V)
+        candidates+=("${step_files[@]}")
+    fi
+    for path in "${candidates[@]}"; do
         [[ -e "$path" ]] || continue
         name="${path##*/}"
         [[ "$name" =~ ^events-(review|fix|maintainer|mntfix|code|continuation)-[0-9]+(-p[0-9]+)?\.jsonl$ \
@@ -680,7 +688,9 @@ latest_event_file() {
     for f in "${EVENT_FILES[@]}"; do
         m="$("$FS_STAT" -c %Y -- "$f" 2>/dev/null)"
         [[ "$m" =~ ^[0-9]+$ ]] || continue
-        if [[ -z "$LATEST_EVENT_FILE" ]] || (( m > LATEST_EVENT_MTIME )); then
+        # A tie goes to the later file: events.jsonl is listed first, and a
+        # run with no code leg leaves it empty.
+        if [[ -z "$LATEST_EVENT_FILE" ]] || (( m >= LATEST_EVENT_MTIME )); then
             LATEST_EVENT_FILE="$f"
             LATEST_EVENT_MTIME="$m"
         fi

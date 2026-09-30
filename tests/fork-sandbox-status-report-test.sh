@@ -251,6 +251,19 @@ out="$(timeout 12 "$status" "$rd_new" 2>&1)"
 [[ "$out" != *"last:     code leg line"* ]] \
     || { echo "last event still from events.jsonl: $out"; exit 1; }
 
+# 6d2. Event files sharing one mtime: the tie goes to the later step by
+# number, so step 10 outranks steps 2 through 9.
+new_run_dir
+now_s=$(date +%s)
+for n in 2 9 10; do
+    printf '{"type":"assistant","message":{"content":[{"type":"text","text":"step %s line"}]}}\n' \
+        "$n" > "$rd_new/events-s$n-review-1.jsonl"
+    touch -d "@$((now_s - 5))" "$rd_new/events-s$n-review-1.jsonl"
+done
+out="$(timeout 12 "$status" "$rd_new" 2>&1)"
+[[ "$out" == *"last:     step 10 line"* ]] \
+    || { echo "a tie did not go to step 10: $out"; exit 1; }
+
 # 6e. A file that merely starts events- is not an event file: it is not
 # read, and the counts are unaffected.
 new_run_dir

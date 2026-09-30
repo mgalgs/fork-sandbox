@@ -3237,7 +3237,9 @@ EOF
 #                         of the body; see fs_append_handoff_brief.
 # $7  flavor              "spec" (default), "review-only", or
 #                         "review-only-maintained" (review-only, with a
-#                         maintain leg reading the verdict next).
+#                         maintain leg reading the verdict next), or
+#                         "review-only-continued" (review-only, with later
+#                         legs of any kind reading the verdict next).
 fs_emit_review_prompt_body() {
     local branch="$1" base_sha="$2" review_skill_dir="$3"
     local review_verdict_file="$4" inbox_dir="$5"
@@ -3256,6 +3258,14 @@ verdict ends the run outright"
         ro_next_sentence="This run has no fix leg -- a maintainer reads your
 verdict next and builds on it, and then the run ends"
         ro_output_sentence="Your verdict is what the maintainer builds on"
+    elif [[ "$flavor" == "review-only-continued" ]]; then
+        # An intermediate leg of a multi-step read-only pipeline: later
+        # legs read this verdict and build on it.
+        flavor=review-only
+        handoff_flavor=review-only
+        ro_next_sentence="This run has no fix leg -- later legs read your
+verdict next and build on it, and then the run ends"
+        ro_output_sentence="Your verdict is what the later legs build on"
     fi
     if [[ "$flavor" == "review-only" ]]; then
         review_role_para="This branch was not built in this sandbox -- it was built elsewhere,
@@ -3444,7 +3454,9 @@ fs_emit_headless_turn_section() {
 #
 # $6  handoff_file  the caller's original handoff, embedded at the end of
 #                   the body; see fs_append_handoff_brief.
-# $7  flavor        "spec" (default) or "review-only", as for
+# $7  flavor        "spec" (default), "review-only" or
+#                   "review-only-continued" (review-only with later legs
+#                   reading the verdict), as for
 #                   fs_emit_review_prompt_body and for the same reasons: in a
 #                   read-only pipeline the branch was built elsewhere, the
 #                   handoff is a review brief, and no fix leg follows.
@@ -3454,6 +3466,19 @@ fs_emit_maintainer_prompt_body() {
     local inner_review="$5"
     local handoff_file="$6" flavor="${7:-spec}"
     local mnt_role_para addendum_para hands_off_para invented_para
+    local ro_ends_sentence="a FINDINGS verdict ends
+it" ro_output_sentence="Your verdict is this run's output: nothing downstream applies fixes, and
+every change you make in this clone is thrown away with the sandbox."
+    local handoff_flavor="$flavor"
+    if [[ "$flavor" == "review-only-continued" ]]; then
+        # An intermediate leg of a multi-step read-only pipeline: later
+        # legs read this verdict and build on it.
+        flavor=review-only
+        handoff_flavor=review-only
+        ro_ends_sentence="later legs read your verdict next and the run ends after them"
+        ro_output_sentence="Your verdict is what the later legs build on: nothing applies fixes, and
+every change you make in this clone is thrown away with the sandbox."
+    fi
     if [[ "$flavor" == "review-only" ]]; then
         mnt_role_para="This branch was not built in this sandbox -- it was built elsewhere,
 against a spec this sandbox never had. You are the MAINTAINER, deciding
@@ -3476,13 +3501,11 @@ exists."
         addendum_para="You read the operator inbox as part of every session; this leg is where that
 reading has to show up in the verdict. If an addendum asks for work that the
 commits under review do not contain, that is a finding. Report it as one,
-with the addendum quoted. This run has no fix leg -- a FINDINGS verdict ends
-it -- so reporting the gap is all this leg can do about it. Do not approve a
+with the addendum quoted. This run has no fix leg -- $ro_ends_sentence -- so reporting the gap is all this leg can do about it. Do not approve a
 branch that leaves an operator instruction unfollowed. You are reporting the
 gap here, not closing it — the next section still applies."
         hands_off_para="Do not fix anything. Do not edit, stage, commit, amend, rebase or revert.
-Your verdict is this run's output: nothing downstream applies fixes, and
-every change you make in this clone is thrown away with the sandbox.
+$ro_output_sentence
 Reading, building and running the tests is fine — changing tracked files is
 not."
         invented_para="Say \`APPROVED\` when you mean it. An invented finding costs the operator real
@@ -3605,7 +3628,7 @@ author's message. The orchestrator reads this report instead of the
 author's own account. Keep the \`Checked:\` paragraph where it is, in the
 verdict body, before this heading.
 EOF
-    fs_emit_handoff_spec_section "$handoff_file" "$flavor"
+    fs_emit_handoff_spec_section "$handoff_file" "$handoff_flavor"
 }
 
 # The fix leg's task text, for fork-sandbox.sh's --review-loop and the

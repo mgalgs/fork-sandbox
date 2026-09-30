@@ -621,9 +621,9 @@ refuses "--harness is refused against a composed pipeline with more than one cod
 refuses "--k8s is refused against a composed pipeline preset" \
     "does not support a composed pipeline preset ('composed')" \
     --preset composed --k8s
-refuses "--review-only refuses a preset whose remaining steps are not a read-only shape" \
-    "a read-only pipeline (no code step, no fix_agent) is a review step, a maintain step, or a review step then a maintain step" \
-    --preset composed --review-only --checkout HEAD
+run --preset composed --review-only --checkout HEAD >/dev/null 2>"$err" || true
+contains "--review-only accepts a preset whose remaining steps are several read-only steps" \
+    "$(cat "$err")" "composed pipeline, 3 steps, read-only"
 
 accepts "a composed pipeline preset launches with no conflicting flags" --preset composed
 
@@ -1293,18 +1293,36 @@ pipeline:
     agent: reviewer
 EOF
 
-parse_refuses "a read-only pipeline must be review, maintain, or review then maintain" \
-    "a read-only pipeline (no code step, no fix_agent) is a review step" <<'EOF'
+# Any number of review and maintain steps, in any order, is read-only.
+for ro_shape in "review review" "review review maintain" \
+    "review maintain review" "maintain maintain" "maintain review"; do
+    {
+        printf 'agents:\n  reviewer:\n    harness: claude\n    model: opus\npipeline:\n'
+        for ro_action in $ro_shape; do
+            printf '  - action: %s\n    repeat: 1\n    agent: reviewer\n' "$ro_action"
+        done
+    } > "$tmp/ro-shape.yaml"
+    out="$(python3 "$preset_parser" "$tmp/ro-shape.yaml" roshape x 2>"$err")" \
+        || no "a read-only pipeline of '$ro_shape' parses" "$(cat "$err")"
+    contains "a read-only pipeline of '$ro_shape' is flagged read-only" \
+        "$out" "pipeline	readonly	1"
+    check "a read-only pipeline of '$ro_shape' keeps its step order" \
+        "${ro_shape// /,}" \
+        "$(sed -n 's/^step\t[0-9]*\taction\t//p' <<<"$out" | paste -sd, -)"
+    lacks "a read-only pipeline of '$ro_shape' has no fix seat" "$out" "fix_"
+done
+parse_refuses "repeat > 1 is still refused on the later step of a multi-step read-only pipeline" \
+    "'repeat' is 3 on a read-only maintain step" <<'EOF'
 agents:
   reviewer:
     harness: claude
     model: opus
 pipeline:
-  - action: maintain
-    repeat: 1
-    agent: reviewer
   - action: review
     repeat: 1
+    agent: reviewer
+  - action: maintain
+    repeat: 3
     agent: reviewer
 EOF
 
@@ -1510,18 +1528,17 @@ python3 "$repo_dir/scripts/fork-sandbox-pipeline-spec.py" \
         "pipeline	steps	5" \
         "step	2	agent	reviewer" "step	3	agent	reviewer2" \
         "step	4	agent	maintainer" "step	5	agent	maintainer2"
-# A codeless spec compiles to a read-only pipeline, which the preset parser
-# only ever accepts as a review step, a maintain step, or a review step
-# then a maintain step (see the read-only tests below) -- so, unlike a
-# spec with a code stage, a codeless spec cannot repeat review or maintain
-# stages. Refused here, in the compiler, rather than left to surface as a
-# confusing read-only-shape error out of fork-sandbox-preset-parse.py.
-refuses "a repeated review stage with no code stage is refused" \
-    "a codeless spec compiles to a read-only pipeline" --pipeline ropus-rsonnet
-refuses "a repeated maintain stage with no code stage is refused" \
-    "a codeless spec compiles to a read-only pipeline" --pipeline mopus-msonnet
-refuses "a repeated maintain stage after a single review stage, with no code stage, is refused" \
-    "a codeless spec compiles to a read-only pipeline" --pipeline rhaiku-mopus-msonnet
+# A codeless spec compiles to a read-only pipeline: any number of review
+# and maintain stages in any order, each run once.
+for ro_spec in r-r r-r-m r-m-r m-m; do
+    ro_spec_full="${ro_spec//r/ropus}"
+    ro_spec_full="${ro_spec_full//m/msonnet}"
+    python3 "$repo_dir/scripts/fork-sandbox-pipeline-spec.py" "$ro_spec_full" | \
+        parses "a codeless --pipeline '$ro_spec_full' compiles to a read-only pipeline" \
+            "pipeline	readonly	1" "pipeline	steps	$(tr -cd 'rm' <<<"$ro_spec" | wc -c)"
+done
+refuses "repeat > 1 on a read-only --pipeline step is still refused after a prior step" \
+    "'repeat' is 2 on a read-only maintain step" --pipeline ropus-msonnet2 --checkout HEAD
 refuses "an unknown stage letter is refused" \
     "stage 'x' is not c (code)" --pipeline xsonnet
 refuses "a zero repeat is refused" \
@@ -2394,6 +2411,102 @@ else
     no "a read-only maintain-only launch succeeds"
 fi
 
+# A read-only pipeline of several steps, in any order: each leg runs once, in
+# order, and builds on every earlier leg's verdict.
+prep_stub $'findings\napproved\nfindings'
+if rd_ms="$(run_stubbed --pipeline rhaiku-mopus-rsonnet --checkout "ro-target-$$" \
+    --review-base "$ro_base")"; then
+    tmpdirs+=("$rd_ms")
+    check "a three-step read-only pipeline runs three legs" "3" "$(cat "$count")"
+    check "step 1's verdict is kept under its own name" "FINDINGS" \
+        "$(head -1 "$rd_ms/s1-review-verdict-1.md" 2>/dev/null)"
+    check "step 2's verdict is kept under its own name" "APPROVED" \
+        "$(head -1 "$rd_ms/s2-maintain-verdict-1.md" 2>/dev/null)"
+    check "step 3's verdict is kept under its own name" "FINDINGS" \
+        "$(head -1 "$rd_ms/s3-review-verdict-1.md" 2>/dev/null)"
+    check "every leg has its own events file" "3" \
+        "$(for f in events-s1-review-1 events-s2-maintain-1 events-s3-review-1; do
+            [[ -s "$rd_ms/$f.jsonl" ]] && echo x; done | wc -l)"
+    lacks "the first leg's prompt holds no earlier verdict" \
+        "$(cat "$rd_ms/step-1-prompt-1.md")" "Verdicts of the earlier legs"
+    contains "the second leg's prompt holds step 1's verdict" \
+        "$(cat "$rd_ms/step-2-prompt-1.md")" "### Step 1: review (claude/haiku)"
+    contains "the second leg's prompt quotes that verdict verbatim" \
+        "$(cat "$rd_ms/step-2-prompt-1.md")" "file.txt:1 the stub found a problem"
+    lacks "the second leg's prompt holds no verdict of its own" \
+        "$(cat "$rd_ms/step-2-prompt-1.md")" "### Step 2"
+    contains "the third leg's prompt holds step 1's verdict" \
+        "$(cat "$rd_ms/step-3-prompt-1.md")" "### Step 1: review (claude/haiku)"
+    contains "the third leg's prompt holds step 2's verdict" \
+        "$(cat "$rd_ms/step-3-prompt-1.md")" "### Step 2: maintain (claude/opus)"
+    contains "the third leg's prompt holds step 2's verdict text" \
+        "$(cat "$rd_ms/step-3-prompt-1.md")" "Checked: everything."
+    contains "the maintainer leg reads the review as its inner review" \
+        "$(cat "$rd_ms/step-2-prompt-1.md")" "A review leg has"
+    contains "the review legs use the review-only wording" \
+        "$(cat "$rd_ms/step-3-prompt-1.md")" "This branch was not built in this sandbox"
+    if compgen -G "$rd_ms/*fix-prompt*" >/dev/null || compgen -G "$rd_ms/events-*fix*" >/dev/null; then
+        no "a multi-step read-only run builds no fix prompt and runs no fix leg" "$(ls "$rd_ms")"
+    else
+        ok "a multi-step read-only run builds no fix prompt and runs no fix leg"
+    fi
+    check "a multi-step read-only run exits 0" "0" "$(cat "$rd_ms/exit-code" 2>/dev/null)"
+    check "pipeline.json lists every step, none a code step" "review,maintain,review" \
+        "$(jq -r '[.steps[].action] | join(",")' "$rd_ms/pipeline.json")"
+    check "no step records a fix seat" "0" \
+        "$(jq '[.steps[] | select(.fix != null)] | length' "$rd_ms/pipeline.json")"
+    check "progress.json lists every step done" "done,done,done" \
+        "$(jq -r '[.steps[].state] | join(",")' "$rd_ms/progress.json")"
+    check "each step ran its one pass" "1,1,1" \
+        "$(jq -r '[.steps[].i] | join(",")' "$rd_ms/progress.json")"
+    check "the steps ended on findings, approved, findings" "findings,approved,findings" \
+        "$(jq -r '[.steps[].ended] | join(",")' "$rd_ms/progress.json")"
+    check "each step has its own loop record" "3" \
+        "$(compgen -G "$rd_ms/step-[0-9]-loop.json" | wc -l)"
+    check "the total cost sums all three legs" "0.030000" \
+        "$(jq -r '.total_cost_usd' "$rd_ms/summary.json")"
+    check "summary.json lists every leg" "review,maintain,review" \
+        "$(jq -r '[.steps[].action] | join(",")' "$rd_ms/summary.json")"
+    check "summary.json records how each leg ended" "findings,approved,findings" \
+        "$(jq -r '[.steps[].ended] | join(",")' "$rd_ms/summary.json")"
+    check "summary.txt lists every leg" "3" \
+        "$(grep -cE '^step [123]:' "$rd_ms/summary.txt")"
+    check "report_from names the last leg with a usable report" "review" \
+        "$(jq -r '.report_from' "$rd_ms/summary.json")"
+    lacks "a leg that a later leg follows does not claim to end the run" \
+        "$(cat "$rd_ms/step-1-prompt-1.md")" "ends the run outright"
+    lacks "an intermediate leg does not call its verdict the run's whole output" \
+        "$(cat "$rd_ms/step-1-prompt-1.md")" "whole output"
+    contains "an intermediate leg says later legs build on its verdict" \
+        "$(cat "$rd_ms/step-1-prompt-1.md")" "later legs read your"
+    contains "an intermediate maintainer says later legs build on its verdict" \
+        "$(cat "$rd_ms/step-2-prompt-1.md")" "later legs read your verdict"
+    lacks "the last leg keeps the end-of-run wording's absence of later legs" \
+        "$(cat "$rd_ms/step-3-prompt-1.md")" "later legs"
+    st_out="$(HOME="$launcher_home" "$repo_dir/scripts/fork-sandbox-status.sh" "$rd_ms" 2>&1)" || true
+    # The legs finish within a second of each other, so which one is "last"
+    # is the clock's call; any of them is named by step and action.
+    check "status labels a leg by its step and action" "1" \
+        "$(grep -cE '^activity: s[123]-(review|maintain)-1,' <<<"$st_out")"
+    contains "status counts every leg's events" "$st_out" "events:   3"
+    contains "status reports the run as review-only" "$st_out" "mode:      review-only"
+else
+    no "a three-step read-only launch succeeds"
+fi
+
+prep_stub $'approved\nfindings'
+if rd_mm="$(run_stubbed --pipeline mopus-msonnet --checkout "ro-target-$$" \
+    --review-base "$ro_base")"; then
+    tmpdirs+=("$rd_mm")
+    check "a maintain-then-maintain read-only pipeline runs two legs" "2" "$(cat "$count")"
+    contains "the second maintainer builds on the first maintainer's verdict" \
+        "$(cat "$rd_mm/step-2-prompt-1.md")" "### Step 1: maintain (claude/opus)"
+    lacks "a maintainer after only a maintainer is not told a review leg ran" \
+        "$(cat "$rd_mm/step-2-prompt-1.md")" "A review leg has"
+else
+    no "a maintain-then-maintain read-only launch succeeds"
+fi
+
 # --review-only over a preset drops its code step and runs the rest once.
 # Each step has its own model, so a leg seated on the dropped coder shows.
 cat > "$real_presets/ro-alias.yaml" <<'EOF'
@@ -2502,6 +2615,24 @@ else
     no "--model overrides a read-only review seat" "$(cat "$err")"
 fi
 
+# Seat flags have no single seat to land on in a multi-step shape.
+for ro_flag in "--model sonnet" "--harness claude" "--review-model sonnet" \
+    "--review-harness claude" "--maintainer-model sonnet" \
+    "--maintainer-harness claude" "--claude-args --effort=high" \
+    "--pi-args --x" "--codex-args --x" "--review-loop 2" "--maintainer-loop 2"; do
+    # shellcheck disable=SC2086
+    ro_refuses "${ro_flag%% *} is refused on a multi-step read-only pipeline" \
+        "it is a read-only pipeline of 3 steps" \
+        --pipeline rhaiku-mopus-rsonnet $ro_flag
+done
+ro_refuses "--k8s is refused on a multi-step read-only pipeline" \
+    "--review-only is not supported with --k8s" --pipeline rhaiku-rsonnet --k8s
+if out="$(ro_dry --pipeline rhaiku-rsonnet 2>"$err")"; then
+    contains "a two-review read-only pipeline passes --dry-run" "$out" "mode=review-only"
+else
+    no "a two-review read-only pipeline passes --dry-run" "$(cat "$err")"
+fi
+
 # --claude-args/--pi-args/--codex-args have no maintainer-seat route the
 # way --model/--harness do above (there is no --maintainer-args flag): a
 # maintain-only read-only pipeline's implement seat is phantom, so these
@@ -2536,6 +2667,8 @@ ro_refuses "--session-id is refused on a read-only pipeline" \
 
 refuses "a read-only pipeline needs --checkout" \
     "is read-only (no code step), so it" --pipeline ropus
+refuses "a multi-step read-only pipeline needs --checkout" \
+    "is read-only (no code step), so it" --pipeline ropus-rsonnet
 refuses "a read-only --pipeline step with repeat > 1 is refused" \
     "'repeat' is 2 on a read-only review step" --pipeline ropus2 --checkout HEAD
 

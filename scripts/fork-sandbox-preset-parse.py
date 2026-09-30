@@ -305,11 +305,6 @@ def main():
     read_only = (all(s["action"] != "code" for s in steps)
                  and all(s["fix_ref"] is None for s in steps))
     if read_only:
-        shape = [s["action"] for s in steps]
-        if shape not in (["review"], ["maintain"], ["review", "maintain"]):
-            fail("a read-only pipeline (no code step, no fix_agent) is a "
-                 "review step, a maintain step, or a review step then a "
-                 "maintain step")
         for s in steps:
             if s["cap"] != 1:
                 if not DROP_CODE:

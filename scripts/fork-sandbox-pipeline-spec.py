@@ -12,9 +12,8 @@ or `ropus-msonnet` (opus review, sonnet maintain -- no code step at all).
              count, exactly as a preset file's pipeline allows --
              UNLESS there is no c segment: a codeless spec compiles to a
              read-only pipeline (see fork-sandbox-preset-parse.py), which
-             only ever runs as a review step, a maintain step, or a review
-             step then a maintain step, so a codeless spec takes at most
-             one r and at most one m.
+             reviews an existing branch and runs each r and m step once,
+             so every repeat in it must be 1.
     model    a name from MODELS below. It runs on its native harness, the
              first one listed for it.
     harness  optional: claude, codex or pi, to seat the model on a
@@ -115,12 +114,6 @@ def compile_spec(spec):
         agent = (AGENT_NAMES[stage] if occurrence == 1
                  else f"{AGENT_NAMES[stage]}{occurrence}")
         seats.append((stage, harness, model_id, repeat, agent))
-
-    if occurrences["c"] == 0 and (occurrences["r"] > 1
-                                  or occurrences["m"] > 1):
-        fail(spec, "a codeless spec compiles to a read-only pipeline, which "
-                   "runs at most one review step and one maintain step; "
-                   "add a code segment to repeat review or maintain stages")
 
     lines = [f"# Compiled from --pipeline {spec}", "agents:"]
     for stage, harness, model_id, repeat, agent in seats:
