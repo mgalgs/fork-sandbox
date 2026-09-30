@@ -688,14 +688,16 @@ latest_event_file() {
     [[ -n "$LATEST_EVENT_FILE" ]]
 }
 
-# Which leg an event file belongs to: events.jsonl is the code leg,
+# Which leg an event file belongs to: events.jsonl is the run's first leg
+# (run.env's first_leg_kind; "code" for run dirs that predate the key),
 # events-<kind>-<N>.jsonl is <kind>-<N> (a repeat pass's -p<P> stays in the
 # name, so a fix round's second pass reads as fix-1-p2).
 event_file_leg_name() {
-    local base
+    local base leg_kind
     base="${1##*/}"
     if [[ "$base" == "events.jsonl" ]]; then
-        printf 'code'
+        leg_kind="$(run_env_get first_leg_kind)"
+        printf '%s' "${leg_kind:-code}"
     else
         base="${base#events-}"
         printf '%s' "${base%.jsonl}"

@@ -7457,6 +7457,18 @@ launcher_session_id="${CLAUDE_CODE_SESSION_ID:-}"
     else
         printf 'mode=run\n'
     fi
+    # Which leg writes events.jsonl, for the status script's leg label: a
+    # review-only run has no code leg, so its first leg (a review, or the
+    # maintainer when impl_seat_is_phantom) takes that file.
+    first_leg_kind=code
+    if [[ "$review_only" == true ]]; then
+        if [[ "$impl_seat_is_phantom" == true ]]; then
+            first_leg_kind=maintainer
+        else
+            first_leg_kind=review
+        fi
+    fi
+    printf 'first_leg_kind=%s\n' "$first_leg_kind"
     printf 'outbox_max_bytes=%s\n' "$outbox_max_bytes"
     printf 'started_at=%s\n' "$started_at"
     # The launching Claude session's id, always printed (never conditional

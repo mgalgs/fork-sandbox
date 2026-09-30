@@ -375,6 +375,31 @@ out="$(timeout 12 "$status" "$rd_new" 2>&1)"
 [[ "$out" == *"activity: code, last event "* ]] \
     || { echo "activity line did not name the code leg: $out"; exit 1; }
 
+# 8b-i. A read-only run (bare --review-only, or any preset whose first step
+# is a review step) has no code leg at all -- its first leg's events go to
+# events.jsonl too (run_leg's own "mode == review-only" branch), and
+# run.env's first_leg_kind (written at launch) says which leg that was, so
+# the activity line must name it, not "code".
+new_run_dir
+printf 'first_leg_kind=review\n' >> "$rd_new/run.env"
+cat > "$rd_new/events.jsonl" <<'EOF'
+{"type":"result","subtype":"success","result":"account"}
+EOF
+out="$(timeout 12 "$status" "$rd_new" 2>&1)"
+[[ "$out" == *"activity: review, last event "* ]] \
+    || { echo "activity line did not name the read-only review leg: $out"; exit 1; }
+
+# 8b-ii. A read-only preset whose lone step is a maintain step runs on the
+# maintainer seat instead, and its leg claims events.jsonl the same way.
+new_run_dir
+printf 'first_leg_kind=maintainer\n' >> "$rd_new/run.env"
+cat > "$rd_new/events.jsonl" <<'EOF'
+{"type":"result","subtype":"success","result":"account"}
+EOF
+out="$(timeout 12 "$status" "$rd_new" 2>&1)"
+[[ "$out" == *"activity: maintainer, last event "* ]] \
+    || { echo "activity line did not name the read-only maintainer leg: $out"; exit 1; }
+
 # 8c. A run with no event files yet prints no activity line at all.
 new_run_dir
 out="$(timeout 12 "$status" "$rd_new" 2>&1)"
