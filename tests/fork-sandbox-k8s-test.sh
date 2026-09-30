@@ -6213,6 +6213,19 @@ case " $* " in
             cat >/dev/null
         fi
         exit 0 ;;
+    *"--field-manager=fork-sandbox-k8s-claude-token"*)
+        # The claude-token Secret's own apply, distinguished from every
+        # other apply below by its field manager -- captured separately so
+        # a test can inspect exactly this payload, not whichever apply
+        # happened to run last (a plain "apply -f -" submit stream applies
+        # the Secret, the proxy manifest and the Job in turn, and the
+        # generic case below would only ever keep the last one's stdin).
+        if [[ -n "${K8S_STUB_SECRET_APPLY_CAPTURE:-}" ]]; then
+            cat > "$K8S_STUB_SECRET_APPLY_CAPTURE"
+        else
+            cat >/dev/null
+        fi
+        exit "${K8S_STUB_APPLY_RC:-0}" ;;
     *" apply -f -"*)
         if [[ -n "${K8S_STUB_APPLY_MANIFEST:-}" ]]; then
             cat > "$K8S_STUB_APPLY_MANIFEST"
@@ -7358,6 +7371,12 @@ if grep -qF 'tok2' "$keeper_log"; then
     no "the token never appears in any kubectl argv (keeper push)" "found 'tok2' in $keeper_log"
 else
     ok "the token never appears in any kubectl argv (keeper push)"
+fi
+if grep -qE -- 'apply -f - --server-side --field-manager=fork-sandbox-k8s-claude-token --force-conflicts( |$)' "$keeper_log"; then
+    ok "the keeper's own Secret re-apply carries --server-side and its field manager too"
+else
+    no "the keeper's own Secret re-apply carries --server-side and its field manager too" \
+        "$(cat "$keeper_log")"
 fi
 sleep 3
 keeper_exec_calls_2="$(grep -c -- '-claude-proxy -- sh -c' "$keeper_log" || true)"
@@ -13921,6 +13940,58 @@ if [[ -n "$balance_happy_rd" && -d "$balance_happy_rd" ]]; then
         no "balance happy path: collect exits 0 and writes a valid summary.json" \
             "rc=$balance_happy_collect_rc out=$(cat "$balance_happy_collect_out") summary=$(cat "$balance_happy_rd/summary.json" 2>/dev/null; echo NOFILE)"
     fi
+fi
+
+printf '\n== fork-sandbox-k8s.sh submit --harness claude: the token Secret is applied server-side ==\n'
+# Client-side apply would copy the token into the last-applied-configuration
+# annotation. A full --harness claude submit through runstub_dir's kubectl,
+# whose field-manager case captures exactly the Secret's own payload.
+secretapply_log="$(newdir)/kubectl.log"; tmpdirs+=("$(dirname "$secretapply_log")")
+secretapply_capture="$(newdir)/secret-apply-payload.json"; tmpdirs+=("$(dirname "$secretapply_capture")")
+secretapply_out="$(HOME="$claude_home" PATH="$runstub_dir:$PATH" \
+    K8S_STUB_LOG="$secretapply_log" K8S_STUB_SECRET_APPLY_CAPTURE="$secretapply_capture" \
+    K8S_STUB_BASE_SHA="$rundir_head_sha" \
+    FORK_SANDBOX_CONFIG_DIR="$config_dir" \
+    "$k8s_sh" submit --branch fs-k8s-test-secret-serverside --model claude-sonnet-5 \
+    --harness claude "$proj_dir" "$handoff_file" 2>&1)"
+secretapply_rc=$?
+secretapply_rd="$(sed -n 's/^  run dir:  *//p' <<<"$secretapply_out" | head -1)"
+if (( secretapply_rc == 0 )) && [[ -n "$secretapply_rd" && -d "$secretapply_rd" ]]; then
+    tmpdirs+=("$secretapply_rd")
+    ok "submit --harness claude (server-side Secret): exits 0 and produces a run dir"
+else
+    no "submit --harness claude (server-side Secret): exits 0 and produces a run dir" \
+        "rc=$secretapply_rc out=$secretapply_out"
+fi
+if grep -qE -- 'apply -f - --server-side --field-manager=fork-sandbox-k8s-claude-token --force-conflicts( |$)' "$secretapply_log"; then
+    ok "the token Secret's own apply carries --server-side and its field manager"
+else
+    no "the token Secret's own apply carries --server-side and its field manager" \
+        "$(cat "$secretapply_log")"
+fi
+if [[ "$(jq -r '.kind + "/" + .metadata.name' "$secretapply_capture" 2>/dev/null)" \
+        == "Secret/fork-sandbox-agent-fs-k8s-test-secret-serverside-claude-token" ]]; then
+    ok "the server-side apply under that field manager is the token Secret itself"
+else
+    no "the server-side apply under that field manager is the token Secret itself" \
+        "$(cat "$secretapply_capture" 2>/dev/null; echo NOFILE)"
+fi
+# The labels stay a separate `kubectl label` (field manager kubectl-label),
+# so the keeper's re-apply, which omits them, does not remove them. The
+# stub cannot prove that ownership rule; it pins the command shape.
+if grep -qE -- 'label secret fork-sandbox-agent-fs-k8s-test-secret-serverside-claude-token .*--overwrite$' "$secretapply_log" \
+    && ! grep -qE -- 'label secret fork-sandbox-agent-fs-k8s-test-secret-serverside-claude-token .*--server-side' "$secretapply_log"; then
+    ok "the label call after the Secret's create is unchanged (no --server-side of its own)"
+else
+    no "the label call after the Secret's create is unchanged (no --server-side of its own)" \
+        "$(cat "$secretapply_log")"
+fi
+# The Job's own server-side apply keeps kubectl's default field manager.
+if grep -qE -- 'apply -f - --server-side$' "$secretapply_log"; then
+    ok "the Job's own apply keeps its plain --server-side, no claude-token field manager"
+else
+    no "the Job's own apply keeps its plain --server-side, no claude-token field manager" \
+        "$(cat "$secretapply_log")"
 fi
 
 printf '\n== fork-sandbox.sh --k8s delegation: via/source attribution and single hook call ==\n'

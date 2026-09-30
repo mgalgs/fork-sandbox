@@ -1181,6 +1181,13 @@ reject_nginx_unsafe_chars() {
     return 0
 }
 
+# The server-side-apply field manager for the claude-token Secret. Its two
+# applies (cmd_submit's create, k8s_push_claude_key's replacement) must use
+# the same one, or the second conflicts with the first over .data. Both pass
+# --force-conflicts: a Secret an older submit created client-side belongs to
+# kubectl-client-side-apply, and without it the keeper's push is refused.
+K8S_CLAUDE_TOKEN_FIELD_MANAGER=fork-sandbox-k8s-claude-token
+
 # Builds the per-run Claude token Secret manifest -- name and namespace as
 # arguments, the real access token on STDIN ONLY, never argv, so it never
 # appears in `ps` or a log line. Prints a Secret manifest (JSON, which
@@ -5921,7 +5928,9 @@ EOF
         # bare token Secret left behind. Built by
         # k8s_render_claude_token_secret_manifest, the same manifest builder
         # k8s_push_claude_key's later replacement uses (see cmd_wait's
-        # keeper) -- token on STDIN ONLY, never argv, then applied --
+        # keeper) -- token on STDIN ONLY, never argv, then applied
+        # --server-side (client-side apply would copy the whole Secret,
+        # token included, into the last-applied-configuration annotation) --
         # then labeled in a SEPARATE command, since the manifest above
         # carries no labels of its own and this keeps the token off that
         # second command's argv too. Install the trap BEFORE the create
@@ -5942,7 +5951,7 @@ EOF
         ' EXIT
         printf '%s' "$claude_access_token" \
             | k8s_render_claude_token_secret_manifest "$safe_name-claude-token" "$K8S_NAMESPACE" \
-            | kubectl apply -f -
+            | kubectl apply -f - --server-side --field-manager="$K8S_CLAUDE_TOKEN_FIELD_MANAGER" --force-conflicts
         # The attribution labels go on here too, not just fork-sandbox/branch:
         # this Secret is one of the run's objects, and the docs promise every
         # one of them carries the owner. kubectl label takes key=value;
@@ -6323,11 +6332,13 @@ cmd_rm() {
 #
 # Pushes a replacement Claude access token to this run's live proxy pod --
 # an nginx reload, over `kubectl exec` with the token on stdin only -- and
-# then to the Secret backing it, so the two never drift apart. Called only
-# from cmd_wait's keeper (k8s_claude_keeper_start below), which owns the
-# host-side view of "did the credential change". Uses this file's own
-# kubectl() wrapper (which already carries --context/-n), so callers need
-# not thread those through themselves.
+# then to the Secret backing it, applied --server-side (client-side apply
+# would copy the whole Secret, token included, into the
+# last-applied-configuration annotation), so the two never drift apart.
+# Called only from cmd_wait's keeper (k8s_claude_keeper_start below), which
+# owns the host-side view of "did the credential change". Uses this file's
+# own kubectl() wrapper (which already carries --context/-n), so callers
+# need not thread those through themselves.
 #
 # The token reaches the proxy pod's writable /etc/nginx/key emptyDir (see
 # manifests/k8s/31-claude-proxy.yaml) via a temp file in that SAME
@@ -6376,7 +6387,7 @@ fi'
 
     if ! printf '%s' "$token" \
         | k8s_render_claude_token_secret_manifest "$safe_name-claude-token" "$K8S_NAMESPACE" \
-        | kubectl apply -f - >/dev/null 2>&1; then
+        | kubectl apply -f - --server-side --field-manager="$K8S_CLAUDE_TOKEN_FIELD_MANAGER" --force-conflicts >/dev/null 2>&1; then
         echo "fork-sandbox-k8s: warning: pushed a new Claude access token to the proxy but could not update its Secret; they may now differ." >&2
         return 1
     fi

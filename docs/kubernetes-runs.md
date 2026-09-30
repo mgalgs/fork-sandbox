@@ -1381,10 +1381,13 @@ resolves `HOST_CLAUDE_BIN`: PATH, then `~/.local/bin/claude`).
 `cmd_submit` then creates the per-run Secret via
 `k8s_render_claude_token_secret_manifest` — one jq call that reads the real
 token on STDIN ONLY (never argv) and prints a Secret manifest with it
-base64-encoded, piped straight to `kubectl apply -f -`. This is the ONE
-place that ever turns the real token into this Secret's content; the same
-function builds it again every time the keeper (below) pushes a
-replacement, so the two can never render the object differently. Under
+base64-encoded, piped straight to `kubectl apply --server-side -f -`
+(client-side apply would copy the whole Secret, token included, into the
+`kubectl.kubernetes.io/last-applied-configuration` annotation). This is the
+ONE place that ever turns the real token into this Secret's content; the
+same function builds it again every time the keeper (below) pushes a
+replacement, applied --server-side under the same field manager so the two
+applies cooperate rather than fight over ownership. Under
 `--dry-run` nothing is created; one comment line says the Secret would be,
 with no value. `cmd_submit` still refuses an already-expired token outright
 and warns on stderr when it has under an hour left — the same two hard
