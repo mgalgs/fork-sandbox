@@ -18,7 +18,10 @@ The session is one turn: when it stops, the run ends, and nothing wakes it
 later. So a Claude session runs with background tasks switched off
 (`CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`) and a one-hour Bash timeout cap,
 which keeps a long test suite in the foreground rather than killed at exit
-along with the session's uncommitted work.
+along with the session's uncommitted work. Every harness's prompt — claude,
+pi, codex — also says this in plain words, coding and fix legs included:
+run tests and builds in the foreground, and commit before ending the turn,
+since only committed work leaves the sandbox.
 
 Results come home on their own:
 

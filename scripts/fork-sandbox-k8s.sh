@@ -5428,7 +5428,8 @@ CENV
 
     # The exact prompt text the pod's ConfigMap embeds under handoff.md --
     # preamble, then the optional context/services sections, then the
-    # operator's own handoff -- captured here once so run_dir's own
+    # headless-turn warning, then the operator's own handoff -- captured
+    # here once so run_dir's own
     # handoff.md (below) is a faithful archive rather than a second,
     # independent render. A trailing sentinel byte survives command
     # substitution's trailing-newline stripping and is peeled back off, so
@@ -5444,6 +5445,7 @@ CENV
    [[ -n "$context_ro" ]] && render_context_section "$POD_CONTEXT_DIR"
    [[ -n "$context_secret" ]] && render_context_secret_section "$POD_CONTEXT_DIR" "$context_secret"
    [[ -n "$services_prompt_text" ]] && render_services_section "$services_prompt_text" "$sandbox_env_present"
+   fs_emit_headless_turn_section
    printf 'X'; })"
     continuation_header="${continuation_header%X}"
     rendered_handoff="$({ printf '%s' "$continuation_header"

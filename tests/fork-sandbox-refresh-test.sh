@@ -670,6 +670,14 @@ if [[ -n "$rd" ]]; then
             "## The original brief" "$(cat "$cont_prompt")"
         contains "leg 2's prompt has the hand-off heading" \
             "## Hand-off from the previous leg" "$(cat "$cont_prompt")"
+        # The continuation header carries the same headless-turn warning as
+        # the leg-1 coding prompt: a continuation is still a leg that edits,
+        # with no verdict file to fall back on.
+        contains "leg 2's prompt warns nothing wakes it for a background result" \
+            "wakes you later to deliver a background command's result" \
+            "$(cat "$cont_prompt")"
+        contains "leg 2's prompt says only committed work leaves the sandbox" \
+            "Only committed work leaves the sandbox" "$(cat "$cont_prompt")"
         if grep -q '## Warning: this hand-off is stale' "$cont_prompt"; then
             no "an on-time hand-off's prompt carries no stale warning"
         else
@@ -690,6 +698,8 @@ if [[ -n "$rd" ]]; then
         no "leg 2's prompt carries the original brief's text"
         no "leg 2's prompt has the original-brief heading"
         no "leg 2's prompt has the hand-off heading"
+        no "leg 2's prompt warns nothing wakes it for a background result"
+        no "leg 2's prompt says only committed work leaves the sandbox"
         no "an on-time hand-off's prompt carries no stale warning"
         no "the brief heading appears before the hand-off heading"
     fi

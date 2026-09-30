@@ -6286,6 +6286,7 @@ EOF
     fi
     fs_emit_browser_section
     fs_emit_prompt_overlay implement
+    fs_emit_headless_turn_section
     printf '\n---\n\n'
     cat -- "$handoff_file"
 } > "$handoff_copy.part"
@@ -6577,8 +6578,11 @@ continuation_prompt_header=""
 if (( refresh_enabled )); then
     continuation_prompt_header="$run_dir/continuation-prompt-header.md"
     fs_reject_unsafe_chars "$continuation_prompt_header"
-    fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" "$harness" "$preamble_network" \
-        "$outbox_dir" "" "$outbox_max_bytes" > "$continuation_prompt_header.part"
+    {
+        fs_emit_prompt_preamble "$clone_dir" "$inbox_dir" "$harness" "$preamble_network" \
+            "$outbox_dir" "" "$outbox_max_bytes"
+        fs_emit_headless_turn_section
+    } > "$continuation_prompt_header.part"
     mv -- "$continuation_prompt_header.part" "$continuation_prompt_header"
 fi
 

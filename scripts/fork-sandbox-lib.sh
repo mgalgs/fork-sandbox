@@ -3377,6 +3377,31 @@ verdict, and the run treats that as a failure.
 EOF
 }
 
+# A leg that edits (implement, fix, and a self-refreshed continuation of
+# either) has no verdict file to fall back on the way a review or maintainer
+# leg does, so it needs the same headless warning spelled out for commits
+# instead: a session that starts its test suite in the background and ends
+# its turn to wait for the result is never woken to see it finish, and every
+# change it made is still uncommitted when the sandbox is torn down. Used
+# bare, mid-paragraph, where a prompt already has a natural place for it
+# (fs_emit_fix_prompt_body); fs_emit_headless_turn_section wraps it with its
+# own heading for a prompt that does not.
+fs_emit_headless_turn_para() {
+    cat <<'EOF'
+This session is headless: when your turn ends, the run ends, and nothing
+wakes you later to deliver a background command's result. Run tests and
+builds in the foreground and wait for them -- never end your turn on
+something still running. Only committed work leaves the sandbox, so commit
+before you end your turn; anything left uncommitted is discarded with the
+clone.
+EOF
+}
+
+fs_emit_headless_turn_section() {
+    printf '\n## Before you end your turn\n\n'
+    fs_emit_headless_turn_para
+}
+
 # inner_review is "yes" when a --review-loop ran before this one and "no"
 # otherwise: the two wordings are the difference between "the diff was
 # already read line by line, read around it" and "you are the branch's only
@@ -3593,6 +3618,8 @@ reported the problems repeated below.
 
 Fix the real ones, and commit. Uncommitted work is lost with the clone, so a
 fix you do not commit is a fix nobody gets.
+
+$(fs_emit_headless_turn_para)
 
 Some of what follows may be wrong: the reviewer read the same code you are
 about to read and could have misread it. **Do not change code to satisfy a

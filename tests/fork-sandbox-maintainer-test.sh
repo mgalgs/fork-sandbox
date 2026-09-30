@@ -770,6 +770,20 @@ if (( rc3 == 0 )) && [[ -n "$rd3" ]]; then
     contains "the maintainer prompt forbids ending the turn on background work" \
         "nothing wakes you when a background task finishes" \
         "$(cat "$rd3/maintainer-prompt.md")"
+    # A leg that edits has no verdict file to fall back on, so it gets the
+    # same headless warning spelled out for commits instead.
+    contains "the coding leg's prompt warns nothing wakes it for a background result" \
+        "wakes you later to deliver a background command's result" \
+        "$(cat "$rd3/handoff.md")"
+    contains "the coding leg's prompt says only committed work leaves the sandbox" \
+        "Only committed work leaves the sandbox" \
+        "$(cat "$rd3/handoff.md")"
+    contains "the fix leg's prompt warns nothing wakes it for a background result" \
+        "wakes you later to deliver a background command's result" \
+        "$(cat "$rd3/fix-prompt-1.md")"
+    contains "the maintainer-fix leg's prompt warns nothing wakes it for a background result" \
+        "wakes you later to deliver a background command's result" \
+        "$(cat "$rd3/maintainer-fix-prompt-1.md")"
     # Every prompt that actually went to a leg in this run -- two review
     # iterations, the fix leg, the maintainer leg -- carries the handoff,
     # and carries it exactly once. The review prompt is rendered once at

@@ -1675,6 +1675,22 @@ else
     no "rendered handoff.md still carries the operator's own handoff text" \
         "not found in $submit_out"
 fi
+# fs_emit_headless_turn_section, folded into the same continuation_header
+# that prefixes both the pod's coding-leg handoff.md and every continuation
+# prompt it re-sends: a leg that edits has no verdict file to fall back on,
+# so it gets the headless warning spelled out for commits instead.
+if grep -q "wakes you later to deliver a background command" "$submit_out"; then
+    ok "rendered handoff.md warns nothing wakes a headless leg for a background result"
+else
+    no "rendered handoff.md warns nothing wakes a headless leg for a background result" \
+        "not found in $submit_out"
+fi
+if grep -q "Only committed work leaves the sandbox" "$submit_out"; then
+    ok "rendered handoff.md says only committed work leaves the sandbox"
+else
+    no "rendered handoff.md says only committed work leaves the sandbox" \
+        "not found in $submit_out"
+fi
 rm -f /tmp/fs-k8s-test-install.err /tmp/fs-k8s-test-submit.err
 
 printf '\n== K8S_PROXY_ENDPOINTS: named keyless endpoints ==\n'
@@ -13862,6 +13878,7 @@ if [[ -n "$rundir_rd" && -d "$rundir_rd" ]]; then
     # the archive's blank terminal lines before this write.
     expected_rundir_handoff="$({ fs_emit_prompt_preamble /work/clone /work/inbox \
         pi gated /work/outbox pod 67108864
+        fs_emit_headless_turn_section
         printf '\n---\n\n'
         cat -- "$rundir_handoff"
         printf X

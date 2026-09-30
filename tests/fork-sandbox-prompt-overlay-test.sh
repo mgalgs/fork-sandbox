@@ -470,6 +470,15 @@ write one image instead of forty rather than risk the rest.
 No browser is available in this sandbox. Do not spend tool calls
 looking for one; if the task needs rendering, say so in your report.
 
+## Before you end your turn
+
+This session is headless: when your turn ends, the run ends, and nothing
+wakes you later to deliver a background command's result. Run tests and
+builds in the foreground and wait for them -- never end your turn on
+something still running. Only committed work leaves the sandbox, so commit
+before you end your turn; anything left uncommitted is discarded with the
+clone.
+
 ---
 
 do the task
@@ -977,6 +986,13 @@ reported the problems repeated below.
 
 Fix the real ones, and commit. Uncommitted work is lost with the clone, so a
 fix you do not commit is a fix nobody gets.
+
+This session is headless: when your turn ends, the run ends, and nothing
+wakes you later to deliver a background command's result. Run tests and
+builds in the foreground and wait for them -- never end your turn on
+something still running. Only committed work leaves the sandbox, so commit
+before you end your turn; anything left uncommitted is discarded with the
+clone.
 
 Some of what follows may be wrong: the reviewer read the same code you are
 about to read and could have misread it. **Do not change code to satisfy a
