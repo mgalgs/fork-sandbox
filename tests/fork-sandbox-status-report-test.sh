@@ -151,6 +151,45 @@ out="$(timeout 30 "$status" --monitor-terminal "$rd_new" 2>&1)"
 [[ "$out" == *"finished: failed, exit 3, "* && "$out" == *"failed run summary"* ]] \
     || { echo "monitor-terminal missing failed finished line or summary: $out"; exit 1; }
 
+# 4c. The terminal block is one burst, emitted only once summary.txt
+# exists: the result event must not go out ahead of the summary wait, or
+# the Monitor tool delivers it as its own notification seconds early.
+new_run_dir
+printf '%s\n' "$dead_pid" > "$rd_new/pid"
+cat > "$rd_new/events.jsonl" <<'EOF'
+{"type":"result","subtype":"success","result":"early account"}
+EOF
+printf '0\n' > "$rd_new/exit-code"
+burst_out="$rd_new/monitor-out"
+timeout 30 "$status" --monitor-terminal "$rd_new" > "$burst_out" 2>&1 &
+burst_pid=$!
+sleep 3
+[[ ! -s "$burst_out" ]] \
+    || { echo "monitor-terminal printed before summary.txt existed: $(cat "$burst_out")"; exit 1; }
+printf 'late summary\n' > "$rd_new/summary.txt"
+wait "$burst_pid"
+out="$(cat "$burst_out")"
+[[ "$out" == *"early account"* && "$out" == *"finished: done, exit 0, "* && "$out" == *"late summary"* ]] \
+    || { echo "monitor-terminal burst incomplete: $out"; exit 1; }
+
+# 4d. On a multi-leg run events.jsonl is only the code leg, so its result
+# event is labelled as the code leg's rather than read as the run's end.
+new_run_dir
+printf '%s\n' "$dead_pid" > "$rd_new/pid"
+cat > "$rd_new/events.jsonl" <<'EOF'
+{"type":"result","subtype":"success","result":"code leg account"}
+EOF
+cat > "$rd_new/events-review-1.jsonl" <<'EOF'
+{"type":"result","subtype":"success","result":"review leg account"}
+EOF
+printf '0\n' > "$rd_new/exit-code"
+printf 'multi summary\n' > "$rd_new/summary.txt"
+out="$(timeout 30 "$status" --monitor-terminal "$rd_new" 2>&1)"
+[[ "$(head -1 <<<"$out")" == "(the code leg's own account; later legs' verdicts follow)" ]] \
+    || { echo "multi-leg result event not labelled as the code leg's: $out"; exit 1; }
+[[ "$out" == *"code leg account"* && "$out" == *"multi summary"* ]] \
+    || { echo "multi-leg monitor-terminal block incomplete: $out"; exit 1; }
+
 # 5. --monitor-terminal combined with another mode flag is refused in
 # either argument order. A mode flag after it would switch the mode out from
 # under terminal_only — a --follow that prints nothing at all, and an

@@ -60,10 +60,12 @@
 #               suppressed: every mid-run line is a notification that goes
 #               nowhere for the Monitor tool of an orchestrating session
 #               that acts on terminal events only. At the terminal state it
-#               prints the final result event, when the session wrote one,
-#               then the same finished line, summary, and report marker
-#               --monitor prints. Cannot be combined with another mode flag
-#               in either argument order.
+#               waits for the summary, then prints one block: the code
+#               leg's final result event, when the session wrote one
+#               (labelled as the code leg's on a multi-leg run), then the
+#               same finished line, summary, and report marker --monitor
+#               prints. Cannot be combined with another mode flag in either
+#               argument order.
 # --follow:     watch the run and print EVERY event, rendered — the same
 #               stream the run's tmux pane shows. For a human at a terminal;
 #               the Monitor tool wants --monitor-terminal. Ends like
@@ -985,10 +987,24 @@ print_tail_of_log() {
 # watch, and that stream is the only other place a final result event is
 # printed. Flush it at the terminal state so the output carries the
 # session's own account, exactly as --monitor's does.
+# $1 is the event-file count. events.jsonl holds only the code leg, so on a
+# multi-leg run its result event is not the run's outcome and must say so.
 flush_result_if_terminal_only() {
     if (( terminal_only )) && have_events; then
+        if (( ${1:-1} > 1 )); then
+            printf "(the code leg's own account; later legs' verdicts follow)\n"
+        fi
         "$formatter" --result "$RUN_FILE_PATH"
     fi
+}
+
+# Counted outside the command substitution that buffers the terminal block:
+# all_event_files can die, and a die in a subshell would truncate the block
+# instead of stopping the script.
+count_event_files() {
+    EVENT_FILE_COUNT=0
+    all_event_files 2>/dev/null && EVENT_FILE_COUNT=${#EVENT_FILES[@]}
+    return 0
 }
 
 case "$mode" in
@@ -1165,33 +1181,44 @@ case "$mode" in
             state="$(run_state)"
             case "$state" in
                 done|failed)
-                    flush_result_if_terminal_only
                     # exit-code is written before the fetch, so wait a bounded
-                    # while for the summary the fetch produces.
+                    # while for the summary the fetch produces -- before
+                    # printing anything, and then print the block in one
+                    # write: the Monitor tool turns each burst of output into
+                    # its own notification.
                     waited=0
                     while [[ ! -f "$run_dir/summary.txt" ]] && (( waited < 120 )); do
                         sleep 2
                         waited=$(( waited + 2 ))
                     done
-                    printf 'finished: %s, exit %s, after %s\n' \
-                        "$state" "$(exit_code)" "$(elapsed_human)"
-                    if summary="$(run_file_read summary.txt 2>/dev/null)"; then
-                        printf '%s\n' "$summary"
-                    else
-                        printf 'No summary was written, so the branch was probably never fetched.\n'
-                        print_tail_of_log
-                    fi
-                    if [[ "$mode" == "monitor" ]]; then
-                        print_report_marker
-                    fi
+                    count_event_files
+                    block="$(
+                        flush_result_if_terminal_only "$EVENT_FILE_COUNT"
+                        printf 'finished: %s, exit %s, after %s\n' \
+                            "$state" "$(exit_code)" "$(elapsed_human)"
+                        if summary="$(run_file_read summary.txt 2>/dev/null)"; then
+                            printf '%s\n' "$summary"
+                        else
+                            printf 'No summary was written, so the branch was probably never fetched.\n'
+                            print_tail_of_log
+                        fi
+                        if [[ "$mode" == "monitor" ]]; then
+                            print_report_marker
+                        fi
+                    )"
+                    printf '%s\n' "$block"
                     exit 0
                     ;;
                 abandoned)
-                    flush_result_if_terminal_only
-                    printf 'abandoned: the runner is gone and wrote no exit code, after %s\n' \
-                        "$(elapsed_human)"
-                    printf 'Nothing was fetched. The clone is still at %s\n' "$clone_dir"
-                    print_tail_of_log
+                    count_event_files
+                    block="$(
+                        flush_result_if_terminal_only "$EVENT_FILE_COUNT"
+                        printf 'abandoned: the runner is gone and wrote no exit code, after %s\n' \
+                            "$(elapsed_human)"
+                        printf 'Nothing was fetched. The clone is still at %s\n' "$clone_dir"
+                        print_tail_of_log
+                    )"
+                    printf '%s\n' "$block"
                     exit 0
                     ;;
                 starting)
